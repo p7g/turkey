@@ -23,7 +23,7 @@ signature Show[T] {
 }
 
 fn print[T](obj: T)(S: Show[T]) {
-    S.show(obj)
+    print_to_console_somehow(S.show(obj))
 }
 
 type Option[T] = Some(T) | None

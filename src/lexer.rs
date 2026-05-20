@@ -281,7 +281,7 @@ impl<'src> Lexer<'src> {
                 Some('\n') | None => {
                     diagnostics.push(Diagnostic::UnterminatedCharLiteral);
                     return self.token(start, TokenKind::Error);
-                },
+                }
                 _ => len += 1,
             }
         }
@@ -300,11 +300,15 @@ impl<'src> Lexer<'src> {
             match self.bump() {
                 Some('"') => break None,
                 Some('\n') | None => break Some(Diagnostic::UnterminatedStringLiteral),
-                _ => {},
+                _ => {}
             }
         };
 
-        let kind = if diag.is_some() { TokenKind::Error } else { TokenKind::String };
+        let kind = if diag.is_some() {
+            TokenKind::Error
+        } else {
+            TokenKind::String
+        };
         self.token(start, kind)
     }
 

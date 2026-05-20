@@ -39,5 +39,8 @@ implicit module StringShow : Show[string] {
     fn show(self: string) -> string = self
 }
 
+// print[Option[string]] needs Show[Option[string]] -> finds ShowOption[T]
+// ShowOption[string] needs Show[string] -> finds StringShow
+// implicitly print(Some("hello!"))(OptionShow(StringShow))
 print(Some("hello!")) // prints: Some("hello!")
 ```

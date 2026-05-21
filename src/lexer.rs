@@ -89,6 +89,7 @@ pub enum Diagnostic {
     UnexpectedEof,
     EmptyCharLiteral,
     InvalidCharLiteral,
+    UnterminatedBlockComment,
     UnterminatedCharLiteral,
     UnterminatedStringLiteral,
 }
@@ -212,6 +213,17 @@ impl<'src> Lexer<'src> {
                                 Some('\n') => self.token(start, TokenKind::Newline),
                                 _ => continue,
                             };
+                        }
+                    } else if self.bump_if('*') {
+                        loop {
+                            return match self.bump() {
+                                None => {
+                                    diagnostics.push(Diagnostic::UnterminatedBlockComment);
+                                    self.token(start, TokenKind::Error)
+                                },
+                                Some('*') if self.bump_if('/') => self.next_token(diagnostics),
+                                _ => continue,
+                            }
                         }
                     }
 

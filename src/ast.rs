@@ -127,7 +127,7 @@ pub struct Body {
 }
 
 pub enum ExprOrBody {
-    Statement(Statement),
+    Expression(Expression),
     Body(Body),
 }
 
@@ -147,6 +147,9 @@ pub enum StatementKind {
     Var(Pattern, Expression),
     Assignment(Expression, Expression),
     Expression(Expression),
+    Break(Option<Expression>),
+    Continue,
+    Return(Option<Expression>),
     Error,
 }
 
@@ -174,6 +177,8 @@ pub enum ExpressionKind {
     Index(Box<Expression>, Box<Expression>),
     Call(Box<Expression>, Vec<Expression>),
     RecordConstruction(RecordConstruction),
+    AnnotatedExpression(Box<Expression>, TypeExpr),
+    FnExpr(Vec<FnParam>, Option<TypeExpr>, Box<ExprOrBody>),
     Error,
 }
 

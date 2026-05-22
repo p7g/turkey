@@ -222,10 +222,10 @@ impl<'src> Lexer<'src> {
                                 None => {
                                     diagnostics.push(Diagnostic::UnterminatedBlockComment);
                                     self.token(start, TokenKind::Error)
-                                },
+                                }
                                 Some('*') if self.bump_if('/') => self.next_token(diagnostics),
                                 _ => continue,
-                            }
+                            };
                         }
                     }
 

@@ -2,8 +2,8 @@ use crate::source::{FileId, SourceMap, Span};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TokenKind {
-    And,
     AmpAmp,
+    And,
     Arrow,
     As,
     Break,
@@ -23,7 +23,6 @@ pub enum TokenKind {
     Fn,
     Greater,
     GreaterEqual,
-    Ident,
     If,
     Import,
     Int,
@@ -34,6 +33,7 @@ pub enum TokenKind {
     LessEqual,
     Let,
     Loop,
+    LowerIdent,
     Match,
     Minus,
     Newline,
@@ -52,6 +52,8 @@ pub enum TokenKind {
     String,
     True,
     Type,
+    Underscore,
+    UpperIdent,
     Var,
     While,
 }
@@ -271,10 +273,9 @@ impl<'src> Lexer<'src> {
         while let Some('a'..='z' | 'A'..='Z' | '0'..='9' | '_') = self.peek() {
             self.bump();
         }
+        let name = &self.source[start..self.pos];
         Token {
-            kind: self
-                .kw(&self.source[start..self.pos])
-                .unwrap_or(TokenKind::Ident),
+            kind: self.kw(name).unwrap_or_else(|| ident_token_kind(name)),
             span: self.span(start),
         }
     }
@@ -335,5 +336,13 @@ impl<'src> Lexer<'src> {
         }
 
         self.token(start, TokenKind::Int)
+    }
+}
+
+fn ident_token_kind(ident: &str) -> TokenKind {
+    match ident.chars().find(|&c| c != '_') {
+        Some(c) if c.is_ascii_uppercase() => TokenKind::UpperIdent,
+        Some(_) => TokenKind::LowerIdent,
+        None => TokenKind::Underscore,
     }
 }

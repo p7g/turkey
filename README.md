@@ -18,28 +18,28 @@ Roadmap:
 Sample (syntax subject to change):
 
 ```rust
-signature Show[T] {
-    fn show(T) -> string
+signature Show[a] {
+    fn show(a) -> String
 }
 
-fn print[T](obj: T)(S: Show[T]) {
+fn print(obj: a)(S: Show[a]) {
     print_to_console_somehow(S.show(obj))
 }
 
-type Option[T] = Some(T) | None
+type Option[a] = Some(a) | None
 
-implicit module OptionShow[T](ShowT: Show[T]) : Show[Option[T]] {
-    fn show(self: Option[T]) -> string = match self {
+implicit module OptionShow[a](ShowT: Show[a]) : Show[Option[a]] {
+    fn show(self: Option[a]) -> String = match self {
         Some(v) => "Some(" + ShowT.show(v) + ")"
         None => "None"
     }
 }
 
-implicit module StringShow : Show[string] {
-    fn show(self: string) -> string = self
+implicit module StringShow : Show[String] {
+    fn show(self: String) -> String = self
 }
 
-// print[Option[string]] needs Show[Option[string]] -> finds OptionShow[T]
+// print[Option[string]] needs Show[Option[string]] -> finds OptionShow[a]
 // OptionShow[string] needs Show[string] -> finds StringShow
 // implicitly print(Some("hello!"))(OptionShow(StringShow))
 print(Some("hello!")) // prints: Some("hello!")

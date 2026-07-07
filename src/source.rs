@@ -77,6 +77,17 @@ impl Span {
         let file = source_map.file(self.file_id);
         &file.source()[self.start..self.end]
     }
+
+    pub fn span(self, to: Span) -> Span {
+        debug_assert!(self.file_id == to.file_id);
+        debug_assert!(self.start <= to.start);
+        debug_assert!(self.end <= to.end);
+        Span {
+            file_id: self.file_id,
+            start: self.start,
+            end: self.end,
+        }
+    }
 }
 
 #[derive(Debug, Default)]

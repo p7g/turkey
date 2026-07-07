@@ -1,6 +1,6 @@
 use crate::source::{FileId, SourceMap, Span};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenKind {
     AmpAmp,
     And,
@@ -58,7 +58,7 @@ pub enum TokenKind {
     While,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Token {
     kind: TokenKind,
     span: Span,

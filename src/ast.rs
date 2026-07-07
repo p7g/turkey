@@ -1,15 +1,18 @@
 use crate::source::Span;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Module {
-    span: Span,
-    items: Vec<TopLevelItem>,
+    pub span: Span,
+    pub items: Vec<TopLevelItem>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopLevelItem {
-    span: Span,
-    kind: TopLevelItemKind,
+    pub span: Span,
+    pub kind: TopLevelItemKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TopLevelItemKind {
     ImportDecl(ImportDecl),
     TypeGroup(TypeGroup),
@@ -18,88 +21,105 @@ pub enum TopLevelItemKind {
     Error,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Name {
-    span: Span,
-    name: String,
+    pub span: Span,
+    pub name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QualifiedName {
-    span: Span,
-    path: Vec<Name>,
+    pub span: Span,
+    pub path: Vec<Name>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportDecl {
-    span: Span,
-    module_path: QualifiedName,
-    kind: ImportKind,
+    pub span: Span,
+    pub module_path: QualifiedName,
+    pub kind: ImportKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ImportKind {
     Module,
     Alias(ImportAlias),
     Items(Vec<ImportItem>),
+    Error,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportAlias {
-    span: Span,
-    name: Name,
+    pub span: Span,
+    pub name: Name,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportItem {
-    span: Span,
-    name: Name,
-    alias: Option<ImportAlias>,
+    pub span: Span,
+    pub name: Name,
+    pub alias: Option<ImportAlias>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeGroup {
-    span: Span,
-    decls: Vec<TypeDecl>,
+    pub span: Span,
+    pub decls: Vec<TypeDecl>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeDecl {
-    span: Span,
-    name: Name,
-    type_params: Vec<Name>,
-    value: TypeDeclValue,
+    pub span: Span,
+    pub name: Name,
+    pub type_params: Vec<Name>,
+    pub value: TypeDeclValue,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeDeclValue {
     Alias(TypeExpr),
     Constructors(Vec<VariantConstructor>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VariantConstructor {
-    span: Span,
-    name: Name,
-    payload: Option<ConstructorPayload>,
+    pub span: Span,
+    pub name: Name,
+    pub payload: Option<ConstructorPayload>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConstructorPayload {
     Tuple(TuplePayload),
     Record(RecordPayload),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuplePayload {
-    span: Span,
-    items: Vec<TypeExpr>,
+    pub span: Span,
+    pub items: Vec<TypeExpr>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordPayload {
-    span: Span,
-    items: Vec<RecordPayloadField>,
+    pub span: Span,
+    pub items: Vec<RecordPayloadField>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordPayloadField {
-    span: Span,
-    name: Name,
-    type_: TypeExpr,
+    pub span: Span,
+    pub name: Name,
+    pub type_: TypeExpr,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TypeExpr {
-    span: Span,
-    kind: TypeExprKind,
+    pub span: Span,
+    pub kind: TypeExprKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeExprKind {
     Variable(Name),
     Instance(QualifiedName, Vec<TypeExpr>),
@@ -108,40 +128,47 @@ pub enum TypeExprKind {
     Error,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FnGroup {
-    span: Span,
-    decls: Vec<FnDecl>,
+    pub span: Span,
+    pub decls: Vec<FnDecl>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FnDecl {
-    span: Span,
-    name: Name,
-    params: Vec<FnParam>,
-    return_type: Option<TypeExpr>,
-    body: ExprOrBody,
+    pub vspan: Span,
+    pub vname: Name,
+    pub vparams: Vec<FnParam>,
+    pub vreturn_type: Option<TypeExpr>,
+    pub vbody: ExprOrBody,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Body {
-    span: Span,
-    statements: Vec<Statement>,
+    pub span: Span,
+    pub statements: Vec<Statement>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExprOrBody {
     Expression(Expression),
     Body(Body),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FnParam {
-    span: Span,
-    name: Name,
-    type_: Option<TypeExpr>,
+    pub span: Span,
+    pub name: Name,
+    pub type_: Option<TypeExpr>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Statement {
-    span: Span,
-    kind: StatementKind,
+    pub span: Span,
+    pub kind: StatementKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StatementKind {
     Let(Pattern, Expression),
     Var(Pattern, Expression),
@@ -153,11 +180,13 @@ pub enum StatementKind {
     Error,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Expression {
-    span: Span,
-    kind: ExpressionKind,
+    pub span: Span,
+    pub kind: ExpressionKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExpressionKind {
     IntLiteral(IntLiteral),
     FloatLiteral(FloatLiteral),
@@ -182,45 +211,54 @@ pub enum ExpressionKind {
     Error,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntLiteral {
-    raw: String,
+    pub raw: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FloatLiteral {
-    raw: String,
+    pub raw: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StringLiteral {
-    raw: String,
+    pub raw: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CharLiteral {
-    raw: String,
+    pub raw: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct If {
-    condition: Box<Expression>,
-    then_body: Body,
-    else_branch: Option<Else>,
+    pub condition: Box<Expression>,
+    pub then_body: Body,
+    pub else_branch: Option<Else>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Else {
     If(Box<If>),
     Body(Body),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MatchArm {
-    span: Span,
-    pattern: Pattern,
-    guard: Option<Box<Expression>>,
-    body: ExprOrBody,
+    pub span: Span,
+    pub pattern: Pattern,
+    pub guard: Option<Box<Expression>>,
+    pub body: ExprOrBody,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BinaryOperator {
-    span: Span,
-    kind: BinaryOperatorKind,
+    pub span: Span,
+    pub kind: BinaryOperatorKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BinaryOperatorKind {
     LogicalOr,
     LogicalAnd,
@@ -236,32 +274,38 @@ pub enum BinaryOperatorKind {
     Quotient,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UnaryOperator {
-    span: Span,
-    kind: UnaryOperatorKind,
+    pub span: Span,
+    pub kind: UnaryOperatorKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UnaryOperatorKind {
     Negation,
     LogicalNot,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordConstruction {
-    path: QualifiedName,
-    fields: Vec<RecordConstructionField>,
+    pub path: QualifiedName,
+    pub fields: Vec<RecordConstructionField>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordConstructionField {
-    span: Span,
-    name: Name,
-    value: Expression,
+    pub span: Span,
+    pub name: Name,
+    pub value: Expression,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pattern {
-    span: Span,
-    kind: PatternKind,
+    pub span: Span,
+    pub kind: PatternKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PatternKind {
     Or(Vec<Pattern>),
     As(Box<Pattern>, Name),
@@ -277,18 +321,21 @@ pub enum PatternKind {
     Error,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConstructorPayloadPattern {
-    span: Span,
-    kind: ConstructorPayloadPatternKind,
+    pub span: Span,
+    pub kind: ConstructorPayloadPatternKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConstructorPayloadPatternKind {
     Tuple(Vec<Pattern>),
     Record(Vec<RecordFieldPattern>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordFieldPattern {
-    span: Span,
-    name: Name,
-    value: Pattern,
+    pub span: Span,
+    pub name: Name,
+    pub value: Pattern,
 }

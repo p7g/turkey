@@ -39,6 +39,14 @@ let expect tok state =
   let matches other = if tok = other then Some () else None in
   expect_with matches (Lexer.tok_to_string tok) state
 
+let expect_one toks state =
+  let matches other = if List.mem other toks then Some () else None in
+  let msg = (
+    "one of: "
+    ^ String.concat ", " (List.map Lexer.tok_to_string toks)
+  )
+  in expect_with matches msg state
+
 let expect_upper_ident msg state =
   let f = function UPPER_ID n -> Some n | _ -> None in
   expect_with f msg state
@@ -59,6 +67,7 @@ let take tok state =
 let rec skip_newlines state = if take NEWLINE state then skip_newlines state
 
 let rec list_inner sep term parse state =
+  skip_newlines state;
   if take sep state then
     let* item = parse state in
     let* rest = list_inner sep term parse state in
@@ -74,6 +83,8 @@ let list sep term parse state =
   let* x = parse state in
   let* xs = list_inner sep term parse state in
   Ok (x :: xs)
+
+let stmt_sep = expect_one [NEWLINE; SEMICOLON; EOF]
 
 let import state =
   let loc = state.pos in
@@ -109,23 +120,30 @@ let rec type_expr_or_ctor state =
   | LPAREN ->
       let pos = state.pos in
       advance state;
+      skip_newlines state;
       if take RPAREN state then
         Ok (Either.Right (TUnit pos))
       else
         let* t = type_expr state in
+        skip_newlines state;
         if take RPAREN state then
           Ok (Either.Right t)
-        else if take COMMA state then
+        else if take COMMA state then begin
+          skip_newlines state;
           let* rest = list COMMA (Some RPAREN) type_expr state in
           Ok (Either.Right (TTuple (pos, t :: rest)))
-        else
+        end else
           unexpected_token "comma or right paren" state
   | FUN ->
       let pos = state.pos in
       advance state;
+      skip_newlines state;
       let* _ = expect LPAREN state in
+      skip_newlines state;
       let* params = list COMMA (Some RPAREN) type_expr state in
+      skip_newlines state;
       let* _ = expect ARROW state in
+      skip_newlines state;
       let* ret = type_expr state in
       Ok (Either.Right (TFun (pos, params, ret)))
   | UPPER_ID n ->
@@ -134,6 +152,7 @@ let rec type_expr_or_ctor state =
       (match state.current with
       | LBRACK ->
           advance state;
+          skip_newlines state;
           let* args = list COMMA (Some RBRACK) type_expr state in
           Ok (Either.Right (TInst (pos, n, Some args)))
       | LPAREN | LBRACE ->
@@ -153,11 +172,13 @@ and ctor_payload state =
   match state.current with
     | LPAREN ->
         advance state;
+        skip_newlines state;
         let* fields = list COMMA (Some RPAREN) type_expr state in
         skip_newlines state;
         Ok (Some (CtorTuple fields))
     | LBRACE ->
         advance state;
+        skip_newlines state;
         let* fields = list COMMA (Some RBRACE) record_field state in
         skip_newlines state;
         Ok (Some (CtorRecord fields))
@@ -166,7 +187,9 @@ and ctor_payload state =
 and record_field state =
   let pos = state.pos in
   let* name = expect_lower_ident "lowercase name" state in
+  skip_newlines state;
   let* _ = expect EQ state in
+  skip_newlines state;
   let* ty = type_expr state in
   Ok (pos, name, ty)
 
@@ -186,6 +209,7 @@ let type_rhs state =
     let* v1 = type_expr_or_ctor state in
     match v1 with
     | Left ctor ->
+        skip_newlines state;
         let* rest = type_ctors state in
         Ok (VariantType (ctor :: rest))
     | Right expr ->
@@ -194,8 +218,11 @@ let type_rhs state =
 
 let type_decl obj loc state =
   let* name = expect_upper_ident "uppercase type name" state in
+  skip_newlines state;
   let* params = type_params state in
+  skip_newlines state;
   let* _ = expect EQ state in
+  skip_newlines state;
   let* rhs = type_rhs state in
   if obj then
     Ok (ObjectTypeDecl (loc, name, params, rhs))
@@ -229,6 +256,7 @@ let rec program state =
   | EOF -> Ok []
   | _ ->
       let* s = top_level_item state in
+      let* _ = stmt_sep state in
       let* ss = program state in
       Ok (s :: ss)
 

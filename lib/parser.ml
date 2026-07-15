@@ -5,6 +5,10 @@ let (let*) = Result.bind
 
 type parse_error = Lexing.position * string
 
+let show_parse_error ((pos, msg) : parse_error) =
+  let pos_str = Int.to_string pos.pos_lnum ^ ":" ^ Int.to_string pos.pos_cnum in
+  "Parse error " ^ pos.pos_fname ^ " at " ^ pos_str ^ ": " ^ msg
+
 type state = {
   lexbuf : Lexing.lexbuf;
   mutable current : Lexer.tok;
@@ -69,9 +73,15 @@ let rec skip_newlines state = if take NEWLINE state then skip_newlines state
 let rec list_inner sep term parse state =
   skip_newlines state;
   if take sep state then
-    let* item = parse state in
-    let* rest = list_inner sep term parse state in
-    Ok (item :: rest)
+    (* automatically support trailing sep if there's a termination token *)
+    match (state.current, term) with
+    | (x, Some y) when x = y ->
+        advance state;
+        Ok []
+    | _ ->
+      let* item = parse state in
+      let* rest = list_inner sep term parse state in
+      Ok (item :: rest)
   else
     match term with
     | Some t ->
@@ -111,7 +121,7 @@ let decl_group leading_tok parse state =
 let type_params state =
   let* _ = expect LBRACK state in
   let parse_item = expect_lower_ident "expected lowercase name" in
-  let* names = list COMMA (Some LBRACK) parse_item state in
+  let* names = list COMMA (Some RBRACK) parse_item state in
   Ok names
 
 let rec type_expr_or_ctor state =
@@ -188,7 +198,7 @@ and record_field state =
   let pos = state.pos in
   let* name = expect_lower_ident "lowercase name" state in
   skip_newlines state;
-  let* _ = expect EQ state in
+  let* _ = expect COLON state in
   skip_newlines state;
   let* ty = type_expr state in
   Ok (pos, name, ty)
@@ -199,7 +209,10 @@ let type_ctor state =
   let* payload = ctor_payload state in
   Ok (pos, name, payload)
 
-let type_ctors = list PIPE None type_ctor
+let type_ctors state =
+  match state.current with
+  | UPPER_ID _ -> list PIPE None type_ctor state
+  | _ -> Ok []
 
 let type_rhs state =
   if take PIPE state then
@@ -219,8 +232,11 @@ let type_rhs state =
 let type_decl obj loc state =
   let* name = expect_upper_ident "uppercase type name" state in
   skip_newlines state;
-  let* params = type_params state in
-  skip_newlines state;
+  let* params =
+    match state.current with
+    | LBRACK -> type_params state
+    | _ -> Ok []
+  in skip_newlines state;
   let* _ = expect EQ state in
   skip_newlines state;
   let* rhs = type_rhs state in

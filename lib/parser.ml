@@ -44,7 +44,7 @@ let expect tok state =
   expect_with matches (Lexer.tok_to_string tok) state
 
 let expect_one toks state =
-  let matches other = if List.mem other toks then Some () else None in
+  let matches other = if List.mem other toks then Some other else None in
   let msg = (
     "one of: "
     ^ String.concat ", " (List.map Lexer.tok_to_string toks)
@@ -166,7 +166,7 @@ let rec type_expr_or_ctor state =
           let* args = list COMMA (Some RBRACK) type_expr state in
           Ok (Either.Right (TInst (pos, n, Some args)))
       | LPAREN | LBRACE ->
-          let* payload = ctor_payload state in
+          let* payload = ctor_payload_decl state in
           Ok (Either.Left (pos, n, payload))
       | _ -> Ok (Either.Right (TInst (pos, n, None))))
   | _ -> unexpected_token "type expression" state
@@ -178,7 +178,7 @@ and type_expr state =
   | Left _ -> Error (pos, "Expected type expression but got constructor decl")
   | Right expr -> Ok expr
 
-and ctor_payload state =
+and ctor_payload_decl state =
   match state.current with
     | LPAREN ->
         advance state;
@@ -206,7 +206,7 @@ and record_field state =
 let type_ctor state =
   let pos = state.pos in
   let* name = expect_upper_ident "uppercase name" state in
-  let* payload = ctor_payload state in
+  let* payload = ctor_payload_decl state in
   Ok (pos, name, payload)
 
 let type_ctors state =
@@ -253,7 +253,201 @@ let type_group state =
   let* items = decl_group TYPE (type_decl obj) state in
   Ok (TopType items)
 
-let fun_group state = failwith "TODO"
+let binary tok_to_op nextprec state =
+  let rec loop lhs =
+    match List.assoc_opt state.current tok_to_op with
+    | Some op ->
+        skip_newlines state;
+        let loc = state.pos in
+        let* rhs = nextprec state in
+        loop (BinaryOp (loc, lhs, op, rhs))
+    | None ->
+        Ok lhs
+  in Result.bind (nextprec state) loop
+
+let rec expr state = annotated_expr state
+
+and annotated_expr state =
+  let loc = state.pos in
+  let* e = logical_or state in
+  if take COLON state then (
+    skip_newlines state;
+    let* ty = type_expr state in
+    Ok (Annotate (loc, e, ty))
+  ) else Ok e
+
+and logical_or state = binary [(PIPEPIPE, Or)] logical_and state
+and logical_and state = binary [(AMPAMP, And)] comparison state
+
+and comparison state =
+  let* lhs = term state in
+  let op = match state.current with
+  | EQEQ -> Some Eq
+  | BANGEQ -> Some Neq
+  | LT -> Some Lt
+  | LE -> Some Le
+  | GT -> Some Gt
+  | GE -> Some Ge
+  | _ -> None
+  in match op with
+  | None -> Ok lhs
+  | Some op ->
+      let pos = state.pos in
+      advance state;
+      skip_newlines state;
+      let* rhs = term state in
+      Ok (BinaryOp (pos, lhs, op, rhs))
+
+and term state = binary [(PLUS, Add); (MINUS, Sub)] factor state
+and factor state = binary [(STAR, Mul); (SLASH, Div)] unary state
+
+and unary state =
+  let loc = state.pos in
+  match state.current with
+  | BANG ->
+      skip_newlines state;
+      let* rhs = unary state in
+      Ok (UnaryOp (loc, Not, rhs))
+  | MINUS ->
+      skip_newlines state;
+      let* rhs = unary state in
+      Ok (UnaryOp (loc, Neg, rhs))
+  | _ -> postfix state
+
+and postfix state =
+  let rec loop lhs =
+    let pos = state.pos in
+    match state.current with
+    | LPAREN ->
+        advance state;
+        skip_newlines state;
+        let* args = list COMMA (Some RPAREN) expr state in
+        loop (Call (pos, lhs, args))
+    | DOT ->
+        advance state;
+        skip_newlines state;
+        let* lhs' = match state.current with
+        | INT_LIT n -> Ok (TupleAccess (pos, lhs, n))
+        | LOWER_ID n -> Ok (FieldAccess (pos, lhs, n))
+        | _ -> unexpected_token "tuple index or field name" state
+        in loop lhs'
+    | LBRACK ->
+        advance state;
+        skip_newlines state;
+        let* idx = expr state in
+        let* _ = expect RBRACK state in
+        loop (Index (pos, lhs, idx))
+    | _ -> Ok lhs
+
+  in Result.bind (primary state) loop
+
+and primary state =
+  let pos = state.pos in
+  match state.current with
+  | MATCH -> match_expr state
+  | LOOP -> loop_expr state
+  | WHILE -> while_expr state
+  | FUN -> fun_expr state
+  | BREAK ->
+      advance state;
+      if List.mem state.current [NEWLINE; SEMICOLON] then
+        Ok (Break (pos, None))
+      else
+        let* e = expr state in
+        Ok (Break (pos, Some e))
+  | CONTINUE -> advance state; Ok (Continue pos)
+  | RETURN ->
+      advance state;
+      if List.mem state.current [NEWLINE; SEMICOLON] then
+        Ok (Return (pos, None))
+      else
+        let* e = expr state in
+        Ok (Return (pos, Some e))
+  | TRUE -> advance state; Ok (BoolLit (pos, true))
+  | FALSE -> advance state; Ok (BoolLit (pos, false))
+  | INT_LIT i -> advance state; Ok (IntLit (pos, i))
+  | FLOAT_LIT f -> advance state; Ok (FloatLit (pos, f))
+  | STRING_LIT s -> advance state; Ok (StrLit (pos, s))
+  | CHAR_LIT c -> advance state; Ok (CharLit (pos, c))
+  | LPAREN ->
+      advance state;
+      skip_newlines state;
+      (match state.current with
+      | RPAREN -> advance state; Ok (UnitLit pos)
+      | _ ->
+          let* e = expr state in
+          skip_newlines state;
+          let* tok = expect_one [RPAREN; COMMA] state in
+          if tok = RPAREN then
+            Ok e
+          else
+            let* rest = list COMMA (Some RPAREN) expr state in
+            Ok (Tuple (pos, e :: rest )))
+  | LOWER_ID n -> Ok (Var (pos, n))
+  | UPPER_ID n ->
+      advance state;
+      let* payload = match state.current with
+      | LPAREN | LBRACE ->
+          let* p = ctor_payload state in
+          Ok (Some p)
+      | _ -> Ok None
+      in Ok (Ctor (pos, n, payload))
+  | _ -> unexpected_token "expression" state
+
+and ctor_payload = failwith "unimplemented"
+and match_expr = failwith "unimplemented"
+and loop_expr = failwith "unimplemented"
+and while_expr = failwith "unimplemented"
+and fun_expr = failwith "unimplemented"
+
+let block state = failwith "unimplemented"
+
+let fun_params state =
+  let* _ = expect LPAREN state in
+  skip_newlines state;
+  let one state =
+    let loc = state.pos in
+    let* name = expect_lower_ident "lowercase param name" state in
+    skip_newlines state;
+    let* ann = if take COLON state then (
+      skip_newlines state;
+      let* ty = type_expr state in
+      Ok (Some ty)
+    ) else
+      Ok None
+    in Ok (loc, name, ann)
+  in list COMMA (Some RPAREN) one state
+
+let fun_body state =
+  if take EQ state then (
+    skip_newlines state;
+    let* e = expr state in
+    Ok (FunBodyExpr e)
+  ) else (
+    skip_newlines state;
+    let* b = block state in
+    Ok (FunBodyBlock b)
+  )
+
+let fun_decl loc state =
+  let* name = expect_lower_ident "lowercase function name" state in
+  skip_newlines state;
+  let* params = fun_params state in
+  skip_newlines state;
+  let* ret = if take ARROW state then (
+    skip_newlines state;
+    let* ty = type_expr state in
+    Ok (Some ty)
+  ) else Ok None in
+  skip_newlines state;
+  let* body = fun_body state in
+  Ok ((loc, name, params, ret, body) : fun_decl)
+
+let fun_group_items state = decl_group FUN fun_decl state
+let fun_group state =
+  let* items = fun_group_items state in
+  Ok (TopFun items)
+
 let let_decl state = failwith "TODO"
 let var_decl state = failwith "TODO"
 

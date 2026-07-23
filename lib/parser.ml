@@ -39,25 +39,25 @@ let expect_with f msg state =
   | Some v -> advance state; Ok v
   | None   -> unexpected_token msg state
 
-let expect tok state =
+let expect tok =
   let matches other = if tok = other then Some () else None in
-  expect_with matches (Lexer.tok_to_string tok) state
+  expect_with matches (Lexer.tok_to_string tok)
 
-let expect_one toks state =
+let expect_one toks =
   let matches other = if List.mem other toks then Some other else None in
   let msg = (
     "one of: "
     ^ String.concat ", " (List.map Lexer.tok_to_string toks)
   )
-  in expect_with matches msg state
+  in expect_with matches msg
 
-let expect_upper_ident msg state =
+let expect_upper_ident msg =
   let f = function UPPER_ID n -> Some n | _ -> None in
-  expect_with f msg state
+  expect_with f msg
 
-let expect_lower_ident msg state =
+let expect_lower_ident msg =
   let f = function LOWER_ID n -> Some n | _ -> None in
-  expect_with f msg state
+  expect_with f msg
 
 let take_with f state =
   match f state.current with
@@ -68,11 +68,15 @@ let take tok state =
   let matches other = if other == tok then Some () else None in
   Option.is_some (take_with matches state)
 
+let take_one toks =
+  let matches other = if List.mem other toks then Some other else None in
+  take_with matches
+
 let rec skip_newlines state = if take NEWLINE state then skip_newlines state
 
-let rec list_inner sep term parse state =
+let rec list_inner seps term parse state =
   skip_newlines state;
-  if take sep state then
+  if Option.is_some (take_one seps state) then
     (* automatically support trailing sep if there's a termination token *)
     match (state.current, term) with
     | (x, Some y) when x = y ->
@@ -80,7 +84,7 @@ let rec list_inner sep term parse state =
         Ok []
     | _ ->
       let* item = parse state in
-      let* rest = list_inner sep term parse state in
+      let* rest = list_inner seps term parse state in
       Ok (item :: rest)
   else
     match term with
@@ -89,10 +93,16 @@ let rec list_inner sep term parse state =
         Ok []
     | _ -> Ok []
 
-let list sep term parse state =
+let list seps term parse state =
   let* x = parse state in
-  let* xs = list_inner sep term parse state in
+  let* xs = list_inner seps term parse state in
   Ok (x :: xs)
+
+let list_opt seps term parse state =
+  if Some state.current = term then
+    Ok []
+  else
+    list seps term parse state
 
 let stmt_sep = expect_one [NEWLINE; SEMICOLON; EOF]
 
@@ -121,7 +131,7 @@ let decl_group leading_tok parse state =
 let type_params state =
   let* _ = expect LBRACK state in
   let parse_item = expect_lower_ident "expected lowercase name" in
-  let* names = list COMMA (Some RBRACK) parse_item state in
+  let* names = list [COMMA] (Some RBRACK) parse_item state in
   Ok names
 
 let rec type_expr_or_ctor state =
@@ -140,7 +150,7 @@ let rec type_expr_or_ctor state =
           Ok (Either.Right t)
         else if take COMMA state then begin
           skip_newlines state;
-          let* rest = list COMMA (Some RPAREN) type_expr state in
+          let* rest = list [COMMA] (Some RPAREN) type_expr state in
           Ok (Either.Right (TTuple (pos, t :: rest)))
         end else
           unexpected_token "comma or right paren" state
@@ -150,7 +160,7 @@ let rec type_expr_or_ctor state =
       skip_newlines state;
       let* _ = expect LPAREN state in
       skip_newlines state;
-      let* params = list COMMA (Some RPAREN) type_expr state in
+      let* params = list_opt [COMMA] (Some RPAREN) type_expr state in
       skip_newlines state;
       let* _ = expect ARROW state in
       skip_newlines state;
@@ -163,7 +173,7 @@ let rec type_expr_or_ctor state =
       | LBRACK ->
           advance state;
           skip_newlines state;
-          let* args = list COMMA (Some RBRACK) type_expr state in
+          let* args = list [COMMA] (Some RBRACK) type_expr state in
           Ok (Either.Right (TInst (pos, n, Some args)))
       | LPAREN | LBRACE ->
           let* payload = ctor_payload_decl state in
@@ -183,13 +193,13 @@ and ctor_payload_decl state =
     | LPAREN ->
         advance state;
         skip_newlines state;
-        let* fields = list COMMA (Some RPAREN) type_expr state in
+        let* fields = list [COMMA] (Some RPAREN) type_expr state in
         skip_newlines state;
         Ok (Some (CtorTuple fields))
     | LBRACE ->
         advance state;
         skip_newlines state;
-        let* fields = list COMMA (Some RBRACE) record_field state in
+        let* fields = list [COMMA] (Some RBRACE) record_field state in
         skip_newlines state;
         Ok (Some (CtorRecord fields))
     | _ -> Ok None
@@ -211,7 +221,7 @@ let type_ctor state =
 
 let type_ctors state =
   match state.current with
-  | UPPER_ID _ -> list PIPE None type_ctor state
+  | UPPER_ID _ -> list [PIPE] None type_ctor state
   | _ -> Ok []
 
 let type_rhs state =
@@ -321,7 +331,7 @@ and postfix state =
     | LPAREN ->
         advance state;
         skip_newlines state;
-        let* args = list COMMA (Some RPAREN) expr state in
+        let* args = list_opt [COMMA] (Some RPAREN) expr state in
         loop (Call (pos, lhs, args))
     | DOT ->
         advance state;
@@ -381,7 +391,7 @@ and primary state =
           if tok = RPAREN then
             Ok e
           else
-            let* rest = list COMMA (Some RPAREN) expr state in
+            let* rest = list [COMMA] (Some RPAREN) expr state in
             Ok (Tuple (pos, e :: rest )))
   | LOWER_ID n -> Ok (Var (pos, n))
   | UPPER_ID n ->
@@ -400,9 +410,31 @@ and loop_expr = failwith "unimplemented"
 and while_expr = failwith "unimplemented"
 and fun_expr = failwith "unimplemented"
 
-let block state = failwith "unimplemented"
+and statement state =
+  let pos = state.pos in
+  match state.current with
+  | LET -> let* items = let_decl state in Ok (SLet (pos, items))
+  | VAR -> let* items = var_decl state in Ok (SVar (pos, items))
+  | FUN -> let* items = fun_group state in Ok (SFun items)
+  | _ -> expr_or_assignment state
 
-let fun_params state =
+and expr_or_assignment state = failwith "unimplemented"
+
+and block state =
+  let* _ = expect LBRACE state in
+  let maybe_stmt state =
+    skip_newlines state;
+    if state.current = RBRACE then
+      Ok None
+    else
+      let* s = statement state in
+      Ok (Some s)
+  in
+  let* ss = list_opt [NEWLINE; SEMICOLON] (Some RBRACE) maybe_stmt state in
+  skip_newlines state;
+  Ok (List.filter_map (fun x -> x) ss)
+
+and fun_params state =
   let* _ = expect LPAREN state in
   skip_newlines state;
   let one state =
@@ -416,9 +448,9 @@ let fun_params state =
     ) else
       Ok None
     in Ok (loc, name, ann)
-  in list COMMA (Some RPAREN) one state
+  in list_opt [COMMA] (Some RPAREN) one state
 
-let fun_body state =
+and fun_body state =
   if take EQ state then (
     skip_newlines state;
     let* e = expr state in
@@ -429,7 +461,7 @@ let fun_body state =
     Ok (FunBodyBlock b)
   )
 
-let fun_decl loc state =
+and fun_decl loc state =
   let* name = expect_lower_ident "lowercase function name" state in
   skip_newlines state;
   let* params = fun_params state in
@@ -443,21 +475,22 @@ let fun_decl loc state =
   let* body = fun_body state in
   Ok ((loc, name, params, ret, body) : fun_decl)
 
-let fun_group_items state = decl_group FUN fun_decl state
-let fun_group state =
+and fun_group_items state = decl_group FUN fun_decl state
+and fun_group state =
   let* items = fun_group_items state in
-  Ok (TopFun items)
+  Ok items
 
-let let_decl state = failwith "TODO"
-let var_decl state = failwith "TODO"
+and let_decl state = failwith "TODO"
+and var_decl state = failwith "TODO"
 
 let top_level_item state =
+  let pos = state.pos in
   match state.current with
   | IMPORT -> import state
   | TYPE -> type_group state
-  | FUN -> fun_group state
-  | LET -> let_decl state
-  | VAR -> var_decl state
+  | FUN -> let* items = fun_group state in Ok (TopFun items)
+  | LET -> let* items = let_decl state in Ok (TopLet (pos, items))
+  | VAR -> let* items = var_decl state in Ok (TopVar (pos, items))
   | tok -> unexpected_token "top-level item" state
 
 let rec program state =

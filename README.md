@@ -91,11 +91,13 @@ absorbs (§4.3). Absorption alone is not enough: in
 a no-op that leaves the caller no wiser. So `types.join` is used wherever two
 branches must agree, and it returns the surviving type.
 
-**Field access needs a known receiver.** There is no row polymorphism, so `r.f`
-prunes `r`'s type and demands a concrete record type; when it cannot get one,
-the error asks for an annotation. This keeps field names from having to be
-globally unique, at the cost of making inference order-sensitive
-(SPEC-DELTAS.md 7).
+**Field access is a predicate.** `r.f` emits `HasField "f" typeof(r) a` and
+decides nothing; the solver settles it once the receiver is known, however much
+later that is. A demand still unresolved when its binding generalizes travels
+in the scheme, so `fun get(r) = r.n` is `[HasField "n" a b] fun(a) -> b` and
+reads from any record with an `n`. Records stay nominal and there are no rows:
+this is Gaster & Jones's `r \ l` without them, which is decidable here because
+entailment is a declaration lookup (SPEC-DELTAS.md 7).
 
 **The newline rule.** §2.4 as written is circular — newlines inside braces are
 "dropped except where the inner grammar uses it as a separator", which a lexer

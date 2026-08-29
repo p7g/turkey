@@ -38,12 +38,16 @@ def main() -> int:
             print(f"warning: {source.name} was expected to {word}, exit code {code}")
         print(f"{source.name}: exit {code}, {len(output.splitlines())} line(s)")
 
-    types = subprocess.run(
-        [sys.executable, "-m", "turkey", "types", "stack.tl"],
-        cwd=PROGRAMS, env=dict(os.environ, PYTHONPATH=str(ROOT)),
-        capture_output=True, text=True,
-    )
-    (PROGRAMS / "stack.types").write_text(types.stdout + types.stderr, encoding="utf-8")
+    # Only programs that already have a `.types` golden get one regenerated;
+    # adding a new one is a deliberate act, not a side effect of running this.
+    for golden in sorted(PROGRAMS.glob("*.types")):
+        types = subprocess.run(
+            [sys.executable, "-m", "turkey", "types", golden.with_suffix(".tl").name],
+            cwd=PROGRAMS, env=dict(os.environ, PYTHONPATH=str(ROOT)),
+            capture_output=True, text=True,
+        )
+        golden.write_text(types.stdout + types.stderr, encoding="utf-8")
+        print(f"{golden.name}: exit {types.returncode}")
     return 0
 
 

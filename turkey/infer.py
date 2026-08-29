@@ -9,9 +9,11 @@ Three things here are specific to this language rather than to Hindley-Milner:
 * Bottom. Anything that transfers control has type bottom, which unification
   absorbs. Wherever two branches must agree, `join` is used instead of `unify`
   so the surviving type comes back out (see turkey/types.py).
-* Field access. `r.f` needs `r`'s type to already be known -- there is no row
-  polymorphism -- so it prunes the receiver and demands a concrete record type.
-  See SPEC-DELTAS.md entry 7.
+* Field access. `r.f` emits a `HasField` predicate rather than inspecting
+  the receiver, so it does not matter whether the receiver's type is known yet
+  -- or ever. An unresolved receiver that is still generalizable travels in the
+  scheme, which is how a function may be polymorphic in the record it reads
+  from without the language having rows.
 * Annotation type variables are scoped to the enclosing function, so the `a` in
   a signature and the `a` in a body annotation are the same variable
   (SPEC-DELTAS.md entry 13).
@@ -22,13 +24,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from . import ast
-from .constraints import Solver
+from .constraints import HAS_FIELD, CPred, Solver
 from .decls import DeclTable
 from .deps import free_names, pattern_vars, sccs
 from .errors import Span, TypeError_
 from .types import (
-    BOOL, BOTTOM, CHAR, FLOAT, INT, STRING, UNIT, Scheme, TCon, TFun, TTuple,
-    TVar, Type, generalize, instantiate, lower_to, mono, prune, show,
+    BOOL, BOTTOM, CHAR, FLOAT, INT, STRING, UNIT, Pred, Scheme, TCon, TFun,
+    TLabel, TTuple, TVar, Type, generalize, instantiate_qual, lower_to, mono,
+    vars_of,
 )
 
 LITERAL_TYPES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR, "Bool": BOOL}
@@ -85,7 +88,7 @@ class Inferencer:
     def __init__(self, decls: DeclTable, env: Env):
         self.decls = decls
         self.env = env
-        self.solver = Solver()
+        self.solver = Solver(decls)
         self.level = 0
         self.fn_stack: list[Type] = []
         self.loop_stack: list[LoopCtx] = []
@@ -103,6 +106,38 @@ class Inferencer:
         """Translate an annotation, resolving its type variables in the
         innermost function's scope."""
         return self.decls.to_type(te, self.tyvar_scopes[-1], self.level)
+
+    def use(self, scheme: Scheme, span: Span | None) -> Type:
+        """Instantiate a scheme at a use site, re-emitting its context.
+
+        A scheme's predicates are obligations on whoever instantiates it, so
+        they come back as constraints over this site's fresh variables. The
+        verb is "read": a scheme records which field it needs, not whether the
+        access that produced the demand was a read or an assignment.
+        """
+        preds, ty = instantiate_qual(scheme, self.level)
+        for p in preds:
+            self.solver.pred(p, span, "read")
+        return ty
+
+    def _reject_stranded(self, stranded: list[CPred]) -> None:
+        """Report a predicate that can be neither discharged nor quantified.
+
+        A `HasField` whose receiver is still a variable is fine as long as some
+        scheme can carry it. One that reaches a generalization point without
+        appearing in any of the types being generalized is stuck for good: no
+        later unification can reach it, because nothing else mentions it.
+        """
+        if not stranded:
+            return
+        c = stranded[0]
+        label = c.pred.args[0]
+        assert isinstance(label, TLabel)
+        raise TypeError_(
+            f"cannot determine the type of the value whose field '{label.name}' "
+            f"is being accessed. Add a type annotation.",
+            c.span,
+        )
 
     def _scoped(self, env: Env):
         outer, self.env = self.env, env
@@ -146,6 +181,8 @@ class Inferencer:
             bound = sorted(n for key in component for n in names_of[key])
             self._infer_group(group, bound, component, graph)
             ordered.extend(group)
+        self.solver.settle()
+        self._reject_stranded(self.solver.deferred)
         self._check_exhaustiveness()
         return ordered
 
@@ -215,12 +252,21 @@ class Inferencer:
         for decl in decls:
             self.solver.eq(placeholders[decl.name], self.infer_function(decl), decl.span)
         self.level -= 1
-        for decl in decls:
+        # Everything the bodies deferred gets one more chance now that the
+        # whole group has been generated, then is split: general enough to
+        # quantify travels in the scheme, the rest waits for an enclosing
+        # binding.
+        self.solver.settle()
+        retained = self.solver.retained(self.level)
+        types = [placeholders[decl.name] for decl in decls]
+        for decl, ty in zip(decls, types):
             # A `fun` is syntactically a value, so the value restriction never
             # blocks generalization here.
             self.env.define(
-                decl.name, Binding(generalize(placeholders[decl.name], self.level), False)
+                decl.name,
+                Binding(generalize(ty, self.level, _constrain(retained, ty)), False),
             )
+        self._reject_stranded(_unattributed(retained, types))
 
     # -- functions ---------------------------------------------------------
 
@@ -250,9 +296,19 @@ class Inferencer:
 
     # -- patterns ----------------------------------------------------------
 
-    def bind_pattern(self, pat: ast.Pattern, t: Type, mutable: bool, gen: bool = False) -> None:
+    def bind_pattern(
+        self,
+        pat: ast.Pattern,
+        t: Type,
+        mutable: bool,
+        gen: bool = False,
+        preds: list[CPred] | None = None,
+    ) -> None:
         for name, ty in self.match_pattern(pat, t).items():
-            scheme = generalize(ty, self.level) if gen else mono(ty)
+            # `let (f, g) = ...` binds two schemes from one right-hand side, so
+            # a retained predicate goes to whichever of them it constrains.
+            scheme = (generalize(ty, self.level, _constrain(preds or [], ty))
+                      if gen else mono(ty))
             self.env.define(name, Binding(scheme, mutable))
 
     def match_pattern(self, pat: ast.Pattern, t: Type) -> dict[str, Type]:
@@ -335,13 +391,21 @@ class Inferencer:
             self.level -= 1
             # Section 4.4: only a `let` bound to a syntactic value generalizes.
             gen = is_let and self.is_nonexpansive(stmt.value)
-            if not gen:
+            retained: list[CPred] = []
+            if gen:
+                self.solver.settle()
+                retained = self.solver.retained(self.level)
+                self._reject_stranded(_unattributed(retained, [value]))
+            else:
                 # The right-hand side was inferred one level in, so its
                 # variables are still marked deeper than this binding. Bring
                 # them back down or the next binding to mention them will
-                # generalize what the value restriction just refused to.
+                # generalize what the value restriction just refused to. This
+                # lowers any deferred predicate over those variables with them,
+                # so it stays behind for an enclosing binding as well.
                 lower_to(value, self.level)
-            self.bind_pattern(stmt.pat, value, mutable=not is_let, gen=gen)
+            self.bind_pattern(stmt.pat, value, mutable=not is_let, gen=gen,
+                              preds=retained)
             return UNIT
 
         if isinstance(stmt, ast.SFun):
@@ -368,7 +432,7 @@ class Inferencer:
                     span,
                 )
             self.solver.eq(
-                instantiate(binding.scheme, self.level),
+                self.use(binding.scheme, span),
                 self.infer_expr(stmt.value),
                 span,
                 f"the assignment to '{target.name}'",
@@ -410,7 +474,7 @@ class Inferencer:
         binding = self.env.lookup(e.name)
         if binding is None:
             raise TypeError_(f"'{e.name}' is not defined", e.span)
-        return instantiate(binding.scheme, self.level)
+        return self.use(binding.scheme, e.span)
 
     def _infer_ECon(self, e: ast.ECon) -> Type:
         con = self.decls.instantiate_con(e.name, self.level, e.span)
@@ -475,47 +539,23 @@ class Inferencer:
         return self.infer_field(e, assigning=False)
 
     def infer_field(self, e: ast.EField, assigning: bool) -> Type:
-        """Resolve `r.f`, which requires `r`'s type to be known already.
+        """Emit `HasField "f" r a` for `r.f` and hand back the `a`.
 
-        There is no row polymorphism, so an unresolved receiver is an error the
-        author fixes with an annotation (SPEC-DELTAS.md entry 7).
+        Nothing is decided here. If the receiver is already known the solver
+        discharges the predicate immediately and the result is unified with the
+        declared field type; if it is not, the predicate waits. That is the
+        whole of SPEC-DELTAS.md entry 7: the old code pruned the receiver and
+        demanded a record on the spot, which made `a.length` mean different
+        things depending on whether the walk had reached `a[0]` yet.
         """
-        receiver = prune(self.infer_expr(e.obj))
-
-        if isinstance(receiver, TCon) and receiver.name == "Array":
-            if e.name in ("length", "capacity"):
-                return INT  # section 8.3: both are readable and writable
-            raise TypeError_(
-                f"an Array has no field '{e.name}' (only 'length' and 'capacity')",
-                e.span,
-            )
-
-        if isinstance(receiver, TCon):
-            info = self.decls.tycons.get(receiver.name)
-            if info is not None and info.is_mutable_record:
-                con = self.decls.instantiate_con(info.variants[0].name, self.level, e.span)
-                self.solver.eq(con.ret, receiver, e.span, "a field access")
-                names = info.variants[0].field_names
-                if e.name not in names:
-                    raise TypeError_(
-                        f"type '{receiver.name}' has no field '{e.name}' "
-                        f"(it has: {', '.join(names)})",
-                        e.span,
-                    )
-                return con.params[names.index(e.name)]
-            what = "mutate" if assigning else "read"
-            raise TypeError_(
-                f"cannot {what} field '{e.name}': '{show(receiver)}' is not a "
-                f"single-variant record type. Multi-variant types are immutable "
-                f"and are taken apart with 'match'.",
-                e.span,
-            )
-
-        raise TypeError_(
-            f"cannot determine the type of the value whose field '{e.name}' is "
-            f"being accessed. Add a type annotation.",
+        receiver = self.infer_expr(e.obj)
+        result = self.fresh()
+        self.solver.pred(
+            Pred(HAS_FIELD, [TLabel(e.name), receiver, result]),
             e.span,
+            "mutate" if assigning else "read",
         )
+        return result
 
     def _infer_EUnary(self, e: ast.EUnary) -> Type:
         operand, result = UNARY_OPS[e.op]
@@ -670,6 +710,50 @@ class Inferencer:
         if info is None:
             return False
         return not self.decls.tycons[info.tycon].is_mutable_record
+
+
+def _reach(preds: list[CPred], types: list[Type]) -> set[int]:
+    """The variables `types` pin, following predicates to a fixed point.
+
+    Membership is transitive because a `HasField` is a *function* of its
+    receiver: fix the record and the field type follows. So a variable that
+    appears nowhere in the type is still determined, as long as some chain of
+    predicates connects it to one that is. `t.data.length` in bf.tl is exactly
+    that -- it demands `HasField "length" d n` where `d` is reachable only
+    through `HasField "data" t d` -- and it is why this is a closure rather
+    than a single intersection.
+
+    That functional reading is also why the usual ambiguity objection to a
+    variable appearing only in the context does not apply here.
+    """
+    ids = {v.id for t in types for v in vars_of(t)}
+    changed = True
+    while changed:
+        changed = False
+        for c in preds:
+            reachable = vars_of(*c.pred.args)
+            if any(v.id in ids for v in reachable):
+                for v in reachable:
+                    if v.id not in ids:
+                        ids.add(v.id)
+                        changed = True
+    return ids
+
+
+def _constrain(preds: list[CPred], t: Type) -> list[Pred]:
+    """The retained predicates that constrain `t`."""
+    ids = _reach(preds, [t])
+    return [c.pred for c in preds if _touches(c, ids)]
+
+
+def _unattributed(preds: list[CPred], types: list[Type]) -> list[CPred]:
+    """The retained predicates no scheme in the group will carry."""
+    ids = _reach(preds, types)
+    return [c for c in preds if not _touches(c, ids)]
+
+
+def _touches(c: CPred, ids: set[int]) -> bool:
+    return any(v.id in ids for v in vars_of(*c.pred.args))
 
 
 class _Restore:

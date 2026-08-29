@@ -74,6 +74,25 @@ class TTuple(Type):
         return f"TTuple({self.elems!r})"
 
 
+class TLabel(Type):
+    """A field name lifted into the type language.
+
+    Legal only in the first argument of `HasField`, and deliberately not kinded
+    -- it exists so one predicate former can name any field, rather than the
+    domain growing a former per label. It is rigid (two labels are equal only
+    when they are the same string) and contains no variables, so every walk
+    over types passes it through untouched.
+    """
+
+    __slots__ = ("name",)
+
+    def __init__(self, name: str):
+        self.name = name
+
+    def __repr__(self) -> str:
+        return f"TLabel({self.name!r})"
+
+
 class TBottom(Type):
     """The type of an expression that never yields a value (section 4.1)."""
 
@@ -114,6 +133,14 @@ class Pred:
     def __init__(self, name: str, args: list[Type]):
         self.name = name
         self.args = args
+
+    def key(self) -> tuple:
+        """A hashable identity, for dropping a context's duplicate predicates.
+
+        `r.n = r.n + 1` demands the same field twice, and there is no reason
+        for the scheme to say so twice.
+        """
+        return (self.name,) + tuple(type_key(a) for a in self.args)
 
     def level(self) -> int:
         """The binder depth this predicate is tied to.
@@ -225,6 +252,11 @@ def unify(a: Type, b: Type, span: Span | None = None, context: str = "") -> None
         for x, y in zip(a.params, b.params):
             unify(x, y, span, context)
         unify(a.ret, b.ret, span, context)
+        return
+
+    if isinstance(a, TLabel) and isinstance(b, TLabel):
+        if a.name != b.name:
+            raise _mismatch(a, b, span, context)
         return
 
     if isinstance(a, TTuple) and isinstance(b, TTuple):
@@ -347,6 +379,22 @@ def lower_to(t: Type, level: int) -> None:
         v.level = min(v.level, level)
 
 
+def type_key(t: Type) -> tuple:
+    """A structural identity for a type, up to the current substitution."""
+    t = prune(t)
+    if isinstance(t, TVar):
+        return ("var", t.id)
+    if isinstance(t, TCon):
+        return ("con", t.name, tuple(type_key(a) for a in t.args))
+    if isinstance(t, TFun):
+        return ("fun", tuple(type_key(p) for p in t.params), type_key(t.ret))
+    if isinstance(t, TTuple):
+        return ("tuple", tuple(type_key(e) for e in t.elems))
+    if isinstance(t, TLabel):
+        return ("label", t.name)
+    return ("bottom",)
+
+
 def vars_of(*types: Type) -> list[TVar]:
     """The unbound variables reachable from `types`, first occurrence first."""
     seen: dict[int, TVar] = {}
@@ -398,7 +446,8 @@ def _var_name(index: int) -> str:
     return _LETTERS[index % 26] + ("" if index < 26 else str(index // 26))
 
 
-def show(t: Type, names: dict[int, str] | None = None, free_prefix: str = "") -> str:
+def show(t: Type, names: dict[int, str] | None = None, free_prefix: str = "",
+         prec: int = 0) -> str:
     """Render a type in surface syntax, naming variables a, b, c, ... in order.
 
     `free_prefix` is prepended to variables not already present in `names`.
@@ -417,6 +466,8 @@ def show(t: Type, names: dict[int, str] | None = None, free_prefix: str = "") ->
             return names[ty.id]
         if isinstance(ty, TBottom):
             return "!"
+        if isinstance(ty, TLabel):
+            return f'"{ty.name}"'
         if isinstance(ty, TTuple):
             return "(" + ", ".join(go(e, 0) for e in ty.elems) + ")"
         if isinstance(ty, TFun):
@@ -431,7 +482,7 @@ def show(t: Type, names: dict[int, str] | None = None, free_prefix: str = "") ->
             return f"({out})" if prec > 1 else out
         return repr(ty)
 
-    return go(t, 0)
+    return go(t, prec)
 
 
 def show_scheme(scheme: Scheme) -> str:
@@ -454,5 +505,7 @@ def show_scheme(scheme: Scheme) -> str:
 
 
 def show_pred(pred: Pred, names: dict[int, str] | None = None) -> str:
-    args = " ".join(show(a, names, free_prefix="_") for a in pred.args)
+    # A predicate is itself an application, so its arguments are rendered at
+    # argument precedence: `HasField "d" a (Array Int)`, not `... a Array Int`.
+    args = " ".join(show(a, names, free_prefix="_", prec=2) for a in pred.args)
     return f"{pred.name} {args}" if args else pred.name

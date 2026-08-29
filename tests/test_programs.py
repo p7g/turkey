@@ -63,9 +63,19 @@ def test_program_conformance(program: Path) -> None:
         )
 
 
-def test_types_command_matches_stack_types() -> None:
-    expected = (PROGRAMS_DIR / "stack.types").read_text()
-    result = _run(["types", "stack.tl"])
+SIGNATURES = sorted(PROGRAMS_DIR.glob("*.types"))
+
+
+@pytest.mark.parametrize("golden", SIGNATURES, ids=[p.stem for p in SIGNATURES])
+def test_types_command(golden: Path) -> None:
+    """`NAME.types` pins what `turkey types NAME.tl` prints.
+
+    A program only needs one when its inferred signatures are the point --
+    which now includes any program whose functions carry a predicate context,
+    since that is where a change in the solver would show up first.
+    """
+    expected = golden.read_text()
+    result = _run(["types", golden.with_suffix(".tl").name])
     actual = result.stdout + result.stderr
     assert actual == expected, _diff_message(expected, actual, result.returncode)
     assert result.returncode == 0

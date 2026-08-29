@@ -2,26 +2,26 @@ type Tape = Tape { data : Array Int, pos : Int }
 
 fun newTape() = Tape { data = [0], pos = 0 }
 
-fun inc(t : Tape, amount) {
+fun inc(t, amount) {
     let val = t.data[t.pos] + amount
     t.data[t.pos] = val % 256
 }
 
-fun move(t : Tape, amount) {
+fun move(t, amount) {
     t.pos = t.pos + amount
     while t.pos >= t.data.length {
         Array.push(t.data, 0)
     }
 }
 
-fun get(t : Tape) = t.data[t.pos]
+fun get(t) = t.data[t.pos]
 
 type Op = Inc(Int)
         | Move(Int)
         | Print
         | Loop(Array Op)
 
-fun parse(chars : Array Char, start) {
+fun parse(chars, start) {
     var i = start
     let ops = []
     while i < chars.length {

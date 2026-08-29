@@ -172,6 +172,34 @@ class DeclTable:
     def con(self, name: str) -> ConInfo | None:
         return self.constructors.get(name)
 
+    # -- record field lookup -----------------------------------------------
+
+    def record_fields(self, receiver: TCon) -> list[str] | None:
+        """`receiver`'s field names, or None if it is not a mutable record."""
+        info = self.tycons.get(receiver.name)
+        if info is None or not info.is_mutable_record:
+            return None
+        return info.variants[0].field_names
+
+    def field_type(self, receiver: TCon, label: str) -> Type:
+        """The type of `receiver.label`, for a receiver already resolved.
+
+        The receiver's arguments *are* the constructor's parameters, so
+        substituting them directly is exact. Instantiating the constructor's
+        scheme and unifying its result with the receiver -- which is what
+        `HasField` solving would otherwise do -- gives the same type but
+        introduces fresh variables first, and unification would then impose
+        their level on the receiver's. Solving happens after generation, at
+        whatever level the solver has reached rather than the one the field
+        access was written at, so that level is not ours to impose.
+        """
+        con = self.tycons[receiver.name].variants[0]
+        body = con.scheme.body
+        assert isinstance(body, TFun) and isinstance(body.ret, TCon)
+        mapping = {v.id: arg for v, arg in zip(body.ret.args, receiver.args)
+                   if isinstance(v, TVar)}
+        return _substitute(body.params[con.field_names.index(label)], mapping)
+
 
 def _substitute(t: Type, mapping: dict[int, Type]) -> Type:
     from .types import prune

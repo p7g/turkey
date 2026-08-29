@@ -13,9 +13,17 @@ generalization by *scanning the environment* for free variables instead of
 comparing levels. `fv(env)` is the definition levels are an optimization of, so
 if the two disagree the level bookkeeping is wrong.
 
+It also carries the `HasField` predicate, the second constraint form in the
+domain, and settles it the same obvious way: a flat list retried until nothing
+more can be discharged, with a predicate travelling into a scheme only when the
+environment holds none of its variables. That last test is the naive reading of
+the real checker's `pred.level() > level`, which is precisely the seam this
+module exists to check.
+
 It covers only the fragment `tests/test_infer_reference.py` generates -- no
-bottom, no loops, no records, no annotations -- and raises `Unsupported` for
-anything else, so it can never silently agree by skipping the hard part.
+bottom, no loops, no polymorphic records, no annotations -- and raises
+`Unsupported` for anything else, so it can never silently agree by skipping the
+hard part.
 
 References: Milner (JCSS 17(3), 1978) for W and J; Damas & Milner (POPL '82)
 for W's completeness; Pottier & Remy (ATTAPL ch. 10) for the modern treatment.
@@ -23,17 +31,46 @@ for W's completeness; Pottier & Remy (ATTAPL ch. 10) for the modern treatment.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
 from turkey import ast
 from turkey.parser import parse
 from turkey.types import (
-    BOOL, CHAR, FLOAT, INT, STRING, Scheme, TCon, TFun, TTuple, TVar, Type,
-    vars_of,
+    BOOL, CHAR, FLOAT, INT, STRING, Pred, Scheme, TCon, TFun, TLabel, TTuple,
+    TVar, Type, type_key, vars_of,
 )
 
 LITERALS = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR, "Bool": BOOL}
 
 Subst = dict[int, Type]
 Env = dict[str, Scheme]
+
+
+@dataclass
+class RefPred:
+    """`HasField label receiver result`, in the shape this module works with."""
+
+    label: str
+    receiver: Type
+    result: Type
+
+    def to_pred(self, s: Subst) -> Pred:
+        return Pred("HasField", [TLabel(self.label),
+                                 substitute(self.receiver, s),
+                                 substitute(self.result, s)])
+
+
+@dataclass
+class State:
+    """Everything inference threads: the substitution and the pending demands.
+
+    The real checker keeps the second of these in `Solver.deferred` and settles
+    it against levels; here it is a flat list settled against `fv(env)`.
+    """
+
+    subst: Subst = field(default_factory=dict)
+    preds: list[RefPred] = field(default_factory=list)
+    records: dict[str, dict[str, Type]] = field(default_factory=dict)
 
 
 class RefError(Exception):
@@ -122,27 +159,130 @@ def free_in_env(env: Env, s: Subst) -> set[int]:
     out: set[int] = set()
     for scheme in env.values():
         bound = {v.id for v in scheme.quantified}
-        out |= {v.id for v in vars_of(substitute(scheme.body, s))} - bound
+        held = vars_of(substitute(scheme.body, s))
+        for pred in scheme.preds:
+            held += vars_of(*[substitute(a, s) for a in pred.args])
+        out |= {v.id for v in held} - bound
     return out
 
 
-def generalize(t: Type, env: Env, s: Subst) -> Scheme:
-    """Quantify what the environment does not hold.
+def pred_vars(p: RefPred, s: Subst) -> set[int]:
+    return {v.id for v in vars_of(substitute(p.receiver, s), substitute(p.result, s))}
+
+
+def improve(st: State) -> None:
+    """One field of one receiver has one type, so equate the results.
+
+    The counterpart of `Solver.improve`. Written out separately rather than
+    imported, since a shared implementation would agree with itself for free.
+    """
+    seen: dict[tuple, Type] = {}
+    for p in st.preds:
+        key = (p.label, type_key(substitute(p.receiver, st.subst)))
+        if key in seen:
+            unify(seen[key], p.result, st.subst)
+        else:
+            seen[key] = p.result
+
+
+def discharge(p: RefPred, st: State) -> bool:
+    """Settle one demand, or report that its receiver is still unknown."""
+    receiver = substitute(p.receiver, st.subst)
+    if isinstance(receiver, TVar):
+        return False
+    if isinstance(receiver, TCon):
+        if receiver.name == "Array":
+            if p.label not in ("length", "capacity"):
+                raise RefError(f"Array has no field {p.label}")
+            unify(p.result, INT, st.subst)
+            return True
+        fields = st.records.get(receiver.name)
+        if fields is not None:
+            if p.label not in fields:
+                raise RefError(f"{receiver.name} has no field {p.label}")
+            unify(p.result, fields[p.label], st.subst)
+            return True
+    raise RefError(f"no field {p.label} on {receiver}")
+
+
+def settle(st: State) -> None:
+    """Retry every demand until a round discharges none of them."""
+    while st.preds:
+        improve(st)
+        rest = [p for p in st.preds if not discharge(p, st)]
+        stuck = len(rest) >= len(st.preds)
+        st.preds = rest
+        if stuck:
+            return
+
+
+def generalize(t: Type, env: Env, st: State) -> Scheme:
+    """Quantify what the environment does not hold, with its context.
 
     The quantified list is ordered by first occurrence in the body, matching
     `turkey.types.generalize`, so that `show_scheme` names the variables the
     same way in both checkers and the rendered types can be compared directly.
+
+    A demand travels only if the environment holds *none* of its variables --
+    which is what `pred.level() > level` says, since that level is the minimum
+    over the same variables. Of those, a demand belongs to this scheme if it is
+    reachable from the quantified variables by following demands, `HasField`
+    being a function of its receiver. One that travels but is reachable from
+    nothing is stranded: no later unification can name it, so it is an error.
     """
-    body = substitute(t, s)
-    held = free_in_env(env, s)
-    return Scheme([v for v in vars_of(body) if v.id not in held], body)
+    settle(st)
+    body = substitute(t, st.subst)
+    held = free_in_env(env, st.subst)
+    quantified = [v for v in vars_of(body) if v.id not in held]
+
+    travelling = [p for p in st.preds if not (pred_vars(p, st.subst) & held)]
+    reach = {v.id for v in quantified}
+    changed = True
+    while changed:
+        changed = False
+        for p in travelling:
+            vs = pred_vars(p, st.subst)
+            if vs & reach and not vs <= reach:
+                reach |= vs
+                changed = True
+
+    mine: list[RefPred] = []
+    seen: set[tuple] = set()
+    for p in travelling:
+        if not (pred_vars(p, st.subst) & reach):
+            raise RefError(f"stranded demand for field {p.label}")
+        key = type_key(TTuple([TLabel(p.label), substitute(p.receiver, st.subst),
+                               substitute(p.result, st.subst)]))
+        if key not in seen:
+            seen.add(key)
+            mine.append(p)
+
+    st.preds = [p for p in st.preds if p not in travelling]
+    preds = [p.to_pred(st.subst) for p in mine]
+    # A demand may mention a variable the body does not, so quantify over both.
+    for p in preds:
+        for v in vars_of(*p.args):
+            if v.id not in held and all(q.id != v.id for q in quantified):
+                quantified.append(v)
+    return Scheme(quantified, body, preds)
 
 
-def instantiate(scheme: Scheme) -> Type:
+def instantiate(scheme: Scheme, st: State) -> Type:
+    """Instantiate at a use site, re-emitting the scheme's demands."""
     if not scheme.quantified:
+        for p in scheme.preds:
+            st.preds.append(_as_ref_pred(p))
         return scheme.body
     mapping: Subst = {v.id: TVar(0) for v in scheme.quantified}
+    for p in scheme.preds:
+        st.preds.append(_as_ref_pred(Pred(p.name, [substitute(a, mapping) for a in p.args])))
     return substitute(scheme.body, mapping)
+
+
+def _as_ref_pred(p: Pred) -> RefPred:
+    label, receiver, result = p.args
+    assert isinstance(label, TLabel)
+    return RefPred(label.name, receiver, result)
 
 
 def nonexpansive(e: ast.Expr) -> bool:
@@ -157,7 +297,7 @@ def nonexpansive(e: ast.Expr) -> bool:
 # ---------------------------------------------------------------- inference
 
 
-def infer(e: ast.Expr, env: Env, s: Subst) -> Type:
+def infer(e: ast.Expr, env: Env, st: State) -> Type:
     if isinstance(e, ast.ELit):
         return LITERALS[e.kind]
 
@@ -167,7 +307,24 @@ def infer(e: ast.Expr, env: Env, s: Subst) -> Type:
     if isinstance(e, ast.EVar):
         if e.name not in env:
             raise RefError(f"unbound {e.name}")
-        return instantiate(env[e.name])
+        return instantiate(env[e.name], st)
+
+    if isinstance(e, ast.EField):
+        receiver = infer(e.obj, env, st)
+        result = TVar(0)
+        st.preds.append(RefPred(e.name, receiver, result))
+        return result
+
+    if isinstance(e, ast.ERecord):
+        fields = st.records.get(e.con)
+        if fields is None:
+            raise Unsupported(f"record {e.con}")
+        given = [label for label, _ in e.fields]
+        if sorted(given) != sorted(fields):
+            raise RefError(f"wrong fields for {e.con}")
+        for label, value in e.fields:
+            unify(fields[label], infer(value, env, st), st.subst)
+        return TCon(e.con)
 
     if isinstance(e, ast.ELambda):
         if e.ret is not None:
@@ -180,51 +337,51 @@ def infer(e: ast.Expr, env: Env, s: Subst) -> Type:
             tv = TVar(0)
             params.append(tv)
             scope[p.name] = Scheme([], tv)
-        return TFun(params, infer(e.body, scope, s))
+        return TFun(params, infer(e.body, scope, st))
 
     if isinstance(e, ast.ECall):
-        fn = infer(e.fn, env, s)
-        args = [infer(a, env, s) for a in e.args]
+        fn = infer(e.fn, env, st)
+        args = [infer(a, env, st) for a in e.args]
         result = TVar(0)
-        unify(fn, TFun(args, result), s)
+        unify(fn, TFun(args, result), st.subst)
         return result
 
     if isinstance(e, ast.ETuple):
-        return TTuple([infer(x, env, s) for x in e.elems])
+        return TTuple([infer(x, env, st) for x in e.elems])
 
     if isinstance(e, ast.EBlock):
         scope = dict(env)
         result: Type = TCon("Unit")
         for stmt in e.stmts:
-            result = infer_stmt(stmt, scope, s)
+            result = infer_stmt(stmt, scope, st)
         return result
 
     raise Unsupported(type(e).__name__)
 
 
-def infer_stmt(stmt: ast.Stmt, env: Env, s: Subst) -> Type:
+def infer_stmt(stmt: ast.Stmt, env: Env, st: State) -> Type:
     """Infer a statement in `env`, which it may extend. Returns its value."""
     if isinstance(stmt, ast.SExpr):
-        return infer(stmt.expr, env, s)
+        return infer(stmt.expr, env, st)
 
     if isinstance(stmt, ast.SLet):
         if not isinstance(stmt.pat, ast.PVar):
             raise Unsupported("destructuring let")
-        value = infer(stmt.value, env, s)
+        value = infer(stmt.value, env, st)
         env[stmt.pat.name] = (
-            generalize(value, env, s) if nonexpansive(stmt.value)
-            else Scheme([], substitute(value, s))
+            generalize(value, env, st) if nonexpansive(stmt.value)
+            else Scheme([], substitute(value, st.subst))
         )
         return TCon("Unit")
 
     if isinstance(stmt, ast.SFun):
-        infer_fun(stmt.decl, env, s)
+        infer_fun(stmt.decl, env, st)
         return TCon("Unit")
 
     raise Unsupported(type(stmt).__name__)
 
 
-def infer_fun(decl: ast.FunDecl, env: Env, s: Subst) -> None:
+def infer_fun(decl: ast.FunDecl, env: Env, st: State) -> None:
     """A `fun` binds monomorphically while its own body is checked, then
     generalizes -- so it may recurse, but only at one type."""
     if decl.ret is not None:
@@ -241,11 +398,34 @@ def infer_fun(decl: ast.FunDecl, env: Env, s: Subst) -> None:
         params.append(tv)
         scope[p.name] = Scheme([], tv)
 
-    body = infer(decl.body, scope, s)
-    unify(placeholder, TFun(params, body), s)
+    body = infer(decl.body, scope, st)
+    unify(placeholder, TFun(params, body), st.subst)
     # `fun` is syntactically a value, so the value restriction never applies.
     outer = {k: v for k, v in env.items() if k != decl.name}
-    env[decl.name] = generalize(placeholder, outer, s)
+    env[decl.name] = generalize(placeholder, outer, st)
+
+
+def _record_table(decls: list[ast.TypeDecl]) -> dict[str, dict[str, Type]]:
+    """Monomorphic single-variant record declarations, and nothing else.
+
+    Anything with parameters or several variants is outside the fragment: it
+    would drag in constructor schemes and pattern matching, neither of which
+    this module is trying to cross-check.
+    """
+    table: dict[str, dict[str, Type]] = {}
+    for d in decls:
+        if d.is_alias or d.params or len(d.variants or []) != 1:
+            raise Unsupported("type declaration")
+        con = d.variants[0]
+        if not con.is_record or con.name != d.name:
+            raise Unsupported("type declaration")
+        fields = {}
+        for label, te in con.fields:
+            if not isinstance(te, ast.TECon) or te.args or te.name not in LITERALS:
+                raise Unsupported("field type")
+            fields[label] = LITERALS[te.name]
+        table[d.name] = fields
+    return table
 
 
 def check(src: str) -> list[tuple[str, Scheme]]:
@@ -258,14 +438,16 @@ def check(src: str) -> list[tuple[str, Scheme]]:
     program = parse(src)
     if program.header is not None or program.imports:
         raise Unsupported("module syntax")
-    if any(isinstance(d, ast.TypeDecl) for d in program.decls):
-        raise Unsupported("type declaration")
 
+    st = State(records=_record_table(
+        [d for d in program.decls if isinstance(d, ast.TypeDecl)]
+    ))
     env: Env = {}
-    s: Subst = {}
     names: list[str] = []
     for item in program.decls:
-        infer_stmt(item, env, s)
+        if isinstance(item, ast.TypeDecl):
+            continue
+        infer_stmt(item, env, st)
         if isinstance(item, ast.SFun):
             names.append(item.decl.name)
         elif isinstance(item, ast.SLet) and isinstance(item.pat, ast.PVar):
@@ -273,10 +455,16 @@ def check(src: str) -> list[tuple[str, Scheme]]:
         else:
             raise Unsupported(type(item).__name__)
 
+    settle(st)
+    if st.preds:
+        raise RefError(f"unsettled demand for field {st.preds[0].label}")
+
     # Re-generalize at the end: a later binding may have constrained an earlier
     # one, and the printed signature has to show that.
     return [(n, Scheme(
-        [v for v in vars_of(substitute(env[n].body, s))
+        [v for v in vars_of(substitute(env[n].body, st.subst),
+                            *[a for p in env[n].preds for a in p.args])
          if v.id in {q.id for q in env[n].quantified}],
-        substitute(env[n].body, s),
+        substitute(env[n].body, st.subst),
+        [Pred(p.name, [substitute(a, st.subst) for a in p.args]) for p in env[n].preds],
     )) for n in names]

@@ -22,7 +22,24 @@ from turkey.driver import check as real_check
 from turkey.errors import ParseError, TypeError_, Unsupported
 from turkey.types import show_scheme
 
+SEEDS = range(600)
+
 LITERALS = ["1", "2", "-3", '"s"', "true", "'c'"]
+
+# Two record types sharing a field, so that a function reading `.a` is
+# genuinely polymorphic in its receiver rather than pinned by the only
+# declaration in scope. `HasField` demands over these are the second
+# constraint form, and the one whose generalization rule this test exists to
+# check.
+PRELUDE = """type R = R { a : Int, b : String }
+type Q = Q { a : Int, c : Bool }
+"""
+
+RECORDS = {"R": [("a", "1"), ("b", '"s"')], "Q": [("a", "2"), ("c", "true")]}
+# Weighted: `a` is on both records, so it is the one that produces a demand a
+# scheme can actually carry; `d` is on neither, and is here to make sure the
+# unsatisfiable case is generated too.
+FIELDS = ["a", "a", "a", "a", "b", "c", "d"]
 
 
 def gen_expr(rng: random.Random, scope: list[str], depth: int) -> str:
@@ -30,7 +47,7 @@ def gen_expr(rng: random.Random, scope: list[str], depth: int) -> str:
     if scope:
         kinds += ["var", "var"]
     if depth > 0:
-        kinds += ["lambda", "call", "tuple", "apply_var"]
+        kinds += ["lambda", "call", "tuple", "apply_var", "field", "record"]
 
     kind = rng.choice(kinds)
 
@@ -54,6 +71,22 @@ def gen_expr(rng: random.Random, scope: list[str], depth: int) -> str:
         body = gen_expr(rng, scope + params, depth - 1)
         args = ", ".join(gen_expr(rng, scope, depth - 1) for _ in range(n))
         return f"(fun({', '.join(params)}) = {body})({args})"
+
+    if kind == "field":
+        # Half the time the receiver is a bare name, which is the shape that
+        # leaves a demand to generalize rather than one to discharge on the
+        # spot.
+        obj = (rng.choice(scope) if scope and rng.random() < 0.5
+               else f"({gen_expr(rng, scope, depth - 1)})")
+        return f"{obj}.{rng.choice(FIELDS)}"
+
+    if kind == "record":
+        con = rng.choice(sorted(RECORDS))
+        assignments = ", ".join(
+            f"{label} = {gen_expr(rng, scope, depth - 1) if rng.random() < 0.5 else default}"
+            for label, default in RECORDS[con]
+        )
+        return f"{con} {{ {assignments} }}"
 
     if kind == "apply_var":
         # Applying a name of unknown type is where the interesting failures and
@@ -80,7 +113,7 @@ def gen_program(rng: random.Random, items: int) -> str:
             body = gen_expr(rng, scope + params, 2)
             lines.append(f"fun {name}({', '.join(params)}) = {body}")
         scope.append(name)
-    return "\n".join(lines) + "\n"
+    return PRELUDE + "\n".join(lines) + "\n"
 
 
 def signatures(pairs) -> list[tuple[str, str]]:
@@ -101,7 +134,7 @@ def _real(src):
         return None
 
 
-@pytest.mark.parametrize("seed", range(400))
+@pytest.mark.parametrize("seed", SEEDS)
 def test_levels_agree_with_scanning_the_environment(seed: int) -> None:
     rng = random.Random(seed)
     src = gen_program(rng, rng.randint(1, 4))
@@ -132,17 +165,24 @@ def test_the_generator_produces_programs_that_typecheck() -> None:
     """
     accepted = 0
     considered = 0
-    for seed in range(400):
+    qualified = 0
+    for seed in SEEDS:
         rng = random.Random(seed)
         src = gen_program(rng, rng.randint(1, 4))
         try:
-            if _reference(src) is None:
-                considered += 1
-                continue
+            result = _reference(src)
         except (reference.Unsupported, ParseError, Unsupported):
             continue
         considered += 1
+        if result is None:
+            continue
         accepted += 1
+        qualified += any("HasField" in rendered for _, rendered in result)
 
     assert considered >= 200, f"only {considered} programs reached the comparison"
     assert accepted >= 50, f"only {accepted} of {considered} programs typechecked"
+    # The second constraint form has to be exercised too, and specifically the
+    # case where a demand survives generalization rather than being discharged
+    # where it was written -- that is the rule the two checkers implement
+    # differently, and so the only one this test can catch a bug in.
+    assert qualified >= 20, f"only {qualified} accepted programs carried a context"

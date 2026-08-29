@@ -79,22 +79,53 @@ the two-token sequence `"[" "]"` with no elements between.
 These resolve places where §4.5 and other sections state a rule without an
 algorithm, or where the project owner chose one reading over another.
 
-### 7. Field access requires a known receiver type
+### 7. Field access is a `HasField` predicate
 
 §4.5 says `r.f` is well-typed only when the static type of `r` is a
 single-variant record or `Array a`, and decision 27 (§11) calls field access
 "type-directed". Under ordinary Hindley-Milner inference, though, the
 expression `r.f` is typically visited before `r`'s type is fully resolved
 (`r` may still be an unbound unification variable at that point), so
-"type-directed" does not by itself say what to do. The implementation:
-at `r.f`, prune `typeof(r)` through the current substitution; if it resolves
-to a concrete single-variant record type (or to `Array`, for the built-in
-`.length`/`.capacity` fields) the field resolves against that type, otherwise
-it is a compile error asking the author to add a type annotation. Field
-names need **not** be globally unique — the field's own name is not enough to
-resolve it without a known receiver type. Documented consequence: inference
-is order-sensitive, and some programs a row-polymorphic field system would
-accept need an explicit annotation here.
+"type-directed" does not by itself say what to do.
+
+This entry originally recorded the obvious answer -- prune `typeof(r)` through
+the substitution and demand a concrete record type on the spot -- along with
+its documented consequence, that inference became order-sensitive:
+
+```
+fun f(a) { let n = a.length   let x = a[0]   n + x }   -- rejected
+fun f(a) { let x = a[0]       let n = a.length   n + x }   -- accepted
+```
+
+**That is no longer the implementation.** `r.f` now emits the qualified-type
+predicate `HasField "f" typeof(r) a` and decides nothing; the solver settles it
+whenever the receiver becomes known, which may be long after the access was
+visited. Both orderings above are accepted, and a predicate that is still
+unresolved when its binding generalizes travels in the scheme:
+
+```
+fun get(r) = r.n        -- get : [HasField "n" a b] fun(a) -> b
+```
+
+so a function may be polymorphic in the record it reads from. `HasField` is
+the `r \ l` predicate of Gaster & Jones, *A Polymorphic Type System for
+Extensible Records and Variants* (NOTTCS-TR-96-3, 1996), taken without the
+rows: records stay nominal, so entailment is a declaration lookup. It is a
+built-in predicate, not a class -- there is no way to write an instance of it.
+
+Two consequences worth stating. A function like `bf.tl`'s `inc` becomes
+structurally polymorphic over any record carrying the fields it reads, in a
+language whose records are otherwise nominal. And field names still need not
+be globally unique: the receiver, not the field name, is what resolves the
+access -- it is simply allowed to arrive later. What remains an error is a
+demand that no scheme can carry, because nothing else mentions its receiver:
+
+```
+fun main() {
+    var box = []
+    print(Int.toString(box[0].n))   -- add a type annotation
+}
+```
 
 ### 8. Array bounds are checked against `length`, not `capacity`
 

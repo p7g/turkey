@@ -22,13 +22,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from . import ast
+from .constraints import Solver
 from .decls import DeclTable
 from .deps import free_names, pattern_vars, sccs
 from .errors import Span, TypeError_
-from .constraints import Solver
 from .types import (
     BOOL, BOTTOM, CHAR, FLOAT, INT, STRING, UNIT, Scheme, TCon, TFun, TTuple,
-    TVar, Type, generalize, instantiate, mono, prune, show,
+    TVar, Type, generalize, instantiate, lower_to, mono, prune, show,
 )
 
 LITERAL_TYPES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR, "Bool": BOOL}
@@ -335,6 +335,12 @@ class Inferencer:
             self.level -= 1
             # Section 4.4: only a `let` bound to a syntactic value generalizes.
             gen = is_let and self.is_nonexpansive(stmt.value)
+            if not gen:
+                # The right-hand side was inferred one level in, so its
+                # variables are still marked deeper than this binding. Bring
+                # them back down or the next binding to mention them will
+                # generalize what the value restriction just refused to.
+                lower_to(value, self.level)
             self.bind_pattern(stmt.pat, value, mutable=not is_let, gen=gen)
             return UNIT
 

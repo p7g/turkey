@@ -326,6 +326,27 @@ def instantiate_qual(scheme: Scheme, level: int) -> tuple[list[Pred], Type]:
     return preds, walk(scheme.body)
 
 
+def lower_to(t: Type, level: int) -> None:
+    """Cap every variable in `t` at `level`.
+
+    The companion to levels-based generalization, and easy to forget. A binding
+    that is *not* generalized still had its right-hand side inferred one level
+    in, so its variables are marked deeper than the binding itself. Left that
+    way they look generalizable to the next binding that asks, which launders a
+    monomorphic type into a polymorphic one:
+
+        let cell = Array.new(4)   -- Array _a, correctly not generalized
+        fun get() = cell          -- fun() -> Array a, wrongly generalized
+
+    and `get()` then yields a fresh element type on every call while there is
+    only ever one array. Unification lowers levels this way already
+    (`occurs_and_adjust`); this is the same adjustment where no unification
+    happens to be taking place.
+    """
+    for v in vars_of(t):
+        v.level = min(v.level, level)
+
+
 def vars_of(*types: Type) -> list[TVar]:
     """The unbound variables reachable from `types`, first occurrence first."""
     seen: dict[int, TVar] = {}

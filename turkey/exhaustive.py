@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from . import ast
 from .decls import DeclTable
-from .types import TCon, TTuple, Type, prune, unify
+from .types import TCon, TTuple, TVar, Type, prune, unify
 
 # A pattern is one of:
 #   ("wild",)
@@ -96,7 +96,10 @@ class Checker:
             return list(prune(t).elems)
         if key[0] == "lit":
             return []
-        con = self.decls.instantiate_con(key[1], 1, None)
+        # Exhaustiveness runs after solving, so these variables belong to no
+        # pool: they exist only to carry the constructor's field types into the
+        # unification below, and are discarded with it.
+        con = self.decls.instantiate_con(key[1], lambda: TVar(0), None)
         # The pattern already type-checked, so this only propagates the
         # scrutinee's arguments into the constructor's field types.
         unify(con.ret, t)

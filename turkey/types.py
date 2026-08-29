@@ -1,10 +1,12 @@
 """Semantic types and unification (design.md section 4).
 
-Inference uses Algorithm J: type variables are mutable cells, so unification
-updates types in place and there is no substitution to thread around. Each
-variable carries a `level` (Remy's trick) recording the binder depth at which it
-was created, which is what makes generalization a cheap comparison rather than a
-scan of the whole environment.
+Unification is Algorithm J's: type variables are mutable cells, so it updates
+types in place and there is no substitution to thread around. Each variable
+carries a `level` -- its rank, in Remy's sense -- recording the binder depth it
+was created under, which makes generalization a cheap comparison rather than a
+scan of the whole environment. Ranks are assigned by the solver as it descends
+(`turkey/constraints.py`), never by the code that builds the types; nothing
+here decides what a variable's rank should be.
 
 The one departure from textbook Hindley-Milner is the bottom type. Section 4.3
 says bottom is absorbed by whatever it meets, so unification treats it as a
@@ -13,6 +15,7 @@ no-op. That is not enough on its own -- see `join`.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from itertools import count
 
 from .errors import Span, TypeError_
@@ -20,6 +23,12 @@ from .errors import Span, TypeError_
 
 class Type:
     pass
+
+
+# A source of fresh unification variables. Whoever hands one of these out is
+# also responsible for recording the variables it makes, so that generalization
+# can later find them.
+Fresh = Callable[[], "TVar"]
 
 
 class TVar(Type):
@@ -326,13 +335,19 @@ def generalize(t: Type, level: int, preds: list[Pred] | None = None) -> Scheme:
     return Scheme(quantified, t, list(preds or []))
 
 
-def instantiate(scheme: Scheme, level: int) -> Type:
+def instantiate(scheme: Scheme, fresh: Fresh) -> Type:
     """Replace the scheme's quantified variables with fresh ones."""
-    return instantiate_qual(scheme, level)[1]
+    return instantiate_qual(scheme, fresh)[1]
 
 
-def instantiate_qual(scheme: Scheme, level: int) -> tuple[list[Pred], Type]:
+def instantiate_qual(scheme: Scheme, fresh: Fresh) -> tuple[list[Pred], Type]:
     """Instantiate a scheme, returning its context alongside its type.
+
+    `fresh` is supplied by the caller rather than a rank being passed in,
+    because a new variable has to be registered wherever its owner tracks them
+    -- the solver's pool for the current rank, or the enclosing existential
+    while a constraint is still being generated. Handing out `TVar(rank)` here
+    would create a variable nothing is keeping track of.
 
     The context has to be renamed by the same substitution as the body, or its
     predicates would constrain the scheme's original variables rather than this
@@ -340,7 +355,7 @@ def instantiate_qual(scheme: Scheme, level: int) -> tuple[list[Pred], Type]:
     """
     if not scheme.quantified:
         return list(scheme.preds), scheme.body
-    mapping = {v.id: TVar(level) for v in scheme.quantified}
+    mapping = {v.id: fresh() for v in scheme.quantified}
 
     def walk(ty: Type) -> Type:
         ty = prune(ty)
@@ -356,27 +371,6 @@ def instantiate_qual(scheme: Scheme, level: int) -> tuple[list[Pred], Type]:
 
     preds = [Pred(p.name, [walk(a) for a in p.args]) for p in scheme.preds]
     return preds, walk(scheme.body)
-
-
-def lower_to(t: Type, level: int) -> None:
-    """Cap every variable in `t` at `level`.
-
-    The companion to levels-based generalization, and easy to forget. A binding
-    that is *not* generalized still had its right-hand side inferred one level
-    in, so its variables are marked deeper than the binding itself. Left that
-    way they look generalizable to the next binding that asks, which launders a
-    monomorphic type into a polymorphic one:
-
-        let cell = Array.new(4)   -- Array _a, correctly not generalized
-        fun get() = cell          -- fun() -> Array a, wrongly generalized
-
-    and `get()` then yields a fresh element type on every call while there is
-    only ever one array. Unification lowers levels this way already
-    (`occurs_and_adjust`); this is the same adjustment where no unification
-    happens to be taking place.
-    """
-    for v in vars_of(t):
-        v.level = min(v.level, level)
 
 
 def type_key(t: Type) -> tuple:

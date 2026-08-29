@@ -1,10 +1,14 @@
-"""Differential test: Algorithm J against a naive reference checker.
+"""Differential test: rank-based generalization against a naive reference.
 
 `tests/reference.py` computes types the obvious way -- an explicit substitution
 and generalization by scanning the environment. The real inferencer uses Remy
-levels instead, which is an optimization of exactly that scan. If the two ever
-disagree the level bookkeeping is wrong, which is the failure mode that would
+ranks instead, which is an optimization of exactly that scan. If the two ever
+disagree the rank bookkeeping is wrong, which is the failure mode that would
 otherwise show up as a program wrongly accepted rather than as a crash.
+
+This is the *only* property the two are meant to establish independently.
+Everything else the solver does is shared rather than reimplemented, since a
+second copy of a rule with no independent specification proves nothing.
 
 Programs are generated from a seeded RNG rather than a property-testing
 library, so the suite keeps its zero-dependency stance and every failure names

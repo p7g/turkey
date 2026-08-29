@@ -7,11 +7,12 @@ from dataclasses import dataclass
 
 from . import ast
 from .builtins import initial_type_env, initial_values
+from .constraints import Env, Solver
 from .decls import DeclTable
 from .deps import pattern_vars
 from .errors import Unsupported
 from .eval import Evaluator
-from .infer import Env, Inferencer
+from .infer import Generator
 from .parser import parse
 from .types import Scheme
 
@@ -40,8 +41,14 @@ def check(src: str) -> Checked:
 
     decls = DeclTable()
     env = initial_type_env().child()
-    inferencer = Inferencer(decls, env)
-    ordered = inferencer.check_program(program)
+
+    # Generation builds the whole program's constraint and decides nothing;
+    # solving is what assigns ranks, generalizes and fills in `env`. Splitting
+    # them this way is the point of the HM(X) shape -- see constraints.py.
+    generator = Generator(decls, env)
+    ordered, constraint = generator.generate(program)
+    Solver(decls, env).run(constraint)
+    generator.check_exhaustiveness()
 
     signatures = []
     for item in program.decls:
@@ -53,7 +60,7 @@ def check(src: str) -> Checked:
             if binding is not None:
                 signatures.append((name, binding.scheme))
 
-    return Checked(program, ordered, decls, env, signatures, inferencer.warnings)
+    return Checked(program, ordered, decls, env, signatures, generator.warnings)
 
 
 def run(src: str, filename: str = "<input>") -> None:

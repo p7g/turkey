@@ -88,8 +88,9 @@ def test_generalize_only_quantifies_deeper_variables():
 def test_instantiate_yields_fresh_independent_variables():
     v = TVar(2)
     scheme = Scheme([v], v)
-    i1 = instantiate(scheme, 1)
-    i2 = instantiate(scheme, 1)
+    fresh = lambda: TVar(1)  # noqa: E731 -- the factory the solver would supply
+    i1 = instantiate(scheme, fresh)
+    i2 = instantiate(scheme, fresh)
     assert i1 is not i2
 
     unify(i1, INT)

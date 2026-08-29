@@ -13,7 +13,8 @@ from dataclasses import dataclass, field
 from . import ast
 from .errors import Span, TypeError_
 from .types import (
-    PRIMITIVES, Scheme, TCon, TFun, TTuple, TVar, Type, generalize, instantiate,
+    PRIMITIVES, Fresh, Scheme, TCon, TFun, TTuple, TVar, Type, generalize,
+    instantiate,
 )
 
 
@@ -113,7 +114,7 @@ class DeclTable:
 
     # -- translation -------------------------------------------------------
 
-    def to_type(self, te: ast.TypeExpr, tyvars: dict[str, TVar], level: int) -> Type:
+    def to_type(self, te: ast.TypeExpr, tyvars: dict[str, TVar], fresh: Fresh) -> Type:
         """Translate type syntax into a semantic type.
 
         `tyvars` maps annotation type variable names to unification variables and
@@ -122,23 +123,23 @@ class DeclTable:
         """
         if isinstance(te, ast.TEVar):
             if te.name not in tyvars:
-                tyvars[te.name] = TVar(level)
+                tyvars[te.name] = fresh()
             return tyvars[te.name]
 
         if isinstance(te, ast.TETuple):
-            return TTuple([self.to_type(e, tyvars, level) for e in te.elems])
+            return TTuple([self.to_type(e, tyvars, fresh) for e in te.elems])
 
         if isinstance(te, ast.TEFun):
             return TFun(
-                [self.to_type(p, tyvars, level) for p in te.params],
-                self.to_type(te.ret, tyvars, level),
+                [self.to_type(p, tyvars, fresh) for p in te.params],
+                self.to_type(te.ret, tyvars, fresh),
             )
 
         assert isinstance(te, ast.TECon)
         info = self.tycons.get(te.name)
         if info is None:
             raise TypeError_(f"unknown type '{te.name}'", te.span)
-        args = [self.to_type(a, tyvars, level) for a in te.args]
+        args = [self.to_type(a, tyvars, fresh) for a in te.args]
         if len(args) != len(info.params):
             raise TypeError_(
                 f"type '{te.name}' expects {len(info.params)} argument(s), "
@@ -148,26 +149,26 @@ class DeclTable:
         if info.is_alias:
             # Aliases are transparent: expand rather than build a TCon.
             substitution = dict(zip(info.params, args))
-            return self._expand_alias(info, substitution, level, te.span)
+            return self._expand_alias(info, substitution, fresh, te.span)
         return TCon(te.name, args)
 
     def _expand_alias(
-        self, info: TyconInfo, substitution: dict[str, Type], level: int, span: Span
+        self, info: TyconInfo, substitution: dict[str, Type], fresh: Fresh, span: Span
     ) -> Type:
         # The alias body's own parameter names are bound to the supplied
         # arguments; anything else in it is a fresh variable.
         local: dict[str, TVar] = {}
-        body = self.to_type(info.alias_body, local, level)
+        body = self.to_type(info.alias_body, local, fresh)
         return _substitute(body, {v.id: substitution[k] for k, v in local.items()
                                   if k in substitution})
 
     # -- constructor helpers -----------------------------------------------
 
-    def instantiate_con(self, name: str, level: int, span: Span) -> TFun:
+    def instantiate_con(self, name: str, fresh: Fresh, span: Span) -> TFun:
         info = self.constructors.get(name)
         if info is None:
             raise TypeError_(f"unknown constructor '{name}'", span)
-        return instantiate(info.scheme, level)  # always a TFun
+        return instantiate(info.scheme, fresh)  # always a TFun
 
     def con(self, name: str) -> ConInfo | None:
         return self.constructors.get(name)

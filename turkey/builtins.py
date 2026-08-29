@@ -11,7 +11,7 @@ from __future__ import annotations
 import sys
 
 from .errors import TurkeyPanic
-from .infer import Binding, Env
+from .constraints import Binding, Env
 from .types import (
     BOOL, CHAR, FLOAT, INT, STRING, UNIT, TCon, TFun, TVar, generalize, mono,
 )

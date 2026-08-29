@@ -76,7 +76,8 @@ main : fun() -> Unit
 | `turkey/types.py` | Semantic types, unification, the bottom type, generalization |
 | `turkey/decls.py` | Type and constructor declarations; alias expansion |
 | `turkey/deps.py` | Free variables and Tarjan SCC, for §5.2's grouped inference |
-| `turkey/infer.py` | Algorithm J, the value restriction, control-flow typing |
+| `turkey/infer.py` | Constraint generation: the value restriction, control-flow typing |
+| `turkey/constraints.py` | The constraint language and its solver; ranks, predicates |
 | `turkey/exhaustive.py` | Maranget's usefulness algorithm, for match warnings |
 | `turkey/values.py` | Runtime values; array length/capacity semantics |
 | `turkey/eval.py` | Tree-walking evaluator |

@@ -1,17 +1,17 @@
 """A deliberately naive reference type checker, for differential testing.
 
-The real inferencer is Algorithm J: type variables are mutable cells and
-generalization is a level comparison (Remy's trick). That is fast, but the
-level bookkeeping is exactly the kind of thing that goes subtly wrong -- a
-variable whose level is not lowered when it should be gets generalized when it
-should not, and the result is a program that wrongly typechecks rather than one
-that crashes.
+The real inferencer generalizes by *rank*: variables are pooled by the binder
+depth they were created under, and leaving a binder is a walk over the pool
+born there (Remy's trick). That is fast, but the bookkeeping is exactly the
+kind of thing that goes subtly wrong -- a variable that is not lowered into the
+parent pool when it should be gets generalized when it should not, and the
+result is a program that wrongly typechecks rather than one that crashes.
 
 So this module computes the same answer the slow, obvious way: an explicit
 substitution that is threaded rather than written into the types, and
 generalization by *scanning the environment* for free variables instead of
-comparing levels. `fv(env)` is the definition levels are an optimization of, so
-if the two disagree the level bookkeeping is wrong.
+scanning it. `fv(env)` is the definition ranks are an optimization of, so if
+the two disagree the rank bookkeeping is wrong.
 
 It also carries the `HasField` predicate, the second constraint form in the
 domain, and settles it the same obvious way: a flat list retried until nothing
@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 
 from turkey import ast
 from turkey.parser import parse
+from turkey.constraints import CPred, reach
 from turkey.types import (
     BOOL, CHAR, FLOAT, INT, STRING, Pred, Scheme, TCon, TFun, TLabel, TTuple,
     TVar, Type, type_key, vars_of,
@@ -236,20 +237,21 @@ def generalize(t: Type, env: Env, st: State) -> Scheme:
     quantified = [v for v in vars_of(body) if v.id not in held]
 
     travelling = [p for p in st.preds if not (pred_vars(p, st.subst) & held)]
-    reach = {v.id for v in quantified}
-    changed = True
-    while changed:
-        changed = False
-        for p in travelling:
-            vs = pred_vars(p, st.subst)
-            if vs & reach and not vs <= reach:
-                reach |= vs
-                changed = True
+
+    # Attribution is *shared* with the real solver rather than reimplemented.
+    # This module exists to check one thing -- generalization by scanning the
+    # environment against generalization by rank -- and a second copy of a rule
+    # with no independent specification would only confirm that the same thing
+    # was typed twice. The transitive closure is the subtle part, so it is
+    # imported; `improve` and the declaration lookup below stay local because
+    # they are four lines each and reimplementing them costs less than the
+    # indirection would.
+    reachable = reach([CPred(p.to_pred(st.subst)) for p in travelling], [body])
 
     mine: list[RefPred] = []
     seen: set[tuple] = set()
     for p in travelling:
-        if not (pred_vars(p, st.subst) & reach):
+        if not (pred_vars(p, st.subst) & reachable):
             raise RefError(f"stranded demand for field {p.label}")
         key = type_key(TTuple([TLabel(p.label), substitute(p.receiver, st.subst),
                                substitute(p.result, st.subst)]))

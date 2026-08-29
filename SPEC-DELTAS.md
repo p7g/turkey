@@ -110,7 +110,11 @@ fun get(r) = r.n        -- get : [HasField "n" a b] fun(a) -> b
 so a function may be polymorphic in the record it reads from. `HasField` is
 the `r \ l` predicate of Gaster & Jones, *A Polymorphic Type System for
 Extensible Records and Variants* (NOTTCS-TR-96-3, 1996), taken without the
-rows: records stay nominal, so entailment is a declaration lookup. It is a
+rows: records stay nominal, so entailment is a declaration lookup. In that
+three-argument shape it is GHC's `HasField x r a | x r -> a` (Gundry's
+`OverloadedRecordFields`, in `GHC.Records` since 8.2), and the solver's
+`improve` rule is that functional dependency -- see `constraints.py` for why
+dropping the rows is what makes the rule necessary rather than free. It is a
 built-in predicate, not a class -- there is no way to write an instance of it.
 
 Two consequences worth stating. A function like `bf.tl`'s `inc` becomes
@@ -393,3 +397,26 @@ Consequences:
 The cost, acknowledged: `type Option a = None | Some(a)` puts both notations on
 one line, which needs the explanation above rather than being self-evident.
 
+### 26. Scope errors are reported before type errors
+
+Inference is HM(X): generation walks the AST and builds a constraint, and a
+separate solver settles it. Some failures are found while *generating* -- an
+undefined name, an unknown constructor, a field a record literal does not
+declare, a write to a `let` binding -- and the rest while *solving*.
+
+Because generation now finishes before solving begins, a program containing
+both kinds reports the generation one first, even when the type error comes
+earlier in the source:
+
+```
+fun main() {
+    let a : Int = "wrong"       -- line 2: a type error
+    let b = Nope { n = 1 }      -- line 3: an unknown constructor
+}
+```
+
+reports line 3. Previously, when generation and solving were interleaved, it
+reported line 2. Compilation stops at the first error either way, so this only
+changes *which* of several errors is shown, and the resulting order -- names
+and declarations first, types second -- is the conventional one. Within each
+kind, source order is preserved.

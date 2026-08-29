@@ -25,9 +25,10 @@ from . import ast
 from .decls import DeclTable
 from .deps import free_names, pattern_vars, sccs
 from .errors import Span, TypeError_
+from .constraints import Solver
 from .types import (
     BOOL, BOTTOM, CHAR, FLOAT, INT, STRING, UNIT, Scheme, TCon, TFun, TTuple,
-    TVar, Type, generalize, instantiate, join, mono, prune, show, unify,
+    TVar, Type, generalize, instantiate, mono, prune, show,
 )
 
 LITERAL_TYPES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR, "Bool": BOOL}
@@ -84,6 +85,7 @@ class Inferencer:
     def __init__(self, decls: DeclTable, env: Env):
         self.decls = decls
         self.env = env
+        self.solver = Solver()
         self.level = 0
         self.fn_stack: list[Type] = []
         self.loop_stack: list[LoopCtx] = []
@@ -211,7 +213,7 @@ class Inferencer:
             placeholders[decl.name] = tv
             self.env.define(decl.name, Binding(mono(tv), False))
         for decl in decls:
-            unify(placeholders[decl.name], self.infer_function(decl), decl.span)
+            self.solver.eq(placeholders[decl.name], self.infer_function(decl), decl.span)
         self.level -= 1
         for decl in decls:
             # A `fun` is syntactically a value, so the value restriction never
@@ -233,7 +235,7 @@ class Inferencer:
 
             ret = self.fresh()
             if decl.ret is not None:
-                unify(ret, self.type_of(decl.ret), decl.span, "the return type annotation")
+                self.solver.eq(ret, self.type_of(decl.ret), decl.span, "the return type annotation")
 
             self.fn_stack.append(ret)
             loops, self.loop_stack = self.loop_stack, []  # `break` cannot cross a function
@@ -242,7 +244,7 @@ class Inferencer:
             self.fn_stack.pop()
 
             # A body of type bottom leaves `ret` to be fixed by the `return`s.
-            unify(ret, body, decl.span, "the function body")
+            self.solver.eq(ret, body, decl.span, "the function body")
         self.tyvar_scopes.pop()
         return TFun(param_types, ret)
 
@@ -260,14 +262,14 @@ class Inferencer:
         if isinstance(pat, ast.PVar):
             return {pat.name: t}
         if isinstance(pat, ast.PLit):
-            unify(t, LITERAL_TYPES[pat.kind], pat.span, "a literal pattern")
+            self.solver.eq(t, LITERAL_TYPES[pat.kind], pat.span, "a literal pattern")
             return {}
         if isinstance(pat, ast.PAnnot):
-            unify(t, self.type_of(pat.type_expr), pat.span, "a pattern annotation")
+            self.solver.eq(t, self.type_of(pat.type_expr), pat.span, "a pattern annotation")
             return self.match_pattern(pat.pat, t)
         if isinstance(pat, ast.PTuple):
             elems = [self.fresh() for _ in pat.elems]
-            unify(t, TTuple(elems), pat.span, "a tuple pattern")
+            self.solver.eq(t, TTuple(elems), pat.span, "a tuple pattern")
             out: dict[str, Type] = {}
             for sub, ty in zip(pat.elems, elems):
                 self._merge(out, self.match_pattern(sub, ty), pat.span)
@@ -287,7 +289,7 @@ class Inferencer:
                     f"'{pat.name} {{ ... }}'",
                     pat.span,
                 )
-            unify(t, con.ret, pat.span, f"the pattern '{pat.name}'")
+            self.solver.eq(t, con.ret, pat.span, f"the pattern '{pat.name}'")
             out = {}
             for sub, ty in zip(pat.args, con.params):
                 self._merge(out, self.match_pattern(sub, ty), pat.span)
@@ -300,7 +302,7 @@ class Inferencer:
                     f"constructor '{pat.name}' has positional arguments, not fields",
                     pat.span,
                 )
-            unify(t, con.ret, pat.span, f"the pattern '{pat.name}'")
+            self.solver.eq(t, con.ret, pat.span, f"the pattern '{pat.name}'")
             out = {}
             for label, sub in pat.fields:
                 if label not in info.field_names:
@@ -359,7 +361,7 @@ class Inferencer:
                     f"Use 'var' to make it reassignable.",
                     span,
                 )
-            unify(
+            self.solver.eq(
                 instantiate(binding.scheme, self.level),
                 self.infer_expr(stmt.value),
                 span,
@@ -369,17 +371,17 @@ class Inferencer:
 
         if isinstance(target, ast.EField):
             field = self.infer_field(target, assigning=True)
-            unify(field, self.infer_expr(stmt.value), span, "the assigned value")
+            self.solver.eq(field, self.infer_expr(stmt.value), span, "the assigned value")
             return
 
         if isinstance(target, ast.EIndex):
             element = self.fresh()
-            unify(
+            self.solver.eq(
                 self.infer_expr(target.arr), TCon("Array", [element]), span,
                 "an indexed assignment",
             )
-            unify(self.infer_expr(target.index), INT, span, "an array index")
-            unify(element, self.infer_expr(stmt.value), span, "the assigned value")
+            self.solver.eq(self.infer_expr(target.index), INT, span, "an array index")
+            self.solver.eq(element, self.infer_expr(stmt.value), span, "the assigned value")
             return
 
         raise AssertionError("parser should have rejected this assignment target")
@@ -415,7 +417,7 @@ class Inferencer:
     def _infer_EArray(self, e: ast.EArray) -> Type:
         element: Type = self.fresh()
         for item in e.elems:
-            element = join(element, self.infer_expr(item), item.span, "an array literal")
+            element = self.solver.join(element, self.infer_expr(item), item.span, "an array literal")
         return TCon("Array", [element])
 
     def _infer_ERecord(self, e: ast.ERecord) -> Type:
@@ -441,7 +443,7 @@ class Inferencer:
         # Section 6.1: fields evaluate left to right, so check them in that order.
         for label, value in e.fields:
             index = info.field_names.index(label)
-            unify(
+            self.solver.eq(
                 con.params[index], self.infer_expr(value), value.span,
                 f"field '{label}' of '{e.con}'",
             )
@@ -454,13 +456,13 @@ class Inferencer:
         fn = self.infer_expr(e.fn)
         args = [self.infer_expr(a) for a in e.args]
         result = self.fresh()
-        unify(fn, TFun(args, result), e.span, "a function call")
+        self.solver.eq(fn, TFun(args, result), e.span, "a function call")
         return result
 
     def _infer_EIndex(self, e: ast.EIndex) -> Type:
         element = self.fresh()
-        unify(self.infer_expr(e.arr), TCon("Array", [element]), e.span, "an index")
-        unify(self.infer_expr(e.index), INT, e.index.span, "an array index")
+        self.solver.eq(self.infer_expr(e.arr), TCon("Array", [element]), e.span, "an index")
+        self.solver.eq(self.infer_expr(e.index), INT, e.index.span, "an array index")
         return element
 
     def _infer_EField(self, e: ast.EField) -> Type:
@@ -486,7 +488,7 @@ class Inferencer:
             info = self.decls.tycons.get(receiver.name)
             if info is not None and info.is_mutable_record:
                 con = self.decls.instantiate_con(info.variants[0].name, self.level, e.span)
-                unify(con.ret, receiver, e.span, "a field access")
+                self.solver.eq(con.ret, receiver, e.span, "a field access")
                 names = info.variants[0].field_names
                 if e.name not in names:
                     raise TypeError_(
@@ -511,18 +513,18 @@ class Inferencer:
 
     def _infer_EUnary(self, e: ast.EUnary) -> Type:
         operand, result = UNARY_OPS[e.op]
-        unify(self.infer_expr(e.operand), operand, e.span, f"the operand of '{e.op}'")
+        self.solver.eq(self.infer_expr(e.operand), operand, e.span, f"the operand of '{e.op}'")
         return result
 
     def _infer_EBinary(self, e: ast.EBinary) -> Type:
         left, right, result = BINARY_OPS[e.op]
-        unify(self.infer_expr(e.left), left, e.left.span, f"the left operand of '{e.op}'")
-        unify(self.infer_expr(e.right), right, e.right.span, f"the right operand of '{e.op}'")
+        self.solver.eq(self.infer_expr(e.left), left, e.left.span, f"the left operand of '{e.op}'")
+        self.solver.eq(self.infer_expr(e.right), right, e.right.span, f"the right operand of '{e.op}'")
         return result
 
     def _infer_EAnnot(self, e: ast.EAnnot) -> Type:
         annotated = self.type_of(e.type_expr)
-        return join(self.infer_expr(e.expr), annotated, e.span, "a type annotation")
+        return self.solver.join(self.infer_expr(e.expr), annotated, e.span, "a type annotation")
 
     def _infer_EBlock(self, e: ast.EBlock) -> Type:
         with self._scoped(self.env.child()):
@@ -534,14 +536,14 @@ class Inferencer:
         return result
 
     def _infer_EIf(self, e: ast.EIf) -> Type:
-        unify(self.infer_expr(e.cond), BOOL, e.cond.span, "an 'if' condition")
+        self.solver.eq(self.infer_expr(e.cond), BOOL, e.cond.span, "an 'if' condition")
         then = self.infer_expr(e.then)
         if e.otherwise is None:
             return UNIT  # section 6.7: statement-style `if` has no value
-        return join(then, self.infer_expr(e.otherwise), e.span, "the branches of an 'if'")
+        return self.solver.join(then, self.infer_expr(e.otherwise), e.span, "the branches of an 'if'")
 
     def _infer_EWhile(self, e: ast.EWhile) -> Type:
-        unify(self.infer_expr(e.cond), BOOL, e.cond.span, "a 'while' condition")
+        self.solver.eq(self.infer_expr(e.cond), BOOL, e.cond.span, "a 'while' condition")
         self.loop_stack.append(LoopCtx("while", UNIT))
         self.infer_expr(e.body)
         self.loop_stack.pop()
@@ -549,7 +551,7 @@ class Inferencer:
 
     def _infer_EForIn(self, e: ast.EForIn) -> Type:
         element = self.fresh()
-        unify(
+        self.solver.eq(
             self.infer_expr(e.iterable), TCon("Array", [element]), e.iterable.span,
             "the sequence of a 'for ... in' loop",
         )
@@ -565,7 +567,7 @@ class Inferencer:
         with self._scoped(self.env.child()):
             if e.init is not None:
                 self.infer_stmt(e.init)
-            unify(self.infer_expr(e.cond), BOOL, e.cond.span, "a 'for' condition")
+            self.solver.eq(self.infer_expr(e.cond), BOOL, e.cond.span, "a 'for' condition")
             self.loop_stack.append(LoopCtx("for", UNIT))
             self.infer_expr(e.body)
             if e.step is not None:
@@ -597,19 +599,19 @@ class Inferencer:
                         alt.span,
                     )
                 for name, ty in other.items():
-                    unify(bindings[name], ty, alt.span, f"the binding '{name}'")
+                    self.solver.eq(bindings[name], ty, alt.span, f"the binding '{name}'")
             with self._scoped(self.env.child()):
                 for name, ty in bindings.items():
                     self.env.define(name, Binding(mono(ty), False))
                 body = self.infer_expr(arm.body)
-            result = join(result, body, arm.span, "the arms of a 'match'")
+            result = self.solver.join(result, body, arm.span, "the arms of a 'match'")
         return result
 
     def _infer_EReturn(self, e: ast.EReturn) -> Type:
         if not self.fn_stack:
             raise TypeError_("'return' is only valid inside a function", e.span)
         value = self.infer_expr(e.value) if e.value is not None else UNIT
-        unify(self.fn_stack[-1], value, e.span, "a 'return'")
+        self.solver.eq(self.fn_stack[-1], value, e.span, "a 'return'")
         return BOTTOM
 
     def _infer_EBreak(self, e: ast.EBreak) -> Type:
@@ -618,7 +620,7 @@ class Inferencer:
         ctx = self.loop_stack[-1]
         ctx.saw_break = True
         if e.value is None:
-            unify(ctx.result, UNIT, e.span, "a valueless 'break'")
+            self.solver.eq(ctx.result, UNIT, e.span, "a valueless 'break'")
         elif ctx.kind != "loop":
             raise TypeError_(
                 f"'break' cannot carry a value out of a '{ctx.kind}' loop; only "
@@ -626,7 +628,7 @@ class Inferencer:
                 e.span,
             )
         else:
-            ctx.result = join(ctx.result, self.infer_expr(e.value), e.span, "a 'break'")
+            ctx.result = self.solver.join(ctx.result, self.infer_expr(e.value), e.span, "a 'break'")
         return BOTTOM
 
     def _infer_EContinue(self, e: ast.EContinue) -> Type:

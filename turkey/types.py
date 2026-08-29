@@ -101,17 +101,55 @@ PRIMITIVES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR,
               "Bool": BOOL, "Unit": UNIT}
 
 
-class Scheme:
-    """`forall q1 ... qn . body`. An empty `quantified` means monomorphic."""
+class Pred:
+    """An atomic predicate: `HasField l r a`, `OneOf t {...}`, `Eq a`.
 
-    __slots__ = ("quantified", "body")
+    Predicates live here rather than beside the solver because a scheme can
+    carry them -- they are part of the type language, not of the machinery that
+    discharges them.
+    """
 
-    def __init__(self, quantified: list[TVar], body: Type):
-        self.quantified = quantified
-        self.body = body
+    __slots__ = ("name", "args")
+
+    def __init__(self, name: str, args: list[Type]):
+        self.name = name
+        self.args = args
+
+    def level(self) -> int:
+        """The binder depth this predicate is tied to.
+
+        A predicate is no more general than its most-constrained variable, so
+        its level is the minimum over the variables it mentions, and
+        generalization compares against it exactly as it does for a type.
+        Keeping the two tests identical is what stops a predicate from
+        outliving, or being stranded by, the type it constrains. A ground
+        predicate mentions no variables and can be settled anywhere.
+        """
+        levels = [v.level for v in vars_of(*self.args)]
+        return min(levels) if levels else GROUND
 
     def __repr__(self) -> str:
-        return f"Scheme({len(self.quantified)}, {self.body!r})"
+        return f"Pred({self.name}, {self.args!r})"
+
+
+GROUND = 1 << 30
+
+
+class Scheme:
+    """`forall q1 ... qn . preds => body`.
+
+    An empty `quantified` means monomorphic; an empty `preds` means unqualified.
+    """
+
+    __slots__ = ("quantified", "body", "preds")
+
+    def __init__(self, quantified: list[TVar], body: Type, preds: list[Pred] | None = None):
+        self.quantified = quantified
+        self.body = body
+        self.preds: list[Pred] = preds or []
+
+    def __repr__(self) -> str:
+        return f"Scheme({len(self.quantified)}, {self.preds!r}, {self.body!r})"
 
 
 def mono(t: Type) -> Scheme:
@@ -221,8 +259,14 @@ def join(a: Type, b: Type, span: Span | None = None, context: str = "") -> Type:
     return a
 
 
-def generalize(t: Type, level: int) -> Scheme:
-    """Quantify every variable created deeper than `level` (section 4.4)."""
+def generalize(t: Type, level: int, preds: list[Pred] | None = None) -> Scheme:
+    """Quantify every variable created deeper than `level` (section 4.4).
+
+    `preds` are the predicates the solver decided this binding retains. They are
+    walked too, so a variable a predicate constrains is quantified along with
+    the type's own -- a retained predicate must not mention a variable the
+    scheme left free.
+    """
     quantified: list[TVar] = []
     seen: set[int] = set()
 
@@ -244,13 +288,26 @@ def generalize(t: Type, level: int) -> Scheme:
                 walk(e)
 
     walk(t)
-    return Scheme(quantified, t)
+    for pred in preds or []:
+        for arg in pred.args:
+            walk(arg)
+    return Scheme(quantified, t, list(preds or []))
 
 
 def instantiate(scheme: Scheme, level: int) -> Type:
     """Replace the scheme's quantified variables with fresh ones."""
+    return instantiate_qual(scheme, level)[1]
+
+
+def instantiate_qual(scheme: Scheme, level: int) -> tuple[list[Pred], Type]:
+    """Instantiate a scheme, returning its context alongside its type.
+
+    The context has to be renamed by the same substitution as the body, or its
+    predicates would constrain the scheme's original variables rather than this
+    use site's fresh ones.
+    """
     if not scheme.quantified:
-        return scheme.body
+        return list(scheme.preds), scheme.body
     mapping = {v.id: TVar(level) for v in scheme.quantified}
 
     def walk(ty: Type) -> Type:
@@ -265,7 +322,32 @@ def instantiate(scheme: Scheme, level: int) -> Type:
             return TTuple([walk(e) for e in ty.elems])
         return ty
 
-    return walk(scheme.body)
+    preds = [Pred(p.name, [walk(a) for a in p.args]) for p in scheme.preds]
+    return preds, walk(scheme.body)
+
+
+def vars_of(*types: Type) -> list[TVar]:
+    """The unbound variables reachable from `types`, first occurrence first."""
+    seen: dict[int, TVar] = {}
+
+    def walk(ty: Type) -> None:
+        ty = prune(ty)
+        if isinstance(ty, TVar):
+            seen.setdefault(ty.id, ty)
+        elif isinstance(ty, TCon):
+            for a in ty.args:
+                walk(a)
+        elif isinstance(ty, TFun):
+            for p in ty.params:
+                walk(p)
+            walk(ty.ret)
+        elif isinstance(ty, TTuple):
+            for e in ty.elems:
+                walk(e)
+
+    for t in types:
+        walk(t)
+    return list(seen.values())
 
 
 def free_vars(t: Type, acc: set[int] | None = None) -> set[int]:
@@ -336,6 +418,20 @@ def show_scheme(scheme: Scheme) -> str:
 
     A `let` bound to an expansive expression is not generalized (section 4.4),
     so its variables stay free -- `Array _a` rather than `Array a`.
+
+    A qualified scheme prints its context first, in the bracket syntax a `fun`
+    declaration writes: `[Ord a] fun(Array a) -> a`. The names have to be
+    assigned before the context is rendered so that the `a` in the context and
+    the `a` in the body come out as the same letter.
     """
     names = {var.id: _var_name(i) for i, var in enumerate(scheme.quantified)}
-    return show(scheme.body, names, free_prefix="_")
+    body = show(scheme.body, names, free_prefix="_")
+    if not scheme.preds:
+        return body
+    context = ", ".join(show_pred(p, names) for p in scheme.preds)
+    return f"[{context}] {body}"
+
+
+def show_pred(pred: Pred, names: dict[int, str] | None = None) -> str:
+    args = " ".join(show(a, names, free_prefix="_") for a in pred.args)
+    return f"{pred.name} {args}" if args else pred.name

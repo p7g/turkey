@@ -85,6 +85,8 @@ export        ::= IDENT
                | CONID "(" ".." ")"
                | CONID "(" CONID ("," CONID)* ")"
 toplevel      ::= type-decl
+               | class-decl                      -- (delta 29)
+               | instance-decl                   -- (delta 29)
                | fun-decl
                | let-decl
                | var-decl
@@ -124,10 +126,22 @@ type-list    ::= type-expr ("," type-expr)*
 ```
 fun-decl     ::= "fun" CONID? IDENT "(" pat-list? ")" fun-ret? fun-body
                -- CONID? would be invalid per naming rules; so:
-fun-decl     ::= "fun" IDENT "(" pat-list? ")" fun-ret? fun-body
+fun-decl     ::= "fun" IDENT context? "(" pat-list? ")" fun-ret? fun-body
 fun-ret      ::= "->" type-expr
 fun-body     ::= "=" expr
                | "{" stmt* "}"
+
+-- Classes and instances (delta 29). A `fun` with no body is a signature, and
+-- its parameters are then *types*, not binders; that form is legal only in a
+-- class body.
+class-decl   ::= "class" CONID IDENT (":" class-pred ("," class-pred)*)?
+                 "{" method* "}"
+instance-decl ::= "instance" context? CONID atype "{" fun-decl* "}"
+method       ::= fun-decl
+               | "fun" IDENT context? "(" type-list? ")" "->" type-expr
+context      ::= "[" class-pred ("," class-pred)* "]"
+class-pred   ::= CONID atype
+type-list    ::= type-expr ("," type-expr)*
 let-decl     ::= "let" pat "=" expr
 var-decl     ::= "var" pat "=" expr
 pat-list     ::= pat ("," pat)*
@@ -240,8 +254,13 @@ expr-postfix "[" expr "]" "=" expr  -- mutate an array element
 ### 4.2 Type schemes
 
 ```
-σ ::= ∀ α₁ ... αₙ. τ                 -- n ≥ 0; n=0 means monomorphic
+σ ::= ∀ α₁ ... αₙ. π₁, ..., πₘ ⇒ τ   -- n, m ≥ 0; both 0 means monomorphic
+π ::= C τ                            -- a class predicate (delta 29)
+    | HasField l τ τ                 -- a field demand (delta 7)
+    | OneOf τ {T₁, ..., Tₙ}          -- a numeric literal's set (delta 27)
 ```
+
+A context is written in brackets, ahead of the type: `[Ord a] fun(Array a) -> a`.
 
 Type variables in annotations are implicitly universally quantified at the enclosing `let`/`fun`/top-level binding. No explicit `forall` keyword in v1.
 

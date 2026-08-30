@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from . import ast
 from .builtins import initial_type_env, initial_values
+from .classes import ClassTable
 from .constraints import Env, Solver
 from .decls import DeclTable
 from .deps import pattern_vars
@@ -22,6 +23,7 @@ class Checked:
     program: ast.Program
     ordered: list[ast.Stmt]
     decls: DeclTable
+    classes: ClassTable
     env: Env
     signatures: list[tuple[str, Scheme]]  # in source order
     warnings: list[str]
@@ -47,12 +49,19 @@ def check(src: str) -> Checked:
     # them this way is the point of the HM(X) shape -- see constraints.py.
     generator = Generator(decls, env)
     ordered, constraint = generator.generate(program)
-    Solver(decls, env).run(constraint)
+    Solver(decls, env, generator.classes).run(constraint)
     generator.check_exhaustiveness()
 
     signatures = []
     for item in program.decls:
-        if isinstance(item, ast.TypeDecl):
+        if isinstance(item, ast.ClassDecl):
+            # A method's scheme is stated by its class rather than inferred, but
+            # it is still the thing a reader wants to see, and the class
+            # variable's discovered kind shows up nowhere else.
+            info = generator.classes.classes[item.name]
+            signatures.extend((m.name, info.methods[m.name].scheme) for m in item.methods)
+            continue
+        if not isinstance(item, ast.Stmt):
             continue
         names = [item.decl.name] if isinstance(item, ast.SFun) else sorted(pattern_vars(item.pat))
         for name in names:
@@ -60,7 +69,8 @@ def check(src: str) -> Checked:
             if binding is not None:
                 signatures.append((name, binding.scheme))
 
-    return Checked(program, ordered, decls, env, signatures, generator.warnings)
+    return Checked(program, ordered, decls, generator.classes, env, signatures,
+                   generator.warnings)
 
 
 def run(src: str, filename: str = "<input>") -> None:

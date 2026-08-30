@@ -119,7 +119,7 @@ class Parser:
         self.skip_newlines()
         header = self.parse_module_header() if self.at("module") else None
         imports: list[ast.ImportDecl] = []
-        decls: list[ast.Stmt | ast.TypeDecl] = []
+        decls: list[ast.Stmt | ast.TypeDecl | ast.ClassDecl | ast.InstanceDecl] = []
 
         self.skip_newlines()
         while not self.at("EOF"):
@@ -127,6 +127,10 @@ class Parser:
                 imports.append(self.parse_import())
             elif self.at("type"):
                 decls.append(self.parse_type_decl())
+            elif self.at("class"):
+                decls.append(self.parse_class_decl())
+            elif self.at("instance"):
+                decls.append(self.parse_instance_decl())
             elif self.at("fun"):
                 decls.append(ast.SFun(self.cur.span, self.parse_fun_decl()))
             elif self.at("let", "var"):
@@ -354,13 +358,135 @@ class Parser:
 
     # -- declarations and statements ---------------------------------------
 
-    def parse_fun_decl(self) -> ast.FunDecl:
+    def parse_fun_decl(self, allow_signature: bool = False) -> ast.FunDecl:
+        """`fun name [context] (params) -> ret body`.
+
+        Inside a `class` a method may have no body, and then its parameters are
+        *types* rather than binders. That is the one genuinely ambiguous
+        production in the language: a bare identifier is both a legal parameter
+        name and a legal type expression, so `fun combine(a, a) -> a` is two
+        occurrences of one type variable while `fun combine(a, b) = a` is two
+        binders. Nothing local decides it -- what follows the return type does.
+
+        So the parameter list is parsed twice at worst: once as types, and, if
+        that either fails or turns out to be followed by a body, again as
+        patterns. The readings never mix. No body means every parameter is a
+        type; a body means every parameter is a binder. A signature therefore
+        cannot name its parameters and a definition cannot omit them, which is
+        what makes the classification total rather than per-parameter.
+        """
         span = self.expect("fun").span
         name = self.expect("IDENT", "a function name").text
+        context = self.parse_context()
+        if allow_signature:
+            sig = self._try_signature(span, name, context)
+            if sig is not None:
+                return sig
         params = self.parse_param_list()
         ret = self.parse_type_expr() if self.eat("->") else None
         body = self.parse_fun_body()
-        return ast.FunDecl(span, name, params, ret, body)
+        return ast.FunDecl(span, name, params, ret, body, context)
+
+    def parse_context(self) -> list[ast.ClassPred]:
+        """`[C a, D b]` -- a context, not a binder.
+
+        The variables it mentions are the enclosing declaration's annotation
+        variables (SPEC-DELTAS.md 13), which is why this constrains rather than
+        introduces. It sits after the name so that a bare `fun[...]` stays free
+        for a constrained lambda later.
+        """
+        if not self.at("["):
+            return []
+        self.advance()
+        preds: list[ast.ClassPred] = []
+        while True:
+            tok = self.expect("CONID", "a class name")
+            preds.append(ast.ClassPred(tok.span, tok.text, self.parse_atype()))
+            if not self.eat(","):
+                break
+        self.expect("]")
+        return preds
+
+    def _try_signature(
+        self, span: Span, name: str, context: list[ast.ClassPred]
+    ) -> ast.FunDecl | None:
+        """Read the parameter list as types. None means "this has a body"."""
+        start = self.i
+        try:
+            params = self._signature_params()
+        except ParseError:
+            self.i = start
+            return None
+        if self.at("=", "{"):
+            self.i = start
+            return None
+        if not self.eat("->"):
+            raise ParseError(
+                f"method '{name}' has no body, so it is a signature and must "
+                f"state a return type",
+                self.cur.span,
+            )
+        ret = self.parse_type_expr()
+        if self.at("=", "{"):
+            self.i = start
+            return None
+        # A parameter of a stated type with no name is an anonymous binder.
+        return ast.FunDecl(
+            span, name,
+            [ast.PAnnot(t.span, ast.PWild(t.span), t) for t in params],
+            ret, None, context,
+        )
+
+    def _signature_params(self) -> list[ast.TypeExpr]:
+        self.expect("(")
+        params: list[ast.TypeExpr] = []
+        while not self.at(")"):
+            params.append(self.parse_type_expr())
+            if not self.eat(","):
+                break
+        self.expect(")")
+        return params
+
+    # -- classes and instances ---------------------------------------------
+
+    def parse_class_decl(self) -> ast.ClassDecl:
+        span = self.expect("class").span
+        name = self.expect("CONID", "a class name").text
+        param = self.expect("IDENT", "the class parameter").text
+        supers: list[ast.ClassPred] = []
+        if self.eat(":"):
+            while True:
+                tok = self.expect("CONID", "a superclass name")
+                supers.append(ast.ClassPred(tok.span, tok.text, self.parse_atype()))
+                if not self.eat(","):
+                    break
+        return ast.ClassDecl(span, name, param, supers, self.parse_method_block(True))
+
+    def parse_instance_decl(self) -> ast.InstanceDecl:
+        span = self.expect("instance").span
+        context = self.parse_context()
+        name = self.expect("CONID", "a class name").text
+        # An `atype`, so a partially applied head parenthesizes:
+        # `instance Functor (Either l)`.
+        head = self.parse_atype()
+        return ast.InstanceDecl(
+            span, name, head, context, self.parse_method_block(False)
+        )
+
+    def parse_method_block(self, allow_signature: bool) -> list[ast.FunDecl]:
+        self.expect("{")
+        self.skip_newlines()
+        methods: list[ast.FunDecl] = []
+        while not self.at("}"):
+            if not self.at("fun"):
+                raise ParseError(
+                    f"expected a method, found {self._describe(self.cur)}",
+                    self.cur.span,
+                )
+            methods.append(self.parse_fun_decl(allow_signature))
+            self.end_of_statement()
+        self.expect("}")
+        return methods
 
     def parse_param_list(self) -> list[ast.Pattern]:
         self.expect("(")

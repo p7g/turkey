@@ -325,11 +325,39 @@ class SExpr(Stmt):
 
 
 @dataclass(eq=False)
+class ClassPred(Node):
+    """One constraint as written: `Ord a`, `Monoid m`, `Functor (Either l)`.
+
+    The same node serves every position a constraint appears in -- a `fun`'s
+    `[...]` context, a class's superclass list, an instance's context -- because
+    they all mean the same thing and differ only in where they are attached.
+    """
+
+    name: str
+    arg: TypeExpr
+
+
+@dataclass(eq=False)
 class FunDecl(Node):
+    """A function, or -- with `body is None` -- a bare signature.
+
+    A signature is legal only inside a `class`, and there its parameters are
+    *types*, not binders. They are still stored as patterns, because a
+    parameter of a stated type with no name is exactly `PAnnot(PWild, ty)`, and
+    keeping one representation means the method's type is read off a signature
+    and off a defaulted method by the same code. See `Parser.parse_fun_decl`
+    for why the two readings cannot be mixed within one declaration.
+    """
+
     name: str
     params: list[Pattern]
     ret: TypeExpr | None
-    body: Expr
+    body: Expr | None
+    context: list[ClassPred] = field(default_factory=list)
+
+    @property
+    def is_signature(self) -> bool:
+        return self.body is None
 
 
 @dataclass(eq=False)
@@ -371,6 +399,35 @@ class TypeDecl(Node):
 
 
 @dataclass(eq=False)
+class ClassDecl(Node):
+    """`class C a : Super a, ... { methods }`.
+
+    Superclasses use `:` rather than the `[...]` a `fun` writes. The positions
+    are disjoint so nothing is ambiguous, and the split keeps `[...]` meaning
+    exactly one thing: a context on a *value*'s type.
+    """
+
+    name: str
+    param: str
+    supers: list[ClassPred]
+    methods: list[FunDecl]  # signatures, and defaulted methods with bodies
+
+
+@dataclass(eq=False)
+class InstanceDecl(Node):
+    """`instance [context] C head { methods }`.
+
+    `head` is an `atype`, so a partial application parenthesizes:
+    `instance Functor (Either l)`.
+    """
+
+    cls: str
+    head: TypeExpr
+    context: list[ClassPred]
+    methods: list[FunDecl]
+
+
+@dataclass(eq=False)
 class ModuleHeader(Node):
     name: str
     exports: list[str] | None
@@ -389,4 +446,4 @@ class ImportDecl(Node):
 class Program(Node):
     header: ModuleHeader | None
     imports: list[ImportDecl]
-    decls: list[Stmt | TypeDecl]
+    decls: list[Stmt | TypeDecl | ClassDecl | InstanceDecl]

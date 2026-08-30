@@ -527,3 +527,87 @@ Two consequences worth stating:
 - An alias body must classify values, so `type Boxed f = f Int` is fine but
   `type Alias = Array` is not. Since an alias cannot be partially applied, an
   alias standing for an unapplied constructor could never be used anyway.
+
+### 29. Single-parameter type classes
+
+design.md has no classes at all -- §8.2 says only that `==`/`<` "can be unified
+under `Eq`/`Ord` classes" later. This adds them, with one parameter, in the
+syntax `Prelude.tl` already assumes:
+
+```
+class Semigroup a {
+    fun combine(a, a) -> a
+}
+
+class Monoid a : Semigroup a {
+    fun empty() -> a
+    fun concat(xs : Array a) -> a = fold(xs)
+}
+
+instance Semigroup (Array a) { ... }
+instance [Eq a] Eq (Array a) { ... }
+
+fun largest[Ord a](xs : Array a) -> a { ... }
+```
+
+A class predicate `C t` is the fourth form of the constraint domain X, beside
+`t1 ~ t2`, `HasField` and `OneOf`. Entailment is Jones's, from *Typing Haskell
+in Haskell* (Haskell Workshop 1999): `by_super` walks the superclass closure,
+`by_inst` matches an instance head, and the two together decide `entail`. All
+of it lives in `turkey/classes.py`; `unify` learns nothing.
+
+**A `fun` with no body is a signature, and its parameters are types.** This is
+the one genuinely ambiguous production in the grammar: a bare identifier is
+both a legal parameter name and a legal type expression, so `fun combine(a, a)
+-> a` is two occurrences of one type variable while `fun combine(a, b) = a` is
+two binders. Nothing local decides it -- what follows the return type does --
+so the parameter list is read as types first and re-read as patterns if a body
+turns up. **The two readings never mix**: no body means every parameter is a
+type, a body means every parameter is a binder. A signature therefore cannot
+name its parameters and a definition cannot omit them, which is what makes the
+classification total rather than per-parameter. A body-less `fun` is legal only
+inside a `class`.
+
+**Superclasses use `:`, contexts use `[...]`.** Both mean "requires", but the
+positions are disjoint, so there is no grammatical conflict and no reason to
+force one spelling on the other. The split matches Rust (`trait A: B` versus
+`fn f<T: Ord>`), and it keeps `[...]` meaning exactly one thing: a context on a
+*value*'s type. A context is a constraint, not a binder -- the variables it
+names are the enclosing declaration's annotation variables (delta 13).
+
+Three restrictions, each load-bearing:
+
+- **One class parameter, and no functional dependencies.** Ambiguity is then
+  the plain free-variable test: a quantified variable a predicate mentions and
+  the type does not can never be pinned by a use site. Multi-parameter classes
+  need fundeps before that test says anything useful, and associated type
+  families are meant to make the second parameter unnecessary.
+- **An instance head is a constructor applied to distinct type variables**
+  (Haskell 98's rule). `instance Functor (Either l)` yes, `instance Functor
+  (Either Int)` no. Matching is then a one-way structural walk, and two
+  instances overlap exactly when they name the same constructor -- so the
+  overlap check is a lookup rather than a unification test.
+- **A superclass constrains the class variable itself.** `class Monoid a :
+  Semigroup a`, not `Semigroup (Array a)`, so carrying a predicate across the
+  superclass edge is substitution-free.
+
+**An instance method is checked, not inferred, and the variables the instance
+does not fix are rigid.** Otherwise a body less general than its class's
+signature would pass by narrowing the signature to fit -- `instance Functor
+Option { fun map(opt, g) = match opt { Some(x) -> Some(x + 1) ... } }` would be
+accepted with `a` silently `Int`. The quantified variables are replaced by
+nullary `TCon`s named after them, which `unify` already treats as rigid, so the
+error still reads in the author's own names.
+
+Checking a method against a declared type is the one place a predicate is
+*granted* rather than proved: the class's own predicate, the instance's context
+and the method's context are facts inside the body. That is the whole of local
+assumptions, deliberately -- an assumption introduced by a *pattern* is what
+makes GADTs destroy principal types, and none is introduced anywhere.
+
+A method shares the value namespace with ordinary functions, so `fun eq` and a
+class method `eq` collide.
+
+Nothing runs yet: a method call has no dictionary to resolve it until
+dictionary passing lands. `tests/programs/classes.tl` type-checks and its
+`main` stays clear of methods.

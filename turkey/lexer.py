@@ -15,8 +15,9 @@ from dataclasses import dataclass
 from .errors import LexError, Span
 
 KEYWORDS = frozenset(
-    """type fun let var match if else while for in loop return break continue
-    true false module import export as qualified hiding where""".split()
+    """type class instance fun let var match if else while for in loop return
+    break continue true false module import export as qualified hiding
+    where""".split()
 )
 
 # Longest match first: `<=` must beat `<`, `->` must beat `-`, `+.` must beat `+`.
@@ -43,8 +44,9 @@ CAN_END = (
 CAN_START = (
     LITERAL_KINDS
     | {
-        "let", "var", "fun", "type", "if", "match", "while", "for", "loop",
-        "return", "break", "continue", "module", "import",
+        "let", "var", "fun", "type", "class", "instance", "if", "match",
+        "while", "for", "loop", "return", "break", "continue", "module",
+        "import",
         "IDENT", "CONID", "true", "false", "(", "[", "{", "-", "!",
     }
 )

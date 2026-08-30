@@ -33,9 +33,10 @@ from dataclasses import dataclass, field
 from typing import TypeVar
 
 from . import ast
+from .classes import ClassTable, MethodInfo, Skolems
 from .constraints import (
-    HAS_FIELD, ONE_OF, Binding, CAnd, CDef, CEq, CExists, CInstance, CLet,
-    CPred, Constraint, Env,
+    HAS_FIELD, ONE_OF, Binding, CAnd, CAssume, CDef, CEq, CExists, CInstance,
+    CLet, CPred, Constraint, Env,
 )
 from .decls import DeclTable
 from .deps import free_names, pattern_vars, sccs
@@ -43,6 +44,7 @@ from .errors import Span, TypeError_
 from .types import (
     BOOL, BOTTOM, CHAR, FLOAT, INT, STRING, UNIT, Pred, TBottom, TFun, TLabel,
     TSet, TTuple, TVar, Type, array_of, float_literal_set, int_literal_set,
+    show, vars_of,
 )
 
 LITERAL_TYPES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR, "Bool": BOOL}
@@ -84,6 +86,11 @@ class Frame:
 class Generator:
     def __init__(self, decls: DeclTable, builtins: Env):
         self.decls = decls
+        self.classes = ClassTable(decls)
+        # Class methods are bound here rather than by a `CLet`: a method's type
+        # comes from its class, not from anything solving discovers, so it is
+        # in scope from the first line of the program.
+        self.env = builtins
         self.frames: list[Frame] = [Frame()]
         # Name -> mutable. Types are the solver's business; this is only what
         # generation needs to reject an undefined name or a write to a `let`.
@@ -161,8 +168,12 @@ class Generator:
         scope of earlier ones.
         """
         type_decls = [d for d in program.decls if isinstance(d, ast.TypeDecl)]
-        items = [d for d in program.decls if not isinstance(d, ast.TypeDecl)]
+        class_decls = [d for d in program.decls if isinstance(d, ast.ClassDecl)]
+        inst_decls = [d for d in program.decls if isinstance(d, ast.InstanceDecl)]
+        items = [d for d in program.decls if isinstance(d, ast.Stmt)]
         self.decls.register_all(type_decls)
+        self.classes.register_all(class_decls, inst_decls)
+        self.bind_methods()
 
         # The graph is keyed by item, not by bound name: a single binding may
         # introduce several names (`let (a, b) = ...`), and keying by name would
@@ -177,6 +188,13 @@ class Generator:
             for name in names_of[keys[id(item)]]:
                 if name in owner:
                     raise TypeError_(f"'{name}' is declared more than once", item.span)
+                if name in self.classes.owner:
+                    raise TypeError_(
+                        f"'{name}' is already defined: it is a method of class "
+                        f"'{self.classes.owner[name]}', and methods share the "
+                        f"namespace of ordinary functions",
+                        item.span,
+                    )
                 owner[name] = keys[id(item)]
 
         graph = {
@@ -196,9 +214,92 @@ class Generator:
         def nest(index: int) -> None:
             if index < len(groups):
                 self.bind_group(groups[index], lambda: nest(index + 1), top_level=True)
+            else:
+                # Method bodies are generated innermost, so that they may call
+                # any top-level binding. Nothing calls *them* by name, so their
+                # position in the nesting is otherwise free.
+                self.gen_method_bodies(class_decls, inst_decls)
 
         nest(0)
         return ordered, self.pop()
+
+    def bind_methods(self) -> None:
+        """Put every class method in scope, under the scheme its class gives it."""
+        for info in self.classes.classes.values():
+            for method in info.methods.values():
+                if self.bound(method.name):
+                    raise TypeError_(
+                        f"'{method.name}' is already defined; a class method "
+                        f"shares the namespace of ordinary functions",
+                        method.decl.span,
+                    )
+                self.env.define(method.name, Binding(method.scheme, False))
+                self.scopes[0][method.name] = False
+
+    def gen_method_bodies(
+        self, classes: list[ast.ClassDecl], instances: list[ast.InstanceDecl]
+    ) -> None:
+        """Check every defaulted class method and every instance method.
+
+        Each is checked against the type its *class* states, with everything
+        the declaration does not fix made rigid -- see `Skolems`. That is the
+        whole difference between checking a method and inferring a function: a
+        method has a type to live up to, and a fresh unification variable would
+        let a body that is less general than the signature pass by narrowing
+        the signature to fit.
+        """
+        for decl in classes:
+            info = self.classes.classes[decl.name]
+            for method in info.methods.values():
+                if method.decl.body is None:
+                    continue
+                skolems = Skolems()
+                skolems.bind(info.var, info.param)
+                self.check_method(method, skolems, [],
+                                  f"the default definition of '{method.name}'")
+        for decl in instances:
+            inst = next(i for i in self.classes.instances[decl.cls] if i.decl is decl)
+            info = self.classes.classes[decl.cls]
+            for method_decl in decl.methods:
+                method = info.methods[method_decl.name]
+                skolems = Skolems()
+                for var in vars_of(inst.head):
+                    skolems.bind(var, inst.names[var.id])
+                # The class variable is not made rigid: the instance fixes it.
+                skolems.mapping[method.class_var.id] = skolems.apply(inst.head)
+                self.check_method(
+                    method, skolems,
+                    [Pred(q.name, [skolems.apply(q.args[0])]) for q in inst.context],
+                    f"instance '{decl.cls} {show(inst.head)}'",
+                    method_decl,
+                )
+
+    def check_method(
+        self,
+        method: MethodInfo,
+        skolems: Skolems,
+        context: list[Pred],
+        what: str,
+        decl: ast.FunDecl | None = None,
+    ) -> None:
+        for var in method.scheme.quantified:
+            if var.id not in skolems.mapping:
+                skolems.bind(var, method.names.get(var.id, "a"))
+        expected = skolems.apply(method.scheme.body)
+        given = [skolems.apply_pred(p) for p in method.scheme.preds] + context
+
+        decl = decl if decl is not None else method.decl
+        self.push()
+        inferred = self.gen_function(decl)
+        self.eq(inferred, expected, decl.span,
+                f"the type class '{method.cls}' declares for '{method.name}'")
+        defn = self.pop()
+        # A `CLet` for the rank, not for the polymorphism: the expected type is
+        # rigid, so nothing generalizes. What the rank buys is that a predicate
+        # the body raised is settled here, against the assumptions, instead of
+        # escaping to the end of the program.
+        self.emit(CAssume(given, CLet([(f"%{what}.{method.name}", expected)],
+                                      defn, CAnd([]), decl.span)))
 
     def check_exhaustiveness(self) -> None:
         """Section 5.1: a non-exhaustive match is a warning, not an error --
@@ -345,6 +446,17 @@ class Generator:
         ret = self.fresh()
         if decl.ret is not None:
             self.eq(ret, self.type_of(decl.ret), decl.span, "the return type annotation")
+
+        # A declared context is emitted as an ordinary demand rather than being
+        # attached to the scheme by hand. It then travels the same road as one
+        # the body raised -- deferred while its variable is open, retained by
+        # the binder that quantifies it, and rejected as ambiguous if no type
+        # in the group mentions it. Declaring a context is asking for it, not
+        # asserting it; a `fun` has no signature to be granted anything by.
+        for pred in self.classes.resolve_context(
+            getattr(decl, "context", []), self.tyvar_scopes[-1], self.fresh
+        ):
+            self.emit(CPred(pred, decl.span, "read"))
 
         self.scopes.append({name: False for name in binds})
         self.push()

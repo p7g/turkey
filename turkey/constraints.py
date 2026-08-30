@@ -18,6 +18,7 @@ group both need it:
     def x : t in C     CDef        monomorphic binding
     let x = C1 in C2   CLet        generalize C1, bind the schemes, solve C2
     x <= t             CInstance   a use site
+    given |- C         CAssume     the obligations a signature already grants
 
 **Ranks live here, not in the generator.** A variable's rank is the depth of
 the binder it was created under, and `CLet` is where that depth changes -- so
@@ -37,6 +38,11 @@ rows removed; in that shape it is GHC's `HasField x r a | x r -> a` (Gundry's
 nominal, so entailment is a declaration lookup. See `improve` for what the
 missing rows cost.
 
+A class predicate `C t` is the fourth form. It is discharged from the instance
+table (`turkey/classes.py`), or from the assumptions a `CAssume` has in scope:
+checking an instance method against its class's signature is the one place a
+predicate is *granted* rather than proved, because the signature said so.
+
 `OneOf` is the other predicate: the set of types a numeric literal could have.
 It is closed -- membership is decided by a built-in table, not by anything a
 program can declare -- so it needs no evidence at runtime, only a decision.
@@ -49,6 +55,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from .classes import ClassTable
 from .decls import DeclTable
 from .errors import Span, TypeError_
 from .types import (
@@ -140,6 +147,23 @@ class CLet(Constraint):
 
 
 @dataclass
+class CAssume(Constraint):
+    """Solve `body` with `preds` taken as given.
+
+    The only source of assumptions is a *declared* type that a body is being
+    checked against -- an instance method, or a class's default method. There
+    the class's own predicate, the instance's context and the method's context
+    are all facts, not obligations, and the body is entitled to use them. This
+    is the local-assumption form, and it is deliberately the whole of it: an
+    assumption introduced by a *pattern* is what makes GADTs destroy principal
+    types, and none is introduced here.
+    """
+
+    preds: list[Pred]
+    body: Constraint
+
+
+@dataclass
 class CInstance(Constraint):
     """`name <= t`: instantiate the scheme bound to `name` at `t`.
 
@@ -194,9 +218,13 @@ class Solver:
     always either solvable or an error.
     """
 
-    def __init__(self, decls: DeclTable, env: Env):
+    def __init__(self, decls: DeclTable, env: Env, classes: ClassTable | None = None):
         self.decls = decls
+        self.classes = classes if classes is not None else ClassTable(decls)
         self.env = env
+        # Predicates a `CAssume` currently grants. A stack in effect, restored
+        # on the way out of each one.
+        self.assumptions: list[Pred] = []
         self.pools: list[list[TVar]] = [[]]
         self.deferred: list[CPred] = []
         # Schemes of every name a `CLet` bound, for the `types` command.
@@ -252,6 +280,14 @@ class Solver:
             self.adopt(c.vars)
             self.solve(c.body)
             return
+        if isinstance(c, CAssume):
+            saved = self.assumptions
+            self.assumptions = saved + c.preds
+            try:
+                self.solve(c.body)
+            finally:
+                self.assumptions = saved
+            return
         if isinstance(c, CDef):
             with self.scope():
                 for name, ty in c.binds:
@@ -304,7 +340,8 @@ class Solver:
 
         with self.scope():
             for name, ty in c.binds:
-                binding = Binding(generalize(ty, self.rank, _constrain(retained, ty)), False)
+                preds = self.classes.simplify(_constrain(retained, ty))
+                binding = Binding(generalize(ty, self.rank, preds), False)
                 self.env.define(name, binding)
                 if c.top_level:
                     self.top_level.define(name, binding)
@@ -412,7 +449,38 @@ class Solver:
             return self._has_field(c)
         if c.pred.name == ONE_OF:
             return self._one_of(c)
+        if self.classes.is_class(c.pred.name):
+            return self._class(c)
         raise TypeError_(f"no rule for predicate '{c.pred.name}'", c.span)
+
+    def _class(self, c: CPred) -> bool:
+        """`C t`: an assumption grants it, or an instance covers it.
+
+        A predicate whose argument is still headed by a variable defers -- a
+        later unification may yet decide which instance applies. One headed by
+        anything rigid is decided here and now, which is what keeps a missing
+        instance a local error naming the type that lacks one, rather than a
+        stranded predicate reported at the end of a binding group.
+        """
+        t = prune(c.pred.args[0])
+        if isinstance(t, TBottom):
+            return True  # absorbed; there is no value to find a method for
+        head, _ = spine(t)
+        if isinstance(head, TVar):
+            return False
+        pred = Pred(c.pred.name, [t])
+        key = pred.key()
+        if any(q.key() == key for a in self.assumptions
+               for q in self.classes.by_super(a)):
+            return True
+        obligations = self.classes.by_inst(pred)
+        if obligations is None:
+            raise TypeError_(f"no instance for '{show_pred(pred)}'", c.span)
+        # The instance's own context becomes this site's, over the types the
+        # match supplied: `Eq (Array a)` leaves `Eq a` behind.
+        for q in obligations:
+            self.solve(CPred(q, c.span, c.context))
+        return True
 
     def _has_field(self, c: CPred) -> bool:
         label, receiver, result = c.pred.args
@@ -607,7 +675,7 @@ class Solver:
                 c.span,
             )
         raise TypeError_(
-            f"cannot determine a type satisfying '{show_pred(c.pred)}'. "
+            f"cannot determine a type satisfying '{show_pred(c.pred, free_prefix="")}'. "
             f"Add a type annotation.",
             c.span,
         )

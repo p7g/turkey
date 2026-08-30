@@ -244,7 +244,7 @@ class DeclTable:
         # arguments; anything else in it is a fresh variable.
         local: dict[str, TVar] = {}
         body = self.to_type(info.alias_body, local, fresh)
-        return _substitute(body, {v.id: substitution[k] for k, v in local.items()
+        return substitute(body, {v.id: substitution[k] for k, v in local.items()
                                   if k in substitution})
 
     # -- constructor helpers -----------------------------------------------
@@ -287,21 +287,21 @@ class DeclTable:
         _, params = spine(body.ret)
         mapping = {v.id: arg for v, arg in zip(params, args)
                    if isinstance(v, TVar)}
-        return _substitute(body.params[con.field_names.index(label)], mapping)
+        return substitute(body.params[con.field_names.index(label)], mapping)
 
 
-def _substitute(t: Type, mapping: dict[int, Type]) -> Type:
+def substitute(t: Type, mapping: dict[int, Type]) -> Type:
     from .types import prune
 
     t = prune(t)
     if isinstance(t, TVar):
         return mapping.get(t.id, t)
     if isinstance(t, TApp):
-        return TApp(_substitute(t.fn, mapping), _substitute(t.arg, mapping), t.kind)
+        return TApp(substitute(t.fn, mapping), substitute(t.arg, mapping), t.kind)
     if isinstance(t, TFun):
-        return TFun([_substitute(p, mapping) for p in t.params], _substitute(t.ret, mapping))
+        return TFun([substitute(p, mapping) for p in t.params], substitute(t.ret, mapping))
     if isinstance(t, TTuple):
-        return TTuple([_substitute(e, mapping) for e in t.elems])
+        return TTuple([substitute(e, mapping) for e in t.elems])
     return t
 
 

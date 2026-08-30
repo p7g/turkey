@@ -872,8 +872,11 @@ def show_scheme(scheme: Scheme) -> str:
     return f"[{context}] {body}"
 
 
-def show_pred(pred: Pred, names: dict[int, str] | None = None) -> str:
+def show_pred(pred: Pred, names: dict[int, str] | None = None,
+              free_prefix: str = "_") -> str:
     # A predicate is itself an application, so its arguments are rendered at
     # argument precedence: `HasField "d" a (Array Int)`, not `... a Array Int`.
-    args = " ".join(show(a, names, free_prefix="_", prec=2) for a in pred.args)
+    # The `_` marks a variable no scheme quantified, which is the point when a
+    # context is being printed and noise when a lone predicate is being blamed.
+    args = " ".join(show(a, names, free_prefix=free_prefix, prec=2) for a in pred.args)
     return f"{pred.name} {args}" if args else pred.name

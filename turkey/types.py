@@ -511,6 +511,12 @@ def sort_numeric(names) -> list[str]:
     return sorted(names, key=lambda n: (order.index(n) if n in order else len(order), n))
 
 
+# The name of the equality predicate (delta 39). It lives here, with `Pred`,
+# because a scheme carries it like any other; it is deliberately not a class
+# name, and `Classes.is_class` is false for it, which is what keeps it erased.
+EQUALS = "~"
+
+
 class Pred:
     """An atomic predicate: `HasField l r a`, `OneOf t {...}`, `Eq a`.
 
@@ -872,6 +878,29 @@ def type_key(t: Type) -> tuple:
     return ("bottom",)
 
 
+def subterms(t: Type):
+    """Every sub-term of `t`, itself included, pruned as it goes.
+
+    An occurs check over whole types rather than over variables: delta 39
+    needs to know whether one *family application* appears inside another
+    type, which `vars_of` cannot answer.
+    """
+    t = prune(t)
+    yield t
+    if isinstance(t, TApp):
+        yield from subterms(t.fn)
+        yield from subterms(t.arg)
+    elif isinstance(t, TFam):
+        yield from subterms(t.arg)
+    elif isinstance(t, TFun):
+        for p in t.params:
+            yield from subterms(p)
+        yield from subterms(t.ret)
+    elif isinstance(t, TTuple):
+        for e in t.elems:
+            yield from subterms(e)
+
+
 def vars_of(*types: Type) -> list[TVar]:
     """The unbound variables reachable from `types`, first occurrence first."""
     seen: dict[int, TVar] = {}
@@ -993,6 +1022,14 @@ def show_scheme(scheme: Scheme) -> str:
 
 def show_pred(pred: Pred, names: dict[int, str] | None = None,
               free_prefix: str = "_") -> str:
+    # An equality is written infix, as it is in a context: `Item c ~ Op`. Its
+    # sides are rendered at application precedence rather than argument
+    # precedence, since `~` binds looser than application and a family need not
+    # be parenthesized on either side of it.
+    if pred.name == EQUALS and len(pred.args) == 2:
+        left, right = (show(a, names, free_prefix=free_prefix, prec=1)
+                       for a in pred.args)
+        return f"{left} ~ {right}"
     # A predicate is itself an application, so its arguments are rendered at
     # argument precedence: `HasField "d" a (Array Int)`, not `... a Array Int`.
     # The `_` marks a variable no scheme quantified, which is the point when a

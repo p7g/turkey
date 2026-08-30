@@ -144,8 +144,13 @@ method       ::= fun-decl
 -- any other type constructor, so `type-expr` needs no production of its own.
 fam-decl     ::= "type" CONID IDENT
 fam-bind     ::= "type" CONID "=" type-expr
-context      ::= "[" class-pred ("," class-pred)* "]"
+context      ::= "[" ctx-pred ("," ctx-pred)* "]"
+ctx-pred     ::= class-pred | eq-pred                 -- (delta 39)
 class-pred   ::= CONID atype
+-- An equality states what a family answers (delta 39). The left side must be
+-- a family application and the right may not mention it, so a given is a
+-- terminating rewrite rule rather than a general equation.
+eq-pred      ::= type-expr "~" type-expr
 type-list    ::= type-expr ("," type-expr)*
 let-decl     ::= "let" pat "=" expr
 var-decl     ::= "var" pat "=" expr
@@ -269,6 +274,7 @@ expr-postfix "[" expr "]" "=" expr  -- mutate an array element
 ```
 σ ::= ∀ α₁ ... αₙ. π₁, ..., πₘ ⇒ τ   -- n, m ≥ 0; both 0 means monomorphic
 π ::= C τ                            -- a class predicate (delta 29)
+    | F τ ~ τ                        -- a family's answer (delta 39)
     | HasField l τ τ                 -- a field demand (delta 7)
     | OneOf τ {T₁, ..., Tₙ}          -- a numeric literal's set (delta 27)
 ```

@@ -51,13 +51,20 @@ parameters the group takes. Both are written where the decision is already
 being made -- there is no second pass over the constraint to find them, and no
 second notion of what a scheme carries.
 
-Since M7 the solver keeps a second queue. An associated type family makes an
-*equation* deferrable: `Elem a ~ Int` with `a` unbound is neither solvable nor
-false, so `unify` hands it back rather than deciding, and it is retried
-alongside the predicates. The two queues unblock each other -- reducing a
-family decides a type a predicate was waiting on, and discharging a predicate
-binds the variable a family was applied to -- which is why `settle` stops only
-when a round shortens neither.
+An associated type family makes an *equation* deferrable: `Elem a ~ Int` with
+`a` unbound is neither solvable nor false, so `unify` hands it back rather than
+deciding. Since delta 39 it comes back as the equality predicate `~`, which is
+the fifth form of the domain and the reason there is one queue here rather than
+two. An equation and a predicate wait on the same thing, so the binder that can
+carry one can carry the other: `retained` puts a stuck `Item a ~ Op` into a
+scheme exactly as it puts `Show (Item a)` there, and the caller decides it.
+Equalities and predicates still unblock each other -- reducing a family decides
+a type a predicate was waiting on, and discharging a predicate binds the
+variable a family was applied to -- which is why `settle` iterates.
+
+A `~` needs no evidence: it is not a class, so `is_class` is false for it and
+the same filters that erase `HasField` erase it. What it does carry is a
+*rewrite*, when it arrives as a given -- see `Solver.reduce`.
 
 `OneOf` is the other predicate: the set of types a numeric literal could have.
 It is closed -- membership is decided by a built-in table, not by anything a
@@ -76,7 +83,7 @@ from .decls import DeclTable
 from .evidence import Abstraction, Scope, Use, dict_name
 from .errors import Span, TypeError_
 from .types import (
-    GROUND, INT, Pred, Scheme, TBottom, TCon, TFam, TLabel, TSet, TVar, Type,
+    EQUALS, INT, Pred, Scheme, TBottom, TCon, TFam, TLabel, TSet, TVar, Type,
     generalize, instantiate_qual, mono, numeric_order, numeric_type, prune, show,
     show_pred, sort_numeric, spine, type_key, unify, vars_of,
 )
@@ -284,7 +291,6 @@ class Solver:
         # Equations `unify` could not decide: one side is a family application
         # whose argument is still open. This is the third outcome M7 gives
         # unification, and it is a queue for the same reason `deferred` is.
-        self.deferred_eqs: list[CEq] = []
         # Schemes of every name a `CLet` bound, for the `types` command.
         self.top_level: Env = env
 
@@ -313,10 +319,33 @@ class Solver:
     # -- families (the `types.Families` protocol) --------------------------
 
     def reduce(self, t: TFam) -> Type | None:
+        """`t`'s definition, from an assumption first and an instance after.
+
+        A *given* equality is a reduction rule for the family it names, and
+        this is where it is used. Discharging `Item c ~ Op` is not enough on
+        its own: the body's `match op { Inc(n) -> ... }` cannot find its
+        constructors unless `Item c` genuinely *becomes* `Op`, and `Item c`
+        over a skolem will never reduce through the instance table. So the
+        assumptions are consulted first, and the rule they supply is applied
+        exactly as an instance's would be.
+
+        `Classes.resolve_equality` guarantees each rule has a family
+        application on the left and does not mention it on the right, so a
+        family over a given skolem has one rule and rewriting terminates.
+        """
+        key = type_key(t)
+        for pred in self.assumptions:
+            if pred.name == EQUALS and type_key(pred.args[0]) == key:
+                return pred.args[1]
         return self.classes.reduce_fam(t)
 
     def defer(self, a: Type, b: Type, span: Span | None, context: str) -> None:
         """Take an equation unification could not decide.
+
+        It becomes an equality *predicate* rather than joining a queue of its
+        own. That is the whole of delta 39: a stuck equation and a deferred
+        predicate are waiting on the same thing, so the binder that can carry
+        one can carry the other, and `retained` now sees both.
 
         Before queueing it, ask whether it *could* ever be decided: a family
         over a constructor no instance covers is stuck for good, and the
@@ -337,7 +366,13 @@ class Solver:
                         f"'{show(t)}' has no definition",
                         span,
                     )
-        self.deferred_eqs.append(CEq(a, b, span, context))
+        # Oriented family-first, so a carried equality reads the way a written
+        # one has to be written (`Classes._resolve_equality`): `Item a ~ Op`,
+        # never `Op ~ Item a`. Nothing depends on the order -- `_equals` is
+        # symmetric -- but a scheme is read by people.
+        if isinstance(prune(b), TFam) and not isinstance(prune(a), TFam):
+            a, b = b, a
+        self.deferred.append(CPred(Pred(EQUALS, [a, b]), span, context))
 
     # -- solving -----------------------------------------------------------
 
@@ -349,7 +384,6 @@ class Solver:
         # error.
         while self.deferred and self.apply_defaults(list(self.deferred)):
             self.settle()
-        self.reject_stuck(self.deferred_eqs)
         self.reject_stranded(self.deferred)
 
     def solve(self, c: Constraint) -> None:
@@ -450,7 +484,6 @@ class Solver:
         # -- so this is where it is stuck for good. The test is `retained`'s,
         # for the same reason: an equation and a predicate are both waiting on
         # the same variables.
-        self.reject_stuck(self.take_stuck(self.rank - 1))
         self.discharge_pool(self.pools.pop())
 
         # The class predicates are shared across the group, and the dictionary
@@ -537,26 +570,23 @@ class Solver:
         was waiting on, which is why this iterates -- and why it may stop only
         when a round discharges nothing.
 
-        Since M7 there are two queues, because a family application makes an
-        *equation* deferrable too, and each can unblock the other: reducing
-        `Elem (Array Int)` decides a type that a `Show` predicate was waiting
-        on, and discharging a predicate can bind the variable a family was
-        applied to. A round that shortens neither queue has nothing left to
-        learn, so it stops.
+        M7 gave a family application the power to defer an *equation* too, and
+        each kind can unblock the other: reducing `Elem (Array Int)` decides a
+        type a `Show` predicate was waiting on, and discharging a predicate can
+        bind the variable a family was applied to. Since delta 39 an equation
+        *is* a predicate, so there is one queue rather than two -- but the
+        order within a round still matters, and equalities go first for the
+        same reason they used to: a family that has become reducible decides a
+        type, and a predicate waiting on that type can then settle in the same
+        round.
         """
-        while self.deferred or self.deferred_eqs:
+        while self.deferred:
             self.improve()
             pending, self.deferred = self.deferred, []
-            equations, self.deferred_eqs = self.deferred_eqs, []
-            # Equations first: a family that has become reducible decides a
-            # type, and a predicate waiting on that type can then be settled in
-            # the same round.
-            for c in equations:
-                unify(c.left, c.right, c.span, c.context, self)
+            pending.sort(key=lambda c: c.pred.name != EQUALS)
             for c in pending:
                 self.solve(c)
-            if (len(self.deferred) >= len(pending)
-                    and len(self.deferred_eqs) >= len(equations)):
+            if len(self.deferred) >= len(pending):
                 return
 
     def improve(self) -> None:
@@ -583,6 +613,7 @@ class Solver:
         `unify`, which is the coupling HM(X) is chosen to avoid.)
         """
         self.improve_numeric()
+        self.improve_families()
         seen: dict[tuple, Type] = {}
         for c in self.deferred:
             if c.pred.name != HAS_FIELD:
@@ -595,12 +626,39 @@ class Solver:
             else:
                 seen[key] = result
 
+    def improve_families(self) -> None:
+        """Equate the answers of two equalities on one family application.
+
+        The same rule as `improve`'s, and for the same reason: a family is a
+        *function* of its argument, so `Item c ~ Op` and `Item c ~ Char`
+        cannot both hold. Neither is discharged while `Item c` is stuck, so
+        without this they would both be carried and the contradiction would
+        never be reported at all.
+        """
+        seen: dict[tuple, tuple[Type, CPred]] = {}
+        for c in self.deferred:
+            if c.pred.name != EQUALS:
+                continue
+            left, right = c.pred.args
+            if not isinstance(prune(left), TFam):
+                continue
+            key = type_key(left)
+            if key in seen:
+                first, at = seen[key]
+                unify(first, right, c.span or at.span,
+                      f"the answers given for '{show(left, free_prefix='')}'",
+                      self)
+            else:
+                seen[key] = (right, c)
+
     def entail(self, c: CPred) -> bool:
         """Try to discharge one predicate. False means "not yet" -- defer it.
 
         An unsatisfiable predicate raises; only genuine lack of information
         returns False, so nothing can be quietly dropped.
         """
+        if c.pred.name == EQUALS:
+            return self._equals(c)
         if c.pred.name == HAS_FIELD:
             return self._has_field(c)
         if c.pred.name == ONE_OF:
@@ -608,6 +666,28 @@ class Solver:
         if self.classes.is_class(c.pred.name):
             return self._class(c)
         raise TypeError_(f"no rule for predicate '{c.pred.name}'", c.span)
+
+    def _equals(self, c: CPred) -> bool:
+        """`s ~ t`: retry the equation now that something may have moved.
+
+        Normalizing is what makes progress: `reduce` consults the assumptions
+        and then the instance table, so a side that has become reducible --
+        because a variable was decided, or because a given names it -- reduces
+        here. What is left decides the answer. Two identical family
+        applications are equal by reflexivity, and a side that is *still* a
+        stuck family means the equation is not yet decidable, which is
+        `False`: back onto `deferred`, where `retained` may put it in a scheme
+        and hand it to the caller. Anything else is an ordinary unification.
+        """
+        left = self.classes.normalize(c.pred.args[0])
+        right = self.classes.normalize(c.pred.args[1])
+        c.pred.args = [left, right]
+        if type_key(left) == type_key(right):
+            return True
+        if isinstance(left, TFam) or isinstance(right, TFam):
+            return False
+        unify(left, right, c.span, c.context, self)
+        return True
 
     def granted(self, pred: Pred) -> bool:
         """Is `pred` a fact the enclosing declaration already assumed?
@@ -827,36 +907,6 @@ class Solver:
         self.deferred = keep
         return retained
 
-    def take_stuck(self, level: int) -> list[CEq]:
-        """Deferred equations no binder outside `level` could ever decide."""
-        keep, taken = [], []
-        for c in self.deferred_eqs:
-            (keep if _eq_level(c) <= level else taken).append(c)
-        self.deferred_eqs = keep
-        return taken
-
-    def reject_stuck(self, stuck: list[CEq]) -> None:
-        """Report an equation whose family application will never reduce.
-
-        The blame goes on the family rather than on what it was compared with:
-        the equation is not wrong, it is undecidable, and what is missing is
-        the knowledge of which instance defines the family.
-        """
-        if not stuck:
-            return
-        c = stuck[0]
-        fam = c.left if isinstance(c.left, TFam) else c.right
-        other = c.right if fam is c.left else c.left
-        assert isinstance(fam, TFam)
-        cls = self.classes.decls.families[fam.name].cls
-        where = f" in {c.context}" if c.context else ""
-        raise TypeError_(
-            f"cannot reduce '{show(fam, free_prefix='')}' to "
-            f"'{show(other, free_prefix='')}'{where}: nothing says which "
-            f"'{cls}' instance defines it.",
-            c.span,
-        )
-
     def reject_stranded(self, stranded: list[CPred]) -> None:
         """Report a predicate that can be neither discharged nor quantified.
 
@@ -869,6 +919,26 @@ class Solver:
         if not stranded:
             return
         c = stranded[0]
+        if c.pred.name == EQUALS:
+            # An equality that reaches here is not wrong, it is undecidable,
+            # and the blame goes on the family rather than on what it was
+            # compared with: what is missing is the knowledge of which instance
+            # defines it. A scheme would have carried it happily -- that is the
+            # ordinary case since delta 39 -- so getting this far means no type
+            # being generalized mentions the family's argument, and no caller
+            # will ever supply one.
+            left, right = c.pred.args
+            fam = left if isinstance(left, TFam) else right
+            other = right if fam is left else left
+            assert isinstance(fam, TFam)
+            cls = self.classes.decls.families[fam.name].cls
+            where = f" in {c.context}" if c.context else ""
+            raise TypeError_(
+                f"cannot reduce '{show(fam, free_prefix='')}' to "
+                f"'{show(other, free_prefix='')}'{where}: nothing says which "
+                f"'{cls}' instance defines it.",
+                c.span,
+            )
         if c.pred.name == HAS_FIELD:
             label = c.pred.args[0]
             assert isinstance(label, TLabel)
@@ -941,16 +1011,6 @@ def _unattributed(preds: list[CPred], types: list[Type]) -> list[CPred]:
     """The retained predicates no scheme in the group will carry."""
     ids = reach(preds, types)
     return [c for c in preds if not _touches(c, ids)]
-
-
-def _eq_level(c: CEq) -> int:
-    """The binder depth a deferred equation is tied to -- `Pred.level`'s rule.
-
-    An equation between skolems mentions no unification variable at all, which
-    makes it ground and therefore decidable nowhere but here.
-    """
-    levels = [v.level for v in vars_of(c.left, c.right)]
-    return min(levels) if levels else GROUND
 
 
 def _touches(c: CPred, ids: set[int]) -> bool:

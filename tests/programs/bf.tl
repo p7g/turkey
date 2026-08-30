@@ -44,7 +44,15 @@ fun parse(chars, start) {
     (ops, i)
 }
 
-fun run(tape, ops) {
+-- The general type, and it takes both halves of M10 to write it down. `ops` is
+-- any `Iterator` whose element is an `Op`, which is what `run` actually needs
+-- -- not an `Array Op`, which is merely what the recursive call would have
+-- pinned it to. `Item s ~ Op` is the equality (delta 39); stating it in a
+-- signature is what makes it a *given*, so `Item s` reduces to `Op` and the
+-- `match` below can find its constructors. And because the signature is known
+-- before the body is solved (delta 38), `run(tape, loopOps)` instantiates it at
+-- `Array Op` rather than forcing `s` to be one.
+fun run[Iterator s, Item s ~ Op](tape : Tape, ops : s) -> Unit {
     for op in ops {
         match op {
             Inc(n) -> inc(tape, n)

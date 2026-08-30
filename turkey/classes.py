@@ -48,9 +48,9 @@ from . import ast
 from .decls import DeclTable, FamilyInfo, substitute
 from .errors import Span, TypeError_
 from .types import (
-    KVar, Kind, Pred, Scheme, TApp, TCon, TFam, TFun, TTuple, TVar, Type,
-    default_kind, generalize, kind_of, prune, show, show_kind, show_pred, spine,
-    type_key, unify_kinds,
+    EQUALS, KVar, Kind, Pred, Scheme, TApp, TCon, TFam, TFun, TTuple, TVar,
+    Type, default_kind, generalize, kind_of, prune, show, show_kind, show_pred,
+    spine, subterms, type_key, unify_kinds,
 )
 
 
@@ -291,7 +291,25 @@ class ClassTable:
         if fresh is None:
             fresh = lambda: TVar(1)  # noqa: E731
         out: list[Pred] = []
+        answers: dict[tuple, ast.EqPred] = {}
         for pred in context:
+            if isinstance(pred, ast.EqPred):
+                equality = self._resolve_equality(pred, tyvars, fresh)
+                # A family is a function of its argument, so a context may give
+                # it one answer. Two are caught here rather than by `improve`,
+                # which only sees the *deferred* queue: a written equality
+                # becomes an assumption and never joins it.
+                key = type_key(equality.args[0])
+                if key in answers:
+                    raise TypeError_(
+                        f"'{show(equality.args[0])}' is already required to be "
+                        f"'{show(answers[key].args[1])}' here, and a family "
+                        f"has one answer for one argument",
+                        pred.span,
+                    )
+                answers[key] = equality
+                out.append(equality)
+                continue
             info = self.classes.get(pred.name)
             if info is None:
                 raise TypeError_(f"unknown class '{pred.name}'", pred.span)
@@ -305,6 +323,43 @@ class ClassTable:
                 )
             out.append(Pred(pred.name, [arg]))
         return out
+
+    def _resolve_equality(self, pred: ast.EqPred, tyvars, fresh) -> Pred:
+        """Translate a written `Item c ~ Op` (delta 39).
+
+        The left side must be a family application, and that restriction is
+        what keeps the rule sound as a *given*. A given equality is used by
+        rewriting -- `Item c` has to actually become `Op` for a `match` on the
+        element to find its constructors -- so each one is read as a reduction
+        rule for the family it names. Requiring the family on the left gives
+        every rule a single, syntactically evident left-hand side; requiring
+        the right side not to mention it keeps rewriting terminating.
+
+        A general equality between two arbitrary types would be neither. It is
+        also not needed: `Int ~ a` says nothing a plain annotation cannot.
+        """
+        left = self.decls.to_type(pred.left, tyvars, fresh)
+        right = self.decls.to_type(pred.right, tyvars, fresh)
+        if not isinstance(left, TFam):
+            raise TypeError_(
+                f"'{show(left)}' is not a type family, and the left side of "
+                f"a '~' must be one -- an equality says what a family "
+                f"answers, not that two types happen to agree",
+                pred.span,
+            )
+        if any(type_key(t) == type_key(left) for t in subterms(right)):
+            raise TypeError_(
+                f"'{show(right)}' mentions '{show(left)}', so the equality "
+                f"defines it in terms of itself",
+                pred.span,
+            )
+        if not unify_kinds(kind_of(left), kind_of(right)):
+            raise TypeError_(
+                f"'{show(left)}' has kind {show_kind(kind_of(left))}, but "
+                f"'{show(right)}' has kind {show_kind(kind_of(right))}",
+                pred.span,
+            )
+        return Pred(EQUALS, [left, right])
 
     def _resolve_instance(self, d: ast.InstanceDecl) -> InstInfo:
         info = self.classes.get(d.cls)

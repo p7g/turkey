@@ -407,13 +407,19 @@ class Generator:
         rigid = {name: skolems.bind(var, name) for name, var in tyvars.items()
                  if isinstance(var, TVar)}
         expected = skolems.apply(scheme.body)
-        # Only a class predicate arrives as a dictionary; the erased kinds are
-        # facts the body may use but never asks for evidence of. The order is
-        # the scheme's, because that is the order a use site instantiates in
-        # and `eval.supply` zips the two together positionally.
-        wanted = [p for p in scheme.preds if self.classes.is_class(p.name)]
-        givens = [(dict_name(p.name), skolems.apply_pred(p)) for p in wanted]
-        decl.dicts = Abstraction([n for n, _ in givens], wanted)
+        # *Every* declared predicate is a fact the body may use, so every one
+        # becomes a given -- an equality included, since `Solver.reduce` reads
+        # the assumptions for the rewrite that makes `Item s` become `Op`.
+        # Only a class predicate arrives as a *dictionary*, though; the erased
+        # kinds are facts the body never asks for evidence of. So the runtime
+        # parameters are the class predicates alone, in the scheme's order,
+        # because that is the order a use site instantiates in and
+        # `eval.supply` zips the two together positionally.
+        givens = [(dict_name(p.name), skolems.apply_pred(p))
+                  for p in scheme.preds]
+        passed = [(name, p) for (name, _), p in zip(givens, scheme.preds)
+                  if self.classes.is_class(p.name)]
+        decl.dicts = Abstraction([n for n, _ in passed], [p for _, p in passed])
 
         self.push()
         inferred = self.gen_function(decl, rigid)

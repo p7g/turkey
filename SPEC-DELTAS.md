@@ -1120,3 +1120,94 @@ that mixes the two paths *mutually recursively* is rejected: the skolem of the
 annotated member flows into the inferred member's placeholder, and the
 assumption granting it belongs to the annotated member's body. Splitting a
 group's assumptions per member would fix it; nothing needs it yet.
+
+### 39. A context may state an equality, and a scheme may carry one
+
+Delta 31 gave unification a third outcome and then took half of it back. An
+equation over a family can *defer*, and a deferred equation was retried
+alongside the deferred predicates -- but where a predicate that survived to a
+binder was **retained** into the scheme, an equation that survived to the same
+binder was **rejected**. Delta 31 said why in as many words:
+
+> An equation still stuck when the binding that owns its variables generalizes
+> can never be decided by anything outside, and is an error there.
+
+The first clause is true of the *variables* and false of the equation. Nothing
+outside can decide `a`, but every caller decides it, which is what a qualified
+type is for. The same argument would prove that `Container a` cannot be
+quantified either -- and the asymmetry was visible in the code, since
+`retained` and `take_stuck` applied the identical level test and one fed
+`generalize` while the other fed a `raise`. It was visible in the language too:
+`Show (Elem c)` -- a predicate *over* a stuck family -- was inferred and
+carried without complaint. Only the equation was refused.
+
+**An equation is now a predicate.** `~` is the fifth form of the domain,
+`Pred("~", [left, right])`, and `unify` defers into the one queue the
+predicates already use. `take_stuck`, `reject_stuck`, `deferred_eqs` and the
+duplicate of `Pred.level` that served them are gone; `retained` handles both
+kinds because there is only one kind. Within a round equalities are still
+solved first, for the reason two queues used to encode: a family that has just
+become reducible decides a type a predicate is waiting on.
+
+The immediate effect is that programs which had no type acquire one:
+
+```
+fun countOps(ops) {
+    var n = 0
+    for op in ops { n = n + useOp(op) }
+    n
+}
+```
+
+was `cannot reduce 'Item a' to 'Op'` and is now `[Item a ~ Op, Iterator a]
+fun(a) -> Int`. So is the version that *matches* on the element rather than
+passing it: a constructor pattern fixes the scrutinee by ordinary unification,
+which defers the equality, which is now kept.
+
+**`~` costs nothing at runtime.** It is deliberately not a class name, so
+`is_class` is false for it and the three filters that already erase `HasField`
+erase it: it never reaches `Use.preds`, never becomes a dictionary parameter,
+and still travels in the scheme. No evidence, no elaboration case, no change to
+the evaluator.
+
+**A written equality is a rewrite rule.** Discharging `Item s ~ Op` is not
+enough on its own. In `bf.tl`'s `run` the scrutinee has type `Item s`, and
+`match op { Inc(n) -> ... }` cannot look up a constructor until `Item s`
+genuinely *becomes* `Op`. So a *given* equality is read as a reduction rule for
+the family it names: `Solver.reduce` consults the assumptions before the
+instance table, and `Item s` reduces everywhere in the body -- match,
+exhaustiveness, field access alike.
+
+Two syntactic restrictions keep that sound and terminating, both checked where
+the equality is written. The left side must be a family application, so every
+rule has one evident left-hand side; and the right side may not mention it, so
+no rule feeds itself. A context may also give a family only one answer: `[Item
+s ~ Op, Item s ~ Int]` is rejected there, because a written equality becomes an
+assumption and never joins the deferred queue that `improve` inspects. For
+equalities that *are* deferred, `improve_families` applies the same rule that
+`improve` has always applied to `HasField`, and for the same reason -- a family
+is a function of its argument.
+
+**Syntax.** `~` is a new token, and `class-pred` becomes one of two forms.
+`parse_context` reads each entry as a type expression and classifies it
+afterwards, because nothing shorter can tell `Item c ~ Op` from `Show (Elem c)`
+-- they begin identically and the `~` is two atypes away. Destructuring the
+result also enforces the one-argument rule the old `CONID atype` production
+enforced by shape. A carried equality is oriented family-first when it is
+built, so an inferred context reads the way a written one must be written.
+
+**This is what `bf.tl`'s `run` was missing**, and it needed both halves of M10:
+
+```
+fun run[Iterator s, Item s ~ Op](tape : Tape, ops : s) -> Unit
+```
+
+Delta 39 is what lets the type be written and the `match` reduce; delta 38 is
+what stops the recursive `run(tape, loopOps)` from pinning `s` to `Array Op`.
+
+**Scope.** `bf.tl` and its `.types` moved; no other golden did. Declined while
+here: a general `σ ~ τ` between two arbitrary types. It is what would make this
+a rewrite system needing confluence rather than a table of family definitions,
+and it says nothing an annotation cannot. Equalities introduced by a *pattern*
+are declined for the reason `CAssume` already gives -- that is what destroys
+principal types -- and none is introduced.

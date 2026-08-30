@@ -387,21 +387,38 @@ class Parser:
         body = self.parse_fun_body()
         return ast.FunDecl(span, name, params, ret, body, context)
 
-    def parse_context(self) -> list[ast.ClassPred]:
-        """`[C a, D b]` -- a context, not a binder.
+    def parse_context(self) -> list[ast.ClassPred | ast.EqPred]:
+        """`[C a, Item c ~ Op]` -- a context, not a binder.
 
         The variables it mentions are the enclosing declaration's annotation
         variables (SPEC-DELTAS.md 13), which is why this constrains rather than
         introduces. It sits after the name so that a bare `fun[...]` stays free
         for a constrained lambda later.
+
+        Each entry is read as a *type expression* first and classified after,
+        because nothing shorter can tell the two forms apart: `Item c ~ Op` and
+        `Show (Elem c)` begin identically, and the `~` that separates them is
+        two atypes away. So the class-predicate reading is recovered by
+        destructuring what came back, which also enforces the arity rule a
+        `CONID atype` production used to enforce by shape.
         """
         if not self.at("["):
             return []
         self.advance()
-        preds: list[ast.ClassPred] = []
+        preds: list[ast.ClassPred | ast.EqPred] = []
         while True:
-            tok = self.expect("CONID", "a class name")
-            preds.append(ast.ClassPred(tok.span, tok.text, self.parse_atype()))
+            start = self.cur.span
+            written = self.parse_type_expr()
+            if self.eat("~"):
+                preds.append(ast.EqPred(start, written, self.parse_type_expr()))
+            elif isinstance(written, ast.TECon) and len(written.args) == 1:
+                preds.append(ast.ClassPred(start, written.name, written.args[0]))
+            else:
+                raise ParseError(
+                    "a context entry is a class applied to one type, as in "
+                    "'Ord a', or an equality, as in 'Item c ~ Op'",
+                    start,
+                )
             if not self.eat(","):
                 break
         self.expect("]")

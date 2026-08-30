@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import pytest
 
+from turkey import ast
 from turkey.driver import check, run
 from turkey.errors import TurkeyError
 from turkey.types import TFam, show_scheme
@@ -187,16 +188,42 @@ def test_an_equation_over_an_open_family_waits_rather_than_failing():
     assert scheme(src, "f") == "fun(Array Int) -> Int"
 
 
-def test_an_equation_no_signature_could_promise_is_rejected():
-    # The counterpart: here nothing ever decides `c`, and `Elem c ~ Int` holds
-    # for some containers and not others, so `f` cannot be given a type.
+def test_an_equation_no_instance_decides_is_carried_by_the_scheme():
+    # The counterpart, and what delta 39 changed. Nothing here ever decides
+    # `c`, and `Elem c ~ Int` holds for some containers and not others -- so
+    # the condition travels to the caller, exactly as `Container c` does. This
+    # was a hard error before: the equation was stuck, and a stuck equation was
+    # rejected at the binder rather than retained by it.
     src = CONTAINER + """
     fun f(xs) {
         let n : Int = first(xs)
         return n
     }
     """
-    assert "cannot reduce 'Elem a' to 'Int'" in fails(src)
+    assert scheme(src, "f") == "[Elem a ~ Int, Container a] fun(a) -> Elem a"
+
+
+def test_a_carried_equation_is_checked_at_the_use_site(capsys):
+    """What the caller has to make good on, and what happens if it cannot."""
+    src = CONTAINER + """
+    fun f(xs) {
+        let n : Int = first(xs)
+        return n
+    }
+    fun main() { print(Int.toString(f([1, 2]))) }
+    """
+    assert output(src, capsys) == ["1"]
+
+    bad = CONTAINER + """
+    fun f(xs) {
+        let n : Int = first(xs)
+        return n
+    }
+    fun g() = f(["no"])
+    """
+    # `Elem (Array String)` reduces, and the equality is then an ordinary
+    # mismatch at the call rather than a mystery inside `f`.
+    assert "expected String, found Int" in fails(bad)
 
 
 def test_an_equation_that_can_never_be_decided_is_rejected():
@@ -283,3 +310,127 @@ def _has_family(t) -> bool:
     if isinstance(t, TTuple):
         return any(_has_family(e) for e in t.elems)
     return False
+
+
+# -- equality constraints (delta 39) ------------------------------------------
+
+OPS = """
+type Op = Inc(Int) | Loop(Array Op)
+
+fun useOp(o : Op) -> Int = 1
+"""
+
+
+def test_an_equality_parses_and_round_trips():
+    src = OPS + """
+    fun c[Iterator s, Item s ~ Op](ops : s) -> Int {
+        var n = 0
+        for op in ops { n = n + 1 }
+        n
+    }
+    """
+    assert scheme(src, "c") == "[Iterator a, Item a ~ Op] fun(a) -> Int"
+
+
+def test_an_equality_on_the_element_is_inferred():
+    """No annotation: the element is merely *used* at a concrete type.
+
+    This was a hard error before delta 39 -- `Item a ~ Op` was stuck at the
+    binder, and a stuck equation was rejected there rather than retained.
+    """
+    src = OPS + """
+    fun countOps(ops) {
+        var n = 0
+        for op in ops { n = n + useOp(op) }
+        n
+    }
+    """
+    assert scheme(src, "countOps") == "[Item a ~ Op, Iterator a] fun(a) -> Int"
+
+
+def test_a_given_equality_lets_a_match_find_its_constructors(capsys):
+    """The rewrite, not merely the discharge.
+
+    `op` has type `Item s`, and a `match` cannot look up `Inc` until that
+    *becomes* `Op`. Only a declared equality can do it: the given is read as a
+    reduction rule for the family (`Solver.reduce`).
+    """
+    src = OPS + """
+    fun runOps[Iterator s, Item s ~ Op](ops : s) -> Int {
+        var n = 0
+        for op in ops {
+            match op {
+                Inc(k) -> { n = n + k }
+                Loop(inner) -> { n = n + runOps(inner) }
+            }
+        }
+        n
+    }
+    fun main() {
+        print(Int.toString(runOps([Inc(2), Loop([Inc(3), Inc(4)]), Inc(1)])))
+    }
+    """
+    assert scheme(src, "runOps") == "[Iterator a, Item a ~ Op] fun(a) -> Int"
+    assert output(src, capsys) == ["10"]
+
+
+def test_matching_the_element_is_inferred_too():
+    """A constructor pattern *unifies*, so it needs no given to work.
+
+    `Inc` fixes the scrutinee at `Op` by the ordinary route, which defers
+    `Item a ~ Op` and now retains it. So the un-annotated form gets a type as
+    well, and a more general one than delta 38 alone could give it. The given
+    earns its place where a family must reduce for something other than
+    unification -- see the `runOps` above, whose `Item s` is rigid.
+    """
+    src = OPS + """
+    fun runOps(ops) {
+        var n = 0
+        for op in ops {
+            match op {
+                Inc(k) -> { n = n + k }
+                Loop(inner) -> { n = n + 1 }
+            }
+        }
+        n
+    }
+    """
+    assert scheme(src, "runOps") == "[Item a ~ Op, Iterator a] fun(a) -> Int"
+
+
+def test_two_answers_for_one_family_application_conflict():
+    """A family is a function of its argument, so it has one answer."""
+    src = OPS + """
+    fun bad[Iterator s, Item s ~ Op, Item s ~ Int](ops : s) -> Int = 1
+    """
+    assert "and a family has one answer for one argument" in fails(src)
+
+
+def test_the_left_side_of_an_equality_must_be_a_family():
+    src = "fun f[Int ~ a](x : a) -> Int = 1"
+    assert "is not a type family" in fails(src)
+
+
+def test_an_equality_may_not_define_a_family_by_itself():
+    src = OPS + "fun f[Iterator s, Item s ~ Array (Item s)](ops : s) -> Int = 1"
+    assert "in terms of itself" in fails(src)
+
+
+def test_a_context_entry_that_is_neither_form_is_a_parse_error():
+    assert "an equality, as in 'Item c ~ Op'" in fails("fun f[Ord a b](x : a) -> Int = 1")
+
+
+def test_an_equality_costs_no_dictionary():
+    """`~` is not a class, so the filters that erase `HasField` erase it too."""
+    src = OPS + """
+    fun c[Iterator s, Item s ~ Op](ops : s) -> Int {
+        var n = 0
+        for op in ops { n = n + 1 }
+        n
+    }
+    """
+    checked = check(src)
+    decl = next(s.decl for s in checked.ordered
+                if isinstance(s, ast.SFun) and s.decl.name == "c")
+    assert [p.name for p in decl.dicts.preds] == ["Iterator"]
+    assert len(decl.dicts.params) == 1

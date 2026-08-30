@@ -354,6 +354,20 @@ class ClassPred(Node):
 
 
 @dataclass(eq=False)
+class EqPred(Node):
+    """One equality as written: `Item c ~ Op` (delta 39).
+
+    A family application is a *function* on types, so an equality is how a
+    context says what that function answers -- the thing a class predicate
+    cannot say, because `Item c` is not a class. The left side is required to
+    be a family application; see `Classes.resolve_context` for why.
+    """
+
+    left: TypeExpr
+    right: TypeExpr
+
+
+@dataclass(eq=False)
 class FunDecl(Node):
     """A function, or -- with `body is None` -- a bare signature.
 

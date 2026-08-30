@@ -83,7 +83,8 @@ from .decls import DeclTable
 from .evidence import Abstraction, Scope, Use, dict_name
 from .errors import Span, TypeError_
 from .types import (
-    EQUALS, INT, Pred, Scheme, TBottom, TCon, TFam, TLabel, TSet, TVar, Type,
+    EQUALS, INT, NO_SCOPE, Pred, Scheme, TBottom, TCon, TFam, TLabel, TSet, TVar,
+    Type,
     generalize, instantiate_qual, mono, numeric_order, numeric_type, prune, show,
     show_pred, sort_numeric, spine, type_key, unify, vars_of,
 )
@@ -192,6 +193,11 @@ class CLet(Constraint):
     span: Span | None = None
     top_level: bool = False
     dicts: Abstraction | None = None
+    #: Skolems that live exactly as long as `defn`'s rank -- the constants a
+    #: signature's variables became. Carried here for the same reason ranks
+    #: are the solver's business at all: this is the one place that knows how
+    #: deep the definition sits, so this is where they can be stamped.
+    skolems: list[TCon] = field(default_factory=list)
 
 
 @dataclass
@@ -472,6 +478,24 @@ class Solver:
         into the parent's pool.
         """
         self.pools.append([])
+        # Now that the rank exists, the constants that belong to it can say so.
+        # `escaping` needs nothing else: a variable born shallower than this is
+        # a variable no skolem of this binder may bind.
+        #
+        # And only while the rank exists. `solve_let` is the whole of a
+        # skolem's life, so the stamp is lifted on the way out -- not tidiness,
+        # but correctness: `check_exhaustiveness` unifies constructor types
+        # against a solved scrutinee long afterwards, at no rank at all, and a
+        # constant still claiming a rank there would look like an escape.
+        for con in c.skolems:
+            con.level = self.rank
+        try:
+            self._let(c)
+        finally:
+            for con in c.skolems:
+                con.level = NO_SCOPE
+
+    def _let(self, c: CLet) -> None:
         scope = Scope()
         self.scopes.append(scope)
         first_use = len(self.uses)

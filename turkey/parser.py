@@ -425,7 +425,7 @@ class Parser:
         return preds
 
     def _try_signature(
-        self, span: Span, name: str, context: list[ast.ClassPred]
+        self, span: Span, name: str, context: list[ast.ClassPred | ast.EqPred]
     ) -> ast.FunDecl | None:
         """Read the parameter list as types. None means "this has a body"."""
         start = self.i
@@ -833,11 +833,19 @@ class Parser:
         # `for pat in expr` and the C-style header are told apart by trying the
         # first and backtracking. Only `in` distinguishes them.
         saved = self.i
+        # `in` is the only thing that tells the two apart, so it is also the
+        # point of no return. Backtracking past it would re-read the loop as
+        # the C-style form and report whatever *that* reading fails on -- an
+        # error about a missing `;` in a loop that never had one, hiding the
+        # real complaint about the body. So a failure before `in` backtracks
+        # and a failure after it is the answer.
+        committed = False
         try:
             with self._with_no_record(False):
                 pat = self.parse_pattern()
             if self.at("in"):
                 self.advance()
+                committed = True
                 iterable = self.parse_scrutinee()
                 body = self.parse_block()
                 return ast.EForIn(
@@ -846,7 +854,8 @@ class Parser:
                     ast.EVar(iterable.span, prelude.ITER_NEXT),
                 )
         except ParseError:
-            pass
+            if committed:
+                raise
         self.i = saved
 
         with self._with_no_record(False):

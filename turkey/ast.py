@@ -383,7 +383,7 @@ class FunDecl(Node):
     params: list[Pattern]
     ret: TypeExpr | None
     body: Expr | None
-    context: list[ClassPred] = field(default_factory=list)
+    context: list[ClassPred | EqPred] = field(default_factory=list)
     # `evidence.Abstraction`: the leading dictionary parameters this
     # declaration gained, if its scheme retained any class predicate. Written
     # by the solver, at the one place it decides what a scheme carries.
@@ -480,7 +480,7 @@ class InstanceDecl(Node):
 
     cls: str
     head: TypeExpr
-    context: list[ClassPred]
+    context: list[ClassPred | EqPred]
     methods: list[FunDecl]
     families: list[FamBind] = field(default_factory=list)
 

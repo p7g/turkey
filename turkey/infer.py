@@ -336,7 +336,8 @@ class Generator:
         # the body raised is settled here, against the assumptions, instead of
         # escaping to the end of the program.
         self.emit(CAssume(givens, CLet([(f"%{what}.{method.name}", expected)],
-                                       defn, CAnd([]), decl.span)))
+                                       defn, CAnd([]), decl.span,
+                                       skolems=list(skolems.made))))
         return MethodImpl(decl, self_name, params)
 
     # -- signatures --------------------------------------------------------
@@ -431,7 +432,8 @@ class Generator:
         # buys is that a predicate the body raised is settled here, against the
         # assumptions, instead of escaping to the end of the program.
         return CAssume(givens, CLet([(f"%sig.{decl.name}", expected)],
-                                    defn, CAnd([]), decl.span))
+                                    defn, CAnd([]), decl.span,
+                                    skolems=list(skolems.made)))
 
     def check_exhaustiveness(self) -> None:
         """Section 5.1: a non-exhaustive match is a warning, not an error --

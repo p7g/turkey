@@ -16,6 +16,15 @@ from turkey.driver import check, run
 from turkey.errors import TurkeyError
 from turkey.types import show_scheme
 
+#: The message a skolem escape raises (delta 40), quoted rather than matched
+#: on a fragment: it is the whole of what a reader gets, so a test that
+#: accepted half of it would not be pinning the diagnostic.
+ESCAPES = (
+    "the type 'a' cannot escape the signature that declares it: it stands "
+    "for whatever a caller of that function chooses, so nothing outside can "
+    "be equal to it"
+)
+
 ITER = """
 type Two a = Two { fst : a, snd : a }
 type TwoCur = TwoCur { taken : Int }
@@ -238,15 +247,16 @@ def test_an_inferred_caller_instantiates_an_annotated_callee(capsys):
     assert output(src, capsys) == ["5"]
 
 
-def test_mutual_recursion_across_the_two_paths_is_rejected():
-    """A known limit, recorded rather than claimed -- see delta 38.
+def test_mutual_recursion_across_the_two_paths_reports_the_escape():
+    """Rejected, and now for the reason it is actually rejected -- delta 40.
 
     `size` states its type, so its parameter is a skolem; `other` shares its
-    group and is inferred, so it is checked against a monomorphic placeholder
-    that the skolem flows into. The demand `other` then raises is about a
-    rigid type, and the assumption granting it belongs to `size`'s body, not
-    to `other`'s. Splitting the group's assumptions per member would fix it;
-    nothing here needs it yet.
+    SCC and is inferred, so it is checked against one monomorphic placeholder,
+    which the skolem flows into. That is a real error rather than a gap:
+    `other` is used at two element types, so it would have to be polymorphic,
+    and a member the group infers cannot be -- polymorphic recursion again,
+    undecidable in inference. The remedy is a signature on `other` too, which
+    is what the message points at and what Haskell asks for here.
     """
     src = ITER + """
     fun size[Iterator a](xs : a) -> Int {
@@ -257,22 +267,70 @@ def test_mutual_recursion_across_the_two_paths_is_rejected():
     }
     fun other(xs) = size(xs) + size(Two { fst = 1, snd = 2 })
     """
-    assert fails(src) == "no instance for 'Iterator a'"
+    assert fails(src) == ESCAPES
+
+
+def test_mutual_recursion_checks_when_both_members_state_their_types(capsys):
+    """And with the signature that message asks for, the same group goes
+    through: every recursive occurrence instantiates a declared scheme."""
+    src = ITER + """
+    fun size[Iterator a](xs : a) -> Int {
+        var n = 0
+        for x in xs { n = n + 1 }
+        if n == 99 { return other(xs) }
+        n
+    }
+    fun other[Iterator b](xs : b) -> Int =
+        size(xs) + size(Two { fst = 1, snd = 2 })
+    fun main() { print(Int.toString(other([1, 2, 3]))) }
+    """
+    assert scheme(src, "size") == "[Iterator a] fun(a) -> Int"
+    assert scheme(src, "other") == "[Iterator a] fun(a) -> Int"
+    assert output(src, capsys) == ["5"]
 
 
 # -- rigidity is not a leak ---------------------------------------------------
 
 
-def test_a_skolem_does_not_escape_into_an_enclosing_binding():
-    """Recorded behaviour, not a claim of coverage -- see delta 38.
-
-    Nothing checks that a skolem stays inside the body it was made for. It
-    cannot leak through the scheme, which is the declared one and mentions
-    only quantified variables, and this pins that the ordinary route out --
-    a call -- is a type error rather than a silent success.
-    """
+def test_a_call_is_not_an_escape():
+    """The ordinary route out of a signature, which is no leak at all: the
+    scheme is the declared one and quantifies `a`, so a use site instantiates
+    it and nothing rigid crosses the boundary."""
     src = """
     fun f(x : a) -> a = x
     fun g() -> Int = f(1)
     """
     assert scheme(src, "g") == "fun() -> Int"
+
+
+def test_a_skolem_cannot_be_stored_in_an_enclosing_binding():
+    """The escape that would make a checked signature unsound -- delta 40.
+
+    `f` promises to work for whatever type a caller picks, so inside its body
+    `a` is a constant nobody outside has seen. Letting it fix the element type
+    of `cell`, which was born outside, would record an equation between a real
+    type and one that has no values yet -- and `f(3)` and `f("x")` would then
+    both be well typed and both push into the same array.
+    """
+    src = """
+    fun main() {
+        let cell = []
+        fun f(x : a) -> Int { Array.push(cell, x); 1 }
+        print(Int.toString(f(3)))
+    }
+    """
+    assert fails(src) == ESCAPES
+
+
+def test_a_skolem_may_move_within_the_body_it_belongs_to():
+    """The other half, and the case a blunter check would break: rigidity is
+    not a ban on the skolem *moving*, only on its being equated with something
+    older. Collecting it, handing it to a polymorphic function and returning
+    it where the signature wrote `a` are all fine.
+    """
+    src = """
+    fun id2(x) = x
+    fun f(x : a, y : a) -> a { let both = [x, y]; id2(both[0]) }
+    fun main() { print(f("l", "r")) }
+    """
+    assert scheme(src, "f") == "fun(a, a) -> a"

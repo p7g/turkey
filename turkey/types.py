@@ -190,6 +190,12 @@ class TVar(Type):
         return f"TVar({self.id}, lvl={self.level}, ref={self.ref!r})"
 
 
+#: The `level` of a constructor that belongs to no binder -- every declared
+#: one. Below every rank the solver hands out, so the escape test below is
+#: false for it without a special case.
+NO_SCOPE = -1
+
+
 class TCon(Type):
     """A type constructor, *unapplied*: `Int`, `Array`, `Stack`.
 
@@ -201,13 +207,21 @@ class TCon(Type):
     The kind is the constructor's declared one and is shared by every
     occurrence: `decls.DeclTable` is the single place user constructors are
     built, so two `TCon("Stack")`s cannot disagree.
+
+    `level` is `NO_SCOPE` for a real constructor, which is what "rigid and
+    variable-free" already implied: `Int` is the same type at every rank, so
+    it can be mentioned from anywhere. A *skolem* is not. It is a constructor
+    only for the length of one body, standing for a type the caller has yet to
+    choose, so it carries the rank of the binder that made it and must not be
+    seen from outside it (`escaping`).
     """
 
-    __slots__ = ("name", "kind")
+    __slots__ = ("name", "kind", "level")
 
-    def __init__(self, name: str, kind: Kind | None = None):
+    def __init__(self, name: str, kind: Kind | None = None, level: int = NO_SCOPE):
         self.name = name
         self.kind: Kind = STAR if kind is None else kind
+        self.level = level
 
     def __repr__(self) -> str:
         return f"TCon({self.name})"
@@ -656,6 +670,42 @@ def occurs_and_adjust(var: TVar, t: Type) -> bool:
     return False
 
 
+def escaping(var: TVar, t: Type) -> TCon | None:
+    """The first skolem in `t` that outlives `var`, if there is one.
+
+    A signature's variable becomes a rigid constructor for the length of the
+    body (`classes.Skolems`), standing for a type the *caller* picks. So it
+    means something only inside the binder that made it. Letting it bind a
+    variable born outside would state that some type out there is equal to a
+    type the callee never gets to see -- the escape that makes a checked
+    signature unsound rather than merely unchecked.
+
+    Ranks already say this exactly, which is why the test is one comparison:
+    the skolem carries the rank of its binder, `var` carries its own, and a
+    skolem younger than the variable it would bind is out of scope. Run before
+    `occurs_and_adjust`, which lowers levels and would erase the evidence.
+    """
+    t = prune(t)
+    if isinstance(t, TCon):
+        return t if t.level > var.level else None
+    if isinstance(t, TApp):
+        return escaping(var, t.fn) or escaping(var, t.arg)
+    if isinstance(t, TFam):
+        return escaping(var, t.arg)
+    if isinstance(t, TFun):
+        for p in t.params:
+            found = escaping(var, p)
+            if found is not None:
+                return found
+        return escaping(var, t.ret)
+    if isinstance(t, TTuple):
+        for e in t.elems:
+            found = escaping(var, e)
+            if found is not None:
+                return found
+    return None
+
+
 def unify(a: Type, b: Type, span: Span | None = None, context: str = "",
           fams: Families | None = None) -> None:
     """Equate two types, or -- since M7 -- report that it cannot be decided yet.
@@ -677,6 +727,14 @@ def unify(a: Type, b: Type, span: Span | None = None, context: str = "",
         return
 
     if isinstance(a, TVar):
+        out = escaping(a, b)
+        if out is not None:
+            raise TypeError_(
+                f"the type '{out.name}' cannot escape the signature that "
+                f"declares it: it stands for whatever a caller of that "
+                f"function chooses, so nothing outside can be equal to it",
+                span,
+            )
         if occurs_and_adjust(a, b):
             raise TypeError_(f"cannot construct the infinite type {show(a)} = {show(b)}", span)
         if not unify_kinds(a.kind, kind_of(b)):
@@ -687,7 +745,10 @@ def unify(a: Type, b: Type, span: Span | None = None, context: str = "",
         return unify(b, a, span, context, fams)
 
     if isinstance(a, TCon) and isinstance(b, TCon):
-        if a.name != b.name:
+        # Levels distinguish two skolems that happen to share a name: `Skolems`
+        # only uniquifies within one scope, so a nested signature may write `a`
+        # too, and those two are not the same type.
+        if a.name != b.name or a.level != b.level:
             raise _mismatch(a, b, span, context)
         return
 

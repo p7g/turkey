@@ -278,7 +278,7 @@ class ClassTable:
 
     def resolve_context(
         self,
-        context: list[ast.ClassPred],
+        context: list[ast.ClassPred | ast.EqPred],
         tyvars: dict[str, Type],
         fresh=None,
     ) -> list[Pred]:
@@ -709,6 +709,10 @@ class Skolems:
     def __init__(self) -> None:
         self.used: set[str] = set()
         self.mapping: dict[int, Type] = {}
+        #: Every constant made here, for the solver to stamp with the rank of
+        #: the binder they belong to. Generation cannot do it: ranks are the
+        #: solver's, and it is the one that knows how deep this body sits.
+        self.made: list[TCon] = []
 
     def bind(self, var: TVar, name: str) -> Type:
         candidate, n = name, 1
@@ -718,6 +722,7 @@ class Skolems:
         self.used.add(candidate)
         con = TCon(candidate, kind_of(var))
         self.mapping[var.id] = con
+        self.made.append(con)
         return con
 
     def apply(self, t: Type) -> Type:

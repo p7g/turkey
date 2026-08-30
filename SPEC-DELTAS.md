@@ -1114,12 +1114,11 @@ scheme order, which is the order a use site instantiates in.
 f(x) -> a { 5 }` has an unannotated parameter, so it is not a signature and
 stays on the soft path. Closing that needs a body's inferred predicates
 re-abstracted over the skolems a partial annotation fixed, which is a different
-and larger change. Nothing checks that a skolem does not escape into an
-enclosing binding -- the same gap `check_method` has always had. And a group
-that mixes the two paths *mutually recursively* is rejected: the skolem of the
-annotated member flows into the inferred member's placeholder, and the
-assumption granting it belongs to the annotated member's body. Splitting a
-group's assumptions per member would fix it; nothing needs it yet.
+and larger change.
+
+Two further gaps this delta left open -- an unchecked escape, and a mutually
+recursive group mixing the two paths -- turned out to be one gap, and are
+closed by delta 40.
 
 ### 39. A context may state an equality, and a scheme may carry one
 
@@ -1211,3 +1210,87 @@ a rewrite system needing confluence rather than a table of family definitions,
 and it says nothing an annotation cannot. Equalities introduced by a *pattern*
 are declined for the reason `CAssume` already gives -- that is what destroys
 principal types -- and none is introduced.
+
+### 40. A skolem carries the rank of the binder that made it
+
+Delta 38 made a declared type a promise the body has to keep, and then left the
+promise half-open: nothing stopped the constant standing for `a` from leaving
+the body it belonged to. Delta 38 recorded that as one limitation and the
+rejection of a mixed mutually-recursive group as another. They are the same
+limitation, and this is the one line that states it:
+
+> A signature's variable is rigid *inside* the body and quantified *outside*
+> it. So it is a constructor only for the length of that body, and no type
+> older than the body may be equal to it.
+
+Rigidity was already modelled -- a skolem is a nullary `TCon` (delta 29), and
+`unify` treats a constructor as rigid without further machinery. Scope was not.
+A `TCon` was ground by construction, so `Int` and a skolem `a` were the same
+sort of thing, and a variable born anywhere could be bound to either.
+
+**What changed.** `TCon` gains a `level`, `NO_SCOPE` for every declared
+constructor and the rank of its binder for a skolem. `escaping` walks the type
+a variable is about to be bound to and answers with the first constant younger
+than that variable; `unify` runs it before `occurs_and_adjust`, which lowers
+levels and would erase the evidence. The test is one comparison because ranks
+already say exactly this -- the same Remy ranks that decide generalization,
+read in the other direction.
+
+Ranks belong to the solver, so the solver stamps them: `CLet` carries the
+skolems of the body it ranks, `Skolems` records what it made, and `solve_let`
+stamps on the way in and unstamps on the way out. The unstamping is not
+tidiness. `check_exhaustiveness` unifies constructor types against a solved
+scrutinee long after solving, at no rank at all, and a constant still claiming
+a rank there reads as an escape when nothing has escaped.
+
+Two skolems that share a name are now distinguished by level as well, since
+`Skolems` uniquifies names only within one scope and a nested signature may
+write `a` too.
+
+**What this rejects.** The unsoundness first:
+
+```
+fun main() {
+    let cell = []
+    fun f(x : a) -> Int { Array.push(cell, x); 1 }   -- error, delta 40
+    print(Int.toString(f(3)))
+}
+```
+
+`f` promises to work for whatever type a caller picks, so `cell : Array a`
+records an equation between a real type and one that has no values yet. Before
+this delta it was accepted, and the complaint arrived at some later, unrelated
+use of `cell`.
+
+And the mixed mutually-recursive group, which delta 38 listed as a separate
+limitation and which is really this one seen from the other end:
+
+```
+fun size[Iterator a](xs : a) -> Int { ... other(xs) ... }
+fun other(xs) = size(xs) + size(Two { fst = 1, snd = 2 })
+```
+
+`other` shares `size`'s SCC and is inferred, so it has one monomorphic
+placeholder, which `size`'s skolem flows into. This is a real error and not a
+gap: `other` is used at two element types, so it would have to be polymorphic,
+and an inferred member of a group cannot be -- that is polymorphic recursion,
+undecidable in inference (delta 38). The remedy is a signature on `other` too,
+and with one the group checks. What changed is that the diagnostic now says so,
+instead of reporting a missing `Iterator a` instance that was never the
+problem. Haskell asks for the same signature here, and for the same reason.
+
+**What this does not reject.** Rigidity is not a ban on the skolem *moving*.
+Collecting it, handing it to a polymorphic function, and returning it where the
+signature wrote `a` are all still fine -- only being equated with something
+older is not, which is why the test is on the variable's rank and not on the
+constant's presence.
+
+**Scope.** No golden moved. Instance and default method bodies get the check
+for free, since `check_method` builds its skolems the same way.
+
+**Also here.** `for pat in e` and the C-style header are told apart by parsing
+the first and backtracking, and `in` is the only token that distinguishes them
+-- so `in` is now the point of no return. A parse error *after* it is reported
+where it is, rather than sending the parser back to re-read the loop as a
+C-style header and complain about a missing `;` in a loop whose source has no
+`;` in it.

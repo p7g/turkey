@@ -161,6 +161,18 @@ def test_both_for_forms_parse():
     assert isinstance(b, ast.EForC)
 
 
+def test_an_error_after_in_is_reported_where_it_is():
+    """`in` is where the two forms stop being ambiguous, so it is where
+    backtracking stops.
+
+    Without that, a bad *body* is re-read as a C-style header and the parser
+    complains about a missing `;` in a loop whose source has no `;` in it --
+    a diagnostic pointing at the wrong construct entirely.
+    """
+    with pytest.raises(ParseError, match="expected the next match arm"):
+        parse("fun f(xs) { for x in xs { match x { 1 -> y = 2 } } }\n")
+
+
 # -- match arms -------------------------------------------------------
 
 

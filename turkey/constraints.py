@@ -54,7 +54,7 @@ from .errors import Span, TypeError_
 from .types import (
     INT, Pred, Scheme, TBottom, TCon, TLabel, TSet, TVar, Type, generalize,
     instantiate_qual, mono, numeric_order, numeric_type, prune, show, show_pred,
-    sort_numeric, type_key, unify, vars_of,
+    sort_numeric, spine, type_key, unify, vars_of,
 )
 
 HAS_FIELD = "HasField"
@@ -427,8 +427,12 @@ class Solver:
             # field demand vacuously -- there is no value to read one from.
             return True
 
-        if isinstance(receiver, TCon):
-            if receiver.name == "Array":
+        # The receiver is asked about by its *head*: `Array Int` and
+        # `Stack a` are applications now, and what decides whether a field
+        # exists is the constructor they are headed by.
+        head, _ = spine(receiver)
+        if isinstance(head, TCon):
+            if head.name == "Array":
                 if label.name in ("length", "capacity"):
                     # Section 8.3: both are readable and writable.
                     unify(result, INT, c.span, "a field access")
@@ -438,11 +442,11 @@ class Solver:
                     f"(only 'length' and 'capacity')",
                     c.span,
                 )
-            names = self.decls.record_fields(receiver)
+            names = self.decls.record_fields(head.name)
             if names is not None:
                 if label.name not in names:
                     raise TypeError_(
-                        f"type '{receiver.name}' has no field '{label.name}' "
+                        f"type '{head.name}' has no field '{label.name}' "
                         f"(it has: {', '.join(names)})",
                         c.span,
                     )
@@ -489,7 +493,7 @@ class Solver:
             return True  # absorbed; there is no value to represent
         if isinstance(t, TVar):
             return False  # still open -- improvement or defaulting will decide
-        if isinstance(t, TCon) and not t.args and t.name in names:
+        if isinstance(t, TCon) and t.name in names:
             return True
         # The span is always the literal's, so name it: "expected one of ..."
         # alone reads as though something at this position asked for a numeric

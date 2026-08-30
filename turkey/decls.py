@@ -13,8 +13,9 @@ from dataclasses import dataclass, field
 from . import ast
 from .errors import Span, TypeError_
 from .types import (
-    PRIMITIVES, Fresh, Scheme, TCon, TFun, TTuple, TVar, Type, generalize,
-    instantiate,
+    ARRAY, PRIMITIVES, STAR, Fresh, KFun, Kind, Scheme, TApp, TCon, TFun, TTuple,
+    TVar, Type, apply, default_kind, generalize, instantiate, kind_arrow, kind_of,
+    show, show_kind, spine, unify_kinds,
 )
 
 
@@ -26,7 +27,7 @@ class ConInfo:
     tycon: str
     field_names: list[str] | None  # None for the positional form
     arity: int
-    scheme: Scheme  # always forall params. fun(args...) -> TCon(tycon, params)
+    scheme: Scheme  # always forall params. fun(args...) -> tycon params
 
     @property
     def is_record(self) -> bool:
@@ -41,6 +42,7 @@ class TyconInfo:
     is_alias: bool = False
     alias_body: ast.TypeExpr | None = None
     span: Span | None = None
+    kind: Kind | None = None  # filled in by `register_all`
 
     @property
     def is_mutable_record(self) -> bool:
@@ -52,9 +54,17 @@ class DeclTable:
     def __init__(self) -> None:
         self.tycons: dict[str, TyconInfo] = {}
         self.constructors: dict[str, ConInfo] = {}
+        # One `TCon` per name, so a constructor's kind cannot be recorded twice
+        # and disagree with itself. Unification compares names, but everything
+        # that reads a kind reads it off the constructor.
+        self.heads: dict[str, TCon] = dict(PRIMITIVES)
         for name in PRIMITIVES:
-            self.tycons[name] = TyconInfo(name, [])
-        self.tycons["Array"] = TyconInfo("Array", ["a"])
+            self.tycons[name] = TyconInfo(name, [], kind=STAR)
+        self.tycons["Array"] = TyconInfo("Array", ["a"], kind=ARRAY.kind)
+        self.heads["Array"] = ARRAY
+
+    def head(self, name: str) -> TCon:
+        return self.heads[name]
 
     # -- registration ------------------------------------------------------
 
@@ -66,22 +76,69 @@ class DeclTable:
                 raise TypeError_(f"cannot redefine the built-in type '{d.name}'", d.span)
             if d.name in self.tycons:
                 raise TypeError_(f"type '{d.name}' is declared more than once", d.span)
-            self.tycons[d.name] = TyconInfo(
-                d.name, d.params, [], d.is_alias, d.alias, d.span
-            )
+            # Every declaration is given its kind *skeleton* up front -- one
+            # arrow per parameter, over kind variables. Arity is syntactic, so
+            # the skeleton is exact and only the parameters' own kinds are left
+            # to discover; that is why mutual recursion needs no SCC pass here,
+            # unlike the value level. Kinds are not polymorphic, so there is
+            # nothing to generalize between one declaration and the next.
+            info = TyconInfo(d.name, d.params, [], d.is_alias, d.alias, d.span,
+                             kind_arrow(len(d.params)))
+            self.tycons[d.name] = info
+            self.heads[d.name] = TCon(d.name, info.kind)
         for d in decls:
             if not d.is_alias:
                 self._resolve_variants(d)
         for d in decls:
             if d.is_alias:
                 self._check_alias_acyclic(d.name, d.name, set())
+                self._kind_check_alias(self.tycons[d.name])
+        self.settle_kinds()
+
+    def _param_vars(self, info: TyconInfo, level: int = 1) -> dict[str, TVar]:
+        """The declaration's parameters as variables carrying the kinds its own
+        kind assigns them, so applying one in the body constrains the header."""
+        kinds: list[Kind] = []
+        k = info.kind
+        for _ in info.params:
+            assert isinstance(k, KFun)
+            kinds.append(k.arg)
+            k = k.res
+        return {p: TVar(level, kind) for p, kind in zip(info.params, kinds)}
+
+    def _kind_check_alias(self, info: TyconInfo) -> None:
+        """Resolve an alias body once, for its kinds alone.
+
+        Aliases are expanded at each use rather than stored, so nothing else
+        would ever look at the body with the header's parameters in scope --
+        and `type Id f a = f a` would leave `f` defaulted to `*`.
+
+        The body must classify values. An alias has to be saturated where it is
+        used, so an alias *to* an unapplied constructor could never be written
+        down, and rejecting it here says so where the mistake is.
+        """
+        self.star(info.alias_body, self._param_vars(info), lambda: TVar(1))
+
+    def settle_kinds(self) -> None:
+        """Haskell 98's defaulting rule: a kind still undecided is `*`.
+
+        Kinds are first-order here -- no polymorphism, no `forall k` -- so a
+        variable left over after the declarations have been read is one nothing
+        constrained, and `*` is the only choice that keeps the type usable.
+        """
+        for info in self.tycons.values():
+            default_kind(info.kind)
+        for con in self.constructors.values():
+            for var in con.scheme.quantified:
+                default_kind(var.kind)
 
     def _resolve_variants(self, decl: ast.TypeDecl) -> None:
         info = self.tycons[decl.name]
         # The type's own parameters become variables shared by every variant, so
         # `Some a` and `None` both land in `Option a`.
-        tyvars = {p: TVar(1) for p in decl.params}
-        result = TCon(decl.name, [tyvars[p] for p in decl.params])
+        tyvars = self._param_vars(info)
+        result = apply(self.head(decl.name), [tyvars[p] for p in decl.params],
+                       decl.span)
 
         for con in decl.variants or []:
             if con.name in self.constructors:
@@ -92,10 +149,10 @@ class DeclTable:
                 )
             if con.is_record:
                 names = [n for n, _ in con.fields]
-                arg_types = [self.to_type(t, tyvars, 1) for _, t in con.fields]
+                arg_types = [self.star(t, tyvars, 1) for _, t in con.fields]
             else:
                 names = None
-                arg_types = [self.to_type(t, tyvars, 1) for t in con.args]
+                arg_types = [self.star(t, tyvars, 1) for t in con.args]
             scheme = generalize(TFun(arg_types, result), 0)
             cinfo = ConInfo(con.name, decl.name, names, len(arg_types), scheme)
             info.variants.append(cinfo)
@@ -113,6 +170,25 @@ class DeclTable:
             self._check_alias_acyclic(root, referenced, seen)
 
     # -- translation -------------------------------------------------------
+
+    def star(self, te: ast.TypeExpr, tyvars: dict[str, TVar], fresh: Fresh) -> Type:
+        """`to_type`, where a type that classifies values is required.
+
+        Every annotation and every constructor field is such a position: `x :
+        Array` names a constructor, not a type, and nothing can have it. This
+        is the check that used to be the arity comparison in `to_type`, moved
+        to the places that actually need saturation -- `to_type` itself no
+        longer does, because a partially applied constructor is exactly what a
+        higher-kinded argument is made of.
+        """
+        t = self.to_type(te, tyvars, fresh)
+        if not unify_kinds(kind_of(t), STAR):
+            raise TypeError_(
+                f"'{show(t)}' has kind {show_kind(kind_of(t))}, but a type of "
+                f"kind * is needed here",
+                te.span,
+            )
+        return t
 
     def to_type(self, te: ast.TypeExpr, tyvars: dict[str, TVar], fresh: Fresh) -> Type:
         """Translate type syntax into a semantic type.
@@ -135,22 +211,31 @@ class DeclTable:
                 self.to_type(te.ret, tyvars, fresh),
             )
 
+        if isinstance(te, ast.TEApp):
+            return apply(self.to_type(te.fn, tyvars, fresh),
+                         [self.to_type(a, tyvars, fresh) for a in te.args],
+                         te.span)
+
         assert isinstance(te, ast.TECon)
         info = self.tycons.get(te.name)
         if info is None:
             raise TypeError_(f"unknown type '{te.name}'", te.span)
         args = [self.to_type(a, tyvars, fresh) for a in te.args]
-        if len(args) != len(info.params):
-            raise TypeError_(
-                f"type '{te.name}' expects {len(info.params)} argument(s), "
-                f"but {len(args)} were given",
-                te.span,
-            )
         if info.is_alias:
-            # Aliases are transparent: expand rather than build a TCon.
+            # Aliases are transparent: expand rather than build a constructor.
+            # They must be *saturated* first. An alias is the one head that is
+            # not rigid, so a partially applied one would make `f a ~ g b`
+            # decomposition unsound -- and it is why type-level lambdas are out.
+            if len(args) != len(info.params):
+                raise TypeError_(
+                    f"type alias '{te.name}' expects {len(info.params)} "
+                    f"argument(s), but {len(args)} were given; an alias cannot "
+                    f"be partially applied",
+                    te.span,
+                )
             substitution = dict(zip(info.params, args))
             return self._expand_alias(info, substitution, fresh, te.span)
-        return TCon(te.name, args)
+        return apply(self.head(te.name), args, te.span)
 
     def _expand_alias(
         self, info: TyconInfo, substitution: dict[str, Type], fresh: Fresh, span: Span
@@ -175,14 +260,14 @@ class DeclTable:
 
     # -- record field lookup -----------------------------------------------
 
-    def record_fields(self, receiver: TCon) -> list[str] | None:
-        """`receiver`'s field names, or None if it is not a mutable record."""
-        info = self.tycons.get(receiver.name)
+    def record_fields(self, name: str) -> list[str] | None:
+        """The named type's field names, or None if it is not a mutable record."""
+        info = self.tycons.get(name)
         if info is None or not info.is_mutable_record:
             return None
         return info.variants[0].field_names
 
-    def field_type(self, receiver: TCon, label: str) -> Type:
+    def field_type(self, receiver: Type, label: str) -> Type:
         """The type of `receiver.label`, for a receiver already resolved.
 
         The receiver's arguments *are* the constructor's parameters, so
@@ -194,10 +279,13 @@ class DeclTable:
         whatever level the solver has reached rather than the one the field
         access was written at, so that level is not ours to impose.
         """
-        con = self.tycons[receiver.name].variants[0]
+        head, args = spine(receiver)
+        assert isinstance(head, TCon)
+        con = self.tycons[head.name].variants[0]
         body = con.scheme.body
-        assert isinstance(body, TFun) and isinstance(body.ret, TCon)
-        mapping = {v.id: arg for v, arg in zip(body.ret.args, receiver.args)
+        assert isinstance(body, TFun)
+        _, params = spine(body.ret)
+        mapping = {v.id: arg for v, arg in zip(params, args)
                    if isinstance(v, TVar)}
         return _substitute(body.params[con.field_names.index(label)], mapping)
 
@@ -208,8 +296,8 @@ def _substitute(t: Type, mapping: dict[int, Type]) -> Type:
     t = prune(t)
     if isinstance(t, TVar):
         return mapping.get(t.id, t)
-    if isinstance(t, TCon):
-        return TCon(t.name, [_substitute(a, mapping) for a in t.args]) if t.args else t
+    if isinstance(t, TApp):
+        return TApp(_substitute(t.fn, mapping), _substitute(t.arg, mapping), t.kind)
     if isinstance(t, TFun):
         return TFun([_substitute(p, mapping) for p in t.params], _substitute(t.ret, mapping))
     if isinstance(t, TTuple):
@@ -222,6 +310,9 @@ def _referenced_tycons(te: ast.TypeExpr | None) -> list[str]:
         return []
     if isinstance(te, ast.TECon):
         return [te.name] + [n for a in te.args for n in _referenced_tycons(a)]
+    if isinstance(te, ast.TEApp):
+        return _referenced_tycons(te.fn) + [n for a in te.args
+                                            for n in _referenced_tycons(a)]
     if isinstance(te, ast.TETuple):
         return [n for e in te.elems for n in _referenced_tycons(e)]
     if isinstance(te, ast.TEFun):

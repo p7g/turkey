@@ -315,9 +315,14 @@ class Parser:
             args.append(self.parse_atype())
         if not args:
             return head
-        if not isinstance(head, ast.TECon) or head.args:
-            raise ParseError("only a type constructor can be applied to arguments", head.span)
-        return ast.TECon(head.span, head.name, args)
+        if isinstance(head, ast.TECon) and not head.args:
+            return ast.TECon(head.span, head.name, args)
+        if isinstance(head, ast.TEVar):
+            # A variable in head position: `f a`. Legal since M4, and what a
+            # higher-kinded parameter looks like at the surface.
+            return ast.TEApp(head.span, head, args)
+        raise ParseError("only a type constructor or a type variable can be "
+                         "applied to arguments", head.span)
 
     def parse_atype(self) -> ast.TypeExpr:
         tok = self.cur

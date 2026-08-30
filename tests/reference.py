@@ -38,9 +38,9 @@ from turkey import ast
 from turkey.parser import parse
 from turkey.constraints import HAS_FIELD, ONE_OF, CPred, reach
 from turkey.types import (
-    BOOL, CHAR, FLOAT, INT, STRING, Pred, Scheme, TCon, TFun, TLabel, TSet,
+    BOOL, CHAR, FLOAT, INT, STRING, Pred, Scheme, TApp, TCon, TFun, TLabel, TSet,
     TTuple, TVar, Type, float_literal_set, int_literal_set, numeric_order,
-    numeric_type, type_key, vars_of,
+    numeric_type, spine, type_key, vars_of,
 )
 
 LITERALS = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR, "Bool": BOOL}
@@ -88,8 +88,8 @@ def resolve(t: Type, s: Subst) -> Type:
 def substitute(t: Type, s: Subst) -> Type:
     """Apply the substitution everywhere, building a fresh type."""
     t = resolve(t, s)
-    if isinstance(t, TCon):
-        return TCon(t.name, [substitute(a, s) for a in t.args])
+    if isinstance(t, TApp):
+        return TApp(substitute(t.fn, s), substitute(t.arg, s), t.kind)
     if isinstance(t, TFun):
         return TFun([substitute(p, s) for p in t.params], substitute(t.ret, s))
     if isinstance(t, TTuple):
@@ -120,10 +120,12 @@ def unify(a: Type, b: Type, s: Subst) -> None:
         return unify(b, a, s)
 
     if isinstance(a, TCon) and isinstance(b, TCon):
-        if a.name != b.name or len(a.args) != len(b.args):
+        if a.name != b.name:
             raise RefError(f"{a.name} vs {b.name}")
-        for x, y in zip(a.args, b.args):
-            unify(x, y, s)
+        return
+    if isinstance(a, TApp) and isinstance(b, TApp):
+        unify(a.fn, b.fn, s)
+        unify(a.arg, b.arg, s)
         return
     if isinstance(a, TFun) and isinstance(b, TFun):
         if len(a.params) != len(b.params):
@@ -209,16 +211,17 @@ def discharge(p: Pred, st: State) -> bool:
     receiver = substitute(receiver, st.subst)
     if isinstance(receiver, TVar):
         return False
-    if isinstance(receiver, TCon):
-        if receiver.name == "Array":
+    head, _ = spine(receiver)
+    if isinstance(head, TCon):
+        if head.name == "Array":
             if label.name not in ("length", "capacity"):
                 raise RefError(f"Array has no field {label.name}")
             unify(result, INT, st.subst)
             return True
-        fields = st.records.get(receiver.name)
+        fields = st.records.get(head.name)
         if fields is not None:
             if label.name not in fields:
-                raise RefError(f"{receiver.name} has no field {label.name}")
+                raise RefError(f"{head.name} has no field {label.name}")
             unify(result, fields[label.name], st.subst)
             return True
     raise RefError(f"no field {label.name} on {receiver}")
@@ -236,7 +239,7 @@ def _discharge_one_of(p: Pred, st: State) -> bool:
     t = substitute(t, st.subst)
     if isinstance(t, TVar):
         return False
-    if isinstance(t, TCon) and not t.args and t.name in names:
+    if isinstance(t, TCon) and t.name in names:
         return True
     raise RefError(f"{t} is not one of {sorted(names)}")
 

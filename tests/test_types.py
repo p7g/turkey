@@ -11,7 +11,7 @@ from turkey.types import (
     INT,
     STRING,
     Scheme,
-    TCon,
+    array_of,
     TFun,
     TTuple,
     TVar,
@@ -44,7 +44,7 @@ def test_prune_follows_a_chain_of_bindings():
 def test_occurs_check_rejects_an_infinite_type():
     a = TVar(1)
     with pytest.raises(TypeError_, match="infinite type"):
-        unify(a, TCon("Array", [a]))
+        unify(a, array_of(a))
 
 
 def test_constructor_mismatch_raises():
@@ -79,10 +79,10 @@ def test_join_recovers_the_surviving_type():
 
 def test_generalize_only_quantifies_deeper_variables():
     deep = TVar(5)
-    assert len(generalize(TCon("Array", [deep]), 1).quantified) == 1
+    assert len(generalize(array_of(deep), 1).quantified) == 1
 
     shallow = TVar(1)
-    assert len(generalize(TCon("Array", [shallow]), 1).quantified) == 0
+    assert len(generalize(array_of(shallow), 1).quantified) == 0
 
 
 def test_instantiate_yields_fresh_independent_variables():
@@ -103,15 +103,15 @@ def test_instantiate_yields_fresh_independent_variables():
 
 def test_show_renders_surface_syntax():
     assert show(TFun([INT, STRING], BOOL)) == "fun(Int, String) -> Bool"
-    assert show(TCon("Array", [TVar(1)])) == "Array a"
+    assert show(array_of(TVar(1))) == "Array a"
     assert show(TTuple([INT, STRING])) == "(Int, String)"
     # A function type nested as a constructor argument gets parenthesized.
-    assert show(TCon("Array", [TFun([INT], INT)])) == "Array (fun(Int) -> Int)"
+    assert show(array_of(TFun([INT], INT))) == "Array (fun(Int) -> Int)"
 
 
 def test_show_scheme_marks_non_quantified_variables_with_underscore():
     free = TVar(1)
-    assert show_scheme(Scheme([], TCon("Array", [free]))) == "Array _a"
+    assert show_scheme(Scheme([], array_of(free))) == "Array _a"
 
     bound = TVar(1)
-    assert show_scheme(Scheme([bound], TCon("Array", [bound]))) == "Array a"
+    assert show_scheme(Scheme([bound], array_of(bound))) == "Array a"

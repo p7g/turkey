@@ -111,6 +111,7 @@ field        ::= IDENT ":" type-expr
 type-expr    ::= btype ("->" btype)*           -- right-assoc (function type uses fun(...) syntax, see below)
 btype        ::= atype+
 atype        ::= IDENT                           -- type variable
+               | IDENT atype+                    -- variable in head position (delta 28)
                | CONID                           -- nullary type constructor
                | CONID atype+                    -- type constructor application
                | "(" type-expr ("," type-expr)* ")"
@@ -227,7 +228,8 @@ expr-postfix "[" expr "]" "=" expr  -- mutate an array element
 
 ```
 τ ::= α                              -- type variable
-    | TyCon τ ... τ                  -- type constructor application
+    | TyCon                          -- type constructor (kinded; delta 28)
+    | τ τ                            -- type application, curried (delta 28)
     | fun(τ₁, ..., τₙ) -> τ          -- function type (n ≥ 0, uncurried)
     | (τ₁, ..., τₙ)                  -- tuple type (n ≥ 2)
     | ⊥                              -- bottom type

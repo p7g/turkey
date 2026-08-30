@@ -41,8 +41,8 @@ from .decls import DeclTable
 from .deps import free_names, pattern_vars, sccs
 from .errors import Span, TypeError_
 from .types import (
-    BOOL, BOTTOM, CHAR, FLOAT, INT, STRING, UNIT, Pred, TBottom, TCon, TFun,
-    TLabel, TSet, TTuple, TVar, Type, float_literal_set, int_literal_set,
+    BOOL, BOTTOM, CHAR, FLOAT, INT, STRING, UNIT, Pred, TBottom, TFun, TLabel,
+    TSet, TTuple, TVar, Type, array_of, float_literal_set, int_literal_set,
 )
 
 LITERAL_TYPES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR, "Bool": BOOL}
@@ -148,7 +148,7 @@ class Generator:
     def type_of(self, te: ast.TypeExpr) -> Type:
         """Translate an annotation, resolving its type variables in the
         innermost function's scope."""
-        return self.decls.to_type(te, self.tyvar_scopes[-1], self.fresh)
+        return self.decls.star(te, self.tyvar_scopes[-1], self.fresh)
 
     # -- program -----------------------------------------------------------
 
@@ -492,7 +492,7 @@ class Generator:
         if isinstance(target, ast.EIndex):
             element = self.fresh()
             self.eq(
-                self.gen_expr(target.arr), TCon("Array", [element]), span,
+                self.gen_expr(target.arr), array_of(element), span,
                 "an indexed assignment",
             )
             self.eq(self.gen_expr(target.index), INT, span, "an array index")
@@ -553,7 +553,7 @@ class Generator:
         element: Type = self.fresh()
         for item in e.elems:
             element = self.join(element, self.gen_expr(item), item.span, "an array literal")
-        return TCon("Array", [element])
+        return array_of(element)
 
     def _gen_ERecord(self, e: ast.ERecord) -> Type:
         con = self.decls.instantiate_con(e.con, self.fresh, e.span)
@@ -596,7 +596,7 @@ class Generator:
 
     def _gen_EIndex(self, e: ast.EIndex) -> Type:
         element = self.fresh()
-        self.eq(self.gen_expr(e.arr), TCon("Array", [element]), e.span, "an index")
+        self.eq(self.gen_expr(e.arr), array_of(element), e.span, "an index")
         self.eq(self.gen_expr(e.index), INT, e.index.span, "an array index")
         return element
 
@@ -658,7 +658,7 @@ class Generator:
     def _gen_EForIn(self, e: ast.EForIn) -> Type:
         element = self.fresh()
         self.eq(
-            self.gen_expr(e.iterable), TCon("Array", [element]), e.iterable.span,
+            self.gen_expr(e.iterable), array_of(element), e.iterable.span,
             "the sequence of a 'for ... in' loop",
         )
         # Section 6.5: `x` is a fresh immutable binding each iteration.

@@ -474,3 +474,56 @@ generalizes to `[..., HasField "data" a (Array b), OneOf b {Int, Float}]`
 rather than `Array Int` -- correct, and more general than intended, which is
 the noise Haskell's monomorphism restriction exists to suppress. Turkey has no
 such restriction and accepts the noise.
+
+### 28. Types have kinds, and application is curried
+
+`design.md` §4.1 writes a type constructor application as `TyCon τ ... τ` --
+saturated, with the arguments held by the constructor itself, and arity checked
+by counting them against the declaration. That representation has no sub-term
+for a *constructor* to be, so nothing can abstract over one: `Functor f` has no
+`f` to quantify.
+
+Application is now curried. `Array Int` is `TApp(TCon("Array"), Int)`, a head
+applied to one argument at a time, and a type variable may stand at the head:
+
+```
+type Wrap f a = Wrap(f a)          -- f :: * -> *, discovered from the body
+
+fun unwrap(w) = match w { Wrap(inner) -> inner }
+                                   -- unwrap : fun(Wrap a b) -> a b
+```
+
+`fun(τ₁, ..., τₙ) -> τ` stays a separate, uncurried node. It is the language's
+fixed-arity function type (delta 2), not a constructor that happens to take two
+arguments, and currying it would reintroduce partial application at the value
+level through the back door.
+
+**Kinds** are what keep the two apart and what replaces the arity check. `Int ::
+*`, `Array :: * -> *`, `Wrap :: (* -> *) -> * -> *`. Over-application is no
+longer counted, it is a kind error, and the same rule rejects `Int Bool`:
+
+```
+fun f(x : Array Int Bool) = x   -- 'Array Int' has kind *, so it cannot be
+                                -- applied to 'Bool'
+fun g(x : Array) = x            -- 'Array' has kind * -> *, but a type of kind
+                                -- * is needed here
+```
+
+A declaration's parameter kinds are not written down, so they are inferred: a
+kind *skeleton* -- one arrow per parameter, over kind variables -- is assigned
+to every declaration before any body is read, and the bodies then constrain it.
+Arity is syntactic, so the skeleton is exact and mutual recursion needs no
+dependency ordering, unlike the value level. Kinds are first-order: nothing is
+kind-polymorphic, and whatever is still undecided once the declarations have
+been read is defaulted to `*`, as in Haskell 98.
+
+Two consequences worth stating:
+
+- **Decomposing an application is sound only because every head is rigid.**
+  `f a ~ g b` is solved pointwise, which would be wrong if a head could be a
+  function on types. There are no type-level lambdas, and a **type alias must
+  be saturated** where it is used -- an alias is the one head that is not
+  rigid, so a partially applied one is rejected rather than expanded later.
+- An alias body must classify values, so `type Boxed f = f Int` is fine but
+  `type Alias = Array` is not. Since an alias cannot be partially applied, an
+  alias standing for an unapplied constructor could never be used anyway.

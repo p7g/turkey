@@ -11,6 +11,13 @@ here decides what a variable's rank should be.
 The one departure from textbook Hindley-Milner is the bottom type. Section 4.3
 says bottom is absorbed by whatever it meets, so unification treats it as a
 no-op. That is not enough on its own -- see `join`.
+
+Type application is *curried* even though the function type is not: `Array Int`
+is `TApp(TCon("Array"), INT)`, so a variable can stand in head position and
+`Functor f` has something to quantify over. `TFun` stays a separate uncurried
+node because it is the language's fixed-arity function type (section 4.1), not
+a constructor that happens to take two arguments. Kinds keep the two apart and
+make application decomposition sound -- see the kind section below.
 """
 
 from __future__ import annotations
@@ -19,6 +26,135 @@ from collections.abc import Callable
 from itertools import count
 
 from .errors import Span, TypeError_
+
+
+# ----------------------------------------------------------------------- kinds
+#
+# A kind is the type of a type. `Int :: *`, `Array :: * -> *`, and once classes
+# arrive `Functor f` demands `f :: * -> *`. Kinds exist here for exactly one
+# reason: with application curried, `spine`-based arity is no longer syntactic,
+# and something has to say that `Array` alone is not a type while `Array Int`
+# is.
+#
+# Kind variables are inferred the same way type variables are -- mutable cells,
+# union-find, occurs check -- because a type declaration's parameter kinds are
+# not written down and have to be discovered from the bodies. Kinds are not
+# polymorphic: whatever is still unresolved once the declarations are read is
+# defaulted to `*` (`decls.settle_kinds`), which is Haskell 98's rule and keeps
+# a kind a first-order term.
+
+
+class Kind:
+    pass
+
+
+class KStar(Kind):
+    """`*`, the kind of types that classify values."""
+
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    def __repr__(self) -> str:
+        return "*"
+
+
+STAR = KStar()
+
+
+class KFun(Kind):
+    """`k1 -> k2`, the kind of a constructor awaiting an argument."""
+
+    __slots__ = ("arg", "res")
+
+    def __init__(self, arg: Kind, res: Kind):
+        self.arg = arg
+        self.res = res
+
+    def __repr__(self) -> str:
+        return f"KFun({self.arg!r}, {self.res!r})"
+
+
+class KVar(Kind):
+    """A kind not yet decided. `ref` is None while unbound."""
+
+    _ids = count()
+
+    __slots__ = ("id", "ref")
+
+    def __init__(self) -> None:
+        self.id = next(KVar._ids)
+        self.ref: Kind | None = None
+
+    def __repr__(self) -> str:
+        return f"KVar({self.id}, ref={self.ref!r})"
+
+
+def kprune(k: Kind) -> Kind:
+    if isinstance(k, KVar) and k.ref is not None:
+        k.ref = kprune(k.ref)
+        return k.ref
+    return k
+
+
+def _koccurs(var: KVar, k: Kind) -> bool:
+    k = kprune(k)
+    if isinstance(k, KVar):
+        return k is var
+    if isinstance(k, KFun):
+        return _koccurs(var, k.arg) or _koccurs(var, k.res)
+    return False
+
+
+def unify_kinds(a: Kind, b: Kind) -> bool:
+    """Match two kinds, binding variables. False on mismatch -- the caller has
+    the span and the words, so nothing is raised from here."""
+    a, b = kprune(a), kprune(b)
+    if a is b:
+        return True
+    if isinstance(a, KVar):
+        if _koccurs(a, b):
+            return False
+        a.ref = b
+        return True
+    if isinstance(b, KVar):
+        return unify_kinds(b, a)
+    if isinstance(a, KFun) and isinstance(b, KFun):
+        return unify_kinds(a.arg, b.arg) and unify_kinds(a.res, b.res)
+    return isinstance(a, KStar) and isinstance(b, KStar)
+
+
+def default_kind(k: Kind) -> Kind:
+    """Bind every variable still unresolved in `k` to `*`, and return it."""
+    k = kprune(k)
+    if isinstance(k, KVar):
+        k.ref = STAR
+        return STAR
+    if isinstance(k, KFun):
+        default_kind(k.arg)
+        default_kind(k.res)
+    return k
+
+
+def kind_arrow(n: int, result: Kind = STAR) -> Kind:
+    """`* -> ... -> result`, with `n` arrows over fresh argument kinds."""
+    k = result
+    for _ in range(n):
+        k = KFun(KVar(), k)
+    return k
+
+
+def show_kind(k: Kind) -> str:
+    k = kprune(k)
+    if isinstance(k, KFun):
+        left = show_kind(k.arg)
+        if isinstance(kprune(k.arg), KFun):
+            left = f"({left})"
+        return f"{left} -> {show_kind(k.res)}"
+    return "*"  # an undecided kind prints as the `*` it will default to
 
 
 class Type:
@@ -32,32 +168,72 @@ Fresh = Callable[[], "TVar"]
 
 
 class TVar(Type):
-    """A unification variable. `ref` is None while unbound."""
+    """A unification variable. `ref` is None while unbound.
+
+    Its kind is a fresh variable by default rather than `*`, because a variable
+    written in an annotation may turn out to stand for a constructor -- the `f`
+    of `Wrap f a` is discovered to be `* -> *` only by seeing it applied.
+    """
 
     _ids = count()
 
-    __slots__ = ("id", "level", "ref")
+    __slots__ = ("id", "level", "ref", "kind")
 
-    def __init__(self, level: int):
+    def __init__(self, level: int, kind: Kind | None = None):
         self.id = next(TVar._ids)
         self.level = level
         self.ref: Type | None = None
+        self.kind: Kind = kind if kind is not None else KVar()
 
     def __repr__(self) -> str:
         return f"TVar({self.id}, lvl={self.level}, ref={self.ref!r})"
 
 
 class TCon(Type):
-    """A type constructor applied to arguments: `Int`, `Array a`, `Stack a`."""
+    """A type constructor, *unapplied*: `Int`, `Array`, `Stack`.
 
-    __slots__ = ("name", "args")
+    Arguments are no longer carried here -- `Array Int` is `TApp(TCon("Array"),
+    INT)`. A constructor is therefore rigid and variable-free, which is what
+    lets `instantiate` and `substitute` return it untouched, and what makes
+    decomposing an application sound (see `unify`).
 
-    def __init__(self, name: str, args: list[Type] | None = None):
+    The kind is the constructor's declared one and is shared by every
+    occurrence: `decls.DeclTable` is the single place user constructors are
+    built, so two `TCon("Stack")`s cannot disagree.
+    """
+
+    __slots__ = ("name", "kind")
+
+    def __init__(self, name: str, kind: Kind | None = None):
         self.name = name
-        self.args: list[Type] = args or []
+        self.kind: Kind = STAR if kind is None else kind
 
     def __repr__(self) -> str:
-        return f"TCon({self.name}, {self.args!r})"
+        return f"TCon({self.name})"
+
+
+class TApp(Type):
+    """`f a` -- one type applied to one argument.
+
+    Curried, so `Array Int` is a one-deep spine and `Either l r` a two-deep
+    one, and a *variable* can sit at the head of either. That is the whole
+    point: `Functor f` needs an `f` to abstract over, and a saturated
+    `TCon(name, args)` has no sub-term for it to be.
+
+    `kind` is the kind of the application itself, computed once by `apply`
+    (which is also where the argument's kind is checked), so `kind_of` stays a
+    pure lookup rather than a re-derivation.
+    """
+
+    __slots__ = ("fn", "arg", "kind")
+
+    def __init__(self, fn: Type, arg: Type, kind: Kind):
+        self.fn = fn
+        self.arg = arg
+        self.kind = kind
+
+    def __repr__(self) -> str:
+        return f"TApp({self.fn!r}, {self.arg!r})"
 
 
 class TFun(Type):
@@ -145,6 +321,77 @@ UNIT = TCon("Unit")
 
 PRIMITIVES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR,
               "Bool": BOOL, "Unit": UNIT}
+
+ARRAY = TCon("Array", KFun(STAR, STAR))
+
+
+# ------------------------------------------------------- application and spines
+
+
+def kind_of(t: Type) -> Kind:
+    """The kind of a type. Everything but a constructor, a variable and an
+    application classifies values, so it is `*`."""
+    t = prune(t)
+    if isinstance(t, (TVar, TCon, TApp)):
+        return t.kind
+    return STAR
+
+
+def apply(head: Type, args: list[Type], span: Span | None = None) -> Type:
+    """`head a1 ... an`, checking each application against `head`'s kind.
+
+    This is the only place a `TApp` is built, so it is also the only place a
+    kind can be got wrong. An over-applied constructor is caught here rather
+    than by a separate arity check: `Array Int Bool` fails because `*` is not
+    an arrow, which is the same rule that rejects `Int Bool`.
+    """
+    t = head
+    for arg in args:
+        k = kprune(kind_of(t))
+        result = KVar()
+        if not unify_kinds(k, KFun(kind_of(arg), result)):
+            # A kind still undecided can only have failed the occurs check,
+            # since a variable unifies with anything else: `f f` would need
+            # `f`'s kind to contain itself.
+            if isinstance(kprune(k), KVar):
+                raise TypeError_(
+                    f"'{show(t)}' cannot be applied to '{show(arg)}': that "
+                    f"would need a kind that contains itself",
+                    span,
+                )
+            raise TypeError_(
+                f"'{show(t)}' has kind {show_kind(k)}, so it cannot be applied "
+                f"to '{show(arg)}'",
+                span,
+            )
+        t = TApp(t, arg, result)
+    return t
+
+
+def spine(t: Type) -> tuple[Type, list[Type]]:
+    """Decompose `f a1 ... an` into its head and its arguments.
+
+    Most of the checker wants to ask "is this an `Array`?", which is a question
+    about the head; asking it in spine terms keeps those places written the way
+    they were before application was curried.
+    """
+    args: list[Type] = []
+    t = prune(t)
+    while isinstance(t, TApp):
+        args.append(t.arg)
+        t = prune(t.fn)
+    args.reverse()
+    return t, args
+
+
+def head_con(t: Type) -> TCon | None:
+    """The constructor at the head of `t`, if it is one."""
+    head, _ = spine(t)
+    return head if isinstance(head, TCon) else None
+
+
+def array_of(element: Type) -> Type:
+    return TApp(ARRAY, element, STAR)
 
 
 # ------------------------------------------------------------- the numeric tower
@@ -311,8 +558,8 @@ def occurs_and_adjust(var: TVar, t: Type) -> bool:
             return True
         t.level = min(t.level, var.level)
         return False
-    if isinstance(t, TCon):
-        return any(occurs_and_adjust(var, a) for a in t.args)
+    if isinstance(t, TApp):
+        return occurs_and_adjust(var, t.fn) or occurs_and_adjust(var, t.arg)
     if isinstance(t, TFun):
         return any(occurs_and_adjust(var, p) for p in t.params) or occurs_and_adjust(var, t.ret)
     if isinstance(t, TTuple):
@@ -334,16 +581,26 @@ def unify(a: Type, b: Type, span: Span | None = None, context: str = "") -> None
     if isinstance(a, TVar):
         if occurs_and_adjust(a, b):
             raise TypeError_(f"cannot construct the infinite type {show(a)} = {show(b)}", span)
+        if not unify_kinds(a.kind, kind_of(b)):
+            raise _kind_mismatch(a, b, span)
         a.ref = b
         return
     if isinstance(b, TVar):
         return unify(b, a, span, context)
 
     if isinstance(a, TCon) and isinstance(b, TCon):
-        if a.name != b.name or len(a.args) != len(b.args):
+        if a.name != b.name:
             raise _mismatch(a, b, span, context)
-        for x, y in zip(a.args, b.args):
-            unify(x, y, span, context)
+        return
+
+    # Decomposing an application is sound only because there are no type-level
+    # lambdas: every head is rigid, or a variable that will be bound to a rigid
+    # head, so `f a ~ g b` cannot be satisfied any way but pointwise. Aliases
+    # are expanded before they reach here (`decls.to_type`), which is what
+    # keeps that true.
+    if isinstance(a, TApp) and isinstance(b, TApp):
+        unify(a.fn, b.fn, span, context)
+        unify(a.arg, b.arg, span, context)
         return
 
     if isinstance(a, TFun) and isinstance(b, TFun):
@@ -372,6 +629,14 @@ def unify(a: Type, b: Type, span: Span | None = None, context: str = "") -> None
         return
 
     raise _mismatch(a, b, span, context)
+
+
+def _kind_mismatch(a: Type, b: Type, span: Span | None) -> TypeError_:
+    return TypeError_(
+        f"'{show(b)}' has kind {show_kind(kind_of(b))}, but a type of kind "
+        f"{show_kind(kind_of(a))} was expected here",
+        span,
+    )
 
 
 def _mismatch(a: Type, b: Type, span: Span | None, context: str) -> TypeError_:
@@ -413,9 +678,9 @@ def generalize(t: Type, level: int, preds: list[Pred] | None = None) -> Scheme:
             if ty.level > level and ty.id not in seen:
                 seen.add(ty.id)
                 quantified.append(ty)
-        elif isinstance(ty, TCon):
-            for a in ty.args:
-                walk(a)
+        elif isinstance(ty, TApp):
+            walk(ty.fn)
+            walk(ty.arg)
         elif isinstance(ty, TFun):
             for p in ty.params:
                 walk(p)
@@ -451,14 +716,20 @@ def instantiate_qual(scheme: Scheme, fresh: Fresh) -> tuple[list[Pred], Type]:
     """
     if not scheme.quantified:
         return list(scheme.preds), scheme.body
-    mapping = {v.id: fresh() for v in scheme.quantified}
+    # A fresh variable stands for a quantified one, so it inherits its kind:
+    # instantiating `Wrap f a` must not turn the `f` into something of kind `*`.
+    mapping = {}
+    for v in scheme.quantified:
+        replacement = fresh()
+        unify_kinds(replacement.kind, v.kind)
+        mapping[v.id] = replacement
 
     def walk(ty: Type) -> Type:
         ty = prune(ty)
         if isinstance(ty, TVar):
             return mapping.get(ty.id, ty)
-        if isinstance(ty, TCon):
-            return TCon(ty.name, [walk(a) for a in ty.args]) if ty.args else ty
+        if isinstance(ty, TApp):
+            return TApp(walk(ty.fn), walk(ty.arg), ty.kind)
         if isinstance(ty, TFun):
             return TFun([walk(p) for p in ty.params], walk(ty.ret))
         if isinstance(ty, TTuple):
@@ -475,7 +746,9 @@ def type_key(t: Type) -> tuple:
     if isinstance(t, TVar):
         return ("var", t.id)
     if isinstance(t, TCon):
-        return ("con", t.name, tuple(type_key(a) for a in t.args))
+        return ("con", t.name)
+    if isinstance(t, TApp):
+        return ("app", type_key(t.fn), type_key(t.arg))
     if isinstance(t, TFun):
         return ("fun", tuple(type_key(p) for p in t.params), type_key(t.ret))
     if isinstance(t, TTuple):
@@ -495,9 +768,9 @@ def vars_of(*types: Type) -> list[TVar]:
         ty = prune(ty)
         if isinstance(ty, TVar):
             seen.setdefault(ty.id, ty)
-        elif isinstance(ty, TCon):
-            for a in ty.args:
-                walk(a)
+        elif isinstance(ty, TApp):
+            walk(ty.fn)
+            walk(ty.arg)
         elif isinstance(ty, TFun):
             for p in ty.params:
                 walk(p)
@@ -516,9 +789,9 @@ def free_vars(t: Type, acc: set[int] | None = None) -> set[int]:
     t = prune(t)
     if isinstance(t, TVar):
         acc.add(t.id)
-    elif isinstance(t, TCon):
-        for a in t.args:
-            free_vars(a, acc)
+    elif isinstance(t, TApp):
+        free_vars(t.fn, acc)
+        free_vars(t.arg, acc)
     elif isinstance(t, TFun):
         for p in t.params:
             free_vars(p, acc)
@@ -569,10 +842,11 @@ def show(t: Type, names: dict[int, str] | None = None, free_prefix: str = "",
             out = f"fun({params}) -> {go(ty.ret, 0)}"
             return f"({out})" if prec > 0 else out
         if isinstance(ty, TCon):
-            if not ty.args:
-                return ty.name
-            args = " ".join(go(a, 2) for a in ty.args)
-            out = f"{ty.name} {args}"
+            return ty.name
+        if isinstance(ty, TApp):
+            head, args = spine(ty)
+            rendered = " ".join(go(a, 2) for a in args)
+            out = f"{go(head, 2)} {rendered}"
             return f"({out})" if prec > 1 else out
         return repr(ty)
 

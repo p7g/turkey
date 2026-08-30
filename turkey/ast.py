@@ -43,6 +43,20 @@ class TECon(TypeExpr):
 
 
 @dataclass(eq=False)
+class TEApp(TypeExpr):
+    """`f a` -- an application whose head is a type *variable*.
+
+    A named head keeps its own node (`TECon`) because it is also the thing an
+    alias is looked up by, and an alias must be saturated where a constructor
+    need not be. Only a variable head needs this form, and only since M4 gave
+    variables kinds to be applied at.
+    """
+
+    fn: TypeExpr
+    args: list[TypeExpr]
+
+
+@dataclass(eq=False)
 class TETuple(TypeExpr):
     elems: list[TypeExpr]
 

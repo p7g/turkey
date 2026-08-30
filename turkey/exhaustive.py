@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from . import ast
 from .decls import DeclTable
-from .types import TCon, TTuple, TVar, Type, prune, unify
+from .types import TTuple, TVar, Type, head_con, prune, unify
 
 # A pattern is one of:
 #   ("wild",)
@@ -82,10 +82,11 @@ class Checker:
         t = prune(t)
         if isinstance(t, TTuple):
             return [("tuple", len(t.elems))]
-        if isinstance(t, TCon):
-            if t.name == "Bool":
+        head = head_con(t)
+        if head is not None:
+            if head.name == "Bool":
                 return [("lit", "Bool", True), ("lit", "Bool", False)]
-            info = self.decls.tycons.get(t.name)
+            info = self.decls.tycons.get(head.name)
             if info is not None and info.variants:
                 return [("con", v.name) for v in info.variants]
         return None

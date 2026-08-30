@@ -13,13 +13,9 @@ import sys
 from .errors import TurkeyPanic
 from .constraints import Binding, Env
 from .types import (
-    BOOL, CHAR, FLOAT, INT, STRING, UNIT, TCon, TFun, TVar, generalize, mono,
+    BOOL, CHAR, FLOAT, INT, STRING, UNIT, TFun, TVar, array_of, generalize, mono,
 )
 from .values import UNIT as UNIT_VALUE, ArrayObj, Builtin
-
-
-def _array_of(element):
-    return TCon("Array", [element])
 
 
 def _scheme(build):
@@ -79,15 +75,15 @@ _CORE: dict[str, tuple] = {
 
     # Section 8.3, the Data.Array module.
     "Array.new": (
-        _scheme(lambda a: TFun([INT], _array_of(a))),
+        _scheme(lambda a: TFun([INT], array_of(a))),
         _bi("Array.new", 1, lambda n: ArrayObj(n)),
     ),
     "Array.push": (
-        _scheme(lambda a: TFun([_array_of(a), a], UNIT)),
+        _scheme(lambda a: TFun([array_of(a), a], UNIT)),
         _bi("Array.push", 2, _push),
     ),
     "Array.pop": (
-        _scheme(lambda a: TFun([_array_of(a)], a)),
+        _scheme(lambda a: TFun([array_of(a)], a)),
         _bi("Array.pop", 1, lambda arr: arr.pop()),
     ),
 
@@ -102,7 +98,7 @@ _CORE: dict[str, tuple] = {
     "Float.lt": (mono(TFun([FLOAT, FLOAT], BOOL)), _bi("Float.lt", 2, lambda a, b: a < b)),
     "Char.eq": (mono(TFun([CHAR, CHAR], BOOL)), _bi("Char.eq", 2, lambda a, b: a == b)),
     "String.chars": (
-        mono(TFun([STRING], _array_of(CHAR))), _bi("String.chars", 1, _chars),
+        mono(TFun([STRING], array_of(CHAR))), _bi("String.chars", 1, _chars),
     ),
     "Char.fromInt": (
         mono(TFun([INT], CHAR)), _bi("Char.fromInt", 1, _char_from_int),

@@ -42,16 +42,16 @@ from . import ast, prelude
 from .classes import ClassTable, MethodInfo, Skolems
 from .constraints import (
     HAS_FIELD, ONE_OF, Binding, CAnd, CAssume, CDef, CEq, CExists, CInstance,
-    CLet, CPred, Constraint, Env,
+    CBind, CLet, CPred, Constraint, Env, reach,
 )
 from .decls import DeclTable
 from .deps import free_names, pattern_vars, sccs
 from .evidence import Abstraction, InstancePlan, MethodImpl, Use, dict_name
 from .errors import Span, TypeError_
 from .types import (
-    BOOL, BOTTOM, CHAR, FLOAT, INT, STRING, UNIT, Pred, TBottom, TFun, TLabel,
-    TSet, TTuple, TVar, Type, apply, array_of, float_literal_set,
-    int_literal_set, show, vars_of,
+    BOOL, BOTTOM, CHAR, FLOAT, INT, STRING, UNIT, Pred, Scheme, TBottom, TFun,
+    TLabel, TSet, TTuple, TVar, Type, apply, array_of, float_literal_set,
+    int_literal_set, show, show_pred, vars_of,
 )
 
 LITERAL_TYPES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR}
@@ -109,7 +109,7 @@ class Generator:
         self.scopes: list[dict[str, bool]] = [_names_of(builtins)]
         self.fn_stack: list[Type] = []
         self.loop_stack: list[LoopCtx] = []
-        self.tyvar_scopes: list[dict[str, TVar]] = [{}]
+        self.tyvar_scopes: list[dict[str, Type]] = [{}]
         self.warnings: list[str] = []
         # Exhaustiveness runs after solving, when scrutinee types are known.
         self.match_sites: list[tuple[ast.EMatch, Type]] = []
@@ -339,6 +339,94 @@ class Generator:
                                        defn, CAnd([]), decl.span)))
         return MethodImpl(decl, self_name, params)
 
+    # -- signatures --------------------------------------------------------
+
+    def declared_scheme(
+        self, decl: ast.FunDecl
+    ) -> tuple[Scheme, dict[str, Type]] | None:
+        """The type a `fun` states outright, or None if it states none.
+
+        A signature is *complete* or it is nothing: every parameter annotated
+        and a return type written. The all-or-nothing rule is not a limitation
+        of the machinery but the point of it -- a half-stated type has no
+        scheme for a recursive call to instantiate, and a reader can tell by
+        eye which functions are checked and which are inferred.
+
+        The quantified variables are read off the annotation scope rather than
+        found by `generalize`, because generalization is a *solving* step and
+        nothing here has a rank yet. It needs no search: SPEC-DELTAS 13 already
+        says an annotation's variables are exactly those scoped to the `fun`.
+        """
+        if decl.body is None or decl.ret is None:
+            return None
+        annots = []
+        for param in decl.params:
+            if not isinstance(param, ast.PAnnot):
+                return None
+            annots.append(param.type_expr)
+        tyvars: dict[str, Type] = {}
+        params = [self.decls.star(a, tyvars, self.fresh) for a in annots]
+        ret = self.decls.star(decl.ret, tyvars, self.fresh)
+        preds = self.classes.resolve_context(decl.context, tyvars, self.fresh)
+        quantified = [v for v in tyvars.values() if isinstance(v, TVar)]
+        body = TFun(params, ret)
+        # The ambiguity test the inference path applies at generalization, run
+        # here instead, where it is purely syntactic: a written context that
+        # constrains a variable the type does not reach can never be decided by
+        # a use site, because there is nothing at a use site to decide it with.
+        # `reach` is the same closure `split` uses, so `[Container c, Show
+        # (Elem c)]` passes -- `Elem c` reaches `c`, and `c` is in the type.
+        ids = reach([CPred(p, decl.span, "read") for p in preds], [body])
+        # Blamed in the names the signature wrote, not in the letters `show`
+        # would invent: the whole point of a declared type is that it is the
+        # programmer's text, so a complaint about it should quote that text.
+        written_names = {v.id: n for n, v in tyvars.items() if isinstance(v, TVar)}
+        for pred, written in zip(preds, decl.context):
+            if not any(v.id in ids for v in vars_of(*pred.args)):
+                raise TypeError_(
+                    f"'{show_pred(pred, written_names)}' constrains a type "
+                    f"that the declared type of '{decl.name}' does not "
+                    f"mention, so no use of '{decl.name}' could decide it",
+                    written.span,
+                )
+        return Scheme(quantified, body, list(preds)), tyvars
+
+    def check_signature(
+        self, decl: ast.FunDecl, scheme: Scheme, tyvars: dict[str, Type]
+    ) -> Constraint:
+        """Check a body against the type its `fun` declared.
+
+        The same procedure as `check_method`, for the same reason: a stated
+        type has to be lived up to, and a fresh unification variable would let
+        a body that is *less* general than the signature pass by narrowing the
+        signature to fit. That is precisely the defect SPEC-DELTAS 13 recorded
+        and deferred -- an annotation was a constraint the body could unify
+        away rather than a promise it had to keep.
+        """
+        skolems = Skolems()
+        rigid = {name: skolems.bind(var, name) for name, var in tyvars.items()
+                 if isinstance(var, TVar)}
+        expected = skolems.apply(scheme.body)
+        # Only a class predicate arrives as a dictionary; the erased kinds are
+        # facts the body may use but never asks for evidence of. The order is
+        # the scheme's, because that is the order a use site instantiates in
+        # and `eval.supply` zips the two together positionally.
+        wanted = [p for p in scheme.preds if self.classes.is_class(p.name)]
+        givens = [(dict_name(p.name), skolems.apply_pred(p)) for p in wanted]
+        decl.dicts = Abstraction([n for n, _ in givens], wanted)
+
+        self.push()
+        inferred = self.gen_function(decl, rigid)
+        self.eq(inferred, expected, decl.span,
+                f"the declared type of '{decl.name}'")
+        defn = self.pop()
+        # A `CLet` for the rank, not for the polymorphism -- see `check_method`:
+        # the expected type is rigid, so nothing generalizes, and what the rank
+        # buys is that a predicate the body raised is settled here, against the
+        # assumptions, instead of escaping to the end of the program.
+        return CAssume(givens, CLet([(f"%sig.{decl.name}", expected)],
+                                    defn, CAnd([]), decl.span))
+
     def check_exhaustiveness(self) -> None:
         """Section 5.1: a non-exhaustive match is a warning, not an error --
         reaching an unhandled case is a runtime panic.
@@ -407,9 +495,12 @@ class Generator:
         statements" -- a C-style `for`'s initializer scopes over the condition
         and step too.
         """
-        binds, defn, generalizes, mutable = self.build_definition(group)
+        binds, defn, generalizes, mutable, sigs = self.build_definition(group)
 
-        self.scopes.append({name: mutable for name, _ in binds})
+        self.scopes.append(
+            {name: mutable for name, _ in binds}
+            | {name: False for name, _ in sigs}
+        )
         self.push()
         try:
             out = rest()
@@ -417,33 +508,49 @@ class Generator:
             body = self.pop()
             self.scopes.pop()
 
-        if generalizes:
+        if not binds:
+            # Every member states its own type, so there is nothing left to
+            # generalize and no rank to push for.
+            node: Constraint = CAnd([defn, body])
+        elif generalizes:
             # One abstraction for the group, hung on each declaration in it so
             # the evaluator can find it, and handed to the `CLet` so the solver
-            # can fill it in when it decides what the schemes retain.
+            # can fill it in when it decides what the schemes retain. A member
+            # with a signature is not in the group's `binds` and got its own
+            # abstraction from `check_signature`, so it is skipped here.
             dicts = Abstraction()
+            bound = {name for name, _ in binds}
             for item in group:
                 if isinstance(item, ast.SFun):
-                    item.decl.dicts = dicts
+                    if item.decl.name in bound:
+                        item.decl.dicts = dicts
                 else:
                     item.dicts = dicts
-            self.emit(CLet(binds, defn, body, group[0].span, top_level, dicts))
+            node = CLet(binds, defn, body, group[0].span, top_level, dicts)
         else:
             # No generalization means no new rank, so the definition is solved
             # right here and only the names are scoped. Nothing needs its rank
             # lowered afterwards, because nothing ever raised it.
-            self.emit(CAnd([defn, CDef(binds, body, top_level)]))
+            node = CAnd([defn, CDef(binds, body, top_level)])
+        # The declared schemes scope over the whole group *and* over `rest`,
+        # which is what makes a recursive occurrence an instantiation.
+        if sigs:
+            node = CBind(sigs, node, top_level)
+        self.emit(node)
         return out
 
     def build_definition(
         self, group: list[ast.Stmt]
-    ) -> tuple[list[tuple[str, Type]], Constraint, bool, bool]:
+    ) -> tuple[
+        list[tuple[str, Type]], Constraint, bool, bool, list[tuple[str, Scheme]]
+    ]:
         """The bound names, the definition's constraint, and how it binds."""
         if all(isinstance(item, ast.SFun) for item in group):
-            binds, defn = self.build_fun_group([item.decl for item in group])
+            binds, defn, sigs = self.build_fun_group(
+                [item.decl for item in group])
             # A `fun` is syntactically a value, so the value restriction never
             # blocks generalization here.
-            return binds, defn, True, False
+            return binds, defn, True, False, sigs
 
         assert len(group) == 1, "only functions may share a binding group"
         stmt = group[0]
@@ -454,35 +561,69 @@ class Generator:
         defn = self.pop()
         # Section 4.4: only a `let` bound to a syntactic value generalizes.
         generalizes = isinstance(stmt, ast.SLet) and self.is_nonexpansive(stmt.value)
-        return binds, defn, generalizes, isinstance(stmt, ast.SVar)
+        return binds, defn, generalizes, isinstance(stmt, ast.SVar), []
 
     def build_fun_group(
         self, decls: list[ast.FunDecl]
-    ) -> tuple[list[tuple[str, Type]], Constraint]:
+    ) -> tuple[list[tuple[str, Type]], Constraint, list[tuple[str, Scheme]]]:
         """Section 5.2 step 3: one strongly-connected group at a time.
 
-        The placeholders are bound *monomorphically* inside the definition, by
-        the inner `CDef`, which is what keeps polymorphic recursion out. The
-        enclosing `CLet` generalizes them only once every body has been solved.
+        A group splits by whether a member states its own type. An inferred
+        member's placeholder is bound *monomorphically* inside the definition,
+        by the inner `CDef`, which is what keeps polymorphic recursion out of
+        inference, where it is undecidable; the enclosing `CLet` generalizes it
+        only once every body has been solved. A member with a signature is
+        bound to that signature by the `CBind` `bind_group` wraps around the
+        whole group, so a recursive use of it instantiates instead.
+
+        Mixing the two in one group is allowed and behaves as it does in
+        Haskell: an inferred member calling an annotated one instantiates the
+        declared scheme, and an annotated member calling an inferred one sees
+        the one monomorphic placeholder, since there is nothing more to see.
         """
+        sigs: list[tuple[str, Scheme]] = []
+        checks: list[tuple[ast.FunDecl, Scheme, dict[str, Type]]] = []
+        inferred: list[ast.FunDecl] = []
+        for decl in decls:
+            declared = self.declared_scheme(decl)
+            if declared is None:
+                inferred.append(decl)
+            else:
+                scheme, tyvars = declared
+                sigs.append((decl.name, scheme))
+                checks.append((decl, scheme, tyvars))
+
         self.push()
-        binds = [(decl.name, self.fresh()) for decl in decls]
-        self.scopes.append({name: False for name, _ in binds})
+        binds = [(decl.name, self.fresh()) for decl in inferred]
+        self.scopes.append(
+            {name: False for name, _ in binds}
+            | {name: False for name, _ in sigs}
+        )
         self.push()
-        for decl, (_, placeholder) in zip(decls, binds):
+        for decl, scheme, tyvars in checks:
+            self.emit(self.check_signature(decl, scheme, tyvars))
+        for decl, (_, placeholder) in zip(inferred, binds):
             self.eq(placeholder, self.gen_function(decl), decl.span)
         inner = self.pop()
         self.scopes.pop()
         self.emit(CDef(binds, inner))
-        return binds, self.pop()
+        return binds, self.pop(), sigs
 
-    def gen_function(self, decl: ast.FunDecl | ast.ELambda) -> TFun:
+    def gen_function(
+        self, decl: ast.FunDecl | ast.ELambda, rigid: dict[str, Type] | None = None
+    ) -> TFun:
         """A function's own constraint. Parameters bind monomorphically.
 
         No rank is pushed: a lambda is not a generalization point, so its
         parameters live at whatever rank the enclosing binder established.
+
+        `rigid` is the annotation scope to work in, and passing one is what
+        distinguishes checking from inferring. It maps each name the signature
+        quantifies to a skolem constant, so every annotation in the body reads
+        the *same* rigid type the signature promised -- and, since the context
+        is then a fact rather than an obligation, it is not emitted here.
         """
-        self.tyvar_scopes.append({})
+        self.tyvar_scopes.append({} if rigid is None else dict(rigid))
         self.push()
 
         param_types: list[Type] = []
@@ -496,16 +637,22 @@ class Generator:
         if decl.ret is not None:
             self.eq(ret, self.type_of(decl.ret), decl.span, "the return type annotation")
 
-        # A declared context is emitted as an ordinary demand rather than being
-        # attached to the scheme by hand. It then travels the same road as one
-        # the body raised -- deferred while its variable is open, retained by
-        # the binder that quantifies it, and rejected as ambiguous if no type
-        # in the group mentions it. Declaring a context is asking for it, not
-        # asserting it; a `fun` has no signature to be granted anything by.
-        for pred in self.classes.resolve_context(
-            getattr(decl, "context", []), self.tyvar_scopes[-1], self.fresh
-        ):
-            self.emit(CPred(pred, decl.span, "read"))
+        # On the inference path a declared context is emitted as an ordinary
+        # demand rather than attached to the scheme by hand. It then travels
+        # the same road as one the body raised -- deferred while its variable
+        # is open, retained by the binder that quantifies it, and rejected as
+        # ambiguous if no type in the group mentions it. Asking for a context
+        # is not the same as being granted one, and a `fun` with an incomplete
+        # annotation has no signature to be granted anything by.
+        #
+        # A complete one does. There the context has already become a *given*
+        # (`check_signature`), so re-emitting it here would demand of the body
+        # exactly what the caller has been made to promise.
+        if rigid is None:
+            for pred in self.classes.resolve_context(
+                getattr(decl, "context", []), self.tyvar_scopes[-1], self.fresh
+            ):
+                self.emit(CPred(pred, decl.span, "read"))
 
         # Parameters are reassignable (`fun gcd(a, b) { a = b ... }`). `CDef`
         # binds them monomorphically, so the value restriction that makes a

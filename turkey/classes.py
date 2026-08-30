@@ -279,7 +279,7 @@ class ClassTable:
     def resolve_context(
         self,
         context: list[ast.ClassPred],
-        tyvars: dict[str, TVar],
+        tyvars: dict[str, Type],
         fresh=None,
     ) -> list[Pred]:
         """Translate a written `[C a, D b]` into predicates over `tyvars`.

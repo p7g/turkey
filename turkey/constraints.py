@@ -147,6 +147,29 @@ class CDef(Constraint):
 
 
 @dataclass
+class CBind(Constraint):
+    """Bind names to *schemes* already built, while solving `body`.
+
+    The one binder whose schemes solving does not discover. A `fun` with a
+    complete annotation states its own type, so there is nothing to generalize
+    and nothing to wait for: the scheme is in scope from the group's first
+    line, which is exactly what lets a recursive occurrence *instantiate* it
+    rather than share one monomorphic placeholder.
+
+    That is polymorphic recursion, and it is admissible here for the reason it
+    is inadmissible in `CLet`. Inferring it is undecidable (Henglein 1993;
+    Kfoury, Tiuryn and Urzyczyn 1993, both by reduction with semi-unification),
+    but *checking* a recursive use against a type the programmer wrote down is
+    an ordinary instantiation. So the rule is the usual one: rejected when the
+    type has to be guessed, accepted when it has been stated.
+    """
+
+    binds: list[tuple[str, Scheme]]
+    body: Constraint
+    top_level: bool = False
+
+
+@dataclass
 class CLet(Constraint):
     """Solve `defn` one rank deeper, generalize, bind the schemes, solve `body`.
 
@@ -303,7 +326,12 @@ class Solver:
         for t in (a, b):
             if isinstance(t, TFam):
                 missing = self.classes.uncovered(t)
-                if missing is not None:
+                # A skolem is a nullary constructor, so a family over one looks
+                # exactly like a family over a type whose instance is missing.
+                # It is not: the declaration assumed that instance, and which
+                # one it will be is the caller's business. Such an equation is
+                # merely stuck, and is reported as stuck.
+                if missing is not None and not self.granted(missing):
                     raise TypeError_(
                         f"no instance for '{show_pred(missing)}', so "
                         f"'{show(t)}' has no definition",
@@ -354,6 +382,15 @@ class Solver:
             with self.scope():
                 for name, ty in c.binds:
                     binding = Binding(mono(ty), c.top_level)
+                    self.env.define(name, binding)
+                    if c.top_level:
+                        self.top_level.define(name, binding)
+                self.solve(c.body)
+            return
+        if isinstance(c, CBind):
+            with self.scope():
+                for name, scheme in c.binds:
+                    binding = Binding(scheme, c.top_level)
                     self.env.define(name, binding)
                     if c.top_level:
                         self.top_level.define(name, binding)
@@ -572,6 +609,19 @@ class Solver:
             return self._class(c)
         raise TypeError_(f"no rule for predicate '{c.pred.name}'", c.span)
 
+    def granted(self, pred: Pred) -> bool:
+        """Is `pred` a fact the enclosing declaration already assumed?
+
+        Both sides are normalized before they are compared, since an
+        assumption is written down and a demand is discovered, and the two may
+        name the same type by different routes.
+        """
+        key = Pred(pred.name, [self.classes.normalize(pred.args[0])]).key()
+        return any(
+            Pred(q.name, [self.classes.normalize(q.args[0])]).key() == key
+            for a in self.assumptions for q in self.classes.by_super(a)
+        )
+
     def _class(self, c: CPred) -> bool:
         """`C t`: an assumption grants it, or an instance covers it.
 
@@ -584,14 +634,18 @@ class Solver:
         t = self.classes.normalize(c.pred.args[0])
         if isinstance(t, TBottom):
             return True  # absorbed; there is no value to find a method for
+        pred = Pred(c.pred.name, [t])
+        # Assumptions are consulted before the shape of the argument is, and
+        # that order matters: a given may be *about* a family application, as
+        # `[Container c, Show (Elem c)]` is, and `Elem c` over a skolem never
+        # reduces. Testing the head first would defer such a predicate for
+        # ever, and it would be reported as stranded at the end of the group --
+        # a demand the declaration had already granted.
+        if self.granted(pred):
+            return True
         head, _ = spine(t)
         if isinstance(head, (TVar, TFam)):
             return False
-        pred = Pred(c.pred.name, [t])
-        key = pred.key()
-        if any(q.key() == key for a in self.assumptions
-               for q in self.classes.by_super(a)):
-            return True
         obligations = self.classes.by_inst(pred)
         if obligations is None:
             raise TypeError_(f"no instance for '{show_pred(pred)}'", c.span)

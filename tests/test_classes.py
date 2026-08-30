@@ -153,12 +153,37 @@ def test_a_missing_instance_names_the_type_that_lacks_one():
 
 
 def test_an_instance_context_becomes_the_use_site_obligation():
-    """`Egal (Array a)` holds only where `Egal a` does, and says so."""
+    """`Egal (Array a)` holds only where `Egal a` does, and says so.
+
+    No return type, so this is inferred rather than checked (delta 38) and the
+    context is the solver's to discover.
+    """
+    src = EQ + """
+    instance [Egal a] Egal (Array a) {
+        fun egal(xs, ys) = egal(xs[0], ys[0])
+    }
+    fun heads(xs : Array a, ys : Array a) = egal(xs, ys)
+    """
+    assert sigs(src)["heads"] == "[Egal a] fun(Array a, Array a) -> Bool"
+
+
+def test_a_signature_must_declare_the_context_its_body_needs():
+    """The other side of delta 38: a stated type is the whole of the type."""
     src = EQ + """
     instance [Egal a] Egal (Array a) {
         fun egal(xs, ys) = egal(xs[0], ys[0])
     }
     fun heads(xs : Array a, ys : Array a) -> Bool = egal(xs, ys)
+    """
+    assert bad(src) == "no instance for 'Egal a'"
+
+
+def test_a_signature_that_declares_its_context_is_accepted():
+    src = EQ + """
+    instance [Egal a] Egal (Array a) {
+        fun egal(xs, ys) = egal(xs[0], ys[0])
+    }
+    fun heads[Egal a](xs : Array a, ys : Array a) -> Bool = egal(xs, ys)
     """
     assert sigs(src)["heads"] == "[Egal a] fun(Array a, Array a) -> Bool"
 
@@ -191,8 +216,10 @@ def test_a_declared_context_is_asked_for_rather_than_asserted():
 
 def test_a_declared_context_over_a_variable_the_type_omits_is_ambiguous():
     src = EQ + "fun f[Egal b](x : Int) -> Int = x"
-    assert bad(src) == \
-        "cannot determine a type satisfying 'Egal a'. Add a type annotation."
+    assert bad(src) == (
+        "'Egal b' constrains a type that the declared type of 'f' does not "
+        "mention, so no use of 'f' could decide it"
+    )
 
 
 def test_a_context_names_the_annotation_variables_it_shares():

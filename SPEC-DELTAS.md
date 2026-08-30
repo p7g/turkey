@@ -1033,3 +1033,90 @@ Int` is partial: `2 ** -1` has no `Int` answer, so it would be a second
 operator that panics. It also wants a new right-associative precedence level
 binding tighter than unary minus. If it arrives it belongs with the numeric
 tower delta 27 was built for. `square(n) = n * n` costs one line.
+
+### 38. A complete annotation is a signature, and a signature is checked
+
+Delta 13 made an annotation's type variables ordinary unification variables and
+recorded the consequence it could see: an over-general signature is not caught,
+so `fun f(x) -> a { 5 }` wrongly type-checks. It deferred skolemization as a
+follow-up. The hole runs the other way too, and there it is worse -- the
+annotation is not merely unchecked but silently *overwritten*:
+
+```
+fun g[Iterator a](xs : a) -> Int {
+    var n = 0
+    for x in xs { n = n + 1; if n < 0 { n = n + g([1, 2]) } }
+    n
+}
+```
+
+reported `[OneOf a {Int, Float}] fun(Array a) -> Int`. The recursive call
+unified the annotation's own `a` with `Array _`, the declared `[Iterator a]`
+vanished, and nothing said so. An annotation that inference may rewrite cannot
+document anything, because it is not a claim about the function -- it is a hint
+the solver is free to discard.
+
+**A `fun` whose annotation is complete now states its type.** Complete means
+every parameter annotated and a return type written; anything less takes the
+inference path exactly as before, unchanged. Annotations remain optional, and
+the all-or-nothing rule is what keeps "checked or inferred" something a reader
+settles by eye rather than per parameter.
+
+Checking is `check_method`'s procedure applied to a `fun`, and reuses it whole:
+the declared variables become rigid nullary constructors (`Skolems`, delta 29),
+the declared context becomes a `CAssume` given rather than a wanted, and the
+body is checked against the skolemized type. A method already had a type to
+live up to; now a `fun` may have one too.
+
+**A stated type is the whole of the type, contexts included.** This is the
+visible behaviour change. `fun heads(xs : Array a, ys : Array a) -> Bool =
+egal(xs, ys)` was accepted, with `[Egal a]` inferred and added; it is now an
+error, and the signature must say `[Egal a]`. That is Haskell's rule and it
+follows from the same place: if the body may quietly add to the declared
+context, the declaration is again not a claim. Dropping the return type is
+enough to ask for inference back.
+
+**Polymorphic recursion, once the type is written.** Inferring it is
+undecidable -- Milner-Mycroft typability reduces to semi-unification (Henglein
+1993; Kfoury, Tiuryn and Urzyczyn 1993) -- which is why `build_fun_group` binds
+an inferred group's placeholders monomorphically, and still does. But
+*checking* a recursive use against a stated type is an ordinary instantiation,
+so a signature is bound by a new `CBind` before its own body is solved, and a
+recursive occurrence instantiates it. `g` above now keeps `[Iterator a] fun(a)
+-> Int` and calls itself at `Array Int`, dictionary and all.
+
+**A written context is checked for ambiguity where it is written.** `fun
+f[Egal b](x : Int) -> Int` constrains a `b` the type never mentions, so no use
+site could ever decide it. The inference path catches this at generalization,
+via `split`; a signature has no generalization step, so the same `reach`
+closure runs over the written signature instead. `[Container c, Show (Elem c)]`
+still passes: `Elem c` reaches `c`, and `c` is in the type.
+
+**Two solver rules that only a *given* could expose.** Both are fixes, not
+accommodations. `_class` now consults assumptions *before* it looks at the
+shape of the predicate's argument: a given may be about a family application,
+as `Show (Elem c)` is, and `Elem c` over a skolem never reduces, so testing the
+head first deferred such a predicate for ever and then reported it stranded --
+a demand the declaration had already granted. And `defer` no longer reports a
+family over a *skolem* as a missing instance: a skolem is a nullary constructor
+(delta 29), so `Elem c` looks exactly like a family over a type whose instance
+is absent, when in fact the declaration assumed that instance and which one it
+will be is the caller's business. Such an equation is merely stuck, and is
+reported as stuck -- now naming `c`, the variable the signature wrote, rather
+than a letter `show` invented.
+
+**Scope.** One golden moved: `err_stuck_family.expected`, for that better name.
+`bf.tl` is unaffected here; it needs delta 39 as well. Erased predicates are
+untouched -- a signature's dictionary parameters are its class predicates in
+scheme order, which is the order a use site instantiates in.
+
+**Still open, deliberately.** Delta 13's own example is *not* repaired: `fun
+f(x) -> a { 5 }` has an unannotated parameter, so it is not a signature and
+stays on the soft path. Closing that needs a body's inferred predicates
+re-abstracted over the skolems a partial annotation fixed, which is a different
+and larger change. Nothing checks that a skolem does not escape into an
+enclosing binding -- the same gap `check_method` has always had. And a group
+that mixes the two paths *mutually recursively* is rejected: the skolem of the
+annotated member flows into the inferred member's placeholder, and the
+assumption granting it belongs to the annotated member's body. Splitting a
+group's assumptions per member would fix it; nothing needs it yet.

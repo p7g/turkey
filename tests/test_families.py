@@ -201,7 +201,8 @@ def test_an_equation_no_signature_could_promise_is_rejected():
 
 def test_an_equation_that_can_never_be_decided_is_rejected():
     message = fails(CONTAINER + "fun f[Container c](xs : c) -> Int = first(xs)")
-    assert "cannot reduce 'Elem a' to 'Int'" in message
+    # `c` is the name the signature wrote, kept by the skolem (delta 38).
+    assert "cannot reduce 'Elem c' to 'Int'" in message
     assert "which 'Container' instance defines it" in message
 
 

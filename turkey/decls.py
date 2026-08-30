@@ -194,7 +194,7 @@ class DeclTable:
 
     # -- translation -------------------------------------------------------
 
-    def star(self, te: ast.TypeExpr, tyvars: dict[str, TVar], fresh: Fresh) -> Type:
+    def star(self, te: ast.TypeExpr, tyvars: dict[str, Type], fresh: Fresh) -> Type:
         """`to_type`, where a type that classifies values is required.
 
         Every annotation and every constructor field is such a position: `x :
@@ -213,10 +213,13 @@ class DeclTable:
             )
         return t
 
-    def to_type(self, te: ast.TypeExpr, tyvars: dict[str, TVar], fresh: Fresh) -> Type:
+    def to_type(self, te: ast.TypeExpr, tyvars: dict[str, Type], fresh: Fresh) -> Type:
         """Translate type syntax into a semantic type.
 
-        `tyvars` maps annotation type variable names to unification variables and
+        `tyvars` maps annotation type variable names to the types they stand
+        for -- unification variables while a type is being inferred, and rigid
+        skolem constants while a body is being checked against a signature --
+        and
         is shared across an entire function, so the `a` in a parameter and the
         `a` in a body annotation are the same variable (SPEC-DELTAS.md 13).
         """
@@ -262,7 +265,7 @@ class DeclTable:
             return self._expand_alias(info, substitution, fresh, te.span)
         return apply(self.head(te.name), args, te.span)
 
-    def _family(self, te: ast.TECon, tyvars: dict[str, TVar], fresh: Fresh) -> Type:
+    def _family(self, te: ast.TECon, tyvars: dict[str, Type], fresh: Fresh) -> Type:
         """`Elem c` -- a family application, which is not an application.
 
         A family is saturated where it is written, for the same reason an alias

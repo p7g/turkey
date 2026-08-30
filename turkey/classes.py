@@ -75,6 +75,10 @@ class ClassInfo:
     supers: list[Pred] = field(default_factory=list)
     methods: dict[str, MethodInfo] = field(default_factory=dict)
     span: Span | None = None
+    # Method name -> `evidence.MethodImpl` for its default body, elaborated
+    # once and shared by every instance that does not override it. Filled in by
+    # the generator, which is where method bodies are checked.
+    defaults: dict = field(default_factory=dict)
 
     @property
     def kind(self) -> Kind:
@@ -88,6 +92,9 @@ class InstInfo:
     context: list[Pred]
     decl: ast.InstanceDecl
     names: dict[int, str]
+    # `evidence.InstancePlan`: what the evaluator needs to build this
+    # dictionary. Set by the generator once the method bodies are checked.
+    plan: object = None
 
     @property
     def con(self) -> str:
@@ -379,6 +386,11 @@ class ClassTable:
 
     def is_class(self, name: str) -> bool:
         return name in self.classes
+
+    def method(self, name: str) -> MethodInfo | None:
+        """The method `name` denotes, if it denotes one rather than a function."""
+        cls = self.owner.get(name)
+        return self.classes[cls].methods[name] if cls is not None else None
 
     def simplify(self, preds: list[Pred]) -> list[Pred]:
         """Drop a class predicate that the others already imply.

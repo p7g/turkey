@@ -43,6 +43,14 @@ table (`turkey/classes.py`), or from the assumptions a `CAssume` has in scope:
 checking an instance method against its class's signature is the one place a
 predicate is *granted* rather than proved, because the signature said so.
 
+It is also the only form that survives into the running program, so solving
+leaves two things behind for elaboration (`turkey/evidence.py`). A `CInstance`
+records what its use site turned out to demand, and the scopes that were open
+around it. A `CLet` records what its schemes retained, as the dictionary
+parameters the group takes. Both are written where the decision is already
+being made -- there is no second pass over the constraint to find them, and no
+second notion of what a scheme carries.
+
 `OneOf` is the other predicate: the set of types a numeric literal could have.
 It is closed -- membership is decided by a built-in table, not by anything a
 program can declare -- so it needs no evidence at runtime, only a decision.
@@ -57,6 +65,7 @@ from dataclasses import dataclass, field
 
 from .classes import ClassTable
 from .decls import DeclTable
+from .evidence import Abstraction, Scope, Use, dict_name
 from .errors import Span, TypeError_
 from .types import (
     INT, Pred, Scheme, TBottom, TCon, TLabel, TSet, TVar, Type, generalize,
@@ -144,11 +153,15 @@ class CLet(Constraint):
     body: Constraint
     span: Span | None = None
     top_level: bool = False
+    dicts: Abstraction | None = None
 
 
 @dataclass
 class CAssume(Constraint):
-    """Solve `body` with `preds` taken as given.
+    """Solve `body` with `givens` taken as facts.
+
+    Each given carries the runtime name its dictionary will arrive under, since
+    a granted predicate is exactly one the body may need evidence for.
 
     The only source of assumptions is a *declared* type that a body is being
     checked against -- an instance method, or a class's default method. There
@@ -159,8 +172,12 @@ class CAssume(Constraint):
     types, and none is introduced here.
     """
 
-    preds: list[Pred]
+    givens: list[tuple[str, Pred]]
     body: Constraint
+
+    @property
+    def preds(self) -> list[Pred]:
+        return [p for _, p in self.givens]
 
 
 @dataclass
@@ -174,6 +191,7 @@ class CInstance(Constraint):
     name: str
     type: Type
     span: Span | None = None
+    use: Use | None = None
 
 
 # ------------------------------------------------------------- the environment
@@ -225,6 +243,11 @@ class Solver:
         # Predicates a `CAssume` currently grants. A stack in effect, restored
         # on the way out of each one.
         self.assumptions: list[Pred] = []
+        # The dictionary scopes open at the point being solved, innermost last.
+        # A `Use` keeps the objects rather than their contents, because what a
+        # binder makes available is only known once its definition is solved.
+        self.scopes: list[Scope] = []
+        self.uses: list[Use] = []
         self.pools: list[list[TVar]] = [[]]
         self.deferred: list[CPred] = []
         # Schemes of every name a `CLet` bound, for the `types` command.
@@ -283,10 +306,12 @@ class Solver:
         if isinstance(c, CAssume):
             saved = self.assumptions
             self.assumptions = saved + c.preds
+            self.scopes.append(Scope(list(c.givens)))
             try:
                 self.solve(c.body)
             finally:
                 self.assumptions = saved
+                self.scopes.pop()
             return
         if isinstance(c, CDef):
             with self.scope():
@@ -320,6 +345,12 @@ class Solver:
         assert binding is not None, f"generation let '{c.name}' through unbound"
         preds, ty = instantiate_qual(binding.scheme, self.fresh)
         unify(ty, c.type, c.span, "")
+        if c.use is not None:
+            # Only the class predicates: `HasField` and `OneOf` are discharged
+            # by a lookup and a decision, and leave nothing behind to pass.
+            c.use.preds = [p for p in preds if self.classes.is_class(p.name)]
+            c.use.scopes = tuple(self.scopes)
+            self.uses.append(c.use)
         for p in preds:
             self.solve(CPred(p, c.span, "read"))
 
@@ -333,14 +364,32 @@ class Solver:
         into the parent's pool.
         """
         self.pools.append([])
+        scope = Scope()
+        self.scopes.append(scope)
         self.solve(c.defn)
+        self.scopes.pop()
         self.settle()
         retained = self.split([ty for _, ty in c.binds])
         self.discharge_pool(self.pools.pop())
 
+        # The class predicates are shared across the group, and the dictionary
+        # parameters with them. One member's body may call another's, so a
+        # per-name context would leave that call needing a dictionary the
+        # caller's own signature never promised. Everything else stays per
+        # name: a `HasField` is erased, so nothing has to agree about it.
+        shared = self.classes.simplify(
+            [p.pred for p in retained if self.classes.is_class(p.pred.name)]
+        )
+        scope.givens = [(dict_name(p.name), p) for p in shared]
+        if c.dicts is not None:
+            c.dicts.params = [n for n, _ in scope.givens]
+            c.dicts.preds = shared
+
         with self.scope():
             for name, ty in c.binds:
-                preds = self.classes.simplify(_constrain(retained, ty))
+                own = [p for p in _constrain(retained, ty)
+                       if not self.classes.is_class(p.name)]
+                preds = self.classes.simplify(own + shared)
                 binding = Binding(generalize(ty, self.rank, preds), False)
                 self.env.define(name, binding)
                 if c.top_level:

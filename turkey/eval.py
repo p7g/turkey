@@ -13,9 +13,12 @@ from __future__ import annotations
 
 from . import ast
 from .decls import DeclTable
+from .deps import pattern_vars
 from .errors import TurkeyPanic
+from .evidence import Absent, FromDict, FromInstance
 from .values import (
-    UNIT, ArrayObj, Builtin, Closure, ConstructorFn, ConValue, RecordObj,
+    UNIT, ArrayObj, Builtin, Closure, ConstructorFn, ConValue, Dict, DictAbs,
+    RecordObj,
 )
 
 
@@ -114,6 +117,10 @@ class Evaluator:
     def __init__(self, decls: DeclTable, globals_: dict):
         self.decls = decls
         self.globals = REnv(None, dict(globals_))
+        # One dictionary per (instance, arguments). Shared rather than rebuilt
+        # so that `Eq (Array a)` applied to the same `Eq a` is the same object,
+        # which is what makes a recursive instance terminate.
+        self.dicts: dict[tuple, Dict] = {}
         for name, info in decls.constructors.items():
             mutable = decls.tycons[info.tycon].is_mutable_record
             if info.arity == 0:
@@ -144,6 +151,13 @@ class Evaluator:
             return self.eval(stmt.expr, env)
 
         if isinstance(stmt, (ast.SLet, ast.SVar)):
+            dicts = getattr(stmt, "dicts", None)
+            if dicts is not None and dicts.params:
+                # The value cannot be built until the dictionaries arrive, so
+                # each name it binds stands for the binding itself until then.
+                for name in pattern_vars(stmt.pat):
+                    env.define(name, DictAbs(dicts.params, stmt, env))
+                return UNIT
             value = self.eval(stmt.value, env)
             bindings = match_pattern(stmt.pat, value)
             if bindings is None:
@@ -156,7 +170,10 @@ class Evaluator:
 
         if isinstance(stmt, ast.SFun):
             decl = stmt.decl
-            env.define(decl.name, Closure(decl.params, decl.body, env, decl.name))
+            if decl.dicts is not None and decl.dicts.params:
+                env.define(decl.name, DictAbs(decl.dicts.params, decl, env))
+            else:
+                env.define(decl.name, Closure(decl.params, decl.body, env, decl.name))
             return UNIT
 
         if isinstance(stmt, ast.SAssign):
@@ -199,7 +216,77 @@ class Evaluator:
         return UNIT
 
     def _eval_EVar(self, e, env):
-        return env.lookup(e.name)
+        use = e.use
+        if use is None or not use.evidence:
+            return env.lookup(e.name)
+        dicts = [self.evidence(ev, env) for ev in use.evidence]
+        if use.method is not None:
+            # A method is *selected* from its class's dictionary; the rest of
+            # the evidence is the method's own context, which every call takes.
+            value = dicts[0].methods[e.name]
+            dicts = dicts[1:]
+        else:
+            value = env.lookup(e.name)
+        return self.supply(value, dicts, e.name)
+
+    # -- dictionaries -------------------------------------------------------
+
+    def supply(self, value, dicts, name: str):
+        """Hand `dicts` to a binding that abstracts over them."""
+        if not isinstance(value, DictAbs):
+            return value
+        scope = value.env.child()
+        for param, d in zip(value.params, dicts):
+            scope.define(param, d)
+        node = value.node
+        if isinstance(node, ast.FunDecl):
+            return Closure(node.params, node.body, scope, node.name)
+        # A `let`: re-run the binding with the dictionaries in scope and take
+        # the name that was asked for.
+        bindings = match_pattern(node.pat, self.eval(node.value, scope))
+        if bindings is None:
+            raise TurkeyPanic("the pattern in this binding does not match its value")
+        return bindings[name]
+
+    def evidence(self, ev, env) -> Dict:
+        """Build the dictionary one piece of evidence stands for."""
+        if isinstance(ev, FromDict):
+            d = env.lookup(ev.name)
+            for step in ev.path:
+                d = d.supers[step]
+            return d
+        if isinstance(ev, FromInstance):
+            return self.instance_dict(ev.inst, [self.evidence(a, env) for a in ev.args])
+        assert isinstance(ev, Absent)
+        raise TurkeyPanic(
+            f"internal error: a '{ev.pred}' dictionary was needed after all"
+        )
+
+    def instance_dict(self, inst, args: list[Dict]) -> Dict:
+        key = (id(inst), tuple(id(a) for a in args))
+        cached = self.dicts.get(key)
+        if cached is not None:
+            return cached
+        plan = inst.plan
+        d = Dict(inst.cls, inst.con)
+        # Registered *before* the methods are built. A method body may need
+        # this very dictionary -- an instance method that recurses, or a
+        # superclass whose own instance leads back here -- and without this the
+        # construction would not terminate.
+        self.dicts[key] = d
+        scope = self.globals.child()
+        for name, arg in zip(plan.params, args):
+            scope.define(name, arg)
+        for name, impl in plan.methods.items():
+            inner = scope.child()
+            inner.define(impl.self_name, d)
+            d.methods[name] = (
+                DictAbs(impl.dict_params, impl.decl, inner) if impl.dict_params
+                else Closure(impl.decl.params, impl.decl.body, inner, name)
+            )
+        for sup, sup_ev in plan.supers.items():
+            d.supers[sup] = self.evidence(sup_ev, scope)
+        return d
 
     def _eval_ECon(self, e, env):
         return env.lookup(e.name)

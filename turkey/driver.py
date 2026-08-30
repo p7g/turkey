@@ -13,6 +13,7 @@ from .decls import DeclTable
 from .deps import pattern_vars
 from .errors import Unsupported
 from .eval import Evaluator
+from .evidence import Elaborator
 from .infer import Generator
 from .parser import parse
 from .types import Scheme
@@ -49,8 +50,13 @@ def check(src: str) -> Checked:
     # them this way is the point of the HM(X) shape -- see constraints.py.
     generator = Generator(decls, env)
     ordered, constraint = generator.generate(program)
-    Solver(decls, env, generator.classes).run(constraint)
+    solver = Solver(decls, env, generator.classes)
+    solver.run(constraint)
     generator.check_exhaustiveness()
+    # Elaboration is last because it is the only stage that needs the answers:
+    # which instance covers `Semigroup a` is not a question until the solver
+    # has decided what `a` is. See turkey/evidence.py.
+    Elaborator(generator.classes).run(solver.uses)
 
     signatures = []
     for item in program.decls:

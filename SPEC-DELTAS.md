@@ -609,5 +609,62 @@ A method shares the value namespace with ordinary functions, so `fun eq` and a
 class method `eq` collide.
 
 Nothing runs yet: a method call has no dictionary to resolve it until
-dictionary passing lands. `tests/programs/classes.tl` type-checks and its
-`main` stays clear of methods.
+dictionary passing lands (delta 30). `tests/programs/classes.tl` type-checks
+and its `main` stays clear of methods.
+
+
+### 30. Classes run by passing dictionaries
+
+design.md §6 gives the evaluator no notion of a class, and it does not need
+one: overloading is resolved before anything runs. A class predicate is turned
+into a *value* -- a dictionary of that class's methods for that type -- which
+is Wadler & Blott's translation ("How to make ad-hoc polymorphism less ad hoc",
+POPL 1989) in the shape Jones gives it for qualified types ("A theory of
+qualified types", ESOP 1992). `turkey/evidence.py` decides the evidence;
+`turkey/eval.py` builds the dictionaries.
+
+Three rules:
+
+- **A binding that retains *n* class predicates takes *n* leading
+  dictionaries.** `fun squash[Monoid a](xs : Array a) -> a` is a function of a
+  `Monoid a` dictionary and then of `xs`. The order is the scheme's own
+  predicate list, so nothing else in the pipeline has to agree about one.
+- **A use site names its evidence.** Either a dictionary already in scope --
+  a parameter, or the instance's own while its methods are being built -- or
+  the dictionary of the instance that covers it, applied to evidence for that
+  instance's context. `instance [Semigroup a] Semigroup (Array a)` is a
+  function from dictionaries to a dictionary, and that is exactly how it runs.
+- **A superclass is a selection, not a second obligation.** A `Monoid`
+  dictionary carries its `Semigroup` one, so `[Monoid a]` alone is enough to
+  call `combine`.
+
+**Evidence is resolved after solving, and only after.** Which instance covers
+`Semigroup a` is not a question that has an answer while `a` is still open,
+which is the same reason generation does not decide it either. So generation
+marks each use site, solving fills in the predicates and the scopes that were
+open there, and elaboration is a third pass that reads the answers. Resolution
+is `entail` again, made constructive: the same order -- assumptions first, then
+the instance table -- returning the derivation instead of a boolean.
+
+**A group's class predicates are shared across its bindings.** Per-name they
+would not be: one member of a mutually recursive group may call another, and
+would then need a dictionary its own signature never promised. Haskell 98
+shares a group's context for the same reason. `HasField` and `OneOf` stay per
+name, because both are erased and neither leaves anything to pass.
+
+**A dictionary is registered before its methods are built.** An instance
+method may need the very dictionary it belongs to -- by recursing, or through a
+recursive type, where `Show (Array Rose)` needs `Show Rose` which needs it
+back. Closing the cycle on the object under construction is what makes such a
+dictionary finite; it is also what lets a default method call another method of
+its own class without anything being passed.
+
+A `let` can need dictionaries before it is a value at all -- `let f = combine`
+generalizes to `[Semigroup a] fun(a, a) -> a` -- so such a binding stands for
+itself until they arrive and is re-run per instantiation. Only a binding the
+value restriction already calls non-expansive can get there, so re-running it
+observes nothing.
+
+Operators are still monomorphic and still route through the evaluator's
+`BINARY` table: `+` becomes `Add.add` at the milestone that makes every
+operator a class method, not here.

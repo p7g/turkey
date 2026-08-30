@@ -21,6 +21,12 @@ What it does keep is everything genuinely syntactic:
 * **Field access** emits `HasField "f" r a` and hands back the `a`; whether the
   receiver is known yet does not matter, and need never be true at all.
 
+What generation does *not* decide includes which instance a method call means:
+each occurrence of a name is marked with a `Use` for elaboration to fill in
+later (`turkey/evidence.py`), because the answer depends on what solving
+decides the name's predicates are about. Marking rather than resolving is the
+same discipline as everything else here.
+
 Variables invented here have no rank: generation has no idea what binder depth
 it is under, which is the point. Each is recorded in the enclosing frame and
 becomes part of a `CExists`, and the solver stamps the rank when it gets there.
@@ -40,6 +46,7 @@ from .constraints import (
 )
 from .decls import DeclTable
 from .deps import free_names, pattern_vars, sccs
+from .evidence import Abstraction, InstancePlan, MethodImpl, Use, dict_name
 from .errors import Span, TypeError_
 from .types import (
     BOOL, BOTTOM, CHAR, FLOAT, INT, STRING, UNIT, Pred, TBottom, TFun, TLabel,
@@ -255,11 +262,21 @@ class Generator:
                     continue
                 skolems = Skolems()
                 skolems.bind(info.var, info.param)
-                self.check_method(method, skolems, [],
-                                  f"the default definition of '{method.name}'")
+                # One elaboration of a default serves every instance: its own
+                # class dictionary arrives under a name that each instance
+                # rebinds as its dictionary is built.
+                info.defaults[method.name] = self.check_method(
+                    method, skolems, [], [],
+                    f"the default definition of '{method.name}'")
         for decl in instances:
             inst = next(i for i in self.classes.instances[decl.cls] if i.decl is decl)
             info = self.classes.classes[decl.cls]
+            plan = InstancePlan([dict_name(q.name) for q in inst.context])
+            inst.plan = plan
+            # The instance's own dictionary and its context are named once and
+            # shared by every method, because that is how they are bound: once,
+            # when the dictionary is built.
+            self_name = dict_name(decl.cls)
             for method_decl in decl.methods:
                 method = info.methods[method_decl.name]
                 skolems = Skolems()
@@ -267,11 +284,13 @@ class Generator:
                     skolems.bind(var, inst.names[var.id])
                 # The class variable is not made rigid: the instance fixes it.
                 skolems.mapping[method.class_var.id] = skolems.apply(inst.head)
-                self.check_method(
+                plan.methods[method_decl.name] = self.check_method(
                     method, skolems,
                     [Pred(q.name, [skolems.apply(q.args[0])]) for q in inst.context],
+                    plan.params,
                     f"instance '{decl.cls} {show(inst.head)}'",
                     method_decl,
+                    self_name,
                 )
 
     def check_method(
@@ -279,14 +298,27 @@ class Generator:
         method: MethodInfo,
         skolems: Skolems,
         context: list[Pred],
+        context_names: list[str],
         what: str,
         decl: ast.FunDecl | None = None,
-    ) -> None:
+        self_name: str | None = None,
+    ) -> MethodImpl:
         for var in method.scheme.quantified:
             if var.id not in skolems.mapping:
                 skolems.bind(var, method.names.get(var.id, "a"))
         expected = skolems.apply(method.scheme.body)
-        given = [skolems.apply_pred(p) for p in method.scheme.preds] + context
+        # A method's scheme states its class's predicate first, then its own
+        # context. The two are given to the body for different reasons and
+        # arrive by different routes: the first is the dictionary the body
+        # belongs to, the rest are parameters of every call.
+        own = [skolems.apply_pred(p) for p in method.scheme.preds[1:]]
+        self_name = self_name if self_name is not None else dict_name(method.cls)
+        params = [dict_name(p.name) for p in own]
+        givens = (
+            [(self_name, skolems.apply_pred(method.scheme.preds[0]))]
+            + list(zip(params, own))
+            + list(zip(context_names, context))
+        )
 
         decl = decl if decl is not None else method.decl
         self.push()
@@ -298,8 +330,9 @@ class Generator:
         # rigid, so nothing generalizes. What the rank buys is that a predicate
         # the body raised is settled here, against the assumptions, instead of
         # escaping to the end of the program.
-        self.emit(CAssume(given, CLet([(f"%{what}.{method.name}", expected)],
-                                      defn, CAnd([]), decl.span)))
+        self.emit(CAssume(givens, CLet([(f"%{what}.{method.name}", expected)],
+                                       defn, CAnd([]), decl.span)))
+        return MethodImpl(decl, self_name, params)
 
     def check_exhaustiveness(self) -> None:
         """Section 5.1: a non-exhaustive match is a warning, not an error --
@@ -378,7 +411,16 @@ class Generator:
             self.scopes.pop()
 
         if generalizes:
-            self.emit(CLet(binds, defn, body, group[0].span, top_level))
+            # One abstraction for the group, hung on each declaration in it so
+            # the evaluator can find it, and handed to the `CLet` so the solver
+            # can fill it in when it decides what the schemes retain.
+            dicts = Abstraction()
+            for item in group:
+                if isinstance(item, ast.SFun):
+                    item.decl.dicts = dicts
+                else:
+                    item.dicts = dicts
+            self.emit(CLet(binds, defn, body, group[0].span, top_level, dicts))
         else:
             # No generalization means no new rank, so the definition is solved
             # right here and only the names are scoped. Nothing needs its rank
@@ -621,10 +663,20 @@ class Generator:
             raise AssertionError(f"unhandled expression {type(e).__name__}")
         return method(e)
 
-    def use(self, name: str, span: Span | None) -> Type:
-        """`name <= t` for a fresh `t`. No lookup: that is the solver's job."""
+    def use(self, name: str, span: Span | None, node: ast.EVar | None = None) -> Type:
+        """`name <= t` for a fresh `t`. No lookup: that is the solver's job.
+
+        A `Use` rides along when there is an occurrence to attach it to, so that
+        elaboration has somewhere to put the evidence this site turns out to
+        need. What that is cannot be known here -- it depends on what the solver
+        decides the name's predicates are about -- which is why the site is
+        marked rather than resolved.
+        """
         t = self.fresh()
-        self.emit(CInstance(name, t, span))
+        marker = Use(name, span) if node is not None else None
+        if node is not None:
+            node.use = marker
+        self.emit(CInstance(name, t, span, marker))
         return t
 
     def _gen_ELit(self, e: ast.ELit) -> Type:
@@ -651,7 +703,7 @@ class Generator:
     def _gen_EVar(self, e: ast.EVar) -> Type:
         if not self.bound(e.name):
             raise TypeError_(f"'{e.name}' is not defined", e.span)
-        return self.use(e.name, e.span)
+        return self.use(e.name, e.span, e)
 
     def _gen_ECon(self, e: ast.ECon) -> Type:
         con = self.decls.instantiate_con(e.name, self.fresh, e.span)

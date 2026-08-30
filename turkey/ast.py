@@ -142,6 +142,10 @@ class EUnit(Expr):
 @dataclass(eq=False)
 class EVar(Expr):
     name: str
+    # `evidence.Use`: the dictionaries this occurrence needs. Attached by the
+    # generator, filled in by the solver and the elaborator. A name with no
+    # class predicates keeps `None` and costs nothing.
+    use: object | None = None
 
 
 @dataclass(eq=False)
@@ -295,6 +299,8 @@ class Stmt(Node):
 class SLet(Stmt):
     pat: Pattern
     value: Expr
+    # `evidence.Abstraction`, if this binding generalizes. See `FunDecl.dicts`.
+    dicts: object | None = None
 
 
 @dataclass(eq=False)
@@ -354,6 +360,10 @@ class FunDecl(Node):
     ret: TypeExpr | None
     body: Expr | None
     context: list[ClassPred] = field(default_factory=list)
+    # `evidence.Abstraction`: the leading dictionary parameters this
+    # declaration gained, if its scheme retained any class predicate. Written
+    # by the solver, at the one place it decides what a scheme carries.
+    dicts: object | None = None
 
     @property
     def is_signature(self) -> bool:

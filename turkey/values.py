@@ -176,6 +176,54 @@ class Closure:
         return f"<fun {self.name}/{len(self.params)}>"
 
 
+class Dict:
+    """A class dictionary: the evidence that one type is an instance of one class.
+
+    Methods and superclasses are separate because they are reached differently.
+    A method is what the program asked for; a superclass is a *selection* --
+    `class Monoid a : Semigroup a` means a `Monoid` dictionary carries the
+    `Semigroup` one, so a function with a `Monoid` context can call `combine`
+    without the caller passing a second dictionary.
+
+    A dictionary is registered in the evaluator's table before its methods are
+    filled in, which is what lets an instance's own method refer to the
+    instance -- and what keeps a recursive instance like `Eq a => Eq (Array a)`
+    from building an infinite tower of dictionaries for a recursive type.
+    """
+
+    __slots__ = ("cls", "head", "methods", "supers")
+
+    def __init__(self, cls: str, head: str):
+        self.cls = cls
+        self.head = head
+        self.methods: dict[str, object] = {}
+        self.supers: dict[str, Dict] = {}
+
+    def __repr__(self) -> str:
+        return f"<dict {self.cls} {self.head}>"
+
+
+class DictAbs:
+    """A binding that takes dictionaries before it is a value.
+
+    A `fun` with a class context is one; so is `let f = combine`, where the
+    dictionaries have to arrive before there is a function at all. `node` is
+    the declaration or the `let` itself, re-elaborated per instantiation --
+    which costs nothing, since only a binding the value restriction already
+    called non-expansive can get here.
+    """
+
+    __slots__ = ("params", "node", "env")
+
+    def __init__(self, params: list[str], node, env):
+        self.params = params
+        self.node = node
+        self.env = env
+
+    def __repr__(self) -> str:
+        return f"<dict-abstraction/{len(self.params)}>"
+
+
 class Builtin:
     __slots__ = ("name", "arity", "fn")
 

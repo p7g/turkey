@@ -102,6 +102,24 @@ class TLabel(Type):
         return f"TLabel({self.name!r})"
 
 
+class TSet(Type):
+    """A closed set of type constructor names, lifted into the type language.
+
+    Legal only in the second argument of `OneOf`, and the counterpart of
+    `TLabel`: it lets one predicate former name any set of candidates rather
+    than the domain growing a former per set. Rigid, variable-free, and passed
+    through every walk over types untouched.
+    """
+
+    __slots__ = ("names",)
+
+    def __init__(self, names):
+        self.names: frozenset[str] = frozenset(names)
+
+    def __repr__(self) -> str:
+        return f"TSet({sorted(self.names)!r})"
+
+
 class TBottom(Type):
     """The type of an expression that never yields a value (section 4.1)."""
 
@@ -127,6 +145,67 @@ UNIT = TCon("Unit")
 
 PRIMITIVES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR,
               "Bool": BOOL, "Unit": UNIT}
+
+
+# ------------------------------------------------------------- the numeric tower
+#
+# A numeric literal does not have a type; it has a *set* of types it could
+# have, and `OneOf` (turkey/constraints.py) is what carries that set until
+# something decides. The set is closed and built in -- there is no way to add a
+# member from source -- so the two tables below are the whole of it.
+#
+# Both are singletons today, which is why this milestone is invisible: a
+# singleton `OneOf` is just an equation and is discharged as one. They are
+# written as tables anyway so that a sized-integer tower drops in by editing
+# them, with no change to the generator or the solver. `None` as a width means
+# unbounded, which is what `Int` is (a Python int).
+#
+# Order is meaning: defaulting takes the first member of a set in this order,
+# and printing renders a set in it. So `Int` leads the integral types and, once
+# the tower lands and `Float` is renamed, `Double` leads the decimal ones --
+# which is exactly the "integral defaults to Int, decimal defaults to Double"
+# rule, obtained from one mechanism rather than two.
+INTEGRAL_WIDTHS: dict[str, int | None] = {"Int": None}
+DECIMAL_TYPES: tuple[str, ...] = ("Float",)
+
+
+def numeric_order() -> list[str]:
+    """The tower, most-preferred first. Read at each call, not cached, so that
+    a test can extend the tables and see the whole pipeline follow."""
+    return list(INTEGRAL_WIDTHS) + list(DECIMAL_TYPES)
+
+
+def integral_set(value: int) -> frozenset[str]:
+    """The integral types `value` fits in -- the set an integer literal gets.
+
+    This is where a literal's set becomes value-dependent: `200` fits an `Int8`
+    and `300` does not, so the two literals are given different sets rather
+    than one type being narrowed afterwards.
+    """
+    return frozenset(
+        name for name, width in INTEGRAL_WIDTHS.items()
+        if width is None or -(1 << (width - 1)) <= value < (1 << (width - 1))
+    )
+
+
+def decimal_set() -> frozenset[str]:
+    return frozenset(DECIMAL_TYPES)
+
+
+def numeric_type(name: str) -> TCon:
+    """The type a tower member names.
+
+    Every member is a nullary constructor, so its type is a `TCon` of that
+    name. `PRIMITIVES` is consulted first only to reuse the shared `INT` and
+    `FLOAT` instances; the tables above are the source of truth for which names
+    are legal, and a name not in them can never reach here.
+    """
+    return PRIMITIVES.get(name) or TCon(name)
+
+
+def sort_numeric(names) -> list[str]:
+    order = numeric_order()
+    return sorted(names, key=lambda n: (order.index(n) if n in order else len(order), n))
 
 
 class Pred:
@@ -386,6 +465,8 @@ def type_key(t: Type) -> tuple:
         return ("tuple", tuple(type_key(e) for e in t.elems))
     if isinstance(t, TLabel):
         return ("label", t.name)
+    if isinstance(t, TSet):
+        return ("set", tuple(sorted(t.names)))
     return ("bottom",)
 
 
@@ -462,6 +543,8 @@ def show(t: Type, names: dict[int, str] | None = None, free_prefix: str = "",
             return "!"
         if isinstance(ty, TLabel):
             return f'"{ty.name}"'
+        if isinstance(ty, TSet):
+            return "{" + ", ".join(sort_numeric(ty.names)) + "}"
         if isinstance(ty, TTuple):
             return "(" + ", ".join(go(e, 0) for e in ty.elems) + ")"
         if isinstance(ty, TFun):

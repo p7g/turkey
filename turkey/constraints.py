@@ -36,6 +36,13 @@ rows removed; in that shape it is GHC's `HasField x r a | x r -> a` (Gundry's
 `OverloadedRecordFields`, in `GHC.Records` since 8.2). Records here are
 nominal, so entailment is a declaration lookup. See `improve` for what the
 missing rows cost.
+
+`OneOf` is the other predicate: the set of types a numeric literal could have.
+It is closed -- membership is decided by a built-in table, not by anything a
+program can declare -- so it needs no evidence at runtime, only a decision.
+Three rules settle it, in `_one_of` and `improve_numeric`: a singleton set is
+an equation, two sets over the same variable intersect, and a set that survives
+to a point where nothing can ever narrow it further is *defaulted*.
 """
 
 from __future__ import annotations
@@ -45,11 +52,13 @@ from dataclasses import dataclass, field
 from .decls import DeclTable
 from .errors import Span, TypeError_
 from .types import (
-    INT, Pred, Scheme, TBottom, TCon, TLabel, TVar, Type, generalize,
-    instantiate_qual, mono, prune, show, type_key, unify, vars_of,
+    INT, Pred, Scheme, TBottom, TCon, TLabel, TSet, TVar, Type, generalize,
+    instantiate_qual, mono, numeric_order, numeric_type, prune, show, show_pred,
+    sort_numeric, type_key, unify, vars_of,
 )
 
 HAS_FIELD = "HasField"
+ONE_OF = "OneOf"
 
 
 # ------------------------------------------------------------------ the tree
@@ -220,6 +229,11 @@ class Solver:
     def run(self, c: Constraint) -> None:
         self.solve(c)
         self.settle()
+        # The outermost boundary: nothing further can narrow what is left, so
+        # anything still open that has a default takes it, and the rest is an
+        # error.
+        while self.deferred and self.apply_defaults(list(self.deferred)):
+            self.settle()
         self.reject_stranded(self.deferred)
 
     def solve(self, c: Constraint) -> None:
@@ -285,8 +299,7 @@ class Solver:
         self.pools.append([])
         self.solve(c.defn)
         self.settle()
-        retained = self.retained(self.rank - 1)
-        self.reject_stranded(_unattributed(retained, [ty for _, ty in c.binds]))
+        retained = self.split([ty for _, ty in c.binds])
         self.discharge_pool(self.pools.pop())
 
         with self.scope():
@@ -296,6 +309,26 @@ class Solver:
                 if c.top_level:
                     self.top_level.define(name, binding)
             self.solve(c.body)
+
+    def split(self, types: list[Type]) -> list[CPred]:
+        """The predicates the schemes about to be built will carry.
+
+        Defaulting sits between splitting and reporting, because ambiguity is
+        precisely the condition that licenses it: a predicate no scheme can
+        carry mentions a variable that appears in no type being generalized, so
+        no use site will ever pin it. Choosing for one can unblock another, so
+        the split is redone until it stops moving.
+        """
+        while True:
+            retained = self.retained(self.rank - 1)
+            stranded = _unattributed(retained, types)
+            if not stranded or not self.apply_defaults(stranded):
+                self.reject_stranded(stranded)
+                return retained
+            # Something was decided. Put the split back and settle again, so
+            # the choice is visible to everything that was waiting on it.
+            self.deferred.extend(retained)
+            self.settle()
 
     def discharge_pool(self, young: list[TVar]) -> None:
         """Hand every variable born at the rank just left to its new owner.
@@ -356,8 +389,11 @@ class Solver:
         merging. That is declined deliberately: it puts record knowledge inside
         `unify`, which is the coupling HM(X) is chosen to avoid.)
         """
+        self.improve_numeric()
         seen: dict[tuple, Type] = {}
         for c in self.deferred:
+            if c.pred.name != HAS_FIELD:
+                continue
             label, receiver, result = c.pred.args
             assert isinstance(label, TLabel)
             key = (label.name, type_key(receiver))
@@ -374,6 +410,8 @@ class Solver:
         """
         if c.pred.name == HAS_FIELD:
             return self._has_field(c)
+        if c.pred.name == ONE_OF:
+            return self._one_of(c)
         raise TypeError_(f"no rule for predicate '{c.pred.name}'", c.span)
 
     def _has_field(self, c: CPred) -> bool:
@@ -419,6 +457,103 @@ class Solver:
             c.span,
         )
 
+    def _one_of(self, c: CPred) -> bool:
+        """`OneOf t {...}`: `t` must be one of a closed set of built-in types.
+
+        A **singleton set is an equation** and is discharged as one, right
+        here, at the moment the constraint is reached. That is not an
+        optimization: deferring it would let a later unification bind `t` to
+        something else first, and the mismatch would then be reported against
+        the literal rather than against whatever disagreed with it. With both
+        of today's sets singletons, this branch is the only one that ever runs,
+        and a numeric literal behaves exactly as if it had been given its type
+        outright.
+        """
+        t, candidates = c.pred.args
+        assert isinstance(candidates, TSet)
+        names = candidates.names
+
+        if not names:
+            raise TypeError_(
+                "this numeric literal is not representable in any numeric type",
+                c.span,
+            )
+        if len(names) == 1:
+            # Same argument order as the equation this stands in for, so a
+            # mismatch reads the way it did before literals had sets.
+            unify(prune(t), numeric_type(next(iter(names))), c.span, c.context)
+            return True
+
+        t = prune(t)
+        if isinstance(t, TBottom):
+            return True  # absorbed; there is no value to represent
+        if isinstance(t, TVar):
+            return False  # still open -- improvement or defaulting will decide
+        if isinstance(t, TCon) and not t.args and t.name in names:
+            return True
+        raise TypeError_(
+            f"expected one of {', '.join(sort_numeric(names))}, found {show(t)}"
+            + (f" in {c.context}" if c.context else ""),
+            c.span,
+        )
+
+    def improve_numeric(self) -> None:
+        """Intersect `OneOf` sets that constrain the same variable.
+
+        Two demands on one variable are one demand on the intersection, and an
+        empty intersection is an error rather than a deferral -- nothing later
+        can widen a closed set. Like `improve` for `HasField` this adds no
+        solutions; it only commits to what every solution shares. Narrowing to
+        a singleton is what lets the next round discharge it as an equation.
+        """
+        merged: dict[tuple, CPred] = {}
+        out: list[CPred] = []
+        for c in self.deferred:
+            if c.pred.name != ONE_OF:
+                out.append(c)
+                continue
+            key = type_key(c.pred.args[0])
+            first = merged.get(key)
+            if first is None:
+                merged[key] = c
+                out.append(c)
+                continue
+            names = first.pred.args[1].names & c.pred.args[1].names
+            if not names:
+                raise TypeError_(
+                    f"no numeric type is both {show(first.pred.args[1])} and "
+                    f"{show(c.pred.args[1])}",
+                    c.span,
+                )
+            first.pred.args[1] = TSet(names)
+        self.deferred = out
+
+    def apply_defaults(self, stuck: list[CPred]) -> bool:
+        """Resolve `OneOf`s that nothing will ever narrow, by picking a member.
+
+        This is Haskell's defaulting, and it applies for the same reason: the
+        variable is ambiguous -- it appears in no type being generalized, so no
+        use site can pin it and no scheme can carry it. The choice is the first
+        member of the set in tower order, which is `Int` for an integral
+        literal and, once `Float` is renamed, `Double` for a decimal one.
+
+        Only `OneOf` defaults. A stranded `HasField` is a genuine error: there
+        is no preferred record type to guess.
+        """
+        progress = False
+        for c in stuck:
+            if c.pred.name != ONE_OF:
+                continue
+            t, candidates = c.pred.args
+            assert isinstance(candidates, TSet)
+            order = numeric_order()
+            choice = next((n for n in order if n in candidates.names), None)
+            if choice is None:
+                continue
+            unify(prune(t), numeric_type(choice), c.span, c.context)
+            progress = True
+        return progress
+
     def retained(self, level: int) -> list[CPred]:
         """Deferred predicates general enough to be quantified at `level`.
 
@@ -456,11 +591,17 @@ class Solver:
         if not stranded:
             return
         c = stranded[0]
-        label = c.pred.args[0]
-        assert isinstance(label, TLabel)
+        if c.pred.name == HAS_FIELD:
+            label = c.pred.args[0]
+            assert isinstance(label, TLabel)
+            raise TypeError_(
+                f"cannot determine the type of the value whose field "
+                f"'{label.name}' is being accessed. Add a type annotation.",
+                c.span,
+            )
         raise TypeError_(
-            f"cannot determine the type of the value whose field '{label.name}' "
-            f"is being accessed. Add a type annotation.",
+            f"cannot determine a type satisfying '{show_pred(c.pred)}'. "
+            f"Add a type annotation.",
             c.span,
         )
 

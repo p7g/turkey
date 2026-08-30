@@ -34,18 +34,22 @@ from typing import TypeVar
 
 from . import ast
 from .constraints import (
-    HAS_FIELD, Binding, CAnd, CDef, CEq, CExists, CInstance, CLet, CPred,
-    Constraint, Env,
+    HAS_FIELD, ONE_OF, Binding, CAnd, CDef, CEq, CExists, CInstance, CLet,
+    CPred, Constraint, Env,
 )
 from .decls import DeclTable
 from .deps import free_names, pattern_vars, sccs
 from .errors import Span, TypeError_
 from .types import (
     BOOL, BOTTOM, CHAR, FLOAT, INT, STRING, UNIT, Pred, TBottom, TCon, TFun,
-    TLabel, TTuple, TVar, Type,
+    TLabel, TSet, TTuple, TVar, Type, decimal_set, integral_set,
 )
 
 LITERAL_TYPES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR, "Bool": BOOL}
+
+# Which literals get a set rather than a type. A string or a char has exactly
+# one type and is emitted as one; only the numeric kinds are open.
+NUMERIC_KINDS = frozenset({"Int", "Float"})
 
 # Section 8.2. Without typeclasses every operator is monomorphic.
 BINARY_OPS: dict[str, tuple[Type, Type, Type]] = {
@@ -370,7 +374,12 @@ class Generator:
         if isinstance(pat, ast.PVar):
             return {pat.name: t}
         if isinstance(pat, ast.PLit):
-            self.eq(t, LITERAL_TYPES[pat.kind], pat.span, "a literal pattern")
+            if pat.kind in NUMERIC_KINDS:
+                self.eq(t, self.numeric(pat.kind, pat.value, pat.span,
+                                        "a literal pattern"),
+                        pat.span, "a literal pattern")
+            else:
+                self.eq(t, LITERAL_TYPES[pat.kind], pat.span, "a literal pattern")
             return {}
         if isinstance(pat, ast.PAnnot):
             self.eq(t, self.type_of(pat.type_expr), pat.span, "a pattern annotation")
@@ -507,7 +516,24 @@ class Generator:
         return t
 
     def _gen_ELit(self, e: ast.ELit) -> Type:
+        if e.kind in NUMERIC_KINDS:
+            return self.numeric(e.kind, e.value, e.span, "")
         return LITERAL_TYPES[e.kind]
+
+    def numeric(self, kind: str, value, span: Span | None, context: str) -> Type:
+        """A fresh variable, plus the set of types the literal could have.
+
+        A numeric literal is not given a type here. Which type it has is a
+        decision, and decisions belong to the solver -- the set is all the
+        syntax actually determines. Today every set is a singleton, so the
+        solver turns each one straight back into the equation this used to
+        emit; the shape is what lets a wider tower arrive without touching
+        this file.
+        """
+        t = self.fresh()
+        names = integral_set(value) if kind == "Int" else decimal_set()
+        self.emit(CPred(Pred(ONE_OF, [t, TSet(names)]), span, context))
+        return t
 
     def _gen_EUnit(self, e: ast.EUnit) -> Type:
         return UNIT

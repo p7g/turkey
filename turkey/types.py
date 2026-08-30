@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from itertools import count
+from typing import Protocol
 
 from .errors import Span, TypeError_
 
@@ -236,6 +237,39 @@ class TApp(Type):
         return f"TApp({self.fn!r}, {self.arg!r})"
 
 
+class TFam(Type):
+    """`F t` -- an associated type family applied to its class's parameter.
+
+    A family is a *function* on types: `Elem (Array a)` is `a` once the
+    instance is known, and nothing at all until then. That is why it cannot be
+    a `TCon` at the head of a `TApp`. Decomposing `f a ~ g b` pointwise is
+    sound only because every head is rigid, and a family head is precisely the
+    one that is not -- the same reason type aliases must be saturated before
+    expansion, and the same reason there are no type-level lambdas.
+
+    It is saturated by construction: a family is declared in a class and takes
+    that class's parameter, so its arity is one and there is no partial
+    application to represent. `kind` is the family's declared result kind,
+    shared by every occurrence (`decls.FamilyInfo`), so a family may return a
+    constructor as readily as a type.
+
+    Families are **not injective**: `Elem i ~ Int` says nothing about `i`. So
+    two family applications unify only when they are syntactically the same
+    application -- that is reflexivity, not decomposition -- and everything
+    else waits (see `unify`).
+    """
+
+    __slots__ = ("name", "arg", "kind")
+
+    def __init__(self, name: str, arg: Type, kind: Kind):
+        self.name = name
+        self.arg = arg
+        self.kind = kind
+
+    def __repr__(self) -> str:
+        return f"TFam({self.name}, {self.arg!r})"
+
+
 class TFun(Type):
     """`fun(t1, ..., tn) -> t`. Uncurried, fixed arity (section 4.1)."""
 
@@ -332,7 +366,7 @@ def kind_of(t: Type) -> Kind:
     """The kind of a type. Everything but a constructor, a variable and an
     application classifies values, so it is `*`."""
     t = prune(t)
-    if isinstance(t, (TVar, TCon, TApp)):
+    if isinstance(t, (TVar, TCon, TApp, TFam)):
         return t.kind
     return STAR
 
@@ -546,6 +580,44 @@ def prune(t: Type) -> Type:
     return t
 
 
+class Families(Protocol):
+    """What unification needs from the solver once families exist.
+
+    Two operations, and deliberately no more: reduce a family application if
+    the instance table decides it, and take an equation that cannot yet be
+    decided. Stating it as a protocol rather than importing the solver keeps
+    the dependency pointing the way it already does -- the solver knows about
+    types, types know nothing about the solver.
+    """
+
+    def reduce(self, t: "TFam") -> "Type | None":
+        """`t`'s definition, or None if no instance decides it yet."""
+
+    def defer(self, a: "Type", b: "Type", span: Span | None, context: str) -> None:
+        """Put `a ~ b` back on the queue: neither solvable nor false, yet."""
+
+
+def normalize(t: Type, fams: Families | None) -> Type:
+    """Prune, then reduce family applications at the head until one sticks.
+
+    `fams` is the solver, which is the only thing that knows the instance
+    table; passing it in rather than reaching for a global is what keeps this
+    module ignorant of classes. `None` means "no reducer available" -- the
+    post-solving passes, where every family that was going to reduce already
+    has.
+
+    Only the head is reduced. A family buried inside an argument is reduced
+    when something compares it, which is the only moment its value can matter.
+    """
+    t = prune(t)
+    while isinstance(t, TFam) and fams is not None:
+        reduced = fams.reduce(t)
+        if reduced is None:
+            return t
+        t = prune(reduced)
+    return t
+
+
 def occurs_and_adjust(var: TVar, t: Type) -> bool:
     """Occurs check, lowering levels along the way.
 
@@ -560,6 +632,12 @@ def occurs_and_adjust(var: TVar, t: Type) -> bool:
         return False
     if isinstance(t, TApp):
         return occurs_and_adjust(var, t.fn) or occurs_and_adjust(var, t.arg)
+    if isinstance(t, TFam):
+        # Over-strict, strictly speaking: a family is not injective, so `a ~
+        # Elem a` is not obviously a cycle. Rejecting it is the standard
+        # choice and the safe one -- admitting it would need the family's
+        # definition to prove the recursion bottoms out.
+        return occurs_and_adjust(var, t.arg)
     if isinstance(t, TFun):
         return any(occurs_and_adjust(var, p) for p in t.params) or occurs_and_adjust(var, t.ret)
     if isinstance(t, TTuple):
@@ -567,8 +645,17 @@ def occurs_and_adjust(var: TVar, t: Type) -> bool:
     return False
 
 
-def unify(a: Type, b: Type, span: Span | None = None, context: str = "") -> None:
-    a, b = prune(a), prune(b)
+def unify(a: Type, b: Type, span: Span | None = None, context: str = "",
+          fams: Families | None = None) -> None:
+    """Equate two types, or -- since M7 -- report that it cannot be decided yet.
+
+    A family application whose argument is still open is neither solvable nor
+    an error: `Elem a ~ Int` becomes true or false depending on what `a` turns
+    out to be. That is the third outcome, and `fams.defer` is where it goes --
+    back on the solver's queue, to be retried when something has been learnt.
+    Without a `fams` to defer to there is no queue, so it is a mismatch.
+    """
+    a, b = normalize(a, fams), normalize(b, fams)
 
     if a is b:
         return
@@ -586,7 +673,7 @@ def unify(a: Type, b: Type, span: Span | None = None, context: str = "") -> None
         a.ref = b
         return
     if isinstance(b, TVar):
-        return unify(b, a, span, context)
+        return unify(b, a, span, context, fams)
 
     if isinstance(a, TCon) and isinstance(b, TCon):
         if a.name != b.name:
@@ -599,8 +686,8 @@ def unify(a: Type, b: Type, span: Span | None = None, context: str = "") -> None
     # are expanded before they reach here (`decls.to_type`), which is what
     # keeps that true.
     if isinstance(a, TApp) and isinstance(b, TApp):
-        unify(a.fn, b.fn, span, context)
-        unify(a.arg, b.arg, span, context)
+        unify(a.fn, b.fn, span, context, fams)
+        unify(a.arg, b.arg, span, context, fams)
         return
 
     if isinstance(a, TFun) and isinstance(b, TFun):
@@ -612,8 +699,8 @@ def unify(a: Type, b: Type, span: Span | None = None, context: str = "") -> None
                 span,
             )
         for x, y in zip(a.params, b.params):
-            unify(x, y, span, context)
-        unify(a.ret, b.ret, span, context)
+            unify(x, y, span, context, fams)
+        unify(a.ret, b.ret, span, context, fams)
         return
 
     if isinstance(a, TLabel) and isinstance(b, TLabel):
@@ -625,7 +712,20 @@ def unify(a: Type, b: Type, span: Span | None = None, context: str = "") -> None
         if len(a.elems) != len(b.elems):
             raise _mismatch(a, b, span, context)
         for x, y in zip(a.elems, b.elems):
-            unify(x, y, span, context)
+            unify(x, y, span, context, fams)
+        return
+
+    # A family that did not reduce. Two of them are equal when they are the
+    # *same* application -- `Elem i ~ Elem i` is reflexivity, and is as far as
+    # it goes, because a family is not injective and `Elem i ~ Elem j` must not
+    # conclude `i ~ j`. Anything else waits for the argument to be decided.
+    if isinstance(a, TFam) or isinstance(b, TFam):
+        if (isinstance(a, TFam) and isinstance(b, TFam)
+                and a.name == b.name and type_key(a.arg) == type_key(b.arg)):
+            return
+        if fams is None:
+            raise _mismatch(a, b, span, context)
+        fams.defer(a, b, span, context)
         return
 
     raise _mismatch(a, b, span, context)
@@ -644,7 +744,8 @@ def _mismatch(a: Type, b: Type, span: Span | None, context: str) -> TypeError_:
     return TypeError_(f"expected {show(a)}, found {show(b)}{where}", span)
 
 
-def join(a: Type, b: Type, span: Span | None = None, context: str = "") -> Type:
+def join(a: Type, b: Type, span: Span | None = None, context: str = "",
+         fams: Families | None = None) -> Type:
     """Unify two types and return the one that survives.
 
     Plain `unify` cannot answer this. `if c { return 1 } else { 2 }` has arms of
@@ -657,7 +758,7 @@ def join(a: Type, b: Type, span: Span | None = None, context: str = "") -> Type:
         return b
     if isinstance(b, TBottom):
         return a
-    unify(a, b, span, context)
+    unify(a, b, span, context, fams)
     return a
 
 
@@ -680,6 +781,8 @@ def generalize(t: Type, level: int, preds: list[Pred] | None = None) -> Scheme:
                 quantified.append(ty)
         elif isinstance(ty, TApp):
             walk(ty.fn)
+            walk(ty.arg)
+        elif isinstance(ty, TFam):
             walk(ty.arg)
         elif isinstance(ty, TFun):
             for p in ty.params:
@@ -730,6 +833,8 @@ def instantiate_qual(scheme: Scheme, fresh: Fresh) -> tuple[list[Pred], Type]:
             return mapping.get(ty.id, ty)
         if isinstance(ty, TApp):
             return TApp(walk(ty.fn), walk(ty.arg), ty.kind)
+        if isinstance(ty, TFam):
+            return TFam(ty.name, walk(ty.arg), ty.kind)
         if isinstance(ty, TFun):
             return TFun([walk(p) for p in ty.params], walk(ty.ret))
         if isinstance(ty, TTuple):
@@ -749,6 +854,8 @@ def type_key(t: Type) -> tuple:
         return ("con", t.name)
     if isinstance(t, TApp):
         return ("app", type_key(t.fn), type_key(t.arg))
+    if isinstance(t, TFam):
+        return ("fam", t.name, type_key(t.arg))
     if isinstance(t, TFun):
         return ("fun", tuple(type_key(p) for p in t.params), type_key(t.ret))
     if isinstance(t, TTuple):
@@ -771,6 +878,8 @@ def vars_of(*types: Type) -> list[TVar]:
         elif isinstance(ty, TApp):
             walk(ty.fn)
             walk(ty.arg)
+        elif isinstance(ty, TFam):
+            walk(ty.arg)
         elif isinstance(ty, TFun):
             for p in ty.params:
                 walk(p)
@@ -791,6 +900,8 @@ def free_vars(t: Type, acc: set[int] | None = None) -> set[int]:
         acc.add(t.id)
     elif isinstance(t, TApp):
         free_vars(t.fn, acc)
+        free_vars(t.arg, acc)
+    elif isinstance(t, TFam):
         free_vars(t.arg, acc)
     elif isinstance(t, TFun):
         for p in t.params:
@@ -843,6 +954,9 @@ def show(t: Type, names: dict[int, str] | None = None, free_prefix: str = "",
             return f"({out})" if prec > 0 else out
         if isinstance(ty, TCon):
             return ty.name
+        if isinstance(ty, TFam):
+            out = f"{ty.name} {go(ty.arg, 2)}"
+            return f"({out})" if prec > 1 else out
         if isinstance(ty, TApp):
             head, args = spine(ty)
             rendered = " ".join(go(a, 2) for a in args)

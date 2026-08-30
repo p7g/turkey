@@ -39,7 +39,7 @@ from . import ast
 from .classes import ClassTable, InstInfo, MethodInfo, match
 from .decls import substitute
 from .errors import Span, TypeError_
-from .types import Pred, TBottom, Type, prune, show_pred
+from .types import Pred, TBottom, Type, show_pred
 
 _counter = itertools.count()
 
@@ -220,7 +220,11 @@ class Elaborator:
     def resolve(
         self, pred: Pred, scopes: tuple[Scope, ...], span: Span | None
     ) -> Evidence:
-        target: Type = prune(pred.args[0])
+        # Normalized, not merely pruned: `Show (Elem (Array Int))` names an
+        # instance only once the family has been reduced. This is the last
+        # place a family can appear -- evidence is over types, and a family is
+        # not one until it is.
+        target: Type = self.classes.normalize(pred.args[0])
         if isinstance(target, TBottom):
             return Absent(pred.name)
         pred = Pred(pred.name, [target])

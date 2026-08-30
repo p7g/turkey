@@ -409,6 +409,28 @@ class TypeDecl(Node):
 
 
 @dataclass(eq=False)
+class FamDecl(Node):
+    """`type Elem c` inside a class: an associated type family.
+
+    `param` must be the class's own parameter. A family is a function on types
+    determined by that parameter -- there is nothing else in scope for it to be
+    a function of -- so its arity is one and its argument is named rather than
+    implied, the same way a superclass names the parameter it constrains.
+    """
+
+    name: str
+    param: str
+
+
+@dataclass(eq=False)
+class FamBind(Node):
+    """`type Elem = a` inside an instance: what the family is, here."""
+
+    name: str
+    body: TypeExpr
+
+
+@dataclass(eq=False)
 class ClassDecl(Node):
     """`class C a : Super a, ... { methods }`.
 
@@ -421,6 +443,7 @@ class ClassDecl(Node):
     param: str
     supers: list[ClassPred]
     methods: list[FunDecl]  # signatures, and defaulted methods with bodies
+    families: list[FamDecl] = field(default_factory=list)
 
 
 @dataclass(eq=False)
@@ -435,6 +458,7 @@ class InstanceDecl(Node):
     head: TypeExpr
     context: list[ClassPred]
     methods: list[FunDecl]
+    families: list[FamBind] = field(default_factory=list)
 
 
 @dataclass(eq=False)

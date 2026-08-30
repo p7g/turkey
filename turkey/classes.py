@@ -11,8 +11,9 @@ Three restrictions hold it up, and each buys something:
 * **One parameter.** With a single class variable, ambiguity is the plain
   free-variable test -- a quantified variable that a predicate mentions and the
   type does not is unresolvable, full stop. Multi-parameter classes need
-  functional dependencies before that test says anything useful, and M7's
-  associated type families are meant to make the second parameter unnecessary.
+  functional dependencies before that test says anything useful, and an
+  associated type family makes the second parameter unnecessary: `Elem c` is
+  the element type of a container, computed rather than quantified.
 * **An instance head is a constructor applied to distinct type variables**
   (Haskell 98's rule). Matching is then a one-way structural walk that cannot
   fail to terminate, and two instances of a class overlap exactly when they
@@ -30,6 +31,13 @@ variables are replaced by rigid nullary `TCon`s named after them -- `unify`
 already treats a `TCon` as rigid and compares by name, so this needs no new
 machinery, and the name means an error message about one reads as though it
 were still the type variable the author wrote.
+
+**A family is `by_inst` for types.** `reduce_fam` matches a family application
+against the same instance table, by the same one-way match, and returns what
+that instance said the family is -- a family is a function defined by cases on
+the instance head, so there is nothing else it could be. Failing to match is
+*stuck*, never false: the class predicate that travels beside every family
+application is what reports a missing instance, with the better message.
 """
 
 from __future__ import annotations
@@ -37,12 +45,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from . import ast
-from .decls import DeclTable, substitute
+from .decls import DeclTable, FamilyInfo, substitute
 from .errors import Span, TypeError_
 from .types import (
-    Kind, Pred, Scheme, TApp, TCon, TFun, TTuple, TVar, Type, default_kind,
-    generalize, kind_of, prune, show, show_kind, show_pred, spine, type_key,
-    unify_kinds,
+    KVar, Kind, Pred, Scheme, TApp, TCon, TFam, TFun, TTuple, TVar, Type,
+    default_kind, generalize, kind_of, prune, show, show_kind, show_pred, spine,
+    type_key, unify_kinds,
 )
 
 
@@ -75,6 +83,10 @@ class ClassInfo:
     supers: list[Pred] = field(default_factory=list)
     methods: dict[str, MethodInfo] = field(default_factory=dict)
     span: Span | None = None
+    # Family name -> the parameter it was written over. The types themselves
+    # live in `DeclTable.families`, because a family is a name in type
+    # position and one table decides what those mean.
+    families: dict[str, str] = field(default_factory=dict)
     # Method name -> `evidence.MethodImpl` for its default body, elaborated
     # once and shared by every instance that does not override it. Filled in by
     # the generator, which is where method bodies are checked.
@@ -92,6 +104,8 @@ class InstInfo:
     context: list[Pred]
     decl: ast.InstanceDecl
     names: dict[int, str]
+    # Family name -> what it is at this head, over the head's own variables.
+    families: dict[str, Type] = field(default_factory=dict)
     # `evidence.InstancePlan`: what the evaluator needs to build this
     # dictionary. Set by the generator once the method bodies are checked.
     plan: object = None
@@ -134,11 +148,14 @@ class ClassTable:
                     d.span,
                 )
             self.classes[d.name] = ClassInfo(d.name, d.param, TVar(1), span=d.span)
+            self._declare_families(d)
 
         for d in classes:
             self._resolve_class(d)
         for d in classes:
             self._check_super_acyclic(d.name, ())
+        for fam in self.decls.families.values():
+            default_kind(fam.res_kind)
         for info in self.classes.values():
             default_kind(info.var.kind)
             for method in info.methods.values():
@@ -151,6 +168,42 @@ class ClassTable:
         # `Semigroup (Array a)` written further down the file.
         for inst in registered:
             self._check_instance(inst)
+
+    def _declare_families(self, d: ast.ClassDecl) -> None:
+        """Register a class's families before any signature is read.
+
+        They go in `DeclTable`, because that is what `to_type` consults, and a
+        family shares the type namespace with constructors and aliases -- `Elem`
+        cannot also be a data type. The argument kind is the class variable's
+        own kind cell, so a family applied in a signature constrains the class
+        exactly as a method's use of the parameter does; the result kind starts
+        undecided and is settled by use.
+        """
+        info = self.classes[d.name]
+        for fam in d.families:
+            if fam.param != d.param:
+                raise TypeError_(
+                    f"'{fam.name}' must be a family over '{d.param}', the "
+                    f"parameter of class '{d.name}': a family is determined by "
+                    f"the class variable and there is nothing else in scope",
+                    fam.span,
+                )
+            if fam.name in self.decls.families:
+                other = self.decls.families[fam.name].cls
+                raise TypeError_(
+                    f"'{fam.name}' is already a type family of class '{other}'",
+                    fam.span,
+                )
+            if fam.name in self.decls.tycons:
+                raise TypeError_(
+                    f"'{fam.name}' is already a type; a type family cannot "
+                    f"share its name",
+                    fam.span,
+                )
+            self.decls.families[fam.name] = FamilyInfo(
+                fam.name, d.name, info.var.kind, KVar(), fam.span
+            )
+            info.families[fam.name] = fam.param
 
     def _check_super_acyclic(self, name: str, seen: tuple[str, ...]) -> None:
         if name in seen:
@@ -277,12 +330,108 @@ class ClassTable:
                     d.span,
                 )
         context = self.resolve_context(d.context, tyvars)
+        families = self._resolve_families(d, info, head, tyvars, fresh)
         for var in tyvars.values():
             default_kind(var.kind)
         names = {var.id: name for name, var in tyvars.items()}
-        inst = InstInfo(d.cls, head, context, d, names)
+        inst = InstInfo(d.cls, head, context, d, names, families)
         self.instances.setdefault(d.cls, []).append(inst)
         return inst
+
+    def _resolve_families(
+        self, d: ast.InstanceDecl, info: ClassInfo, head: Type,
+        tyvars: dict[str, TVar], fresh
+    ) -> dict[str, Type]:
+        """`type Elem = a`: what each of the class's families is, at this head.
+
+        The right-hand side is read in the *head's* scope, so its variables are
+        the head's and nothing else may appear -- an unbound one would be a
+        type the instance never fixed, which is a family with no definition
+        rather than a polymorphic one.
+        """
+        bound: dict[str, Type] = {}
+        for fb in d.families:
+            if fb.name not in info.families:
+                raise TypeError_(
+                    f"'{fb.name}' is not a type family of class '{d.cls}'",
+                    fb.span,
+                )
+            if fb.name in bound:
+                raise TypeError_(
+                    f"'{fb.name}' is defined twice in this instance", fb.span
+                )
+            known = set(tyvars)
+            body = self.decls.to_type(fb.body, tyvars, fresh)
+            escaped = sorted(set(tyvars) - known)
+            if escaped:
+                raise TypeError_(
+                    f"'{escaped[0]}' is not bound by the instance head "
+                    f"'{show(head)}'",
+                    fb.span,
+                )
+            fam = self.decls.families[fb.name]
+            if not unify_kinds(kind_of(body), fam.res_kind):
+                raise TypeError_(
+                    f"'{show(body)}' has kind {show_kind(kind_of(body))}, but "
+                    f"'{fb.name}' produces a type of kind "
+                    f"{show_kind(fam.res_kind)}",
+                    fb.span,
+                )
+            _check_fam_decreasing(fb, body)
+            bound[fb.name] = body
+        missing = [n for n in info.families if n not in bound]
+        if missing:
+            raise TypeError_(
+                f"instance '{d.cls} {show(head)}' does not define "
+                f"{', '.join(sorted(missing))}",
+                d.span,
+            )
+        return bound
+
+    # -- reduction ---------------------------------------------------------
+
+    def reduce_fam(self, t: TFam) -> Type | None:
+        """`t`'s definition, or None if no instance decides it yet.
+
+        This is `by_inst` for types instead of predicates, and it is the same
+        one-way match against the same instance table -- a family is a function
+        defined by cases on the instance head, so there is nothing else it
+        could be. None is *stuck*, never failure: an argument no instance
+        covers is a missing instance, and the class predicate that travels
+        beside every family application is what reports it, with the better
+        message and the right span.
+        """
+        arg = self.normalize(t.arg)
+        for inst in self.instances.get(self.decls.families[t.name].cls, []):
+            mapping = match(inst.head, arg)
+            if mapping is not None:
+                return substitute(inst.families[t.name], mapping)
+        return None
+
+    def normalize(self, t: Type) -> Type:
+        """Reduce family applications at the head of `t` until one sticks."""
+        t = prune(t)
+        while isinstance(t, TFam):
+            reduced = self.reduce_fam(t)
+            if reduced is None:
+                return t
+            t = prune(reduced)
+        return t
+
+    def uncovered(self, t: TFam) -> Pred | None:
+        """The instance a stuck `t` is missing, if its argument is rigid enough.
+
+        A family over a variable is waiting; one over a constructor that no
+        instance names will wait forever, and saying so where the equation was
+        written beats a stranded-predicate report at the end of the group.
+        """
+        arg = self.normalize(t.arg)
+        head, _ = spine(arg)
+        if not isinstance(head, TCon):
+            return None
+        cls = self.decls.families[t.name].cls
+        pred = Pred(cls, [arg])
+        return None if self.by_inst(pred) is not None else pred
 
     @staticmethod
     def _check_head_shape(d: ast.InstanceDecl, head: Type) -> None:
@@ -420,6 +569,40 @@ class ClassTable:
             if not implied:
                 out.append(p)
         return out
+
+
+def _check_fam_decreasing(fb: ast.FamBind, body: Type) -> None:
+    """A family's definition may only apply a family to a *variable*.
+
+    That is what makes reduction terminate. An instance head is a constructor
+    over distinct variables, so a family applied to one of them is applied to a
+    proper subterm of the argument that selected this instance, and every step
+    is a strict decrease. `type Elem = Elem (Array a)` is the rule's whole
+    point: it would reduce forever.
+    """
+    def walk(t: Type) -> None:
+        t = prune(t)
+        if isinstance(t, TFam):
+            if not isinstance(prune(t.arg), TVar):
+                raise TypeError_(
+                    f"'{show(t)}' cannot appear here: a type family definition "
+                    f"may apply a family only to a type variable of the "
+                    f"instance head, so that reduction terminates",
+                    fb.span,
+                )
+            walk(t.arg)
+        elif isinstance(t, TApp):
+            walk(t.fn)
+            walk(t.arg)
+        elif isinstance(t, TFun):
+            for p in t.params:
+                walk(p)
+            walk(t.ret)
+        elif isinstance(t, TTuple):
+            for e in t.elems:
+                walk(e)
+
+    walk(body)
 
 
 def _con_of(t: Type) -> TCon:

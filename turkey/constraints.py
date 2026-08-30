@@ -51,6 +51,14 @@ parameters the group takes. Both are written where the decision is already
 being made -- there is no second pass over the constraint to find them, and no
 second notion of what a scheme carries.
 
+Since M7 the solver keeps a second queue. An associated type family makes an
+*equation* deferrable: `Elem a ~ Int` with `a` unbound is neither solvable nor
+false, so `unify` hands it back rather than deciding, and it is retried
+alongside the predicates. The two queues unblock each other -- reducing a
+family decides a type a predicate was waiting on, and discharging a predicate
+binds the variable a family was applied to -- which is why `settle` stops only
+when a round shortens neither.
+
 `OneOf` is the other predicate: the set of types a numeric literal could have.
 It is closed -- membership is decided by a built-in table, not by anything a
 program can declare -- so it needs no evidence at runtime, only a decision.
@@ -68,9 +76,9 @@ from .decls import DeclTable
 from .evidence import Abstraction, Scope, Use, dict_name
 from .errors import Span, TypeError_
 from .types import (
-    INT, Pred, Scheme, TBottom, TCon, TLabel, TSet, TVar, Type, generalize,
-    instantiate_qual, mono, numeric_order, numeric_type, prune, show, show_pred,
-    sort_numeric, spine, type_key, unify, vars_of,
+    GROUND, INT, Pred, Scheme, TBottom, TCon, TFam, TLabel, TSet, TVar, Type,
+    generalize, instantiate_qual, mono, numeric_order, numeric_type, prune, show,
+    show_pred, sort_numeric, spine, type_key, unify, vars_of,
 )
 
 HAS_FIELD = "HasField"
@@ -250,6 +258,10 @@ class Solver:
         self.uses: list[Use] = []
         self.pools: list[list[TVar]] = [[]]
         self.deferred: list[CPred] = []
+        # Equations `unify` could not decide: one side is a family application
+        # whose argument is still open. This is the third outcome M7 gives
+        # unification, and it is a queue for the same reason `deferred` is.
+        self.deferred_eqs: list[CEq] = []
         # Schemes of every name a `CLet` bound, for the `types` command.
         self.top_level: Env = env
 
@@ -275,6 +287,30 @@ class Solver:
             var.level = self.rank
             self.pools[-1].append(var)
 
+    # -- families (the `types.Families` protocol) --------------------------
+
+    def reduce(self, t: TFam) -> Type | None:
+        return self.classes.reduce_fam(t)
+
+    def defer(self, a: Type, b: Type, span: Span | None, context: str) -> None:
+        """Take an equation unification could not decide.
+
+        Before queueing it, ask whether it *could* ever be decided: a family
+        over a constructor no instance covers is stuck for good, and the
+        equation's own span is the best place to say so. A family over a
+        variable is merely waiting.
+        """
+        for t in (a, b):
+            if isinstance(t, TFam):
+                missing = self.classes.uncovered(t)
+                if missing is not None:
+                    raise TypeError_(
+                        f"no instance for '{show_pred(missing)}', so "
+                        f"'{show(t)}' has no definition",
+                        span,
+                    )
+        self.deferred_eqs.append(CEq(a, b, span, context))
+
     # -- solving -----------------------------------------------------------
 
     def run(self, c: Constraint) -> None:
@@ -285,11 +321,12 @@ class Solver:
         # error.
         while self.deferred and self.apply_defaults(list(self.deferred)):
             self.settle()
+        self.reject_stuck(self.deferred_eqs)
         self.reject_stranded(self.deferred)
 
     def solve(self, c: Constraint) -> None:
         if isinstance(c, CEq):
-            unify(c.left, c.right, c.span, c.context)
+            unify(c.left, c.right, c.span, c.context, self)
             return
         if isinstance(c, CPred):
             if not self.entail(c):
@@ -344,7 +381,7 @@ class Solver:
         binding = self.env.lookup(c.name)
         assert binding is not None, f"generation let '{c.name}' through unbound"
         preds, ty = instantiate_qual(binding.scheme, self.fresh)
-        unify(ty, c.type, c.span, "")
+        unify(ty, c.type, c.span, "", self)
         if c.use is not None:
             # Only the class predicates: `HasField` and `OneOf` are discharged
             # by a lookup and a decision, and leave nothing behind to pass.
@@ -370,6 +407,12 @@ class Solver:
         self.scopes.pop()
         self.settle()
         retained = self.split([ty for _, ty in c.binds])
+        # An equation tied to a variable this binder quantifies can never be
+        # decided by an enclosing one -- nothing outside mentions the variable
+        # -- so this is where it is stuck for good. The test is `retained`'s,
+        # for the same reason: an equation and a predicate are both waiting on
+        # the same variables.
+        self.reject_stuck(self.take_stuck(self.rank - 1))
         self.discharge_pool(self.pools.pop())
 
         # The class predicates are shared across the group, and the dictionary
@@ -441,15 +484,28 @@ class Solver:
         Each round re-solves what is left; a predicate that is still stuck goes
         straight back on `deferred`. Discharging one can bind variables another
         was waiting on, which is why this iterates -- and why it may stop only
-        when a round discharges nothing, since `deferred` shrinks monotonically
-        and cannot grow.
+        when a round discharges nothing.
+
+        Since M7 there are two queues, because a family application makes an
+        *equation* deferrable too, and each can unblock the other: reducing
+        `Elem (Array Int)` decides a type that a `Show` predicate was waiting
+        on, and discharging a predicate can bind the variable a family was
+        applied to. A round that shortens neither queue has nothing left to
+        learn, so it stops.
         """
-        while self.deferred:
+        while self.deferred or self.deferred_eqs:
             self.improve()
             pending, self.deferred = self.deferred, []
+            equations, self.deferred_eqs = self.deferred_eqs, []
+            # Equations first: a family that has become reducible decides a
+            # type, and a predicate waiting on that type can then be settled in
+            # the same round.
+            for c in equations:
+                unify(c.left, c.right, c.span, c.context, self)
             for c in pending:
                 self.solve(c)
-            if len(self.deferred) >= len(pending):
+            if (len(self.deferred) >= len(pending)
+                    and len(self.deferred_eqs) >= len(equations)):
                 return
 
     def improve(self) -> None:
@@ -484,7 +540,7 @@ class Solver:
             assert isinstance(label, TLabel)
             key = (label.name, type_key(receiver))
             if key in seen:
-                unify(seen[key], result, c.span, "a field access")
+                unify(seen[key], result, c.span, "a field access", self)
             else:
                 seen[key] = result
 
@@ -511,11 +567,11 @@ class Solver:
         instance a local error naming the type that lacks one, rather than a
         stranded predicate reported at the end of a binding group.
         """
-        t = prune(c.pred.args[0])
+        t = self.classes.normalize(c.pred.args[0])
         if isinstance(t, TBottom):
             return True  # absorbed; there is no value to find a method for
         head, _ = spine(t)
-        if isinstance(head, TVar):
+        if isinstance(head, (TVar, TFam)):
             return False
         pred = Pred(c.pred.name, [t])
         key = pred.key()
@@ -534,9 +590,9 @@ class Solver:
     def _has_field(self, c: CPred) -> bool:
         label, receiver, result = c.pred.args
         assert isinstance(label, TLabel)
-        receiver = prune(receiver)
+        receiver = self.classes.normalize(receiver)
 
-        if isinstance(receiver, TVar):
+        if isinstance(receiver, (TVar, TFam)):
             return False  # nothing known about the receiver yet
 
         if isinstance(receiver, TBottom):
@@ -552,7 +608,7 @@ class Solver:
             if head.name == "Array":
                 if label.name in ("length", "capacity"):
                     # Section 8.3: both are readable and writable.
-                    unify(result, INT, c.span, "a field access")
+                    unify(result, INT, c.span, "a field access", self)
                     return True
                 raise TypeError_(
                     f"an Array has no field '{label.name}' "
@@ -568,7 +624,7 @@ class Solver:
                         c.span,
                     )
                 unify(result, self.decls.field_type(receiver, label.name),
-                      c.span, "a field access")
+                      c.span, "a field access", self)
                 return True
 
         raise TypeError_(
@@ -602,13 +658,13 @@ class Solver:
         if len(names) == 1:
             # Same argument order as the equation this stands in for, so a
             # mismatch reads the way it did before literals had sets.
-            unify(prune(t), numeric_type(next(iter(names))), c.span, c.context)
+            unify(prune(t), numeric_type(next(iter(names))), c.span, c.context, self)
             return True
 
-        t = prune(t)
+        t = self.classes.normalize(t)
         if isinstance(t, TBottom):
             return True  # absorbed; there is no value to represent
-        if isinstance(t, TVar):
+        if isinstance(t, (TVar, TFam)):
             return False  # still open -- improvement or defaulting will decide
         if isinstance(t, TCon) and t.name in names:
             return True
@@ -674,7 +730,7 @@ class Solver:
             choice = next((n for n in order if n in candidates.names), None)
             if choice is None:
                 continue
-            unify(prune(t), numeric_type(choice), c.span, c.context)
+            unify(prune(t), numeric_type(choice), c.span, c.context, self)
             progress = True
         return progress
 
@@ -702,6 +758,36 @@ class Solver:
                 retained.append(c)
         self.deferred = keep
         return retained
+
+    def take_stuck(self, level: int) -> list[CEq]:
+        """Deferred equations no binder outside `level` could ever decide."""
+        keep, taken = [], []
+        for c in self.deferred_eqs:
+            (keep if _eq_level(c) <= level else taken).append(c)
+        self.deferred_eqs = keep
+        return taken
+
+    def reject_stuck(self, stuck: list[CEq]) -> None:
+        """Report an equation whose family application will never reduce.
+
+        The blame goes on the family rather than on what it was compared with:
+        the equation is not wrong, it is undecidable, and what is missing is
+        the knowledge of which instance defines the family.
+        """
+        if not stuck:
+            return
+        c = stuck[0]
+        fam = c.left if isinstance(c.left, TFam) else c.right
+        other = c.right if fam is c.left else c.left
+        assert isinstance(fam, TFam)
+        cls = self.classes.decls.families[fam.name].cls
+        where = f" in {c.context}" if c.context else ""
+        raise TypeError_(
+            f"cannot reduce '{show(fam, free_prefix='')}' to "
+            f"'{show(other, free_prefix='')}'{where}: nothing says which "
+            f"'{cls}' instance defines it.",
+            c.span,
+        )
 
     def reject_stranded(self, stranded: list[CPred]) -> None:
         """Report a predicate that can be neither discharged nor quantified.
@@ -787,6 +873,16 @@ def _unattributed(preds: list[CPred], types: list[Type]) -> list[CPred]:
     """The retained predicates no scheme in the group will carry."""
     ids = reach(preds, types)
     return [c for c in preds if not _touches(c, ids)]
+
+
+def _eq_level(c: CEq) -> int:
+    """The binder depth a deferred equation is tied to -- `Pred.level`'s rule.
+
+    An equation between skolems mentions no unification variable at all, which
+    makes it ground and therefore decidable nowhere but here.
+    """
+    levels = [v.level for v in vars_of(c.left, c.right)]
+    return min(levels) if levels else GROUND
 
 
 def _touches(c: CPred, ids: set[int]) -> bool:

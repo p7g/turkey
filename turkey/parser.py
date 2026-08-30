@@ -460,7 +460,8 @@ class Parser:
                 supers.append(ast.ClassPred(tok.span, tok.text, self.parse_atype()))
                 if not self.eat(","):
                     break
-        return ast.ClassDecl(span, name, param, supers, self.parse_method_block(True))
+        methods, families = self.parse_class_body(True, param)
+        return ast.ClassDecl(span, name, param, supers, methods, families)
 
     def parse_instance_decl(self) -> ast.InstanceDecl:
         span = self.expect("instance").span
@@ -469,24 +470,45 @@ class Parser:
         # An `atype`, so a partially applied head parenthesizes:
         # `instance Functor (Either l)`.
         head = self.parse_atype()
-        return ast.InstanceDecl(
-            span, name, head, context, self.parse_method_block(False)
-        )
+        methods, families = self.parse_class_body(False, None)
+        return ast.InstanceDecl(span, name, head, context, methods, families)
 
-    def parse_method_block(self, allow_signature: bool) -> list[ast.FunDecl]:
+    def parse_class_body(
+        self, is_class: bool, param: str | None
+    ) -> tuple[list[ast.FunDecl], list]:
+        """The `{ ... }` of a class or an instance: methods, and families.
+
+        `type` inside the braces is an associated type family -- its
+        declaration in a class, its definition in an instance. The two forms
+        cannot be confused with each other or with a top-level `type`, since a
+        declaration names the class parameter and a definition writes `=`.
+        """
         self.expect("{")
         self.skip_newlines()
         methods: list[ast.FunDecl] = []
+        families: list = []
         while not self.at("}"):
-            if not self.at("fun"):
+            if self.at("type"):
+                families.append(self.parse_family(is_class, param))
+            elif self.at("fun"):
+                methods.append(self.parse_fun_decl(is_class))
+            else:
                 raise ParseError(
-                    f"expected a method, found {self._describe(self.cur)}",
+                    f"expected a method or a 'type', found {self._describe(self.cur)}",
                     self.cur.span,
                 )
-            methods.append(self.parse_fun_decl(allow_signature))
             self.end_of_statement()
         self.expect("}")
-        return methods
+        return methods, families
+
+    def parse_family(self, is_class: bool, param: str | None):
+        span = self.expect("type").span
+        name = self.expect("CONID", "a type family name").text
+        if is_class:
+            written = self.expect("IDENT", f"'{param}', the class parameter").text
+            return ast.FamDecl(span, name, written)
+        self.expect("=")
+        return ast.FamBind(span, name, self.parse_type_expr())
 
     def parse_param_list(self) -> list[ast.Pattern]:
         self.expect("(")

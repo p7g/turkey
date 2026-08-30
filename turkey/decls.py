@@ -13,9 +13,9 @@ from dataclasses import dataclass, field
 from . import ast
 from .errors import Span, TypeError_
 from .types import (
-    ARRAY, PRIMITIVES, STAR, Fresh, KFun, Kind, Scheme, TApp, TCon, TFun, TTuple,
-    TVar, Type, apply, default_kind, generalize, instantiate, kind_arrow, kind_of,
-    show, show_kind, spine, unify_kinds,
+    ARRAY, PRIMITIVES, STAR, Fresh, KFun, Kind, Scheme, TApp, TCon, TFam, TFun,
+    TTuple, TVar, Type, apply, default_kind, generalize, instantiate, kind_arrow,
+    kind_of, show, show_kind, spine, unify_kinds,
 )
 
 
@@ -50,6 +50,25 @@ class TyconInfo:
         return len(self.variants) == 1 and self.variants[0].is_record
 
 
+@dataclass
+class FamilyInfo:
+    """An associated type family, as the type language sees it.
+
+    Families are declared inside classes (`classes.ClassTable`), but they are
+    *type* names, so they are resolved here alongside constructors and aliases
+    -- one place decides what a name in type position means. Both kinds start
+    undecided and are narrowed by use, exactly as a class variable's is:
+    `arg_kind` is the owning class's parameter kind, and `res_kind` is what the
+    family produces.
+    """
+
+    name: str
+    cls: str
+    arg_kind: Kind
+    res_kind: Kind
+    span: Span | None = None
+
+
 class DeclTable:
     def __init__(self) -> None:
         self.tycons: dict[str, TyconInfo] = {}
@@ -60,6 +79,10 @@ class DeclTable:
         self.heads: dict[str, TCon] = dict(PRIMITIVES)
         for name in PRIMITIVES:
             self.tycons[name] = TyconInfo(name, [], kind=STAR)
+        # Filled in by `ClassTable.register_all`, before any signature is
+        # resolved, since a method's type may mention a family of a class
+        # declared further down the file.
+        self.families: dict[str, FamilyInfo] = {}
         self.tycons["Array"] = TyconInfo("Array", ["a"], kind=ARRAY.kind)
         self.heads["Array"] = ARRAY
 
@@ -217,6 +240,8 @@ class DeclTable:
                          te.span)
 
         assert isinstance(te, ast.TECon)
+        if te.name in self.families:
+            return self._family(te, tyvars, fresh)
         info = self.tycons.get(te.name)
         if info is None:
             raise TypeError_(f"unknown type '{te.name}'", te.span)
@@ -236,6 +261,31 @@ class DeclTable:
             substitution = dict(zip(info.params, args))
             return self._expand_alias(info, substitution, fresh, te.span)
         return apply(self.head(te.name), args, te.span)
+
+    def _family(self, te: ast.TECon, tyvars: dict[str, TVar], fresh: Fresh) -> Type:
+        """`Elem c` -- a family application, which is not an application.
+
+        A family is saturated where it is written, for the same reason an alias
+        is: it is the one head that is not rigid, and `unify` decomposes an
+        application pointwise. Any further arguments *are* an ordinary
+        application, of whatever the family returns.
+        """
+        fam = self.families[te.name]
+        if not te.args:
+            raise TypeError_(
+                f"'{te.name}' is a type family of class '{fam.cls}' and must be "
+                f"applied to a type",
+                te.span,
+            )
+        args = [self.to_type(a, tyvars, fresh) for a in te.args]
+        if not unify_kinds(kind_of(args[0]), fam.arg_kind):
+            raise TypeError_(
+                f"'{show(args[0])}' has kind {show_kind(kind_of(args[0]))}, but "
+                f"'{te.name}' is a family over a type of kind "
+                f"{show_kind(fam.arg_kind)}",
+                te.span,
+            )
+        return apply(TFam(te.name, args[0], fam.res_kind), args[1:], te.span)
 
     def _expand_alias(
         self, info: TyconInfo, substitution: dict[str, Type], fresh: Fresh, span: Span
@@ -298,6 +348,8 @@ def substitute(t: Type, mapping: dict[int, Type]) -> Type:
         return mapping.get(t.id, t)
     if isinstance(t, TApp):
         return TApp(substitute(t.fn, mapping), substitute(t.arg, mapping), t.kind)
+    if isinstance(t, TFam):
+        return TFam(t.name, substitute(t.arg, mapping), t.kind)
     if isinstance(t, TFun):
         return TFun([substitute(p, mapping) for p in t.params], substitute(t.ret, mapping))
     if isinstance(t, TTuple):

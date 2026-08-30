@@ -667,4 +667,74 @@ observes nothing.
 
 Operators are still monomorphic and still route through the evaluator's
 `BINARY` table: `+` becomes `Add.add` at the milestone that makes every
-operator a class method, not here.
+operator a class method, not here. Associated type families (delta 31) are
+erased before any of this runs and leave it unchanged.
+
+
+### 31. Associated type families, and unification's third outcome
+
+design.md's type language has type constructors and type variables, and every
+type in it is a *value*. A family is a **function** on types: `Elem c` is a
+type the class computes from its own parameter, declared in the class and
+defined by each instance.
+
+```
+class Container c {
+    type Elem c
+
+    fun first(c) -> Elem c
+}
+
+instance Container (Array a) {
+    type Elem = a
+
+    fun first(xs) = xs[0]
+}
+```
+
+**Only associated families, never free-standing ones.** A family is declared
+inside a class and takes that class's parameter, so its arity is one, its
+coverage is anchored to an instance head, and there is exactly one place to
+look for its definition. That is the setting of Schrijvers, Peyton Jones,
+Chakravarty & Sulzmann ("Type Checking with Open Type Functions", ICFP 2008)
+with the general case left out.
+
+**This is what makes one class parameter enough.** `Container c` says what the
+element type is without a second parameter and without a functional
+dependency, which is the trade SPEC-DELTAS 29 named and deferred to here. A
+context may then constrain a type nobody wrote down: `fun describe[Container
+c, Show (Elem c)](xs : c) -> String` demands `Show` of the element, and the
+demand reduces the moment the container is known.
+
+**Unification gains a third outcome, and this is the milestone.** `Elem a ~
+Int` with `a` unbound is neither solvable nor false -- it becomes one or the
+other once `a` is decided. So `types.unify`, which could previously only bind
+or raise, can now **defer**: the equation goes back on the solver's queue and
+is retried as the solver learns more, alongside the deferred predicates it
+already kept. An equation still stuck when the binding that owns its variables
+generalizes can never be decided by anything outside, and is an error there.
+Nothing but a family application can defer, so nothing else changes.
+
+**Families are not injective.** `Elem i ~ Int` says nothing about `i`; two
+containers with the same element type are not the same container. So two
+family applications unify only when they are syntactically the same
+application -- reflexivity, not decomposition -- and that is the one thing a
+functional dependency would have given. Iteration only ever goes container to
+element, so it is not missed.
+
+A family application is its own type former (`types.TFam`) rather than a
+constructor at the head of an application, for the reason delta 28 gives for
+saturating type aliases: decomposing `f a ~ g b` pointwise is sound only
+because every head is rigid, and a family head is precisely the one that is
+not.
+
+**Reduction terminates by a syntactic rule.** An instance head is a
+constructor over distinct variables (delta 29), and a family definition may
+apply a family only to a *variable of that head* -- a proper subterm of the
+argument that selected the instance -- so every reduction step is a strict
+decrease. `type Elem = Elem (Array a)` is rejected where it is written.
+
+Families are **erased**: they are reduced away during solving and again before
+evidence is resolved, so `turkey/eval.py` never sees one and delta 30 is
+untouched. A family that no instance covers is reported as the missing
+instance it is, at the equation that needed it.

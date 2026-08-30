@@ -135,10 +135,16 @@ fun-body     ::= "=" expr
 -- its parameters are then *types*, not binders; that form is legal only in a
 -- class body.
 class-decl   ::= "class" CONID IDENT (":" class-pred ("," class-pred)*)?
-                 "{" method* "}"
-instance-decl ::= "instance" context? CONID atype "{" fun-decl* "}"
+                 "{" (method | fam-decl)* "}"
+instance-decl ::= "instance" context? CONID atype
+                 "{" (fun-decl | fam-bind)* "}"
 method       ::= fun-decl
                | "fun" IDENT context? "(" type-list? ")" "->" type-expr
+-- Associated type families (delta 31). A family is declared over the class's
+-- own parameter and defined by each instance; it is written and applied like
+-- any other type constructor, so `type-expr` needs no production of its own.
+fam-decl     ::= "type" CONID IDENT
+fam-bind     ::= "type" CONID "=" type-expr
 context      ::= "[" class-pred ("," class-pred)* "]"
 class-pred   ::= CONID atype
 type-list    ::= type-expr ("," type-expr)*

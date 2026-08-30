@@ -18,7 +18,7 @@ from .errors import TurkeyPanic
 from .evidence import Absent, FromDict, FromInstance
 from .values import (
     UNIT, ArrayObj, Builtin, Closure, ConstructorFn, ConValue, Dict, DictAbs,
-    RecordObj,
+    RecordObj, from_bool, truth,
 )
 
 
@@ -337,15 +337,18 @@ class Evaluator:
     def _eval_EUnary(self, e, env):
         value = self.eval(e.operand, env)
         if e.fn is None:
-            return not value
+            # The only non-method unary operator (section 8.2).
+            return from_bool(not truth(value))
         return self.call(self._eval_EVar(e.fn, env), [value], e.span)
 
     def _eval_EBinary(self, e, env):
         # Section 8.2: these two short-circuit; everything else is strict.
         if e.op == "&&":
-            return self.eval(e.left, env) and self.eval(e.right, env)
+            left = self.eval(e.left, env)
+            return self.eval(e.right, env) if truth(left) else left
         if e.op == "||":
-            return self.eval(e.left, env) or self.eval(e.right, env)
+            left = self.eval(e.left, env)
+            return left if truth(left) else self.eval(e.right, env)
         if e.fn is None:
             return BINARY[e.op](self.eval(e.left, env), self.eval(e.right, env))
         # Every other operator is a method, and `e.fn` is the use that carries
@@ -365,14 +368,14 @@ class Evaluator:
         return result
 
     def _eval_EIf(self, e, env):
-        if self.eval(e.cond, env):
+        if truth(self.eval(e.cond, env)):
             return self.eval(e.then, env)
         if e.otherwise is not None:
             return self.eval(e.otherwise, env)
         return UNIT
 
     def _eval_EWhile(self, e, env):
-        while self.eval(e.cond, env):
+        while truth(self.eval(e.cond, env)):
             try:
                 self.eval(e.body, env)
             except ContinueSignal:
@@ -416,7 +419,7 @@ class Evaluator:
         scope = env.child()
         if e.init is not None:
             self.exec_stmt(e.init, scope)
-        while self.eval(e.cond, scope):
+        while truth(self.eval(e.cond, scope)):
             try:
                 self.eval(e.body, scope)
             except ContinueSignal:
@@ -477,10 +480,18 @@ def match_pattern(pat: ast.Pattern, value) -> dict[str, object] | None:
             out.update(inner)
         return out
     if isinstance(pat, ast.PCon):
-        if not isinstance(value, ConValue) or value.con != pat.name:
+        # Either runtime shape: a record variant is a positional one plus
+        # names, and a single-variant record is a `RecordObj`.
+        if isinstance(value, ConValue):
+            args = value.args
+        elif isinstance(value, RecordObj):
+            args = value.positional()
+        else:
+            return None
+        if value.con != pat.name:
             return None
         out = {}
-        for sub, item in zip(pat.args, value.args):
+        for sub, item in zip(pat.args, args):
             inner = match_pattern(sub, item)
             if inner is None:
                 return None

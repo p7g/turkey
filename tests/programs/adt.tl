@@ -9,8 +9,8 @@ fun size(t) -> Int = match t {
     Node(l, _, r) -> size(l) + 1 + size(r)
 }
 
-fun isEven(n) = if n == 0 { true } else { isOdd(n - 1) }
-fun isOdd(n) = if n == 0 { false } else { isEven(n - 1) }
+fun isEven(n) = if n == 0 { True } else { isOdd(n - 1) }
+fun isOdd(n) = if n == 0 { False } else { isEven(n - 1) }
 
 fun classify(o) -> String = match o {
     None -> "none"

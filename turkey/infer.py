@@ -54,7 +54,7 @@ from .types import (
     int_literal_set, show, vars_of,
 )
 
-LITERAL_TYPES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR, "Bool": BOOL}
+LITERAL_TYPES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR}
 
 # Which literals get a set rather than a type. A string or a char has exactly
 # one type and is emitted as one; only the numeric kinds are open.
@@ -507,7 +507,11 @@ class Generator:
         ):
             self.emit(CPred(pred, decl.span, "read"))
 
-        self.scopes.append({name: False for name in binds})
+        # Parameters are reassignable (`fun gcd(a, b) { a = b ... }`). `CDef`
+        # binds them monomorphically, so the value restriction that makes a
+        # `var` binding special has nothing to say about them; reassigning one
+        # rebinds this local slot and does not write through to the caller.
+        self.scopes.append({name: True for name in binds})
         self.push()
         self.fn_stack.append(ret)
         loops, self.loop_stack = self.loop_stack, []  # `break` cannot cross a function
@@ -553,18 +557,15 @@ class Generator:
                 self._merge(out, self.match_pattern(sub, ty), pat.span)
             return out
         if isinstance(pat, ast.PCon):
+            # A record variant matches positionally too: `con.params` is in
+            # declaration order for both forms, so nothing here cares which
+            # form declared it. Only the record form may omit fields, which
+            # is why the arity check below stays unconditional.
             con = self.decls.instantiate_con(pat.name, self.fresh, pat.span)
-            info = self.decls.con(pat.name)
             if len(pat.args) != len(con.params):
                 raise TypeError_(
                     f"constructor '{pat.name}' takes {len(con.params)} argument(s), "
                     f"but the pattern supplies {len(pat.args)}",
-                    pat.span,
-                )
-            if info.is_record and pat.args:
-                raise TypeError_(
-                    f"'{pat.name}' has named fields; match it with "
-                    f"'{pat.name} {{ ... }}'",
                     pat.span,
                 )
             self.eq(t, con.ret, pat.span, f"the pattern '{pat.name}'")

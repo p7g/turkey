@@ -139,6 +139,10 @@ element count) and `.capacity` (allocated storage) as compiler-known fields.
 The implementation checks both reads and writes against `.length`; indices
 in `[capacity, length)` still panic even though storage exists.
 
+**Amended at delta 37.** `pop` no longer panics on an empty array: it answers
+`Option a`. Indexing still panics, and that distinction is the point -- see
+delta 37.
+
 ### 9. No modules in v0
 
 §9 describes a full Haskell-style module system (headers, qualified/
@@ -148,6 +152,12 @@ implements a single file only: no `module`/`import` semantics. `Data.Array`
 global environment as if always in scope. `module` and `import` are still
 lexed and parsed per §3.1/§9.2 so the surface syntax isn't lost, but both are
 rejected at a later stage with a "not supported in v0" error.
+
+**Amended at delta 36.** `Bool` was on the list of types a program may not
+redefine. It is not built in any more -- the prelude declares it -- so the
+list is `Int`, `Float`, `String`, `Char`, `Unit` and `Array`. Redeclaring
+`Bool` is now the ordinary "declared more than once" collision with the
+prelude's declaration.
 
 ### 10. Record update is dropped
 
@@ -889,3 +899,137 @@ alongside the declaration and class tables, and the evaluator runs the
 prelude's statements before the program's. Exported are exactly the names the
 prelude's own statements bind -- which is how `print` crosses the seam and
 `Prim.print` does not.
+
+### 34. A record variant is symmetric with a positional one
+
+design.md decision 28 says record construction may be positional (`C(v₁, ...)`)
+or labeled (`C { f = v, ... }`), and §3.6's pattern grammar lists `CONID pat*`
+for constructors with no restriction on which declaration form it applies to.
+The implementation allowed positional *construction* and refused positional
+*destructuring*, at one guard in `Generator.match_pattern`. Nothing in
+design.md or in these deltas argued for the refusal; it was an omission.
+
+The guard is gone. `Circle(r)` and `Circle { radius = r }` now match the same
+value, and the arity check that already sat above the guard gives the error for
+the wrong count. Nothing else moved, because nothing else was asymmetric:
+`ConInfo` stores field *types* positionally with `field_names` a parallel list,
+`ConstructorFn.build` zips positional arguments against declaration order for
+both shapes, and `exhaustive._normalize` already reduced a record pattern to a
+positional row. The evaluator learned only that a `PCon` may meet a
+single-variant record's `RecordObj` as well as a `ConValue`.
+
+**The two forms still differ in one respect, deliberately.** A record pattern
+may name a subset of the fields; a positional one may not. `R(x)` for a
+two-field `R` is an arity error. Names are self-describing and positions are
+not, and this is the one place where that difference should have a consequence.
+
+**A bug this fixed for free.** `exhaustive.render` prints a missing-case
+witness positionally whatever form declared the constructor, so a missing
+`Circle { center, radius }` was reported as `Circle(_, _)` -- a pattern the
+checker then rejected. The suggestion is now legal, and a test pins that.
+
+**Punning in construction,** the other half of the same asymmetry: patterns
+have always punned (`C { x }` binds `x` from field `x`) and expressions
+required `C { x = x }`. The `=` is optional now, exactly as in
+`parse_con_pattern`; a literal may mix punned and written fields. Neither
+generation nor evaluation can tell the difference -- both work from the
+`(label, expr)` list -- and non-expansiveness is unaffected, an `EVar` being
+non-expansive already. design.md §3.5's `field-init` and §3.6 are amended.
+
+### 35. Parameters are reassignable
+
+A parameter could not be assigned to: `cannot assign to 'x': it was bound with
+'let'`. Working around it meant shadowing (`fun gcd(_a, _b) { var a = _a ... }`),
+which is noise with no rule behind it. A parameter is bound monomorphically by
+its function, so the value restriction -- which is about what may be
+generalized -- has nothing to say about it, and there was no soundness question
+being answered.
+
+Every name a parameter pattern binds is now mutable. There is no keyword: an
+opt-in `var` prefix would have cost a parser change, an AST field and a rule
+about which parameter patterns may carry one, to state something the type
+system does not care about. `fun` parameters and lambda parameters are treated
+alike.
+
+Nothing in the parser, the AST or the checker moved. The generator keeps a
+name → mutable map, which is a scope rather than a type environment --
+mutability is a property of the binding form, not of a type -- and
+`gen_function` enters its parameters into it as mutable; the evaluator was
+already storing them in ordinary environment slots.
+
+**Reassignment rebinds the local name and does not write through.** For a
+destructured parameter -- `fun f(Point(x, y)) { x = 1 }` -- this is the thing a
+reader might assume wrongly, so it has a test: the caller's value is untouched,
+patterns binding rather than aliasing, and a `ConValue` being immutable (§4.5)
+in any case. `let` bindings inside a function body still refuse assignment.
+
+### 36. `Bool` is a declared type, and its constructors are `True` and `False`
+
+`true` and `false` were reserved words producing a `Bool` literal, and `Bool`
+was a primitive type constructor seeded into the declaration table. That made
+booleans the one data type in the language the language could not have
+declared, and their spelling the one place where a value of a two-variant sum
+was written in lower case.
+
+`Bool` is now `type Bool = False | True`, in the prelude, checked like anything
+else (delta 32's shape). `True` and `False` are ordinary nullary constructors:
+they lex as `CONID`, they are looked up like any other constructor in both
+expression and pattern position, and exhaustiveness gets their signature out of
+the same table as every other type's -- so a one-armed `match b { True -> ... }`
+now warns, which the literal path could not have been made to do without a
+special case of its own.
+
+**The cosmetic version would have been worse.** Renaming the reserved words to
+`True`/`False` makes them lex as `CONID`, where `expr-atom ::= CONID` and
+`pat ::= CONID` already mean "nullary constructor" -- so they would have needed
+special-casing *ahead* of constructor lookup in both positions, plus a rule
+forbidding a user constructor of either name. That is strictly more special
+casing than declaring the type, for a worse end state.
+
+**`types.BOOL` did not have to move.** A `TCon` is compared by name, so the
+module constant and the head the prelude's declaration installs are the same
+type, and every builtin written in terms of `BOOL` -- `Prim.boolEq`,
+`Bool.toString`, every `if` condition -- meets the declared type without
+knowing it. What did have to be separated is `PRIMITIVES`, which served as both
+the seeded-heads table and the redefinition blocklist; `Bool` leaves both.
+
+At run time a boolean is `ConValue("True", ())`, so every site that read a
+Python `bool` -- `if`, `while`, the C-style `for` header, `&&`, `||`, `!` --
+goes through one `truth` helper, and the comparison builtins answer with
+`from_bool`. `ArrayObj._check`'s `isinstance(index, bool)` guard became dead
+and was deleted. `Show Bool` prints `True`/`False`, which is the whole of the
+golden churn: the `.expected` diff for this delta is exactly that
+substitution.
+
+### 37. `Array.pop` answers with `Option`
+
+`pop` panicked on an empty array, which delta 8 recorded without arguing for.
+Popping an empty array is not a program bug -- it is the ordinary end of a
+loop, and the only case a caller has any business handling. `Option` is in the
+prelude since delta 33, so `pop` can now say so:
+
+```
+fun pop(arr : Array a) -> Option a
+```
+
+The builtin checks the length and answers `None` without mutating;
+`ArrayObj.pop` still raises, because every other caller of it is reading past
+a length that a bug moved. Naming `Option` from `turkey/builtins.py` needs no
+`DeclTable`, by the same name-equality that delta 36 relies on for `Bool`.
+
+**Scope.** Only `pop` changed. `xs[i]` out of bounds, `Array.new`'s
+uninitialized slots, `Int.div` by zero and `error` all still panic: those
+report a program bug rather than an ordinary empty case, and turning them into
+`Option` is a language-wide decision about partiality, not a repair to one
+signature. The one golden that moved is `stack.tl`, whose `pop` now matches on
+the answer; its `.expected` and `.types` are unchanged.
+
+**Declined while here: an exponentiation operator.** Two reasons, neither of
+them the parser. Operators are homogeneous (delta 32), so `class Pow a { fun
+pow(a, a) -> a }` cannot express `Float ** Int`, which is the one people
+actually want -- Haskell ships `^`, `^^` and `**` for exactly this reason, and
+one class parameter can express only the least useful of the three. And `Int **
+Int` is partial: `2 ** -1` has no `Int` answer, so it would be a second
+operator that panics. It also wants a new right-associative precedence level
+binding tighter than unary minus. If it arrives it belongs with the numeric
+tower delta 27 was built for. `square(n) = n * n` costs one line.

@@ -13,8 +13,8 @@ fun describe(c : Color) -> String = match c {
 
 -- Exhaustive through a tuple, including the nested Bool.
 fun pair(p : (Color, Bool)) -> Int = match p {
-    (Red, true) -> 1
-    (Red, false) -> 2
+    (Red, True) -> 1
+    (Red, False) -> 2
     (Green, _) -> 3
     (Blue, _) -> 4
 }
@@ -32,13 +32,13 @@ fun flatten(o : Option (Option Int)) -> Int = match o {
 
 -- Not exhaustive: Int has too many values to enumerate.
 fun small(n : Int) -> Bool = match n {
-    0 -> true
-    1 -> true
+    0 -> True
+    1 -> True
 }
 
 fun main() {
     print(describe(Green))
-    print(Int.toString(pair((Blue, true))))
+    print(Int.toString(pair((Blue, True))))
     print(Int.toString(flatten(Some(None))))
     print(Bool.toString(small(0)))
 }

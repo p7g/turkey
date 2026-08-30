@@ -84,8 +84,9 @@ class Checker:
             return [("tuple", len(t.elems))]
         head = head_con(t)
         if head is not None:
-            if head.name == "Bool":
-                return [("lit", "Bool", True), ("lit", "Bool", False)]
+            # `Bool` needs no special case any more: it is `type Bool = False |
+            # True` in the prelude, so its two variants come out of the same
+            # table as any other type's.
             info = self.decls.tycons.get(head.name)
             if info is not None and info.variants:
                 return [("con", v.name) for v in info.variants]
@@ -187,8 +188,6 @@ def render(pattern) -> str:
     if pattern[0] == "wild":
         return "_"
     if pattern[0] == "lit":
-        if pattern[1] == "Bool":
-            return "true" if pattern[2] else "false"
         return repr(pattern[2])
     if pattern[0] == "tuple":
         return "(" + ", ".join(render(p) for p in pattern[1]) + ")"

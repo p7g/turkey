@@ -29,13 +29,13 @@ BUILTIN_TYCONS = frozenset({"Int", "Float", "String", "Char", "Bool", "Unit", "A
 EXPR_START = frozenset(
     set(LITERAL_KINDS)
     | {
-        "IDENT", "CONID", "true", "false", "(", "[", "{", "-", "!",
+        "IDENT", "CONID", "(", "[", "{", "-", "!",
         "fun", "if", "match", "while", "for", "loop", "return", "break", "continue",
     }
 )
 
 PATTERN_START = frozenset(
-    set(LITERAL_KINDS) | {"IDENT", "CONID", "true", "false", "("}
+    set(LITERAL_KINDS) | {"IDENT", "CONID", "("}
 )
 
 # Binary operator precedence, loosest first (section 3.5).
@@ -593,9 +593,6 @@ class Parser:
         if tok.kind in LITERAL_KINDS:
             self.advance()
             return ast.PLit(tok.span, LITERAL_TYPE[tok.kind], tok.value)
-        if tok.kind in ("true", "false"):
-            self.advance()
-            return ast.PLit(tok.span, "Bool", tok.kind == "true")
         if tok.kind == "(":
             self.advance()
             elems = [self.parse_pattern()]
@@ -705,9 +702,6 @@ class Parser:
         if kind in LITERAL_KINDS:
             self.advance()
             return ast.ELit(tok.span, LITERAL_TYPE[kind], tok.value)
-        if kind in ("true", "false"):
-            self.advance()
-            return ast.ELit(tok.span, "Bool", kind == "true")
         if kind == "IDENT":
             self.advance()
             return ast.EVar(tok.span, tok.text)
@@ -787,8 +781,10 @@ class Parser:
             with self._with_no_record(False):
                 while not self.at("}"):
                     fname = self.expect("IDENT", "a field name")
-                    self.expect("=")
-                    fields.append((fname.text, self.parse_expr()))
+                    # Punning: `C { x }` is `C { x = x }`, as in patterns.
+                    value = (self.parse_expr() if self.eat("=")
+                             else ast.EVar(fname.span, fname.text))
+                    fields.append((fname.text, value))
                     self.skip_newlines()
                     if not self.eat(","):
                         break

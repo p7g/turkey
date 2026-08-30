@@ -20,10 +20,12 @@ import sys
 
 from .errors import TurkeyPanic
 from .constraints import Binding, Env
+from .prelude import OPTION, OPTION_NONE, OPTION_SOME
 from .types import (
-    BOOL, CHAR, FLOAT, INT, STRING, UNIT, TFun, TVar, array_of, generalize, mono,
+    BOOL, CHAR, FLOAT, INT, STAR, STRING, UNIT, KFun, TCon, TFun, TVar, apply,
+    array_of, generalize, mono,
 )
-from .values import UNIT as UNIT_VALUE, ArrayObj, Builtin
+from .values import UNIT as UNIT_VALUE, ArrayObj, Builtin, ConValue, from_bool
 
 
 def _scheme(build):
@@ -39,6 +41,18 @@ def _bi(name, arity, fn):
 def _push(arr, value):
     arr.push(value)
     return UNIT_VALUE
+
+
+def _pop(arr):
+    """Total, unlike `ArrayObj.pop`: an empty array is an ordinary answer.
+
+    The array's own `pop` still raises, because reading past the length is a
+    program bug wherever else it happens; it is only *this* call, the one whose
+    empty case a program is expected to handle, that answers with `Option`.
+    """
+    if arr.length == 0:
+        return ConValue(OPTION_NONE, ())
+    return ConValue(OPTION_SOME, (arr.pop(),))
 
 
 def _print(text):
@@ -110,8 +124,11 @@ _CORE: dict[str, tuple] = {
         _bi("Array.push", 2, _push),
     ),
     "Array.pop": (
-        _scheme(lambda a: TFun([array_of(a)], a)),
-        _bi("Array.pop", 1, lambda arr: arr.pop()),
+        # `Option` is declared in the prelude, and a `TCon` is compared by
+        # name, so naming it here needs no `DeclTable` -- the same trick that
+        # lets `BOOL` above mean the prelude's `Bool`.
+        _scheme(lambda a: TFun([array_of(a)], apply(TCon(OPTION, KFun(STAR, STAR)), [a]))),
+        _bi("Array.pop", 1, _pop),
     ),
 
     "String.length": (
@@ -133,7 +150,7 @@ _CORE: dict[str, tuple] = {
     ),
     "Bool.toString": (
         mono(TFun([BOOL], STRING)),
-        _bi("Bool.toString", 1, lambda b: "true" if b else "false"),
+        _bi("Bool.toString", 1, lambda b: b.con),
     ),
     "Char.toString": (
         mono(TFun([CHAR], STRING)), _bi("Char.toString", 1, _char_to_string),
@@ -145,7 +162,9 @@ def _num(name, ty, fn):
 
 
 def _cmp(name, ty, fn):
-    return (mono(TFun([ty, ty], BOOL)), _bi(name, 2, fn))
+    # `fn` answers in Python; a turkey `Bool` is a constructor (M9.4), so the
+    # wrapper is where the two representations meet.
+    return (mono(TFun([ty, ty], BOOL)), _bi(name, 2, lambda a, b: from_bool(fn(a, b))))
 
 
 # The machine operations the prelude's instances are defined in terms of. Not
@@ -180,8 +199,9 @@ _PRIM: dict[str, tuple] = {
     "Prim.stringLt": _cmp("Prim.stringLt", STRING, lambda a, b: a < b),
     "Prim.charEq": _cmp("Prim.charEq", CHAR, lambda a, b: a == b),
     "Prim.charLt": _cmp("Prim.charLt", CHAR, lambda a, b: a < b),
-    "Prim.boolEq": _cmp("Prim.boolEq", BOOL, lambda a, b: a == b),
-    "Prim.boolLt": _cmp("Prim.boolLt", BOOL, lambda a, b: (not a) and b),
+    "Prim.boolEq": _cmp("Prim.boolEq", BOOL, lambda a, b: a.con == b.con),
+    "Prim.boolLt": _cmp(
+        "Prim.boolLt", BOOL, lambda a, b: a.con == "False" and b.con == "True"),
 }
 
 # design.md writes these as `Data.Array.new` and so on; accept both spellings.

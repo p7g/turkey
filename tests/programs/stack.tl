@@ -15,7 +15,10 @@ fun push(s : Stack a, x : a) -> Unit {
 fun pop(s : Stack a) -> a {
     if s.top == 0 { return error("empty stack") }
     s.top = s.top - 1
-    Array.pop(s.data)
+    match Array.pop(s.data) {
+        Some(x) -> x
+        None -> error("the stack's top ran ahead of its array")
+    }
 }
 
 fun drain(s : Stack a) -> Array a {

@@ -222,7 +222,7 @@ def test_two_instances_of_one_class_dispatch_apart(capsys):
     src = SHOW + """
 fun main() {
     print(display(1))
-    print(display(true))
+    print(display(True))
 }
 """
     assert output(src, capsys) == ["1", "true"]
@@ -301,7 +301,7 @@ instance Foldable Array {
 
 fun main() {
     print(each([1, 2, 3]))
-    print(each([true, false]))
+    print(each([True, False]))
 }
 """
     assert output(src, capsys) == ["123", "truefalse"]
@@ -337,7 +337,7 @@ def test_a_let_bound_to_a_method_takes_its_dictionary(capsys):
 fun main() {
     let s = display
     print(s(1))
-    print(s(true))
+    print(s(True))
 }
 """
     assert output(src, capsys) == ["1", "true"]

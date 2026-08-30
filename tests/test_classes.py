@@ -248,12 +248,12 @@ def test_a_class_may_not_be_its_own_superclass():
 
 
 def test_two_instances_for_one_constructor_overlap():
-    assert bad(EQ + "instance Egal Int { fun egal(x, y) = false }") == \
+    assert bad(EQ + "instance Egal Int { fun egal(x, y) = False }") == \
         "overlapping instances: 'Egal Int' and 'Egal Int' both apply"
 
 
 def test_an_instance_head_must_be_a_constructor_over_distinct_variables():
-    src = EQ + "instance Egal (Either Int Int) { fun egal(x, y) = true }"
+    src = EQ + "instance Egal (Either Int Int) { fun egal(x, y) = True }"
     assert "distinct type variables" in bad(src)
 
 
@@ -265,7 +265,7 @@ def test_an_instance_must_define_every_method_that_has_no_default():
 def test_an_instance_may_not_define_a_method_of_another_class():
     src = EQ + """
     class Display a { fun display(a) -> String }
-    instance Display Int { fun egal(x, y) = true }
+    instance Display Int { fun egal(x, y) = True }
     """
     assert bad(src) == "'egal' is not a method of class 'Display'"
 
@@ -313,7 +313,7 @@ def test_an_instance_method_must_return_what_the_class_says():
 
 
 def test_an_instance_method_must_have_the_declared_arity():
-    assert bad(EQ.replace("fun egal(x, y) = x == y", "fun egal(x) = true")) == \
+    assert bad(EQ.replace("fun egal(x, y) = x == y", "fun egal(x) = True")) == \
         "this function takes 1 argument but 2 were supplied"
 
 

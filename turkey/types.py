@@ -353,8 +353,13 @@ CHAR = TCon("Char")
 BOOL = TCon("Bool")
 UNIT = TCon("Unit")
 
+# The types the checker seeds itself with, and therefore also the ones a
+# program may not redefine. `Bool` is deliberately absent: it is declared in
+# the prelude as `type Bool = False | True`, and `BOOL` above still names it
+# because a `TCon` is compared by name (see `TCon.__eq__`), so every builtin
+# written in terms of `BOOL` meets the declared type without knowing it.
 PRIMITIVES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR,
-              "Bool": BOOL, "Unit": UNIT}
+              "Unit": UNIT}
 
 ARRAY = TCon("Array", KFun(STAR, STAR))
 

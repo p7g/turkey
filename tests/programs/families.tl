@@ -47,7 +47,7 @@ fun twice(xs) = [first(xs), first(xs)]
 fun main() {
     print(describe([10, 20, 30]))
     print(describe(Pair { left = 7, right = 8 }))
-    print(describe([true]))
+    print(describe([True]))
     -- Reduced at a nested head: `Elem (Array (Array Int))` is `Array Int`.
     print(Int.toString(size(first([[1, 2], [3]]))))
     print(Int.toString(first(twice([9, 8])) + 1))

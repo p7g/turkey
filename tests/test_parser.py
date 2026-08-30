@@ -104,7 +104,7 @@ def test_and_binds_tighter_than_or():
 
 
 def test_comparison_binds_tighter_than_equality():
-    v = first_value("let a = 1 < 2 == true\n")
+    v = first_value("let a = 1 < 2 == True\n")
     assert v.op == "=="
     assert isinstance(v.left, ast.EBinary) and v.left.op == "<"
 

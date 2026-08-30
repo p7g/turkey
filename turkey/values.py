@@ -68,7 +68,7 @@ class ArrayObj:
 
     def _check(self, index: int, what: str) -> None:
         # SPEC-DELTAS.md entry 8: bounds are the length, not the capacity.
-        if not isinstance(index, int) or isinstance(index, bool):
+        if not isinstance(index, int):
             raise TurkeyPanic(f"array index must be an Int, got {index!r}")
         if index < 0 or index >= self.length:
             raise TurkeyPanic(
@@ -137,6 +137,16 @@ class RecordObj:
         self.con = con
         self.fields = fields
 
+    def positional(self) -> tuple:
+        """The fields in declaration order.
+
+        Both places a `RecordObj` is built -- `ConstructorFn.build` below and
+        `Evaluator._eval_ERecord` -- fill `fields` by walking
+        `ConInfo.field_names`, so insertion order *is* declaration order. That
+        is what lets a positional pattern match a record variant.
+        """
+        return tuple(self.fields.values())
+
     def __repr__(self) -> str:
         inner = ", ".join(f"{k} = {v!r}" for k, v in self.fields.items())
         return f"{self.con} {{ {inner} }}"
@@ -161,6 +171,25 @@ class ConValue:
             )
             return f"{self.con} {{ {inner} }}"
         return f"{self.con}(" + ", ".join(repr(a) for a in self.args) + ")"
+
+
+# `Bool` is a declared type now (`type Bool = False | True`, in the prelude),
+# so a boolean is an ordinary nullary constructor and not a Python `bool`. The
+# evaluator registers its own `ConValue`s for the two names like any other
+# constructor; these singletons are what code *outside* the evaluator -- the
+# comparison builtins, mostly -- answers with. Nothing compares them by
+# identity: `con` is the tag, here as everywhere.
+TRUE = ConValue("True", ())
+FALSE = ConValue("False", ())
+
+
+def from_bool(b: bool) -> ConValue:
+    return TRUE if b else FALSE
+
+
+def truth(value) -> bool:
+    """Read a turkey `Bool` back as a Python one, for `if` and friends."""
+    return value.con == "True"
 
 
 class Closure:

@@ -206,7 +206,7 @@ def test_an_equation_that_can_never_be_decided_is_rejected():
 
 
 def test_a_family_over_a_type_with_no_instance_is_rejected_where_written():
-    assert fails(CONTAINER + "fun f(x : Elem Bool) -> Int = 1\nfun g() = f(true)") == (
+    assert fails(CONTAINER + "fun f(x : Elem Bool) -> Int = 1\nfun g() = f(True)") == (
         "no instance for 'Container Bool', so 'Elem Bool' has no definition"
     )
 
@@ -256,7 +256,7 @@ def test_the_element_type_dispatches_the_method_called_on_it(capsys):
 
     fun main() {
         print(render([7]))
-        print(render([true]))
+        print(render([True]))
         print(render(Box { it = 3 }))
     }
     """

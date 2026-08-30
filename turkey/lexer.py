@@ -16,7 +16,7 @@ from .errors import LexError, Span
 
 KEYWORDS = frozenset(
     """type class instance fun let var match if else while for in loop return
-    break continue true false module import export as qualified hiding
+    break continue module import export as qualified hiding
     where""".split()
 )
 
@@ -34,7 +34,7 @@ LITERAL_KINDS = frozenset({"INT", "FLOAT", "STRING", "CHAR"})
 # statement ending in one of them must still be terminable by a newline.
 CAN_END = (
     LITERAL_KINDS
-    | {"IDENT", "CONID", ")", "]", "}", "true", "false", "break", "continue", "return"}
+    | {"IDENT", "CONID", ")", "]", "}", "break", "continue", "return"}
 )
 
 # Section 2.4, following condition: tokens that can legally start a sibling
@@ -47,7 +47,7 @@ CAN_START = (
         "let", "var", "fun", "type", "class", "instance", "if", "match",
         "while", "for", "loop", "return", "break", "continue", "module",
         "import",
-        "IDENT", "CONID", "true", "false", "(", "[", "{", "-", "!",
+        "IDENT", "CONID", "(", "[", "{", "-", "!",
     }
 )
 

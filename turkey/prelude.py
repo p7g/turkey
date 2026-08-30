@@ -48,6 +48,8 @@ which is in scope here and nowhere else.
 from __future__ import annotations
 
 SOURCE = """
+type Bool = False | True
+
 type Option a = None | Some(a)
 
 class Eq a {
@@ -124,7 +126,12 @@ instance Iterator (Array a) {
 
 instance Show Int { fun show(x) = Int.toString(x) }
 instance Show Float { fun show(x) = Float.toString(x) }
-instance Show Bool { fun show(x) = Bool.toString(x) }
+instance Show Bool {
+    fun show(x) = match x {
+        True -> "True"
+        False -> "False"
+    }
+}
 instance Show Char { fun show(x) = Char.toString(x) }
 instance Show String { fun show(x) = x }
 
@@ -138,11 +145,11 @@ instance [Show a] Show (Option a) {
 instance [Show a] Show (Array a) {
     fun show(xs) {
         var out = "["
-        var rest = false
+        var rest = False
         for x in xs {
             if rest { out = out ++ ", " }
             out = out ++ show(x)
-            rest = true
+            rest = True
         }
         out ++ "]"
     }

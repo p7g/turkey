@@ -43,6 +43,9 @@ from turkey.types import (
     numeric_type, spine, type_key, vars_of,
 )
 
+# Type names, for literals and for record field annotations. `Bool` is not a
+# literal kind any more (M9.4 made it a declared type), but it is still a
+# perfectly good field type, so it stays in the table.
 LITERALS = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR, "Bool": BOOL}
 
 Subst = dict[int, Type]

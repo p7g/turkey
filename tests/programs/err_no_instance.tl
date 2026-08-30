@@ -9,5 +9,5 @@ instance Semigroup Int {
 fun main() {
     -- `Bool` is a type, but nothing has said how to combine two of them.
     print(Int.toString(1))
-    let _ = combine(true, false)
+    let _ = combine(True, False)
 }

@@ -31,7 +31,7 @@ fun neverReturns() -> Int {
 fun whileSum(limit : Int) -> Int {
     var total = 0
     var i = 0
-    while true {
+    while True {
         if i >= limit { break }
         total = total + i
         i = i + 1

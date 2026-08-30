@@ -28,7 +28,11 @@ from turkey.types import show_scheme
 
 SEEDS = range(600)
 
-LITERALS = ["1", "2", "-3", '"s"', "true", "'c'"]
+# Expression atoms the reference checker understands. `True` is absent on
+# purpose: since M9.4 a boolean is a nullary constructor, not a literal, and
+# the reference has no constructors -- generating one would skip the seed
+# rather than test it.
+LITERALS = ["1", "2", "-3", "4", '"s"', "'c'"]
 
 # Two record types sharing a field, so that a function reading `.a` is
 # genuinely polymorphic in its receiver rather than pinned by the only
@@ -36,10 +40,10 @@ LITERALS = ["1", "2", "-3", '"s"', "true", "'c'"]
 # constraint form, and the one whose generalization rule this test exists to
 # check.
 PRELUDE = """type R = R { a : Int, b : String }
-type Q = Q { a : Int, c : Bool }
+type Q = Q { a : Int, c : Char }
 """
 
-RECORDS = {"R": [("a", "1"), ("b", '"s"')], "Q": [("a", "2"), ("c", "true")]}
+RECORDS = {"R": [("a", "1"), ("b", '"s"')], "Q": [("a", "2"), ("c", "'c'")]}
 # Weighted: `a` is on both records, so it is the one that produces a demand a
 # scheme can actually carry; `d` is on neither, and is here to make sure the
 # unsatisfiable case is generated too.

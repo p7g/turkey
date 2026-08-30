@@ -35,7 +35,7 @@ STRING   ← "..."   (escapes: \n \t \\ \" \uXXXX)
 CHAR     ← '...'
 ```
 
-**Reserved words:** `type fun let var match if else while for in loop return break continue true false module import export as qualified hiding where`
+**Reserved words:** `type fun let var match if else while for in loop return break continue module import export as qualified hiding where`
 
 **Operators and punctuation:**
 ```
@@ -61,7 +61,7 @@ This distinction resolves syntactic ambiguities: in a function literal's paramet
 
 A `NEWLINE` token terminates the current production iff **both**:
 
-1. **Preceding condition:** the previous token can legally end the current production. Accepting tokens: `IDENT`, `CONID`, literals, `)`, `]`, `}`, `true`, `false`, type annotations.
+1. **Preceding condition:** the previous token can legally end the current production. Accepting tokens: `IDENT`, `CONID`, literals, `)`, `]`, `}`, type annotations.
 2. **Following condition:** the next non-`NEWLINE` token can legally start a new sibling production. Starting tokens: keywords (`let`, `var`, `fun`, `type`, `if`, `match`, `while`, `for`, `loop`, `return`, `break`, `continue`, `module`, `import`), `IDENT`, `CONID`, literals, `(`, `[`, `{`, unary `-`, unary `!`.
 
 If only one condition holds, the `NEWLINE` is dropped (treated as whitespace). Inside `(...)`, `[...]`, or `{...}` of a brace-delimited block, `NEWLINE` is also dropped except where the inner grammar uses it as a separator (e.g., between `match` arms, between block statements).
@@ -184,7 +184,6 @@ expr-postfix ::= expr-atom (
                  | "." IDENT                     -- field access
                  )*
 expr-atom    ::= INT | FLOAT | STRING | CHAR
-               | "true" | "false"
                | IDENT                           -- variable
                | CONID                           -- nullary constructor
                | "(" expr ("," expr)* ")"       -- tuple (if >1) or grouping
@@ -203,6 +202,7 @@ expr-atom    ::= INT | FLOAT | STRING | CHAR
                | block
 block        ::= "{" stmt* "}"
 field-init   ::= IDENT "=" expr
+               | IDENT                           -- punning: `C { x }` is `C { x = x }`
 for-header   ::= stmt-no-block ";" expr ";" stmt-no-block    -- C-style
                | pat "in" expr                                 -- iteration over an Iterator
 match-arm    ::= pat ("|" pat)* "->" expr
@@ -222,19 +222,27 @@ pat          ::= IDENT                          -- variable binder
                | "_"                             -- wildcard
                | CONID pat*                      -- constructor (positional)
                | CONID "{" field-pat ("," field-pat)* "}"  -- constructor (record)
-               | INT | FLOAT | STRING | CHAR | "true" | "false"  -- literal
+               | INT | FLOAT | STRING | CHAR    -- literal
                | "(" pat ("," pat)* ")"         -- tuple or grouping
                | pat ":" type-expr              -- annotated pattern
 field-pat    ::= IDENT "=" pat
                | IDENT                           -- punning: binds same-name variable
 ```
 
+**Either form matches either declaration.** A record variant is a positional
+variant plus a list of field names, so `Circle(r)` and `Circle { radius = r }`
+match the same value, exactly as `Circle(2)` and `Circle { radius = 2 }` both
+construct one (decision 28). The two forms differ in one respect only: the
+record form may name a subset of the fields, and the positional form may not --
+`R(x)` for a two-field `R` is an arity error, because a position is not
+self-describing the way a name is.
+
 ### 3.7 Assignment
 
 Three forms of assignment, all written with `=`:
 
 ```
-IDENT "=" expr              -- reassign a var binding
+IDENT "=" expr              -- reassign a var binding, or a parameter
 expr-postfix "." IDENT "=" expr   -- mutate a record field
 expr-postfix "[" expr "]" "=" expr  -- mutate an array element
 ```
@@ -284,11 +292,18 @@ unify(T₁, T₂) = ...  -- standard otherwise
 
 A `let` binding (or top-level `let`/`fun`) is generalized iff its RHS is a **non-expansive** (syntactic value) expression. `var` bindings are **never** generalized.
 
+**Parameters are reassignable**, with no `var` and no keyword of any kind. A
+parameter is bound monomorphically by the enclosing function, so the value
+restriction -- which is about what may be generalized -- has nothing to say
+about it, and there is no soundness question to answer. Reassignment rebinds
+the local name: it does not write through to the argument, and that holds for a
+destructured parameter too, since a pattern binds rather than aliases.
+
 An expression is **non-expansive** iff:
 
 | Form | Non-expansive? |
 |---|---|
-| literal (`0`, `"x"`, `true`, `'c'`) | ✓ |
+| literal (`0`, `"x"`, `'c'`) | ✓ |
 | variable | ✓ |
 | lambda `fun(...) ...` | ✓ |
 | `C(v₁, ..., vₙ)` positional, `C` immutable constructor, all `vᵢ` non-expansive | ✓ |
@@ -309,7 +324,7 @@ An expression is **non-expansive** iff:
 | Multi-variant ADT (`type T = A \| B ...`) | ✗ | immutable; value or immutable reference |
 | Positional single-variant ADT (`type T = T a b`) | ✗ | immutable |
 | `Array a` | ✓ | reference type; elements and fields mutable |
-| Primitives (`Int`, `Float`, `String`, `Char`, `Bool`, `Unit`) | ✗ | immutable |
+| Primitives (`Int`, `Float`, `String`, `Char`, `Unit`) | ✗ | immutable |
 
 Field access `r.f` and field mutation `r.f = e` are only well-typed when the static type of `r` is a single-variant record type or `Array a`.
 
@@ -479,7 +494,7 @@ Records (constructor payload using `{ ... }`) are only mutable when the data typ
 | `Float` | `0.0`, `3.14`, ... | floating-point |
 | `String` | `"hello"`, ... | UTF-8 |
 | `Char` | `'a'`, `'\n'`, ... | single Unicode codepoint |
-| `Bool` | `true`, `false` | |
+| `Bool` | `True`, `False` | declared in the prelude as `type Bool = False \| True`, not built in |
 | `Unit` | `()` | singleton type |
 
 ### 8.2 Operators
@@ -566,7 +581,7 @@ module Data.Array where
 
 fun new(capacity : Int) -> Array a             -- empty array, given capacity
 fun push(arr : Array a, x : a) -> Unit          -- append, growing if needed
-fun pop(arr : Array a) -> a                     -- remove and return last; panics on empty
+fun pop(arr : Array a) -> Option a              -- remove and return last, or None if empty
 ```
 
 ### 8.4 Other standard modules (suggested)
@@ -699,7 +714,7 @@ Notes:
 | 25 | Anonymous function expression: `fun(params) -> ret = body` or `fun(params) -> ret { body }` |
 | 26 | Type declarations disambiguated by name resolution: `|` or `{}` → data type; otherwise resolve head |
 | 27 | Records only as constructor payloads; field access via `r.f` (type-directed, single-variant only) |
-| 28 | Record construction: positional `C(v₁, ...)` or labeled `C { f = v, ... }` |
+| 28 | Record construction: positional `C(v₁, ...)` or labeled `C { f = v, ... }`; patterns are symmetric with it (delta 34) |
 | 29 | Record update: `r { f = e }` (functional, returns new value) |
 | 30 | SCC-grouped inference for mutual recursion |
 | 31 | Haskell-style modules with explicit exports and qualified imports |

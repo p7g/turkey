@@ -4,6 +4,23 @@ type Cell = Cell { value : Int }
 
 fun bump(c : Cell) -> Unit { c.value = c.value + 1 }
 
+-- M9.3: a parameter is reassignable, so the loop needs no shadow copies.
+fun gcd(a : Int, b : Int) -> Int {
+    while b != 0 {
+        let t = b
+        b = a % b
+        a = t
+    }
+    a
+}
+
+-- Reassigning a destructured parameter rebinds the local name and nothing
+-- else: patterns bind, they do not alias.
+fun ignore(Cell { value }) -> Int {
+    value = 0
+    value
+}
+
 fun main() {
     -- `let d = c` aliases; writes through one are visible through the other.
     let c = Cell { value = 0 }
@@ -38,4 +55,9 @@ fun main() {
     current = Cell { value = 42 }
     print(Int.toString(current.value))
     print(Int.toString(c.value))
+
+    print(Int.toString(gcd(48, 18)))
+    let keep = Cell { value = 7 }
+    print(Int.toString(ignore(keep)))
+    print(Int.toString(keep.value))
 }

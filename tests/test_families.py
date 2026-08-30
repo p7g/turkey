@@ -1,7 +1,7 @@
 """Associated type families: reduction, deferral, and what they let a class say.
 
 `families.tl` is the golden that runs. This file is the part a golden cannot
-show -- that an equation over a family *waits* rather than succeeding or
+display -- that an equation over a family *waits* rather than succeeding or
 failing, which is the third outcome M7 gives unification, and that everything
 downstream (schemes, dictionaries, the evaluator) sees a family only after it
 has reduced.
@@ -157,19 +157,19 @@ def test_a_family_over_an_open_type_survives_into_the_scheme():
 
 def test_a_scheme_may_be_constrained_on_a_family():
     src = CONTAINER + """
-    class Show a {
-        fun show(a) -> String
+    class Display a {
+        fun display(a) -> String
     }
 
-    instance Show Int {
-        fun show(n) = Int.toString(n)
+    instance Display Int {
+        fun display(n) = Int.toString(n)
     }
 
-    fun render[Container c, Show (Elem c)](xs : c) -> String = show(first(xs))
+    fun render[Container c, Display (Elem c)](xs : c) -> String = display(first(xs))
     """
-    # The whole point of families over a second class parameter: `Show` is
+    # The whole point of families over a second class parameter: `Display` is
     # demanded of a type the signature never names.
-    assert scheme(src, "render") == "[Container a, Show (Elem a)] fun(a) -> String"
+    assert scheme(src, "render") == "[Container a, Display (Elem a)] fun(a) -> String"
 
 
 def test_an_equation_over_an_open_family_waits_rather_than_failing():
@@ -240,19 +240,19 @@ def test_two_of_the_same_family_application_unify():
 
 def test_the_element_type_dispatches_the_method_called_on_it(capsys):
     src = CONTAINER + """
-    class Show a {
-        fun show(a) -> String
+    class Display a {
+        fun display(a) -> String
     }
 
-    instance Show Int {
-        fun show(n) = Int.toString(n)
+    instance Display Int {
+        fun display(n) = Int.toString(n)
     }
 
-    instance Show Bool {
-        fun show(b) = if b { "yes" } else { "no" }
+    instance Display Bool {
+        fun display(b) = if b { "yes" } else { "no" }
     }
 
-    fun render[Container c, Show (Elem c)](xs : c) -> String = show(first(xs))
+    fun render[Container c, Display (Elem c)](xs : c) -> String = display(first(xs))
 
     fun main() {
         print(render([7]))

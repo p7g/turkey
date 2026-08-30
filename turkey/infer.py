@@ -38,7 +38,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import TypeVar
 
-from . import ast
+from . import ast, prelude
 from .classes import ClassTable, MethodInfo, Skolems
 from .constraints import (
     HAS_FIELD, ONE_OF, Binding, CAnd, CAssume, CDef, CEq, CExists, CInstance,
@@ -50,8 +50,8 @@ from .evidence import Abstraction, InstancePlan, MethodImpl, Use, dict_name
 from .errors import Span, TypeError_
 from .types import (
     BOOL, BOTTOM, CHAR, FLOAT, INT, STRING, UNIT, Pred, TBottom, TFun, TLabel,
-    TSet, TTuple, TVar, Type, array_of, float_literal_set, int_literal_set,
-    show, vars_of,
+    TSet, TTuple, TVar, Type, apply, array_of, float_literal_set,
+    int_literal_set, show, vars_of,
 )
 
 LITERAL_TYPES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR, "Bool": BOOL}
@@ -848,19 +848,23 @@ class Generator:
         return UNIT
 
     def _gen_EForIn(self, e: ast.EForIn) -> Type:
-        """`for x in xs` is `Iterator xs`, and `x` is `Item xs` (M8).
+        """`for x in xs` walks a cursor, and `x` is `Item xs` (M8, amended).
 
-        The two methods are generated as ordinary uses, so the loop demands the
-        class the same way any call does and elaboration hands it a dictionary
-        with no case of its own. The element type is a family application, and
-        is left to reduce like every other one.
+        `iter` makes the cursor and `next` advances it; both are generated as
+        ordinary uses, so the loop demands `Iterator` the same way any call
+        does and elaboration hands it a dictionary with no case of its own.
+        Both the cursor and the element are family applications, and are left
+        to reduce like every other one.
         """
         sequence = self.gen_expr(e.iterable)
+        cursor = self.fresh()
         element = self.fresh()
         where = "the sequence of a 'for ... in' loop"
-        self.eq(self.gen_expr(e.count_fn), TFun([sequence], INT), e.iterable.span, where)
+        self.eq(self.gen_expr(e.iter_fn), TFun([sequence], cursor),
+                e.iterable.span, where)
         self.eq(
-            self.gen_expr(e.nth_fn), TFun([sequence, INT], element),
+            self.gen_expr(e.next_fn),
+            TFun([sequence, cursor], apply(self.decls.heads[prelude.OPTION], [element])),
             e.iterable.span, where,
         )
         # Section 6.5: `x` is a fresh immutable binding each iteration.

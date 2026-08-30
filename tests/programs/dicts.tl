@@ -2,7 +2,6 @@
 -- built by turkey/evidence.py. `classes.tl` beside this one checks the same
 -- declarations without running any of them.
 
-type Option a = None | Some(a)
 
 fun identity(x) = x
 

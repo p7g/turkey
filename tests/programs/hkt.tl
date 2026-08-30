@@ -2,7 +2,6 @@
 -- which nothing in the source says: it is discovered from `f a` in the body,
 -- and every use of `Wrap` then has to supply a constructor rather than a type.
 
-type Option a = None | Some(a)
 
 type Wrap f a = Wrap(f a)
 

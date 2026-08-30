@@ -389,21 +389,28 @@ for x in seq { body }
 desugars to:
 ```
 {
-    var __i = 0
-    while __i < count(seq) {
-        let x = nth(seq, __i)
-        body
-        __i = __i + 1
+    let __c = iter(seq)
+    loop {
+        match next(seq, __c) {
+            None -> break
+            Some(x) -> body
+        }
     }
 }
 ```
 
-`count` and `nth` are the methods of the `Iterator` class (§8.2), so the loop
+`iter` and `next` are the methods of the `Iterator` class (§8.2), so the loop
 runs on anything with an instance and `x` has the type the associated family
 `Item seq` reduces to. `Array` is the instance the language ships; it is no
-longer the only sequence a `for` can walk. Iteration is indexed rather than
-cursor-based because a cursor's `next` wants an `Option`, which v0 does not
-have.
+longer the only sequence a `for` can walk.
+
+Iteration is **cursor-based**: `iter` makes the mutable state that walks the
+container and `next` advances it, ending the loop by answering `None`. Nothing
+asks the container how long it is, which is what lets a linked list, a stream
+or a generator be iterated at all -- an indexed protocol can only describe
+containers that can produce their *k*th element, and would make a loop over a
+list quadratic. `Cursor seq` is a second associated family, so the state a
+container walks with is computed from the container, like its element type.
 
 `x` is an immutable `let` binding, fresh each iteration. If the element type is a mutable reference type, `x` is a reference to the object stored in the array; mutations via `x.field = e` affect the array's contents. If the element type is immutable, `x` is the value.
 
@@ -514,7 +521,15 @@ The classes that ship, and their instances:
 | `Add` `Sub` `Mul` `Div` | | `Int` `Float` |
 | `Rem` | `rem` | `Int` |
 | `Neg` | `neg` | `Int` `Float` |
-| `Iterator` | `count`, `nth`, and the family `Item` | `Array a` |
+| `Show` | `show` | `Int` `Float` `String` `Char` `Bool`, and `Array a` / `Option a` given `Show a` |
+| `Iterator` | `iter`, `next`, and the families `Item` and `Cursor` | `Array a` |
+
+`print` and `write` are not builtins. Both are `[Show a] fun(a) -> Unit`,
+written in the prelude as `Prim.print(show(x))`, and `Prim.print` is the only
+thing that reaches stdout and is reachable from nowhere else. So the only way
+to print a value is to say what it looks like as a `String`.
+
+`Option a` is declared in the prelude, because `Iterator.next` needs it.
 
 `String.eq`, `String.lt`, `Bool.eq`, `Float.lt` and `Char.eq` are gone: they
 were the per-type equality this section promised would be "unified under

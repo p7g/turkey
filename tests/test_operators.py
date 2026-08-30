@@ -186,12 +186,21 @@ def test_a_user_iterator_runs(capsys):
     src = """
 type Two a = Two(a, a)
 
+type TwoCursor = TwoCursor { taken : Int }
+
 instance Iterator (Two a) {
     type Item = a
+    type Cursor = TwoCursor
 
-    fun count(p) = 2
-    fun nth(p, k) = match p {
-        Two(x, y) -> if k == 0 { x } else { y }
+    fun iter(p) = TwoCursor { taken = 0 }
+
+    fun next(p, cur) {
+        let k = cur.taken
+        cur.taken = k + 1
+        if k >= 2 { return None }
+        match p {
+            Two(x, y) -> if k == 0 { Some(x) } else { Some(y) }
+        }
     }
 }
 

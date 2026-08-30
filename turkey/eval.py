@@ -11,7 +11,7 @@ binding a name to one aliases it.
 
 from __future__ import annotations
 
-from . import ast
+from . import ast, prelude
 from .decls import DeclTable
 from .deps import pattern_vars
 from .errors import TurkeyPanic
@@ -382,20 +382,24 @@ class Evaluator:
         return UNIT
 
     def _eval_EForIn(self, e, env):
-        # Section 6.5, with one correction: `continue` still advances the index.
-        # Desugaring literally to a `while` would make `continue` spin forever.
+        # Section 6.5, with one correction: `continue` still advances the
+        # cursor. Desugaring literally to a `while` would make it spin forever.
         #
         # The sequence is reached through its `Iterator` dictionary rather than
         # assumed to be an array (M8), so the two methods are evaluated once,
-        # outside the loop, exactly as a hand-written desugaring would.
+        # outside the loop, exactly as a hand-written desugaring would. The one
+        # thing the loop knows about a value is which of `Option`'s two
+        # constructors ends it (`turkey/prelude.py`).
         sequence = self.eval(e.iterable, env)
-        count = self._eval_EVar(e.count_fn, env)
-        nth = self._eval_EVar(e.nth_fn, env)
-        index = 0
-        total = self.call(count, [sequence], e.span)
-        while index < total:
+        make = self._eval_EVar(e.iter_fn, env)
+        advance = self._eval_EVar(e.next_fn, env)
+        cursor = self.call(make, [sequence], e.span)
+        while True:
+            step = self.call(advance, [sequence, cursor], e.span)
+            if step.con == prelude.OPTION_NONE:
+                break
             scope = env.child()
-            bindings = match_pattern(e.pat, self.call(nth, [sequence, index], e.span))
+            bindings = match_pattern(e.pat, step.args[0])
             if bindings is None:
                 raise TurkeyPanic("loop pattern does not match an element")
             for name, bound in bindings.items():
@@ -406,7 +410,6 @@ class Evaluator:
                 pass
             except BreakSignal:
                 break
-            index += 1
         return UNIT
 
     def _eval_EForC(self, e, env):

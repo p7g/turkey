@@ -31,7 +31,11 @@ fun biggest(xs) {
     best
 }
 
-fun show(m : Money) -> String = Int.toString(m.cents) ++ "c"
+-- `print` is `Prim.print(show(x))`, so a type that says how it looks is a
+-- type that can be printed.
+instance Show Money {
+    fun show(m) = Int.toString(m.cents) ++ "c"
+}
 
 fun main() {
     print(Int.toString(7 / 2) ++ " " ++ Int.toString(-7 / 2))
@@ -42,10 +46,10 @@ fun main() {
 
     print(Int.toString(sum3(1, 2, 3)))
     print(Float.toString(sum3(0.5, 0.25, 0.25)))
-    print(show(sum3(Money { cents = 1 }, Money { cents = 2 }, Money { cents = 3 })))
+    print(sum3(Money { cents = 1 }, Money { cents = 2 }, Money { cents = 3 }))
 
-    print(show(-Money { cents = 5 }))
+    print(-Money { cents = 5 })
     print(Bool.toString(Money { cents = 1 } < Money { cents = 2 }))
-    print(show(biggest([Money { cents = 3 }, Money { cents = 9 }, Money { cents = 4 }])))
+    print(biggest([Money { cents = 3 }, Money { cents = 9 }, Money { cents = 4 }]))
     print(Int.toString(biggest([3, 9, 4])))
 }

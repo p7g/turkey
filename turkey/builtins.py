@@ -9,9 +9,9 @@ Two environments come out of here, not one. `_CORE` is the surface language:
 what a program may name. `_PRIM` is the machine underneath it -- integer
 addition, the comparison that reads one string against another -- and is in
 scope only while `turkey/prelude.py` is being checked, because every one of
-those operations now has a name in the surface language already, and it is an
-operator. `Prim.intAdd` is what `instance Add Int` is written in terms of, and
-nothing else is entitled to say it.
+those operations now has a name in the surface language already -- an operator,
+or `print`. `Prim.intAdd` is what `instance Add Int` is written in terms of and
+`Prim.print` is what `print` is, and nothing else is entitled to say either.
 """
 
 from __future__ import annotations
@@ -125,8 +125,8 @@ _CORE: dict[str, tuple] = {
     ),
     "Char.toInt": (mono(TFun([CHAR], INT)), _bi("Char.toInt", 1, lambda c: ord(c))),
 
-    # Conversions and output. design.md has no I/O; a prototype that cannot
-    # print cannot be tested, so these are an addition (SPEC-DELTAS.md).
+    # Conversions. The `Show` instances are written in terms of these, and a
+    # program may still call them directly (SPEC-DELTAS.md entry 22).
     "Int.toString": (mono(TFun([INT], STRING)), _bi("Int.toString", 1, lambda n: str(n))),
     "Float.toString": (
         mono(TFun([FLOAT], STRING)), _bi("Float.toString", 1, lambda x: repr(x)),
@@ -138,8 +138,6 @@ _CORE: dict[str, tuple] = {
     "Char.toString": (
         mono(TFun([CHAR], STRING)), _bi("Char.toString", 1, _char_to_string),
     ),
-    "print": (mono(TFun([STRING], UNIT)), _bi("print", 1, _print)),
-    "write": (mono(TFun([STRING], UNIT)), _bi("write", 1, _write)),
 }
 
 def _num(name, ty, fn):
@@ -156,6 +154,11 @@ def _cmp(name, ty, fn):
 # *values* are in `initial_values()` regardless, because an instance method
 # elaborated against the prelude's environment still has to run.
 _PRIM: dict[str, tuple] = {
+    # Output. `print` and `write` themselves are prelude functions now, one
+    # `show` away (`turkey/prelude.py`); these are the two writes underneath.
+    "Prim.print": (mono(TFun([STRING], UNIT)), _bi("Prim.print", 1, _print)),
+    "Prim.write": (mono(TFun([STRING], UNIT)), _bi("Prim.write", 1, _write)),
+
     "Prim.intAdd": _num("Prim.intAdd", INT, lambda a, b: a + b),
     "Prim.intSub": _num("Prim.intSub", INT, lambda a, b: a - b),
     "Prim.intMul": _num("Prim.intMul", INT, lambda a, b: a * b),

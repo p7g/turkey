@@ -1,6 +1,6 @@
 """Dictionary passing: the evidence, and the programs it makes run.
 
-`dicts.tl` is the golden that runs; this file is what a golden cannot show --
+`dicts.tl` is the golden that runs; this file is what a golden cannot display --
 the *shape* of the evidence that produced the output. The two questions are
 separate on purpose: whether a program prints the right thing, and whether it
 got there by selecting a superclass rather than by passing a second dictionary.
@@ -18,23 +18,23 @@ from turkey.errors import TurkeyError
 from turkey.evidence import FromDict, FromInstance
 
 SHOW = """
-class Show a {
-    fun show(a) -> String
+class Display a {
+    fun display(a) -> String
 }
 
-instance Show Int {
-    fun show(n) = Int.toString(n)
+instance Display Int {
+    fun display(n) = Int.toString(n)
 }
 
-instance Show Bool {
-    fun show(b) = if b { "true" } else { "false" }
+instance Display Bool {
+    fun display(b) = if b { "true" } else { "false" }
 }
 
-instance [Show a] Show (Array a) {
-    fun show(xs) {
+instance [Display a] Display (Array a) {
+    fun display(xs) {
         var s = ""
         for x in xs {
-            s = s ++ show(x)
+            s = s ++ display(x)
         }
         return s
     }
@@ -115,8 +115,8 @@ def params_of(checked, name: str) -> list[str]:
 
 
 def test_a_known_type_resolves_to_its_instance():
-    checked = check(SHOW + "fun main() { print(show(1)) }")
-    (evidence,) = uses(checked, "main")["show"][0].evidence
+    checked = check(SHOW + "fun main() { print(display(1)) }")
+    (evidence,) = uses(checked, "main")["display"][0].evidence
     assert isinstance(evidence, FromInstance)
     assert evidence.inst.con == "Int"
     assert evidence.args == []
@@ -126,10 +126,10 @@ def test_an_unknown_type_resolves_to_the_dictionary_in_scope():
     """Inside a constrained function the evidence is a *parameter*, not a choice.
 
     This is the whole reason resolution waits for solving: at generation time
-    `show(x)` looks exactly the same either way.
+    `display(x)` looks exactly the same either way.
     """
-    checked = check(SHOW + "fun twice[Show a](x : a) -> String = show(x) ++ show(x)")
-    first, second = uses(checked, "twice")["show"]
+    checked = check(SHOW + "fun twice[Display a](x : a) -> String = display(x) ++ display(x)")
+    first, second = uses(checked, "twice")["display"]
     assert isinstance(first.evidence[0], FromDict)
     # Both occurrences take the same dictionary, and it is the one the
     # declaration abstracted over.
@@ -138,8 +138,8 @@ def test_an_unknown_type_resolves_to_the_dictionary_in_scope():
 
 
 def test_an_instance_context_is_applied_to_the_dictionary_it_needs():
-    checked = check(SHOW + "fun main() { print(show([1, 2])) }")
-    (evidence,) = uses(checked, "main")["show"][0].evidence
+    checked = check(SHOW + "fun main() { print(display([1, 2])) }")
+    (evidence,) = uses(checked, "main")["display"][0].evidence
     assert isinstance(evidence, FromInstance)
     assert evidence.inst.con == "Array"
     (arg,) = evidence.args
@@ -147,8 +147,8 @@ def test_an_instance_context_is_applied_to_the_dictionary_it_needs():
 
 
 def test_a_nested_instance_nests_its_evidence():
-    checked = check(SHOW + "fun main() { print(show([[1], [2]])) }")
-    (outer,) = uses(checked, "main")["show"][0].evidence
+    checked = check(SHOW + "fun main() { print(display([[1], [2]])) }")
+    (outer,) = uses(checked, "main")["display"][0].evidence
     (middle,) = outer.args
     (inner,) = middle.args
     assert [e.inst.con for e in (outer, middle, inner)] == ["Array", "Array", "Int"]
@@ -183,9 +183,9 @@ def test_only_class_predicates_become_parameters():
 
 def test_a_function_gains_one_parameter_per_retained_predicate():
     src = SHOW + ORD + """
-fun both[Show a, Rank a](x : a, y : a) -> String {
-    if underEq(x, y) { return show(x) }
-    return show(y)
+fun both[Display a, Rank a](x : a, y : a) -> String {
+    if underEq(x, y) { return display(x) }
+    return display(y)
 }
 """
     assert len(params_of(check(src), "both")) == 2
@@ -204,7 +204,7 @@ def test_a_mutually_recursive_group_shares_its_context():
     """
     src = SHOW + """
 fun even(x, n : Int) {
-    if n == 0 { return show(x) }
+    if n == 0 { return display(x) }
     return odd(x, n - 1)
 }
 
@@ -221,8 +221,8 @@ fun odd(x, n) = even(x, n - 1)
 def test_two_instances_of_one_class_dispatch_apart(capsys):
     src = SHOW + """
 fun main() {
-    print(show(1))
-    print(show(true))
+    print(display(1))
+    print(display(true))
 }
 """
     assert output(src, capsys) == ["1", "true"]
@@ -249,7 +249,10 @@ instance Default String {
 
 fun main() {
     print(Int.toString(default()))
-    print(default())
+    -- `print` is itself constrained now, so the result type has to be said
+    -- somewhere; the point is that nothing at the call site says it.
+    let s : String = default()
+    print(s)
 }
 """
     assert output(src, capsys) == ["7", "-"]
@@ -283,14 +286,14 @@ def test_a_method_with_its_own_context_takes_it_per_call(capsys):
     """`foldMap[Monoid m]`: the class dictionary is selected, `Monoid m` passed."""
     src = SHOW + """
 class Foldable t {
-    fun each[Show a](t a) -> String
+    fun each[Display a](t a) -> String
 }
 
 instance Foldable Array {
     fun each(xs) {
         var s = ""
         for x in xs {
-            s = s ++ show(x)
+            s = s ++ display(x)
         }
         return s
     }
@@ -305,7 +308,7 @@ fun main() {
 
 
 def test_a_recursive_type_does_not_build_dictionaries_forever(capsys):
-    """`Show (Array Rose)` needs `Show Rose`, which needs it back.
+    """`Display (Array Rose)` needs `Display Rose`, which needs it back.
 
     The dictionary is registered before its methods are built, so the cycle
     closes on the object already under construction instead of descending
@@ -314,15 +317,15 @@ def test_a_recursive_type_does_not_build_dictionaries_forever(capsys):
     src = SHOW + """
 type Rose = Leaf(Int) | Node(Array Rose)
 
-instance Show Rose {
-    fun show(t) = match t {
-        Leaf(n) -> show(n)
-        Node(kids) -> "(" ++ show(kids) ++ ")"
+instance Display Rose {
+    fun display(t) = match t {
+        Leaf(n) -> display(n)
+        Node(kids) -> "(" ++ display(kids) ++ ")"
     }
 }
 
 fun main() {
-    print(show(Node([Leaf(1), Node([Leaf(2)]), Leaf(3)])))
+    print(display(Node([Leaf(1), Node([Leaf(2)]), Leaf(3)])))
 }
 """
     assert output(src, capsys) == ["(1(2)3)"]
@@ -332,7 +335,7 @@ def test_a_let_bound_to_a_method_takes_its_dictionary(capsys):
     """The dictionaries have to arrive before there is a function at all."""
     src = SHOW + """
 fun main() {
-    let s = show
+    let s = display
     print(s(1))
     print(s(true))
 }
@@ -342,8 +345,8 @@ fun main() {
 
 def test_a_local_function_may_have_its_own_context(capsys):
     src = SHOW + """
-fun outer[Show a](x : a) -> String {
-    fun inner(y) = show(y) ++ show(y)
+fun outer[Display a](x : a) -> String {
+    fun inner(y) = display(y) ++ display(y)
     return inner(x)
 }
 
@@ -389,6 +392,6 @@ def test_a_missing_instance_is_still_reported_before_any_of_this():
     The two would otherwise disagree about which one speaks, and the message
     that names the type is the one worth keeping.
     """
-    assert "no instance for 'Show Char'" in fails(
-        SHOW + "fun main() { print(show('c')) }"
+    assert "no instance for 'Display Char'" in fails(
+        SHOW + "fun main() { print(display('c')) }"
     )

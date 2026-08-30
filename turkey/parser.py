@@ -829,8 +829,8 @@ class Parser:
                 body = self.parse_block()
                 return ast.EForIn(
                     span, pat, iterable, body,
-                    ast.EVar(iterable.span, prelude.ITER_COUNT),
-                    ast.EVar(iterable.span, prelude.ITER_NTH),
+                    ast.EVar(iterable.span, prelude.ITER_ITER),
+                    ast.EVar(iterable.span, prelude.ITER_NEXT),
                 )
         except ParseError:
             pass

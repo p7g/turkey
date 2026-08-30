@@ -144,7 +144,6 @@ def test_a_higher_kinded_variable_survives_generalization() -> None:
     """`Wrap a b` in a signature means the `a` was quantified at kind `* -> *`;
     if instantiation dropped the kind, the second use below would not unify."""
     result = check("""
-        type Option a = None | Some(a)
         type Wrap f a = Wrap(f a)
         fun unwrap(w) = match w { Wrap(inner) -> inner }
         fun main() {

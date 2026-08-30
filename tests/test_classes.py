@@ -18,7 +18,6 @@ from turkey.parser import parse
 from turkey.types import show_kind, show_scheme
 
 PRELUDE = """
-type Option a = None | Some(a)
 type Either l r = Left(l) | Right(r)
 """
 
@@ -265,10 +264,10 @@ def test_an_instance_must_define_every_method_that_has_no_default():
 
 def test_an_instance_may_not_define_a_method_of_another_class():
     src = EQ + """
-    class Show a { fun show(a) -> String }
-    instance Show Int { fun egal(x, y) = true }
+    class Display a { fun display(a) -> String }
+    instance Display Int { fun egal(x, y) = true }
     """
-    assert bad(src) == "'egal' is not a method of class 'Show'"
+    assert bad(src) == "'egal' is not a method of class 'Display'"
 
 
 def test_an_instance_method_states_no_signature():

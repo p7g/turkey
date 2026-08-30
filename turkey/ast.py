@@ -246,8 +246,8 @@ class EForIn(Expr):
     # The two `Iterator` methods the loop runs on, as ordinary uses, so that
     # solving demands `Iterator` of the sequence and elaboration hands the loop
     # its dictionary without the loop being a special case anywhere (M8).
-    count_fn: EVar | None = None
-    nth_fn: EVar | None = None
+    iter_fn: EVar | None = None
+    next_fn: EVar | None = None
 
 
 @dataclass(eq=False)

@@ -2,7 +2,6 @@
 -- dictionary to resolve it, so `main` stays out of the way and the point of
 -- this program is `classes.types` beside it.
 
-type Option a = None | Some(a)
 
 type Either l r = Left(l) | Right(r)
 

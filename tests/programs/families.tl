@@ -3,18 +3,6 @@
 -- element type is a *function* of the container, not a second parameter that
 -- would need a functional dependency to pin down.
 
-class Show a {
-    fun show(a) -> String
-}
-
-instance Show Int {
-    fun show(n) = Int.toString(n)
-}
-
-instance Show Bool {
-    fun show(b) = if b { "true" } else { "false" }
-}
-
 class Container c {
     type Elem c
 

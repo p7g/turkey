@@ -1,7 +1,7 @@
 -- Exhaustiveness warnings (design.md section 5.1). A missing case is a warning;
 -- reaching one at run time is a panic.
+-- `Option`, matched on below, comes from the prelude.
 
-type Option a = None | Some(a)
 type Color = Red | Green | Blue
 
 -- Exhaustive: every constructor is covered.

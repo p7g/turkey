@@ -1,4 +1,3 @@
-type Option a = None | Some(a)
 type Tree a = Leaf | Node(Tree a, a, Tree a)
 type Counter = Counter { n : Int }
 

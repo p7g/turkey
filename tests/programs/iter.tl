@@ -1,23 +1,64 @@
--- `for x in xs` is `Iterator`, and the loop variable's type is the family
--- `Item xs`. `Array` is an instance like any other, not a special case.
+-- `for x in xs` is `Iterator`: `iter` makes a cursor and `next` advances it,
+-- answering `Option (Item xs)`. Both the element type and the cursor type are
+-- associated families, so the loop variable's type is computed from the
+-- container and nobody has to write it down.
+--
+-- The linked list below is why iteration is cursor-based rather than indexed:
+-- it has no kth element to hand out, and under an indexed protocol a loop over
+-- it would be quadratic. `Array` is one instance among these, not a special
+-- case.
 
 type Range = Range { from : Int, to : Int }
+type RangeCursor = RangeCursor { at : Int }
 
 instance Iterator Range {
     type Item = Int
+    type Cursor = RangeCursor
 
-    fun count(r) = r.to - r.from
-    fun nth(r, k) = r.from + k
+    fun iter(r) = RangeCursor { at = r.from }
+
+    fun next(r, cur) {
+        if cur.at >= r.to { return None }
+        let x = cur.at
+        cur.at = cur.at + 1
+        Some(x)
+    }
+}
+
+type List a = Nil | Cons(a, List a)
+type ListCursor a = ListCursor { rest : List a }
+
+instance Iterator (List a) {
+    type Item = a
+    type Cursor = ListCursor a
+
+    fun iter(xs) = ListCursor { rest = xs }
+
+    fun next(xs, cur) = match cur.rest {
+        Nil -> None
+        Cons(h, t) -> {
+            cur.rest = t
+            Some(h)
+        }
+    }
 }
 
 type Pair a = Pair(a, a)
+type PairCursor = PairCursor { taken : Int }
 
 instance Iterator (Pair a) {
     type Item = a
+    type Cursor = PairCursor
 
-    fun count(p) = 2
-    fun nth(p, k) = match p {
-        Pair(x, y) -> if k == 0 { x } else { y }
+    fun iter(p) = PairCursor { taken = 0 }
+
+    fun next(p, cur) {
+        let k = cur.taken
+        cur.taken = k + 1
+        if k >= 2 { return None }
+        match p {
+            Pair(x, y) -> if k == 0 { Some(x) } else { Some(y) }
+        }
     }
 }
 
@@ -41,15 +82,20 @@ fun join(xs : Array String) -> String {
 }
 
 -- The class is ordinary, so its methods are callable by name.
-fun second(p : Pair a) -> a = nth(p, 1)
+fun firstOf(xs) {
+    let cur = iter(xs)
+    next(xs, cur)
+}
 
 fun main() {
-    print(Int.toString(total([1, 2, 3, 4])))
-    print(Int.toString(total(Range { from = 10, to = 15 })))
-    print(Int.toString(total(Pair(20, 22))))
+    print(total([1, 2, 3, 4]))
+    print(total(Range { from = 10, to = 15 }))
+    print(total(Pair(20, 22)))
+    print(total(Cons(1, Cons(2, Cons(39, Nil)))))
     print(join(["x", "y", "z"]))
-    print(second(Pair("a", "b")))
-    print(Int.toString(count(Range { from = 3, to = 9 })))
+    print(firstOf(Pair("a", "b")))
+    let empty : List Int = Nil
+    print(firstOf(empty))
 
     -- `continue` still advances, and `break` leaves early.
     var seen = 0
@@ -59,5 +105,5 @@ fun main() {
         if i > 6 { break }
         seen = seen + i
     }
-    print(Int.toString(seen))
+    print(seen)
 }

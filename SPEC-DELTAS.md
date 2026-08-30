@@ -316,11 +316,12 @@ recursive.
 `design.md` never says how a program starts. After the top-level bindings are
 evaluated, a zero-argument `main`, if one is defined, is called.
 
-### 22. Output and conversion primitives
+### 22. Output and conversion primitives — **amended at delta 33**
 
 §8.4 sketches `Data.Int`, `Data.String` and `Data.Bool` without contents, and
 `design.md` has no I/O at all — but a prototype that cannot print cannot be
-tested. The initial environment adds `print : fun(String) -> Unit`,
+tested. The initial environment adds `print : fun(String) -> Unit`
+(`[Show a] fun(a) -> Unit` since delta 33),
 `Int.toString`, `Float.toString`, `Bool.toString`, `Char.toString`,
 `String.eq`, `String.lt`, `String.length`, `Bool.eq`, `Char.eq` and
 `Float.lt`. The last few are the named comparison functions §8.2 promises for
@@ -796,15 +797,15 @@ for it and no `.expected` did: `bf.tl`'s `inc` and `fields.tl`'s `bump` are
 polymorphic in the numeric type they increment.
 
 **`for x in xs` runs on a class.** `Iterator i` declares the associated family
-`Item i` (delta 31) together with `count` and `nth`, and the loop is a call to
-each; the loop variable's type is `Item xs`, left to reduce like any other
-family application. `Array` is the instance that ships, and it is no longer the
-only sequence a `for` can walk -- `tests/programs/iter.tl` walks a `Range`
-record and a `Pair`. Iteration is indexed rather than cursor-based because a
-cursor's `next` wants an `Option`, and v0 has no such type; `count`/`nth` is
-what the language can say today. The cost is on the other side: a `String` is
-not an `Iterator`, so `for c in s` is a missing instance and the characters are
-still reached through `String.chars`.
+`Item i` (delta 31), and the loop is a call to its methods; the loop variable's
+type is `Item xs`, left to reduce like any other family application. `Array` is
+the instance that ships, and it is no longer the only sequence a `for` can walk
+-- `tests/programs/iter.tl` walks a `Range` record, a linked list and a `Pair`.
+The cost is on the other side: a `String` is not an `Iterator`, so `for c in s`
+is a missing instance and the characters are still reached through
+`String.chars`. **Amended at delta 33:** the methods were `count` and `nth`,
+because a cursor's `next` wants an `Option` and v0 had no such type. Delta 33
+declares `Option` and makes the protocol a cursor.
 
 **The classes are ordinary source.** They live in `turkey/prelude.py` as a
 turkey program, and it is *checked* rather than trusted -- through the same
@@ -814,7 +815,8 @@ privileged is not the classes but a small set of machine operations,
 checked and nowhere else; `Prim.intAdd` in a program is an undefined name. The
 prelude declares no top-level binding, only classes and instances, so there is
 nothing for the evaluator to run before the program: a dictionary is built from
-its instance's plan on demand, as any other is.
+its instance's plan on demand, as any other is. (**Amended at delta 33:** it
+now declares two, `print` and `write`.)
 
 One latent bug in delta 30 surfaced here and is fixed. A call from one member
 of a binding group to another -- or to itself -- is solved against the
@@ -823,3 +825,67 @@ it was handed the undischarged binding rather than a function. No golden had a
 mutually recursive group with a class context until `adt.tl`'s `isEven`/`isOdd`
 acquired one from `==` and `-`. Such a use now takes the group's own
 dictionaries, which is what the group's context always meant.
+
+### 33. `Show`, `Option`, and iteration as a cursor
+
+Three changes with one cause: delta 32 left `print` taking a `String` and left
+`for` walking an index, and both were compromises made for a missing type.
+
+**`Option a` is declared in the prelude.** It is `None | Some(a)`, the same
+type four test programs had each been declaring for themselves, and it is
+there because `Iterator.next` needs it. A program that declares its own is now
+told the type is declared more than once.
+
+**Iteration is cursor-based.** `Iterator c` declares two families and two
+methods:
+
+```
+class Iterator c {
+    type Item c
+    type Cursor c
+
+    fun iter(c) -> Cursor c
+    fun next(c, Cursor c) -> Option (Item c)
+}
+```
+
+`iter` makes the mutable state that walks the container; `next` advances it and
+ends the loop by answering `None`. Nothing asks the container how long it is.
+That is the point: an indexed protocol can only describe containers that can
+produce their *k*th element, so a linked list, a stream, a generator or a
+file's lines could not be iterated at all, and a loop over a list that somehow
+could would be quadratic. `tests/programs/iter.tl` now walks a linked list for
+exactly this reason, and `tests/test_prelude.py` iterates a source with no end.
+
+The cursor is a second associated family rather than a second class parameter,
+and the container is passed to `next` alongside it rather than split across an
+`Iterable`/`Iterator` pair as Rust does. The pair would need `Iterator (Iter c)`
+as a superclass over its own family application; one class with two families
+says the same thing and asks nothing new of delta 29's machinery.
+
+**`print` is an ordinary function over `Show`.** `class Show a { fun show(a)
+-> String }` ships with instances for the five primitives, and for `Array a`
+and `Option a` given `Show a`. `print` and `write` are no longer builtins:
+
+```
+fun print(x) = Prim.print(show(x))
+fun write(x) = Prim.write(show(x))
+```
+
+Both infer `[Show a] fun(a) -> Unit`. `Prim.print` and `Prim.write` are the
+only things that reach stdout and are reachable only from the prelude, so the
+one way to print a value is to say what it looks like as a `String` -- which
+is what §8.2's `Show` was for. `print(Int.toString(n))` still works and every
+golden's output is unchanged; `print(n)` now also does.
+
+One consequence is worth stating: because `print` is constrained, it no longer
+pins its argument's type. `print(default())`, where `default` is a method known
+only by its result type, was previously resolved by `print` demanding a
+`String` and is now correctly ambiguous.
+
+**What this cost the prelude's seam.** Delta 32 could say the prelude declared
+no top-level binding. It declares two now, so `driver.prelude` returns them
+alongside the declaration and class tables, and the evaluator runs the
+prelude's statements before the program's. Exported are exactly the names the
+prelude's own statements bind -- which is how `print` crosses the seam and
+`Prim.print` does not.

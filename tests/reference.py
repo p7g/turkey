@@ -13,12 +13,13 @@ generalization by *scanning the environment* for free variables instead of
 scanning it. `fv(env)` is the definition ranks are an optimization of, so if
 the two disagree the rank bookkeeping is wrong.
 
-It also carries the `HasField` predicate, the second constraint form in the
-domain, and settles it the same obvious way: a flat list retried until nothing
-more can be discharged, with a predicate travelling into a scheme only when the
+It also carries the domain's predicates -- `HasField` and `OneOf` -- and
+settles them the same obvious way: a flat list retried until nothing more can
+be discharged, with a predicate travelling into a scheme only when the
 environment holds none of its variables. That last test is the naive reading of
 the real checker's `pred.level() > level`, which is precisely the seam this
-module exists to check.
+module exists to check, and it is deliberately payload-blind: a `OneOf` from a
+numeric literal generalizes by the same rule a `HasField` does.
 
 It covers only the fragment `tests/test_infer_reference.py` generates -- no
 bottom, no loops, no polymorphic records, no annotations -- and raises
@@ -35,10 +36,11 @@ from dataclasses import dataclass, field
 
 from turkey import ast
 from turkey.parser import parse
-from turkey.constraints import CPred, reach
+from turkey.constraints import HAS_FIELD, ONE_OF, CPred, reach
 from turkey.types import (
-    BOOL, CHAR, FLOAT, INT, STRING, Pred, Scheme, TCon, TFun, TLabel, TTuple,
-    TVar, Type, type_key, vars_of,
+    BOOL, CHAR, FLOAT, INT, STRING, Pred, Scheme, TCon, TFun, TLabel, TSet,
+    TTuple, TVar, Type, float_literal_set, int_literal_set, numeric_order,
+    numeric_type, type_key, vars_of,
 )
 
 LITERALS = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR, "Bool": BOOL}
@@ -47,18 +49,9 @@ Subst = dict[int, Type]
 Env = dict[str, Scheme]
 
 
-@dataclass
-class RefPred:
-    """`HasField label receiver result`, in the shape this module works with."""
-
-    label: str
-    receiver: Type
-    result: Type
-
-    def to_pred(self, s: Subst) -> Pred:
-        return Pred("HasField", [TLabel(self.label),
-                                 substitute(self.receiver, s),
-                                 substitute(self.result, s)])
+def sub_pred(p: Pred, s: Subst) -> Pred:
+    """The predicate with the substitution applied to its arguments."""
+    return Pred(p.name, [substitute(a, s) for a in p.args])
 
 
 @dataclass
@@ -70,7 +63,7 @@ class State:
     """
 
     subst: Subst = field(default_factory=dict)
-    preds: list[RefPred] = field(default_factory=list)
+    preds: list[Pred] = field(default_factory=list)
     records: dict[str, dict[str, Type]] = field(default_factory=dict)
 
 
@@ -167,8 +160,8 @@ def free_in_env(env: Env, s: Subst) -> set[int]:
     return out
 
 
-def pred_vars(p: RefPred, s: Subst) -> set[int]:
-    return {v.id for v in vars_of(substitute(p.receiver, s), substitute(p.result, s))}
+def pred_vars(p: Pred, s: Subst) -> set[int]:
+    return {v.id for v in vars_of(*[substitute(a, s) for a in p.args])}
 
 
 def improve(st: State) -> None:
@@ -177,33 +170,86 @@ def improve(st: State) -> None:
     The counterpart of `Solver.improve`. Written out separately rather than
     imported, since a shared implementation would agree with itself for free.
     """
+    merged: dict[tuple, Pred] = {}
+    kept: list[Pred] = []
+    for p in st.preds:
+        if p.name != ONE_OF:
+            kept.append(p)
+            continue
+        key = type_key(substitute(p.args[0], st.subst))
+        first = merged.get(key)
+        if first is None:
+            merged[key] = p
+            kept.append(p)
+            continue
+        names = first.args[1].names & p.args[1].names
+        if not names:
+            raise RefError("no numeric type satisfies both sets")
+        first.args[1] = TSet(names)
+    st.preds = kept
+
     seen: dict[tuple, Type] = {}
     for p in st.preds:
-        key = (p.label, type_key(substitute(p.receiver, st.subst)))
+        if p.name != HAS_FIELD:
+            continue
+        label, receiver, result = p.args
+        key = (label.name, type_key(substitute(receiver, st.subst)))
         if key in seen:
-            unify(seen[key], p.result, st.subst)
+            unify(seen[key], result, st.subst)
         else:
-            seen[key] = p.result
+            seen[key] = result
 
 
-def discharge(p: RefPred, st: State) -> bool:
-    """Settle one demand, or report that its receiver is still unknown."""
-    receiver = substitute(p.receiver, st.subst)
+def discharge(p: Pred, st: State) -> bool:
+    """Settle one predicate, or report that it is still waiting on something."""
+    if p.name == ONE_OF:
+        return _discharge_one_of(p, st)
+
+    label, receiver, result = p.args
+    receiver = substitute(receiver, st.subst)
     if isinstance(receiver, TVar):
         return False
     if isinstance(receiver, TCon):
         if receiver.name == "Array":
-            if p.label not in ("length", "capacity"):
-                raise RefError(f"Array has no field {p.label}")
-            unify(p.result, INT, st.subst)
+            if label.name not in ("length", "capacity"):
+                raise RefError(f"Array has no field {label.name}")
+            unify(result, INT, st.subst)
             return True
         fields = st.records.get(receiver.name)
         if fields is not None:
-            if p.label not in fields:
-                raise RefError(f"{receiver.name} has no field {p.label}")
-            unify(p.result, fields[p.label], st.subst)
+            if label.name not in fields:
+                raise RefError(f"{receiver.name} has no field {label.name}")
+            unify(result, fields[label.name], st.subst)
             return True
-    raise RefError(f"no field {p.label} on {receiver}")
+    raise RefError(f"no field {label.name} on {receiver}")
+
+
+def _discharge_one_of(p: Pred, st: State) -> bool:
+    """A singleton set is an equation; a ground type is a membership test."""
+    t, candidates = p.args
+    names = candidates.names
+    if not names:
+        raise RefError("no numeric type can represent this literal")
+    if len(names) == 1:
+        unify(t, numeric_type(next(iter(names))), st.subst)
+        return True
+    t = substitute(t, st.subst)
+    if isinstance(t, TVar):
+        return False
+    if isinstance(t, TCon) and not t.args and t.name in names:
+        return True
+    raise RefError(f"{t} is not one of {sorted(names)}")
+
+
+def default(p: Pred, st: State) -> bool:
+    """Choose for an ambiguous `OneOf`. Nothing else has a default."""
+    if p.name != ONE_OF:
+        return False
+    choice = next((n for n in numeric_order() if n in p.args[1].names), None)
+    if choice is None:
+        return False
+    unify(p.args[0], numeric_type(choice), st.subst)
+    return True
 
 
 def settle(st: State) -> None:
@@ -232,35 +278,43 @@ def generalize(t: Type, env: Env, st: State) -> Scheme:
     nothing is stranded: no later unification can name it, so it is an error.
     """
     settle(st)
-    body = substitute(t, st.subst)
     held = free_in_env(env, st.subst)
-    quantified = [v for v in vars_of(body) if v.id not in held]
-
-    travelling = [p for p in st.preds if not (pred_vars(p, st.subst) & held)]
 
     # Attribution is *shared* with the real solver rather than reimplemented.
     # This module exists to check one thing -- generalization by scanning the
     # environment against generalization by rank -- and a second copy of a rule
     # with no independent specification would only confirm that the same thing
     # was typed twice. The transitive closure is the subtle part, so it is
-    # imported; `improve` and the declaration lookup below stay local because
-    # they are four lines each and reimplementing them costs less than the
-    # indirection would.
-    reachable = reach([CPred(p.to_pred(st.subst)) for p in travelling], [body])
+    # imported; `improve`, `discharge` and `default` stay local because they are
+    # a few lines each and reimplementing them costs less than the indirection.
+    #
+    # A predicate no scheme can carry is ambiguous, and ambiguity is what
+    # licenses defaulting -- so the split is redone until it stops moving,
+    # mirroring `Solver.split`.
+    while True:
+        body = substitute(t, st.subst)
+        travelling = [p for p in st.preds if not (pred_vars(p, st.subst) & held)]
+        reachable = reach([CPred(sub_pred(p, st.subst)) for p in travelling], [body])
+        stranded = [p for p in travelling if not (pred_vars(p, st.subst) & reachable)]
+        if not stranded:
+            break
+        if not any([default(p, st) for p in stranded]):
+            raise RefError(f"stranded predicate {stranded[0].name}")
+        settle(st)
+        held = free_in_env(env, st.subst)
 
-    mine: list[RefPred] = []
+    quantified = [v for v in vars_of(body) if v.id not in held]
+
+    mine: list[Pred] = []
     seen: set[tuple] = set()
     for p in travelling:
-        if not (pred_vars(p, st.subst) & reachable):
-            raise RefError(f"stranded demand for field {p.label}")
-        key = type_key(TTuple([TLabel(p.label), substitute(p.receiver, st.subst),
-                               substitute(p.result, st.subst)]))
+        key = sub_pred(p, st.subst).key()
         if key not in seen:
             seen.add(key)
             mine.append(p)
 
-    st.preds = [p for p in st.preds if p not in travelling]
-    preds = [p.to_pred(st.subst) for p in mine]
+    st.preds = [p for p in st.preds if not any(p is q for q in travelling)]
+    preds = [sub_pred(p, st.subst) for p in mine]
     # A demand may mention a variable the body does not, so quantify over both.
     for p in preds:
         for v in vars_of(*p.args):
@@ -273,18 +327,12 @@ def instantiate(scheme: Scheme, st: State) -> Type:
     """Instantiate at a use site, re-emitting the scheme's demands."""
     if not scheme.quantified:
         for p in scheme.preds:
-            st.preds.append(_as_ref_pred(p))
+            st.preds.append(Pred(p.name, list(p.args)))
         return scheme.body
     mapping: Subst = {v.id: TVar(0) for v in scheme.quantified}
     for p in scheme.preds:
-        st.preds.append(_as_ref_pred(Pred(p.name, [substitute(a, mapping) for a in p.args])))
+        st.preds.append(Pred(p.name, [substitute(a, mapping) for a in p.args]))
     return substitute(scheme.body, mapping)
-
-
-def _as_ref_pred(p: Pred) -> RefPred:
-    label, receiver, result = p.args
-    assert isinstance(label, TLabel)
-    return RefPred(label.name, receiver, result)
 
 
 def nonexpansive(e: ast.Expr) -> bool:
@@ -301,6 +349,13 @@ def nonexpansive(e: ast.Expr) -> bool:
 
 def infer(e: ast.Expr, env: Env, st: State) -> Type:
     if isinstance(e, ast.ELit):
+        if e.kind in ("Int", "Float"):
+            # A numeral is not a typed value: it is a set of candidates.
+            tv = TVar(0)
+            names = (int_literal_set(e.value) if e.kind == "Int"
+                     else float_literal_set())
+            st.preds.append(Pred(ONE_OF, [tv, TSet(names)]))
+            return tv
         return LITERALS[e.kind]
 
     if isinstance(e, ast.EUnit):
@@ -314,7 +369,7 @@ def infer(e: ast.Expr, env: Env, st: State) -> Type:
     if isinstance(e, ast.EField):
         receiver = infer(e.obj, env, st)
         result = TVar(0)
-        st.preds.append(RefPred(e.name, receiver, result))
+        st.preds.append(Pred(HAS_FIELD, [TLabel(e.name), receiver, result]))
         return result
 
     if isinstance(e, ast.ERecord):
@@ -458,8 +513,12 @@ def check(src: str) -> list[tuple[str, Scheme]]:
             raise Unsupported(type(item).__name__)
 
     settle(st)
+    # The outermost boundary: nothing can narrow what is left, so anything with
+    # a default takes it and the rest is an error.
+    while st.preds and any([default(p, st) for p in st.preds]):
+        settle(st)
     if st.preds:
-        raise RefError(f"unsettled demand for field {st.preds[0].label}")
+        raise RefError(f"unsettled predicate {st.preds[0].name}")
 
     # Re-generalize at the end: a later binding may have constrained an earlier
     # one, and the printed signature has to show that.

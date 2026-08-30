@@ -154,11 +154,11 @@ PRIMITIVES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR,
 # something decides. The set is closed and built in -- there is no way to add a
 # member from source -- so the two tables below are the whole of it.
 #
-# Both are singletons today, which is why this milestone is invisible: a
-# singleton `OneOf` is just an equation and is discharged as one. They are
-# written as tables anyway so that a sized-integer tower drops in by editing
-# them, with no change to the generator or the solver. `None` as a width means
-# unbounded, which is what `Int` is (a Python int).
+# Both are written as tables so that a sized-integer tower drops in by editing
+# them, with no change to the generator or the solver. A width of `None` means
+# unbounded, which is what `Int` is (a Python int); a mantissa is how many bits
+# of significand a float type has, which is what decides whether an integer
+# literal is exactly representable in it.
 #
 # Order is meaning: defaulting takes the first member of a set in this order,
 # and printing renders a set in it. So `Int` leads the integral types and, once
@@ -166,30 +166,47 @@ PRIMITIVES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR,
 # which is exactly the "integral defaults to Int, decimal defaults to Double"
 # rule, obtained from one mechanism rather than two.
 INTEGRAL_WIDTHS: dict[str, int | None] = {"Int": None}
-DECIMAL_TYPES: tuple[str, ...] = ("Float",)
+DECIMAL_MANTISSAS: dict[str, int] = {"Float": 53}  # f64
 
 
 def numeric_order() -> list[str]:
     """The tower, most-preferred first. Read at each call, not cached, so that
     a test can extend the tables and see the whole pipeline follow."""
-    return list(INTEGRAL_WIDTHS) + list(DECIMAL_TYPES)
+    return list(INTEGRAL_WIDTHS) + list(DECIMAL_MANTISSAS)
 
 
-def integral_set(value: int) -> frozenset[str]:
-    """The integral types `value` fits in -- the set an integer literal gets.
+def int_literal_set(value: int) -> frozenset[str]:
+    """The types an integer literal could have: everything that holds `value`.
 
-    This is where a literal's set becomes value-dependent: `200` fits an `Int8`
-    and `300` does not, so the two literals are given different sets rather
-    than one type being narrowed afterwards.
+    **Including the float types.** An integer literal is not an integer-typed
+    expression; it is a written numeral, and `1` denotes a perfectly good
+    `Float`. Only the reverse is unsafe, which is why `float_literal_set` is
+    the float types alone. This is the `Num`/`Fractional` split, and it is what
+    lets `1 +. 2.0` mean what it reads as.
+
+    One rule decides membership for the whole tower: can the type hold this
+    value exactly? For an integral type that is its width; for a float type it
+    is its mantissa, so a literal past 2^53 is an `Int` and not a `Float`
+    rather than silently rounding.
     """
+    magnitude = abs(value)
     return frozenset(
-        name for name, width in INTEGRAL_WIDTHS.items()
-        if width is None or -(1 << (width - 1)) <= value < (1 << (width - 1))
+        [name for name, width in INTEGRAL_WIDTHS.items()
+         if width is None or -(1 << (width - 1)) <= value < (1 << (width - 1))]
+        + [name for name, mantissa in DECIMAL_MANTISSAS.items()
+           if magnitude < (1 << mantissa)]
     )
 
 
-def decimal_set() -> frozenset[str]:
-    return frozenset(DECIMAL_TYPES)
+def float_literal_set() -> frozenset[str]:
+    """The types a decimal literal could have: the float types, and only those.
+
+    Not narrowed by the value the way `int_literal_set` is. `0.1` is
+    inexact in every binary float, so representability would reject every
+    member and say nothing useful; what a decimal literal picks out is the
+    *kind* of type, and precision is the programmer's business from there.
+    """
+    return frozenset(DECIMAL_MANTISSAS)
 
 
 def numeric_type(name: str) -> TCon:

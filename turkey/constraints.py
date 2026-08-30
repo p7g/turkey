@@ -491,9 +491,12 @@ class Solver:
             return False  # still open -- improvement or defaulting will decide
         if isinstance(t, TCon) and not t.args and t.name in names:
             return True
+        # The span is always the literal's, so name it: "expected one of ..."
+        # alone reads as though something at this position asked for a numeric
+        # type, when in fact this position *is* the numeral.
         raise TypeError_(
-            f"expected one of {', '.join(sort_numeric(names))}, found {show(t)}"
-            + (f" in {c.context}" if c.context else ""),
+            f"a numeric literal cannot have type '{show(t)}'; it must be one "
+            f"of {', '.join(sort_numeric(names))}",
             c.span,
         )
 

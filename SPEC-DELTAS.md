@@ -420,3 +420,57 @@ reported line 2. Compilation stops at the first error either way, so this only
 changes *which* of several errors is shown, and the resulting order -- names
 and declarations first, types second -- is the conventional one. Within each
 kind, source order is preserved.
+
+### 27. Numeric literals are polymorphic over a closed set
+
+A numeric literal does not have a type. It has the *set* of types it could
+have, carried as a `OneOf` predicate until something decides:
+
+```
+let x = 1        -- x : [OneOf a {Int, Float}] a
+let y = 1.5      -- y : Float
+```
+
+`1` denotes a numeral, not an `Int`, so `1 +. 2.0` is well typed. Only the
+reverse is unsafe: a decimal literal's set is the float types alone, so
+`f(1.5)` where `f` wants an `Int` is still rejected. This is the
+`Num`/`Fractional` split, without the classes.
+
+Membership is decided by one rule for the whole tower -- can the type hold this
+value exactly? -- so it is **value-dependent**: `1` is `{Int, Float}`, while
+`9007199254740993` (past an f64 mantissa) is `{Int}` and will not silently
+round. The set is **closed**: no program can add a member, so a `OneOf` needs
+no runtime evidence, only a decision.
+
+Three rules settle one. A singleton set is an equation and is discharged as
+one on the spot. Two sets over the same variable intersect, and an empty
+intersection is an error rather than a deferral, since nothing can widen a
+closed set. A set that reaches a point where nothing can ever narrow it
+further -- its variable appears in no type being generalized, so no use site
+can pin it -- is **defaulted** to the first member in tower order: `Int` for an
+integral literal, and for a decimal one the leading float type, which today is
+`Float` and after the tower lands will be `Double`.
+
+The cost, acknowledged: a mismatch is now reported against the literal rather
+than against what disagreed with it, because the literal is what carries the
+open set.
+
+```
+fun main() {
+    let a = Array.new(4)
+    Array.push(a, 1)
+    Array.push(a, "two")        -- line 4
+}
+```
+
+reports line 3, `a numeric literal cannot have type 'String'`, where a
+monomorphic `1` would have reported line 4. Carrying an origin span into a
+predicate would recover the better message; that is deferred to the milestone
+that adds classes, which needs the same machinery.
+
+A literal's openness can also surface in an inferred signature. `bf.tl`'s
+`move` pushes `0` onto `t.data` and nothing else pins the element type, so it
+generalizes to `[..., HasField "data" a (Array b), OneOf b {Int, Float}]`
+rather than `Array Int` -- correct, and more general than intended, which is
+the noise Haskell's monomorphism restriction exists to suppress. Turkey has no
+such restriction and accepts the noise.

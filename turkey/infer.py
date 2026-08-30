@@ -42,7 +42,7 @@ from .deps import free_names, pattern_vars, sccs
 from .errors import Span, TypeError_
 from .types import (
     BOOL, BOTTOM, CHAR, FLOAT, INT, STRING, UNIT, Pred, TBottom, TCon, TFun,
-    TLabel, TSet, TTuple, TVar, Type, decimal_set, integral_set,
+    TLabel, TSet, TTuple, TVar, Type, float_literal_set, int_literal_set,
 )
 
 LITERAL_TYPES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR, "Bool": BOOL}
@@ -525,13 +525,11 @@ class Generator:
 
         A numeric literal is not given a type here. Which type it has is a
         decision, and decisions belong to the solver -- the set is all the
-        syntax actually determines. Today every set is a singleton, so the
-        solver turns each one straight back into the equation this used to
-        emit; the shape is what lets a wider tower arrive without touching
-        this file.
+        syntax actually determines. `1` is not an `Int` that a later rule might
+        widen; it is a numeral whose set happens to contain `Int`.
         """
         t = self.fresh()
-        names = integral_set(value) if kind == "Int" else decimal_set()
+        names = int_literal_set(value) if kind == "Int" else float_literal_set()
         self.emit(CPred(Pred(ONE_OF, [t, TSet(names)]), span, context))
         return t
 

@@ -1,17 +1,17 @@
-"""The initial environment: primitives that exist before any user code.
+"""The machine operations, and nothing else.
 
-v0 has no module system (SPEC-DELTAS.md entry 9), so what would live in
-`Data.Array` and friends is seeded here instead. Each name is registered both
-bare-qualified (`Array.push`) and fully qualified (`Data.Array.push`) so that
-programs written against section 8.3 keep working once modules land.
+Everything a program can name is written in the language now: the classes and
+`print` in `turkey/lib/Prelude.tl`, and `Array.push`, `Int.toString` and the
+rest in `turkey/lib/Data/*.tl` (SPEC-DELTAS.md entry 42). What is left here is
+the floor they stand on -- integer addition, the comparison that reads one
+string against another, the two writes to stdout -- under names that begin
+`Prim.`.
 
-Two environments come out of here, not one. `_CORE` is the surface language:
-what a program may name. `_PRIM` is the machine underneath it -- integer
-addition, the comparison that reads one string against another -- and is in
-scope only while `turkey/prelude.py` is being checked, because every one of
-those operations now has a name in the surface language already -- an operator,
-or `print`. `Prim.intAdd` is what `instance Add Int` is written in terms of and
-`Prim.print` is what `print` is, and nothing else is entitled to say either.
+A `Prim.` name is in the *environment* for every module, because a value
+elaborated in one module still has to run in the same evaluator. What keeps it
+out of the surface language is a module's scope: `turkey/modules.py` spells
+`Prim.intAdd` only for a module under `turkey/lib`, and a user program that
+writes it is told the name is not defined.
 """
 
 from __future__ import annotations
@@ -109,54 +109,6 @@ def _float_div(a: float, b: float) -> float:
     return a / b
 
 
-# name -> (type scheme, runtime value). Aliases are added below.
-_CORE: dict[str, tuple] = {
-    # Section 10 note: `error` diverges, so it can claim any result type.
-    "error": (_scheme(lambda a: TFun([STRING], a)), _bi("error", 1, _error)),
-
-    # Section 8.3, the Data.Array module.
-    "Array.new": (
-        _scheme(lambda a: TFun([INT], array_of(a))),
-        _bi("Array.new", 1, lambda n: ArrayObj(n)),
-    ),
-    "Array.push": (
-        _scheme(lambda a: TFun([array_of(a), a], UNIT)),
-        _bi("Array.push", 2, _push),
-    ),
-    "Array.pop": (
-        # `Option` is declared in the prelude, and a `TCon` is compared by
-        # name, so naming it here needs no `DeclTable` -- the same trick that
-        # lets `BOOL` above mean the prelude's `Bool`.
-        _scheme(lambda a: TFun([array_of(a)], apply(TCon(OPTION, KFun(STAR, STAR)), [a]))),
-        _bi("Array.pop", 1, _pop),
-    ),
-
-    "String.length": (
-        mono(TFun([STRING], INT)), _bi("String.length", 1, lambda s: len(s)),
-    ),
-    "String.chars": (
-        mono(TFun([STRING], array_of(CHAR))), _bi("String.chars", 1, _chars),
-    ),
-    "Char.fromInt": (
-        mono(TFun([INT], CHAR)), _bi("Char.fromInt", 1, _char_from_int),
-    ),
-    "Char.toInt": (mono(TFun([CHAR], INT)), _bi("Char.toInt", 1, lambda c: ord(c))),
-
-    # Conversions. The `Show` instances are written in terms of these, and a
-    # program may still call them directly (SPEC-DELTAS.md entry 22).
-    "Int.toString": (mono(TFun([INT], STRING)), _bi("Int.toString", 1, lambda n: str(n))),
-    "Float.toString": (
-        mono(TFun([FLOAT], STRING)), _bi("Float.toString", 1, lambda x: repr(x)),
-    ),
-    "Bool.toString": (
-        mono(TFun([BOOL], STRING)),
-        _bi("Bool.toString", 1, lambda b: b.con),
-    ),
-    "Char.toString": (
-        mono(TFun([CHAR], STRING)), _bi("Char.toString", 1, _char_to_string),
-    ),
-}
-
 def _num(name, ty, fn):
     return (mono(TFun([ty, ty], ty)), _bi(name, 2, fn))
 
@@ -167,16 +119,48 @@ def _cmp(name, ty, fn):
     return (mono(TFun([ty, ty], BOOL)), _bi(name, 2, lambda a, b: from_bool(fn(a, b))))
 
 
-# The machine operations the prelude's instances are defined in terms of. Not
-# part of the surface language: `initial_type_env()` leaves them out, so a
-# program that writes `Prim.intAdd` is told the name is not defined. Their
-# *values* are in `initial_values()` regardless, because an instance method
-# elaborated against the prelude's environment still has to run.
 _PRIM: dict[str, tuple] = {
-    # Output. `print` and `write` themselves are prelude functions now, one
-    # `show` away (`turkey/prelude.py`); these are the two writes underneath.
+    # Output. `print` and `write` themselves are prelude functions, one `show`
+    # away; these are the two writes underneath.
     "Prim.print": (mono(TFun([STRING], UNIT)), _bi("Prim.print", 1, _print)),
     "Prim.write": (mono(TFun([STRING], UNIT)), _bi("Prim.write", 1, _write)),
+
+    # Section 10: `error` diverges, so it can claim any result type.
+    "Prim.error": (_scheme(lambda a: TFun([STRING], a)),
+                   _bi("Prim.error", 1, _error)),
+
+    # What `Data.Array` is written in terms of (section 8.3). Only `pop` is
+    # more than a rename: it is total where `ArrayObj.pop` is not, because an
+    # empty array is an ordinary answer for the one call whose empty case a
+    # program is expected to handle (delta 37).
+    "Prim.arrayNew": (_scheme(lambda a: TFun([INT], array_of(a))),
+                      _bi("Prim.arrayNew", 1, lambda n: ArrayObj(n))),
+    "Prim.arrayPush": (_scheme(lambda a: TFun([array_of(a), a], UNIT)),
+                       _bi("Prim.arrayPush", 2, _push)),
+    "Prim.arrayPop": (
+        # `Option` is declared in `Data.Option` and a `TCon` is compared by
+        # name, so naming it here needs no `DeclTable` -- the same trick that
+        # lets `BOOL` above mean the `Bool` the library declares.
+        _scheme(lambda a: TFun([array_of(a)], apply(TCon(OPTION, KFun(STAR, STAR)), [a]))),
+        _bi("Prim.arrayPop", 1, _pop),
+    ),
+
+    "Prim.stringLength": (mono(TFun([STRING], INT)),
+                          _bi("Prim.stringLength", 1, lambda s: len(s))),
+    "Prim.stringChars": (mono(TFun([STRING], array_of(CHAR))),
+                         _bi("Prim.stringChars", 1, _chars)),
+
+    "Prim.charFromInt": (mono(TFun([INT], CHAR)),
+                         _bi("Prim.charFromInt", 1, _char_from_int)),
+    "Prim.charToInt": (mono(TFun([CHAR], INT)),
+                       _bi("Prim.charToInt", 1, lambda c: ord(c))),
+    "Prim.charToString": (mono(TFun([CHAR], STRING)),
+                          _bi("Prim.charToString", 1, _char_to_string)),
+
+    "Prim.intToString": (mono(TFun([INT], STRING)),
+                         _bi("Prim.intToString", 1, lambda n: str(n))),
+    "Prim.floatToString": (mono(TFun([FLOAT], STRING)),
+                           _bi("Prim.floatToString", 1, lambda x: repr(x))),
 
     "Prim.intAdd": _num("Prim.intAdd", INT, lambda a, b: a + b),
     "Prim.intSub": _num("Prim.intSub", INT, lambda a, b: a - b),
@@ -204,33 +188,17 @@ _PRIM: dict[str, tuple] = {
         "Prim.boolLt", BOOL, lambda a, b: a.con == "False" and b.con == "True"),
 }
 
-# design.md writes these as `Data.Array.new` and so on; accept both spellings.
-_ALIAS_PREFIXES = {"Array": "Data.Array", "String": "Data.String", "Int": "Data.Int",
-                   "Bool": "Data.Bool", "Float": "Data.Float", "Char": "Data.Char"}
-
-BUILTINS: dict[str, tuple] = dict(_CORE)
-for _name, _entry in _CORE.items():
-    if "." in _name:
-        _prefix, _rest = _name.split(".", 1)
-        if _prefix in _ALIAS_PREFIXES:
-            BUILTINS[f"{_ALIAS_PREFIXES[_prefix]}.{_rest}"] = _entry
-
-
-# The names a library module may additionally write. Module resolution is what
-# enforces that now (`turkey/modules.py`): the environment holds every builtin,
-# and a user module's scope simply does not spell these.
+# The names a library module may write, and no other module may.
 PRIM_NAMES = frozenset(_PRIM)
 
 
-def initial_type_env(prims: bool = False) -> Env:
-    """The names a program may use. `prims` is for the prelude alone."""
+def initial_type_env() -> Env:
+    """The environment every module is checked in. Scope is what narrows it."""
     env = Env()
-    table = {**BUILTINS, **_PRIM} if prims else BUILTINS
-    for name, (scheme, _value) in table.items():
+    for name, (scheme, _value) in _PRIM.items():
         env.define(name, Binding(scheme, False))
     return env
 
 
 def initial_values() -> dict[str, object]:
-    return {name: value
-            for name, (_scheme, value) in {**BUILTINS, **_PRIM}.items()}
+    return {name: value for name, (_scheme, value) in _PRIM.items()}

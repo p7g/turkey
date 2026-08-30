@@ -81,10 +81,10 @@ main : fun() -> Unit
 | `turkey/exhaustive.py` | Maranget's usefulness algorithm, for match warnings |
 | `turkey/values.py` | Runtime values; array length/capacity semantics |
 | `turkey/eval.py` | Tree-walking evaluator |
-| `turkey/builtins.py` | The initial environment, and the machine primitives |
+| `turkey/builtins.py` | The machine primitives, and nothing else |
 | `turkey/modules.py` | The import graph, and what each module can see |
 | `turkey/resolve.py` | Rewrites a module's names so the program shares one namespace |
-| `turkey/lib/` | The library, written in the language: `Prelude.tl` |
+| `turkey/lib/` | The library, written in the language: `Prelude.tl`, `Data/*.tl` |
 
 Three things are worth knowing before reading the code, because they are where
 this language departs from a textbook implementation.
@@ -131,10 +131,9 @@ is a multi-file program, run from inside that directory, with its golden in
 ## Not in v0
 
 Modules (§9) work — a program is a directory, `import` means what §9 says, and
-the prelude is an ordinary file under `turkey/lib` (SPEC-DELTAS.md 41). What is
-not there yet: `Data.Array`, `Data.String` and `Data.Int` are still names
-seeded into the initial environment rather than modules written in the
-language, and classes, instances and type constructors are global — an export
-list may name a type or a class, but withholds nothing. So two libraries that
-each declare a `Node` cannot yet be used together, and there is no orphan rule.
-Exhaustiveness is a warning, per §5.1.
+the prelude and the `Data.*` modules are ordinary source under `turkey/lib`
+(SPEC-DELTAS.md 41, 42). What is not there yet: classes, instances and type
+constructors are global. An export list may name a type or a class, but
+withholds nothing, and an instance is visible wherever it was declared. So two
+libraries that each declare a `Node` cannot yet be used together, and there is
+no orphan rule. Exhaustiveness is a warning, per §5.1.

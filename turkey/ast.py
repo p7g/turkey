@@ -491,17 +491,32 @@ class InstanceDecl(Node):
 
 
 @dataclass(eq=False)
+class ExportItem(Node):
+    """One entry of an export list, or of an import's `(...)` / `hiding (...)`.
+
+    `kind` is `"name"` for `f`, `T(A, B)` and `T(..)`, and `"module"` for
+    design.md section 3.1's `module M` re-export -- which is a different thing
+    entirely: it names no entity of its own, it says "everything already in
+    scope here under that qualification, passed on".
+    """
+
+    name: str
+    kind: str = "name"  # name | module
+    subs: list[str] | None = None  # T(A, B); `None` for `T`, `[".."]` for T(..)
+
+
+@dataclass(eq=False)
 class ModuleHeader(Node):
     name: str
-    exports: list[str] | None
+    exports: list[ExportItem] | None
 
 
 @dataclass(eq=False)
 class ImportDecl(Node):
     name: str
     alias: str | None
-    items: list[str] | None
-    hiding: list[str] | None
+    items: list[ExportItem] | None
+    hiding: list[ExportItem] | None
     qualified: bool
 
 

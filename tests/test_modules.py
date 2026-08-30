@@ -264,3 +264,69 @@ def test_run_from_a_file_searches_beside_it(tmp_path, capsys):
                      encoding="utf-8")
     run(entry.read_text(), str(entry))
     assert capsys.readouterr().out.splitlines() == ["hello, you"]
+
+
+# -- the library is written in the language (M11b) ----------------------------
+
+
+def test_the_bare_names_the_library_uses_are_free(tmp_path, capsys):
+    """`plan.txt` item 3, the other half: the built-in `Array.push` used to
+    claim `push` too. A *module* re-export claims no bare name."""
+    src = """
+fun push(n : Int) -> Int = n + 1
+fun new(n : Int) -> Int = n + 2
+fun pop(n : Int) -> Int = n + 3
+fun toString(n : Int) -> Int = n + 4
+
+fun main() {
+    print(push(0) + new(0) + pop(0) + toString(0))
+    let xs = Array.new(2)
+    Array.push(xs, 9)
+    print(Array.pop(xs))
+}
+"""
+    assert output(src, [tmp_path], capsys) == ["10", "Some(9)"]
+
+
+def test_the_library_is_reachable_without_an_import(tmp_path):
+    src = ('fun f(s : String) -> Int = String.length(s)\n'
+           'fun g(n : Int) -> String = Int.toString(n)\n'
+           'fun h(c : Char) -> Int = Char.toInt(c)\n'
+           'fun i(b : Bool) -> String = Bool.toString(b)\n'
+           'fun j(x : Float) -> String = Float.toString(x)')
+    got = sigs(src, [tmp_path])
+    assert got["f"] == "fun(String) -> Int"
+    assert got["i"] == "fun(Bool) -> String"
+
+
+def test_the_long_spelling_is_available_by_importing_the_module(tmp_path):
+    """The Prelude re-exports `Data.Array` under the short alias. A program
+    that wants section 8.3's spelling asks for the module itself."""
+    src = ("import qualified Data.Array\n"
+           "fun f(xs : Array Int) -> Unit = Data.Array.push(xs, 1)")
+    assert sigs(src, [tmp_path])["f"] == "fun(Array Int) -> Unit"
+    assert fails("fun f(xs : Array Int) = Data.Array.push(xs, 1)", [tmp_path]) == \
+        "'Data.Array.push' is not defined"
+
+
+def test_the_library_functions_are_ordinary_turkey(tmp_path, capsys):
+    src = """
+fun main() {
+    print(Bool.not(True))
+    print(Option.isSome(Some(1)))
+    print(Option.unwrapOr(None, 5))
+}
+"""
+    assert output(src, [tmp_path], capsys) == ["False", "True", "5"]
+
+
+def test_a_re_export_needs_the_module_to_be_imported(tmp_path):
+    search = write(tmp_path, Nope="module Nope (module Missing) where\nfun f() = 1")
+    assert fails("import Nope", search) == \
+        "module 'Nope' re-exports 'Missing', which is not imported here"
+
+
+def test_module_is_an_export_form_not_an_import_one(tmp_path):
+    search = write(tmp_path, Helper=HELPER)
+    assert "'module' may appear in an export list" in \
+        fails("import Helper (module Helper)", search)

@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import ast
-from .builtins import BUILTINS, PRIM_NAMES
+from .builtins import PRIM_NAMES
 from .deps import pattern_vars
 from .errors import Span, TypeError_
 from .parser import parse
@@ -98,7 +98,7 @@ class ModuleLoader:
         path = self._resolve(name)
         src = path.read_text(encoding="utf-8")
         library = path.is_relative_to(LIB)
-        display = path.name if library else str(path)
+        display = str(path.relative_to(LIB)) if library else str(path)
         return self._add(name, src, display, library=library,
                          stack=[*stack, name])
 
@@ -137,16 +137,18 @@ class ModuleLoader:
     # -- scope and exports -------------------------------------------------
 
     def _scope(self, module: Module) -> dict[str, str]:
-        # The built-in names are spelled the way they are stored, so they map
-        # to themselves. `Prim.*` is reachable only from a library module,
-        # which is what keeps the machine operations out of the language.
-        scope = {name: name for name in BUILTINS}
+        # `Prim.*` is spellable only from a library module, which is what
+        # keeps the machine operations out of the language: the environment
+        # holds them for every module, and this is the stage that says no.
+        scope: dict[str, str] = {}
         if module.library:
             scope.update({name: name for name in PRIM_NAMES})
         # A class method is global and unqualified; see turkey/resolve.py.
         scope.update({name: name for name in self.methods})
 
-        if module.name != PRELUDE:
+        # A module the Prelude itself imports is loaded before the Prelude
+        # exists, and needs nothing from it.
+        if PRELUDE in self.modules:
             self._bring(scope, self.modules[PRELUDE], PRELUDE,
                         qualified=False, span=None)
         for imp in module.program.imports:
@@ -165,7 +167,7 @@ class ModuleLoader:
                hiding: list[str] | None = None) -> None:
         chosen = dict(dep.exports)
         if items is not None:
-            wanted = {_short(i) for i in items}
+            wanted = {i.name for i in items}
             missing = sorted(n for n in wanted
                              if n not in chosen and n[:1].islower())
             if missing:
@@ -174,7 +176,7 @@ class ModuleLoader:
                     f"{', '.join(repr(n) for n in missing)}", span)
             chosen = {n: v for n, v in chosen.items() if n in wanted}
         if hiding is not None:
-            hidden = {_short(i) for i in hiding}
+            hidden = {i.name for i in hiding}
             chosen = {n: v for n, v in chosen.items() if n not in hidden}
 
         for short, internal in chosen.items():
@@ -190,7 +192,21 @@ class ModuleLoader:
             return own
         out: dict[str, str] = {}
         for item in header.exports:
-            short = _short(item)
+            if item.kind == "module":
+                # Everything in scope here under that qualification, passed on
+                # *still qualified*. That is what lets the Prelude hand every
+                # program `Array.push` without claiming the bare `push`.
+                prefix = item.name + "."
+                found = {surface: target
+                         for surface, target in module.scope.items()
+                         if surface.startswith(prefix)}
+                if not found:
+                    raise TypeError_(
+                        f"module '{module.name}' re-exports '{item.name}', "
+                        f"which is not imported here", item.span)
+                out.update(found)
+                continue
+            short = item.name
             if not short[:1].islower():
                 # A type or a class. Both are global in this milestone, so an
                 # export list neither adds nor withholds anything for them;
@@ -216,6 +232,3 @@ def own_names(program: ast.Program) -> list[str]:
     return out
 
 
-def _short(item: str) -> str:
-    """`Point(..)` and `Eq(..)` name a type or a class; keep just the head."""
-    return item.split("(", 1)[0]

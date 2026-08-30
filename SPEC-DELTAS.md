@@ -338,7 +338,7 @@ recursive.
 `design.md` never says how a program starts. After the top-level bindings are
 evaluated, a zero-argument `main`, if one is defined, is called.
 
-### 22. Output and conversion primitives — **amended at delta 33**
+### 22. Output and conversion primitives — **amended at deltas 33, 42**
 
 §8.4 sketches `Data.Int`, `Data.String` and `Data.Bool` without contents, and
 `design.md` has no I/O at all — but a prototype that cannot print cannot be
@@ -363,6 +363,14 @@ Added later, when the brainfuck program needed them:
   `Char.fromInt` panics on a value outside `0..0x10FFFF` rather than letting
   Python's `chr` raise through the interpreter. Only `fromInt` was needed;
   `toInt` is there so the pair is symmetric.
+
+**Amended at delta 42.** None of these is an entry in the initial environment
+any more: `§8.4`'s modules are written in the language, under `turkey/lib/Data`,
+over `Prim.*`. The named comparisons (`String.eq`, `Char.eq`, `Float.lt` and
+the rest) are gone entirely — they were delta 32's debt and it was paid there.
+And the `Data.`-prefixed spelling is no longer a second registration of the
+same name: `Data.Array.push` is what the function *is*, and `Array.push` is
+what the Prelude re-exports it as.
 
 ### 23. A tuple of non-expansive expressions is non-expansive
 
@@ -1397,3 +1405,63 @@ whose entry is `Main.tl` is now a program — and `tests/test_modules.py` covers
 the scoping rules themselves. Three tests changed because what they asserted is
 what this delta reverses: a method and a top-level function may now share a
 name, and a program may define `add`.
+
+### 42. The library is written in the language
+
+Delta 32 moved the operators out of the checker and into the prelude, and named
+the rest of the debt: `Data.Array`, `Data.String` and the other §8 modules were
+still Python entries in the initial environment, registered under two spellings
+each (`Array.push` and `Data.Array.push`) because there was no module system to
+tell them apart. Delta 41 built the module system. This is the move.
+
+`turkey/lib/Data/{Array,Bool,Char,Float,Int,Option,String}.tl` are ordinary
+source, checked exactly as a program is. What is left in `turkey/builtins.py`
+is the floor they stand on: `Prim.arrayPush`, `Prim.intToString`,
+`Prim.stringChars` and the arithmetic, under names a module outside
+`turkey/lib` cannot spell. `_CORE` and the `_ALIAS_PREFIXES` table are gone.
+
+**`Bool` and `Option` moved out of the Prelude**, into `Data.Bool` and
+`Data.Option`, because a type belongs in the module that is about it — and
+under delta 43's orphan rule that is where an instance for it will have to be
+able to live. `Bool.toString` is a `match` now rather than a Python attribute
+read, and `Option` gained `isSome` and `unwrapOr`. Neither type is built in:
+`if` demands `Bool` by name (delta 36) and `Prim.arrayPop` answers `Option` by
+name, both of which work because a `TCon` is compared by name.
+
+**A module re-export, not a name re-export.** The Prelude reads:
+
+```
+module Prelude (print, write, error, module Array, module Bool, ...) where
+
+import qualified Data.Array as Array
+import qualified Data.Bool  as Bool
+...
+```
+
+`module M` is §3.1's export form, and here it means: everything in scope under
+that qualification, passed on *still qualified*. So an importer of the Prelude
+— which is every module — gets `Array.push` and `Int.toString` with no import,
+and the bare names `push`, `new`, `pop` and `toString` are **not** claimed and
+stay free for a program to define. That is the second half of `plan.txt` item
+3: the first half (delta 41) freed the seventeen class-method names, and this
+frees the library's.
+
+Our `module M` is not quite Haskell's, which exports the entities in scope
+*both* as `M.e` and as `e`. Ours re-exports the qualified spelling and only the
+qualified spelling, which is the whole point — a re-export that claimed bare
+names would put the papercut straight back.
+
+The long spelling is no longer a free alias: `Data.Array.push` is what the
+function is, and a program that wants to write it says `import qualified
+Data.Array`. `error` stays a bare Prelude export, since it has no module to
+belong to.
+
+**`ExportItem`.** An export or import list entry was a string with the
+sub-names glued back on (`"Point(..)"`). It is a node now, with a `kind` that
+distinguishes `module M` from an entity, because the two are not the same shape
+of thing. `module` is rejected inside an import's name list: a module
+re-exports, it does not import.
+
+**Scope.** No golden moved, which is the acceptance test for this delta: all 93
+`Array.*` and `Int.toString` call sites in the conformance programs resolve
+through the re-export unchanged. `turkey/lib` ships as package data.

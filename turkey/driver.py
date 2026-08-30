@@ -61,7 +61,7 @@ def check(src: str, file: str | None = None,
     decls = DeclTable()
     # Every builtin, `Prim.*` included: what a module may *write* is settled by
     # its scope, one stage earlier, so the environment no longer has to.
-    env = initial_type_env(prims=True).child()
+    env = initial_type_env().child()
     classes: ClassTable | None = None
     ordered: list[ast.Stmt] = []
     warnings: list[str] = []

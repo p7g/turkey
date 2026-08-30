@@ -31,16 +31,40 @@
 -- been simpler, but it only describes containers that can produce their kth
 -- element in the first place -- a linked list, a stream, a file's lines cannot,
 -- and those are the cases iteration exists for. The cost of the cursor is
--- `Option`, which is therefore declared here too.
+-- `Option`, which `Data.Option` declares.
 --
 -- Both families are indexed by the container rather than split across an
 -- `Iterable`/`Iterator` pair as Rust does, because the second class would need
 -- `Iterator (Iter c)` as a superclass over its own family application. One class
 -- with two families says the same thing and asks nothing new of M5's machinery.
 
-type Bool = False | True
+-- Every program is checked as if this module were imported, and nothing else
+-- is (delta 41). What that gets a program is three things: the classes the
+-- operators mean, `print`, and the library re-exported *qualified* -- so
+-- `Array.push` and `Int.toString` resolve with no import while the bare names
+-- `push`, `new`, `pop` and `toString` stay free for a program to define. A
+-- name re-export would have claimed them; a module re-export does not. That is
+-- the papercut `plan.txt` item 3 opens with, and it is what `module Array`
+-- below is for.
+module Prelude (
+    print, write, error,
 
-type Option a = None | Some(a)
+    module Array,
+    module Bool,
+    module Char,
+    module Float,
+    module Int,
+    module Option,
+    module String,
+) where
+
+import qualified Data.Array  as Array
+import qualified Data.Bool   as Bool
+import qualified Data.Char   as Char
+import qualified Data.Float  as Float
+import qualified Data.Int    as Int
+import qualified Data.Option as Option
+import qualified Data.String as String
 
 class Eq a {
     fun eq(a, a) -> Bool
@@ -116,12 +140,7 @@ instance Iterator (Array a) {
 
 instance Show Int { fun show(x) = Int.toString(x) }
 instance Show Float { fun show(x) = Float.toString(x) }
-instance Show Bool {
-    fun show(x) = match x {
-        True -> "True"
-        False -> "False"
-    }
-}
+instance Show Bool { fun show(x) = Bool.toString(x) }
 instance Show Char { fun show(x) = Char.toString(x) }
 instance Show String { fun show(x) = x }
 
@@ -145,7 +164,11 @@ instance [Show a] Show (Array a) {
     }
 }
 
--- The prelude's only top-level bindings, and the only place `Prim.print` and
--- `Prim.write` are reachable from. Both infer `[Show a] fun(a) -> Unit`.
+-- The Prelude's own bindings. `print` and `write` are the only place
+-- `Prim.print` and `Prim.write` are reachable from, and both infer
+-- `[Show a] fun(a) -> Unit`. `error` diverges, so it can claim any result
+-- type (section 10).
 fun print(x) = Prim.print(show(x))
 fun write(x) = Prim.write(show(x))
+
+fun error(message : String) -> a = Prim.error(message)

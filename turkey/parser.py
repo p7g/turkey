@@ -157,7 +157,7 @@ class Parser:
     def parse_module_header(self) -> ast.ModuleHeader:
         span = self.expect("module").span
         name = self.parse_modname()
-        exports: list[str] | None = None
+        exports: list[ast.ExportItem] | None = None
         if self.at("("):
             exports = []
             self.advance()
@@ -169,21 +169,25 @@ class Parser:
         self.expect("where")
         return ast.ModuleHeader(span, name, exports)
 
-    def parse_export_item(self) -> str:
+    def parse_export_item(self) -> ast.ExportItem:
+        # `module M` re-exports everything in scope under that qualification
+        # (section 3.1). It is the one export form that names no entity.
+        if self.at("module"):
+            span = self.advance().span
+            return ast.ExportItem(span, self.parse_modname(), "module")
         tok = self.advance()
         if tok.kind not in ("IDENT", "CONID"):
             raise ParseError(f"expected an export name, found {self._describe(tok)}", tok.span)
-        name = tok.text
+        subs: list[str] | None = None
         if tok.kind == "CONID" and self.at("("):
             self.advance()
-            inner: list[str] = []
+            subs = []
             while not self.at(")"):
-                inner.append(self.advance().text)
+                subs.append(self.advance().text)
                 if not self.eat(","):
                     break
             self.expect(")")
-            name += "(" + ",".join(inner) + ")"
-        return name
+        return ast.ExportItem(tok.span, tok.text, "name", subs)
 
     def parse_modname(self) -> str:
         parts = [self.expect("CONID", "a module name").text]
@@ -208,11 +212,17 @@ class Parser:
             items = self.parse_paren_name_list()
         return ast.ImportDecl(span, name, alias, items, hiding, qualified)
 
-    def parse_paren_name_list(self) -> list[str]:
+    def parse_paren_name_list(self) -> list[ast.ExportItem]:
         self.expect("(")
-        names: list[str] = []
+        names: list[ast.ExportItem] = []
         while not self.at(")"):
-            names.append(self.parse_export_item())
+            item = self.parse_export_item()
+            if item.kind == "module":
+                raise ParseError(
+                    "'module' may appear in an export list, not in an import's "
+                    "name list: a module re-exports, it does not import",
+                    item.span)
+            names.append(item)
             if not self.eat(","):
                 break
         self.expect(")")

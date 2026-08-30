@@ -60,17 +60,18 @@ LITERAL_TYPES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR, "Bo
 # one type and is emitted as one; only the numeric kinds are open.
 NUMERIC_KINDS = frozenset({"Int", "Float"})
 
-# Section 8.2. Without typeclasses every operator is monomorphic.
+# What is left of section 8.2's operator table after M8. Everything arithmetic
+# or comparative is a class method now (`turkey/prelude.py`); these three are
+# not, and each for its own reason. `&&` and `||` short-circuit, which no
+# function call does, and `++` is concatenation on `String`, which has no class
+# to belong to until there is a `Semigroup`.
 BINARY_OPS: dict[str, tuple[Type, Type, Type]] = {
-    **{op: (INT, INT, INT) for op in ("+", "-", "*", "/", "%")},
-    **{op: (FLOAT, FLOAT, FLOAT) for op in ("+.", "-.", "*.", "/.")},
-    **{op: (INT, INT, BOOL) for op in ("==", "!=", "<", "<=", ">", ">=")},
     "++": (STRING, STRING, STRING),
     "&&": (BOOL, BOOL, BOOL),
     "||": (BOOL, BOOL, BOOL),
 }
 
-UNARY_OPS: dict[str, tuple[Type, Type]] = {"!": (BOOL, BOOL), "-": (INT, INT)}
+UNARY_OPS: dict[str, tuple[Type, Type]] = {"!": (BOOL, BOOL)}
 
 T = TypeVar("T")
 
@@ -91,9 +92,13 @@ class Frame:
 
 
 class Generator:
-    def __init__(self, decls: DeclTable, builtins: Env):
+    def __init__(self, decls: DeclTable, builtins: Env,
+                 classes: ClassTable | None = None):
         self.decls = decls
-        self.classes = ClassTable(decls)
+        # The prelude's classes arrive already registered (M8); the table is
+        # shared so that `instance Add Int` is visible here, while the
+        # environment is not, so `Prim.intAdd` is not.
+        self.classes = ClassTable(decls) if classes is None else classes
         # Class methods are bound here rather than by a `CLet`: a method's type
         # comes from its class, not from anything solving discovers, so it is
         # in scope from the first line of the program.
@@ -344,7 +349,9 @@ class Generator:
 
         checker = Checker(self.decls)
         for match, scrutinee in self.match_sites:
-            missing = checker.check(match, scrutinee)
+            # Normalized, not merely pruned: the element of a `for ... in` loop
+            # is `Item xs`, and a family names a type only once it has reduced.
+            missing = checker.check(match, self.classes.normalize(scrutinee))
             if missing is None:
                 continue
             # A bare `_` witness means the scrutinee's type has too many values
@@ -788,14 +795,35 @@ class Generator:
         return result
 
     def _gen_EUnary(self, e: ast.EUnary) -> Type:
+        if e.fn is not None:
+            return self.gen_operator(e.fn, [e.operand], e.op, e.span)
         operand, result = UNARY_OPS[e.op]
         self.eq(self.gen_expr(e.operand), operand, e.span, f"the operand of '{e.op}'")
         return result
 
     def _gen_EBinary(self, e: ast.EBinary) -> Type:
+        if e.fn is not None:
+            return self.gen_operator(e.fn, [e.left, e.right], e.op, e.span)
         left, right, result = BINARY_OPS[e.op]
         self.eq(self.gen_expr(e.left), left, e.left.span, f"the left operand of '{e.op}'")
         self.eq(self.gen_expr(e.right), right, e.right.span, f"the right operand of '{e.op}'")
+        return result
+
+    def gen_operator(
+        self, fn: ast.EVar, operands: list[ast.Expr], op: str, span: Span
+    ) -> Type:
+        """An operator is a call to the method it desugars to (M8).
+
+        Nothing here knows that `add` is special. The method's own scheme --
+        `[Add a] fun(a, a) -> a` -- is what makes both operands agree and what
+        raises the class predicate, so an operator on a user's own type needs
+        no case anywhere: it needs an instance.
+        """
+        method = self.gen_expr(fn)
+        args = [self.gen_expr(x) for x in operands]
+        result = self.fresh()
+        self.eq(method, TFun(args, result), span,
+                f"the operands of '{op}'" if len(args) > 1 else f"the operand of '{op}'")
         return result
 
     def _gen_EAnnot(self, e: ast.EAnnot) -> Type:
@@ -820,10 +848,20 @@ class Generator:
         return UNIT
 
     def _gen_EForIn(self, e: ast.EForIn) -> Type:
+        """`for x in xs` is `Iterator xs`, and `x` is `Item xs` (M8).
+
+        The two methods are generated as ordinary uses, so the loop demands the
+        class the same way any call does and elaboration hands it a dictionary
+        with no case of its own. The element type is a family application, and
+        is left to reduce like every other one.
+        """
+        sequence = self.gen_expr(e.iterable)
         element = self.fresh()
+        where = "the sequence of a 'for ... in' loop"
+        self.eq(self.gen_expr(e.count_fn), TFun([sequence], INT), e.iterable.span, where)
         self.eq(
-            self.gen_expr(e.iterable), array_of(element), e.iterable.span,
-            "the sequence of a 'for ... in' loop",
+            self.gen_expr(e.nth_fn), TFun([sequence, INT], element),
+            e.iterable.span, where,
         )
         # Section 6.5: `x` is a fresh immutable binding each iteration.
         binds = self.match_pattern(e.pat, element)

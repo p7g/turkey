@@ -2,7 +2,7 @@
 
 A numeric literal does not have a type. It has the *set* of types it could
 have, and `1` is a numeral, not an `Int` -- its set contains `Float` too, which
-is what makes `1 +. 2.0` mean what it reads as. Only the reverse is unsafe, so
+is what makes `1 + 2.0` mean what it reads as. Only the reverse is unsafe, so
 a decimal literal's set is the float types alone. That asymmetry is the
 `Num`/`Fractional` split, and it is the whole of the design.
 
@@ -66,7 +66,7 @@ def test_an_integer_too_large_to_represent_exactly_is_not_a_float() -> None:
 
 
 def test_an_integer_literal_works_where_a_float_is_wanted() -> None:
-    assert sigs("fun main() { print(Float.toString(1 +. 2.0)) }\n") == {
+    assert sigs("fun main() { print(Float.toString(1 + 2.0)) }\n") == {
         "main": "fun() -> Unit"
     }
 

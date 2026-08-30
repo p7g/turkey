@@ -41,7 +41,6 @@ CHAR     ← '...'
 ```
 =  ==  !=  <  <=  >  >=
 +  -  *  /  %
-+. -. *. /.
 ++ && ||  !
 -> :  ;  ,  .  |  {  }  (  )  [  ]
 ```
@@ -174,8 +173,8 @@ expr-or      ::= expr-and ("||" expr-and)*
 expr-and     ::= expr-eq ("&&" expr-eq)*
 expr-eq      ::= expr-rel (("==" | "!=") expr-rel)*
 expr-rel     ::= expr-add (("<" | "<=" | ">" | ">=") expr-add)*
-expr-add     ::= expr-mul (("+" | "-" | "++" | "+." | "-.") expr-mul)*
-expr-mul     ::= expr-unary (("*" | "/" | "%" | "*." | "/.") expr-unary)*
+expr-add     ::= expr-mul (("+" | "-" | "++") expr-mul)*
+expr-mul     ::= expr-unary (("*" | "/" | "%") expr-unary)*
 expr-unary   ::= "!" expr-unary
                | "-" expr-unary
                | expr-postfix
@@ -205,7 +204,7 @@ expr-atom    ::= INT | FLOAT | STRING | CHAR
 block        ::= "{" stmt* "}"
 field-init   ::= IDENT "=" expr
 for-header   ::= stmt-no-block ";" expr ";" stmt-no-block    -- C-style
-               | pat "in" expr                                 -- iteration over Array
+               | pat "in" expr                                 -- iteration over an Iterator
 match-arm    ::= pat ("|" pat)* "->" expr
 arg-list     ::= arg ("," arg)*
 arg          ::= expr
@@ -382,22 +381,29 @@ The runtime representation of values is **opaque** — the surface language does
 - `let x = e`: the binding `x` is **immutable** — `x = e2` is a type error. The name `x` cannot be reassigned. If `e` is a mutable reference, the *data* is still mutable (`x.field = e2` works).
 - `var x = e`: the binding `x` is **mutable** — `x = e2` is allowed and rebinds `x` to a new reference/value.
 
-### 6.5 `for x in arr` elaboration
+### 6.5 `for x in seq` elaboration
 
 ```
-for x in arr { body }
+for x in seq { body }
 ```
 desugars to:
 ```
 {
     var __i = 0
-    while __i < arr.length {
-        let x = arr[__i]
+    while __i < count(seq) {
+        let x = nth(seq, __i)
         body
         __i = __i + 1
     }
 }
 ```
+
+`count` and `nth` are the methods of the `Iterator` class (§8.2), so the loop
+runs on anything with an instance and `x` has the type the associated family
+`Item seq` reduces to. `Array` is the instance the language ships; it is no
+longer the only sequence a `for` can walk. Iteration is indexed rather than
+cursor-based because a cursor's `next` wants an `Option`, which v0 does not
+have.
 
 `x` is an immutable `let` binding, fresh each iteration. If the element type is a mutable reference type, `x` is a reference to the object stored in the array; mutations via `x.field = e` affect the array's contents. If the element type is immutable, `x` is the value.
 
@@ -471,19 +477,50 @@ Records (constructor payload using `{ ... }`) are only mutable when the data typ
 
 ### 8.2 Operators
 
-Without typeclasses, operators are monomorphic:
+Every arithmetic and comparison operator is a **class method**. There is no
+operator table in the checker: `a + b` *is* `add(a, b)`, and what makes it
+mean integer addition is `instance Add Int`.
 
-| Operator | Type | Notes |
+| Operator | Desugars to | Class |
 |---|---|---|
-| `+` `-` `*` `/` `%` | `fun(Int, Int) -> Int` | integer arithmetic |
-| `+.` `-.` `*.` `/.` | `fun(Float, Float) -> Float` | float arithmetic |
-| `++` | `fun(String, String) -> String` | string concatenation |
-| `==` `!=` | `fun(Int, Int) -> Bool` | integer equality (per-type variants later) |
-| `<` `<=` `>` `>=` | `fun(Int, Int) -> Bool` | integer comparison |
-| `&&` `\|\|` | `fun(Bool, Bool) -> Bool` | logical (short-circuit) |
-| `!` | `fun(Bool) -> Bool` | logical negation |
+| `+` `-` `*` `/` `%` | `add` `sub` `mul` `div` `rem` | `Add` `Sub` `Mul` `Div` `Rem` |
+| `-` (unary) | `neg` | `Neg` |
+| `==` `!=` | `eq` `ne` | `Eq` |
+| `<` `<=` `>` `>=` | `lt` `lte` `gt` `gte` | `Ord`, whose superclass is `Eq` |
+| `++` | -- | `fun(String, String) -> String` |
+| `&&` `\|\|` | -- | `fun(Bool, Bool) -> Bool`, short-circuit |
+| `!` | -- | `fun(Bool) -> Bool` |
 
-Equality and comparison for other types (String, Bool, etc.) are provided as named functions in their respective modules (e.g., `String.eq`, `String.lt`). When typeclasses are added, these can be unified under `Eq`/`Ord` classes and the operators overloaded.
+The last three are not methods. `&&` and `||` short-circuit, which no function
+call does, and `++` is concatenation on `String`, which has no class to belong
+to until there is a `Semigroup`.
+
+The classes are per-operator and Rust-shaped rather than one omnibus `Num`, so
+a type that adds is not thereby required to divide. They are ordinary source
+(`turkey/prelude.py`), declared and checked exactly like a program's own, and a
+program may write `instance Add` for its own type and use `+` on it.
+
+**Operators are homogeneous.** With one class parameter there is no `Add a b`,
+so both operands and the result have the same type; `Vec * Scalar` is not
+expressible. This is the one place the decision to do without multi-parameter
+classes is visible in the surface language.
+
+The classes that ship, and their instances:
+
+| Class | Method | Instances |
+|---|---|---|
+| `Eq` | `eq`, and `ne` by default | `Int` `Float` `String` `Char` `Bool` |
+| `Ord : Eq` | `lt`, and `lte`/`gt`/`gte` by default | `Int` `Float` `String` `Char` `Bool` |
+| `Add` `Sub` `Mul` `Div` | | `Int` `Float` |
+| `Rem` | `rem` | `Int` |
+| `Neg` | `neg` | `Int` `Float` |
+| `Iterator` | `count`, `nth`, and the family `Item` | `Array a` |
+
+`String.eq`, `String.lt`, `Bool.eq`, `Float.lt` and `Char.eq` are gone: they
+were the per-type equality this section promised would be "unified under
+`Eq`/`Ord` classes later", and this is later. So are `+.` `-.` `*.` `/.`, which
+existed only because `+` could not be overloaded; `1.5 + 2.0` is now what it
+reads as.
 
 ### 8.3 Array
 
@@ -653,5 +690,5 @@ Notes:
 | 31 | Haskell-style modules with explicit exports and qualified imports |
 | 32 | Runtime representation is opaque (compiler's choice) |
 | 33 | Array literals: `[]` = `Data.Array.new(0)`; `[e₁,...]` = new + pushes |
-| 34 | Operators are monomorphic (Int/Float variants); no typeclasses in v1 |
+| 34 | ~~Operators are monomorphic (Int/Float variants); no typeclasses in v1~~ -- superseded: every arithmetic and comparison operator is a class method (SPEC-DELTAS.md 32) |
 | 35 | `error : String -> a` is a polymorphic primitive (panics/diverges) |

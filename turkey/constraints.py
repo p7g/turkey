@@ -403,6 +403,7 @@ class Solver:
         self.pools.append([])
         scope = Scope()
         self.scopes.append(scope)
+        first_use = len(self.uses)
         self.solve(c.defn)
         self.scopes.pop()
         self.settle()
@@ -424,6 +425,19 @@ class Solver:
             [p.pred for p in retained if self.classes.is_class(p.pred.name)]
         )
         scope.givens = [(dict_name(p.name), p) for p in shared]
+        # A call from one member of the group to another -- or to itself -- was
+        # solved against the *monomorphic* placeholder `CDef` bound, so it
+        # demanded nothing and would be handed the undischarged binding at run
+        # time. It needs the group's own dictionaries, which is exactly what
+        # the scope now holds, so the demand is recorded here and resolved like
+        # any other: a use inside the definition, of a name the group binds,
+        # that asked for nothing.
+        group = {name for name, _ in c.binds}
+        if shared:
+            for use in self.uses[first_use:]:
+                if (not use.preds and use.name in group
+                        and any(s is scope for s in use.scopes)):
+                    use.preds = list(shared)
         if c.dicts is not None:
             c.dicts.params = [n for n, _ in scope.givens]
             c.dicts.preds = shared

@@ -39,12 +39,12 @@ def kind_of_class(src: str, name: str) -> str:
 
 
 EQ = """
-class Eq a {
-    fun eq(a, a) -> Bool
+class Egal a {
+    fun egal(a, a) -> Bool
 }
 
-instance Eq Int {
-    fun eq(x, y) = x == y
+instance Egal Int {
+    fun egal(x, y) = x == y
 }
 """
 
@@ -135,105 +135,105 @@ def test_a_partially_applied_head_is_what_makes_a_two_parameter_type_a_functor()
 
 
 def test_a_method_carries_its_class_as_a_predicate():
-    assert sigs(EQ)["eq"] == "[Eq a] fun(a, a) -> Bool"
+    assert sigs(EQ)["egal"] == "[Egal a] fun(a, a) -> Bool"
 
 
 def test_a_use_site_propagates_the_context_it_cannot_discharge():
-    assert sigs(EQ + "fun both(x, y, z) = eq(x, y) && eq(y, z)")["both"] == \
-        "[Eq a] fun(a, a, a) -> Bool"
+    assert sigs(EQ + "fun both(x, y, z) = egal(x, y) && egal(y, z)")["both"] == \
+        "[Egal a] fun(a, a, a) -> Bool"
 
 
 def test_a_ground_use_discharges_against_the_instance_table():
-    assert sigs(EQ + "fun same(x : Int) -> Bool = eq(x, x)")["same"] == \
+    assert sigs(EQ + "fun same(x : Int) -> Bool = egal(x, x)")["same"] == \
         "fun(Int) -> Bool"
 
 
 def test_a_missing_instance_names_the_type_that_lacks_one():
-    assert bad(EQ + 'fun f() -> Bool = eq("a", "b")') == \
-        "no instance for 'Eq String'"
+    assert bad(EQ + 'fun f() -> Bool = egal("a", "b")') == \
+        "no instance for 'Egal String'"
 
 
 def test_an_instance_context_becomes_the_use_site_obligation():
-    """`Eq (Array a)` holds only where `Eq a` does, and says so."""
+    """`Egal (Array a)` holds only where `Egal a` does, and says so."""
     src = EQ + """
-    instance [Eq a] Eq (Array a) {
-        fun eq(xs, ys) = eq(xs[0], ys[0])
+    instance [Egal a] Egal (Array a) {
+        fun egal(xs, ys) = egal(xs[0], ys[0])
     }
-    fun heads(xs : Array a, ys : Array a) -> Bool = eq(xs, ys)
+    fun heads(xs : Array a, ys : Array a) -> Bool = egal(xs, ys)
     """
-    assert sigs(src)["heads"] == "[Eq a] fun(Array a, Array a) -> Bool"
+    assert sigs(src)["heads"] == "[Egal a] fun(Array a, Array a) -> Bool"
 
 
 def test_an_instance_context_is_discharged_when_the_element_is_known():
     src = EQ + """
-    instance [Eq a] Eq (Array a) {
-        fun eq(xs, ys) = eq(xs[0], ys[0])
+    instance [Egal a] Egal (Array a) {
+        fun egal(xs, ys) = egal(xs[0], ys[0])
     }
-    fun ints(xs : Array Int) -> Bool = eq(xs, xs)
+    fun ints(xs : Array Int) -> Bool = egal(xs, xs)
     """
     assert sigs(src)["ints"] == "fun(Array Int) -> Bool"
 
 
 def test_an_instance_context_that_cannot_be_met_is_reported():
     src = EQ + """
-    instance [Eq a] Eq (Array a) {
-        fun eq(xs, ys) = eq(xs[0], ys[0])
+    instance [Egal a] Egal (Array a) {
+        fun egal(xs, ys) = egal(xs[0], ys[0])
     }
-    fun f(xs : Array String) -> Bool = eq(xs, xs)
+    fun f(xs : Array String) -> Bool = egal(xs, xs)
     """
-    assert bad(src) == "no instance for 'Eq String'"
+    assert bad(src) == "no instance for 'Egal String'"
 
 
 def test_a_declared_context_is_asked_for_rather_than_asserted():
     """A `fun`'s `[...]` travels the same road as a demand its body raised."""
-    src = EQ + "fun f[Eq a](x : a, y : a) -> Bool = eq(x, y)"
-    assert sigs(src)["f"] == "[Eq a] fun(a, a) -> Bool"
+    src = EQ + "fun f[Egal a](x : a, y : a) -> Bool = egal(x, y)"
+    assert sigs(src)["f"] == "[Egal a] fun(a, a) -> Bool"
 
 
 def test_a_declared_context_over_a_variable_the_type_omits_is_ambiguous():
-    src = EQ + "fun f[Eq b](x : Int) -> Int = x"
+    src = EQ + "fun f[Egal b](x : Int) -> Int = x"
     assert bad(src) == \
-        "cannot determine a type satisfying 'Eq a'. Add a type annotation."
+        "cannot determine a type satisfying 'Egal a'. Add a type annotation."
 
 
 def test_a_context_names_the_annotation_variables_it_shares():
-    """`[Eq a]` constrains the `a` of the signature; it does not introduce one."""
-    src = EQ + "fun f[Eq a](xs : Array a) -> Bool = eq(xs[0], xs[0])"
-    assert sigs(src)["f"] == "[Eq a] fun(Array a) -> Bool"
+    """`[Egal a]` constrains the `a` of the signature; it does not introduce one."""
+    src = EQ + "fun f[Egal a](xs : Array a) -> Bool = egal(xs[0], xs[0])"
+    assert sigs(src)["f"] == "[Egal a] fun(Array a) -> Bool"
 
 
 # -- superclasses -------------------------------------------------------------
 
 ORD = EQ + """
-class Ord a : Eq a {
-    fun lt(a, a) -> Bool
+class Rank a : Egal a {
+    fun under(a, a) -> Bool
 }
 
-instance Ord Int {
-    fun lt(x, y) = x < y
+instance Rank Int {
+    fun under(x, y) = x < y
 }
 """
 
 
 def test_a_superclass_predicate_is_dropped_from_an_inferred_context():
-    assert sigs(ORD + "fun f(x, y) = lt(x, y) && eq(x, y)")["f"] == \
-        "[Ord a] fun(a, a) -> Bool"
+    assert sigs(ORD + "fun f(x, y) = under(x, y) && egal(x, y)")["f"] == \
+        "[Rank a] fun(a, a) -> Bool"
 
 
 def test_a_superclass_method_is_available_under_the_subclass_context():
-    assert sigs(ORD + "fun f[Ord a](x : a, y : a) -> Bool = eq(x, y)")["f"] == \
-        "[Ord a] fun(a, a) -> Bool"
+    assert sigs(ORD + "fun f[Rank a](x : a, y : a) -> Bool = egal(x, y)")["f"] == \
+        "[Rank a] fun(a, a) -> Bool"
 
 
 def test_an_instance_must_have_its_superclass_instance():
-    src = ORD.replace("instance Ord Int", "instance Ord Bool").replace(
-        "fun lt(x, y) = x < y", "fun lt(x, y) = x")
+    src = ORD.replace("instance Rank Int", "instance Rank Bool").replace(
+        "fun under(x, y) = x < y", "fun under(x, y) = x")
     assert bad(src) == \
-        "'Eq Bool' is required by 'Ord', but there is no such instance"
+        "'Egal Bool' is required by 'Rank', but there is no such instance"
 
 
 def test_a_superclass_must_constrain_the_class_parameter():
-    src = EQ + "class Ord a : Eq Int { fun lt(a, a) -> Bool }"
+    src = EQ + "class Rank a : Egal Int { fun under(a, a) -> Bool }"
     assert "must constrain its own parameter 'a'" in bad(src)
 
 
@@ -249,42 +249,42 @@ def test_a_class_may_not_be_its_own_superclass():
 
 
 def test_two_instances_for_one_constructor_overlap():
-    assert bad(EQ + "instance Eq Int { fun eq(x, y) = false }") == \
-        "overlapping instances: 'Eq Int' and 'Eq Int' both apply"
+    assert bad(EQ + "instance Egal Int { fun egal(x, y) = false }") == \
+        "overlapping instances: 'Egal Int' and 'Egal Int' both apply"
 
 
 def test_an_instance_head_must_be_a_constructor_over_distinct_variables():
-    src = EQ + "instance Eq (Either Int Int) { fun eq(x, y) = true }"
+    src = EQ + "instance Egal (Either Int Int) { fun egal(x, y) = true }"
     assert "distinct type variables" in bad(src)
 
 
 def test_an_instance_must_define_every_method_that_has_no_default():
-    assert bad(EQ.replace("fun eq(x, y) = x == y", "")) == \
-        "instance 'Eq Int' does not define eq"
+    assert bad(EQ.replace("fun egal(x, y) = x == y", "")) == \
+        "instance 'Egal Int' does not define egal"
 
 
 def test_an_instance_may_not_define_a_method_of_another_class():
     src = EQ + """
     class Show a { fun show(a) -> String }
-    instance Show Int { fun eq(x, y) = true }
+    instance Show Int { fun egal(x, y) = true }
     """
-    assert bad(src) == "'eq' is not a method of class 'Show'"
+    assert bad(src) == "'egal' is not a method of class 'Show'"
 
 
 def test_an_instance_method_states_no_signature():
-    src = "class Eq a { fun eq(a, a) -> Bool }\ninstance Eq Int { fun eq(x, y) = x == y }"
+    src = "class Egal a { fun egal(a, a) -> Bool }\ninstance Egal Int { fun egal(x, y) = x == y }"
     (inst,) = [d for d in parse(src).decls if isinstance(d, ast.InstanceDecl)]
     assert inst.methods[0].body is not None
 
 
 def test_a_method_may_not_share_a_name_with_a_top_level_function():
-    src = EQ + "fun eq(x, y) = x"
-    assert "'eq' is already defined" in bad(src)
+    src = EQ + "fun egal(x, y) = x"
+    assert "'egal' is already defined" in bad(src)
 
 
 def test_a_method_may_not_be_declared_by_two_classes():
-    src = EQ + "class Same a { fun eq(a, a) -> Bool }"
-    assert bad(src) == "'eq' is already a method of class 'Eq'"
+    src = EQ + "class Same a { fun egal(a, a) -> Bool }"
+    assert bad(src) == "'egal' is already a method of class 'Egal'"
 
 
 # -- rigidity -----------------------------------------------------------------
@@ -314,7 +314,7 @@ def test_an_instance_method_must_return_what_the_class_says():
 
 
 def test_an_instance_method_must_have_the_declared_arity():
-    assert bad(EQ.replace("fun eq(x, y) = x == y", "fun eq(x) = true")) == \
+    assert bad(EQ.replace("fun egal(x, y) = x == y", "fun egal(x) = true")) == \
         "this function takes 1 argument but 2 were supplied"
 
 
@@ -369,8 +369,8 @@ def test_an_unknown_class_in_an_instance_is_reported():
 
 
 def test_a_class_may_not_be_declared_twice():
-    src = EQ + "class Eq a { fun same(a, a) -> Bool }"
-    assert bad(src) == "class 'Eq' is declared more than once"
+    src = EQ + "class Egal a { fun same(a, a) -> Bool }"
+    assert bad(src) == "class 'Egal' is declared more than once"
 
 
 def test_a_class_may_not_share_a_name_with_a_type():

@@ -15,7 +15,7 @@ A few decisions worth knowing before reading:
 
 from __future__ import annotations
 
-from . import ast
+from . import ast, prelude
 from .errors import ParseError, Span
 from .lexer import Token, tokenize
 
@@ -44,8 +44,8 @@ PRECEDENCE: list[tuple[str, ...]] = [
     ("&&",),
     ("==", "!="),
     ("<", "<=", ">", ">="),
-    ("+", "-", "++", "+.", "-."),
-    ("*", "/", "%", "*.", "/."),
+    ("+", "-", "++"),
+    ("*", "/", "%"),
 ]
 
 
@@ -660,13 +660,17 @@ class Parser:
         while self.cur.kind in PRECEDENCE[level]:
             op = self.advance().kind
             right = self.parse_binary(level + 1)
-            left = ast.EBinary(left.span, op, left, right)
+            method = prelude.BINARY_METHOD.get(op)
+            fn = ast.EVar(left.span, method) if method else None
+            left = ast.EBinary(left.span, op, left, right, fn)
         return left
 
     def parse_unary(self) -> ast.Expr:
         if self.at("!", "-"):
             tok = self.advance()
-            return ast.EUnary(tok.span, tok.kind, self.parse_unary())
+            method = prelude.UNARY_METHOD.get(tok.kind)
+            fn = ast.EVar(tok.span, method) if method else None
+            return ast.EUnary(tok.span, tok.kind, self.parse_unary(), fn)
         return self.parse_postfix()
 
     def parse_postfix(self) -> ast.Expr:
@@ -822,7 +826,12 @@ class Parser:
             if self.at("in"):
                 self.advance()
                 iterable = self.parse_scrutinee()
-                return ast.EForIn(span, pat, iterable, self.parse_block())
+                body = self.parse_block()
+                return ast.EForIn(
+                    span, pat, iterable, body,
+                    ast.EVar(iterable.span, prelude.ITER_COUNT),
+                    ast.EVar(iterable.span, prelude.ITER_NTH),
+                )
         except ParseError:
             pass
         self.i = saved

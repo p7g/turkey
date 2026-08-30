@@ -42,20 +42,20 @@ instance [Show a] Show (Array a) {
 """
 
 ORD = """
-class Eq a {
-    fun eq(a, a) -> Bool
+class Egal a {
+    fun egal(a, a) -> Bool
 }
 
-class Ord a : Eq a {
-    fun lte(a, a) -> Bool
+class Rank a : Egal a {
+    fun underEq(a, a) -> Bool
 }
 
-instance Eq Int {
-    fun eq(x, y) = x == y
+instance Egal Int {
+    fun egal(x, y) = x == y
 }
 
-instance Ord Int {
-    fun lte(x, y) = x <= y
+instance Rank Int {
+    fun underEq(x, y) = x <= y
 }
 """
 
@@ -155,15 +155,15 @@ def test_a_nested_instance_nests_its_evidence():
 
 
 def test_a_superclass_is_selected_rather_than_passed():
-    """`[Ord a]` gives `eq` for free -- one dictionary, walked into.
+    """`[Rank a]` gives `egal` for free -- one dictionary, walked into.
 
     A `Monoid` dictionary carrying its `Semigroup` is what makes a superclass
     an implication rather than a second obligation on the caller.
     """
-    checked = check(ORD + "fun same[Ord a](x : a, y : a) -> Bool = eq(x, y)")
-    (evidence,) = uses(checked, "same")["eq"][0].evidence
+    checked = check(ORD + "fun same[Rank a](x : a, y : a) -> Bool = egal(x, y)")
+    (evidence,) = uses(checked, "same")["egal"][0].evidence
     assert isinstance(evidence, FromDict)
-    assert evidence.path == ("Eq",)
+    assert evidence.path == ("Egal",)
     assert params_of(checked, "same") == [evidence.name]
 
 
@@ -176,15 +176,15 @@ def test_only_class_predicates_become_parameters():
     `OneOf` is the same: both are erased, and only a class predicate survives
     into the running program.
     """
-    checked = check("fun get(r) = r.x\nfun add(a) = a + 1")
+    checked = check("fun get(r) = r.x\nfun bump(a : Int) = a + 1")
     assert params_of(checked, "get") == []
-    assert params_of(checked, "add") == []
+    assert params_of(checked, "bump") == []
 
 
 def test_a_function_gains_one_parameter_per_retained_predicate():
     src = SHOW + ORD + """
-fun both[Show a, Ord a](x : a, y : a) -> String {
-    if lte(x, y) { return show(x) }
+fun both[Show a, Rank a](x : a, y : a) -> String {
+    if underEq(x, y) { return show(x) }
     return show(y)
 }
 """
@@ -203,7 +203,7 @@ def test_a_mutually_recursive_group_shares_its_context():
     context for exactly this reason.
     """
     src = SHOW + """
-fun even(x, n) {
+fun even(x, n : Int) {
     if n == 0 { return show(x) }
     return odd(x, n - 1)
 }
@@ -356,7 +356,7 @@ fun main() {
 
 def test_a_superclass_method_runs_through_the_selection(capsys):
     src = ORD + """
-fun same[Ord a](x : a, y : a) -> Bool = eq(x, y)
+fun same[Rank a](x : a, y : a) -> Bool = egal(x, y)
 
 fun main() {
     if same(2, 2) { print("yes") } else { print("no") }

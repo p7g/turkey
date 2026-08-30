@@ -192,8 +192,8 @@ def test_an_equation_no_signature_could_promise_is_rejected():
     # for some containers and not others, so `f` cannot be given a type.
     src = CONTAINER + """
     fun f(xs) {
-        let n = first(xs)
-        return n + 1
+        let n : Int = first(xs)
+        return n
     }
     """
     assert "cannot reduce 'Elem a' to 'Int'" in fails(src)

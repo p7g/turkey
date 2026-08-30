@@ -205,6 +205,10 @@ class EField(Expr):
 class EUnary(Expr):
     op: str  # ! | -
     operand: Expr
+    # `-x` is `neg(x)`; `!x` is not a method and leaves this `None`. The parser
+    # fills it in, so the operator is still there to blame in a message while
+    # every later stage sees an ordinary use of a class method (M8).
+    fn: EVar | None = None
 
 
 @dataclass(eq=False)
@@ -212,6 +216,7 @@ class EBinary(Expr):
     op: str
     left: Expr
     right: Expr
+    fn: EVar | None = None  # the method this operator means; see EUnary.fn
 
 
 @dataclass(eq=False)
@@ -238,6 +243,11 @@ class EForIn(Expr):
     pat: Pattern
     iterable: Expr
     body: Expr
+    # The two `Iterator` methods the loop runs on, as ordinary uses, so that
+    # solving demands `Iterator` of the sequence and elaboration hands the loop
+    # its dictionary without the loop being a special case anywhere (M8).
+    count_fn: EVar | None = None
+    nth_fn: EVar | None = None
 
 
 @dataclass(eq=False)

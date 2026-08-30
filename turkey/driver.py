@@ -16,6 +16,7 @@ from .eval import Evaluator
 from .evidence import Elaborator
 from .infer import Generator
 from .parser import parse
+from .prelude import SOURCE as PRELUDE_SOURCE
 from .types import Scheme
 
 
@@ -30,6 +31,29 @@ class Checked:
     warnings: list[str]
 
 
+def prelude() -> tuple[DeclTable, ClassTable]:
+    """Check the prelude, and hand back the tables a program starts from.
+
+    It is checked, not trusted: `class Add a` and `instance Add Int` go through
+    exactly the machinery a user's would, which is the point -- an operator is
+    a class method and nothing about it is privileged. It declares no top-level
+    binding, only classes and instances, so there is nothing for the evaluator
+    to run first; a dictionary is built from the instance plan on demand.
+
+    Rebuilt per check rather than cached, because both tables are mutable and
+    the program about to be checked will add to them.
+    """
+    decls = DeclTable()
+    # `Prim.*` is in scope here and only here (see turkey/builtins.py).
+    env = initial_type_env(prims=True).child()
+    generator = Generator(decls, env)
+    _ordered, constraint = generator.generate(parse(PRELUDE_SOURCE))
+    solver = Solver(decls, env, generator.classes)
+    solver.run(constraint)
+    Elaborator(generator.classes).run(solver.uses)
+    return decls, generator.classes
+
+
 def check(src: str) -> Checked:
     program = parse(src)
     if program.header is not None or program.imports:
@@ -42,13 +66,15 @@ def check(src: str) -> Checked:
             span,
         )
 
-    decls = DeclTable()
+    decls, classes = prelude()
+    # A sibling of the prelude's scope rather than a child: the classes are
+    # shared, the primitives they are written in terms of are not.
     env = initial_type_env().child()
 
     # Generation builds the whole program's constraint and decides nothing;
     # solving is what assigns ranks, generalizes and fills in `env`. Splitting
     # them this way is the point of the HM(X) shape -- see constraints.py.
-    generator = Generator(decls, env)
+    generator = Generator(decls, env, classes)
     ordered, constraint = generator.generate(program)
     solver = Solver(decls, env, generator.classes)
     solver.run(constraint)

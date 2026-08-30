@@ -268,19 +268,29 @@ match x { A -> 1
         | B -> 2 }            -- two arms, one pattern each
 ```
 
-### 17. Unary `-` is `fun(Int) -> Int`
+### 17. Unary `-` is `fun(Int) -> Int` -- **retired at delta 32**
 
 §3.5 admits `"-" expr-unary` but §8.2's operator table lists no unary operator
 except `!`. Since operators are monomorphic in v1 (decision 34), unary minus is
 given the Int type. Negating a Float requires `0.0 -. x`. When typeclasses
 arrive this becomes a `Num` method.
 
+**They arrived.** Unary `-` is `Neg.neg`, with instances for `Int` and `Float`,
+and `-x` on a float is written `-x`. `0.0 -. x` no longer parses: `-.` is
+gone.
+
 ### 18. Integer division truncates toward zero; division by zero panics
 
 §8.2 types `/` and `%` as `fun(Int, Int) -> Int` but does not say how they
 round or what happens at zero. The implementation truncates toward zero and
 takes the remainder's sign from the dividend, matching C and Rust rather than
-Python's flooring `//`. `1 / 0` and `1 % 0` panic, as does `1.0 /. 0.0`.
+Python's flooring `//`. `1 / 0` and `1 % 0` panic, as does `1.0 / 0.0`.
+
+**Amended at delta 32.** That behaviour is now what `instance Div Int` and
+`instance Rem Int` do, rather than what the operator is; it is a property of
+`Int`, which is where it belongs. `Float` has `Div` and no `Rem`, so `1.5 % 2.0`
+is a missing instance rather than a silent choice about how floats take a
+remainder.
 
 ### 19. `continue` still advances the loop
 
@@ -738,3 +748,78 @@ Families are **erased**: they are reduced away during solving and again before
 evidence is resolved, so `turkey/eval.py` never sees one and delta 30 is
 untouched. A family that no instance covers is reported as the missing
 instance it is, at the equation that needed it.
+
+### 32. Operators are class methods, and the library is written in the language
+
+§8.2 gave every operator a monomorphic type, listed `+.` `-.` `*.` `/.` as a
+second arithmetic for floats, and shipped `String.eq`, `String.lt`, `Bool.eq`,
+`Float.lt` and `Char.eq` as named functions because there was no way to say
+"equality, at whatever type this is". It closed by naming its own repayment:
+"when typeclasses are added, these can be unified under `Eq`/`Ord` classes and
+the operators overloaded." Deltas 29 through 31 built the typeclasses. This is
+the repayment.
+
+**Every arithmetic and comparison operator desugars to a method call.** `a + b`
+is `add(a, b)` and nothing else; the parser records which method the operator
+means and every stage after it sees an ordinary use of an ordinary name. There
+is no operator table in the checker, no case in the evaluator, and no way for
+`+` to be more privileged than a function a program writes itself. What is left
+of §8.2's table is three entries: `&&` and `||`, which short-circuit and so
+cannot be calls, and `++`, which is concatenation on `String` and has no class
+to belong to until there is a `Semigroup`.
+
+**Per-operator classes, not one `Num`.** `Add`, `Sub`, `Mul`, `Div`, `Rem` and
+`Neg` are separate, as in Rust's `std::ops`, so a type that adds is not thereby
+required to divide. `Money` in `tests/programs/operators.tl` has `Add`, `Neg`,
+`Eq` and `Ord` and no arithmetic beyond them, and `a / a` on it is a missing
+instance.
+
+**Operators are homogeneous, and this is where declining MPTCs costs
+something.** With a single class parameter there is no `Add a b`, so both
+operands and the result share one type: `Vec * Scalar` is not expressible.
+Delta 29 recorded the choice; this is the one place it is visible in the
+surface language, and it is stated rather than left to be discovered.
+
+**A numeric literal is still open, so `1 + 2` carries two predicates.** The
+literal contributes `OneOf a {Int, Float}` (delta 27) and the operator
+contributes `Add a`; at the outermost boundary the first defaults to `Int` and
+the second is discharged against it. An *unannotated* function that adds keeps
+both, which is Haskell's `Num a =>` in all but name:
+
+```
+fun inc(x) = x + 1      -- [OneOf a {Int, Float}, Add a] fun(a) -> a
+```
+
+That generality is correct and is more than was intended, in exactly the sense
+delta 27 already accepted for `bf.tl`'s `move`. Two `.types` goldens changed
+for it and no `.expected` did: `bf.tl`'s `inc` and `fields.tl`'s `bump` are
+polymorphic in the numeric type they increment.
+
+**`for x in xs` runs on a class.** `Iterator i` declares the associated family
+`Item i` (delta 31) together with `count` and `nth`, and the loop is a call to
+each; the loop variable's type is `Item xs`, left to reduce like any other
+family application. `Array` is the instance that ships, and it is no longer the
+only sequence a `for` can walk -- `tests/programs/iter.tl` walks a `Range`
+record and a `Pair`. Iteration is indexed rather than cursor-based because a
+cursor's `next` wants an `Option`, and v0 has no such type; `count`/`nth` is
+what the language can say today. The cost is on the other side: a `String` is
+not an `Iterator`, so `for c in s` is a missing instance and the characters are
+still reached through `String.chars`.
+
+**The classes are ordinary source.** They live in `turkey/prelude.py` as a
+turkey program, and it is *checked* rather than trusted -- through the same
+generator, solver and elaborator a user's program goes through. What is
+privileged is not the classes but a small set of machine operations,
+`Prim.intAdd` and its neighbours, which are in scope while the prelude is
+checked and nowhere else; `Prim.intAdd` in a program is an undefined name. The
+prelude declares no top-level binding, only classes and instances, so there is
+nothing for the evaluator to run before the program: a dictionary is built from
+its instance's plan on demand, as any other is.
+
+One latent bug in delta 30 surfaced here and is fixed. A call from one member
+of a binding group to another -- or to itself -- is solved against the
+monomorphic placeholder the group binds, so it demands nothing, and at run time
+it was handed the undischarged binding rather than a function. No golden had a
+mutually recursive group with a class context until `adt.tl`'s `isEven`/`isOdd`
+acquired one from `==` and `-`. Such a use now takes the group's own
+dictionaries, which is what the group's context always meant.

@@ -20,9 +20,9 @@ KEYWORDS = frozenset(
     where""".split()
 )
 
-# Longest match first: `<=` must beat `<`, `->` must beat `-`, `+.` must beat `+`.
+# Longest match first: `<=` must beat `<`, `->` must beat `-`, `++` must beat `+`.
 OPERATORS = [
-    "==", "!=", "<=", ">=", "->", "++", "&&", "||", "+.", "-.", "*.", "/.", "..",
+    "==", "!=", "<=", ">=", "->", "++", "&&", "||", "..",
     "=", "<", ">", "+", "-", "*", "/", "%", "!", ":", ",", ".", "|",
     "{", "}", "(", ")", "[", "]",
 ]

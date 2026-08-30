@@ -93,24 +93,10 @@ def _float_div(a: float, b: float) -> float:
     return a / b
 
 
-BINARY = {
-    "+": lambda a, b: a + b,
-    "-": lambda a, b: a - b,
-    "*": lambda a, b: a * b,
-    "/": _int_div,
-    "%": _int_mod,
-    "+.": lambda a, b: a + b,
-    "-.": lambda a, b: a - b,
-    "*.": lambda a, b: a * b,
-    "/.": _float_div,
-    "++": lambda a, b: a + b,
-    "==": lambda a, b: a == b,
-    "!=": lambda a, b: a != b,
-    "<": lambda a, b: a < b,
-    "<=": lambda a, b: a <= b,
-    ">": lambda a, b: a > b,
-    ">=": lambda a, b: a >= b,
-}
+# All that is left of the operator table (M8): `++` is the only binary operator
+# that is not a class method, and `&&`/`||` are handled inline because they
+# short-circuit.
+BINARY = {"++": lambda a, b: a + b}
 
 
 class Evaluator:
@@ -350,7 +336,9 @@ class Evaluator:
 
     def _eval_EUnary(self, e, env):
         value = self.eval(e.operand, env)
-        return (not value) if e.op == "!" else -value
+        if e.fn is None:
+            return not value
+        return self.call(self._eval_EVar(e.fn, env), [value], e.span)
 
     def _eval_EBinary(self, e, env):
         # Section 8.2: these two short-circuit; everything else is strict.
@@ -358,7 +346,13 @@ class Evaluator:
             return self.eval(e.left, env) and self.eval(e.right, env)
         if e.op == "||":
             return self.eval(e.left, env) or self.eval(e.right, env)
-        return BINARY[e.op](self.eval(e.left, env), self.eval(e.right, env))
+        if e.fn is None:
+            return BINARY[e.op](self.eval(e.left, env), self.eval(e.right, env))
+        # Every other operator is a method, and `e.fn` is the use that carries
+        # the evidence for it -- selecting `add` from an `Add` dictionary is the
+        # same code path as any other method call.
+        fn = self._eval_EVar(e.fn, env)
+        return self.call(fn, [self.eval(e.left, env), self.eval(e.right, env)], e.span)
 
     def _eval_EAnnot(self, e, env):
         return self.eval(e.expr, env)
@@ -390,11 +384,18 @@ class Evaluator:
     def _eval_EForIn(self, e, env):
         # Section 6.5, with one correction: `continue` still advances the index.
         # Desugaring literally to a `while` would make `continue` spin forever.
-        arr = self.eval(e.iterable, env)
+        #
+        # The sequence is reached through its `Iterator` dictionary rather than
+        # assumed to be an array (M8), so the two methods are evaluated once,
+        # outside the loop, exactly as a hand-written desugaring would.
+        sequence = self.eval(e.iterable, env)
+        count = self._eval_EVar(e.count_fn, env)
+        nth = self._eval_EVar(e.nth_fn, env)
         index = 0
-        while index < arr.length:
+        total = self.call(count, [sequence], e.span)
+        while index < total:
             scope = env.child()
-            bindings = match_pattern(e.pat, arr.get(index))
+            bindings = match_pattern(e.pat, self.call(nth, [sequence, index], e.span))
             if bindings is None:
                 raise TurkeyPanic("loop pattern does not match an element")
             for name, bound in bindings.items():

@@ -4,6 +4,11 @@ For every `tests/programs/NAME.tl` there is a `NAME.expected` holding the
 combined stdout+stderr (in that order) of running the program. Each program is
 executed in a subprocess with its cwd set to `tests/programs`, so error messages
 that quote the source file do so by its bare name.
+
+A program may also be a *directory*: `tests/programs/NAME/` whose entry module
+is `Main.tl` and whose golden is `Main.expected` beside it (M11a). It is run
+from inside that directory, so its imports resolve against it and its
+diagnostics quote bare file names the same way.
 """
 
 from __future__ import annotations
@@ -20,16 +25,24 @@ PROGRAMS_DIR = TESTS_DIR / "programs"
 REPO_ROOT = TESTS_DIR.parent
 
 PROGRAMS = sorted(PROGRAMS_DIR.glob("*.tl"))
+# A multi-file program: a directory with a `Main.tl` in it.
+BUNDLES = sorted(p / "Main.tl" for p in PROGRAMS_DIR.iterdir()
+                 if p.is_dir() and (p / "Main.tl").is_file())
 
 
-def _run(args: list[str]) -> subprocess.CompletedProcess[str]:
+def _id(program: Path) -> str:
+    """A bundle is named by its directory; a single file, by its stem."""
+    return program.parent.name if program.name == "Main.tl" else program.stem
+
+
+def _run(args: list[str], cwd: Path = PROGRAMS_DIR) -> subprocess.CompletedProcess[str]:
     # Invoked exactly as tests/regenerate_expected.py invokes it, so the runner
     # and the goldens cannot drift: same argv, same cwd, PYTHONPATH overwritten
     # (not appended) to the repo root, stdout+stderr captured and concatenated
     # in that order.
     return subprocess.run(
         [sys.executable, "-m", "turkey", *args],
-        cwd=PROGRAMS_DIR,
+        cwd=cwd,
         env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)),
         capture_output=True,
         text=True,
@@ -45,15 +58,16 @@ def _diff_message(expected: str, actual: str, code: int) -> str:
     )
 
 
-@pytest.mark.parametrize("program", PROGRAMS, ids=[p.stem for p in PROGRAMS])
+@pytest.mark.parametrize("program", PROGRAMS + BUNDLES,
+                         ids=[_id(p) for p in PROGRAMS + BUNDLES])
 def test_program_conformance(program: Path) -> None:
     expected = program.with_suffix(".expected").read_text()
-    result = _run(["run", program.name])
+    result = _run(["run", program.name], cwd=program.parent)
     actual = result.stdout + result.stderr
 
     assert actual == expected, _diff_message(expected, actual, result.returncode)
 
-    if program.stem.startswith("err_"):
+    if _id(program).startswith("err_"):
         assert result.returncode != 0, (
             f"{program.name} is an err_ program but exited 0"
         )

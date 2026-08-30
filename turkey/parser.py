@@ -199,7 +199,9 @@ class Parser:
         alias = items = hiding = None
         if self.eat("as"):
             alias = self.expect("CONID", "a module alias").text
-        elif self.at("hiding"):
+        # An alias and a selective list are independent: `import qualified M as
+        # S (f)` names the module *and* narrows what it brings.
+        if self.at("hiding"):
             self.advance()
             hiding = self.parse_paren_name_list()
         elif self.at("("):
@@ -675,7 +677,7 @@ class Parser:
             op = self.advance().kind
             right = self.parse_binary(level + 1)
             method = prelude.BINARY_METHOD.get(op)
-            fn = ast.EVar(left.span, method) if method else None
+            fn = ast.EVar(left.span, method, method=True) if method else None
             left = ast.EBinary(left.span, op, left, right, fn)
         return left
 
@@ -683,7 +685,7 @@ class Parser:
         if self.at("!", "-"):
             tok = self.advance()
             method = prelude.UNARY_METHOD.get(tok.kind)
-            fn = ast.EVar(tok.span, method) if method else None
+            fn = ast.EVar(tok.span, method, method=True) if method else None
             return ast.EUnary(tok.span, tok.kind, self.parse_unary(), fn)
         return self.parse_postfix()
 
@@ -850,8 +852,8 @@ class Parser:
                 body = self.parse_block()
                 return ast.EForIn(
                     span, pat, iterable, body,
-                    ast.EVar(iterable.span, prelude.ITER_ITER),
-                    ast.EVar(iterable.span, prelude.ITER_NEXT),
+                    ast.EVar(iterable.span, prelude.ITER_ITER, method=True),
+                    ast.EVar(iterable.span, prelude.ITER_NEXT, method=True),
                 )
         except ParseError:
             if committed:
@@ -915,6 +917,11 @@ def collect_tycons(tokens: list[Token]) -> frozenset[str]:
     return frozenset(names)
 
 
-def parse(src: str) -> ast.Program:
-    tokens = tokenize(src)
-    return Parser(tokens, collect_tycons(tokens)).parse_program()
+def parse(src: str, known: frozenset[str] = frozenset(),
+          file: str | None = None) -> ast.Program:
+    """Parse one module. `known` is the type constructor names its imports
+    already put in scope: section 7's alias-vs-data question is decided by a
+    token pre-pass over this file, and a name declared in *another* file is
+    invisible to it (M11a)."""
+    tokens = tokenize(src, file)
+    return Parser(tokens, collect_tycons(tokens) | known).parse_program()

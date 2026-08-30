@@ -42,6 +42,12 @@ def scheme(src: str, name: str) -> str:
     return next(show_scheme(s) for n, s in checked.signatures if n == name)
 
 
+
+def _short(name: str) -> str:
+    """A top-level binding is `Module#name` after resolution (M11a); the tests
+    ask for it the way it was written."""
+    return name.rpartition("#")[2]
+
 def _uses(checked, fn: str) -> list[ast.EVar]:
     """Every `EVar` inside one top-level function, in source order."""
     from dataclasses import fields
@@ -63,7 +69,7 @@ def _uses(checked, fn: str) -> list[ast.EVar]:
             walk(getattr(node, f.name))
 
     for item in checked.program.decls:
-        if isinstance(item, ast.SFun) and item.decl.name == fn:
+        if isinstance(item, ast.SFun) and _short(item.decl.name) == fn:
             walk(item.decl.body)
     return found
 
@@ -233,8 +239,25 @@ def test_a_program_may_not_redeclare_a_prelude_class():
         "class 'Add' is declared more than once"
 
 
-def test_a_program_may_not_shadow_an_operator_method():
-    assert "it is a method of class 'Add'" in fails("fun add(x, y) = x")
+def test_a_program_may_define_a_name_a_class_method_already_has():
+    """A method lives in the *global* namespace and a top-level binding lives
+    in its module's, so the two no longer collide (M11a). This is the papercut
+    `plan.txt` item 3 opens with: M9 had to rename its `add`."""
+    assert scheme('fun add(x, y) = x ++ y', "add") == "fun(String, String) -> String"
+
+
+def test_an_operator_still_means_its_method_next_to_a_local_of_that_name(capsys):
+    """`+` desugars to `add` at parse time, so a module that defines its own
+    `add` would capture every `+` if that node were resolved by name. It is
+    marked as a method instead -- see `turkey/resolve.py`."""
+    src = '''
+fun add(x, y) = x ++ y
+fun main() {
+    print(add("a", "b"))
+    print(1 + 2)
+}
+'''
+    assert output(src, capsys) == ["ab", "3"]
 
 
 def test_a_second_instance_for_a_built_in_type_overlaps():

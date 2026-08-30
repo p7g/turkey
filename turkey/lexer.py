@@ -75,8 +75,9 @@ class Token:
 
 
 class Lexer:
-    def __init__(self, src: str):
+    def __init__(self, src: str, file: str | None = None):
         self.src = src
+        self.file = file
         self.pos = 0
         self.line = 1
         self.col = 1
@@ -99,7 +100,7 @@ class Lexer:
         return taken
 
     def _span(self) -> Span:
-        return Span(self.line, self.col)
+        return Span(self.line, self.col, self.file)
 
     # -- main loop --------------------------------------------------------
 
@@ -291,6 +292,6 @@ def apply_newline_rule(tokens: list[Token]) -> list[Token]:
     return out
 
 
-def tokenize(src: str) -> list[Token]:
+def tokenize(src: str, file: str | None = None) -> list[Token]:
     """Lex `src` all the way to a parser-ready token stream."""
-    return apply_newline_rule(Lexer(src).tokenize())
+    return apply_newline_rule(Lexer(src, file).tokenize())

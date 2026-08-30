@@ -118,7 +118,7 @@ class Evaluator:
 
     # -- program ------------------------------------------------------------
 
-    def run(self, ordered: list[ast.Stmt]) -> None:
+    def run(self, ordered: list[ast.Stmt], main: str = "main") -> None:
         """Evaluate top-level items, then call `main` if the program has one.
 
         The order is the dependency order inference produced, so every binding
@@ -126,9 +126,9 @@ class Evaluator:
         """
         for item in ordered:
             self.exec_stmt(item, self.globals)
-        main = self.globals.names.get("main")
-        if main is not None:
-            self.call(main, [], span=None)
+        entry = self.globals.names.get(main)
+        if entry is not None:
+            self.call(entry, [], span=None)
 
     # -- statements ---------------------------------------------------------
 

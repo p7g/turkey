@@ -216,6 +216,12 @@ for _name, _entry in _CORE.items():
             BUILTINS[f"{_ALIAS_PREFIXES[_prefix]}.{_rest}"] = _entry
 
 
+# The names a library module may additionally write. Module resolution is what
+# enforces that now (`turkey/modules.py`): the environment holds every builtin,
+# and a user module's scope simply does not spell these.
+PRIM_NAMES = frozenset(_PRIM)
+
+
 def initial_type_env(prims: bool = False) -> Env:
     """The names a program may use. `prims` is for the prelude alone."""
     env = Env()

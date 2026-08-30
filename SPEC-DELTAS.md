@@ -143,7 +143,7 @@ in `[capacity, length)` still panic even though storage exists.
 `Option a`. Indexing still panics, and that distinction is the point -- see
 delta 37.
 
-### 9. No modules in v0
+### 9. No modules in v0 — **amended at delta 41**
 
 §9 describes a full Haskell-style module system (headers, qualified/
 selective/hiding imports, cross-module name resolution). The prototype
@@ -152,6 +152,10 @@ implements a single file only: no `module`/`import` semantics. `Data.Array`
 global environment as if always in scope. `module` and `import` are still
 lexed and parsed per §3.1/§9.2 so the surface syntax isn't lost, but both are
 rejected at a later stage with a "not supported in v0" error.
+
+**Amended at delta 41.** A program is a graph of modules now. `module` and
+`import` mean what §9 says they mean, and this entry survives only as the
+record of what came before.
 
 **Amended at delta 36.** `Bool` was on the list of types a program may not
 redefine. It is not built in any more -- the prelude declares it -- so the
@@ -242,6 +246,14 @@ not a language bug — but since v0 has no modules at all (delta 9), it's moot
 for now; the conformance test is written with distinct names (no
 same-named local defs shadowing the seeded `Data.Array` builtins) so the
 example's intent is preserved.
+
+**Amended at delta 41.** Modules exist, and the shadowing this entry
+describes is exactly what `tests/programs/modules/Stack.tl` now relies on:
+it defines `push` and `pop` of its own and calls `Array.push` qualified. The
+infinite recursion the spec's example would have had is a consequence of
+writing `import Data.Array (push)` *and* a local `push` and then calling the
+bare name, which is a mistake the author can see, not one the language can
+prevent.
 
 ### 15. Exhaustiveness checking is warning-only
 
@@ -1294,3 +1306,94 @@ the first and backtracking, and `in` is the only token that distinguishes them
 where it is, rather than sending the parser back to re-read the loop as a
 C-style header and complain about a missing `;` in a loop whose source has no
 `;` in it.
+
+### 41. A program is a graph of modules
+
+`plan.txt` puts modules ahead of everything else because they were already
+blocking. The prelude claimed seventeen ordinary names — `add sub mul div rem
+neg eq ne lt lte gt gte show iter next print write` — in one flat namespace,
+and a program that defined any of them was told `'add' is already defined; a
+class method shares the namespace of ordinary functions`. M9 hit this on `add`
+and worked around it by renaming. This delta is the repayment.
+
+A program is now a directory. `turkey run Main.tl` loads `Main.tl`, follows its
+`import`s against that file's own directory and then the shipped library under
+`turkey/lib`, and checks each module in dependency order. §9's surface syntax
+was already lexed and parsed; what it means is here.
+
+**Names are made unique rather than scoped.** Every stage after resolution keys
+on a flat string — `Env`, `REnv`, `DeclTable`, the evaluator's globals are all
+`dict[str, ...]`. A module system could thread *n* of each of those through
+every stage, or it could give each top-level binding a name no other module can
+collide with. This takes the second road: `turkey/modules.py` works out what
+each module can see, `turkey/resolve.py` rewrites the module's AST so that a
+top-level `f` in module `M` becomes `M#f`, and nothing downstream learns that
+modules exist. The scope is built in §9.3's order — the Prelude, then each
+import, then the module's own declarations, later winning — so a local
+definition shadows an import and an import shadows the Prelude.
+
+`#` is the separator because no surface name may contain one, so an internal
+name can never collide with something a program could write, and a diagnostic
+can strip the prefix back off without guessing where the module name ends (an
+ordinary `.` would be ambiguous against `Array.push`). `errors.short` does that
+stripping once, in `TurkeyError.__init__`, so a message added later cannot
+forget: no diagnostic ever says `Main#f`.
+
+**Three kinds of name stay unqualified.** Locals, because they never leave the
+scope that binds them. Class methods, because classes and instances are global
+(below) and a method means the same thing in every module — which is also what
+lets a program define its own `add`: the ordinary binding becomes `Main#add`
+and the method stays `add`, and the two coexist. And *operators*.
+
+**The operator hazard.** `a + b` has desugared to a plain `EVar("add")` at
+parse time since delta 32. That was safe only while no program could define
+`add`; the moment shadowing an import became legal, a module's own `add` would
+have silently captured every `+` in the file. The parser now marks the node it
+writes (`EVar.method`), and resolution skips a marked node — so `+` still means
+`Add.add` in a module whose own `add` concatenates strings. The same mark
+covers the `iter`/`next` a `for` loop desugars to.
+
+**Classes, instances and type constructors are global, not scoped.** They are
+registered into one shared `ClassTable`/`DeclTable` as each module is checked,
+and an import neither adds nor withholds them. Instance coherence is the
+reason: a predicate is solved once, and it must not matter which module asked.
+Concretely, `Solver._class` and `Elaborator.resolve` must agree about which
+instances exist, and a disagreement between them surfaces as an *internal
+error* rather than a diagnostic. Global instances is what keeps them in
+agreement. The consequence is that an export list's type and class entries
+(`Point(..)`, `Eq(..)`) parse and are accepted but withhold nothing; a
+constructor is reachable from any module, qualified or not. Delta 43 is where
+that is repaid.
+
+**The import graph must be acyclic.** Two modules that need each other are one
+module here: the checker solves a whole module's bindings as one
+dependency-ordered pass, and nothing would interleave two. A cycle is reported
+by name (`imports form a cycle: Odd -> Even -> Odd`).
+
+**The prelude is a file.** `turkey/lib/Prelude.tl` is ordinary source, loaded
+like any other module and implicitly imported by every one. It is checked, not
+trusted — `class Add a` and `instance Add Int` go through exactly the machinery
+a user's would. `turkey/prelude.py` keeps only what the *compiler* has to know:
+which method an operator desugars to, and what a `for` loop is written in terms
+of. `Prim.*` is in the shared environment so that the prelude can be checked
+against it, and is kept out of the language one stage earlier: a module's scope
+spells `Prim.intAdd` only if the module lives under `turkey/lib`.
+
+**Two smaller fixes fall out.** §7's alias-vs-data question is decided by a
+token pre-pass over `type CONID` in one file, so a type name declared in
+*another* file was invisible to it and `type Foo = Bar` with an imported `Bar`
+would have misparsed; the loader threads the known type names into `parse`. And
+`import qualified M as S (f)` did not parse at all — the parser's `elif` chain
+made `as` and a selective list mutually exclusive.
+
+**A span knows its file.** `Span` gained `file`, set by the lexer, so a
+diagnostic in an imported module names that module rather than the entry point.
+It is `None` for the entry file, which keeps single-file diagnostics printing
+the name the CLI was given.
+
+**Scope.** No golden moved. `tests/programs/err_modules_unsupported` is gone,
+replaced by three multi-file programs — a directory under `tests/programs/`
+whose entry is `Main.tl` is now a program — and `tests/test_modules.py` covers
+the scoping rules themselves. Three tests changed because what they asserted is
+what this delta reverses: a method and a top-level function may now share a
+name, and a program may define `add`.

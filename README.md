@@ -81,7 +81,10 @@ main : fun() -> Unit
 | `turkey/exhaustive.py` | Maranget's usefulness algorithm, for match warnings |
 | `turkey/values.py` | Runtime values; array length/capacity semantics |
 | `turkey/eval.py` | Tree-walking evaluator |
-| `turkey/builtins.py` | The initial environment |
+| `turkey/builtins.py` | The initial environment, and the machine primitives |
+| `turkey/modules.py` | The import graph, and what each module can see |
+| `turkey/resolve.py` | Rewrites a module's names so the program shares one namespace |
+| `turkey/lib/` | The library, written in the language: `Prelude.tl` |
 
 Three things are worth knowing before reading the code, because they are where
 this language departs from a textbook implementation.
@@ -121,11 +124,17 @@ write the two files — or write the `.tl` and run
 `python3 tests/regenerate_expected.py`, then read the diff to confirm the
 output is what you meant.
 
+`tests/programs/` also holds *directories*: one whose entry module is `Main.tl`
+is a multi-file program, run from inside that directory, with its golden in
+`Main.expected` beside it.
+
 ## Not in v0
 
-Modules (§9) are parsed and then rejected; a program is one file, and the
-`Data.Array`, `Data.String` and `Data.Int` names are seeded directly into the
-initial environment. Typeclasses were already out of scope in the spec, so
-operators stay monomorphic (§8.2). Type annotations are not skolemized, so an
-over-general signature such as `fun f(x) -> a { 5 }` is accepted rather than
-rejected (SPEC-DELTAS.md 13). Exhaustiveness is a warning, per §5.1.
+Modules (§9) work — a program is a directory, `import` means what §9 says, and
+the prelude is an ordinary file under `turkey/lib` (SPEC-DELTAS.md 41). What is
+not there yet: `Data.Array`, `Data.String` and `Data.Int` are still names
+seeded into the initial environment rather than modules written in the
+language, and classes, instances and type constructors are global — an export
+list may name a type or a class, but withholds nothing. So two libraries that
+each declare a `Node` cannot yet be used together, and there is no orphan rule.
+Exhaustiveness is a warning, per §5.1.

@@ -99,11 +99,14 @@ def test_the_machine_write_is_not_in_the_surface_language():
 
 
 def test_the_prelude_exports_its_bindings_and_nothing_else():
-    checked = check("fun main() {}")
-    assert checked.env.lookup("print") is not None
-    assert checked.env.lookup("show") is not None      # a method of a shared class
-    assert checked.env.lookup("Prim.print") is None
-    assert checked.env.lookup("Prim.intAdd") is None
+    """What a module may write is its *scope*, not the environment: after
+    M11a every builtin lives in one environment and resolution is what
+    decides which of them a given module can name."""
+    scope = check("fun main() {}").scope
+    assert scope["print"] == "Prelude#print"
+    assert scope["show"] == "show"                     # a method of a shared class
+    assert "Prim.print" not in scope
+    assert "Prim.intAdd" not in scope
 
 
 def test_option_comes_from_the_prelude():

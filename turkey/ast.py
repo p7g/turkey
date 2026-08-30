@@ -142,6 +142,11 @@ class EUnit(Expr):
 @dataclass(eq=False)
 class EVar(Expr):
     name: str
+    # True when the parser wrote this node itself to mean a *class method* --
+    # the `add` an `+` desugars to. Module resolution leaves such a node alone,
+    # so a module that defines its own `add` shadows the Prelude's for ordinary
+    # calls without quietly capturing every `+` in the file (M11a).
+    method: bool = False
     # `evidence.Use`: the dictionaries this occurrence needs. Attached by the
     # generator, filled in by the solver and the elaborator. A name with no
     # class predicates keeps `None` and costs nothing.

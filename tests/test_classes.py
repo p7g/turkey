@@ -303,9 +303,11 @@ def test_an_instance_method_states_no_signature():
     assert inst.methods[0].body is not None
 
 
-def test_a_method_may_not_share_a_name_with_a_top_level_function():
+def test_a_method_may_share_a_name_with_a_top_level_function():
+    """It could not before M11a, because both lived in one flat namespace. A
+    top-level binding belongs to its module now; a method stays global."""
     src = EQ + "fun egal(x, y) = x"
-    assert "'egal' is already defined" in bad(src)
+    assert sigs(src)["egal"] == "fun(a, b) -> a"
 
 
 def test_a_method_may_not_be_declared_by_two_classes():

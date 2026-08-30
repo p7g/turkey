@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 from .driver import check, report_warnings, run
 from .errors import TurkeyError, TurkeyPanic
@@ -38,7 +39,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "ast":
             print(parse(src))
         elif args.command == "types":
-            checked = check(src)
+            checked = check(src, args.file, [Path(args.file).resolve().parent])
             report_warnings(checked.warnings, args.file)
             for name, scheme in checked.signatures:
                 print(f"{name} : {show_scheme(scheme)}")

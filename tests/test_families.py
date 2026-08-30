@@ -431,6 +431,6 @@ def test_an_equality_costs_no_dictionary():
     """
     checked = check(src)
     decl = next(s.decl for s in checked.ordered
-                if isinstance(s, ast.SFun) and s.decl.name == "c")
+                if isinstance(s, ast.SFun) and s.decl.name.endswith("#c"))
     assert [p.name for p in decl.dicts.preds] == ["Iterator"]
     assert len(decl.dicts.params) == 1

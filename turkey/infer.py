@@ -239,6 +239,11 @@ class Generator:
         """Put every class method in scope, under the scheme its class gives it."""
         for info in self.classes.classes.values():
             for method in info.methods.values():
+                if method.name in self.classes.owner and self.bound(method.name):
+                    # Already bound by an earlier module: a class method is
+                    # global and unqualified, so every module sees the same
+                    # one. Binding it again is a no-op, not a collision.
+                    continue
                 if self.bound(method.name):
                     raise TypeError_(
                         f"'{method.name}' is already defined; a class method "

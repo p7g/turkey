@@ -71,9 +71,15 @@ def fails(src: str) -> str:
     return exc.value.message
 
 
+
+def _short(name: str) -> str:
+    """A top-level binding is `Module#name` after resolution (M11a); the tests
+    ask for it the way it was written."""
+    return name.rpartition("#")[2]
+
 def _decl(checked, name: str) -> ast.FunDecl:
     for item in checked.program.decls:
-        if isinstance(item, ast.SFun) and item.decl.name == name:
+        if isinstance(item, ast.SFun) and _short(item.decl.name) == name:
             return item.decl
     raise AssertionError(f"no top-level fun '{name}'")
 

@@ -542,15 +542,30 @@ The classes that ship, and their instances:
 | `Add` `Sub` `Mul` `Div` | | `Int` `Float` |
 | `Rem` | `rem` | `Int` |
 | `Neg` | `neg` | `Int` `Float` |
-| `Show` | `show` | `Int` `Float` `String` `Char` `Bool`, and `Array a` / `Option a` given `Show a` |
+| `Show` | `show` | `Int` `Float` `String` `Char` `Bool`, and `Array a` / `Option a` / `Either l r` given `Show` of the parts |
 | `Iterator` | `iter`, `next`, and the families `Item` and `Cursor` | `Array a` |
+| `Functor` | `map` | `Option` `Either l` `Array` |
+| `Applicative : Functor` | `pure` | `Option` `Either l` `Array` |
+| `Monad : Applicative` | `bind` | `Option` `Either l` `Array` |
+
+The last three are what `?` means (SPEC-DELTAS.md 45). Their class variable has
+kind `* -> *`, discovered from `m a` in `bind`'s own signature and written down
+nowhere. `Monad (Either l)` fixes the left parameter and varies the right, which
+is why `Either` is right-biased — the same one-parameter constraint the
+homogeneity paragraph above describes, seen from the other side. Unlike the
+operator classes, these three claim their method names: `map`, `pure` and `bind`
+are the prelude's, and a program cannot define its own.
 
 `print` and `write` are not builtins. Both are `[Show a] fun(a) -> Unit`,
 written in the prelude as `Prim.print(show(x))`, and `Prim.print` is the only
 thing that reaches stdout and is reachable from nowhere else. So the only way
 to print a value is to say what it looks like as a `String`.
 
-`Option a` is declared in the prelude, because `Iterator.next` needs it.
+`Option a` is declared in the prelude, because `Iterator.next` needs it. `Either
+l r` is there too, and for a weaker reason: nothing in the language names it, but
+`?` is only worth having over more than one monad, and "failure that says why" is
+the second one (SPEC-DELTAS.md 45). Both live beside their functions, in
+`Data.Option` and `Data.Either`, and are re-exported.
 
 `String.eq`, `String.lt`, `Bool.eq`, `Float.lt` and `Char.eq` are gone: they
 were the per-type equality this section promised would be "unified under

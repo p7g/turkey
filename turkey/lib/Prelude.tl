@@ -56,9 +56,15 @@ module Prelude (
     Bool(..),
     Option(..),
 
+    -- `Either` is named by no rule of the language, unlike the two above. It
+    -- is here because `?` is only worth having over more than one monad, and
+    -- an error that says why is the second one (delta 45).
+    Either(..),
+
     module Array,
     module Bool,
     module Char,
+    module Either,
     module Float,
     module Int,
     module Option,
@@ -66,11 +72,13 @@ module Prelude (
 ) where
 
 import Data.Bool   (Bool(..))
+import Data.Either (Either(..))
 import Data.Option (Option(..))
 
 import qualified Data.Array  as Array
 import qualified Data.Bool   as Bool
 import qualified Data.Char   as Char
+import qualified Data.Either as Either
 import qualified Data.Float  as Float
 import qualified Data.Int    as Int
 import qualified Data.Option as Option
@@ -96,6 +104,32 @@ class Rem a { fun rem(a, a) -> a }
 class Neg a { fun neg(a) -> a }
 
 class Show a { fun show(a) -> String }
+
+-- The three classes `?` is written against (delta 45). `Monad` is the one it
+-- needs; the other two are here because a `Monad` that cannot lift a plain
+-- value is not one anybody can write code against, and because the chain is
+-- the one every reader already knows.
+--
+-- The kinds are discovered, not written: `f a` in `map`'s signature is the only
+-- evidence that `f :: * -> *`, exactly as `type Wrap f a = Wrap(f a)` discovers
+-- it at the type level (M4). Nothing here asks anything new of M5 or M6.
+--
+-- Unlike `Add` and `Ord`, these three claim ordinary names: `map`, `pure` and
+-- `bind` are the prelude's now, and a program cannot define its own. `?` did
+-- not need that -- it reaches `bind` the way `+` reaches `add`, through a
+-- marked node resolution leaves alone -- so exporting them is a choice made for
+-- the reader, and `map` is the one most likely to be missed.
+class Functor f {
+    fun map(f a, fun(a) -> b) -> f b
+}
+
+class Applicative f : Functor f {
+    fun pure(a) -> f a
+}
+
+class Monad m : Applicative m {
+    fun bind(m a, fun(a) -> m b) -> m b
+}
 
 class Iterator c {
     type Item c
@@ -150,6 +184,65 @@ instance Iterator (Array a) {
     }
 }
 
+-- The three monads that ship. `Option` is failure with nothing to say, `Either
+-- l` is failure that says why, and `Array` is the list monad -- the one whose
+-- bind invokes its continuation more than once, and so the one that settles
+-- that `?` means bind and not an early return.
+instance Functor Option {
+    fun map(o, g) = match o {
+        Some(x) -> Some(g(x))
+        None -> None
+    }
+}
+
+instance Applicative Option { fun pure(x) = Some(x) }
+
+instance Monad Option {
+    fun bind(o, g) = match o {
+        Some(x) -> g(x)
+        None -> None
+    }
+}
+
+-- `Either l` fixes the left parameter and varies the right, because a class has
+-- one parameter and the right is what is left over. The rightward bias every
+-- `Either` in every language has is that fact, not a taste.
+instance Functor (Either l) {
+    fun map(e, g) = match e {
+        Right(x) -> Right(g(x))
+        Left(y) -> Left(y)
+    }
+}
+
+instance Applicative (Either l) { fun pure(x) = Right(x) }
+
+instance Monad (Either l) {
+    fun bind(e, g) = match e {
+        Right(x) -> g(x)
+        Left(y) -> Left(y)
+    }
+}
+
+instance Functor Array {
+    fun map(xs, g) {
+        let out = Array.new(xs.length)
+        for x in xs { Array.push(out, g(x)) }
+        out
+    }
+}
+
+instance Applicative Array { fun pure(x) = [x] }
+
+instance Monad Array {
+    fun bind(xs, g) {
+        let out = Array.new(xs.length)
+        for x in xs {
+            for y in g(x) { Array.push(out, y) }
+        }
+        out
+    }
+}
+
 instance Show Int { fun show(x) = Int.toString(x) }
 instance Show Float { fun show(x) = Float.toString(x) }
 instance Show Bool { fun show(x) = Bool.toString(x) }
@@ -160,6 +253,13 @@ instance [Show a] Show (Option a) {
     fun show(o) = match o {
         None -> "None"
         Some(x) -> "Some(" + show(x) + ")"
+    }
+}
+
+instance [Show l, Show r] Show (Either l r) {
+    fun show(e) = match e {
+        Left(x) -> "Left(" + show(x) + ")"
+        Right(x) -> "Right(" + show(x) + ")"
     }
 }
 

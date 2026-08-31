@@ -64,26 +64,9 @@ instance [Semigroup a] Monoid (Array a) {
     fun empty() = []
 }
 
-class Functor f {
-    fun map(f a, fun(a) -> b) -> f b
-}
-
-instance Functor Option {
-    fun map(opt, g) = match opt {
-        Some(x) -> Some(g(x))
-        None -> None
-    }
-}
-
-instance Functor Array {
-    fun map(xs, g) {
-        let out = Array.new(xs.length)
-        for x in xs {
-            Array.push(out, g(x))
-        }
-        return out
-    }
-}
+-- `Functor`, and its `Option` and `Array` instances, moved to the prelude at
+-- delta 45 -- `map` below is that class's method, reached through that
+-- dictionary, and this file is now one of its callers rather than its author.
 
 -- A method with a context of its own: `Monoid m` is per *call*, so it arrives
 -- as an argument where the `Foldable` dictionary arrives by selection.

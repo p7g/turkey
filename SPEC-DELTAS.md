@@ -1577,3 +1577,75 @@ test that relied on that pinning writes the annotation instead.
 
 **Scope.** Every `.tl` that concatenated changed spelling; no `.expected` and no
 `.types` golden moved.
+
+### 45. `Functor`, `Applicative` and `Monad`, and the library grows an `Either`
+
+`plan.txt` item 4 wants `?`: Rust's operator, generalized past `Result` to any
+monad. Before any of that can be spelled there has to be something for it to
+mean, and there was nothing — no `Monad`, no `bind`, no `pure`, no `Either`
+anywhere in the language or its library. This entry is that groundwork and no
+syntax at all; `?` itself is delta 46.
+
+**The chain is the one everybody knows.** `class Functor f`, then
+`class Applicative f : Functor f` adding `pure`, then `class Monad m :
+Applicative m` adding `bind`. Only `bind` is needed to give `?` a meaning, and
+the argument for the other two is not fidelity to Haskell: a `Monad` with no way
+back in from a plain value is one nobody can write a generic function against,
+and the lowering of `?` in delta 47 emits `pure` itself.
+
+**Nothing in the checker moved.** A class whose variable has kind `* -> *` has
+been expressible since M4, and `bind`'s own signature is the only evidence that
+`m` is one — `m a` appears in it, so the kind is discovered exactly as
+`type Wrap f a = Wrap(f a)` discovers it. `pure`'s class variable appears only
+in its result, which is the shape `Monoid.empty` already had and the reason M6
+passes dictionaries rather than selecting them from an argument. `instance Monad
+(Either l)` is a partially applied head, which delta 29's Haskell 98 rule has
+always allowed. Three classes and nine instances, all of it ordinary source in
+`turkey/lib/Prelude.tl`, checked by the same machinery a program's own would be.
+
+**`Either` is declared beside its functions**, in `turkey/lib/Data/Either.tl`,
+the way delta 42 put `Option` in `Data.Option` — and re-exported by the Prelude
+both qualified (`Either.isRight`) and unqualified (`Either(..)`), so `Left` and
+`Right` need no import. `Option` earned its unqualified place by being named by
+a rule of the language, since `next` answers one. `Either` has no such claim; it
+is there because `?` is only worth having over more than one monad, and "failure
+that says why" is the second one.
+
+**The instances are right-biased because a class has one parameter.** `Monad
+(Either l)` fixes `l` and varies `r`, so `map`, `pure` and `bind` can only work
+on `Right` and pass a `Left` through. The bias every language's `Either` has is
+that fact rather than a taste, and §8.2's homogeneity paragraph is the same
+constraint seen from the other side.
+
+**`Array` is a monad, and that is the point.** Its `bind` invokes the
+continuation once per element, so `bind([1,2,3], fun(x) = bind([10,20], fun(y) =
+pure(x*y)))` is the cross product. A monad whose continuation runs zero times
+(`None`), once (`Some`), and many times (`Array`) is what settles the question
+delta 46 has to answer: `?` means the instance's `bind`, and cannot mean an
+early return, because for `Array` there is no single value to return early with.
+
+**What it costs.** Three ordinary names. `map`, `pure` and `bind` are the
+prelude's now, and a program cannot define its own — which takes `plan.txt`
+item 3's count of names the prelude claims from seventeen to twenty, and `map`
+is the one most likely to be wanted back. `?` did not require this: it reaches
+`bind` the way `+` reaches `add`, through a node marked at parse time that
+resolution leaves alone (`turkey/resolve.py`), so the methods could have stayed
+qualified. Exporting them is a choice made for the reader, and the cost is
+stated here rather than left to be discovered.
+
+A second cost, smaller and worth knowing: **a class is a single global name**,
+where delta 43 qualified types and instances by the module that declared them.
+So a program that declares its own `Functor` now collides with the prelude's,
+where a program declaring its own `Either` merely shadows and prints as
+`Main.Either`. Two goldens declared a `Functor` and now consume the prelude's
+instead. Whether classes should be qualified too is a real question and not this
+entry's to answer.
+
+**Scope.** `classes.tl` and `dicts.tl` lost their local `Functor` — the first
+keeps its `instance Functor (Either l)` over its own `Either`, which is still
+what shows a partially applied head — and both `.types` goldens lost their `map`
+line. `tests/test_classes.py` renamed its fixture class to `Mappable`/`over` and
+dropped the local `Either` its helpers prepended. New golden `monads.tl`, with
+`.expected` and `.types`, writes the chains out by hand: it is what delta 46's
+sugar has to agree with, and worth reading in longhand once before any of it is
+hidden.

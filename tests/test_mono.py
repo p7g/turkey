@@ -149,14 +149,10 @@ fun main() { print(Int.toString(twice([1, 2])[0])) }
                     f"'{bind.name}' still builds a dictionary per request")
 
 
-def test_a_recursive_instance_names_itself():
-    """`Display (Array Rose)` needs `Display Rose`, which needs it back.
-
-    The collapse has to close the cycle on the binding it is in the middle of
-    making, rather than asking for another one -- which is what recording the
-    name before building the body is for.
-    """
-    checked = check("""
+# `Display (Array Rose)` needs `Display Rose`, which needs it back: the two
+# ground dictionaries are a cycle. Used both for what the pass builds and,
+# below, for whether the evaluator can then build it.
+RECURSIVE_INSTANCE = """
 class Display a {
     fun display(a) -> String
 }
@@ -185,7 +181,17 @@ instance Display Rose {
 }
 
 fun main() { print(display(Node([Leaf(1), Node([Leaf(2)]), Leaf(3)]))) }
-""")
+"""
+
+
+def test_a_recursive_instance_names_itself():
+    """`Display (Array Rose)` needs `Display Rose`, which needs it back.
+
+    The collapse has to close the cycle on the binding it is in the middle of
+    making, rather than asking for another one -- which is what recording the
+    name before building the body is for.
+    """
+    checked = check(RECURSIVE_INSTANCE)
     built = named(checked.mono, "%inst.Display.Array@Rose")
     assert isinstance(built.value, CRecord)
     inner = [n.name for n in walk(built.value) if isinstance(n, CVar)]
@@ -265,3 +271,59 @@ def test_the_capped_program_still_runs(capsys):
     from turkey.driver import run
     run(POLYREC)
     assert capsys.readouterr().out.splitlines() == ["3"]
+
+
+# -- the specialized program is the one that runs (M14b) ---------------------
+#
+# `driver.run` evaluates `checked.mono`, so every golden in `tests/programs`
+# is already a differential test of the pass: same source, same `.expected`,
+# a different Core underneath. The two cases below are the ones the plan
+# singled out to confirm rather than assume, because neither is visible in a
+# golden's output when it goes wrong -- one crashes, the other silently
+# prints a smaller number.
+
+
+def test_a_recursive_instance_closes_its_cycle_at_run_time(capsys):
+    """The structural test above says the binding names itself. This says the
+    evaluator can then build it.
+
+    A ground self-referential dictionary is a cycle among `program.dicts`, and
+    what resolves it is `Evaluator.run`'s two-pass loop: bind every dictionary
+    to an empty record first, fill the fields second. Before specialization
+    the cycle was not there to close -- the recursive mention was an
+    application to be performed later.
+    """
+    from turkey.driver import run
+
+    run(RECURSIVE_INSTANCE)
+    assert capsys.readouterr().out.splitlines() == ["(1(2)3)"]
+
+
+def test_specializing_a_binding_does_not_duplicate_a_cell(capsys):
+    """Copying a binding must copy code, never state.
+
+    It holds because only a *generalized* binding is copied and, under the
+    value restriction (design.md 4.4), a generalized right-hand side is a
+    syntactic value -- so a binding that owns a mutable cell is monomorphic
+    and is carried through as itself. `counter` below is reached from two
+    specializations of `bump`; if each copy had got its own, this prints 1.
+    """
+    from turkey.driver import run
+
+    run(SEMI + """
+type Cell = Cell { n : Int }
+
+let counter = Cell { n = 0 }
+
+fun bump[Semigroup a](x : a) -> a {
+    counter.n = counter.n + 1
+    combine(x, x)
+}
+
+fun main() {
+    bump(1)
+    bump("a")
+    print(Int.toString(counter.n))
+}
+""")
+    assert capsys.readouterr().out.splitlines() == ["2"]

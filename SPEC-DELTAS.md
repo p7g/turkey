@@ -2198,3 +2198,45 @@ writes the same way the ones it replaces were reduced; one call and one field in
 runs the unspecialized Core -- making the specialized one the program that runs
 is the next step, and it is kept separate for the reason delta 50 was kept
 separate from delta 49.
+
+### 52. The program that runs is the specialized one
+
+`plan.txt` item 6, second of three, and delta 51's claim collected. One line:
+`driver.run` evaluates `checked.mono` rather than `checked.core`. The
+unspecialized Core is still built, still checked, and still what `turkey core`
+prints -- it is what the specialization is *read against*, and delta 51's whole
+argument for the `dicts.core`/`dicts.mono` pair depends on both existing -- but
+nothing evaluates it any more.
+
+**The suite is the differential test, and it is the only one worth having.**
+Twenty-three of the forty-two golden programs actually run (the other nineteen
+are `err_` cases that are expected to fail before evaluation). All twenty-three
+produce byte-identical output with a different Core underneath. That is the same
+evidence delta 50 offered, and it is the right evidence: a specializer's
+correctness claim is *this program means what it meant*, and the goldens are the
+only place that claim is written down as text rather than as structure.
+
+Two things were confirmed rather than assumed, because neither is visible in a
+golden when it goes wrong -- one crashes, the other silently prints a smaller
+number.
+
+**A ground self-referential dictionary is a cycle that has to close.**
+`Display (Array Rose)` needs `Display Rose`, which needs it back. Before
+specialization the cycle was not there: the recursive mention was an application
+to be performed later, at a variable. Afterwards both are top-level bindings
+that name each other, and what resolves them is the two-pass loop delta 50 wrote
+for exactly this -- bind every dictionary to an empty record first, fill the
+fields second. It does resolve them, and now there is a test that says so.
+
+**Copying a binding copies code, never state.** The property holds for a reason
+worth stating: only a *generalized* binding is copied, and under the value
+restriction (design.md 4.4) a generalized right-hand side is a syntactic value,
+so a binding that owns a `var` cell is monomorphic and is carried through as
+itself rather than duplicated. A top-level cell reached from two specializations
+of the same function is one cell.
+
+**Scope.** One line in `turkey/driver.py`; the same line in `tests/test_modules.py`'s
+runner; two tests in `tests/test_mono.py`. **No `.expected` moved**, which is
+the entry's whole claim. What is still not done is delta 51's third part:
+a method selection off a ground dictionary is still a record projection at run
+time, and nothing is dropped for being unreachable.

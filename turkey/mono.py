@@ -71,7 +71,9 @@ rather than what it consumes.
 
 The result is checked by `turkey/coretc.py`, unconditionally, exactly as the
 lowering is. A pass whose output nobody checks is believed for the reason the
-pre-M13 elaborator was believed, which is that nobody looked.
+pre-M13 elaborator was believed, which is that nobody looked. It is also the
+program the evaluator runs (delta 52), so the goldens are its differential
+test: the same source, the same `.expected`, a different Core underneath.
 """
 
 from __future__ import annotations

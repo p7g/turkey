@@ -231,6 +231,13 @@ def test_an_equation_that_can_never_be_decided_is_rejected():
     # `c` is the name the signature wrote, kept by the skolem (delta 38).
     assert "cannot reduce 'Elem c' to 'Int'" in message
     assert "which 'Container' instance defines it" in message
+    # And the remedy, which is the equality itself: `f` is rejected for saying
+    # too little, not for being wrong, and adding it to the context fixes it.
+    assert "Add 'Elem c ~ Int' to the context." in message
+    assert scheme(
+        CONTAINER + "fun f[Elem c ~ Int, Container c](xs : c) -> Int = first(xs)",
+        "f",
+    ) == "[Elem a ~ Int, Container a] fun(a) -> Int"
 
 
 def test_a_family_over_a_type_with_no_instance_is_rejected_where_written():

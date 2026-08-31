@@ -563,11 +563,17 @@ def show_expr(e: CExpr | None, indent: int = 0,
     if isinstance(e, CJump):
         return _call(None, f"jump {alias(e.name)}", e.args, pad, indent, names, alias)
     if isinstance(e, CRef):
-        return f"{pad}ref({show_expr(e.value, 0, names, alias).strip()})"
+        return _call(None, "ref", [e.value], pad, indent, names, alias)
     if isinstance(e, CDeref):
         return f"{pad}!{show_expr(e.target, 0, names, alias).strip()}"
     if isinstance(e, CAssign):
-        return f"{pad}{show_expr(e.target, 0, names, alias).strip()} := {show_expr(e.value, 0, names, alias).strip()}"
+        value = show_expr(e.value, 0, names, alias).strip()
+        target = show_expr(e.target, 0, names, alias).strip()
+        if "\n" in value:
+            # An assigned value that is itself a block, which is what a
+            # dereference-and-add becomes once the dictionary is inlined.
+            return f"{pad}{target} :=\n{show_expr(e.value, indent + 1, names, alias)}"
+        return f"{pad}{target} := {value}"
     if isinstance(e, CIf):
         cond = show_expr(e.cond, 0, names, alias).strip()
         if "\n" in cond:

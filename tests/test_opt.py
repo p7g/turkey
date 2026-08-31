@@ -95,12 +95,20 @@ def test_the_dictionary_let_a_devirtualized_method_leaves_is_dropped():
 # -- and the reductions that must not fire -----------------------------------
 
 
-def test_a_body_holding_a_return_is_not_inlined():
-    """Found the hard way, on `polyrec.tl`.
+def test_a_body_that_used_to_hold_a_return_is_inlined_now():
+    """The debt M15e settles, written as the test that used to assert it.
 
-    `return` names its target by where it is -- item 7's last step is what
-    changes that -- so a body holding one, dropped into a caller, returns from
-    the caller. The program printed one line of four and exited cleanly.
+    `return` named its target by where it was, so a body holding one could not
+    be moved: dropped into a caller it returned from the caller, and `polyrec.tl`
+    printed one line of four. The pass refused to inline any such body, which
+    was one function in eight across the suite.
+
+    `loops.collapse` runs first now and makes that `return` a jump to a join
+    point in the function's own body, and a join point travels with the term it
+    is in. So the refusal is gone and the call is inlined. `opt._transfers`
+    still guards, because `turkey/lower.py` still emits the nodes and this pass
+    is partial by design -- but on a term it converted, there is nothing left
+    for the guard to find.
     """
     program = optimized("""
 fun guard(n : Int) -> Int {
@@ -112,7 +120,7 @@ fun main() {
     print(guard(0 - 1))
 }
 """)
-    assert calls_to(named(program, "Main#main"), "Main#guard") == 2
+    assert calls_to(named(program, "Main#main"), "Main#guard") == 0
 
 
 def test_an_argument_is_not_captured_by_a_loop_variable():

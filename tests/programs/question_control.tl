@@ -136,6 +136,22 @@ fun spread(xs : Array Int) -> Array Int {
     pure(t)
 }
 
+-- `return` under `Array`, which is where "carried as a value" is easiest to
+-- misread. It does *not* stop the other branches: in a three-element bind it
+-- replaces one branch's answer and the other two are untouched. That is not the
+-- encoding showing through -- `pickByHand` has no `?` and no `Flow` in it and
+-- answers the same -- it is that "return" cannot mean anything else in a monad
+-- where the continuation runs more than once.
+fun pick(xs : Array Int) -> Array Int {
+    let x = xs?
+    if x == 2 { return [999] }
+    pure(x * 10)
+}
+
+fun pickByHand(xs : Array Int) -> Array Int {
+    bind(xs, fun(x) = if x == 2 { [999] } else { pure(x * 10) })
+}
+
 fun spreadByHand(xs : Array Int) -> Array Int {
     var t = 0
     let seq = [1, 2]
@@ -185,4 +201,7 @@ fun main() {
     -- most: these two must agree, and the second contains no `?`.
     print(spread([10, 20]))
     print(spreadByHand([10, 20]))
+
+    print(pick([1, 2, 3]))
+    print(pickByHand([1, 2, 3]))
 }

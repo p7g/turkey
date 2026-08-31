@@ -170,6 +170,26 @@ instance Neg Float { fun neg(x) = Prim.floatNeg(x) }
 -- name it; it exists so that `Cursor (Array a)` has something to be.
 type ArrayCursor = ArrayCursor { at : Int }
 
+-- What a `return`, `break` or `continue` becomes when it has to cross a `?`
+-- (delta 47). Like `ArrayCursor` above, nothing else in the language may name
+-- it: it is not exported, and only `turkey/desugar.py` ever writes one.
+--
+-- A transfer of control cannot *escape* through a `bind` -- escaping is not
+-- something a `bind` does, and for `Array`, whose bind runs its continuation
+-- once per element, there is no coherent thing for an escape to mean. So it
+-- travels as a value instead, because a value is the only thing a `bind`
+-- propagates. Each statement in a block that needs this answers with one of
+-- these, and the next statement runs only under `Fall`.
+--
+--   `Fall(a)`  fell off the end with this value; carry on
+--   `Brk(b)`   the enclosing loop is finished, with this value
+--   `Cont`     this iteration is finished
+--   `Ret(r)`   the enclosing function is finished, with this value
+--
+-- Three parameters because the three values are three types: a block's own
+-- value, its loop's, and its function's.
+type Flow a b r = Fall(a) | Brk(b) | Cont | Ret(r)
+
 instance Iterator (Array a) {
     type Item = a
     type Cursor = ArrayCursor

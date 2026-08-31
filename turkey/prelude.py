@@ -35,6 +35,20 @@ MONAD_CLASS = "Monad"
 MONAD_BIND = "bind"
 MONAD_PURE = "pure"
 
+# What a `return`, `break` or `continue` becomes when it crosses a `?` (delta
+# 47). Declared in the Prelude and exported by nothing, like `ArrayCursor`, so
+# only the lowering can write one.
+FLOW = "Prelude#Flow"
+FLOW_FALL = "Prelude#Fall"
+FLOW_BRK = "Prelude#Brk"
+FLOW_CONT = "Prelude#Cont"
+FLOW_RET = "Prelude#Ret"
+
+# `error` diverges, so it can stand in for a `Flow` arm the language's own rules
+# make unreachable -- a `break` where there is no loop -- which the exhaustive-
+# ness checker has no way to know is unreachable.
+ERROR = "Prelude#error"
+
 ITER_CLASS = "Iterator"
 ITER_ITEM = "Item"
 ITER_CURSOR = "Cursor"

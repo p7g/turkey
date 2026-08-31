@@ -37,19 +37,33 @@ def refuse(src: str) -> str:
     return exc.value.message
 
 
+_GENERATED = re.compile(r"%([a-z]+)\d+")
+
+
 def _normalize(text: str) -> str:
-    """`%k7` -> `%k1`, `%k9` -> `%k2`, in order of first appearance."""
+    """`%k7` -> `%k1`, `%fell9` -> `%fell1`, in order of first appearance.
+
+    The prefix is kept because it says what the binder is for; only the counter,
+    which is shared across the whole pass, is not part of any claim.
+    """
     seen: dict[str, str] = {}
-    for name in re.findall(r"%k\d+", text):
-        seen.setdefault(name, f"%k{len(seen) + 1}")
-    return re.sub(r"%k\d+", lambda m: seen[m.group()], text)
+    counts: dict[str, int] = {}
+
+    def rename(match: re.Match[str]) -> str:
+        whole, prefix = match.group(), match.group(1)
+        if whole not in seen:
+            counts[prefix] = counts.get(prefix, 0) + 1
+            seen[whole] = f"%{prefix}{counts[prefix]}"
+        return seen[whole]
+
+    return _GENERATED.sub(rename, text)
 
 
 def show(e) -> str:
     """A small printer -- enough of one to read a lowering back."""
     t = type(e)
     if t is ast.EVar:
-        return e.name
+        return _short(e.name)
     if t is ast.ECon:
         return _short(e.name)
     if t is ast.ELit:
@@ -232,15 +246,61 @@ def test_short_circuiting_is_preserved_by_reading_the_operator_as_an_if():
 # -- what is refused, for now -------------------------------------------------
 
 
-def test_a_question_in_a_loop_body_is_refused():
-    assert "not supported inside a loop yet" in \
-        refuse("fun f(xs) { for x in xs { let y = x?; k(y) } }")
+UNREACHABLE = 'error("internal error: a loop transfer escaped its loop")'
 
 
-def test_a_return_after_a_question_is_refused():
-    """It would land inside the generated lambda and mean the wrong thing."""
-    assert "cannot cross a '?' yet" in \
-        refuse("fun f(a) { let x = a?; if x { return None }; k(x) }")
+def _boundary(n: int) -> str:
+    """The do-context boundary, where `Ret` stops being a value again."""
+    return (f"fun(%k{n}) match %k{n} {{ Fall(%v) -> %v Ret(%r) -> %r "
+            f"Brk(_) -> {UNREACHABLE} Cont -> {UNREACHABLE} }})")
+
+
+def test_a_return_after_a_question_becomes_a_value():
+    """It would land inside the generated lambda, where `return` means "return
+    from the lambda" -- so it stops being a jump and becomes a `Ret`, and the
+    context's boundary cashes it back in.
+
+    `Brk` and `Cont` cannot arrive at a function's boundary, but nothing in the
+    type system knows that, so the arms exist and diverge."""
+    assert lower("fun f(a) { let x = a?; return n; k(x) }") == \
+        "bind(bind(a, fun(%k1) { let x = %k1; pure(Ret(n)) }), " + _boundary(2)
+
+
+def test_the_statements_after_a_transfer_are_not_translated():
+    """`return` ends the sequence: what follows it cannot run."""
+    assert "k(x)" not in lower("fun f(a) { let x = a?; return n; k(x) }")
+
+
+def test_a_loop_becomes_a_recursive_function_answering_with_a_flow():
+    """A loop's continuation is not known until its body has run, so it cannot
+    be a lambda written once. `Fall` and `Cont` both go round again."""
+    assert lower("fun f(a) { while c { let x = a?; k(x) }\n done() }") == (
+        "bind(bind({ fun %loop1(...) if c "
+        "bind(bind(a, fun(%k1) { let x = %k1; pure(Fall(k(x))) }), "
+        "fun(%k2) match %k2 { Fall(_) -> %loop1() Cont -> %loop1() "
+        "Brk(%b) -> pure(Fall(%b)) Ret(%r) -> pure(Ret(%r)) }) "
+        "else pure(Fall(())); %loop1() }, "
+        "fun(%k3) match %k3 { Fall(%fell1) -> pure(Fall(done())) "
+        "Brk(%b) -> pure(Brk(%b)) Cont -> pure(Cont) Ret(%r) -> pure(Ret(%r)) }), "
+        + _boundary(4))
+
+
+def test_a_break_inside_a_lifted_loop_becomes_the_loops_own_fall():
+    """Which is why a lifted loop may still be bound to a name: the value it
+    broke with is the value it fell through with."""
+    lowered = lower("fun f(a) { while c { let x = a?; break }\n done() }")
+    assert "pure(Brk(()))" in lowered
+    assert "Brk(%b) -> pure(Fall(%b))" in lowered
+
+
+def test_a_for_in_is_expanded_to_its_cursor_form_before_being_lifted():
+    """Only the expansion has a loop to lift, so it happens here rather than
+    being left to turkey/infer.py (design.md section 6.5)."""
+    lowered = lower("fun f(a, xs) { for y in xs { let x = a?; k(x) }\n done() }")
+    assert "let %seq1 = xs; let %cur1 = iter(%seq1)" in lowered
+    assert "match next(%seq1, %cur1)" in lowered
+    assert "None -> pure(Fall(()))" in lowered
+    assert "Some(%item1) -> { let y = %item1;" in lowered
 
 
 def test_a_return_before_every_question_is_allowed():

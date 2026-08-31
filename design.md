@@ -528,10 +528,22 @@ means. This matters more here than in Haskell, since a function body becomes a
 do block without anyone typing `do`. The `pure` the lowering inserts appears only
 where it lifts something whose value was `Unit` by rule.
 
-**Not yet:** a `?` inside a loop, and a `return`/`break`/`continue` that would
-land inside a generated lambda. Both are rejected with a diagnostic saying so. A
-`return` *before* every `?` in its block is unaffected — it stays in the prefix,
-outside every lambda — so the common early exit works today.
+**What crosses a bind.** A `return`, `break` or `continue` after a `?` would land
+inside a generated lambda, and it cannot escape through the `bind` either —
+escaping is not something a `bind` does, and for `Array` there is nothing for an
+escape to mean. So it travels as a *value*, in the prelude's unexported `Flow`
+(SPEC-DELTAS.md 47), because a value is the only thing a `bind` propagates. Each
+statement in such a block answers with `m (Flow …)`, the next runs only under
+`Fall`, and the do-context's boundary is where `Ret` becomes a result again.
+
+A `return` *before* every `?` in its block needs none of that: it stays in the
+prefix, outside every lambda, and means exactly what it says.
+
+A loop containing a `?` becomes a **recursive local function** answering with a
+`Flow` — its continuation is not known until its body has run, so it cannot be a
+lambda written once. `Brk` becomes the loop's own `Fall`, which is what lets
+`let v = loop { … break x }` still work, and `Ret` keeps travelling outward.
+`for x in xs` is expanded to its cursor form (§6.5) before being lifted.
 
 ---
 

@@ -48,18 +48,29 @@ block* is still taken to be already monadic. A lifted branch is not a do block
 anyone wrote -- its value was `Unit` by the language's own rule -- and something
 has to carry it into the monad the rest of the block is in.
 
-## Not yet: what crosses a bind
+## What crosses a bind (delta 47)
 
-A `return`, `break` or `continue` that would land inside a generated lambda is
-rejected here rather than mistranslated. Carrying one across a `bind` means
-carrying it as a *value*, since a value is the only thing a `bind` propagates,
-and that -- along with loops, whose continuation is dynamic and so needs the
-same machinery -- is delta 47.
+A `return`, `break` or `continue` after a `?` would land inside a generated
+lambda, where `return` means "return from the lambda" -- which is not what
+anyone wrote. It cannot *escape* through the `bind` either: escaping is not
+something a `bind` does, and for `Array`, whose bind runs its continuation once
+per element, there is nothing coherent for an escape to mean.
 
-Note what is *not* rejected: a `return` before any `?` in the same block stays
-where it was written and needs nothing. `do { if c { return None }; let x = a?;
-g(x) }` lowers with the `if` untouched in the prefix, so the common Rust-shaped
-early exit works today.
+So it travels as a value, in the Prelude's `Flow`, because a value is the only
+thing a `bind` propagates. A context that needs this runs in **flow mode**:
+every statement answers with `m (Flow ...)`, the next one runs only under
+`Fall`, and the context's boundary is where `Ret` becomes a result again.
+
+A `return` before every `?` in its block needs none of that -- it stays in the
+prefix, at the nesting it was written at -- and `_needs_flow` is what keeps the
+common case free of the machinery.
+
+Loops are the same problem twice over: a loop's continuation is not known until
+its body has run, so it cannot be a lambda written once. A lifted loop becomes a
+recursive local `fun` answering with a `Flow`, where `Brk` becomes the loop's own
+`Fall` -- which is why `let v = loop { ... break x }` still works -- and `Ret`
+keeps travelling. `for x in xs` is expanded to its cursor form here
+(design.md §6.5), since only the expansion has a loop to lift.
 """
 
 from __future__ import annotations
@@ -123,6 +134,29 @@ def _owns(node: object) -> bool:
     return any(_owns(child) for child in _children(node))
 
 
+def _stmts(body: ast.Expr) -> list[ast.Stmt]:
+    if isinstance(body, ast.EBlock):
+        return list(body.stmts)
+    return [ast.SExpr(body.span, body)]
+
+
+def _needs_flow(stmts: list[ast.Stmt]) -> bool:
+    """Must this context carry control transfers as values?
+
+    Two reasons it must. Either a transfer sits at or after the *first*
+    statement holding a `?`, so it would end up inside a lambda -- everything
+    before that stays in the prefix, at the nesting the author wrote it at,
+    where a `return` still means what it says. Or the context holds a lifted
+    loop, which answers with a `Flow` whether or not its body transfers.
+    """
+    if any(_has_lifted_loop(stmt) for stmt in stmts):
+        return True
+    for i, stmt in enumerate(stmts):
+        if _owns(stmt):
+            return any(_escapes(s) is not None for s in stmts[i:])
+    return False
+
+
 def _escapes(node: object, *, in_loop: bool = False) -> ast.Expr | None:
     """A `return`/`break`/`continue` here that targets something outside `node`.
 
@@ -151,6 +185,15 @@ def _escapes(node: object, *, in_loop: bool = False) -> ast.Expr | None:
 class Desugarer:
     def __init__(self) -> None:
         self._n = 0
+        # How many lifted loops enclose the code being translated. A `break`
+        # only becomes a `Brk` inside one; outside, it is left alone so that the
+        # checker still reports it as a `break` with no loop, which is what it
+        # is.
+        self._depth = 0
+        # One bound method, made once: the flow-mode tail continuation is
+        # compared by identity below, and `self._fall` would make a new bound
+        # object on every attribute access.
+        self.fall: Cont = self._fall
 
     def fresh(self, span: Span) -> tuple[ast.PVar, Cont]:
         """A binder nothing can capture, and the way to read it back.
@@ -180,15 +223,23 @@ class Desugarer:
         decl.body = self.context(decl.body)
 
     def context(self, body: ast.Expr) -> ast.Expr:
+        """A do-context: a `do` block, or the body of a `fun` holding a `?`."""
         if not _owns(body):
             self.walk(body)
             return body
-        return self.block(body, _identity)
+        if not _needs_flow(_stmts(body)):
+            return self.block(body, _identity)
+        # Something at or after the first `?` transfers control, so it would end
+        # up inside a lambda where `return` means the wrong thing. The whole
+        # context runs in flow mode, and its boundary is where `Ret` is cashed
+        # in. A transfer that is only ever *before* every `?` does not trigger
+        # this: it stays in the prefix and needs nothing.
+        return self._unflow(self.block(body, self.fall, flow=True), body.span)
 
-    def block(self, body: ast.Expr, k: Cont) -> ast.Expr:
+    def block(self, body: ast.Expr, k: Cont, flow: bool = False) -> ast.Expr:
         stmts = body.stmts if isinstance(body, ast.EBlock) else [
             ast.SExpr(body.span, body)]
-        return self.seq(stmts, k, body.span)
+        return self.seq(list(stmts), k, body.span, flow)
 
     # -- the transparent walk ----------------------------------------------
 
@@ -232,27 +283,43 @@ class Desugarer:
 
     # -- statement sequences -----------------------------------------------
 
-    def seq(self, stmts: list[ast.Stmt], k: Cont, span: Span) -> ast.Expr:
+    def seq(self, stmts: list[ast.Stmt], k: Cont, span: Span,
+            flow: bool = False) -> ast.Expr:
         """`S[stmts] k`. Statements with no `?` accumulate into a prefix, so a
-        block splits only where it actually has to."""
+        block splits only where it actually has to.
+
+        In `flow` mode every statement answers with `m (Flow ...)` rather than a
+        plain value, `k` is `pure . Fall`, and a control transfer becomes one of
+        the other three constructors instead of a jump. A statement that neither
+        holds a `?` nor transfers control still just goes in the prefix.
+        """
         prefix: list[ast.Stmt] = []
         for i, stmt in enumerate(stmts):
             last = i == len(stmts) - 1
             rest = stmts[i + 1:]
 
-            if not _owns(stmt):
+            if flow and (transfer := _transfer_stmt(stmt)) is not None \
+                    and (self._depth > 0
+                         or isinstance(transfer, ast.EReturn)):
+                # Whatever follows is unreachable, so the sequence ends here.
+                return _wrap(prefix, self._transfer(transfer, k), span)
+
+            if not _owns(stmt) and not (flow and _escapes(stmt) is not None):
                 self.walk(stmt)
                 if last and isinstance(stmt, ast.SExpr):
                     return _wrap(prefix, k(stmt.expr), span)
                 prefix.append(stmt)
                 continue
 
-            # This statement splits the block. Everything after it is about to
-            # become the body of a lambda, so nothing in it may escape.
-            self._refuse_escape(stmt, rest)
+            if not flow:
+                # Everything after this is about to become a lambda body, so a
+                # transfer in it would change meaning. `context` decides whether
+                # to run in flow mode; reaching here with one is a bug.
+                self._refuse_escape(stmt, rest)
 
             def after(value: ast.Expr, stmt=stmt, rest=rest, last=last) -> ast.Expr:
-                return k(ast.EUnit(stmt.span)) if last else self.seq(rest, k, span)
+                return (k(ast.EUnit(stmt.span)) if last
+                        else self.seq(rest, k, span, flow))
 
             if isinstance(stmt, (ast.SLet, ast.SVar)):
                 make = type(stmt)
@@ -263,7 +330,14 @@ class Desugarer:
                         ast.SExpr(stmt.span, after(ast.EUnit(stmt.span))),
                     ])
 
-                body = self.expr(stmt.value, bound)
+                if flow and _flowing(stmt):
+                    # `let found = loop { ... break v }`: the value comes out of
+                    # the loop's `Fall`, and the other three keep travelling.
+                    head = self.expr(stmt.value, self.fall, tail=True,
+                                     flow=True)
+                    body = self._sequence(head, bound, stmt.span)
+                else:
+                    body = self.expr(stmt.value, bound, flow=flow)
             elif isinstance(stmt, ast.SAssign):
                 def assigned(v: ast.Expr, stmt=stmt, after=after) -> ast.Expr:
                     return ast.EBlock(stmt.span, [
@@ -271,10 +345,19 @@ class Desugarer:
                         ast.SExpr(stmt.span, after(ast.EUnit(stmt.span))),
                     ])
 
-                body = self.expr(stmt.value, assigned)
+                body = self.expr(stmt.value, assigned, flow=flow)
             elif isinstance(stmt, ast.SExpr):
-                body = (self.expr(stmt.expr, k, tail=True) if last
-                        else self.expr(stmt.expr, after))
+                if last:
+                    body = self.expr(stmt.expr, k, tail=True, flow=flow)
+                elif flow and _flowing(stmt):
+                    # A lifted construct holding a transfer, or a lifted loop:
+                    # it answers with a `Flow`, so the rest of the block runs
+                    # only under `Fall` and the other three travel outward.
+                    head = self.expr(stmt.expr, self.fall, tail=True,
+                                     flow=True)
+                    body = self._sequence(head, after, stmt.span)
+                else:
+                    body = self.expr(stmt.expr, after, flow=flow)
             else:
                 raise Unsupported(
                     "'?' is not supported in this kind of statement yet",
@@ -297,7 +380,8 @@ class Desugarer:
 
     # -- expressions --------------------------------------------------------
 
-    def expr(self, e: ast.Expr, k: Cont, tail: bool = False) -> ast.Expr:
+    def expr(self, e: ast.Expr, k: Cont, tail: bool = False,
+             flow: bool = False) -> ast.Expr:
         """`E[e] k`. Hoists each `?` in `e`, left to right.
 
         `tail` says that `e` *is* the value of the enclosing do-context, so `k`
@@ -308,7 +392,10 @@ class Desugarer:
         being trusted for -- it is the no-auto-`pure` rule, which says the tail
         of a do block is already the monadic value.
         """
-        if not _owns(e):
+        # In flow mode a construct with no `?` in it still needs lowering if
+        # it transfers control: the transfer has to become a value even though
+        # nothing here binds.
+        if not _owns(e) and not (flow and _escapes(e) is not None):
             return k(self.walk(e))
 
         t = type(e)
@@ -344,19 +431,21 @@ class Desugarer:
                 [value for _, value in e.fields], [],
                 lambda vs: k(ast.ERecord(e.span, e.con, list(zip(names, vs)))))
         if t is ast.EBinary:
-            return self._binary(e, k, tail)
+            return self._binary(e, k, tail, flow)
         if t is ast.EIf:
-            return self._if(e, k, tail)
+            return self._if(e, k, tail, flow)
         if t is ast.EMatch:
-            return self._match(e, k, tail)
+            return self._match(e, k, tail, flow)
 
         if t in (ast.EWhile, ast.EForIn, ast.EForC, ast.ELoop):
-            raise Unsupported(
-                "'?' is not supported inside a loop yet: the loop would have to "
-                "become a recursive function in the monad, which is not "
-                "implemented",
-                e.span,
-            )
+            if k is not self.fall:
+                raise Unsupported(
+                    "a loop containing a '?' can only be a statement, not a "
+                    "value: its result has to carry whether the body broke, "
+                    "continued or returned",
+                    e.span,
+                )
+            return self._loop(e)
         if t in (ast.EReturn, ast.EBreak):
             raise Unsupported(
                 "'?' cannot appear in the value of a 'return' or 'break' yet",
@@ -372,7 +461,8 @@ class Desugarer:
         return self.expr(
             todo[0], lambda v: self._thread(todo[1:], [*done, v], k))
 
-    def _binary(self, e: ast.EBinary, k: Cont, tail: bool = False) -> ast.Expr:
+    def _binary(self, e: ast.EBinary, k: Cont, tail: bool = False,
+                flow: bool = False) -> ast.Expr:
         if e.op in ("&&", "||") and _owns(e.right):
             # These short-circuit, which no `bind` argument does. Reading them
             # as the `if` they already mean is what keeps that true: the right
@@ -381,12 +471,14 @@ class Desugarer:
                              else prelude.BOOL_TRUE)
             branches = ((e.right, other) if e.op == "&&" else (other, e.right))
             return self._if(
-                ast.EIf(e.span, e.left, branches[0], branches[1]), k, tail)
+                ast.EIf(e.span, e.left, branches[0], branches[1]), k, tail, flow)
         return self.expr(e.left, lambda l: self.expr(
             e.right, lambda r: k(ast.EBinary(e.span, e.op, l, r, e.fn))))
 
-    def _if(self, e: ast.EIf, k: Cont, tail: bool = False) -> ast.Expr:
-        lifted = _owns(e.then) or (e.otherwise is not None and _owns(e.otherwise))
+    def _if(self, e: ast.EIf, k: Cont, tail: bool = False,
+            flow: bool = False) -> ast.Expr:
+        lifted = _branching(e.then, flow) or (
+            e.otherwise is not None and _branching(e.otherwise, flow))
 
         if not lifted:
             def plain(c: ast.Expr) -> ast.Expr:
@@ -401,11 +493,14 @@ class Desugarer:
         inner: Cont = k if tail else self._pure
 
         def branch(c: ast.Expr) -> ast.Expr:
-            self._refuse_escape(ast.SExpr(e.span, e.then), [])
-            if e.otherwise is not None:
-                self._refuse_escape(ast.SExpr(e.span, e.otherwise), [])
-            then = self.block(e.then, inner)
-            other = (self.block(e.otherwise, inner)
+            if not flow:
+                # Outside flow mode a branch becomes a lambda body, so a
+                # transfer in it would change meaning.
+                self._refuse_escape(ast.SExpr(e.span, e.then), [])
+                if e.otherwise is not None:
+                    self._refuse_escape(ast.SExpr(e.span, e.otherwise), [])
+            then = self.block(e.then, inner, flow)
+            other = (self.block(e.otherwise, inner, flow)
                      if e.otherwise is not None
                      else inner(ast.EUnit(e.span)))
             built = ast.EIf(e.span, c, then, other)
@@ -413,8 +508,9 @@ class Desugarer:
 
         return self.expr(e.cond, branch)
 
-    def _match(self, e: ast.EMatch, k: Cont, tail: bool = False) -> ast.Expr:
-        lifted = any(_owns(arm.body) for arm in e.arms)
+    def _match(self, e: ast.EMatch, k: Cont, tail: bool = False,
+               flow: bool = False) -> ast.Expr:
+        lifted = any(_branching(arm.body, flow) for arm in e.arms)
 
         if not lifted:
             def plain(s: ast.Expr) -> ast.Expr:
@@ -428,9 +524,10 @@ class Desugarer:
         def arms(s: ast.Expr) -> ast.Expr:
             built = []
             for arm in e.arms:
-                self._refuse_escape(ast.SExpr(arm.span, arm.body), [])
+                if not flow:
+                    self._refuse_escape(ast.SExpr(arm.span, arm.body), [])
                 built.append(ast.MatchArm(arm.span, arm.patterns,
-                                          self.block(arm.body, inner)))
+                                          self.block(arm.body, inner, flow)))
             made = ast.EMatch(e.span, s, built)
             return made if tail else self._bind(made, k, e.span)
 
@@ -452,9 +549,203 @@ class Desugarer:
         return ast.ECall(
             span, ast.EVar(span, prelude.MONAD_PURE, method=True), [value])
 
+    # -- flow mode: control transfers as values (delta 47) -----------------
+
+    def _fall(self, value: ast.Expr) -> ast.Expr:
+        """The flow-mode tail: fell off the end of the block with this value."""
+        return self._pure(_con(prelude.FLOW_FALL, [value], value.span))
+
+    def _transfer(self, e: ast.Expr, k: Cont) -> ast.Expr:
+        """`return e` / `break e` / `continue`, as the value that carries it."""
+        span = e.span
+        if isinstance(e, ast.EContinue):
+            return self._pure(_con(prelude.FLOW_CONT, [], span))
+        con = prelude.FLOW_RET if isinstance(e, ast.EReturn) else prelude.FLOW_BRK
+        if e.value is None:
+            return self._pure(_con(con, [ast.EUnit(span)], span))
+        return self.expr(e.value, lambda v: self._pure(_con(con, [v], span)))
+
+    def _sequence(self, head: ast.Expr, after: Cont, span: Span) -> ast.Expr:
+        """Run `after` only if `head` fell through; carry the rest outward.
+
+        `after` receives the value `head` fell through *with*, which is how
+        `let found = loop { ... break v }` gets its `v`: a lifted loop's `Fall`
+        carries the value it broke with.
+
+        The three propagating arms rebuild rather than passing on the value they
+        matched, because the `Flow` `head` answers with and the one this answers
+        with differ in their first parameter -- `head`'s own value type is not
+        the rest of the block's.
+        """
+        self._n += 1
+        fell = f"%fell{self._n}"
+        return self._bind(head, lambda f: ast.EMatch(span, f, [
+            _arm(prelude.FLOW_FALL, fell, span, after(_var(fell, span))),
+            _arm(prelude.FLOW_BRK, "%b", span,
+                 self._pure(_con(prelude.FLOW_BRK, [_var("%b", span)], span))),
+            _arm(prelude.FLOW_CONT, None, span,
+                 self._pure(_con(prelude.FLOW_CONT, [], span))),
+            _arm(prelude.FLOW_RET, "%r", span,
+                 self._pure(_con(prelude.FLOW_RET, [_var("%r", span)], span))),
+        ]), span)
+
+    # -- lifted loops -------------------------------------------------------
+
+    def _loop(self, e: ast.Expr) -> ast.Expr:
+        """A loop holding a `?` becomes a recursive local function.
+
+        There is no way around the recursion: a loop's continuation is not
+        known until the body has run, so it cannot be a lambda written once. The
+        function answers with a `Flow`, which is what carries a `break` out and
+        a `return` further out still; `Fall` and `Cont` both mean "go round
+        again", and differ only in where they came from.
+
+        `for x in xs` is expanded to its cursor form here (design.md §6.5)
+        rather than left for `turkey/infer.py`, because only the expansion has a
+        loop to lift.
+        """
+        span = e.span
+        self._n += 1
+        name = f"%loop{self._n}"
+        call = ast.ECall(span, _var(name, span), [])
+
+        self._depth += 1
+        body_flow = self.block(e.body, self.fall, flow=True)
+        self._depth -= 1
+
+        step = [e.step] if isinstance(e, ast.EForC) and e.step is not None else []
+        again = _wrap(list(step), call, span) if step else call
+        # `Brk(v)` is the loop's own value, so it becomes this expression's
+        # `Fall`; `Ret` keeps travelling.
+        round_again = self._bind(body_flow, lambda f: ast.EMatch(span, f, [
+            _arm(prelude.FLOW_FALL, "%_", span, again),
+            _arm(prelude.FLOW_CONT, None, span, again),
+            _arm(prelude.FLOW_BRK, "%b", span,
+                 self._fall(_var("%b", span))),
+            _arm(prelude.FLOW_RET, "%r", span,
+                 self._pure(_con(prelude.FLOW_RET, [_var("%r", span)], span))),
+        ]), span)
+
+        done = self._fall(ast.EUnit(span))
+
+        if isinstance(e, ast.ELoop):
+            inner: ast.Expr = round_again  # only a `break` ever ends it
+            prefix: list[ast.Stmt] = []
+        elif isinstance(e, ast.EForIn):
+            return self._for_in(e, name, call, round_again, span)
+        else:
+            cond = e.cond
+            inner = self.expr(cond, lambda c: ast.EIf(
+                span, c, round_again, done), flow=True)
+            prefix = ([e.init] if isinstance(e, ast.EForC)
+                      and e.init is not None else [])
+
+        return _wrap([*prefix, _fun(name, inner, span)], call, span)
+
+    def _for_in(self, e: ast.EForIn, name: str, call: ast.Expr,
+                round_again: ast.Expr, span: Span) -> ast.Expr:
+        """`for x in xs` in its cursor form, then lifted like any other loop."""
+        self._n += 1
+        seq_name, cur_name = f"%seq{self._n}", f"%cur{self._n}"
+        item = f"%item{self._n}"
+
+        def built(xs: ast.Expr) -> ast.Expr:
+            advance = ast.ECall(span, e.next_fn, [
+                _var(seq_name, span), _var(cur_name, span)])
+            body = ast.EMatch(span, advance, [
+                _arm(prelude.OPTION_NONE, None, span,
+                     self._fall(ast.EUnit(span))),
+                ast.MatchArm(span, [ast.PCon(span, prelude.OPTION_SOME,
+                                             [ast.PVar(span, item)])],
+                             ast.EBlock(span, [
+                                 ast.SLet(span, e.pat, _var(item, span)),
+                                 ast.SExpr(span, round_again),
+                             ])),
+            ])
+            return _wrap([
+                ast.SLet(span, ast.PVar(span, seq_name), xs),
+                ast.SLet(span, ast.PVar(span, cur_name),
+                         ast.ECall(span, e.iter_fn, [_var(seq_name, span)])),
+                _fun(name, body, span),
+            ], call, span)
+
+        return self.expr(e.iterable, built)
+
+    def _unflow(self, body: ast.Expr, span: Span) -> ast.Expr:
+        """A do-context's boundary: where `Ret` stops being a value again.
+
+        `Brk` and `Cont` cannot arrive -- a `break` outside a loop is refused
+        while this pass runs -- but nothing in the type system knows that, so
+        the arms exist and diverge.
+        """
+        unreachable = ast.ECall(
+            span, ast.EVar(span, prelude.ERROR, method=False),
+            [ast.ELit(span, "String", "internal error: a loop transfer escaped "
+                                     "its loop")])
+        return self._bind(body, lambda f: ast.EMatch(span, f, [
+            _arm(prelude.FLOW_FALL, "%v", span, _var("%v", span)),
+            _arm(prelude.FLOW_RET, "%r", span, _var("%r", span)),
+            _arm(prelude.FLOW_BRK, "%_", span, unreachable),
+            _arm(prelude.FLOW_CONT, None, span, unreachable),
+        ]), span)
+
 
 def _identity(value: ast.Expr) -> ast.Expr:
     return value
+
+
+def _var(name: str, span: Span) -> ast.EVar:
+    return ast.EVar(span, name)
+
+
+def _con(name: str, args: list[ast.Expr], span: Span) -> ast.Expr:
+    """A `Flow` constructor. Nullary ones are values, not calls."""
+    made = ast.ECon(span, name)
+    return made if not args else ast.ECall(span, made, args)
+
+
+def _fun(name: str, body: ast.Expr, span: Span) -> ast.Stmt:
+    """`fun name() { body }`, as a statement, so the loop can call itself."""
+    return ast.SFun(span, ast.FunDecl(span, name, [], None, body))
+
+
+def _arm(con: str, bind: str | None, span: Span, body: ast.Expr) -> ast.MatchArm:
+    args = [] if bind is None else [
+        ast.PWild(span) if bind == "%_" else ast.PVar(span, bind)]
+    return ast.MatchArm(span, [ast.PCon(span, con, args)], body)
+
+
+def _transfer_stmt(stmt: ast.Stmt) -> ast.Expr | None:
+    """`return e`, `break e` or `continue` written as a whole statement."""
+    if isinstance(stmt, ast.SExpr) and isinstance(
+            stmt.expr, (ast.EReturn, ast.EBreak, ast.EContinue)):
+        return stmt.expr
+    return None
+
+
+def _has_lifted_loop(node: object) -> bool:
+    """A loop holding a `?`, which therefore answers with a `Flow`."""
+    if isinstance(node, (ast.EWhile, ast.EForIn, ast.EForC, ast.ELoop)) \
+            and _owns(node):
+        return True
+    if isinstance(node, (ast.EDo, ast.ELambda, ast.SFun)):
+        return False
+    return any(_has_lifted_loop(child) for child in _children(node))
+
+
+def _branching(branch: ast.Expr, flow: bool) -> bool:
+    """Does this branch force its `if`/`match` to be lifted into the monad?
+
+    A `?` always does. In flow mode a control transfer does too, even with no
+    `?` anywhere near it: the transfer has to leave as a value, and only a
+    lifted branch can answer with one.
+    """
+    return _owns(branch) or (flow and _escapes(branch) is not None)
+
+
+def _flowing(stmt: ast.Stmt) -> bool:
+    """Does this statement answer with a `Flow` when translated in flow mode?"""
+    return _escapes(stmt) is not None or _has_lifted_loop(stmt)
 
 
 def _wrap(prefix: list[ast.Stmt], value: ast.Expr, span: Span) -> ast.Expr:

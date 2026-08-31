@@ -1752,3 +1752,84 @@ check itself against; a suffix case in `parse_postfix` and an atom case in
 `turkey/driver.py`. New goldens `question.tl` (with `.types`),
 `question_capture.tl`, and three `err_question_*.tl`, two of which record what
 delta 47 has yet to do. New `tests/test_desugar.py`. No existing golden moved.
+
+### 47. What crosses a bind is a value
+
+Delta 46 gave `?` its meaning and refused two things: a `?` inside a loop, and a
+`return`, `break` or `continue` after one. Both refusals were the same gap seen
+twice, and this closes it. `plan.txt` item 4 is now done except for the fast
+lowering, which belongs after items 5 and 6.
+
+**A control transfer cannot escape through a `bind`.** After a `?`, everything
+that follows is inside a lambda, so a `return` there means "return from the
+lambda" -- not what anyone wrote. The obvious repair is to let it escape: the
+evaluator implements `return` as an exception, so it would propagate out through
+`bind` for free, and for `Option` and `Either` that even gives Rust's semantics.
+
+It is still wrong, and delta 45's `instance Monad Array` is why. That `bind`
+runs its continuation once per element. An escape out of the third of five
+branches is not "the function returned" -- there is no single answer to return
+-- and any behaviour it had would be a fact about the interpreter rather than
+about the program. Escaping is not something a `bind` does.
+
+**So it travels as a value**, since a value is the only thing a `bind`
+propagates. The Prelude gains `type Flow a b r = Fall(a) | Brk(b) | Cont |
+Ret(r)`, declared and exported by nobody, exactly as `ArrayCursor` is: it exists
+so that the lowering has something to say, and no program can name it. A context
+that needs it runs in **flow mode** -- every statement answers with `m (Flow
+...)`, the next runs only under `Fall`, and the other three are rebuilt and
+passed along. Three parameters because the three values are three types: a
+block's own, its loop's, and its function's.
+
+**The do-context's boundary is where `Ret` becomes a result again**, with one
+`match` at the end of the function body. `Brk` and `Cont` cannot arrive there --
+a `break` outside a loop is refused before this pass -- but the type system has
+no way to know that, so those arms exist and call `error`, which diverges and so
+can claim any type (§10). An unreachable arm that says so is better than a
+partial match.
+
+**Flow mode is not switched on for a block that does not need it.** The test is
+whether a transfer sits at or after the *first* statement holding a `?`:
+everything before that stays in the prefix, at the nesting the author wrote it
+at, where a `return` still is one. So `question.tl`'s `early` lowers exactly as
+it did before this entry, and the machinery here shows up only where the
+alternative was being wrong.
+
+**A loop is the same problem twice over.** Its continuation is not known until
+its body has run, so it cannot be a lambda written once, and it becomes a
+recursive local `fun` that answers with a `Flow`. `Fall` and `Cont` both mean
+"go round again" and differ only in where they came from; `Brk(v)` becomes the
+loop's own `Fall(v)`, which is what lets `let v = loop { ... break x }` keep
+working; `Ret` keeps travelling. A C-style `for`'s step runs on `Cont` as well as
+on `Fall`, or a `continue` would not terminate.
+
+`for x in xs` is expanded to its cursor form (§6.5) *here* rather than left to
+`turkey/infer.py`, because only the expansion has a loop to lift. That is the
+first time that desugaring exists as a tree rather than as an agreement between
+the checker and the evaluator.
+
+**What it costs.** The encoding is observable, and that is worth saying plainly
+rather than filing as an implementation detail. A user's `bind` receives `Flow`
+values as ordinary payloads; it cannot match on them, but `Array`'s can
+duplicate and reorder them, so how many `bind` calls the lowering makes and in
+what order is part of what a program means. A later lowering -- the join-point
+one `plan.txt` defers behind items 5 and 6 -- has to reproduce this, not pick its
+own. Which is why the translation is written out in full in design.md §6.9 and
+asserted directly in `tests/test_desugar.py`, rather than left to be read off
+the code.
+
+The sharpest illustration is `question_control.tl`'s `spread`, which answers
+`[90, 90, 90]`. Three, not four, because iteration is a cursor (delta 33) and a
+cursor is one mutable object: the list monad explores depth-first, the branches
+share the cursor, and the first to run exhausts it. All three are `90` because
+the counter is one mutable cell, read after the traversal finished mutating it.
+None of that is a decision `?` made, and the file proves it -- `spreadByHand`
+beside it is the same loop with the recursion and the `bind` written out, no `?`
+anywhere, and it prints the same thing. That is the differential test `plan.txt`
+asked for, at the one point where the answer is surprising enough to want one.
+
+**Scope.** `Flow` added to `turkey/lib/Prelude.tl`, unexported;
+`turkey/desugar.py` gains flow mode and the loop lowering. `err_question_in_loop`
+and `err_question_escape` are **deleted** -- they recorded delta 46's gap, and
+the gap is closed. New golden `question_control.tl`, with `.expected` and
+`.types`. No other golden moved, and `question.tl`'s lowering is unchanged.

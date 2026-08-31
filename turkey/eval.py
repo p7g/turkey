@@ -47,7 +47,8 @@ from __future__ import annotations
 from . import ast
 from .core import (
     CApp, CArray, CAssign, CBreak, CCon, CContinue, CDeref, CExpr, CField,
-    CForC, CForIn, CIf, CIndex, CLam, CLet, CLetRec, CLit, CLoop, CMatch,
+    CForC, CForIn, CIf, CIndex, CJoin, CJump, CLam, CLet, CLetRec, CLit,
+    CLoop, CMatch,
     CPrim, CProgram, CRecord, CRef, CReturn, CTuple, CTyApp, CTyLam, CUnit,
     CVar, CWhile,
 )
@@ -74,6 +75,24 @@ class BreakSignal(Exception):
 
 class ContinueSignal(Exception):
     pass
+
+
+class JumpSignal(Exception):
+    """A jump to a join point, carrying the name it targets and its arguments.
+
+    An exception, like the other three transfers, and for the same reason: the
+    interpreter's control flow is Python's. Catching by *name* is enough to be
+    lexical rather than dynamic, because the checker will not let a jump appear
+    inside a lambda -- a lambda body is out of tail position, so it gets an
+    empty join scope. So the innermost `CJoin` with this name on the Python
+    stack is always the one that lexically binds it.
+    """
+
+    __slots__ = ("name", "args")
+
+    def __init__(self, name, args):
+        self.name = name
+        self.args = args
 
 
 class Cell:
@@ -311,6 +330,30 @@ class Evaluator:
             return self.eval(alt.body, scope)
         raise TurkeyPanic(f"no match arm applies to {value!r}")
 
+    def _eval_CJoin(self, e: CJoin, env: REnv):
+        """Run the rest; when it jumps here, run the body instead, and repeat.
+
+        A loop rather than a call, which is the whole point of a join point:
+        the jump consumes the frame it left rather than stacking one. That a
+        non-recursive join goes round at most once is a fact about the term,
+        not a case to write here.
+        """
+        target = e.rest
+        scope = env
+        while True:
+            try:
+                return self.eval(target, scope)
+            except JumpSignal as jump:
+                if jump.name != e.name:
+                    raise
+                scope = env.child()
+                for param, value in zip(e.params, jump.args):
+                    scope.define(param.name, value)
+                target = e.body
+
+    def _eval_CJump(self, e: CJump, env: REnv):
+        raise JumpSignal(e.name, [self.eval(a, env) for a in e.args])
+
     def _eval_CWhile(self, e: CWhile, env: REnv):
         while truth(self.eval(e.cond, env)):
             try:
@@ -459,5 +502,6 @@ def match_pattern(pat: ast.Pattern, value) -> dict[str, object] | None:
     raise AssertionError(f"unhandled pattern {type(pat).__name__}")
 
 
-__all__ = ["BreakSignal", "Cell", "ContinueSignal", "Evaluator", "REnv",
+__all__ = ["BreakSignal", "Cell", "ContinueSignal", "Evaluator",
+           "JumpSignal", "REnv",
            "ReturnSignal", "match_pattern"]

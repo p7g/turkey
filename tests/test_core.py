@@ -69,7 +69,7 @@ def walk(e):
     yield e
     for attr in ("fn", "body", "value", "target", "index", "cond", "then",
                  "otherwise", "scrutinee", "seq", "iter_fn", "next_fn",
-                 "init", "step"):
+                 "init", "step", "rest"):
         yield from walk(getattr(e, attr, None))
     for attr in ("args", "elems", "params"):
         for item in getattr(e, attr, []) or []:

@@ -49,6 +49,15 @@ dictionaries would be one a mis-lowering could walk straight past.
 
 ## What it derives rather than reads
 
+A jump's *tail position* is derived too, and by the same trick. The checker
+carries a second environment of join names beside the term environment, and
+passes it down only into tail positions -- the branches of an `if`, the body of
+an alternative, the body of a `let`, the body and the rest of a `join`. Every
+other recursion gets an empty one. So there is no tail-position predicate to
+write and none to get wrong: a `jump` in an argument, in a scrutinee, in a
+`let`'s value or inside a lambda simply does not find its name, and is
+reported as an unbound join.
+
 A `CAlt` records no binding types, on purpose. The checker works out what a
 pattern binds from the scrutinee's type and the constructor's declaration, so
 a pattern that does not fit its scrutinee is a rejected term. That is a check
@@ -64,8 +73,10 @@ from . import ast
 from .classes import ClassTable, match
 from .core import (
     CAlt, CApp, CArray, CAssign, CBind, CBreak, CCon, CContinue, CDeref, CExpr,
-    CField, CForC, CForIn, CIf, CIndex, CLam, CLet, CLetRec, CLit, CLoop,
-    CMatch, CPrim, CProgram, CRecord, CRef, CReturn, CTuple, CTyApp, CTyLam,
+    CField, CForC, CForIn, CIf, CIndex, CJoin, CJump, CLam, CLet, CLetRec,
+    CLit, CLoop,
+    CMatch, CParam, CPrim, CProgram, CRecord, CRef, CReturn, CTuple, CTyApp,
+    CTyLam,
     CUnit, CVar, CWhile, is_ref, ref_elem, ref_of,
 )
 from .decls import DeclTable, substitute
@@ -116,10 +127,23 @@ class Env:
         return None
 
 
+# A join name to what a jump to it must supply and what it answers. Plain
+# dictionaries, copied when extended: a join scope is a handful of names deep
+# at most, and a `dict` that is never mutated after it is built cannot leak a
+# join out of the branch that bound it.
+Joins = dict[str, tuple[list[CParam], Type]]
+
+_NO_JOINS: Joins = {}
+
+
 class Checker:
     def __init__(self, decls: DeclTable, classes: ClassTable) -> None:
         self.decls = decls
         self.classes = classes
+        # The join points a `jump` here may name. Set by `check`, which gives
+        # every rule an empty one unless the rule asked otherwise -- so tail
+        # position is what a rule opts *into*, and forgetting is safe.
+        self.joins: Joins = _NO_JOINS
         # The equalities the binding being checked states. Consulted before the
         # instance table, exactly as `Solver.reduce` consults its assumptions
         # first and for the same reason: `Item s` over a rigid `s` will never
@@ -154,13 +178,23 @@ class Checker:
 
     # -- expressions -------------------------------------------------------
 
-    def check(self, e: CExpr | None, env: Env) -> Type:
-        """The type this node must have, compared against the one it claims."""
+    def check(self, e: CExpr | None, env: Env, joins: Joins | None = None) -> Type:
+        """The type this node must have, compared against the one it claims.
+
+        `joins` is the join scope this subterm is in, and it defaults to
+        *empty*: a rule that descends without saying anything descends out of
+        tail position, which is the common case and the safe one. The four
+        rules with tail positions pass their own scope down explicitly.
+        """
         assert e is not None, "a missing subterm reached the checker"
         method = getattr(self, "_check_" + type(e).__name__, None)
         if method is None:
             raise CoreError(f"no rule for Core node {type(e).__name__}", e.span)
-        got = method(e, env)
+        outer, self.joins = self.joins, _NO_JOINS if joins is None else joins
+        try:
+            got = method(e, env)
+        finally:
+            self.joins = outer
         self.expect(e.ty, got, e.span, _describe(e))
         # The *derived* type, not the claimed one. They agree or `expect` has
         # already objected -- but "agree" is deliberately slack about
@@ -461,7 +495,7 @@ class Checker:
         self.expect(e.bound, value, e.span, f"the binding '{e.name}'")
         inner = env.child()
         inner.define(e.name, e.binders, e.bound)
-        return self.check(e.body, inner)
+        return self.check(e.body, inner, self.joins)
 
     def _check_CLetRec(self, e: CLetRec, env: Env) -> Type:
         inner = env.child()
@@ -469,7 +503,7 @@ class Checker:
             inner.define(bind.name, bind.binders, bind.ty)
         for bind in e.binds:
             self.bind(bind, inner)
-        return self.check(e.body, inner)
+        return self.check(e.body, inner, self.joins)
 
     def _check_CRef(self, e: CRef, env: Env) -> Type:
         return ref_of(self.check(e.value, env))
@@ -498,21 +532,23 @@ class Checker:
         raise CoreError(f"{show(target)} is not indexable", e.span)
 
     def _check_CIf(self, e: CIf, env: Env) -> Type:
+        joins = self.joins
         self.expect(BOOL, self.check(e.cond, env), e.span, "a condition")
-        then = self.check(e.then, env)
+        then = self.check(e.then, env, joins)
         if e.otherwise is None:
             return e.ty
-        other = self.check(e.otherwise, env)
+        other = self.check(e.otherwise, env, joins)
         return _join(then, other)
 
     def _check_CMatch(self, e: CMatch, env: Env) -> Type:
+        joins = self.joins
         scrutinee = self.check(e.scrutinee, env)
         result: Type | None = None
         for alt in e.alts:
             inner = env.child()
             for name, ty in self.pattern(alt.pat, scrutinee, e.span).items():
                 inner.define(name, [], ty)
-            got = self.check(alt.body, inner)
+            got = self.check(alt.body, inner, joins)
             result = got if result is None else _join(result, got)
         return e.ty if result is None else result
 
@@ -566,6 +602,56 @@ class Checker:
             inner.define(name, [], ty)
         self.check(e.body, inner)
         return TCon("Unit")
+
+    def _check_CJoin(self, e: CJoin, env: Env) -> Type:
+        """`join j(params) = body in rest`.
+
+        The join's result type is the node's own, and both halves are checked
+        against it: a jump replaces the value of this whole expression, so the
+        body answers what the rest answers or the label would not be one.
+
+        `j` is in scope for the rest always, and for the body only if the join
+        says it is recursive -- which is what stops a non-recursive join being
+        a loop nobody declared.
+        """
+        joins = self.joins
+        inner_joins = dict(joins)
+        inner_joins[e.name] = (list(e.params), e.ty)
+        body_env = env.child()
+        for p in e.params:
+            body_env.define(p.name, [], p.ty)
+        body = self.check(e.body, body_env,
+                          inner_joins if e.recursive else joins)
+        self.expect(e.ty, body, e.span, f"the join point '{e.name}'")
+        return _join(body, self.check(e.rest, env, inner_joins))
+
+    def _check_CJump(self, e: CJump, env: Env) -> Type:
+        """`jump j(args)`.
+
+        Reaching here at all is the tail-position check: `self.joins` is empty
+        everywhere but in a tail position, so a jump anywhere else fails to
+        find its name. The message says so, since the two ways to fail -- no
+        such join, and not in tail position -- are worth telling apart.
+        """
+        joins = self.joins
+        found = joins.get(e.name)
+        args = [self.check(a, env) for a in e.args]
+        if found is None:
+            raise CoreError(
+                f"'{e.name}' is not a join point in scope here; a jump must "
+                f"be in tail position of the join that binds it", e.span)
+        params, _ = found
+        if len(params) != len(args):
+            raise CoreError(
+                f"a jump to '{e.name}' passes {len(args)} arguments for "
+                f"{len(params)} parameters", e.span)
+        for i, (p, got) in enumerate(zip(params, args)):
+            self.expect(p.ty, got, e.span, f"argument {i + 1} of the jump")
+        if not isinstance(prune(e.ty), TBottom):
+            raise CoreError(
+                f"a jump to '{e.name}' claims {show(e.ty)}; it never yields to "
+                f"its context, so it is bottom", e.span)
+        return e.ty
 
     def _check_CReturn(self, e: CReturn, env: Env) -> Type:
         if e.value is not None:

@@ -236,6 +236,54 @@ class CLetRec(CExpr):
 
 
 @dataclass(eq=False)
+class CJoin(CExpr):
+    """`join j(params) = body in rest` -- a label, not a function.
+
+    A join point is a `let`-bound continuation that is only ever *jumped* to:
+    every mention is a saturated call in tail position, and none of them
+    escapes. That is what makes it compilable as a label rather than as a
+    closure, which is the whole content of Maurer, Downen, Ariola and Peyton
+    Jones, *Compiling without continuations* (PLDI 2017).
+
+    It is a distinct node rather than a flag on `CLetRec`, and a jump is a
+    distinct node rather than a `CApp`, because the restriction is the point.
+    A walker that has not been taught about these fails loudly; a walker that
+    has not been taught about a flag treats a join point as a closure and is
+    silently right, which is exactly the shape of trust `plan.txt` item 5 was
+    written to remove.
+
+    `recursive` says whether the body may jump to the join itself -- a loop
+    compiled as a label, which is what item 7's last step makes of `while`.
+    A non-recursive join is the case-of-case duplication: one continuation,
+    several branches reaching it.
+
+    The join's result type is the node's own `ty`: a jump replaces the value
+    of the whole `join ... in ...` expression, so the body and the rest agree
+    on it by construction.
+    """
+
+    name: str = ""
+    params: list[CParam] = field(default_factory=list)
+    body: CExpr | None = None
+    rest: CExpr | None = None
+    recursive: bool = False
+
+
+@dataclass(eq=False)
+class CJump(CExpr):
+    """`jump j(args)`. Typed `!`: it never yields to its context.
+
+    Which is why it needs no type of its own beyond bottom, and why a branch
+    that jumps stays compatible with a branch that does not -- `coretc._join`
+    already makes bottom absorb, for `return`, and a jump is the same kind of
+    thing.
+    """
+
+    name: str = ""
+    args: list[CExpr] = field(default_factory=list)
+
+
+@dataclass(eq=False)
 class CRef(CExpr):
     """Make a reference cell. What a `var` binding is."""
 
@@ -470,6 +518,15 @@ def show_expr(e: CExpr | None, indent: int = 0,
             out.append(show_expr(bind.value, indent + 2, names, alias))
         out.append(show_expr(e.body, indent, names, alias))
         return "\n".join(out)
+    if isinstance(e, CJoin):
+        params = ", ".join(f"{alias(p.name)} : {show(p.ty, names)}" for p in e.params)
+        kind = "join rec" if e.recursive else "join"
+        return (f"{pad}{kind} {alias(e.name)}({params}) : {show(e.ty, names)} = {{\n"
+                f"{show_expr(e.body, indent + 1, names, alias)}\n{pad}}}\n"
+                f"{show_expr(e.rest, indent, names, alias)}")
+    if isinstance(e, CJump):
+        args = ", ".join(show_expr(a, 0, names, alias).strip() for a in e.args)
+        return f"{pad}jump {alias(e.name)}({args})"
     if isinstance(e, CRef):
         return f"{pad}ref({show_expr(e.value, 0, names, alias).strip()})"
     if isinstance(e, CDeref):
@@ -608,7 +665,8 @@ def show_bind(bind: CBind) -> str:
 __all__ = [
     "CAlt", "CApp", "CArray", "CAssign", "CBind", "CBreak", "CCon",
     "CContinue", "CDeref", "CExpr", "CField", "CForC", "CForIn", "CIf",
-    "CIndex", "CLam", "CLet", "CLetRec", "CLit", "CLoop", "CMatch", "CParam",
+    "CIndex", "CJoin", "CJump", "CLam", "CLet", "CLetRec", "CLit", "CLoop",
+    "CMatch", "CParam",
     "CPrim", "CProgram", "CRecord", "CRef", "CReturn", "CTuple", "CTyApp",
     "CTyLam", "CUnit", "CVar", "CWhile", "REF", "is_ref", "ref_elem", "ref_of",
     "show_bind", "show_expr", "show_program",

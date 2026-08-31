@@ -362,12 +362,17 @@ Roadmap, in order. Rationale kept short; open questions are the point.
      effects and lifts the restriction.
 
    And one thing it does *not* reach, which is worth recording precisely.
-   `question_control.tl` keeps all 105 of its `Flow` constructors. Its `?` sits
-   under a `Flow` whose type still has a variable in it, so 6 leaves the `bind`
-   polymorphic; the call site is a `CTyApp` rather than a name, and inlining
-   needs a name. That is a gap in 6, not in this item, and it is the precise
-   thing 6 would have to close for 7 to reach that program. `tests/test_opt.py`
-   asserts the number so it cannot move unnoticed.
+   `question_control.tl` keeps all 245 of its `Flow` constructors. The cause
+   written here was that 6 left the `bind` polymorphic, and M16b established
+   that it was wrong: every top-level binding in that program is monomorphic,
+   and what was polymorphic was a *local* one, which M16b then pinned without
+   the constructor count moving at all. The real cause is that `bind` and
+   `pure` are *methods*, so their call sites are type applications over the
+   method's own quantifiers no matter how ground the dictionary is, and
+   `opt._Reducer` declines a binding with binders on purpose. So it is a gap
+   in this item after all, and the closing move is to instantiate through a
+   `CTyApp` rather than to make anything less polymorphic.
+   `tests/test_opt.py` holds the reasoning beside the assertions.
 
    The passes make programs *bigger*: on `question.tl` the specialized Core
    grows about half again. That is what an inliner is, and item 7 said as much
@@ -401,11 +406,62 @@ Roadmap, in order. Rationale kept short; open questions are the point.
    because a control-flow rewrite that is subtly wrong is a wrong answer rather
    than a rejected term. The count is zero and the suite asserts it.
 
-   What is *not* done: the nodes are still in Core. Nothing that runs holds
-   one, but `lower.py` still emits them, so `coretc.py` and `eval.py` still
-   know them and `turkey core` still prints them. Deleting them from the IR
-   means doing this in the lowering, which has a scope chain and a statement
-   shape to keep and is a different piece of work.
+   What it left: the nodes were still in Core. Nothing that ran held one, but
+   `lower.py` still emitted them, so `coretc.py` and `eval.py` still had to
+   know them. M16a is that debt.
+
+   Done, M16a: the loop forms are lowered, not collapsed. `turkey/lower.py`
+   builds `CJoin` and `CJump` straight from the AST, and `CWhile`, `CLoop`,
+   `CForC`, `CForIn`, `CReturn`, `CBreak` and `CContinue` are deleted from
+   `core.py` -- with their rules in `coretc.py` and `eval.py`, the
+   `ReturnSignal`/`BreakSignal`/`ContinueSignal` exceptions, and
+   `turkey/loops.py` entire. A term that names its control target by *where it
+   sits* is now unrepresentable rather than merely unused, which is the
+   difference between a claim about the suite and a claim about the IR.
+
+   The cost the shape decision was meant to bound did not materialize: no
+   continuation parameter runs through the walker. `Scope` carries three join
+   names, `expr` gains one branch -- a subtree holding a loop or a transfer
+   goes to the converter, everything else takes the walk it always took -- and
+   the operand case installs its lowered operands in a by-identity map and
+   then calls the node's ordinary rule, so `_lower_ECall` neither knows nor
+   needs to know that an argument arrived as a jump.
+
+   Two things fell out. `CForIn`'s cursor elaboration now happens *before*
+   `coretc.check_program` instead of after it, so design.md 6.5's elaboration
+   is checked rather than trusted. And `opt._transfers` stopped being a node
+   test and became a free-join-name test -- whether a jump names a target
+   bound outside the term being moved -- which is the reduction the join
+   points were for.
+
+   M15e's partiality is gone with the fallback: there is no loop node to leave
+   behind, so a shape with no rule is `Unsupported` at compile time rather
+   than a binding quietly left alone, and compiling every program in the suite
+   is how that is noticed. `Checked.unlooped` and the count it carried are
+   deleted.
+
+   It also turned up a latent bug in `coretc.bind`, which compared a binding's
+   derived type against its declared one *after* restoring the equation scope,
+   so `want` never reduced under the binding's own equations. It went
+   unnoticed because every early `return` used to make a body bottom, and
+   bottom is compatible with anything.
+
+   Done, M16b: a lifted loop's helper is not generalized. `desugar._loop`
+   lifts a loop into a recursive helper whose `Flow` `Brk` slot is uninhabited
+   by construction -- `round_again` turns a `Brk` into the *enclosing* `Fall`
+   -- so inference quantified over a variable nothing could ever solve, and
+   `mono` only specializes at ground instantiations. `ast.FunDecl` gains an
+   explicit flag rather than a check on the `%` prefix, which `desugar.py`
+   documents as a collision-avoidance guarantee and nothing else; `desugar._fun`
+   is its only writer and `infer.build_definition` honours it. The
+   justification is that the helper has exactly one use site, so there is
+   nothing for generalization to buy.
+
+   `question_control.tl`'s optimized Core goes from nine `forall`s to none and
+   loses 142 lines. Its 245 `Flow` constructors do not move, and that is the
+   result: the hypothesis this milestone was built on was wrong, and the M15d
+   paragraph above now says so. What holds them up is method-level
+   polymorphism, which is not something specialization removes.
 
    Three passes, none of which knows what a monad is:
 
@@ -511,7 +567,7 @@ before building the hard-but-not-novel parts. Which is why 4 and 5 sit early
 
 Where it stands: 1 through 7 are done. 4 closed not by building its fast
 lowering but by deleting it: the speed it wanted is general Core passes that
-know nothing about monads, and those are 7 -- which now exists, in five parts.
+know nothing about monads, and those are 7 -- which now exists, in seven parts.
 `CJoin` and `CJump` are in the IR with tail position derived rather than
 tested for (M15a); discovery finds the labels already in a program (M15b);
 inlining, beta, case-of-known-constructor and dead-`let` do the local
@@ -520,13 +576,20 @@ intermediate value, and a `?` chain over `Option` comes out as the nested `if`
 that Rust's `?` compiles to (M15d); and the four loop forms are one recursive
 join point, so `return` no longer names its target by where it sits (M15e).
 
-Two things 7 leaves behind, both stated where they live. The loop nodes are
-still in Core because `lower.py` still emits them, and taking them out means
-doing M15e's work in the lowering instead. And `question_control.tl` keeps all
-105 of its `Flow` constructors, because its `bind` stayed polymorphic and a
-call through a type application is not a name inlining can see: that is a gap
-in 6, not in 7, and `tests/test_opt.py` holds the number so it cannot move
-unnoticed.
+M16a then took the loop nodes out of Core altogether by doing M15e's work in
+the lowering, so seven nodes and `turkey/loops.py` are gone and a term that
+names its control target by where it sits cannot be written; and M16b stopped
+generalizing the helper a lifted loop becomes.
+
+One thing 7 leaves behind, and M16b is why it is stated precisely rather than
+guessed at. `question_control.tl` keeps all 245 of its `Flow` constructors.
+The cause was recorded for two milestones as 6 leaving the `bind` polymorphic;
+it is not that. `bind` and `pure` are methods, so their call sites are type
+applications over the method's *own* quantifiers however ground the dictionary
+is, and `opt` declines a binding with binders by design. Reaching them means
+teaching the inliner to instantiate a `CTyLam`-valued binding's body, which
+needs `mono`'s substitution and is a milestone of its own.
+`tests/test_opt.py` holds both the assertions and the reasoning.
 
 Next is 8, the bootstrap interpreter -- the first real program in the language,
 and the only thing that will find out whether any of this was worth it at a

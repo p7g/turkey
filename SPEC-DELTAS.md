@@ -1808,15 +1808,36 @@ on `Fall`, or a `continue` would not terminate.
 first time that desugaring exists as a tree rather than as an agreement between
 the checker and the evaluator.
 
-**What it costs.** The encoding is observable, and that is worth saying plainly
-rather than filing as an implementation detail. A user's `bind` receives `Flow`
-values as ordinary payloads; it cannot match on them, but `Array`'s can
-duplicate and reorder them, so how many `bind` calls the lowering makes and in
-what order is part of what a program means. A later lowering -- the join-point
-one `plan.txt` defers behind items 5 and 6 -- has to reproduce this, not pick its
-own. Which is why the translation is written out in full in design.md §6.9 and
-asserted directly in `tests/test_desugar.py`, rather than left to be read off
-the code.
+**What it costs, stated exactly.** `Flow` is not part of `Monad`. It appears in
+no signature -- `bind` is still `fun(m a, fun(a) -> m b) -> m b` -- and an
+instance never writes it, never sees it and could not match on it if it wanted
+to, since the constructors are exported by nobody. All the lowering does is
+instantiate the method's own type variable with it at the call sites it
+generates.
+
+What *is* observable is one step removed, and it is not special to `Flow`: **the
+shape of the bind chain**. How many times the lowering invokes a continuation,
+and in what order, is part of what a program means as soon as the instance is
+free to run its continuation other than exactly once. That was already true
+before this entry -- delta 46's tail-position rule, which drops a `pure` and a
+`bind` where the branches are the do block's tail, changes a bind count.
+
+So the constraint on a later lowering -- the join-point one `plan.txt` defers
+behind items 5 and 6 -- is that it reproduce the *chain*, not that it reproduce
+`Flow`. Anything answering with the same sequence of continuation invocations may
+represent a transfer however it likes, join points and no sum type included.
+That is why design.md §6.9 writes the translation out and
+`tests/test_desugar.py` asserts it: the chain is the specification, and the
+encoding is only this lowering's way of producing it.
+
+The reading to avoid is that carrying a transfer as data gives it some meaning
+of its own. It does not. `return` under `Array` is the plainest case: in a
+five-element bind it does not stop the other four, it replaces one branch's
+answer, so `fun(xs) { let x = xs?; if x == 2 { return [999] }; pure(x * 10) }`
+over `[1, 2, 3]` is `[10, 999, 30]` -- and `bind(xs, fun(x) = if x == 2 { [999] }
+else { pure(x * 10) })`, with no `?` and no `Flow` anywhere, is the same thing.
+"Return" means "this branch's answer is that" because in a nondeterministic
+monad there is nothing else it could mean.
 
 The sharpest illustration is `question_control.tl`'s `spread`, which answers
 `[90, 90, 90]`. Three, not four, because iteration is a cursor (delta 33) and a

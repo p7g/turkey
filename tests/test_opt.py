@@ -138,11 +138,23 @@ fun main() { print(pairs([1, 2], [10, 20])) }
     assert out.getvalue() == "[10, 20, 20, 40]\n"
 
 
-def test_a_match_on_a_constructor_of_effects_is_left_alone():
-    """Selecting a branch discards the arms not taken, and under a wildcard the
-    scrutinee itself. `Some(sideEffect())` is a constructor application and is
-    not a value, so the rule declines rather than reasoning about effects."""
-    program = optimized("""
+def test_a_match_on_a_constructor_of_effects_keeps_the_effects():
+    """Selecting a branch discards the arms not taken -- which the `match`
+    would not have run anyway -- and the constructor application itself, which
+    it would have. So the arguments are bound in order, including the ones the
+    pattern ignores. `Some(noisy())` still prints.
+
+    This started life as a test that the rule *declined* on a scrutinee that
+    was not a value. Declining was the safe first answer and the wrong one: it
+    also declined on `Some(n / 2)`, which is every `?` over `Option` there is.
+    """
+    from turkey.driver import run
+    import io
+    import contextlib
+
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        run("""
 fun noisy() -> Int {
     print("ran")
     7
@@ -155,7 +167,7 @@ fun main() {
     print(r)
 }
 """)
-    assert matches(named(program, "Main#main")) == 1
+    assert out.getvalue() == "ran\n1\n"
 
 
 def test_a_let_whose_value_does_work_is_kept_even_if_nothing_reads_it():
@@ -206,3 +218,77 @@ fun odd(n : Int) -> Bool = if n == 0 { False } else { even(n - 1) }
 fun main() { print(even(4)) }
 """)
     assert out.getvalue() == "True\n"
+
+
+# -- case-of-case (M15d) -----------------------------------------------------
+
+
+def test_a_match_on_an_if_is_pushed_into_its_branches():
+    """`match (if c { Some(v) } else { None }) { ... }`.
+
+    Both branches are constructors, so both collapse and nothing is left to
+    jump to -- the join point is built and then dropped, which is the case
+    worth having a test for, since the golden shows only its absence.
+    """
+    program = optimized("""
+fun maybe(n : Int) -> Option Int = if n > 0 { Some(n) } else { None }
+fun classify(n : Int) -> Int =
+    match maybe(n) {
+        Some(x) -> x
+        None -> 0
+    }
+fun main() { print(classify(3)) }
+""")
+    assert matches(named(program, "Main#classify")) == 0
+
+
+def test_a_question_chain_becomes_nested_ifs():
+    """The milestone, stated as a property rather than shown as a golden.
+
+    `tests/programs/question_opt.opt` is the readable version. What is asserted
+    here is what it means: after the passes, a two-`?` function over `Option`
+    contains no call, no lambda and no `match` -- the intermediate `Option` is
+    never built, and what remains is the nested `if` a C programmer writes by
+    hand. No pass involved knows what a monad is.
+    """
+    from turkey.core import CLam
+
+    program = optimized("""
+fun half(n : Int) -> Option Int =
+    if n % 2 == 0 { Some(n / 2) } else { None }
+fun quarter(n : Int) -> Option Int {
+    let a = half(n)?
+    let b = half(a)?
+    Some(b)
+}
+fun main() { print(quarter(8)) }
+""")
+    quarter = named(program, "Main#quarter")
+    assert matches(quarter) == 0
+    assert sum(1 for n in nodes(quarter.value) if isinstance(n, CLam)) == 1, \
+        "only the function's own lambda: the continuation is gone"
+    assert calls_to(quarter, "Main#half") == 0
+
+
+def test_a_polymorphic_bind_is_out_of_reach_and_the_suite_says_so():
+    """`question_control.tl` keeps all 105 of its `Flow` constructors.
+
+    Not a failure of case-of-case. Its `?` sits under a `Flow` whose type still
+    has a variable in it, so item 6's specializer leaves the `bind` polymorphic
+    and the call site is a `CTyApp` rather than a name -- and inlining, which
+    needs a name, cannot see through it. Written down as a test because it is
+    the precise thing item 6 would have to do for item 7 to reach that program,
+    and because a number nobody records is a number nobody notices moving.
+    """
+    from pathlib import Path
+    from turkey.core import CTyApp
+
+    root = Path(__file__).parent / "programs"
+    program = check((root / "question_control.tl").read_text(),
+                    str(root / "question_control.tl"), [root]).opt
+    generic = sum(
+        1 for bind in program.binds for n in nodes(bind.value)
+        if isinstance(n, CApp) and isinstance(n.fn, CTyApp))
+    assert generic > 0, (
+        "if this is zero, specialization now reaches question_control and the "
+        "Flow traffic should be collapsing -- check, and delete this test")

@@ -63,11 +63,12 @@ from dataclasses import fields, replace
 
 from . import ast
 from .core import (
-    CAlt, CApp, CBind, CBreak, CCon, CContinue, CExpr, CJoin, CLam, CLet,
-    CLetRec, CLit, CMatch, CPrim, CProgram, CReturn, CTuple, CUnit, CVar,
-    names_of,
+    CAlt, CApp, CBind, CBreak, CCon, CContinue, CExpr, CForC, CForIn, CIf,
+    CJoin, CJump, CLam, CLet, CLetRec, CLit, CMatch, CParam, CPrim, CProgram,
+    CReturn, CTuple, CUnit, CVar, names_of,
 )
 from .deps import pattern_vars, sccs
+from .types import TBottom
 
 # How large a body may be and still be inlined, counted in Core nodes. Small
 # enough that a call site does not become unreadable, large enough for the
@@ -128,6 +129,9 @@ class _Reducer:
         # `h` once per path that reaches it, which is exponential in the depth
         # of the call graph and was, measurably, the whole cost of this pass.
         self.reduced: dict[str, CExpr] = {}
+        # For the join points case-of-case invents. Per program and in
+        # traversal order, so it is deterministic and a golden can hold it.
+        self.counter = 0
 
     def expr(self, e):
         """`e` with its subterms reduced, then reduced itself to a fixed point.
@@ -143,7 +147,13 @@ class _Reducer:
             made = self.step(e)
             if made is None:
                 return e
-            e = made
+            # And walk it again. A reduction does not only rewrite the node it
+            # fires on: substituting a continuation for a parameter puts a
+            # lambda where `bind`'s body had `f(x)`, and that beta redex is in
+            # a subterm this traversal has already been past. Reducing only the
+            # root left every `?` chain one beta short, which is exactly the
+            # reduction the whole milestone is for.
+            e = self.children(made)
 
     def children(self, e):
         return type(e)(**{f.name: self.value(getattr(e, f.name))
@@ -171,10 +181,16 @@ class _Reducer:
         if isinstance(e, CApp):
             return self.beta(e) if isinstance(e.fn, CLam) else self.inline(e)
         if isinstance(e, CMatch):
-            return self.known_constructor(e)
+            return (self.known_constructor(e) or self.float_let(e)
+                    or self.case_of_case(e))
         if isinstance(e, CLet):
-            return self.dead_let(e)
+            return (self.dead_let(e) or self.trivial_let(e)
+                    or self.let_to_match(e))
         return None
+
+    def fresh(self, hint: str) -> str:
+        self.counter += 1
+        return f"%{hint}{self.counter}"
 
     # -- the three reductions --------------------------------------------
 
@@ -244,6 +260,125 @@ class _Reducer:
             return None
         return e.body if e.name not in names_of(e.body) else None
 
+    def float_let(self, e: CMatch):
+        """`match (let x = v in b) { alts }` is `let x = v in match b { alts }`.
+
+        Not a reduction in itself: it is what lets the other rules see. Every
+        call this pass inlines becomes a `let` chain around the body, so a
+        scrutinee that is morally `Some(5)` arrives as several bindings wrapped
+        around it, and case-of-known-constructor -- which looks only at the
+        node in front of it -- would stop there.
+
+        Declined when the alternatives mention the name, since moving them
+        inside the binding would rebind it out from under them.
+        """
+        scrut = e.scrutinee
+        if not isinstance(scrut, CLet) or scrut.binders:
+            return None
+        if scrut.name in names_of(e.alts):
+            return None
+        inner = CMatch(e.ty, e.span, scrut.body, e.alts)
+        return CLet(e.ty, scrut.span, scrut.name, scrut.bound, scrut.value,
+                    inner)
+
+    def case_of_case(self, e: CMatch):
+        """`match (match S {...}) { alts }`, with the outer match pushed in.
+
+        The pass item 7 names as the one that actually erases `Flow`. A `?`
+        builds a `Flow` in one branch and scrutinises it downstream, and the
+        two never meet until the downstream match is moved next to the
+        constructor -- at which point case-of-known-constructor collapses both.
+
+        It is also the pass that duplicates continuations, which is why item 7
+        insists on join points *first*. `alts` goes into a `CJoin`, each branch
+        that does not reduce becomes a `jump` to it, and only the branches that
+        genuinely collapse carry a copy. Without the join, a chain of `?` over
+        a four-constructor `Flow` multiplies its continuation by four at every
+        step, which is the classic way to get a correct compiler that emits
+        absurd amounts of code.
+
+        Declined outright when no branch reduces: the join would then be pure
+        overhead, and this is not a rewrite worth doing for its own sake.
+        """
+        scrut = e.scrutinee
+        if isinstance(scrut, CMatch):
+            branches = [alt.body for alt in scrut.alts]
+        elif isinstance(scrut, CIf) and scrut.otherwise is not None:
+            branches = [scrut.then, scrut.otherwise]
+        else:
+            return None
+        if _transfers(scrut):
+            # A branch holding a `return` is one whose value is not what the
+            # outer match will scrutinise. Item 7's last step is what makes
+            # this case ordinary; until then it is one to leave alone.
+            return None
+
+        name = self.fresh("cc")
+        pushed = []
+        landed = False
+        for branch in branches:
+            made = self.expr(CMatch(e.ty, e.span, branch, e.alts))
+            if _mentions_alts(made, e.alts):
+                pushed.append(CJump(TBottom(), branch.span, name, [branch]))
+            else:
+                pushed.append(made)
+                landed = True
+        if not landed:
+            return None
+
+        param = CParam(self.fresh("cv"), scrut.ty)
+        body = CMatch(e.ty, e.span, CVar(scrut.ty, e.span, param.name), e.alts)
+        if isinstance(scrut, CMatch):
+            rest = CMatch(e.ty, scrut.span, scrut.scrutinee,
+                          [CAlt(alt.pat, made)
+                           for alt, made in zip(scrut.alts, pushed)])
+        else:
+            rest = CIf(e.ty, scrut.span, scrut.cond, pushed[0], pushed[1])
+        if not any(isinstance(n, CJump) and n.name == name
+                   for n in _nodes(rest)):
+            # Every branch reduced, so nothing jumps and the join is dead.
+            return rest
+        return CJoin(e.ty, e.span, name, [param], body, rest, False)
+
+    def trivial_let(self, e: CLet):
+        """A binding of a name to a name is not a binding.
+
+        `let %k1 = x in let a = %k1 in ...` is what a `?` chain becomes once
+        `bind` is inlined and its continuation beta-reduced: three names for
+        one value. Substituting costs nothing -- reading a variable is free and
+        may be done twice or never -- and it is what puts the `if` that built
+        the value next to the `match` that scrutinises it.
+
+        Only names and literals, not every value: substituting a `CLam` would
+        duplicate its body at each mention, which is inlining and has a size
+        limit for a reason.
+        """
+        if e.binders or not isinstance(e.value, (CVar, CLit, CUnit, CCon)):
+            return None
+        bound = _binders_of(e.body)
+        if e.name in bound or (_free_names(e.value) & bound):
+            return None
+        return _substitute(e.body, {e.name: e.value})
+
+    def let_to_match(self, e: CLet):
+        """`let x = v in match x {...}` is `match v {...}`, when `x` is read
+        only there.
+
+        The other half of putting a producer next to its consumer, and the one
+        that hands case-of-case something to work on: `v` is an `if` returning
+        `Some` or `None`, and the `match` that reads it is one binding away.
+        """
+        body = e.body
+        if e.binders or not isinstance(body, CMatch):
+            return None
+        if not isinstance(body.scrutinee, CVar) or body.scrutinee.name != e.name:
+            return None
+        if e.name in _free_names(body.alts):
+            return None
+        if _free_names(e.value) & _binders_of(body.alts):
+            return None
+        return CMatch(body.ty, body.span, e.value, body.alts)
+
     def known_constructor(self, e: CMatch):
         """A `match` on a constructor whose identity is right there.
 
@@ -253,35 +388,32 @@ class _Reducer:
         variables is left alone: the nested case is a real transformation and
         this is not the milestone for it.
 
-        The scrutinee must be a *value*, not merely a constructor application.
-        Selecting a branch discards the arms that were not taken and, where the
-        pattern is a wildcard, the scrutinee itself -- and discarding
-        `Some(launch())` is not the same program. Requiring a value is what
-        makes "select the branch" a reduction rather than a rewrite that has to
-        reason about effects.
+        The scrutinee need not be a value, but nothing it computes may be
+        thrown away. Selecting a branch discards the arms not taken -- which a
+        `match` would not have run anyway -- and it discards the constructor
+        application itself, which it *would* have. So every argument is bound,
+        in order, including the ones the pattern ignores, under a name nothing
+        reads. `Some(launch())` still launches.
         """
         con, args = _constructor(e.scrutinee)
-        if con is None or not _is_value(e.scrutinee):
+        if con is None:
             return None
         for alt in e.alts:
             pat = _unannot(alt.pat)
             if isinstance(pat, ast.PCon):
                 if pat.name != con:
                     continue  # a different constructor: cannot match
-                if not all(isinstance(_unannot(a), (ast.PVar, ast.PWild))
-                           for a in pat.args):
+                subs = [_unannot(a) for a in pat.args]
+                if not all(isinstance(p, (ast.PVar, ast.PWild)) for p in subs):
                     return None
-                names = [_unannot(a) for a in pat.args]
-                params = [n.name for n in names if isinstance(n, ast.PVar)]
-                values = [a for n, a in zip(names, args)
-                          if isinstance(n, ast.PVar)]
-                return _apply_names(params, values, alt.body, e.ty)
+                names = [p.name if isinstance(p, ast.PVar) else self.fresh("seq")
+                         for p in subs]
+                return _apply_names(names, args, alt.body, e.ty)
             if isinstance(pat, ast.PVar):
                 return _apply_names([pat.name], [e.scrutinee], alt.body, e.ty)
             if isinstance(pat, ast.PWild):
-                # Licensed by the value requirement above: nothing is lost by
-                # dropping a scrutinee that does no work.
-                return alt.body
+                return _apply_names([self.fresh("seq")], [e.scrutinee],
+                                    alt.body, e.ty)
             return None  # a literal, a tuple, a record: not decided here
         return None
 
@@ -311,10 +443,10 @@ def _apply_names(names, args, body, ty):
     substitution = {}
     remaining: list[tuple[str, object]] = []
     for index, (name, arg) in enumerate(zip(names, args)):
-        if names_of(arg) & set(names[:index]):
+        free = _free_names(arg)
+        if free & set(names[:index]):
             return None
-        if (_is_value(arg) and name not in bound
-                and not (names_of(arg) & bound)):
+        if _is_value(arg) and name not in bound and not (free & bound):
             substitution[name] = arg
         else:
             remaining.append((name, arg))
@@ -360,6 +492,27 @@ def _is_value(e) -> bool:
     return False
 
 
+def _nodes(e):
+    if isinstance(e, (CExpr, CBind, CAlt)):
+        yield e
+        for f in fields(e):
+            yield from _nodes(getattr(e, f.name))
+    elif isinstance(e, (list, tuple)):
+        for x in e:
+            yield from _nodes(x)
+
+
+def _mentions_alts(e, alts) -> bool:
+    """Whether the alternatives `alts` are still being matched on inside `e`.
+
+    Identity, not equality, and that is the point: it asks whether *this*
+    match survived the reduction, which is exactly the question "did pushing
+    it into the branch buy anything". A structural comparison would answer a
+    different and less useful question.
+    """
+    return any(isinstance(n, CMatch) and n.alts is alts for n in _nodes(e))
+
+
 def _transfers(e) -> bool:
     """Whether `e` contains a control transfer that leaves it.
 
@@ -400,6 +553,67 @@ def _size(e) -> int:
     if isinstance(e, (list, tuple)):
         return sum(_size(x) for x in e)
     return 0
+
+
+def _free_names(e) -> set[str]:
+    """The term variables `e` mentions and does not itself bind.
+
+    `core.names_of` is the over-approximation -- every name, bound or not --
+    and it is the right one for keeping a binding alive. It is the wrong one
+    for asking whether moving a term could capture something, and using it
+    there cost most of this pass's reductions: the continuation a `?` builds
+    contains `let x = ... in ...`, and `Option`'s `bind` calls its first
+    parameter `x`, so a guard reading every mentioned name refused to inline
+    `bind` at all.
+
+    Binders are read from field names, as in `_binders_of`, plus the two
+    scopes that are not simply "this field's binders cover that field": a
+    `CLet` binds only over its body, and a `CForC`'s init binds over the rest
+    of the loop.
+    """
+    if e is None or isinstance(e, (str, int, float, bool)):
+        return set()
+    if isinstance(e, CVar):
+        return {e.name}
+    if isinstance(e, CLam):
+        return _free_names(e.body) - {p.name for p in e.params}
+    if isinstance(e, CLet):
+        return _free_names(e.value) | (_free_names(e.body) - {e.name})
+    if isinstance(e, CLetRec):
+        inner = _free_names(e.body)
+        for bind in e.binds:
+            inner |= _free_names(bind.value)
+        return inner - {b.name for b in e.binds}
+    if isinstance(e, CJoin):
+        body = _free_names(e.body) - {p.name for p in e.params}
+        if e.recursive:
+            body -= {e.name}
+        return body | (_free_names(e.rest) - {e.name})
+    if isinstance(e, CJump):
+        return set().union(*(_free_names(a) for a in e.args)) if e.args else set()
+    if isinstance(e, CAlt):
+        return _free_names(e.body) - set(pattern_vars(e.pat))
+    if isinstance(e, CForIn):
+        bound = set(pattern_vars(e.pat))
+        return ((_free_names(e.seq) | _free_names(e.iter_fn)
+                 | _free_names(e.next_fn)) | (_free_names(e.body) - bound))
+    if isinstance(e, CForC):
+        rest = (_free_names(e.cond) | _free_names(e.step)
+                | _free_names(e.body))
+        if isinstance(e.init, CLet):
+            return _free_names(e.init.value) | (rest - {e.init.name})
+        return _free_names(e.init) | rest
+    if isinstance(e, (CExpr, CBind)):
+        out: set[str] = set()
+        for f in fields(e):
+            out |= _free_names(getattr(e, f.name))
+        return out
+    if isinstance(e, (list, tuple)):
+        out = set()
+        for x in e:
+            out |= _free_names(x)
+        return out
+    return set()
 
 
 def _binders_of(e) -> set[str]:

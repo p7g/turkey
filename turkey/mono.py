@@ -17,9 +17,16 @@ What that buys, in the order `plan.txt` asks for it:
   a ground instance application becomes one top-level binding of a record.
 * **Every dictionary at a call site is a name.** Not the projection of a
   parameter, and not an application to be performed: a `CVar` naming a
-  top-level record. That is what M14c needs to turn a method selection into a
-  direct call, and what item 4's fast lowering needs before it can inline an
-  instance's `bind`.
+  top-level record.
+* **And then not even a name.** Given that, a method selection off a ground
+  dictionary is a projection out of a record whose definition is right here, so
+  it is replaced by a binding: `%inst.Ord.Int#lt`. That is the second half of
+  the file (`_Devirtualizer`), it is what item 4's fast lowering needs before
+  it can inline an instance's `bind`, and on `tests/programs/dicts.tl` it takes
+  the dictionary projections from forty-five to six.
+* **And what nothing reaches is dropped.** Specialization only ever adds
+  bindings; after it, most of what it copied from is unreachable, and so is
+  every Prelude dictionary the program never mentions (`_reachable`).
 
 ## It is a *partial* pass, and that is a decision
 
@@ -54,20 +61,27 @@ keeps this pass small:
   argument that came from a binder is ground, and a `CTyApp` that is *not*
   ground is one whose variable came from somewhere else -- an ambiguous
   residual, or a method's own quantification -- and is left alone.
-* Nothing is deleted. A binding nothing reaches any more is still emitted;
-  dropping it is reachability, which is M14c's, and doing it here would mean
-  this pass had to be right about liveness as well as about types.
+* Nothing is deleted *by the specializer*. It emits a binding nothing reaches
+  any more and leaves the question of liveness to `_reachable`, which asks it
+  once, at the end, over the finished program -- so the specializer never has
+  to be right about liveness as well as about types.
 
 ## What it does not do
 
-A method's own polymorphism -- `map` in a `Functor` dictionary is still
-`forall a b` -- lives in a record *field*, not in a binding, so `CTyApp` over a
-`CField` stays. Erasing it means hoisting the field into a binding, which is
-devirtualization, which is M14c. Likewise the dictionary *parameters* of an
-ordinary function: `Main#squash@Int` still takes its `%Dict.Monoid Int`, it is
-just always handed the same one. Dropping a parameter that is provably constant
-is an optimization over ground code, and ground code is what this pass produces
-rather than what it consumes.
+The three passes run once each, in order, and nothing goes back round. That is
+visible in the output: `%inst.Foldable.Array#foldMap` is a binding this file
+made, and `Main#render` calls it at ground types with ground evidence --
+`#foldMap[Int, String](%inst.Monoid.String)` -- which is exactly the shape the
+specializer collapses, had the specializer been able to see a binding that did
+not exist when it ran. Iterating to a fixed point would collect those. It is
+deliberately not done here: a second round needs its own termination argument,
+and the cap's is written for one.
+
+What genuinely cannot be done is what the cap refuses. A capped call site keeps
+its type application and its dictionary argument, so the generic binding it
+names keeps its dictionary *parameter* and keeps projecting out of it -- and
+that projection is the one thing coherence says nothing about, because the
+parameter is not a dictionary this pass can see.
 
 The result is checked by `turkey/coretc.py`, unconditionally, exactly as the
 lowering is. A pass whose output nobody checks is believed for the reason the
@@ -81,7 +95,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields, replace
 
 from .classes import ClassTable
-from .core import CAlt, CBind, CExpr, CLam, CLet, CLetRec, CParam, CProgram, CRecord, CTyApp, CVar
+from .core import (CAlt, CBind, CExpr, CField, CLam, CLet, CLetRec,
+                   CParam, CProgram, CRecord, CTyApp, CTyLam, CVar)
 from .coretc import Fams
 from .decls import DeclTable, substitute
 from .typed import reduce_deep
@@ -140,16 +155,31 @@ def _mangle(t: Type) -> str:
     return "_"
 
 
-def _dict_constructor(bind: CBind) -> bool:
-    """Whether this binding is an instance *with a context*: a function from
-    dictionaries to a dictionary.
+def _dict_class(ty: Type) -> str | None:
+    """The class a `%Dict.C h` type names, or None if it is not one."""
+    head, args = spine(prune(ty))
+    if isinstance(head, TCon) and head.name.startswith("%Dict.") and len(args) == 1:
+        return head.name[len("%Dict."):]
+    return None
+
+
+def _takes_dictionaries(bind: CBind) -> bool:
+    """Whether this binding is a lambda over nothing but dictionaries.
+
+    Two things wear that shape and the collapse below treats them alike:
+    an instance with a context (`[Semigroup a] Semigroup (Array a)` is a
+    function from a dictionary to a dictionary) and any binding whose scheme
+    retained a predicate (`fun twice[Semigroup a]` is a function from a
+    dictionary to the real lambda). Both are applied to evidence at every use
+    and neither needs to be, once the evidence is ground.
 
     Asked structurally rather than by the `%inst.` prefix, because the shape is
-    what the collapse below actually depends on -- a lambda whose body is the
-    record -- and a name is a convention a later pass could change.
+    what the collapse depends on and a name is a convention a later pass could
+    change. `%Dict.` is not a convention in the same sense: no source type can
+    be spelled that way, so a parameter with one is evidence and nothing else.
     """
-    return (isinstance(bind.value, CLam)
-            and isinstance(bind.value.body, CRecord))
+    return (isinstance(bind.value, CLam) and bool(bind.value.params)
+            and all(_dict_class(p.ty) is not None for p in bind.value.params))
 
 
 @dataclass
@@ -296,16 +326,25 @@ class _Rewriter:
         return self.generic(e) if collapsed is None else collapsed
 
     def collapse(self, e) -> CExpr | None:
-        """`%inst.C.T[t](ev)` -- an instance with a context, applied -- becomes
-        one top-level binding of the record it builds.
+        """An application to ground evidence becomes a binding with the
+        evidence already in it.
 
-        This is the per-request rebuild M13 left behind. The application is
-        collapsed rather than merely specialized because specializing alone
+        For an instance -- `%inst.Monoid.Array[Int](%inst.Semigroup.Int)` --
+        that removes the per-request rebuild M13 left behind: the application
+        is collapsed rather than merely specialized because specializing alone
         would leave `%inst.Monoid.Array@Int` a *function*, still applied, still
-        allocating. Coherence is what makes it sound: the dictionary arguments
-        are ground, so they are the only ones this instance could ever be
-        applied to at this head, and building the record once is building it
-        with the same contents.
+        allocating a record every time.
+
+        For an ordinary binding -- `Main#squash[Int](%inst.Monoid.Int)` -- it
+        removes the parameter. M14a's copy still took its dictionary and was
+        still handed the same one at every call; a copy per *dictionary* as
+        well as per type is what makes the dictionary a top-level name inside
+        the body, which is what devirtualization then needs to see.
+
+        Coherence is what makes both sound: the dictionary arguments are
+        ground, so they are the only ones this name could be applied to at
+        these types, and doing the application once does it with the same
+        contents.
         """
         fn, targs = e.fn, []
         if isinstance(fn, CTyApp):
@@ -315,7 +354,7 @@ class _Rewriter:
             return None
         name = self.rename.get(fn.name, fn.name)
         bind = self.owner.byname.get(name)
-        if bind is None or name not in self.owner.dict_ctors:
+        if bind is None or name not in self.owner.takes_dicts:
             return None
         assert isinstance(bind.value, CLam)
         if len(bind.binders) != len(targs) or len(bind.value.params) != len(e.args):
@@ -461,10 +500,14 @@ class Monomorphizer:
         self.classes = classes
         self.byname: dict[str, CBind] = {}
         self.generic: dict[str, CBind] = {}
-        self.dict_ctors: set[str] = set()
+        self.takes_dicts: set[str] = set()
         # Every top-level dictionary binding. A collapse may only be handed
         # one of these, since the binding it makes lives out here with them.
+        # A dictionary this pass *builds* joins the set: the second collapse
+        # of a chain is handed the first one's answer, and refusing it there
+        # would leave the rebuild in place one level up.
         self.top_dicts: set[str] = set()
+        self.dict_group: set[str] = set()
         # key -> the name built for it. The key is the original's name, the
         # `type_key` of each type argument, and -- for an instance whose
         # context was collapsed -- the dictionaries it was applied to.
@@ -484,10 +527,12 @@ class Monomorphizer:
                 self.used.add(bind.name)
                 if bind.binders:
                     self.generic[bind.name] = bind
+                if is_dict:
+                    self.dict_group.add(bind.name)
                 if is_dict and not bind.binders:
                     self.top_dicts.add(bind.name)
-                if _dict_constructor(bind):
-                    self.dict_ctors.add(bind.name)
+                if _takes_dictionaries(bind):
+                    self.takes_dicts.add(bind.name)
         # A ground binding is where every specialization starts: its body's
         # type arguments are already types rather than variables. `main` is one
         # of these, and so is every instance dictionary with no context.
@@ -534,6 +579,8 @@ class Monomorphizer:
             return None
         self.counts[bind.name] = self.counts.get(bind.name, 0) + 1
         name = self.fresh(bind.name, targs)
+        if bind.name in self.dict_group and dicts is not None:
+            self.top_dicts.add(name)
         # Recorded *before* the body is built, which is what makes a recursive
         # binding terminate: the copy's own call to itself, at its own
         # arguments, finds this entry rather than asking for another copy.
@@ -568,11 +615,11 @@ class Monomorphizer:
         rewriter = _Rewriter(self, subst, bind.equations)
         ty, value = rewriter.ty(bind.ty), bind.value
         if dicts is not None:
-            # An instance's context, supplied. The lambda goes away and its
-            # parameters are renamed to the dictionaries they were handed --
-            # a rename and not a `let`, because the argument is a top-level
-            # name, so substituting it is capture-free and leaves the record's
-            # fields projecting from something M14c can see through.
+            # The evidence, supplied. The lambda goes away and its parameters
+            # are renamed to the dictionaries they were handed -- a rename and
+            # not a `let`, because the argument is a top-level name, so
+            # substituting it is capture-free and leaves what the body
+            # projects out of something M14c can see through.
             assert isinstance(value, CLam)
             rewriter.rename = dict(zip((p.name for p in value.params), dicts))
             value = value.body
@@ -581,10 +628,260 @@ class Monomorphizer:
                      bind.mutable, bind.module, rewriter.equations)
 
 
-def monomorphize(program: CProgram, decls: DeclTable,
-                 classes: ClassTable) -> tuple[CProgram, list[str]]:
+# --------------------------------------------------------- devirtualization
+
+
+class _Devirtualizer:
+    """A method selected from a *known* dictionary becomes a name.
+
+    After specialization `%inst.Ord.Int.lt(!i, n)` is a projection out of a
+    record this pass can see the definition of, and then an indirect call. Both
+    halves are avoidable, and avoiding them is what `plan.txt` item 6 was for:
+    each field of a ground dictionary is hoisted into its own top-level binding
+    (`%inst.Ord.Int#lt`) and the projection becomes a `CVar` naming it.
+
+    Coherence is again what makes it sound. A ground dictionary is one record,
+    built once, and no other value can ever be the `Ord Int` dictionary, so the
+    field's value is decided at compile time and a name for it is a name for
+    what the projection would have found.
+
+    Three things fall out rather than being arranged:
+
+    * `CForIn.iter_fn` and `next_fn` are ordinary terms, so every `for` loop in
+      the suite stops projecting.
+    * A method's own quantification stops being a special case. A `CTyApp` over
+      a `CField` -- the one form M14a said it had to leave -- becomes a
+      `CTyApp` over a `CVar`, which is the form everything else already uses.
+      Where the binders come from is `abstraction`, below, and it is not always
+      the term.
+    * A superclass field is already a top-level dictionary's name, so it is
+      followed rather than hoisted, and `d.%super.Semigroup.combine` collapses
+      in one step to `%inst.Semigroup.Int#combine`.
+
+    The record itself stays. A dictionary *parameter* is still projected from,
+    and a capped call site still passes one; what removes the records nothing
+    reads any more is `_reachable`, below, which is a separate question.
+    """
+
+    def __init__(self, program: CProgram, classes: ClassTable) -> None:
+        self.program = program
+        self.classes = classes
+        # Ground dictionaries only: a record whose contents are known. An
+        # instance with a context is a lambda and has no fields to hoist.
+        self.records: dict[str, CRecord] = {}
+        self.used: set[str] = set()
+        # (dictionary, field) -> the name that projection is now.
+        self.target: dict[tuple[str, str], str] = {}
+        self.hoisted: list[CBind] = []
+
+    def run(self) -> CProgram:
+        for bind in self.program.dicts + self.program.binds:
+            self.used.add(bind.name)
+        for bind in self.program.dicts:
+            if not bind.binders and isinstance(bind.value, CRecord):
+                self.records[bind.name] = bind.value
+        # Every hoist decided before any rewrite, because a method's body may
+        # project out of a dictionary whose fields have not been looked at yet
+        # -- including its own.
+        for bind in self.program.dicts:
+            record = self.records.get(bind.name)
+            if record is None:
+                continue
+            for name, value in record.fields:
+                made = self.hoist(bind, name, value)
+                if made is not None:
+                    self.target[(bind.name, name)] = made
+
+        out = CProgram()
+        out.dicts.extend(self.bind(b) for b in self.program.dicts)
+        # The hoisted bindings live with the dictionaries, not after them.
+        # `Evaluator.run` defines everything in `dicts` before it fills any
+        # record, and a record's field may now name a hoisted binding; a
+        # hoisted binding is always a lambda, so defining it builds a closure
+        # and cannot read a record that is still empty.
+        out.dicts.extend(self.bind(b) for b in self.hoisted)
+        out.binds.extend(self.bind(b) for b in self.program.binds)
+        return out
+
+    def bind(self, b: CBind) -> CBind:
+        return replace(b, value=self.rewrite(b.value))
+
+    def hoist(self, owner: CBind, name: str, value: CExpr) -> str | None:
+        """The name `owner.name`'s field now has, or None to leave it a
+        projection."""
+        if isinstance(value, CVar) and value.name in self.records:
+            return value.name
+        binders, inner = self.abstraction(owner, name, value)
+        if not isinstance(inner, CLam):
+            # A field whose value is neither a lambda nor another dictionary's
+            # name stays where it is. Hoisting it would move an evaluation to
+            # where the dictionaries are built, and what an evaluation there
+            # can observe is exactly what delta 50's two-pass loop exists to be
+            # careful about.
+            return None
+        made = f"{owner.name}#{name}"
+        while made in self.used:
+            made += "~"
+        self.used.add(made)
+        self.hoisted.append(CBind(made, inner.ty, binders, inner, owner.span,
+                                  False, owner.module))
+        return made
+
+    def abstraction(self, owner: CBind, name: str,
+                    value: CExpr) -> tuple[list[TVar], CExpr]:
+        """A field's own type abstraction, as binders and a body.
+
+        A method that quantifies over more than its class variable is not
+        always a `CTyLam`. When the method has a context of its own --
+        `fun fold[Monoid m](t m) -> m` -- the lowering emits the dictionary
+        lambda and leaves the quantification implicit, because the checker
+        reads a projection's binders off the *class table* rather than off the
+        term (`coretc.method_scheme`). So this reads them the same way, and
+        takes the term's only when the term states them.
+
+        Getting this from the term alone is what a first attempt did, and the
+        checker caught it immediately: `%inst.Foldable.Array#fold` was hoisted
+        with no binders and the use site still had one type argument.
+        """
+        if isinstance(value, CTyLam):
+            return list(value.binders), value.body
+        cls = _dict_class(owner.ty)
+        info = None if cls is None else self.classes.classes.get(cls)
+        method = None if info is None else info.methods.get(name)
+        if method is None:
+            return [], value
+        return [q for q in method.scheme.quantified
+                if q is not method.class_var], value
+
+    # -- rewriting ---------------------------------------------------------
+
+    def rewrite(self, e: CExpr) -> CExpr:
+        if isinstance(e, CField):
+            found = self.projected(e)
+            if found is not None:
+                return CVar(e.ty, e.span, found)
+        return type(e)(**{f.name: self.mapped(getattr(e, f.name))
+                          for f in fields(e)})
+
+    def mapped(self, v):
+        if isinstance(v, CExpr):
+            return self.rewrite(v)
+        if isinstance(v, CBind):
+            return self.bind(v)
+        if isinstance(v, CAlt):
+            return CAlt(v.pat, self.rewrite(v.body))
+        if isinstance(v, list):
+            return [self.mapped(x) for x in v]
+        if isinstance(v, tuple):
+            return tuple(self.mapped(x) for x in v)
+        return v
+
+    def projected(self, e: CField) -> str | None:
+        owner = self.owner(e.target)
+        return None if owner is None else self.target.get((owner, e.name))
+
+    def owner(self, e) -> str | None:
+        """The ground dictionary this expression names, if it names one.
+
+        Recursive, so a superclass chain resolves in one go: the target of
+        `.combine` is `d.%super.Semigroup`, which is itself a projection this
+        already knows the answer to.
+        """
+        if isinstance(e, CVar):
+            return e.name if e.name in self.records else None
+        if isinstance(e, CField):
+            found = self.projected(e)
+            return found if found in self.records else None
+        return None
+
+
+# ------------------------------------------------------------- reachability
+
+
+def _names(e) -> set[str]:
+    """Every name mentioned anywhere inside a term.
+
+    Deliberately an over-approximation: a local that happens to share a
+    top-level binding's name keeps that binding alive. Being wrong in this
+    direction costs a binding nobody calls; being wrong in the other costs a
+    program that does not run.
+    """
+    out: set[str] = set()
+
+    def walk(v) -> None:
+        if isinstance(v, CVar):
+            out.add(v.name)
+        if isinstance(v, (CExpr, CBind, CAlt)):
+            for f in fields(v):
+                walk(getattr(v, f.name))
+        elif isinstance(v, (list, tuple)):
+            for x in v:
+                walk(x)
+
+    walk(e)
+    return out
+
+
+def _droppable(bind: CBind, is_dict: bool) -> bool:
+    """Whether not evaluating this binding is unobservable.
+
+    The test is *effects*, not use, because a top-level binding is evaluated
+    for its own sake: `turkey/eval.py` walks `program.binds` in order before it
+    calls `main`, so a binding whose right-hand side prints has printed whether
+    or not anything reads it. Three kinds are safe, and each for a stated
+    reason rather than by inspection:
+
+    * a dictionary, which is a record or a lambda;
+    * a binding with `binders`, which generalized, and under the value
+      restriction (design.md 4.4) a generalized right-hand side is a syntactic
+      value;
+    * any other binding whose value is literally a lambda -- most of the
+      library, since a `fun` declaration is one.
+
+    Everything else stays, evaluated in the order it always was.
+    """
+    return is_dict or bool(bind.binders) or isinstance(bind.value, (CLam, CTyLam))
+
+
+def _reachable(program: CProgram, main: str) -> CProgram:
+    """Drop the bindings nothing reaches, where dropping one is unobservable.
+
+    This is what makes specialization a saving rather than an addition. A
+    program that used `Semigroup` at `Int` and `String` carried the generic
+    binding, the two copies, and every dictionary the Prelude declares; after
+    this it carries the two copies and the dictionaries they name.
+
+    The guard the cap needs is not written here because it does not need to be:
+    a capped call site still holds `CTyApp(CVar(generic), ...)`, so the generic
+    binding is named by whatever reaches that call site, and being named is all
+    this asks for. `test_the_capped_call_site_still_names_the_generic_binding`
+    is that claim as a test.
+    """
+    byname = {b.name: b for b in program.dicts + program.binds}
+    droppable = {b.name for b in program.dicts}
+    droppable |= {b.name for b in program.binds if _droppable(b, False)}
+    work = [n for n in byname if n not in droppable]
+    work.append(main)
+    reach = set(work)
+    while work:
+        bind = byname.get(work.pop())
+        if bind is None:
+            continue
+        for name in _names(bind.value):
+            if name not in reach:
+                reach.add(name)
+                work.append(name)
+    out = CProgram()
+    out.dicts.extend(b for b in program.dicts if b.name in reach)
+    out.binds.extend(b for b in program.binds if b.name in reach)
+    return out
+
+
+def monomorphize(program: CProgram, decls: DeclTable, classes: ClassTable,
+                 main: str = "main") -> tuple[CProgram, list[str]]:
     pass_ = Monomorphizer(program, decls, classes)
-    return pass_.run(), pass_.warnings
+    out = _Devirtualizer(pass_.run(), classes).run()
+    return _reachable(out, main), pass_.warnings
 
 
 __all__ = ["MAX_SPECIALIZATIONS", "MAX_TYPE_NODES", "Monomorphizer",

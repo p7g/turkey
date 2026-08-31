@@ -2240,3 +2240,73 @@ runner; two tests in `tests/test_mono.py`. **No `.expected` moved**, which is
 the entry's whole claim. What is still not done is delta 51's third part:
 a method selection off a ground dictionary is still a record projection at run
 time, and nothing is dropped for being unreachable.
+
+---
+
+### 53. A known dictionary's method is a name, and what nothing reaches is gone
+
+`plan.txt` item 6, third of three, and the one the first two were for. Deltas 51
+and 52 made every dictionary at a call site a known top-level record and then
+ran the result. That leaves two things on the table, and this takes both.
+
+**A method selection off a ground dictionary is decided at compile time.**
+`%inst.Ord.Int.lt(!i, n)` projects a field out of a record whose definition is
+right there and then calls whatever it found. Coherence (delta 43) is what
+settles it: a ground dictionary is one record, built once, and no other value
+can ever be the `Ord Int` dictionary -- so the field's value is known, and a
+name for it is a name for what the projection would have found. Each ground
+dictionary's fields become top-level bindings (`%inst.Ord.Int#lt`) and each
+projection becomes a `CVar`. A superclass field already holds another
+dictionary's *name*, so it is followed rather than hoisted, and
+`d.%super.Semigroup.combine` collapses in one step rather than two.
+
+`CForIn` carries its `iter` and `next` as ordinary terms (delta 48 said that
+was enough for the checker and would be enough for a later pass), so every
+`for` loop in the suite stops projecting without a line written for it.
+
+**And a specialized binding stops taking the dictionary it is always handed.**
+Delta 51 said `Main#squash@Int` still takes its `%Dict.Monoid Int`, and called
+removing it an optimization over ground code. It is the same collapse that
+delta 51 already performs for an instance with a context: `f[T](ev)` where the
+evidence is ground becomes one binding with the evidence substituted in. The
+only thing that had to change is which bindings are eligible -- any lambda over
+nothing but `%Dict.` parameters, rather than only the ones whose body is a
+record. So `Main#squash@Int : fun(Array Int) -> Int`, and inside it every call
+is direct. Without this the devirtualization above has nothing to see: a
+dictionary that arrives as a parameter is the one kind coherence says nothing
+about.
+
+**Then reachability.** Specialization only ever adds; after it, the binding
+each copy came from is usually dead, and so is every Prelude instance the
+program never mentions. A binding is dropped when it is unreached *and* not
+evaluating it is unobservable -- a dictionary, a binding with `binders` (which
+generalized, so under the value restriction its right-hand side is a value), or
+any binding whose value is literally a lambda. Everything else is a root and
+runs in the order it always did, because a top-level binding is evaluated for
+its own sake before `main` is called: `let noisy = shout()` prints whether or
+not anything reads `noisy`.
+
+The cap needs a guard here and does not get one, because it does not need one.
+A capped call site still holds `CTyApp(CVar(generic), ...)`, so the generic
+binding is named by whatever reaches that call site, and being named is all
+reachability asks for. That is a test rather than an argument
+(`test_the_capped_call_site_still_names_the_generic_binding`).
+
+**What it is worth.** On `tests/programs/dicts.tl`: 45 dictionary projections
+become 6, and 77 top-level bindings become 61 -- fewer, *after* a pass whose
+only job is to make copies. The six that remain are inside the two bindings
+that are still genuinely polymorphic.
+
+**What is still on the table, stated rather than hidden.** The three passes run
+once each and nothing goes back round. `%inst.Foldable.Array#foldMap` is a
+binding this pass made, and `Main#render` calls it at ground types with ground
+evidence -- exactly the shape the specializer collapses, had the specializer
+been able to see a binding that did not exist when it ran. Iterating to a fixed
+point would collect those, and is deliberately not done: a second round needs
+its own termination argument and the cap's is written for one.
+
+**Scope.** `turkey/mono.py` only, plus the `main` name threaded in from
+`turkey/driver.py` so reachability knows its root; `tests/programs/dicts.mono`
+regenerated. Nine new tests. **No `.expected` moved**, which is again the
+entry's whole claim -- and this time the pass deletes things, so it is a
+sharper one.

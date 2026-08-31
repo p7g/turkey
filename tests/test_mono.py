@@ -95,8 +95,9 @@ fun main() {
     made = names(checked.mono)
     assert "Main#twice@Int" in made
     assert "Main#twice@String" in made
-    # And the generic survives, because nothing in this pass deletes anything.
-    assert "Main#twice" in made
+    # And the generic is gone, because after M14c nothing reaches it. It is
+    # kept when something does: see the capped call site, further down.
+    assert "Main#twice" not in made
 
 
 def test_a_copy_takes_no_type_application():
@@ -197,8 +198,10 @@ def test_a_recursive_instance_names_itself():
     inner = [n.name for n in walk(built.value) if isinstance(n, CVar)]
     assert "%inst.Display.Array@Rose" in inner, "the cycle did not close"
     # Named by the *resolved* constructor -- `Main#Rose` -- where the copy's
-    # own name carries the bare one, since `_mangle` is for reading.
-    assert "%inst.Display.Main#Rose" in inner, "the element dictionary went missing"
+    # own name carries the bare one, since `_mangle` is for reading. And named
+    # through the method M14c hoisted out of it rather than through a
+    # projection, which is that milestone's whole claim.
+    assert "%inst.Display.Main#Rose#display" in inner, "the element method went missing"
 
 
 def test_a_dictionary_argument_that_is_not_a_top_level_name_is_left_alone():
@@ -238,6 +241,30 @@ fun depth(x : a, n : Int) -> Int {
 fun main() { print(Int.toString(depth(1, 3))) }
 """
 
+
+
+# Polymorphic recursion with a dictionary in it: the cap refuses to copy
+# `grow`, so the generic binding survives *and* still has a parameter to
+# project its `combine` out of.
+CAPPED_DICT = """
+type Pair a = Pair(a, a)
+
+class Semigroup a { fun combine(a, a) -> a }
+
+instance Semigroup Int { fun combine(x, y) = x + y }
+
+instance [Semigroup a] Semigroup (Pair a) {
+    fun combine(x, y) = x
+}
+
+fun grow[Semigroup a](x : a, n : Int) -> a {
+    if n <= 0 { return combine(x, x) }
+    grow(Pair(x, x), n - 1)
+    return combine(x, x)
+}
+
+fun main() { print(Int.toString(grow(1, 3))) }
+"""
 
 def test_polymorphic_recursion_terminates_at_the_cap():
     checked = check(POLYREC)
@@ -327,3 +354,130 @@ fun main() {
 }
 """)
     assert capsys.readouterr().out.splitlines() == ["2"]
+
+
+# -- a known dictionary's method is a name (M14c) ----------------------------
+#
+# After M14a a method selection is a projection out of a record whose
+# definition is right there, and then an indirect call. Coherence says the
+# field's value is decided, so the projection has a name: these are the tests
+# that it got one. None of it shows in a golden's output -- the same program
+# runs, through one less indirection.
+
+
+def dictionaries(program: CProgram) -> list[str]:
+    return [b.name for b in program.dicts if isinstance(b.value, CRecord)]
+
+
+def test_a_method_of_a_known_dictionary_becomes_a_binding():
+    checked = check(SEMI + """
+fun main() { print(Int.toString(twice(2))) }
+""")
+    assert "%inst.Semigroup.Int#combine" in names(checked.mono)
+    body = nodes(checked.mono, "Main#twice@Int")
+    assert not [n for n in body if isinstance(n, core.CField)], \
+        "a projection survived"
+    called = [n.fn.name for n in body
+              if isinstance(n, CApp) and isinstance(n.fn, CVar)]
+    assert "%inst.Semigroup.Int#combine" in called
+
+
+def test_a_superclass_chain_collapses_in_one_step():
+    """`d.%super.Semigroup.combine` is two projections, and the inner one
+    names a top-level dictionary already -- so it is followed rather than
+    hoisted, and the pair becomes the one name the outer one resolves to."""
+    checked = check("""
+class Semigroup a { fun combine(a, a) -> a }
+class Monoid a : Semigroup a { fun empty() -> a }
+instance Semigroup Int { fun combine(x, y) = x + y }
+instance Monoid Int { fun empty() = 0 }
+fun squash[Monoid a](xs : Array a) -> a {
+    var acc = empty()
+    for x in xs { acc = combine(acc, x) }
+    return acc
+}
+fun main() { print(Int.toString(squash([1, 2, 3]))) }
+""")
+    body = nodes(checked.mono, "Main#squash@Int")
+    called = {n.fn.name for n in body
+              if isinstance(n, CApp) and isinstance(n.fn, CVar)}
+    assert "%inst.Semigroup.Int#combine" in called, sorted(called)
+    assert "%inst.Monoid.Int#empty" in called, sorted(called)
+
+
+def test_a_for_loop_stops_projecting():
+    """`CForIn` carries `iter` and `next` as ordinary terms, so they are
+    rewritten by the same rule as everything else -- which is where every
+    `for` loop in the suite was paying a projection."""
+    checked = check("""
+fun main() {
+    var total = 0
+    for x in [1, 2, 3] { total = total + x }
+    print(Int.toString(total))
+}
+""")
+    loops = [n for n in nodes(checked.mono, "Main#main")
+             if isinstance(n, core.CForIn)]
+    assert loops, "no loop found"
+    for loop in loops:
+        assert isinstance(loop.iter_fn, CVar), loop.iter_fn
+        assert isinstance(loop.next_fn, CVar), loop.next_fn
+
+
+def test_a_dictionary_parameter_is_still_projected_from():
+    """The rewrite is about dictionaries this pass can *see*.
+
+    A binding the cap left generic still takes its dictionary as a parameter
+    and still projects out of it. That is not a shortcoming: it is what makes
+    the capped call site work, and a projection off a parameter is exactly the
+    thing coherence says nothing about.
+    """
+    checked = check(CAPPED_DICT)
+    generic = named(checked.mono, "Main#grow")
+    assert generic.binders, "the generic binding did not survive"
+    assert [n for n in walk(generic.value) if isinstance(n, core.CField)], \
+        "a generic body has nothing to project from but its parameter"
+
+
+# -- and what nothing reaches is dropped (M14c) ------------------------------
+
+
+def test_a_dictionary_nothing_reaches_is_dropped():
+    """The Prelude declares instances a given program never mentions. Before
+    this they were all emitted; the specialized program carries the ones it
+    names and no others."""
+    checked = check(SEMI + """
+fun main() { print(twice("a")) }
+""")
+    kept = dictionaries(checked.mono)
+    before = dictionaries(checked.core)
+    assert "%inst.Semigroup.String" in kept
+    assert "%inst.Semigroup.Int" not in kept
+    assert "%inst.Semigroup.Int" in before, "not a claim about the lowering"
+    assert len(kept) < len(before)
+
+
+def test_a_binding_that_could_have_run_is_kept(capsys):
+    """Only a binding whose value is a *value* may be dropped, because a
+    top-level binding is evaluated for its own sake before `main` is called.
+    `noisy` below is reached by nothing and must still print."""
+    from turkey.driver import run
+
+    run("""
+fun shout() -> Int {
+    print("hi")
+    return 1
+}
+
+let noisy = shout()
+
+fun main() { print("bye") }
+""")
+    assert capsys.readouterr().out.splitlines() == ["hi", "bye"]
+
+
+def test_the_specialized_program_is_smaller_than_the_one_it_came_from():
+    checked = check(SEMI + """
+fun main() { print(Int.toString(twice(2))) }
+""")
+    assert len(names(checked.mono)) < len(names(checked.core))

@@ -111,12 +111,14 @@ def check(src: str, file: str | None = None,
     # same checker: it rewrites every type in every body it copies, so "the
     # copy still typechecks" is the property that a substitution went wrong
     # would break first. See turkey/mono.py.
-    program_mono, mono_warnings = mono.monomorphize(program_core, decls, classes)
+    main = entry.scope.values.get("main", "main")
+    program_mono, mono_warnings = mono.monomorphize(program_core, decls,
+                                                    classes, main)
     coretc.check_program(program_mono, decls, classes, coretc.globals_of(env))
     warnings.extend(mono_warnings)
     return Checked(
         entry.program, ordered, decls, classes, env, loader.order,
-        entry.scope.values, entry.scope.values.get("main", "main"),
+        entry.scope.values, main,
         _signatures(entry, env, classes), warnings, types,
         program_core, program_mono, entry.name,
     )

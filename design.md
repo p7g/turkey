@@ -410,6 +410,8 @@ The Core is **checked**, on every compile, against the class table and the decla
 
 ## 6. Operational Semantics
 
+What runs is the Core of section 5.4, not the surface tree (SPEC-DELTAS.md 50). The two agree — the semantics below are the language's either way — but where the two descriptions differ, the Core is the one being described: a dictionary is a record, a method call is a field projection, a `var` is a reference cell, and a block is a chain of `let`s. Type abstraction and application are erased.
+
 ### 6.1 Evaluation strategy
 
 Strict, call-by-value, left-to-right evaluation of arguments and record fields. Pattern matching is exhaustive-checked at compile time (warnings; runtime error on unhandled cases).

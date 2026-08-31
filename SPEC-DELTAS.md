@@ -2035,3 +2035,73 @@ on correct input is asserted to accept, which is the half that cannot fail.
 New `.core` goldens for `dicts`, `monads` and `question_control`. **No
 `.expected` and no `.types` moved**, which is the point: this entry adds a
 check and changes nothing a program can see.
+
+### 50. The program that runs is the Core
+
+Delta 49 built the Core and checked it, and left the evaluator walking the
+surface tree beside it. That made the Core a second opinion: correct, checked,
+and consulted by nobody. This entry makes it the program.
+
+**Every golden's output is unchanged, and that is the whole verification.**
+`tests/test_programs.py` runs the compiler in a subprocess and compares
+stdout+stderr for ninety-one programs. The evaluator underneath all of them
+changed and not one `.expected` moved. Two independently written evaluators of
+one language agreeing on every program in the suite is the criterion M2.5 set
+for when a differential test earns its keep, and this is the second time the
+repository has been able to meet it.
+
+**Three things left the evaluator with the surface tree.**
+
+*Evidence.* `_eval_EVar` used to read a `Use` off the node, walk an `Evidence`
+tree to a dictionary, and select a method from it. A dictionary is a record
+now, so `%d.Show.Int.show(x)` is a projection and a call, and there is no
+`Evidence` interpreter left because there is nothing for it to interpret.
+
+*`DictAbs`.* A binding that took dictionaries used to be a value that was not
+yet a value: `let plus = combine` bound the *declaration*, and its right-hand
+side was **re-evaluated** at every instantiation. It is a lambda now, evaluated
+once like everything else.
+
+*The instance memo table.* Dictionaries were memoised on object identity so
+that `instance [Eq a] Eq (Array a)` would terminate: the dictionary was
+registered before its methods were filled in. That is gone, and its going
+required a change to the lowering rather than to the evaluator -- which is the
+point. An instance's reference to itself now sits *inside* its methods'
+lambdas, so it is not reached until the dictionary exists. Two placements had
+to move for that: the `let` binding a method's own dictionary went under the
+method's lambda, and a default method's field became an eta-expansion rather
+than an application. Both were run-time facts about an interpreter, and both
+are now facts about a term that a reader can see and a checker can check.
+
+**A parameter is a name.** It used to be a *pattern*, so calling meant
+matching, and a call that had typechecked could still fail at run time with
+"argument does not match the parameter pattern". The lowering turns a
+destructured parameter into a plain binder and a `match`, so the failure has
+nowhere left to happen.
+
+**What did not go.** `Use`, `Abstraction` and `InstancePlan` are still there,
+and still hung on AST nodes. They are the *elaborator's* output, read once by
+`turkey/lower.py` and never again -- and having solving, elaboration and
+lowering be three passes that hand each other results is the arrangement, not
+an accident of it. What has gone is anything reading them while a program runs.
+
+**One thing became slower and is worth saying.** Without the memo table, a
+parameterised instance's dictionary is rebuilt each time it is asked for --
+`empty()` on a `Monoid (Array a)` constructs the dictionary it belongs to. It
+is correct and it terminates; it is also work a memo table or, better, the
+specialization `plan.txt` item 6 describes would remove. Recorded rather than
+fixed, because fixing it here would put an interpreter's cache back in the
+place a term was just made honest.
+
+**What it costs.** `turkey/eval.py` is rewritten. `values.Dict` and
+`values.DictAbs` are deleted. `Prim.not` joins `builtins.py`: `!` is the one
+operator that is not a class method (design.md 8.2), the evaluator used to
+inline it, and Core has no node for it -- so it is an ordinary call now, like
+everything else.
+
+**Scope.** `turkey/eval.py` consumes `turkey/core.py`; `turkey/values.py` loses
+the two dictionary classes; `turkey/lower.py` gains `bind_self` and `eta`, both
+of them about *when* a dictionary is built. `turkey/core.py`'s printer
+renumbers generated binders per binding, the way it already renames type
+variables, so a `.core` golden no longer churns when an unrelated pass invents
+one more name. **No `.expected` moved**, which is the entry's whole claim.

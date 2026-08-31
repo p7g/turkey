@@ -54,7 +54,7 @@ def output(src: str, search: list[Path], capsys) -> list[str]:
     from turkey.builtins import initial_values
     from turkey.eval import Evaluator
 
-    Evaluator(checked.decls, initial_values()).run(checked.ordered, checked.main)
+    Evaluator(checked.decls, initial_values()).run(checked.core, checked.main)
     return capsys.readouterr().out.splitlines()
 
 

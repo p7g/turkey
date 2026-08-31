@@ -366,7 +366,13 @@ class Lowerer:
                                CVar(_unknown(), impl.decl.span,
                                     self.default_name(inst.cls, name)),
                                [head])
-            return CApp(result, impl.decl.span, fn, [own])
+            call = CApp(result, impl.decl.span, fn, [own])
+            # Eta-expanded, for the same reason `bind_self` puts the self
+            # dictionary under the lambda: the argument is the dictionary this
+            # field belongs to, so evaluating the application while the record
+            # is being built would build it again, for ever. Under a lambda it
+            # waits until the method is called.
+            return self.eta(call, result, impl.decl.span)
         mapping = {method_info.class_var.id: head}
         ty = substitute(method_info.scheme.body, mapping)
         with self.skolems_of(impl, method_info, _free_vars(inst.head)):
@@ -374,10 +380,42 @@ class Lowerer:
                                  dict_params=impl.dict_params,
                                  preds=method_info.scheme.preds[1:])
         if impl.self_name:
-            own = self.self_dict(inst, params)
-            body = CLet(body.ty, impl.decl.span, impl.self_name, own.ty,
-                        own, body)
+            body = self.bind_self(inst, params, impl.self_name, body,
+                                  impl.decl.span)
         return self.method_abstraction(method_info, body, impl.decl.span)
+
+    def eta(self, call: CExpr, result: Type, span) -> CExpr:
+        """`f` as `fun(x, ...) { f(x, ...) }`, to defer evaluating `f`."""
+        fn = prune(result)
+        if not isinstance(fn, TFun):
+            return call
+        params = [CParam(fresh_name("eta"), p) for p in fn.params]
+        args: list[CExpr] = [CVar(p.ty, span, p.name) for p in params]
+        return CLam(fn, span, params, CApp(fn.ret, span, call, args))
+
+    def bind_self(self, inst: InstInfo, params: list[str], name: str,
+                  body: CExpr, span) -> CExpr:
+        """Bind the instance's own dictionary *inside* the method's lambda.
+
+        Inside, not around it, and that placement is the difference between a
+        program that runs and one that does not. `instance [Show a] Show
+        (Array a)` names itself, so a binding evaluated while the dictionary is
+        being built would build the dictionary again, for ever. Under the
+        lambda it is evaluated when the method is *called*, by which time the
+        dictionary exists.
+
+        The evaluator used to arrange this with a memo table keyed on object
+        identity, registering a dictionary before filling in its methods. That
+        was a fact about the interpreter. Here it is a fact about the term.
+        """
+        own = self.self_dict(inst, params)
+        if isinstance(body, CLam):
+            inner = body.body
+            assert inner is not None
+            return CLam(body.ty, body.span, body.params,
+                        CLet(inner.ty, span, name, own.ty, own, inner),
+                        body.name)
+        return CLet(body.ty, span, name, own.ty, own, body)
 
     def method_abstraction(self, info, body: CExpr, span) -> CExpr:
         """A method is polymorphic in its *own* variables, and the dictionary

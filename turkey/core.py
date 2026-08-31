@@ -58,6 +58,7 @@ a checker can see it, rather than left to the representation of a scope.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 
 from .errors import Span
@@ -392,7 +393,8 @@ class CProgram:
 
 
 def show_expr(e: CExpr | None, indent: int = 0,
-              names: dict[int, str] | None = None) -> str:
+              names: dict[int, str] | None = None,
+              alias=None) -> str:
     """A readable rendering, for `turkey core` and for tests.
 
     Types are shown where they are decided -- at a binder, at a type
@@ -408,34 +410,34 @@ def show_expr(e: CExpr | None, indent: int = 0,
     if isinstance(e, CUnit):
         return f"{pad}()"
     if isinstance(e, CVar):
-        return f"{pad}{e.name}"
+        return f"{pad}{alias(e.name)}"
     if isinstance(e, CCon):
-        return f"{pad}{e.name}"
+        return f"{pad}{alias(e.name)}"
     if isinstance(e, CPrim):
         return f"{pad}#{e.name}"
     if isinstance(e, CTuple):
-        return f"{pad}({', '.join(show_expr(x, 0, names).strip() for x in e.elems)})"
+        return f"{pad}({', '.join(show_expr(x, 0, names, alias).strip() for x in e.elems)})"
     if isinstance(e, CArray):
-        return f"{pad}[{', '.join(show_expr(x, 0, names).strip() for x in e.elems)}]"
+        return f"{pad}[{', '.join(show_expr(x, 0, names, alias).strip() for x in e.elems)}]"
     if isinstance(e, CRecord):
         if not e.fields:
             return f"{pad}{e.con} {{}}"
         out = [f"{pad}{e.con} {{"]
         for name, value in e.fields:
             out.append(f"{pad}  {name} =")
-            out.append(show_expr(value, indent + 2, names))
+            out.append(show_expr(value, indent + 2, names, alias))
         out.append(f"{pad}}}")
         return "\n".join(out)
     if isinstance(e, CField):
-        return f"{pad}{show_expr(e.target, 0, names).strip()}.{e.name}"
+        return f"{pad}{show_expr(e.target, 0, names, alias).strip()}.{alias(e.name)}"
     if isinstance(e, CIndex):
-        return f"{pad}{show_expr(e.target, 0, names).strip()}[{show_expr(e.index, 0, names).strip()}]"
+        return f"{pad}{show_expr(e.target, 0, names, alias).strip()}[{show_expr(e.index, 0, names, alias).strip()}]"
     if isinstance(e, CLam):
-        params = ", ".join(f"{p.name} : {show(p.ty, names)}" for p in e.params)
-        return f"{pad}fun({params}) {{\n{show_expr(e.body, indent + 1, names)}\n{pad}}}"
+        params = ", ".join(f"{alias(p.name)} : {show(p.ty, names)}" for p in e.params)
+        return f"{pad}fun({params}) {{\n{show_expr(e.body, indent + 1, names, alias)}\n{pad}}}"
     if isinstance(e, CApp):
-        rendered = [show_expr(a, 0, names).strip() for a in e.args]
-        fn = show_expr(e.fn, 0, names).strip()
+        rendered = [show_expr(a, 0, names, alias).strip() for a in e.args]
+        fn = show_expr(e.fn, 0, names, alias).strip()
         if not any("\n" in a for a in rendered):
             return f"{pad}{fn}({', '.join(rendered)})"
         # An argument that spans lines -- a lambda, almost always, since that
@@ -445,68 +447,68 @@ def show_expr(e: CExpr | None, indent: int = 0,
         out = [f"{pad}{fn}("]
         for i, arg in enumerate(e.args):
             tail = "," if i < len(e.args) - 1 else ""
-            out.append(show_expr(arg, indent + 1, names) + tail)
+            out.append(show_expr(arg, indent + 1, names, alias) + tail)
         out.append(f"{pad})")
         return "\n".join(out)
     if isinstance(e, CTyLam):
         binders = " ".join(show(b, names) for b in e.binders)
-        return f"{pad}/\\{binders}.\n{show_expr(e.body, indent + 1, names)}"
+        return f"{pad}/\\{binders}.\n{show_expr(e.body, indent + 1, names, alias)}"
     if isinstance(e, CTyApp):
         args = ", ".join(show(a, names) for a in e.args)
-        return f"{pad}{show_expr(e.fn, 0, names).strip()}[{args}]"
+        return f"{pad}{show_expr(e.fn, 0, names, alias).strip()}[{args}]"
     if isinstance(e, CLet):
         forall = (f" forall {' '.join(show(b, names) for b in e.binders)}."
                   if e.binders else "")
-        return (f"{pad}let {e.name} :{forall} {show(e.bound, names)} =\n"
-                f"{show_expr(e.value, indent + 1, names)}\n{show_expr(e.body, indent, names)}")
+        return (f"{pad}let {alias(e.name)} :{forall} {show(e.bound, names)} =\n"
+                f"{show_expr(e.value, indent + 1, names, alias)}\n{show_expr(e.body, indent, names, alias)}")
     if isinstance(e, CLetRec):
         out = [f"{pad}letrec"]
         for bind in e.binds:
             forall = (f" forall {' '.join(show(b, names) for b in bind.binders)}."
                       if bind.binders else "")
-            out.append(f"{pad}  {bind.name} :{forall} {show(bind.ty, names)} =")
-            out.append(show_expr(bind.value, indent + 2, names))
-        out.append(show_expr(e.body, indent, names))
+            out.append(f"{pad}  {alias(bind.name)} :{forall} {show(bind.ty, names)} =")
+            out.append(show_expr(bind.value, indent + 2, names, alias))
+        out.append(show_expr(e.body, indent, names, alias))
         return "\n".join(out)
     if isinstance(e, CRef):
-        return f"{pad}ref({show_expr(e.value, 0, names).strip()})"
+        return f"{pad}ref({show_expr(e.value, 0, names, alias).strip()})"
     if isinstance(e, CDeref):
-        return f"{pad}!{show_expr(e.target, 0, names).strip()}"
+        return f"{pad}!{show_expr(e.target, 0, names, alias).strip()}"
     if isinstance(e, CAssign):
-        return f"{pad}{show_expr(e.target, 0, names).strip()} := {show_expr(e.value, 0, names).strip()}"
+        return f"{pad}{show_expr(e.target, 0, names, alias).strip()} := {show_expr(e.value, 0, names, alias).strip()}"
     if isinstance(e, CIf):
-        out = [f"{pad}if {show_expr(e.cond, 0, names).strip()} {{",
-               show_expr(e.then, indent + 1, names)]
+        out = [f"{pad}if {show_expr(e.cond, 0, names, alias).strip()} {{",
+               show_expr(e.then, indent + 1, names, alias)]
         if e.otherwise is not None:
             out.append(f"{pad}}} else {{")
-            out.append(show_expr(e.otherwise, indent + 1, names))
+            out.append(show_expr(e.otherwise, indent + 1, names, alias))
         out.append(f"{pad}}}")
         return "\n".join(out)
     if isinstance(e, CMatch):
-        out = [f"{pad}match {show_expr(e.scrutinee, 0, names).strip()} {{"]
+        out = [f"{pad}match {show_expr(e.scrutinee, 0, names, alias).strip()} {{"]
         for alt in e.alts:
             out.append(f"{pad}  {_pattern(alt.pat)} ->")
-            out.append(show_expr(alt.body, indent + 2, names))
+            out.append(show_expr(alt.body, indent + 2, names, alias))
         out.append(f"{pad}}}")
         return "\n".join(out)
     if isinstance(e, CWhile):
-        return (f"{pad}while {show_expr(e.cond, 0, names).strip()} {{\n"
-                f"{show_expr(e.body, indent + 1, names)}\n{pad}}}")
+        return (f"{pad}while {show_expr(e.cond, 0, names, alias).strip()} {{\n"
+                f"{show_expr(e.body, indent + 1, names, alias)}\n{pad}}}")
     if isinstance(e, CLoop):
-        return f"{pad}loop {{\n{show_expr(e.body, indent + 1, names)}\n{pad}}}"
+        return f"{pad}loop {{\n{show_expr(e.body, indent + 1, names, alias)}\n{pad}}}"
     if isinstance(e, CForC):
-        return (f"{pad}for {show_expr(e.init, 0, names).strip()}; "
-                f"{show_expr(e.cond, 0, names).strip()}; {show_expr(e.step, 0, names).strip()} {{\n"
-                f"{show_expr(e.body, indent + 1, names)}\n{pad}}}")
+        return (f"{pad}for {show_expr(e.init, 0, names, alias).strip()}; "
+                f"{show_expr(e.cond, 0, names, alias).strip()}; {show_expr(e.step, 0, names, alias).strip()} {{\n"
+                f"{show_expr(e.body, indent + 1, names, alias)}\n{pad}}}")
     if isinstance(e, CForIn):
-        return (f"{pad}for {_pattern(e.pat)} in {show_expr(e.seq, 0, names).strip()} "
-                f"via {show_expr(e.iter_fn, 0, names).strip()}, "
-                f"{show_expr(e.next_fn, 0, names).strip()} {{\n"
-                f"{show_expr(e.body, indent + 1, names)}\n{pad}}}")
+        return (f"{pad}for {_pattern(e.pat)} in {show_expr(e.seq, 0, names, alias).strip()} "
+                f"via {show_expr(e.iter_fn, 0, names, alias).strip()}, "
+                f"{show_expr(e.next_fn, 0, names, alias).strip()} {{\n"
+                f"{show_expr(e.body, indent + 1, names, alias)}\n{pad}}}")
     if isinstance(e, CReturn):
-        return f"{pad}return {show_expr(e.value, 0, names).strip()}"
+        return f"{pad}return {show_expr(e.value, 0, names, alias).strip()}"
     if isinstance(e, CBreak):
-        return f"{pad}break {show_expr(e.value, 0, names).strip()}"
+        return f"{pad}break {show_expr(e.value, 0, names, alias).strip()}"
     if isinstance(e, CContinue):
         return f"{pad}continue"
     raise AssertionError(f"unprintable Core node {type(e).__name__}")
@@ -554,16 +556,53 @@ def show_program(program: CProgram, module: str | None = None) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
+_GENERATED = re.compile(r"^%([A-Za-z]+)(\d+)(\..*)?$")
+
+
+class _Aliases:
+    """Renumbers the binders a pass invented, per binding, in encounter order.
+
+    `%seq24` and `%d52.Show` carry a counter that is global to a whole
+    compilation, so adding a generated name anywhere renumbers every name after
+    it. That makes a `.core` golden churn on changes it has nothing to do with,
+    and the numbers mean nothing to a reader anyway -- they exist to be
+    unique, and they still are after this.
+
+    The same decision the printer already makes for type variables, which are
+    named `a, b, c` in encounter order rather than by their global ids.
+    """
+
+    def __init__(self) -> None:
+        self.seen: dict[str, str] = {}
+        self.counts: dict[tuple[str, str], int] = {}
+
+    def __call__(self, name: str) -> str:
+        found = self.seen.get(name)
+        if found is not None:
+            return found
+        match = _GENERATED.match(name)
+        if match is None:
+            self.seen[name] = name
+            return name
+        hint, _, suffix = match.groups()
+        key = (hint, suffix or "")
+        self.counts[key] = self.counts.get(key, 0) + 1
+        out = f"%{hint}{self.counts[key]}{suffix or ''}"
+        self.seen[name] = out
+        return out
+
+
 def show_bind(bind: CBind) -> str:
     """One binding. The `names` dictionary starts here and is shared by every
     type printed under it, so the `a` a binder introduces is the `a` its body
     mentions -- which is the whole reason a reader can follow a type variable
     from a `forall` to the parameter that uses it."""
     names: dict[int, str] = {}
+    alias = _Aliases()
     binders = " ".join(show(b, names) for b in bind.binders)
     forall = f"forall {binders}. " if bind.binders else ""
     return (f"{bind.name} : {forall}{show(bind.ty, names)} =\n"
-            f"{show_expr(bind.value, 1, names)}")
+            f"{show_expr(bind.value, 1, names, alias)}")
 
 
 __all__ = [

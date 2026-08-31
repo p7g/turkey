@@ -57,7 +57,7 @@ fun run[Iterator s, Item s ~ Op](tape : Tape, ops : s) -> Unit {
         match op {
             Inc(n) -> inc(tape, n)
             Move(n) -> move(tape, n)
-            Print -> write(Char.toString(Char.fromInt(get(tape))))
+            Print -> write(Char.fromInt(get(tape)))
             Loop(loopOps) -> {
                 while get(tape) != 0 {
                     run(tape, loopOps)

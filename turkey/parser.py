@@ -31,6 +31,7 @@ EXPR_START = frozenset(
     | {
         "IDENT", "CONID", "(", "[", "{", "-", "!",
         "fun", "if", "match", "while", "for", "loop", "return", "break", "continue",
+        "do",
     }
 )
 
@@ -727,6 +728,14 @@ class Parser:
             elif self.at(".") and self.peek(1).kind == "IDENT":
                 self.advance()
                 expr = ast.EField(expr.span, expr, self.advance().text)
+            elif self.at("?"):
+                # A suffix like the other three, so it binds tighter than any
+                # operator and chains with them: `f(x)?.field?` reads as it
+                # looks. `bind` is marked, so a program's own `bind` is not what
+                # a `?` means -- see `turkey/resolve.py`.
+                self.advance()
+                fn = ast.EVar(expr.span, prelude.MONAD_BIND, method=True)
+                expr = ast.EQuestion(expr.span, expr, fn)
             else:
                 return expr
 
@@ -765,6 +774,9 @@ class Parser:
             return ast.EArray(tok.span, elems)
         if kind == "{":
             return self.parse_block()
+        if kind == "do":
+            self.advance()
+            return ast.EDo(tok.span, self.parse_block())
         if kind == "fun":
             self.advance()
             params = self.parse_param_list()

@@ -302,6 +302,38 @@ class EBlock(Expr):
     stmts: list[Stmt]
 
 
+@dataclass(eq=False)
+class EQuestion(Expr):
+    """`e?` -- the instance's `bind`, with the rest of the block as its
+    continuation (SPEC-DELTAS.md 46).
+
+    Unlike every other sugar in this file, this one cannot be a node the later
+    stages interpret: what `?` binds is *the rest of the enclosing statement
+    sequence*, which no locally annotated node can name. So `turkey/desugar.py`
+    rewrites it away before anything else runs, and `bind_fn` is the marked
+    method reference it rewrites to -- the same trick `EBinary.fn` uses to keep
+    `+` meaning `Add.add` in a module that defines its own `add`.
+
+    The node is *consumed* by that pass, not deleted from this file. When there
+    is a Core IR to lower to, `?` will want lowering to join points directly,
+    with the source-to-source pass kept as the oracle to differential-test
+    against -- and that needs a sugared tree still to lower.
+    """
+    expr: Expr
+    bind_fn: EVar | None = None
+
+
+@dataclass(eq=False)
+class EDo(Expr):
+    """`do { ... }` -- says which block a `?` inside it unwinds to.
+
+    It is only a marker. A `do` containing no `?` emits nothing at all and means
+    exactly the block it wraps, which is why a `?`-free `do` cannot be ambiguous
+    about its monad: it does not have one.
+    """
+    body: EBlock
+
+
 # ------------------------------------------------------------------ statements
 
 

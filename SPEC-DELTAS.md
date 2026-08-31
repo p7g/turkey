@@ -1854,3 +1854,86 @@ asked for, at the one point where the answer is surprising enough to want one.
 and `err_question_escape` are **deleted** -- they recorded delta 46's gap, and
 the gap is closed. New golden `question_control.tl`, with `.expected` and
 `.types`. No other golden moved, and `question.tl`'s lowering is unchanged.
+
+### 48. Every expression knows the type it was given
+
+`plan.txt` item 5 asks for a typed Core IR, on the grounds that the elaborator
+(delta 30) is already a proto-Core that has no datatype. Before any of that can
+be built there is a precondition, and this entry is only that: **inference stops
+throwing away the types it computed.**
+
+**Today it throws away nearly all of them.** `Generator` gives every expression
+a type, uses it to build the constraint, and drops it. Afterwards the only
+per-node record in the whole compiler is `match_sites`, kept since M7 so that
+exhaustiveness can see a scrutinee's type. Per-*binding* schemes survive, in the
+environment, which is what `turkey types` prints -- but a scheme is not what a
+lowering reads. A lowering reads every node.
+
+**The cheap part is cheap because `Type` is mutable union-find.** A `TVar`
+stashed during generation is not a snapshot: solving fills in `ref`, and `prune`
+reads the answer out later. So recording costs one dictionary write per
+expression at generation and nothing at all at solving time -- no second pass,
+no zonking, no copying back. `match_sites` has relied on exactly this since M7;
+`turkey/typed.py` is the same trick applied to every expression rather than to
+`match` scrutinees.
+
+**The table is not a field on `ast.Expr`, deliberately.** Mechanically it could
+not be: every expression node declares non-default fields, so a defaulted field
+on the base class is a `TypeError` at class creation. But the real reason is
+that the AST already carries three side channels -- `EVar.use`, `FunDecl.dicts`,
+`SLet.dicts` -- typed `object` and trusted by the evaluator, and the point of
+what follows this entry is to *delete* them. Adding a fourth on the way there
+would be moving backwards.
+
+**What a use site instantiated its scheme at is now recorded too**, beside the
+predicates it already recorded and by the same line of the solver. The two are
+halves of one story: the predicates say what evidence an occurrence costs, the
+type arguments say what the occurrence instantiated the scheme *at*.
+`instantiate_qual` built both and returned one, because until there was
+something to lower to, nothing downstream asked. A type application in a
+System-F-ish Core is precisely that argument list, in `scheme.quantified`'s
+order -- which is the same order a type abstraction at the definition binds in,
+so the two need no separate agreement to keep, exactly as `Abstraction.preds` is
+already the order of the dictionary parameters.
+
+**Reading a type back reduces families throughout, and `types.normalize` does
+not.** That is not an oversight there; it says so, and gives the reason: "Only
+the head is reduced. A family buried inside an argument is reduced when
+something compares it, which is the only moment its value can matter."
+Unification only ever compares heads, so head-only is exactly enough for it. A
+table something reads *whole* is the case that module did not have. `iter(xs)`
+answers `Cursor (Array Int)` and `next` answers `Option (Item (Array Int))`:
+both families sit under a constructor, and a Core term annotated with either
+would carry a type that was never reduced and would not check. So
+`TypeTable.resolve` reduces at every level, and `adt.tl`'s loop records
+`fun(Array Int, ArrayCursor) -> Option Int`.
+
+**What must not survive, and what may.** Two things would make a recorded type
+not a type. A `TSet` -- a numeric literal whose type is still a *decision*
+(delta 32) -- must be gone, and is: across all 38 non-error golden programs,
+11,470 recorded expressions, none unresolved. A `TFam` is different: 28 survive,
+and all 28 should. `Elem c` where `c` is bound by the enclosing signature is
+rigid, and as much a type as `Int` is -- a type abstraction binds the `c`. What
+must not survive is a family still *waiting* on an instance, and that is
+rejected during solving (delta 39), not here.
+
+**A generalized binding records its own bound variable, and that is correct.**
+In `let n = 1`, `n` is non-expansive and generalizes, so the literal's recorded
+type is the variable the scheme quantifies, not `Int`. The `Int` appears where
+it is decided, at the use site. This looks like a gap and is the opposite of
+one: it is what a typed Core says out loud, since the definition becomes a type
+abstraction and inside one the bound variable *is* the type. Recording anything
+else would be recording a lie.
+
+**What it costs.** One dictionary entry per expression, for the life of the
+check -- roughly 11,000 on the largest golden, which is bounded by the program
+and freed with it. Nothing observable changes: no output moved, no scheme
+changed, no diagnostic changed, and the evaluator does not know the table
+exists. `instantiate_qual` returns a triple instead of a pair, which has one
+caller.
+
+**Scope.** New `turkey/typed.py`; `Generator.gen_expr` records in one place, so
+no case can forget; `Solver.solve_instance` fills in `Use.type_args`;
+`Checked` carries the table. New `tests/test_typed_ast.py`. No golden moved --
+this entry adds nothing a program can see, which is the point of doing it
+separately.

@@ -457,12 +457,18 @@ class Solver:
         """
         binding = self.env.lookup(c.name)
         assert binding is not None, f"generation let '{c.name}' through unbound"
-        preds, ty = instantiate_qual(binding.scheme, self.fresh)
+        preds, ty, type_args = instantiate_qual(binding.scheme, self.fresh)
         unify(ty, c.type, c.span, "", self)
         if c.use is not None:
             # Only the class predicates: `HasField` and `OneOf` are discharged
             # by a lookup and a decision, and leave nothing behind to pass.
             c.use.preds = [p for p in preds if self.classes.is_class(p.name)]
+            # Every type argument, though, and unfiltered: a type application
+            # has to name one per quantified variable or it is not the scheme's
+            # instantiation. They are recorded before `unify` has run to
+            # completion and are variables at this point, which is correct --
+            # what they turn out to be is read back after solving.
+            c.use.type_args = type_args
             c.use.scopes = tuple(self.scopes)
             self.uses.append(c.use)
         for p in preds:

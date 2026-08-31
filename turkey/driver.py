@@ -146,7 +146,7 @@ def run(src: str, filename: str = "<input>") -> None:
     search = [Path(filename).resolve().parent] if filename != "<input>" else None
     checked = check(src, None if filename == "<input>" else filename, search)
     report_warnings(checked.warnings, filename)
-    Evaluator(checked.decls, initial_values()).run(checked.ordered, checked.main)
+    Evaluator(checked.decls, initial_values()).run(checked.core, checked.main)
 
 
 def report_warnings(warnings: list[str], filename: str) -> None:

@@ -21,7 +21,11 @@ Three pieces, and they are separate on purpose:
   predicates takes *n* leading dictionaries, and the `Abstraction` beside its
   `CLet` records their runtime names. Nothing else in the pipeline has to agree
   about an order, because the scheme's own predicate list is the order.
-* **What a dictionary is** is `values.Dict`, built by the evaluator.
+* **What a dictionary is** is settled downstream: `turkey/lower.py` turns
+  each `Evidence` into an ordinary term over a record type, and
+  `turkey/coretc.py` checks it (delta 49). This module decides *which*
+  instance covers a predicate; it no longer decides what that costs at
+  run time, because a dictionary is now just a value.
 
 The predicates a binding retains are shared across its whole group rather than
 computed per name. For the single-name group that is every real case the two

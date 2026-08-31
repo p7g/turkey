@@ -1,4 +1,4 @@
-"""Tree-walking evaluator (design.md section 6).
+"""Tree-walking evaluator for the typed Core (design.md section 6).
 
 Strict, call-by-value, left-to-right. Control transfers -- `return`, `break`,
 `continue` -- are Python exceptions, which is the natural fit for constructs
@@ -7,18 +7,54 @@ whose type is bottom: they never yield a value to their context.
 Reference semantics for records and arrays (section 6.3) need no special
 machinery: the objects in `turkey.values` are mutable and are never copied, so
 binding a name to one aliases it.
+
+## It runs the Core, not the surface tree
+
+Until M13c this walked `turkey/ast.py` and consulted three side channels the
+elaborator had filled in -- a `Use` per occurrence, an `Abstraction` per
+binding group, an `InstancePlan` per instance -- reading dictionaries back out
+of an `Evidence` tree at every method call. All of that is gone. What arrives
+here is `turkey/core.py`, already checked by `turkey/coretc.py`, and three
+things this file used to do have gone with it:
+
+* **Evidence.** A dictionary is an ordinary record and a method is an ordinary
+  field of it, so `%d.Show.Int.show(x)` is a projection and a call. There is no
+  `Evidence` interpreter here any more, because there is no `Evidence`.
+* **`DictAbs`.** A binding that took dictionaries used to be a value that was
+  not yet a value, re-elaborated per instantiation -- a `let`'s right-hand side
+  was *re-evaluated* every time it was used at a new type. It is a lambda now.
+* **The instance memo table.** Dictionaries were memoised on object identity
+  so a recursive instance would terminate. In Core the instance's reference to
+  itself sits inside its methods' lambdas, so it is not reached until the
+  dictionary exists, and there is nothing to memoise for.
+
+Type abstraction and application are erased: `CTyLam` evaluates its body and
+`CTyApp` its operand. Types decided what ran; they do not run.
+
+## What is left that is not obvious
+
+Top-level dictionaries are defined in **two passes**: every one is bound to an
+empty record first, then the fields are filled in. `instance Monoid Int` holds
+its `Semigroup Int` superclass dictionary, and the two are built in whatever
+order the class table happens to hold them. Binding the object before filling
+it means an order that would otherwise be a lookup failure is simply a record
+that is complete a moment later -- the same trick the memo table used, for the
+same reason, in the one place it is still needed.
 """
 
 from __future__ import annotations
 
-from . import ast, prelude
+from . import ast
+from .core import (
+    CApp, CArray, CAssign, CBreak, CCon, CContinue, CDeref, CExpr, CField,
+    CForC, CForIn, CIf, CIndex, CLam, CLet, CLetRec, CLit, CLoop, CMatch,
+    CPrim, CProgram, CRecord, CRef, CReturn, CTuple, CTyApp, CTyLam, CUnit,
+    CVar, CWhile,
+)
 from .decls import DeclTable
-from .deps import pattern_vars
 from .errors import TurkeyPanic
-from .evidence import Absent, FromDict, FromInstance
 from .values import (
-    UNIT, ArrayObj, Builtin, Closure, ConstructorFn, ConValue, Dict, DictAbs,
-    RecordObj, from_bool, truth,
+    UNIT, ArrayObj, Builtin, Closure, ConstructorFn, ConValue, RecordObj, truth,
 )
 
 
@@ -40,8 +76,25 @@ class ContinueSignal(Exception):
     pass
 
 
+class Cell:
+    """A mutable binding: what a `var` is (design.md decision 36).
+
+    One object, captured by value, so a closure that writes through it writes
+    to the same cell everyone else reads. That was previously a property of the
+    evaluator's scope chain and is now a property of the term.
+    """
+
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        self.value = value
+
+    def __repr__(self) -> str:
+        return f"<cell {self.value!r}>"
+
+
 class REnv:
-    """A runtime scope chain. Assignment rebinds in whichever scope owns the name."""
+    """A runtime scope chain. Lookup walks outward."""
 
     __slots__ = ("parent", "names")
 
@@ -61,46 +114,13 @@ class REnv:
             if name in env.names:
                 return env.names[name]
             env = env.parent
-        raise TurkeyPanic(f"internal error: '{name}' is not bound at run time")
-
-    def assign(self, name: str, value) -> None:
-        env: REnv | None = self
-        while env is not None:
-            if name in env.names:
-                env.names[name] = value
-                return
-            env = env.parent
-        raise TurkeyPanic(f"internal error: cannot assign to unbound '{name}'")
-
-
-def _int_div(a: int, b: int) -> int:
-    if b == 0:
-        raise TurkeyPanic("division by zero")
-    # Truncate toward zero, as machine integer division does; Python's `//`
-    # floors instead.
-    return -(-a // b) if (a < 0) != (b < 0) else a // b
-
-
-def _int_mod(a: int, b: int) -> int:
-    if b == 0:
-        raise TurkeyPanic("remainder by zero")
-    return a - b * _int_div(a, b)
-
-
-def _float_div(a: float, b: float) -> float:
-    if b == 0.0:
-        raise TurkeyPanic("division by zero")
-    return a / b
+        raise TurkeyPanic(f"'{name}' is not defined at run time")
 
 
 class Evaluator:
     def __init__(self, decls: DeclTable, globals_: dict):
         self.decls = decls
         self.globals = REnv(None, dict(globals_))
-        # One dictionary per (instance, arguments). Shared rather than rebuilt
-        # so that `Eq (Array a)` applied to the same `Eq a` is the same object,
-        # which is what makes a recursive instance terminate.
-        self.dicts: dict[tuple, Dict] = {}
         for name, info in decls.constructors.items():
             mutable = decls.tycons[info.tycon].is_mutable_record
             if info.arity == 0:
@@ -112,203 +132,109 @@ class Evaluator:
 
     # -- program ------------------------------------------------------------
 
-    def run(self, ordered: list[ast.Stmt], main: str = "main") -> None:
-        """Evaluate top-level items, then call `main` if the program has one.
+    def run(self, program: CProgram, main: str = "main") -> None:
+        """Build the dictionaries, evaluate the bindings, then call `main`."""
+        records: list[tuple[RecordObj, CRecord]] = []
+        for bind in program.dicts:
+            if isinstance(bind.value, CRecord):
+                # Bound before it is filled. See the note in the module
+                # docstring: dictionaries hold each other, and the order they
+                # are emitted in is the class table's, not a dependency order.
+                obj = RecordObj(bind.value.con, {})
+                self.globals.define(bind.name, obj)
+                records.append((obj, bind.value))
+            else:
+                self.globals.define(bind.name, self.eval(bind.value, self.globals))
+        for obj, node in records:
+            for name, value in node.fields:
+                obj.fields[name] = self.eval(value, self.globals)
 
-        The order is the dependency order inference produced, so every binding
-        is initialized before anything that reads it.
-        """
-        for item in ordered:
-            self.exec_stmt(item, self.globals)
+        for bind in program.binds:
+            self.globals.define(bind.name, self.eval(bind.value, self.globals))
+
         entry = self.globals.names.get(main)
         if entry is not None:
-            self.call(entry, [], span=None)
-
-    # -- statements ---------------------------------------------------------
-
-    def exec_stmt(self, stmt: ast.Stmt, env: REnv):
-        if isinstance(stmt, ast.SExpr):
-            return self.eval(stmt.expr, env)
-
-        if isinstance(stmt, (ast.SLet, ast.SVar)):
-            dicts = getattr(stmt, "dicts", None)
-            if dicts is not None and dicts.params:
-                # The value cannot be built until the dictionaries arrive, so
-                # each name it binds stands for the binding itself until then.
-                for name in pattern_vars(stmt.pat):
-                    env.define(name, DictAbs(dicts.params, stmt, env))
-                return UNIT
-            value = self.eval(stmt.value, env)
-            bindings = match_pattern(stmt.pat, value)
-            if bindings is None:
-                raise TurkeyPanic(
-                    f"the pattern in this binding does not match the value {value!r}"
-                )
-            for name, bound in bindings.items():
-                env.define(name, bound)
-            return UNIT
-
-        if isinstance(stmt, ast.SFun):
-            decl = stmt.decl
-            if decl.dicts is not None and decl.dicts.params:
-                env.define(decl.name, DictAbs(decl.dicts.params, decl, env))
-            else:
-                env.define(decl.name, Closure(decl.params, decl.body, env, decl.name))
-            return UNIT
-
-        if isinstance(stmt, ast.SAssign):
-            self.exec_assign(stmt, env)
-            return UNIT
-
-        raise AssertionError(f"unhandled statement {type(stmt).__name__}")
-
-    def exec_assign(self, stmt: ast.SAssign, env: REnv) -> None:
-        target = stmt.target
-        value = self.eval(stmt.value, env)
-
-        if isinstance(target, ast.EVar):
-            env.assign(target.name, value)
-            return
-        if isinstance(target, ast.EField):
-            obj = self.eval(target.obj, env)
-            if isinstance(obj, ArrayObj):
-                if target.name == "length":
-                    obj.set_length(value)
-                else:
-                    obj.set_capacity(value)
-                return
-            obj.fields[target.name] = value
-            return
-        if isinstance(target, ast.EIndex):
-            self.eval(target.arr, env).set(self.eval(target.index, env), value)
-            return
-        raise AssertionError("unhandled assignment target")
+            self.call(entry, [])
 
     # -- expressions --------------------------------------------------------
 
-    def eval(self, e: ast.Expr, env: REnv):
-        return getattr(self, "_eval_" + type(e).__name__)(e, env)
+    def eval(self, e: CExpr, env: REnv):
+        method = getattr(self, "_eval_" + type(e).__name__, None)
+        if method is None:
+            raise AssertionError(f"cannot evaluate {type(e).__name__}")
+        return method(e, env)
 
-    def _eval_ELit(self, e, env):
+    def _eval_CLit(self, e: CLit, env: REnv):
         return e.value
 
-    def _eval_EUnit(self, e, env):
+    def _eval_CUnit(self, e: CUnit, env: REnv):
         return UNIT
 
-    def _eval_EVar(self, e, env):
-        use = e.use
-        if use is None or not use.evidence:
-            return env.lookup(e.name)
-        dicts = [self.evidence(ev, env) for ev in use.evidence]
-        if use.method is not None:
-            # A method is *selected* from its class's dictionary; the rest of
-            # the evidence is the method's own context, which every call takes.
-            value = dicts[0].methods[e.name]
-            dicts = dicts[1:]
-        else:
-            value = env.lookup(e.name)
-        return self.supply(value, dicts, e.name)
-
-    # -- dictionaries -------------------------------------------------------
-
-    def supply(self, value, dicts, name: str):
-        """Hand `dicts` to a binding that abstracts over them."""
-        if not isinstance(value, DictAbs):
-            return value
-        scope = value.env.child()
-        for param, d in zip(value.params, dicts):
-            scope.define(param, d)
-        node = value.node
-        if isinstance(node, ast.FunDecl):
-            return Closure(node.params, node.body, scope, node.name)
-        # A `let`: re-run the binding with the dictionaries in scope and take
-        # the name that was asked for.
-        bindings = match_pattern(node.pat, self.eval(node.value, scope))
-        if bindings is None:
-            raise TurkeyPanic("the pattern in this binding does not match its value")
-        return bindings[name]
-
-    def evidence(self, ev, env) -> Dict:
-        """Build the dictionary one piece of evidence stands for."""
-        if isinstance(ev, FromDict):
-            d = env.lookup(ev.name)
-            for step in ev.path:
-                d = d.supers[step]
-            return d
-        if isinstance(ev, FromInstance):
-            return self.instance_dict(ev.inst, [self.evidence(a, env) for a in ev.args])
-        assert isinstance(ev, Absent)
-        raise TurkeyPanic(
-            f"internal error: a '{ev.pred}' dictionary was needed after all"
-        )
-
-    def instance_dict(self, inst, args: list[Dict]) -> Dict:
-        key = (id(inst), tuple(id(a) for a in args))
-        cached = self.dicts.get(key)
-        if cached is not None:
-            return cached
-        plan = inst.plan
-        d = Dict(inst.cls, inst.con)
-        # Registered *before* the methods are built. A method body may need
-        # this very dictionary -- an instance method that recurses, or a
-        # superclass whose own instance leads back here -- and without this the
-        # construction would not terminate.
-        self.dicts[key] = d
-        scope = self.globals.child()
-        for name, arg in zip(plan.params, args):
-            scope.define(name, arg)
-        for name, impl in plan.methods.items():
-            inner = scope.child()
-            inner.define(impl.self_name, d)
-            d.methods[name] = (
-                DictAbs(impl.dict_params, impl.decl, inner) if impl.dict_params
-                else Closure(impl.decl.params, impl.decl.body, inner, name)
-            )
-        for sup, sup_ev in plan.supers.items():
-            d.supers[sup] = self.evidence(sup_ev, scope)
-        return d
-
-    def _eval_ECon(self, e, env):
+    def _eval_CVar(self, e: CVar, env: REnv):
         return env.lookup(e.name)
 
-    def _eval_ETuple(self, e, env):
+    def _eval_CCon(self, e: CCon, env: REnv):
+        return env.lookup(e.name)
+
+    def _eval_CPrim(self, e: CPrim, env: REnv):
+        return env.lookup(e.name)
+
+    def _eval_CTuple(self, e: CTuple, env: REnv):
         return tuple(self.eval(x, env) for x in e.elems)
 
-    def _eval_EArray(self, e, env):
-        # Section 6.6: a literal is `Array.new(n)` followed by one push each.
+    def _eval_CArray(self, e: CArray, env: REnv):
         arr = ArrayObj(len(e.elems))
         for item in e.elems:
             arr.push(self.eval(item, env))
         return arr
 
-    def _eval_ERecord(self, e, env):
-        info = self.decls.con(e.con)
+    def _eval_CRecord(self, e: CRecord, env: REnv):
+        """A record, or a dictionary -- which is a record with no declaration.
+
+        A declared record's fields are stored in *declaration* order, not in
+        the order the author wrote the labels: `RecordObj.positional()` reads
+        them back that way, and a positional pattern matches them that way.
+        Evaluation is still left to right in the order written, because that is
+        what section 6.1 says and the two orders are independent.
+        """
         values = {label: self.eval(value, env) for label, value in e.fields}
-        ordered = tuple(values[name] for name in info.field_names)
+        info = self.decls.constructors.get(e.con)
+        if info is None:
+            # `%Dict.C`: no declaration, so nothing to reorder against.
+            return RecordObj(e.con, values)
+        ordered = tuple(values[name] for name in info.field_names or [])
         if self.decls.tycons[info.tycon].is_mutable_record:
-            return RecordObj(e.con, dict(zip(info.field_names, ordered)))
+            return RecordObj(e.con, dict(zip(info.field_names or [], ordered)))
         return ConValue(e.con, ordered, info.field_names)
 
-    def _eval_ELambda(self, e, env):
-        return Closure(e.params, e.body, env)
+    def _eval_CField(self, e: CField, env: REnv):
+        obj = self.eval(e.target, env)
+        if isinstance(obj, ArrayObj):
+            return obj.length if e.name == "length" else obj.capacity
+        return obj.fields[e.name]
 
-    def _eval_ECall(self, e, env):
+    def _eval_CIndex(self, e: CIndex, env: REnv):
+        return self.eval(e.target, env).get(self.eval(e.index, env))
+
+    def _eval_CLam(self, e: CLam, env: REnv):
+        return Closure([p.name for p in e.params], e.body, env, e.name)
+
+    def _eval_CApp(self, e: CApp, env: REnv):
         fn = self.eval(e.fn, env)
-        args = [self.eval(a, env) for a in e.args]
-        return self.call(fn, args, e.span)
+        return self.call(fn, [self.eval(a, env) for a in e.args])
 
-    def call(self, fn, args, span):
+    def call(self, fn, args):
+        """Apply a value. Parameters are names now, so there is nothing to match.
+
+        Under the surface tree a parameter was a *pattern*, and calling meant
+        matching -- which could fail at run time, in a call that typechecked.
+        The lowering turns a destructured parameter into a plain binder and a
+        `match`, so what is left here is a positional bind.
+        """
         if isinstance(fn, Closure):
             scope = fn.env.child()
-            for pattern, value in zip(fn.params, args):
-                bindings = match_pattern(pattern, value)
-                if bindings is None:
-                    raise TurkeyPanic(
-                        f"argument {value!r} does not match the parameter pattern "
-                        f"of {fn.name}"
-                    )
-                for name, bound in bindings.items():
-                    scope.define(name, bound)
+            for name, value in zip(fn.params, args):
+                scope.define(name, value)
             try:
                 return self.eval(fn.body, scope)
             except ReturnSignal as ret:
@@ -319,142 +245,163 @@ class Evaluator:
             return fn.build(tuple(args))
         raise TurkeyPanic(f"{fn!r} is not callable")
 
-    def _eval_EIndex(self, e, env):
-        return self.eval(e.arr, env).get(self.eval(e.index, env))
+    def _eval_CTyLam(self, e: CTyLam, env: REnv):
+        # Types are erased: what a term is polymorphic *in* decided what runs,
+        # and does not itself run.
+        return self.eval(e.body, env)
 
-    def _eval_EField(self, e, env):
-        obj = self.eval(e.obj, env)
-        if isinstance(obj, ArrayObj):
-            return obj.length if e.name == "length" else obj.capacity
-        return obj.fields[e.name]
+    def _eval_CTyApp(self, e: CTyApp, env: REnv):
+        return self.eval(e.fn, env)
 
-    def _eval_EUnary(self, e, env):
-        value = self.eval(e.operand, env)
-        if e.fn is None:
-            # The only non-method unary operator (section 8.2).
-            return from_bool(not truth(value))
-        return self.call(self._eval_EVar(e.fn, env), [value], e.span)
-
-    def _eval_EBinary(self, e, env):
-        # Section 8.2: these two short-circuit; everything else is strict.
-        if e.op == "&&":
-            left = self.eval(e.left, env)
-            return self.eval(e.right, env) if truth(left) else left
-        if e.op == "||":
-            left = self.eval(e.left, env)
-            return left if truth(left) else self.eval(e.right, env)
-        # Every other operator is a method, and `e.fn` is the use that carries
-        # the evidence for it -- selecting `add` from an `Add` dictionary is the
-        # same code path as any other method call.
-        fn = self._eval_EVar(e.fn, env)
-        return self.call(fn, [self.eval(e.left, env), self.eval(e.right, env)], e.span)
-
-    def _eval_EAnnot(self, e, env):
-        return self.eval(e.expr, env)
-
-    def _eval_EBlock(self, e, env):
+    def _eval_CLet(self, e: CLet, env: REnv):
         scope = env.child()
-        result = UNIT
-        for stmt in e.stmts:
-            result = self.exec_stmt(stmt, scope)
-        return result
+        scope.define(e.name, self.eval(e.value, env))
+        return self.eval(e.body, scope)
 
-    def _eval_EIf(self, e, env):
+    def _eval_CLetRec(self, e: CLetRec, env: REnv):
+        # One scope, filled before any body runs, so a member may call itself
+        # and its siblings. The values are lambdas, so evaluating them in the
+        # scope they are about to populate is not circular.
+        scope = env.child()
+        for bind in e.binds:
+            scope.define(bind.name, self.eval(bind.value, scope))
+        return self.eval(e.body, scope)
+
+    def _eval_CRef(self, e: CRef, env: REnv):
+        return Cell(self.eval(e.value, env))
+
+    def _eval_CDeref(self, e: CDeref, env: REnv):
+        return self.eval(e.target, env).value
+
+    def _eval_CAssign(self, e: CAssign, env: REnv):
+        value = self.eval(e.value, env)
+        target = e.target
+        if isinstance(target, CIndex):
+            self.eval(target.target, env).set(self.eval(target.index, env), value)
+            return UNIT
+        if isinstance(target, CField):
+            obj = self.eval(target.target, env)
+            if isinstance(obj, ArrayObj):
+                if target.name == "length":
+                    obj.length = value
+                else:
+                    obj.capacity = value
+                return UNIT
+            obj.fields[target.name] = value
+            return UNIT
+        # A cell, reached by name. `CDeref` never appears as a target: writing
+        # a cell is not writing what it holds.
+        self.eval(target, env).value = value
+        return UNIT
+
+    def _eval_CIf(self, e: CIf, env: REnv):
         if truth(self.eval(e.cond, env)):
             return self.eval(e.then, env)
-        if e.otherwise is not None:
-            return self.eval(e.otherwise, env)
-        return UNIT
+        return UNIT if e.otherwise is None else self.eval(e.otherwise, env)
 
-    def _eval_EWhile(self, e, env):
+    def _eval_CMatch(self, e: CMatch, env: REnv):
+        value = self.eval(e.scrutinee, env)
+        for alt in e.alts:
+            bindings = match_pattern(alt.pat, value)
+            if bindings is None:
+                continue
+            scope = env.child()
+            for name, bound in bindings.items():
+                scope.define(name, bound)
+            return self.eval(alt.body, scope)
+        raise TurkeyPanic(f"no match arm applies to {value!r}")
+
+    def _eval_CWhile(self, e: CWhile, env: REnv):
         while truth(self.eval(e.cond, env)):
             try:
-                self.eval(e.body, env)
-            except ContinueSignal:
-                continue
+                self.eval(e.body, env.child())
             except BreakSignal:
                 break
+            except ContinueSignal:
+                continue
         return UNIT
 
-    def _eval_EForIn(self, e, env):
-        # Section 6.5, with one correction: `continue` still advances the
-        # cursor. Desugaring literally to a `while` would make it spin forever.
-        #
-        # The sequence is reached through its `Iterator` dictionary rather than
-        # assumed to be an array (M8), so the two methods are evaluated once,
-        # outside the loop, exactly as a hand-written desugaring would. The one
-        # thing the loop knows about a value is which of `Option`'s two
-        # constructors ends it (`turkey/prelude.py`).
-        sequence = self.eval(e.iterable, env)
-        make = self._eval_EVar(e.iter_fn, env)
-        advance = self._eval_EVar(e.next_fn, env)
-        cursor = self.call(make, [sequence], e.span)
+    def _eval_CLoop(self, e: CLoop, env: REnv):
         while True:
-            step = self.call(advance, [sequence, cursor], e.span)
-            if step.con == prelude.OPTION_NONE:
+            try:
+                self.eval(e.body, env.child())
+            except BreakSignal as brk:
+                return brk.value
+            except ContinueSignal:
+                continue
+
+    def _eval_CForC(self, e: CForC, env: REnv):
+        scope = env.child()
+        if e.init is not None:
+            self.open(e.init, scope)
+        while truth(self.eval(e.cond, scope)):
+            try:
+                self.eval(e.body, scope.child())
+            except BreakSignal:
                 break
-            scope = env.child()
-            bindings = match_pattern(e.pat, step.args[0])
+            except ContinueSignal:
+                pass
+            if e.step is not None:
+                self.open(e.step, scope)
+        return UNIT
+
+    def open(self, e: CExpr, env: REnv):
+        """A C-style `for`'s init and step, whose bindings scope over the loop
+        rather than over the rest of the term -- so a `let` here defines into
+        the loop's own scope instead of making a child of it."""
+        if isinstance(e, CLet):
+            env.define(e.name, self.eval(e.value, env))
+            return UNIT
+        return self.eval(e, env)
+
+    def _eval_CForIn(self, e: CForIn, env: REnv):
+        """`for x in seq`, with `iter` and `next` already resolved to terms.
+
+        The two calls are what carry the `Iterator` dictionary, so the loop is
+        not a special case anywhere: it is two ordinary applications and a
+        pattern bind (design.md 6.5).
+        """
+        seq = self.eval(e.seq, env)
+        cursor = self.call(self.eval(e.iter_fn, env), [seq])
+        step = self.eval(e.next_fn, env)
+        while True:
+            item = self.call(step, [seq, cursor])
+            if not isinstance(item, ConValue) or not item.args:
+                return UNIT  # `None`: the sequence is finished.
+            bindings = match_pattern(e.pat, item.args[0])
             if bindings is None:
-                raise TurkeyPanic("loop pattern does not match an element")
+                raise TurkeyPanic(
+                    f"the loop pattern does not match {item.args[0]!r}")
+            scope = env.child()
             for name, bound in bindings.items():
                 scope.define(name, bound)
             try:
                 self.eval(e.body, scope)
-            except ContinueSignal:
-                pass
             except BreakSignal:
-                break
-        return UNIT
-
-    def _eval_EForC(self, e, env):
-        scope = env.child()
-        if e.init is not None:
-            self.exec_stmt(e.init, scope)
-        while truth(self.eval(e.cond, scope)):
-            try:
-                self.eval(e.body, scope)
-            except ContinueSignal:
-                pass
-            except BreakSignal:
-                break
-            if e.step is not None:
-                self.exec_stmt(e.step, scope)
-        return UNIT
-
-    def _eval_ELoop(self, e, env):
-        while True:
-            try:
-                self.eval(e.body, env)
+                return UNIT
             except ContinueSignal:
                 continue
-            except BreakSignal as brk:
-                return brk.value
 
-    def _eval_EMatch(self, e, env):
-        value = self.eval(e.scrutinee, env)
-        for arm in e.arms:
-            for pattern in arm.patterns:
-                bindings = match_pattern(pattern, value)
-                if bindings is not None:
-                    scope = env.child()
-                    for name, bound in bindings.items():
-                        scope.define(name, bound)
-                    return self.eval(arm.body, scope)
-        raise TurkeyPanic(f"no match arm applies to {value!r}")
-
-    def _eval_EReturn(self, e, env):
+    def _eval_CReturn(self, e: CReturn, env: REnv):
         raise ReturnSignal(UNIT if e.value is None else self.eval(e.value, env))
 
-    def _eval_EBreak(self, e, env):
+    def _eval_CBreak(self, e: CBreak, env: REnv):
         raise BreakSignal(UNIT if e.value is None else self.eval(e.value, env))
 
-    def _eval_EContinue(self, e, env):
+    def _eval_CContinue(self, e: CContinue, env: REnv):
         raise ContinueSignal()
 
 
+
+
 def match_pattern(pat: ast.Pattern, value) -> dict[str, object] | None:
-    """Match a value, returning the bindings, or None if the pattern does not fit."""
+    """Match a value, returning the bindings, or None if the pattern does not fit.
+
+    Patterns are `ast.Pattern` still: Core does not restate them, because they
+    are already a small total language with nothing implicit in them, and
+    `exhaustive.py` has decided about them before this point. So this function
+    is unchanged by M13c -- its input never was Core.
+    """
     if isinstance(pat, ast.PWild):
         return {}
     if isinstance(pat, ast.PVar):
@@ -510,3 +457,7 @@ def match_pattern(pat: ast.Pattern, value) -> dict[str, object] | None:
             out.update(inner)
         return out
     raise AssertionError(f"unhandled pattern {type(pat).__name__}")
+
+
+__all__ = ["BreakSignal", "Cell", "ContinueSignal", "Evaluator", "REnv",
+           "ReturnSignal", "match_pattern"]

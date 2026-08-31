@@ -25,7 +25,9 @@ from .types import (
     BOOL, CHAR, FLOAT, INT, STAR, STRING, UNIT, KFun, TCon, TFun, TVar, apply,
     array_of, generalize, mono,
 )
-from .values import UNIT as UNIT_VALUE, ArrayObj, Builtin, ConValue, from_bool
+from .values import (
+    UNIT as UNIT_VALUE, ArrayObj, Builtin, ConValue, from_bool, truth,
+)
 
 
 def _scheme(build):
@@ -170,6 +172,11 @@ _PRIM: dict[str, tuple] = {
     "Prim.intDiv": _num("Prim.intDiv", INT, _int_div),
     "Prim.intRem": _num("Prim.intRem", INT, _int_rem),
     "Prim.intNeg": (mono(TFun([INT], INT)), _bi("Prim.intNeg", 1, lambda a: -a)),
+    # The one operator that is not a class method (design.md 8.2). It was
+    # inlined by the evaluator while the evaluator walked the surface tree;
+    # Core has no `!` node, so it is an ordinary call like everything else.
+    "Prim.not": (mono(TFun([BOOL], BOOL)),
+                 _bi("Prim.not", 1, lambda a: from_bool(not truth(a)))),
     "Prim.intEq": _cmp("Prim.intEq", INT, lambda a, b: a == b),
     "Prim.intLt": _cmp("Prim.intLt", INT, lambda a, b: a < b),
 

@@ -2105,3 +2105,96 @@ of them about *when* a dictionary is built. `turkey/core.py`'s printer
 renumbers generated binders per binding, the way it already renames type
 variables, so a `.core` golden no longer churns when an unrelated pass invents
 one more name. **No `.expected` moved**, which is the entry's whole claim.
+
+### 51. A polymorphic binding gets one copy per type it is used at
+
+`plan.txt` item 6. Delta 49 gave every dictionary an explicit argument at a
+known type and delta 50 made that program the one that runs; between them they
+built exactly the input a specializer needs, which is why this could not have
+come first. A generalized binding is a `CBind` with `binders` and every use of
+one is a `CTyApp` at the arguments delta 48 recorded, so *which types is this
+used at* is a question the IR already answers. `turkey/mono.py` reads the answer
+and writes a copy per answer.
+
+**The per-request dictionary rebuild is gone.** Delta 50 recorded it as the one
+thing that got slower: without the memo table, `%inst.Monoid.Array[Int](...)`
+constructs a fresh record every time it is evaluated, three times in `dicts.tl`
+alone. A ground instance application is now one top-level binding whose *value*
+is the record, built once by the two-pass loop that already binds dictionaries.
+Delta 50 said "the specialization `plan.txt` item 6 describes would remove it";
+this is that, and it removes it in the place delta 50 asked for -- in a term,
+not in an interpreter's cache.
+
+**Monomorphization is partial, and that is a decision rather than a
+shortcoming.** Turkey admits polymorphic recursion: a complete signature gives
+a recursive call a scheme to instantiate, which `declared_scheme` says outright
+is the point of insisting a signature be complete. So
+
+```
+fun depth(x : a, n : Int) -> Int {
+    if n <= 0 { return 0 }
+    return 1 + depth(Pair(x, x), n - 1)
+}
+```
+
+recurses at `Pair a`, and the set of types `depth` is used at does not end --
+though the program plainly does, since `n` counts down. This is the standard
+reason monomorphization is undecidable, and specializing on *dictionaries*
+instead escapes nothing: add `instance [Show a] Show (Pair a)` and the
+dictionary chain is infinite too, which the solver accepts, because the evidence
+it builds is the finite term `%inst.Show.Pair[a](%d1.Show)` with a variable
+still in it.
+
+So there is a cap -- thirty-two copies per binding, and a bound on how large a
+type argument may be -- and when it trips the call site keeps its type
+application and goes on calling the generic binding, which therefore has to
+survive the pass. `tests/programs/polyrec.tl` is that program, and it says so:
+`warning: 'depth' is used at more than 32 types, so its remaining uses are left
+polymorphic`. A program whose performance quietly depends on something nobody
+was told about is worse than a slow one.
+
+Two consequences, both of which are what keeps the pass small. A **generic
+binding's body is not rewritten at all** -- only a ground binding and a
+specialized copy are -- so inside anything the pass touches, every type argument
+that came from a binder is ground, and one that is *not* ground came from
+somewhere else and is left alone. And **nothing is deleted**: a binding nothing
+reaches any more is still emitted, because dropping it is reachability, and a
+pass that had to be right about liveness as well as about types is a pass with
+two ways to be wrong.
+
+**A dictionary the collapse hoists must be visible where it lands.** The one
+real bug this pass had, kept here because the shape of it is not obvious: an
+instance method opens with its own dictionary bound *locally*
+(`let %d2.Display = %inst.Display.Rose`), and handing that name to a binding
+hoisted to the top level puts it out of scope. So the collapse resolves such a
+`let` to the global it aliases and refuses any argument that is not a top-level
+dictionary. `instance Display Rose` over `Array Rose` -- the recursive
+dictionary delta 50's memo table used to exist for -- is exactly the case, which
+is the second time that program has paid for being in the suite.
+
+**What is not done, and deliberately.** A method's own polymorphism lives in a
+record *field*, not in a binding, so a `CTyApp` over a `CField` stays; erasing
+it means hoisting the field into a binding, which is devirtualization. And an
+ordinary function keeps its dictionary *parameters* -- `squash@Int` still takes
+its `%Dict.Monoid Int`, it is just always handed the same one. Both are
+optimizations over ground code, and ground code is what this milestone produces
+rather than what it consumes.
+
+**Verification.** `turkey/coretc.py` checks the specialized program on every
+compile, unconditionally, the way it checks the lowering: the pass rewrites
+every type in every body it copies, so "the copy still typechecks" is the
+property a bad substitution breaks first. That runs over every golden in the
+suite. `turkey mono` prints the result, `dicts.mono` pins it beside
+`dicts.core`, and the pair is the point -- the same program before and after,
+so a reader can see which `[t]` became a copy and which dictionary stopped being
+rebuilt.
+
+**Scope.** New `turkey/mono.py` and `tests/test_mono.py`; `turkey/coretc.py`'s
+family reducer becomes public, since a specialization has to reduce the types it
+writes the same way the ones it replaces were reduced; one call and one field in
+`turkey/driver.py`; one subcommand in `turkey/cli.py`; a `.mono` case in
+`tests/test_programs.py` and `tests/regenerate_expected.py`. New goldens
+`polyrec.tl` and `dicts.mono`. **No existing golden moved.** The evaluator still
+runs the unspecialized Core -- making the specialized one the program that runs
+is the next step, and it is kept separate for the reason delta 50 was kept
+separate from delta 49.

@@ -658,7 +658,7 @@ class Checker:
                 f"{where} should be {show(want)} but is {show(got)}", span)
 
     def reduce(self, ty: Type) -> Type:
-        return reduce_deep(ty, _Fams(self.classes, self.equations))
+        return reduce_deep(ty, Fams(self.classes, self.equations))
 
     def instance_of(self, scheme, ty: Type) -> bool:
         """Whether `ty` is an instantiation of `scheme`. One-way, as
@@ -703,8 +703,14 @@ def compatible(want: Type, got: Type) -> bool:
     return False
 
 
-class _Fams:
+class Fams:
     """`types.Families`: the binding's equalities first, then the instances.
+
+    Public because `turkey/mono.py` needs the same reducer for the same
+    reason. A specialization substitutes into a body checked under those
+    equalities, so the types it writes have to be reduced the way the ones it
+    replaces were -- and reducing them a second, slightly different way is
+    exactly the kind of disagreement M13 exists to prevent.
 
     The order is `Solver.reduce`'s, and copied deliberately. A given equality
     is a reduction rule for the family it names, and it has to be consulted
@@ -828,5 +834,5 @@ def check_program(prog: CProgram, decls: DeclTable, classes: ClassTable,
     Checker(decls, classes).program(prog, globals_)
 
 
-__all__ = ["Checker", "CoreError", "Env", "check_program", "compatible",
-           "globals_of"]
+__all__ = ["Checker", "CoreError", "Env", "Fams", "check_program",
+           "compatible", "globals_of"]

@@ -23,7 +23,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import ast, coretc, desugar, lower
+from . import ast, coretc, desugar, lower, mono
 from .builtins import initial_type_env, initial_values
 from .classes import ClassTable
 from .constraints import Env, Solver
@@ -54,6 +54,7 @@ class Checked:
     warnings: list[str]
     types: TypeTable  # every expression's type, for the lowering (M13a)
     core: CProgram  # the elaboration, as a checked datatype (M13b)
+    mono: CProgram  # the elaboration specialized, checked the same way (M14a)
     module: str  # the entry module's name, for `turkey core`
 
 
@@ -106,11 +107,18 @@ def check(src: str, file: str | None = None,
     # of a check nobody runs, so it runs the way exhaustiveness does: always.
     program_core = lower.Lowerer(decls, classes, env, types).program(ordered)
     coretc.check_program(program_core, decls, classes, coretc.globals_of(env))
+    # Specialization is checked for the same reason the lowering is, and by the
+    # same checker: it rewrites every type in every body it copies, so "the
+    # copy still typechecks" is the property that a substitution went wrong
+    # would break first. See turkey/mono.py.
+    program_mono, mono_warnings = mono.monomorphize(program_core, decls, classes)
+    coretc.check_program(program_mono, decls, classes, coretc.globals_of(env))
+    warnings.extend(mono_warnings)
     return Checked(
         entry.program, ordered, decls, classes, env, loader.order,
         entry.scope.values, entry.scope.values.get("main", "main"),
         _signatures(entry, env, classes), warnings, types,
-        program_core, entry.name,
+        program_core, program_mono, entry.name,
     )
 
 

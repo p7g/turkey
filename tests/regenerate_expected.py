@@ -49,10 +49,11 @@ def main() -> int:
             print(f"warning: {name_of(source)} was expected to {word}, exit {code}")
         print(f"{name_of(source)}: exit {code}, {len(output.splitlines())} line(s)")
 
-    # Only programs that already have a `.types` or `.core` golden get one
-    # regenerated; adding a new one is a deliberate act, not a side effect of
-    # running this.
-    for suffix, command in ((".types", "types"), (".core", "core")):
+    # Only programs that already have a `.types`, `.core` or `.mono` golden
+    # get one regenerated; adding a new one is a deliberate act, not a side
+    # effect of running this.
+    for suffix, command in ((".types", "types"), (".core", "core"),
+                            (".mono", "mono")):
         for golden in sorted(PROGRAMS.glob(f"*{suffix}")):
             result = subprocess.run(
                 [sys.executable, "-m", "turkey", command,

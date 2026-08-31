@@ -118,3 +118,22 @@ def test_core_command(golden: Path) -> None:
     actual = result.stdout + result.stderr
     assert actual == expected, _diff_message(expected, actual, result.returncode)
     assert result.returncode == 0
+
+
+MONO = sorted(PROGRAMS_DIR.glob("*.mono"))
+
+
+@pytest.mark.parametrize("golden", MONO, ids=[p.stem for p in MONO])
+def test_mono_command(golden: Path) -> None:
+    """`NAME.mono` pins what `turkey mono NAME.tl` prints (M14a).
+
+    Beside the `.core` golden rather than instead of it, because the pair is
+    the point: the same program before and after specialization, so a reader
+    can see which `[t]` became a copy, which dictionary stopped being rebuilt,
+    and which type application survived because it is a method's own.
+    """
+    expected = golden.read_text()
+    result = _run(["mono", golden.with_suffix(".tl").name])
+    actual = result.stdout + result.stderr
+    assert actual == expected, _diff_message(expected, actual, result.returncode)
+    assert result.returncode == 0

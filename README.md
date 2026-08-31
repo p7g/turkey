@@ -20,6 +20,8 @@ python3 -m turkey run    program.tl    # type-check and execute
 python3 -m turkey types  program.tl    # print each top-level binding's type
 python3 -m turkey tokens program.tl    # dump the token stream
 python3 -m turkey ast    program.tl    # dump the parse tree
+python3 -m turkey core   program.tl    # dump the typed Core the elaboration produces
+python3 -m turkey mono   program.tl    # dump that Core with its polymorphism specialized away
 ```
 
 A program is a single file. Execution evaluates the top-level bindings, then

@@ -406,6 +406,14 @@ Control constructs are unchanged: `if`, `match`, `while`, `loop`, `for`, and `re
 
 The Core is **checked**, on every compile, against the class table and the declarations. That is the point of having it: before it existed, a dictionary in the wrong position was not a compile error but a wrong answer at run time.
 
+### 5.5 Specialization (SPEC-DELTAS.md 51)
+
+The Core is then **specialized**: a generalized binding gets one copy per type it is used at, and every use becomes a reference to the copy rather than a type application. An instance with a context is applied at ground types once, at the top level, so a dictionary is built once rather than per request.
+
+Specialization is **partial**, because it cannot be total. Turkey admits polymorphic recursion (§5.3: a complete signature gives a recursive call a scheme to instantiate), so a binding may be used at unboundedly many types even though the program terminates. Past a cap the pass stops making copies, the call site keeps its type application, and the generic dictionary-passing binding — which is never removed — serves it. A program that hits the cap is told so.
+
+The specialized program is checked by the same checker, on every compile. It is not a different language: it is Core with fewer type abstractions in it.
+
 ---
 
 ## 6. Operational Semantics

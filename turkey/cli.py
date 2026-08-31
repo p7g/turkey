@@ -23,6 +23,7 @@ def main(argv: list[str] | None = None) -> int:
         ("tokens", "dump the token stream"),
         ("ast", "dump the parse tree"),
         ("core", "dump the typed Core the elaboration produces"),
+        ("mono", "dump that Core with its polymorphism specialized away"),
     ]:
         p = sub.add_parser(name, help=help_text)
         p.add_argument("file")
@@ -44,6 +45,10 @@ def main(argv: list[str] | None = None) -> int:
             checked = check(src, args.file, [Path(args.file).resolve().parent])
             report_warnings(checked.warnings, args.file)
             print(show_program(checked.core, checked.module), end="")
+        elif args.command == "mono":
+            checked = check(src, args.file, [Path(args.file).resolve().parent])
+            report_warnings(checked.warnings, args.file)
+            print(show_program(checked.mono, checked.module), end="")
         elif args.command == "types":
             checked = check(src, args.file, [Path(args.file).resolve().parent])
             report_warnings(checked.warnings, args.file)

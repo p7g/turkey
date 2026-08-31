@@ -93,8 +93,10 @@ class Frame:
 
 class Generator:
     def __init__(self, decls: DeclTable, builtins: Env,
-                 classes: ClassTable | None = None):
+                 classes: ClassTable | None = None, module: str = ""):
         self.decls = decls
+        # Which module is being generated, for the orphan rule (delta 43).
+        self.module = module
         # The prelude's classes arrive already registered (M8); the table is
         # shared so that `instance Add Int` is visible here, while the
         # environment is not, so `Prim.intAdd` is not.
@@ -184,7 +186,7 @@ class Generator:
         inst_decls = [d for d in program.decls if isinstance(d, ast.InstanceDecl)]
         items = [d for d in program.decls if isinstance(d, ast.Stmt)]
         self.decls.register_all(type_decls)
-        self.classes.register_all(class_decls, inst_decls)
+        self.classes.register_all(class_decls, inst_decls, self.module)
         self.bind_methods()
 
         # The graph is keyed by item, not by bound name: a single binding may

@@ -214,6 +214,13 @@ class TCon(Type):
     only for the length of one body, standing for a type the caller has yet to
     choose, so it carries the rank of the binder that made it and must not be
     seen from outside it (`escaping`).
+
+    `name` is qualified once a module declares it -- `Data.Option#Option`, see
+    `turkey/modules.py` -- because two libraries may each declare a `Node` and
+    unification, which compares names, has to tell them apart. `display` is
+    what a message shows, which is the short name unless `DeclTable` found two
+    that clash. The primitives and `Array` are declared by no module and are
+    their own short name.
     """
 
     __slots__ = ("name", "kind", "level")
@@ -222,6 +229,10 @@ class TCon(Type):
         self.name = name
         self.kind: Kind = STAR if kind is None else kind
         self.level = level
+
+    @property
+    def display(self) -> str:
+        return _qualified(self.name) if self.name in QUALIFY else short_name(self.name)
 
     def __repr__(self) -> str:
         return f"TCon({self.name})"
@@ -360,11 +371,31 @@ class TBottom(Type):
 
 BOTTOM = TBottom()
 
+def short_name(name: str) -> str:
+    """The part of an internal name a reader wrote. See `turkey/modules.py`,
+    which owns the `#` separator this splits on."""
+    return name.rpartition("#")[2]
+
+
+def _qualified(name: str) -> str:
+    """An internal name written the way a program would qualify it."""
+    return name.replace("#", ".")
+
+
+# The internal names that must print qualified, because two modules declared
+# the same short one and a message that said `Node` twice would be worse than
+# one that says which is which (delta 43). It is a program-wide property, not a
+# constructor's own, and the same constructor may exist as more than one `TCon`
+# object -- `BOOL` below and the one `Data.Bool` registers -- so it cannot live
+# on the instance. `DeclTable.__init__` clears it and fills it in.
+QUALIFY: set[str] = set()
+
+
 INT = TCon("Int")
 FLOAT = TCon("Float")
 STRING = TCon("String")
 CHAR = TCon("Char")
-BOOL = TCon("Bool")
+BOOL = TCon("Data.Bool#Bool")
 UNIT = TCon("Unit")
 
 # The types the checker seeds itself with, and therefore also the ones a
@@ -1048,7 +1079,7 @@ def show(t: Type, names: dict[int, str] | None = None, free_prefix: str = "",
             out = f"fun({params}) -> {go(ty.ret, 0)}"
             return f"({out})" if prec > 0 else out
         if isinstance(ty, TCon):
-            return ty.name
+            return ty.display
         if isinstance(ty, TFam):
             out = f"{ty.name} {go(ty.arg, 2)}"
             return f"({out})" if prec > 1 else out

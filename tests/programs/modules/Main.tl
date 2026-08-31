@@ -15,7 +15,7 @@ fun main() {
     print(add("mod", "ules"))
     print(1 + 2)                -- still Add.add, not the local `add`
 
-    -- A constructor is global in M11a even under a qualified import; the
-    -- functions are not.
-    print(G.describe(G.translate(Point(1, 2), 3, 4)))
+    -- A constructor is scoped like everything else (delta 43), so under a
+    -- qualified import it is written `G.Point`.
+    print(G.describe(G.translate(G.Point(1, 2), 3, 4)))
 }

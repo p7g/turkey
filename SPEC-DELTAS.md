@@ -983,7 +983,7 @@ reader might assume wrongly, so it has a test: the caller's value is untouched,
 patterns binding rather than aliasing, and a `ConValue` being immutable (§4.5)
 in any case. `let` bindings inside a function body still refuse assignment.
 
-### 36. `Bool` is a declared type, and its constructors are `True` and `False`
+### 36. `Bool` is a declared type, and its constructors are `True` and `False` — **amended at delta 43**
 
 `true` and `false` were reserved words producing a `Bool` literal, and `Bool`
 was a primitive type constructor seeded into the declaration table. That made
@@ -1465,3 +1465,77 @@ re-exports, it does not import.
 **Scope.** No golden moved, which is the acceptance test for this delta: all 93
 `Array.*` and `Int.toString` call sites in the conformance programs resolve
 through the re-export unchanged. `turkey/lib` ships as package data.
+
+### 43. A type constructor is qualified, and an instance is not an orphan
+
+Delta 41 made a *value* belong to its module and delta 42 moved the library
+into the language. What was left global was the type namespace: every
+`TCon`, every data constructor, keyed on a bare name in one flat table. So two
+libraries that each declared a `Node` could not be used in one program, which
+is the thing a module system exists to make possible.
+
+**A type and its constructors are qualified**, the same way and by the same
+pass: `type Point` in module `Geometry` is `Geometry#Point`, and so is its
+constructor. They are separate namespaces from values and from each other,
+because `type Point = Point(Int, Int)` puts one spelling in two of them, so
+`turkey/modules.py` carries three maps per module rather than one.
+`type_key`, `match` and unification are untouched: all three already compared
+`TCon.name`, and the name is simply longer now.
+
+**What a reader sees does not change.** `TCon.display` is the short name, so
+`fun() -> Point` is still what a signature prints — the module a type came from
+is not news to the person who wrote the file. Two modules that declare the same
+short name are the exception: neither may keep it, and both print qualified
+(`Shape.Node`, `Graph.Node`), because a message saying `Node` twice says less
+than one that says which is which. `DeclTable` notices the clash while
+registering, and records it in `types.QUALIFY` rather than on the constructor —
+the same constructor exists as more than one `TCon` object (`types.BOOL` and
+the one `Data.Bool` registers), and both have to agree.
+
+A skolem stays out of the qualified space: it is a constructor for the length
+of one body, named after the type variable it stands for, and it belongs to no
+module.
+
+**A constructor may be qualified where it is written.** `G.Point(1, 2)` in
+expression position, `G.Point(x, y)` in a pattern, and `S.Node` in type
+position — the last needed a parser change, since a dotted CONID chain was only
+read as one name in expression position. This is what §9.3's "the constructor
+must be qualified, or an error is raised" needs, and it is what makes an
+`import qualified` actually qualify: before this delta a constructor came into
+scope bare no matter how it was imported.
+
+**An export list finally withholds something.** `T` exports the type alone and
+`T(..)` its constructors too, which is the difference between an abstract type
+and a transparent one — `module Opaque (Token, make)` lets an importer hold a
+`Token` and not take one apart. Class entries are still accepted and still
+withhold nothing, because a class is global.
+
+**Coherence: global instances, plus an orphan rule.** Instances remain global
+— every module sees every one — because a predicate must mean the same thing
+wherever it is solved. Concretely, `Solver._class` and `Elaborator.resolve` have
+to agree about which instances exist, and a disagreement between them surfaces
+as an *internal error* rather than a diagnostic; keeping them global is what
+keeps them in agreement. The overlap check is unchanged and was already
+whole-program, since the table is shared and accumulates as each module is
+checked.
+
+Global and *unrestricted* is what would make coherence a matter of luck: two
+libraries could each write `instance Show Point` over someone else's `Show` and
+someone else's `Point`, and whichever loaded second would be the error, in a
+file neither author wrote. So an instance must be declared in the module that
+declares its class or the module that declares its head constructor. A built-in
+head (`Int`, `String`, `Array`) belongs to no module, so an instance over one is
+legal only from the class's own module — Haskell's rule, and `plan.txt` flagged
+it as cheap now and expensive later.
+
+**Bool and Option may now be shadowed.** Delta 36 recorded that redeclaring
+`Bool` was an ordinary "declared more than once" collision. It is not any more:
+`Bool` belongs to `Data.Bool` (delta 42) and a type belongs to its module, so a
+program's own `type Bool` shadows the import and is a different type. `if` still
+demands the library's, which is what stops the shadow from being a way to break
+the language — `if A { ... }` over a local `Bool` is now
+`expected Main.Bool, found Data.Bool.Bool`. The same goes for `Option`.
+
+**Scope.** No golden moved except `tests/programs/modules/Main.tl`, which now
+writes `G.Point` where it wrote `Point` — the deliberate change. Two tests
+changed because they pinned the redeclaration collision this delta removes.

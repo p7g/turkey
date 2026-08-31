@@ -330,3 +330,113 @@ def test_module_is_an_export_form_not_an_import_one(tmp_path):
     search = write(tmp_path, Helper=HELPER)
     assert "'module' may appear in an export list" in \
         fails("import Helper (module Helper)", search)
+
+
+# -- a type and an instance know which module made them (M11c) ----------------
+
+SHAPE = """
+module Shape (Node(..), leaf) where
+
+type Node = Leaf | Fork(Node, Node)
+
+fun leaf() -> Node = Leaf
+"""
+
+
+def test_two_modules_may_each_declare_the_same_type(tmp_path):
+    """The stated outcome of delta 43: two libraries that each have a `Node`
+    can be used together, because the two are different type constructors."""
+    search = write(tmp_path, Shape=SHAPE,
+                   Graph="module Graph (Node(..)) where\ntype Node = Node(Int)")
+    src = ("import qualified Shape as S\nimport qualified Graph as G\n"
+           "fun a() -> S.Node = S.Leaf\nfun b() -> G.Node = G.Node(1)")
+    got = sigs(src, search)
+    # Both print qualified, because printing `Node` twice would say less.
+    assert got["a"] == "fun() -> Shape.Node"
+    assert got["b"] == "fun() -> Graph.Node"
+
+
+def test_a_type_with_one_declaration_prints_short(tmp_path):
+    search = write(tmp_path, Shape=SHAPE)
+    assert sigs("import Shape\nfun f() -> Node = leaf()", search)["f"] == \
+        "fun() -> Node"
+
+
+def test_a_constructor_is_qualified_under_a_qualified_import(tmp_path):
+    search = write(tmp_path, Shape=SHAPE)
+    src = "import qualified Shape as S\nfun f() -> S.Node = S.Leaf"
+    assert sigs(src, search)["f"] == "fun() -> Node"
+    assert fails("import qualified Shape as S\nfun f() = Leaf", search) == \
+        "unknown constructor 'Leaf'"
+
+
+def test_an_export_list_may_withhold_the_constructors(tmp_path):
+    """`T` exports the type; `T(..)` exports its constructors too. That is the
+    difference between an abstract type and a transparent one."""
+    search = write(
+        tmp_path,
+        Opaque="module Opaque (Token, make) where\n"
+               "type Token = Token(Int)\n"
+               "fun make(n : Int) -> Token = Token(n)",
+    )
+    assert sigs("import Opaque\nfun f() -> Token = make(1)", search)["f"] == \
+        "fun() -> Token"
+    assert "unknown constructor 'Token'" in \
+        fails("import Opaque\nfun f() = Token(1)", search)
+
+
+def test_a_selective_import_of_a_type_brings_its_constructors_with_dots(tmp_path):
+    search = write(tmp_path, Shape=SHAPE)
+    assert sigs("import Shape (Node(..), leaf)\nfun f() -> Node = Fork(Leaf, Leaf)",
+                search)["f"] == "fun() -> Node"
+    assert "unknown constructor 'Fork'" in \
+        fails("import Shape (Node, leaf)\nfun f() = Fork(Leaf, Leaf)", search)
+
+
+# -- coherence ----------------------------------------------------------------
+
+
+def test_an_instance_may_live_with_its_type(tmp_path):
+    search = write(tmp_path, Shape=SHAPE)
+    src = ("import Shape\n"
+           "type Tree = Tree(Int)\n"
+           "instance Show Tree { fun show(t) = \"tree\" }\n"
+           "fun f(t : Tree) -> String = show(t)")
+    assert sigs(src, search)["f"] == "fun(Tree) -> String"
+
+
+def test_an_instance_may_live_with_its_class(tmp_path):
+    src = ("class Sized a { fun size(a) -> Int }\n"
+           "instance Sized Int { fun size(n) = n }\n"
+           "fun f(n : Int) -> Int = size(n)")
+    assert sigs(src, [tmp_path])["f"] == "fun(Int) -> Int"
+
+
+def test_an_orphan_instance_is_rejected(tmp_path):
+    """Neither `Show` nor `Node` is this module's, so nothing stops another
+    module from declaring the same instance -- and one of the two would be an
+    error in a file neither author wrote."""
+    search = write(tmp_path, Shape=SHAPE)
+    message = fails(
+        'import Shape\ninstance Show Node { fun show(n) = "node" }', search)
+    assert message.startswith("orphan instance: 'Show Node' is declared in 'Main'")
+    assert "'Show' belongs to 'Prelude'" in message
+    assert "'Node' to 'Shape'" in message
+
+
+def test_an_instance_for_a_built_in_type_over_a_library_class_is_an_orphan(tmp_path):
+    """`Neg` is the Prelude's and `String` is the language's, so this module
+    owns neither end of it."""
+    message = fails("instance Neg String { fun neg(s) = s }", [tmp_path])
+    assert message.startswith("orphan instance: 'Neg String'")
+    assert "the language itself" in message
+
+
+def test_two_instances_for_one_head_still_overlap(tmp_path):
+    search = write(
+        tmp_path,
+        Shape=SHAPE,
+        Extra="module Extra () where\nimport Shape (Node(..))\n"
+              'instance Show Node { fun show(n) = "a" }',
+    )
+    assert "orphan instance" in fails("import Extra", search)

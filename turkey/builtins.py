@@ -20,7 +20,7 @@ import sys
 
 from .errors import TurkeyPanic
 from .constraints import Binding, Env
-from .prelude import OPTION, OPTION_NONE, OPTION_SOME
+from .prelude import BOOL_FALSE, BOOL_TRUE, OPTION, OPTION_NONE, OPTION_SOME
 from .types import (
     BOOL, CHAR, FLOAT, INT, STAR, STRING, UNIT, KFun, TCon, TFun, TVar, apply,
     array_of, generalize, mono,
@@ -185,7 +185,7 @@ _PRIM: dict[str, tuple] = {
     "Prim.charLt": _cmp("Prim.charLt", CHAR, lambda a, b: a < b),
     "Prim.boolEq": _cmp("Prim.boolEq", BOOL, lambda a, b: a.con == b.con),
     "Prim.boolLt": _cmp(
-        "Prim.boolLt", BOOL, lambda a, b: a.con == "False" and b.con == "True"),
+        "Prim.boolLt", BOOL, lambda a, b: a.con == BOOL_FALSE and b.con == BOOL_TRUE),
 }
 
 # The names a library module may write, and no other module may.

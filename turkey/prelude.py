@@ -31,6 +31,11 @@ ITER_CURSOR = "Cursor"
 ITER_ITER = "iter"
 ITER_NEXT = "next"
 
-OPTION = "Option"
-OPTION_NONE = "None"
-OPTION_SOME = "Some"
+# Internal names (`turkey/modules.py`): `Option` and `Bool` are declared by
+# library modules now, so the compiler names them the way resolution does.
+OPTION = "Data.Option#Option"
+OPTION_NONE = "Data.Option#None"
+OPTION_SOME = "Data.Option#Some"
+
+BOOL_TRUE = "Data.Bool#True"
+BOOL_FALSE = "Data.Bool#False"

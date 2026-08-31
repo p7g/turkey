@@ -15,7 +15,7 @@ from .errors import Span, TypeError_
 from .types import (
     ARRAY, PRIMITIVES, STAR, Fresh, KFun, Kind, Scheme, TApp, TCon, TFam, TFun,
     TTuple, TVar, Type, apply, default_kind, generalize, instantiate, kind_arrow,
-    kind_of, show, show_kind, spine, unify_kinds,
+    QUALIFY, kind_of, short_name, show, show_kind, spine, unify_kinds,
 )
 
 
@@ -83,8 +83,16 @@ class DeclTable:
         # resolved, since a method's type may mention a family of a class
         # declared further down the file.
         self.families: dict[str, FamilyInfo] = {}
+        # Short name -> the qualified name that claimed it first. Two modules
+        # may each declare a `Node`; this is what notices, so that both print
+        # qualified rather than both printing `Node` (delta 43). It is also
+        # what the class and family namespaces are checked against, since a
+        # class name is global and unqualified.
+        self.shorts: dict[str, str] = {name: name for name in PRIMITIVES}
+        QUALIFY.clear()
         self.tycons["Array"] = TyconInfo("Array", ["a"], kind=ARRAY.kind)
         self.heads["Array"] = ARRAY
+        self.shorts["Array"] = "Array"
 
     def head(self, name: str) -> TCon:
         return self.heads[name]
@@ -95,8 +103,9 @@ class DeclTable:
         """Declare every type before resolving any, so they may refer to each
         other in any order."""
         for d in decls:
-            if d.name in PRIMITIVES or d.name == "Array":
-                raise TypeError_(f"cannot redefine the built-in type '{d.name}'", d.span)
+            short = short_name(d.name)
+            if short in PRIMITIVES or short == "Array":
+                raise TypeError_(f"cannot redefine the built-in type '{short}'", d.span)
             if d.name in self.tycons:
                 raise TypeError_(f"type '{d.name}' is declared more than once", d.span)
             # Every declaration is given its kind *skeleton* up front -- one
@@ -109,6 +118,13 @@ class DeclTable:
                              kind_arrow(len(d.params)))
             self.tycons[d.name] = info
             self.heads[d.name] = TCon(d.name, info.kind)
+            claimed = self.shorts.get(short)
+            if claimed is not None and claimed != d.name:
+                # Two modules declare this short name. Neither may keep it.
+                QUALIFY.add(claimed)
+                QUALIFY.add(d.name)
+            else:
+                self.shorts[short] = d.name
         for d in decls:
             if not d.is_alias:
                 self._resolve_variants(d)

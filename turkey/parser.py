@@ -347,7 +347,13 @@ class Parser:
             return ast.TEVar(tok.span, tok.text)
         if tok.kind == "CONID":
             self.advance()
-            return ast.TECon(tok.span, tok.text, [])
+            # A qualified type constructor: `S.Node`, `Data.Array.Foo`. The
+            # dotted chain is one name, resolved as one (delta 43).
+            parts = [tok.text]
+            while self.at(".") and self.peek(1).kind == "CONID":
+                self.advance()
+                parts.append(self.advance().text)
+            return ast.TECon(tok.span, ".".join(parts), [])
         if tok.kind == "fun":
             self.advance()
             self.expect("(")

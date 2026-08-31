@@ -250,11 +250,13 @@ def test_both_boolean_arms_are_a_complete_signature():
     assert warnings(src) == []
 
 
-def test_bool_may_not_be_redeclared():
-    """It is the prelude's now, so the collision is an ordinary one."""
-    assert fails("type Bool = A | B\nfun main() { print(1) }") == (
-        "type 'Bool' is declared more than once"
-    )
+def test_a_program_may_declare_its_own_bool():
+    """`Bool` belongs to `Data.Bool` (delta 42), and a type belongs to its
+    module (delta 43), so this shadows -- but `if` still demands the library's,
+    which is what stops the shadow from being a way to break the language."""
+    check("type Bool = A | B\nfun main() { print(1) }")
+    assert fails("type Bool = A | B\nfun main() { if A { print(1) } }") == (
+        "expected Main.Bool, found Data.Bool.Bool in an 'if' condition")
 
 
 def test_the_lower_case_spellings_are_gone():

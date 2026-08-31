@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from . import ast
 from .decls import DeclTable
-from .types import TTuple, TVar, Type, head_con, prune, unify
+from .types import TTuple, TVar, Type, head_con, prune, short_name, unify
 
 # A pattern is one of:
 #   ("wild",)
@@ -191,8 +191,11 @@ def render(pattern) -> str:
         return repr(pattern[2])
     if pattern[0] == "tuple":
         return "(" + ", ".join(render(p) for p in pattern[1]) + ")"
+    # A witness is shown the way the author would write it, so the constructor
+    # loses the module qualification resolution gave it (delta 43).
+    name = short_name(pattern[1])
     if not pattern[2]:
-        return pattern[1]
+        return name
     # The paren form is self-delimiting, so a nested witness needs no extra
     # grouping: `Some(Some(_))`, not `Some (Some _)`.
-    return pattern[1] + "(" + ", ".join(render(p) for p in pattern[2]) + ")"
+    return name + "(" + ", ".join(render(p) for p in pattern[2]) + ")"

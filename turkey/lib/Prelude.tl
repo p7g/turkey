@@ -49,6 +49,13 @@
 module Prelude (
     print, write, error,
 
+    -- The two types the language itself names: `if` demands `Bool` and a
+    -- cursor's `next` answers `Option`. Their modules are re-exported below
+    -- for the functions; these two lines are what puts the types and their
+    -- constructors in scope unqualified.
+    Bool(..),
+    Option(..),
+
     module Array,
     module Bool,
     module Char,
@@ -57,6 +64,9 @@ module Prelude (
     module Option,
     module String,
 ) where
+
+import Data.Bool   (Bool(..))
+import Data.Option (Option(..))
 
 import qualified Data.Array  as Array
 import qualified Data.Bool   as Bool

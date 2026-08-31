@@ -46,7 +46,7 @@ class Checked:
     classes: ClassTable
     env: Env
     modules: list[Module]
-    scope: dict[str, str]  # the entry module's: surface name -> internal name
+    scope: dict[str, str]  # the entry module's values: surface -> internal
     main: str  # what `main` is called internally, if the entry defines one
     signatures: list[tuple[str, Scheme]]  # the entry module's, in source order
     warnings: list[str]
@@ -72,7 +72,7 @@ def check(src: str, file: str | None = None,
         # Generation builds the module's constraint and decides nothing;
         # solving is what assigns ranks, generalizes and fills in `env`.
         # Splitting them this way is the point of the HM(X) shape.
-        generator = Generator(decls, env, classes)
+        generator = Generator(decls, env, classes, module.name)
         classes = generator.classes
         items, constraint = generator.generate(module.program)
         solver = Solver(decls, env, classes)
@@ -87,8 +87,8 @@ def check(src: str, file: str | None = None,
 
     assert generator is not None and classes is not None
     return Checked(
-        entry.program, ordered, decls, classes, env, loader.order, entry.scope,
-        entry.scope.get("main", "main"),
+        entry.program, ordered, decls, classes, env, loader.order,
+        entry.scope.values, entry.scope.values.get("main", "main"),
         _signatures(entry, env, classes), warnings,
     )
 

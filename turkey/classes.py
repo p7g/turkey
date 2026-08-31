@@ -83,6 +83,7 @@ class ClassInfo:
     supers: list[Pred] = field(default_factory=list)
     methods: dict[str, MethodInfo] = field(default_factory=dict)
     span: Span | None = None
+    module: str = ""  # which module declared it, for the orphan rule
     # Family name -> the parameter it was written over. The types themselves
     # live in `DeclTable.families`, because a family is a name in type
     # position and one table decides what those mean.
@@ -109,6 +110,8 @@ class InstInfo:
     # `evidence.InstancePlan`: what the evaluator needs to build this
     # dictionary. Set by the generator once the method bodies are checked.
     plan: object = None
+    # The module that declared it, for the orphan rule (delta 43).
+    module: str = ""
 
     @property
     def con(self) -> str:
@@ -119,6 +122,8 @@ class InstInfo:
 
 class ClassTable:
     def __init__(self, decls: DeclTable) -> None:
+        # Set by `register_all` for the module it is registering.
+        self.module = ""
         self.decls = decls
         self.classes: dict[str, ClassInfo] = {}
         self.instances: dict[str, list[InstInfo]] = {}
@@ -129,7 +134,8 @@ class ClassTable:
     # -- registration ------------------------------------------------------
 
     def register_all(
-        self, classes: list[ast.ClassDecl], instances: list[ast.InstanceDecl]
+        self, classes: list[ast.ClassDecl], instances: list[ast.InstanceDecl],
+        module: str = "",
     ) -> None:
         """Declare every class before resolving any signature.
 
@@ -142,12 +148,15 @@ class ClassTable:
         for d in classes:
             if d.name in self.classes:
                 raise TypeError_(f"class '{d.name}' is declared more than once", d.span)
-            if d.name in self.decls.tycons:
+            # A class name is global and unqualified, so it is checked against
+            # the *short* names the type namespace has claimed (delta 43).
+            if d.name in self.decls.shorts:
                 raise TypeError_(
                     f"'{d.name}' is already a type; a class cannot share its name",
                     d.span,
                 )
-            self.classes[d.name] = ClassInfo(d.name, d.param, TVar(1), span=d.span)
+            self.classes[d.name] = ClassInfo(d.name, d.param, TVar(1), span=d.span,
+                                             module=module)
             self._declare_families(d)
 
         for d in classes:
@@ -162,7 +171,7 @@ class ClassTable:
                 for var in method.scheme.quantified:
                     default_kind(var.kind)
 
-        registered = [self._resolve_instance(d) for d in instances]
+        registered = [self._resolve_instance(d, module) for d in instances]
         # Coverage is checked only once every instance is in the table, since
         # `instance Monoid (Array a)` is entitled to be satisfied by a
         # `Semigroup (Array a)` written further down the file.
@@ -194,7 +203,7 @@ class ClassTable:
                     f"'{fam.name}' is already a type family of class '{other}'",
                     fam.span,
                 )
-            if fam.name in self.decls.tycons:
+            if fam.name in self.decls.shorts:
                 raise TypeError_(
                     f"'{fam.name}' is already a type; a type family cannot "
                     f"share its name",
@@ -361,7 +370,7 @@ class ClassTable:
             )
         return Pred(EQUALS, [left, right])
 
-    def _resolve_instance(self, d: ast.InstanceDecl) -> InstInfo:
+    def _resolve_instance(self, d: ast.InstanceDecl, module: str = "") -> InstInfo:
         info = self.classes.get(d.cls)
         if info is None:
             raise TypeError_(f"unknown class '{d.cls}'", d.span)
@@ -389,9 +398,36 @@ class ClassTable:
         for var in tyvars.values():
             default_kind(var.kind)
         names = {var.id: name for name, var in tyvars.items()}
-        inst = InstInfo(d.cls, head, context, d, names, families)
+        inst = InstInfo(d.cls, head, context, d, names, families, module=module)
+        self._check_orphan(inst, d)
         self.instances.setdefault(d.cls, []).append(inst)
         return inst
+
+    def _check_orphan(self, inst: InstInfo, d: ast.InstanceDecl) -> None:
+        """An instance belongs to its class's module or its head's (delta 43).
+
+        Instances are global -- every module sees every one, because a
+        predicate has to mean the same thing wherever it is solved. Global and
+        *unrestricted* is what would make coherence a matter of luck: two
+        libraries could each write `instance Show Point` over someone else's
+        `Show` and someone else's `Point`, and whichever loaded second would be
+        the error, in a file neither author wrote. The orphan rule makes the
+        overlap check above a local obligation instead: an instance can only
+        clash with one its author was in a position to see.
+        """
+        home = self.classes[inst.cls].module
+        head_module = _module_of(inst.con)
+        if inst.module in (home, head_module):
+            return
+        raise TypeError_(
+            f"orphan instance: '{d.cls} {show(inst.head)}' is declared in "
+            f"'{inst.module}', but '{d.cls}' belongs to "
+            f"'{home or 'the library'}' and '{show(inst.head)}' to "
+            f"'{head_module or 'the language itself'}'. An instance must live "
+            f"with its class or with its type, so that no two modules can each "
+            f"claim it.",
+            d.span,
+        )
 
     def _resolve_families(
         self, d: ast.InstanceDecl, info: ClassInfo, head: Type,
@@ -658,6 +694,12 @@ def _check_fam_decreasing(fb: ast.FamBind, body: Type) -> None:
                 walk(e)
 
     walk(body)
+
+
+def _module_of(name: str) -> str:
+    """Which module an internal name came from; empty for a built-in type."""
+    module, sep, _short = name.rpartition("#")
+    return module if sep else ""
 
 
 def _con_of(t: Type) -> TCon:

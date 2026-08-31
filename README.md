@@ -130,10 +130,11 @@ is a multi-file program, run from inside that directory, with its golden in
 
 ## Not in v0
 
-Modules (§9) work — a program is a directory, `import` means what §9 says, and
-the prelude and the `Data.*` modules are ordinary source under `turkey/lib`
-(SPEC-DELTAS.md 41, 42). What is not there yet: classes, instances and type
-constructors are global. An export list may name a type or a class, but
-withholds nothing, and an instance is visible wherever it was declared. So two
-libraries that each declare a `Node` cannot yet be used together, and there is
-no orphan rule. Exhaustiveness is a warning, per §5.1.
+Modules (§9) work — a program is a directory, `import` means what §9 says, the
+prelude and the `Data.*` modules are ordinary source under `turkey/lib`, and a
+type constructor belongs to the module that declared it, so two libraries that
+each declare a `Node` can be used together (SPEC-DELTAS.md 41, 42, 43). What is
+not there yet: classes are global, so an export list may name one but withholds
+nothing, and two modules cannot each declare an `Eq`. Instances are global too,
+which the orphan rule is what makes safe. Exhaustiveness is a warning, per
+§5.1.

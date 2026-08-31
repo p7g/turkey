@@ -111,7 +111,16 @@ def test_the_prelude_exports_its_bindings_and_nothing_else():
 
 def test_option_comes_from_the_prelude():
     assert scheme("fun f(x) = Some(x)", "f") == "fun(a) -> Option a"
-    assert "declared more than once" in fails("type Option a = None | Some(a)")
+
+
+def test_a_program_may_declare_its_own_option():
+    """A type belongs to its module now (delta 43), so this shadows rather than
+    colliding -- and the two are different types, which is the point."""
+    src = "type Option a = None | Some(a)\nfun f(x) = Some(x)"
+    # Both print qualified, because printing `Option` twice would say less.
+    assert scheme(src, "f") == "fun(a) -> Main.Option a"
+    assert "Data.Option.Option" in fails(
+        src + "\nfun g(o : Option Int) -> Bool = Option.isSome(o)")
 
 
 # -- the loop drives a cursor -------------------------------------------------

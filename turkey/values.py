@@ -9,6 +9,7 @@ objects and never copying them.
 from __future__ import annotations
 
 from .errors import TurkeyPanic
+from .types import short_name
 
 
 class Unit:
@@ -149,7 +150,7 @@ class RecordObj:
 
     def __repr__(self) -> str:
         inner = ", ".join(f"{k} = {v!r}" for k, v in self.fields.items())
-        return f"{self.con} {{ {inner} }}"
+        return f"{short_name(self.con)} {{ {inner} }}"
 
 
 class ConValue:
@@ -163,14 +164,17 @@ class ConValue:
         self.field_names = field_names
 
     def __repr__(self) -> str:
+        # A value prints under the name the author wrote, not the qualified one
+        # resolution gave the constructor (delta 43).
+        name = short_name(self.con)
         if not self.args:
-            return self.con
+            return name
         if self.field_names:
             inner = ", ".join(
                 f"{n} = {v!r}" for n, v in zip(self.field_names, self.args)
             )
-            return f"{self.con} {{ {inner} }}"
-        return f"{self.con}(" + ", ".join(repr(a) for a in self.args) + ")"
+            return f"{name} {{ {inner} }}"
+        return f"{name}(" + ", ".join(repr(a) for a in self.args) + ")"
 
 
 # `Bool` is a declared type now (`type Bool = False | True`, in the prelude),
@@ -179,8 +183,10 @@ class ConValue:
 # constructor; these singletons are what code *outside* the evaluator -- the
 # comparison builtins, mostly -- answers with. Nothing compares them by
 # identity: `con` is the tag, here as everywhere.
-TRUE = ConValue("True", ())
-FALSE = ConValue("False", ())
+# The tags are the internal names `Data.Bool` gives its constructors, since a
+# `ConValue`'s tag is what a pattern is matched against (`turkey/modules.py`).
+TRUE = ConValue("Data.Bool#True", ())
+FALSE = ConValue("Data.Bool#False", ())
 
 
 def from_bool(b: bool) -> ConValue:
@@ -189,7 +195,7 @@ def from_bool(b: bool) -> ConValue:
 
 def truth(value) -> bool:
     """Read a turkey `Bool` back as a Python one, for `if` and friends."""
-    return value.con == "True"
+    return value.con == TRUE.con
 
 
 class Closure:

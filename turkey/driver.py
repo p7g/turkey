@@ -23,7 +23,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import ast, coretc, desugar, joins, lower, mono
+from . import ast, coretc, desugar, joins, lower, mono, opt
 from .builtins import initial_type_env, initial_values
 from .classes import ClassTable
 from .constraints import Env, Solver
@@ -121,7 +121,7 @@ def check(src: str, file: str | None = None,
     # scope. A pass that called a position a tail when the rule does not emits
     # a jump with nowhere to go, and this is where that is caught -- on every
     # program in the suite, on every run. See turkey/joins.py.
-    program_opt = joins.discover(program_mono)
+    program_opt = joins.discover(opt.reduce_program(program_mono))
     coretc.check_program(program_opt, decls, classes, coretc.globals_of(env))
     return Checked(
         entry.program, ordered, decls, classes, env, loader.order,

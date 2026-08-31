@@ -59,7 +59,7 @@ a checker can see it, rather than left to the representation of a scope.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 
 from .errors import Span
 from .types import (
@@ -458,6 +458,34 @@ class CProgram:
     binds: list[CBind] = field(default_factory=list)
 
 
+def names_of(e) -> set[str]:
+    """Every term name mentioned anywhere inside a term.
+
+    Deliberately an over-approximation: a local that happens to share a
+    top-level binding's name counts as a mention of it. Being wrong in this
+    direction costs a binding kept alive or a call left un-inlined; being wrong
+    in the other costs a program that does not run.
+
+    Here rather than in one of its callers because it has three -- dead-code
+    elimination in `mono.py`, the call graph the loop breakers come out of in
+    `opt.py`, and `joins.py` -- and a fact about a term belongs with the term.
+    """
+    out: set[str] = set()
+
+    def walk(v) -> None:
+        if isinstance(v, CVar):
+            out.add(v.name)
+        if isinstance(v, (CExpr, CBind, CAlt)):
+            for f in fields(v):
+                walk(getattr(v, f.name))
+        elif isinstance(v, (list, tuple)):
+            for x in v:
+                walk(x)
+
+    walk(e)
+    return out
+
+
 # --------------------------------------------------------------- printing
 
 
@@ -505,20 +533,7 @@ def show_expr(e: CExpr | None, indent: int = 0,
         params = ", ".join(f"{alias(p.name)} : {show(p.ty, names)}" for p in e.params)
         return f"{pad}fun({params}) {{\n{show_expr(e.body, indent + 1, names, alias)}\n{pad}}}"
     if isinstance(e, CApp):
-        rendered = [show_expr(a, 0, names, alias).strip() for a in e.args]
-        fn = show_expr(e.fn, 0, names, alias).strip()
-        if not any("\n" in a for a in rendered):
-            return f"{pad}{fn}({', '.join(rendered)})"
-        # An argument that spans lines -- a lambda, almost always, since that
-        # is what a `?` makes of the rest of a block -- gets a line of its own,
-        # indented under the call. Rendering it flat would put a function body
-        # at column zero in the middle of a nested expression.
-        out = [f"{pad}{fn}("]
-        for i, arg in enumerate(e.args):
-            tail = "," if i < len(e.args) - 1 else ""
-            out.append(show_expr(arg, indent + 1, names, alias) + tail)
-        out.append(f"{pad})")
-        return "\n".join(out)
+        return _call(e.fn, "", e.args, pad, indent, names, alias)
     if isinstance(e, CTyLam):
         binders = " ".join(show(b, names) for b in e.binders)
         return f"{pad}/\\{binders}.\n{show_expr(e.body, indent + 1, names, alias)}"
@@ -546,8 +561,7 @@ def show_expr(e: CExpr | None, indent: int = 0,
                 f"{show_expr(e.body, indent + 1, names, alias)}\n{pad}}}\n"
                 f"{show_expr(e.rest, indent, names, alias)}")
     if isinstance(e, CJump):
-        args = ", ".join(show_expr(a, 0, names, alias).strip() for a in e.args)
-        return f"{pad}jump {alias(e.name)}({args})"
+        return _call(None, f"jump {alias(e.name)}", e.args, pad, indent, names, alias)
     if isinstance(e, CRef):
         return f"{pad}ref({show_expr(e.value, 0, names, alias).strip()})"
     if isinstance(e, CDeref):
@@ -555,8 +569,16 @@ def show_expr(e: CExpr | None, indent: int = 0,
     if isinstance(e, CAssign):
         return f"{pad}{show_expr(e.target, 0, names, alias).strip()} := {show_expr(e.value, 0, names, alias).strip()}"
     if isinstance(e, CIf):
-        out = [f"{pad}if {show_expr(e.cond, 0, names, alias).strip()} {{",
-               show_expr(e.then, indent + 1, names, alias)]
+        cond = show_expr(e.cond, 0, names, alias).strip()
+        if "\n" in cond:
+            # A condition that is itself a block -- which is what `&&` lowers
+            # to, and what inlining leaves behind. Flat, it would put a `let`
+            # at column zero between the `if` and its brace.
+            out = [f"{pad}if", show_expr(e.cond, indent + 1, names, alias),
+                   f"{pad}{{", show_expr(e.then, indent + 1, names, alias)]
+        else:
+            out = [f"{pad}if {cond} {{",
+                   show_expr(e.then, indent + 1, names, alias)]
         if e.otherwise is not None:
             out.append(f"{pad}}} else {{")
             out.append(show_expr(e.otherwise, indent + 1, names, alias))
@@ -590,6 +612,30 @@ def show_expr(e: CExpr | None, indent: int = 0,
     if isinstance(e, CContinue):
         return f"{pad}continue"
     raise AssertionError(f"unprintable Core node {type(e).__name__}")
+
+
+def _call(fn, name: str, args, pad: str, indent: int, names, alias) -> str:
+    """`fn(args)` or `name(args)`, on one line when every argument fits on one.
+
+    An argument that spans lines -- a lambda, since that is what a `?` makes of
+    the rest of a block, or a `let` chain, since that is what inlining makes of
+    a call -- gets a line of its own, indented under the call. Rendering it
+    flat would put a function body at column zero in the middle of a nested
+    expression, which is what `turkey opt` output looked like before this.
+    """
+    # Arguments before the head, which matters: `show` numbers type variables
+    # in the order it meets them, so rendering the two the other way round
+    # renames every variable in the program and moves every `.core` golden.
+    rendered = [show_expr(a, 0, names, alias).strip() for a in args]
+    head = name if fn is None else show_expr(fn, 0, names, alias).strip()
+    if not any("\n" in a for a in rendered):
+        return f"{pad}{head}({', '.join(rendered)})"
+    out = [f"{pad}{head}("]
+    for i, arg in enumerate(args):
+        tail = "," if i < len(args) - 1 else ""
+        out.append(show_expr(arg, indent + 1, names, alias) + tail)
+    out.append(f"{pad})")
+    return "\n".join(out)
 
 
 def _pattern(pat) -> str:
@@ -690,6 +736,6 @@ __all__ = [
     "CMatch", "CParam",
     "CPrim", "CProgram", "CRecord", "CRef", "CReturn", "CTuple", "CTyApp",
     "CTyLam", "CUnit", "CVar", "CWhile", "REF", "TAIL_FIELDS", "is_ref",
-    "ref_elem", "ref_of",
+    "names_of", "ref_elem", "ref_of",
     "show_bind", "show_expr", "show_program",
 ]

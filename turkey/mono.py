@@ -123,7 +123,7 @@ from dataclasses import dataclass, field, fields, replace
 
 from .classes import ClassTable
 from .core import (CAlt, CBind, CExpr, CField, CLam, CLet, CLetRec,
-                   CParam, CProgram, CRecord, CTyApp, CTyLam, CVar)
+                   CParam, CProgram, CRecord, CTyApp, CTyLam, CVar, names_of)
 from .coretc import Fams
 from .decls import DeclTable, substitute
 from .typed import reduce_deep
@@ -907,30 +907,6 @@ class _Devirtualizer:
 # ------------------------------------------------------------- reachability
 
 
-def _names(e) -> set[str]:
-    """Every name mentioned anywhere inside a term.
-
-    Deliberately an over-approximation: a local that happens to share a
-    top-level binding's name keeps that binding alive. Being wrong in this
-    direction costs a binding nobody calls; being wrong in the other costs a
-    program that does not run.
-    """
-    out: set[str] = set()
-
-    def walk(v) -> None:
-        if isinstance(v, CVar):
-            out.add(v.name)
-        if isinstance(v, (CExpr, CBind, CAlt)):
-            for f in fields(v):
-                walk(getattr(v, f.name))
-        elif isinstance(v, (list, tuple)):
-            for x in v:
-                walk(x)
-
-    walk(e)
-    return out
-
-
 def _droppable(bind: CBind, is_dict: bool) -> bool:
     """Whether not evaluating this binding is unobservable.
 
@@ -980,7 +956,7 @@ def _reachable(program: CProgram, main: str) -> CProgram:
         bind = byname.get(work.pop())
         if bind is None:
             continue
-        for name in _names(bind.value):
+        for name in names_of(bind.value):
             if name not in reach:
                 reach.add(name)
                 work.append(name)

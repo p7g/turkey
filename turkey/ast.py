@@ -314,10 +314,14 @@ class EQuestion(Expr):
     method reference it rewrites to -- the same trick `EBinary.fn` uses to keep
     `+` meaning `Add.add` in a module that defines its own `add`.
 
-    The node is *consumed* by that pass, not deleted from this file. When there
-    is a Core IR to lower to, `?` will want lowering to join points directly,
-    with the source-to-source pass kept as the oracle to differential-test
-    against -- and that needs a sugared tree still to lower.
+    That rewrite is the *only* lowering of `?`, and this note used to say
+    otherwise: it promised a second, join-point-aware lowering off the same
+    sugared tree, with this one kept as the oracle to differential-test it
+    against. `plan.txt` item 4 has since deleted that plan. Nothing about `?`
+    is lowered twice, and nothing about a monad is known below `desugar.py`;
+    join points arrive instead as a general Core pass under item 7, which
+    reaches a `bind` chain the way it reaches any other saturated call to a
+    known small function.
     """
     expr: Expr
     bind_fn: EVar | None = None

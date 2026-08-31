@@ -1,0 +1,310 @@
+Roadmap, in order. Rationale kept short; open questions are the point.
+
+1. base language
+   Done through M9.
+
+2. fix papercuts
+   Done, and by two different milestones.
+   - injectivity. M10b repaid the first half: an unannotated function that
+     iterates and then pattern-matches the element no longer needs an
+     annotation, because a scheme may carry the equation (delta 39). test.tl's
+     `exec` infers `[Item a ~ Instr, Iterator a] fun(a) -> Int` with no
+     annotation at all, and the comment there claiming otherwise was false
+     until it was corrected.
+
+     The second half was the error message. It now names the remedy -- and
+     the remedy changed with the first half: not "add a type annotation" but
+     add the equality to the context, which the message prints in full
+     (`Add 'Elem c ~ Int' to the context.`).
+
+     Non-injectivity itself is unchanged and still deliberate. Two family
+     applications unify only when they are syntactically the same
+     application; that is the one thing a functional dependency would have
+     bought, and it is still not bought.
+
+3. modules
+   Done, M11a/b/c. Moved ahead of the rest because it was already blocking:
+   the prelude claimed seventeen ordinary names (add sub mul div rem neg eq ne
+   lt lte gt gte show iter next print write) and a user program could not
+   define any of them -- M9 hit this on `add` and worked around it by
+   renaming.
+
+   The count is twenty now, not seventeen: M12a added map, pure and bind by
+   exporting Functor/Applicative/Monad unqualified, which was a deliberate
+   ergonomic choice with a stated cost (delta 45). `map` is the one a program
+   is most likely to want back.
+
+   Answered: instance coherence. Global uniqueness plus an orphan rule --
+   an instance must be declared by the module that declares its class or the
+   one that declares its head constructor (delta 43).
+
+4. `?` as general bind
+   Not do-notation: `?` is Rust's, generalized past Result. Option, Either,
+   List, and eventually a Beam-shaped query monad. Ambient effects do not
+   make it redundant -- the abstraction is over data, not over effects.
+
+   Settled: `?` is sugar for `bind` plus a lambda, and must behave identically
+   to writing that out. Mutable variables crossing a `?` therefore get closure
+   capture semantics, which are already correct. The List case --
+   continuation invoked many times, mutable locals shared across branches --
+   is not ambiguous; the meaning is whatever the instance's bind does. The
+   use case is questionable, which is not a reason to refuse it.
+
+   Scoping: `do { ... }` introduces a monadic context explicitly, and the body
+   of any function whose return type is monadic is implicitly a do block. So
+   `?` needs no ceremony in the common case and `do` is there for the nested
+   or local one.
+
+   Settled, from that rule:
+   - A `?` in the body is what raises `Monad m` on the return type. Not "the
+     return type has a Monad instance" -- that is not known during generation,
+     and it would be non-monotonic in the instance table: adding
+     `instance Monad Array` later would retroactively turn every function
+     returning an Array into a do block.
+   - No auto-`pure`. The trailing expression of a do block is already the
+     monadic value (`Some(3)`, not `3`), so `do` never changes what an
+     ordinary expression means. This matters more here than in Haskell, since
+     a function body becomes a do block without anyone typing `do`.
+
+   Answered: an empty or `?`-free `do { ... }` emits nothing at all. No
+   `bind`, so no `Monad` obligation, so nothing for the monad to be ambiguous
+   *about* -- it is exactly the block it wraps, and `do { }` is `Unit`. The
+   question dissolved rather than being decided.
+
+   Not doing: error conversion across a `?`. Rust needs `From<E1, E2>`, an
+   MPTC, which single-parameter classes cannot express (the same homogeneity
+   cost as design.md section 8.2's operators). Same error type, or convert by
+   hand. Revisit if it proves a real ergonomic problem, not before -- no
+   cargo-culting features in ahead of the evidence.
+
+   Done, M12c. There is no fast lowering, and there is not going to be one.
+
+   The "two lowerings" framing below was wrong twice over, and both
+   corrections are worth keeping rather than deleting.
+
+   The first: it conflated two axes. What M12 needed first was a more
+   *general* lowering, for control-flow correctness -- and the naive closure
+   lowering is the oracle only on the fragment where nothing crosses a `?`.
+
+   - Naive: every continuation becomes a closure. Still the definition of
+     what `?` means -- on straight-line code, where a `?` is exactly `bind`
+     plus a lambda and nothing else is emitted.
+   - General (M12c, done): a control construct containing a `?` is *lifted*
+     into the monad, and a `return`/`break`/`continue` that crosses one
+     travels as a value (`Flow`) because a value is the only thing a `bind`
+     propagates. Escaping is not something a `bind` does, and for `Array` --
+     continuation once per element -- there is nothing coherent an escape
+     could mean. Written out longhand in design.md 6.9.
+
+   The second correction is the larger one: *fast* was never an axis of the
+   lowering at all. A "fast lowering" was going to be a second, `?`-aware
+   translation, guarded by a closure fallback, differential-tested against
+   the first. All three of those are now deleted, because the premise was
+   wrong.
+
+   Nobody does this. GHC desugars `do` exactly once, in GHC.HsToCore, to
+   `>>=` applied to a lambda; the speed comes afterwards from general Core
+   passes -- inline the instance's `>>=` (which is why IO/State bind carry
+   INLINE), beta-reduce the now-known continuation, case-of-known-constructor,
+   join points (Maurer, Downen, Ariola & Peyton Jones, *Compiling without
+   continuations*, PLDI 2017). Scala's for-comprehension is `flatMap` plus a
+   lambda and leaves it to the JIT; OCaml's `let*` is `bind` and leaves it to
+   Flambda. Rust's `?` looks like the exception and is not one: its
+   continuation is always the rest of the function, which is already the
+   fallthrough, so it lowers to a `match` on `Try::branch` and no closure is
+   ever built. That is the *shape inlining reveals* for a monad whose bind
+   invokes its continuation at most once and does not escape -- not something
+   a lowering has to decide up front.
+
+   So: desugar.py stays the only lowering of `?`, and everything that was
+   going to be the fast one moves to 7 as passes that know nothing about
+   monads. See 7 for the three.
+
+   Three obligations retire with it:
+
+   - **The closure fallback is not a mode.** Capped generic code -- a `?`
+     inside `fun f[Monad m](...)` that still projects `bind` out of a
+     parameter, which coherence says nothing about -- is simply code the
+     inliner could not fire on. An absence of an optimization, not a second
+     path, and so not a shape anyone has to design.
+   - **The differential test is retired.** One lowering has nothing to be
+     tested against. Validation is coretc.py re-run on each pass's output
+     plus the goldens, which is the M14b pattern: same source, same output,
+     different Core underneath. (M2.5's criterion asked for two
+     known-equivalent implementations of one specification; there is now one.)
+   - **Nothing needs marking in the sugar.** `EQuestion` and `EDo` are still
+     consumed by desugar.py rather than deleted from ast.py, but the reason
+     given there -- keeping a sugared tree to lower a second way -- has
+     lapsed. ast.py's note that `?` "will want lowering to join points
+     directly" is superseded by this entry.
+
+   What survives unchanged is what a fast `?` owes, stated exactly (delta
+   47): reproduce the *bind chain* -- how many times a continuation is
+   invoked and in what order -- and not the `Flow` encoding. `Flow` is not
+   part of `Monad`; it appears in no signature and an instance can neither
+   see nor match on it. That is what licenses 7's passes to erase it.
+
+   Still true, and now 7's problem rather than 4's:
+   - Whatever form mutable locals take across a join point has to reproduce
+     capture semantics exactly, since that is the spec. Since M13c a `var` is
+     an explicit reference cell in Core, so what has to be reproduced is
+     written down rather than implied by the evaluator's scope chain.
+   - M14 is what gives the inliner something to fire on. In `question.tl`
+     there are no `.bind` projections left at all: every one is a top-level
+     binding by name, specialized to the element types as well as the monad
+     (`%inst.Monad.Data.Option#Option#bind@Int,Int`, ten of them). Not a
+     projection, not an indirect call, monomorphic in its argument types --
+     an ordinary inliner's ordinary case.
+
+5. typed Core IR
+   Done, M13a/b/c. The description below held up exactly: giving the
+   elaborator a datatype is what made evidence checkable rather than trusted,
+   and a dictionary is now an ordinary value passed as an ordinary argument.
+   SSA stayed below it, untouched.
+
+   What it took, in the order it had to happen:
+   - M13a: inference stops discarding what it computed. Every expression's
+     type, and the *type arguments* every use site instantiated its scheme at
+     -- `instantiate_qual` had always built the second and thrown it away,
+     because until there was something to lower to, nothing asked.
+   - M13b: `core.py`, `lower.py`, `coretc.py`. A class is a record type, an
+     instance a top-level binding, evidence an ordinary term. The checker
+     runs unconditionally, because a check nobody runs does not make evidence
+     checked.
+   - M13c: the evaluator runs the Core. Ninety-one goldens, not one output
+     changed.
+
+   Three things the checker caught the moment it existed, none of them
+   visible in any program's output: a default method is elaborated once
+   against the class variable and shared, so copying it per instance put `a`
+   where `Int` belonged; a method body -- and any body with a complete
+   signature -- is checked against skolems, so its recorded types name
+   constants where the declaration names variables, and nothing recorded
+   which was which; and a recursive call, monomorphic to inference, still
+   needs its type application in System-F. That is the milestone paying for
+   itself on the day it landed.
+
+   Two things it made visible rather than fixed, both now recorded in the IR
+   rather than in the interpreter: a `var` is a reference cell, so capture by
+   reference is a property of the term; and a parameterised instance's
+   dictionary is rebuilt per request now that the memo table is gone, which
+   is correct, terminating, and work 6 should remove.
+
+6. monomorphization / specialization
+   Done, M14a/b/c/d. Was missing from this list, and delivered all three things
+   it was asked for: dictionary passing is cheap, the per-request rebuild 5
+   left behind is gone, and `?`'s fast lowering has something to inline in
+   ground code (see 4 for what it still does not have).
+
+   The fact that shaped the whole design, and was verified rather than
+   assumed: Turkey admits polymorphic recursion, so monomorphization cannot
+   terminate in general. `fun depth(x : a, n : Int)` recursing at `Pair a` is
+   the probe, and adding `instance [Show a] Show (Pair a)` makes the dictionary
+   chain infinite too, so specializing on dictionaries instead would not have
+   escaped it. So the pass is **partial** by decision: past a cap the call site
+   keeps its type application and calls the generic binding, which is never
+   removed, and the program is told so through the ordinary warning channel.
+   Every program that compiled before compiles now; some are only partly
+   specialized.
+
+   What it took:
+   - M14a: one copy of a generalized binding per type it is used at. A ground
+     instance application becomes one top-level record rather than a rebuild
+     per request.
+   - M14b: the evaluator runs the specialized program. The goldens are the
+     differential test -- same source, same output, different Core underneath.
+   - M14c: a method selected from a ground dictionary becomes a name, which
+     coherence (delta 43) is what makes sound; and what nothing reaches is
+     dropped, which is where the pass stops being an addition.
+   - M14d: the first two make work for each other, so they run twice, on one
+     shared budget. The budget had to be shared rather than per-round or the
+     cap would have stopped being a bound -- N rounds would have granted 32N
+     copies -- and sharing the memo is what stops a second round rebuilding
+     the first round's copies under a disambiguated name.
+
+   Two rounds and not a fixed point, deliberately: a third round changes
+   nothing measurable, and "iterate until nothing changes" is a promise about a
+   number polymorphic recursion does not let this pass make. Raising the round
+   count is a one-line change that cannot break the bound.
+
+   On tests/programs/dicts.tl: dictionary projections 65 -> 14, and 77
+   top-level bindings -> 62, after a pass whose only job is to make copies.
+   What remains is inside the bindings that are still genuinely polymorphic.
+
+7. optimizations
+   A consequence of 5 and 6, not a milestone of its own -- but it absorbed 4's
+   fast lowering, so it is now where the `?` work lives. Choosing the IR shape
+   is still the decision; the pass list follows from it.
+
+   The shape decision, made: **join points go in Core, not in an SSA IR below
+   it.** Item 5 deferred them -- "control transfers are still nodes typed `!`
+   rather than jumps to join points ... worth doing, under item 7, against a
+   Core that already exists" (core.py) -- and design.md 405 says the same.
+   That deferral is now cashed, and item 5's "SSA belongs below this, in the
+   backend" still holds: SSA is 9-11's business. Join points are not SSA. They
+   are a distinguished form of `let` whose bound lambda is only ever
+   tail-called and never escapes, which is the *Compiling without
+   continuations* design, and GHC put them in Core for the same reason: a
+   separate IR below Core is not where the information is.
+
+   Three passes, none of which knows what a monad is:
+
+   - **Inlining.** A `CVar` naming a top-level binding with a known, small
+     RHS. M14c is what made instance methods into such names.
+   - **Beta and case-of-known-constructor.** The continuation lambda
+     disappears by reduction once its call site is known. This is where a `?`
+     over Option becomes the `match` Rust writes by hand.
+   - **Join-point discovery.** An analysis marking `CLet`-bound lambdas that
+     are only tail-called and never escape. Not `?`-specific: it is what the
+     four loop forms and `CReturn`/`CBreak`/`CContinue` need anyway, and
+     collapsing those four into one is the other half of what 5 deferred here.
+
+   Ordering, and it is the one thing that is not free: **join points before
+   leaning on case-of-case.** Inlining `bind` does not by itself remove
+   `Flow` -- that needs case-of-case, to see that a `Flow` built in one branch
+   is scrutinised downstream, and case-of-case is exactly the pass that
+   duplicates continuations and blows up code size. Join points are the known
+   answer to that, and are most of what the 2017 paper is about. Doing them in
+   the other order is the way to get a correct compiler that emits absurd
+   amounts of code.
+
+   Open, and genuinely: how much of this the Python prototype should carry.
+   The evaluator is a tree-walker over name-keyed environments, so an inlined
+   `bind` costs it a dict lookup either way and the goldens will not show a
+   difference. The passes are still worth having here -- they are checkable by
+   coretc.py, and 8 is the program that will exercise them -- but the payoff
+   is 9's, not this one's.
+
+8. bootstrap interpreter (same frontend, IR, optimizations)
+   Moved ahead of the backend work. It is the first real program in the
+   language and the only forcing function that finds papercuts at a scale
+   test.tl cannot, and it costs no backend work -- the Python implementation
+   runs it. Discovering the language is unpleasant to write a compiler in is
+   much cheaper before two backends exist.
+
+9. runtime: GC, closure representation, boxing
+   Was missing from this list, and is the hard part of native compilation --
+   not LLVM. Today everything is a Python object: RecordObj has reference
+   semantics, ConValue is immutable, ArrayObj is mutable. None of that has a
+   memory answer yet.
+
+10. native compilation via LLVM
+
+11. DIY backend
+
+Deferred probe: Beam. Its leverage is HKT-parameterized records (`Table f`,
+`Table (Nullable Identity)`) plus MPTCs over rows. Turkey has HKTs and
+families; nominal records, no rows, no MPTCs. Treat it as a type-system
+requirements exercise -- attempt the port, and if it cannot be done, derive
+the minimal missing feature set from what failed. Option and Either prove
+nothing here; they typecheck today.
+
+The thesis behind the order: prototype in Python to iron out the language
+before building the hard-but-not-novel parts. Which is why 4 and 5 sit early
+-- they are where the novel semantics live -- and 9 through 11 sit late.
+
+Where it stands: 1, 2, 3, 4, 5 and 6 are done. 4 closed not by building its
+fast lowering but by deleting it: the speed it wanted is three general Core
+passes that know nothing about monads, and those are 7. Next is 7, starting
+with join points in Core, because case-of-case without them is how a compiler
+comes to emit an absurd amount of correct code.

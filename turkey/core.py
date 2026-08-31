@@ -24,13 +24,14 @@ Three things, and only three:
 * **Polymorphism.** A generalized binding becomes a type abstraction and every
   use of it a type application, at the argument list delta 48 recorded.
 
-Everything else keeps the shape it had. `CIf`, `CMatch`, `CWhile`, `CLoop`,
-`CForIn`, `CForC` are the surface constructs, and control transfers are still
-nodes typed `!` rather than jumps to join points. That is deliberate and it is
-what `plan.txt` item 5 asks for: "SSA belongs below this, in the backend; the
-two are separate layers." Collapsing the four loop forms into one, and turning
-`return` into a jump, is worth doing -- under item 7, against a Core that
-already exists, rather than mixed into the commit that introduces one.
+Everything else keeps the shape it had, with one exception. `CIf` and `CMatch`
+are the surface constructs they always were, but there is no node here for a
+loop and none for a control transfer: `while`, `loop`, the C-style `for` and
+`for ... in` are all `CJoin`, and `return`, `break` and `continue` are all
+`CJump`. `turkey/lower.py` makes them so, on the way down from the AST, which
+is what "unrepresentable" means -- not that no pass emits one, but that there
+is nothing to emit. A term that names its control target by *where it sits*
+cannot be written here at all.
 
 ## The one thing that is not a translation
 
@@ -344,43 +345,6 @@ class CMatch(CExpr):
     alts: list[CAlt] = field(default_factory=list)
 
 
-@dataclass(eq=False)
-class CWhile(CExpr):
-    cond: CExpr | None = None
-    body: CExpr | None = None
-
-
-@dataclass(eq=False)
-class CLoop(CExpr):
-    body: CExpr | None = None
-
-
-@dataclass(eq=False)
-class CForC(CExpr):
-    init: CExpr | None = None
-    cond: CExpr | None = None
-    step: CExpr | None = None
-    body: CExpr | None = None
-
-
-@dataclass(eq=False)
-class CForIn(CExpr):
-    """`for x in seq`, with its `iter` and `next` already resolved to terms.
-
-    The elaboration in design.md 6.5 is not performed here. It could be, and a
-    later pass should -- but the two calls are what carry the `Iterator`
-    dictionary, and having them present as ordinary `CExpr`s is already enough
-    for the checker to check that the right one is being passed, which is what
-    this milestone is about.
-    """
-
-    pat: object = None  # ast.Pattern
-    seq: CExpr | None = None
-    iter_fn: CExpr | None = None
-    next_fn: CExpr | None = None
-    body: CExpr | None = None
-
-
 # Which subterm of which node is a **tail position**: the places a `CJump` may
 # stand, because the value of what stands there is the value of the whole
 # enclosing term. Stated once, here in the IR, because it is a fact about the
@@ -388,11 +352,11 @@ class CForIn(CExpr):
 # `joins.py` reads it to decide what a tail call is, and two statements of one
 # fact is exactly the kind of agreement `plan.txt` item 5 exists to be rid of.
 #
-# Everything absent is not a tail position, and the absences carry weight. A
-# `CLam`'s body is missing on purpose: a closure outlives the frame that binds
-# the join, so a label is not something it can jump to. So is a `CWhile`'s or a
-# `CLoop`'s body -- until item 7's last step makes those join points
-# themselves, a loop body runs many times and is not the value of anything.
+# Everything absent is not a tail position, and the one absence that carries
+# weight is `CLam`'s body: a closure outlives the frame that binds the join, so
+# a label is not something it can jump to. There is no loop body to say the
+# same of any more -- a loop *is* a `CJoin` here, so its body is a join's body
+# and reaches whatever that reaches.
 TAIL_FIELDS: dict[str, tuple[str, ...]] = {
     "CIf": ("then", "otherwise"),
     "CLet": ("body",),
@@ -400,21 +364,6 @@ TAIL_FIELDS: dict[str, tuple[str, ...]] = {
     "CJoin": ("body", "rest"),
     "CMatch": ("alts",),
 }
-
-
-@dataclass(eq=False)
-class CReturn(CExpr):
-    value: CExpr | None = None
-
-
-@dataclass(eq=False)
-class CBreak(CExpr):
-    value: CExpr | None = None
-
-
-@dataclass(eq=False)
-class CContinue(CExpr):
-    pass
 
 
 # ------------------------------------------------------------- the program
@@ -597,26 +546,6 @@ def show_expr(e: CExpr | None, indent: int = 0,
             out.append(show_expr(alt.body, indent + 2, names, alias))
         out.append(f"{pad}}}")
         return "\n".join(out)
-    if isinstance(e, CWhile):
-        return (f"{pad}while {show_expr(e.cond, 0, names, alias).strip()} {{\n"
-                f"{show_expr(e.body, indent + 1, names, alias)}\n{pad}}}")
-    if isinstance(e, CLoop):
-        return f"{pad}loop {{\n{show_expr(e.body, indent + 1, names, alias)}\n{pad}}}"
-    if isinstance(e, CForC):
-        return (f"{pad}for {show_expr(e.init, 0, names, alias).strip()}; "
-                f"{show_expr(e.cond, 0, names, alias).strip()}; {show_expr(e.step, 0, names, alias).strip()} {{\n"
-                f"{show_expr(e.body, indent + 1, names, alias)}\n{pad}}}")
-    if isinstance(e, CForIn):
-        return (f"{pad}for {_pattern(e.pat)} in {show_expr(e.seq, 0, names, alias).strip()} "
-                f"via {show_expr(e.iter_fn, 0, names, alias).strip()}, "
-                f"{show_expr(e.next_fn, 0, names, alias).strip()} {{\n"
-                f"{show_expr(e.body, indent + 1, names, alias)}\n{pad}}}")
-    if isinstance(e, CReturn):
-        return f"{pad}return {show_expr(e.value, 0, names, alias).strip()}"
-    if isinstance(e, CBreak):
-        return f"{pad}break {show_expr(e.value, 0, names, alias).strip()}"
-    if isinstance(e, CContinue):
-        return f"{pad}continue"
     raise AssertionError(f"unprintable Core node {type(e).__name__}")
 
 
@@ -736,12 +665,12 @@ def show_bind(bind: CBind) -> str:
 
 
 __all__ = [
-    "CAlt", "CApp", "CArray", "CAssign", "CBind", "CBreak", "CCon",
-    "CContinue", "CDeref", "CExpr", "CField", "CForC", "CForIn", "CIf",
-    "CIndex", "CJoin", "CJump", "CLam", "CLet", "CLetRec", "CLit", "CLoop",
+    "CAlt", "CApp", "CArray", "CAssign", "CBind", "CCon",
+    "CDeref", "CExpr", "CField", "CIf",
+    "CIndex", "CJoin", "CJump", "CLam", "CLet", "CLetRec", "CLit",
     "CMatch", "CParam",
-    "CPrim", "CProgram", "CRecord", "CRef", "CReturn", "CTuple", "CTyApp",
-    "CTyLam", "CUnit", "CVar", "CWhile", "REF", "TAIL_FIELDS", "is_ref",
+    "CPrim", "CProgram", "CRecord", "CRef", "CTuple", "CTyApp",
+    "CTyLam", "CUnit", "CVar", "REF", "TAIL_FIELDS", "is_ref",
     "names_of", "ref_elem", "ref_of",
     "show_bind", "show_expr", "show_program",
 ]

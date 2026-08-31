@@ -46,11 +46,10 @@ from __future__ import annotations
 
 from . import ast
 from .core import (
-    CApp, CArray, CAssign, CBreak, CCon, CContinue, CDeref, CExpr, CField,
-    CForC, CForIn, CIf, CIndex, CJoin, CJump, CLam, CLet, CLetRec, CLit,
-    CLoop, CMatch,
-    CPrim, CProgram, CRecord, CRef, CReturn, CTuple, CTyApp, CTyLam, CUnit,
-    CVar, CWhile,
+    CApp, CArray, CAssign, CCon, CDeref, CExpr, CField,
+    CIf, CIndex, CJoin, CJump, CLam, CLet, CLetRec, CLit, CMatch,
+    CPrim, CProgram, CRecord, CRef, CTuple, CTyApp, CTyLam, CUnit,
+    CVar,
 )
 from .decls import DeclTable
 from .errors import TurkeyPanic
@@ -59,33 +58,17 @@ from .values import (
 )
 
 
-class ReturnSignal(Exception):
-    __slots__ = ("value",)
-
-    def __init__(self, value):
-        self.value = value
-
-
-class BreakSignal(Exception):
-    __slots__ = ("value",)
-
-    def __init__(self, value):
-        self.value = value
-
-
-class ContinueSignal(Exception):
-    pass
-
-
 class JumpSignal(Exception):
     """A jump to a join point, carrying the name it targets and its arguments.
 
-    An exception, like the other three transfers, and for the same reason: the
-    interpreter's control flow is Python's. Catching by *name* is enough to be
-    lexical rather than dynamic, because the checker will not let a jump appear
-    inside a lambda -- a lambda body is out of tail position, so it gets an
-    empty join scope. So the innermost `CJoin` with this name on the Python
-    stack is always the one that lexically binds it.
+    An exception, because the interpreter's control flow is Python's. It is
+    the only one: `return`, `break` and `continue` were three more, each
+    caught by whichever frame happened to be running, and all three are now
+    this -- caught by *name*, which is enough to be lexical rather than
+    dynamic, because the checker will not let a jump appear inside a lambda.
+    A lambda body is out of tail position, so it gets an empty join scope, and
+    the innermost `CJoin` with this name on the Python stack is therefore
+    always the one that lexically binds it.
     """
 
     __slots__ = ("name", "args")
@@ -254,10 +237,7 @@ class Evaluator:
             scope = fn.env.child()
             for name, value in zip(fn.params, args):
                 scope.define(name, value)
-            try:
-                return self.eval(fn.body, scope)
-            except ReturnSignal as ret:
-                return ret.value
+            return self.eval(fn.body, scope)
         if isinstance(fn, Builtin):
             return fn.fn(*args)
         if isinstance(fn, ConstructorFn):
@@ -354,88 +334,6 @@ class Evaluator:
     def _eval_CJump(self, e: CJump, env: REnv):
         raise JumpSignal(e.name, [self.eval(a, env) for a in e.args])
 
-    def _eval_CWhile(self, e: CWhile, env: REnv):
-        while truth(self.eval(e.cond, env)):
-            try:
-                self.eval(e.body, env.child())
-            except BreakSignal:
-                break
-            except ContinueSignal:
-                continue
-        return UNIT
-
-    def _eval_CLoop(self, e: CLoop, env: REnv):
-        while True:
-            try:
-                self.eval(e.body, env.child())
-            except BreakSignal as brk:
-                return brk.value
-            except ContinueSignal:
-                continue
-
-    def _eval_CForC(self, e: CForC, env: REnv):
-        scope = env.child()
-        if e.init is not None:
-            self.open(e.init, scope)
-        while truth(self.eval(e.cond, scope)):
-            try:
-                self.eval(e.body, scope.child())
-            except BreakSignal:
-                break
-            except ContinueSignal:
-                pass
-            if e.step is not None:
-                self.open(e.step, scope)
-        return UNIT
-
-    def open(self, e: CExpr, env: REnv):
-        """A C-style `for`'s init and step, whose bindings scope over the loop
-        rather than over the rest of the term -- so a `let` here defines into
-        the loop's own scope instead of making a child of it."""
-        if isinstance(e, CLet):
-            env.define(e.name, self.eval(e.value, env))
-            return UNIT
-        return self.eval(e, env)
-
-    def _eval_CForIn(self, e: CForIn, env: REnv):
-        """`for x in seq`, with `iter` and `next` already resolved to terms.
-
-        The two calls are what carry the `Iterator` dictionary, so the loop is
-        not a special case anywhere: it is two ordinary applications and a
-        pattern bind (design.md 6.5).
-        """
-        seq = self.eval(e.seq, env)
-        cursor = self.call(self.eval(e.iter_fn, env), [seq])
-        step = self.eval(e.next_fn, env)
-        while True:
-            item = self.call(step, [seq, cursor])
-            if not isinstance(item, ConValue) or not item.args:
-                return UNIT  # `None`: the sequence is finished.
-            bindings = match_pattern(e.pat, item.args[0])
-            if bindings is None:
-                raise TurkeyPanic(
-                    f"the loop pattern does not match {item.args[0]!r}")
-            scope = env.child()
-            for name, bound in bindings.items():
-                scope.define(name, bound)
-            try:
-                self.eval(e.body, scope)
-            except BreakSignal:
-                return UNIT
-            except ContinueSignal:
-                continue
-
-    def _eval_CReturn(self, e: CReturn, env: REnv):
-        raise ReturnSignal(UNIT if e.value is None else self.eval(e.value, env))
-
-    def _eval_CBreak(self, e: CBreak, env: REnv):
-        raise BreakSignal(UNIT if e.value is None else self.eval(e.value, env))
-
-    def _eval_CContinue(self, e: CContinue, env: REnv):
-        raise ContinueSignal()
-
-
-
 
 def match_pattern(pat: ast.Pattern, value) -> dict[str, object] | None:
     """Match a value, returning the bindings, or None if the pattern does not fit.
@@ -502,6 +400,4 @@ def match_pattern(pat: ast.Pattern, value) -> dict[str, object] | None:
     raise AssertionError(f"unhandled pattern {type(pat).__name__}")
 
 
-__all__ = ["BreakSignal", "Cell", "ContinueSignal", "Evaluator",
-           "JumpSignal", "REnv",
-           "ReturnSignal", "match_pattern"]
+__all__ = ["Cell", "Evaluator", "JumpSignal", "REnv", "match_pattern"]

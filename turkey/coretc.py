@@ -72,10 +72,10 @@ from dataclasses import dataclass, field
 from . import ast
 from .classes import ClassTable, match
 from .core import (
-    TAIL_FIELDS, CAlt, CApp, CArray, CAssign, CBind, CBreak, CCon, CContinue,
-    CDeref, CExpr, CField, CForC, CForIn, CIf, CIndex, CJoin, CJump, CLam,
-    CLet, CLetRec, CLit, CLoop, CMatch, CParam, CPrim, CProgram, CRecord, CRef,
-    CReturn, CTuple, CTyApp, CTyLam, CUnit, CVar, CWhile, is_ref, ref_elem,
+    TAIL_FIELDS, CApp, CArray, CAssign, CBind, CCon,
+    CDeref, CExpr, CField, CIf, CIndex, CJoin, CJump, CLam,
+    CLet, CLetRec, CLit, CMatch, CParam, CPrim, CProgram, CRecord, CRef,
+    CTuple, CTyApp, CTyLam, CUnit, CVar, is_ref, ref_elem,
     ref_of,
 )
 from .decls import DeclTable, substitute
@@ -169,11 +169,18 @@ class Checker:
         self.equations = saved + bind.equations
         try:
             got = self.check(bind.value, env)
+            if bind.mutable and is_ref(bind.ty):
+                got = ref_elem(got) if is_ref(got) else got
+            # Compared *under* the binding's own equations, which is the only
+            # place they hold. `check` returns a reduced type, so a body that
+            # was checked with `Elem a ~ Int` in scope hands back `Int` -- and
+            # comparing that against an unreduced `Elem a` outside the scope
+            # asks the two sides to agree on a rewrite only one of them was
+            # allowed to make. It went unnoticed while every early `return`
+            # made a body bottom, and bottom is compatible with anything.
+            self.expect(want, got, bind.span, f"the binding '{bind.name}'")
         finally:
             self.equations = saved
-        if bind.mutable and is_ref(bind.ty):
-            got = ref_elem(got) if is_ref(got) else got
-        self.expect(want, got, bind.span, f"the binding '{bind.name}'")
 
     # -- expressions -------------------------------------------------------
 
@@ -561,57 +568,6 @@ class Checker:
             result = got if result is None else _join(result, got)
         return e.ty if result is None else result
 
-    def _check_CWhile(self, e: CWhile, env: Env) -> Type:
-        self.expect(BOOL, self.check(e.cond, env), e.span, "a condition")
-        self.check(e.body, env)
-        return TCon("Unit")
-
-    def _check_CLoop(self, e: CLoop, env: Env) -> Type:
-        self.check(e.body, env)
-        return e.ty
-
-    def _check_CForC(self, e: CForC, env: Env) -> Type:
-        inner = env.child()
-        if e.init is not None:
-            self.check_open(e.init, inner)
-        self.expect(BOOL, self.check(e.cond, inner), e.span, "a condition")
-        if e.step is not None:
-            self.check_open(e.step, inner)
-        self.check(e.body, inner)
-        return TCon("Unit")
-
-    def check_open(self, e: CExpr, env: Env) -> None:
-        """A C-style `for`'s init and step, whose bindings scope over the loop.
-
-        A `let` in that position is checked here rather than through `check`,
-        because its body is the rest of the *loop*, not the rest of the term.
-        """
-        if isinstance(e, CLet):
-            assert e.bound is not None
-            self.expect(e.bound, self.check(e.value, env), e.span,
-                        f"the binding '{e.name}'")
-            env.define(e.name, e.binders, e.bound)
-            return
-        self.check(e, env)
-
-    def _check_CForIn(self, e: CForIn, env: Env) -> Type:
-        seq = self.check(e.seq, env)
-        iter_fn = prune(self.check(e.iter_fn, env))
-        next_fn = prune(self.check(e.next_fn, env))
-        if not isinstance(iter_fn, TFun) or not isinstance(next_fn, TFun):
-            raise CoreError("a loop's iterator is not a function", e.span)
-        self.expect(iter_fn.params[0], seq, e.span, "the sequence iterated")
-        element = _option_arg(next_fn.ret)
-        if element is None:
-            raise CoreError(
-                f"a loop's `next` answers {show(next_fn.ret)}, not an Option",
-                e.span)
-        inner = env.child()
-        for name, ty in self.pattern(e.pat, element, e.span).items():
-            inner.define(name, [], ty)
-        self.check(e.body, inner)
-        return TCon("Unit")
-
     def _check_CJoin(self, e: CJoin, env: Env) -> Type:
         """`join j(params) = body in rest`.
 
@@ -660,19 +616,6 @@ class Checker:
             raise CoreError(
                 f"a jump to '{e.name}' claims {show(e.ty)}; it never yields to "
                 f"its context, so it is bottom", e.span)
-        return e.ty
-
-    def _check_CReturn(self, e: CReturn, env: Env) -> Type:
-        if e.value is not None:
-            self.check(e.value, env)
-        return e.ty
-
-    def _check_CBreak(self, e: CBreak, env: Env) -> Type:
-        if e.value is not None:
-            self.check(e.value, env)
-        return e.ty
-
-    def _check_CContinue(self, e: CContinue, env: Env) -> Type:
         return e.ty
 
     # -- patterns, derived rather than read --------------------------------
@@ -892,15 +835,6 @@ def _head_mapping(scheme, target: Type) -> dict[int, Type]:
     # The target is not an instance of the result -- a variable somewhere, or a
     # bottom. Nothing can be derived, and the caller's own checks report it.
     return {}
-
-
-def _option_arg(t: Type) -> Type | None:
-    head, args = spine(prune(t))
-    if isinstance(head, TCon) and head.name.endswith("Option") and args:
-        return args[0]
-    if isinstance(head, (TVar, TBottom)):
-        return _fresh()
-    return None
 
 
 def globals_of(env) -> Env:

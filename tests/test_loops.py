@@ -1,10 +1,16 @@
-"""The four loop forms, collapsed into one (`plan.txt` item 7, M15e).
+"""The four loop forms, lowered into one (`plan.txt` item 7, M16a).
 
-`tests/programs/loops.opt` is the readable version, and `loops.mono` beside it
-is the same program with the loops still in it. What is here is the properties
-that a golden shows but does not state, and the two questions a golden cannot
-ask at all: whether the pass is *total* on the suite, and whether the thing it
-was built to unlock actually unlocked.
+`tests/programs/loops.opt` is the readable version. What is here is the
+properties a golden shows but does not state, and the question a golden cannot
+ask at all: whether the loop forms are *gone from the IR* rather than merely
+absent from the programs that happen to be in the suite.
+
+That is the change M16a made. M15e collapsed the loops in a Core-to-Core pass
+after monomorphization, so nothing that ran held one -- but `turkey/lower.py`
+still emitted them, `coretc.py` and `eval.py` still had to know them, and the
+pass was partial by construction, with a fallback that left a binding alone.
+Now the lowering builds join points directly and there is no node to leave: a
+term that names its control target by where it sits cannot be written.
 
 The programs run their loops as well as being inspected, because the whole
 milestone is a semantics-preserving rewrite of control flow -- and a rewrite of
@@ -20,16 +26,15 @@ from pathlib import Path
 
 import pytest
 
-from turkey.core import (
-    CAlt, CBind, CBreak, CContinue, CExpr, CForC, CForIn, CJoin, CLoop,
-    CProgram, CReturn, CWhile,
-)
+from turkey import core
+from turkey.core import CAlt, CBind, CExpr, CJoin, CJump, CLet, CProgram
 from turkey.driver import check, run
 
 PROGRAMS = Path(__file__).parent / "programs"
 
-# What the pass exists to remove.
-GONE = (CWhile, CLoop, CForC, CForIn, CReturn, CBreak, CContinue)
+# The nodes M16a deleted. Named as strings because the point of the test is
+# that there is nothing left to import.
+GONE = ("CWhile", "CLoop", "CForC", "CForIn", "CReturn", "CBreak", "CContinue")
 
 
 def optimized(src: str):
@@ -110,21 +115,28 @@ fun main() { print(firstEven([1, 3, 4, 7])) }
     (WHILE, "10\n"), (LOOP, "25\n"), (FORC, "3\n"), (FORIN, "Some(4)\n")],
     ids=["while", "loop", "for-c", "for-in"])
 def test_each_loop_form_becomes_a_join_and_still_answers(src, answer):
-    _, program = optimized(src)
-    assert count(program, GONE) == 0
+    checked, program = optimized(src)
+    # In the *lowering's* own output, not just after the optimizer: this is
+    # what "lowered, not collapsed" means, and the earlier the claim holds the
+    # fewer passes had to know what a loop was.
+    assert count(checked.core, CJoin) > 0
     assert count(program, CJoin) > 0
     assert output(src) == answer
 
 
-def test_a_for_in_loops_cursor_is_made_explicit():
+def test_a_for_in_loops_cursor_is_made_explicit_before_anything_checks_it():
     """design.md 6.5's elaboration, which `core.py` left as a note that "a
-    later pass should" perform. This is that pass, and the cursor binding it
-    introduces is the evidence: before it, the `Iterator` protocol lived in the
-    evaluator's `_eval_CForIn` and nowhere a checker could see it."""
-    from turkey.core import CLet
+    later pass should" perform.
 
-    _, program = optimized(FORIN)
-    lets = [n.name for bind in program.binds for n in nodes(bind.value)
+    The lowering is that pass now, and *that* is the improvement over M15e
+    rather than the elaboration itself. `driver.check` runs
+    `coretc.check_program` on the lowering's output, so the cursor binding and
+    the `Option` match that reads `next`'s answer are checked. When the same
+    elaboration happened after monomorphization, the Core checker had already
+    accepted the un-elaborated node and never saw what replaced it.
+    """
+    checked, _ = optimized(FORIN)
+    lets = [n.name for bind in checked.core.binds for n in nodes(bind.value)
             if isinstance(n, CLet)]
     assert any(name.startswith("%cu") for name in lets), (
         "the cursor `iter` answers should be an ordinary binding now")
@@ -155,35 +167,76 @@ def test_a_return_out_of_a_loop_leaves_the_function():
     assert output(FORIN.replace("[1, 3, 4, 7]", "[1, 3, 5]")) == "None\n"
 
 
-# -- the two questions a golden cannot ask -----------------------------------
+def test_a_transfer_inside_a_call_argument_keeps_evaluation_order():
+    """`bf.tl` writes `Array.push(ops, match c { ']' -> break, _ -> ... })`.
 
+    A transfer in an operand cannot simply be hoisted out: the arguments
+    beside it would then be evaluated after it, and the evaluator is strict
+    and left to right. `lower.anf` binds every operand up to the last
+    transferring one, in order, which is A-normal form arrived at because the
+    order has to be preserved rather than because the form is wanted.
 
-def test_the_pass_is_total_on_the_suite():
-    """`loops.collapse` is partial by construction -- a shape its rules do not
-    cover leaves the binding alone rather than being guessed at -- and this is
-    the number that says how partial. It is zero, and it is asserted rather
-    than believed because "no program hits the fallback" is a claim that goes
-    stale silently.
-
-    It was not always zero. `bf.tl` writes `Array.push(ops, match c { ... })`
-    with a `break` and a `continue` among the arms, which is a transfer inside
-    a call argument -- and the other arguments have to be bound around it to
-    stay in evaluation order. `loops._operands` is the answer, and this is what
-    would notice if a new shape arrived without one.
+    Asserted by what it prints, because getting it wrong reorders effects
+    rather than producing a term anything would reject.
     """
+    src = """
+fun main() {
+    var log = []
+    var i = 0
+    loop {
+        i = i + 1
+        Array.push(log, if i > 2 { break } else { i })
+    }
+    print(log)
+}
+"""
+    assert output(src) == "[1, 2]\n"
+
+
+# -- the question a golden cannot ask ----------------------------------------
+
+
+def test_the_loop_nodes_are_gone_from_the_ir():
+    """The whole of M16a, as one assertion.
+
+    M15e could only say "no program in the suite reaches the evaluator with a
+    loop node left", which is a claim about the suite. This is a claim about
+    the IR: there is no `CWhile` to construct, so a pass cannot emit one by
+    accident and a later milestone cannot quietly reintroduce the fallback
+    that M15e's partiality needed.
+    """
+    for name in GONE:
+        assert not hasattr(core, name), f"core.{name} is back"
+        assert name not in core.__all__
+
+
+def test_every_program_lowers_to_joins_with_nothing_declined():
+    """`loops.collapse` was partial by construction -- a shape its rules did
+    not cover left the binding alone rather than being guessed at -- and
+    `Checked.unlooped` counted how partial. The count is gone because the
+    fallback is: there is no loop node to leave behind, so a shape with no
+    rule is an error at compile time rather than a term that quietly still
+    holds a loop.
+
+    So what this asserts is that no program in the suite hits one: a shape
+    `lower.anf` has no rule for raises `Unsupported`, and compiling every
+    program is how that is noticed. `driver.check` also runs
+    `coretc.check_program` on all three stages, so a jump this pass put
+    outside a tail position fails here too, on every program, on every run.
+    """
+    jumped = 0
     for source in sorted(PROGRAMS.glob("*.tl")):
         if source.name.startswith("err_"):
             continue  # these are the programs that are supposed to be rejected
         checked = check(source.read_text(), str(source), [source.parent])
-        assert checked.unlooped == 0, f"{source.name} has an unconverted binding"
-        assert count(checked.opt, GONE) == 0, f"{source.name} kept a loop node"
+        jumped += count(checked.core, CJump)
+    assert jumped > 0, "no program in the suite lowered a transfer at all"
 
 
-def test_the_optimized_core_of_every_program_has_no_loop_nodes_left():
-    """The same claim from the other side, and the one that says the collapse
-    is a collapse: `turkey mono` still prints four loop forms, and `turkey opt`
-    prints none."""
+def test_a_program_with_loops_lowers_to_joins_and_jumps():
+    """The positive form of the same claim, on the fixture built for it."""
     source = PROGRAMS / "loops.tl"
     checked = check(source.read_text(), str(source), [source.parent])
-    assert count(checked.mono, GONE) > 0, "the fixture should have loops in it"
-    assert count(checked.opt, GONE) == 0
+    for stage in (checked.core, checked.mono, checked.opt):
+        assert count(stage, CJoin) > 0
+        assert count(stage, CJump) > 0

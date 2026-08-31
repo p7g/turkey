@@ -745,8 +745,9 @@ class _Devirtualizer:
 
     Three things fall out rather than being arranged:
 
-    * `CForIn.iter_fn` and `next_fn` are ordinary terms, so every `for` loop in
-      the suite stops projecting.
+    * A `for` loop's `iter` and `next` are ordinary terms -- `lower.py` makes
+      the loop a join point and its cursor two applications -- so every `for`
+      loop in the suite stops projecting.
     * A method's own quantification stops being a special case. A `CTyApp` over
       a `CField` -- the one form M14a said it had to leave -- becomes a
       `CTyApp` over a `CVar`, which is the form everything else already uses.

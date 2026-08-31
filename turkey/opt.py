@@ -63,9 +63,9 @@ from dataclasses import fields, replace
 
 from . import ast
 from .core import (
-    CAlt, CApp, CBind, CBreak, CCon, CContinue, CExpr, CForC, CForIn, CIf,
+    CAlt, CApp, CBind, CCon, CExpr, CIf,
     CJoin, CJump, CLam, CLet, CLetRec, CLit, CMatch, CParam, CPrim, CProgram,
-    CReturn, CTuple, CUnit, CVar, names_of,
+    CTuple, CUnit, CVar, names_of,
 )
 from .deps import pattern_vars, sccs
 from .types import TBottom
@@ -513,28 +513,41 @@ def _mentions_alts(e, alts) -> bool:
     return any(isinstance(n, CMatch) and n.alts is alts for n in _nodes(e))
 
 
-def _transfers(e) -> bool:
-    """Whether `e` contains a control transfer that leaves it.
+def _transfers(e, bound: frozenset[str] = frozenset()) -> bool:
+    """Whether `e` contains a jump that leaves it.
 
-    `return`, `break` and `continue` are still nodes rather than jumps -- item
-    7's last step is what changes that -- and they name their target by *where
-    they are*. So a body holding one cannot be moved into another function or
-    out of the lambda that bound it: the `return 0` inside `depth`, dropped
-    into `depth`'s caller, returns from the caller.
+    A term is movable when everything it transfers to travels with it. This
+    used to be a much blunter question, because `return`, `break` and
+    `continue` were nodes that named their target by *where they were*: the
+    `return 0` inside `depth`, dropped into `depth`'s caller, returns from the
+    caller, so a body holding one could not be moved at all. About one in
+    eight of the functions in the suite were un-inlinable for that reason
+    alone.
 
-    A transfer under a nested `CLam` belongs to that lambda and travels with
-    it, and is not counted. Nothing else is exempt, including the bodies of the
-    loop forms: `break` there is the loop's, and until M15e the loop is not
-    something this pass may move either.
+    A jump names its target, so the question is whether the name is bound
+    inside `e`. A function whose body holds a `return` now carries its own
+    `%ret` join *inside* its lambda, so the whole body is self-contained and
+    this answers false where it used to answer true -- which is the reduction
+    the join points were for.
+
+    A jump under a nested `CLam` cannot exist: a lambda body is out of tail
+    position and the checker gives it an empty join scope. So a lambda is not
+    descended into, and a `CJoin` extends the bound set for its `rest` always
+    and for its own `body` only when it says it is recursive, exactly as
+    `coretc._check_CJoin` does.
     """
-    if isinstance(e, (CReturn, CBreak, CContinue)):
-        return True
+    if isinstance(e, CJump):
+        return e.name not in bound
     if isinstance(e, CLam):
         return False
+    if isinstance(e, CJoin):
+        inner = bound | {e.name}
+        return (_transfers(e.body, inner if e.recursive else bound)
+                or _transfers(e.rest, inner))
     if isinstance(e, (CExpr, CBind, CAlt)):
-        return any(_transfers(getattr(e, f.name)) for f in fields(e))
+        return any(_transfers(getattr(e, f.name), bound) for f in fields(e))
     if isinstance(e, (list, tuple)):
-        return any(_transfers(x) for x in e)
+        return any(_transfers(x, bound) for x in e)
     return False
 
 
@@ -566,10 +579,9 @@ def _free_names(e) -> set[str]:
     parameter `x`, so a guard reading every mentioned name refused to inline
     `bind` at all.
 
-    Binders are read from field names, as in `_binders_of`, plus the two
-    scopes that are not simply "this field's binders cover that field": a
-    `CLet` binds only over its body, and a `CForC`'s init binds over the rest
-    of the loop.
+    Binders are read from field names, as in `_binders_of`, plus the scopes
+    that are not simply "this field's binders cover that field": a `CLet`
+    binds only over its body, and a `CJoin`'s parameters only over its own.
     """
     if e is None or isinstance(e, (str, int, float, bool)):
         return set()
@@ -593,16 +605,6 @@ def _free_names(e) -> set[str]:
         return set().union(*(_free_names(a) for a in e.args)) if e.args else set()
     if isinstance(e, CAlt):
         return _free_names(e.body) - set(pattern_vars(e.pat))
-    if isinstance(e, CForIn):
-        bound = set(pattern_vars(e.pat))
-        return ((_free_names(e.seq) | _free_names(e.iter_fn)
-                 | _free_names(e.next_fn)) | (_free_names(e.body) - bound))
-    if isinstance(e, CForC):
-        rest = (_free_names(e.cond) | _free_names(e.step)
-                | _free_names(e.body))
-        if isinstance(e.init, CLet):
-            return _free_names(e.init.value) | (rest - {e.init.name})
-        return _free_names(e.init) | rest
     if isinstance(e, (CExpr, CBind)):
         out: set[str] = set()
         for f in fields(e):
@@ -622,10 +624,12 @@ def _binders_of(e) -> set[str]:
     Driven by *field names* rather than by a case per node -- a `pat` binds
     what its pattern binds, a `params` binds its parameters' names, and a node
     that binds one name calls it `name`. A case list is what this was, and it
-    silently omitted `CForIn.pat`: the `Array` instance's `bind` walks its
-    elements in a `for`, so a continuation substituted into it was captured by
-    the very element it was meant to be applied to. A rule about field names is
-    one a node added later cannot fall outside of by accident.
+    silently omitted the pattern a `for` loop binds: the `Array` instance's
+    `bind` walks its elements in one, so a continuation substituted into it
+    was captured by the very element it was meant to be applied to. A rule
+    about field names is one a node added later cannot fall outside of by
+    accident -- and the `for` is a `CMatch` now, which is exactly the kind of
+    change that would have reintroduced the bug under a case list.
 
     An over-approximation, and in the safe direction: a name that appears here
     but binds nothing on the path to an occurrence only costs a substitution

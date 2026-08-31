@@ -65,8 +65,7 @@ def walk(e):
         return
     yield e
     for attr in ("fn", "body", "value", "target", "index", "cond", "then",
-                 "otherwise", "scrutinee", "seq", "iter_fn", "next_fn",
-                 "init", "step", "rest"):
+                 "otherwise", "scrutinee", "rest"):
         yield from walk(getattr(e, attr, None))
     for attr in ("args", "elems", "params"):
         for item in getattr(e, attr, []) or []:
@@ -415,9 +414,17 @@ fun main() { print(Int.toString(squash([1, 2, 3]))) }
 
 
 def test_a_for_loop_stops_projecting():
-    """`CForIn` carries `iter` and `next` as ordinary terms, so they are
+    """A `for` loop's `iter` and `next` are ordinary terms, so they are
     rewritten by the same rule as everything else -- which is where every
-    `for` loop in the suite was paying a projection."""
+    `for` loop in the suite was paying a projection.
+
+    They are ordinary applications by the time this sees them: `lower.py`
+    turns the loop into a join point and its cursor into two calls and a
+    match, so what used to be two fields of a `CForIn` are now two `CApp`s
+    like any other. The claim is the same one and it survived the node going
+    away, which is the point of asserting it here rather than reading a
+    golden.
+    """
     checked = check("""
 fun main() {
     var total = 0
@@ -425,12 +432,12 @@ fun main() {
     print(Int.toString(total))
 }
 """)
-    loops = [n for n in nodes(checked.mono, "Main#main")
-             if isinstance(n, core.CForIn)]
-    assert loops, "no loop found"
-    for loop in loops:
-        assert isinstance(loop.iter_fn, CVar), loop.iter_fn
-        assert isinstance(loop.next_fn, CVar), loop.next_fn
+    called = {n.fn.name for n in nodes(checked.mono, "Main#main")
+              if isinstance(n, CApp) and isinstance(n.fn, CVar)}
+    cursor = {name for name in called if name.endswith(("#iter", "#next"))}
+    assert cursor, sorted(called)
+    for name in cursor:
+        assert "%inst.Iterator.Array" in name, name
 
 
 def test_a_dictionary_parameter_is_still_projected_from():

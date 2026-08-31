@@ -103,12 +103,12 @@ def test_a_body_that_used_to_hold_a_return_is_inlined_now():
     printed one line of four. The pass refused to inline any such body, which
     was one function in eight across the suite.
 
-    `loops.collapse` runs first now and makes that `return` a jump to a join
-    point in the function's own body, and a join point travels with the term it
-    is in. So the refusal is gone and the call is inlined. `opt._transfers`
-    still guards, because `turkey/lower.py` still emits the nodes and this pass
-    is partial by design -- but on a term it converted, there is nothing left
-    for the guard to find.
+    `turkey/lower.py` makes that `return` a jump to a `%ret` join in the
+    function's own body, and a join point travels with the term it is in. So
+    the refusal is gone and the call is inlined. `opt._transfers` still
+    guards, but it asks a sharper question now -- whether a jump names a join
+    bound *outside* the term being moved -- and on a whole function body the
+    answer is no.
     """
     program = optimized("""
 fun guard(n : Int) -> Int {

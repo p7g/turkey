@@ -1,14 +1,14 @@
--- The four loop forms, and what they all become (plan.txt item 7, M15e).
+-- The four loop forms, and what they all become (plan.txt item 7, M16a).
 --
 -- `while`, `loop`, the C-style `for` and `for ... in` are four constructs in
--- the surface language and four nodes in Core, and `loops.opt` is where they
--- are one: a recursive join point and the jumps into it. `return`, `break` and
--- `continue`, which named their target by where they sat, are jumps that name
--- it.
+-- the surface language and *none* in Core: `turkey/lower.py` makes each of
+-- them a recursive join point and the jumps into it, on the way down from the
+-- AST. `return`, `break` and `continue`, which named their target by where
+-- they sat, are jumps that name it.
 --
 -- Read the golden for the shape of each. `loops.mono` beside it is the same
--- program with the loops still in it, which is what makes the pair worth
--- having: the two files are the before and after of one pass.
+-- program before the optimizer runs -- both already in join points, since
+-- there is no stage of the pipeline at which a loop node exists to be seen.
 
 -- `while`, with a `var` the body writes. The cell survives the collapse -- a
 -- join point's parameters are not what a mutable binding is.

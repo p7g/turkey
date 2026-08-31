@@ -23,7 +23,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import ast, coretc, desugar, joins, loops, lower, mono, opt
+from . import ast, coretc, desugar, joins, lower, mono, opt
 from .builtins import initial_type_env, initial_values
 from .classes import ClassTable
 from .constraints import Env, Solver
@@ -56,7 +56,6 @@ class Checked:
     core: CProgram  # the elaboration, as a checked datatype (M13b)
     mono: CProgram  # the elaboration specialized, checked the same way (M14a)
     opt: CProgram  # and optimized, checked again (M15b)
-    unlooped: int  # bindings `loops.collapse` declined to touch (M15e)
     module: str  # the entry module's name, for `turkey core`
 
 
@@ -122,14 +121,13 @@ def check(src: str, file: str | None = None,
     # scope. A pass that called a position a tail when the rule does not emits
     # a jump with nowhere to go, and this is where that is caught -- on every
     # program in the suite, on every run. See turkey/joins.py.
-    program_loops, refused = loops.collapse(program_mono, decls)
-    program_opt = joins.discover(opt.reduce_program(program_loops))
+    program_opt = joins.discover(opt.reduce_program(program_mono))
     coretc.check_program(program_opt, decls, classes, coretc.globals_of(env))
     return Checked(
         entry.program, ordered, decls, classes, env, loader.order,
         entry.scope.values, main,
         _signatures(entry, env, classes), warnings, types,
-        program_core, program_mono, program_opt, refused, entry.name,
+        program_core, program_mono, program_opt, entry.name,
     )
 
 

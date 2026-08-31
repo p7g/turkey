@@ -70,20 +70,29 @@ from dataclasses import dataclass, field
 from . import ast, core, prelude
 from .classes import ClassTable, InstInfo, match
 from .core import (
-    CAlt, CApp, CArray, CAssign, CBind, CBreak, CCon, CContinue, CDeref, CExpr,
-    CField, CForC, CForIn, CIf, CIndex, CLam, CLet, CLetRec, CLit, CLoop,
-    CMatch, CParam, CProgram, CRecord, CRef, CReturn, CTuple, CTyApp, CTyLam,
-    CUnit, CVar, CWhile, ref_of,
+    CAlt, CApp, CArray, CAssign, CBind, CCon, CDeref, CExpr,
+    CField, CIf, CIndex, CJoin, CJump, CLam, CLet, CLetRec, CLit,
+    CMatch, CParam, CProgram, CRecord, CRef, CTuple, CTyApp, CTyLam,
+    CUnit, CVar, ref_of,
 )
 from .decls import DeclTable, substitute
-from .errors import Span
+from .errors import Span, Unsupported
 from .evidence import (
     Absent, Evidence, FromDict, FromInstance, InstancePlan, MethodImpl, Use,
 )
 from .types import (
-    BOOL, EQUALS, KFun, STAR, TApp, TCon, TFam, TFun, TTuple, TVar, Type,
-    prune,
+    BOOL, EQUALS, KFun, STAR, TApp, TBottom, TCon, TFam, TFun, TTuple, TVar,
+    Type, prune, spine,
 )
+
+UNIT = TCon("Unit")
+
+# The surface forms that this pass turns into join points rather than into
+# nodes of their own. There is no Core node for any of them: `core.py` used to
+# hold four loops and three transfers, and what replaced them is the `CJoin`
+# and `CJump` that were already there for M15a.
+LOOPS = (ast.EWhile, ast.ELoop, ast.EForC, ast.EForIn)
+TRANSFERS = (ast.EReturn, ast.EBreak, ast.EContinue)
 
 _counter = itertools.count()
 
@@ -146,9 +155,18 @@ class Scope:
     # record. System-F still wants the application, and at the binding's own
     # variables, which is what this remembers.
     binders: dict[str, list[TVar]] = field(default_factory=dict)
+    # Where a `return`, a `break` and a `continue` written here jump to. Each
+    # is a join name, or None where writing that transfer would have been a
+    # compile error anyway -- a `break` outside a loop, a `return` outside a
+    # function. This is what replaces "the transfer names its target by where
+    # it sits": the scope chain already knows where it sits, so it can say.
+    ret: str | None = None
+    brk: str | None = None
+    cont: str | None = None
 
     def child(self) -> "Scope":
-        return Scope(set(self.cells), dict(self.binders))
+        return Scope(set(self.cells), dict(self.binders),
+                     self.ret, self.brk, self.cont)
 
 
 class Lowerer:
@@ -161,6 +179,10 @@ class Lowerer:
         # stands for which quantified variable. Empty everywhere else, because
         # nothing else is checked against skolems. See `MethodImpl.skolems`.
         self.rigid: dict[str, TVar] = {}
+        # Surface expressions already lowered, by object identity, and what
+        # they lowered to. Only `anf` puts anything here, and only for as long
+        # as it takes to rebuild one node around its operands. See `anf`.
+        self.placeholders: dict[int, CExpr] = {}
 
     # -- the program -------------------------------------------------------
 
@@ -573,7 +595,20 @@ class Lowerer:
             inner.cells.discard(shadow)
         inner.cells.update(name for name, _ in cells)
         inner.cells.update(name for name, _ in pattern_cells)
-        out = self.expr(body, inner)
+        # A lambda is its own function: the `return` in it is this one's, and
+        # the `break` in it cannot be an enclosing loop's, because a closure
+        # outlives the frame that bound that loop's join. So all three targets
+        # start again here, and `return` gets one exactly where the body has a
+        # `return` to use it -- a function that never returns early reads as it
+        # always did.
+        inner.ret = inner.brk = inner.cont = None
+        joined = None
+        if _has_return(body):
+            joined = (fresh_name("ret"), fresh_name("rv"), fn.ret)
+            inner.ret = joined[0]
+            out = self.conv(body, inner, joined[0])
+        else:
+            out = self.expr(body, inner)
         for cell_name, cell_ty in reversed(pattern_cells):
             out = CLet(out.ty, span, cell_name, ref_of(cell_ty),
                        CRef(ref_of(cell_ty), span,
@@ -587,11 +622,31 @@ class Lowerer:
             out = CLet(out.ty, span, cell_name, ref_of(cell_ty),
                        CRef(ref_of(cell_ty), span, CVar(cell_ty, span, cell_name)),
                        out)
+        if joined is not None:
+            ret_name, value_name, result = joined
+            out = CJoin(result, span, ret_name, [CParam(value_name, result)],
+                        CVar(result, span, value_name), out, False)
         return CLam(fn, span, cparams, out, name)
 
     # -- expressions -------------------------------------------------------
 
     def expr(self, e: ast.Expr, scope: Scope) -> CExpr:
+        """One expression, as a term whose value is the value of the whole.
+
+        Three answers, in the order they are asked for. A node `anf` has
+        already lowered stands for what it lowered to. A node holding a loop
+        or a transfer goes to `conv`, which is the only thing that knows how
+        to give those a value. Everything else is the ordinary walk, which is
+        what almost every node in almost every program is.
+        """
+        held = self.placeholders.get(id(e))
+        if held is not None:
+            return held
+        if _special(e):
+            return self.conv(e, scope, None)
+        return self.dispatch(e, scope)
+
+    def dispatch(self, e: ast.Expr, scope: Scope) -> CExpr:
         method = getattr(self, "_lower_" + type(e).__name__, None)
         if method is None:
             raise AssertionError(f"cannot lower {type(e).__name__}")
@@ -821,43 +876,468 @@ class Lowerer:
                     scope.child(), arm.span)))
         return CMatch(self.ty_of(e), e.span, self.expr(e.scrutinee, scope), alts)
 
-    def _lower_EWhile(self, e: ast.EWhile, scope: Scope) -> CExpr:
-        return CWhile(self.ty_of(e), e.span, self.expr(e.cond, scope),
-                      self.expr(e.body, scope.child()))
-
-    def _lower_ELoop(self, e: ast.ELoop, scope: Scope) -> CExpr:
-        return CLoop(self.ty_of(e), e.span, self.expr(e.body, scope.child()))
-
-    def _lower_EForC(self, e: ast.EForC, scope: Scope) -> CExpr:
-        inner = scope.child()
-        init = None if e.init is None else self.stmt_value(e.init, inner)
-        cond = self.expr(e.cond, inner)
-        step = None if e.step is None else self.stmt_value(e.step, inner)
-        return CForC(self.ty_of(e), e.span, init, cond, step,
-                     self.expr(e.body, inner.child()))
-
-    def _lower_EForIn(self, e: ast.EForIn, scope: Scope) -> CExpr:
-        assert e.iter_fn is not None and e.next_fn is not None
-        inner = scope.child()
-        return CForIn(
-            self.ty_of(e), e.span, e.pat, self.expr(e.iterable, scope),
-            self.var(e.iter_fn, scope), self.var(e.next_fn, scope),
-            self.expr(e.body, inner),
-        )
-
-    def _lower_EReturn(self, e: ast.EReturn, scope: Scope) -> CExpr:
-        value = None if e.value is None else self.expr(e.value, scope)
-        return CReturn(self.ty_of(e), e.span, value)
-
-    def _lower_EBreak(self, e: ast.EBreak, scope: Scope) -> CExpr:
-        value = None if e.value is None else self.expr(e.value, scope)
-        return CBreak(self.ty_of(e), e.span, value)
-
-    def _lower_EContinue(self, e: ast.EContinue, scope: Scope) -> CExpr:
-        return CContinue(self.ty_of(e), e.span)
-
     def _lower_EBlock(self, e: ast.EBlock, scope: Scope) -> CExpr:
         return self.block(e.stmts, self.ty_of(e), e.span, scope.child())
+
+    # -- loops and transfers, as join points -------------------------------
+    #
+    # `while`, `loop`, the C-style `for` and `for ... in` are four constructs
+    # in the surface language and none in Core, and `return`, `break` and
+    # `continue`, which named their target by where they sat, are `CJump`s
+    # that name it. Core holds no node for any of the seven, which is what
+    # makes a term that names its target by position unrepresentable rather
+    # than merely absent.
+    #
+    # The shape. Every function whose body contains a `return` is wrapped in
+    # a join (`lambda_of`):
+    #
+    #     fun(x) { join %ret(%rv) = %rv in <body, every return a jump to %ret> }
+    #
+    # and every loop becomes one recursive join and, when nothing is already
+    # waiting for the loop's value, one more for what follows it:
+    #
+    #     join %af(%v) = <what follows>
+    #     in join rec %lp() = <one iteration, ending in a jump to %lp or %af>
+    #        in jump %lp()
+    #
+    # `break` jumps to `%af` and `continue` to `%lp` -- or, for a C-style
+    # `for`, to a third join holding the step, since `continue` there runs the
+    # step before the test. A loop in a statement position is already a `let`
+    # binding it, so `%af` is that continuation and the common case adds one
+    # join rather than two.
+
+    def conv(self, e: ast.Expr, scope: Scope, k: str | None) -> CExpr:
+        """`e`, lowered so that its value reaches `k`.
+
+        `k` is a join name, or None meaning "the value of this term is the
+        value of the term it stands in". Every rule below either produces a
+        value in place or ends in a jump, which is what makes the result
+        satisfy `core.TAIL_FIELDS` without any rule having to check it.
+        """
+        held = self.placeholders.get(id(e))
+        if held is not None:
+            return self.finish(held, k)
+        if not _special(e):
+            return self.finish(self.dispatch(e, scope), k)
+        if isinstance(e, ast.EAnnot):
+            return self.conv(e.expr, scope, k)
+        if isinstance(e, ast.EReturn):
+            return self.transfer(scope.ret, e.value, e.span, scope,
+                                 "a 'return' outside a function")
+        if isinstance(e, ast.EBreak):
+            return self.transfer(scope.brk, e.value, e.span, scope,
+                                 "a 'break' outside a loop")
+        if isinstance(e, ast.EContinue):
+            if scope.cont is None:
+                raise Unsupported("a 'continue' outside a loop", e.span)
+            return CJump(TBottom(), e.span, scope.cont, [])
+        if isinstance(e, ast.EBlock):
+            return self.conv_block(e.stmts, self.ty_of(e), e.span,
+                                   scope.child(), k)
+        if isinstance(e, ast.EIf):
+            return self.conv_if(e, scope, k)
+        if isinstance(e, ast.EMatch):
+            return self.conv_match(e, scope, k)
+        if isinstance(e, ast.EBinary) and e.op in ("&&", "||"):
+            return self.conv_shortcircuit(e, scope, k)
+        if isinstance(e, LOOPS):
+            return self.loop(e, scope, k)
+        return self.anf(e, scope, k)
+
+    def finish(self, value: CExpr, k: str | None) -> CExpr:
+        return value if k is None else CJump(TBottom(), value.span, k, [value])
+
+    def transfer(self, target: str | None, value: ast.Expr | None, span,
+                 scope: Scope, complaint: str) -> CExpr:
+        """`return e` and `break e`, which carry a value where `continue` does
+        not. A bare one carries unit, which is what the value of the thing it
+        leaves already was."""
+        if target is None:
+            raise Unsupported(complaint, span)
+        if value is None:
+            return CJump(TBottom(), span, target, [CUnit(UNIT, span)])
+        return self.conv(value, scope, target)
+
+    def conv_if(self, e: ast.EIf, scope: Scope, k: str | None) -> CExpr:
+        """An `if` whose branches are the interesting part.
+
+        A jump goes in each branch and `k` is a *name*, so the continuation is
+        shared rather than copied -- which is the property join points exist
+        for, and the reason this can be written at all without a code-size
+        argument attached.
+
+        An `if` with no `else` still has to reach `k` when it takes the branch
+        that is not written: `if c { return None }` in a statement position
+        falls through with unit, and a fall-through is exactly what `conv`
+        promises not to leave. So the missing arm is supplied -- but only
+        where a jump is actually owed.
+        """
+        ty = self.ty_of(e)
+
+        def build(cond: CExpr) -> CExpr:
+            then = self.conv(e.then, scope, k)
+            if e.otherwise is not None:
+                otherwise = self.conv(e.otherwise, scope, k)
+            elif k is not None:
+                otherwise = self.finish(CUnit(UNIT, e.span), k)
+            else:
+                otherwise = None
+            return CIf(ty, e.span, cond, then, otherwise)
+
+        return self.scrutinized(e.cond, ty, e.span, scope, build)
+
+    def conv_match(self, e: ast.EMatch, scope: Scope, k: str | None) -> CExpr:
+        ty = self.ty_of(e)
+
+        def build(scrutinee: CExpr) -> CExpr:
+            alts = []
+            for arm in e.arms:
+                for pat in arm.patterns:
+                    alts.append(CAlt(pat, self.celled(
+                        pat, arm.body,
+                        lambda inner: self.conv(arm.body, inner, k),
+                        scope.child(), arm.span)))
+            return CMatch(ty, e.span, scrutinee, alts)
+
+        return self.scrutinized(e.scrutinee, ty, e.span, scope, build)
+
+    def scrutinized(self, e: ast.Expr, ty: Type, span, scope: Scope,
+                    build) -> CExpr:
+        """A branch whose *scrutinee* may itself hold a transfer, which has to
+        run before the branch is taken and so becomes a join of its own."""
+        if not _special(e):
+            return build(self.expr(e, scope))
+        name, value = fresh_name("on"), fresh_name("sv")
+        held = self.ty_of(e)
+        return CJoin(ty, span, name, [CParam(value, held)],
+                     build(CVar(held, span, value)),
+                     self.conv(e, scope, name), False)
+
+    def conv_shortcircuit(self, e: ast.EBinary, scope: Scope,
+                          k: str | None) -> CExpr:
+        """`&&` and `||`, whose right operand a transfer must not escape past.
+
+        `_lower_EBinary` makes these the `if` they already mean; this makes the
+        same `if`, with the branches converted, so that a `break` on the right
+        of an `&&` is taken only when the left was true.
+        """
+        ty = self.ty_of(e)
+        name = fresh_name("b")
+
+        def build(left: CExpr) -> CExpr:
+            held = CVar(left.ty, e.span, name)
+            right = self.conv(e.right, scope, k)
+            kept = self.finish(held, k)
+            branch = (CIf(ty, e.span, held, right, kept) if e.op == "&&"
+                      else CIf(ty, e.span, held, kept, right))
+            return CLet(ty, e.span, name, left.ty, left, branch)
+
+        return self.scrutinized(e.left, ty, e.span, scope, build)
+
+    def anf(self, e: ast.Expr, scope: Scope, k: str | None) -> CExpr:
+        """A node whose *operands* hold a transfer: `push(ops, match c {...})`.
+
+        `bf.tl` writes exactly that, with a `break` and a `continue` among the
+        arms, and it is the one shape in the suite that none of the rules
+        above covers. What makes it awkward is evaluation order: hoisting the
+        `match` out and leaving `ops` in place would evaluate `ops` after it,
+        and the evaluator is strict and left to right.
+
+        So every operand up to and including the last special one is bound, in
+        order, each to a join whose body is the next -- which is A-normal form,
+        arrived at because the order has to be preserved rather than because
+        the form is desirable. Operands after the last special one are left
+        where they are: nothing has moved past them.
+
+        The node itself is then lowered by its ordinary rule, with the bound
+        operands standing for what they were bound to. That is what
+        `placeholders` is: `_lower_ECall` neither knows nor needs to know that
+        one of its arguments arrived as a jump.
+        """
+        children = _operands(e)
+        if children is None or not any(_special(c) for c in children):
+            raise Unsupported(
+                f"a control transfer inside a {type(e).__name__}", e.span)
+        last = max(i for i, c in enumerate(children) if _special(c))
+        bound = children[:last + 1]
+        joins = [(fresh_name("arg"), fresh_name("av")) for _ in bound]
+        for child, (_, value) in zip(bound, joins):
+            self.placeholders[id(child)] = CVar(self.ty_of(child), e.span, value)
+        try:
+            made = self.finish(self.dispatch(e, scope), k)
+        finally:
+            for child in bound:
+                self.placeholders.pop(id(child), None)
+        ty = self.ty_of(e)
+        for (name, value), child in zip(reversed(joins), reversed(bound)):
+            made = CJoin(ty, e.span, name,
+                         [CParam(value, self.ty_of(child))], made,
+                         self.conv(child, scope, name), False)
+        return made
+
+    # -- the four loop forms -----------------------------------------------
+
+    def loop(self, e: ast.Expr, scope: Scope, k: str | None) -> CExpr:
+        """Any of the four, as a recursive join and the jumps into it.
+
+        One `join rec` for the iteration and, when there is nothing already
+        waiting for the loop's value, one more for what follows it. Then the
+        four forms differ only in what one iteration is, which is what
+        `iteration` says and all that it says.
+        """
+        ty = self.ty_of(e)
+        after, wrapper = k, None
+        if after is None:
+            after = fresh_name("af")
+            wrapper = CParam(fresh_name("av"), ty)
+
+        name = fresh_name("lp")
+        inner = scope.child()
+        inner.brk = after
+        pending, body = self.iteration(e, inner, name, after)
+
+        made: CExpr = CJoin(TBottom(), e.span, name, [], body,
+                            CJump(TBottom(), e.span, name, []), True)
+        for bound, bound_ty, value in reversed(pending):
+            made = CLet(TBottom(), e.span, bound, bound_ty, value, made)
+        if wrapper is None:
+            return made
+        return CJoin(ty, e.span, after, [wrapper],
+                     CVar(ty, e.span, wrapper.name), made, False)
+
+    def iteration(self, e: ast.Expr, scope: Scope, name: str, after: str):
+        """One turn of the loop, and whatever bindings stand outside it.
+
+        `while c { b }` *is* `if c { b; continue } else { break }`, and saying
+        so here leaves one rule to be right about instead of four. `scope`
+        already carries the `break` target; what each form decides is where
+        its `continue` goes and what runs before the test.
+        """
+        span = e.span
+        stop = CJump(TBottom(), span, after, [CUnit(UNIT, span)])
+        if isinstance(e, ast.ELoop):
+            scope.cont = name
+            return [], self.seq_then(e.body, scope.child(),
+                                     CJump(TBottom(), span, name, []))
+        if isinstance(e, ast.EWhile):
+            scope.cont = name
+            cond = self.expr(e.cond, scope)
+            body = self.seq_then(e.body, scope.child(),
+                                 CJump(TBottom(), span, name, []))
+            return [], CIf(TBottom(), span, cond, body, stop)
+        if isinstance(e, ast.EForC):
+            return self.for_c(e, scope, name, stop)
+        assert isinstance(e, ast.EForIn)
+        return self.for_in(e, scope, name, stop)
+
+    def for_c(self, e: ast.EForC, scope: Scope, name: str, stop: CExpr):
+        """The C-style `for`, whose `continue` runs the step before the test.
+
+        So the step is a join of its own, and every `continue` this loop owns
+        -- the written ones and the one that falls off the end of the body --
+        names that rather than the loop's. Which is the whole of the
+        difference between this and a `while`, and the reason nothing has to
+        be duplicated at each `continue`.
+
+        The init and the step are lowered in the loop's own scope, not in a
+        child of it: `for var i = 0` binds `i` over the condition, the step
+        and the body alike.
+        """
+        span = e.span
+        pending: list[tuple[str, Type, CExpr]] = []
+        if e.init is not None:
+            init = self.stmt_value(e.init, scope)
+            if isinstance(init, CLet):
+                pending.append((init.name, init.bound, init.value))
+            else:
+                pending.append((fresh_name("seq"), init.ty, init))
+        cond = self.expr(e.cond, scope)
+        step = None
+        if e.step is not None:
+            value = self.stmt_value(e.step, scope)
+            # `stmt_value` hands back a `let` whose body is a placeholder,
+            # because a `for`'s init and step bind over the *loop* rather than
+            # over a body of their own. The init's binding is hoisted out
+            # above the loop join; what runs each turn is the step's value.
+            if isinstance(value, CLet):
+                value = value.value
+            step = (fresh_name("st"), value)
+        scope.cont = name if step is None else step[0]
+        body = CIf(TBottom(), span, cond,
+                   self.seq_then(e.body, scope.child(),
+                                 CJump(TBottom(), span, scope.cont, [])),
+                   stop)
+        if step is not None:
+            joined, value = step
+            ran = CLet(TBottom(), span, fresh_name("seq"), value.ty, value,
+                       CJump(TBottom(), span, name, []))
+            body = CJoin(TBottom(), span, joined, [], ran, body, False)
+        return pending, body
+
+    def for_in(self, e: ast.EForIn, scope: Scope, name: str, stop: CExpr):
+        """`for p in seq`, with the cursor made explicit.
+
+        design.md 6.5's elaboration, which `core.py` used to leave as a note
+        saying a later pass should perform it. The two calls already carry the
+        `Iterator` dictionary -- that is why they are ordinary uses on the AST
+        node rather than something this has to find -- so what is added here is
+        the cursor binding and the `Option` match that reads `next`'s answer.
+
+        Done here rather than after monomorphization, which is the point of
+        doing it at all: `coretc.check_program` runs on this pass's output, so
+        the cursor and the match are checked rather than taken on trust.
+        """
+        assert e.iter_fn is not None and e.next_fn is not None
+        span = e.span
+        seq = self.expr(e.iterable, scope)
+        iter_fn = self.var(e.iter_fn, scope)
+        next_fn = self.var(e.next_fn, scope)
+        next_ty = prune(next_fn.ty)
+        if not isinstance(next_ty, TFun) or len(next_ty.params) != 2:
+            raise Unsupported("a 'for' whose `next` is not a cursor step", span)
+        cursor_ty, option_ty = next_ty.params[1], next_ty.ret
+        some, none = self.option_parts(option_ty, span)
+
+        seq_name, cur_name = fresh_name("sq"), fresh_name("cu")
+        pending = [
+            (seq_name, seq.ty, seq),
+            (cur_name, cursor_ty,
+             CApp(cursor_ty, span, iter_fn, [CVar(seq.ty, span, seq_name)])),
+        ]
+        step = CApp(option_ty, span, next_fn,
+                    [CVar(seq.ty, span, seq_name),
+                     CVar(cursor_ty, span, cur_name)])
+        scope.cont = name
+        body = self.seq_then(e.body, scope.child(),
+                             CJump(TBottom(), span, name, []))
+        return pending, CMatch(TBottom(), span, step, [
+            CAlt(ast.PCon(span, none, []), stop),
+            CAlt(ast.PCon(span, some, [e.pat]), body),
+        ])
+
+    def option_parts(self, ty: Type, span) -> tuple[str, str]:
+        """The `Option` constructors, found from the type `next` answers.
+
+        By the type rather than by name: the Prelude's `Option` is an ordinary
+        declaration under an ordinary qualified name, and a pass that spelled
+        that name out would be one more thing to keep in agreement with it.
+        """
+        head, args = spine(prune(ty))
+        if not isinstance(head, TCon) or not args:
+            raise Unsupported("a 'for' whose `next` answers no Option", span)
+        cons = [(cname, info)
+                for cname, info in self.decls.constructors.items()
+                if info.tycon == head.name]
+        some = [n for n, i in cons if i.arity == 1]
+        none = [n for n, i in cons if i.arity == 0]
+        if len(some) != 1 or len(none) != 1:
+            raise Unsupported(f"'{head.name}' is not shaped like an Option",
+                              span)
+        return some[0], none[0]
+
+    def seq_then(self, e: ast.Expr, scope: Scope, after: CExpr) -> CExpr:
+        """`e; after` -- `e` run for its effect, and then `after`.
+
+        A loop body is this: it is run, its value is discarded, and what
+        follows is the jump that goes round again. When the body itself holds
+        a transfer the discarding has to be a join, since a `let` has nowhere
+        for a jump to land.
+        """
+        if not _special(e):
+            value = self.expr(e, scope)
+            return CLet(after.ty, e.span, fresh_name("seq"), value.ty, value,
+                        after)
+        name, value_name = fresh_name("bind"), fresh_name("bv")
+        return CJoin(after.ty, e.span, name,
+                     [CParam(value_name, self.ty_of(e))], after,
+                     self.conv(e, scope, name), False)
+
+    # -- statements, in the presence of a transfer -------------------------
+
+    def conv_block(self, stmts: list[ast.Stmt], ty: Type, span: Span | None,
+                   scope: Scope, k: str | None) -> CExpr:
+        """`block`, for a statement sequence one of whose statements holds a
+        transfer. The same shape, with the value of the last statement reaching
+        `k` and every earlier one still a binding around what follows it."""
+        if not stmts:
+            return self.finish(CUnit(ty, span), k)
+        head, rest = stmts[0], stmts[1:]
+        if not rest:
+            if isinstance(head, ast.SExpr):
+                return self.conv(head.expr, scope, k)
+            return self.conv_bind(head, lambda: self.finish(CUnit(ty, span), k),
+                                  ty, span, scope)
+        if isinstance(head, ast.SFun):
+            group = [head]
+            while rest and isinstance(rest[0], ast.SFun):
+                group.append(rest[0])
+                rest = rest[1:]
+            for stmt in group:
+                scope.binders[stmt.decl.name] = self.fun_binders(stmt.decl)
+            binds = [self.local_fun(stmt.decl, scope) for stmt in group]
+            return CLetRec(ty, span, binds,
+                           self.conv_block(rest, ty, span, scope, k))
+        return self.conv_bind(
+            head, lambda: self.conv_block(rest, ty, span, scope, k),
+            ty, span, scope)
+
+    def conv_bind(self, stmt: ast.Stmt, rest, ty: Type, span: Span | None,
+                  scope: Scope) -> CExpr:
+        """One statement, as a binding around everything after it.
+
+        When the value being bound holds a transfer that leaves it -- a
+        `return` in a branch of an `if` that is being bound -- the binding
+        becomes a join: the value runs first and jumps to it, and the join's
+        body is the rest. Which is exactly what a `let` already means, said in
+        a form a jump can land in.
+        """
+        if isinstance(stmt, ast.SFun):
+            scope.binders[stmt.decl.name] = self.fun_binders(stmt.decl)
+            return CLetRec(ty, stmt.span, [self.local_fun(stmt.decl, scope)],
+                           rest())
+        source = stmt.value if isinstance(stmt, (ast.SLet, ast.SVar, ast.SAssign)) \
+            else stmt.expr if isinstance(stmt, ast.SExpr) else None
+        if source is None or not _special(source):
+            return self.bind(stmt, rest, ty, span, scope)
+        # The value transfers. It gets a join, whose parameter is the bound
+        # name itself where there is one, so that nothing is bound twice.
+        held = self.ty_of(source)
+        if isinstance(stmt, (ast.SLet, ast.SVar)):
+            bare = _unannot(stmt.pat)
+            if not isinstance(bare, ast.PVar):
+                raise Unsupported(
+                    "a control transfer in a destructuring binding", stmt.span)
+            if self.let_binders(stmt):
+                raise Unsupported(
+                    "a control transfer under a polymorphic 'let'", stmt.span)
+            joined, value_name = fresh_name("bind"), fresh_name("bv")
+            held_var = CVar(held, stmt.span, value_name)
+            # The value is converted *before* the rest, because the rest is
+            # lowered under whatever this binding did to the scope -- a `var`
+            # becomes a cell, and every mention of it after this point has to
+            # be a read of that cell.
+            value = self.conv(source, scope, joined)
+            scope.binders[bare.name] = []
+            if isinstance(stmt, ast.SVar):
+                scope.cells.add(bare.name)
+                cell = CRef(ref_of(held), stmt.span, held_var)
+                body: CExpr = CLet(ty, stmt.span, bare.name, cell.ty, cell,
+                                   rest())
+            else:
+                body = CLet(ty, stmt.span, bare.name, held, held_var, rest())
+            return CJoin(ty, stmt.span, joined, [CParam(value_name, held)],
+                         body, value, False)
+        name = fresh_name("bind")
+        value_name = fresh_name("bv")
+        self.placeholders[id(source)] = CVar(held, stmt.span, value_name)
+        try:
+            made = (self.assign(stmt, scope) if isinstance(stmt, ast.SAssign)
+                    else self.expr(source, scope))
+        finally:
+            self.placeholders.pop(id(source), None)
+        after = CLet(ty, stmt.span, fresh_name("seq"), made.ty, made, rest())
+        return CJoin(ty, stmt.span, name, [CParam(value_name, held)], after,
+                     self.conv(source, scope, name), False)
 
     # -- statements, which Core does not have ------------------------------
 
@@ -1175,6 +1655,80 @@ def _free_vars(t: Type) -> list[TVar]:
 
     go(t)
     return out
+
+
+def _walk(node):
+    """Every AST child of `node`, without descending into a nested function.
+
+    A lambda and a local `fun` are their own functions: the `return` in one is
+    that one's, and it travels with it. Every question this file asks about
+    what a body *contains* stops there for that reason, so the stopping is
+    written once here rather than in each of them.
+    """
+    import dataclasses
+    if isinstance(node, (ast.ELambda, ast.SFun)):
+        return
+    if isinstance(node, (list, tuple)):
+        for item in node:
+            yield from _walk(item)
+        return
+    if not dataclasses.is_dataclass(node) or not isinstance(node, ast.Node):
+        return
+    for f in dataclasses.fields(node):
+        held = getattr(node, f.name)
+        if isinstance(held, ast.Node):
+            yield held
+        elif isinstance(held, (list, tuple)):
+            for item in held:
+                if isinstance(item, ast.Node):
+                    yield item
+
+
+def _holds(node, kinds) -> bool:
+    if isinstance(node, kinds):
+        return True
+    return any(_holds(child, kinds) for child in _walk(node))
+
+
+def _special(e) -> bool:
+    """Whether `e` holds a loop or a transfer outside any nested function.
+
+    The question `conv` exists to answer: a term for which this is false has
+    nothing in it that a join point is needed for, and is lowered by the
+    ordinary walk.
+    """
+    return _holds(e, LOOPS + TRANSFERS)
+
+
+def _has_return(e) -> bool:
+    """Whether a function body needs a `%ret` join at all."""
+    return _holds(e, ast.EReturn)
+
+
+def _operands(e: ast.Expr) -> list[ast.Expr] | None:
+    """The subterms of `e` that are evaluated, in the order they are evaluated.
+
+    Taken from what this file lowers each node to and what `eval.py` then does
+    with it, which is not the same as the field order. A node absent from this
+    table cannot be A-normalized, and a transfer inside one is declined rather
+    than guessed at -- including `&&` and `||`, whose right operand is not
+    unconditionally evaluated and which `conv_shortcircuit` handles instead.
+    """
+    if isinstance(e, ast.ECall):
+        return [e.fn, *e.args]
+    if isinstance(e, (ast.ETuple, ast.EArray)):
+        return list(e.elems)
+    if isinstance(e, ast.ERecord):
+        return [v for _, v in e.fields]
+    if isinstance(e, ast.EIndex):
+        return [e.arr, e.index]
+    if isinstance(e, ast.EField):
+        return [e.obj]
+    if isinstance(e, ast.EUnary):
+        return [e.operand]
+    if isinstance(e, ast.EBinary) and e.op not in ("&&", "||"):
+        return [e.left, e.right]
+    return None
 
 
 def _assigned(node) -> set[str]:

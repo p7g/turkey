@@ -39,7 +39,7 @@ from . import ast
 from .classes import ClassTable, InstInfo, MethodInfo, match
 from .decls import substitute
 from .errors import Span, TypeError_
-from .types import Pred, TBottom, Type, show_pred
+from .types import Pred, Scheme, TBottom, Type, show_pred
 
 _counter = itertools.count()
 
@@ -128,6 +128,20 @@ class Abstraction:
 
     params: list[str] = field(default_factory=list)
     preds: list[Pred] = field(default_factory=list)
+    # The scheme each name in the group ended up with, filled in beside the
+    # parameters and by the same loop. A *local* binding's scheme is otherwise
+    # unrecoverable: it is defined into a child environment that is popped as
+    # soon as the body is solved, so by the time anything lowers the tree there
+    # is nowhere left to ask what `fun go()` was generalized to. The lowering
+    # needs it for the same reason it needs `params` -- to know what the
+    # binding abstracts over, types this time rather than dictionaries.
+    schemes: dict[str, Scheme] = field(default_factory=dict)
+    # For a group that is one *signature-checked* declaration: which rigid
+    # constant stands for which of the signature's variables. A declared type
+    # is checked against skolems (delta 38), so the body's recorded types name
+    # constants where the scheme names variables. Same need, and same shape, as
+    # `MethodImpl.skolems`.
+    skolems: dict[int, Type] = field(default_factory=dict)
 
 
 @dataclass
@@ -173,6 +187,14 @@ class MethodImpl:
     decl: ast.FunDecl
     self_name: str
     dict_params: list[str] = field(default_factory=list)
+    # Which rigid constant stands for which quantified variable, while this
+    # body is being checked. A method body is checked against skolems (M10c) --
+    # the instance's variables *and* the method's own -- so every type recorded
+    # inside it names constants, while the type the class declares names
+    # variables. They are the same types, and this is the only record of which
+    # constant is which variable. A lowering that ignored it would put `l`
+    # where the dictionary's binder belongs.
+    skolems: dict[int, Type] = field(default_factory=dict)
 
 
 @dataclass

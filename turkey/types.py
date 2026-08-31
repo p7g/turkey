@@ -1069,7 +1069,11 @@ def show(t: Type, names: dict[int, str] | None = None, free_prefix: str = "",
     monomorphic `Array _a` is not mistaken for a polymorphic `Array a`.
     """
     names = names if names is not None else {}
-    unnamed = [0]
+    # Start after whatever the caller already named. A shared `names` is how
+    # several types are rendered as one story -- a Core binding's `forall`, its
+    # own type and its body all name a variable alike -- and restarting the
+    # counter would call the second call's first new variable `a` as well.
+    unnamed = [len(names)]
 
     def go(ty: Type, prec: int) -> str:
         ty = prune(ty)

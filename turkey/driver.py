@@ -23,7 +23,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import ast, desugar
+from . import ast, coretc, desugar, lower
 from .builtins import initial_type_env, initial_values
 from .classes import ClassTable
 from .constraints import Env, Solver
@@ -35,6 +35,7 @@ from .evidence import Elaborator
 from .infer import Generator
 from .modules import ENTRY, SEP, Module, ModuleLoader
 from .resolve import Resolver
+from .core import CProgram
 from .typed import TypeTable
 from .types import Scheme
 
@@ -52,6 +53,8 @@ class Checked:
     signatures: list[tuple[str, Scheme]]  # the entry module's, in source order
     warnings: list[str]
     types: TypeTable  # every expression's type, for the lowering (M13a)
+    core: CProgram  # the elaboration, as a checked datatype (M13b)
+    module: str  # the entry module's name, for `turkey core`
 
 
 def check(src: str, file: str | None = None,
@@ -98,10 +101,16 @@ def check(src: str, file: str | None = None,
         warnings.extend(generator.warnings)
 
     assert generator is not None and classes is not None
+    # Lowering and checking are the last stage, and the check is not optional.
+    # "Evidence checkable rather than trusted" (`plan.txt` item 5) is not true
+    # of a check nobody runs, so it runs the way exhaustiveness does: always.
+    program_core = lower.Lowerer(decls, classes, env, types).program(ordered)
+    coretc.check_program(program_core, decls, classes, coretc.globals_of(env))
     return Checked(
         entry.program, ordered, decls, classes, env, loader.order,
         entry.scope.values, entry.scope.values.get("main", "main"),
         _signatures(entry, env, classes), warnings, types,
+        program_core, entry.name,
     )
 
 

@@ -381,6 +381,31 @@ A `fun` that calls itself is an SCC of size 1.
 
 Wherever a type annotation appears (expression `e : τ`, parameter pattern `pat : τ`, return type `-> τ`), the inferred type is unified with `τ` before generalization. Annotations never cause generalization themselves; they only constrain.
 
+### 5.4 Elaboration: the typed Core (SPEC-DELTAS.md 48, 49)
+
+Inference does not only decide types. It decides which instance every class predicate is discharged by, and a program cannot run without that answer. The result is a **typed Core**: the same term language with three things made explicit that the surface language leaves implicit.
+
+**Every node carries its type.** Not a scheme: a type, with family applications reduced throughout and numeric literals decided.
+
+**Dictionaries are ordinary values.** A class `C a` has a record type `%Dict.C a`, one field per method and a `%super.S` field per superclass. An instance is a top-level binding of that type; one with a context is a function from dictionaries to a dictionary. Selecting a method is a field projection, and so is selecting a superclass.
+
+**Polymorphism is explicit.** A generalized binding is a type abstraction; every use of it is a type application, and then an application to its dictionaries, in that order:
+
+```
+print : forall a. fun(%Dict.Show a) -> fun(a) -> Unit
+
+print(x)  ⇒  print[String](%inst.Show.String)(x)
+```
+
+Two further differences from the surface language:
+
+- **Core has no statements.** A block is nested `let`s; a statement whose value is discarded binds a name nothing reads. `{ }` is `()`.
+- **`var` is a reference cell** (see decision 36). `let` is an immutable binding, `var x = e` binds a cell, a mention of it is a read, and an assignment is a write.
+
+Control constructs are unchanged: `if`, `match`, `while`, `loop`, `for`, and `return`/`break`/`continue` typed `⊥`. Turning those into join points is a separate layer and belongs below this one.
+
+The Core is **checked**, on every compile, against the class table and the declarations. That is the point of having it: before it existed, a dictionary in the wrong position was not a compile error but a wrong answer at run time.
+
 ---
 
 ## 6. Operational Semantics
@@ -817,3 +842,4 @@ Notes:
 | 33 | Array literals: `[]` = `Data.Array.new(0)`; `[e₁,...]` = new + pushes |
 | 34 | ~~Operators are monomorphic (Int/Float variants); no typeclasses in v1~~ -- superseded: every arithmetic and comparison operator is a class method (SPEC-DELTAS.md 32) |
 | 35 | `error : String -> a` is a polymorphic primitive (panics/diverges) |
+| 36 | A `var` is a mutable cell, and closures capture the cell, not its value -- so a lambda that writes a captured `var` writes through to it (SPEC-DELTAS.md 49; new prose for behaviour the evaluator always had) |

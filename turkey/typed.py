@@ -58,6 +58,8 @@ class TypeTable:
 
     def __init__(self) -> None:
         self._exprs: dict[int, tuple[ast.Expr, Type]] = {}
+        self._decls: dict[int, tuple[object, Type]] = {}
+        self._pats: dict[int, tuple[object, dict[str, Type]]] = {}
         self._fams: Families | None = None
 
     def observe(self, classes) -> None:
@@ -74,6 +76,32 @@ class TypeTable:
 
     def record(self, e: ast.Expr, ty: Type) -> None:
         self._exprs[id(e)] = (e, ty)
+
+    def record_decl(self, decl, ty: Type) -> None:
+        """The type a `fun` declaration was bound at.
+
+        Needed for the *local* case and only there. A top-level name's type is
+        in the environment afterwards, but a local `fun`'s is not: it is
+        defined into a child scope that is popped. A group that generalizes
+        records its schemes instead (`evidence.Abstraction.schemes`); this is
+        the other case, a group that does not.
+        """
+        self._decls[id(decl)] = (decl, ty)
+
+    def of_decl(self, decl) -> Type | None:
+        found = self._decls.get(id(decl))
+        return None if found is None else self.resolve(found[1])
+
+    def record_pattern(self, pat, binds: dict[str, Type]) -> None:
+        """What one pattern binds, and at what types."""
+        if binds:
+            self._pats[id(pat)] = (pat, dict(binds))
+
+    def of_pattern(self, pat) -> dict[str, Type]:
+        found = self._pats.get(id(pat))
+        if found is None:
+            return {}
+        return {n: self.resolve(t) for n, t in found[1].items()}
 
     def of(self, e: ast.Expr) -> Type:
         """The resolved type of one expression. Only meaningful after solving."""
@@ -107,24 +135,7 @@ class TypeTable:
         become `Option a` there or the Core term is annotated with a type that
         was never reduced and will not check.
         """
-        return self._deep(prune(ty))
-
-    def _deep(self, ty: Type) -> Type:
-        ty = normalize(ty, self._fams)
-        if isinstance(ty, TApp):
-            return TApp(self._deep(ty.fn), self._deep(ty.arg), ty.kind)
-        if isinstance(ty, TFun):
-            return TFun([self._deep(p) for p in ty.params], self._deep(ty.ret))
-        if isinstance(ty, TTuple):
-            return TTuple([self._deep(e) for e in ty.elems])
-        if isinstance(ty, TFam):
-            # The head stuck, so reduce the argument and ask once more: what
-            # blocked `Item (Elem c)` may have been the `Elem c`, and one
-            # retry is all it can take, since the argument is now reduced.
-            arg = self._deep(ty.arg)
-            again = normalize(TFam(ty.name, arg, ty.kind), self._fams)
-            return again if not isinstance(again, TFam) else TFam(ty.name, arg, ty.kind)
-        return ty
+        return reduce_deep(ty, self._fams)
 
     def __len__(self) -> int:
         return len(self._exprs)
@@ -146,6 +157,33 @@ class TypeTable:
             if _stuck(resolved):
                 out.append((node, resolved))
         return out
+
+
+def reduce_deep(ty: Type, fams: Families | None) -> Type:
+    """`types.normalize`, applied at every level rather than at the head.
+
+    Head-only is right for unification, which only ever compares heads, and
+    `normalize` says so. It is not enough for anything that reads a type
+    *whole* -- a lowering writing it into an IR, or a checker comparing two of
+    them -- because `Option (Item (Array Int))` and `Option Int` are the same
+    type and only one of them has been reduced.
+    """
+    ty = normalize(prune(ty), fams)
+    if isinstance(ty, TApp):
+        return TApp(reduce_deep(ty.fn, fams), reduce_deep(ty.arg, fams), ty.kind)
+    if isinstance(ty, TFun):
+        return TFun([reduce_deep(p, fams) for p in ty.params],
+                    reduce_deep(ty.ret, fams))
+    if isinstance(ty, TTuple):
+        return TTuple([reduce_deep(e, fams) for e in ty.elems])
+    if isinstance(ty, TFam):
+        # The head stuck, so reduce the argument and ask once more: what
+        # blocked `Item (Elem c)` may have been the `Elem c`, and one retry is
+        # all it can take, since the argument is now reduced.
+        arg = reduce_deep(ty.arg, fams)
+        again = normalize(TFam(ty.name, arg, ty.kind), fams)
+        return again if not isinstance(again, TFam) else TFam(ty.name, arg, ty.kind)
+    return ty
 
 
 def _stuck(ty: Type) -> bool:
@@ -171,4 +209,4 @@ def children(ty: Type) -> list[Type]:
     return []
 
 
-__all__ = ["TypeTable", "children"]
+__all__ = ["TypeTable", "children", "reduce_deep"]

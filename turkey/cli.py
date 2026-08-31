@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .driver import check, report_warnings, run
 from .errors import TurkeyError, TurkeyPanic
+from .core import show_program
 from .lexer import tokenize
 from .parser import parse
 from .types import show_scheme
@@ -21,6 +22,7 @@ def main(argv: list[str] | None = None) -> int:
         ("types", "print the inferred type of each top-level binding"),
         ("tokens", "dump the token stream"),
         ("ast", "dump the parse tree"),
+        ("core", "dump the typed Core the elaboration produces"),
     ]:
         p = sub.add_parser(name, help=help_text)
         p.add_argument("file")
@@ -38,6 +40,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(token)
         elif args.command == "ast":
             print(parse(src))
+        elif args.command == "core":
+            checked = check(src, args.file, [Path(args.file).resolve().parent])
+            report_warnings(checked.warnings, args.file)
+            print(show_program(checked.core, checked.module), end="")
         elif args.command == "types":
             checked = check(src, args.file, [Path(args.file).resolve().parent])
             report_warnings(checked.warnings, args.file)

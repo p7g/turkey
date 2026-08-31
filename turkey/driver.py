@@ -112,10 +112,8 @@ def check(src: str, file: str | None = None,
     # copy still typechecks" is the property that a substitution went wrong
     # would break first. See turkey/mono.py.
     main = entry.scope.values.get("main", "main")
-    program_mono, mono_warnings = mono.monomorphize(program_core, decls,
-                                                    classes, main)
+    program_mono = mono.monomorphize(program_core, decls, classes, main)
     coretc.check_program(program_mono, decls, classes, coretc.globals_of(env))
-    warnings.extend(mono_warnings)
     return Checked(
         entry.program, ordered, decls, classes, env, loader.order,
         entry.scope.values, main,

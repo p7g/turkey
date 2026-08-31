@@ -50,8 +50,17 @@ So there is a cap, and when it trips the call site keeps its `CTyApp` and its
 dictionary arguments and goes on calling the generic binding. Every generic
 binding therefore **survives the pass unchanged**, which is why the output is a
 mixture rather than a program with no polymorphism left in it. A program that
-compiles today compiles here; some of them are only partly specialized, and the
-pass says which through the ordinary warning channel rather than silently.
+compiles today compiles here; some of them are only partly specialized.
+
+And the cap says nothing when it trips. It used to warn, on the grounds that a
+program whose performance quietly depends on a budget is a program whose
+performance nobody was told about. That was the wrong frame: Turkey does not
+*promise* monomorphization, and a binding that stays polymorphic is compiled by
+layout-keyed sharing instead -- one body per layout of its type arguments,
+which is a finite set, so it always terminates (`plan.txt` items 6 and 9). How
+much a backend recovers past that, by inlining and constant propagation, is the
+backend's business. So the cap is an optimization budget and not a diagnostic,
+and there is nothing here for a program to have gone wrong about.
 
 Two consequences of "survives unchanged" worth stating, because they are what
 keeps this pass small:
@@ -238,10 +247,6 @@ class _State:
     "`f` has at most `MAX_SPECIALIZATIONS` copies" true of the finished program
     rather than of one round of it.
 
-    **The warnings already said.** A cap that trips in round one trips again in
-    round two; saying so twice would describe the implementation rather than the
-    program.
-
     **The hoists already made.** `%inst.Ord.Int#lt` is a binding the first
     round's devirtualizer created and the first round's rewrites already name.
     Without this the second round would hoist the same field again under a
@@ -260,7 +265,6 @@ class _State:
     # A binding this pass made -> the original binding it descends from.
     # Transitive by construction: `derive` stores the root, never the parent.
     origin: dict[str, str] = field(default_factory=dict)
-    capped: set[str] = field(default_factory=set)
     # (ground dictionary, field name) -> the binding that field is now.
     hoists: dict[tuple[str, str], str] = field(default_factory=dict)
 
@@ -625,7 +629,6 @@ class Monomorphizer:
         self.made: dict[str, list[CBind]] = {}
         self.queue: list[tuple[str, CBind, list[Type], list[str] | None]] = []
         self.used: set[str] = set()
-        self.warnings: list[str] = []
 
     def run(self) -> CProgram:
         for group, is_dict in ((self.program.dicts, True),
@@ -681,11 +684,8 @@ class Monomorphizer:
         # Size first, then the budget, so a request refused for its type does
         # not also spend a copy the program never received.
         if any(_size(t) > MAX_TYPE_NODES for t in targs):
-            self.cap(bind, f"is used at a type of more than {MAX_TYPE_NODES} "
-                           f"parts")
             return None
         if not self.state.spend(bind.name):
-            self.cap(bind, f"is used at more than {MAX_SPECIALIZATIONS} types")
             return None
         name = self.fresh(bind.name, targs)
         self.state.derive(name, bind.name)
@@ -697,23 +697,6 @@ class Monomorphizer:
         self.done[key] = name
         self.queue.append((name, bind, targs, dicts))
         return name
-
-    def cap(self, bind: CBind, why: str) -> None:
-        """Said once per binding, and said at all because a program that
-        quietly stops being specialized is a program whose performance depends
-        on something nobody was told about.
-
-        Once per binding across every round, not once per round: the cap that
-        refused a copy in round one refuses it again in round two, and the
-        program has one thing wrong with it either way.
-        """
-        if bind.name in self.state.capped:
-            return
-        self.state.capped.add(bind.name)
-        where = f"{bind.span}: " if bind.span is not None else ""
-        self.warnings.append(
-            f"{where}warning: '{bind.name}' {why}, so its remaining uses are "
-            f"left polymorphic")
 
     def fresh(self, name: str, targs: list[Type]) -> str:
         base = f"{name}@{','.join(_mangle(t) for t in targs)}" if targs else f"{name}@"
@@ -1008,7 +991,7 @@ def _reachable(program: CProgram, main: str) -> CProgram:
 
 
 def monomorphize(program: CProgram, decls: DeclTable, classes: ClassTable,
-                 main: str = "main") -> tuple[CProgram, list[str]]:
+                 main: str = "main") -> CProgram:
     """Specialize, devirtualize, again, and then drop what nothing reaches.
 
     The rounds share one `_State`, which is what keeps the cap a cap; see
@@ -1018,12 +1001,12 @@ def monomorphize(program: CProgram, decls: DeclTable, classes: ClassTable,
     ask.
     """
     state = _State()
-    out, warnings = program, []
+    out = program
     for _ in range(ROUNDS):
-        pass_ = Monomorphizer(out, decls, classes, state)
-        out = _Devirtualizer(pass_.run(), classes, state).run()
-        warnings.extend(pass_.warnings)
-    return _reachable(out, main), warnings
+        out = _Devirtualizer(
+            Monomorphizer(out, decls, classes, state).run(), classes, state
+        ).run()
+    return _reachable(out, main)
 
 
 __all__ = ["MAX_SPECIALIZATIONS", "MAX_TYPE_NODES", "ROUNDS", "Monomorphizer",

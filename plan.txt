@@ -203,9 +203,18 @@ Roadmap, in order. Rationale kept short; open questions are the point.
    chain infinite too, so specializing on dictionaries instead would not have
    escaped it. So the pass is **partial** by decision: past a cap the call site
    keeps its type application and calls the generic binding, which is never
-   removed, and the program is told so through the ordinary warning channel.
-   Every program that compiled before compiles now; some are only partly
-   specialized.
+   removed. Every program that compiled before compiles now; some are only
+   partly specialized.
+
+   The cap used to warn when it tripped, and no longer does. The warning was
+   arguing that a program whose performance depends on a budget is a program
+   whose performance nobody was told about -- which assumed the cap was a
+   *failure to compile properly*. It is not. **Turkey does not guarantee
+   monomorphization.** What the cap refuses is an optimization; 9's layout-keyed
+   sharing compiles what is left, and 7's passes may recover much of the rest by
+   inlining and constant propagation, with no promise about how much. A binding
+   that stays polymorphic is not a binding with something wrong with it, so
+   there is nothing to say about it. The budget stays; the diagnostic goes.
 
    What it took:
    - M14a: one copy of a generalized binding per type it is used at. A ground
@@ -287,6 +296,52 @@ Roadmap, in order. Rationale kept short; open questions are the point.
    not LLVM. Today everything is a Python object: RecordObj has reference
    semantics, ConValue is immutable, ArrayObj is mutable. None of that has a
    memory answer yet.
+
+   **Layout-keyed sharing**, which is what makes 6's cap safe to be silent
+   about. 6 specializes by *type* and cannot be total, because Turkey admits
+   polymorphic recursion and the set of types a binding is used at can be
+   infinite. So below it, specialize by *layout*: one compiled body per
+   distinct layout of the type arguments, everything pointer-shaped sharing
+   one. That pass is total, and for a reason worth stating exactly -- the set
+   of layouts is finite by construction where the set of types is not. `Pair a`
+   is pointer-shaped whatever `a` is, so `depth`'s infinite chain
+   (`Pair Int`, `Pair (Pair Int)`, ...) collapses to a single layout key. The
+   thing that diverged was the type index; the layout index cannot.
+
+   So the tiers are: 6 specializes by type, on a budget, to enable
+   devirtualization and 7's inliner; 9 shares by layout, always, for whatever
+   6 declined. Exactly .NET's split -- one native body shared across every
+   reference-type instantiation of a generic (`__Canon`), separate code only
+   for value types, where size differs. Swift is the closest statement of the
+   *policy*: generics compile unspecialized, via witness tables carrying size
+   and alignment, and monomorphization is an optimization rather than a
+   promise.
+
+   What it costs, and it is not free: dictionaries. `Show (Pair Int)` and
+   `Show (Pair (Pair Int))` share a layout but are different *values*, and with
+   polymorphic recursion that chain is still infinite -- so a shared body
+   builds its dictionaries as it recurses, which is exactly the dictionary
+   passing 6 set out to remove, back in the region where the cap tripped. And
+   7's inliner cannot fire there either, since `bind` is a runtime argument
+   again. Layout sharing and devirtualization pull in opposite directions;
+   the tiering above is what settles which wins where.
+
+   Not a type-system change, and the earlier claim that it was is withdrawn.
+   GHC needs levity polymorphism (`TYPE r`, `RuntimeRep`) and OCaml needs
+   layouts because both *expose unboxed types in the surface language*, so a
+   quantifier can range over things of different size and the kind has to say
+   which. Turkey exposes none: `Int` and `Float` are ordinary types whose
+   representation is this item's choice and nobody else's. So layout is a
+   function of an already-explicit Core type, computed here, and `types.py`'s
+   kinds do not move. The day an unboxed type becomes writable is the day this
+   turns into a type-system question, and not before.
+
+   What that policy does require: nothing type-directed at run time beyond
+   dictionaries -- no reflection, no `typeof`, nothing that could observe which
+   body it landed in. Coherence (delta 43) is what makes that hold, since the
+   same instance is selected either way, so specialization can change speed and
+   never meaning. It is the thing that would quietly break if reflection ever
+   arrived.
 
 10. native compilation via LLVM
 

@@ -11,8 +11,8 @@ What is left for this file is the half a golden cannot see:
   an application to be performed;
 * that the per-request dictionary rebuild `plan.txt` item 6 names is actually
   gone, rather than merely renamed;
-* that a program monomorphization cannot finish still compiles, still runs, and
-  says so.
+* that a program monomorphization cannot finish still compiles and still runs,
+  and that it does so *silently* -- the cap is a budget, not a diagnostic.
 """
 
 from __future__ import annotations
@@ -290,10 +290,17 @@ def test_the_capped_call_site_still_names_the_generic_binding():
     assert [n.fn.name for n in applied] == ["Main#depth"]
 
 
-def test_giving_up_is_said_out_loud():
+def test_giving_up_is_silent():
+    """The cap is a budget, not a diagnostic.
+
+    Turkey does not promise that a program is monomorphized -- layout-keyed
+    sharing is the fallback, and how much of it a backend recovers is the
+    backend's business. A program that stays polymorphic is not a program with
+    something wrong with it, so there is nothing to say about it.
+    """
     checked = check(POLYREC)
-    assert any("depth" in w and "left polymorphic" in w
-               for w in checked.warnings), checked.warnings
+    assert not any("polymorphic" in w for w in checked.warnings), \
+        checked.warnings
 
 
 def test_the_capped_program_still_runs(capsys):
@@ -579,8 +586,8 @@ def test_a_third_round_changes_nothing():
     try:
         for rounds in (2, 3):
             mono.ROUNDS = rounds
-            out, _ = mono.monomorphize(checked.core, checked.decls,
-                                       checked.classes, checked.main)
+            out = mono.monomorphize(checked.core, checked.decls,
+                                    checked.classes, checked.main)
             outs[rounds] = sorted(names(out))
     finally:
         mono.ROUNDS = saved
@@ -614,10 +621,3 @@ def test_the_budget_survives_the_round_count():
     assert len(copies) == MAX_SPECIALIZATIONS, \
         f"{len(copies)} copies over five rounds, not {MAX_SPECIALIZATIONS}"
 
-
-def test_the_cap_is_reported_once_across_rounds():
-    """Every round trips the same cap. Saying so once per round would describe
-    this file's structure rather than the program's."""
-    checked = check(POLYREC)
-    said = [w for w in checked.warnings if "Main#depth" in w]
-    assert len(said) == 1, said

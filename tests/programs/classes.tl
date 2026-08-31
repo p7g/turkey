@@ -40,17 +40,12 @@ instance Monoid String {
 
 -- The instance head is an `atype`, so a partial application parenthesizes.
 -- `Either l` is what makes the class variable of kind `* -> *` reachable.
-class Functor f {
-    fun map(f a, fun(a) -> b) -> f b
-}
-
-instance Functor Option {
-    fun map(opt, g) = match opt {
-        Some(x) -> Some(g(x))
-        None -> None
-    }
-}
-
+--
+-- `Functor` is the prelude's since delta 45, and this file no longer declares
+-- one -- a class is a single global name, unlike a type or an instance, which
+-- delta 43 qualified. The `Either` above is this module's own, though, so the
+-- instance below is not an orphan and the partially applied head is still the
+-- thing being shown.
 instance Functor (Either l) {
     fun map(e, g) = match e {
         Right(x) -> Right(g(x))

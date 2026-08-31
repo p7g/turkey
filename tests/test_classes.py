@@ -17,9 +17,10 @@ from turkey.errors import TurkeyError
 from turkey.parser import parse
 from turkey.types import show_kind, show_scheme
 
-PRELUDE = """
-type Either l r = Left(l) | Right(r)
-"""
+# `Either` was declared here until delta 45 put it in the prelude. Declaring one
+# anyway would still work -- a type is qualified by its module -- but every
+# signature below would then print it as `Main.Either` to say which one it meant.
+PRELUDE = ""
 
 
 def sigs(src: str) -> dict[str, str]:
@@ -82,7 +83,7 @@ def test_a_top_level_fun_may_not_omit_its_body():
 
 
 def test_a_higher_order_parameter_type_needs_no_new_syntax():
-    src = "class Functor f { fun map(f a, fun(a) -> b) -> f b }"
+    src = "class Mappable f { fun over(f a, fun(a) -> b) -> f b }"
     (decl,) = [d for d in parse(src).decls if isinstance(d, ast.ClassDecl)]
     assert isinstance(decl.methods[0].params[1].type_expr, ast.TEFun)
 
@@ -91,8 +92,8 @@ def test_a_higher_order_parameter_type_needs_no_new_syntax():
 
 
 def test_the_class_variable_gets_the_kind_its_methods_imply():
-    src = "class Functor f { fun map(f a, fun(a) -> b) -> f b }"
-    assert kind_of_class(src, "Functor") == "* -> *"
+    src = "class Mappable f { fun over(f a, fun(a) -> b) -> f b }"
+    assert kind_of_class(src, "Mappable") == "* -> *"
 
 
 def test_an_unconstrained_class_variable_defaults_to_star():
@@ -102,30 +103,30 @@ def test_an_unconstrained_class_variable_defaults_to_star():
 
 def test_a_superclass_shares_the_kind_of_its_subclass_variable():
     src = """
-    class Functor f { fun map(f a, fun(a) -> b) -> f b }
-    class Pointed f : Functor f { fun pure(a) -> f a }
+    class Mappable f { fun over(f a, fun(a) -> b) -> f b }
+    class Pointed f : Mappable f { fun lift(a) -> f a }
     """
     assert kind_of_class(src, "Pointed") == "* -> *"
 
 
 def test_an_instance_head_must_have_the_class_variable_kind():
     src = """
-    class Functor f { fun map(f a, fun(a) -> b) -> f b }
-    instance Functor Int { fun map(x, g) = x }
+    class Mappable f { fun over(f a, fun(a) -> b) -> f b }
+    instance Mappable Int { fun over(x, g) = x }
     """
     assert "has kind *" in bad(src)
 
 
 def test_a_partially_applied_head_is_what_makes_a_two_parameter_type_a_functor():
     src = """
-    class Functor f { fun map(f a, fun(a) -> b) -> f b }
-    instance Functor (Either l) {
-        fun map(e, g) = match e {
+    class Mappable f { fun over(f a, fun(a) -> b) -> f b }
+    instance Mappable (Either l) {
+        fun over(e, g) = match e {
             Right(x) -> Right(g(x))
             Left(y) -> Left(y)
         }
     }
-    fun use(e : Either String Int) -> Either String Int = map(e, fun(n) { return n })
+    fun use(e : Either String Int) -> Either String Int = over(e, fun(n) { return n })
     """
     assert sigs(src)["use"] == "fun(Either String Int) -> Either String Int"
 
@@ -322,9 +323,9 @@ def test_an_instance_method_may_not_narrow_the_type_its_class_gave_it():
     """The variables the instance does not fix are rigid, so a body that is
     less general than the signature is rejected rather than accommodated."""
     src = """
-    class Functor f { fun map(f a, fun(a) -> b) -> f b }
-    instance Functor Option {
-        fun map(opt, g) = match opt {
+    class Mappable f { fun over(f a, fun(a) -> b) -> f b }
+    instance Mappable Option {
+        fun over(opt, g) = match opt {
             Some(x) -> Some(x + 1)
             None -> None
         }
@@ -335,8 +336,8 @@ def test_an_instance_method_may_not_narrow_the_type_its_class_gave_it():
 
 def test_an_instance_method_must_return_what_the_class_says():
     src = """
-    class Functor f { fun map(f a, fun(a) -> b) -> f b }
-    instance Functor Option { fun map(opt, g) = opt }
+    class Mappable f { fun over(f a, fun(a) -> b) -> f b }
+    instance Mappable Option { fun over(opt, g) = opt }
     """
     assert "expected" in bad(src)
 

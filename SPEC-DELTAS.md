@@ -1649,3 +1649,106 @@ dropped the local `Either` its helpers prepended. New golden `monads.tl`, with
 `.expected` and `.types`, writes the chains out by hand: it is what delta 46's
 sugar has to agree with, and worth reading in longhand once before any of it is
 hidden.
+
+### 46. `?` is the instance's `bind`, and `do` says where it unwinds to
+
+Delta 45 put `Monad` in the library and left it to be called by hand.
+`plan.txt` item 4 wanted the operator: Rust's `?`, generalized past `Result` to
+any monad. This is that, for everything except loops and the control transfers
+that cross one -- which are delta 47.
+
+**`?` is not an early return, and could not be.** Rust's `?` is a non-local
+exit, and that reading works only because `Option` and `Result` are the
+try-shaped monads: there is one value to leave with. `Array` is a monad too
+(delta 45), its `bind` runs the continuation once per element, and "return
+early" names nothing there. So `e?` is `bind(e, fun(x) { <the rest> })` and
+nothing else, and every question below is answered by asking what the
+instance's `bind` does rather than by a rule of the language.
+
+**It cannot be a node, and that is the only structural novelty here.** Every
+other sugar in the language is a node carrying the method it means: `a + b` is
+an `EBinary` holding `add` (delta 32), `for x in xs` an `EForIn` holding `iter`
+and `next` (delta 33), and `turkey/infer.py` and `turkey/eval.py` each read that
+field. `?` cannot work that way, because what it binds is *the rest of the
+enclosing statement sequence*, which no node annotated in place can name. So
+there is a pass, `turkey/desugar.py`, and it is the first one in this
+implementation that rewrites the tree rather than annotating it.
+
+The upside of paying that once is that nothing else changes at all. `?` and `do`
+are gone before the tree reaches the checker, so `turkey/infer.py`,
+`turkey/eval.py`, `turkey/deps.py` and `turkey/exhaustive.py` know nothing about
+this feature -- no cases, no fields, no `Monad` special case anywhere. The
+`Monad m` obligation is raised by `bind`'s own scheme, the same way `Add a` is
+raised by `add`'s, and the dictionary arrives by M6's ordinary path.
+
+**It runs after resolution.** `turkey/driver.py` calls it between `Resolver` and
+`Generator`. Both halves of that matter: the code the pass lifts into lambdas has
+already had its names settled, so lifting it cannot change what one means; and
+the code the pass writes may name internal constructors directly rather than
+hoping a module exported the surface spelling. Generated binders are `%k1`,
+`%k2`, and `%` is not a character an identifier may contain, so a generated name
+cannot capture one the author wrote -- the guarantee `%sig.{name}` already
+relies on.
+
+**A do-context is what a `?` unwinds to, and there are two:** an explicit
+`do { ... }`, and the body of a `fun` or lambda containing a `?`. Everything
+else is transparent -- `if`, `match`, a bare block -- and a `?` inside one lifts
+outward through it. A lambda is opaque, so a `?` in a callback belongs to the
+callback and the enclosing function is not monadic at all.
+
+Which settles the open question `plan.txt` left about an empty or `?`-free `do`:
+**it emits nothing whatsoever.** No `bind`, so no `Monad` obligation, so nothing
+for it to be ambiguous about. `question.tl`'s `plain` is `fun(Int) -> Int` in
+the `.types` golden, and `do { }` is `Unit`. `do` is a scoping marker and not a
+mode.
+
+**Straight-line code comes out as the chain a person would write.** One `bind`
+per `?`, the rest of the block inside the lambda, and statements before the
+first `?` left exactly where they were -- a block splits only where it must.
+`tests/test_desugar.py` asserts the shape directly rather than inferring it from
+output, because "`?` is sugar for `bind` plus a lambda" is a claim about a tree.
+
+**A control construct holding a `?` is lifted into the monad.** An `if` branch's
+value is `Unit` by the language's own rule, not `m Unit`, so a `?` inside one
+cannot be hoisted past it. Instead each branch is translated with `pure` as its
+continuation and the `if` becomes the left argument of a `bind`; `match` is the
+same, per arm. In *tail* position neither the `pure` nor the `bind` is emitted:
+there the branches already are the do block's tail, and the tail of a do block
+is the monadic value. So `if` costs nothing where it is the answer, and costs a
+join where it is a statement.
+
+`&&` and `||` are read as the `if` they already mean when a `?` is on the right.
+§8.2 says these two are not class methods because they short-circuit and no
+function call does -- and no argument to `bind` does either, so hoisting the
+right operand out would have quietly evaluated it. Under a branch it stays
+unevaluated: `guarded(0, None)` answers rather than failing.
+
+**The `pure` the lowering inserts is not the auto-`pure` that was ruled out.**
+That rule is about the tail of a do block, and the tail is still taken to be
+already monadic -- `do { a? }` is a type error, from ordinary unification, with
+no special case. The inserted `pure` appears only where the lowering lifts
+something whose value was `Unit` by rule into a monad it never asked to be in.
+
+**What it costs.** Two things, both stated rather than discovered.
+
+An unwritten invariant became observable. Closure capture in this language is by
+reference over a shared mutable scope chain, and `Generator.is_mutable` walks
+scopes with no function barrier -- so a lambda that writes an enclosing `var`
+writes through to it. No document said so, because until `?` no program could
+easily notice. Now everything after a `?` is inside a lambda, and
+`question_capture.tl` pins what follows: under `Some` the write happens once,
+under `None` never, and under `Array` once per element *sharing one counter*, so
+`each([7, 8, 9])` is `[107, 208, 309]`. That is not a decision about `?`. It is
+the instance's `bind`, which is what `?` was defined to be.
+
+And `do` is a reserved word now, so a program cannot use it as a name.
+
+**Scope.** New `turkey/desugar.py`; `?` and `do` added to `turkey/lexer.py`'s
+operator, keyword, `CAN_END` and `CAN_START` tables; `EQuestion` and `EDo` in
+`turkey/ast.py`, consumed by the pass and deliberately not deleted, since a
+lowering straight to a Core IR will want a sugared tree to lower and this pass to
+check itself against; a suffix case in `parse_postfix` and an atom case in
+`parse_atom`; two passthrough cases in `turkey/resolve.py`; one line in
+`turkey/driver.py`. New goldens `question.tl` (with `.types`),
+`question_capture.tl`, and three `err_question_*.tl`, two of which record what
+delta 47 has yet to do. New `tests/test_desugar.py`. No existing golden moved.

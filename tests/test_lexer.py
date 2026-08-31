@@ -187,3 +187,36 @@ def test_dot_not_followed_by_digit_is_a_separate_token():
 
 def test_dot_not_followed_by_digit_at_end_of_input():
     assert kinds("1.foo") == ["INT", ".", "IDENT", "EOF"]
+
+
+# -- `?` and `do` (delta 46) -----------------------------------------------------
+
+
+def test_question_is_one_token():
+    assert kinds("a?") == ["IDENT", "?", "EOF"]
+
+
+def test_question_ends_a_statement():
+    """`?` is postfix, so a statement's last token can be one. Without `?` in
+    `CAN_END` the newline would vanish and the next line would read as a
+    continuation of this one."""
+    assert kinds("let x = a?\nlet y = b") == [
+        "let", "IDENT", "=", "IDENT", "?", "NEWLINE",
+        "let", "IDENT", "=", "IDENT", "EOF",
+    ]
+
+
+def test_a_newline_before_a_question_does_not_survive():
+    """`?` cannot begin a production, so it is absent from `CAN_START` and a
+    line break in front of one simply disappears."""
+    assert kinds("a\n?") == ["IDENT", "?", "EOF"]
+
+
+def test_do_starts_a_statement():
+    assert kinds("f()\ndo { }") == [
+        "IDENT", "(", ")", "NEWLINE", "do", "{", "}", "EOF",
+    ]
+
+
+def test_do_is_a_keyword_and_no_longer_an_identifier():
+    assert kinds("do") == ["do", "EOF"]

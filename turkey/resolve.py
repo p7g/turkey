@@ -298,6 +298,16 @@ class Resolver:
                 self.stmt(stmt)
             self._pop()
             return
+        if t is ast.EQuestion:
+            # `bind_fn` is a marked method reference and deliberately not walked,
+            # like `EForIn`'s `iter_fn`. `turkey/desugar.py` rewrites this node
+            # away immediately after this pass.
+            self.expr(e.expr)
+            return
+        if t is ast.EDo:
+            # Only a marker; the block underneath scopes as any block does.
+            self.expr(e.body)
+            return
 
         raise AssertionError(f"resolve: unrecognized expression node {t.__name__}")
 

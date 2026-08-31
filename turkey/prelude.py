@@ -25,6 +25,16 @@ UNARY_METHOD: dict[str, str] = {"-": "neg"}
 # What `for x in xs` is written in terms of: a cursor from `iter`, advanced by
 # `next` until it answers `None`. The two constructor names are here because
 # the evaluator has to recognize the answer, and one place should say so.
+# What `?` is written in terms of (delta 46). `bind` is the method it desugars
+# to; `pure` is the one the lowering needs on its own, to lift a branch that was
+# never monadic into the monad the rest of the block is in. Both are marked
+# method references, so a program that defines its own `bind` does not capture
+# the one a `?` means -- the same reason `BINARY_METHOD` is a table here rather
+# than a lookup.
+MONAD_CLASS = "Monad"
+MONAD_BIND = "bind"
+MONAD_PURE = "pure"
+
 ITER_CLASS = "Iterator"
 ITER_ITEM = "Item"
 ITER_CURSOR = "Cursor"

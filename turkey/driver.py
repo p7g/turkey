@@ -23,7 +23,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import ast
+from . import ast, desugar
 from .builtins import initial_type_env, initial_values
 from .classes import ClassTable
 from .constraints import Env, Solver
@@ -69,6 +69,12 @@ def check(src: str, file: str | None = None,
 
     for module in loader.order:
         Resolver(module.scope).program(module.program)
+        # `?` and `do` die here, before anything looks at the tree. Desugaring
+        # after resolution means the code the pass moves into lambdas has
+        # already had its names settled, so moving it cannot change what one
+        # means -- and the code the pass writes may name internal constructors
+        # directly. See turkey/desugar.py.
+        desugar.program(module.program)
         # Generation builds the module's constraint and decides nothing;
         # solving is what assigns ranks, generalizes and fills in `env`.
         # Splitting them this way is the point of the HM(X) shape.

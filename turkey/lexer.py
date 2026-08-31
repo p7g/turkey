@@ -17,13 +17,14 @@ from .errors import LexError, Span
 KEYWORDS = frozenset(
     """type class instance fun let var match if else while for in loop return
     break continue module import export as qualified hiding
-    where""".split()
+    where do""".split()
 )
 
-# Longest match first: `<=` must beat `<`, `->` must beat `-`.
+# Longest match first: `<=` must beat `<`, `->` must beat `-`. `?` is a suffix
+# and no two-character operator begins with one, so it sits with the singles.
 OPERATORS = [
     "==", "!=", "<=", ">=", "->", "&&", "||", "..",
-    "=", "<", ">", "+", "-", "*", "/", "%", "!", ":", ",", ".", "|", "~",
+    "=", "<", ">", "+", "-", "*", "/", "%", "!", ":", ",", ".", "|", "~", "?",
     "{", "}", "(", ")", "[", "]",
 ]
 
@@ -32,9 +33,12 @@ LITERAL_KINDS = frozenset({"INT", "FLOAT", "STRING", "CHAR"})
 # Section 2.4, preceding condition: tokens that can legally end a production.
 # `break`, `continue` and bare `return` are added -- design.md omits them, but a
 # statement ending in one of them must still be terminable by a newline.
+# `?` is here because it is a *postfix* operator: `let x = f()?` is a complete
+# statement whose last token is the `?`, and without this the newline after it
+# would be dropped and the next statement read as a continuation.
 CAN_END = (
     LITERAL_KINDS
-    | {"IDENT", "CONID", ")", "]", "}", "break", "continue", "return"}
+    | {"IDENT", "CONID", ")", "]", "}", "break", "continue", "return", "?"}
 )
 
 # Section 2.4, following condition: tokens that can legally start a sibling
@@ -46,7 +50,7 @@ CAN_START = (
     | {
         "let", "var", "fun", "type", "class", "instance", "if", "match",
         "while", "for", "loop", "return", "break", "continue", "module",
-        "import",
+        "import", "do",
         "IDENT", "CONID", "(", "[", "{", "-", "!",
     }
 )

@@ -35,15 +35,19 @@ STRING   ← "..."   (escapes: \n \t \\ \" \uXXXX)
 CHAR     ← '...'
 ```
 
-**Reserved words:** `type fun let var match if else while for in loop return break continue module import export as qualified hiding where`
+**Reserved words:** `type class instance fun let var match if else while for in loop return break continue do module import export as qualified hiding where`
 
 **Operators and punctuation:**
 ```
 =  ==  !=  <  <=  >  >=
 +  -  *  /  %
 && ||  !
+?
 -> :  ;  ,  .  |  {  }  (  )  [  ]
 ```
+
+`?` is a postfix operator (§6.9), so it can end a statement — §2.4's preceding
+condition includes it.
 
 ### 2.2 Comments
 
@@ -187,6 +191,7 @@ expr-postfix ::= expr-atom (
                    "(" arg-list? ")"            -- function application
                  | "[" expr "]"                  -- array index
                  | "." IDENT                     -- field access
+                 | "?"                           -- monadic bind (§6.9)
                  )*
 expr-atom    ::= INT | FLOAT | STRING | CHAR
                | IDENT                           -- variable
@@ -204,6 +209,7 @@ expr-atom    ::= INT | FLOAT | STRING | CHAR
                | "return" expr?
                | "break" expr?
                | "continue"
+               | "do" block                      -- monadic context (§6.9)
                | block
 block        ::= "{" stmt* "}"
 field-init   ::= IDENT "=" expr
@@ -319,6 +325,7 @@ An expression is **non-expansive** iff:
 | `Data.Array.new(...)` | ✗ |
 | function application `f(args)` | ✗ |
 | `if` / `match` / `while` / `for` / `loop` / `return` / `break` / `continue` | ✗ |
+| `e?` and `do { ... }` | ✗ — `e?` is a call to `bind` (§6.9) |
 | block `{ ... }` | ✗ |
 | `e : τ` | iff `e` is non-expansive |
 
@@ -470,6 +477,61 @@ container walks with is computed from the container, like its element type.
 ### 6.8 Block evaluation
 
 A block `{ s₁; ...; sₙ }` evaluates each statement in order. Declarations (`let`, `var`, `fun`) are in scope for all subsequent statements. The value of the block is the value of the last statement. If the last statement is a declaration, the block's value is `Unit`.
+
+### 6.9 `e?` elaboration
+
+`e?` is the `Monad` instance's `bind`, with the rest of the enclosing statement
+sequence as its continuation (SPEC-DELTAS.md 46). It is **not** an early return:
+`Array` is a monad, its `bind` runs the continuation once per element, and there
+is no single value to leave with.
+
+```
+do { let x = e?; rest }
+```
+desugars to:
+```
+bind(e, fun(__x) { let x = __x; rest })
+```
+
+A **do-context** is the block a `?` unwinds to, and there are two: an explicit
+`do { ... }`, and the body of a `fun` or lambda that contains a `?`. `if`,
+`match` and bare blocks are transparent — a `?` inside one lifts outward through
+it. A lambda is opaque, so a `?` in a callback belongs to the callback.
+
+A `do` containing no `?` emits nothing at all: no `bind`, hence no `Monad`
+obligation, hence nothing for it to be ambiguous about. It means the block it
+wraps, and `do { }` is `Unit`.
+
+A `?` inside a control construct **lifts** the construct into the monad, since
+an `if` branch's value is `Unit` by §6.7 rather than `m Unit`:
+
+```
+if c { A } else { B }; rest      -- with a `?` somewhere in A or B
+```
+becomes
+```
+bind(if c { A′ } else { B′ }, fun(__j) { rest })
+```
+
+where each branch is translated with `pure` as its continuation and a missing
+`else` is `pure(())`. In **tail** position neither the `pure` nor the `bind` is
+emitted: the branches already are the do block's tail, and the tail of a do block
+is the monadic value. `match` lifts the same way, per arm.
+
+`x && y` and `x || y` with a `?` in the right operand are read as the `if` they
+already mean (§8.2), which keeps the operand unevaluated when the operator
+short-circuits.
+
+**No auto-`pure`.** The trailing expression of a do block is already the monadic
+value — `Some(3)`, not `3` — so `do` never changes what an ordinary expression
+means. This matters more here than in Haskell, since a function body becomes a
+do block without anyone typing `do`. The `pure` the lowering inserts appears only
+where it lifts something whose value was `Unit` by rule.
+
+**Not yet:** a `?` inside a loop, and a `return`/`break`/`continue` that would
+land inside a generated lambda. Both are rejected with a diagnostic saying so. A
+`return` *before* every `?` in its block is unaffected — it stays in the prefix,
+outside every lambda — so the common early exit works today.
 
 ---
 

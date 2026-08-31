@@ -93,3 +93,28 @@ def test_types_command(golden: Path) -> None:
     actual = result.stdout + result.stderr
     assert actual == expected, _diff_message(expected, actual, result.returncode)
     assert result.returncode == 0
+
+
+CORE = sorted(PROGRAMS_DIR.glob("*.core"))
+
+
+@pytest.mark.parametrize("golden", CORE, ids=[p.stem for p in CORE])
+def test_core_command(golden: Path) -> None:
+    """`NAME.core` pins what `turkey core NAME.tl` prints (M13b).
+
+    A `.expected` cannot see any of this. Whether a method was reached by
+    selecting a superclass or by taking a second dictionary, whether an
+    instance was applied at the right types, whether a `var` became a cell --
+    all of it produces the same output when it is right *and* when it is
+    subtly wrong, which is why the elaboration went unchecked for as long as
+    it did. These files are the elaboration written down.
+
+    Only a few programs have one, chosen for what they show rather than for
+    coverage: every program in the suite is checked by `coretc` on every run
+    anyway, because `driver.check` runs it unconditionally.
+    """
+    expected = golden.read_text()
+    result = _run(["core", golden.with_suffix(".tl").name])
+    actual = result.stdout + result.stderr
+    assert actual == expected, _diff_message(expected, actual, result.returncode)
+    assert result.returncode == 0

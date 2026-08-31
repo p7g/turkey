@@ -548,6 +548,13 @@ class Solver:
                        if not self.classes.is_class(p.name)]
                 preds = self.classes.simplify(own + shared)
                 binding = Binding(generalize(ty, self.rank, preds), False)
+                if c.dicts is not None:
+                    # Recorded here because here is the only place it exists.
+                    # A local binding's scheme goes into an environment that is
+                    # popped as soon as `c.body` has been solved, so a later
+                    # pass asking what `fun go()` generalized to has nowhere
+                    # left to ask. See `evidence.Abstraction.schemes`.
+                    c.dicts.schemes[name] = binding.scheme
                 self.env.define(name, binding)
                 if c.top_level:
                     self.top_level.define(name, binding)

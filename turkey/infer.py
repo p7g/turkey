@@ -352,7 +352,14 @@ class Generator:
         self.emit(CAssume(givens, CLet([(f"%{what}.{method.name}", expected)],
                                        defn, CAnd([]), decl.span,
                                        skolems=list(skolems.made))))
-        return MethodImpl(decl, self_name, params)
+        # Only the constants this scope actually *made*. The mapping also holds
+        # the class variable, whose entry is the instance head rather than a
+        # skolem -- `Functor Option`'s is `Option` itself -- and inverting that
+        # one would turn every real `Option` in the body back into a variable.
+        made = {id(con) for con in skolems.made}
+        return MethodImpl(decl, self_name, params,
+                          {k: v for k, v in skolems.mapping.items()
+                           if id(v) in made})
 
     # -- signatures --------------------------------------------------------
 
@@ -435,6 +442,13 @@ class Generator:
         passed = [(name, p) for (name, _), p in zip(givens, scheme.preds)
                   if self.classes.is_class(p.name)]
         decl.dicts = Abstraction([n for n, _ in passed], [p for _, p in passed])
+        # Which constant stands for which of the signature's variables, for the
+        # same reason `MethodImpl` records it: this body's recorded types name
+        # the constants, and the scheme names the variables.
+        decl.dicts.skolems = {
+            var.id: skolems.mapping[var.id] for var in tyvars.values()
+            if isinstance(var, TVar) and var.id in skolems.mapping
+        }
 
         self.push()
         inferred = self.gen_function(decl, rigid)
@@ -518,6 +532,14 @@ class Generator:
         and step too.
         """
         binds, defn, generalizes, mutable, sigs = self.build_definition(group)
+        # What each `fun` in the group was bound at. A generalizing group's
+        # schemes are recorded by the solver, which is the only place they
+        # exist; this covers the group that does not generalize, whose names
+        # are monomorphic and whose types are exactly these.
+        bound_types = dict(binds) | {n: s.body for n, s in sigs}
+        for item in group:
+            if isinstance(item, ast.SFun) and item.decl.name in bound_types:
+                self.types.record_decl(item.decl, bound_types[item.decl.name])
 
         self.scopes.append(
             {name: mutable for name, _ in binds}
@@ -703,6 +725,16 @@ class Generator:
         """Constrain a pattern against the type it scrutinizes, and name its
         binders. Binding them is the caller's job, since only the caller knows
         whether they are monomorphic."""
+        out = self._match_pattern(pat, t)
+        # Kept for the lowering, which needs a pattern binder's type wherever a
+        # binder becomes a reference cell -- `fun ignore(Cell { value })` may
+        # reassign `value`, and a cell needs to know what it holds. The Core
+        # checker derives these independently from the scrutinee, so recording
+        # them here is a second opinion rather than the only one.
+        self.types.record_pattern(pat, out)
+        return out
+
+    def _match_pattern(self, pat: ast.Pattern, t: Type) -> dict[str, Type]:
         if isinstance(pat, ast.PWild):
             return {}
         if isinstance(pat, ast.PVar):

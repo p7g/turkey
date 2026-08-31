@@ -49,16 +49,19 @@ def main() -> int:
             print(f"warning: {name_of(source)} was expected to {word}, exit {code}")
         print(f"{name_of(source)}: exit {code}, {len(output.splitlines())} line(s)")
 
-    # Only programs that already have a `.types` golden get one regenerated;
-    # adding a new one is a deliberate act, not a side effect of running this.
-    for golden in sorted(PROGRAMS.glob("*.types")):
-        types = subprocess.run(
-            [sys.executable, "-m", "turkey", "types", golden.with_suffix(".tl").name],
-            cwd=PROGRAMS, env=dict(os.environ, PYTHONPATH=str(ROOT)),
-            capture_output=True, text=True,
-        )
-        golden.write_text(types.stdout + types.stderr, encoding="utf-8")
-        print(f"{golden.name}: exit {types.returncode}")
+    # Only programs that already have a `.types` or `.core` golden get one
+    # regenerated; adding a new one is a deliberate act, not a side effect of
+    # running this.
+    for suffix, command in ((".types", "types"), (".core", "core")):
+        for golden in sorted(PROGRAMS.glob(f"*{suffix}")):
+            result = subprocess.run(
+                [sys.executable, "-m", "turkey", command,
+                 golden.with_suffix(".tl").name],
+                cwd=PROGRAMS, env=dict(os.environ, PYTHONPATH=str(ROOT)),
+                capture_output=True, text=True,
+            )
+            golden.write_text(result.stdout + result.stderr, encoding="utf-8")
+            print(f"{golden.name}: exit {result.returncode}")
     return 0
 
 

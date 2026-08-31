@@ -1937,3 +1937,101 @@ no case can forget; `Solver.solve_instance` fills in `Use.type_args`;
 `Checked` carries the table. New `tests/test_typed_ast.py`. No golden moved --
 this entry adds nothing a program can see, which is the point of doing it
 separately.
+
+### 49. The elaborator has a datatype, and evidence is checked
+
+Delta 30 made classes run by passing dictionaries, and left the elaboration as
+a set of mutable side objects hung on surface AST nodes: a `Use` per
+occurrence, an `Abstraction` per binding group, an `InstancePlan` per instance.
+`ast.py` types the first of them `object`. Nothing ever checked any of it. This
+entry gives it a datatype and a typechecker, which is `plan.txt` item 5's
+sentence exactly: it "makes evidence checkable rather than trusted".
+
+**What was actually at stake.** A dictionary in the wrong position was not a
+compile error. It was a wrong answer, or an `AttributeError` raised from inside
+the interpreter at whatever later moment the missing method was reached. The
+elaborator was correct, as far as anyone knew; "as far as anyone knew" was the
+problem, and it is the same problem the whole prototype exists to avoid
+elsewhere.
+
+**A class becomes a record type.** `class C a` gives `%Dict.C a`, with a field
+per method and a `%super.S` field per superclass. `%` cannot start an
+identifier, so no program can name it. That is the whole trick and everything
+else follows: a dictionary now has a type to be *wrong* about, so passing a
+`Monoid Int` where a `Semigroup Int` belongs stops typechecking.
+
+**An instance becomes a top-level binding.** `%inst.C.Con`, unique because
+instances are coherent (delta 43). One with a context becomes a function from
+dictionaries to a dictionary, which is what `instance [Show a] Show (Array a)`
+always meant -- the evaluator built it on demand and memoised it on object
+identity, and here it is an ordinary binding an ordinary application uses.
+
+**Evidence stops being a language.** `FromDict(name, path)` is a variable and a
+chain of field projections; `FromInstance(inst, args)` is a variable applied to
+the evidence for its own context. `Absent` is a call to `error`. There is no
+`Evidence` in Core, because there is nothing for it to be: it was a second,
+unchecked term language that only the evaluator understood.
+
+**A use site is a type application and then a value application**, in that
+order, because that is the order the two were abstracted in:
+
+    print(x)  ==>  Prelude#print[String](%inst.Show.String)(x)
+
+**Core has no statements.** A block is nested `CLet`s and a `var` is a
+reference cell -- `CRef` makes one, `CDeref` reads it, `CAssign` writes it.
+That last is the one place this entry writes down something the language never
+wrote down. Capture by reference was an accident of the evaluator's scope
+representation (`eval.py`'s shared mutable `REnv` chain), invisible until
+delta 46 put the rest of a block inside a lambda and delta 47's `spread` made
+it decide an answer. In Core it is a cell, so capture is by value of a
+reference and the reproduction is checkable rather than incidental.
+
+**The checker runs on every compile.** Not behind a flag and not only in tests:
+"evidence checkable rather than trusted" is not true of a check nobody runs, so
+it runs where exhaustiveness runs, unconditionally, in `driver.check`.
+
+**Three things it found immediately**, all of them real and none of them
+visible in any program's output:
+
+* A **default method** is elaborated once, against the *class* variable, and
+  shared by every instance that does not override it. Copying that body into
+  each dictionary put `a` where `Int` belonged. It is now one top-level
+  `%default.C.m`, polymorphic in the class variable, applied at each head.
+* A **method body is checked against skolems** (delta 40), so every type
+  recorded inside it names rigid constants where the class's declaration names
+  variables. So is the body of any `fun` with a complete signature (delta 38).
+  Both now record which constant stands for which variable, because nothing
+  else did and the two are the same types.
+* A **recursive call** is monomorphic to inference -- correctly; there is
+  nothing to record yet -- and still needs its type application in System-F, at
+  the binding's own variables. `isEven` calling `isOdd` is the case.
+
+**What the checker derives rather than reads.** A `CAlt` records no binding
+types. The checker works them out from the scrutinee's type and the
+constructor's declaration, so a pattern that does not fit its scrutinee is a
+rejected term. That check did not exist before: in the surface language the
+same fact was established by unification during inference and then forgotten.
+
+**What it is slack about, deliberately.** `⊥` absorbs, because it does
+(decision 12) -- a branch that returns is compatible with one that does not. A
+free variable matches anything, so a term that is *more* general than expected
+is not rejected. And an equality the binding's context states is a reduction
+rule while that binding is checked, consulted before the instance table exactly
+as `Solver.reduce` consults its assumptions first: `Item s` over a rigid `s`
+never reduces through an instance, and `bf.tl`'s `run[Iterator s, Item s ~ Op]`
+needs it to become `Op` for its `match` to typecheck at all.
+
+**What it costs.** A second traversal of every program at every compile, and
+three modules -- `core.py`, `lower.py`, `coretc.py` -- to keep in step with the
+elaborator they re-express. The evaluator does not use any of it yet, so for
+this entry the Core is a second opinion; delta 50 is what makes it the program.
+
+**Scope.** New `turkey/core.py`, `turkey/lower.py`, `turkey/coretc.py`; a
+`turkey core` subcommand printing the entry module's Core, as `turkey types`
+prints its signatures. `evidence.MethodImpl` and `evidence.Abstraction` record
+skolem maps and schemes the solver had been discarding. New
+`tests/test_core.py`, including the negative cases -- a checker exercised only
+on correct input is asserted to accept, which is the half that cannot fail.
+New `.core` goldens for `dicts`, `monads` and `question_control`. **No
+`.expected` and no `.types` moved**, which is the point: this entry adds a
+check and changes nothing a program can see.

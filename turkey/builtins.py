@@ -145,6 +145,8 @@ _PRIM: dict[str, tuple] = {
         _bi("Prim.arrayPop", 1, _pop),
     ),
 
+    "Prim.stringConcat": (mono(TFun([STRING, STRING], STRING)),
+                          _bi("Prim.stringConcat", 2, lambda a, b: a + b)),
     "Prim.stringLength": (mono(TFun([STRING], INT)),
                           _bi("Prim.stringLength", 1, lambda s: len(s))),
     "Prim.stringChars": (mono(TFun([STRING], array_of(CHAR))),

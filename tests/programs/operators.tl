@@ -34,15 +34,15 @@ fun biggest(xs) {
 -- `print` is `Prim.print(show(x))`, so a type that says how it looks is a
 -- type that can be printed.
 instance Show Money {
-    fun show(m) = Int.toString(m.cents) ++ "c"
+    fun show(m) = Int.toString(m.cents) + "c"
 }
 
 fun main() {
-    print(Int.toString(7 / 2) ++ " " ++ Int.toString(-7 / 2))
-    print(Int.toString(7 % 2) ++ " " ++ Int.toString(-7 % 2))
+    print(Int.toString(7 / 2) + " " + Int.toString(-7 / 2))
+    print(Int.toString(7 % 2) + " " + Int.toString(-7 % 2))
     print(Float.toString(1 + 2.5))
-    print(Bool.toString("abc" < "abd") ++ " " ++ Bool.toString('a' == 'a'))
-    print(Bool.toString(False < True) ++ " " ++ Bool.toString(1.5 != 1.5))
+    print(Bool.toString("abc" < "abd") + " " + Bool.toString('a' == 'a'))
+    print(Bool.toString(False < True) + " " + Bool.toString(1.5 != 1.5))
 
     print(Int.toString(sum3(1, 2, 3)))
     print(Float.toString(sum3(0.5, 0.25, 0.25)))

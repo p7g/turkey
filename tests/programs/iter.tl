@@ -71,12 +71,12 @@ fun total(xs) {
     sum
 }
 
--- `++` is `String`-only, so this one is not general: `Item xs ~ String` is
--- exactly the equation M7 defers, and nothing here would ever decide it.
+-- The annotation is what makes this one concrete. Without it `Item xs ~ Add a`
+-- would be exactly the equation M7 defers, and nothing here would decide it.
 fun join(xs : Array String) -> String {
     var out = ""
     for x in xs {
-        out = out ++ x
+        out = out + x
     }
     out
 }

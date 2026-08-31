@@ -34,7 +34,7 @@ instance [Display a] Display (Array a) {
     fun display(xs) {
         var s = ""
         for x in xs {
-            s = s ++ display(x)
+            s = s + display(x)
         }
         return s
     }
@@ -134,7 +134,7 @@ def test_an_unknown_type_resolves_to_the_dictionary_in_scope():
     This is the whole reason resolution waits for solving: at generation time
     `display(x)` looks exactly the same either way.
     """
-    checked = check(SHOW + "fun twice[Display a](x : a) -> String = display(x) ++ display(x)")
+    checked = check(SHOW + "fun twice[Display a](x : a) -> String = display(x) + display(x)")
     first, second = uses(checked, "twice")["display"]
     assert isinstance(first.evidence[0], FromDict)
     # Both occurrences take the same dictionary, and it is the one the
@@ -277,7 +277,7 @@ instance Twice Int {
 }
 
 instance Twice String {
-    fun join(x, y) = x ++ y
+    fun join(x, y) = x + y
 }
 
 fun main() {
@@ -299,7 +299,7 @@ instance Foldable Array {
     fun each(xs) {
         var s = ""
         for x in xs {
-            s = s ++ display(x)
+            s = s + display(x)
         }
         return s
     }
@@ -326,7 +326,7 @@ type Rose = Leaf(Int) | Node(Array Rose)
 instance Display Rose {
     fun display(t) = match t {
         Leaf(n) -> display(n)
-        Node(kids) -> "(" ++ display(kids) ++ ")"
+        Node(kids) -> "(" + display(kids) + ")"
     }
 }
 
@@ -352,7 +352,7 @@ fun main() {
 def test_a_local_function_may_have_its_own_context(capsys):
     src = SHOW + """
 fun outer[Display a](x : a) -> String {
-    fun inner(y) = display(y) ++ display(y)
+    fun inner(y) = display(y) + display(y)
     return inner(x)
 }
 
@@ -378,7 +378,7 @@ def test_an_empty_instance_takes_every_default(capsys):
     src = """
 class Greet a {
     fun name(a) -> String
-    fun hello(x : a) -> String = "hi " ++ name(x)
+    fun hello(x : a) -> String = "hi " + name(x)
 }
 
 instance Greet Int {

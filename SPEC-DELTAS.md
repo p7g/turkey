@@ -797,7 +797,8 @@ is no operator table in the checker, no case in the evaluator, and no way for
 `+` to be more privileged than a function a program writes itself. What is left
 of §8.2's table is three entries: `&&` and `||`, which short-circuit and so
 cannot be calls, and `++`, which is concatenation on `String` and has no class
-to belong to until there is a `Semigroup`.
+to belong to until there is a `Semigroup`. (Delta 44 removes `++`: the class it
+belongs to turned out to be `Add`.)
 
 **Per-operator classes, not one `Num`.** `Add`, `Sub`, `Mul`, `Div`, `Rem` and
 `Neg` are separate, as in Rust's `std::ops`, so a type that adds is not thereby
@@ -1539,3 +1540,40 @@ the language — `if A { ... }` over a local `Bool` is now
 **Scope.** No golden moved except `tests/programs/modules/Main.tl`, which now
 writes `G.Point` where it wrote `Point` — the deliberate change. Two tests
 changed because they pinned the redeclaration collision this delta removes.
+
+### 44. Concatenation is `instance Add String`, and `++` is gone
+
+Delta 32 made every arithmetic and comparison operator a class method and left
+three entries behind in §8.2's table. Two of them, `&&` and `||`, are there for
+a reason no class can express: they short-circuit, and a function call does not.
+The third, `++`, was there for no reason at all — only because delta 32 looked
+for a `Semigroup` to put it in and there wasn't one.
+
+There did not need to be. `Add` is `class Add a { fun add(a, a) -> a }`, which
+is exactly the shape of concatenation, so **`instance Add String` is the whole
+change** and `"a" + "b"` is `add("a", "b")` like any other `+`. The primitive it
+calls, `Prim.stringConcat`, joins the other `Prim.string*` operations that
+delta 42 moved the library onto.
+
+Nothing about `Add` had to bend to accept it. The class is per-operator rather
+than one omnibus `Num` (delta 32), so `String` adding does not oblige it to
+subtract or divide, and `"a" - "b"` is still a missing instance rather than a
+runtime error. The instance is not an orphan under delta 43 either: `Add` is the
+Prelude's own class, and it is declared in the Prelude.
+
+**What this removes.** The token, its precedence row, the last entry in
+`infer.BINARY_OPS` that is not short-circuiting, and `eval.BINARY` entirely —
+the evaluator now has no binary-operator table at all, only the two
+short-circuit cases and the method path. `String` gains nothing it did not have
+and the language loses an operator that a program could not have written for
+itself.
+
+**What it costs.** A concatenation is a dictionary-mediated method call where it
+used to be a builtin, which is the same trade delta 32 already made for `+` on
+`Int`. And a use of `+` no longer pins its operands to `String` on sight: `fun
+add(x, y) = x + y` was `fun(String, String) -> String` when written with `++`
+and is `[Add a] fun(a, a) -> a` now, which is more general and more honest. One
+test that relied on that pinning writes the annotation instead.
+
+**Scope.** Every `.tl` that concatenated changed spelling; no `.expected` and no
+`.types` golden moved.

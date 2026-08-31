@@ -124,6 +124,8 @@ instance Div Int { fun div(x, y) = Prim.intDiv(x, y) }
 instance Rem Int { fun rem(x, y) = Prim.intRem(x, y) }
 instance Neg Int { fun neg(x) = Prim.intNeg(x) }
 
+instance Add String { fun add(x, y) = Prim.stringConcat(x, y) }
+
 instance Add Float { fun add(x, y) = Prim.floatAdd(x, y) }
 instance Sub Float { fun sub(x, y) = Prim.floatSub(x, y) }
 instance Mul Float { fun mul(x, y) = Prim.floatMul(x, y) }
@@ -157,7 +159,7 @@ instance Show String { fun show(x) = x }
 instance [Show a] Show (Option a) {
     fun show(o) = match o {
         None -> "None"
-        Some(x) -> "Some(" ++ show(x) ++ ")"
+        Some(x) -> "Some(" + show(x) + ")"
     }
 }
 
@@ -166,11 +168,11 @@ instance [Show a] Show (Array a) {
         var out = "["
         var rest = False
         for x in xs {
-            if rest { out = out ++ ", " }
-            out = out ++ show(x)
+            if rest { out = out + ", " }
+            out = out + show(x)
             rest = True
         }
-        out ++ "]"
+        out + "]"
     }
 }
 

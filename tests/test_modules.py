@@ -26,7 +26,7 @@ module Helper (twice, greet) where
 
 fun twice(n : Int) -> Int = n + n
 
-fun greet(who : String) -> String = "hello, " ++ who
+fun greet(who : String) -> String = "hello, " + who
 
 fun secret() -> Int = 7
 """
@@ -141,7 +141,7 @@ def test_a_local_definition_shadows_an_import(tmp_path):
     """design.md section 9.3 rule 2. The two are different bindings, not a
     conflict: `twice` here is `Main#twice`."""
     search = write(tmp_path, Helper=HELPER)
-    src = "import Helper\nfun twice(s : String) -> String = s ++ s"
+    src = "import Helper\nfun twice(s : String) -> String = s + s"
     assert sigs(src, search)["twice"] == "fun(String) -> String"
 
 
@@ -159,7 +159,7 @@ def test_a_module_may_define_a_name_the_prelude_uses(tmp_path):
 
 def test_an_operator_still_means_its_class_method(tmp_path, capsys):
     """The desugared node is marked, not looked up -- see turkey/resolve.py."""
-    src = 'fun add(x : String, y : String) -> String = x ++ y\n' \
+    src = 'fun add(x : String, y : String) -> String = x + y\n' \
           'fun main() { print(add("a", "b")); print(1 + 2) }'
     assert output(src, [tmp_path], capsys) == ["ab", "3"]
 
@@ -240,7 +240,7 @@ def test_run_evaluates_every_module_in_dependency_order(tmp_path, capsys):
         tmp_path,
         Helper=HELPER,
         Middle="module Middle (loud) where\nimport Helper (greet)\n"
-               "fun loud(who : String) -> String = greet(who) ++ \"!\"",
+               "fun loud(who : String) -> String = greet(who) + \"!\"",
     )
     src = 'import Middle\nfun main() { print(loud("world")) }'
     assert output(src, search, capsys) == ["hello, world!"]

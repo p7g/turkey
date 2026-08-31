@@ -18,8 +18,8 @@ fun area(s : Shape) -> Int {
 
 fun describe(s : Shape) -> String {
     match s {
-        Circle { radius } -> "circle of " ++ Int.toString(radius)
-        Rect(w, h) -> Int.toString(w) ++ "x" ++ Int.toString(h)
+        Circle { radius } -> "circle of " + Int.toString(radius)
+        Rect(w, h) -> Int.toString(w) + "x" + Int.toString(h)
     }
 }
 
@@ -45,7 +45,7 @@ fun main() {
     print(Int.toString(width(Rect(6, 7))))
 
     let Point(a, b) = shift(Point { x = 1, y = 2 }, 10)
-    print(Int.toString(a) ++ "," ++ Int.toString(b))
+    print(Int.toString(a) + "," + Int.toString(b))
 
     match shift(Point(0, 0), 4) {
         Point { x } -> print(Int.toString(x))

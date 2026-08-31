@@ -31,7 +31,7 @@ instance Monoid Int {
 }
 
 instance Semigroup String {
-    fun combine(x, y) = x ++ y
+    fun combine(x, y) = x + y
 }
 
 instance Monoid String {

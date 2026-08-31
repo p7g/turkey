@@ -41,7 +41,7 @@ CHAR     ← '...'
 ```
 =  ==  !=  <  <=  >  >=
 +  -  *  /  %
-++ && ||  !
+&& ||  !
 -> :  ;  ,  .  |  {  }  (  )  [  ]
 ```
 
@@ -178,7 +178,7 @@ expr-or      ::= expr-and ("||" expr-and)*
 expr-and     ::= expr-eq ("&&" expr-eq)*
 expr-eq      ::= expr-rel (("==" | "!=") expr-rel)*
 expr-rel     ::= expr-add (("<" | "<=" | ">" | ">=") expr-add)*
-expr-add     ::= expr-mul (("+" | "-" | "++") expr-mul)*
+expr-add     ::= expr-mul (("+" | "-") expr-mul)*
 expr-mul     ::= expr-unary (("*" | "/" | "%") expr-unary)*
 expr-unary   ::= "!" expr-unary
                | "-" expr-unary
@@ -515,13 +515,13 @@ mean integer addition is `instance Add Int`.
 | `-` (unary) | `neg` | `Neg` |
 | `==` `!=` | `eq` `ne` | `Eq` |
 | `<` `<=` `>` `>=` | `lt` `lte` `gt` `gte` | `Ord`, whose superclass is `Eq` |
-| `++` | -- | `fun(String, String) -> String` |
 | `&&` `\|\|` | -- | `fun(Bool, Bool) -> Bool`, short-circuit |
 | `!` | -- | `fun(Bool) -> Bool` |
 
-The last three are not methods. `&&` and `||` short-circuit, which no function
-call does, and `++` is concatenation on `String`, which has no class to belong
-to until there is a `Semigroup`.
+The last three are not methods, and for a reason no class can express: `&&` and
+`||` short-circuit, which no function call does, and `!` is defined in terms of
+them. There is no `++`: concatenation is `instance Add String`, so `+` on two
+strings is the same method call as `+` on two integers (SPEC-DELTAS.md 44).
 
 The classes are per-operator and Rust-shaped rather than one omnibus `Num`, so
 a type that adds is not thereby required to divide. They are ordinary source

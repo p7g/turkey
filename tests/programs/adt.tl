@@ -14,7 +14,7 @@ fun isOdd(n) = if n == 0 { False } else { isEven(n - 1) }
 
 fun classify(o) -> String = match o {
     None -> "none"
-    Some(x) -> "some " ++ Int.toString(x)
+    Some(x) -> "some " + Int.toString(x)
 }
 
 fun bump(c : Counter) -> Unit { c.n = c.n + 1 }
@@ -49,6 +49,6 @@ fun main() {
     print(Int.toString(c.n))
     print(classify(firstEven([1, 3, 4, 5])))
     print(Int.toString(countdown(5)))
-    print(poly("polymorphic use") ++ " / " ++ Int.toString(poly(7)))
+    print(poly("polymorphic use") + " / " + Int.toString(poly(7)))
     print(Int.toString(apply(fun(y) = y * 2, 21)))
 }

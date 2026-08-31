@@ -72,7 +72,7 @@ def test_a_user_type_prints_through_its_own_instance(capsys):
 type Money = Money { cents : Int }
 
 instance Show Money {
-    fun show(m) = Int.toString(m.cents) ++ "c"
+    fun show(m) = Int.toString(m.cents) + "c"
 }
 
 fun main() { print(Money { cents = 7 }) }

@@ -60,13 +60,11 @@ LITERAL_TYPES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR}
 # one type and is emitted as one; only the numeric kinds are open.
 NUMERIC_KINDS = frozenset({"Int", "Float"})
 
-# What is left of section 8.2's operator table after M8. Everything arithmetic
-# or comparative is a class method now (`turkey/prelude.py`); these three are
-# not, and each for its own reason. `&&` and `||` short-circuit, which no
-# function call does, and `++` is concatenation on `String`, which has no class
-# to belong to until there is a `Semigroup`.
+# What is left of section 8.2's operator table after M8 and delta 44. Every
+# operator that names a value is a class method now (`turkey/prelude.py`);
+# these two are not, and for a reason no class can express: `&&` and `||`
+# short-circuit, which no function call does.
 BINARY_OPS: dict[str, tuple[Type, Type, Type]] = {
-    "++": (STRING, STRING, STRING),
     "&&": (BOOL, BOOL, BOOL),
     "||": (BOOL, BOOL, BOOL),
 }

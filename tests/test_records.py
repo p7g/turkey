@@ -72,7 +72,7 @@ def test_a_positional_pattern_binds_in_declaration_order(capsys):
 fun main() {
     let r = Rect { height = 4, width = 3 }
     match r {
-        Rect(w, h) -> print(Int.toString(w) ++ "," ++ Int.toString(h))
+        Rect(w, h) -> print(Int.toString(w) + "," + Int.toString(h))
         Circle(_) -> print("no")
     }
 }

@@ -2,7 +2,7 @@ import Stack (empty, push, pop)
 import qualified Geometry as G
 
 -- A bare `add`, which every version before M11a rejected outright.
-fun add(x : String, y : String) -> String = x ++ y
+fun add(x : String, y : String) -> String = x + y
 
 fun main() {
     let s = empty()

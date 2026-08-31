@@ -38,7 +38,7 @@ instance Monoid Int {
 }
 
 instance Semigroup String {
-    fun combine(x, y) = x ++ y
+    fun combine(x, y) = x + y
 }
 
 instance Monoid String {
@@ -117,7 +117,7 @@ fun squash[Monoid a](xs : Array a) -> a {
 fun triple(x) = combine(x, combine(x, x))
 
 fun render(xs : Array Int) -> String {
-    return foldMap(xs, fun(n) = Int.toString(n) ++ " ")
+    return foldMap(xs, fun(n) = Int.toString(n) + " ")
 }
 
 fun main() {

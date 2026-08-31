@@ -166,7 +166,7 @@ def test_an_unannotated_numeric_function_carries_both_predicates():
 
 def test_int_division_still_truncates_toward_zero(capsys):
     # SPEC-DELTAS.md entry 18, now carried by `instance Div Int`.
-    src = "fun main() { print(Int.toString(-7 / 2) ++ \" \" ++ Int.toString(-7 % 2)) }"
+    src = "fun main() { print(Int.toString(-7 / 2) + \" \" + Int.toString(-7 % 2)) }"
     assert output(src, capsys) == ["-3 -1"]
 
 
@@ -243,7 +243,8 @@ def test_a_program_may_define_a_name_a_class_method_already_has():
     """A method lives in the *global* namespace and a top-level binding lives
     in its module's, so the two no longer collide (M11a). This is the papercut
     `plan.txt` item 3 opens with: M9 had to rename its `add`."""
-    assert scheme('fun add(x, y) = x ++ y', "add") == "fun(String, String) -> String"
+    assert scheme('fun add(x : String, y : String) -> String = x + y', "add") == \
+        "fun(String, String) -> String"
 
 
 def test_an_operator_still_means_its_method_next_to_a_local_of_that_name(capsys):
@@ -251,7 +252,7 @@ def test_an_operator_still_means_its_method_next_to_a_local_of_that_name(capsys)
     `add` would capture every `+` if that node were resolved by name. It is
     marked as a method instead -- see `turkey/resolve.py`."""
     src = '''
-fun add(x, y) = x ++ y
+fun add(x, y) = x + y
 fun main() {
     print(add("a", "b"))
     print(1 + 2)

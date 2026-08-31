@@ -93,12 +93,6 @@ def _float_div(a: float, b: float) -> float:
     return a / b
 
 
-# All that is left of the operator table (M8): `++` is the only binary operator
-# that is not a class method, and `&&`/`||` are handled inline because they
-# short-circuit.
-BINARY = {"++": lambda a, b: a + b}
-
-
 class Evaluator:
     def __init__(self, decls: DeclTable, globals_: dict):
         self.decls = decls
@@ -349,8 +343,6 @@ class Evaluator:
         if e.op == "||":
             left = self.eval(e.left, env)
             return left if truth(left) else self.eval(e.right, env)
-        if e.fn is None:
-            return BINARY[e.op](self.eval(e.left, env), self.eval(e.right, env))
         # Every other operator is a method, and `e.fn` is the use that carries
         # the evidence for it -- selecting `add` from an `Add` dictionary is the
         # same code path as any other method call.

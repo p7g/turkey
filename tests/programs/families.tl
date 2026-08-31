@@ -38,7 +38,7 @@ instance Container Pair {
 -- mentions. It waits while `c` is open and reduces the moment `c` is a
 -- constructor, which is the whole of what a family buys.
 fun describe[Container c, Show (Elem c)](xs : c) -> String {
-    return show(first(xs)) ++ " of " ++ Int.toString(size(xs))
+    return show(first(xs)) + " of " + Int.toString(size(xs))
 }
 
 -- Inferred, context and all: nothing here is annotated.

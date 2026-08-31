@@ -132,7 +132,15 @@ class Abstraction:
 
 @dataclass
 class Use:
-    """One occurrence of a name, and the evidence it turned out to need."""
+    """One occurrence of a name, and the evidence it turned out to need.
+
+    `type_args` is the other half of the same story, and is filled in beside
+    the predicates by the same line of the solver. A use of a polymorphic name
+    instantiates its scheme at *something*; the predicates say what evidence
+    that costs, and the type arguments say what the instantiation was. Both
+    were built by `instantiate_qual` and only the first was kept, because until
+    there was a typed Core nothing downstream asked what a name was used at.
+    """
 
     name: str
     span: Span | None = None
@@ -140,6 +148,10 @@ class Use:
     scopes: tuple[Scope, ...] = ()
     evidence: list[Evidence] = field(default_factory=list)
     method: MethodInfo | None = None
+    # In the scheme's `quantified` order, which is the order a `CTyLam` at the
+    # definition binds them in -- so the two need no separate agreement, the
+    # same way `Abstraction.preds` is the order of the dictionary parameters.
+    type_args: list[Type] = field(default_factory=list)
 
 
 # ------------------------------------------------------- what a method becomes

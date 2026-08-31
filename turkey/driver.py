@@ -35,6 +35,7 @@ from .evidence import Elaborator
 from .infer import Generator
 from .modules import ENTRY, SEP, Module, ModuleLoader
 from .resolve import Resolver
+from .typed import TypeTable
 from .types import Scheme
 
 
@@ -50,6 +51,7 @@ class Checked:
     main: str  # what `main` is called internally, if the entry defines one
     signatures: list[tuple[str, Scheme]]  # the entry module's, in source order
     warnings: list[str]
+    types: TypeTable  # every expression's type, for the lowering (M13a)
 
 
 def check(src: str, file: str | None = None,
@@ -66,6 +68,10 @@ def check(src: str, file: str | None = None,
     ordered: list[ast.Stmt] = []
     warnings: list[str] = []
     generator = None
+    # Shared across modules for the same reason `decls` and `env` are: after
+    # resolution there is one flat namespace and one program, so there is
+    # nothing for a second table to separate.
+    types = TypeTable()
 
     for module in loader.order:
         Resolver(module.scope).program(module.program)
@@ -78,7 +84,7 @@ def check(src: str, file: str | None = None,
         # Generation builds the module's constraint and decides nothing;
         # solving is what assigns ranks, generalizes and fills in `env`.
         # Splitting them this way is the point of the HM(X) shape.
-        generator = Generator(decls, env, classes, module.name)
+        generator = Generator(decls, env, classes, module.name, types)
         classes = generator.classes
         items, constraint = generator.generate(module.program)
         solver = Solver(decls, env, classes)
@@ -95,7 +101,7 @@ def check(src: str, file: str | None = None,
     return Checked(
         entry.program, ordered, decls, classes, env, loader.order,
         entry.scope.values, entry.scope.values.get("main", "main"),
-        _signatures(entry, env, classes), warnings,
+        _signatures(entry, env, classes), warnings, types,
     )
 
 

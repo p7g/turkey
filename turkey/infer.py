@@ -48,6 +48,7 @@ from .decls import DeclTable
 from .deps import free_names, pattern_vars, sccs
 from .evidence import Abstraction, InstancePlan, MethodImpl, Use, dict_name
 from .errors import Span, TypeError_
+from .typed import TypeTable
 from .types import (
     BOOL, BOTTOM, CHAR, FLOAT, INT, STRING, UNIT, Pred, Scheme, TBottom, TFun,
     TLabel, TSet, TTuple, TVar, Type, apply, array_of, float_literal_set,
@@ -91,14 +92,22 @@ class Frame:
 
 class Generator:
     def __init__(self, decls: DeclTable, builtins: Env,
-                 classes: ClassTable | None = None, module: str = ""):
+                 classes: ClassTable | None = None, module: str = "",
+                 types: TypeTable | None = None):
         self.decls = decls
+        # Every expression's type, kept for the lowering rather than dropped
+        # once the constraint is built. Shared across modules the way `decls`
+        # and `env` are: one program, one table. See turkey/typed.py.
+        self.types = TypeTable() if types is None else types
         # Which module is being generated, for the orphan rule (delta 43).
         self.module = module
         # The prelude's classes arrive already registered (M8); the table is
         # shared so that `instance Add Int` is visible here, while the
         # environment is not, so `Prim.intAdd` is not.
         self.classes = ClassTable(decls) if classes is None else classes
+        # A recorded type is read back through the instance table, so the table
+        # has to know it. Idempotent: every module shares the one `ClassTable`.
+        self.types.observe(self.classes)
         # Class methods are bound here rather than by a `CLet`: a method's type
         # comes from its class, not from anything solving discovers, so it is
         # in scope from the first line of the program.
@@ -829,7 +838,12 @@ class Generator:
         method = getattr(self, "_gen_" + type(e).__name__, None)
         if method is None:
             raise AssertionError(f"unhandled expression {type(e).__name__}")
-        return method(e)
+        ty = method(e)
+        # One place, so no case can forget. What is recorded is the variable
+        # itself, not a snapshot of it: solving fills it in later, and reading
+        # it back is `TypeTable.resolve`'s job. See turkey/typed.py.
+        self.types.record(e, ty)
+        return ty
 
     def use(self, name: str, span: Span | None, node: ast.EVar | None = None) -> Type:
         """`name <= t` for a fresh `t`. No lookup: that is the solver's job.

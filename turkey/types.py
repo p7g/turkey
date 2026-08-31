@@ -907,8 +907,10 @@ def instantiate(scheme: Scheme, fresh: Fresh) -> Type:
     return instantiate_qual(scheme, fresh)[1]
 
 
-def instantiate_qual(scheme: Scheme, fresh: Fresh) -> tuple[list[Pred], Type]:
-    """Instantiate a scheme, returning its context alongside its type.
+def instantiate_qual(
+    scheme: Scheme, fresh: Fresh,
+) -> tuple[list[Pred], Type, list[Type]]:
+    """Instantiate a scheme, returning its context and its type arguments.
 
     `fresh` is supplied by the caller rather than a rank being passed in,
     because a new variable has to be registered wherever its owner tracks them
@@ -919,16 +921,26 @@ def instantiate_qual(scheme: Scheme, fresh: Fresh) -> tuple[list[Pred], Type]:
     The context has to be renamed by the same substitution as the body, or its
     predicates would constrain the scheme's original variables rather than this
     use site's fresh ones.
+
+    The third result is the substitution itself, in `scheme.quantified`'s order:
+    what this occurrence instantiated the scheme *at*. It was built here and
+    thrown away until M13a, because nothing downstream of the solver asked. A
+    typed Core asks -- it is the argument list of the type application that a
+    use of a polymorphic name becomes -- and the variables are still bare here,
+    which is right: the solver decides what they are, and reading them back is
+    `typed.TypeTable.resolve`'s job, not this function's.
     """
     if not scheme.quantified:
-        return list(scheme.preds), scheme.body
+        return list(scheme.preds), scheme.body, []
     # A fresh variable stands for a quantified one, so it inherits its kind:
     # instantiating `Wrap f a` must not turn the `f` into something of kind `*`.
     mapping = {}
+    args: list[Type] = []
     for v in scheme.quantified:
         replacement = fresh()
         unify_kinds(replacement.kind, v.kind)
         mapping[v.id] = replacement
+        args.append(replacement)
 
     def walk(ty: Type) -> Type:
         ty = prune(ty)
@@ -945,7 +957,7 @@ def instantiate_qual(scheme: Scheme, fresh: Fresh) -> tuple[list[Pred], Type]:
         return ty
 
     preds = [Pred(p.name, [walk(a) for a in p.args]) for p in scheme.preds]
-    return preds, walk(scheme.body)
+    return preds, walk(scheme.body), args
 
 
 def type_key(t: Type) -> tuple:

@@ -157,8 +157,12 @@ type Instr = IPush(Int)
            | IMul
            | INeg
 
--- `instrs` must be annotated: `Item a` is not injective (M7), so matching the
--- loop variable against `IPush` cannot say which `Iterator` instance produced it.
+-- The annotation is documentation, not a requirement. It once was one: `Item a`
+-- is not injective (M7), so matching the loop variable against `IPush` cannot
+-- say which `Iterator` instance produced it. Since delta 39 a scheme may carry
+-- the equation instead, and without the annotation this infers
+-- `[Item a ~ Instr, Iterator a] fun(a) -> Int` -- which is the more general
+-- type, and says out loud what the body needed.
 fun exec(instrs : Array Instr) {
     let s = newStack()
     for i in instrs {

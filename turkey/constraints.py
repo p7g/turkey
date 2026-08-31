@@ -957,10 +957,17 @@ class Solver:
             assert isinstance(fam, TFam)
             cls = self.classes.decls.families[fam.name].cls
             where = f" in {c.context}" if c.context else ""
+            # Name the remedy, the way the other two branches below do. Since
+            # delta 39 that remedy is no longer "add a type annotation": an
+            # equality is something a *context* may state, so the fix is to
+            # write in the signature what an inferred scheme would have carried
+            # by itself.
+            equality = (f"{show(fam, free_prefix='')} ~ "
+                        f"{show(other, free_prefix='')}")
             raise TypeError_(
                 f"cannot reduce '{show(fam, free_prefix='')}' to "
                 f"'{show(other, free_prefix='')}'{where}: nothing says which "
-                f"'{cls}' instance defines it.",
+                f"'{cls}' instance defines it. Add '{equality}' to the context.",
                 c.span,
             )
         if c.pred.name == HAS_FIELD:

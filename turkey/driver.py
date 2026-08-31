@@ -23,7 +23,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import ast, coretc, desugar, lower, mono
+from . import ast, coretc, desugar, joins, lower, mono
 from .builtins import initial_type_env, initial_values
 from .classes import ClassTable
 from .constraints import Env, Solver
@@ -55,6 +55,7 @@ class Checked:
     types: TypeTable  # every expression's type, for the lowering (M13a)
     core: CProgram  # the elaboration, as a checked datatype (M13b)
     mono: CProgram  # the elaboration specialized, checked the same way (M14a)
+    opt: CProgram  # and optimized, checked again (M15b)
     module: str  # the entry module's name, for `turkey core`
 
 
@@ -114,11 +115,19 @@ def check(src: str, file: str | None = None,
     main = entry.scope.values.get("main", "main")
     program_mono = mono.monomorphize(program_core, decls, classes, main)
     coretc.check_program(program_mono, decls, classes, coretc.globals_of(env))
+    # And the optimizations, checked the same way and for the sharpest reason
+    # yet: join-point discovery decides that a call is in tail position, and
+    # the checker decides the same thing independently by threading a join
+    # scope. A pass that called a position a tail when the rule does not emits
+    # a jump with nowhere to go, and this is where that is caught -- on every
+    # program in the suite, on every run. See turkey/joins.py.
+    program_opt = joins.discover(program_mono)
+    coretc.check_program(program_opt, decls, classes, coretc.globals_of(env))
     return Checked(
         entry.program, ordered, decls, classes, env, loader.order,
         entry.scope.values, main,
         _signatures(entry, env, classes), warnings, types,
-        program_core, program_mono, entry.name,
+        program_core, program_mono, program_opt, entry.name,
     )
 
 
@@ -154,11 +163,12 @@ def run(src: str, filename: str = "<input>") -> None:
     search = [Path(filename).resolve().parent] if filename != "<input>" else None
     checked = check(src, None if filename == "<input>" else filename, search)
     report_warnings(checked.warnings, filename)
-    # The specialized Core is the program that runs (M14b). `checked.core` is
-    # kept because it is what `turkey core` prints and what the specialization
-    # is read against, but nothing evaluates it: a pass whose output is only
-    # ever inspected is a pass nothing tests.
-    Evaluator(checked.decls, initial_values()).run(checked.mono, checked.main)
+    # The *optimized* Core is the program that runs (M15b), for the reason the
+    # specialized one was made to run at M14b: a pass whose output is only ever
+    # inspected is a pass nothing tests. `checked.core` and `checked.mono` are
+    # kept because they are what `turkey core` and `turkey mono` print and what
+    # each later stage is read against, but nothing evaluates them.
+    Evaluator(checked.decls, initial_values()).run(checked.opt, checked.main)
 
 
 def report_warnings(warnings: list[str], filename: str) -> None:

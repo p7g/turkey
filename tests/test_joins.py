@@ -1,4 +1,4 @@
-"""Join points in Core: the nodes, the rule, and what runs them.
+"""Join points in Core: the nodes, the rule, what runs them, and what finds them.
 
 `plan.txt` item 7. A join point is a `let`-bound continuation that is only ever
 jumped to -- every mention saturated, every mention in tail position, none of
@@ -6,13 +6,19 @@ them escaping -- which is what lets a backend compile it as a label instead of
 a closure (Maurer, Downen, Ariola and Peyton Jones, *Compiling without
 continuations*, PLDI 2017).
 
-Nothing produces these nodes yet. That is deliberate and it is what makes this
-file the whole of the milestone's evidence: no golden moves, so the only thing
-that can say the IR and its rule exist is a test that builds the terms by hand
-and asks the checker about them. As in `tests/test_core.py`, the interesting
-assertions are the ones about terms that must be **rejected** -- a checker
-exercised only on correct input is asserted to accept, which is the half that
-cannot fail.
+Two halves, in the order they were built. **M15a** is the IR and the rule, and
+nothing produced a join point when it landed -- so no golden moved, and the
+only thing that could say the nodes existed was a test building the terms by
+hand and asking the checker about them. As in `tests/test_core.py`, the
+interesting assertions there are about terms that must be **rejected**: a
+checker exercised only on correct input is asserted to accept, which is the
+half that cannot fail.
+
+**M15b** is `turkey/joins.py`, the pass that finds them. Its own evidence is
+mostly `tests/programs/joins.opt`, which shows which local function became a
+label and which stayed a closure; what is here is the small cases and the
+negative ones, where being wrong would be a miscompilation rather than a missed
+optimization.
 
 The restriction is the reason these are separate nodes rather than a flag on
 `CLetRec` with `CApp` for the jumps. A walker taught nothing about `CJoin`
@@ -300,3 +306,145 @@ def test_the_printer_renders_a_join_and_a_jump():
     text = show_bind(_named(program, "Main#probe"))
     assert "join %j(x : Int) : Int = {" in text
     assert "jump %j(5)" in text
+
+
+# -- discovery (M15b) --------------------------------------------------------
+
+
+def opt(src: str):
+    """A program's optimized Core, and the `Checked` it came from."""
+    checked = check(src)
+    return checked, checked.opt
+
+
+def joins_in(program, name: str):
+    from dataclasses import fields
+    from turkey.core import CAlt, CBind, CExpr
+
+    found = []
+
+    def go(v):
+        if isinstance(v, CJoin):
+            found.append(v)
+        if isinstance(v, (CExpr, CBind, CAlt)):
+            for f in fields(v):
+                go(getattr(v, f.name))
+        elif isinstance(v, (list, tuple)):
+            for x in v:
+                go(x)
+
+    go(_named(program, name).value)
+    return found
+
+
+def test_a_local_called_only_from_tail_positions_becomes_a_label():
+    checked, program = opt("""
+fun converge(n : Int) -> Int {
+    let tag = fun(x : Int) -> Int { x + 1 }
+    if n > 0 { tag(n) } else { tag(0 - n) }
+}
+fun main() { print(converge(1)) }
+""")
+    found = joins_in(program, "Main#converge")
+    assert len(found) == 1 and not found[0].recursive
+    accept(checked, program)
+
+
+def test_a_tail_recursive_local_becomes_a_recursive_label():
+    """A loop, and nothing in the surface program said so.
+
+    The fact is derived from where the calls are. That is the argument for
+    doing this in Core instead of in the desugaring: the desugaring can only
+    know what the author wrote.
+    """
+    checked, program = opt("""
+fun countdown(n : Int) -> Int {
+    fun go(i : Int, acc : Int) -> Int =
+        if i <= 0 { acc } else { go(i - 1, acc + i) }
+    go(n, 0)
+}
+fun main() { print(countdown(4)) }
+""")
+    found = joins_in(program, "Main#countdown")
+    assert len(found) == 1 and found[0].recursive
+    accept(checked, program)
+
+
+def test_a_local_that_escapes_stays_a_closure():
+    """`twice` calls its argument, so `step` is passed somewhere.
+
+    A label is not something you can pass, and this is the case where being
+    wrong would be a miscompilation rather than a missed optimization.
+    """
+    _, program = opt("""
+fun twice(f : fun(Int) -> Int, x : Int) -> Int = f(f(x))
+fun escapes(n : Int) -> Int {
+    let step = fun(x : Int) -> Int { x + 3 }
+    twice(step, n)
+}
+fun main() { print(escapes(1)) }
+""")
+    assert not joins_in(program, "Main#escapes")
+
+
+def test_a_local_called_out_of_tail_position_stays_a_closure():
+    """The call is saturated and the name never escapes, and it still does not
+    qualify: its value is not the value of the body, so a jump would discard
+    the `+ 1` that comes after it."""
+    _, program = opt("""
+fun offset(n : Int) -> Int {
+    let tag = fun(x : Int) -> Int { x * 2 }
+    tag(n) + 1
+}
+fun main() { print(offset(1)) }
+""")
+    assert not joins_in(program, "Main#offset")
+
+
+def test_the_optimized_program_is_the_one_that_runs(capsys):
+    """M14b's rule, one stage further along: a pass whose output is only ever
+    inspected is a pass nothing tests. So `driver.run` evaluates `opt`, and
+    every golden in `tests/programs` exercises the join evaluator."""
+    from turkey.driver import run
+
+    run("""
+fun countdown(n : Int) -> Int {
+    fun go(i : Int, acc : Int) -> Int =
+        if i <= 0 { acc } else { go(i - 1, acc + i) }
+    go(n, 0)
+}
+fun main() { print(countdown(4)) }
+""")
+    assert capsys.readouterr().out == "10\n"
+
+
+def test_the_checker_accepts_a_jump_in_every_position_the_table_calls_a_tail():
+    """`core.TAIL_FIELDS` is read by `joins.py` to find tail calls and by
+    `coretc.py` to decide what a join scope reaches. This is the third reader,
+    and it exists so the table cannot quietly grow an entry the rule does not
+    honour -- which would be a pass emitting jumps the checker rejects.
+    """
+    from turkey.core import TAIL_FIELDS
+
+    assert set(TAIL_FIELDS) == {"CIf", "CLet", "CLetRec", "CJoin", "CMatch"}, (
+        "a new entry needs a case below, and a rule in coretc that honours it")
+
+    from turkey import ast
+    from turkey.core import CAlt, CBind, CLetRec, CMatch
+
+    inner = jump("%j", lit(4))
+    bodies = [
+        CIf(INT, None, true(), inner, lit(0)),
+        CIf(INT, None, true(), lit(0), inner),
+        CLet(INT, None, "%seq", INT, lit(1), inner),
+        CLetRec(INT, None,
+                [CBind("%r", TFun([], INT), [],
+                       CLam(TFun([], INT), None, [], lit(0)))],
+                inner),
+        CJoin(INT, None, "%k", [], lit(0), inner),
+        CMatch(INT, None, lit(1), [CAlt(ast.PWild(None), inner)]),
+    ]
+    for body in bodies:
+        checked, program = built(
+            CJoin(INT, None, "%j", [CParam("x", INT)], var("x"), body))
+        accept(checked, program)

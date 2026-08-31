@@ -72,12 +72,11 @@ from dataclasses import dataclass, field
 from . import ast
 from .classes import ClassTable, match
 from .core import (
-    CAlt, CApp, CArray, CAssign, CBind, CBreak, CCon, CContinue, CDeref, CExpr,
-    CField, CForC, CForIn, CIf, CIndex, CJoin, CJump, CLam, CLet, CLetRec,
-    CLit, CLoop,
-    CMatch, CParam, CPrim, CProgram, CRecord, CRef, CReturn, CTuple, CTyApp,
-    CTyLam,
-    CUnit, CVar, CWhile, is_ref, ref_elem, ref_of,
+    TAIL_FIELDS, CAlt, CApp, CArray, CAssign, CBind, CBreak, CCon, CContinue,
+    CDeref, CExpr, CField, CForC, CForIn, CIf, CIndex, CJoin, CJump, CLam,
+    CLet, CLetRec, CLit, CLoop, CMatch, CParam, CPrim, CProgram, CRecord, CRef,
+    CReturn, CTuple, CTyApp, CTyLam, CUnit, CVar, CWhile, is_ref, ref_elem,
+    ref_of,
 )
 from .decls import DeclTable, substitute
 from .errors import Span, TurkeyError
@@ -207,6 +206,17 @@ class Checker:
         # field has to be looking at the type rather than at the family
         # application that names it.
         return prune(self.reduce(got))
+
+    def tail(self, e: CExpr, field: str) -> Joins | None:
+        """The join scope a named subterm of `e` inherits.
+
+        `core.TAIL_FIELDS` decides, so this rule and `joins.py` are reading one
+        statement of the discipline rather than two. Anything not named there
+        gets nothing, which is why a rule that simply forgets to ask is safe:
+        forgetting rejects jumps, it does not admit them.
+        """
+        return (self.joins
+                if field in TAIL_FIELDS.get(type(e).__name__, ()) else None)
 
     # trivial forms: they are their own evidence
 
@@ -495,7 +505,7 @@ class Checker:
         self.expect(e.bound, value, e.span, f"the binding '{e.name}'")
         inner = env.child()
         inner.define(e.name, e.binders, e.bound)
-        return self.check(e.body, inner, self.joins)
+        return self.check(e.body, inner, self.tail(e, "body"))
 
     def _check_CLetRec(self, e: CLetRec, env: Env) -> Type:
         inner = env.child()
@@ -503,7 +513,7 @@ class Checker:
             inner.define(bind.name, bind.binders, bind.ty)
         for bind in e.binds:
             self.bind(bind, inner)
-        return self.check(e.body, inner, self.joins)
+        return self.check(e.body, inner, self.tail(e, "body"))
 
     def _check_CRef(self, e: CRef, env: Env) -> Type:
         return ref_of(self.check(e.value, env))
@@ -532,16 +542,15 @@ class Checker:
         raise CoreError(f"{show(target)} is not indexable", e.span)
 
     def _check_CIf(self, e: CIf, env: Env) -> Type:
-        joins = self.joins
         self.expect(BOOL, self.check(e.cond, env), e.span, "a condition")
-        then = self.check(e.then, env, joins)
+        then = self.check(e.then, env, self.tail(e, "then"))
         if e.otherwise is None:
             return e.ty
-        other = self.check(e.otherwise, env, joins)
+        other = self.check(e.otherwise, env, self.tail(e, "otherwise"))
         return _join(then, other)
 
     def _check_CMatch(self, e: CMatch, env: Env) -> Type:
-        joins = self.joins
+        joins = self.tail(e, "alts")
         scrutinee = self.check(e.scrutinee, env)
         result: Type | None = None
         for alt in e.alts:

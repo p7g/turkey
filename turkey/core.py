@@ -381,6 +381,27 @@ class CForIn(CExpr):
     body: CExpr | None = None
 
 
+# Which subterm of which node is a **tail position**: the places a `CJump` may
+# stand, because the value of what stands there is the value of the whole
+# enclosing term. Stated once, here in the IR, because it is a fact about the
+# IR -- `coretc.py` reads it to decide what a join scope reaches, and
+# `joins.py` reads it to decide what a tail call is, and two statements of one
+# fact is exactly the kind of agreement `plan.txt` item 5 exists to be rid of.
+#
+# Everything absent is not a tail position, and the absences carry weight. A
+# `CLam`'s body is missing on purpose: a closure outlives the frame that binds
+# the join, so a label is not something it can jump to. So is a `CWhile`'s or a
+# `CLoop`'s body -- until item 7's last step makes those join points
+# themselves, a loop body runs many times and is not the value of anything.
+TAIL_FIELDS: dict[str, tuple[str, ...]] = {
+    "CIf": ("then", "otherwise"),
+    "CLet": ("body",),
+    "CLetRec": ("body",),
+    "CJoin": ("body", "rest"),
+    "CMatch": ("alts",),
+}
+
+
 @dataclass(eq=False)
 class CReturn(CExpr):
     value: CExpr | None = None
@@ -668,6 +689,7 @@ __all__ = [
     "CIndex", "CJoin", "CJump", "CLam", "CLet", "CLetRec", "CLit", "CLoop",
     "CMatch", "CParam",
     "CPrim", "CProgram", "CRecord", "CRef", "CReturn", "CTuple", "CTyApp",
-    "CTyLam", "CUnit", "CVar", "CWhile", "REF", "is_ref", "ref_elem", "ref_of",
+    "CTyLam", "CUnit", "CVar", "CWhile", "REF", "TAIL_FIELDS", "is_ref",
+    "ref_elem", "ref_of",
     "show_bind", "show_expr", "show_program",
 ]

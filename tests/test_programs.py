@@ -120,6 +120,25 @@ def test_core_command(golden: Path) -> None:
     assert result.returncode == 0
 
 
+OPT = sorted(PROGRAMS_DIR.glob("*.opt"))
+
+
+@pytest.mark.parametrize("golden", OPT, ids=[p.stem for p in OPT])
+def test_opt_command(golden: Path) -> None:
+    """`NAME.opt` pins what `turkey opt NAME.tl` prints (M15b).
+
+    The third of the trio, and the one that shows an *analysis* rather than a
+    translation: which local function became a label and which stayed a
+    closure. The `.expected` beside it is the other half of the claim, since a
+    pass that only writes a fact down must not change any answer.
+    """
+    expected = golden.read_text()
+    result = _run(["opt", golden.with_suffix(".tl").name])
+    actual = result.stdout + result.stderr
+    assert actual == expected, _diff_message(expected, actual, result.returncode)
+    assert result.returncode == 0
+
+
 MONO = sorted(PROGRAMS_DIR.glob("*.mono"))
 
 

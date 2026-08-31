@@ -429,6 +429,13 @@ class FunDecl(Node):
     # declaration gained, if its scheme retained any class predicate. Written
     # by the solver, at the one place it decides what a scheme carries.
     dicts: object | None = None
+    # Set on a helper this compiler invented for a binding with exactly one
+    # use site: it is not generalized. Nothing a program can write sets it --
+    # `turkey/desugar.py` is the only writer, for the recursive function a
+    # lifted loop becomes -- and it is a fact about *that* declaration, not a
+    # policy about local bindings, which is why it is a field here rather than
+    # a rule in `turkey/infer.py` about what a name looks like.
+    monomorphic: bool = False
 
     @property
     def is_signature(self) -> bool:

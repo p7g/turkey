@@ -705,8 +705,25 @@ def _con(name: str, args: list[ast.Expr], span: Span) -> ast.Expr:
 
 
 def _fun(name: str, body: ast.Expr, span: Span) -> ast.Stmt:
-    """`fun name() { body }`, as a statement, so the loop can call itself."""
-    return ast.SFun(span, ast.FunDecl(span, name, [], None, body))
+    """`fun name() { body }`, as a statement, so the loop can call itself.
+
+    Not generalized (`FunDecl.monomorphic`). It has one use site -- the `call`
+    that `_loop` builds beside it -- plus its own recursion, so there is
+    nothing for a scheme to be used at more than one type, and generalizing it
+    is what made the loops in `question_control.tl` survive every pass.
+
+    The helper answers with the enclosing block's `Flow`, and the arms above
+    only ever build `Fall` and `Ret` at that type: a `Brk` becomes the
+    enclosing `Fall`, which is what makes `break v` the loop's value. So the
+    `Brk` slot is uninhabited *by construction*, for every lifted loop, and
+    generalizing left a variable there that nothing could ever solve. Every
+    call site then read `%loopN[c, Option Int]` -- ground in the slot that
+    matters and open in the one that cannot -- and `mono` specializes only at
+    ground instantiations, so one dead parameter kept the whole loop generic
+    and out of reach of the inliner behind it.
+    """
+    return ast.SFun(span, ast.FunDecl(span, name, [], None, body,
+                                      monomorphic=True))
 
 
 def _arm(con: str, bind: str | None, span: Span, body: ast.Expr) -> ast.MatchArm:

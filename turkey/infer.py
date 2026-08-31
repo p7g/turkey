@@ -590,11 +590,15 @@ class Generator:
     ]:
         """The bound names, the definition's constraint, and how it binds."""
         if all(isinstance(item, ast.SFun) for item in group):
-            binds, defn, sigs = self.build_fun_group(
-                [item.decl for item in group])
+            decls = [item.decl for item in group]
+            binds, defn, sigs = self.build_fun_group(decls)
             # A `fun` is syntactically a value, so the value restriction never
-            # blocks generalization here.
-            return binds, defn, True, False, sigs
+            # blocks generalization here. What can is a declaration saying it
+            # does not want generalizing -- which no program can say, and only
+            # `desugar._fun` does, for a helper with a single use site. See
+            # `ast.FunDecl.monomorphic`.
+            return (binds, defn, not any(d.monomorphic for d in decls), False,
+                    sigs)
 
         assert len(group) == 1, "only functions may share a binding group"
         stmt = group[0]

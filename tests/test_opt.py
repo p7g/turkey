@@ -17,7 +17,9 @@ from __future__ import annotations
 from dataclasses import fields
 
 from turkey import opt
-from turkey.core import CApp, CBind, CExpr, CMatch, CPrim, CProgram, CVar
+from turkey.core import (
+    CApp, CBind, CExpr, CMatch, CPrim, CProgram, CTyApp, CVar,
+)
 from turkey.driver import check
 
 
@@ -278,25 +280,50 @@ fun main() { print(quarter(8)) }
     assert calls_to(quarter, "Main#half") == 0
 
 
-def test_a_polymorphic_bind_is_out_of_reach_and_the_suite_says_so():
-    """`question_control.tl` keeps all 105 of its `Flow` constructors.
+def test_a_lifted_loop_is_monomorphic_and_the_flow_residue_is_not_its_fault():
+    """`question_control.tl` keeps all of its `Flow` constructors. Why, exactly.
 
-    Not a failure of case-of-case. Its `?` sits under a `Flow` whose type still
-    has a variable in it, so item 6's specializer leaves the `bind` polymorphic
-    and the call site is a `CTyApp` rather than a name -- and inlining, which
-    needs a name, cannot see through it. Written down as a test because it is
-    the precise thing item 6 would have to do for item 7 to reach that program,
-    and because a number nobody records is a number nobody notices moving.
+    The old answer written here was wrong, and worth recording as wrong: it
+    said item 6's specializer left the `bind` polymorphic. Every top-level
+    binding in that program is monomorphic. What was polymorphic was a
+    *local* one -- the recursive helper `desugar._loop` lifts a loop into --
+    generalized over its `Flow`'s `Brk` slot, which is uninhabited by
+    construction for every lifted loop, so nothing could ever solve it. Eight
+    loops, eight `forall`s, every call site `%loopN[c, Option Int]`: ground in
+    the slot that matters and open in the one that cannot be.
+
+    `ast.FunDecl.monomorphic` settles that, and this asserts it: no lifted
+    loop is generalized any more.
+
+    It was not the whole cause. The `Flow` traffic is a chain of `bind` and
+    `pure` calls, and every one of those is a `CTyApp` over a method's own
+    `forall a b` -- which is not polymorphism specialization removes, because
+    a method *is* polymorphic in its own variables no matter how ground its
+    dictionary is. `opt._Reducer` declines those on purpose ("a binding with
+    `binders` is a `CTyLam` and its call sites are type applications, which is
+    M14's business and not this one's"), so the bodies that would collapse the
+    `Flow` matches are never inlined. That is the next thing to change, and it
+    is a change to what this pass will instantiate rather than to what the
+    lifting produces.
     """
     from pathlib import Path
-    from turkey.core import CTyApp
+    from turkey.core import CLetRec
 
     root = Path(__file__).parent / "programs"
-    program = check((root / "question_control.tl").read_text(),
-                    str(root / "question_control.tl"), [root]).opt
+    checked = check((root / "question_control.tl").read_text(),
+                    str(root / "question_control.tl"), [root])
+    lifted = [b for bind in checked.core.binds
+              for n in nodes(bind.value) if isinstance(n, CLetRec)
+              for b in n.binds if b.name.startswith("%loop")]
+    assert lifted, "the fixture should still lift its loops"
+    for bind in lifted:
+        assert not bind.binders, (
+            f"{bind.name} is generalized again; its `Brk` slot is dead by "
+            f"construction, so the quantifier can never be solved")
+
     generic = sum(
-        1 for bind in program.binds for n in nodes(bind.value)
+        1 for bind in checked.opt.binds for n in nodes(bind.value)
         if isinstance(n, CApp) and isinstance(n.fn, CTyApp))
     assert generic > 0, (
-        "if this is zero, specialization now reaches question_control and the "
-        "Flow traffic should be collapsing -- check, and delete this test")
+        "if this is zero, inlining now reaches through a type application and "
+        "the Flow traffic should be collapsing -- check, and rewrite this test")

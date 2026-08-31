@@ -17,6 +17,8 @@ What is left for this file is the half a golden cannot see:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from turkey import core
 from turkey.core import CApp, CBind, CProgram, CRecord, CTyApp, CVar
 from turkey.driver import check
@@ -481,3 +483,141 @@ def test_the_specialized_program_is_smaller_than_the_one_it_came_from():
 fun main() { print(Int.toString(twice(2))) }
 """)
     assert len(names(checked.mono)) < len(names(checked.core))
+
+
+# -- and it goes round twice, on one budget (M14d) ---------------------------
+
+# A method with a context of its own. `squash` needs a `Monoid a` that its
+# *class* does not supply, so `%inst.Container.Array`'s copy of it is a lambda
+# over a dictionary -- and hoisting that lambda out of the record is what gives
+# the second round something the first could not have seen.
+MULTIROUND = """
+class Monoid a {
+    fun empty() -> a
+    fun join(a, a) -> a
+}
+
+instance Monoid String {
+    fun empty() = ""
+    fun join(x, y) = x + y
+}
+
+class Container t {
+    fun squash[Monoid a](t a) -> a
+}
+
+instance Container Array {
+    fun squash(xs) {
+        var acc = empty()
+        for x in xs { acc = join(acc, x) }
+        return acc
+    }
+}
+
+fun main() {
+    let xs = ["a", "b"]
+    print(squash(xs))
+}
+"""
+
+
+def test_a_second_round_specializes_what_the_first_round_made():
+    """The claim the milestone exists for.
+
+    `%inst.Container.Array#squash` is a binding the *devirtualizer* created, so
+    the specializer had already run when it appeared. Its one call site is at
+    ground types with ground evidence, which is exactly the shape the collapse
+    handles -- and a second round is what lets the collapse see it.
+    """
+    checked = check(MULTIROUND)
+    made = names(checked.mono)
+    hoisted = [n for n in made if n.startswith("%inst.Container.Array#squash")]
+    assert hoisted, "the method was never hoisted at all"
+    assert any("@" in n for n in hoisted), \
+        f"the hoisted method was never specialized: {hoisted}"
+
+
+def test_the_specialized_method_takes_no_dictionary():
+    """And the point of specializing it: the `Monoid` argument is gone, so
+    every `join` inside is a direct call to a name."""
+    checked = check(MULTIROUND)
+    bind = named(checked.mono, "%inst.Container.Array#squash@String")
+    assert not bind.binders, "a specialized binding has no type binders"
+    # The type is the claim: `fun(Array String) -> String` and not
+    # `fun(%Dict.Monoid String) -> fun(Array String) -> String`.
+    assert "%Dict." not in str(bind.ty), bind.ty
+    assert not [n for n in walk(bind.value) if isinstance(n, core.CField)], \
+        "the body still projects out of a dictionary"
+
+
+def test_a_second_round_reuses_the_first_rounds_copies():
+    """Round two re-asks for specializations round one already built, because
+    it is walking bodies round one wrote. The memo on `_State` is what makes
+    the answer the existing copy rather than a byte-identical second one under
+    a disambiguated name -- which `fresh` would happily have supplied.
+
+    Against `dicts.tl` rather than `MULTIROUND`, because it has to be a program
+    big enough for the second round to re-ask at all: with a per-round memo
+    this one grows five duplicate copies (`Data.Array#new@Int~2` and friends)
+    and `MULTIROUND` grows none. A `~` in a name is `fresh` disambiguating a
+    collision, and after this pass there should be nothing to collide with.
+    """
+    path = Path(__file__).parent / "programs" / "dicts.tl"
+    checked = check(path.read_text(), str(path))
+    dups = [n for n in names(checked.mono) if "~" in n]
+    assert not dups, f"round two duplicated round one's work: {dups}"
+
+
+def test_a_third_round_changes_nothing():
+    """Two is a number, not a fixed point -- but on a real program it is the
+    fixed point, and this is that measurement rather than a hope."""
+    from turkey import mono
+
+    checked = check(MULTIROUND)
+    saved = mono.ROUNDS
+    outs = {}
+    try:
+        for rounds in (2, 3):
+            mono.ROUNDS = rounds
+            out, _ = mono.monomorphize(checked.core, checked.decls,
+                                       checked.classes, checked.main)
+            outs[rounds] = sorted(names(out))
+    finally:
+        mono.ROUNDS = saved
+    assert outs[2] == outs[3]
+
+
+def test_the_budget_survives_the_round_count():
+    """`MAX_SPECIALIZATIONS` bounds the *program*, not the round.
+
+    Run the pipeline five times over the polymorphic recursion the cap was
+    written for and there are still thirty-two copies of `Main#depth`. That is
+    the property `_State.counts` is there to guarantee: a count kept per round
+    would let a binding refused its thirty-third copy collect thirty-two more
+    in every round after, and `ROUNDS` is a constant someone may raise.
+
+    Stated as a guarantee rather than as a caught bug, honestly: no program in
+    the suite re-asks for a *capped* binding in a later round, because a capped
+    call site lives in a generic body and generic bodies are never rewritten.
+    The sharing that the suite does force is the memo -- see
+    `test_a_second_round_reuses_the_first_rounds_copies`.
+    """
+    from turkey import mono
+
+    saved = mono.ROUNDS
+    try:
+        mono.ROUNDS = 5
+        checked = check(POLYREC)
+    finally:
+        mono.ROUNDS = saved
+    copies = [n for n in names(checked.mono) if n.startswith("Main#depth@")]
+    assert len(copies) == MAX_SPECIALIZATIONS, \
+        f"{len(copies)} copies over five rounds, not {MAX_SPECIALIZATIONS}"
+
+
+def test_the_cap_is_reported_once_across_rounds():
+    """Every round trips the same cap. Saying so once per round would describe
+    this file's structure rather than the program's."""
+    checked = check(POLYREC)
+    said = [w for w in checked.warnings if "Main#depth" in w]
+    assert len(said) == 1, said

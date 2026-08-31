@@ -2310,3 +2310,59 @@ its own termination argument and the cap's is written for one.
 regenerated. Nine new tests. **No `.expected` moved**, which is again the
 entry's whole claim -- and this time the pass deletes things, so it is a
 sharper one.
+
+---
+
+### 54. The pass goes round twice, on one budget
+
+Delta 53 ended by naming what it left on the table, and this takes it. The three
+passes ran once each, and two of them *make* work for the other: the specializer
+collapses a ground instance into a record, the devirtualizer hoists that
+record's methods into top-level bindings, and those bindings have ground call
+sites the specializer never saw, because they did not exist when it ran.
+`%inst.Foldable.Array#foldMap` was the case -- `Main#render` calls it at ground
+types with ground evidence, exactly the shape the collapse handles.
+
+So the pipeline runs twice and reachability runs once, at the end.
+
+**The interesting part is not the loop, it is the cap.** `MAX_SPECIALIZATIONS`
+is what stands between this pass and the undecidability delta 51 is about, and a
+budget spent per round is not a bound: N rounds would grant one binding 32N
+copies, and N is exactly the number a fixed point declines to name. So the
+budget is shared. A `_State` carried across rounds holds the counts, charged
+not to the binding being copied but to the original it *descends from* --
+`Main#squash@Int` and `%inst.Ord.Int#lt` are both charged to what they came out
+of -- so the claim "a binding descended from `f` has at most
+`MAX_SPECIALIZATIONS` copies in the output" is true of the finished program
+rather than of one round of it, and stays true if `ROUNDS` is raised.
+
+`_State` carries two more things, and the second is the one the suite actually
+forced. The warnings already said, so a cap that trips in every round is
+reported once. And **the memo of what has already been built**: without it a
+second round re-asks for `Data.Array#new` at `Int`, does not find round one's
+answer, and builds a byte-identical second copy under the disambiguated name
+`Data.Array#new@Int~2`. Five of those on `dicts.tl`, seventeen across the
+suite -- specialization as a source of duplication, which is the opposite of
+the point.
+
+**Two rounds, and why not a fixed point.** Two is what the measurement asks
+for: a third round changes nothing at all. On `tests/programs/dicts.tl` the
+dictionary projections go 65 in the Core, 16 after one round, 14 after two, 14
+after three; four more methods are specialized and three of the generics they
+came from are then unreachable, for a net of one binding. It is a constant
+rather than a `while changed:` because the termination argument is the cap's,
+and the cap bounds copies, not rounds -- raising `ROUNDS` is a one-line change
+that cannot break the bound, and asking for a genuine fixed point is asking
+this pass to promise something about a number it does not control.
+
+**One thing measured and thrown away**, recorded because the next person will
+think of it too. A specialized body opens with
+`let %d1.Foldable = %inst.Foldable.Array`, and it looks as though the
+devirtualizer should follow that alias the way the specializer already does.
+Implemented, the alias fires 3698 times across the suite and changes the output
+of exactly zero programs: the specializer resolves those before devirtualization
+ever sees them. It is not in the diff.
+
+**Scope.** `turkey/mono.py` only -- a `_State` dataclass, a `ROUNDS` constant,
+and `monomorphize` looping -- plus `tests/programs/dicts.mono` regenerated. Six
+new tests. **No `.expected` moved.**

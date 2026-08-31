@@ -66,18 +66,36 @@ keeps this pass small:
   once, at the end, over the finished program -- so the specializer never has
   to be right about liveness as well as about types.
 
+## It goes round twice, and the budget does not restart
+
+Specializing and devirtualizing each *make* bindings the other would have
+worked on. The specializer collapses a ground instance into a record; the
+devirtualizer hoists that record's methods into top-level bindings; and those
+bindings have ground call sites that the specializer never saw, because they
+did not exist when it ran. `%inst.Foldable.Array#foldMap` was the case that
+made this milestone: `Main#render` calls it at ground types with ground
+evidence, which is exactly the shape the collapse handles.
+
+So the pipeline runs `ROUNDS` times and reachability runs once at the end.
+The thing that has to be got right is not the loop but the cap: a budget spent
+per round is no bound at all, since N rounds would grant one binding 32N copies.
+`_State` is the answer -- one budget for the whole pass, charged to the original
+a copy descends from, plus the memo of what has already been built, so a later
+round finds an earlier round's copy instead of making a second one under a
+disambiguated name. With that, "a binding descended from `f` has at most
+`MAX_SPECIALIZATIONS` copies in the output" is true of the program rather than
+of one round of it, and would stay true if `ROUNDS` were raised.
+
+It is two rounds and not a genuine fixed point because the cap is what stands
+between this pass and the undecidability above, and "iterate until nothing
+changes" is a promise about a number this pass is not in a position to make.
+Two is what the measurement asks for: on `tests/programs/dicts.tl` a third
+round changes nothing at all, and a second takes the dictionary projections
+from sixteen to fourteen and specializes four more methods.
+
 ## What it does not do
 
-The three passes run once each, in order, and nothing goes back round. That is
-visible in the output: `%inst.Foldable.Array#foldMap` is a binding this file
-made, and `Main#render` calls it at ground types with ground evidence --
-`#foldMap[Int, String](%inst.Monoid.String)` -- which is exactly the shape the
-specializer collapses, had the specializer been able to see a binding that did
-not exist when it ran. Iterating to a fixed point would collect those. It is
-deliberately not done here: a second round needs its own termination argument,
-and the cap's is written for one.
-
-What genuinely cannot be done is what the cap refuses. A capped call site keeps
+What cannot be done is what the cap refuses. A capped call site keeps
 its type application and its dictionary argument, so the generic binding it
 names keeps its dictionary *parameter* and keeps projecting out of it -- and
 that projection is the one thing coherence says nothing about, because the
@@ -109,6 +127,28 @@ from .types import TApp, TCon, TFam, TFun, TTuple, TVar, Type, prune, spine, typ
 # than a routine event.
 MAX_SPECIALIZATIONS = 32
 MAX_TYPE_NODES = 64
+
+# How many times the whole pipeline runs. Each round can only see the bindings
+# that existed when it started, and both halves of a round *make* bindings the
+# other half would have specialized: the specializer collapses a ground
+# instance into a record, the devirtualizer hoists that record's methods into
+# bindings, and those bindings have ground call sites the specializer has never
+# looked at. So one round leaves work on the table -- `%inst.Foldable.Array`'s
+# `foldMap` was the case that made this milestone -- and a second collects it.
+#
+# It is a fixed number rather than a fixed point, and the reason is the cap.
+# `MAX_SPECIALIZATIONS` is what stands between this pass and the undecidability
+# above, and a budget spent per round is not a bound at all: N rounds would
+# permit 32N copies of one binding, and N is exactly what a fixed point refuses
+# to promise. So the budget is shared across rounds (`_State`) *and* the rounds
+# are counted. Either alone would do; both is what makes the bound easy to
+# state, which is: a binding descended from `f` has at most 32 copies in the
+# output, whatever ROUNDS is set to.
+#
+# Two, rather than more, because the measurement says so: on the suite, round
+# two takes the last of the projections one round left behind and round three
+# finds nothing. Raising it is a one-line change that cannot break the bound.
+ROUNDS = 2
 
 
 def _ground(t: Type) -> bool:
@@ -180,6 +220,71 @@ def _takes_dictionaries(bind: CBind) -> bool:
     """
     return (isinstance(bind.value, CLam) and bool(bind.value.params)
             and all(_dict_class(p.ty) is not None for p in bind.value.params))
+
+
+@dataclass
+class _State:
+    """What one round has to tell the next.
+
+    The pipeline runs more than once (`ROUNDS`), and a round is a fresh
+    `Monomorphizer` and a fresh `_Devirtualizer` over the previous round's
+    output. Three things must not restart with them.
+
+    **The budget.** A per-round count is not a cap: refuse a binding its
+    thirty-third copy and the next round, counting from zero, grants it
+    thirty-two more. So the count is kept here and charged to the binding a copy
+    *descends from* -- `Main#squash@Int` and `Main#squash@String` are both
+    `Main#squash` -- which is what `origin` records, and what makes
+    "`f` has at most `MAX_SPECIALIZATIONS` copies" true of the finished program
+    rather than of one round of it.
+
+    **The warnings already said.** A cap that trips in round one trips again in
+    round two; saying so twice would describe the implementation rather than the
+    program.
+
+    **The hoists already made.** `%inst.Ord.Int#lt` is a binding the first
+    round's devirtualizer created and the first round's rewrites already name.
+    Without this the second round would hoist the same field again under a
+    fresh name and point its own rewrites at the copy, leaving two bindings
+    where the program needs one.
+    """
+
+    counts: dict[str, int] = field(default_factory=dict)
+    # (original name, type-argument keys, evidence) -> the name built for it.
+    # Shared for the same reason `counts` is, and with a sharper symptom: a
+    # second round that re-asked for `Data.Array#new` at `Int` would not find
+    # round one's answer, and would build a byte-identical second copy under a
+    # disambiguated name -- specialization as a source of duplication, which is
+    # the opposite of the point.
+    done: dict[tuple, str] = field(default_factory=dict)
+    # A binding this pass made -> the original binding it descends from.
+    # Transitive by construction: `derive` stores the root, never the parent.
+    origin: dict[str, str] = field(default_factory=dict)
+    capped: set[str] = field(default_factory=set)
+    # (ground dictionary, field name) -> the binding that field is now.
+    hoists: dict[tuple[str, str], str] = field(default_factory=dict)
+
+    def root(self, name: str) -> str:
+        return self.origin.get(name, name)
+
+    def spend(self, name: str) -> bool:
+        """Charge one copy to whatever `name` descends from, or refuse."""
+        root = self.root(name)
+        if self.counts.get(root, 0) >= MAX_SPECIALIZATIONS:
+            return False
+        self.counts[root] = self.counts.get(root, 0) + 1
+        return True
+
+    def derive(self, made: str, parent: str) -> None:
+        """Record that `made` is a descendant of `parent`'s original.
+
+        Used for a specialization (`Main#squash` -> `Main#squash@Int`) and for
+        a hoisted method (`%inst.Ord.Int` -> `%inst.Ord.Int#lt`) alike. The
+        method is charged to the dictionary it came out of because that is what
+        it is: a piece of it, and a chain that grows one needs the other's
+        budget to be bounded by.
+        """
+        self.origin[made] = self.root(parent)
 
 
 @dataclass
@@ -494,10 +599,13 @@ class Monomorphizer:
     """The whole program, and the specializations asked of it."""
 
     def __init__(self, program: CProgram, decls: DeclTable,
-                 classes: ClassTable) -> None:
+                 classes: ClassTable, state: _State | None = None) -> None:
         self.program = program
         self.decls = decls
         self.classes = classes
+        # Shared with every other round; see `_State`. A caller that runs one
+        # round in isolation -- a test -- gets a private one.
+        self.state = state if state is not None else _State()
         self.byname: dict[str, CBind] = {}
         self.generic: dict[str, CBind] = {}
         self.takes_dicts: set[str] = set()
@@ -510,13 +618,13 @@ class Monomorphizer:
         self.dict_group: set[str] = set()
         # key -> the name built for it. The key is the original's name, the
         # `type_key` of each type argument, and -- for an instance whose
-        # context was collapsed -- the dictionaries it was applied to.
-        self.done: dict[tuple, str] = {}
-        self.counts: dict[str, int] = {}
+        # context was collapsed -- the dictionaries it was applied to. Held on
+        # `_State`, so a later round finds an earlier round's copy rather than
+        # making its own.
+        self.done = self.state.done
         self.made: dict[str, list[CBind]] = {}
         self.queue: list[tuple[str, CBind, list[Type], list[str] | None]] = []
         self.used: set[str] = set()
-        self.capped: set[str] = set()
         self.warnings: list[str] = []
 
     def run(self) -> CProgram:
@@ -570,15 +678,17 @@ class Monomorphizer:
         found = self.done.get(key)
         if found is not None:
             return found
-        if self.counts.get(bind.name, 0) >= MAX_SPECIALIZATIONS:
-            self.cap(bind, f"is used at more than {MAX_SPECIALIZATIONS} types")
-            return None
+        # Size first, then the budget, so a request refused for its type does
+        # not also spend a copy the program never received.
         if any(_size(t) > MAX_TYPE_NODES for t in targs):
             self.cap(bind, f"is used at a type of more than {MAX_TYPE_NODES} "
                            f"parts")
             return None
-        self.counts[bind.name] = self.counts.get(bind.name, 0) + 1
+        if not self.state.spend(bind.name):
+            self.cap(bind, f"is used at more than {MAX_SPECIALIZATIONS} types")
+            return None
         name = self.fresh(bind.name, targs)
+        self.state.derive(name, bind.name)
         if bind.name in self.dict_group and dicts is not None:
             self.top_dicts.add(name)
         # Recorded *before* the body is built, which is what makes a recursive
@@ -591,10 +701,15 @@ class Monomorphizer:
     def cap(self, bind: CBind, why: str) -> None:
         """Said once per binding, and said at all because a program that
         quietly stops being specialized is a program whose performance depends
-        on something nobody was told about."""
-        if bind.name in self.capped:
+        on something nobody was told about.
+
+        Once per binding across every round, not once per round: the cap that
+        refused a copy in round one refuses it again in round two, and the
+        program has one thing wrong with it either way.
+        """
+        if bind.name in self.state.capped:
             return
-        self.capped.add(bind.name)
+        self.state.capped.add(bind.name)
         where = f"{bind.span}: " if bind.span is not None else ""
         self.warnings.append(
             f"{where}warning: '{bind.name}' {why}, so its remaining uses are "
@@ -663,15 +778,19 @@ class _Devirtualizer:
     reads any more is `_reachable`, below, which is a separate question.
     """
 
-    def __init__(self, program: CProgram, classes: ClassTable) -> None:
+    def __init__(self, program: CProgram, classes: ClassTable,
+                 state: _State | None = None) -> None:
         self.program = program
         self.classes = classes
+        self.state = state if state is not None else _State()
         # Ground dictionaries only: a record whose contents are known. An
         # instance with a context is a lambda and has no fields to hoist.
         self.records: dict[str, CRecord] = {}
         self.used: set[str] = set()
-        # (dictionary, field) -> the name that projection is now.
-        self.target: dict[tuple[str, str], str] = {}
+        # (dictionary, field) -> the name that projection is now. Shared across
+        # rounds, so a projection this round is the first to see still resolves
+        # to the binding a previous round hoisted.
+        self.target: dict[tuple[str, str], str] = self.state.hoists
         self.hoisted: list[CBind] = []
 
     def run(self) -> CProgram:
@@ -688,6 +807,12 @@ class _Devirtualizer:
             if record is None:
                 continue
             for name, value in record.fields:
+                if (bind.name, name) in self.target:
+                    # A previous round hoisted it, and the binding it made is
+                    # in `program.dicts` already. Hoisting again would make a
+                    # second copy under a `~` name and split the call sites
+                    # between them.
+                    continue
                 made = self.hoist(bind, name, value)
                 if made is not None:
                     self.target[(bind.name, name)] = made
@@ -723,6 +848,7 @@ class _Devirtualizer:
         while made in self.used:
             made += "~"
         self.used.add(made)
+        self.state.derive(made, owner.name)
         self.hoisted.append(CBind(made, inner.ty, binders, inner, owner.span,
                                   False, owner.module))
         return made
@@ -856,6 +982,10 @@ def _reachable(program: CProgram, main: str) -> CProgram:
     binding is named by whatever reaches that call site, and being named is all
     this asks for. `test_the_capped_call_site_still_names_the_generic_binding`
     is that claim as a test.
+
+    Run once, at the end, and not between rounds: an intermediate round's
+    output is full of bindings nothing reaches *yet*, and dropping one would be
+    answering a question the next round was going to ask.
     """
     byname = {b.name: b for b in program.dicts + program.binds}
     droppable = {b.name for b in program.dicts}
@@ -879,10 +1009,22 @@ def _reachable(program: CProgram, main: str) -> CProgram:
 
 def monomorphize(program: CProgram, decls: DeclTable, classes: ClassTable,
                  main: str = "main") -> tuple[CProgram, list[str]]:
-    pass_ = Monomorphizer(program, decls, classes)
-    out = _Devirtualizer(pass_.run(), classes).run()
-    return _reachable(out, main), pass_.warnings
+    """Specialize, devirtualize, again, and then drop what nothing reaches.
+
+    The rounds share one `_State`, which is what keeps the cap a cap; see
+    `ROUNDS`. Reachability runs once, at the end, over the finished program --
+    an intermediate round's output is full of bindings nothing reaches *yet*,
+    and dropping one would be answering a question the next round was going to
+    ask.
+    """
+    state = _State()
+    out, warnings = program, []
+    for _ in range(ROUNDS):
+        pass_ = Monomorphizer(out, decls, classes, state)
+        out = _Devirtualizer(pass_.run(), classes, state).run()
+        warnings.extend(pass_.warnings)
+    return _reachable(out, main), warnings
 
 
-__all__ = ["MAX_SPECIALIZATIONS", "MAX_TYPE_NODES", "Monomorphizer",
+__all__ = ["MAX_SPECIALIZATIONS", "MAX_TYPE_NODES", "ROUNDS", "Monomorphizer",
            "monomorphize"]

@@ -19,7 +19,7 @@ import pytest
 from turkey import core, coretc
 from turkey.core import CApp, CBind, CField, CLam, CTyApp, CVar
 from turkey.driver import check
-from turkey.types import TCon
+from turkey.types import TCon, show_scheme
 
 ORD = """
 class Egal a {
@@ -310,3 +310,32 @@ def test_the_checker_rejects_an_argument_of_the_wrong_type():
         coretc.check_program(program, checked.decls, checked.classes,
                              coretc.globals_of(checked.env))
     assert "argument 1" in exc.value.message
+
+
+def test_a_field_of_a_record_polymorphic_target_keeps_its_inferred_type():
+    """A `HasField` the solver discharged leaves the target a variable.
+
+    The field's type is then not recoverable from the target, but it is not
+    unknown either: inference recorded it on the selection. Handing back a
+    fresh variable instead makes every use of the field a type error -- a
+    `step` field holding a function stops being callable -- so the checker
+    falls back to the type on the node, the way `CIndex` already does.
+    """
+    src = """
+type Auto = Auto {
+    tag  : Int,
+    step : fun(Char) -> Auto
+}
+
+fun choice(x, y) = Auto {
+    tag  = x.tag + y.tag,
+    step = fun(c) = choice(x.step(c), y.step(c))
+}
+
+fun main() { print(choice(Auto(1, fail), Auto(2, fail)).tag) }
+fun fail(c : Char) -> Auto = Auto(0, fail)
+"""
+    scheme = next(s for n, s in check(src).signatures if n == "choice")
+    rendered = show_scheme(scheme)
+    assert 'HasField "step" a (fun(Char) -> a)' in rendered
+    assert rendered.endswith("fun(a, b) -> Auto")

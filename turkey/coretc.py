@@ -383,9 +383,10 @@ class Checker:
                     f"{' '.join(show(b) for b in binders)} and is used "
                     f"without a type application", e.span)
             return body
-        return self.record_field(target, e.name, e.span)
+        return self.record_field(target, e.name, e.span, e.ty)
 
-    def record_field(self, target: Type, name: str, span: Span | None) -> Type:
+    def record_field(self, target: Type, name: str, span: Span | None,
+                     erased: Type | None = None) -> Type:
         """A field of a single-variant record, or an array's own fields."""
         head, args = spine(prune(target))
         if isinstance(head, TCon) and head.name == "Array":
@@ -395,7 +396,12 @@ class Checker:
             # The lowering kept the type inference gave it; if that is still a
             # variable the field was resolved by a `HasField` the solver
             # discharged and erased, and there is nothing left here to check.
-            return _fresh()
+            # Hand back the type inference recorded for the selection rather
+            # than a fresh variable: a fresh variable is not "unknown" to the
+            # callers, it is a rigid nothing, and `x.step(c)` on a record-
+            # polymorphic `x` would be rejected as applying a non-function.
+            # `_check_CIndex` falls back to `e.ty` for the same reason.
+            return erased if erased is not None else _fresh()
         if not isinstance(head, TCon):
             raise CoreError(f"{show(target)} has no fields", span)
         info = self.decls.tycons.get(head.name)

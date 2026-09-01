@@ -12,3 +12,7 @@ instance Div Int { fun div(x, y) = Prim.intDiv(x, y) }
 instance Rem Int { fun rem(x, y) = Prim.intRem(x, y) }
 instance Neg Int { fun neg(x) = Prim.intNeg(x) }
 instance Show Int { fun show(x) = toString(x) }
+
+instance Hash Int {
+    fun hashInto(i, h) = update(h, i)
+}

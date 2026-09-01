@@ -173,6 +173,8 @@ _PRIM: dict[str, tuple] = {
 
     "Prim.intToString": (mono(TFun([INT], STRING)),
                          _bi("Prim.intToString", 1, lambda n: str(n))),
+    "Prim.intToFloat": (mono(TFun([INT], FLOAT)),
+                         _bi("Prim.intToFloat", 1, lambda n: float(n))),
     "Prim.floatToString": (mono(TFun([FLOAT], STRING)),
                            _bi("Prim.floatToString", 1, lambda x: repr(x))),
 

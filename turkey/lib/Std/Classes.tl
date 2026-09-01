@@ -8,6 +8,8 @@ module Std.Classes (
     Rem(..),
     Neg(..),
     Show(..),
+    Hash(..),
+    Hasher(..),
     Functor(..),
     Applicative(..),
     Monad(..),
@@ -46,6 +48,15 @@ class Rem a { fun rem(a, a) -> a }
 class Neg a { fun neg(a) -> a }
 
 class Show a { fun show(a) -> String }
+
+class Hasher h {
+    fun digest(h) -> Int
+    fun update(h, Int) -> Unit
+}
+
+class Hash a : Eq a {
+    fun hashInto[Hasher h](a, h) -> Unit
+}
 
 class Functor f {
     fun map(f a, fun(a) -> b) -> f b

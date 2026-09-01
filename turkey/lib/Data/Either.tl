@@ -44,3 +44,24 @@ instance Show (Either l r) : Show l, Show r {
         Right(x) -> Prim.stringConcat(Prim.stringConcat("Right(", show(x)), ")")
     }
 }
+
+instance Eq (Either l r) : Eq l, Eq r {
+    fun eq(a, b) = match (a, b) {
+        (Left(l1), Left(l2)) -> l1 == l2
+        (Right(r1), Right(r2)) -> r1 == r2
+        _ -> False
+    }
+}
+
+instance Hash (Either l r) : Hash l, Hash r {
+    fun hashInto(e, h) = match e {
+        Left(x) -> {
+            update(h, 0)
+            hashInto(x, h)
+        }
+        Right(x) -> {
+            update(h, 1)
+            hashInto(x, h)
+        }
+    }
+}

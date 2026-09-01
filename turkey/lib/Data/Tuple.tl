@@ -17,6 +17,13 @@ instance Show (a, b) : Show a, Show b {
     )
 }
 
+instance Hash (a, b) : Hash a, Hash b {
+    fun hashInto((a, b), h) = {
+        hashInto(a, h)
+        hashInto(b, h)
+    }
+}
+
 instance Eq (a, b, c) : Eq a, Eq b, Eq c {
     fun eq((a, b, c), (d, e, f)) = eq(a, d) && eq(b, e) && eq(c, f)
 }
@@ -35,6 +42,14 @@ instance Show (a, b, c) : Show a, Show b, Show c {
         ),
         ")",
     )
+}
+
+instance Hash (a, b, c) : Hash a, Hash b, Hash c {
+    fun hashInto((a, b, c), h) {
+        hashInto(a, h)
+        hashInto(b, h)
+        hashInto(c, h)
+    }
 }
 
 instance Eq (a, b, c, d) : Eq a, Eq b, Eq c, Eq d {
@@ -61,4 +76,13 @@ instance Show (a, b, c, d) : Show a, Show b, Show c, Show d {
         ),
         Prim.stringConcat(show(d), ")"),
     )
+}
+
+instance Hash (a, b, c, d) : Hash a, Hash b, Hash c, Hash d {
+    fun hashInto((a, b, c, d), h) {
+        hashInto(a, h)
+        hashInto(b, h)
+        hashInto(c, h)
+        hashInto(d, h)
+    }
 }

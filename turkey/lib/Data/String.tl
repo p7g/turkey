@@ -34,3 +34,11 @@ instance Show String { fun show(x) = x }
 instance Semigroup String { fun combine(x, y) = add(x, y) }
 instance Monoid String { fun empty() = "" }
 instance Length String { fun len(s) = length(s) }
+
+instance Hash String {
+    fun hashInto(s, d) = {
+        for c in chars(s) {
+            update(d, Char.toInt(c))
+        }
+    }
+}

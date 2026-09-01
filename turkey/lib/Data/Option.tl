@@ -43,3 +43,21 @@ instance Show (Option a) : Show a {
         Some(x) -> Prim.stringConcat(Prim.stringConcat("Some(", show(x)), ")")
     }
 }
+
+instance Eq (Option a) : Eq a {
+    fun eq(a, b) = match (a, b) {
+        (None, None) -> True
+        (Some(aa), Some(bb)) -> aa == bb
+        _ -> False
+    }
+}
+
+instance Hash (Option a) : Hash a {
+    fun hashInto(o, h) = match o {
+        None -> update(h, 0)
+        Some(x) -> {
+            update(h, 1)
+            hashInto(x, h)
+        }
+    }
+}

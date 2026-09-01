@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 
 from turkey.builtins import initial_values
+from turkey.cli import main as cli_main
 from turkey.driver import check, run
 from turkey.eval import Evaluator
 from turkey.pygen import execute, generate
@@ -41,6 +42,17 @@ def test_generated_source_is_internal_python_not_a_serialized_evaluator():
     assert "REnv" not in source
     assert "Closure" not in source
     assert "JumpSignal" not in source
+
+
+def test_python_command_prints_compilable_source_without_running_it(tmp_path, capsys):
+    program = tmp_path / "program.tl"
+    program.write_text("fun main() { print(12345) }", encoding="utf-8")
+
+    assert cli_main(["python", str(program)]) == 0
+    captured = capsys.readouterr()
+    compile(captured.out, str(program), "exec")
+    assert captured.err == ""
+    assert "def __turkey_run():" in captured.out
 
 
 def test_values_closures_shadowing_mutation_and_patterns_compile_together():

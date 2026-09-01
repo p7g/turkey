@@ -22,11 +22,15 @@ python3 -m turkey tokens program.tl    # dump the token stream
 python3 -m turkey ast    program.tl    # dump the parse tree
 python3 -m turkey core   program.tl    # dump the typed Core the elaboration produces
 python3 -m turkey mono   program.tl    # dump that Core specialized -- what actually runs
+python3 -m turkey opt    program.tl    # dump the optimized Core
+python3 -m turkey python program.tl    # print generated Python without running it
 ```
 
 A program is a single file. Execution compiles the optimized typed Core to
 internal Python source, runs the top-level bindings, then calls `main` if one
-is defined.
+is defined. The `python` command exposes that source for inspection and
+debugging; it still relies on turkey-lite's runtime and is not a standalone-file
+interface.
 
 ```
 type Stack a = Stack {

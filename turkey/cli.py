@@ -6,6 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
+from . import pygen
 from .driver import check, report_warnings, run
 from .errors import TurkeyError, TurkeyPanic
 from .core import show_program
@@ -25,6 +26,7 @@ def main(argv: list[str] | None = None) -> int:
         ("core", "dump the typed Core the elaboration produces"),
         ("mono", "dump that Core with its polymorphism specialized away"),
         ("opt", "dump that Core with the optimizations applied"),
+        ("python", "print the generated Python source without running it"),
     ]:
         p = sub.add_parser(name, help=help_text)
         p.add_argument("file")
@@ -54,6 +56,10 @@ def main(argv: list[str] | None = None) -> int:
             checked = check(src, args.file, [Path(args.file).resolve().parent])
             report_warnings(checked.warnings, args.file)
             print(show_program(checked.opt, checked.module), end="")
+        elif args.command == "python":
+            checked = check(src, args.file, [Path(args.file).resolve().parent])
+            report_warnings(checked.warnings, args.file)
+            print(pygen.generate(checked.opt, checked.decls, checked.main), end="")
         elif args.command == "types":
             checked = check(src, args.file, [Path(args.file).resolve().parent])
             report_warnings(checked.warnings, args.file)

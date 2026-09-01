@@ -12,9 +12,11 @@ from __future__ import annotations
 
 import pytest
 
+from turkey.builtins import PRIM_NAMES
 from turkey.driver import check, run
 from turkey.errors import TurkeyError, TurkeyPanic
 from turkey.types import show_scheme
+from turkey.values import ArrayObj, UNINIT
 
 SHAPES = """
 type Shape = Circle { radius : Int } | Rect { width : Int, height : Int }
@@ -326,3 +328,45 @@ fun main() {
 """
     with pytest.raises(TurkeyPanic):
         run(src)
+
+
+def test_primitive_arrays_are_fixed_length_storage():
+    filled = ArrayObj(3, 7)
+    assert filled.length == 3
+    assert [filled.get(i) for i in range(3)] == [7, 7, 7]
+    filled.set(1, 9)
+    assert filled.get(1) == 9
+    with pytest.raises(TurkeyPanic, match="length 3"):
+        filled.get(3)
+
+    unsafe = ArrayObj(2)
+    assert unsafe.get(0) is UNINIT
+    assert "Prim.arrayNewUninit" in PRIM_NAMES
+    assert "Prim.arrayPush" not in PRIM_NAMES
+    assert "Prim.arrayPop" not in PRIM_NAMES
+
+
+def test_filled_arrays_have_length_and_remain_growable(capsys):
+    src = """
+fun main() {
+    let xs = Array.filled(3, 4)
+    xs[1] = 9
+    Array.push(xs, 12)
+    print(len(xs))
+    print(xs)
+}
+"""
+    assert output(src, capsys) == ["4", "[4, 9, 4, 12]"]
+
+
+def test_map_rehashes_into_filled_fixed_storage(capsys):
+    src = """
+fun main() {
+    let m = Map.new()
+    for var i = 0; i < 40; i = i + 1 { Map.put(m, i, i * 3) }
+    print(Map.get(m, 0))
+    print(Map.get(m, 23))
+    print(Map.get(m, 39))
+}
+"""
+    assert output(src, capsys) == ["Some(0)", "Some(69)", "Some(117)"]

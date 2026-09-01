@@ -20,6 +20,23 @@ from turkey.types import (
 )
 
 
+@pytest.mark.parametrize("src, variable", [
+    ("type Keys k = Keys(Array v)", "v"),
+    ("type Box = Box { value : a }", "a"),
+    ("type Alias = Array a", "a"),
+])
+def test_a_type_declaration_rejects_an_undeclared_variable(src, variable):
+    with pytest.raises(TypeError_, match=(
+        rf"type variable '{variable}' is not declared by type"
+    )):
+        check(src)
+
+
+def test_a_declared_phantom_parameter_is_valid():
+    checked = check("type Tagged a = Tagged(Int)\nfun tag(n) = Tagged(n)")
+    assert dict(checked.signatures)["tag"] is not None
+
+
 def kinds(src: str) -> dict[str, str]:
     """Every declared type constructor's kind, as it prints."""
     table = DeclTable()

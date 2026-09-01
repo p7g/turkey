@@ -1,5 +1,6 @@
 module Data.Float (toString)
 
+import Prelude ()
 import Std.Classes
 
 fun toString(x : Float) -> String = Prim.floatToString(x)

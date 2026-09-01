@@ -103,6 +103,16 @@ class DeclTable:
         """Declare every type before resolving any, so they may refer to each
         other in any order."""
         for d in decls:
+            declared = set(d.params)
+            for te in _declaration_types(d):
+                for var in _type_variables(te):
+                    if var.name not in declared:
+                        raise TypeError_(
+                            f"type variable '{var.name}' is not declared by "
+                            f"type '{d.name}'",
+                            var.span,
+                        )
+        for d in decls:
             short = short_name(d.name)
             if short in PRIMITIVES:
                 raise TypeError_(f"cannot redefine the built-in type '{short}'", d.span)
@@ -188,10 +198,12 @@ class DeclTable:
                 )
             if con.is_record:
                 names = [n for n, _ in con.fields]
-                arg_types = [self.star(t, tyvars, 1) for _, t in con.fields]
+                arg_types = [self.star(t, tyvars, _unexpected_type_variable)
+                             for _, t in con.fields]
             else:
                 names = None
-                arg_types = [self.star(t, tyvars, 1) for t in con.args]
+                arg_types = [self.star(t, tyvars, _unexpected_type_variable)
+                             for t in con.args]
             scheme = generalize(TFun(arg_types, result), 0)
             cinfo = ConInfo(con.name, decl.name, names, len(arg_types), scheme)
             info.variants.append(cinfo)
@@ -405,3 +417,36 @@ def _referenced_tycons(te: ast.TypeExpr | None) -> list[str]:
     if isinstance(te, ast.TEFun):
         return [n for p in te.params for n in _referenced_tycons(p)] + _referenced_tycons(te.ret)
     return []
+
+
+def _declaration_types(decl: ast.TypeDecl) -> list[ast.TypeExpr]:
+    if decl.alias is not None:
+        return [decl.alias]
+    out: list[ast.TypeExpr] = []
+    for con in decl.variants or []:
+        if con.fields is not None:
+            out.extend(t for _, t in con.fields)
+        else:
+            out.extend(con.args)
+    return out
+
+
+def _type_variables(te: ast.TypeExpr) -> list[ast.TEVar]:
+    if isinstance(te, ast.TEVar):
+        return [te]
+    if isinstance(te, ast.TETuple):
+        return [var for elem in te.elems for var in _type_variables(elem)]
+    if isinstance(te, ast.TEFun):
+        return [var for part in [*te.params, te.ret]
+                for var in _type_variables(part)]
+    if isinstance(te, ast.TEApp):
+        return [*_type_variables(te.fn),
+                *(var for arg in te.args for var in _type_variables(arg))]
+    if isinstance(te, ast.TECon):
+        return [var for arg in te.args for var in _type_variables(arg)]
+    return []
+
+
+def _unexpected_type_variable() -> TVar:
+    raise AssertionError(
+        "type declaration validation missed an undeclared variable")

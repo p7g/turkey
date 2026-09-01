@@ -1,6 +1,7 @@
 module Data.Array (
     Array,
     new,
+    filled,
     push,
     pop,
     map,
@@ -10,18 +11,69 @@ module Data.Array (
     append,
 )
 
+import Prelude ()
 import Std.Classes
 import Data.Bool.Type (Bool(..))
 import Data.Int ()
 import Data.Option.Type (Option(..))
 
-type Array a = Array(Prim.Array a)
+type ArrayStorage a = ArrayStorage {
+    storage : Prim.Array a,
+    length  : Int,
+}
 
-fun raw(Array(value)) = value
+type Array a = Array(ArrayStorage a)
 
-fun new(capacity : Int) -> Array a = Array(Prim.arrayNew(capacity))
-fun push(xs : Array a, x : a) -> Unit = Prim.arrayPush(raw(xs), x)
-fun pop(xs : Array a) -> Option a = Prim.arrayPop(raw(xs))
+fun state(Array(value)) = value
+
+fun new(capacity : Int) -> Array a = Array(ArrayStorage {
+    storage = Prim.arrayNewUninit(capacity),
+    length = 0,
+})
+
+fun filled(length : Int, value : a) -> Array a = Array(ArrayStorage {
+    storage = Prim.arrayNew(length, value),
+    length,
+})
+
+fun grow(xs : Array a) {
+    let data = state(xs)
+    let capacity = Prim.arrayLength(data.storage)
+    if data.length < capacity { return }
+    let nextCapacity = if capacity == 0 { 1 } else { capacity * 2 }
+    let storage = Prim.arrayNewUninit(nextCapacity)
+    for var i = 0; i < data.length; i = i + 1 {
+        Prim.arraySet(storage, i, Prim.arrayGet(data.storage, i))
+    }
+    data.storage = storage
+}
+
+fun push(xs : Array a, x : a) -> Unit {
+    grow(xs)
+    let data = state(xs)
+    Prim.arraySet(data.storage, data.length, x)
+    data.length = data.length + 1
+}
+
+fun pop(xs : Array a) -> Option a {
+    let data = state(xs)
+    if data.length == 0 { return None }
+    data.length = data.length - 1
+    Some(Prim.arrayGet(data.storage, data.length))
+}
+
+fun bounds(xs : Array a, i : Int, operation : String) {
+    let length = state(xs).length
+    if i < 0 || i >= length {
+        Prim.error(Prim.stringConcat(
+            Prim.stringConcat(
+                Prim.stringConcat(
+                    Prim.stringConcat("array index out of bounds: ", operation),
+                    " index "),
+                Prim.intToString(i)),
+            Prim.stringConcat(", length ", Prim.intToString(length))))
+    }
+}
 
 fun map(xs : Array a, f : fun(a) -> b) -> Array b {
     let out = new(len(xs))
@@ -63,11 +115,17 @@ fun append(xs : Array a, ys : Array a) -> Array a {
 instance Index (Array a) {
     type Key = Int
     type Value = a
-    fun get(xs, i) = Prim.arrayGet(raw(xs), i)
-    fun set(xs, i, x) = Prim.arraySet(raw(xs), i, x)
+    fun get(xs, i) {
+        bounds(xs, i, "read at")
+        Prim.arrayGet(state(xs).storage, i)
+    }
+    fun set(xs, i, x) {
+        bounds(xs, i, "write at")
+        Prim.arraySet(state(xs).storage, i, x)
+    }
 }
 
-instance Length (Array a) { fun len(xs) = Prim.arrayLength(raw(xs)) }
+instance Length (Array a) { fun len(xs) = state(xs).length }
 
 type ArrayCursor = ArrayCursor { at : Int }
 

@@ -25,6 +25,7 @@ module Std.Classes (
     error,
 )
 
+import Prelude ()
 import Data.Bool.Type (Bool(..))
 import Data.Option.Type (Option(..))
 

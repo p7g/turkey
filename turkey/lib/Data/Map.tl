@@ -1,6 +1,6 @@
 module Data.Map (Map, new, get, put, delete)
 
--- import Prelude ()
+import Prelude ()
 import Algorithm.Hash (djb2)
 import Data.Bool (Bool(..))
 import Data.Float ()
@@ -39,15 +39,8 @@ fun hashKey(k) {
     digest(d)
 }
 
-fun fill(arr, n, v) {
-    for var i = 0; Prim.intLt(i, n); i = i + 1 {
-        Prim.arrayPush(arr, v)
-    }
-}
-
 fun new() -> Map k v {
-    let table = Prim.arrayNew(defaultSize)
-    fill(table, defaultSize, Empty)
+    let table = Prim.arrayNew(defaultSize, Empty)
     Map {
         table,
         cap = defaultSize,
@@ -174,10 +167,9 @@ fun delete[Hash k](m : Map k v, key : k) -> Bool {
 }
 
 fun resize(m) {
-    let oldTable = m.table
     let newCap = m.cap * 2
-    m.table = Prim.arrayNew(newCap)
-    fill(m.table, newCap, Empty)
+    m.table = Prim.arrayNew(newCap, Empty)
+    m.cap = newCap
     m.tombstoneCount = 0
 
     var current = m.head

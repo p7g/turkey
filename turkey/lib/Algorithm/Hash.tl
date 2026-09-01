@@ -1,5 +1,6 @@
 module Algorithm.Hash (djb2)
 
+import Prelude ()
 import Std.Classes
 import Data.Int ()
 

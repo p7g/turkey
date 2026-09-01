@@ -71,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
         print(exc.render(args.file), file=sys.stderr)
         return 1
     except TurkeyPanic as exc:
-        print(f"panic: {exc.message}", file=sys.stderr)
+        print(exc.render(args.file), file=sys.stderr)
         return 1
     return 0
 

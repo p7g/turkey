@@ -157,10 +157,11 @@ Modules (§9) work for values, types, constructors, classes, methods, and
 associated families. A plain `import M` provides bare and `M.`-qualified names;
 `import M as A` is qualified-only. Classes and their members belong to their
 declaring module, while globally coherent instances are protected by the
-orphan and overlap rules. `import Prelude ()` disables the automatic Prelude
-for low-level modules. Exhaustiveness remains a warning, per §5.1.
+orphan and overlap rules. Any explicit Prelude import replaces the automatic
+one, and `import Prelude ()` removes its dependency edge entirely for low-level
+modules. Exhaustiveness remains a warning, per §5.1.
 
-`Array` is an ordinary opaque library type backed by `Prim.Array`. Indexing and
-`len` are the `Index` and `Length` class methods, so user-defined containers can
-support the same syntax. Storage capacity and the primitive backing value are
-not part of the surface API.
+`Array` is an ordinary opaque growable library type backed by fixed-length
+`Prim.Array` storage. Indexing and `len` are the `Index` and `Length` class
+methods, so user-defined containers can support the same syntax. Storage
+capacity and the primitive backing value are not part of the surface API.

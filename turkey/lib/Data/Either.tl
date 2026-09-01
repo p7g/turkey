@@ -1,5 +1,6 @@
 module Data.Either (Either(..), isRight, unwrapOr, map, fold)
 
+import Prelude ()
 import Std.Classes
 import Data.Bool.Type (Bool(..))
 

@@ -1,5 +1,6 @@
 module Data.Bool (Bool(..), toString, not)
 
+import Prelude ()
 import Std.Classes
 import Data.Bool.Type (Bool(..))
 

@@ -23,7 +23,28 @@ from .types import TCon, spine
 from .values import (
     UNIT, ArrayObj, Cell, ConValue, RecordObj, get_field, set_field, truth,
 )
-from .errors import TurkeyPanic
+from .errors import Span, TurkeyPanic
+
+
+def _panic_call(fn, args, function: str, file: str | None,
+                line: int, col: int):
+    try:
+        return fn(*args)
+    except TurkeyPanic as panic:
+        span = None if line == 0 else Span(line, col, file)
+        raise panic.add_frame(function, span)
+
+
+def _panic(message: str, function: str, file: str | None,
+           line: int, col: int) -> TurkeyPanic:
+    span = None if line == 0 else Span(line, col, file)
+    return TurkeyPanic(message).add_frame(function, span)
+
+
+def _frame_args(function: str, span: Span | None) -> str:
+    if span is None:
+        return f"{function!r}, None, 0, 0"
+    return f"{function!r}, {span.file!r}, {span.line}, {span.col}"
 
 
 @dataclass(frozen=True)
@@ -76,6 +97,7 @@ class _MatchArm:
 class _Match:
     value: str
     arms: tuple[_MatchArm, ...]
+    span: Span | None
 
 
 _SAFE = re.compile(r"[^A-Za-z0-9_]")
@@ -104,17 +126,19 @@ class _Generator:
                 seen.add(binding.py)
                 captures.append(binding.py)
         signature = params + [f"{name}={name}" for name in captures]
-        compiler = _Function(self, py_name, signature)
+        compiler = _Function(self, py_name, signature, name)
         compiler.compile(body, env, {}, compiler.entry, _Dest(None))
         return py_name, compiler.render()
 
 
 class _Function:
     def __init__(self, gen: _Generator, name: str,
-                 signature: list[str] | None = None) -> None:
+                 signature: list[str] | None = None,
+                 turkey_name: str = "<module initialization>") -> None:
         self.gen = gen
         self.name = name
         self.signature = signature or []
+        self.turkey_name = turkey_name
         self.blocks: list[_Block] = []
         self.preamble: list[str] = []
         self.entry = self.new_block()
@@ -206,7 +230,7 @@ class _Function:
                     cond, assignments = self.pattern(alt.pat, held, inner)
                     arms.append(_MatchArm(cond, tuple(assignments), target))
                     self.compile(alt.body, inner, joins, target, dest)
-                self.end(at, _Match(held, tuple(arms)))
+                self.end(at, _Match(held, tuple(arms), e.span))
 
             self.values([e.scrutinee], env, joins, block, decide)
             return
@@ -304,10 +328,10 @@ class _Function:
         if isinstance(e, CArray):
             arr = self.gen.fresh("array")
             self.line(block, f"{arr} = _ArrayObj({len(e.elems)})")
-            for item in e.elems:
+            for index, item in enumerate(e.elems):
                 value = self.gen.fresh("item")
                 self.line(block, f"{value} = {self.value(item, env, joins, block)}")
-                self.line(block, f"{arr}.push({value})")
+                self.line(block, f"{arr}.set({index}, {value})")
             return arr
         if isinstance(e, CRecord):
             made: list[tuple[str, str]] = []
@@ -346,7 +370,8 @@ class _Function:
             index = self.gen.fresh("index")
             self.line(block, f"{target} = {self.value(e.target, env, joins, block)}")
             self.line(block, f"{index} = {self.value(e.index, env, joins, block)}")
-            return f"{target}.get({index})"
+            frame = _frame_args(self.turkey_name, e.span)
+            return f"_panic_call({target}.get, ({index},), {frame})"
         if isinstance(e, CLam):
             inner = dict(env)
             params = []
@@ -365,7 +390,9 @@ class _Function:
                 held = self.gen.fresh("argument")
                 self.line(block, f"{held} = {self.value(arg, env, joins, block)}")
                 args.append(held)
-            return f"{fn}({', '.join(args)})"
+            packed = ", ".join(args) + ("," if len(args) == 1 else "")
+            frame = _frame_args(self.turkey_name, e.span)
+            return f"_panic_call({fn}, ({packed}), {frame})"
         if isinstance(e, CTyLam):
             return self.value(e.body, env, joins, block)
         if isinstance(e, CTyApp):
@@ -411,8 +438,8 @@ class _Function:
             elif isinstance(e, CArray):
                 arr = self.gen.fresh("array")
                 self.line(at, f"{arr} = _ArrayObj({len(values)})")
-                for item in values:
-                    self.line(at, f"{arr}.push({item})")
+                for index, item in enumerate(values):
+                    self.line(at, f"{arr}.set({index}, {item})")
                 value = arr
             elif isinstance(e, CRecord):
                 value = self.record_from_values(e, values)
@@ -613,10 +640,11 @@ class _Function:
             ]
         if isinstance(term, _Match):
             out: list[str] = []
+            frame = _frame_args(self.turkey_name, term.span)
             if not term.arms:
                 return [
-                    f'{pad}raise _TurkeyPanic('
-                    f'f"no match arm applies to {{{term.value}!r}}")'
+                    f'{pad}raise _panic('
+                    f'f"no match arm applies to {{{term.value}!r}}", {frame})'
                 ]
             for i, arm in enumerate(term.arms):
                 out.append(f"{pad}{'if' if i == 0 else 'elif'} {arm.cond}:")
@@ -627,8 +655,8 @@ class _Function:
                 out.append(f"{pad}    _pc = {arm.block}")
             out.append(f"{pad}else:")
             out.append(
-                f'{pad}    raise _TurkeyPanic('
-                f'f"no match arm applies to {{{term.value}!r}}")')
+                f'{pad}    raise _panic('
+                f'f"no match arm applies to {{{term.value}!r}}", {frame})')
             out.append(f"{pad}continue")
             return out
         raise AssertionError(f"no renderer for {type(term).__name__}")
@@ -740,6 +768,8 @@ def _runtime_namespace() -> dict[str, object]:
         "_set_field": set_field,
         "_truth": truth,
         "_TurkeyPanic": TurkeyPanic,
+        "_panic_call": _panic_call,
+        "_panic": _panic,
         "_PRIMS": initial_primitives(),
     }
 

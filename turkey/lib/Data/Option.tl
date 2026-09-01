@@ -1,5 +1,6 @@
 module Data.Option (Option(..), isSome, unwrapOr, map, fold)
 
+import Prelude ()
 import Std.Classes
 import Data.Bool.Type (Bool(..))
 import Data.Option.Type (Option(..))

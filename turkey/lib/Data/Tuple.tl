@@ -1,5 +1,6 @@
 module Data.Tuple ()
 
+import Prelude ()
 import Std.Classes
 
 instance Eq (a, b) : Eq a, Eq b {

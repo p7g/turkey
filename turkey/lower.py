@@ -81,8 +81,8 @@ from .evidence import (
     Absent, Evidence, FromDict, FromInstance, InstancePlan, MethodImpl, Use,
 )
 from .types import (
-    BOOL, EQUALS, KFun, STAR, TApp, TBottom, TCon, TFam, TFun, TTuple, TVar,
-    Type, prune, raw_array_of, spine,
+    BOOL, EQUALS, INT, KFun, STAR, TApp, TBottom, TCon, TFam, TFun, TTuple, TVar,
+    Type, apply, prune, raw_array_of, spine,
 )
 
 UNIT = TCon("Unit")
@@ -822,8 +822,14 @@ class Lowerer:
         assert len(args) == 1
         raw = CArray(raw_array_of(args[0]), e.span,
                      [self.expr(x, scope) for x in e.elems])
-        constructor = CCon(TFun([raw.ty], public), e.span, "Data.Array#Array")
-        return CApp(public, e.span, constructor, [raw])
+        length = CLit(INT, e.span, "Int", len(e.elems))
+        storage_ty = apply(self.decls.head("Data.Array#ArrayStorage"),
+                           [args[0]], e.span)
+        storage = CRecord(storage_ty, e.span, "Data.Array#ArrayStorage",
+                          [("storage", raw), ("length", length)])
+        constructor = CCon(TFun([storage_ty], public), e.span,
+                           "Data.Array#Array")
+        return CApp(public, e.span, constructor, [storage])
 
     def _lower_ERecord(self, e: ast.ERecord, scope: Scope) -> CExpr:
         return CRecord(self.ty_of(e), e.span, e.con,

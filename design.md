@@ -331,7 +331,7 @@ An expression is **non-expansive** iff:
 | `C { f₁ = v₁, ... }` record, `C` immutable (multi-variant) constructor, all `vᵢ` non-expansive | ✓ |
 | `C { ... }` record, `C` mutable (single-variant record) | ✗ |
 | array literal `[...]` or `[]` | ✗ |
-| `Data.Array.new(...)` | ✗ |
+| `Data.Array.new(...)` / `Data.Array.filled(...)` | ✗ |
 | function application `f(args)` | ✗ |
 | `if` / `match` / `while` / `for` / `loop` / `return` / `break` / `continue` | ✗ |
 | `e?` and `do { ... }` | ✗ — `e?` is a call to `bind` (§6.9) |
@@ -704,8 +704,9 @@ reads as.
 ### 8.3 Array
 
 `Array a` is an opaque mutable type declared by `Data.Array`, with reference
-semantics. Its representation is a hidden `Prim.Array a`; neither that storage
-nor its capacity is accessible to source programs.
+semantics. Its representation holds hidden fixed-length `Prim.Array a` storage
+plus a logical length; neither the storage nor capacity is accessible to source
+programs.
 
 Array literals are compiler-known syntax, but indexing and length are ordinary
 class operations:
@@ -725,12 +726,26 @@ without compiler changes.
 **`Data.Array` module:**
 
 ```
-module Data.Array (Array, new, push, pop, map, filter, fold, reverse, append)
+module Data.Array (Array, new, filled, push, pop, map, filter, fold, reverse, append)
 
 fun new(capacity : Int) -> Array a             -- empty array, given capacity
+fun filled(length : Int, value : a) -> Array a -- initialized logical elements
 fun push(arr : Array a, x : a) -> Unit          -- append, growing if needed
 fun pop(arr : Array a) -> Option a              -- remove and return last, or None if empty
 ```
+
+The library-only primitive operations are fixed-length:
+
+```
+Prim.arrayNew(length, value)
+Prim.arrayNewUninit(length)
+Prim.arrayGet(storage, index)
+Prim.arraySet(storage, index, value)
+Prim.arrayLength(storage)
+```
+
+The unsafe constructor does not track initialized slots. Dynamic growth and
+logical bounds are entirely `Data.Array` policy.
 
 The standard library also provides `Functor`, `Applicative`, `Monad`,
 `Iterator`, `Index`, `Length`, `Foldable`, `Semigroup`, `Monoid`, `Add`, and
@@ -771,8 +786,11 @@ import MyMod.Sub (f, MyType(..))       -- selective
 import MyMod.Sub hiding (f)            -- everything but f
 ```
 
-An explicit `import Prelude ()` suppresses the automatic Prelude import and
-imports none of its names.
+Any explicit Prelude import replaces the automatic one. A selective import
+therefore exposes only what it names and contributes one ordinary dependency
+edge. The special spelling `import Prelude ()` exposes no names and removes
+the implicit dependency edge entirely; for every other module, `import M ()`
+remains an instance-only dependency.
 
 ### 9.3 Name resolution
 
@@ -862,7 +880,7 @@ Notes:
 | 8 | `Array` is an opaque source-library type over hidden `Prim.Array` storage; indexing is the `Index` class |
 | 9 | `Data.Array` provides collection functions and standard class instances |
 | 10 | Logical length is `len` through `Length`; storage capacity is not a surface value |
-| 11 | `Array.new` takes capacity only (no default) |
+| 11 | `Array.new` takes capacity; `Array.filled` takes length and a value |
 | 12 | Bottom type `⊥` unifies with anything (`⊥ ∪ T = T`) |
 | 13 | `return`, `break`, `continue` have type `⊥` |
 | 14 | `loop { }` with `break e` returns a value; `while`/`for` return `Unit` |

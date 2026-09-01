@@ -42,8 +42,9 @@ class Cell:
 class Uninitialized:
     """Occupies an array slot that has been allocated but never written.
 
-    Reading one is undefined behaviour in the surface language; the prototype
-    turns it into a panic rather than handing back a value out of nowhere.
+    Reading one is undefined behaviour in the surface language.  Primitive
+    arrays deliberately do not track initialization, so the sentinel may flow
+    out through the unsafe constructor if library code reads before writing.
     """
 
     _instance = None
@@ -61,70 +62,37 @@ UNINIT = Uninitialized()
 
 
 class ArrayObj:
-    """The hidden, dynamically sized storage behind `Data.Array.Array`."""
+    """The fixed-length storage behind `Prim.Array`."""
 
-    __slots__ = ("slots", "length")
+    __slots__ = ("slots",)
 
-    def __init__(self, capacity: int):
-        if capacity < 0:
-            raise TurkeyPanic(f"array capacity cannot be negative (got {capacity})")
-        self.slots: list[object] = [UNINIT] * capacity
-        self.length = 0
+    def __init__(self, length: int, fill=UNINIT):
+        if length < 0:
+            raise TurkeyPanic(f"array length cannot be negative (got {length})")
+        self.slots: list[object] = [fill] * length
 
     @property
-    def capacity(self) -> int:
+    def length(self) -> int:
         return len(self.slots)
 
     def _check(self, index: int, what: str) -> None:
-        # SPEC-DELTAS.md entry 8: bounds are the length, not the capacity.
         if not isinstance(index, int):
             raise TurkeyPanic(f"array index must be an Int, got {index!r}")
-        if index < 0 or index >= self.length:
+        if index < 0 or index >= len(self.slots):
             raise TurkeyPanic(
-                f"array index out of bounds: {what} index {index}, length {self.length}"
+                f"array index out of bounds: {what} index {index}, length {len(self.slots)}"
             )
 
     def get(self, index: int) -> object:
         self._check(index, "read at")
-        value = self.slots[index]
-        if value is UNINIT:
-            raise TurkeyPanic(
-                f"read of uninitialized array slot {index}; the length was raised "
-                f"past what has actually been written"
-            )
-        return value
+        return self.slots[index]
 
     def set(self, index: int, value: object) -> None:
         self._check(index, "write at")
         self.slots[index] = value
 
-    def push(self, value: object) -> None:
-        if self.length == len(self.slots):
-            self.set_capacity(max(1, len(self.slots) * 2))
-        self.slots[self.length] = value
-        self.length += 1
-
-    def pop(self) -> object:
-        if self.length == 0:
-            raise TurkeyPanic("pop from an empty array")
-        self.length -= 1
-        value = self.slots[self.length]
-        self.slots[self.length] = UNINIT
-        if value is UNINIT:
-            raise TurkeyPanic(f"pop of uninitialized array slot {self.length}")
-        return value
-
-    def set_capacity(self, new_capacity: int) -> None:
-        if new_capacity < 0:
-            raise TurkeyPanic(f"capacity cannot be negative (got {new_capacity})")
-        if new_capacity < len(self.slots):
-            self.slots = self.slots[:new_capacity]
-            self.length = min(self.length, new_capacity)
-        else:
-            self.slots.extend([UNINIT] * (new_capacity - len(self.slots)))
-
     def __repr__(self) -> str:
-        return "[" + ", ".join(repr(self.slots[i]) for i in range(self.length)) + "]"
+        return "[" + ", ".join(repr(value) for value in self.slots) + "]"
 
 
 class RecordObj:

@@ -107,6 +107,7 @@ class Evaluator:
     def __init__(self, decls: DeclTable, globals_: dict):
         self.decls = decls
         self.globals = REnv(None, dict(globals_))
+        self.functions = ["<module initialization>"]
         for name, info in decls.constructors.items():
             mutable = decls.tycons[info.tycon].is_mutable_record
             if info.arity == 0:
@@ -170,8 +171,8 @@ class Evaluator:
 
     def _eval_CArray(self, e: CArray, env: REnv):
         arr = ArrayObj(len(e.elems))
-        for item in e.elems:
-            arr.push(self.eval(item, env))
+        for index, item in enumerate(e.elems):
+            arr.set(index, self.eval(item, env))
         return arr
 
     def _eval_CRecord(self, e: CRecord, env: REnv):
@@ -202,14 +203,23 @@ class Evaluator:
         return obj[e.index] if isinstance(obj, tuple) else obj.args[e.index]
 
     def _eval_CIndex(self, e: CIndex, env: REnv):
-        return self.eval(e.target, env).get(self.eval(e.index, env))
+        target = self.eval(e.target, env)
+        index = self.eval(e.index, env)
+        try:
+            return target.get(index)
+        except TurkeyPanic as panic:
+            raise panic.add_frame(self.functions[-1], e.span)
 
     def _eval_CLam(self, e: CLam, env: REnv):
         return Closure([p.name for p in e.params], e.body, env, e.name)
 
     def _eval_CApp(self, e: CApp, env: REnv):
         fn = self.eval(e.fn, env)
-        return self.call(fn, [self.eval(a, env) for a in e.args])
+        args = [self.eval(a, env) for a in e.args]
+        try:
+            return self.call(fn, args)
+        except TurkeyPanic as panic:
+            raise panic.add_frame(self.functions[-1], e.span)
 
     def call(self, fn, args):
         """Apply a value. Parameters are names now, so there is nothing to match.
@@ -223,7 +233,11 @@ class Evaluator:
             scope = fn.env.child()
             for name, value in zip(fn.params, args):
                 scope.define(name, value)
-            return self.eval(fn.body, scope)
+            self.functions.append(fn.name)
+            try:
+                return self.eval(fn.body, scope)
+            finally:
+                self.functions.pop()
         if isinstance(fn, Builtin):
             return fn.fn(*args)
         if isinstance(fn, ConstructorFn):
@@ -288,7 +302,9 @@ class Evaluator:
             for name, bound in bindings.items():
                 scope.define(name, bound)
             return self.eval(alt.body, scope)
-        raise TurkeyPanic(f"no match arm applies to {value!r}")
+        raise TurkeyPanic(
+            f"no match arm applies to {value!r}"
+        ).add_frame(self.functions[-1], e.span)
 
     def _eval_CJoin(self, e: CJoin, env: REnv):
         """Run the rest; when it jumps here, run the body instead, and repeat.

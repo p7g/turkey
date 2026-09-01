@@ -1,5 +1,6 @@
 module Data.String (length, chars, fromChars, join)
 
+import Prelude ()
 import Std.Classes
 import Data.Array (Array)
 import Data.Array as Array

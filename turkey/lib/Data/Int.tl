@@ -1,5 +1,6 @@
 module Data.Int (toString)
 
+import Prelude ()
 import Std.Classes
 fun toString(n : Int) -> String = Prim.intToString(n)
 

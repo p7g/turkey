@@ -2394,3 +2394,30 @@ example `Option (Index.Value (Array (a, b)))` -- looking unknown beneath
 `Some`, and falsely warned that `Some(_)` was missing after `Some((x, y))`.
 It now reads the scrutinee through the shared deep type-resolution table, the
 same boundary used by Core lowering.
+
+---
+
+### 56. Primitive arrays are fixed storage; Prelude edges and panics are explicit
+
+`Prim.Array` now has one physical length. `Prim.arrayNew(n, x)` fills every
+slot, while the library-only `Prim.arrayNewUninit(n)` leaves them unsafe and
+does not track initialization. Primitive push and pop are gone. The opaque
+`Data.Array.Array` keeps mutable storage and a logical length, implements growth
+by reallocating and copying, and adds `Array.filled(n, x)` alongside the
+capacity-only `Array.new(n)`. `Data.Map` uses filled primitive tables directly
+when creating and resizing.
+
+The implicit Prelude is now a real dependency edge. Any explicit Prelude
+import replaces it: non-empty imports keep an explicit edge and their selected
+scope, while `import Prelude ()` removes the edge and imports nothing. Empty
+imports of every other module remain ordinary instance-only dependencies. The
+shipped modules underneath Prelude use the empty marker to keep the graph
+acyclic.
+
+Runtime panics carry source frames from the optimized Core that actually runs.
+Generated code and the evaluator both report the innermost surviving Turkey
+function first; functions erased by inlining are deliberately absent. Finally,
+a type variable used in a declaration body must occur in that declaration's
+parameter list. Constructor-only variables are rejected with a source error;
+declared but unused phantom parameters remain valid, and existential types are
+still outside the language.

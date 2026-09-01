@@ -20,9 +20,9 @@ import sys
 
 from .errors import TurkeyPanic
 from .constraints import Binding, Env
-from .prelude import BOOL_FALSE, BOOL_TRUE, OPTION, OPTION_NONE, OPTION_SOME
+from .prelude import BOOL_FALSE, BOOL_TRUE
 from .types import (
-    BOOL, CHAR, FLOAT, INT, STAR, STRING, UNIT, KFun, TCon, TFun, TVar, apply,
+    BOOL, CHAR, FLOAT, INT, STRING, UNIT, TFun, TVar,
     array_of, generalize, mono, raw_array_of,
 )
 from .values import (
@@ -38,23 +38,6 @@ def _scheme(build):
 
 def _bi(name, arity, fn):
     return Builtin(name, arity, fn)
-
-
-def _push(arr, value):
-    arr.push(value)
-    return UNIT_VALUE
-
-
-def _pop(arr):
-    """Total, unlike `ArrayObj.pop`: an empty array is an ordinary answer.
-
-    The array's own `pop` still raises, because reading past the length is a
-    program bug wherever else it happens; it is only *this* call, the one whose
-    empty case a program is expected to handle, that answers with `Option`.
-    """
-    if arr.length == 0:
-        return ConValue(OPTION_NONE, ())
-    return ConValue(OPTION_SOME, (arr.pop(),))
 
 
 def _set(arr, index, value):
@@ -77,9 +60,11 @@ def _write(text):
 
 def _chars(s):
     arr = ArrayObj(len(s))
-    for ch in s:
-        arr.push(ch)
-    return ConValue("Data.Array#Array", (arr,), None)
+    for index, ch in enumerate(s):
+        arr.set(index, ch)
+    storage = RecordObj(
+        "Data.Array#ArrayStorage", {"storage": arr, "length": len(s)})
+    return ConValue("Data.Array#Array", (storage,), None)
 
 
 def _char_from_int(n):
@@ -135,21 +120,11 @@ _PRIM: dict[str, tuple] = {
     "Prim.error": (_scheme(lambda a: TFun([STRING], a)),
                    _bi("Prim.error", 1, _error)),
 
-    # What `Data.Array` is written in terms of (section 8.3). Only `pop` is
-    # more than a rename: it is total where `ArrayObj.pop` is not, because an
-    # empty array is an ordinary answer for the one call whose empty case a
-    # program is expected to handle (delta 37).
-    "Prim.arrayNew": (_scheme(lambda a: TFun([INT], raw_array_of(a))),
-                      _bi("Prim.arrayNew", 1, lambda n: ArrayObj(n))),
-    "Prim.arrayPush": (_scheme(lambda a: TFun([raw_array_of(a), a], UNIT)),
-                       _bi("Prim.arrayPush", 2, _push)),
-    "Prim.arrayPop": (
-        # `Option` is declared in `Data.Option` and a `TCon` is compared by
-        # name, so naming it here needs no `DeclTable` -- the same trick that
-        # lets `BOOL` above mean the `Bool` the library declares.
-        _scheme(lambda a: TFun([raw_array_of(a)], apply(TCon(OPTION, KFun(STAR, STAR)), [a]))),
-        _bi("Prim.arrayPop", 1, _pop),
-    ),
+    # Fixed-length storage. Dynamic length and capacity are `Data.Array` policy.
+    "Prim.arrayNew": (_scheme(lambda a: TFun([INT, a], raw_array_of(a))),
+                      _bi("Prim.arrayNew", 2, lambda n, value: ArrayObj(n, value))),
+    "Prim.arrayNewUninit": (_scheme(lambda a: TFun([INT], raw_array_of(a))),
+                            _bi("Prim.arrayNewUninit", 1, lambda n: ArrayObj(n))),
     "Prim.arrayGet": (_scheme(lambda a: TFun([raw_array_of(a), INT], a)),
                       _bi("Prim.arrayGet", 2, lambda xs, i: xs.get(i))),
     "Prim.arraySet": (_scheme(lambda a: TFun([raw_array_of(a), INT, a], UNIT)),

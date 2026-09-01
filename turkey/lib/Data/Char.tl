@@ -1,5 +1,6 @@
 module Data.Char (fromInt, toInt, toString)
 
+import Prelude ()
 import Std.Classes
 
 fun fromInt(code : Int) -> Char = Prim.charFromInt(code)

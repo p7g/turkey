@@ -107,8 +107,7 @@ class ModuleLoader:
 
     def load_entry(self, src: str, file: str | None = None,
                    name: str = ENTRY) -> Module:
-        """Load the Prelude, then the program the driver was handed."""
-        self._load(PRELUDE, [])
+        """Load the program and the effective imports it declares."""
         return self._add(name, src, file, library=False, stack=[name])
 
     def _load(self, name: str, stack: list[str]) -> Module:
@@ -142,7 +141,14 @@ class ModuleLoader:
              stack: list[str]) -> Module:
         program = parse(src, frozenset(self.tycons), file)
         before = frozenset(self.tycons)
+        explicit_prelude = any(imp.name == PRELUDE for imp in program.imports)
+        if name != PRELUDE and not explicit_prelude:
+            self._load(PRELUDE, stack)
         for imp in program.imports:
+            # The empty Prelude import removes the otherwise implicit edge.
+            # Empty imports of every other module remain instance-only edges.
+            if imp.name == PRELUDE and imp.items == []:
+                continue
             self._load(imp.name, stack)
         if frozenset(self.tycons) != before:
             # An imported type name changes how section 7 reads this file, and
@@ -179,16 +185,15 @@ class ModuleLoader:
         # So are the built-in type constructors, which no module declares.
         scope.types.update({name: name for name in BUILTIN_TYCONS})
 
-        # A module the Prelude itself imports is loaded before the Prelude
-        # exists, and needs nothing from it.
-        no_prelude = any(
-            imp.name == PRELUDE and imp.items == []
-            for imp in module.program.imports
+        explicit_prelude = any(
+            imp.name == PRELUDE for imp in module.program.imports
         )
-        if PRELUDE in self.modules and not no_prelude:
+        if module.name != PRELUDE and not explicit_prelude:
             self._bring(scope, self.modules[PRELUDE], PRELUDE,
                         qualified=False, span=None)
         for imp in module.program.imports:
+            if imp.name == PRELUDE and imp.items == []:
+                continue
             dep = self.modules[imp.name]
             self._bring(scope, dep, imp.alias or imp.name, imp.qualified,
                         imp.span, items=imp.items, hiding=imp.hiding)

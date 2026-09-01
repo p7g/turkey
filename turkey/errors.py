@@ -70,9 +70,30 @@ class Unsupported(TurkeyError):
     stage = "unsupported"
 
 
+@dataclass(frozen=True)
+class PanicFrame:
+    function: str
+    span: Span | None
+
+
 class TurkeyPanic(Exception):
     """A runtime panic: `error(...)`, a bounds violation, a failed match."""
 
     def __init__(self, message: str):
         super().__init__(message)
         self.message = message
+        self.frames: list[PanicFrame] = []
+
+    def add_frame(self, function: str, span: Span | None) -> TurkeyPanic:
+        self.frames.append(PanicFrame(short(function), span))
+        return self
+
+    def render(self, filename: str = "<input>") -> str:
+        lines = [f"panic: {self.message}"]
+        for frame in self.frames:
+            if frame.span is None:
+                lines.append(f"  at {frame.function}")
+            else:
+                where = frame.span.file or filename
+                lines.append(f"  at {frame.function} ({where}:{frame.span})")
+        return "\n".join(lines)

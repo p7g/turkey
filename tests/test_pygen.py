@@ -11,6 +11,7 @@ import pytest
 from turkey.builtins import initial_values
 from turkey.cli import main as cli_main
 from turkey.driver import check, run
+from turkey.errors import TurkeyPanic
 from turkey.eval import Evaluator
 from turkey.pygen import execute, generate
 
@@ -208,3 +209,40 @@ def test_run_uses_the_generated_backend(monkeypatch, capsys):
     run("fun main() { print(1) }")
     assert called
     assert capsys.readouterr().out == ""
+
+
+def test_optimized_panic_frames_agree_between_backends():
+    src = """fun descend(n : Int) -> Int {
+    if n == 0 { return error("boom") }
+    descend(n - 1)
+}
+fun main() { print(descend(2)) }
+"""
+    checked = check(src, "trace.tl")
+
+    with pytest.raises(TurkeyPanic) as compiled_panic:
+        execute(checked.opt, checked.decls, checked.main, "trace.tl")
+    with pytest.raises(TurkeyPanic) as interpreted_panic:
+        Evaluator(checked.decls, initial_values()).run(
+            checked.opt, checked.main)
+
+    expected = """panic: boom
+  at descend (trace.tl:2:24)
+  at descend (trace.tl:3:5)
+  at descend (trace.tl:3:5)
+  at main (trace.tl:5:20)"""
+    assert compiled_panic.value.render("trace.tl") == expected
+    assert interpreted_panic.value.render("trace.tl") == expected
+
+
+def test_a_panic_stack_does_not_invent_inlined_frames():
+    src = """fun boom(n : Int) -> Int = error("bad")
+fun middle(n : Int) -> Int = boom(n)
+fun main() { print(middle(3)) }
+"""
+    checked = check(src, "inline.tl")
+    with pytest.raises(TurkeyPanic) as panic:
+        execute(checked.opt, checked.decls, checked.main, "inline.tl")
+    assert panic.value.render("inline.tl") == (
+        "panic: bad\n  at main (inline.tl:3:20)"
+    )

@@ -109,10 +109,46 @@ def test_hiding_withholds_only_what_it_names(tmp_path):
 
 def test_import_prelude_empty_disables_the_implicit_prelude(tmp_path):
     src = "import Prelude ()\nfun identity(n : Int) -> Int = n"
-    assert sigs(src, [tmp_path])["identity"] == "fun(Int) -> Int"
+    checked = check(src, None, [tmp_path])
+    assert {module.name for module in checked.modules} == {"Main"}
+    assert dict((name, show_scheme(scheme))
+                for name, scheme in checked.signatures)["identity"] == \
+        "fun(Int) -> Int"
     assert fails(
         "import Prelude ()\nfun main() { print(1) }", [tmp_path]
     ) == "'print' is not defined"
+
+
+def test_an_explicit_prelude_import_replaces_the_implicit_scope(tmp_path):
+    checked = check("import Prelude (error)\nfun stop() -> Int = error(\"x\")",
+                    None, [tmp_path])
+    assert "error" in checked.scope
+    assert "print" not in checked.scope
+    assert [m.name for m in checked.modules].count("Prelude") == 1
+
+
+def test_an_implicit_prelude_is_a_real_dependency_edge(tmp_path):
+    checked = check("fun identity(n : Int) -> Int = n", None, [tmp_path])
+    names = [module.name for module in checked.modules]
+    assert names.index("Prelude") < names.index("Main")
+
+
+def test_the_empty_prelude_marker_breaks_a_real_import_cycle(tmp_path):
+    search = write(
+        tmp_path,
+        Prelude="module Prelude ()\nimport Base",
+        Base="module Base ()\nimport Prelude ()",
+    )
+    checked = check("fun identity(n : Int) -> Int = n", None, search)
+    assert [module.name for module in checked.modules] == ["Base", "Prelude", "Main"]
+
+    search = write(
+        tmp_path,
+        Prelude="module Prelude ()\nimport Base",
+        Base="module Base ()",
+    )
+    assert "Prelude -> Base -> Prelude" in fails(
+        "fun identity(n : Int) -> Int = n", search)
 
 
 # -- what an export list withholds --------------------------------------------

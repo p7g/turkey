@@ -67,6 +67,41 @@ fun main() { print(addOne(4)) }
     assert calls_to(named(program, "Main#main"), "Main#addOne") == 0
 
 
+def test_a_large_function_is_inlined_only_when_the_call_site_makes_it_small(
+        capsys):
+    """The large-inline cost model measures the specialized residual.
+
+    The generic body is deliberately over the ordinary limit because its
+    ``None`` arm performs fifteen writes. At ``Some(7)`` that cold arm vanishes,
+    leaving a tiny residual worth admitting; at an unknown argument the call
+    remains, so the policy cannot become a disguised higher blanket limit.
+    """
+    from turkey.driver import run
+
+    cold = "\n".join(f'        print("cold {i}")' for i in range(15))
+    src = f"""
+fun choose(o : Option Int) -> Int = match o {{
+    Some(x) -> x
+    None -> {{
+{cold}
+        0
+    }}
+}}
+fun mystery(n : Int) -> Option Int =
+    if n == 0 {{ None }} else {{ mystery(n - 1) }}
+fun main() {{
+    print(choose(Some(7)))
+    print(choose(mystery(0)))
+}}
+"""
+    program = optimized(src)
+    assert calls_to(named(program, "Main#main"), "Main#choose") == 1
+
+    run(src)
+    expected = "7\n" + "".join(f"cold {i}\n" for i in range(15)) + "0\n"
+    assert capsys.readouterr().out == expected
+
+
 def test_a_match_on_a_known_constructor_selects_its_branch():
     """The chain, end to end: `pick(Some(5))` inlines to `match Some(5)`,
     which is where case-of-known-constructor picks the arm and leaves `5`."""
@@ -371,11 +406,12 @@ def test_type_applied_methods_inline_and_the_remaining_flow_is_tracked():
     The `Flow` traffic is a chain of type-applied `bind` and `pure` methods.
     M16c instantiates the small Option and Either method bodies in place,
     including at the non-ground phantom `Brk` type above: local type beta is
-    not monomorphization and needs no groundness restriction. Array's `bind`
-    stays because its reduced body is over `INLINE_LIMIT`, and `Flow` still
-    crosses joins which keep a producer away from its downstream match. Those
-    are separate, recorded follow-ons rather than reasons to make this rule
-    unbounded.
+    not monomorphization and needs no groundness restriction. M16e fuses the
+    recursive loop result with its consumer. M16f's call-site cost model still
+    leaves Array's `bind`: although its reduced body is within the speculative
+    ceiling, none of its eight specialized residuals shrinks under the ordinary
+    limit. That is a measured refusal, rather than a reason to make the blanket
+    limit larger.
     """
     from pathlib import Path
     from turkey.core import CLetRec
@@ -400,15 +436,15 @@ def test_type_applied_methods_inline_and_the_remaining_flow_is_tracked():
     assert "%inst.Applicative.Data.Option#Option#pure" not in typed
     assert "%inst.Monad.Data.Either#Either@String#bind" not in typed
     assert "%inst.Applicative.Data.Either#Either@String#pure" not in typed
-    assert "%inst.Monad.Array#bind" in typed, (
-        "Array bind is deliberately still over the inlining size limit; if it "
-        "moved, check the code-size result and update plan.txt's policy item")
+    assert typed.count("%inst.Monad.Array#bind") == 8, (
+        "Array bind's eight residuals do not repay their size; if this moves, "
+        "check both generated-code size and warm backend time")
 
     flow = sum(
         1 for bind in checked.opt.binds for n in nodes(bind.value)
         if isinstance(n, CCon)
         and n.name in {"Prelude#Fall", "Prelude#Brk",
                        "Prelude#Cont", "Prelude#Ret"})
-    assert 0 < flow < 46, (
-        "M16d must improve on the 46 constructions left before discovered "
-        "joins were reduced, while recursive-boundary elimination remains")
+    assert flow == 33, (
+        "M16e must retain the nine-construction reduction from fusing recursive "
+        "loop result boundaries")

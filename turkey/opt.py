@@ -33,9 +33,12 @@ lexicographically first, which is the first element because `deps.sccs` sorts
 each component. Arbitrary because no criterion here is better than another;
 stable because a `.opt` golden would otherwise move whenever a name changed.
 
-Two smaller bounds sit under that one. A binding is inlined only if its body is
-under `INLINE_LIMIT` nodes, so the acyclic walk cannot blow up on the way down;
-and a name already being inlined is never inlined into its own expansion, which
+Two smaller bounds sit under that one. A binding is ordinarily inlined only if
+its body is under `INLINE_LIMIT` nodes. A body under the larger speculative
+ceiling may be reduced against a particular call's known arguments, but is
+committed only when the residual comes back under `INLINE_LIMIT`, and large
+speculation never nests. Thus the acyclic walk cannot blow up on the way down.
+A name already being inlined is never inlined into its own expansion, which
 makes termination true of the code rather than of an argument about the graph.
 
 ## Arguments are bound, not substituted -- unless they are values
@@ -85,6 +88,12 @@ INLINE_LIMIT = 40
 # reduction, and neither fixture-specific traffic nor the number of callers
 # gets to raise that bound implicitly.
 JOIN_SPECIALIZE_LIMIT = INLINE_LIMIT
+
+# A larger body may be *examined* at a call site, but is admitted only if
+# applying the known arguments and reducing it brings the residual back under
+# INLINE_LIMIT.  This bounds the work spent asking the question as well as the
+# code ultimately copied.  It is deliberately not another emission limit.
+SPECULATIVE_INLINE_LIMIT = INLINE_LIMIT * 4
 
 
 def reduce_program(program: CProgram) -> CProgram:
@@ -136,6 +145,12 @@ class _Reducer:
         # breakers: this makes non-termination impossible in the code rather
         # than merely absent from the graph.
         self.active: list[str] = []
+        # A speculative large inline may reduce ordinary small calls inside
+        # its residual, but does not recursively speculate about another large
+        # call.  Besides bounding compile time, this makes the profitability
+        # decision local rather than letting a chain spend the ceiling once at
+        # every level.
+        self.speculating = False
         # A binding's body, reduced, computed once. Not an optimization of an
         # optimization: without it a chain `f` calls `g` calls `h` re-reduces
         # `h` once per path that reaches it, which is exponential in the depth
@@ -248,15 +263,29 @@ class _Reducer:
         if len(lam.params) != len(e.args):
             return None
         body = self.body_of(name, key, lam)
-        # The *reduced* body against the limit, not the written one. A body of
-        # ten nodes that inlines to five hundred is five hundred nodes at every
-        # call site, and measuring the source would let exactly that through
-        # one level at a time.
-        if body is None or _size(body) > INLINE_LIMIT:
+        # The *reduced* body drives the ordinary limit, not the written one. A
+        # small source body that expands to five hundred nodes is five hundred
+        # nodes at every call site. A larger body gets the separate speculative
+        # path below, whose post-application residual must become small again.
+        if body is None:
             return None
         if _transfers(body):
             return None
-        return _apply(lam.params, e.args, body, e.ty)
+        made = _apply(lam.params, e.args, body, e.ty)
+        if made is None:
+            return None
+        size = _size(body)
+        if size <= INLINE_LIMIT:
+            return made
+        if self.speculating or size > SPECULATIVE_INLINE_LIMIT:
+            return None
+
+        self.speculating = True
+        try:
+            residual = self.expr(made)
+        finally:
+            self.speculating = False
+        return residual if _size(residual) <= INLINE_LIMIT else None
 
     def body_of(self, name: str, key: tuple[str, tuple], lam: CLam):
         """A binding's reduced body, computed once.
@@ -971,5 +1000,6 @@ def _unannot(pat):
 
 
 __all__ = [
-    "INLINE_LIMIT", "JOIN_SPECIALIZE_LIMIT", "loop_breakers", "reduce_program",
+    "INLINE_LIMIT", "JOIN_SPECIALIZE_LIMIT", "SPECULATIVE_INLINE_LIMIT",
+    "loop_breakers", "reduce_program",
 ]

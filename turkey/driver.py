@@ -23,14 +23,13 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import ast, coretc, desugar, joins, lower, mono, opt
-from .builtins import initial_type_env, initial_values
+from . import ast, coretc, desugar, joins, lower, mono, opt, pygen
+from .builtins import initial_type_env
 from .classes import ClassTable
 from .constraints import Env, Solver
 from .decls import DeclTable
 from .deps import pattern_vars
 from .errors import short
-from .eval import Evaluator
 from .evidence import Elaborator
 from .infer import Generator
 from .modules import ENTRY, SEP, Module, ModuleLoader
@@ -167,12 +166,11 @@ def run(src: str, filename: str = "<input>") -> None:
     search = [Path(filename).resolve().parent] if filename != "<input>" else None
     checked = check(src, None if filename == "<input>" else filename, search)
     report_warnings(checked.warnings, filename)
-    # The *optimized* Core is the program that runs (M15b), for the reason the
-    # specialized one was made to run at M14b: a pass whose output is only ever
-    # inspected is a pass nothing tests. `checked.core` and `checked.mono` are
-    # kept because they are what `turkey core` and `turkey mono` print and what
-    # each later stage is read against, but nothing evaluates them.
-    Evaluator(checked.decls, initial_values()).run(checked.opt, checked.main)
+    # The *optimized* Core is compiled to Python and run (M17).  The old
+    # evaluator remains a differential oracle in the tests, but keeping it on
+    # this path would hide code-generator bugs and make the optimizer's payoff
+    # unmeasurable.
+    pygen.execute(checked.opt, checked.decls, checked.main, filename)
 
 
 def report_warnings(warnings: list[str], filename: str) -> None:

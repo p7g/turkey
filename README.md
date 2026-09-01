@@ -24,8 +24,9 @@ python3 -m turkey core   program.tl    # dump the typed Core the elaboration pro
 python3 -m turkey mono   program.tl    # dump that Core specialized -- what actually runs
 ```
 
-A program is a single file. Execution evaluates the top-level bindings, then
-calls `main` if one is defined.
+A program is a single file. Execution compiles the optimized typed Core to
+internal Python source, runs the top-level bindings, then calls `main` if one
+is defined.
 
 ```
 type Stack a = Stack {
@@ -82,7 +83,8 @@ main : fun() -> Unit
 | `turkey/constraints.py` | The constraint language and its solver; ranks, predicates |
 | `turkey/exhaustive.py` | Maranget's usefulness algorithm, for match warnings |
 | `turkey/values.py` | Runtime values; array length/capacity semantics |
-| `turkey/eval.py` | Tree-walking evaluator |
+| `turkey/pygen.py` | Internal Python-source backend used by `turkey run` |
+| `turkey/eval.py` | Tree-walking differential-test oracle |
 | `turkey/builtins.py` | The machine primitives, and nothing else |
 | `turkey/modules.py` | The import graph, and what each module can see |
 | `turkey/resolve.py` | Rewrites a module's names so the program shares one namespace |
@@ -117,6 +119,15 @@ and only the innermost one gets to decide.
 
 ```
 python3 -m pytest tests -q
+```
+
+The generated-Python backend has a manual, non-CI comparison against the
+tree-walking evaluator. It reports generation, Python compilation, and median
+warm execution separately, and exits unsuccessfully if either workload is
+less than three times faster:
+
+```
+python3 -m benchmarks.python_backend --rounds 3
 ```
 
 `tests/programs/` holds golden-file conformance programs: each `NAME.tl` is

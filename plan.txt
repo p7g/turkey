@@ -250,7 +250,7 @@ Roadmap, in order. Rationale kept short; open questions are the point.
    rather than jumps to join points ... worth doing, under item 7, against a
    Core that already exists" (core.py) -- and design.md 405 says the same.
    That deferral is now cashed, and item 5's "SSA belongs below this, in the
-   backend" still holds: SSA is 9-11's business. Join points are not SSA. They
+   backend" still holds: SSA is 10-12's business. Join points are not SSA. They
    are a distinguished form of `let` whose bound lambda is only ever
    tail-called and never escapes, which is the *Compiling without
    continuations* design, and GHC put them in Core for the same reason: a
@@ -532,21 +532,42 @@ Roadmap, in order. Rationale kept short; open questions are the point.
    pass exposes continuations, discovery preserves their sharing, and the last
    pass specializes known incoming tags without copying per edge.
 
-   Open, and genuinely: how much of this the Python prototype should carry.
-   The evaluator is a tree-walker over name-keyed environments, so an inlined
-   `bind` costs it a dict lookup either way and the goldens will not show a
-   difference. The passes are still worth having here -- they are checkable by
-   coretc.py, and 8 is the program that will exercise them -- but the payoff
-   is 9's, not this one's.
+   The old evaluator was a tree-walker over name-keyed environments, so an
+   inlined `bind` cost it a dict lookup either way and the goldens could not
+   show a difference. Item 8 changes that: the same checked optimized Core now
+   becomes Python locals, calls and labels, so these passes have a measurable
+   payoff before the native runtime exists. Item 9 remains the scale test.
 
-8. bootstrap interpreter (same frontend, IR, optimizations)
-   Moved ahead of the backend work. It is the first real program in the
+8. Python source backend
+   Done, M17. `turkey run` compiles optimized Core to deterministic internal
+   Python source, compiles that source in memory, and executes it. Ordinary
+   Core values are Python locals and direct calls; type abstraction and
+   application erase; constructors, records, arrays and cells reuse the small
+   existing runtime. There is no supported source-file artifact and no cache.
+
+   Each lambda and the top-level initializer lower to numbered basic blocks.
+   `CJoin` is a block and `CJump` evaluates its arguments left to right,
+   assigns the block parameters simultaneously, and continues one dispatcher
+   loop. A recursive join is therefore stack-safe without an exception or a
+   Python call. Lambdas snapshot ordinary captured locals in defaults, while
+   recursive and top-level names use Python closure cells; that distinction is
+   what preserves the fresh parameter scope of each loop iteration.
+
+   The tree-walking evaluator remains as an oracle, not a fallback. Every
+   successful conformance program runs through both in `test_pygen.py`, while
+   the ordinary goldens reach only generated Python through `turkey run`.
+   The non-CI benchmark separates generation, Python compilation and warm
+   execution. On the landing probe, the 200,000-iteration join loop was 9.1x
+   faster and `bf.tl` 8.0x faster than the evaluator, past the 3x gate.
+
+9. bootstrap interpreter (same frontend, IR, optimizations)
+   Still ahead of the native backend work. It is the first real program in the
    language and the only forcing function that finds papercuts at a scale
-   test.tl cannot, and it costs no backend work -- the Python implementation
-   runs it. Discovering the language is unpleasant to write a compiler in is
-   much cheaper before two backends exist.
+   test.tl cannot. The generated-Python implementation runs it, so it needs no
+   GC or machine-code work. Discovering that the language is unpleasant to
+   write a compiler in is much cheaper before the native backends exist.
 
-9. runtime: GC, closure representation, boxing
+10. runtime: GC, closure representation, boxing
    Was missing from this list, and is the hard part of native compilation --
    not LLVM. Today everything is a Python object: RecordObj has reference
    semantics, ConValue is immutable, ArrayObj is mutable. None of that has a
@@ -564,7 +585,7 @@ Roadmap, in order. Rationale kept short; open questions are the point.
    thing that diverged was the type index; the layout index cannot.
 
    So the tiers are: 6 specializes by type, on a budget, to enable
-   devirtualization and 7's inliner; 9 shares by layout, always, for whatever
+   devirtualization and 7's inliner; 10 shares by layout, always, for whatever
    6 declined. Exactly .NET's split -- one native body shared across every
    reference-type instantiation of a generic (`__Canon`), separate code only
    for value types, where size differs. Swift is the closest statement of the
@@ -598,9 +619,9 @@ Roadmap, in order. Rationale kept short; open questions are the point.
    never meaning. It is the thing that would quietly break if reflection ever
    arrived.
 
-10. native compilation via LLVM
+11. native compilation via LLVM
 
-11. DIY backend
+12. DIY backend
 
 Deferred probe: Beam. Its leverage is HKT-parameterized records (`Table f`,
 `Table (Nullable Identity)`) plus MPTCs over rows. Turkey has HKTs and
@@ -611,9 +632,9 @@ nothing here; they typecheck today.
 
 The thesis behind the order: prototype in Python to iron out the language
 before building the hard-but-not-novel parts. Which is why 4 and 5 sit early
--- they are where the novel semantics live -- and 9 through 11 sit late.
+-- they are where the novel semantics live -- and 10 through 12 sit late.
 
-Where it stands: 1 through 7 are done. 4 closed not by building its fast
+Where it stands: 1 through 8 are done. 4 closed not by building its fast
 lowering but by deleting it: the speed it wanted is general Core passes that
 know nothing about monads, and those are 7 -- which now exists, in nine parts.
 `CJoin` and `CJump` are in the IR with tail position derived rather than
@@ -636,6 +657,11 @@ of its remaining actual Flow constructions. What remains is stated as M16e
 and M16f where it lives: recursive loop joins still return Flow, and Array's
 65-node `bind` is intentionally over the size limit.
 
-Next is 8, the bootstrap interpreter -- the first real program in the language,
-and the only thing that will find out whether any of this was worth it at a
-scale `test.tl` cannot.
+M17 then made optimized Core executable as generated Python rather than a tree
+walk. The evaluator remains a differential oracle, recursive joins are Python
+loops, and the optimizer's wins now change wall-clock cost. M16e and M16f stay
+tracked above: the backend gives the bootstrap probe a way to decide whether
+they are worth doing rather than making their counts ends in themselves.
+
+Next is 9, the bootstrap interpreter -- the first real program in the language,
+and the scale test for both the language and its new execution path.

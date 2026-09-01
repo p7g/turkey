@@ -54,7 +54,8 @@ from .core import (
 from .decls import DeclTable
 from .errors import TurkeyPanic
 from .values import (
-    UNIT, ArrayObj, Builtin, Closure, ConstructorFn, ConValue, RecordObj, truth,
+    UNIT, ArrayObj, Builtin, Cell, Closure, ConstructorFn, ConValue, RecordObj,
+    get_field, set_field, truth,
 )
 
 
@@ -76,23 +77,6 @@ class JumpSignal(Exception):
     def __init__(self, name, args):
         self.name = name
         self.args = args
-
-
-class Cell:
-    """A mutable binding: what a `var` is (design.md decision 36).
-
-    One object, captured by value, so a closure that writes through it writes
-    to the same cell everyone else reads. That was previously a property of the
-    evaluator's scope chain and is now a property of the term.
-    """
-
-    __slots__ = ("value",)
-
-    def __init__(self, value):
-        self.value = value
-
-    def __repr__(self) -> str:
-        return f"<cell {self.value!r}>"
 
 
 class REnv:
@@ -211,9 +195,7 @@ class Evaluator:
 
     def _eval_CField(self, e: CField, env: REnv):
         obj = self.eval(e.target, env)
-        if isinstance(obj, ArrayObj):
-            return obj.length if e.name == "length" else obj.capacity
-        return obj.fields[e.name]
+        return get_field(obj, e.name)
 
     def _eval_CIndex(self, e: CIndex, env: REnv):
         return self.eval(e.target, env).get(self.eval(e.index, env))
@@ -280,13 +262,7 @@ class Evaluator:
             return UNIT
         if isinstance(target, CField):
             obj = self.eval(target.target, env)
-            if isinstance(obj, ArrayObj):
-                if target.name == "length":
-                    obj.length = value
-                else:
-                    obj.capacity = value
-                return UNIT
-            obj.fields[target.name] = value
+            set_field(obj, target.name, value)
             return UNIT
         # A cell, reached by name. `CDeref` never appears as a target: writing
         # a cell is not writing what it holds.

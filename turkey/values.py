@@ -27,6 +27,18 @@ class Unit:
 UNIT = Unit()
 
 
+class Cell:
+    """A mutable binding: the shared runtime representation of Core's CRef."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value):
+        self.value = value
+
+    def __repr__(self) -> str:
+        return f"<cell {self.value!r}>"
+
+
 class Uninitialized:
     """Occupies an array slot that has been allocated but never written.
 
@@ -249,3 +261,21 @@ class ConstructorFn:
 
     def __repr__(self) -> str:
         return f"<constructor {self.con}/{self.arity}>"
+
+
+def get_field(obj, name: str):
+    """Read a field with the one dynamic case Core permits: an Array field."""
+    if isinstance(obj, ArrayObj):
+        return obj.length if name == "length" else obj.capacity
+    return obj.fields[name]
+
+
+def set_field(obj, name: str, value) -> None:
+    """Write a mutable field, preserving Array's length/capacity invariants."""
+    if isinstance(obj, ArrayObj):
+        if name == "length":
+            obj.set_length(value)
+        else:
+            obj.set_capacity(value)
+        return
+    obj.fields[name] = value

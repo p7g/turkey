@@ -211,3 +211,8 @@ def initial_type_env() -> Env:
 
 def initial_values() -> dict[str, object]:
     return {name: value for name, (_scheme, value) in _PRIM.items()}
+
+
+def initial_primitives() -> dict[str, object]:
+    """Raw primitive callables for compiled code, without evaluator wrappers."""
+    return {name: value.fn for name, (_scheme, value) in _PRIM.items()}

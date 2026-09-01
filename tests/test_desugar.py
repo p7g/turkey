@@ -312,3 +312,18 @@ def test_a_return_before_every_question_is_allowed():
 def test_a_question_outside_any_context_is_refused():
     assert "only meaningful inside a function body or a 'do' block" in \
         refuse("type T = T(Int)\nlet x = y?")
+
+
+def test_a_lambda_in_a_record_field_is_a_context_of_its_own():
+    """The walk has to descend through `ERecord.fields`, whose items are
+    `(name, expr)` pairs rather than bare expressions. A `?` left unlowered
+    there survives into inference, which has no node for it."""
+    program = parse("fun f(x) = C { g = fun(n) { let y = n?; k(y) } }")
+    desugar.program(program)
+    assert not _holds_a_question(program)
+
+
+def _holds_a_question(node: object) -> bool:
+    if isinstance(node, ast.EQuestion):
+        return True
+    return any(_holds_a_question(child) for child in desugar._children(node))

@@ -276,7 +276,11 @@ class Desugarer:
                     if isinstance(item, ast.MatchArm):
                         item.body = self.walk(item.body)
                 setattr(node, field.name, [
-                    self.walk(x) if isinstance(x, (ast.Expr, ast.Stmt)) else x
+                    self.walk(x) if isinstance(x, (ast.Expr, ast.Stmt))
+                    else (x[0], self.walk(x[1]))
+                    if isinstance(x, tuple) and len(x) == 2
+                    and isinstance(x[1], ast.Expr)
+                    else x
                     for x in value
                 ])
         return node

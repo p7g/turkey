@@ -1,4 +1,5 @@
 module Prelude (
+    const,
     print,
     write,
     error,

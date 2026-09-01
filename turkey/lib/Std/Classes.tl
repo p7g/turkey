@@ -17,6 +17,7 @@ module Std.Classes (
     Semigroup(..),
     Monoid(..),
     Foldable(..),
+    const,
     print,
     write,
     error,
@@ -85,6 +86,7 @@ class Foldable f {
     fun fold[Monoid m](xs : f m) -> m = foldMap(xs, fun(x) { return x })
 }
 
+fun const(x) = fun(_) = x
 fun print(x) = Prim.print(show(x))
 fun write(x) = Prim.write(show(x))
 fun error(message : String) -> a = Prim.error(message)

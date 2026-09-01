@@ -822,7 +822,8 @@ class Lowerer:
         assert len(args) == 1
         raw = CArray(raw_array_of(args[0]), e.span,
                      [self.expr(x, scope) for x in e.elems])
-        return CRecord(public, e.span, "Data.Array#Array", [("raw", raw)])
+        constructor = CCon(TFun([raw.ty], public), e.span, "Data.Array#Array")
+        return CApp(public, e.span, constructor, [raw])
 
     def _lower_ERecord(self, e: ast.ERecord, scope: Scope) -> CExpr:
         return CRecord(self.ty_of(e), e.span, e.con,

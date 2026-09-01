@@ -34,7 +34,7 @@ interface.
 
 ```
 type Stack a = Stack {
-    data : Array a,
+    data : Array a
     top  : Int
 }
 
@@ -50,9 +50,10 @@ fun push(s : Stack a, x : a) -> Unit {
 fun drain(s : Stack a) -> Array a {
     let out = [] : Array a
     loop {
-        if s.top == 0 { break out }
-        Array.push(out, Array.pop(s.data))
-        s.top = s.top - 1
+        match Array.pop(s.data) {
+            Some(x) -> Array.push(out, x)
+            None -> break out
+        }
     }
 }
 
@@ -86,13 +87,13 @@ main : fun() -> Unit
 | `turkey/infer.py` | Constraint generation: the value restriction, control-flow typing |
 | `turkey/constraints.py` | The constraint language and its solver; ranks, predicates |
 | `turkey/exhaustive.py` | Maranget's usefulness algorithm, for match warnings |
-| `turkey/values.py` | Runtime values; array length/capacity semantics |
+| `turkey/values.py` | Runtime values, including the hidden primitive array storage |
 | `turkey/pygen.py` | Internal Python-source backend used by `turkey run` |
 | `turkey/eval.py` | Tree-walking differential-test oracle |
 | `turkey/builtins.py` | The machine primitives, and nothing else |
 | `turkey/modules.py` | The import graph, and what each module can see |
 | `turkey/resolve.py` | Rewrites a module's names so the program shares one namespace |
-| `turkey/lib/` | The library, written in the language: `Prelude.tl`, `Data/*.tl` |
+| `turkey/lib/` | The library, written in the language: classes, Prelude, and `Data.*` modules |
 
 Three things are worth knowing before reading the code, because they are where
 this language departs from a textbook implementation.
@@ -145,13 +146,16 @@ output is what you meant.
 is a multi-file program, run from inside that directory, with its golden in
 `Main.expected` beside it.
 
-## Not in v0
+## Current boundaries
 
-Modules (§9) work — a program is a directory, `import` means what §9 says, the
-prelude and the `Data.*` modules are ordinary source under `turkey/lib`, and a
-type constructor belongs to the module that declared it, so two libraries that
-each declare a `Node` can be used together (SPEC-DELTAS.md 41, 42, 43). What is
-not there yet: classes are global, so an export list may name one but withholds
-nothing, and two modules cannot each declare an `Eq`. Instances are global too,
-which the orphan rule is what makes safe. Exhaustiveness is a warning, per
-§5.1.
+Modules (§9) work for values, types, constructors, classes, methods, and
+associated families. A plain `import M` provides bare and `M.`-qualified names;
+`import M as A` is qualified-only. Classes and their members belong to their
+declaring module, while globally coherent instances are protected by the
+orphan and overlap rules. `import Prelude ()` disables the automatic Prelude
+for low-level modules. Exhaustiveness remains a warning, per §5.1.
+
+`Array` is an ordinary opaque library type backed by `Prim.Array`. Indexing and
+`len` are the `Index` and `Length` class methods, so user-defined containers can
+support the same syntax. Storage capacity and the primitive backing value are
+not part of the surface API.

@@ -386,10 +386,7 @@ class _Function:
                 obj = self.gen.fresh("target")
                 self.line(block, f"{obj} = {self.value(target.target, env, joins, block)}")
                 kind = self.field_kind(target.target)
-                if kind == "array":
-                    method = "set_length" if target.name == "length" else "set_capacity"
-                    self.line(block, f"{obj}.{method}({value})")
-                elif kind == "record":
+                if kind == "record":
                     self.line(block, f"{obj}.fields[{target.name!r}] = {value}")
                 else:
                     self.line(block, f"_set_field({obj}, {target.name!r}, {value})")
@@ -504,10 +501,7 @@ class _Function:
             self.line(block, f"{values[1]}.set({values[2]}, {value})")
         elif isinstance(target, CField):
             kind = self.field_kind(target.target)
-            if kind == "array":
-                method = "set_length" if target.name == "length" else "set_capacity"
-                self.line(block, f"{values[1]}.{method}({value})")
-            elif kind == "record":
+            if kind == "record":
                 self.line(block, f"{values[1]}.fields[{target.name!r}] = {value}")
             else:
                 self.line(block, f"_set_field({values[1]}, {target.name!r}, {value})")
@@ -565,8 +559,6 @@ class _Function:
         head, _ = spine(e.ty)
         if not isinstance(head, TCon):
             return "dynamic"
-        if head.name == "Array":
-            return "array"
         if head.name.startswith("%Dict.") or head.name in self.gen.decls.tycons:
             return "record"
         return "dynamic"

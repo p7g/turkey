@@ -14,8 +14,8 @@ A minimal procedural programming language with an ML-style type system and Hindl
 | Recursion | explicit via `fun`; SCC-grouped inference |
 | Mutation | `let`/`var` control binding mutability; record fields and arrays are mutable |
 | Data types | single-variant records are mutable (reference semantics); multi-variant ADTs are immutable |
-| Arrays | primitive mutable type, reference semantics, dynamic capacity |
-| Modules | Haskell-style, explicit exports, qualified imports |
+| Arrays | opaque source-library type over hidden primitive storage; reference semantics |
+| Modules | explicit exports; plain and qualified-only imports |
 | Runtime | opaque; compiler chooses representation |
 | Type syntax | `fun(Int) -> Int` for function types; `-> τ` for return annotations; `e : τ` for expression annotations |
 | Naming | lowercase = variables; uppercase = type and value constructors |
@@ -35,7 +35,7 @@ STRING   ← "..."   (escapes: \n \t \\ \" \uXXXX)
 CHAR     ← '...'
 ```
 
-**Reserved words:** `type class instance fun let var match if else while for in loop return break continue do module import export as qualified hiding where`
+**Reserved words:** `type class instance fun let var match if else while for in loop return break continue do module import export as hiding`
 
 **Operators and punctuation:**
 ```
@@ -80,7 +80,7 @@ A `;` may always be used in place of a significant `NEWLINE`.
 
 ```
 program       ::= module-header? toplevel*
-module-header ::= "module" modname export-list? "where"
+module-header ::= "module" modname export-list?
 modname       ::= CONID ("." CONID)*
 export-list   ::= "(" export ("," export)* ")"
 export        ::= IDENT
@@ -94,9 +94,8 @@ toplevel      ::= type-decl
                | let-decl
                | var-decl
                | import-decl
-import-decl   ::= "import" modname import-spec?
-import-spec   ::= "as" CONID
-               | "(" import-item ("," import-item)* ")"
+import-decl   ::= "import" modname ("as" CONID)? import-spec?
+import-spec   ::= "(" import-item ("," import-item)* ")"
                | "hiding" "(" IDENT ("," IDENT)* ")"
 import-item   ::= IDENT | CONID | CONID "(" ".." ")"
 ```
@@ -111,7 +110,9 @@ type-rhs     ::= con-decl ("|" con-decl)*     -- data type (multi or single vari
                | type-expr                      -- type alias
 con-decl     ::= CONID con-arg*
 con-arg      ::= atype
-               | "{" field ("," field)* "}"    -- record payload (at most one per constructor)
+               | "{" record-fields? "}"        -- record payload (at most one per constructor)
+record-fields ::= field (record-sep field)* ","?
+record-sep    ::= "," NEWLINE? | NEWLINE
 field        ::= IDENT ":" type-expr
 type-expr    ::= btype ("->" btype)*           -- right-assoc (function type uses fun(...) syntax, see below)
 btype        ::= atype+
@@ -139,7 +140,7 @@ fun-body     ::= "=" expr
 -- class body.
 class-decl   ::= "class" CONID IDENT (":" class-pred ("," class-pred)*)?
                  "{" (method | fam-decl)* "}"
-instance-decl ::= "instance" context? CONID atype
+instance-decl ::= "instance" qclass atype (":" class-pred ("," class-pred)*)?
                  "{" (fun-decl | fam-bind)* "}"
 method       ::= fun-decl
                | "fun" IDENT context? "(" type-list? ")" "->" type-expr
@@ -150,7 +151,8 @@ fam-decl     ::= "type" CONID IDENT
 fam-bind     ::= "type" CONID "=" type-expr
 context      ::= "[" ctx-pred ("," ctx-pred)* "]"
 ctx-pred     ::= class-pred | eq-pred                 -- (delta 39)
-class-pred   ::= CONID atype
+class-pred   ::= qclass atype
+qclass       ::= CONID ("." CONID)*
 -- An equality states what a family answers (delta 39). The left side must be
 -- a family application and the right may not mention it, so a given is a
 -- terminating rewrite rule rather than a general equation.
@@ -160,6 +162,11 @@ let-decl     ::= "let" pat "=" expr
 var-decl     ::= "var" pat "=" expr
 pat-list     ::= pat ("," pat)*
 ```
+
+Comma-separated forms accept a trailing comma. In a multiline record payload,
+a significant newline is also a field separator, so commas are optional.
+Parenthesized singleton tuples do not exist: `(x)` is grouping and `(x,)` is
+rejected.
 
 ### 3.4 Statements
 
@@ -688,35 +695,38 @@ reads as.
 
 ### 8.3 Array
 
-`Array a` is a primitive mutable type with reference semantics.
+`Array a` is an opaque mutable type declared by `Data.Array`, with reference
+semantics. Its representation is a hidden `Prim.Array a`; neither that storage
+nor its capacity is accessible to source programs.
 
-**Compiler-known fields** (mutable, at user's own risk):
-
-| Field | Type | Notes |
-|---|---|---|
-| `.length` | `Int` | current number of elements |
-| `.capacity` | `Int` | allocated capacity |
-
-**Compiler-known syntax:**
+Array literals are compiler-known syntax, but indexing and length are ordinary
+class operations:
 
 | Syntax | Type | Notes |
 |---|---|---|
-| `arr[i]` | `(Array a, Int) -> a` | index read; runtime bounds check |
-| `arr[i] = e` | `(Array a, Int, a) -> Unit` | index write; runtime bounds check |
+| `container[key]` | `[Index c] (c, Index.IndexKey c) -> Index.IndexItem c` | `get`; implementation may bounds-check |
+| `container[key] = e` | `[Index c] (c, Index.IndexKey c, Index.IndexItem c) -> Unit` | `set` |
+| `len(container)` | `[Length c] c -> Int` | logical length |
 | `[]` | `Array α` | empty literal, α fresh |
 | `[e₁, ..., eₙ]` | `Array τ` | literal with n elements |
 
-These will become typeclass methods/instances when typeclasses are added; existing code remains valid.
+`Index` has associated families `IndexKey` and `IndexItem`. User-defined
+containers may implement `Index` and `Length`, and the same syntax then works
+without compiler changes.
 
 **`Data.Array` module:**
 
 ```
-module Data.Array where
+module Data.Array (Array, new, push, pop, map, filter, fold, reverse, append)
 
 fun new(capacity : Int) -> Array a             -- empty array, given capacity
 fun push(arr : Array a, x : a) -> Unit          -- append, growing if needed
 fun pop(arr : Array a) -> Option a              -- remove and return last, or None if empty
 ```
+
+The standard library also provides `Functor`, `Applicative`, `Monad`,
+`Iterator`, `Index`, `Length`, `Foldable`, `Semigroup`, `Monoid`, `Add`, and
+`Show` instances for Array where their element constraints permit them.
 
 ### 8.4 Other standard modules (suggested)
 
@@ -736,64 +746,77 @@ module Data.List    -- list operations (immutable lists via ADT)
 Each file begins with an optional module header:
 
 ```
-module MyMod.Sub (f, MyType(..), g) where
+module MyMod.Sub (f, MyType(..), MyClass(..), g)
 ```
 
-If omitted, the module name defaults to the file name. If no export list is given, all top-level `fun`, `let`, `var`, and `type` declarations (with all constructors) are exported.
+If omitted, the module name defaults to the file name. If no export list is
+given, top-level values, types, constructors, classes, methods, and associated
+families are exported. `C(..)` exports a class with all its members.
 
 ### 9.2 Imports
 
 ```
 import MyMod.Sub                       -- unqualified, all exports
-import MyMod.Sub as S                  -- qualified as S
+                                       -- and also MyMod.Sub-qualified
+import MyMod.Sub as S                  -- qualified-only as S
 import MyMod.Sub (f, MyType(..))       -- selective
-import qualified MyMod.Sub as S        -- qualified only
 import MyMod.Sub hiding (f)            -- everything but f
 ```
+
+An explicit `import Prelude ()` suppresses the automatic Prelude import and
+imports none of its names.
 
 ### 9.3 Name resolution
 
 1. Local scope (parameters, `let`/`var` bindings).
 2. Module's own top-level declarations.
-3. Imported names (unqualified imports).
-4. Qualified names (`M.x`).
+3. Bare names from plain imports.
+4. Qualified names (`M.x` or an explicit alias).
 
 Constructor disambiguation in patterns: if two imported types share a constructor name, the constructor must be qualified, or an error is raised requiring qualification.
+
+Classes, methods, and associated families have stable qualified identities.
+Two modules may each declare `Eq`, and two classes may each declare `map`.
+Instances are visible globally for coherence, but an instance must be declared
+in the module that owns its class or the module that owns its head type; tuple
+instances may live with their class or in `Data.Tuple`. Overlapping heads are
+rejected.
 
 ---
 
 ## 10. Complete Worked Example
 
 ```
-module Stack (Stack, new, push, pop, drain) where
+module Stack (Stack, new, push, pop, drain)
 
-import Data.Array (new, push, pop)
+import Data.Array as Array
 
 type Stack a = Stack {
-    data : Array a,
-    top  : Int
+    data : Array a
 }
 
 fun new(capacity : Int) -> Stack a {
-    Stack { data = new(capacity), top = 0 }
+    Stack { data = Array.new(capacity) }
 }
 
 fun push(s : Stack a, x : a) -> Unit {
-    s.data[s.top] = x
-    s.top = s.top + 1
+    Array.push(s.data, x)
 }
 
 fun pop(s : Stack a) -> a {
-    if s.top == 0 { return error("empty stack") }
-    s.top = s.top - 1
-    s.data[s.top]
+    match Array.pop(s.data) {
+        Some(x) -> x
+        None -> error("empty stack")
+    }
 }
 
 fun drain(s : Stack a) -> Array a {
     let out = [] : Array a
     loop {
-        if s.top == 0 { break out }
-        push(out, pop(s))
+        match Array.pop(s.data) {
+            Some(x) -> Array.push(out, x)
+            None -> break out
+        }
     }
 }
 ```
@@ -801,10 +824,10 @@ fun drain(s : Stack a) -> Array a {
 Inferred types:
 
 ```
-new   : Int -> Stack a
-push  : (Stack a, a) -> Unit
-pop   : Stack a -> a
-drain : Stack a -> Array a
+new   : fun(Int) -> Stack a
+push  : fun(Stack a, a) -> Unit
+pop   : fun(Stack a) -> a
+drain : fun(Stack a) -> Array a
 ```
 
 Notes:
@@ -828,9 +851,9 @@ Notes:
 | 5 | `let` = immutable binding; `var` = mutable binding; both can hold mutable data |
 | 6 | `var` never generalized; `let`/`fun` generalized iff non-expansive |
 | 7 | Single-variant records are mutable (reference semantics); multi-variant ADTs are immutable |
-| 8 | Array is a primitive mutable type with `.length`/`.capacity` fields and `arr[i]` indexing |
-| 9 | `Data.Array` module provides `new`/`push`/`pop` as ordinary functions |
-| 10 | Array `.length`/`.capacity` are mutable (user's risk) |
+| 8 | `Array` is an opaque source-library type over hidden `Prim.Array` storage; indexing is the `Index` class |
+| 9 | `Data.Array` provides collection functions and standard class instances |
+| 10 | Logical length is `len` through `Length`; storage capacity is not a surface value |
 | 11 | `Array.new` takes capacity only (no default) |
 | 12 | Bottom type `⊥` unifies with anything (`⊥ ∪ T = T`) |
 | 13 | `return`, `break`, `continue` have type `⊥` |
@@ -851,9 +874,9 @@ Notes:
 | 28 | Record construction: positional `C(v₁, ...)` or labeled `C { f = v, ... }`; patterns are symmetric with it (delta 34) |
 | 29 | Record update: `r { f = e }` (functional, returns new value) |
 | 30 | SCC-grouped inference for mutual recursion |
-| 31 | Haskell-style modules with explicit exports and qualified imports |
+| 31 | Modules have explicit exports; plain imports add bare and module-qualified names, while `as` is qualified-only |
 | 32 | Runtime representation is opaque (compiler's choice) |
-| 33 | Array literals: `[]` = `Data.Array.new(0)`; `[e₁,...]` = new + pushes |
+| 33 | Array literals construct the opaque `Data.Array.Array` wrapper around primitive storage |
 | 34 | ~~Operators are monomorphic (Int/Float variants); no typeclasses in v1~~ -- superseded: every arithmetic and comparison operator is a class method (SPEC-DELTAS.md 32) |
 | 35 | `error : String -> a` is a polymorphic primitive (panics/diverges) |
 | 36 | A `var` is a mutable cell, and closures capture the cell, not its value -- so a lambda that writes a captured `var` writes through to it (SPEC-DELTAS.md 49; new prose for behaviour the evaluator always had) |

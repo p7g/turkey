@@ -144,6 +144,12 @@ fun main() {
     ]
 
 
+@pytest.mark.parametrize("field", ["raw", "length", "capacity"])
+def test_array_storage_and_capacity_are_not_surface_fields(field):
+    message = fails(f"fun leak(xs : Array Int) = xs.{field}")
+    assert f"cannot read field '{field}'" in message
+
+
 # -- the loop drives a cursor -------------------------------------------------
 
 

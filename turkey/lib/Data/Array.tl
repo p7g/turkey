@@ -15,13 +15,13 @@ import Data.Bool.Type (Bool(..))
 import Data.Int ()
 import Data.Option.Type (Option(..))
 
-type Array a = Array {
-    raw : Prim.Array a
-}
+type Array a = Array(Prim.Array a)
 
-fun new(capacity : Int) -> Array a = Array { raw = Prim.arrayNew(capacity) }
-fun push(xs : Array a, x : a) -> Unit = Prim.arrayPush(xs.raw, x)
-fun pop(xs : Array a) -> Option a = Prim.arrayPop(xs.raw)
+fun raw(Array(value)) = value
+
+fun new(capacity : Int) -> Array a = Array(Prim.arrayNew(capacity))
+fun push(xs : Array a, x : a) -> Unit = Prim.arrayPush(raw(xs), x)
+fun pop(xs : Array a) -> Option a = Prim.arrayPop(raw(xs))
 
 fun map(xs : Array a, f : fun(a) -> b) -> Array b {
     let out = new(len(xs))
@@ -63,11 +63,11 @@ fun append(xs : Array a, ys : Array a) -> Array a {
 instance Index (Array a) {
     type IndexKey = Int
     type IndexItem = a
-    fun get(xs, i) = Prim.arrayGet(xs.raw, i)
-    fun set(xs, i, x) = Prim.arraySet(xs.raw, i, x)
+    fun get(xs, i) = Prim.arrayGet(raw(xs), i)
+    fun set(xs, i, x) = Prim.arraySet(raw(xs), i, x)
 }
 
-instance Length (Array a) { fun len(xs) = Prim.arrayLength(xs.raw) }
+instance Length (Array a) { fun len(xs) = Prim.arrayLength(raw(xs)) }
 
 type ArrayCursor = ArrayCursor { at : Int }
 

@@ -76,11 +76,10 @@ def _write(text):
 
 
 def _chars(s):
-    # Sized exactly, so `capacity` is not misleading to a program that reads it.
     arr = ArrayObj(len(s))
     for ch in s:
         arr.push(ch)
-    return RecordObj("Data.Array#Array", {"raw": arr})
+    return ConValue("Data.Array#Array", (arr,), None)
 
 
 def _char_from_int(n):

@@ -387,11 +387,8 @@ class Checker:
 
     def record_field(self, target: Type, name: str, span: Span | None,
                      erased: Type | None = None) -> Type:
-        """A field of a single-variant record, or an array's own fields."""
+        """A field of a single-variant record."""
         head, args = spine(prune(target))
-        if isinstance(head, TCon) and head.name == "Array":
-            if name in ("length", "capacity"):
-                return TCon("Int")
         if isinstance(head, TVar) or isinstance(head, TBottom):
             # The lowering kept the type inference gave it; if that is still a
             # variable the field was resolved by a `HasField` the solver
@@ -549,8 +546,6 @@ class Checker:
         target = prune(self.check(e.target, env))
         self.expect(TCon("Int"), self.check(e.index, env), e.span, "an index")
         head, args = spine(target)
-        if isinstance(head, TCon) and head.name == "Array" and args:
-            return args[0]
         if isinstance(head, (TVar, TBottom)):
             return e.ty
         raise CoreError(f"{show(target)} is not indexable", e.span)

@@ -785,21 +785,9 @@ class Solver:
             # field demand vacuously -- there is no value to read one from.
             return True
 
-        # The receiver is asked about by its *head*: `Array Int` and
-        # `Stack a` are applications now, and what decides whether a field
-        # exists is the constructor they are headed by.
+        # Applied and nullary record types are both decided by their head.
         head, _ = spine(receiver)
         if isinstance(head, TCon):
-            if head.name == "Array":
-                if label.name in ("length", "capacity"):
-                    # Section 8.3: both are readable and writable.
-                    unify(result, INT, c.span, "a field access", self)
-                    return True
-                raise TypeError_(
-                    f"an Array has no field '{label.name}' "
-                    f"(only 'length' and 'capacity')",
-                    c.span,
-                )
             names = self.decls.record_fields(head.name)
             if names is not None:
                 if label.name not in names:

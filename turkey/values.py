@@ -61,11 +61,7 @@ UNINIT = Uninitialized()
 
 
 class ArrayObj:
-    """A dynamically sized array with a user-visible length and capacity.
-
-    Section 8.3 exposes both fields for reading *and* writing, so capacity is
-    tracked explicitly rather than inferred from the backing list's size.
-    """
+    """The hidden, dynamically sized storage behind `Data.Array.Array`."""
 
     __slots__ = ("slots", "length")
 
@@ -117,16 +113,6 @@ class ArrayObj:
         if value is UNINIT:
             raise TurkeyPanic(f"pop of uninitialized array slot {self.length}")
         return value
-
-    def set_length(self, new_length: int) -> None:
-        if new_length < 0 or new_length > len(self.slots):
-            raise TurkeyPanic(
-                f"length must be between 0 and the capacity {len(self.slots)}, "
-                f"got {new_length}"
-            )
-        for i in range(new_length, self.length):
-            self.slots[i] = UNINIT
-        self.length = new_length
 
     def set_capacity(self, new_capacity: int) -> None:
         if new_capacity < 0:
@@ -264,18 +250,10 @@ class ConstructorFn:
 
 
 def get_field(obj, name: str):
-    """Read a field with the one dynamic case Core permits: an Array field."""
-    if isinstance(obj, ArrayObj):
-        return obj.length if name == "length" else obj.capacity
+    """Read a record field after static field checking."""
     return obj.fields[name]
 
 
 def set_field(obj, name: str, value) -> None:
-    """Write a mutable field, preserving Array's length/capacity invariants."""
-    if isinstance(obj, ArrayObj):
-        if name == "length":
-            obj.set_length(value)
-        else:
-            obj.set_capacity(value)
-        return
+    """Write a record field after static field checking."""
     obj.fields[name] = value

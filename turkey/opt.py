@@ -1,4 +1,4 @@
-"""The local reductions, from inlining through join specialization (M15c-M16d).
+"""The local reductions, from inlining through loop-result fusion (M15c-M16e).
 
 `plan.txt` item 7's local passes, around the discovery `joins.py` does. None of
 them knows what a monad is, which is the whole reason item 4's `?`-aware fast
@@ -199,6 +199,7 @@ class _Reducer:
             return self.beta(e) if isinstance(e.fn, CLam) else self.inline(e)
         if isinstance(e, CMatch):
             return (self.known_constructor(e) or self.float_let(e)
+                    or self.fuse_recursive_join_result(e)
                     or self.case_of_case(e))
         if isinstance(e, CLet):
             return (self.dead_let(e) or self.trivial_let(e)
@@ -380,6 +381,41 @@ class _Reducer:
             # Every branch reduced, so nothing jumps and the join is dead.
             return rest
         return CJoin(e.ty, e.span, name, [param], body, rest, False)
+
+    def fuse_recursive_join_result(self, e: CMatch):
+        """Push a recursive join's result consumer through its boundary.
+
+        A lifted loop commonly has this shape::
+
+            match (join rec loop() : Option (Flow ...) = body
+                   in jump loop()) { exits }
+
+        The loop breaker correctly prevents ordinary inlining from unfolding
+        ``loop``, so the produced ``Flow`` cannot meet ``exits`` unless the
+        consumer moves into the loop.  Change the join's answer type to the
+        match's answer type and consume both its body and its entry there.
+        Self-jumps stay self-jumps, so recursion is neither copied nor turned
+        into Python recursion; only the loop's actual exits are rewritten.
+
+        This is a general worker/result-wrapper fusion rule.  It knows neither
+        ``Flow`` nor ``Option`` and is useful whenever a recursive join returns
+        a value that is immediately scrutinised.
+
+        Moving the alternatives under the join parameters could capture a
+        same-named free variable.  That rare shape is declined rather than
+        renamed, consistently with the other capture-avoiding reductions in
+        this module.
+        """
+        join = e.scrutinee
+        if not isinstance(join, CJoin) or not join.recursive:
+            return None
+        free = _free_names(e.alts)
+        if free & (_binders_of(join.body) | _binders_of(join.rest)
+                   | {p.name for p in join.params}):
+            return None
+        body = self.expr(_consume_tail(join.body, e.alts, e.ty, e.span))
+        rest = self.expr(_consume_tail(join.rest, e.alts, e.ty, e.span))
+        return replace(join, ty=e.ty, body=body, rest=rest)
 
     def trivial_let(self, e: CLet):
         """A binding of a name to a name is not a binding.
@@ -578,6 +614,36 @@ class _Reducer:
 
 def _apply(params, args, body, ty):
     return _apply_names([p.name for p in params], list(args), body, ty)
+
+
+def _consume_tail(e, alts, ty, span):
+    """Apply a result match at every yielding tail of ``e``.
+
+    A jump is already an exit and must remain in tail position.  The other
+    cases mirror ``core.TAIL_FIELDS`` but are written out because their result
+    type also changes from the consumed value's type to ``ty``.
+    """
+    if isinstance(e, CJump):
+        return e
+    if isinstance(e, CIf):
+        otherwise = (e.otherwise if e.otherwise is not None
+                     else CUnit(e.ty, e.span))
+        return replace(e, ty=ty,
+                       then=_consume_tail(e.then, alts, ty, span),
+                       otherwise=_consume_tail(otherwise, alts, ty, span))
+    if isinstance(e, CLet):
+        return replace(e, ty=ty, body=_consume_tail(e.body, alts, ty, span))
+    if isinstance(e, CLetRec):
+        return replace(e, ty=ty, body=_consume_tail(e.body, alts, ty, span))
+    if isinstance(e, CMatch):
+        return replace(e, ty=ty,
+                       alts=[CAlt(a.pat, _consume_tail(a.body, alts, ty, span))
+                             for a in e.alts])
+    if isinstance(e, CJoin):
+        return replace(e, ty=ty,
+                       body=_consume_tail(e.body, alts, ty, span),
+                       rest=_consume_tail(e.rest, alts, ty, span))
+    return CMatch(ty, span, e, alts)
 
 
 def _apply_names(names, args, body, ty):

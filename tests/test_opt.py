@@ -294,6 +294,37 @@ fun main() { print(clamp(Some(2))) }
         "a specialized join body should already know its incoming Flow tag")
 
 
+def test_a_recursive_join_result_is_consumed_inside_the_loop(capsys):
+    """A recursive join is a loop breaker, not a barrier to its result match.
+
+    The outer match is fused into the join's real exits while the back edge
+    remains a jump.  Twenty thousand iterations pins both the result and the
+    fact that the transformation did not turn the loop into Python recursion.
+    """
+    from turkey.driver import run
+
+    src = """
+fun finish(o : Option Int) -> Option Int {
+    var i = 0
+    while i < 20000 {
+        let n = o?
+        i = i + 1
+    }
+    Some(i)
+}
+fun main() { print(finish(Some(1))) }
+"""
+    program = optimized(src)
+    finish = named(program, "Main#finish")
+    recursive = [n for n in nodes(finish.value)
+                 if isinstance(n, CJoin) and n.recursive]
+    assert recursive
+    assert all("Flow" not in str(n.ty) for n in recursive)
+
+    run(src)
+    assert capsys.readouterr().out == "Some(20000)\n"
+
+
 def test_a_question_chain_becomes_nested_ifs():
     """The milestone, stated as a property rather than shown as a golden.
 

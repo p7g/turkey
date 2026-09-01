@@ -1,17 +1,20 @@
-"""The local reductions: inlining, beta, case-of-known-constructor (M15c).
+"""The local reductions, from inlining through join specialization (M15c-M16d).
 
-`plan.txt` item 7's three passes, less the one `joins.py` already does. None of
+`plan.txt` item 7's local passes, around the discovery `joins.py` does. None of
 them knows what a monad is, which is the whole reason item 4's `?`-aware fast
 lowering was deleted in favour of this: a `bind` chain is reached the way any
 other saturated call to a known small function is reached.
 
-They are one traversal rather than three because they feed each other and it
-would be dishonest to pretend otherwise. Inlining `bind` puts a lambda in the
-function position of an application, which is beta; beta binds a parameter to a
-constructor application, which is case-of-known-constructor; and that selects a
-branch, which exposes the next call. Splitting them into three passes over the
-whole program would mean running the sequence to a fixed point from outside,
-which is the same computation with more traversals and a less obvious bound.
+Within either side of join discovery they are one traversal rather than a pass
+per rule, because they feed each other and it would be dishonest to pretend
+otherwise. Inlining `bind` puts a lambda in the function position of an
+application, which is beta; beta binds a parameter to a constructor
+application, which is case-of-known-constructor; and that selects a branch,
+which exposes the next call. Splitting those rules into separate passes over
+the whole program would mean running the sequence to a fixed point from
+outside, which is the same computation with more traversals and a less obvious
+bound. Join discovery is the representation boundary between two such local
+reductions: it exposes jumps which the second traversal can specialize.
 
 ## Termination is structural, not budgeted
 
@@ -76,6 +79,13 @@ from .types import TBottom, Type, type_key
 # things this exists to reach: a method's body, an instance's `bind`.
 INLINE_LIMIT = 40
 
+# A shared join is copied only when specializing a known constructor makes
+# the copy small. This is deliberately the same scale as ordinary inlining:
+# both transformations trade a bounded amount of code for exposing a local
+# reduction, and neither fixture-specific traffic nor the number of callers
+# gets to raise that bound implicitly.
+JOIN_SPECIALIZE_LIMIT = INLINE_LIMIT
+
 
 def reduce_program(program: CProgram) -> CProgram:
     """Every binding's body, reduced."""
@@ -134,6 +144,10 @@ class _Reducer:
         # For the join points case-of-case invents. Per program and in
         # traversal order, so it is deterministic and a golden can hold it.
         self.counter = 0
+        self.used_names = set()
+        for bind in program.dicts + program.binds:
+            self.used_names.add(bind.name)
+            self.used_names |= names_of(bind.value) | _binders_of(bind.value)
 
     def expr(self, e):
         """`e` with its subterms reduced, then reduced itself to a fixed point.
@@ -177,8 +191,9 @@ class _Reducer:
     def step(self, e):
         """One reduction at the root of `e`, or None if none applies.
 
-        Whatever it returns has reduced subterms: `_inline` reduces the body it
-        brings in, and the other two only rearrange terms that came from here.
+        Whatever it returns has reduced subterms: inlining and join
+        specialization reduce the bodies they bring in, and the remaining
+        rules only rearrange terms that came from here.
         """
         if isinstance(e, CApp):
             return self.beta(e) if isinstance(e.fn, CLam) else self.inline(e)
@@ -187,14 +202,20 @@ class _Reducer:
                     or self.case_of_case(e))
         if isinstance(e, CLet):
             return (self.dead_let(e) or self.trivial_let(e)
-                    or self.let_to_match(e))
+                    or self.let_to_match(e) or self.float_let_through_join(e))
+        if isinstance(e, CJoin):
+            return self.specialize_join(e)
         return None
 
     def fresh(self, hint: str) -> str:
-        self.counter += 1
-        return f"%{hint}{self.counter}"
+        while True:
+            self.counter += 1
+            name = f"%{hint}{self.counter}"
+            if name not in self.used_names:
+                self.used_names.add(name)
+                return name
 
-    # -- the three reductions --------------------------------------------
+    # -- the reductions --------------------------------------------------
 
     def inline(self, e: CApp):
         """A saturated call to a small, known, non-loop-breaking binding."""
@@ -395,9 +416,123 @@ class _Reducer:
             return None
         if e.name in _free_names(body.alts):
             return None
-        if _free_names(e.value) & _binders_of(body.alts):
-            return None
+        # Pattern variables scope over their alternative bodies, not over the
+        # scrutinee. A free name in `value` therefore cannot be captured by an
+        # equally named pattern when `value` becomes that scrutinee.
         return CMatch(body.ty, body.span, e.value, body.alts)
+
+    def float_let_through_join(self, e: CLet):
+        """Move a binding used only by a join's `rest` to that `rest`.
+
+        Inlined `bind` commonly leaves exactly this shape: the producer is an
+        `if`, its consumer is a `match`, and the continuation join introduced
+        to keep case-of-case from duplicating code sits between them. Moving
+        the `let` across a non-recursive join puts producer and consumer back
+        together; case-of-case can then expose constructor-valued jumps for
+        `specialize_join` below.
+
+        The value is not moved into the join body, and the rewrite is declined
+        when that body reads the binding. A recursive join is left alone: its
+        rest is an entry to a loop rather than merely the continuation beside
+        this binding, and M16e owns transformations of that boundary.
+        """
+        join = e.body
+        if (e.binders or not isinstance(join, CJoin) or join.recursive
+                or e.name in _free_names(join.body)):
+            return None
+        rest = CLet(join.ty, e.span, e.name, e.bound, e.value, join.rest,
+                    list(e.binders))
+        return replace(join, ty=e.ty, rest=rest)
+
+    def specialize_join(self, e: CJoin):
+        """Carry known constructor tags across a non-recursive join.
+
+        A single-use join is beta-reduced when doing so is capture-safe. For a
+        shared join, calls with the same constructor signature are redirected
+        to one specialized copy. Constructor fields, and arguments whose tag
+        is unknown, become parameters of that copy; rebuilding the known
+        constructor in its body lets the ordinary match rule select an arm.
+
+        This preserves the reason the join exists: a continuation is copied
+        once per useful tag, never once per incoming edge. Copies which do not
+        shrink after reduction, or remain over `JOIN_SPECIALIZE_LIMIT`, are
+        declined.
+        """
+        if e.recursive:
+            return None
+        jumps = _join_jumps(e.rest, e.name)
+        if not jumps:
+            return e.rest
+
+        known = [j for j in jumps if any(_constructor(a)[0] is not None
+                                         for a in j.args)]
+        if not known:
+            return None
+
+        if len(jumps) == 1:
+            # Moving the body to the jump site must not capture one of its
+            # free variables under a same-named binder in `rest`.
+            if _free_names(e.body) & _binders_of(e.rest):
+                return None
+            made = _apply(e.params, jumps[0].args, e.body, e.ty)
+            if made is None:
+                return None
+            made = self.expr(made)
+            return _replace_jumps(e.rest, {id(jumps[0]): made})
+
+        groups: dict[tuple, list[CJump]] = {}
+        for jump in known:
+            signature = tuple((con, len(args)) if con is not None else None
+                              for con, args in map(_constructor, jump.args))
+            groups.setdefault(signature, []).append(jump)
+
+        replacements: dict[int, CExpr] = {}
+        variants = []
+        for signature, calls in groups.items():
+            params: list[CParam] = []
+            templates: list[CExpr] = []
+            first = calls[0]
+            for original, arg, part in zip(e.params, first.args, signature):
+                if part is None:
+                    name = self.fresh("jv")
+                    params.append(CParam(name, original.ty))
+                    templates.append(CVar(original.ty, arg.span, name))
+                    continue
+                _, fields_ = _constructor(arg)
+                field_vars = []
+                for field in fields_:
+                    name = self.fresh("jf")
+                    params.append(CParam(name, field.ty))
+                    field_vars.append(CVar(field.ty, field.span, name))
+                templates.append(_rebuild_constructor(arg, field_vars))
+
+            body = _apply(e.params, templates, e.body, e.ty)
+            if body is None:
+                continue
+            body = self.expr(body)
+            if (_size(body) >= _size(e.body)
+                    or _size(body) > JOIN_SPECIALIZE_LIMIT):
+                continue
+
+            name = self.fresh("js")
+            for jump in calls:
+                args = []
+                for arg, part in zip(jump.args, signature):
+                    args.extend(_constructor(arg)[1] if part is not None
+                                else [arg])
+                replacements[id(jump)] = CJump(TBottom(), jump.span,
+                                                name, args)
+            variants.append((name, params, body))
+
+        if not variants:
+            return None
+
+        rest = _replace_jumps(e.rest, replacements)
+        if len(replacements) != len(jumps):
+            rest = replace(e, rest=rest)
+        for name, params, body in reversed(variants):
+            rest = CJoin(e.ty, e.span, name, params, body, rest, False)
+        return rest
 
     def known_constructor(self, e: CMatch):
         """A `match` on a constructor whose identity is right there.
@@ -609,6 +744,63 @@ def _constructor(e):
     return None, []
 
 
+def _rebuild_constructor(e, args):
+    """A constructor shaped like `e`, with `args` as its fields."""
+    if isinstance(e, CCon):
+        assert not args
+        return e
+    assert isinstance(e, CApp) and isinstance(e.fn, CCon)
+    return replace(e, args=list(args))
+
+
+def _join_jumps(e, name: str) -> list[CJump]:
+    """The jumps in `e` bound by the surrounding join named `name`."""
+    out = []
+
+    def walk(v, shadowed=False):
+        if isinstance(v, CJump):
+            if not shadowed and v.name == name:
+                out.append(v)
+            for arg in v.args:
+                walk(arg, shadowed)
+            return
+        if isinstance(v, CJoin):
+            same = v.name == name
+            walk(v.body, shadowed or (same and v.recursive))
+            walk(v.rest, shadowed or same)
+            return
+        if isinstance(v, (CExpr, CBind, CAlt)):
+            for f in fields(v):
+                walk(getattr(v, f.name), shadowed)
+        elif isinstance(v, (list, tuple)):
+            for item in v:
+                walk(item, shadowed)
+
+    walk(e)
+    return out
+
+
+def _replace_jumps(e, replacements: dict[int, CExpr]):
+    """Replace the particular jump objects named by their identities."""
+    found = replacements.get(id(e))
+    if found is not None:
+        return found
+    if isinstance(e, CAlt):
+        return CAlt(e.pat, _replace_jumps(e.body, replacements))
+    if isinstance(e, CBind):
+        return replace(e, value=_replace_jumps(e.value, replacements))
+    if isinstance(e, CExpr):
+        return type(e)(**{
+            f.name: _replace_jumps(getattr(e, f.name), replacements)
+            for f in fields(e)
+        })
+    if isinstance(e, list):
+        return [_replace_jumps(x, replacements) for x in e]
+    if isinstance(e, tuple):
+        return tuple(_replace_jumps(x, replacements) for x in e)
+    return e
+
+
 def _size(e) -> int:
     if isinstance(e, (CExpr, CBind, CAlt)):
         return 1 + sum(_size(getattr(e, f.name)) for f in fields(e))
@@ -712,4 +904,6 @@ def _unannot(pat):
     return pat
 
 
-__all__ = ["INLINE_LIMIT", "loop_breakers", "reduce_program"]
+__all__ = [
+    "INLINE_LIMIT", "JOIN_SPECIALIZE_LIMIT", "loop_breakers", "reduce_program",
+]

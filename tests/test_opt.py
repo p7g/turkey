@@ -18,7 +18,7 @@ from dataclasses import fields
 
 from turkey import opt
 from turkey.core import (
-    CApp, CBind, CCon, CExpr, CMatch, CPrim, CProgram, CTyApp, CVar,
+    CApp, CBind, CCon, CExpr, CJoin, CMatch, CPrim, CProgram, CTyApp, CVar,
 )
 from turkey.driver import check
 
@@ -252,6 +252,48 @@ fun main() { print(classify(3)) }
     assert matches(named(program, "Main#classify")) == 0
 
 
+def test_a_pattern_does_not_capture_a_free_name_in_the_scrutinee():
+    """A pattern scopes over its arm, not over the match scrutinee.
+
+    The old capture guard treated both as one scope and blocked the
+    producer/consumer rewrite whenever an outer name was reused by a pattern.
+    That is the ordinary spelling emitted by an inlined `bind`.
+    """
+    program = optimized("""
+fun classify(x : Int) -> Int {
+    let o = if x > 0 { Some(x) } else { None }
+    match o { Some(x) -> x; None -> 0 }
+}
+fun main() { print(classify(3)) }
+""")
+    assert matches(named(program, "Main#classify")) == 0
+
+
+def test_a_known_constructor_specializes_a_shared_join_by_tag():
+    """The `Flow` tag reaches the continuation without copying it per edge.
+
+    `clamp` creates both `Ret` and `Fall` edges to the continuation produced by
+    `bind`. Join discovery makes that continuation explicit; the second local
+    reduction specializes its shared match by tag. The surviving Fall variant
+    is still a join, but its body no longer scrutinizes the incoming Flow.
+    """
+    program = optimized("""
+fun clamp(o : Option Int) -> Option Int {
+    let x = o?
+    if x > 3 { return None }
+    Some(x * 2)
+}
+fun main() { print(clamp(Some(2))) }
+""")
+    clamp = named(program, "Main#clamp")
+    joins = [n for n in nodes(clamp.value)
+             if isinstance(n, CJoin) and not n.recursive]
+    assert joins, "the shared Fall continuation should remain a join"
+    assert all(not any(isinstance(n, CMatch) for n in nodes(join.body))
+               for join in joins), (
+        "a specialized join body should already know its incoming Flow tag")
+
+
 def test_a_question_chain_becomes_nested_ifs():
     """The milestone, stated as a property rather than shown as a golden.
 
@@ -336,6 +378,6 @@ def test_type_applied_methods_inline_and_the_remaining_flow_is_tracked():
         if isinstance(n, CCon)
         and n.name in {"Prelude#Fall", "Prelude#Brk",
                        "Prelude#Cont", "Prelude#Ret"})
-    assert 0 < flow < 105, (
-        "M16c must improve on the old 105 constructions, while join and "
-        "recursive-boundary elimination remain explicitly tracked work")
+    assert 0 < flow < 46, (
+        "M16d must improve on the 46 constructions left before discovered "
+        "joins were reduced, while recursive-boundary elimination remains")

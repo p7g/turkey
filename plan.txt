@@ -368,8 +368,9 @@ Roadmap, in order. Rationale kept short; open questions are the point.
    is not monomorphization: it makes no top-level copy, needs no groundness
    restriction, and therefore accepts the phantom variable in a lifted loop's
    uninhabited `Brk` slot. The small Option and Either methods disappear from
-   `question_control.tl`; Array's `bind` and Flow across joins do not, and are
-   tracked below rather than hidden behind this first obstruction.
+   `question_control.tl`; Array's `bind` and Flow across joins do not. M16d now
+   handles the non-recursive join boundary; the recursive and large-method
+   cases remain tracked below rather than hidden behind that first obstruction.
 
    The passes make programs *bigger*: on `question.tl` the specialized Core
    grows about half again. That is what an inliner is, and item 7 said as much
@@ -475,13 +476,24 @@ Roadmap, in order. Rationale kept short; open questions are the point.
    match patterns; after inlining exposes more matches that number rises, so it
    is not a constructor-allocation metric and is no longer used as one.
 
-   Tracked, M16d: specialize join arguments that arrive as known constructors.
+   Done, M16d: specialize join arguments that arrive as known constructors.
    Case-of-case deliberately puts a shared continuation in a `CJoin` to avoid
    multiplying it by four, then jumps to it with values such as `Fall(x)` and
-   `Ret(r)`. No rule currently carries that known tag across the jump, so the
-   join body's match cannot collapse. Start with non-recursive, single-use
-   joins; for shared joins, specialize by constructor tag under an explicit
-   size bound rather than copying the whole continuation at every edge.
+   `Ret(r)`. A non-recursive single-use join is beta-reduced when moving its
+   body cannot capture a free name. A shared join is copied once per useful
+   constructor signature, not once per edge: constructor fields and unknown
+   arguments become the specialized join's parameters, its body rebuilds the
+   known value, and ordinary case-of-known-constructor does the rest. A copy
+   must shrink and remain at or below `JOIN_SPECIALIZE_LIMIT` 40.
+
+   The representation determines the staging. The first reduction exposes
+   local continuations; discovery turns them into joins; one more reduction
+   sees the constructor-valued jumps. This also exposed an over-conservative
+   `let`-to-match capture guard: a match pattern scopes over its arm, not its
+   scrutinee, so an equally named free variable in the producer cannot be
+   captured there. Removing that refusal is what lets the producer reach the
+   join in the first place. On `question_control.tl`, type-applied calls fall
+   again from 77 to 49 and actual Flow `CCon` constructions from 97 to 42.
 
    Tracked, M16e: remove `Flow` from recursive loop boundaries. A lifted loop's
    recursive join genuinely returns `Option (Flow ...)`, and a loop breaker
@@ -510,14 +522,15 @@ Roadmap, in order. Rationale kept short; open questions are the point.
      four loop forms and `CReturn`/`CBreak`/`CContinue` need anyway, and
      collapsing those four into one is the other half of what 5 deferred here.
 
-   Ordering, and it is the one thing that is not free: **join points before
-   leaning on case-of-case.** Inlining `bind` does not by itself remove
+   Ordering, and it is the one thing that is not free: **join points around
+   case-of-case's sharing boundary.** Inlining `bind` does not by itself remove
    `Flow` -- that needs case-of-case, to see that a `Flow` built in one branch
    is scrutinised downstream, and case-of-case is exactly the pass that
    duplicates continuations and blows up code size. Join points are the known
-   answer to that, and are most of what the 2017 paper is about. Doing them in
-   the other order is the way to get a correct compiler that emits absurd
-   amounts of code.
+   answer to that, and are most of what the 2017 paper is about. Reduction,
+   discovery, then a second local reduction is the concrete order: the first
+   pass exposes continuations, discovery preserves their sharing, and the last
+   pass specializes known incoming tags without copying per edge.
 
    Open, and genuinely: how much of this the Python prototype should carry.
    The evaluator is a tree-walker over name-keyed environments, so an inlined
@@ -602,7 +615,7 @@ before building the hard-but-not-novel parts. Which is why 4 and 5 sit early
 
 Where it stands: 1 through 7 are done. 4 closed not by building its fast
 lowering but by deleting it: the speed it wanted is general Core passes that
-know nothing about monads, and those are 7 -- which now exists, in eight parts.
+know nothing about monads, and those are 7 -- which now exists, in nine parts.
 `CJoin` and `CJump` are in the IR with tail position derived rather than
 tested for (M15a); discovery finds the labels already in a program (M15b);
 inlining, beta, case-of-known-constructor and dead-`let` do the local
@@ -614,12 +627,14 @@ join point, so `return` no longer names its target by where it sits (M15e).
 M16a then took the loop nodes out of Core altogether by doing M15e's work in
 the lowering, so seven nodes and `turkey/loops.py` are gone and a term that
 names its control target by where it sits cannot be written; M16b stopped
-generalizing the helper a lifted loop becomes; and M16c taught the bounded
-inliner to instantiate a type-applied lambda locally, including at non-ground
-type arguments. `question_control.tl` now loses every small Option and Either
-`bind`/`pure` call. What remains is stated as M16d through M16f where it lives:
-known constructors do not yet cross shared joins, recursive loop joins still
-return Flow, and Array's 65-node `bind` is intentionally over the size limit.
+generalizing the helper a lifted loop becomes; M16c taught the bounded inliner
+to instantiate a type-applied lambda locally, including at non-ground type
+arguments; and M16d carries known constructor tags through non-recursive joins
+without copying their continuation per incoming edge. `question_control.tl`
+now loses every small Option and Either `bind`/`pure` call and more than half
+of its remaining actual Flow constructions. What remains is stated as M16e
+and M16f where it lives: recursive loop joins still return Flow, and Array's
+65-node `bind` is intentionally over the size limit.
 
 Next is 8, the bootstrap interpreter -- the first real program in the language,
 and the only thing that will find out whether any of this was worth it at a

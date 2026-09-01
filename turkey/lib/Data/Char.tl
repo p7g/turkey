@@ -1,4 +1,14 @@
-module Data.Char (fromInt, toInt, toString, isAscii, maxValue)
+module Data.Char (
+    fromInt,
+    toInt,
+    toString,
+    isAscii,
+    isDigit,
+    isAsciiAlpha,
+    isAsciiAlphanumeric,
+    isSpace,
+    maxValue,
+)
 
 import Prelude ()
 import Std.Classes
@@ -26,6 +36,38 @@ fun toString(c : Char) -> String = Prim.charToString(c)
 fun isAscii(c : Char) -> Bool = toInt(c) < 128
 
 fun maxValue() -> Char = Prim.charFromInt(1114111)
+
+-- -- classification -----------------------------------------------------------
+--
+-- Named for the range they actually answer over. `isDigit` is ASCII 0-9 and
+-- says so, rather than quietly meaning `Nd` -- which would make Devanagari and
+-- fullwidth digits true and then feed them to an `Int` parser that only knows
+-- ten of them. The Unicode-wide versions belong beside normalization and
+-- collation in a later `Data.Unicode`, where the tables to do them correctly
+-- will be; guessing at them here is how a compatibility trap gets shipped.
+--
+-- These are classification, not case mapping, so the ban above does not reach
+-- them: no scalar value's *class* depends on its neighbours or on a locale.
+
+fun isDigit(c : Char) -> Bool {
+    let code = toInt(c)
+    code >= 48 && code <= 57
+}
+
+fun isAsciiAlpha(c : Char) -> Bool {
+    let code = toInt(c)
+    (code >= 65 && code <= 90) || (code >= 97 && code <= 122)
+}
+
+fun isAsciiAlphanumeric(c : Char) -> Bool = isAsciiAlpha(c) || isDigit(c)
+
+-- Space, tab, newline, carriage return, form feed and vertical tab: the ASCII
+-- whitespace a source file is made of. Not Unicode `White_Space`, which adds
+-- the no-break space and the line separators.
+fun isSpace(c : Char) -> Bool {
+    let code = toInt(c)
+    code == 32 || (code >= 9 && code <= 13)
+}
 
 -- There is deliberately no `toUpper` / `toLower`. Case mapping is not a
 -- per-scalar-value function: `ss` uppercases to two characters, Greek final

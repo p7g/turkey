@@ -579,12 +579,98 @@ Roadmap, in order. Rationale kept short; open questions are the point.
    execution. On the landing probe, the 200,000-iteration join loop was 9.1x
    faster and `bf.tl` 8.0x faster than the evaluator, past the 3x gate.
 
-9. bootstrap interpreter (same frontend, IR, optimizations)
-   Still ahead of the native backend work. It is the first real program in the
-   language and the only forcing function that finds papercuts at a scale
-   test.tl cannot. The generated-Python implementation runs it, so it needs no
-   GC or machine-code work. Discovering that the language is unpleasant to
-   write a compiler in is much cheaper before the native backends exist.
+9. bootstrap compiler (same frontend, IR, optimizations), emitting C
+   Still ahead of the native backend work, and still the first real program in
+   the language -- the only forcing function that finds papercuts at a scale
+   test.tl cannot. What changed is the artifact: a *compiler*, not an
+   interpreter, and one with a real target from the first line.
+
+   An interpreter would exercise the same language surface and leave the
+   compiler's hardest question -- what a Turkey value is on a machine --
+   untouched, and would be thrown away when 10 through 12 arrive. So the
+   bootstrap emits C, which is a decision about all four of these:
+
+   - **Target C.** `CJoin` and `CJump` are labels and `goto` with no
+     relooping, libc is the file I/O and the argv, and generated C is
+     diffable when it is wrong. WASM needs a linear-memory layout, an
+     allocator and a relooper before it prints a line; it is the second
+     target, and the thing that proves the Core-to-target boundary is real.
+   - **No intermediate cgen.py.** The self-hosted compiler is the first thing
+     that ever emits C.
+   - **Full Turkey.** It accepts the whole language -- classes, families,
+     HKTs, `?`, mono, opt -- and consumes `turkey/lib` as-is rather than
+     reimplementing it. That constrains the accepted language, not the
+     delivery order: the milestones stage internally and each is diffed
+     against the Python implementation.
+   - **Unboxed primitives, on a bump arena that never frees.** Section 6.2
+     makes representation opaque and forbids the *type system* from
+     influencing it, which is precisely the licence for the backend to choose
+     one: an `Int` is an `int64_t`. What makes that total rather than
+     best-effort is 10's layout-keyed sharing, which therefore lands here --
+     see below. Memory is a pointer bump and no collector, because a compile
+     is a short batch process; if a self-compile does not fit, that
+     measurement is the argument for the collector, and it is a better
+     argument than the guess this document would otherwise be making.
+
+   The Python implementation is not replaced. It becomes what eval.py became
+   after M17: the differential oracle, and the second host whose agreement
+   M26 checks.
+
+   Done, M18: the floor. `print`, `write` and `error` were the whole of the
+   language's contact with anything outside itself, which is to say a Turkey
+   program could not read its own source and so could not be a compiler.
+   Six primitives (`args`, `fileCanRead`, `readFileBytes`, `writeFileBytes`,
+   `stderrWrite`, `exit`), `System.Env` and `System.IO` over them, and `--` on
+   `turkey run` to hand a program its own command line. Both file doors speak
+   bytes, so `readFile` answers `Option String` through the checked
+   constructor rather than hiding the UTF-8 validation inside a read.
+
+   With it: the opaque `String.Index` PRIMITIVES.md 4.3 held in reserve,
+   shipped now because a lexer is what needs it; `Int.parse`, whose
+   accumulator runs negative so that `minValue()` parses; ASCII classification
+   on `Data.Char`; `Data.Array`'s `at`/`last`/`swap`/`slice`/`indexOf`/
+   `contains` and a stable merge `sort`; `Data.Map`'s `contains`/`getOr`/
+   `update`/`keys`/`values`/`entries`; `Data.Set` over `Map k Unit`; and
+   `String.lines`/`words`. Every one of these has to be written a second time
+   in the C runtime, which is what keeps the list short.
+
+   And the recursion limit, which was a real cap rather than a detail: the
+   generated program runs on a thread with a 512 MiB stack, because CPython's
+   thousand frames is a fact about the host and an AST walk passes it on an
+   ordinary file. The C backend's answer is the same shape.
+
+   The first papercut is already recorded, and it is the kind item 9 exists to
+   find: an instance's associated family may be defined as a family applied to
+   a *variable* of the instance head but not to a concrete type, so a wrapper
+   type cannot reuse its inner type's cursor abstractly and `Data.Map` has to
+   export `MapCursor` for `Data.Set` to name. The restriction is what makes
+   family reduction terminate, so the export is the cheaper side -- but it is
+   a real cost of the design, found by writing the second program that ever
+   wrapped a container.
+
+   Ahead, in order, each diffed against the Python implementation over
+   `tests/programs` and `turkey/lib`:
+
+   - M19-M22, the front end in Turkey: lexer, parser, resolve/desugar, and
+     inference. `boot tokens/ast/types` against `turkey tokens/ast/types`.
+     Two representation decisions are taken up front because retrofitting
+     either touches every node -- a mutable single-variant record wrapping an
+     immutable variant, since Turkey ADTs cannot be mutated and desugar
+     rewrites in place; and an `Int` id per node, since `typed.py` keys
+     expressions by Python object identity and Turkey has no identity hash.
+   - M23-M24, Core, mono and opt in Turkey, against the `.core`/`.mono`/`.opt`
+     goldens. Two details are ports rather than approximations because a
+     golden depends on each: mono's *shared* budget across its two rounds
+     (M14d) and opt's lexicographically first loop breaker (M15c).
+   - M25, the C runtime and `Boot.Cgen`. Six layouts -- I64, F64, U8, U32,
+     VOID and PTR -- read off the Core type. `Array Byte` comes out packed and
+     `Bool` comes out a bare tag by layout rather than by name, which is what
+     PRIMITIVES.md 2 and 6 ask for. Every golden compiled by `cc` and run.
+   - M26, self-hosting. stage1 under Python builds tc2; tc2 builds tc3. The
+     ordinary fixpoint is stage3 against a fourth stage; the *stronger* check
+     is stage2.c against stage3.c -- one Turkey program compiled by two
+     different hosts, which is what catches a divergence between generated
+     Python and generated C.
 
 10. runtime: GC, closure representation, boxing
    Was missing from this list, and is the hard part of native compilation --
@@ -592,7 +678,10 @@ Roadmap, in order. Rationale kept short; open questions are the point.
    semantics, ConValue is immutable, ArrayObj is mutable. None of that has a
    memory answer yet.
 
-   **Layout-keyed sharing**, which is what makes 6's cap safe to be silent
+   **Layout-keyed sharing** is delivered by 9's C backend rather than here,
+   because unboxing is what needs it; what stays in this item is the
+   collector. The reasoning is unchanged and is kept here because this is
+   where it was worked out. It is what makes 6's cap safe to be silent
    about. 6 specializes by *type* and cannot be total, because Turkey admits
    polymorphic recursion and the set of types a binding is used at can be
    infinite. So below it, specialize by *layout*: one compiled body per
@@ -682,5 +771,9 @@ loops, and the optimizer's wins now change wall-clock cost. M16e and M16f stay
 tracked above: the backend gives the bootstrap probe a way to decide whether
 they are worth doing rather than making their counts ends in themselves.
 
-Next is 9, the bootstrap interpreter -- the first real program in the language,
-and the scale test for both the language and its new execution path.
+Next is 9, and it is a compiler rather than an interpreter: the first real
+program in the language, the scale test for both the language and its new
+execution path, and the thing that makes a Turkey value a machine value. M18
+has landed -- the I/O, argument and string floor a compiler stands on, plus the
+recursion depth to walk an AST -- so what is left is the compiler itself,
+M19 through M26.

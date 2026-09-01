@@ -5,9 +5,9 @@ carries the summary and SPEC-DELTAS.md 57 records what changed; this document
 stays as the reasoning behind each decision.
 
 Not yet done, and called out again at the end of each section that owns it:
-packed `Array Byte` layout, the opaque `String.Index`, everything in
-`Data.Unicode` (normalization, collation, case mapping, graphemes), and the
-`Show`/`Debug` split.
+packed `Array Byte` layout, everything in `Data.Unicode` (normalization,
+collation, case mapping, graphemes), and the `Show`/`Debug` split. The opaque
+`String.Index` has since shipped -- see 4.3.
 
 `design.md` §8.1 defines the primitives in six table rows -- "machine
 integer", "floating-point", "UTF-8", "single Unicode codepoint". None of
@@ -333,8 +333,34 @@ Something has to be able to take a string apart. Two shapes are available:
 `contains`, `stripPrefix`, `stripSuffix`, `replace`, `repeat`, `trim`,
 `trimStart`, `trimEnd`. It covers the overwhelming majority of real string
 handling and costs no new type. Add the opaque `String.Index` when something
-genuinely needs it. (A public `find` is deliberately not in that list: its
-only useful return *is* an offset.)
+genuinely needs it.
+
+**Something did, and (1) has now shipped too.** A lexer is the thing that
+needs it: the two shapes otherwise available to one are to materialize an
+`Array Char`, at four bytes per code point and an allocation per file, or to
+drive the `CodePoints` view, which cannot look ahead and cannot say where a
+token started. So `Data.String` gained
+
+```
+type Index                                        -- opaque
+String.start(s) / String.end(s) -> Index
+String.step(s, i)   -> Option (Char, Index)       -- decode and advance
+String.decode(s, i) -> Option Char                -- decode without moving
+String.atEnd(s, i)  -> Bool
+String.slice(s, from, to) -> String
+String.find(s, needle, from) -> Option Index
+```
+
+with `Eq` and `Ord` instances ordering by position. The invariant holds by
+construction exactly as this section says it does: an `Index` comes only from
+`start`, `end`, `step` or `find`, and there is no arithmetic on one, so `slice`
+has nothing to validate and cannot cut a character in half. `find` is public in
+this form and not in the earlier one -- what made it unshippable was that its
+only useful return was an *offset*, and an `Index` is not one.
+
+An `Index` belongs to the string it came from, and using one with another
+string is not caught. Catching it would cost a tag per index; the same
+discipline already governs `Iterator`'s `Cursor`.
 
 `startsWith` and `endsWith` are the search, not a slice-and-compare. Cutting
 a prefix of the needle's byte length would split a multi-byte character in

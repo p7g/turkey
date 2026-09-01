@@ -19,6 +19,7 @@ the repo root:
 
 ```
 python3 -m turkey run    program.tl    # type-check and execute
+python3 -m turkey run    program.tl -- a b   # ... passing it arguments
 python3 -m turkey types  program.tl    # print each top-level binding's type
 python3 -m turkey tokens program.tl    # dump the token stream
 python3 -m turkey ast    program.tl    # dump the parse tree
@@ -34,8 +35,11 @@ A program is a single file. Execution lowers optimized typed Core to a checked
 control-flow IR, compiles it with LLVM, initializes top-level bindings, and
 calls `main` if one is defined. `--backend python` retains the previous
 generated-Python implementation as a compatibility and differential-testing
-backend. The `llvm` and `python` commands expose their generated forms for
-inspection; neither is a standalone-file interface.
+backend. Everything after `--` is the program's own command line, reached
+through `System.Env.args`; under either backend the program runs with a large
+stack, because the host's default recursion limit is a fact about the host
+rather than about the language. The `llvm` and `python` commands expose their
+generated forms for inspection; neither is a standalone-file interface.
 
 ```
 type Stack a = Stack {
@@ -102,7 +106,7 @@ main : fun() -> Unit
 | `turkey/builtins.py` | The machine primitives, and nothing else |
 | `turkey/modules.py` | The import graph, and what each module can see |
 | `turkey/resolve.py` | Rewrites a module's names so the program shares one namespace |
-| `turkey/lib/` | The library, written in the language: classes, Prelude, and `Data.*` modules |
+| `turkey/lib/` | The library, written in the language: classes, Prelude, `Data.*` and `System.*` modules |
 
 Three things are worth knowing before reading the code, because they are where
 this language departs from a textbook implementation.
@@ -168,6 +172,17 @@ declaring module, while globally coherent instances are protected by the
 orphan and overlap rules. Any explicit Prelude import replaces the automatic
 one, and `import Prelude ()` removes its dependency edge entirely for low-level
 modules. Exhaustiveness remains a warning, per §5.1.
+
+A program can reach outside itself: `System.Env` has `args` and `exit`, and
+`System.IO` has `readFile`, `writeFile` and `stderr`. Files are read as bytes
+and turned into a `String` by the checked constructor, so `readFile` answers
+`Option String` -- a file is not guaranteed to be well-formed UTF-8 and a
+`String` is.
+
+`Data.String.Index` is an opaque position in a string. It is obtainable only
+from `start`, `end`, `step` or `find`, and no arithmetic on one is exposed, so
+every index names a character boundary and `slice` has nothing to validate. A
+raw byte offset never reaches the surface language.
 
 `Array` is an ordinary opaque growable library type backed by fixed-length
 `Prim.Array` storage. Indexing and `len` are the `Index` and `Length` class

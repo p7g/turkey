@@ -1,5 +1,6 @@
 module Data.Int (
     toString,
+    parse,
     minValue,
     maxValue,
     compare,
@@ -93,6 +94,52 @@ fun mulChecked(a : Int, b : Int) -> Option Int {
 
 fun negChecked(a : Int) -> Option Int =
     if a == minValue() { None } else { Some(-a) }
+
+-- -- parsing ------------------------------------------------------------------
+--
+-- The counterpart of `toString`, and the one `Float.parse` has had all along.
+--
+-- Written against the bytes rather than against `Data.Char`, because
+-- `Data.Char` already depends on this module and the import graph is a DAG.
+-- That costs nothing here: every digit this accepts is ASCII, so every one of
+-- them is a single byte, and asking for a byte cannot land mid-character.
+--
+-- The accumulator runs *negative*. Parsing into a positive number and negating
+-- at the end cannot represent `minValue()`, whose magnitude is one past
+-- `maxValue()` -- so the sign that has the extra value is the one accumulated
+-- in, and it is the positive result that is checked on the way out.
+fun parse(s : String) -> Option Int {
+    let n = Prim.stringByteLength(s)
+    var i = 0
+    var negative = False
+    if n > 0 {
+        let first = Prim.byteToInt(Prim.stringByteAt(s, 0))
+        if first == 45 {
+            negative = True
+            i = 1
+        } else {
+            if first == 43 { i = 1 }
+        }
+    }
+    -- A sign on its own is not a number, and neither is the empty string.
+    if i >= n { return None }
+    var acc = 0
+    while i < n {
+        let digit = Prim.byteToInt(Prim.stringByteAt(s, i)) - 48
+        if digit < 0 || digit > 9 { return None }
+        var scaled = 0
+        match mulChecked(acc, 10) {
+            None -> { return None }
+            Some(v) -> { scaled = v }
+        }
+        match subChecked(scaled, digit) {
+            None -> { return None }
+            Some(v) -> { acc = v }
+        }
+        i = i + 1
+    }
+    if negative { Some(acc) } else { negChecked(acc) }
+}
 
 fun and(a : Int, b : Int) -> Int = Prim.intAnd(a, b)
 fun or(a : Int, b : Int) -> Int = Prim.intOr(a, b)

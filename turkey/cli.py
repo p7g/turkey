@@ -32,7 +32,16 @@ def main(argv: list[str] | None = None) -> int:
         p = sub.add_parser(name, help=help_text)
         p.add_argument("file")
         if name == "run":
-            p.add_argument("--backend", choices=("llvm", "python"), default="llvm")
+            p.add_argument("--backend", choices=("llvm", "python"),
+                           default="llvm")
+            # Everything after the file is the *program's*, not turkey's, so it
+            # is taken verbatim rather than parsed: a compiler written in
+            # Turkey wants to be handed `-o out.c` without argparse claiming
+            # the `-o` first. A leading `--` is the separator and is dropped.
+            # `--backend` therefore has to come before the file, which is the
+            # ordinary shape of a flag anyway.
+            p.add_argument("args", nargs=argparse.REMAINDER,
+                           help="arguments passed to the program, after `--`")
 
     args = parser.parse_args(argv)
     try:
@@ -73,7 +82,10 @@ def main(argv: list[str] | None = None) -> int:
             for name, scheme in checked.signatures:
                 print(f"{name} : {show_scheme(scheme)}")
         else:
-            run(src, args.file, args.backend)
+            rest = list(args.args)
+            if rest and rest[0] == "--":
+                rest = rest[1:]
+            run(src, args.file, rest, args.backend)
     except TurkeyError as exc:
         print(exc.render(args.file), file=sys.stderr)
         return 1

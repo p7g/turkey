@@ -8,6 +8,14 @@ module Data.String (
     bytes,
     codePoints,
     fromCodePoints,
+    Index,
+    start,
+    end,
+    atEnd,
+    step,
+    decode,
+    slice,
+    find,
     toBytes,
     fromBytes,
     builder,
@@ -26,6 +34,8 @@ module Data.String (
     trim,
     trimStart,
     trimEnd,
+    lines,
+    words,
 )
 
 import Prelude ()
@@ -105,6 +115,65 @@ instance Iterator CodePoints {
         Some(c)
     }
 }
+
+-- -- indices -----------------------------------------------------------------
+--
+-- The opaque index PRIMITIVES.md 4.3 held in reserve, added now because a
+-- lexer is the thing that genuinely needs it. The two alternatives a lexer is
+-- otherwise left with are both wrong at scale: materialize an `Array Char`,
+-- which costs four bytes per code point and an allocation per file, or drive
+-- the `CodePoints` view, which cannot look ahead and cannot say where a token
+-- started.
+--
+-- The invariant holds by *construction*, which is the whole design. An `Index`
+-- is only ever obtained from `start`, `end`, `step` or `find`, so it always
+-- names a character boundary, and there is no arithmetic on one -- no
+-- addition, no `toInt`, nothing that could compute an offset that is not a
+-- boundary. `slice` therefore neither validates nor admits an ill-formed
+-- result; the question cannot be asked. Exposing a raw `Int` offset instead is
+-- the one decision PRIMITIVES.md says cannot be taken back, which is why this
+-- shape and not that one.
+--
+-- An `Index` belongs to the string it came from. Using one with a different
+-- string is not caught -- it would cost a tag per index to catch -- and lands
+-- on a boundary of the wrong string or panics. That is the same discipline
+-- `Iterator`'s `Cursor` already runs on.
+
+type Index = Index(Int)
+
+fun start(s : String) -> Index = Index(0)
+
+fun end(s : String) -> Index = Index(Prim.stringByteLength(s))
+
+fun atEnd(s : String, Index(at)) -> Bool = at >= Prim.stringByteLength(s)
+
+-- Decode one scalar value and answer where the next one begins. This is the
+-- whole of forward motion: `None` at the end, and otherwise a character and
+-- an index strictly greater than the one handed in, so a loop written on it
+-- terminates.
+fun step(s : String, Index(at)) -> Option (Char, Index) {
+    if at >= Prim.stringByteLength(s) { return None }
+    Some((Prim.stringDecodeAt(s, at), Index(Prim.stringNextIndex(s, at))))
+}
+
+-- The character at an index, without moving. What a lexer's `peek` is.
+fun decode(s : String, Index(at)) -> Option Char {
+    if at >= Prim.stringByteLength(s) { return None }
+    Some(Prim.stringDecodeAt(s, at))
+}
+
+fun slice(s : String, Index(from), Index(to)) -> String =
+    Prim.stringSlice(s, from, to)
+
+fun find(s : String, needle : String, Index(from)) -> Option Index {
+    let found = Prim.stringFind(s, needle, from)
+    if found < 0 { None } else { Some(Index(found)) }
+}
+
+-- Ordering is by position in the string, which is what a slice's two ends
+-- have to be compared for. It is not a comparison between strings.
+instance Eq Index { fun eq(Index(a), Index(b)) = a == b }
+instance Ord Index { fun lt(Index(a), Index(b)) = a < b }
 
 -- -- interchange --------------------------------------------------------------
 --
@@ -226,19 +295,70 @@ fun splitOnce(s : String, separator : String) -> Option (String, String) {
 fun replace(s : String, from : String, to : String) -> String =
     if isEmpty(from) { s } else { join(split(s, from), to) }
 
--- ASCII whitespace only, and named as a limitation rather than hidden: the
--- full Unicode White_Space property needs a table, and tables belong in the
--- `Data.Unicode` that does not exist yet.
-fun isSpace(c : Char) -> Bool {
-    let n = Char.toInt(c)
-    n == 32 || n == 9 || n == 10 || n == 13 || n == 11 || n == 12
+-- -- lines and words -----------------------------------------------------------
+--
+-- The two splits a file gets read with, reserved in PRIMITIVES.md 4.2 and
+-- shipped here because a compiler reporting an error by line number is the
+-- thing that needed them.
+
+-- Split on newlines, and neither invent a last line nor lose one. A file that
+-- ends with a newline has no empty line after it -- the newline terminates the
+-- last line rather than separating it from another -- while a file that does
+-- not end with one still has its final line. `split` cannot tell those apart,
+-- which is why this is not written on it.
+--
+-- A carriage return immediately before the newline goes with it, so a file
+-- written on Windows reads the same as one written anywhere else. A lone
+-- carriage return is not a line break: treating it as one is a Classic MacOS
+-- convention that now only ever misreads data.
+fun lines(s : String) -> Array String {
+    let out = Array.new(8)
+    let n = byteLength(s)
+    var start = 0
+    while start < n {
+        var stop = Prim.stringFind(s, "\n", start)
+        if stop < 0 { stop = n }
+        var cut = stop
+        if cut > start {
+            if Prim.stringByteAt(s, cut - 1) == carriageReturn() { cut = cut - 1 }
+        }
+        Array.push(out, Prim.stringSlice(s, start, cut))
+        start = stop + 1
+    }
+    out
+}
+
+fun carriageReturn() -> Byte = Prim.byteFromInt(13)
+
+-- Split on runs of whitespace, discarding them. Unlike `split(s, " ")` this
+-- yields no empty strings: two spaces separate two words rather than fencing
+-- an empty one between them, and leading or trailing space produces nothing at
+-- all.
+fun words(s : String) -> Array String {
+    let out = Array.new(8)
+    let n = byteLength(s)
+    var i = 0
+    while i < n {
+        while i < n {
+            if !Char.isSpace(Prim.stringDecodeAt(s, i)) { break }
+            i = Prim.stringNextIndex(s, i)
+        }
+        if i >= n { break }
+        let start = i
+        while i < n {
+            if Char.isSpace(Prim.stringDecodeAt(s, i)) { break }
+            i = Prim.stringNextIndex(s, i)
+        }
+        Array.push(out, Prim.stringSlice(s, start, i))
+    }
+    out
 }
 
 fun trimStart(s : String) -> String {
     let n = byteLength(s)
     var i = 0
     while i < n {
-        if !isSpace(Prim.stringDecodeAt(s, i)) { break }
+        if !Char.isSpace(Prim.stringDecodeAt(s, i)) { break }
         i = Prim.stringNextIndex(s, i)
     }
     Prim.stringSlice(s, i, n)
@@ -250,7 +370,7 @@ fun trimEnd(s : String) -> String {
     var end = 0
     while i < n {
         let next = Prim.stringNextIndex(s, i)
-        if !isSpace(Prim.stringDecodeAt(s, i)) { end = next }
+        if !Char.isSpace(Prim.stringDecodeAt(s, i)) { end = next }
         i = next
     }
     Prim.stringSlice(s, 0, end)

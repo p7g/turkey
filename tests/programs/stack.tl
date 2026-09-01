@@ -36,5 +36,5 @@ fun main() {
     push(s, 30)
     let d = drain(s)
     for x in d { print(Int.toString(x)) }
-    print(Int.toString(d.length))
+    print(Int.toString(len(d)))
 }

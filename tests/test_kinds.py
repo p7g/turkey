@@ -65,10 +65,11 @@ def test_an_alias_body_constrains_the_alias_kind() -> None:
     assert kinds("type Boxed f = f Int")["Boxed"] == "(* -> *) -> *"
 
 
-def test_the_built_in_kinds() -> None:
-    table = kinds("")
-    assert table["Array"] == "* -> *"
-    assert table["Int"] == "*"
+def test_the_prelude_and_built_in_kinds() -> None:
+    decls = check("").decls
+    assert show_kind(decls.tycons["Data.Array#Array"].kind) == "* -> *"
+    assert show_kind(decls.tycons["Prim.Array"].kind) == "* -> *"
+    assert show_kind(decls.tycons["Int"].kind) == "*"
 
 
 # -- what kinds reject -----------------------------------------------------

@@ -150,6 +150,50 @@ def test_unit_grouping_and_tuple():
     assert isinstance(first_value("let u = (1, 2)\n"), ast.ETuple)
 
 
+def test_tuple_trailing_comma_is_allowed_but_singleton_tuple_is_not():
+    assert isinstance(first_value("let u = (1, 2,)\n"), ast.ETuple)
+    with pytest.raises(ParseError, match="singleton tuple"):
+        parse("let u = (1,)\n")
+
+
+def test_module_headers_no_longer_have_a_where_suffix():
+    header = parse("module Example (f,)\nfun f() = 1\n").header
+    assert header is not None and header.name == "Example"
+    with pytest.raises(ParseError):
+        parse("module Example where\nfun f() = 1\n")
+
+
+def test_import_alias_is_qualified_only_and_plain_import_has_both_forms():
+    plain = parse("import Example\n").imports[0]
+    aliased = parse("import Example as E\n").imports[0]
+    assert plain.qualified is False and plain.alias is None
+    assert aliased.qualified is True and aliased.alias == "E"
+
+
+def test_instance_context_follows_the_head():
+    inst = parse(
+        "class Show a { fun show(a) -> String }\n"
+        "instance Show (Array a) : Show a, Show a, {\n"
+        "}\n"
+    ).decls[1]
+    assert isinstance(inst, ast.InstanceDecl)
+    assert [p.name for p in inst.context] == ["Show", "Show"]
+    with pytest.raises(ParseError):
+        parse("instance [Show a] Show (Array a) { }\n")
+
+
+def test_class_and_instance_predicates_accept_qualified_class_names():
+    class_decl = parse(
+        "class Local a : Foreign.Base a { fun f(a) -> a }\n"
+    ).decls[0]
+    assert isinstance(class_decl, ast.ClassDecl)
+    assert class_decl.supers[0].name == "Foreign.Base"
+
+    inst = parse("instance Foreign.Base Int { }\n").decls[0]
+    assert isinstance(inst, ast.InstanceDecl)
+    assert inst.cls == "Foreign.Base"
+
+
 # -- for loops ----------------------------------------------------------
 
 

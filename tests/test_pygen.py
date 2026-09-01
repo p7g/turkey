@@ -77,18 +77,44 @@ fun main() {
     assert compiled(src) == interpreted(checked) == "12\n"
 
 
-def test_array_field_writes_share_the_checked_runtime_operations():
+def test_array_length_uses_the_length_protocol_in_both_backends():
     src = """
 fun main() {
-    let a = Array.new(1)
-    a.capacity = 3
-    a.length = 2
-    print(a.capacity)
-    print(a.length)
+    let a = Array.new(3)
+    print(len(a))
+    Array.push(a, 10)
+    Array.push(a, 20)
+    print(len(a))
 }
 """
     checked = check(src)
-    assert compiled(src) == interpreted(checked) == "3\n2\n"
+    assert compiled(src) == interpreted(checked) == "0\n2\n"
+
+
+def test_user_defined_index_and_length_instances_work_together():
+    src = """
+type Box = Box { values : Array Int }
+
+instance Index Box {
+    type IndexKey = Int
+    type IndexItem = Int
+    fun get(box, i) = box.values[i]
+    fun set(box, i, x) { box.values[i] = x }
+}
+
+instance Length Box {
+    fun len(box) = len(box.values)
+}
+
+fun main() {
+    let box = Box { values = [1, 2] }
+    box[1] = 7
+    print(len(box))
+    print(box[1])
+}
+"""
+    checked = check(src)
+    assert compiled(src) == interpreted(checked) == "2\n7\n"
 
 
 def test_operands_stay_left_to_right_across_a_control_flow_operand():

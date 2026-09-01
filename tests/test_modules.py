@@ -22,7 +22,7 @@ from turkey.errors import TurkeyError
 from turkey.types import show_scheme
 
 HELPER = """
-module Helper (twice, greet) where
+module Helper (twice, greet)
 
 fun twice(n : Int) -> Int = n + n
 
@@ -69,27 +69,27 @@ def test_a_plain_import_brings_a_name_both_ways(tmp_path):
 
 def test_a_qualified_import_brings_only_the_qualified_name(tmp_path):
     search = write(tmp_path, Helper=HELPER)
-    src = "import qualified Helper\nfun f() -> Int = Helper.twice(1)"
+    src = "import Helper as Helper\nfun f() -> Int = Helper.twice(1)"
     assert sigs(src, search)["f"] == "fun() -> Int"
-    bad = "import qualified Helper\nfun f() -> Int = twice(1)"
+    bad = "import Helper as Helper\nfun f() -> Int = twice(1)"
     assert fails(bad, search) == "'twice' is not defined"
 
 
 def test_an_alias_renames_the_module(tmp_path):
     search = write(tmp_path, Helper=HELPER)
-    src = "import qualified Helper as H\nfun f() -> Int = H.twice(1)"
+    src = "import Helper as H\nfun f() -> Int = H.twice(1)"
     assert sigs(src, search)["f"] == "fun() -> Int"
-    assert fails("import qualified Helper as H\nfun f() = Helper.twice(1)",
+    assert fails("import Helper as H\nfun f() = Helper.twice(1)",
                  search) == "'Helper.twice' is not defined"
 
 
 def test_an_alias_and_a_selective_list_are_independent(tmp_path):
-    """`import qualified M as S (f)` did not even parse before M11a: the
+    """`import M as S (f)` did not even parse before M11a: the
     parser's `elif` chain made `as` and a list mutually exclusive."""
     search = write(tmp_path, Helper=HELPER)
-    src = "import qualified Helper as H (twice)\nfun f() -> Int = H.twice(1)"
+    src = "import Helper as H (twice)\nfun f() -> Int = H.twice(1)"
     assert sigs(src, search)["f"] == "fun() -> Int"
-    assert fails("import qualified Helper as H (twice)\nfun f() = H.greet(\"x\")",
+    assert fails("import Helper as H (twice)\nfun f() = H.greet(\"x\")",
                  search) == "'H.greet' is not defined"
 
 
@@ -105,6 +105,14 @@ def test_hiding_withholds_only_what_it_names(tmp_path):
     assert sigs(src, search)["f"] == "fun() -> Int"
     assert fails("import Helper hiding (greet)\nfun f() = greet(\"x\")",
                  search) == "'greet' is not defined"
+
+
+def test_import_prelude_empty_disables_the_implicit_prelude(tmp_path):
+    src = "import Prelude ()\nfun identity(n : Int) -> Int = n"
+    assert sigs(src, [tmp_path])["identity"] == "fun(Int) -> Int"
+    assert fails(
+        "import Prelude ()\nfun main() { print(1) }", [tmp_path]
+    ) == "'print' is not defined"
 
 
 # -- what an export list withholds --------------------------------------------
@@ -123,7 +131,7 @@ def test_importing_a_name_that_is_not_exported_says_so(tmp_path):
 
 
 def test_a_module_may_not_export_what_it_does_not_have(tmp_path):
-    search = write(tmp_path, Broken="module Broken (nope) where\nfun yes() = 1")
+    search = write(tmp_path, Broken="module Broken (nope)\nfun yes() = 1")
     assert fails("import Broken", search) == \
         "module 'Broken' exports 'nope', which is not defined or imported here"
 
@@ -172,7 +180,7 @@ def test_an_import_is_transitive_only_through_its_own_names(tmp_path):
     search = write(
         tmp_path,
         Helper=HELPER,
-        Middle="module Middle (thrice) where\nimport Helper (twice)\n"
+        Middle="module Middle (thrice)\nimport Helper (twice)\n"
                "fun thrice(n : Int) -> Int = twice(n) + n",
     )
     assert sigs("import Middle\nfun f() -> Int = thrice(1)", search)["f"] == \
@@ -184,8 +192,8 @@ def test_an_import_is_transitive_only_through_its_own_names(tmp_path):
 def test_a_cycle_is_rejected(tmp_path):
     search = write(
         tmp_path,
-        A="module A (a) where\nimport B (b)\nfun a() -> Int = b()",
-        B="module B (b) where\nimport A (a)\nfun b() -> Int = a()",
+        A="module A (a)\nimport B (b)\nfun a() -> Int = b()",
+        B="module B (b)\nimport A (a)\nfun b() -> Int = a()",
     )
     assert "imports form a cycle" in fails("import A", search)
 
@@ -199,7 +207,7 @@ def test_a_type_declared_in_another_module_is_usable(tmp_path):
     hand the parser the type names an import already put in scope."""
     search = write(
         tmp_path,
-        Shape="module Shape (Circle(..)) where\ntype Circle = Circle(Int)",
+        Shape="module Shape (Circle(..))\ntype Circle = Circle(Int)",
     )
     src = "import Shape\ntype Round = Circle\nfun f(c : Round) -> Round = c"
     assert sigs(src, search)["f"] == "fun(Circle) -> Circle"
@@ -221,7 +229,7 @@ def test_the_prelude_is_imported_without_being_asked_for(tmp_path):
 
 
 def test_a_diagnostic_in_an_imported_module_names_that_module(tmp_path):
-    search = write(tmp_path, Wrong="module Wrong (w) where\nfun w() -> Int = \"s\"")
+    search = write(tmp_path, Wrong="module Wrong (w)\nfun w() -> Int = \"s\"")
     with pytest.raises(TurkeyError) as exc:
         check("import Wrong", None, search)
     assert exc.value.span is not None
@@ -239,7 +247,7 @@ def test_run_evaluates_every_module_in_dependency_order(tmp_path, capsys):
     search = write(
         tmp_path,
         Helper=HELPER,
-        Middle="module Middle (loud) where\nimport Helper (greet)\n"
+        Middle="module Middle (loud)\nimport Helper (greet)\n"
                "fun loud(who : String) -> String = greet(who) + \"!\"",
     )
     src = 'import Middle\nfun main() { print(loud("world")) }'
@@ -249,10 +257,10 @@ def test_run_evaluates_every_module_in_dependency_order(tmp_path, capsys):
 def test_two_modules_may_each_define_the_same_name(tmp_path, capsys):
     search = write(
         tmp_path,
-        One="module One (name) where\nfun name() -> String = \"one\"",
-        Two="module Two (name) where\nfun name() -> String = \"two\"",
+        One="module One (name)\nfun name() -> String = \"one\"",
+        Two="module Two (name)\nfun name() -> String = \"two\"",
     )
-    src = ('import qualified One\nimport qualified Two\n'
+    src = ('import One as One\nimport Two as Two\n'
            'fun main() { print(One.name()); print(Two.name()) }')
     assert output(src, search, capsys) == ["one", "two"]
 
@@ -302,7 +310,7 @@ def test_the_library_is_reachable_without_an_import(tmp_path):
 def test_the_long_spelling_is_available_by_importing_the_module(tmp_path):
     """The Prelude re-exports `Data.Array` under the short alias. A program
     that wants section 8.3's spelling asks for the module itself."""
-    src = ("import qualified Data.Array\n"
+    src = ("import Data.Array\n"
            "fun f(xs : Array Int) -> Unit = Data.Array.push(xs, 1)")
     assert sigs(src, [tmp_path])["f"] == "fun(Array Int) -> Unit"
     assert fails("fun f(xs : Array Int) = Data.Array.push(xs, 1)", [tmp_path]) == \
@@ -321,7 +329,7 @@ fun main() {
 
 
 def test_a_re_export_needs_the_module_to_be_imported(tmp_path):
-    search = write(tmp_path, Nope="module Nope (module Missing) where\nfun f() = 1")
+    search = write(tmp_path, Nope="module Nope (module Missing)\nfun f() = 1")
     assert fails("import Nope", search) == \
         "module 'Nope' re-exports 'Missing', which is not imported here"
 
@@ -335,7 +343,7 @@ def test_module_is_an_export_form_not_an_import_one(tmp_path):
 # -- a type and an instance know which module made them (M11c) ----------------
 
 SHAPE = """
-module Shape (Node(..), leaf) where
+module Shape (Node(..), leaf)
 
 type Node = Leaf | Fork(Node, Node)
 
@@ -347,8 +355,8 @@ def test_two_modules_may_each_declare_the_same_type(tmp_path):
     """The stated outcome of delta 43: two libraries that each have a `Node`
     can be used together, because the two are different type constructors."""
     search = write(tmp_path, Shape=SHAPE,
-                   Graph="module Graph (Node(..)) where\ntype Node = Node(Int)")
-    src = ("import qualified Shape as S\nimport qualified Graph as G\n"
+                   Graph="module Graph (Node(..))\ntype Node = Node(Int)")
+    src = ("import Shape as S\nimport Graph as G\n"
            "fun a() -> S.Node = S.Leaf\nfun b() -> G.Node = G.Node(1)")
     got = sigs(src, search)
     # Both print qualified, because printing `Node` twice would say less.
@@ -364,9 +372,9 @@ def test_a_type_with_one_declaration_prints_short(tmp_path):
 
 def test_a_constructor_is_qualified_under_a_qualified_import(tmp_path):
     search = write(tmp_path, Shape=SHAPE)
-    src = "import qualified Shape as S\nfun f() -> S.Node = S.Leaf"
+    src = "import Shape as S\nfun f() -> S.Node = S.Leaf"
     assert sigs(src, search)["f"] == "fun() -> Node"
-    assert fails("import qualified Shape as S\nfun f() = Leaf", search) == \
+    assert fails("import Shape as S\nfun f() = Leaf", search) == \
         "unknown constructor 'Leaf'"
 
 
@@ -375,7 +383,7 @@ def test_an_export_list_may_withhold_the_constructors(tmp_path):
     difference between an abstract type and a transparent one."""
     search = write(
         tmp_path,
-        Opaque="module Opaque (Token, make) where\n"
+        Opaque="module Opaque (Token, make)\n"
                "type Token = Token(Int)\n"
                "fun make(n : Int) -> Token = Token(n)",
     )
@@ -412,6 +420,21 @@ def test_an_instance_may_live_with_its_class(tmp_path):
     assert sigs(src, [tmp_path])["f"] == "fun(Int) -> Int"
 
 
+def test_an_imported_qualified_class_can_have_a_local_type_instance(tmp_path):
+    search = write(
+        tmp_path,
+        Rules=("module Rules (Render(..))\n"
+               "class Render a { fun render(a) -> String }"),
+    )
+    src = ("import Rules as R\n"
+           "type Thing = Thing\n"
+           "instance R.Render Thing { fun render(x) = \"thing\" }\n"
+           "fun f(x : Thing) -> String = R.render(x)")
+    checked = check(src, None, search)
+    assert "Rules#Render" in checked.classes.classes
+    assert sigs(src, search)["f"] == "fun(Thing) -> String"
+
+
 def test_an_orphan_instance_is_rejected(tmp_path):
     """Neither `Show` nor `Node` is this module's, so nothing stops another
     module from declaring the same instance -- and one of the two would be an
@@ -420,7 +443,7 @@ def test_an_orphan_instance_is_rejected(tmp_path):
     message = fails(
         'import Shape\ninstance Show Node { fun show(n) = "node" }', search)
     assert message.startswith("orphan instance: 'Show Node' is declared in 'Main'")
-    assert "'Show' belongs to 'Prelude'" in message
+    assert "'Show' belongs to 'Std.Classes'" in message
     assert "'Node' to 'Shape'" in message
 
 
@@ -436,7 +459,7 @@ def test_two_instances_for_one_head_still_overlap(tmp_path):
     search = write(
         tmp_path,
         Shape=SHAPE,
-        Extra="module Extra () where\nimport Shape (Node(..))\n"
+        Extra="module Extra ()\nimport Shape (Node(..))\n"
               'instance Show Node { fun show(n) = "a" }',
     )
     assert "orphan instance" in fails("import Extra", search)

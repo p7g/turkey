@@ -210,7 +210,8 @@ def uses_of(checked, name: str):
     out = []
     for node in entry_nodes(checked):
         if isinstance(node, ast.EVar) and node.use is not None:
-            if node.name.rpartition(SEP)[2] == name:
+            surface = node.name.rpartition(".")[2].rpartition(SEP)[2]
+            if surface == name:
                 out.append(node.use)
     return out
 
@@ -272,4 +273,4 @@ fun main() { print(display(3)) }
     assert [show(table.resolve(a)) for a in use.type_args] == ["Int"]
     # The two travel together and mean different things: what evidence this
     # site costs, and what it instantiated the scheme at.
-    assert [p.name for p in use.preds] == ["Display"]
+    assert [p.name for p in use.preds] == ["Main#Display"]

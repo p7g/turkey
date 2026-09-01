@@ -167,7 +167,6 @@ class Parser:
                 if not self.eat(","):
                     break
             self.expect(")")
-        self.expect("where")
         return ast.ModuleHeader(span, name, exports)
 
     def parse_export_item(self) -> ast.ExportItem:
@@ -199,19 +198,19 @@ class Parser:
 
     def parse_import(self) -> ast.ImportDecl:
         span = self.expect("import").span
-        qualified = self.eat("qualified") is not None
         name = self.parse_modname()
         alias = items = hiding = None
         if self.eat("as"):
             alias = self.expect("CONID", "a module alias").text
-        # An alias and a selective list are independent: `import qualified M as
-        # S (f)` names the module *and* narrows what it brings.
+        # An alias and a selective list are independent: `import M as S (f)`
+        # names the module and narrows what it brings. Aliased imports are
+        # qualified-only; unaliased imports bring both spellings.
         if self.at("hiding"):
             self.advance()
             hiding = self.parse_paren_name_list()
         elif self.at("("):
             items = self.parse_paren_name_list()
-        return ast.ImportDecl(span, name, alias, items, hiding, qualified)
+        return ast.ImportDecl(span, name, alias, items, hiding, alias is not None)
 
     def parse_paren_name_list(self) -> list[ast.ExportItem]:
         self.expect("(")
@@ -370,6 +369,10 @@ class Parser:
             self.advance()
             elems = [self.parse_type_expr()]
             while self.eat(","):
+                if self.at(")"):
+                    if len(elems) == 1:
+                        raise ParseError("a singleton tuple '(x,)' is not supported", self.cur.span)
+                    break
                 elems.append(self.parse_type_expr())
             self.expect(")")
             return elems[0] if len(elems) == 1 else ast.TETuple(tok.span, elems)
@@ -438,7 +441,7 @@ class Parser:
                     "'Ord a', or an equality, as in 'Item c ~ Op'",
                     start,
                 )
-            if not self.eat(","):
+            if not self.eat(",") or self.at("]"):
                 break
         self.expect("]")
         return preds
@@ -492,22 +495,61 @@ class Parser:
         supers: list[ast.ClassPred] = []
         if self.eat(":"):
             while True:
-                tok = self.expect("CONID", "a superclass name")
-                supers.append(ast.ClassPred(tok.span, tok.text, self.parse_atype()))
+                tok = self.cur
+                class_name = self.parse_modname()
+                supers.append(ast.ClassPred(tok.span, class_name, self.parse_atype()))
                 if not self.eat(","):
                     break
+                self.skip_newlines()
+                if self.at("{"):
+                    break
+        self.skip_newlines()
         methods, families = self.parse_class_body(True, param)
         return ast.ClassDecl(span, name, param, supers, methods, families)
 
     def parse_instance_decl(self) -> ast.InstanceDecl:
         span = self.expect("instance").span
-        context = self.parse_context()
-        name = self.expect("CONID", "a class name").text
+        name = self.parse_modname()
         # An `atype`, so a partially applied head parenthesizes:
         # `instance Functor (Either l)`.
         head = self.parse_atype()
+        context = self.parse_instance_context()
+        self.skip_newlines()
         methods, families = self.parse_class_body(False, None)
         return ast.InstanceDecl(span, name, head, context, methods, families)
+
+    def parse_instance_context(self) -> list[ast.ClassPred | ast.EqPred]:
+        """Parse the post-head instance context: ``C T : P a, Q b``.
+
+        Unlike function contexts, instance constraints are attached after the
+        instance head.  The old bracketed spelling is deliberately not
+        accepted: after ``instance`` the parser expects the class name.
+        """
+        if not self.eat(":"):
+            return []
+        return self.parse_context_entries("{")
+
+    def parse_context_entries(self, end: str) -> list[ast.ClassPred | ast.EqPred]:
+        preds: list[ast.ClassPred | ast.EqPred] = []
+        while True:
+            start = self.cur.span
+            written = self.parse_type_expr()
+            if self.eat("~"):
+                preds.append(ast.EqPred(start, written, self.parse_type_expr()))
+            elif isinstance(written, ast.TECon) and len(written.args) == 1:
+                preds.append(ast.ClassPred(start, written.name, written.args[0]))
+            else:
+                raise ParseError(
+                    "a context entry is a class applied to one type, as in "
+                    "'Ord a', or an equality, as in 'Item c ~ Op'",
+                    start,
+                )
+            if not self.eat(","):
+                break
+            self.skip_newlines()
+            if self.at(end):
+                break
+        return preds
 
     def parse_class_body(
         self, is_class: bool, param: str | None
@@ -633,6 +675,10 @@ class Parser:
             self.advance()
             elems = [self.parse_pattern()]
             while self.eat(","):
+                if self.at(")"):
+                    if len(elems) == 1:
+                        raise ParseError("a singleton tuple '(x,)' is not supported", self.cur.span)
+                    break
                 elems.append(self.parse_pattern())
             self.expect(")")
             return elems[0] if len(elems) == 1 else ast.PTuple(tok.span, elems)
@@ -759,6 +805,10 @@ class Parser:
             with self._with_no_record(False):
                 elems = [self.parse_expr()]
                 while self.eat(","):
+                    if self.at(")"):
+                        if len(elems) == 1:
+                            raise ParseError("a singleton tuple '(x,)' is not supported", self.cur.span)
+                        break
                     elems.append(self.parse_expr())
                 self.expect(")")
             return elems[0] if len(elems) == 1 else ast.ETuple(tok.span, elems)

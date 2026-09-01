@@ -15,22 +15,16 @@ the two are different `TCon`s, and unification, which compares names, can tell
 them apart. What a reader sees is unchanged, because the printer shows a
 constructor's short name (`turkey/decls.py` decides which).
 
-Three kinds of name are deliberately left alone.
+Two kinds of name are deliberately left alone.
 
 * **Locals.** A parameter, a `let`, a pattern variable -- these never leave the
   scope that binds them, so they need no qualification, and the resolver tracks
   scopes precisely enough to tell one from a top-level reference.
-* **Class methods, and classes themselves.** `add` is a method of `Add`, and
-  classes and instances are global (see SPEC-DELTAS.md entry 41). A method name
-  means the same thing in every module, so qualifying it would only make the
-  same name look like several. This is also what lets a module define its own
-  `add`: the ordinary binding becomes `Main#add` and the method stays `add`, so
-  the two coexist.
 * **Operators.** `a + b` desugared to a plain `EVar("add")` at parse time, and
-  once shadowing an import is legal that node would resolve to whatever `add`
-  the module happens to define. The parser now marks the node (`EVar.method`),
-  and the resolver skips it -- so `+` still means `Add.add` in a module whose
-  own `add` concatenates strings.
+    once shadowing an import is legal that node would resolve to whatever `add`
+    the module happens to define. The parser marks the node (`EVar.method`),
+    and the resolver uses the separate protocol-method scope -- so `+` still
+    means the imported `Add.add` in a module whose own `add` is unrelated.
 
 A qualified name whose module part is not in scope is reported here, because
 this is the only stage that knows what "in scope" means. An *unqualified* name
@@ -52,6 +46,8 @@ class Resolver:
         self.scope = scope.values
         self.types = scope.types
         self.cons = scope.cons
+        self.classes = scope.classes
+        self.methods = scope.methods
         self.locals: list[set[str]] = []
 
     # -- types and constructors --------------------------------------------
@@ -61,6 +57,15 @@ class Resolver:
 
     def con(self, name: str) -> str:
         return self.cons.get(name, name)
+
+    def cls(self, name: str) -> str:
+        return self.classes.get(name, name)
+
+    def method_ref(self, ref) -> None:
+        if ref is not None:
+            target = self.methods.get(ref.name)
+            if target is not None:
+                ref.name = target
 
     def type_expr(self, te) -> None:
         t = type(te)
@@ -82,13 +87,13 @@ class Resolver:
         # TEVar names a type variable, which is scoped to its own declaration.
 
     def context(self, preds) -> None:
-        """A `[...]` context, a superclass list, an instance's context. Class
-        names stay as written; the types they constrain do not."""
+        """Resolve a superclass/function/instance context."""
         for pred in preds:
             if isinstance(pred, ast.EqPred):
                 self.type_expr(pred.left)
                 self.type_expr(pred.right)
             else:
+                pred.name = self.cls(pred.name)
                 self.type_expr(pred.arg)
 
     def pattern(self, pat) -> None:
@@ -141,13 +146,19 @@ class Resolver:
                     for _label, te in variant.fields or []:
                         self.type_expr(te)
             elif isinstance(decl, ast.ClassDecl):
+                decl.name = self.cls(decl.name)
                 self.context(decl.supers)
                 for method in decl.methods:
+                    method.name = f"{decl.name}.{method.name}"
                     self.fun(method)
+                for family in decl.families:
+                    family.name = f"{decl.name}.{family.name}"
             elif isinstance(decl, ast.InstanceDecl):
+                decl.cls = self.cls(decl.cls)
                 self.type_expr(decl.head)
                 self.context(decl.context)
                 for bind in decl.families:
+                    bind.name = self.tycon(bind.name)
                     self.type_expr(bind.body)
                 for method in decl.methods:
                     self.fun(method)
@@ -187,7 +198,12 @@ class Resolver:
         if t is ast.EVar:
             # `e.method` is the parser's own node for an operator or a `for`
             # loop's `iter`/`next`; it means the class method by construction.
-            if e.method or self._is_local(e.name):
+            if e.method:
+                target = self.methods.get(e.name)
+                if target is not None:
+                    e.name = target
+                return
+            if self._is_local(e.name):
                 return
             internal = self.scope.get(e.name)
             if internal is not None:
@@ -222,14 +238,22 @@ class Resolver:
         if t is ast.EIndex:
             self.expr(e.arr)
             self.expr(e.index)
+            get = self.methods.get("get")
+            set_ = self.methods.get("set")
+            if get is not None:
+                e.get_fn = ast.EVar(e.span, get, method=True)
+            if set_ is not None:
+                e.set_fn = ast.EVar(e.span, set_, method=True)
             return
         if t is ast.EField:
             self.expr(e.obj)
             return
         if t is ast.EUnary:
+            self.method_ref(e.fn)
             self.expr(e.operand)
             return
         if t is ast.EBinary:
+            self.method_ref(e.fn)
             self.expr(e.left)
             self.expr(e.right)
             return
@@ -275,6 +299,8 @@ class Resolver:
                 self._pop()
             return
         if t is ast.EForIn:
+            self.method_ref(e.iter_fn)
+            self.method_ref(e.next_fn)
             self.expr(e.iterable)
             self.pattern(e.pat)
             self._push(pattern_vars(e.pat))
@@ -299,9 +325,7 @@ class Resolver:
             self._pop()
             return
         if t is ast.EQuestion:
-            # `bind_fn` is a marked method reference and deliberately not walked,
-            # like `EForIn`'s `iter_fn`. `turkey/desugar.py` rewrites this node
-            # away immediately after this pass.
+            self.method_ref(e.bind_fn)
             self.expr(e.expr)
             return
         if t is ast.EDo:

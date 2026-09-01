@@ -105,7 +105,7 @@ def lit(n: int) -> CLit:
 def true() -> CCon:
     """`True` is a constructor, not a literal: `Bool` is an ordinary sum,
     declared in the Prelude and qualified by resolution like anything else."""
-    return CCon(BOOL, None, "Data.Bool#True")
+    return CCon(BOOL, None, "Data.Bool.Type#True")
 
 
 # -- what a well-formed join is ----------------------------------------------

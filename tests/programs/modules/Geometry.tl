@@ -1,4 +1,4 @@
-module Geometry (Point(..), translate, describe) where
+module Geometry (Point(..), translate, describe)
 
 type Point = Point(Int, Int)
 

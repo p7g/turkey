@@ -1,15 +1,7 @@
--- `Either` is the second thing `?` unwinds (delta 45). `Option` says that a
--- value is missing; `Either` says why, which is the whole difference and the
--- reason both exist.
---
--- The payload order is `Left` then `Right`, and the instances are biased to
--- the right: `map`, `pure` and `bind` all work on `Right` and pass a `Left`
--- through untouched. That is forced rather than chosen -- a class parameter is
--- one type, so `Monad (Either l)` fixes `l` and varies `r`, and the bias falls
--- out of which parameter is left over.
-module Data.Either (Either(..), isRight, unwrapOr) where
+module Data.Either (Either(..), isRight, unwrapOr, map, fold)
 
-import Data.Bool (Bool(..))
+import Std.Classes
+import Data.Bool.Type (Bool(..))
 
 type Either l r = Left(l) | Right(r)
 
@@ -21,4 +13,34 @@ fun isRight(e : Either l r) -> Bool = match e {
 fun unwrapOr(e : Either l r, fallback : r) -> r = match e {
     Right(x) -> x
     Left(_) -> fallback
+}
+
+fun map(e : Either l a, f : fun(a) -> b) -> Either l b = match e {
+    Right(x) -> Right(f(x))
+    Left(x) -> Left(x)
+}
+
+fun fold(e : Either l r, onLeft : fun(l) -> a, onRight : fun(r) -> a) -> a = match e {
+    Left(x) -> onLeft(x)
+    Right(x) -> onRight(x)
+}
+
+instance Functor (Either l) {
+    fun map(e, f) = map(e, f)
+}
+
+instance Applicative (Either l) { fun pure(x) = Right(x) }
+
+instance Monad (Either l) {
+    fun bind(e, g) = match e {
+        Right(x) -> g(x)
+        Left(y) -> Left(y)
+    }
+}
+
+instance Show (Either l r) : Show l, Show r {
+    fun show(e) = match e {
+        Left(x) -> Prim.stringConcat(Prim.stringConcat("Left(", show(x)), ")")
+        Right(x) -> Prim.stringConcat(Prim.stringConcat("Right(", show(x)), ")")
+    }
 }

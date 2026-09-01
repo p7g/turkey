@@ -46,7 +46,7 @@ def scheme(src: str, name: str) -> str:
 def _short(name: str) -> str:
     """A top-level binding is `Module#name` after resolution (M11a); the tests
     ask for it the way it was written."""
-    return name.rpartition("#")[2]
+    return name.rpartition(".")[2].rpartition("#")[2]
 
 def _uses(checked, fn: str) -> list[ast.EVar]:
     """Every `EVar` inside one top-level function, in source order."""
@@ -80,15 +80,16 @@ def _uses(checked, fn: str) -> list[ast.EVar]:
 def test_an_operator_is_a_use_of_its_method():
     """`+` carries an ordinary `Use`, resolved by the ordinary machinery."""
     checked = check("fun f(x : Int) -> Int = x + 1")
-    (use,) = [v.use for v in _uses(checked, "f") if v.name == "add"]
+    (use,) = [v.use for v in _uses(checked, "f") if _short(v.name) == "add"]
     (evidence,) = use.evidence
     assert isinstance(evidence, FromInstance)
-    assert evidence.inst.cls == "Add" and evidence.inst.con == "Int"
+    assert evidence.inst.cls == "Std.Classes#Add" and evidence.inst.con == "Int"
 
 
 def test_an_operator_on_an_open_type_takes_a_dictionary():
     checked = check("fun twice(x) = x + x")
-    (use,) = [v.use for v in _uses(checked, "twice") if v.name == "add"]
+    (use,) = [v.use for v in _uses(checked, "twice")
+              if _short(v.name) == "add"]
     assert isinstance(use.evidence[0], FromDict)
 
 
@@ -185,7 +186,7 @@ def test_a_for_loop_demands_iterator():
 
 def test_the_loop_variable_is_the_family():
     assert scheme("fun first(xs) { for x in xs { return x }\n error(\"empty\") }",
-                  "first") == "[Iterator a] fun(a) -> Item a"
+                  "first") == "[Iterator a] fun(a) -> Iterator.Item a"
 
 
 def test_a_user_iterator_runs(capsys):
@@ -234,9 +235,10 @@ def test_the_primitives_are_not_in_the_surface_language():
         "'Prim.intAdd' is not defined"
 
 
-def test_a_program_may_not_redeclare_a_prelude_class():
-    assert fails("class Add a { fun add(a, a) -> a }") == \
-        "class 'Add' is declared more than once"
+def test_a_program_may_declare_a_class_with_a_prelude_class_short_name():
+    checked = check("class Add a { fun add(a, a) -> a }")
+    assert "Main#Add" in checked.classes.classes
+    assert "Std.Classes#Add" in checked.classes.classes
 
 
 def test_a_program_may_define_a_name_a_class_method_already_has():

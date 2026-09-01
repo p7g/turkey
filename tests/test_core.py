@@ -88,9 +88,9 @@ def walk(e):
 
 def test_a_class_becomes_a_record_type_and_an_instance_a_binding():
     _, program = lowered(ORD + "fun main() { print(same(1, 2)) }")
-    text = rendered(program, "%inst.Egal.Int")
-    assert text.startswith("%inst.Egal.Int : %Dict.Egal Int =")
-    assert "%Dict.Egal {" in text
+    text = rendered(program, "%inst.Main#Egal.Int")
+    assert text.startswith("%inst.Main#Egal.Int : Egal Int =")
+    assert "%Dict.Main#Egal {" in text
 
 
 def test_a_superclass_is_a_field_and_not_a_second_dictionary():
@@ -106,27 +106,27 @@ def test_a_superclass_is_a_field_and_not_a_second_dictionary():
     lam = bind.value
     assert isinstance(lam, CLam)
     assert len(lam.params) == 1, "one dictionary, not one per predicate"
-    assert lam.params[0].name.endswith(".Rank")
+    assert lam.params[0].name.endswith(".Main#Rank")
     fields = [n.name for n in walk(lam) if isinstance(n, CField)]
-    assert "%super.Egal" in fields
+    assert "%super.Main#Egal" in fields
 
 
 def test_an_instance_with_a_context_is_a_function_from_dictionaries():
     src = """
 class Display a { fun display(a) -> String }
 instance Display Int { fun display(n) = Int.toString(n) }
-instance [Display a] Display (Array a) {
+instance Display (Array a) : Display a {
     fun display(xs) = "?"
 }
 fun main() { print(display([1, 2])) }
 """
     _, program = lowered(src)
-    bind = named(program, "%inst.Display.Array")
+    bind = named(program, "%inst.Main#Display.Data.Array#Array")
     assert isinstance(bind.value, CLam), "a context makes the instance a function"
     assert len(bind.binders) == 1, "and it is polymorphic in the element"
     # And the use site applies it: at the type first, then the dictionary.
     text = rendered(program, "Main#main")
-    assert "%inst.Display.Array[Int](%inst.Display.Int)" in text
+    assert "%inst.Main#Display.Data.Array#Array[Int](%inst.Main#Display.Int)" in text
 
 
 def test_a_use_of_a_polymorphic_name_is_a_type_application():
@@ -140,7 +140,7 @@ def test_a_recursive_call_is_type_applied_at_its_own_binders():
     application, at the binding's own variables."""
     src = """
 fun length(xs : Array a, i : Int) -> Int =
-    if i >= xs.length { 0 } else { 1 + length(xs, i + 1) }
+    if i >= len(xs) { 0 } else { 1 + length(xs, i + 1) }
 fun main() { print(length([1], 0)) }
 """
     _, program = lowered(src)
@@ -181,8 +181,8 @@ def test_a_default_method_is_lowered_once_and_shared():
     Copying it into each dictionary would put `a` where `Int` belongs."""
     _, program = lowered(ORD + "fun main() { print(same(1, 2)) }")
     names = [b.name for b in program.dicts]
-    assert "%default.Eq.ne" in names
-    bind = named(program, "%default.Eq.ne")
+    assert "%default.Std.Classes#Eq.Std.Classes#Eq.ne" in names
+    bind = named(program, "%default.Std.Classes#Eq.Std.Classes#Eq.ne")
     assert len(bind.binders) == 1, "polymorphic in the class variable"
     assert isinstance(bind.value, CLam)
     assert bind.value.params[0].ty is not None
@@ -202,16 +202,16 @@ def test_the_checker_rejects_a_dictionary_of_the_wrong_class():
     bind = named(program, "Main#main")
     swapped = False
     for node in walk(bind.value):
-        if isinstance(node, CVar) and node.name == "%inst.Rank.Int":
-            node.name = "%inst.Egal.Int"
+        if isinstance(node, CVar) and node.name == "%inst.Main#Rank.Int":
+            node.name = "%inst.Main#Egal.Int"
             swapped = True
     assert swapped, "the fixture should pass a Rank dictionary"
 
     with pytest.raises(coretc.CoreError) as exc:
         coretc.check_program(program, checked.decls, checked.classes,
                              coretc.globals_of(checked.env))
-    assert "%Dict.Rank Int" in exc.value.message
-    assert "%Dict.Egal Int" in exc.value.message
+    assert "Rank Int" in exc.value.message
+    assert "Egal Int" in exc.value.message
 
 
 def test_the_checker_rejects_a_method_a_class_does_not_have():
@@ -234,7 +234,7 @@ def test_the_checker_rejects_a_superclass_a_class_does_not_have():
     checked, program = lowered(ORD + "fun main() { print(atLeast(1, 2)) }")
     bind = named(program, "Main#atLeast")
     for node in walk(bind.value):
-        if isinstance(node, CField) and node.name == "%super.Egal":
+        if isinstance(node, CField) and node.name == "%super.Main#Egal":
             node.name = "%super.Nonesuch"
 
     with pytest.raises(coretc.CoreError) as exc:
@@ -245,7 +245,7 @@ def test_the_checker_rejects_a_superclass_a_class_does_not_have():
 
 def test_the_checker_rejects_a_dictionary_with_a_method_missing():
     checked, program = lowered(ORD + "fun main() { print(same(1, 2)) }")
-    bind = named(program, "%inst.Egal.Int")
+    bind = named(program, "%inst.Main#Egal.Int")
     record = bind.value
     assert isinstance(record, core.CRecord)
     record.fields = []

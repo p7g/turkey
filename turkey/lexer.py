@@ -16,8 +16,8 @@ from .errors import LexError, Span
 
 KEYWORDS = frozenset(
     """type class instance fun let var match if else while for in loop return
-    break continue module import export as qualified hiding
-    where do""".split()
+    break continue module import export as hiding
+    do""".split()
 )
 
 # Longest match first: `<=` must beat `<`, `->` must beat `-`. `?` is a suffix

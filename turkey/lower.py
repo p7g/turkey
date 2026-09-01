@@ -82,7 +82,7 @@ from .evidence import (
 )
 from .types import (
     BOOL, EQUALS, KFun, STAR, TApp, TBottom, TCon, TFam, TFun, TTuple, TVar,
-    Type, prune, spine,
+    Type, prune, raw_array_of, spine,
 )
 
 UNIT = TCon("Unit")
@@ -108,6 +108,10 @@ def dict_con(cls: str, kind) -> TCon:
 
 def super_field(cls: str) -> str:
     return f"%super.{cls}"
+
+
+def _member_surface(name: str) -> str:
+    return name.rpartition(".")[2].rpartition("#")[2] or name
 
 
 def inst_name(inst: InstInfo) -> str:
@@ -290,7 +294,8 @@ class Lowerer:
                                          self.dict_type(sup, inst.head),
                                          self.instance_givens(inst, plan))))
         for name, impl in plan.methods.items():
-            fields.append((name, self.method(inst, name, impl, plan.params)))
+            fields.append((_member_surface(name),
+                           self.method(inst, name, impl, plan.params)))
         record = CRecord(result, inst.decl.span, f"%Dict.{inst.cls}", fields)
         value: CExpr = record
         if plan.params:
@@ -475,6 +480,8 @@ class Lowerer:
             # believe a term instead of reading it.
             head = _dict_arg(want)
             start = (givens or {}).get(ev.name)
+            if start is None and ev.pred is not None:
+                start = self.pred_type(ev.pred)
             out: CExpr = CVar(start if start is not None else want, None, ev.name)
             for i, step in enumerate(ev.path):
                 at = want if i == len(ev.path) - 1 else self.dict_type(step, head)
@@ -705,7 +712,7 @@ class Lowerer:
             # convention the method's scheme sets up; the method is a field of
             # it and the rest, if any, are the method's own context.
             base: CExpr = CField(_unknown(), e.span, dicts[0],
-                                 e.name.rpartition(SEP_HASH)[2] or e.name)
+                                 _member_surface(e.name))
             dicts = dicts[1:]
             # And the class variable is *already* fixed, by the dictionary the
             # method was projected from. It is one of the method scheme's
@@ -810,8 +817,12 @@ class Lowerer:
                       [self.expr(x, scope) for x in e.elems])
 
     def _lower_EArray(self, e: ast.EArray, scope: Scope) -> CExpr:
-        return CArray(self.ty_of(e), e.span,
-                      [self.expr(x, scope) for x in e.elems])
+        public = self.ty_of(e)
+        _head, args = spine(public)
+        assert len(args) == 1
+        raw = CArray(raw_array_of(args[0]), e.span,
+                     [self.expr(x, scope) for x in e.elems])
+        return CRecord(public, e.span, "Data.Array#Array", [("raw", raw)])
 
     def _lower_ERecord(self, e: ast.ERecord, scope: Scope) -> CExpr:
         return CRecord(self.ty_of(e), e.span, e.con,

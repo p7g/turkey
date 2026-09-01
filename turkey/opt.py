@@ -271,6 +271,10 @@ class _Reducer:
             return None
         if _transfers(body):
             return None
+        # A copied callee body becomes part of this call site.  Keep spans on
+        # caller-supplied arguments, but make every node copied from the callee
+        # blame the invocation if a later Core check rejects the residual.
+        body = _rebase_spans(body, e.span)
         made = _apply(lam.params, e.args, body, e.ty)
         if made is None:
             return None
@@ -733,6 +737,27 @@ def _instantiate_types(value, mapping: dict[int, Type]):
         return [_instantiate_types(x, mapping) for x in value]
     if isinstance(value, tuple):
         return tuple(_instantiate_types(x, mapping) for x in value)
+    return value
+
+
+def _rebase_spans(value, span):
+    """Give a copied Core subtree one diagnostic origin.
+
+    This runs before value arguments are substituted, so those argument nodes
+    retain their own caller spans when `_substitute` inserts them.
+    """
+    if isinstance(value, (CExpr, CBind)):
+        return type(value)(**{
+            f.name: (span if f.name == "span"
+                     else _rebase_spans(getattr(value, f.name), span))
+            for f in fields(value)
+        })
+    if isinstance(value, CAlt):
+        return CAlt(value.pat, _rebase_spans(value.body, span))
+    if isinstance(value, list):
+        return [_rebase_spans(x, span) for x in value]
+    if isinstance(value, tuple):
+        return tuple(_rebase_spans(x, span) for x in value)
     return value
 
 

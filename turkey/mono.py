@@ -858,6 +858,10 @@ class _Devirtualizer:
         cls = _dict_class(owner.ty)
         info = None if cls is None else self.classes.classes.get(cls)
         method = None if info is None else info.methods.get(name)
+        if method is None and info is not None:
+            matches = [m for internal, m in info.methods.items()
+                       if internal.rpartition(".")[2].rpartition("#")[2] == name]
+            method = matches[0] if len(matches) == 1 else None
         if method is None:
             return [], value
         return [q for q in method.scheme.quantified

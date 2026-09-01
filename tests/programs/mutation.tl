@@ -40,15 +40,14 @@ fun main() {
     let b = a
     b[0] = 99
     print(Int.toString(a[0]))
-    print(Int.toString(a.length))
+    print(Int.toString(len(a)))
 
-    -- push grows capacity; length tracks what has actually been written.
+    -- push grows storage; len tracks what has actually been written.
     let grown = Array.new(1)
     Array.push(grown, 1)
     Array.push(grown, 2)
     Array.push(grown, 3)
-    print(Int.toString(grown.length))
-    print(Bool.toString(grown.capacity >= grown.length))
+    print(Int.toString(len(grown)))
 
     -- `var` rebinds the name; `let` data stays mutable either way.
     var current = c

@@ -1,4 +1,4 @@
-module Odd (odd) where
+module Odd (odd)
 import Even (even)
 
 fun odd(n : Int) -> Bool = if n == 0 { False } else { even(n - 1) }

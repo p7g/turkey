@@ -40,7 +40,7 @@ instance Semigroup String {
     fun combine(x, y) = x + y
 }
 
-instance [Semigroup a] Semigroup (Array a) {
+instance Semigroup (Array a) : Semigroup a {
     fun combine(xs, ys) = xs
 }
 
@@ -137,7 +137,7 @@ def test_a_contexted_instance_becomes_a_record_not_a_call():
     checked = check(SEMI + """
 fun main() { print(Int.toString(twice([1, 2])[0])) }
 """)
-    built = named(checked.mono, "%inst.Semigroup.Array@Int")
+    built = named(checked.mono, "%inst.Main#Semigroup.Data.Array#Array@Int")
     assert isinstance(built.value, CRecord)
     assert built.binders == []
     # Nothing is applying the generic instance any more.
@@ -147,7 +147,8 @@ fun main() { print(Int.toString(twice([1, 2])[0])) }
         for node in walk(bind.value):
             if isinstance(node, CApp) and isinstance(node.fn, CTyApp):
                 assert not (isinstance(node.fn.fn, CVar)
-                            and node.fn.fn.name == "%inst.Semigroup.Array"), (
+                            and node.fn.fn.name ==
+                            "%inst.Main#Semigroup.Data.Array#Array"), (
                     f"'{bind.name}' still builds a dictionary per request")
 
 
@@ -163,7 +164,7 @@ instance Display Int {
     fun display(n) = Int.toString(n)
 }
 
-instance [Display a] Display (Array a) {
+instance Display (Array a) : Display a {
     fun display(xs) {
         var s = ""
         for x in xs {
@@ -194,15 +195,18 @@ def test_a_recursive_instance_names_itself():
     name before building the body is for.
     """
     checked = check(RECURSIVE_INSTANCE)
-    built = named(checked.mono, "%inst.Display.Array@Rose")
+    built = named(
+        checked.mono, "%inst.Main#Display.Data.Array#Array@Rose")
     assert isinstance(built.value, CRecord)
     inner = [n.name for n in walk(built.value) if isinstance(n, CVar)]
-    assert "%inst.Display.Array@Rose" in inner, "the cycle did not close"
+    assert "%inst.Main#Display.Data.Array#Array@Rose" in inner, \
+        "the cycle did not close"
     # Named by the *resolved* constructor -- `Main#Rose` -- where the copy's
     # own name carries the bare one, since `_mangle` is for reading. And named
     # through the method M14c hoisted out of it rather than through a
     # projection, which is that milestone's whole claim.
-    assert "%inst.Display.Main#Rose#display" in inner, "the element method went missing"
+    assert "%inst.Main#Display.Main#Rose#display" in inner, \
+        "the element method went missing"
 
 
 def test_a_dictionary_argument_that_is_not_a_top_level_name_is_left_alone():
@@ -254,7 +258,7 @@ class Semigroup a { fun combine(a, a) -> a }
 
 instance Semigroup Int { fun combine(x, y) = x + y }
 
-instance [Semigroup a] Semigroup (Pair a) {
+instance Semigroup (Pair a) : Semigroup a {
     fun combine(x, y) = x
 }
 
@@ -381,13 +385,13 @@ def test_a_method_of_a_known_dictionary_becomes_a_binding():
     checked = check(SEMI + """
 fun main() { print(Int.toString(twice(2))) }
 """)
-    assert "%inst.Semigroup.Int#combine" in names(checked.mono)
+    assert "%inst.Main#Semigroup.Int#combine" in names(checked.mono)
     body = nodes(checked.mono, "Main#twice@Int")
     assert not [n for n in body if isinstance(n, core.CField)], \
         "a projection survived"
     called = [n.fn.name for n in body
               if isinstance(n, CApp) and isinstance(n.fn, CVar)]
-    assert "%inst.Semigroup.Int#combine" in called
+    assert "%inst.Main#Semigroup.Int#combine" in called
 
 
 def test_a_superclass_chain_collapses_in_one_step():
@@ -409,8 +413,8 @@ fun main() { print(Int.toString(squash([1, 2, 3]))) }
     body = nodes(checked.mono, "Main#squash@Int")
     called = {n.fn.name for n in body
               if isinstance(n, CApp) and isinstance(n.fn, CVar)}
-    assert "%inst.Semigroup.Int#combine" in called, sorted(called)
-    assert "%inst.Monoid.Int#empty" in called, sorted(called)
+    assert "%inst.Main#Semigroup.Int#combine" in called, sorted(called)
+    assert "%inst.Main#Monoid.Int#empty" in called, sorted(called)
 
 
 def test_a_for_loop_stops_projecting():
@@ -437,7 +441,7 @@ fun main() {
     cursor = {name for name in called if name.endswith(("#iter", "#next"))}
     assert cursor, sorted(called)
     for name in cursor:
-        assert "%inst.Iterator.Array" in name, name
+        assert "%inst.Std.Classes#Iterator.Data.Array#Array" in name, name
 
 
 def test_a_dictionary_parameter_is_still_projected_from():
@@ -467,9 +471,10 @@ fun main() { print(twice("a")) }
 """)
     kept = dictionaries(checked.mono)
     before = dictionaries(checked.core)
-    assert "%inst.Semigroup.String" in kept
-    assert "%inst.Semigroup.Int" not in kept
-    assert "%inst.Semigroup.Int" in before, "not a claim about the lowering"
+    assert "%inst.Main#Semigroup.String" in kept
+    assert "%inst.Main#Semigroup.Int" not in kept
+    assert "%inst.Main#Semigroup.Int" in before, \
+        "not a claim about the lowering"
     assert len(kept) < len(before)
 
 
@@ -545,7 +550,8 @@ def test_a_second_round_specializes_what_the_first_round_made():
     """
     checked = check(MULTIROUND)
     made = names(checked.mono)
-    hoisted = [n for n in made if n.startswith("%inst.Container.Array#squash")]
+    hoisted = [n for n in made if n.startswith(
+        "%inst.Main#Container.Data.Array#Array#squash")]
     assert hoisted, "the method was never hoisted at all"
     assert any("@" in n for n in hoisted), \
         f"the hoisted method was never specialized: {hoisted}"
@@ -555,7 +561,8 @@ def test_the_specialized_method_takes_no_dictionary():
     """And the point of specializing it: the `Monoid` argument is gone, so
     every `join` inside is a direct call to a name."""
     checked = check(MULTIROUND)
-    bind = named(checked.mono, "%inst.Container.Array#squash@String")
+    bind = named(
+        checked.mono, "%inst.Main#Container.Data.Array#Array#squash@String")
     assert not bind.binders, "a specialized binding has no type binders"
     # The type is the claim: `fun(Array String) -> String` and not
     # `fun(%Dict.Monoid String) -> fun(Array String) -> String`.
@@ -627,4 +634,3 @@ def test_the_budget_survives_the_round_count():
     copies = [n for n in names(checked.mono) if n.startswith("Main#depth@")]
     assert len(copies) == MAX_SPECIALIZATIONS, \
         f"{len(copies)} copies over five rounds, not {MAX_SPECIALIZATIONS}"
-

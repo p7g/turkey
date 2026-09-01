@@ -13,17 +13,17 @@ fun get(r) = r.n
 
 fun bump(r) { r.n = r.n + 1 }
 
--- `.length` before the index, and after it. Both used to be needed to make
+-- `len` before the index, and after it. Both used to be needed to make
 -- the same program mean two different things.
 fun before(a) {
-    let n = a.length
+    let n = len(a)
     let x = a[0]
     n + x
 }
 
 fun after(a) {
     let x = a[0]
-    let n = a.length
+    let n = len(a)
     n + x
 }
 

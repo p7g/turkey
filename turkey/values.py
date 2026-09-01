@@ -197,8 +197,8 @@ class ConValue:
 # identity: `con` is the tag, here as everywhere.
 # The tags are the internal names `Data.Bool` gives its constructors, since a
 # `ConValue`'s tag is what a pattern is matched against (`turkey/modules.py`).
-TRUE = ConValue("Data.Bool#True", ())
-FALSE = ConValue("Data.Bool#False", ())
+TRUE = ConValue("Data.Bool.Type#True", ())
+FALSE = ConValue("Data.Bool.Type#False", ())
 
 
 def from_bool(b: bool) -> ConValue:

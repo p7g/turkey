@@ -256,7 +256,7 @@ def test_a_program_may_declare_its_own_bool():
     which is what stops the shadow from being a way to break the language."""
     check("type Bool = A | B\nfun main() { print(1) }")
     assert fails("type Bool = A | B\nfun main() { if A { print(1) } }") == (
-        "expected Main.Bool, found Data.Bool.Bool in an 'if' condition")
+        "expected Main.Bool, found Data.Bool.Type.Bool in an 'if' condition")
 
 
 def test_the_lower_case_spellings_are_gone():
@@ -310,7 +310,7 @@ fun main() {
         Some(x) -> Int.toString(x)
         None -> "empty"
     })
-    print(Int.toString(a.length))
+    print(Int.toString(len(a)))
 }
 """
     assert output(src, capsys) == ["empty", "0"]

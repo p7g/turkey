@@ -18,7 +18,8 @@ from dataclasses import fields
 
 from turkey import opt
 from turkey.core import (
-    CApp, CBind, CCon, CExpr, CJoin, CMatch, CPrim, CProgram, CTyApp, CVar,
+    CApp, CBind, CCon, CExpr, CJoin, CLit, CMatch, CPrim, CProgram, CTyApp,
+    CVar,
 )
 from turkey.driver import check
 
@@ -65,6 +66,20 @@ fun addOne(n : Int) -> Int = n + 1
 fun main() { print(addOne(4)) }
 """)
     assert calls_to(named(program, "Main#main"), "Main#addOne") == 0
+
+
+def test_an_inlined_body_blames_the_call_site_but_arguments_keep_theirs():
+    checked = check(
+        "fun bump(x : Int) -> Int = x + 1\n"
+        "fun main() { print(bump(41)) }\n",
+        "inline_test.tl",
+    )
+    literals = {n.value: n.span for n in nodes(
+        named(checked.opt, "Main#main").value) if isinstance(n, CLit)}
+    # `1` came from the callee, so any error in the copied residual points at
+    # `bump(41)`.  The caller-supplied `41` retains its more precise location.
+    assert (literals[1].line, literals[1].col) == (2, 20)
+    assert (literals[41].line, literals[41].col) == (2, 25)
 
 
 def test_a_large_function_is_inlined_only_when_the_call_site_makes_it_small(
@@ -432,11 +447,12 @@ def test_type_applied_methods_inline_and_the_remaining_flow_is_tracked():
              for bind in checked.opt.binds for n in nodes(bind.value)
              if isinstance(n, CApp) and isinstance(n.fn, CTyApp)
              and isinstance(n.fn.fn, CVar)]
-    assert "%inst.Monad.Data.Option#Option#bind" not in typed
-    assert "%inst.Applicative.Data.Option#Option#pure" not in typed
-    assert "%inst.Monad.Data.Either#Either@String#bind" not in typed
-    assert "%inst.Applicative.Data.Either#Either@String#pure" not in typed
-    assert typed.count("%inst.Monad.Array#bind") == 8, (
+    assert "%inst.Std.Classes#Monad.Data.Option.Type#Option#bind" not in typed
+    assert "%inst.Std.Classes#Applicative.Data.Option.Type#Option#pure" not in typed
+    assert "%inst.Std.Classes#Monad.Data.Either#Either@String#bind" not in typed
+    assert "%inst.Std.Classes#Applicative.Data.Either#Either@String#pure" not in typed
+    assert typed.count(
+        "%inst.Std.Classes#Monad.Data.Array#Array#bind") == 8, (
         "Array bind's eight residuals do not repay their size; if this moves, "
         "check both generated-code size and warm backend time")
 

@@ -83,7 +83,7 @@ from .errors import Span, TurkeyError
 from .typed import reduce_deep
 from .types import (
     BOOL, STAR, TApp, TBottom, TCon, TFam, TFun, TTuple, TVar, Type,
-    array_of, prune, show, spine, type_key,
+    array_of, prune, raw_array_of, show, spine, type_key,
 )
 
 
@@ -280,7 +280,7 @@ class Checker:
         elems = [self.check(x, env) for x in e.elems]
         if not elems:
             return e.ty
-        return array_of(elems[0])
+        return raw_array_of(elems[0])
 
     # the three that carry the milestone
 
@@ -324,7 +324,7 @@ class Checker:
         dict_ty = self.check(e.target, env)
         cls, head = self.dict_parts(dict_ty, e.span)
         info = self.classes.classes[cls]
-        method = info.methods.get(e.name)
+        method = _class_method(info.methods, e.name)
         if method is None:
             raise CoreError(
                 f"class '{cls}' has no method '{e.name}'", e.span)
@@ -468,17 +468,18 @@ class Checker:
                 self.expect(want, self.check(value, env), e.span,
                             f"the '{name}' of a '{cls}' dictionary")
                 continue
-            method = info.methods.get(name)
+            method = _class_method(info.methods, name)
             if method is None:
                 raise CoreError(f"class '{cls}' has no method '{name}'", e.span)
             got = self.check(value, env)
             self.expect(self.method_type(method, head), got, e.span,
                         f"method '{name}' of '{cls}'")
         for name in info.methods:
-            if name not in seen:
+            surface = _member_surface(name)
+            if surface not in seen:
                 raise CoreError(
                     f"the '{cls}' dictionary for {show(head)} has no "
-                    f"'{name}'", e.span)
+                    f"'{surface}'", e.span)
         for sup in info.supers:
             if f"%super.{sup.name}" not in seen:
                 raise CoreError(
@@ -823,6 +824,19 @@ def _unannot(pat):
 def _vars_of(pat) -> set[str]:
     from .deps import pattern_vars
     return set(pattern_vars(pat))
+
+
+def _class_method(methods: dict[str, object], written: str):
+    direct = methods.get(written)
+    if direct is not None:
+        return direct
+    found = [method for name, method in methods.items()
+             if _member_surface(name) == written]
+    return found[0] if len(found) == 1 else None
+
+
+def _member_surface(name: str) -> str:
+    return name.rpartition(".")[2].rpartition("#")[2] or name
 
 
 def _head_mapping(scheme, target: Type) -> dict[int, Type]:

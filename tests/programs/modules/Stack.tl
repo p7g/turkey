@@ -1,4 +1,4 @@
-module Stack (Stack, empty, push, pop) where
+module Stack (Stack, empty, push, pop)
 
 -- `push` and `pop` are the point of this module: before M11a the built-in
 -- `Array.push` claimed the bare name and a program could not define one.

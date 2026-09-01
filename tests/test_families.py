@@ -70,11 +70,13 @@ def test_a_family_may_not_share_a_name_with_a_type():
     )
 
 
-def test_two_classes_may_not_declare_the_same_family():
-    assert "already a type family of class 'C'" in fails(
+def test_two_classes_may_declare_the_same_family_name():
+    checked = check(
         "class C c {\n type Elem c\n fun f(c) -> Int\n}\n"
         "class D d {\n type Elem d\n fun g(d) -> Int\n}"
     )
+    assert "Main#C.Elem" in checked.decls.families
+    assert "Main#D.Elem" in checked.decls.families
 
 
 def test_a_family_must_be_applied():
@@ -95,7 +97,7 @@ def test_a_family_takes_the_kind_the_class_gives_its_parameter():
     """
     # `f` is applied in `peek`, so it is `* -> *`, and `Held` is a family over
     # a constructor rather than over a type.
-    assert "has kind *, but 'Held' is a family over a type of kind * -> *" in fails(
+    assert "has kind *, but 'Box.Held' is a family over a type of kind * -> *" in fails(
         src + "fun f(x : Held Int) -> Int = 1"
     )
 
@@ -153,7 +155,7 @@ def test_a_family_over_an_open_type_survives_into_the_scheme():
     # Not an error and not a solution: the scheme carries it, and each use
     # site reduces it for itself.
     assert scheme(CONTAINER + "fun f(xs) = first(xs)",
-                  "f") == "[Container a] fun(a) -> Elem a"
+                  "f") == "[Container a] fun(a) -> Container.Elem a"
 
 
 def test_a_scheme_may_be_constrained_on_a_family():
@@ -170,7 +172,8 @@ def test_a_scheme_may_be_constrained_on_a_family():
     """
     # The whole point of families over a second class parameter: `Display` is
     # demanded of a type the signature never names.
-    assert scheme(src, "render") == "[Container a, Display (Elem a)] fun(a) -> String"
+    assert scheme(src, "render") == \
+        "[Container a, Display (Container.Elem a)] fun(a) -> String"
 
 
 def test_an_equation_over_an_open_family_waits_rather_than_failing():
@@ -200,7 +203,8 @@ def test_an_equation_no_instance_decides_is_carried_by_the_scheme():
         return n
     }
     """
-    assert scheme(src, "f") == "[Elem a ~ Int, Container a] fun(a) -> Elem a"
+    assert scheme(src, "f") == \
+        "[Container.Elem a ~ Int, Container a] fun(a) -> Container.Elem a"
 
 
 def test_a_carried_equation_is_checked_at_the_use_site(capsys):
@@ -229,20 +233,20 @@ def test_a_carried_equation_is_checked_at_the_use_site(capsys):
 def test_an_equation_that_can_never_be_decided_is_rejected():
     message = fails(CONTAINER + "fun f[Container c](xs : c) -> Int = first(xs)")
     # `c` is the name the signature wrote, kept by the skolem (delta 38).
-    assert "cannot reduce 'Elem c' to 'Int'" in message
+    assert "cannot reduce 'Container.Elem c' to 'Int'" in message
     assert "which 'Container' instance defines it" in message
     # And the remedy, which is the equality itself: `f` is rejected for saying
     # too little, not for being wrong, and adding it to the context fixes it.
-    assert "Add 'Elem c ~ Int' to the context." in message
+    assert "Add 'Container.Elem c ~ Int' to the context." in message
     assert scheme(
         CONTAINER + "fun f[Elem c ~ Int, Container c](xs : c) -> Int = first(xs)",
         "f",
-    ) == "[Elem a ~ Int, Container a] fun(a) -> Int"
+    ) == "[Container.Elem a ~ Int, Container a] fun(a) -> Int"
 
 
 def test_a_family_over_a_type_with_no_instance_is_rejected_where_written():
     assert fails(CONTAINER + "fun f(x : Elem Bool) -> Int = 1\nfun g() = f(True)") == (
-        "no instance for 'Container Bool', so 'Elem Bool' has no definition"
+        "no instance for 'Container Bool', so 'Container.Elem Bool' has no definition"
     )
 
 
@@ -267,7 +271,7 @@ def test_two_of_the_same_family_application_unify():
         return x
     }
     """
-    assert scheme(src, "f") == "[Container a] fun(a, a) -> Elem a"
+    assert scheme(src, "f") == "[Container a] fun(a, a) -> Container.Elem a"
 
 
 # -- what it makes run --------------------------------------------------------
@@ -336,7 +340,8 @@ def test_an_equality_parses_and_round_trips():
         n
     }
     """
-    assert scheme(src, "c") == "[Iterator a, Item a ~ Op] fun(a) -> Int"
+    assert scheme(src, "c") == \
+        "[Iterator a, Iterator.Item a ~ Op] fun(a) -> Int"
 
 
 def test_an_equality_on_the_element_is_inferred():
@@ -352,7 +357,8 @@ def test_an_equality_on_the_element_is_inferred():
         n
     }
     """
-    assert scheme(src, "countOps") == "[Item a ~ Op, Iterator a] fun(a) -> Int"
+    assert scheme(src, "countOps") == \
+        "[Iterator.Item a ~ Op, Iterator a] fun(a) -> Int"
 
 
 def test_a_given_equality_lets_a_match_find_its_constructors(capsys):
@@ -377,7 +383,8 @@ def test_a_given_equality_lets_a_match_find_its_constructors(capsys):
         print(Int.toString(runOps([Inc(2), Loop([Inc(3), Inc(4)]), Inc(1)])))
     }
     """
-    assert scheme(src, "runOps") == "[Iterator a, Item a ~ Op] fun(a) -> Int"
+    assert scheme(src, "runOps") == \
+        "[Iterator a, Iterator.Item a ~ Op] fun(a) -> Int"
     assert output(src, capsys) == ["10"]
 
 
@@ -402,7 +409,8 @@ def test_matching_the_element_is_inferred_too():
         n
     }
     """
-    assert scheme(src, "runOps") == "[Item a ~ Op, Iterator a] fun(a) -> Int"
+    assert scheme(src, "runOps") == \
+        "[Iterator.Item a ~ Op, Iterator a] fun(a) -> Int"
 
 
 def test_two_answers_for_one_family_application_conflict():
@@ -439,5 +447,5 @@ def test_an_equality_costs_no_dictionary():
     checked = check(src)
     decl = next(s.decl for s in checked.ordered
                 if isinstance(s, ast.SFun) and s.decl.name.endswith("#c"))
-    assert [p.name for p in decl.dicts.preds] == ["Iterator"]
+    assert [p.name for p in decl.dicts.preds] == ["Std.Classes#Iterator"]
     assert len(decl.dicts.params) == 1

@@ -47,7 +47,7 @@ FLOW_RET = "Prelude#Ret"
 # `error` diverges, so it can stand in for a `Flow` arm the language's own rules
 # make unreachable -- a `break` where there is no loop -- which the exhaustive-
 # ness checker has no way to know is unreachable.
-ERROR = "Prelude#error"
+ERROR = "Std.Classes#error"
 
 ITER_CLASS = "Iterator"
 ITER_ITEM = "Item"
@@ -57,9 +57,9 @@ ITER_NEXT = "next"
 
 # Internal names (`turkey/modules.py`): `Option` and `Bool` are declared by
 # library modules now, so the compiler names them the way resolution does.
-OPTION = "Data.Option#Option"
-OPTION_NONE = "Data.Option#None"
-OPTION_SOME = "Data.Option#Some"
+OPTION = "Data.Option.Type#Option"
+OPTION_NONE = "Data.Option.Type#None"
+OPTION_SOME = "Data.Option.Type#Some"
 
-BOOL_TRUE = "Data.Bool#True"
-BOOL_FALSE = "Data.Bool#False"
+BOOL_TRUE = "Data.Bool.Type#True"
+BOOL_FALSE = "Data.Bool.Type#False"

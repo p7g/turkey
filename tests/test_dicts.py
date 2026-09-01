@@ -30,7 +30,7 @@ instance Display Bool {
     fun display(b) = if b { "true" } else { "false" }
 }
 
-instance [Display a] Display (Array a) {
+instance Display (Array a) : Display a {
     fun display(xs) {
         var s = ""
         for x in xs {
@@ -75,7 +75,7 @@ def fails(src: str) -> str:
 def _short(name: str) -> str:
     """A top-level binding is `Module#name` after resolution (M11a); the tests
     ask for it the way it was written."""
-    return name.rpartition("#")[2]
+    return name.rpartition(".")[2].rpartition("#")[2]
 
 def _decl(checked, name: str) -> ast.FunDecl:
     for item in checked.program.decls:
@@ -103,7 +103,7 @@ def uses(checked, fn: str) -> dict[str, list]:
             return
         seen.add(id(node))
         if isinstance(node, ast.EVar) and node.use is not None:
-            found.setdefault(node.name, []).append(node.use)
+            found.setdefault(_short(node.name), []).append(node.use)
         for f in fields(node):
             walk(getattr(node, f.name))
 
@@ -147,7 +147,7 @@ def test_an_instance_context_is_applied_to_the_dictionary_it_needs():
     checked = check(SHOW + "fun main() { print(display([1, 2])) }")
     (evidence,) = uses(checked, "main")["display"][0].evidence
     assert isinstance(evidence, FromInstance)
-    assert evidence.inst.con == "Array"
+    assert evidence.inst.con == "Data.Array#Array"
     (arg,) = evidence.args
     assert isinstance(arg, FromInstance) and arg.inst.con == "Int"
 
@@ -157,7 +157,9 @@ def test_a_nested_instance_nests_its_evidence():
     (outer,) = uses(checked, "main")["display"][0].evidence
     (middle,) = outer.args
     (inner,) = middle.args
-    assert [e.inst.con for e in (outer, middle, inner)] == ["Array", "Array", "Int"]
+    assert [e.inst.con for e in (outer, middle, inner)] == [
+        "Data.Array#Array", "Data.Array#Array", "Int",
+    ]
 
 
 def test_a_superclass_is_selected_rather_than_passed():
@@ -169,7 +171,7 @@ def test_a_superclass_is_selected_rather_than_passed():
     checked = check(ORD + "fun same[Rank a](x : a, y : a) -> Bool = egal(x, y)")
     (evidence,) = uses(checked, "same")["egal"][0].evidence
     assert isinstance(evidence, FromDict)
-    assert evidence.path == ("Egal",)
+    assert evidence.path == ("Main#Egal",)
     assert params_of(checked, "same") == [evidence.name]
 
 

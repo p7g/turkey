@@ -47,9 +47,9 @@ instance Monoid String {
 
 -- An instance with a context is a *function* from dictionaries to a
 -- dictionary: `Semigroup (Array a)` is built from a `Semigroup a`.
-instance [Semigroup a] Semigroup (Array a) {
+instance Semigroup (Array a) : Semigroup a {
     fun combine(xs, ys) {
-        let out = Array.new(xs.length + ys.length)
+        let out = Array.new(len(xs) + len(ys))
         for x in xs {
             Array.push(out, x)
         }
@@ -60,7 +60,7 @@ instance [Semigroup a] Semigroup (Array a) {
     }
 }
 
-instance [Semigroup a] Monoid (Array a) {
+instance Monoid (Array a) : Semigroup a {
     fun empty() = []
 }
 

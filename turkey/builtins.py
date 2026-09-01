@@ -23,10 +23,10 @@ from .constraints import Binding, Env
 from .prelude import BOOL_FALSE, BOOL_TRUE, OPTION, OPTION_NONE, OPTION_SOME
 from .types import (
     BOOL, CHAR, FLOAT, INT, STAR, STRING, UNIT, KFun, TCon, TFun, TVar, apply,
-    array_of, generalize, mono,
+    array_of, generalize, mono, raw_array_of,
 )
 from .values import (
-    UNIT as UNIT_VALUE, ArrayObj, Builtin, ConValue, from_bool, truth,
+    UNIT as UNIT_VALUE, ArrayObj, Builtin, ConValue, RecordObj, from_bool, truth,
 )
 
 
@@ -57,6 +57,11 @@ def _pop(arr):
     return ConValue(OPTION_SOME, (arr.pop(),))
 
 
+def _set(arr, index, value):
+    arr.set(index, value)
+    return UNIT_VALUE
+
+
 def _print(text):
     sys.stdout.write(text + "\n")
     sys.stdout.flush()
@@ -75,7 +80,7 @@ def _chars(s):
     arr = ArrayObj(len(s))
     for ch in s:
         arr.push(ch)
-    return arr
+    return RecordObj("Data.Array#Array", {"raw": arr})
 
 
 def _char_from_int(n):
@@ -135,17 +140,23 @@ _PRIM: dict[str, tuple] = {
     # more than a rename: it is total where `ArrayObj.pop` is not, because an
     # empty array is an ordinary answer for the one call whose empty case a
     # program is expected to handle (delta 37).
-    "Prim.arrayNew": (_scheme(lambda a: TFun([INT], array_of(a))),
+    "Prim.arrayNew": (_scheme(lambda a: TFun([INT], raw_array_of(a))),
                       _bi("Prim.arrayNew", 1, lambda n: ArrayObj(n))),
-    "Prim.arrayPush": (_scheme(lambda a: TFun([array_of(a), a], UNIT)),
+    "Prim.arrayPush": (_scheme(lambda a: TFun([raw_array_of(a), a], UNIT)),
                        _bi("Prim.arrayPush", 2, _push)),
     "Prim.arrayPop": (
         # `Option` is declared in `Data.Option` and a `TCon` is compared by
         # name, so naming it here needs no `DeclTable` -- the same trick that
         # lets `BOOL` above mean the `Bool` the library declares.
-        _scheme(lambda a: TFun([array_of(a)], apply(TCon(OPTION, KFun(STAR, STAR)), [a]))),
+        _scheme(lambda a: TFun([raw_array_of(a)], apply(TCon(OPTION, KFun(STAR, STAR)), [a]))),
         _bi("Prim.arrayPop", 1, _pop),
     ),
+    "Prim.arrayGet": (_scheme(lambda a: TFun([raw_array_of(a), INT], a)),
+                      _bi("Prim.arrayGet", 2, lambda xs, i: xs.get(i))),
+    "Prim.arraySet": (_scheme(lambda a: TFun([raw_array_of(a), INT, a], UNIT)),
+                      _bi("Prim.arraySet", 3, _set)),
+    "Prim.arrayLength": (_scheme(lambda a: TFun([raw_array_of(a)], INT)),
+                         _bi("Prim.arrayLength", 1, lambda xs: xs.length)),
 
     "Prim.stringConcat": (mono(TFun([STRING, STRING], STRING)),
                           _bi("Prim.stringConcat", 2, lambda a, b: a + b)),

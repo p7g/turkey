@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from . import ast
 from .errors import Span, TypeError_
 from .types import (
-    ARRAY, PRIMITIVES, STAR, Fresh, KFun, Kind, Scheme, TApp, TCon, TFam, TFun,
+    RAW_ARRAY, PRIMITIVES, STAR, Fresh, KFun, Kind, Scheme, TApp, TCon, TFam, TFun,
     TTuple, TVar, Type, apply, default_kind, generalize, instantiate, kind_arrow,
     QUALIFY, kind_of, short_name, show, show_kind, spine, unify_kinds,
 )
@@ -90,9 +90,9 @@ class DeclTable:
         # class name is global and unqualified.
         self.shorts: dict[str, str] = {name: name for name in PRIMITIVES}
         QUALIFY.clear()
-        self.tycons["Array"] = TyconInfo("Array", ["a"], kind=ARRAY.kind)
-        self.heads["Array"] = ARRAY
-        self.shorts["Array"] = "Array"
+        self.tycons["Prim.Array"] = TyconInfo(
+            "Prim.Array", ["a"], kind=RAW_ARRAY.kind)
+        self.heads["Prim.Array"] = RAW_ARRAY
 
     def head(self, name: str) -> TCon:
         return self.heads[name]
@@ -104,7 +104,7 @@ class DeclTable:
         other in any order."""
         for d in decls:
             short = short_name(d.name)
-            if short in PRIMITIVES or short == "Array":
+            if short in PRIMITIVES:
                 raise TypeError_(f"cannot redefine the built-in type '{short}'", d.span)
             if d.name in self.tycons:
                 raise TypeError_(f"type '{d.name}' is declared more than once", d.span)

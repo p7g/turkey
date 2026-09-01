@@ -35,7 +35,8 @@ def bad(src: str) -> str:
 
 
 def kind_of_class(src: str, name: str) -> str:
-    return show_kind(check(PRELUDE + src).classes.classes[name].kind)
+    classes = check(PRELUDE + src).classes.classes
+    return show_kind(classes[f"Main#{name}"].kind)
 
 
 EQ = """
@@ -160,7 +161,7 @@ def test_an_instance_context_becomes_the_use_site_obligation():
     context is the solver's to discover.
     """
     src = EQ + """
-    instance [Egal a] Egal (Array a) {
+    instance Egal (Array a) : Egal a {
         fun egal(xs, ys) = egal(xs[0], ys[0])
     }
     fun heads(xs : Array a, ys : Array a) = egal(xs, ys)
@@ -171,7 +172,7 @@ def test_an_instance_context_becomes_the_use_site_obligation():
 def test_a_signature_must_declare_the_context_its_body_needs():
     """The other side of delta 38: a stated type is the whole of the type."""
     src = EQ + """
-    instance [Egal a] Egal (Array a) {
+    instance Egal (Array a) : Egal a {
         fun egal(xs, ys) = egal(xs[0], ys[0])
     }
     fun heads(xs : Array a, ys : Array a) -> Bool = egal(xs, ys)
@@ -181,7 +182,7 @@ def test_a_signature_must_declare_the_context_its_body_needs():
 
 def test_a_signature_that_declares_its_context_is_accepted():
     src = EQ + """
-    instance [Egal a] Egal (Array a) {
+    instance Egal (Array a) : Egal a {
         fun egal(xs, ys) = egal(xs[0], ys[0])
     }
     fun heads[Egal a](xs : Array a, ys : Array a) -> Bool = egal(xs, ys)
@@ -191,7 +192,7 @@ def test_a_signature_that_declares_its_context_is_accepted():
 
 def test_an_instance_context_is_discharged_when_the_element_is_known():
     src = EQ + """
-    instance [Egal a] Egal (Array a) {
+    instance Egal (Array a) : Egal a {
         fun egal(xs, ys) = egal(xs[0], ys[0])
     }
     fun ints(xs : Array Int) -> Bool = egal(xs, xs)
@@ -201,7 +202,7 @@ def test_an_instance_context_is_discharged_when_the_element_is_known():
 
 def test_an_instance_context_that_cannot_be_met_is_reported():
     src = EQ + """
-    instance [Egal a] Egal (Array a) {
+    instance Egal (Array a) : Egal a {
         fun egal(xs, ys) = egal(xs[0], ys[0])
     }
     fun f(xs : Array String) -> Bool = egal(xs, xs)
@@ -306,14 +307,30 @@ def test_an_instance_method_states_no_signature():
 
 def test_a_method_may_share_a_name_with_a_top_level_function():
     """It could not before M11a, because both lived in one flat namespace. A
-    top-level binding belongs to its module now; a method stays global."""
+    top-level binding and the class method now have distinct internal names."""
     src = EQ + "fun egal(x, y) = x"
     assert sigs(src)["egal"] == "fun(a, b) -> a"
 
 
-def test_a_method_may_not_be_declared_by_two_classes():
+def test_two_classes_may_declare_the_same_method_name():
     src = EQ + "class Same a { fun egal(a, a) -> Bool }"
-    assert bad(src) == "'egal' is already a method of class 'Egal'"
+    classes = check(src).classes.classes
+    assert "Main#Egal" in classes
+    assert "Main#Same" in classes
+    assert "Main#Egal.egal" in classes["Main#Egal"].methods
+    assert "Main#Same.egal" in classes["Main#Same"].methods
+
+
+def test_an_instance_head_may_be_a_tuple():
+    src = """
+class PairSize p { fun pairSize(p) -> Int }
+instance PairSize (a, b) { fun pairSize(pair) = 2 }
+fun size() -> Int = pairSize(("left", True))
+"""
+    checked = check(src)
+    instance = checked.classes.instances["Main#PairSize"][0]
+    assert instance.con == "Tuple2"
+    assert sigs(src)["size"] == "fun() -> Int"
 
 
 # -- rigidity -----------------------------------------------------------------
@@ -402,9 +419,11 @@ def test_a_class_may_not_be_declared_twice():
     assert bad(src) == "class 'Egal' is declared more than once"
 
 
-def test_a_class_may_not_share_a_name_with_a_type():
+def test_a_class_may_share_a_short_name_with_a_type():
     src = "class Option a { fun f(a) -> a }"
-    assert "is already a type" in bad(src)
+    checked = check(src)
+    assert "Main#Option" in checked.classes.classes
+    assert "Data.Option.Type#Option" in checked.decls.tycons
 
 
 def test_a_method_parameter_needs_a_type():

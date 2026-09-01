@@ -183,8 +183,9 @@ def _escapes(node: object, *, in_loop: bool = False) -> ast.Expr | None:
 
 
 class Desugarer:
-    def __init__(self) -> None:
+    def __init__(self, methods: dict[str, str] | None = None) -> None:
         self._n = 0
+        self.methods = methods or {}
         # How many lifted loops enclose the code being translated. A `break`
         # only becomes a `Brk` inside one; outside, it is left alone so that the
         # checker still reports it as a `break` with no loop, which is what it
@@ -416,7 +417,8 @@ class Desugarer:
             return self.expr(e.obj, lambda o: k(ast.EField(e.span, o, e.name)))
         if t is ast.EIndex:
             return self.expr(e.arr, lambda a: self.expr(
-                e.index, lambda i: k(ast.EIndex(e.span, a, i))))
+                e.index, lambda i: k(ast.EIndex(
+                    e.span, a, i, e.get_fn, e.set_fn))))
         if t is ast.EUnary:
             return self.expr(e.operand,
                              lambda v: k(ast.EUnary(e.span, e.op, v, e.fn)))
@@ -544,14 +546,15 @@ class Desugarer:
         param, read = self.fresh(span)
         lam = ast.ELambda(span, [param], None, k(read()))
         if fn is None:
-            fn = ast.EVar(span, prelude.MONAD_BIND, method=True)
+            fn = ast.EVar(span, self.methods.get(
+                prelude.MONAD_BIND, prelude.MONAD_BIND), method=True)
         return ast.ECall(span, fn, [m, lam])
 
-    @staticmethod
-    def _pure(value: ast.Expr) -> ast.Expr:
+    def _pure(self, value: ast.Expr) -> ast.Expr:
         span = value.span
         return ast.ECall(
-            span, ast.EVar(span, prelude.MONAD_PURE, method=True), [value])
+            span, ast.EVar(span, self.methods.get(
+                prelude.MONAD_PURE, prelude.MONAD_PURE), method=True), [value])
 
     # -- flow mode: control transfers as values (delta 47) -----------------
 
@@ -775,9 +778,45 @@ def _wrap(prefix: list[ast.Stmt], value: ast.Expr, span: Span) -> ast.Expr:
     return ast.EBlock(span, [*prefix, ast.SExpr(value.span, value)])
 
 
-def program(program_: ast.Program) -> None:
-    """Rewrite every `?` and `do` in one module away."""
-    Desugarer().program(program_)
+def program(program_: ast.Program, methods: dict[str, str] | None = None) -> None:
+    """Rewrite every surface-only construct in one module away."""
+    Desugarer(methods).program(program_)
+    _desugar_indexes(program_)
+
+
+def _desugar_indexes(program_: ast.Program) -> None:
+    """Turn bracket reads/writes into resolved `Index` method calls."""
+    def rewrite(value):
+        if isinstance(value, ast.SAssign) and isinstance(value.target, ast.EIndex):
+            target = value.target
+            if target.set_fn is None:
+                return value
+            return ast.SExpr(value.span, ast.ECall(
+                value.span, target.set_fn,
+                [rewrite(target.arr), rewrite(target.index), rewrite(value.value)]))
+        if isinstance(value, ast.EIndex):
+            if value.get_fn is None:
+                return value
+            return ast.ECall(value.span, value.get_fn,
+                             [rewrite(value.arr), rewrite(value.index)])
+        if isinstance(value, ast.Node):
+            for field in dataclasses.fields(value):
+                held = getattr(value, field.name)
+                if isinstance(held, ast.Node):
+                    setattr(value, field.name, rewrite(held))
+                elif isinstance(held, list):
+                    setattr(value, field.name, [
+                        (item[0], rewrite(item[1]))
+                        if isinstance(item, tuple) and len(item) == 2
+                        and isinstance(item[1], ast.Expr)
+                        else rewrite(item) if isinstance(item, ast.Node) else item
+                        for item in held
+                    ])
+            return value
+        return value
+
+    for i, decl in enumerate(program_.decls):
+        program_.decls[i] = rewrite(decl)
 
 
 __all__ = ["Desugarer", "program"]

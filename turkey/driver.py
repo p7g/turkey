@@ -84,7 +84,7 @@ def check(src: str, file: str | None = None,
         # already had its names settled, so moving it cannot change what one
         # means -- and the code the pass writes may name internal constructors
         # directly. See turkey/desugar.py.
-        desugar.program(module.program)
+        desugar.program(module.program, module.scope.methods)
         # Generation builds the module's constraint and decides nothing;
         # solving is what assigns ranks, generalizes and fills in `env`.
         # Splitting them this way is the point of the HM(X) shape.
@@ -149,7 +149,8 @@ def _signatures(entry: Module, env: Env,
             # but it is still the thing a reader wants to see, and the class
             # variable's discovered kind shows up nowhere else.
             info = classes.classes[item.name]
-            out.extend((m.name, info.methods[m.name].scheme) for m in item.methods)
+            out.extend(((m.name.rpartition(".")[2].rpartition(SEP)[2] or m.name),
+                        info.methods[m.name].scheme) for m in item.methods)
             continue
         if not isinstance(item, ast.Stmt):
             continue

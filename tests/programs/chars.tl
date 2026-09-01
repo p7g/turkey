@@ -11,8 +11,7 @@ fun classify(c : Char) -> String {
 
 fun main() {
     let cs = String.chars("ae?z")
-    print(Int.toString(cs.length))
-    print(Int.toString(cs.capacity))
+    print(Int.toString(len(cs)))
 
     for c in cs {
         print(classify(c))

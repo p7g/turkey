@@ -77,6 +77,10 @@ class FromDict(Evidence):
 
     name: str
     path: tuple[str, ...] = ()
+    # Keep the predicate of the parameter itself.  Looking its type up later
+    # by generated name is fragile when evidence is completed outside a use
+    # site (notably while constructing instance superclass dictionaries).
+    pred: Pred | None = None
 
 
 @dataclass
@@ -272,7 +276,7 @@ class Elaborator:
             for name, given in scope.givens:
                 path = self.super_path(given, key)
                 if path is not None:
-                    return FromDict(name, path)
+                    return FromDict(name, path, given)
 
         for inst in self.classes.instances.get(pred.name, []):
             mapping = match(inst.head, target)

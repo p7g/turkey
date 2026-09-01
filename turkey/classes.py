@@ -116,8 +116,19 @@ class InstInfo:
     @property
     def con(self) -> str:
         head, _ = spine(self.head)
-        assert isinstance(head, TCon)
-        return head.name
+        if isinstance(head, TCon):
+            return head.name
+        if isinstance(head, TTuple):
+            return f"Tuple{len(head.elems)}"
+        raise AssertionError("validated instance head has no stable key")
+
+    @property
+    def head_key(self) -> tuple[str, object]:
+        head, _ = spine(self.head)
+        if isinstance(head, TCon):
+            return ("con", head.name)
+        assert isinstance(head, TTuple)
+        return ("tuple", len(head.elems))
 
 
 class ClassTable:
@@ -148,13 +159,6 @@ class ClassTable:
         for d in classes:
             if d.name in self.classes:
                 raise TypeError_(f"class '{d.name}' is declared more than once", d.span)
-            # A class name is global and unqualified, so it is checked against
-            # the *short* names the type namespace has claimed (delta 43).
-            if d.name in self.decls.shorts:
-                raise TypeError_(
-                    f"'{d.name}' is already a type; a class cannot share its name",
-                    d.span,
-                )
             self.classes[d.name] = ClassInfo(d.name, d.param, TVar(1), span=d.span,
                                              module=module)
             self._declare_families(d)
@@ -203,7 +207,7 @@ class ClassTable:
                     f"'{fam.name}' is already a type family of class '{other}'",
                     fam.span,
                 )
-            if fam.name in self.decls.shorts:
+            if fam.name in self.decls.tycons:
                 raise TypeError_(
                     f"'{fam.name}' is already a type; a type family cannot "
                     f"share its name",
@@ -386,8 +390,9 @@ class ClassTable:
             )
         self._check_head_shape(d, head)
 
+        key = _instance_head_key(head)
         for other in self.instances.get(d.cls, []):
-            if other.con == _con_of(head).name:
+            if other.head_key == key:
                 raise TypeError_(
                     f"overlapping instances: '{d.cls} {show(head)}' and "
                     f"'{other.cls} {show(other.head)}' both apply",
@@ -417,7 +422,17 @@ class ClassTable:
         """
         home = self.classes[inst.cls].module
         head_module = _module_of(inst.con)
-        if inst.module in (home, head_module):
+        # A public facade owns types declared in its private child module
+        # (`Data.Bool.Type` -> `Data.Bool`) as well as types declared directly.
+        head_facade = head_module.rpartition(".")[0]
+        builtin_home = {
+            "Int": "Data.Int", "Float": "Data.Float",
+            "String": "Data.String", "Char": "Data.Char",
+        }.get(inst.con)
+        tuple_home = "Data.Tuple" if inst.con.startswith("Tuple") else None
+        if inst.module in (
+            home, head_module, head_facade, builtin_home, tuple_home,
+        ):
             return
         raise TypeError_(
             f"orphan instance: '{d.cls} {show(inst.head)}' is declared in "
@@ -442,12 +457,14 @@ class ClassTable:
         """
         bound: dict[str, Type] = {}
         for fb in d.families:
-            if fb.name not in info.families:
+            resolved = _member_named(info.families, fb.name)
+            if resolved is None:
                 raise TypeError_(
                     f"'{fb.name}' is not a type family of class '{d.cls}'",
                     fb.span,
                 )
-            if fb.name in bound:
+            fb.name = resolved
+            if resolved in bound:
                 raise TypeError_(
                     f"'{fb.name}' is defined twice in this instance", fb.span
                 )
@@ -460,7 +477,7 @@ class ClassTable:
                     f"'{show(head)}'",
                     fb.span,
                 )
-            fam = self.decls.families[fb.name]
+            fam = self.decls.families[resolved]
             if not unify_kinds(kind_of(body), fam.res_kind):
                 raise TypeError_(
                     f"'{show(body)}' has kind {show_kind(kind_of(body))}, but "
@@ -469,12 +486,12 @@ class ClassTable:
                     fb.span,
                 )
             _check_fam_decreasing(fb, body)
-            bound[fb.name] = body
+            bound[resolved] = body
         missing = [n for n in info.families if n not in bound]
         if missing:
             raise TypeError_(
                 f"instance '{d.cls} {show(head)}' does not define "
-                f"{', '.join(sorted(missing))}",
+                f"{', '.join(sorted(_surface_member(n) for n in missing))}",
                 d.span,
             )
         return bound
@@ -534,7 +551,9 @@ class ClassTable:
         turns a missing instance into a silently different one.
         """
         con, args = spine(head)
-        if not isinstance(con, TCon):
+        if isinstance(con, TTuple):
+            args = list(con.elems)
+        elif not isinstance(con, TCon):
             raise TypeError_(
                 f"'{show(head)}' cannot be an instance head: it must be a type "
                 f"constructor applied to distinct type variables",
@@ -565,12 +584,14 @@ class ClassTable:
                 )
         defined: set[str] = set()
         for method in inst.decl.methods:
-            if method.name not in info.methods:
+            resolved = _member_named(info.methods, method.name)
+            if resolved is None:
                 raise TypeError_(
                     f"'{method.name}' is not a method of class '{inst.cls}'",
                     method.span,
                 )
-            if method.name in defined:
+            method.name = resolved
+            if resolved in defined:
                 raise TypeError_(
                     f"'{method.name}' is defined twice in this instance",
                     method.span,
@@ -581,7 +602,7 @@ class ClassTable:
                     f"comes from the class, so it does not restate it",
                     method.span,
                 )
-            defined.add(method.name)
+            defined.add(resolved)
         missing = [
             name for name, m in info.methods.items()
             if name not in defined and not m.has_default
@@ -589,7 +610,7 @@ class ClassTable:
         if missing:
             raise TypeError_(
                 f"instance '{inst.cls} {show(inst.head)}' does not define "
-                f"{', '.join(sorted(missing))}",
+                f"{', '.join(sorted(_surface_member(n) for n in missing))}",
                 inst.decl.span,
             )
 
@@ -640,8 +661,19 @@ class ClassTable:
         context that restates its own superclasses is noise.
         """
         out: list[Pred] = []
+        equalities: set[frozenset[tuple]] = set()
         for i, p in enumerate(preds):
             if not self.is_class(p.name):
+                if p.name == EQUALS and len(p.args) == 2:
+                    # Equality is symmetric.  Inference can encounter both
+                    # directions when two associated families meet through a
+                    # mutable local (`Item c ~ IndexItem c` and its reverse).
+                    # Carrying both into a scheme creates a cyclic rewrite
+                    # system for Core checking, although they state one fact.
+                    key = frozenset(type_key(a) for a in p.args)
+                    if key in equalities:
+                        continue
+                    equalities.add(key)
                 out.append(p)
                 continue
             implied = False
@@ -702,10 +734,30 @@ def _module_of(name: str) -> str:
     return module if sep else ""
 
 
-def _con_of(t: Type) -> TCon:
+def _instance_head_key(t: Type) -> tuple[str, object]:
     head, _ = spine(t)
-    assert isinstance(head, TCon)
-    return head
+    if isinstance(head, TCon):
+        return ("con", head.name)
+    if isinstance(head, TTuple):
+        return ("tuple", len(head.elems))
+    raise AssertionError("instance head was not shape-checked")
+
+
+def _member_named(members: dict[str, object], written: str) -> str | None:
+    """Resolve an instance-body member by its surface short name.
+
+    Instance bodies declare `fun show`, not a qualified binding.  The selected
+    class makes that spelling unambiguous even when another imported class has
+    a method with the same short name.
+    """
+    if written in members:
+        return written
+    found = [name for name in members if _surface_member(name) == written]
+    return found[0] if len(found) == 1 else None
+
+
+def _surface_member(name: str) -> str:
+    return name.rpartition(".")[2].rpartition("#")[2] or name
 
 
 def match(pattern: Type, target: Type) -> dict[int, Type] | None:

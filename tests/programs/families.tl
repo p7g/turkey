@@ -22,7 +22,7 @@ instance Container (Array a) {
     type Elem = a
 
     fun first(xs) = xs[0]
-    fun size(xs) = xs.length
+    fun size(xs) = len(xs)
 }
 
 type Pair = Pair { left : Int, right : Int }

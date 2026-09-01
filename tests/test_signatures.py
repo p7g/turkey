@@ -90,8 +90,9 @@ def test_a_declared_type_is_reported_as_written():
 
 
 def test_a_body_less_general_than_its_signature_is_rejected():
-    """`xs[0]` needs an `Array`, but the signature promised any `a`."""
-    assert "found Array" in fails("fun first(xs : a) -> Int = xs[0]")
+    """`xs[0]` needs an `Index` instance, but the signature promises none."""
+    assert "no instance for 'Index a'" in \
+        fails("fun first(xs : a) -> Int = xs[0]")
 
 
 def test_a_signature_may_not_narrow_its_return_type():
@@ -189,7 +190,8 @@ def test_a_context_reaching_the_type_through_a_family_is_accepted():
         n
     }
     """
-    assert scheme(src, "describe") == "[Iterator a, Show (Item a)] fun(a) -> Int"
+    assert scheme(src, "describe") == \
+        "[Iterator a, Show (Iterator.Item a)] fun(a) -> Int"
 
 
 # -- what counts as a signature -----------------------------------------------

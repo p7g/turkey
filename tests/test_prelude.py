@@ -103,8 +103,8 @@ def test_the_prelude_exports_its_bindings_and_nothing_else():
     M11a every builtin lives in one environment and resolution is what
     decides which of them a given module can name."""
     scope = check("fun main() {}").scope
-    assert scope["print"] == "Prelude#print"
-    assert scope["show"] == "show"                     # a method of a shared class
+    assert scope["print"] == "Std.Classes#print"
+    assert scope["show"] == "Std.Classes#Show.show"
     assert "Prim.print" not in scope
     assert "Prim.intAdd" not in scope
 
@@ -119,8 +119,29 @@ def test_a_program_may_declare_its_own_option():
     src = "type Option a = None | Some(a)\nfun f(x) = Some(x)"
     # Both print qualified, because printing `Option` twice would say less.
     assert scheme(src, "f") == "fun(a) -> Main.Option a"
-    assert "Data.Option.Option" in fails(
+    assert "Data.Option.Type.Option" in fails(
         src + "\nfun g(o : Option Int) -> Bool = Option.isSome(o)")
+
+
+def test_collection_helpers_and_tuple_instances_are_available(capsys):
+    src = """
+fun main() {
+    print(Array.map([1, 2, 3], fun(n) = n * 2))
+    print(Array.filter([1, 2, 3, 4], fun(n) = n % 2 == 0))
+    print(Array.fold([1, 2, 3], 0, fun(a, n) = a + n))
+    print(Array.reverse([1, 2, 3]))
+    print(Array.append([1, 2], [3]))
+    print(String.join(["a", "b"], "-"))
+    print(Option.fold(Some(3), 0, fun(n) = n + 1))
+    print(Either.fold(Right(4), fun(s : String) = 0, fun(n) = n + 1))
+    print((1, "x"))
+    print((1, 2) < (1, 3))
+}
+"""
+    assert output(src, capsys) == [
+        "[2, 4, 6]", "[2, 4]", "6", "[3, 2, 1]", "[1, 2, 3]",
+        "a-b", "4", "5", "(1, x)", "True",
+    ]
 
 
 # -- the loop drives a cursor -------------------------------------------------
@@ -141,7 +162,7 @@ def test_the_loop_variable_is_the_item_family():
     assert scheme(LIST + "fun f(xs : List a) { for x in xs { return x }\n error(\"\") }",
                   "f") == "fun(List a) -> a"
     assert scheme("fun f(xs) { for x in xs { return x }\n error(\"\") }",
-                  "f") == "[Iterator a] fun(a) -> Item a"
+                  "f") == "[Iterator a] fun(a) -> Iterator.Item a"
 
 
 def test_the_cursor_is_made_once_and_advanced_per_element(capsys):
@@ -240,4 +261,5 @@ instance Iterator (Bag a) {
 
 def test_the_methods_are_ordinary_and_callable_by_name():
     src = "fun head(xs) { let cur = iter(xs)\n next(xs, cur) }"
-    assert scheme(src, "head") == "[Iterator a] fun(a) -> Option (Item a)"
+    assert scheme(src, "head") == \
+        "[Iterator a] fun(a) -> Option (Iterator.Item a)"

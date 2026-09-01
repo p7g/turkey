@@ -395,7 +395,7 @@ INT = TCon("Int")
 FLOAT = TCon("Float")
 STRING = TCon("String")
 CHAR = TCon("Char")
-BOOL = TCon("Data.Bool#Bool")
+BOOL = TCon("Data.Bool.Type#Bool")
 UNIT = TCon("Unit")
 
 # The types the checker seeds itself with, and therefore also the ones a
@@ -406,7 +406,8 @@ UNIT = TCon("Unit")
 PRIMITIVES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR,
               "Unit": UNIT}
 
-ARRAY = TCon("Array", KFun(STAR, STAR))
+ARRAY = TCon("Data.Array#Array", KFun(STAR, STAR))
+RAW_ARRAY = TCon("Prim.Array", KFun(STAR, STAR))
 
 
 # ------------------------------------------------------- application and spines
@@ -476,6 +477,10 @@ def head_con(t: Type) -> TCon | None:
 
 def array_of(element: Type) -> Type:
     return TApp(ARRAY, element, STAR)
+
+
+def raw_array_of(element: Type) -> Type:
+    return TApp(RAW_ARRAY, element, STAR)
 
 
 # ------------------------------------------------------------- the numeric tower
@@ -1097,7 +1102,7 @@ def show(t: Type, names: dict[int, str] | None = None, free_prefix: str = "",
         if isinstance(ty, TCon):
             return ty.display
         if isinstance(ty, TFam):
-            out = f"{ty.name} {go(ty.arg, 2)}"
+            out = f"{short_name(ty.name)} {go(ty.arg, 2)}"
             return f"({out})" if prec > 1 else out
         if isinstance(ty, TApp):
             head, args = spine(ty)
@@ -1143,4 +1148,5 @@ def show_pred(pred: Pred, names: dict[int, str] | None = None,
     # The `_` marks a variable no scheme quantified, which is the point when a
     # context is being printed and noise when a lone predicate is being blamed.
     args = " ".join(show(a, names, free_prefix=free_prefix, prec=2) for a in pred.args)
-    return f"{pred.name} {args}" if args else pred.name
+    name = short_name(pred.name)
+    return f"{name} {args}" if args else name

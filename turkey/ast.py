@@ -198,6 +198,8 @@ class ECall(Expr):
 class EIndex(Expr):
     arr: Expr
     index: Expr
+    get_fn: EVar | None = None
+    set_fn: EVar | None = None
 
 
 @dataclass(eq=False)

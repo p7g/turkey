@@ -9,7 +9,7 @@ fun inc(t, amount) {
 
 fun move(t, amount) {
     t.pos = t.pos + amount
-    while t.pos >= t.data.length {
+    while t.pos >= len(t.data) {
         Array.push(t.data, 0)
     }
 }
@@ -24,7 +24,7 @@ type Op = Inc(Int)
 fun parse(chars, start) {
     var i = start
     let ops = []
-    while i < chars.length {
+    while i < len(chars) {
         Array.push(ops, match chars[i] {
             '+' -> Inc(1)
             '-' -> Inc(-1)

@@ -61,8 +61,8 @@ fun append(xs : Array a, ys : Array a) -> Array a {
 }
 
 instance Index (Array a) {
-    type IndexKey = Int
-    type IndexItem = a
+    type Key = Int
+    type Value = a
     fun get(xs, i) = Prim.arrayGet(raw(xs), i)
     fun set(xs, i, x) = Prim.arraySet(raw(xs), i, x)
 }

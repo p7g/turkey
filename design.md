@@ -704,13 +704,13 @@ class operations:
 
 | Syntax | Type | Notes |
 |---|---|---|
-| `container[key]` | `[Index c] (c, Index.IndexKey c) -> Index.IndexItem c` | `get`; implementation may bounds-check |
-| `container[key] = e` | `[Index c] (c, Index.IndexKey c, Index.IndexItem c) -> Unit` | `set` |
+| `container[key]` | `[Index c] (c, Index.Key c) -> Index.Value c` | `get`; implementation may bounds-check |
+| `container[key] = e` | `[Index c] (c, Index.Key c, Index.Value c) -> Unit` | `set` |
 | `len(container)` | `[Length c] c -> Int` | logical length |
 | `[]` | `Array α` | empty literal, α fresh |
 | `[e₁, ..., eₙ]` | `Array τ` | literal with n elements |
 
-`Index` has associated families `IndexKey` and `IndexItem`. User-defined
+`Index` has associated families `Key` and `Value`. User-defined
 containers may implement `Index` and `Length`, and the same syntax then works
 without compiler changes.
 

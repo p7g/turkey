@@ -67,11 +67,11 @@ class Iterator c {
 }
 
 class Index c {
-    type IndexKey c
-    type IndexItem c
+    type Key c
+    type Value c
 
-    fun get(c, IndexKey c) -> IndexItem c
-    fun set(c, IndexKey c, IndexItem c) -> Unit
+    fun get(c, Key c) -> Value c
+    fun set(c, Key c, Value c) -> Unit
 }
 
 class Length c { fun len(c) -> Int }

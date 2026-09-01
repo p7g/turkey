@@ -96,8 +96,8 @@ def test_user_defined_index_and_length_instances_work_together():
 type Box = Box { values : Array Int }
 
 instance Index Box {
-    type IndexKey = Int
-    type IndexItem = Int
+    type Key = Int
+    type Value = Int
     fun get(box, i) = box.values[i]
     fun set(box, i, x) { box.values[i] = x }
 }

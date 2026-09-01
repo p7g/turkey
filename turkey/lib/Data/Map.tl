@@ -1,10 +1,25 @@
-module Data.Map (Map, new, get, put, delete)
+module Data.Map (
+    Map,
+    new,
+    get,
+    put,
+    delete,
+    contains,
+    getOr,
+    update,
+    keys,
+    values,
+    entries,
+    MapCursor,
+)
 
 import Prelude ()
 import Algorithm.Hash (fnv1a)
 import Data.Int as Int
 import Data.Bool (Bool(..))
 import Data.Float ()
+import Data.Array as Array
+import Data.Array (Array)
 import Data.Option (Option(..))
 import Data.String ()
 import Std.Classes
@@ -198,6 +213,56 @@ fun resize(m) {
     }
 }
 
+-- -- asking, without committing to an answer -----------------------------------
+--
+-- `m[key]` is the `Index` method and panics on a missing key; `get` answers an
+-- `Option`. These are the three shapes built on `get` that every caller was
+-- otherwise writing out by hand.
+
+fun contains[Hash k](m : Map k v, key : k) -> Bool = match get(m, key) {
+    Some(_) -> True
+    None -> False
+}
+
+-- The default is evaluated whether or not it is used: arguments are strict and
+-- left to right (design.md 6.1), and nothing here can change that. A default
+-- that is expensive to build belongs behind a `match` on `get`.
+fun getOr[Hash k](m : Map k v, key : k, fallback : v) -> v = match get(m, key) {
+    Some(found) -> found
+    None -> fallback
+}
+
+-- Read, modify, write, in one place. `update(counts, word, 0, fun(n) = n + 1)`
+-- is the frequency count that is otherwise four lines and two lookups.
+fun update[Hash k](m : Map k v, key : k, initial : v, f : fun(v) -> v) -> Unit =
+    put(m, key, f(getOr(m, key, initial)))
+
+-- -- reading the whole thing out ------------------------------------------------
+--
+-- In insertion order, which is what iteration already promises: the buckets are
+-- on a doubly-linked list threaded in insertion order, and nothing here sorts
+-- or rehashes. That the order is a property of the structure rather than of the
+-- hash is what lets a program's output be reproducible -- which M26's
+-- byte-identical comparison of two compilers' output requires.
+
+fun keys(m : Map k v) -> Array k {
+    let out = Array.new(len(m))
+    for (key, _value) in m { Array.push(out, key) }
+    out
+}
+
+fun values(m : Map k v) -> Array v {
+    let out = Array.new(len(m))
+    for (_key, value) in m { Array.push(out, value) }
+    out
+}
+
+fun entries(m : Map k v) -> Array (k, v) {
+    let out = Array.new(len(m))
+    for pair in m { Array.push(out, pair) }
+    out
+}
+
 instance Index (Map k v) : Hash k {
     type Key = k
     type Value = v
@@ -216,6 +281,12 @@ instance Length (Map k v) {
     fun len(m) = m.size
 }
 
+-- Exported, and not by choice. A wrapper type such as `Data.Set` has to name
+-- this in its own `Iterator` instance: an instance's associated family may be
+-- defined as a family applied to a *variable* of the instance head, but not to
+-- a concrete type, so `type Cursor = Cursor (Map a Unit)` is rejected and the
+-- underlying cursor type has to be nameable instead. The restriction is what
+-- makes family reduction terminate, so the export is the cheaper side.
 type MapCursor k v = MapCursor { bucket : Option (Bucket k v) }
 
 instance Iterator (Map k v) {

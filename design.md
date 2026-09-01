@@ -820,7 +820,19 @@ module Data.Ordering -- the three-way comparison result
 module Data.String   -- UTF-8 views, search and split, `Builder`, interchange
 module Data.Bool    -- logical functions
 module Data.List    -- list operations (immutable lists via ADT)
+module Data.Set      -- a set, over `Map k Unit`
+module System.Env    -- `args` and `exit`
+module System.IO     -- `readFile`, `writeFile`, `stderr`
 ```
+
+`System.IO` and `System.Env` are the whole of a program's contact with anything
+outside itself, and are deliberately small: each operation has to exist in
+every backend's runtime. Files are read and written as bytes, so `readFile`
+answers `Option String` -- the validating constructor of 8.1 is what stands
+between a file and a `String`, rather than something hidden inside a read.
+`main` keeps the type `fun() -> Unit`; a program chooses a status with
+`System.Env.exit`, which diverges. `System.Env.args` excludes the program's own
+name, so element zero is its first real argument (SPEC-DELTAS.md 58).
 
 ---
 

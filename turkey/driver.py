@@ -20,10 +20,11 @@ unique after resolution, so there is nothing left for a second one to separate.
 from __future__ import annotations
 
 import sys
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import ast, coretc, desugar, joins, lower, mono, opt, pygen
+from . import ast, builtins, coretc, desugar, joins, lower, mono, opt, pygen
 from .builtins import initial_type_env
 from .classes import ClassTable
 from .constraints import Env, Solver
@@ -163,15 +164,71 @@ def _signatures(entry: Module, env: Env,
     return out
 
 
-def run(src: str, filename: str = "<input>") -> None:
+# A Turkey program's recursion depth is its own business, and CPython's is not
+# a fact about the language. The default 1000 frames is reached by an ordinary
+# recursive walk over a few hundred nodes -- which is to say, by any compiler
+# reading a source file of any size (plan.txt item 9). The generated program
+# therefore runs on a thread of its own with a large stack.
+#
+# This is not a workaround that gets thrown away: the C backend's answer is the
+# same shape, a pthread with an explicit stack size, because a native program
+# has exactly the same problem and exactly the same fix.
+STACK_BYTES = 512 * 1024 * 1024
+RECURSION_LIMIT = 200_000
+
+
+def run_deep(thunk):
+    """Run `thunk` with room to recurse, and re-raise what it raised.
+
+    A thread's exception does not reach its parent, so it is caught and
+    carried across by hand. `SystemExit` is carried too -- `Prim.exit` is a
+    primitive, so a program's chosen status has to survive the trip.
+    """
+    box: list = []
+
+    def body() -> None:
+        previous = sys.getrecursionlimit()
+        sys.setrecursionlimit(max(previous, RECURSION_LIMIT))
+        try:
+            thunk()
+        except BaseException as exc:  # re-raised on the caller's thread below
+            box.append(exc)
+        finally:
+            sys.setrecursionlimit(previous)
+
+    previous_size = threading.stack_size()
+    try:
+        threading.stack_size(STACK_BYTES)
+    except (ValueError, RuntimeError):
+        # A host that will not grow a thread stack still runs the program;
+        # it just runs it with whatever depth it has.
+        pass
+    try:
+        worker = threading.Thread(target=body, name="turkey")
+        worker.start()
+        worker.join()
+    finally:
+        threading.stack_size(previous_size)
+    if box:
+        raise box[0]
+
+
+def run(src: str, filename: str = "<input>", args: list[str] | None = None) -> None:
     search = [Path(filename).resolve().parent] if filename != "<input>" else None
     checked = check(src, None if filename == "<input>" else filename, search)
     report_warnings(checked.warnings, filename)
+    # What the program will see through `Prim.args`: its own arguments, with
+    # neither the interpreter nor the file name in front of them. The C backend
+    # hands over `argv + 1`, so the two hosts agree on element zero -- which
+    # M26's stage2/stage3 comparison needs, since the compiler reads its own
+    # arguments to decide what to write.
+    builtins.set_args(args or [])
     # The *optimized* Core is compiled to Python and run (M17).  The old
     # evaluator remains a differential oracle in the tests, but keeping it on
     # this path would hide code-generator bugs and make the optimizer's payoff
     # unmeasurable.
-    pygen.execute(checked.opt, checked.decls, checked.main, filename)
+    run_deep(lambda: pygen.execute(
+        checked.opt, checked.decls, checked.main, filename))
 
 
 def report_warnings(warnings: list[str], filename: str) -> None:
@@ -179,4 +236,5 @@ def report_warnings(warnings: list[str], filename: str) -> None:
         print(f"{filename}:{short(warning)}", file=sys.stderr)
 
 
-__all__ = ["Checked", "ENTRY", "check", "run", "report_warnings"]
+__all__ = ["Checked", "ENTRY", "check", "run", "run_deep",
+           "report_warnings"]

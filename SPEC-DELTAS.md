@@ -2529,3 +2529,106 @@ makes newly visible: `show(["a,b"])` and `show(["a", "b"])` are
 indistinguishable. That is the `Display`/`Debug` split the class hierarchy
 does not have, and it is left for later rather than fixed by quoting, which
 would make `print` worse.
+
+---
+
+### 58. A program can reach outside itself, and a string can be taken apart
+
+design.md 8.1 and 8.4; PRIMITIVES.md 4.3.
+
+**The language had three I/O operations and no way to read a file.**
+`Prim.print`, `Prim.write` and `Prim.error` were the entire surface, so the
+only way to get data into a program was to compile it in as a string literal
+-- which `tests/programs/bf.tl` does, and which is fine for a test and
+impossible for a compiler. Roadmap item 9 is a compiler written in the
+language, and it cannot read its own source.
+
+Six primitives close that, and the count is the point: every one of them has
+to be written a second time in the C runtime, so the floor is kept as small as
+it can be.
+
+```
+Prim.args() -> Array String              Prim.stderrWrite(String) -> Unit
+Prim.fileCanRead(String) -> Bool         Prim.exit(Int) -> a
+Prim.readFileBytes(String) -> Array Byte
+Prim.writeFileBytes(String, Array Byte) -> Bool
+```
+
+`System.Env` (`args`, `exit`) and `System.IO` (`readFile`, `writeFile`,
+`stderr`) are the library over them.
+
+**Both file doors speak bytes.** A file is not guaranteed to be well-formed
+UTF-8 and a `String` is, so `readFile` answers `Option String` by running the
+bytes through `String.fromBytes` -- the checked constructor PRIMITIVES.md 4.7
+calls the only door in -- rather than hiding the validation inside the read. A
+program that wants the bytes is therefore not made to go through text to get
+them. Reading splits into a predicate and a total primitive, which is the
+split `Prim.floatCanParse`/`Prim.floatParse` already uses so that the `Option`
+is built where `Some` and `None` are in scope. Writing does not: a failed
+write is ordinary, and unlike a failed read there is no predicate that could
+be asked first without lying about the race, so it answers `Bool`.
+
+**`main` does not move.** It is still `fun() -> Unit`; a program that wants a
+status calls `System.Env.exit`, which diverges. And `args` excludes the
+program's own name -- element zero is the first real argument -- because the C
+backend hands over `argv + 1` and the two hosts have to agree, or a
+self-compiled compiler reads a different command line than the one that built
+it.
+
+**The opaque `String.Index` has shipped**, which PRIMITIVES.md 4.3 deferred
+"until something genuinely needs it". A lexer is that something: the two
+shapes otherwise available are to materialize an `Array Char`, at four bytes
+per code point and an allocation per file, or to drive the `CodePoints` view,
+which cannot look ahead and cannot say where a token started.
+
+```
+type Index                                  -- opaque
+start(s) / end(s) -> Index
+step(s, i)   -> Option (Char, Index)        -- decode and advance
+decode(s, i) -> Option Char                 -- decode without moving
+atEnd(s, i)  -> Bool
+slice(s, from, to) -> String
+find(s, needle, from) -> Option Index
+```
+
+The invariant holds by construction and not by checking: an `Index` comes only
+from those four, there is no arithmetic on one, and so `slice` has nothing to
+validate and cannot cut a character in half. That is why a public `find` is
+shippable now and was not before -- what made it unshippable was that its only
+useful return was an `Int` offset, and an `Index` is not one. An `Index`
+belongs to the string it came from; using one with another string is not
+caught, for the same reason an `Iterator`'s `Cursor` is not.
+
+**The rest of the floor**, all of it ordinary library source: `Int.parse`,
+whose accumulator runs *negative* so that `minValue()` -- whose magnitude is
+one past `maxValue()` -- can be parsed at all, and which is written against
+bytes rather than `Data.Char` because `Data.Char` already depends on
+`Data.Int` and the import graph is a DAG; ASCII classification on `Data.Char`,
+named for the range it answers over, since an `isDigit` that quietly meant
+`Nd` would feed Devanagari digits to a parser that knows ten of them;
+`Data.Array`'s `at` (`get` belongs to the `Index` class, whose method must
+answer the element rather than an `Option` of it), `last`, `swap`, `slice`,
+`indexOf`, `contains`, and a *stable* merge `sort`, stable because a sort
+whose result depends on how the input was arranged makes a golden file a coin
+toss; `Data.Map`'s `contains`, `getOr`, `update`, `keys`, `values`,
+`entries`; `Data.Set` over `Map k Unit`, a wrapper rather than a second hash
+table because `Unit` is zero-sized and there was no second implementation
+worth having; and `String.lines`/`words`, which are not `split` -- a file that
+ends in a newline has no empty line after it, and two spaces separate two
+words rather than fencing an empty one between them.
+
+**And the recursion limit, which was a cap and not a detail.** Nothing called
+`setrecursionlimit`, so a program could recurse a thousand frames -- passed by
+an ordinary walk over a few hundred AST nodes. The generated program now runs
+on a thread with a 512 MiB stack. CPython's default is a fact about the host,
+not about the language, and the C backend's answer is the same shape.
+
+**One papercut found, and it is the kind item 9 exists to find.** An
+instance's associated family may be defined as a family applied to a
+*variable* of the instance head, but not to a concrete type -- the restriction
+that makes family reduction terminate. So a wrapper type cannot reuse its
+inner type's cursor abstractly: `Data.Set`'s `Iterator` instance cannot write
+`type Cursor = Cursor (Map a Unit)`, and `Data.Map` has to export `MapCursor`
+for it to name instead. Exporting the cursor is much the cheaper side of that
+trade, but it is a real cost of the design, and it was found by writing the
+second program that ever wrapped a container.

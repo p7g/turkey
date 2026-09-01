@@ -186,7 +186,7 @@ def test_a_context_reaching_the_type_through_a_family_is_accepted():
     src = """
     fun describe[Iterator a, Show (Item a)](xs : a) -> Int {
         var n = 0
-        for x in xs { n = n + String.length(show(x)) }
+        for x in xs { n = n + String.byteLength(show(x)) }
         n
     }
     """

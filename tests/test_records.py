@@ -221,7 +221,7 @@ def test_a_let_inside_a_function_still_refuses_assignment():
 
 def test_a_parameter_is_still_monomorphic():
     """Mutability is about the binding form, not the type; `CDef` is unchanged."""
-    assert fails("fun f(g) -> Int = g(1) + String.length(g(\"s\"))") != ""
+    assert fails("fun f(g) -> Int = g(1) + String.byteLength(g(\"s\"))") != ""
 
 
 # -- M9.4: `Bool` is a declared type ----------------------------------------

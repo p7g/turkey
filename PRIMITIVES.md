@@ -1,6 +1,13 @@
 # Primitive type semantics
 
-Status: proposal
+Status: implemented, except where a section says otherwise. `design.md` §8.1
+carries the summary and SPEC-DELTAS.md 57 records what changed; this document
+stays as the reasoning behind each decision.
+
+Not yet done, and called out again at the end of each section that owns it:
+packed `Array Byte` layout, the opaque `String.Index`, everything in
+`Data.Unicode` (normalization, collation, case mapping, graphemes), and the
+`Show`/`Debug` split.
 
 `design.md` §8.1 defines the primitives in six table rows -- "machine
 integer", "floating-point", "UTF-8", "single Unicode codepoint". None of
@@ -308,9 +315,10 @@ slots in beside the others without changing the shape of anything, and a
 grapheme view *cannot* be an `Array` of a primitive anyway, since a grapheme
 cluster is a substring.
 
-`Data.String.fromChars` -- currently a `+`-in-a-loop, O(n^2) -- becomes a
-builder over `Array Byte`. Add `Data.String.Builder` and use it for `join`
-too.
+`Data.String.fromChars` -- a `+`-in-a-loop, O(n^2) -- becomes a builder. It
+shipped as `fromCodePoints`, over a `String.Builder` that collects the pieces
+in an `Array String` and joins them once through a new
+`Prim.stringConcatAll`; `join` and `repeat` are written on the same builder.
 
 ### 4.3 Cutting strings without indices
 
@@ -322,10 +330,18 @@ Something has to be able to take a string apart. Two shapes are available:
 2. A search-and-split API with no index type at all.
 
 **Ship (2) first**: `split`, `splitOnce`, `startsWith`, `endsWith`,
-`contains`, `find -> Option`, `stripPrefix`, `stripSuffix`, `trim`,
+`contains`, `stripPrefix`, `stripSuffix`, `replace`, `repeat`, `trim`,
 `trimStart`, `trimEnd`. It covers the overwhelming majority of real string
 handling and costs no new type. Add the opaque `String.Index` when something
-genuinely needs it.
+genuinely needs it. (A public `find` is deliberately not in that list: its
+only useful return *is* an offset.)
+
+`startsWith` and `endsWith` are the search, not a slice-and-compare. Cutting
+a prefix of the needle's byte length would split a multi-byte character in
+half -- `startsWith("é", "a")` asks for one byte of a two-byte character --
+and `Prim.stringSlice` panics on a non-boundary offset rather than inventing
+a replacement character. The search cannot make that mistake, because a
+well-formed needle only ever matches at a boundary.
 
 What must **not** happen in the interim is exposing raw byte offsets as
 `Int`, because that is the one decision that cannot be taken back: once a
@@ -461,6 +477,17 @@ which is worse), or the class splits. Recording it so the next person does
 not rediscover it.
 
 ### 7.2 The `Prim.` floor changes
+
+The list below is what was planned; what shipped differs in two places.
+`Prim.stringDecodeAt` returns just the `Char` and `Prim.stringNextIndex`
+gives the following offset, rather than one primitive returning a pair — two
+primitives were cheaper than plumbing a tuple `ConValue` through
+`builtins.py`. And several `Option`-returning conversions are split into a
+predicate plus a total primitive (`Prim.floatCanParse` + `Prim.floatParse`,
+`Prim.charIsScalar` + `Prim.charFromInt`, `Prim.stringIsValidUtf8` +
+`Prim.stringFromBytes`), so that the `Option` is built in the library where
+`Some`/`None` are already in scope. `Prim.stringConcatAll` was added for the
+builder.
 
 Removed: `Prim.stringLength`, `Prim.stringChars`.
 Changed: `Prim.charFromInt` (reject surrogates), `Prim.floatDiv` (no panic),

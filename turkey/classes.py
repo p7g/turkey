@@ -426,7 +426,7 @@ class ClassTable:
         # (`Data.Bool.Type` -> `Data.Bool`) as well as types declared directly.
         head_facade = head_module.rpartition(".")[0]
         builtin_home = {
-            "Int": "Data.Int", "Float": "Data.Float",
+            "Int": "Data.Int", "Byte": "Data.Byte", "Float": "Data.Float",
             "String": "Data.String", "Char": "Data.Char",
         }.get(inst.con)
         tuple_home = "Data.Tuple" if inst.con.startswith("Tuple") else None

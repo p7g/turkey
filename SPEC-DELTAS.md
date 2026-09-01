@@ -2421,3 +2421,111 @@ a type variable used in a declaration body must occur in that declaration's
 parameter list. Constructor-only variables are rejected with a source error;
 declared but unused phantom parameters remain valid, and existential types are
 still outside the language.
+
+---
+
+### 57. The primitives get a semantics of their own, and `Byte` joins them
+
+§8.1 defined the primitives in six table rows -- "machine integer",
+"floating-point", "UTF-8", "single Unicode codepoint" -- none of which is a
+semantics. What the implementation did was whatever Python did, so the
+language promised an unbounded `Int` (`INTEGRAL_WIDTHS` said `None`), a
+`Float` whose `/` panicked on zero, a `String` that was a code-point sequence
+rather than UTF-8, a `Char` that could hold a surrogate, and a `Show Float`
+that printed `inf` and `nan` because `repr` does. `PRIMITIVES.md` writes each
+one down independently of the host; this entry records what changed.
+
+**`Int` is two's-complement 64-bit and traps.** `+`, `-`, `*` and unary `-`
+panic on overflow, as does `minInt / -1`; `INTEGRAL_WIDTHS["Int"]` is now
+`64`, so an out-of-range literal empties its own `OneOf` set and is rejected
+where it is written. Trapping rather than wrapping is the choice the language
+had already made everywhere else -- `/` by zero panicked, array indexing
+panicked -- and wrapping is recoverable from trapping while the reverse is
+not. `Data.Int` gains `addWrapping`/`subWrapping`/`mulWrapping`/`negWrapping`,
+the `Option`-returning checked forms, floored `mod`, the bitwise functions,
+and `shl`/`shr` that panic outside `0..63` rather than masking. It also gains
+`minValue()`, because `-9223372036854775808` cannot be *written*: it lexes as
+a negation applied to a literal that is itself out of range.
+
+The wrapping forms are not a convenience. `Algorithm.Hash` computed
+`h * 33 + x` and masked back to 32 bits *after* the multiply, which was never
+a statement about hash quality -- it was the only way to keep an unbounded
+`Int` from growing without limit. It is replaced by 64-bit FNV-1a over the
+explicit wrapping primitives. `Data.Map` follows: a signed hash is negative
+half the time and `%` takes the sign of the dividend, so bucket selection
+moves to `Int.mod`.
+
+**`Byte` is a new primitive**, unsigned 8-bit, with `Eq`/`Ord`/`Show`/`Hash`,
+conversions, bitwise functions -- and deliberately **no arithmetic instances
+at all**. Byte arithmetic goes through `Int`, which sidesteps the whole "does
+`u8 + u8` wrap, trap, or promote" question; adding instances later is
+backward-compatible, removing them would not be. It is not a member of the
+numeric literal tower, because there is no `Byte` numeral, only
+`Byte.fromInt`. It exists to be the element of `Array Byte`, which is what
+`String.toBytes` and `String.fromBytes` speak.
+
+**`Float` is IEEE 754 binary64, so `/` stops panicking.** `1.0 / 0.0` is
+`Infinity` and `0.0 / 0.0` is `NaN`; the old zero check in `_float_div` was
+the largest single departure from the standard in the implementation. There
+is no `Rem Float` -- C's `fmod` and IEEE's `remainder` disagree and neither
+deserves the operator, so both are spelled out in `Data.Float`.
+
+The NaN consequences are written down rather than discovered. `instance Ord
+Float` now overrides all four methods: inheriting the class defaults derived
+`gte(x, y)` as `!lt(x, y)`, which made `gte(NaN, 1.0)` **true** while
+`lte(NaN, 1.0)` was false -- neither IEEE nor anything else. That leaves
+`Eq Float`/`Ord Float` as the one pair of instances in the language that does
+not satisfy its class's laws (`Eq` is not reflexive, `Ord` is not total),
+because there is one `Ord` and no `PartialOrd` split to put the distinction
+in. So: sorting a `Float` array containing NaN is safe but unspecified, a new
+prelude `Ordering` type and `Float.totalCompare` (IEEE `totalOrder`) exist for
+code that must not misbehave, and there is **no `Hash Float`** -- a
+non-reflexive key can be inserted into a `Map` and never found again, and
+refusing the instance makes that a type error. `Float.bits` is the visible
+opt-in for anyone who really wants it.
+
+`Show Float` is specified rather than inherited: shortest round-tripping
+digits, always a `.` or an exponent, and `Infinity`/`-Infinity`/`NaN` for the
+specials. To make the round trip real, `FLOAT` gains exponent syntax after
+the fractional part (`1.0e+16`), and `Float.parse` accepts what `show`
+produces -- including the two spellings that have no literal form.
+
+**`String` is an immutable, well-formed UTF-8 byte sequence.** `String.length`
+and `instance Length String` are gone: they were Python's code-point count
+under a name that promised one answer to a three-answer question. In their
+place, O(1) `byteLength`, `isEmpty`, and an explicitly O(n) `codePointCount`.
+`Prim.stringLength` and `Prim.stringChars` are removed from the floor and
+replaced by byte addressing (`stringByteLength`, `stringByteAt`,
+`stringDecodeAt`, `stringNextIndex`, `stringSlice`, `stringFind`) plus
+`stringConcatAll`; `Data.String.chars` becomes the lazy `bytes` and
+`codePoints` iterator views, which is what leaves room for `graphemes`.
+`fromChars` and `join` were quadratic and are now a `Builder` over one
+`concatAll`. The search-and-split API (`split`, `splitOnce`, `startsWith`,
+`endsWith`, `contains`, `stripPrefix`, `stripSuffix`, `trim`) ships instead of
+an index type, and **no byte offset reaches the surface language** -- that is
+the one decision that cannot be taken back, since a program that can compute
+an offset forces `slice` to either validate or admit ill-formed strings.
+Equality is byte equality and normalizes nothing; ordering is
+byte-lexicographic and is not a collation.
+
+**`Char` is a Unicode scalar value**, not a code point: `D800..DFFF` is
+excluded, which is what makes the `String` invariant enforceable.
+`Prim.charFromInt` accepted surrogates -- `chr(0xD800)` succeeded -- and now
+rejects them, and `Char.fromInt` returns `Option Char`. There is no
+`Char.toUpper`, and there will not be: case mapping is not a per-scalar-value
+function.
+
+The lexer enforces the same invariant at the source level. `\uXXXX` becomes
+`\u{H...H}` with one to six digits, since four cannot reach past the BMP, and
+an escape naming a surrogate or a value above `10FFFF` is a lex error. There
+is no `\xNN`, because a raw byte escape can produce text that is not UTF-8.
+
+Two implementation notes. The evaluator still holds a Python `str` for a
+`String`; that is isomorphic to well-formed UTF-8 once surrogates are
+excluded, and every primitive is defined over the *encoding* (memoized, so
+iteration stays linear), so no operation can observe Python's code-point
+indexing. And `Show String` remains the identity, which nailing `String` down
+makes newly visible: `show(["a,b"])` and `show(["a", "b"])` are
+indistinguishable. That is the `Display`/`Debug` split the class hierarchy
+does not have, and it is left for later rather than fixed by quoting, which
+would make `print` worse.

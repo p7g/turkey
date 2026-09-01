@@ -57,7 +57,7 @@ fun run[Iterator s, Item s ~ Op](tape : Tape, ops : s) -> Unit {
         match op {
             Inc(n) -> inc(tape, n)
             Move(n) -> move(tape, n)
-            Print -> write(Char.fromInt(get(tape)))
+            Print -> write(Option.unwrapOr(Char.fromInt(get(tape)), '?'))
             Loop(loopOps) -> {
                 while get(tape) != 0 {
                     run(tape, loopOps)
@@ -70,8 +70,16 @@ fun run[Iterator s, Item s ~ Op](tape : Tape, ops : s) -> Unit {
 let hello = "++++++++[>++++[>++>+++>+++>+<<<<-]>+>->+>>+[<]<-]>>.>>---.+++++++..+++.>.<<-.>.+++.------.--------.>+.>++."
 let bench = ">++[<+++++++++++++>-]<[[>+>+<<-]>[<+>-]++++++++[>++++++++<-]>.[-]<<>++++++++++[>++++++++++[>++++++++++[>++++++++++[>++++++++++[>++++++++++[>++++++++++[-]<-]<-]<-]<-]<-]<-]<-]++++++++++."
 
+-- `String.codePoints` is a lazy view; the parser indexes, so it wants an
+-- array and says so.
+fun collect(s : String) -> Array Char {
+    let out = Array.new(String.byteLength(s))
+    for c in String.codePoints(s) { Array.push(out, c) }
+    out
+}
+
 fun main() {
-    let source = String.chars(hello)
+    let source = collect(hello)
     let (ops, _) = parse(source, 0)
     let tape = newTape()
     run(tape, ops)

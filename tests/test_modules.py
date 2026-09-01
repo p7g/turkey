@@ -333,7 +333,7 @@ fun main() {
 
 
 def test_the_library_is_reachable_without_an_import(tmp_path):
-    src = ('fun f(s : String) -> Int = String.length(s)\n'
+    src = ('fun f(s : String) -> Int = String.byteLength(s)\n'
            'fun g(n : Int) -> String = Int.toString(n)\n'
            'fun h(c : Char) -> Int = Char.toInt(c)\n'
            'fun i(b : Bool) -> String = Bool.toString(b)\n'

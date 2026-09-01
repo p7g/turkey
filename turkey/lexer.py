@@ -13,6 +13,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .errors import LexError, Span
+from .types import is_scalar_value
+
+HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
 KEYWORDS = frozenset(
     """type class instance fun let var match if else while for in loop return
@@ -182,19 +185,63 @@ class Lexer:
             self._advance()
             while self._peek().isdigit():
                 self._advance()
+            # An exponent, and only after a fractional part: `1e10` stays two
+            # tokens, so the rule that a numeral needs a `.` to be a `Float` is
+            # unchanged. What this buys is round-tripping -- `show` on a large
+            # `Float` has to print an exponent, and without this the string it
+            # produced would not lex back (PRIMITIVES.md 3.3).
+            if self._peek() in "eE" and (
+                self._peek(1).isdigit()
+                or (self._peek(1) in "+-" and self._peek(2).isdigit())
+            ):
+                self._advance(2 if self._peek(1) in "+-" else 1)
+                while self._peek().isdigit():
+                    self._advance()
             return Token("FLOAT", float(self.src[start : self.pos]), span)
         return Token("INT", int(self.src[start : self.pos]), span)
 
     def _lex_escape(self, quote: str) -> str:
+        """One escape sequence, as a single Unicode scalar value.
+
+        `\\u{H...H}` takes one to six hex digits, replacing the old
+        `\\uXXXX`: four digits cannot reach past the BMP, so `"\\u{1F600}"`
+        was simply unwritable. There is deliberately no `\\xNN`, because a
+        raw byte escape can produce text that is not UTF-8, and the escape
+        must not be able to name a surrogate for the same reason -- together
+        those two rules are what make "a string literal is well-formed UTF-8"
+        true by construction (PRIMITIVES.md 4.6).
+        """
         span = self._span()
         self._advance()  # the backslash
         ch = self._advance()
         if ch == "u":
-            digits = self.src[self.pos : self.pos + 4]
-            if len(digits) != 4 or any(d not in "0123456789abcdefABCDEF" for d in digits):
-                raise LexError("\\u escape needs exactly four hex digits", span)
-            self._advance(4)
-            return chr(int(digits, 16))
+            if self._peek() != "{":
+                raise LexError(
+                    "\\u escape must be written \\u{...}, with one to six hex "
+                    "digits in the braces",
+                    span,
+                )
+            self._advance()
+            start = self.pos
+            while self._peek() in HEX_DIGITS:
+                self._advance()
+            digits = self.src[start : self.pos]
+            if not 1 <= len(digits) <= 6 or self._peek() != "}":
+                raise LexError(
+                    "\\u escape must be written \\u{...}, with one to six hex "
+                    "digits in the braces",
+                    span,
+                )
+            self._advance()  # the closing brace
+            code = int(digits, 16)
+            if not is_scalar_value(code):
+                raise LexError(
+                    f"\\u{{{digits}}} is not a Unicode scalar value: "
+                    f"{'the surrogates D800..DFFF are' if code <= 0xDFFF else 'values above 10FFFF are'}"
+                    " not characters, and a string may not contain one",
+                    span,
+                )
+            return chr(code)
         if ch in STRING_ESCAPES:
             return STRING_ESCAPES[ch]
         raise LexError(f"unknown escape sequence '\\{ch}'", span)

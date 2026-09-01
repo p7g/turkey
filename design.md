@@ -30,8 +30,8 @@ A minimal procedural programming language with an ML-style type system and Hindl
 IDENT    ← [a-z_][A-Za-z0-9_']*
 CONID    ← [A-Z][A-Za-z0-9_']*
 INT      ← [0-9]+
-FLOAT    ← [0-9]+\.[0-9]+
-STRING   ← "..."   (escapes: \n \t \\ \" \uXXXX)
+FLOAT    ← [0-9]+\.[0-9]+([eE][+-]?[0-9]+)?
+STRING   ← "..."   (escapes: \n \t \r \0 \\ \" \' \u{H...H})
 CHAR     ← '...'
 ```
 
@@ -48,6 +48,17 @@ CHAR     ← '...'
 
 `?` is a postfix operator (§6.9), so it can end a statement — §2.4's preceding
 condition includes it.
+
+An exponent is only recognized after a fractional part, so `1e10` is still two
+tokens and a numeral still needs a `.` to be a `Float`. What the exponent buys
+is round-tripping: `show` on a large `Float` has to print one, and the string
+it produces must lex back.
+
+`\u{H...H}` takes one to six hex digits — four could not reach past the BMP,
+so `"\u{1F600}"` was previously unwritable. An escape naming a surrogate
+(`D800..DFFF`) or a value above `10FFFF` is a lex error, and there is no
+`\xNN`; together those two rules make "a string literal is well-formed UTF-8"
+true by construction.
 
 ### 2.2 Comments
 
@@ -346,7 +357,7 @@ An expression is **non-expansive** iff:
 | Multi-variant ADT (`type T = A \| B ...`) | ✗ | immutable; value or immutable reference |
 | Positional single-variant ADT (`type T = T a b`) | ✗ | immutable |
 | `Array a` | ✓ | reference type; elements and fields mutable |
-| Primitives (`Int`, `Float`, `String`, `Char`, `Unit`) | ✗ | immutable |
+| Primitives (`Int`, `Byte`, `Float`, `String`, `Char`, `Unit`) | ✗ | immutable |
 
 Field access `r.f` and field mutation `r.f = e` are only well-typed when the static type of `r` is a single-variant record type or `Array a`.
 
@@ -624,12 +635,59 @@ Records (constructor payload using `{ ... }`) are only mutable when the data typ
 
 | Type | Values | Notes |
 |---|---|---|
-| `Int` | `0`, `1`, `-5`, ... | machine integer |
-| `Float` | `0.0`, `3.14`, ... | floating-point |
-| `String` | `"hello"`, ... | UTF-8 |
-| `Char` | `'a'`, `'\n'`, ... | single Unicode codepoint |
+| `Int` | `0`, `1`, `-5`, ... | two's-complement signed 64-bit; arithmetic **traps** on overflow |
+| `Byte` | `Byte.fromInt(200)` | unsigned 8-bit; no literal syntax, and no arithmetic instances |
+| `Float` | `0.0`, `3.14`, `1.0e16` | IEEE 754 binary64, roundTiesToEven |
+| `String` | `"hello"`, ... | an immutable, well-formed **UTF-8 byte sequence**; no indexing, no `length` |
+| `Char` | `'a'`, `'\n'`, ... | a Unicode **scalar value**: `0..10FFFF` excluding the surrogates `D800..DFFF` |
 | `Bool` | `True`, `False` | declared in the prelude as `type Bool = False \| True`, not built in |
 | `Unit` | `()` | singleton type |
+
+`PRIMITIVES.md` is the full semantics; what follows is the part that changes
+how ordinary code reads.
+
+**`Int` traps.** `+`, `-`, `*` and unary `-` panic when the result leaves
+`-2^63 .. 2^63-1`, the way `/` by zero already panicked. An integer literal
+outside that range is a compile error rather than a wraparound. `Data.Int`
+carries the escape hatches — `addWrapping`, `addChecked : ... -> Option Int`,
+the bitwise functions, and `minValue()`, which exists because
+`-9223372036854775808` cannot be *written* (it lexes as a negation of a
+literal that is itself out of range). `%` is remainder and takes the sign of
+the dividend; `Int.mod` is the floored one, and is what a bucket index wants.
+
+**`Float` is IEEE, NaN included.** `1.0 / 0.0` is `Infinity`, not a panic.
+`==`, `<`, `<=`, `>`, `>=` are the IEEE predicates, so every comparison
+involving NaN is false and `NaN != NaN` is true. This makes `Eq Float` and
+`Ord Float` the one pair of instances in the language that does not satisfy
+its class's laws — `Eq` is not reflexive and `Ord` is not total — because
+there is one `Ord` and no `PartialOrd` to put the distinction in. Sorting a
+`Float` array containing NaN is therefore *safe but unspecified*: it
+terminates and panics nowhere, and may produce an unsorted result. Code that
+must not misbehave on NaN uses `Float.totalCompare`, which is IEEE 754
+`totalOrder` and returns an `Ordering`. There is deliberately **no
+`Hash Float`**, since a non-reflexive key can be inserted into a `Map` and
+never found again.
+
+**`String` is bytes.** No `s[i]`, no `Length String`, and no `String.length`
+— "how long is this string" has three defensible answers, so the cheap one is
+`String.byteLength` (O(1)) and the usual one is `String.codePointCount`
+(O(n), and spelled out). `String.bytes` and `String.codePoints` are lazy
+iterator views, leaving room for `String.graphemes`. `==` is byte equality
+and performs **no Unicode normalization**, so `"\u{00E9}" != "\u{0065}\u{0301}"`
+even though both render as é; `Ord` is byte-lexicographic, which is not a
+collation. No byte offset reaches the surface language: strings are taken
+apart with `split`, `splitOnce`, `stripPrefix`, `stripSuffix`, `startsWith`,
+`endsWith`, `contains` and `trim`. `String.toBytes` / `String.fromBytes` (which
+validates, returning `Option String`) are the only door in and out, and are
+what `Byte` exists for.
+
+**`Char` is a scalar value, not a code point.** The surrogates are excluded,
+which is what makes the `String` invariant enforceable, so `Char.fromInt`
+returns `Option Char`. A `Char` is *not* a user-perceived character — that is
+a grapheme cluster, which may be several scalar values — so `codePoints` is
+not "the characters". There is no `Char.toUpper`: case mapping is not a
+per-scalar-value function (`ß` uppercases to two characters), so case will
+live on `String` when there is a Unicode table to do it correctly.
 
 ### 8.2 Operators
 
@@ -665,12 +723,13 @@ The classes that ship, and their instances:
 
 | Class | Method | Instances |
 |---|---|---|
-| `Eq` | `eq`, and `ne` by default | `Int` `Float` `String` `Char` `Bool` |
-| `Ord : Eq` | `lt`, and `lte`/`gt`/`gte` by default | `Int` `Float` `String` `Char` `Bool` |
+| `Eq` | `eq`, and `ne` by default | `Int` `Byte` `Float` `String` `Char` `Bool` `Ordering` |
+| `Ord : Eq` | `lt`, and `lte`/`gt`/`gte` by default — except `Float`, which overrides all four | `Int` `Byte` `Float` `String` `Char` `Bool` `Ordering` |
 | `Add` `Sub` `Mul` `Div` | | `Int` `Float` |
 | `Rem` | `rem` | `Int` |
 | `Neg` | `neg` | `Int` `Float` |
-| `Show` | `show` | `Int` `Float` `String` `Char` `Bool`, and `Array a` / `Option a` / `Either l r` given `Show` of the parts |
+| `Show` | `show` | `Int` `Byte` `Float` `String` `Char` `Bool` `Ordering`, and `Array a` / `Option a` / `Either l r` given `Show` of the parts |
+| `Hash : Eq` | `hashInto` | `Int` `Byte` `String` `Char` `Ordering`, and the composites — **not** `Float` |
 | `Iterator` | `iter`, `next`, and the families `Item` and `Cursor` | `Array a` |
 | `Functor` | `map` | `Option` `Either l` `Array` |
 | `Applicative : Functor` | `pure` | `Option` `Either l` `Array` |
@@ -754,8 +813,11 @@ The standard library also provides `Functor`, `Applicative`, `Monad`,
 ### 8.4 Other standard modules (suggested)
 
 ```
-module Data.Int     -- arithmetic, conversion functions
-module Data.String  -- string operations
+module Data.Int      -- arithmetic, wrapping/checked forms, bitwise, `mod`
+module Data.Byte     -- conversions and bitwise; no arithmetic instances
+module Data.Float    -- IEEE 754 binary64: parsing, rounding, `totalCompare`
+module Data.Ordering -- the three-way comparison result
+module Data.String   -- UTF-8 views, search and split, `Builder`, interchange
 module Data.Bool    -- logical functions
 module Data.List    -- list operations (immutable lists via ADT)
 ```

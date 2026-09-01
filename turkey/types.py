@@ -404,6 +404,7 @@ QUALIFY: set[str] = set()
 
 
 INT = TCon("Int")
+BYTE = TCon("Byte")
 FLOAT = TCon("Float")
 STRING = TCon("String")
 CHAR = TCon("Char")
@@ -415,8 +416,28 @@ UNIT = TCon("Unit")
 # the prelude as `type Bool = False | True`, and `BOOL` above still names it
 # because a `TCon` is compared by name (see `TCon.__eq__`), so every builtin
 # written in terms of `BOOL` meets the declared type without knowing it.
-PRIMITIVES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR,
-              "Unit": UNIT}
+PRIMITIVES = {"Int": INT, "Byte": BYTE, "Float": FLOAT, "String": STRING,
+              "Char": CHAR, "Unit": UNIT}
+
+# The ranges the primitives actually have, now that they have some. `Int` is
+# two's-complement 64-bit and `Byte` is unsigned 8-bit on every target; neither
+# is "whatever the host does" (PRIMITIVES.md 1, 2).
+INT_MIN = -(1 << 63)
+INT_MAX = (1 << 63) - 1
+BYTE_MIN = 0
+BYTE_MAX = 255
+
+# A `Char` is a Unicode *scalar value*, not a code point: the surrogate range
+# is excluded, which is what makes "a `String` is well-formed UTF-8" an
+# invariant that no sequence of `Char`s can break (PRIMITIVES.md 5).
+CHAR_MAX = 0x10FFFF
+SURROGATE_MIN = 0xD800
+SURROGATE_MAX = 0xDFFF
+
+
+def is_scalar_value(code: int) -> bool:
+    """Whether `code` is a Unicode scalar value, i.e. a legal `Char`."""
+    return 0 <= code <= CHAR_MAX and not (SURROGATE_MIN <= code <= SURROGATE_MAX)
 
 ARRAY = TCon("Data.Array#Array", KFun(STAR, STAR))
 RAW_ARRAY = TCon("Prim.Array", KFun(STAR, STAR))
@@ -503,17 +524,27 @@ def raw_array_of(element: Type) -> Type:
 # member from source -- so the two tables below are the whole of it.
 #
 # Both are written as tables so that a sized-integer tower drops in by editing
-# them, with no change to the generator or the solver. A width of `None` means
-# unbounded, which is what `Int` is (a Python int); a mantissa is how many bits
+# them, with no change to the generator or the solver. A width is the number of
+# two's-complement bits a type has (`None` would mean unbounded, which nothing
+# is any more); a mantissa is how many bits
 # of significand a float type has, which is what decides whether an integer
-# literal is exactly representable in it.
+# literal is exactly representable in it. `Int`'s width is 64 (PRIMITIVES.md
+# 1.3), so a literal outside two's-complement 64-bit range now empties its own
+# set and is rejected where it is written rather than silently becoming a
+# bignum.
+#
+# `Byte` is deliberately absent from the tower. It is an integral type but not
+# a literal one: there is no `Byte` numeral, only `Byte.fromInt`, so nothing
+# ever needs to default to it (PRIMITIVES.md 2).
 #
 # Order is meaning: defaulting takes the first member of a set in this order,
-# and printing renders a set in it. So `Int` leads the integral types and, once
-# the tower lands and `Float` is renamed, `Double` leads the decimal ones --
-# which is exactly the "integral defaults to Int, decimal defaults to Double"
-# rule, obtained from one mechanism rather than two.
-INTEGRAL_WIDTHS: dict[str, int | None] = {"Int": None}
+# and printing renders a set in it. So `Int` leads the integral types and
+# `Float` the decimal ones -- which is exactly the "integral defaults to Int,
+# decimal defaults to Float" rule, obtained from one mechanism rather than two.
+# `Float` keeps its name for binary64 and a future 32-bit type is `Float32`;
+# the rename to `Double` this comment used to anticipate is not happening
+# (PRIMITIVES.md 3).
+INTEGRAL_WIDTHS: dict[str, int | None] = {"Int": 64}
 DECIMAL_MANTISSAS: dict[str, int] = {"Float": 53}  # f64
 
 

@@ -1,7 +1,8 @@
 module Data.Map (Map, new, get, put, delete)
 
 import Prelude ()
-import Algorithm.Hash (djb2)
+import Algorithm.Hash (fnv1a)
+import Data.Int as Int
 import Data.Bool (Bool(..))
 import Data.Float ()
 import Data.Option (Option(..))
@@ -34,7 +35,7 @@ type Entry k v
     | Active (Bucket k v)
 
 fun hashKey(k) {
-    let d = djb2()
+    let d = fnv1a()
     hashInto(k, d)
     digest(d)
 }
@@ -52,7 +53,11 @@ fun new() -> Map k v {
 }
 
 fun findSlot(m, h, key, isSearching) {
-    var index = h % m.cap
+    -- `Int.mod`, not `%`. A 64-bit hash is signed and half of them are
+    -- negative, and `%` is *remainder*: it takes the sign of the dividend, so
+    -- `h % cap` would be a negative bucket index roughly half the time. This
+    -- is the case PRIMITIVES.md 1.2 says floored `mod` exists for.
+    var index = Int.mod(h, m.cap)
     var firstTombstone = None
 
     loop {
@@ -177,7 +182,7 @@ fun resize(m) {
         match current {
             None -> break
             Some(bucket) -> {
-                var i = bucket.hash % newCap
+                var i = Int.mod(bucket.hash, newCap)
                 loop {
                     match Prim.arrayGet(m.table, i) {
                         Empty -> break

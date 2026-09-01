@@ -47,7 +47,7 @@ from __future__ import annotations
 from . import ast
 from .core import (
     CApp, CArray, CAssign, CCon, CDeref, CExpr, CField,
-    CIf, CIndex, CJoin, CJump, CLam, CLet, CLetRec, CLit, CMatch,
+    CIf, CIndex, CJoin, CJump, CLam, CLet, CLetRec, CLit, CMatch, CProject,
     CPrim, CProgram, CRecord, CRef, CTuple, CTyApp, CTyLam, CUnit,
     CVar,
 )
@@ -196,6 +196,10 @@ class Evaluator:
     def _eval_CField(self, e: CField, env: REnv):
         obj = self.eval(e.target, env)
         return get_field(obj, e.name)
+
+    def _eval_CProject(self, e: CProject, env: REnv):
+        obj = self.eval(e.target, env)
+        return obj[e.index] if isinstance(obj, tuple) else obj.args[e.index]
 
     def _eval_CIndex(self, e: CIndex, env: REnv):
         return self.eval(e.target, env).get(self.eval(e.index, env))

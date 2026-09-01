@@ -415,6 +415,8 @@ class Desugarer:
             return self.expr(e.expr, lambda v: k(ast.EAnnot(e.span, v, e.type_expr)))
         if t is ast.EField:
             return self.expr(e.obj, lambda o: k(ast.EField(e.span, o, e.name)))
+        if t is ast.EProject:
+            return self.expr(e.obj, lambda o: k(ast.EProject(e.span, o, e.index)))
         if t is ast.EIndex:
             return self.expr(e.arr, lambda a: self.expr(
                 e.index, lambda i: k(ast.EIndex(

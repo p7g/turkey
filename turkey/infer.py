@@ -41,7 +41,7 @@ from typing import TypeVar
 from . import ast, prelude
 from .classes import ClassTable, MethodInfo, Skolems
 from .constraints import (
-    HAS_FIELD, ONE_OF, Binding, CAnd, CAssume, CDef, CEq, CExists, CInstance,
+    HAS_FIELD, HAS_PROJECTION, ONE_OF, Binding, CAnd, CAssume, CDef, CEq, CExists, CInstance,
     CBind, CLet, CPred, Constraint, Env, reach,
 )
 from .decls import DeclTable
@@ -51,7 +51,7 @@ from .errors import Span, TypeError_
 from .typed import TypeTable
 from .types import (
     BOOL, BOTTOM, CHAR, FLOAT, INT, STRING, UNIT, Pred, Scheme, TBottom, TFun,
-    TLabel, TSet, TTuple, TVar, Type, apply, array_of, float_literal_set,
+    TIndex, TLabel, TSet, TTuple, TVar, Type, apply, array_of, float_literal_set,
     int_literal_set, show, show_pred, vars_of,
 )
 
@@ -475,7 +475,7 @@ class Generator:
         for match, scrutinee in self.match_sites:
             # Normalized, not merely pruned: the element of a `for ... in` loop
             # is `Item xs`, and a family names a type only once it has reduced.
-            missing = checker.check(match, self.classes.normalize(scrutinee))
+            missing = checker.check(match, self.types.resolve(scrutinee))
             if missing is None:
                 continue
             # A bare `_` witness means the scrutinee's type has too many values
@@ -984,6 +984,15 @@ class Generator:
 
     def _gen_EField(self, e: ast.EField) -> Type:
         return self.gen_field(e, assigning=False)
+
+    def _gen_EProject(self, e: ast.EProject) -> Type:
+        receiver = self.gen_expr(e.obj)
+        result = self.fresh()
+        self.emit(CPred(
+            Pred(HAS_PROJECTION, [TIndex(e.index), receiver, result]),
+            e.span, "read",
+        ))
+        return result
 
     def gen_field(self, e: ast.EField, assigning: bool) -> Type:
         """Emit `HasField "f" r a` for `r.f` and hand back the `a`.

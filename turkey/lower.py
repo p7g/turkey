@@ -71,7 +71,7 @@ from . import ast, core, prelude
 from .classes import ClassTable, InstInfo, match
 from .core import (
     CAlt, CApp, CArray, CAssign, CBind, CCon, CDeref, CExpr,
-    CField, CIf, CIndex, CJoin, CJump, CLam, CLet, CLetRec, CLit,
+    CField, CIf, CIndex, CJoin, CJump, CLam, CLet, CLetRec, CLit, CProject,
     CMatch, CParam, CProgram, CRecord, CRef, CTuple, CTyApp, CTyLam,
     CUnit, CVar, ref_of,
 )
@@ -831,6 +831,9 @@ class Lowerer:
 
     def _lower_EField(self, e: ast.EField, scope: Scope) -> CExpr:
         return CField(self.ty_of(e), e.span, self.expr(e.obj, scope), e.name)
+
+    def _lower_EProject(self, e: ast.EProject, scope: Scope) -> CExpr:
+        return CProject(self.ty_of(e), e.span, self.expr(e.obj, scope), e.index)
 
     def _lower_EIndex(self, e: ast.EIndex, scope: Scope) -> CExpr:
         return CIndex(self.ty_of(e), e.span, self.expr(e.arr, scope),
@@ -1735,6 +1738,8 @@ def _operands(e: ast.Expr) -> list[ast.Expr] | None:
     if isinstance(e, ast.EIndex):
         return [e.arr, e.index]
     if isinstance(e, ast.EField):
+        return [e.obj]
+    if isinstance(e, ast.EProject):
         return [e.obj]
     if isinstance(e, ast.EUnary):
         return [e.operand]

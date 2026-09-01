@@ -124,7 +124,10 @@ class Lexer:
                 self._advance()
                 tokens.append(Token("NEWLINE", ";", span, forced=True))
             elif ch.isdigit():
-                tokens.append(self._lex_number(span))
+                # After a dot, digits are a projection selector. Do not let a
+                # following dot fold the selector and its successor into one
+                # FLOAT: `x.0.1` is two chained projections.
+                tokens.append(self._lex_number(span, allow_float=not tokens or tokens[-1].kind != "."))
             elif ch == '"':
                 tokens.append(self._lex_string(span))
             elif ch == "'":
@@ -169,13 +172,13 @@ class Lexer:
 
     # -- token kinds ------------------------------------------------------
 
-    def _lex_number(self, span: Span) -> Token:
+    def _lex_number(self, span: Span, allow_float: bool = True) -> Token:
         start = self.pos
         while self._peek().isdigit():
             self._advance()
         # FLOAT is `[0-9]+.[0-9]+`: a `.` only continues the number when a digit
         # follows it, so `1.foo` stays an INT followed by a field access.
-        if self._peek() == "." and self._peek(1).isdigit():
+        if allow_float and self._peek() == "." and self._peek(1).isdigit():
             self._advance()
             while self._peek().isdigit():
                 self._advance()

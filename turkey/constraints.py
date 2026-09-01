@@ -83,13 +83,14 @@ from .decls import DeclTable
 from .evidence import Abstraction, Scope, Use, dict_name
 from .errors import Span, TypeError_
 from .types import (
-    EQUALS, INT, NO_SCOPE, Pred, Scheme, TBottom, TCon, TFam, TLabel, TSet, TVar,
+    EQUALS, INT, NO_SCOPE, Pred, Scheme, TBottom, TCon, TFam, TIndex, TLabel, TSet, TTuple, TVar,
     Type,
     generalize, instantiate_qual, mono, numeric_order, numeric_type, prune, show,
     show_pred, sort_numeric, spine, type_key, unify, vars_of,
 )
 
 HAS_FIELD = "HasField"
+HAS_PROJECTION = "HasProjection"
 ONE_OF = "OneOf"
 
 
@@ -653,11 +654,10 @@ class Solver:
         self.improve_families()
         seen: dict[tuple, Type] = {}
         for c in self.deferred:
-            if c.pred.name != HAS_FIELD:
+            if c.pred.name not in (HAS_FIELD, HAS_PROJECTION):
                 continue
-            label, receiver, result = c.pred.args
-            assert isinstance(label, TLabel)
-            key = (label.name, type_key(receiver))
+            selector, receiver, result = c.pred.args
+            key = (c.pred.name, type_key(selector), type_key(receiver))
             if key in seen:
                 unify(seen[key], result, c.span, "a field access", self)
             else:
@@ -698,6 +698,8 @@ class Solver:
             return self._equals(c)
         if c.pred.name == HAS_FIELD:
             return self._has_field(c)
+        if c.pred.name == HAS_PROJECTION:
+            return self._has_projection(c)
         if c.pred.name == ONE_OF:
             return self._one_of(c)
         if self.classes.is_class(c.pred.name):
@@ -806,6 +808,35 @@ class Solver:
             f"and are taken apart with 'match'.",
             c.span,
         )
+
+    def _has_projection(self, c: CPred) -> bool:
+        selector, receiver, result = c.pred.args
+        assert isinstance(selector, TIndex)
+        receiver = self.classes.normalize(receiver)
+        if isinstance(receiver, (TVar, TFam)):
+            return False
+        if isinstance(receiver, TBottom):
+            return True
+        choices: list[Type] | None = None
+        if isinstance(receiver, TTuple):
+            choices = receiver.elems
+        else:
+            choices = self.decls.projection_types(receiver)
+        if choices is None:
+            raise TypeError_(
+                f"cannot project position {selector.value} from '{show(receiver)}': "
+                "numeric projection requires a tuple or an immutable type with "
+                "exactly one positional constructor",
+                c.span,
+            )
+        if selector.value >= len(choices):
+            raise TypeError_(
+                f"projection index {selector.value} is out of bounds for "
+                f"'{show(receiver)}', which has {len(choices)} element(s)",
+                c.span,
+            )
+        unify(result, choices[selector.value], c.span, "a numeric projection", self)
+        return True
 
     def _one_of(self, c: CPred) -> bool:
         """`OneOf t {...}`: `t` must be one of a closed set of built-in types.
@@ -978,6 +1009,13 @@ class Solver:
                 f"cannot determine the type of the value whose field "
                 f"'{label.name}' is being accessed. Add a type annotation.",
                 c.span,
+            )
+        if c.pred.name == HAS_PROJECTION:
+            selector = c.pred.args[0]
+            assert isinstance(selector, TIndex)
+            raise TypeError_(
+                f"cannot determine the type of the value being projected at "
+                f"position {selector.value}. Add a type annotation.", c.span,
             )
         raise TypeError_(
             f"cannot determine a type satisfying '{show_pred(c.pred, free_prefix="")}'. "

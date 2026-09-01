@@ -112,6 +112,11 @@ reads from any record with an `n`. Records stay nominal and there are no rows:
 this is Gaster & Jones's `r \ l` without them, which is decidable here because
 entailment is a declaration lookup (SPEC-DELTAS.md 7).
 
+**Numeric projection is also a predicate.** `x.0` emits
+`HasProjection 0 typeof(x) a`. It works on tuples and immutable types with one
+positional constructor, can travel in an inferred scheme, and is read-only.
+The solver checks the index once the receiver shape is known.
+
 **The newline rule.** §2.4 as written is circular — newlines inside braces are
 "dropped except where the inner grammar uses it as a separator", which a lexer
 cannot decide. It is implemented as a concrete two-sided filter over the token

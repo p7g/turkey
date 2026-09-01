@@ -248,6 +248,9 @@ class Resolver:
         if t is ast.EField:
             self.expr(e.obj)
             return
+        if t is ast.EProject:
+            self.expr(e.obj)
+            return
         if t is ast.EUnary:
             self.method_ref(e.fn)
             self.expr(e.operand)

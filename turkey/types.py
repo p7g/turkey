@@ -337,6 +337,18 @@ class TLabel(Type):
         return f"TLabel({self.name!r})"
 
 
+class TIndex(Type):
+    """A numeric projection index lifted into a predicate argument."""
+
+    __slots__ = ("value",)
+
+    def __init__(self, value: int):
+        self.value = value
+
+    def __repr__(self) -> str:
+        return f"TIndex({self.value!r})"
+
+
 class TSet(Type):
     """A closed set of type constructor names, lifted into the type language.
 
@@ -816,6 +828,11 @@ def unify(a: Type, b: Type, span: Span | None = None, context: str = "",
             raise _mismatch(a, b, span, context)
         return
 
+    if isinstance(a, TIndex) and isinstance(b, TIndex):
+        if a.value != b.value:
+            raise _mismatch(a, b, span, context)
+        return
+
     if isinstance(a, TTuple) and isinstance(b, TTuple):
         if len(a.elems) != len(b.elems):
             raise _mismatch(a, b, span, context)
@@ -982,6 +999,8 @@ def type_key(t: Type) -> tuple:
         return ("tuple", tuple(type_key(e) for e in t.elems))
     if isinstance(t, TLabel):
         return ("label", t.name)
+    if isinstance(t, TIndex):
+        return ("index", t.value)
     if isinstance(t, TSet):
         return ("set", tuple(sorted(t.names)))
     return ("bottom",)
@@ -1091,6 +1110,8 @@ def show(t: Type, names: dict[int, str] | None = None, free_prefix: str = "",
             return "!"
         if isinstance(ty, TLabel):
             return f'"{ty.name}"'
+        if isinstance(ty, TIndex):
+            return str(ty.value)
         if isinstance(ty, TSet):
             return "{" + ", ".join(sort_numeric(ty.names)) + "}"
         if isinstance(ty, TTuple):

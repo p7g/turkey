@@ -73,7 +73,7 @@ from . import ast
 from .classes import ClassTable, match
 from .core import (
     TAIL_FIELDS, CApp, CArray, CAssign, CBind, CCon,
-    CDeref, CExpr, CField, CIf, CIndex, CJoin, CJump, CLam,
+    CDeref, CExpr, CField, CIf, CIndex, CJoin, CJump, CLam, CProject,
     CLet, CLetRec, CLit, CMatch, CParam, CPrim, CProgram, CRecord, CRef,
     CTuple, CTyApp, CTyLam, CUnit, CVar, is_ref, ref_elem,
     ref_of,
@@ -384,6 +384,15 @@ class Checker:
                     f"without a type application", e.span)
             return body
         return self.record_field(target, e.name, e.span, e.ty)
+
+    def _check_CProject(self, e: CProject, env: Env) -> Type:
+        target = prune(self.check(e.target, env))
+        if isinstance(target, (TVar, TBottom)):
+            return e.ty
+        choices = target.elems if isinstance(target, TTuple) else self.decls.projection_types(target)
+        if choices is None or e.index >= len(choices):
+            raise CoreError(f"invalid projection .{e.index} from {show(target)}", e.span)
+        return choices[e.index]
 
     def record_field(self, target: Type, name: str, span: Span | None,
                      erased: Type | None = None) -> Type:
@@ -786,6 +795,8 @@ def _describe(e: CExpr) -> str:
         return f"the variable '{e.name}'"
     if isinstance(e, CField):
         return f"the field '{e.name}'"
+    if isinstance(e, CProject):
+        return f"the projection '.{e.index}'"
     if isinstance(e, CCon):
         return f"the constructor '{e.name}'"
     if isinstance(e, CPrim):

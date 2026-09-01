@@ -632,6 +632,8 @@ class Parser:
             # C-style `for` header, but blocks plainly need them too.
             if self.at("="):
                 self.advance()
+                if isinstance(expr, ast.EProject):
+                    raise ParseError("numeric projections are read-only", span)
                 if not isinstance(expr, (ast.EVar, ast.EField, ast.EIndex)):
                     raise ParseError(
                         "left side of an assignment must be a variable, "
@@ -771,9 +773,13 @@ class Parser:
                     index = self.parse_expr()
                 self.expect("]")
                 expr = ast.EIndex(expr.span, expr, index)
-            elif self.at(".") and self.peek(1).kind == "IDENT":
+            elif self.at(".") and self.peek(1).kind in ("IDENT", "INT"):
                 self.advance()
-                expr = ast.EField(expr.span, expr, self.advance().text)
+                member = self.advance()
+                if member.kind == "INT":
+                    expr = ast.EProject(expr.span, expr, int(member.value))
+                else:
+                    expr = ast.EField(expr.span, expr, member.text)
             elif self.at("?"):
                 # A suffix like the other three, so it binds tighter than any
                 # operator and chains with them: `f(x)?.field?` reads as it

@@ -76,6 +76,8 @@ def free_names(node, bound: frozenset[str] = frozenset()) -> set[str]:
         return _union(node.elems, bound)
     if t is ast.EField:
         return free_names(node.obj, bound)
+    if t is ast.EProject:
+        return free_names(node.obj, bound)
     if t is ast.ERecord:
         out = set() if node.con in bound else {node.con}
         for _label, value in node.fields:

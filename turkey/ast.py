@@ -209,6 +209,14 @@ class EField(Expr):
 
 
 @dataclass(eq=False)
+class EProject(Expr):
+    """Zero-based projection from a tuple or positional single-variant value."""
+
+    obj: Expr
+    index: int
+
+
+@dataclass(eq=False)
 class EUnary(Expr):
     op: str  # ! | -
     operand: Expr
@@ -369,7 +377,7 @@ class SFun(Stmt):
 
 @dataclass(eq=False)
 class SAssign(Stmt):
-    """`x = e`, `r.f = e`, `a[i] = e`. Target is EVar, EField or EIndex."""
+    """`x = e`, `r.f = e`, `a[i] = e`. Numeric projections are read-only."""
 
     target: Expr
     value: Expr

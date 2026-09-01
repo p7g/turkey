@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from . import ast
 from .builtins import PRIM_NAMES, initial_primitives
 from .core import (
-    CApp, CArray, CAssign, CCon, CDeref, CExpr, CField, CIf, CIndex,
+    CApp, CArray, CAssign, CCon, CDeref, CExpr, CField, CIf, CIndex, CProject,
     CJoin, CJump, CLam, CLet, CLetRec, CLit, CMatch, CPrim, CProgram,
     CRecord, CRef, CTuple, CTyApp, CTyLam, CUnit, CVar,
 )
@@ -259,6 +259,8 @@ class _Function:
             return all(self.can_value(x) for _, x in e.fields)
         if isinstance(e, CField):
             return self.can_value(e.target)
+        if isinstance(e, CProject):
+            return self.can_value(e.target)
         if isinstance(e, CIndex):
             return self.can_value(e.target) and self.can_value(e.index)
         if isinstance(e, CApp):
@@ -335,6 +337,10 @@ class _Function:
             if kind == "record":
                 return f"{target}.fields[{e.name!r}]"
             return f"_get_field({target}, {e.name!r})"
+        if isinstance(e, CProject):
+            target = self.gen.fresh("target")
+            self.line(block, f"{target} = {self.value(e.target, env, joins, block)}")
+            return f"({target}[{e.index}] if isinstance({target}, tuple) else {target}.args[{e.index}])"
         if isinstance(e, CIndex):
             target = self.gen.fresh("target")
             index = self.gen.fresh("index")
@@ -418,6 +424,8 @@ class _Function:
                     value = f"{values[0]}.fields[{e.name!r}]"
                 else:
                     value = f"_get_field({values[0]}, {e.name!r})"
+            elif isinstance(e, CProject):
+                value = f"({values[0]}[{e.index}] if isinstance({values[0]}, tuple) else {values[0]}.args[{e.index}])"
             elif isinstance(e, CIndex):
                 value = f"{values[0]}.get({values[1]})"
             elif isinstance(e, CApp):
@@ -439,6 +447,8 @@ class _Function:
         elif isinstance(e, CRecord):
             operands = [x for _, x in e.fields]
         elif isinstance(e, CField):
+            operands = [e.target]
+        elif isinstance(e, CProject):
             operands = [e.target]
         elif isinstance(e, CIndex):
             operands = [e.target, e.index]

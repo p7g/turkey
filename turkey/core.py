@@ -162,6 +162,12 @@ class CField(CExpr):
 
 
 @dataclass(eq=False)
+class CProject(CExpr):
+    target: CExpr | None = None
+    index: int = 0
+
+
+@dataclass(eq=False)
 class CIndex(CExpr):
     target: CExpr | None = None
     index: CExpr | None = None
@@ -476,6 +482,8 @@ def show_expr(e: CExpr | None, indent: int = 0,
         return "\n".join(out)
     if isinstance(e, CField):
         return f"{pad}{show_expr(e.target, 0, names, alias).strip()}.{alias(e.name)}"
+    if isinstance(e, CProject):
+        return f"{pad}{show_expr(e.target, 0, names, alias).strip()}.{e.index}"
     if isinstance(e, CIndex):
         return f"{pad}{show_expr(e.target, 0, names, alias).strip()}[{show_expr(e.index, 0, names, alias).strip()}]"
     if isinstance(e, CLam):
@@ -669,7 +677,7 @@ __all__ = [
     "CDeref", "CExpr", "CField", "CIf",
     "CIndex", "CJoin", "CJump", "CLam", "CLet", "CLetRec", "CLit",
     "CMatch", "CParam",
-    "CPrim", "CProgram", "CRecord", "CRef", "CTuple", "CTyApp",
+    "CPrim", "CProgram", "CProject", "CRecord", "CRef", "CTuple", "CTyApp",
     "CTyLam", "CUnit", "CVar", "REF", "TAIL_FIELDS", "is_ref",
     "names_of", "ref_elem", "ref_of",
     "show_bind", "show_expr", "show_program",

@@ -2366,3 +2366,31 @@ ever sees them. It is not in the diff.
 **Scope.** `turkey/mono.py` only -- a `_State` dataclass, a `ROUNDS` constant,
 and `monomorphize` looping -- plus `tests/programs/dicts.mono` regenerated. Six
 new tests. **No `.expected` moved.**
+
+---
+
+### 55. Numeric projection is an erased predicate, and exhaustiveness reads whole types
+
+Tuples and immutable single-constructor positional wrappers now support
+zero-based projection: `(a, b).0` and `Packed(a, b).1`. The syntax is a postfix
+`.INT`, distinct from named record fields and from array indexing. It is
+read-only; positional values keep the immutable semantics they already had.
+
+Like field access, a projection need not know its receiver immediately.
+`x.0` raises `HasProjection 0 r a`, with the functional dependency
+`0 r -> a`; repeated demands for the same index and receiver therefore agree.
+The erased predicate is retained in generalized schemes and discharged when
+the receiver becomes either a structural tuple or an immutable type with
+exactly one positional constructor. Records, multi-variant types, and
+out-of-range indices are rejected during solving.
+
+Surface projection lowers to its own typed Core node. The evaluator and Python
+backend read a tuple slot or positional constructor argument, while Core
+checking independently derives the selected type from the receiver.
+
+The exhaustiveness checker previously normalized only the head of a match
+scrutinee. That left a solved family buried in a type application -- for
+example `Option (Index.Value (Array (a, b)))` -- looking unknown beneath
+`Some`, and falsely warned that `Some(_)` was missing after `Some((x, y))`.
+It now reads the scrutinee through the shared deep type-resolution table, the
+same boundary used by Core lowering.

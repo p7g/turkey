@@ -358,6 +358,22 @@ class DeclTable:
                    if isinstance(v, TVar)}
         return substitute(body.params[con.field_names.index(label)], mapping)
 
+    def projection_types(self, receiver: Type) -> list[Type] | None:
+        """Payload types for an immutable, single positional variant."""
+        head, args = spine(receiver)
+        if not isinstance(head, TCon):
+            return None
+        info = self.tycons.get(head.name)
+        if info is None or len(info.variants) != 1 or info.variants[0].is_record:
+            return None
+        con = info.variants[0]
+        body = con.scheme.body
+        assert isinstance(body, TFun)
+        _, params = spine(body.ret)
+        mapping = {v.id: arg for v, arg in zip(params, args)
+                   if isinstance(v, TVar)}
+        return [substitute(t, mapping) for t in body.params]
+
 
 def substitute(t: Type, mapping: dict[int, Type]) -> Type:
     from .types import prune

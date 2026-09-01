@@ -198,6 +198,7 @@ expr-postfix ::= expr-atom (
                    "(" arg-list? ")"            -- function application
                  | "[" expr "]"                  -- array index
                  | "." IDENT                     -- field access
+                 | "." INT                       -- zero-based tuple/payload projection
                  | "?"                           -- monadic bind (§6.9)
                  )*
 expr-atom    ::= INT | FLOAT | STRING | CHAR
@@ -289,6 +290,7 @@ expr-postfix "[" expr "]" "=" expr  -- mutate an array element
 π ::= C τ                            -- a class predicate (delta 29)
     | F τ ~ τ                        -- a family's answer (delta 39)
     | HasField l τ τ                 -- a field demand (delta 7)
+    | HasProjection n τ τ            -- a numeric projection demand (delta 55)
     | OneOf τ {T₁, ..., Tₙ}          -- a numeric literal's set (delta 27)
 ```
 
@@ -347,6 +349,12 @@ An expression is **non-expansive** iff:
 | Primitives (`Int`, `Float`, `String`, `Char`, `Unit`) | ✗ | immutable |
 
 Field access `r.f` and field mutation `r.f = e` are only well-typed when the static type of `r` is a single-variant record type or `Array a`.
+
+Numeric projection `v.n` is zero-based and read-only. It applies to structural
+tuples and to immutable types with exactly one positional constructor. A
+projection whose receiver is not yet known is carried by `HasProjection n r a`,
+so `fun first(x) = x.0` remains polymorphic. Records and multi-variant data
+types are taken apart with named fields and `match`, respectively.
 
 ### 4.6 Bottom-typed expressions
 
@@ -880,3 +888,4 @@ Notes:
 | 34 | ~~Operators are monomorphic (Int/Float variants); no typeclasses in v1~~ -- superseded: every arithmetic and comparison operator is a class method (SPEC-DELTAS.md 32) |
 | 35 | `error : String -> a` is a polymorphic primitive (panics/diverges) |
 | 36 | A `var` is a mutable cell, and closures capture the cell, not its value -- so a lambda that writes a captured `var` writes through to it (SPEC-DELTAS.md 49; new prose for behaviour the evaluator always had) |
+| 37 | Numeric projection `v.0` is zero-based, read-only, and polymorphic over tuples and immutable single-positional-variant values (SPEC-DELTAS.md 55) |

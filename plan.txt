@@ -361,18 +361,15 @@ Roadmap, in order. Rationale kept short; open questions are the point.
      arguments in order, including the ones the pattern ignores, keeps the
      effects and lifts the restriction.
 
-   And one thing it does *not* reach, which is worth recording precisely.
-   `question_control.tl` keeps all 245 of its `Flow` constructors. The cause
-   written here was that 6 left the `bind` polymorphic, and M16b established
-   that it was wrong: every top-level binding in that program is monomorphic,
-   and what was polymorphic was a *local* one, which M16b then pinned without
-   the constructor count moving at all. The real cause is that `bind` and
-   `pure` are *methods*, so their call sites are type applications over the
-   method's own quantifiers no matter how ground the dictionary is, and
-   `opt._Reducer` declines a binding with binders on purpose. So it is a gap
-   in this item after all, and the closing move is to instantiate through a
-   `CTyApp` rather than to make anything less polymorphic.
-   `tests/test_opt.py` holds the reasoning beside the assertions.
+   M16c reaches the first thing this did not. `bind` and `pure` are methods, so
+   their call sites remain type applications over the method's own quantifiers
+   however ground the dictionary is. The inliner now beta-reduces that type
+   application in place before doing its ordinary term beta reduction. This
+   is not monomorphization: it makes no top-level copy, needs no groundness
+   restriction, and therefore accepts the phantom variable in a lifted loop's
+   uninhabited `Brk` slot. The small Option and Either methods disappear from
+   `question_control.tl`; Array's `bind` and Flow across joins do not, and are
+   tracked below rather than hidden behind this first obstruction.
 
    The passes make programs *bigger*: on `question.tl` the specialized Core
    grows about half again. That is what an inliner is, and item 7 said as much
@@ -463,10 +460,48 @@ Roadmap, in order. Rationale kept short; open questions are the point.
    paragraph above now says so. What holds them up is method-level
    polymorphism, which is not something specialization removes.
 
+   Done, M16c: local type beta reduction. A devirtualized method is represented
+   as a `CBind` with type binders and a `CLam` value, not necessarily as a
+   literal `CTyLam`; a saturated `CApp(CTyApp(CVar(...), targs), args)` now
+   substitutes those type arguments through the lambda and enters the same
+   bounded inliner as a monomorphic call. Instantiated bodies are memoized by
+   name and structural type key, and the existing loop breakers remain keyed
+   by binding, so accepting non-ground type arguments creates no new route to
+   polymorphic-recursion divergence.
+
+   On `question_control.tl`, type-applied calls fall from 182 to 77 and printed
+   `Flow` type occurrences from 219 to 86. Actual `CCon` constructions fall
+   from 105 to 97. The old number 245 counted every printed Flow tag, including
+   match patterns; after inlining exposes more matches that number rises, so it
+   is not a constructor-allocation metric and is no longer used as one.
+
+   Tracked, M16d: specialize join arguments that arrive as known constructors.
+   Case-of-case deliberately puts a shared continuation in a `CJoin` to avoid
+   multiplying it by four, then jumps to it with values such as `Fall(x)` and
+   `Ret(r)`. No rule currently carries that known tag across the jump, so the
+   join body's match cannot collapse. Start with non-recursive, single-use
+   joins; for shared joins, specialize by constructor tag under an explicit
+   size bound rather than copying the whole continuation at every edge.
+
+   Tracked, M16e: remove `Flow` from recursive loop boundaries. A lifted loop's
+   recursive join genuinely returns `Option (Flow ...)`, and a loop breaker
+   correctly prevents local inlining from unfolding it. Eliminating that value
+   needs a worker/wrapper or multi-exit join transformation which gives Fall,
+   Ret and loop transfers distinct control exits. It is not another local
+   case-of-known-constructor rule.
+
+   Tracked, M16f: keep large method inlining a policy question. `Array#bind`'s
+   reduced body is 65 nodes, over `INLINE_LIMIT` 40. Raising the global limit
+   to admit it made the probe substantially larger and increased Flow traffic,
+   so M16c deliberately leaves its eight call sites alone. Revisit it only with
+   a cost model, a smaller worker, or evidence from the bootstrap interpreter;
+   do not raise the blanket threshold to make one fixture's count move.
+
    Three passes, none of which knows what a monad is:
 
-   - **Inlining.** A `CVar` naming a top-level binding with a known, small
-     RHS. M14c is what made instance methods into such names.
+   - **Inlining.** A `CVar`, directly or under a `CTyApp`, naming a top-level
+     binding with a known, small RHS. M14c is what made instance methods into
+     such names and M16c instantiates their own quantifiers locally.
    - **Beta and case-of-known-constructor.** The continuation lambda
      disappears by reduction once its call site is known. This is where a `?`
      over Option becomes the `match` Rust writes by hand.
@@ -567,7 +602,7 @@ before building the hard-but-not-novel parts. Which is why 4 and 5 sit early
 
 Where it stands: 1 through 7 are done. 4 closed not by building its fast
 lowering but by deleting it: the speed it wanted is general Core passes that
-know nothing about monads, and those are 7 -- which now exists, in seven parts.
+know nothing about monads, and those are 7 -- which now exists, in eight parts.
 `CJoin` and `CJump` are in the IR with tail position derived rather than
 tested for (M15a); discovery finds the labels already in a program (M15b);
 inlining, beta, case-of-known-constructor and dead-`let` do the local
@@ -578,18 +613,13 @@ join point, so `return` no longer names its target by where it sits (M15e).
 
 M16a then took the loop nodes out of Core altogether by doing M15e's work in
 the lowering, so seven nodes and `turkey/loops.py` are gone and a term that
-names its control target by where it sits cannot be written; and M16b stopped
-generalizing the helper a lifted loop becomes.
-
-One thing 7 leaves behind, and M16b is why it is stated precisely rather than
-guessed at. `question_control.tl` keeps all 245 of its `Flow` constructors.
-The cause was recorded for two milestones as 6 leaving the `bind` polymorphic;
-it is not that. `bind` and `pure` are methods, so their call sites are type
-applications over the method's *own* quantifiers however ground the dictionary
-is, and `opt` declines a binding with binders by design. Reaching them means
-teaching the inliner to instantiate a `CTyLam`-valued binding's body, which
-needs `mono`'s substitution and is a milestone of its own.
-`tests/test_opt.py` holds both the assertions and the reasoning.
+names its control target by where it sits cannot be written; M16b stopped
+generalizing the helper a lifted loop becomes; and M16c taught the bounded
+inliner to instantiate a type-applied lambda locally, including at non-ground
+type arguments. `question_control.tl` now loses every small Option and Either
+`bind`/`pure` call. What remains is stated as M16d through M16f where it lives:
+known constructors do not yet cross shared joins, recursive loop joins still
+return Flow, and Array's 65-node `bind` is intentionally over the size limit.
 
 Next is 8, the bootstrap interpreter -- the first real program in the language,
 and the only thing that will find out whether any of this was worth it at a

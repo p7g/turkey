@@ -18,7 +18,7 @@ from dataclasses import fields
 
 from turkey import opt
 from turkey.core import (
-    CApp, CBind, CExpr, CMatch, CPrim, CProgram, CTyApp, CVar,
+    CApp, CBind, CCon, CExpr, CMatch, CPrim, CProgram, CTyApp, CVar,
 )
 from turkey.driver import check
 
@@ -280,8 +280,8 @@ fun main() { print(quarter(8)) }
     assert calls_to(quarter, "Main#half") == 0
 
 
-def test_a_lifted_loop_is_monomorphic_and_the_flow_residue_is_not_its_fault():
-    """`question_control.tl` keeps all of its `Flow` constructors. Why, exactly.
+def test_type_applied_methods_inline_and_the_remaining_flow_is_tracked():
+    """The first obstruction in `question_control.tl`, and what lies past it.
 
     The old answer written here was wrong, and worth recording as wrong: it
     said item 6's specializer left the `bind` polymorphic. Every top-level
@@ -295,16 +295,14 @@ def test_a_lifted_loop_is_monomorphic_and_the_flow_residue_is_not_its_fault():
     `ast.FunDecl.monomorphic` settles that, and this asserts it: no lifted
     loop is generalized any more.
 
-    It was not the whole cause. The `Flow` traffic is a chain of `bind` and
-    `pure` calls, and every one of those is a `CTyApp` over a method's own
-    `forall a b` -- which is not polymorphism specialization removes, because
-    a method *is* polymorphic in its own variables no matter how ground its
-    dictionary is. `opt._Reducer` declines those on purpose ("a binding with
-    `binders` is a `CTyLam` and its call sites are type applications, which is
-    M14's business and not this one's"), so the bodies that would collapse the
-    `Flow` matches are never inlined. That is the next thing to change, and it
-    is a change to what this pass will instantiate rather than to what the
-    lifting produces.
+    The `Flow` traffic is a chain of type-applied `bind` and `pure` methods.
+    M16c instantiates the small Option and Either method bodies in place,
+    including at the non-ground phantom `Brk` type above: local type beta is
+    not monomorphization and needs no groundness restriction. Array's `bind`
+    stays because its reduced body is over `INLINE_LIMIT`, and `Flow` still
+    crosses joins which keep a producer away from its downstream match. Those
+    are separate, recorded follow-ons rather than reasons to make this rule
+    unbounded.
     """
     from pathlib import Path
     from turkey.core import CLetRec
@@ -321,9 +319,23 @@ def test_a_lifted_loop_is_monomorphic_and_the_flow_residue_is_not_its_fault():
             f"{bind.name} is generalized again; its `Brk` slot is dead by "
             f"construction, so the quantifier can never be solved")
 
-    generic = sum(
+    typed = [n.fn.fn.name
+             for bind in checked.opt.binds for n in nodes(bind.value)
+             if isinstance(n, CApp) and isinstance(n.fn, CTyApp)
+             and isinstance(n.fn.fn, CVar)]
+    assert "%inst.Monad.Data.Option#Option#bind" not in typed
+    assert "%inst.Applicative.Data.Option#Option#pure" not in typed
+    assert "%inst.Monad.Data.Either#Either@String#bind" not in typed
+    assert "%inst.Applicative.Data.Either#Either@String#pure" not in typed
+    assert "%inst.Monad.Array#bind" in typed, (
+        "Array bind is deliberately still over the inlining size limit; if it "
+        "moved, check the code-size result and update plan.txt's policy item")
+
+    flow = sum(
         1 for bind in checked.opt.binds for n in nodes(bind.value)
-        if isinstance(n, CApp) and isinstance(n.fn, CTyApp))
-    assert generic > 0, (
-        "if this is zero, inlining now reaches through a type application and "
-        "the Flow traffic should be collapsing -- check, and rewrite this test")
+        if isinstance(n, CCon)
+        and n.name in {"Prelude#Fall", "Prelude#Brk",
+                       "Prelude#Cont", "Prelude#Ret"})
+    assert 0 < flow < 105, (
+        "M16c must improve on the old 105 constructions, while join and "
+        "recursive-boundary elimination remain explicitly tracked work")

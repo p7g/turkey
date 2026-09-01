@@ -65,10 +65,11 @@ from . import ast
 from .core import (
     CAlt, CApp, CBind, CCon, CExpr, CIf,
     CJoin, CJump, CLam, CLet, CLetRec, CLit, CMatch, CParam, CPrim, CProgram,
-    CTuple, CUnit, CVar, names_of,
+    CTuple, CTyApp, CUnit, CVar, names_of,
 )
+from .decls import substitute
 from .deps import pattern_vars, sccs
-from .types import TBottom
+from .types import TBottom, Type, type_key
 
 # How large a body may be and still be inlined, counted in Core nodes. Small
 # enough that a call site does not become unreadable, large enough for the
@@ -111,14 +112,15 @@ def loop_breakers(program: CProgram) -> set[str]:
 class _Reducer:
     def __init__(self, program: CProgram) -> None:
         self.breakers = loop_breakers(program)
-        # Only a monomorphic, immutable, lambda-valued binding can be inlined.
-        # A binding with `binders` is a `CTyLam` and its call sites are type
-        # applications, which is M14's business and not this one's; a mutable
-        # one is a cell, and reading it twice is not reading it once.
-        self.bodies = {
-            b.name: b.value
+        # Only an immutable, lambda-valued binding can be inlined. A mutable
+        # one is a cell, and reading it twice is not reading it once. Type
+        # binders are fine: a call through `CTyApp` instantiates the lambda in
+        # place, which is type-level beta reduction rather than M14's creation
+        # of another top-level specialization.
+        self.bindings = {
+            b.name: b
             for b in program.dicts + program.binds
-            if not b.binders and not b.mutable and isinstance(b.value, CLam)
+            if not b.mutable and isinstance(b.value, CLam)
         }
         # What is currently being inlined. Belt and braces beside the loop
         # breakers: this makes non-termination impossible in the code rather
@@ -128,7 +130,7 @@ class _Reducer:
         # optimization: without it a chain `f` calls `g` calls `h` re-reduces
         # `h` once per path that reaches it, which is exponential in the depth
         # of the call graph and was, measurably, the whole cost of this pass.
-        self.reduced: dict[str, CExpr] = {}
+        self.reduced: dict[tuple[str, tuple], CExpr] = {}
         # For the join points case-of-case invents. Per program and in
         # traversal order, so it is deterministic and a golden can hold it.
         self.counter = 0
@@ -197,15 +199,33 @@ class _Reducer:
     def inline(self, e: CApp):
         """A saturated call to a small, known, non-loop-breaking binding."""
         fn = e.fn
-        if not isinstance(fn, CVar):
+        targs = None
+        if isinstance(fn, CVar):
+            name = fn.name
+        elif isinstance(fn, CTyApp) and isinstance(fn.fn, CVar):
+            name, targs = fn.fn.name, fn.args
+        else:
             return None
-        name = fn.name
         if name in self.breakers or name in self.active:
             return None
-        lam = self.bodies.get(name)
-        if lam is None or len(lam.params) != len(e.args):
+        bind = self.bindings.get(name)
+        if bind is None:
             return None
-        body = self.body_of(name)
+        if targs is None:
+            if bind.binders:
+                return None
+            lam = bind.value
+            key = (name, ())
+        else:
+            if not bind.binders or len(bind.binders) != len(targs):
+                return None
+            mapping = {b.id: a for b, a in zip(bind.binders, targs)}
+            lam = _instantiate_types(bind.value, mapping)
+            key = (name, tuple(type_key(a) for a in targs))
+        assert isinstance(lam, CLam)
+        if len(lam.params) != len(e.args):
+            return None
+        body = self.body_of(name, key, lam)
         # The *reduced* body against the limit, not the written one. A body of
         # ten nodes that inlines to five hundred is five hundred nodes at every
         # call site, and measuring the source would let exactly that through
@@ -216,7 +236,7 @@ class _Reducer:
             return None
         return _apply(lam.params, e.args, body, e.ty)
 
-    def body_of(self, name: str):
+    def body_of(self, name: str, key: tuple[str, tuple], lam: CLam):
         """A binding's reduced body, computed once.
 
         The `active` guard cannot actually fire -- every cycle in the call
@@ -227,14 +247,14 @@ class _Reducer:
         one expansion short of fully reduced, which costs an optimization and
         cannot cost an answer.
         """
-        found = self.reduced.get(name)
+        found = self.reduced.get(key)
         if found is None:
             self.active.append(name)
             try:
-                found = self.expr(self.bodies[name].body)
+                found = self.expr(lam.body)
             finally:
                 self.active.pop()
-            self.reduced[name] = found
+            self.reduced[key] = found
         return found
 
     def beta(self, e: CApp):
@@ -455,6 +475,35 @@ def _apply_names(names, args, body, ty):
     for name, arg in reversed(remaining):
         body = CLet(ty, arg.span, name, arg.ty, arg, body)
     return body
+
+
+def _instantiate_types(value, mapping: dict[int, Type]):
+    """`value` with free type variables replaced by a call's type arguments.
+
+    This is the erased-language equivalent of beta-reducing a `CTyApp`. It is
+    deliberately happy with non-ground arguments: unlike monomorphization it
+    makes no top-level copy and cannot chase polymorphic recursion, and a
+    phantom variable such as a lifted loop's uninhabited `Brk` slot is exactly
+    the case that brought this rule here.
+
+    A field named `binders` introduces type variables rather than using them,
+    so those objects themselves are preserved. Their ids are distinct from
+    the outer binding's ids; the types under them may still mention an outer
+    variable and are therefore walked normally.
+    """
+    if isinstance(value, Type):
+        return substitute(value, mapping)
+    if isinstance(value, (CExpr, CBind, CAlt, CParam)):
+        return type(value)(**{
+            f.name: (getattr(value, f.name) if f.name == "binders"
+                     else _instantiate_types(getattr(value, f.name), mapping))
+            for f in fields(value)
+        })
+    if isinstance(value, list):
+        return [_instantiate_types(x, mapping) for x in value]
+    if isinstance(value, tuple):
+        return tuple(_instantiate_types(x, mapping) for x in value)
+    return value
 
 
 def _substitute(e, mapping):

@@ -195,6 +195,11 @@ type PredKind
 -- exactly an annotated wildcard, so a method's type is read off a signature and
 -- off a defaulted method by the same code.
 type FunDecl = FunDecl {
+    -- From the same supply as every other node's, so a table keyed by node id
+    -- can hold declarations and expressions at once. What wants one is the
+    -- dictionary abstraction a signature-checked `fun` is given: Python hangs
+    -- it on the node, and the modules that define its type sit above this one.
+    id      : Int,
     span    : Span,
     name    : String,
     params  : Array Pat,

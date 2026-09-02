@@ -549,7 +549,7 @@ fun parseFunDecl(p : P, allowSignature : Bool) -> FunDecl {
     var ret : Option Type = None
     if eat(p, "->") { ret = Some(parseTypeExpr(p)) }
     FunDecl {
-        span = s, name = name, params = params, ret = ret,
+        id = freshId(p), span = s, name = name, params = params, ret = ret,
         body = Some(parseFunBody(p)), context = context,
         monomorphic = False,
     }
@@ -606,8 +606,8 @@ fun parseSignature(p : P, s : Span, name : String, context : Array Pred) -> FunD
         Array.push(params, mkPat(p, t.span, PAnnot(mkPat(p, t.span, PWild), t)))
     }
     FunDecl {
-        span = s, name = name, params = params, ret = Some(ret), body = None,
-        context = context, monomorphic = False,
+        id = freshId(p), span = s, name = name, params = params,
+        ret = Some(ret), body = None, context = context, monomorphic = False,
     }
 }
 

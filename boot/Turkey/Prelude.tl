@@ -2,7 +2,7 @@ module Turkey.Prelude (
     monadBind, monadPure,
     flowFall, flowBrk, flowCont, flowRet,
     error,
-    optionNone, optionSome,
+    optionType, optionNone, optionSome,
     boolTrue, boolFalse,
     preludeName, entryName, sep, internal,
 )
@@ -38,6 +38,7 @@ let flowRet = "Prelude#Ret"
 -- checker has no way to know is unreachable.
 let error = "Std.Classes#error"
 
+let optionType = "Data.Option.Type#Option"
 let optionNone = "Data.Option.Type#None"
 let optionSome = "Data.Option.Type#Some"
 

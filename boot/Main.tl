@@ -23,6 +23,7 @@
 import Data.Set as Set
 import System.Env as Env
 import System.IO as IO
+import Turkey.Diag as Diag
 import Turkey.Source as Source
 import Turkey.Source (Source)
 import Turkey.Lexer as Lexer
@@ -41,6 +42,8 @@ import Turkey.Constraints as Constraints
 import Turkey.Typed as Typed
 import Turkey.Exhaustive as Exhaustive
 import Turkey.PrimTypes as PrimTypes
+import Turkey.Infer as Infer
+import Turkey.Evidence as Evidence
 import Turkey.Ast (Decl(..), Stmt(..), StmtKind(..), patternVars)
 
 -- Where the language's own library lives, relative to where this is run from.
@@ -54,7 +57,7 @@ fun main() {
     if len(args) < 2 { usage() }
     let command = args[0]
     if !Array.contains(["tokens", "ast", "desugar", "decls", "deps",
-                    "classes"], command) {
+                    "classes", "types"], command) {
         die("unknown command '" + command + "'")
     }
     -- One builder for every file: a `print` per token is a flush per token,
@@ -69,7 +72,8 @@ fun main() {
             "desugar" -> dumpDesugared(b, path)
             "decls" -> dumpDecls(b, path)
             "deps" -> dumpDeps(b, path)
-            _ -> dumpClasses(b, path)
+            "classes" -> dumpClasses(b, path)
+            _ -> dumpTypes(b, path)
         }
     }
     write(String.build(b))
@@ -96,13 +100,21 @@ fun dumpDesugared(b : String.Builder, path : String) -> Unit {
 -- Every module of the program, loaded, resolved and desugared, in dependency
 -- order. What every stage from here on starts from.
 fun loadResolved(path : String) -> Array Modules.Module {
+    let (modules, _) = loadProgram(path)
+    modules
+}
+
+-- Every module of the program, and the entry among them. The entry is the last
+-- to finish loading, since a module finishes after everything it imports, but
+-- saying so here beats relying on it at every call site.
+fun loadProgram(path : String) -> (Array Modules.Module, Modules.Module) {
     let loader = Modules.newLoader([directoryOf(path), libRoot])
-    discard(Modules.loadEntry(loader, readOrDie(path), "Main"))
+    let entry = Modules.loadEntry(loader, readOrDie(path), "Main")
     for m in loader.order {
         Resolve.program(m.scope, m.program)
         Desugar.program(m.program, m.scope.methods)
     }
-    loader.order
+    (loader.order, entry)
 }
 
 -- The program's declaration table, and nothing after it: every type constructor
@@ -214,6 +226,91 @@ fun itemDeps(item : Stmt) -> Set.Set String = match item.kind {
     _ -> Set.new()
 }
 
+-- The inferred type of each of the entry module's top-level bindings.
+--
+-- The whole front end, end to end: load, resolve, desugar, register the
+-- declarations and classes, generate a constraint per module, solve it, check
+-- exhaustiveness and elaborate the evidence. What is printed is the last step's
+-- input rather than its output, because a scheme is what a reader can check by
+-- eye and evidence is not.
+fun dumpTypes(b : String.Builder, path : String) -> Unit {
+    Solved.resetDictNames()
+    let (modules, entry) = loadProgram(path)
+    let decls = Decls.newDeclTable()
+    let classes = Classes.newClassTable(decls)
+    let env = Constraints.childEnv(initialEnv())
+    let types = Typed.newTypeTable()
+    let warnings = Array.new(4)
+
+    for m in modules {
+        let g = Infer.newGenerator(decls, env, classes, m.name, types)
+        let (_, constraint) = Infer.generate(g, m.program)
+        let solver = Constraints.newSolver(decls, env, classes)
+        Constraints.run(solver, constraint)
+        Infer.checkExhaustiveness(g)
+        Evidence.run(classes, solver.uses)
+        for w in g.warnings { Array.push(warnings, w) }
+    }
+
+    for w in warnings { IO.stderr(path + ":" + Diag.short(w) + "\n") }
+    for (name, scheme) in signatures(entry, env, classes) {
+        String.push(b, name + " : " + Ty.showScheme(scheme) + "\n")
+    }
+}
+
+-- The environment every module is checked in. What a module may *write* is
+-- settled by its scope one stage earlier, so this holds every primitive for
+-- everybody.
+fun initialEnv() -> Constraints.Env {
+    let env = Constraints.newEnv()
+    for (name, scheme) in PrimTypes.schemes() {
+        Constraints.define(env, name,
+            Constraints.Binding { scheme = scheme, mutable = False })
+    }
+    env
+}
+
+-- What `types` prints: the entry module's own bindings, under the names the
+-- author wrote rather than the qualified ones resolution gave them -- the module
+-- a name came from is not news to the person who wrote the file.
+fun signatures(entry : Modules.Module, env : Constraints.Env,
+               classes : Classes.ClassTable) -> Array (String, Ty.Scheme) {
+    let out = Array.new(16)
+    for item in entry.program.decls {
+        match item {
+            -- A method's scheme is stated by its class rather than inferred, but
+            -- it is still the thing a reader wants to see, and the class
+            -- variable's discovered kind shows up nowhere else.
+            DClass(c) -> match Map.get(classes.classes, c.name) {
+                Some(info) -> for meth in c.methods {
+                    match Map.get(info.methods, meth.name) {
+                        Some(mi) -> Array.push(out,
+                            (Classes.surfaceMember(meth.name), mi.scheme))
+                        None -> {}
+                    }
+                }
+                None -> {}
+            }
+            DStmt(s) -> for name in bindingNames(s) {
+                match Constraints.lookup_(env, name) {
+                    Some(binding) -> Array.push(out,
+                        (Ty.shortName(name), binding.scheme))
+                    None -> {}
+                }
+            }
+            _ -> {}
+        }
+    }
+    out
+}
+
+fun bindingNames(s : Stmt) -> Array String = match s.kind {
+    SFun(d) -> [d.name]
+    SLet(pat, _) -> Array.sort(patternVars(pat))
+    SVar(pat, _) -> Array.sort(patternVars(pat))
+    _ -> Array.new(0)
+}
+
 -- The directory a path is in, as a search root. A path with no separator is in
 -- the current directory, which is what the empty prefix would mean anyway --
 -- but `"" + "/" + rest` is a leading slash, so it is spelled out.
@@ -229,7 +326,8 @@ fun readOrDie(path : String) -> Source = match Source.read(path) {
 }
 
 fun usage() -> a =
-    die("usage: boot <tokens|ast|desugar|decls|deps|classes> FILE...")
+    die("usage: boot <tokens|ast|desugar|decls|deps|classes|types> "
+        + "FILE...")
 
 fun die(message : String) -> a {
     IO.stderr("boot: " + message + "\n")

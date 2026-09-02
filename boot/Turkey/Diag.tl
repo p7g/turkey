@@ -1,4 +1,4 @@
-module Turkey.Diag (Diag(..), at, whole, render, fail)
+module Turkey.Diag (Diag(..), at, whole, render, fail, short)
 
 -- A diagnostic is a value.
 --
@@ -42,3 +42,44 @@ fun fail(d : Diag, filename : String) -> a {
     IO.stderr(render(d, filename) + "\n")
     Env.exit(1)
 }
+
+-- A message with every internal name written the way the author wrote it.
+--
+-- `Module#name` is what module resolution calls a top-level binding. No
+-- diagnostic should say it: the author wrote `f`, not `Main#f`, and which
+-- module a name came from is not news to them. Python strips it with one
+-- regular expression, `[A-Za-z_][A-Za-z0-9_.]*#`; this is that expression as a
+-- scan, which is what there is without a regex engine.
+fun short(text : String) -> String {
+    let out = String.builder()
+    -- The run of characters that could be the prefix of an internal name, held
+    -- back until the next one says whether a `#` follows.
+    let pending = Array.new(16)
+    for c in String.codePoints(text) {
+        if c == '#' && len(pending) > 0 {
+            -- The run was a module qualification. Drop it and the `#` with it.
+            Array.clear(pending)
+        } else if len(pending) > 0 && isNameRest(c) {
+            Array.push(pending, c)
+        } else {
+            flush(out, pending)
+            if isNameStart(c) { Array.push(pending, c) }
+            else { String.push(out, Char.toString(c)) }
+        }
+    }
+    flush(out, pending)
+    String.build(out)
+}
+
+fun flush(out : String.Builder, pending : Array Char) -> Unit {
+    if len(pending) == 0 { return {} }
+    String.push(out, String.fromCodePoints(pending))
+    Array.clear(pending)
+}
+
+fun isNameStart(c : Char) -> Bool = Char.isAsciiAlpha(c) || c == '_'
+
+fun isNameRest(c : Char) -> Bool =
+    Char.isAsciiAlphanumeric(c) || c == '_' || c == '.'
+
+fun discard(x : a) -> Unit = {}

@@ -912,8 +912,9 @@ fun optStmtArray(s : Option Stmt) -> Array Stmt = match s {
 -- loop generic and out of reach of the inliner behind it.
 fun loopFun(d : D, name : String, body : Expr, span : Span) -> Stmt =
     mkStmt(d, span, SFun(FunDecl {
-        span = span, name = name, params = Array.new(0), ret = None,
-        body = Some(body), context = Array.new(0), monomorphic = True,
+        id = freshId(d), span = span, name = name, params = Array.new(0),
+        ret = None, body = Some(body), context = Array.new(0),
+        monomorphic = True,
     }))
 
 -- `for x in xs` in its cursor form, then lifted like any other loop.

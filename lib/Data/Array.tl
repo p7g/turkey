@@ -4,6 +4,7 @@ module Data.Array (
     filled,
     push,
     pop,
+    clear,
     map,
     filter,
     fold,
@@ -88,6 +89,13 @@ fun outOfBounds(operation : String, i : Int, length : Int) -> a {
                 " index "),
             Prim.intToString(i)),
         Prim.stringConcat(", length ", Prim.intToString(length))))
+}
+
+-- Drop every element, keeping the capacity. The elements themselves are still
+-- reachable from the storage until they are overwritten, which costs nothing a
+-- compiler notices and saves the reallocation a fresh array would need.
+fun clear(xs : Array a) -> Unit {
+    state(xs).length = 0
 }
 
 fun bounds(xs : Array a, i : Int, operation : String) {

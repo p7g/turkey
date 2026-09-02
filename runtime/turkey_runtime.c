@@ -46,7 +46,9 @@ enum { HEAP_STRING = 1, HEAP_OBJECT = 2, HEAP_CELL = 3 };
 static HeapHeader *heap;
 static RootFrame *roots;
 static int64_t heap_count;
-static int64_t allocation_count;
+static int64_t allocations_since_collection;
+static int64_t collection_threshold = 1024;
+static int64_t collection_count;
 static int gc_stress = -1;
 
 static void mark(void *value);
@@ -119,7 +121,7 @@ static HeapHeader *header_of(void *value) {
 
 static void *heap_allocate(size_t size, uint32_t kind) {
     if (gc_stress < 0) gc_stress = getenv("TURKEY_GC_STRESS") != NULL;
-    if (gc_stress || (allocation_count > 1024 && allocation_count > heap_count * 2))
+    if (gc_stress || allocations_since_collection >= collection_threshold)
         turkey_collect();
     if (size > SIZE_MAX - sizeof(HeapHeader)) {
         turkey_panic("allocation is too large"); return NULL;
@@ -132,13 +134,16 @@ static void *heap_allocate(size_t size, uint32_t kind) {
     header->marked = 0;
     heap = header;
     heap_count++;
-    allocation_count++;
+    allocations_since_collection++;
     return header + 1;
 }
 
 static void mark(void *value) {
     if (value == NULL) return;
-    HeapHeader *header = find_header(value);
+    /* Exact roots and layout metadata make this an O(1) operation in normal
+       execution. GC stress retains the expensive membership check as a
+       diagnostic for a broken compiler/runtime invariant. */
+    HeapHeader *header = gc_stress ? find_header(value) : header_of(value);
     if (header == NULL) {
         char message[128];
         snprintf(message, sizeof(message),
@@ -157,7 +162,7 @@ static void mark(void *value) {
             if (object->tag >= 6)
                 for (int64_t index = 0; index < object->count; ++index) {
                     void *child = (void *)(uintptr_t)object->slots[index];
-                    if (child != NULL && find_header(child) == NULL) {
+                    if (gc_stress && child != NULL && find_header(child) == NULL) {
                         char message[160];
                         snprintf(message, sizeof(message),
                                  "array pointer field %" PRId64
@@ -169,7 +174,7 @@ static void mark(void *value) {
             for (int64_t index = 0; index < object->count; ++index)
                 if (((object->pointer_bitmap >> (3 * index)) & 7) >= 6) {
                     void *child = (void *)(uintptr_t)object->slots[index];
-                    if (child != NULL && find_header(child) == NULL) {
+                    if (gc_stress && child != NULL && find_header(child) == NULL) {
                         char message[160];
                         snprintf(message, sizeof(message),
                                  "object tag %d pointer field %" PRId64
@@ -200,9 +205,13 @@ void turkey_collect(void) {
             link = &header->next;
         }
     }
+    allocations_since_collection = 0;
+    collection_threshold = heap_count > 1024 ? heap_count : 1024;
+    collection_count++;
 }
 
 int64_t turkey_heap_objects(void) { return heap_count; }
+int64_t turkey_collection_count(void) { return collection_count; }
 void turkey_gc_set_stress(int32_t enabled) { gc_stress = enabled != 0; }
 
 void turkey_panic(const char *message) {

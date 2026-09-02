@@ -182,6 +182,26 @@ fun main() {
     assert module.runtime.turkey_heap_objects() == 0
 
 
+def test_normal_execution_collects_before_the_entry_function_returns():
+    checked = check("""
+fun main() {
+    var text = ""
+    var i = 0
+    while i < 5000 {
+        text = text + "x"
+        i = i + 1
+    }
+}
+""")
+    module = compile(checked.opt, checked.decls, checked.main)
+    before = module.runtime.turkey_collection_count()
+    module.execute()
+    # NativeModule.execute performs one final collection. More than one proves
+    # the allocation threshold also collected while generated code was active.
+    assert module.runtime.turkey_collection_count() - before > 1
+    assert module.runtime.turkey_heap_objects() == 0
+
+
 def test_pointer_arrays_are_traced_under_gc_stress(monkeypatch, capfd):
     monkeypatch.setenv("TURKEY_GC_STRESS", "1")
     native("""

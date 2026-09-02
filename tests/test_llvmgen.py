@@ -38,6 +38,16 @@ def test_shadow_roots_use_stack_storage_and_direct_stores():
     assert "@turkey_root_push" not in text
 
 
+def test_language_string_literals_are_allocated_once_at_module_entry():
+    checked = check('fun main() { print("same"); print("same") }')
+    text = generate(checked.opt, checked.decls, checked.main)
+    calls = [line for line in text.splitlines()
+             if "call i8* @turkey_string_new" in line]
+    assert len(calls) == 1
+    assert text.count("@.turkey.literal.bytes.0") >= 1
+    assert text.count("load i8*, i8** @.turkey.literal.value.0") == 2
+
+
 def test_native_scalar_program_prints(capfd):
     native("fun main() { print(40 + 2) }")
     assert capfd.readouterr().out == "42\n"

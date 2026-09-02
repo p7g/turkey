@@ -74,6 +74,7 @@ class _Emitter:
         self.globals: dict[str, ir.GlobalVariable] = {}
         self.runtime: dict[str, ir.Function] = {}
         self.closure_thunks: dict[str, ir.Function] = {}
+        self.string_literals: dict[str, tuple[ir.GlobalVariable, ir.GlobalVariable, int]] = {}
         self.string_count = 0
         self._declare_runtime()
 
@@ -142,6 +143,28 @@ class _Emitter:
         self._runtime("turkey_root_leave", ir.VoidType(), [_PTR])
 
     def emit(self) -> tuple[str, binding.TargetMachine]:
+        literals = sorted({
+            instruction.args[0]
+            for function in self.source.functions
+            for block in function.blocks
+            for instruction in block.instructions
+            if instruction.op == "string_const"
+        })
+        for index, value in enumerate(literals):
+            data = value.encode("utf-8")
+            terminated = data + b"\0"
+            array = ir.Constant(
+                ir.ArrayType(_I8, len(terminated)), bytearray(terminated))
+            bytes_global = ir.GlobalVariable(
+                self.module, array.type, name=f".turkey.literal.bytes.{index}")
+            bytes_global.global_constant = True
+            bytes_global.linkage = "private"
+            bytes_global.initializer = array
+            value_global = ir.GlobalVariable(
+                self.module, _PTR, name=f".turkey.literal.value.{index}")
+            value_global.linkage = "internal"
+            value_global.initializer = ir.Constant(_PTR, None)
+            self.string_literals[value] = (bytes_global, value_global, len(data))
         for source in self.source.globals:
             global_ = ir.GlobalVariable(self.module, _llvm_type(source.layout),
                                         name=source.name)
@@ -170,7 +193,10 @@ class _Emitter:
         entry_builder = ir.IRBuilder(blocks[source.entry])
         slots = {slot.name: entry_builder.alloca(_llvm_type(slot.layout), name=slot.name)
                  for slot in source.slots}
-        root_index, root_count = _root_slots(source)
+        root_index, value_root_count = _root_slots(source)
+        literal_roots = (list(self.string_literals.values())
+                         if source.name == self.source.entry else [])
+        root_count = value_root_count + len(literal_roots)
         root_frame = entry_builder.alloca(_ROOT_FRAME, name="root_frame")
         panic_frame_storage = entry_builder.alloca(_PANIC_FRAME, name="panic_frame")
         root_array_type = ir.ArrayType(_PTR, max(1, root_count))
@@ -190,6 +216,17 @@ class _Emitter:
         self._root_index = root_index
         self._panic_frame_storage = panic_frame_storage
         self._active_panic_frame = None
+        for offset, (bytes_global, value_global, length) in enumerate(literal_roots):
+            literal = entry_builder.call(self.runtime["turkey_string_new"], [
+                entry_builder.bitcast(bytes_global, _PTR),
+                ir.Constant(_I64, length),
+            ])
+            entry_builder.store(literal, value_global)
+            pointer = entry_builder.gep(root_values, [
+                ir.Constant(_I32, 0),
+                ir.Constant(_I32, value_root_count + offset),
+            ])
+            entry_builder.store(literal, pointer)
         self._slot_layouts = {slot.name: slot.layout for slot in source.slots}
         for param in source.params:
             if param.name in root_index:
@@ -316,17 +353,9 @@ class _Emitter:
             return builder.load(self.globals[instruction.args[0]],
                                 name=instruction.result.name), builder
         if op == "string_const":
-            data = instruction.args[0].encode("utf-8")
-            array = ir.Constant(ir.ArrayType(_I8, len(data)), bytearray(data))
-            glob = ir.GlobalVariable(self.module, array.type,
-                                     name=f".turkey.string.{self.string_count}")
-            self.string_count += 1
-            glob.global_constant = True
-            glob.linkage = "private"
-            glob.initializer = array
-            pointer = builder.bitcast(glob, _PTR)
-            return builder.call(self.runtime["turkey_string_new"],
-                                [pointer, ir.Constant(_I64, len(data))]), builder
+            return builder.load(
+                self.string_literals[instruction.args[0]][1],
+                name=instruction.result.name), builder
         if op == "call":
             value = builder.call(self.functions[instruction.args[0]], args,
                                  name=instruction.result.name)

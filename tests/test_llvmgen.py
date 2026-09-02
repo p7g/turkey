@@ -195,6 +195,19 @@ fun main() {
     assert capfd.readouterr().out == "[Some(1), None]\n"
 
 
+def test_generic_filled_arrays_box_initial_scalars_under_gc_stress(
+        monkeypatch, capfd):
+    monkeypatch.setenv("TURKEY_GC_STRESS", "1")
+    native("""
+fun main() {
+    let values = Array.filled(3, 4)
+    values[1] = 9
+    print(values)
+}
+""")
+    assert capfd.readouterr().out == "[4, 9, 4]\n"
+
+
 def test_array_byte_uses_one_byte_elements(capfd):
     checked = check("""
 fun main() {

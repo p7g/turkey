@@ -658,19 +658,23 @@ class _FunctionLowerer:
                     self.lower_values(expr.args, env, joins, block, to_bytes)
                     return
                 operation = "prim." + primitive.removeprefix("Prim.")
+                array_element_layout = None
                 if primitive in ("Prim.arrayNew", "Prim.arrayNewUninit"):
                     _, type_args = spine(expr.ty)
                     element_layout = layout_of(type_args[0]) if type_args else bir.Layout.BOXED
+                    array_element_layout = element_layout
                     operation += "." + element_layout.value
                 elif primitive == "Prim.arrayGet":
                     operation += "." + layout_of(expr.ty).value
                 elif primitive == "Prim.arraySet":
                     operation += "." + _expr_layout(expr.args[2]).value
-                self.lower_values(expr.args, env, joins, block,
-                                  lambda at, xs: done(at, self.emit(
-                                      at, operation,
-                                      tuple(xs), layout_of(expr.ty),
-                                      self.frame(expr.span))))
+                def primitive_call(at: bir.Block, values: list[bir.Operand]) -> None:
+                    if array_element_layout is not None and len(values) == 2:
+                        values[1] = self.coerce(at, values[1], array_element_layout)
+                    done(at, self.emit(
+                        at, operation, tuple(values), layout_of(expr.ty),
+                        self.frame(expr.span)))
+                self.lower_values(expr.args, env, joins, block, primitive_call)
                 return
             if isinstance(fn, CVar) and fn.name in self.functions:
                 symbol, function_type = self.functions[fn.name]

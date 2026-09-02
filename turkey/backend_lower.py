@@ -50,6 +50,9 @@ def layout_of(ty: Type) -> bir.Layout:
 
 def _expr_layout(expr: CExpr) -> bir.Layout:
     if isinstance(expr, CLit):
+        resolved = prune(expr.ty)
+        if not isinstance(resolved, TVar):
+            return layout_of(resolved)
         return {
             "Int": bir.Layout.I64, "Byte": bir.Layout.I8,
             "Char": bir.Layout.I32, "Float": bir.Layout.F64,
@@ -76,6 +79,7 @@ class _FunctionLowerer:
                  functions: dict[str, tuple[str, TFun]], decls,
                  tags: dict[str, int], record_fields: dict[str, list[str]],
                  lifted: list[bir.Function], lift_counter: list[int],
+                 globals_: dict[str, bir.Value],
                  captures: list[tuple[str, bir.Layout]] | None = None,
                  output_name: str | None = None) -> None:
         self.bind = bind
@@ -86,6 +90,7 @@ class _FunctionLowerer:
         self.record_fields = record_fields
         self.lifted = lifted
         self.lift_counter = lift_counter
+        self.globals = globals_
         self.closure_abi = captures is not None
         self.captures = captures or []
         self.output_name = output_name or mangle(bind.name)
@@ -94,9 +99,17 @@ class _FunctionLowerer:
         self.slots: list[bir.Value] = []
         self.slot_names: set[str] = set()
         self.entry = self.new_block("entry")
+        parameter_hints = {
+            param.name: hint
+            for param in lam.params
+            if (hint := _free_variable_type(lam.body, param.name)) is not None
+        }
         self.params = ([bir.Value(self.fresh("environment"), bir.Layout.PTR)]
                        if self.closure_abi else [])
-        self.params += [bir.Value(self.fresh(p.name), layout_of(p.ty)) for p in lam.params]
+        self.params += [
+            bir.Value(self.fresh(p.name), layout_of(parameter_hints.get(p.name, p.ty)))
+            for p in lam.params
+        ]
         self.env: dict[str, bir.Value] = {}
         if self.closure_abi:
             environment = self.params[0]
@@ -162,6 +175,89 @@ class _FunctionLowerer:
             self.entry.name, self.slots,
         )
 
+    def finish_initializers(self, program: CProgram,
+                            runtime_binds: list[CBind]) -> bir.Function:
+        final = self.new_block("initialized")
+        final.terminator = bir.Return(bir.Constant(bir.Layout.UNIT, 0))
+        record_roots: dict[str, bir.Value] = {}
+        actions: list[tuple] = []
+        deferred: list[tuple[str, CRecord]] = []
+        runtime_names = {bind.name for bind in runtime_binds}
+        for bind in program.dicts:
+            if bind.name not in runtime_names:
+                continue
+            value = _erase_types(bind.value)
+            if isinstance(value, CRecord):
+                actions.append(("placeholder", bind.name, value))
+                deferred.append((bind.name, value))
+            else:
+                actions.append(("bind", bind.name, bind.value))
+        for name, record in deferred:
+            for index, (_, value) in enumerate(record.fields):
+                actions.append(("field", name, index, value))
+        for bind in program.binds:
+            if bind.name in runtime_names:
+                actions.append(("bind", bind.name, bind.value))
+
+        following = final
+        for action in reversed(actions):
+            entry = self.new_block("initialize")
+            kind = action[0]
+            if kind == "placeholder":
+                _, name, record = action
+                fields = self.record_fields.get(record.con,
+                                                [field for field, _ in record.fields])
+                bitmap = sum(1 << index for index, (_, value) in enumerate(record.fields)
+                             if _pointer_layout(_expr_layout(value)))
+                made = self.emit(entry, "object_new", (
+                    "1", str(self.tags.get(record.con, -1)), str(len(fields)), str(bitmap),
+                ), bir.Layout.PTR)
+                entry.instructions.append(bir.Instruction(
+                    "global_store", (self.globals[name].name, made)))
+                root = self.new_slot("global_" + name, bir.Layout.PTR)
+                record_roots[name] = root
+                entry.instructions.append(bir.Instruction("slot_store", (root.name, made)))
+                entry.terminator = bir.Jump(following.name)
+            elif kind == "bind":
+                _, name, value = action
+                after = self.new_block("store_global", _expr_layout(value))
+                after.instructions.append(bir.Instruction(
+                    "global_store", (self.globals[name].name, after.params[0])))
+                after.terminator = bir.Jump(following.name)
+                self.lower(value, {}, {}, entry, _Destination(after))
+            else:
+                _, name, index, value = action
+                after = self.new_block("store_field", _expr_layout(value))
+                record = self.emit(after, "global_load",
+                                   (self.globals[name].name,), bir.Layout.PTR)
+                after.instructions.append(bir.Instruction(
+                    "object_set", (record, str(index), after.params[0])))
+                after.terminator = bir.Jump(following.name)
+                self.lower(value, {}, {}, entry, _Destination(after))
+            following = entry
+        self.entry.terminator = bir.Jump(following.name)
+        # Reuse finish's reachability pruning without compiling the dummy body.
+        function_type = prune(self.bind.ty)
+        assert isinstance(function_type, TFun)
+        by_name = {block.name: block for block in self.blocks}
+        reachable: set[str] = set()
+        pending = [self.entry.name]
+        while pending:
+            name = pending.pop()
+            if name in reachable:
+                continue
+            reachable.add(name)
+            term = by_name[name].terminator
+            if isinstance(term, bir.Jump):
+                pending.append(term.target)
+            elif isinstance(term, bir.Branch):
+                pending.extend((term.yes, term.no))
+        return bir.Function(
+            self.output_name, [], bir.Layout.UNIT,
+            [block for block in self.blocks if block.name in reachable],
+            self.entry.name, self.slots,
+        )
+
     def transfer(self, block: bir.Block, dest: _Destination,
                  value: bir.Operand) -> None:
         if dest.block is None:
@@ -209,8 +305,13 @@ class _FunctionLowerer:
                 failure = (failed if index + 1 == len(expr.alts)
                            else self.new_block("match_next"))
                 inner = dict(env)
+                hints = {
+                    name: hint
+                    for name in _pattern_names(alt.pat)
+                    if (hint := _free_variable_type(alt.body, name)) is not None
+                }
                 self.lower_pattern(alt.pat, value, expr.scrutinee.ty,
-                                   inner, test, success, failure)
+                                   inner, test, success, failure, hints)
                 self.lower(alt.body, inner, joins, success, dest)
                 test = failure
             self.lower(expr.scrutinee, env, joins, block,
@@ -333,6 +434,11 @@ class _FunctionLowerer:
                     done(block, self.emit(block, "function_closure",
                                           (self.functions[expr.name][0],),
                                           bir.Layout.PTR))
+                    return
+                if expr.name in self.globals:
+                    global_ = self.globals[expr.name]
+                    done(block, self.emit(block, "global_load",
+                                          (global_.name,), global_.layout))
                     return
                 raise Unsupported(f"LLVM backend cannot use top-level value '{expr.name}'", expr.span)
             slot = env[expr.name]
@@ -520,6 +626,7 @@ class _FunctionLowerer:
         child = _FunctionLowerer(
             bind, lam, self.functions, self.decls, self.tags,
             self.record_fields, self.lifted, self.lift_counter,
+            self.globals,
             [(name, slot.layout) for name, slot in captures], symbol,
         )
         function = child.finish()
@@ -541,15 +648,17 @@ class _FunctionLowerer:
     def lower_pattern(self, pat, value: bir.Operand, ty: Type,
                       env: dict[str, bir.Value],
                       block: bir.Block, success: bir.Block,
-                      failure: bir.Block) -> None:
+                      failure: bir.Block,
+                      hints: dict[str, Type]) -> None:
         if isinstance(pat, ast.PAnnot):
-            self.lower_pattern(pat.pat, value, ty, env, block, success, failure)
+            self.lower_pattern(pat.pat, value, ty, env, block, success, failure,
+                               hints)
             return
         if isinstance(pat, ast.PWild):
             block.terminator = bir.Jump(success.name)
             return
         if isinstance(pat, ast.PVar):
-            slot = self.new_slot(pat.name, layout_of(ty))
+            slot = self.new_slot(pat.name, layout_of(hints.get(pat.name, ty)))
             env[pat.name] = slot
             block.instructions.append(bir.Instruction("slot_store", (slot.name, value)))
             block.terminator = bir.Jump(success.name)
@@ -588,11 +697,12 @@ class _FunctionLowerer:
             at = contents
             for index, (field, sub) in enumerate(pieces):
                 field_ty = con_type.params[field]
-                field_layout = layout_of(field_ty)
+                field_layout = _pattern_layout(sub, field_ty, hints)
                 object_value = self.emit(at, "slot_load", (held.name,), held.layout)
                 loaded = self.emit(at, "object_get", (object_value, str(field)), field_layout)
                 following = success if index + 1 == len(pieces) else self.new_block("pattern_field")
-                self.lower_pattern(sub, loaded, field_ty, env, at, following, failure)
+                self.lower_pattern(sub, loaded, field_ty, env, at, following,
+                                   failure, hints)
                 at = following
             if not pieces:
                 contents.terminator = bir.Jump(success.name)
@@ -606,9 +716,10 @@ class _FunctionLowerer:
             for index, (sub, field_ty) in enumerate(zip(pat.elems, tuple_ty.elems)):
                 tuple_value = self.emit(at, "slot_load", (held.name,), held.layout)
                 loaded = self.emit(at, "object_get", (tuple_value, str(index)),
-                                   layout_of(field_ty))
+                                   _pattern_layout(sub, field_ty, hints))
                 following = success if index + 1 == len(pat.elems) else self.new_block("tuple_field")
-                self.lower_pattern(sub, loaded, field_ty, env, at, following, failure)
+                self.lower_pattern(sub, loaded, field_ty, env, at, following,
+                                   failure, hints)
                 at = following
             if not pat.elems:
                 block.terminator = bir.Jump(success.name)
@@ -655,6 +766,81 @@ def _record_layouts(program: CProgram, decls) -> dict[str, list[str]]:
     return layouts
 
 
+def _pattern_names(pattern) -> set[str]:
+    names: set[str] = set()
+
+    def walk(value) -> None:
+        if isinstance(value, ast.PVar):
+            names.add(value.name)
+        elif isinstance(value, ast.Pattern):
+            for item in data_fields(value):
+                walk(getattr(value, item.name))
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item)
+
+    walk(pattern)
+    return names
+
+
+def _free_variable_type(expr: CExpr, name: str) -> Type | None:
+    """Find an occurrence type without confusing a shadowing source binder."""
+    found: Type | None = None
+
+    def walk(value, shadowed: bool = False) -> None:
+        nonlocal found
+        if found is not None or value is None:
+            return
+        if isinstance(value, CVar):
+            if not shadowed and value.name == name:
+                found = value.ty
+            return
+        if isinstance(value, CLam):
+            walk(value.body, shadowed or any(p.name == name for p in value.params))
+            return
+        if isinstance(value, CLet):
+            walk(value.value, shadowed)
+            walk(value.body, shadowed or value.name == name)
+            return
+        if isinstance(value, CLetRec):
+            hidden = shadowed or any(bind.name == name for bind in value.binds)
+            for bind in value.binds:
+                walk(bind.value, hidden)
+            walk(value.body, hidden)
+            return
+        if isinstance(value, CJoin):
+            walk(value.body, shadowed or any(p.name == name for p in value.params))
+            walk(value.rest, shadowed)
+            return
+        if isinstance(value, CMatch):
+            walk(value.scrutinee, shadowed)
+            for alt in value.alts:
+                walk(alt.body, shadowed or name in _pattern_names(alt.pat))
+            return
+        if isinstance(value, CExpr):
+            for item in data_fields(value):
+                walk(getattr(value, item.name), shadowed)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                walk(item, shadowed)
+
+    walk(expr)
+    return found
+
+
+def _pattern_layout(pattern, fallback: Type,
+                    hints: dict[str, Type]) -> bir.Layout:
+    while isinstance(pattern, ast.PAnnot):
+        pattern = pattern.pat
+    if isinstance(pattern, ast.PVar) and pattern.name in hints:
+        return layout_of(hints[pattern.name])
+    # Nested constructors and tuples are heap values regardless of the type
+    # family carried by their contents.
+    if isinstance(pattern, (ast.PCon, ast.PRecord, ast.PTuple)):
+        return bir.Layout.PTR
+    return layout_of(fallback)
+
+
 def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
     record_fields = _record_layouts(program, decls)
     tag_names = sorted(set(decls.constructors) | set(record_fields))
@@ -684,29 +870,73 @@ def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
         raise Unsupported(f"LLVM entry '{main}' is not a function")
     by_name = {bind.name: (bind, lam) for bind, lam in candidates}
     owner = {functions[name][0]: name for name in by_name}
+    all_binds = {bind.name: bind for bind in program.dicts + program.binds}
+    main_module = all_binds[main].module
     reachable: set[str] = set()
-    pending = [main]
+    # Entry-module values retain observable source initialization order. The
+    # work list then pulls in every imported function/value they reference.
+    pending = [main, *(bind.name for bind in program.binds
+                       if bind.module == main_module and bind.name not in functions)]
     while pending:
         name = pending.pop()
         if name in reachable:
             continue
         reachable.add(name)
-        bind, _ = by_name[name]
+        bind = all_binds[name]
         for dependency in sorted(names_of(bind.value)):
             if dependency in functions:
                 actual = owner.get(functions[dependency][0])
                 if actual is not None and actual not in reachable:
                     pending.append(actual)
+            elif dependency in all_binds and dependency not in reachable:
+                pending.append(dependency)
     chosen = [pair for pair in candidates if pair[0].name in reachable]
     lifted: list[bir.Function] = []
     lift_counter = [0]
+    runtime_binds = [bind for bind in program.dicts + program.binds
+                     if bind.name in reachable and bind.name not in functions]
+    globals_ = {
+        bind.name: bir.Value(mangle("global." + bind.name),
+                             _expr_layout(_erase_types(bind.value)))
+        for bind in runtime_binds
+    }
     top: list[bir.Function] = []
     for bind, lam in chosen:
         top.append(_FunctionLowerer(
             bind, lam, functions, decls, tags, record_fields,
-            lifted, lift_counter,
+            lifted, lift_counter, globals_,
         ).finish())
-    module = bir.Module(top + lifted, functions[main][0])
+
+    init_name = "turkey_module_initialize"
+    init_type = TFun([], UNIT)
+    init_lam = CLam(ty=init_type, params=[], body=CUnit(UNIT),
+                    name="<module initialization>")
+    init_bind = CBind(init_name, init_type, [], init_lam)
+    initializer = _FunctionLowerer(
+        init_bind, init_lam, functions, decls, tags, record_fields,
+        lifted, lift_counter, globals_, output_name=init_name,
+    ).finish_initializers(program, runtime_binds)
+
+    run_name = "turkey_run"
+    run_block = bir.Block("entry")
+    init_result = bir.Value("initialized", bir.Layout.UNIT)
+    run_block.instructions.append(bir.Instruction("call", (init_name,), init_result))
+    for global_ in globals_.values():
+        if _pointer_layout(global_.layout):
+            held = bir.Value("root_" + global_.name, global_.layout)
+            run_block.instructions.append(
+                bir.Instruction("global_load", (global_.name,), held))
+    result_layout = functions[main][1].ret
+    result = bir.Value("result", layout_of(result_layout))
+    run_block.instructions.append(
+        bir.Instruction("call", (functions[main][0],), result))
+    run_block.terminator = bir.Return(result)
+    runner = bir.Function(run_name, [], result.layout, [run_block])
+
+    module = bir.Module(
+        [initializer, *top, *lifted, runner], run_name,
+        list(globals_.values()),
+    )
     bir.check(module)
     return module
 

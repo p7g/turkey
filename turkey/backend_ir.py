@@ -95,6 +95,7 @@ class Function:
 class Module:
     functions: list[Function]
     entry: str
+    globals: list[Value] = field(default_factory=list)
 
 
 class CheckError(ValueError):
@@ -154,7 +155,11 @@ def _check_function(function: Function) -> None:
                 raise CheckError(f"wrong jump arity to {term.target} in {function.name}")
             if any(_layout(arg) is not param.layout
                    for arg, param in zip(term.args, target.params)):
-                raise CheckError(f"wrong jump layout to {term.target} in {function.name}")
+                actual = ", ".join(_layout(arg).value for arg in term.args)
+                expected = ", ".join(param.layout.value for param in target.params)
+                raise CheckError(
+                    f"wrong jump layout to {term.target} in {function.name}: "
+                    f"got ({actual}), expected ({expected})")
             operands = term.args
         elif isinstance(term, Branch):
             if term.yes not in blocks or term.no not in blocks:
@@ -175,6 +180,8 @@ def _layout(operand: Operand) -> Layout:
 def format_module(module: Module) -> str:
     """Stable human-readable form used by focused lowering tests."""
     lines = [f"entry @{module.entry}"]
+    lines.extend(f"global ${value.name}:{value.layout.value}"
+                 for value in module.globals)
     for function in module.functions:
         params = ", ".join(_value(p) for p in function.params)
         lines.append(f"fun @{function.name}({params}) -> {function.result.value} {{")

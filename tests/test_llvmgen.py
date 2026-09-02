@@ -149,8 +149,11 @@ def test_run_accepts_opt_in_llvm_backend(tmp_path, capfd):
     assert capfd.readouterr().out == "7\n"
 
 
-@pytest.mark.parametrize("name", ["records", "fields"])
-def test_native_aggregates_and_patterns_match_conformance_output(name, capfd):
+@pytest.mark.parametrize("name", [
+    "records", "fields", "tuple_binding", "iter", "dicts",
+    "question_control", "operators",
+])
+def test_native_supported_programs_match_conformance_output(name, capfd):
     program = Path(__file__).parent / "programs" / f"{name}.tl"
     checked = check(program.read_text(encoding="utf-8"), str(program),
                     [program.parent.resolve()])

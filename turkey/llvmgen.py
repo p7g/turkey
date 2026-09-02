@@ -46,6 +46,7 @@ class _Emitter:
         self.module.triple = binding.get_default_triple()
         self.module.data_layout = str(self.machine.target_data)
         self.functions: dict[str, ir.Function] = {}
+        self.globals: dict[str, ir.GlobalVariable] = {}
         self.runtime: dict[str, ir.Function] = {}
         self.closure_thunks: dict[str, ir.Function] = {}
         self.string_count = 0
@@ -87,6 +88,12 @@ class _Emitter:
         self._runtime("turkey_root_pop", ir.VoidType(), [_PTR])
 
     def emit(self) -> tuple[str, binding.TargetMachine]:
+        for source in self.source.globals:
+            global_ = ir.GlobalVariable(self.module, _llvm_type(source.layout),
+                                        name=source.name)
+            global_.linkage = "internal"
+            global_.initializer = ir.Constant(_llvm_type(source.layout), None)
+            self.globals[source.name] = global_
         for source in self.source.functions:
             ty = ir.FunctionType(_llvm_type(source.result),
                                  [_llvm_type(p.layout) for p in source.params])
@@ -194,6 +201,13 @@ class _Emitter:
             return None, builder
         if op == "slot_load":
             return builder.load(slots[instruction.args[0]], name=instruction.result.name), builder
+        if op == "global_store":
+            builder.store(self._operand(instruction.args[1], values),
+                          self.globals[instruction.args[0]])
+            return None, builder
+        if op == "global_load":
+            return builder.load(self.globals[instruction.args[0]],
+                                name=instruction.result.name), builder
         if op == "string_const":
             data = instruction.args[0].encode("utf-8")
             array = ir.Constant(ir.ArrayType(_I8, len(data)), bytearray(data))

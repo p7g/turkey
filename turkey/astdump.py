@@ -34,7 +34,7 @@ would otherwise pass M20 and fail much later.
 from __future__ import annotations
 
 from . import ast
-from .lexer import quote
+from .lexer import literal_text, quote
 from .types import float_to_string
 
 
@@ -109,11 +109,7 @@ class _Writer:
 
 
 def _literal(kind: str, value: object) -> str:
-    if kind == "Float":
-        return float_to_string(value)
-    if kind == "Int":
-        return str(value)
-    return quote(value)
+    return literal_text(kind, value)
 
 
 # Each rule writes the node's own line, then its children in field order.

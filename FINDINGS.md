@@ -139,6 +139,76 @@ and there was nothing in it to port wrongly. This is the first bug in the
 bootstrap that is *only* a bug in the port, and it is one the language's absence
 of identity made available.
 
+### 38. A generated node kept the id zero, and the checker found it
+**bug, fixed.** M23, and entry 36's other half. `Resolve` writes an `EVar` of
+its own for the `get` and `set` a bracket means, and stamped it `id = 0` --
+written when node ids came only from the parser and resolution had no counter to
+draw on. Every bracket in the program therefore shared one id, so every `set`
+read whatever the first one had recorded.
+
+What makes it worth its own entry is *how* it was found. The `core` dump matched
+the reference byte for byte and all three `.core` goldens still passed, because
+the printer does not show a node's type: the wrong type sat on a `CField` where
+nothing printed it. It was the Core checker, on its first run, that said `the
+field 'set' should be fun(Array a, Int) -> a but is fun(Array a, Int, a) ->
+Unit`.
+
+That is `plan.txt` item 5's claim, demonstrated on the port rather than argued
+for: a differential test compares what two implementations *print*, and a
+checker compares what a term *is*. The two catch different things, and this is
+one only the second could catch.
+
+### 39. The Core dump printed literals raw, and one control character showed it
+**bug, fixed.** M23. Entry 2 records the token and tree dumps being made to
+print the *language's* spelling rather than the host's. `core.show_expr` was
+never given the same treatment: a string literal was `f'"{e.value}"'`, so a
+`\r` or a `\n` inside one went into the dump as itself.
+
+That makes the dump not read back -- a literal ends the line it is printed on --
+and it makes the text sensitive to how it is captured, which is how it surfaced.
+The harness read `boot`'s output with `text=True`, whose universal-newline
+translation rewrites a `\r` as a `\n`; the reference side was built in-process
+and did no such thing. The result was a mismatch four thousand lines from
+anything wrong, in the one corpus program that writes `"a\r\nb\r\n"`.
+
+Two fixes, and the second is the one that matters. The harness now decodes bytes
+itself rather than letting the capture rewrite what it is comparing. And both
+dumps now share one spelling -- `lexer.literal_text` in the Python,
+`Ast.literalText` in the port -- so a float gets PRIMITIVES.md 3.3's form and a
+string or char gets design.md 2.1's escapes, wherever it is printed.
+
+No golden moved, which is exactly why this lasted: not one of the three `.core`
+goldens contains a control character in a literal. A dump nobody has printed a
+hard case through is a dump whose escaping has not been tested.
+
+### 40. The optimizer was quadratic in call sites, and only `boot` was big enough to show it
+**performance, fixed.** M23. Compiling `boot` takes about ninety-seven seconds,
+and a profile said that ninety-five of them are `turkey/opt.py` -- the *Python*
+optimizer working on `boot`'s own Core, before a single line of `boot` runs.
+Two costs, both invisible at the scale of `tests/programs`:
+
+**`dataclasses.fields` was called fifty-five million times.** It builds a fresh
+tuple per call, and six generic walks in that module ask it once per node per
+traversal. The answer depends only on the class, so it is now asked once per
+class. About a sixth of the compile.
+
+**The inliner asked per call site what it should have asked per callee.**
+`body_of` already memoizes each binding's *reduced body*, and then every site
+that mentioned that binding recomputed `_transfers(body)` and `_size(body)` over
+it -- and, worse, ran `_rebase_spans` (a full copy) and `_apply` (a full
+substitution) *before* discovering the body was too large to inline at all. Both
+questions are about the callee, so both are now answered once per binding, and
+answered before anything is copied.
+
+Together: ninety-seven seconds to forty-six, with every golden and all 1,083
+Python tests unchanged.
+
+`plan.txt` item 9 calls the bootstrap "the scale test for both the language and
+its new execution path". This is the second half of that sentence collecting.
+Nothing in `tests/programs` is large enough for a per-call-site copy of a
+too-large body to cost anything measurable; `boot` is twelve thousand lines with
+a standard library behind it, and it made a constant factor into a wall.
+
 ---
 
 ## Open, and accepted

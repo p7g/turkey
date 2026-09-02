@@ -3,7 +3,7 @@ module Turkey.Ast (
     Pat(..), PatKind(..),
     Expr(..), ExprKind(..),
     Stmt(..), StmtKind(..),
-    Lit(..), litKind,
+    Lit(..), litKind, literalText,
     Arm(..),
     Pred(..), PredKind(..),
     FunDecl(..),
@@ -47,6 +47,7 @@ module Turkey.Ast (
 -- keys a table by one.
 
 import Turkey.Source (Span)
+import Turkey.Token (quote)
 
 -- Where a node's `id` comes from.
 --
@@ -83,6 +84,20 @@ fun litKind(l : Lit) -> String = match l {
     LFloat(_) -> "Float"
     LString(_) -> "String"
     LChar(_) -> "Char"
+}
+
+-- A literal, spelled the way the language spells it rather than the host.
+--
+-- The tree dump and the Core dump both print literals, and both must print them
+-- the same way -- so the rule is here, once, beside the kind it names. A float
+-- gets PRIMITIVES.md 3.3's spelling and a string or char gets design.md 2.1's
+-- escapes, which is what keeps a control character inside a literal from ending
+-- the line it is printed on.
+fun literalText(l : Lit) -> String = match l {
+    LInt(n) -> Int.toString(n)
+    LFloat(f) -> Float.toString(f)
+    LString(s) -> quote(s)
+    LChar(c) -> quote(Char.toString(c))
 }
 
 -- -- type syntax ------------------------------------------------------------------

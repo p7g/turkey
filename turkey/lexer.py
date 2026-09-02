@@ -143,6 +143,22 @@ def quote(text: str) -> str:
     return "".join(out)
 
 
+def literal_text(kind: str, value: object) -> str:
+    """A literal, spelled the way the language spells it rather than the host.
+
+    `turkey ast` and `turkey core` both print literals, and both must print them
+    the same way -- so the rule is here, once, beside the `quote` it is mostly
+    made of. A float gets PRIMITIVES.md 3.3's spelling and a string or char gets
+    design.md 2.1's escapes, which is what keeps a control character inside a
+    literal from ending the line it is printed on.
+    """
+    if kind == "Float":
+        return float_to_string(value)
+    if kind == "Int":
+        return str(value)
+    return quote(value)
+
+
 class Lexer:
     def __init__(self, src: str, file: str | None = None):
         self.src = src

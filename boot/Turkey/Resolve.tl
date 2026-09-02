@@ -392,8 +392,11 @@ fun resolveMethod(r : R, ref : Option Expr) -> Unit = match ref {
 fun methodRef(r : R, name : String, where : Span) -> Option Expr =
     match Map.get(r.scope.methods, name) {
         None -> None
+        -- From the same supply as every parsed node's. A constant here would
+        -- give every bracket in the program one id, and the tables keyed by it
+        -- hold a whole program: the second `get` would read the first's type.
         Some(target) -> Some(Expr {
-            id = 0, span = where, kind = EVar(target, True),
+            id = freshNodeId(), span = where, kind = EVar(target, True),
         })
     }
 

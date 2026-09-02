@@ -63,6 +63,7 @@ import re
 from dataclasses import dataclass, field, fields
 
 from .errors import Span
+from .lexer import literal_text
 from .types import (
     STAR, TApp, TCon, TVar, Type, kind_arrow, show,
 )
@@ -457,8 +458,7 @@ def show_expr(e: CExpr | None, indent: int = 0,
     if e is None:
         return f"{pad}<none>"
     if isinstance(e, CLit):
-        value = f'"{e.value}"' if e.kind == "String" else str(e.value)
-        return f"{pad}{value}"
+        return f"{pad}{literal_text(e.kind, e.value)}"
     if isinstance(e, CUnit):
         return f"{pad}()"
     if isinstance(e, CVar):
@@ -589,7 +589,7 @@ def _pattern(pat) -> str:
     if isinstance(pat, ast.PWild):
         return "_"
     if isinstance(pat, ast.PLit):
-        return f'"{pat.value}"' if pat.kind == "String" else str(pat.value)
+        return literal_text(pat.kind, pat.value)
     if isinstance(pat, ast.PCon):
         if not pat.args:
             return pat.name

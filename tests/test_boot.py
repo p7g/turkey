@@ -1,6 +1,7 @@
 """The bootstrap compiler, diffed against the implementation it is porting.
 
-`boot/` is a Turkey compiler written in Turkey (plan.txt item 9). Each of its
+`boot/` is a Turkey compiler written in Turkey (plan.txt item 9), whose
+modules are `Turkey.*`. Each of its
 milestones is checked the same way: run it over every Turkey file in the repo
 and compare its output, byte for byte, against the Python implementation's.
 
@@ -36,7 +37,7 @@ def _corpus() -> list[Path]:
     """Every Turkey file in the repository, in a stable order."""
     found = sorted(
         set(REPO_ROOT.glob("tests/programs/**/*.tl"))
-        | set(REPO_ROOT.glob("turkey/lib/**/*.tl"))
+        | set(REPO_ROOT.glob("lib/**/*.tl"))
         | set(REPO_ROOT.glob("boot/**/*.tl"))
     )
     assert found, "no Turkey source found to compare against"

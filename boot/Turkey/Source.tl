@@ -1,17 +1,11 @@
-module Boot.Source (Span, Span(..), span, showSpan, Source, Source(..), read)
+module Turkey.Source (Span(..), span, showSpan, Source(..), read)
 
 -- Where a thing is, and what it is in.
 --
--- The bottom of the bootstrap compiler's module graph (plan.txt item 9). Turkey
--- has no mutually recursive modules, so every layer above this one may mention
--- a `Span` and nothing here may mention a token, a tree or a type.
+-- The bottom of the compiler's module graph (plan.txt item 9). Turkey has no
+-- mutually recursive modules, so every layer above this one may mention a
+-- `Span` and nothing here may mention a token, a tree or a type.
 
-import Prelude ()
-import Std.Classes
-import Data.Bool.Type (Bool(..))
-import Data.Int as Int
-import Data.Option.Type (Option(..))
-import Data.String as String
 import System.IO as IO
 
 -- Lines and columns are 1-based, counted in *code points* rather than bytes,
@@ -37,11 +31,9 @@ type Source = Source {
 }
 
 -- `None` when the file cannot be read *or* is not well-formed UTF-8. The two
--- are not distinguished here because nothing above needs to: either way there
--- is no source to compile, and the message says which file.
-fun read(path : String) -> Option Source {
-    match IO.readFile(path) {
-        None -> None
-        Some(text) -> Some(Source { name = path, text = text })
-    }
+-- are not distinguished because nothing above needs them to be: either way
+-- there is no source to compile, and the message says which file.
+fun read(path : String) -> Option Source = match IO.readFile(path) {
+    None -> None
+    Some(text) -> Some(Source { name = path, text = text })
 }

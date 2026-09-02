@@ -1,4 +1,4 @@
-module Boot.Lexer (tokenize, tokenizeRaw, applyNewlineRule)
+module Turkey.Lexer (tokenize, tokenizeRaw, applyNewlineRule)
 
 -- The tokenizer, in two passes (design.md 2, SPEC-DELTAS.md 11).
 --
@@ -8,27 +8,16 @@ module Boot.Lexer (tokenize, tokenizeRaw, applyNewlineRule)
 -- is how `turkey/lexer.py` is arranged too -- this is a port, and a port that
 -- reorganized things would be much harder to diff.
 --
--- Two deliberate differences from the Python, both in the direction of the
--- spec. Python asks `str.isalpha` and `str.isdigit`, which are Unicode-wide, so
--- a Devanagari digit or a Greek letter would start a numeral or an identifier
--- there; design.md 2.1 says `[a-z_]` and `[0-9]`, and that is what this asks.
--- And an integer literal outside `Int`'s range is a lex error here rather than
--- an unbounded token, which is what PRIMITIVES.md 1.3 requires.
+-- Two deliberate differences from the Python, both toward the spec. Python asks
+-- `str.isalpha` and `str.isdigit`, which are Unicode-wide, so a Devanagari
+-- digit or a Greek letter would start a numeral or an identifier there;
+-- design.md 2.1 says `[a-z_]` and `[0-9]`, and that is what this asks. And an
+-- integer literal outside `Int`'s range is a lex error here rather than an
+-- unbounded token, which is what PRIMITIVES.md 1.3 requires.
 
-import Prelude ()
-import Std.Classes
-import Data.Array as Array
-import Data.Array (Array)
-import Data.Bool.Type (Bool(..))
-import Data.Char as Char
-import Data.Float as Float
-import Data.Int as Int
-import Data.Option.Type (Option(..))
-import Data.String as String
-import Boot.Diag as Diag
-import Boot.Diag (Diag)
-import Boot.Source (Source, Span, span)
-import Boot.Token (Kind, Kind(..), Token, Token(..), Value, Value(..), isOp)
+import Turkey.Diag as Diag
+import Turkey.Source (Source, Span, span)
+import Turkey.Token (Kind(..), Token(..), Value(..), isOp)
 
 type Lexer = Lexer {
     src  : String,
@@ -37,6 +26,33 @@ type Lexer = Lexer {
     line : Int,
     col  : Int,
 }
+
+-- -- tables -------------------------------------------------------------------------
+--
+-- Built once, at load time. A function returning a literal would rebuild its
+-- array on every call, which for `keywords` means once per identifier.
+
+let keywords = [
+    "type", "class", "instance", "fun", "let", "var", "match", "if", "else",
+    "while", "for", "in", "loop", "return", "break", "continue", "module",
+    "import", "export", "as", "hiding", "do",
+]
+
+-- Longest match first: `<=` must beat `<` and `->` must beat `-`. `?` is a
+-- postfix operator and no two-character operator begins with one, so it sits
+-- with the singles.
+let operators = [
+    "==", "!=", "<=", ">=", "->", "&&", "||", "..",
+    "=", "<", ">", "+", "-", "*", "/", "%", "!", ":", ",", ".", "|", "~", "?",
+    "{", "}", "(", ")", "[", "]",
+]
+
+-- design.md 2.4's following condition, for the keywords among it.
+let starters = [
+    "let", "var", "fun", "type", "class", "instance", "if", "match",
+    "while", "for", "loop", "return", "break", "continue", "module",
+    "import", "do",
+]
 
 -- -- character helpers -----------------------------------------------------------
 
@@ -116,24 +132,15 @@ fun charIsSign(c : Option Char) -> Bool = match c {
     None -> False
 }
 
--- -- the tables -------------------------------------------------------------------
-
-fun keywords() -> Array String = [
-    "type", "class", "instance", "fun", "let", "var", "match", "if", "else",
-    "while", "for", "in", "loop", "return", "break", "continue", "module",
-    "import", "export", "as", "hiding", "do",
-]
-
--- Longest match first: `<=` must beat `<` and `->` must beat `-`. `?` is a
--- postfix operator and no two-character operator begins with one, so it sits
--- with the singles.
-fun operators() -> Array String = [
-    "==", "!=", "<=", ">=", "->", "&&", "||", "..",
-    "=", "<", ">", "+", "-", "*", "/", "%", "!", ":", ",", ".", "|", "~", "?",
-    "{", "}", "(", ")", "[", "]",
-]
-
-fun hexDigits() -> String = "0123456789abcdefABCDEF"
+fun isHexDigit(c : Option Char) -> Bool = match c {
+    None -> False
+    Some(found) -> match found {
+        '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' -> True
+        'a' | 'b' | 'c' | 'd' | 'e' | 'f' -> True
+        'A' | 'B' | 'C' | 'D' | 'E' | 'F' -> True
+        _ -> False
+    }
+}
 
 -- -- pass one ----------------------------------------------------------------------
 
@@ -152,43 +159,34 @@ fun tokenizeRaw(source : Source) -> Array Token {
         let start = here(lx)
         match peek(lx) {
             None -> { break }
-            Some(c) -> {
-                if c == '\n' {
-                    bump(lx)
-                    Array.push(tokens, plain(KNewline, VText("\n"), start))
-                } else {
-                    if c == ';' {
-                        bump(lx)
-                        Array.push(tokens, forcedNewline(start))
-                    } else {
-                        if Char.isDigit(c) {
-                            -- After a dot, digits are a projection selector, so
-                            -- a following dot must not fold the selector and its
-                            -- successor into one FLOAT: `x.0.1` is two chained
-                            -- projections.
-                            Array.push(tokens, lexNumber(lx, start, afterDot(tokens)))
-                        } else {
-                            if c == '"' {
-                                Array.push(tokens, lexString(lx, start))
-                            } else {
-                                if c == '\'' {
-                                    Array.push(tokens, lexChar(lx, start))
-                                } else {
-                                    if Char.isAsciiAlpha(c) || c == '_' {
-                                        Array.push(tokens, lexWord(lx, start))
-                                    } else {
-                                        Array.push(tokens, lexOperator(lx, start, c))
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            Some(c) -> { Array.push(tokens, lexOne(lx, start, c, tokens)) }
         }
     }
     Array.push(tokens, plain(KEof, VText(""), here(lx)))
     tokens
+}
+
+fun lexOne(lx : Lexer, start : Span, c : Char, tokens : Array Token) -> Token {
+    if c == '\n' {
+        bump(lx)
+        plain(KNewline, VText("\n"), start)
+    } else if c == ';' {
+        bump(lx)
+        Token { kind = KNewline, value = VText(";"), span = start, forced = True }
+    } else if Char.isDigit(c) {
+        -- After a dot, digits are a projection selector, so a following dot
+        -- must not fold the selector and its successor into one FLOAT: `x.0.1`
+        -- is two chained projections.
+        lexNumber(lx, start, afterDot(tokens))
+    } else if c == '"' {
+        lexString(lx, start)
+    } else if c == '\'' {
+        lexChar(lx, start)
+    } else if Char.isAsciiAlpha(c) || c == '_' {
+        lexWord(lx, start)
+    } else {
+        lexOperator(lx, start, c)
+    }
 }
 
 fun afterDot(tokens : Array Token) -> Bool = match Array.last(tokens) {
@@ -198,9 +196,6 @@ fun afterDot(tokens : Array Token) -> Bool = match Array.last(tokens) {
 
 fun plain(kind : Kind, value : Value, where : Span) -> Token =
     Token { kind = kind, value = value, span = where, forced = False }
-
-fun forcedNewline(where : Span) -> Token =
-    Token { kind = KNewline, value = VText(";"), span = where, forced = True }
 
 -- Spaces, tabs, carriage returns and comments -- but never a newline, which is
 -- a token.
@@ -212,19 +207,15 @@ fun skipInlineTrivia(lx : Lexer) -> Unit {
             Some(c) -> {
                 if c == ' ' || c == '\t' || c == '\r' {
                     bump(lx)
-                } else {
-                    if c == '-' && charIs(peekAt(lx, 1), '-') {
-                        while !atEnd(lx) {
-                            if charIs(peek(lx), '\n') { break }
-                            bump(lx)
-                        }
-                    } else {
-                        if c == '{' && charIs(peekAt(lx, 1), '-') {
-                            skipBlockComment(lx)
-                        } else {
-                            break
-                        }
+                } else if c == '-' && charIs(peekAt(lx, 1), '-') {
+                    while !atEnd(lx) {
+                        if charIs(peek(lx), '\n') { break }
+                        bump(lx)
                     }
+                } else if c == '{' && charIs(peekAt(lx, 1), '-') {
+                    skipBlockComment(lx)
+                } else {
+                    break
                 }
             }
         }
@@ -240,14 +231,12 @@ fun skipBlockComment(lx : Lexer) -> Unit {
         if charIs(peek(lx), '{') && charIs(peekAt(lx, 1), '-') {
             bumpBy(lx, 2)
             depth = depth + 1
+        } else if charIs(peek(lx), '-') && charIs(peekAt(lx, 1), '}') {
+            bumpBy(lx, 2)
+            depth = depth - 1
+            if depth == 0 { break }
         } else {
-            if charIs(peek(lx), '-') && charIs(peekAt(lx, 1), '}') {
-                bumpBy(lx, 2)
-                depth = depth - 1
-                if depth == 0 { break }
-            } else {
-                bump(lx)
-            }
+            bump(lx)
         }
     }
 }
@@ -260,27 +249,7 @@ fun lexNumber(lx : Lexer, start : Span, afterDot : Bool) -> Token {
     -- FLOAT is `[0-9]+.[0-9]+`: a `.` only continues the number when a digit
     -- follows, so `1.foo` stays an INT and a field access.
     if !afterDot && charIs(peek(lx), '.') && charIsDigit(peekAt(lx, 1)) {
-        bump(lx)
-        while charIsDigit(peek(lx)) { bump(lx) }
-        -- An exponent, and only after a fractional part, so `1e10` is still two
-        -- tokens. What it buys is round-tripping: `show` on a large `Float`
-        -- prints one, and the string it produces has to lex back.
-        if charIs(peek(lx), 'e') || charIs(peek(lx), 'E') {
-            if charIsDigit(peekAt(lx, 1)) {
-                bumpBy(lx, 1)
-                while charIsDigit(peek(lx)) { bump(lx) }
-            } else {
-                if charIsSign(peekAt(lx, 1)) && charIsDigit(peekAt(lx, 2)) {
-                    bumpBy(lx, 2)
-                    while charIsDigit(peek(lx)) { bump(lx) }
-                }
-            }
-        }
-        let text = String.slice(lx.src, from, lx.at)
-        match Float.parse(text) {
-            Some(x) -> { return plain(KFloat, VFloat(x), start) }
-            None -> { oops(lx, "malformed floating-point literal " + text, start) }
-        }
+        return lexFloat(lx, start, from)
     }
     let text = String.slice(lx.src, from, lx.at)
     match Int.parse(text) {
@@ -288,6 +257,28 @@ fun lexNumber(lx : Lexer, start : Span, afterDot : Bool) -> Token {
         -- PRIMITIVES.md 1.3: `Int` is 64-bit, so a literal past its range is a
         -- compile error rather than something that wraps or widens.
         None -> oops(lx, "integer literal out of range: " + text, start)
+    }
+}
+
+fun lexFloat(lx : Lexer, start : Span, from : String.Index) -> Token {
+    bump(lx)
+    while charIsDigit(peek(lx)) { bump(lx) }
+    -- An exponent, and only after a fractional part, so `1e10` is still two
+    -- tokens. What it buys is round-tripping: `show` on a large `Float` prints
+    -- one, and the string it produces has to lex back.
+    if charIs(peek(lx), 'e') || charIs(peek(lx), 'E') {
+        if charIsDigit(peekAt(lx, 1)) {
+            bump(lx)
+            while charIsDigit(peek(lx)) { bump(lx) }
+        } else if charIsSign(peekAt(lx, 1)) && charIsDigit(peekAt(lx, 2)) {
+            bumpBy(lx, 2)
+            while charIsDigit(peek(lx)) { bump(lx) }
+        }
+    }
+    let text = String.slice(lx.src, from, lx.at)
+    match Float.parse(text) {
+        Some(x) -> plain(KFloat, VFloat(x), start)
+        None -> oops(lx, "malformed floating-point literal " + text, start)
     }
 }
 
@@ -353,21 +344,24 @@ fun lexEscape(lx : Lexer) -> Char {
         Some(found) -> { c = found }
     }
     bump(lx)
-    if c == 'u' { return lexUnicodeEscape(lx, start) }
-    if c == 'n' { return '\n' }
-    if c == 't' { return '\t' }
-    if c == 'r' { return '\r' }
-    if c == '0' { return '\0' }
-    if c == '\\' { return '\\' }
-    if c == '"' { return '"' }
-    if c == '\'' { return '\'' }
-    oops(lx, "unknown escape sequence '\\" + Char.toString(c) + "'", start)
+    match c {
+        'u' -> lexUnicodeEscape(lx, start)
+        'n' -> '\n'
+        't' -> '\t'
+        'r' -> '\r'
+        '0' -> '\0'
+        '\\' -> '\\'
+        '"' -> '"'
+        '\'' -> '\''
+        _ -> oops(lx, "unknown escape sequence '\\" + Char.toString(c) + "'", start)
+    }
 }
 
+let malformedUnicodeEscape =
+    "\\u escape must be written \\u{...}, with one to six hex digits in the braces"
+
 fun lexUnicodeEscape(lx : Lexer, start : Span) -> Char {
-    let malformed =
-        "\\u escape must be written \\u{...}, with one to six hex digits in the braces"
-    if !charIs(peek(lx), '{') { oops(lx, malformed, start) }
+    if !charIs(peek(lx), '{') { oops(lx, malformedUnicodeEscape, start) }
     bump(lx)
     let from = lx.at
     var count = 0
@@ -375,7 +369,9 @@ fun lexUnicodeEscape(lx : Lexer, start : Span) -> Char {
         bump(lx)
         count = count + 1
     }
-    if count < 1 || count > 6 || !charIs(peek(lx), '}') { oops(lx, malformed, start) }
+    if count < 1 || count > 6 || !charIs(peek(lx), '}') {
+        oops(lx, malformedUnicodeEscape, start)
+    }
     let digits = String.slice(lx.src, from, lx.at)
     bump(lx)
     let code = hexValue(digits)
@@ -393,24 +389,22 @@ fun notScalarBecause(code : Int) -> String =
         "values above 10FFFF are not characters, and a string may not contain one"
     }
 
-fun isHexDigit(c : Option Char) -> Bool = match c {
-    None -> False
-    Some(found) -> String.contains(hexDigits(), Char.toString(found))
-}
-
 fun hexValue(digits : String) -> Int {
     var total = 0
-    for c in String.codePoints(digits) {
-        total = total * 16 + hexDigitValue(c)
-    }
+    for c in String.codePoints(digits) { total = total * 16 + hexDigitValue(c) }
     total
 }
 
+-- 48 is '0', 87 is 'a' - 10, and 55 is 'A' - 10.
 fun hexDigitValue(c : Char) -> Int {
     let code = Char.toInt(c)
-    if code >= 48 && code <= 57 { return code - 48 }
-    if code >= 97 && code <= 102 { return code - 87 }
-    code - 55
+    if code >= 48 && code <= 57 {
+        code - 48
+    } else if code >= 97 && code <= 102 {
+        code - 87
+    } else {
+        code - 55
+    }
 }
 
 -- -- words and operators --------------------------------------------------------------
@@ -430,23 +424,28 @@ fun lexWord(lx : Lexer, start : Span) -> Token {
         }
     }
     let text = String.slice(lx.src, from, lx.at)
-    if Array.contains(keywords(), text) { return plain(KWord(text), VText(text), start) }
-    -- design.md 2.3: the leading character decides. `_` and lowercase are
-    -- variables; uppercase are type and value constructors.
-    if startsUpper(text) { plain(KConid, VText(text), start) }
-    else { plain(KIdent, VText(text), start) }
-}
-
-fun startsUpper(text : String) -> Bool = match String.decode(text, String.start(text)) {
-    None -> False
-    Some(c) -> {
-        let code = Char.toInt(c)
-        code >= 65 && code <= 90
+    if Array.contains(keywords, text) {
+        plain(KWord(text), VText(text), start)
+    } else if startsUpper(text) {
+        -- design.md 2.3: the leading character decides. `_` and lowercase are
+        -- variables; uppercase are type and value constructors.
+        plain(KConid, VText(text), start)
+    } else {
+        plain(KIdent, VText(text), start)
     }
 }
 
+fun startsUpper(text : String) -> Bool =
+    match String.decode(text, String.start(text)) {
+        None -> False
+        Some(c) -> {
+            let code = Char.toInt(c)
+            code >= 65 && code <= 90
+        }
+    }
+
 fun lexOperator(lx : Lexer, start : Span, c : Char) -> Token {
-    for op in operators() {
+    for op in operators {
         if matchesAt(lx.src, lx.at, op) {
             bumpBy(lx, String.codePointCount(op))
             return plain(KOp(op), VText(op), start)
@@ -500,10 +499,8 @@ fun applyNewlineRule(tokens : Array Token) -> Array Token {
             _ -> {
                 if isOpen(tok.kind) {
                     Array.push(stack, tok.kind)
-                } else {
-                    if isClose(tok.kind) && len(stack) > 0 {
-                        Array.pop(stack)
-                    }
+                } else if isClose(tok.kind) && len(stack) > 0 {
+                    Array.pop(stack)
                 }
                 Array.push(out, tok)
                 i = i + 1
@@ -515,31 +512,33 @@ fun applyNewlineRule(tokens : Array Token) -> Array Token {
 
 fun keepNewline(out : Array Token, tokens : Array Token, runEnd : Int,
                 forced : Bool, stack : Array Kind) -> Bool {
-    let prev = Array.last(out)
-    let next = Array.at(tokens, runEnd)
-    match prev {
+    -- Never lead or trail the stream with a separator.
+    match Array.last(out) {
         None -> { return False }
         Some(_) -> {}
     }
-    match next {
-        None -> { return False }
-        Some(after) -> {
-            match after.kind {
-                KEof -> { return False }
-                _ -> {}
-            }
-            if forced { return True }
-            match Array.last(stack) {
-                None -> {}
-                Some(open) -> {
-                    if isOp(open, "(") || isOp(open, "[") { return False }
-                }
-            }
-            match prev {
-                None -> False
-                Some(before) -> canEnd(before.kind) && canStart(after.kind)
-            }
+    match Array.at(tokens, runEnd) {
+        None -> False
+        Some(after) -> keepBefore(Array.last(out), after, forced, stack)
+    }
+}
+
+fun keepBefore(prev : Option Token, after : Token, forced : Bool,
+               stack : Array Kind) -> Bool {
+    match after.kind {
+        KEof -> { return False }
+        _ -> {}
+    }
+    if forced { return True }
+    match Array.last(stack) {
+        None -> {}
+        Some(open) -> {
+            if isOp(open, "(") || isOp(open, "[") { return False }
         }
+    }
+    match prev {
+        None -> False
+        Some(before) -> canEnd(before.kind) && canStart(after.kind)
     }
 }
 
@@ -565,8 +564,14 @@ fun canEnd(k : Kind) -> Bool {
     match k {
         KIdent -> True
         KConid -> True
-        KWord(word) -> word == "break" || word == "continue" || word == "return"
-        KOp(op) -> op == ")" || op == "]" || op == "}" || op == "?"
+        KWord(word) -> match word {
+            "break" | "continue" | "return" -> True
+            _ -> False
+        }
+        KOp(op) -> match op {
+            ")" | "]" | "}" | "?" -> True
+            _ -> False
+        }
         _ -> False
     }
 }
@@ -580,17 +585,13 @@ fun canStart(k : Kind) -> Bool {
     match k {
         KIdent -> True
         KConid -> True
-        KWord(word) -> Array.contains(starters(), word)
-        KOp(op) -> op == "(" || op == "[" || op == "{" || op == "-" || op == "!"
+        KWord(word) -> Array.contains(starters, word)
+        KOp(op) -> match op {
+            "(" | "[" | "{" | "-" | "!" -> True
+            _ -> False
+        }
         _ -> False
     }
 }
 
-fun starters() -> Array String = [
-    "let", "var", "fun", "type", "class", "instance", "if", "match",
-    "while", "for", "loop", "return", "break", "continue", "module",
-    "import", "do",
-]
-
-fun tokenize(source : Source) -> Array Token =
-    applyNewlineRule(tokenizeRaw(source))
+fun tokenize(source : Source) -> Array Token = applyNewlineRule(tokenizeRaw(source))

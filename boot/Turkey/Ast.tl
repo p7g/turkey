@@ -1,23 +1,23 @@
-module Boot.Ast (
-    Type, Type(..), TypeKind, TypeKind(..),
-    Pat, Pat(..), PatKind, PatKind(..),
-    Expr, Expr(..), ExprKind, ExprKind(..),
-    Stmt, Stmt(..), StmtKind, StmtKind(..),
-    Lit, Lit(..), litKind,
-    Arm, Arm(..),
-    Pred, Pred(..), PredKind, PredKind(..),
-    FunDecl, FunDecl(..),
-    ConDecl, ConDecl(..),
-    TypeDecl, TypeDecl(..),
-    FamDecl, FamDecl(..),
-    FamBind, FamBind(..),
-    ClassDecl, ClassDecl(..),
-    InstanceDecl, InstanceDecl(..),
-    ExportItem, ExportItem(..),
-    ModuleHeader, ModuleHeader(..),
-    ImportDecl, ImportDecl(..),
-    Decl, Decl(..),
-    Program, Program(..),
+module Turkey.Ast (
+    Type(..), TypeKind(..),
+    Pat(..), PatKind(..),
+    Expr(..), ExprKind(..),
+    Stmt(..), StmtKind(..),
+    Lit(..), litKind,
+    Arm(..),
+    Pred(..), PredKind(..),
+    FunDecl(..),
+    ConDecl(..),
+    TypeDecl(..),
+    FamDecl(..),
+    FamBind(..),
+    ClassDecl(..),
+    InstanceDecl(..),
+    ExportItem(..),
+    ModuleHeader(..),
+    ImportDecl(..),
+    Decl(..),
+    Program(..),
 )
 
 -- Abstract syntax (design.md 3), as the bootstrap compiler represents it.
@@ -44,12 +44,7 @@ module Boot.Ast (
 -- Declarations are ordinary records: nothing rewrites one in place, and nothing
 -- keys a table by one.
 
-import Prelude ()
-import Std.Classes
-import Data.Array (Array)
-import Data.Bool.Type (Bool(..))
-import Data.Option.Type (Option(..))
-import Boot.Source (Span)
+import Turkey.Source (Span)
 
 -- -- literals ---------------------------------------------------------------------
 

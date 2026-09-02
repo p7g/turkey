@@ -106,8 +106,8 @@ main : fun() -> Unit
 | `turkey/builtins.py` | The machine primitives, and nothing else |
 | `turkey/modules.py` | The import graph, and what each module can see |
 | `turkey/resolve.py` | Rewrites a module's names so the program shares one namespace |
-| `turkey/lib/` | The library, written in the language: classes, Prelude, `Data.*` and `System.*` modules |
-| `boot/` | The bootstrap compiler, written in the language (`plan.txt` item 9) |
+| `lib/` | The library, written in the language: classes, Prelude, `Data.*` and `System.*` modules |
+| `boot/` | The compiler, written in the language: `Turkey.*` (`plan.txt` item 9) |
 
 Three things are worth knowing before reading the code, because they are where
 this language departs from a textbook implementation.
@@ -141,7 +141,7 @@ and only the innermost one gets to decide.
 
 ## The bootstrap compiler
 
-`boot/` is a Turkey compiler written in Turkey. It is being built one stage at
+`boot/` is a Turkey compiler written in Turkey, whose modules are `Turkey.*`. `boot/STYLE.md` says how it is written. It is being built one stage at
 a time, and each stage is checked by diffing it against the Python
 implementation over every Turkey file in the repository -- the conformance
 programs, the standard library, and `boot/`'s own source:
@@ -153,7 +153,10 @@ python3 -m turkey run boot/Main.tl -- ast FILE...
 
 The lexer and the parser are done, and agree with `turkey tokens` and
 `turkey ast` on every token and every node of all 82 of them, spans included.
-`tests/test_boot.py` is that comparison. Both dumps are deliberately *not*
+`tests/test_boot.py` is that comparison, and
+[`FINDINGS.md`](FINDINGS.md) is the running list of language bugs, design
+costs and missing library pieces that writing it has turned up -- which is
+what `plan.txt` item 9 says the exercise is *for*. Both dumps are deliberately *not*
 Python's `repr`: the float spelling is the one `PRIMITIVES.md` specifies and
 the escapes are the language's, so neither implementation can be right merely
 by being the host.

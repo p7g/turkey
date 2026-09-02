@@ -1,4 +1,4 @@
-module Boot.AstDump (dump)
+module Turkey.AstDump (dump)
 
 -- The canonical spelling of a parse tree, matching `turkey/astdump.py` byte for
 -- byte. See that file for the format; the rules are three:
@@ -14,19 +14,9 @@ module Boot.AstDump (dump)
 -- detail on both sides, and printing them would make the diff depend on the
 -- order in which nodes happen to be allocated.
 
-import Prelude ()
-import Std.Classes
-import Data.Array as Array
-import Data.Array (Array)
-import Data.Bool.Type (Bool(..))
-import Data.Char as Char
-import Data.Float as Float
-import Data.Int as Int
-import Data.Option.Type (Option(..))
-import Data.String as String
-import Boot.Ast
-import Boot.Source (Span)
-import Boot.Token (quote)
+import Turkey.Ast
+import Turkey.Source (Span)
+import Turkey.Token (quote)
 
 type Out = Out {
     parts : String.Builder,

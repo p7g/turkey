@@ -603,31 +603,32 @@ int32_t turkey_object_tag(void *pointer) {
     return ((TurkeyObject *)pointer)->tag;
 }
 
-uint64_t turkey_object_get(void *pointer, int64_t index) {
-    if (!valid_heap_pointer(pointer)) return 0;
-    TurkeyObject *object = pointer;
+static int object_index(TurkeyObject *object, int64_t index) {
     if (index < 0 || index >= object->count) {
         turkey_panic("invalid object field");
         return 0;
     }
-    return object->slots[index];
+    return 1;
+}
+
+uint64_t turkey_object_get(void *pointer, int64_t index) {
+    if (!valid_heap_pointer(pointer)) return 0;
+    TurkeyObject *object = pointer;
+    return object_index(object, index) ? object->slots[index] : 0;
 }
 
 void turkey_object_set(void *pointer, int64_t index, uint64_t value) {
     if (!valid_heap_pointer(pointer)) return;
     TurkeyObject *object = pointer;
-    if (index < 0 || index >= object->count) {
-        turkey_panic("invalid object field");
-        return;
-    }
-    object->slots[index] = value;
+    if (object_index(object, index)) object->slots[index] = value;
 }
 
 uint64_t turkey_object_get_as(void *pointer, int64_t index, int32_t layout) {
     if (!valid_heap_pointer(pointer)) return 0;
     TurkeyObject *object = pointer;
-    uint64_t value = turkey_object_get(pointer, index);
-    if (has_panicked || !(object->kind == 0 || object->kind == 1)) return value;
+    if (!object_index(object, index)) return 0;
+    uint64_t value = object->slots[index];
+    if (!(object->kind == 0 || object->kind == 1)) return value;
     int32_t stored = (object->pointer_bitmap >> (3 * index)) & 7;
     if (stored == layout || (stored >= 6 && layout >= 6)) return value;
     if (stored == 7 && layout < 6)
@@ -642,20 +643,20 @@ void turkey_object_set_as(void *pointer, int64_t index, uint64_t value,
                           int32_t layout) {
     if (!valid_heap_pointer(pointer)) return;
     TurkeyObject *object = pointer;
+    if (!object_index(object, index)) return;
     if (!(object->kind == 0 || object->kind == 1)) {
-        turkey_object_set(pointer, index, value);
+        object->slots[index] = value;
         return;
     }
     int32_t stored = (object->pointer_bitmap >> (3 * index)) & 7;
     if (stored == layout || (stored >= 6 && layout >= 6)) {
-        turkey_object_set(pointer, index, value);
+        object->slots[index] = value;
     } else if (stored == 7 && layout < 6) {
         void *box = turkey_box(value, layout);
-        if (!has_panicked)
-            turkey_object_set(pointer, index, (uint64_t)(uintptr_t)box);
+        if (!has_panicked) object->slots[index] = (uint64_t)(uintptr_t)box;
     } else if (stored < 6 && layout == 7) {
         uint64_t bits = turkey_unbox((void *)(uintptr_t)value, stored);
-        if (!has_panicked) turkey_object_set(pointer, index, bits);
+        if (!has_panicked) object->slots[index] = bits;
     } else {
         turkey_panic("object field has the wrong scalar layout");
     }
@@ -721,9 +722,7 @@ static int array_index(TurkeyObject *array, int64_t index, const char *operation
     return 1;
 }
 
-uint64_t turkey_array_get(void *pointer, int64_t index) {
-    if (!valid_heap_pointer(pointer)) return 0;
-    TurkeyObject *array = pointer;
+static uint64_t array_get(TurkeyObject *array, int64_t index) {
     uint64_t value = 0;
     if (array_index(array, index, "read at")) {
         int32_t width = (int32_t)array->pointer_bitmap;
@@ -732,19 +731,27 @@ uint64_t turkey_array_get(void *pointer, int64_t index) {
     return value;
 }
 
-void turkey_array_set(void *pointer, int64_t index, uint64_t value) {
-    if (!valid_heap_pointer(pointer)) return;
-    TurkeyObject *array = pointer;
+static void array_set(TurkeyObject *array, int64_t index, uint64_t value) {
     if (array_index(array, index, "write at")) {
         int32_t width = (int32_t)array->pointer_bitmap;
         memcpy((unsigned char *)array->slots + index * width, &value, (size_t)width);
     }
 }
 
+uint64_t turkey_array_get(void *pointer, int64_t index) {
+    if (!valid_heap_pointer(pointer)) return 0;
+    return array_get(pointer, index);
+}
+
+void turkey_array_set(void *pointer, int64_t index, uint64_t value) {
+    if (!valid_heap_pointer(pointer)) return;
+    array_set(pointer, index, value);
+}
+
 uint64_t turkey_array_get_as(void *pointer, int64_t index, int32_t layout) {
     if (!valid_object_kind(pointer, 2)) return 0;
     TurkeyObject *array = pointer;
-    uint64_t value = turkey_array_get(pointer, index);
+    uint64_t value = array_get(array, index);
     if (has_panicked || array->tag == layout ||
             (array->tag >= 6 && layout >= 6)) return value;
     if (array->tag == 7 && layout < 6)
@@ -760,14 +767,13 @@ void turkey_array_set_as(void *pointer, int64_t index, uint64_t value,
     if (!valid_object_kind(pointer, 2)) return;
     TurkeyObject *array = pointer;
     if (array->tag == layout || (array->tag >= 6 && layout >= 6)) {
-        turkey_array_set(pointer, index, value);
+        array_set(array, index, value);
     } else if (array->tag == 7 && layout < 6) {
         void *box = turkey_box(value, layout);
-        if (!has_panicked)
-            turkey_array_set(pointer, index, (uint64_t)(uintptr_t)box);
+        if (!has_panicked) array_set(array, index, (uint64_t)(uintptr_t)box);
     } else if (array->tag < 6 && layout == 7) {
         uint64_t bits = turkey_unbox((void *)(uintptr_t)value, array->tag);
-        if (!has_panicked) turkey_array_set(pointer, index, bits);
+        if (!has_panicked) array_set(array, index, bits);
     } else {
         turkey_panic("array element has the wrong scalar layout");
     }
@@ -776,7 +782,7 @@ void turkey_array_set_as(void *pointer, int64_t index, uint64_t value,
 void *turkey_array_get_boxed(void *pointer, int64_t index) {
     if (!valid_object_kind(pointer, 2)) return NULL;
     TurkeyObject *array = pointer;
-    uint64_t value = turkey_array_get(pointer, index);
+    uint64_t value = array_get(array, index);
     if (has_panicked) return NULL;
     if (array->tag >= 6) return (void *)(uintptr_t)value;
     return turkey_box(value, array->tag);
@@ -787,7 +793,7 @@ void turkey_array_set_boxed(void *pointer, int64_t index, void *value) {
     TurkeyObject *array = pointer;
     uint64_t bits = (array->tag >= 6 ? (uint64_t)(uintptr_t)value
                      : turkey_unbox(value, array->tag));
-    if (!has_panicked) turkey_array_set(pointer, index, bits);
+    if (!has_panicked) array_set(array, index, bits);
 }
 
 static int array_parts(void *wrapper, TurkeyObject **data, int64_t *length) {

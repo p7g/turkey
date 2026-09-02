@@ -20,15 +20,12 @@
 
 import System.Env as Env
 import System.IO as IO
-import Data.Array as Array
-import Data.Array (Array)
-import Data.String as String
-import Boot.Source as Source
-import Boot.Source (Source)
-import Boot.Lexer as Lexer
-import Boot.Token as Token
-import Boot.Parser as Parser
-import Boot.AstDump as AstDump
+import Turkey.Source as Source
+import Turkey.Source (Source)
+import Turkey.Lexer as Lexer
+import Turkey.Token as Token
+import Turkey.Parser as Parser
+import Turkey.AstDump as AstDump
 
 fun main() {
     let args = Env.args()

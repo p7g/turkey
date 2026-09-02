@@ -33,7 +33,11 @@ from .deps import pattern_vars
 from .errors import Span, TypeError_
 from .parser import BUILTIN_TYCONS, parse
 
-LIB = Path(__file__).resolve().parent / "lib"
+# The library is ordinary Turkey source and sits beside the implementation
+# rather than inside it: it is what the language ships, not part of the
+# Python that happens to run it, and the bootstrap compiler will read it
+# from the same place.
+LIB = Path(__file__).resolve().parent.parent / "lib"
 
 # What a module's top-level binding is called once resolution has run. `#` is
 # not a character any surface name may contain, so an internal name can never

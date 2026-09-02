@@ -2672,20 +2672,22 @@ everything imported, and now the export list agrees. Nothing in the suite could
 have found this: `boot` is the first program to name that type from another
 module.
 
-**A qualified type name does not resolve.** `String.Index` and `Map.Cursor`
-are both rejected as unknown types, even though `_bring` puts every qualified
-name into every namespace, the type namespace included -- only *values* consult
-it. Section 9.3's resolution order is written for values and is implemented for
-values.
+**A qualified type name resolves after all -- this entry first said it did
+not, and that was wrong.** `String.Index` was rejected as an unknown type, and
+the conclusion drawn here was that section 9.3's resolution order is
+implemented for values only. It is not: `_bring` puts every qualified name into
+every namespace and `Resolver.tycon` consults the type one.
 
-That is not merely an inconvenience. A type can only be named bare, so a type
-whose name collides with anything else in scope cannot be named at all, and the
-collision is not hypothetical: every module imports `Std.Classes`, which claims
-`Index`, so `Data.String.Index` is unnameable by exactly the modules that want
-it. `boot` works around it by importing the type bare and letting its own
-declaration shadow the class. Worth fixing rather than documenting, since the
-parser already produces the dotted name and the scope already holds it; left
-alone for now because M19's job was the lexer.
+What was actually broken was the export bug above, fixed in the same commit and
+not re-tested afterwards. `Data.String` was exporting the `Index` *class* under
+that name, so `String.Index` named nothing in the type namespace -- the symptom
+of one bug, read as a second. `String.Index` now works, from a module with no
+imports at all, since the Prelude re-exports `module String`. The workaround it
+prompted (importing the type bare, and letting the module's own declaration
+shadow the `Index` class) has been removed.
+
+Worth recording rather than quietly deleting: a fix and a diagnosis landed
+together, and the diagnosis was never re-run against the fix.
 
 **Two divergences from the Python lexer, both toward the spec.** `boot`
 classifies characters with `Data.Char`'s ASCII predicates, where

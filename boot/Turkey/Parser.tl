@@ -1,4 +1,4 @@
-module Boot.Parser (parse, collectTycons)
+module Turkey.Parser (parse, collectTycons)
 
 -- Recursive descent (design.md 3), ported from `turkey/parser.py`.
 --
@@ -20,22 +20,12 @@ module Boot.Parser (parse, collectTycons)
 -- this is the shape the file was reaching for rather than a workaround: a
 -- speculative parse decides by failing, and a scan decides by looking.
 
-import Prelude ()
-import Std.Classes
-import Data.Array as Array
-import Data.Array (Array)
-import Data.Bool.Type (Bool(..))
-import Data.Char as Char
-import Data.Float as Float
-import Data.Int as Int
-import Data.Option.Type (Option(..))
-import Data.String as String
-import Boot.Ast
-import Boot.Diag as Diag
-import Boot.Lexer as Lexer
-import Boot.Source (Source, Span)
-import Boot.Token as Token
-import Boot.Token (Kind, Kind(..), Token, Token(..), Value, Value(..))
+import Turkey.Ast
+import Turkey.Diag as Diag
+import Turkey.Lexer as Lexer
+import Turkey.Source (Source, Span)
+import Turkey.Token as Token
+import Turkey.Token (Kind(..), Token(..), Value(..))
 
 type P = P {
     toks     : Array Token,
@@ -61,20 +51,16 @@ fun parse(source : Source, known : Array String) -> Program {
 
 -- design.md 7's pre-pass: every `type CONID` name declared in this file.
 fun collectTycons(toks : Array Token) -> Array String {
-    let names = builtinTycons()
+    let names = Array.slice(builtinTycons, 0, len(builtinTycons))
     for var i = 0; i + 1 < len(toks); i = i + 1 {
-        if Token.isWord(toks[i].kind, "type") {
-            match toks[i + 1].kind {
-                KConid -> Array.push(names, text(toks[i + 1]))
-                _ -> {}
-            }
+        if Token.isWord(toks[i].kind, "type") && isConid(toks[i + 1]) {
+            Array.push(names, text(toks[i + 1]))
         }
     }
     names
 }
 
-fun builtinTycons() -> Array String =
-    ["Int", "Float", "String", "Char", "Bool", "Unit", "Array"]
+let builtinTycons = ["Int", "Float", "String", "Char", "Bool", "Unit", "Array"]
 
 -- -- token helpers ------------------------------------------------------------------
 
@@ -94,10 +80,7 @@ fun atAny(p : P, names : Array String) -> Bool = Array.contains(names, kindOf(p)
 
 fun advance(p : P) -> Token {
     let tok = cur(p)
-    match tok.kind {
-        KEof -> {}
-        _ -> { p.i = p.i + 1 }
-    }
+    if !at(p, "EOF") { p.i = p.i + 1 }
     tok
 }
 
@@ -136,15 +119,14 @@ fun expectWhat(p : P, name : String, what : String) -> Token {
 fun oops(p : P, message : String, where : Span) -> a =
     Diag.fail(Diag.at("parse error", message, where), p.file)
 
+-- How a token is named in a message. A literal or a name is quoted with its
+-- kind, since "found IDENT 'x'" says more than "found 'IDENT'"; everything
+-- else *is* its kind, so it is quoted alone.
 fun describe(tok : Token) -> String = match tok.kind {
     KEof -> "end of input"
     KNewline -> "end of line"
-    KInt -> "INT '" + text(tok) + "'"
-    KFloat -> "FLOAT '" + text(tok) + "'"
-    KString -> "STRING '" + text(tok) + "'"
-    KChar -> "CHAR '" + text(tok) + "'"
-    KIdent -> "IDENT '" + text(tok) + "'"
-    KConid -> "CONID '" + text(tok) + "'"
+    KInt | KFloat | KString | KChar | KIdent | KConid ->
+        Token.kindName(tok.kind) + " '" + text(tok) + "'"
     _ -> "'" + Token.kindName(tok.kind) + "'"
 }
 
@@ -196,19 +178,19 @@ fun method(p : P, s : Span, name : String) -> Expr =
 
 -- -- tables -------------------------------------------------------------------------
 
-fun literalKinds() -> Array String = ["INT", "FLOAT", "STRING", "CHAR"]
+let literalKinds = ["INT", "FLOAT", "STRING", "CHAR"]
 
-fun exprStart() -> Array String = [
+let exprStart = [
     "INT", "FLOAT", "STRING", "CHAR",
     "IDENT", "CONID", "(", "[", "{", "-", "!",
     "fun", "if", "match", "while", "for", "loop", "return", "break", "continue",
     "do",
 ]
 
-fun patternStart() -> Array String = ["INT", "FLOAT", "STRING", "CHAR", "IDENT", "CONID", "("]
+let patternStart = ["INT", "FLOAT", "STRING", "CHAR", "IDENT", "CONID", "("]
 
 -- Loosest first (design.md 3.5).
-fun precedence() -> Array (Array String) = [
+let precedence = [
     ["||"],
     ["&&"],
     ["==", "!="],
@@ -217,19 +199,21 @@ fun precedence() -> Array (Array String) = [
     ["*", "/", "%"],
 ]
 
-fun binaryMethod(op : String) -> Option String {
-    if op == "+" { return Some("add") }
-    if op == "-" { return Some("sub") }
-    if op == "*" { return Some("mul") }
-    if op == "/" { return Some("div") }
-    if op == "%" { return Some("rem") }
-    if op == "==" { return Some("eq") }
-    if op == "!=" { return Some("ne") }
-    if op == "<" { return Some("lt") }
-    if op == "<=" { return Some("lte") }
-    if op == ">" { return Some("gt") }
-    if op == ">=" { return Some("gte") }
-    None
+-- `&&`, `||` and `!` are absent deliberately: the first two short-circuit,
+-- which no function call does, and `!` is defined in terms of them.
+fun binaryMethod(op : String) -> Option String = match op {
+    "+" -> Some("add")
+    "-" -> Some("sub")
+    "*" -> Some("mul")
+    "/" -> Some("div")
+    "%" -> Some("rem")
+    "==" -> Some("eq")
+    "!=" -> Some("ne")
+    "<" -> Some("lt")
+    "<=" -> Some("lte")
+    ">" -> Some("gt")
+    ">=" -> Some("gte")
+    _ -> None
 }
 
 -- -- program ------------------------------------------------------------------------
@@ -245,30 +229,20 @@ fun parseProgram(p : P) -> Program {
     while !at(p, "EOF") {
         if at(p, "import") {
             Array.push(imports, parseImport(p))
+        } else if at(p, "type") {
+            Array.push(decls, DType(parseTypeDecl(p)))
+        } else if at(p, "class") {
+            Array.push(decls, DClass(parseClassDecl(p)))
+        } else if at(p, "instance") {
+            Array.push(decls, DInstance(parseInstanceDecl(p)))
+        } else if at(p, "fun") {
+            let s2 = cur(p).span
+            Array.push(decls, DStmt(mkStmt(p, s2, SFun(parseFunDecl(p, False)))))
+        } else if at(p, "let") || at(p, "var") {
+            Array.push(decls, DStmt(parseBindingStmt(p)))
         } else {
-            if at(p, "type") {
-                Array.push(decls, DType(parseTypeDecl(p)))
-            } else {
-                if at(p, "class") {
-                    Array.push(decls, DClass(parseClassDecl(p)))
-                } else {
-                    if at(p, "instance") {
-                        Array.push(decls, DInstance(parseInstanceDecl(p)))
-                    } else {
-                        if at(p, "fun") {
-                            let s2 = cur(p).span
-                            Array.push(decls, DStmt(mkStmt(p, s2, SFun(parseFunDecl(p, False)))))
-                        } else {
-                            if at(p, "let") || at(p, "var") {
-                                Array.push(decls, DStmt(parseBindingStmt(p)))
-                            } else {
-                                oops(p, "expected a top-level declaration, found "
-                                        + describe(cur(p)), cur(p).span)
-                            }
-                        }
-                    }
-                }
-            }
+            oops(p, "expected a top-level declaration, found "
+                    + describe(cur(p)), cur(p).span)
         }
         endOfStatement(p)
     }
@@ -278,10 +252,8 @@ fun parseProgram(p : P) -> Program {
 fun endOfStatement(p : P) -> Unit {
     if at(p, "NEWLINE") {
         skipNewlines(p)
-    } else {
-        if !at(p, "EOF") && !at(p, "}") {
-            oops(p, "expected end of statement, found " + describe(cur(p)), cur(p).span)
-        }
+    } else if !at(p, "EOF") && !at(p, "}") {
+        oops(p, "expected end of statement, found " + describe(cur(p)), cur(p).span)
     }
 }
 
@@ -327,31 +299,15 @@ fun parseExportItem(p : P) -> ExportItem {
     ExportItem { span = tok.span, name = text(tok), kind = "name", subs = subs }
 }
 
-fun isNameToken(tok : Token) -> Bool = match tok.kind {
-    KIdent -> True
-    KConid -> True
+fun isNameToken(tok : Token) -> Bool = match Token.kindName(tok.kind) {
+    "IDENT" | "CONID" -> True
     _ -> False
 }
 
-fun isConid(tok : Token) -> Bool = match tok.kind {
-    KConid -> True
-    _ -> False
-}
+fun isConid(tok : Token) -> Bool = Token.kindName(tok.kind) == "CONID"
 
-fun parseModname(p : P) -> String {
-    let parts = Array.new(2)
-    Array.push(parts, text(expectWhat(p, "CONID", "a module name")))
-    while at(p, ".") {
-        match peek(p, 1).kind {
-            KConid -> {
-                advance(p)
-                Array.push(parts, text(advance(p)))
-            }
-            _ -> { break }
-        }
-    }
-    String.join(parts, ".")
-}
+fun parseModname(p : P) -> String =
+    dottedFrom(p, expectWhat(p, "CONID", "a module name"))
 
 fun parseImport(p : P) -> ImportDecl {
     let s = expect(p, "import").span
@@ -366,18 +322,13 @@ fun parseImport(p : P) -> ImportDecl {
     if at(p, "hiding") {
         advance(p)
         hidden = Some(parseParenNameList(p))
-    } else {
-        if at(p, "(") { items = Some(parseParenNameList(p)) }
+    } else if at(p, "(") {
+        items = Some(parseParenNameList(p))
     }
     ImportDecl {
         span = s, name = name, alias = alias, items = items, hidden = hidden,
-        qualified = isSome(alias),
+        qualified = Option.isSome(alias),
     }
-}
-
-fun isSome(o : Option a) -> Bool = match o {
-    Some(_) -> True
-    None -> False
 }
 
 fun parseParenNameList(p : P) -> Array ExportItem {
@@ -432,16 +383,12 @@ fun rhsHasAlternatives(p : P) -> Bool {
         let kind = Token.kindName(p.toks[j].kind)
         if kind == "(" || kind == "[" || kind == "{" {
             depth = depth + 1
-        } else {
-            if kind == ")" || kind == "]" || kind == "}" {
-                if depth == 0 { return False }
-                depth = depth - 1
-            } else {
-                if depth == 0 {
-                    if kind == "|" { return True }
-                    if kind == "NEWLINE" || kind == "EOF" { return False }
-                }
-            }
+        } else if kind == ")" || kind == "]" || kind == "}" {
+            if depth == 0 { return False }
+            depth = depth - 1
+        } else if depth == 0 {
+            if kind == "|" { return True }
+            if kind == "NEWLINE" || kind == "EOF" { return False }
         }
         j = j + 1
     }
@@ -476,11 +423,9 @@ fun parseConDecl(p : P) -> ConDecl {
             if !eat(p, ",") { break }
         }
         skipToken(p, ")")
-    } else {
-        if at(p, "IDENT") || at(p, "CONID") || at(p, "fun") {
-            oops(p, "constructor '" + text(tok) + "' must parenthesize its payload: write '"
-                    + text(tok) + "(...)'", cur(p).span)
-        }
+    } else if at(p, "IDENT") || at(p, "CONID") || at(p, "fun") {
+        oops(p, "constructor '" + text(tok) + "' must parenthesize its payload: write '"
+                + text(tok) + "(...)'", cur(p).span)
     }
     ConDecl { span = tok.span, name = text(tok), args = args, fields = None }
 }
@@ -533,63 +478,61 @@ fun parseTypeExpr(p : P) -> Type {
 
 fun parseAtype(p : P) -> Type {
     let tok = cur(p)
-    match tok.kind {
-        KIdent -> {
+    match kindOf(p) {
+        "IDENT" -> {
             advance(p)
             mkType(p, tok.span, TEVar(text(tok)))
         }
-        KConid -> {
+        -- A qualified type constructor: `S.Node`. The dotted chain is one name,
+        -- resolved as one.
+        "CONID" -> {
             advance(p)
-            -- A qualified type constructor: `S.Node`. The dotted chain is one
-            -- name, resolved as one.
-            let parts = Array.new(2)
-            Array.push(parts, text(tok))
-            while at(p, ".") {
-                match peek(p, 1).kind {
-                    KConid -> {
-                        advance(p)
-                        Array.push(parts, text(advance(p)))
-                    }
-                    _ -> { break }
-                }
-            }
-            mkType(p, tok.span, TECon(String.join(parts, "."), Array.new(0)))
+            mkType(p, tok.span, TECon(dottedFrom(p, tok), Array.new(0)))
         }
-        _ -> parseAtypeRest(p, tok)
+        "fun" -> {
+            advance(p)
+            skipToken(p, "(")
+            let params = Array.new(2)
+            while !at(p, ")") {
+                Array.push(params, parseTypeExpr(p))
+                if !eat(p, ",") { break }
+            }
+            skipToken(p, ")")
+            skipWhat(p, "->", "'->' and a return type")
+            mkType(p, tok.span, TEFun(params, parseTypeExpr(p)))
+        }
+        "(" -> parseParenType(p, tok)
+        _ -> oops(p, "expected a type, found " + describe(tok), tok.span)
     }
 }
 
-fun parseAtypeRest(p : P, tok : Token) -> Type {
-    if at(p, "fun") {
+-- The rest of a dotted name whose first CONID has already been consumed.
+fun dottedFrom(p : P, first : Token) -> String {
+    let parts = Array.new(2)
+    Array.push(parts, text(first))
+    while at(p, ".") && Token.kindName(peek(p, 1).kind) == "CONID" {
         advance(p)
-        skipToken(p, "(")
-        let params = Array.new(2)
-        while !at(p, ")") {
-            Array.push(params, parseTypeExpr(p))
-            if !eat(p, ",") { break }
-        }
-        skipToken(p, ")")
-        skipWhat(p, "->", "'->' and a return type")
-        return mkType(p, tok.span, TEFun(params, parseTypeExpr(p)))
+        Array.push(parts, text(advance(p)))
     }
-    if at(p, "(") {
-        advance(p)
-        let elems = Array.new(2)
-        Array.push(elems, parseTypeExpr(p))
-        while eat(p, ",") {
-            if at(p, ")") {
-                if len(elems) == 1 {
-                    oops(p, "a singleton tuple '(x,)' is not supported", cur(p).span)
-                }
-                break
+    String.join(parts, ".")
+}
+
+fun parseParenType(p : P, tok : Token) -> Type {
+    advance(p)
+    let elems = Array.new(2)
+    Array.push(elems, parseTypeExpr(p))
+    while eat(p, ",") {
+        if at(p, ")") {
+            if len(elems) == 1 {
+                oops(p, "a singleton tuple '(x,)' is not supported", cur(p).span)
             }
-            Array.push(elems, parseTypeExpr(p))
+            break
         }
-        skipToken(p, ")")
-        if len(elems) == 1 { return elems[0] }
-        return mkType(p, tok.span, TETuple(elems))
+        Array.push(elems, parseTypeExpr(p))
     }
-    oops(p, "expected a type, found " + describe(tok), tok.span)
+    skipToken(p, ")")
+    if len(elems) == 1 { return elems[0] }
+    mkType(p, tok.span, TETuple(elems))
 }
 
 -- -- functions -----------------------------------------------------------------------
@@ -630,16 +573,12 @@ fun looksLikeSignature(p : P) -> Bool {
         if kind == "(" || kind == "[" || kind == "{" {
             if depth == 0 && kind == "{" { return False }
             depth = depth + 1
-        } else {
-            if kind == ")" || kind == "]" || kind == "}" {
-                if depth == 0 { return True }
-                depth = depth - 1
-            } else {
-                if depth == 0 {
-                    if kind == "=" { return False }
-                    if kind == "NEWLINE" || kind == "EOF" { return True }
-                }
-            }
+        } else if kind == ")" || kind == "]" || kind == "}" {
+            if depth == 0 { return True }
+            depth = depth - 1
+        } else if depth == 0 {
+            if kind == "=" { return False }
+            if kind == "NEWLINE" || kind == "EOF" { return True }
         }
         j = j + 1
     }
@@ -699,13 +638,13 @@ fun parsePredEntry(p : P) -> Pred {
             if len(args) == 1 {
                 return Pred { span = s, kind = PClass(name, args[0]) }
             }
-            oops(p, contextShape(), s)
+            oops(p, contextShape, s)
         }
-        _ -> oops(p, contextShape(), s)
+        _ -> oops(p, contextShape, s)
     }
 }
 
-fun contextShape() -> String =
+let contextShape =
     "a context entry is a class applied to one type, as in 'Ord a', or an "
     + "equality, as in 'Item c ~ Op'"
 
@@ -775,13 +714,11 @@ fun parseClassBody(p : P, isClass : Bool, param : String)
             let name = text(expectWhat(p, "CONID", "a type family name"))
             let written = text(expectWhat(p, "IDENT", "'" + param + "', the class parameter"))
             Array.push(families, FamDecl { span = s, name = name, param = written })
+        } else if at(p, "fun") {
+            Array.push(methods, parseFunDecl(p, isClass))
         } else {
-            if at(p, "fun") {
-                Array.push(methods, parseFunDecl(p, isClass))
-            } else {
-                oops(p, "expected a method or a 'type', found " + describe(cur(p)),
-                     cur(p).span)
-            }
+            oops(p, "expected a method or a 'type', found " + describe(cur(p)),
+                 cur(p).span)
         }
         endOfStatement(p)
     }
@@ -803,13 +740,11 @@ fun parseInstanceBody(p : P) -> (Array FunDecl, Array FamBind) {
             let name = text(expectWhat(p, "CONID", "a type family name"))
             skipToken(p, "=")
             Array.push(families, FamBind { span = s, name = name, body = parseTypeExpr(p) })
+        } else if at(p, "fun") {
+            Array.push(methods, parseFunDecl(p, False))
         } else {
-            if at(p, "fun") {
-                Array.push(methods, parseFunDecl(p, False))
-            } else {
-                oops(p, "expected a method or a 'type', found " + describe(cur(p)),
-                     cur(p).span)
-            }
+            oops(p, "expected a method or a 'type', found " + describe(cur(p)),
+                 cur(p).span)
         }
         endOfStatement(p)
     }
@@ -860,14 +795,9 @@ fun parseBindingStmt(p : P) -> Stmt {
 
 fun parseStmt(p : P) -> Stmt {
     if at(p, "let") || at(p, "var") { return parseBindingStmt(p) }
-    if at(p, "fun") {
-        match peek(p, 1).kind {
-            KIdent -> {
-                let s = cur(p).span
-                return mkStmt(p, s, SFun(parseFunDecl(p, False)))
-            }
-            _ -> {}
-        }
+    if at(p, "fun") && Token.kindName(peek(p, 1).kind) == "IDENT" {
+        let s = cur(p).span
+        return mkStmt(p, s, SFun(parseFunDecl(p, False)))
     }
     let s = cur(p).span
     let saved = setNoRecord(p, False)
@@ -922,40 +852,41 @@ fun parsePattern(p : P) -> Pat {
 
 fun parsePatternAtom(p : P) -> Pat {
     let tok = cur(p)
-    match tok.kind {
-        KIdent -> {
+    match kindOf(p) {
+        "IDENT" -> {
             advance(p)
-            if text(tok) == "_" { mkPat(p, tok.span, PWild) }
-            else { mkPat(p, tok.span, PVar(text(tok))) }
+            if text(tok) == "_" {
+                mkPat(p, tok.span, PWild)
+            } else {
+                mkPat(p, tok.span, PVar(text(tok)))
+            }
         }
-        KConid -> parseConPattern(p)
-        _ -> parsePatternRest(p, tok)
+        "CONID" -> parseConPattern(p)
+        "INT" | "FLOAT" | "STRING" | "CHAR" -> {
+            advance(p)
+            mkPat(p, tok.span, PLit(literalOf(tok)))
+        }
+        "(" -> parseParenPattern(p, tok)
+        _ -> oops(p, "expected a pattern, found " + describe(tok), tok.span)
     }
 }
 
-fun parsePatternRest(p : P, tok : Token) -> Pat {
-    if atAny(p, literalKinds()) {
-        advance(p)
-        return mkPat(p, tok.span, PLit(literalOf(tok)))
-    }
-    if at(p, "(") {
-        advance(p)
-        let elems = Array.new(2)
-        Array.push(elems, parsePattern(p))
-        while eat(p, ",") {
-            if at(p, ")") {
-                if len(elems) == 1 {
-                    oops(p, "a singleton tuple '(x,)' is not supported", cur(p).span)
-                }
-                break
+fun parseParenPattern(p : P, tok : Token) -> Pat {
+    advance(p)
+    let elems = Array.new(2)
+    Array.push(elems, parsePattern(p))
+    while eat(p, ",") {
+        if at(p, ")") {
+            if len(elems) == 1 {
+                oops(p, "a singleton tuple '(x,)' is not supported", cur(p).span)
             }
-            Array.push(elems, parsePattern(p))
+            break
         }
-        skipToken(p, ")")
-        if len(elems) == 1 { return elems[0] }
-        return mkPat(p, tok.span, PTuple(elems))
+        Array.push(elems, parsePattern(p))
     }
-    oops(p, "expected a pattern, found " + describe(tok), tok.span)
+    skipToken(p, ")")
+    if len(elems) == 1 { return elems[0] }
+    mkPat(p, tok.span, PTuple(elems))
 }
 
 fun literalOf(tok : Token) -> Lit = match tok.value {
@@ -993,11 +924,9 @@ fun parseConPattern(p : P) -> Pat {
             if !eat(p, ",") { break }
         }
         skipToken(p, ")")
-    } else {
-        if atAny(p, patternStart()) {
-            oops(p, "constructor pattern '" + text(tok) + "' must parenthesize its "
-                    + "arguments: write '" + text(tok) + "(...)'", cur(p).span)
-        }
+    } else if atAny(p, patternStart) {
+        oops(p, "constructor pattern '" + text(tok) + "' must parenthesize its "
+                + "arguments: write '" + text(tok) + "(...)'", cur(p).span)
     }
     mkPat(p, tok.span, PCon(text(tok), args))
 }
@@ -1014,7 +943,7 @@ fun parseExpr(p : P) -> Expr {
 }
 
 fun parseBinary(p : P, level : Int) -> Expr {
-    let levels = precedence()
+    let levels = precedence
     if level >= len(levels) { return parseUnary(p) }
     var left = parseBinary(p, level + 1)
     while Array.contains(levels[level], kindOf(p)) {
@@ -1055,44 +984,37 @@ fun parsePostfix(p : P) -> Expr {
             skipToken(p, ")")
             p.noRecord = saved
             e = mkExpr(p, e.span, ECall(e, args))
-        } else {
-            if at(p, "[") {
-                advance(p)
-                let saved = setNoRecord(p, False)
-                let index = parseExpr(p)
-                p.noRecord = saved
-                skipToken(p, "]")
-                e = mkExpr(p, e.span, EIndex(e, index))
-            } else {
-                if at(p, ".") && memberFollows(p) {
-                    advance(p)
-                    let member = advance(p)
-                    match member.kind {
-                        KInt -> { e = mkExpr(p, e.span, EProject(e, intOf(member))) }
-                        _ -> { e = mkExpr(p, e.span, EField(e, text(member))) }
-                    }
-                } else {
-                    if at(p, "?") {
-                        -- A suffix like the other three, so it binds tighter
-                        -- than any operator and chains with them. `bind` is
-                        -- marked, so a program's own `bind` is not what a `?`
-                        -- means.
-                        advance(p)
-                        e = mkExpr(p, e.span,
-                                   EQuestion(e, Some(method(p, e.span, "bind"))))
-                    } else {
-                        break
-                    }
-                }
+        } else if at(p, "[") {
+            advance(p)
+            let saved = setNoRecord(p, False)
+            let index = parseExpr(p)
+            p.noRecord = saved
+            skipToken(p, "]")
+            e = mkExpr(p, e.span, EIndex(e, index))
+        } else if at(p, ".") && memberFollows(p) {
+            advance(p)
+            let member = advance(p)
+            match member.kind {
+                KInt -> { e = mkExpr(p, e.span, EProject(e, intOf(member))) }
+                _ -> { e = mkExpr(p, e.span, EField(e, text(member))) }
             }
+        } else if at(p, "?") {
+            -- A suffix like the other three, so it binds tighter
+            -- than any operator and chains with them. `bind` is
+            -- marked, so a program's own `bind` is not what a `?`
+            -- means.
+            advance(p)
+            e = mkExpr(p, e.span,
+                       EQuestion(e, Some(method(p, e.span, "bind"))))
+        } else {
+            break
         }
     }
     e
 }
 
-fun memberFollows(p : P) -> Bool = match peek(p, 1).kind {
-    KIdent -> True
-    KInt -> True
+fun memberFollows(p : P) -> Bool = match Token.kindName(peek(p, 1).kind) {
+    "IDENT" | "INT" -> True
     _ -> False
 }
 
@@ -1101,123 +1023,112 @@ fun intOf(tok : Token) -> Int = match tok.value {
     _ -> 0
 }
 
+-- Dispatch on the current token's kind, which is what `turkey/parser.py` does
+-- with a chain of `if kind == ...`. A `match` on the kind name says the same
+-- thing and says that it is a table.
 fun parseAtom(p : P) -> Expr {
     let tok = cur(p)
-    if atAny(p, literalKinds()) {
-        advance(p)
-        return mkExpr(p, tok.span, ELit(literalOf(tok)))
-    }
-    match tok.kind {
-        KIdent -> {
+    match kindOf(p) {
+        "INT" | "FLOAT" | "STRING" | "CHAR" -> {
+            advance(p)
+            mkExpr(p, tok.span, ELit(literalOf(tok)))
+        }
+        "IDENT" -> {
             advance(p)
             mkExpr(p, tok.span, EVar(text(tok), False))
         }
-        KConid -> parseConidAtom(p)
-        _ -> parseAtomRest(p, tok)
+        "CONID" -> parseConidAtom(p)
+        "(" -> parseParenAtom(p, tok)
+        "[" -> parseArrayAtom(p, tok)
+        "{" -> parseBlock(p)
+        "do" -> {
+            advance(p)
+            mkExpr(p, tok.span, EDo(parseBlock(p)))
+        }
+        "fun" -> {
+            advance(p)
+            let params = parseParamList(p)
+            var ret : Option Type = None
+            if eat(p, "->") { ret = Some(parseTypeExpr(p)) }
+            mkExpr(p, tok.span, ELambda(params, ret, parseFunBody(p)))
+        }
+        "if" -> parseIf(p)
+        "while" -> {
+            advance(p)
+            let cond = parseScrutinee(p)
+            mkExpr(p, tok.span, EWhile(cond, parseBlock(p)))
+        }
+        "for" -> parseFor(p)
+        "loop" -> {
+            advance(p)
+            mkExpr(p, tok.span, ELoop(parseBlock(p)))
+        }
+        "match" -> parseMatch(p)
+        "return" -> {
+            advance(p)
+            mkExpr(p, tok.span, EReturn(parseOptionalValue(p)))
+        }
+        "break" -> {
+            advance(p)
+            mkExpr(p, tok.span, EBreak(parseOptionalValue(p)))
+        }
+        "continue" -> {
+            advance(p)
+            mkExpr(p, tok.span, EContinue)
+        }
+        _ -> oops(p, "expected an expression, found " + describe(tok), tok.span)
     }
 }
 
-fun parseAtomRest(p : P, tok : Token) -> Expr {
-    if at(p, "(") {
+-- `()` is Unit, `(e)` is grouping, and `(e, ...)` is a tuple.
+fun parseParenAtom(p : P, tok : Token) -> Expr {
+    advance(p)
+    if at(p, ")") {
         advance(p)
+        return mkExpr(p, tok.span, EUnit)
+    }
+    let saved = setNoRecord(p, False)
+    let elems = Array.new(2)
+    Array.push(elems, parseExpr(p))
+    while eat(p, ",") {
         if at(p, ")") {
-            advance(p)
-            return mkExpr(p, tok.span, EUnit)
-        }
-        let saved = setNoRecord(p, False)
-        let elems = Array.new(2)
-        Array.push(elems, parseExpr(p))
-        while eat(p, ",") {
-            if at(p, ")") {
-                if len(elems) == 1 {
-                    oops(p, "a singleton tuple '(x,)' is not supported", cur(p).span)
-                }
-                break
+            if len(elems) == 1 {
+                oops(p, "a singleton tuple '(x,)' is not supported", cur(p).span)
             }
-            Array.push(elems, parseExpr(p))
+            break
         }
-        skipToken(p, ")")
-        p.noRecord = saved
-        if len(elems) == 1 { return elems[0] }
-        return mkExpr(p, tok.span, ETuple(elems))
+        Array.push(elems, parseExpr(p))
     }
-    if at(p, "[") {
-        advance(p)
-        let saved = setNoRecord(p, False)
-        let elems = Array.new(4)
-        while !at(p, "]") {
-            Array.push(elems, parseExpr(p))
-            if !eat(p, ",") { break }
-        }
-        skipToken(p, "]")
-        p.noRecord = saved
-        return mkExpr(p, tok.span, EArray(elems))
+    skipToken(p, ")")
+    p.noRecord = saved
+    if len(elems) == 1 { return elems[0] }
+    mkExpr(p, tok.span, ETuple(elems))
+}
+
+fun parseArrayAtom(p : P, tok : Token) -> Expr {
+    advance(p)
+    let saved = setNoRecord(p, False)
+    let elems = Array.new(4)
+    while !at(p, "]") {
+        Array.push(elems, parseExpr(p))
+        if !eat(p, ",") { break }
     }
-    if at(p, "{") { return parseBlock(p) }
-    if at(p, "do") {
-        advance(p)
-        return mkExpr(p, tok.span, EDo(parseBlock(p)))
-    }
-    if at(p, "fun") {
-        advance(p)
-        let params = parseParamList(p)
-        var ret : Option Type = None
-        if eat(p, "->") { ret = Some(parseTypeExpr(p)) }
-        return mkExpr(p, tok.span, ELambda(params, ret, parseFunBody(p)))
-    }
-    if at(p, "if") { return parseIf(p) }
-    if at(p, "while") {
-        advance(p)
-        let cond = parseScrutinee(p)
-        return mkExpr(p, tok.span, EWhile(cond, parseBlock(p)))
-    }
-    if at(p, "for") { return parseFor(p) }
-    if at(p, "loop") {
-        advance(p)
-        return mkExpr(p, tok.span, ELoop(parseBlock(p)))
-    }
-    if at(p, "match") { return parseMatch(p) }
-    if at(p, "return") {
-        advance(p)
-        return mkExpr(p, tok.span, EReturn(parseOptionalValue(p)))
-    }
-    if at(p, "break") {
-        advance(p)
-        return mkExpr(p, tok.span, EBreak(parseOptionalValue(p)))
-    }
-    if at(p, "continue") {
-        advance(p)
-        return mkExpr(p, tok.span, EContinue)
-    }
-    oops(p, "expected an expression, found " + describe(tok), tok.span)
+    skipToken(p, "]")
+    p.noRecord = saved
+    mkExpr(p, tok.span, EArray(elems))
 }
 
 -- A CONID atom is a constructor, a record construction, or -- when followed by
 -- `.` and a lowercase name -- a qualified variable.
 fun parseConidAtom(p : P) -> Expr {
     let tok = expect(p, "CONID")
-    let parts = Array.new(2)
-    Array.push(parts, text(tok))
-    while at(p, ".") {
-        match peek(p, 1).kind {
-            KConid -> {
-                advance(p)
-                Array.push(parts, text(advance(p)))
-            }
-            _ -> { break }
-        }
+    let name = dottedFrom(p, tok)
+    -- A trailing lowercase name makes the whole chain a qualified *variable*:
+    -- `Data.Array.push`, not the constructor `Data.Array` applied to anything.
+    if at(p, ".") && Token.kindName(peek(p, 1).kind) == "IDENT" {
+        advance(p)
+        return mkExpr(p, tok.span, EVar(name + "." + text(advance(p)), False))
     }
-    if at(p, ".") {
-        match peek(p, 1).kind {
-            KIdent -> {
-                advance(p)
-                Array.push(parts, text(advance(p)))
-                return mkExpr(p, tok.span, EVar(String.join(parts, "."), False))
-            }
-            _ -> {}
-        }
-    }
-    let name = String.join(parts, ".")
     if at(p, "{") && !p.noRecord {
         advance(p)
         skipNewlines(p)
@@ -1241,7 +1152,7 @@ fun parseConidAtom(p : P) -> Expr {
 }
 
 fun parseOptionalValue(p : P) -> Option Expr {
-    if atAny(p, exprStart()) { return Some(parseExpr(p)) }
+    if atAny(p, exprStart) { return Some(parseExpr(p)) }
     None
 }
 
@@ -1303,16 +1214,12 @@ fun forInFollows(p : P) -> Bool {
         if kind == "(" || kind == "[" || kind == "{" {
             if depth == 0 && kind == "{" { return False }
             depth = depth + 1
-        } else {
-            if kind == ")" || kind == "]" || kind == "}" {
-                if depth == 0 { return False }
-                depth = depth - 1
-            } else {
-                if depth == 0 {
-                    if kind == "in" { return True }
-                    if kind == "NEWLINE" || kind == "EOF" { return False }
-                }
-            }
+        } else if kind == ")" || kind == "]" || kind == "}" {
+            if depth == 0 { return False }
+            depth = depth - 1
+        } else if depth == 0 {
+            if kind == "in" { return True }
+            if kind == "NEWLINE" || kind == "EOF" { return False }
         }
         j = j + 1
     }
@@ -1333,11 +1240,9 @@ fun parseMatch(p : P) -> Expr {
         -- design.md 2.4, so it is the only separator left.
         if at(p, "NEWLINE") {
             skipNewlines(p)
-        } else {
-            if !at(p, "}") && !at(p, "|") {
-                oops(p, "expected the next match arm, found " + describe(cur(p)),
-                     cur(p).span)
-            }
+        } else if !at(p, "}") && !at(p, "|") {
+            oops(p, "expected the next match arm, found " + describe(cur(p)),
+                 cur(p).span)
         }
     }
     skipToken(p, "}")

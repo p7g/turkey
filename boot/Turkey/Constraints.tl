@@ -1,6 +1,6 @@
 module Turkey.Constraints (
     hasField, hasProjection, oneOf,
-    Constraint(..),
+    Constraint(..), PredCell(..), LetCell(..), cpredOf,
     Binding(..), Env(..), newEnv, childEnv, define, lookup_,
     Solver(..), newSolver, run, solve, families,
     fresh, adopt, rank,
@@ -115,7 +115,7 @@ type PredCell = PredCell {
     context : String,
 }
 
-fun cpred(p : Pred, where : Option Span, context : String) -> Constraint =
+fun cpredOf(p : Pred, where : Option Span, context : String) -> Constraint =
     CPred(PredCell { pred = p, span = where, context = context })
 
 type LetCell = LetCell {
@@ -392,7 +392,7 @@ fun solveInstance(s : Solver, name : String, ty : Ty.Type, where : Option Span,
         }
         None -> {}
     }
-    for p in preds { solve(s, cpred(p, where, "read")) }
+    for p in preds { solve(s, cpredOf(p, where, "read")) }
 }
 
 -- Solve the definition one rank in, generalize, then solve the body.
@@ -712,7 +712,7 @@ fun classRule(s : Solver, c : PredCell) -> Bool {
         Some(obligations) -> {
             -- The instance's own context becomes this site's, over the types the
             -- match supplied: `Eq (Array a)` leaves `Eq a` behind.
-            for q in obligations { solve(s, cpred(q, c.span, c.context)) }
+            for q in obligations { solve(s, cpredOf(q, c.span, c.context)) }
             True
         }
     }

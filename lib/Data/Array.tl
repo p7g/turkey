@@ -4,6 +4,7 @@ module Data.Array (
     filled,
     push,
     pop,
+    clear,
     map,
     filter,
     fold,
@@ -70,6 +71,13 @@ fun pop(xs : Array a) -> Option a {
     if data.length == 0 { return None }
     data.length = data.length - 1
     Some(Prim.arrayGet(data.storage, data.length))
+}
+
+-- Drop every element, keeping the capacity. The elements themselves are still
+-- reachable from the storage until they are overwritten, which costs nothing a
+-- compiler notices and saves the reallocation a fresh array would need.
+fun clear(xs : Array a) -> Unit {
+    state(xs).length = 0
 }
 
 fun bounds(xs : Array a, i : Int, operation : String) {

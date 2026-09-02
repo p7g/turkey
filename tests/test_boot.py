@@ -32,9 +32,12 @@ from pathlib import Path
 import pytest
 
 from turkey.astdump import dump as dump_ast
-from turkey.driver import desugared
+from turkey.driver import (check, declared, desugared, registered,
+                           show_binding_groups, show_classes, show_declarations)
+from turkey.errors import short
 from turkey.lexer import tokenize
 from turkey.parser import parse
+from turkey.types import show_scheme
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BOOT_MAIN = REPO_ROOT / "boot" / "Main.tl"
@@ -70,6 +73,26 @@ def _entries() -> list[Path]:
 
 
 ENTRIES = _entries()
+
+
+def _sample() -> list[Path]:
+    """A few entries, for the stages whose diff is redundant across programs.
+
+    `decls`, `deps` and `classes` each dump tables built from the whole module
+    graph, so thirty-two programs dump the library thirty-two times. One
+    invocation of `boot` per stage is minutes; the milestone check below runs at
+    full breadth and these run on a sample chosen for what it covers -- classes
+    with superclasses and defaults, associated families, records and dictionary
+    passing, `?`, and the compiler itself.
+    """
+    names = ["adt", "classes", "families", "dicts", "question", "records"]
+    found = [REPO_ROOT / "tests" / "programs" / f"{n}.tl" for n in names]
+    missing = [p for p in found if not p.is_file()]
+    assert not missing, f"sample programs are gone: {missing}"
+    return [*found, BOOT_MAIN]
+
+
+SAMPLE = _sample()
 
 
 def _boot(*args: str) -> str:
@@ -125,6 +148,40 @@ def boot_tokens() -> str:
 @pytest.fixture(scope="module")
 def boot_ast() -> str:
     return _boot("ast", *(str(p) for p in CORPUS))
+
+
+def _relative(paths: list[Path]) -> list[str]:
+    return [str(p.relative_to(REPO_ROOT)) for p in paths]
+
+
+@pytest.fixture(scope="module")
+def boot_decls() -> str:
+    return _boot("decls", *_relative(SAMPLE))
+
+
+@pytest.fixture(scope="module")
+def boot_deps() -> str:
+    return _boot("deps", *_relative(SAMPLE))
+
+
+@pytest.fixture(scope="module")
+def boot_classes() -> str:
+    return _boot("classes", *_relative(SAMPLE))
+
+
+@pytest.fixture(scope="module")
+def boot_types() -> tuple[str, str]:
+    result = subprocess.run(
+        [sys.executable, "-m", "turkey", "run", str(BOOT_MAIN), "--",
+         "types", *_relative(ENTRIES)],
+        cwd=REPO_ROOT,
+        env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)),
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, (
+        f"boot exited {result.returncode}\n{result.stdout}\n{result.stderr}")
+    return result.stdout, result.stderr
 
 
 @pytest.fixture(scope="module")
@@ -206,6 +263,88 @@ def test_the_desugar_corpus_exercises_the_hard_cases() -> None:
     assert "%seq" in dumped, "no `for ... in` was expanded to its cursor form"
     assert "Prelude#Fall" in dumped, "no control transfer became a value"
     assert "\n  eindex" not in dumped, "a bracket survived desugaring"
+
+
+def test_boot_builds_the_same_declaration_table(boot_decls: str) -> None:
+    """M22a: every type constructor's inferred kind and every value
+    constructor's generalized scheme, for the whole program's table."""
+    expected = "".join(
+        show_declarations(declared(
+            p.read_text(encoding="utf-8"), str(p.relative_to(REPO_ROOT)),
+            [p.parent])[0])
+        for p in SAMPLE)
+    _first_difference(boot_decls, expected, "decls")
+
+
+def test_boot_orders_binding_groups_the_same_way(boot_deps: str) -> None:
+    """M22a: the strongly-connected components, dependencies first.
+
+    The order groups come out in is the order bindings are checked and then
+    evaluated, so it has to be a property of the program rather than of the
+    host's iteration order -- which is what a second implementation agreeing
+    about it demonstrates.
+    """
+    expected = "".join(
+        show_binding_groups(desugared(
+            p.read_text(encoding="utf-8"), str(p.relative_to(REPO_ROOT)),
+            [p.parent]))
+        for p in SAMPLE)
+    _first_difference(boot_deps, expected, "deps")
+
+
+def test_boot_builds_the_same_class_table(boot_classes: str) -> None:
+    """M22b: classes, their kinds, superclasses, families and method schemes,
+    and every instance's head, context, family bindings and home module."""
+    expected = "".join(
+        show_classes(*registered(
+            p.read_text(encoding="utf-8"), str(p.relative_to(REPO_ROOT)),
+            [p.parent]))
+        for p in SAMPLE)
+    _first_difference(boot_classes, expected, "classes")
+
+
+def test_boot_infers_the_same_types(boot_types: tuple[str, str]) -> None:
+    """M22, the milestone: the whole front end, end to end.
+
+    Every entry program in the corpus, at full breadth -- so the library is
+    inferred thirty-two times over and `boot/Main.tl` puts the compiler itself
+    through it. What is compared is the entry module's schemes and the warnings
+    exhaustiveness produced, which between them cover unification, ranks and
+    generalization, the value restriction, class entailment and superclass
+    simplification, associated-family reduction, numeric defaulting, and the
+    context a scheme ends up carrying.
+
+    A disagreement anywhere else in inference does not go unnoticed either: a
+    program is only reported at all if it type-checks, so one implementation
+    accepting what the other rejects fails here as an exit status.
+    """
+    out, err = boot_types
+    expected_out: list[str] = []
+    expected_err: list[str] = []
+    for path in ENTRIES:
+        relative = str(path.relative_to(REPO_ROOT))
+        checked = check(path.read_text(encoding="utf-8"), relative, [path.parent])
+        for warning in checked.warnings:
+            expected_err.append(f"{relative}:{short(warning)}\n")
+        for name, scheme in checked.signatures:
+            expected_out.append(f"{name} : {show_scheme(scheme)}\n")
+    _first_difference(out, "".join(expected_out), "types")
+    _first_difference(err, "".join(expected_err), "warnings")
+
+
+def test_the_types_corpus_exercises_the_hard_cases() -> None:
+    """Again, the milestone is only worth its runtime if the shapes are in it."""
+    seen = "".join(
+        f"{n} : {show_scheme(s)}\n"
+        for p in ENTRIES
+        for n, s in check(p.read_text(encoding="utf-8"),
+                          str(p.relative_to(REPO_ROOT)), [p.parent]).signatures)
+    assert "[" in seen, "no scheme carried a context"
+    assert "OneOf" in seen, "no numeric literal set survived into a scheme"
+    assert "Container.Elem" in seen, "no associated family reached a signature"
+    assert "HasField" in seen, "no field demand travelled in a scheme"
+    assert "~" in seen, "no family equality was carried"
+    assert "fun(a) -> a" in seen, "nothing was generalized"
 
 
 def test_boot_reports_a_missing_file(tmp_path: Path) -> None:

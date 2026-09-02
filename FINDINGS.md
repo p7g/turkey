@@ -112,6 +112,11 @@ more than once. `Turkey.Decls.newDeclTable` now clears it, which is what
 `DeclTable.__init__` was doing all along -- the Python was already written for
 the case its host never exercised.
 
+### 30. `Array` could not be emptied
+**library, fixed.** M22. `Data.Array` had `push` and `pop` and no way to drop
+every element, so a reused buffer had to be reallocated. `Array.clear` keeps the
+capacity, which is the point of reusing it.
+
 ---
 
 ## Open, and accepted
@@ -221,6 +226,63 @@ counter record wanted a field called `type`; it is `tyvar`. Together with
 `hiding`, `export` and `module`, five common nouns are now unavailable to every
 binder in every program, in exchange for keywords the grammar could mostly
 disambiguate positionally.
+
+### 31. No mutually recursive modules, so two files became one
+**design.** M22. `FromInstance` holds the instance whose dictionary it is; an
+instance holds the plan for building that dictionary; a plan is made of
+evidence. Python is two files and breaks the cycle by typing one field `object`.
+Here they are one module.
+
+The language's own answer, stated in design.md 9 -- "two modules that need each
+other are one module" -- and this is the first place the compiler has had to
+take it. It is a *good* answer for genuine mutual recursion, and the cost is
+that it applies to a cycle of one field as much as to a real one: what wanted
+merging was three small record types, and what got merged was an eight-hundred
+line class table with the elaborator's data. Splitting the algorithm out kept it
+to the data, which is the mitigation available.
+
+### 32. A type constructor's level had to become a mutable cell
+**design.** M22, and the third consequence of entry 10. A *skolem* is a
+constructor whose level is the rank of the binder that made it, and the solver
+stamps that rank on after generation has already built every type mentioning it.
+Python's constructors are objects shared by reference, so `con.level = rank` is
+seen everywhere at once. A level carried in the immutable variant would have to
+be rebuilt into every type that holds one, so `TCon` carries a record like a
+variable does.
+
+Nothing is wrong with this -- it is the same "record wrapping a variant" shape
+the AST uses. It is recorded because it was *not* obvious from the Python, where
+mutating a field of a shared object reads like an assignment rather than like a
+design decision, and because it had to be found by asking "what does the solver
+write to, and who else can see it".
+
+### 33. There is no regular expression, anywhere
+**library.** M22. `errors.short` strips the module qualification out of every
+diagnostic with one expression, `[A-Za-z_][A-Za-z0-9_.]*#`. Written as a scan it
+is twenty lines and a helper, and the twenty lines are the part a reader has to
+check against the intent. Not an argument for a regex engine in the language --
+one pattern does not pay for one -- but worth noting that the first real program
+wanted one within its first ten thousand lines.
+
+### 34. An exhaustiveness witness was spelled with the host's `repr`
+**bug, latent.** M22. `exhaustive.render` renders a literal witness with
+Python's `repr`, which is the same host dependency the token and tree dumps had
+to be rid of (entry 2). It is unreachable in practice -- a literal key never
+appears in a type's signature, so a witness is never rebuilt from one -- so
+nothing has ever printed it. The port spells it the language's way; the Python
+still does not, and the branch stays dead in both.
+
+### 35. A panic trace golden pins a *library* line number
+**design.** M22. `err_out_of_bounds.expected` names `Data/Array.tl:78:9`, so
+adding `Array.clear` above `bounds` broke two conformance tests that have
+nothing to do with either. The frame is the right thing to print -- a panic
+trace naming only the user's file would be much worse -- but it couples every
+golden that panics inside the library to the library's layout, and the failure
+reads as "output mismatch" rather than "a line moved".
+
+Regenerating is correct and was correct here: the message, the frame names and
+the user-file locations were all unchanged and only the line moved. Recorded
+because the *next* such break will look exactly like a real one.
 
 ### 24. `Data.Set` is not one of the modules the Prelude re-exports
 **library.** M21. `Array`, `Map`, `Option` and eight others arrive

@@ -68,6 +68,21 @@ def test_native_float_division_is_ieee(capfd):
     assert capfd.readouterr().out == "Infinity\nNaN\n-0.0\n"
 
 
+def test_native_float_text_conversion_and_rounding_match_primitives(capfd):
+    native("""
+fun main() {
+    print(0.1); print(1.0e16); print(1000000000.0)
+    print(Float.parse("1.0e+16")); print(Float.parse("Infinity"))
+    print(Float.parse("nan")); print(Float.parse("oops"))
+    print(Float.round(0.5)); print(Float.round(-2.5)); print(Float.floor(-1.5))
+}
+""")
+    assert capfd.readouterr().out == (
+        "0.1\n1.0e+16\n1000000000.0\nSome(1.0e+16)\nSome(Infinity)\n"
+        "None\nNone\n1.0\n-3.0\n-2.0\n"
+    )
+
+
 def test_native_utf8_views_and_checked_byte_conversion(capfd):
     native("""
 fun main() {

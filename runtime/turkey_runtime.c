@@ -246,14 +246,98 @@ TurkeyString *turkey_float_to_string(double value) {
     if (isnan(value)) length = snprintf(buffer, sizeof(buffer), "NaN");
     else if (isinf(value)) length = snprintf(buffer, sizeof(buffer),
                                              signbit(value) ? "-Infinity" : "Infinity");
-    else {
-        length = snprintf(buffer, sizeof(buffer), "%.17g", value);
-        if (strchr(buffer, '.') == NULL && strchr(buffer, 'e') == NULL) {
-            buffer[length++] = '.'; buffer[length++] = '0'; buffer[length] = '\0';
+    else if (value == 0.0) {
+        length = snprintf(buffer, sizeof(buffer), signbit(value) ? "-0.0" : "0.0");
+    } else {
+        union { double number; uint64_t bits; } original = { .number = value }, parsed;
+        char trial[64];
+        int precision;
+        for (precision = 1; precision < 17; ++precision) {
+            snprintf(trial, sizeof(trial), "%.*g", precision, value);
+            parsed.number = strtod(trial, NULL);
+            if (parsed.bits == original.bits) break;
+        }
+        int exponent = (int)floor(log10(fabs(value)));
+        if (exponent >= -4 && exponent < 16) {
+            int decimals = precision - exponent - 1;
+            if (decimals < 0) decimals = 0;
+            length = snprintf(buffer, sizeof(buffer), "%.*f", decimals, value);
+        } else {
+            length = snprintf(buffer, sizeof(buffer), "%.*e", precision - 1, value);
+            length = (int)strlen(buffer);
+        }
+        char *marker = strchr(buffer, 'e');
+        if (strchr(buffer, '.') == NULL || (marker != NULL && strchr(buffer, '.') > marker)) {
+            size_t position = marker == NULL ? (size_t)length : (size_t)(marker - buffer);
+            memmove(buffer + position + 2, buffer + position,
+                    (size_t)length - position + 1);
+            buffer[position] = '.';
+            buffer[position + 1] = '0';
+            length += 2;
         }
     }
     return turkey_string_new((const unsigned char *)buffer, length);
 }
+
+static int parse_float(TurkeyString *value, double *result) {
+    if (value == NULL) return 0;
+    if (value->length == 3 && memcmp(value->bytes, "NaN", 3) == 0) {
+        *result = NAN; return 1;
+    }
+    if (value->length == 8 && memcmp(value->bytes, "Infinity", 8) == 0) {
+        *result = INFINITY; return 1;
+    }
+    if (value->length == 9 && memcmp(value->bytes, "-Infinity", 9) == 0) {
+        *result = -INFINITY; return 1;
+    }
+    int64_t index = 0;
+    if (index < value->length &&
+            (value->bytes[index] == '+' || value->bytes[index] == '-')) index++;
+    int64_t whole = index;
+    while (index < value->length && value->bytes[index] >= '0' &&
+           value->bytes[index] <= '9') index++;
+    if (index == whole || index >= value->length || value->bytes[index++] != '.') return 0;
+    int64_t fraction = index;
+    while (index < value->length && value->bytes[index] >= '0' &&
+           value->bytes[index] <= '9') index++;
+    if (index == fraction) return 0;
+    if (index < value->length &&
+            (value->bytes[index] == 'e' || value->bytes[index] == 'E')) {
+        index++;
+        if (index < value->length &&
+                (value->bytes[index] == '+' || value->bytes[index] == '-')) index++;
+        int64_t exponent = index;
+        while (index < value->length && value->bytes[index] >= '0' &&
+               value->bytes[index] <= '9') index++;
+        if (index == exponent) return 0;
+    }
+    if (index != value->length || (uint64_t)value->length >= SIZE_MAX) return 0;
+    char *text = malloc((size_t)value->length + 1);
+    if (text == NULL) { turkey_panic("out of memory"); return 0; }
+    memcpy(text, value->bytes, (size_t)value->length);
+    text[value->length] = '\0';
+    *result = strtod(text, NULL);
+    free(text);
+    return 1;
+}
+
+double turkey_float_parse(TurkeyString *value) {
+    double result = 0.0;
+    if (!parse_float(value, &result)) turkey_panic("string is not a Float");
+    return result;
+}
+
+int32_t turkey_float_can_parse(TurkeyString *value) {
+    double ignored;
+    return parse_float(value, &ignored);
+}
+
+double turkey_float_fmod(double left, double right) { return fmod(left, right); }
+double turkey_float_remainder(double left, double right) { return remainder(left, right); }
+double turkey_float_floor(double value) { return floor(value); }
+double turkey_float_ceil(double value) { return ceil(value); }
+double turkey_float_round(double value) { return round(value); }
+double turkey_float_trunc(double value) { return trunc(value); }
 
 TurkeyString *turkey_char_to_string(uint32_t value) {
     unsigned char out[4];

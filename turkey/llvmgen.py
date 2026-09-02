@@ -70,6 +70,14 @@ class _Emitter:
         self._runtime("turkey_string_concat", _PTR, [_PTR, _PTR])
         self._runtime("turkey_int_to_string", _PTR, [_I64])
         self._runtime("turkey_float_to_string", _PTR, [_F64])
+        self._runtime("turkey_float_parse", _F64, [_PTR])
+        self._runtime("turkey_float_can_parse", _I32, [_PTR])
+        self._runtime("turkey_float_fmod", _F64, [_F64, _F64])
+        self._runtime("turkey_float_remainder", _F64, [_F64, _F64])
+        self._runtime("turkey_float_floor", _F64, [_F64])
+        self._runtime("turkey_float_ceil", _F64, [_F64])
+        self._runtime("turkey_float_round", _F64, [_F64])
+        self._runtime("turkey_float_trunc", _F64, [_F64])
         self._runtime("turkey_char_to_string", _PTR, [_I32])
         self._runtime("turkey_string_byte_length", _I64, [_PTR])
         self._runtime("turkey_string_byte_at", _I8, [_PTR, _I64])
@@ -543,12 +551,23 @@ class _Emitter:
             "stringToByteStorage": "turkey_string_to_byte_storage",
             "stringFromBytes": "turkey_string_from_bytes",
             "stringConcatAll": "turkey_string_concat_all",
+            "floatParse": "turkey_float_parse",
+            "floatFmod": "turkey_float_fmod",
+            "floatRemainder": "turkey_float_remainder",
+            "floatFloor": "turkey_float_floor",
+            "floatCeil": "turkey_float_ceil",
+            "floatRound": "turkey_float_round",
+            "floatTrunc": "turkey_float_trunc",
         }.get(name)
         if runtime:
             value = builder.call(self.runtime[runtime], args)
             return value, self._propagate(function, builder)
         if name == "stringIsValidUtf8":
             raw = builder.call(self.runtime["turkey_string_is_valid_utf8"], args)
+            value = builder.icmp_unsigned("!=", raw, ir.Constant(_I32, 0))
+            return value, self._propagate(function, builder)
+        if name == "floatCanParse":
+            raw = builder.call(self.runtime["turkey_float_can_parse"], args)
             value = builder.icmp_unsigned("!=", raw, ir.Constant(_I32, 0))
             return value, self._propagate(function, builder)
         if name in ("stringEq", "stringLt"):
@@ -647,7 +666,10 @@ class _Emitter:
 
 _RUNTIME_SYMBOLS = (
     "turkey_string_new", "turkey_string_concat", "turkey_int_to_string",
-    "turkey_float_to_string", "turkey_char_to_string", "turkey_print",
+    "turkey_float_to_string", "turkey_float_parse", "turkey_float_can_parse",
+    "turkey_float_fmod", "turkey_float_remainder", "turkey_float_floor",
+    "turkey_float_ceil", "turkey_float_round", "turkey_float_trunc",
+    "turkey_char_to_string", "turkey_print",
     "turkey_write", "turkey_cell_new", "turkey_cell_load", "turkey_cell_store",
     "turkey_panic", "turkey_panicked",
     "turkey_string_byte_length", "turkey_string_byte_at",
@@ -679,6 +701,8 @@ def _load_runtime() -> ctypes.CDLL:
         "libturkey.dylib" if sys.platform == "darwin" else "libturkey.so")
     command = ["cc", "-std=c11", "-O2", "-fPIC", str(source), "-o", str(output)]
     command.insert(1, "-dynamiclib" if sys.platform == "darwin" else "-shared")
+    if sys.platform != "darwin":
+        command.append("-lm")
     if "TURKEY_RUNTIME_SANITIZE" in os.environ:
         command[2:2] = ["-O1", "-g", "-fsanitize=address,undefined",
                         "-fno-omit-frame-pointer"]

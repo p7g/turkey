@@ -112,11 +112,6 @@ type Generator = Generator {
     warnings    : Array String,
     -- Exhaustiveness runs after solving, when scrutinee types are known.
     matchSites  : Array (Expr, Ty.Type),
-    -- The dictionary abstraction of a binding group, and the `Use` of an
-    -- occurrence. Python hangs both on the tree; the modules that define their
-    -- types sit above `Turkey.Ast`, so they are keyed by node id here.
-    abstractions : Map Int Abstraction,
-    uses        : Map Int Use,
 }
 
 fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
@@ -128,7 +123,6 @@ fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
         scopes = [namesOf(builtins)], fnStack = Array.new(4),
         loopStack = Array.new(4), tyvarScopes = [Map.new()],
         warnings = Array.new(4), matchSites = Array.new(8),
-        abstractions = Map.new(), uses = Map.new(),
     }
 }
 
@@ -651,7 +645,7 @@ fun checkSignature(g : Generator, decl : FunDecl, s : Scheme,
             _ -> {}
         }
     }
-    Map.put(g.abstractions, decl.id, dicts)
+    Map.put(g.types.abstractions, decl.id, dicts)
 
     push(g)
     let inferred = genFunction(g, decl.params, decl.ret, decl.body, decl.span,
@@ -744,9 +738,9 @@ fun bindGroup(g : Generator, group : Array Stmt, rest : fun() -> a,
         for item in group {
             match item.kind {
                 SFun(d) -> if Set.contains(names, d.name) {
-                    Map.put(g.abstractions, d.id, dicts)
+                    Map.put(g.types.abstractions, d.id, dicts)
                 }
-                _ -> Map.put(g.abstractions, item.id, dicts)
+                _ -> Map.put(g.types.abstractions, item.id, dicts)
             }
         }
         node = CLet(LetCell {
@@ -1136,7 +1130,7 @@ fun use(g : Generator, name : String, where : Option Span,
     let marker = match node {
         Some(n) -> {
             let u = newUse(name, where, None)
-            Map.put(g.uses, n.id, u)
+            Map.put(g.types.uses, n.id, u)
             Some(u)
         }
         None -> None

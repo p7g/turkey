@@ -44,6 +44,7 @@ import Turkey.Exhaustive as Exhaustive
 import Turkey.PrimTypes as PrimTypes
 import Turkey.Infer as Infer
 import Turkey.Evidence as Evidence
+import Turkey.Core as Core
 import Turkey.Ast (Decl(..), Stmt(..), StmtKind(..), patternVars)
 
 -- Where the language's own library lives, relative to where this is run from.

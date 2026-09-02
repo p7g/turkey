@@ -86,6 +86,7 @@ class _FunctionLowerer:
         self.record_fields = record_fields
         self.lifted = lifted
         self.lift_counter = lift_counter
+        self.closure_abi = captures is not None
         self.captures = captures or []
         self.output_name = output_name or mangle(bind.name)
         self.count = 0
@@ -94,10 +95,10 @@ class _FunctionLowerer:
         self.slot_names: set[str] = set()
         self.entry = self.new_block("entry")
         self.params = ([bir.Value(self.fresh("environment"), bir.Layout.PTR)]
-                       if self.captures else [])
+                       if self.closure_abi else [])
         self.params += [bir.Value(self.fresh(p.name), layout_of(p.ty)) for p in lam.params]
         self.env: dict[str, bir.Value] = {}
-        if self.captures:
+        if self.closure_abi:
             environment = self.params[0]
             for index, (name, layout) in enumerate(self.captures):
                 slot = self.new_slot(name, layout)
@@ -106,7 +107,7 @@ class _FunctionLowerer:
                 self.entry.instructions.append(
                     bir.Instruction("slot_store", (slot.name, loaded)))
                 self.env[name] = slot
-        visible_params = self.params[1:] if self.captures else self.params
+        visible_params = self.params[1:] if self.closure_abi else self.params
         for core_param, param in zip(lam.params, visible_params):
             slot = self.new_slot(core_param.name, param.layout)
             self.entry.instructions.append(bir.Instruction("slot_store", (slot.name, param)))
@@ -396,9 +397,13 @@ class _FunctionLowerer:
                      else [value for _, value in expr.fields])
             def aggregate(at: bir.Block, values: list[bir.Operand]) -> None:
                 if isinstance(expr, CArray):
-                    pointer_bits = 1 if values and _pointer_layout(values[0].layout) else 0
+                    _, type_args = spine(expr.ty)
+                    element_layout = (layout_of(type_args[0]) if type_args else
+                                      values[0].layout if values else bir.Layout.BOXED)
+                    pointer_bits = 1 if _pointer_layout(element_layout) else 0
                     made = self.emit(at, "array_new",
-                                     (str(len(values)), str(pointer_bits)), bir.Layout.PTR)
+                                     (str(len(values)), str(_layout_width(element_layout)),
+                                      str(pointer_bits)), bir.Layout.PTR)
                     for index, value in enumerate(values):
                         at.instructions.append(bir.Instruction(
                             "array_set", (made, str(index), value)))
@@ -448,9 +453,14 @@ class _FunctionLowerer:
                         at.terminator = bir.Panic("error")
                     self.lower_values(expr.args, env, joins, block, panic)
                     return
+                operation = "prim." + primitive.removeprefix("Prim.")
+                if primitive in ("Prim.arrayNew", "Prim.arrayNewUninit"):
+                    _, type_args = spine(expr.ty)
+                    element_layout = layout_of(type_args[0]) if type_args else bir.Layout.BOXED
+                    operation += "." + element_layout.value
                 self.lower_values(expr.args, env, joins, block,
                                   lambda at, xs: done(at, self.emit(
-                                      at, "prim." + primitive.removeprefix("Prim."),
+                                      at, operation,
                                       tuple(xs), layout_of(expr.ty))))
                 return
             if isinstance(fn, CVar) and fn.name in self.functions:
@@ -614,6 +624,14 @@ def _erase_types(expr: CExpr | None) -> CExpr | None:
 
 def _pointer_layout(layout: bir.Layout) -> bool:
     return layout in (bir.Layout.PTR, bir.Layout.BOXED)
+
+
+def _layout_width(layout: bir.Layout) -> int:
+    if layout is bir.Layout.I8:
+        return 1
+    if layout is bir.Layout.I32:
+        return 4
+    return 8
 
 
 def _record_layouts(program: CProgram, decls) -> dict[str, list[str]]:

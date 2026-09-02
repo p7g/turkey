@@ -19,7 +19,7 @@ int32_t turkey_string_lt(TurkeyString *left, TurkeyString *right);
 uint8_t turkey_print(TurkeyString *value);
 uint8_t turkey_write(TurkeyString *value);
 
-void *turkey_cell_new(uint64_t value);
+void *turkey_cell_new(uint64_t value, int32_t pointer_value);
 uint64_t turkey_cell_load(void *cell);
 void turkey_cell_store(void *cell, uint64_t value);
 
@@ -28,7 +28,8 @@ void *turkey_object_new(int32_t kind, int32_t tag, int64_t count,
 int32_t turkey_object_tag(void *object);
 uint64_t turkey_object_get(void *object, int64_t index);
 void turkey_object_set(void *object, int64_t index, uint64_t value);
-void *turkey_array_new(int64_t length, uint64_t initial, int32_t pointer_elements);
+void *turkey_array_new(int64_t length, uint64_t initial, int32_t element_width,
+                       int32_t pointer_elements);
 int64_t turkey_array_length(void *array);
 uint64_t turkey_array_get(void *array, int64_t index);
 void turkey_array_set(void *array, int64_t index, uint64_t value);
@@ -37,6 +38,13 @@ void *turkey_closure_new(uint64_t code, int64_t capture_count,
 uint64_t turkey_closure_code(void *closure);
 void *turkey_closure_environment(void *closure);
 void turkey_closure_capture(void *closure, int64_t index, uint64_t value);
+
+void *turkey_root_push(int64_t count);
+void turkey_root_set(void *frame, int64_t index, void *value);
+void turkey_root_pop(void *frame);
+void turkey_collect(void);
+int64_t turkey_heap_objects(void);
+void turkey_gc_set_stress(int32_t enabled);
 
 void turkey_panic(const char *message);
 int32_t turkey_panicked(void);

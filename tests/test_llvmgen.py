@@ -4,7 +4,7 @@ from pathlib import Path
 from turkey.driver import check
 from turkey.cli import main as cli_main
 from turkey.errors import TurkeyPanic
-from turkey.llvmgen import execute, generate
+from turkey.llvmgen import compile, execute, generate
 
 
 def native(src: str) -> None:
@@ -90,6 +90,49 @@ fun main() {
 }
 """)
     assert capfd.readouterr().out == "55\n"
+
+
+def test_exact_roots_survive_collection_on_every_allocation(monkeypatch, capfd):
+    monkeypatch.setenv("TURKEY_GC_STRESS", "1")
+    checked = check("""
+fun main() {
+    let prefix = "value="
+    let values = [40, 41, 42]
+    let show = fun(i : Int) -> String = prefix + Int.toString(values[i])
+    print(show(2))
+}
+""")
+    module = compile(checked.opt, checked.decls, checked.main)
+    module.execute()
+    assert capfd.readouterr().out == "value=42\n"
+    assert module.runtime.turkey_heap_objects() == 0
+
+
+def test_pointer_arrays_are_traced_under_gc_stress(monkeypatch, capfd):
+    monkeypatch.setenv("TURKEY_GC_STRESS", "1")
+    native("""
+fun main() {
+    let values = [] : Array (Option Int)
+    Array.push(values, Some(1))
+    Array.push(values, None)
+    print(values)
+}
+""")
+    assert capfd.readouterr().out == "[Some(1), None]\n"
+
+
+def test_array_byte_uses_one_byte_elements(capfd):
+    checked = check("""
+fun main() {
+    let values = [Byte.maxValue(), Byte.truncate(300)]
+    print(values)
+}
+""")
+    text = generate(checked.opt, checked.decls, checked.main)
+    calls = [line for line in text.splitlines() if "call i8* @turkey_array_new" in line]
+    assert any("i32 1, i32 0" in line for line in calls)
+    execute(checked.opt, checked.decls, checked.main)
+    assert capfd.readouterr().out == "[255, 44]\n"
 
 
 def test_llvm_command_prints_verified_ir(tmp_path, capsys):

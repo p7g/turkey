@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import os
 import subprocess
 import sys
 import tempfile
@@ -64,14 +65,14 @@ class _Emitter:
         self._runtime("turkey_string_lt", _I32, [_PTR, _PTR])
         self._runtime("turkey_print", _I8, [_PTR])
         self._runtime("turkey_write", _I8, [_PTR])
-        self._runtime("turkey_cell_new", _PTR, [_I64])
+        self._runtime("turkey_cell_new", _PTR, [_I64, _I32])
         self._runtime("turkey_cell_load", _I64, [_PTR])
         self._runtime("turkey_cell_store", ir.VoidType(), [_PTR, _I64])
         self._runtime("turkey_object_new", _PTR, [_I32, _I32, _I64, _I64])
         self._runtime("turkey_object_tag", _I32, [_PTR])
         self._runtime("turkey_object_get", _I64, [_PTR, _I64])
         self._runtime("turkey_object_set", ir.VoidType(), [_PTR, _I64, _I64])
-        self._runtime("turkey_array_new", _PTR, [_I64, _I64, _I32])
+        self._runtime("turkey_array_new", _PTR, [_I64, _I64, _I32, _I32])
         self._runtime("turkey_array_length", _I64, [_PTR])
         self._runtime("turkey_array_get", _I64, [_PTR, _I64])
         self._runtime("turkey_array_set", ir.VoidType(), [_PTR, _I64, _I64])
@@ -81,6 +82,9 @@ class _Emitter:
         self._runtime("turkey_closure_capture", ir.VoidType(), [_PTR, _I64, _I64])
         self._runtime("turkey_panic", ir.VoidType(), [_PTR])
         self._runtime("turkey_panicked", _I32, [])
+        self._runtime("turkey_root_push", _PTR, [_I64])
+        self._runtime("turkey_root_set", ir.VoidType(), [_PTR, _I64, _PTR])
+        self._runtime("turkey_root_pop", ir.VoidType(), [_PTR])
 
     def emit(self) -> tuple[str, binding.TargetMachine]:
         for source in self.source.functions:
@@ -105,6 +109,24 @@ class _Emitter:
         entry_builder = ir.IRBuilder(blocks[source.entry])
         slots = {slot.name: entry_builder.alloca(_llvm_type(slot.layout), name=slot.name)
                  for slot in source.slots}
+        root_values = [value for value in source.params + source.slots
+                       if value.layout in (bir.Layout.PTR, bir.Layout.BOXED)]
+        root_values += [value for block in source.blocks for value in block.params
+                        if value.layout in (bir.Layout.PTR, bir.Layout.BOXED)]
+        root_values += [instruction.result for block in source.blocks
+                        for instruction in block.instructions
+                        if instruction.result is not None and instruction.result.layout
+                        in (bir.Layout.PTR, bir.Layout.BOXED)]
+        root_index = {value.name: index for index, value in enumerate(root_values)}
+        root_frame = entry_builder.call(
+            self.runtime["turkey_root_push"],
+            [ir.Constant(_I64, len(root_values))], name="roots")
+        self._root_frame = root_frame
+        self._root_index = root_index
+        self._slot_layouts = {slot.name: slot.layout for slot in source.slots}
+        for param in source.params:
+            if param.name in root_index:
+                self._set_root(entry_builder, param.name, values[param.name])
         phis: dict[tuple[str, str], ir.PhiInstr] = {}
         builders: dict[str, ir.IRBuilder] = {}
         for block in source.blocks:
@@ -114,6 +136,9 @@ class _Emitter:
                 phi = builder.phi(_llvm_type(param.layout), name=param.name)
                 phis[(block.name, param.name)] = phi
                 values[param.name] = phi
+            for param in block.params:
+                if param.name in root_index:
+                    self._set_root(builder, param.name, values[param.name])
 
         for block in source.blocks:
             builder = builders[block.name]
@@ -122,9 +147,16 @@ class _Emitter:
                     function, builder, instruction, values, slots)
                 if instruction.result is not None:
                     values[instruction.result.name] = value
+                    if instruction.result.name in root_index:
+                        self._set_root(builder, instruction.result.name, value)
+                if (instruction.op == "slot_store"
+                        and instruction.args[0] in root_index):
+                    self._set_root(builder, instruction.args[0],
+                                   self._operand(instruction.args[1], values))
             term = block.terminator
             assert term is not None
             if isinstance(term, bir.Return):
+                builder.call(self.runtime["turkey_root_pop"], [root_frame])
                 builder.ret(self._operand(term.value, values))
             elif isinstance(term, bir.Jump):
                 builder.branch(blocks[term.target])
@@ -137,7 +169,13 @@ class _Emitter:
                                 blocks[term.yes], blocks[term.no])
             else:
                 self._panic(builder, term.message)
+                builder.call(self.runtime["turkey_root_pop"], [root_frame])
                 builder.ret(ir.Constant(function.function_type.return_type, None))
+
+    def _set_root(self, builder: ir.IRBuilder, name: str, value: ir.Value) -> None:
+        builder.call(self.runtime["turkey_root_set"], [
+            self._root_frame, ir.Constant(_I64, self._root_index[name]), value,
+        ])
 
     def _operand(self, operand: bir.Operand, values: dict[str, ir.Value]) -> ir.Value:
         if isinstance(operand, bir.Value):
@@ -171,13 +209,17 @@ class _Emitter:
         args = [self._operand(arg, values) for arg in instruction.args
                 if isinstance(arg, (bir.Value, bir.Constant))]
         if op == "call":
-            return builder.call(self.functions[instruction.args[0]], args,
-                                name=instruction.result.name), builder
+            value = builder.call(self.functions[instruction.args[0]], args,
+                                 name=instruction.result.name)
+            return value, self._propagate(function, builder)
         if op.startswith("prim."):
             return self._primitive(function, builder, op[5:], args, instruction.result.layout)
         if op == "cell_new":
             bits = self._to_i64(builder, args[0])
-            return builder.call(self.runtime["turkey_cell_new"], [bits]), builder
+            pointer = int(instruction.args[0].layout in (bir.Layout.PTR, bir.Layout.BOXED))
+            value = builder.call(self.runtime["turkey_cell_new"],
+                                 [bits, ir.Constant(_I32, pointer)])
+            return value, self._propagate(function, builder)
         if op == "cell_load":
             bits = builder.call(self.runtime["turkey_cell_load"], args)
             return self._from_i64(builder, bits, instruction.result.layout), builder
@@ -206,7 +248,8 @@ class _Emitter:
             return builder.call(self.runtime["turkey_array_new"],
                                 [ir.Constant(_I64, int(instruction.args[0])),
                                  ir.Constant(_I64, 0),
-                                 ir.Constant(_I32, int(instruction.args[1]))]), builder
+                                 ir.Constant(_I32, int(instruction.args[1])),
+                                 ir.Constant(_I32, int(instruction.args[2]))]), builder
         if op == "array_get":
             bits = builder.call(self.runtime["turkey_array_get"], args)
             return self._from_i64(builder, bits, instruction.result.layout), builder
@@ -240,13 +283,15 @@ class _Emitter:
             code = builder.call(self.runtime["turkey_closure_code"], [closure])
             environment = builder.call(
                 self.runtime["turkey_closure_environment"], [closure])
+            builder = self._propagate(function, builder)
             signature = ir.FunctionType(
                 _llvm_type(instruction.result.layout),
                 [_PTR, *(arg.type for arg in args[1:])],
             ).as_pointer()
             callee = builder.inttoptr(code, signature)
-            return builder.call(callee, [environment, *args[1:]],
-                                name=instruction.result.name), builder
+            value = builder.call(callee, [environment, *args[1:]],
+                                 name=instruction.result.name)
+            return value, self._propagate(function, builder)
         if op in ("scalar_eq", "float_eq"):
             return (builder.fcmp_ordered("==", args[0], args[1]) if op == "float_eq"
                     else builder.icmp_unsigned("==", args[0], args[1])), builder
@@ -274,6 +319,11 @@ class _Emitter:
 
     def _primitive(self, function: ir.Function, builder: ir.IRBuilder, name: str,
                    args: list[ir.Value], layout: bir.Layout) -> tuple[ir.Value, ir.IRBuilder]:
+        array_layout: bir.Layout | None = None
+        suffix = name.rpartition(".")[2]
+        if suffix in {layout.value for layout in bir.Layout}:
+            array_layout = bir.Layout(suffix)
+            name = name.rpartition(".")[0]
         overflow = {"intAdd": builder.sadd_with_overflow,
                     "intSub": builder.ssub_with_overflow,
                     "intMul": builder.smul_with_overflow}
@@ -413,9 +463,13 @@ class _Emitter:
                        else ir.Constant(_I64, 0))
             # The element layout is carried by specialization in later phases;
             # scalar/pointer tracing is conservatively selected at the call.
-            pointer = int(len(args) == 2 and isinstance(args[1].type, ir.PointerType))
+            pointer = int(array_layout in (bir.Layout.PTR, bir.Layout.BOXED)
+                          if array_layout is not None
+                          else len(args) == 2 and isinstance(args[1].type, ir.PointerType))
+            width = 1 if array_layout is bir.Layout.I8 else 4 if array_layout is bir.Layout.I32 else 8
             return builder.call(self.runtime["turkey_array_new"],
-                                [args[0], initial, ir.Constant(_I32, pointer)]), builder
+                                [args[0], initial, ir.Constant(_I32, width),
+                                 ir.Constant(_I32, pointer)]), builder
         if name == "error":
             # Runtime strings are length-delimited, while panic messages are C
             # strings. A dedicated runtime entry is added with full panic ABI;
@@ -425,14 +479,24 @@ class _Emitter:
         raise Unsupported(f"LLVM primitive Prim.{name} is not implemented")
 
     def _guard(self, function: ir.Function, builder: ir.IRBuilder,
-               failed: ir.Value, message: str) -> ir.IRBuilder:
+               failed: ir.Value, message: str | None) -> ir.IRBuilder:
         bad = function.append_basic_block("panic")
         good = function.append_basic_block("checked")
         builder.cbranch(failed, bad, good)
         panic_builder = ir.IRBuilder(bad)
-        self._panic(panic_builder, message)
+        if message is not None:
+            self._panic(panic_builder, message)
+        panic_builder.call(self.runtime["turkey_root_pop"], [self._root_frame])
         panic_builder.ret(ir.Constant(function.function_type.return_type, None))
         return ir.IRBuilder(good)
+
+    def _propagate(self, function: ir.Function,
+                   builder: ir.IRBuilder) -> ir.IRBuilder:
+        panicked = builder.call(self.runtime["turkey_panicked"], [])
+        return self._guard(
+            function, builder,
+            builder.icmp_unsigned("!=", panicked, ir.Constant(_I32, 0)), None,
+        )
 
     def _panic(self, builder: ir.IRBuilder, message: str) -> None:
         data = message.encode("utf-8") + b"\0"
@@ -471,6 +535,7 @@ _RUNTIME_SYMBOLS = (
     "turkey_array_get", "turkey_array_set",
     "turkey_closure_new", "turkey_closure_code",
     "turkey_closure_environment", "turkey_closure_capture",
+    "turkey_root_push", "turkey_root_set", "turkey_root_pop",
 )
 _runtime_library: ctypes.CDLL | None = None
 
@@ -485,6 +550,9 @@ def _load_runtime() -> ctypes.CDLL:
         "libturkey.dylib" if sys.platform == "darwin" else "libturkey.so")
     command = ["cc", "-std=c11", "-O2", "-fPIC", str(source), "-o", str(output)]
     command.insert(1, "-dynamiclib" if sys.platform == "darwin" else "-shared")
+    if "TURKEY_RUNTIME_SANITIZE" in os.environ:
+        command[2:2] = ["-O1", "-g", "-fsanitize=address,undefined",
+                        "-fno-omit-frame-pointer"]
     try:
         subprocess.run(command, check=True, capture_output=True, text=True)
     except (OSError, subprocess.CalledProcessError) as exc:
@@ -495,6 +563,7 @@ def _load_runtime() -> ctypes.CDLL:
         binding.add_symbol(name, ctypes.cast(getattr(library, name), ctypes.c_void_p).value)
     library.turkey_panicked.restype = ctypes.c_int32
     library.turkey_panic_message.restype = ctypes.c_char_p
+    library.turkey_heap_objects.restype = ctypes.c_int64
     library.turkey_panic_clear()
     _runtime_library = library
     return library
@@ -510,8 +579,10 @@ class NativeModule:
 
     def execute(self) -> None:
         self.runtime.turkey_panic_clear()
+        self.runtime.turkey_gc_set_stress(int("TURKEY_GC_STRESS" in os.environ))
         address = self.engine.get_function_address(self.entry)
         ctypes.CFUNCTYPE(_ctype(self.result))(address)()
+        self.runtime.turkey_collect()
         if self.runtime.turkey_panicked():
             raw = self.runtime.turkey_panic_message()
             raise TurkeyPanic(raw.decode("utf-8", "replace"))

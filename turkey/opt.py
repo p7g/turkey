@@ -692,18 +692,38 @@ def _apply_names(names, args, body, ty):
     the chain means something the call did not. The names in question are a
     callee's parameters and a caller's locals, so it takes a coincidence -- but
     a reduction that is wrong on a coincidence is wrong.
+
+    The `let`s this builds are themselves binders, and a substituted argument
+    lands *inside* them, so `bound` cannot be read off the callee's body alone.
+    `internal(name, b.name)` -- a caller's local spelled like a callee's second
+    parameter -- substitutes `name` for `owner` and then wraps `let name =
+    b.name` around it, and the body reads the field twice. So a parameter that
+    becomes a `let` disqualifies substituting any argument that mentions it,
+    and disqualifying one turns it into a `let` in turn, which is why this
+    settles rather than deciding in one pass.
     """
     bound = _binders_of(body)
-    substitution = {}
-    remaining: list[tuple[str, object]] = []
+    candidates = {}
+    letters: list[str] = []  # parameters that will be bound by a `let`
     for index, (name, arg) in enumerate(zip(names, args)):
         free = _free_names(arg)
         if free & set(names[:index]):
             return None
         if _is_value(arg) and name not in bound and not (free & bound):
-            substitution[name] = arg
+            candidates[name] = arg
         else:
-            remaining.append((name, arg))
+            letters.append(name)
+    while True:
+        captured = [name for name, arg in candidates.items()
+                    if _free_names(arg) & set(letters)]
+        if not captured:
+            break
+        for name in captured:
+            del candidates[name]
+        letters.extend(captured)
+
+    substitution = {n: a for n, a in candidates.items()}
+    remaining = [(n, a) for n, a in zip(names, args) if n not in substitution]
     if substitution:
         body = _substitute(body, substitution)
     for name, arg in reversed(remaining):

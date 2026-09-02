@@ -135,6 +135,23 @@ def check(src: str, file: str | None = None,
     )
 
 
+def desugared(src: str, file: str | None = None,
+              search: list[Path] | None = None) -> list[Module]:
+    """Every module of a program, loaded, resolved and desugared -- and no
+    further. This is the front end's halfway point made observable: the two
+    passes it runs are exactly the two `check` runs before inference, in the
+    same order and with the same arguments, so the tree it hands back is the
+    tree the checker would have seen. `turkey desugar` prints it, and the
+    bootstrap compiler's `desugar` is diffed against that.
+    """
+    loader = ModuleLoader(search)
+    loader.load_entry(src, file)
+    for module in loader.order:
+        Resolver(module.scope).program(module.program)
+        desugar.program(module.program, module.scope.methods)
+    return loader.order
+
+
 def _signatures(entry: Module, env: Env,
                 classes: ClassTable) -> list[tuple[str, Scheme]]:
     """What `turkey types` prints: the entry module's own bindings.

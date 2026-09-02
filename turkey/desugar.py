@@ -226,8 +226,11 @@ class Desugarer:
     def context(self, body: ast.Expr) -> ast.Expr:
         """A do-context: a `do` block, or the body of a `fun` holding a `?`."""
         if not _owns(body):
-            self.walk(body)
-            return body
+            # The *result*, not `body`: `walk` replaces a node rather than
+            # rewriting it when the node is a `do`, and `fun f() = do { a? }`
+            # is a body that is one. Returning `body` there left the `?` in the
+            # tree for `deps.free_names` to fall over on.
+            return self.walk(body)
         if not _needs_flow(_stmts(body)):
             return self.block(body, _identity)
         # Something at or after the first `?` transfers control, so it would end
@@ -490,10 +493,12 @@ class Desugarer:
 
         if not lifted:
             def plain(c: ast.Expr) -> ast.Expr:
-                self.walk(e.then)
-                if e.otherwise is not None:
-                    self.walk(e.otherwise)
-                return k(ast.EIf(e.span, c, e.then, e.otherwise))
+                # Rebuilt from what `walk` answers, for the reason `context`
+                # is: a branch that *is* a `do` is replaced, not rewritten.
+                then = self.walk(e.then)
+                other = (self.walk(e.otherwise)
+                         if e.otherwise is not None else None)
+                return k(ast.EIf(e.span, c, then, other))
             return self.expr(e.cond, plain)
 
         # In tail position `k` goes into the branches and there is no `bind` at

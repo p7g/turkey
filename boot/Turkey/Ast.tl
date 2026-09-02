@@ -18,6 +18,7 @@ module Turkey.Ast (
     ImportDecl(..),
     Decl(..),
     Program(..),
+    patternVars,
 )
 
 -- Abstract syntax (design.md 3), as the bootstrap compiler represents it.
@@ -125,7 +126,10 @@ type ExprKind
     | ERecord(String, Array (String, Expr))
     | ELambda(Array Pat, Option Type, Expr)
     | ECall(Expr, Array Expr)
-    | EIndex(Expr, Expr)
+    -- The two trailing references are `Index`'s `get` and `set`, filled in by
+    -- resolution and consumed by desugaring, which turns every bracket into
+    -- the call it means. The parser writes `None` for both.
+    | EIndex(Expr, Expr, Option Expr, Option Expr)
     | EField(Expr, String)
     | EProject(Expr, Int)
     -- The trailing `Option Expr` of each operator form is the method it means,
@@ -197,6 +201,12 @@ type FunDecl = FunDecl {
     ret     : Option Type,
     body    : Option Expr,
     context : Array Pred,
+    -- Set on the local `fun` a lifted loop becomes, and on nothing else. Such
+    -- a function has one call site plus its own recursion, so there is nothing
+    -- for a scheme to be used at twice -- and generalizing it left a variable
+    -- in the `Brk` slot that nothing could solve, which kept every lifted loop
+    -- out of reach of the inliner. See `Turkey.Desugar.loopFun`.
+    monomorphic : Bool,
 }
 
 -- One variant of a data type. Exactly one of `args` and `fields` is meaningful.
@@ -290,4 +300,34 @@ type Program = Program {
     header  : Option ModuleHeader,
     imports : Array ImportDecl,
     decls   : Array Decl,
+    -- Where the parser's id counter got to. Desugaring writes nodes of its own
+    -- and they need ids as much as parsed ones do, so the counter is handed on
+    -- rather than restarted -- a second counter starting at zero would collide
+    -- with every node already in the tree. Not part of the syntax, and not
+    -- dumped.
+    nextId  : Int,
+}
+
+-- Every variable a pattern binds.
+--
+-- A structural question about the tree and nothing more, which is why it lives
+-- here rather than in the one stage that happens to ask it first: `Modules`
+-- wants a `let`'s binders to know what a module declares, `Resolve` wants a
+-- match arm's to know what is local, and `Infer` will want a parameter's.
+-- `turkey/deps.py` holds the Python's copy for the historical reason that
+-- dependency ordering asked first.
+fun patternVars(p : Pat) -> Array String {
+    let out = Array.new(4)
+    collectPatternVars(p, out)
+    out
+}
+
+fun collectPatternVars(p : Pat, out : Array String) -> Unit = match p.kind {
+    PVar(name) -> Array.push(out, name)
+    PWild -> {}
+    PLit(_) -> {}
+    PCon(_, args) -> for a in args { collectPatternVars(a, out) }
+    PRecord(_, fields) -> for (_, sub) in fields { collectPatternVars(sub, out) }
+    PTuple(elems) -> for e in elems { collectPatternVars(e, out) }
+    PAnnot(inner, _) -> collectPatternVars(inner, out)
 }

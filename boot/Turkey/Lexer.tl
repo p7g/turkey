@@ -438,10 +438,7 @@ fun lexWord(lx : Lexer, start : Span) -> Token {
 fun startsUpper(text : String) -> Bool =
     match String.decode(text, String.start(text)) {
         None -> False
-        Some(c) -> {
-            let code = Char.toInt(c)
-            code >= 65 && code <= 90
-        }
+        Some(c) -> Char.isAsciiUpper(c)
     }
 
 fun lexOperator(lx : Lexer, start : Span, c : Char) -> Token {

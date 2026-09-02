@@ -1,4 +1,4 @@
-module Turkey.Parser (parse, collectTycons)
+module Turkey.Parser (parse, collectTycons, builtinTycons)
 
 -- Recursive descent (design.md 3), ported from `turkey/parser.py`.
 --
@@ -246,7 +246,8 @@ fun parseProgram(p : P) -> Program {
         }
         endOfStatement(p)
     }
-    Program { span = s, header = header, imports = imports, decls = decls }
+    Program { span = s, header = header, imports = imports, decls = decls,
+              nextId = p.nextId }
 }
 
 fun endOfStatement(p : P) -> Unit {
@@ -550,6 +551,7 @@ fun parseFunDecl(p : P, allowSignature : Bool) -> FunDecl {
     FunDecl {
         span = s, name = name, params = params, ret = ret,
         body = Some(parseFunBody(p)), context = context,
+        monomorphic = False,
     }
 }
 
@@ -605,7 +607,7 @@ fun parseSignature(p : P, s : Span, name : String, context : Array Pred) -> FunD
     }
     FunDecl {
         span = s, name = name, params = params, ret = Some(ret), body = None,
-        context = context,
+        context = context, monomorphic = False,
     }
 }
 
@@ -819,7 +821,7 @@ fun checkAssignable(p : P, e : Expr, s : Span) -> Unit = match e.kind {
     EProject(_, _) -> oops(p, "numeric projections are read-only", s)
     EVar(_, _) -> {}
     EField(_, _) -> {}
-    EIndex(_, _) -> {}
+    EIndex(_, _, _, _) -> {}
     _ -> oops(p, "left side of an assignment must be a variable, a record field, "
                  + "or an array element", s)
 }
@@ -990,7 +992,7 @@ fun parsePostfix(p : P) -> Expr {
             let index = parseExpr(p)
             p.noRecord = saved
             skipToken(p, "]")
-            e = mkExpr(p, e.span, EIndex(e, index))
+            e = mkExpr(p, e.span, EIndex(e, index, None, None))
         } else if at(p, ".") && memberFollows(p) {
             advance(p)
             let member = advance(p)

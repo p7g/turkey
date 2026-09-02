@@ -204,6 +204,43 @@ binder in every program, not just from the production that wanted it.
 automatically; `Set` needs an import, for no reason a reader could guess. Either
 it belongs in the list or the list needs a stated rule for what is in it.
 
+### 25. No reflection, so four scanners share one hand-written child list
+**design.** M21. `turkey/desugar.py` asks four questions of a subtree --
+"is there a `?` or `do` under here", "is there one that unwinds to *this*
+context", "does anything transfer control out of here", "is there a loop that
+will be lifted" -- which differ only in where they stop. Each is a generic walk
+over the dataclass fields, so a node kind added to `turkey/ast.py` cannot be
+missed by one of them.
+
+Turkey has no reflection, so `Turkey.Desugar.children` is that enumerator
+written out once and the four scanners share it. That is the honest port and it
+reads well, but the safety property is gone: a node kind added to `Turkey.Ast`
+and forgotten in `children` is missed by all four at once, silently. The same
+shape recurs three more times in the file -- the transparent walk, the bracket
+lowering, and `Turkey.Resolve`'s walk -- each an explicit case per node kind
+where the Python has none.
+
+This is not an argument for reflection. It is the cost of not having it, and
+the mitigation available is the one already in use: the corpus diff, which
+notices a missed node the moment any file contains one.
+
+### 26. No function identity, so a continuation is a variant
+**design, and an improvement.** M21. The lowering threads a continuation
+through every rule, and in one place asks *which* continuation it has:
+`if k is not self.fall` is how `turkey/desugar.py` decides that a loop is in
+statement position rather than value position. Turkey has closures but no
+function identity -- nothing to compare `k` against.
+
+So `Cont` here is a four-way variant: `KId`, `KFall`, `KPure` and `KFn`, the
+first three being the ones the pass builds for itself and only the last a real
+closure. The question becomes `isFall(k)`, which is a case analysis rather than
+a pointer comparison.
+
+Recorded as a finding because it was forced, but it is the better spelling:
+`KFall` says what the continuation *is* where a bound method compared by
+identity said only that it was that particular object. Worth remembering when
+the same pressure comes up again -- an absent feature made the code say more.
+
 ---
 
 ## Library, still wanted

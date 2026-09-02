@@ -14,6 +14,12 @@ Cost is why `boot` is handed the entire corpus in one invocation. Starting it
 means compiling it, which is about two seconds; per-file that would be minutes,
 and once per suite it is once. The Python side needs no subprocess at all,
 being an ordinary function call.
+
+The M21 milestone is the slow one, and knowingly: it loads a whole module graph
+per entry program, so the library is parsed once per program on both sides. The
+Python side does that in under three seconds and `boot` takes minutes, because
+`boot` is a Turkey program running on generated Python. That ratio is the thing
+M26 removes rather than a reason to shrink the corpus.
 """
 
 from __future__ import annotations
@@ -26,6 +32,7 @@ from pathlib import Path
 import pytest
 
 from turkey.astdump import dump as dump_ast
+from turkey.driver import desugared
 from turkey.lexer import tokenize
 from turkey.parser import parse
 
@@ -45,6 +52,24 @@ def _corpus() -> list[Path]:
 
 
 CORPUS = _corpus()
+
+
+def _entries() -> list[Path]:
+    """The corpus files that can be an *entry* module.
+
+    A library module resolves its own imports against its own directory, so
+    `lib/Data/Array.tl` alone is not a program and neither implementation can
+    load it as one. Every library module is still covered by the milestone
+    below, as an import of every program that is here.
+    """
+    found = sorted(
+        p for p in REPO_ROOT.glob("tests/programs/**/*.tl")
+        if "err_" not in str(p))
+    found.append(BOOT_MAIN)
+    return found
+
+
+ENTRIES = _entries()
 
 
 def _boot(*args: str) -> str:
@@ -102,6 +127,22 @@ def boot_ast() -> str:
     return _boot("ast", *(str(p) for p in CORPUS))
 
 
+@pytest.fixture(scope="module")
+def boot_desugar() -> str:
+    return _boot("desugar", *(str(p.relative_to(REPO_ROOT)) for p in ENTRIES))
+
+
+def _python_desugar(paths: list[Path]) -> str:
+    out: list[str] = []
+    for path in paths:
+        relative = str(path.relative_to(REPO_ROOT))
+        src = path.read_text(encoding="utf-8")
+        for module in desugared(src, relative, [path.parent]):
+            out.append(f"module {module.name}\n")
+            out.append(dump_ast(module.program))
+    return "".join(out)
+
+
 def test_the_corpus_is_the_whole_repository() -> None:
     # A shrinking corpus would silently weaken every test below it.
     names = {p.name for p in CORPUS}
@@ -135,6 +176,36 @@ def test_boot_parses_the_corpus_exactly_as_python_does(boot_ast: str) -> None:
     says the two readings coincide.
     """
     _first_difference(boot_ast, _python_ast(CORPUS), "ast")
+
+
+def test_boot_resolves_and_desugars_the_corpus_exactly_as_python_does(
+        boot_desugar: str) -> None:
+    """M21: module loading, name resolution and the `?`/`do` lowering.
+
+    Every module of every program, not just the entry one: what resolution does
+    to a module depends on what it imported, so a dump of the entry alone would
+    check the interesting half of the stage against nothing. Between them these
+    programs pull in the whole of `lib/`, and `boot/Main.tl` pulls in the whole
+    of `boot/`.
+
+    The tree is the M20 dump, so what this adds over that milestone is exactly
+    what the two passes changed: every name is internal, every bracket is an
+    `Index` call, and every `?` is a `bind` -- including the lifted loops, whose
+    generated `%loop`/`%fell`/`%k` binders are in the dump and therefore pin the
+    two implementations to the same *numbering*, not merely the same shape.
+    """
+    _first_difference(boot_desugar, _python_desugar(ENTRIES), "desugar")
+
+
+def test_the_desugar_corpus_exercises_the_hard_cases() -> None:
+    """The milestone is only worth its runtime if the shapes are in it."""
+    dumped = _python_desugar(ENTRIES)
+    assert "%k1" in dumped, "no `?` was lowered to a bind"
+    assert "%loop" in dumped, "no loop containing a `?` was lifted"
+    assert "%fell" in dumped, "no flow-mode sequencing point"
+    assert "%seq" in dumped, "no `for ... in` was expanded to its cursor form"
+    assert "Prelude#Fall" in dumped, "no control transfer became a value"
+    assert "\n  eindex" not in dumped, "a bracket survived desugaring"
 
 
 def test_boot_reports_a_missing_file(tmp_path: Path) -> None:

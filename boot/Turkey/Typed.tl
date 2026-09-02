@@ -1,7 +1,7 @@
 module Turkey.Typed (
     TypeTable(..), newTypeTable, observe,
     record, recordDecl, ofDecl, recordPattern, ofPattern, of_, resolve,
-    unresolved, reduceDeep, children,
+    unresolved, reduceDeep, typeChildren,
 )
 
 -- What inference discovered about each expression, kept rather than dropped
@@ -29,6 +29,7 @@ import Data.Set as Set
 import Turkey.Ast
 import Turkey.Classes as Classes
 import Turkey.Classes (ClassTable(..))
+import Turkey.Solved (Abstraction(..), Use(..))
 import Turkey.Types as Ty
 import Turkey.Types (TVar, TCon, TApp, TFam, TFun, TTuple, TSet, TBottom)
 
@@ -37,10 +38,18 @@ type TypeTable = TypeTable {
     decls : Map Int Ty.Type,
     pats  : Map Int (Map String Ty.Type),
     fams  : Option Ty.Families,
+    -- The dictionary abstraction of a binding group, and the evidence a use
+    -- site turned out to need. Python hangs both on the surface node; the
+    -- modules that define their types sit above `Turkey.Ast`, so they live here
+    -- -- which is where the *other* thing keyed by node id already lives, and
+    -- is shared across modules for the same reason.
+    abstractions : Map Int Abstraction,
+    uses         : Map Int Use,
 }
 
 fun newTypeTable() -> TypeTable = TypeTable {
     exprs = Map.new(), decls = Map.new(), pats = Map.new(), fams = None,
+    abstractions = Map.new(), uses = Map.new(),
 }
 
 -- Take the family reducer to read recorded types back with.
@@ -160,7 +169,7 @@ fun stuck(ty : Ty.Type) -> Bool {
         TSet(_) -> return True
         _ -> {}
     }
-    for c in children(Ty.prune(ty)) {
+    for c in typeChildren(Ty.prune(ty)) {
         if stuck(c) { return True }
     }
     False
@@ -169,7 +178,7 @@ fun stuck(ty : Ty.Type) -> Bool {
 -- One level of a type's structure. Spelled out rather than reflected: a missing
 -- case here would silently under-report, which is the one thing a check for what
 -- must not survive cannot afford.
-fun children(ty : Ty.Type) -> Array Ty.Type = match ty {
+fun typeChildren(ty : Ty.Type) -> Array Ty.Type = match ty {
     TApp(fn, arg, _) -> [fn, arg]
     TFam(_, arg, _) -> [arg]
     TFun(params, ret) -> Array.append(params, [ret])

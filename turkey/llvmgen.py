@@ -68,6 +68,8 @@ class _Emitter:
         self.module = ir.Module(name="turkey")
         self.module.triple = binding.get_default_triple()
         self.module.data_layout = str(self.machine.target_data)
+        self.panic_flag = ir.GlobalVariable(
+            self.module, _I32, name="turkey_has_panicked")
         self.functions: dict[str, ir.Function] = {}
         self.source_functions = {function.name: function
                                  for function in source.functions}
@@ -709,7 +711,7 @@ class _Emitter:
 
     def _propagate(self, function: ir.Function,
                    builder: ir.IRBuilder) -> ir.IRBuilder:
-        panicked = builder.call(self.runtime["turkey_panicked"], [])
+        panicked = builder.load(self.panic_flag, name="panicked")
         return self._guard(
             function, builder,
             builder.icmp_unsigned("!=", panicked, ir.Constant(_I32, 0)), None,
@@ -807,6 +809,10 @@ def _load_runtime() -> ctypes.CDLL:
     library = ctypes.CDLL(str(output))
     for name in _RUNTIME_SYMBOLS:
         binding.add_symbol(name, ctypes.cast(getattr(library, name), ctypes.c_void_p).value)
+    binding.add_symbol(
+        "turkey_has_panicked",
+        ctypes.addressof(ctypes.c_int32.in_dll(library, "turkey_has_panicked")),
+    )
     library.turkey_panicked.restype = ctypes.c_int32
     library.turkey_panic_message.restype = ctypes.c_char_p
     library.turkey_frame_count.restype = ctypes.c_int64

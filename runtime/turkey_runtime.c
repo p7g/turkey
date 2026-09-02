@@ -16,7 +16,7 @@ typedef struct TurkeyObject {
 } TurkeyObject;
 
 static char panic_buffer[256];
-static int32_t has_panicked;
+int32_t turkey_has_panicked;
 
 typedef struct PanicCallFrame {
     struct PanicCallFrame *previous;
@@ -216,28 +216,28 @@ static void capture_panic_trace(void) {
 }
 
 void turkey_panic(const char *message) {
-    if (!has_panicked) {
+    if (!turkey_has_panicked) {
         snprintf(panic_buffer, sizeof(panic_buffer), "%s", message);
-        has_panicked = 1;
+        turkey_has_panicked = 1;
         capture_panic_trace();
     }
 }
 
 void turkey_panic_string(TurkeyString *message) {
-    if (has_panicked) return;
+    if (turkey_has_panicked) return;
     if (message == NULL) { turkey_panic("error"); return; }
     int length = message->length < (int64_t)sizeof(panic_buffer) - 1
         ? (int)message->length : (int)sizeof(panic_buffer) - 1;
     memcpy(panic_buffer, message->bytes, (size_t)length);
     panic_buffer[length] = '\0';
-    has_panicked = 1;
+    turkey_has_panicked = 1;
     capture_panic_trace();
 }
 
-int32_t turkey_panicked(void) { return has_panicked; }
+int32_t turkey_panicked(void) { return turkey_has_panicked; }
 const char *turkey_panic_message(void) { return panic_buffer; }
 void turkey_panic_clear(void) {
-    has_panicked = 0;
+    turkey_has_panicked = 0;
     panic_buffer[0] = '\0';
     panic_calls = NULL;
     free(panic_trace);
@@ -654,10 +654,10 @@ void turkey_object_set_as(void *pointer, int64_t index, uint64_t value,
         object->slots[index] = value;
     } else if (stored == 7 && layout < 6) {
         void *box = turkey_box(value, layout);
-        if (!has_panicked) object->slots[index] = (uint64_t)(uintptr_t)box;
+        if (!turkey_has_panicked) object->slots[index] = (uint64_t)(uintptr_t)box;
     } else if (stored < 6 && layout == 7) {
         uint64_t bits = turkey_unbox((void *)(uintptr_t)value, stored);
-        if (!has_panicked) object->slots[index] = bits;
+        if (!turkey_has_panicked) object->slots[index] = bits;
     } else {
         turkey_panic("object field has the wrong scalar layout");
     }
@@ -753,7 +753,7 @@ uint64_t turkey_array_get_as(void *pointer, int64_t index, int32_t layout) {
     if (!valid_object_kind(pointer, 2)) return 0;
     TurkeyObject *array = pointer;
     uint64_t value = array_get(array, index);
-    if (has_panicked || array->tag == layout ||
+    if (turkey_has_panicked || array->tag == layout ||
             (array->tag >= 6 && layout >= 6)) return value;
     if (array->tag == 7 && layout < 6)
         return turkey_unbox((void *)(uintptr_t)value, layout);
@@ -771,10 +771,10 @@ void turkey_array_set_as(void *pointer, int64_t index, uint64_t value,
         array_set(array, index, value);
     } else if (array->tag == 7 && layout < 6) {
         void *box = turkey_box(value, layout);
-        if (!has_panicked) array_set(array, index, (uint64_t)(uintptr_t)box);
+        if (!turkey_has_panicked) array_set(array, index, (uint64_t)(uintptr_t)box);
     } else if (array->tag < 6 && layout == 7) {
         uint64_t bits = turkey_unbox((void *)(uintptr_t)value, array->tag);
-        if (!has_panicked) array_set(array, index, bits);
+        if (!turkey_has_panicked) array_set(array, index, bits);
     } else {
         turkey_panic("array element has the wrong scalar layout");
     }
@@ -784,7 +784,7 @@ void *turkey_array_get_boxed(void *pointer, int64_t index) {
     if (!valid_object_kind(pointer, 2)) return NULL;
     TurkeyObject *array = pointer;
     uint64_t value = array_get(array, index);
-    if (has_panicked) return NULL;
+    if (turkey_has_panicked) return NULL;
     if (array->tag >= 6) return (void *)(uintptr_t)value;
     return turkey_box(value, array->tag);
 }
@@ -794,7 +794,7 @@ void turkey_array_set_boxed(void *pointer, int64_t index, void *value) {
     TurkeyObject *array = pointer;
     uint64_t bits = (array->tag >= 6 ? (uint64_t)(uintptr_t)value
                      : turkey_unbox(value, array->tag));
-    if (!has_panicked) array_set(array, index, bits);
+    if (!turkey_has_panicked) array_set(array, index, bits);
 }
 
 static int array_parts(void *wrapper, TurkeyObject **data, int64_t *length) {

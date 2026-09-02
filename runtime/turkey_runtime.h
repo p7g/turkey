@@ -3,6 +3,8 @@
 
 #include <stdint.h>
 
+extern int32_t turkey_has_panicked;
+
 typedef struct TurkeyString {
     int64_t length;
     unsigned char bytes[];

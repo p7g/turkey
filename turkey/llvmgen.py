@@ -211,11 +211,15 @@ class _Emitter:
             ir.Constant(_I64, root_count),
             self._c_string(entry_builder, source.name, ".turkey.function"),
         ])
+        entry_builder.call(self.runtime["turkey_frame_enter"], [
+            entry_builder.bitcast(panic_frame_storage, _PTR),
+            self._c_string(entry_builder, source.name, ".turkey.frame"),
+            ir.Constant(_PTR, None), ir.Constant(_I64, 0), ir.Constant(_I64, 0),
+        ])
         self._root_frame = root_frame
         self._root_values = root_values
         self._root_index = root_index
         self._panic_frame_storage = panic_frame_storage
-        self._active_panic_frame = None
         for offset, (bytes_global, value_global, length) in enumerate(literal_roots):
             literal = entry_builder.call(self.runtime["turkey_string_new"], [
                 entry_builder.bitcast(bytes_global, _PTR),
@@ -247,14 +251,10 @@ class _Emitter:
         for block in source.blocks:
             builder = builders[block.name]
             for instruction in block.instructions:
-                panic_frame = (self._frame_enter(builder, instruction.frame)
-                               if instruction.frame is not None else None)
-                self._active_panic_frame = panic_frame
+                if instruction.frame is not None:
+                    self._frame_update(builder, instruction.frame)
                 value, builder = self._instruction(
                     function, builder, instruction, values, slots)
-                self._active_panic_frame = None
-                if panic_frame is not None:
-                    builder.call(self.runtime["turkey_frame_leave"], [panic_frame])
                 if instruction.result is not None:
                     values[instruction.result.name] = value
                     if instruction.result.name in root_index:
@@ -266,6 +266,8 @@ class _Emitter:
             term = block.terminator
             assert term is not None
             if isinstance(term, bir.Return):
+                builder.call(self.runtime["turkey_frame_leave"], [
+                    builder.bitcast(panic_frame_storage, _PTR)])
                 builder.call(self.runtime["turkey_root_leave"], [
                     builder.bitcast(root_frame, _PTR)])
                 builder.ret(self._operand(term.value, values))
@@ -279,16 +281,15 @@ class _Emitter:
                 builder.cbranch(self._operand(term.condition, values),
                                 blocks[term.yes], blocks[term.no])
             else:
-                panic_frame = None
                 if term.frame is not None:
-                    panic_frame = self._frame_enter(builder, term.frame)
+                    self._frame_update(builder, term.frame)
                 if isinstance(term.message, str):
                     self._panic(builder, term.message)
                 else:
                     builder.call(self.runtime["turkey_panic_string"], [
                         self._operand(term.message, values)])
-                if panic_frame is not None:
-                    builder.call(self.runtime["turkey_frame_leave"], [panic_frame])
+                builder.call(self.runtime["turkey_frame_leave"], [
+                    builder.bitcast(panic_frame_storage, _PTR)])
                 builder.call(self.runtime["turkey_root_leave"], [
                     builder.bitcast(root_frame, _PTR)])
                 builder.ret(ir.Constant(function.function_type.return_type, None))
@@ -299,16 +300,18 @@ class _Emitter:
         ])
         builder.store(value, pointer)
 
-    def _frame_enter(self, builder: ir.IRBuilder, frame: bir.Frame) -> ir.Value:
+    def _frame_update(self, builder: ir.IRBuilder, frame: bir.Frame) -> None:
         file = (ir.Constant(_PTR, None) if frame.file is None else
                 self._c_string(builder, frame.file, ".turkey.file"))
-        storage = builder.bitcast(self._panic_frame_storage, _PTR)
-        builder.call(self.runtime["turkey_frame_enter"], [
-            storage,
-            self._c_string(builder, frame.function, ".turkey.frame"), file,
-            ir.Constant(_I64, frame.line), ir.Constant(_I64, frame.col),
-        ])
-        return storage
+        values = (
+            self._c_string(builder, frame.function, ".turkey.frame"),
+            file, ir.Constant(_I64, frame.line), ir.Constant(_I64, frame.col),
+        )
+        for index, value in enumerate(values, 1):
+            pointer = builder.gep(self._panic_frame_storage, [
+                ir.Constant(_I32, 0), ir.Constant(_I32, index),
+            ])
+            builder.store(value, pointer)
 
     def _operand(self, operand: bir.Operand, values: dict[str, ir.Value]) -> ir.Value:
         if isinstance(operand, bir.Value):
@@ -697,9 +700,8 @@ class _Emitter:
         panic_builder = ir.IRBuilder(bad)
         if message is not None:
             self._panic(panic_builder, message)
-        if self._active_panic_frame is not None:
-            panic_builder.call(self.runtime["turkey_frame_leave"], [
-                self._active_panic_frame])
+        panic_builder.call(self.runtime["turkey_frame_leave"], [
+            panic_builder.bitcast(self._panic_frame_storage, _PTR)])
         panic_builder.call(self.runtime["turkey_root_leave"], [
             panic_builder.bitcast(self._root_frame, _PTR)])
         panic_builder.ret(ir.Constant(function.function_type.return_type, None))

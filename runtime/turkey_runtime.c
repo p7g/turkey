@@ -201,13 +201,14 @@ static void capture_panic_trace(void) {
     int64_t count = 0;
     for (PanicCallFrame *frame = panic_calls; frame != NULL;
          frame = frame->previous)
-        count++;
+        if (frame->line != 0) count++;
     panic_trace = malloc((size_t)count * sizeof(PanicCallFrame));
     if (panic_trace == NULL) return;
     panic_trace_count = count;
     int64_t index = 0;
     for (PanicCallFrame *frame = panic_calls; frame != NULL;
          frame = frame->previous) {
+        if (frame->line == 0) continue;
         panic_trace[index] = *frame;
         panic_trace[index].previous = NULL;
         index++;

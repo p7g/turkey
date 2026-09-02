@@ -58,11 +58,22 @@ class _Emitter:
         self._runtime("turkey_int_to_string", _PTR, [_I64])
         self._runtime("turkey_float_to_string", _PTR, [_F64])
         self._runtime("turkey_char_to_string", _PTR, [_I32])
+        self._runtime("turkey_string_byte_length", _I64, [_PTR])
+        self._runtime("turkey_string_eq", _I32, [_PTR, _PTR])
+        self._runtime("turkey_string_lt", _I32, [_PTR, _PTR])
         self._runtime("turkey_print", _I8, [_PTR])
         self._runtime("turkey_write", _I8, [_PTR])
         self._runtime("turkey_cell_new", _PTR, [_I64])
         self._runtime("turkey_cell_load", _I64, [_PTR])
         self._runtime("turkey_cell_store", ir.VoidType(), [_PTR, _I64])
+        self._runtime("turkey_object_new", _PTR, [_I32, _I32, _I64, _I64])
+        self._runtime("turkey_object_tag", _I32, [_PTR])
+        self._runtime("turkey_object_get", _I64, [_PTR, _I64])
+        self._runtime("turkey_object_set", ir.VoidType(), [_PTR, _I64, _I64])
+        self._runtime("turkey_array_new", _PTR, [_I64, _I64, _I32])
+        self._runtime("turkey_array_length", _I64, [_PTR])
+        self._runtime("turkey_array_get", _I64, [_PTR, _I64])
+        self._runtime("turkey_array_set", ir.VoidType(), [_PTR, _I64, _I64])
         self._runtime("turkey_panic", ir.VoidType(), [_PTR])
         self._runtime("turkey_panicked", _I32, [])
 
@@ -169,6 +180,44 @@ class _Emitter:
             builder.call(self.runtime["turkey_cell_store"],
                          [args[0], self._to_i64(builder, args[1])])
             return None, builder
+        if op == "object_new":
+            raw = [ir.Constant(_I32, int(instruction.args[0])),
+                   ir.Constant(_I32, int(instruction.args[1])),
+                   ir.Constant(_I64, int(instruction.args[2])),
+                   ir.Constant(_I64, int(instruction.args[3]))]
+            return builder.call(self.runtime["turkey_object_new"], raw), builder
+        if op == "object_tag":
+            return builder.call(self.runtime["turkey_object_tag"], args), builder
+        if op == "object_get":
+            bits = builder.call(self.runtime["turkey_object_get"],
+                                [args[0], ir.Constant(_I64, int(instruction.args[1]))])
+            return self._from_i64(builder, bits, instruction.result.layout), builder
+        if op == "object_set":
+            builder.call(self.runtime["turkey_object_set"],
+                         [args[0], ir.Constant(_I64, int(instruction.args[1])),
+                          self._to_i64(builder, args[1])])
+            return None, builder
+        if op == "array_new":
+            return builder.call(self.runtime["turkey_array_new"],
+                                [ir.Constant(_I64, int(instruction.args[0])),
+                                 ir.Constant(_I64, 0),
+                                 ir.Constant(_I32, int(instruction.args[1]))]), builder
+        if op == "array_get":
+            bits = builder.call(self.runtime["turkey_array_get"], args)
+            return self._from_i64(builder, bits, instruction.result.layout), builder
+        if op == "array_set":
+            index = (ir.Constant(_I64, int(instruction.args[1]))
+                     if isinstance(instruction.args[1], str) else args[1])
+            value = args[1] if isinstance(instruction.args[1], str) else args[2]
+            builder.call(self.runtime["turkey_array_set"],
+                         [args[0], index, self._to_i64(builder, value)])
+            return None, builder
+        if op in ("scalar_eq", "float_eq"):
+            return (builder.fcmp_ordered("==", args[0], args[1]) if op == "float_eq"
+                    else builder.icmp_unsigned("==", args[0], args[1])), builder
+        if op == "string_eq":
+            value = builder.call(self.runtime["turkey_string_eq"], args)
+            return builder.icmp_unsigned("!=", value, ir.Constant(_I32, 0)), builder
         raise Unsupported(f"no LLVM emission rule for {op}")
 
     def _primitive(self, function: ir.Function, builder: ir.IRBuilder, name: str,
@@ -218,9 +267,31 @@ class _Emitter:
             "intToString": "turkey_int_to_string", "floatToString": "turkey_float_to_string",
             "charToString": "turkey_char_to_string", "stringConcat": "turkey_string_concat",
             "print": "turkey_print", "write": "turkey_write",
+            "stringByteLength": "turkey_string_byte_length",
         }.get(name)
         if runtime:
             return builder.call(self.runtime[runtime], args), builder
+        if name in ("stringEq", "stringLt"):
+            raw = builder.call(self.runtime[
+                "turkey_string_eq" if name == "stringEq" else "turkey_string_lt"], args)
+            return builder.icmp_unsigned("!=", raw, ir.Constant(_I32, 0)), builder
+        if name == "arrayLength":
+            return builder.call(self.runtime["turkey_array_length"], args), builder
+        if name == "arrayGet":
+            bits = builder.call(self.runtime["turkey_array_get"], args)
+            return self._from_i64(builder, bits, layout), builder
+        if name == "arraySet":
+            builder.call(self.runtime["turkey_array_set"],
+                         [args[0], args[1], self._to_i64(builder, args[2])])
+            return ir.Constant(_I8, 0), builder
+        if name in ("arrayNew", "arrayNewUninit"):
+            initial = (self._to_i64(builder, args[1]) if len(args) == 2
+                       else ir.Constant(_I64, 0))
+            # The element layout is carried by specialization in later phases;
+            # scalar/pointer tracing is conservatively selected at the call.
+            pointer = int(len(args) == 2 and isinstance(args[1].type, ir.PointerType))
+            return builder.call(self.runtime["turkey_array_new"],
+                                [args[0], initial, ir.Constant(_I32, pointer)]), builder
         if name == "error":
             # Runtime strings are length-delimited, while panic messages are C
             # strings. A dedicated runtime entry is added with full panic ABI;
@@ -270,6 +341,10 @@ _RUNTIME_SYMBOLS = (
     "turkey_float_to_string", "turkey_char_to_string", "turkey_print",
     "turkey_write", "turkey_cell_new", "turkey_cell_load", "turkey_cell_store",
     "turkey_panic", "turkey_panicked",
+    "turkey_string_byte_length", "turkey_string_eq", "turkey_string_lt",
+    "turkey_object_new", "turkey_object_tag", "turkey_object_get",
+    "turkey_object_set", "turkey_array_new", "turkey_array_length",
+    "turkey_array_get", "turkey_array_set",
 )
 _runtime_library: ctypes.CDLL | None = None
 
@@ -326,12 +401,12 @@ def _ctype(layout: bir.Layout):
 
 
 def generate(program: CProgram, decls: DeclTable, main: str = "main") -> str:
-    source = lower(program, main)
+    source = lower(program, decls, main)
     return _Emitter(source).emit()[0]
 
 
 def compile(program: CProgram, decls: DeclTable, main: str = "main") -> NativeModule:
-    source = lower(program, main)
+    source = lower(program, decls, main)
     emitter = _Emitter(source)
     text, machine = emitter.emit()
     try:

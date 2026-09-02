@@ -1,4 +1,5 @@
 import pytest
+from pathlib import Path
 
 from turkey.driver import check
 from turkey.cli import main as cli_main
@@ -51,3 +52,14 @@ def test_run_accepts_opt_in_llvm_backend(tmp_path, capfd):
     program.write_text("fun main() { print(7) }", encoding="utf-8")
     assert cli_main(["run", "--backend", "llvm", str(program)]) == 0
     assert capfd.readouterr().out == "7\n"
+
+
+@pytest.mark.parametrize("name", ["records", "fields"])
+def test_native_aggregates_and_patterns_match_conformance_output(name, capfd):
+    program = Path(__file__).parent / "programs" / f"{name}.tl"
+    checked = check(program.read_text(encoding="utf-8"), str(program),
+                    [program.parent.resolve()])
+    execute(checked.opt, checked.decls, checked.main, str(program))
+    expected = (program.with_suffix(".expected")
+                .read_text(encoding="utf-8"))
+    assert capfd.readouterr().out == expected

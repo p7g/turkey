@@ -26,6 +26,7 @@ _I64 = ir.IntType(64)
 _F64 = ir.DoubleType()
 _PTR = _I8.as_pointer()
 _ROOT_FRAME = ir.LiteralStructType([_PTR, _PTR, _I64, _PTR])
+_PANIC_FRAME = ir.LiteralStructType([_PTR, _PTR, _PTR, _I64, _I64])
 
 
 def _llvm_type(layout: bir.Layout) -> ir.Type:
@@ -134,7 +135,8 @@ class _Emitter:
         self._runtime("turkey_panic", ir.VoidType(), [_PTR])
         self._runtime("turkey_panic_string", ir.VoidType(), [_PTR])
         self._runtime("turkey_panicked", _I32, [])
-        self._runtime("turkey_frame_enter", _PTR, [_PTR, _PTR, _I64, _I64])
+        self._runtime("turkey_frame_enter", ir.VoidType(),
+                      [_PTR, _PTR, _PTR, _I64, _I64])
         self._runtime("turkey_frame_leave", ir.VoidType(), [_PTR])
         self._runtime("turkey_root_enter", ir.VoidType(), [_PTR, _PTR, _I64, _PTR])
         self._runtime("turkey_root_leave", ir.VoidType(), [_PTR])
@@ -170,6 +172,7 @@ class _Emitter:
                  for slot in source.slots}
         root_index, root_count = _root_slots(source)
         root_frame = entry_builder.alloca(_ROOT_FRAME, name="root_frame")
+        panic_frame_storage = entry_builder.alloca(_PANIC_FRAME, name="panic_frame")
         root_array_type = ir.ArrayType(_PTR, max(1, root_count))
         root_values = entry_builder.alloca(root_array_type, name="root_values")
         for index in range(root_count):
@@ -185,6 +188,8 @@ class _Emitter:
         self._root_frame = root_frame
         self._root_values = root_values
         self._root_index = root_index
+        self._panic_frame_storage = panic_frame_storage
+        self._active_panic_frame = None
         self._slot_layouts = {slot.name: slot.layout for slot in source.slots}
         for param in source.params:
             if param.name in root_index:
@@ -207,8 +212,10 @@ class _Emitter:
             for instruction in block.instructions:
                 panic_frame = (self._frame_enter(builder, instruction.frame)
                                if instruction.frame is not None else None)
+                self._active_panic_frame = panic_frame
                 value, builder = self._instruction(
                     function, builder, instruction, values, slots)
+                self._active_panic_frame = None
                 if panic_frame is not None:
                     builder.call(self.runtime["turkey_frame_leave"], [panic_frame])
                 if instruction.result is not None:
@@ -235,13 +242,16 @@ class _Emitter:
                 builder.cbranch(self._operand(term.condition, values),
                                 blocks[term.yes], blocks[term.no])
             else:
+                panic_frame = None
                 if term.frame is not None:
-                    self._frame_enter(builder, term.frame)
+                    panic_frame = self._frame_enter(builder, term.frame)
                 if isinstance(term.message, str):
                     self._panic(builder, term.message)
                 else:
                     builder.call(self.runtime["turkey_panic_string"], [
                         self._operand(term.message, values)])
+                if panic_frame is not None:
+                    builder.call(self.runtime["turkey_frame_leave"], [panic_frame])
                 builder.call(self.runtime["turkey_root_leave"], [
                     builder.bitcast(root_frame, _PTR)])
                 builder.ret(ir.Constant(function.function_type.return_type, None))
@@ -255,10 +265,13 @@ class _Emitter:
     def _frame_enter(self, builder: ir.IRBuilder, frame: bir.Frame) -> ir.Value:
         file = (ir.Constant(_PTR, None) if frame.file is None else
                 self._c_string(builder, frame.file, ".turkey.file"))
-        return builder.call(self.runtime["turkey_frame_enter"], [
+        storage = builder.bitcast(self._panic_frame_storage, _PTR)
+        builder.call(self.runtime["turkey_frame_enter"], [
+            storage,
             self._c_string(builder, frame.function, ".turkey.frame"), file,
             ir.Constant(_I64, frame.line), ir.Constant(_I64, frame.col),
         ])
+        return storage
 
     def _operand(self, operand: bir.Operand, values: dict[str, ir.Value]) -> ir.Value:
         if isinstance(operand, bir.Value):
@@ -655,6 +668,9 @@ class _Emitter:
         panic_builder = ir.IRBuilder(bad)
         if message is not None:
             self._panic(panic_builder, message)
+        if self._active_panic_frame is not None:
+            panic_builder.call(self.runtime["turkey_frame_leave"], [
+                self._active_panic_frame])
         panic_builder.call(self.runtime["turkey_root_leave"], [
             panic_builder.bitcast(self._root_frame, _PTR)])
         panic_builder.ret(ir.Constant(function.function_type.return_type, None))

@@ -27,6 +27,8 @@ typedef struct PanicCallFrame {
 } PanicCallFrame;
 
 static PanicCallFrame *panic_calls;
+static PanicCallFrame *panic_trace;
+static int64_t panic_trace_count;
 
 typedef struct HeapHeader {
     struct HeapHeader *next;
@@ -195,10 +197,28 @@ int64_t turkey_heap_objects(void) { return heap_count; }
 int64_t turkey_collection_count(void) { return collection_count; }
 void turkey_gc_set_stress(int32_t enabled) { gc_stress = enabled != 0; }
 
+static void capture_panic_trace(void) {
+    int64_t count = 0;
+    for (PanicCallFrame *frame = panic_calls; frame != NULL;
+         frame = frame->previous)
+        count++;
+    panic_trace = malloc((size_t)count * sizeof(PanicCallFrame));
+    if (panic_trace == NULL) return;
+    panic_trace_count = count;
+    int64_t index = 0;
+    for (PanicCallFrame *frame = panic_calls; frame != NULL;
+         frame = frame->previous) {
+        panic_trace[index] = *frame;
+        panic_trace[index].previous = NULL;
+        index++;
+    }
+}
+
 void turkey_panic(const char *message) {
     if (!has_panicked) {
         snprintf(panic_buffer, sizeof(panic_buffer), "%s", message);
         has_panicked = 1;
+        capture_panic_trace();
     }
 }
 
@@ -210,6 +230,7 @@ void turkey_panic_string(TurkeyString *message) {
     memcpy(panic_buffer, message->bytes, (size_t)length);
     panic_buffer[length] = '\0';
     has_panicked = 1;
+    capture_panic_trace();
 }
 
 int32_t turkey_panicked(void) { return has_panicked; }
@@ -217,24 +238,22 @@ const char *turkey_panic_message(void) { return panic_buffer; }
 void turkey_panic_clear(void) {
     has_panicked = 0;
     panic_buffer[0] = '\0';
-    while (panic_calls != NULL) {
-        PanicCallFrame *previous = panic_calls->previous;
-        free(panic_calls);
-        panic_calls = previous;
-    }
+    panic_calls = NULL;
+    free(panic_trace);
+    panic_trace = NULL;
+    panic_trace_count = 0;
 }
 
-void *turkey_frame_enter(const char *function_name, const char *file,
-                         int64_t line, int64_t col) {
-    PanicCallFrame *frame = malloc(sizeof(PanicCallFrame));
-    if (frame == NULL) { turkey_panic("out of memory"); return NULL; }
+void turkey_frame_enter(void *pointer, const char *function_name,
+                        const char *file, int64_t line, int64_t col) {
+    PanicCallFrame *frame = pointer;
+    if (frame == NULL) { turkey_panic("invalid panic frame"); return; }
     frame->previous = panic_calls;
     frame->function_name = function_name;
     frame->file = file;
     frame->line = line;
     frame->col = col;
     panic_calls = frame;
-    return frame;
 }
 
 void turkey_frame_leave(void *pointer) {
@@ -242,20 +261,14 @@ void turkey_frame_leave(void *pointer) {
     if (frame == NULL) return;
     if (panic_calls != frame) { turkey_panic("unbalanced panic frame"); return; }
     panic_calls = frame->previous;
-    free(frame);
 }
 
 int64_t turkey_frame_count(void) {
-    int64_t count = 0;
-    for (PanicCallFrame *frame = panic_calls; frame != NULL; frame = frame->previous)
-        count++;
-    return count;
+    return panic_trace_count;
 }
 
 static PanicCallFrame *panic_frame_at(int64_t index) {
-    PanicCallFrame *frame = panic_calls;
-    while (frame != NULL && index-- > 0) frame = frame->previous;
-    return frame;
+    return index < 0 || index >= panic_trace_count ? NULL : &panic_trace[index];
 }
 
 const char *turkey_frame_function(int64_t index) {

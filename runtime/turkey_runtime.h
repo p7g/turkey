@@ -80,8 +80,8 @@ void turkey_panic_string(TurkeyString *message);
 int32_t turkey_panicked(void);
 const char *turkey_panic_message(void);
 void turkey_panic_clear(void);
-void *turkey_frame_enter(const char *function_name, const char *file,
-                         int64_t line, int64_t col);
+void turkey_frame_enter(void *frame, const char *function_name,
+                        const char *file, int64_t line, int64_t col);
 void turkey_frame_leave(void *frame);
 int64_t turkey_frame_count(void);
 const char *turkey_frame_function(int64_t index);

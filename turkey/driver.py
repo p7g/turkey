@@ -167,10 +167,9 @@ def run(src: str, filename: str = "<input>", backend: str = "python") -> None:
     search = [Path(filename).resolve().parent] if filename != "<input>" else None
     checked = check(src, None if filename == "<input>" else filename, search)
     report_warnings(checked.warnings, filename)
-    # The *optimized* Core is compiled to Python and run (M17).  The old
-    # evaluator remains a differential oracle in the tests, but keeping it on
-    # this path would hide code-generator bugs and make the optimizer's payoff
-    # unmeasurable.
+    # The CLI selects LLVM by default.  This lower-level API keeps its Python
+    # default so existing embedders can capture output with Python streams;
+    # either path executes the same optimized Core.
     if backend == "llvm":
         llvmgen.execute(checked.opt, checked.decls, checked.main, filename)
     elif backend == "python":

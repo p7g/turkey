@@ -32,7 +32,7 @@ def main(argv: list[str] | None = None) -> int:
         p = sub.add_parser(name, help=help_text)
         p.add_argument("file")
         if name == "run":
-            p.add_argument("--backend", choices=("python", "llvm"), default="python")
+            p.add_argument("--backend", choices=("llvm", "python"), default="llvm")
 
     args = parser.parse_args(argv)
     try:

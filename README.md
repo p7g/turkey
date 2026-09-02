@@ -13,7 +13,9 @@ Running one does. Every disagreement found along the way is recorded in
 
 ## Using it
 
-No dependencies beyond the standard library. From the repo root:
+Install the project with Python 3.11 or newer; native execution requires a C
+compiler for the small runtime and uses `llvmlite` for code generation. From
+the repo root:
 
 ```
 python3 -m turkey run    program.tl    # type-check and execute
@@ -24,13 +26,16 @@ python3 -m turkey core   program.tl    # dump the typed Core the elaboration pro
 python3 -m turkey mono   program.tl    # dump that Core specialized -- what actually runs
 python3 -m turkey opt    program.tl    # dump the optimized Core
 python3 -m turkey python program.tl    # print generated Python without running it
+python3 -m turkey llvm   program.tl    # print verified LLVM IR
+python3 -m turkey run --backend python program.tl  # compatibility backend
 ```
 
-A program is a single file. Execution compiles the optimized typed Core to
-internal Python source, runs the top-level bindings, then calls `main` if one
-is defined. The `python` command exposes that source for inspection and
-debugging; it still relies on turkey-lite's runtime and is not a standalone-file
-interface.
+A program is a single file. Execution lowers optimized typed Core to a checked
+control-flow IR, compiles it with LLVM, initializes top-level bindings, and
+calls `main` if one is defined. `--backend python` retains the previous
+generated-Python implementation as a compatibility and differential-testing
+backend. The `llvm` and `python` commands expose their generated forms for
+inspection; neither is a standalone-file interface.
 
 ```
 type Stack a = Stack {
@@ -88,7 +93,11 @@ main : fun() -> Unit
 | `turkey/constraints.py` | The constraint language and its solver; ranks, predicates |
 | `turkey/exhaustive.py` | Maranget's usefulness algorithm, for match warnings |
 | `turkey/values.py` | Runtime values, including the hidden primitive array storage |
-| `turkey/pygen.py` | Internal Python-source backend used by `turkey run` |
+| `turkey/backend_ir.py` | Checked, layout-aware control-flow IR shared by native lowering |
+| `turkey/backend_lower.py` | Core-to-backend-IR lowering, closure conversion, and ABI bridges |
+| `turkey/llvmgen.py` | llvmlite emission, verification, JIT execution, and runtime loading |
+| `runtime/` | Native strings, arrays, closures, panic frames, and exact-root collector |
+| `turkey/pygen.py` | Retained generated-Python compatibility backend |
 | `turkey/eval.py` | Tree-walking differential-test oracle |
 | `turkey/builtins.py` | The machine primitives, and nothing else |
 | `turkey/modules.py` | The import graph, and what each module can see |
@@ -131,10 +140,9 @@ and only the innermost one gets to decide.
 python3 -m pytest tests -q
 ```
 
-The generated-Python backend has a manual, non-CI comparison against the
-tree-walking evaluator. It reports generation, Python compilation, and median
-warm execution separately, and exits unsuccessfully if either workload is
-less than three times faster:
+The generated-Python compatibility backend has a manual, non-CI comparison
+against the tree-walking evaluator. It reports generation, Python compilation,
+and median warm execution separately:
 
 ```
 python3 -m benchmarks.python_backend --rounds 3

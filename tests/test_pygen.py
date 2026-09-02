@@ -198,7 +198,7 @@ def test_generated_python_agrees_with_the_evaluator(program: Path):
     assert out.getvalue() == expected
 
 
-def test_run_uses_the_generated_backend(monkeypatch, capsys):
+def test_run_keeps_the_python_api_default_for_capture_compatibility(monkeypatch, capsys):
     called = False
 
     def fake_execute(program, decls, main, filename):
@@ -207,6 +207,19 @@ def test_run_uses_the_generated_backend(monkeypatch, capsys):
 
     monkeypatch.setattr("turkey.driver.pygen.execute", fake_execute)
     run("fun main() { print(1) }")
+    assert called
+    assert capsys.readouterr().out == ""
+
+
+def test_run_accepts_the_native_backend_explicitly(monkeypatch, capsys):
+    called = False
+
+    def fake_execute(program, decls, main, filename):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr("turkey.driver.llvmgen.execute", fake_execute)
+    run("fun main() { print(1) }", backend="llvm")
     assert called
     assert capsys.readouterr().out == ""
 

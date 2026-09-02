@@ -721,6 +721,10 @@ def _load_runtime() -> ctypes.CDLL:
         return _runtime_library
     root = Path(__file__).resolve().parent.parent
     source = root / "runtime" / "turkey_runtime.c"
+    if not source.is_file():
+        source = Path(sys.prefix) / "runtime" / "turkey_runtime.c"
+    if not source.is_file():
+        raise Unsupported("the packaged Turkey native runtime source is missing")
     output = Path(tempfile.mkdtemp(prefix="turkey-runtime-")) / (
         "libturkey.dylib" if sys.platform == "darwin" else "libturkey.so")
     command = ["cc", "-std=c11", "-O2", "-fPIC", str(source), "-o", str(output)]

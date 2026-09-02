@@ -6,7 +6,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from . import pygen
+from . import llvmgen, pygen
 from .driver import check, report_warnings, run
 from .errors import TurkeyError, TurkeyPanic
 from .core import show_program
@@ -27,9 +27,12 @@ def main(argv: list[str] | None = None) -> int:
         ("mono", "dump that Core with its polymorphism specialized away"),
         ("opt", "dump that Core with the optimizations applied"),
         ("python", "print the generated Python source without running it"),
+        ("llvm", "print verified LLVM IR without running it"),
     ]:
         p = sub.add_parser(name, help=help_text)
         p.add_argument("file")
+        if name == "run":
+            p.add_argument("--backend", choices=("python", "llvm"), default="python")
 
     args = parser.parse_args(argv)
     try:
@@ -60,13 +63,17 @@ def main(argv: list[str] | None = None) -> int:
             checked = check(src, args.file, [Path(args.file).resolve().parent])
             report_warnings(checked.warnings, args.file)
             print(pygen.generate(checked.opt, checked.decls, checked.main), end="")
+        elif args.command == "llvm":
+            checked = check(src, args.file, [Path(args.file).resolve().parent])
+            report_warnings(checked.warnings, args.file)
+            print(llvmgen.generate(checked.opt, checked.decls, checked.main), end="")
         elif args.command == "types":
             checked = check(src, args.file, [Path(args.file).resolve().parent])
             report_warnings(checked.warnings, args.file)
             for name, scheme in checked.signatures:
                 print(f"{name} : {show_scheme(scheme)}")
         else:
-            run(src, args.file)
+            run(src, args.file, args.backend)
     except TurkeyError as exc:
         print(exc.render(args.file), file=sys.stderr)
         return 1

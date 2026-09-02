@@ -23,7 +23,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import ast, coretc, desugar, joins, lower, mono, opt, pygen
+from . import ast, coretc, desugar, joins, llvmgen, lower, mono, opt, pygen
 from .builtins import initial_type_env
 from .classes import ClassTable
 from .constraints import Env, Solver
@@ -163,7 +163,7 @@ def _signatures(entry: Module, env: Env,
     return out
 
 
-def run(src: str, filename: str = "<input>") -> None:
+def run(src: str, filename: str = "<input>", backend: str = "python") -> None:
     search = [Path(filename).resolve().parent] if filename != "<input>" else None
     checked = check(src, None if filename == "<input>" else filename, search)
     report_warnings(checked.warnings, filename)
@@ -171,7 +171,12 @@ def run(src: str, filename: str = "<input>") -> None:
     # evaluator remains a differential oracle in the tests, but keeping it on
     # this path would hide code-generator bugs and make the optimizer's payoff
     # unmeasurable.
-    pygen.execute(checked.opt, checked.decls, checked.main, filename)
+    if backend == "llvm":
+        llvmgen.execute(checked.opt, checked.decls, checked.main, filename)
+    elif backend == "python":
+        pygen.execute(checked.opt, checked.decls, checked.main, filename)
+    else:
+        raise ValueError(f"unknown backend {backend!r}")
 
 
 def report_warnings(warnings: list[str], filename: str) -> None:

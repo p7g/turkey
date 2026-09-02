@@ -1,4 +1,4 @@
-module Data.Option (Option(..), isSome, unwrapOr, map, fold)
+module Data.Option (Option(..), isSome, isNone, unwrapOr, map, fold)
 
 import Prelude ()
 import Std.Classes
@@ -8,6 +8,11 @@ import Data.Option.Type (Option(..))
 fun isSome(o : Option a) -> Bool = match o {
     Some(_) -> True
     None -> False
+}
+
+fun isNone(o : Option a) -> Bool = match o {
+    None -> True
+    Some(_) -> False
 }
 
 fun unwrapOr(o : Option a, fallback : a) -> a = match o {

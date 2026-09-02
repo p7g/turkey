@@ -37,7 +37,7 @@ from .modules import ENTRY, SEP, Module, ModuleLoader
 from .resolve import Resolver
 from .core import CProgram
 from .typed import TypeTable
-from .types import Scheme
+from .types import Scheme, show_kind, show_scheme
 
 
 @dataclass
@@ -150,6 +150,40 @@ def desugared(src: str, file: str | None = None,
         Resolver(module.scope).program(module.program)
         desugar.program(module.program, module.scope.methods)
     return loader.order
+
+
+def declared(src: str, file: str | None = None,
+             search: list[Path] | None = None) -> tuple[DeclTable, list[Module]]:
+    """The program's declaration table, and nothing after it.
+
+    The stage between desugaring and inference made observable: every type
+    constructor with the kind that was inferred for it, every value constructor
+    with the scheme it was generalized to, in registration order. One table for
+    the whole program, as `check` builds it -- which is also what makes the
+    clash rule (delta 43) visible, since it takes two modules to trip.
+    """
+    modules = desugared(src, file, search)
+    decls = DeclTable()
+    for module in modules:
+        decls.register_all([d for d in module.program.decls
+                            if isinstance(d, ast.TypeDecl)])
+    return decls, modules
+
+
+def show_declarations(decls: DeclTable) -> str:
+    """The declaration table, one line per entity, in registration order."""
+    out: list[str] = []
+    for name in decls.tycons:
+        info = decls.tycons[name]
+        params = "".join(f" {p}" for p in info.params)
+        alias = " = alias" if info.is_alias else ""
+        out.append(f"type {name}{params} :: {show_kind(info.kind)}{alias}\n")
+        for con in info.variants:
+            fields = ("" if con.field_names is None
+                      else " {" + ", ".join(con.field_names) + "}")
+            out.append(f"  con {con.name}/{con.arity}{fields} : "
+                       f"{show_scheme(con.scheme)}\n")
+    return "".join(out)
 
 
 def _signatures(entry: Module, env: Env,

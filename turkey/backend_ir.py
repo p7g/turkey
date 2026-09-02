@@ -85,6 +85,10 @@ class Function:
     result: Layout
     blocks: list[Block]
     entry: str = "entry"
+    # Mutable compiler temporaries.  LLVM emission lowers these to entry-block
+    # allocas, so values remain available after a control-flow edge without
+    # weakening the IR's block-local SSA rule.
+    slots: list[Value] = field(default_factory=list)
 
 
 @dataclass
@@ -119,6 +123,9 @@ def _check_function(function: Function) -> None:
     defined = {value.name for value in function.params}
     if len(defined) != len(function.params):
         raise CheckError(f"duplicate parameter in {function.name}")
+    slot_names = {slot.name for slot in function.slots}
+    if len(slot_names) != len(function.slots):
+        raise CheckError(f"duplicate slot in {function.name}")
     for block in function.blocks:
         if block.terminator is None:
             raise CheckError(f"unterminated block {function.name}:{block.name}")
@@ -171,6 +178,8 @@ def format_module(module: Module) -> str:
     for function in module.functions:
         params = ", ".join(_value(p) for p in function.params)
         lines.append(f"fun @{function.name}({params}) -> {function.result.value} {{")
+        for slot in function.slots:
+            lines.append(f"  slot ${slot.name}:{slot.layout.value}")
         for block in function.blocks:
             suffix = "(" + ", ".join(_value(p) for p in block.params) + ")" if block.params else ""
             lines.append(f"  {block.name}{suffix}:")

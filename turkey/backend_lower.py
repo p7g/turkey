@@ -19,8 +19,8 @@ from .builtins import PRIM_NAMES
 from .errors import Unsupported
 from .prelude import BOOL_FALSE, BOOL_TRUE
 from .types import (
-    BOTTOM, BYTE, CHAR, FLOAT, INT, STRING, UNIT, TCon, TFun, TTuple, Type,
-    TVar, instantiate, prune, spine, unify,
+    BOTTOM, BYTE, CHAR, FLOAT, INT, STRING, UNIT, TApp, TCon, TFam, TFun,
+    TTuple, Type, TVar, instantiate, prune, spine, unify,
 )
 
 
@@ -44,6 +44,10 @@ def layout_of(ty: Type) -> bir.Layout:
         if ty.name == "Data.Bool.Type#Bool":
             return bir.Layout.I1
     if is_ref(ty) or isinstance(ty, TFun):
+        return bir.Layout.PTR
+    if isinstance(ty, (TVar, TFam)):
+        return bir.Layout.BOXED
+    if isinstance(ty, (TApp, TTuple)):
         return bir.Layout.PTR
     return bir.Layout.PTR
 
@@ -94,6 +98,10 @@ class _FunctionLowerer:
         self.closure_abi = captures is not None
         self.captures = captures or []
         self.output_name = output_name or mangle(bind.name)
+        function_type = prune(bind.ty)
+        assert isinstance(function_type, TFun)
+        self.result_layout = (bir.Layout.BOXED if self.closure_abi
+                              else layout_of(function_type.ret))
         self.count = 0
         self.blocks: list[bir.Block] = []
         self.slots: list[bir.Value] = []
@@ -106,10 +114,12 @@ class _FunctionLowerer:
         }
         self.params = ([bir.Value(self.fresh("environment"), bir.Layout.PTR)]
                        if self.closure_abi else [])
-        self.params += [
-            bir.Value(self.fresh(p.name), layout_of(parameter_hints.get(p.name, p.ty)))
-            for p in lam.params
-        ]
+        internal_layouts = [layout_of(parameter_hints.get(p.name, p.ty))
+                            for p in lam.params]
+        self.params += [bir.Value(
+            self.fresh(p.name),
+            bir.Layout.BOXED if self.closure_abi else layout,
+        ) for p, layout in zip(lam.params, internal_layouts)]
         self.env: dict[str, bir.Value] = {}
         if self.closure_abi:
             environment = self.params[0]
@@ -121,9 +131,11 @@ class _FunctionLowerer:
                     bir.Instruction("slot_store", (slot.name, loaded)))
                 self.env[name] = slot
         visible_params = self.params[1:] if self.closure_abi else self.params
-        for core_param, param in zip(lam.params, visible_params):
-            slot = self.new_slot(core_param.name, param.layout)
-            self.entry.instructions.append(bir.Instruction("slot_store", (slot.name, param)))
+        for core_param, param, layout in zip(lam.params, visible_params,
+                                             internal_layouts):
+            slot = self.new_slot(core_param.name, layout)
+            value = self.coerce(self.entry, param, layout)
+            self.entry.instructions.append(bir.Instruction("slot_store", (slot.name, value)))
             self.env[core_param.name] = slot
 
     def fresh(self, hint: str) -> str:
@@ -152,6 +164,25 @@ class _FunctionLowerer:
         block.instructions.append(bir.Instruction(op, args, result))
         return result
 
+    def coerce(self, block: bir.Block, value: bir.Operand,
+               target: bir.Layout) -> bir.Operand:
+        source = value.layout
+        if source is target:
+            return value
+        pointer_source = source in (bir.Layout.PTR, bir.Layout.BOXED)
+        pointer_target = target in (bir.Layout.PTR, bir.Layout.BOXED)
+        if pointer_source and pointer_target:
+            return self.emit(block, "relabel", (value,), target)
+        if target is bir.Layout.BOXED:
+            if source is bir.Layout.UNIT:
+                return bir.Constant(bir.Layout.BOXED, 0)
+            return self.emit(block, "box", (value,), bir.Layout.BOXED)
+        if source is bir.Layout.BOXED:
+            if target is bir.Layout.UNIT:
+                return bir.Constant(bir.Layout.UNIT, 0)
+            return self.emit(block, "unbox", (value,), target)
+        raise Unsupported(f"LLVM cannot convert {source.value} to {target.value}")
+
     def finish(self) -> bir.Function:
         self.lower(self.lam.body, dict(self.env), {}, self.entry, _Destination(None))
         function_type = prune(self.bind.ty)
@@ -170,7 +201,7 @@ class _FunctionLowerer:
             elif isinstance(term, bir.Branch):
                 pending.extend((term.yes, term.no))
         return bir.Function(
-            self.output_name, self.params, layout_of(function_type.ret),
+            self.output_name, self.params, self.result_layout,
             [block for block in self.blocks if block.name in reachable],
             self.entry.name, self.slots,
         )
@@ -179,7 +210,11 @@ class _FunctionLowerer:
                             runtime_binds: list[CBind]) -> bir.Function:
         final = self.new_block("initialized")
         final.terminator = bir.Return(bir.Constant(bir.Layout.UNIT, 0))
-        record_roots: dict[str, bir.Value] = {}
+        global_roots = {
+            name: self.new_slot("global_" + name, value.layout)
+            for name, value in self.globals.items()
+            if _pointer_layout(value.layout)
+        }
         actions: list[tuple] = []
         deferred: list[tuple[str, CRecord]] = []
         runtime_names = {bind.name for bind in runtime_binds}
@@ -207,22 +242,26 @@ class _FunctionLowerer:
                 _, name, record = action
                 fields = self.record_fields.get(record.con,
                                                 [field for field, _ in record.fields])
-                bitmap = sum(1 << index for index, (_, value) in enumerate(record.fields)
-                             if _pointer_layout(_expr_layout(value)))
+                by_name = dict(record.fields)
+                metadata = _layout_metadata(
+                    _expr_layout(by_name[field]) for field in fields)
                 made = self.emit(entry, "object_new", (
-                    "1", str(self.tags.get(record.con, -1)), str(len(fields)), str(bitmap),
+                    "1", str(self.tags.get(record.con, -1)), str(len(fields)),
+                    str(metadata),
                 ), bir.Layout.PTR)
                 entry.instructions.append(bir.Instruction(
                     "global_store", (self.globals[name].name, made)))
-                root = self.new_slot("global_" + name, bir.Layout.PTR)
-                record_roots[name] = root
-                entry.instructions.append(bir.Instruction("slot_store", (root.name, made)))
+                entry.instructions.append(bir.Instruction(
+                    "slot_store", (global_roots[name].name, made)))
                 entry.terminator = bir.Jump(following.name)
             elif kind == "bind":
                 _, name, value = action
                 after = self.new_block("store_global", _expr_layout(value))
                 after.instructions.append(bir.Instruction(
                     "global_store", (self.globals[name].name, after.params[0])))
+                if name in global_roots:
+                    after.instructions.append(bir.Instruction(
+                        "slot_store", (global_roots[name].name, after.params[0])))
                 after.terminator = bir.Jump(following.name)
                 self.lower(value, {}, {}, entry, _Destination(after))
             else:
@@ -261,9 +300,11 @@ class _FunctionLowerer:
     def transfer(self, block: bir.Block, dest: _Destination,
                  value: bir.Operand) -> None:
         if dest.block is None:
-            block.terminator = bir.Return(value)
+            block.terminator = bir.Return(self.coerce(block, value, self.result_layout))
         else:
-            block.terminator = bir.Jump(dest.block.name, (value,))
+            target = dest.block.params[0].layout
+            block.terminator = bir.Jump(
+                dest.block.name, (self.coerce(block, value, target),))
 
     def lower(self, expr: CExpr | None, env: dict[str, bir.Value],
               joins: dict[str, tuple[bir.Block, list[bir.Value]]],
@@ -437,12 +478,14 @@ class _FunctionLowerer:
                     return
                 if expr.name in self.globals:
                     global_ = self.globals[expr.name]
-                    done(block, self.emit(block, "global_load",
-                                          (global_.name,), global_.layout))
+                    loaded = self.emit(block, "global_load",
+                                       (global_.name,), global_.layout)
+                    done(block, self.coerce(block, loaded, _expr_layout(expr)))
                     return
                 raise Unsupported(f"LLVM backend cannot use top-level value '{expr.name}'", expr.span)
             slot = env[expr.name]
-            done(block, self.emit(block, "slot_load", (slot.name,), slot.layout))
+            loaded = self.emit(block, "slot_load", (slot.name,), slot.layout)
+            done(block, self.coerce(block, loaded, _expr_layout(expr)))
             return
         if isinstance(expr, CCon):
             if expr.name == BOOL_FALSE:
@@ -484,8 +527,9 @@ class _FunctionLowerer:
                 return
             if isinstance(expr.target, CIndex):
                 def set_index(at: bir.Block, xs: list[bir.Operand]) -> None:
+                    value = self.coerce(at, xs[0], layout_of(expr.target.ty))
                     at.instructions.append(bir.Instruction(
-                        "array_set", (xs[1], xs[2], xs[0])))
+                        "array_set", (xs[1], xs[2], value)))
                     done(at, bir.Constant(bir.Layout.UNIT, 0))
                 self.lower_values([expr.value, expr.target.target, expr.target.index],
                                   env, joins, block, set_index)
@@ -506,11 +550,11 @@ class _FunctionLowerer:
                     _, type_args = spine(expr.ty)
                     element_layout = (layout_of(type_args[0]) if type_args else
                                       values[0].layout if values else bir.Layout.BOXED)
-                    pointer_bits = 1 if _pointer_layout(element_layout) else 0
                     made = self.emit(at, "array_new",
                                      (str(len(values)), str(_layout_width(element_layout)),
-                                      str(pointer_bits)), bir.Layout.PTR)
+                                      element_layout.value), bir.Layout.PTR)
                     for index, value in enumerate(values):
+                        value = self.coerce(at, value, element_layout)
                         at.instructions.append(bir.Instruction(
                             "array_set", (made, str(index), value)))
                 else:
@@ -521,10 +565,10 @@ class _FunctionLowerer:
                         tag, kind = self.tags.get(expr.con, -1), 1
                     else:
                         tag, kind = -1, 0
-                    bitmap = sum(1 << i for i, value in enumerate(values)
-                                 if _pointer_layout(value.layout))
+                    metadata = _layout_metadata(value.layout for value in values)
                     made = self.emit(at, "object_new",
-                                     (str(kind), str(tag), str(len(values)), str(bitmap)),
+                                     (str(kind), str(tag), str(len(values)),
+                                      str(metadata)),
                                      bir.Layout.PTR)
                     for index, value in enumerate(values):
                         at.instructions.append(bir.Instruction(
@@ -559,40 +603,84 @@ class _FunctionLowerer:
                         at.terminator = bir.Panic("error")
                     self.lower_values(expr.args, env, joins, block, panic)
                     return
+                if primitive == "Prim.stringToBytes":
+                    def to_bytes(at: bir.Block, values: list[bir.Operand]) -> None:
+                        string = values[0]
+                        raw = self.emit(at, "prim.stringToByteStorage", (string,),
+                                        bir.Layout.PTR)
+                        length = self.emit(at, "prim.stringByteLength", (string,),
+                                           bir.Layout.I64)
+                        storage_fields = self.record_fields["Data.Array#ArrayStorage"]
+                        storage_values = {"storage": raw, "length": length}
+                        ordered = [storage_values[name] for name in storage_fields]
+                        storage = self.emit(at, "object_new", (
+                            "1", str(self.tags["Data.Array#ArrayStorage"]),
+                            str(len(ordered)), str(_layout_metadata(
+                                item.layout for item in ordered)),
+                        ), bir.Layout.PTR)
+                        for index, item in enumerate(ordered):
+                            at.instructions.append(bir.Instruction(
+                                "object_set", (storage, str(index), item)))
+                        outer = self.emit(at, "object_new", (
+                            "1", str(self.tags["Data.Array#Array"]), "1",
+                            str(_layout_metadata([bir.Layout.PTR])),
+                        ), bir.Layout.PTR)
+                        at.instructions.append(bir.Instruction(
+                            "object_set", (outer, "0", storage)))
+                        done(at, outer)
+                    self.lower_values(expr.args, env, joins, block, to_bytes)
+                    return
                 operation = "prim." + primitive.removeprefix("Prim.")
                 if primitive in ("Prim.arrayNew", "Prim.arrayNewUninit"):
                     _, type_args = spine(expr.ty)
                     element_layout = layout_of(type_args[0]) if type_args else bir.Layout.BOXED
                     operation += "." + element_layout.value
+                elif primitive == "Prim.arrayGet":
+                    operation += "." + layout_of(expr.ty).value
+                elif primitive == "Prim.arraySet":
+                    operation += "." + _expr_layout(expr.args[2]).value
                 self.lower_values(expr.args, env, joins, block,
                                   lambda at, xs: done(at, self.emit(
                                       at, operation,
                                       tuple(xs), layout_of(expr.ty))))
                 return
             if isinstance(fn, CVar) and fn.name in self.functions:
-                symbol, _ = self.functions[fn.name]
-                self.lower_values(expr.args, env, joins, block,
-                                  lambda at, xs: done(at, self.emit(
-                                      at, "call", (symbol, *xs), layout_of(expr.ty))))
+                symbol, function_type = self.functions[fn.name]
+                def direct_call(at: bir.Block, values: list[bir.Operand]) -> None:
+                    arguments = [self.coerce(at, value, layout_of(expected))
+                                 for value, expected in zip(values,
+                                                            function_type.params)]
+                    called = self.emit(at, "call", (symbol, *arguments),
+                                       layout_of(function_type.ret))
+                    done(at, self.coerce(at, called, layout_of(expr.ty)))
+                self.lower_values(expr.args, env, joins, block, direct_call)
                 return
             if isinstance(fn, CCon):
                 info = self.decls.constructors[fn.name]
                 def construct(at: bir.Block, values: list[bir.Operand]) -> None:
-                    bitmap = sum(1 << i for i, value in enumerate(values)
-                                 if _pointer_layout(value.layout))
+                    con_type = instantiate(info.scheme, lambda: TVar(1))
+                    assert isinstance(con_type, TFun)
+                    unify(con_type.ret, expr.ty)
+                    values = [self.coerce(at, value, layout_of(expected))
+                              for value, expected in zip(values, con_type.params)]
+                    metadata = _layout_metadata(value.layout for value in values)
                     made = self.emit(at, "object_new",
                                      ("1", str(self.tags[fn.name]), str(info.arity),
-                                      str(bitmap)), bir.Layout.PTR)
+                                      str(metadata)), bir.Layout.PTR)
                     for index, value in enumerate(values):
                         at.instructions.append(bir.Instruction(
                             "object_set", (made, str(index), value)))
                     done(at, made)
                 self.lower_values(expr.args, env, joins, block, construct)
                 return
+            def closure_call(at: bir.Block, values: list[bir.Operand]) -> None:
+                arguments = [values[0], *(self.coerce(at, value, bir.Layout.BOXED)
+                                           for value in values[1:])]
+                called = self.emit(at, "closure_call", tuple(arguments),
+                                   bir.Layout.BOXED)
+                done(at, self.coerce(at, called, layout_of(expr.ty)))
             self.lower_values([expr.fn, *expr.args], env, joins, block,
-                              lambda at, xs: done(at, self.emit(
-                                  at, "closure_call", tuple(xs),
-                                  layout_of(expr.ty))))
+                              closure_call)
             return
         if isinstance(expr, CPrim):
             raise Unsupported("LLVM primitive values must be called directly", expr.span)
@@ -658,14 +746,19 @@ class _FunctionLowerer:
             block.terminator = bir.Jump(success.name)
             return
         if isinstance(pat, ast.PVar):
-            slot = self.new_slot(pat.name, layout_of(hints.get(pat.name, ty)))
+            layout = layout_of(hints.get(pat.name, ty))
+            stored = self.coerce(block, value, layout)
+            slot = self.new_slot(pat.name, layout)
             env[pat.name] = slot
-            block.instructions.append(bir.Instruction("slot_store", (slot.name, value)))
+            block.instructions.append(bir.Instruction("slot_store", (slot.name, stored)))
             block.terminator = bir.Jump(success.name)
             return
         if isinstance(pat, ast.PLit):
             literal = (self.emit(block, "string_const", (str(pat.value),), bir.Layout.PTR)
-                       if pat.kind == "String" else bir.Constant(value.layout, pat.value))
+                       if pat.kind == "String" else bir.Constant(
+                           value.layout,
+                           ord(pat.value) if pat.kind == "Char" else pat.value,
+                       ))
             op = "string_eq" if pat.kind == "String" else (
                 "float_eq" if value.layout is bir.Layout.F64 else "scalar_eq")
             condition = self.emit(block, op, (value, literal), bir.Layout.I1)
@@ -735,6 +828,16 @@ def _erase_types(expr: CExpr | None) -> CExpr | None:
 
 def _pointer_layout(layout: bir.Layout) -> bool:
     return layout in (bir.Layout.PTR, bir.Layout.BOXED)
+
+
+def _layout_metadata(layouts) -> int:
+    codes = {
+        bir.Layout.UNIT: 0, bir.Layout.I1: 1, bir.Layout.I8: 2,
+        bir.Layout.I32: 3, bir.Layout.I64: 4, bir.Layout.F64: 5,
+        bir.Layout.PTR: 6, bir.Layout.BOXED: 7,
+    }
+    return sum(codes[layout] << (3 * index)
+               for index, layout in enumerate(layouts))
 
 
 def _layout_width(layout: bir.Layout) -> int:
@@ -834,6 +937,8 @@ def _pattern_layout(pattern, fallback: Type,
         pattern = pattern.pat
     if isinstance(pattern, ast.PVar) and pattern.name in hints:
         return layout_of(hints[pattern.name])
+    if isinstance(pattern, ast.PCon) and pattern.name in (BOOL_FALSE, BOOL_TRUE):
+        return bir.Layout.I1
     # Nested constructors and tuples are heap values regardless of the type
     # family carried by their contents.
     if isinstance(pattern, (ast.PCon, ast.PRecord, ast.PTuple)):

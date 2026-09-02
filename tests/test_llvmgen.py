@@ -6,6 +6,12 @@ from turkey.cli import main as cli_main
 from turkey.errors import TurkeyPanic
 from turkey.llvmgen import compile, execute, generate
 
+PROGRAMS_DIR = Path(__file__).parent / "programs"
+NATIVE_PROGRAMS = sorted(
+    path.stem for path in PROGRAMS_DIR.glob("*.tl")
+    if not path.stem.startswith("err_") and path.with_suffix(".expected").exists()
+)
+
 
 def native(src: str) -> None:
     checked = check(src)
@@ -60,6 +66,38 @@ def test_native_invalid_shift_panics():
 def test_native_float_division_is_ieee(capfd):
     native("fun main() { print(1.0 / 0.0); print(0.0 / 0.0); print(-0.0) }")
     assert capfd.readouterr().out == "Infinity\nNaN\n-0.0\n"
+
+
+def test_native_utf8_views_and_checked_byte_conversion(capfd):
+    native("""
+fun main() {
+    for b in String.bytes("hé") { print(b) }
+    for c in String.codePoints("hé") { print(c) }
+    print(String.toBytes("hé"))
+    print(String.fromBytes(String.toBytes("hé")))
+    let invalid = Array.filled(
+        1, Option.unwrapOr(Byte.fromInt(195), Byte.minValue()))
+    print(String.fromBytes(invalid))
+}
+""")
+    assert capfd.readouterr().out == \
+        "104\n195\n169\nh\né\n[104, 195, 169]\nSome(hé)\nNone\n"
+
+
+def test_native_string_search_slices_and_builder(capfd):
+    native("""
+fun main() {
+    print(String.split("a,b,c", ","))
+    print(String.replace("a-b-c", "-", "+"))
+    print(String.startsWith("é", "a"))
+    print(String.endsWith("hé", "é"))
+    let b = String.builder()
+    String.push(b, "a"); String.push(b, "é"); String.push(b, "c")
+    print(String.build(b))
+}
+""")
+    assert capfd.readouterr().out == \
+        "[a, b, c]\na+b+c\nFalse\nTrue\naéc\n"
 
 
 def test_native_closures_snapshot_values_and_share_cells(capfd):
@@ -130,7 +168,7 @@ fun main() {
 """)
     text = generate(checked.opt, checked.decls, checked.main)
     calls = [line for line in text.splitlines() if "call i8* @turkey_array_new" in line]
-    assert any("i32 1, i32 0" in line for line in calls)
+    assert any("i32 1, i32 2" in line for line in calls)
     execute(checked.opt, checked.decls, checked.main)
     assert capfd.readouterr().out == "[255, 44]\n"
 
@@ -149,15 +187,22 @@ def test_run_accepts_opt_in_llvm_backend(tmp_path, capfd):
     assert capfd.readouterr().out == "7\n"
 
 
-@pytest.mark.parametrize("name", [
-    "records", "fields", "tuple_binding", "iter", "dicts",
-    "question_control", "operators",
-])
-def test_native_supported_programs_match_conformance_output(name, capfd):
-    program = Path(__file__).parent / "programs" / f"{name}.tl"
+@pytest.mark.parametrize("name", NATIVE_PROGRAMS)
+def test_native_programs_match_conformance_output(name, monkeypatch, capfd):
+    program = PROGRAMS_DIR / f"{name}.tl"
+    monkeypatch.chdir(PROGRAMS_DIR)
+    assert cli_main(["run", "--backend", "llvm", program.name]) == 0
+    expected = (program.with_suffix(".expected")
+                .read_text(encoding="utf-8"))
+    captured = capfd.readouterr()
+    assert captured.out + captured.err == expected
+
+
+def test_generic_layout_bridges_survive_gc_stress(monkeypatch, capfd):
+    monkeypatch.setenv("TURKEY_GC_STRESS", "1")
+    program = PROGRAMS_DIR / "question_control.tl"
     checked = check(program.read_text(encoding="utf-8"), str(program),
                     [program.parent.resolve()])
     execute(checked.opt, checked.decls, checked.main, str(program))
-    expected = (program.with_suffix(".expected")
-                .read_text(encoding="utf-8"))
-    assert capfd.readouterr().out == expected
+    captured = capfd.readouterr()
+    assert captured.out + captured.err == program.with_suffix(".expected").read_text()

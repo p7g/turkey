@@ -35,6 +35,14 @@ def _llvm_type(layout: bir.Layout) -> ir.Type:
     }[layout]
 
 
+def _layout_code(layout: bir.Layout) -> int:
+    return {
+        bir.Layout.UNIT: 0, bir.Layout.I1: 1, bir.Layout.I8: 2,
+        bir.Layout.I32: 3, bir.Layout.I64: 4, bir.Layout.F64: 5,
+        bir.Layout.PTR: 6, bir.Layout.BOXED: 7,
+    }[layout]
+
+
 class _Emitter:
     def __init__(self, source: bir.Module) -> None:
         binding.initialize_native_target()
@@ -46,6 +54,8 @@ class _Emitter:
         self.module.triple = binding.get_default_triple()
         self.module.data_layout = str(self.machine.target_data)
         self.functions: dict[str, ir.Function] = {}
+        self.source_functions = {function.name: function
+                                 for function in source.functions}
         self.globals: dict[str, ir.GlobalVariable] = {}
         self.runtime: dict[str, ir.Function] = {}
         self.closure_thunks: dict[str, ir.Function] = {}
@@ -62,6 +72,16 @@ class _Emitter:
         self._runtime("turkey_float_to_string", _PTR, [_F64])
         self._runtime("turkey_char_to_string", _PTR, [_I32])
         self._runtime("turkey_string_byte_length", _I64, [_PTR])
+        self._runtime("turkey_string_byte_at", _I8, [_PTR, _I64])
+        self._runtime("turkey_string_decode_at", _I32, [_PTR, _I64])
+        self._runtime("turkey_string_next_index", _I64, [_PTR, _I64])
+        self._runtime("turkey_string_slice", _PTR, [_PTR, _I64, _I64])
+        self._runtime("turkey_string_find", _I64, [_PTR, _PTR, _I64])
+        self._runtime("turkey_string_rfind", _I64, [_PTR, _PTR])
+        self._runtime("turkey_string_to_byte_storage", _PTR, [_PTR])
+        self._runtime("turkey_string_from_bytes", _PTR, [_PTR])
+        self._runtime("turkey_string_is_valid_utf8", _I32, [_PTR])
+        self._runtime("turkey_string_concat_all", _PTR, [_PTR])
         self._runtime("turkey_string_eq", _I32, [_PTR, _PTR])
         self._runtime("turkey_string_lt", _I32, [_PTR, _PTR])
         self._runtime("turkey_print", _I8, [_PTR])
@@ -73,17 +93,25 @@ class _Emitter:
         self._runtime("turkey_object_tag", _I32, [_PTR])
         self._runtime("turkey_object_get", _I64, [_PTR, _I64])
         self._runtime("turkey_object_set", ir.VoidType(), [_PTR, _I64, _I64])
+        self._runtime("turkey_object_get_as", _I64, [_PTR, _I64, _I32])
+        self._runtime("turkey_object_set_as", ir.VoidType(), [_PTR, _I64, _I64, _I32])
+        self._runtime("turkey_box", _PTR, [_I64, _I32])
+        self._runtime("turkey_unbox", _I64, [_PTR, _I32])
         self._runtime("turkey_array_new", _PTR, [_I64, _I64, _I32, _I32])
         self._runtime("turkey_array_length", _I64, [_PTR])
         self._runtime("turkey_array_get", _I64, [_PTR, _I64])
         self._runtime("turkey_array_set", ir.VoidType(), [_PTR, _I64, _I64])
+        self._runtime("turkey_array_get_as", _I64, [_PTR, _I64, _I32])
+        self._runtime("turkey_array_set_as", ir.VoidType(), [_PTR, _I64, _I64, _I32])
+        self._runtime("turkey_array_get_boxed", _PTR, [_PTR, _I64])
+        self._runtime("turkey_array_set_boxed", ir.VoidType(), [_PTR, _I64, _PTR])
         self._runtime("turkey_closure_new", _PTR, [_I64, _I64, _I64])
         self._runtime("turkey_closure_code", _I64, [_PTR])
         self._runtime("turkey_closure_environment", _PTR, [_PTR])
         self._runtime("turkey_closure_capture", ir.VoidType(), [_PTR, _I64, _I64])
         self._runtime("turkey_panic", ir.VoidType(), [_PTR])
         self._runtime("turkey_panicked", _I32, [])
-        self._runtime("turkey_root_push", _PTR, [_I64])
+        self._runtime("turkey_root_push", _PTR, [_I64, _PTR])
         self._runtime("turkey_root_set", ir.VoidType(), [_PTR, _I64, _PTR])
         self._runtime("turkey_root_pop", ir.VoidType(), [_PTR])
 
@@ -127,7 +155,9 @@ class _Emitter:
         root_index = {value.name: index for index, value in enumerate(root_values)}
         root_frame = entry_builder.call(
             self.runtime["turkey_root_push"],
-            [ir.Constant(_I64, len(root_values))], name="roots")
+            [ir.Constant(_I64, len(root_values)),
+             self._c_string(entry_builder, source.name, ".turkey.function")],
+            name="roots")
         self._root_frame = root_frame
         self._root_index = root_index
         self._slot_layouts = {slot.name: slot.layout for slot in source.slots}
@@ -190,17 +220,35 @@ class _Emitter:
         ty = _llvm_type(operand.layout)
         if operand.layout is bir.Layout.F64:
             return ir.Constant(ty, float(operand.value))
+        if isinstance(ty, ir.PointerType) and int(operand.value) == 0:
+            return ir.Constant(ty, None)
         return ir.Constant(ty, int(operand.value))
 
     def _instruction(self, function: ir.Function, builder: ir.IRBuilder,
                      instruction: bir.Instruction, values: dict[str, ir.Value],
                      slots: dict[str, ir.AllocaInstr]) -> tuple[ir.Value | None, ir.IRBuilder]:
         op = instruction.op
+        args = [self._operand(arg, values) for arg in instruction.args
+                if isinstance(arg, (bir.Value, bir.Constant))]
         if op == "slot_store":
             builder.store(self._operand(instruction.args[1], values), slots[instruction.args[0]])
             return None, builder
         if op == "slot_load":
             return builder.load(slots[instruction.args[0]], name=instruction.result.name), builder
+        if op == "relabel":
+            return args[0], builder
+        if op == "box":
+            value = builder.call(self.runtime["turkey_box"], [
+                self._to_i64(builder, args[0]),
+                ir.Constant(_I32, _layout_code(instruction.args[0].layout)),
+            ])
+            return value, self._propagate(function, builder)
+        if op == "unbox":
+            bits = builder.call(self.runtime["turkey_unbox"], [
+                args[0], ir.Constant(_I32, _layout_code(instruction.result.layout)),
+            ])
+            value = self._from_i64(builder, bits, instruction.result.layout)
+            return value, self._propagate(function, builder)
         if op == "global_store":
             builder.store(self._operand(instruction.args[1], values),
                           self.globals[instruction.args[0]])
@@ -220,8 +268,6 @@ class _Emitter:
             pointer = builder.bitcast(glob, _PTR)
             return builder.call(self.runtime["turkey_string_new"],
                                 [pointer, ir.Constant(_I64, len(data))]), builder
-        args = [self._operand(arg, values) for arg in instruction.args
-                if isinstance(arg, (bir.Value, bir.Constant))]
         if op == "call":
             value = builder.call(self.functions[instruction.args[0]], args,
                                  name=instruction.result.name)
@@ -250,30 +296,42 @@ class _Emitter:
         if op == "object_tag":
             return builder.call(self.runtime["turkey_object_tag"], args), builder
         if op == "object_get":
-            bits = builder.call(self.runtime["turkey_object_get"],
-                                [args[0], ir.Constant(_I64, int(instruction.args[1]))])
-            return self._from_i64(builder, bits, instruction.result.layout), builder
+            bits = builder.call(self.runtime["turkey_object_get_as"], [
+                args[0], ir.Constant(_I64, int(instruction.args[1])),
+                ir.Constant(_I32, _layout_code(instruction.result.layout)),
+            ])
+            value = self._from_i64(builder, bits, instruction.result.layout)
+            return value, self._propagate(function, builder)
         if op == "object_set":
-            builder.call(self.runtime["turkey_object_set"],
-                         [args[0], ir.Constant(_I64, int(instruction.args[1])),
-                          self._to_i64(builder, args[1])])
-            return None, builder
+            layout = instruction.args[-1].layout
+            builder.call(self.runtime["turkey_object_set_as"], [
+                args[0], ir.Constant(_I64, int(instruction.args[1])),
+                self._to_i64(builder, args[1]),
+                ir.Constant(_I32, _layout_code(layout)),
+            ])
+            return None, self._propagate(function, builder)
         if op == "array_new":
             return builder.call(self.runtime["turkey_array_new"],
                                 [ir.Constant(_I64, int(instruction.args[0])),
                                  ir.Constant(_I64, 0),
                                  ir.Constant(_I32, int(instruction.args[1])),
-                                 ir.Constant(_I32, int(instruction.args[2]))]), builder
+                                 ir.Constant(_I32, _layout_code(
+                                     bir.Layout(instruction.args[2])))]), builder
         if op == "array_get":
-            bits = builder.call(self.runtime["turkey_array_get"], args)
-            return self._from_i64(builder, bits, instruction.result.layout), builder
+            bits = builder.call(self.runtime["turkey_array_get_as"], [
+                *args, ir.Constant(_I32, _layout_code(instruction.result.layout))])
+            value = self._from_i64(builder, bits, instruction.result.layout)
+            return value, self._propagate(function, builder)
         if op == "array_set":
             index = (ir.Constant(_I64, int(instruction.args[1]))
                      if isinstance(instruction.args[1], str) else args[1])
             value = args[1] if isinstance(instruction.args[1], str) else args[2]
-            builder.call(self.runtime["turkey_array_set"],
-                         [args[0], index, self._to_i64(builder, value)])
-            return None, builder
+            layout = instruction.args[-1].layout
+            builder.call(self.runtime["turkey_array_set_as"], [
+                args[0], index, self._to_i64(builder, value),
+                ir.Constant(_I32, _layout_code(layout)),
+            ])
+            return None, self._propagate(function, builder)
         if op == "closure_new":
             code = builder.ptrtoint(self.functions[instruction.args[0]], _I64)
             return builder.call(self.runtime["turkey_closure_new"], [
@@ -319,15 +377,35 @@ class _Emitter:
         if found is not None:
             return found
         target = self.functions[symbol]
+        source = self.source_functions[symbol]
         original = target.function_type
         thunk = ir.Function(
             self.module,
-            ir.FunctionType(original.return_type, [_PTR, *original.args]),
+            ir.FunctionType(_PTR, [_PTR, *(_PTR for _ in original.args)]),
             name=symbol + "_closure",
         )
         builder = ir.IRBuilder(thunk.append_basic_block("entry"))
-        result = builder.call(target, list(thunk.args[1:]))
-        builder.ret(result)
+        arguments = []
+        for boxed, expected, parameter in zip(thunk.args[1:], original.args,
+                                              source.params):
+            if parameter.layout in (bir.Layout.PTR, bir.Layout.BOXED):
+                arguments.append(boxed)
+            else:
+                bits = builder.call(self.runtime["turkey_unbox"], [
+                    boxed, ir.Constant(_I32, _layout_code(parameter.layout)),
+                ])
+                arguments.append(self._from_i64_type(builder, bits, expected))
+        result = builder.call(target, arguments)
+        if source.result in (bir.Layout.PTR, bir.Layout.BOXED):
+            boxed_result = result
+        elif source.result is bir.Layout.UNIT:
+            boxed_result = ir.Constant(_PTR, None)
+        else:
+            boxed_result = builder.call(self.runtime["turkey_box"], [
+                self._to_i64(builder, result),
+                ir.Constant(_I32, _layout_code(source.result)),
+            ])
+        builder.ret(boxed_result)
         self.closure_thunks[symbol] = thunk
         return thunk
 
@@ -456,9 +534,23 @@ class _Emitter:
             "charToString": "turkey_char_to_string", "stringConcat": "turkey_string_concat",
             "print": "turkey_print", "write": "turkey_write",
             "stringByteLength": "turkey_string_byte_length",
+            "stringByteAt": "turkey_string_byte_at",
+            "stringDecodeAt": "turkey_string_decode_at",
+            "stringNextIndex": "turkey_string_next_index",
+            "stringSlice": "turkey_string_slice",
+            "stringFind": "turkey_string_find",
+            "stringRfind": "turkey_string_rfind",
+            "stringToByteStorage": "turkey_string_to_byte_storage",
+            "stringFromBytes": "turkey_string_from_bytes",
+            "stringConcatAll": "turkey_string_concat_all",
         }.get(name)
         if runtime:
-            return builder.call(self.runtime[runtime], args), builder
+            value = builder.call(self.runtime[runtime], args)
+            return value, self._propagate(function, builder)
+        if name == "stringIsValidUtf8":
+            raw = builder.call(self.runtime["turkey_string_is_valid_utf8"], args)
+            value = builder.icmp_unsigned("!=", raw, ir.Constant(_I32, 0))
+            return value, self._propagate(function, builder)
         if name in ("stringEq", "stringLt"):
             raw = builder.call(self.runtime[
                 "turkey_string_eq" if name == "stringEq" else "turkey_string_lt"], args)
@@ -466,24 +558,30 @@ class _Emitter:
         if name == "arrayLength":
             return builder.call(self.runtime["turkey_array_length"], args), builder
         if name == "arrayGet":
-            bits = builder.call(self.runtime["turkey_array_get"], args)
-            return self._from_i64(builder, bits, layout), builder
+            requested = array_layout or layout
+            bits = builder.call(self.runtime["turkey_array_get_as"], [
+                *args, ir.Constant(_I32, _layout_code(requested))])
+            value = self._from_i64(builder, bits, layout)
+            return value, self._propagate(function, builder)
         if name == "arraySet":
-            builder.call(self.runtime["turkey_array_set"],
-                         [args[0], args[1], self._to_i64(builder, args[2])])
-            return ir.Constant(_I8, 0), builder
+            requested = array_layout or bir.Layout.BOXED
+            builder.call(self.runtime["turkey_array_set_as"], [
+                args[0], args[1], self._to_i64(builder, args[2]),
+                ir.Constant(_I32, _layout_code(requested)),
+            ])
+            return ir.Constant(_I8, 0), self._propagate(function, builder)
         if name in ("arrayNew", "arrayNewUninit"):
             initial = (self._to_i64(builder, args[1]) if len(args) == 2
                        else ir.Constant(_I64, 0))
             # The element layout is carried by specialization in later phases;
             # scalar/pointer tracing is conservatively selected at the call.
-            pointer = int(array_layout in (bir.Layout.PTR, bir.Layout.BOXED)
-                          if array_layout is not None
-                          else len(args) == 2 and isinstance(args[1].type, ir.PointerType))
+            element_layout = (array_layout if array_layout is not None else
+                              bir.Layout.PTR if len(args) == 2 and
+                              isinstance(args[1].type, ir.PointerType) else bir.Layout.I64)
             width = 1 if array_layout is bir.Layout.I8 else 4 if array_layout is bir.Layout.I32 else 8
             return builder.call(self.runtime["turkey_array_new"],
                                 [args[0], initial, ir.Constant(_I32, width),
-                                 ir.Constant(_I32, pointer)]), builder
+                                 ir.Constant(_I32, _layout_code(element_layout))]), builder
         if name == "error":
             # Runtime strings are length-delimited, while panic messages are C
             # strings. A dedicated runtime entry is added with full panic ABI;
@@ -513,15 +611,20 @@ class _Emitter:
         )
 
     def _panic(self, builder: ir.IRBuilder, message: str) -> None:
-        data = message.encode("utf-8") + b"\0"
+        builder.call(self.runtime["turkey_panic"], [
+            self._c_string(builder, message, ".turkey.panic")])
+
+    def _c_string(self, builder: ir.IRBuilder, value: str,
+                  prefix: str) -> ir.Value:
+        data = value.encode("utf-8") + b"\0"
         array = ir.Constant(ir.ArrayType(_I8, len(data)), bytearray(data))
         glob = ir.GlobalVariable(self.module, array.type,
-                                 name=f".turkey.panic.{self.string_count}")
+                                 name=f"{prefix}.{self.string_count}")
         self.string_count += 1
         glob.global_constant = True
         glob.linkage = "private"
         glob.initializer = array
-        builder.call(self.runtime["turkey_panic"], [builder.bitcast(glob, _PTR)])
+        return builder.bitcast(glob, _PTR)
 
     def _to_i64(self, builder: ir.IRBuilder, value: ir.Value) -> ir.Value:
         if value.type == _F64: return builder.bitcast(value, _I64)
@@ -532,6 +635,10 @@ class _Emitter:
     def _from_i64(self, builder: ir.IRBuilder, value: ir.Value,
                   layout: bir.Layout) -> ir.Value:
         target = _llvm_type(layout)
+        return self._from_i64_type(builder, value, target)
+
+    def _from_i64_type(self, builder: ir.IRBuilder, value: ir.Value,
+                       target: ir.Type) -> ir.Value:
         if target == _F64: return builder.bitcast(value, _F64)
         if isinstance(target, ir.PointerType): return builder.inttoptr(value, target)
         if target.width < 64: return builder.trunc(value, target)
@@ -543,10 +650,18 @@ _RUNTIME_SYMBOLS = (
     "turkey_float_to_string", "turkey_char_to_string", "turkey_print",
     "turkey_write", "turkey_cell_new", "turkey_cell_load", "turkey_cell_store",
     "turkey_panic", "turkey_panicked",
-    "turkey_string_byte_length", "turkey_string_eq", "turkey_string_lt",
+    "turkey_string_byte_length", "turkey_string_byte_at",
+    "turkey_string_decode_at", "turkey_string_next_index",
+    "turkey_string_slice", "turkey_string_find", "turkey_string_rfind",
+    "turkey_string_to_byte_storage", "turkey_string_from_bytes",
+    "turkey_string_is_valid_utf8", "turkey_string_concat_all",
+    "turkey_string_eq", "turkey_string_lt",
     "turkey_object_new", "turkey_object_tag", "turkey_object_get",
-    "turkey_object_set", "turkey_array_new", "turkey_array_length",
-    "turkey_array_get", "turkey_array_set",
+    "turkey_object_set", "turkey_object_get_as", "turkey_object_set_as",
+    "turkey_box", "turkey_unbox",
+    "turkey_array_new", "turkey_array_length", "turkey_array_get",
+    "turkey_array_set", "turkey_array_get_as", "turkey_array_set_as",
+    "turkey_array_get_boxed", "turkey_array_set_boxed",
     "turkey_closure_new", "turkey_closure_code",
     "turkey_closure_environment", "turkey_closure_capture",
     "turkey_root_push", "turkey_root_set", "turkey_root_pop",

@@ -16,7 +16,7 @@ from . import backend_ir as bir
 from .backend_lower import lower
 from .core import CProgram
 from .decls import DeclTable
-from .errors import TurkeyPanic, Unsupported
+from .errors import Span, TurkeyPanic, Unsupported
 
 
 _I1 = ir.IntType(1)
@@ -118,7 +118,10 @@ class _Emitter:
         self._runtime("turkey_closure_environment", _PTR, [_PTR])
         self._runtime("turkey_closure_capture", ir.VoidType(), [_PTR, _I64, _I64])
         self._runtime("turkey_panic", ir.VoidType(), [_PTR])
+        self._runtime("turkey_panic_string", ir.VoidType(), [_PTR])
         self._runtime("turkey_panicked", _I32, [])
+        self._runtime("turkey_frame_enter", _PTR, [_PTR, _PTR, _I64, _I64])
+        self._runtime("turkey_frame_leave", ir.VoidType(), [_PTR])
         self._runtime("turkey_root_push", _PTR, [_I64, _PTR])
         self._runtime("turkey_root_set", ir.VoidType(), [_PTR, _I64, _PTR])
         self._runtime("turkey_root_pop", ir.VoidType(), [_PTR])
@@ -188,8 +191,12 @@ class _Emitter:
         for block in source.blocks:
             builder = builders[block.name]
             for instruction in block.instructions:
+                panic_frame = (self._frame_enter(builder, instruction.frame)
+                               if instruction.frame is not None else None)
                 value, builder = self._instruction(
                     function, builder, instruction, values, slots)
+                if panic_frame is not None:
+                    builder.call(self.runtime["turkey_frame_leave"], [panic_frame])
                 if instruction.result is not None:
                     values[instruction.result.name] = value
                     if instruction.result.name in root_index:
@@ -213,13 +220,27 @@ class _Emitter:
                 builder.cbranch(self._operand(term.condition, values),
                                 blocks[term.yes], blocks[term.no])
             else:
-                self._panic(builder, term.message)
+                if term.frame is not None:
+                    self._frame_enter(builder, term.frame)
+                if isinstance(term.message, str):
+                    self._panic(builder, term.message)
+                else:
+                    builder.call(self.runtime["turkey_panic_string"], [
+                        self._operand(term.message, values)])
                 builder.call(self.runtime["turkey_root_pop"], [root_frame])
                 builder.ret(ir.Constant(function.function_type.return_type, None))
 
     def _set_root(self, builder: ir.IRBuilder, name: str, value: ir.Value) -> None:
         builder.call(self.runtime["turkey_root_set"], [
             self._root_frame, ir.Constant(_I64, self._root_index[name]), value,
+        ])
+
+    def _frame_enter(self, builder: ir.IRBuilder, frame: bir.Frame) -> ir.Value:
+        file = (ir.Constant(_PTR, None) if frame.file is None else
+                self._c_string(builder, frame.file, ".turkey.file"))
+        return builder.call(self.runtime["turkey_frame_enter"], [
+            self._c_string(builder, frame.function, ".turkey.frame"), file,
+            ir.Constant(_I64, frame.line), ir.Constant(_I64, frame.col),
         ])
 
     def _operand(self, operand: bir.Operand, values: dict[str, ir.Value]) -> ir.Value:
@@ -671,7 +692,10 @@ _RUNTIME_SYMBOLS = (
     "turkey_float_ceil", "turkey_float_round", "turkey_float_trunc",
     "turkey_char_to_string", "turkey_print",
     "turkey_write", "turkey_cell_new", "turkey_cell_load", "turkey_cell_store",
-    "turkey_panic", "turkey_panicked",
+    "turkey_panic", "turkey_panic_string", "turkey_panicked",
+    "turkey_frame_enter", "turkey_frame_leave", "turkey_frame_count",
+    "turkey_frame_function", "turkey_frame_file", "turkey_frame_line",
+    "turkey_frame_col",
     "turkey_string_byte_length", "turkey_string_byte_at",
     "turkey_string_decode_at", "turkey_string_next_index",
     "turkey_string_slice", "turkey_string_find", "turkey_string_rfind",
@@ -716,6 +740,11 @@ def _load_runtime() -> ctypes.CDLL:
         binding.add_symbol(name, ctypes.cast(getattr(library, name), ctypes.c_void_p).value)
     library.turkey_panicked.restype = ctypes.c_int32
     library.turkey_panic_message.restype = ctypes.c_char_p
+    library.turkey_frame_count.restype = ctypes.c_int64
+    library.turkey_frame_function.restype = ctypes.c_char_p
+    library.turkey_frame_file.restype = ctypes.c_char_p
+    library.turkey_frame_line.restype = ctypes.c_int64
+    library.turkey_frame_col.restype = ctypes.c_int64
     library.turkey_heap_objects.restype = ctypes.c_int64
     library.turkey_panic_clear()
     _runtime_library = library
@@ -738,7 +767,16 @@ class NativeModule:
         self.runtime.turkey_collect()
         if self.runtime.turkey_panicked():
             raw = self.runtime.turkey_panic_message()
-            raise TurkeyPanic(raw.decode("utf-8", "replace"))
+            panic = TurkeyPanic(raw.decode("utf-8", "replace"))
+            for index in range(self.runtime.turkey_frame_count()):
+                function = self.runtime.turkey_frame_function(index)
+                file = self.runtime.turkey_frame_file(index)
+                line = self.runtime.turkey_frame_line(index)
+                col = self.runtime.turkey_frame_col(index)
+                span = None if line == 0 else Span(
+                    line, col, None if file is None else file.decode("utf-8", "replace"))
+                panic.add_frame(function.decode("utf-8", "replace"), span)
+            raise panic
 
 
 def _ctype(layout: bir.Layout):

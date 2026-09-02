@@ -159,10 +159,35 @@ class _FunctionLowerer:
         return block
 
     def emit(self, block: bir.Block, op: str,
-             args: tuple[bir.Operand | str, ...], layout: bir.Layout) -> bir.Value:
+             args: tuple[bir.Operand | str, ...], layout: bir.Layout,
+             frame: bir.Frame | None = None) -> bir.Value:
         result = bir.Value(self.fresh(op), layout)
-        block.instructions.append(bir.Instruction(op, args, result))
+        block.instructions.append(bir.Instruction(op, args, result, frame))
         return result
+
+    def frame(self, span) -> bir.Frame:
+        return bir.Frame(
+            self.lam.name, None if span is None else span.file,
+            0 if span is None else span.line,
+            0 if span is None else span.col,
+        )
+
+    def match_failure(self, expr: CMatch) -> str:
+        head, _ = spine(expr.scrutinee.ty)
+        if isinstance(head, TCon) and head.name in self.decls.tycons:
+            variants = self.decls.tycons[head.name].variants
+            handled: set[str] = set()
+            for alt in expr.alts:
+                pattern = alt.pat
+                while isinstance(pattern, ast.PAnnot):
+                    pattern = pattern.pat
+                if isinstance(pattern, (ast.PCon, ast.PRecord)):
+                    handled.add(pattern.name)
+            missing = [variant.name for variant in variants
+                       if variant.name not in handled]
+            if len(missing) == 1:
+                return "no match arm applies to " + missing[0].rpartition("#")[2]
+        return "no match arm applies"
 
     def coerce(self, block: bir.Block, value: bir.Operand,
                target: bir.Layout) -> bir.Operand:
@@ -337,7 +362,8 @@ class _FunctionLowerer:
                 bir.Instruction("slot_store", (scrutinee_slot.name,
                                                 after_scrutinee.params[0])))
             failed = self.new_block("match_failed")
-            failed.terminator = bir.Panic("no match arm applies")
+            failed.terminator = bir.Panic(
+                self.match_failure(expr), self.frame(expr.span))
             test = after_scrutinee
             for index, alt in enumerate(expr.alts):
                 value = self.emit(test, "slot_load", (scrutinee_slot.name,),
@@ -581,7 +607,8 @@ class _FunctionLowerer:
                        else [expr.target])
             def project(at: bir.Block, values: list[bir.Operand]) -> None:
                 if isinstance(expr, CIndex):
-                    made = self.emit(at, "array_get", tuple(values), layout_of(expr.ty))
+                    made = self.emit(at, "array_get", tuple(values),
+                                     layout_of(expr.ty), self.frame(expr.span))
                 else:
                     index = expr.index if isinstance(expr, CProject) else self.field_index(
                         expr.target.ty, expr.name)
@@ -599,15 +626,15 @@ class _FunctionLowerer:
                     isinstance(fn, CVar) and fn.name in PRIM_NAMES):
                 primitive = fn.name
                 if primitive == "Prim.error":
-                    def panic(at: bir.Block, _values: list[bir.Operand]) -> None:
-                        at.terminator = bir.Panic("error")
+                    def panic(at: bir.Block, values: list[bir.Operand]) -> None:
+                        at.terminator = bir.Panic(values[0], self.frame(expr.span))
                     self.lower_values(expr.args, env, joins, block, panic)
                     return
                 if primitive == "Prim.stringToBytes":
                     def to_bytes(at: bir.Block, values: list[bir.Operand]) -> None:
                         string = values[0]
                         raw = self.emit(at, "prim.stringToByteStorage", (string,),
-                                        bir.Layout.PTR)
+                                        bir.Layout.PTR, self.frame(expr.span))
                         length = self.emit(at, "prim.stringByteLength", (string,),
                                            bir.Layout.I64)
                         storage_fields = self.record_fields["Data.Array#ArrayStorage"]
@@ -642,7 +669,8 @@ class _FunctionLowerer:
                 self.lower_values(expr.args, env, joins, block,
                                   lambda at, xs: done(at, self.emit(
                                       at, operation,
-                                      tuple(xs), layout_of(expr.ty))))
+                                      tuple(xs), layout_of(expr.ty),
+                                      self.frame(expr.span))))
                 return
             if isinstance(fn, CVar) and fn.name in self.functions:
                 symbol, function_type = self.functions[fn.name]
@@ -651,7 +679,7 @@ class _FunctionLowerer:
                                  for value, expected in zip(values,
                                                             function_type.params)]
                     called = self.emit(at, "call", (symbol, *arguments),
-                                       layout_of(function_type.ret))
+                                       layout_of(function_type.ret), self.frame(expr.span))
                     done(at, self.coerce(at, called, layout_of(expr.ty)))
                 self.lower_values(expr.args, env, joins, block, direct_call)
                 return
@@ -677,7 +705,7 @@ class _FunctionLowerer:
                 arguments = [values[0], *(self.coerce(at, value, bir.Layout.BOXED)
                                            for value in values[1:])]
                 called = self.emit(at, "closure_call", tuple(arguments),
-                                   bir.Layout.BOXED)
+                                   bir.Layout.BOXED, self.frame(expr.span))
                 done(at, self.coerce(at, called, layout_of(expr.ty)))
             self.lower_values([expr.fn, *expr.args], env, joins, block,
                               closure_call)

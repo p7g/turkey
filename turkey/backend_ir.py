@@ -38,10 +38,19 @@ Operand = Value | Constant
 
 
 @dataclass(frozen=True)
+class Frame:
+    function: str
+    file: str | None
+    line: int
+    col: int
+
+
+@dataclass(frozen=True)
 class Instruction:
     op: str
     args: tuple[Operand | str, ...] = ()
     result: Value | None = None
+    frame: Frame | None = None
 
 
 @dataclass(frozen=True)
@@ -64,7 +73,8 @@ class Branch:
 
 @dataclass(frozen=True)
 class Panic:
-    message: str
+    message: str | Operand
+    frame: Frame | None = None
 
 
 Terminator = Return | Jump | Branch | Panic
@@ -167,6 +177,10 @@ def _check_function(function: Function) -> None:
             if _layout(term.condition) is not Layout.I1:
                 raise CheckError(f"non-boolean branch in {function.name}:{block.name}")
             operands = (term.condition,)
+        elif isinstance(term, Panic) and isinstance(term.message, (Value, Constant)):
+            if _layout(term.message) is not Layout.PTR:
+                raise CheckError(f"non-string panic in {function.name}:{block.name}")
+            operands = (term.message,)
         for operand in operands:
             if isinstance(operand, Value) and operand.name not in local:
                 raise CheckError(
@@ -220,11 +234,13 @@ def _term(term: Terminator | None) -> str:
         return f"jump {term.target}({', '.join(_operand(a) for a in term.args)})"
     if isinstance(term, Branch):
         return f"branch {_operand(term.condition)}, {term.yes}, {term.no}"
-    return f"panic {term.message!r}"
+    message = (_operand(term.message) if isinstance(term.message, (Value, Constant))
+               else repr(term.message))
+    return f"panic {message}"
 
 
 __all__ = [
-    "Block", "Branch", "CheckError", "Constant", "Function", "Instruction",
+    "Block", "Branch", "CheckError", "Constant", "Frame", "Function", "Instruction",
     "Jump", "Layout", "Module", "Operand", "Panic", "Return", "Value",
     "check", "format_module",
 ]

@@ -11,6 +11,10 @@ NATIVE_PROGRAMS = sorted(
     path.stem for path in PROGRAMS_DIR.glob("*.tl")
     if not path.stem.startswith("err_") and path.with_suffix(".expected").exists()
 )
+ERROR_PROGRAMS = sorted(
+    path.stem for path in PROGRAMS_DIR.glob("err_*.tl")
+    if path.with_suffix(".expected").exists()
+)
 
 
 def native(src: str) -> None:
@@ -61,6 +65,23 @@ fun main() {
 def test_native_invalid_shift_panics():
     with pytest.raises(TurkeyPanic, match="shift amount"):
         native("fun main() { print(Int.shl(1, 64)) }")
+
+
+def test_native_panic_frames_match_the_optimized_backend():
+    source = """fun descend(n : Int) -> Int {
+    if n == 0 { return error("boom") }
+    descend(n - 1)
+}
+fun main() { print(descend(2)) }
+"""
+    checked = check(source, "trace.tl")
+    with pytest.raises(TurkeyPanic) as raised:
+        execute(checked.opt, checked.decls, checked.main, "trace.tl")
+    assert raised.value.render("trace.tl") == """panic: boom
+  at descend (trace.tl:2:24)
+  at descend (trace.tl:3:5)
+  at descend (trace.tl:3:5)
+  at main (trace.tl:5:20)"""
 
 
 def test_native_float_division_is_ieee(capfd):
@@ -209,6 +230,16 @@ def test_native_programs_match_conformance_output(name, monkeypatch, capfd):
     assert cli_main(["run", "--backend", "llvm", program.name]) == 0
     expected = (program.with_suffix(".expected")
                 .read_text(encoding="utf-8"))
+    captured = capfd.readouterr()
+    assert captured.out + captured.err == expected
+
+
+@pytest.mark.parametrize("name", ERROR_PROGRAMS)
+def test_native_error_programs_match_conformance_output(name, monkeypatch, capfd):
+    program = PROGRAMS_DIR / f"{name}.tl"
+    monkeypatch.chdir(PROGRAMS_DIR)
+    assert cli_main(["run", "--backend", "llvm", program.name]) != 0
+    expected = program.with_suffix(".expected").read_text(encoding="utf-8")
     captured = capfd.readouterr()
     assert captured.out + captured.err == expected
 

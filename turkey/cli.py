@@ -8,7 +8,8 @@ from pathlib import Path
 
 from . import pygen
 from .driver import (check, declared, desugared, report_warnings,
-                     run, show_declarations)
+                     registered, run, show_binding_groups,
+                     show_classes, show_declarations)
 from .errors import TurkeyError, TurkeyPanic
 from .astdump import dump as dump_ast
 from .core import show_program
@@ -27,6 +28,8 @@ def main(argv: list[str] | None = None) -> int:
         ("ast", "dump the parse tree"),
         ("desugar", "dump every module's tree, resolved and desugared"),
         ("decls", "dump the program's type and constructor table"),
+        ("deps", "dump each module's top-level binding groups, in order"),
+        ("classes", "dump the program's class and instance table"),
         ("core", "dump the typed Core the elaboration produces"),
         ("mono", "dump that Core with its polymorphism specialized away"),
         ("opt", "dump that Core with the optimizations applied"),
@@ -68,6 +71,14 @@ def main(argv: list[str] | None = None) -> int:
             table, _ = declared(src, args.file,
                                 [Path(args.file).resolve().parent])
             print(show_declarations(table), end="")
+        elif args.command == "deps":
+            print(show_binding_groups(
+                desugared(src, args.file,
+                          [Path(args.file).resolve().parent])), end="")
+        elif args.command == "classes":
+            table, class_table = registered(
+                src, args.file, [Path(args.file).resolve().parent])
+            print(show_classes(table, class_table), end="")
         elif args.command == "core":
             checked = check(src, args.file, [Path(args.file).resolve().parent])
             report_warnings(checked.warnings, args.file)

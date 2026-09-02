@@ -26,7 +26,8 @@ import Turkey.Types as Ty
 -- file `Type` is the syntax the author wrote (`Turkey.Ast`) and `Ty.Type` is
 -- what inference manipulates, and translating between them is the whole job.
 import Turkey.Types (Kind(..), VarCell(..), Scheme(..),
-                     TVar, TCon, TApp, TFam, TFun, TTuple, TLabel, TIndex,
+                     TVar, TCon, ConCell(..), TApp, TFam, TFun, TTuple,
+                     TLabel, TIndex,
                      TSet, TBottom)
 
 -- One value constructor. `fields` is `None` for the positional form.
@@ -99,7 +100,7 @@ fun newDeclTable() -> DeclTable {
         families = Map.new(), shorts = Map.new(), order = Array.new(16),
     }
     for name in Ty.primitives() {
-        Map.put(t.heads, name, TCon(name, KStar, Ty.noScope))
+        Map.put(t.heads, name, Ty.tcon(name, KStar, Ty.noScope))
         Map.put(t.tycons, name, TyconInfo {
             name = name, params = Array.new(0), variants = Array.new(0),
             isAlias = False, aliasBody = None, span = None, kind = KStar,
@@ -112,7 +113,7 @@ fun newDeclTable() -> DeclTable {
         name = "Prim.Array", params = ["a"], variants = Array.new(0),
         isAlias = False, aliasBody = None, span = None, kind = rawKind,
     })
-    Map.put(t.heads, "Prim.Array", TCon("Prim.Array", rawKind, Ty.noScope))
+    Map.put(t.heads, "Prim.Array", Ty.tcon("Prim.Array", rawKind, Ty.noScope))
     Array.push(t.order, "Prim.Array")
     t
 }
@@ -162,7 +163,7 @@ fun registerAll(t : DeclTable, decls : Array TypeDecl) -> Unit {
             isAlias = Option.isSome(d.alias), aliasBody = d.alias,
             span = Some(d.span), kind = kind,
         })
-        Map.put(t.heads, d.name, TCon(d.name, kind, Ty.noScope))
+        Map.put(t.heads, d.name, Ty.tcon(d.name, kind, Ty.noScope))
         Array.push(t.order, d.name)
         match Map.get(t.shorts, short) {
             Some(claimed) -> if claimed != d.name {
@@ -424,10 +425,11 @@ fun expandAlias(t : DeclTable, info : TyconInfo, substitution : Map String Ty.Ty
 -- -- constructor helpers ------------------------------------------------------------
 
 fun instantiateCon(t : DeclTable, name : String, fresh : Ty.Fresh,
-                   where : Span) -> Ty.Type = match Map.get(t.constructors, name) {
-    Some(info) -> Ty.instantiate(info.scheme, fresh)
-    None -> oops("unknown constructor '" + name + "'", Some(where))
-}
+                   where : Option Span) -> Ty.Type =
+    match Map.get(t.constructors, name) {
+        Some(info) -> Ty.instantiate(info.scheme, fresh)
+        None -> oops("unknown constructor '" + name + "'", where)
+    }
 
 fun con(t : DeclTable, name : String) -> Option ConInfo = Map.get(t.constructors, name)
 
@@ -452,7 +454,7 @@ fun recordFields(t : DeclTable, name : String) -> Option (Array String) =
 fun fieldType(t : DeclTable, receiver : Ty.Type, label : String) -> Ty.Type {
     let (h, args) = Ty.spine(receiver)
     let name = match h {
-        TCon(n, _, _) -> n
+        TCon(c) -> c.name
         _ -> oops("a field was read from something that is not a record", None)
     }
     let c = tyconOf(t, name).variants[0]
@@ -476,7 +478,7 @@ fun fieldType(t : DeclTable, receiver : Ty.Type, label : String) -> Ty.Type {
 fun projectionTypes(t : DeclTable, receiver : Ty.Type) -> Option (Array Ty.Type) {
     let (h, args) = Ty.spine(receiver)
     match h {
-        TCon(name, _, _) -> match Map.get(t.tycons, name) {
+        TCon(c) -> match Map.get(t.tycons, c.name) {
             None -> None
             Some(info) -> {
                 if len(info.variants) != 1 || isRecord(info.variants[0]) {

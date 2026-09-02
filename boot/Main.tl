@@ -20,6 +20,7 @@
 -- what keeps the milestone's diff to one process, since starting this program
 -- currently means compiling it.
 
+import Data.Set as Set
 import System.Env as Env
 import System.IO as IO
 import Turkey.Source as Source
@@ -33,7 +34,14 @@ import Turkey.Resolve as Resolve
 import Turkey.Desugar as Desugar
 import Turkey.Types as Ty
 import Turkey.Decls as Decls
-import Turkey.Ast (Decl(..))
+import Turkey.Deps as Deps
+import Turkey.Classes as Classes
+import Turkey.Solved as Solved
+import Turkey.Constraints as Constraints
+import Turkey.Typed as Typed
+import Turkey.Exhaustive as Exhaustive
+import Turkey.PrimTypes as PrimTypes
+import Turkey.Ast (Decl(..), Stmt(..), StmtKind(..), patternVars)
 
 -- Where the language's own library lives, relative to where this is run from.
 -- The Python finds it beside its own source; a compiled binary has no such
@@ -45,7 +53,8 @@ fun main() {
     let args = Env.args()
     if len(args) < 2 { usage() }
     let command = args[0]
-    if !Array.contains(["tokens", "ast", "desugar", "decls"], command) {
+    if !Array.contains(["tokens", "ast", "desugar", "decls", "deps",
+                    "classes"], command) {
         die("unknown command '" + command + "'")
     }
     -- One builder for every file: a `print` per token is a flush per token,
@@ -58,7 +67,9 @@ fun main() {
             "ast" -> String.push(b, AstDump.dump(
                 Parser.parse(readOrDie(path), Array.new(0))))
             "desugar" -> dumpDesugared(b, path)
-            _ -> dumpDecls(b, path)
+            "decls" -> dumpDecls(b, path)
+            "deps" -> dumpDeps(b, path)
+            _ -> dumpClasses(b, path)
         }
     }
     write(String.build(b))
@@ -99,18 +110,108 @@ fun loadResolved(path : String) -> Array Modules.Module {
 -- generalized to. One table for the whole program, which is what makes the
 -- two-modules-claim-one-short-name rule visible at all.
 fun dumpDecls(b : String.Builder, path : String) -> Unit {
+    let (table, _) = registerTables(path, False)
+    String.push(b, Decls.showDeclarations(table))
+}
+
+-- Everything before the first constraint is generated: types, constructors,
+-- classes, their methods' schemes, their families, and the instance table. One
+-- pair of tables for the whole program.
+fun dumpClasses(b : String.Builder, path : String) -> Unit {
+    let (_, classes) = registerTables(path, True)
+    String.push(b, Classes.showClasses(classes))
+}
+
+fun registerTables(path : String,
+                   withClasses : Bool) -> (Decls.DeclTable, Classes.ClassTable) {
     let table = Decls.newDeclTable()
+    let classes = Classes.newClassTable(table)
     for m in loadResolved(path) {
         let types = Array.new(8)
+        let classDecls = Array.new(4)
+        let instDecls = Array.new(4)
         for d in m.program.decls {
             match d {
                 DType(td) -> Array.push(types, td)
+                DClass(cd) -> Array.push(classDecls, cd)
+                DInstance(idl) -> Array.push(instDecls, idl)
                 _ -> {}
             }
         }
         Decls.registerAll(table, types)
+        if withClasses {
+            Classes.registerAll(classes, classDecls, instDecls, m.name)
+        }
     }
-    String.push(b, Decls.showDeclarations(table))
+    (table, classes)
+}
+
+-- Each module's top-level binding groups, in the order they are checked.
+--
+-- The graph is keyed by *item*, not by bound name: one binding may introduce
+-- several names, and keying by name would split an item across two components
+-- and infer -- and evaluate -- its right-hand side twice.
+fun dumpDeps(b : String.Builder, path : String) -> Unit {
+    for m in loadResolved(path) {
+        String.push(b, "module " + m.name + "\n")
+        let items = topLevelItems(m.program.decls)
+        let namesOf = Map.new()
+        let owner = Map.new()
+        for var i = 0; i < len(items); i = i + 1 {
+            let key = "item" + Int.toString(i)
+            let names = itemNames(items[i])
+            Map.put(namesOf, key, names)
+            for n in names {
+                if !Map.contains(owner, n) { Map.put(owner, n, key) }
+            }
+        }
+        let graph = Map.new()
+        for var i = 0; i < len(items); i = i + 1 {
+            let edges = Set.new()
+            for n in Set.elements(itemDeps(items[i])) {
+                match Map.get(owner, n) {
+                    Some(key) -> Set.add(edges, key)
+                    None -> {}
+                }
+            }
+            Map.put(graph, "item" + Int.toString(i), edges)
+        }
+        for component in Deps.sccs(graph) {
+            let bound = Array.new(4)
+            for key in component {
+                for n in Map.getOr(namesOf, key, Array.new(0)) {
+                    Array.push(bound, n)
+                }
+            }
+            String.push(b, "  group " + String.join(component, " ") + " : "
+                           + String.join(Array.sort(bound), ", ") + "\n")
+        }
+    }
+}
+
+fun topLevelItems(decls : Array Decl) -> Array Stmt {
+    let out = Array.new(8)
+    for d in decls {
+        match d {
+            DStmt(s) -> Array.push(out, s)
+            _ -> {}
+        }
+    }
+    out
+}
+
+fun itemNames(item : Stmt) -> Array String = match item.kind {
+    SFun(d) -> [d.name]
+    SLet(pat, _) -> Array.sort(patternVars(pat))
+    SVar(pat, _) -> Array.sort(patternVars(pat))
+    _ -> Array.new(0)
+}
+
+fun itemDeps(item : Stmt) -> Set.Set String = match item.kind {
+    SFun(d) -> Deps.freeNamesOfFun(d, Set.new())
+    SLet(_, value) -> Deps.freeNames(value, Set.new())
+    SVar(_, value) -> Deps.freeNames(value, Set.new())
+    _ -> Set.new()
 }
 
 -- The directory a path is in, as a search root. A path with no separator is in
@@ -127,7 +228,8 @@ fun readOrDie(path : String) -> Source = match Source.read(path) {
     None -> die("cannot read " + path)
 }
 
-fun usage() -> a = die("usage: boot <tokens|ast|desugar|decls> FILE...")
+fun usage() -> a =
+    die("usage: boot <tokens|ast|desugar|decls|deps|classes> FILE...")
 
 fun die(message : String) -> a {
     IO.stderr("boot: " + message + "\n")

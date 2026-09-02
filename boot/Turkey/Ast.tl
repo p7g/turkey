@@ -18,7 +18,7 @@ module Turkey.Ast (
     ImportDecl(..),
     Decl(..),
     Program(..),
-    patternVars,
+    patternVars, freshNodeId,
     Child(..), children, exprChildren, stmtChildren,
 )
 
@@ -47,6 +47,26 @@ module Turkey.Ast (
 -- keys a table by one.
 
 import Turkey.Source (Span)
+
+-- Where a node's `id` comes from.
+--
+-- Program-wide rather than per-file, and that is the whole point: the tables
+-- keyed by it -- every expression's inferred type, a use site's evidence, a
+-- group's dictionary abstraction -- hold a whole program at once, so an id that
+-- restarted per file would have two nodes sharing an entry. Python keys those
+-- tables by object identity, which is unique by construction and so never had
+-- to say this.
+--
+-- Never reset, and never printed. Uniqueness is all that is asked of it, and a
+-- monotone counter gives that for as many programs as one process compiles.
+type NodeIds = NodeIds { next : Int }
+
+let nodeIds = NodeIds { next = 0 }
+
+fun freshNodeId() -> Int {
+    nodeIds.next = nodeIds.next + 1
+    nodeIds.next
+}
 
 -- -- literals ---------------------------------------------------------------------
 
@@ -306,12 +326,6 @@ type Program = Program {
     header  : Option ModuleHeader,
     imports : Array ImportDecl,
     decls   : Array Decl,
-    -- Where the parser's id counter got to. Desugaring writes nodes of its own
-    -- and they need ids as much as parsed ones do, so the counter is handed on
-    -- rather than restarted -- a second counter starting at zero would collide
-    -- with every node already in the tree. Not part of the syntax, and not
-    -- dumped.
-    nextId  : Int,
 }
 
 -- Every variable a pattern binds.

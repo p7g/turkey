@@ -17,7 +17,8 @@ FILES = [
     "tests/programs/families.tl",
     "tests/programs/question_control.tl",
 ]
-STAGES = sys.argv[1:] or ["desugar", "decls", "deps", "classes", "types"]
+STAGES = sys.argv[1:] or ["desugar", "decls", "deps", "classes",
+                          "types", "core"]
 
 failed = False
 for stage in STAGES:

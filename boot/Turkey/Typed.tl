@@ -27,6 +27,7 @@ module Turkey.Typed (
 
 import Data.Set as Set
 import Turkey.Ast
+import Turkey.Diag as Diag
 import Turkey.Classes as Classes
 import Turkey.Classes (ClassTable(..))
 import Turkey.Solved (Abstraction(..), Use(..))
@@ -107,9 +108,14 @@ fun ofPattern(t : TypeTable, p : Pat) -> Map String Ty.Type = match Map.get(t.pa
 }
 
 -- The resolved type of one expression. Only meaningful after solving.
+--
+-- A miss is a bug rather than a program's mistake: generation records every
+-- expression it visits, in one place so that no case can forget. Answering
+-- something plausible instead would push the failure into whatever read it.
 fun of_(t : TypeTable, e : Expr) -> Ty.Type = match Map.get(t.exprs, e.id) {
     Some(ty) -> resolve(t, ty)
-    None -> TBottom
+    None -> Diag.fail(Diag.at("internal error",
+        "no type was recorded for this expression", e.span), e.span.file)
 }
 
 -- Read a recorded type out, once solving has decided what it is.

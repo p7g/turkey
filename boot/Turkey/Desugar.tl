@@ -92,14 +92,9 @@ type D = D {
     -- becomes a `Brk` inside one; outside, it is left alone so that the checker
     -- still reports it as a `break` with no loop, which is what it is.
     depth   : Int,
-    -- Where the parser's id counter got to. Nodes written here continue it.
-    nextId  : Int,
 }
 
-fun freshId(d : D) -> Int {
-    d.nextId = d.nextId + 1
-    d.nextId
-}
+fun freshId(d : D) -> Int = freshNodeId()
 
 fun mkExpr(d : D, s : Span, k : ExprKind) -> Expr =
     Expr { id = freshId(d), span = s, kind = k }
@@ -293,7 +288,7 @@ fun transferOf(s : Stmt) -> Option Expr = match s.kind {
 -- -- the pass -----------------------------------------------------------------------
 
 fun program(p : Program, methods : Map String String) -> Unit {
-    let d = D { n = 0, methods = methods, depth = 0, nextId = p.nextId }
+    let d = D { n = 0, methods = methods, depth = 0 }
     for decl in p.decls {
         match decl {
             DClass(c) -> for m in c.methods { funBody(d, m) }
@@ -303,7 +298,6 @@ fun program(p : Program, methods : Map String String) -> Unit {
         }
     }
     desugarIndexes(d, p)
-    p.nextId = d.nextId
 }
 
 -- A `fun` body is a do-context exactly when it contains a `?`.

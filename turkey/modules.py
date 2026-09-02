@@ -255,7 +255,16 @@ class ModuleLoader:
             elif item.name[:1].islower():
                 out.values[item.name] = self._exported(
                     module, mine.values, item, "values")
-            elif item.name in mine.classes or item.name in module.scope.classes:
+            # A name the module *declares itself* is that declaration, whatever
+            # an import may have brought in under the same spelling. Without
+            # this, `Data.String`'s own `Index` type is invisible and its
+            # export list silently re-exports `Std.Classes`'s `Index` class
+            # instead -- the module's own declaration losing to an import,
+            # which is the opposite of the rule `_scope` applies everywhere
+            # else. Found by the bootstrap compiler, which is the first program
+            # to name that type from outside.
+            elif item.name not in mine.types and (
+                    item.name in mine.classes or item.name in module.scope.classes):
                 target = self._exported(module, mine.classes, item, "classes")
                 out.classes[item.name] = target
                 for member in _subs_of(item, self.class_members.get(target, [])):

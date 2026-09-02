@@ -2632,3 +2632,67 @@ inner type's cursor abstractly: `Data.Set`'s `Iterator` instance cannot write
 for it to name instead. Exporting the cursor is much the cheaper side of that
 trade, but it is a real cost of the design, and it was found by writing the
 second program that ever wrapped a container.
+
+---
+
+### 59. A token stream has a spelling of its own, and an export list prefers the module's own declarations
+
+design.md 2.1, 2.4, 9.2, 9.3.
+
+Three findings, all from writing the bootstrap compiler's lexer in the language
+(plan.txt item 9, M19).
+
+**`turkey tokens` printed the host.** Its output was Python's `repr` of each
+token: the quote character depends on the contents, the escapes are Python's,
+and a `Float` is `repr`'s. None of that is reproducible from Turkey, so a
+second implementation could only have matched it by imitating CPython -- which
+is the opposite of what a differential test is for. The dump is now canonical:
+
+```
+12:5 IDENT parse
+3:19 STRING "a\nb"
+7:1 NEWLINE forced
+```
+
+`line:col KIND`, with a payload only where the kind does not determine it. The
+float spelling is the one PRIMITIVES.md 3.3 defines, the escapes are the six of
+design.md 2.1 plus `\u{...}`, and a `NEWLINE` says `forced` when it came from
+a `;` -- which is the one property of a newline not recoverable from its kind,
+since a run of line breaks containing a `;` collapses to a single forced
+separator whose *value* is the first break's.
+
+**A module's own declaration lost to an import, in its own export list.** This
+was a bug, not a trade-off. `modules._exports` decides what an uppercase export
+names, and it asked "is this a class anywhere in scope?" before "does this
+module declare a type by that name?". So `Data.String`, which imports
+`Std.Classes` and therefore has the `Index` *class* in scope, exported that
+class under the name `Index` and left its own `Index` *type* unexported.
+Everywhere else -- `modules._scope` -- a module's own declarations shadow
+everything imported, and now the export list agrees. Nothing in the suite could
+have found this: `boot` is the first program to name that type from another
+module.
+
+**A qualified type name does not resolve.** `String.Index` and `Map.Cursor`
+are both rejected as unknown types, even though `_bring` puts every qualified
+name into every namespace, the type namespace included -- only *values* consult
+it. Section 9.3's resolution order is written for values and is implemented for
+values.
+
+That is not merely an inconvenience. A type can only be named bare, so a type
+whose name collides with anything else in scope cannot be named at all, and the
+collision is not hypothetical: every module imports `Std.Classes`, which claims
+`Index`, so `Data.String.Index` is unnameable by exactly the modules that want
+it. `boot` works around it by importing the type bare and letting its own
+declaration shadow the class. Worth fixing rather than documenting, since the
+parser already produces the dotted name and the scope already holds it; left
+alone for now because M19's job was the lexer.
+
+**Two divergences from the Python lexer, both toward the spec.** `boot`
+classifies characters with `Data.Char`'s ASCII predicates, where
+`turkey/lexer.py` asks `str.isalpha` and `str.isdigit` -- which are
+Unicode-wide, so a Devanagari digit starts a numeral and a Greek letter starts
+an identifier there. design.md 2.1 says `[a-z_]` and `[0-9]`. And an integer
+literal outside `Int`'s range is a lex error in `boot`, as PRIMITIVES.md 1.3
+requires; the Python lexer still produces an unbounded token. Neither
+divergence is reachable from any file in the repository, which is why the two
+agree on all 79 of them.

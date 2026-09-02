@@ -22,6 +22,8 @@ make application decomposition sound -- see the kind section below.
 
 from __future__ import annotations
 
+import math
+
 from collections.abc import Callable
 from itertools import count
 from typing import Protocol
@@ -506,6 +508,36 @@ def head_con(t: Type) -> TCon | None:
     """The constructor at the head of `t`, if it is one."""
     head, _ = spine(t)
     return head if isinstance(head, TCon) else None
+
+
+def float_to_string(x: float) -> str:
+    """The shortest decimal that round-trips, always lexable as a `Float`.
+
+    Python's `repr` already gives the shortest round-tripping digits, so the
+    only work is spelling: the specials get their own names, and a result with
+    no `.` acquires one so it re-lexes as a `Float` literal rather than an
+    `Int` one (PRIMITIVES.md 3.3).
+
+    It lives here rather than beside the other primitive operations because
+    `turkey/lexer.py` needs it too, to dump a token stream in a spelling that
+    is the language's rather than the host's -- and the lexer sits below
+    `turkey/builtins.py`.
+    """
+    if x != x:
+        return "NaN"
+    if x == math.inf:
+        return "Infinity"
+    if x == -math.inf:
+        return "-Infinity"
+    text = repr(x)
+    if "e" in text or "E" in text:
+        mantissa, _, exponent = text.partition("e")
+        if "." not in mantissa:
+            mantissa += ".0"
+        return f"{mantissa}e{exponent}"
+    if "." not in text:
+        text += ".0"
+    return text
 
 
 def array_of(element: Type) -> Type:

@@ -45,6 +45,7 @@ import Turkey.PrimTypes as PrimTypes
 import Turkey.Infer as Infer
 import Turkey.Evidence as Evidence
 import Turkey.Core as Core
+import Turkey.Lower as Lower
 import Turkey.Ast (Decl(..), Stmt(..), StmtKind(..), patternVars)
 
 -- Where the language's own library lives, relative to where this is run from.
@@ -58,7 +59,7 @@ fun main() {
     if len(args) < 2 { usage() }
     let command = args[0]
     if !Array.contains(["tokens", "ast", "desugar", "decls", "deps",
-                    "classes", "types"], command) {
+                    "classes", "types", "core"], command) {
         die("unknown command '" + command + "'")
     }
     -- One builder for every file: a `print` per token is a flush per token,
@@ -74,7 +75,8 @@ fun main() {
             "decls" -> dumpDecls(b, path)
             "deps" -> dumpDeps(b, path)
             "classes" -> dumpClasses(b, path)
-            _ -> dumpTypes(b, path)
+            "types" -> dumpTypes(b, path)
+            _ -> dumpCore(b, path)
         }
     }
     write(String.build(b))
@@ -235,28 +237,63 @@ fun itemDeps(item : Stmt) -> Set.Set String = match item.kind {
 -- input rather than its output, because a scheme is what a reader can check by
 -- eye and evidence is not.
 fun dumpTypes(b : String.Builder, path : String) -> Unit {
-    Solved.resetDictNames()
-    let (modules, entry) = loadProgram(path)
-    let decls = Decls.newDeclTable()
-    let classes = Classes.newClassTable(decls)
-    let env = Constraints.childEnv(initialEnv())
-    let types = Typed.newTypeTable()
-    let warnings = Array.new(4)
-
-    for m in modules {
-        let g = Infer.newGenerator(decls, env, classes, m.name, types)
-        let (_, constraint) = Infer.generate(g, m.program)
-        let solver = Constraints.newSolver(decls, env, classes)
-        Constraints.run(solver, constraint)
-        Infer.checkExhaustiveness(g)
-        Evidence.run(classes, solver.uses)
-        for w in g.warnings { Array.push(warnings, w) }
-    }
-
-    for w in warnings { IO.stderr(path + ":" + Diag.short(w) + "\n") }
-    for (name, scheme) in signatures(entry, env, classes) {
+    let (checked, entry) = checkProgram(path)
+    for w in checked.warnings { IO.stderr(path + ":" + Diag.short(w) + "\n") }
+    for (name, scheme) in signatures(entry, checked.env, checked.classes) {
         String.push(b, name + " : " + Ty.showScheme(scheme) + "\n")
     }
+}
+
+-- The typed Core the elaboration produces, for the entry module.
+--
+-- The same front end `types` runs, and then the lowering: what solving decided
+-- stops being an agreement between passes and becomes a term. Only the entry
+-- module's part is printed, for the reason `types` prints one module's
+-- signatures -- a whole program's Core is mostly the Prelude's.
+fun dumpCore(b : String.Builder, path : String) -> Unit {
+    let (checked, entry) = checkProgram(path)
+    let lowerer = Lower.newLowerer(checked.decls, checked.classes, checked.env,
+                                   checked.types)
+    let program = Lower.program(lowerer, checked.ordered)
+    String.push(b, Core.showProgram(program, Some(entry.name)))
+}
+
+-- What the whole front end leaves behind.
+type Checked = Checked {
+    decls    : Decls.DeclTable,
+    classes  : Classes.ClassTable,
+    env      : Constraints.Env,
+    types    : Typed.TypeTable,
+    -- Every module's top-level items, in evaluation order. A binding is always
+    -- initialized before anything that reads it, and the lowering keeps that
+    -- order because the running program depends on it.
+    ordered  : Array Stmt,
+    warnings : Array String,
+}
+
+fun checkProgram(path : String) -> (Checked, Modules.Module) {
+    Solved.resetDictNames()
+    let (modules, entry) = loadProgram(path)
+    let checked = Checked {
+        decls = Decls.newDeclTable(), classes = Classes.newClassTable(
+            Decls.newDeclTable()),
+        env = Constraints.childEnv(initialEnv()), types = Typed.newTypeTable(),
+        ordered = Array.new(32), warnings = Array.new(4),
+    }
+    checked.classes = Classes.newClassTable(checked.decls)
+    for m in modules {
+        let g = Infer.newGenerator(checked.decls, checked.env, checked.classes,
+                                   m.name, checked.types)
+        let (items, constraint) = Infer.generate(g, m.program)
+        let solver = Constraints.newSolver(checked.decls, checked.env,
+                                           checked.classes)
+        Constraints.run(solver, constraint)
+        Infer.checkExhaustiveness(g)
+        Evidence.run(checked.classes, solver.uses)
+        for item in items { Array.push(checked.ordered, item) }
+        for w in g.warnings { Array.push(checked.warnings, w) }
+    }
+    (checked, entry)
 }
 
 -- The environment every module is checked in. What a module may *write* is
@@ -327,8 +364,8 @@ fun readOrDie(path : String) -> Source = match Source.read(path) {
 }
 
 fun usage() -> a =
-    die("usage: boot <tokens|ast|desugar|decls|deps|classes|types> "
-        + "FILE...")
+    die("usage: boot <tokens|ast|desugar|decls|deps|classes|types|core>"
+        + " FILE...")
 
 fun die(message : String) -> a {
     IO.stderr("boot: " + message + "\n")

@@ -33,7 +33,6 @@ type P = P {
     tycons   : Array String,
     noRecord : Bool,
     file     : String,
-    nextId   : Int,
 }
 
 fun parse(source : Source, known : Array String) -> Program {
@@ -44,7 +43,6 @@ fun parse(source : Source, known : Array String) -> Program {
         tycons = Array.append(collectTycons(toks), known),
         noRecord = False,
         file = source.name,
-        nextId = 0,
     }
     parseProgram(p)
 }
@@ -154,10 +152,7 @@ fun setNoRecord(p : P, flag : Bool) -> Bool {
 --
 -- Every node gets a fresh id here, which is the only place nodes are made.
 
-fun freshId(p : P) -> Int {
-    p.nextId = p.nextId + 1
-    p.nextId
-}
+fun freshId(p : P) -> Int = freshNodeId()
 
 fun mkType(p : P, s : Span, k : TypeKind) -> Type =
     Type { id = freshId(p), span = s, kind = k }
@@ -246,8 +241,7 @@ fun parseProgram(p : P) -> Program {
         }
         endOfStatement(p)
     }
-    Program { span = s, header = header, imports = imports, decls = decls,
-              nextId = p.nextId }
+    Program { span = s, header = header, imports = imports, decls = decls }
 }
 
 fun endOfStatement(p : P) -> Unit {

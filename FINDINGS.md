@@ -117,6 +117,28 @@ the case its host never exercised.
 every element, so a reused buffer had to be reallocated. `Array.clear` keeps the
 capacity, which is the point of reusing it.
 
+### 36. Node ids were unique per file, and one table is per program
+**bug, fixed.** M23. Entry 10 records the decision: Turkey has no identity, so
+the parser stamps a monotone `Int` on every node and the tables key on that. The
+counter was the *parser's*, and restarted for each file -- which is fine while
+every table keyed by it is per-module, and wrong the moment one is not.
+`TypeTable` holds a whole program by design, so `Data.Array`'s node 57 read
+whatever module had got there first.
+
+It surfaced as an absurdity rather than a crash: the `next` of a `for ... in`
+over an array came back typed `fun(String) -> Int`, which is `len`. Two facts
+made that a one-step diagnosis instead of a hunt. The type was *printable*, so
+the wrong answer named itself. And `TypeTable.of_` had just been changed to
+report a miss rather than answer `TBottom`, which is what turned "some later
+pass is confused" into "this node has no type".
+
+The counter is program-wide now, and lives in `Turkey.Ast` with the node kinds.
+Python keys those tables by object identity, which is unique by construction --
+so the Python never had to say that program-wide uniqueness was load-bearing,
+and there was nothing in it to port wrongly. This is the first bug in the
+bootstrap that is *only* a bug in the port, and it is one the language's absence
+of identity made available.
+
 ---
 
 ## Open, and accepted
@@ -283,6 +305,13 @@ reads as "output mismatch" rather than "a line moved".
 Regenerating is correct and was correct here: the message, the frame names and
 the user-file locations were all unchanged and only the line moved. Recorded
 because the *next* such break will look exactly like a real one.
+
+### 37. `instance` and `loop` cannot name a function
+**design.** M23, and the fifth and sixth reserved word to take an obvious name
+(entries 7, 23, 28). `instance` is what the function that lowers one instance
+wants to be called, and `loop` is what the function that lowers a loop wants to
+be called; they are `instanceBind` and `lowerLoop`. Eight common words are now
+unavailable to every binder in every program.
 
 ### 24. `Data.Set` is not one of the modules the Prelude re-exports
 **library.** M21. `Array`, `Map`, `Option` and eight others arrive

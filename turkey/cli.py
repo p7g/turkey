@@ -9,6 +9,7 @@ from pathlib import Path
 from . import pygen
 from .driver import check, report_warnings, run
 from .errors import TurkeyError, TurkeyPanic
+from .astdump import dump as dump_ast
 from .core import show_program
 from .lexer import tokenize
 from .parser import parse
@@ -50,7 +51,7 @@ def main(argv: list[str] | None = None) -> int:
             for token in tokenize(src):
                 print(token.canonical())
         elif args.command == "ast":
-            print(parse(src))
+            print(dump_ast(parse(src)), end="")
         elif args.command == "core":
             checked = check(src, args.file, [Path(args.file).resolve().parent])
             report_warnings(checked.warnings, args.file)

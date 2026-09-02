@@ -2696,3 +2696,54 @@ literal outside `Int`'s range is a lex error in `boot`, as PRIMITIVES.md 1.3
 requires; the Python lexer still produces an unbounded token. Neither
 divergence is reachable from any file in the repository, which is why the two
 agree on all 79 of them.
+
+---
+
+### 60. A parse tree has a spelling of its own, and speculation is a scan rather than a failure
+
+design.md 2.1, 3, 7.
+
+From porting the parser to the language (plan.txt item 9, M20).
+
+**`turkey ast` printed the dataclass `repr`**, and gets the treatment delta 59
+gave the token dump: an indented tree, two spaces a level, one node a line.
+Three rules and no others -- scalars are atoms on the node's own line in field
+order, sub-nodes are children below it in field order, and a list is a `list N`
+line while an absent optional is a `none` line, both occupying the child
+position they would have so that a node's arity is fixed. Spans are included,
+because a parser that builds the right shape from the wrong token reports every
+later error in the wrong place and this is the cheapest place to notice.
+
+**Backtracking by catching a parse error has no equivalent in the language.**
+`turkey/parser.py` speculates twice -- `_try_signature` reads a method's
+parameter list as types and undoes that if it fails or if a body turns up, and
+`parse_for` reads a pattern to find out whether an `in` follows. Turkey has no
+exceptions, so a failed parse cannot be caught and undone.
+
+Both are answered instead by a token scan, run *before* either reading is
+attempted, for the one thing that separates them: a definition has an `=` or a
+`{` at bracket depth zero after its parameter list and a signature has neither;
+a `for ... in` has the keyword `in` at depth zero before its body, where the
+C-style form has a `;` first. Nothing nested can be mistaken for either, since
+the scan only looks at depth zero.
+
+This is not a workaround so much as the shape the Python was already reaching
+for -- `_rhs_has_alternatives`, which decides design.md 7's alias-vs-data
+question, is exactly such a scan. A speculative parse decides by failing; a
+scan decides by looking. The two agree on every file in the repository, which
+is the claim worth making, since the standard library is full of class
+signatures and of both loop forms.
+
+**Two costs of the language, both about names.**
+
+`hiding` is a reserved word (design.md 2.1) and therefore cannot be a field
+name: `ImportDecl.hiding` in the Python is `ImportDecl.hidden` here. `export`
+is reserved too, and the grammar never uses it. Reserving a common word takes
+it away from every record in every program, not just from the one production
+that wanted it.
+
+And a block answers with its last statement, so a branch ending in
+`expect(...)` answers a `Token` while the sibling branch ending in a `while`
+answers `Unit`, and the two do not unify. Thirty-eight call sites in the parser
+wanted the call as a *statement*, which is what the local `skipToken` is for.
+Discarding a result is a thing that has to be said.

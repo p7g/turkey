@@ -1,7 +1,7 @@
 module Turkey.Types (
     Kind(..), KCell(..),
     kstar, kvar, kprune, unifyKinds, defaultKind, kindArrow, showKind,
-    VarCell(..), Type(..), Fresh,
+    VarCell(..), ConCell(..), Type(..), Fresh, tcon,
     noScope, ground, equals,
     newVar, freshVar, tvar,
     shortName, qualify, qualifyAll, clearQualified, display,
@@ -18,6 +18,7 @@ module Turkey.Types (
     unify, join, generalize, instantiate, instantiateQual,
     typeKey, subterms, varsOf, freeVars,
     Namer(..), namer, namerFrom, show, showAt, showScheme, showPred,
+    showPredWith,
 )
 
 -- Semantic types and unification (design.md 4, `turkey/types.py`).
@@ -179,6 +180,18 @@ type VarCell = VarCell {
     kind  : Kind,
 }
 
+-- A type constructor's own record. It is mutable for one reason: a *skolem* is
+-- a constructor whose level is the rank of the binder that made it, and the
+-- solver stamps that rank on after generation has already built the types that
+-- mention it. Python's constructors are objects shared by reference, so
+-- assigning `con.level` is seen everywhere at once; a level carried in the
+-- immutable variant would have to be rebuilt into every type that holds one.
+type ConCell = ConCell {
+    name  : String,
+    kind  : Kind,
+    level : Int,
+}
+
 type Type
     = TVar(VarCell)
     -- A type constructor, *unapplied*: `Int`, `Array`, `Stack`. Arguments are
@@ -187,12 +200,12 @@ type Type
     -- `instantiate` return it untouched and what makes decomposing an
     -- application sound.
     --
-    -- The `Int` is the level. `noScope` for a real constructor: `Int` is the
-    -- same type at every rank, so it can be mentioned from anywhere. A
-    -- *skolem* is not -- it is a constructor only for the length of one body,
-    -- standing for a type the caller has yet to choose, so it carries the rank
-    -- of the binder that made it and must not be seen from outside it.
-    | TCon(String, Kind, Int)
+    -- `level` is `noScope` for a real constructor: `Int` is the same type at
+    -- every rank, so it can be mentioned from anywhere. A *skolem* is not --
+    -- it is a constructor only for the length of one body, standing for a type
+    -- the caller has yet to choose, so it carries the rank of the binder that
+    -- made it and must not be seen from outside it.
+    | TCon(ConCell)
     -- `f a` -- one type applied to one argument. Curried, so a *variable* can
     -- sit at the head. That is the whole point: `Functor f` needs an `f` to
     -- abstract over, and a saturated constructor has no sub-term for it to be.
@@ -258,6 +271,9 @@ fun freshVar(level : Int) -> VarCell = newVar(level, kvar())
 
 fun tvar(level : Int) -> Type = TVar(freshVar(level))
 
+fun tcon(name : String, kind : Kind, level : Int) -> Type =
+    TCon(ConCell { name = name, kind = kind, level = level })
+
 -- -- names --------------------------------------------------------------------------
 
 -- The part of an internal name a reader wrote. `Turkey.Modules` owns the `#`
@@ -297,15 +313,15 @@ fun display(name : String) -> String =
 
 -- -- the built-in constructors ------------------------------------------------------
 
-fun tInt() -> Type = TCon("Int", KStar, noScope)
-fun tByte() -> Type = TCon("Byte", KStar, noScope)
-fun tFloat() -> Type = TCon("Float", KStar, noScope)
-fun tString() -> Type = TCon("String", KStar, noScope)
-fun tChar() -> Type = TCon("Char", KStar, noScope)
+fun tInt() -> Type = tcon("Int", KStar, noScope)
+fun tByte() -> Type = tcon("Byte", KStar, noScope)
+fun tFloat() -> Type = tcon("Float", KStar, noScope)
+fun tString() -> Type = tcon("String", KStar, noScope)
+fun tChar() -> Type = tcon("Char", KStar, noScope)
 -- Declared in the Prelude as `type Bool = False | True`; this still names it,
 -- because a constructor is compared by name.
-fun tBool() -> Type = TCon("Data.Bool.Type#Bool", KStar, noScope)
-fun tUnit() -> Type = TCon("Unit", KStar, noScope)
+fun tBool() -> Type = tcon("Data.Bool.Type#Bool", KStar, noScope)
+fun tUnit() -> Type = tcon("Unit", KStar, noScope)
 
 -- The types the checker seeds itself with, and therefore also the ones a
 -- program may not redefine. `Bool` is deliberately absent: it is declared in
@@ -335,8 +351,8 @@ fun isScalarValue(code : Int) -> Bool =
     code >= 0 && code <= charMax
     && !(code >= surrogateMin && code <= surrogateMax)
 
-fun tArray() -> Type = TCon("Data.Array#Array", KFun(KStar, KStar), noScope)
-fun tRawArray() -> Type = TCon("Prim.Array", KFun(KStar, KStar), noScope)
+fun tArray() -> Type = tcon("Data.Array#Array", KFun(KStar, KStar), noScope)
+fun tRawArray() -> Type = tcon("Prim.Array", KFun(KStar, KStar), noScope)
 
 fun arrayOf(element : Type) -> Type = TApp(tArray(), element, KStar)
 fun rawArrayOf(element : Type) -> Type = TApp(tRawArray(), element, KStar)
@@ -347,7 +363,7 @@ fun rawArrayOf(element : Type) -> Type = TApp(tRawArray(), element, KStar)
 -- and a family classifies values, so it is `*`.
 fun kindOf(t : Type) -> Kind = match prune(t) {
     TVar(cell) -> cell.kind
-    TCon(_, k, _) -> k
+    TCon(c) -> c.kind
     TApp(_, _, k) -> k
     TFam(_, _, k) -> k
     _ -> KStar
@@ -406,7 +422,7 @@ fun spine(t : Type) -> (Type, Array Type) {
 fun headCon(t : Type) -> Option String {
     let (head, _) = spine(t)
     match head {
-        TCon(name, _, _) -> Some(name)
+        TCon(c) -> Some(c.name)
         _ -> None
     }
 }
@@ -484,7 +500,7 @@ fun floatLiteralSet() -> Array String {
 }
 
 -- Every tower member is a nullary constructor, so its type is a `TCon`.
-fun numericType(name : String) -> Type = TCon(name, KStar, noScope)
+fun numericType(name : String) -> Type = tcon(name, KStar, noScope)
 
 fun sortNumeric(names : Array String) -> Array String {
     let order = numericOrder()
@@ -656,7 +672,7 @@ fun occursAndAdjust(slot : VarCell, t : Type) -> Bool = match prune(t) {
 -- younger than the variable it would bind is out of scope. Run before
 -- `occursAndAdjust`, which lowers levels and would erase the evidence.
 fun escaping(slot : VarCell, t : Type) -> Option String = match prune(t) {
-    TCon(name, _, level) -> if level > slot.level { Some(name) } else { None }
+    TCon(c) -> if c.level > slot.level { Some(c.name) } else { None }
     TApp(fn, arg, _) -> firstOf(escaping(slot, fn), escaping(slot, arg))
     TFam(_, arg, _) -> escaping(slot, arg)
     TFun(params, ret) -> {
@@ -740,8 +756,10 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
     match (x, y) {
         -- Levels distinguish two skolems that happen to share a name: a nested
         -- signature may write `a` too, and those two are not the same type.
-        (TCon(n1, _, l1), TCon(n2, _, l2)) ->
-            if n1 != n2 || l1 != l2 { mismatch(x, y, where, context) }
+        (TCon(c1), TCon(c2)) ->
+            if c1.name != c2.name || c1.level != c2.level {
+                mismatch(x, y, where, context)
+            }
         -- Decomposing an application is sound only because there are no
         -- type-level lambdas: every head is rigid, or a variable that will be
         -- bound to a rigid head, so `f a ~ g b` cannot be satisfied any way but
@@ -931,11 +949,11 @@ fun typeKeyInto(b : String.Builder, t : Type) -> Unit = match prune(t) {
         String.push(b, "v")
         String.push(b, Int.toString(cell.id))
     }
-    TCon(name, _, level) -> {
+    TCon(c) -> {
         String.push(b, "c")
-        String.push(b, name)
+        String.push(b, c.name)
         String.push(b, "@")
-        String.push(b, Int.toString(level))
+        String.push(b, Int.toString(c.level))
     }
     TApp(fn, arg, _) -> {
         String.push(b, "(a ")
@@ -1107,7 +1125,7 @@ fun showAt(t : Type, n : Namer, prec : Int) -> String = match prune(t) {
                   + showAt(ret, n, 0)
         if prec > 0 { "(" + out + ")" } else { out }
     }
-    TCon(name, _, _) -> display(name)
+    TCon(c) -> display(c.name)
     TFam(name, arg, _) -> {
         let out = shortName(name) + " " + showAt(arg, n, 2)
         if prec > 1 { "(" + out + ")" } else { out }

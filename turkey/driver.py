@@ -30,7 +30,7 @@ from .builtins import initial_type_env
 from .classes import ClassTable
 from .constraints import Env, Solver
 from .decls import DeclTable
-from .deps import pattern_vars
+from .deps import free_names, pattern_vars, sccs
 from .errors import short
 from .evidence import Elaborator
 from .infer import Generator
@@ -38,7 +38,7 @@ from .modules import ENTRY, SEP, Module, ModuleLoader
 from .resolve import Resolver
 from .core import CProgram
 from .typed import TypeTable
-from .types import Scheme, show_kind, show_scheme
+from .types import Scheme, show, show_kind, show_pred, show_scheme
 
 
 @dataclass
@@ -187,6 +187,108 @@ def show_declarations(decls: DeclTable) -> str:
                       else " {" + ", ".join(con.field_names) + "}")
             out.append(f"  con {con.name}/{con.arity}{fields} : "
                        f"{show_scheme(con.scheme)}\n")
+    return "".join(out)
+
+
+def binding_groups(module: Module) -> list[tuple[list[str], list[str]]]:
+    """One module's top-level binding groups, in the order they are checked.
+
+    The graph is keyed by *item*, not by bound name: a single binding may
+    introduce several names (`let (a, b) = ...`), and keying by name would split
+    one item across two components and infer -- and evaluate -- its right-hand
+    side twice. `turkey/infer.py` builds exactly this and then hangs a
+    constraint on it; this is the same computation with nothing hung on it, so
+    that the ordering can be diffed on its own.
+    """
+    items = [d for d in module.program.decls if isinstance(d, ast.Stmt)]
+    keys = {id(item): f"item{i}" for i, item in enumerate(items)}
+    names_of = {keys[id(item)]: _names_of(item) for item in items}
+    owner: dict[str, str] = {}
+    for item in items:
+        for name in names_of[keys[id(item)]]:
+            owner.setdefault(name, keys[id(item)])
+    graph = {
+        keys[id(item)]: {owner[n] for n in _deps_of(item) if n in owner}
+        for item in items
+    }
+    return [(component, sorted(n for key in component for n in names_of[key]))
+            for component in sccs(graph)]
+
+
+def _names_of(item: ast.Stmt) -> list[str]:
+    if isinstance(item, ast.SFun):
+        return [item.decl.name]
+    return sorted(pattern_vars(item.pat))
+
+
+def _deps_of(item: ast.Stmt) -> set[str]:
+    if isinstance(item, ast.SFun):
+        return free_names(item.decl.body, frozenset(
+            n for p in item.decl.params for n in pattern_vars(p)))
+    return free_names(item.value)
+
+
+def show_binding_groups(modules: list[Module]) -> str:
+    out: list[str] = []
+    for module in modules:
+        out.append(f"module {module.name}\n")
+        for component, bound in binding_groups(module):
+            out.append(f"  group {' '.join(component)} : {', '.join(bound)}\n")
+    return "".join(out)
+
+
+def registered(src: str, file: str | None = None,
+               search: list[Path] | None = None) -> tuple[DeclTable, ClassTable]:
+    """The declaration and class tables, and nothing after them.
+
+    Everything `check` does before it generates a single constraint: types,
+    constructors, classes, their methods' schemes, their families, and the
+    instance table. One pair of tables for the whole program, in the order
+    `check` builds them.
+    """
+    decls = DeclTable()
+    classes = ClassTable(decls)
+    for module in desugared(src, file, search):
+        decls.register_all([d for d in module.program.decls
+                            if isinstance(d, ast.TypeDecl)])
+        classes.register_all(
+            [d for d in module.program.decls if isinstance(d, ast.ClassDecl)],
+            [d for d in module.program.decls if isinstance(d, ast.InstanceDecl)],
+            module.name)
+    return decls, classes
+
+
+def show_classes(decls: DeclTable, classes: ClassTable) -> str:
+    """The class table, in registration order.
+
+    Each class names the variable it abstracts over `a`, and its superclasses,
+    families and methods are printed against that one naming -- so the `a` in
+    `[Semigroup a]` and the `a` in `fun(a, a) -> a` are visibly the same
+    variable. An instance does the same over its head's variables.
+    """
+    out: list[str] = []
+    for name, info in classes.classes.items():
+        names = {info.var.id: "a"}
+        out.append(f"class {name} {info.param} :: {show_kind(info.kind)}\n")
+        for sup in info.supers:
+            out.append(f"  super {show_pred(sup, names, free_prefix='')}\n")
+        for fam in info.families:
+            fi = decls.families[fam]
+            out.append(f"  family {fam} :: {show_kind(fi.arg_kind)} -> "
+                       f"{show_kind(fi.res_kind)}\n")
+        for mname, m in info.methods.items():
+            out.append(f"  method {mname} : {show_scheme(m.scheme)}\n")
+    for cls, insts in classes.instances.items():
+        for inst in insts:
+            names: dict[int, str] = {}
+            out.append(f"instance {cls} "
+                       f"{show(inst.head, names, free_prefix='')} "
+                       f"[{inst.module}]\n")
+            for p in inst.context:
+                out.append(f"  context {show_pred(p, names, free_prefix='')}\n")
+            for fam, body in inst.families.items():
+                out.append(f"  type {fam} = "
+                           f"{show(body, names, free_prefix='')}\n")
     return "".join(out)
 
 

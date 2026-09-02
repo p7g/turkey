@@ -336,6 +336,28 @@ def test_a_lambda_in_a_record_field_is_a_context_of_its_own():
     assert not _holds_a_question(program)
 
 
+def test_a_do_block_that_is_the_whole_function_body_is_still_lowered():
+    """`walk` *replaces* a `do` rather than rewriting it in place, so whoever
+    called it has to take the answer. `context` did not, which left the `?` in
+    the tree -- and the first stage to look at it fell over on a node no pass
+    downstream has ever had to know about."""
+    assert lower("fun f(o) = do { let x = o?; Some(x) }") == \
+        "bind(o, fun(%k1) { let x = %k1; Some(x) })"
+    program = parse("fun f(o) = do { let x = o?; Some(x) }")
+    desugar.program(program)
+    assert not _holds_a_question(program)
+
+
+def test_a_do_block_as_a_branch_of_an_unlifted_if_is_still_lowered():
+    """The same replacement, in the other place that discarded it: an `if`
+    with no `?` of its own still walks its branches, and a branch may be the
+    `do` that has one."""
+    program = parse("fun f(c, o) { if c { do { let x = o?; Some(x) } } else "
+                    "{ do { let y = o?; Some(y) } } }")
+    desugar.program(program)
+    assert not _holds_a_question(program)
+
+
 def _holds_a_question(node: object) -> bool:
     if isinstance(node, ast.EQuestion):
         return True

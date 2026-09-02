@@ -5,6 +5,8 @@ module Data.Char (
     isAscii,
     isDigit,
     isAsciiAlpha,
+    isAsciiUpper,
+    isAsciiLower,
     isAsciiAlphanumeric,
     isSpace,
     maxValue,
@@ -54,10 +56,17 @@ fun isDigit(c : Char) -> Bool {
     code >= 48 && code <= 57
 }
 
-fun isAsciiAlpha(c : Char) -> Bool {
+fun isAsciiUpper(c : Char) -> Bool {
     let code = toInt(c)
-    (code >= 65 && code <= 90) || (code >= 97 && code <= 122)
+    code >= 65 && code <= 90
 }
+
+fun isAsciiLower(c : Char) -> Bool {
+    let code = toInt(c)
+    code >= 97 && code <= 122
+}
+
+fun isAsciiAlpha(c : Char) -> Bool = isAsciiUpper(c) || isAsciiLower(c)
 
 fun isAsciiAlphanumeric(c : Char) -> Bool = isAsciiAlpha(c) || isDigit(c)
 

@@ -299,7 +299,7 @@ fun expr(o : Out, e : Expr) -> Unit = match e.kind {
         exprList(o, args)
         outdent(o)
     }
-    EIndex(arr, index) -> {
+    EIndex(arr, index, _, _) -> {
         head(o, "eindex", e.span, [])
         indent(o)
         expr(o, arr)

@@ -53,6 +53,51 @@ over a few hundred AST nodes overflowed. The generated program now runs on a
 thread with a 512 MiB stack. CPython's default is a fact about the host, not
 about the language, and the C backend's answer is the same shape.
 
+### 18. The inliner captured a caller's variable in a callee's parameter
+**bug, fixed.** M21. `opt._apply_names` substitutes a *value* argument into the
+body and let-binds the rest. It checked the substitution against the binders of
+the callee's body -- but not against the `let`s it was itself about to wrap
+around that body. So
+
+```
+fun internal(owner : String, name : String) -> String = owner + "#" + name
+...
+internal(name, c.name)          -- a caller's local spelled like a parameter
+```
+
+inlined to `let name = c.name in name + "#" + name`: the argument substituted
+for `owner` was captured by the binding made for `name`, and the call answered
+`Eq#Eq` where it meant `Std.Classes#Eq`. A parameter that becomes a `let` now
+disqualifies substituting any argument mentioning it, and disqualifying one
+makes it a `let` in turn, so the decision is a fixpoint rather than one pass.
+
+Nothing in the suite could have caught it: it needs a caller's local and a
+callee's parameter to share a spelling, and the argument for the *other*
+parameter to be a value. `Turkey.Modules` is the first code to have written
+that, and it did so twice.
+
+### 19. A `do` block as an entire function body was never lowered
+**bug, fixed.** M21. `Desugarer.walk` *replaces* a `do` node rather than
+rewriting it in place, so its answer has to be taken. Two callers dropped it:
+`context`, which then returned the untouched `do`, and `_if`'s unlifted case.
+`fun f(o) = do { let x = o?; Some(x) }` therefore kept its `?` all the way to
+`deps.free_names`, which crashed with an internal assertion rather than a
+diagnostic. Found by reading the pass closely enough to port it, which is a
+different kind of reading from using it.
+
+### 20. `Data.Char` had no `isAsciiUpper` / `isAsciiLower`
+**library, fixed.** M21. `Turkey.Lexer` had already written the first inline to
+tell a `CONID` from an `IDENT`; `Turkey.Modules` needed the second to tell a
+value export from a type export. Both now sit in `Data.Char`, and
+`isAsciiAlpha` is their disjunction. The Python asks `str.islower()`, which is
+Unicode-wide -- the same deliberate ASCII narrowing the lexer already carries.
+
+### 21. `System.IO` could not ask whether a file exists
+**library, fixed.** M21. A module search path has to try several candidates and
+read only the one that is there, and `readFile` answering `None` conflates "no
+such file" with "not UTF-8". `System.IO.canRead` is the predicate; the
+primitive behind it was already there for `readFile` to use.
+
 ---
 
 ## Open, and accepted
@@ -139,6 +184,25 @@ this is the single most likely source of a late bug.
 anything a machine will read back -- which is why both canonical dumps have
 their own quoting rather than using `show`. The `Display`/`Debug` split the
 class hierarchy does not have.
+
+### 22. An assignment cannot be a `match` arm's body
+**ergonomics.** M21. An arm's body is an expression and an assignment is a
+statement, so every arm of `Turkey.Resolve` that rewrites a node in place --
+which is most of them, that being what the pass does -- is written
+`PVar(name) -> { p.kind = ... }`. The braces carry no meaning; they say
+"statement goes here". Related to entry 8, and the same shape: the block is
+doing the work a statement position would.
+
+### 23. `module` is a reserved word, so it cannot name a parameter
+**design.** M21, and the same cost entry 7 records for `hiding`. `internal(module,
+name)` is the natural spelling of "qualify this name by that module" and is a
+parse error; the parameter is `owner`. Reserving a word takes it from every
+binder in every program, not just from the production that wanted it.
+
+### 24. `Data.Set` is not one of the modules the Prelude re-exports
+**library.** M21. `Array`, `Map`, `Option` and eight others arrive
+automatically; `Set` needs an import, for no reason a reader could guess. Either
+it belongs in the list or the list needs a stated rule for what is in it.
 
 ---
 

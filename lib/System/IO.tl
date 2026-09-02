@@ -1,4 +1,4 @@
-module System.IO (readFile, writeFile, stderr)
+module System.IO (readFile, writeFile, canRead, stderr)
 
 -- Files, addressed as bytes.
 --
@@ -21,6 +21,11 @@ fun readFile(path : String) -> Option String {
         None
     }
 }
+
+-- Is there a file here this program may read? A search path needs to ask
+-- before it reads, since the answer decides *which* file to read and the
+-- reading is what costs.
+fun canRead(path : String) -> Bool = Prim.fileCanRead(path)
 
 fun writeFile(path : String, contents : String) -> Bool =
     Prim.writeFileBytes(path, String.toBytes(contents))

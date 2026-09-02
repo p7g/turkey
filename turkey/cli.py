@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from . import llvmgen, pygen
-from .driver import check, report_warnings, run
+from .driver import check, desugared, report_warnings, run
 from .errors import TurkeyError, TurkeyPanic
 from .astdump import dump as dump_ast
 from .core import show_program
@@ -24,6 +24,7 @@ def main(argv: list[str] | None = None) -> int:
         ("types", "print the inferred type of each top-level binding"),
         ("tokens", "dump the token stream"),
         ("ast", "dump the parse tree"),
+        ("desugar", "dump every module's tree, resolved and desugared"),
         ("core", "dump the typed Core the elaboration produces"),
         ("mono", "dump that Core with its polymorphism specialized away"),
         ("opt", "dump that Core with the optimizations applied"),
@@ -57,6 +58,15 @@ def main(argv: list[str] | None = None) -> int:
                 print(token.canonical())
         elif args.command == "ast":
             print(dump_ast(parse(src)), end="")
+        elif args.command == "desugar":
+            # Every module, not just the entry one: what resolution and
+            # desugaring do to a module depends on what it imported, so a dump
+            # of the entry alone would check the interesting half of the stage
+            # against nothing.
+            for module in desugared(src, args.file,
+                                    [Path(args.file).resolve().parent]):
+                print(f"module {module.name}")
+                print(dump_ast(module.program), end="")
         elif args.command == "core":
             checked = check(src, args.file, [Path(args.file).resolve().parent])
             report_warnings(checked.warnings, args.file)

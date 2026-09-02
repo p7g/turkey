@@ -46,6 +46,7 @@ class _Emitter:
         self.module.data_layout = str(self.machine.target_data)
         self.functions: dict[str, ir.Function] = {}
         self.runtime: dict[str, ir.Function] = {}
+        self.closure_thunks: dict[str, ir.Function] = {}
         self.string_count = 0
         self._declare_runtime()
 
@@ -74,6 +75,10 @@ class _Emitter:
         self._runtime("turkey_array_length", _I64, [_PTR])
         self._runtime("turkey_array_get", _I64, [_PTR, _I64])
         self._runtime("turkey_array_set", ir.VoidType(), [_PTR, _I64, _I64])
+        self._runtime("turkey_closure_new", _PTR, [_I64, _I64, _I64])
+        self._runtime("turkey_closure_code", _I64, [_PTR])
+        self._runtime("turkey_closure_environment", _PTR, [_PTR])
+        self._runtime("turkey_closure_capture", ir.VoidType(), [_PTR, _I64, _I64])
         self._runtime("turkey_panic", ir.VoidType(), [_PTR])
         self._runtime("turkey_panicked", _I32, [])
 
@@ -212,6 +217,36 @@ class _Emitter:
             builder.call(self.runtime["turkey_array_set"],
                          [args[0], index, self._to_i64(builder, value)])
             return None, builder
+        if op == "closure_new":
+            code = builder.ptrtoint(self.functions[instruction.args[0]], _I64)
+            return builder.call(self.runtime["turkey_closure_new"], [
+                code, ir.Constant(_I64, int(instruction.args[1])),
+                ir.Constant(_I64, int(instruction.args[2])),
+            ]), builder
+        if op == "function_closure":
+            thunk = self._closure_thunk(instruction.args[0])
+            code = builder.ptrtoint(thunk, _I64)
+            return builder.call(self.runtime["turkey_closure_new"], [
+                code, ir.Constant(_I64, 0), ir.Constant(_I64, 0),
+            ]), builder
+        if op == "closure_capture":
+            builder.call(self.runtime["turkey_closure_capture"], [
+                args[0], ir.Constant(_I64, int(instruction.args[1])),
+                self._to_i64(builder, args[1]),
+            ])
+            return None, builder
+        if op == "closure_call":
+            closure = args[0]
+            code = builder.call(self.runtime["turkey_closure_code"], [closure])
+            environment = builder.call(
+                self.runtime["turkey_closure_environment"], [closure])
+            signature = ir.FunctionType(
+                _llvm_type(instruction.result.layout),
+                [_PTR, *(arg.type for arg in args[1:])],
+            ).as_pointer()
+            callee = builder.inttoptr(code, signature)
+            return builder.call(callee, [environment, *args[1:]],
+                                name=instruction.result.name), builder
         if op in ("scalar_eq", "float_eq"):
             return (builder.fcmp_ordered("==", args[0], args[1]) if op == "float_eq"
                     else builder.icmp_unsigned("==", args[0], args[1])), builder
@@ -219,6 +254,23 @@ class _Emitter:
             value = builder.call(self.runtime["turkey_string_eq"], args)
             return builder.icmp_unsigned("!=", value, ir.Constant(_I32, 0)), builder
         raise Unsupported(f"no LLVM emission rule for {op}")
+
+    def _closure_thunk(self, symbol: str) -> ir.Function:
+        found = self.closure_thunks.get(symbol)
+        if found is not None:
+            return found
+        target = self.functions[symbol]
+        original = target.function_type
+        thunk = ir.Function(
+            self.module,
+            ir.FunctionType(original.return_type, [_PTR, *original.args]),
+            name=symbol + "_closure",
+        )
+        builder = ir.IRBuilder(thunk.append_basic_block("entry"))
+        result = builder.call(target, list(thunk.args[1:]))
+        builder.ret(result)
+        self.closure_thunks[symbol] = thunk
+        return thunk
 
     def _primitive(self, function: ir.Function, builder: ir.IRBuilder, name: str,
                    args: list[ir.Value], layout: bir.Layout) -> tuple[ir.Value, ir.IRBuilder]:
@@ -417,6 +469,8 @@ _RUNTIME_SYMBOLS = (
     "turkey_object_new", "turkey_object_tag", "turkey_object_get",
     "turkey_object_set", "turkey_array_new", "turkey_array_length",
     "turkey_array_get", "turkey_array_set",
+    "turkey_closure_new", "turkey_closure_code",
+    "turkey_closure_environment", "turkey_closure_capture",
 )
 _runtime_library: ctypes.CDLL | None = None
 

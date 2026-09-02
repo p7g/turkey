@@ -32,6 +32,11 @@ void *turkey_array_new(int64_t length, uint64_t initial, int32_t pointer_element
 int64_t turkey_array_length(void *array);
 uint64_t turkey_array_get(void *array, int64_t index);
 void turkey_array_set(void *array, int64_t index, uint64_t value);
+void *turkey_closure_new(uint64_t code, int64_t capture_count,
+                         uint64_t pointer_bitmap);
+uint64_t turkey_closure_code(void *closure);
+void *turkey_closure_environment(void *closure);
+void turkey_closure_capture(void *closure, int64_t index, uint64_t value);
 
 void turkey_panic(const char *message);
 int32_t turkey_panicked(void);

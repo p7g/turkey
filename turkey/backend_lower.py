@@ -48,6 +48,16 @@ def layout_of(ty: Type) -> bir.Layout:
     return bir.Layout.PTR
 
 
+def _expr_layout(expr: CExpr) -> bir.Layout:
+    if isinstance(expr, CLit):
+        return {
+            "Int": bir.Layout.I64, "Byte": bir.Layout.I8,
+            "Char": bir.Layout.I32, "Float": bir.Layout.F64,
+            "String": bir.Layout.PTR,
+        }.get(expr.kind, layout_of(expr.ty))
+    return layout_of(expr.ty)
+
+
 def mangle(name: str) -> str:
     pieces = []
     for byte in name.encode("utf-8"):
@@ -64,21 +74,40 @@ class _Destination:
 class _FunctionLowerer:
     def __init__(self, bind: CBind, lam: CLam,
                  functions: dict[str, tuple[str, TFun]], decls,
-                 tags: dict[str, int], record_fields: dict[str, list[str]]) -> None:
+                 tags: dict[str, int], record_fields: dict[str, list[str]],
+                 lifted: list[bir.Function], lift_counter: list[int],
+                 captures: list[tuple[str, bir.Layout]] | None = None,
+                 output_name: str | None = None) -> None:
         self.bind = bind
         self.lam = lam
         self.functions = functions
         self.decls = decls
         self.tags = tags
         self.record_fields = record_fields
+        self.lifted = lifted
+        self.lift_counter = lift_counter
+        self.captures = captures or []
+        self.output_name = output_name or mangle(bind.name)
         self.count = 0
         self.blocks: list[bir.Block] = []
         self.slots: list[bir.Value] = []
         self.slot_names: set[str] = set()
         self.entry = self.new_block("entry")
-        self.params = [bir.Value(self.fresh(p.name), layout_of(p.ty)) for p in lam.params]
+        self.params = ([bir.Value(self.fresh("environment"), bir.Layout.PTR)]
+                       if self.captures else [])
+        self.params += [bir.Value(self.fresh(p.name), layout_of(p.ty)) for p in lam.params]
         self.env: dict[str, bir.Value] = {}
-        for core_param, param in zip(lam.params, self.params):
+        if self.captures:
+            environment = self.params[0]
+            for index, (name, layout) in enumerate(self.captures):
+                slot = self.new_slot(name, layout)
+                loaded = self.emit(self.entry, "object_get",
+                                   (environment, str(index)), layout)
+                self.entry.instructions.append(
+                    bir.Instruction("slot_store", (slot.name, loaded)))
+                self.env[name] = slot
+        visible_params = self.params[1:] if self.captures else self.params
+        for core_param, param in zip(lam.params, visible_params):
             slot = self.new_slot(core_param.name, param.layout)
             self.entry.instructions.append(bir.Instruction("slot_store", (slot.name, param)))
             self.env[core_param.name] = slot
@@ -113,9 +142,23 @@ class _FunctionLowerer:
         self.lower(self.lam.body, dict(self.env), {}, self.entry, _Destination(None))
         function_type = prune(self.bind.ty)
         assert isinstance(function_type, TFun)
+        by_name = {block.name: block for block in self.blocks}
+        reachable: set[str] = set()
+        pending = [self.entry.name]
+        while pending:
+            name = pending.pop()
+            if name in reachable:
+                continue
+            reachable.add(name)
+            term = by_name[name].terminator
+            if isinstance(term, bir.Jump):
+                pending.append(term.target)
+            elif isinstance(term, bir.Branch):
+                pending.extend((term.yes, term.no))
         return bir.Function(
-            mangle(self.bind.name), self.params, layout_of(function_type.ret),
-            self.blocks, self.entry.name, self.slots,
+            self.output_name, self.params, layout_of(function_type.ret),
+            [block for block in self.blocks if block.name in reachable],
+            self.entry.name, self.slots,
         )
 
     def transfer(self, block: bir.Block, dest: _Destination,
@@ -130,8 +173,9 @@ class _FunctionLowerer:
               block: bir.Block, dest: _Destination) -> None:
         assert expr is not None
         if isinstance(expr, CLet):
-            after = self.new_block("let", layout_of(expr.value.ty))
-            slot = self.new_slot(expr.name, layout_of(expr.bound))
+            value_layout = _expr_layout(expr.value)
+            after = self.new_block("let", value_layout)
+            slot = self.new_slot(expr.name, value_layout)
             after.instructions.append(
                 bir.Instruction("slot_store", (slot.name, after.params[0])))
             inner = dict(env)
@@ -201,8 +245,39 @@ class _FunctionLowerer:
                 at.terminator = bir.Jump(target.name, tuple(values))
             self.lower_values(expr.args, env, joins, block, jump)
             return
-        if isinstance(expr, (CLetRec,)):
-            raise Unsupported("LLVM backend does not yet support local recursive closures", expr.span)
+        if isinstance(expr, CLetRec):
+            inner = dict(env)
+            closure_slots: list[bir.Value] = []
+            lambdas: list[tuple[CBind, CLam, str, list[tuple[str, bir.Value]]]] = []
+            for bind in expr.binds:
+                value = _erase_types(bind.value)
+                if not isinstance(value, CLam):
+                    raise Unsupported("LLVM recursive non-function binding", bind.span)
+                slot = self.new_slot(bind.name, bir.Layout.PTR)
+                inner[bind.name] = slot
+                closure_slots.append(slot)
+            # Every shell has an address before recursive captures are read.
+            for bind, slot in zip(expr.binds, closure_slots):
+                value = _erase_types(bind.value)
+                assert isinstance(value, CLam)
+                symbol, captures = self.lift(value, inner)
+                bitmap = sum(1 << i for i, (_, captured) in enumerate(captures)
+                             if _pointer_layout(captured.layout))
+                closure = self.emit(block, "closure_new",
+                                    (symbol, str(len(captures)), str(bitmap)),
+                                    bir.Layout.PTR)
+                block.instructions.append(
+                    bir.Instruction("slot_store", (slot.name, closure)))
+                lambdas.append((bind, value, symbol, captures))
+            for closure_slot, (_, _, _, captures) in zip(closure_slots, lambdas):
+                closure = self.emit(block, "slot_load", (closure_slot.name,),
+                                    bir.Layout.PTR)
+                for index, (_, captured) in enumerate(captures):
+                    value = self.emit(block, "slot_load", (captured.name,), captured.layout)
+                    block.instructions.append(bir.Instruction(
+                        "closure_capture", (closure, str(index), value)))
+            self.lower(expr.body, inner, joins, block, dest)
+            return
 
         self.lower_value(expr, env, joins, block,
                          lambda at, value: self.transfer(at, dest, value))
@@ -220,8 +295,8 @@ class _FunctionLowerer:
                 return
             expr = exprs[index]
             assert expr is not None
-            after = self.new_block("operand", layout_of(expr.ty))
-            slot = self.new_slot("operand", layout_of(expr.ty))
+            after = self.new_block("operand", _expr_layout(expr))
+            slot = self.new_slot("operand", _expr_layout(expr))
             slots.append(slot)
             after.instructions.append(
                 bir.Instruction("slot_store", (slot.name, after.params[0])))
@@ -234,7 +309,7 @@ class _FunctionLowerer:
                     joins: dict[str, tuple[bir.Block, list[bir.Value]]],
                     block: bir.Block, done) -> None:
         if isinstance(expr, CLit):
-            layout = layout_of(expr.ty)
+            layout = _expr_layout(expr)
             if expr.kind == "Int" and not (-(1 << 63) <= int(expr.value) < (1 << 63)):
                 raise Unsupported("Int literal is outside the signed 64-bit range", expr.span)
             if expr.kind == "Char":
@@ -253,6 +328,11 @@ class _FunctionLowerer:
             return
         if isinstance(expr, CVar):
             if expr.name not in env:
+                if expr.name in self.functions:
+                    done(block, self.emit(block, "function_closure",
+                                          (self.functions[expr.name][0],),
+                                          bir.Layout.PTR))
+                    return
                 raise Unsupported(f"LLVM backend cannot use top-level value '{expr.name}'", expr.span)
             slot = env[expr.name]
             done(block, self.emit(block, "slot_load", (slot.name,), slot.layout))
@@ -393,11 +473,25 @@ class _FunctionLowerer:
                     done(at, made)
                 self.lower_values(expr.args, env, joins, block, construct)
                 return
-            raise Unsupported("LLVM closure calls are not implemented", expr.span)
+            self.lower_values([expr.fn, *expr.args], env, joins, block,
+                              lambda at, xs: done(at, self.emit(
+                                  at, "closure_call", tuple(xs),
+                                  layout_of(expr.ty))))
+            return
         if isinstance(expr, CPrim):
             raise Unsupported("LLVM primitive values must be called directly", expr.span)
         if isinstance(expr, CLam):
-            raise Unsupported("LLVM closures are not implemented", expr.span)
+            symbol, captures = self.lift(expr, env)
+            bitmap = sum(1 << i for i, (_, captured) in enumerate(captures)
+                         if _pointer_layout(captured.layout))
+            closure = self.emit(block, "closure_new",
+                                (symbol, str(len(captures)), str(bitmap)), bir.Layout.PTR)
+            for index, (_, captured) in enumerate(captures):
+                value = self.emit(block, "slot_load", (captured.name,), captured.layout)
+                block.instructions.append(bir.Instruction(
+                    "closure_capture", (closure, str(index), value)))
+            done(block, closure)
+            return
         # Control-shaped operands re-enter the general continuation lowering.
         if isinstance(expr, (CLet, CIf, CJoin, CJump, CLetRec)):
             after = self.new_block("value", layout_of(expr.ty))
@@ -405,6 +499,22 @@ class _FunctionLowerer:
             self.lower(expr, env, joins, block, _Destination(after))
             return
         raise Unsupported(f"LLVM backend does not support {type(expr).__name__}", expr.span)
+
+    def lift(self, lam: CLam, env: dict[str, bir.Value]) -> tuple[
+            str, list[tuple[str, bir.Value]]]:
+        captures = list(env.items())
+        number = self.lift_counter[0]
+        self.lift_counter[0] += 1
+        symbol = f"{self.output_name}_lambda_{number}"
+        bind = CBind(symbol, lam.ty, [], lam, lam.span)
+        child = _FunctionLowerer(
+            bind, lam, self.functions, self.decls, self.tags,
+            self.record_fields, self.lifted, self.lift_counter,
+            [(name, slot.layout) for name, slot in captures], symbol,
+        )
+        function = child.finish()
+        self.lifted.append(function)
+        return symbol, captures
 
     def field_index(self, ty: Type, name: str) -> int:
         head, _ = spine(ty)
@@ -539,9 +649,23 @@ def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
         if isinstance(value, CLam) and isinstance(ty, TFun):
             functions[bind.name] = (mangle(bind.name), ty)
             candidates.append((bind, value))
+    # Specialization sometimes leaves a top-level function as a pure alias.
+    # Resolve those aliases to the same native symbol; they need no storage or
+    # initialization of their own.
+    changed = True
+    while changed:
+        changed = False
+        for bind in program.dicts + program.binds:
+            value = _erase_types(bind.value)
+            ty = prune(bind.ty)
+            if (bind.name not in functions and isinstance(value, CVar)
+                    and value.name in functions and isinstance(ty, TFun)):
+                functions[bind.name] = (functions[value.name][0], ty)
+                changed = True
     if main not in functions:
         raise Unsupported(f"LLVM entry '{main}' is not a function")
     by_name = {bind.name: (bind, lam) for bind, lam in candidates}
+    owner = {functions[name][0]: name for name in by_name}
     reachable: set[str] = set()
     pending = [main]
     while pending:
@@ -550,13 +674,21 @@ def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
             continue
         reachable.add(name)
         bind, _ = by_name[name]
-        pending.extend(sorted((names_of(bind.value) & by_name.keys()) - reachable))
+        for dependency in sorted(names_of(bind.value)):
+            if dependency in functions:
+                actual = owner.get(functions[dependency][0])
+                if actual is not None and actual not in reachable:
+                    pending.append(actual)
     chosen = [pair for pair in candidates if pair[0].name in reachable]
-    module = bir.Module(
-        [_FunctionLowerer(bind, lam, functions, decls, tags,
-                          record_fields).finish() for bind, lam in chosen],
-        functions[main][0],
-    )
+    lifted: list[bir.Function] = []
+    lift_counter = [0]
+    top: list[bir.Function] = []
+    for bind, lam in chosen:
+        top.append(_FunctionLowerer(
+            bind, lam, functions, decls, tags, record_fields,
+            lifted, lift_counter,
+        ).finish())
+    module = bir.Module(top + lifted, functions[main][0])
     bir.check(module)
     return module
 

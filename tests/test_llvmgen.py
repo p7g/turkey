@@ -62,6 +62,36 @@ def test_native_float_division_is_ieee(capfd):
     assert capfd.readouterr().out == "Infinity\nNaN\n-0.0\n"
 
 
+def test_native_closures_snapshot_values_and_share_cells(capfd):
+    native("""
+fun main() {
+    let fs = [] : Array (fun() -> Int)
+    var i = 0
+    while i < 3 {
+        let n = i
+        Array.push(fs, fun() -> Int = n)
+        i = i + 1
+    }
+    var total = 0
+    let bump = fun() -> Int = { total = total + 1; total }
+    print(fs[0]()); print(fs[1]()); print(fs[2]())
+    print(bump()); print(bump())
+}
+""")
+    assert capfd.readouterr().out == "0\n1\n2\n1\n2\n"
+
+
+def test_native_recursive_local_closure_uses_two_phase_environment(capfd):
+    native("""
+fun main() {
+    fun fib(n : Int) -> Int =
+        if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+    print(fib(10))
+}
+""")
+    assert capfd.readouterr().out == "55\n"
+
+
 def test_llvm_command_prints_verified_ir(tmp_path, capsys):
     program = tmp_path / "program.tl"
     program.write_text("fun main() { print(3) }", encoding="utf-8")

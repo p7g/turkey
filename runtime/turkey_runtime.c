@@ -208,3 +208,28 @@ void turkey_array_set(void *pointer, int64_t index, uint64_t value) {
     TurkeyObject *array = pointer;
     if (array_index(array, index, "write at")) array->slots[index] = value;
 }
+
+void *turkey_closure_new(uint64_t code, int64_t capture_count,
+                         uint64_t pointer_bitmap) {
+    TurkeyObject *environment = turkey_object_new(
+        4, -1, capture_count, pointer_bitmap);
+    if (environment == NULL) return NULL;
+    TurkeyObject *closure = turkey_object_new(3, -1, 2, 2);
+    if (closure == NULL) return NULL;
+    closure->slots[0] = code;
+    closure->slots[1] = (uint64_t)(uintptr_t)environment;
+    return closure;
+}
+
+uint64_t turkey_closure_code(void *pointer) {
+    return ((TurkeyObject *)pointer)->slots[0];
+}
+
+void *turkey_closure_environment(void *pointer) {
+    return (void *)(uintptr_t)((TurkeyObject *)pointer)->slots[1];
+}
+
+void turkey_closure_capture(void *pointer, int64_t index, uint64_t value) {
+    TurkeyObject *closure = pointer;
+    turkey_object_set((void *)(uintptr_t)closure->slots[1], index, value);
+}

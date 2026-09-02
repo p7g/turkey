@@ -237,6 +237,43 @@ class _Emitter:
             value, failed = builder.extract_value(pair, 0), builder.extract_value(pair, 1)
             builder = self._guard(function, builder, failed, "integer overflow in unary -")
             return value, builder
+        if name in ("intDiv", "intRem"):
+            zero = builder.icmp_signed("==", args[1], ir.Constant(_I64, 0))
+            builder = self._guard(function, builder, zero,
+                                  "division by zero" if name == "intDiv"
+                                  else "remainder by zero")
+            if name == "intDiv":
+                minimum = builder.icmp_signed("==", args[0], ir.Constant(_I64, -(1 << 63)))
+                minus_one = builder.icmp_signed("==", args[1], ir.Constant(_I64, -1))
+                builder = self._guard(function, builder, builder.and_(minimum, minus_one),
+                                      "integer overflow in /")
+                return builder.sdiv(args[0], args[1]), builder
+            # LLVM defines the overflowing quotient's remainder as zero only
+            # indirectly; avoid depending on target lowering for this pair.
+            special = builder.and_(
+                builder.icmp_signed("==", args[0], ir.Constant(_I64, -(1 << 63))),
+                builder.icmp_signed("==", args[1], ir.Constant(_I64, -1)))
+            ordinary = function.append_basic_block("remainder")
+            merged = function.append_basic_block("remainder.done")
+            special_block = function.append_basic_block("remainder.min")
+            builder.cbranch(special, special_block, ordinary)
+            special_builder = ir.IRBuilder(special_block)
+            special_builder.branch(merged)
+            ordinary_builder = ir.IRBuilder(ordinary)
+            remainder = ordinary_builder.srem(args[0], args[1])
+            ordinary_builder.branch(merged)
+            final = ir.IRBuilder(merged)
+            phi = final.phi(_I64)
+            phi.add_incoming(ir.Constant(_I64, 0), special_block)
+            phi.add_incoming(remainder, ordinary)
+            return phi, final
+        if name in ("intShl", "intShr"):
+            negative = builder.icmp_signed("<", args[1], ir.Constant(_I64, 0))
+            large = builder.icmp_signed(">", args[1], ir.Constant(_I64, 63))
+            builder = self._guard(function, builder, builder.or_(negative, large),
+                                  "shift amount is not in 0..63")
+            return (builder.shl(args[0], args[1]) if name == "intShl"
+                    else builder.ashr(args[0], args[1])), builder
         binary = {
             "intAddWrapping": builder.add, "intSubWrapping": builder.sub,
             "intMulWrapping": builder.mul, "intAnd": builder.and_, "intOr": builder.or_,
@@ -263,6 +300,41 @@ class _Emitter:
         if name == "not": return builder.xor(args[0], ir.Constant(_I1, 1)), builder
         if name == "intToFloat": return builder.sitofp(args[0], _F64), builder
         if name in ("byteToInt", "charToInt"): return builder.zext(args[0], _I64), builder
+        if name == "byteFromInt":
+            negative = builder.icmp_signed("<", args[0], ir.Constant(_I64, 0))
+            large = builder.icmp_signed(">", args[0], ir.Constant(_I64, 255))
+            builder = self._guard(function, builder, builder.or_(negative, large),
+                                  "value is not a Byte")
+            return builder.trunc(args[0], _I8), builder
+        if name == "charFromInt":
+            negative = builder.icmp_signed("<", args[0], ir.Constant(_I64, 0))
+            large = builder.icmp_signed(">", args[0], ir.Constant(_I64, 0x10ffff))
+            low = builder.icmp_signed(">=", args[0], ir.Constant(_I64, 0xd800))
+            high = builder.icmp_signed("<=", args[0], ir.Constant(_I64, 0xdfff))
+            invalid = builder.or_(builder.or_(negative, large), builder.and_(low, high))
+            builder = self._guard(function, builder, invalid,
+                                  "value is not a Unicode scalar")
+            return builder.trunc(args[0], _I32), builder
+        if name == "charIsScalar":
+            large = builder.icmp_unsigned(">", args[0], ir.Constant(_I64, 0x10ffff))
+            low = builder.icmp_unsigned(">=", args[0], ir.Constant(_I64, 0xd800))
+            high = builder.icmp_unsigned("<=", args[0], ir.Constant(_I64, 0xdfff))
+            return builder.not_(builder.or_(large, builder.and_(low, high))), builder
+        if name == "floatBits": return builder.bitcast(args[0], _I64), builder
+        if name == "floatFromBits": return builder.bitcast(args[0], _F64), builder
+        if name == "floatFitsInt":
+            ordered = builder.fcmp_ordered("ord", args[0], args[0])
+            low = builder.fcmp_ordered(">=", args[0], ir.Constant(_F64, float(-(1 << 63))))
+            high = builder.fcmp_ordered("<", args[0], ir.Constant(_F64, float(1 << 63)))
+            return builder.and_(ordered, builder.and_(low, high)), builder
+        if name == "floatTruncate":
+            ordered = builder.fcmp_ordered("ord", args[0], args[0])
+            low = builder.fcmp_ordered(">=", args[0], ir.Constant(_F64, float(-(1 << 63))))
+            high = builder.fcmp_ordered("<", args[0], ir.Constant(_F64, float(1 << 63)))
+            builder = self._guard(function, builder,
+                                  builder.not_(builder.and_(ordered, builder.and_(low, high))),
+                                  "Float is not representable as an Int")
+            return builder.fptosi(args[0], _I64), builder
         runtime = {
             "intToString": "turkey_int_to_string", "floatToString": "turkey_float_to_string",
             "charToString": "turkey_char_to_string", "stringConcat": "turkey_string_concat",

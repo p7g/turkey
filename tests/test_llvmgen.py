@@ -40,6 +40,28 @@ def test_native_checked_integer_overflow_panics():
         native("fun main() { print(9223372036854775807 + 1) }")
 
 
+def test_native_integer_division_remainder_and_shifts(capfd):
+    native("""
+fun main() {
+    print(-7 / 2)
+    print(-7 % 3)
+    print(Int.shl(1, 10))
+    print(Int.shr(-8, 1))
+}
+""")
+    assert capfd.readouterr().out == "-3\n-1\n1024\n-4\n"
+
+
+def test_native_invalid_shift_panics():
+    with pytest.raises(TurkeyPanic, match="shift amount"):
+        native("fun main() { print(Int.shl(1, 64)) }")
+
+
+def test_native_float_division_is_ieee(capfd):
+    native("fun main() { print(1.0 / 0.0); print(0.0 / 0.0); print(-0.0) }")
+    assert capfd.readouterr().out == "Infinity\nNaN\n-0.0\n"
+
+
 def test_llvm_command_prints_verified_ir(tmp_path, capsys):
     program = tmp_path / "program.tl"
     program.write_text("fun main() { print(3) }", encoding="utf-8")

@@ -107,6 +107,7 @@ main : fun() -> Unit
 | `turkey/modules.py` | The import graph, and what each module can see |
 | `turkey/resolve.py` | Rewrites a module's names so the program shares one namespace |
 | `turkey/lib/` | The library, written in the language: classes, Prelude, `Data.*` and `System.*` modules |
+| `boot/` | The bootstrap compiler, written in the language (`plan.txt` item 9) |
 
 Three things are worth knowing before reading the code, because they are where
 this language departs from a textbook implementation.
@@ -137,6 +138,23 @@ stream (SPEC-DELTAS.md 11), which is why it lives in its own pass and has its
 own tests. Bracket nesting is tracked as a stack rather than a counter: `(` and
 `{` disagree about whether a line break matters, either can contain the other,
 and only the innermost one gets to decide.
+
+## The bootstrap compiler
+
+`boot/` is a Turkey compiler written in Turkey. It is being built one stage at
+a time, and each stage is checked by diffing it against the Python
+implementation over every Turkey file in the repository -- the conformance
+programs, the standard library, and `boot/`'s own source:
+
+```
+python3 -m turkey run boot/Main.tl -- tokens FILE...
+```
+
+The lexer is done and agrees on every token of all 79 of them. `tests/test_boot.py`
+is that comparison. The token dump both sides print is deliberately *not*
+Python's `repr`: its float spelling is the one `PRIMITIVES.md` specifies and
+its escapes are the language's, so neither implementation can be right merely
+by being the host.
 
 ## Tests
 

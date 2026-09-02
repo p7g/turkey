@@ -53,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "tokens":
             for token in tokenize(src):
-                print(token)
+                print(token.canonical())
         elif args.command == "ast":
             print(parse(src))
         elif args.command == "core":

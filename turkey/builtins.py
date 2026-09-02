@@ -34,8 +34,8 @@ from .constraints import Binding, Env
 from .prelude import BOOL_FALSE, BOOL_TRUE
 from .types import (
     BOOL, BYTE, BYTE_MAX, BYTE_MIN, CHAR, FLOAT, INT, INT_MAX, INT_MIN, STRING,
-    UNIT, TFun, TVar, array_of, generalize, is_scalar_value, mono,
-    raw_array_of,
+    UNIT, TFun, TVar, array_of, float_to_string, generalize,
+    is_scalar_value, mono, raw_array_of,
 )
 from .values import (
     UNIT as UNIT_VALUE, ArrayObj, Builtin, ConValue, RecordObj, from_bool, truth,
@@ -225,36 +225,13 @@ def _float_div(a: float, b: float) -> float:
     return a / b
 
 
-def _float_to_string(x: float) -> str:
-    """The shortest decimal that round-trips, always lexable as a `Float`.
-
-    Python's `repr` already gives the shortest round-tripping digits, so the
-    only work is spelling: the specials get their own names, and a result with
-    no `.` acquires one so it re-lexes as a `Float` literal rather than an
-    `Int` one (PRIMITIVES.md 3.3).
-    """
-    if x != x:
-        return "NaN"
-    if x == math.inf:
-        return "Infinity"
-    if x == -math.inf:
-        return "-Infinity"
-    text = repr(x)
-    if "e" in text or "E" in text:
-        mantissa, _, exponent = text.partition("e")
-        if "." not in mantissa:
-            mantissa += ".0"
-        return f"{mantissa}e{exponent}"
-    if "." not in text:
-        text += ".0"
-    return text
 
 
 _FLOAT_SPECIALS = {"NaN": math.nan, "Infinity": math.inf, "-Infinity": -math.inf}
 
 
 def _float_parse(text: str) -> float:
-    """The inverse of `_float_to_string`, for the strings it can invert.
+    """The inverse of `float_to_string`, for the strings it can invert.
 
     Accepts what the language writes -- including `Infinity` and `NaN`, which
     have no literal syntax -- and rejects Python's own spellings (`inf`,
@@ -312,7 +289,7 @@ def _float_fits_int(x: float) -> bool:
 
 def _float_truncate(x: float) -> int:
     if not _float_fits_int(x):
-        raise TurkeyPanic(f"{_float_to_string(x)} is not representable as an Int")
+        raise TurkeyPanic(f"{float_to_string(x)} is not representable as an Int")
     return math.trunc(x)
 
 
@@ -593,7 +570,7 @@ _PRIM: dict[str, tuple] = {
     # is what Python's `float(int)` already does (PRIMITIVES.md 3.4).
     "Prim.intToFloat": _un("Prim.intToFloat", INT, FLOAT, float),
     "Prim.floatToString": _un(
-        "Prim.floatToString", FLOAT, STRING, _float_to_string),
+        "Prim.floatToString", FLOAT, STRING, float_to_string),
     "Prim.floatParse": _un("Prim.floatParse", STRING, FLOAT, _float_parse),
     "Prim.floatCanParse": _pred("Prim.floatCanParse", STRING, _float_can_parse),
     "Prim.floatTruncate": _un(

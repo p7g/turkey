@@ -13,7 +13,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .errors import LexError, Span
-from .types import is_scalar_value
+from .types import float_to_string, is_scalar_value
 
 HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 
@@ -79,6 +79,68 @@ class Token:
         if self.kind in LITERAL_KINDS or self.kind in ("IDENT", "CONID"):
             return f"{self.kind}({self.value!r})@{self.span}"
         return f"{self.kind}@{self.span}"
+
+    def canonical(self) -> str:
+        """One line, in a spelling no host is responsible for.
+
+        `__repr__` above prints Python's `repr` of the value, which is fine for
+        a Python debugger and impossible for anything else to reproduce: the
+        quote it picks depends on the contents, its escapes are Python's, and
+        its floats are `repr`'s. `turkey tokens` prints *this* instead, because
+        the bootstrap compiler has to emit the same bytes from Turkey, and a
+        format that leaks the host is not a format two implementations can
+        agree on (plan.txt item 9, M19).
+
+        The shape is `line:col KIND` with an optional payload::
+
+            12:5 IDENT parse
+            3:19 STRING "a b"
+            7:1 NEWLINE forced
+
+        A keyword or an operator is its own kind and needs no payload. A
+        `NEWLINE` carries one only when it came from a `;`, which is the one
+        thing about it not recoverable from the kind -- a run of line breaks
+        containing a `;` collapses to a single forced separator whose value is
+        the first break's.
+        """
+        return f"{self.span} {self.kind}{self._payload()}"
+
+    def _payload(self) -> str:
+        if self.kind in ("IDENT", "CONID", "INT"):
+            return f" {self.value}"
+        if self.kind == "FLOAT":
+            return f" {float_to_string(self.value)}"
+        if self.kind in ("STRING", "CHAR"):
+            return f" {quote(self.value)}"
+        if self.kind == "NEWLINE" and self.forced:
+            return " forced"
+        return ""
+
+
+# The six named escapes of design.md 2.1, and nothing else: there is no `\xNN`,
+# so a control character has exactly one spelling here.
+QUOTED = {
+    chr(92): chr(92) + chr(92),
+    chr(34): chr(92) + chr(34),
+    chr(10): chr(92) + "n",
+    chr(9): chr(92) + "t",
+    chr(13): chr(92) + "r",
+    chr(0): chr(92) + "0",
+}
+
+
+def quote(text: str) -> str:
+    """`text` as a literal the language's own lexer would read back."""
+    out = [chr(34)]
+    for ch in text:
+        if ch in QUOTED:
+            out.append(QUOTED[ch])
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(chr(92) + "u{" + format(ord(ch), "x") + "}")
+        else:
+            out.append(ch)
+    out.append(chr(34))
+    return "".join(out)
 
 
 class Lexer:

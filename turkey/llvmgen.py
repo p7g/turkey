@@ -25,6 +25,7 @@ _I32 = ir.IntType(32)
 _I64 = ir.IntType(64)
 _F64 = ir.DoubleType()
 _PTR = _I8.as_pointer()
+_ROOT_FRAME = ir.LiteralStructType([_PTR, _PTR, _I64, _PTR])
 
 
 def _llvm_type(layout: bir.Layout) -> ir.Type:
@@ -41,6 +42,19 @@ def _layout_code(layout: bir.Layout) -> int:
         bir.Layout.I32: 3, bir.Layout.I64: 4, bir.Layout.F64: 5,
         bir.Layout.PTR: 6, bir.Layout.BOXED: 7,
     }[layout]
+
+
+def _root_slots(function: bir.Function) -> tuple[dict[str, int], int]:
+    """Give each pointer value stack storage in the exact-root frame."""
+    values = function.params + function.slots
+    values += [param for block in function.blocks for param in block.params]
+    values += [instruction.result for block in function.blocks
+               for instruction in block.instructions
+               if instruction.result is not None]
+    pointers = [value for value in values
+                if value.layout in (bir.Layout.PTR, bir.Layout.BOXED)]
+    return ({value.name: index for index, value in enumerate(pointers)},
+            len(pointers))
 
 
 class _Emitter:
@@ -122,9 +136,8 @@ class _Emitter:
         self._runtime("turkey_panicked", _I32, [])
         self._runtime("turkey_frame_enter", _PTR, [_PTR, _PTR, _I64, _I64])
         self._runtime("turkey_frame_leave", ir.VoidType(), [_PTR])
-        self._runtime("turkey_root_push", _PTR, [_I64, _PTR])
-        self._runtime("turkey_root_set", ir.VoidType(), [_PTR, _I64, _PTR])
-        self._runtime("turkey_root_pop", ir.VoidType(), [_PTR])
+        self._runtime("turkey_root_enter", ir.VoidType(), [_PTR, _PTR, _I64, _PTR])
+        self._runtime("turkey_root_leave", ir.VoidType(), [_PTR])
 
     def emit(self) -> tuple[str, binding.TargetMachine]:
         for source in self.source.globals:
@@ -155,21 +168,22 @@ class _Emitter:
         entry_builder = ir.IRBuilder(blocks[source.entry])
         slots = {slot.name: entry_builder.alloca(_llvm_type(slot.layout), name=slot.name)
                  for slot in source.slots}
-        root_values = [value for value in source.params + source.slots
-                       if value.layout in (bir.Layout.PTR, bir.Layout.BOXED)]
-        root_values += [value for block in source.blocks for value in block.params
-                        if value.layout in (bir.Layout.PTR, bir.Layout.BOXED)]
-        root_values += [instruction.result for block in source.blocks
-                        for instruction in block.instructions
-                        if instruction.result is not None and instruction.result.layout
-                        in (bir.Layout.PTR, bir.Layout.BOXED)]
-        root_index = {value.name: index for index, value in enumerate(root_values)}
-        root_frame = entry_builder.call(
-            self.runtime["turkey_root_push"],
-            [ir.Constant(_I64, len(root_values)),
-             self._c_string(entry_builder, source.name, ".turkey.function")],
-            name="roots")
+        root_index, root_count = _root_slots(source)
+        root_frame = entry_builder.alloca(_ROOT_FRAME, name="root_frame")
+        root_array_type = ir.ArrayType(_PTR, max(1, root_count))
+        root_values = entry_builder.alloca(root_array_type, name="root_values")
+        for index in range(root_count):
+            pointer = entry_builder.gep(
+                root_values, [ir.Constant(_I32, 0), ir.Constant(_I32, index)])
+            entry_builder.store(ir.Constant(_PTR, None), pointer)
+        entry_builder.call(self.runtime["turkey_root_enter"], [
+            entry_builder.bitcast(root_frame, _PTR),
+            entry_builder.bitcast(root_values, _PTR),
+            ir.Constant(_I64, root_count),
+            self._c_string(entry_builder, source.name, ".turkey.function"),
+        ])
         self._root_frame = root_frame
+        self._root_values = root_values
         self._root_index = root_index
         self._slot_layouts = {slot.name: slot.layout for slot in source.slots}
         for param in source.params:
@@ -208,7 +222,8 @@ class _Emitter:
             term = block.terminator
             assert term is not None
             if isinstance(term, bir.Return):
-                builder.call(self.runtime["turkey_root_pop"], [root_frame])
+                builder.call(self.runtime["turkey_root_leave"], [
+                    builder.bitcast(root_frame, _PTR)])
                 builder.ret(self._operand(term.value, values))
             elif isinstance(term, bir.Jump):
                 builder.branch(blocks[term.target])
@@ -227,13 +242,15 @@ class _Emitter:
                 else:
                     builder.call(self.runtime["turkey_panic_string"], [
                         self._operand(term.message, values)])
-                builder.call(self.runtime["turkey_root_pop"], [root_frame])
+                builder.call(self.runtime["turkey_root_leave"], [
+                    builder.bitcast(root_frame, _PTR)])
                 builder.ret(ir.Constant(function.function_type.return_type, None))
 
     def _set_root(self, builder: ir.IRBuilder, name: str, value: ir.Value) -> None:
-        builder.call(self.runtime["turkey_root_set"], [
-            self._root_frame, ir.Constant(_I64, self._root_index[name]), value,
+        pointer = builder.gep(self._root_values, [
+            ir.Constant(_I32, 0), ir.Constant(_I32, self._root_index[name]),
         ])
+        builder.store(value, pointer)
 
     def _frame_enter(self, builder: ir.IRBuilder, frame: bir.Frame) -> ir.Value:
         file = (ir.Constant(_PTR, None) if frame.file is None else
@@ -638,7 +655,8 @@ class _Emitter:
         panic_builder = ir.IRBuilder(bad)
         if message is not None:
             self._panic(panic_builder, message)
-        panic_builder.call(self.runtime["turkey_root_pop"], [self._root_frame])
+        panic_builder.call(self.runtime["turkey_root_leave"], [
+            panic_builder.bitcast(self._root_frame, _PTR)])
         panic_builder.ret(ir.Constant(function.function_type.return_type, None))
         return ir.IRBuilder(good)
 
@@ -710,7 +728,7 @@ _RUNTIME_SYMBOLS = (
     "turkey_array_get_boxed", "turkey_array_set_boxed",
     "turkey_closure_new", "turkey_closure_code",
     "turkey_closure_environment", "turkey_closure_capture",
-    "turkey_root_push", "turkey_root_set", "turkey_root_pop",
+    "turkey_root_enter", "turkey_root_leave",
 )
 _runtime_library: ctypes.CDLL | None = None
 

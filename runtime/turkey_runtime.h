@@ -67,9 +67,9 @@ uint64_t turkey_closure_code(void *closure);
 void *turkey_closure_environment(void *closure);
 void turkey_closure_capture(void *closure, int64_t index, uint64_t value);
 
-void *turkey_root_push(int64_t count, const char *function_name);
-void turkey_root_set(void *frame, int64_t index, void *value);
-void turkey_root_pop(void *frame);
+void turkey_root_enter(void *frame, void *values, int64_t count,
+                       const char *function_name);
+void turkey_root_leave(void *frame);
 void turkey_collect(void);
 int64_t turkey_heap_objects(void);
 int64_t turkey_collection_count(void);

@@ -29,6 +29,15 @@ def test_generated_llvm_is_verified_and_contains_native_arithmetic():
     assert "turkey_int_to_string" in text
 
 
+def test_shadow_roots_use_stack_storage_and_direct_stores():
+    checked = check('fun main() { let value = Some("rooted"); print(value) }')
+    text = generate(checked.opt, checked.decls, checked.main)
+    assert "alloca [" in text
+    assert "@turkey_root_enter" in text
+    assert "@turkey_root_set" not in text
+    assert "@turkey_root_push" not in text
+
+
 def test_native_scalar_program_prints(capfd):
     native("fun main() { print(40 + 2) }")
     assert capfd.readouterr().out == "42\n"

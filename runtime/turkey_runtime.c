@@ -39,7 +39,7 @@ typedef struct RootFrame {
     struct RootFrame *previous;
     const char *function_name;
     int64_t count;
-    void *values[];
+    void **values;
 } RootFrame;
 
 enum { HEAP_STRING = 1, HEAP_OBJECT = 2, HEAP_CELL = 3 };
@@ -76,43 +76,24 @@ static int valid_object_kind(void *value, int32_t kind) {
     return 1;
 }
 
-void *turkey_root_push(int64_t count, const char *function_name) {
-    if (count < 0 || (uint64_t)count >
-            (SIZE_MAX - sizeof(RootFrame)) / sizeof(void *)) {
+void turkey_root_enter(void *pointer, void *values, int64_t count,
+                       const char *function_name) {
+    RootFrame *frame = pointer;
+    if (frame == NULL || values == NULL || count < 0) {
         turkey_panic("invalid root frame size");
-        return NULL;
+        return;
     }
-    RootFrame *frame = calloc(1, sizeof(RootFrame) + (size_t)count * sizeof(void *));
-    if (frame == NULL) { turkey_panic("out of memory"); return NULL; }
     frame->previous = roots;
     frame->function_name = function_name;
     frame->count = count;
+    frame->values = values;
     roots = frame;
-    return frame;
 }
 
-void turkey_root_set(void *pointer, int64_t index, void *value) {
-    RootFrame *frame = pointer;
-    if (frame == NULL || index < 0 || index >= frame->count) {
-        turkey_panic("invalid root slot");
-        return;
-    }
-    if (gc_stress && value != NULL && find_header(value) == NULL) {
-        char message[128];
-        snprintf(message, sizeof(message),
-                 "%s: root slot %" PRId64 " is not a heap pointer (%p)",
-                 frame->function_name, index, value);
-        turkey_panic(message);
-        return;
-    }
-    frame->values[index] = value;
-}
-
-void turkey_root_pop(void *pointer) {
+void turkey_root_leave(void *pointer) {
     RootFrame *frame = pointer;
     if (frame == NULL || roots != frame) { turkey_panic("unbalanced root frame"); return; }
     roots = frame->previous;
-    free(frame);
 }
 
 static HeapHeader *header_of(void *value) {
@@ -896,16 +877,18 @@ TurkeyString *turkey_string_concat_all(void *wrapper) {
 
 void *turkey_closure_new(uint64_t code, int64_t capture_count,
                          uint64_t pointer_bitmap) {
-    RootFrame *frame = turkey_root_push(1, "turkey_closure_new");
+    RootFrame frame;
+    void *roots[1] = {NULL};
+    turkey_root_enter(&frame, roots, 1, "turkey_closure_new");
     TurkeyObject *environment = turkey_object_new(
         4, -1, capture_count, pointer_bitmap);
-    if (environment == NULL) { turkey_root_pop(frame); return NULL; }
-    turkey_root_set(frame, 0, environment);
+    if (environment == NULL) { turkey_root_leave(&frame); return NULL; }
+    roots[0] = environment;
     TurkeyObject *closure = turkey_object_new(3, -1, 2, 2);
-    if (closure == NULL) { turkey_root_pop(frame); return NULL; }
+    if (closure == NULL) { turkey_root_leave(&frame); return NULL; }
     closure->slots[0] = code;
     closure->slots[1] = (uint64_t)(uintptr_t)environment;
-    turkey_root_pop(frame);
+    turkey_root_leave(&frame);
     return closure;
 }
 

@@ -148,12 +148,14 @@ programs, the standard library, and `boot/`'s own source:
 
 ```
 python3 -m turkey run boot/Main.tl -- tokens FILE...
+python3 -m turkey run boot/Main.tl -- ast FILE...
 ```
 
-The lexer is done and agrees on every token of all 79 of them. `tests/test_boot.py`
-is that comparison. The token dump both sides print is deliberately *not*
-Python's `repr`: its float spelling is the one `PRIMITIVES.md` specifies and
-its escapes are the language's, so neither implementation can be right merely
+The lexer and the parser are done, and agree with `turkey tokens` and
+`turkey ast` on every token and every node of all 82 of them, spans included.
+`tests/test_boot.py` is that comparison. Both dumps are deliberately *not*
+Python's `repr`: the float spelling is the one `PRIMITIVES.md` specifies and
+the escapes are the language's, so neither implementation can be right merely
 by being the host.
 
 ## Tests

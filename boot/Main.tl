@@ -3,6 +3,7 @@
 -- Run under the Python implementation for now:
 --
 --     python3 -m turkey run boot/Main.tl -- tokens FILE...
+--     python3 -m turkey run boot/Main.tl -- ast FILE...
 --
 -- and, once it emits C and compiles itself, as a native binary taking the same
 -- arguments. Element zero of `args` is the first real argument under both
@@ -26,17 +27,26 @@ import Boot.Source as Source
 import Boot.Source (Source)
 import Boot.Lexer as Lexer
 import Boot.Token as Token
+import Boot.Parser as Parser
+import Boot.AstDump as AstDump
 
 fun main() {
     let args = Env.args()
     if len(args) < 2 { usage() }
     let command = args[0]
-    if command != "tokens" { die("unknown command '" + command + "'") }
+    if command != "tokens" && command != "ast" {
+        die("unknown command '" + command + "'")
+    }
     -- One builder for every file: a `print` per token is a flush per token,
     -- and the library is a hundred thousand of them.
     let b = String.builder()
     for var i = 1; i < len(args); i = i + 1 {
-        dumpTokens(b, readOrDie(args[i]))
+        let source = readOrDie(args[i])
+        if command == "tokens" {
+            dumpTokens(b, source)
+        } else {
+            String.push(b, AstDump.dump(Parser.parse(source, Array.new(0))))
+        }
     }
     write(String.build(b))
 }
@@ -53,7 +63,7 @@ fun readOrDie(path : String) -> Source = match Source.read(path) {
     None -> die("cannot read " + path)
 }
 
-fun usage() -> a = die("usage: boot tokens FILE...")
+fun usage() -> a = die("usage: boot <tokens|ast> FILE...")
 
 fun die(message : String) -> a {
     IO.stderr("boot: " + message + "\n")

@@ -65,7 +65,7 @@ one can read against its input.
 
 from __future__ import annotations
 
-from dataclasses import fields, replace
+from dataclasses import fields as _dataclass_fields, replace
 
 from . import ast
 from .core import (
@@ -76,6 +76,26 @@ from .core import (
 from .decls import substitute
 from .deps import pattern_vars, sccs
 from .types import TBottom, Type, type_key
+
+# `dataclasses.fields` builds a fresh tuple on every call, and the six generic
+# walks below call it once per node per traversal -- fifty-five million times
+# while compiling the bootstrap compiler, which is a sixth of that compile. The
+# answer depends only on the class, so it is asked once per class.
+#
+# Found by profiling `boot`, which is the first program large enough for this
+# module's constant factors to be visible at all (`plan.txt` item 9: the scale
+# test for the new execution path).
+_FIELDS: dict[type, tuple] = {}
+
+
+def fields(node):
+    """`dataclasses.fields`, memoised by class."""
+    cls = type(node)
+    found = _FIELDS.get(cls)
+    if found is None:
+        found = _FIELDS[cls] = tuple(_dataclass_fields(cls))
+    return found
+
 
 # How large a body may be and still be inlined, counted in Core nodes. Small
 # enough that a call site does not become unreadable, large enough for the
@@ -145,6 +165,11 @@ class _Reducer:
         # breakers: this makes non-termination impossible in the code rather
         # than merely absent from the graph.
         self.active: list[str] = []
+        # `_size` and `_transfers` of each reduced body, beside the body
+        # itself: both are questions about the callee, so both are asked
+        # once per binding rather than once per call site.
+        self.sizes: dict[tuple, int] = {}
+        self.moves: dict[tuple, bool] = {}
         # A speculative large inline may reduce ordinary small calls inside
         # its residual, but does not recursively speculate about another large
         # call.  Besides bounding compile time, this makes the profitability
@@ -269,7 +294,17 @@ class _Reducer:
         # path below, whose post-application residual must become small again.
         if body is None:
             return None
-        if _transfers(body):
+        # Both questions are about the *callee's* body, which `body_of` has
+        # already computed once and shares with every call site. Asking them
+        # here, before anything is copied, is what keeps a body that can never
+        # be inlined from being copied and substituted at every site that
+        # mentions it -- which is most of the work this pass did on a program
+        # the size of the bootstrap compiler.
+        if self.transfers(key, body):
+            return None
+        size = self.size_of(key, body)
+        if size > SPECULATIVE_INLINE_LIMIT or (self.speculating
+                                               and size > INLINE_LIMIT):
             return None
         # A copied callee body becomes part of this call site.  Keep spans on
         # caller-supplied arguments, but make every node copied from the callee
@@ -278,11 +313,8 @@ class _Reducer:
         made = _apply(lam.params, e.args, body, e.ty)
         if made is None:
             return None
-        size = _size(body)
         if size <= INLINE_LIMIT:
             return made
-        if self.speculating or size > SPECULATIVE_INLINE_LIMIT:
-            return None
 
         self.speculating = True
         try:
@@ -290,6 +322,21 @@ class _Reducer:
         finally:
             self.speculating = False
         return residual if _size(residual) <= INLINE_LIMIT else None
+
+    def size_of(self, key: tuple[str, tuple], body) -> int:
+        """`_size` of a reduced body, once per binding rather than per site."""
+        found = self.sizes.get(key)
+        if found is None:
+            found = self.sizes[key] = _size(body)
+        return found
+
+    def transfers(self, key: tuple[str, tuple], body) -> bool:
+        """`_transfers` of a reduced body, once per binding rather than per
+        site. Both are answers about the callee, and the callee is shared."""
+        found = self.moves.get(key)
+        if found is None:
+            found = self.moves[key] = _transfers(body)
+        return found
 
     def body_of(self, name: str, key: tuple[str, tuple], lam: CLam):
         """A binding's reduced body, computed once.

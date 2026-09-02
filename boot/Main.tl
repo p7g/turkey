@@ -46,6 +46,7 @@ import Turkey.Infer as Infer
 import Turkey.Evidence as Evidence
 import Turkey.Core as Core
 import Turkey.Lower as Lower
+import Turkey.Coretc as Coretc
 import Turkey.Ast (Decl(..), Stmt(..), StmtKind(..), patternVars)
 
 -- Where the language's own library lives, relative to where this is run from.
@@ -252,10 +253,21 @@ fun dumpTypes(b : String.Builder, path : String) -> Unit {
 -- signatures -- a whole program's Core is mostly the Prelude's.
 fun dumpCore(b : String.Builder, path : String) -> Unit {
     let (checked, entry) = checkProgram(path)
+    String.push(b, Core.showProgram(lowered(checked), Some(entry.name)))
+}
+
+-- The lowering, and the check that makes it evidence rather than a claim.
+--
+-- The check is not optional and is not a flag. "Evidence checkable rather than
+-- trusted" (plan.txt item 5) is not true of a check nobody runs, so it runs the
+-- way exhaustiveness does: always, on every program.
+fun lowered(checked : Checked) -> Core.CProgram {
     let lowerer = Lower.newLowerer(checked.decls, checked.classes, checked.env,
                                    checked.types)
     let program = Lower.program(lowerer, checked.ordered)
-    String.push(b, Core.showProgram(program, Some(entry.name)))
+    Coretc.checkProgram(checked.decls, checked.classes, program,
+                        Coretc.globalsOf(checked.env))
+    program
 }
 
 -- What the whole front end leaves behind.

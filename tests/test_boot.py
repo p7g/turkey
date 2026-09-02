@@ -37,6 +37,7 @@ from turkey.driver import (check, declared, desugared, registered,
 from turkey.errors import short
 from turkey.lexer import tokenize
 from turkey.parser import parse
+from turkey.core import show_program
 from turkey.types import show_scheme
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -96,16 +97,22 @@ SAMPLE = _sample()
 
 
 def _boot(*args: str) -> str:
+    # Bytes, decoded here rather than by `text=True`. Universal-newline
+    # translation would rewrite a `\r` inside a *string literal* in the output
+    # as a `\n`, which is a difference the reference side never had -- and the
+    # dumps are compared line by line, so it lands as a mismatch several
+    # thousand lines from anything that is actually wrong.
     result = subprocess.run(
         [sys.executable, "-m", "turkey", "run", str(BOOT_MAIN), "--", *args],
         cwd=REPO_ROOT,
         env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)),
         capture_output=True,
-        text=True,
     )
+    out = result.stdout.decode("utf-8")
+    err = result.stderr.decode("utf-8")
     assert result.returncode == 0, (
-        f"boot exited {result.returncode}\n{result.stdout}\n{result.stderr}")
-    return result.stdout
+        f"boot exited {result.returncode}\n{out}\n{err}")
+    return out
 
 
 def _python_tokens(paths: list[Path]) -> str:
@@ -177,11 +184,17 @@ def boot_types() -> tuple[str, str]:
         cwd=REPO_ROOT,
         env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)),
         capture_output=True,
-        text=True,
     )
+    out = result.stdout.decode("utf-8")
+    err = result.stderr.decode("utf-8")
     assert result.returncode == 0, (
-        f"boot exited {result.returncode}\n{result.stdout}\n{result.stderr}")
-    return result.stdout, result.stderr
+        f"boot exited {result.returncode}\n{out}\n{err}")
+    return out, err
+
+
+@pytest.fixture(scope="module")
+def boot_core() -> str:
+    return _boot("core", *_relative(ENTRIES))
 
 
 @pytest.fixture(scope="module")
@@ -345,6 +358,31 @@ def test_the_types_corpus_exercises_the_hard_cases() -> None:
     assert "HasField" in seen, "no field demand travelled in a scheme"
     assert "~" in seen, "no family equality was carried"
     assert "fun(a) -> a" in seen, "nothing was generalized"
+
+
+def test_boot_elaborates_to_the_same_core(boot_core: str) -> None:
+    """M23: the typed Core, and the checker that makes it evidence.
+
+    Every entry program, at full breadth. What is compared is the entry
+    module's elaboration -- dictionaries as records, instances as bindings,
+    evidence as ordinary terms, polymorphism as type abstraction and
+    application, and the four loop forms and three control transfers gone,
+    replaced by join points and jumps.
+
+    The dump is only half the check. `boot core` runs `Turkey.Coretc` on what
+    it lowered, unconditionally, so a term that does not typecheck fails here
+    as an exit status rather than as a diff -- which matters because the
+    printer does not show a node's type, and a wrong one is invisible in the
+    text. That is not hypothetical: it is how the port's `get`/`set` collision
+    was found, with every golden still matching.
+    """
+    parts = []
+    for path in ENTRIES:
+        checked = check(path.read_text(encoding="utf-8"),
+                        str(path.relative_to(REPO_ROOT)), [path.parent])
+        parts.append(show_program(checked.core, checked.module))
+    expected = "".join(parts)
+    _first_difference(boot_core, expected, "core")
 
 
 def test_boot_reports_a_missing_file(tmp_path: Path) -> None:

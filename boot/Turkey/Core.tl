@@ -1,7 +1,8 @@
 module Turkey.Core (
     refName, refOf, isRef, refElem,
     Core(..), CoreKind(..), CParam(..), CAlt(..), CBind(..), CProgram(..),
-    mkCore, tailParts,
+    mkCore, tailParts, tailFieldNames,
+    Mapper(..), mapKind,
     namesOf, namesInto,
     Aliases(..), newAliases, alias,
     showExpr, showBind, showProgram,
@@ -217,6 +218,19 @@ type CProgram = CProgram {
 -- weight is a lambda's body: a closure outlives the frame that binds the join,
 -- so a label is not something it can jump to. There is no loop body to say the
 -- same of any more -- a loop *is* a join here.
+-- The same fact, by field name, for the checker: it asks "does this subterm
+-- inherit the join scope" rather than "what are the tail subterms". One
+-- statement, read two ways, because two statements is what item 5 exists to be
+-- rid of.
+fun tailFieldNames(k : CoreKind) -> Array String = match k {
+    CIf(_, _, _) -> ["then", "otherwise"]
+    CLet(_, _, _, _, _) -> ["body"]
+    CLetRec(_, _) -> ["body"]
+    CJoin(_, _, _, _, _) -> ["body", "rest"]
+    CMatch(_, _) -> ["alts"]
+    _ -> Array.new(0)
+}
+
 fun tailParts(k : CoreKind) -> Array Core = match k {
     CIf(_, then, otherwise) -> match otherwise {
         Some(o) -> [then, o]
@@ -227,6 +241,67 @@ fun tailParts(k : CoreKind) -> Array Core = match k {
     CJoin(_, _, body, rest, _) -> [body, rest]
     CMatch(_, alts) -> Array.map(alts, fun(a) = a.body)
     _ -> Array.new(0)
+}
+
+-- -- rebuilding ---------------------------------------------------------------------
+
+-- How to rebuild a node from its parts.
+--
+-- Python writes this as one reflective walk over the dataclass fields, and says
+-- why: there is exactly one rule -- rewrite the children, substitute the types
+-- -- and "writing it thirty times is thirty chances to miss a field a later node
+-- gains". With no reflection the thirty cases have to exist, so they exist
+-- *once*, here, and every pass that rebuilds a term supplies the three
+-- functions rather than its own walk. `Turkey.Ast.children` is the same
+-- decision for the surface tree, made for the same reason (FINDINGS.md 25).
+--
+-- A `CTyLam`'s and a `CLet`'s `binders` are deliberately not mapped: a binder is
+-- a variable being *bound*, not one being used, so a substitution must not reach
+-- it.
+type Mapper = Mapper {
+    expr  : fun(Core) -> Core,
+    type_ : fun(Ty.Type) -> Ty.Type,
+    bind  : fun(CBind) -> CBind,
+}
+
+fun mapKind(k : CoreKind, m : Mapper) -> CoreKind = match k {
+    CLit(_) -> k
+    CUnit -> k
+    CVar(_) -> k
+    CCon(_) -> k
+    CPrim(_) -> k
+    CTuple(elems) -> CTuple(Array.map(elems, m.expr))
+    CArray(elems) -> CArray(Array.map(elems, m.expr))
+    CRecord(con, fields) -> CRecord(con, Array.map(fields, fun(f) = {
+        let (name, value) = f
+        (name, m.expr(value))
+    }))
+    CField(target, name) -> CField(m.expr(target), name)
+    CProject(target, index) -> CProject(m.expr(target), index)
+    CIndex(target, index) -> CIndex(m.expr(target), m.expr(index))
+    CLam(params, body, name) -> CLam(Array.map(params, fun(p) =
+        CParam { name = p.name, ty = m.type_(p.ty) }), m.expr(body), name)
+    CApp(fn, args) -> CApp(m.expr(fn), Array.map(args, m.expr))
+    CTyLam(binders, body) -> CTyLam(binders, m.expr(body))
+    CTyApp(fn, args) -> CTyApp(m.expr(fn), Array.map(args, m.type_))
+    CLet(name, bound, value, body, binders) ->
+        CLet(name, m.type_(bound), m.expr(value), m.expr(body), binders)
+    CLetRec(binds, body) -> CLetRec(Array.map(binds, m.bind), m.expr(body))
+    CJoin(name, params, body, rest, recursive) ->
+        CJoin(name, Array.map(params, fun(p) =
+            CParam { name = p.name, ty = m.type_(p.ty) }),
+            m.expr(body), m.expr(rest), recursive)
+    CJump(name, args) -> CJump(name, Array.map(args, m.expr))
+    CRef(value) -> CRef(m.expr(value))
+    CDeref(target) -> CDeref(m.expr(target))
+    CAssign(target, value) -> CAssign(m.expr(target), m.expr(value))
+    CIf(cond, then, otherwise) -> CIf(m.expr(cond), m.expr(then),
+        match otherwise {
+            Some(o) -> Some(m.expr(o))
+            None -> None
+        })
+    CMatch(scrutinee, alts) -> CMatch(m.expr(scrutinee),
+        Array.map(alts, fun(a) = CAlt { pat = a.pat, body = m.expr(a.body) }))
 }
 
 -- -- names --------------------------------------------------------------------------
@@ -494,12 +569,7 @@ fun showExpr(e : Core, indent : Int, n : Namer, a : Aliases) -> String {
     }
 }
 
-fun showLit(l : Ast.Lit) -> String = match l {
-    LString(s) -> "\"" + s + "\""
-    LInt(v) -> Int.toString(v)
-    LFloat(v) -> Float.toString(v)
-    LChar(c) -> Char.toString(c)
-}
+fun showLit(l : Ast.Lit) -> String = literalText(l)
 
 fun flat(e : Core, n : Namer, a : Aliases) -> String =
     String.trim(showExpr(e, 0, n, a))

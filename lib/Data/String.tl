@@ -29,6 +29,7 @@ module Data.String (
     stripSuffix,
     split,
     splitOnce,
+    rsplitOnce,
     replace,
     repeat,
     trim,
@@ -285,6 +286,20 @@ fun split(s : String, separator : String) -> Array String {
 fun splitOnce(s : String, separator : String) -> Option (String, String) {
     if isEmpty(separator) { return None }
     let at = Prim.stringFind(s, separator, 0)
+    if at < 0 { return None }
+    Some((
+        Prim.stringSlice(s, 0, at),
+        Prim.stringSlice(s, at + byteLength(separator), byteLength(s)),
+    ))
+}
+
+-- The same, splitting at the *last* occurrence. `"M#C.eq"` split on `"#"` is
+-- how an internal name is taken apart, and the qualification is the part after
+-- the last separator whatever the name before it contains. The primitive was
+-- already there for this; only the wrapper was missing.
+fun rsplitOnce(s : String, separator : String) -> Option (String, String) {
+    if isEmpty(separator) { return None }
+    let at = Prim.stringRfind(s, separator)
     if at < 0 { return None }
     Some((
         Prim.stringSlice(s, 0, at),

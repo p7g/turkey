@@ -7,7 +7,8 @@ import sys
 from pathlib import Path
 
 from . import llvmgen, pygen
-from .driver import check, desugared, report_warnings, run
+from .driver import (check, declared, desugared, report_warnings,
+                     run, show_declarations)
 from .errors import TurkeyError, TurkeyPanic
 from .astdump import dump as dump_ast
 from .core import show_program
@@ -25,6 +26,7 @@ def main(argv: list[str] | None = None) -> int:
         ("tokens", "dump the token stream"),
         ("ast", "dump the parse tree"),
         ("desugar", "dump every module's tree, resolved and desugared"),
+        ("decls", "dump the program's type and constructor table"),
         ("core", "dump the typed Core the elaboration produces"),
         ("mono", "dump that Core with its polymorphism specialized away"),
         ("opt", "dump that Core with the optimizations applied"),
@@ -67,6 +69,10 @@ def main(argv: list[str] | None = None) -> int:
                                     [Path(args.file).resolve().parent]):
                 print(f"module {module.name}")
                 print(dump_ast(module.program), end="")
+        elif args.command == "decls":
+            table, _ = declared(src, args.file,
+                                [Path(args.file).resolve().parent])
+            print(show_declarations(table), end="")
         elif args.command == "core":
             checked = check(src, args.file, [Path(args.file).resolve().parent])
             report_warnings(checked.warnings, args.file)

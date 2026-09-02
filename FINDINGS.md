@@ -98,6 +98,20 @@ read only the one that is there, and `readFile` answering `None` conflates "no
 such file" with "not UTF-8". `System.IO.canRead` is the predicate; the
 primitive behind it was already there for `readFile` to use.
 
+### 27. A module-level `let` is process state, and the compiler is one process
+**bug, fixed.** M22. `types.QUALIFY` is a program-wide set of the names that
+must print qualified because two modules claimed one short name, and
+`DeclTable.__init__` clears it. The port made it a top-level `let` in
+`Turkey.Types`, which is per-*process* -- and `boot` checks thirty-two programs
+in one process where `python3 -m turkey` gets a fresh interpreter for each. So
+a clash in one program made `Either` print qualified in the next thirty-one.
+
+Nothing about this is specific to that set. It is the shape of every global the
+Python has: correct in a script, wrong in a compiler that is asked to compile
+more than once. `Turkey.Decls.newDeclTable` now clears it, which is what
+`DeclTable.__init__` was doing all along -- the Python was already written for
+the case its host never exercised.
+
 ---
 
 ## Open, and accepted
@@ -199,6 +213,15 @@ name)` is the natural spelling of "qualify this name by that module" and is a
 parse error; the parameter is `owner`. Reserving a word takes it from every
 binder in every program, not just from the production that wanted it.
 
+### 28. `var` and `type` are reserved, so they cannot name a parameter or field
+**design.** M22, and the third time entry 7's cost has been paid.
+`occurs_and_adjust(var, t)` is the name the algorithm goes by in every
+textbook, and `var` is a parse error in a parameter list; it is `slot` here. A
+counter record wanted a field called `type`; it is `tyvar`. Together with
+`hiding`, `export` and `module`, five common nouns are now unavailable to every
+binder in every program, in exchange for keywords the grammar could mostly
+disambiguate positionally.
+
 ### 24. `Data.Set` is not one of the modules the Prelude re-exports
 **library.** M21. `Array`, `Map`, `Option` and eight others arrive
 automatically; `Set` needs an import, for no reason a reader could guess. Either
@@ -251,6 +274,14 @@ the Prelude's re-export of `module Option` was not where it was looked for. Now
 removed in favour of `Option.isSome`. The lesson is not "read the library" so
 much as: there is no way to *search* it, and the Prelude re-exports ten modules
 whose contents are only discoverable by opening them.
+
+### 29. `Option.isNone` and `String.rsplitOnce` were missing
+**library, fixed.** M22. `isSome` was there and its negation was not, which is
+the kind of gap that gets papered over with a `match` at every call site.
+`rsplitOnce` is the more interesting one: `splitOnce` existed, `Prim.stringRfind`
+existed, and only the four-line wrapper between them did not -- and taking an
+internal name apart needs the *last* separator, since `M#C.method` has a `.` in
+the half after the `#`.
 
 ### 14. No `Array.copy`
 **library.** M20. Copying an array is `Array.slice(xs, 0, len(xs))`, which says

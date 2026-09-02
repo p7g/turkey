@@ -31,6 +31,9 @@ import Turkey.AstDump as AstDump
 import Turkey.Modules as Modules
 import Turkey.Resolve as Resolve
 import Turkey.Desugar as Desugar
+import Turkey.Types as Ty
+import Turkey.Decls as Decls
+import Turkey.Ast (Decl(..))
 
 -- Where the language's own library lives, relative to where this is run from.
 -- The Python finds it beside its own source; a compiled binary has no such
@@ -42,7 +45,7 @@ fun main() {
     let args = Env.args()
     if len(args) < 2 { usage() }
     let command = args[0]
-    if !Array.contains(["tokens", "ast", "desugar"], command) {
+    if !Array.contains(["tokens", "ast", "desugar", "decls"], command) {
         die("unknown command '" + command + "'")
     }
     -- One builder for every file: a `print` per token is a flush per token,
@@ -54,7 +57,8 @@ fun main() {
             "tokens" -> dumpTokens(b, readOrDie(path))
             "ast" -> String.push(b, AstDump.dump(
                 Parser.parse(readOrDie(path), Array.new(0))))
-            _ -> dumpDesugared(b, path)
+            "desugar" -> dumpDesugared(b, path)
+            _ -> dumpDecls(b, path)
         }
     }
     write(String.build(b))
@@ -72,14 +76,41 @@ fun dumpTokens(b : String.Builder, source : Source) -> Unit {
 -- dump of the entry alone would check the interesting half of the stage against
 -- nothing.
 fun dumpDesugared(b : String.Builder, path : String) -> Unit {
+    for m in loadResolved(path) {
+        String.push(b, "module " + m.name + "\n")
+        String.push(b, AstDump.dump(m.program))
+    }
+}
+
+-- Every module of the program, loaded, resolved and desugared, in dependency
+-- order. What every stage from here on starts from.
+fun loadResolved(path : String) -> Array Modules.Module {
     let loader = Modules.newLoader([directoryOf(path), libRoot])
     discard(Modules.loadEntry(loader, readOrDie(path), "Main"))
     for m in loader.order {
         Resolve.program(m.scope, m.program)
         Desugar.program(m.program, m.scope.methods)
-        String.push(b, "module " + m.name + "\n")
-        String.push(b, AstDump.dump(m.program))
     }
+    loader.order
+}
+
+-- The program's declaration table, and nothing after it: every type constructor
+-- with the kind inferred for it, every value constructor with the scheme it was
+-- generalized to. One table for the whole program, which is what makes the
+-- two-modules-claim-one-short-name rule visible at all.
+fun dumpDecls(b : String.Builder, path : String) -> Unit {
+    let table = Decls.newDeclTable()
+    for m in loadResolved(path) {
+        let types = Array.new(8)
+        for d in m.program.decls {
+            match d {
+                DType(td) -> Array.push(types, td)
+                _ -> {}
+            }
+        }
+        Decls.registerAll(table, types)
+    }
+    String.push(b, Decls.showDeclarations(table))
 }
 
 -- The directory a path is in, as a search root. A path with no separator is in
@@ -96,7 +127,7 @@ fun readOrDie(path : String) -> Source = match Source.read(path) {
     None -> die("cannot read " + path)
 }
 
-fun usage() -> a = die("usage: boot <tokens|ast|desugar> FILE...")
+fun usage() -> a = die("usage: boot <tokens|ast|desugar|decls> FILE...")
 
 fun die(message : String) -> a {
     IO.stderr("boot: " + message + "\n")

@@ -30,6 +30,7 @@ import Turkey.Parser as Parser
 import Turkey.AstDump as AstDump
 import Turkey.Modules as Modules
 import Turkey.Resolve as Resolve
+import Turkey.Desugar as Desugar
 
 -- Where the language's own library lives, relative to where this is run from.
 -- The Python finds it beside its own source; a compiled binary has no such
@@ -75,6 +76,7 @@ fun dumpDesugared(b : String.Builder, path : String) -> Unit {
     discard(Modules.loadEntry(loader, readOrDie(path), "Main"))
     for m in loader.order {
         Resolve.program(m.scope, m.program)
+        Desugar.program(m.program, m.scope.methods)
         String.push(b, "module " + m.name + "\n")
         String.push(b, AstDump.dump(m.program))
     }

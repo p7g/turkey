@@ -743,13 +743,66 @@ Roadmap, in order. Rationale kept short; open questions are the point.
      `skipToken` is. A language where a block answers with its last statement
      makes "call this and discard the result" a thing that has to be said.
 
-   - M21-M22, the rest of the front end in Turkey: resolve/desugar, and
-     inference. `boot types` against `turkey types`.
-     Two representation decisions are taken up front because retrofitting
-     either touches every node -- a mutable single-variant record wrapping an
-     immutable variant, since Turkey ADTs cannot be mutated and desugar
-     rewrites in place; and an `Int` id per node, since `typed.py` keys
-     expressions by Python object identity and Turkey has no identity hash.
+   Done, M21: modules, resolution and the `?`/`do` lowering.
+   `boot/Turkey/{Prims,Prelude,Modules,Resolve,Desugar}.tl`, and `boot desugar`
+   agrees with `turkey desugar` on every node of every module of every entry
+   program -- 376,529 lines. The dump is M20's tree under a `module NAME` line,
+   for *every* module of the program rather than the entry one: what resolution
+   does to a module depends on what it imported, so the entry alone would check
+   the interesting half against nothing. A library module cannot itself be an
+   entry -- it resolves its own imports against its own directory -- so the
+   entry list is the conformance programs plus `boot/Main.tl`, and between them
+   they pull in the whole of `lib/` and the whole of `boot/`.
+
+   What that adds over M20 is exactly what the two passes change: every name is
+   internal, every bracket is an `Index` method call, and every `?` is a `bind`.
+   The generated binders are in the dump, so the two implementations are pinned
+   to the same *numbering* of `%k1`, `%loop1`, `%fell1` and the cursor names --
+   not merely to the same shape.
+
+   Writing the port found two miscompiles in the Python, in passes the suite
+   already covered well:
+
+   - **The inliner captured a caller's variable in a callee's parameter.**
+     `opt._apply_names` substitutes a value argument into the callee's body and
+     let-binds the rest, and checked the substitution against the binders of
+     that body -- not against the `let`s it was about to wrap around it. So
+     `internal(name, c.name)`, where `name` is a caller's local and also the
+     callee's second parameter, bound `name` around the substituted `name` and
+     the body read the field twice. It needs a caller's local and a callee's
+     parameter to share a spelling plus a value argument for the other
+     parameter; `Turkey.Modules` is the first code that ever wrote it. The fix
+     is a fixpoint: a parameter that becomes a `let` disqualifies substituting
+     anything mentioning it, and disqualifying one makes it a `let` in turn.
+   - **A `do` block as an entire function body was never lowered.**
+     `Desugarer.walk` replaces a `do` rather than rewriting it, so its answer
+     has to be taken, and two callers dropped it. `fun f(o) = do { let x = o?;
+     Some(x) }` kept its `?` into `deps.free_names`, which crashed with an
+     internal assertion. That one came from reading the pass closely enough to
+     port it, which is a different kind of reading from using it.
+
+   Two things the language forced, both recorded in FINDINGS.md:
+
+   - **No reflection.** The Python writes its four scanners -- and its
+     transparent walk, and its bracket lowering -- as generic walks over the
+     dataclass fields, so a node kind added later cannot be missed by one of
+     them. Here `Turkey.Desugar.children` is that enumerator written out once
+     and shared, and the safety property is gone: a node kind added to
+     `Turkey.Ast` and forgotten there is missed by all four scanners at once.
+     The mitigation is the corpus diff, which notices the moment any file
+     contains such a node.
+   - **No function identity.** `if k is not self.fall` is how the Python
+     decides a loop is in statement rather than value position. There is
+     nothing to compare a Turkey closure against, so `Cont` is a variant here:
+     `KId`, `KFall`, `KPure` and `KFn`, only the last a real closure. That is
+     the better spelling -- `KFall` says what the continuation is, where a
+     bound method compared by identity said only which object it was.
+
+   `Ast.Program` now carries the parser's id counter on, because desugaring
+   writes nodes of its own and they need ids from the same supply; a second
+   counter starting at zero would collide with every node already in the tree.
+
+   - M22, inference in Turkey. `boot types` against `turkey types`.
    - M23-M24, Core, mono and opt in Turkey, against the `.core`/`.mono`/`.opt`
      goldens. Two details are ports rather than approximations because a
      golden depends on each: mono's *shared* budget across its two rounds
@@ -867,7 +920,10 @@ Next is 9, and it is a compiler rather than an interpreter: the first real
 program in the language, the scale test for both the language and its new
 execution path, and the thing that makes a Turkey value a machine value. M18
 has landed -- the I/O, argument and string floor a compiler stands on, plus the
-recursion depth to walk an AST -- and M19 and M20 with it: `boot` lexes and
+recursion depth to walk an AST -- and M19 through M21 with it: `boot` lexes and
 parses every Turkey file in the repository, its own source included, to the same
-tokens and the same tree the Python implementation builds. What is left is M21
-through M26.
+tokens and the same tree the Python implementation builds, and loads, resolves
+and desugars every module of every program to the same tree again. The whole
+front end up to inference is now two implementations that agree. It has already
+paid for itself twice, in an inliner miscompile and a lowering that dropped a
+`do`, neither of which the suite could reach. What is left is M22 through M26.

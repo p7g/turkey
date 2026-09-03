@@ -566,6 +566,7 @@ class _Emitter:
 
         for block in source.blocks:
             builder = builders[block.name]
+            self._block_here = block.name
             self._root_here = root_region[block.name]
             self._panic_here = panic_region[block.name]
             for index, instruction in enumerate(block.instructions):
@@ -924,6 +925,8 @@ class _Emitter:
         if op == "call":
             value = builder.call(self.functions[instruction.args[0]], args,
                                  name=instruction.result.name)
+            if instruction.diverges:
+                return value, self._diverged(function, builder)
             return value, self._propagate(function, builder)
         if op.startswith("prim."):
             return self._primitive(function, builder, op[5:], args, instruction.result.layout)
@@ -1285,6 +1288,28 @@ class _Emitter:
         self._leave_globals(panic_builder)
         panic_builder.ret(ir.Constant(function.function_type.return_type, None))
         return ir.IRBuilder(good)
+
+    def _diverged(self, function: ir.Function,
+                  builder: ir.IRBuilder) -> ir.IRBuilder:
+        """Leave, after a call that has already panicked.
+
+        The ordinary sequence is `_propagate`: test the flag, return if it is
+        set, carry on if it is not. For a callee that always panics the second
+        arm cannot be taken, and saying so is worth much more than the branch
+        it removes. The arm that carries on merges back into the code after
+        the call -- after a bounds check, that is the array access itself --
+        and because the call may write anything, LLVM has to redo every load
+        across the merge. `Main#inc` reloaded the array header and its length
+        four times and checked the same index against the same length twice,
+        entirely because the failure path was still, formally, able to come
+        back.
+
+        The rest of the block is emitted into a block nothing branches to, so
+        the optimizer drops it along with the phi entries naming it.
+        """
+        self._leave_frames(builder, self._block_here)
+        builder.ret(ir.Constant(function.function_type.return_type, None))
+        return ir.IRBuilder(function.append_basic_block("after.panic"))
 
     def _propagate(self, function: ir.Function,
                    builder: ir.IRBuilder) -> ir.IRBuilder:

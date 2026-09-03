@@ -933,28 +933,63 @@ def _transfers(e, bound: frozenset[str] = frozenset()) -> bool:
     return False
 
 
-def _bottoms(e) -> bool:
+def _bottoms(e, known: frozenset[str] = frozenset()) -> bool:
     """Whether evaluating `e` always diverges.
 
-    GHC's `exprIsBottom`, cut down to the one producer this compiler has:
-    `Prim.error`. Conservative in the direction of answering false, which
-    costs an inline allowed rather than a term moved wrongly.
+    GHC's `exprIsBottom`. The one primitive producer is `Prim.error`; `known`
+    carries the top-level functions already shown to reduce to it, so that
+    `Data.Array#bounds` calling `outOfBounds` counts as well. Conservative in
+    the direction of answering false, which costs an inline allowed rather
+    than a term moved wrongly.
     """
     if isinstance(e, CApp):
         fn = e.fn
         while isinstance(fn, CTyApp):
             fn = fn.fn
-        return getattr(fn, "name", None) == "Prim.error"
+        name = getattr(fn, "name", None)
+        return name == "Prim.error" or (name is not None and name in known)
     if isinstance(e, CLet):
-        return _bottoms(e.body)
+        return _bottoms(e.body, known)
     if isinstance(e, CJoin):
-        return _bottoms(e.rest)
+        return _bottoms(e.rest, known)
     if isinstance(e, CMatch):
-        return bool(e.alts) and all(_bottoms(alt.body) for alt in e.alts)
+        return bool(e.alts) and all(_bottoms(alt.body, known) for alt in e.alts)
     if isinstance(e, CIf):
-        return (e.otherwise is not None and _bottoms(e.then)
-                and _bottoms(e.otherwise))
+        return (e.otherwise is not None and _bottoms(e.then, known)
+                and _bottoms(e.otherwise, known))
     return False
+
+
+def bottoming(program: CProgram) -> frozenset[str]:
+    """The top-level functions that never return.
+
+    Grown from nothing rather than assumed and narrowed, so a function that
+    only calls itself is not mistaken for one that panics: a name is added
+    only once its body is bottom given the names already added.
+
+    The backend uses this to say what it cannot otherwise know -- that the
+    edge back from a call to one of these is dead. `Data.Array#outOfBounds`
+    returns to its caller like anything else, and the caller then tests the
+    panic flag and returns; but the flag is always set, so the arm that
+    carries on is unreachable. Leaving it in the CFG costs far more than the
+    branch: it merges into the code after the bounds check, and because the
+    call may write anything, every load after the merge has to be redone.
+    `Main#inc` reloaded the array header and its length four times, and
+    checked the same index against the same length twice, for that reason.
+    """
+    found: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for bind in program.binds:
+            if bind.name in found:
+                continue
+            value = bind.value
+            body = value.body if isinstance(value, CLam) else value
+            if _bottoms(body, frozenset(found)):
+                found.add(bind.name)
+                changed = True
+    return frozenset(found)
 
 
 def _falls_through(e) -> bool:

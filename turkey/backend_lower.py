@@ -17,6 +17,7 @@ from .core import (
 )
 from .builtins import PRIM_NAMES
 from .errors import Unsupported
+from .opt import bottoming
 from .prelude import BOOL_FALSE, BOOL_TRUE
 from .types import (
     BOTTOM, BYTE, CHAR, FLOAT, INT, STRING, UNIT, TApp, TCon, TFam, TFun,
@@ -84,6 +85,7 @@ class _FunctionLowerer:
                  tags: dict[str, int], record_fields: dict[str, list[str]],
                  lifted: list[bir.Function], lift_counter: list[int],
                  globals_: dict[str, bir.Value],
+                 bottoming: frozenset[str] = frozenset(),
                  captures: list[tuple[str, bir.Layout]] | None = None,
                  output_name: str | None = None) -> None:
         self.bind = bind
@@ -95,6 +97,7 @@ class _FunctionLowerer:
         self.lifted = lifted
         self.lift_counter = lift_counter
         self.globals = globals_
+        self.bottoming = bottoming
         self.closure_abi = captures is not None
         self.captures = captures or []
         self.output_name = output_name or mangle(bind.name)
@@ -163,9 +166,11 @@ class _FunctionLowerer:
 
     def emit(self, block: bir.Block, op: str,
              args: tuple[bir.Operand | str, ...], layout: bir.Layout,
-             frame: bir.Frame | None = None) -> bir.Value:
+             frame: bir.Frame | None = None,
+             diverges: bool = False) -> bir.Value:
         result = bir.Value(self.fresh(op), layout)
-        block.instructions.append(bir.Instruction(op, args, result, frame))
+        block.instructions.append(
+            bir.Instruction(op, args, result, frame, diverges))
         return result
 
     def frame(self, span) -> bir.Frame:
@@ -756,7 +761,9 @@ class _FunctionLowerer:
                                  for value, expected in zip(values,
                                                             function_type.params)]
                     called = self.emit(at, "call", (symbol, *arguments),
-                                       layout_of(function_type.ret), self.frame(expr.span))
+                                       layout_of(function_type.ret),
+                                       self.frame(expr.span),
+                                       diverges=fn.name in self.bottoming)
                     done(at, self.coerce(at, called, layout_of(expr.ty)))
                 self.lower_values(expr.args, env, joins, block, direct_call)
                 return
@@ -819,7 +826,7 @@ class _FunctionLowerer:
         child = _FunctionLowerer(
             bind, lam, self.functions, self.decls, self.tags,
             self.record_fields, self.lifted, self.lift_counter,
-            self.globals,
+            self.globals, self.bottoming,
             [(name, slot.layout) for name, slot in captures], symbol,
         )
         function = child.finish()
@@ -1191,6 +1198,7 @@ def _pattern_layout(pattern, fallback: Type,
 
 
 def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
+    never_returns = bottoming(program)
     record_fields = _record_layouts(program, decls)
     tag_names = sorted(set(decls.constructors) | set(record_fields))
     tags = {name: index for index, name in enumerate(tag_names)}
@@ -1253,7 +1261,7 @@ def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
     for bind, lam in chosen:
         top.append(_FunctionLowerer(
             bind, lam, functions, decls, tags, record_fields,
-            lifted, lift_counter, globals_,
+            lifted, lift_counter, globals_, never_returns,
         ).finish())
 
     init_name = "turkey_module_initialize"
@@ -1263,7 +1271,7 @@ def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
     init_bind = CBind(init_name, init_type, [], init_lam)
     initializer = _FunctionLowerer(
         init_bind, init_lam, functions, decls, tags, record_fields,
-        lifted, lift_counter, globals_, output_name=init_name,
+        lifted, lift_counter, globals_, never_returns, output_name=init_name,
     ).finish_initializers(program, runtime_binds)
 
     run_name = "turkey_run"

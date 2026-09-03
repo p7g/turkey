@@ -51,6 +51,13 @@ class Instruction:
     args: tuple[Operand | str, ...] = ()
     result: Value | None = None
     frame: Frame | None = None
+    # Set on a call to a function that always panics. The call returns like
+    # any other -- there is no nonlocal exit -- but it returns with the panic
+    # flag set, so the arm that carries on afterwards is dead. Saying so is
+    # worth more than the branch it saves: the live arm otherwise merges back
+    # into the code after it, and since the callee may write anything, every
+    # load past the merge has to be redone.
+    diverges: bool = False
 
 
 @dataclass(frozen=True)

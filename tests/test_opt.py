@@ -428,22 +428,35 @@ def test_type_applied_methods_inline_and_the_remaining_flow_is_tracked():
     limit. That is a measured refusal, rather than a reason to make the blanket
     limit larger.
 
-    Six residuals, not the eight this asserted before `_Rewriter.value` learned
-    to descend into a `CLetRec` member. A lifted loop is a *monomorphic*
-    `letrec`, so `_rw_CLetRec` handed it to `generic`, whose reflective walk had
-    no `CBind` case and copied the group's bodies verbatim -- leaving every
-    ground call site inside every loop in the program unspecialized. Two of
-    Array `bind`'s residuals were ground call sites of exactly that kind.
+    No residual at all now, where this asserted eight. Two things moved it, and
+    both were the same bug seen from different ends: a ground call site that
+    monomorphization could not see was ground.
 
-    The size this buys back, measured on this fixture: opt bindings 112 -> 137,
-    emitted IR 52208 -> 55374 lines (+6.1%), warm backend compile 889 -> 924ms
-    (+4%). `monads.tl` and `dicts.tl` are unchanged on all three. The cost is
-    real and confined to this program; it is paid for by the loop bodies that
-    now specialize at all.
+    First, `_Rewriter.value` had no `CBind` case, so a `CBind` fell through to
+    `return v`. The one field holding one is `CLetRec.binds`, reached whenever
+    `_rw_CLetRec` finds no polymorphic member and defers to `generic` -- which
+    is every lifted loop, since a loop body is not generalized. Every loop body
+    in every program went through the pass untouched.
 
-    The `Flow` count below moved with it, 33 -> 27, and in the direction that
-    wants no defending: a loop body whose `bind` and `pure` are specialized has
-    six fewer `Fall`/`Brk`/`Cont`/`Ret` records left to allocate.
+    Second, `desugar._unflow` left the `b` of `Flow a b r` open. Nothing
+    constructs a `Brk` at a do-context boundary, so no constraint ever reached
+    that slot, it generalized, and every call site downstream read
+    `bind[Int, Flow(.., ?b)]` -- ground in the slot that matters and open in the
+    one that cannot be. `mono` specializes only at ground instantiations, so one
+    uninhabited slot kept `bind` generic. Annotating the arm's payload `Unit`
+    closes it.
+
+    The size this costs, measured on this fixture: opt bindings 112 -> 158,
+    emitted IR 52208 -> 57679 lines (+10.5%), warm backend compile 889 -> 983ms
+    (+10.6%). `monads.tl` and `dicts.tl` are unchanged on all three. That is the
+    trade this milestone is making on purpose: a generic body reached through a
+    generic dictionary is compiled at `BOXED` and read through runtime layout
+    checks, and removing it is what lets field access become a load.
+
+    The `Flow` count below is unmoved at 27 by the second change and was taken
+    there by the first, which is the direction that wants no defending: a loop
+    body whose `bind` and `pure` are specialized has six fewer
+    `Fall`/`Brk`/`Cont`/`Ret` records to allocate.
     """
     from pathlib import Path
     from turkey.core import CLetRec
@@ -469,8 +482,8 @@ def test_type_applied_methods_inline_and_the_remaining_flow_is_tracked():
     assert "%inst.Std.Classes#Monad.Data.Either#Either@String#bind" not in typed
     assert "%inst.Std.Classes#Applicative.Data.Either#Either@String#pure" not in typed
     assert typed.count(
-        "%inst.Std.Classes#Monad.Data.Array#Array#bind") == 6, (
-        "Array bind's six residuals do not repay their size; if this moves, "
+        "%inst.Std.Classes#Monad.Data.Array#Array#bind") == 0, (
+        "Array bind should have no type-applied residual left; if this moves, "
         "check both generated-code size and warm backend time")
 
     flow = sum(

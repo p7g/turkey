@@ -129,6 +129,12 @@ def _pat(p) -> str:
     if t is ast.PCon:
         inner = f"({', '.join(_pat(x) for x in p.args)})" if p.args else ""
         return f"{_short(p.name)}{inner}"
+    if t is ast.PAnnot:
+        # Only a nullary `TECon` is ever written by the desugarer, and only at
+        # the `Brk` arm of a do-context boundary; printing just its name keeps
+        # the goldens readable rather than pulling a whole type printer in.
+        written = getattr(p.type_expr, "name", type(p.type_expr).__name__)
+        return f"{_pat(p.pat)} : {written}"
     return f"<{t.__name__}>"
 
 
@@ -250,9 +256,16 @@ UNREACHABLE = 'error("internal error: a loop transfer escaped its loop")'
 
 
 def _boundary(n: int) -> str:
-    """The do-context boundary, where `Ret` stops being a value again."""
+    """The do-context boundary, where `Ret` stops being a value again.
+
+    The `Brk` payload is annotated because nothing constructs a `Brk` here, so
+    without an annotation the `b` of `Flow a b r` is a variable no constraint
+    ever reaches: it generalizes, and `mono` -- which specializes only at
+    ground instantiations -- then cannot specialize any call site that mentions
+    it. See `desugar._unflow`.
+    """
     return (f"fun(%k{n}) match %k{n} {{ Fall(%v) -> %v Ret(%r) -> %r "
-            f"Brk(_) -> {UNREACHABLE} Cont -> {UNREACHABLE} }})")
+            f"Brk(_ : Unit) -> {UNREACHABLE} Cont -> {UNREACHABLE} }})")
 
 
 def test_a_return_after_a_question_becomes_a_value():

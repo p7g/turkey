@@ -686,15 +686,34 @@ class Desugarer:
         `Brk` and `Cont` cannot arrive -- a `break` outside a loop is refused
         while this pass runs -- but nothing in the type system knows that, so
         the arms exist and diverge.
+
+        The `Brk` arm annotates its payload `Unit`, and that annotation is
+        load-bearing rather than documentation. Nothing constructs a `Brk` at
+        this boundary, so without it the `b` of `Flow a b r` is a variable no
+        constraint ever reaches: it generalizes, and every call site downstream
+        reads `bind[Int, Flow(.., ?b)]` -- ground in the slot that matters and
+        open in the one that cannot be. `mono` specializes only at ground
+        instantiations, so that one dead slot kept `bind` generic, and with it
+        every generic body it names: `Data.Array#grow` and `Data.Array#bounds`
+        stayed reachable at `BOXED` and were reached through a generic
+        dictionary. `_fun` above says the same thing about a lifted loop's own
+        `Brk` and fixes it the same way, by refusing to generalize; this is the
+        other half, at the boundary where the slot finally dies.
+
+        `Unit` rather than an uninhabited type because Turkey has no bottom
+        type to name. That is the one thing here a `Never` would say better.
         """
         unreachable = ast.ECall(
             span, ast.EVar(span, prelude.ERROR, method=False),
             [ast.ELit(span, "String", "internal error: a loop transfer escaped "
                                      "its loop")])
+        broke = ast.MatchArm(span, [ast.PCon(span, prelude.FLOW_BRK, [
+            ast.PAnnot(span, ast.PWild(span), ast.TECon(span, "Unit", [])),
+        ])], unreachable)
         return self._bind(body, lambda f: ast.EMatch(span, f, [
             _arm(prelude.FLOW_FALL, "%v", span, _var("%v", span)),
             _arm(prelude.FLOW_RET, "%r", span, _var("%r", span)),
-            _arm(prelude.FLOW_BRK, "%_", span, unreachable),
+            broke,
             _arm(prelude.FLOW_CONT, None, span, unreachable),
         ]), span)
 

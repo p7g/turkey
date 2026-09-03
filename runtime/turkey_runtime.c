@@ -18,6 +18,16 @@ typedef struct TurkeyObject {
 static char panic_buffer[256];
 int32_t turkey_has_panicked;
 
+/* How many times a field or element read/written at one scalar layout found
+   another one stored, and was silently boxed or unboxed to bridge the two.
+   This is the differential oracle for making field access static: the stored
+   layout is chosen by the *construction site* from its operand layouts, and
+   the requested one is computed independently by the consumer, so a nonzero
+   count is a producer/consumer disagreement that a plain load would compile
+   wrongly. Emitting `getelementptr`+`load` in place of these calls is safe
+   exactly when this stays zero. */
+static int64_t layout_reconciliations;
+
 typedef struct PanicCallFrame {
     struct PanicCallFrame *previous;
     const char *function_name;
@@ -194,6 +204,7 @@ void turkey_collect(void) {
 }
 
 int64_t turkey_heap_objects(void) { return heap_count; }
+int64_t turkey_layout_reconciliations(void) { return layout_reconciliations; }
 int64_t turkey_collection_count(void) { return collection_count; }
 void turkey_gc_set_stress(int32_t enabled) { gc_stress = enabled != 0; }
 
@@ -632,6 +643,7 @@ uint64_t turkey_object_get_as(void *pointer, int64_t index, int32_t layout) {
     if (!(object->kind == 0 || object->kind == 1)) return value;
     int32_t stored = (object->pointer_bitmap >> (3 * index)) & 7;
     if (stored == layout || (stored >= 6 && layout >= 6)) return value;
+    layout_reconciliations++;
     if (stored == 7 && layout < 6)
         return turkey_unbox((void *)(uintptr_t)value, layout);
     if (stored < 6 && layout == 7)
@@ -652,7 +664,10 @@ void turkey_object_set_as(void *pointer, int64_t index, uint64_t value,
     int32_t stored = (object->pointer_bitmap >> (3 * index)) & 7;
     if (stored == layout || (stored >= 6 && layout >= 6)) {
         object->slots[index] = value;
-    } else if (stored == 7 && layout < 6) {
+        return;
+    }
+    layout_reconciliations++;
+    if (stored == 7 && layout < 6) {
         void *box = turkey_box(value, layout);
         if (!turkey_has_panicked) object->slots[index] = (uint64_t)(uintptr_t)box;
     } else if (stored < 6 && layout == 7) {
@@ -755,6 +770,7 @@ uint64_t turkey_array_get_as(void *pointer, int64_t index, int32_t layout) {
     uint64_t value = array_get(array, index);
     if (turkey_has_panicked || array->tag == layout ||
             (array->tag >= 6 && layout >= 6)) return value;
+    layout_reconciliations++;
     if (array->tag == 7 && layout < 6)
         return turkey_unbox((void *)(uintptr_t)value, layout);
     if (array->tag < 6 && layout == 7)
@@ -769,7 +785,10 @@ void turkey_array_set_as(void *pointer, int64_t index, uint64_t value,
     TurkeyObject *array = pointer;
     if (array->tag == layout || (array->tag >= 6 && layout >= 6)) {
         array_set(array, index, value);
-    } else if (array->tag == 7 && layout < 6) {
+        return;
+    }
+    layout_reconciliations++;
+    if (array->tag == 7 && layout < 6) {
         void *box = turkey_box(value, layout);
         if (!turkey_has_panicked) array_set(array, index, (uint64_t)(uintptr_t)box);
     } else if (array->tag < 6 && layout == 7) {

@@ -296,6 +296,41 @@ def test_native_error_programs_match_conformance_output(name, monkeypatch, capfd
     assert captured.out + captured.err == expected
 
 
+@pytest.mark.parametrize("name", NATIVE_PROGRAMS)
+def test_no_conformance_program_reconciles_a_scalar_layout(name, monkeypatch, capfd):
+    """No field or element is read at one scalar layout and found at another.
+
+    This is the licence for emitting `getelementptr`+`load` where the backend
+    now calls `turkey_object_get_as`. The stored layout is chosen by the
+    *construction site* from its operand layouts (`_layout_metadata`), and the
+    requested one is computed independently by the consumer (`layout_of`, or
+    `_pattern_layout` at a pattern). Nothing makes those two agree by
+    construction: when they disagree the runtime silently boxes or unboxes to
+    bridge them, and a plain load would compile the disagreement wrongly. So
+    the count staying at zero is exactly the precondition for deleting the
+    call.
+
+    It is a *dynamic* oracle and proves only what it executed. `dicts.tl` still
+    has one binding -- `Data.Array#bounds`, reached through the higher-kinded
+    `Foldable` default method -- that is generic, reachable, and destructures a
+    transparent `Array a`; this says that path does not disagree when run, not
+    that it cannot.
+    """
+    program = PROGRAMS_DIR / f"{name}.tl"
+    monkeypatch.chdir(PROGRAMS_DIR)
+    checked = check(program.read_text(encoding="utf-8"), str(program),
+                    [program.parent.resolve()])
+    module = compile(checked.opt, checked.decls, checked.main)
+    # The module is fresh per program but the runtime library is a process-wide
+    # singleton, so this has to be read as a delta rather than an absolute.
+    before = module.runtime.turkey_layout_reconciliations()
+    module.execute()
+    capfd.readouterr()
+    assert module.runtime.turkey_layout_reconciliations() - before == 0, (
+        f"{name} bridged a scalar layout at run time; field access cannot "
+        f"become a plain load until this is zero")
+
+
 def test_generic_layout_bridges_survive_gc_stress(monkeypatch, capfd):
     monkeypatch.setenv("TURKEY_GC_STRESS", "1")
     program = PROGRAMS_DIR / "question_control.tl"

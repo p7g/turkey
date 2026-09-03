@@ -822,6 +822,7 @@ def _load_runtime() -> ctypes.CDLL:
     library.turkey_frame_col.restype = ctypes.c_int64
     library.turkey_heap_objects.restype = ctypes.c_int64
     library.turkey_collection_count.restype = ctypes.c_int64
+    library.turkey_layout_reconciliations.restype = ctypes.c_int64
     library.turkey_panic_clear()
     _runtime_library = library
     return library

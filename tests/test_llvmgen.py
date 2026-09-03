@@ -6,7 +6,9 @@ from pathlib import Path
 from turkey.driver import check
 from turkey.cli import main as cli_main
 from turkey.errors import TurkeyPanic
-from turkey.llvmgen import compile, execute, generate
+from turkey import backend_ir as bir
+from turkey.backend_lower import lower
+from turkey.llvmgen import compile, execute, generate, _root_slots
 
 PROGRAMS_DIR = Path(__file__).parent / "programs"
 NATIVE_PROGRAMS = sorted(
@@ -38,6 +40,41 @@ def test_shadow_roots_use_stack_storage_and_direct_stores():
     assert "@turkey_root_enter" in text
     assert "@turkey_root_set" not in text
     assert "@turkey_root_push" not in text
+
+
+def test_a_nullary_constructor_is_built_once_for_the_whole_run():
+    checked = check(
+        'fun pick(n) = if n > 0 { Some(n) } else { None }\n'
+        'fun main() { print(pick(1)); print(pick(-1)) }')
+    text = generate(checked.opt, checked.decls, checked.main)
+    # `None` carries no fields, so every evaluation of it may share one
+    # object. Only the entry function still builds one; everywhere else the
+    # use is a load of the global holding it.
+    for part in text.split("\ndefine ")[1:]:
+        if part.startswith("i8 @turkey_run("):
+            continue
+        assert "i64 0, i64 0)" not in part, part.splitlines()[0]
+    assert text.count("@.turkey.nullary.value.") >= 2
+
+
+def test_roots_are_the_slots_live_across_a_collection():
+    # `bump` allocates nothing and the only thing in it that can collect is
+    # the bounds check it calls. `backend_lower` gives every ANF temporary a
+    # slot, and slots used to be rooted whether or not a collection could
+    # happen while they held anything, so a two-line function paid a root
+    # store per temporary.
+    checked = check(
+        'type Tape = Tape { data : Array Int, pos : Int }\n'
+        'fun bump(t : Tape) { t.data[t.pos] = t.data[t.pos] + 1 }\n'
+        'fun main() { let t = Tape { data = [0], pos = 0 }\n'
+        '             bump(t); print(t.data[0]) }')
+    source = lower(checked.opt, checked.decls, checked.main)
+    bump = next(f for f in source.functions if "23_bump" in f.name)
+    pointers = [s for s in bump.slots
+                if s.layout in (bir.Layout.PTR, bir.Layout.BOXED)]
+    assert len(pointers) >= 8, "the lowering should still be slot-heavy"
+    _, roots = _root_slots(bump)
+    assert roots < len(pointers)
 
 
 def test_language_string_literals_are_allocated_once_at_module_entry():

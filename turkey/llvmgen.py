@@ -117,6 +117,91 @@ def _operands(instruction: bir.Instruction) -> list[bir.Value]:
     return [arg for arg in instruction.args if isinstance(arg, bir.Value)]
 
 
+def _successors(terminator) -> list[str]:
+    if isinstance(terminator, bir.Jump):
+        return [terminator.target]
+    if isinstance(terminator, bir.Branch):
+        return [terminator.yes, terminator.no]
+    return []
+
+
+def _live_across_safepoint(function: bir.Function) -> set[str]:
+    """Which parameters and slots hold a pointer over a possible collection.
+
+    `_root_slots` bounds an instruction result's live range inside one block,
+    because `bir.check` rebuilds the SSA scope per block. Parameters and slots
+    are the two things that escape that rule -- a parameter is nameable from
+    every block, a slot is function-wide mutable storage -- so both used to be
+    rooted unconditionally, on the grounds that there are few of them.
+
+    There are not few of them. `backend_lower` gives every ANF temporary its
+    own slot, so a two-line `Main#inc` has thirty-eight, twenty-four of them
+    pointers; it allocates nothing itself and paid twenty-six root stores per
+    call. What is needed is ordinary backward liveness over the CFG, with a
+    slot killed by a store to it and a parameter never killed, asking of each
+    safepoint which of them is live across it. This is how any collector with
+    a precise stack map computes one (OCaml, Go, and LLVM's own
+    `gc.statepoint` all do the same dataflow); the only wrinkle here is that
+    a value passed *to* the safepoint counts as live across it, since the
+    callee holds it while it may collect.
+    """
+    tracked = {value.name for value in list(function.params) + list(function.slots)
+               if value.layout in (bir.Layout.PTR, bir.Layout.BOXED)}
+    if not tracked:
+        return set()
+    blocks = {block.name: block for block in function.blocks}
+    if not any(_is_safepoint(instruction.op)
+               for block in function.blocks
+               for instruction in block.instructions):
+        return set()
+
+    def uses(instruction: bir.Instruction) -> set[str]:
+        found = {operand.name for operand in _operands(instruction)}
+        if instruction.op == "slot_load":
+            found.add(instruction.args[0])
+        return found & tracked
+
+    def killed(instruction: bir.Instruction) -> str | None:
+        if instruction.op == "slot_store" and instruction.args[0] in tracked:
+            return instruction.args[0]
+        return None
+
+    live_in: dict[str, set[str]] = {block.name: set() for block in function.blocks}
+    changed = True
+    while changed:
+        changed = False
+        for block in reversed(function.blocks):
+            assert block.terminator is not None
+            live = {operand.name
+                    for operand in _terminator_operands(block.terminator)} & tracked
+            for name in _successors(block.terminator):
+                live |= live_in[name]
+            for instruction in reversed(block.instructions):
+                dead = killed(instruction)
+                if dead is not None:
+                    live.discard(dead)
+                live |= uses(instruction)
+            if live != live_in[block.name]:
+                live_in[block.name] = live
+                changed = True
+
+    wanted: set[str] = set()
+    for block in function.blocks:
+        assert block.terminator is not None
+        live = {operand.name
+                for operand in _terminator_operands(block.terminator)} & tracked
+        for name in _successors(block.terminator):
+            live |= live_in[name]
+        for instruction in reversed(block.instructions):
+            if _is_safepoint(instruction.op):
+                wanted |= live | uses(instruction)
+            dead = killed(instruction)
+            if dead is not None:
+                live.discard(dead)
+            live |= uses(instruction)
+    return wanted
+
+
 def _root_slots(function: bir.Function) -> tuple[dict[str, int], int]:
     """Stack storage in the exact-root frame, for the values that need it.
 
@@ -150,10 +235,13 @@ def _root_slots(function: bir.Function) -> tuple[dict[str, int], int]:
                 and value.name not in index):
             index[value.name] = len(index)
 
+    wanted = _live_across_safepoint(function)
     for value in function.params:
-        take(value)
+        if value.name in wanted:
+            take(value)
     for value in function.slots:
-        take(value)
+        if value.name in wanted:
+            take(value)
 
     for block in function.blocks:
         safepoints = [position for position, instruction

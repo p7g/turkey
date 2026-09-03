@@ -126,6 +126,9 @@ def check(src: str, file: str | None = None,
     program_opt = opt.reduce_program(
         joins.discover(opt.reduce_program(program_mono)))
     coretc.check_program(program_opt, decls, classes, coretc.globals_of(env))
+    # Every layout the backend reads a field at has to be knowable, and this
+    # is the program it is handed. See `mono.transparent_parameters`.
+    mono.check_layouts(program_opt)
     return Checked(
         entry.program, ordered, decls, classes, env, loader.order,
         entry.scope.values, main,

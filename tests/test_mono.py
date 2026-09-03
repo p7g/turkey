@@ -634,3 +634,83 @@ def test_the_budget_survives_the_round_count():
     copies = [n for n in names(checked.mono) if n.startswith("Main#depth@")]
     assert len(copies) == MAX_SPECIALIZATIONS, \
         f"{len(copies)} copies over five rounds, not {MAX_SPECIALIZATIONS}"
+
+
+# -- the layout invariant ----------------------------------------------------
+
+
+PROGRAMS_DIR = Path(__file__).parent / "programs"
+
+
+def _conformance_programs():
+    return sorted(path for path in PROGRAMS_DIR.glob("*.tl")
+                  if not path.stem.startswith("err_"))
+
+
+def test_no_reachable_generic_body_can_destructure_polymorphic_data():
+    """The invariant that lets field access be a load.
+
+    A generic body may hold an abstracted value and pass it on -- that is
+    parametricity -- but it may not take one apart, because the layout it
+    would read the field at is decided by the consumer and the layout the
+    field was written at is decided by the construction site, from the operand
+    layouts it happened to have. Nothing makes those agree. The runtime used
+    to reconcile them by boxing, in `turkey_object_get_as`, and that call is
+    what a `getelementptr` and a `load` replaced.
+
+    So this is the property that replaced the counter: over the whole
+    conformance suite, no binding reachable from `main` in the program the
+    backend is handed takes a parameter whose type mentions one of the
+    binding's own type variables without being one.
+    """
+    from turkey import mono
+
+    for program in _conformance_programs():
+        checked = check(program.read_text(encoding="utf-8"), str(program),
+                        [PROGRAMS_DIR])
+        found = mono.transparent_parameters(checked.opt)
+        assert not found, (
+            f"{program.stem}: {found}")
+
+
+def test_the_layout_invariant_is_not_vacuous():
+    """It has to be able to fail, or it says nothing.
+
+    Before specialization and inlining, `Data.Array#bounds` and `#grow` take
+    an `Array a` and read its length and its storage out of it -- which is
+    exactly the shape the check exists to reject. Asserting that it finds them
+    there is what makes the empty answer above worth having.
+
+    It also records where the invariant is actually established: not by
+    monomorphization alone, which still leaves these in its output, but by
+    `opt` inlining them into the ground call sites specialization created.
+    """
+    from turkey import mono
+
+    program = PROGRAMS_DIR / "dicts.tl"
+    checked = check(program.read_text(encoding="utf-8"), str(program),
+                    [PROGRAMS_DIR])
+
+    early = {name for name, _, _ in mono.transparent_parameters(checked.core)}
+    assert any(name.endswith("#bounds") for name in early), (
+        "the check should find the generic bounds check before specialization")
+
+    middle = {name for name, _, _ in mono.transparent_parameters(checked.mono)}
+    assert middle, "monomorphization alone does not establish the invariant"
+    assert not mono.transparent_parameters(checked.opt)
+
+
+def test_a_dictionary_parameter_is_not_a_layout_leak():
+    """`%Dict.C a` is the mechanism, not a violation of it.
+
+    A dictionary is a record of closures, and handing polymorphic data to the
+    closures inside it is how a generic body is supposed to work. Every
+    `%default.` method takes one, so a check that counted them would report
+    every program in the suite and mean nothing.
+    """
+    from turkey import mono
+
+    checked = check(POLYREC)
+    for name, param, _ in mono.transparent_parameters(checked.core):
+        assert not param.startswith("%d"), (
+            f"{name}'s dictionary parameter {param} should be exempt")

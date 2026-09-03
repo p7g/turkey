@@ -127,7 +127,9 @@ from .core import (CAlt, CBind, CExpr, CField, CLam, CLet, CLetRec,
 from .coretc import Fams
 from .decls import DeclTable, substitute
 from .typed import reduce_deep
-from .types import TApp, TCon, TFam, TFun, TTuple, TVar, Type, prune, spine, type_key, vars_of
+from .errors import Unsupported
+from .types import (TApp, TCon, TFam, TFun, TTuple, TVar, Type, prune,
+                    show, spine, type_key, vars_of)
 
 # How many distinct specializations one binding may have, and how large a type
 # argument may be. Either limit stops the unrolling a polymorphically recursive
@@ -980,6 +982,83 @@ def _reachable(program: CProgram, main: str) -> CProgram:
     out.dicts.extend(b for b in program.dicts if b.name in reach)
     out.binds.extend(b for b in program.binds if b.name in reach)
     return out
+
+
+def transparent_parameters(program: CProgram) -> list[tuple[str, str, Type]]:
+    """Where a generic body could take polymorphic data apart.
+
+    A generic body may hold a value of an abstracted type, and pass it on, and
+    nothing else: that is parametricity, and it is why a bare `a` parameter is
+    always fine. What it may not do is *destructure* one, because the layout it
+    would read a field at is decided here and the layout the field was written
+    at is decided at the construction site, from the operand layouts it had
+    (`backend_lower._layout_metadata`). Nothing makes the two agree, and the
+    runtime used to paper over the disagreement by boxing -- which is what
+    `turkey_object_get_as` was for, and why field access could not be a load
+    until this was true.
+
+    So the parameter to look at is a *transparent* one: a type that mentions an
+    abstracted variable without being one. `Array a` is transparent and `a` is
+    not. A dictionary is exempt: `%Dict.C a` is a record of closures, and
+    passing polymorphic data to the closures inside it is the mechanism this
+    exists to leave intact.
+
+    Reachability is from `main`, because an unreachable generic binding is
+    never compiled.
+
+    Two passes together are what make this hold, which is worth writing down
+    because neither does it alone. Specializing dictionaries stops the generic
+    `Data.Array#bounds` and `#grow` from being *reached*; but they are still
+    in `mono`'s output, along with `#push`, `#state` and `Option#map`, and it
+    is `opt` inlining them into their now-ground call sites that removes them.
+    So this is checked on the program the backend is handed, not on `mono`'s,
+    and it is a guard on the combination.
+    """
+    binds = {bind.name: bind for bind in program.dicts + program.binds}
+    seen: set[str] = set()
+    stack = [name for name in binds if name.endswith("#main")]
+    while stack:
+        name = stack.pop()
+        if name in seen or name not in binds:
+            continue
+        seen.add(name)
+        stack.extend(names_of(binds[name].value) & set(binds))
+
+    def dictionary(ty: Type) -> bool:
+        head, _ = spine(prune(ty))
+        return isinstance(head, TCon) and head.name.startswith("%Dict.")
+
+    found: list[tuple[str, str, Type]] = []
+    for name in sorted(seen):
+        bind = binds[name]
+        value = bind.value
+        if not bind.binders or not isinstance(value, CLam):
+            continue
+        abstracted = {variable.id for variable in bind.binders}
+        for param in value.params:
+            ty = prune(param.ty)
+            if isinstance(ty, TVar) or dictionary(ty):
+                continue
+            if {variable.id for variable in vars_of(ty)} & abstracted:
+                found.append((name, param.name, ty))
+    return found
+
+
+def check_layouts(program: CProgram) -> None:
+    """Refuse to compile a program whose layouts cannot all be known.
+
+    Raises rather than warns because the alternative is silence: the backend
+    reads a field at the layout it computes, and if a generic body disagreed
+    the result would be a wrong value rather than an error.
+    """
+    leaks = transparent_parameters(program)
+    if not leaks:
+        return
+    detail = "; ".join(f"{name} takes {param} : {show(ty)}"
+                       for name, param, ty in leaks)
+    raise Unsupported(
+        f"monomorphization left a generic body able to destructure "
+        f"polymorphic data, whose layout it cannot know: {detail}")
 
 
 def monomorphize(program: CProgram, decls: DeclTable, classes: ClassTable,

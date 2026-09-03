@@ -82,11 +82,20 @@ def test_roots_are_the_slots_live_across_a_collection():
     # slot, and slots used to be rooted whether or not a collection could
     # happen while they held anything, so a two-line function paid a root
     # store per temporary.
-    checked = check(
-        'type Tape = Tape { data : Array Int, pos : Int }\n'
-        'fun bump(t : Tape) { t.data[t.pos] = t.data[t.pos] + 1 }\n'
-        'fun main() { let t = Tape { data = [0], pos = 0 }\n'
-        '             bump(t); print(t.data[0]) }')
+    # Recursive so that it survives to be looked at: `loop_breakers` never
+    # inlines a self-recursive binding, and since `_size` started discounting
+    # the names and single-constructor unpacks that make up most of a function
+    # like this one, the straight-line version folds into its caller.
+    checked = check("""
+type Tape = Tape { data : Array Int, pos : Int }
+fun bump(t : Tape, n : Int) {
+    if n <= 0 { return }
+    t.data[t.pos] = t.data[t.pos] + 1
+    bump(t, n - 1)
+}
+fun main() { let t = Tape { data = [0], pos = 0 }
+             bump(t, 3); print(t.data[0]) }
+""")
     source = lower(checked.opt, checked.decls, checked.main)
     bump = next(f for f in source.functions if "23_bump" in f.name)
     pointers = [s for s in bump.slots
@@ -108,10 +117,18 @@ def test_a_function_whose_only_safepoints_are_cold_registers_nothing_hot():
     Both are the out-of-bounds message, so the frame that describes them --
     and the array it describes, and the zeroing that array used to need --
     belongs on the paths that panic, not on the one that stores a byte.
+
+    Recursive so that there is still a function to look at: a self-recursive
+    binding is a loop breaker and is never inlined, which the straight-line
+    version now would be.
     """
     checked = check("""
 type Tape = Tape { data : Array Int, pos : Int }
-fun inc(t : Tape, amount : Int) { t.data[t.pos] = t.data[t.pos] + amount }
+fun inc(t : Tape, amount : Int) {
+    if amount <= 0 { return }
+    t.data[t.pos] = t.data[t.pos] + amount
+    inc(t, amount - 1)
+}
 fun main() { let t = Tape { data = [0], pos = 0 }
              inc(t, 1); print(t.data[0]) }
 """)

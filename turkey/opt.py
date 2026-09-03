@@ -80,7 +80,7 @@ from .types import TBottom, Type, type_key
 # How large a body may be and still be inlined, counted in Core nodes. Small
 # enough that a call site does not become unreadable, large enough for the
 # things this exists to reach: a method's body, an instance's `bind`.
-INLINE_LIMIT = 40
+INLINE_LIMIT = 32
 
 # A shared join is copied only when specializing a known constructor makes
 # the copy small. This is deliberately the same scale as ordinary inlining:
@@ -109,8 +109,10 @@ SCRUTINEE_INLINE_LIMIT = INLINE_LIMIT * 2
 # forwarding call -- `fun error(message) = Prim.error(message)` -- is worth
 # copying, because it costs the caller nothing and keeps the standard library
 # out of the panic trace. Anything larger is the failure path charging the
-# success path, which is what this exists to stop.
-BOTTOM_INLINE_LIMIT = 8
+# success path, which is what this exists to stop. On `_size`'s scale that
+# forwarder is the single call and nothing else, since its argument is a
+# variable and variables are free.
+BOTTOM_INLINE_LIMIT = 1
 
 
 def reduce_program(program: CProgram) -> CProgram:
@@ -1111,11 +1113,49 @@ def _replace_jumps(e, replacements: dict[int, CExpr]):
 
 
 def _size(e) -> int:
-    if isinstance(e, (CExpr, CBind, CAlt)):
-        return 1 + sum(_size(getattr(e, f.name)) for f in fields(e))
+    """Roughly the code `e` becomes, for the inliner to spend a budget of.
+
+    Counting every node as one is what this did, and it charges for a great
+    deal that is not code. `Main#inc` in the brainfuck benchmark -- one array
+    element read, incremented and written back -- measured 98 against a budget
+    of 40 and so stayed a call, while the loop that called it three times a
+    cycle paid a frame, a spill set and a panic-flag test for each. Most of
+    those 98 nodes were names: `match xs { Data.Array#Array(value) -> value }`
+    appeared four times, which is a single-constructor unpack and lowers to
+    one load, and the `let`s naming each intermediate lower to nothing at all,
+    since the backend is in SSA already.
+
+    So: a variable, a literal and a nullary constructor are operands and cost
+    nothing; a type application is erased; a `let` is a name for a value, and
+    costs what it names. A match with one alternative is a projection -- the
+    backend does not even test the tag -- while one with several costs a
+    branch each. This is GHC's `sizeExpr`, which is free for variables,
+    literals, types and coercions and charges per case alternative, and it is
+    the same reasoning as the discounts already here: the budget should track
+    what a call site actually grows by.
+    """
     if isinstance(e, (list, tuple)):
         return sum(_size(x) for x in e)
-    return 0
+    if not isinstance(e, (CExpr, CBind, CAlt)):
+        return 0
+    if isinstance(e, (CVar, CLit, CUnit, CCon)):
+        return 0
+    if isinstance(e, CTyApp):
+        return _size(e.fn)
+    if isinstance(e, CLet):
+        return _size(e.value) + _size(e.body)
+    if isinstance(e, CBind):
+        return _size(e.value)
+    if isinstance(e, CLam):
+        return _size(e.body)
+    if isinstance(e, CJoin):
+        return _size(e.body) + _size(e.rest)
+    if isinstance(e, CAlt):
+        return _size(e.body)
+    if isinstance(e, CMatch):
+        branches = 0 if len(e.alts) <= 1 else len(e.alts)
+        return branches + _size(e.scrutinee) + _size(e.alts)
+    return 1 + sum(_size(getattr(e, f.name)) for f in fields(e))
 
 
 def _free_names(e) -> set[str]:

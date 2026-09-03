@@ -87,13 +87,18 @@ def test_a_large_function_is_inlined_only_when_the_call_site_makes_it_small(
     """The large-inline cost model measures the specialized residual.
 
     The generic body is deliberately over the ordinary limit because its
-    ``None`` arm performs fifteen writes. At ``Some(7)`` that cold arm vanishes,
+    ``None`` arm performs forty writes. At ``Some(7)`` that cold arm vanishes,
     leaving a tiny residual worth admitting; at an unknown argument the call
     remains, so the policy cannot become a disguised higher blanket limit.
+
+    Forty rather than the fifteen this used to say: `_size` charges for the
+    calls and nothing else here, since a string literal is an operand and the
+    `let`s naming nothing are not code, so fifteen of them no longer reach the
+    limit they are meant to be over.
     """
     from turkey.driver import run
 
-    cold = "\n".join(f'        print("cold {i}")' for i in range(15))
+    cold = "\n".join(f'        print("cold {i}")' for i in range(40))
     src = f"""
 fun choose(o : Option Int) -> Int = match o {{
     Some(x) -> x
@@ -113,7 +118,7 @@ fun main() {{
     assert calls_to(named(program, "Main#main"), "Main#choose") == 1
 
     run(src)
-    expected = "7\n" + "".join(f"cold {i}\n" for i in range(15)) + "0\n"
+    expected = "7\n" + "".join(f"cold {i}\n" for i in range(40)) + "0\n"
     assert capsys.readouterr().out == expected
 
 
@@ -453,10 +458,22 @@ def test_type_applied_methods_inline_and_the_remaining_flow_is_tracked():
     generic dictionary is compiled at `BOXED` and read through runtime layout
     checks, and removing it is what lets field access become a load.
 
-    The `Flow` count below is unmoved at 27 by the second change and was taken
+    The `Flow` count below was unmoved at 27 by the second change and was taken
     there by the first, which is the direction that wants no defending: a loop
     body whose `bind` and `pure` are specialized has six fewer
     `Fall`/`Brk`/`Cont`/`Ret` records to allocate.
+
+    It reads 35 now, and the reason is inlining rather than anything undone.
+    `_size` stopped charging for names, type applications and
+    single-constructor unpacks, which is most of what a loop body is made of,
+    so bodies that used to stay calls are copied to their call sites -- and a
+    copied loop body brings its `Flow` records with it. Measured on this
+    fixture, old model against new: opt bindings 52 in both, `Flow` 27 -> 35,
+    emitted IR 35348 -> 40377 lines (+14.2%), front end 2420 -> 1864ms. The
+    brainfuck benchmark's inner loop went 3.22s -> 2.51s over the same change,
+    which is what the IR is being spent on. Note the fusion this guards cannot
+    be switched off to be measured against: without it `question_control.tl`
+    does not typecheck in Core at all, because a jump escapes its join.
     """
     from pathlib import Path
     from turkey.core import CLetRec
@@ -491,7 +508,7 @@ def test_type_applied_methods_inline_and_the_remaining_flow_is_tracked():
         if isinstance(n, CCon)
         and n.name in {"Prelude#Fall", "Prelude#Brk",
                        "Prelude#Cont", "Prelude#Ret"})
-    assert flow == 27, (
+    assert flow == 35, (
         "M16e must retain the nine-construction reduction from fusing recursive "
         "loop result boundaries")
 

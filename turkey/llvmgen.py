@@ -223,6 +223,7 @@ class _Emitter:
         self.string_count = 0
         self.c_strings: dict[str, ir.GlobalVariable] = {}
         self.panic_sites: dict[bir.Frame, ir.GlobalVariable] = {}
+        self.nullary_objects: dict[tuple[int, int], ir.GlobalVariable] = {}
         self._declare_runtime()
 
     def _runtime(self, name: str, ret: ir.Type, args: list[ir.Type]) -> None:
@@ -311,6 +312,28 @@ class _Emitter:
             value_global.linkage = "internal"
             value_global.initializer = ir.Constant(_PTR, None)
             self.string_literals[value] = (bytes_global, value_global, len(data))
+        # A constructor with no fields carries no information beyond its own
+        # identity: `None` is one word of `kind`, one of `tag`, a zero count
+        # and an empty bitmap, and nothing can ever write to it. Allocating a
+        # fresh one per evaluation is the single largest source of garbage in
+        # an iterator-driven program -- `Iterator.next` returns `None` once per
+        # loop and `Some` once per element -- so each distinct (kind, tag) gets
+        # one object built at module entry and shared for the whole run. This
+        # is what OCaml does with constant constructors (immediates, no heap
+        # cell at all), what GHC does with nullary constructors (a single
+        # static closure per constructor), and what Java does for `enum`.
+        for kind, tag in sorted({
+                (int(instruction.args[0]), int(instruction.args[1]))
+                for function in self.source.functions
+                for block in function.blocks
+                for instruction in block.instructions
+                if instruction.op == "object_new" and instruction.args[2] == "0"}):
+            value_global = ir.GlobalVariable(
+                self.module, _PTR,
+                name=f".turkey.nullary.value.{kind}.{tag}".replace("-", "_"))
+            value_global.linkage = "internal"
+            value_global.initializer = ir.Constant(_PTR, None)
+            self.nullary_objects[(kind, tag)] = value_global
         # A pointer-typed global holds a top-level dictionary or value for the
         # whole run, so it is a GC root and has to be one *explicitly*. It was
         # never registered as one: what kept these alive was that
@@ -369,9 +392,10 @@ class _Emitter:
         slots = {slot.name: entry_builder.alloca(_llvm_type(slot.layout), name=slot.name)
                  for slot in source.slots}
         root_index, value_root_count = _root_slots(source)
-        literal_roots = (list(self.string_literals.values())
-                         if source.name == self.source.entry else [])
-        root_count = value_root_count + len(literal_roots)
+        in_entry = source.name == self.source.entry
+        literal_roots = list(self.string_literals.values()) if in_entry else []
+        nullary_roots = list(self.nullary_objects.items()) if in_entry else []
+        root_count = value_root_count + len(literal_roots) + len(nullary_roots)
         root_frame = entry_builder.alloca(_ROOT_FRAME, name="root_frame")
         panic_frame_storage = entry_builder.alloca(_PANIC_FRAME, name="panic_frame")
         root_array_type = ir.ArrayType(_PTR, max(1, root_count))
@@ -425,6 +449,17 @@ class _Emitter:
                 ir.Constant(_I32, value_root_count + offset),
             ])
             entry_builder.store(literal, pointer)
+        for offset, ((kind, tag), value_global) in enumerate(nullary_roots):
+            made = entry_builder.call(self.runtime["turkey_object_new"], [
+                ir.Constant(_I32, kind), ir.Constant(_I32, tag),
+                ir.Constant(_I64, 0), ir.Constant(_I64, 0),
+            ])
+            entry_builder.store(made, value_global)
+            pointer = entry_builder.gep(root_values, [
+                ir.Constant(_I32, 0),
+                ir.Constant(_I32, value_root_count + len(literal_roots) + offset),
+            ])
+            entry_builder.store(made, pointer)
         self._slot_layouts = {slot.name: slot.layout for slot in source.slots}
         for param in source.params:
             if param.name in root_index:
@@ -656,6 +691,10 @@ class _Emitter:
                           self._cell_value(builder, args[0]))
             return None, builder
         if op == "object_new":
+            if instruction.args[2] == "0":
+                shared = self.nullary_objects[
+                    (int(instruction.args[0]), int(instruction.args[1]))]
+                return builder.load(shared, name=instruction.result.name), builder
             raw = [ir.Constant(_I32, int(instruction.args[0])),
                    ir.Constant(_I32, int(instruction.args[1])),
                    ir.Constant(_I64, int(instruction.args[2])),

@@ -597,7 +597,16 @@ class _Emitter:
                 if live is not None:
                     self._publish_roots(builder, live, values, slots)
                 self._current_frame = instruction.frame
-                if instruction.frame is not None and self._panic_here:
+                # Only before a call. The callee raises the panic, so the site
+                # has to be in place before control leaves; an inline check
+                # raises it itself, and sets the site in the block where it
+                # fails. `+` is checked, so leaving this unconditional put a
+                # store in the body of every arithmetic loop in the program --
+                # and, since it is a store into an alloca whose address has
+                # escaped, one that the loads around it had to be ordered
+                # against.
+                if (instruction.frame is not None and self._panic_here
+                        and _is_safepoint(instruction.op)):
                     self._frame_update(builder, instruction.frame)
                 value, builder = self._instruction(
                     function, builder, instruction, values, slots)
@@ -1304,7 +1313,8 @@ class _Emitter:
         raise Unsupported(f"LLVM primitive Prim.{name} is not implemented")
 
     def _guard(self, function: ir.Function, builder: ir.IRBuilder,
-               failed: ir.Value, message: str | None) -> ir.IRBuilder:
+               failed: ir.Value, message: str | None,
+               site: bool = True) -> ir.IRBuilder:
         bad = function.append_basic_block("panic")
         good = function.append_basic_block("checked")
         builder.cbranch(failed, bad, good)
@@ -1321,8 +1331,12 @@ class _Emitter:
         registered = self._panic_here
         if not registered and self._current_frame is not None:
             self._frame_enter(panic_builder, self._current_frame.function)
-            self._frame_update(panic_builder, self._current_frame)
             registered = True
+        if site and self._current_frame is not None:
+            # Where the check failed. `_propagate` passes `site=False`: its
+            # panic was raised by the callee, which captured the trace before
+            # returning, so there is nothing left for a site to say.
+            self._frame_update(panic_builder, self._current_frame)
         if message is not None:
             self._panic(panic_builder, message)
         # A guard's panic block is a way out of the enclosing bir block, so it
@@ -1365,6 +1379,7 @@ class _Emitter:
         return self._guard(
             function, builder,
             builder.icmp_unsigned("!=", panicked, ir.Constant(_I32, 0)), None,
+            site=False,
         )
 
     def _panic(self, builder: ir.IRBuilder, message: str) -> None:

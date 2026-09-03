@@ -11,8 +11,8 @@ from dataclasses import fields as data_fields
 
 from . import ast, backend_ir as bir
 from .core import (
-    CApp, CArray, CAssign, CBind, CCon, CDeref, CExpr, CField, CIf, CIndex,
-    CJoin, CJump, CLam, CLet, CLetRec, CLit, CMatch, CPrim, CProgram, CProject,
+    CAlt, CApp, CArray, CAssign, CBind, CCon, CDeref, CExpr, CField, CIf,
+    CIndex, CJoin, CJump, CLam, CLet, CLetRec, CLit, CMatch, CPrim, CProgram, CProject,
     CRecord, CRef, CTuple, CTyApp, CTyLam, CUnit, CVar, is_ref, names_of,
 )
 from .builtins import PRIM_NAMES
@@ -103,6 +103,7 @@ class _FunctionLowerer:
         self.result_layout = (bir.Layout.BOXED if self.closure_abi
                               else layout_of(function_type.ret))
         self.count = 0
+        self.flat_refs = _flat_refs(lam.body)
         self.blocks: list[bir.Block] = []
         self.slots: list[bir.Value] = []
         self.slot_names: set[str] = set()
@@ -336,7 +337,17 @@ class _FunctionLowerer:
               block: bir.Block, dest: _Destination) -> None:
         assert expr is not None
         if isinstance(expr, CLet):
-            value_layout = _expr_layout(expr.value)
+            # A `var` whose cell never escapes is the slot itself: the value
+            # goes in where the pointer to it used to, and the `CRef` around
+            # it is dropped. See `_flat_refs`.
+            # The value has to be checked as well as the name: `flat_refs`
+            # compares names bare, so another binding of the same name -- one
+            # that is not a cell at all -- must not have a `CRef` unwrapped
+            # off it.
+            flattened = (expr.name in self.flat_refs
+                         and isinstance(expr.value, CRef))
+            bound = expr.value.value if flattened else expr.value
+            value_layout = _expr_layout(bound)
             after = self.new_block("let", value_layout)
             slot = self.new_slot(expr.name, value_layout)
             after.instructions.append(
@@ -344,7 +355,7 @@ class _FunctionLowerer:
             inner = dict(env)
             inner[expr.name] = slot
             self.lower(expr.body, inner, joins, after, dest)
-            self.lower(expr.value, env, joins, block, _Destination(after))
+            self.lower(bound, env, joins, block, _Destination(after))
             return
         if isinstance(expr, CIf):
             def branch(at: bir.Block, values: list[bir.Operand]) -> None:
@@ -537,6 +548,16 @@ class _FunctionLowerer:
                                   at, "cell_new", (xs[0],), bir.Layout.PTR)))
             return
         if isinstance(expr, CDeref):
+            # `env` as well as the name, because `flat_refs` compares names
+            # bare: a top-level `var` sharing a name with a flattened local is
+            # reached through `self.globals`, not through a slot.
+            if (isinstance(expr.target, CVar)
+                    and expr.target.name in self.flat_refs
+                    and expr.target.name in env):
+                slot = env[expr.target.name]
+                loaded = self.emit(block, "slot_load", (slot.name,), slot.layout)
+                done(block, self.coerce(block, loaded, layout_of(expr.ty)))
+                return
             self.lower_values([expr.target], env, joins, block,
                               lambda at, xs: done(at, self.emit(
                                   at, "cell_load", (xs[0],), layout_of(expr.ty))))
@@ -559,6 +580,17 @@ class _FunctionLowerer:
                     done(at, bir.Constant(bir.Layout.UNIT, 0))
                 self.lower_values([expr.value, expr.target.target, expr.target.index],
                                   env, joins, block, set_index)
+                return
+            if (isinstance(expr.target, CVar)
+                    and expr.target.name in self.flat_refs
+                    and expr.target.name in env):
+                slot = env[expr.target.name]
+                def store(at: bir.Block, xs: list[bir.Operand]) -> None:
+                    at.instructions.append(bir.Instruction(
+                        "slot_store",
+                        (slot.name, self.coerce(at, xs[0], slot.layout))))
+                    done(at, bir.Constant(bir.Layout.UNIT, 0))
+                self.lower_values([expr.value], env, joins, block, store)
                 return
             if not is_ref(expr.target.ty):
                 raise Unsupported("LLVM assignment target is not addressable", expr.span)
@@ -856,6 +888,68 @@ def _erase_types(expr: CExpr | None) -> CExpr | None:
     while isinstance(expr, (CTyApp, CTyLam)):
         expr = expr.fn if isinstance(expr, CTyApp) else expr.body
     return expr
+
+
+def _flat_refs(body) -> set[str]:
+    """The `var` cells in this body that can be a stack slot instead.
+
+    `lower.py` makes every `var` a `CRef`, because a `var` is captured by
+    reference: a closure that writes one writes through to it, and a heap cell
+    is what makes that true. A `var` no closure can see owes nothing to that
+    rule, and paying for it costs an allocation, an indirection on every read
+    and write, a GC root, and a value `mem2reg` can never promote to a
+    register.
+
+    This is OCaml's `simplify_local_refs` and MLton's `LocalRef` pass, and the
+    criterion is theirs: a cell is local when every mention of it is either a
+    read or a write of the cell itself, and none of them is inside a closure.
+    Anything else -- passed as an argument, returned, put in a record -- is the
+    cell escaping, and then the cell is what the program means.
+
+    Done here rather than in `lower.py` because a `var`'s *type* is `%Ref t`,
+    fixed by the elaborator and checked by `coretc`; Core has no mutable
+    binding that is not a reference. So the cell stays in Core and stops
+    existing here, where the backend IR already has a mutable slot to put it
+    in and nothing downstream re-derives the type.
+
+    Conservative on shadowing: names are compared bare, so one disqualified
+    mention rules out every binding sharing that name.
+    """
+    import dataclasses
+    candidates: set[str] = set()
+    escaped: set[str] = set()
+
+    def children(node, closed: bool) -> None:
+        if not dataclasses.is_dataclass(node):
+            return
+        for field in dataclasses.fields(node):
+            value = getattr(node, field.name)
+            for item in value if isinstance(value, list) else [value]:
+                if isinstance(item, (CExpr, CBind, CAlt)):
+                    walk(item, closed)
+
+    def walk(node, closed: bool) -> None:
+        if isinstance(node, CLet) and isinstance(node.value, CRef) and not closed:
+            candidates.add(node.name)
+        if isinstance(node, CVar):
+            # A bare mention is the cell itself being handed somewhere.
+            escaped.add(node.name)
+            return
+        if isinstance(node, CDeref) and isinstance(node.target, CVar):
+            # Reading through the cell needs no cell -- unless a closure is
+            # doing the reading, which needs the cell to share.
+            if closed:
+                escaped.add(node.target.name)
+            return
+        if isinstance(node, CAssign) and isinstance(node.target, CVar):
+            if closed:
+                escaped.add(node.target.name)
+            walk(node.value, closed)
+            return
+        children(node, closed or isinstance(node, CLam))
+
+    walk(body, False)
+    return candidates - escaped
 
 
 def _pointer_layout(layout: bir.Layout) -> bool:

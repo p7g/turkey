@@ -1,3 +1,5 @@
+import os
+
 import pytest
 from pathlib import Path
 
@@ -181,6 +183,42 @@ fun main() {
     assert capfd.readouterr().out == "0\n1\n2\n1\n2\n"
 
 
+def test_a_var_no_closure_sees_is_a_slot_rather_than_a_cell():
+    """Both directions of `backend_lower._flat_refs`.
+
+    `lower.py` makes every `var` a `CRef` because a `var` is captured by
+    reference. A `var` no closure mentions owes nothing to that rule, and the
+    cell costs an allocation, an indirection per access, a GC root, and a value
+    `mem2reg` can never put in a register.
+    """
+    def allocates_a_cell(source: str) -> bool:
+        # Call sites only: the declaration is in the module either way.
+        checked = check(source)
+        return any(
+            "@turkey_cell_new(" in line and " call " in f" {line} "
+            for line in generate(
+                checked.opt, checked.decls, checked.main).splitlines())
+
+    assert not allocates_a_cell("""
+fun main() {
+    var total = 0
+    for var i = 0; i < 10; i = i + 1 { total = total + i }
+    print(total)
+}
+""")
+
+    # The same loop, with a closure that writes `total`. The cell is what
+    # makes that write visible outside the closure, so it has to stay.
+    assert allocates_a_cell("""
+fun main() {
+    var total = 0
+    let bump = fun() -> Int = { total = total + 1; total }
+    for var i = 0; i < 10; i = i + 1 { total = total + i }
+    print(bump())
+}
+""")
+
+
 def test_native_recursive_local_closure_uses_two_phase_environment(capfd):
     native("""
 fun main() {
@@ -349,6 +387,9 @@ def test_field_and_element_access_is_emitted_inline(name, monkeypatch):
         f"be a getelementptr and a load")
 
 
+@pytest.mark.skipif(
+    "TURKEY_GC_STRESS" in os.environ,
+    reason="half a million allocations, each collecting the whole live heap")
 def test_a_deep_heap_chain_is_traced_without_the_c_stack(capfd):
     """Tracing is a worklist, so its depth is not the C stack's depth.
 

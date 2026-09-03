@@ -57,6 +57,25 @@ def test_a_nullary_constructor_is_built_once_for_the_whole_run():
     assert text.count("@.turkey.nullary.value.") >= 2
 
 
+def test_a_for_loop_allocates_no_cursor():
+    # `Iterator.iter` builds a one-field mutable record and `next` reads and
+    # writes it. Once `next` is inlined the record is born and dies inside
+    # one function without being handed to anything, so it is its field and
+    # nothing else -- and a loop over an array allocates nothing at all.
+    checked = check(
+        'fun total(xs : Array Int) -> Int {\n'
+        '    var sum = 0\n'
+        '    for x in xs { sum = sum + x }\n'
+        '    sum\n'
+        '}\n'
+        'fun main() { print(total([1, 2, 3])) }')
+    source = lower(checked.opt, checked.decls, checked.main)
+    total = next(f for f in source.functions if "23_total" in f.name)
+    built = [i.op for b in total.blocks for i in b.instructions
+             if i.op in ("object_new", "array_new", "cell_new", "closure_new")]
+    assert not built, f"the loop still allocates {built}"
+
+
 def test_roots_are_the_slots_live_across_a_collection():
     # `bump` allocates nothing and the only thing in it that can collect is
     # the bounds check it calls. `backend_lower` gives every ANF temporary a

@@ -104,6 +104,8 @@ class _FunctionLowerer:
                               else layout_of(function_type.ret))
         self.count = 0
         self.flat_refs = _flat_refs(lam.body)
+        self.flat_records = _flat_records(lam.body)
+        self.record_slots: dict[str, dict[str, bir.Value]] = {}
         self.blocks: list[bir.Block] = []
         self.slots: list[bir.Value] = []
         self.slot_names: set[str] = set()
@@ -336,6 +338,26 @@ class _FunctionLowerer:
               joins: dict[str, tuple[bir.Block, list[bir.Value]]],
               block: bir.Block, dest: _Destination) -> None:
         assert expr is not None
+        if (isinstance(expr, CLet) and not expr.binders
+                and isinstance(expr.value, CRecord)
+                and expr.name in self.flat_records):
+            # A record no one can see the identity of is its fields and
+            # nothing else. See `_flat_records`.
+            record = expr.value
+            names = [name for name, _ in record.fields]
+
+            def scattered(at: bir.Block, values: list[bir.Operand]) -> None:
+                held = {}
+                for name, value in zip(names, values):
+                    slot = self.new_slot(f"{expr.name}_{name}", value.layout)
+                    at.instructions.append(
+                        bir.Instruction("slot_store", (slot.name, value)))
+                    held[name] = slot
+                self.record_slots[expr.name] = held
+                self.lower(expr.body, env, joins, at, dest)
+            self.lower_values([value for _, value in record.fields],
+                              env, joins, block, scattered)
+            return
         if isinstance(expr, CLet):
             # A `var` whose cell never escapes is the slot itself: the value
             # goes in where the pointer to it used to, and the `CRef` around
@@ -563,6 +585,19 @@ class _FunctionLowerer:
                                   at, "cell_load", (xs[0],), layout_of(expr.ty))))
             return
         if isinstance(expr, CAssign):
+            if (isinstance(expr.target, CField)
+                    and isinstance(expr.target.target, CVar)
+                    and expr.target.target.name in self.record_slots):
+                slot = self.record_slots[
+                    expr.target.target.name][expr.target.name]
+                def scattered_set(at: bir.Block, xs: list[bir.Operand]) -> None:
+                    at.instructions.append(bir.Instruction(
+                        "slot_store",
+                        (slot.name, self.coerce(at, xs[0], slot.layout))))
+                    done(at, bir.Constant(bir.Layout.UNIT, 0))
+                self.lower_values([expr.value], env, joins, block,
+                                  scattered_set)
+                return
             if isinstance(expr.target, CField):
                 index = self.field_index(expr.target.target.ty, expr.target.name)
                 def set_field(at: bir.Block, xs: list[bir.Operand]) -> None:
@@ -633,6 +668,12 @@ class _FunctionLowerer:
                             "object_set", (made, str(index), value)))
                 done(at, made)
             self.lower_values(items, env, joins, block, aggregate)
+            return
+        if (isinstance(expr, CField) and isinstance(expr.target, CVar)
+                and expr.target.name in self.record_slots):
+            slot = self.record_slots[expr.target.name][expr.name]
+            loaded = self.emit(block, "slot_load", (slot.name,), slot.layout)
+            done(block, self.coerce(block, loaded, layout_of(expr.ty)))
             return
         if isinstance(expr, (CField, CProject, CIndex)):
             targets = ([expr.target, expr.index] if isinstance(expr, CIndex)
@@ -888,6 +929,70 @@ def _erase_types(expr: CExpr | None) -> CExpr | None:
     while isinstance(expr, (CTyApp, CTyLam)):
         expr = expr.fn if isinstance(expr, CTyApp) else expr.body
     return expr
+
+
+def _flat_records(body) -> set[str]:
+    """The record bindings in this body that can be their fields instead.
+
+    A `for` loop's cursor is the case this is for. `Iterator.iter` builds a
+    one-field mutable record, `next` reads and writes that field, and once
+    `next` is inlined the record is created and destroyed inside one function
+    without ever being handed to anything -- an allocation, a GC root and two
+    memory operations per loop step, for a value that could be a register.
+
+    The criterion is the one `_flat_refs` uses, and the one every escape
+    analysis uses: a record is local when every mention of it is a field of
+    it, read or assigned, and none is inside a closure. A bare mention means
+    the record itself is going somewhere -- passed, returned, matched on,
+    stored in another record -- and then its identity is observable and the
+    allocation is what the program means. HotSpot and Go decide the same
+    question by escape analysis and LLVM's SROA decides it for an `alloca`;
+    the difference here is only that the answer is available in Core.
+
+    Conservative on shadowing, like `_flat_refs`: names are compared bare, so
+    one disqualified mention rules out every binding sharing that name, and a
+    name bound to a record twice is refused outright rather than reasoned
+    about.
+    """
+    import dataclasses
+    candidates: set[str] = set()
+    repeated: set[str] = set()
+    escaped: set[str] = set()
+
+    def children(node, closed: bool) -> None:
+        if not dataclasses.is_dataclass(node):
+            return
+        for field in dataclasses.fields(node):
+            value = getattr(node, field.name)
+            for item in value if isinstance(value, list) else [value]:
+                if isinstance(item, (CExpr, CBind, CAlt)):
+                    walk(item, closed)
+                elif isinstance(item, tuple):
+                    for part in item:
+                        if isinstance(part, (CExpr, CBind, CAlt)):
+                            walk(part, closed)
+
+    def walk(node, closed: bool) -> None:
+        if isinstance(node, CLet) and isinstance(node.value, CRecord):
+            if node.name in candidates:
+                repeated.add(node.name)
+            elif not closed and not node.binders:
+                candidates.add(node.name)
+            else:
+                escaped.add(node.name)
+        if isinstance(node, CVar):
+            escaped.add(node.name)
+            return
+        if isinstance(node, CField) and isinstance(node.target, CVar):
+            # Reading or writing one field needs no record -- unless a closure
+            # is doing it, which needs the record to share.
+            if closed:
+                escaped.add(node.target.name)
+            return
+        children(node, closed or isinstance(node, CLam))
+
+    walk(body, False)
+    return candidates - escaped - repeated
 
 
 def _flat_refs(body) -> set[str]:

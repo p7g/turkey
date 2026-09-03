@@ -28,16 +28,25 @@ int32_t turkey_has_panicked;
    exactly when this stays zero. */
 static int64_t layout_reconciliations;
 
-typedef struct PanicCallFrame {
-    struct PanicCallFrame *previous;
-    const char *function_name;
+/* Where a frame currently is, as a constant the compiler emits once per site.
+   Generated code changes its position by storing a pointer to one of these,
+   which is a store rather than the four it used to take -- and this happens
+   before every operation that can panic, so the four were on the hot path of
+   every loop that could overflow or index out of bounds. */
+typedef struct PanicSite {
+    const char *function;
     const char *file;
     int64_t line;
     int64_t col;
+} PanicSite;
+
+typedef struct PanicCallFrame {
+    struct PanicCallFrame *previous;
+    const PanicSite *site;
 } PanicCallFrame;
 
 static PanicCallFrame *panic_calls;
-static PanicCallFrame *panic_trace;
+static const PanicSite **panic_trace;
 static int64_t panic_trace_count;
 
 typedef struct HeapHeader {
@@ -212,16 +221,17 @@ static void capture_panic_trace(void) {
     int64_t count = 0;
     for (PanicCallFrame *frame = panic_calls; frame != NULL;
          frame = frame->previous)
-        if (frame->line != 0) count++;
-    panic_trace = malloc((size_t)count * sizeof(PanicCallFrame));
+        if (frame->site != NULL && frame->site->line != 0) count++;
+    panic_trace = malloc((size_t)count * sizeof(const PanicSite *));
     if (panic_trace == NULL) return;
     panic_trace_count = count;
     int64_t index = 0;
     for (PanicCallFrame *frame = panic_calls; frame != NULL;
          frame = frame->previous) {
-        if (frame->line == 0) continue;
-        panic_trace[index] = *frame;
-        panic_trace[index].previous = NULL;
+        if (frame->site == NULL || frame->site->line == 0) continue;
+        // The site is a constant in the compiled module, which outlives the
+        // frame that pointed at it, so the snapshot can be of pointers.
+        panic_trace[index] = frame->site;
         index++;
     }
 }
@@ -256,15 +266,11 @@ void turkey_panic_clear(void) {
     panic_trace_count = 0;
 }
 
-void turkey_frame_enter(void *pointer, const char *function_name,
-                        const char *file, int64_t line, int64_t col) {
+void turkey_frame_enter(void *pointer, const void *site) {
     PanicCallFrame *frame = pointer;
     if (frame == NULL) { turkey_panic("invalid panic frame"); return; }
     frame->previous = panic_calls;
-    frame->function_name = function_name;
-    frame->file = file;
-    frame->line = line;
-    frame->col = col;
+    frame->site = site;
     panic_calls = frame;
 }
 
@@ -279,24 +285,24 @@ int64_t turkey_frame_count(void) {
     return panic_trace_count;
 }
 
-static PanicCallFrame *panic_frame_at(int64_t index) {
-    return index < 0 || index >= panic_trace_count ? NULL : &panic_trace[index];
+static const PanicSite *panic_frame_at(int64_t index) {
+    return index < 0 || index >= panic_trace_count ? NULL : panic_trace[index];
 }
 
 const char *turkey_frame_function(int64_t index) {
-    PanicCallFrame *frame = panic_frame_at(index);
-    return frame == NULL ? NULL : frame->function_name;
+    const PanicSite *frame = panic_frame_at(index);
+    return frame == NULL ? NULL : frame->function;
 }
 const char *turkey_frame_file(int64_t index) {
-    PanicCallFrame *frame = panic_frame_at(index);
+    const PanicSite *frame = panic_frame_at(index);
     return frame == NULL ? NULL : frame->file;
 }
 int64_t turkey_frame_line(int64_t index) {
-    PanicCallFrame *frame = panic_frame_at(index);
+    const PanicSite *frame = panic_frame_at(index);
     return frame == NULL ? 0 : frame->line;
 }
 int64_t turkey_frame_col(int64_t index) {
-    PanicCallFrame *frame = panic_frame_at(index);
+    const PanicSite *frame = panic_frame_at(index);
     return frame == NULL ? 0 : frame->col;
 }
 

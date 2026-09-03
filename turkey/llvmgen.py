@@ -28,7 +28,13 @@ _I64 = ir.IntType(64)
 _F64 = ir.DoubleType()
 _PTR = _I8.as_pointer()
 _ROOT_FRAME = ir.LiteralStructType([_PTR, _PTR, _I64, _PTR])
-_PANIC_FRAME = ir.LiteralStructType([_PTR, _PTR, _PTR, _I64, _I64])
+# `PanicCallFrame` is now {previous, site}, and `PanicSite` is the constant the
+# frame points at. Moving a frame is one store of a pointer to a constant this
+# module already holds, rather than four stores of its fields -- and that
+# happens before every operation that can panic, so the four were in the body
+# of every loop that could overflow or index out of bounds.
+_PANIC_FRAME = ir.LiteralStructType([_PTR, _PTR])
+_PANIC_SITE = ir.LiteralStructType([_PTR, _PTR, _I64, _I64])
 # `TurkeyObject` from runtime/turkey_runtime.h, field for field. Reading a slot
 # is a `getelementptr` rather than a call because the layout it would be read
 # at is a compile-time constant in a monomorphized program; see
@@ -215,6 +221,8 @@ class _Emitter:
         self.closure_thunks: dict[str, ir.Function] = {}
         self.string_literals: dict[str, tuple[ir.GlobalVariable, ir.GlobalVariable, int]] = {}
         self.string_count = 0
+        self.c_strings: dict[str, ir.GlobalVariable] = {}
+        self.panic_sites: dict[bir.Frame, ir.GlobalVariable] = {}
         self._declare_runtime()
 
     def _runtime(self, name: str, ret: ir.Type, args: list[ir.Type]) -> None:
@@ -275,8 +283,7 @@ class _Emitter:
         self._runtime("turkey_panic", ir.VoidType(), [_PTR])
         self._runtime("turkey_panic_string", ir.VoidType(), [_PTR])
         self._runtime("turkey_panicked", _I32, [])
-        self._runtime("turkey_frame_enter", ir.VoidType(),
-                      [_PTR, _PTR, _PTR, _I64, _I64])
+        self._runtime("turkey_frame_enter", ir.VoidType(), [_PTR, _PTR])
         self._runtime("turkey_frame_leave", ir.VoidType(), [_PTR])
         self._runtime("turkey_root_enter", ir.VoidType(), [_PTR, _PTR, _I64, _PTR])
         self._runtime("turkey_root_leave", ir.VoidType(), [_PTR])
@@ -394,10 +401,13 @@ class _Emitter:
             ir.Constant(_I64, root_count),
             self._c_string(entry_builder, source.name, ".turkey.function"),
         ])
+        # Entered at the function's own name with no position: line 0 is what
+        # `capture_panic_trace` reads as "this frame has not reached a site
+        # yet", and such a frame is left out of the trace.
         entry_builder.call(self.runtime["turkey_frame_enter"], [
             entry_builder.bitcast(panic_frame_storage, _PTR),
-            self._c_string(entry_builder, source.name, ".turkey.frame"),
-            ir.Constant(_PTR, None), ir.Constant(_I64, 0), ir.Constant(_I64, 0),
+            entry_builder.bitcast(
+                self._panic_site(bir.Frame(source.name, None, 0, 0)), _PTR),
         ])
         self._root_frame = root_frame
         self._root_values = root_values
@@ -576,17 +586,9 @@ class _Emitter:
         builder.store(value, pointer)
 
     def _frame_update(self, builder: ir.IRBuilder, frame: bir.Frame) -> None:
-        file = (ir.Constant(_PTR, None) if frame.file is None else
-                self._c_string(builder, frame.file, ".turkey.file"))
-        values = (
-            self._c_string(builder, frame.function, ".turkey.frame"),
-            file, ir.Constant(_I64, frame.line), ir.Constant(_I64, frame.col),
-        )
-        for index, value in enumerate(values, 1):
-            pointer = builder.gep(self._panic_frame_storage, [
-                ir.Constant(_I32, 0), ir.Constant(_I32, index),
-            ])
-            builder.store(value, pointer)
+        pointer = builder.gep(self._panic_frame_storage, [
+            ir.Constant(_I32, 0), ir.Constant(_I32, 1)])
+        builder.store(builder.bitcast(self._panic_site(frame), _PTR), pointer)
 
     def _operand(self, operand: bir.Operand, values: dict[str, ir.Value]) -> ir.Value:
         if isinstance(operand, bir.Value):
@@ -991,6 +993,17 @@ class _Emitter:
 
     def _c_string(self, builder: ir.IRBuilder, value: str,
                   prefix: str) -> ir.Value:
+        return builder.bitcast(self._c_string_global(value, prefix), _PTR)
+
+    def _c_string_global(self, value: str, prefix: str) -> ir.GlobalVariable:
+        """The NUL-terminated bytes, as a private constant.
+
+        Interned: a panic site names its function and its file, and a function
+        with twenty of them would otherwise emit its own name twenty times.
+        """
+        found = self.c_strings.get(value)
+        if found is not None:
+            return found
         data = value.encode("utf-8") + b"\0"
         array = ir.Constant(ir.ArrayType(_I8, len(data)), bytearray(data))
         glob = ir.GlobalVariable(self.module, array.type,
@@ -999,7 +1012,35 @@ class _Emitter:
         glob.global_constant = True
         glob.linkage = "private"
         glob.initializer = array
-        return builder.bitcast(glob, _PTR)
+        self.c_strings[value] = glob
+        return glob
+
+    def _panic_site(self, frame: bir.Frame) -> ir.GlobalVariable:
+        """The `PanicSite` constant for one source position.
+
+        One per distinct position rather than per mention, so a loop body that
+        updates the frame before each of its operations shares whatever sites
+        repeat, and the module holds a table rather than a copy per store.
+        """
+        found = self.panic_sites.get(frame)
+        if found is not None:
+            return found
+        empty = ir.Constant(_PTR, None)
+        site = ir.Constant(_PANIC_SITE, [
+            self._c_string_global(frame.function, ".turkey.frame").gep(
+                [ir.Constant(_I32, 0), ir.Constant(_I32, 0)]),
+            empty if frame.file is None else
+            self._c_string_global(frame.file, ".turkey.file").gep(
+                [ir.Constant(_I32, 0), ir.Constant(_I32, 0)]),
+            ir.Constant(_I64, frame.line), ir.Constant(_I64, frame.col),
+        ])
+        glob = ir.GlobalVariable(self.module, _PANIC_SITE,
+                                 name=f".turkey.site.{len(self.panic_sites)}")
+        glob.global_constant = True
+        glob.linkage = "private"
+        glob.initializer = site
+        self.panic_sites[frame] = glob
+        return glob
 
     def _to_i64(self, builder: ir.IRBuilder, value: ir.Value) -> ir.Value:
         if value.type == _F64: return builder.bitcast(value, _I64)

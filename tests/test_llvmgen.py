@@ -92,8 +92,46 @@ def test_roots_are_the_slots_live_across_a_collection():
     pointers = [s for s in bump.slots
                 if s.layout in (bir.Layout.PTR, bir.Layout.BOXED)]
     assert len(pointers) >= 8, "the lowering should still be slot-heavy"
-    _, roots = _root_slots(bump)
+    index, roots, live = _root_slots(bump)
     assert roots < len(pointers)
+    # And each safepoint names its own live set rather than the union: the
+    # frame is registered once but the collector is told, per call, exactly
+    # which of those slots holds something.
+    assert live, "the bounds check it calls is a safepoint"
+    assert any(names < set(index) for names in live.values()), (
+        "no safepoint should have to claim every root the function has")
+
+
+def test_a_function_whose_only_safepoints_are_cold_registers_nothing_hot():
+    """`inc` is the brainfuck benchmark's hot loop body, and it has two calls.
+
+    Both are the out-of-bounds message, so the frame that describes them --
+    and the array it describes, and the zeroing that array used to need --
+    belongs on the paths that panic, not on the one that stores a byte.
+    """
+    checked = check("""
+type Tape = Tape { data : Array Int, pos : Int }
+fun inc(t : Tape, amount : Int) { t.data[t.pos] = t.data[t.pos] + amount }
+fun main() { let t = Tape { data = [0], pos = 0 }
+             inc(t, 1); print(t.data[0]) }
+""")
+    text = generate(checked.opt, checked.decls, checked.main)
+    body = _body(text, "23_inc")
+    entry = body.split("\n\n")[0]
+    assert "@turkey_root_enter" in body, "the cold paths still need a frame"
+    assert "@turkey_root_enter" not in entry, (
+        "the hot path should register no root frame")
+    assert "@turkey_frame_enter" not in entry, (
+        "the hot path should register no panic frame")
+
+
+def _body(text: str, name: str) -> str:
+    """The text of one generated function, by the fragment naming it."""
+    lines = text.splitlines()
+    start = next(i for i, line in enumerate(lines)
+                 if line.startswith("define ") and name in line)
+    end = next(i for i in range(start, len(lines)) if lines[i] == "}")
+    return "\n".join(lines[start:end])
 
 
 def test_language_string_literals_are_allocated_once_at_module_entry():

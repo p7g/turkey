@@ -350,9 +350,7 @@ to make native execution correct. Allocation and explicitly annotated runtime
 calls are safepoints.
 
 Generated functions maintain exact shadow-stack root frames linked through
-the runtime state. The first implementation may root every pointer-capable
-local for the full function, provided slots are initialized before a
-safepoint. A later liveness pass may shorten ranges. Roots include:
+the runtime state. Roots include:
 
 - live pointer and boxed locals;
 - closure environments and arguments;
@@ -360,10 +358,40 @@ safepoint. A later liveness pass may shorten ranges. Roots include:
 - top-level values and dictionaries; and
 - the current panic object while unwinding.
 
+The root set is a property of a program point, not of a function. Rooting
+every pointer-capable local for the whole call -- which the first
+implementation did -- lets one cold call site decide what the hot path costs,
+and cannot be undone afterwards: the frame's address escapes into
+`turkey_root_enter`, so no LLVM pass may drop a store into it. `Main#inc` in
+the brainfuck benchmark has five roots and two safepoints, and both safepoints
+are the cold out-of-bounds calls.
+
+So `llvmgen` computes a live set for each safepoint separately
+(`_safepoint_live`) and stores it, as a bitmap in `RootFrame.live`, before the
+call it describes; a slot the bitmap does not name is not scanned and so does
+not have to be initialized. Registration itself sinks to the blocks that
+contain a safepoint, plus any block on a cycle through one, so a loop with a
+call registers once per loop rather than once per iteration and a function
+whose only safepoints are cold registers nothing on its hot path
+(`_frame_region`). Panic frames get the same treatment, and an inline check --
+arithmetic overflow, a shift amount -- registers on its failure branch rather
+than on the way in.
+
 The collector traces objects through static layout descriptors. It must not
 scan the native stack conservatively; doing so would make behavior depend on
 optimizer register allocation and would complicate the later bootstrap
 backend.
+
+The alternative is what Go, OCaml 5 and the JVM do: let the code generator
+emit a stack map per safepoint and unwind the real machine stack. LLVM will do
+this, through `gc.statepoint` and a `.llvm_stackmaps` section, but two things
+stand in the way. llvmlite exposes `get_function_address` and
+`get_global_value_address` and no way to read a *loaded* section, so the
+records cannot be tied to JIT'd code without parsing the object out of an
+object-cache hook and matching them to symbols by hand; and statepoint
+lowering requires rewriting every pointer use after a call through
+`gc.relocate`, which is relocation machinery a non-moving collector does not
+need. Worth revisiting if either changes.
 
 ## Lowering Core
 
@@ -466,8 +494,12 @@ to keep its current reporting path.
 
 This area needs a focused spike before broad code generation. Sanitizers must
 confirm that nonlocal exit does not bypass required runtime cleanup. GC root
-frames live in runtime-managed memory and are reset by the entry boundary on a
-panic.
+frames live in the generated function's own stack storage, and the runtime
+holds only the list linking them. There is no nonlocal exit to bypass: a panic
+sets a flag, and each frame checks it and returns, popping its own root and
+panic frames on the way out exactly as a normal return does. The panic frames
+are snapshotted when the panic is raised, before any of that unwinding, which
+is what lets the trace outlive them.
 
 ## JIT lifecycle
 

@@ -61,6 +61,20 @@ typedef struct RootFrame {
     const char *function_name;
     int64_t count;
     void **values;
+    // Which of `values` actually holds a live pointer right now. A root set is
+    // a property of a program point, not of a function: `Main#inc` in the
+    // brainfuck benchmark has five roots and two safepoints, and both
+    // safepoints are the cold out-of-bounds calls, so unioning the live sets
+    // over the function made every in-range access pay for paths that never
+    // run. The compiler knows the live set at each safepoint exactly, so it
+    // stores it here -- one immediate -- before each call that may collect.
+    //
+    // Bit `i` covers `values[i]`; slots from 64 up are always scanned, which
+    // is what keeps the two producers that are not compiled code total. The
+    // globals frame has arbitrarily many slots and all of them are live for
+    // the whole run, and a function needing more than 64 roots falls back to
+    // an all-ones mask with the array zeroed on entry, as it used to be.
+    int64_t live;
 } RootFrame;
 
 enum { HEAP_STRING = 1, HEAP_OBJECT = 2, HEAP_CELL = 3 };
@@ -108,6 +122,11 @@ void turkey_root_enter(void *pointer, void *values, int64_t count,
     frame->function_name = function_name;
     frame->count = count;
     frame->values = values;
+    // Nothing is live at registration: the frame is entered on the way into
+    // the region that contains the safepoints, and each safepoint names its
+    // own live set. A caller with roots that outlive the call stores the mask
+    // itself right after this returns.
+    frame->live = 0;
     roots = frame;
 }
 
@@ -218,7 +237,9 @@ static void mark(void *value) {
 
 void turkey_collect(void) {
     for (RootFrame *frame = roots; frame != NULL; frame = frame->previous)
-        for (int64_t index = 0; index < frame->count; ++index) mark(frame->values[index]);
+        for (int64_t index = 0; index < frame->count; ++index)
+            if (index >= 64 || (frame->live >> index) & 1)
+                mark(frame->values[index]);
     HeapHeader **link = &heap;
     while (*link != NULL) {
         HeapHeader *header = *link;
@@ -966,6 +987,7 @@ void *turkey_closure_new(uint64_t code, int64_t capture_count,
         4, -1, capture_count, pointer_bitmap);
     if (environment == NULL) { turkey_root_leave(&frame); return NULL; }
     roots[0] = environment;
+    frame.live = 1;
     TurkeyObject *closure = turkey_object_new(3, -1, 2, 2);
     if (closure == NULL) { turkey_root_leave(&frame); return NULL; }
     closure->slots[0] = code;

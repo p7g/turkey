@@ -27,7 +27,13 @@ _I32 = ir.IntType(32)
 _I64 = ir.IntType(64)
 _F64 = ir.DoubleType()
 _PTR = _I8.as_pointer()
-_ROOT_FRAME = ir.LiteralStructType([_PTR, _PTR, _I64, _PTR])
+# `RootFrame` from runtime/turkey_runtime.c: {previous, function_name, count,
+# values, live}. `live` is a bitmap of which slots of `values` hold a live
+# pointer at the safepoint about to run; see `_safepoint_live`. Slot 64 and up
+# is always scanned, which is how the frames the runtime itself builds -- and
+# the permanently live ones this module registers -- stay describable.
+_ROOT_FRAME = ir.LiteralStructType([_PTR, _PTR, _I64, _PTR, _I64])
+_ROOT_FRAME_LIVE = 4
 # `PanicCallFrame` is now {previous, site}, and `PanicSite` is the constant the
 # frame points at. Moving a frame is one store of a pointer to a constant this
 # module already holds, rather than four stores of its fields -- and that
@@ -125,35 +131,45 @@ def _successors(terminator) -> list[str]:
     return []
 
 
-def _live_across_safepoint(function: bir.Function) -> set[str]:
-    """Which parameters and slots hold a pointer over a possible collection.
+def _value_layouts(function: bir.Function) -> dict[str, bir.Layout]:
+    layouts = {value.name: value.layout
+               for value in list(function.params) + list(function.slots)}
+    for block in function.blocks:
+        for param in block.params:
+            layouts[param.name] = param.layout
+        for instruction in block.instructions:
+            if instruction.result is not None:
+                layouts[instruction.result.name] = instruction.result.layout
+    return layouts
 
-    `_root_slots` bounds an instruction result's live range inside one block,
-    because `bir.check` rebuilds the SSA scope per block. Parameters and slots
-    are the two things that escape that rule -- a parameter is nameable from
-    every block, a slot is function-wide mutable storage -- so both used to be
-    rooted unconditionally, on the grounds that there are few of them.
 
-    There are not few of them. `backend_lower` gives every ANF temporary its
-    own slot, so a two-line `Main#inc` has thirty-eight, twenty-four of them
-    pointers; it allocates nothing itself and paid twenty-six root stores per
-    call. What is needed is ordinary backward liveness over the CFG, with a
-    slot killed by a store to it and a parameter never killed, asking of each
-    safepoint which of them is live across it. This is how any collector with
-    a precise stack map computes one (OCaml, Go, and LLVM's own
-    `gc.statepoint` all do the same dataflow); the only wrinkle here is that
-    a value passed *to* the safepoint counts as live across it, since the
-    callee holds it while it may collect.
+def _safepoint_live(function: bir.Function) -> dict[tuple[str, int], frozenset[str]]:
+    """Which pointers are live across each individual safepoint.
+
+    A root set is a property of a program point, not of a function. This used
+    to union the per-point sets and root everything in the union for the whole
+    call, which let one cold call site decide what the hot path costs:
+    `Main#inc` in the brainfuck benchmark has five roots and exactly two
+    safepoints, and both safepoints are the cold out-of-bounds calls, so every
+    *in-range* access paid for a frame it could not use. Keeping the sets apart
+    is the same dataflow -- ordinary backward liveness over the CFG -- with the
+    answer not thrown away.
+
+    Two wrinkles. A value passed *to* a safepoint is live across it, since the
+    callee holds it while it may collect; a value the safepoint *returns* is
+    not, since it does not exist until the collection is over. And a slot is
+    function-wide mutable storage, so it is killed by a store rather than by a
+    definition, while `bir.check` rebuilds the SSA scope per block, so an
+    instruction result cannot outlive its block and a block parameter is killed
+    at the top of the block that declares it.
     """
-    tracked = {value.name for value in list(function.params) + list(function.slots)
-               if value.layout in (bir.Layout.PTR, bir.Layout.BOXED)}
+    layouts = _value_layouts(function)
+    tracked = {name for name, layout in layouts.items()
+               if layout in (bir.Layout.PTR, bir.Layout.BOXED)}
     if not tracked:
-        return set()
-    blocks = {block.name: block for block in function.blocks}
-    if not any(_is_safepoint(instruction.op)
-               for block in function.blocks
-               for instruction in block.instructions):
-        return set()
+        return {}
+    declared = {block.name: {param.name for param in block.params}
+                for block in function.blocks}
 
     def uses(instruction: bir.Instruction) -> set[str]:
         found = {operand.name for operand in _operands(instruction)}
@@ -161,120 +177,123 @@ def _live_across_safepoint(function: bir.Function) -> set[str]:
             found.add(instruction.args[0])
         return found & tracked
 
-    def killed(instruction: bir.Instruction) -> str | None:
-        if instruction.op == "slot_store" and instruction.args[0] in tracked:
-            return instruction.args[0]
-        return None
+    def defines(instruction: bir.Instruction) -> set[str]:
+        found = set()
+        if instruction.result is not None:
+            found.add(instruction.result.name)
+        if instruction.op == "slot_store":
+            found.add(instruction.args[0])
+        return found & tracked
+
+    def out_of(block: bir.Block, live_in: dict[str, set[str]]) -> set[str]:
+        assert block.terminator is not None
+        live = {operand.name
+                for operand in _terminator_operands(block.terminator)} & tracked
+        for name in _successors(block.terminator):
+            live |= live_in[name]
+        return live
 
     live_in: dict[str, set[str]] = {block.name: set() for block in function.blocks}
     changed = True
     while changed:
         changed = False
         for block in reversed(function.blocks):
-            assert block.terminator is not None
-            live = {operand.name
-                    for operand in _terminator_operands(block.terminator)} & tracked
-            for name in _successors(block.terminator):
-                live |= live_in[name]
+            live = out_of(block, live_in)
             for instruction in reversed(block.instructions):
-                dead = killed(instruction)
-                if dead is not None:
-                    live.discard(dead)
+                live -= defines(instruction)
                 live |= uses(instruction)
+            live -= declared[block.name]
             if live != live_in[block.name]:
                 live_in[block.name] = live
                 changed = True
 
-    wanted: set[str] = set()
+    found: dict[tuple[str, int], frozenset[str]] = {}
     for block in function.blocks:
-        assert block.terminator is not None
-        live = {operand.name
-                for operand in _terminator_operands(block.terminator)} & tracked
-        for name in _successors(block.terminator):
-            live |= live_in[name]
-        for instruction in reversed(block.instructions):
+        live = out_of(block, live_in)
+        for index in reversed(range(len(block.instructions))):
+            instruction = block.instructions[index]
+            live -= defines(instruction)
             if _is_safepoint(instruction.op):
-                wanted |= live | uses(instruction)
-            dead = killed(instruction)
-            if dead is not None:
-                live.discard(dead)
+                found[(block.name, index)] = frozenset(live | uses(instruction))
             live |= uses(instruction)
-    return wanted
+    return found
 
 
-def _root_slots(function: bir.Function) -> tuple[dict[str, int], int]:
-    """Stack storage in the exact-root frame, for the values that need it.
+# How many roots one frame can describe with a bitmap. The runtime scans a slot
+# at or above this index unconditionally, so a function needing more than this
+# many falls back to what this all did before: every slot always live, and the
+# array zeroed on entry. The most any conformance program asks for is thirteen.
+_MAPPED_ROOTS = 64
 
-    A pointer needs a root only where a collection can happen while it is
-    live. Rooting every pointer-typed value in the function -- which is what
-    this did, and what `LLVM-BACKEND.md` allowed as a first implementation --
-    costs a store per definition and, worse, is unremovable: the frame's
-    address escapes into `turkey_root_enter`, so no LLVM pass may drop a store
-    into it. A nine-line `main` paid 76 slots and a 608-byte memset.
 
-    Two kinds of value are rooted unconditionally. A function parameter is
-    nameable from every block (`bir.check` scopes SSA per block but exempts
-    parameters), and a slot is function-wide mutable storage, so neither has a
-    live range this can bound cheaply. There are few of both.
+def _root_slots(
+    function: bir.Function,
+) -> tuple[dict[str, int], int, dict[tuple[str, int], frozenset[str]]]:
+    """Stack storage in the exact-root frame, and what is live at each safepoint.
 
-    Everything else -- block parameters and instruction results -- is
-    block-local by construction, since `bir.check` rebuilds the scope per block
-    and anything crossing an edge must become a block parameter or a slot. So
-    its live range is an interval inside one block, and it needs a root exactly
-    when a safepoint falls in that interval. A value passed *to* a safepoint
-    counts: the callee holds it while it may collect.
+    A pointer needs a root only where a collection can happen while it is live,
+    and only *at* that collection. Rooting every pointer in the function --
+    which is what this did, and what `LLVM-BACKEND.md` allowed as a first
+    implementation -- costs a store per definition and, worse, is unremovable:
+    the frame's address escapes into `turkey_root_enter`, so no LLVM pass may
+    drop a store into it.
 
-    This is what makes the Phase 2 work pay: with field access no longer a
-    call, a loop that touches no allocation has no safepoint in its body, and
-    so takes no root stores at all.
+    Indices are assigned in a fixed order so the emitted bitmaps are stable
+    between runs; nothing else depends on the numbering.
     """
+    live = _safepoint_live(function)
     index: dict[str, int] = {}
+    for key in sorted(live):
+        for name in sorted(live[key]):
+            if name not in index:
+                index[name] = len(index)
+    return index, len(index), live
 
-    def take(value: bir.Value) -> None:
-        if (value.layout in (bir.Layout.PTR, bir.Layout.BOXED)
-                and value.name not in index):
-            index[value.name] = len(index)
 
-    wanted = _live_across_safepoint(function)
-    for value in function.params:
-        if value.name in wanted:
-            take(value)
-    for value in function.slots:
-        if value.name in wanted:
-            take(value)
+def _frame_region(function: bir.Function,
+                  present: dict[str, bool]) -> dict[str, bool]:
+    """The blocks a frame has to stay registered across, given where it is read.
 
-    for block in function.blocks:
-        safepoints = [position for position, instruction
-                      in enumerate(block.instructions)
-                      if _is_safepoint(instruction.op)]
-        if not safepoints:
-            continue
-        # The last position each block-local value is read at. The terminator
-        # reads after every instruction, and none of the terminators emits a
-        # call, so `len(instructions)` is a fine stand-in for "to the end".
-        last_use: dict[str, int] = {}
-        for position, instruction in enumerate(block.instructions):
-            for operand in _operands(instruction):
-                last_use[operand.name] = position
-        terminator = block.terminator
-        assert terminator is not None
-        for operand in _terminator_operands(terminator):
-            last_use[operand.name] = len(block.instructions)
+    Every block that reads the frame, plus every block on a cycle through one:
+    registration then sinks onto the edges into that set and pops on the edges
+    out of it, which alternate along any path and so keep the balance
+    `turkey_root_leave`'s "the frame being left is the one on top" insists on.
 
-        def live_across(name: str, defined: int) -> bool:
-            end = last_use.get(name)
-            return end is not None and any(
-                defined < point <= end for point in safepoints)
+    The cycles are the whole of what is added, and they are what stops a loop
+    with a call in it from registering a frame per iteration. Widening any
+    further -- to every block that has a reader both behind and ahead, which is
+    the natural way to say "between two safepoints" -- puts the frame straight
+    back on the hot path: `Main#inc` checks two indices, and each check's cold
+    arm rejoins the fast one, so every block between the two checks has a call
+    behind it and a call ahead of it without either being on the path that
+    actually runs.
 
-        for param in block.params:
-            if live_across(param.name, -1):
-                take(param)
-        for position, instruction in enumerate(block.instructions):
-            result = instruction.result
-            if result is not None and live_across(result.name, position):
-                take(result)
+    Neither reachability alone nor dominance alone would do either. A safepoint
+    is reachable from `Main#inc`'s entry, so reachability registers there; and
+    the two cold blocks' nearest common dominator *is* the entry, so dominance
+    registers there too.
+    """
+    successors = {block.name: _successors(block.terminator)
+                  for block in function.blocks}
+    predecessors: dict[str, list[str]] = {block.name: [] for block in function.blocks}
+    for name, targets in successors.items():
+        for target in targets:
+            predecessors[target].append(name)
 
-    return index, len(index)
+    def closure(start: str, edges: dict[str, list[str]]) -> set[str]:
+        seen = {start}
+        stack = [start]
+        while stack:
+            for name in edges[stack.pop()]:
+                if name not in seen:
+                    seen.add(name)
+                    stack.append(name)
+        return seen
+
+    region = {name for name, value in present.items() if value}
+    for name in sorted(region):
+        region |= closure(name, successors) & closure(name, predecessors)
+    return {block.name: block.name in region for block in function.blocks}
 
 
 def _terminator_operands(terminator) -> list[bir.Value]:
@@ -308,6 +327,8 @@ class _Emitter:
         self.runtime: dict[str, ir.Function] = {}
         self.closure_thunks: dict[str, ir.Function] = {}
         self.string_literals: dict[str, tuple[ir.GlobalVariable, ir.GlobalVariable, int]] = {}
+        self._literal_frame: ir.Value | None = None
+        self._current_frame: bir.Frame | None = None
         self.string_count = 0
         self.c_strings: dict[str, ir.GlobalVariable] = {}
         self.panic_sites: dict[bir.Frame, ir.GlobalVariable] = {}
@@ -479,84 +500,60 @@ class _Emitter:
         entry_builder = ir.IRBuilder(blocks[source.entry])
         slots = {slot.name: entry_builder.alloca(_llvm_type(slot.layout), name=slot.name)
                  for slot in source.slots}
-        root_index, value_root_count = _root_slots(source)
+        root_index, root_count, safepoint_live = _root_slots(source)
         in_entry = source.name == self.source.entry
-        literal_roots = list(self.string_literals.values()) if in_entry else []
-        nullary_roots = list(self.nullary_objects.items()) if in_entry else []
-        root_count = value_root_count + len(literal_roots) + len(nullary_roots)
         root_frame = entry_builder.alloca(_ROOT_FRAME, name="root_frame")
         panic_frame_storage = entry_builder.alloca(_PANIC_FRAME, name="panic_frame")
         root_array_type = ir.ArrayType(_PTR, max(1, root_count))
         root_values = entry_builder.alloca(root_array_type, name="root_values")
-        for index in range(root_count):
-            pointer = entry_builder.gep(
-                root_values, [ir.Constant(_I32, 0), ir.Constant(_I32, index)])
-            entry_builder.store(ir.Constant(_PTR, None), pointer)
-        if self.global_array is not None and source.name == self.source.entry:
-            # Registered from the entry function, which does not return until
-            # the program is over, so it sits below every other frame for the
-            # whole run. It goes in before this function's own frame and comes
-            # out after it, since `turkey_root_leave` insists the frame being
-            # left is the one on top. It is *left*, rather than being a
-            # permanent registration, because the runtime outlives any one
-            # compiled module: a frame never popped would still be on the
-            # runtime's list pointing into a module the engine has freed.
-            entry_builder.call(self.runtime["turkey_root_enter"], [
-                entry_builder.bitcast(self.global_frame, _PTR),
-                entry_builder.bitcast(self.global_array, _PTR),
-                ir.Constant(_I64, len(self.global_roots)),
-                self._c_string(entry_builder, "<globals>", ".turkey.function"),
-            ])
-        # A function with nothing to root registers no frame. The collector
-        # walks a list of frames; an empty one contributes nothing to a trace
-        # and costs a push and a pop on every call, which for a leaf like
-        # `Main#move` is most of what the call does.
-        if root_count:
-            entry_builder.call(self.runtime["turkey_root_enter"], [
-                entry_builder.bitcast(root_frame, _PTR),
-                entry_builder.bitcast(root_values, _PTR),
-                ir.Constant(_I64, root_count),
-                self._c_string(entry_builder, source.name, ".turkey.function"),
-            ])
-        # Entered at the function's own name with no position: line 0 is what
-        # `capture_panic_trace` reads as "this frame has not reached a site
-        # yet", and such a frame is left out of the trace.
-        entry_builder.call(self.runtime["turkey_frame_enter"], [
-            entry_builder.bitcast(panic_frame_storage, _PTR),
-            entry_builder.bitcast(
-                self._panic_site(bir.Frame(source.name, None, 0, 0)), _PTR),
-        ])
+        # Only the fallback needs this. A slot the bitmap does not name is
+        # never read, so it does not have to hold anything -- which is what
+        # takes the `movi.2d` and its stores off the front of every call.
+        if root_count > _MAPPED_ROOTS:
+            for index in range(root_count):
+                pointer = entry_builder.gep(
+                    root_values, [ir.Constant(_I32, 0), ir.Constant(_I32, index)])
+                entry_builder.store(ir.Constant(_PTR, None), pointer)
+
         self._root_frame = root_frame
         self._root_values = root_values
         self._root_index = root_index
+        self._root_count = root_count
         self._panic_frame_storage = panic_frame_storage
-        self._in_entry = source.name == self.source.entry
-        for offset, (bytes_global, value_global, length) in enumerate(literal_roots):
-            literal = entry_builder.call(self.runtime["turkey_string_new"], [
-                entry_builder.bitcast(bytes_global, _PTR),
-                ir.Constant(_I64, length),
-            ])
-            entry_builder.store(literal, value_global)
-            pointer = entry_builder.gep(root_values, [
-                ir.Constant(_I32, 0),
-                ir.Constant(_I32, value_root_count + offset),
-            ])
-            entry_builder.store(literal, pointer)
-        for offset, ((kind, tag), value_global) in enumerate(nullary_roots):
-            made = entry_builder.call(self.runtime["turkey_object_new"], [
-                ir.Constant(_I32, kind), ir.Constant(_I32, tag),
-                ir.Constant(_I64, 0), ir.Constant(_I64, 0),
-            ])
-            entry_builder.store(made, value_global)
-            pointer = entry_builder.gep(root_values, [
-                ir.Constant(_I32, 0),
-                ir.Constant(_I32, value_root_count + len(literal_roots) + offset),
-            ])
-            entry_builder.store(made, pointer)
+        self._in_entry = in_entry
         self._slot_layouts = {slot.name: slot.layout for slot in source.slots}
-        for param in source.params:
-            if param.name in root_index:
-                self._set_root(entry_builder, param.name, values[param.name])
+
+        # Where each frame has to be registered. A collection reads the root
+        # frame at a safepoint and nowhere else. A panic frame is read when a
+        # panic is raised, which is at any operation carrying a source position
+        # and at any call, since the callee may panic under it.
+        root_present = {
+            block.name: any((block.name, index) in safepoint_live
+                            for index in range(len(block.instructions)))
+            for block in source.blocks}
+        panic_present = {
+            block.name: any(_is_safepoint(instruction.op)
+                            for instruction in block.instructions)
+                        or isinstance(block.terminator, bir.Panic)
+            for block in source.blocks}
+        if in_entry:
+            # The entry function registers the permanently live frames before
+            # anything else and leaves them last, so it is inside both regions
+            # for its whole body whatever its own instructions do.
+            root_present[source.entry] = True
+        root_region = ({block.name: False for block in source.blocks}
+                       if not root_count else _frame_region(source, root_present))
+        panic_region = _frame_region(source, panic_present)
+        self._root_region = root_region
+        self._panic_region = panic_region
+
+        if in_entry:
+            self._enter_permanent_roots(entry_builder)
+        if root_region[source.entry]:
+            self._root_enter(entry_builder, source.name)
+        if panic_region[source.entry]:
+            self._frame_enter(entry_builder, source.name)
+
         phis: dict[tuple[str, str], ir.PhiInstr] = {}
         builders: dict[str, ir.IRBuilder] = {}
         for block in source.blocks:
@@ -566,63 +563,227 @@ class _Emitter:
                 phi = builder.phi(_llvm_type(param.layout), name=param.name)
                 phis[(block.name, param.name)] = phi
                 values[param.name] = phi
-            for param in block.params:
-                if param.name in root_index:
-                    self._set_root(builder, param.name, values[param.name])
 
         for block in source.blocks:
             builder = builders[block.name]
-            for instruction in block.instructions:
-                if instruction.frame is not None:
+            self._root_here = root_region[block.name]
+            self._panic_here = panic_region[block.name]
+            for index, instruction in enumerate(block.instructions):
+                live = safepoint_live.get((block.name, index))
+                if live is not None:
+                    self._publish_roots(builder, live, values, slots)
+                self._current_frame = instruction.frame
+                if instruction.frame is not None and self._panic_here:
                     self._frame_update(builder, instruction.frame)
                 value, builder = self._instruction(
                     function, builder, instruction, values, slots)
                 if instruction.result is not None:
                     values[instruction.result.name] = value
-                    if instruction.result.name in root_index:
-                        self._set_root(builder, instruction.result.name, value)
-                if (instruction.op == "slot_store"
-                        and instruction.args[0] in root_index):
-                    self._set_root(builder, instruction.args[0],
-                                   self._operand(instruction.args[1], values))
             term = block.terminator
             assert term is not None
             if isinstance(term, bir.Return):
-                builder.call(self.runtime["turkey_frame_leave"], [
-                    builder.bitcast(panic_frame_storage, _PTR)])
-                if root_count:
-                    builder.call(self.runtime["turkey_root_leave"], [
-                        builder.bitcast(root_frame, _PTR)])
-                self._leave_globals(builder)
+                self._leave_frames(builder, block.name)
                 builder.ret(self._operand(term.value, values))
             elif isinstance(term, bir.Jump):
-                builder.branch(blocks[term.target])
                 target = next(b for b in source.blocks if b.name == term.target)
-                for param, arg in zip(target.params, term.args):
+                arguments = [self._operand(arg, values) for arg in term.args]
+                incoming = self._edge(function, builder, block.name, term.target,
+                                      blocks)
+                for param, argument in zip(target.params, arguments):
                     phis[(target.name, param.name)].add_incoming(
-                        self._operand(arg, values), builder.block)
+                        argument, incoming)
             elif isinstance(term, bir.Branch):
-                builder.cbranch(self._operand(term.condition, values),
-                                blocks[term.yes], blocks[term.no])
+                condition = self._operand(term.condition, values)
+                yes = self._edge_block(function, block.name, term.yes, blocks)
+                no = self._edge_block(function, block.name, term.no, blocks)
+                builder.cbranch(condition, yes, no)
             else:
-                if term.frame is not None:
+                if term.frame is not None and self._panic_here:
                     self._frame_update(builder, term.frame)
                 if isinstance(term.message, str):
                     self._panic(builder, term.message)
                 else:
                     builder.call(self.runtime["turkey_panic_string"], [
                         self._operand(term.message, values)])
-                builder.call(self.runtime["turkey_frame_leave"], [
-                    builder.bitcast(panic_frame_storage, _PTR)])
-                if root_count:
-                    builder.call(self.runtime["turkey_root_leave"], [
-                        builder.bitcast(root_frame, _PTR)])
-                self._leave_globals(builder)
+                self._leave_frames(builder, block.name)
                 builder.ret(ir.Constant(function.function_type.return_type, None))
 
+    def _root_enter(self, builder: ir.IRBuilder, name: str) -> None:
+        builder.call(self.runtime["turkey_root_enter"], [
+            builder.bitcast(self._root_frame, _PTR),
+            builder.bitcast(self._root_values, _PTR),
+            ir.Constant(_I64, self._root_count),
+            self._c_string(builder, name, ".turkey.function"),
+        ])
+        if self._root_count > _MAPPED_ROOTS:
+            self._set_live(builder, -1)
+
+    def _root_leave(self, builder: ir.IRBuilder) -> None:
+        builder.call(self.runtime["turkey_root_leave"],
+                     [builder.bitcast(self._root_frame, _PTR)])
+
+    def _frame_enter(self, builder: ir.IRBuilder, name: str) -> None:
+        # Entered at the function's own name with no position: line 0 is what
+        # `capture_panic_trace` reads as "this frame has not reached a site
+        # yet", and such a frame is left out of the trace.
+        builder.call(self.runtime["turkey_frame_enter"], [
+            builder.bitcast(self._panic_frame_storage, _PTR),
+            builder.bitcast(self._panic_site(bir.Frame(name, None, 0, 0)), _PTR),
+        ])
+
+    def _frame_leave(self, builder: ir.IRBuilder) -> None:
+        builder.call(self.runtime["turkey_frame_leave"],
+                     [builder.bitcast(self._panic_frame_storage, _PTR)])
+
+    def _set_live(self, builder: ir.IRBuilder, mask: int) -> None:
+        pointer = builder.gep(self._root_frame, [
+            ir.Constant(_I32, 0), ir.Constant(_I32, _ROOT_FRAME_LIVE)])
+        builder.store(ir.Constant(_I64, mask), pointer)
+
+    def _publish_roots(self, builder: ir.IRBuilder, live: frozenset[str],
+                       values: dict[str, ir.Value],
+                       slots: dict[str, ir.Value]) -> None:
+        """Make the collector's view of this frame exact, for one safepoint.
+
+        The stores are here rather than at each value's definition because a
+        value is very often defined on the hot path and live only into a cold
+        one -- which is the whole of `Main#inc` -- and a store at the definition
+        cannot be sunk afterwards, since the frame's address has escaped into
+        the runtime and no LLVM pass may touch it.
+        """
+        mask = 0
+        for name in sorted(live):
+            index = self._root_index[name]
+            if index < _MAPPED_ROOTS:
+                mask |= 1 << index
+            value = (builder.load(slots[name]) if name in slots
+                     else values[name])
+            self._store_root(builder, index, value)
+        if self._root_count <= _MAPPED_ROOTS:
+            self._set_live(builder, mask)
+
+    def _store_root(self, builder: ir.IRBuilder, index: int,
+                    value: ir.Value) -> None:
+        pointer = builder.gep(self._root_values, [
+            ir.Constant(_I32, 0), ir.Constant(_I32, index)])
+        builder.store(builder.bitcast(value, _PTR), pointer)
+
+    def _leave_frames(self, builder: ir.IRBuilder, block: str) -> None:
+        """Pop what this block holds, innermost first, on the way out."""
+        if self._panic_region[block]:
+            self._frame_leave(builder)
+        if self._root_region[block]:
+            self._root_leave(builder)
+        self._leave_globals(builder)
+
+    def _edge_block(self, function: ir.Function, source: str, target: str,
+                    blocks: dict[str, ir.BasicBlock]) -> ir.BasicBlock:
+        """The block to branch to, with any frame transition on the way.
+
+        A transition sits on the edge rather than in either end because a
+        target can be reached both from inside a region and from outside it --
+        one arm of a branch registering the frame says nothing about the other.
+        """
+        entering_root = self._root_region[target] and not self._root_region[source]
+        leaving_root = self._root_region[source] and not self._root_region[target]
+        entering_panic = self._panic_region[target] and not self._panic_region[source]
+        leaving_panic = self._panic_region[source] and not self._panic_region[target]
+        if not (entering_root or leaving_root or entering_panic or leaving_panic):
+            return blocks[target]
+        landing = function.append_basic_block(f"{source}.to.{target}.frames")
+        builder = ir.IRBuilder(landing)
+        if leaving_panic:
+            self._frame_leave(builder)
+        if leaving_root:
+            self._root_leave(builder)
+        if entering_root:
+            self._root_enter(builder, function.name)
+        if entering_panic:
+            self._frame_enter(builder, function.name)
+        builder.branch(blocks[target])
+        return landing
+
+    def _edge(self, function: ir.Function, builder: ir.IRBuilder, source: str,
+              target: str, blocks: dict[str, ir.BasicBlock]) -> ir.BasicBlock:
+        """Branch to `target`, and report the block the phis come in from.
+
+        Which is the landing block when there is one, and otherwise whatever
+        block the builder ended up in -- an instruction that emits a check
+        splits one bir block into several LLVM ones, so it is not necessarily
+        the block this one started in.
+        """
+        destination = self._edge_block(function, source, target, blocks)
+        incoming = builder.block
+        builder.branch(destination)
+        return incoming if destination is blocks[target] else destination
+
+    def _enter_permanent_roots(self, builder: ir.IRBuilder) -> None:
+        """Register what stays live for the whole run, below everything else.
+
+        Registered from the entry function, which does not return until the
+        program is over, so these sit below every other frame for the whole
+        run. They are *left*, rather than being permanent registrations,
+        because the runtime outlives any one compiled module: a frame never
+        popped would still be on the runtime's list pointing into a module the
+        engine has freed.
+        """
+        if self.global_array is not None:
+            builder.call(self.runtime["turkey_root_enter"], [
+                builder.bitcast(self.global_frame, _PTR),
+                builder.bitcast(self.global_array, _PTR),
+                ir.Constant(_I64, len(self.global_roots)),
+                self._c_string(builder, "<globals>", ".turkey.function"),
+            ])
+            pointer = builder.gep(self.global_frame, [
+                ir.Constant(_I32, 0), ir.Constant(_I32, _ROOT_FRAME_LIVE)])
+            builder.store(ir.Constant(_I64, -1), pointer)
+        literals = list(self.string_literals.values())
+        nullaries = list(self.nullary_objects.items())
+        if not literals and not nullaries:
+            return
+        # One frame of its own rather than slots in the function's, because
+        # these are live at every safepoint in the program and would otherwise
+        # have to appear in every bitmap the entry function emits.
+        frame = builder.alloca(_ROOT_FRAME, name="literal_frame")
+        array_type = ir.ArrayType(_PTR, len(literals) + len(nullaries))
+        array = builder.alloca(array_type, name="literal_values")
+        for index in range(len(literals) + len(nullaries)):
+            builder.store(ir.Constant(_PTR, None), builder.gep(
+                array, [ir.Constant(_I32, 0), ir.Constant(_I32, index)]))
+        builder.call(self.runtime["turkey_root_enter"], [
+            builder.bitcast(frame, _PTR), builder.bitcast(array, _PTR),
+            ir.Constant(_I64, len(literals) + len(nullaries)),
+            self._c_string(builder, "<literals>", ".turkey.function"),
+        ])
+        builder.store(ir.Constant(_I64, -1), builder.gep(
+            frame, [ir.Constant(_I32, 0), ir.Constant(_I32, _ROOT_FRAME_LIVE)]))
+        self._literal_frame = frame
+        for offset, (bytes_global, value_global, length) in enumerate(literals):
+            literal = builder.call(self.runtime["turkey_string_new"], [
+                builder.bitcast(bytes_global, _PTR), ir.Constant(_I64, length)])
+            builder.store(literal, value_global)
+            builder.store(literal, builder.gep(
+                array, [ir.Constant(_I32, 0), ir.Constant(_I32, offset)]))
+        for offset, ((kind, tag), value_global) in enumerate(nullaries):
+            made = builder.call(self.runtime["turkey_object_new"], [
+                ir.Constant(_I32, kind), ir.Constant(_I32, tag),
+                ir.Constant(_I64, 0), ir.Constant(_I64, 0)])
+            builder.store(made, value_global)
+            builder.store(made, builder.gep(array, [
+                ir.Constant(_I32, 0),
+                ir.Constant(_I32, len(literals) + offset)]))
+
     def _leave_globals(self, builder: ir.IRBuilder) -> None:
-        """Pop the globals frame, on every path out of the entry function."""
-        if self._in_entry and self.global_array is not None:
+        """Pop the permanent frames, on every path out of the entry function.
+
+        Innermost first: the literals were registered after the globals.
+        """
+        if not self._in_entry:
+            return
+        if self._literal_frame is not None:
+            builder.call(self.runtime["turkey_root_leave"],
+                         [builder.bitcast(self._literal_frame, _PTR)])
+        if self.global_array is not None:
             builder.call(self.runtime["turkey_root_leave"],
                          [builder.bitcast(self.global_frame, _PTR)])
 
@@ -708,12 +869,6 @@ class _Emitter:
         address, width = self._array_element(builder, pointer, index, layout)
         builder.store(self._to_i64(builder, value) if width == 8 else value,
                       address)
-
-    def _set_root(self, builder: ir.IRBuilder, name: str, value: ir.Value) -> None:
-        pointer = builder.gep(self._root_values, [
-            ir.Constant(_I32, 0), ir.Constant(_I32, self._root_index[name]),
-        ])
-        builder.store(value, pointer)
 
     def _frame_update(self, builder: ir.IRBuilder, frame: bir.Frame) -> None:
         pointer = builder.gep(self._panic_frame_storage, [
@@ -1103,12 +1258,30 @@ class _Emitter:
         good = function.append_basic_block("checked")
         builder.cbranch(failed, bad, good)
         panic_builder = ir.IRBuilder(bad)
+        # An inline check needs this function's panic frame only where it
+        # fails. `+` is checked, so every arithmetic loop in the program has a
+        # guard in it, and registering for that on the way *in* put the frame
+        # back on exactly the hot paths this is trying to clear -- for a branch
+        # that, when it is taken, ends the program. So a block that is not
+        # already in the panic region registers here instead, where the failure
+        # is, and `capture_panic_trace` still sees the frame it needs.
+        assert self._panic_here or self._current_frame is not None, (
+            "a check with no source position cannot name itself in a trace")
+        registered = self._panic_here
+        if not registered and self._current_frame is not None:
+            self._frame_enter(panic_builder, self._current_frame.function)
+            self._frame_update(panic_builder, self._current_frame)
+            registered = True
         if message is not None:
             self._panic(panic_builder, message)
-        panic_builder.call(self.runtime["turkey_frame_leave"], [
-            panic_builder.bitcast(self._panic_frame_storage, _PTR)])
-        panic_builder.call(self.runtime["turkey_root_leave"], [
-            panic_builder.bitcast(self._root_frame, _PTR)])
+        # A guard's panic block is a way out of the enclosing bir block, so it
+        # pops exactly what that block holds.
+        if registered:
+            panic_builder.call(self.runtime["turkey_frame_leave"], [
+                panic_builder.bitcast(self._panic_frame_storage, _PTR)])
+        if self._root_here:
+            panic_builder.call(self.runtime["turkey_root_leave"], [
+                panic_builder.bitcast(self._root_frame, _PTR)])
         self._leave_globals(panic_builder)
         panic_builder.ret(ir.Constant(function.function_type.return_type, None))
         return ir.IRBuilder(good)

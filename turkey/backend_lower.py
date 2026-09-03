@@ -877,12 +877,25 @@ class _FunctionLowerer:
         if isinstance(pat, (ast.PCon, ast.PRecord)):
             held = self.new_slot("pattern_value", value.layout)
             block.instructions.append(bir.Instruction("slot_store", (held.name, value)))
-            tag = self.emit(block, "object_tag", (value,), bir.Layout.I32)
-            wanted = self.tags[pat.name]
-            condition = self.emit(block, "scalar_eq",
-                                  (tag, bir.Constant(bir.Layout.I32, wanted)), bir.Layout.I1)
             contents = self.new_block("pattern_contents")
-            block.terminator = bir.Branch(condition, contents.name, failure.name)
+            # A type with one constructor has nothing to distinguish. Reading
+            # the tag to compare it against the only value it can hold costs a
+            # load, a compare and a branch on the hot path -- `Array a =
+            # Array(ArrayStorage a)` pays it on every element access -- and
+            # the arm it branches to is unreachable. Exhaustiveness already
+            # knows the match is total; this is the lowering agreeing.
+            variants = self.decls.tycons[
+                self.decls.constructors[pat.name].tycon].variants
+            if len(variants) == 1:
+                block.terminator = bir.Jump(contents.name)
+            else:
+                tag = self.emit(block, "object_tag", (value,), bir.Layout.I32)
+                wanted = self.tags[pat.name]
+                condition = self.emit(
+                    block, "scalar_eq",
+                    (tag, bir.Constant(bir.Layout.I32, wanted)), bir.Layout.I1)
+                block.terminator = bir.Branch(condition, contents.name,
+                                              failure.name)
             if isinstance(pat, ast.PCon):
                 pieces = list(enumerate(pat.args))
             else:

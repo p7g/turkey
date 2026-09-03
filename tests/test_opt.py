@@ -526,3 +526,51 @@ fun main() { print(total([1, 2, 3])) }
              if isinstance(n, CApp) and isinstance(n.fn, CVar)
              and "#next" in n.fn.name]
     assert not calls, "the iterator step should have been inlined"
+
+
+def test_a_panicking_callee_does_not_drag_its_message_into_the_caller():
+    """The failure path may not decide what the success path costs.
+
+    Every string in `Data.Array#bounds`'s message is allocated, so inlining
+    the message left thirteen pointers live across allocations inside a
+    function that is otherwise two comparisons -- and every *in-range* access
+    paid for a root frame, a root registration and a 288-byte stack frame it
+    could not use. Sixty per cent of the brainfuck benchmark was that.
+
+    So a callee that always panics is not copied into its caller. `bounds`
+    itself becomes small enough to inline, which is the point: the comparison
+    ends up at the call site and the message stays behind a call.
+    """
+    program = optimized("""
+fun main() { let xs = [1, 2, 3]; print(xs[1]) }
+""")
+    main = named(program, "Main#main")
+    calls = [n.fn.name for n in nodes(main.value)
+             if isinstance(n, CApp) and isinstance(n.fn, CVar)]
+    typed = [n.fn.fn.name for n in nodes(main.value)
+             if isinstance(n, CApp) and isinstance(n.fn, CTyApp)
+             and isinstance(n.fn.fn, CVar)]
+    named_calls = calls + typed
+    assert not any("#bounds" in n for n in named_calls), (
+        "the comparison should have been inlined into the access")
+    assert any("#outOfBounds" in n for n in named_calls), (
+        "the message should still be behind a call")
+
+
+def test_a_bare_panicking_forwarder_is_still_inlined():
+    """`fun error(message) = Prim.error(message)` carries nothing.
+
+    Declining it would put a standard-library frame in every panic trace,
+    pointing at `Std/Classes.tl` rather than at the code that failed --
+    which is what `test_a_panic_stack_does_not_invent_inlined_frames` is
+    about. The rule is about what a bottoming callee *carries*, not about
+    its bottoming.
+    """
+    program = optimized("""
+fun main() { error("bad") }
+""")
+    main = named(program, "Main#main")
+    called = [n.name for n in nodes(main.value) if isinstance(n, CVar)]
+    assert "Prim.error" in called, (
+        "the forwarder should have been inlined away")
+    assert not any(n.endswith("Classes#error") for n in called)

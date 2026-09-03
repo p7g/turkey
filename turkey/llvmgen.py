@@ -507,12 +507,17 @@ class _Emitter:
                 ir.Constant(_I64, len(self.global_roots)),
                 self._c_string(entry_builder, "<globals>", ".turkey.function"),
             ])
-        entry_builder.call(self.runtime["turkey_root_enter"], [
-            entry_builder.bitcast(root_frame, _PTR),
-            entry_builder.bitcast(root_values, _PTR),
-            ir.Constant(_I64, root_count),
-            self._c_string(entry_builder, source.name, ".turkey.function"),
-        ])
+        # A function with nothing to root registers no frame. The collector
+        # walks a list of frames; an empty one contributes nothing to a trace
+        # and costs a push and a pop on every call, which for a leaf like
+        # `Main#move` is most of what the call does.
+        if root_count:
+            entry_builder.call(self.runtime["turkey_root_enter"], [
+                entry_builder.bitcast(root_frame, _PTR),
+                entry_builder.bitcast(root_values, _PTR),
+                ir.Constant(_I64, root_count),
+                self._c_string(entry_builder, source.name, ".turkey.function"),
+            ])
         # Entered at the function's own name with no position: line 0 is what
         # `capture_panic_trace` reads as "this frame has not reached a site
         # yet", and such a frame is left out of the trace.
@@ -585,8 +590,9 @@ class _Emitter:
             if isinstance(term, bir.Return):
                 builder.call(self.runtime["turkey_frame_leave"], [
                     builder.bitcast(panic_frame_storage, _PTR)])
-                builder.call(self.runtime["turkey_root_leave"], [
-                    builder.bitcast(root_frame, _PTR)])
+                if root_count:
+                    builder.call(self.runtime["turkey_root_leave"], [
+                        builder.bitcast(root_frame, _PTR)])
                 self._leave_globals(builder)
                 builder.ret(self._operand(term.value, values))
             elif isinstance(term, bir.Jump):
@@ -608,8 +614,9 @@ class _Emitter:
                         self._operand(term.message, values)])
                 builder.call(self.runtime["turkey_frame_leave"], [
                     builder.bitcast(panic_frame_storage, _PTR)])
-                builder.call(self.runtime["turkey_root_leave"], [
-                    builder.bitcast(root_frame, _PTR)])
+                if root_count:
+                    builder.call(self.runtime["turkey_root_leave"], [
+                        builder.bitcast(root_frame, _PTR)])
                 self._leave_globals(builder)
                 builder.ret(ir.Constant(function.function_type.return_type, None))
 

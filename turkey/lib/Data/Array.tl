@@ -62,17 +62,27 @@ fun pop(xs : Array a) -> Option a {
     Some(Prim.arrayGet(data.storage, data.length))
 }
 
+-- The message is built in its own function, and that is the whole point of
+-- it being one. Every string in it is allocated, so building it inline made
+-- the *failure* path decide what the success path costs: the pointers live
+-- across those allocations all need to be visible to the collector, so
+-- `bounds` paid a thirteen-slot root frame, a root registration and a 288-byte
+-- stack frame on every in-range access, and was too large to inline besides.
+-- Rust outlines the same path into a cold `panic_bounds_check` for the same
+-- reason.
+fun outOfBounds(operation : String, i : Int, length : Int) -> a {
+    Prim.error(Prim.stringConcat(
+        Prim.stringConcat(
+            Prim.stringConcat(
+                Prim.stringConcat("array index out of bounds: ", operation),
+                " index "),
+            Prim.intToString(i)),
+        Prim.stringConcat(", length ", Prim.intToString(length))))
+}
+
 fun bounds(xs : Array a, i : Int, operation : String) {
     let length = state(xs).length
-    if i < 0 || i >= length {
-        Prim.error(Prim.stringConcat(
-            Prim.stringConcat(
-                Prim.stringConcat(
-                    Prim.stringConcat("array index out of bounds: ", operation),
-                    " index "),
-                Prim.intToString(i)),
-            Prim.stringConcat(", length ", Prim.intToString(length))))
-    }
+    if i < 0 || i >= length { outOfBounds(operation, i, length) }
 }
 
 fun map(xs : Array a, f : fun(a) -> b) -> Array b {

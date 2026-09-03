@@ -105,6 +105,12 @@ SPECULATIVE_INLINE_LIMIT = INLINE_LIMIT * 4
 # LLVM's inliner does it too, crediting a call whose result feeds a branch.
 # The whole cost of a `for` loop's `Some` per element rides on this.
 SCRUTINEE_INLINE_LIMIT = INLINE_LIMIT * 2
+# What a callee that always panics may carry into its caller. A bare
+# forwarding call -- `fun error(message) = Prim.error(message)` -- is worth
+# copying, because it costs the caller nothing and keeps the standard library
+# out of the panic trace. Anything larger is the failure path charging the
+# success path, which is what this exists to stop.
+BOTTOM_INLINE_LIMIT = 8
 
 
 def reduce_program(program: CProgram) -> CProgram:
@@ -295,6 +301,25 @@ class _Reducer:
             return None
         if _transfers(body):
             return None
+        size = _size(body)
+        if _bottoms(body) and size > BOTTOM_INLINE_LIMIT:
+            # A callee that always panics has no useful residual -- there is
+            # nothing for the caller to reduce against -- so copying in
+            # anything it carries lets the *failure* path decide what the
+            # success path costs. `Data.Array#bounds` is the case that
+            # matters: every string in its message is allocated, so inlining
+            # the message put thirteen live pointers across allocations into a
+            # function that is otherwise two comparisons, and every in-range
+            # access paid for a root frame it could not use. Rust marks these
+            # paths `#[cold] #[inline(never)]` and GHC keeps bottoming
+            # expressions off the hot path with `exprIsBottom`.
+            #
+            # Only when it carries something, though. `Std.Classes#error` is
+            # `Prim.error(message)` and nothing else, so inlining it costs the
+            # caller nothing -- and *not* inlining it would put a frame in
+            # every panic trace pointing at the standard library rather than
+            # at the code that failed.
+            return None
         # A copied callee body becomes part of this call site.  Keep spans on
         # caller-supplied arguments, but make every node copied from the callee
         # blame the invocation if a later Core check rejects the residual.
@@ -302,7 +327,6 @@ class _Reducer:
         made = _apply(lam.params, e.args, body, e.ty)
         if made is None:
             return None
-        size = _size(body)
         if size <= limit:
             return made
         if self.speculating or size > SPECULATIVE_INLINE_LIMIT:
@@ -906,6 +930,30 @@ def _transfers(e, bound: frozenset[str] = frozenset()) -> bool:
         return any(_transfers(getattr(e, f.name), bound) for f in fields(e))
     if isinstance(e, (list, tuple)):
         return any(_transfers(x, bound) for x in e)
+    return False
+
+
+def _bottoms(e) -> bool:
+    """Whether evaluating `e` always diverges.
+
+    GHC's `exprIsBottom`, cut down to the one producer this compiler has:
+    `Prim.error`. Conservative in the direction of answering false, which
+    costs an inline allowed rather than a term moved wrongly.
+    """
+    if isinstance(e, CApp):
+        fn = e.fn
+        while isinstance(fn, CTyApp):
+            fn = fn.fn
+        return getattr(fn, "name", None) == "Prim.error"
+    if isinstance(e, CLet):
+        return _bottoms(e.body)
+    if isinstance(e, CJoin):
+        return _bottoms(e.rest)
+    if isinstance(e, CMatch):
+        return bool(e.alts) and all(_bottoms(alt.body) for alt in e.alts)
+    if isinstance(e, CIf):
+        return (e.otherwise is not None and _bottoms(e.then)
+                and _bottoms(e.otherwise))
     return False
 
 

@@ -424,9 +424,26 @@ def test_type_applied_methods_inline_and_the_remaining_flow_is_tracked():
     not monomorphization and needs no groundness restriction. M16e fuses the
     recursive loop result with its consumer. M16f's call-site cost model still
     leaves Array's `bind`: although its reduced body is within the speculative
-    ceiling, none of its eight specialized residuals shrinks under the ordinary
+    ceiling, none of its specialized residuals shrinks under the ordinary
     limit. That is a measured refusal, rather than a reason to make the blanket
     limit larger.
+
+    Six residuals, not the eight this asserted before `_Rewriter.value` learned
+    to descend into a `CLetRec` member. A lifted loop is a *monomorphic*
+    `letrec`, so `_rw_CLetRec` handed it to `generic`, whose reflective walk had
+    no `CBind` case and copied the group's bodies verbatim -- leaving every
+    ground call site inside every loop in the program unspecialized. Two of
+    Array `bind`'s residuals were ground call sites of exactly that kind.
+
+    The size this buys back, measured on this fixture: opt bindings 112 -> 137,
+    emitted IR 52208 -> 55374 lines (+6.1%), warm backend compile 889 -> 924ms
+    (+4%). `monads.tl` and `dicts.tl` are unchanged on all three. The cost is
+    real and confined to this program; it is paid for by the loop bodies that
+    now specialize at all.
+
+    The `Flow` count below moved with it, 33 -> 27, and in the direction that
+    wants no defending: a loop body whose `bind` and `pure` are specialized has
+    six fewer `Fall`/`Brk`/`Cont`/`Ret` records left to allocate.
     """
     from pathlib import Path
     from turkey.core import CLetRec
@@ -452,8 +469,8 @@ def test_type_applied_methods_inline_and_the_remaining_flow_is_tracked():
     assert "%inst.Std.Classes#Monad.Data.Either#Either@String#bind" not in typed
     assert "%inst.Std.Classes#Applicative.Data.Either#Either@String#pure" not in typed
     assert typed.count(
-        "%inst.Std.Classes#Monad.Data.Array#Array#bind") == 8, (
-        "Array bind's eight residuals do not repay their size; if this moves, "
+        "%inst.Std.Classes#Monad.Data.Array#Array#bind") == 6, (
+        "Array bind's six residuals do not repay their size; if this moves, "
         "check both generated-code size and warm backend time")
 
     flow = sum(
@@ -461,6 +478,6 @@ def test_type_applied_methods_inline_and_the_remaining_flow_is_tracked():
         if isinstance(n, CCon)
         and n.name in {"Prelude#Fall", "Prelude#Brk",
                        "Prelude#Cont", "Prelude#Ret"})
-    assert flow == 33, (
+    assert flow == 27, (
         "M16e must retain the nine-construction reduction from fusing recursive "
         "loop result boundaries")

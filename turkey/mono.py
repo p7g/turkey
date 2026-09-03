@@ -131,9 +131,11 @@ from .types import TApp, TCon, TFam, TFun, TTuple, TVar, Type, prune, spine, typ
 
 # How many distinct specializations one binding may have, and how large a type
 # argument may be. Either limit stops the unrolling a polymorphically recursive
-# binding would otherwise ask for. The numbers are deliberately generous: no
-# program in the suite comes near them, so tripping one is a real signal rather
-# than a routine event.
+# binding would otherwise ask for. The numbers are deliberately generous, but
+# "no program in the suite comes near them" -- which this said until it was
+# measured -- is false: `polyrec.tl` trips MAX_SPECIALIZATIONS on `Main#depth`,
+# which is the whole point of that fixture. It is the only one in the suite that
+# does, so tripping one is still a signal rather than a routine event.
 MAX_SPECIALIZATIONS = 32
 MAX_TYPE_NODES = 64
 
@@ -391,6 +393,15 @@ class _Rewriter:
             return CParam(v.name, self.ty(v.ty))
         if isinstance(v, CAlt):
             return CAlt(v.pat, self.rewrite(v.body))
+        # A `letrec` member. Reached when `_rw_CLetRec` hands a group with no
+        # polymorphic member to `generic`, which is every lifted loop: `for`
+        # and `while` become a monomorphic `CLetRec`, so without this case the
+        # group's bodies are copied verbatim and the ground call sites inside
+        # them -- every `next` of every loop in the program -- are never
+        # specialized. `rewrite_bind` rather than `rewrite` because a member
+        # may carry equations of its own.
+        if isinstance(v, CBind):
+            return self.rewrite_bind(v)
         if isinstance(v, Type):
             return self.ty(v)
         if isinstance(v, list):

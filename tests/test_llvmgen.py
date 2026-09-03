@@ -478,15 +478,20 @@ def test_field_and_element_access_is_emitted_inline(name, monkeypatch):
 
     What is checkable *now* is the property that replaced it, so this asserts
     that rather than re-asserting a counter nothing can increment any more.
+
+    The four `_as` accessors are not in the list below any more because they
+    are not in the runtime any more: nothing had called them since the
+    cutover, and a name that cannot be emitted is guarded by its absence
+    rather than by a test. The six that remain are in the same position --
+    declared, never called -- and are named here so that a lowering which
+    started reaching for one again would be caught before they go too.
     """
     program = PROGRAMS_DIR / f"{name}.tl"
     monkeypatch.chdir(PROGRAMS_DIR)
     checked = check(program.read_text(encoding="utf-8"), str(program),
                     [program.parent.resolve()])
     text = generate(checked.opt, checked.decls, checked.main)
-    accessors = ("turkey_object_get_as", "turkey_object_set_as",
-                 "turkey_array_get_as", "turkey_array_set_as",
-                 "turkey_object_tag", "turkey_array_length",
+    accessors = ("turkey_object_tag", "turkey_array_length",
                  "turkey_cell_load", "turkey_cell_store",
                  "turkey_closure_code", "turkey_closure_environment")
     # Call sites only: the declarations stay in the module whether or not

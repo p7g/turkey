@@ -26,7 +26,6 @@ int32_t turkey_has_panicked;
    count is a producer/consumer disagreement that a plain load would compile
    wrongly. Emitting `getelementptr`+`load` in place of these calls is safe
    exactly when this stays zero. */
-static int64_t layout_reconciliations;
 
 /* Where a frame currently is, as a constant the compiler emits once per site.
    Generated code changes its position by storing a pointer to one of these,
@@ -258,7 +257,6 @@ void turkey_collect(void) {
 }
 
 int64_t turkey_heap_objects(void) { return heap_count; }
-int64_t turkey_layout_reconciliations(void) { return layout_reconciliations; }
 int64_t turkey_collection_count(void) { return collection_count; }
 void turkey_gc_set_stress(int32_t enabled) { gc_stress = enabled != 0; }
 
@@ -686,49 +684,6 @@ void turkey_object_set(void *pointer, int64_t index, uint64_t value) {
     if (object_index(object, index)) object->slots[index] = value;
 }
 
-uint64_t turkey_object_get_as(void *pointer, int64_t index, int32_t layout) {
-    if (!valid_heap_pointer(pointer)) return 0;
-    TurkeyObject *object = pointer;
-    if (!object_index(object, index)) return 0;
-    uint64_t value = object->slots[index];
-    if (!(object->kind == 0 || object->kind == 1)) return value;
-    int32_t stored = (object->pointer_bitmap >> (3 * index)) & 7;
-    if (stored == layout || (stored >= 6 && layout >= 6)) return value;
-    layout_reconciliations++;
-    if (stored == 7 && layout < 6)
-        return turkey_unbox((void *)(uintptr_t)value, layout);
-    if (stored < 6 && layout == 7)
-        return (uint64_t)(uintptr_t)turkey_box(value, stored);
-    turkey_panic("object field has the wrong scalar layout");
-    return 0;
-}
-
-void turkey_object_set_as(void *pointer, int64_t index, uint64_t value,
-                          int32_t layout) {
-    if (!valid_heap_pointer(pointer)) return;
-    TurkeyObject *object = pointer;
-    if (!object_index(object, index)) return;
-    if (!(object->kind == 0 || object->kind == 1)) {
-        object->slots[index] = value;
-        return;
-    }
-    int32_t stored = (object->pointer_bitmap >> (3 * index)) & 7;
-    if (stored == layout || (stored >= 6 && layout >= 6)) {
-        object->slots[index] = value;
-        return;
-    }
-    layout_reconciliations++;
-    if (stored == 7 && layout < 6) {
-        void *box = turkey_box(value, layout);
-        if (!turkey_has_panicked) object->slots[index] = (uint64_t)(uintptr_t)box;
-    } else if (stored < 6 && layout == 7) {
-        uint64_t bits = turkey_unbox((void *)(uintptr_t)value, stored);
-        if (!turkey_has_panicked) object->slots[index] = bits;
-    } else {
-        turkey_panic("object field has the wrong scalar layout");
-    }
-}
-
 void *turkey_box(uint64_t value, int32_t layout) {
     TurkeyObject *box = turkey_object_new(5, layout, 1, 0);
     if (box != NULL) box->slots[0] = value;
@@ -826,41 +781,6 @@ uint64_t turkey_array_get(void *pointer, int64_t index) {
 void turkey_array_set(void *pointer, int64_t index, uint64_t value) {
     if (!valid_heap_pointer(pointer)) return;
     array_set(pointer, index, value);
-}
-
-uint64_t turkey_array_get_as(void *pointer, int64_t index, int32_t layout) {
-    if (!valid_object_kind(pointer, 2)) return 0;
-    TurkeyObject *array = pointer;
-    uint64_t value = array_get(array, index);
-    if (turkey_has_panicked || array->tag == layout ||
-            (array->tag >= 6 && layout >= 6)) return value;
-    layout_reconciliations++;
-    if (array->tag == 7 && layout < 6)
-        return turkey_unbox((void *)(uintptr_t)value, layout);
-    if (array->tag < 6 && layout == 7)
-        return (uint64_t)(uintptr_t)turkey_box(value, array->tag);
-    turkey_panic("array element has the wrong scalar layout");
-    return 0;
-}
-
-void turkey_array_set_as(void *pointer, int64_t index, uint64_t value,
-                         int32_t layout) {
-    if (!valid_object_kind(pointer, 2)) return;
-    TurkeyObject *array = pointer;
-    if (array->tag == layout || (array->tag >= 6 && layout >= 6)) {
-        array_set(array, index, value);
-        return;
-    }
-    layout_reconciliations++;
-    if (array->tag == 7 && layout < 6) {
-        void *box = turkey_box(value, layout);
-        if (!turkey_has_panicked) array_set(array, index, (uint64_t)(uintptr_t)box);
-    } else if (array->tag < 6 && layout == 7) {
-        uint64_t bits = turkey_unbox((void *)(uintptr_t)value, array->tag);
-        if (!turkey_has_panicked) array_set(array, index, bits);
-    } else {
-        turkey_panic("array element has the wrong scalar layout");
-    }
 }
 
 void *turkey_array_get_boxed(void *pointer, int64_t index) {

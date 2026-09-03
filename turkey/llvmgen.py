@@ -397,16 +397,12 @@ class _Emitter:
         self._runtime("turkey_object_tag", _I32, [_PTR])
         self._runtime("turkey_object_get", _I64, [_PTR, _I64])
         self._runtime("turkey_object_set", ir.VoidType(), [_PTR, _I64, _I64])
-        self._runtime("turkey_object_get_as", _I64, [_PTR, _I64, _I32])
-        self._runtime("turkey_object_set_as", ir.VoidType(), [_PTR, _I64, _I64, _I32])
         self._runtime("turkey_box", _PTR, [_I64, _I32])
         self._runtime("turkey_unbox", _I64, [_PTR, _I32])
         self._runtime("turkey_array_new", _PTR, [_I64, _I64, _I32, _I32])
         self._runtime("turkey_array_length", _I64, [_PTR])
         self._runtime("turkey_array_get", _I64, [_PTR, _I64])
         self._runtime("turkey_array_set", ir.VoidType(), [_PTR, _I64, _I64])
-        self._runtime("turkey_array_get_as", _I64, [_PTR, _I64, _I32])
-        self._runtime("turkey_array_set_as", ir.VoidType(), [_PTR, _I64, _I64, _I32])
         self._runtime("turkey_array_get_boxed", _PTR, [_PTR, _I64])
         self._runtime("turkey_array_set_boxed", ir.VoidType(), [_PTR, _I64, _PTR])
         self._runtime("turkey_closure_new", _PTR, [_I64, _I64, _I64])
@@ -1474,11 +1470,9 @@ _RUNTIME_SYMBOLS = (
     "turkey_string_is_valid_utf8", "turkey_string_concat_all",
     "turkey_string_eq", "turkey_string_lt",
     "turkey_object_new", "turkey_object_tag", "turkey_object_get",
-    "turkey_object_set", "turkey_object_get_as", "turkey_object_set_as",
-    "turkey_box", "turkey_unbox",
+    "turkey_object_set", "turkey_box", "turkey_unbox",
     "turkey_array_new", "turkey_array_length", "turkey_array_get",
-    "turkey_array_set", "turkey_array_get_as", "turkey_array_set_as",
-    "turkey_array_get_boxed", "turkey_array_set_boxed",
+    "turkey_array_set", "turkey_array_get_boxed", "turkey_array_set_boxed",
     "turkey_closure_new", "turkey_closure_code",
     "turkey_closure_environment", "turkey_closure_capture",
     "turkey_root_enter", "turkey_root_leave",
@@ -1500,7 +1494,6 @@ _RUNTIME_CALLS: dict[str, tuple[object, tuple]] = {
     "turkey_gc_set_stress": (None, (ctypes.c_int32,)),
     "turkey_heap_objects": (ctypes.c_int64, ()),
     "turkey_collection_count": (ctypes.c_int64, ()),
-    "turkey_layout_reconciliations": (ctypes.c_int64, ()),
 }
 _runtime_ir: str | None = None
 

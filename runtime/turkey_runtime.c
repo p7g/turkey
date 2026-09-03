@@ -635,11 +635,6 @@ void *turkey_cell_new(uint64_t value, int32_t pointer_value) {
     return cell;
 }
 
-uint64_t turkey_cell_load(void *pointer) { return ((TurkeyCell *)pointer)->value; }
-void turkey_cell_store(void *pointer, uint64_t value) {
-    ((TurkeyCell *)pointer)->value = value;
-}
-
 void *turkey_object_new(int32_t kind, int32_t tag, int64_t count,
                         uint64_t pointer_bitmap) {
     if (count < 0 || count > 63 ||
@@ -659,23 +654,12 @@ void *turkey_object_new(int32_t kind, int32_t tag, int64_t count,
     return object;
 }
 
-int32_t turkey_object_tag(void *pointer) {
-    if (!valid_heap_pointer(pointer)) return -1;
-    return ((TurkeyObject *)pointer)->tag;
-}
-
 static int object_index(TurkeyObject *object, int64_t index) {
     if (index < 0 || index >= object->count) {
         turkey_panic("invalid object field");
         return 0;
     }
     return 1;
-}
-
-uint64_t turkey_object_get(void *pointer, int64_t index) {
-    if (!valid_heap_pointer(pointer)) return 0;
-    TurkeyObject *object = pointer;
-    return object_index(object, index) ? object->slots[index] : 0;
 }
 
 void turkey_object_set(void *pointer, int64_t index, uint64_t value) {
@@ -738,66 +722,6 @@ void *turkey_array_new(int64_t length, uint64_t initial, int32_t element_width,
         for (int64_t index = 0; index < length; ++index) words[index] = initial;
     }
     return array;
-}
-
-int64_t turkey_array_length(void *pointer) {
-    if (!valid_heap_pointer(pointer)) return 0;
-    return ((TurkeyObject *)pointer)->count;
-}
-
-static int array_index(TurkeyObject *array, int64_t index, const char *operation) {
-    if (index < 0 || index >= array->count) {
-        char message[128];
-        snprintf(message, sizeof(message),
-                 "array index out of bounds: %s index %" PRId64 ", length %" PRId64,
-                 operation, index, array->count);
-        turkey_panic(message);
-        return 0;
-    }
-    return 1;
-}
-
-static uint64_t array_get(TurkeyObject *array, int64_t index) {
-    uint64_t value = 0;
-    if (array_index(array, index, "read at")) {
-        int32_t width = (int32_t)array->pointer_bitmap;
-        memcpy(&value, (unsigned char *)array->slots + index * width, (size_t)width);
-    }
-    return value;
-}
-
-static void array_set(TurkeyObject *array, int64_t index, uint64_t value) {
-    if (array_index(array, index, "write at")) {
-        int32_t width = (int32_t)array->pointer_bitmap;
-        memcpy((unsigned char *)array->slots + index * width, &value, (size_t)width);
-    }
-}
-
-uint64_t turkey_array_get(void *pointer, int64_t index) {
-    if (!valid_heap_pointer(pointer)) return 0;
-    return array_get(pointer, index);
-}
-
-void turkey_array_set(void *pointer, int64_t index, uint64_t value) {
-    if (!valid_heap_pointer(pointer)) return;
-    array_set(pointer, index, value);
-}
-
-void *turkey_array_get_boxed(void *pointer, int64_t index) {
-    if (!valid_object_kind(pointer, 2)) return NULL;
-    TurkeyObject *array = pointer;
-    uint64_t value = array_get(array, index);
-    if (turkey_has_panicked) return NULL;
-    if (array->tag >= 6) return (void *)(uintptr_t)value;
-    return turkey_box(value, array->tag);
-}
-
-void turkey_array_set_boxed(void *pointer, int64_t index, void *value) {
-    if (!valid_object_kind(pointer, 2)) return;
-    TurkeyObject *array = pointer;
-    uint64_t bits = (array->tag >= 6 ? (uint64_t)(uintptr_t)value
-                     : turkey_unbox(value, array->tag));
-    if (!turkey_has_panicked) array_set(array, index, bits);
 }
 
 static int array_parts(void *wrapper, TurkeyObject **data, int64_t *length) {
@@ -914,16 +838,6 @@ void *turkey_closure_new(uint64_t code, int64_t capture_count,
     closure->slots[1] = (uint64_t)(uintptr_t)environment;
     turkey_root_leave(&frame);
     return closure;
-}
-
-uint64_t turkey_closure_code(void *pointer) {
-    if (!valid_object_kind(pointer, 3)) return 0;
-    return ((TurkeyObject *)pointer)->slots[0];
-}
-
-void *turkey_closure_environment(void *pointer) {
-    if (!valid_object_kind(pointer, 3)) return NULL;
-    return (void *)(uintptr_t)((TurkeyObject *)pointer)->slots[1];
 }
 
 void turkey_closure_capture(void *pointer, int64_t index, uint64_t value) {

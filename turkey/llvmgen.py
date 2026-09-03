@@ -391,23 +391,11 @@ class _Emitter:
         self._runtime("turkey_print", _I8, [_PTR])
         self._runtime("turkey_write", _I8, [_PTR])
         self._runtime("turkey_cell_new", _PTR, [_I64, _I32])
-        self._runtime("turkey_cell_load", _I64, [_PTR])
-        self._runtime("turkey_cell_store", ir.VoidType(), [_PTR, _I64])
         self._runtime("turkey_object_new", _PTR, [_I32, _I32, _I64, _I64])
-        self._runtime("turkey_object_tag", _I32, [_PTR])
-        self._runtime("turkey_object_get", _I64, [_PTR, _I64])
-        self._runtime("turkey_object_set", ir.VoidType(), [_PTR, _I64, _I64])
         self._runtime("turkey_box", _PTR, [_I64, _I32])
         self._runtime("turkey_unbox", _I64, [_PTR, _I32])
         self._runtime("turkey_array_new", _PTR, [_I64, _I64, _I32, _I32])
-        self._runtime("turkey_array_length", _I64, [_PTR])
-        self._runtime("turkey_array_get", _I64, [_PTR, _I64])
-        self._runtime("turkey_array_set", ir.VoidType(), [_PTR, _I64, _I64])
-        self._runtime("turkey_array_get_boxed", _PTR, [_PTR, _I64])
-        self._runtime("turkey_array_set_boxed", ir.VoidType(), [_PTR, _I64, _PTR])
         self._runtime("turkey_closure_new", _PTR, [_I64, _I64, _I64])
-        self._runtime("turkey_closure_code", _I64, [_PTR])
-        self._runtime("turkey_closure_environment", _PTR, [_PTR])
         self._runtime("turkey_closure_capture", ir.VoidType(), [_PTR, _I64, _I64])
         self._runtime("turkey_panic", ir.VoidType(), [_PTR])
         self._runtime("turkey_panic_string", ir.VoidType(), [_PTR])
@@ -1452,31 +1440,6 @@ class _Emitter:
         return value
 
 
-_RUNTIME_SYMBOLS = (
-    "turkey_string_new", "turkey_string_concat", "turkey_int_to_string",
-    "turkey_float_to_string", "turkey_float_parse", "turkey_float_can_parse",
-    "turkey_float_fmod", "turkey_float_remainder", "turkey_float_floor",
-    "turkey_float_ceil", "turkey_float_round", "turkey_float_trunc",
-    "turkey_char_to_string", "turkey_print",
-    "turkey_write", "turkey_cell_new", "turkey_cell_load", "turkey_cell_store",
-    "turkey_panic", "turkey_panic_string", "turkey_panicked",
-    "turkey_frame_enter", "turkey_frame_leave", "turkey_frame_count",
-    "turkey_frame_function", "turkey_frame_file", "turkey_frame_line",
-    "turkey_frame_col",
-    "turkey_string_byte_length", "turkey_string_byte_at",
-    "turkey_string_decode_at", "turkey_string_next_index",
-    "turkey_string_slice", "turkey_string_find", "turkey_string_rfind",
-    "turkey_string_to_byte_storage", "turkey_string_from_bytes",
-    "turkey_string_is_valid_utf8", "turkey_string_concat_all",
-    "turkey_string_eq", "turkey_string_lt",
-    "turkey_object_new", "turkey_object_tag", "turkey_object_get",
-    "turkey_object_set", "turkey_box", "turkey_unbox",
-    "turkey_array_new", "turkey_array_length", "turkey_array_get",
-    "turkey_array_set", "turkey_array_get_boxed", "turkey_array_set_boxed",
-    "turkey_closure_new", "turkey_closure_code",
-    "turkey_closure_environment", "turkey_closure_capture",
-    "turkey_root_enter", "turkey_root_leave",
-)
 # The runtime entry points Python itself calls, rather than generated code:
 # panic reporting at the JIT boundary and the collector's diagnostics. Written
 # out because a linked-in module has no `ctypes.CDLL` to read `restype` off,

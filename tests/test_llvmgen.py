@@ -1,4 +1,5 @@
 import os
+import re
 
 import pytest
 from pathlib import Path
@@ -11,6 +12,43 @@ from turkey.backend_lower import lower
 from turkey.llvmgen import compile, execute, generate, _root_slots
 
 PROGRAMS_DIR = Path(__file__).parent / "programs"
+# Every runtime entry point generated code is allowed to call. Allocation,
+# panics, root and frame bookkeeping, and the string and float operations that
+# genuinely need C. Reading a field, an element, a tag, an array length, a cell
+# or a closure slot is not here and must not be: each is a `getelementptr` and
+# a `load`, because the offset and the layout are compile-time facts in a
+# monomorphized program. Anything new appearing here is a decision, not an
+# accident, which is the point of listing what is allowed rather than what is
+# forbidden.
+def _runtime_entry_points() -> set[str]:
+    """Every function the runtime exports, read from its header.
+
+    Read rather than listed so that deleting one cannot leave this test
+    quietly asserting something about a name that no longer exists.
+    """
+    header = (Path(__file__).parent.parent / "runtime" / "turkey_runtime.h")
+    return set(re.findall(r"\b(turkey_\w+)\s*\(", header.read_text()))
+
+
+ALLOWED_RUNTIME_CALLS = {
+    "turkey_object_new", "turkey_array_new", "turkey_cell_new",
+    "turkey_closure_new", "turkey_closure_capture",
+    "turkey_box", "turkey_unbox",
+    "turkey_string_new", "turkey_string_concat", "turkey_string_concat_all",
+    "turkey_string_eq", "turkey_string_lt", "turkey_string_byte_length",
+    "turkey_string_byte_at", "turkey_string_decode_at",
+    "turkey_string_next_index", "turkey_string_slice", "turkey_string_find",
+    "turkey_string_rfind", "turkey_string_to_byte_storage",
+    "turkey_string_from_bytes", "turkey_string_is_valid_utf8",
+    "turkey_int_to_string", "turkey_float_to_string", "turkey_char_to_string",
+    "turkey_float_parse", "turkey_float_can_parse", "turkey_float_fmod",
+    "turkey_float_remainder", "turkey_float_floor", "turkey_float_ceil",
+    "turkey_float_round", "turkey_float_trunc",
+    "turkey_print", "turkey_write",
+    "turkey_panic", "turkey_panic_string", "turkey_panicked",
+    "turkey_root_enter", "turkey_root_leave",
+    "turkey_frame_enter", "turkey_frame_leave",
+}
 NATIVE_PROGRAMS = sorted(
     path.stem for path in PROGRAMS_DIR.glob("*.tl")
     if not path.stem.startswith("err_") and path.with_suffix(".expected").exists()
@@ -479,28 +517,28 @@ def test_field_and_element_access_is_emitted_inline(name, monkeypatch):
     What is checkable *now* is the property that replaced it, so this asserts
     that rather than re-asserting a counter nothing can increment any more.
 
-    The four `_as` accessors are not in the list below any more because they
-    are not in the runtime any more: nothing had called them since the
-    cutover, and a name that cannot be emitted is guarded by its absence
-    rather than by a test. The six that remain are in the same position --
-    declared, never called -- and are named here so that a lowering which
-    started reaching for one again would be caught before they go too.
+    The accessors this used to name are gone from the runtime, so naming them
+    would assert nothing. What replaces the list is its complement: the
+    runtime entry points a program may call at all. A reader of a field or an
+    element is not on it, so a lowering that reached for one -- or that
+    reintroduced an accessor to reach for -- fails here rather than passing a
+    check that has quietly stopped being able to fail.
     """
     program = PROGRAMS_DIR / f"{name}.tl"
     monkeypatch.chdir(PROGRAMS_DIR)
     checked = check(program.read_text(encoding="utf-8"), str(program),
                     [program.parent.resolve()])
     text = generate(checked.opt, checked.decls, checked.main)
-    accessors = ("turkey_object_tag", "turkey_array_length",
-                 "turkey_cell_load", "turkey_cell_store",
-                 "turkey_closure_code", "turkey_closure_environment")
-    # Call sites only: the declarations stay in the module whether or not
-    # anything reaches them, so matching the bare name would match those.
-    called = {accessor for line in text.splitlines() if " call " in f" {line} "
-              for accessor in accessors if f"@{accessor}(" in line}
-    assert not called, (
-        f"{name} still reaches a field through {sorted(called)}; each should "
-        f"be a getelementptr and a load")
+    called = {match.group(1) for line in text.splitlines()
+              if " call " in f" {line} "
+              for match in [re.search(r"@(turkey_\w+)\(", line)] if match}
+    # A compiled Turkey function is mangled with the same prefix, so the
+    # runtime's own entry points are the ones the header declares.
+    unexpected = (called & _runtime_entry_points()) - ALLOWED_RUNTIME_CALLS
+    assert not unexpected, (
+        f"{name} calls {sorted(unexpected)}; if that is deliberate, add it to "
+        f"ALLOWED_RUNTIME_CALLS, and if it is a field or element read it "
+        f"should be a getelementptr and a load instead")
 
 
 @pytest.mark.skipif(

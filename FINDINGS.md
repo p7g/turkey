@@ -383,6 +383,67 @@ wants to be called, and `loop` is what the function that lowers a loop wants to
 be called; they are `instanceBind` and `lowerLoop`. Eight common words are now
 unavailable to every binder in every program.
 
+### 41. A control transfer cannot cross a destructuring binding
+**design.** M24. This is refused:
+
+```
+let (fn, args) = match e.kind {
+    CApp(f, a) -> (f, a)
+    _ -> return None
+}
+```
+
+with `a control transfer in a destructuring binding`. The lowering's rule wants
+a plain name to hang the join's parameter on, and a tuple pattern has none --
+`Turkey.Lower.convBindName` says so outright. The same statement with a single
+binder is fine, and so is the tuple binding without the `return`.
+
+The shape is not exotic; it is what a function does when it takes several things
+apart at once and has a nothing-to-do case. It came up in `Turkey.Mono` within
+an hour of the file existing, and the fix -- split the function so the `match`
+dispatches to a second one that takes the pieces as parameters -- reads better,
+which is the honest reason to leave it. What it costs is that the better
+spelling was not a choice.
+
+Related to entry 8: both are places where a form the language *has* is not
+available in a position it obviously belongs.
+
+### 42. A guard that could never fire, and cannot simply be made to
+**design, open.** M24. `opt._mentions_alts` asks whether the `match` that
+case-of-case pushed into a branch survived the reduction -- "did pushing it
+there buy anything" -- and asks it as `n.alts is alts`. The answer is always
+false. `_Reducer.expr` rebuilds every node it walks, the alternative list
+included, before any rule fires, and no rule reuses the caller's list; so the
+object being compared is gone by the time the reduction it is asking about has
+happened. Counted over the whole suite to be sure: 364 calls, 364 answers of
+false.
+
+What that leaves switched off is case-of-case's join point. The `landed` guard
+is always satisfied, no branch ever becomes a `jump`, and the continuation is
+copied into every branch -- the code explosion `plan.txt` item 7 introduces join
+points to prevent, described in the docstring immediately above the line.
+
+The port could not translate `is`, so the question had to be asked properly, and
+the fix looked easy: carry the *patterns*' identity, which is the one part of an
+alternative that survives a rebuild (`CAlt` is rebuilt with its `pat` reused,
+here and in `core.map_kind` alike). It works -- the guard then fires 206 times
+and 18 rewrites that bought nothing are declined -- and it makes the compiler
+worse. A branch whose pushed-in match has not collapsed *yet* becomes a jump
+carrying the whole unreduced branch, so the join specialization downstream finds
+no constructor tag to split on: `tests/test_opt.py`'s `clamp` goes from erasing
+its `Flow` entirely to keeping a four-way match on it. Reverted on both sides.
+
+So the entry is open rather than fixed, and it is two findings. The guard has
+never fired, which is a bug. And "did this rewrite buy anything" is not
+answerable by looking for the term afterwards, because the reductions are a
+fixed point and a term that is still there may be one rewrite from gone --
+which is a design question about where the protection belongs, not a spelling
+mistake. All three `.opt` goldens are byte-identical either way, which is its
+own finding about what the goldens cover.
+
+`boot` states the answer as a constant with the reasoning attached, which is
+the honest translation of a question whose answer is decided.
+
 ### 24. `Data.Set` is not one of the modules the Prelude re-exports
 **library.** M21. `Array`, `Map`, `Option` and eight others arrive
 automatically; `Set` needs an import, for no reason a reader could guess. Either

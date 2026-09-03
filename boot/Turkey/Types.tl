@@ -16,7 +16,7 @@ module Turkey.Types (
     Families(..),
     prune, normalize, occursAndAdjust, escaping,
     unify, join, generalize, instantiate, instantiateQual,
-    typeKey, subterms, varsOf, freeVars,
+    typeKey, sameType, subterms, varsOf, freeVars,
     Namer(..), namer, namerFrom, show, showAt, showScheme, showPred,
     showPredWith,
 )
@@ -713,10 +713,10 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
     let x = normalize(a, fams)
     let y = normalize(b, fams)
 
-    -- Python compares by object identity here; structural equality is the same
-    -- answer for a unifier that has nothing to do when the two already agree,
-    -- and is what there is without identities.
-    if typeKey(x) == typeKey(y) { return {} }
+    -- Python asks `a is b`. There is no pointer to ask about, so this is the
+    -- structural version of the same question -- and it is asked without
+    -- building anything, which a key would not have been.
+    if sameType(x, y) { return {} }
 
     -- Section 4.3: bottom is absorbed by anything it meets. A no-op, not a
     -- binding -- `join` is what recovers the surviving type.
@@ -798,7 +798,7 @@ fun unifyRest(x : Type, y : Type, where : Option Span, context : String,
     if !isFam(x) && !isFam(y) { mismatch(x, y, where, context) }
     match (x, y) {
         (TFam(n1, a1, _), TFam(n2, a2, _)) ->
-            if n1 == n2 && typeKey(a1) == typeKey(a2) { return {} }
+            if n1 == n2 && sameType(a1, a2) { return {} }
         _ -> {}
     }
     match fams {
@@ -932,6 +932,52 @@ fun subst(t : Type, mapping : Map Int Type) -> Type = match prune(t) {
                               subst(ret, mapping))
     TTuple(elems) -> TTuple(Array.map(elems, fun(e) = subst(e, mapping)))
     _ -> prune(t)
+}
+
+-- Whether two types are structurally the same, without building anything.
+--
+-- The comparison `typeKey` supports, done directly. Python compares two tuples,
+-- and in the one place that matters -- unification's first line -- it does not
+-- compare at all, it asks `a is b`, which is a pointer. There is no pointer to
+-- ask about here, so this is what stands in for it: the same answer, and no
+-- allocation, where a key would have built two strings per call on the hottest
+-- function in inference.
+--
+-- `typeKey` stays, for the places that genuinely want a *key* -- a map from
+-- types to something, or a set of them. Comparing two of them was never one of
+-- those places.
+fun sameType(a : Type, b : Type) -> Bool {
+    let x = prune(a)
+    let y = prune(b)
+    match (x, y) {
+        (TVar(c1), TVar(c2)) -> c1.id == c2.id
+        (TCon(c1), TCon(c2)) -> c1.name == c2.name && c1.level == c2.level
+        (TApp(f1, a1, _), TApp(f2, a2, _)) -> sameType(f1, f2) && sameType(a1, a2)
+        (TFam(n1, a1, _), TFam(n2, a2, _)) -> n1 == n2 && sameType(a1, a2)
+        (TFun(p1, r1), TFun(p2, r2)) -> sameTypes(p1, p2) && sameType(r1, r2)
+        (TTuple(e1), TTuple(e2)) -> sameTypes(e1, e2)
+        (TLabel(n1), TLabel(n2)) -> n1 == n2
+        (TIndex(v1), TIndex(v2)) -> v1 == v2
+        (TSet(n1), TSet(n2)) -> sameNames(n1, n2)
+        (TBottom, TBottom) -> True
+        _ -> False
+    }
+}
+
+fun sameTypes(a : Array Type, b : Array Type) -> Bool {
+    if len(a) != len(b) { return False }
+    for var i = 0; i < len(a); i = i + 1 {
+        if !sameType(a[i], b[i]) { return False }
+    }
+    True
+}
+
+fun sameNames(a : Array String, b : Array String) -> Bool {
+    if len(a) != len(b) { return False }
+    for var i = 0; i < len(a); i = i + 1 {
+        if a[i] != b[i] { return False }
+    }
+    True
 }
 
 -- A structural identity for a type, up to the current substitution.

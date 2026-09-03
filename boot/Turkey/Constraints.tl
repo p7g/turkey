@@ -237,9 +237,8 @@ fun adopt(s : Solver, vars : Array VarCell) -> Unit {
 -- reduce through the instance table. So the assumptions are consulted first, and
 -- the rule they supply is applied exactly as an instance's would be.
 fun reduceFam(s : Solver, t : Ty.Type) -> Option Ty.Type {
-    let key = Ty.typeKey(t)
     for p in s.assumptions {
-        if p.name == Ty.equals && Ty.typeKey(p.args[0]) == key {
+        if p.name == Ty.equals && Ty.sameType(p.args[0], t) {
             return Some(p.args[1])
         }
     }
@@ -658,7 +657,7 @@ fun equals(s : Solver, c : PredCell) -> Bool {
     let left = Classes.normalize(s.classes, c.pred.args[0])
     let right = Classes.normalize(s.classes, c.pred.args[1])
     c.pred = Ty.pred(c.pred.name, [left, right])
-    if Ty.typeKey(left) == Ty.typeKey(right) { return True }
+    if Ty.sameType(left, right) { return True }
     if isFam(left) || isFam(right) { return False }
     Ty.unify(left, right, c.span, c.context, families(s))
     True

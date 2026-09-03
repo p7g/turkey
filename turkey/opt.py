@@ -964,10 +964,27 @@ def _nodes(e):
 def _mentions_alts(e, alts) -> bool:
     """Whether the alternatives `alts` are still being matched on inside `e`.
 
-    Identity, not equality, and that is the point: it asks whether *this*
-    match survived the reduction, which is exactly the question "did pushing
-    it into the branch buy anything". A structural comparison would answer a
-    different and less useful question.
+    Identity, not equality, and that is the point: it asks whether *this* match
+    survived the reduction, which is exactly the question "did pushing it into
+    the branch buy anything". A structural comparison would answer a different
+    and less useful question.
+
+    It is also a question that can no longer be asked, and so this answers
+    false always -- see FINDINGS.md 42. `self.expr` rebuilds every node it
+    walks, list included, before any rule fires, so the object `alts` names is
+    gone by the time the reduction it is being asked about has happened.
+    Nothing here reuses it: the rules that build a `CMatch` around existing
+    alternatives build it around the *rebuilt* ones.
+
+    Making it fire is not a matter of comparing something that does survive
+    (the patterns do). That was tried, and it costs optimization: a branch
+    whose pushed-in match has not collapsed *yet* becomes a jump carrying the
+    whole unreduced branch, and the join specialization downstream can no
+    longer see a constructor tag to split on -- `tests/test_opt.py`'s
+    `clamp` keeps its four-way `Flow` match instead of erasing it. The
+    protection this guard is meant to provide is real and the shape it should
+    key on is an open question; what is not open is that this spelling of it
+    has never once fired.
     """
     return any(isinstance(n, CMatch) and n.alts is alts for n in _nodes(e))
 

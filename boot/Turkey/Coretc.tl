@@ -865,9 +865,8 @@ fun reduce(ck : Checker, ty : Ty.Type) -> Ty.Type =
 fun famsOf(classes : ClassTable,
            equations : Array (Ty.Type, Ty.Type)) -> Ty.Families = Ty.Families {
     reduce = fun(t) = {
-        let key = Ty.typeKey(t)
         for (left, right) in equations {
-            if Ty.typeKey(left) == key { return Some(right) }
+            if Ty.sameType(left, t) { return Some(right) }
         }
         match t {
             TFam(name, arg, _) -> Classes.reduceFam(classes, name, arg)
@@ -901,7 +900,7 @@ fun compatible(want : Ty.Type, got : Ty.Type) -> Bool {
         TVar(_) -> return True
         _ -> {}
     }
-    if Ty.typeKey(w) == Ty.typeKey(g) { return True }
+    if Ty.sameType(w, g) { return True }
     match (w, g) {
         (TFun(wp, wr), TFun(gp, gr)) -> {
             if len(wp) != len(gp) { return False }

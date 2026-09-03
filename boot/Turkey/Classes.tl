@@ -455,9 +455,8 @@ fun resolveEquality(t : ClassTable, p : Ast.Pred, leftTe : Type, rightTe : Type,
                   + "side of a '~' must be one -- an equality says what a family "
                   + "answers, not that two types happen to agree", Some(p.span))
     }
-    let key = Ty.typeKey(left)
     for sub in Ty.subterms(right) {
-        if Ty.typeKey(sub) == key {
+        if Ty.sameType(sub, left) {
             oops("'" + Ty.show(right) + "' mentions '" + Ty.show(left)
                  + "', so the equality defines it in terms of itself", Some(p.span))
         }
@@ -912,7 +911,7 @@ fun matchInto(p : Ty.Type, t : Ty.Type, mapping : Map Int Ty.Type) -> Bool {
                 Map.put(mapping, cell.id, target)
                 True
             }
-            Some(bound) -> Ty.typeKey(bound) == Ty.typeKey(target)
+            Some(bound) -> Ty.sameType(bound, target)
         }
         TCon(c) -> match target {
             TCon(other) -> c.name == other.name

@@ -47,6 +47,9 @@ import Turkey.Evidence as Evidence
 import Turkey.Core as Core
 import Turkey.Lower as Lower
 import Turkey.Coretc as Coretc
+import Turkey.Mono as Mono
+import Turkey.Joins as Joins
+import Turkey.Opt as Opt
 import Turkey.Ast (Decl(..), Stmt(..), StmtKind(..), patternVars)
 
 -- Where the language's own library lives, relative to where this is run from.
@@ -60,7 +63,7 @@ fun main() {
     if len(args) < 2 { usage() }
     let command = args[0]
     if !Array.contains(["tokens", "ast", "desugar", "decls", "deps",
-                    "classes", "types", "core"], command) {
+                    "classes", "types", "core", "mono", "opt"], command) {
         die("unknown command '" + command + "'")
     }
     -- One builder for every file: a `print` per token is a flush per token,
@@ -77,7 +80,9 @@ fun main() {
             "deps" -> dumpDeps(b, path)
             "classes" -> dumpClasses(b, path)
             "types" -> dumpTypes(b, path)
-            _ -> dumpCore(b, path)
+            "core" -> dumpCore(b, path)
+            "mono" -> dumpMono(b, path)
+            _ -> dumpOpt(b, path)
         }
     }
     write(String.build(b))
@@ -270,6 +275,47 @@ fun lowered(checked : Checked) -> Core.CProgram {
     program
 }
 
+-- That Core with its polymorphism specialized away.
+--
+-- Checked again, and by the same checker: specialization rewrites every type in
+-- every body it copies, so "the copy still typechecks" is the property that a
+-- substitution went wrong would break first.
+fun dumpMono(b : String.Builder, path : String) -> Unit {
+    let (checked, entry) = checkProgram(path)
+    let program = lowered(checked)
+    let main = Map.getOr(entry.scope.values, "main", "main")
+    let specialized = Mono.monomorphize(program, checked.decls, checked.classes,
+                                        main)
+    Coretc.checkProgram(checked.decls, checked.classes, specialized,
+                        Coretc.globalsOf(checked.env))
+    String.push(b, Core.showProgram(specialized, Some(entry.name)))
+}
+
+-- And that with the optimizations applied.
+--
+-- The composition is load-bearing and is reproduced exactly: reduction exposes
+-- local continuations for join discovery, and discovery in turn exposes
+-- constructor-valued jumps for join specialization, so each pass gets one look
+-- at the representation it knows how to simplify.
+--
+-- Checked again, and for the sharpest reason yet: join discovery decides that a
+-- call is in tail position, and the checker decides the same thing
+-- independently by threading a join scope. A pass that called a position a tail
+-- where the rule does not emits a jump with nowhere to go, and this is where
+-- that is caught.
+fun dumpOpt(b : String.Builder, path : String) -> Unit {
+    let (checked, entry) = checkProgram(path)
+    let program = lowered(checked)
+    let main = Map.getOr(entry.scope.values, "main", "main")
+    let specialized = Mono.monomorphize(program, checked.decls, checked.classes,
+                                        main)
+    let optimized = Opt.reduceProgram(
+        Joins.discover(Opt.reduceProgram(specialized)))
+    Coretc.checkProgram(checked.decls, checked.classes, optimized,
+                        Coretc.globalsOf(checked.env))
+    String.push(b, Core.showProgram(optimized, Some(entry.name)))
+}
+
 -- What the whole front end leaves behind.
 type Checked = Checked {
     decls    : Decls.DeclTable,
@@ -376,8 +422,9 @@ fun readOrDie(path : String) -> Source = match Source.read(path) {
 }
 
 fun usage() -> a =
-    die("usage: boot <tokens|ast|desugar|decls|deps|classes|types|core>"
-        + " FILE...")
+    die("usage: boot "
+        + "<tokens|ast|desugar|decls|deps|classes|types|core|mono|opt> "
+        + "FILE...")
 
 fun die(message : String) -> a {
     IO.stderr("boot: " + message + "\n")

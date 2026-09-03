@@ -198,6 +198,16 @@ def boot_core() -> str:
 
 
 @pytest.fixture(scope="module")
+def boot_mono() -> str:
+    return _boot("mono", *_relative(SAMPLE))
+
+
+@pytest.fixture(scope="module")
+def boot_opt() -> str:
+    return _boot("opt", *_relative(ENTRIES))
+
+
+@pytest.fixture(scope="module")
 def boot_desugar() -> str:
     return _boot("desugar", *(str(p.relative_to(REPO_ROOT)) for p in ENTRIES))
 
@@ -383,6 +393,52 @@ def test_boot_elaborates_to_the_same_core(boot_core: str) -> None:
         parts.append(show_program(checked.core, checked.module))
     expected = "".join(parts)
     _first_difference(boot_core, expected, "core")
+
+
+def test_boot_specializes_the_same_way(boot_mono: str) -> None:
+    """M24: monomorphization, and the checker run again on its output.
+
+    On the sample rather than at full breadth, because the milestone check is
+    the one below: `opt` runs this pass first and then two more on top of it,
+    so a specialization that differed would have to survive three passes to
+    escape both. What this adds is the smaller failure -- a diff at the stage
+    it happened in rather than at the stage after it.
+    """
+    parts = []
+    for path in SAMPLE:
+        checked = check(path.read_text(encoding="utf-8"),
+                        str(path.relative_to(REPO_ROOT)), [path.parent])
+        parts.append(show_program(checked.mono, checked.module))
+    _first_difference(boot_mono, "".join(parts), "mono")
+
+
+def test_boot_optimizes_the_same_way(boot_opt: str) -> None:
+    """M24: inlining, join discovery and the local reductions.
+
+    Every entry program, at full breadth, and the last stage before a backend.
+    Two details are ports rather than approximations because a golden depends
+    on each: the specialization budget is shared across mono's two rounds, and
+    the loop breaker chosen within a strongly-connected component is the
+    lexicographically first name in it.
+
+    The composition is load-bearing and is reproduced exactly on both sides --
+    `reduce`, then `discover`, then `reduce` -- because the middle pass is the
+    representation boundary: the first reduction exposes local continuations
+    for discovery, and discovery exposes constructor-valued jumps for join
+    specialization.
+
+    As with `core`, the dump is only half of it. `boot opt` runs
+    `Turkey.Coretc` on what it produced, which is where join discovery and the
+    checker are made to agree about what a tail position is: calling one a tail
+    where the rule does not is a jump with nowhere to go, and that is an exit
+    status rather than a diff.
+    """
+    parts = []
+    for path in ENTRIES:
+        checked = check(path.read_text(encoding="utf-8"),
+                        str(path.relative_to(REPO_ROOT)), [path.parent])
+        parts.append(show_program(checked.opt, checked.module))
+    _first_difference(boot_opt, "".join(parts), "opt")
 
 
 def test_boot_reports_a_missing_file(tmp_path: Path) -> None:

@@ -80,10 +80,31 @@ COMPILED_PREFIX = "turkeyfn_"
 
 
 def mangle(name: str) -> str:
+    """A Turkey name as a native symbol, one name to one symbol.
+
+    An underscore doubles rather than passing through, which is what makes
+    this injective and is not decoration. With `_` left alone, `_25_` in a
+    symbol could have come from a `%` in the name or from the four characters
+    `_25_` in it, and those are different names: `Main#f%lambda0` and
+    `Main#f_25_lambda0` both used to mangle to `turkeyfn_Main_23_f_25_lambda0`.
+
+    That was reachable. A lifted lambda is named after the binding it came out
+    of, so `Main#f`'s first lambda was `turkeyfn_Main_23_f_lambda_0` and so was
+    a Turkey function actually called `f_lambda_0`. Two definitions, one
+    symbol, and llvmlite raises `DuplicatedNameError` from somewhere that says
+    nothing about either.
+
+    Doubling makes the reading unambiguous: an escape is `_`, two hex digits,
+    `_`, and a literal underscore is always a pair, so no run of literal
+    underscores and digits can spell one.
+    """
     pieces = []
     for byte in name.encode("utf-8"):
         char = chr(byte)
-        pieces.append(char if char.isalnum() or char == "_" else f"_{byte:02x}_")
+        if char == "_":
+            pieces.append("__")
+        else:
+            pieces.append(char if char.isalnum() else f"_{byte:02x}_")
     return COMPILED_PREFIX + "".join(pieces)
 
 
@@ -834,7 +855,12 @@ class _FunctionLowerer:
         captures = list(env.items())
         number = self.lift_counter[0]
         self.lift_counter[0] += 1
-        symbol = f"{self.output_name}_lambda_{number}"
+        # `_25_` is the escape for `%`, and `%` is the compiler's own
+        # character: the lexer will not accept one in an identifier, so no
+        # Turkey name mangles to a symbol containing this. Appending a bare
+        # `_lambda_0` instead is what a function named `f_lambda_0` used to
+        # collide with.
+        symbol = f"{self.output_name}_25_lambda{number}"
         bind = CBind(symbol, lam.ty, [], lam, lam.span)
         child = _FunctionLowerer(
             bind, lam, self.functions, self.decls, self.tags,

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -1045,60 +1047,126 @@ _RUNTIME_SYMBOLS = (
     "turkey_closure_environment", "turkey_closure_capture",
     "turkey_root_enter", "turkey_root_leave",
 )
-_runtime_library: ctypes.CDLL | None = None
+# The runtime entry points Python itself calls, rather than generated code:
+# panic reporting at the JIT boundary and the collector's diagnostics. Written
+# out because a linked-in module has no `ctypes.CDLL` to read `restype` off,
+# and a wrong `restype` here is a silently truncated pointer.
+_RUNTIME_CALLS: dict[str, tuple[object, tuple]] = {
+    "turkey_panic_clear": (None, ()),
+    "turkey_panicked": (ctypes.c_int32, ()),
+    "turkey_panic_message": (ctypes.c_char_p, ()),
+    "turkey_frame_count": (ctypes.c_int64, ()),
+    "turkey_frame_function": (ctypes.c_char_p, (ctypes.c_int64,)),
+    "turkey_frame_file": (ctypes.c_char_p, (ctypes.c_int64,)),
+    "turkey_frame_line": (ctypes.c_int64, (ctypes.c_int64,)),
+    "turkey_frame_col": (ctypes.c_int64, (ctypes.c_int64,)),
+    "turkey_collect": (None, ()),
+    "turkey_gc_set_stress": (None, (ctypes.c_int32,)),
+    "turkey_heap_objects": (ctypes.c_int64, ()),
+    "turkey_collection_count": (ctypes.c_int64, ()),
+    "turkey_layout_reconciliations": (ctypes.c_int64, ()),
+}
+_runtime_ir: str | None = None
 
 
-def _load_runtime() -> ctypes.CDLL:
-    global _runtime_library
-    if _runtime_library is not None:
-        return _runtime_library
+class _Runtime:
+    """The runtime, reached through the engine that compiled it.
+
+    It used to be a `ctypes.CDLL` over a dynamic library, and callers still
+    spell it that way -- `module.runtime.turkey_heap_objects()`. What changed
+    is where the code is: the runtime is now linked into the JIT module, so
+    there is exactly one copy of its state and the optimizer can see through
+    it, and an address comes from the engine rather than from `dlsym`.
+    """
+
+    def __init__(self, engine: binding.ExecutionEngine) -> None:
+        self._engine = engine
+        self._resolved: dict[str, object] = {}
+
+    def __getattr__(self, name: str):
+        found = self._resolved.get(name)
+        if found is None:
+            if name not in _RUNTIME_CALLS:
+                raise AttributeError(name)
+            result, arguments = _RUNTIME_CALLS[name]
+            address = self._engine.get_function_address(name)
+            if not address:
+                raise Unsupported(f"the runtime did not define {name}")
+            found = ctypes.CFUNCTYPE(result, *arguments)(address)
+            self._resolved[name] = found
+        return found
+
+
+def _runtime_source() -> Path:
     root = Path(__file__).resolve().parent.parent
     source = root / "runtime" / "turkey_runtime.c"
     if not source.is_file():
         source = Path(sys.prefix) / "runtime" / "turkey_runtime.c"
     if not source.is_file():
         raise Unsupported("the packaged Turkey native runtime source is missing")
-    output = Path(tempfile.mkdtemp(prefix="turkey-runtime-")) / (
-        "libturkey.dylib" if sys.platform == "darwin" else "libturkey.so")
-    command = ["cc", "-std=c11", "-O2", "-fPIC", str(source), "-o", str(output)]
-    command.insert(1, "-dynamiclib" if sys.platform == "darwin" else "-shared")
-    if sys.platform != "darwin":
-        command.append("-lm")
-    if "TURKEY_RUNTIME_SANITIZE" in os.environ:
-        command[2:2] = ["-O1", "-g", "-fsanitize=address,undefined",
-                        "-fno-omit-frame-pointer"]
+    return source
+
+
+def _runtime_module(triple: str) -> str:
+    """The runtime as LLVM IR, to be linked into the module being compiled.
+
+    Compiled rather than shipped: the IR has a target baked into it, so it
+    cannot be a build artifact the way the C source can. It is cached on disk
+    under a key that covers the source, the target and the compiler, because
+    `turkey run` is a fresh process each time -- `tests/test_programs.py`
+    starts about forty of them -- and none of them should pay for this twice.
+    """
+    global _runtime_ir
+    if _runtime_ir is not None:
+        return _runtime_ir
+    source = _runtime_source()
     try:
-        subprocess.run(command, check=True, capture_output=True, text=True)
+        version = subprocess.run(["cc", "--version"], check=True,
+                                 capture_output=True, text=True).stdout
     except (OSError, subprocess.CalledProcessError) as exc:
-        detail = exc.stderr.strip() if isinstance(exc, subprocess.CalledProcessError) else str(exc)
-        raise Unsupported(f"could not build the Turkey runtime: {detail}") from exc
-    library = ctypes.CDLL(str(output))
-    for name in _RUNTIME_SYMBOLS:
-        binding.add_symbol(name, ctypes.cast(getattr(library, name), ctypes.c_void_p).value)
-    binding.add_symbol(
-        "turkey_has_panicked",
-        ctypes.addressof(ctypes.c_int32.in_dll(library, "turkey_has_panicked")),
-    )
-    library.turkey_panicked.restype = ctypes.c_int32
-    library.turkey_panic_message.restype = ctypes.c_char_p
-    library.turkey_frame_count.restype = ctypes.c_int64
-    library.turkey_frame_function.restype = ctypes.c_char_p
-    library.turkey_frame_file.restype = ctypes.c_char_p
-    library.turkey_frame_line.restype = ctypes.c_int64
-    library.turkey_frame_col.restype = ctypes.c_int64
-    library.turkey_heap_objects.restype = ctypes.c_int64
-    library.turkey_collection_count.restype = ctypes.c_int64
-    library.turkey_layout_reconciliations.restype = ctypes.c_int64
-    library.turkey_panic_clear()
-    _runtime_library = library
-    return library
+        raise Unsupported(f"could not run the C compiler: {exc}") from exc
+    key = hashlib.sha256(
+        b"\0".join([source.read_bytes(), triple.encode(), version.encode()])
+    ).hexdigest()[:32]
+    cached = Path(tempfile.gettempdir()) / f"turkey-runtime-{key}.ll"
+    if not cached.is_file():
+        command = ["cc", "-std=c11", "-O2", "-fPIC", "-S", "-emit-llvm",
+                   str(source), "-o", str(cached) + f".{os.getpid()}"]
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            # Renamed into place so that two processes racing here cannot leave
+            # a half-written file behind for a third to read.
+            os.replace(command[-1], cached)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            detail = (exc.stderr.strip()
+                      if isinstance(exc, subprocess.CalledProcessError)
+                      else str(exc))
+            raise Unsupported(
+                f"could not build the Turkey runtime: {detail}") from exc
+    _runtime_ir = _retarget(cached.read_text(encoding="utf-8"))
+    return _runtime_ir
+
+
+# Function attributes the C compiler attaches for the machine *it* was going to
+# emit for, which are wrong for the machine the JIT emits for.
+# `probe-stack="__chkstk_darwin"` is fatal -- the engine's target machine has no
+# such probing method and LLVM aborts the process with "Unsupported stack
+# probing method" rather than diagnosing it -- and `target-cpu`/`target-features`
+# name a specific Apple core, which the generic target machine reports as
+# unrecognised for every feature on every compile.
+_RETARGET = re.compile(
+    r'\s*"(?:probe-stack|target-cpu|target-features)"="[^"]*"')
+
+
+def _retarget(text: str) -> str:
+    return _RETARGET.sub("", text)
 
 
 @dataclass
 class NativeModule:
     engine: binding.ExecutionEngine
     module: binding.ModuleRef
-    runtime: ctypes.CDLL
+    runtime: _Runtime
     entry: str
     result: bir.Layout
 
@@ -1164,17 +1232,24 @@ def compile(program: CProgram, decls: DeclTable, main: str = "main") -> NativeMo
         binding.check_jit_execution()
     except OSError as exc:
         raise Unsupported("this host does not permit JIT execution") from exc
-    runtime = _load_runtime()
-    backing = binding.parse_assembly("")
-    engine = binding.create_mcjit_compiler(backing, machine)
     module = binding.parse_assembly(text)
     module.verify()
+    # Linked before optimizing, which is the whole point: with the runtime in
+    # the module, allocation's fast path can inline into its caller and the
+    # `turkey_has_panicked` load can be forwarded across calls the optimizer
+    # can now see the insides of.
+    runtime_module = binding.parse_assembly(_runtime_module(module.triple))
+    runtime_module.verify()
+    module.link_in(runtime_module)
     _optimize(module, machine)
+    backing = binding.parse_assembly("")
+    engine = binding.create_mcjit_compiler(backing, machine)
     engine.add_module(module)
     engine.finalize_object()
     engine.run_static_constructors()
     entry = next(fn for fn in source.functions if fn.name == source.entry)
-    return NativeModule(engine, module, runtime, source.entry, entry.result)
+    return NativeModule(engine, module, _Runtime(engine), source.entry,
+                        entry.result)
 
 
 def execute(program: CProgram, decls: DeclTable, main: str = "main",

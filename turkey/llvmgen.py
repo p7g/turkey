@@ -316,6 +316,29 @@ class _Emitter:
         self.target = binding.Target.from_default_triple()
         self.machine = self.target.create_target_machine()
         self.module = ir.Module(name="turkey")
+        # A generated heap access never touches a frame. Saying so is worth a
+        # third of the brainfuck benchmark, because the panic-site store --
+        # `_frame_update`, one store before anything that can panic -- is into
+        # an alloca whose address escapes into `turkey_frame_enter`, and
+        # nothing generated here carried alias metadata. So every load of an
+        # array header, its length or its storage after that store had to be
+        # redone, which is why the second bounds check reappears as soon as a
+        # function with two array accesses is inlined into its caller.
+        #
+        # Scoped noalias rather than TBAA, deliberately. A TBAA tag makes a
+        # claim about *all* accesses to that memory, and the runtime is linked
+        # into this module and reads these same frames -- `turkey_collect`
+        # walks `frame->values`, `capture_panic_trace` reads `frame->site` --
+        # with the tags clang gave it, from a different tree. Accesses from
+        # unrelated TBAA roots are taken not to alias, so the collector's read
+        # of a root and this module's store of it would be free to be
+        # reordered against each other. A scope cuts the edge only between
+        # instructions annotated on both sides, so an unannotated access, and
+        # every access in the linked-in runtime is one, stays conservative.
+        domain = self.module.add_metadata([ir.MetaDataString(self.module, "turkey")])
+        scope = self.module.add_metadata(
+            [ir.MetaDataString(self.module, "turkey.frames"), domain])
+        self.frame_scope = self.module.add_metadata([scope])
         self.module.triple = binding.get_default_triple()
         self.module.data_layout = str(self.machine.target_data)
         self.panic_flag = ir.GlobalVariable(
@@ -513,7 +536,7 @@ class _Emitter:
             for index in range(root_count):
                 pointer = entry_builder.gep(
                     root_values, [ir.Constant(_I32, 0), ir.Constant(_I32, index)])
-                entry_builder.store(ir.Constant(_PTR, None), pointer)
+                self._frame_store(entry_builder, ir.Constant(_PTR, None), pointer)
 
         self._root_frame = root_frame
         self._root_values = root_values
@@ -636,10 +659,31 @@ class _Emitter:
         builder.call(self.runtime["turkey_frame_leave"],
                      [builder.bitcast(self._panic_frame_storage, _PTR)])
 
+    def _frame_store(self, builder: ir.IRBuilder, value: ir.Value,
+                     pointer: ir.Value) -> ir.Instruction:
+        """Store into a root or panic frame: stack storage no Turkey value can
+        name, since the only pointers into it are the ones this module hands
+        the runtime."""
+        made = builder.store(value, pointer)
+        made.set_metadata("alias.scope", self.frame_scope)
+        return made
+
+    def _heap_load(self, builder: ir.IRBuilder, pointer: ir.Value,
+                   name: str = "") -> ir.Value:
+        made = builder.load(pointer, name=name)
+        made.set_metadata("noalias", self.frame_scope)
+        return made
+
+    def _heap_store(self, builder: ir.IRBuilder, value: ir.Value,
+                    pointer: ir.Value) -> ir.Instruction:
+        made = builder.store(value, pointer)
+        made.set_metadata("noalias", self.frame_scope)
+        return made
+
     def _set_live(self, builder: ir.IRBuilder, mask: int) -> None:
         pointer = builder.gep(self._root_frame, [
             ir.Constant(_I32, 0), ir.Constant(_I32, _ROOT_FRAME_LIVE)])
-        builder.store(ir.Constant(_I64, mask), pointer)
+        self._frame_store(builder, ir.Constant(_I64, mask), pointer)
 
     def _publish_roots(self, builder: ir.IRBuilder, live: frozenset[str],
                        values: dict[str, ir.Value],
@@ -667,7 +711,7 @@ class _Emitter:
                     value: ir.Value) -> None:
         pointer = builder.gep(self._root_values, [
             ir.Constant(_I32, 0), ir.Constant(_I32, index)])
-        builder.store(builder.bitcast(value, _PTR), pointer)
+        self._frame_store(builder, builder.bitcast(value, _PTR), pointer)
 
     def _leave_frames(self, builder: ir.IRBuilder, block: str) -> None:
         """Pop what this block holds, innermost first, on the way out."""
@@ -858,7 +902,7 @@ class _Emitter:
     def _array_load(self, builder: ir.IRBuilder, pointer: ir.Value,
                     index: ir.Value, layout: bir.Layout) -> ir.Value:
         address, width = self._array_element(builder, pointer, index, layout)
-        loaded = builder.load(address)
+        loaded = self._heap_load(builder, address)
         # A narrow element is already its own type; a wide one is a raw 64-bit
         # pattern, the same as an object slot.
         return (self._from_i64(builder, loaded, layout) if width == 8
@@ -868,13 +912,14 @@ class _Emitter:
                      index: ir.Value, value: ir.Value,
                      layout: bir.Layout) -> None:
         address, width = self._array_element(builder, pointer, index, layout)
-        builder.store(self._to_i64(builder, value) if width == 8 else value,
-                      address)
+        self._heap_store(builder, self._to_i64(builder, value) if width == 8
+                         else value, address)
 
     def _frame_update(self, builder: ir.IRBuilder, frame: bir.Frame) -> None:
         pointer = builder.gep(self._panic_frame_storage, [
             ir.Constant(_I32, 0), ir.Constant(_I32, 1)])
-        builder.store(builder.bitcast(self._panic_site(frame), _PTR), pointer)
+        self._frame_store(builder, builder.bitcast(self._panic_site(frame), _PTR),
+                          pointer)
 
     def _operand(self, operand: bir.Operand, values: dict[str, ir.Value]) -> ir.Value:
         if isinstance(operand, bir.Value):
@@ -937,11 +982,11 @@ class _Emitter:
                                  [bits, ir.Constant(_I32, pointer)])
             return value, self._propagate(function, builder)
         if op == "cell_load":
-            bits = builder.load(self._cell_value(builder, args[0]))
+            bits = self._heap_load(builder, self._cell_value(builder, args[0]))
             return self._from_i64(builder, bits, instruction.result.layout), builder
         if op == "cell_store":
-            builder.store(self._to_i64(builder, args[1]),
-                          self._cell_value(builder, args[0]))
+            self._heap_store(builder, self._to_i64(builder, args[1]),
+                             self._cell_value(builder, args[0]))
             return None, builder
         if op == "object_new":
             if instruction.args[2] == "0":
@@ -954,17 +999,18 @@ class _Emitter:
                    ir.Constant(_I64, int(instruction.args[3]))]
             return builder.call(self.runtime["turkey_object_new"], raw), builder
         if op == "object_tag":
-            return builder.load(
-                self._object_field(builder, args[0], _OBJECT_TAG),
+            return self._heap_load(
+                builder, self._object_field(builder, args[0], _OBJECT_TAG),
                 name=instruction.result.name), builder
         if op == "object_get":
-            bits = builder.load(
+            bits = self._heap_load(
+                builder,
                 self._object_slot(builder, args[0], int(instruction.args[1])))
             value = self._from_i64(builder, bits, instruction.result.layout)
             return value, builder
         if op == "object_set":
-            builder.store(
-                self._to_i64(builder, args[1]),
+            self._heap_store(
+                builder, self._to_i64(builder, args[1]),
                 self._object_slot(builder, args[0], int(instruction.args[1])))
             return None, builder
         if op == "array_new":
@@ -1006,9 +1052,10 @@ class _Emitter:
             closure = args[0]
             # A closure is kind 3 with exactly two slots, code then
             # environment, so both are constant-offset loads.
-            code = builder.load(self._object_slot(builder, closure, 0))
+            code = self._heap_load(builder, self._object_slot(builder, closure, 0))
             environment = builder.inttoptr(
-                builder.load(self._object_slot(builder, closure, 1)), _PTR)
+                self._heap_load(builder, self._object_slot(builder, closure, 1)),
+                _PTR)
             signature = ir.FunctionType(
                 _llvm_type(instruction.result.layout),
                 [_PTR, *(arg.type for arg in args[1:])],
@@ -1220,7 +1267,8 @@ class _Emitter:
                 "turkey_string_eq" if name == "stringEq" else "turkey_string_lt"], args)
             return builder.icmp_unsigned("!=", raw, ir.Constant(_I32, 0)), builder
         if name == "arrayLength":
-            return builder.load(
+            return self._heap_load(
+                builder,
                 self._object_field(builder, args[0], _OBJECT_COUNT)), builder
         if name == "arrayGet":
             requested = array_layout or layout

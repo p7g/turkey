@@ -94,6 +94,17 @@ JOIN_SPECIALIZE_LIMIT = INLINE_LIMIT
 # INLINE_LIMIT.  This bounds the work spent asking the question as well as the
 # code ultimately copied.  It is deliberately not another emission limit.
 SPECULATIVE_INLINE_LIMIT = INLINE_LIMIT * 4
+# What a call may cost when its result is scrutinised right there. The
+# ordinary limit asks only how much code a call site grows by, which is the
+# wrong question when the caller is about to take the constructor apart:
+# inlining `Iterator.next` puts a `Some` next to the `match` that reads it,
+# `case_of_case` pushes the match through the join the callee's early `return`
+# left behind, and `known_constructor` then deletes both the allocation and
+# the branch. GHC gives the same discount by name -- a case on a call's result
+# raises the inliner's budget, so `Option` never reaches the heap -- and
+# LLVM's inliner does it too, crediting a call whose result feeds a branch.
+# The whole cost of a `for` loop's `Some` per element rides on this.
+SCRUTINEE_INLINE_LIMIT = INLINE_LIMIT * 2
 
 
 def reduce_program(program: CProgram) -> CProgram:
@@ -213,9 +224,10 @@ class _Reducer:
         if isinstance(e, CApp):
             return self.beta(e) if isinstance(e.fn, CLam) else self.inline(e)
         if isinstance(e, CMatch):
-            return (self.known_constructor(e) or self.float_let(e)
+            return (self.known_constructor(e) or self.inline_scrutinee(e)
+                    or self.float_let(e)
                     or self.fuse_recursive_join_result(e)
-                    or self.case_of_case(e))
+                    or self.case_of_case(e) or self.case_of_join(e))
         if isinstance(e, CLet):
             return (self.dead_let(e) or self.trivial_let(e)
                     or self.let_to_match(e) or self.float_let_through_join(e))
@@ -233,7 +245,19 @@ class _Reducer:
 
     # -- the reductions --------------------------------------------------
 
-    def inline(self, e: CApp):
+    def inline_scrutinee(self, e: CMatch):
+        """A call under a `match`, inlined on the larger budget.
+
+        `expr` works bottom-up, so by the time this `match` is reduced its
+        scrutinee has already been offered to `inline` and turned down on
+        size. Being scrutinised is the information that offer did not have.
+        """
+        if not isinstance(e.scrutinee, CApp):
+            return None
+        made = self.inline(e.scrutinee, limit=SCRUTINEE_INLINE_LIMIT)
+        return None if made is None else replace(e, scrutinee=made)
+
+    def inline(self, e: CApp, limit: int = INLINE_LIMIT):
         """A saturated call to a small, known, non-loop-breaking binding."""
         fn = e.fn
         targs = None
@@ -279,7 +303,7 @@ class _Reducer:
         if made is None:
             return None
         size = _size(body)
-        if size <= INLINE_LIMIT:
+        if size <= limit:
             return made
         if self.speculating or size > SPECULATIVE_INLINE_LIMIT:
             return None
@@ -289,7 +313,7 @@ class _Reducer:
             residual = self.expr(made)
         finally:
             self.speculating = False
-        return residual if _size(residual) <= INLINE_LIMIT else None
+        return residual if _size(residual) <= limit else None
 
     def body_of(self, name: str, key: tuple[str, tuple], lam: CLam):
         """A binding's reduced body, computed once.
@@ -355,6 +379,36 @@ class _Reducer:
         inner = CMatch(e.ty, e.span, scrut.body, e.alts)
         return CLet(e.ty, scrut.span, scrut.name, scrut.bound, scrut.value,
                     inner)
+
+    def case_of_join(self, e: CMatch):
+        """`match (join j(p) = B in R) { alts }`, with the match moved into B.
+
+        What an inlined `Iterator.next` leaves behind. The callee's early
+        `return` became a join, so the constructor the caller wants to take
+        apart is not the scrutinee itself but the argument of a `jump` inside
+        it, and `case_of_case` -- which knows how to push a match into the
+        arms of a `match` or an `if` -- does not reach it.
+
+        Moving the match into the join's *body* puts it exactly one step from
+        those jumps, and `specialize_join` closes the gap: it copies the body
+        once per constructor signature seen at a jump, and the copy is a match
+        on a known constructor, which `known_constructor` deletes along with
+        the allocation. This is GHC's case-of-case over join points, and the
+        reason it is one rule there and two here is that this compiler's join
+        specialization is a separate rule already.
+
+        `R` must not fall through, or its own value would escape unmatched.
+        That is not a restriction in practice: a join stands where a `return`
+        or a `?` was, and control reaches its continuation by jumping.
+        """
+        scrut = e.scrutinee
+        if not isinstance(scrut, CJoin) or _falls_through(scrut.rest):
+            return None
+        if {param.name for param in scrut.params} & names_of(e.alts):
+            return None
+        body = CMatch(e.ty, e.span, scrut.body, e.alts)
+        return replace(scrut, ty=e.ty, body=body,
+                       rest=_retype(scrut.rest, e.ty))
 
     def case_of_case(self, e: CMatch):
         """`match (match S {...}) { alts }`, with the outer match pushed in.
@@ -853,6 +907,58 @@ def _transfers(e, bound: frozenset[str] = frozenset()) -> bool:
     if isinstance(e, (list, tuple)):
         return any(_transfers(x, bound) for x in e)
     return False
+
+
+def _falls_through(e) -> bool:
+    """Whether `e` can produce a value of its own rather than jumping away.
+
+    A join's type is the type of its result, which says nothing about where
+    that result comes from: the `if` an inlined `return` leaves behind is
+    typed `Option a` while both its branches are jumps, so nothing ever
+    reaches the expression after it. `case_of_join` needs that distinction,
+    and only the syntax has it.
+
+    Conservative in the direction of answering true: an unrecognised term is
+    assumed to fall through, which costs a rewrite declined rather than a
+    value dropped.
+    """
+    if isinstance(e, CJump):
+        return False
+    if isinstance(e, CLet):
+        return _falls_through(e.body)
+    if isinstance(e, CJoin):
+        return _falls_through(e.body) or _falls_through(e.rest)
+    if isinstance(e, CMatch):
+        return any(_falls_through(alt.body) for alt in e.alts)
+    if isinstance(e, CIf):
+        return (e.otherwise is None or _falls_through(e.then)
+                or _falls_through(e.otherwise))
+    return True
+
+
+def _retype(e, ty):
+    """`e`, with the result type of every tail position replaced.
+
+    Only ever called where `_falls_through(e)` is false, and that is what
+    makes it sound: nothing here can produce a value, so the type each of
+    these nodes carries is a label on a result that never happens. Because
+    `_falls_through` decides a join by *both* its body and its rest, and a
+    match by all of its arms, the recursion below reaches exactly the terms
+    that inherited the phantom type and stops at the jumps that gave it away.
+    """
+    if isinstance(e, CLet):
+        return replace(e, ty=ty, body=_retype(e.body, ty))
+    if isinstance(e, CJoin):
+        return replace(e, ty=ty, body=_retype(e.body, ty),
+                       rest=_retype(e.rest, ty))
+    if isinstance(e, CMatch):
+        return replace(e, ty=ty,
+                       alts=[CAlt(alt.pat, _retype(alt.body, ty))
+                             for alt in e.alts])
+    if isinstance(e, CIf):
+        return replace(e, ty=ty, then=_retype(e.then, ty),
+                       otherwise=_retype(e.otherwise, ty))
+    return e
 
 
 def _constructor(e):

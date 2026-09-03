@@ -494,3 +494,35 @@ def test_type_applied_methods_inline_and_the_remaining_flow_is_tracked():
     assert flow == 27, (
         "M16e must retain the nine-construction reduction from fusing recursive "
         "loop result boundaries")
+
+
+def test_a_for_loop_does_not_build_the_option_its_iterator_returns():
+    """The `Some` per element, and the `None` per loop, are both reduced away.
+
+    `Iterator.next` returns an `Option`, so a `for` loop allocated one object
+    per element for a value the loop takes apart on the very next line. It
+    survived because inlining `next` cost more than the ordinary budget, and
+    because the constructor is not the inlined body's result but the argument
+    of a `jump` inside the join its early `return` left behind.
+
+    Two rules together: the scrutinee discount pays for the inline, and
+    `case_of_join` moves the match next to those jumps for `specialize_join`
+    and case-of-known-constructor to finish. What is asserted is the outcome
+    the loop is for -- no `Option` is built anywhere in it.
+    """
+    program = optimized("""
+fun total(xs : Array Int) -> Int {
+    var sum = 0
+    for x in xs { sum = sum + x }
+    sum
+}
+fun main() { print(total([1, 2, 3])) }
+""")
+    total = named(program, "Main#total")
+    built = [n for n in nodes(total.value)
+             if isinstance(n, CCon) and n.name.startswith("Data.Option.Type#")]
+    assert not built, f"the loop still builds {[n.name for n in built]}"
+    calls = [n for n in nodes(total.value)
+             if isinstance(n, CApp) and isinstance(n.fn, CVar)
+             and "#next" in n.fn.name]
+    assert not calls, "the iterator step should have been inlined"

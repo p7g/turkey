@@ -297,38 +297,46 @@ def test_native_error_programs_match_conformance_output(name, monkeypatch, capfd
 
 
 @pytest.mark.parametrize("name", NATIVE_PROGRAMS)
-def test_no_conformance_program_reconciles_a_scalar_layout(name, monkeypatch, capfd):
-    """No field or element is read at one scalar layout and found at another.
+def test_field_and_element_access_is_emitted_inline(name, monkeypatch):
+    """No conformance program reaches a field or element through a call.
 
-    This is the licence for emitting `getelementptr`+`load` where the backend
-    now calls `turkey_object_get_as`. The stored layout is chosen by the
-    *construction site* from its operand layouts (`_layout_metadata`), and the
-    requested one is computed independently by the consumer (`layout_of`, or
-    `_pattern_layout` at a pattern). Nothing makes those two agree by
-    construction: when they disagree the runtime silently boxes or unboxes to
-    bridge them, and a plain load would compile the disagreement wrongly. So
-    the count staying at zero is exactly the precondition for deleting the
-    call.
+    A field's offset and a field's scalar layout are both compile-time
+    constants in a monomorphized program, so reading one is a
+    `getelementptr` and a `load`. The runtime accessors these replace did the
+    work at run time instead: `turkey_object_get_as` re-derived the stored
+    layout from a 3-bit code in the header, compared it against the requested
+    one, and silently boxed or unboxed on a mismatch.
 
-    It is a *dynamic* oracle and proves only what it executed. `dicts.tl` still
-    has one binding -- `Data.Array#bounds`, reached through the higher-kinded
-    `Foldable` default method -- that is generic, reachable, and destructures a
-    transparent `Array a`; this says that path does not disagree when run, not
-    that it cannot.
+    That mismatch is what made the call load-bearing rather than merely slow,
+    and it is why the cutover was gated on measurement rather than argument:
+    the stored layout is chosen by the *construction site* from its operand
+    layouts (`_layout_metadata`) and the requested one is computed
+    independently by the consumer (`layout_of`, or `_pattern_layout` at a
+    pattern), and nothing makes the two agree by construction. Before the
+    cutover a counter in the runtime recorded every bridge, and it was zero
+    across all of these programs; that measurement is the licence, and it is
+    recorded in the commit that took it.
+
+    What is checkable *now* is the property that replaced it, so this asserts
+    that rather than re-asserting a counter nothing can increment any more.
     """
     program = PROGRAMS_DIR / f"{name}.tl"
     monkeypatch.chdir(PROGRAMS_DIR)
     checked = check(program.read_text(encoding="utf-8"), str(program),
                     [program.parent.resolve()])
-    module = compile(checked.opt, checked.decls, checked.main)
-    # The module is fresh per program but the runtime library is a process-wide
-    # singleton, so this has to be read as a delta rather than an absolute.
-    before = module.runtime.turkey_layout_reconciliations()
-    module.execute()
-    capfd.readouterr()
-    assert module.runtime.turkey_layout_reconciliations() - before == 0, (
-        f"{name} bridged a scalar layout at run time; field access cannot "
-        f"become a plain load until this is zero")
+    text = generate(checked.opt, checked.decls, checked.main)
+    accessors = ("turkey_object_get_as", "turkey_object_set_as",
+                 "turkey_array_get_as", "turkey_array_set_as",
+                 "turkey_object_tag", "turkey_array_length",
+                 "turkey_cell_load", "turkey_cell_store",
+                 "turkey_closure_code", "turkey_closure_environment")
+    # Call sites only: the declarations stay in the module whether or not
+    # anything reaches them, so matching the bare name would match those.
+    called = {accessor for line in text.splitlines() if " call " in f" {line} "
+              for accessor in accessors if f"@{accessor}(" in line}
+    assert not called, (
+        f"{name} still reaches a field through {sorted(called)}; each should "
+        f"be a getelementptr and a load")
 
 
 def test_generic_layout_bridges_survive_gc_stress(monkeypatch, capfd):

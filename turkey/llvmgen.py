@@ -27,6 +27,19 @@ _F64 = ir.DoubleType()
 _PTR = _I8.as_pointer()
 _ROOT_FRAME = ir.LiteralStructType([_PTR, _PTR, _I64, _PTR])
 _PANIC_FRAME = ir.LiteralStructType([_PTR, _PTR, _PTR, _I64, _I64])
+# `TurkeyObject` from runtime/turkey_runtime.h, field for field. Reading a slot
+# is a `getelementptr` rather than a call because the layout it would be read
+# at is a compile-time constant in a monomorphized program; see
+# `test_no_conformance_program_reconciles_a_scalar_layout` for the licence.
+# The trailing zero-length array is how a C flexible member is spelled here, so
+# slot `i` is field 4, index `i`. Every slot holds a raw 64-bit pattern -- a
+# `Float` is bitcast in, a pointer is `ptrtoint`ed in -- which is why the load
+# is always `i64` and `_from_i64` does the rest.
+_OBJECT = ir.LiteralStructType(
+    [_I32, _I32, _I64, _I64, ir.ArrayType(_I64, 0)])
+_OBJECT_KIND, _OBJECT_TAG, _OBJECT_COUNT, _OBJECT_BITMAP, _OBJECT_SLOTS = range(5)
+# `TurkeyCell`: one traced word plus the flag saying whether to trace it.
+_CELL = ir.LiteralStructType([_I64, _I32])
 
 
 def _llvm_type(layout: bir.Layout) -> ir.Type:
@@ -43,6 +56,20 @@ def _layout_code(layout: bir.Layout) -> int:
         bir.Layout.I32: 3, bir.Layout.I64: 4, bir.Layout.F64: 5,
         bir.Layout.PTR: 6, bir.Layout.BOXED: 7,
     }[layout]
+
+
+def _layout_width(layout: bir.Layout) -> int:
+    """Bytes one array element of this layout occupies.
+
+    The same rule as `backend_lower._layout_width`, and it has to stay the
+    same: that one decides the width `turkey_array_new` is called with, and
+    this one decides the stride the element is then read at.
+    """
+    if layout is bir.Layout.I8:
+        return 1
+    if layout is bir.Layout.I32:
+        return 4
+    return 8
 
 
 def _root_slots(function: bir.Function) -> tuple[dict[str, int], int]:
@@ -296,6 +323,76 @@ class _Emitter:
                     builder.bitcast(root_frame, _PTR)])
                 builder.ret(ir.Constant(function.function_type.return_type, None))
 
+    def _object_field(self, builder: ir.IRBuilder, pointer: ir.Value,
+                      field: int) -> ir.Value:
+        """The address of one named header field of a `TurkeyObject`."""
+        object_ = builder.bitcast(pointer, _OBJECT.as_pointer())
+        return builder.gep(object_, [ir.Constant(_I32, 0),
+                                     ir.Constant(_I32, field)])
+
+    def _object_slot(self, builder: ir.IRBuilder, pointer: ir.Value,
+                     index: int) -> ir.Value:
+        """The address of payload slot `index`, as an `i64*`."""
+        object_ = builder.bitcast(pointer, _OBJECT.as_pointer())
+        return builder.gep(object_, [ir.Constant(_I32, 0),
+                                     ir.Constant(_I32, _OBJECT_SLOTS),
+                                     ir.Constant(_I64, index)])
+
+    def _cell_value(self, builder: ir.IRBuilder,
+                    pointer: ir.Value) -> ir.Value:
+        """The address of a `TurkeyCell`'s payload word.
+
+        A cell's `pointer_value` flag decides only whether the collector traces
+        the word; reading and writing it never consults the flag, so this is
+        the whole of `turkey_cell_load` and `turkey_cell_store`.
+        """
+        cell = builder.bitcast(pointer, _CELL.as_pointer())
+        return builder.gep(cell, [ir.Constant(_I32, 0), ir.Constant(_I32, 0)])
+
+    def _array_element(self, builder: ir.IRBuilder, pointer: ir.Value,
+                       index: ir.Value, layout: bir.Layout) -> tuple[ir.Value, int]:
+        """The address of array element `index`, at the element's own width.
+
+        An array is kind 2, so its `count` is the length and its
+        `pointer_bitmap` slot is reused as the element width in bytes -- 1 for
+        `Array Byte`, 4 for `Array Char`, 8 otherwise. The width is a function
+        of the element layout, which is a compile-time constant here, so the
+        stride is baked into the pointer type rather than read back out of the
+        header.
+
+        Unchecked, deliberately. `Prim.*` is spellable only from a library
+        module (`modules.py`), and every one of the nineteen call sites in
+        `turkey/lib` either bounds-checks first (`Data.Array`'s `Index`
+        instance, via `bounds`) or indexes modulo the capacity (`Data.Map`).
+        The check this replaces was against the *physical* capacity while
+        `Data.Array.bounds` checks the *logical* length, and length <= capacity,
+        so it could never be the one to fire on that path.
+        """
+        width = _layout_width(layout)
+        element = _I8 if width == 1 else _I32 if width == 4 else _I64
+        object_ = builder.bitcast(pointer, _OBJECT.as_pointer())
+        base = builder.gep(object_, [ir.Constant(_I32, 0),
+                                     ir.Constant(_I32, _OBJECT_SLOTS),
+                                     ir.Constant(_I64, 0)])
+        return builder.gep(builder.bitcast(base, element.as_pointer()),
+                           [index]), width
+
+    def _array_load(self, builder: ir.IRBuilder, pointer: ir.Value,
+                    index: ir.Value, layout: bir.Layout) -> ir.Value:
+        address, width = self._array_element(builder, pointer, index, layout)
+        loaded = builder.load(address)
+        # A narrow element is already its own type; a wide one is a raw 64-bit
+        # pattern, the same as an object slot.
+        return (self._from_i64(builder, loaded, layout) if width == 8
+                else loaded)
+
+    def _array_store(self, builder: ir.IRBuilder, pointer: ir.Value,
+                     index: ir.Value, value: ir.Value,
+                     layout: bir.Layout) -> None:
+        address, width = self._array_element(builder, pointer, index, layout)
+        builder.store(self._to_i64(builder, value) if width == 8 else value,
+                      address)
+
     def _set_root(self, builder: ir.IRBuilder, name: str, value: ir.Value) -> None:
         pointer = builder.gep(self._root_values, [
             ir.Constant(_I32, 0), ir.Constant(_I32, self._root_index[name]),
@@ -374,11 +471,11 @@ class _Emitter:
                                  [bits, ir.Constant(_I32, pointer)])
             return value, self._propagate(function, builder)
         if op == "cell_load":
-            bits = builder.call(self.runtime["turkey_cell_load"], args)
+            bits = builder.load(self._cell_value(builder, args[0]))
             return self._from_i64(builder, bits, instruction.result.layout), builder
         if op == "cell_store":
-            builder.call(self.runtime["turkey_cell_store"],
-                         [args[0], self._to_i64(builder, args[1])])
+            builder.store(self._to_i64(builder, args[1]),
+                          self._cell_value(builder, args[0]))
             return None, builder
         if op == "object_new":
             raw = [ir.Constant(_I32, int(instruction.args[0])),
@@ -387,22 +484,19 @@ class _Emitter:
                    ir.Constant(_I64, int(instruction.args[3]))]
             return builder.call(self.runtime["turkey_object_new"], raw), builder
         if op == "object_tag":
-            return builder.call(self.runtime["turkey_object_tag"], args), builder
+            return builder.load(
+                self._object_field(builder, args[0], _OBJECT_TAG),
+                name=instruction.result.name), builder
         if op == "object_get":
-            bits = builder.call(self.runtime["turkey_object_get_as"], [
-                args[0], ir.Constant(_I64, int(instruction.args[1])),
-                ir.Constant(_I32, _layout_code(instruction.result.layout)),
-            ])
+            bits = builder.load(
+                self._object_slot(builder, args[0], int(instruction.args[1])))
             value = self._from_i64(builder, bits, instruction.result.layout)
-            return value, self._propagate(function, builder)
+            return value, builder
         if op == "object_set":
-            layout = instruction.args[-1].layout
-            builder.call(self.runtime["turkey_object_set_as"], [
-                args[0], ir.Constant(_I64, int(instruction.args[1])),
+            builder.store(
                 self._to_i64(builder, args[1]),
-                ir.Constant(_I32, _layout_code(layout)),
-            ])
-            return None, self._propagate(function, builder)
+                self._object_slot(builder, args[0], int(instruction.args[1])))
+            return None, builder
         if op == "array_new":
             return builder.call(self.runtime["turkey_array_new"],
                                 [ir.Constant(_I64, int(instruction.args[0])),
@@ -411,20 +505,15 @@ class _Emitter:
                                  ir.Constant(_I32, _layout_code(
                                      bir.Layout(instruction.args[2])))]), builder
         if op == "array_get":
-            bits = builder.call(self.runtime["turkey_array_get_as"], [
-                *args, ir.Constant(_I32, _layout_code(instruction.result.layout))])
-            value = self._from_i64(builder, bits, instruction.result.layout)
-            return value, self._propagate(function, builder)
+            return self._array_load(builder, args[0], args[1],
+                                    instruction.result.layout), builder
         if op == "array_set":
             index = (ir.Constant(_I64, int(instruction.args[1]))
                      if isinstance(instruction.args[1], str) else args[1])
             value = args[1] if isinstance(instruction.args[1], str) else args[2]
             layout = instruction.args[-1].layout
-            builder.call(self.runtime["turkey_array_set_as"], [
-                args[0], index, self._to_i64(builder, value),
-                ir.Constant(_I32, _layout_code(layout)),
-            ])
-            return None, self._propagate(function, builder)
+            self._array_store(builder, args[0], index, value, layout)
+            return None, builder
         if op == "closure_new":
             code = builder.ptrtoint(self.functions[instruction.args[0]], _I64)
             return builder.call(self.runtime["turkey_closure_new"], [
@@ -445,10 +534,11 @@ class _Emitter:
             return None, builder
         if op == "closure_call":
             closure = args[0]
-            code = builder.call(self.runtime["turkey_closure_code"], [closure])
-            environment = builder.call(
-                self.runtime["turkey_closure_environment"], [closure])
-            builder = self._propagate(function, builder)
+            # A closure is kind 3 with exactly two slots, code then
+            # environment, so both are constant-offset loads.
+            code = builder.load(self._object_slot(builder, closure, 0))
+            environment = builder.inttoptr(
+                builder.load(self._object_slot(builder, closure, 1)), _PTR)
             signature = ir.FunctionType(
                 _llvm_type(instruction.result.layout),
                 [_PTR, *(arg.type for arg in args[1:])],
@@ -660,20 +750,21 @@ class _Emitter:
                 "turkey_string_eq" if name == "stringEq" else "turkey_string_lt"], args)
             return builder.icmp_unsigned("!=", raw, ir.Constant(_I32, 0)), builder
         if name == "arrayLength":
-            return builder.call(self.runtime["turkey_array_length"], args), builder
+            return builder.load(
+                self._object_field(builder, args[0], _OBJECT_COUNT)), builder
         if name == "arrayGet":
             requested = array_layout or layout
-            bits = builder.call(self.runtime["turkey_array_get_as"], [
-                *args, ir.Constant(_I32, _layout_code(requested))])
-            value = self._from_i64(builder, bits, layout)
-            return value, self._propagate(function, builder)
+            value = self._array_load(builder, args[0], args[1], requested)
+            # `array_layout` is the width the element was allocated at; the
+            # result may still want a different *view* of those same bits.
+            return (value if requested is layout
+                    else self._from_i64_type(
+                        builder, self._to_i64(builder, value),
+                        _llvm_type(layout))), builder
         if name == "arraySet":
             requested = array_layout or bir.Layout.BOXED
-            builder.call(self.runtime["turkey_array_set_as"], [
-                args[0], args[1], self._to_i64(builder, args[2]),
-                ir.Constant(_I32, _layout_code(requested)),
-            ])
-            return ir.Constant(_I8, 0), self._propagate(function, builder)
+            self._array_store(builder, args[0], args[1], args[2], requested)
+            return ir.Constant(_I8, 0), builder
         if name in ("arrayNew", "arrayNewUninit"):
             initial = (self._to_i64(builder, args[1]) if len(args) == 2
                        else ir.Constant(_I64, 0))

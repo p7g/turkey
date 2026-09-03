@@ -339,6 +339,29 @@ def test_field_and_element_access_is_emitted_inline(name, monkeypatch):
         f"be a getelementptr and a load")
 
 
+def test_top_level_dictionaries_survive_gc_stress(monkeypatch, capfd):
+    """A pointer-typed module global is a root in its own right.
+
+    `dicts.tl` keeps seven of them, each an instance dictionary built once by
+    the module initializer and read for the rest of the run. Nothing registered
+    them: what kept them alive was that the root frame held every pointer in
+    the function that built them and never cleared a slot, so they were rooted
+    by accident. Rooting by liveness ends the accident, and under GC stress
+    this program collected its own dictionaries and then read them.
+
+    They now live in a module-level array that is registered once from the
+    entry function, so the store that updates a global is the store that roots
+    it.
+    """
+    monkeypatch.setenv("TURKEY_GC_STRESS", "1")
+    program = PROGRAMS_DIR / "dicts.tl"
+    checked = check(program.read_text(encoding="utf-8"), str(program),
+                    [program.parent.resolve()])
+    execute(checked.opt, checked.decls, checked.main, str(program))
+    captured = capfd.readouterr()
+    assert captured.out + captured.err == program.with_suffix(".expected").read_text()
+
+
 def test_generic_layout_bridges_survive_gc_stress(monkeypatch, capfd):
     monkeypatch.setenv("TURKEY_GC_STRESS", "1")
     program = PROGRAMS_DIR / "question_control.tl"

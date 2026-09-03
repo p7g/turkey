@@ -72,17 +72,125 @@ def _layout_width(layout: bir.Layout) -> int:
     return 8
 
 
+# Operations that emit a call, and so may collect before they return. Being
+# wrong in the *inclusive* direction costs a redundant root store; being wrong
+# the other way costs a live object freed under a caller's feet, which is why
+# a call that cannot itself allocate is still listed. The GC-stress tests are
+# what check this set: they collect at every allocation, so a root this misses
+# is a panic on the first collection rather than a rare corruption.
+_CALLING_OPS = frozenset({
+    "call", "closure_call", "box", "unbox", "cell_new", "object_new",
+    "array_new", "closure_new", "function_closure", "closure_capture",
+})
+_CALLING_PRIMS = frozenset({
+    "intToString", "floatToString", "charToString", "stringConcat", "print",
+    "write", "stringByteLength", "stringByteAt", "stringDecodeAt",
+    "stringNextIndex", "stringSlice", "stringFind", "stringRfind",
+    "stringToByteStorage", "stringFromBytes", "stringConcatAll", "floatParse",
+    "floatFmod", "floatRemainder", "floatFloor", "floatCeil", "floatRound",
+    "floatTrunc", "stringIsValidUtf8", "floatCanParse", "stringEq", "stringLt",
+    "arrayNew", "arrayNewUninit", "error",
+})
+_LAYOUT_SUFFIXES = frozenset(layout.value for layout in bir.Layout)
+
+
+def _is_safepoint(op: str) -> bool:
+    if op in _CALLING_OPS:
+        return True
+    if not op.startswith("prim."):
+        return False
+    name = op[5:]
+    if name.rpartition(".")[2] in _LAYOUT_SUFFIXES:
+        name = name.rpartition(".")[0]
+    return name in _CALLING_PRIMS
+
+
+def _operands(instruction: bir.Instruction) -> list[bir.Value]:
+    return [arg for arg in instruction.args if isinstance(arg, bir.Value)]
+
+
 def _root_slots(function: bir.Function) -> tuple[dict[str, int], int]:
-    """Give each pointer value stack storage in the exact-root frame."""
-    values = function.params + function.slots
-    values += [param for block in function.blocks for param in block.params]
-    values += [instruction.result for block in function.blocks
-               for instruction in block.instructions
-               if instruction.result is not None]
-    pointers = [value for value in values
-                if value.layout in (bir.Layout.PTR, bir.Layout.BOXED)]
-    return ({value.name: index for index, value in enumerate(pointers)},
-            len(pointers))
+    """Stack storage in the exact-root frame, for the values that need it.
+
+    A pointer needs a root only where a collection can happen while it is
+    live. Rooting every pointer-typed value in the function -- which is what
+    this did, and what `LLVM-BACKEND.md` allowed as a first implementation --
+    costs a store per definition and, worse, is unremovable: the frame's
+    address escapes into `turkey_root_enter`, so no LLVM pass may drop a store
+    into it. A nine-line `main` paid 76 slots and a 608-byte memset.
+
+    Two kinds of value are rooted unconditionally. A function parameter is
+    nameable from every block (`bir.check` scopes SSA per block but exempts
+    parameters), and a slot is function-wide mutable storage, so neither has a
+    live range this can bound cheaply. There are few of both.
+
+    Everything else -- block parameters and instruction results -- is
+    block-local by construction, since `bir.check` rebuilds the scope per block
+    and anything crossing an edge must become a block parameter or a slot. So
+    its live range is an interval inside one block, and it needs a root exactly
+    when a safepoint falls in that interval. A value passed *to* a safepoint
+    counts: the callee holds it while it may collect.
+
+    This is what makes the Phase 2 work pay: with field access no longer a
+    call, a loop that touches no allocation has no safepoint in its body, and
+    so takes no root stores at all.
+    """
+    index: dict[str, int] = {}
+
+    def take(value: bir.Value) -> None:
+        if (value.layout in (bir.Layout.PTR, bir.Layout.BOXED)
+                and value.name not in index):
+            index[value.name] = len(index)
+
+    for value in function.params:
+        take(value)
+    for value in function.slots:
+        take(value)
+
+    for block in function.blocks:
+        safepoints = [position for position, instruction
+                      in enumerate(block.instructions)
+                      if _is_safepoint(instruction.op)]
+        if not safepoints:
+            continue
+        # The last position each block-local value is read at. The terminator
+        # reads after every instruction, and none of the terminators emits a
+        # call, so `len(instructions)` is a fine stand-in for "to the end".
+        last_use: dict[str, int] = {}
+        for position, instruction in enumerate(block.instructions):
+            for operand in _operands(instruction):
+                last_use[operand.name] = position
+        terminator = block.terminator
+        assert terminator is not None
+        for operand in _terminator_operands(terminator):
+            last_use[operand.name] = len(block.instructions)
+
+        def live_across(name: str, defined: int) -> bool:
+            end = last_use.get(name)
+            return end is not None and any(
+                defined < point <= end for point in safepoints)
+
+        for param in block.params:
+            if live_across(param.name, -1):
+                take(param)
+        for position, instruction in enumerate(block.instructions):
+            result = instruction.result
+            if result is not None and live_across(result.name, position):
+                take(result)
+
+    return index, len(index)
+
+
+def _terminator_operands(terminator) -> list[bir.Value]:
+    if isinstance(terminator, bir.Return):
+        found = [terminator.value]
+    elif isinstance(terminator, bir.Jump):
+        found = list(terminator.args)
+    elif isinstance(terminator, bir.Branch):
+        found = [terminator.condition]
+    else:
+        found = [terminator.message]
+    return [value for value in found if isinstance(value, bir.Value)]
 
 
 class _Emitter:
@@ -194,7 +302,36 @@ class _Emitter:
             value_global.linkage = "internal"
             value_global.initializer = ir.Constant(_PTR, None)
             self.string_literals[value] = (bytes_global, value_global, len(data))
+        # A pointer-typed global holds a top-level dictionary or value for the
+        # whole run, so it is a GC root and has to be one *explicitly*. It was
+        # never registered as one: what kept these alive was that
+        # `_root_slots` rooted every pointer in a function and never cleared a
+        # slot, so the frame that built them held them by accident. Rooting by
+        # liveness removes that accident, and `dicts.tl` collects its own
+        # instance dictionaries out from under itself under GC stress.
+        #
+        # So the storage *is* the root array: one module-level array of
+        # pointers, registered once with a frame that is never left, and
+        # `global_load`/`global_store` index into it. A separate global plus a
+        # shadow copy would need every store to update both.
+        pointers = [source for source in self.source.globals
+                    if source.layout in (bir.Layout.PTR, bir.Layout.BOXED)]
+        self.global_roots = {source.name: index
+                             for index, source in enumerate(pointers)}
+        self.global_array = None
+        if pointers:
+            array = ir.ArrayType(_PTR, len(pointers))
+            self.global_array = ir.GlobalVariable(
+                self.module, array, name=".turkey.global.roots")
+            self.global_array.linkage = "internal"
+            self.global_array.initializer = ir.Constant(array, None)
+            self.global_frame = ir.GlobalVariable(
+                self.module, _ROOT_FRAME, name=".turkey.global.frame")
+            self.global_frame.linkage = "internal"
+            self.global_frame.initializer = ir.Constant(_ROOT_FRAME, None)
         for source in self.source.globals:
+            if source.name in self.global_roots:
+                continue
             global_ = ir.GlobalVariable(self.module, _llvm_type(source.layout),
                                         name=source.name)
             global_.linkage = "internal"
@@ -234,6 +371,21 @@ class _Emitter:
             pointer = entry_builder.gep(
                 root_values, [ir.Constant(_I32, 0), ir.Constant(_I32, index)])
             entry_builder.store(ir.Constant(_PTR, None), pointer)
+        if self.global_array is not None and source.name == self.source.entry:
+            # Registered from the entry function, which does not return until
+            # the program is over, so it sits below every other frame for the
+            # whole run. It goes in before this function's own frame and comes
+            # out after it, since `turkey_root_leave` insists the frame being
+            # left is the one on top. It is *left*, rather than being a
+            # permanent registration, because the runtime outlives any one
+            # compiled module: a frame never popped would still be on the
+            # runtime's list pointing into a module the engine has freed.
+            entry_builder.call(self.runtime["turkey_root_enter"], [
+                entry_builder.bitcast(self.global_frame, _PTR),
+                entry_builder.bitcast(self.global_array, _PTR),
+                ir.Constant(_I64, len(self.global_roots)),
+                self._c_string(entry_builder, "<globals>", ".turkey.function"),
+            ])
         entry_builder.call(self.runtime["turkey_root_enter"], [
             entry_builder.bitcast(root_frame, _PTR),
             entry_builder.bitcast(root_values, _PTR),
@@ -249,6 +401,7 @@ class _Emitter:
         self._root_values = root_values
         self._root_index = root_index
         self._panic_frame_storage = panic_frame_storage
+        self._in_entry = source.name == self.source.entry
         for offset, (bytes_global, value_global, length) in enumerate(literal_roots):
             literal = entry_builder.call(self.runtime["turkey_string_new"], [
                 entry_builder.bitcast(bytes_global, _PTR),
@@ -299,6 +452,7 @@ class _Emitter:
                     builder.bitcast(panic_frame_storage, _PTR)])
                 builder.call(self.runtime["turkey_root_leave"], [
                     builder.bitcast(root_frame, _PTR)])
+                self._leave_globals(builder)
                 builder.ret(self._operand(term.value, values))
             elif isinstance(term, bir.Jump):
                 builder.branch(blocks[term.target])
@@ -321,7 +475,14 @@ class _Emitter:
                     builder.bitcast(panic_frame_storage, _PTR)])
                 builder.call(self.runtime["turkey_root_leave"], [
                     builder.bitcast(root_frame, _PTR)])
+                self._leave_globals(builder)
                 builder.ret(ir.Constant(function.function_type.return_type, None))
+
+    def _leave_globals(self, builder: ir.IRBuilder) -> None:
+        """Pop the globals frame, on every path out of the entry function."""
+        if self._in_entry and self.global_array is not None:
+            builder.call(self.runtime["turkey_root_leave"],
+                         [builder.bitcast(self.global_frame, _PTR)])
 
     def _object_field(self, builder: ir.IRBuilder, pointer: ir.Value,
                       field: int) -> ir.Value:
@@ -337,6 +498,19 @@ class _Emitter:
         return builder.gep(object_, [ir.Constant(_I32, 0),
                                      ir.Constant(_I32, _OBJECT_SLOTS),
                                      ir.Constant(_I64, index)])
+
+    def _global(self, builder: ir.IRBuilder, name: str) -> ir.Value:
+        """The address a global's value lives at.
+
+        A pointer-typed one lives in the permanently rooted array rather than
+        in a global of its own, so that storing to it and rooting it are the
+        same store.
+        """
+        index = self.global_roots.get(name)
+        if index is None:
+            return self.globals[name]
+        return builder.gep(self.global_array, [ir.Constant(_I32, 0),
+                                               ir.Constant(_I32, index)])
 
     def _cell_value(self, builder: ir.IRBuilder,
                     pointer: ir.Value) -> ir.Value:
@@ -449,10 +623,10 @@ class _Emitter:
             return value, self._propagate(function, builder)
         if op == "global_store":
             builder.store(self._operand(instruction.args[1], values),
-                          self.globals[instruction.args[0]])
+                          self._global(builder, instruction.args[0]))
             return None, builder
         if op == "global_load":
-            return builder.load(self.globals[instruction.args[0]],
+            return builder.load(self._global(builder, instruction.args[0]),
                                 name=instruction.result.name), builder
         if op == "string_const":
             return builder.load(
@@ -797,6 +971,7 @@ class _Emitter:
             panic_builder.bitcast(self._panic_frame_storage, _PTR)])
         panic_builder.call(self.runtime["turkey_root_leave"], [
             panic_builder.bitcast(self._root_frame, _PTR)])
+        self._leave_globals(panic_builder)
         panic_builder.ret(ir.Constant(function.function_type.return_type, None))
         return ir.IRBuilder(good)
 

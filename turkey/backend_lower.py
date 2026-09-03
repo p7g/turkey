@@ -66,12 +66,25 @@ def _expr_layout(expr: CExpr) -> bir.Layout:
     return layout_of(expr.ty)
 
 
+# Every symbol this backend defines begins with this, and no symbol the
+# runtime exports may. That is the whole of the guarantee that a Turkey
+# function cannot land on a runtime entry point: `mangle` is the only way a
+# Turkey name becomes a symbol and it always prepends this, so the two
+# namespaces cannot meet. Anything weaker is an accident -- `Module#name`
+# mangles to a `_23_` no runtime name contains, but `%bound11757` is a real
+# top-level binding with no `#` in it, so that separation was never a rule.
+#
+# `test_no_runtime_symbol_can_be_named_by_a_turkey_program` holds up the other
+# half, that the runtime keeps off this prefix.
+COMPILED_PREFIX = "turkeyfn_"
+
+
 def mangle(name: str) -> str:
     pieces = []
     for byte in name.encode("utf-8"):
         char = chr(byte)
         pieces.append(char if char.isalnum() or char == "_" else f"_{byte:02x}_")
-    return "turkey_" + "".join(pieces)
+    return COMPILED_PREFIX + "".join(pieces)
 
 
 @dataclass(frozen=True)
@@ -1264,7 +1277,7 @@ def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
             lifted, lift_counter, globals_, never_returns,
         ).finish())
 
-    init_name = "turkey_module_initialize"
+    init_name = COMPILED_PREFIX + "module_initialize"
     init_type = TFun([], UNIT)
     init_lam = CLam(ty=init_type, params=[], body=CUnit(UNIT),
                     name="<module initialization>")
@@ -1274,7 +1287,7 @@ def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
         lifted, lift_counter, globals_, never_returns, output_name=init_name,
     ).finish_initializers(program, runtime_binds)
 
-    run_name = "turkey_run"
+    run_name = COMPILED_PREFIX + "run"
     run_block = bir.Block("entry")
     init_result = bir.Value("initialized", bir.Layout.UNIT)
     run_block.instructions.append(bir.Instruction("call", (init_name,), init_result))

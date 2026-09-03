@@ -89,7 +89,7 @@ def test_a_nullary_constructor_is_built_once_for_the_whole_run():
     # object. Only the entry function still builds one; everywhere else the
     # use is a load of the global holding it.
     for part in text.split("\ndefine ")[1:]:
-        if part.startswith("i8 @turkey_run("):
+        if part.startswith("i8 @turkeyfn_run("):
             continue
         assert "i64 0, i64 0)" not in part, part.splitlines()[0]
     assert text.count("@.turkey.nullary.value.") >= 2
@@ -462,7 +462,7 @@ def test_llvm_command_prints_verified_ir(tmp_path, capsys):
     program = tmp_path / "program.tl"
     program.write_text("fun main() { print(3) }", encoding="utf-8")
     assert cli_main(["llvm", str(program)]) == 0
-    assert "define i8 @turkey_Main_23_main" in capsys.readouterr().out
+    assert "define i8 @turkeyfn_Main_23_main" in capsys.readouterr().out
 
 
 def test_run_accepts_opt_in_llvm_backend(tmp_path, capfd):
@@ -609,3 +609,48 @@ def test_generic_layout_bridges_survive_gc_stress(monkeypatch, capfd):
     execute(checked.opt, checked.decls, checked.main, str(program))
     captured = capfd.readouterr()
     assert captured.out + captured.err == program.with_suffix(".expected").read_text()
+
+
+def test_no_runtime_symbol_can_be_named_by_a_turkey_program():
+    """The two symbol namespaces cannot meet.
+
+    `mangle` is the only way a Turkey name becomes a native symbol and it
+    always prepends `COMPILED_PREFIX`, so the compiled program owns that
+    prefix entirely; this asserts the runtime stays off it, which is the other
+    half. Together they make a collision impossible rather than merely
+    unobserved.
+
+    It is worth having as a rule rather than as a habit. `mangle("panic")` is
+    `turkey_panic` under the old prefix, and the only thing that stopped a
+    Turkey function reaching it was that top-level binding names happen to
+    carry a module qualifier -- except `%bound11757`, which does not, so even
+    that was not true. The failure it prevents is not a compile error either:
+    `turkey_collect` and `turkey_heap_objects` are called from Python by name
+    through `get_function_address`, so a compiled function landing on one
+    would be handed back to Python and called as the collector.
+    """
+    from turkey.backend_lower import COMPILED_PREFIX
+
+    entry_points = _runtime_entry_points()
+    assert entry_points, "the header should declare something"
+    clashing = {name for name in entry_points
+                if name.startswith(COMPILED_PREFIX)}
+    assert not clashing, (
+        f"{sorted(clashing)} could be named by a Turkey program; the runtime "
+        f"must keep off {COMPILED_PREFIX!r}")
+
+
+def test_every_compiled_symbol_carries_the_compiled_prefix():
+    """The half of the guarantee that lives in the backend.
+
+    Not only the mangled names: the two symbols the backend invents for
+    itself, module setup and the entry thunk, are in the same namespace and
+    were spelled `turkey_module_initialize` and `turkey_run` before this.
+    """
+    from turkey.backend_lower import COMPILED_PREFIX, lower
+
+    checked = check('fun main() { print(len([1, 2])) }')
+    source = lower(checked.opt, checked.decls, checked.main)
+    stray = [function.name for function in source.functions
+             if not function.name.startswith(COMPILED_PREFIX)]
+    assert not stray, f"{stray} would share the runtime's namespace"

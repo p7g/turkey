@@ -1131,6 +1131,26 @@ def _ctype(layout: bir.Layout):
     }[layout]
 
 
+def _optimize(module, machine) -> None:
+    """Run an -O2 pipeline over the module, on either pass-manager API.
+
+    LLVM's legacy pass manager is gone from llvmlite 0.45 onwards, and with it
+    `PassManagerBuilder`. The replacement takes the target machine, which the
+    legacy one never did, so the two are spelled differently enough to be worth
+    one branch rather than a shim: `speed_level=2` is `opt_level = 2`.
+    """
+    if hasattr(binding, "PassManagerBuilder"):
+        manager = binding.ModulePassManager()
+        builder = binding.PassManagerBuilder()
+        builder.opt_level = 2
+        builder.populate(manager)
+        manager.run(module)
+        return
+    options = binding.create_pipeline_tuning_options(speed_level=2)
+    passes = binding.create_pass_builder(machine, options)
+    passes.getModulePassManager().run(module, passes)
+
+
 def generate(program: CProgram, decls: DeclTable, main: str = "main") -> str:
     source = lower(program, decls, main)
     return _Emitter(source).emit()[0]
@@ -1149,11 +1169,7 @@ def compile(program: CProgram, decls: DeclTable, main: str = "main") -> NativeMo
     engine = binding.create_mcjit_compiler(backing, machine)
     module = binding.parse_assembly(text)
     module.verify()
-    manager = binding.ModulePassManager()
-    builder = binding.PassManagerBuilder()
-    builder.opt_level = 2
-    builder.populate(manager)
-    manager.run(module)
+    _optimize(module, machine)
     engine.add_module(module)
     engine.finalize_object()
     engine.run_static_constructors()

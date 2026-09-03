@@ -41,11 +41,18 @@ def test_shadow_roots_use_stack_storage_and_direct_stores():
 def test_language_string_literals_are_allocated_once_at_module_entry():
     checked = check('fun main() { print("same"); print("same") }')
     text = generate(checked.opt, checked.decls, checked.main)
+    # Matched without the pointer's spelling: `generate` returns LLVM's own
+    # rendering of the module, so a typed-pointer LLVM writes `i8*` where an
+    # opaque-pointer one writes `ptr`. What this test is about is how many
+    # times the literal is built and read, which neither spelling changes.
     calls = [line for line in text.splitlines()
-             if "call i8* @turkey_string_new" in line]
+             if "@turkey_string_new(" in line and " call " in f" {line} "]
     assert len(calls) == 1
     assert text.count("@.turkey.literal.bytes.0") >= 1
-    assert text.count("load i8*, i8** @.turkey.literal.value.0") == 2
+    loads = [line for line in text.splitlines()
+             if line.lstrip().startswith("%")
+             and " load " in line and "@.turkey.literal.value.0" in line]
+    assert len(loads) == 2
 
 
 def test_native_scalar_program_prints(capfd):
@@ -255,7 +262,10 @@ fun main() {
 }
 """)
     text = generate(checked.opt, checked.decls, checked.main)
-    calls = [line for line in text.splitlines() if "call i8* @turkey_array_new" in line]
+    # The element width and layout code are the point; the return type's
+    # spelling is not, and differs between a typed- and opaque-pointer LLVM.
+    calls = [line for line in text.splitlines()
+             if "@turkey_array_new(" in line and " call " in f" {line} "]
     assert any("i32 1, i32 2" in line for line in calls)
     execute(checked.opt, checked.decls, checked.main)
     assert capfd.readouterr().out == "[255, 44]\n"

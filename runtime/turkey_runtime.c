@@ -140,56 +140,80 @@ static void *heap_allocate(size_t size, uint32_t kind) {
     return header + 1;
 }
 
-static void mark(void *value) {
+/* The grey set, as an explicit stack. Tracing used to recurse, which made the
+   C stack depth proportional to the longest chain of heap pointers: a list of
+   a hundred thousand elements is an ordinary thing for a program to build and
+   was a segfault to collect. Kept across collections so the capacity is paid
+   for once. */
+static void **mark_stack;
+static int64_t mark_count;
+static int64_t mark_capacity;
+
+static void mark_grey(void *value, const char *what, int64_t index) {
     if (value == NULL) return;
-    /* Exact roots and layout metadata make this an O(1) operation in normal
-       execution. GC stress retains the expensive membership check as a
-       diagnostic for a broken compiler/runtime invariant. */
+    /* Exact roots and layout metadata make finding the header O(1) in normal
+       execution. GC stress keeps the expensive membership check, and it earns
+       the cost: a pointer that is not in the heap means a root was missed or
+       a layout bitmap is wrong, and this turns that from a rare corruption
+       into a panic on the first collection. */
     HeapHeader *header = gc_stress ? find_header(value) : header_of(value);
     if (header == NULL) {
-        char message[128];
-        snprintf(message, sizeof(message),
-                 "GC root or field is not a heap pointer (%p)", value);
+        char message[160];
+        if (what == NULL)
+            snprintf(message, sizeof(message),
+                     "GC root or field is not a heap pointer (%p)", value);
+        else
+            snprintf(message, sizeof(message), "%s %" PRId64
+                     " is not a heap pointer (%p)", what, index, value);
         turkey_panic(message);
         return;
     }
     if (header->marked) return;
     header->marked = 1;
+    if (mark_count == mark_capacity) {
+        int64_t capacity = mark_capacity < 64 ? 64 : mark_capacity * 2;
+        void **grown = realloc(mark_stack, (size_t)capacity * sizeof(void *));
+        if (grown == NULL) {
+            turkey_panic("out of memory while tracing the heap");
+            return;
+        }
+        mark_stack = grown;
+        mark_capacity = capacity;
+    }
+    mark_stack[mark_count++] = value;
+}
+
+static void mark_children(void *value) {
+    HeapHeader *header = header_of(value);
     if (header->kind == HEAP_CELL) {
         TurkeyCell *cell = value;
-        if (cell->pointer_value) mark((void *)(uintptr_t)cell->value);
-    } else if (header->kind == HEAP_OBJECT) {
-        TurkeyObject *object = value;
-        if (object->kind == 2) {
-            if (object->tag >= 6)
-                for (int64_t index = 0; index < object->count; ++index) {
-                    void *child = (void *)(uintptr_t)object->slots[index];
-                    if (gc_stress && child != NULL && find_header(child) == NULL) {
-                        char message[160];
-                        snprintf(message, sizeof(message),
-                                 "array pointer field %" PRId64
-                                 " is not a heap pointer (%p)", index, child);
-                        turkey_panic(message);
-                    } else mark(child);
-                }
-        } else if (object->kind == 0 || object->kind == 1) {
-            for (int64_t index = 0; index < object->count; ++index)
-                if (((object->pointer_bitmap >> (3 * index)) & 7) >= 6) {
-                    void *child = (void *)(uintptr_t)object->slots[index];
-                    if (gc_stress && child != NULL && find_header(child) == NULL) {
-                        char message[160];
-                        snprintf(message, sizeof(message),
-                                 "object tag %d pointer field %" PRId64
-                                 " is not a heap pointer (%p)", object->tag, index, child);
-                        turkey_panic(message);
-                    } else mark(child);
-                }
-        } else {
-            for (int64_t index = 0; index < object->count; ++index)
-                if (object->pointer_bitmap & (UINT64_C(1) << index))
-                    mark((void *)(uintptr_t)object->slots[index]);
-        }
+        if (cell->pointer_value)
+            mark_grey((void *)(uintptr_t)cell->value, NULL, 0);
+        return;
     }
+    if (header->kind != HEAP_OBJECT) return;
+    TurkeyObject *object = value;
+    if (object->kind == 2) {
+        if (object->tag >= 6)
+            for (int64_t index = 0; index < object->count; ++index)
+                mark_grey((void *)(uintptr_t)object->slots[index],
+                          "array pointer field", index);
+    } else if (object->kind == 0 || object->kind == 1) {
+        for (int64_t index = 0; index < object->count; ++index)
+            if (((object->pointer_bitmap >> (3 * index)) & 7) >= 6)
+                mark_grey((void *)(uintptr_t)object->slots[index],
+                          "object pointer field", index);
+    } else {
+        for (int64_t index = 0; index < object->count; ++index)
+            if (object->pointer_bitmap & (UINT64_C(1) << index))
+                mark_grey((void *)(uintptr_t)object->slots[index],
+                          "capture", index);
+    }
+}
+
+static void mark(void *value) {
+    mark_grey(value, NULL, 0);
+    while (mark_count > 0) mark_children(mark_stack[--mark_count]);
 }
 
 void turkey_collect(void) {
@@ -720,9 +744,22 @@ void *turkey_array_new(int64_t length, uint64_t initial, int32_t element_width,
     array->tag = element_layout;
     array->count = length;
     array->pointer_bitmap = (uint32_t)element_width;
-    for (int64_t index = 0; index < length; ++index) {
-        unsigned char *slot = (unsigned char *)array->slots + index * element_width;
-        memcpy(slot, &initial, (size_t)element_width);
+    /* One `memcpy` call per element was the previous shape of this, which for
+       a million-element array is a million calls to copy up to eight bytes.
+       A zero fill is a `memset` whatever the width, and a repeating fill is a
+       typed store. */
+    unsigned char *bytes = (unsigned char *)array->slots;
+    if (initial == 0) {
+        memset(bytes, 0, (size_t)length * (uint32_t)element_width);
+    } else if (element_width == 1) {
+        memset(bytes, (int)(initial & 0xff), (size_t)length);
+    } else if (element_width == 4) {
+        uint32_t *words = (uint32_t *)bytes;
+        uint32_t value = (uint32_t)initial;
+        for (int64_t index = 0; index < length; ++index) words[index] = value;
+    } else {
+        uint64_t *words = (uint64_t *)bytes;
+        for (int64_t index = 0; index < length; ++index) words[index] = initial;
     }
     return array;
 }

@@ -349,6 +349,40 @@ def test_field_and_element_access_is_emitted_inline(name, monkeypatch):
         f"be a getelementptr and a load")
 
 
+def test_a_deep_heap_chain_is_traced_without_the_c_stack(capfd):
+    """Tracing is a worklist, so its depth is not the C stack's depth.
+
+    It used to recurse, one frame per heap pointer followed, so the longest
+    chain of pointers a program could build was bounded by the C stack: half
+    a million links is an unremarkable thing to allocate and this program
+    died with SIGSEGV inside the collector rather than answering.
+    """
+    native("""
+type Chain = Link(Chain) | End
+
+fun build(n : Int) -> Chain {
+    var out = End
+    for var i = 0; i < n; i = i + 1 { out = Link(out) }
+    out
+}
+
+fun depth(c : Chain) -> Int {
+    var n = 0
+    var at = c
+    loop {
+        match at {
+            End -> break
+            Link(next) -> { n = n + 1; at = next }
+        }
+    }
+    n
+}
+
+fun main() { print(show(depth(build(500000)))) }
+""")
+    assert capfd.readouterr().out == "500000\n"
+
+
 def test_top_level_dictionaries_survive_gc_stress(monkeypatch, capfd):
     """A pointer-typed module global is a root in its own right.
 

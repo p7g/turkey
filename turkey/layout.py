@@ -160,13 +160,16 @@ def _needs_layouts(binds: dict[str, CBind]) -> set[str]:
 def _key(args: list[Type], abstracted: dict[int, str]) -> tuple[str, ...] | None:
     """The layout of each type argument, or None if one is not knowable.
 
-    `BOXED` is the answer `layout_of` gives a variable it has no layout for,
-    which is exactly the case a copy cannot be keyed on.
+    Asked directly now. This used to test for `BOXED`, because that was the
+    answer `layout_of` gave a variable it had no layout for -- reading an
+    absence out of a value that also means "there is a box here". `layout_of`
+    says which it means, so this passes the absence along instead of
+    reconstructing it.
     """
     out = []
     for arg in args:
         layout = layout_of(arg, abstracted)
-        if layout is bir.Layout.BOXED:
+        if layout is None:
             return None
         out.append(layout.value)
     return tuple(out)

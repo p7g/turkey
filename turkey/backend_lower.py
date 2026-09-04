@@ -47,14 +47,27 @@ class _Scattered:
 
 
 def layout_of(ty: Type, abstracted: dict[int, str] | None = None
-              ) -> bir.Layout:
-    """The layout a value of `ty` is held at.
+              ) -> bir.Layout | None:
+    """The layout a value of `ty` is held at, or `None` if that is not known.
 
     `abstracted` is the binding's `layouts`: the layout each of its abstracted
-    variables stands for, when it is one of `layout.share`'s copies. Without
-    it an abstracted variable has no layout and the answer is `BOXED`, which
-    is the uniform representation `mono.check_layouts` exists to keep out of
-    any body that would take polymorphic data apart.
+    variables stands for, when it is one of `layout.share`'s copies. A variable
+    that is not in it has no layout, and this says so.
+
+    Partial on purpose. It used to answer `BOXED` there, and its own docstring
+    read "an abstracted variable has no layout and the answer is `BOXED`" --
+    two different facts under one value, because `BOXED` is also a real
+    representation that `turkey_box` produces and `turkey_unbox` consumes. The
+    conflation is not academic: `layout.share._key` had to *pattern-match* on
+    `BOXED` to recover "I do not know", while the generic `Data.Map#findSlot`
+    read the same answer as "there is a box in this field" and dereferenced an
+    integer (FINDINGS 53). One of those readings had to be wrong and nothing
+    said which.
+
+    So the absence is now a value of its own, and a caller that wants the
+    uniform representation asks for it by name -- `held_at` below. What that
+    buys is that the choice is written down at each site rather than inherited
+    from a default nobody chose.
     """
     ty = prune(ty)
     if abstracted and isinstance(ty, TVar) and ty.id in abstracted:
@@ -79,10 +92,27 @@ def layout_of(ty: Type, abstracted: dict[int, str] | None = None
     if is_ref(ty) or isinstance(ty, TFun):
         return bir.Layout.PTR
     if isinstance(ty, (TVar, TFam)):
-        return bir.Layout.BOXED
+        return None
     if isinstance(ty, (TApp, TTuple)):
         return bir.Layout.PTR
     return bir.Layout.PTR
+
+
+def held_at(ty: Type, abstracted: dict[int, str] | None = None) -> bir.Layout:
+    """`layout_of`, with the uniform representation where it has no answer.
+
+    This is the right question for a value a body only *holds* and passes on,
+    which is what parametricity leaves a generic body able to do: it needs
+    some way to keep an `a` in a slot, and `BOXED` is that way.
+
+    It is the wrong question for the layout a field was *written* at, which is
+    decided by the construction site and cannot be recovered from the type. No
+    body should be reading a field of abstracted type at all --
+    `mono.check_layouts` refuses one that could -- so a `None` reaching a field
+    read means that check has a hole rather than that this needs a default.
+    """
+    found = layout_of(ty, abstracted)
+    return bir.Layout.BOXED if found is None else found
 
 
 def _expr_layout(expr: CExpr, abstracted: dict[int, str] | None = None
@@ -90,13 +120,13 @@ def _expr_layout(expr: CExpr, abstracted: dict[int, str] | None = None
     if isinstance(expr, CLit):
         resolved = prune(expr.ty)
         if not isinstance(resolved, TVar):
-            return layout_of(resolved, abstracted)
+            return held_at(resolved, abstracted)
         return {
             "Int": bir.Layout.I64, "Byte": bir.Layout.I8,
             "Char": bir.Layout.I32, "Float": bir.Layout.F64,
             "String": bir.Layout.PTR,
-        }.get(expr.kind, layout_of(expr.ty, abstracted))
-    return layout_of(expr.ty, abstracted)
+        }.get(expr.kind, held_at(expr.ty, abstracted))
+    return held_at(expr.ty, abstracted)
 
 
 # Every symbol this backend defines begins with this, and no symbol the
@@ -216,7 +246,7 @@ class _FunctionLowerer:
 
     def layout(self, ty: Type) -> bir.Layout:
         """`layout_of`, under this body's abstracted layouts."""
-        return layout_of(ty, self.abstracted)
+        return held_at(ty, self.abstracted)
 
     def expr_layout(self, expr: CExpr) -> bir.Layout:
         return _expr_layout(expr, self.abstracted)
@@ -911,11 +941,11 @@ class _FunctionLowerer:
                     # scheme would pass boxed values to a body expecting bare
                     # ones. See `turkey/layout.py`.
                     arguments = [self.coerce(at, value,
-                                             layout_of(expected, callee))
+                                             held_at(expected, callee))
                                  for value, expected in zip(values,
                                                             function_type.params)]
                     called = self.emit(at, "call", (symbol, *arguments),
-                                       layout_of(function_type.ret, callee),
+                                       held_at(function_type.ret, callee),
                                        self.frame(expr.span),
                                        diverges=fn.name in self.bottoming)
                     done(at, self.coerce(at, called, self.layout(expr.ty)))
@@ -1357,14 +1387,14 @@ def _pattern_layout(pattern, fallback: Type,
     while isinstance(pattern, ast.PAnnot):
         pattern = pattern.pat
     if isinstance(pattern, ast.PVar) and pattern.name in hints:
-        return layout_of(hints[pattern.name], abstracted)
+        return held_at(hints[pattern.name], abstracted)
     if isinstance(pattern, ast.PCon) and pattern.name in (BOOL_FALSE, BOOL_TRUE):
         return bir.Layout.I1
     # Nested constructors and tuples are heap values regardless of the type
     # family carried by their contents.
     if isinstance(pattern, (ast.PCon, ast.PRecord, ast.PTuple)):
         return bir.Layout.PTR
-    return layout_of(fallback, abstracted)
+    return held_at(fallback, abstracted)
 
 
 def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
@@ -1456,7 +1486,7 @@ def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
             run_block.instructions.append(
                 bir.Instruction("global_load", (global_.name,), held))
     result_layout = functions[main][1].ret
-    result = bir.Value("result", layout_of(result_layout))
+    result = bir.Value("result", held_at(result_layout))
     run_block.instructions.append(
         bir.Instruction("call", (functions[main][0],), result))
     run_block.terminator = bir.Return(result)

@@ -802,6 +802,83 @@ def test_the_backend_is_handed_no_stuck_type_family():
     assert not found, found[:5]
 
 
+# --- a newtype is its payload ---------------------------------------------
+
+
+def test_a_single_field_wrapper_is_not_allocated():
+    """`type Wrapped = W(Int)` has no run-time existence.
+
+    One variant, one field, no way to tell the wrapper from what it wraps --
+    and with no function identity and no reflection in the language, a value
+    of it *is* its payload. So it is held at the payload's layout, which for
+    an `Int` is `i64` and not a pointer to a heap object holding one.
+    """
+    checked = check("""
+type Wrapped = W(Int)
+fun main() { let w = W(7); match w { W(n) -> print(n) } }
+""")
+    assert "Main#Wrapped" in checked.decls.newtypes()
+    text = generate(checked.opt, checked.decls, checked.main)
+    assert "call ptr @turkey_object_new" not in text
+
+
+def test_an_erased_wrapper_still_answers_its_payload(capfd):
+    """Built, matched, projected and passed through a generic function."""
+    native("""
+type Wrapped = W(Int)
+type Boxed a = Boxed(a)
+
+fun unwrap(w : Wrapped) -> Int = match w { W(n) -> n }
+
+fun main() {
+    let wrapped = Array.map([1, 2, 3], W)
+    print(Array.map(wrapped, unwrap))
+    let b = Boxed("inside")
+    print(b.0)
+    print(W(4).0 + unwrap(W(5)))
+}
+""")
+    assert capfd.readouterr().out == "[1, 2, 3]\ninside\n9\n"
+
+
+def test_a_wrapper_over_a_type_variable_is_erased_too():
+    """`Boxed a` adds no edge to the recursion graph, so nothing stops it.
+
+    A bare variable payload is not another candidate -- it is whatever the
+    caller's type argument is, and that has a layout of its own or is held
+    uniformly like any other `a`.
+    """
+    checked = check("type Boxed a = Boxed(a)\nfun main() { print(Boxed(1).0) }")
+    assert "Main#Boxed" in checked.decls.newtypes()
+
+
+def test_a_cycle_of_wrappers_keeps_one_box():
+    """Erasure has to terminate, and a cycle is where it would not.
+
+    `A(B)`, `B(C)`, `C(A)` is one wrapper spread over three declarations and
+    has no representation if all three are erased. One member of the cycle
+    keeps its box -- the first by name -- which is enough for the rest.
+    """
+    checked = check("""
+type A = A(B)
+type B = B(C)
+type C = C(A)
+fun main() { print("ok") }
+""")
+    erased = {n for n in checked.decls.newtypes() if n.startswith("Main#")}
+    assert erased == {"Main#B", "Main#C"}, erased
+
+
+def test_an_array_element_is_one_indirection_closer():
+    """`Array a = Array(ArrayStorage a)` is the case that motivated this.
+
+    The comment in `lower_pattern` says the wrapper's tag test is paid on
+    every element access; erasing the wrapper removes the load beneath it too.
+    """
+    checked = check("fun main() { let xs = [1, 2, 3]; print(xs[1]) }")
+    assert "Data.Array#Array" in checked.decls.newtypes()
+
+
 def test_a_one_armed_if_discards_a_branch_that_answers_something(capfd):
     """`if c { e }` is `Unit` whatever `e` is (section 6.7, `infer._gen_EIf`).
 

@@ -139,7 +139,7 @@ def check(src: str, file: str | None = None,
     # stuck one has no representation and `held_at` would guess. See
     # `mono.reduce_types`.
     program_opt = mono.reduce_types(program_opt, classes)
-    program_opt = layout.share(program_opt)
+    program_opt = layout.share(program_opt, decls)
     coretc.check_program(program_opt, decls, classes, coretc.globals_of(env))
     # Every layout the backend reads a field at has to be knowable, and this
     # is the program it is handed. See `mono.transparent_parameters`.

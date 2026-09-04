@@ -46,8 +46,8 @@ class _Scattered:
     fields: dict[str, bir.Value]
 
 
-def layout_of(ty: Type, abstracted: dict[int, str] | None = None
-              ) -> bir.Layout | None:
+def layout_of(ty: Type, abstracted: dict[int, str] | None = None,
+              decls=None) -> bir.Layout | None:
     """The layout a value of `ty` is held at, or `None` if that is not known.
 
     `abstracted` is the binding's `layouts`: the layout each of its abstracted
@@ -74,6 +74,15 @@ def layout_of(ty: Type, abstracted: dict[int, str] | None = None
         return bir.Layout(abstracted[ty.id])
     if ty is BOTTOM:
         return bir.Layout.UNIT
+    if decls is not None:
+        # A newtype is its payload, so its representation is its payload's --
+        # and that is the whole of the erasure the backend has to know about,
+        # since a value of one is never built and never taken apart. See
+        # `DeclTable.newtypes`, which is also where the recursion that would
+        # make this loop is excluded.
+        payload = decls.erased_payload(ty)
+        if payload is not None:
+            return layout_of(payload, abstracted, decls)
     if isinstance(ty, TCon):
         if ty.name == INT.name:
             return bir.Layout.I64
@@ -107,7 +116,8 @@ def layout_of(ty: Type, abstracted: dict[int, str] | None = None
     raise Unsupported(f"no layout for the type {ty!r}")
 
 
-def held_at(ty: Type, abstracted: dict[int, str] | None = None) -> bir.Layout:
+def held_at(ty: Type, abstracted: dict[int, str] | None = None,
+            decls=None) -> bir.Layout:
     """`layout_of`, with the uniform representation for a variable alone.
 
     A body that knows nothing about a type still needs somewhere to keep a
@@ -127,7 +137,7 @@ def held_at(ty: Type, abstracted: dict[int, str] | None = None) -> bir.Layout:
     none of which said anything until the process died (FINDINGS 53, 54). A
     refusal here names the pass that has the hole.
     """
-    found = layout_of(ty, abstracted)
+    found = layout_of(ty, abstracted, decls)
     if found is not None:
         return found
     if isinstance(prune(ty), TVar):
@@ -137,18 +147,18 @@ def held_at(ty: Type, abstracted: dict[int, str] | None = None) -> bir.Layout:
         f"variable, so the uniform representation is not the answer either")
 
 
-def _expr_layout(expr: CExpr, abstracted: dict[int, str] | None = None
-                 ) -> bir.Layout:
+def _expr_layout(expr: CExpr, abstracted: dict[int, str] | None = None,
+                 decls=None) -> bir.Layout:
     if isinstance(expr, CLit):
         resolved = prune(expr.ty)
         if not isinstance(resolved, TVar):
-            return held_at(resolved, abstracted)
+            return held_at(resolved, abstracted, decls)
         return {
             "Int": bir.Layout.I64, "Byte": bir.Layout.I8,
             "Char": bir.Layout.I32, "Float": bir.Layout.F64,
             "String": bir.Layout.PTR,
-        }.get(expr.kind, held_at(expr.ty, abstracted))
-    return held_at(expr.ty, abstracted)
+        }.get(expr.kind, held_at(expr.ty, abstracted, decls))
+    return held_at(expr.ty, abstracted, decls)
 
 
 # Every symbol this backend defines begins with this, and no symbol the
@@ -268,10 +278,10 @@ class _FunctionLowerer:
 
     def layout(self, ty: Type) -> bir.Layout:
         """`layout_of`, under this body's abstracted layouts."""
-        return held_at(ty, self.abstracted)
+        return held_at(ty, self.abstracted, self.decls)
 
     def expr_layout(self, expr: CExpr) -> bir.Layout:
-        return _expr_layout(expr, self.abstracted)
+        return _expr_layout(expr, self.abstracted, self.decls)
 
     def fresh(self, hint: str) -> str:
         clean = "".join(c if c.isalnum() else "_" for c in hint).strip("_") or "v"
@@ -512,9 +522,13 @@ class _FunctionLowerer:
 
         Three primitives answer a `Data.Array.Array` that the runtime can only
         build the *contents* of: it allocates the flat storage, and the record
-        and constructor around it carry tags that live in this table. The
-        runtime reads the same shape back structurally (`array_parts`), which
-        needs no tags -- only building one does.
+        around it carries a tag that lives in this table. The runtime reads
+        the same shape back structurally (`array_parts`), which needs no tags
+        -- only building one does.
+
+        The `Array` constructor itself is a newtype and is not built, here or
+        anywhere: what a value of `Array a` *is* is the `ArrayStorage a`
+        record. `array_parts` reads it at that shape for the same reason.
         """
         fields = self.record_fields["Data.Array#ArrayStorage"]
         by_name = {"storage": storage, "length": length}
@@ -526,6 +540,8 @@ class _FunctionLowerer:
         for index, item in enumerate(ordered):
             block.instructions.append(bir.Instruction(
                 "object_set", (inner, str(index), item)))
+        if "Data.Array#Array" in self.decls.newtypes():
+            return inner
         outer = self.emit(block, "object_new", (
             "1", str(self.tags["Data.Array#Array"]), "1",
             str(_layout_metadata([bir.Layout.PTR])),
@@ -893,6 +909,11 @@ class _FunctionLowerer:
             targets = ([expr.target, expr.index] if isinstance(expr, CIndex)
                        else [expr.target])
             def project(at: bir.Block, values: list[bir.Operand]) -> None:
+                if (not isinstance(expr, CIndex)
+                        and self.decls.erased_payload(expr.target.ty)
+                        is not None):
+                    done(at, self.coerce(at, values[0], self.layout(expr.ty)))
+                    return
                 if isinstance(expr, CIndex):
                     made = self.emit(at, "array_get", tuple(values),
                                      self.layout(expr.ty), self.frame(expr.span))
@@ -973,11 +994,11 @@ class _FunctionLowerer:
                     # scheme would pass boxed values to a body expecting bare
                     # ones. See `turkey/layout.py`.
                     arguments = [self.coerce(at, value,
-                                             held_at(expected, callee))
+                                             held_at(expected, callee, self.decls))
                                  for value, expected in zip(values,
                                                             function_type.params)]
                     called = self.emit(at, "call", (symbol, *arguments),
-                                       held_at(function_type.ret, callee),
+                                       held_at(function_type.ret, callee, self.decls),
                                        self.frame(expr.span),
                                        diverges=fn.name in self.bottoming)
                     done(at, self.coerce(at, called, self.layout(expr.ty)))
@@ -985,6 +1006,12 @@ class _FunctionLowerer:
                 return
             if isinstance(fn, CCon):
                 info = self.decls.constructors[fn.name]
+                if self.decls.erased_payload(expr.ty) is not None:
+                    def wrap(at: bir.Block, values: list[bir.Operand]) -> None:
+                        done(at, self.coerce(at, values[0],
+                                             self.layout(expr.ty)))
+                    self.lower_values(expr.args, env, joins, block, wrap)
+                    return
                 def construct(at: bir.Block, values: list[bir.Operand]) -> None:
                     con_type = instantiate(info.scheme, lambda: TVar(1))
                     assert isinstance(con_type, TFun)
@@ -1112,6 +1139,15 @@ class _FunctionLowerer:
             condition = self.emit(block, "scalar_eq", (value, wanted), bir.Layout.I1)
             block.terminator = bir.Branch(condition, success.name, failure.name)
             return
+        if isinstance(pat, ast.PCon) and (
+                self.decls.erased_payload(ty) is not None):
+            # The wrapper is not there, so there is no tag to test and nothing
+            # to take out: the value in hand already *is* the payload, and the
+            # one sub-pattern goes straight on to it. See `DeclTable.newtypes`.
+            payload = self.decls.erased_payload(ty)
+            self.lower_pattern(pat.args[0], value, payload, env, block,
+                               success, failure, hints)
+            return
         if isinstance(pat, (ast.PCon, ast.PRecord)):
             held = self.new_slot("pattern_value", value.layout)
             block.instructions.append(bir.Instruction("slot_store", (held.name, value)))
@@ -1146,7 +1182,8 @@ class _FunctionLowerer:
             at = contents
             for index, (field, sub) in enumerate(pieces):
                 field_ty = con_type.params[field]
-                field_layout = _pattern_layout(sub, field_ty, hints, self.abstracted)
+                field_layout = _pattern_layout(sub, field_ty, hints,
+                                               self.abstracted, self.decls)
                 object_value = self.emit(at, "slot_load", (held.name,), held.layout)
                 loaded = self.emit(at, "object_get", (object_value, str(field)), field_layout)
                 following = success if index + 1 == len(pieces) else self.new_block("pattern_field")
@@ -1165,7 +1202,8 @@ class _FunctionLowerer:
             for index, (sub, field_ty) in enumerate(zip(pat.elems, tuple_ty.elems)):
                 tuple_value = self.emit(at, "slot_load", (held.name,), held.layout)
                 loaded = self.emit(at, "object_get", (tuple_value, str(index)),
-                                   _pattern_layout(sub, field_ty, hints, self.abstracted))
+                                   _pattern_layout(sub, field_ty, hints,
+                                                   self.abstracted, self.decls))
                 following = success if index + 1 == len(pat.elems) else self.new_block("tuple_field")
                 self.lower_pattern(sub, loaded, field_ty, env, at, following,
                                    failure, hints)
@@ -1415,18 +1453,23 @@ def _free_variable_type(expr: CExpr, name: str) -> Type | None:
 
 def _pattern_layout(pattern, fallback: Type,
                     hints: dict[str, Type],
-                    abstracted: dict[int, str] | None = None) -> bir.Layout:
+                    abstracted: dict[int, str] | None = None,
+                    decls=None) -> bir.Layout:
     while isinstance(pattern, ast.PAnnot):
         pattern = pattern.pat
     if isinstance(pattern, ast.PVar) and pattern.name in hints:
-        return held_at(hints[pattern.name], abstracted)
+        return held_at(hints[pattern.name], abstracted, decls)
     if isinstance(pattern, ast.PCon) and pattern.name in (BOOL_FALSE, BOOL_TRUE):
         return bir.Layout.I1
     # Nested constructors and tuples are heap values regardless of the type
     # family carried by their contents.
     if isinstance(pattern, (ast.PCon, ast.PRecord, ast.PTuple)):
+        # ... unless the constructor is not there: an erased wrapper is its
+        # payload, and the pattern that names it binds one.
+        if decls is not None and decls.erased_payload(fallback) is not None:
+            return held_at(fallback, abstracted, decls)
         return bir.Layout.PTR
-    return held_at(fallback, abstracted)
+    return held_at(fallback, abstracted, decls)
 
 
 def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
@@ -1488,7 +1531,8 @@ def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
                      if bind.name in reachable and bind.name not in functions]
     globals_ = {
         bind.name: bir.Value(mangle("global." + bind.name),
-                             _expr_layout(_erase_types(bind.value)))
+                             _expr_layout(_erase_types(bind.value),
+                                          decls=decls))
         for bind in runtime_binds
     }
     top: list[bir.Function] = []
@@ -1518,7 +1562,7 @@ def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
             run_block.instructions.append(
                 bir.Instruction("global_load", (global_.name,), held))
     result_layout = functions[main][1].ret
-    result = bir.Value("result", held_at(result_layout))
+    result = bir.Value("result", held_at(result_layout, decls=decls))
     run_block.instructions.append(
         bir.Instruction("call", (functions[main][0],), result))
     run_block.terminator = bir.Return(result)

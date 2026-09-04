@@ -63,7 +63,7 @@ def test_sharing_is_what_makes_the_layout_check_pass(capped):
     # live call sites, and no way to know what width its elements are.
     checked = driver.check(SOURCE)
     mono.check_layouts(checked.opt)
-    without = layout._Sharer(checked.mono)
+    without = layout._Sharer(checked.mono, checked.decls)
     assert "Data.Array#push" in without.shared
 
 

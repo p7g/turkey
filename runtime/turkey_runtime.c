@@ -727,13 +727,12 @@ void *turkey_array_new(int64_t length, uint64_t initial, int32_t element_width,
     return array;
 }
 
+/* `Data.Array#Array` is a newtype (`DeclTable.newtypes`), so the value handed
+   over here is the `ArrayStorage` record itself: the constructor around it is
+   not built by `wrap_array` and is not there to be read back. */
 static int array_parts(void *wrapper, TurkeyObject **data, int64_t *length) {
     if (!valid_object_kind(wrapper, 1)) return 0;
-    TurkeyObject *outer = wrapper;
-    if (outer->count < 1) { turkey_panic("invalid Array value"); return 0; }
-    void *storage_pointer = (void *)(uintptr_t)outer->slots[0];
-    if (!valid_object_kind(storage_pointer, 1)) return 0;
-    TurkeyObject *storage = storage_pointer;
+    TurkeyObject *storage = wrapper;
     if (storage->count < 2) { turkey_panic("invalid Array storage"); return 0; }
     void *data_pointer = (void *)(uintptr_t)storage->slots[0];
     if (!valid_object_kind(data_pointer, 2)) return 0;

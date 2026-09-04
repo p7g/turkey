@@ -83,6 +83,8 @@ class DeclTable:
         # resolved, since a method's type may mention a family of a class
         # declared further down the file.
         self.families: dict[str, FamilyInfo] = {}
+        # `newtypes`, once the declarations are all in.
+        self._newtypes: set[str] | None = None
         # Short name -> the qualified name that claimed it first. Two modules
         # may each declare a `Node`; this is what notices, so that both print
         # qualified rather than both printing `Node` (delta 43). It is also
@@ -369,6 +371,63 @@ class DeclTable:
         mapping = {v.id: arg for v, arg in zip(params, args)
                    if isinstance(v, TVar)}
         return substitute(body.params[con.field_names.index(label)], mapping)
+
+    def newtypes(self) -> set[str]:
+        """The type names whose one constructor is not there at run time.
+
+        `type Array a = Array(ArrayStorage a)` gives its payload a name and a
+        `match` to get back out of, and nothing else: one variant, one field,
+        and no way to tell the wrapper from what it wraps. There is no
+        function identity in Turkey and no reflection, so a value of it *is*
+        its payload, and the allocation is a cost with no observable effect --
+        `backend_lower` says so itself where it reads an array element,
+        because that indirection is paid on every one.
+
+        Records are excluded, and this is the reason there is a rule rather
+        than a check for one variant and one field: a single-variant record is
+        mutable (section 4.5), and assigning through two names for one box is
+        exactly the identity that erasure would take away.
+
+        Recursion is excluded because it is what erasure cannot terminate on.
+        A wrapper is erased into its payload, so `type Loop = Loop(Loop)` has
+        no representation at all -- and the cycle need not be direct, since
+        `A(B)`, `B(C)`, `C(A)` is the same thing spread over three
+        declarations. An edge is drawn only where the payload's *head* is
+        another candidate: a payload of `Option B` is a pointer to a variant
+        type whatever `B` is, and that pointer is where the recursion stops.
+        One member of each cycle keeps its box -- the first by name, as
+        `opt.loop_breakers` picks one -- which is enough to make the rest
+        terminate.
+        """
+        if self._newtypes is not None:
+            return self._newtypes
+        candidates = {
+            name for name, info in self.tycons.items()
+            if len(info.variants) == 1 and not info.variants[0].is_record
+            and info.variants[0].arity == 1
+        }
+        graph: dict[str, set[str]] = {}
+        for name in candidates:
+            body = self.tycons[name].variants[0].scheme.body
+            assert isinstance(body, TFun)
+            head, _ = spine(body.params[0])
+            graph[name] = ({head.name} & candidates
+                           if isinstance(head, TCon) else set())
+        from .deps import sccs
+        for component in sccs(graph):
+            cyclic = len(component) > 1 or component[0] in graph[component[0]]
+            if cyclic:
+                candidates.discard(min(component))
+        self._newtypes = candidates
+        return candidates
+
+    def erased_payload(self, receiver: Type) -> Type | None:
+        """What a value of `receiver` really is, if its wrapper is erased."""
+        head, _ = spine(receiver)
+        if not isinstance(head, TCon) or head.name not in self.newtypes():
+            return None
+        payload = self.projection_types(receiver)
+        return None if payload is None else payload[0]
 
     def projection_types(self, receiver: Type) -> list[Type] | None:
         """Payload types for an immutable, single positional variant."""

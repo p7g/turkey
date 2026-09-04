@@ -144,7 +144,8 @@ def _needs_layouts(binds: dict[str, CBind]) -> set[str]:
             return found
 
 
-def _key(args: list[Type], abstracted: dict[int, str]) -> tuple[str, ...] | None:
+def _key(args: list[Type], abstracted: dict[int, str],
+         decls) -> tuple[str, ...] | None:
     """The layout of each type argument, or None if one is not knowable.
 
     Asked directly now. This used to test for `BOXED`, because that was the
@@ -155,7 +156,7 @@ def _key(args: list[Type], abstracted: dict[int, str]) -> tuple[str, ...] | None
     """
     out = []
     for arg in args:
-        layout = layout_of(arg, abstracted)
+        layout = layout_of(arg, abstracted, decls)
         if layout is None:
             return None
         out.append(layout.value)
@@ -163,7 +164,8 @@ def _key(args: list[Type], abstracted: dict[int, str]) -> tuple[str, ...] | None
 
 
 class _Sharer:
-    def __init__(self, program: CProgram) -> None:
+    def __init__(self, program: CProgram, decls) -> None:
+        self.decls = decls
         self.binds = {b.name: b for b in program.dicts + program.binds}
         self.shared = _needs_layouts(self.binds)
         # key -> the name built for it, and the copies in request order.
@@ -257,7 +259,7 @@ class _Sharer:
                 # is left alone -- `mono.check_layouts` then says so, which is
                 # a limit that is visible rather than one that is guessed at.
                 want = len(abstraction_binders(self.binds[node.fn.name]))
-                key = (_key(node.args, abstracted)
+                key = (_key(node.args, abstracted, self.decls)
                        if len(node.args) == want else None)
                 if key is not None:
                     made = self.request(node.fn.name, key)
@@ -274,9 +276,9 @@ class _Sharer:
         return node
 
 
-def share(program: CProgram) -> CProgram:
+def share(program: CProgram, decls) -> CProgram:
     """The program with one body per layout of every binding that needs one."""
-    return _Sharer(program).run(program)
+    return _Sharer(program, decls).run(program)
 
 
 __all__ = ["share", "transparent"]

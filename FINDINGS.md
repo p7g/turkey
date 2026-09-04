@@ -444,6 +444,65 @@ own finding about what the goldens cover.
 `boot` states the answer as a constant with the reasoning attached, which is
 the honest translation of a question whose answer is decided.
 
+### 43. The new inliner does not finish on a program the size of the compiler
+**performance, open.** M24, after rebasing onto the LLVM backend. `turkey`
+cannot compile `boot` at all any more. Measured, with a 2 GB stack and no
+recursion limit worth speaking of: 125,459 reductions in 472 seconds, at a
+flat ~250 a second, and then a `RecursionError`. The same check under the
+*previous* cost model takes 54 seconds.
+
+Two scale failures, and neither is a bug in a rule:
+
+**Four fifths of the compiler is now inlinable.** `_size` charging nothing for
+variables, literals, `let`s and single-alternative matches is right about what
+a call site grows by, and on `tests/programs` it is a clear win -- the
+benchmark goes 3.22s to 2.51s. On `boot` it puts **1519 of 1896** lambda
+bindings under the budget. It is not that any one body is secretly huge: the
+worst understatement in the whole program is `Turkey.Desugar#sequence` at 32
+against 112 real nodes. It is that nearly everything qualifies, so every
+inlined body arrives full of calls that also qualify.
+
+**Each reduction costs more than the last.** `_Reducer.expr` re-walks the whole
+subtree after every rewrite -- `e = self.children(made)` -- so as the terms
+grow the constant factor grows with them. Small programs run ~1500 reductions
+a second; `boot` runs 250.
+
+**And the stack is call-graph depth times term depth.** `inline` asks
+`body_of` for a callee's reduced body *while inside* the caller's walk, so a
+chain of first-time expansions stacks a full traversal per link. There is no
+rewrite cycle -- no node reached even 400 rounds of its own fixpoint -- so this
+is depth, not divergence.
+
+The shape of a fix is not this milestone's to choose, but the three that
+present themselves are: reduce bodies in dependency order (`deps.sccs` already
+emits it) so `body_of` is a lookup rather than a nested traversal; do not
+re-walk a subtree after a rewrite that only rearranged already-reduced terms;
+and a global tick limit, as GHC's simplifier has, so that a program too large
+to finish optimizing still compiles.
+
+### 44. The layout invariant refuses the bootstrap compiler
+**design, open.** M25's problem, arriving early. With the old cost model
+`boot` gets far enough to reach `mono.check_layouts`, and is refused:
+
+```
+monomorphization left a generic body able to destructure polymorphic data,
+whose layout it cannot know: grow takes xs : Array a; map takes xs : Array a;
+map takes f : fun(a) -> b; push takes xs : Array a
+```
+
+Nothing in `tests/programs` violates it, and the commit that added the check
+says why: specialization stops the generic `Data.Array#grow` and `#push` from
+being *reached*, and inlining removes what is left. Neither finishes the job on
+a program where the specialization cap actually binds -- `boot` uses `Array` at
+enough types, through enough layers, that generic bodies survive with live call
+sites.
+
+This is exactly the hole `plan.txt` item 10 describes and M25 was already
+scheduled to fill: **one compiled body per distinct layout of the type
+arguments**, which is total where specialization is partial, because there are
+six layouts and infinitely many types. The refusal is the right thing to do
+until that exists; it is not a thing `boot` can be written around.
+
 ### 24. `Data.Set` is not one of the modules the Prelude re-exports
 **library.** M21. `Array`, `Map`, `Option` and eight others arrive
 automatically; `Set` needs an import, for no reason a reader could guess. Either

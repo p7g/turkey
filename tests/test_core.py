@@ -313,13 +313,18 @@ def test_the_checker_rejects_an_argument_of_the_wrong_type():
 
 
 def test_a_field_of_a_record_polymorphic_target_keeps_its_inferred_type():
-    """A `HasField` the solver discharged leaves the target a variable.
+    """A field of a record-polymorphic target is still callable.
 
-    The field's type is then not recoverable from the target, but it is not
-    unknown either: inference recorded it on the selection. Handing back a
-    fresh variable instead makes every use of the field a type error -- a
-    `step` field holding a function stops being callable -- so the checker
-    falls back to the type on the node, the way `CIndex` already does.
+    The field's type is not recoverable from the target -- that is still a
+    variable -- but it is not unknown either: it is `Field.step a`, and the
+    equality the body forces says that application is `fun(Char) -> a`. A
+    `step` field holding a function has to stay callable, which is what this
+    is here to hold up.
+
+    It is also the program that found two ways to make the compiler spin. A
+    retained `Field.tag a ~ Field.tag a` is a rewrite rule from a family
+    application to itself, and both `normalize`'s loop and `Fams.reduce` had
+    to learn that such a rule is stuck rather than progress.
     """
     src = """
 type Auto = Auto {
@@ -337,5 +342,6 @@ fun fail(c : Char) -> Auto = Auto(0, fail)
 """
     scheme = next(s for n, s in check(src).signatures if n == "choice")
     rendered = show_scheme(scheme)
-    assert 'HasField "step" a (fun(Char) -> a)' in rendered
+    assert 'HasField "step" a' in rendered
+    assert 'Field.step a ~ (fun(Char) -> a)' in rendered
     assert rendered.endswith("fun(a, b) -> Auto")

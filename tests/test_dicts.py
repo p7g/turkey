@@ -178,14 +178,21 @@ def test_a_superclass_is_selected_rather_than_passed():
 # -- what abstracts over it ---------------------------------------------------
 
 
-def test_only_class_predicates_become_parameters():
-    """A `HasField` is discharged by a declaration lookup and leaves nothing.
+def test_a_field_access_carries_evidence_like_any_other_method():
+    """A `HasField` is a class predicate, and so it does become a parameter.
 
-    `OneOf` is the same: both are erased, and only a class predicate survives
-    into the running program.
+    It used to be discharged by a declaration lookup and *erased*, which is
+    what left a record-polymorphic body knowing a field's type and not its
+    position -- uncompilable, and at worst compiled into a read at the wrong
+    width. `get` is handed a dictionary of accessors instead. See FINDINGS 45.
+
+    `OneOf` is still erased, and `bump` still takes nothing: it is a decision
+    about which numeric type a literal has, and nothing at run time depends on
+    the answer.
     """
     checked = check("fun get(r) = r.x\nfun bump(a : Int) = a + 1")
-    assert params_of(checked, "get") == []
+    (parameter,) = params_of(checked, "get")
+    assert parameter.endswith("HasField.x")
     assert params_of(checked, "bump") == []
 
 

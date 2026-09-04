@@ -36,9 +36,11 @@ from dataclasses import dataclass, field
 
 from turkey import ast
 from turkey.parser import parse
+from turkey.classes import field_class, field_family
 from turkey.constraints import HAS_FIELD, ONE_OF, CPred, reach
 from turkey.types import (
-    BOOL, CHAR, FLOAT, INT, STRING, Pred, Scheme, TApp, TCon, TFun, TLabel, TSet,
+    BOOL, CHAR, EQUALS, FLOAT, INT, STAR, STRING, Pred, Scheme, TApp, TCon,
+    TFam, TFun, TLabel, TSet,
     TTuple, TVar, Type, float_literal_set, int_literal_set, numeric_order,
     numeric_type, spine, type_key, vars_of,
 )
@@ -97,6 +99,12 @@ def substitute(t: Type, s: Subst) -> Type:
         return TFun([substitute(p, s) for p in t.params], substitute(t.ret, s))
     if isinstance(t, TTuple):
         return TTuple([substitute(e, s) for e in t.elems])
+    if isinstance(t, TFam):
+        # A family's argument is a type like any other. This matters only for
+        # `_as_families`, which rewrites a chain of demands -- `p.a.b` makes
+        # the first access's result the second's receiver -- but leaving it out
+        # silently stopped the rewrite one link short.
+        return TFam(t.name, substitute(t.arg, s), t.kind)
     return t
 
 
@@ -528,10 +536,72 @@ def check(src: str) -> list[tuple[str, Scheme]]:
 
     # Re-generalize at the end: a later binding may have constrained an earlier
     # one, and the printed signature has to show that.
-    return [(n, Scheme(
+    return [(n, _as_families(Scheme(
         [v for v in vars_of(substitute(env[n].body, st.subst),
                             *[a for p in env[n].preds for a in p.args])
          if v.id in {q.id for q in env[n].quantified}],
         substitute(env[n].body, st.subst),
         [Pred(p.name, [substitute(a, st.subst) for a in p.args]) for p in env[n].preds],
-    )) for n in names]
+    ))) for n in names]
+
+
+def _as_families(scheme: Scheme) -> Scheme:
+    """The same answer, spelled the way the real checker spells it.
+
+    This module settles `HasField l r a` with the field's type in the
+    predicate's third argument, which is the obvious reading and the one the
+    real checker used to have. The real checker now says the same thing with
+    an associated family -- `HasField "l" r` and `Field.l r` -- because a
+    field's type is a *function* of the receiver and a family is what says so.
+
+    The two are the same statement, and the translation is mechanical: a
+    retained demand's result variable is exactly `Field.l r`, so substituting
+    it away and dropping it from the quantifier is not an approximation. Doing
+    it here rather than reworking the naive solver keeps this module naive,
+    which is the whole of its value -- and it keeps the differential honest
+    about what it compares, since the quantifier really does lose a variable.
+    """
+    # The field type of each demand, as the family it is. Collected before
+    # anything is rewritten, because a chain -- `p.a.b` -- makes one demand's
+    # *receiver* another's result, so the receivers have to be rewritten too.
+    mapping: dict[int, Type] = {}
+    equalities: list[Pred] = []
+    for p in scheme.preds:
+        if p.name != HAS_FIELD:
+            continue
+        label, receiver, result = p.args
+        held = TFam(field_family(label.name), receiver, STAR)
+        if isinstance(result, TVar):
+            mapping[result.id] = held
+        else:
+            # The field's type met a concrete one -- `p.d` used where a
+            # `String` was wanted. A variable could simply be unified with it;
+            # a family cannot, so the real checker defers and the scheme
+            # retains `Field.d a ~ String`. Saying the same thing here is what
+            # keeps the two comparable.
+            equalities.append(Pred(EQUALS, [held, result]))
+    # `Field.b _b` becomes `Field.b (Field.a a)` once `_b` is itself known, so
+    # this runs until it stops moving. A chain is finite and each round
+    # resolves at least one link, so the bound is the number of demands.
+    for _ in range(len(mapping)):
+        made = {k: substitute(v, mapping) for k, v in mapping.items()}
+        if all(type_key(made[k]) == type_key(mapping[k]) for k in mapping):
+            break
+        mapping = made
+    # A class predicate comes last, because the real checker builds a scheme's
+    # context as `own + shared` and only the class ones are shared across a
+    # binding group. `HasField` is one of those now; `OneOf` never was.
+    preds: list[Pred] = ([p for p in scheme.preds if p.name != HAS_FIELD]
+                        + equalities)
+    for p in scheme.preds:
+        if p.name != HAS_FIELD:
+            continue
+        label, receiver, _ = p.args
+        preds.append(Pred(field_class(label.name), [receiver]))
+    if not mapping:
+        return Scheme(scheme.quantified, scheme.body, preds)
+    return Scheme(
+        [q for q in scheme.quantified if q.id not in mapping],
+        substitute(scheme.body, mapping),
+        [Pred(q.name, [substitute(a, mapping) for a in q.args]) for q in preds],
+    )

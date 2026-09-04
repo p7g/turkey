@@ -68,7 +68,8 @@ import itertools
 from dataclasses import dataclass, field
 
 from . import ast, core, prelude
-from .classes import ClassTable, InstInfo, match
+from .classes import (ClassTable, InstInfo, generated_index,
+                      generated_label, is_generated, match)
 from .core import (
     CAlt, CApp, CArray, CAssign, CBind, CCon, CDeref, CExpr,
     CField, CIf, CIndex, CJoin, CJump, CLam, CLet, CLetRec, CLit, CProject,
@@ -287,6 +288,8 @@ class Lowerer:
         plan = inst.plan
         assert isinstance(plan, InstancePlan)
         result = self.dict_type(inst.cls, inst.head)
+        if is_generated(inst.cls):
+            return self.accessors(inst, result)
         fields: list[tuple[str, CExpr]] = []
         for sup, evidence in plan.supers.items():
             fields.append((super_field(sup),
@@ -305,6 +308,45 @@ class Lowerer:
                          params, record, inst_name(inst))
         return CBind(inst_name(inst), value.ty, self.instance_binders(inst),
                      value, inst.decl.span, module=inst.module)
+
+    def accessors(self, inst: InstInfo, result: Type) -> CBind:
+        """The dictionary of a generated field or projection class.
+
+        Written here in Core rather than in the surface language, and it has to
+        be: `fun get(r) = r.cap` is itself a field access, so it would demand
+        the very predicate it is the evidence for and regress. `CField` stays
+        the primitive and the class is its interface -- the same relation
+        `Prim.intAdd` has to `class Add`.
+
+        No context, so the dictionary is a bare record rather than a function
+        of one. That is what lets `mono`'s devirtualizer hoist these accessors
+        and the inliner collapse them: wherever specialization reaches, a field
+        access ends up the same `CField` it always was.
+        """
+        label, index = generated_label(inst.cls), generated_index(inst.cls)
+        fam = next(iter(inst.families))
+        held = inst.families[fam]
+        span = None
+        target = CParam("%r", inst.head)
+        read: CExpr = (
+            CField(held, span, CVar(inst.head, span, target.name), label)
+            if label is not None else
+            CProject(held, span, CVar(inst.head, span, target.name), index)
+        )
+        fields = [("get", CLam(TFun([inst.head], held), span, [target], read,
+                               f"{inst_name(inst)}#get"))]
+        if label is not None:
+            written = CParam("%v", held)
+            slot = CField(held, span, CVar(inst.head, span, target.name), label)
+            fields.append(("set", CLam(
+                TFun([inst.head, held], TCon("Unit")), span,
+                [CParam(target.name, inst.head), written],
+                CAssign(TCon("Unit"), span, slot,
+                        CVar(held, span, written.name)),
+                f"{inst_name(inst)}#set")))
+        record = CRecord(result, span, f"%Dict.{inst.cls}", fields)
+        return CBind(inst_name(inst), result, self.instance_binders(inst),
+                     record, span, module=inst.module)
 
     def self_dict(self, inst: InstInfo, params: list[str]) -> CExpr:
         """The instance's own dictionary, as seen from inside one of its

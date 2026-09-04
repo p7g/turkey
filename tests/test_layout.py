@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from turkey import driver, layout, mono
-from turkey.errors import Unsupported
+from turkey.types import show_scheme
 
 
 @pytest.fixture
@@ -81,10 +81,19 @@ def test_a_bare_type_variable_needs_no_copy(capped):
     assert not [name for name in names(checked.opt) if "pick@[" in name]
 
 
-def test_a_record_polymorphic_body_is_refused_rather_than_compiled(capped):
-    # `HasField` is discharged and erased, so `at.cap` in a body whose `at` is
-    # still a variable knows the field's type and not its position. Layout
-    # sharing cannot supply an offset, so this is refused. See FINDINGS 45.
+def test_a_record_polymorphic_body_compiles(capped):
+    """The case that made `HasField` a class.
+
+    `capOf` is record-polymorphic: its receiver is a bare type variable, and
+    what licenses `at.cap` is a `HasField` demand its scheme carries. That
+    demand used to be *erased*, leaving a body that knew the field's type and
+    not its position -- refused by the backend at best, and at worst compiled
+    into a read at the boxed width whatever the field was written at.
+
+    The cap is zero here, so nothing is specialized and the generic body is
+    what runs. It is handed a dictionary of accessors rather than an offset it
+    would have to guess. See FINDINGS 45.
+    """
     source = """
     type Box = Box { cap : Int }
     fun capOf(at) = at.cap
@@ -92,5 +101,26 @@ def test_a_record_polymorphic_body_is_refused_rather_than_compiled(capped):
         print(capOf(Box { cap = 3 }))
     }
     """
-    with pytest.raises(Unsupported, match="HasField"):
-        driver.check(source)
+    checked = driver.check(source)
+    scheme = dict(checked.signatures)["capOf"]
+    assert show_scheme(scheme) == '[HasField "cap" a] fun(a) -> Field.cap a'
+    # The accessors are an ordinary instance dictionary, and the call that
+    # could not be compiled before is an ordinary call through it.
+    assert "%inst.%HasField.cap.Main#Box" in names(checked.core)
+
+
+def test_a_capped_field_access_reaches_the_right_field(capped, capsys):
+    """And it runs. None of this is checkable by inspection alone: the hazard
+    was a body that compiled and read the wrong bytes."""
+    source = """
+    type Box = Box { cap : Int, name : String }
+    fun capOf(at) = at.cap
+    fun nameOf(at) = at.name
+    fun main() -> Unit {
+        let b = Box { cap = 7, name = "seven" }
+        print(capOf(b))
+        print(nameOf(b))
+    }
+    """
+    driver.run(source, backend="python")
+    assert capsys.readouterr().out == "7\nseven\n"

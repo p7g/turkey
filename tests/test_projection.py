@@ -38,14 +38,21 @@ def test_projection_is_read_only():
 def test_generic_projection_is_retained_in_the_signature():
     checked = check("fun first(x) = x.0")
     assert show_scheme(checked.signatures[0][1]) == (
-        "[HasProjection 0 a b] fun(a) -> b"
+        "[HasProjection 0 a] fun(a) -> Elem.0 a"
     )
 
 
 def test_projection_result_improves_for_repeated_receiver_and_index():
+    """Two projections of one position of one receiver have one type.
+
+    That used to need a rule -- the functional dependency of
+    `HasProjection i t a`, enforced by hand in `Solver.improve`. The position's
+    type is an associated family now, so both are the type expression
+    `Elem.0 a` and ordinary unification does it.
+    """
     checked = check("fun duplicate(x) = (x.0, x.0)")
     assert show_scheme(checked.signatures[0][1]) == (
-        "[HasProjection 0 a b] fun(a) -> (b, b)"
+        "[HasProjection 0 a] fun(a) -> (Elem.0 a, Elem.0 a)"
     )
 
 

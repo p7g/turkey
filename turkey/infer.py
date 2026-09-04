@@ -39,7 +39,8 @@ from dataclasses import dataclass, field
 from typing import TypeVar
 
 from . import ast, prelude
-from .classes import ClassTable, MethodInfo, Skolems
+from .classes import (ClassTable, MethodInfo, Skolems, field_class,
+                      field_family, projection_class, projection_family)
 from .constraints import (
     HAS_FIELD, HAS_PROJECTION, ONE_OF, Binding, CAnd, CAssume, CDef, CEq, CExists, CInstance,
     CBind, CLet, CPred, Constraint, Env, reach,
@@ -50,8 +51,8 @@ from .evidence import Abstraction, InstancePlan, MethodImpl, Use, dict_name
 from .errors import Span, TypeError_
 from .typed import TypeTable
 from .types import (
-    BOOL, BOTTOM, CHAR, FLOAT, INT, STRING, UNIT, Pred, Scheme, TBottom, TFun,
-    TIndex, TLabel, TSet, TTuple, TVar, Type, apply, array_of, float_literal_set,
+    BOOL, BOTTOM, CHAR, FLOAT, INT, STRING, UNIT, Pred, Scheme, TBottom, TFam,
+    TFun, TSet, TTuple, TVar, Type, apply, array_of, float_literal_set,
     int_literal_set, show, show_pred, vars_of,
 )
 
@@ -987,32 +988,36 @@ class Generator:
 
     def _gen_EProject(self, e: ast.EProject) -> Type:
         receiver = self.gen_expr(e.obj)
-        result = self.fresh()
-        self.emit(CPred(
-            Pred(HAS_PROJECTION, [TIndex(e.index), receiver, result]),
-            e.span, "read",
-        ))
-        return result
+        cls = projection_class(e.index)
+        self.classes.ensure_generated(cls)
+        self.emit(CPred(Pred(cls, [receiver]), e.span, "read"))
+        return TFam(projection_family(e.index), receiver,
+                    self.decls.families[projection_family(e.index)].res_kind)
 
     def gen_field(self, e: ast.EField, assigning: bool) -> Type:
-        """Emit `HasField "f" r a` for `r.f` and hand back the `a`.
+        """Emit `%HasField.f r` for `r.f` and hand back `%Field.f r`.
 
         Nothing is decided here. If the receiver turns out to be known the
-        solver discharges the predicate and unifies the result with the declared
-        field type; if not, the predicate waits, and may end up travelling in a
-        scheme. That is the whole of SPEC-DELTAS.md entry 7: the old code pruned
-        the receiver and demanded a record on the spot, which made `a.length`
-        mean different things depending on whether the walk had reached `a[0]`
-        yet.
+        solver finds the generated instance and the family reduces to the
+        declared field type; if not, the predicate waits, and may end up
+        travelling in a scheme. That is the whole of SPEC-DELTAS.md entry 7:
+        the old code pruned the receiver and demanded a record on the spot,
+        which made `a.length` mean different things depending on whether the
+        walk had reached `a[0]` yet.
+
+        The result is a *family application* rather than a fresh variable, and
+        that is what retires `Solver.improve`'s hand-written functional
+        dependency: two reads of `r.f` used to be two unrelated variables that
+        an improvement rule had to equate, and are now the same type
+        expression, which ordinary unification equates for free.
         """
         receiver = self.gen_expr(e.obj)
-        result = self.fresh()
-        self.emit(CPred(
-            Pred(HAS_FIELD, [TLabel(e.name), receiver, result]),
-            e.span,
-            "mutate" if assigning else "read",
-        ))
-        return result
+        cls = field_class(e.name)
+        self.classes.ensure_generated(cls)
+        self.emit(CPred(Pred(cls, [receiver]), e.span,
+                        "mutate" if assigning else "read"))
+        fam = field_family(e.name)
+        return TFam(fam, receiver, self.decls.families[fam].res_kind)
 
     def _gen_EUnary(self, e: ast.EUnary) -> Type:
         if e.fn is not None:

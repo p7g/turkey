@@ -40,7 +40,7 @@ import itertools
 from dataclasses import dataclass, field
 
 from . import ast
-from .classes import ClassTable, InstInfo, MethodInfo, match
+from .classes import ClassTable, is_generated, InstInfo, MethodInfo, match
 from .decls import substitute
 from .errors import Span, TypeError_
 from .types import Pred, Scheme, TBottom, Type, show_pred
@@ -249,6 +249,13 @@ class Elaborator:
         for insts in self.classes.instances.values():
             for inst in insts:
                 info = self.classes.classes[inst.cls]
+                if is_generated(inst.cls):
+                    # A generated field accessor has no superclasses and no
+                    # written body: `lower` builds `get` and `set` out of the
+                    # primitive `CField` the class is the interface to. There
+                    # is nothing here to complete.
+                    inst.plan = InstancePlan()
+                    continue
                 plan = inst.plan
                 scopes = (Scope(list(zip(plan.params, inst.context))),)
                 for sup in info.supers:

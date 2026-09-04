@@ -38,7 +38,9 @@ from .modules import ENTRY, SEP, Module, ModuleLoader
 from .resolve import Resolver
 from .core import CProgram
 from .typed import TypeTable
-from .types import Scheme, show, show_kind, show_pred, show_scheme
+from .coretc import Fams
+from .typed import reduce_deep
+from .types import Pred, Scheme, show, show_kind, show_pred, show_scheme
 
 
 @dataclass
@@ -138,9 +140,6 @@ def check(src: str, file: str | None = None,
     # Every layout the backend reads a field at has to be knowable, and this
     # is the program it is handed. See `mono.transparent_parameters`.
     mono.check_layouts(program_opt)
-    # And the field positions, which are a separate question from the widths
-    # and are not answered by sharing. See `mono.opaque_destructuring`.
-    mono.check_opaque_destructuring(program_opt)
     return Checked(
         entry.program, ordered, decls, classes, env, loader.order,
         entry.scope.values, main,
@@ -327,8 +326,27 @@ def _signatures(entry: Module, env: Env,
         for name in names:
             binding = env.lookup(name)
             if binding is not None:
-                out.append((name.rpartition(SEP)[2], binding.scheme))
+                out.append((name.rpartition(SEP)[2],
+                            _reduced(binding.scheme, classes)))
     return out
+
+
+def _reduced(scheme: Scheme, classes: ClassTable) -> Scheme:
+    """A scheme with its family applications reduced at every level.
+
+    A field access has the type `Field.n r`, and once `r` is a known record
+    that family *is* the field's type. The solver reduces at the head, which is
+    all unification compares; a signature is read whole, and a monomorphic
+    binding never passes through generalization at all, so the reduction that
+    a reader needs happens here. `turkey/typed.py` does the same for the types
+    the lowering writes into Core.
+    """
+    fams = Fams(classes)
+    return Scheme(
+        scheme.quantified, reduce_deep(scheme.body, fams),
+        [Pred(p.name, [reduce_deep(a, fams) for a in p.args])
+         for p in scheme.preds],
+    )
 
 
 # A Turkey program's recursion depth is its own business, and CPython's is not

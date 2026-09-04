@@ -48,10 +48,88 @@ from . import ast
 from .decls import DeclTable, FamilyInfo, substitute
 from .errors import Span, TypeError_
 from .types import (
-    EQUALS, KVar, Kind, Pred, Scheme, TApp, TCon, TFam, TFun, TTuple, TVar,
-    Type, default_kind, generalize, kind_of, prune, show, show_kind, show_pred,
-    spine, subterms, type_key, unify_kinds,
+    EQUALS, KVar, Kind, Pred, STAR, Scheme, TApp, TCon, TFam, TFun, TTuple,
+    TVar, Type, UNIT, default_kind, generalize, kind_of, prune, show,
+    show_kind, show_pred, spine, subterms, type_key, unify_kinds,
 )
+
+
+# ------------------------------------------------------- generated classes
+#
+# A field access is a class method, and the reason it did not look like one is
+# that `HasField l r a` has three arguments where a class has one. The label is
+# a compile-time constant and folds into the class's *name*; the field's type
+# is a function of the receiver, which is what an associated family is for. So
+# `r.cap` demands `%HasField.cap r` and has the type `%Field.cap r`, and both
+# the class and its instances are generated rather than written.
+#
+# This is what stops `HasField` being erased. A predicate the solver discharges
+# and throws away leaves a record-polymorphic body knowing a field's type and
+# not its position, which cannot be compiled and -- worse -- can be compiled
+# wrong, since `backend_lower.layout_of` answers `BOXED` for anything read out
+# of a receiver it does not know. As a class it carries a dictionary of
+# accessors instead, and the body is handed the offset rather than guessing it.
+#
+# Nothing ground pays for this. An instance below has no context, so wherever
+# specialization reaches the dictionary is ground, `mono`'s devirtualizer
+# hoists the accessor, and the inliner takes it -- the body is a single node --
+# leaving exactly the `CField` that used to be emitted directly.
+
+
+def field_class(label: str) -> str:
+    return f"%HasField.{label}"
+
+
+def field_family(label: str) -> str:
+    return f"%Field.{label}"
+
+
+def projection_class(index: int) -> str:
+    return f"%HasProjection.{index}"
+
+
+def projection_family(index: int) -> str:
+    return f"%Elem.{index}"
+
+
+def generated_label(cls: str) -> str | None:
+    """The field name a generated class accesses, if it is one of them."""
+    return cls[len("%HasField."):] if cls.startswith("%HasField.") else None
+
+
+def generated_index(cls: str) -> int | None:
+    """The position a generated projection class reads, if it is one."""
+    if not cls.startswith("%HasProjection."):
+        return None
+    return int(cls[len("%HasProjection."):])
+
+
+def field_family_owner(fam: str) -> str:
+    """The generated class a generated family belongs to, or the name itself.
+
+    `%Field.cap` is declared by `%HasField.cap` and `%Elem.0` by
+    `%HasProjection.0`, so the label is recoverable from either name.
+    """
+    if fam.startswith("%Field."):
+        return field_class(fam[len("%Field."):])
+    if fam.startswith("%Elem."):
+        return projection_class(int(fam[len("%Elem."):]))
+    return fam
+
+
+def is_generated(cls: str) -> bool:
+    return cls.startswith("%HasField.") or cls.startswith("%HasProjection.")
+
+
+def accessor(cls: str, which: str) -> str:
+    """The internal name of a generated class's method.
+
+    `#` and not `.`, because `lower._member_surface` splits on it: the
+    dictionary's field ends up called `get`, while the method's own name stays
+    unique across labels. `ClassTable.owner` is one flat namespace and rejects
+    a method declared twice, so every label needs its own pair.
+    """
+    return f"{cls}#{which}"
 
 
 @dataclass
@@ -510,7 +588,14 @@ class ClassTable:
         message and the right span.
         """
         arg = self.normalize(t.arg)
-        for inst in self.instances.get(self.decls.families[t.name].cls, []):
+        cls = self.decls.families[t.name].cls
+        if is_generated(cls):
+            # A generated class's instances are built on demand, and a family
+            # application is a demand: `Field.cap (Map k v)` is the first thing
+            # to ask about the record, and there is no predicate ahead of it to
+            # have created the instance already.
+            self.synthesize(Pred(cls, [arg]))
+        for inst in self.instances.get(cls, []):
             mapping = match(inst.head, arg)
             if mapping is not None:
                 return substitute(inst.families[t.name], mapping)
@@ -628,8 +713,116 @@ class ClassTable:
             out.extend(self.by_super(Pred(sup.name, list(p.args))))
         return out
 
+    # -- the generated classes ---------------------------------------------
+
+    def ensure_generated(self, cls: str) -> ClassInfo:
+        """Declare a field or projection class, once per label.
+
+        Built here rather than enumerated up front for two reasons. A label's
+        class has to exist before any signature mentioning it is read, and
+        eager registration would have to guess the order; and no pass can know
+        which tuple arities a program projects from. Generated on demand, a
+        class appears exactly when something asks for it.
+        """
+        found = self.classes.get(cls)
+        if found is not None:
+            return found
+        label = generated_label(cls)
+        var = TVar(1)
+        info = ClassInfo(cls, "r", var)
+        self.classes[cls] = info
+        fam = (field_family(label) if label is not None
+               else projection_family(generated_index(cls)))
+        self.decls.families[fam] = FamilyInfo(fam, cls, var.kind, KVar())
+        info.families[fam] = "r"
+        held = TFam(fam, var, self.decls.families[fam].res_kind)
+        pred = Pred(cls, [var])
+        members = [("get", TFun([var], held))]
+        if label is not None:
+            # Projections are read-only: `parser.py` rejects `x.0 = v`, so
+            # there is nothing for a setter to be the evidence of.
+            members.append(("set", TFun([var, held], UNIT)))
+        for which, ty in members:
+            name = accessor(cls, which)
+            info.methods[name] = MethodInfo(
+                name, cls, generalize(ty, 0, [pred]),
+                ast.FunDecl(None, name, [], None, None), var, {var.id: "r"},
+            )
+            self.owner[name] = cls
+        return info
+
+    def synthesize(self, p: Pred) -> InstInfo | None:
+        """The instance covering a generated class's demand, on demand.
+
+        Coherent by construction: one record type declares one field once, so
+        there is exactly one instance per head and nothing to overlap with.
+        That is why this bypasses `_check_instance` -- its coverage and orphan
+        rules exist to police what a *program* may declare.
+
+        One class has many instances, because many record types may declare a
+        field of the same name. They are keyed by head, and an instance is
+        built the first time its head is demanded.
+        """
+        cls = p.name
+        if not is_generated(cls):
+            return None
+        receiver = prune(p.args[0])
+        head, _ = spine(receiver)
+        label, index = generated_label(cls), generated_index(cls)
+
+        # The instance's head is the *general* one -- `Map k v`, not
+        # `Map String Int` -- so one instance covers every use. It is read off
+        # the constructor's own scheme, which is where those variables live.
+        if isinstance(head, TTuple):
+            if label is not None:
+                return None  # a tuple has positions, not field names
+            # Over fresh variables, not over the tuple that happened to be
+            # demanded first: one instance covers every 2-tuple, and giving it
+            # a concrete head would make it cover exactly one of them while
+            # still claiming the slot for the rest.
+            general: Type = TTuple([TVar(1) for _ in head.elems])
+            key: tuple[str, object] = ("tuple", len(head.elems))
+        elif isinstance(head, TCon):
+            info = self.decls.tycons.get(head.name)
+            if info is None or len(info.variants) != 1:
+                return None
+            body = info.variants[0].scheme.body
+            if not isinstance(body, TFun):
+                return None
+            general = body.ret
+            key = ("con", head.name)
+        else:
+            return None
+
+        for inst in self.instances.get(cls, []):
+            if inst.head_key == key:
+                return inst
+
+        if label is not None:
+            assert isinstance(head, TCon)
+            names = self.decls.record_fields(head.name)
+            if names is None or label not in names:
+                return None
+            held = self.decls.field_type(general, label)
+            fam = field_family(label)
+        else:
+            choices = (general.elems if isinstance(general, TTuple)
+                       else self.decls.projection_types(general))
+            if choices is None or index is None or index >= len(choices):
+                return None
+            held = choices[index]
+            fam = projection_family(index)
+
+        inst = InstInfo(cls, general, [],
+                        ast.InstanceDecl(None, cls, None, [], []), {},
+                        families={fam: held})
+        self.instances.setdefault(cls, []).append(inst)
+        return inst
+
     def by_inst(self, p: Pred) -> list[Pred] | None:
         """The obligations of the instance that covers `p`, or None if none does."""
+        if is_generated(p.name):
+            self.synthesize(p)
         for inst in self.instances.get(p.name, []):
             mapping = match(inst.head, p.args[0])
             if mapping is not None:
@@ -665,6 +858,15 @@ class ClassTable:
         for i, p in enumerate(preds):
             if not self.is_class(p.name):
                 if p.name == EQUALS and len(p.args) == 2:
+                    # `Field.tag a ~ Field.tag a` states nothing, and it is
+                    # not merely noise: as a given it is a rewrite rule from a
+                    # family application to itself, so `normalize`'s loop --
+                    # reduce until the head is no longer a family -- never
+                    # terminates. Two family applications are deferred while
+                    # their arguments differ and can become equal afterwards,
+                    # which is where these come from.
+                    if type_key(p.args[0]) == type_key(p.args[1]):
+                        continue
                     # Equality is symmetric.  Inference can encounter both
                     # directions when two associated families meet through a
                     # mutable local (`Item c ~ IndexItem c` and its reverse).

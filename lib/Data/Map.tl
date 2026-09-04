@@ -67,13 +67,14 @@ fun new() -> Map k v {
     }
 }
 
--- Annotated rather than inferred, and the annotation is load-bearing. Left to
--- inference, `m` is a bare type variable carrying `HasField "cap" m Int`, and
--- `HasField` is discharged by the solver and *erased*: nothing is passed for
--- it. A record-polymorphic body therefore knows a field's type and not its
--- position, so it can only be compiled once its receiver is a known record --
--- which happens when specialization reaches it, and stops happening on a
--- program large enough for item 6's cap to bind. See FINDINGS 45.
+-- Annotated rather than inferred, and deliberately. Left to inference `m` is a
+-- bare type variable and this is record-polymorphic, which now *compiles* --
+-- `HasField` is a class and the body is handed accessors -- but costs more
+-- than it is worth here. A field's type is `Field.table m`, which says nothing
+-- about the `Entry` constructors below, so the `match` cannot be checked for
+-- exhaustiveness and every access goes through a dictionary that
+-- specialization has to remove again. The receiver is a `Map` at every call
+-- site, so saying so loses nothing. See FINDINGS 45.
 fun findSlot[Eq k](m : Map k v, h : Int, key : k, isSearching : Bool) -> Int {
     -- `Int.mod`, not `%`. A 64-bit hash is signed and half of them are
     -- negative, and `%` is *remainder*: it takes the sign of the dividend, so

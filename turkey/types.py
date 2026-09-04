@@ -387,7 +387,20 @@ BOTTOM = TBottom()
 
 def short_name(name: str) -> str:
     """The part of an internal name a reader wrote. See `turkey/modules.py`,
-    which owns the `#` separator this splits on."""
+    which owns the `#` separator this splits on.
+
+    The generated field and projection names are the exception. `%HasField.cap`
+    and `%Field.cap` are one class and one family *per label*, which is how the
+    label rides in a single-parameter class; but a reader wrote `r.cap`, not a
+    class name, so they print as the predicate and the family a reader would
+    recognise: `HasField "cap" r` and `Field.cap r`.
+    """
+    if name.startswith("%HasField."):
+        return f'HasField "{name[len("%HasField."):]}"'
+    if name.startswith("%HasProjection."):
+        return f"HasProjection {name[len('%HasProjection.'):]}"
+    if name.startswith("%Field.") or name.startswith("%Elem."):
+        return name[1:]
     return name.rpartition("#")[2]
 
 
@@ -750,7 +763,16 @@ def normalize(t: Type, fams: Families | None) -> Type:
         reduced = fams.reduce(t)
         if reduced is None:
             return t
-        t = prune(reduced)
+        reduced = prune(reduced)
+        if type_key(reduced) == type_key(t):
+            # A rule that rewrites a family application to itself is stuck,
+            # not progress. `classes.simplify` drops the reflexive equations
+            # that produce one, so this should be unreachable; it is here so
+            # that a rule which fails to make progress costs an answer rather
+            # than the compiler, which is what it cost when a retained
+            # `Field.tag a ~ Field.tag a` reached `Fams.reduce`.
+            return t
+        t = reduced
     return t
 
 

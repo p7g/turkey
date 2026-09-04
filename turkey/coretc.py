@@ -386,8 +386,8 @@ class Checker:
         return self.record_field(target, e.name, e.span, e.ty)
 
     def _check_CProject(self, e: CProject, env: Env) -> Type:
-        target = prune(self.check(e.target, env))
-        if isinstance(target, (TVar, TBottom)):
+        target = self.reduce(prune(self.check(e.target, env)))
+        if isinstance(target, (TVar, TFam, TBottom)):
             return e.ty
         choices = target.elems if isinstance(target, TTuple) else self.decls.projection_types(target)
         if choices is None or e.index >= len(choices):
@@ -397,8 +397,8 @@ class Checker:
     def record_field(self, target: Type, name: str, span: Span | None,
                      erased: Type | None = None) -> Type:
         """A field of a single-variant record."""
-        head, args = spine(prune(target))
-        if isinstance(head, TVar) or isinstance(head, TBottom):
+        head, args = spine(self.reduce(prune(target)))
+        if isinstance(head, (TVar, TFam, TBottom)):
             # The lowering kept the type inference gave it; if that is still a
             # variable the field was resolved by a `HasField` the solver
             # discharged and erased, and there is nothing left here to check.
@@ -777,7 +777,11 @@ class Fams:
     def reduce(self, t):
         key = type_key(t)
         for left, right in self.equations:
-            if type_key(left) == key:
+            # A rule from a family application to itself is no rule. Skipped
+            # rather than returned, so the instance table still gets its turn:
+            # returning it would leave `Field.tag Auto` unreduced next to the
+            # `Int` it is, and stop the comparison that needs them equal.
+            if type_key(left) == key and type_key(right) != key:
                 return right
         return self.classes.reduce_fam(t)
 

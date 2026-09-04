@@ -583,7 +583,7 @@ six layouts and infinitely many types. The refusal is the right thing to do
 until that exists; it is not a thing `boot` can be written around.
 
 ### 45. `HasField` is erased, so a record-polymorphic body cannot be compiled
-**design, open (guarded).** M25. `mono.transparent_parameters` holds that a
+**design, fixed.** M25. `mono.transparent_parameters` holds that a
 bare `a` parameter is always safe, "because that is parametricity": a generic
 body may hold an abstracted value and pass it on, and nothing else.
 
@@ -655,12 +655,69 @@ than a follow-up. The accessor bodies must also be built directly in Core:
 written in the surface language, `fun get(r) = r.cap` demands its own
 `HasField` and regresses.
 
-Guarded rather than fixed, for now: `mono.check_opaque_destructuring` refuses
-these bodies instead of compiling them, so the miscompile is not reachable.
-The two that `boot` needed -- `Data.Map#findSlot` and `#resize` -- are
-annotated in `lib/Data/Map.tl`, which is what a user has to do today and is
-why the annotation carries a comment saying it is load-bearing. Both the
-guard and the annotations come out when the class arrives.
+**Done.** The class is generated per label, the instances per record type, and
+both on demand -- a label's class has to exist before any signature mentioning
+it is read, and no pass can know in advance which tuple arities a program
+projects from. `mono.check_opaque_destructuring` is gone, because what it
+guarded against cannot happen: there is no body that reads a field without
+evidence for reading it.
+
+Nothing ground pays for it, which was the thing to check rather than assume.
+Every `.core`, `.mono` and `.opt` golden is byte-identical: the instance has no
+context, so wherever specialization reaches, the dictionary is ground,
+`mono`'s devirtualizer hoists the accessor, and the inliner takes it -- the
+body is one node -- leaving exactly the `CField` that used to be emitted
+directly.
+
+Two things it cost, and both are worth recording.
+
+**A family does not propagate the way a unified variable did.** `HasField "pos" a Int`
+put `Int` in the predicate's third argument, so an assignment to the field
+unified a *variable* with `Int` and everything downstream knew it. `Field.pos a ~ Int`
+is an equality, and an equality does not substitute. So `bf.tl`'s `move` picked
+up `Add (Field.pos a)`, `Ord (Field.pos a)` and `Length (Field.data a)` that
+used to discharge, and an un-annotated `Data.Map#resize` has a `match` reported
+non-exhaustive -- not because the scrutinee is really unknown, but because the
+equality that says what it is never reaches the exhaustiveness check.
+
+That is the capability `Solver.improve`'s hand-written functional dependency
+was buying, and writing it off as free was wrong. The fix is that a wanted
+equality on a stuck family is a rewrite -- GHC's wanteds-rewrite-wanteds --
+and the reason it is not done here is that three places normalize
+independently: `_class` through the class table, exhaustiveness through the
+recorded type, and `Elaborator.resolve` through its own. Teaching only the
+first made solving accept `Add (Field.pos a)` and elaboration then fail to
+find evidence for it. One normalization, equalities included, used by all
+three, is the shape of it.
+
+`lib/Data/Map.tl` keeps its two annotations for that reason, but they are a
+choice now rather than a workaround: the receiver is a `Map` at every call
+site, so saying so costs nothing and keeps both the exhaustiveness check and
+the specialization sharp.
+
+### 46. A reflexive equation makes family reduction spin
+**bug, fixed.** M25, found by `test_a_field_of_a_record_polymorphic_target_keeps_its_inferred_type`
+-- a recursive record type accessed record-polymorphically, which is exactly
+the program that has two demands for one field of two receivers.
+
+`Field.tag a ~ Field.tag a` reaches a binding's `equations`. Two family
+applications are deferred while their arguments differ, and the arguments can
+become equal afterwards; nothing dropped the equation once they had. As a
+*given* it is a rewrite rule from a family application to itself, so
+`types.normalize` -- reduce at the head until the head is no longer a family --
+never terminates. The compiler did not crash or report anything; it spun, in
+`mono`, on a program the suite had been checking all along.
+
+Three changes, and each is a different kind of guard. `classes.simplify` drops
+an equation whose sides are already equal, since it states nothing.
+`Fams.reduce` and `Solver.reduce` *skip* such a rule rather than returning it,
+so the instance table still gets its turn -- returning it left `Field.tag Auto`
+sitting next to the `Int` it is, and the comparison that needed them equal
+failed. And `normalize` stops when a rule hands back what it was given, so a
+reducer that fails to make progress costs an answer rather than the compiler.
+
+It was reachable before this milestone: associated families have always been
+able to produce one. Making field access a family is what found it.
 
 ### 24. `Data.Set` is not one of the modules the Prelude re-exports
 **library.** M21. `Array`, `Map`, `Option` and eight others arrive

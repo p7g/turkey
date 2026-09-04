@@ -1053,61 +1053,6 @@ def transparent_parameters(program: CProgram) -> list[tuple[str, str, Type]]:
     return found
 
 
-def opaque_destructuring(program: CProgram) -> list[tuple[str, str]]:
-    """Where a generic body reads a field off a type it cannot know.
-
-    `transparent_parameters` says a bare `a` parameter is always fine, because
-    a body may hold an abstracted value and pass it on and nothing else. That
-    is parametricity, and `HasField` is the exception to it: a record-
-    polymorphic binding *does* take an `a` apart, and the predicate that
-    licenses it is discharged by the solver and **erased** -- nothing is passed
-    for it, so the body knows the field's type and not its position.
-
-    Specialization hides this whenever it reaches such a binding, because the
-    receiver becomes a known record. On a program large enough for item 6's
-    cap to bind it does not, and what is left cannot be compiled: the field's
-    index is unknown, and so is its type, so `layout_of` answers `BOXED` for
-    everything read out of it. `Data.Map#findSlot` was the case -- unannotated,
-    so inference gave it `HasField "cap" m Int` -- and its `m.table` would have
-    been indexed at the boxed width whatever the elements were actually
-    written at.
-
-    Layout sharing cannot fix this and is not asked to: a layout is a width and
-    a pointer bit, and what is missing here is an offset and an element type.
-    Both come back the moment the receiver's *head* is known, which is the
-    shape of the real fix -- specialize one level on the head constructor,
-    with fresh variables underneath, which terminates because the head is
-    stable where the type is not. Until that exists this is refused rather
-    than compiled wrong. See FINDINGS 45.
-    """
-    binds = {bind.name: bind for bind in program.dicts + program.binds}
-    found: list[tuple[str, str]] = []
-
-    for name in sorted(binds):
-        bind = binds[name]
-        if not bind.binders:
-            continue
-        abstracted = {variable.id for variable in bind.binders}
-
-        def walk(node) -> None:
-            if isinstance(node, (CField, CProject, CIndex)) and node.target:
-                head, _ = spine(prune(node.target.ty))
-                if isinstance(head, TVar) and head.id in abstracted:
-                    label = (node.name if isinstance(node, CField)
-                             else f"element {node.index}"
-                             if isinstance(node, CProject) else "an element")
-                    found.append((name, label))
-            if isinstance(node, (CExpr, CAlt, CBind)):
-                for f in fields(node):
-                    walk(getattr(node, f.name))
-            elif isinstance(node, (list, tuple)):
-                for item in node:
-                    walk(item)
-
-        walk(bind.value)
-    return found
-
-
 def check_layouts(program: CProgram) -> None:
     """Refuse to compile a program whose layouts cannot all be known.
 
@@ -1123,19 +1068,6 @@ def check_layouts(program: CProgram) -> None:
     raise Unsupported(
         f"monomorphization left a generic body able to destructure "
         f"polymorphic data, whose layout it cannot know: {detail}")
-
-
-def check_opaque_destructuring(program: CProgram) -> None:
-    """Refuse a record-polymorphic body. See `opaque_destructuring`."""
-    leaks = opaque_destructuring(program)
-    if not leaks:
-        return
-    detail = "; ".join(f"{name} reads {field}" for name, field in leaks)
-    raise Unsupported(
-        f"a generic body reads a field of a type it cannot know, because the "
-        f"`HasField` that licensed it is erased: {detail}")
-
-
 def monomorphize(program: CProgram, decls: DeclTable, classes: ClassTable,
                  main: str = "main") -> CProgram:
     """Specialize, devirtualize, again, and then drop what nothing reaches.

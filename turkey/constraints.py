@@ -78,15 +78,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .classes import ClassTable
+from .classes import (ClassTable, field_family_owner, generated_index,
+                      generated_label, is_generated)
 from .decls import DeclTable
 from .evidence import Abstraction, Scope, Use, dict_name
 from .errors import Span, TypeError_
+from .typed import reduce_deep
 from .types import (
     EQUALS, INT, NO_SCOPE, Pred, Scheme, TBottom, TCon, TFam, TIndex, TLabel, TSet, TTuple, TVar,
     Type,
     generalize, instantiate_qual, mono, numeric_order, numeric_type, prune, show,
-    show_pred, sort_numeric, spine, type_key, unify, vars_of,
+    short_name, show_pred, sort_numeric, spine, type_key, unify, vars_of,
 )
 
 HAS_FIELD = "HasField"
@@ -342,7 +344,9 @@ class Solver:
         """
         key = type_key(t)
         for pred in self.assumptions:
-            if pred.name == EQUALS and type_key(pred.args[0]) == key:
+            # Reflexive rules are skipped, not returned; see `coretc.Fams`.
+            if (pred.name == EQUALS and type_key(pred.args[0]) == key
+                    and type_key(pred.args[1]) != key):
                 return pred.args[1]
         return self.classes.reduce_fam(t)
 
@@ -548,7 +552,14 @@ class Solver:
                 own = [p for p in _constrain(retained, ty)
                        if not self.classes.is_class(p.name)]
                 preds = self.classes.simplify(own + shared)
-                binding = Binding(generalize(ty, self.rank, preds), False)
+                # Reduced at every level, not just the head. A field access
+                # has the type `Field.n r`, and once `r` is a known record
+                # that family *is* the field's type -- leaving it unreduced
+                # would put machinery in a signature a reader has to read.
+                # Head-only reduction is right for unification and not for
+                # anything that reads a type whole, which a scheme is.
+                binding = Binding(
+                    generalize(reduce_deep(ty, self), self.rank, preds), False)
                 if c.dicts is not None:
                     # Recorded here because here is the only place it exists.
                     # A local binding's scheme goes into an environment that is
@@ -652,16 +663,6 @@ class Solver:
         """
         self.improve_numeric()
         self.improve_families()
-        seen: dict[tuple, Type] = {}
-        for c in self.deferred:
-            if c.pred.name not in (HAS_FIELD, HAS_PROJECTION):
-                continue
-            selector, receiver, result = c.pred.args
-            key = (c.pred.name, type_key(selector), type_key(receiver))
-            if key in seen:
-                unify(seen[key], result, c.span, "a field access", self)
-            else:
-                seen[key] = result
 
     def improve_families(self) -> None:
         """Equate the answers of two equalities on one family application.
@@ -696,10 +697,6 @@ class Solver:
         """
         if c.pred.name == EQUALS:
             return self._equals(c)
-        if c.pred.name == HAS_FIELD:
-            return self._has_field(c)
-        if c.pred.name == HAS_PROJECTION:
-            return self._has_projection(c)
         if c.pred.name == ONE_OF:
             return self._one_of(c)
         if self.classes.is_class(c.pred.name):
@@ -767,6 +764,8 @@ class Solver:
             return False
         obligations = self.classes.by_inst(pred)
         if obligations is None:
+            if is_generated(pred.name):
+                self._no_field(pred, t, c)
             raise TypeError_(f"no instance for '{show_pred(pred)}'", c.span)
         # The instance's own context becomes this site's, over the types the
         # match supplied: `Eq (Array a)` leaves `Eq a` behind.
@@ -774,70 +773,47 @@ class Solver:
             self.solve(CPred(q, c.span, c.context))
         return True
 
-    def _has_field(self, c: CPred) -> bool:
-        label, receiver, result = c.pred.args
-        assert isinstance(label, TLabel)
-        receiver = self.classes.normalize(receiver)
+    def _no_field(self, pred: Pred, receiver: Type, c: CPred) -> None:
+        """Why a generated field or projection class has no instance.
 
-        if isinstance(receiver, (TVar, TFam)):
-            return False  # nothing known about the receiver yet
-
-        if isinstance(receiver, TBottom):
-            # Bottom is absorbed by whatever it meets, so it satisfies any
-            # field demand vacuously -- there is no value to read one from.
-            return True
-
-        # Applied and nullary record types are both decided by their head.
+        Ordinary instance resolution would say "no instance for
+        `%HasField.cap Int`", which names a class the programmer cannot see and
+        did not write. These are the messages the structural discharge used to
+        produce, kept word for word: the class is an implementation of field
+        access, so its failures have to read as field errors.
+        """
+        label, index = generated_label(pred.name), generated_index(pred.name)
         head, _ = spine(receiver)
-        if isinstance(head, TCon):
-            names = self.decls.record_fields(head.name)
-            if names is not None:
-                if label.name not in names:
+        if label is not None:
+            if isinstance(head, TCon):
+                names = self.decls.record_fields(head.name)
+                if names is not None and label not in names:
                     raise TypeError_(
-                        f"type '{head.name}' has no field '{label.name}' "
+                        f"type '{head.name}' has no field '{label}' "
                         f"(it has: {', '.join(names)})",
                         c.span,
                     )
-                unify(result, self.decls.field_type(receiver, label.name),
-                      c.span, "a field access", self)
-                return True
-
-        raise TypeError_(
-            f"cannot {c.context} field '{label.name}': '{show(receiver)}' is not "
-            f"a single-variant record type. Multi-variant types are immutable "
-            f"and are taken apart with 'match'.",
-            c.span,
-        )
-
-    def _has_projection(self, c: CPred) -> bool:
-        selector, receiver, result = c.pred.args
-        assert isinstance(selector, TIndex)
-        receiver = self.classes.normalize(receiver)
-        if isinstance(receiver, (TVar, TFam)):
-            return False
-        if isinstance(receiver, TBottom):
-            return True
-        choices: list[Type] | None = None
-        if isinstance(receiver, TTuple):
-            choices = receiver.elems
-        else:
-            choices = self.decls.projection_types(receiver)
+            raise TypeError_(
+                f"cannot {c.context} field '{label}': '{show(receiver)}' is not "
+                f"a single-variant record type. Multi-variant types are "
+                f"immutable and are taken apart with 'match'.",
+                c.span,
+            )
+        assert index is not None
+        choices = (receiver.elems if isinstance(receiver, TTuple)
+                   else self.decls.projection_types(receiver))
         if choices is None:
             raise TypeError_(
-                f"cannot project position {selector.value} from '{show(receiver)}': "
+                f"cannot project position {index} from '{show(receiver)}': "
                 "numeric projection requires a tuple or an immutable type with "
                 "exactly one positional constructor",
                 c.span,
             )
-        if selector.value >= len(choices):
-            raise TypeError_(
-                f"projection index {selector.value} is out of bounds for "
-                f"'{show(receiver)}', which has {len(choices)} element(s)",
-                c.span,
-            )
-        unify(result, choices[selector.value], c.span, "a numeric projection", self)
-        return True
-
+        raise TypeError_(
+            f"projection index {index} is out of bounds for "
+            f"'{show(receiver)}', which has {len(choices)} element(s)",
+            c.span,
+        )
     def _one_of(self, c: CPred) -> bool:
         """`OneOf t {...}`: `t` must be one of a closed set of built-in types.
 
@@ -987,7 +963,24 @@ class Solver:
             fam = left if isinstance(left, TFam) else right
             other = right if fam is left else left
             assert isinstance(fam, TFam)
-            cls = self.classes.decls.families[fam.name].cls
+            # A generated field family is machinery, not something a context
+            # can state: a reader wrote `r.n` and cannot write
+            # `Field.n r ~ Int`. So it keeps the message the stranded
+            # `HasField` predicate used to give, which names what was written.
+            label = generated_label(field_family_owner(fam.name))
+            if label is not None:
+                raise TypeError_(
+                    f"cannot determine the type of the value whose field "
+                    f"'{label}' is being accessed. Add a type annotation.",
+                    c.span,
+                )
+            index = generated_index(field_family_owner(fam.name))
+            if index is not None:
+                raise TypeError_(
+                    f"cannot determine the type of the value being projected "
+                    f"at position {index}. Add a type annotation.", c.span,
+                )
+            cls = short_name(self.classes.decls.families[fam.name].cls)
             where = f" in {c.context}" if c.context else ""
             # Name the remedy, the way the other two branches below do. Since
             # delta 39 that remedy is no longer "add a type annotation": an
@@ -1002,20 +995,18 @@ class Solver:
                 f"'{cls}' instance defines it. Add '{equality}' to the context.",
                 c.span,
             )
-        if c.pred.name == HAS_FIELD:
-            label = c.pred.args[0]
-            assert isinstance(label, TLabel)
+        if generated_label(c.pred.name) is not None:
             raise TypeError_(
                 f"cannot determine the type of the value whose field "
-                f"'{label.name}' is being accessed. Add a type annotation.",
+                f"'{generated_label(c.pred.name)}' is being accessed. "
+                f"Add a type annotation.",
                 c.span,
             )
-        if c.pred.name == HAS_PROJECTION:
-            selector = c.pred.args[0]
-            assert isinstance(selector, TIndex)
+        if generated_index(c.pred.name) is not None:
+            index = generated_index(c.pred.name)
             raise TypeError_(
                 f"cannot determine the type of the value being projected at "
-                f"position {selector.value}. Add a type annotation.", c.span,
+                f"position {index}. Add a type annotation.", c.span,
             )
         raise TypeError_(
             f"cannot determine a type satisfying '{show_pred(c.pred, free_prefix="")}'. "

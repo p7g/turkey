@@ -445,7 +445,7 @@ own finding about what the goldens cover.
 the honest translation of a question whose answer is decided.
 
 ### 43. The new inliner does not finish on a program the size of the compiler
-**performance, open.** M24, after rebasing onto the LLVM backend. `turkey`
+**performance, fixed.** M24, after rebasing onto the LLVM backend. `turkey`
 cannot compile `boot` at all any more. Measured, with a 2 GB stack and no
 recursion limit worth speaking of: 125,459 reductions in 472 seconds, at a
 flat ~250 a second, and then a `RecursionError`. The same check under the
@@ -473,22 +473,74 @@ chain of first-time expansions stacks a full traversal per link. There is no
 rewrite cycle -- no node reached even 400 rounds of its own fixpoint -- so this
 is depth, not divergence.
 
-The shape of a fix is not this milestone's to choose, but the three that
-present themselves are: reduce bodies in dependency order (`deps.sccs` already
-emits it) so `body_of` is a lookup rather than a nested traversal; do not
-re-walk a subtree after a rewrite that only rearranged already-reduced terms;
-and a global tick limit, as GHC's simplifier has, so that a program too large
-to finish optimizing still compiles.
+**What it actually was.** The first two measurements above are true and were
+not the cause; the third was, and it was worse than "depth". Reducing
+top-level bindings in dependency order fixed the part it describes -- 472
+seconds to 52, and the deepest chain of nested body reductions from the height
+of the call graph down to nine -- and `boot` still could not be compiled.
+
+The measurements that found the rest, each contradicting a plausible story:
+
+* Not a rewrite cycle. No node reached 200 rounds of its own fixpoint.
+* Not speculation. With `SPECULATIVE_INLINE_LIMIT` lowered to refuse it
+  outright, the overflow is unchanged.
+* Not the input. `mono` hands `opt` 2,123 bindings, 106,294 nodes, deepest
+  term 96 levels. During reduction one term passes 440,000 levels -- deeper
+  than the whole input program has nodes.
+* Not recursion through the rules. In a 1.9-million-frame stack there is
+  exactly one `inline` frame and one `step` frame. The rest is a single flat
+  descent into one enormous term.
+
+The term is `Turkey.Desugar#thread`: fifty nodes, in a twenty-one binding
+cycle with `#expr`, the desugarer's whole expression walker. `inline` asked
+`body_of` for each of the other twenty *while inside* `thread`'s own walk, and
+then refused most of them on size -- 74,073 inlinings, every reduction in the
+trace, and then the stack. Both halves of that are work done before the
+question that would have made it unnecessary:
+
+* the ceiling was asked of the *reduced* body, so a callee too large to inline
+  was fully optimized at every call site that named it, and the answer thrown
+  away. Asked of the body as written it costs nothing observable: across the
+  3,393 inlines the conformance suite performs, the largest body inlined is
+  fifty nodes as written, and reduction never shrinks one by more than a
+  quarter, against a ceiling of 128. It is the size question GHC asks, whose
+  unfolding guidance is computed from the term as written.
+* a cold callee was reduced nested inside its caller. With bindings reduced in
+  dependency order, a cold monomorphic callee is one in the caller's own cycle
+  whose turn has not come. Declining it leaves a cycle's members inlined into
+  each other in the order `deps.sccs` already sorts them into -- the same
+  arbitrary-but-stable choice the loop breaker makes.
+
+`turkey opt boot/Main.tl` finishes in 44 seconds, and no golden moves: the
+whole corpus reaches neither declined case.
+
+Two things are left. Speculation restores its flag to what it was rather than
+to `False` -- clearing it on the way out of an inner speculation re-armed the
+outer one -- which was a real bug and not the cause of anything measured here.
+And an instantiated key is still exempt from the second rule, because
+`reduce_program` warms no key that names type arguments; warming those through
+a request queue, as `mono` already has, would remove the exemption rather than
+state it.
+
+The third candidate fix, a global tick limit, is rejected rather than
+deferred. It makes the output depend on traversal order and on program size,
+which would break M26's claim outright: `stage2.c` and `stage3.c` are the same
+program compiled by two hosts, and a budget exhausted at a different point in
+two different walks gives two different programs. It also answers "is this
+reduction worth doing" with "was it early".
 
 ### 44. The layout invariant refuses the bootstrap compiler
-**design, open.** M25's problem, arriving early. With the old cost model
-`boot` gets far enough to reach `mono.check_layouts`, and is refused:
+**design, open.** M25's problem, arriving early. Once `opt` finishes (43),
+`boot` reaches `mono.check_layouts` and is refused:
 
 ```
 monomorphization left a generic body able to destructure polymorphic data,
-whose layout it cannot know: grow takes xs : Array a; map takes xs : Array a;
-map takes f : fun(a) -> b; push takes xs : Array a
+whose layout it cannot know: push takes xs : Array a
 ```
+
+One leak, down from the four the old cost model left (`grow`, `map` twice and
+`push`) -- the stronger inliner removes three of them, and cannot remove the
+last.
 
 Nothing in `tests/programs` violates it, and the commit that added the check
 says why: specialization stops the generic `Data.Array#grow` and `#push` from

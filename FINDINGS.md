@@ -669,28 +669,8 @@ context, so wherever specialization reaches, the dictionary is ground,
 body is one node -- leaving exactly the `CField` that used to be emitted
 directly.
 
-Two things it cost, and both are worth recording.
-
-**A family does not propagate the way a unified variable did.** `HasField "pos" a Int`
-put `Int` in the predicate's third argument, so an assignment to the field
-unified a *variable* with `Int` and everything downstream knew it. `Field.pos a ~ Int`
-is an equality, and an equality does not substitute. So `bf.tl`'s `move` picked
-up `Add (Field.pos a)`, `Ord (Field.pos a)` and `Length (Field.data a)` that
-used to discharge, and an un-annotated `Data.Map#resize` has a `match` reported
-non-exhaustive -- not because the scrutinee is really unknown, but because the
-equality that says what it is never reaches the exhaustiveness check.
-
-That is the capability `Solver.improve`'s hand-written functional dependency
-was buying, and writing it off as free was wrong. The fix is that a wanted
-equality on a stuck family is a rewrite -- GHC's wanteds-rewrite-wanteds --
-and the reason it is not done here is that three places normalize
-independently: `_class` through the class table, exhaustiveness through the
-recorded type, and `Elaborator.resolve` through its own. Teaching only the
-first made solving accept `Add (Field.pos a)` and elaboration then fail to
-find evidence for it. One normalization, equalities included, used by all
-three, is the shape of it.
-
-`lib/Data/Map.tl` keeps its two annotations for that reason, but they are a
+What it cost is entry 47, which arrived with the fix rather than surviving it.
+`lib/Data/Map.tl` keeps its two annotations because of that, but they are a
 choice now rather than a workaround: the receiver is a `Map` at every call
 site, so saying so costs nothing and keeps both the exhaustiveness check and
 the specialization sharp.
@@ -718,6 +698,41 @@ reducer that fails to make progress costs an answer rather than the compiler.
 
 It was reachable before this milestone: associated families have always been
 able to produce one. Making field access a family is what found it.
+
+### 47. A wanted equality on a family is not used as a rewrite
+**bug, open.** M25, and a regression that arrived with entry 45 rather than
+one it failed to fix.
+
+`HasField "pos" a Int` put the field's type in the predicate's third argument,
+so an assignment to the field unified a *variable* with `Int` and everything
+downstream knew it. `Field.pos a ~ Int` says the same thing and does not
+substitute, because a family application is not a variable. Two symptoms, one
+cause:
+
+* `bf.tl`'s `move` retains `Add (Field.pos a)`, `Ord (Field.pos a)` and
+  `Length (Field.data a)`, which used to discharge. They are correct, and they
+  are three dictionaries a caller now passes for nothing.
+* an un-annotated `Data.Map#resize` has its `match` reported non-exhaustive.
+  The scrutinee is *not* opaque: matching `Empty` is what contributes the
+  equality that says which type it is. Exhaustiveness reads the recorded type
+  without applying that equality and concludes it knows no constructors.
+
+Neither rejects a valid program today -- the first costs speed in unspecialized
+code, the second is a warning -- but the second is a false report, which is
+worse than either.
+
+This is the capability `Solver.improve`'s hand-written functional dependency
+was buying, and writing it off as free (entry 45) was wrong. The fix is
+GHC's rule that a wanted equality rewrites other wanteds. What makes it more
+than a one-line change is that three places normalize independently:
+`Solver._class` through the class table, exhaustiveness through the type the
+inferencer recorded, and `Elaborator.resolve` through its own. Teaching only
+the first is not a partial fix but a broken one -- solving then accepts
+`Add (Field.pos a)` and elaboration fails with "no evidence for
+'Add (Field.pos _a)', which solving had already accepted". It wants one
+normalization that includes the equalities in scope, used by all three, which
+also means the equality set has to reach elaboration: it is known per binding
+at generalization, and the `Use` recorded at each site is where it would ride.
 
 ### 24. `Data.Set` is not one of the modules the Prelude re-exports
 **library.** M21. `Array`, `Map`, `Option` and eight others arrive

@@ -608,18 +608,59 @@ hazard `check_layouts` exists to prevent, in the one case it was not looking
 at.
 
 Layout sharing cannot fix it and is not asked to: a layout is a width and a
-pointer bit, and what is missing is an offset and an element type. Both come
-back the moment the receiver's *head* is known, which is the shape of the real
-fix -- specialize one level on the head constructor with fresh variables
-underneath, which terminates for the same reason layout sharing does, since
-the head is stable where the type is not (`Pair a` and `Pair (Pair a)` are both
-`Pair`).
+pointer bit, and what is missing is an offset and an element type.
 
-Guarded rather than fixed: `mono.check_opaque_destructuring` now refuses these
-bodies instead of compiling them, so the miscompile is not reachable. The two
-that `boot` needed -- `Data.Map#findSlot` and `#resize` -- are annotated in
-`lib/Data/Map.tl`, which is what a user has to do today and is why the
-annotation carries a comment saying it is load-bearing.
+**The fix is to stop erasing it.** A field access is a class method, and the
+reason it did not look like one is that `HasField l r a` has three arguments
+where a class has one. The label is a compile-time constant and folds into the
+name; the field type is a *function* of the receiver, which is what an
+associated type family is for. So the encoding is one generated
+single-parameter class per label:
+
+```
+class %HasField.cap r { type %Field.cap
+                        get : fun(r) -> %Field.cap r
+                        set : fun(r, %Field.cap r) -> Unit }
+```
+
+with a generated instance per record type declaring that field. Nothing in the
+dictionary machinery widens: `dict_parts` finds a real class, the dictionary is
+an ordinary one-argument `%Dict.%HasField.cap r`, devirtualization hoists
+`%inst.%HasField.cap.Map#get`, and the inliner collapses it back to a direct
+field load wherever the receiver is known -- the path `Ord Int`'s `lt` already
+takes. `transparent_parameters` then exempts the dictionary parameter by the
+rule it already has, and a record-polymorphic body compiles because it is
+handed accessors rather than being expected to guess an offset.
+
+It **removes** machinery rather than adding it. `Solver.improve`'s
+`HAS_FIELD`/`HAS_PROJECTION` branch exists to enforce the fundep `l r -> a` by
+hand -- two stuck demands on the same label and receiver are made to agree, or
+two reads of `m.cap` on an unknown `m` would generalize to unrelated variables.
+With the family both reads have the type `%Field.cap r`, the same type
+expression, so ordinary unification does it and the branch goes. That is the
+position `classes.py` already states in its header -- "an associated type
+family makes the second parameter unnecessary" -- and it keeps the fundep out
+of the language, where it belongs.
+
+The uniform version is the one to build: making only *retained* `HasField`
+predicates carry dictionaries would leave two lowering paths for field access
+and a class generated on demand, which is the kind of special case that rots.
+The cost to watch is diagnostics -- `_has_field` produces "type 'Box' has no
+field 'cap' (it has: ...)" and "'Int' is not a single-variant record type.
+Multi-variant types are immutable and are taken apart with 'match'", which
+ordinary instance resolution would render as "no instance for
+`%HasField.cap Int`". Several `err_*` goldens cover those, so the generated
+classes need their own diagnostic path, and that is part of the work rather
+than a follow-up. The accessor bodies must also be built directly in Core:
+written in the surface language, `fun get(r) = r.cap` demands its own
+`HasField` and regresses.
+
+Guarded rather than fixed, for now: `mono.check_opaque_destructuring` refuses
+these bodies instead of compiling them, so the miscompile is not reachable.
+The two that `boot` needed -- `Data.Map#findSlot` and `#resize` -- are
+annotated in `lib/Data/Map.tl`, which is what a user has to do today and is
+why the annotation carries a comment saying it is load-bearing. Both the
+guard and the annotations come out when the class arrives.
 
 ### 24. `Data.Set` is not one of the modules the Prelude re-exports
 **library.** M21. `Array`, `Map`, `Option` and eight others arrive

@@ -341,7 +341,19 @@ def _reduced(scheme: Scheme, classes: ClassTable) -> Scheme:
     a reader needs happens here. `turkey/typed.py` does the same for the types
     the lowering writes into Core.
     """
-    fams = Fams(classes)
+    # Without the wanted rules: a scheme's own equation must print as it was
+    # retained, and `Container.Elem c ~ Int` reduced by the rule it supplied
+    # prints as `Int ~ Int`, which says nothing and hides what the caller has
+    # to prove. See `ClassTable.settled`.
+    was = classes.rules_apply
+    classes.rules_apply = False
+    try:
+        return _reduce_scheme(scheme, Fams(classes))
+    finally:
+        classes.rules_apply = was
+
+
+def _reduce_scheme(scheme: Scheme, fams) -> Scheme:
     return Scheme(
         scheme.quantified, reduce_deep(scheme.body, fams),
         [Pred(p.name, [reduce_deep(a, fams) for a in p.args])

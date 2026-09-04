@@ -219,6 +219,58 @@ class ClassTable:
         # Method name -> owning class. Methods share the value namespace with
         # ordinary functions, so this is also what detects a collision.
         self.owner: dict[str, str] = {}
+        # Equations the solver has stuck on, as rewrite rules for the families
+        # they name. A *wanted* equality is a rule too: if the binding retains
+        # it then every caller proves it, and if it is discharged later then
+        # unification has made both sides one anyway -- so reducing by it is
+        # sound either way. GHC calls this wanteds rewriting wanteds.
+        #
+        # They live here rather than on the solver because everything that
+        # reduces a family goes through this table -- predicate discharge, the
+        # type table the lowering and exhaustiveness read, and the elaborator
+        # -- and those three disagreeing is the whole defect (FINDINGS 47).
+        # Teaching one is worse than teaching none: solving then accepts a
+        # predicate whose evidence the elaborator cannot reconstruct.
+        #
+        # A rule names particular type *variables*, and `type_key` prunes, so
+        # one binding's rule cannot fire inside another: no other binding
+        # mentions its variables. That is what makes a flat list correct where
+        # a scope stack would be needed for anything else.
+        self.rules: list[tuple[Type, Type]] = []
+        # Turned off while an equation is being retried. A wanted equality may
+        # rewrite *other* constraints and must never discharge itself: reducing
+        # `Container.Elem c` by the very rule `Container.Elem c ~ Int` supplied
+        # makes the equation trivially true, so a program that should be told
+        # to state it in its context is accepted and fails in the Core checker
+        # instead. GHC keeps the same distinction by tracking where a wanted
+        # came from.
+        self.rules_apply = True
+
+    def settled_fam(self, t: TFam) -> Type | None:
+        """`reduce_fam`, refusing the wanted rules. See `settled`."""
+        was = self.rules_apply
+        self.rules_apply = False
+        try:
+            return self.reduce_fam(t)
+        finally:
+            self.rules_apply = was
+
+    def settled(self, t: Type) -> Type:
+        """`normalize`, refusing the wanted rules.
+
+        For the two questions that decide whether an equation *survives*: is it
+        already true, and can it be retried. Both must be answered from
+        definitions and givens alone, because an equation answered by the rule
+        it supplied is answered by itself -- and a scheme that drops it stops
+        making its callers prove it, which is the difference between a carried
+        equation and an unsound one.
+        """
+        was = self.rules_apply
+        self.rules_apply = False
+        try:
+            return self.normalize(t)
+        finally:
+            self.rules_apply = was
 
     # -- registration ------------------------------------------------------
 
@@ -599,6 +651,16 @@ class ClassTable:
             mapping = match(inst.head, arg)
             if mapping is not None:
                 return substitute(inst.families[t.name], mapping)
+        # Only once no instance decides it. A definition is the truth about a
+        # family and a wanted equality is merely something else known to be
+        # equal to it, so a rule can fill a gap and must never contradict an
+        # answer.
+        if not self.rules_apply:
+            return None
+        key = type_key(TFam(t.name, arg, t.kind))
+        for left, right in self.rules:
+            if type_key(left) == key:
+                return right
         return None
 
     def normalize(self, t: Type) -> Type:
@@ -865,7 +927,12 @@ class ClassTable:
                     # terminates. Two family applications are deferred while
                     # their arguments differ and can become equal afterwards,
                     # which is where these come from.
-                    if type_key(p.args[0]) == type_key(p.args[1]):
+                    # Normalized first: a side can become reducible after the
+                    # last time the equation was retried, so `Int ~ Int` is a
+                    # shape this actually reaches. It states nothing and, as a
+                    # given, is a rewrite from a type to itself.
+                    if (type_key(self.settled(p.args[0]))
+                            == type_key(self.settled(p.args[1]))):
                         continue
                     # Equality is symmetric.  Inference can encounter both
                     # directions when two associated families meet through a

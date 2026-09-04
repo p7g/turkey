@@ -700,7 +700,7 @@ It was reachable before this milestone: associated families have always been
 able to produce one. Making field access a family is what found it.
 
 ### 47. A wanted equality on a family is not used as a rewrite
-**bug, open.** M25, and a regression that arrived with entry 45 rather than
+**bug, fixed.** M25, and a regression that arrived with entry 45 rather than
 one it failed to fix.
 
 `HasField "pos" a Int` put the field's type in the predicate's third argument,
@@ -722,17 +722,53 @@ code, the second is a warning -- but the second is a false report, which is
 worse than either.
 
 This is the capability `Solver.improve`'s hand-written functional dependency
-was buying, and writing it off as free (entry 45) was wrong. The fix is
-GHC's rule that a wanted equality rewrites other wanteds. What makes it more
-than a one-line change is that three places normalize independently:
-`Solver._class` through the class table, exhaustiveness through the type the
-inferencer recorded, and `Elaborator.resolve` through its own. Teaching only
-the first is not a partial fix but a broken one -- solving then accepts
-`Add (Field.pos a)` and elaboration fails with "no evidence for
-'Add (Field.pos _a)', which solving had already accepted". It wants one
-normalization that includes the equalities in scope, used by all three, which
-also means the equality set has to reach elaboration: it is known per binding
-at generalization, and the `Use` recorded at each site is where it would ride.
+was buying, and writing it off as free (entry 45) was wrong.
+
+**The fix is GHC's rule that a wanted equality rewrites other wanteds**, and
+the reason it is not one line is the answer to "why does every place need
+patching": because the domain's entailment was four relations rather than one.
+`ClassTable.reduce_fam` knew instances; `Solver.reduce` knew instances and
+givens; `coretc.Fams` knew instances and a binding's stated equations;
+`typed._Reducer` knew instances alone. `types.normalize(t, fams)` has the right
+seam -- one reducer, passed in -- and four different things were being passed
+into it, so a fact learned by one was invisible to the others. Teaching one is
+worse than teaching none: solving then accepts `Add (Field.pos a)` and
+elaboration fails with "no evidence for 'Add (Field.pos _a)', which solving had
+already accepted".
+
+So the rules live on `ClassTable`, which all four consult, and they are
+correct there because a rule names particular type *variables*: no other
+binding mentions them, so one binding's rule cannot fire inside another and a
+flat list needs no scope stack.
+
+Three restrictions make it sound, and each was found by a test rather than by
+thinking:
+
+* **A rule must make progress.** `c.bucket = b.next` equates two *stuck*
+  families, and rewriting one to the other is a step sideways that steps back.
+  Only an equality whose other side is neither a family nor a bare variable
+  becomes a rule.
+* **A rule never decides what a type is.** `Solver.reduce` is what `unify`
+  calls, and a unification is irreversible: reducing `Container.Elem a` to
+  `Int` by an unproved equation *binds* a variable, and the family is then gone
+  from the scheme that was supposed to carry it. `_class` asks with the rules;
+  everything unification can reach asks without them. A scheme's own body and
+  its printed form are read the same way, so `fun(a) -> Container.Elem a` stays
+  what it is.
+* **A rule never discharges the equation it came from.** Reducing
+  `Container.Elem c` by the rule `Container.Elem c ~ Int` supplied makes that
+  equation trivially true, so a program that should be told to state it in its
+  context is accepted and fails in the Core checker instead --
+  `err_stuck_family` caught it. `ClassTable.settled` is the reducer that
+  refuses them, and both the retry in `_equals` and the reflexive-drop in
+  `simplify` use it. The second matters as much as the first: a `simplify` that
+  reduced with the rules dropped the equation as trivial, and a scheme that
+  drops an equation stops making its callers prove it.
+
+`bf.tl`'s `move` loses all three of the predicates it had picked up, and an
+un-annotated `Data.Map#resize` no longer reports its `match` non-exhaustive.
+`lib/Data/Map.tl` keeps its annotations, but they are now only worth what an
+annotation is normally worth.
 
 ### 24. `Data.Set` is not one of the modules the Prelude re-exports
 **library.** M21. `Array`, `Map`, `Option` and eight others arrive

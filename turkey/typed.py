@@ -35,7 +35,16 @@ from .types import (
 
 
 class _Reducer:
-    """`types.Families`, backed by the instance table alone. See `observe`."""
+    """`types.Families`, backed by the class table. See `observe`.
+
+    Including the equations the solver stuck on, which it keeps as rewrite
+    rules. That is not optional: if a predicate was discharged by such a rule
+    then the evidence names an instance of the *reduced* type, so a recorded
+    type left unreduced cannot be given that evidence -- the lowering asks for
+    `%Dict.Mul (Field.cap a)` and is handed `Mul Int`. Solving, elaboration and
+    the recorded types have to reduce by the same rules or they disagree, which
+    is the whole of FINDINGS 47.
+    """
 
     def __init__(self, classes) -> None:
         self.classes = classes

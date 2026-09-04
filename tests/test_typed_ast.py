@@ -195,7 +195,11 @@ def test_a_family_over_a_signature_variable_survives_and_should():
         if contains(checked.types.resolve(ty), TFam)
     ]
     assert stuck, "families.tl should have at least one rigid family"
-    assert all("Elem" in s or "Item" in s for s in stuck)
+    # `Field.n` and `Elem.0` belong on this list too: a field access is a class
+    # method whose result is an associated family, so a record-polymorphic
+    # receiver leaves one behind exactly as `Container.Elem c` does.
+    assert all(any(fam in s for fam in ("Elem", "Item", "Field."))
+               for s in stuck)
 
 
 # -- type arguments ----------------------------------------------------------

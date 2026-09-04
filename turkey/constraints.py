@@ -348,7 +348,13 @@ class Solver:
             if (pred.name == EQUALS and type_key(pred.args[0]) == key
                     and type_key(pred.args[1]) != key):
                 return pred.args[1]
-        return self.classes.reduce_fam(t)
+        # Without the wanted rules. This reducer is what `unify` calls, and a
+        # unification is irreversible: reducing `Container.Elem a` to `Int` by
+        # an equation nobody has proved yet *binds* a variable to `Int`, and
+        # the family is then gone from the scheme that was supposed to carry
+        # it. The rules answer whether a predicate can be discharged, which
+        # `_class` asks explicitly; they do not decide what a type is.
+        return self.classes.settled_fam(t)
 
     def defer(self, a: Type, b: Type, span: Span | None, context: str) -> None:
         """Take an equation unification could not decide.
@@ -384,6 +390,20 @@ class Solver:
         if isinstance(prune(b), TFam) and not isinstance(prune(a), TFam):
             a, b = b, a
         self.deferred.append(CPred(Pred(EQUALS, [a, b]), span, context))
+        # And it is a rewrite rule from here on. `x.pos` used where an `Int` is
+        # wanted leaves `Field.pos a ~ Int`, and without this every predicate
+        # about the field's type stays stuck and rides into the scheme --
+        # `bf.tl`'s `move` collected `Add (Field.pos a)`, `Ord (Field.pos a)`
+        # and `Length (Field.data a)` that way -- while exhaustiveness reads a
+        # scrutinee type the equality would have decided. See FINDINGS 47.
+        # Only a rule that makes progress. `Field.pos a ~ Int` says what the
+        # family is; `Field.bucket c ~ Field.next b` -- which `c.bucket = b.next`
+        # produces -- says only that two stuck families agree, and rewriting
+        # one to the other is a step sideways that can step back. A bare
+        # variable on the right teaches nothing either.
+        left, right = prune(a), prune(b)
+        if isinstance(left, TFam) and not isinstance(right, (TFam, TVar)):
+            self.classes.rules.append((left, right))
 
     # -- solving -----------------------------------------------------------
 
@@ -558,8 +578,19 @@ class Solver:
                 # would put machinery in a signature a reader has to read.
                 # Head-only reduction is right for unification and not for
                 # anything that reads a type whole, which a scheme is.
-                binding = Binding(
-                    generalize(reduce_deep(ty, self), self.rank, preds), False)
+                # Reduced without the wanted rules. A scheme is an interface:
+                # it carries `Container.Elem a ~ Int` and its body should say
+                # `Container.Elem a`, not the `Int` that equation happens to
+                # make it. The rules are for discharging predicates inside the
+                # body, not for restating the body in terms a caller has not
+                # been told yet. See `ClassTable.settled`.
+                was = self.classes.rules_apply
+                self.classes.rules_apply = False
+                try:
+                    body = reduce_deep(ty, self)
+                finally:
+                    self.classes.rules_apply = was
+                binding = Binding(generalize(body, self.rank, preds), False)
                 if c.dicts is not None:
                     # Recorded here because here is the only place it exists.
                     # A local binding's scheme goes into an environment that is
@@ -715,8 +746,10 @@ class Solver:
         `False`: back onto `deferred`, where `retained` may put it in a scheme
         and hand it to the caller. Anything else is an ordinary unification.
         """
-        left = self.classes.normalize(c.pred.args[0])
-        right = self.classes.normalize(c.pred.args[1])
+        # Without the wanted rules: an equation proved by a rule it supplied is
+        # proved by itself. See `ClassTable.settled`.
+        left = self.classes.settled(c.pred.args[0])
+        right = self.classes.settled(c.pred.args[1])
         c.pred.args = [left, right]
         if type_key(left) == type_key(right):
             return True
@@ -747,6 +780,11 @@ class Solver:
         instance a local error naming the type that lacks one, rather than a
         stranded predicate reported at the end of a binding group.
         """
+        # *With* the wanted rules, unlike everywhere unification can reach:
+        # `Add (Field.pos a)` under `Field.pos a ~ Int` is `Add Int`, and the
+        # binding retains the equation so every caller proves it. Asking
+        # without them leaves the predicate stuck and rides it into the scheme
+        # -- three of them, in `bf.tl`'s `move`. See FINDINGS 47.
         t = self.classes.normalize(c.pred.args[0])
         if isinstance(t, TBottom):
             return True  # absorbed; there is no value to find a method for

@@ -135,6 +135,10 @@ def check(src: str, file: str | None = None,
     # body under another name, so there is nothing left to reduce in it, and
     # `turkey opt` keeps printing the program the optimizer produced. See
     # turkey/layout.py.
+    # Family applications reduced before the layouts are decided, since a
+    # stuck one has no representation and `held_at` would guess. See
+    # `mono.reduce_types`.
+    program_opt = mono.reduce_types(program_opt, classes)
     program_opt = layout.share(program_opt)
     coretc.check_program(program_opt, decls, classes, coretc.globals_of(env))
     # Every layout the backend reads a field at has to be knowable, and this

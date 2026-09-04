@@ -4,6 +4,7 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <pthread.h>
 #include <signal.h>
 #include <string.h>
 #include <unistd.h>
@@ -1117,7 +1118,54 @@ void turkey_install_crash_handler(void) {
  * In C rather than in generated IR because none of it depends on the program:
  * only the entry's *name* does, and that is the argument.
  */
+/* The entry runs on a thread of its own, for its stack.
+ *
+ * A compiler is a tree walk, and a Turkey frame is not small: `Opt#expr` roots
+ * every live pointer it holds in one array, so its frame is kilobytes, and a
+ * deeply nested program overruns the 8MB the main thread gets on macOS. The
+ * fault is a write to the guard page, which is a `SIGSEGV` like any other and
+ * says nothing -- the handler cannot even run, because running it needs the
+ * stack that just ran out.
+ *
+ * A thread takes its stack size as an attribute and the main thread's cannot
+ * be changed once the process is running, so the entry goes on a thread made
+ * for it. `main` does nothing but wait, so this costs one thread and no
+ * concurrency: the collector still sees exactly one mutator.
+ */
+/* The same 512MB `driver.STACK_BYTES` gives the interpreter, and for the
+   same reason: the two hosts should run out of stack in the same place. */
+#define TURKEY_STACK_BYTES ((size_t)512 * 1024 * 1024)
+
+static void *entry_thread(void *argument) {
+    ((void (*)(void))argument)();
+    return NULL;
+}
+
+static void run_entry(void (*entry)(void)) {
+    pthread_attr_t attributes;
+    pthread_t thread;
+    if (pthread_attr_init(&attributes) != 0) {
+        entry();
+        return;
+    }
+    if (pthread_attr_setstacksize(&attributes, TURKEY_STACK_BYTES) != 0 ||
+            pthread_create(&thread, &attributes, entry_thread,
+                           (void *)entry) != 0) {
+        /* No thread to be had: the small stack beats not running at all. */
+        pthread_attr_destroy(&attributes);
+        entry();
+        return;
+    }
+    pthread_attr_destroy(&attributes);
+    pthread_join(thread, NULL);
+}
+
 int turkey_main(int argc, char **argv, void (*entry)(void)) {
+    /* Same opt-in as the JIT's: a compiled program is the one that most needs
+       the shadow stacks read back, since there is no Python left to read the
+       flags. */
+    if (getenv("TURKEY_SEGV_FRAMES") != NULL) turkey_install_crash_handler();
+
     /* `argv + 1`: the program's own arguments, with its name dropped, which is
        what `driver.run` hands the JIT so that the two hosts agree on element
        zero. */
@@ -1143,7 +1191,7 @@ int turkey_main(int argc, char **argv, void (*entry)(void)) {
         turkey_args_set(0, NULL, NULL);
     }
 
-    entry();
+    run_entry(entry);
 
     if (turkey_exiting()) {
         int64_t status = turkey_exit_status();

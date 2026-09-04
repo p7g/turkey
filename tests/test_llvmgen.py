@@ -10,6 +10,7 @@ from turkey.driver import check
 from turkey.cli import main as cli_main
 from turkey.errors import TurkeyPanic
 from turkey import backend_ir as bir
+from turkey import core
 from turkey.backend_lower import lower
 from turkey.llvmgen import compile, execute, generate, _root_slots
 
@@ -686,6 +687,119 @@ def _core_children(node):
             if dataclasses.is_dataclass(item):
                 out.append(item)
     return out
+
+
+# --- FINDINGS 54: four ways for a layout to be forgotten -------------------
+
+
+def test_the_uniform_representation_is_only_offered_to_a_variable():
+    """`held_at` answers `BOXED` for `a` and refuses `Index.Value (Array a)`.
+
+    A body that knows nothing about a type still has to keep a value of it
+    somewhere, and the uniform representation is that somewhere -- but the
+    type that says a body can only *hold* a value is a bare variable. A stuck
+    family application is not that: `Index.Value (Array Bool)` is the `Bool`
+    the instance says it is, and its writer stores it as one. Answering
+    `BOXED` there is one side guessing rather than a convention two sides
+    keep, and the reader then unboxes a raw value (FINDINGS 54).
+    """
+    from turkey.backend_lower import held_at
+    from turkey.types import STAR, TFam, TVar
+    from turkey.errors import Unsupported
+
+    variable = TVar(1)
+    assert held_at(variable) is bir.Layout.BOXED
+    with pytest.raises(Unsupported):
+        held_at(TFam("Index.Value", variable, STAR))
+
+
+def test_a_dictionarys_methods_count_as_its_abstractions_parameters():
+    """An instance dictionary is a record of lambdas, not a lambda.
+
+    `layout.transparent` asks what a binding's abstraction takes, and reading
+    the lambda *spine* finds nothing in `instance Index (Array a)` -- while
+    the `get` inside it does `Prim.arrayGet` on an `Array a`. The argument
+    that a lambda deeper in the body is a closure the body makes for itself
+    does not survive a body that hands the closure out, and a dictionary is
+    nothing but that.
+    """
+    from turkey import layout
+    from turkey.core import CBind, CLam, CParam, CRecord, CTyLam, CUnit, CVar
+    from turkey.types import (STAR, TApp, TCon, TFun, TVar, UNIT,
+                              kind_arrow)
+
+    a = TVar(1)
+    array = TApp(TCon("Data.Array#Array", kind_arrow(1)), a, STAR)
+    dict_ty = TApp(TCon("%Dict.Std.Classes#Index", kind_arrow(1)),
+                   array, STAR)
+    get_ty = TFun([array], a)
+    # The shape `lower` builds for an instance: the class's binder outside, a
+    # record of methods inside, and the method that destructures an `Array a`
+    # inside that.
+    value = CTyLam(dict_ty, None, [a], CRecord(
+        dict_ty, None, "%Dict.Std.Classes#Index",
+        [("get", CLam(get_ty, None, [CParam("xs", array)],
+                      CVar(a, None, "xs"), "#get"))]))
+    bind = CBind("%inst.Std.Classes#Index.Data.Array#Array", dict_ty, [a],
+                 value)
+    assert [p.name for p in core.abstraction_parameters(value)] == ["xs"]
+    assert layout.transparent(bind)
+
+
+def test_a_specialized_method_states_the_forall_it_kept():
+    """`mono` consumes the dictionary lambda; the `CTyLam` under it survives.
+
+    A method quantifies over its own variables as well as its class's, and
+    `lower.method_abstraction` states those beneath the dictionary lambda.
+    Supplying the evidence leaves that abstraction outermost, and a copy that
+    left it there had empty `binders` and a still-generic body -- which
+    `mono.instantiate` cannot match type arguments against and
+    `layout.share` cannot key a copy on.
+    """
+    from turkey.core import CTyLam
+    source = (PROGRAMS_DIR / "dicts.tl").read_text(encoding="utf-8")
+    checked = check(source, "dicts.tl", [PROGRAMS_DIR])
+    for bind in checked.opt.dicts + checked.opt.binds:
+        if isinstance(bind.value, CTyLam):
+            assert bind.binders, bind.name
+
+
+def test_the_backend_is_handed_no_stuck_type_family():
+    """`Index.Value (Array Bool)` is the `Bool` the instance says it is.
+
+    `layout_of` cannot answer a family application, so one reaching the
+    backend is a value whose representation is decided by guesswork on one
+    side and by the instance on the other. `_Rewriter.ty` reduces as it
+    substitutes and is right that with no substitution there is nothing to
+    do, which leaves every binding nothing specialized carrying the types the
+    lowering wrote -- and a dictionary's methods are typed in the class's
+    families there.
+    """
+    import dataclasses
+    from turkey.core import CAlt, CExpr, CParam
+    from turkey.types import TFam, prune
+
+    source = (PROGRAMS_DIR / "dicts.tl").read_text(encoding="utf-8")
+    checked = check(source, "dicts.tl", [PROGRAMS_DIR])
+    found: list[str] = []
+
+    def walk(node, owner: str) -> None:
+        if isinstance(node, TFam):
+            found.append(f"{owner}: {node!r}")
+            return
+        if isinstance(node, (CExpr, CAlt, CParam)):
+            for f in dataclasses.fields(node):
+                if f.name == "binders":
+                    continue
+                walk(getattr(node, f.name), owner)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item, owner)
+
+    for bind in checked.opt.dicts + checked.opt.binds:
+        walk(prune(bind.ty), bind.name)
+        walk(bind.value, bind.name)
+    assert not found, found[:5]
 
 
 def test_a_one_armed_if_discards_a_branch_that_answers_something(capfd):

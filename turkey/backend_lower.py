@@ -21,7 +21,7 @@ from .opt import bottoming
 from .prelude import BOOL_FALSE, BOOL_TRUE
 from .types import (
     BOTTOM, BYTE, CHAR, FLOAT, INT, STRING, UNIT, TApp, TCon, TFam, TFun,
-    TTuple, Type, TVar, instantiate, prune, spine, unify,
+    TTuple, Type, TVar, instantiate, prune, show, spine, unify,
 )
 
 
@@ -108,20 +108,33 @@ def layout_of(ty: Type, abstracted: dict[int, str] | None = None
 
 
 def held_at(ty: Type, abstracted: dict[int, str] | None = None) -> bir.Layout:
-    """`layout_of`, with the uniform representation where it has no answer.
+    """`layout_of`, with the uniform representation for a variable alone.
 
-    This is the right question for a value a body only *holds* and passes on,
-    which is what parametricity leaves a generic body able to do: it needs
-    some way to keep an `a` in a slot, and `BOXED` is that way.
+    A body that knows nothing about a type still needs somewhere to keep a
+    value of it, and `BOXED` is that somewhere. What parametricity says is
+    that this is the *whole* of what such a body can do with it -- hold it,
+    and pass it on -- and the type that says so is a bare variable. `a` gets
+    the uniform representation. A stuck `Index.Value (Array Bool)` does not:
+    it is the `Bool` the instance says it is, and the code that writes one
+    writes a `Bool`. Answering `BOXED` there is not a convention two sides
+    keep, it is one side guessing.
 
-    It is the wrong question for the layout a field was *written* at, which is
-    decided by the construction site and cannot be recovered from the type. No
-    body should be reading a field of abstracted type at all --
-    `mono.check_layouts` refuses one that could -- so a `None` reaching a field
-    read means that check has a hole rather than that this needs a default.
+    So this is not a total function either, and that is deliberate. It was,
+    and the fallback covered three separate holes at once for as long as it
+    was: a shared dictionary lifted with its layouts forgotten, a stuck
+    `Index.Value (Array Bool)`, and a method whose own `forall` went missing
+    -- each of which produced a bare value that its reader then unboxed, and
+    none of which said anything until the process died (FINDINGS 53, 54). A
+    refusal here names the pass that has the hole.
     """
     found = layout_of(ty, abstracted)
-    return bir.Layout.BOXED if found is None else found
+    if found is not None:
+        return found
+    if isinstance(prune(ty), TVar):
+        return bir.Layout.BOXED
+    raise Unsupported(
+        f"the layout of {show(ty)} is not knowable here, and it is not a type "
+        f"variable, so the uniform representation is not the answer either")
 
 
 def _expr_layout(expr: CExpr, abstracted: dict[int, str] | None = None
@@ -383,10 +396,19 @@ class _FunctionLowerer:
             if bind.name in runtime_names:
                 actions.append(("bind", bind.name, bind.value))
 
+        # A global's value is lowered under the layouts of the binding it
+        # belongs to, not the initializer's. `layout.share` gives a copy its
+        # `layouts` and the copy of a *dictionary* is a record built here, so
+        # an initializer that kept its own empty map would lift the copy's
+        # methods with nothing known -- and `%inst.Index (Array a)@[i1]` would
+        # read an array of `i1` at the boxed width (FINDINGS 54).
+        layouts = {bind.name: bind.layouts
+                   for bind in program.dicts + program.binds}
         following = final
         for action in reversed(actions):
             entry = self.new_block("initialize")
             kind = action[0]
+            self.abstracted = layouts.get(action[1], {})
             if kind == "placeholder":
                 _, name, record = action
                 fields = self.record_fields.get(record.con,
@@ -423,6 +445,7 @@ class _FunctionLowerer:
                 after.terminator = bir.Jump(following.name)
                 self.lower(value, {}, {}, entry, _Destination(after))
             following = entry
+        self.abstracted = self.bind.layouts
         self.entry.terminator = bir.Jump(following.name)
         # Reuse finish's reachability pruning without compiling the dummy body.
         function_type = prune(self.bind.ty)

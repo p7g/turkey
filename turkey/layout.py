@@ -64,6 +64,7 @@ from dataclasses import fields as _dataclass_fields, replace
 from . import backend_ir as bir
 from .backend_lower import layout_of
 from .core import (CAlt, CBind, CExpr, CProgram, CTyApp, CVar,
+                   abstraction_binders, names_of,
                    transparent_parameters as core_transparent)
 from .types import Type, vars_of
 
@@ -89,7 +90,7 @@ def transparent(bind: CBind) -> bool:
     two were written separately they were blind to constrained bindings
     together.
     """
-    return bool(core_transparent(bind, {v.id for v in bind.binders}))
+    return bool(core_transparent(bind, {v.id for v in abstraction_binders(bind)}))
 
 
 def _applications(node, out: list[CTyApp]) -> None:
@@ -125,9 +126,9 @@ def _needs_layouts(binds: dict[str, CBind]) -> set[str]:
             if name in found:
                 continue
             bind = binds[name]
-            if not bind.binders:
+            if not abstraction_binders(bind):
                 continue
-            abstracted = {variable.id for variable in bind.binders}
+            abstracted = {variable.id for variable in abstraction_binders(bind)}
             applications: list[CTyApp] = []
             _applications(bind.value, applications)
             for application in applications:
@@ -184,6 +185,7 @@ class _Sharer:
             self.made.setdefault(original, []).append(
                 self.build(name, self.binds[original], key))
 
+        kept = self.reachable(rewritten)
         out = CProgram()
         for group, target in ((program.dicts, out.dicts),
                               (program.binds, out.binds)):
@@ -193,8 +195,37 @@ class _Sharer:
                 # no more than the original does, and top-level bindings are
                 # evaluated in this order.
                 target.extend(self.made.get(bind.name, []))
-                target.append(rewritten.get(bind.name, bind))
+                if bind.name in kept:
+                    target.append(rewritten.get(bind.name, bind))
         return out
+
+    def reachable(self, rewritten: dict[str, CBind]) -> set[str]:
+        """The names still worth emitting, which is every one but a shared
+        original that nothing calls any more.
+
+        A shared binding's original is the one body here that is *not*
+        rewritten, because rewriting it would need the layouts it does not
+        have. Once every call site has gone to a copy it is dead, and leaving
+        it is not harmless: it names the other originals, so one that survives
+        keeps the rest alive, and `mono.check_layouts` then refuses a program
+        for a body nothing would have compiled.
+
+        A fixed point rather than one pass, since dropping one can orphan the
+        next.
+        """
+        made = {b.name: b for copies in self.made.values() for b in copies}
+        live = {name for name in self.binds if name not in self.shared}
+        live |= set(made)
+        while True:
+            grew = False
+            for name in sorted(live):
+                bind = made.get(name) or rewritten.get(name) or self.binds[name]
+                for used in names_of(bind.value) & set(self.binds):
+                    if used not in live:
+                        live.add(used)
+                        grew = True
+            if not grew:
+                return live
 
     def request(self, name: str, key: tuple[str, ...]) -> str:
         found = self.done.get((name, key))
@@ -213,7 +244,7 @@ class _Sharer:
 
     def build(self, made: str, bind: CBind, key: tuple[str, ...]) -> CBind:
         abstracted = {variable.id: layout
-                      for variable, layout in zip(bind.binders, key)}
+                      for variable, layout in zip(abstraction_binders(bind), key)}
         return replace(bind, name=made, layouts=abstracted,
                        value=self.rewrite(bind.value, abstracted))
 
@@ -221,7 +252,13 @@ class _Sharer:
         """Every call to a shared binding, pointed at the copy it means."""
         if isinstance(node, CTyApp) and isinstance(node.fn, CVar):
             if node.fn.name in self.shared:
-                key = _key(node.args, abstracted)
+                # Positional, so a binding that states its `forall` in both
+                # places at once cannot be keyed from one type application and
+                # is left alone -- `mono.check_layouts` then says so, which is
+                # a limit that is visible rather than one that is guessed at.
+                want = len(abstraction_binders(self.binds[node.fn.name]))
+                key = (_key(node.args, abstracted)
+                       if len(node.args) == want else None)
                 if key is not None:
                     made = self.request(node.fn.name, key)
                     return replace(node, fn=replace(node.fn, name=made))

@@ -124,7 +124,7 @@ from dataclasses import dataclass, field, fields, replace
 from .classes import ClassTable
 from .core import (dict_class, CAlt, CBind, CExpr, CField, CIndex, CLam, CLet, CLetRec,
                    CParam, CProgram, CProject, CRecord, CTyApp, CTyLam, CVar,
-                   names_of,
+                   abstraction_binders, names_of,
                    transparent_parameters as core_transparent)
 from .coretc import Fams
 from .decls import DeclTable, substitute
@@ -170,6 +170,30 @@ def _ground(t: Type) -> bool:
     """No unbound variable anywhere in it, so it names one type and not a
     family of them. The test a specialization request has to pass."""
     return not vars_of(t)
+
+
+def _promoted(bind: CBind, dicts: list[str] | None) -> list[TVar]:
+    """The binders a specialization of `bind` will state for itself.
+
+    A method quantifies over its own variables as well as its class's, and
+    `lower.method_abstraction` states those in a `CTyLam` under the dictionary
+    lambda. Supplying the evidence consumes that lambda, so the abstraction
+    ends up outermost -- and a copy that left it there would be a binding with
+    empty `binders` whose body is still generic: invisible to `mono`'s own
+    `instantiate`, which needs binders to match type arguments against, and to
+    `layout.share`, which keys copies on them. `%default.Foldable.fold` at
+    `Array` was exactly that, and reached the generic `Index (Array a)`
+    dictionary, whose elements it then read at whatever width it guessed
+    (FINDINGS 54).
+    """
+    if dicts is None or not isinstance(bind.value, CLam):
+        return []
+    out: list[TVar] = []
+    value = bind.value.body
+    while isinstance(value, CTyLam):
+        out.extend(value.binders)
+        value = value.body
+    return out
 
 
 def _size(t: Type) -> int:
@@ -490,7 +514,17 @@ class _Rewriter:
             # is exactly what it was.
             return None
         made = self.owner.request(bind, targs, supplied)
-        return None if made is None else CVar(self.ty(e.ty), e.span, made)
+        if made is None:
+            return None
+        promoted = _promoted(bind, supplied)
+        if not promoted:
+            return CVar(self.ty(e.ty), e.span, made)
+        # The copy states the abstraction; this site is where the value of it
+        # was expected, so it is restated here as the eta-expansion it is.
+        ty = self.ty(e.ty)
+        return CTyLam(ty, e.span, promoted,
+                      CTyApp(ty, e.span, CVar(ty, e.span, made),
+                             list(promoted)))
 
     def global_dict(self, e: CExpr) -> str | None:
         """The top-level dictionary this expression names, or None."""
@@ -734,7 +768,12 @@ class Monomorphizer:
             rewriter.rename = dict(zip((p.name for p in value.params), dicts))
             value = value.body
             ty = rewriter.ty(value.ty)
-        return CBind(name, ty, [], rewriter.rewrite(value), bind.span,
+        binders: list[TVar] = []
+        while isinstance(value, CTyLam):
+            binders.extend(value.binders)
+            value = value.body
+            ty = rewriter.ty(value.ty)
+        return CBind(name, ty, binders, rewriter.rewrite(value), bind.span,
                      bind.mutable, bind.module, rewriter.equations)
 
 
@@ -1019,11 +1058,58 @@ def transparent_parameters(program: CProgram) -> list[tuple[str, str, Type]]:
     found: list[tuple[str, str, Type]] = []
     for name in sorted(seen):
         bind = binds[name]
-        abstracted = {variable.id for variable in bind.binders
+        abstracted = {variable.id for variable in abstraction_binders(bind)
                       if variable.id not in bind.layouts}
         for param in core_transparent(bind, abstracted):
             found.append((name, param.name, prune(param.ty)))
     return found
+
+
+def reduce_types(program: CProgram, classes: ClassTable) -> CProgram:
+    """Every type in the program, with its family applications reduced.
+
+    The backend reads a type *whole* and asks it for a representation, and an
+    unreduced family has none: `layout_of` cannot answer `Index.Value (Array
+    Bool)` and `held_at` therefore says `BOXED`, while the body that produces
+    the value knows it is the `Bool` the instance says it is and hands over a
+    bare `i1`. The reader then unboxes a `1` (FINDINGS 54).
+
+    `_Rewriter.ty` reduces as it substitutes, so a *specialized* binding is
+    already reduced -- and says, correctly, that with no substitution there is
+    nothing to do. What that leaves is the binding nothing specialized, whose
+    types are the ones `lower` wrote: a dictionary's method still takes
+    `Index.Key (Array a)` there, because the lowering builds a field's type by
+    putting the instance head into the method's scheme and the scheme is
+    written in the class's families.
+
+    So it is done here, once, for the whole program, rather than at each of
+    the places a family can be introduced -- `layout_of` is total on the types
+    that reach it only if *every* such place remembered, and one pass is a
+    thing that can be true rather than a rule five writers have to keep.
+    """
+    fams = Fams(classes)
+
+    def walk(node):
+        if isinstance(node, Type):
+            return reduce_deep(node, fams)
+        if isinstance(node, (CExpr, CAlt, CParam)):
+            return type(node)(**{
+                f.name: getattr(node, f.name) if f.name == "binders" else walk(
+                    getattr(node, f.name))
+                for f in fields(node)})
+        if isinstance(node, list):
+            return [walk(item) for item in node]
+        if isinstance(node, tuple):
+            return tuple(walk(item) for item in node)
+        return node
+
+    out = CProgram()
+    for group, target in ((program.dicts, out.dicts),
+                          (program.binds, out.binds)):
+        for bind in group:
+            target.append(replace(bind, ty=reduce_deep(bind.ty, fams),
+                                  value=walk(bind.value)))
+    return out
 
 
 def check_layouts(program: CProgram) -> None:

@@ -923,7 +923,7 @@ Opt-in through `TURKEY_SEGV_FRAMES`, the way `TURKEY_GC_STRESS` is: taking
 choice, not a default.
 
 ### 53. A record field is written bare and read boxed when only some copies specialize
-**bug, open.** M26, and the reason six `test_boot` cases still fail. Found by
+**bug, fixed.** M26, and the reason six `test_boot` cases still fail. Found by
 entry 52 in one run, having been invisible before `boot` could run natively at
 all.
 
@@ -959,23 +959,86 @@ has no layout for". What is missing is that nothing then stops the *unshared*
 original from staying reachable, and the original assumes `BOXED` for the very
 variable no copy would accept it for.
 
-The fix is not yet chosen. Two candidates:
+The fix was the first of the two candidates weighed here: close the sharing
+gap rather than give up an unboxed key in `Map Int v`. `layout.share` is right
+that `_key` must refuse a copy it cannot key, and the unshared original stays
+in the program -- so the answer is that nothing must still *call* it, and the
+pass now drops an original once every call site has gone to a copy. Leaving it
+was not harmless: an original names the other originals, so one that survived
+kept the rest alive and `check_layouts` refused a program for a body nothing
+would have compiled.
 
-* close the sharing gap -- `Set Int` is `Map Int Unit`, whose key `(i64, unit)`
-  is perfectly knowable, so a shared copy should exist and the generic original
-  should have become unreachable for `_reachable` to drop. Why it did not is
-  the thing to find out, and if the gap is small this is the intended design
-  working;
-* or make the representation of a field follow its *declared* type: a field
-  whose declared type is a variable is `BOXED` in every copy, specialized ones
-  included, so specialized code boxes on write rather than storing bare. That
-  gives up an unboxed key in `Map Int v`, which is what Java and OCaml pay, and
-  it is sound whatever the cap does -- which matters, because
-  `MAX_SPECIALIZATIONS` guarantees there is *always* a generic fallback for
-  some program.
+The second candidate is written down because it is the floor the first sits
+on, and it is still true that `MAX_SPECIALIZATIONS` guarantees a generic
+fallback for some program. What makes the floor unnecessary is that layouts
+are a *finite* lattice where types are not: sharing by layout terminates on
+any program, so the copy the fallback would have needed always exists. See
+entry 54 for the three further places a layout was being forgotten and the
+guess in `held_at` that kept all of them quiet.
 
-The second is the floor the first sits on: the cap means a generic copy can
-always exist, so its assumption has to be one the whole program keeps.
+---
+
+### 54. Four ways for a layout to be forgotten, and one guess that hid them all
+**bug, fixed.** M26. `boot` compiled itself to a binary and then segfaulted in
+`Turkey.Opt#specializeOn`, at `group.known[i]`, with `check_layouts` passing.
+The fault was `turkey_unbox` handed the raw value `1`: a reader unboxing what
+its writer had stored bare, which is entry 53's shape again in three new
+places at once.
+
+`known : Array Bool` is an array of `i1`, one byte to an element. It was
+allocated at that width and pushed to at that width -- and read through
+`%inst.Index (Array a)`, compiled with `a` unknown, at eight. What made the
+three causes one bug is that each was survivable alone: `held_at` answered
+`BOXED` wherever `layout_of` had no answer, so every one of them produced a
+program that ran, right up until an element was not pointer-sized.
+
+**An instance dictionary is not a lambda.** `layout.transparent` asks
+`core.abstraction_parameters` what a binding's abstraction takes, and that
+read the *spine*: lambdas, one inside the next. A dictionary is a `CRecord` of
+lambdas under the class's type binder, so the spine reader found no parameters
+in `instance Index (Array a)` and concluded it destructured nothing, while the
+`get` inside it does `Prim.arrayGet` on an `Array a`. Its earlier argument --
+that a lambda deeper in the body is a closure the body makes for itself --
+does not survive a body that hands the closure out, and a dictionary is
+nothing but that. So: every lambda in the value.
+
+**A method's own `forall` went missing.** A method quantifies over its own
+variables as well as its class's, and `lower.method_abstraction` states those
+in a `CTyLam` *under* the dictionary lambda. `mono` supplies the evidence,
+which consumes that lambda and leaves the abstraction outermost -- and the
+copy it wrote had empty `binders` and a still-generic body. `mono.instantiate`
+needs binders to match type arguments against and `layout.share` keys copies
+on them, so `%default.Foldable.fold@Array` was invisible to both and reached
+the generic `Index (Array a)` dictionary. The copy now states what it
+abstracts over, and the use site restates it as the eta-expansion it is.
+
+**A global was lowered under the initializer's layouts.** `layout.share` gives
+a copy its `layouts`, and the copy of a *dictionary* is a record built in the
+module initializer -- which lowered every global's value under its own empty
+map. So `%inst.Index (Array a)@[i1]` existed, was correctly selected, and had
+its methods lifted with nothing known.
+
+**And a family that never reduced.** `layout_of` cannot answer
+`Index.Value (Array Bool)`, which is the `Bool` the instance says it is and is
+written as one. `_Rewriter.ty` reduces as it substitutes and says, correctly,
+that with no substitution there is nothing to do -- which leaves the binding
+nothing specialized carrying the types `lower` wrote, and a dictionary's
+method is typed in its class's families there. One pass over the program
+before the layouts are decided, rather than a rule that each of the places a
+family is introduced has to remember.
+
+The last of these is why the entry is one entry. `held_at` was total: the
+uniform representation wherever `layout_of` had no answer, documented as the
+right question for a value a body only *holds*. It is -- but the type that
+says a body can only hold a value is a bare *variable*. `Array a` is not that,
+and neither is `Index.Value (Array Bool)`, and neither is a field of a
+dictionary compiled with its layouts mislaid. Answering `BOXED` for those is
+not a convention two sides keep, it is one side guessing, and each of the four
+bugs above is a case where the guess was wrong and nothing said so.
+
+`held_at` now falls back only for a `TVar` and refuses anything else. Three of
+the four would have been a compile error the day they were written, and the
+whole suite passes with the guess gone -- so nothing was relying on it.
 
 ---
 

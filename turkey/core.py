@@ -464,21 +464,59 @@ def is_dictionary(ty: Type) -> bool:
 
 
 def abstraction_parameters(value) -> list[CParam]:
-    """Every parameter of a binding's own abstraction, not the first lambda's.
+    """Every parameter of every lambda inside a binding's value.
 
     Elaboration gives a constrained binding more than one lambda: the
     dictionaries in the outer, the value parameters in another inside it. A
     reader that stops at the first therefore sees a constrained function's
     dictionaries and *nothing else*.
 
-    The spine only. A lambda deeper in the body is a closure the body makes
-    for itself, and what that may take apart is decided by what the binding
-    already holds.
+    Nor is the spine enough, which is what this used to read. An instance
+    dictionary is not a lambda at all -- it is a `CRecord` of them, under the
+    class's type binder -- so a spine reader finds no parameters in
+    `instance Index (Array a)` and concludes it destructures nothing, while
+    the `get` inside it does `Prim.arrayGet` on an `Array a` (FINDINGS 54).
+    Every lambda in the value, then, and the argument that a lambda deeper in
+    the body is a closure the body makes for itself does not save it: a body
+    may hand that closure out, and a dictionary is nothing but that.
+
+    Over-approximating costs a binding a copy per layout that nothing needed.
+    Under-approximating costs a field read at a width it was not written at.
     """
     out: list[CParam] = []
+
+    def walk(node) -> None:
+        if isinstance(node, CLam):
+            out.extend(node.params)
+        if isinstance(node, (CExpr, CBind, CAlt)):
+            for f in fields(node):
+                walk(getattr(node, f.name))
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item)
+
+    walk(value)
+    return out
+
+
+def abstraction_binders(bind: CBind) -> list[TVar]:
+    """Every type variable `bind` abstracts, wherever it states them.
+
+    A binding says `forall` in two places. `CBind.binders` is the one the
+    checker reads at a use site, and it is the only one a *generic* binding
+    has. A method quantifies over its own variables as well as its class's,
+    and `lower.method_abstraction` states those in a `CTyLam` under the
+    dictionary lambda -- so `mono`, which consumes that lambda, leaves a copy
+    whose `binders` are empty and whose body is still generic.
+
+    Both are `forall`, and the use site applies types to both the same way, so
+    a pass that asks what a binding abstracts over wants them together.
+    """
+    out = list(bind.binders)
+    value = bind.value
     while isinstance(value, (CLam, CTyLam)):
-        if isinstance(value, CLam):
-            out.extend(value.params)
+        if isinstance(value, CTyLam):
+            out.extend(value.binders)
         value = value.body
     return out
 
@@ -507,7 +545,7 @@ def transparent_parameters(bind: CBind, abstracted: set[int]) -> list[CParam]:
     shared nor refused (FINDINGS 53). They differ in *which* variables count as
     abstracted, which is the argument, and in nothing else.
     """
-    if not bind.binders or not isinstance(bind.value, CLam) or not abstracted:
+    if not abstracted:
         return []
     found = []
     for param in abstraction_parameters(bind.value):
@@ -784,7 +822,8 @@ __all__ = [
     "CMatch", "CParam",
     "CPrim", "CProgram", "CProject", "CRecord", "CRef", "CTuple", "CTyApp",
     "CTyLam", "CUnit", "CVar", "REF", "TAIL_FIELDS", "is_ref",
-    "abstraction_parameters", "class_of_dict", "dict_class",
+    "abstraction_binders", "abstraction_parameters",
+    "class_of_dict", "dict_class",
     "dict_name", "is_dictionary",
     "names_of", "ref_elem", "ref_of", "transparent_parameters",
     "show_bind", "show_expr", "show_program",

@@ -1,5 +1,7 @@
 import os
 import re
+import subprocess
+import sys
 
 import pytest
 from pathlib import Path
@@ -10,6 +12,8 @@ from turkey.errors import TurkeyPanic
 from turkey import backend_ir as bir
 from turkey.backend_lower import lower
 from turkey.llvmgen import compile, execute, generate, _root_slots
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 PROGRAMS_DIR = Path(__file__).parent / "programs"
 # Every runtime entry point generated code is allowed to call. Allocation,
@@ -796,3 +800,58 @@ fun main() {
 }
 """)
     assert capfd.readouterr().out == "42\n"
+
+
+# -- a standalone executable -------------------------------------------------
+
+
+def test_build_produces_an_executable_that_runs_on_its_own(tmp_path):
+    """`turkey build`, end to end: no Python at run time.
+
+    The JIT reaches the entry through `ctypes` and reads the panic and exit
+    flags back in Python. A compiled program has neither, so this checks the
+    three things the C `main` took over: the arguments arrive, what the program
+    prints is what it printed under the JIT, and the status it chose is the
+    process's.
+    """
+    source = tmp_path / "prog.tl"
+    source.write_text("""
+import System.Env as Env
+
+fun main() {
+    let given = Env.args()
+    print(Int.toString(len(given)))
+    for a in given { print(a) }
+    Env.exit(3)
+}
+""", encoding="utf-8")
+    output = tmp_path / "prog"
+    build = subprocess.run(
+        [sys.executable, "-m", "turkey", "build", str(source), "-o", str(output)],
+        cwd=REPO_ROOT, env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)),
+        capture_output=True, text=True)
+    assert build.returncode == 0, build.stderr
+    assert output.is_file()
+
+    ran = subprocess.run([str(output), "one", "two"], capture_output=True,
+                         text=True)
+    assert ran.stdout == "2\none\ntwo\n"
+    assert ran.returncode == 3
+
+
+def test_a_built_program_reports_a_panic_and_fails(tmp_path):
+    """The other half of what `turkey_main` took over from the JIT boundary."""
+    source = tmp_path / "boom.tl"
+    source.write_text(
+        "fun main() { let xs = [1]\n print(xs[4]) }\n", encoding="utf-8")
+    output = tmp_path / "boom"
+    build = subprocess.run(
+        [sys.executable, "-m", "turkey", "build", str(source), "-o", str(output)],
+        cwd=REPO_ROOT, env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)),
+        capture_output=True, text=True)
+    assert build.returncode == 0, build.stderr
+    ran = subprocess.run([str(output)], capture_output=True, text=True)
+    assert ran.returncode == 1
+    assert "panic:" in ran.stderr
+    # The frames come from the same shadow stack the JIT boundary reads.
+    assert "boom.tl" in ran.stderr

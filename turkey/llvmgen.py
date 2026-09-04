@@ -1706,4 +1706,56 @@ def execute(program: CProgram, decls: DeclTable, main: str = "main",
     compile(program, decls, main).execute()
 
 
-__all__ = ["NativeModule", "compile", "execute", "generate"]
+def build(program: CProgram, decls: DeclTable, output: Path,
+          main: str = "main") -> None:
+    """Compile to a standalone executable.
+
+    The same module the JIT runs, with a `main` in front of it and the object
+    handed to `cc` for linking. The runtime is already *in* the module -- it is
+    linked as IR before `-O2` so that allocation can inline -- so nothing but
+    libc is left to link against, and `cc` is a dependency this already had for
+    building that IR in the first place.
+    """
+    source = lower(program, decls, main)
+    emitter = _Emitter(source)
+    text, machine = emitter.emit()
+    module = binding.parse_assembly(text)
+    module.verify()
+    runtime_module = binding.parse_assembly(_runtime_module(module.triple))
+    runtime_module.verify()
+    module.link_in(runtime_module)
+    module.link_in(binding.parse_assembly(_entry_module(source, module.triple)))
+    _optimize(module, machine)
+    with tempfile.TemporaryDirectory() as directory:
+        obj = Path(directory) / "program.o"
+        obj.write_bytes(machine.emit_object(module))
+        command = ["cc", str(obj), "-o", str(output)]
+        try:
+            subprocess.run(command, check=True, capture_output=True, text=True)
+        except (OSError, subprocess.CalledProcessError) as exc:
+            detail = (exc.stderr.strip()
+                      if isinstance(exc, subprocess.CalledProcessError)
+                      else str(exc))
+            raise Unsupported(f"could not link the program: {detail}") from exc
+
+
+def _entry_module(source: bir.Source, triple: str) -> str:
+    """A `main` that hands off to `turkey_main` with this program's entry.
+
+    Three lines of IR because everything that does not depend on the program
+    is in the runtime: only the entry's *name* varies, and that is what this
+    passes. Emitted as a separate module and linked in so that the JIT path,
+    which has its own way in through `ctypes`, never acquires a `main`.
+    """
+    return f"""
+target triple = "{triple}"
+declare i32 @turkey_main(i32, ptr, ptr)
+declare void @{source.entry}()
+define i32 @main(i32 %argc, ptr %argv) {{
+  %status = call i32 @turkey_main(i32 %argc, ptr %argv, ptr @{source.entry})
+  ret i32 %status
+}}
+"""
+
+
+__all__ = ["NativeModule", "build", "compile", "execute", "generate"]

@@ -82,6 +82,11 @@ void turkey_exit_clear(void);
    `SIGSEGV` handler is not this library's to take by default. */
 void turkey_install_crash_handler(void);
 
+/* The `main` of a compiled program: hands the arguments over, runs `entry`,
+   and turns the panic and exit flags into an exit status. The code generator
+   emits a `main` that is a call to this. */
+int turkey_main(int argc, char **argv, void (*entry)(void));
+
 void turkey_panic(const char *message);
 void turkey_panic_string(TurkeyString *message);
 int32_t turkey_panicked(void);

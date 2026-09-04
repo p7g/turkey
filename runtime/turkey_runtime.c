@@ -1106,3 +1106,63 @@ void turkey_install_crash_handler(void) {
     signal(SIGSEGV, crash_report);
     signal(SIGBUS, crash_report);
 }
+
+/* ------------------------------------------------------------- a real binary
+ *
+ * The JIT reaches the entry through `ctypes` and reads the panic and exit
+ * flags back in Python. A compiled program has no Python, so the same three
+ * steps -- hand over the arguments, run, report -- are here instead, and the
+ * `main` the code generator emits is a call to this with the entry thunk.
+ *
+ * In C rather than in generated IR because none of it depends on the program:
+ * only the entry's *name* does, and that is the argument.
+ */
+int turkey_main(int argc, char **argv, void (*entry)(void)) {
+    /* `argv + 1`: the program's own arguments, with its name dropped, which is
+       what `driver.run` hands the JIT so that the two hosts agree on element
+       zero. */
+    int count = argc > 0 ? argc - 1 : 0;
+    if (count > 0) {
+        const unsigned char **bytes =
+            malloc((size_t)count * sizeof(unsigned char *));
+        int64_t *lengths = malloc((size_t)count * sizeof(int64_t));
+        if (bytes == NULL || lengths == NULL) {
+            free((void *)bytes);
+            free(lengths);
+            fputs("turkey: out of memory reading arguments\n", stderr);
+            return 1;
+        }
+        for (int index = 0; index < count; ++index) {
+            bytes[index] = (const unsigned char *)argv[index + 1];
+            lengths[index] = (int64_t)strlen(argv[index + 1]);
+        }
+        turkey_args_set(count, bytes, lengths);
+        free((void *)bytes);
+        free(lengths);
+    } else {
+        turkey_args_set(0, NULL, NULL);
+    }
+
+    entry();
+
+    if (turkey_exiting()) {
+        int64_t status = turkey_exit_status();
+        return (int)(status & 0xff);
+    }
+    if (turkey_panicked()) {
+        const char *message = turkey_panic_message();
+        fprintf(stderr, "panic: %s\n", message == NULL ? "" : message);
+        int64_t depth = turkey_frame_count();
+        for (int64_t index = 0; index < depth; ++index) {
+            const char *function = turkey_frame_function(index);
+            const char *file = turkey_frame_file(index);
+            fprintf(stderr, "  at %s (%s:%" PRId64 ":%" PRId64 ")\n",
+                    function == NULL ? "?" : function,
+                    file == NULL ? "?" : file,
+                    turkey_frame_line(index), turkey_frame_col(index));
+        }
+        return 1;
+    }
+    turkey_collect();
+    return 0;
+}

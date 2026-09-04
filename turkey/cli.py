@@ -49,9 +49,13 @@ def _main(argv: list[str] | None = None) -> int:
         ("opt", "dump that Core with the optimizations applied"),
         ("python", "print the generated Python source without running it"),
         ("llvm", "print verified LLVM IR without running it"),
+        ("build", "compile to a standalone executable"),
     ]:
         p = sub.add_parser(name, help=help_text)
         p.add_argument("file")
+        if name == "build":
+            p.add_argument("-o", "--output", required=True,
+                           help="where to write the executable")
         if name == "run":
             p.add_argument("--backend", choices=("llvm", "python"),
                            default="llvm")
@@ -118,6 +122,11 @@ def _main(argv: list[str] | None = None) -> int:
             checked = check(src, args.file, [Path(args.file).resolve().parent])
             report_warnings(checked.warnings, args.file)
             print(llvmgen.generate(checked.opt, checked.decls, checked.main), end="")
+        elif args.command == "build":
+            checked = check(src, args.file, [Path(args.file).resolve().parent])
+            report_warnings(checked.warnings, args.file)
+            llvmgen.build(checked.opt, checked.decls, Path(args.output),
+                          checked.main)
         elif args.command == "types":
             checked = check(src, args.file, [Path(args.file).resolve().parent])
             report_warnings(checked.warnings, args.file)

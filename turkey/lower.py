@@ -720,7 +720,18 @@ class Lowerer:
         return CUnit(self.ty_of(e), e.span)
 
     def _lower_ECon(self, e: ast.ECon, scope: Scope) -> CExpr:
-        return CCon(self.ty_of(e), e.span, e.name)
+        """A constructor named rather than applied, which is a function value.
+
+        `Array.map(xs, ChExpr)` passes one along, so it has to *be* one. A
+        `CCon` is not: it is the allocation itself, and every backend reads it
+        as such -- `CApp(CCon, args)` is the only shape that builds a value,
+        which is why `_lower_ECall` names it directly below. So a constructor
+        of arity greater than zero is eta-expanded here, and a nullary one is
+        left alone: it is already a value, and `eta` declines it for the same
+        reason (its type is not a function).
+        """
+        return self.eta(CCon(self.ty_of(e), e.span, e.name),
+                        self.ty_of(e), e.span)
 
     def _lower_EVar(self, e: ast.EVar, scope: Scope) -> CExpr:
         return self.var(e, scope)
@@ -891,8 +902,18 @@ class Lowerer:
         return self.lambda_of(e.params, e.body, self.ty_of(e), e.span, scope)
 
     def _lower_ECall(self, e: ast.ECall, scope: Scope) -> CExpr:
-        return CApp(self.ty_of(e), e.span, self.expr(e.fn, scope),
-                    [self.expr(a, scope) for a in e.args])
+        args = [self.expr(a, scope) for a in e.args]
+        callee = e.fn
+        while isinstance(callee, ast.EAnnot):
+            callee = callee.expr
+        if isinstance(callee, ast.ECon):
+            # Named *and* applied, so the wrapper `_lower_ECon` would build is
+            # one this would immediately undo. `CApp(CCon, args)` is what the
+            # saturated case has always emitted and what the backends match on.
+            return CApp(self.ty_of(e), e.span,
+                        CCon(self.ty_of(callee), callee.span, callee.name),
+                        args)
+        return CApp(self.ty_of(e), e.span, self.expr(e.fn, scope), args)
 
     def _lower_EAnnot(self, e: ast.EAnnot, scope: Scope) -> CExpr:
         # An annotation constrained inference and has nothing left to say.

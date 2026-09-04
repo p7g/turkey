@@ -387,6 +387,43 @@ class _FunctionLowerer:
             self.entry.name, self.slots,
         )
 
+    def discarding(self, expr: CIf, dest: _Destination) -> _Destination:
+        """Where a one-armed `if`'s `then` branch delivers its value.
+
+        Nowhere, is the answer: an `if` with no `else` *is* the statement form,
+        and section 6.7 gives it the type `Unit` whatever its branch answers
+        (`infer._gen_EIf`). So `if c { Array.pop(xs) }` is a well-typed program
+        whose branch hands back an `Option` the `if` does not have -- and
+        handing that to `dest` is asking for a pointer to become a unit.
+
+        The branch is therefore given a destination of its own, one that takes
+        the value it really produces and passes `dest` the unit the `if`
+        really answers. Unreachable when the branch diverges, and `finish`
+        drops it then, so a `return` inside the branch costs nothing.
+        """
+        if expr.otherwise is not None:
+            return dest
+        block = self.new_block("discard", self.expr_layout(expr.then))
+        self.transfer(block, dest, bir.Constant(bir.Layout.UNIT, 0))
+        return _Destination(block)
+
+    def flat_slots(self, target, env: dict[str, bir.Value]):
+        """The scattered slots of the record `target` names, or `None`.
+
+        Through `env` rather than by the Core name directly, because Core
+        names shadow: `_flat_records` compares names bare, so it can call one
+        `b` flat while a different `b` elsewhere in the body is an ordinary
+        record with different fields. Looking the name up in the environment
+        that scoping already maintains asks about *this* `b` -- the flattened
+        binding puts a stand-in there and nothing else does, so an inner `b`
+        finds its own slot, which is not a record's, and falls through to the
+        ordinary `object_get`.
+        """
+        if not isinstance(target, CVar):
+            return None
+        value = env.get(target.name)
+        return None if value is None else self.record_slots.get(value.name)
+
     def transfer(self, block: bir.Block, dest: _Destination,
                  value: bir.Operand) -> None:
         if dest.block is None:
@@ -415,8 +452,15 @@ class _FunctionLowerer:
                     at.instructions.append(
                         bir.Instruction("slot_store", (slot.name, value)))
                     held[name] = slot
-                self.record_slots[expr.name] = held
-                self.lower(expr.body, env, joins, at, dest)
+                # Keyed by a name of this binding's own, and reached through
+                # `env`, so that a second `b` somewhere else in the body finds
+                # its own slots or none. See `flat_slots`.
+                stand_in = bir.Value(self.fresh("flat_" + expr.name),
+                                     bir.Layout.PTR)
+                self.record_slots[stand_in.name] = held
+                inner = dict(env)
+                inner[expr.name] = stand_in
+                self.lower(expr.body, inner, joins, at, dest)
             self.lower_values([value for _, value in record.fields],
                               env, joins, block, scattered)
             return
@@ -445,7 +489,7 @@ class _FunctionLowerer:
             def branch(at: bir.Block, values: list[bir.Operand]) -> None:
                 yes, no = self.new_block("then"), self.new_block("else")
                 at.terminator = bir.Branch(values[0], yes.name, no.name)
-                self.lower(expr.then, env, joins, yes, dest)
+                self.lower(expr.then, env, joins, yes, self.discarding(expr, dest))
                 other = expr.otherwise or CUnit(UNIT, expr.span)
                 self.lower(other, env, joins, no, dest)
             self.lower_values([expr.cond], env, joins, block, branch)
@@ -647,11 +691,9 @@ class _FunctionLowerer:
                                   at, "cell_load", (xs[0],), self.layout(expr.ty))))
             return
         if isinstance(expr, CAssign):
-            if (isinstance(expr.target, CField)
-                    and isinstance(expr.target.target, CVar)
-                    and expr.target.target.name in self.record_slots):
-                slot = self.record_slots[
-                    expr.target.target.name][expr.target.name]
+            held = self.flat_slots(getattr(expr.target, "target", None), env)
+            if isinstance(expr.target, CField) and held is not None:
+                slot = held[expr.target.name]
                 def scattered_set(at: bir.Block, xs: list[bir.Operand]) -> None:
                     at.instructions.append(bir.Instruction(
                         "slot_store",
@@ -731,9 +773,10 @@ class _FunctionLowerer:
                 done(at, made)
             self.lower_values(items, env, joins, block, aggregate)
             return
-        if (isinstance(expr, CField) and isinstance(expr.target, CVar)
-                and expr.target.name in self.record_slots):
-            slot = self.record_slots[expr.target.name][expr.name]
+        held = (self.flat_slots(expr.target, env)
+                if isinstance(expr, CField) else None)
+        if held is not None:
+            slot = held[expr.name]
             loaded = self.emit(block, "slot_load", (slot.name,), slot.layout)
             done(block, self.coerce(block, loaded, self.layout(expr.ty)))
             return

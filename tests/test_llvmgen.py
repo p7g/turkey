@@ -654,3 +654,140 @@ def test_every_compiled_symbol_carries_the_compiled_prefix():
     stray = [function.name for function in source.functions
              if not function.name.startswith(COMPILED_PREFIX)]
     assert not stray, f"{stray} would share the runtime's namespace"
+
+
+# -- values a statement throws away, and values a name stands for -------------
+#
+# Three shapes `boot` reached that no test program had. Each was well-typed,
+# ran correctly under `pygen`, and could not be lowered to LLVM -- which is the
+# signature of a fact the front end knows and the backend was never told.
+# FINDINGS 48, 49 and 50.
+
+
+def _core_children(node):
+    """One level of a Core node, for the small structural checks below."""
+    import dataclasses
+
+    if not dataclasses.is_dataclass(node):
+        return []
+    out = []
+    for f in dataclasses.fields(node):
+        value = getattr(node, f.name)
+        for item in value if isinstance(value, (list, tuple)) else [value]:
+            if dataclasses.is_dataclass(item):
+                out.append(item)
+    return out
+
+
+def test_a_one_armed_if_discards_a_branch_that_answers_something(capfd):
+    """`if c { e }` is `Unit` whatever `e` is (section 6.7, `infer._gen_EIf`).
+
+    The branch here answers an `Option`, held at `PTR`, where the `if` answers
+    `Unit`. Lowering the branch straight into the `if`'s destination made that
+    a `ptr` arriving where a `unit` was expected; the value is simply not
+    wanted, and nothing had said so.
+    """
+    native("""
+fun main() {
+    let xs = [1, 2, 3]
+    if len(xs) > 0 { Array.pop(xs) }
+    print(len(xs))
+}
+""")
+    assert capfd.readouterr().out == "2\n"
+
+
+def test_a_one_armed_if_whose_branch_diverges_is_still_lowered(capfd):
+    """The other half: the discard must not make an unreachable block real.
+
+    `return` leaves the branch, so the block that would take its value is
+    never jumped to, and `finish` drops it for being unreachable.
+    """
+    native("""
+fun first(xs : Array Int) -> Int {
+    if len(xs) == 0 { return -1 }
+    xs[0]
+}
+fun main() { print(first([])); print(first([7])) }
+""")
+    assert capfd.readouterr().out == "-1\n7\n"
+
+
+def test_a_constructor_can_be_passed_as_a_function(capfd):
+    """`Array.map(xs, Some)` names a constructor without applying it.
+
+    `CCon` is the allocation itself, so a bare one is not a value any backend
+    can pass. It is eta-expanded into the function its type already says it is.
+    """
+    native("""
+type Wrapped = W(Int)
+fun unwrap(w : Wrapped) -> Int = match w { W(n) -> n }
+fun main() {
+    let wrapped = Array.map([1, 2, 3], W)
+    print(Array.map(wrapped, unwrap))
+}
+""")
+    assert capfd.readouterr().out == "[1, 2, 3]\n"
+
+
+def test_a_saturated_constructor_call_builds_no_wrapper():
+    """Named *and* applied stays `CApp(CCon, args)`, the shape it always was.
+
+    Asserted on the Core rather than on the output, because the output would
+    be right either way: a wrapper the optimizer inlines is invisible from
+    outside and is exactly what this must not start emitting.
+    """
+    from turkey.core import CApp, CCon, CLam
+
+    checked = check("""
+type Pair = P(Int, Int)
+fun left(p : Pair) -> Int = match p { P(a, _) -> a }
+fun main() { print(left(P(4, 5))) }
+""")
+    seen = []
+
+    def walk(node):
+        if isinstance(node, CApp) and isinstance(node.fn, CCon):
+            seen.append(node.fn.name)
+        for child in _core_children(node):
+            walk(child)
+
+    for bind in checked.core.binds:
+        walk(bind)
+    assert any(name.endswith("#P") or name == "P" for name in seen), seen
+
+
+def test_two_records_sharing_a_name_keep_their_own_scattered_slots(capfd):
+    """A flattened record's slots are found through `env`, which has scope.
+
+    `b` in `main` is a record every mention of which is a field of it, so it
+    is scattered into slots and never allocated. Inlining `tally` then brings
+    a second `b` into the same body -- bound by a `match`, over a different
+    record, with a different field. Keyed by the bare name, as the slots once
+    were, the inner `b.value` looked into the outer `b`'s slots and found
+    `parts`; here that raises, and where the field names happen to agree it
+    would instead read the wrong field at the wrong layout.
+
+    The shape is `boot`'s: `Turkey.Classes#showClasses` builds a string in a
+    `b` that inlining turns into slots, and `Map.entries` brought its own `b`.
+    Reproducing it needs the inner binding *not* to be a record literal, or
+    `_flat_records` refuses the name as repeated and the collision cannot
+    arise -- hence the `Array.at`.
+    """
+    native("""
+type Acc = Acc { parts : Array Int }
+type Item = Item { value : Int }
+
+fun tally(xs : Array Item) -> Int = match Array.at(xs, 0) {
+    None -> 0
+    Some(b) -> b.value
+}
+
+fun main() {
+    let items = [Item { value = 42 }]
+    let b = Acc { parts = Array.new(4) }
+    Array.push(b.parts, tally(items))
+    print(b.parts[0])
+}
+""")
+    assert capfd.readouterr().out == "42\n"

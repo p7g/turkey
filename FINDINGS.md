@@ -812,6 +812,74 @@ Recorded as a finding because it was forced, but it is the better spelling:
 identity said only that it was that particular object. Worth remembering when
 the same pressure comes up again -- an absent feature made the code say more.
 
+### 48. A one-armed `if` discards a value the backend tried to keep
+**bug, fixed.** M25. Section 6.7 gives statement-style `if` the type `Unit`
+whatever its branch answers, and `infer._gen_EIf` says so outright: with no
+`else`, the branch's type is generated and then dropped on the floor. So
+`if isClose(tok.kind) && len(stack) > 0 { Array.pop(stack) }` in
+`Turkey.Lexer#applyNewlineRule` is a well-typed program whose branch produces an
+`Option Kind` the `if` does not have.
+
+`backend_lower` lowered the branch straight into the `if`'s own destination, so
+that `Option` -- a `PTR` -- arrived at a join parameter of layout `UNIT` and the
+lowering refused: `LLVM cannot convert ptr to unit`. The value was never wanted;
+nothing had been told to drop it.
+
+Nothing upstream could object, and `coretc._check_CIf` is explicit about why: on
+`e.otherwise is None` it returns the node's own type without checking the
+branch against it. That is the same rule as `_gen_EIf`, faithfully kept, and it
+is the *lowering* that had not been told. The branch now gets a destination of
+its own -- one whose parameter is the layout it really produces, and which
+hands the real destination the unit the `if` really answers. When the branch
+diverges the block is unreachable and `finish` drops it, so a `return` inside a
+one-armed `if` costs nothing.
+
+Worth noticing that this is the *third* consumer to need telling separately.
+`pygen` never noticed because Python is untyped, `coretc` deliberately declines
+to look, and only a backend with layouts had to care. A discard that the Core
+stated -- the `CLet %seq` that `core.py` already documents as "how a statement
+whose value is discarded is expressed" -- would have been one fact rather than
+three agreements.
+
+### 49. A constructor named rather than applied is not a function
+**bug, fixed.** M25. `Array.map(xs, ChExpr)` in `Turkey.Ast#exprChildren` passes
+a constructor as a function value, which the surface language allows and the
+type checker types. `CCon` cannot express it: it *is* the allocation, and
+`CApp(CCon, args)` is the only shape any backend reads as building a value. So
+the LLVM backend reported `constructor 'ChExpr' must be saturated` -- correctly,
+about a Core term that should never have reached it.
+
+`_lower_ECon` now eta-expands through the `eta` helper the lowering already had
+for deferring a method, and `_lower_ECall` names a constructor callee directly
+so that a saturated call emits exactly the Core it always did. A nullary
+constructor is untouched: it is already a value, and `eta` declines it for the
+same reason its type gives -- it is not a function.
+
+`pygen` had no trouble with a bare `CCon` because a Python constructor is a
+callable, which is why this survived to the second backend.
+
+### 50. Scattered record slots were keyed by a name that shadows
+**bug, fixed.** M25, and found on the way to 49 rather than looked for.
+
+`_flat_records` compares names bare and says so -- "one disqualified mention
+rules out every binding sharing that name". `backend_lower.record_slots` then
+keyed the scattered slots by that same bare Core name, on the lowerer rather
+than in the environment, so it had no scope at all. In `Turkey.Classes#showClasses`
+a flattened `b` with a field `parts` and an unrelated `b` elsewhere in the body
+met in that one dictionary, and reading `b.value` raised `KeyError: 'value'`.
+
+The `KeyError` was luck. Two records whose field *names* agree would have read
+each other's slots silently, at whatever layout the other's field was written
+at -- a wrong answer of exactly the kind `check_layouts` exists to prevent, in
+a table it does not look at.
+
+The fix is to stop keeping a second, worse scope beside the real one: the
+flattened binding puts a stand-in in `env`, which the lowering already copies
+per scope, and the slots are keyed by that. An inner `b` finds its own slot,
+which is not a record's, and falls through to the ordinary `object_get`. The
+name-based analysis stays name-based -- it only has to over-approximate escape,
+which it still does, so it costs opportunities and not correctness.
+
 ---
 
 ## Library, still wanted

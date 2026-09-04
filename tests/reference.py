@@ -40,7 +40,7 @@ from turkey.classes import field_class, field_family
 from turkey.constraints import HAS_FIELD, ONE_OF, CPred, reach
 from turkey.types import (
     BOOL, CHAR, EQUALS, FLOAT, INT, STAR, STRING, Pred, Scheme, TApp, TCon,
-    TFam, TFun, TLabel, TSet,
+    TFam, TFun, TSet,
     TTuple, TVar, Type, float_literal_set, int_literal_set, numeric_order,
     numeric_type, spine, type_key, vars_of,
 )
@@ -383,7 +383,10 @@ def infer(e: ast.Expr, env: Env, st: State) -> Type:
     if isinstance(e, ast.EField):
         receiver = infer(e.obj, env, st)
         result = TVar(0)
-        st.preds.append(Pred(HAS_FIELD, [TLabel(e.name), receiver, result]))
+        # A `TCon` carries the label, since all this model ever reads off
+        # it is `.name`. The compiler had a `TLabel` for this and no
+        # longer does: a generated class's *name* carries the field.
+        st.preds.append(Pred(HAS_FIELD, [TCon(e.name, STAR), receiver, result]))
         return result
 
     if isinstance(e, ast.ERecord):

@@ -122,9 +122,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field, fields, replace
 
 from .classes import ClassTable
-from .core import (CAlt, CBind, CExpr, CField, CIndex, CLam, CLet, CLetRec,
+from .core import (dict_class, CAlt, CBind, CExpr, CField, CIndex, CLam, CLet, CLetRec,
                    CParam, CProgram, CProject, CRecord, CTyApp, CTyLam, CVar,
-                   names_of)
+                   names_of,
+                   transparent_parameters as core_transparent)
 from .coretc import Fams
 from .decls import DeclTable, substitute
 from .typed import reduce_deep
@@ -211,10 +212,7 @@ def _mangle(t: Type) -> str:
 
 def _dict_class(ty: Type) -> str | None:
     """The class a `%Dict.C h` type names, or None if it is not one."""
-    head, args = spine(prune(ty))
-    if isinstance(head, TCon) and head.name.startswith("%Dict.") and len(args) == 1:
-        return head.name[len("%Dict."):]
-    return None
+    return dict_class(ty)
 
 
 def _takes_dictionaries(bind: CBind) -> bool:
@@ -988,21 +986,14 @@ def _reachable(program: CProgram, main: str) -> CProgram:
 def transparent_parameters(program: CProgram) -> list[tuple[str, str, Type]]:
     """Where a generic body could take polymorphic data apart.
 
-    A generic body may hold a value of an abstracted type, and pass it on, and
-    nothing else: that is parametricity, and it is why a bare `a` parameter is
-    always fine. What it may not do is *destructure* one, because the layout it
-    would read a field at is decided here and the layout the field was written
-    at is decided at the construction site, from the operand layouts it had
-    (`backend_lower._layout_metadata`). Nothing makes the two agree, and the
-    runtime used to paper over the disagreement by boxing -- which is what
-    `turkey_object_get_as` was for, and why field access could not be a load
-    until this was true.
-
-    So the parameter to look at is a *transparent* one: a type that mentions an
-    abstracted variable without being one. `Array a` is transparent and `a` is
-    not. A dictionary is exempt: `%Dict.C a` is a record of closures, and
-    passing polymorphic data to the closures inside it is the mechanism this
-    exists to leave intact.
+    The predicate is `core.transparent_parameters`, shared with
+    `layout.transparent` -- see there for why one definition and not two. What
+    is decided here is *which* variables count as abstracted, and the answer is
+    the ones no layout was found for: a variable whose layout the binding was
+    compiled under is not a variable without a layout. That is what
+    `layout.share` produces and the whole of what this check wanted -- not
+    which type it is, which is undecidable and is what the cap gave up on, but
+    how wide it is and whether it is a pointer.
 
     Reachability is from `main`, because an unreachable generic binding is
     never compiled.
@@ -1025,56 +1016,14 @@ def transparent_parameters(program: CProgram) -> list[tuple[str, str, Type]]:
         seen.add(name)
         stack.extend(names_of(binds[name].value) & set(binds))
 
-    def dictionary(ty: Type) -> bool:
-        head, _ = spine(prune(ty))
-        return isinstance(head, TCon) and head.name.startswith("%Dict.")
-
     found: list[tuple[str, str, Type]] = []
     for name in sorted(seen):
         bind = binds[name]
-        value = bind.value
-        if not bind.binders or not isinstance(value, CLam):
-            continue
-        parameters = _abstraction_parameters(value)
-        # A variable whose layout the binding was compiled under is not a
-        # variable without a layout. That is what `layout.share` produces and
-        # the whole of what this check wanted: not which type it is, which is
-        # undecidable and is what the cap gave up on, but how wide it is and
-        # whether it is a pointer.
         abstracted = {variable.id for variable in bind.binders
                       if variable.id not in bind.layouts}
-        if not abstracted:
-            continue
-        for param in parameters:
-            ty = prune(param.ty)
-            if isinstance(ty, TVar) or dictionary(ty):
-                continue
-            if {variable.id for variable in vars_of(ty)} & abstracted:
-                found.append((name, param.name, ty))
+        for param in core_transparent(bind, abstracted):
+            found.append((name, param.name, prune(param.ty)))
     return found
-
-
-def _abstraction_parameters(value: CExpr) -> list[CParam]:
-    """Every parameter of a binding's own abstraction, not the first lambda's.
-
-    Elaboration gives a constrained function *two* lambdas: the dictionaries
-    in one, and the value parameters in another inside it. Reading only the
-    outermost therefore sees a constrained function's dictionaries and nothing
-    else -- and a dictionary is exempt above, so every constrained generic
-    function was exempt along with it. `Data.Map#findSlot[Eq k]` is the one
-    that mattered: its outer lambda takes `%Dict.Eq a`, and the `m : Map a b`
-    this check exists to refuse is one layer further in (FINDINGS 53).
-
-    The spine only. A lambda deeper in the *body* is a closure the body makes
-    for itself, and what it may destructure is decided by what this binding
-    already holds.
-    """
-    out: list[CParam] = []
-    while isinstance(value, (CLam, CTyLam)):
-        if isinstance(value, CLam):
-            out.extend(value.params)
-        value = value.body
-    return out
 
 
 def check_layouts(program: CProgram) -> None:

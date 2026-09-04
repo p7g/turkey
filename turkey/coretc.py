@@ -71,7 +71,7 @@ from dataclasses import dataclass, field
 
 from . import ast
 from .classes import ClassTable, match
-from .core import (
+from .core import (class_of_dict, dict_class, 
     TAIL_FIELDS, CApp, CArray, CAssign, CBind, CCon,
     CDeref, CExpr, CField, CIf, CIndex, CJoin, CJump, CLam, CProject,
     CLet, CLetRec, CLit, CMatch, CParam, CPrim, CProgram, CRecord, CRef,
@@ -351,11 +351,10 @@ class Checker:
     def dict_parts(self, ty: Type, span: Span | None) -> tuple[str, Type]:
         """Read `%Dict.C t` back as the class `C` and the type `t`."""
         ty = prune(ty)
-        head, args = spine(ty)
-        if (not isinstance(head, TCon) or not head.name.startswith("%Dict.")
-                or len(args) != 1):
+        cls = dict_class(ty)
+        if cls is None:
             raise CoreError(f"{show(ty)} is not a dictionary", span)
-        cls = head.name[len("%Dict."):]
+        _, args = spine(ty)
         if cls not in self.classes.classes:
             raise CoreError(f"no such class '{cls}'", span)
         return cls, args[0]
@@ -427,9 +426,7 @@ class Checker:
         raise CoreError(f"'{head.name}' has no field '{name}'", span)
 
     def is_dict(self, ty: Type) -> bool:
-        head, args = spine(prune(ty))
-        return (isinstance(head, TCon) and head.name.startswith("%Dict.")
-                and len(args) == 1)
+        return dict_class(ty) is not None
 
     def dict_type(self, cls: str, arg: Type) -> Type:
         from .lower import dict_con
@@ -440,7 +437,7 @@ class Checker:
 
     def _check_CRecord(self, e: CRecord, env: Env) -> Type:
         """A record, which is also how a dictionary is built."""
-        if e.con.startswith("%Dict."):
+        if class_of_dict(e.con) is not None:
             cls, head = self.dict_parts(e.ty, e.span)
             self.dictionary(e, cls, head, env)
             return e.ty

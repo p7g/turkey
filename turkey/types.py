@@ -320,44 +320,17 @@ class TTuple(Type):
         return f"TTuple({self.elems!r})"
 
 
-class TLabel(Type):
-    """A field name lifted into the type language.
-
-    Legal only in the first argument of `HasField`, and deliberately not kinded
-    -- it exists so one predicate former can name any field, rather than the
-    domain growing a former per label. It is rigid (two labels are equal only
-    when they are the same string) and contains no variables, so every walk
-    over types passes it through untouched.
-    """
-
-    __slots__ = ("name",)
-
-    def __init__(self, name: str):
-        self.name = name
-
-    def __repr__(self) -> str:
-        return f"TLabel({self.name!r})"
-
-
-class TIndex(Type):
-    """A numeric projection index lifted into a predicate argument."""
-
-    __slots__ = ("value",)
-
-    def __init__(self, value: int):
-        self.value = value
-
-    def __repr__(self) -> str:
-        return f"TIndex({self.value!r})"
-
-
 class TSet(Type):
     """A closed set of type constructor names, lifted into the type language.
 
-    Legal only in the second argument of `OneOf`, and the counterpart of
-    `TLabel`: it lets one predicate former name any set of candidates rather
-    than the domain growing a former per set. Rigid, variable-free, and passed
-    through every walk over types untouched.
+    Legal only in the second argument of `OneOf`: it lets one predicate former
+    name any set of candidates rather than the domain growing a former per set.
+    Rigid, variable-free, and passed through every walk over types untouched.
+
+    The last of its kind. `TLabel` and `TIndex` lifted a field name and a tuple
+    index the same way, for `HasField` and `HasProjection`, and went out when
+    those became generated classes whose *name* carries the label -- so the
+    field is in the class and there is nothing left to lift.
     """
 
     __slots__ = ("names",)
@@ -908,16 +881,6 @@ def unify(a: Type, b: Type, span: Span | None = None, context: str = "",
         unify(a.ret, b.ret, span, context, fams)
         return
 
-    if isinstance(a, TLabel) and isinstance(b, TLabel):
-        if a.name != b.name:
-            raise _mismatch(a, b, span, context)
-        return
-
-    if isinstance(a, TIndex) and isinstance(b, TIndex):
-        if a.value != b.value:
-            raise _mismatch(a, b, span, context)
-        return
-
     if isinstance(a, TTuple) and isinstance(b, TTuple):
         if len(a.elems) != len(b.elems):
             raise _mismatch(a, b, span, context)
@@ -1082,10 +1045,6 @@ def type_key(t: Type) -> tuple:
         return ("fun", tuple(type_key(p) for p in t.params), type_key(t.ret))
     if isinstance(t, TTuple):
         return ("tuple", tuple(type_key(e) for e in t.elems))
-    if isinstance(t, TLabel):
-        return ("label", t.name)
-    if isinstance(t, TIndex):
-        return ("index", t.value)
     if isinstance(t, TSet):
         return ("set", tuple(sorted(t.names)))
     return ("bottom",)
@@ -1193,10 +1152,6 @@ def show(t: Type, names: dict[int, str] | None = None, free_prefix: str = "",
             return names[ty.id]
         if isinstance(ty, TBottom):
             return "!"
-        if isinstance(ty, TLabel):
-            return f'"{ty.name}"'
-        if isinstance(ty, TIndex):
-            return str(ty.value)
         if isinstance(ty, TSet):
             return "{" + ", ".join(sort_numeric(ty.names)) + "}"
         if isinstance(ty, TTuple):

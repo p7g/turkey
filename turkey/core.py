@@ -65,7 +65,7 @@ from dataclasses import dataclass, field, fields
 from .errors import Span
 from .lexer import literal_text
 from .types import (
-    STAR, TApp, TCon, TVar, Type, kind_arrow, show,
+    STAR, TApp, TCon, TVar, Type, kind_arrow, prune, show, spine, vars_of,
 )
 
 # The reference-cell constructor. `%` cannot start a source identifier, so this
@@ -424,6 +424,101 @@ class CProgram:
     binds: list[CBind] = field(default_factory=list)
 
 
+# A class's dictionary type is named after the class, and this is that naming.
+# Not a prefix constant: the encoding is a *bijection*, and it was spread over
+# a maker in `lower.dict_con` and seven hand-written `startswith`/slice pairs
+# in five other modules -- so every consumer knew how the name is built, and
+# changing it would have meant finding all of them. `%` cannot start a source
+# identifier, so none of these can collide with a declared type.
+_DICT_PREFIX = "%Dict."
+
+
+def dict_name(cls: str) -> str:
+    """The name of the dictionary type for `cls`."""
+    return _DICT_PREFIX + cls
+
+
+def class_of_dict(name: str) -> str | None:
+    """The class a dictionary type is for, given its name, or `None`."""
+    if not name.startswith(_DICT_PREFIX):
+        return None
+    return name[len(_DICT_PREFIX):]
+
+
+def dict_class(ty: Type) -> str | None:
+    """The class `ty` is the dictionary of, or `None` if it is not one.
+
+    Saturated: `dict_con` gives the constructor kind `k -> *`, so an
+    unapplied one is not the type of any value. Every caller wanted that and
+    two of the three checked it separately.
+    """
+    head, args = spine(prune(ty))
+    if not isinstance(head, TCon) or len(args) != 1:
+        return None
+    return class_of_dict(head.name)
+
+
+def is_dictionary(ty: Type) -> bool:
+    """Whether `ty` is a `%Dict.C a`."""
+    return dict_class(ty) is not None
+
+
+def abstraction_parameters(value) -> list[CParam]:
+    """Every parameter of a binding's own abstraction, not the first lambda's.
+
+    Elaboration gives a constrained binding more than one lambda: the
+    dictionaries in the outer, the value parameters in another inside it. A
+    reader that stops at the first therefore sees a constrained function's
+    dictionaries and *nothing else*.
+
+    The spine only. A lambda deeper in the body is a closure the body makes
+    for itself, and what that may take apart is decided by what the binding
+    already holds.
+    """
+    out: list[CParam] = []
+    while isinstance(value, (CLam, CTyLam)):
+        if isinstance(value, CLam):
+            out.extend(value.params)
+        value = value.body
+    return out
+
+
+def transparent_parameters(bind: CBind, abstracted: set[int]) -> list[CParam]:
+    """The parameters through which `bind` could take polymorphic data apart.
+
+    A generic body may hold a value of an abstracted type and pass it on, and
+    nothing else: that is parametricity, and it is why a bare `a` parameter is
+    always fine. What it may not do is *destructure* one, because the layout
+    it would read a field at is decided here while the layout the field was
+    written at is decided at the construction site. So the parameter to look
+    at is a *transparent* one -- a type that mentions an abstracted variable
+    without being one. `Array a` is transparent and `a` is not.
+
+    A dictionary is exempt. It is a record of closures, and passing polymorphic
+    data to the closures inside it is the mechanism the design rests on rather
+    than a leak.
+
+    One definition, because there were two and they were wrong together.
+    `mono.check_layouts` asks this to *refuse* a program and `layout.share`
+    asks it to decide which bindings need a copy per layout -- a producer and
+    its checker, which is worth having only while both mean the same thing by
+    it. Both used to read the outermost lambda alone, so both were blind to
+    every constrained binding, and `Data.Map#findSlot[Eq k]` was neither
+    shared nor refused (FINDINGS 53). They differ in *which* variables count as
+    abstracted, which is the argument, and in nothing else.
+    """
+    if not bind.binders or not isinstance(bind.value, CLam) or not abstracted:
+        return []
+    found = []
+    for param in abstraction_parameters(bind.value):
+        ty = prune(param.ty)
+        if isinstance(ty, TVar) or is_dictionary(ty):
+            continue
+        if {variable.id for variable in vars_of(ty)} & abstracted:
+            found.append(param)
+    return found
+
+
 def names_of(e) -> set[str]:
     """Every term name mentioned anywhere inside a term.
 
@@ -689,6 +784,8 @@ __all__ = [
     "CMatch", "CParam",
     "CPrim", "CProgram", "CProject", "CRecord", "CRef", "CTuple", "CTyApp",
     "CTyLam", "CUnit", "CVar", "REF", "TAIL_FIELDS", "is_ref",
-    "names_of", "ref_elem", "ref_of",
+    "abstraction_parameters", "class_of_dict", "dict_class",
+    "dict_name", "is_dictionary",
+    "names_of", "ref_elem", "ref_of", "transparent_parameters",
     "show_bind", "show_expr", "show_program",
 ]

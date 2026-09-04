@@ -85,7 +85,7 @@ from .evidence import Abstraction, Scope, Use, dict_name
 from .errors import Span, TypeError_
 from .typed import reduce_deep
 from .types import (
-    EQUALS, INT, NO_SCOPE, Pred, Scheme, TBottom, TCon, TFam, TIndex, TLabel, TSet, TTuple, TVar,
+    EQUALS, INT, NO_SCOPE, Pred, Scheme, TBottom, TCon, TFam, TSet, TTuple, TVar,
     Type,
     generalize, instantiate_qual, mono, numeric_order, numeric_type, prune, show,
     short_name, show_pred, sort_numeric, spine, type_key, unify, vars_of,

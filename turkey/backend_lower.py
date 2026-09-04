@@ -89,13 +89,22 @@ def layout_of(ty: Type, abstracted: dict[int, str] | None = None
             return bir.Layout.UNIT
         if ty.name == "Data.Bool.Type#Bool":
             return bir.Layout.I1
+        # Every other declared type is a heap object, and a heap object is
+        # reached by pointer. Said here rather than left to a catch-all at the
+        # end, so that the end can be a refusal.
+        return bir.Layout.PTR
     if is_ref(ty) or isinstance(ty, TFun):
         return bir.Layout.PTR
     if isinstance(ty, (TVar, TFam)):
         return None
     if isinstance(ty, (TApp, TTuple)):
         return bir.Layout.PTR
-    return bir.Layout.PTR
+    # `TSet` is the one that can arrive: a numeric literal whose type was still
+    # a *decision*. Defaulting settles it at generalization and
+    # `TypeTable.unresolved` is the check that it did, so one here is a hole in
+    # that rather than a type wanting a representation. `TLabel` and `TIndex`
+    # have no construction sites left at all since field access became a class.
+    raise Unsupported(f"no layout for the type {ty!r}")
 
 
 def held_at(ty: Type, abstracted: dict[int, str] | None = None) -> bir.Layout:

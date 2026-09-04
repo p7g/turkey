@@ -70,7 +70,7 @@ from dataclasses import dataclass, field
 from . import ast, core, prelude
 from .classes import (ClassTable, InstInfo, generated_index,
                       generated_label, is_generated, match)
-from .core import (
+from .core import (dict_name, 
     CAlt, CApp, CArray, CAssign, CBind, CCon, CDeref, CExpr,
     CField, CIf, CIndex, CJoin, CJump, CLam, CLet, CLetRec, CLit, CProject,
     CMatch, CParam, CProgram, CRecord, CRef, CTuple, CTyApp, CTyLam,
@@ -104,7 +104,13 @@ def fresh_name(hint: str) -> str:
 
 
 def dict_con(cls: str, kind) -> TCon:
-    return TCon(f"%Dict.{cls}", KFun(kind, STAR))
+    """The dictionary type constructor for `cls`.
+
+    The name comes from `core.dict_name`, which is also where the readers of
+    it get the inverse. This used to spell the prefix itself, so the encoding
+    was known in six modules at once.
+    """
+    return TCon(dict_name(cls), KFun(kind, STAR))
 
 
 def super_field(cls: str) -> str:
@@ -299,7 +305,7 @@ class Lowerer:
         for name, impl in plan.methods.items():
             fields.append((_member_surface(name),
                            self.method(inst, name, impl, plan.params)))
-        record = CRecord(result, inst.decl.span, f"%Dict.{inst.cls}", fields)
+        record = CRecord(result, inst.decl.span, dict_name(inst.cls), fields)
         value: CExpr = record
         if plan.params:
             params = [CParam(p, self.dict_type(pred.name, pred.args[0]))
@@ -344,7 +350,7 @@ class Lowerer:
                 CAssign(TCon("Unit"), span, slot,
                         CVar(held, span, written.name)),
                 f"{inst_name(inst)}#set")))
-        record = CRecord(result, span, f"%Dict.{inst.cls}", fields)
+        record = CRecord(result, span, dict_name(inst.cls), fields)
         return CBind(inst_name(inst), result, self.instance_binders(inst),
                      record, span, module=inst.module)
 

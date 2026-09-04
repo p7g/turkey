@@ -63,8 +63,9 @@ from dataclasses import fields as _dataclass_fields, replace
 
 from . import backend_ir as bir
 from .backend_lower import layout_of
-from .core import CAlt, CBind, CExpr, CProgram, CTyApp, CVar
-from .types import TCon, TVar, Type, prune, spine, vars_of
+from .core import (CAlt, CBind, CExpr, CProgram, CTyApp, CVar,
+                   transparent_parameters as core_transparent)
+from .types import Type, vars_of
 
 _FIELDS: dict[type, tuple] = {}
 
@@ -77,33 +78,18 @@ def _fields(node):
     return found
 
 
-def _dictionary(ty: Type) -> bool:
-    """A `%Dict.C a` parameter, which is exempt.
-
-    It is a record of closures, and passing polymorphic data to the closures
-    inside it is the mechanism the whole design rests on rather than a leak.
-    """
-    head, _ = spine(prune(ty))
-    return isinstance(head, TCon) and head.name.startswith("%Dict.")
-
-
 def transparent(bind: CBind) -> bool:
     """Whether this binding could take polymorphic data apart.
 
-    The same question `mono.transparent_parameters` asks, of one binding.
+    Every binder counts as abstracted here, which is the difference from
+    `mono.check_layouts`: that one asks after this pass has run and so may
+    discount a variable whose layout a copy already carries, while this one is
+    deciding which bindings need such a copy in the first place. The predicate
+    itself is `core.transparent_parameters`, shared with it, because when the
+    two were written separately they were blind to constrained bindings
+    together.
     """
-    from .core import CLam
-    value = bind.value
-    if not bind.binders or not isinstance(value, CLam):
-        return False
-    abstracted = {variable.id for variable in bind.binders}
-    for param in value.params:
-        ty = prune(param.ty)
-        if isinstance(ty, TVar) or _dictionary(ty):
-            continue
-        if {variable.id for variable in vars_of(ty)} & abstracted:
-            return True
-    return False
+    return bool(core_transparent(bind, {v.id for v in bind.binders}))
 
 
 def _applications(node, out: list[CTyApp]) -> None:

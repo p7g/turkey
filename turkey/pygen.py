@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 
 from . import ast
 from .builtins import PRIM_NAMES, initial_primitives
-from .core import (
+from .core import (class_of_dict, 
     CApp, CArray, CAssign, CCon, CDeref, CExpr, CField, CIf, CIndex, CProject,
     CJoin, CJump, CLam, CLet, CLetRec, CLit, CMatch, CPrim, CProgram,
     CRecord, CRef, CTuple, CTyApp, CTyLam, CUnit, CVar,
@@ -596,7 +596,8 @@ class _Function:
         head, _ = spine(e.ty)
         if not isinstance(head, TCon):
             return "dynamic"
-        if head.name.startswith("%Dict.") or head.name in self.gen.decls.tycons:
+        if (class_of_dict(head.name) is not None
+                or head.name in self.gen.decls.tycons):
             return "record"
         return "dynamic"
 

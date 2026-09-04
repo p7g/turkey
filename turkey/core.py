@@ -404,6 +404,16 @@ class CBind:
     # them from its assumptions and let them go; a checker that reads this
     # binding later has nowhere else to learn that `Item s` is `Op`.
     equations: list[tuple[Type, Type]] = field(default_factory=list)
+    # The layout each abstracted variable stands for, by `TVar.id`, when this
+    # binding is one of `layout.share`'s copies. Empty on everything else.
+    #
+    # A copy is still polymorphic -- its scheme is the original's, so its call
+    # sites type-check unchanged -- and this is the one thing it knows that the
+    # original does not: not *which* type each variable is, which is not
+    # decidable and is what monomorphization gave up on, but how wide it is and
+    # whether it is a pointer. That is all the backend ever needed. See
+    # `turkey/layout.py`.
+    layouts: dict[int, str] = field(default_factory=dict)
 
 
 @dataclass

@@ -530,7 +530,7 @@ two different walks gives two different programs. It also answers "is this
 reduction worth doing" with "was it early".
 
 ### 44. The layout invariant refuses the bootstrap compiler
-**design, open.** M25's problem, arriving early. Once `opt` finishes (43),
+**design, fixed.** M25's problem, arriving early. Once `opt` finishes (43),
 `boot` reaches `mono.check_layouts` and is refused:
 
 ```
@@ -541,6 +541,33 @@ whose layout it cannot know: push takes xs : Array a
 One leak, down from the four the old cost model left (`grow`, `map` twice and
 `push`) -- the stronger inliner removes three of them, and cannot remove the
 last.
+
+**Fixed by `turkey/layout.py`**: the same specialization keyed on the *layout*
+of each type argument rather than on the type, with no cap, because the reason
+for the cap does not apply. There are seven layouts and infinitely many types,
+and `layout(Pair a)` is `ptr` whatever `a` is, so the chain that made item 6
+partial -- `Pair Int`, `Pair (Pair Int)`, ... -- collapses to one key.
+
+The copies stay *polymorphic*. Substituting a type would be a lie: `#push` at
+layout `ptr` is called with `Array String` and `Array (Option Int)` alike and
+no type checks against both. So a copy keeps the original's scheme, its call
+sites type-check unchanged, `coretc` checks it as it checked the original, and
+it carries one extra fact -- `CBind.layouts`, the layout each abstracted
+variable stands for, which `backend_lower.layout_of` consults. A variable that
+had no layout and was held `BOXED` now has one.
+
+Nothing type-directed happens at run time that did not happen before: no
+witness table, no address-only value, no reabstraction thunk for a closure
+crossing the boundary, because `layout(fun(a) -> b)` is `ptr` and the closure's
+own body is a binding this pass shares in its turn. That was the alternative
+considered -- Swift passes a value-witness table and keeps unknown-typed
+values address-only -- and it buys the same totality for a runtime indirection
+on every access. The six keys also make the exact-root collector's job
+computable: a body keyed `ptr` knows its slots are pointers and one keyed
+`i64` knows they are not.
+
+`tests/test_layout.py` exercises it by setting `MAX_SPECIALIZATIONS` to zero,
+which is the same situation `boot` reaches by being large.
 
 Nothing in `tests/programs` violates it, and the commit that added the check
 says why: specialization stops the generic `Data.Array#grow` and `#push` from
@@ -554,6 +581,45 @@ scheduled to fill: **one compiled body per distinct layout of the type
 arguments**, which is total where specialization is partial, because there are
 six layouts and infinitely many types. The refusal is the right thing to do
 until that exists; it is not a thing `boot` can be written around.
+
+### 45. `HasField` is erased, so a record-polymorphic body cannot be compiled
+**design, open (guarded).** M25. `mono.transparent_parameters` holds that a
+bare `a` parameter is always safe, "because that is parametricity": a generic
+body may hold an abstracted value and pass it on, and nothing else.
+
+`HasField` is the exception, and it is not a small one. A record-polymorphic
+binding *does* take an `a` apart, and the predicate that licenses it is
+discharged by the solver and **erased** -- nothing is passed for it. So the
+body knows a field's type and not its position, and `coretc.record_field` says
+so in as many words: "if that is still a variable the field was resolved by a
+`HasField` the solver discharged and erased, and there is nothing left here to
+check."
+
+Specialization hides this whenever it reaches such a binding, because the
+receiver becomes a known record. It stopped reaching `Data.Map#findSlot` on
+`boot`, which was unannotated and so had inference give it
+`HasField "cap" m Int`. What was left could not be compiled, and the failure
+was the lucky one: the *field index* is unknown, so the backend refused. Had
+the body only done `Prim.arrayGet(m.table, i)` there would have been no
+refusal -- `layout_of` answers `BOXED` for everything read out of an unknown
+receiver, so the elements would have been read at the boxed width whatever
+they were written at. That is a silent wrong answer, and it is the exact
+hazard `check_layouts` exists to prevent, in the one case it was not looking
+at.
+
+Layout sharing cannot fix it and is not asked to: a layout is a width and a
+pointer bit, and what is missing is an offset and an element type. Both come
+back the moment the receiver's *head* is known, which is the shape of the real
+fix -- specialize one level on the head constructor with fresh variables
+underneath, which terminates for the same reason layout sharing does, since
+the head is stable where the type is not (`Pair a` and `Pair (Pair a)` are both
+`Pair`).
+
+Guarded rather than fixed: `mono.check_opaque_destructuring` now refuses these
+bodies instead of compiling them, so the miscompile is not reachable. The two
+that `boot` needed -- `Data.Map#findSlot` and `#resize` -- are annotated in
+`lib/Data/Map.tl`, which is what a user has to do today and is why the
+annotation carries a comment saying it is load-bearing.
 
 ### 24. `Data.Set` is not one of the modules the Prelude re-exports
 **library.** M21. `Array`, `Map`, `Option` and eight others arrive

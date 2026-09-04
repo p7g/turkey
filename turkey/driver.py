@@ -24,8 +24,8 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import (ast, builtins, coretc, desugar, joins, llvmgen, lower, mono,
-               opt, pygen)
+from . import (ast, builtins, coretc, desugar, joins, layout, llvmgen, lower,
+               mono, opt, pygen)
 from .builtins import initial_type_env
 from .classes import ClassTable
 from .constraints import Env, Solver
@@ -128,9 +128,19 @@ def check(src: str, file: str | None = None,
     program_opt = opt.reduce_program(
         joins.discover(opt.reduce_program(program_mono)))
     coretc.check_program(program_opt, decls, classes, coretc.globals_of(env))
+    # What the cap left generic, shared by layout instead of by type. This is
+    # after the optimizations rather than among them: a copy is the optimized
+    # body under another name, so there is nothing left to reduce in it, and
+    # `turkey opt` keeps printing the program the optimizer produced. See
+    # turkey/layout.py.
+    program_opt = layout.share(program_opt)
+    coretc.check_program(program_opt, decls, classes, coretc.globals_of(env))
     # Every layout the backend reads a field at has to be knowable, and this
     # is the program it is handed. See `mono.transparent_parameters`.
     mono.check_layouts(program_opt)
+    # And the field positions, which are a separate question from the widths
+    # and are not answered by sharing. See `mono.opaque_destructuring`.
+    mono.check_opaque_destructuring(program_opt)
     return Checked(
         entry.program, ordered, decls, classes, env, loader.order,
         entry.scope.values, main,

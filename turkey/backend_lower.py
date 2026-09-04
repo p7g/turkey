@@ -25,8 +25,19 @@ from .types import (
 )
 
 
-def layout_of(ty: Type) -> bir.Layout:
+def layout_of(ty: Type, abstracted: dict[int, str] | None = None
+              ) -> bir.Layout:
+    """The layout a value of `ty` is held at.
+
+    `abstracted` is the binding's `layouts`: the layout each of its abstracted
+    variables stands for, when it is one of `layout.share`'s copies. Without
+    it an abstracted variable has no layout and the answer is `BOXED`, which
+    is the uniform representation `mono.check_layouts` exists to keep out of
+    any body that would take polymorphic data apart.
+    """
     ty = prune(ty)
+    if abstracted and isinstance(ty, TVar) and ty.id in abstracted:
+        return bir.Layout(abstracted[ty.id])
     if ty is BOTTOM:
         return bir.Layout.UNIT
     if isinstance(ty, TCon):
@@ -53,17 +64,18 @@ def layout_of(ty: Type) -> bir.Layout:
     return bir.Layout.PTR
 
 
-def _expr_layout(expr: CExpr) -> bir.Layout:
+def _expr_layout(expr: CExpr, abstracted: dict[int, str] | None = None
+                 ) -> bir.Layout:
     if isinstance(expr, CLit):
         resolved = prune(expr.ty)
         if not isinstance(resolved, TVar):
-            return layout_of(resolved)
+            return layout_of(resolved, abstracted)
         return {
             "Int": bir.Layout.I64, "Byte": bir.Layout.I8,
             "Char": bir.Layout.I32, "Float": bir.Layout.F64,
             "String": bir.Layout.PTR,
-        }.get(expr.kind, layout_of(expr.ty))
-    return layout_of(expr.ty)
+        }.get(expr.kind, layout_of(expr.ty, abstracted))
+    return layout_of(expr.ty, abstracted)
 
 
 # Every symbol this backend defines begins with this, and no symbol the
@@ -115,7 +127,7 @@ class _Destination:
 
 class _FunctionLowerer:
     def __init__(self, bind: CBind, lam: CLam,
-                 functions: dict[str, tuple[str, TFun]], decls,
+                 functions: dict[str, tuple[str, TFun, dict[int, str]]], decls,
                  tags: dict[str, int], record_fields: dict[str, list[str]],
                  lifted: list[bir.Function], lift_counter: list[int],
                  globals_: dict[str, bir.Value],
@@ -124,6 +136,10 @@ class _FunctionLowerer:
                  output_name: str | None = None) -> None:
         self.bind = bind
         self.lam = lam
+        # The layouts this body's abstracted variables stand for, if it is one
+        # of `layout.share`'s copies; empty otherwise, which is every ground
+        # binding and every generic one the sharing pass left alone.
+        self.abstracted = bind.layouts
         self.functions = functions
         self.decls = decls
         self.tags = tags
@@ -138,7 +154,7 @@ class _FunctionLowerer:
         function_type = prune(bind.ty)
         assert isinstance(function_type, TFun)
         self.result_layout = (bir.Layout.BOXED if self.closure_abi
-                              else layout_of(function_type.ret))
+                              else self.layout(function_type.ret))
         self.count = 0
         self.flat_refs = _flat_refs(lam.body)
         self.flat_records = _flat_records(lam.body)
@@ -154,7 +170,7 @@ class _FunctionLowerer:
         }
         self.params = ([bir.Value(self.fresh("environment"), bir.Layout.PTR)]
                        if self.closure_abi else [])
-        internal_layouts = [layout_of(parameter_hints.get(p.name, p.ty))
+        internal_layouts = [self.layout(parameter_hints.get(p.name, p.ty))
                             for p in lam.params]
         self.params += [bir.Value(
             self.fresh(p.name),
@@ -177,6 +193,13 @@ class _FunctionLowerer:
             value = self.coerce(self.entry, param, layout)
             self.entry.instructions.append(bir.Instruction("slot_store", (slot.name, value)))
             self.env[core_param.name] = slot
+
+    def layout(self, ty: Type) -> bir.Layout:
+        """`layout_of`, under this body's abstracted layouts."""
+        return layout_of(ty, self.abstracted)
+
+    def expr_layout(self, expr: CExpr) -> bir.Layout:
+        return _expr_layout(expr, self.abstracted)
 
     def fresh(self, hint: str) -> str:
         clean = "".join(c if c.isalnum() else "_" for c in hint).strip("_") or "v"
@@ -311,7 +334,7 @@ class _FunctionLowerer:
                                                 [field for field, _ in record.fields])
                 by_name = dict(record.fields)
                 metadata = _layout_metadata(
-                    _expr_layout(by_name[field]) for field in fields)
+                    self.expr_layout(by_name[field]) for field in fields)
                 made = self.emit(entry, "object_new", (
                     "1", str(self.tags.get(record.con, -1)), str(len(fields)),
                     str(metadata),
@@ -323,7 +346,7 @@ class _FunctionLowerer:
                 entry.terminator = bir.Jump(following.name)
             elif kind == "bind":
                 _, name, value = action
-                after = self.new_block("store_global", _expr_layout(value))
+                after = self.new_block("store_global", self.expr_layout(value))
                 after.instructions.append(bir.Instruction(
                     "global_store", (self.globals[name].name, after.params[0])))
                 if name in global_roots:
@@ -333,7 +356,7 @@ class _FunctionLowerer:
                 self.lower(value, {}, {}, entry, _Destination(after))
             else:
                 _, name, index, value = action
-                after = self.new_block("store_field", _expr_layout(value))
+                after = self.new_block("store_field", self.expr_layout(value))
                 record = self.emit(after, "global_load",
                                    (self.globals[name].name,), bir.Layout.PTR)
                 after.instructions.append(bir.Instruction(
@@ -408,7 +431,7 @@ class _FunctionLowerer:
             flattened = (expr.name in self.flat_refs
                          and isinstance(expr.value, CRef))
             bound = expr.value.value if flattened else expr.value
-            value_layout = _expr_layout(bound)
+            value_layout = self.expr_layout(bound)
             after = self.new_block("let", value_layout)
             slot = self.new_slot(expr.name, value_layout)
             after.instructions.append(
@@ -428,8 +451,8 @@ class _FunctionLowerer:
             self.lower_values([expr.cond], env, joins, block, branch)
             return
         if isinstance(expr, CMatch):
-            after_scrutinee = self.new_block("match_value", layout_of(expr.scrutinee.ty))
-            scrutinee_slot = self.new_slot("scrutinee", layout_of(expr.scrutinee.ty))
+            after_scrutinee = self.new_block("match_value", self.layout(expr.scrutinee.ty))
+            scrutinee_slot = self.new_slot("scrutinee", self.layout(expr.scrutinee.ty))
             after_scrutinee.instructions.append(
                 bir.Instruction("slot_store", (scrutinee_slot.name,
                                                 after_scrutinee.params[0])))
@@ -458,7 +481,7 @@ class _FunctionLowerer:
             return
         if isinstance(expr, CJoin):
             target = self.new_block("join")
-            param_slots = [self.new_slot(p.name, layout_of(p.ty)) for p in expr.params]
+            param_slots = [self.new_slot(p.name, self.layout(p.ty)) for p in expr.params]
             target.params = [bir.Value(self.fresh("join_arg"), slot.layout)
                              for slot in param_slots]
             for slot, value in zip(param_slots, target.params):
@@ -536,8 +559,8 @@ class _FunctionLowerer:
                 return
             expr = exprs[index]
             assert expr is not None
-            after = self.new_block("operand", _expr_layout(expr))
-            slot = self.new_slot("operand", _expr_layout(expr))
+            after = self.new_block("operand", self.expr_layout(expr))
+            slot = self.new_slot("operand", self.expr_layout(expr))
             slots.append(slot)
             after.instructions.append(
                 bir.Instruction("slot_store", (slot.name, after.params[0])))
@@ -550,7 +573,7 @@ class _FunctionLowerer:
                     joins: dict[str, tuple[bir.Block, list[bir.Value]]],
                     block: bir.Block, done) -> None:
         if isinstance(expr, CLit):
-            layout = _expr_layout(expr)
+            layout = self.expr_layout(expr)
             if expr.kind == "Int" and not (-(1 << 63) <= int(expr.value) < (1 << 63)):
                 raise Unsupported("Int literal is outside the signed 64-bit range", expr.span)
             if expr.kind == "Char":
@@ -578,12 +601,12 @@ class _FunctionLowerer:
                     global_ = self.globals[expr.name]
                     loaded = self.emit(block, "global_load",
                                        (global_.name,), global_.layout)
-                    done(block, self.coerce(block, loaded, _expr_layout(expr)))
+                    done(block, self.coerce(block, loaded, self.expr_layout(expr)))
                     return
                 raise Unsupported(f"LLVM backend cannot use top-level value '{expr.name}'", expr.span)
             slot = env[expr.name]
             loaded = self.emit(block, "slot_load", (slot.name,), slot.layout)
-            done(block, self.coerce(block, loaded, _expr_layout(expr)))
+            done(block, self.coerce(block, loaded, self.expr_layout(expr)))
             return
         if isinstance(expr, CCon):
             if expr.name == BOOL_FALSE:
@@ -617,11 +640,11 @@ class _FunctionLowerer:
                     and expr.target.name in env):
                 slot = env[expr.target.name]
                 loaded = self.emit(block, "slot_load", (slot.name,), slot.layout)
-                done(block, self.coerce(block, loaded, layout_of(expr.ty)))
+                done(block, self.coerce(block, loaded, self.layout(expr.ty)))
                 return
             self.lower_values([expr.target], env, joins, block,
                               lambda at, xs: done(at, self.emit(
-                                  at, "cell_load", (xs[0],), layout_of(expr.ty))))
+                                  at, "cell_load", (xs[0],), self.layout(expr.ty))))
             return
         if isinstance(expr, CAssign):
             if (isinstance(expr.target, CField)
@@ -648,7 +671,7 @@ class _FunctionLowerer:
                 return
             if isinstance(expr.target, CIndex):
                 def set_index(at: bir.Block, xs: list[bir.Operand]) -> None:
-                    value = self.coerce(at, xs[0], layout_of(expr.target.ty))
+                    value = self.coerce(at, xs[0], self.layout(expr.target.ty))
                     at.instructions.append(bir.Instruction(
                         "array_set", (xs[1], xs[2], value)))
                     done(at, bir.Constant(bir.Layout.UNIT, 0))
@@ -680,7 +703,7 @@ class _FunctionLowerer:
             def aggregate(at: bir.Block, values: list[bir.Operand]) -> None:
                 if isinstance(expr, CArray):
                     _, type_args = spine(expr.ty)
-                    element_layout = (layout_of(type_args[0]) if type_args else
+                    element_layout = (self.layout(type_args[0]) if type_args else
                                       values[0].layout if values else bir.Layout.BOXED)
                     made = self.emit(at, "array_new",
                                      (str(len(values)), str(_layout_width(element_layout)),
@@ -712,7 +735,7 @@ class _FunctionLowerer:
                 and expr.target.name in self.record_slots):
             slot = self.record_slots[expr.target.name][expr.name]
             loaded = self.emit(block, "slot_load", (slot.name,), slot.layout)
-            done(block, self.coerce(block, loaded, layout_of(expr.ty)))
+            done(block, self.coerce(block, loaded, self.layout(expr.ty)))
             return
         if isinstance(expr, (CField, CProject, CIndex)):
             targets = ([expr.target, expr.index] if isinstance(expr, CIndex)
@@ -720,12 +743,12 @@ class _FunctionLowerer:
             def project(at: bir.Block, values: list[bir.Operand]) -> None:
                 if isinstance(expr, CIndex):
                     made = self.emit(at, "array_get", tuple(values),
-                                     layout_of(expr.ty), self.frame(expr.span))
+                                     self.layout(expr.ty), self.frame(expr.span))
                 else:
                     index = expr.index if isinstance(expr, CProject) else self.field_index(
                         expr.target.ty, expr.name)
                     made = self.emit(at, "object_get", (values[0], str(index)),
-                                     layout_of(expr.ty))
+                                     self.layout(expr.ty))
                 done(at, made)
             self.lower_values(targets, env, joins, block, project)
             return
@@ -773,32 +796,38 @@ class _FunctionLowerer:
                 array_element_layout = None
                 if primitive in ("Prim.arrayNew", "Prim.arrayNewUninit"):
                     _, type_args = spine(expr.ty)
-                    element_layout = layout_of(type_args[0]) if type_args else bir.Layout.BOXED
+                    element_layout = self.layout(type_args[0]) if type_args else bir.Layout.BOXED
                     array_element_layout = element_layout
                     operation += "." + element_layout.value
                 elif primitive == "Prim.arrayGet":
-                    operation += "." + layout_of(expr.ty).value
+                    operation += "." + self.layout(expr.ty).value
                 elif primitive == "Prim.arraySet":
-                    operation += "." + _expr_layout(expr.args[2]).value
+                    operation += "." + self.expr_layout(expr.args[2]).value
                 def primitive_call(at: bir.Block, values: list[bir.Operand]) -> None:
                     if array_element_layout is not None and len(values) == 2:
                         values[1] = self.coerce(at, values[1], array_element_layout)
                     done(at, self.emit(
-                        at, operation, tuple(values), layout_of(expr.ty),
+                        at, operation, tuple(values), self.layout(expr.ty),
                         self.frame(expr.span)))
                 self.lower_values(expr.args, env, joins, block, primitive_call)
                 return
             if isinstance(fn, CVar) and fn.name in self.functions:
-                symbol, function_type = self.functions[fn.name]
+                symbol, function_type, callee = self.functions[fn.name]
                 def direct_call(at: bir.Block, values: list[bir.Operand]) -> None:
-                    arguments = [self.coerce(at, value, layout_of(expected))
+                    # The *callee's* abstracted layouts, not this function's.
+                    # A layout-shared copy holds its parameters at the layouts
+                    # its key names, and a caller that read them off the shared
+                    # scheme would pass boxed values to a body expecting bare
+                    # ones. See `turkey/layout.py`.
+                    arguments = [self.coerce(at, value,
+                                             layout_of(expected, callee))
                                  for value, expected in zip(values,
                                                             function_type.params)]
                     called = self.emit(at, "call", (symbol, *arguments),
-                                       layout_of(function_type.ret),
+                                       layout_of(function_type.ret, callee),
                                        self.frame(expr.span),
                                        diverges=fn.name in self.bottoming)
-                    done(at, self.coerce(at, called, layout_of(expr.ty)))
+                    done(at, self.coerce(at, called, self.layout(expr.ty)))
                 self.lower_values(expr.args, env, joins, block, direct_call)
                 return
             if isinstance(fn, CCon):
@@ -807,7 +836,7 @@ class _FunctionLowerer:
                     con_type = instantiate(info.scheme, lambda: TVar(1))
                     assert isinstance(con_type, TFun)
                     unify(con_type.ret, expr.ty)
-                    values = [self.coerce(at, value, layout_of(expected))
+                    values = [self.coerce(at, value, self.layout(expected))
                               for value, expected in zip(values, con_type.params)]
                     metadata = _layout_metadata(value.layout for value in values)
                     made = self.emit(at, "object_new",
@@ -824,7 +853,7 @@ class _FunctionLowerer:
                                            for value in values[1:])]
                 called = self.emit(at, "closure_call", tuple(arguments),
                                    bir.Layout.BOXED, self.frame(expr.span))
-                done(at, self.coerce(at, called, layout_of(expr.ty)))
+                done(at, self.coerce(at, called, self.layout(expr.ty)))
             self.lower_values([expr.fn, *expr.args], env, joins, block,
                               closure_call)
             return
@@ -844,7 +873,7 @@ class _FunctionLowerer:
             return
         # Control-shaped operands re-enter the general continuation lowering.
         if isinstance(expr, (CLet, CIf, CJoin, CJump, CLetRec)):
-            after = self.new_block("value", layout_of(expr.ty))
+            after = self.new_block("value", self.layout(expr.ty))
             done(after, after.params[0])
             self.lower(expr, env, joins, block, _Destination(after))
             return
@@ -861,7 +890,12 @@ class _FunctionLowerer:
         # `_lambda_0` instead is what a function named `f_lambda_0` used to
         # collide with.
         symbol = f"{self.output_name}_25_lambda{number}"
-        bind = CBind(symbol, lam.ty, [], lam, lam.span)
+        # The lifted lambda is compiled under the same abstracted layouts as
+        # the body it came out of: a closure inside a layout-shared copy holds
+        # the copy's variables at the copy's layouts, and a synthetic binding
+        # that forgot them would read its captures at `BOXED`.
+        bind = CBind(symbol, lam.ty, [], lam, lam.span,
+                     layouts=self.abstracted)
         child = _FunctionLowerer(
             bind, lam, self.functions, self.decls, self.tags,
             self.record_fields, self.lifted, self.lift_counter,
@@ -897,7 +931,7 @@ class _FunctionLowerer:
             block.terminator = bir.Jump(success.name)
             return
         if isinstance(pat, ast.PVar):
-            layout = layout_of(hints.get(pat.name, ty))
+            layout = self.layout(hints.get(pat.name, ty))
             stored = self.coerce(block, value, layout)
             slot = self.new_slot(pat.name, layout)
             env[pat.name] = slot
@@ -954,7 +988,7 @@ class _FunctionLowerer:
             at = contents
             for index, (field, sub) in enumerate(pieces):
                 field_ty = con_type.params[field]
-                field_layout = _pattern_layout(sub, field_ty, hints)
+                field_layout = _pattern_layout(sub, field_ty, hints, self.abstracted)
                 object_value = self.emit(at, "slot_load", (held.name,), held.layout)
                 loaded = self.emit(at, "object_get", (object_value, str(field)), field_layout)
                 following = success if index + 1 == len(pieces) else self.new_block("pattern_field")
@@ -973,7 +1007,7 @@ class _FunctionLowerer:
             for index, (sub, field_ty) in enumerate(zip(pat.elems, tuple_ty.elems)):
                 tuple_value = self.emit(at, "slot_load", (held.name,), held.layout)
                 loaded = self.emit(at, "object_get", (tuple_value, str(index)),
-                                   _pattern_layout(sub, field_ty, hints))
+                                   _pattern_layout(sub, field_ty, hints, self.abstracted))
                 following = success if index + 1 == len(pat.elems) else self.new_block("tuple_field")
                 self.lower_pattern(sub, loaded, field_ty, env, at, following,
                                    failure, hints)
@@ -1222,18 +1256,19 @@ def _free_variable_type(expr: CExpr, name: str) -> Type | None:
 
 
 def _pattern_layout(pattern, fallback: Type,
-                    hints: dict[str, Type]) -> bir.Layout:
+                    hints: dict[str, Type],
+                    abstracted: dict[int, str] | None = None) -> bir.Layout:
     while isinstance(pattern, ast.PAnnot):
         pattern = pattern.pat
     if isinstance(pattern, ast.PVar) and pattern.name in hints:
-        return layout_of(hints[pattern.name])
+        return layout_of(hints[pattern.name], abstracted)
     if isinstance(pattern, ast.PCon) and pattern.name in (BOOL_FALSE, BOOL_TRUE):
         return bir.Layout.I1
     # Nested constructors and tuples are heap values regardless of the type
     # family carried by their contents.
     if isinstance(pattern, (ast.PCon, ast.PRecord, ast.PTuple)):
         return bir.Layout.PTR
-    return layout_of(fallback)
+    return layout_of(fallback, abstracted)
 
 
 def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
@@ -1241,13 +1276,14 @@ def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
     record_fields = _record_layouts(program, decls)
     tag_names = sorted(set(decls.constructors) | set(record_fields))
     tags = {name: index for index, name in enumerate(tag_names)}
-    functions: dict[str, tuple[str, TFun]] = {}
+    functions: dict[str, tuple[str, TFun, dict[int, str]]] = {}
     candidates: list[tuple[CBind, CLam]] = []
     for bind in program.dicts + program.binds:
         value = _erase_types(bind.value)
         ty = prune(bind.ty)
         if isinstance(value, CLam) and isinstance(ty, TFun):
-            functions[bind.name] = (mangle(bind.name), ty)
+            functions[bind.name] = (mangle(bind.name), ty,
+                                    bind.layouts)
             candidates.append((bind, value))
     # Specialization sometimes leaves a top-level function as a pure alias.
     # Resolve those aliases to the same native symbol; they need no storage or
@@ -1260,7 +1296,8 @@ def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
             ty = prune(bind.ty)
             if (bind.name not in functions and isinstance(value, CVar)
                     and value.name in functions and isinstance(ty, TFun)):
-                functions[bind.name] = (functions[value.name][0], ty)
+                functions[bind.name] = (functions[value.name][0], ty,
+                                        bind.layouts)
                 changed = True
     if main not in functions:
         raise Unsupported(f"LLVM entry '{main}' is not a function")

@@ -941,12 +941,41 @@ a closure that unboxes it. The raw value 1 becomes a pointer, and
 `turkey_unbox` computes `header_of(1)->kind` -- address -7, which is the
 fault.
 
-This is the hazard `mono.check_layouts` exists to prevent and `layout.share`
-(entry 45, M25) exists to fix, so the interesting part is why neither caught
-it: `check_layouts` passes on this program. A layout is agreed *per copy*
-here, and what is missing is agreement between copies about a value neither
-one allocated. Either the generic copy has to stop assuming a box, or a record
-reachable from both has to be built the same way by both.
+This is the hazard `mono.check_layouts` exists to prevent, and the reason it
+did not is now known and fixed. `transparent_parameters` read the parameters of
+a binding's *outermost* lambda. Elaboration gives a constrained function two:
+the dictionaries in one, and the value parameters in another inside it. So the
+outermost lambda of `findSlot[Eq k]` takes `%Dict.Eq a` and nothing else -- and
+a dictionary is deliberately exempt, because passing polymorphic data to the
+closures inside one is the mechanism the check exists to leave intact. Every
+*constrained* generic function was therefore exempt along with its dictionary,
+which is a hole the width of the language's main abstraction mechanism. Reading
+the whole abstraction spine closes it, and across `tests/programs`, `lib` and
+`boot` it flags exactly one thing: this bug.
+
+`layout.share` is right and is not the problem: `_key` refuses to key a copy on
+`BOXED`, precisely because that is "the answer `layout_of` gives a variable it
+has no layout for". What is missing is that nothing then stops the *unshared*
+original from staying reachable, and the original assumes `BOXED` for the very
+variable no copy would accept it for.
+
+The fix is not yet chosen. Two candidates:
+
+* close the sharing gap -- `Set Int` is `Map Int Unit`, whose key `(i64, unit)`
+  is perfectly knowable, so a shared copy should exist and the generic original
+  should have become unreachable for `_reachable` to drop. Why it did not is
+  the thing to find out, and if the gap is small this is the intended design
+  working;
+* or make the representation of a field follow its *declared* type: a field
+  whose declared type is a variable is `BOXED` in every copy, specialized ones
+  included, so specialized code boxes on write rather than storing bare. That
+  gives up an unboxed key in `Map Int v`, which is what Java and OCaml pay, and
+  it is sound whatever the cap does -- which matters, because
+  `MAX_SPECIALIZATIONS` guarantees there is *always* a generic fallback for
+  some program.
+
+The second is the floor the first sits on: the cap means a generic copy can
+always exist, so its assumption has to be one the whole program keeps.
 
 ---
 

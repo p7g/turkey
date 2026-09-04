@@ -1035,6 +1035,7 @@ def transparent_parameters(program: CProgram) -> list[tuple[str, str, Type]]:
         value = bind.value
         if not bind.binders or not isinstance(value, CLam):
             continue
+        parameters = _abstraction_parameters(value)
         # A variable whose layout the binding was compiled under is not a
         # variable without a layout. That is what `layout.share` produces and
         # the whole of what this check wanted: not which type it is, which is
@@ -1044,13 +1045,36 @@ def transparent_parameters(program: CProgram) -> list[tuple[str, str, Type]]:
                       if variable.id not in bind.layouts}
         if not abstracted:
             continue
-        for param in value.params:
+        for param in parameters:
             ty = prune(param.ty)
             if isinstance(ty, TVar) or dictionary(ty):
                 continue
             if {variable.id for variable in vars_of(ty)} & abstracted:
                 found.append((name, param.name, ty))
     return found
+
+
+def _abstraction_parameters(value: CExpr) -> list[CParam]:
+    """Every parameter of a binding's own abstraction, not the first lambda's.
+
+    Elaboration gives a constrained function *two* lambdas: the dictionaries
+    in one, and the value parameters in another inside it. Reading only the
+    outermost therefore sees a constrained function's dictionaries and nothing
+    else -- and a dictionary is exempt above, so every constrained generic
+    function was exempt along with it. `Data.Map#findSlot[Eq k]` is the one
+    that mattered: its outer lambda takes `%Dict.Eq a`, and the `m : Map a b`
+    this check exists to refuse is one layer further in (FINDINGS 53).
+
+    The spine only. A lambda deeper in the *body* is a closure the body makes
+    for itself, and what it may destructure is decided by what this binding
+    already holds.
+    """
+    out: list[CParam] = []
+    while isinstance(value, (CLam, CTyLam)):
+        if isinstance(value, CLam):
+            out.extend(value.params)
+        value = value.body
+    return out
 
 
 def check_layouts(program: CProgram) -> None:

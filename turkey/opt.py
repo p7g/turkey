@@ -136,15 +136,53 @@ BOTTOM_INLINE_LIMIT = 1
 
 
 def reduce_program(program: CProgram) -> CProgram:
-    """Every binding's body, reduced."""
+    """Every binding's body, reduced -- callees before their callers.
+
+    The order is not cosmetic. `body_of` reduces a callee the first time some
+    call site asks for it, and if that call site is itself inside a body being
+    reduced, the callee's traversal runs *nested inside* the caller's. On a
+    program with a deep call graph that makes the traversal's stack depth the
+    product of call-graph depth and term depth, which is what made this pass
+    fail to compile the bootstrap compiler at all.
+
+    Reducing in dependency order -- `deps.sccs` already emits it -- means the
+    memo is warm before anyone asks, so `body_of` is a dictionary lookup and
+    every traversal is one term deep. Within a cycle there is no such order and
+    the nesting can still happen, but it is then bounded by the size of the
+    component rather than by the height of the whole graph.
+    """
     inliner = _Reducer(program)
+    binds = program.dicts + program.binds
+    first: dict[str, int] = {}
+    for index, bind in enumerate(binds):
+        first.setdefault(bind.name, index)
+    done: dict[int, CExpr] = {}
+    for component in sccs(call_graph(binds)):
+        for name in component:
+            index = first[name]
+            value = inliner.expr(binds[index].value)
+            done[index] = value
+            inliner.memoize(name, value)
+    # A name bound twice has one entry in the graph, so its later bindings are
+    # in no component. Nothing else can be missing.
+    for index, bind in enumerate(binds):
+        if index not in done:
+            done[index] = inliner.expr(bind.value)
+    split = len(program.dicts)
     return CProgram(
-        dicts=[replace(b, value=inliner.expr(b.value)) for b in program.dicts],
-        binds=[replace(b, value=inliner.expr(b.value)) for b in program.binds],
+        dicts=[replace(b, value=done[i]) for i, b in enumerate(program.dicts)],
+        binds=[replace(b, value=done[split + i])
+               for i, b in enumerate(program.binds)],
     )
 
 
 # -- the call graph, and the cycles in it ------------------------------------
+
+
+def call_graph(binds: list[CBind]) -> dict[str, set[str]]:
+    """Which top-level bindings each one mentions, and nothing else."""
+    known = {b.name for b in binds}
+    return {b.name: names_of(b.value) & known for b in binds}
 
 
 def loop_breakers(program: CProgram) -> set[str]:
@@ -154,9 +192,7 @@ def loop_breakers(program: CProgram) -> set[str]:
     first is the lexicographically first name, and a golden that depends on
     which binding was broken does not move when an unrelated one is added.
     """
-    binds = program.dicts + program.binds
-    known = {b.name for b in binds}
-    graph = {b.name: names_of(b.value) & known for b in binds}
+    graph = call_graph(program.dicts + program.binds)
     out: set[str] = set()
     for component in sccs(graph):
         if len(component) > 1 or component[0] in graph[component[0]]:
@@ -367,11 +403,19 @@ class _Reducer:
         if size <= limit:
             return made
 
+        # Restored to what it was, not to False. Speculation is meant not to
+        # nest -- the flag is the whole mechanism for that -- and clearing it
+        # on the way out of an inner speculation re-armed the outer one, so a
+        # chain of large calls could speculate at every level after all. That
+        # is unbounded rather than merely expensive: the traversal's depth grew
+        # with whatever stack it was given (68k levels at 1 GiB, 457k at 3 GiB)
+        # and the bootstrap compiler could not be optimized at any size.
+        was = self.speculating
         self.speculating = True
         try:
             residual = self.expr(made)
         finally:
-            self.speculating = False
+            self.speculating = was
         return residual if _size(residual) <= limit else None
 
     def size_of(self, key: tuple[str, tuple], body) -> int:
@@ -416,6 +460,18 @@ class _Reducer:
                 self.active.pop()
             self.reduced[key] = found
         return found
+
+    def memoize(self, name: str, value) -> None:
+        """Record a top-level binding's reduced body for `body_of`.
+
+        Only the monomorphic ones: a binding with type binders is reduced
+        again per instantiation, under a key that names the type arguments,
+        and the uninstantiated body is not an answer to any of those.
+        """
+        bind = self.bindings.get(name)
+        if bind is None or bind.binders or not isinstance(value, CLam):
+            return
+        self.reduced.setdefault((name, ()), value.body)
 
     def beta(self, e: CApp):
         """A lambda applied directly. What inlining a call site leaves behind

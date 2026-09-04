@@ -721,6 +721,19 @@ fun armOf(d : D, con : String, bind : Option String, span : Span,
 -- `Brk` and `Cont` cannot arrive -- a `break` outside a loop is refused while
 -- this pass runs -- but nothing in the type system knows that, so the arms
 -- exist and diverge.
+--
+-- The `Brk` arm annotates its payload `Unit`, and that annotation is
+-- load-bearing rather than documentation. Nothing constructs a `Brk` at this
+-- boundary, so without it the `b` of `Flow a b r` is a variable no constraint
+-- ever reaches: it generalizes, and every call site downstream reads
+-- `bind[Int, Flow(.., ?b)]` -- ground in the slot that matters and open in the
+-- one that cannot be. `Turkey.Mono` specializes only at ground instantiations,
+-- so that one dead slot kept `bind` generic, and with it every generic body it
+-- names. A lifted loop's own `Brk` is fixed the same way, by refusing to
+-- generalize; this is the other half, at the boundary where the slot dies.
+--
+-- `Unit` rather than an uninhabited type because Turkey has no bottom type to
+-- name. That is the one thing here a `Never` would say better.
 fun unflow(d : D, body : Expr, span : Span) -> Expr {
     let unreachable = mkExpr(d, span, ECall(
         mkExpr(d, span, EVar(P.error, False)),
@@ -729,9 +742,21 @@ fun unflow(d : D, body : Expr, span : Span) -> Expr {
     bindWith(d, body, KFn(fun(f) = mkExpr(d, span, EMatch(f, [
         armOf(d, P.flowFall, Some("%v"), span, varOf(d, "%v", span)),
         armOf(d, P.flowRet, Some("%r"), span, varOf(d, "%r", span)),
-        armOf(d, P.flowBrk, Some("%_"), span, unreachable),
+        brokeArm(d, span, unreachable),
         armOf(d, P.flowCont, None, span, unreachable),
     ]))), span, None)
+}
+
+-- The `Brk` arm, with its payload pinned to `Unit`.
+fun brokeArm(d : D, span : Span, body : Expr) -> Arm {
+    let unit = Type { id = freshId(d), span = span,
+                      kind = TECon("Unit", Array.new(0)) }
+    let inner = mkPat(d, span, PAnnot(mkPat(d, span, PWild), unit))
+    Arm {
+        span = span,
+        patterns = [mkPat(d, span, PCon(P.flowBrk, [inner]))],
+        body = body,
+    }
 }
 
 -- -- lifted loops -------------------------------------------------------------------

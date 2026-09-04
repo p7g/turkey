@@ -65,10 +65,10 @@ import Turkey.Source (Span)
 import Turkey.Types as Ty
 import Turkey.Types (VarCell(..), TBottom)
 
--- How large a body may be and still be inlined, counted in Core nodes. Small
--- enough that a call site does not become unreadable, large enough for the
--- things this exists to reach: a method's body, an instance's `bind`.
-let inlineLimit = 40
+-- How large a body may be and still be inlined, counted as `sizeOf_` counts.
+-- Small enough that a call site does not become unreadable, large enough for
+-- the things this exists to reach: a method's body, an instance's `bind`.
+let inlineLimit = 32
 
 -- A shared join is copied only when specializing a known constructor makes the
 -- copy small. Deliberately the same scale as ordinary inlining: both trade a
@@ -81,6 +81,27 @@ let joinSpecializeLimit = inlineLimit
 -- `inlineLimit`. This bounds the work spent asking the question as well as the
 -- code ultimately copied. It is deliberately not another emission limit.
 let speculativeInlineLimit = inlineLimit * 4
+
+-- What a call may cost when its result is scrutinised right there. The
+-- ordinary limit asks only how much code a call site grows by, which is the
+-- wrong question when the caller is about to take the constructor apart:
+-- inlining `Iterator.next` puts a `Some` next to the `match` that reads it,
+-- `caseOfCase` pushes the match through the join the callee's early `return`
+-- left behind, and `knownConstructor` then deletes both the allocation and the
+-- branch. GHC gives the same discount by name -- a case on a call's result
+-- raises the inliner's budget, so `Option` never reaches the heap -- and LLVM's
+-- inliner does it too, crediting a call whose result feeds a branch. The whole
+-- cost of a `for` loop's `Some` per element rides on this.
+let scrutineeInlineLimit = inlineLimit * 2
+
+-- What a callee that always panics may carry into its caller. A bare
+-- forwarding call -- `fun error(message) = Prim.error(message)` -- is worth
+-- copying, because it costs the caller nothing and keeps the standard library
+-- out of the panic trace. Anything larger is the failure path charging the
+-- success path, which is what this exists to stop. On `sizeOf_`'s scale that
+-- forwarder is the single call and nothing else, since its argument is a
+-- variable and variables are free.
+let bottomInlineLimit = 1
 
 -- -- the shape of a node, once -------------------------------------------------------
 
@@ -132,14 +153,6 @@ fun kids(k : CoreKind) -> Array Core = match k {
         for a in alts { Array.push(out, a.body) }
         out
     }
-}
-
--- The `CBind` and `CAlt` wrappers directly under a node. Python counts each as
--- a node of its own in `_size`, so this is what keeps the count identical.
-fun wrappers(k : CoreKind) -> Int = match k {
-    CLetRec(binds, _) -> len(binds)
-    CMatch(_, alts) -> len(alts)
-    _ -> 0
 }
 
 fun withValue(b : CBind, value : Core) -> CBind = CBind {
@@ -199,6 +212,7 @@ type Reducer = Reducer {
     -- binding rather than once per call site.
     sizes : Map String Int,
     moves : Map String Bool,
+    ends  : Map String Bool,
     -- A speculative large inline may reduce ordinary small calls inside its
     -- residual, but does not recursively speculate about another large call.
     speculating : Bool,
@@ -232,6 +246,7 @@ fun newReducer(program : CProgram) -> Reducer {
     Reducer {
         breakers = loopBreakers(program), bindings = bindings,
         active = Array.new(8), sizes = Map.new(), moves = Map.new(),
+        ends = Map.new(),
         speculating = False, reduced = Map.new(), counter = 0,
         usedNames = used,
     }
@@ -283,10 +298,14 @@ fun step(r : Reducer, e : Core) -> Option Core {
     match e.kind {
         CApp(fn, _) -> return match fn.kind {
             CLam(_, _, _) -> beta(r, e)
-            _ -> inline(r, e)
+            _ -> inline(r, e, inlineLimit)
         }
         CMatch(_, _) -> {
             match knownConstructor(r, e) {
+                Some(m) -> return Some(m)
+                None -> {}
+            }
+            match inlineScrutinee(r, e) {
                 Some(m) -> return Some(m)
                 None -> {}
             }
@@ -298,7 +317,11 @@ fun step(r : Reducer, e : Core) -> Option Core {
                 Some(m) -> return Some(m)
                 None -> {}
             }
-            return caseOfCase(r, e)
+            match caseOfCase(r, e) {
+                Some(m) -> return Some(m)
+                None -> {}
+            }
+            return caseOfJoin(e)
         }
         CLet(_, _, _, _, _) -> {
             match deadLet(e) {
@@ -335,14 +358,30 @@ fun fresh(r : Reducer, hint : String) -> String {
 
 -- -- the reductions --------------------------------------------------------------------
 
--- A saturated call to a small, known, non-loop-breaking binding.
-fun inline(r : Reducer, e : Core) -> Option Core = match e.kind {
-    CApp(fn, args) -> inlineApp(r, e, fn, args)
+-- A call under a `match`, inlined on the larger budget.
+--
+-- `expr` works bottom-up, so by the time this `match` is reduced its scrutinee
+-- has already been offered to `inline` and turned down on size. Being
+-- scrutinised is the information that offer did not have.
+fun inlineScrutinee(r : Reducer, e : Core) -> Option Core = match e.kind {
+    CMatch(scrutinee, alts) -> match scrutinee.kind {
+        CApp(_, _) -> match inline(r, scrutinee, scrutineeInlineLimit) {
+            Some(made) -> Some(mkCore(e.ty, e.span, CMatch(made, alts)))
+            None -> None
+        }
+        _ -> None
+    }
     _ -> None
 }
 
-fun inlineApp(r : Reducer, e : Core, fn : Core,
-              args : Array Core) -> Option Core {
+-- A saturated call to a small, known, non-loop-breaking binding.
+fun inline(r : Reducer, e : Core, limit : Int) -> Option Core = match e.kind {
+    CApp(fn, args) -> inlineApp(r, e, fn, args, limit)
+    _ -> None
+}
+
+fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
+              limit : Int) -> Option Core {
     var name = ""
     var targs = None
     match fn.kind {
@@ -396,9 +435,24 @@ fun inlineApp(r : Reducer, e : Core, fn : Core,
     -- bootstrap compiler.
     if movesOf(r, key, body) { return None }
     let size = sizeOf(r, key, body)
-    if size > speculativeInlineLimit || (r.speculating && size > inlineLimit) {
+    if size > speculativeInlineLimit || (r.speculating && size > limit) {
         return None
     }
+    -- A callee that always panics has no useful residual -- there is nothing
+    -- for the caller to reduce against -- so copying in anything it carries
+    -- lets the *failure* path decide what the success path costs.
+    -- `Data.Array#outOfBounds` is the case that matters: every string in its
+    -- message is allocated, so inlining the message put thirteen live pointers
+    -- across allocations into a function that is otherwise two comparisons, and
+    -- every in-range access paid for a root frame it could not use. Rust marks
+    -- these paths `#[cold] #[inline(never)]` and GHC keeps bottoming
+    -- expressions off the hot path with `exprIsBottom`.
+    --
+    -- Only when it carries something, though. `Std.Classes#error` is
+    -- `Prim.error(message)` and nothing else, so inlining it costs the caller
+    -- nothing -- and *not* inlining it would put a frame in every panic trace
+    -- pointing at the standard library rather than at the code that failed.
+    if endsOf(r, key, body) && size > bottomInlineLimit { return None }
     -- A copied callee body becomes part of this call site. Keep spans on
     -- caller-supplied arguments, but make every node copied from the callee
     -- blame the invocation if a later Core check rejects the residual.
@@ -406,11 +460,11 @@ fun inlineApp(r : Reducer, e : Core, fn : Core,
         Some(m) -> m
         None -> return None
     }
-    if size <= inlineLimit { return Some(made) }
+    if size <= limit { return Some(made) }
     r.speculating = True
     let residual = expr(r, made)
     r.speculating = False
-    if sizeOf_(residual) <= inlineLimit { Some(residual) } else { None }
+    if sizeOf_(residual) <= limit { Some(residual) } else { None }
 }
 
 -- `size` of a reduced body, once per binding rather than per site.
@@ -430,6 +484,16 @@ fun movesOf(r : Reducer, key : String, body : Core) -> Bool = match Map.get(r.mo
     None -> {
         let made = transfers(body, Set.new())
         Map.put(r.moves, key, made)
+        made
+    }
+}
+
+-- `bottoms` of a reduced body, on the same terms as the other two.
+fun endsOf(r : Reducer, key : String, body : Core) -> Bool = match Map.get(r.ends, key) {
+    Some(found) -> found
+    None -> {
+        let made = bottoms(body)
+        Map.put(r.ends, key, made)
         made
     }
 }
@@ -508,6 +572,43 @@ fun floatLet(e : Core) -> Option Core = match e.kind {
             let inner = mkCore(e.ty, e.span, CMatch(body, alts))
             Some(mkCore(e.ty, scrutinee.span,
                         CLet(name, bound, value, inner, Array.new(0))))
+        }
+        _ -> None
+    }
+    _ -> None
+}
+
+-- `match (join j(p) = B in R) { alts }`, with the match moved into B.
+--
+-- What an inlined `Iterator.next` leaves behind. The callee's early `return`
+-- became a join, so the constructor the caller wants to take apart is not the
+-- scrutinee itself but the argument of a `jump` inside it, and `caseOfCase` --
+-- which knows how to push a match into the arms of a `match` or an `if` -- does
+-- not reach it.
+--
+-- Moving the match into the join's *body* puts it exactly one step from those
+-- jumps, and `specializeJoin` closes the gap: it copies the body once per
+-- constructor signature seen at a jump, and the copy is a match on a known
+-- constructor, which `knownConstructor` deletes along with the allocation. This
+-- is GHC's case-of-case over join points, and the reason it is one rule there
+-- and two here is that this compiler's join specialization is a separate rule
+-- already.
+--
+-- `R` must not fall through, or its own value would escape unmatched. That is
+-- not a restriction in practice: a join stands where a `return` or a `?` was,
+-- and control reaches its continuation by jumping.
+fun caseOfJoin(e : Core) -> Option Core = match e.kind {
+    CMatch(scrutinee, alts) -> match scrutinee.kind {
+        CJoin(name, params, body, rest, recursive) -> {
+            if fallsThrough(rest) { return None }
+            let mentioned = namesOfAlts(alts)
+            for p in params {
+                if Set.contains(mentioned, p.name) { return None }
+            }
+            Some(mkCore(e.ty, scrutinee.span, CJoin(
+                name, params,
+                mkCore(e.ty, e.span, CMatch(body, alts)),
+                retype(rest, e.ty), recursive)))
         }
         _ -> None
     }
@@ -1081,10 +1182,133 @@ fun isValue(e : Core) -> Bool = match e.kind {
     _ -> False
 }
 
-fun sizeOf_(e : Core) -> Int {
-    var total = 1 + wrappers(e.kind)
-    for child in kids(e.kind) { total = total + sizeOf_(child) }
-    total
+-- Roughly the code `e` becomes, for the inliner to spend a budget of.
+--
+-- Counting every node as one is what this did, and it charges for a great deal
+-- that is not code. `Main#inc` in the brainfuck benchmark -- one array element
+-- read, incremented and written back -- measured 98 against a budget of 40 and
+-- so stayed a call, while the loop that called it three times a cycle paid a
+-- frame, a spill set and a panic-flag test for each. Most of those 98 nodes
+-- were names: `match xs { Data.Array#Array(value) -> value }` appeared four
+-- times, which is a single-constructor unpack and lowers to one load, and the
+-- `let`s naming each intermediate lower to nothing at all, the backend being in
+-- SSA already.
+--
+-- So: a variable, a literal and a nullary constructor are operands and cost
+-- nothing; a type application is erased; a `let` is a name for a value, and
+-- costs what it names. A match with one alternative is a projection -- the
+-- backend does not even test the tag -- while one with several costs a branch
+-- each. This is GHC's `sizeExpr`, which is free for variables, literals, types
+-- and coercions and charges per case alternative, and it is the same reasoning
+-- as the discounts already here: the budget should track what a call site
+-- actually grows by.
+fun sizeOf_(e : Core) -> Int = match e.kind {
+    CVar(_) -> 0
+    CLit(_) -> 0
+    CUnit -> 0
+    CCon(_) -> 0
+    CTyApp(fn, _) -> sizeOf_(fn)
+    CLet(_, _, value, body, _) -> sizeOf_(value) + sizeOf_(body)
+    CLam(_, body, _) -> sizeOf_(body)
+    CJoin(_, _, body, rest, _) -> sizeOf_(body) + sizeOf_(rest)
+    CMatch(scrutinee, alts) -> {
+        var total = if len(alts) <= 1 { 0 } else { len(alts) }
+        total = total + sizeOf_(scrutinee)
+        for a in alts { total = total + sizeOf_(a.body) }
+        total
+    }
+    -- A `letrec` member costs what its value costs, which is what the
+    -- recursion over `kids` already does: the wrapper itself is not code.
+    _ -> {
+        var total = 1
+        for child in kids(e.kind) { total = total + sizeOf_(child) }
+        total
+    }
+}
+
+-- Whether evaluating `e` always diverges.
+--
+-- GHC's `exprIsBottom`, cut down to the one producer this compiler has:
+-- `Prim.error`. Conservative in the direction of answering false, which costs
+-- an inline allowed rather than a term moved wrongly.
+fun bottoms(e : Core) -> Bool = match e.kind {
+    CApp(fn, _) -> match stripTyApp(fn).kind {
+        CPrim(name) -> name == "Prim.error"
+        -- Python asks for a `name` field and takes whichever node has one, so
+        -- a variable spelled this way would answer too. Nothing builds one,
+        -- and saying so costs a line.
+        CVar(name) -> name == "Prim.error"
+        _ -> False
+    }
+    CLet(_, _, _, body, _) -> bottoms(body)
+    CJoin(_, _, _, rest, _) -> bottoms(rest)
+    CMatch(_, alts) -> {
+        if len(alts) == 0 { return False }
+        for a in alts { if !bottoms(a.body) { return False } }
+        True
+    }
+    CIf(_, then, otherwise) -> match otherwise {
+        Some(o) -> bottoms(then) && bottoms(o)
+        None -> False
+    }
+    _ -> False
+}
+
+fun stripTyApp(e : Core) -> Core = match e.kind {
+    CTyApp(fn, _) -> stripTyApp(fn)
+    _ -> e
+}
+
+-- Whether `e` can produce a value of its own rather than jumping away.
+--
+-- A join's type is the type of its result, which says nothing about where that
+-- result comes from: the `if` an inlined `return` leaves behind is typed
+-- `Option a` while both its branches are jumps, so nothing ever reaches the
+-- expression after it. `caseOfJoin` needs that distinction, and only the syntax
+-- has it.
+--
+-- Conservative in the direction of answering true: an unrecognised term is
+-- assumed to fall through, which costs a rewrite declined rather than a value
+-- dropped.
+fun fallsThrough(e : Core) -> Bool = match e.kind {
+    CJump(_, _) -> False
+    CLet(_, _, _, body, _) -> fallsThrough(body)
+    CJoin(_, _, body, rest, _) -> fallsThrough(body) || fallsThrough(rest)
+    CMatch(_, alts) -> {
+        for a in alts { if fallsThrough(a.body) { return True } }
+        False
+    }
+    CIf(_, then, otherwise) -> match otherwise {
+        Some(o) -> fallsThrough(then) || fallsThrough(o)
+        None -> True
+    }
+    _ -> True
+}
+
+-- `e`, with the result type of every tail position replaced.
+--
+-- Only ever called where `fallsThrough(e)` is false, and that is what makes it
+-- sound: nothing here can produce a value, so the type each of these nodes
+-- carries is a label on a result that never happens. Because `fallsThrough`
+-- decides a join by *both* its body and its rest, and a match by all of its
+-- arms, the recursion below reaches exactly the terms that inherited the
+-- phantom type and stops at the jumps that gave it away.
+fun retype(e : Core, ty : Ty.Type) -> Core = match e.kind {
+    CLet(name, bound, value, body, binders) ->
+        mkCore(ty, e.span, CLet(name, bound, value, retype(body, ty), binders))
+    CJoin(name, params, body, rest, recursive) ->
+        mkCore(ty, e.span, CJoin(name, params, retype(body, ty),
+                                 retype(rest, ty), recursive))
+    CMatch(scrutinee, alts) ->
+        mkCore(ty, e.span, CMatch(scrutinee, Array.map(alts, fun(a) = CAlt {
+            pat = a.pat, body = retype(a.body, ty),
+        })))
+    CIf(cond, then, otherwise) -> match otherwise {
+        Some(o) -> mkCore(ty, e.span, CIf(cond, retype(then, ty),
+                                          Some(retype(o, ty))))
+        None -> e
+    }
+    _ -> e
 }
 
 -- Whether the alternatives `alts` are still being matched on inside `e`:

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from . import llvmgen, pygen
-from .driver import (check, declared, desugared, report_warnings,
+from .driver import (check, declared, desugared, report_warnings, run_deep,
                      registered, run, show_binding_groups,
                      show_classes, show_declarations)
 from .errors import TurkeyError, TurkeyPanic
@@ -19,6 +19,20 @@ from .types import show_scheme
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Every command, on a thread with room to recurse.
+
+    `run` has needed that since a compiler became a thing this could be asked
+    to execute, and the dumps need it for the same reason one step earlier:
+    *compiling* a program the size of the bootstrap compiler recurses over its
+    Core about as deeply as running one does, and `turkey types boot/Main.tl`
+    reached the host's limit inside the inliner.
+    """
+    box: list[int] = []
+    run_deep(lambda: box.append(_main(argv)))
+    return box[0] if box else 2
+
+
+def _main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="turkey", description="turkey-lite prototype")
     sub = parser.add_subparsers(dest="command", required=True)
     for name, help_text in [

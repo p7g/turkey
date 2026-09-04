@@ -226,6 +226,9 @@ class _Reducer:
         self.sizes: dict[tuple, int] = {}
         self.moves: dict[tuple, bool] = {}
         self.ends: dict[tuple, bool] = {}
+        # `_size` of each body *as written*, which is what the speculative
+        # ceiling is checked against before the body is reduced at all.
+        self.wrote: dict[str, int] = {}
         # A speculative large inline may reduce ordinary small calls inside
         # its residual, but does not recursively speculate about another large
         # call.  Besides bounding compile time, this makes the profitability
@@ -356,6 +359,53 @@ class _Reducer:
         assert isinstance(lam, CLam)
         if len(lam.params) != len(e.args):
             return None
+        # The ceiling, asked of the body *as written*, before anything reduces
+        # it. Asking it only of the reduced body -- which is what this did --
+        # means the reduction happens first and the answer is discarded, so a
+        # callee too large to inline is fully optimized at every call site that
+        # names it, nested inside that call site's own traversal.
+        #
+        # `Turkey.Desugar#thread` is fifty nodes and sits in a twenty-one
+        # binding cycle with `#expr`, the desugarer's whole expression walker.
+        # Reducing `thread` reduced `expr` inside it: 74,073 inlinings, every
+        # reduction in the trace, and then the stack. Nothing was gained --
+        # `expr` is refused on size the moment the question is finally asked.
+        #
+        # It costs no inlining that was ever taken. Across the 3,393 inlines
+        # the conformance suite performs, the largest body inlined is fifty
+        # nodes as written, and reduction never shrinks one by more than a
+        # quarter (`Data.Map#delete@String,Unit` grows, 40 to 43). The
+        # speculative ceiling is 128, so the check has more than twice the
+        # margin of anything observed, and this is the size question GHC asks
+        # too: its unfolding guidance is computed from the term as written.
+        if self.written(name) > SPECULATIVE_INLINE_LIMIT:
+            return None
+        # A monomorphic callee is reduced in its own turn, and `reduce_program`
+        # takes those turns in dependency order, so by the time a caller is
+        # reached every callee it can name is already in the memo. A cold one
+        # is therefore a binding in the caller's own cycle whose turn has not
+        # come -- and reducing it *here*, nested inside this traversal, is what
+        # the dependency order exists to avoid. The twenty-one binding
+        # `Turkey.Desugar` cycle is the case: each member is small enough to
+        # inline, so reducing any one of them reduced the other twenty inside
+        # it, and the walker's depth was the sum of what they all expand to.
+        #
+        # Declining costs the inlining of a cycle's members into each other
+        # before their turn, and keeps it after: the components come out of
+        # `deps.sccs` sorted, so a member is inlined into every later member
+        # and into none of the earlier ones. That is the same arbitrary-but-
+        # stable choice the loop breaker already makes, for the same reason --
+        # no order within a cycle is better than another, and a golden must
+        # not move when an unrelated binding is renamed. GHC's simplifier
+        # inlines the previous iteration's version of a recursive group's
+        # members for exactly this reason.
+        #
+        # Type instantiation is exempt: `reduce_program` warms no key that
+        # names type arguments, so a cold one there means "not asked for yet"
+        # rather than "not its turn", and that nesting is bounded anyway --
+        # measured at nine deep on the bootstrap compiler.
+        if targs is None and key not in self.reduced:
+            return None
         body = self.body_of(name, key, lam)
         # The *reduced* body drives the ordinary limit, not the written one. A
         # small source body that expands to five hundred nodes is five hundred
@@ -417,6 +467,19 @@ class _Reducer:
         finally:
             self.speculating = was
         return residual if _size(residual) <= limit else None
+
+    def written(self, name: str) -> int:
+        """`_size` of a binding's body as written, once per binding.
+
+        Type instantiation copies a body without changing its shape, so this
+        is asked of the name rather than of the key: every specialization of
+        `name` has the same written size.
+        """
+        found = self.wrote.get(name)
+        if found is None:
+            value = self.bindings[name].value
+            found = self.wrote[name] = _size(value.body)
+        return found
 
     def size_of(self, key: tuple[str, tuple], body) -> int:
         """`_size` of a reduced body, once per binding rather than per site."""

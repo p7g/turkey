@@ -15,6 +15,7 @@ from pathlib import Path
 from llvmlite import binding, ir
 
 from . import backend_ir as bir
+from . import builtins
 from .backend_lower import lower
 from .core import CProgram
 from .decls import DeclTable
@@ -103,7 +104,9 @@ _CALLING_PRIMS = frozenset({
     "stringToByteStorage", "stringFromBytes", "stringConcatAll", "floatParse",
     "floatFmod", "floatRemainder", "floatFloor", "floatCeil", "floatRound",
     "floatTrunc", "stringIsValidUtf8", "floatCanParse", "stringEq", "stringLt",
-    "arrayNew", "arrayNewUninit", "error",
+    "arrayNew", "arrayNewUninit", "error", "stderrWrite", "exit",
+    "argsStorage", "fileCanRead", "readFileStorage",
+    "writeFileBytes",
 })
 _LAYOUT_SUFFIXES = frozenset(layout.value for layout in bir.Layout)
 
@@ -388,6 +391,12 @@ class _Emitter:
         self._runtime("turkey_string_concat_all", _PTR, [_PTR])
         self._runtime("turkey_string_eq", _I32, [_PTR, _PTR])
         self._runtime("turkey_string_lt", _I32, [_PTR, _PTR])
+        self._runtime("turkey_args_storage", _PTR, [])
+        self._runtime("turkey_file_can_read", _I32, [_PTR])
+        self._runtime("turkey_read_file_bytes", _PTR, [_PTR])
+        self._runtime("turkey_write_file_bytes", _I32, [_PTR, _PTR])
+        self._runtime("turkey_stderr_write", _I8, [_PTR])
+        self._runtime("turkey_exit", ir.VoidType(), [_I64])
         self._runtime("turkey_print", _I8, [_PTR])
         self._runtime("turkey_write", _I8, [_PTR])
         self._runtime("turkey_cell_new", _PTR, [_I64, _I32])
@@ -1226,6 +1235,9 @@ class _Emitter:
             "intToString": "turkey_int_to_string", "floatToString": "turkey_float_to_string",
             "charToString": "turkey_char_to_string", "stringConcat": "turkey_string_concat",
             "print": "turkey_print", "write": "turkey_write",
+            "stderrWrite": "turkey_stderr_write",
+            "argsStorage": "turkey_args_storage",
+            "readFileStorage": "turkey_read_file_bytes",
             "stringByteLength": "turkey_string_byte_length",
             "stringByteAt": "turkey_string_byte_at",
             "stringDecodeAt": "turkey_string_decode_at",
@@ -1251,6 +1263,20 @@ class _Emitter:
             raw = builder.call(self.runtime["turkey_string_is_valid_utf8"], args)
             value = builder.icmp_unsigned("!=", raw, ir.Constant(_I32, 0))
             return value, self._propagate(function, builder)
+        if name in ("fileCanRead", "writeFileBytes"):
+            raw = builder.call(self.runtime[
+                "turkey_file_can_read" if name == "fileCanRead"
+                else "turkey_write_file_bytes"], args)
+            value = builder.icmp_unsigned("!=", raw, ir.Constant(_I32, 0))
+            return value, self._propagate(function, builder)
+        if name == "exit":
+            # Never returns, so the rest of the block is unreachable and
+            # `_diverged` says so -- the same shape `error` has, and worth as
+            # much here: everything after an `exit` is dead and LLVM should
+            # not have to keep it live across a call that may write anything.
+            builder.call(self.runtime["turkey_exit"], args)
+            return (ir.Constant(_llvm_type(layout), None),
+                    self._diverged(function, builder))
         if name == "floatCanParse":
             raw = builder.call(self.runtime["turkey_float_can_parse"], args)
             value = builder.icmp_unsigned("!=", raw, ir.Constant(_I32, 0))
@@ -1446,6 +1472,12 @@ class _Emitter:
 # and a wrong `restype` here is a silently truncated pointer.
 _RUNTIME_CALLS: dict[str, tuple[object, tuple]] = {
     "turkey_panic_clear": (None, ()),
+    "turkey_install_crash_handler": (None, ()),
+    "turkey_args_set": (None, (ctypes.c_int64, ctypes.POINTER(ctypes.c_char_p),
+                               ctypes.POINTER(ctypes.c_int64))),
+    "turkey_exiting": (ctypes.c_int32, ()),
+    "turkey_exit_status": (ctypes.c_int64, ()),
+    "turkey_exit_clear": (None, ()),
     "turkey_panicked": (ctypes.c_int32, ()),
     "turkey_panic_message": (ctypes.c_char_p, ()),
     "turkey_frame_count": (ctypes.c_int64, ()),
@@ -1562,11 +1594,36 @@ class NativeModule:
     entry: str
     result: bir.Layout
 
+    def _set_args(self, args: list[str]) -> None:
+        """Hand the runtime what the program will see through `Prim.args`.
+
+        As bytes with explicit lengths rather than as C strings: an argument
+        may contain anything the operating system allowed, and truncating one
+        at a NUL would be inventing a different program invocation. The
+        runtime copies them, so the buffers here need not outlive the call.
+        """
+        encoded = [value.encode("utf-8", "surrogateescape") for value in args]
+        count = len(encoded)
+        bytes_array = (ctypes.c_char_p * count)(*encoded)
+        lengths = (ctypes.c_int64 * count)(*[len(value) for value in encoded])
+        self.runtime.turkey_args_set(count, bytes_array, lengths)
+
     def execute(self) -> None:
         self.runtime.turkey_panic_clear()
+        self.runtime.turkey_exit_clear()
+        if "TURKEY_SEGV_FRAMES" in os.environ:
+            # A fault in generated code is otherwise silent: no symbols for the
+            # JIT, and no debugger on a hardened interpreter. See the runtime.
+            self.runtime.turkey_install_crash_handler()
+        self._set_args(builtins.program_args())
         self.runtime.turkey_gc_set_stress(int("TURKEY_GC_STRESS" in os.environ))
         address = self.engine.get_function_address(self.entry)
         ctypes.CFUNCTYPE(_ctype(self.result))(address)()
+        if self.runtime.turkey_exiting():
+            # `Prim.exit` unwinds on the panic flag, so it arrives here looking
+            # like one. It is not: there is no message and no frames, and the
+            # status is the program's answer rather than a failure to report.
+            raise SystemExit(self.runtime.turkey_exit_status())
         self.runtime.turkey_collect()
         if self.runtime.turkey_panicked():
             raw = self.runtime.turkey_panic_message()

@@ -99,6 +99,16 @@ def set_args(args) -> None:
     _ARGS[:] = list(args)
 
 
+def program_args() -> list[str]:
+    """What `set_args` recorded, for a host that runs the program natively.
+
+    The native backend cannot read `_ARGS` the way `_args` does -- it hands
+    the bytes to the runtime before the program starts -- so the two hosts
+    share the setter and this is the other half of it.
+    """
+    return list(_ARGS)
+
+
 def _args() -> ConValue:
     return _array_of_values(list(_ARGS))
 

@@ -60,6 +60,28 @@ int64_t turkey_heap_objects(void);
 int64_t turkey_collection_count(void);
 void turkey_gc_set_stress(int32_t enabled);
 
+/* The outside world: arguments, two file doors, the error stream and `exit`.
+   `turkey_args_set` is called by the host before the program runs and copies
+   what it is given; `turkey_args_storage` builds the `TurkeyString`s on
+   demand. `turkey_exit` unwinds through the panic flag, and `turkey_exiting`
+   is what tells an exit from a panic at the boundary. */
+void turkey_args_set(int64_t count, const unsigned char *const *bytes,
+                     const int64_t *lengths);
+void *turkey_args_storage(void);
+int32_t turkey_file_can_read(TurkeyString *path);
+void *turkey_read_file_bytes(TurkeyString *path);
+int32_t turkey_write_file_bytes(TurkeyString *path, void *array);
+uint8_t turkey_stderr_write(TurkeyString *value);
+void turkey_exit(int64_t status);
+int32_t turkey_exiting(void);
+int64_t turkey_exit_status(void);
+void turkey_exit_clear(void);
+
+/* Print the Turkey call stack on a fault in generated code, then exit 139.
+   Opt-in: the host installs it when `TURKEY_SEGV_FRAMES` is set, because a
+   `SIGSEGV` handler is not this library's to take by default. */
+void turkey_install_crash_handler(void);
+
 void turkey_panic(const char *message);
 void turkey_panic_string(TurkeyString *message);
 int32_t turkey_panicked(void);

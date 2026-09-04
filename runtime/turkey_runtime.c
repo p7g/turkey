@@ -4,7 +4,9 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <signal.h>
 #include <string.h>
+#include <unistd.h>
 
 typedef struct TurkeyCell { uint64_t value; int32_t pointer_value; } TurkeyCell;
 typedef struct TurkeyObject {
@@ -844,4 +846,263 @@ void turkey_closure_capture(void *pointer, int64_t index, uint64_t value) {
     if (!valid_object_kind(pointer, 3)) return;
     TurkeyObject *closure = pointer;
     turkey_object_set((void *)(uintptr_t)closure->slots[1], index, value);
+}
+
+/* ------------------------------------------------------------ the outside world
+ *
+ * The floor `turkey/builtins.py` describes: arguments, two file doors, the
+ * error stream and `exit`. Every one of them is written twice -- once there
+ * for the Python host and once here -- so the cost of a primitive is paid
+ * twice and the set is deliberately small.
+ *
+ * Bytes, not text, on both file doors: a file is not guaranteed to be
+ * well-formed UTF-8 and a `String` is, so the validating constructor stays in
+ * the library where `Some` and `None` are in scope. Reading is total only
+ * after `turkey_file_can_read` says so, the same predicate-plus-total split
+ * `turkey_float_can_parse`/`turkey_float_parse` already uses.
+ */
+
+static unsigned char **argument_bytes;
+static int64_t *argument_lengths;
+static int64_t argument_count;
+
+void turkey_args_set(int64_t count, const unsigned char *const *bytes,
+                     const int64_t *lengths) {
+    /* Copied out of the host's memory and held outside the Turkey heap. A
+       `TurkeyString` per argument would have to stay reachable for the life
+       of the program from a root the collector scans, and there is no such
+       root; plain bytes need none, and `turkey_args_storage` builds the
+       strings on demand. */
+    for (int64_t index = 0; index < argument_count; ++index)
+        free(argument_bytes[index]);
+    free(argument_bytes);
+    free(argument_lengths);
+    argument_bytes = NULL;
+    argument_lengths = NULL;
+    argument_count = 0;
+    if (count <= 0) return;
+    argument_bytes = calloc((size_t)count, sizeof(unsigned char *));
+    argument_lengths = calloc((size_t)count, sizeof(int64_t));
+    if (argument_bytes == NULL || argument_lengths == NULL) {
+        free(argument_bytes);
+        free(argument_lengths);
+        argument_bytes = NULL;
+        argument_lengths = NULL;
+        turkey_panic("out of memory recording arguments");
+        return;
+    }
+    for (int64_t index = 0; index < count; ++index) {
+        int64_t length = lengths[index];
+        unsigned char *copy = malloc((size_t)length + 1);
+        if (copy == NULL) {
+            argument_count = index;
+            turkey_panic("out of memory recording arguments");
+            return;
+        }
+        memcpy(copy, bytes[index], (size_t)length);
+        copy[length] = '\0';
+        argument_bytes[index] = copy;
+        argument_lengths[index] = length;
+    }
+    argument_count = count;
+}
+
+void *turkey_args_storage(void) {
+    RootFrame frame;
+    void *roots[1] = {NULL};
+    turkey_root_enter(&frame, roots, 1, "turkey_args_storage");
+    /* Rooted before the first string is built: every `turkey_string_new` can
+       collect, and the array is the only thing holding the strings made
+       before it. */
+    TurkeyObject *storage = turkey_array_new(argument_count, 0, 8, 6);
+    if (storage == NULL) { turkey_root_leave(&frame); return NULL; }
+    roots[0] = storage;
+    frame.live = 1;
+    for (int64_t index = 0; index < argument_count; ++index) {
+        TurkeyString *value = turkey_string_new(argument_bytes[index],
+                                                argument_lengths[index]);
+        if (value == NULL) { turkey_root_leave(&frame); return NULL; }
+        storage->slots[index] = (uint64_t)(uintptr_t)value;
+    }
+    turkey_root_leave(&frame);
+    return storage;
+}
+
+/* A `TurkeyString` is length-delimited and a path is a C string, so every
+   door here needs a NUL-terminated copy. An embedded NUL is rejected rather
+   than truncated at: a path that names one file to Turkey and another to the
+   operating system is the shape of a directory-traversal bug. */
+static char *path_of(TurkeyString *value) {
+    if (value == NULL) return NULL;
+    if (memchr(value->bytes, '\0', (size_t)value->length) != NULL) {
+        turkey_panic("a path cannot contain a NUL byte");
+        return NULL;
+    }
+    char *path = malloc((size_t)value->length + 1);
+    if (path == NULL) { turkey_panic("out of memory"); return NULL; }
+    memcpy(path, value->bytes, (size_t)value->length);
+    path[value->length] = '\0';
+    return path;
+}
+
+int32_t turkey_file_can_read(TurkeyString *value) {
+    char *path = path_of(value);
+    if (path == NULL) return 0;
+    FILE *handle = fopen(path, "rb");
+    free(path);
+    if (handle == NULL) return 0;
+    fclose(handle);
+    return 1;
+}
+
+void *turkey_read_file_bytes(TurkeyString *value) {
+    char *path = path_of(value);
+    if (path == NULL) return NULL;
+    FILE *handle = fopen(path, "rb");
+    if (handle == NULL) {
+        snprintf(panic_buffer, sizeof panic_buffer, "cannot read %s", path);
+        free(path);
+        turkey_panic(panic_buffer);
+        return NULL;
+    }
+    /* Grown rather than sized by `fseek` first: a pipe or a device has no
+       length to ask for, and a regular file can change between the two
+       calls. */
+    size_t capacity = 4096, length = 0;
+    unsigned char *bytes = malloc(capacity);
+    if (bytes == NULL) {
+        fclose(handle); free(path); turkey_panic("out of memory"); return NULL;
+    }
+    for (;;) {
+        if (length == capacity) {
+            size_t grown = capacity * 2;
+            unsigned char *bigger = realloc(bytes, grown);
+            if (bigger == NULL) {
+                free(bytes); fclose(handle); free(path);
+                turkey_panic("out of memory");
+                return NULL;
+            }
+            bytes = bigger;
+            capacity = grown;
+        }
+        size_t read = fread(bytes + length, 1, capacity - length, handle);
+        length += read;
+        if (read == 0) break;
+    }
+    int failed = ferror(handle);
+    fclose(handle);
+    if (failed) {
+        snprintf(panic_buffer, sizeof panic_buffer, "cannot read %s", path);
+        free(bytes); free(path);
+        turkey_panic(panic_buffer);
+        return NULL;
+    }
+    free(path);
+    TurkeyObject *storage = turkey_array_new((int64_t)length, 0, 1, 2);
+    if (storage != NULL && length > 0) memcpy(storage->slots, bytes, length);
+    free(bytes);
+    return storage;
+}
+
+int32_t turkey_write_file_bytes(TurkeyString *value, void *wrapper) {
+    /* Answers whether it worked rather than panicking. A failed write is an
+       ordinary thing to want to report -- a full disk, a read-only directory
+       -- and unlike a failed read there is no predicate that could be asked
+       first without lying about the race. */
+    TurkeyObject *array;
+    int64_t length;
+    if (!array_parts(wrapper, &array, &length)) return 0;
+    char *path = path_of(value);
+    if (path == NULL) return 0;
+    FILE *handle = fopen(path, "wb");
+    free(path);
+    if (handle == NULL) return 0;
+    size_t written = length == 0 ? 0
+        : fwrite(array->slots, 1, (size_t)length, handle);
+    int failed = written != (size_t)length || ferror(handle);
+    if (fclose(handle) != 0) failed = 1;
+    return failed ? 0 : 1;
+}
+
+uint8_t turkey_stderr_write(TurkeyString *value) {
+    if (value == NULL) return 0;
+    fwrite(value->bytes, 1, (size_t)value->length, stderr);
+    fflush(stderr);
+    return 0;
+}
+
+static int32_t exit_requested;
+static int64_t exit_status;
+
+void turkey_exit(int64_t status) {
+    /* Unwound the way a panic is, and for the same reason: generated code
+       already tests one flag after every call that can fail, so a second
+       mechanism would be a second thing to get right at every one of those
+       sites. `turkey_exiting` tells the two apart at the boundary -- an exit
+       carries a status and no message. */
+    exit_requested = 1;
+    exit_status = status;
+    fflush(stdout);
+    fflush(stderr);
+    turkey_has_panicked = 1;
+}
+
+int32_t turkey_exiting(void) { return exit_requested; }
+
+int64_t turkey_exit_status(void) { return exit_status; }
+
+void turkey_exit_clear(void) { exit_requested = 0; exit_status = 0; }
+
+/* -------------------------------------------------------- crash diagnostics
+ *
+ * A fault in generated code otherwise says nothing at all. The JIT registers
+ * no symbols, so the operating system's crash report is a list of unnamed
+ * addresses, and a debugger cannot control a hardened interpreter well enough
+ * to be attached to one. Meanwhile two shadow stacks that already exist know
+ * the answer: `panic_calls` carries the source position of every call that
+ * can fail, and the collector's root frames carry the function names. Walking
+ * them turns "exited -11, no output" into the Turkey call stack.
+ *
+ * Opt-in through `TURKEY_SEGV_FRAMES`, the way `TURKEY_GC_STRESS` is, and for
+ * the same reason: taking `SIGSEGV` over for a process that is mostly not
+ * this runtime is a debugging choice rather than a default.
+ */
+
+static void crash_report(int signal_number) {
+    /* Async-signal-safe: `write` alone, out of a stack buffer. Nothing here
+       allocates, takes a lock, or returns -- the process is already lost, and
+       the only job left is to say where from. */
+    char line[512];
+    const char *header = signal_number == SIGBUS
+        ? "\n*** SIGBUS in generated code\n"
+        : "\n*** SIGSEGV in generated code\n";
+    write(2, header, strlen(header));
+    const char *sites = "  innermost call sites:\n";
+    write(2, sites, strlen(sites));
+    int64_t shown = 0;
+    for (PanicCallFrame *frame = panic_calls;
+         frame != NULL && shown < 20; frame = frame->previous) {
+        const PanicSite *site = frame->site;
+        if (site == NULL || site->line == 0) continue;
+        int n = snprintf(line, sizeof line, "    %s (%s:%" PRId64 ":%" PRId64 ")\n",
+                         site->function ? site->function : "?",
+                         site->file ? site->file : "?", site->line, site->col);
+        if (n > 0) write(2, line, (size_t)n);
+        shown++;
+    }
+    const char *frames = "  enclosing functions, innermost first:\n";
+    write(2, frames, strlen(frames));
+    shown = 0;
+    for (RootFrame *frame = roots; frame != NULL && shown < 40;
+         frame = frame->previous, ++shown) {
+        int n = snprintf(line, sizeof line, "    %s\n",
+                         frame->function_name ? frame->function_name : "?");
+        if (n > 0) write(2, line, (size_t)n);
+    }
+    _exit(139);
+}
+
+void turkey_install_crash_handler(void) {
+    signal(SIGSEGV, crash_report);
+    signal(SIGBUS, crash_report);
 }

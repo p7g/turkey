@@ -880,6 +880,74 @@ which is not a record's, and falls through to the ordinary `object_get`. The
 name-based analysis stays name-based -- it only has to over-approximate escape,
 which it still does, so it costs opportunities and not correctness.
 
+### 51. The six outside-world primitives had no native implementation
+**bug, fixed.** M26. `Prim.args`, `Prim.fileCanRead`, `Prim.readFileBytes`,
+`Prim.writeFileBytes`, `Prim.stderrWrite` and `Prim.exit` existed for the
+Python host and nowhere else, so every program that read a file or looked at
+its arguments -- `boot` above all -- stopped at `is not implemented`. They are
+in the runtime now, and `boot` compiles itself to machine code and runs.
+
+Three of them needed more than a C function:
+
+* **arguments** are copied out of the host and held *outside* the Turkey heap.
+  A `TurkeyString` per argument would have to stay reachable for the whole
+  program from a root the collector scans, and there is no such root; plain
+  bytes need none, and the strings are built on demand.
+* **`Data.Array`** is what two of them answer, and the runtime cannot build
+  one: the record and constructor around the flat storage carry tags that live
+  in the code generator's tables. So the runtime allocates the storage and
+  `backend_lower.wrap_array` puts the `Array` around it, which is the shape
+  `Prim.stringToBytes` already had. Reading one back needs no tags -- the
+  runtime does that structurally in `array_parts` -- and only building one
+  does.
+* **`exit`** unwinds on the panic flag rather than through a mechanism of its
+  own. Generated code already tests one flag after every call that can fail,
+  and a second would be a second thing to get right at every one of those
+  sites; `turkey_exiting` is what tells the two apart at the boundary, since
+  an exit carries a status and no message.
+
+### 52. A fault in generated code said nothing at all
+**ergonomics, fixed.** M26. `boot` running natively segfaulted, and what that
+gave was `exited -11` and no output. The JIT registers no symbols, so the
+operating system's crash report is a list of unnamed addresses; and lldb
+cannot control an interpreter built with a hardened runtime -- it attaches and
+then reports "could not pause execution" -- so the usual next step is not
+available either.
+
+Both shadow stacks needed to answer this already existed for other reasons:
+`panic_calls` carries the source position of every call that can fail, and the
+collector's root frames carry function names. Printing them on `SIGSEGV` turned
+a silent `-11` into the exact Turkey call stack and the exact line, first try.
+Opt-in through `TURKEY_SEGV_FRAMES`, the way `TURKEY_GC_STRESS` is: taking
+`SIGSEGV` over for a process that is mostly not this runtime is a debugging
+choice, not a default.
+
+### 53. A record field is written bare and read boxed when only some copies specialize
+**bug, open.** M26, and the reason six `test_boot` cases still fail. Found by
+entry 52 in one run, having been invisible before `boot` could run natively at
+all.
+
+`Data.Map#findSlot` compares `bucket.key == key` through the `Eq k` dictionary.
+`mono` specializes it for the key/value pairs it can see, and those copies are
+right: `findSlot@Int,String` reads `bucket.key` at `i64` and *boxes* it before
+the closure call. The generic copy is also right on its own terms: it reads the
+same field at `boxed` and passes it straight to the closure, because a field of
+an abstracted type is supposed to already hold a box.
+
+They cannot both be right about the same `Bucket`. `Set Int` in
+`Turkey.Types#generalizeWalk` has its buckets built by specialized code, which
+stores a bare `i64`, and read by the generic copy, which hands that integer to
+a closure that unboxes it. The raw value 1 becomes a pointer, and
+`turkey_unbox` computes `header_of(1)->kind` -- address -7, which is the
+fault.
+
+This is the hazard `mono.check_layouts` exists to prevent and `layout.share`
+(entry 45, M25) exists to fix, so the interesting part is why neither caught
+it: `check_layouts` passes on this program. A layout is agreed *per copy*
+here, and what is missing is agreement between copies about a value neither
+one allocated. Either the generic copy has to stop assuming a box, or a record
+reachable from both has to be built the same way by both.
+
 ---
 
 ## Library, still wanted

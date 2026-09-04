@@ -45,6 +45,11 @@ ALLOWED_RUNTIME_CALLS = {
     "turkey_float_remainder", "turkey_float_floor", "turkey_float_ceil",
     "turkey_float_round", "turkey_float_trunc",
     "turkey_print", "turkey_write",
+    # The outside world: arguments, the two file doors, the error stream and
+    # `exit`. Each is one call by construction -- there is no inline form of
+    # opening a file -- so they belong here rather than being made into loads.
+    "turkey_args_storage", "turkey_file_can_read", "turkey_read_file_bytes",
+    "turkey_write_file_bytes", "turkey_stderr_write", "turkey_exit",
     "turkey_panic", "turkey_panic_string", "turkey_panicked",
     "turkey_root_enter", "turkey_root_leave",
     "turkey_frame_enter", "turkey_frame_leave",

@@ -25,6 +25,27 @@ from .types import (
 )
 
 
+@dataclass(frozen=True)
+class _Scattered:
+    """A record taken apart: each of its fields in a slot of its own.
+
+    An environment entry, beside the ordinary `bir.Value` slots, because that
+    is what the name *is* here -- not one value held somewhere but a set of
+    values that were never assembled. Keeping it in `env` is what gives it
+    scope, and scope is the whole point: `_flat_records` compares names bare,
+    so it can call one `b` flat while another `b` in the same body is an
+    ordinary record with different fields, and the environment is already the
+    thing that tells those two apart.
+
+    A distinct type rather than a stand-in slot because `lift` captures the
+    whole environment: a fake `bir.Value` here becomes a capture of a slot
+    that was never allocated. Saying what the entry is makes that a filter on
+    a type instead of a special case on a name.
+    """
+
+    fields: dict[str, bir.Value]
+
+
 def layout_of(ty: Type, abstracted: dict[int, str] | None = None
               ) -> bir.Layout:
     """The layout a value of `ty` is held at.
@@ -158,7 +179,6 @@ class _FunctionLowerer:
         self.count = 0
         self.flat_refs = _flat_refs(lam.body)
         self.flat_records = _flat_records(lam.body)
-        self.record_slots: dict[str, dict[str, bir.Value]] = {}
         self.blocks: list[bir.Block] = []
         self.slots: list[bir.Value] = []
         self.slot_names: set[str] = set()
@@ -421,8 +441,35 @@ class _FunctionLowerer:
         """
         if not isinstance(target, CVar):
             return None
-        value = env.get(target.name)
-        return None if value is None else self.record_slots.get(value.name)
+        found = env.get(target.name)
+        return found.fields if isinstance(found, _Scattered) else None
+
+    def wrap_array(self, block: bir.Block, storage: bir.Operand,
+                   length: bir.Operand) -> bir.Operand:
+        """`Data.Array#Array` around raw storage and the length it holds.
+
+        Three primitives answer a `Data.Array.Array` that the runtime can only
+        build the *contents* of: it allocates the flat storage, and the record
+        and constructor around it carry tags that live in this table. The
+        runtime reads the same shape back structurally (`array_parts`), which
+        needs no tags -- only building one does.
+        """
+        fields = self.record_fields["Data.Array#ArrayStorage"]
+        by_name = {"storage": storage, "length": length}
+        ordered = [by_name[name] for name in fields]
+        inner = self.emit(block, "object_new", (
+            "1", str(self.tags["Data.Array#ArrayStorage"]), str(len(ordered)),
+            str(_layout_metadata(item.layout for item in ordered)),
+        ), bir.Layout.PTR)
+        for index, item in enumerate(ordered):
+            block.instructions.append(bir.Instruction(
+                "object_set", (inner, str(index), item)))
+        outer = self.emit(block, "object_new", (
+            "1", str(self.tags["Data.Array#Array"]), "1",
+            str(_layout_metadata([bir.Layout.PTR])),
+        ), bir.Layout.PTR)
+        block.instructions.append(bir.Instruction("object_set", (outer, "0", inner)))
+        return outer
 
     def transfer(self, block: bir.Block, dest: _Destination,
                  value: bir.Operand) -> None:
@@ -452,14 +499,8 @@ class _FunctionLowerer:
                     at.instructions.append(
                         bir.Instruction("slot_store", (slot.name, value)))
                     held[name] = slot
-                # Keyed by a name of this binding's own, and reached through
-                # `env`, so that a second `b` somewhere else in the body finds
-                # its own slots or none. See `flat_slots`.
-                stand_in = bir.Value(self.fresh("flat_" + expr.name),
-                                     bir.Layout.PTR)
-                self.record_slots[stand_in.name] = held
                 inner = dict(env)
-                inner[expr.name] = stand_in
+                inner[expr.name] = _Scattered(held)
                 self.lower(expr.body, inner, joins, at, dest)
             self.lower_values([value for _, value in record.fields],
                               env, joins, block, scattered)
@@ -635,7 +676,12 @@ class _FunctionLowerer:
             done(block, bir.Constant(bir.Layout.UNIT, 0))
             return
         if isinstance(expr, CVar):
-            if expr.name not in env:
+            found = env.get(expr.name)
+            assert not isinstance(found, _Scattered), (
+                f"'{expr.name}' was scattered into slots, so a bare mention of "
+                f"it is a record that does not exist; `_flat_records` should "
+                f"not have offered it")
+            if found is None:
                 if expr.name in self.functions:
                     done(block, self.emit(block, "function_closure",
                                           (self.functions[expr.name][0],),
@@ -648,8 +694,7 @@ class _FunctionLowerer:
                     done(block, self.coerce(block, loaded, self.expr_layout(expr)))
                     return
                 raise Unsupported(f"LLVM backend cannot use top-level value '{expr.name}'", expr.span)
-            slot = env[expr.name]
-            loaded = self.emit(block, "slot_load", (slot.name,), slot.layout)
+            loaded = self.emit(block, "slot_load", (found.name,), found.layout)
             done(block, self.coerce(block, loaded, self.expr_layout(expr)))
             return
         if isinstance(expr, CCon):
@@ -681,8 +726,9 @@ class _FunctionLowerer:
             # reached through `self.globals`, not through a slot.
             if (isinstance(expr.target, CVar)
                     and expr.target.name in self.flat_refs
-                    and expr.target.name in env):
+                    and isinstance(env.get(expr.target.name), bir.Value)):
                 slot = env[expr.target.name]
+                assert isinstance(slot, bir.Value)
                 loaded = self.emit(block, "slot_load", (slot.name,), slot.layout)
                 done(block, self.coerce(block, loaded, self.layout(expr.ty)))
                 return
@@ -722,8 +768,9 @@ class _FunctionLowerer:
                 return
             if (isinstance(expr.target, CVar)
                     and expr.target.name in self.flat_refs
-                    and expr.target.name in env):
+                    and isinstance(env.get(expr.target.name), bir.Value)):
                 slot = env[expr.target.name]
+                assert isinstance(slot, bir.Value)
                 def store(at: bir.Block, xs: list[bir.Operand]) -> None:
                     at.instructions.append(bir.Instruction(
                         "slot_store",
@@ -815,25 +862,26 @@ class _FunctionLowerer:
                                         bir.Layout.PTR, self.frame(expr.span))
                         length = self.emit(at, "prim.stringByteLength", (string,),
                                            bir.Layout.I64)
-                        storage_fields = self.record_fields["Data.Array#ArrayStorage"]
-                        storage_values = {"storage": raw, "length": length}
-                        ordered = [storage_values[name] for name in storage_fields]
-                        storage = self.emit(at, "object_new", (
-                            "1", str(self.tags["Data.Array#ArrayStorage"]),
-                            str(len(ordered)), str(_layout_metadata(
-                                item.layout for item in ordered)),
-                        ), bir.Layout.PTR)
-                        for index, item in enumerate(ordered):
-                            at.instructions.append(bir.Instruction(
-                                "object_set", (storage, str(index), item)))
-                        outer = self.emit(at, "object_new", (
-                            "1", str(self.tags["Data.Array#Array"]), "1",
-                            str(_layout_metadata([bir.Layout.PTR])),
-                        ), bir.Layout.PTR)
-                        at.instructions.append(bir.Instruction(
-                            "object_set", (outer, "0", storage)))
-                        done(at, outer)
+                        done(at, self.wrap_array(at, raw, length))
                     self.lower_values(expr.args, env, joins, block, to_bytes)
+                    return
+                if primitive in ("Prim.args", "Prim.readFileBytes"):
+                    # The runtime answers raw storage; the `Array` around it is
+                    # built here, where the constructor tags are. `array_parts`
+                    # reads that shape structurally on the way back in, but
+                    # building one needs tags the runtime has no way to know.
+                    storage_prim = ("prim.argsStorage" if primitive == "Prim.args"
+                                    else "prim.readFileStorage")
+                    def from_storage(at: bir.Block,
+                                     values: list[bir.Operand]) -> None:
+                        raw = self.emit(at, storage_prim, tuple(values),
+                                        bir.Layout.PTR, self.frame(expr.span))
+                        # The storage is allocated at exactly the length it
+                        # holds, so its own element count is the length.
+                        length = self.emit(at, "prim.arrayLength", (raw,),
+                                           bir.Layout.I64)
+                        done(at, self.wrap_array(at, raw, length))
+                    self.lower_values(expr.args, env, joins, block, from_storage)
                     return
                 operation = "prim." + primitive.removeprefix("Prim.")
                 array_element_layout = None
@@ -924,7 +972,12 @@ class _FunctionLowerer:
 
     def lift(self, lam: CLam, env: dict[str, bir.Value]) -> tuple[
             str, list[tuple[str, bir.Value]]]:
-        captures = list(env.items())
+        # Slots only. A `_Scattered` names no slot to capture, and cannot be
+        # free in a lambda anyway: `_flat_records` escapes any name a closure
+        # reads a field of, precisely so that a record a closure shares stays
+        # a record.
+        captures = [(name, value) for name, value in env.items()
+                    if isinstance(value, bir.Value)]
         number = self.lift_counter[0]
         self.lift_counter[0] += 1
         # `_25_` is the escape for `%`, and `%` is the compiler's own

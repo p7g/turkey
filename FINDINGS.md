@@ -514,13 +514,28 @@ question that would have made it unnecessary:
 `turkey opt boot/Main.tl` finishes in 44 seconds, and no golden moves: the
 whole corpus reaches neither declined case.
 
-Two things are left. Speculation restores its flag to what it was rather than
-to `False` -- clearing it on the way out of an inner speculation re-armed the
-outer one -- which was a real bug and not the cause of anything measured here.
-And an instantiated key is still exempt from the second rule, because
-`reduce_program` warms no key that names type arguments; warming those through
-a request queue, as `mono` already has, would remove the exemption rather than
-state it.
+Speculation also restores its flag to what it was rather than to `False` --
+clearing it on the way out of an inner speculation re-armed the outer one --
+which was a real bug and not the cause of anything measured here. It is
+unbounded rather than merely expensive: with the flag re-armed the traversal's
+depth grows with whatever stack the process is given, which is how it was
+finally seen (68k levels at 1 GiB, 457k at 3 GiB).
+
+One thing is left. An instantiated key is still exempt from the second rule,
+because `reduce_program` warms no key that names type arguments; warming those
+through a request queue, as `mono` already has, would remove the exemption
+rather than state it.
+
+**And the port needed every one of them.** None of these three reached
+`boot/Turkey/Opt.tl`, which still carried the comment stating the pre-fix
+rationale -- so `boot opt boot/Main.tl` died the same death a milestone later,
+and looked like a stack limit rather than a missing fix. What settled it was
+one measurement rather than any amount of reading: the reference recurses
+**106 levels** on that program and `boot` reached **481,650 frames**. A 1,500x
+gap is not depth. The lesson is about the differential rather than the
+inliner -- `test_boot` compares *output*, so a stage that crashes is a stage
+the oracle says nothing about, and a fix to a shared algorithm has no test
+that notices it was applied to only one of the two implementations.
 
 The third candidate fix, a global tick limit, is rejected rather than
 deferred. It makes the output depend on traversal order and on program size,
@@ -1039,6 +1054,41 @@ bugs above is a case where the guess was wrong and nothing said so.
 `held_at` now falls back only for a `TVar` and refuses anything else. Three of
 the four would have been a compile error the day they were written, and the
 whole suite passes with the guess gone -- so nothing was relying on it.
+
+---
+
+### 55. Every live pointer is rooted, in one flat array, for the whole function
+**performance, open.** M26, found while measuring why a stack overflow in
+`boot` looked like a depth problem.
+
+`Turkey.Opt#expr` compiles to a frame carrying `[481 x ptr]` of GC roots --
+nearly 4KB before anything else the frame holds. The collector is precise and
+non-moving, and `turkey_root_enter` takes a frame of live pointers, so the
+backend roots every pointer-shaped value that is live anywhere in the
+function, in one array sized to the whole function's worst case, and stores to
+it on every write.
+
+Both halves of that are more than the collector asks for:
+
+* **Every pointer, rather than the ones live across a collection.** A root is
+  only needed if a collection can happen while the value is live, and a
+  collection can only happen at an allocation. The IR does not say which
+  instructions allocate, so the backend cannot ask, and roots everything.
+* **One array for the function, rather than per-region.** Two values with
+  disjoint live ranges need one slot between them; the frame is the sum
+  instead of the maximum.
+
+The cost is paid three times: the stores themselves, the frame size, and the
+cache line that frame no longer fits in. It is also what turned a divergence
+into a stack exhaustion -- with ordinary frames `boot` would have hung
+visibly instead of dying at 481,650 of them, and the cause would have been the
+first thing looked at rather than the last.
+
+The fix is an effects bit per opcode -- does this instruction allocate, and
+therefore collect -- which `backend_ir` has no room for today: an instruction
+is an opcode *string* and a tuple of operands, and every rule about what an
+opcode means lives in `llvmgen`. That is the same missing table that
+instruction selection will want, so it is one piece of work and not two.
 
 ---
 

@@ -1,13 +1,14 @@
 # Core-level optimization: CSE and constant folding
 
-Status: proposal
+Status: **surveyed, measured, and declined.** Neither pass is built. The
+analysis is kept because it is what would otherwise be redone, and because the
+measurement moved a decision in the backend.
 
 The design document for optimizations on Core. `opt` today does inlining, beta,
 case-of-case, case-of-known-constructor, join specialization, dead-let,
-let-floating and join lowering. This adds two, and states where the line
-between Core and the backend falls.
+let-floating and join lowering. This considered adding two.
 
-## Why these belong in Core
+## Why they would belong in Core, if they belonged anywhere
 
 Two reasons, and the second is the one particular to this project.
 
@@ -117,28 +118,74 @@ The narrow form is the one that is safe by construction, and it happens to be
 the one the register-pressure argument also wants: replace a later occurrence
 with a reference to an earlier binding already in scope, and move nothing.
 
-## Design
+## Measured, before writing either
 
-**Constant folding.** Literal arithmetic, comparison and boolean operators,
-folded only when the result is in range, computed through a checked path in
-both implementations. Not `if` on a literal condition -- `Bool` is a
-constructor and `known_constructor` already collapses that.
+The survey said both passes were sound and where they belonged. It did not say
+whether they would ever fire, and a constant folder in Core carries a cost the
+survey surfaced: `boot/Turkey/Prims.tl` holds primitive *names* and says so
+deliberately -- "what one *means* is the Python's business until the C runtime
+arrives". Folding would be the first thing to need semantics there, so it is
+worth knowing what it buys before paying.
 
-**CSE.** GHC's opportunistic shape, for our own reasons: within a binding,
-maintain a map from an expression's key to the name already bound to it;
-replace a later occurrence with that name when the binding dominates it and
-nothing has written to anything the expression reads in between. Invalidate the
-whole map at a write whose target the analysis cannot rule out.
+Counted over `tests/programs` and `boot/Main.tl` -- the whole corpus, including
+the compiler compiling itself -- on the program `opt` produces:
 
-Both run inside `opt`'s existing fixed point, so a fold feeds
-case-of-known-constructor and CSE feeds dead-let, without a new pass ordering
-to reason about.
+| | Core | backend IR |
+| --- | ---: | ---: |
+| operations with operands | 3,213 | 301,622 |
+| with at least one literal operand | **0** | 8,724 |
+| with *every* operand literal | **0** | 7 |
+| repeated identical pure expression | 32 | 1,536 |
 
-## Cost
+**Constant folding in Core would fire zero times.** Not rarely: never. Of 3,213
+primitive applications in the optimized Core of every program in the corpus,
+not one has even a single literal argument. In hindsight the reason is
+ordinary -- a programmer writes the constant already folded, and what inlining
+substitutes is arguments, which are variables.
 
-Two implementations plus a golden regeneration -- `turkey/opt.py` and
-`boot/Turkey/Opt.tl` -- and `test_boot` is red until both agree. That is the
-tax the differential charges and the reason it is worth paying.
+**CSE in Core would fire 32 times**, across 384,095 nodes, and 31 of those are
+tuple projections. That is 0.008%, for a pass needing an effects analysis Core
+does not have.
+
+Neither is worth two implementations and a golden regeneration. Neither is
+built.
+
+## What the measurement says about the backend
+
+The interesting half is the other column, because it is the Core-to-backend
+line drawn by counting rather than by citing GHC.
+
+**The constants are created by lowering.** Zero operations in Core take a
+literal operand and 8,724 in the backend IR do. Address arithmetic, tag tests
+and bounds checks are made during lowering out of numbers that were not in the
+program, which is exactly why a folder pays below Core and not in it.
+
+**But plain folding would fire 7 times even there.** Almost every constant
+appears in a `scalar_eq` -- a tag test -- with one constant operand and one
+variable, which is not foldable on its own. It is foldable once something has
+*propagated* the tag a preceding construction wrote.
+
+That is the difference between constant folding and what QBE actually lists,
+which is *sparse conditional constant propagation*. The value is in the
+propagation; the folding is the part that is worthless alone. The backend
+should implement SCCP and should not implement a folder, and this is now a
+measurement rather than a borrowed opinion.
+
+**And block-local CSE would fire 1,536 times**, which is 0.5% of instructions
+and the first real number on the question. Worth revisiting when the backend
+exists, against a live-range cost the backend can actually see; not worth
+guessing at now.
+
+## What this costs and saves
+
+Not writing them saves two passes in two implementations, a golden
+regeneration, and the semantics module `Prims.tl` has so far not needed. It
+keeps `boot` ignorant of what a primitive *means* until the native backend
+makes that unavoidable, which is the point at which it has to know anyway.
+
+The passes stay described here rather than deleted, because the analysis is
+what would otherwise be redone: if a future program is constant-heavy in a way
+this corpus is not, the traps above are the ones a folder still has to avoid.
 
 ## Sources
 

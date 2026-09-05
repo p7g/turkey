@@ -351,9 +351,20 @@ a stated goal:
 * **sparse conditional constant propagation** -- subsumes constant folding and
   unreachable-block elimination in one pass, and after lowering it is what
   removes bounds checks against known lengths and tag tests on known
-  constructors.
+  constructors. The *propagation* is the whole of the value, and this is
+  measured rather than assumed: across the corpus 8,724 backend instructions
+  take a constant operand and only **7** take nothing else, because almost
+  every one is a `scalar_eq` against a tag. A folder alone would fire seven
+  times. See `CORE-OPT.md`.
 * **copy elimination**.
 * **dead instruction elimination**.
+
+Block-local common-subexpression elimination is *not* on the list and is the
+one candidate worth revisiting once the backend exists: 1,536 instructions in
+the corpus repeat an identical earlier instruction within their own block,
+which is 0.5% and the first real number on the question. It is left out now
+because its cost is register pressure, and the backend is the only place that
+can see it.
 
 Plus loop nesting depth, which is not an optimization but is what the spiller
 needs to make good decisions, and is cheap once dominance exists.
@@ -435,10 +446,10 @@ in the low IR is shaped to suit it, so the day it goes costs one module.
 
 * **The first native target.** arm64, because it is what this is developed on
   and a backend that cannot be run is not being tested.
-* **Whether Core gains CSE and constant folding.** Recommended, and *before*
-  the backend rather than after: they are cheap there, they are checked by
-  goldens against a second implementation, and having them removes the argument
-  for a fifth low-IR pass.
+* ~~Whether Core gains CSE and constant folding.~~ Settled by measurement:
+  neither fires often enough to build. Folding in Core would fire *zero* times
+  across the whole corpus, because the constants are made by lowering and are
+  not in the program. See `CORE-OPT.md`.
 
 ## Rejected alternatives
 

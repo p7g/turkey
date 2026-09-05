@@ -220,6 +220,99 @@ What the split buys, then:
 What it costs is one more ADT with its `Inst` instance and its printer. That is
 the cost the objection correctly identified as small.
 
+## Where this idea comes from, and where else it goes
+
+The parameterized CFG is not a novelty, and the company it keeps is worth
+knowing before leaning on it further.
+
+**Hoopl** is the same idea, done first and done in Haskell. Ramsey, Dias and
+Peyton Jones, 2010: a dataflow analysis and transformation library whose
+`Graph` "is parameterized over both nodes `n` and over its shape at entry and
+exit", with "unusually strong static guarantees". It went into GHC as part of a
+rewrite of the back end and is what GHC's Cmm analyses are written against.
+That is this design's direct precedent: analyses written once, over a node type
+the client supplies.
+
+**Nanopass** is the maximal version of the same door. Sarkar, Waddell and
+Dybvig; `define-language` states an IR as a grammar and a later one as a
+*delta* from it, and `define-pass` writes only the cases that change. Chez
+Scheme's compiler is built on it. Where this proposal has two instruction types
+and shares the CFG, nanopass has a dozen intermediate languages and shares
+everything they have in common, generated.
+
+**And the counterexamples all share a property.** QBE puts virtual and machine
+instructions in one C enum and rewrites in place. Go does exactly the same at
+much larger scale: one `Op` enum spanning the architecture-independent
+operations and every architecture's, with lowering rewriting values in place
+from generic ops into `OpAMD64ADDQ` and friends.
+
+Neither language checks a `switch` for exhaustiveness. Neither pays anything
+for the mixed enum, because nothing was ever going to tell them a pass had
+forgotten a case. The two languages in this list that *do* check --- Haskell,
+and Scheme with nanopass's macros --- are the two that parameterize or
+generate.
+
+That correlation is the argument. Following QBE here means importing a design
+that is free in C and costs Turkey the main thing its type system offers.
+
+## Directions this opens
+
+Ordered by what they buy against what they cost. None is a phase-0 commitment;
+they are recorded because the shape chosen now is what makes them available.
+
+**Make "register allocated" a type.** Parameterize over the value type as well
+as the instruction: `Func Virtual MachInst` before allocation and
+`Func Physical MachInst` after. A virtual register then becomes unrepresentable
+in allocated code, which is a whole class of allocator bug that stops
+compiling. LLVM tracks the same facts -- `isSSA`, `NoVRegs`, `TracksLiveness`
+-- as *runtime properties* on `MachineFunction`, checked when someone
+remembers. This is the highest-value item on the list, because the allocator is
+the component whose bugs are both easy to write and invisible in a conformance
+run.
+
+**Generic passes, not just generic analyses.** Dead-code elimination and copy
+elimination need only `uses` and `defs`, so they are written once and run
+before *and* after selection. Post-selection dead code is then free, where QBE
+must write it a second time or skip it. This is the payoff that arrives
+earliest and costs nothing extra.
+
+**A second target costs an instruction type.** With the CFG, the analyses, the
+allocator and the verifier all generic, what a target adds is its instruction
+ADT, its selection table and its encoder. That is what Cwerg's "5kLOC per
+target" is buying, and it is bought here by construction rather than by
+discipline.
+
+**One fuzzer for everything.** Cranelift's evidence is that fuzzing is what
+made a high-complexity allocator transition safe. A random-program generator
+over `class Inst i` is generic too: one fuzzer, both instruction types, every
+target, and it is the only practical check on the allocator.
+
+**Associated families on the `Inst` class.** A target's register type and
+condition-code type are functions of its instruction type, which is what an
+associated family is for -- `class Inst i { type Reg i; ... }` -- and is how
+this stays a single-parameter class. The project does not add functional
+dependencies, and this is the case that would otherwise ask for them.
+
+**Hoopl's other parameter, and why it is not needed.** Hoopl also parameterizes
+a block by its *shape* at entry and exit, so that a block which must end in a
+terminator cannot fall through; it needs GADTs to do it. Turkey has none, and
+does not need them here: `Block.term` is a `Term` and not an `Option Term`, so
+the invariant Hoopl encodes in a type index is already enforced by the record
+having no way to omit it.
+
+**Where not to take it: Core.** Core has blocks and jumps, so the temptation is
+to express it in the same framework and share `joins.discover` and the
+dominance analysis. It should be resisted. Core is expression-structured and
+typed; the framework is flat and representation-typed, and forcing Core into it
+means flattening Core, which is what Core exists not to be.
+
+**The risk worth stating.** The generic machinery is polymorphic code behind a
+class, which is precisely what `mono`'s cap declines to specialize past and
+what M25's layout sharing exists to compile correctly anyway. The backend will
+therefore be the program that stresses that feature hardest -- which is
+fitting, and is also a reason to keep the class small and the instantiation
+count low.
+
 ## The low IR
 
 Values are dense indices carrying a representation. Blocks take parameters,
@@ -401,6 +494,12 @@ Already rejected in `LLVM-BACKEND.md`, for reasons that have not changed.
 
 ## Sources
 
+* Hoopl: a modular, reusable library for dataflow analysis and transformation,
+  Ramsey, Dias and Peyton Jones, <https://www.cs.tufts.edu/~nr/pubs/hoopl10.pdf>
+* A nanopass framework for commercial compiler development, Keep and Dybvig,
+  <https://www.cs.tufts.edu/comp/150FP/archive/icfp13.pdf>
+* Go's SSA opcodes, generic and per-architecture in one enum,
+  <https://pkg.go.dev/cmd/compile/internal/ssa>
 * QBE, <https://c9x.me/compile/>
 * QBE 1.3, LWN, <https://lwn.net/Articles/1080519/>
 * Cwerg backend README,

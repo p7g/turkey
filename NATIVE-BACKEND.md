@@ -174,7 +174,10 @@ diffable and readable when it is wrong, which is the reason `turkey llvm`
 prints text rather than emitting through a builder.
 
 This is what makes `boot` self-sufficient, and it is where the durable half
-gets exercised. It is expected to remain, as a reference and a fallback.
+gets exercised. It is transitional: it stays as the reference the native path
+is checked against, for as long as that check is worth having, and it is
+expected to be dropped rather than maintained forever. Nothing in the IR above
+it is shaped to suit LLVM, so dropping it costs this module and nothing else.
 
 ### `boot/Turkey/Machine.tl` -- the second emitter
 
@@ -256,8 +259,11 @@ Each phase is runnable and verified before the next begins.
 
 * **The first native target.** arm64, on the argument that it is what this is
   being developed on and a backend that cannot be run is not being tested.
-* **Whether LLVM remains permanently.** Recommended: yes, as a reference
-  emitter. It is what phase 5 is differentially tested against.
+* **How long LLVM stays.** Decided: not permanently, but for a long while. It
+  is what phase 5 is differentially tested against, so it outlives the
+  allocator's first working version by however long that takes to trust. What
+  it must not become is a constraint -- nothing in the SSA IR is shaped to suit
+  it, and the day it is dropped should cost one module.
 * **Whether `turkey/`'s backend is kept in step at all.** Recommended: no. It
   is the oracle for Core and above, and freezing it is what makes it one.
 

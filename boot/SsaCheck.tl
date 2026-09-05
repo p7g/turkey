@@ -60,7 +60,7 @@ fun main() {
     print(Ssa.showFunc(f))
 
     let idom = Ssa.dominators(f)
-    print("idom: " + String.join(Array.map(idom, Int.toString), " "))
+    print("idom: " + String.join(Array.map(idom, showIdom), " "))
     print("b0 dom b3: " + showBool(Ssa.dominates(idom, BlockId(0), BlockId(3))))
     print("b1 dom b3: " + showBool(Ssa.dominates(idom, BlockId(1), BlockId(3))))
     print("b1 dom b1: " + showBool(Ssa.dominates(idom, BlockId(1), BlockId(1))))
@@ -80,11 +80,21 @@ fun main() {
     -- Break it two ways. `two` is defined in b2, which does not dominate b1;
     -- and a comparison's operands must agree in representation.
     L.into(b, b1)
-    discard(L.emit(b, Neg(two), i64))
+    let _ = L.emit(b, Neg(two), i64)
     L.into(b, b0)
-    discard(L.emit(b, Cmp(Lt, zero, cond), i1))
+    let _ = L.emit(b, Cmp(Lt, zero, cond), i1)
     report("verify after breaking it", Ssa.verify(f))
     report("reps after breaking it", repComplaints(f))
+
+    -- A block nothing branches to has no immediate dominator, which is what
+    -- `None` says and what a sentinel index could not say apart from a real
+    -- block number.
+    let orphan = L.block(b)
+    L.into(b, orphan)
+    L.terminate(b, Ret(zero))
+    print("orphan idom: " + showIdom(Ssa.dominators(f)[Ssa.blockId(orphan)]))
+    print("b0 dom orphan: "
+          + showBool(Ssa.dominates(Ssa.dominators(f), b0, orphan)))
 }
 
 -- The two verifiers are separate on purpose: `Ssa.verify` owns the shape of
@@ -92,7 +102,7 @@ fun main() {
 -- owns what an operation requires of its operands. Composing them is the
 -- caller's job, which is what keeps target knowledge out of the generic layer.
 fun repComplaints(f : Ssa.Func Low) -> Array String {
-    let out = Array.new(2)
+    let out : Array String = []
     for block in f.blocks {
         for i in block.insts {
             for m in L.checkReps(f, i) { Array.push(out, m) }
@@ -108,4 +118,9 @@ fun report(what : String, messages : Array String) -> Unit {
 
 fun showBool(x : Bool) -> String = if x { "yes" } else { "no" }
 
-fun discard(x : a) -> Unit = {}
+-- `None` is a block the entry does not reach, which is a different fact from
+-- any block number and is why the solver answers an `Option`.
+fun showIdom(d : Option Int) -> String = match d {
+    Some(n) -> Int.toString(n)
+    None -> "-"
+}

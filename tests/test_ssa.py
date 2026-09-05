@@ -105,6 +105,18 @@ def test_trapping_is_not_purity(capfd):
     assert "and deletable: yes" in out
 
 
+def test_an_unreachable_block_has_no_immediate_dominator(capfd):
+    """`None`, not a sentinel index.
+
+    A block the entry does not reach and block number -1 are different facts,
+    and a language with `Option` should not need to be told them apart by
+    convention. The dominance solver answers `Array (Option Int)`.
+    """
+    out = _output(capfd)
+    assert "orphan idom: -" in out
+    assert "b0 dom orphan: no" in out
+
+
 def test_allocation_is_what_makes_a_safepoint(capfd):
     """Nothing reads this until the register allocator exists.
 

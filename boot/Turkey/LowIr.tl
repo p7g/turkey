@@ -167,7 +167,7 @@ fun emit(b : Builder, op : Op, r : Rep) -> Value {
 -- An operation evaluated for its effect. The value it defines is a `unit`
 -- nothing reads, which is what keeps every instruction defining exactly one.
 fun effect(b : Builder, op : Op) -> Unit {
-    discard(emit(b, op, Ssa.untraced(I64)))
+    let _ = emit(b, op, Ssa.untraced(I64))
 }
 
 fun terminate(b : Builder, t : Ssa.Term) -> Unit {
@@ -188,17 +188,15 @@ fun param(b : Builder, at : Ssa.BlockId, r : Rep) -> Value {
     v
 }
 
-fun discard(x : a) -> Unit = {}
-
 -- What each operation may do. The verifier does not read this; the
 -- optimizations and, eventually, the register allocator's stack maps do.
 fun effectsOf(op : Op) -> Effects = match op {
-    ConstInt(_) -> Ssa.pureEffect()
-    ConstFloat(_) -> Ssa.pureEffect()
+    ConstInt(_) -> empty()
+    ConstFloat(_) -> empty()
     -- A string literal is interned by the runtime rather than allocated per
     -- evaluation, so it is not a safepoint.
-    ConstString(_) -> Ssa.pureEffect()
-    ConstUnit -> Ssa.pureEffect()
+    ConstString(_) -> empty()
+    ConstUnit -> empty()
     -- Trapping, not pure: `add`, `sub`, `mul` and `neg` panic on overflow and
     -- `div` and `rem` panic at zero (PRIMITIVES.md 1.1), so an unused one may
     -- not be deleted. The bitwise and shift operations do not trap, and
@@ -209,12 +207,12 @@ fun effectsOf(op : Op) -> Effects = match op {
         Mul -> Ssa.traps()
         Div -> Ssa.traps()
         Rem -> Ssa.traps()
-        _ -> Ssa.pureEffect()
+        _ -> empty()
     }
-    Cmp(_, _, _) -> Ssa.pureEffect()
+    Cmp(_, _, _) -> empty()
     Neg(_) -> Ssa.traps()
-    Not(_) -> Ssa.pureEffect()
-    Convert(_, _) -> Ssa.pureEffect()
+    Not(_) -> empty()
+    Convert(_, _) -> empty()
     Box(_) -> Ssa.allocates()
     Unbox(_) -> Ssa.reads_()
     ObjectNew(_, _, _, _) -> Ssa.allocates()
@@ -223,8 +221,8 @@ fun effectsOf(op : Op) -> Effects = match op {
     ObjectTag(_) -> Ssa.reads_()
     ArrayNew(_, _, _) -> Ssa.allocates()
     -- Reads *and* traps: an index out of range panics.
-    ArrayGet(_, _) -> both(Ssa.reads_(), Ssa.traps())
-    ArraySet(_, _, _) -> both(Ssa.writes(), Ssa.traps())
+    ArrayGet(_, _) -> combine(Ssa.reads_(), Ssa.traps())
+    ArraySet(_, _, _) -> combine(Ssa.writes(), Ssa.traps())
     ArrayLength(_) -> Ssa.reads_()
     CellNew(_) -> Ssa.allocates()
     CellLoad(_) -> Ssa.reads_()
@@ -241,14 +239,6 @@ fun effectsOf(op : Op) -> Effects = match op {
     SlotStore(_, _) -> Ssa.writes()
 }
 
-fun both(a : Effects, b : Effects) -> Effects = Effects {
-    reads = a.reads || b.reads,
-    writes = a.writes || b.writes,
-    allocates = a.allocates || b.allocates,
-    traps = a.traps || b.traps,
-    diverges = a.diverges || b.diverges,
-}
-
 fun everything() -> Effects = Effects {
     reads = True, writes = True, allocates = True, traps = True,
     diverges = False,
@@ -259,10 +249,10 @@ fun everything() -> Effects = Effects {
 -- One `match`, and adding an operation is a compile error here -- which is
 -- the whole reason the opcode is a constructor and not a string.
 fun opUses(op : Op) -> Array Value = match op {
-    ConstInt(_) -> Array.new(0)
-    ConstFloat(_) -> Array.new(0)
-    ConstString(_) -> Array.new(0)
-    ConstUnit -> Array.new(0)
+    ConstInt(_) -> []
+    ConstFloat(_) -> []
+    ConstString(_) -> []
+    ConstUnit -> []
     Bin(_, a, b) -> [a, b]
     Cmp(_, a, b) -> [a, b]
     Neg(a) -> [a]
@@ -270,7 +260,7 @@ fun opUses(op : Op) -> Array Value = match op {
     Convert(_, a) -> [a]
     Box(a) -> [a]
     Unbox(a) -> [a]
-    ObjectNew(_, _, _, _) -> Array.new(0)
+    ObjectNew(_, _, _, _) -> []
     ObjectGet(a, _) -> [a]
     ObjectSet(a, _, b) -> [a, b]
     ObjectTag(a) -> [a]
@@ -281,10 +271,10 @@ fun opUses(op : Op) -> Array Value = match op {
     CellNew(a) -> [a]
     CellLoad(a) -> [a]
     CellStore(a, b) -> [a, b]
-    ClosureNew(_, _) -> Array.new(0)
+    ClosureNew(_, _) -> []
     ClosureCapture(a, _, b) -> [a, b]
     Call(callee, args) -> {
-        let out = Array.new(len(args) + 1)
+        let out : Array Value = []
         match callee {
             Indirect(f) -> Array.push(out, f)
             _ -> {}
@@ -292,9 +282,9 @@ fun opUses(op : Op) -> Array Value = match op {
         for a in args { Array.push(out, a) }
         out
     }
-    GlobalLoad(_) -> Array.new(0)
+    GlobalLoad(_) -> []
     GlobalStore(_, a) -> [a]
-    SlotLoad(_) -> Array.new(0)
+    SlotLoad(_) -> []
     SlotStore(_, a) -> [a]
 }
 
@@ -302,7 +292,6 @@ instance Inst Low {
     fun uses(i) = opUses(i.op)
     fun defs(i) = [i.result]
     fun effects(i) = effectsOf(i.op)
-    fun render(i) = showLow(i)
 }
 
 -- The representation an operation's result must have, where the operation
@@ -340,11 +329,11 @@ fun opResultRep(op : Op) -> Option Rep = match op {
 -- operands. Keeping them apart is what stops the generic layer from
 -- accumulating target knowledge.
 fun checkReps(f : Ssa.Func Low, i : Low) -> Array String {
-    let out = Array.new(1)
+    let out = []
     match opResultRep(i.op) {
-        Some(want) -> if !Ssa.repEq(Ssa.repOf(f, i.result), want) {
-            Array.push(out, "result is " + Ssa.showRep(Ssa.repOf(f, i.result))
-                            + " where " + Ssa.showRep(want) + " was required")
+        Some(want) -> if Ssa.repOf(f, i.result) != want {
+            Array.push(out, "result is " + show(Ssa.repOf(f, i.result))
+                            + " where " + show(want) + " was required")
         }
         None -> {}
     }
@@ -363,38 +352,38 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Array String {
 
 fun sameRep(f : Ssa.Func Low, out : Array String, a : Value, b : Value,
             what : String) -> Unit {
-    if !Ssa.repEq(Ssa.repOf(f, a), Ssa.repOf(f, b)) {
-        Array.push(out, what + " are " + Ssa.showRep(Ssa.repOf(f, a)) + " and "
-                        + Ssa.showRep(Ssa.repOf(f, b)))
+    if Ssa.repOf(f, a) != Ssa.repOf(f, b) {
+        Array.push(out, what + " are " + show(Ssa.repOf(f, a)) + " and "
+                        + show(Ssa.repOf(f, b)))
     }
 }
 
 fun wantClass(f : Ssa.Func Low, out : Array String, v : Value, c : RepClass,
               what : String) -> Unit {
     if Ssa.repOf(f, v).class_ != c {
-        Array.push(out, what + " is " + Ssa.showRep(Ssa.repOf(f, v)))
+        Array.push(out, what + " is " + show(Ssa.repOf(f, v)))
     }
 }
 
 -- -- printing -----------------------------------------------------------------------
 
-fun showLow(i : Low) -> String {
-    let head = "%" + Int.toString(Ssa.valueId(i.result)) + " = "
-    head + showOp(i.op)
+instance Show Low {
+    fun show(i) = "%" + Int.toString(Ssa.valueId(i.result)) + " = " + show(i.op)
 }
 
 fun v(x : Value) -> String = "%" + Int.toString(Ssa.valueId(x))
 
-fun showOp(op : Op) -> String = match op {
+instance Show Op {
+  fun show(op) = match op {
     ConstInt(n) -> "const " + Int.toString(n)
     ConstFloat(x) -> "const " + Float.toString(x)
     ConstString(s) -> "const \"" + s + "\""
     ConstUnit -> "const ()"
-    Bin(o, a, b) -> showBin(o) + " " + v(a) + ", " + v(b)
-    Cmp(o, a, b) -> showCmp(o) + " " + v(a) + ", " + v(b)
+    Bin(o, a, b) -> show(o) + " " + v(a) + ", " + v(b)
+    Cmp(o, a, b) -> show(o) + " " + v(a) + ", " + v(b)
     Neg(a) -> "neg " + v(a)
     Not(a) -> "not " + v(a)
-    Convert(c, a) -> showConv(c) + " " + v(a)
+    Convert(c, a) -> show(c) + " " + v(a)
     Box(a) -> "box " + v(a)
     Unbox(a) -> "unbox " + v(a)
     ObjectNew(kind, tag, count, bitmap) ->
@@ -404,7 +393,7 @@ fun showOp(op : Op) -> String = match op {
     ObjectSet(a, i, b) -> "object.set " + v(a) + ", " + Int.toString(i) + ", " + v(b)
     ObjectTag(a) -> "object.tag " + v(a)
     ArrayNew(n, init, c) ->
-        "array.new " + v(n) + ", " + v(init) + ", " + showClass(c)
+        "array.new " + v(n) + ", " + v(init) + ", " + show(c)
     ArrayGet(a, i) -> "array.get " + v(a) + ", " + v(i)
     ArraySet(a, i, x) -> "array.set " + v(a) + ", " + v(i) + ", " + v(x)
     ArrayLength(a) -> "array.length " + v(a)
@@ -416,7 +405,7 @@ fun showOp(op : Op) -> String = match op {
         "closure.capture " + v(a) + ", " + Int.toString(i) + ", " + v(b)
     Call(callee, args) -> {
         let b = String.builder()
-        String.push(b, "call " + showCallee(callee))
+        String.push(b, "call " + show(callee))
         for a in args { String.push(b, " " + v(a)) }
         String.build(b)
     }
@@ -424,15 +413,19 @@ fun showOp(op : Op) -> String = match op {
     GlobalStore(name, a) -> "global.store $" + name + ", " + v(a)
     SlotLoad(i) -> "slot.load " + Int.toString(i)
     SlotStore(i, a) -> "slot.store " + Int.toString(i) + ", " + v(a)
+  }
 }
 
-fun showCallee(c : Callee) -> String = match c {
+instance Show Callee {
+  fun show(c) = match c {
     Direct(name) -> "@" + name
     Runtime(name) -> "%" + name
     Indirect(f) -> v(f)
+  }
 }
 
-fun showBin(o : BinOp) -> String = match o {
+instance Show BinOp {
+  fun show(o) = match o {
     Add -> "add"
     Sub -> "sub"
     Mul -> "mul"
@@ -444,30 +437,27 @@ fun showBin(o : BinOp) -> String = match o {
     Shl -> "shl"
     Shr -> "shr"
     ShrU -> "shru"
+  }
 }
 
-fun showCmp(o : CmpOp) -> String = match o {
+instance Show CmpOp {
+  fun show(o) = match o {
     Eq -> "eq"
     Ne -> "ne"
     Lt -> "lt"
     Le -> "le"
     Gt -> "gt"
     Ge -> "ge"
+  }
 }
 
-fun showConv(c : Conv) -> String = match c {
+instance Show Conv {
+  fun show(c) = match c {
     IntToFloat -> "itof"
     FloatToInt -> "ftoi"
     Widen -> "widen"
     Narrow -> "narrow"
     Retag -> "retag"
+  }
 }
 
-fun showClass(c : RepClass) -> String = match c {
-    I1 -> "i1"
-    I8 -> "i8"
-    I32 -> "i32"
-    I64 -> "i64"
-    F64 -> "f64"
-    Ptr -> "ptr"
-}

@@ -251,14 +251,22 @@ from the production that wanted it. `export` in particular is currently a pure
 cost.
 
 ### 8. Discarding a result has to be said
-**ergonomics.** M20. A block answers with its last statement, so a branch ending
-in `expect(...)` answers a `Token` while its sibling ending in a `while` answers
-`Unit`, and the two do not unify. Thirty-eight sites in the parser wanted the
-call as a statement; `Turkey.Parser.skipToken` is the wrapper that says so.
+**ergonomics, answered.** M20. A block answers with its last statement, so a
+branch ending in `expect(...)` answers a `Token` while its sibling ending in a
+`while` answers `Unit`, and the two do not unify. Thirty-eight sites in the
+parser wanted the call as a statement; `Turkey.Parser.skipToken` is the wrapper
+that says so.
 
-A statement form -- or a `Unit`-coercing discard -- would remove a wrapper per
-side-effecting function. Not obviously worth a language change; recorded because
-it recurs.
+This asked for "a statement form -- or a `Unit`-coercing discard", and said it
+was not obviously worth a language change. It is not one: **`let _ = expr` is
+already both.** A `let` is a statement, so a block ending in one answers `Unit`,
+and a wildcard pattern binds nothing -- which is exactly the branch-unification
+case above, and exactly what a hand-written `discard(x : a) -> Unit = {}` was
+for. M27 wrote two such helpers before noticing.
+
+What remains is that it has to be *said*, which is the design's choice and not
+a defect: nothing is discarded silently. The wrapper per side-effecting
+function was never necessary.
 
 ### 9. Mutable state means a record wrapping a variant
 **design.** M20. Multi-variant ADTs are immutable and single-variant records are

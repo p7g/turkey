@@ -219,15 +219,12 @@ type Type
     -- `fun(t1, ..., tn) -> t`. Uncurried, fixed arity.
     | TFun(Array Type, Type)
     | TTuple(Array Type)
-    -- A field name lifted into the type language. Legal only in the first
-    -- argument of `HasField`, and deliberately not kinded -- it exists so one
-    -- predicate former can name any field, rather than the domain growing a
-    -- former per label.
-    | TLabel(String)
-    -- A numeric projection index lifted into a predicate argument.
-    | TIndex(Int)
     -- A closed set of constructor names, lifted into the type language. Legal
-    -- only in the second argument of `OneOf`, and the counterpart of `TLabel`.
+    -- only in the second argument of `OneOf`. There used to be a `TLabel` and
+    -- a `TIndex` beside it, lifting a field name and a tuple position into the
+    -- type language for `HasField` and `HasProjection`; once those became
+    -- generated classes whose *name* carries the label there was nothing left
+    -- to lift, and no construction site survived.
     -- Held sorted and deduplicated, so two sets are equal when their arrays
     -- are.
     | TSet(Array String)
@@ -278,9 +275,25 @@ fun tcon(name : String, kind : Kind, level : Int) -> Type =
 
 -- The part of an internal name a reader wrote. `Turkey.Modules` owns the `#`
 -- separator this splits on.
-fun shortName(name : String) -> String = match String.rsplitOnce(name, "#") {
-    None -> name
-    Some((_, after)) -> after
+-- The generated field and projection names are the exception. `%HasField.cap`
+-- and `%Field.cap` are one class and one family *per label*, which is how the
+-- label rides in a single-parameter class; but a reader wrote `r.cap`, not a
+-- class name, so they print as the predicate and the family a reader would
+-- recognise: `HasField "cap" r` and `Field.cap r`.
+fun shortName(name : String) -> String {
+    match String.splitOnce(name, ".") {
+        Some((before, after)) -> {
+            if before == "%HasField" { return "HasField \"" + after + "\"" }
+            if before == "%HasProjection" { return "HasProjection " + after }
+            if before == "%Field" { return "Field." + after }
+            if before == "%Elem" { return "Elem." + after }
+        }
+        None -> {}
+    }
+    match String.rsplitOnce(name, "#") {
+        None -> name
+        Some((_, after)) -> after
+    }
 }
 
 -- An internal name written the way a program would qualify it.
@@ -618,7 +631,22 @@ fun normalize(t : Type, fams : Option Families) -> Type {
                 match out {
                     TFam(_, _, _) -> match f.reduce(out) {
                         None -> { going = False }
-                        Some(reduced) -> { out = prune(reduced) }
+                        Some(raw) -> {
+                            let reduced = prune(raw)
+                            -- A rule that rewrites a family application to
+                            -- itself is stuck, not progress. `simplify` drops
+                            -- the reflexive equations that produce one, so this
+                            -- should be unreachable; it is here so that a rule
+                            -- which fails to make progress costs an answer
+                            -- rather than the compiler, which is what it cost
+                            -- when a retained `Field.tag a ~ Field.tag a`
+                            -- reached the reducer.
+                            if typeKey(reduced) == typeKey(out) {
+                                going = False
+                            } else {
+                                out = reduced
+                            }
+                        }
                     }
                     _ -> { going = False }
                 }
@@ -775,8 +803,6 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
             }
             unify(r1, r2, where, context, fams)
         }
-        (TLabel(n1), TLabel(n2)) -> if n1 != n2 { mismatch(x, y, where, context) }
-        (TIndex(v1), TIndex(v2)) -> if v1 != v2 { mismatch(x, y, where, context) }
         (TTuple(e1), TTuple(e2)) -> {
             if len(e1) != len(e2) { mismatch(x, y, where, context) }
             for var i = 0; i < len(e1); i = i + 1 {
@@ -956,8 +982,6 @@ fun sameType(a : Type, b : Type) -> Bool {
         (TFam(n1, a1, _), TFam(n2, a2, _)) -> n1 == n2 && sameType(a1, a2)
         (TFun(p1, r1), TFun(p2, r2)) -> sameTypes(p1, p2) && sameType(r1, r2)
         (TTuple(e1), TTuple(e2)) -> sameTypes(e1, e2)
-        (TLabel(n1), TLabel(n2)) -> n1 == n2
-        (TIndex(v1), TIndex(v2)) -> v1 == v2
         (TSet(n1), TSet(n2)) -> sameNames(n1, n2)
         (TBottom, TBottom) -> True
         _ -> False
@@ -1032,14 +1056,6 @@ fun typeKeyInto(b : String.Builder, t : Type) -> Unit = match prune(t) {
             typeKeyInto(b, e)
         }
         String.push(b, ")")
-    }
-    TLabel(name) -> {
-        String.push(b, "l")
-        String.push(b, name)
-    }
-    TIndex(value) -> {
-        String.push(b, "i")
-        String.push(b, Int.toString(value))
     }
     TSet(names) -> {
         String.push(b, "s{")
@@ -1162,8 +1178,6 @@ fun showAt(t : Type, n : Namer, prec : Int) -> String = match prune(t) {
         }
     }
     TBottom -> "!"
-    TLabel(name) -> "\"" + name + "\""
-    TIndex(value) -> Int.toString(value)
     TSet(names) -> "{" + String.join(sortNumeric(names), ", ") + "}"
     TTuple(elems) -> "(" + String.join(showEach(elems, n, 0), ", ") + ")"
     TFun(params, ret) -> {

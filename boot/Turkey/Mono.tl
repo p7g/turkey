@@ -420,10 +420,18 @@ fun collapseApp(r : Rewriter, e : Core, fn : Core,
             Some(n) -> Array.push(supplied, n)
         }
     }
-    match request(r.owner, b, targs, Some(supplied)) {
-        Some(made) -> Some(mkCore(rTy(r, e.ty), e.span, CVar(made)))
-        None -> None
+    let made = match request(r.owner, b, targs, Some(supplied)) {
+        Some(n) -> n
+        None -> return None
     }
+    let ty = rTy(r, e.ty)
+    let promoted = promotedBinders(b, Some(supplied))
+    if len(promoted) == 0 { return Some(mkCore(ty, e.span, CVar(made))) }
+    -- The copy states the abstraction; this site is where the *value* of it was
+    -- expected, so it is restated here as the eta-expansion it is.
+    let types = Array.map(promoted, fun(v) = TVar(v))
+    Some(mkCore(ty, e.span, CTyLam(promoted,
+        mkCore(ty, e.span, CTyApp(mkCore(ty, e.span, CVar(made)), types)))))
 }
 
 -- The top-level dictionary this expression names, or `None`.
@@ -749,11 +757,56 @@ fun build(m : Mono, name : String, b : CBind, targs : Array Ty.Type,
             ty = rTy(r, body.ty)
         }
     }
+    -- A method is polymorphic in its *own* variables as well as the class
+    -- variable, and the lowering states those in a `CTyLam` under the
+    -- dictionary lambda. Consuming that lambda leaves the abstraction
+    -- outermost, and a copy that left it there would be a binding with no
+    -- binders whose body is still generic -- which `instantiate` cannot match
+    -- type arguments against and layout sharing cannot key a copy on. The call
+    -- site already applies these types to the copy, so the abstraction belongs
+    -- on the binding.
+    let binders = Array.new(2)
+    var going = True
+    while going {
+        match value.kind {
+            CTyLam(vs, body) -> {
+                for v in vs { Array.push(binders, v) }
+                value = body
+                ty = rTy(r, body.ty)
+            }
+            _ -> { going = False }
+        }
+    }
     CBind {
-        name = name, ty = ty, binders = Array.new(0), value = rewrite(r, value),
+        name = name, ty = ty, binders = binders, value = rewrite(r, value),
         span = b.span, mutable = b.mutable, module_ = b.module_,
         equations = r.equations,
     }
+}
+
+-- The binders a specialization of `b` will state for itself: the `CTyLam` that
+-- `build` above lifts out once the dictionary lambda is consumed.
+fun promotedBinders(b : CBind, dicts : Option (Array String)) -> Array VarCell {
+    let out = Array.new(2)
+    match dicts {
+        None -> return out
+        Some(_) -> {}
+    }
+    var value = match b.value.kind {
+        CLam(_, body, _) -> body
+        _ -> return out
+    }
+    var going = True
+    while going {
+        match value.kind {
+            CTyLam(vs, body) -> {
+                for v in vs { Array.push(out, v) }
+                value = body
+            }
+            _ -> { going = False }
+        }
+    }
+    out
 }
 
 fun oops(message : String, where : Option Span) -> a = match where {

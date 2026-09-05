@@ -1,5 +1,5 @@
 module Turkey.Constraints (
-    hasField, hasProjection, oneOf,
+    oneOf,
     Constraint(..), PredCell(..), LetCell(..), cpredOf,
     Binding(..), Env(..), newEnv, childEnv, define, lookup_,
     Solver(..), newSolver, run, solve, families,
@@ -57,13 +57,12 @@ import Turkey.Decls (DeclTable(..))
 import Turkey.Diag as Diag
 import Turkey.Solved (Scope(..), Abstraction(..), Use(..), dictName, newScope)
 import Turkey.Source (Span)
+import Turkey.Typed as Typed
 import Turkey.Types as Ty
 import Turkey.Types (VarCell(..), ConCell(..), Scheme(..), Pred(..),
-                     TVar, TCon, TApp, TFam, TFun, TTuple, TLabel, TIndex,
+                     TVar, TCon, TApp, TFam, TFun, TTuple,
                      TSet, TBottom)
 
-let hasField = "HasField"
-let hasProjection = "HasProjection"
 let oneOf = "OneOf"
 
 -- -- the tree ----------------------------------------------------------------------
@@ -238,12 +237,22 @@ fun adopt(s : Solver, vars : Array VarCell) -> Unit {
 -- the rule they supply is applied exactly as an instance's would be.
 fun reduceFam(s : Solver, t : Ty.Type) -> Option Ty.Type {
     for p in s.assumptions {
-        if p.name == Ty.equals && Ty.sameType(p.args[0], t) {
+        -- Reflexive rules are skipped, not returned: a rule from a family
+        -- application to itself is no rule, and returning it would leave
+        -- `Field.tag Auto` unreduced next to the `Int` it is.
+        if p.name == Ty.equals && Ty.sameType(p.args[0], t)
+                && !Ty.sameType(p.args[1], t) {
             return Some(p.args[1])
         }
     }
+    -- Without the wanted rules. This reducer is what `unify` calls, and a
+    -- unification is irreversible: reducing `Container.Elem a` to `Int` by an
+    -- equation nobody has proved yet *binds* a variable to `Int`, and the
+    -- family is then gone from the scheme that was supposed to carry it. The
+    -- rules answer whether a predicate can be discharged, which `classRule`
+    -- asks explicitly; they do not decide what a type is.
     match t {
-        TFam(name, arg, _) -> Classes.reduceFam(s.classes, name, arg)
+        TFam(name, arg, _) -> Classes.settledFam(s.classes, name, arg)
         _ -> None
     }
 }
@@ -286,6 +295,25 @@ fun defer(s : Solver, a : Ty.Type, b : Ty.Type, where : Option Span,
     Array.push(s.deferred, PredCell {
         pred = Ty.pred(Ty.equals, [left, right]), span = where, context = context,
     })
+    -- And it is a rewrite rule from here on. `x.pos` used where an `Int` is
+    -- wanted leaves `Field.pos a ~ Int`, and without this every predicate about
+    -- the field's type stays stuck and rides into the scheme, while
+    -- exhaustiveness reads a scrutinee type the equality would have decided.
+    --
+    -- Only a rule that makes progress. `Field.pos a ~ Int` says what the family
+    -- is; `Field.bucket c ~ Field.next b` -- which `c.bucket = b.next` produces
+    -- -- says only that two stuck families agree, and rewriting one to the
+    -- other is a step sideways that can step back. A bare variable on the right
+    -- teaches nothing either.
+    let l = Ty.prune(left)
+    let rt = Ty.prune(right)
+    var teaches = isFam(l)
+    match rt {
+        TFam(_, _, _) -> { teaches = False }
+        TVar(_) -> { teaches = False }
+        _ -> {}
+    }
+    if teaches { Array.push(s.classes.rules, (l, rt)) }
 }
 
 fun isFam(t : Ty.Type) -> Bool = match t {
@@ -478,8 +506,23 @@ fun letBody(s : Solver, c : LetCell) -> Unit {
             if !Classes.isClass(s.classes, p.name) { Array.push(own, p) }
         }
         let preds = Classes.simplify(s.classes, Array.append(own, shared))
+        -- Reduced at every level, not just the head. A field access has the
+        -- type `Field.n r`, and once `r` is a known record that family *is*
+        -- the field's type -- leaving it unreduced would put machinery in a
+        -- signature a reader has to read. Head-only reduction is right for
+        -- unification and not for anything that reads a type whole, which a
+        -- scheme is.
+        -- Reduced without the wanted rules. A scheme is an interface: it
+        -- carries `Container.Elem a ~ Int` and its body should say
+        -- `Container.Elem a`, not the `Int` that equation happens to make it.
+        -- The rules are for discharging predicates inside the body, not for
+        -- restating the body in terms a caller has not been told yet.
+        let was = s.classes.rulesApply
+        s.classes.rulesApply = False
+        let body = Typed.reduceDeep(ty, families(s))
+        s.classes.rulesApply = was
         let b = Binding {
-            scheme = Ty.generalize(ty, rank(s), preds), mutable = False,
+            scheme = Ty.generalize(body, rank(s), preds), mutable = False,
         }
         match c.dicts {
             -- Recorded here because here is the only place it exists: a local
@@ -577,32 +620,21 @@ fun settle(s : Solver) -> Unit {
     }
 }
 
--- Equate the results of demands for one field of one receiver.
+-- Improvement: what the deferred set decides between two of its own members.
 --
--- `HasField` is a function of its receiver: a record type has exactly one type
--- for a given field. So two stuck demands `HasField l r a` and `HasField l r b`
--- force `a ~ b`, even though neither can be discharged while `r` is unknown.
+-- There used to be a third rule here, equating the results of two demands for
+-- one field of one receiver -- `HasField l r a` and `HasField l r b` forcing
+-- `a ~ b` -- because a record type has exactly one type for a given field and
+-- with the field type in a third argument nothing else said so. In Gaster &
+-- Jones the rule does not exist, since with rows the field's type sits inside
+-- the receiver's and two accesses agree by ordinary unification.
 --
--- In Gaster & Jones this rule does not exist, because it is not a rule: with
--- rows, the field's type sits *inside* the receiver's type, and two accesses
--- agree by ordinary unification. Nominal records have no row to put it in, so
--- the field type lives in the predicate's third argument and equating two of
--- them has to be said out loud.
+-- It is gone for the same reason: `r.f` has the type `Field.f r`, so two reads
+-- are the same type expression rather than two variables, and unification
+-- equates them without being told to.
 fun improve(s : Solver) -> Unit {
     improveNumeric(s)
     improveFamilies(s)
-    let seen = Map.new()
-    for c in s.deferred {
-        if c.pred.name == hasField || c.pred.name == hasProjection {
-            let key = c.pred.name + " " + Ty.typeKey(c.pred.args[0]) + " "
-                      + Ty.typeKey(c.pred.args[1])
-            match Map.get(seen, key) {
-                Some(first) -> Ty.unify(first, c.pred.args[2], c.span,
-                                        "a field access", families(s))
-                None -> Map.put(seen, key, c.pred.args[2])
-            }
-        }
-    }
 }
 
 -- Equate the answers of two equalities on one family application.
@@ -640,8 +672,6 @@ fun firstSpan(a : Option Span, b : Option Span) -> Option Span = match a {
 -- `False`, so nothing can be quietly dropped.
 fun entail(s : Solver, c : PredCell) -> Bool {
     if c.pred.name == Ty.equals { return equals(s, c) }
-    if c.pred.name == hasField { return hasFieldRule(s, c) }
-    if c.pred.name == hasProjection { return hasProjectionRule(s, c) }
     if c.pred.name == oneOf { return oneOfRule(s, c) }
     if Classes.isClass(s.classes, c.pred.name) { return classRule(s, c) }
     oops("no rule for predicate '" + c.pred.name + "'", c.span)
@@ -654,8 +684,10 @@ fun entail(s : Solver, c : PredCell) -> Bool {
 -- Two identical family applications are equal by reflexivity, and a side that is
 -- *still* a stuck family means the equation is not yet decidable.
 fun equals(s : Solver, c : PredCell) -> Bool {
-    let left = Classes.normalize(s.classes, c.pred.args[0])
-    let right = Classes.normalize(s.classes, c.pred.args[1])
+    -- Without the wanted rules: an equation proved by a rule it supplied is
+    -- proved by itself. See `Classes.settled`.
+    let left = Classes.settled(s.classes, c.pred.args[0])
+    let right = Classes.settled(s.classes, c.pred.args[1])
     c.pred = Ty.pred(c.pred.name, [left, right])
     if Ty.sameType(left, right) { return True }
     if isFam(left) || isFam(right) { return False }
@@ -707,7 +739,10 @@ fun classRule(s : Solver, c : PredCell) -> Bool {
         _ -> {}
     }
     match Classes.byInst(s.classes, p) {
-        None -> oops("no instance for '" + Ty.showPred(p) + "'", c.span)
+        None -> {
+            if Classes.isGenerated(p.name) { noField(s, p, t, c) }
+            oops("no instance for '" + Ty.showPred(p) + "'", c.span)
+        }
         Some(obligations) -> {
             -- The instance's own context becomes this site's, over the types the
             -- match supplied: `Eq (Array a)` leaves `Eq a` behind.
@@ -717,55 +752,38 @@ fun classRule(s : Solver, c : PredCell) -> Bool {
     }
 }
 
-fun hasFieldRule(s : Solver, c : PredCell) -> Bool {
-    let label = match c.pred.args[0] {
-        TLabel(n) -> n
-        _ -> oops("a field demand's first argument is not a label", c.span)
-    }
-    let receiver = Classes.normalize(s.classes, c.pred.args[1])
-    match receiver {
-        -- Nothing known about the receiver yet.
-        TVar(_) -> return False
-        TFam(_, _, _) -> return False
-        -- Bottom is absorbed by whatever it meets, so it satisfies any field
-        -- demand vacuously -- there is no value to read one from.
-        TBottom -> return True
-        _ -> {}
-    }
-    -- Applied and nullary record types are both decided by their head.
+-- Why a generated field or projection class has no instance.
+--
+-- Ordinary instance resolution would say "no instance for `%HasField.cap Int`",
+-- which names a class the programmer cannot see and did not write. These are
+-- the messages the structural discharge used to produce, kept word for word:
+-- the class is an implementation of field access, so its failures have to read
+-- as field errors.
+fun noField(s : Solver, p : Pred, receiver : Ty.Type, c : PredCell) -> Unit {
     let (h, _) = Ty.spine(receiver)
-    match h {
-        TCon(con) -> match Decls.recordFields(s.decls, con.name) {
-            Some(names) -> {
-                if !Array.contains(names, label) {
-                    oops("type '" + con.name + "' has no field '" + label
-                         + "' (it has: " + String.join(names, ", ") + ")", c.span)
+    match Classes.generatedLabel(p.name) {
+        Some(label) -> {
+            match h {
+                TCon(con) -> match Decls.recordFields(s.decls, con.name) {
+                    Some(names) -> if !Array.contains(names, label) {
+                        oops("type '" + con.name + "' has no field '" + label
+                             + "' (it has: " + String.join(names, ", ") + ")",
+                             c.span)
+                    }
+                    None -> {}
                 }
-                Ty.unify(c.pred.args[2],
-                         Decls.fieldType(s.decls, receiver, label),
-                         c.span, "a field access", families(s))
-                return True
+                _ -> {}
             }
-            None -> {}
+            oops("cannot " + c.context + " field '" + label + "': '"
+                 + Ty.show(receiver) + "' is not a single-variant record type. "
+                 + "Multi-variant types are immutable and are taken apart with "
+                 + "'match'.", c.span)
         }
-        _ -> {}
+        None -> {}
     }
-    oops("cannot " + c.context + " field '" + label + "': '" + Ty.show(receiver)
-         + "' is not a single-variant record type. Multi-variant types are "
-         + "immutable and are taken apart with 'match'.", c.span)
-}
-
-fun hasProjectionRule(s : Solver, c : PredCell) -> Bool {
-    let index = match c.pred.args[0] {
-        TIndex(v) -> v
-        _ -> oops("a projection demand's first argument is not an index", c.span)
-    }
-    let receiver = Classes.normalize(s.classes, c.pred.args[1])
-    match receiver {
-        TVar(_) -> return False
-        TFam(_, _, _) -> return False
-        TBottom -> return True
-        _ -> {}
+    let index = match Classes.generatedIndex(p.name) {
+        Some(found) -> found
+        None -> return
     }
     let choices = match receiver {
         TTuple(elems) -> Some(elems)
@@ -776,16 +794,10 @@ fun hasProjectionRule(s : Solver, c : PredCell) -> Bool {
                      + Ty.show(receiver) + "': numeric projection requires a "
                      + "tuple or an immutable type with exactly one positional "
                      + "constructor", c.span)
-        Some(elems) -> {
-            if index >= len(elems) {
-                oops("projection index " + Int.toString(index) + " is out of "
-                     + "bounds for '" + Ty.show(receiver) + "', which has "
-                     + Int.toString(len(elems)) + " element(s)", c.span)
-            }
-            Ty.unify(c.pred.args[2], elems[index], c.span,
-                     "a numeric projection", families(s))
-            True
-        }
+        Some(elems) -> oops("projection index " + Int.toString(index)
+                            + " is out of bounds for '" + Ty.show(receiver)
+                            + "', which has " + Int.toString(len(elems))
+                            + " element(s)", c.span)
     }
 }
 
@@ -946,9 +958,29 @@ fun rejectStranded(s : Solver, stranded : Array PredCell) -> Unit {
         let leftIsFam = isFam(Ty.prune(left))
         let fam = if leftIsFam { left } else { right }
         let other = if leftIsFam { right } else { left }
+        -- A generated field family is machinery, not something a context can
+        -- state: a reader wrote `r.n` and cannot write `Field.n r ~ Int`. So it
+        -- keeps the message the stranded `HasField` predicate used to give,
+        -- which names what was written.
+        let owner = match fam {
+            TFam(name, _, _) -> Classes.fieldFamilyOwner(name)
+            _ -> "?"
+        }
+        match Classes.generatedLabel(owner) {
+            Some(label) -> oops("cannot determine the type of the value whose "
+                + "field '" + label + "' is being accessed. Add a type "
+                + "annotation.", c.span)
+            None -> {}
+        }
+        match Classes.generatedIndex(owner) {
+            Some(index) -> oops("cannot determine the type of the value being "
+                + "projected at position " + Int.toString(index)
+                + ". Add a type annotation.", c.span)
+            None -> {}
+        }
         let cls = match fam {
             TFam(name, _, _) -> match Map.get(s.decls.families, name) {
-                Some(fi) -> fi.cls
+                Some(fi) -> Ty.shortName(fi.cls)
                 None -> name
             }
             _ -> "?"
@@ -961,21 +993,16 @@ fun rejectStranded(s : Solver, stranded : Array PredCell) -> Unit {
              + where + ": nothing says which '" + cls + "' instance defines it. "
              + "Add '" + equality + "' to the context.", c.span)
     }
-    if c.pred.name == hasField {
-        let label = match c.pred.args[0] {
-            TLabel(n) -> n
-            _ -> "?"
-        }
-        oops("cannot determine the type of the value whose field '" + label
-             + "' is being accessed. Add a type annotation.", c.span)
+    match Classes.generatedLabel(c.pred.name) {
+        Some(label) -> oops("cannot determine the type of the value whose field '"
+             + label + "' is being accessed. Add a type annotation.", c.span)
+        None -> {}
     }
-    if c.pred.name == hasProjection {
-        let index = match c.pred.args[0] {
-            TIndex(v) -> Int.toString(v)
-            _ -> "?"
-        }
-        oops("cannot determine the type of the value being projected at position "
-             + index + ". Add a type annotation.", c.span)
+    match Classes.generatedIndex(c.pred.name) {
+        Some(index) -> oops("cannot determine the type of the value being "
+             + "projected at position " + Int.toString(index)
+             + ". Add a type annotation.", c.span)
+        None -> {}
     }
     oops("cannot determine a type satisfying '"
          + Ty.showPredWith(c.pred, Ty.namer("")) + "'. Add a type annotation.",

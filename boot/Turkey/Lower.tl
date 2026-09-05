@@ -300,6 +300,7 @@ fun instanceBind(l : Lowerer, inst : InstInfo) -> CBind {
         None -> oops("instance has no plan", Some(inst.decl.span))
     }
     let result = dictType(l, inst.cls, inst.head)
+    if Classes.isGenerated(inst.cls) { return accessors(l, inst, result) }
     let fields = Array.new(8)
     let givens = instanceGivens(l, inst, plan)
     for (sup, ev) in Map.entries(plan.supers) {
@@ -327,6 +328,59 @@ fun instanceBind(l : Lowerer, inst : InstInfo) -> CBind {
     }
     let b = newBind(instName(inst), value.ty, instanceBinders(inst), value,
                     Some(inst.decl.span))
+    b.module_ = inst.module_
+    b
+}
+
+-- The dictionary of a generated field or projection class.
+--
+-- Written here in Core rather than in the surface language, and it has to be:
+-- `fun get(r) = r.cap` is itself a field access, so it would demand the very
+-- predicate it is the evidence for and regress. `CField` stays the primitive
+-- and the class is its interface -- the same relation `Prim.intAdd` has to
+-- `class Add`.
+--
+-- No context, so the dictionary is a bare record rather than a function of one.
+-- That is what lets the devirtualizer hoist these accessors and the inliner
+-- collapse them: wherever specialization reaches, a field access ends up the
+-- same `CField` it always was.
+fun accessors(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
+    let label = Classes.generatedLabel(inst.cls)
+    var fam = ""
+    var held = Ty.tUnit()
+    for (name, ty) in Map.entries(inst.families) {
+        fam = name
+        held = ty
+    }
+    discard(fam)
+    let span = Some(inst.decl.span)
+    let target = CParam { name = "%r", ty = inst.head }
+    let receiver = node(inst.head, span, CVar(target.name))
+    let read = match label {
+        Some(name) -> node(held, span, CField(receiver, name))
+        None -> match Classes.generatedIndex(inst.cls) {
+            Some(index) -> node(held, span, CProject(receiver, index))
+            None -> oops("'" + inst.cls + "' is not a generated class", span)
+        }
+    }
+    let fields = [("get", node(TFun([inst.head], held), span,
+                               CLam([target], read, instName(inst) + "#get")))]
+    match label {
+        Some(name) -> {
+            let written = CParam { name = "%v", ty = held }
+            let slot = node(held, span,
+                            CField(node(inst.head, span, CVar(target.name)), name))
+            Array.push(fields, ("set", node(
+                TFun([inst.head, held], Ty.tUnit()), span,
+                CLam([target, written],
+                     node(Ty.tUnit(), span,
+                          CAssign(slot, node(held, span, CVar(written.name)))),
+                     instName(inst) + "#set"))))
+        }
+        None -> {}
+    }
+    let record = node(result, span, CRecord(dictConName(inst.cls), fields))
+    let b = newBind(instName(inst), result, instanceBinders(inst), record, span)
     b.module_ = inst.module_
     b
 }

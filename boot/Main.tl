@@ -369,6 +369,35 @@ fun initialEnv() -> Constraints.Env {
 -- What `types` prints: the entry module's own bindings, under the names the
 -- author wrote rather than the qualified ones resolution gave them -- the module
 -- a name came from is not news to the person who wrote the file.
+-- A scheme with its family applications reduced at every level.
+--
+-- A field access has the type `Field.n r`, and once `r` is a known record that
+-- family *is* the field's type. The solver reduces at the head, which is all
+-- unification compares; a signature is read whole, and a monomorphic binding
+-- never passes through generalization at all, so the reduction that a reader
+-- needs happens here.
+fun reduced(classes : Classes.ClassTable, scheme : Ty.Scheme) -> Ty.Scheme {
+    -- Without the wanted rules: a scheme's own equation must print as it was
+    -- retained, and `Container.Elem c ~ Int` reduced by the rule it supplied
+    -- prints as `Int ~ Int`, which says nothing and hides what the caller has
+    -- to prove. See `Classes.settled`.
+    let was = classes.rulesApply
+    classes.rulesApply = False
+    let fams = Some(Coretc.famsOf(classes, Array.new(1)))
+    let preds = Array.new(len(scheme.preds))
+    for p in scheme.preds {
+        Array.push(preds, Ty.pred(p.name,
+            Array.map(p.args, fun(a) = Typed.reduceDeep(a, fams))))
+    }
+    let out = Ty.Scheme {
+        quantified = scheme.quantified,
+        body = Typed.reduceDeep(scheme.body, fams),
+        preds = preds,
+    }
+    classes.rulesApply = was
+    out
+}
+
 fun signatures(entry : Modules.Module, env : Constraints.Env,
                classes : Classes.ClassTable) -> Array (String, Ty.Scheme) {
     let out = Array.new(16)
@@ -390,7 +419,7 @@ fun signatures(entry : Modules.Module, env : Constraints.Env,
             DStmt(s) -> for name in bindingNames(s) {
                 match Constraints.lookup_(env, name) {
                     Some(binding) -> Array.push(out,
-                        (Ty.shortName(name), binding.scheme))
+                        (Ty.shortName(name), reduced(classes, binding.scheme)))
                     None -> {}
                 }
             }

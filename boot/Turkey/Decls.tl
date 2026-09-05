@@ -27,7 +27,6 @@ import Turkey.Types as Ty
 -- what inference manipulates, and translating between them is the whole job.
 import Turkey.Types (Kind(..), VarCell(..), Scheme(..),
                      TVar, TCon, ConCell(..), TApp, TFam, TFun, TTuple,
-                     TLabel, TIndex,
                      TSet, TBottom)
 
 -- One value constructor. `fields` is `None` for the positional form.

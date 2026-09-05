@@ -481,9 +481,10 @@ fun checkField(ck : Checker, e : Core, target : Core, name : String,
 
 fun checkProject(ck : Checker, e : Core, target : Core, index : Int,
                  env : CEnv) -> Ty.Type {
-    let t = Ty.prune(check(ck, target, env, None))
+    let t = reduce(ck, Ty.prune(check(ck, target, env, None)))
     match t {
         TVar(_) -> return e.ty
+        TFam(_, _, _) -> return e.ty
         TBottom -> return e.ty
         _ -> {}
     }
@@ -504,7 +505,7 @@ fun checkProject(ck : Checker, e : Core, target : Core, index : Int,
 -- A field of a single-variant record.
 fun recordField(ck : Checker, target : Ty.Type, name : String,
                 where : Option Span, erased : Option Ty.Type) -> Ty.Type {
-    let (h, _) = Ty.spine(Ty.prune(target))
+    let (h, _) = Ty.spine(reduce(ck, Ty.prune(target)))
     -- The lowering kept the type inference gave it; if that is still a variable
     -- the field was resolved by a demand the solver discharged and erased, and
     -- there is nothing left here to check. Hand back the type inference recorded
@@ -512,6 +513,10 @@ fun recordField(ck : Checker, target : Ty.Type, name : String,
     -- "unknown" to the callers, it is a rigid nothing.
     match h {
         TVar(_) -> return match erased {
+            Some(t) -> t
+            None -> freshType()
+        }
+        TFam(_, _, _) -> return match erased {
             Some(t) -> t
             None -> freshType()
         }
@@ -866,7 +871,13 @@ fun famsOf(classes : ClassTable,
            equations : Array (Ty.Type, Ty.Type)) -> Ty.Families = Ty.Families {
     reduce = fun(t) = {
         for (left, right) in equations {
-            if Ty.sameType(left, t) { return Some(right) }
+            -- A rule from a family application to itself is no rule. Skipped
+            -- rather than returned, so the instance table still gets its turn:
+            -- returning it would leave `Field.tag Auto` unreduced next to the
+            -- `Int` it is, and stop the comparison that needs them equal.
+            if Ty.sameType(left, t) && !Ty.sameType(right, t) {
+                return Some(right)
+            }
         }
         match t {
             TFam(name, arg, _) -> Classes.reduceFam(classes, name, arg)

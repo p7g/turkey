@@ -51,7 +51,7 @@ import Turkey.Typed as Typed
 import Turkey.Typed (TypeTable(..))
 import Turkey.Types as Ty
 import Turkey.Types (VarCell(..), ConCell(..), Scheme(..), Pred(..),
-                     TVar, TCon, TApp, TFam, TFun, TTuple, TLabel, TIndex,
+                     TVar, TCon, TApp, TFam, TFun, TTuple,
                      TSet, TBottom)
 
 -- Which literals get a set rather than a type. A string or a char has exactly
@@ -1205,10 +1205,11 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
     EField(_, _) -> genField(g, e, False)
     EProject(obj, index) -> {
         let receiver = genExpr(g, obj)
-        let result = fresh(g)
-        emit(g, C.cpredOf(Ty.pred(C.hasProjection,
-            [TIndex(index), receiver, result]), Some(e.span), "read"))
-        result
+        let cls = Classes.projectionClass(index)
+        discard(Classes.ensureGenerated(g.classes, cls))
+        emit(g, C.cpredOf(Ty.pred(cls, [receiver]), Some(e.span), "read"))
+        let fam = Classes.projectionFamily(index)
+        TFam(fam, receiver, familyResult(g, fam))
     }
     EUnary(op, operand, fn) -> match fn {
         Some(f) -> genOperator(g, f, [operand], op, e.span)
@@ -1393,23 +1394,37 @@ fun genRecord(g : Generator, e : Expr, conName : String,
         other -> other
     }
 
--- Emit `HasField "f" r a` for `r.f` and hand back the `a`.
+-- The result kind of a generated family, which `ensureGenerated` declared.
+fun familyResult(g : Generator, fam : String) -> Ty.Kind =
+    match Map.get(g.classes.decls.families, fam) {
+        Some(info) -> info.resKind
+        None -> oops("'" + fam + "' was not declared", None)
+    }
+
+-- Emit `%HasField.f r` for `r.f` and hand back `%Field.f r`.
 --
 -- Nothing is decided here. If the receiver turns out to be known the solver
--- discharges the predicate and unifies the result with the declared field type;
--- if not, the predicate waits, and may end up travelling in a scheme. That is
--- the whole of SPEC-DELTAS.md 7: the old code pruned the receiver and demanded a
--- record on the spot, which made `a.length` mean different things depending on
--- whether the walk had reached `a[0]` yet.
+-- finds the generated instance and the family reduces to the declared field
+-- type; if not, the predicate waits, and may end up travelling in a scheme.
+-- That is the whole of SPEC-DELTAS.md 7: the old code pruned the receiver and
+-- demanded a record on the spot, which made `a.length` mean different things
+-- depending on whether the walk had reached `a[0]` yet.
+--
+-- The result is a *family application* rather than a fresh variable, and that
+-- is what retires `improve`'s hand-written functional dependency: two reads of
+-- `r.f` used to be two unrelated variables that an improvement rule had to
+-- equate, and are now the same type expression, which ordinary unification
+-- equates for free.
 fun genField(g : Generator, e : Expr, assigning : Bool) -> Ty.Type =
     match e.kind {
         EField(obj, name) -> {
             let receiver = genExpr(g, obj)
-            let result = fresh(g)
-            emit(g, C.cpredOf(Ty.pred(C.hasField,
-                [TLabel(name), receiver, result]), Some(e.span),
+            let cls = Classes.fieldClass(name)
+            discard(Classes.ensureGenerated(g.classes, cls))
+            emit(g, C.cpredOf(Ty.pred(cls, [receiver]), Some(e.span),
                 if assigning { "mutate" } else { "read" }))
-            result
+            let fam = Classes.fieldFamily(name)
+            TFam(fam, receiver, familyResult(g, fam))
         }
         _ -> oops("not a field access", Some(e.span))
     }

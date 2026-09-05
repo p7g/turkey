@@ -38,6 +38,14 @@ fun run(classes : ClassTable, uses : Array Use) -> Unit {
 fun completeInstances(classes : ClassTable) -> Unit {
     for (_, insts) in Map.entries(classes.instances) {
         for inst in insts {
+            if Classes.isGenerated(inst.cls) {
+                -- A generated field accessor has no superclasses and no
+                -- written body: the lowering builds `get` and `set` out of the
+                -- primitive `CField` the class is the interface to. There is
+                -- nothing here to complete.
+                inst.plan = Some(Classes.newInstancePlan(Array.new(1)))
+                continue
+            }
             let info = match Map.get(classes.classes, inst.cls) {
                 Some(i) -> i
                 None -> oops("unknown class '" + inst.cls + "'", None)

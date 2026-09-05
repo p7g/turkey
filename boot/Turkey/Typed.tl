@@ -59,7 +59,14 @@ fun newTypeTable() -> TypeTable = TypeTable {
 -- those are per-body and gone by the time anything reads this table -- but so is
 -- the need for them: an assumption's rule was applied during solving, in place,
 -- on these very type objects. What can still be reduced afterwards is what the
--- instance table decides.
+-- class table decides.
+--
+-- Including the equations the solver stuck on, which it keeps as rewrite rules.
+-- That is not optional: if a predicate was discharged by such a rule then the
+-- evidence names an instance of the *reduced* type, so a recorded type left
+-- unreduced cannot be given that evidence -- the lowering asks for
+-- `%Dict.Mul (Field.cap a)` and is handed `Mul Int`. Solving, elaboration and
+-- the recorded types have to reduce by the same rules or they disagree.
 fun observe(t : TypeTable, classes : ClassTable) -> Unit {
     t.fams = Some(Ty.Families {
         reduce = fun(ty) = match ty {

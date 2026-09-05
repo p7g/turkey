@@ -5,8 +5,11 @@ module Turkey.Classes (
     InstInfo(..), instCon, instHeadKey,
     ClassTable(..), newClassTable,
     registerAll, resolveContext,
-    reduceFam, normalize, uncovered,
+    reduceFam, normalize, settled, settledFam, uncovered,
     bySuper, byInst, entail, isClass, method, simplify,
+    fieldClass, fieldFamily, projectionClass, projectionFamily,
+    generatedLabel, generatedIndex, fieldFamilyOwner, isGenerated, accessor,
+    ensureGenerated, synthesize,
     match_, matches,
     Skolems(..), newSkolems, skolemBind, skolemApply, skolemApplyPred,
     surfaceMember, memberNamed,
@@ -70,10 +73,11 @@ import Turkey.Ast as Ast
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), FamilyInfo(..))
 import Turkey.Diag as Diag
+import Turkey.Source as Source
 import Turkey.Source (Span)
 import Turkey.Types as Ty
 import Turkey.Types (Kind(..), VarCell(..), ConCell(..), Scheme(..), Pred(..),
-                     TVar, TCon, TApp, TFam, TFun, TTuple, TLabel, TIndex,
+                     TVar, TCon, TApp, TFam, TFun, TTuple,
                      TSet, TBottom)
 
 -- -- evidence ----------------------------------------------------------------------
@@ -211,11 +215,61 @@ type ClassTable = ClassTable {
     -- Method name -> owning class. Methods share the value namespace with
     -- ordinary functions, so this is also what detects a collision.
     owner     : Map String String,
+    -- Equations the solver has stuck on, as rewrite rules for the families
+    -- they name. A *wanted* equality is a rule too: if the binding retains it
+    -- then every caller proves it, and if it is discharged later then
+    -- unification has made both sides one anyway -- so reducing by it is sound
+    -- either way. GHC calls this wanteds rewriting wanteds.
+    --
+    -- They live here rather than on the solver because everything that reduces
+    -- a family goes through this table -- predicate discharge, the type table
+    -- the lowering and exhaustiveness read, and the elaborator -- and those
+    -- three disagreeing is the whole defect. Teaching one is worse than
+    -- teaching none: solving then accepts a predicate whose evidence the
+    -- elaborator cannot reconstruct.
+    --
+    -- A rule names particular type *variables*, and `typeKey` prunes, so one
+    -- binding's rule cannot fire inside another: no other binding mentions its
+    -- variables. That is what makes a flat list correct where a scope stack
+    -- would be needed for anything else.
+    rules     : Array (Ty.Type, Ty.Type),
+    -- Turned off while an equation is being retried. A wanted equality may
+    -- rewrite *other* constraints and must never discharge itself: reducing
+    -- `Container.Elem c` by the very rule `Container.Elem c ~ Int` supplied
+    -- makes the equation trivially true, so a program that should be told to
+    -- state it in its context is accepted and fails in the Core checker
+    -- instead.
+    rulesApply : Bool,
 }
 
 fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
     decls = decls, classes = Map.new(), instances = Map.new(),
-    owner = Map.new(),
+    owner = Map.new(), rules = Array.new(4), rulesApply = True,
+}
+
+-- `reduceFam`, refusing the wanted rules. See `settled`.
+fun settledFam(t : ClassTable, name : String, arg : Ty.Type) -> Option Ty.Type {
+    let was = t.rulesApply
+    t.rulesApply = False
+    let out = reduceFam(t, name, arg)
+    t.rulesApply = was
+    out
+}
+
+-- `normalize`, refusing the wanted rules.
+--
+-- For the two questions that decide whether an equation *survives*: is it
+-- already true, and can it be retried. Both must be answered from definitions
+-- and givens alone, because an equation answered by the rule it supplied is
+-- answered by itself -- and a scheme that drops it stops making its callers
+-- prove it, which is the difference between a carried equation and an unsound
+-- one.
+fun settled(t : ClassTable, ty : Ty.Type) -> Ty.Type {
+    let was = t.rulesApply
+    t.rulesApply = False
+    let out = normalize(t, ty)
+    t.rulesApply = was
+    out
 }
 
 -- -- registration ------------------------------------------------------------------
@@ -729,11 +783,274 @@ fun checkInstance(t : ClassTable, inst : InstInfo) -> Unit {
 -- *stuck*, never failure: an argument no instance covers is a missing instance,
 -- and the class predicate that travels beside every family application is what
 -- reports it, with the better message and the right span.
+
+-- -- generated classes -------------------------------------------------------------
+--
+-- A field access is a class method, and the reason it did not look like one is
+-- that `HasField l r a` has three arguments where a class has one. The label is
+-- a compile-time constant and folds into the class's *name*; the field's type
+-- is a function of the receiver, which is what an associated family is for. So
+-- `r.cap` demands `%HasField.cap r` and has the type `%Field.cap r`, and both
+-- the class and its instances are generated rather than written.
+--
+-- This is what stops `HasField` being erased. A predicate the solver discharges
+-- and throws away leaves a record-polymorphic body knowing a field's type and
+-- not its position, which cannot be compiled and -- worse -- can be compiled
+-- wrong, since the backend answers `BOXED` for anything read out of a receiver
+-- it does not know. As a class it carries a dictionary of accessors instead,
+-- and the body is handed the offset rather than guessing it.
+--
+-- Nothing ground pays for this. An instance below has no context, so wherever
+-- specialization reaches the dictionary is ground, the devirtualizer hoists the
+-- accessor, and the inliner takes it -- the body is a single node -- leaving
+-- exactly the `CField` that used to be emitted directly.
+
+let fieldClassHead = "%HasField"
+let projectionClassHead = "%HasProjection"
+let fieldFamilyHead = "%Field"
+let projectionFamilyHead = "%Elem"
+
+fun fieldClass(label : String) -> String = fieldClassHead + "." + label
+
+fun fieldFamily(label : String) -> String = fieldFamilyHead + "." + label
+
+fun projectionClass(index : Int) -> String =
+    projectionClassHead + "." + Int.toString(index)
+
+fun projectionFamily(index : Int) -> String =
+    projectionFamilyHead + "." + Int.toString(index)
+
+-- The label a generated name carries, if its head is the one asked for. A
+-- generated name is `head` and a label with one `.` between them, and a field
+-- name cannot contain a `.`, so the last one is the separator.
+fun generatedPart(name : String, head : String) -> Option String =
+    match String.rsplitOnce(name, ".") {
+        Some((before, after)) -> if before == head { Some(after) } else { None }
+        None -> None
+    }
+
+-- The field name a generated class accesses, if it is one of them.
+fun generatedLabel(cls : String) -> Option String =
+    generatedPart(cls, fieldClassHead)
+
+-- The position a generated projection class reads, if it is one.
+fun generatedIndex(cls : String) -> Option Int =
+    match generatedPart(cls, projectionClassHead) {
+        Some(digits) -> Int.parse(digits)
+        None -> None
+    }
+
+-- The generated class a generated family belongs to, or the name itself.
+--
+-- `%Field.cap` is declared by `%HasField.cap` and `%Elem.0` by
+-- `%HasProjection.0`, so the label is recoverable from either name.
+fun fieldFamilyOwner(fam : String) -> String {
+    match generatedPart(fam, fieldFamilyHead) {
+        Some(label) -> return fieldClass(label)
+        None -> {}
+    }
+    match generatedPart(fam, projectionFamilyHead) {
+        Some(digits) -> match Int.parse(digits) {
+            Some(index) -> return projectionClass(index)
+            None -> {}
+        }
+        None -> {}
+    }
+    fam
+}
+
+fun isGenerated(cls : String) -> Bool =
+    Option.isSome(generatedLabel(cls)) || Option.isSome(generatedIndex(cls))
+
+-- The internal name of a generated class's method.
+--
+-- `#` and not `.`, because `surfaceMember` splits on it: the dictionary's field
+-- ends up called `get`, while the method's own name stays unique across labels.
+-- `ClassTable.owner` is one flat namespace and rejects a method declared twice,
+-- so every label needs its own pair.
+fun accessor(cls : String, which : String) -> String = cls + "#" + which
+
+-- A declaration for something nobody wrote. Spans are not optional on `FunDecl`
+-- and `InstanceDecl`, and a generated class has no source to point at.
+fun generatedSpan() -> Span = Source.span("<generated>", 0, 0)
+
+-- Declare a field or projection class, once per label.
+--
+-- Built here rather than enumerated up front for two reasons. A label's class
+-- has to exist before any signature mentioning it is read, and eager
+-- registration would have to guess the order; and no pass can know which tuple
+-- arities a program projects from. Generated on demand, a class appears exactly
+-- when something asks for it.
+fun ensureGenerated(t : ClassTable, cls : String) -> ClassInfo {
+    match Map.get(t.classes, cls) {
+        Some(found) -> return found
+        None -> {}
+    }
+    let label = generatedLabel(cls)
+    let cell = Ty.freshVar(1)
+    let info = ClassInfo {
+        name = cls, param = "r", cvar = cell, supers = Array.new(1),
+        methods = Map.new(), span = None, module_ = "",
+        families = Map.new(), defaults = Map.new(),
+    }
+    Map.put(t.classes, cls, info)
+    let fam = match label {
+        Some(name) -> fieldFamily(name)
+        None -> match generatedIndex(cls) {
+            Some(index) -> projectionFamily(index)
+            None -> oops("'" + cls + "' is not a generated class", None)
+        }
+    }
+    let res = Ty.kvar()
+    Map.put(t.decls.families, fam, FamilyInfo {
+        name = fam, cls = cls, argKind = cell.kind, resKind = res, span = None,
+    })
+    Map.put(info.families, fam, "r")
+    let receiver = TVar(cell)
+    let held = TFam(fam, receiver, res)
+    let pred = Ty.pred(cls, [receiver])
+    let names = Map.new()
+    Map.put(names, cell.id, "r")
+    let members = [("get", TFun([receiver], held))]
+    match label {
+        -- Projections are read-only: the parser rejects `x.0 = v`, so there is
+        -- nothing for a setter to be the evidence of.
+        Some(_) -> Array.push(members, ("set", TFun([receiver, held], Ty.tUnit())))
+        None -> {}
+    }
+    for (which, ty) in members {
+        let name = accessor(cls, which)
+        Map.put(info.methods, name, MethodInfo {
+            name = name, cls = cls,
+            scheme = Ty.generalize(ty, 0, [pred]),
+            decl = FunDecl {
+                id = 0, span = generatedSpan(), name = name,
+                params = Array.new(1), ret = None, body = None,
+                context = Array.new(1), monomorphic = False,
+            },
+            classVar = cell, names = names,
+        })
+        Map.put(t.owner, name, cls)
+    }
+    info
+}
+
+-- The instance covering a generated class's demand, on demand.
+--
+-- Coherent by construction: one record type declares one field once, so there
+-- is exactly one instance per head and nothing to overlap with. That is why
+-- this bypasses `checkInstance` -- its coverage and orphan rules exist to
+-- police what a *program* may declare.
+--
+-- One class has many instances, because many record types may declare a field
+-- of the same name. They are keyed by head, and an instance is built the first
+-- time its head is demanded.
+fun synthesize(t : ClassTable, p : Pred) -> Option InstInfo {
+    let cls = p.name
+    if !isGenerated(cls) { return None }
+    let receiver = Ty.prune(p.args[0])
+    let (head, _) = Ty.spine(receiver)
+    let label = generatedLabel(cls)
+    let index = generatedIndex(cls)
+
+    -- The instance's head is the *general* one -- `Map k v`, not
+    -- `Map String Int` -- so one instance covers every use. It is read off the
+    -- constructor's own scheme, which is where those variables live.
+    let general = match head {
+        TTuple(elems) -> match label {
+            -- A tuple has positions, not field names.
+            Some(_) -> return None
+            None -> {
+                -- Over fresh variables, not over the tuple that happened to be
+                -- demanded first: one instance covers every 2-tuple, and giving
+                -- it a concrete head would make it cover exactly one of them
+                -- while still claiming the slot for the rest.
+                let fresh_ = Array.new(len(elems))
+                for _ in elems { Array.push(fresh_, Ty.tvar(1)) }
+                TTuple(fresh_)
+            }
+        }
+        TCon(c) -> match Map.get(t.decls.tycons, c.name) {
+            None -> return None
+            Some(info) -> if len(info.variants) != 1 { return None } else {
+                match Ty.prune(info.variants[0].scheme.body) {
+                    TFun(_, ret) -> ret
+                    _ -> return None
+                }
+            }
+        }
+        _ -> return None
+    }
+    let key = instHeadKey(general)
+    for inst in instancesOf(t, cls) {
+        if instHeadKey(inst.head) == key { return Some(inst) }
+    }
+
+    var fam = ""
+    var held = Ty.tUnit()
+    match label {
+        Some(name) -> {
+            let owner = match head {
+                TCon(c) -> c.name
+                _ -> return None
+            }
+            match Decls.recordFields(t.decls, owner) {
+                None -> return None
+                Some(names) -> if !Array.contains(names, name) { return None }
+            }
+            fam = fieldFamily(name)
+            held = Decls.fieldType(t.decls, general, name)
+        }
+        None -> {
+            let at = match index {
+                Some(found) -> found
+                None -> return None
+            }
+            let choices = match general {
+                TTuple(elems) -> elems
+                _ -> match Decls.projectionTypes(t.decls, general) {
+                    Some(found) -> found
+                    None -> return None
+                }
+            }
+            if at >= len(choices) { return None }
+            fam = projectionFamily(at)
+            held = choices[at]
+        }
+    }
+
+    let families = Map.new()
+    Map.put(families, fam, held)
+    let inst = InstInfo {
+        cls = cls, head = general, context = Array.new(1),
+        decl = InstanceDecl {
+            span = generatedSpan(), cls = cls,
+            head = Type { id = 0, span = generatedSpan(),
+                          kind = TECon(cls, Array.new(1)) },
+            context = Array.new(1), methods = Array.new(1),
+            families = Array.new(1),
+        },
+        names = Map.new(), families = families, plan = None, module_ = "",
+    }
+    match Map.get(t.instances, cls) {
+        Some(found) -> Array.push(found, inst)
+        None -> Map.put(t.instances, cls, [inst])
+    }
+    Some(inst)
+}
+
 fun reduceFam(t : ClassTable, name : String, arg : Ty.Type) -> Option Ty.Type {
     let target = normalize(t, arg)
     let cls = match Map.get(t.decls.families, name) {
         Some(f) -> f.cls
         None -> return None
+    }
+    if isGenerated(cls) {
+        -- A generated class's instances are built on demand, and a family
+        -- application is a demand: `Field.cap (Map k v)` is the first thing to
+        -- ask about the record, and there is no predicate ahead of it to have
+        -- created the instance already.
+        discard(synthesize(t, Ty.pred(cls, [target])))
     }
     for inst in instancesOf(t, cls) {
         match match_(inst.head, target) {
@@ -743,6 +1060,14 @@ fun reduceFam(t : ClassTable, name : String, arg : Ty.Type) -> Option Ty.Type {
             }
             None -> {}
         }
+    }
+    -- Only once no instance decides it. A definition is the truth about a
+    -- family and a wanted equality is merely something else known to be equal
+    -- to it, so a rule can fill a gap and must never contradict an answer.
+    if !t.rulesApply { return None }
+    let key = Ty.typeKey(TFam(name, target, Ty.kvar()))
+    for (left, right) in t.rules {
+        if Ty.typeKey(left) == key { return Some(right) }
     }
     None
 }
@@ -801,6 +1126,7 @@ fun bySuper(t : ClassTable, p : Pred) -> Array Pred {
 
 -- The obligations of the instance that covers `p`, or `None` if none does.
 fun byInst(t : ClassTable, p : Pred) -> Option (Array Pred) {
+    if isGenerated(p.name) { discard(synthesize(t, p)) }
     for inst in instancesOf(t, p.name) {
         match match_(inst.head, p.args[0]) {
             Some(mapping) -> return Some(Array.map(inst.context, fun(q) =
@@ -851,6 +1177,19 @@ fun simplify(t : ClassTable, preds : Array Pred) -> Array Pred {
         let p = preds[i]
         if !isClass(t, p.name) {
             if p.name == Ty.equals && len(p.args) == 2 {
+                -- `Field.tag a ~ Field.tag a` states nothing, and it is not
+                -- merely noise: as a given it is a rewrite rule from a family
+                -- application to itself, so `normalize`'s loop -- reduce until
+                -- the head is no longer a family -- never terminates. Two
+                -- family applications are deferred while their arguments
+                -- differ and can become equal afterwards, which is where these
+                -- come from.
+                -- Normalized first: a side can become reducible after the last
+                -- time the equation was retried, so `Int ~ Int` is a shape this
+                -- actually reaches. It states nothing and, as a given, is a
+                -- rewrite from a type to itself.
+                if Ty.typeKey(settled(t, p.args[0]))
+                        == Ty.typeKey(settled(t, p.args[1])) { continue }
                 -- Equality is symmetric. Inference can meet both directions when
                 -- two associated families meet through a mutable local. Carrying
                 -- both into a scheme creates a cyclic rewrite system for Core

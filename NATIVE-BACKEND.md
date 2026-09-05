@@ -477,9 +477,46 @@ Each phase runs and is verified before the next begins.
   backend's SSA is block-local and stores the scrutinee into a slot to reload
   it in every test block.
 
-  Status: complete except closure conversion (`CLam`, `CLetRec`) and the
-  module initializer. On the sample programs every binding that is a function
-  lowers, with the verifier silent.
+  Closure conversion departs from the ancestor twice more. A lifted lambda
+  captures its *free* variables rather than the whole environment, which is not
+  an optimization: `turkey_object_new` refuses more than 63 slots, and an
+  environment in a body the size of `Turkey.Opt#expr` would exceed that, so
+  capture-everything is a runtime panic on this compiler's own source. And
+  `CLetRec` needs no slots -- the Python original allocates one per binding so
+  a sibling's closure has an address before it has a value, and with
+  function-wide SSA what must be known before the lift is a capture's
+  *representation*, which is a traced pointer whether or not it has been
+  allocated.
+
+  A top-level function used as a value becomes a **boxing adapter written in
+  this IR**, not an opcode: `llvmgen.py` generates such a thunk at emission
+  time, and doing it here means it is verified and optimized like everything
+  else, and no emitter has to generate a function body from inside a pass whose
+  job is something else. That is the "nothing is shaped to suit LLVM" rule
+  paying for itself rather than costing.
+
+  Two hazards this creates are checked rather than trusted. A **signature
+  table** answers what a callee is called at, so a direct call coerces to the
+  callee's representations and a closure call boxes -- two conventions the
+  lowering had been conflating. And **`LowIr.checkCalls`** checks agreement
+  *between* functions, which `Ssa.verify` cannot: a lifted function taking
+  three parameters and an indirect call passing two are both well-formed
+  graphs.
+
+  The **module initializer** is one function computing every global, and it is
+  two phases for one reason: a dictionary's fields are the instance's methods,
+  and a method mentions the dictionary it belongs to, so building the record in
+  one step would need its own address before it had one. Every record-shaped
+  dictionary is therefore allocated and published first and filled afterwards
+  -- the shell-first discipline `CLetRec` uses, one level up. Unlike a skipped
+  function, a skipped *global* is a hard failure: a missing function leaves a
+  symbol its callers name and `checkCalls` says so, while a missing global
+  leaves an initializer that runs to completion and quietly did not
+  initialize something.
+
+  Status: **complete**. All 28 corpus programs lower with nothing skipped and
+  with the verifier, the representation checks and the cross-function check
+  all silent.
 * **Phase 2.** Low IR to LLVM IR text, and `boot build`. The conformance suite
   runs under differential execution. **`boot` is self-sufficient here**, and
   everything above this line is now exercised by every program in the suite.

@@ -1179,6 +1179,82 @@ worse than measuring. Same lesson as the measurements in `CORE-OPT.md`,
 reached from the other direction.
 
 
+### 59. The same capture bug, in the other map
+
+**compiler, fixed.** M27 phase 1. FINDINGS 56 was `env` growing without ever
+being scoped, so two inlined copies of a body shared one name. The fix scoped
+`env` and left `joins` exactly as it was -- and `joins` has the same property
+for the same reason: a function inlined into itself has two joins called
+`loop`, and `Map.put(l.joins, name, target)` overwrote the outer one.
+
+What that produces is not a wrong value but a wrong *edge* -- the outer copy's
+jump lands in the inner copy's block -- and it surfaced identically:
+
+```
+Main#depth@Pair(Int): value 24 is used outside the blocks its definition dominates
+```
+
+Eleven of those, all in `polyrec.tl`, which is the program that inlines a
+function into itself thirteen deep. The lesson is not "scope your maps". It is
+that **fixing one instance of a bug is not fixing the bug**: `env` and `joins`
+are the two scoped things in that record, the reasoning that condemned one
+condemned the other verbatim, and I fixed one and moved on. A finding is worth
+re-reading against the rest of the file that produced it.
+
+The verifier caught it twice, which is the argument for a check that knows
+nothing about the mistake it is catching.
+
+### 60. Two kinds of thing have named fields, and only one is declared
+
+**compiler, fixed.** M27 phase 1. `fieldIndex` asked `Decls.recordFields`,
+which answers for a mutable record -- the surface language's record. A
+*dictionary* is also a thing with named fields, and it is not one: its type and
+its constructor are synthesized when evidence becomes a value, so nothing
+registers them and `decls.tycons` has never heard of `%Dict.Std.Classes#Length`.
+
+Every method call in the language is a field read off a dictionary, so this was
+19 stopped bindings across the corpus and the single largest remaining gap. It
+was invisible for two rounds because the message said "a field of a type with
+no known layout", which named neither the field nor the type; changing it to
+print both answered it immediately:
+
+```
+--   1  the field 'len' of (a c%Dict.Std.Classes#Length@-1 (a cData.Array#Array@-1 v116501))
+```
+
+The fix is the Python backend's: collect record shapes by *walking the program*
+for `CRecord` nodes, not by asking the declaration table. Worth having the
+diagnostic say what it saw before guessing at what it meant -- two rounds of
+three-minute compiles bought nothing that one better message did.
+
+The second half is that the same table now decides both how a dictionary is
+*built* and how it is *read*. They were two lookups agreeing by convention,
+which is how a field ends up written at one offset and read at another.
+
+### 61. A 2:42 startup, paid thirty times
+
+**tooling, mine.** M27 phase 1. To check the corpus I wrote a shell loop
+running `boot ssa` once per program, and estimated an hour. Measured:
+
+* one program -- **2:42**
+* all twenty-eight in one invocation -- **2:56**
+
+So ~2:40 is fixed and the actual work is about half a second per program. The
+fixed part is `boot` itself: running it means the Python implementation
+typechecks and then *interprets* the whole bootstrap compiler before it looks
+at the target at all.
+
+`boot/Main.tl` already takes any number of files, and its header already said
+why -- "not a convenience for the test -- it is what keeps the milestone's diff
+to one process, since starting this program currently means compiling it". The
+design note was there, in the file I was invoking, and I wrote the loop anyway.
+`tests/test_ssa_lower.py` had the same shape and now makes one invocation and
+splits the dump.
+
+The general form: when a tool documents how it wants to be called, the cost of
+ignoring it is not proportional to the mistake.
+
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

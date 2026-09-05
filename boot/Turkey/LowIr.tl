@@ -1,6 +1,6 @@
 module Turkey.LowIr (
     BinOp(..), CmpOp(..), Conv(..), Callee(..), Op(..), Low(..),
-    low, effectsOf, opUses, opResultRep, checkReps,
+    low, effectsOf, opUses, opResultRep, checkReps, checkCalls,
     Builder(..), builder, into, emit, effect, terminate, block, param,
 )
 
@@ -35,6 +35,7 @@ module Turkey.LowIr (
 -- expose arithmetic no optimization here needs and would put the heap layout
 -- in two places. Instruction selection expands these; that is its job.
 
+import Data.Map as Map
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..),
                    Effects(..), Inst(..), Term(..), Block(..), Func(..))
@@ -95,8 +96,18 @@ type Op
     | CellNew(Value)
     | CellLoad(Value)
     | CellStore(Value, Value)
-    -- A closure over `code`, with room for `n` captures filled in afterwards.
-    | ClosureNew(String, Int)
+    -- A closure over `code`, with room for `n` captures filled in afterwards,
+    -- and the bitmap the collector scans the captures by.
+    --
+    -- That bitmap is **one bit per capture**, and `ObjectNew`'s is three bits
+    -- per field. They are one field in the C struct and the object's *kind* is
+    -- what says which encoding to read -- `mark_children` in
+    -- `runtime/turkey_runtime.c` reads three bits for kinds 0 and 1 and one
+    -- bit for every other kind, and the environment this allocates is kind 4.
+    -- Hence two functions in `Turkey.SsaLower`, `metadata` and `bitmap`, which
+    -- must not be swapped. The two encodings also cap the counts differently:
+    -- 21 fields for an object, 63 captures for an environment.
+    | ClosureNew(String, Int, Int)
     | ClosureCapture(Value, Int, Value)
     | Call(Callee, Array Value)
     | GlobalLoad(String)
@@ -229,7 +240,9 @@ fun effectsOf(op : Op) -> Effects = match op {
     CellNew(_) -> Ssa.allocates()
     CellLoad(_) -> Ssa.reads_()
     CellStore(_, _) -> Ssa.writes()
-    ClosureNew(_, _) -> Ssa.allocates()
+    -- Two allocations, the environment and the closure, and still one
+    -- safepoint: neither is observable before the other.
+    ClosureNew(_, _, _) -> Ssa.allocates()
     ClosureCapture(_, _, _) -> Ssa.writes()
     -- A call may do anything the callee does, which is everything. Knowing
     -- better than this per callee is an interprocedural summary and is not
@@ -273,7 +286,7 @@ fun opUses(op : Op) -> Array Value = match op {
     CellNew(a) -> [a]
     CellLoad(a) -> [a]
     CellStore(a, b) -> [a, b]
-    ClosureNew(_, _) -> []
+    ClosureNew(_, _, _) -> []
     ClosureCapture(a, _, b) -> [a, b]
     Call(callee, args) -> {
         let out : Array Value = []
@@ -313,7 +326,7 @@ fun opResultRep(op : Op) -> Option Rep = match op {
     ArrayNew(_, _, _) -> Some(Ssa.traced(Ptr))
     ArrayLength(_) -> Some(Ssa.untraced(I64))
     CellNew(_) -> Some(Ssa.traced(Ptr))
-    ClosureNew(_, _) -> Some(Ssa.traced(Ptr))
+    ClosureNew(_, _, _) -> Some(Ssa.traced(Ptr))
     ObjectSet(_, _, _) -> Some(Ssa.untraced(Unit))
     ArraySet(_, _, _) -> Some(Ssa.untraced(Unit))
     CellStore(_, _) -> Some(Ssa.untraced(Unit))
@@ -347,7 +360,84 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Array String {
         ArraySet(_, index, _) -> wantClass(f, out, index, I64, "an array index")
         ArrayNew(length, _, _) -> wantClass(f, out, length, I64, "an array length")
         Unbox(a) -> wantClass(f, out, a, Ptr, "the operand of an unbox")
+        ClosureCapture(c, _, _) ->
+            wantClass(f, out, c, Ptr, "the target of a closure capture")
+        Call(callee, _) -> match callee {
+            Indirect(fn) -> wantClass(f, out, fn, Ptr, "an indirect callee")
+            _ -> {}
+        }
         _ -> {}
+    }
+    out
+}
+
+-- What one function's instructions require of *another* function.
+--
+-- `Ssa.verify` is per function, and everything closure conversion introduces
+-- crosses that boundary: a lifted function taking three parameters and an
+-- indirect call passing two are both perfectly well formed graphs, and a
+-- `ClosureNew` naming a symbol nobody emitted is invisible. So is a direct
+-- call whose arguments disagree with the callee's signature, which is the one
+-- thing the signature table exists to prevent and therefore the one thing
+-- worth checking rather than trusting.
+--
+-- Answers complaints rather than failing, the way `Ssa.verify` and
+-- `checkReps` do, and is composed with them: that layer owns the shape of one
+-- graph, this one owns agreement between graphs.
+fun checkCalls(functions : Array (Ssa.Func Low)) -> Array String {
+    let out = []
+    let known = Map.new()
+    for f in functions { Map.put(known, f.name, f) }
+    for f in functions {
+        for block in f.blocks {
+            for i in block.insts {
+                match i.op {
+                    Call(Direct(name), args) -> match Map.get(known, name) {
+                        Some(callee) -> {
+                            if len(args) != len(callee.params) {
+                                Array.push(out, f.name + ": calls @" + name
+                                    + " with " + Int.toString(len(args))
+                                    + " arguments where it takes "
+                                    + Int.toString(len(callee.params)))
+                            } else {
+                                for var n = 0; n < len(args); n = n + 1 {
+                                    if Ssa.repOf(f, args[n])
+                                            != Ssa.repOf(callee,
+                                                         callee.params[n]) {
+                                        Array.push(out, f.name + ": passes "
+                                            + show(Ssa.repOf(f, args[n]))
+                                            + " to @" + name + " parameter "
+                                            + Int.toString(n) + ", which is "
+                                            + show(Ssa.repOf(callee,
+                                                   callee.params[n])))
+                                    }
+                                }
+                            }
+                            if Ssa.repOf(f, i.result) != callee.result {
+                                Array.push(out, f.name + ": reads "
+                                    + show(Ssa.repOf(f, i.result))
+                                    + " from @" + name + ", which answers "
+                                    + show(callee.result))
+                            }
+                        }
+                        None -> Array.push(out, f.name + ": calls @" + name
+                                                + ", which is not a function here")
+                    }
+                    ClosureNew(code, n, _) -> match Map.get(known, code) {
+                        -- A closure's code is called at the uniform
+                        -- representation with the environment first, so its
+                        -- arity is one more than the lambda's.
+                        Some(callee) -> if len(callee.params) < 1 {
+                            Array.push(out, f.name + ": closes over @" + code
+                                            + ", which takes no environment")
+                        }
+                        None -> Array.push(out, f.name + ": closes over @"
+                                                + code + ", which does not exist")
+                    }
+                    _ -> {}
+                }
+            }
+        }
     }
     out
 }
@@ -402,7 +492,9 @@ instance Show Op {
     CellNew(a) -> "cell.new " + v(a)
     CellLoad(a) -> "cell.load " + v(a)
     CellStore(a, b) -> "cell.store " + v(a) + ", " + v(b)
-    ClosureNew(code, n) -> "closure.new @" + code + ", " + Int.toString(n)
+    ClosureNew(code, n, bits) ->
+        "closure.new @" + code + ", " + Int.toString(n) + ", "
+        + Int.toString(bits)
     ClosureCapture(a, i, b) ->
         "closure.capture " + v(a) + ", " + Int.toString(i) + ", " + v(b)
     Call(callee, args) -> {

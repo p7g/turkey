@@ -358,7 +358,14 @@ fun dumpOpt(b : String.Builder, path : String) -> Unit {
 fun dumpSsa(b : String.Builder, path : String) -> Unit {
     let (checked, entry) = checkProgram(path)
     let program = optimized(checked, entry)
-    let (functions, skipped) = SsaLower.lowerProgram(program, checked.decls)
+    let (module_, skipped) = SsaLower.lowerProgram(program, checked.decls)
+    let functions = module_.functions
+    -- The storage the initializer writes. Printed first because a function
+    -- below refers to it, and because a global's *representation* is the fact
+    -- a reader most often wants and the least able to derive.
+    for (name, r) in module_.globals {
+        String.push(b, "global $" + name + " : " + show(r) + "\n")
+    }
     for f in functions {
         String.push(b, Ssa.showFunc(f))
         for message in Ssa.verify(f) {
@@ -372,9 +379,18 @@ fun dumpSsa(b : String.Builder, path : String) -> Unit {
             }
         }
     }
-    String.push(b, "-- lowered " + Int.toString(len(functions)) + " of "
-                   + Int.toString(len(functions) + len(skipped))
-                   + " bindings\n")
+    -- What one function's calls require of another, which the per-function
+    -- verifier cannot see. Everything closure conversion introduces crosses
+    -- that boundary.
+    for message in LowIr.checkCalls(functions) {
+        String.push(b, "!! " + message + "\n")
+    }
+    -- Functions rather than bindings, since one binding may become several:
+    -- a lifted lambda, an adapter and the initializer are all functions no
+    -- binding named.
+    String.push(b, "-- lowered " + Int.toString(len(functions))
+                   + " functions, " + Int.toString(len(skipped))
+                   + " skipped\n")
     -- What stopped the rest, most common first. The count says how far this
     -- has come and this says what to write next, which is the whole reason
     -- the lowering reports rather than raises.

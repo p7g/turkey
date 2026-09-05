@@ -25,26 +25,58 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 BOOT_MAIN = REPO_ROOT / "boot" / "Main.tl"
 PROGRAMS = REPO_ROOT / "tests" / "programs"
 
-# Small, and between them they reach an ordinary function, a loop and a
-# user-defined type. Running `boot` under the Python implementation costs
-# seconds per program, so this is a sample rather than the corpus; the corpus
-# is what `boot ssa` is for once it compiles.
-SAMPLE = ["adt.tl", "loops.tl", "stack.tl"]
+# Small, and between them they reach an ordinary function, a loop, a
+# user-defined type, and -- `generalization.tl` -- a lambda that survives
+# `opt` plus a top-level function used as a value, which are the two cases
+# closure conversion exists for. Running `boot` under the Python
+# implementation costs minutes per program, so this is a sample rather than
+# the corpus; the corpus is what `boot ssa` is for once it compiles.
+SAMPLE = ["adt.tl", "loops.tl", "stack.tl", "generalization.tl"]
 
 
 @functools.lru_cache(maxsize=None)
-def _ssa(name: str) -> str:
-    """`boot ssa <program>`, once per program.
+def _all() -> dict[str, str]:
+    """`boot ssa` over every sample program, in **one** invocation.
 
-    Running `boot` under the Python implementation costs about two minutes,
-    so this is cached across the tests in the module for the same reason
-    `test_boot` builds one binary rather than ten.
+    Measured: one program takes 2:42 and all of them together take 2:56, so
+    roughly 2:40 of that is fixed and about half a second is the actual work.
+    The fixed part is `boot` itself -- running it means the Python
+    implementation typechecks and then interprets the whole bootstrap
+    compiler before it looks at the target at all.
+
+    So the cost is per *process*, not per program, which is exactly why
+    `Main.tl` takes any number of files: its header says the one-process rule
+    is "not a convenience for the test -- it is what keeps the milestone's
+    diff to one process, since starting this program currently means
+    compiling it." A loop of one invocation per program pays 2:40 each time
+    and turns three minutes of work into an hour. Same shape as `test_boot`
+    building one binary and sharing it.
+
+    The dump has no separator between programs, by design -- every one ends
+    with its own count line -- so splitting on that line recovers them.
     """
     out = io.StringIO()
     with contextlib.redirect_stdout(out):
         run(BOOT_MAIN.read_text(encoding="utf-8"), str(BOOT_MAIN),
-            ["ssa", str(PROGRAMS / name)])
-    return out.getvalue()
+            ["ssa", *(str(PROGRAMS / name) for name in SAMPLE)])
+    text = out.getvalue()
+    chunks, current = [], []
+    for line in text.splitlines(keepends=True):
+        current.append(line)
+        if line.startswith("-- lowered"):
+            chunks.append("".join(current))
+            current = []
+    # A program's dump ends at its count line; anything after the last one is
+    # a crash, and belongs to the program that was being compiled.
+    if current:
+        chunks.append("".join(current))
+    assert len(chunks) == len(SAMPLE), (
+        f"{len(chunks)} dumps for {len(SAMPLE)} programs:\n{text[-2000:]}")
+    return dict(zip(SAMPLE, chunks))
+
+
+def _ssa(name: str) -> str:
+    return _all()[name]
 
 
 @pytest.mark.parametrize("name", SAMPLE)
@@ -157,15 +189,104 @@ def test_the_array_primitives_are_instructions():
 
 
 @pytest.mark.parametrize("name", SAMPLE)
-def test_only_whole_globals_remain(name):
-    """The lowering reports why, and by now the reasons are down to one.
+def test_nothing_is_skipped(name):
+    """The histogram is empty, which is what finishes M27 phase 1.
 
-    A global whose value the module initializer computes is not a function and
-    is its own phase; every Core form these programs contain otherwise
-    lowers. This is the coverage signal, asserted so it cannot quietly regress.
+    Every Core form these programs contain reaches the low IR: the function
+    bodies, the lambdas closure conversion lifts out of them, and the globals
+    the module initializer computes. This is the coverage ratchet -- it was
+    "every reason is `not a function`" while globals were unhandled, and a new
+    unhandled form is now a failing test rather than a line in a dump nobody
+    reads.
     """
     out = _ssa(name)
-    reasons = [line for line in out.splitlines()
-               if line.startswith("--   ")]
-    assert reasons, out
-    assert all("not a function" in line for line in reasons), reasons
+    reasons = [line for line in out.splitlines() if line.startswith("--   ")]
+    assert not reasons, reasons
+    counted = [line for line in out.splitlines() if line.startswith("-- lowered")]
+    assert len(counted) == 1
+    assert counted[0].endswith("0 skipped"), counted
+
+
+@pytest.mark.parametrize("name", SAMPLE)
+def test_the_globals_are_declared_and_computed(name):
+    """Storage with a representation, and one function that fills it.
+
+    A global's representation is not derivable at a use site, and both the
+    initializer's store and every load need it -- so the module carries it
+    rather than implying it.
+    """
+    out = _ssa(name)
+    assert "global $" in out
+    assert "fun @%module.initialize()" in out
+    assert "global.store $" in out
+
+
+def test_a_dictionary_is_allocated_before_its_fields():
+    """The two-phase initializer, which is why it is two phases.
+
+    A dictionary's fields are the instance's methods and a method mentions the
+    dictionary it belongs to, so building the record in one step would need
+    its own address before it had one. Every record-shaped dictionary is
+    therefore allocated and published first and filled afterwards.
+    """
+    out = _ssa("adt.tl")
+    body = out.split("fun @%module.initialize()")[1].split("\nfun ")[0]
+    # The property per dictionary, rather than a global ordering of opcodes:
+    # a method's own body allocates objects too, so counting `object.new`
+    # across the whole initializer says nothing. What must hold is that the
+    # store publishing a dictionary comes before the load that fills it.
+    stores, loads = {}, {}
+    for index, line in enumerate(body.splitlines()):
+        for op, seen in (("global.store $", stores), ("global.load $", loads)):
+            if op in line:
+                name = line.split(op, 1)[1].split(",")[0].strip()
+                seen.setdefault(name, index)
+    filled = [name for name in loads if name in stores]
+    assert filled, body[:400]
+    for name in filled:
+        assert stores[name] < loads[name], (
+            f"{name} was read back before it was published")
+
+
+def test_a_lambda_becomes_a_lifted_function_and_a_closure():
+    out = _ssa("generalization.tl")
+    assert "closure.new @" in out
+    assert "%lambda" in out
+    # The environment is the leading parameter, and every user parameter and
+    # the result are boxed -- one code pointer is reached from call sites at
+    # many types.
+    lifted = [line for line in out.splitlines()
+              if line.startswith("fun @") and "%lambda" in line]
+    assert lifted, out
+    for line in lifted:
+        assert "-> ptr*" in line, line
+
+
+def test_a_function_used_as_a_value_gets_a_boxing_adapter():
+    """Not a `GlobalLoad`, which would load a code address.
+
+    A closure's code is called at the uniform representation and a top-level
+    function's parameters are natural, so something has to convert. That
+    something is an ordinary function in this IR rather than an opcode every
+    emitter expands for itself.
+    """
+    out = _ssa("generalization.tl")
+    assert "%closure" in out
+    adapters = [line for line in out.splitlines()
+                if line.startswith("fun @") and "%closure" in line]
+    assert adapters, out
+
+
+def test_the_calling_conventions_are_not_confused():
+    """A cross-function check, because the per-function verifier cannot see it.
+
+    A lifted function taking three parameters and an indirect call passing two
+    are both well-formed graphs; so is a direct call whose arguments disagree
+    with the callee's signature, and a `ClosureNew` naming a symbol nobody
+    emitted. Those are exactly what closure conversion introduces.
+    """
+    for name in SAMPLE:
+        out = _ssa(name)
+        for phrase in ("which is not a function here", "does not exist",
+                       "which takes no environment", "arguments where it takes"):
+            assert phrase not in out, (name, phrase)

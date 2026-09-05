@@ -78,7 +78,9 @@ type Op
     | Box(Value)
     | Unbox(Value)
     -- A heap object: `kind` and `tag` as the runtime understands them,
-    -- `count` fields, and the pointer bitmap the collector scans by.
+    -- `count` fields, and the field metadata -- three bits of representation
+    -- per field, which is what the collector scans by and what says how wide
+    -- each field is. See `Turkey.SsaLower.metadata`.
     | ObjectNew(Int, Int, Int, Int)
     | ObjectGet(Value, Int)
     | ObjectSet(Value, Int, Value)
@@ -309,7 +311,7 @@ fun opResultRep(op : Op) -> Option Rep = match op {
     ObjectNew(_, _, _, _) -> Some(Ssa.traced(Ptr))
     ObjectTag(_) -> Some(Ssa.untraced(I32))
     ArrayNew(_, _, _) -> Some(Ssa.traced(Ptr))
-    ArrayLength(_) -> Some(Ssa.untraced(Unit))
+    ArrayLength(_) -> Some(Ssa.untraced(I64))
     CellNew(_) -> Some(Ssa.traced(Ptr))
     ClosureNew(_, _) -> Some(Ssa.traced(Ptr))
     ObjectSet(_, _, _) -> Some(Ssa.untraced(Unit))

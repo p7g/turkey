@@ -460,6 +460,26 @@ Each phase runs and is verified before the next begins.
   closure conversion, pattern tests, join lowering, the calling convention --
   is correct and hard-won and is what carries across; its IR is not. Split into
   more than one pass; the original is 1,579 lines doing four jobs.
+
+  Built in slices against real programs rather than in one attempt. An
+  unhandled Core form stops one binding and is *reported*, so `boot ssa` prints
+  how much of a program lowered and a histogram of what stopped the rest --
+  which is the plan for the next slice, and is better at making it than reading
+  the input is (FINDINGS 58). What is asserted is not how much lowers but that
+  everything which does is well formed: `Ssa.verify` runs over every lowered
+  function and the dump carries a line per complaint.
+
+  Two departures from the ancestor pay for themselves in the first slice.
+  Destination passing goes into a *block parameter*, so `if` and `match` need
+  no machinery -- the arms lower towards the same destination and the merge
+  block's parameter is where they meet. And nothing gets a slot merely for
+  crossing an edge, because a definition dominates its uses; the Python
+  backend's SSA is block-local and stores the scrutinee into a slot to reload
+  it in every test block.
+
+  Status: complete except closure conversion (`CLam`, `CLetRec`) and the
+  module initializer. On the sample programs every binding that is a function
+  lowers, with the verifier silent.
 * **Phase 2.** Low IR to LLVM IR text, and `boot build`. The conformance suite
   runs under differential execution. **`boot` is self-sufficient here**, and
   everything above this line is now exercised by every program in the suite.

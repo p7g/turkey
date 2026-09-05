@@ -50,6 +50,7 @@ import Turkey.Coretc as Coretc
 import Turkey.Mono as Mono
 import Turkey.Joins as Joins
 import Turkey.Layout as Layout
+import Turkey.LowIr as LowIr
 import Turkey.Ssa as Ssa
 import Turkey.SsaLower as SsaLower
 import Turkey.Opt as Opt
@@ -363,10 +364,30 @@ fun dumpSsa(b : String.Builder, path : String) -> Unit {
         for message in Ssa.verify(f) {
             String.push(b, "  !! " + message + "\n")
         }
+        for block in f.blocks {
+            for i in block.insts {
+                for message in LowIr.checkReps(f, i) {
+                    String.push(b, "  !! " + message + "\n")
+                }
+            }
+        }
     }
     String.push(b, "-- lowered " + Int.toString(len(functions)) + " of "
                    + Int.toString(len(functions) + len(skipped))
                    + " bindings\n")
+    -- What stopped the rest, most common first. The count says how far this
+    -- has come and this says what to write next, which is the whole reason
+    -- the lowering reports rather than raises.
+    let counts = Map.new()
+    for u in skipped {
+        Map.put(counts, u.what, Map.getOr(counts, u.what, 0) + 1)
+    }
+    let reasons = Array.sortBy(Map.keys(counts), fun(x, y) =
+        Array.threeWay(Map.getOr(counts, y, 0), Map.getOr(counts, x, 0)))
+    for why in reasons {
+        String.push(b, "--   " + Int.toString(Map.getOr(counts, why, 0))
+                       + "  " + why + "\n")
+    }
 }
 
 -- What the whole front end leaves behind.

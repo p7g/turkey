@@ -1100,6 +1100,85 @@ instruction selection will want, so it is one piece of work and not two.
 
 ---
 
+### 56. Core names are not unique, and an environment that only grows captures
+
+**compiler, fixed.** M27 phase 1. `Turkey.SsaLower` kept one mutable `env` from
+name to SSA value and never took anything out of it. That is right for a Core
+where every binder is distinct and wrong for the Core this compiler actually
+produces: monomorphization and inlining *copy bodies*, so two unrelated locals
+called `i` in one function are ordinary. The second binding wrote over the
+first, and every use after the first one's scope ended read the second's value
+-- or, in the case that showed it, the reverse.
+
+What makes this worth recording is how it surfaced. The lowering was silent.
+The dump looked plausible. What said something was `Ssa.verify`, and what it
+said was not "a name was captured" but:
+
+```
+Data.Array#push@Int: value 37 is used outside the blocks its definition dominates
+```
+
+-- because a captured name is a *dominance* violation once the two bindings are
+in different blocks. The verifier had no idea about scopes and caught a scoping
+bug anyway, which is the argument for running it after every pass rather than
+at the end: it is checking a property that a whole class of unrelated mistakes
+violates.
+
+The fix is to save the affected names and put them back (`SsaLower.saving` /
+`restore`), rather than copy the map per scope the way `backend_lower.py` does
+with `dict(env)`. A scope binds a handful of names and the map holds every
+local in the function.
+
+### 57. A diverging call still has to answer a representation
+
+**compiler, fixed.** M27 phase 1. `Data.Array#bounds` is declared `-> unit` and
+one of its arms is a call to `outOfBounds`, which never returns. The lowering
+produced `ret %11:ptr*` from a function whose result is `unit`, and the
+verifier refused it.
+
+Two different causes wearing one face, which is why it took two goes:
+
+* a call typed `!` does not come back, so what follows it is *unreachable*
+  rather than merely dead. Emitting `Unreachable` and moving on is both more
+  honest and what keeps a `ret` from being built out of a value that never
+  arrives;
+* and separately, `outOfBounds` is typed `fun(...) -> a`, so the call's result
+  type is a *variable* instantiated at the arm's expected type. It is held at
+  the uniform representation and the context wants `unit`. That is not
+  divergence at all -- it is an ordinary representation boundary, and it needed
+  `coerce`.
+
+The first fix hid the second: with `Unreachable` in place the complaint moved
+rather than disappeared, and only the second made it go. Worth remembering that
+"the verifier still says the same thing about a different function" is evidence
+of a *second* cause and not of a bad fix.
+
+### 58. The reason a lowering stopped is worth more than the count
+
+**practice.** M27 phase 1. `boot ssa` reported `lowered 9 of 50 bindings` and
+the plan for the next slice, made by reading Core, was `CMatch` and `CLam` --
+closure conversion, the expensive one. Then the dump was changed to print
+*what* stopped each binding, and the answer was:
+
+```
+--   15  not a function
+--   10  an unbound name 'Prim.intLt'
+--    4  an unbound name 'Prim.intEq'
+```
+
+Not a lambda in sight. A primitive reaches Core as a `CVar` as often as a
+`CPrim`, because the module scope binds every `Prim.` name to itself, and the
+lowering only knew the `CPrim` spelling. Six lines fixed it and coverage went
+from 9 of 50 to 35 of 50; on the three sample programs every remaining skip is
+a module-level global, which is a separate phase.
+
+The finding is not about primitives. It is that an incomplete pass should
+report the *shape* of what it cannot do and not merely how much, because the
+histogram is the plan for the next slice and reading the input to guess is
+worse than measuring. Same lesson as the measurements in `CORE-OPT.md`,
+reached from the other direction.
+
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

@@ -5,7 +5,7 @@ module Turkey.Decls (
     DeclTable(..), newDeclTable,
     head, registerAll, settleKinds,
     star, toType, instantiateCon, con, recordFields, fieldType, projectionTypes,
-    substitute, newtypes, erasedPayload,
+    substitute, newtypes, erasedPayload, conFieldTypes, variantCount,
     showDeclarations,
 )
 
@@ -552,6 +552,41 @@ fun erasedPayload(t : DeclTable, receiver : Ty.Type) -> Option Ty.Type {
         None -> None
     }
 }
+
+-- The field types of one *named* constructor, at a receiver already resolved.
+--
+-- `projectionTypes` answers the same question for the single-variant
+-- positional case, where the constructor need not be named. A pattern names
+-- one, and a multi-variant type has several, so the variant is a parameter
+-- here rather than `variants[0]`. The substitution is the same one and for
+-- the same reason: the constructor result's arguments *are* its type's
+-- parameters, so pairing them with the receiver's is exact, where
+-- instantiating and unifying would introduce fresh variables first.
+fun conFieldTypes(t : DeclTable, receiver : Ty.Type,
+                  name : String) -> Option (Array Ty.Type) {
+    let (_, args) = Ty.spine(receiver)
+    match Map.get(t.constructors, name) {
+        None -> None
+        Some(info) -> match info.scheme.body {
+            TFun(params, ret) -> {
+                let mapping = paramMapping(ret, args)
+                Some(Array.map(params, fun(p) = substitute(p, mapping)))
+            }
+            _ -> Some([])
+        }
+    }
+}
+
+-- How many variants the constructor's type has. One means there is nothing to
+-- distinguish and a pattern needs no tag test.
+fun variantCount(t : DeclTable, name : String) -> Int =
+    match Map.get(t.constructors, name) {
+        None -> 0
+        Some(info) -> match Map.get(t.tycons, info.tycon) {
+            None -> 0
+            Some(tycon) -> len(tycon.variants)
+        }
+    }
 
 fun projectionTypes(t : DeclTable, receiver : Ty.Type) -> Option (Array Ty.Type) {
     let (h, args) = Ty.spine(receiver)

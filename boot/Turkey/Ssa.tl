@@ -486,8 +486,18 @@ fun verify[Inst i](f : Func i) -> Array String {
         }
     }
 
+    -- Only reachable code is checked. Dominance is a statement about paths
+    -- from the entry, so it says nothing about a block no path reaches, and
+    -- asking anyway would report a use as undominated when what is true is
+    -- that it is dead. Unreachable blocks are ordinary here rather than
+    -- exceptional: an expression whose every arm diverges leaves the merge
+    -- block its context asked for with no edge into it. LLVM's verifier draws
+    -- the same line for the same reason.
+    let live = Set.new()
+    for b in reversePostorder(f) { Set.add(live, blockId(b)) }
     let idom = dominators(f)
     for var b = 0; b < count; b = b + 1 {
+        if !Set.contains(live, b) { continue }
         let block = f.blocks[b]
         for var n = 0; n < len(block.insts); n = n + 1 {
             for v in uses(block.insts[n]) {

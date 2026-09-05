@@ -1025,18 +1025,52 @@ front end and the elaboration are now two implementations that agree. It has alr
 inliner miscompile and a lowering that dropped a `do`, neither of which the
 suite could reach.
 
-M25 has landed on the compiler's side: layout-keyed sharing gives one compiled
-body per distinct layout of the type arguments, which is total where item 6's
-specialization is partial, and `boot` now clears the layout invariant. Two
-things came out of it that were not on the list. `opt` could not finish on a
-program the size of the compiler at all, for reasons that took measuring
-rather than guessing (FINDINGS 43). And `HasField` being erased means a
-record-polymorphic body cannot be compiled and could have been compiled
-*wrong*; it is refused for now, and the fix is to stop erasing it -- a field
-access is a class method, and one generated single-parameter class per label
-with the field type as an associated family is the encoding that fits, which
-also deletes `Solver.improve`'s hand-written fundep (FINDINGS 45). That is its
-own milestone and is the next one to build.
+Layout-keyed sharing has landed on both sides: one compiled body per distinct
+layout of the type arguments, total where item 6's specialization is partial,
+and `boot` runs it too. `HasField` has stopped being erased -- a field access
+is a class method, one generated single-parameter class per label with the
+field type as an associated family, which also deleted `Solver.improve`'s
+hand-written functional dependency (FINDINGS 45). Newtypes are erased: a
+single-variant, single-field, non-recursive, immutable wrapper *is* its
+payload and is no longer allocated.
 
-What is left is that, the rest of M25 -- `boot` emitting native code -- and
-M26.
+**The differential is green end to end.** `tests/test_boot.py` is 14 of 14:
+tokens, the parse tree, declarations, dependencies, classes, desugaring, types,
+Core, `mono` and `opt` are byte-identical between the two implementations over
+the whole corpus -- `boot` compiling itself included. Everything above the
+backend is now two implementations that agree.
+
+Two things came out of getting there that were not on the list. `opt` could not
+finish on a program the size of the compiler, for reasons that took measuring
+rather than guessing (FINDINGS 43) -- and the same fixes had to be made twice,
+which is a lesson about the differential rather than about the inliner: it
+compares *output*, so a stage that crashes is a stage it says nothing about.
+And a layout can be forgotten in four separate places, each survivable alone
+because `held_at` guessed `BOXED` wherever it had no answer (FINDINGS 54). It
+no longer guesses.
+
+What is left is the backend in Turkey and then self-hosting.
+
+The backend is designed in `NATIVE-BACKEND.md` and the design is not the one
+this document sketched. It is not C: the Python implementation went to LLVM,
+and `boot` follows it there before going further. It is not a fresh high IR
+either -- Core already is one, which is why `CORE-OPT.md` exists and why the
+two Core passes it considered were measured and declined. What `boot` gains is
+one *low* IR, an SSA CFG parameterized over its instruction type so that
+dominance, liveness and the generic passes are written once; four
+optimizations, taken from QBE's set because that set was measured against a
+stated goal; then instruction selection and register allocation over a second
+instantiation of the same CFG.
+
+Its phases: the IR and its verifier; Core to the low IR; the low IR to LLVM
+text, at which point `boot` is self-sufficient and everything above it is
+exercised by every program in the suite; the optimizations; instruction
+selection; and register allocation with stack maps. LLVM is transitional and is
+what the native path is differentially checked against.
+
+The verification story changes there and the change is deliberate. Every stage
+so far was a byte-identical diff, and a backend designed independently has no
+such oracle -- diffing `boot`'s IR against a JIT's would couple it to the
+artifact it is decoupling from. What a backend is checked by is what the
+compiled program *does*, which `tests/programs/*.expected` already holds for
+the other host.

@@ -168,8 +168,8 @@ fun withValue(b : CBind, value : Core) -> CBind = CBind {
 -- Deterministic on purpose: `Turkey.Deps.sccs` sorts each component, so taking
 -- the first is the lexicographically first name, and a golden that depends on
 -- which binding was broken does not move when an unrelated one is added.
-fun loopBreakers(program : CProgram) -> Set.Set String {
-    let binds = Array.append(program.dicts, program.binds)
+-- Which top-level bindings each one mentions, and nothing else.
+fun callGraph(binds : Array CBind) -> Map String (Set.Set String) {
     let known = Set.new()
     for b in binds { Set.add(known, b.name) }
     let graph = Map.new()
@@ -180,6 +180,11 @@ fun loopBreakers(program : CProgram) -> Set.Set String {
         }
         Map.put(graph, b.name, deps)
     }
+    graph
+}
+
+fun loopBreakers(program : CProgram) -> Set.Set String {
+    let graph = callGraph(Array.append(program.dicts, program.binds))
     let out = Set.new()
     for component in Deps.sccs(graph) {
         let first = component[0]
@@ -213,6 +218,9 @@ type Reducer = Reducer {
     sizes : Map String Int,
     moves : Map String Bool,
     ends  : Map String Bool,
+    -- `size` of each body *as written*, which is what the speculative ceiling
+    -- is checked against before the body is reduced at all.
+    wrote : Map String Int,
     -- A speculative large inline may reduce ordinary small calls inside its
     -- residual, but does not recursively speculate about another large call.
     speculating : Bool,
@@ -246,18 +254,84 @@ fun newReducer(program : CProgram) -> Reducer {
     Reducer {
         breakers = loopBreakers(program), bindings = bindings,
         active = Array.new(8), sizes = Map.new(), moves = Map.new(),
-        ends = Map.new(),
+        ends = Map.new(), wrote = Map.new(),
         speculating = False, reduced = Map.new(), counter = 0,
         usedNames = used,
     }
 }
 
--- Every binding's body, reduced.
+-- Every binding's body, reduced -- callees before their callers.
+--
+-- The order is not cosmetic. `bodyOf` reduces a callee the first time some call
+-- site asks for it, and if that call site is itself inside a body being
+-- reduced, the callee's traversal runs *nested inside* the caller's. On a
+-- program with a deep call graph that makes the traversal's stack depth the
+-- product of call-graph depth and term depth, which is what made this pass
+-- unable to compile the bootstrap compiler at all.
+--
+-- Reducing in dependency order -- `Deps.sccs` already emits it -- means the
+-- memo is warm before anyone asks, so `bodyOf` is a lookup and every traversal
+-- is one term deep. Within a cycle there is no such order and the nesting can
+-- still happen, but it is then bounded by the size of the component rather than
+-- by the height of the whole graph.
 fun reduceProgram(program : CProgram) -> CProgram {
     let r = newReducer(program)
-    CProgram {
-        dicts = Array.map(program.dicts, fun(b) = withValue(b, expr(r, b.value))),
-        binds = Array.map(program.binds, fun(b) = withValue(b, expr(r, b.value))),
+    let binds = Array.append(program.dicts, program.binds)
+    let first = Map.new()
+    for var i = 0; i < len(binds); i = i + 1 {
+        if !Map.contains(first, binds[i].name) {
+            Map.put(first, binds[i].name, i)
+        }
+    }
+    let done = Map.new()
+    for component in Deps.sccs(callGraph(binds)) {
+        for name in component {
+            match Map.get(first, name) {
+                Some(index) -> {
+                    let value = expr(r, binds[index].value)
+                    Map.put(done, index, value)
+                    memoize(r, name, value)
+                }
+                None -> {}
+            }
+        }
+    }
+    -- A name bound twice has one entry in the graph, so its later bindings are
+    -- in no component. Nothing else can be missing.
+    for var i = 0; i < len(binds); i = i + 1 {
+        if !Map.contains(done, i) { Map.put(done, i, expr(r, binds[i].value)) }
+    }
+    let split = len(program.dicts)
+    let dicts = Array.new(split)
+    for var i = 0; i < split; i = i + 1 {
+        Array.push(dicts, withValue(program.dicts[i], Map.getOr(done, i,
+            program.dicts[i].value)))
+    }
+    let rest = Array.new(len(program.binds))
+    for var i = 0; i < len(program.binds); i = i + 1 {
+        Array.push(rest, withValue(program.binds[i], Map.getOr(done, split + i,
+            program.binds[i].value)))
+    }
+    CProgram { dicts = dicts, binds = rest }
+}
+
+-- Record a top-level binding's reduced body for `bodyOf`.
+--
+-- Only the monomorphic ones: a binding with type binders is reduced again per
+-- instantiation, under a key that names the type arguments, and the
+-- uninstantiated body is not an answer to any of those.
+fun memoize(r : Reducer, name : String, value : Core) -> Unit {
+    let bind = match Map.get(r.bindings, name) {
+        Some(b) -> b
+        None -> return
+    }
+    if len(bind.binders) > 0 { return }
+    match value.kind {
+        CLam(_, body, _) ->
+            if !Map.contains(r.reduced, name + "|") {
+                Map.put(r.reduced, name + "|", body)
+            }
+        _ -> {}
     }
 }
 
@@ -423,6 +497,40 @@ fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
         _ -> oops("an inlinable binding whose value is not a lambda")
     }
     if len(params) != len(args) { return None }
+    -- The ceiling, asked of the body *as written*, before anything reduces it.
+    -- Asking it only of the reduced body -- which is what this did -- means the
+    -- reduction happens first and the answer is discarded, so a callee too
+    -- large to inline is fully optimized at every call site that names it,
+    -- nested inside that call site's own traversal.
+    --
+    -- `Turkey.Desugar#thread` is fifty nodes and sits in a twenty-one binding
+    -- cycle with `#expr`, the desugarer's whole expression walker. Reducing
+    -- `thread` reduced `expr` inside it, and then the stack. Nothing was gained
+    -- -- `expr` is refused on size the moment the question is finally asked.
+    --
+    -- It is also the size question GHC asks: its unfolding guidance is computed
+    -- from the term as written.
+    if written(r, name) > speculativeInlineLimit { return None }
+    -- A monomorphic callee is reduced in its own turn, and `reduceProgram`
+    -- takes those turns in dependency order, so by the time a caller is reached
+    -- every callee it can name is already in the memo. A cold one is therefore
+    -- a binding in the caller's own cycle whose turn has not come -- and
+    -- reducing it *here*, nested inside this traversal, is what the dependency
+    -- order exists to avoid.
+    --
+    -- Declining costs the inlining of a cycle's members into each other before
+    -- their turn, and keeps it after: the components come out of `Deps.sccs`
+    -- sorted, so a member is inlined into every later member and into none of
+    -- the earlier ones. That is the same arbitrary-but-stable choice the loop
+    -- breaker already makes, and for the same reason.
+    --
+    -- Type instantiation is exempt: `reduceProgram` warms no key that names
+    -- type arguments, so a cold one there means "not asked for yet" rather than
+    -- "not its turn", and that nesting is bounded anyway.
+    match targs {
+        None -> if !Map.contains(r.reduced, key) { return None }
+        Some(_) -> {}
+    }
     -- The *reduced* body drives the ordinary limit, not the written one. A
     -- small source body that expands to five hundred nodes is five hundred
     -- nodes at every call site.
@@ -461,13 +569,42 @@ fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
         None -> return None
     }
     if size <= limit { return Some(made) }
+    -- Restored to what it was, not to `False`. Speculation is meant not to
+    -- nest -- the flag is the whole mechanism for that -- and clearing it on
+    -- the way out of an inner speculation re-armed the outer one, so a chain of
+    -- large calls could speculate at every level after all. That is unbounded
+    -- rather than merely expensive: the traversal's depth grew with whatever
+    -- stack it was given.
+    let was = r.speculating
     r.speculating = True
     let residual = expr(r, made)
-    r.speculating = False
+    r.speculating = was
     if sizeOf_(residual) <= limit { Some(residual) } else { None }
 }
 
 -- `size` of a reduced body, once per binding rather than per site.
+-- `size` of a binding's body as written, once per binding.
+--
+-- Type instantiation copies a body without changing its shape, so this is asked
+-- of the name rather than of the key: every specialization of `name` has the
+-- same written size.
+fun written(r : Reducer, name : String) -> Int = match Map.get(r.wrote, name) {
+    Some(found) -> found
+    None -> {
+        let bind = match Map.get(r.bindings, name) {
+            Some(b) -> b
+            None -> oops("no binding named '" + name + "'")
+        }
+        let body = match bind.value.kind {
+            CLam(_, inner, _) -> inner
+            _ -> bind.value
+        }
+        let found = sizeOf_(body)
+        Map.put(r.wrote, name, found)
+        found
+    }
+}
+
 fun sizeOf(r : Reducer, key : String, body : Core) -> Int = match Map.get(r.sizes, key) {
     Some(found) -> found
     None -> {

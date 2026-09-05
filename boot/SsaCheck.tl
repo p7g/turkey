@@ -1,12 +1,11 @@
 -- A second entry point in `boot/`, whose whole job is to instantiate
--- `Turkey.Ssa`.
+-- `Turkey.Ssa` with `Turkey.LowIr` and exercise what they provide.
 --
--- Nothing else imports that module yet -- the lowering into it is the next
+-- Nothing else imports either module yet -- the lowering into them is the next
 -- phase -- and a module nothing imports is not type-checked, which for a
--- compiler under construction means it rots quietly. This instantiates the
--- `Inst` class with a stand-in instruction and exercises the analyses on a
--- graph that has a real dominance question in it: a diamond, whose merge
--- block is dominated by neither arm.
+-- compiler under construction means it rots quietly. So this builds a graph
+-- with a real dominance question in it, a diamond whose merge block is
+-- dominated by neither arm, and then breaks it.
 --
 -- Deliberately in `boot/` rather than in `tests/programs/`: a program there is
 -- part of the conformance corpus and of the `test_boot` differential, and this
@@ -17,37 +16,8 @@ import Turkey.Ssa
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..), Term(..),
                    Block(..), Func(..), Inst(..), Effects(..))
-
--- A stand-in instruction, enough to have uses and defs.
-type Toy = Toy {
-    name   : String,
-    uses_  : Array Value,
-    defs_  : Array Value,
-    effect : Effects,
-}
-
-instance Inst Toy {
-    fun uses(t) = t.uses_
-    fun defs(t) = t.defs_
-    fun effects(t) = t.effect
-    fun render(t) {
-        let b = String.builder()
-        for var i = 0; i < len(t.defs_); i = i + 1 {
-            if i > 0 { String.push(b, ", ") }
-            String.push(b, "%" + Int.toString(Ssa.valueId(t.defs_[i])))
-        }
-        if len(t.defs_) > 0 { String.push(b, " = ") }
-        String.push(b, t.name)
-        for u in t.uses_ {
-            String.push(b, " %" + Int.toString(Ssa.valueId(u)))
-        }
-        String.build(b)
-    }
-}
-
-fun toy(name : String, uses_ : Array Value, defs_ : Array Value) -> Toy = Toy {
-    name = name, uses_ = uses_, defs_ = defs_, effect = Ssa.pureEffect(),
-}
+import Turkey.LowIr as L
+import Turkey.LowIr (Op(..), Low(..), BinOp(..), CmpOp(..), Callee(..))
 
 fun main() {
     let i64 = Ssa.untraced(I64)
@@ -59,21 +29,24 @@ fun main() {
     --    b1  b2
     --     \  /
     --      b3(x)
-    -- `b3` is dominated by `b0` and by neither arm.
+    -- The merge is dominated by the split and by neither arm, which is the
+    -- smallest graph where the answer is not obvious from the block order.
     for _ in [0, 1, 2, 3] { Array.push(f.blocks, Ssa.newBlock()) }
 
+    let zero = Ssa.freshValue(f, i64)
     let cond = Ssa.freshValue(f, i1)
     let one = Ssa.freshValue(f, i64)
     let two = Ssa.freshValue(f, i64)
     let merged = Ssa.freshValue(f, i64)
 
-    Array.push(f.blocks[0].insts, toy("mkcond", Array.new(0), [cond]))
+    Array.push(f.blocks[0].insts, L.low(zero, ConstInt(0)))
+    Array.push(f.blocks[0].insts, L.low(cond, Cmp(Eq, zero, zero)))
     f.blocks[0].term = Branch(cond, BlockId(1), BlockId(2))
 
-    Array.push(f.blocks[1].insts, toy("const1", Array.new(0), [one]))
+    Array.push(f.blocks[1].insts, L.low(one, ConstInt(1)))
     f.blocks[1].term = Jump(BlockId(3), [one])
 
-    Array.push(f.blocks[2].insts, toy("const2", Array.new(0), [two]))
+    Array.push(f.blocks[2].insts, L.low(two, Bin(Add, zero, zero)))
     f.blocks[2].term = Jump(BlockId(3), [two])
 
     Array.push(f.blocks[3].params, merged)
@@ -87,17 +60,43 @@ fun main() {
     print("b1 dom b3: " + showBool(Ssa.dominates(idom, BlockId(1), BlockId(3))))
     print("b1 dom b1: " + showBool(Ssa.dominates(idom, BlockId(1), BlockId(1))))
 
-    let clean = Ssa.verify(f)
-    print("verify (expect none): " + Int.toString(len(clean)))
-    for m in clean { print("  " + m) }
+    report("verify", Ssa.verify(f))
+    report("reps", repComplaints(f))
 
-    -- Now break it: use `one`, defined in b1, from b2, which b1 does not
-    -- dominate. This is the check the Python backend's block-local rule
-    -- cannot make.
-    Array.push(f.blocks[2].insts, toy("use", [one], Array.new(0)))
-    let broken = Ssa.verify(f)
-    print("verify (expect a dominance complaint): " + Int.toString(len(broken)))
-    for m in broken { print("  " + m) }
+    -- What an unused instruction may cost. `add` traps on overflow, so it
+    -- stays even when nothing reads it; `and` does not, so it may go.
+    print("add deletable: " + showBool(Ssa.deletable(L.effectsOf(Bin(Add, zero, zero)))))
+    print("and deletable: " + showBool(Ssa.deletable(L.effectsOf(Bin(And, zero, zero)))))
+    print("object.new is a safepoint: "
+          + showBool(Ssa.isSafepoint(L.effectsOf(ObjectNew(1, 0, 2, 0)))))
+    print("array.get is a safepoint: "
+          + showBool(Ssa.isSafepoint(L.effectsOf(ArrayGet(zero, zero)))))
+
+    -- Break it two ways. `two` is defined in b2, which does not dominate b1;
+    -- and a comparison's operands must agree in representation.
+    Array.push(f.blocks[1].insts, L.low(Ssa.freshValue(f, i64), Neg(two)))
+    Array.push(f.blocks[0].insts, L.low(Ssa.freshValue(f, i1), Cmp(Lt, zero, cond)))
+    report("verify after breaking it", Ssa.verify(f))
+    report("reps after breaking it", repComplaints(f))
+}
+
+-- The two verifiers are separate on purpose: `Ssa.verify` owns the shape of
+-- the graph and dominance, and knows nothing about opcodes; `L.checkReps`
+-- owns what an operation requires of its operands. Composing them is the
+-- caller's job, which is what keeps target knowledge out of the generic layer.
+fun repComplaints(f : Ssa.Func Low) -> Array String {
+    let out = Array.new(2)
+    for block in f.blocks {
+        for i in block.insts {
+            for m in L.checkReps(f, i) { Array.push(out, m) }
+        }
+    }
+    out
+}
+
+fun report(what : String, messages : Array String) -> Unit {
+    print(what + ": " + Int.toString(len(messages)))
+    for m in messages { print("  " + m) }
 }
 
 fun showBool(b : Bool) -> String = if b { "yes" } else { "no" }

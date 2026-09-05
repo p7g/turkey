@@ -1,7 +1,8 @@
 module Turkey.Ssa (
     Value(..), valueId, BlockId(..), blockId,
     RepClass(..), Rep(..), traced, untraced, repEq, showRep,
-    Effects(..), pureEffect, reads_, writes, allocates, diverges, isSafepoint,
+    Effects(..), pureEffect, reads_, writes, allocates, traps, diverges,
+    isSafepoint, deletable,
     Term(..), successors,
     Block(..), newBlock, Func(..), newFunc,
     Inst(..),
@@ -128,15 +129,23 @@ fun showRep(r : Rep) -> String {
 -- It is here from the first commit even though nothing reads it until
 -- allocation exists, because retrofitting precise stack maps into a backend
 -- that did not plan for them is the rewrite this design is avoiding.
+-- `traps` and `diverges` are different questions and the instruction set found
+-- the difference. `diverges` is "never returns", which the Python backend
+-- already tracks for a call to a bottoming function. `traps` is "may not
+-- return" -- an `add` that overflows panics (PRIMITIVES.md 1.1), and a
+-- dead-code pass may not delete one on the grounds that its result is unused.
 type Effects = Effects {
     reads     : Bool,
     writes    : Bool,
     allocates : Bool,
+    traps     : Bool,
     diverges  : Bool,
 }
 
-fun pureEffect() -> Effects =
-    Effects { reads = False, writes = False, allocates = False, diverges = False }
+fun pureEffect() -> Effects = Effects {
+    reads = False, writes = False, allocates = False, traps = False,
+    diverges = False,
+}
 
 fun reads_() -> Effects {
     let e = pureEffect()
@@ -162,7 +171,21 @@ fun diverges() -> Effects {
     e
 }
 
+fun traps() -> Effects {
+    let e = pureEffect()
+    e.traps = True
+    e
+}
+
 fun isSafepoint(e : Effects) -> Bool = e.allocates
+
+-- May an instruction whose result is unused be deleted?
+--
+-- Not the same as "pure". A read may be deleted -- reading has no effect on
+-- anything else -- and so may an allocation, since a collection is not
+-- observable. What may not be deleted is a write, a trap or a divergence,
+-- because each is the whole reason the instruction is there.
+fun deletable(e : Effects) -> Bool = !e.writes && !e.traps && !e.diverges
 
 -- -- the graph ----------------------------------------------------------------------
 

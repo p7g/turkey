@@ -260,15 +260,25 @@ that is free in C and costs Turkey the main thing its type system offers.
 Ordered by what they buy against what they cost. None is a phase-0 commitment;
 they are recorded because the shape chosen now is what makes them available.
 
-**Make "register allocated" a type.** Parameterize over the value type as well
-as the instruction: `Func Virtual MachInst` before allocation and
-`Func Physical MachInst` after. A virtual register then becomes unrepresentable
-in allocated code, which is a whole class of allocator bug that stops
-compiling. LLVM tracks the same facts -- `isSSA`, `NoVRegs`, `TracksLiveness`
--- as *runtime properties* on `MachineFunction`, checked when someone
-remembers. This is the highest-value item on the list, because the allocator is
-the component whose bugs are both easy to write and invisible in a conformance
-run.
+**~~Make "register allocated" a type.~~** Withdrawn, and it was listed here
+first and highest. The idea was to parameterize over the value type as well as
+the instruction -- `Func Virtual MachInst` before allocation, `Func Physical
+MachInst` after -- so that a virtual register is unrepresentable in allocated
+code. LLVM tracks the same facts as *runtime properties* on `MachineFunction`
+(`isSSA`, `NoVRegs`, `TracksLiveness`), checked when someone remembers.
+
+The better answer is that allocation results should not be in the IR at all.
+Cranelift moved to exactly that: with regalloc2, `VCode::emit` "is almost
+completely immutable, due to keeping regalloc2 results on-the-side and using
+the pre-regalloc code plus regalloc results on the fly, rather than editing
+in-place as before". If the code always holds virtual values and a table says
+where each one lives, there is no phase in which a virtual register is illegal
+and nothing to mistype. It also removes a rewrite pass and a third
+instantiation.
+
+Fixed registers for the calling convention are then *operand constraints* on
+virtual values, which is regalloc2's own design, rather than physical
+registers in the instruction stream. So `Value` and `Term` stay monomorphic.
 
 **Generic passes, not just generic analyses.** Dead-code elimination and copy
 elimination need only `uses` and `defs`, so they are written once and run
@@ -326,6 +336,26 @@ A representation is two facts, not one: a register class (`I1 I8 I32 I64 F64
 Ptr`) and whether the collector must trace the value. The Python IR spells this
 as `PTR` versus `BOXED`, two members of one enum, which works until something
 asks a register class about a `BOXED`.
+
+**A value's representation lives in a side table, and that is forced rather
+than chosen.** The alternative is a self-describing value carrying its own
+representation, which is what LLVM and Go have -- and both can, because a value
+there is a *pointer* to one shared object. Turkey records have reference
+semantics and no identity (FINDINGS 10), so such a value would be *copied* at
+every mention and two mentions of one value would be two records agreeing only
+by convention: an inconsistent state made representable, in order to avoid a
+table. It would also cost, since `Value` is a newtype and erases to a machine
+word, so the hottest query a backend has answers a packed array of integers
+rather than an array of pointers. Cranelift reaches the same shape from the
+same constraint, with `Value` an index and `DataFlowGraph::value_type` the
+lookup.
+
+What the table costs is ergonomic, and a builder pays it: a value cannot be
+made without being given a representation and an instruction cannot be
+appended except through a cursor that does, so the table cannot fall out of
+step. There is one such table and it is persistent; everything else an analysis
+needs -- dominance, liveness, definition sites -- is computed and thrown
+away.
 
 Beside the opcode ADT, two functions derived from it by one `match` each:
 

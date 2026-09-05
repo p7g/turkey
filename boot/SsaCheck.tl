@@ -31,26 +31,31 @@ fun main() {
     --      b3(x)
     -- The merge is dominated by the split and by neither arm, which is the
     -- smallest graph where the answer is not obvious from the block order.
-    for _ in [0, 1, 2, 3] { Array.push(f.blocks, Ssa.newBlock()) }
+    -- Built through `L.Builder`, which is what keeps the representation table
+    -- in step: a value cannot be made without being given one, and an
+    -- instruction cannot be appended except through a cursor that does.
+    let b = L.builder(f, BlockId(0))
+    let b0 = L.block(b)
+    let b1 = L.block(b)
+    let b2 = L.block(b)
+    let b3 = L.block(b)
+    L.into(b, b0)
 
-    let zero = Ssa.freshValue(f, i64)
-    let cond = Ssa.freshValue(f, i1)
-    let one = Ssa.freshValue(f, i64)
-    let two = Ssa.freshValue(f, i64)
-    let merged = Ssa.freshValue(f, i64)
+    let zero = L.emit(b, ConstInt(0), i64)
+    let cond = L.emit(b, Cmp(Eq, zero, zero), i1)
+    L.terminate(b, Branch(cond, b1, b2))
 
-    Array.push(f.blocks[0].insts, L.low(zero, ConstInt(0)))
-    Array.push(f.blocks[0].insts, L.low(cond, Cmp(Eq, zero, zero)))
-    f.blocks[0].term = Branch(cond, BlockId(1), BlockId(2))
+    L.into(b, b1)
+    let one = L.emit(b, ConstInt(1), i64)
+    L.terminate(b, Jump(b3, [one]))
 
-    Array.push(f.blocks[1].insts, L.low(one, ConstInt(1)))
-    f.blocks[1].term = Jump(BlockId(3), [one])
+    L.into(b, b2)
+    let two = L.emit(b, Bin(Add, zero, zero), i64)
+    L.terminate(b, Jump(b3, [two]))
 
-    Array.push(f.blocks[2].insts, L.low(two, Bin(Add, zero, zero)))
-    f.blocks[2].term = Jump(BlockId(3), [two])
-
-    Array.push(f.blocks[3].params, merged)
-    f.blocks[3].term = Ret(merged)
+    let merged = L.param(b, b3, i64)
+    L.into(b, b3)
+    L.terminate(b, Ret(merged))
 
     print(Ssa.showFunc(f))
 
@@ -74,8 +79,10 @@ fun main() {
 
     -- Break it two ways. `two` is defined in b2, which does not dominate b1;
     -- and a comparison's operands must agree in representation.
-    Array.push(f.blocks[1].insts, L.low(Ssa.freshValue(f, i64), Neg(two)))
-    Array.push(f.blocks[0].insts, L.low(Ssa.freshValue(f, i1), Cmp(Lt, zero, cond)))
+    L.into(b, b1)
+    discard(L.emit(b, Neg(two), i64))
+    L.into(b, b0)
+    discard(L.emit(b, Cmp(Lt, zero, cond), i1))
     report("verify after breaking it", Ssa.verify(f))
     report("reps after breaking it", repComplaints(f))
 }
@@ -99,4 +106,6 @@ fun report(what : String, messages : Array String) -> Unit {
     for m in messages { print("  " + m) }
 }
 
-fun showBool(b : Bool) -> String = if b { "yes" } else { "no" }
+fun showBool(x : Bool) -> String = if x { "yes" } else { "no" }
+
+fun discard(x : a) -> Unit = {}

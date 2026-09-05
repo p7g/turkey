@@ -1,6 +1,7 @@
 module Turkey.LowIr (
     BinOp(..), CmpOp(..), Conv(..), Callee(..), Op(..), Low(..),
     low, effectsOf, opUses, opResultRep, checkReps,
+    Builder(..), builder, into, emit, effect, terminate, block, param,
 )
 
 -- The virtual instruction set: what `Turkey.Ssa`'s graph is instantiated with
@@ -35,7 +36,8 @@ module Turkey.LowIr (
 -- in two places. Instruction selection expands these; that is its job.
 
 import Turkey.Ssa as Ssa
-import Turkey.Ssa (Value(..), Rep(..), RepClass(..), Effects(..), Inst(..))
+import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..),
+                   Effects(..), Inst(..), Term(..), Block(..), Func(..))
 
 type BinOp = Add | Sub | Mul | Div | Rem | And | Or | Xor | Shl | Shr | ShrU
 
@@ -113,6 +115,80 @@ type Low = Low {
 }
 
 fun low(result : Value, op : Op) -> Low = Low { result = result, op = op }
+
+-- -- building ------------------------------------------------------------------------
+
+-- A cursor into one block of one function.
+--
+-- The side table `Ssa.Func` keeps -- a value's representation, indexed by its
+-- id -- is not optional, and this is what makes it invisible. A value cannot
+-- be made without being given a representation, and there is no way to append
+-- an instruction that does not go through here, so the table cannot fall out
+-- of step with the instructions.
+--
+-- The alternative is a self-describing value, `Value { id, rep }`, which is
+-- what LLVM and Go have -- and both can, because a value there is a *pointer*
+-- to one shared object. Turkey records have reference semantics and no
+-- identity (FINDINGS 10), so a value carrying its own representation would be
+-- *copied* at every mention, and two mentions of one value would be two
+-- records that agree only by convention. That is an inconsistent state made
+-- representable, to avoid a table. It would also cost: `Value` is a newtype
+-- and erases to a machine word, so `uses` answers a packed array of integers
+-- rather than an array of pointers, in the hottest query a backend has.
+--
+-- Cranelift reaches the same shape from the same constraint: a `Value` is an
+-- index and `DataFlowGraph::value_type` is the lookup.
+type Builder = Builder {
+    func : Ssa.Func Low,
+    at   : Ssa.BlockId,
+}
+
+fun builder(f : Ssa.Func Low, at : Ssa.BlockId) -> Builder =
+    Builder { func = f, at = at }
+
+-- Move the cursor. Blocks are built in whatever order the lowering finds
+-- them, so this is ordinary rather than exceptional.
+fun into(b : Builder, at : Ssa.BlockId) -> Unit { b.at = at }
+
+-- Append an operation and answer the value it defines.
+--
+-- The representation is given rather than derived, because for `ObjectGet`,
+-- `ArrayGet`, `Call`, `SlotLoad` and `Unbox` only the caller knows it. Where
+-- the opcode *does* determine it, `checkReps` says so afterwards -- which is
+-- the right division: the builder is for convenience and the verifier is for
+-- truth, and a builder that panicked here would be a second opinion about
+-- what an opcode means.
+fun emit(b : Builder, op : Op, r : Rep) -> Value {
+    let v = Ssa.freshValue(b.func, r)
+    Array.push(Ssa.blockAt(b.func, b.at).insts, low(v, op))
+    v
+}
+
+-- An operation evaluated for its effect. The value it defines is a `unit`
+-- nothing reads, which is what keeps every instruction defining exactly one.
+fun effect(b : Builder, op : Op) -> Unit {
+    discard(emit(b, op, Ssa.untraced(I64)))
+}
+
+fun terminate(b : Builder, t : Ssa.Term) -> Unit {
+    Ssa.blockAt(b.func, b.at).term = t
+}
+
+-- A new empty block, and its id.
+fun block(b : Builder) -> Ssa.BlockId {
+    let id = len(b.func.blocks)
+    Array.push(b.func.blocks, Ssa.newBlock())
+    Ssa.BlockId(id)
+}
+
+-- A parameter of a block, which is where a phi would be.
+fun param(b : Builder, at : Ssa.BlockId, r : Rep) -> Value {
+    let v = Ssa.freshValue(b.func, r)
+    Array.push(Ssa.blockAt(b.func, at).params, v)
+    v
+}
+
+fun discard(x : a) -> Unit = {}
 
 -- What each operation may do. The verifier does not read this; the
 -- optimizations and, eventually, the register allocator's stack maps do.

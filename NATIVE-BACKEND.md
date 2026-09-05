@@ -20,9 +20,12 @@ draft that the prior art contradicted:
    optimizer sits below -- it is already a CFG with block parameters, and the
    optimizations that belong at a high level are already in it. The new IR is a
    *low* IR, and there are two of them in the compiler, not three.
-2. **One low IR, all the way to machine code.** Instruction selection rewrites
-   it in place and register allocation annotates it. QBE does exactly this and
-   is the existence proof at the scale this is aiming for.
+2. **One IR *framework*, two instantiations.** The CFG is parameterized over
+   its instruction type, so dominance, liveness, the printer and the generic
+   passes are written once and instruction selection produces a different
+   instruction type rather than rewriting the same one in place. This is
+   neither QBE's single IL nor LLVM's IR pair; it is the thing Turkey makes
+   cheap and C does not.
 3. **Four optimizations, chosen because someone measured.** Not a menu.
 
 ## Prior art, and what it settles
@@ -148,9 +151,74 @@ to be tempted by.
 recursive modules (FINDINGS 31), so the layering is enforced rather than
 merely intended: the IR module cannot know about its passes.
 
-**Concrete types in the hot paths.** Dictionary passing is a real cost past
-`mono`'s cap, so the IR is one ADT rather than a class with instances, and the
-selector matches on it directly.
+**Parametric containers, concrete payloads.** The CFG is generic in its
+instruction type and the instruction types are plain ADTs, so the generic
+machinery is written once while every `match` on an actual instruction is
+direct. There are two instantiations, so `mono` specializes both and the
+generality costs nothing at run time.
+
+## Why two instruction types, and one CFG
+
+Raised as an objection to the second draft, and it holds: declaring a datatype
+is cheap in Turkey and expensive in C, so a design that copies QBE's economies
+is copying a constraint this language does not have.
+
+But the declaration is not what makes a second IR expensive, in any language.
+The bill is the machinery around it -- dominance, liveness, loop nesting, CFG
+traversal, the printer, the verifier's skeleton, dead-code elimination --
+written a second time against a second set of accessors. Beside that, C's
+struct boilerplate is a rounding error, which is why QBE and Cwerg avoid the
+second IR rather than the second copy of `dominators()`.
+
+Turkey can delete the bill instead of the IR. The CFG is parameterized over its
+instruction type:
+
+```
+type Block i = Block { params : Array Value, insts : Array i, term : Term }
+type Func  i = Func  { blocks : Array (Block i), entry : Int, ... }
+```
+
+Terminators stay in the shared part, because they are what the CFG is made of
+and both levels branch and jump. Everything an analysis needs of an instruction
+-- what it reads, what it defines, what it may do -- is a small class:
+
+```
+class Inst i { fun uses(i) -> Array Value
+               fun defs(i) -> Array Value
+               fun effects(i) -> Effects }
+```
+
+Dominance, liveness, loop nesting, the printer skeleton, dead-code elimination
+and copy elimination are then written *once*, generic in `i`, and run before
+and after instruction selection alike. There are exactly two instantiations, so
+`mono` specializes both and none of this is paid for at run time.
+
+**And there is an argument for two instruction types that is specific to this
+language, which the second draft missed.** The reason to make an opcode an ADT
+rather than a string is that Turkey checks `match` for exhaustiveness, so a new
+opcode is a compile error everywhere it must be handled. Rewriting one IL in
+place means that ADT has to contain the machine instructions too -- and then
+sparse conditional constant propagation, which can never see an `arm64.ldr`,
+must either carry an arm for it or a catch-all. The catch-all is exactly what
+the ADT was chosen to prevent, and it would be added in every low-level pass on
+the first day a target existed. QBE pays nothing for this because C has no
+exhaustiveness to lose.
+
+What the split buys, then:
+
+* **A typed phase boundary.** After selection, a virtual opcode is not
+  representable. In an in-place scheme the IR holds a mixture partway through
+  and nothing checks it.
+* **Exhaustiveness that stays meaningful** on both sides of that boundary.
+* **Machine-shaped instructions.** Two-address forms, fixed physical registers
+  for the calling convention, condition flags and register constraints are
+  natural in a machine instruction and are optional-and-usually-meaningless
+  fields in a virtual one.
+* **Selection becomes testable on its own.** Its output is a value with a
+  printer, so it can be golden-tested without a register allocator existing.
+
+What it costs is one more ADT with its `Inst` instance and its printer. That is
+the cost the objection correctly identified as small.
 
 ## The low IR
 
@@ -211,9 +279,8 @@ what they replaced it with, and is more machinery than this budget carries. A
 table interpreted at compile time is the middle, and it is what QBE ships.
 
 **Allocation is linear scan with hinting, with the spiller split out**, which
-SSA is what makes possible. Physical registers become a field on the value
-rather than a new IR: this is the reason one IR suffices, and it is where the
-earlier draft of this document was wrong.
+SSA is what makes possible. It runs on the machine instantiation only, and
+assigns physical registers to the values a machine instruction already names.
 
 **Stack maps come out of the allocator**, because it is the only pass that
 knows where a value is at a given point.
@@ -289,15 +356,21 @@ Core is already a CFG with block parameters and already carries the term-level
 optimizations; a second high-level IR would duplicate its structure to hold
 optimizations that are better written where a golden checks them.
 
-### A separate machine IR after instruction selection
+### Two fully separate IRs, each with its own CFG
 
-Also in the earlier draft, on the argument that every backend converges on two.
-Every backend an order of magnitude larger does. QBE selects instructions by
-rewriting its one IL in place and allocates registers over the result, which is
-the same job at this scale, and the second IR is a cost -- another datatype,
-another printer, another verifier, another lowering -- paid for a retargeting
-ambition that does not exist yet. If a second target proves it necessary, the
-selector is where it will be added, and the low IR will not have to change.
+The first draft's proposal, and the reason it looked expensive: dominance,
+liveness, CFG traversal, the printer and dead-code elimination would all be
+written twice. That cost is real and is what the parameterized CFG removes; it
+is not an argument against having two *instruction* types.
+
+### QBE's single IL, rewritten in place by the selector
+
+The second draft's proposal, and wrong for a reason particular to this
+language. See "Why two instruction types" above: one opcode ADT containing both
+virtual and machine instructions makes every low-IR pass carry arms for
+opcodes it can never see, and the catch-all that avoids that is the thing an
+ADT was chosen to prevent. QBE pays nothing for this because C has no
+exhaustiveness to lose.
 
 ### Port `turkey/backend_ir.py` and extend it
 

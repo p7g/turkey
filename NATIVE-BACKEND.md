@@ -4,300 +4,337 @@ Status: proposal
 
 ## Summary
 
-`boot` owns the whole path from optimized Core to machine code: an SSA IR, the
-optimizations over it, instruction selection, register allocation, and object
-emission. Written in Turkey, in `boot/`, and nothing above it changes -- the
-front end, the elaboration, `mono`, `opt` and layout sharing are already two
-implementations that agree, and this proposal does not touch them.
+`boot` owns the path from optimized Core to machine code: one low-level SSA IR,
+a small set of optimizations over it, instruction selection, register
+allocation, and object emission. Written in Turkey, in `boot/`.
 
-The Python implementation's backend (`turkey/backend_ir.py`,
-`backend_lower.py`, `llvmgen.py`) is left as it is. It is a JIT: it will never
-do register allocation or instruction selection, so hardening its IR to prepare
+The Python implementation's backend is left as it is. It is a JIT: it will
+never select instructions or allocate registers, so hardening its IR to prepare
 for those is work on the wrong artifact. It stays the differential oracle for
-everything above Core, and takes bug fixes only.
+everything above Core, and takes fixes only.
 
-The design's organizing decision is a line between what must never be rewritten
-and what is expected to be replaced:
+Three decisions carry the design, and the first two are revisions of an earlier
+draft that the prior art contradicted:
 
-```text
-optimized Core
-  -> Turkey.Ssa                 durable: the IR, its verifier, its printer
-  -> optimizations over it      durable
-  -> ...
-       -> LLVM IR text          replaceable: the first emitter
-       -> machine IR            the second emitter: isel, regalloc, encoding
-```
+1. **Core is the high IR.** It is not "the front end's output" that a proper
+   optimizer sits below -- it is already a CFG with block parameters, and the
+   optimizations that belong at a high level are already in it. The new IR is a
+   *low* IR, and there are two of them in the compiler, not three.
+2. **One low IR, all the way to machine code.** Instruction selection rewrites
+   it in place and register allocation annotates it. QBE does exactly this and
+   is the existence proof at the scale this is aiming for.
+3. **Four optimizations, chosen because someone measured.** Not a menu.
 
-Everything above the last arrow is written once. The first emitter exists so
-the durable half is exercised, and wrong where it is wrong, long before a
-register allocator exists to confuse the question.
+## Prior art, and what it settles
 
-## Goals
+Read before designing, because two of these answer questions this document
+otherwise would have guessed at.
 
-* An SSA IR that instruction selection and register allocation can be built on
-  without changing its shape.
-* Precise garbage collection through stack maps rather than through rooting
-  every pointer (FINDINGS 55).
-* Optimizations that Core cannot express, at the level where they are cheap.
-* A verification story that does not depend on the Python backend's design.
-* Native code for one target, with LLVM remaining available.
+**QBE** aims to "provide 70% of the performance of industrial optimizing
+compilers in 10% of the code", and says the size limit is the point: it
+"constrains QBE to focus on the essential". It is SSA, it uses one IL through
+every stage, and instruction selection rewrites that IL in place using a
+bottom-up tree-matching algorithm inherited from Ken Thompson's Plan 9 C
+compiler. Its optimization set is *copy elimination, sparse conditional
+constant propagation, dead instruction elimination, and registerization of
+small stack slots*, plus a loop-based spilling heuristic. Its allocator is
+linear scan with hinting, and it notes that SSA lets the spiller and the
+allocator be separate passes, which is "simpler and faster than graph
+coloring".
 
-## Non-goals
+That is the target shape. It is a complete backend, it is fast, and it is
+roughly the size budget this project can carry.
 
-* Changing the Python backend, beyond fixes.
-* Matching the Python backend's IR, its value names, or its emitted LLVM.
-* Multiple targets before one works.
-* Replacing `opt`. Inlining, case-of-known-constructor and join specialization
-  happen on Core and stay there; the SSA level does the machine-level ones Core
-  cannot see, and redoing either at both levels is how the two disagree.
+**Cwerg** budgets "10kLOC (target independent code)" and "5kLOC (per target)",
+and de-emphasizes code quality -- aiming within 50% of state of the art -- for
+a codebase one developer can hold. Its README states a rule this document
+adopts outright: *"Sophisticated optimizations in the backend, like loop
+optimization. These are best left to the frontend."*
 
-## What the Python backend got right, and what it did not
+**GHC** is the closest analogue for where an optimization belongs, because it
+has the same shape of pipeline. CSE, float-out (which is loop-invariant code
+motion), float-in, specialization and the simplifier are all **Core-to-Core**.
+The machine level, Cmm, gets *sinking* and *common block elimination* and not
+much else. There is also a second CSE at the STG level whose job is to common
+up expressions "that differ in their types, but not their representation" --
+which is precisely the distinction Turkey's layout sharing is built on, and the
+one argument for any CSE below Core at all.
 
-`turkey/backend_ir.py` is 253 lines and worth reading before designing
-anything, because one of its decisions is the one that would have forced a
-rewrite and it was made correctly.
+**Cranelift** contributes two lessons rather than a shape, since its budget is
+an order of magnitude larger. Its handwritten lowering code ossified: the API
+"was ossifying as more and more handwritten backend code came to depend on its
+subtle details, making refactors very hard or impossible", which is why
+instruction selection became a DSL. And fuzzing "proved incredibly effective"
+in moving to a new register allocator "with no serious issues despite the high
+complexity". The first says table-driven selection rather than handwritten. The
+second says the allocator needs a fuzzer, not a test suite.
 
-**Block parameters rather than phi nodes.** `Block.params` with
-`Jump(target, args)`, which is Cranelift's form, Swift SIL's and MLIR's. It
-matters more than anything else here: a jump carrying arguments *is* a parallel
-copy at a named point, which is exactly what going out of SSA and allocating
-registers need. Phi nodes put the copy on an edge that has no place to live,
-and every allocator that meets them has to reconstruct what block arguments
-state directly. This proposal keeps it unchanged.
+**Block parameters over phi nodes** is settled and stays. The choice is where
+the binding on a control-flow edge lives -- source block or target block -- and
+"more recent compilers instead use block arguments", because phis "are
+pseudo-instructions existing as the leading instructions in a basic block, and
+you may well need to special-case them in transformation or analysis passes".
+`turkey/backend_ir.py` already has this right and it is the one thing carried
+across unchanged.
 
-Three things do not carry over, and each is in the layer that must not be
-rewritten later:
+## Core is the high IR
 
-* **SSA is block-local.** `_check_function` rebuilds `local` per block, so a
-  value defined in one block cannot be used in another; anything crossing an
-  edge goes through `Function.slots`, which are memory. Under that rule
-  promoting memory to registers is mandatory rather than an optimization, and
-  every pass that wants to move a computation starts by undoing the lowering's
-  own work.
-* **An opcode is a string.** `Instruction(op="prim.arrayGet.i64", ...)`, with
-  every rule about what an opcode means -- its arity, its operand layouts, its
-  result -- living in `llvmgen` rather than beside the IR. LLVM re-verifies
-  downstream, so this costs nothing today. Instruction selection is a match on
-  opcodes, and a string cannot be matched exhaustively.
-* **There is no effects model.** `Instruction` carries `diverges` and nothing
-  else. Reordering, common-subexpression elimination and code motion all need
-  to know what an instruction reads, writes and allocates -- and so does
-  garbage collection, which is why the backend roots every pointer that is live
-  anywhere in a function into one array sized to the function's worst case.
-  `Turkey.Opt#expr` carries 481 of them.
+This is the question worth getting right before any code exists, and the answer
+is that the overlap is real and the fix is to stop planning a middle layer.
 
-## Proposed components
+Core already is a control-flow graph. `CJoin(name, params, body, rest)` is a
+labelled block with parameters and `CJump(name, args)` is a jump carrying
+arguments -- structurally the same thing the SSA IR's blocks are, arrived at
+from the functional side rather than the imperative one. `joins.discover` is
+the pass that finds them. What Core has that the low IR will not is types,
+nesting, closures and constructors; what the low IR has that Core does not is
+flat instruction sequences, explicit memory, and representations in place of
+types.
 
-### `boot/Turkey/Ssa.tl` -- the IR
+So the pipeline is **Core, then one low IR**, and the optimizations divide
+along a line that is easy to state:
 
-Values are a number and a *representation*; blocks take parameters; a function
-is a set of blocks with an entry.
+* **In Core:** anything expressible about *terms* -- inlining, case-of-case,
+  case-of-known-constructor, join specialization, dead code, let-floating.
+  These are there today. Constant folding, CSE and code motion belong here too
+  if they are wanted, and are not there yet.
+* **In the low IR:** anything that only exists *after* lowering -- address
+  arithmetic, bounds checks, tag tests, spills, the calling convention.
 
-```
-type Rep = Rep {
-    -- What a register has to hold. Instruction selection reads this.
-    class_ : RepClass,          -- I1 I8 I32 I64 F64 Ptr
-    -- Whether the collector must find this value at a safepoint. `Ptr` and
-    -- `Boxed` are one machine class and two different obligations, and the
-    -- Python backend spells the distinction as two members of one enum --
-    -- which works until something asks a register class about a `Boxed`.
-    traced : Bool,
-}
-```
+The practical argument for that line, beyond GHC's precedent: **a Core pass is
+verified for free.** `.opt` goldens are diffed byte-for-byte against the Python
+implementation across the whole corpus, so a CSE written in Core is checked by
+machinery that already exists and by a second implementation. A CSE written in
+the low IR is checked by running programs and hoping the difference shows.
 
-An instruction is an opcode, operands, an optional result, and a source
-position for panics.
+The one exception is GHC's own: a CSE that commons expressions differing in
+type but not in representation cannot be written in Core, because in Core they
+have different types. If that turns out to pay, it is a low-IR pass and it is a
+different pass from the Core one, not the same pass moved.
 
-**The opcode is an ADT.** This is the concrete reason to design rather than
-port: Turkey checks a `match` for exhaustiveness, so adding an opcode becomes a
-compile error in the verifier, the printer, every optimization and the
-selector. A string cannot do that, and the passes that would have to be found
-by hand are exactly the ones whose omissions are silent miscompiles.
+## Written in Turkey
 
-Beside the ADT, and derived from it by one `match` each:
+Previous milestones ported Python and tried to look like it. This one should
+not, and several of Turkey's constraints push toward what modern backends do
+anyway.
 
-* `signature(op) -> (Array Rep, Option Rep)` -- what the verifier checks.
-* `effects(op) -> Effects` -- `Pure`, `Reads`, `Writes`, `Allocates`,
-  `Diverges`. `Allocates` implies *may collect*, which is what makes an
-  instruction a safepoint.
+**Dense integer ids and side tables, not linked objects.** Turkey has no object
+identity (FINDINGS 10), so a value cannot be a node you point at -- it is an
+index, and everything known about it lives in arrays indexed by it. That is
+forced here, and it is also what Cranelift's entity references and Go's
+`ssa.Value` ids are. Liveness becomes bitsets over a dense range, and the
+register allocator's working sets become arrays rather than hash maps.
 
-### The verifier
+**One opcode ADT, matched exhaustively.** Turkey checks a `match` for
+exhaustiveness, so adding an opcode is a compile error in the verifier, the
+printer, every pass and the selector. This is the single biggest advantage over
+porting `backend_ir.py`, where an opcode is a string and the passes that forgot
+it are found at runtime or not at all. It has a price, and the price is the
+design constraint: the opcode set must stay small, which is an argument for a
+QBE-shaped low IR rather than an LLVM-shaped one.
 
-Run after every pass, as `bir.check` already is. It checks what the Python one
-checks -- block termination, jump arity and representation, branch conditions,
-return representation -- and two things it cannot:
+**Records for pass state, mutated in place.** A pass is a record of arrays and
+`var` fields, and its body is loops that assign. This is the procedural lean:
+the data is ML-shaped, the code is not a fold. `Array` beats `Map Int` wherever
+the key is dense, and after newtype erasure and layout sharing an `Array Int`
+is machine integers rather than boxes.
 
-* **Every use is dominated by its definition.** This is the function-wide SSA
-  rule, and having it is what lets the lowering stop routing values through
-  memory.
-* **Every instruction matches its opcode's signature.**
+**Panic for invariants, `Option` for absence.** A verifier failure is a
+compiler bug and should stop the compiler; a lookup that may miss returns
+`Option`. Turkey has no exceptions (FINDINGS 17), so there is no third choice
+to be tempted by.
 
-Dominance is computed here anyway, and the optimizations and the allocator both
-need it, so it is a shared analysis rather than a checking cost.
+**One module per pass, and the IR in its own.** Turkey has no mutually
+recursive modules (FINDINGS 31), so the layering is enforced rather than
+merely intended: the IR module cannot know about its passes.
 
-### `boot/Turkey/SsaLower.tl` -- Core to SSA
+**Concrete types in the hot paths.** Dictionary passing is a real cost past
+`mono`'s cap, so the IR is one ADT rather than a class with instances, and the
+selector matches on it directly.
 
-The *logic* of `turkey/backend_lower.py` -- closure conversion, pattern tests,
-join points, layout selection, the calling convention -- is correct and hard-won,
-and is the part to carry across. Its IR is not.
+## The low IR
 
-Two differences follow from function-wide SSA. Values that cross an edge become
-block arguments or plain dominating definitions rather than slots, so slots are
-left for what actually is mutable. And a safepoint is emitted where an
-allocating instruction is, rather than a root frame being opened for the whole
-function.
+Values are dense indices carrying a representation. Blocks take parameters,
+jumps carry arguments, and SSA is *function-wide*: a definition dominates its
+uses. That last part is the one substantive departure from
+`turkey/backend_ir.py`, where the rule is block-local and everything crossing
+an edge goes through memory -- which makes promoting memory to registers a
+precondition for every optimization instead of one of them.
 
-`turkey/backend_lower.py` is 1,579 lines doing closure conversion, layout
-selection, pattern lowering and rooting in one pass. The port should split
-those; that is a decision about a pass and does not reach the IR.
+A representation is two facts, not one: a register class (`I1 I8 I32 I64 F64
+Ptr`) and whether the collector must trace the value. The Python IR spells this
+as `PTR` versus `BOXED`, two members of one enum, which works until something
+asks a register class about a `BOXED`.
 
-### `boot/Turkey/SsaOpt.tl` -- optimizations
+Beside the opcode ADT, two functions derived from it by one `match` each:
 
-In dependency order, each behind the verifier:
+* `signature(op)` -- operand and result representations, which the verifier
+  checks;
+* `effects(op)` -- `Pure`, `Reads`, `Writes`, `Allocates`, `Diverges`.
 
-* simplify-CFG, copy propagation, constant folding, dead code elimination --
-  the ones that pay for themselves immediately and clean up after lowering;
-* global value numbering, and sparse conditional constant propagation;
-* loop-invariant code motion, which needs loop nesting;
-* bounds-check elimination and load forwarding through the record and array
-  opcodes, which are the ones this program is actually made of.
+**`Allocates` means may-collect, which means safepoint.** That one bit is what
+lets the register allocator emit a stack map -- which registers and spill slots
+hold traced values at each safepoint -- instead of rooting every pointer live
+anywhere in the function into one array. `Turkey.Opt#expr` carries 481 of those
+today (FINDINGS 55). Retrofitting precise stack maps into a backend that did
+not plan for them is the rewrite this design exists to avoid, so the bit is
+there from the first commit even though nothing reads it until phase 5.
 
-Not inlining, and not case-of-known-constructor. Core does those, `opt` is two
-implementations that agree about them, and a second opinion at this level is a
-disagreement waiting to be found by a golden.
+## The optimizations
 
-### `boot/Turkey/Llvm.tl` -- the first emitter
+Four, taken from QBE's set because it is the one that has been measured against
+a stated goal:
 
-SSA to LLVM IR text. No library: llvmlite is a Python binding and boot has no
-Python, so it prints `.ll` and hands it to `clang`. Textual output is also
-diffable and readable when it is wrong, which is the reason `turkey llvm`
-prints text rather than emitting through a builder.
+* **registerization of stack slots** -- mem2reg. The lowering emits slots for
+  what is genuinely mutable, and this promotes the rest.
+* **sparse conditional constant propagation** -- subsumes constant folding and
+  unreachable-block elimination in one pass, and after lowering it is what
+  removes bounds checks against known lengths and tag tests on known
+  constructors.
+* **copy elimination**.
+* **dead instruction elimination**.
 
-This is what makes `boot` self-sufficient, and it is where the durable half
-gets exercised. It is transitional: it stays as the reference the native path
-is checked against, for as long as that check is worth having, and it is
-expected to be dropped rather than maintained forever. Nothing in the IR above
-it is shaped to suit LLVM, so dropping it costs this module and nothing else.
+Plus loop nesting depth, which is not an optimization but is what the spiller
+needs to make good decisions, and is cheap once dominance exists.
 
-### `boot/Turkey/Machine.tl` -- the second emitter
+Not GVN, not LICM, not inlining. Core does the term-level ones and does them
+where a golden checks them; the rest are what Cwerg means by leaving loop
+optimization to the front end.
 
-After instruction selection: target instructions, physical and virtual
-registers, and the shape a register allocator wants. Derived, narrow, generated
-per target, and carrying no optimizations of its own beyond peepholes.
+## Instruction selection and register allocation
 
-Two IRs rather than one because every backend of this kind converges on two --
-LLVM IR and MachineIR, Cranelift's CLIF and VCode, Go's SSA and obj -- and
-because the alternative is the rewrite this document exists to avoid. A single
-IR that is target-independent enough to optimize and target-specific enough to
-allocate registers over does not stay one IR; it becomes two, later, under
-worse conditions.
+**Selection is table-driven, and rewrites the low IR in place.** Bottom-up tree
+matching over the instruction DAG, in the Thompson and QBE line: each node is
+numbered, a number identifies which patterns match, and the patterns are data.
+Handwritten selection is what ossified in Cranelift; a DSL with a generator is
+what they replaced it with, and is more machinery than this budget carries. A
+table interpreted at compile time is the middle, and it is what QBE ships.
 
-**Register allocation** is a live-range-splitting allocator over SSA, in the
-Wimmer-Franz and `regalloc2` family. It needs dominance, loop nesting depth for
-spill costs, and precise liveness -- all of which the IR above already
-provides. Going out of SSA turns block arguments into parallel copies on edges,
-resolved with the usual cycle breaking (Boissinot et al.); block arguments are
-what make those copies land somewhere real.
+**Allocation is linear scan with hinting, with the spiller split out**, which
+SSA is what makes possible. Physical registers become a field on the value
+rather than a new IR: this is the reason one IR suffices, and it is where the
+earlier draft of this document was wrong.
 
-**Stack maps** fall out of the allocator, because it is the only pass that
-knows where a value lives at a given point. At each safepoint it records which
-registers and spill slots hold traced values, and the runtime walks that
-instead of a root frame. That is the fix for FINDINGS 55, and it is the reason
-`Allocates` has to be in the IR from the first commit: retrofitting precise
-stack maps into a backend that did not plan for them is precisely the rewrite
-this design is trying not to need.
+**Stack maps come out of the allocator**, because it is the only pass that
+knows where a value is at a given point.
+
+**The allocator gets a fuzzer, not a test suite.** Cranelift's experience is
+that this is what made a high-complexity allocator transition safe, and a
+register allocator is the one component here whose bugs are both easy to write
+and invisible in a conformance run.
 
 ## Verification
 
-This is the part that changes, and it should be said plainly rather than
-discovered later.
-
-Every stage so far was verified by a byte-identical diff against the Python
+Every stage so far was verified by byte-identical diffs against the Python
 implementation. A backend designed independently has no such oracle, and should
-not have one: diffing boot's IR against a JIT's IR would couple boot's design
-to the artifact this proposal is decoupling from.
+not have one: diffing boot's IR against a JIT's would couple boot's design to
+the artifact this decouples from, and every place boot's IR is better would
+appear as a diff to suppress.
 
-The observable that matters for a backend is not its IR. It is what the
-compiled program does.
+The observable that matters for a backend is what the compiled program does.
 
 * **Differential execution.** Compile every conformance program with `boot`,
-  run it, and compare stdout, exit status and panic trace against the Python
-  implementation running the same program. `tests/programs/*.expected` and
-  `tests/test_system.py` are already exactly this, for the other host.
-* **The verifier, after every pass.** A miscompile becomes a rejected program
-  at the pass that caused it rather than a wrong answer at the end.
-* **Two emitters, one IR.** While the LLVM emitter is there, a program can be
-  compiled twice from the same SSA and the two runs compared -- which tests the
-  emitters against each other and the IR against neither.
+  run it, compare stdout, exit status and panic trace against the Python
+  implementation. `tests/programs/*.expected` and `tests/test_system.py` are
+  already this, for the other host.
+* **The verifier after every pass**, so a miscompile is a rejected program at
+  the pass that caused it rather than a wrong answer at the end.
+* **A fuzzer for the allocator**, per above.
+* **Two emitters over one IR** while LLVM is still there: compile twice from
+  the same low IR and compare the runs.
 * **M26 is unchanged and gets stronger.** stage2 against stage3 is one Turkey
-  program compiled by two different hosts, which is what catches a divergence
-  no single implementation can see.
+  program compiled by two hosts.
 
-There is a real loss here and it is worth naming: a textual diff localizes a
-bug to a line, and differential execution localizes it to a program. The
-verifier and the two-emitter check are what buy that back, and the Core-level
-goldens still cover everything above this boundary.
+The loss is real and worth naming: a textual diff localizes a bug to a line,
+differential execution to a program. The verifier, the fuzzer and the
+two-emitter check are what buy that back.
 
 ## Migration
 
-Each phase is runnable and verified before the next begins.
+Each phase runs and is verified before the next begins.
 
-* **Phase 0.** `Turkey.Ssa`: the IR, the opcode ADT with its signature and
-  effects, the verifier, the printer.
-* **Phase 1.** Core to SSA. Verified by the verifier and by reading the dump;
-  nothing executes yet.
-* **Phase 2.** SSA to LLVM text, and `boot build`. The conformance suite runs
-  under differential execution. **`boot` is self-sufficient at this point**,
-  and the durable half is exercised.
-* **Phase 3.** The optimizations, one at a time, behind the same oracle and
-  measured against phase 2.
-* **Phase 4.** Machine IR and instruction selection, for one target.
-* **Phase 5.** Register allocation, stack maps, encoding, object emission. The
-  LLVM path stays.
+* **Phase 0.** `Turkey.Ssa`: the IR, the opcode ADT with `signature` and
+  `effects`, the verifier including dominance, the printer.
+* **Phase 1.** Core to the low IR. The *logic* of `backend_lower.py` --
+  closure conversion, pattern tests, join lowering, the calling convention --
+  is correct and hard-won and is what carries across; its IR is not. Split into
+  more than one pass; the original is 1,579 lines doing four jobs.
+* **Phase 2.** Low IR to LLVM IR text, and `boot build`. The conformance suite
+  runs under differential execution. **`boot` is self-sufficient here**, and
+  everything above this line is now exercised by every program in the suite.
+* **Phase 3.** The four optimizations, one at a time, each measured.
+* **Phase 4.** Instruction selection, arm64, table-driven.
+* **Phase 5.** Register allocation, stack maps, encoding, object emission.
+
+LLVM is transitional: it is what phase 5 is differentially checked against, so
+it outlives the allocator's first working version by however long that takes to
+trust, and is then dropped. What it must not become is a constraint -- nothing
+in the low IR is shaped to suit it, so the day it goes costs one module.
 
 ## Open decisions
 
-* **The first native target.** arm64, on the argument that it is what this is
-  being developed on and a backend that cannot be run is not being tested.
-* **How long LLVM stays.** Decided: not permanently, but for a long while. It
-  is what phase 5 is differentially tested against, so it outlives the
-  allocator's first working version by however long that takes to trust. What
-  it must not become is a constraint -- nothing in the SSA IR is shaped to suit
-  it, and the day it is dropped should cost one module.
-* **Whether `turkey/`'s backend is kept in step at all.** Recommended: no. It
-  is the oracle for Core and above, and freezing it is what makes it one.
+* **The first native target.** arm64, because it is what this is developed on
+  and a backend that cannot be run is not being tested.
+* **Whether Core gains CSE and constant folding.** Recommended, and *before*
+  the backend rather than after: they are cheap there, they are checked by
+  goldens against a second implementation, and having them removes the argument
+  for a fifth low-IR pass.
 
 ## Rejected alternatives
 
+### A high IR between Core and the low IR
+
+The earlier draft of this document proposed one, and it was one IR too many.
+Core is already a CFG with block parameters and already carries the term-level
+optimizations; a second high-level IR would duplicate its structure to hold
+optimizations that are better written where a golden checks them.
+
+### A separate machine IR after instruction selection
+
+Also in the earlier draft, on the argument that every backend converges on two.
+Every backend an order of magnitude larger does. QBE selects instructions by
+rewriting its one IL in place and allocates registers over the result, which is
+the same job at this scale, and the second IR is a cost -- another datatype,
+another printer, another verifier, another lowering -- paid for a retargeting
+ambition that does not exist yet. If a second target proves it necessary, the
+selector is where it will be added, and the low IR will not have to change.
+
 ### Port `turkey/backend_ir.py` and extend it
 
-Three retrofits, all in the layer that must not be rewritten: block-local SSA
-makes memory promotion a precondition for every optimization, string opcodes
-cannot be selected on exhaustively, and no effects model means no precise stack
-maps. Each is cheaper to do now than after a lowering, an optimizer and a
-selector have been written against the old shape.
+Block-local SSA makes memory promotion a precondition rather than an
+optimization; string opcodes cannot be selected on exhaustively; no effects
+model means no precise stack maps. Three retrofits, all in the layer that must
+not be rewritten later.
 
-### One IR from Core to machine code
+### A DSL and generator for instruction selection
 
-No backend of this kind does this. The pressures are opposite -- an optimizer
-wants target independence and an allocator wants physical registers -- and the
-IR that tries to be both becomes two anyway, later, with more code depending on
-the shape that has to change.
+Cranelift's answer, and correct at Cranelift's size. Here it is a second
+language, its compiler, and a build step, to replace a table.
 
 ### Diff boot's IR against the Python backend's as the oracle
 
-It would couple boot's design to a JIT's: every place boot's IR is better would
-show up as a diff to be suppressed. The behaviour of the compiled program is
-the stronger check and constrains nothing.
+Couples boot's design to a JIT's. Behaviour of the compiled program is the
+stronger check and constrains nothing.
 
 ### Skip LLVM and go straight to instruction selection
 
-The SSA IR and its optimizations would then have no oracle at all until a
-register allocator existed, and every bug in either would present as a
-miscompile with nothing to compare against. Phase 2 costs one emitter and pays
-for itself across phases 3 to 5.
+The low IR and its optimizations would have no oracle until an allocator
+existed, and every bug in either would present as a miscompile with nothing to
+compare against.
 
 ### Conservative stack scanning instead of stack maps
 
-Already rejected in `LLVM-BACKEND.md`, for reasons that have not changed, and
-the collector is precise today.
+Already rejected in `LLVM-BACKEND.md`, for reasons that have not changed.
+
+## Sources
+
+* QBE, <https://c9x.me/compile/>
+* QBE 1.3, LWN, <https://lwn.net/Articles/1080519/>
+* Cwerg backend README,
+  <https://github.com/robertmuth/Cwerg/blob/master/BE/README.md>
+* GHC optimization guide,
+  <https://ghc.gitlab.haskell.org/ghc/doc/users_guide/using-optimisation.html>
+* Cranelift's instruction selector DSL,
+  <https://cfallin.org/blog/2023/01/20/cranelift-isle/>
+* Cranelift, part 4: a new register allocator,
+  <https://cfallin.org/blog/2022/06/09/cranelift-regalloc2/>

@@ -176,6 +176,48 @@ and the first real number on the question. Worth revisiting when the backend
 exists, against a live-range cost the backend can actually see; not worth
 guessing at now.
 
+## And constant propagation? Core already does it
+
+The obvious follow-up, since the measurement above says the value is in the
+propagation rather than in the folding. The answer is that Core has the
+propagation already, under other names:
+
+* `trivial_let` substitutes a `let`-bound `CLit`, `CCon`, `CVar` or `CUnit`
+  into the body. That is constant and copy propagation, and it runs inside the
+  same fixed point as everything else, so a constant it exposes is immediately
+  offered to the rules below.
+* `known_constructor` collapses a `match` whose scrutinee is a known
+  constructor. That is the *conditional* half -- the part that makes sparse
+  conditional constant propagation stronger than plain propagation -- for the
+  only kind of branch Core has.
+* `specialize_join` copies a join per constructor signature of its jumps, which
+  is propagation across the one place Core joins control flow.
+
+What SCCP would add over that is the phi case for *literals*: a join parameter
+that every jump supplies the same constant for, which none of the three
+handles. Counted over the corpus:
+
+| | |
+| --- | ---: |
+| joins | 8,324 |
+| join parameters | 5,283 |
+| parameters every jump gives the same constant | **2** |
+| ...of those, used as a primitive's argument | **0** |
+
+Two, and neither of them enables anything downstream. There is no pass here.
+
+The other direction a constant can travel is into a call, which is a different
+pass again -- specializing a body on a constant argument, GHC's SpecConstr
+territory, and something `mono` does not do because it specializes by type and
+never by value. 934 of 6,362 calls to a top-level binding pass at least one
+constant argument, but only **19 argument positions** are always the same
+constant across every call site, which is what a specializer would need. Small,
+and it trades code size for it. Recorded rather than pursued.
+
+The conclusion is the same as the section above from the other side: Core is
+not missing constant propagation. The backend is missing the *things to
+propagate to*, and lowering is what creates them.
+
 ## What this costs and saves
 
 Not writing them saves two passes in two implementations, a golden

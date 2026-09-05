@@ -158,7 +158,7 @@ fun kids(k : CoreKind) -> Array Core = match k {
 fun withValue(b : CBind, value : Core) -> CBind = CBind {
     name = b.name, ty = b.ty, binders = b.binders, value = value,
     span = b.span, mutable = b.mutable, module_ = b.module_,
-    equations = b.equations,
+    equations = b.equations, layouts = b.layouts,
 }
 
 -- -- the call graph, and the cycles in it ---------------------------------------------
@@ -1262,6 +1262,7 @@ fun instantiateTypes(e : Core, mapping : Map Int Ty.Type) -> Core =
                 let (l, r) = pair
                 (substitute(l, mapping), substitute(r, mapping))
             }),
+            layouts = b.layouts,
         },
     }))
 
@@ -1277,6 +1278,7 @@ fun rebaseSpans(e : Core, span : Option Span) -> Core =
             name = b.name, ty = b.ty, binders = b.binders,
             value = rebaseSpans(b.value, span), span = span,
             mutable = b.mutable, module_ = b.module_, equations = b.equations,
+            layouts = b.layouts,
         },
     }))
 

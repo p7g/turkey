@@ -1,7 +1,7 @@
 module Turkey.Mono (
     maxSpecializations, maxTypeNodes, rounds,
     State(..), newState,
-    monomorphize,
+    monomorphize, reduceTypes, checkLayouts,
 )
 
 -- Monomorphization: one copy of a polymorphic binding per type it is used at
@@ -590,7 +590,7 @@ fun rewriteLetRec(r : Rewriter, e : Core, binds : Array CBind,
                 name = name, ty = rTy(sub, orig.ty), binders = Array.new(0),
                 value = rewrite(sub, orig.value), span = orig.span,
                 mutable = False, module_ = orig.module_,
-                equations = sub.equations,
+                equations = sub.equations, layouts = orig.layouts,
             }
             Array.push(out, b)
         }
@@ -607,6 +607,7 @@ fun rewriteBind(r : Rewriter, b : CBind) -> CBind {
             name = b.name, ty = rTy(r, b.ty), binders = b.binders,
             value = rewrite(r, b.value), span = b.span, mutable = b.mutable,
             module_ = b.module_, equations = b.equations,
+            layouts = b.layouts,
         }
     }
     let sub = childRewriter(r, r.subst, b.equations)
@@ -614,7 +615,7 @@ fun rewriteBind(r : Rewriter, b : CBind) -> CBind {
     CBind {
         name = b.name, ty = rTy(sub, b.ty), binders = b.binders,
         value = rewrite(sub, b.value), span = b.span, mutable = b.mutable,
-        module_ = b.module_, equations = sub.equations,
+        module_ = b.module_, equations = sub.equations, layouts = b.layouts,
     }
 }
 
@@ -678,6 +679,7 @@ fun rewriteTop(m : Mono, b : CBind) -> CBind {
         name = b.name, ty = b.ty, binders = b.binders,
         value = rewrite(r, b.value), span = b.span, mutable = b.mutable,
         module_ = b.module_, equations = b.equations,
+        layouts = b.layouts,
     }
 }
 
@@ -780,7 +782,7 @@ fun build(m : Mono, name : String, b : CBind, targs : Array Ty.Type,
     CBind {
         name = name, ty = ty, binders = binders, value = rewrite(r, value),
         span = b.span, mutable = b.mutable, module_ = b.module_,
-        equations = r.equations,
+        equations = r.equations, layouts = b.layouts,
     }
 }
 
@@ -807,6 +809,120 @@ fun promotedBinders(b : CBind, dicts : Option (Array String)) -> Array VarCell {
         }
     }
     out
+}
+
+-- -- what the backend is handed ---------------------------------------------------
+
+-- Every type in the program, with its family applications reduced.
+--
+-- The backend reads a type *whole* and asks it for a representation, and an
+-- unreduced family has none: nothing can answer `Index.Value (Array Bool)`,
+-- while the body that produces the value knows it is the `Bool` the instance
+-- says it is and hands over a bare `i1`. The reader then unboxes a raw value.
+--
+-- The rewriter reduces as it substitutes, so a *specialized* binding is already
+-- reduced -- and says, correctly, that with no substitution there is nothing to
+-- do. What that leaves is the binding nothing specialized, whose types are the
+-- ones the lowering wrote: a dictionary's method still takes
+-- `Index.Key (Array a)` there, because the lowering builds a field's type by
+-- putting the instance head into the method's scheme and the scheme is written
+-- in the class's families.
+--
+-- So it is done here, once, for the whole program, rather than at each of the
+-- places a family can be introduced -- a layout is total on the types that
+-- reach it only if *every* such place remembered, and one pass is a thing that
+-- can be true rather than a rule five writers have to keep.
+fun reduceTypes(program : CProgram, classes : ClassTable) -> CProgram {
+    let fams = Some(Coretc.famsOf(classes, Array.new(0)))
+    CProgram {
+        dicts = Array.map(program.dicts, fun(b) = reduceBind(b, fams)),
+        binds = Array.map(program.binds, fun(b) = reduceBind(b, fams)),
+    }
+}
+
+fun reduceBind(b : CBind, fams : Option Ty.Families) -> CBind {
+    let out = rewriteValue(b, reduceCore(b.value, fams))
+    out.ty = Typed.reduceDeep(b.ty, fams)
+    out
+}
+
+fun rewriteValue(b : CBind, value : Core) -> CBind = CBind {
+    name = b.name, ty = b.ty, binders = b.binders, value = value,
+    span = b.span, mutable = b.mutable, module_ = b.module_,
+    equations = b.equations, layouts = b.layouts,
+}
+
+fun reduceCore(e : Core, fams : Option Ty.Families) -> Core =
+    mkCore(Typed.reduceDeep(e.ty, fams), e.span, mapKind(e.kind, Mapper {
+        expr = fun(x) = reduceCore(x, fams),
+        type_ = fun(t) = Typed.reduceDeep(t, fams),
+        bind = fun(b) = reduceBind(b, fams),
+    }))
+
+-- Where a generic body could take polymorphic data apart.
+--
+-- The predicate is `Core.transparentParameters`, shared with
+-- `Turkey.Layout.transparent` -- see there for why one definition and not two.
+-- What is decided here is *which* variables count as abstracted, and the answer
+-- is the ones no layout was found for: a variable whose layout the binding was
+-- compiled under is not a variable without a layout.
+--
+-- Reachability is from `main`, because an unreachable generic binding is never
+-- compiled.
+fun leakedParameters(program : CProgram) -> Array (String, String, Ty.Type) {
+    let binds = Map.new()
+    for b in Array.append(program.dicts, program.binds) {
+        Map.put(binds, b.name, b)
+    }
+    let seen = Set.new()
+    let stack = Array.new(8)
+    for (name, _) in Map.entries(binds) {
+        if String.endsWith(name, "#main") { Array.push(stack, name) }
+    }
+    while len(stack) > 0 {
+        let name = match Array.pop(stack) {
+            Some(n) -> n
+            None -> break
+        }
+        if Set.contains(seen, name) { continue }
+        match Map.get(binds, name) {
+            None -> continue
+            Some(b) -> {
+                Set.add(seen, name)
+                for n in Set.elements(namesOf(b.value)) {
+                    if Map.contains(binds, n) { Array.push(stack, n) }
+                }
+            }
+        }
+    }
+    let found = Array.new(2)
+    for name in Array.sort(Set.elements(seen)) {
+        let b = binds[name]
+        let abstracted = Set.new()
+        for v in abstractionBinders(b) {
+            if !Map.contains(b.layouts, v.id) { Set.add(abstracted, v.id) }
+        }
+        for p in transparentParameters(b, abstracted) {
+            Array.push(found, (name, p.name, Ty.prune(p.ty)))
+        }
+    }
+    found
+}
+
+-- Refuse to compile a program whose layouts cannot all be known.
+--
+-- Refusing rather than warning because the alternative is silence: the backend
+-- reads a field at the layout it computes, and if a generic body disagreed the
+-- result would be a wrong value rather than an error.
+fun checkLayouts(program : CProgram) -> Unit {
+    let leaks = leakedParameters(program)
+    if len(leaks) == 0 { return {} }
+    let parts = Array.new(len(leaks))
+    for (name, param, ty) in leaks {
+        Array.push(parts, name + " takes " + param + " : " + Ty.show(ty))
+    }
+    oops("monomorphization left a generic body able to destructure polymorphic "
+         + "data, whose layout it cannot know: " + String.join(parts, "; "), None)
 }
 
 fun oops(message : String, where : Option Span) -> a = match where {
@@ -913,7 +1029,7 @@ fun runDevirt(d : Devirt) -> CProgram {
 fun devirtBind(d : Devirt, b : CBind) -> CBind = CBind {
     name = b.name, ty = b.ty, binders = b.binders, value = devirt(d, b.value),
     span = b.span, mutable = b.mutable, module_ = b.module_,
-    equations = b.equations,
+    equations = b.equations, layouts = b.layouts,
 }
 
 -- The name a field now has, or `None` to leave it a projection.
@@ -939,7 +1055,7 @@ fun hoist(d : Devirt, owner : CBind, name : String,
     Array.push(d.hoisted, CBind {
         name = made, ty = inner.ty, binders = binders, value = inner,
         span = owner.span, mutable = False, module_ = owner.module_,
-        equations = Array.new(0),
+        equations = Array.new(0), layouts = Map.new(),
     })
     Some(made)
 }

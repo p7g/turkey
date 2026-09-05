@@ -49,6 +49,7 @@ import Turkey.Lower as Lower
 import Turkey.Coretc as Coretc
 import Turkey.Mono as Mono
 import Turkey.Joins as Joins
+import Turkey.Layout as Layout
 import Turkey.Opt as Opt
 import Turkey.Ast (Decl(..), Stmt(..), StmtKind(..), patternVars)
 
@@ -309,10 +310,23 @@ fun dumpOpt(b : String.Builder, path : String) -> Unit {
     let main = Map.getOr(entry.scope.values, "main", "main")
     let specialized = Mono.monomorphize(program, checked.decls, checked.classes,
                                         main)
-    let optimized = Opt.reduceProgram(
+    let reduced = Opt.reduceProgram(
         Joins.discover(Opt.reduceProgram(specialized)))
+    Coretc.checkProgram(checked.decls, checked.classes, reduced,
+                        Coretc.globalsOf(checked.env))
+    -- Family applications reduced before the layouts are decided, since a stuck
+    -- one has no representation and the backend would guess. See
+    -- `Mono.reduceTypes`.
+    let settled = Mono.reduceTypes(reduced, checked.classes)
+    -- What the cap left generic, shared by layout instead of by type. This is
+    -- after the optimizations rather than among them: a copy is the optimized
+    -- body under another name, so there is nothing left to reduce in it.
+    let optimized = Layout.share(settled, checked.decls)
     Coretc.checkProgram(checked.decls, checked.classes, optimized,
                         Coretc.globalsOf(checked.env))
+    -- Every layout the backend reads a field at has to be knowable, and this is
+    -- the program it would be handed.
+    Mono.checkLayouts(optimized)
     String.push(b, Core.showProgram(optimized, Some(entry.name)))
 }
 

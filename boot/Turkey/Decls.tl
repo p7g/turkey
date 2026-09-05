@@ -5,7 +5,7 @@ module Turkey.Decls (
     DeclTable(..), newDeclTable,
     head, registerAll, settleKinds,
     star, toType, instantiateCon, con, recordFields, fieldType, projectionTypes,
-    substitute,
+    substitute, newtypes, erasedPayload,
     showDeclarations,
 )
 
@@ -19,6 +19,7 @@ module Turkey.Decls (
 
 import Data.Set as Set
 import Turkey.Ast
+import Turkey.Deps as Deps
 import Turkey.Diag as Diag
 import Turkey.Source (Span)
 import Turkey.Types as Ty
@@ -90,6 +91,8 @@ type DeclTable = DeclTable {
     -- was built. A `Map` here is insertion-ordered, but the primitives and
     -- `Prim.Array` are in it before any module is read.
     order        : Array String,
+    -- `newtypes`, computed once the declarations are all in.
+    newtypeNames : Option (Set.Set String),
 }
 
 fun newDeclTable() -> DeclTable {
@@ -97,6 +100,7 @@ fun newDeclTable() -> DeclTable {
     let t = DeclTable {
         tycons = Map.new(), constructors = Map.new(), heads = Map.new(),
         families = Map.new(), shorts = Map.new(), order = Array.new(16),
+        newtypeNames = None,
     }
     for name in Ty.primitives() {
         Map.put(t.heads, name, Ty.tcon(name, KStar, Ty.noScope))
@@ -474,6 +478,81 @@ fun fieldType(t : DeclTable, receiver : Ty.Type, label : String) -> Ty.Type {
 }
 
 -- Payload types for an immutable, single positional variant.
+-- The type names whose one constructor is not there at run time.
+--
+-- `type Array a = Array(ArrayStorage a)` gives its payload a name and a `match`
+-- to get back out of, and nothing else: one variant, one field, and no way to
+-- tell the wrapper from what it wraps. There is no function identity in Turkey
+-- and no reflection, so a value of it *is* its payload, and the allocation is a
+-- cost with no observable effect.
+--
+-- Records are excluded, and this is the reason there is a rule rather than a
+-- check for one variant and one field: a single-variant record is mutable
+-- (design.md 4.5), and assigning through two names for one box is exactly the
+-- identity that erasure would take away.
+--
+-- Recursion is excluded because it is what erasure cannot terminate on. A
+-- wrapper is erased into its payload, so `type Loop = Loop(Loop)` has no
+-- representation at all -- and the cycle need not be direct, since `A(B)`,
+-- `B(C)`, `C(A)` is the same thing spread over three declarations. An edge is
+-- drawn only where the payload's *head* is another candidate: a payload of
+-- `Option B` is a pointer to a variant type whatever `B` is, and that pointer
+-- is where the recursion stops. One member of each cycle keeps its box -- the
+-- first by name, as `Turkey.Opt`'s loop breaker picks one -- which is enough to
+-- make the rest terminate.
+fun newtypes(t : DeclTable) -> Set.Set String {
+    match t.newtypeNames {
+        Some(found) -> return found
+        None -> {}
+    }
+    let candidates = Set.new()
+    for (name, info) in Map.entries(t.tycons) {
+        if len(info.variants) == 1 && !isRecord(info.variants[0])
+                && info.variants[0].arity == 1 {
+            Set.add(candidates, name)
+        }
+    }
+    let graph = Map.new()
+    for name in Set.elements(candidates) {
+        let deps = Set.new()
+        match Ty.prune(t.tycons[name].variants[0].scheme.body) {
+            TFun(params, _) -> if len(params) == 1 {
+                let (h, _) = Ty.spine(params[0])
+                match h {
+                    TCon(c) -> if Set.contains(candidates, c.name) {
+                        Set.add(deps, c.name)
+                    }
+                    _ -> {}
+                }
+            }
+            _ -> {}
+        }
+        Map.put(graph, name, deps)
+    }
+    for component in Deps.sccs(graph) {
+        let first = component[0]
+        let successors = Map.getOr(graph, first, Set.new())
+        if len(component) > 1 || Set.contains(successors, first) {
+            Set.remove(candidates, first)
+        }
+    }
+    t.newtypeNames = Some(candidates)
+    candidates
+}
+
+-- What a value of `receiver` really is, if its wrapper is erased.
+fun erasedPayload(t : DeclTable, receiver : Ty.Type) -> Option Ty.Type {
+    let (h, _) = Ty.spine(receiver)
+    match h {
+        TCon(c) -> if !Set.contains(newtypes(t), c.name) { return None }
+        _ -> return None
+    }
+    match projectionTypes(t, receiver) {
+        Some(payload) -> if len(payload) > 0 { Some(payload[0]) } else { None }
+        None -> None
+    }
+}
+
 fun projectionTypes(t : DeclTable, receiver : Ty.Type) -> Option (Array Ty.Type) {
     let (h, args) = Ty.spine(receiver)
     match h {

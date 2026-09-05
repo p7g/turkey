@@ -105,7 +105,7 @@ fun mapTails(k : CoreKind, tail : Bool,
     CLetRec(binds, body) -> CLetRec(Array.map(binds, fun(b) = CBind {
         name = b.name, ty = b.ty, binders = b.binders,
         value = f(b.value, False), span = b.span, mutable = b.mutable,
-        module_ = b.module_, equations = b.equations,
+        module_ = b.module_, equations = b.equations, layouts = b.layouts,
     }), f(body, tail))
     CJoin(name, params, body, rest, recursive) ->
         CJoin(name, params, f(body, tail), f(rest, tail), recursive)
@@ -123,6 +123,7 @@ fun mapTails(k : CoreKind, tail : Bool,
             name = b.name, ty = b.ty, binders = b.binders,
             value = f(b.value, False), span = b.span, mutable = b.mutable,
             module_ = b.module_, equations = b.equations,
+            layouts = b.layouts,
         },
     })
 }
@@ -138,7 +139,7 @@ fun discover(program : CProgram) -> CProgram = CProgram {
 fun joinBind(b : CBind) -> CBind = CBind {
     name = b.name, ty = b.ty, binders = b.binders, value = expr(b.value),
     span = b.span, mutable = b.mutable, module_ = b.module_,
-    equations = b.equations,
+    equations = b.equations, layouts = b.layouts,
 }
 
 -- Rewrite `e`, converting any binding under it that is a join point.

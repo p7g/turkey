@@ -190,6 +190,7 @@ fun newBind(name : String, ty : Ty.Type, binders : Array VarCell, value : Core,
             where : Option Span) -> CBind = CBind {
     name = name, ty = ty, binders = binders, value = value, span = where,
     mutable = False, module_ = "", equations = Array.new(0),
+    layouts = Map.new(),
 }
 
 -- One top-level statement. Only bindings occur here.

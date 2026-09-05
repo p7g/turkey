@@ -4,6 +4,8 @@ module Turkey.Core (
     mkCore, tailParts, tailFieldNames,
     Mapper(..), mapKind,
     namesOf, namesInto,
+    dictName, classOfDict, dictClass, isDictionary,
+    abstractionBinders, abstractionParameters, transparentParameters,
     Aliases(..), newAliases, alias,
     showExpr, showBind, showProgram,
 )
@@ -199,6 +201,12 @@ type CBind = CBind {
     -- but they are *facts the body was checked under*, and a family over a rigid
     -- variable does not reduce without them.
     equations : Array (Ty.Type, Ty.Type),
+    -- The layout each abstracted variable stands for, when this binding is one
+    -- of `Turkey.Layout`'s copies; empty otherwise, which is every ground
+    -- binding and every generic one the sharing pass left alone. A variable
+    -- that is not in it has no layout, and `layoutOf` says so rather than
+    -- guessing.
+    layouts   : Map Int String,
 }
 
 -- A whole program: the dictionaries, then the bindings, in run order.
@@ -312,6 +320,157 @@ fun mapKind(k : CoreKind, m : Mapper) -> CoreKind = match k {
 -- binding's name counts as a mention of it. Being wrong in this direction costs
 -- a binding kept alive or a call left un-inlined; being wrong in the other costs
 -- a program that does not run.
+-- -- queries about the IR -------------------------------------------------------------
+
+-- `%Dict.` is a bijection, and both halves live here.
+--
+-- The lowering built the name and five other modules took it apart with their
+-- own `startsWith` and a slice, so every consumer knew the encoding. One maker
+-- and one reader mean the string appears once.
+let dictHead = "%Dict"
+
+fun dictName(cls : String) -> String = dictHead + "." + cls
+
+-- The class a dictionary type is for, given its name, or `None`.
+fun classOfDict(name : String) -> Option String =
+    match String.splitOnce(name, ".") {
+        Some((before, after)) -> if before == dictHead { Some(after) } else { None }
+        None -> None
+    }
+
+-- The class `ty` is the dictionary of, or `None` if it is not one.
+--
+-- Saturated: the dictionary constructor has kind `k -> *`, so an unapplied one
+-- is not the type of any value. Every caller wanted that and two of the three
+-- checked it separately.
+fun dictClass(ty : Ty.Type) -> Option String {
+    let (h, args) = Ty.spine(Ty.prune(ty))
+    match h {
+        TCon(c) -> if len(args) == 1 { classOfDict(c.name) } else { None }
+        _ -> None
+    }
+}
+
+fun isDictionary(ty : Ty.Type) -> Bool = Option.isSome(dictClass(ty))
+
+-- Every type variable a binding abstracts, wherever it states them.
+--
+-- A binding says `forall` in two places. `binders` is the one the checker reads
+-- at a use site, and it is the only one a *generic* binding has. A method
+-- quantifies over its own variables as well as its class's, and the lowering
+-- states those in a `CTyLam` under the dictionary lambda -- so `Turkey.Mono`,
+-- which consumes that lambda, leaves a copy whose `binders` are empty and whose
+-- body is still generic.
+--
+-- Both are `forall`, and the use site applies types to both the same way, so a
+-- pass that asks what a binding abstracts over wants them together.
+fun abstractionBinders(b : CBind) -> Array VarCell {
+    let out = Array.new(len(b.binders) + 2)
+    for v in b.binders { Array.push(out, v) }
+    var value = b.value
+    var going = True
+    while going {
+        match value.kind {
+            CLam(_, body, _) -> { value = body }
+            CTyLam(vs, body) -> {
+                for v in vs { Array.push(out, v) }
+                value = body
+            }
+            _ -> { going = False }
+        }
+    }
+    out
+}
+
+-- Every parameter of every lambda inside a binding's value.
+--
+-- Elaboration gives a constrained binding more than one lambda: the
+-- dictionaries in the outer, the value parameters in another inside it. A
+-- reader that stops at the first therefore sees a constrained function's
+-- dictionaries and *nothing else*.
+--
+-- Nor is the spine enough, which is what this used to read. An instance
+-- dictionary is not a lambda at all -- it is a `CRecord` of them, under the
+-- class's type binder -- so a spine reader finds no parameters in
+-- `instance Index (Array a)` and concludes it destructures nothing, while the
+-- `get` inside it does `Prim.arrayGet` on an `Array a`. Every lambda in the
+-- value, then, and the argument that a lambda deeper in the body is a closure
+-- the body makes for itself does not save it: a body may hand that closure out,
+-- and a dictionary is nothing but that.
+--
+-- Over-approximating costs a binding a copy per layout that nothing needed.
+-- Under-approximating costs a field read at a width it was not written at.
+fun abstractionParameters(value : Core) -> Array CParam {
+    let out = Array.new(4)
+    lambdaParams(value, out)
+    out
+}
+
+fun lambdaParams(e : Core, out : Array CParam) -> Unit {
+    match e.kind {
+        CLam(params, _, _) -> for p in params { Array.push(out, p) }
+        _ -> {}
+    }
+    -- `mapKind` rebuilds what it walks, which is more than a query needs; it
+    -- is the one enumerator over a node's children, and having a second would
+    -- be a second thing to keep in step with the IR.
+    discard(mapKind(e.kind, Mapper {
+        expr = fun(x) = {
+            lambdaParams(x, out)
+            x
+        },
+        type_ = fun(t) = t,
+        bind = fun(b) = {
+            lambdaParams(b.value, out)
+            b
+        },
+    }))
+}
+
+-- The parameters through which `b` could take polymorphic data apart.
+--
+-- A generic body may hold a value of an abstracted type and pass it on, and
+-- nothing else: that is parametricity, and it is why a bare `a` parameter is
+-- always fine. What it may not do is *destructure* one, because the layout it
+-- would read a field at is decided here while the layout the field was written
+-- at is decided at the construction site. So the parameter to look at is a
+-- *transparent* one -- a type that mentions an abstracted variable without
+-- being one. `Array a` is transparent and `a` is not.
+--
+-- A dictionary is exempt. It is a record of closures, and passing polymorphic
+-- data to the closures inside it is the mechanism the design rests on rather
+-- than a leak.
+--
+-- One definition, because there were two and they were wrong together.
+-- `Turkey.Mono.checkLayouts` asks this to *refuse* a program and
+-- `Turkey.Layout.share` asks it to decide which bindings need a copy per
+-- layout -- a producer and its checker, which is worth having only while both
+-- mean the same thing by it. They differ in *which* variables count as
+-- abstracted, which is the argument, and in nothing else.
+fun transparentParameters(b : CBind, abstracted : Set.Set Int) -> Array CParam {
+    let found = Array.new(2)
+    if len(Set.elements(abstracted)) == 0 { return found }
+    for param in abstractionParameters(b.value) {
+        let ty = Ty.prune(param.ty)
+        var skip = isDictionary(ty)
+        match ty {
+            TVar(_) -> { skip = True }
+            _ -> {}
+        }
+        if !skip {
+            for v in Ty.varsOf([ty]) {
+                if Set.contains(abstracted, v.id) {
+                    Array.push(found, param)
+                    break
+                }
+            }
+        }
+    }
+    found
+}
+
+fun discard(x : a) -> Unit = {}
+
 fun namesOf(e : Core) -> Set.Set String {
     let out = Set.new()
     namesInto(e, out)

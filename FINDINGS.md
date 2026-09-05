@@ -539,8 +539,8 @@ that notices it was applied to only one of the two implementations.
 
 The third candidate fix, a global tick limit, is rejected rather than
 deferred. It makes the output depend on traversal order and on program size,
-which would break M26's claim outright: `stage2.c` and `stage3.c` are the same
-program compiled by two hosts, and a budget exhausted at a different point in
+which would break self-hosting's claim outright (plan item 9, M29):
+stage2 and stage3 are the same program compiled by two hosts, and a budget exhausted at a different point in
 two different walks gives two different programs. It also answers "is this
 reduction worth doing" with "was it early".
 

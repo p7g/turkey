@@ -1,6 +1,6 @@
 # The native backend, in Turkey
 
-Status: proposal
+Status: accepted. Plan item 9, M27 and M28.
 
 ## Summary
 

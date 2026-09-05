@@ -70,10 +70,15 @@ instance Eq Value { fun eq(Value(a), Value(b)) = a == b }
 instance Eq BlockId { fun eq(BlockId(a), BlockId(b)) = a == b }
 
 -- What a register has to hold. Instruction selection reads this.
-type RepClass = I1 | I8 | I32 | I64 | F64 | Ptr
+-- `Unit` is zero-width and occupies no register. Every instruction defines a
+-- value, so an effectful one defines a unit -- and without this that would
+-- burn a register per store, per call for effect, per assignment. LLVM's
+-- `void` and QBE's absent return type are the same choice.
+type RepClass = Unit | I1 | I8 | I32 | I64 | F64 | Ptr
 
 instance Eq RepClass {
     fun eq(x, y) = match (x, y) {
+        (Unit, Unit) -> True
         (I1, I1) -> True
         (I8, I8) -> True
         (I32, I32) -> True
@@ -98,6 +103,7 @@ type Rep = Rep {
 
 instance Show RepClass {
     fun show(c) = match c {
+        Unit -> "unit"
         I1 -> "i1"
         I8 -> "i8"
         I32 -> "i32"
@@ -453,6 +459,16 @@ fun verify[Inst i](f : Func i) -> Array String {
     -- its own: there is no edge into it to supply them.
     if len(f.blocks[blockId(f.entry)].params) > 0 {
         Array.push(out, f.name + ": the entry block takes parameters")
+    }
+    -- Only a pointer may be traced. Today every `Ptr` is traced and the field
+    -- looks redundant; it is not, and this is what keeps it honest -- a code
+    -- address is a pointer the collector must *not* follow, and instruction
+    -- selection is where the first one appears.
+    for var i = 0; i < len(f.reps); i = i + 1 {
+        if f.reps[i].traced && f.reps[i].class_ != Ptr {
+            Array.push(out, f.name + ": value " + Int.toString(i) + " is "
+                            + show(f.reps[i]) + ", which is not a pointer")
+        }
     }
 
     -- Where each value is defined. `defAt` is a position within a block and

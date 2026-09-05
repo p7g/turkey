@@ -167,7 +167,7 @@ fun emit(b : Builder, op : Op, r : Rep) -> Value {
 -- An operation evaluated for its effect. The value it defines is a `unit`
 -- nothing reads, which is what keeps every instruction defining exactly one.
 fun effect(b : Builder, op : Op) -> Unit {
-    let _ = emit(b, op, Ssa.untraced(I64))
+    let _ = emit(b, op, Ssa.untraced(Unit))
 }
 
 fun terminate(b : Builder, t : Ssa.Term) -> Unit {
@@ -303,21 +303,21 @@ instance Inst Low {
 fun opResultRep(op : Op) -> Option Rep = match op {
     ConstFloat(_) -> Some(Ssa.untraced(F64))
     ConstString(_) -> Some(Ssa.traced(Ptr))
-    ConstUnit -> Some(Ssa.untraced(I64))
+    ConstUnit -> Some(Ssa.untraced(Unit))
     Cmp(_, _, _) -> Some(Ssa.untraced(I1))
     Box(_) -> Some(Ssa.traced(Ptr))
     ObjectNew(_, _, _, _) -> Some(Ssa.traced(Ptr))
     ObjectTag(_) -> Some(Ssa.untraced(I32))
     ArrayNew(_, _, _) -> Some(Ssa.traced(Ptr))
-    ArrayLength(_) -> Some(Ssa.untraced(I64))
+    ArrayLength(_) -> Some(Ssa.untraced(Unit))
     CellNew(_) -> Some(Ssa.traced(Ptr))
     ClosureNew(_, _) -> Some(Ssa.traced(Ptr))
-    ObjectSet(_, _, _) -> Some(Ssa.untraced(I64))
-    ArraySet(_, _, _) -> Some(Ssa.untraced(I64))
-    CellStore(_, _) -> Some(Ssa.untraced(I64))
-    ClosureCapture(_, _, _) -> Some(Ssa.untraced(I64))
-    GlobalStore(_, _) -> Some(Ssa.untraced(I64))
-    SlotStore(_, _) -> Some(Ssa.untraced(I64))
+    ObjectSet(_, _, _) -> Some(Ssa.untraced(Unit))
+    ArraySet(_, _, _) -> Some(Ssa.untraced(Unit))
+    CellStore(_, _) -> Some(Ssa.untraced(Unit))
+    ClosureCapture(_, _, _) -> Some(Ssa.untraced(Unit))
+    GlobalStore(_, _) -> Some(Ssa.untraced(Unit))
+    SlotStore(_, _) -> Some(Ssa.untraced(Unit))
     _ -> None
 }
 

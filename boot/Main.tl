@@ -50,6 +50,8 @@ import Turkey.Coretc as Coretc
 import Turkey.Mono as Mono
 import Turkey.Joins as Joins
 import Turkey.Layout as Layout
+import Turkey.Ssa as Ssa
+import Turkey.SsaLower as SsaLower
 import Turkey.Opt as Opt
 import Turkey.Ast (Decl(..), Stmt(..), StmtKind(..), patternVars)
 
@@ -64,7 +66,8 @@ fun main() {
     if len(args) < 2 { usage() }
     let command = args[0]
     if !Array.contains(["tokens", "ast", "desugar", "decls", "deps",
-                    "classes", "types", "core", "mono", "opt"], command) {
+                    "classes", "types", "core", "mono", "opt", "ssa"],
+                    command) {
         die("unknown command '" + command + "'")
     }
     -- One builder for every file: a `print` per token is a flush per token,
@@ -83,6 +86,7 @@ fun main() {
             "types" -> dumpTypes(b, path)
             "core" -> dumpCore(b, path)
             "mono" -> dumpMono(b, path)
+            "ssa" -> dumpSsa(b, path)
             _ -> dumpOpt(b, path)
         }
     }
@@ -304,8 +308,12 @@ fun dumpMono(b : String.Builder, path : String) -> Unit {
 -- independently by threading a join scope. A pass that called a position a tail
 -- where the rule does not emits a jump with nowhere to go, and this is where
 -- that is caught.
-fun dumpOpt(b : String.Builder, path : String) -> Unit {
-    let (checked, entry) = checkProgram(path)
+-- Everything between the elaboration and the backend, in one place.
+--
+-- `ssa` needs exactly what `opt` prints, so this is a function rather than the
+-- same nine steps written twice: two copies of a pass order is how the two
+-- stages come to disagree about what the backend is handed.
+fun optimized(checked : Checked, entry : Modules.Module) -> Core.CProgram {
     let program = lowered(checked)
     let main = Map.getOr(entry.scope.values, "main", "main")
     let specialized = Mono.monomorphize(program, checked.decls, checked.classes,
@@ -321,13 +329,44 @@ fun dumpOpt(b : String.Builder, path : String) -> Unit {
     -- What the cap left generic, shared by layout instead of by type. This is
     -- after the optimizations rather than among them: a copy is the optimized
     -- body under another name, so there is nothing left to reduce in it.
-    let optimized = Layout.share(settled, checked.decls)
-    Coretc.checkProgram(checked.decls, checked.classes, optimized,
+    let out = Layout.share(settled, checked.decls)
+    Coretc.checkProgram(checked.decls, checked.classes, out,
                         Coretc.globalsOf(checked.env))
     -- Every layout the backend reads a field at has to be knowable, and this is
     -- the program it would be handed.
-    Mono.checkLayouts(optimized)
+    Mono.checkLayouts(out)
+    out
+}
+
+fun dumpOpt(b : String.Builder, path : String) -> Unit {
+    let (checked, entry) = checkProgram(path)
+    let optimized = optimized(checked, entry)
     String.push(b, Core.showProgram(optimized, Some(entry.name)))
+}
+
+-- The low IR, and how much of the program reached it.
+--
+-- There is no byte-identical oracle below Core and there should not be: the
+-- Python backend is a JIT whose IR this one deliberately does not copy
+-- (`NATIVE-BACKEND.md`). What checks this instead is `Turkey.Ssa.verify`,
+-- run over everything that lowered -- so a malformed graph is a complaint
+-- naming the function that produced it rather than a wrong answer later.
+--
+-- The lowering is incomplete and reports it. The count is the progress
+-- signal: a Core form nothing handles yet stops one function, not the run.
+fun dumpSsa(b : String.Builder, path : String) -> Unit {
+    let (checked, entry) = checkProgram(path)
+    let program = optimized(checked, entry)
+    let (functions, skipped) = SsaLower.lowerProgram(program, checked.decls)
+    for f in functions {
+        String.push(b, Ssa.showFunc(f))
+        for message in Ssa.verify(f) {
+            String.push(b, "  !! " + message + "\n")
+        }
+    }
+    String.push(b, "-- lowered " + Int.toString(len(functions)) + " of "
+                   + Int.toString(len(functions) + len(skipped))
+                   + " bindings\n")
 }
 
 -- What the whole front end leaves behind.

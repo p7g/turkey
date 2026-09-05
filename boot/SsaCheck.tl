@@ -18,6 +18,7 @@ import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..), Term(..),
                    Block(..), Func(..), Inst(..), Effects(..))
 import Turkey.LowIr as L
 import Turkey.LowIr (Op(..), Low(..), BinOp(..), CmpOp(..), Callee(..))
+import Turkey.SsaLower as SsaLower
 
 fun main() {
     let i64 = Ssa.untraced(I64)

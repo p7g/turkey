@@ -567,6 +567,18 @@ Each phase runs and is verified before the next begins.
   remove the C toolchain, the runtime being C.
 * **Phase 3.** The four optimizations, one at a time, each measured.
 * **Phase 4.** Instruction selection, arm64, table-driven.
+
+  Selection produces a machine-instruction *value*, never assembly text. That
+  was already the rule -- a second instantiation of the CFG, so that a virtual
+  opcode is not representable afterwards -- and `LINKER.md` gives it a second
+  reason: text and bytes are then two consumers of one IR, a `Show` and an
+  `encode`, and choosing between them later is adding a consumer rather than
+  replacing a design.
+
+  Build the `Show` first regardless. `as` assembles what it prints, which makes
+  the system assembler an instruction-by-instruction oracle for the byte
+  encoder -- the part of a backend hardest to get right, and the part Cranelift
+  says needs a fuzzer.
 * **Phase 5.** Register allocation, stack maps, encoding, object emission.
 
 LLVM is transitional: it is what phase 5 is differentially checked against, so

@@ -115,10 +115,91 @@ is modeled on it. QBE emits **assembly text** and stops: `qbe -o out.s file.ssa
 object files at all, let alone link them. If the argument were purely "what
 does a small backend do", the answer would be: shell out.
 
+**Go** is the most committed in-tree linker there is -- `cmd/link`, descended
+from Plan 9, emitting ELF, Mach-O and PE itself -- and it contributes two
+things this survey needed.
+
+The first is a warning about the platform, not the linker. Go used to make raw
+syscalls on Darwin; it no longer can. Apple *"[is] not willing to commit to a
+particular syscall ABI"*, so Go's darwin/arm64 syscalls now go through
+`libSystem` with trampolines converting the Go calling convention to C. **The
+language that most wanted to avoid libc on macOS was made to link against it
+anyway.** Cwerg's static-syscall route is not merely unavailable to us; it is
+unavailable to everyone here.
+
+The second is an actual number for the part that sounds worst.
+`cmd/internal/codesign` implements ad-hoc Mach-O signing in **283 lines** --
+`SuperBlob`, `Blob`, `CodeDirectory`, `CodeSigCmd`, SHA-256 over 4 KB pages --
+self-contained apart from the hash. Go's internal linker signs darwin/arm64
+binaries with it and they run.
+
+And a caution: Go's internal linker handles *pure Go*, and **cgo forces
+external linking**, with a trail of invalid-signature bugs from 2020 to 2023 at
+exactly that boundary. That boundary is ours -- we have a C runtime -- which is
+the strongest argument for the dylib: it keeps the C on the far side of a
+`LC_LOAD_DYLIB` instead of mixing C objects into our own link.
+
+**TCC** is *"meant to be self-relying: you do not need an external assembler or
+linker"*, and emits relocatable ELF, executable ELF and dynamic ELF libraries.
+Existence proof that the whole path fits in a famously small compiler.
+
+**Delphi** inverts the expectation usefully: its **desktop** compilers use an
+internal linker, and only the iOS-device and Android ones shell out to `ld`.
+The platforms that force an external linker are the locked-down ones.
+
+**Free Pascal** occupies the middle position and is worth naming because it is
+a position: it has *"its own binary object writer"* but still calls `ld`. Emit
+your own objects, let someone else link them -- option D below, shipped.
+
 **mold, lld, gold** are the wrong budget by an order of magnitude and are worth
 naming only to say so. mold links Chrome's 1.89 GB in 2.2 seconds against
 gold's 53. None of that problem is our problem: we link one module with
 seventeen undefined symbols.
+
+## Assembly text is not a fork in the road
+
+The obvious worry about option B is that emitting `.s` now makes emitting bytes
+later a rewrite, or forces a disassembler to check the bytes against. Both
+dissolve, but only under a design constraint worth writing down.
+
+**Instruction selection must produce a machine-instruction *value*, never
+text.** `NATIVE-BACKEND.md` already requires this -- selection produces a second
+instantiation of the CFG over an `Arm64` instruction type rather than rewriting
+the low IR in place -- and it is what makes the question moot. Assembly text and
+machine bytes are then two *consumers* of one IR:
+
+* a `Show` instance, one line per instruction;
+* an `encode` function, one line per instruction.
+
+Neither is a prerequisite for the other, and neither touches the selector, the
+register allocator, or the CFG. Switching is adding a second consumer, not
+replacing a design. The danger the worry names is real *only* if selection
+emits strings directly -- so the rule is: it must not, and this is the second
+reason for that rule after the exhaustiveness argument.
+
+**And the disassembler is not needed, because `as` is the oracle.** For any
+instruction the printer can spell, the system assembler gives the ground truth
+bytes:
+
+```
+$ printf '.text\nadd x0, x1, x2\nsub w3, w4, #7\nldr x5, [x6, #16]\nret\n' > enc.s
+$ as -arch arm64 -o enc.o enc.s && otool -t -X enc.o
+0000000000000000  8b020020 51001c83 f94008c5 d65f03c0
+```
+
+`add x0, x1, x2` is `8b020020`. So the encoder is checked by printing each
+instruction, assembling it, and comparing bytes -- instruction by instruction,
+automatically, over every form the selector can produce. That is this project's
+existing method, differential testing against a second implementation, applied
+to the one part of a backend that is hardest to get right and that Cranelift
+says needs a fuzzer.
+
+Which turns the fallback into a recommendation: **build the text printer
+regardless**, because it is the encoder's test fixture. It costs a `Show`
+instance, it makes `boot`'s output readable while the selector is being
+debugged, and it is the difference between an encoder that is believed and one
+that is checked. Whether the *shipping* path goes through it is then a separate
+and much smaller question.
 
 ## The options
 
@@ -175,10 +256,15 @@ Linux target would need again differently (though Linux is *easier* -- Cwerg's
 static-ELF route reopens there), and that it does not remove the C toolchain,
 only its position in the build.
 
-**B is the fallback worth remembering.** If M28 runs long, emitting assembly
-text is strictly less work than emitting objects and gets a working native
-compiler sooner, at the cost of keeping the process spawn. QBE has shipped that
-compromise for a decade.
+**B is not a fallback, it is a stage.** The assembly printer should exist
+whatever ships, because it is how the byte encoder gets an oracle -- see above.
+If M28 runs long it is also a working native compiler sooner, at the cost of
+keeping the process spawn, which QBE has shipped for a decade.
+
+**Order of work, then.** Selection and allocation over a machine-instruction
+IR; a `Show` for it; an `encode` checked against `as` instruction by
+instruction; and only then the Mach-O writer and the signature, by which point
+the only untested thing left is the file format.
 
 ## Sources
 
@@ -191,3 +277,13 @@ compromise for a decade.
   <https://www.jakubkonka.com/2022/03/16/hcs-zig.html>
 - lld, adding arm64 macOS code signing: <https://reviews.llvm.org/D96164>
 - mold: <https://github.com/rui314/mold>
+- Go, forced onto libSystem for Darwin syscalls:
+  <https://github.com/golang/go/issues/17490>
+- Go, `cmd/internal/codesign` (283 lines of ad-hoc Mach-O signing):
+  <https://tip.golang.org/src/cmd/internal/codesign/codesign.go>
+- Go, cgo and invalid signatures on darwin/arm64:
+  <https://github.com/golang/go/issues/43105>
+- TCC, self-relying (no external assembler or linker):
+  <https://bellard.org/tcc/tcc-doc.html>
+- Delphi, internal linker on desktop and external `ld` on mobile:
+  <https://docwiki.embarcadero.com/RADStudio/Athens/en/Linking>

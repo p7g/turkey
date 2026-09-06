@@ -587,6 +587,55 @@ Each phase runs and is verified before the next begins.
   consumer cannot tell which of its facts are in its IR and which are in its
   emitter (FINDINGS 70).
 
+  **Why a pass and not the lowering.** The obvious alternative is to emit all
+  of this in `SsaLower`, where the Core is still in hand -- one less pass, and
+  `boot ssa` would show the true semantics immediately. Go answers this, having
+  the same choice for the same reasons: its pass order runs *NilCheckElim,
+  Prove, BCE, Loop, Fuse, DSE,* **WriteBarrier**. Nil checks go in early
+  because `nilcheckelim` and `prove` can *delete* them; write barriers go in
+  late because nothing can, and an early one would only be in the way.
+
+  The rule that falls out is: **early if an optimization can use it, late if it
+  can only be obstructed by it.** Which splits the three:
+
+  * **Overflow and division guards -- late, for now.** They could be removed by
+    range analysis, and there is none: QBE's four are copy elimination, SCCP,
+    dead code and slot promotion, and none of them narrows an integer. So today
+    they are pure obstruction -- and worse than neutral, because `effectsOf`
+    says a checked `Bin` *traps*, which is exactly what DCE reads to decide it
+    cannot be deleted. Expand it into a real branch and that fact becomes a
+    control-flow join instead, which is strictly less information. **This is
+    the one whose answer changes**: add range analysis and the guards want to
+    be early, where it can see them.
+  * **Panic propagation -- late, definitively.** Every call becomes a block
+    terminator, so the block count roughly triples and every analysis after it
+    -- liveness, dominance, the allocator -- pays for a branch that is never
+    taken. Nothing can optimize it away.
+  * **GC roots -- last, and not merely late.** They need liveness over the
+    *final* CFG, and the other two expansions change it. Roots computed at
+    lowering time would be a liveness answer about a graph that does not exist
+    yet. That is not a preference; it is a correctness argument.
+
+  The separate pass also buys an oracle the lowering cannot have: it can be
+  **toggled**. Run the corpus with and without it and the output must be
+  identical for every program that does not trap -- which is a test of the
+  expansion, by itself, that a lowering-time version has no way to express.
+
+  What the lowering-time version is right about is that between lowering and
+  expansion the IR does not mean what it says. That is FINDINGS 70's actual
+  complaint, and the answer is that this is fine as a *named phase* and was not
+  fine as an undocumented thing one emitter did -- so `boot ssa` should dump
+  after expansion once the pass exists.
+
+  **A known compromise, named now.** Rooting by storing into an array forces a
+  rooted value live across the call, which is a shadow stack: portable, and
+  slower than what a real collector does. The alternative is stack maps emitted
+  *after register allocation*, which is where LLVM's statepoints and Go's maps
+  live, because only then is it known where a live pointer actually sits -- a
+  spilled pointer is not in an array anyone wrote to. Our way sidesteps that by
+  construction. The upgrade path exists and is phase 5's business, not this
+  one's.
+
 * **Phase 4.** Instruction selection, arm64, table-driven.
 
   Selection produces a machine-instruction *value*, never assembly text. That

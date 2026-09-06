@@ -566,6 +566,27 @@ Each phase runs and is verified before the next begins.
   the output format is -- and because the one thing none of the options do is
   remove the C toolchain, the runtime being C.
 * **Phase 3.** The four optimizations, one at a time, each measured.
+* **Phase 3.5 -- expansion, and it comes first.** The low IR does not contain
+  the language's semantics: overflow checks, division guards, panic
+  propagation and the entire GC root apparatus live in `Turkey.Llvm`, about
+  300 of its 1,388 lines. A second backend would write all of it again and the
+  two would have to agree about which values are live at a safepoint --
+  the shape of mistake FINDINGS 56, 59, 60 and 66 are all instances of, with
+  the worst failure mode of the four.
+
+  So: a pass over the low IR that rewrites checked arithmetic into an explicit
+  compare and branch, inserts the panic-flag test after each call, and
+  materializes the root frame. `SlotLoad` and `SlotStore` are already in the
+  IR and unemitted, and a root array is exactly the stack slot they were left
+  there for, so no opcode is added. Afterwards both emitters are dumb
+  translations and neither knows what a safepoint is -- and the pass's output
+  is checked by `Ssa.verify`, `LowIr.checkCalls` and differential execution,
+  none of which can see the version that lives inside an emitter.
+
+  Found by starting phase 4, which is the general lesson: a backend with one
+  consumer cannot tell which of its facts are in its IR and which are in its
+  emitter (FINDINGS 70).
+
 * **Phase 4.** Instruction selection, arm64, table-driven.
 
   Selection produces a machine-instruction *value*, never assembly text. That

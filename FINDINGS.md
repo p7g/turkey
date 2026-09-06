@@ -1448,6 +1448,49 @@ finish line, and a gap that has only a note in a design document is a gap
 that gets rediscovered.
 
 
+### 70. The low IR does not contain the language's semantics; the emitter does
+
+**compiler, open.** M28 phase 4. Writing the arm64 instruction type was the
+first thing to consume the low IR from somewhere other than `Turkey.Llvm`, and
+that immediately showed what is *not* in it.
+
+Overflow checks, division-by-zero checks, panic propagation after every call,
+and the whole GC root apparatus -- liveness at safepoints, slot assignment, the
+live mask, `turkey_root_enter`/`leave` -- are all in the **LLVM emitter**, about
+300 lines of `Llvm.tl`'s 1,388. None of it is in the IR. `boot ssa` prints a
+`Bin(Add, x, y)` that does not overflow-check and a `Call` that does not
+propagate a panic, and those are not the semantics of the language.
+
+Which means an arm64 backend would write all of it a second time, in a second
+language, and the two would have to agree about which values are live at a
+safepoint. This project has spent this session finding out what happens when
+one rule lives in two places: FINDINGS 56 and 59 (the same capture bug, twice,
+in two maps), 60 (a dictionary built at one field order and read at another),
+66 (wrapping and checked arithmetic sharing an opcode). A GC root set computed
+twice would be the same shape of mistake with the worst possible failure --
+silent, rare, and only under collection.
+
+The fix is a low-IR **expansion pass**, before either emitter: rewrite checked
+arithmetic into an explicit compare and branch, insert the panic-flag test
+after each call, and materialize the root frame. Then both emitters are dumb
+translations and neither knows what a safepoint is.
+
+Two things make this fit better than it had any right to. `SlotLoad` and
+`SlotStore` already exist in the low IR, unemitted, with a comment saying a
+genuine stack slot appears only when something genuinely needs one -- and a
+root array is exactly that, so the pass needs no new opcode. And the pass's
+output is checked by machinery that already exists: `Ssa.verify` runs on it,
+`LowIr.checkCalls` runs on it, and differential execution still runs the
+program. The version living inside the emitter is checked by none of those,
+because it never exists as IR.
+
+The finding is not "extract a pass". It is that **a backend with one consumer
+cannot tell which of its facts are in its IR and which are in its emitter**,
+and adding the second consumer is what asks the question. The low IR looked
+finished after M27 phase 2 and 28 corpus programs agreed with the reference;
+it was finished as *input to LLVM*, which is a weaker claim than it appeared.
+
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

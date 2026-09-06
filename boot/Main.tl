@@ -50,6 +50,7 @@ import Turkey.Coretc as Coretc
 import Turkey.Mono as Mono
 import Turkey.Joins as Joins
 import Turkey.Layout as Layout
+import Turkey.Arm64 as Arm64
 import Turkey.Llvm as Llvm
 import Turkey.LowIr as LowIr
 import Turkey.Ssa as Ssa

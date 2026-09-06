@@ -1332,6 +1332,73 @@ the stronger comparison: `.expected` is a file someone can update, and the
 reference implementation is not.
 
 
+### 66. Wrapping and checked arithmetic were the same opcode
+
+**compiler, fixed.** M27 phase 2. `Prim.intAdd` panics on overflow and
+`Prim.intAddWrapping` does not -- that is the whole reason the second exists --
+and both lowered to `Bin(Add, x, y)`. The IR comment even said so, cheerfully:
+"the wrapping forms are the same machine instruction; what differs is the
+overflow check the checked ones carry, and that is `Effects.traps`". It is not,
+because `Effects` is derived from the constructor and the constructor was the
+same.
+
+Invisible until the emitter started *emitting* the check. Then `Data.Map`'s
+hashing, which subtracts with wrapping on purpose, panicked with
+`integer overflow in -` and two programs stopped halfway.
+
+`BinOp` now has `AddWrap`, `SubWrap` and `MulWrap`. Which is the version this
+project's design already argued for: a constructor where a pass must match, so
+that a pass which has not been taught the difference fails to compile -- and
+the printer did exactly that, one warning, before anything ran. A flag on `Bin`
+would have been something to forget to read.
+
+It also makes `effectsOf` true rather than approximately true, which is what an
+optimizer will read: a wrapping add is pure and deletable when unused; a
+checked one is not.
+
+### 67. Three primitives answer storage, not an array
+
+**compiler, fixed.** M27 phase 2. `Prim.args`, `Prim.readFileBytes` and
+`Prim.stringToBytes` are typed `Array a`, and the runtime hands back only the
+flat contents -- an `Array` is a record carrying that storage and a length, and
+its tag belongs to the compilation rather than to the runtime. The Python
+backend wraps them; this one did not.
+
+Two of the three refused to compile and said so, which is how they were found.
+The third, `Prim.stringToBytes`, I had mapped straight through to
+`turkey_string_to_byte_storage` -- so it *compiled*, and returned raw storage
+where an `Array Byte` was expected. No corpus program calls `String.toBytes`,
+so nothing caught it; it went in with 27 of 28 passing and would have stayed
+until something used it.
+
+Worth stating plainly: the two that failed loudly cost twenty minutes and the
+one that failed quietly was a miscompile shipped in a green commit. The
+asymmetry is the whole argument for the refusal in FINDINGS 63.
+
+### 68. Nothing survives a collection, and nothing had noticed
+
+**compiler, open.** M27 phase 2. The native backend emits no GC root frames.
+Every corpus program passes anyway, because collection triggers at 1024
+allocations and none of them reaches it -- so the entire root-tracking
+obligation was untested and, until it was measured, unquantified.
+
+`TURKEY_GC_STRESS=1` collects at every allocation. Under it:
+
+```
+=== 0 survive GC stress, 28 do not
+```
+
+Twenty-seven `panic: invalid object field` and one bus error. Not "mostly
+works" -- nothing works, which is the honest state of the feature and a much
+better place to start from than a suspicion.
+
+The test is written and marked `xfail(strict=True)`, so the day roots are
+emitted these stop being expected failures and the marker has to come off.
+That is the shape worth reusing: a gap that has a *test* is a gap with a
+finish line, and a gap that has only a note in a design document is a gap
+that gets rediscovered.
+
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

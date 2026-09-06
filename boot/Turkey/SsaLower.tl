@@ -1522,6 +1522,31 @@ fun primitive(l : Lower, e : Core, name : String, args : Array Value,
         return L.emit(l.b, ArrayNew(args[0], zero(l, element), element.class_),
                       Ssa.traced(Ptr))
     }
+    -- Three primitives answer raw *storage* where the language's type says
+    -- `Array a`. The runtime allocates the flat contents and can go no
+    -- further: an `Array` is a record carrying the storage and a length, and
+    -- its tag lives in this compilation rather than in the runtime. So the
+    -- wrapper is built here, which is what `turkey/backend_lower.py` does and
+    -- for the same reason -- `array_parts` reads the shape back structurally
+    -- on the way *in*, needing no tags; only building one needs them.
+    if name == "Prim.args" && len(args) == 0 {
+        return storageArray(l, L.emit(l.b, Call(Runtime("Prim.argsStorage"), []),
+                                      Ssa.traced(Ptr)))
+    }
+    if name == "Prim.readFileBytes" && len(args) == 1 {
+        return storageArray(l, L.emit(l.b, Call(Runtime("Prim.readFileStorage"),
+                                                args), Ssa.traced(Ptr)))
+    }
+    if name == "Prim.stringToBytes" && len(args) == 1 {
+        -- The length is the *string's* byte length rather than the storage's
+        -- element count. They agree here, and asking the string is what the
+        -- Python backend does; the storage's own count is the allocation's.
+        let raw = L.emit(l.b, Call(Runtime("Prim.stringToByteStorage"), args),
+                         Ssa.traced(Ptr))
+        let length = L.emit(l.b, Call(Runtime("Prim.stringByteLength"), args),
+                            Ssa.untraced(I64))
+        return wrapArray(l, raw, length)
+    }
     match binOp(name) {
         Some(o) -> if len(args) == 2 {
             return L.emit(l.b, Bin(o, args[0], args[1]), rep)
@@ -1534,9 +1559,14 @@ fun primitive(l : Lower, e : Core, name : String, args : Array Value,
         }
         None -> {}
     }
-    if (name == "Prim.intNeg" || name == "Prim.intNegWrapping"
-            || name == "Prim.floatNeg") && len(args) == 1 {
+    if (name == "Prim.intNeg" || name == "Prim.floatNeg") && len(args) == 1 {
         return L.emit(l.b, Neg(args[0]), rep)
+    }
+    -- Wrapping negation is `0 - x` without the check, which is what `SubWrap`
+    -- already is; `Neg` traps.
+    if name == "Prim.intNegWrapping" && len(args) == 1 {
+        let zero = L.emit(l.b, ConstInt(0), rep)
+        return L.emit(l.b, Bin(SubWrap, zero, args[0]), rep)
     }
     match conversion(name) {
         Some(c) -> if len(args) == 1 {
@@ -1548,6 +1578,49 @@ fun primitive(l : Lower, e : Core, name : String, args : Array Value,
         return L.emit(l.b, Not(args[0]), rep)
     }
     L.emit(l.b, Call(Runtime(name), args), rep)
+}
+
+-- Storage the runtime allocated at exactly the length it holds, so its own
+-- element count is the length.
+fun storageArray(l : Lower, raw : Value) -> Value =
+    wrapArray(l, raw, L.emit(l.b, ArrayLength(raw), Ssa.untraced(I64)))
+
+-- `Data.Array#Array` around raw storage and the length it holds.
+--
+-- The `Array` constructor is a newtype and is usually not built at all: what a
+-- value of `Array a` *is* is the `ArrayStorage a` record. The outer object is
+-- emitted only when the erasure did not happen, which keeps this one place
+-- from being a second opinion about `Decls.newtypes`.
+fun wrapArray(l : Lower, storage : Value, length : Value) -> Value {
+    let order = Map.getOr(l.fields, "Data.Array#ArrayStorage", [])
+    let by = Map.new()
+    Map.put(by, "storage", storage)
+    Map.put(by, "length", length)
+    let ordered = []
+    for field in order {
+        match Map.get(by, field) {
+            Some(v) -> Array.push(ordered, v)
+            None -> {}
+        }
+    }
+    if len(ordered) != 2 {
+        return stop(l, "'Data.Array#ArrayStorage' does not have the fields "
+                       + "raw storage is wrapped in")
+    }
+    let reps = Array.map(ordered, fun(v) = Ssa.repOf(l.func, v))
+    let inner = L.emit(l.b, ObjectNew(1, Map.getOr(l.tags,
+                                                   "Data.Array#ArrayStorage", -1),
+                                      len(ordered), metadata(reps)),
+                       Ssa.traced(Ptr))
+    for var i = 0; i < len(ordered); i = i + 1 {
+        L.effect(l.b, ObjectSet(inner, i, ordered[i]))
+    }
+    if Set.contains(Decls.newtypes(l.decls), "Data.Array#Array") { return inner }
+    let outer = L.emit(l.b, ObjectNew(1, Map.getOr(l.tags, "Data.Array#Array", -1),
+                                      1, metadata([Ssa.traced(Ptr)])),
+                       Ssa.traced(Ptr))
+    L.effect(l.b, ObjectSet(outer, 0, inner))
+    outer
 }
 
 -- The element representation of an array type.
@@ -1577,11 +1650,13 @@ fun binOp(name : String) -> Option BinOp = match name {
     "Prim.intXor" -> Some(Xor)
     "Prim.intShl" -> Some(Shl)
     "Prim.intShr" -> Some(Shr)
-    -- The wrapping forms are the same machine instruction; what differs is
-    -- the overflow check the checked ones carry, and that is `Effects.traps`.
-    "Prim.intAddWrapping" -> Some(Add)
-    "Prim.intSubWrapping" -> Some(Sub)
-    "Prim.intMulWrapping" -> Some(Mul)
+    -- Distinct opcodes, not the same one: what differs is whether overflow
+    -- panics, and a backend that could not tell them apart emitted an
+    -- overflow check on `Data.Map`'s hashing and panicked on a subtraction
+    -- the language says wraps.
+    "Prim.intAddWrapping" -> Some(AddWrap)
+    "Prim.intSubWrapping" -> Some(SubWrap)
+    "Prim.intMulWrapping" -> Some(MulWrap)
     "Prim.floatAdd" -> Some(Add)
     "Prim.floatSub" -> Some(Sub)
     "Prim.floatMul" -> Some(Mul)

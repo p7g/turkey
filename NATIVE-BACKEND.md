@@ -530,18 +530,18 @@ Each phase runs and is verified before the next begins.
   because the lowering keeps an invariant worth stating: only a `Jump` carries
   arguments and a `Branch`'s targets take none, so no edge has to be split.
 
-  Status: **27 of the 28 corpus programs** compile to native binaries whose
-  output is byte-identical to the reference implementation running the same
-  source. `system.tl` is the one that does not, and it says why -- `Prim.args`
-  and `Prim.readFileBytes` answer raw storage that the lowering must wrap in an
-  `Array`, which `backend_lower.py` does and `SsaLower` does not yet.
+  Status: **all 28 corpus programs** compile to native binaries whose output is
+  byte-identical to the reference implementation running the same source.
+  Overflow, division-by-zero and panic propagation are all checked -- each is a
+  guard that *splits* a block, which is why a block's phis name the label
+  control left from rather than the one it entered.
 
-  Not done, and not needed for those 27: **GC root frames**. Collection
-  triggers at 1024 allocations, so a program under that never collects and runs
-  correctly without them; `TURKEY_GC_STRESS=1` collects at every allocation and
-  is exactly the test that will demand them. **Panic propagation** is the other
-  gap -- `turkey_panic` sets a flag and returns, so a panicking callee needs a
-  `turkey_panicked()` check after every call, which nothing emits yet.
+  Not done: **GC root frames**. Collection triggers at 1024 allocations, so a
+  program under that never collects and the whole obligation is untested by an
+  ordinary run. `TURKEY_GC_STRESS=1` collects at every allocation, and under it
+  **0 of 28 survive** -- twenty-seven `invalid object field` panics and one bus
+  error. `tests/test_native.py` carries that as a strict `xfail`, so the day
+  roots are emitted the marker has to come off.
 
   `boot build` is blocked on something small and external: `boot` cannot start
   a process, because there is no `Prim.exec`. It emits the module -- which is

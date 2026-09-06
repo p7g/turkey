@@ -40,7 +40,17 @@ import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..),
                    Effects(..), Inst(..), Term(..), Block(..), Func(..))
 
+-- `AddWrap`, `SubWrap` and `MulWrap` are the same machine instruction as
+-- `Add`, `Sub` and `Mul` and a different *opcode*, because what differs is
+-- whether overflow panics -- `Prim.intAdd` traps and `Prim.intAddWrapping`
+-- does not (PRIMITIVES.md 1.1). Encoding that as a flag on `Bin` would make
+-- it something a pass can forget to read; as a constructor, a pass that has
+-- not been taught the difference fails to compile.
+--
+-- It also makes `effectsOf` truthful, which is what an optimizer will read: a
+-- wrapping add is pure and deletable when unused, and a checked one is not.
 type BinOp = Add | Sub | Mul | Div | Rem | And | Or | Xor | Shl | Shr | ShrU
+           | AddWrap | SubWrap | MulWrap
 
 -- Signed comparison. `Ne`, `Le` and `Gt` are here rather than desugared to a
 -- negation because a machine has them and instruction selection would only
@@ -536,6 +546,11 @@ instance Show BinOp {
     Shl -> "shl"
     Shr -> "shr"
     ShrU -> "shru"
+    -- Spelled apart from the checked forms, because a dump that printed them
+    -- the same would hide the one difference that matters about them.
+    AddWrap -> "add.wrap"
+    SubWrap -> "sub.wrap"
+    MulWrap -> "mul.wrap"
   }
 }
 

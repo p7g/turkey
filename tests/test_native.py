@@ -37,11 +37,10 @@ BOOT_MAIN = REPO_ROOT / "boot" / "Main.tl"
 PROGRAMS = REPO_ROOT / "tests" / "programs"
 RUNTIME = REPO_ROOT / "runtime" / "turkey_runtime.c"
 
-# `system.tl` is the one program that does not compile yet, and it says why:
-# `Prim.args` and `Prim.readFileBytes` answer raw storage that the lowering
-# must wrap in an `Array`. Named here rather than silently skipped, so that
-# making it work is a test that starts passing.
-UNSUPPORTED = {"system.tl"}
+# Every corpus program compiles and runs. The set is kept because naming what
+# does not work is how the previous gaps got closed: a program listed here is a
+# test that starts passing.
+UNSUPPORTED: set[str] = set()
 
 CORPUS = sorted(
     path.name for path in PROGRAMS.glob("*.tl")
@@ -126,17 +125,58 @@ def test_the_corpus_compiles_and_agrees_with_the_reference(name):
         f"{name}: native output differs from the reference implementation")
 
 
-@pytest.mark.parametrize("name", sorted(UNSUPPORTED))
-def test_what_does_not_compile_says_so(name):
-    """An unsupported program is refused, not silently miscompiled.
+def test_nothing_is_refused():
+    """No module reports a form or a primitive it could not emit.
 
-    A primitive with no emission rule used to become a zero of the wrong type,
-    which `cc` rejected somewhere unrelated -- and which would have become a
-    wrong program wherever the types happened to line up (FINDINGS 63).
+    The refusal itself is still there and still matters -- a primitive with no
+    rule would become a zero of the wrong type, which `cc` rejects somewhere
+    unrelated and which would compile a *wrong program* wherever the types
+    happened to line up (FINDINGS 63). This asserts it never fires.
     """
-    text = _modules()[name]
-    assert "; FAILED:" in text, text[:400]
-    assert "no rule for" in text
+    refused = {name: text for name, text in _modules().items()
+               if "; FAILED:" in text}
+    assert not refused, sorted(refused)
+
+
+def test_integer_overflow_panics():
+    """`Int` arithmetic traps; `Prim.int*Wrapping` does not.
+
+    Both are `Bin` in the low IR and they are *different opcodes*, because a
+    backend that could not tell them apart put an overflow check on
+    `Data.Map`'s hashing and panicked on a subtraction the language says wraps.
+    """
+    text = _modules()["operators.tl"]
+    assert "llvm.sadd.with.overflow.i64" in text
+    assert "integer overflow in +" in text
+
+
+def test_a_panic_in_a_callee_stops_the_caller():
+    """`turkey_panic` sets a flag and returns -- there is no unwinding.
+
+    So a caller that did not look would carry on with a value the callee never
+    produced. Every call is followed by a check.
+    """
+    text = _modules()["adt.tl"]
+    assert "@turkey_has_panicked" in text
+
+
+@pytest.mark.parametrize("name", COMPILABLE)
+@pytest.mark.xfail(reason="GC root frames are not emitted yet: collection at "
+                          "every allocation frees live objects", strict=True)
+def test_the_corpus_survives_collection(name):
+    """The same programs, collecting at every allocation.
+
+    A program allocating fewer than 1024 objects never collects, which is why
+    the corpus passes without root frames at all -- and why this is the test
+    that says whether they are there. Marked strict, so the day roots land
+    these stop being expected failures and the marker has to come off.
+    """
+    if _cc() is None:
+        pytest.skip("no C compiler")
+    binary = _binary(name)
+    result = subprocess.run([str(binary)], capture_output=True, text=True,
+                            env={"TURKEY_GC_STRESS": "1", "PATH": "/usr/bin"})
+    assert result.returncode == 0 and result.stdout == _reference(name)
 
 
 def test_block_parameters_became_phis():

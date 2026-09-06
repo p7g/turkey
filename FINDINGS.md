@@ -1255,6 +1255,83 @@ The general form: when a tool documents how it wants to be called, the cost of
 ignoring it is not proportional to the mistake.
 
 
+### 65. The same startup cost, ignored a second time -- by the finding's author
+
+**tooling, mine.** M27 phase 2. FINDINGS 61 measured that starting `boot`
+costs 2:42 and compiling a program costs half a second, and concluded that a
+tool documenting how it wants to be called should be called that way. Then I
+added `boot llvm`, which emits one module, and wrote a corpus harness running
+one process per program: 28 x 2:50 of work, twenty minutes wall even at eight
+in parallel.
+
+The user asked why it was twenty minutes. It did not have to be. Two modules
+cannot share a `.ll` *file* -- the symbols collide -- but they can share a
+*run*, and `boot llvm` now prints `; === <path>` before each module so a
+caller splits them afterwards. That is the same trick every other dump in
+`Main.tl` already uses, described in its header, which is where FINDINGS 61
+found it the first time.
+
+**3:34** for the whole corpus, against twenty minutes. The lesson is not the
+one already written down; it is that writing a finding down does not install
+it. The next command I add will have the same shape, and the check is whether
+a *batch* of work can be one process -- asked when the command is designed,
+not when the harness is slow.
+
+### 62. A signed one-bit integer, and what `False < True` compiles to
+
+**compiler, fixed.** M27 phase 2. The LLVM emitter chose `icmp slt` for every
+integer comparison, because Turkey's `Int` is signed and that seemed to be the
+rule. It is not: `Int` is the *only* signed type the language has. `Bool` is
+`i1`, `Byte` is `i8`, `Char` is `i32`, and all three are ordered as magnitudes.
+
+A signed one-bit integer holds 0 and -1, so `False < True` became
+`icmp slt i1 0, -1` and answered **false**. One line of `operators.tl`'s output
+was wrong and the other twenty-five programs were right, which is exactly the
+shape of bug that a spot check misses and a corpus catches.
+
+The rule is now stated by width -- `i64` is signed, everything else is not --
+rather than by listing which primitives are unsigned, which is how
+`turkey/llvmgen.py` says the same thing. Worth noticing that the two
+implementations reached it from opposite ends and only the one that reasoned
+from the *type* got it right first: the one reasoning from the primitive names
+had to enumerate `byteLt`, `charLt`, `boolLt` and remember not to add `intLt`.
+
+### 63. An unimplemented case that lies about its type
+
+**compiler, fixed.** M27 phase 2. A primitive with no emission rule produced
+`add i8 0, 0` and a comment saying so. That is wrong twice over. `cc` rejected
+the module at whatever unrelated instruction first consumed the value --
+`br i1 %v1` where `%v1` was `i8`, several hundred lines from the cause -- and
+where the types *happened* to line up it would have compiled a wrong program
+instead.
+
+The placeholder now has the type the value's `Rep` promised, and the emitter
+collects the missing names and refuses the module:
+
+```
+boot: cannot emit LLVM: no rule for Prim.args, Prim.readFileBytes
+```
+
+Which is the same discipline the lowering already had -- report what is not
+handled, do not improvise -- applied one layer down. The general form: a
+placeholder that is *well typed* is more dangerous than one that is not,
+because the compiler stops catching it.
+
+### 64. Compiling a program is not running it, and `.expected` knows the difference
+
+**testing.** M27 phase 2. The first corpus check diffed each native binary's
+output against `tests/programs/*.expected` and reported `exhaustive.tl` as a
+failure. It was not: that file contains three *compile-time warnings*, which
+`turkey run` prints because it compiles and runs in one process, and which a
+compiled binary cannot print because its compile time was hours ago.
+
+The oracle for this phase is differential *execution*, which
+`NATIVE-BACKEND.md` says plainly -- so the check now runs
+`python3 -m turkey run` on the same program and diffs against that. It is also
+the stronger comparison: `.expected` is a file someone can update, and the
+reference implementation is not.
+
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

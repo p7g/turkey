@@ -520,6 +520,32 @@ Each phase runs and is verified before the next begins.
 * **Phase 2.** Low IR to LLVM IR text, and `boot build`. The conformance suite
   runs under differential execution. **`boot` is self-sufficient here**, and
   everything above this line is now exercised by every program in the suite.
+
+  Three things make the text form less work than `llvmgen.py`'s library form.
+  **Opaque pointers** (LLVM 15+) remove almost every bitcast, since most of
+  them existed only to satisfy a type system this level does not need.
+  **Quoted symbols** take `#`, `@`, `%` and commas, so there is no mangling
+  scheme to invent and later regret -- the symbol in the object file is the
+  name in Core. And **block parameters become phis only here**, mechanically,
+  because the lowering keeps an invariant worth stating: only a `Jump` carries
+  arguments and a `Branch`'s targets take none, so no edge has to be split.
+
+  Status: **27 of the 28 corpus programs** compile to native binaries whose
+  output is byte-identical to the reference implementation running the same
+  source. `system.tl` is the one that does not, and it says why -- `Prim.args`
+  and `Prim.readFileBytes` answer raw storage that the lowering must wrap in an
+  `Array`, which `backend_lower.py` does and `SsaLower` does not yet.
+
+  Not done, and not needed for those 27: **GC root frames**. Collection
+  triggers at 1024 allocations, so a program under that never collects and runs
+  correctly without them; `TURKEY_GC_STRESS=1` collects at every allocation and
+  is exactly the test that will demand them. **Panic propagation** is the other
+  gap -- `turkey_panic` sets a flag and returns, so a panicking callee needs a
+  `turkey_panicked()` check after every call, which nothing emits yet.
+
+  `boot build` is blocked on something small and external: `boot` cannot start
+  a process, because there is no `Prim.exec`. It emits the module -- which is
+  the compiler -- and one `cc` invocation links it against the runtime.
 * **Phase 3.** The four optimizations, one at a time, each measured.
 * **Phase 4.** Instruction selection, arm64, table-driven.
 * **Phase 5.** Register allocation, stack maps, encoding, object emission.

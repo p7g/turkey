@@ -50,6 +50,7 @@ import Turkey.Coretc as Coretc
 import Turkey.Mono as Mono
 import Turkey.Joins as Joins
 import Turkey.Layout as Layout
+import Turkey.Llvm as Llvm
 import Turkey.LowIr as LowIr
 import Turkey.Ssa as Ssa
 import Turkey.SsaLower as SsaLower
@@ -67,8 +68,8 @@ fun main() {
     if len(args) < 2 { usage() }
     let command = args[0]
     if !Array.contains(["tokens", "ast", "desugar", "decls", "deps",
-                    "classes", "types", "core", "mono", "opt", "ssa"],
-                    command) {
+                    "classes", "types", "core", "mono", "opt", "ssa",
+                    "llvm"], command) {
         die("unknown command '" + command + "'")
     }
     -- One builder for every file: a `print` per token is a flush per token,
@@ -88,6 +89,7 @@ fun main() {
             "core" -> dumpCore(b, path)
             "mono" -> dumpMono(b, path)
             "ssa" -> dumpSsa(b, path)
+            "llvm" -> dumpLlvm(b, path)
             _ -> dumpOpt(b, path)
         }
     }
@@ -343,6 +345,46 @@ fun dumpOpt(b : String.Builder, path : String) -> Unit {
     let (checked, entry) = checkProgram(path)
     let optimized = optimized(checked, entry)
     String.push(b, Core.showProgram(optimized, Some(entry.name)))
+}
+
+-- The program as LLVM IR text, ready for `cc` (`NATIVE-BACKEND.md` phase 2).
+--
+-- Written to stdout like every other dump, because `boot` has no way to start
+-- a process: there is no `Prim.exec`, so it cannot invoke the C compiler
+-- itself the way a finished `boot build` would. What it can do is emit the
+-- whole module, which is the compiler; linking it against the runtime is one
+-- `cc` invocation that the test harness makes.
+fun dumpLlvm(b : String.Builder, path : String) -> Unit {
+    let (checked, entry) = checkProgram(path)
+    let program = optimized(checked, entry)
+    let (module_, skipped) = SsaLower.lowerProgram(program, checked.decls)
+    if len(skipped) > 0 {
+        -- Emitting a module with a function missing would produce a link
+        -- error a long way from its cause. Reported rather than fatal, so one
+        -- program in a batch does not cost the rest.
+        String.push(b, "; === " + path + "\n; FAILED: "
+                       + Int.toString(len(skipped)) + " bindings did not lower\n")
+        return
+    }
+    let main = Map.getOr(entry.scope.values, "main", "main")
+    let (text, missing) = Llvm.emitModule(module_, main)
+    -- One marker per module, so several programs can be compiled by *one*
+    -- process. Two modules cannot share a `.ll` file -- the symbols collide --
+    -- but they can share a run, and starting this program means compiling it:
+    -- 2:42 of the 2:50 a program costs is `boot` itself (FINDINGS 61). A
+    -- caller splits on this line; every other dump concatenates unambiguously
+    -- for the same reason and this is the marker that makes it true here too.
+    String.push(b, "; === " + path + "\n")
+    if len(missing) > 0 {
+        -- Refused rather than emitted. A primitive with no rule used to become
+        -- a zero of the wrong type, which `cc` rejected somewhere unrelated --
+        -- and would have become a wrong *program* wherever the types happened
+        -- to line up.
+        String.push(b, "; FAILED: no rule for " + String.join(missing, ", ")
+                       + "\n")
+        return
+    }
+    String.push(b, text)
 }
 
 -- The low IR, and how much of the program reached it.

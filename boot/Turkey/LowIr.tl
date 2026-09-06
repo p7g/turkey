@@ -360,6 +360,11 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Array String {
         ArraySet(_, index, _) -> wantClass(f, out, index, I64, "an array index")
         ArrayNew(length, _, _) -> wantClass(f, out, length, I64, "an array length")
         Unbox(a) -> wantClass(f, out, a, Ptr, "the operand of an unbox")
+        -- A machine has no integer constant of floating type, so an integer
+        -- literal at `f64` has to have become a float before it gets here.
+        ConstInt(_) -> if Ssa.repOf(f, i.result).class_ == F64 {
+            Array.push(out, "an integer constant is held at f64")
+        }
         ClosureCapture(c, _, _) ->
             wantClass(f, out, c, Ptr, "the target of a closure capture")
         Call(callee, _) -> match callee {

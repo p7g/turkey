@@ -1,5 +1,5 @@
 module Turkey.SsaLower (
-    Unsupported(..), Signature(..), Lifting(..),
+    Unsupported(..), Signature(..), Lifting(..), Module(..),
     lowerBind, lowerProgram, tagsOf, signatures, signatureOf, adapterSymbol,
 )
 
@@ -1364,7 +1364,16 @@ fun constructor(l : Lower, e : Core, name : String, args : Array Core,
 }
 
 fun literal(l : Lower, lit : Lit, rep : Rep) -> Value = match lit {
-    LInt(n) -> L.emit(l.b, ConstInt(n), rep)
+    -- An integer literal at a float representation is an integer literal
+    -- whose *type* is `Float` -- `1` where `1.0` was meant, which the surface
+    -- language accepts. The constant has to become a float here, because
+    -- `ConstInt` at `f64` is not a thing a machine has and every backend
+    -- below would have to invent the same conversion.
+    LInt(n) -> if rep.class_ == F64 {
+        L.emit(l.b, ConstFloat(Float.fromInt(n)), rep)
+    } else {
+        L.emit(l.b, ConstInt(n), rep)
+    }
     LFloat(x) -> L.emit(l.b, ConstFloat(x), rep)
     LString(s) -> L.emit(l.b, ConstString(s), Ssa.traced(Ptr))
     LChar(c) -> L.emit(l.b, ConstInt(Char.toInt(c)), rep)

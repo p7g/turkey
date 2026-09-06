@@ -616,11 +616,18 @@ Each phase runs and is verified before the next begins.
 
   So the split is not "early or late" but **neutral or not**:
 
-  * **Panic propagation and GC roots are target-neutral.** A flag test and a
-    branch; stores of pointers into an array and a mask. Both targets do
-    literally the same thing, both are expressible in opcodes the IR already
-    has, and both *remove* nothing -- so no opcode changes meaning and the
-    phase question does not arise. These are the ~190 lines worth hoisting.
+  * **GC roots are target-neutral, and the neutral part is the *analysis*.**
+    Done: `Turkey.Roots`, 171 lines, answering which values are live across
+    which safepoint and what slot each gets. The *emission* -- storing a
+    pointer into an array and writing a mask -- stayed in the emitter, because
+    it is five lines anyone would write the same way and it is not what two
+    backends could disagree about. Hoisting the analysis removes the hazard;
+    hoisting the emission would have removed duplication that was never
+    dangerous, and would have cost the IR an opcode for the address of a stack
+    slot.
+  * **Panic propagation is target-neutral too, and has no analysis at all** --
+    it is "after every call", which is not a rule two backends can disagree
+    about. Left in each emitter.
   * **Overflow and division guards stay in each emitter**, at about 80 lines
     each, because each emitter writes a different and better sequence. Two
     implementations of one *rule* is the hazard; two encodings of one *check*

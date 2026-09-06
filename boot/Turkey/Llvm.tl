@@ -38,6 +38,7 @@ import Data.Set as Set
 import Turkey.LowIr as L
 import Turkey.LowIr (Op(..), Low(..), BinOp(..), CmpOp(..), Conv(..),
                      Callee(..))
+import Turkey.Roots as Roots
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..), Term(..),
                    Func(..), Block(..))
@@ -410,20 +411,22 @@ fun emitFunc(e : Emit, f : Func Low) -> Unit {
         Array.push(params, typeOf(Ssa.repOf(f, p)) + " " + reg(p))
     }
     let incoming = incomingOf(f)
-    let live = Ssa.liveness(f)
-    e.slots = rootSlots(f, live)
+    -- Which values the collector must find, and where. Shared with every
+    -- other backend rather than recomputed here: the emission below is five
+    -- lines anyone would write the same way, and the *analysis* is the part
+    -- two backends could disagree about silently. See `Turkey.Roots`.
+    let frame = Roots.analyze(f)
+    e.slots = frame.slots
     let bodies = []
     let exits = []
     let outer = e.out
     for var b = 0; b < len(f.blocks); b = b + 1 {
         e.out = String.builder()
         e.at = label(BlockId(b))
-        let after = Ssa.liveAfter(f, BlockId(b), live[b])
         let insts = Ssa.blockAt(f, BlockId(b)).insts
         for var n = 0; n < len(insts); n = n + 1 {
-            -- The roots are published *before* the call, naming what must
-            -- survive it, which is what is live after it.
-            if isSafepoint(insts[n].op) { publish(e, f, after[n], insts[n]) }
+            -- Published before the call, naming what must survive it.
+            publish(e, Roots.liveAt(frame, b, n))
             emitInst(e, f, insts[n])
         }
         Array.push(exits, e.at)
@@ -446,89 +449,6 @@ fun emitFunc(e : Emit, f : Func Low) -> Unit {
 }
 
 -- -- garbage collection roots -----------------------------------------------------------
-
--- Which traced values need a slot, and which slot each gets.
---
--- Only the ones live *across* a safepoint. A pointer that is dead by the time
--- a call happens does not have to survive it, and a pointer never live across
--- one is only ever in a register the collector does not need to see -- so the
--- set is usually a small fraction of a function's pointers, and it is the
--- difference between a root array the size of the live set and one the size of
--- the function (FINDINGS 55).
-fun rootSlots(f : Func Low, live : Array (Set.Set Int)) -> Map Int Int {
-    let needed = Set.new()
-    for var b = 0; b < len(f.blocks); b = b + 1 {
-        let after = Ssa.liveAfter(f, BlockId(b), live[b])
-        let insts = Ssa.blockAt(f, BlockId(b)).insts
-        for var n = 0; n < len(insts); n = n + 1 {
-            if isSafepoint(insts[n].op) {
-                for id in Set.elements(across(f, after[n], insts[n])) {
-                    Set.add(needed, id)
-                }
-            }
-        }
-    }
-    let out = Map.new()
-    -- Sorted, so the slot a value gets does not depend on a set's iteration
-    -- order and two runs produce the same module.
-    let ids = Array.sort(Set.elements(needed))
-    for var i = 0; i < len(ids); i = i + 1 { Map.put(out, ids[i], i) }
-    out
-}
-
--- The traced values live *across* a safepoint, which is not the same as those
--- live after it.
---
--- An argument whose last use is this very call is dead afterwards and is still
--- needed *during* it: the callee holds it, and the collector may run while it
--- does. Rooting only what survives the call freed `Int.toString`'s result
--- while `turkey_string_concat` was reading it, and "circle of 5" came out
--- "circle of c".
---
--- The result goes the other way and must *not* be rooted: it does not exist
--- until the collection is over, so storing it would be a use before its
--- definition -- not merely useless but not SSA, which clang answers with a
--- segfault rather than a diagnosis.
---
--- Both halves are stated in `turkey/llvmgen._safepoint_live`'s comment, which
--- is where this should have been read from rather than reasoned out.
---
--- One function, because the slot assignment and the publish must agree about
--- exactly this set: a value in one and not the other is either a root with no
--- slot or a slot never written.
-fun across(f : Func Low, live : Set.Set Int, i : Low) -> Set.Set Int {
-    let out = Set.new()
-    for id in Set.elements(live) {
-        if id != Ssa.valueId(i.result) && traced(f, id) { Set.add(out, id) }
-    }
-    for v in Ssa.uses(i) {
-        let id = Ssa.valueId(v)
-        if id != Ssa.valueId(i.result) && traced(f, id) { Set.add(out, id) }
-    }
-    out
-}
-
-fun traced(f : Func Low, id : Int) -> Bool =
-    if id < 0 || id >= len(f.reps) { False } else { f.reps[id].traced }
-
--- An operation the collector may run inside.
---
--- Every call, and every allocation. Being wrong in the *inclusive* direction
--- costs a store and a mask write; being wrong the other way frees a live
--- object under the program's feet, so a call that cannot itself allocate is
--- listed anyway -- it may call one that can.
-fun isSafepoint(op : Op) -> Bool = match op {
-    Call(_, _) -> True
-    ObjectNew(_, _, _, _) -> True
-    ArrayNew(_, _, _) -> True
-    CellNew(_) -> True
-    ClosureNew(_, _, _) -> True
-    ClosureCapture(_, _, _) -> True
-    Box(_) -> True
-    Unbox(_) -> True
-    ConstString(_) -> False
-    _ -> False
-}
 
 -- The root frame, in the entry block.
 --
@@ -565,21 +485,14 @@ fun enterFrame(e : Emit, f : Func Low) -> Unit {
 -- every path pay for the ones it never takes. The runtime's `live` field is
 -- exactly this, and the comment on it in `turkey_runtime.c` is the measurement
 -- that put it there.
-fun publish(e : Emit, f : Func Low, live : Set.Set Int, i : Low) -> Unit {
-    if len(e.slots) == 0 { return }
+fun publish(e : Emit, stored : Array (Int, Int)) -> Unit {
+    if len(e.slots) == 0 || len(stored) == 0 { return }
     var mask = 0
-    let stored = []
-    for id in Array.sort(Set.elements(across(f, live, i))) {
-        match Map.get(e.slots, id) {
-            Some(slot) -> {
-                Array.push(stored, (slot, id))
-                -- `Int.or`, not `+`: bit 63 is the sign bit of a signed
-                -- 64-bit integer, and adding it to a mask that already has
-                -- bits set overflows -- which now panics.
-                if slot < 64 { mask = Int.or(mask, Int.shl(1, slot)) }
-            }
-            None -> {}
-        }
+    for (slot, _) in stored {
+        -- `Int.or`, not `+`: bit 63 is the sign bit of a signed 64-bit
+        -- integer, and adding it to a mask that already has bits set
+        -- overflows -- which now panics.
+        if slot < 64 { mask = Int.or(mask, Int.shl(1, slot)) }
     }
     for (slot, id) in stored {
         let address = fresh(e)

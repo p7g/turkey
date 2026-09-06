@@ -595,26 +595,54 @@ Each phase runs and is verified before the next begins.
   because `nilcheckelim` and `prove` can *delete* them; write barriers go in
   late because nothing can, and an early one would only be in the way.
 
-  The rule that falls out is: **early if an optimization can use it, late if it
-  can only be obstructed by it.** Which splits the three:
+  **But not all three, and the arithmetic is the one to leave alone.** Expanding
+  a trapping `Bin(Add, ...)` into a check plus a wrapping add would give the
+  opcode two meanings -- traps before the pass, cannot appear after it -- with
+  nothing enforcing which phase a function is in. That is the same "one enum
+  spanning two levels" this design rejected for virtual and machine opcodes,
+  reappearing a level up. Getting the guarantee back would mean a third
+  instantiation, an instruction type differing from `Low` by about six
+  constructors out of thirty; nanopass would *generate* that from a diff and
+  Turkey cannot, so it is 80% duplication for a guarantee about 20%. The
+  selection case is worth it because the two languages share almost nothing.
+  This one is not.
 
-  * **Overflow and division guards -- late, for now.** They could be removed by
-    range analysis, and there is none: QBE's four are copy elimination, SCCP,
-    dead code and slot promotion, and none of them narrows an integer. So today
-    they are pure obstruction -- and worse than neutral, because `effectsOf`
-    says a checked `Bin` *traps*, which is exactly what DCE reads to decide it
-    cannot be deleted. Expand it into a real branch and that fact becomes a
-    control-flow join instead, which is strictly less information. **This is
-    the one whose answer changes**: add range analysis and the guards want to
-    be early, where it can see them.
+  The second problem is the deciding one. Testing overflow without hardware
+  flags needs either a new opcode or four wrapping operations to compute it by
+  hand -- and **the check is precisely the part each target does differently
+  and better**. LLVM wants `llvm.sadd.with.overflow`; arm64 wants `adds` and
+  `b.vs`, reading a flag the IR has no way to name. A target-neutral expansion
+  would pessimize both, and it would be the only part of the pass that does.
+
+  So the split is not "early or late" but **neutral or not**:
+
+  * **Panic propagation and GC roots are target-neutral.** A flag test and a
+    branch; stores of pointers into an array and a mask. Both targets do
+    literally the same thing, both are expressible in opcodes the IR already
+    has, and both *remove* nothing -- so no opcode changes meaning and the
+    phase question does not arise. These are the ~190 lines worth hoisting.
+  * **Overflow and division guards stay in each emitter**, at about 80 lines
+    each, because each emitter writes a different and better sequence. Two
+    implementations of one *rule* is the hazard; two encodings of one *check*
+    is the job.
+
+  The rule for *when* the neutral parts run is still Go's: **early if an
+  optimization can use it, late if it can only be obstructed by it.**
+
   * **Panic propagation -- late, definitively.** Every call becomes a block
     terminator, so the block count roughly triples and every analysis after it
     -- liveness, dominance, the allocator -- pays for a branch that is never
     taken. Nothing can optimize it away.
   * **GC roots -- last, and not merely late.** They need liveness over the
-    *final* CFG, and the other two expansions change it. Roots computed at
-    lowering time would be a liveness answer about a graph that does not exist
-    yet. That is not a preference; it is a correctness argument.
+    *final* CFG, and the panic branches change it. Roots computed at lowering
+    time would be a liveness answer about a graph that does not exist yet. That
+    is not a preference; it is a correctness argument.
+
+  Keeping the arithmetic abstract also keeps a fact the optimizer reads:
+  `effectsOf` says a checked `Bin` *traps*, which is how DCE knows it cannot
+  delete an unused one. Expanded into a branch, that becomes a control-flow
+  join instead -- strictly less information, and the reason the guards would
+  have wanted to be late even if they were neutral.
 
   The separate pass also buys an oracle the lowering cannot have: it can be
   **toggled**. Run the corpus with and without it and the output must be

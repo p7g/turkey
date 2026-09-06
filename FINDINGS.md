@@ -1470,10 +1470,21 @@ in two maps), 60 (a dictionary built at one field order and read at another),
 twice would be the same shape of mistake with the worst possible failure --
 silent, rare, and only under collection.
 
-The fix is a low-IR **expansion pass**, before either emitter: rewrite checked
-arithmetic into an explicit compare and branch, insert the panic-flag test
-after each call, and materialize the root frame. Then both emitters are dumb
-translations and neither knows what a safepoint is.
+The fix looked like a low-IR **expansion pass** covering all of it -- rewrite
+checked arithmetic into a compare and a branch, insert the panic-flag test
+after each call, materialize the root frame -- and one question killed a third
+of that. Expanding the arithmetic would give `Bin(Add, ...)` two meanings, one
+per phase, with nothing enforcing which; and the overflow *test* is exactly
+what each target does differently, LLVM with `llvm.sadd.with.overflow` and
+arm64 with `adds` and a flag the IR cannot name. A neutral expansion would
+pessimize both.
+
+So the line is not early-or-late, it is **neutral or not**. Panic propagation
+and root frames are the same instructions on every target and are hoisted;
+overflow and division checks stay in each emitter, about eighty lines apiece,
+because each writes a different and better sequence. **Two implementations of
+one rule is the hazard; two encodings of one check is the job**, and the
+difference between those had to be asked for rather than noticed.
 
 Two things make this fit better than it had any right to. `SlotLoad` and
 `SlotStore` already exist in the low IR, unemitted, with a comment saying a

@@ -557,6 +557,14 @@ Each phase runs and is verified before the next begins.
   `boot build` is blocked on something small and external: `boot` cannot start
   a process, because there is no `Prim.exec`. It emits the module -- which is
   the compiler -- and one `cc` invocation links it against the runtime.
+
+  What it would take to remove that `cc` is surveyed in `LINKER.md`, and the
+  answer is much smaller than "write a linker": the measured requirement is
+  **seventeen GOT binds against one dylib**, because generated code references
+  only the runtime and never libc. The decision is deferred until phases 4 and
+  5 exist, since instruction selection and encoding are the same work whatever
+  the output format is -- and because the one thing none of the options do is
+  remove the C toolchain, the runtime being C.
 * **Phase 3.** The four optimizations, one at a time, each measured.
 * **Phase 4.** Instruction selection, arm64, table-driven.
 * **Phase 5.** Register allocation, stack maps, encoding, object emission.

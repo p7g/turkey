@@ -51,6 +51,7 @@ import Turkey.Mono as Mono
 import Turkey.Joins as Joins
 import Turkey.Layout as Layout
 import Turkey.Arm64 as Arm64
+import Turkey.Select as Select
 import Turkey.Llvm as Llvm
 import Turkey.LowIr as LowIr
 import Turkey.Ssa as Ssa
@@ -70,7 +71,7 @@ fun main() {
     let command = args[0]
     if !Array.contains(["tokens", "ast", "desugar", "decls", "deps",
                     "classes", "types", "core", "mono", "opt", "ssa",
-                    "llvm"], command) {
+                    "llvm", "asm"], command) {
         die("unknown command '" + command + "'")
     }
     -- One builder for every file: a `print` per token is a flush per token,
@@ -91,6 +92,7 @@ fun main() {
             "mono" -> dumpMono(b, path)
             "ssa" -> dumpSsa(b, path)
             "llvm" -> dumpLlvm(b, path)
+            "asm" -> dumpAsm(b, path)
             _ -> dumpOpt(b, path)
         }
     }
@@ -346,6 +348,41 @@ fun dumpOpt(b : String.Builder, path : String) -> Unit {
     let (checked, entry) = checkProgram(path)
     let optimized = optimized(checked, entry)
     String.push(b, Core.showProgram(optimized, Some(entry.name)))
+}
+
+-- The program as arm64 assembly (`NATIVE-BACKEND.md` M28 phase 4).
+--
+-- Incomplete and says so, the way the Core lowering did: an opcode with no
+-- selection rule stops one function and is counted, so the histogram at the
+-- end is the plan for the next slice. What it prints is what the system
+-- assembler accepts, because `as` is the oracle the encoder will be checked
+-- against once there is one (`LINKER.md`).
+fun dumpAsm(b : String.Builder, path : String) -> Unit {
+    let (checked, entry) = checkProgram(path)
+    let program = optimized(checked, entry)
+    let (module_, skipped) = SsaLower.lowerProgram(program, checked.decls)
+    if len(skipped) > 0 {
+        String.push(b, "; === " + path + "\n; FAILED: "
+                       + Int.toString(len(skipped)) + " bindings did not lower\n")
+        return
+    }
+    String.push(b, "; === " + path + "\n")
+    let (selected, unsupported) = Select.selectModule(module_.functions)
+    for f in selected {
+        String.push(b, Ssa.showFunc(f))
+    }
+    String.push(b, "-- selected " + Int.toString(len(selected)) + " of "
+                   + Int.toString(len(module_.functions)) + " functions\n")
+    let counts = Map.new()
+    for u in unsupported {
+        Map.put(counts, u.what, Map.getOr(counts, u.what, 0) + 1)
+    }
+    let reasons = Array.sortBy(Map.keys(counts), fun(x, y) =
+        Array.threeWay(Map.getOr(counts, y, 0), Map.getOr(counts, x, 0)))
+    for why in reasons {
+        String.push(b, "--   " + Int.toString(Map.getOr(counts, why, 0))
+                       + "  " + why + "\n")
+    }
 }
 
 -- The program as LLVM IR text, ready for `cc` (`NATIVE-BACKEND.md` phase 2).

@@ -1,6 +1,6 @@
 module Turkey.LowIr (
     BinOp(..), CmpOp(..), Conv(..), Callee(..), Op(..), Low(..),
-    low, effectsOf, opUses, opResultRep, checkReps, checkCalls,
+    low, effectsOf, opUses, opResultRep, checkReps, checkCalls, showOpName,
     Builder(..), builder, into, emit, effect, terminate, block, param,
 )
 
@@ -470,6 +470,46 @@ fun wantClass(f : Ssa.Func Low, out : Array String, v : Value, c : RepClass,
     if Ssa.repOf(f, v).class_ != c {
         Array.push(out, what + " is " + show(Ssa.repOf(f, v)))
     }
+}
+
+-- The name of an operation, for reporting what a pass cannot handle yet.
+--
+-- Not `show`, which prints the operands too and would make a histogram of
+-- unhandled opcodes one row per occurrence instead of one row per opcode.
+fun showOpName(op : Op) -> String = match op {
+    ConstInt(_) -> "const.int"
+    ConstFloat(_) -> "const.float"
+    ConstString(_) -> "const.string"
+    ConstUnit -> "const.unit"
+    Bin(o, _, _) -> show(o)
+    Cmp(o, _, _) -> show(o)
+    Neg(_) -> "neg"
+    Not(_) -> "not"
+    Convert(c, _) -> show(c)
+    Box(_) -> "box"
+    Unbox(_) -> "unbox"
+    ObjectNew(_, _, _, _) -> "object.new"
+    ObjectGet(_, _) -> "object.get"
+    ObjectSet(_, _, _) -> "object.set"
+    ObjectTag(_) -> "object.tag"
+    ArrayNew(_, _, _) -> "array.new"
+    ArrayGet(_, _) -> "array.get"
+    ArraySet(_, _, _) -> "array.set"
+    ArrayLength(_) -> "array.length"
+    CellNew(_) -> "cell.new"
+    CellLoad(_) -> "cell.load"
+    CellStore(_, _) -> "cell.store"
+    ClosureNew(_, _, _) -> "closure.new"
+    ClosureCapture(_, _, _) -> "closure.capture"
+    Call(callee, _) -> match callee {
+        Direct(_) -> "call.direct"
+        Runtime(_) -> "call.runtime"
+        Indirect(_) -> "call.indirect"
+    }
+    GlobalLoad(_) -> "global.load"
+    GlobalStore(_, _) -> "global.store"
+    SlotLoad(_) -> "slot.load"
+    SlotStore(_, _) -> "slot.store"
 }
 
 -- -- printing -----------------------------------------------------------------------

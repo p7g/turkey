@@ -591,3 +591,45 @@ fun main() { error("bad") }
     assert "Prim.error" in called, (
         "the forwarder should have been inlined away")
     assert not any(n.endswith("Classes#error") for n in called)
+
+
+def test_case_of_case_does_not_capture_a_pattern_binder():
+    """The outer alternatives move *under* the inner match's binders.
+
+    `uses` calls `other`, so `other` is inlined and the two matches meet.
+    `case_of_case` then pushes `uses`'s alternatives into `other`'s branches
+    -- and `Some(_) -> e.count` mentions a free `e` that `Some(e) ->` binds.
+    Before the guard, case-of-known-constructor collapsed the pair to
+    `e.symbol`'s `e` read at `count`, and `coretc` refused the result with an
+    internal error pointing at a line in a function the change never touched.
+
+    The guard is by *name*, so this covers the far likelier same-typed
+    collision too -- which would not have been caught here at all, because
+    nothing about it is ill-typed. That is why this is a unit test and not a
+    golden: the corpus never produced the shape, and a program that computes
+    the wrong number quietly is not something a diff against the reference
+    would have found either, since both implementations had the bug.
+    """
+    program = optimized("""
+type Emit = Emit { count : Int }
+type Entry = Entry { symbol : String }
+
+fun other(x : Option Entry) -> Option String = match x {
+    Some(e) -> Some(e.symbol)
+    None -> None
+}
+
+fun uses(e : Emit, x : Option Entry) -> Int = match other(x) {
+    Some(_) -> e.count
+    None -> 0
+}
+
+fun main() {
+    print(Int.toString(uses(Emit { count = 1 }, Some(Entry { symbol = "a" }))))
+}
+""")
+    uses = named(program, "Main#uses")
+    read = [n.name for n in nodes(uses.value) if isinstance(n, CVar)]
+    assert not any("symbol" in n for n in read), (
+        "the caller's `e` was captured by the callee's binder and is being "
+        "read at the wrong field")

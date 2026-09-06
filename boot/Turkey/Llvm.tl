@@ -42,6 +42,8 @@ import Turkey.Roots as Roots
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..), Term(..),
                    Func(..), Block(..))
+import Turkey.Runtime as Rt
+import Turkey.Runtime (Entry(..))
 import Turkey.SsaLower as SsaLower
 import Turkey.SsaLower (Module(..))
 
@@ -62,30 +64,7 @@ fun typeOf(r : Rep) -> String = match r.class_ {
     Ptr -> "ptr"
 }
 
--- What the runtime's `turkey_box`/`turkey_unbox` and the object metadata call
--- this representation. Must agree with `Turkey.SsaLower.repCode`, which writes
--- the same numbers into an object's header.
-fun layoutCode(r : Rep) -> Int = match r.class_ {
-    Unit -> 0
-    I1 -> 1
-    I8 -> 2
-    I32 -> 3
-    I64 -> 4
-    F64 -> 5
-    Ptr -> if r.traced { 7 } else { 6 }
-}
-
--- Bytes one array element occupies. The same rule as
--- `turkey/backend_lower._layout_width`, and it has to stay the same: that one
--- decides the width `turkey_array_new` is called with and this one decides the
--- stride the element is then read at.
-fun elementWidth(c : RepClass) -> Int = match c {
-    I8 -> 1
-    I32 -> 4
-    _ -> 8
-}
-
-fun elementType(c : RepClass) -> String = match elementWidth(c) {
+fun elementType(c : RepClass) -> String = match Rt.elementWidth(c) {
     1 -> "i8"
     4 -> "i32"
     _ -> "i64"
@@ -692,12 +671,12 @@ fun emitInst(e : Emit, f : Func Low, i : Low) -> Unit {
             let held = Ssa.repOf(f, a)
             let raw = widened(e, f, a, held)
             line(e, "  " + dst + " = call ptr @turkey_box(i64 " + raw + ", i32 "
-                    + Int.toString(layoutCode(held)) + ")")
+                    + Int.toString(Rt.layoutCode(held)) + ")")
         }
         Unbox(a) -> {
             let raw = fresh(e)
             line(e, "  " + raw + " = call i64 @turkey_unbox(ptr " + reg(a)
-                    + ", i32 " + Int.toString(layoutCode(r)) + ")")
+                    + ", i32 " + Int.toString(Rt.layoutCode(r)) + ")")
             narrow(e, dst, ty, raw, r)
         }
         ObjectNew(kind, tag, count, bitmap) ->
@@ -730,13 +709,13 @@ fun emitInst(e : Emit, f : Func Low, i : Low) -> Unit {
             let raw = widened(e, f, initial, held)
             line(e, "  " + dst + " = call ptr @turkey_array_new(i64 "
                     + reg(length) + ", i64 " + raw + ", i32 "
-                    + Int.toString(elementWidth(element)) + ", i32 "
-                    + Int.toString(layoutCode(Ssa.untraced(element))) + ")")
+                    + Int.toString(Rt.elementWidth(element)) + ", i32 "
+                    + Int.toString(Rt.layoutCode(Ssa.untraced(element))) + ")")
         }
         ArrayGet(target, index) -> {
             let element = elementType(r.class_)
             let address = elementAddress(e, reg(target), reg(index), r.class_)
-            if elementWidth(r.class_) == 8 {
+            if Rt.elementWidth(r.class_) == 8 {
                 let raw = fresh(e)
                 line(e, "  " + raw + " = load i64, ptr " + address)
                 narrow(e, dst, ty, raw, r)
@@ -748,7 +727,7 @@ fun emitInst(e : Emit, f : Func Low, i : Low) -> Unit {
             let held = Ssa.repOf(f, v)
             let address = elementAddress(e, reg(target), reg(index),
                                          held.class_)
-            if elementWidth(held.class_) == 8 {
+            if Rt.elementWidth(held.class_) == 8 {
                 let raw = widened(e, f, v, held)
                 line(e, "  store i64 " + raw + ", ptr " + address)
             } else {
@@ -1218,46 +1197,21 @@ fun emitRuntimeCall(e : Emit, f : Func Low, dst : String, ty : String, r : Rep,
 --
 -- Only the ones with a runtime entry point. Everything arithmetic became an
 -- opcode in `Turkey.SsaLower.primitive` and never reaches here.
-fun runtimeOf(name : String) -> Option (String, String) = match name {
-    "Prim.print" -> Some(("turkey_print", "i8"))
-    "Prim.write" -> Some(("turkey_write", "i8"))
-    "Prim.stderrWrite" -> Some(("turkey_stderr_write", "i8"))
-    "Prim.exit" -> Some(("turkey_exit", "void"))
-    "Prim.intToString" -> Some(("turkey_int_to_string", "ptr"))
-    "Prim.floatToString" -> Some(("turkey_float_to_string", "ptr"))
-    "Prim.charToString" -> Some(("turkey_char_to_string", "ptr"))
-    "Prim.stringConcat" -> Some(("turkey_string_concat", "ptr"))
-    "Prim.stringConcatAll" -> Some(("turkey_string_concat_all", "ptr"))
-    "Prim.stringEq" -> Some(("turkey_string_eq", "i32"))
-    "Prim.stringLt" -> Some(("turkey_string_lt", "i32"))
-    "Prim.stringByteLength" -> Some(("turkey_string_byte_length", "i64"))
-    "Prim.stringByteAt" -> Some(("turkey_string_byte_at", "i8"))
-    "Prim.stringDecodeAt" -> Some(("turkey_string_decode_at", "i32"))
-    "Prim.stringNextIndex" -> Some(("turkey_string_next_index", "i64"))
-    "Prim.stringSlice" -> Some(("turkey_string_slice", "ptr"))
-    "Prim.stringFind" -> Some(("turkey_string_find", "i64"))
-    "Prim.stringRfind" -> Some(("turkey_string_rfind", "i64"))
-    "Prim.stringIsValidUtf8" -> Some(("turkey_string_is_valid_utf8", "i32"))
-    "Prim.floatParse" -> Some(("turkey_float_parse", "double"))
-    "Prim.floatCanParse" -> Some(("turkey_float_can_parse", "i32"))
-    "Prim.floatFmod" -> Some(("turkey_float_fmod", "double"))
-    "Prim.floatRemainder" -> Some(("turkey_float_remainder", "double"))
-    "Prim.floatFloor" -> Some(("turkey_float_floor", "double"))
-    "Prim.floatCeil" -> Some(("turkey_float_ceil", "double"))
-    "Prim.floatRound" -> Some(("turkey_float_round", "double"))
-    "Prim.floatTrunc" -> Some(("turkey_float_trunc", "double"))
-    "Prim.fileCanRead" -> Some(("turkey_file_can_read", "i32"))
-    "Prim.stringFromBytes" -> Some(("turkey_string_from_bytes", "ptr"))
-    -- The *storage* forms. `Turkey.SsaLower` names these rather than the
-    -- language's `Prim.args`, `Prim.readFileBytes` and `Prim.stringToBytes`,
-    -- because those answer an `Array` and the runtime can only build its
-    -- contents -- the record around it carries a tag this compilation owns.
-    "Prim.argsStorage" -> Some(("turkey_args_storage", "ptr"))
-    "Prim.readFileStorage" -> Some(("turkey_read_file_bytes", "ptr"))
-    "Prim.stringToByteStorage" -> Some(("turkey_string_to_byte_storage", "ptr"))
-    "Prim.writeFileBytes" -> Some(("turkey_write_file_bytes", "i32"))
-    _ -> None
-}
+-- A primitive's runtime entry point, as this emitter needs it: the symbol and
+-- the LLVM type C returns it in.
+--
+-- The table itself is `Turkey.Runtime`'s, because the symbols and their C
+-- return types are facts about `turkey_runtime.h` rather than decisions this
+-- emitter makes. What stays here is the translation into LLVM's spelling --
+-- including `void`, which is C's and not the language's unit.
+fun runtimeOf(name : String) -> Option (String, String) =
+    match Rt.entryPoint(name) {
+        Some(e) -> Some((e.symbol, match e.result {
+            None -> "void"
+            Some(c) -> typeOf(Rep { class_ = c, traced = False })
+        }))
+        None -> None
+    }
 
 -- -- the entry point -------------------------------------------------------------------
 

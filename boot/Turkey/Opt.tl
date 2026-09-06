@@ -767,6 +767,19 @@ fun caseOfJoin(e : Core) -> Option Core = match e.kind {
 --
 -- Declined outright when no branch reduces: the join would then be pure
 -- overhead, and this is not a rewrite worth doing for its own sake.
+--
+-- And declined when pushing in would capture. The outer alternatives end up
+-- *under* the inner match's pattern binders, so an alternative that mentions a
+-- free `e` lands inside a branch that binds one -- and the two `e`s are then
+-- one. Every other reduction here guards this and this one did not, which
+-- stayed invisible because the shape needs a caller and a callee that happen
+-- to use the same binder name; it was found when the callee's `e` was an
+-- `Entry` and the caller's an `Emit`, and `coretc` said so. Two same-typed
+-- `e`s would have compiled.
+--
+-- Declined rather than renamed, consistently with the rest of the module:
+-- there is no fresh-name supply for pattern binders, and a pass that renames
+-- them is a pass whose output no golden can be diffed against.
 fun caseOfCase(r : Reducer, e : Core) -> Option Core = match e.kind {
     CMatch(scrutinee, alts) -> caseOfCaseOn(r, e, scrutinee, alts)
     _ -> None
@@ -775,7 +788,17 @@ fun caseOfCase(r : Reducer, e : Core) -> Option Core = match e.kind {
 fun caseOfCaseOn(r : Reducer, e : Core, scrutinee : Core,
                  alts : Array CAlt) -> Option Core {
     let branches = match scrutinee.kind {
-        CMatch(_, inner) -> Array.map(inner, fun(a) = a.body)
+        CMatch(_, inner) -> {
+            let free = freeNamesOfAlts(alts)
+            for a in inner {
+                for name in patternVars(a.pat) {
+                    if Set.contains(free, name) { return None }
+                }
+            }
+            Array.map(inner, fun(a) = a.body)
+        }
+        -- A `CIf` binds nothing, so nothing can be captured by moving under
+        -- its branches.
         CIf(_, then, otherwise) -> match otherwise {
             Some(o) -> [then, o]
             None -> return None

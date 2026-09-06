@@ -633,6 +633,23 @@ Each phase runs and is verified before the next begins.
     implementations of one *rule* is the hazard; two encodings of one *check*
     is the job.
 
+  A third category turned up once a second backend existed, and it is not on
+  the neutral/not axis at all: **facts about an artifact this compiler does
+  not own.** The layout codes `mark_children` reads out of an object header,
+  the array element widths `turkey_array_new` is called with, and the symbol
+  each primitive resolves to are all `runtime/turkey_runtime.c`'s, not any
+  backend's. A backend holding its own copy is not a second implementation of
+  a rule; it is a second transcription of someone else's constant, and it
+  drifts without anything going red -- `Turkey.Select`'s copy of the primitive
+  table had already fallen seven float entries behind `Turkey.Llvm`'s.
+  Collected in `Turkey.Runtime`.
+
+  `Turkey.Llvm.declareRuntime`'s `declare` lines name those same symbols and
+  stayed where they are, which is the boundary of the rule: they carry
+  argument types the table does not have, and an undeclared or mistyped symbol
+  is something LLVM *refuses*. Duplication a checker sees is not the dangerous
+  kind.
+
   The rule for *when* the neutral parts run is still Go's: **early if an
   optimization can use it, late if it can only be obstructed by it.**
 

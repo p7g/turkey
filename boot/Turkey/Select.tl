@@ -39,6 +39,8 @@ import Turkey.Arm64 (Reg(..), Inst(..))
 import Turkey.LowIr as L
 import Turkey.LowIr (Op(..), Low(..), BinOp(..), CmpOp(..), Conv(..),
                      Callee(..))
+import Turkey.Runtime as Rt
+import Turkey.Runtime (Entry(..))
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..), Term(..),
                    Func(..), Block(..))
@@ -192,11 +194,11 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         -- them is choosing a symbol and marshalling arguments -- there is no
         -- instruction to pick.
         Box(a) -> runtimeCall(s, d, "_turkey_box", [A.reg(a)],
-                              [immediate(s, layoutCode(Ssa.repOf(s.source, a)))])
+                              [immediate(s, Rt.layoutCode(Ssa.repOf(s.source, a)))])
         Unbox(a) -> runtimeCall(s, d, "_turkey_unbox", [A.reg(a)],
-                                [immediate(s, layoutCode(r))])
+                                [immediate(s, Rt.layoutCode(r))])
         CellNew(a) -> runtimeCall(s, d, "_turkey_cell_new", [A.reg(a)],
-                                  [immediate(s, traceBit(Ssa.repOf(s.source, a)))])
+                                  [immediate(s, Rt.traceBit(Ssa.repOf(s.source, a)))])
         ObjectNew(kind, tag, count, bitmap) ->
             runtimeCall(s, d, "_turkey_object_new", [],
                         [immediate(s, kind), immediate(s, tag),
@@ -237,22 +239,6 @@ fun immediate(s : Sel, n : Int) -> Reg {
     t
 }
 
--- What the runtime calls this representation. The same numbering
--- `Turkey.SsaLower.repCode` writes into an object header, and the same one
--- `Turkey.Llvm.layoutCode` passes -- three copies of one table is two too
--- many, and this is the third, so it is a candidate for `Turkey.Roots`-style
--- extraction the moment anything disagrees.
-fun layoutCode(r : Rep) -> Int = match r.class_ {
-    Unit -> 0
-    I1 -> 1
-    I8 -> 2
-    I32 -> 3
-    I64 -> 4
-    F64 -> 5
-    Ptr -> if r.traced { 7 } else { 6 }
-}
-
-fun traceBit(r : Rep) -> Int = if r.traced { 1 } else { 0 }
 
 fun runtimeCall(s : Sel, d : Reg, sym : String, first : Array Reg,
                 rest : Array Reg) -> Unit =
@@ -286,37 +272,17 @@ fun call(s : Sel, d : Reg, sym : Option String, indirect : Reg,
 
 fun symbolFor(name : String) -> String = "_" + name
 
--- Primitive name to runtime symbol. The same table `Turkey.Llvm.runtimeOf`
--- has, which is duplication worth naming: it is two encodings of one mapping,
--- and the moment a third appears it should move beside `Turkey.Roots`.
-fun runtimeSymbol(name : String) -> Option String = match name {
-    "Prim.print" -> Some("_turkey_print")
-    "Prim.write" -> Some("_turkey_write")
-    "Prim.stderrWrite" -> Some("_turkey_stderr_write")
-    "Prim.exit" -> Some("_turkey_exit")
-    "Prim.intToString" -> Some("_turkey_int_to_string")
-    "Prim.floatToString" -> Some("_turkey_float_to_string")
-    "Prim.charToString" -> Some("_turkey_char_to_string")
-    "Prim.stringConcat" -> Some("_turkey_string_concat")
-    "Prim.stringConcatAll" -> Some("_turkey_string_concat_all")
-    "Prim.stringEq" -> Some("_turkey_string_eq")
-    "Prim.stringLt" -> Some("_turkey_string_lt")
-    "Prim.stringByteLength" -> Some("_turkey_string_byte_length")
-    "Prim.stringByteAt" -> Some("_turkey_string_byte_at")
-    "Prim.stringDecodeAt" -> Some("_turkey_string_decode_at")
-    "Prim.stringNextIndex" -> Some("_turkey_string_next_index")
-    "Prim.stringSlice" -> Some("_turkey_string_slice")
-    "Prim.stringFind" -> Some("_turkey_string_find")
-    "Prim.stringRfind" -> Some("_turkey_string_rfind")
-    "Prim.stringIsValidUtf8" -> Some("_turkey_string_is_valid_utf8")
-    "Prim.stringFromBytes" -> Some("_turkey_string_from_bytes")
-    "Prim.argsStorage" -> Some("_turkey_args_storage")
-    "Prim.readFileStorage" -> Some("_turkey_read_file_bytes")
-    "Prim.stringToByteStorage" -> Some("_turkey_string_to_byte_storage")
-    "Prim.fileCanRead" -> Some("_turkey_file_can_read")
-    "Prim.writeFileBytes" -> Some("_turkey_write_file_bytes")
-    _ -> None
-}
+-- A primitive's runtime symbol, as the assembler wants it written.
+--
+-- The table is `Turkey.Runtime`'s -- these are the symbols a C file defines,
+-- not a choice this pass makes -- and what is left here is Mach-O's leading
+-- underscore. C's return type is not consulted: every one of these fits in
+-- `x0` and the caller already knows the representation it asked for.
+fun runtimeSymbol(name : String) -> Option String =
+    match Rt.entryPoint(name) {
+        Some(entry) -> Some(symbolFor(entry.symbol))
+        None -> None
+    }
 
 -- A 64-bit constant, in as few instructions as it takes.
 --

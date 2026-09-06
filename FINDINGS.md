@@ -1501,6 +1501,77 @@ and adding the second consumer is what asks the question. The low IR looked
 finished after M27 phase 2 and 28 corpus programs agreed with the reference;
 it was finished as *input to LLVM*, which is a weaker claim than it appeared.
 
+### 71. The optimizer captured a name, and only a type disagreement said so
+**compiler bug, capture, shared algorithm.** M28. Extracting the runtime's
+constants into `Turkey.Runtime` made `boot` stop typechecking, at a line eighty
+lines from anything the change touched:
+
+    Llvm.tl:1127:22: internal error: the variable 'e' should be Emit
+                     but is Turkey.Runtime.Entry
+
+Line 1127 is inside `emitRuntimeCall`, whose parameter `e` is an `Emit`. The
+new code was in `runtimeOf`, a different top-level function, whose match arm
+bound `Some(e)` at the new `Entry`. Renaming that binder to `entry` made the
+error go away, which is the shape of a compiler bug rather than a mistake in
+the edit -- so the rename was reverted and the error chased instead.
+
+It reduces to eighteen lines:
+
+    type Emit  = Emit  { count : Int }
+    type Entry = Entry { symbol : String }
+
+    fun other(x : Option Entry) -> Option String = match x {
+        Some(e) -> Some(e.symbol)
+        None -> None
+    }
+
+    fun uses(e : Emit, x : Option Entry) -> Int = match other(x) {
+        Some(_) -> e.count
+        None -> 0
+    }
+
+`coretc` runs at four points and it was the *third* that failed -- after the
+optimizations, not after the lowering. `opt` inlines `other` into `uses`, which
+makes a match of a match, and `case_of_case` pushes the outer alternatives into
+the inner branches. The outer alternative mentions a free `e`, the inner branch
+binds one, and after the push they are the same `e`. Case-of-known-constructor
+then collapses `match Some(e.symbol) { Some(_) -> e.count }` to `e.count`,
+reading `symbol` where `count` was meant.
+
+Three things are worth keeping from it.
+
+**The guard existed everywhere else.** `opt.py`'s header states the discipline
+in its own words -- "substitution is capture-avoiding by refusing rather than by
+renaming" -- and `trivial_let`, `beta`, `let_to_match` and
+`fuse_recursive_join_result` all implement it, the last with a comment
+explaining precisely this hazard for precisely this reason. `case_of_case` is
+the one rule that moves a term under a *pattern* binder rather than under a
+`let` or a join parameter, and it is the one rule that did not check. A stated
+invariant is not an enforced one, which is the same shape as FINDINGS 65: a
+rule written down in the place it applies is still applied by hand at each
+site.
+
+**The types are what caught it, and they caught it by accident.** The two `e`s
+had to differ for `coretc` to complain. Two same-typed `e`s -- far more likely,
+since a name collides most often with itself -- would have produced a
+well-typed program that computes the wrong value, and the corpus would have
+stayed green. `coretc`'s existence is why this was a compile error rather than
+a bug report from a user of the compiler; its per-stage repetition
+(`driver.py` runs it four times, deliberately) is why the *stage* was
+identifiable in one experiment rather than by bisection.
+
+**Third capture bug, and the first in a shared algorithm.** FINDINGS 56 and 59
+were both `SsaLower` failing to scope an environment, and both were mine. This
+one is older than either, lives in `turkey/opt.py` and `boot/Turkey/Opt.tl`
+both, and had to be fixed twice -- the tax CLAUDE.md's "two implementations"
+section describes, paid in full. The corpus never produced the shape, so
+`test_boot` was never going to find it; what found it was writing a module
+whose record fields happened to collide with an emitter's.
+
+The fix declines rather than renames, in both implementations: if the outer
+alternatives' free names meet the inner alternatives' pattern binders, the
+rewrite does not fire. A `CIf` scrutinee binds nothing and is unaffected.
+
 
 ## Library, still wanted
 

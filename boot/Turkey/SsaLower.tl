@@ -40,6 +40,7 @@ import Turkey.LowIr as L
 import Turkey.LowIr (Op(..), Low(..), BinOp(..), CmpOp(..), Conv(..),
                      Callee(..), Builder(..))
 import Turkey.Prelude as P
+import Turkey.Runtime as Rt
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..), Term(..),
                    Func(..), Block(..))
@@ -1009,23 +1010,15 @@ fun aggregate(l : Lower, items : Array Core, kind : Int, tag : Int) -> Value {
 
 -- How the collector reads an object's fields: three bits of representation
 -- each, least significant field first. Not a pointer bitmap -- a width and a
--- register class are needed too, and one code answers all three.
+-- register class are needed too, and one code answers all three. The code
+-- itself is the runtime's, so it is read from `Turkey.Runtime` rather than
+-- restated here.
 fun metadata(reps : Array Rep) -> Int {
     var out = 0
     for var i = 0; i < len(reps); i = i + 1 {
-        out = out + Int.shl(repCode(reps[i]), 3 * i)
+        out = out + Int.shl(Rt.layoutCode(reps[i]), 3 * i)
     }
     out
-}
-
-fun repCode(r : Rep) -> Int = match r.class_ {
-    Unit -> 0
-    I1 -> 1
-    I8 -> 2
-    I32 -> 3
-    I64 -> 4
-    F64 -> 5
-    Ptr -> if r.traced { 7 } else { 6 }
 }
 
 -- -- closures ----------------------------------------------------------------------

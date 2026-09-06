@@ -536,12 +536,22 @@ Each phase runs and is verified before the next begins.
   guard that *splits* a block, which is why a block's phis name the label
   control left from rather than the one it entered.
 
-  Not done: **GC root frames**. Collection triggers at 1024 allocations, so a
-  program under that never collects and the whole obligation is untested by an
-  ordinary run. `TURKEY_GC_STRESS=1` collects at every allocation, and under it
-  **0 of 28 survive** -- twenty-seven `invalid object field` panics and one bus
-  error. `tests/test_native.py` carries that as a strict `xfail`, so the day
-  roots are emitted the marker has to come off.
+  **GC roots are three things, and two of them are not on a stack.** A stack
+  root frame per function -- liveness at each safepoint, a slot per value live
+  across one, and a live mask written per program point rather than per
+  function, which is what the runtime's `RootFrame.live` exists for. Then the
+  **pointer globals**, which live *in* a permanent root array so that storing
+  to a global and rooting it are the same store; every instance dictionary is
+  one. Then the **interned string literals**, whose caches are globals the
+  collector could not otherwise see.
+
+  Measured with `TURKEY_GC_STRESS=1`, which collects at every allocation:
+  **0 of 28 → 6 → 11**, one set of roots at a time. It is not finished. The
+  remaining failures are a root slot holding `0x100000000` and an array whose
+  element bitmap claims a pointer that is not one.
+  `tests/test_native.py` carries the surviving set as a ratchet and the rest as
+  strict `xfail`s, so fixing one is a failing test until the list is updated
+  and the list cannot drift from what is true.
 
   `boot build` is blocked on something small and external: `boot` cannot start
   a process, because there is no `Prim.exec`. It emits the module -- which is

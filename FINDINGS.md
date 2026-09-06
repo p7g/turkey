@@ -1332,6 +1332,34 @@ the stronger comparison: `.expected` is a file someone can update, and the
 reference implementation is not.
 
 
+### 69. Three kinds of root, and the collector needs all three
+
+**compiler, partly fixed.** M27 phase 2. `TURKEY_GC_STRESS=1` collects at every
+allocation, and under it the native corpus went 0 of 28. Emitting stack root
+frames -- liveness at each safepoint, a slot per value live across one, a live
+mask per program point -- moved it to **6**. Two more sets of roots existed and
+neither is on a stack:
+
+* **The pointer globals.** Every instance dictionary is a global, computed once
+  by the module initializer, and nothing refers to it from a frame afterwards.
+  They now live *in* a permanent root array, so storing to a global and rooting
+  it are the same store -- which is also why there is nothing to keep in step.
+  0 to 6.
+* **The interned string literals.** Each is a `TurkeyString` the runtime
+  allocated, cached in a module global so that `ConstString` is a load rather
+  than an allocation. The cache was invisible to the collector, so the first
+  collection freed every literal in the program. 6 to 11.
+
+Still 11 of 28, so this is *not* finished; the remaining failures are a root
+slot holding `0x100000000` and an array whose element bitmap claims a pointer
+that is not one.
+
+The finding is the shape of the search. "GC roots" sounded like one feature and
+is three, and only the first was on the list -- the other two were found by a
+test that reports a number, one fix at a time, rather than by reasoning about
+what needed rooting. A gap that produces a *count* can be walked down; a gap
+that produces "broken" cannot.
+
 ### 66. Wrapping and checked arithmetic were the same opcode
 
 **compiler, fixed.** M27 phase 2. `Prim.intAdd` panics on overflow and

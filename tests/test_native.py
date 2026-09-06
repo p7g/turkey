@@ -160,22 +160,65 @@ def test_a_panic_in_a_callee_stops_the_caller():
     assert "@turkey_has_panicked" in text
 
 
-@pytest.mark.parametrize("name", COMPILABLE)
-@pytest.mark.xfail(reason="GC root frames are not emitted yet: collection at "
-                          "every allocation frees live objects", strict=True)
-def test_the_corpus_survives_collection(name):
+# Programs that survive collection at every allocation. A ratchet, not a
+# description: root frames are emitted and are not yet complete, so this list
+# is what works today and it may only grow. A name moving *out* of it is a
+# regression the suite fails on; a name that starts passing without being added
+# fails too, so the list cannot quietly fall behind.
+SURVIVES_COLLECTION = {
+    "chars.tl",
+    "classes.tl",
+    "control.tl",
+    "exhaustive.tl",
+    "fields.tl",
+    "generalization.tl",
+    "hkt.tl",
+    "joins.tl",
+    "polyrec.tl",
+    "stack.tl",
+    "tuple_binding.tl",
+}
+
+
+def _under_stress(name: str) -> subprocess.CompletedProcess:
+    return subprocess.run([str(_binary(name))], capture_output=True, text=True,
+                          env={"TURKEY_GC_STRESS": "1", "PATH": "/usr/bin"})
+
+
+@pytest.mark.parametrize("name", sorted(SURVIVES_COLLECTION))
+def test_collection_does_not_break_these(name):
     """The same programs, collecting at every allocation.
 
     A program allocating fewer than 1024 objects never collects, which is why
-    the corpus passes without root frames at all -- and why this is the test
-    that says whether they are there. Marked strict, so the day roots land
-    these stop being expected failures and the marker has to come off.
+    the corpus passed for a while with no root frames at all. Under stress the
+    collector runs between every pair of allocations, so anything the compiler
+    failed to root is freed while still in use.
+
+    Three things have to be rooted and all three were found by this test going
+    from 0 of 28 to 6 to 11: the values live across a safepoint in each frame,
+    the pointer-shaped globals, and the interned string literals.
     """
     if _cc() is None:
         pytest.skip("no C compiler")
-    binary = _binary(name)
-    result = subprocess.run([str(binary)], capture_output=True, text=True,
-                            env={"TURKEY_GC_STRESS": "1", "PATH": "/usr/bin"})
+    result = _under_stress(name)
+    assert result.returncode == 0, result.stderr[-400:]
+    assert result.stdout == _reference(name)
+
+
+@pytest.mark.parametrize(
+    "name", sorted(set(COMPILABLE) - SURVIVES_COLLECTION))
+@pytest.mark.xfail(reason="GC roots are incomplete: something live is still "
+                          "not rooted in these", strict=True)
+def test_collection_still_breaks_these(name):
+    """The other half, kept as strict expected failures.
+
+    Strict, so that fixing one is a *failing test* until it is moved into
+    `SURVIVES_COLLECTION` -- which is what stops the list from drifting away
+    from what is true.
+    """
+    if _cc() is None:
+        pytest.skip("no C compiler")
+    result = _under_stress(name)
     assert result.returncode == 0 and result.stdout == _reference(name)
 
 

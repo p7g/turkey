@@ -9,6 +9,7 @@ module Turkey.Ssa (
     freshValue, repOf, blockAt,
     predecessors, reversePostorder, dominators, dominates,
     verify, showFunc,
+    liveness, liveAfter, termUses,
 )
 
 -- The low IR: an SSA control-flow graph, parameterized over its instructions
@@ -667,4 +668,97 @@ fun showTerm(f : Func i, t : Term) -> String = match t {
         + ", b" + Int.toString(blockId(no))
     Panic(v) -> "panic " + showValue(f, v)
     Unreachable -> "unreachable"
+}
+
+-- -- liveness -----------------------------------------------------------------------
+
+-- Which values are live on the way out of each block.
+--
+-- Backward dataflow to a fixpoint, in reverse postorder reversed, which is the
+-- order that propagates a backward analysis furthest per sweep. Written here
+-- rather than in a pass because it is a fact about the *graph* -- the same
+-- analysis serves the collector's root sets now and the register allocator's
+-- interference later, and the parameter over instructions is what lets one
+-- copy do both.
+--
+-- Block parameters are the reason this is simpler than it looks. A value
+-- crossing an edge is an *argument on that edge*, used by the predecessor's
+-- terminator, and the parameter it becomes is defined in the successor. So
+-- there is no phi to special-case: `uses` and `defs` already say everything,
+-- which is the whole argument `NATIVE-BACKEND.md` makes for block parameters
+-- over phi nodes.
+fun liveness[Inst i](f : Func i) -> Array (Set.Set Int) {
+    let count = len(f.blocks)
+    let liveIn : Array (Set.Set Int) = []
+    let liveOut : Array (Set.Set Int) = []
+    for var b = 0; b < count; b = b + 1 {
+        Array.push(liveIn, Set.new())
+        Array.push(liveOut, Set.new())
+    }
+    let order = Array.reverse(reversePostorder(f))
+    var changed = True
+    while changed {
+        changed = False
+        for at in order {
+            let b = blockId(at)
+            let out = Set.new()
+            for s in successors(f.blocks[b].term) {
+                for v in Set.elements(liveIn[blockId(s)]) { Set.add(out, v) }
+            }
+            let entering = Set.new()
+            for v in Set.elements(out) { Set.add(entering, v) }
+            -- Backward through the terminator, then the instructions.
+            for v in termUses(f.blocks[b].term) {
+                Set.add(entering, valueId(v))
+            }
+            for var n = len(f.blocks[b].insts) - 1; n >= 0; n = n - 1 {
+                for v in defs(f.blocks[b].insts[n]) {
+                    let _ = Set.remove(entering, valueId(v))
+                }
+                for v in uses(f.blocks[b].insts[n]) {
+                    Set.add(entering, valueId(v))
+                }
+            }
+            for p in f.blocks[b].params { let _ = Set.remove(entering, valueId(p)) }
+            if len(entering) != len(liveIn[b]) || len(out) != len(liveOut[b]) {
+                changed = True
+            }
+            liveIn[b] = entering
+            liveOut[b] = out
+        }
+    }
+    liveOut
+}
+
+-- What a terminator reads. Not part of the `Inst` class, because a terminator
+-- is not an instruction here -- it is a field of the block, which is what
+-- keeps a block from ever being without one.
+fun termUses(t : Term) -> Array Value = match t {
+    Ret(v) -> [v]
+    Jump(_, args) -> args
+    Branch(c, _, _) -> [c]
+    Panic(v) -> [v]
+    Unreachable -> []
+}
+
+-- The values live *after* each instruction of a block, given the block's
+-- live-out set. Index `n` is the set live immediately after instruction `n`,
+-- which is what a safepoint needs: the callee may collect, and what must
+-- survive is whatever is still wanted when it returns.
+fun liveAfter[Inst i](f : Func i, at : BlockId,
+                      out : Set.Set Int) -> Array (Set.Set Int) {
+    let block = f.blocks[blockId(at)]
+    let sets : Array (Set.Set Int) = []
+    for var n = 0; n < len(block.insts); n = n + 1 { Array.push(sets, Set.new()) }
+    let live = Set.new()
+    for v in Set.elements(out) { Set.add(live, v) }
+    for v in termUses(block.term) { Set.add(live, valueId(v)) }
+    for var n = len(block.insts) - 1; n >= 0; n = n - 1 {
+        let here = Set.new()
+        for v in Set.elements(live) { Set.add(here, v) }
+        sets[n] = here
+        for v in defs(block.insts[n]) { let _ = Set.remove(live, valueId(v)) }
+        for v in uses(block.insts[n]) { Set.add(live, valueId(v)) }
+    }
+    sets
 }

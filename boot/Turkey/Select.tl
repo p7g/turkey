@@ -186,8 +186,136 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         ObjectTag(target) -> emit(s, A.Ldr(d, A.Offset(A.reg(target), 4), A.W32))
         ArrayLength(target) -> emit(s, A.Ldr(d, A.Offset(A.reg(target), 8), A.W64))
         CellLoad(target) -> emit(s, A.Ldr(d, A.Offset(A.reg(target), 0), A.W64))
+        CellLoad(target) -> emit(s, A.Ldr(d, A.Offset(A.reg(target), 0), A.W64))
+        -- Everything that becomes a runtime call. The heap operations are at
+        -- the runtime's ABI by design (`Turkey.LowIr`'s header), so selecting
+        -- them is choosing a symbol and marshalling arguments -- there is no
+        -- instruction to pick.
+        Box(a) -> runtimeCall(s, d, "_turkey_box", [A.reg(a)],
+                              [immediate(s, layoutCode(Ssa.repOf(s.source, a)))])
+        Unbox(a) -> runtimeCall(s, d, "_turkey_unbox", [A.reg(a)],
+                                [immediate(s, layoutCode(r))])
+        CellNew(a) -> runtimeCall(s, d, "_turkey_cell_new", [A.reg(a)],
+                                  [immediate(s, traceBit(Ssa.repOf(s.source, a)))])
+        ObjectNew(kind, tag, count, bitmap) ->
+            runtimeCall(s, d, "_turkey_object_new", [],
+                        [immediate(s, kind), immediate(s, tag),
+                         immediate(s, count), immediate(s, bitmap)])
+        ObjectSet(target, index, v) ->
+            runtimeCall(s, d, "_turkey_object_set",
+                        [A.reg(target)], [immediate(s, index), A.reg(v)])
+        Call(callee, args) -> {
+            let passed = []
+            for a in args { Array.push(passed, A.reg(a)) }
+            match callee {
+                Direct(name) -> call(s, d, Some(symbolFor(name)), A.xzr, passed)
+                Runtime(name) -> match runtimeSymbol(name) {
+                    Some(sym) -> call(s, d, Some(sym), A.xzr, passed)
+                    None -> stop(s, "the runtime function " + name)
+                }
+                -- A closure: the code is slot 0 and the environment slot 1,
+                -- and the environment goes first, which is the uniform
+                -- convention `Turkey.SsaLower.closureCall` establishes.
+                Indirect(closure) -> {
+                    let code = temp(s, Ssa.traced(Ptr))
+                    let env = temp(s, Ssa.traced(Ptr))
+                    emit(s, A.Ldr(code, A.Offset(A.reg(closure), 24), A.W64))
+                    emit(s, A.Ldr(env, A.Offset(A.reg(closure), 32), A.W64))
+                    call(s, d, None, code, Array.append([env], passed))
+                }
+            }
+        }
         _ -> stop(s, L.showOpName(i.op))
     }
+}
+
+-- A constant in a fresh register, for an operand the IR gives as an integer
+-- and the machine wants in a register.
+fun immediate(s : Sel, n : Int) -> Reg {
+    let t = temp(s, Ssa.untraced(I64))
+    constant(s, t, n)
+    t
+}
+
+-- What the runtime calls this representation. The same numbering
+-- `Turkey.SsaLower.repCode` writes into an object header, and the same one
+-- `Turkey.Llvm.layoutCode` passes -- three copies of one table is two too
+-- many, and this is the third, so it is a candidate for `Turkey.Roots`-style
+-- extraction the moment anything disagrees.
+fun layoutCode(r : Rep) -> Int = match r.class_ {
+    Unit -> 0
+    I1 -> 1
+    I8 -> 2
+    I32 -> 3
+    I64 -> 4
+    F64 -> 5
+    Ptr -> if r.traced { 7 } else { 6 }
+}
+
+fun traceBit(r : Rep) -> Int = if r.traced { 1 } else { 0 }
+
+fun runtimeCall(s : Sel, d : Reg, sym : String, first : Array Reg,
+                rest : Array Reg) -> Unit =
+    call(s, d, Some(sym), A.xzr, Array.append(first, rest))
+
+-- The AAPCS64 sequence: arguments into x0..x7, the call, the result out of x0.
+--
+-- The moves to and from the physical registers are ordinary instructions and
+-- the allocator will coalesce most of them away. `CallArgs` carries what the
+-- call reads and writes, because `Bl` names neither -- without it the
+-- allocator would see a call that uses nothing and keep nothing alive across
+-- it.
+fun call(s : Sel, d : Reg, sym : Option String, indirect : Reg,
+         args : Array Reg) -> Unit {
+    if len(args) > 8 {
+        stop(s, "a call with more than eight arguments")
+        return
+    }
+    let ins = []
+    for var i = 0; i < len(args); i = i + 1 {
+        emit(s, A.Mov(A.argRegs[i], args[i], A.W64))
+        Array.push(ins, A.argRegs[i])
+    }
+    emit(s, A.CallArgs(args, [d]))
+    match sym {
+        Some(name) -> emit(s, A.Bl(name))
+        None -> emit(s, A.Blr(indirect))
+    }
+    emit(s, A.Mov(d, A.x0, A.W64))
+}
+
+fun symbolFor(name : String) -> String = "_" + name
+
+-- Primitive name to runtime symbol. The same table `Turkey.Llvm.runtimeOf`
+-- has, which is duplication worth naming: it is two encodings of one mapping,
+-- and the moment a third appears it should move beside `Turkey.Roots`.
+fun runtimeSymbol(name : String) -> Option String = match name {
+    "Prim.print" -> Some("_turkey_print")
+    "Prim.write" -> Some("_turkey_write")
+    "Prim.stderrWrite" -> Some("_turkey_stderr_write")
+    "Prim.exit" -> Some("_turkey_exit")
+    "Prim.intToString" -> Some("_turkey_int_to_string")
+    "Prim.floatToString" -> Some("_turkey_float_to_string")
+    "Prim.charToString" -> Some("_turkey_char_to_string")
+    "Prim.stringConcat" -> Some("_turkey_string_concat")
+    "Prim.stringConcatAll" -> Some("_turkey_string_concat_all")
+    "Prim.stringEq" -> Some("_turkey_string_eq")
+    "Prim.stringLt" -> Some("_turkey_string_lt")
+    "Prim.stringByteLength" -> Some("_turkey_string_byte_length")
+    "Prim.stringByteAt" -> Some("_turkey_string_byte_at")
+    "Prim.stringDecodeAt" -> Some("_turkey_string_decode_at")
+    "Prim.stringNextIndex" -> Some("_turkey_string_next_index")
+    "Prim.stringSlice" -> Some("_turkey_string_slice")
+    "Prim.stringFind" -> Some("_turkey_string_find")
+    "Prim.stringRfind" -> Some("_turkey_string_rfind")
+    "Prim.stringIsValidUtf8" -> Some("_turkey_string_is_valid_utf8")
+    "Prim.stringFromBytes" -> Some("_turkey_string_from_bytes")
+    "Prim.argsStorage" -> Some("_turkey_args_storage")
+    "Prim.readFileStorage" -> Some("_turkey_read_file_bytes")
+    "Prim.stringToByteStorage" -> Some("_turkey_string_to_byte_storage")
+    "Prim.fileCanRead" -> Some("_turkey_file_can_read")
+    "Prim.writeFileBytes" -> Some("_turkey_write_file_bytes")
+    _ -> None
 }
 
 -- A 64-bit constant, in as few instructions as it takes.

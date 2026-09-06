@@ -309,6 +309,7 @@ fun declareRuntime(e : Emit) -> Unit {
         "declare {i64, i1} @llvm.sadd.with.overflow.i64(i64, i64)",
         "declare {i64, i1} @llvm.ssub.with.overflow.i64(i64, i64)",
         "declare {i64, i1} @llvm.smul.with.overflow.i64(i64, i64)",
+        "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)",
     ] { line(e, d) }
 }
 
@@ -461,8 +462,8 @@ fun rootSlots(f : Func Low, live : Array (Set.Set Int)) -> Map Int Int {
         let insts = Ssa.blockAt(f, BlockId(b)).insts
         for var n = 0; n < len(insts); n = n + 1 {
             if isSafepoint(insts[n].op) {
-                for id in Set.elements(after[n]) {
-                    if traced(f, id) { Set.add(needed, id) }
+                for id in Set.elements(across(f, after[n], insts[n])) {
+                    Set.add(needed, id)
                 }
             }
         }
@@ -472,6 +473,38 @@ fun rootSlots(f : Func Low, live : Array (Set.Set Int)) -> Map Int Int {
     -- order and two runs produce the same module.
     let ids = Array.sort(Set.elements(needed))
     for var i = 0; i < len(ids); i = i + 1 { Map.put(out, ids[i], i) }
+    out
+}
+
+-- The traced values live *across* a safepoint, which is not the same as those
+-- live after it.
+--
+-- An argument whose last use is this very call is dead afterwards and is still
+-- needed *during* it: the callee holds it, and the collector may run while it
+-- does. Rooting only what survives the call freed `Int.toString`'s result
+-- while `turkey_string_concat` was reading it, and "circle of 5" came out
+-- "circle of c".
+--
+-- The result goes the other way and must *not* be rooted: it does not exist
+-- until the collection is over, so storing it would be a use before its
+-- definition -- not merely useless but not SSA, which clang answers with a
+-- segfault rather than a diagnosis.
+--
+-- Both halves are stated in `turkey/llvmgen._safepoint_live`'s comment, which
+-- is where this should have been read from rather than reasoned out.
+--
+-- One function, because the slot assignment and the publish must agree about
+-- exactly this set: a value in one and not the other is either a root with no
+-- slot or a slot never written.
+fun across(f : Func Low, live : Set.Set Int, i : Low) -> Set.Set Int {
+    let out = Set.new()
+    for id in Set.elements(live) {
+        if id != Ssa.valueId(i.result) && traced(f, id) { Set.add(out, id) }
+    }
+    for v in Ssa.uses(i) {
+        let id = Ssa.valueId(v)
+        if id != Ssa.valueId(i.result) && traced(f, id) { Set.add(out, id) }
+    }
     out
 }
 
@@ -508,6 +541,18 @@ fun enterFrame(e : Emit, f : Func Low) -> Unit {
     if len(e.slots) == 0 { return }
     line(e, "  %frame = alloca [5 x i64]")
     line(e, "  %roots = alloca [" + Int.toString(len(e.slots)) + " x ptr]")
+    -- Past 64 slots the live mask runs out of bits, and the runtime scans
+    -- every one of those slots unconditionally -- so they have to start as
+    -- null rather than as whatever the stack held. `Main#main` in
+    -- `question.tl` has more than 64 and read a `0x1` out of slot 64, which is
+    -- what named this.
+    --
+    -- Only past 64: below it the mask says which slots are meaningful, so
+    -- zeroing them all would be a memset per call for nothing.
+    if len(e.slots) > 64 {
+        line(e, "  call void @llvm.memset.p0.i64(ptr %roots, i8 0, i64 "
+                + Int.toString(len(e.slots) * 8) + ", i1 false)")
+    }
     line(e, "  call void @turkey_root_enter(ptr %frame, ptr %roots, i64 "
             + Int.toString(len(e.slots)) + ", ptr "
             + messageGlobal(e, f.name) + ")")
@@ -524,23 +569,16 @@ fun publish(e : Emit, f : Func Low, live : Set.Set Int, i : Low) -> Unit {
     if len(e.slots) == 0 { return }
     var mask = 0
     let stored = []
-    for id in Array.sort(Set.elements(live)) {
-        -- Not what the safepoint *defines*. Its result is live after it and
-        -- does not exist during it, so rooting it would store a value the
-        -- block has not reached -- which is not merely useless, it is not SSA,
-        -- and clang answers a use before its definition with a crash rather
-        -- than a diagnosis.
-        --
-        -- Nor does it need rooting: the collector cannot free something the
-        -- runtime is in the middle of returning.
-        if id != Ssa.valueId(i.result) && traced(f, id) {
-            match Map.get(e.slots, id) {
-                Some(slot) -> {
-                    Array.push(stored, (slot, id))
-                    if slot < 63 { mask = mask + Int.shl(1, slot) }
-                }
-                None -> {}
+    for id in Array.sort(Set.elements(across(f, live, i))) {
+        match Map.get(e.slots, id) {
+            Some(slot) -> {
+                Array.push(stored, (slot, id))
+                -- `Int.or`, not `+`: bit 63 is the sign bit of a signed
+                -- 64-bit integer, and adding it to a mask that already has
+                -- bits set overflows -- which now panics.
+                if slot < 64 { mask = Int.or(mask, Int.shl(1, slot)) }
             }
+            None -> {}
         }
     }
     for (slot, id) in stored {

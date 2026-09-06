@@ -536,7 +536,7 @@ Each phase runs and is verified before the next begins.
   guard that *splits* a block, which is why a block's phis name the label
   control left from rather than the one it entered.
 
-  **GC roots are three things, and two of them are not on a stack.** A stack
+  **GC roots are four things, and two of them are not on a stack.** A stack
   root frame per function -- liveness at each safepoint, a slot per value live
   across one, and a live mask written per program point rather than per
   function, which is what the runtime's `RootFrame.live` exists for. Then the
@@ -545,13 +545,14 @@ Each phase runs and is verified before the next begins.
   one. Then the **interned string literals**, whose caches are globals the
   collector could not otherwise see.
 
+  Two more kinds, and both are about *which* values: a safepoint's **arguments**
+  are live across it, because the callee holds them while the collector may
+  run, even when they are dead afterwards -- and the **slots past 64**, which
+  the live mask has no bits for and the runtime therefore always scans, so they
+  have to start null.
+
   Measured with `TURKEY_GC_STRESS=1`, which collects at every allocation:
-  **0 of 28 → 6 → 11**, one set of roots at a time. It is not finished. The
-  remaining failures are a root slot holding `0x100000000` and an array whose
-  element bitmap claims a pointer that is not one.
-  `tests/test_native.py` carries the surviving set as a ratchet and the rest as
-  strict `xfail`s, so fixing one is a failing test until the list is updated
-  and the list cannot drift from what is true.
+  **0 of 28 → 6 → 11 → 22 → 27 → 28**, one kind of root at a time. Done.
 
   `boot build` is blocked on something small and external: `boot` cannot start
   a process, because there is no `Prim.exec`. It emits the module -- which is

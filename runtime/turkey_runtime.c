@@ -240,8 +240,14 @@ static void mark(void *value) {
 void turkey_collect(void) {
     for (RootFrame *frame = roots; frame != NULL; frame = frame->previous)
         for (int64_t index = 0; index < frame->count; ++index)
-            if (index >= 64 || (frame->live >> index) & 1)
-                mark(frame->values[index]);
+            if (index >= 64 || (frame->live >> index) & 1) {
+                /* Named, because "a root is not a heap pointer" is true of one
+                   slot of one frame and a compiler emitting roots for the
+                   first time needs to know which. `function_name` is already
+                   carried for the crash handler; this is the same string. */
+                mark_grey(frame->values[index], frame->function_name, index);
+                while (mark_count > 0) mark_children(mark_stack[--mark_count]);
+            }
     HeapHeader **link = &heap;
     while (*link != NULL) {
         HeapHeader *header = *link;

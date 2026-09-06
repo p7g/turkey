@@ -1332,13 +1332,13 @@ the stronger comparison: `.expected` is a file someone can update, and the
 reference implementation is not.
 
 
-### 69. Three kinds of root, and the collector needs all three
+### 69. Four kinds of root, and the collector needs all four
 
-**compiler, partly fixed.** M27 phase 2. `TURKEY_GC_STRESS=1` collects at every
+**compiler, fixed.** M27 phase 2. `TURKEY_GC_STRESS=1` collects at every
 allocation, and under it the native corpus went 0 of 28. Emitting stack root
 frames -- liveness at each safepoint, a slot per value live across one, a live
-mask per program point -- moved it to **6**. Two more sets of roots existed and
-neither is on a stack:
+mask per program point -- moved it to **6**. Three more kinds of root existed,
+and two of them are not on a stack at all:
 
 * **The pointer globals.** Every instance dictionary is a global, computed once
   by the module initializer, and nothing refers to it from a frame afterwards.
@@ -1350,15 +1350,36 @@ neither is on a stack:
   than an allocation. The cache was invisible to the collector, so the first
   collection freed every literal in the program. 6 to 11.
 
-Still 11 of 28, so this is *not* finished; the remaining failures are a root
-slot holding `0x100000000` and an array whose element bitmap claims a pointer
-that is not one.
+Two more, and then it was done:
+
+* **A safepoint's *arguments*.** The set rooted was what is live *after* the
+  call, and an argument whose last use is that very call is dead afterwards --
+  while the callee is still holding it and the collector may run. So
+  `Int.toString`'s result was freed while `turkey_string_concat` read it, and
+  "circle of 5" printed as "circle of c". 11 to 22. The rule is stated exactly
+  in `turkey/llvmgen._safepoint_live`'s docstring, which is where it should
+  have been read from rather than reasoned out.
+* **The slots past 64.** The live mask is 64 bits and the runtime scans every
+  slot from 64 up unconditionally, so those have to start null rather than
+  holding whatever the stack left. `Main#main` in `question.tl` read a `0x1`
+  out of slot 64. The runtime's own comment prescribes the fix, one paragraph
+  above the field. 22 to 28.
+
+**0 of 28 → 6 → 11 → 22 → 27 → 28.**
 
 The finding is the shape of the search. "GC roots" sounded like one feature and
-is three, and only the first was on the list -- the other two were found by a
-test that reports a number, one fix at a time, rather than by reasoning about
-what needed rooting. A gap that produces a *count* can be walked down; a gap
-that produces "broken" cannot.
+is four, and only the first was on the list -- the other three were found by a
+test that reports a *number*, one fix at a time. A gap that produces a count
+can be walked down; a gap that produces "broken" cannot, and no amount of
+staring at the emitter would have suggested "the arguments" or "slot 64".
+
+Two of the four were already written down in the code being ported. The Python
+backend's docstring says which values are live at a safepoint and the runtime's
+struct comment says what happens past 64 slots -- both were read *after* the
+failure, to confirm a diagnosis, when reading them first would have prevented
+it. That is the same lesson as FINDINGS 61 and 65 and it is now three for
+three: this project's expensive mistakes are consistently things somebody had
+already written down.
 
 ### 66. Wrapping and checked arithmetic were the same opcode
 

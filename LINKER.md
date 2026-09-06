@@ -234,9 +234,11 @@ prebuilt `libturkey.dylib` shipped alongside. That is a real improvement and it
 is not the improvement it might sound like, and the distinction should be made
 before the work is costed rather than after.
 
-The alternative -- rewriting the runtime in Turkey -- is a much larger question
-than this document, and it runs into the same floor: something must make
-syscalls, and on macOS that something must be `libSystem`.
+The alternative -- rewriting the runtime in Turkey, with pointer primitives and
+an FFI -- is surveyed in `RUNTIME-IN-TURKEY.md`. It runs into the same floor:
+something must make syscalls, and on macOS that something must be `libSystem`,
+so an FFI to libc is still a dependency on libc. What it removes is the C
+*compiler*, not the C library.
 
 ## Recommendation
 

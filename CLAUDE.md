@@ -67,4 +67,5 @@ FINDINGS 43.
   moment it bites and what was being written at the time.
 * `LLVM-BACKEND.md`, `NATIVE-BACKEND.md` -- backend designs.
 * `LINKER.md` -- what producing an executable without `cc` would cost.
+* `RUNTIME-IN-TURKEY.md` -- what replacing the C runtime would cost.
 * `CORE-OPT.md` -- optimizations on Core, and where the line to the backend is.

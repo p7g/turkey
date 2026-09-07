@@ -1069,9 +1069,30 @@ Each phase runs and is verified before the next begins.
   already wrote. That is a fixed rule rather than a heuristic, it needs no
   spill-cost model, and it is why this is still not a spiller.
 
-  The order is what the project does everywhere else: the corpus works and is
-  differentially checkable now, `boot` needs one more slice, and the histogram
-  names it.
+  The order is what the project does everywhere else: the corpus works and
+  `boot` needs one more slice, and the histogram names it.
+
+  **The function boundary has no calling convention at all yet, on either
+  side.** Reading the code to write the prologue turned this up, and it is
+  wider than "there is no prologue":
+
+  * `Select.start` copies `f.params` through as ordinary virtuals. Nothing
+    binds parameter *i* to `x`*i*. This is the callee half of the
+    stack-argument gap recorded under phase 4, and it is not specific to nine
+    parameters -- a *one*-parameter function has no incoming convention either.
+    It has been invisible because no consumer of the selected code exists yet.
+  * `Term.Ret(v)` names a virtual and nothing moves it to `x0`.
+
+  So the "corpus colours 1888 of 1888" above is a statement about the
+  *interior* of each function. The edges are missing, and they are what the
+  prologue slice has to add. The shape is a copy in and a copy out: fresh
+  values pinned to `x0`-`x7` and `d0`-`d7` at entry and to `x0` at exit, with
+  an ordinary `mov` between them and the body's values, which the colourer's
+  hinting should then coalesce away in the common case. Pinning is what the
+  colourer gains for it -- a value whose register is fixed before the walk
+  begins -- and it is the one thing in this design that can *fail* rather than
+  merely allocate badly, because a parameter pinned to `x0` and live across a
+  call has a contradiction the copy exists to break.
 
   **`boot` needs stack arguments to compile itself.** The same run reports four
   calls stopped for more than eight arguments in one register file, in the

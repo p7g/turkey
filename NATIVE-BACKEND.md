@@ -484,9 +484,10 @@ sunk cost. So traced values live across a call are the cheapest things in the
 function to spill, and pressure peaks at exactly those points. This is
 specific to having a shadow stack rather than stack maps, and it is the one
 place this design is cheaper than the peers rather than dearer. Measured under
-phase 5 and it is stronger than this paragraph guessed: those values are not
-the cheapest things to spill, they are *already* spilt, and counting that takes
-`boot`'s own worst function from 88 live values to 10.
+phase 5: those values are not merely the cheapest to spill, they are *already*
+spilt, which takes `boot`'s worst function from 88 live values to 35. It does
+not remove the spiller -- 35 is still more than 28 -- but it is most of the
+problem, and it is a saving no peer gets.
 
 **Stack maps come out of the allocator**, because it is the only pass that
 knows where a value is at a given point.
@@ -1007,23 +1008,70 @@ Each phase runs and is verified before the next begins.
   which have no slot -- peaks at **6** against ten callee-saved registers, in
   the corpus and in `boot` alike.
 
-  So there is **no spiller**, and the shadow stack is why. The design note
-  earlier in this document guessed that traced values live across a call would
-  be the cheapest things to spill; the measurement says they are not merely
-  cheapest, they are already spilt, and spilling anything else is unnecessary.
-  This is the one place this backend is cheaper than its peers rather than
-  dearer, and it is a direct consequence of the choice that makes it slower
-  everywhere else -- rooting by store rather than by stack map. QBE, Go and
-  LLVM all need a spiller because none of them has already written every live
-  pointer to memory.
+  **This nearly became "so there is no spiller", and that was wrong.** The
+  claim survived about an hour, on the strength of the table above, and what
+  killed it was measuring the one category that has nowhere free to go. A
+  traced value has a root slot; an *untraced* one has none, so it needs a real
+  stack frame:
 
-  The 10 is an approximation and honest about which way it errs: a value live
-  across *some* call is excluded from every live set, so it under-counts what
-  such values use between calls. The true figure is between 10 and 88, and 28
-  is the budget. The measurement that settles it is the colourer itself, which
-  will report when it cannot find a register the same way selection reports an
-  opcode it has no rule for -- so a spiller, if one is ever needed, arrives
-  with a histogram saying which functions need it.
+  | | untraced pressure | worst call site |
+  |---|---|---|
+  | the corpus | 10 of 28 | 11 live, of 10 callee-saved |
+  | `boot` compiling itself | **35 of 28** | 84 live |
+
+  Thirty-five untraced values live at once, against twenty-eight registers. No
+  arrangement of root slots helps, because none of those values has one. **A
+  real spiller with real stack slots is required for `boot` to compile
+  itself**, and the frame is its prerequisite.
+
+  What the root slots do buy is the difference between 88 and 35, which is most
+  of the problem and is still the thing this backend has that its peers do not.
+  QBE, Go and LLVM spill every one of those 88; this backend spills at most 35
+  of them, and the other 53 were already written to memory for the collector's
+  sake. That is a smaller spiller, not the absence of one.
+
+  **The spill policy is first come, first served, and deliberately not a
+  heuristic.** Whichever value the colourer reaches with no register free is
+  the one that goes to memory. Nothing is ranked, no cost model is built, and
+  loop depth is not consulted. Two reasons. Feasibility does not depend on the
+  choice -- any value spilled frees exactly one register -- so an ordering
+  could only affect *quality*, and quality here is measurable against the LLVM
+  path rather than guessable. And a spill heuristic is the single largest and
+  least certain part of a register allocator; building one before there is
+  evidence it pays would be the mistake this document's survey section exists
+  to prevent. If measurement later says the allocator is what makes the code
+  slow, Belady's furthest-next-use and QBE's cost-times-loop-depth are both
+  known, both small, and both drop into the same place.
+
+  The 10 was an approximation and said which way it erred: a value live across
+  *some* call was excluded from every live set, so it under-counted what such
+  values use between calls. It was optimistic by a factor of three and a half;
+  the untraced figure above is the honest one.
+
+  **Status: the corpus colours completely; `boot` does not yet.**
+
+  | | coloured | out of registers |
+  |---|---|---|
+  | the corpus | **1888 of 1888** | none |
+  | `boot` compiling itself | 2773 of 2929 | **156** |
+
+  Zero complaints from `verifyColouring` on either, which is the check that
+  matters: a colouring putting two simultaneously live values in one register
+  prints, assembles, links, runs, and computes a wrong answer, and nothing
+  downstream can see it.
+
+  The 156 are the gap between the approximation and the truth, and they are
+  **not** an argument for a spiller. The colourer as written gives each value
+  one register for its whole life, so a rooted value still occupies one across
+  every call -- which is exactly what the 88-to-10 measurement said not to do.
+  What closes them is splitting a rooted value's live range at each call:
+  release the register, and read the value back from the slot the rooting
+  already wrote. That is a fixed rule rather than a heuristic, it needs no
+  spill-cost model, and it is why this is still not a spiller.
+
+  The order is what the project does everywhere else: the corpus works and is
+  differentially checkable now, `boot` needs one more slice, and the histogram
+  names it.
 
   **`boot` needs stack arguments to compile itself.** The same run reports four
   calls stopped for more than eight arguments in one register file, in the

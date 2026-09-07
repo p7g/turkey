@@ -9,7 +9,7 @@ module Turkey.Ssa (
     freshValue, repOf, blockAt,
     predecessors, reversePostorder, dominators, dominates,
     verify, showFunc,
-    liveness, liveAfter, termUses,
+    liveness, livenessInOut, liveAfter, termUses,
 )
 
 -- The low IR: an SSA control-flow graph, parameterized over its instructions
@@ -688,6 +688,16 @@ fun showTerm(f : Func i, t : Term) -> String = match t {
 -- which is the whole argument `NATIVE-BACKEND.md` makes for block parameters
 -- over phi nodes.
 fun liveness[Inst i](f : Func i) -> Array (Set.Set Int) {
+    let (_, out) = livenessInOut(f)
+    out
+}
+
+-- Both halves of the same fixpoint. `liveness` answers only live-*out* because
+-- that is all the root analysis needed; the colourer needs live-*in* too, to
+-- know what a block's parameters interfere with, and computing the fixpoint
+-- twice to get a set it already had would be silly.
+fun livenessInOut[Inst i](f : Func i)
+        -> (Array (Set.Set Int), Array (Set.Set Int)) {
     let count = len(f.blocks)
     let liveIn : Array (Set.Set Int) = []
     let liveOut : Array (Set.Set Int) = []
@@ -727,7 +737,7 @@ fun liveness[Inst i](f : Func i) -> Array (Set.Set Int) {
             liveOut[b] = out
         }
     }
-    liveOut
+    (liveIn, liveOut)
 }
 
 -- What a terminator reads. Not part of the `Inst` class, because a terminator

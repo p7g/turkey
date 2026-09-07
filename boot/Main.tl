@@ -415,6 +415,51 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
                    + Int.toString(Regalloc.availableGp) + "  fp "
                    + Int.toString(effFp) + " of "
                    + Int.toString(Regalloc.availableFp) + "\n")
+    -- Register allocation, and its own verifier. A colouring that puts two
+    -- simultaneously live values in one register assembles, links and runs --
+    -- and computes a wrong answer -- so it is checked here rather than
+    -- trusted, exactly as the machine graph is.
+    var coloured = 0
+    let colourStops = Map.new()
+    for f in selected {
+        let c = Regalloc.colour(f)
+        match c.stopped {
+            Some(why) -> Map.put(colourStops, why,
+                                 Map.getOr(colourStops, why, 0) + 1)
+            None -> { coloured = coloured + 1 }
+        }
+        for message in Regalloc.verifyColouring(f, c) {
+            String.push(b, "  !! " + f.name + ": " + message + "\n")
+        }
+    }
+    -- The two numbers that say whether a real spiller is ever needed. An
+    -- untraced value has no root slot, so if those alone overflow the file a
+    -- frame is required; and the worst single call site is what the ten
+    -- callee-saved registers are actually spent against.
+    var untraced = 0
+    var worst = 0
+    for f in selected {
+        let u = Regalloc.untracedPressure(f)
+        if u.gp > untraced { untraced = u.gp }
+        let w = Regalloc.worstCall(f)
+        if w > worst { worst = w }
+    }
+    String.push(b, "-- untraced  gp " + Int.toString(untraced) + " of "
+                   + Int.toString(Regalloc.availableGp)
+                   + "   worst call site  " + Int.toString(worst) + " of "
+                   + Int.toString(Regalloc.calleeSavedGp) + "\n")
+    String.push(b, "-- coloured " + Int.toString(coloured) + " of "
+                   + Int.toString(len(selected)) + " functions\n")
+    -- A different prefix from selection's histogram on purpose. Both are
+    -- "-- <count> <reason>" and a reader can tell them apart by context, but
+    -- `tests/test_select.py` parses the selection one by prefix, and two
+    -- histograms sharing it would silently add colouring's reasons to
+    -- selection's totals -- which is a test that goes green while measuring
+    -- the wrong thing.
+    for why in Map.keys(colourStops) {
+        String.push(b, "-- colour  " + Int.toString(Map.getOr(colourStops, why, 0))
+                       + "  " + why + "\n")
+    }
     -- And the tighter number: what is live *across* a call can only be in a
     -- callee-saved register, of which there are ten. Total pressure can fit in
     -- 28 and this can still not fit in 10.

@@ -1,6 +1,6 @@
 module Turkey.Arm64 (
     Reg(..), Bank(..), reg, physical, isPhysical, bankOf, Cond(..), Width(..),
-    Mem(..), Arm(..), Inst(..),
+    Mem(..), Arm(..), Inst(..), destRegs,
     xzr, sp, fp, lr, x0, d0, argRegs, fpArgRegs, callerSaved, calleeSaved,
     fpCallerSaved, fpCalleeSaved, showReg, condName, isCall,
 )
@@ -335,65 +335,76 @@ fun usesOf(op : Arm) -> Array Value = match op {
     Brk(_) -> []
 }
 
-fun defsOf(op : Arm) -> Array Value = match op {
-    Mov(d, _, _) -> virtualOf([d])
-    MovZ(d, _, _) -> virtualOf([d])
-    MovK(d, _, _) -> virtualOf([d])
-    Add(d, _, _, _) -> virtualOf([d])
-    AddImm(d, _, _, _) -> virtualOf([d])
-    AddS(d, _, _, _) -> virtualOf([d])
-    Sub(d, _, _, _) -> virtualOf([d])
-    SubImm(d, _, _, _) -> virtualOf([d])
-    SubS(d, _, _, _) -> virtualOf([d])
-    Mul(d, _, _, _) -> virtualOf([d])
-    SMulH(d, _, _) -> virtualOf([d])
-    SDiv(d, _, _, _) -> virtualOf([d])
-    MSub(d, _, _, _, _) -> virtualOf([d])
-    And(d, _, _, _) -> virtualOf([d])
-    Orr(d, _, _, _) -> virtualOf([d])
-    Eor(d, _, _, _) -> virtualOf([d])
-    EorImm(d, _, _, _) -> virtualOf([d])
-    Lsl(d, _, _, _) -> virtualOf([d])
-    Lsr(d, _, _, _) -> virtualOf([d])
-    Asr(d, _, _, _) -> virtualOf([d])
+-- The registers an instruction *writes*, physical ones included.
+--
+-- `defsOf` is this filtered to the virtual ones, which is what liveness and
+-- the verifier want. The allocator wants the unfiltered answer: a `mov x0, %5`
+-- before a call writes a real `x0`, and any value the allocator has put in
+-- `x0` and needs after that instruction has just been destroyed. Deriving both
+-- from one match is the point -- a second sixty-armed `match` listing the same
+-- destinations is exactly the kind of duplication that drifts.
+fun destRegs(op : Arm) -> Array Reg = match op {
+    Mov(d, _, _) -> [d]
+    MovZ(d, _, _) -> [d]
+    MovK(d, _, _) -> [d]
+    Add(d, _, _, _) -> [d]
+    AddImm(d, _, _, _) -> [d]
+    AddS(d, _, _, _) -> [d]
+    Sub(d, _, _, _) -> [d]
+    SubImm(d, _, _, _) -> [d]
+    SubS(d, _, _, _) -> [d]
+    Mul(d, _, _, _) -> [d]
+    SMulH(d, _, _) -> [d]
+    SDiv(d, _, _, _) -> [d]
+    MSub(d, _, _, _, _) -> [d]
+    And(d, _, _, _) -> [d]
+    Orr(d, _, _, _) -> [d]
+    Eor(d, _, _, _) -> [d]
+    EorImm(d, _, _, _) -> [d]
+    Lsl(d, _, _, _) -> [d]
+    Lsr(d, _, _, _) -> [d]
+    Asr(d, _, _, _) -> [d]
     Cmp(_, _, _) -> []
     CmpImm(_, _, _) -> []
-    CSet(d, _) -> virtualOf([d])
-    Sxtw(d, _) -> virtualOf([d])
-    Uxtb(d, _) -> virtualOf([d])
-    Uxth(d, _) -> virtualOf([d])
-    Ubfx(d, _, _, _) -> virtualOf([d])
-    Ldr(d, _, _) -> virtualOf([d])
-    Ldrb(d, _) -> virtualOf([d])
-    Ldrsw(d, _) -> virtualOf([d])
+    CSet(d, _) -> [d]
+    Sxtw(d, _) -> [d]
+    Uxtb(d, _) -> [d]
+    Uxth(d, _) -> [d]
+    Ubfx(d, _, _, _) -> [d]
+    Ldr(d, _, _) -> [d]
+    Ldrb(d, _) -> [d]
+    Ldrsw(d, _) -> [d]
     Str(_, _, _) -> []
     Strb(_, _) -> []
     Stp(_, _, _, _) -> []
-    Ldp(a, b, _, _) -> virtualOf([a, b])
-    Adrp(d, _) -> virtualOf([d])
-    AddLo(d, _, _) -> virtualOf([d])
-    MovConst(d, _) -> virtualOf([d])
-    FMov(d, _) -> virtualOf([d])
-    FMovIn(d, _) -> virtualOf([d])
-    FMovOut(d, _) -> virtualOf([d])
-    FAdd(d, _, _) -> virtualOf([d])
-    FSub(d, _, _) -> virtualOf([d])
-    FMul(d, _, _) -> virtualOf([d])
-    FDiv(d, _, _) -> virtualOf([d])
-    FNeg(d, _) -> virtualOf([d])
+    Ldp(a, b, _, _) -> [a, b]
+    Adrp(d, _) -> [d]
+    AddLo(d, _, _) -> [d]
+    MovConst(d, _) -> [d]
+    FMov(d, _) -> [d]
+    FMovIn(d, _) -> [d]
+    FMovOut(d, _) -> [d]
+    FAdd(d, _, _) -> [d]
+    FSub(d, _, _) -> [d]
+    FMul(d, _, _) -> [d]
+    FDiv(d, _, _) -> [d]
+    FNeg(d, _) -> [d]
     -- `fcmp` writes the flags and no register, which is exactly why the guard
     -- that reads it has to stay adjacent.
     FCmp(_, _) -> []
-    Scvtf(d, _) -> virtualOf([d])
-    Fcvtzs(d, _) -> virtualOf([d])
+    Scvtf(d, _) -> [d]
+    Fcvtzs(d, _) -> [d]
     Bl(_) -> []
     Blr(_) -> []
-    CallArgs(_, outs) -> virtualOf(outs)
+    CallArgs(_, outs) -> outs
     Ret -> []
     B(_) -> []
     BCond(_, _) -> []
     Brk(_) -> []
 }
+
+fun defsOf(op : Arm) -> Array Value = virtualOf(destRegs(op))
+
 
 fun virtualOf(rs : Array Reg) -> Array Value {
     let out = []

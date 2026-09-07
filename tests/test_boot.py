@@ -24,17 +24,15 @@ M26 removes rather than a reason to shrink the corpus.
 
 from __future__ import annotations
 
-import atexit
 import functools
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
 
+from tests import bootc
 from turkey.astdump import dump as dump_ast
 from turkey.driver import (check, declared, desugared, registered,
                            show_binding_groups, show_classes, show_declarations)
@@ -100,53 +98,9 @@ def _sample() -> list[Path]:
 SAMPLE = _sample()
 
 
-@functools.lru_cache(maxsize=1)
-def _binary() -> Path:
-    """`boot`, compiled to an executable once for the whole module.
-
-    Every stage below runs the same program at different arguments. Compiling
-    it takes over two minutes and running it takes hundredths of a second, so
-    ten fixtures each spawning `turkey run` paid the compile ten times over to
-    do the work once -- about half an hour of a test suite that is otherwise
-    six minutes.
-
-    `turkey build` is the answer rather than compiling in-process and calling
-    it ten times, for two reasons: a subprocess per stage keeps a crash in
-    `boot` from taking the test session with it, which matters while `boot`
-    still has one; and a real executable is what self-hosting needs anyway.
-    """
-    directory = Path(tempfile.mkdtemp(prefix="turkey-boot-"))
-    atexit.register(shutil.rmtree, directory, ignore_errors=True)
-    output = directory / "boot"
-    result = subprocess.run(
-        [sys.executable, "-m", "turkey", "build", str(BOOT_MAIN),
-         "-o", str(output)],
-        cwd=REPO_ROOT,
-        env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)),
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, (
-        f"building boot failed\n{result.stdout}\n{result.stderr}")
-    return output
-
-
 def _boot(*args: str) -> str:
-    # Bytes, decoded here rather than by `text=True`. Universal-newline
-    # translation would rewrite a `\r` inside a *string literal* in the output
-    # as a `\n`, which is a difference the reference side never had -- and the
-    # dumps are compared line by line, so it lands as a mismatch several
-    # thousand lines from anything that is actually wrong.
-    result = subprocess.run(
-        [str(_binary()), *args],
-        cwd=REPO_ROOT,
-        capture_output=True,
-    )
-    out = result.stdout.decode("utf-8")
-    err = result.stderr.decode("utf-8")
-    assert result.returncode == 0, (
-        f"boot exited {result.returncode}\n{out}\n{err}")
-    return out
+    return bootc.boot(*args)
+
 
 
 def _python_tokens(paths: list[Path]) -> str:
@@ -477,7 +431,7 @@ def test_boot_optimizes_the_same_way(boot_opt: str) -> None:
 
 def test_boot_reports_a_missing_file(tmp_path: Path) -> None:
     result = subprocess.run(
-        [str(_binary()), "tokens", str(tmp_path / "absent.tl")],
+        [str(bootc.binary()), "tokens", str(tmp_path / "absent.tl")],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,

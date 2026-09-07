@@ -30,6 +30,7 @@ from pathlib import Path
 
 import pytest
 
+from tests import bootc
 from turkey.driver import run
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -55,22 +56,13 @@ def _cc() -> str | None:
 
 @functools.lru_cache(maxsize=None)
 def _modules() -> dict[str, str]:
-    """Every corpus program's LLVM IR, from one `boot` run."""
-    out = io.StringIO()
-    with contextlib.redirect_stdout(out):
-        run(BOOT_MAIN.read_text(encoding="utf-8"), str(BOOT_MAIN),
-            ["llvm", *(str(PROGRAMS / name) for name in CORPUS)])
-    modules, current, name = {}, [], None
-    for line in out.getvalue().splitlines(keepends=True):
-        if line.startswith("; === "):
-            if name is not None:
-                modules[name] = "".join(current)
-            name = Path(line[6:].strip()).name
-            current = []
-        else:
-            current.append(line)
-    if name is not None:
-        modules[name] = "".join(current)
+    """Every corpus program's LLVM IR, from one run of a compiled `boot`.
+
+    Interpreting `boot` here instead cost this module forty-six minutes to do
+    about ten seconds of work; see `tests.bootc`.
+    """
+    text = bootc.boot("llvm", *(str(PROGRAMS / name) for name in CORPUS))
+    modules = bootc.split_before(text, "; === ")
     assert set(modules) == set(CORPUS), sorted(set(CORPUS) - set(modules))
     return modules
 

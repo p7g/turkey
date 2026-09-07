@@ -12,14 +12,12 @@ the artifact it deliberately does not copy -- so the verifier is what stands in
 until `boot ssa` can produce code that runs (`NATIVE-BACKEND.md`).
 """
 
-import contextlib
 import functools
-import io
 from pathlib import Path
 
 import pytest
 
-from turkey.driver import run
+from tests import bootc
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BOOT_MAIN = REPO_ROOT / "boot" / "Main.tl"
@@ -28,9 +26,8 @@ PROGRAMS = REPO_ROOT / "tests" / "programs"
 # Small, and between them they reach an ordinary function, a loop, a
 # user-defined type, and -- `generalization.tl` -- a lambda that survives
 # `opt` plus a top-level function used as a value, which are the two cases
-# closure conversion exists for. Running `boot` under the Python
-# implementation costs minutes per program, so this is a sample rather than
-# the corpus; the corpus is what `boot ssa` is for once it compiles.
+# closure conversion exists for. A sample rather than the corpus because these
+# assertions are about *shape*; `test_boot` is what runs the whole corpus.
 SAMPLE = ["adt.tl", "loops.tl", "stack.tl", "generalization.tl"]
 
 
@@ -38,38 +35,13 @@ SAMPLE = ["adt.tl", "loops.tl", "stack.tl", "generalization.tl"]
 def _all() -> dict[str, str]:
     """`boot ssa` over every sample program, in **one** invocation.
 
-    Measured: one program takes 2:42 and all of them together take 2:56, so
-    roughly 2:40 of that is fixed and about half a second is the actual work.
-    The fixed part is `boot` itself -- running it means the Python
-    implementation typechecks and then interprets the whole bootstrap
-    compiler before it looks at the target at all.
-
-    So the cost is per *process*, not per program, which is exactly why
-    `Main.tl` takes any number of files: its header says the one-process rule
-    is "not a convenience for the test -- it is what keeps the milestone's
-    diff to one process, since starting this program currently means
-    compiling it." A loop of one invocation per program pays 2:40 each time
-    and turns three minutes of work into an hour. Same shape as `test_boot`
-    building one binary and sharing it.
-
-    The dump has no separator between programs, by design -- every one ends
-    with its own count line -- so splitting on that line recovers them.
+    One process for every program, and a compiled `boot` rather than an
+    interpreted one -- both from `tests.bootc`, which explains why. The dump
+    has no separator between programs, by design: every one ends with its own
+    count line, so splitting on that line recovers them.
     """
-    out = io.StringIO()
-    with contextlib.redirect_stdout(out):
-        run(BOOT_MAIN.read_text(encoding="utf-8"), str(BOOT_MAIN),
-            ["ssa", *(str(PROGRAMS / name) for name in SAMPLE)])
-    text = out.getvalue()
-    chunks, current = [], []
-    for line in text.splitlines(keepends=True):
-        current.append(line)
-        if line.startswith("-- lowered"):
-            chunks.append("".join(current))
-            current = []
-    # A program's dump ends at its count line; anything after the last one is
-    # a crash, and belongs to the program that was being compiled.
-    if current:
-        chunks.append("".join(current))
+    text = bootc.boot("ssa", *(str(PROGRAMS / name) for name in SAMPLE))
+    chunks = bootc.split_on(text, "-- lowered")
     assert len(chunks) == len(SAMPLE), (
         f"{len(chunks)} dumps for {len(SAMPLE)} programs:\n{text[-2000:]}")
     return dict(zip(SAMPLE, chunks))

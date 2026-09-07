@@ -435,13 +435,27 @@ fun call(s : Sel, d : Reg, dBank : A.Bank, resultBank : A.Bank,
     var general = 0
     var vector = 0
     for (a, bank) in args {
+        -- Asked *before* the register is taken, not after. Asking after
+        -- indexes the array with the index that overflowed it, so a
+        -- nine-argument call panicked inside the compiler instead of being
+        -- reported by it -- a check that runs one line too late is not a
+        -- check.
+        let full = match bank {
+            Gp -> general >= len(A.argRegs)
+            Fp -> vector >= len(A.fpArgRegs)
+        }
+        if full {
+            -- AAPCS64 passes the rest on the stack, which needs a frame this
+            -- backend does not lay out yet: the prologue that would spill
+            -- them is the same pass that has still to assign a register to
+            -- anything. Reported rather than approximated.
+            stop(s, "a call with more than eight arguments in one register "
+                    + "file, which would need stack arguments")
+            return
+        }
         let into = match bank {
             Gp -> { let at = general; general = general + 1; A.argRegs[at] }
             Fp -> { let at = vector; vector = vector + 1; A.fpArgRegs[at] }
-        }
-        if general > 8 || vector > 8 {
-            stop(s, "a call with more than eight arguments in one file")
-            return
         }
         move(s, into, bank, a, bank)
         Array.push(ins, into)

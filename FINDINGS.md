@@ -1573,6 +1573,61 @@ alternatives' free names meet the inner alternatives' pattern binders, the
 rewrite does not fire. A `CIf` scrutinee binds nothing and is unaffected.
 
 
+### 72. A pattern cannot name a qualified constructor
+**language, papercut.** M28 phase 5. `import Turkey.Arm64 as A` brings `A.Gp`
+into scope as an expression and *not* as a pattern: `match bankOf(r) { A.Gp ->
+... }` is `parse error: expected '->' after the arm's patterns, found '.'`. The
+only way to match on a constructor is to import it unqualified, so a module
+that matches on another module's type must import that type twice --
+`import Turkey.Arm64 as A` for the functions and
+`import Turkey.Arm64 (Bank(..))` for the patterns.
+
+The cost is not the second import line, it is that **the qualification the
+first import bought is then gone**. `Turkey.Select` already carries a paragraph
+explaining which of its two neighbours got the unqualified names and why, and
+the answer -- the side being matched wins -- is a rule about parsing leaking
+into how modules are imported. `Add`, `Eq` and `Ret` each name a constructor in
+two of these modules, so the choice is forced rather than stylistic.
+
+It bit twice, which is what makes it a finding rather than a preference: once
+writing `Turkey.Select`, where it produced that paragraph, and again writing
+`Turkey.Regalloc`, whose three-line `countOf` needed the same second import for
+one two-armed `match`.
+
+Nothing about the type system requires this. A qualified name in a pattern is
+unambiguous by construction -- more so than an unqualified one, which is why
+the workaround is strictly worse than the thing it works around. It is a
+grammar that stops at `.`, and the fix is to let a constructor pattern take a
+dotted path. Recorded rather than fixed because the parser is shared with the
+Python implementation and changing it is two implementations plus goldens.
+
+
+### 73. The build cache was keyed on the session, and the build is a function of the files
+**tooling.** M28 phase 5, and the fourth turn of FINDINGS 61 and 65. `boot`
+takes three minutes to compile and `tests/bootc.py` already built it once and
+shared it -- across a *session*. Three one-off scripts in a row, none of which
+changed a line of `boot`, each paid the full three minutes to ask a question
+the compiled binary answers in ten seconds.
+
+The previous three findings were all "someone pays a startup cost per unit of
+work". This one is a different mistake with the same symptom: the cache had the
+**wrong key**. `boot`'s output is a pure function of `boot/`, `lib/`, `turkey/`
+and `runtime/`, and a session is not any of those. Keyed on a hash of those
+files instead, the build is shared between test runs, scratch scripts,
+concurrent jobs and future sessions, and it invalidates exactly when it should.
+Concurrent builders are safe *because* the key is a content hash -- two of them
+are producing the same bytes -- so the only care needed is that the file never
+be observed half-written, which is one `os.replace`.
+
+    binary() on an unchanged tree:  ~180s  ->  0.02s
+
+The general form, worth having stated: **when the thing being cached is
+deterministic in its inputs, any key that is not those inputs is both too
+coarse and too fine at once** -- it rebuilds when nothing changed, and it
+would happily serve a stale artifact if the lifetime were longer than the
+session. Hashing the inputs is the only key that is neither.
+
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

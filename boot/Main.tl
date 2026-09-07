@@ -52,6 +52,7 @@ import Turkey.Joins as Joins
 import Turkey.Layout as Layout
 import Turkey.Arm64 as Arm64
 import Turkey.Select as Select
+import Turkey.Regalloc as Regalloc
 import Turkey.Llvm as Llvm
 import Turkey.LowIr as LowIr
 import Turkey.Ssa as Ssa
@@ -383,6 +384,28 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
     }
     String.push(b, "-- selected " + Int.toString(len(selected)) + " of "
                    + Int.toString(len(module_.functions)) + " functions\n")
+    -- Maximum register pressure, which is the number that decides whether a
+    -- spiller is needed at all: on SSA the registers required are exactly the
+    -- values live at once, so a corpus that stays under the file size can be
+    -- allocated by the colourer alone. Reported per program rather than per
+    -- function, with any function over budget named, because one function
+    -- over is the whole answer.
+    var maxGp = 0
+    var maxFp = 0
+    for f in selected {
+        let p = Regalloc.pressureOf(f)
+        if p.gp > maxGp { maxGp = p.gp }
+        if p.fp > maxFp { maxFp = p.fp }
+        if p.gp > Regalloc.availableGp || p.fp > Regalloc.availableFp {
+            String.push(b, "--   over budget  " + f.name + "  gp "
+                           + Int.toString(p.gp) + "  fp "
+                           + Int.toString(p.fp) + "\n")
+        }
+    }
+    String.push(b, "-- pressure  gp " + Int.toString(maxGp) + " of "
+                   + Int.toString(Regalloc.availableGp) + "  fp "
+                   + Int.toString(maxFp) + " of "
+                   + Int.toString(Regalloc.availableFp) + "\n")
     let counts = Map.new()
     for u in unsupported {
         Map.put(counts, u.what, Map.getOr(counts, u.what, 0) + 1)

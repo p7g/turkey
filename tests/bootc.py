@@ -34,10 +34,9 @@ driver.
 
 from __future__ import annotations
 
-import atexit
 import functools
+import hashlib
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -47,29 +46,67 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 BOOT_MAIN = REPO_ROOT / "boot" / "Main.tl"
 
 
+# Everything whose contents can change what `boot` compiles to: its own
+# source, the library it links against, the Python compiler that builds it, and
+# the C runtime it is linked with. Hashing these is what lets a build be
+# reused; missing one would mean serving a stale binary, which is worse than
+# rebuilding, so this list errs wide.
+_INPUTS = (("boot", "*.tl"), ("lib", "*.tl"),
+           ("turkey", "*.py"), ("runtime", "*.c"), ("runtime", "*.h"))
+
+
+def _fingerprint() -> str:
+    """A digest of every input to the build, for use as a cache key."""
+    h = hashlib.sha256()
+    for directory, pattern in _INPUTS:
+        for path in sorted((REPO_ROOT / directory).rglob(pattern)):
+            h.update(str(path.relative_to(REPO_ROOT)).encode())
+            h.update(path.read_bytes())
+    return h.hexdigest()[:16]
+
+
 @functools.lru_cache(maxsize=1)
 def binary() -> Path:
-    """The compiled `boot`, built on first use and kept for the session.
+    """The compiled `boot`, built on first use and cached across sessions.
 
     `turkey build` rather than compiling in-process and calling it, for two
     reasons that have not changed: a subprocess per invocation keeps a crash
     in `boot` from taking the test session with it, which matters while `boot`
     still has one -- and it had one this week, on a nine-argument call -- and a
     real executable is what self-hosting needs anyway.
+
+    The build takes about three minutes and the result depends on nothing but
+    the files `_fingerprint` hashes, so it is kept in a shared directory keyed
+    by that hash rather than in a per-session temporary one. A session that
+    changes nothing pays nothing. This matters more outside the test suite than
+    in it: a one-off script that wants a compiled `boot` used to pay the full
+    build every time it ran, which is three minutes to ask a question that
+    takes ten seconds to answer.
+
+    Sharing the directory between concurrent builds is safe because the key is
+    a content hash -- two builders racing are producing the same bytes -- but
+    the *file* must not be observed half-written, so the build goes to a
+    unique path and is moved into place with `os.replace`, which is atomic.
     """
-    directory = Path(tempfile.mkdtemp(prefix="turkey-boot-"))
-    atexit.register(shutil.rmtree, directory, ignore_errors=True)
-    output = directory / "boot"
+    cached = Path(tempfile.gettempdir()) / "turkey-bootc" / _fingerprint()
+    output = cached / "boot"
+    if output.exists():
+        return output
+    cached.mkdir(parents=True, exist_ok=True)
+    staging = cached / f"boot.{os.getpid()}"
     result = subprocess.run(
         [sys.executable, "-m", "turkey", "build", str(BOOT_MAIN),
-         "-o", str(output)],
+         "-o", str(staging)],
         cwd=REPO_ROOT,
         env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)),
         capture_output=True,
         text=True,
     )
-    assert result.returncode == 0, (
-        f"building boot failed\n{result.stdout}\n{result.stderr}")
+    if result.returncode != 0:
+        staging.unlink(missing_ok=True)
+        raise AssertionError(
+            f"building boot failed\n{result.stdout}\n{result.stderr}")
+    os.replace(staging, output)
     return output
 
 

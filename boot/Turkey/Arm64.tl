@@ -84,10 +84,14 @@ let lr = Physical(Gp, 30)
 let x0 = Physical(Gp, 0)
 let d0 = Physical(Fp, 0)
 
--- The first eight are the argument and result registers, which is the whole of
--- the calling convention this backend needs: nothing takes more than eight
--- arguments after closure conversion, because a closure's captures travel in
--- its environment rather than in registers.
+-- The first eight are the argument and result registers.
+-- Closure conversion keeps most calls under eight, because a closure's
+-- captures travel in its environment rather than in registers -- but it does
+-- not bound them, and the claim that it did was wrong: `tests/programs/
+-- manyargs.tl` has a nine-parameter function. A call needing a ninth stops in
+-- `Turkey.Select`, and a *function declaring* a ninth parameter selects
+-- silently and wrongly, because the incoming convention is the prologue's job.
+-- See NATIVE-BACKEND.md phase 4.
 -- AAPCS64 numbers the two files' argument registers separately: an integer
 -- argument takes the next `x` and a double the next `d`, so a call with one of
 -- each passes them in `x0` and `d0` rather than in `x0` and `x1`.

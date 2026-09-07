@@ -413,16 +413,77 @@ Handwritten selection is what ossified in Cranelift; a DSL with a generator is
 what they replaced it with, and is more machinery than this budget carries. A
 table interpreted at compile time is the middle, and it is what QBE ships.
 
-**Allocation is a single greedy pass with hinting, with the spiller split
-out**, which SSA is what makes possible. It runs on the machine instantiation
-only, and assigns physical registers to the values a machine instruction
-already names.
+**Allocation is spill, then colour, then coalesce** -- the SSA decomposition,
+not linear scan and not IRC. It runs on the machine instantiation only, and
+assigns physical registers to the values a machine instruction already names.
 
-It is deliberately *not* described as linear scan any more. That word was taken
-from QBE's project page, and reading `rega.c` shows QBE does not do it either
--- see the survey below, which also gives the reason the distinction costs
-nothing to get right and something to get wrong: the algorithm name is not what
-predicts either the code quality or the size.
+The survey below settles the algorithm, and the deciding fact is one sentence
+of Saarland's: *"The dominance relation of the SSA-form program induces a
+perfect elimination order on the program's interference graph"*, and therefore
+**"the interference graph does not have to be constructed as a data
+structure."** Colouring is a walk of the dominator tree giving each definition
+a register no live value holds. There is no graph, no worklist, and no
+iteration.
+
+**Why not IRC, given WebKit's numbers.** Air is not SSA, and IRC's shape
+follows from that: build the interference graph, then simplify, coalesce,
+freeze, spill and select -- and when a potential spill becomes a real one,
+insert the spill code and *run the whole thing again*. That loop is where its
+time and its subtle bugs are. On SSA it is unnecessary, because maximum
+register pressure is not merely a lower bound on the registers needed, it is
+exactly the answer: chordal graphs have ω(G) = χ(G). So spilling until
+pressure fits is **sufficient**, colouring afterwards **cannot fail**, and the
+decoupling costs nothing in quality. In non-SSA that is false -- pressure ≤ K
+does not imply colourable -- which is the whole reason IRC iterates.
+
+What WebKit's measurement is still worth is the correction it makes to QBE's
+framing: colouring is not the option you take when compile time does not
+matter. It is 1,300 lines and at parity with LLVM. That kills the axis this
+document was reasoning on; it does not make Air's allocator the one to copy.
+
+**Critical edges are a non-problem here, structurally.** Go requires their
+absence so it can "add fixup code to the end of that block", and every
+allocator that shuffles registers at a merge needs the same. Two properties
+remove the question. `Term` gives arguments to `Jump` and not to `Branch`, so
+an edge out of a multiple-successor block carries no bindings *by type* and not
+by discipline -- selection's guard splitting cannot violate it. And
+dominance-order colouring gives each value **one register for its whole live
+range**, so no value needs shuffling on any edge. Only block parameters need
+copies, and only `Jump` carries those.
+
+**Where the quality actually comes from, and what to expect.** Not from the
+colourer, which is optimal in register count by the theorem above. From two
+heuristics and one absence:
+
+* **Spilling** is the dominant term and is a heuristic choice: Belady's
+  furthest-next-use, which is what Go does, or cost times loop depth, which is
+  what QBE does.
+* **Coalescing** is our weakest point and should be expected to be. Selection
+  emits move traffic at every call -- arguments into physical registers, the
+  result out of `x0`, `MovConst`, block-parameter copies -- and *iterated*
+  coalescing is precisely what IRC is named for. Hint-driven greedy coalescing
+  catches most and not all. Nobody solves this: coalescing stays NP-hard on
+  chordal graphs too.
+* **No live-range splitting**, which is exactly what LLVM attributes Greedy's
+  win to: "a large live range may be idle a lot of the time, but used
+  intensively in a hot loop". Go, QBE and Air do not have it either.
+
+So the expectation is Go and QBE's tier, and LLVM's own number bounds the whole
+question: **1-2% smaller and up to 10% faster** is the entire distance between
+a plain allocator and a world-class one. It is also the wrong thing to optimize
+first here, because what surrounds the allocated code costs more than the
+allocation does -- a shadow-stack store per live pointer at every call, a
+test-and-branch after every call, a guard on every arithmetic operation, and
+none of phase 3's optimizations yet. The allocator should not be the reason
+this code is slow, and that is the whole bar.
+
+**The root array is a spill slot, and the spiller should know.** A pointer live
+across a safepoint is *already* being stored to memory, because that is what
+rooting is. Spilling it therefore costs only the reload; the store is
+sunk cost. So traced values live across a call are the cheapest things in the
+function to spill, and pressure peaks at exactly those points. This is
+specific to having a shadow stack rather than stack maps, and it is the one
+place this design is cheaper than the peers rather than dearer.
 
 **Stack maps come out of the allocator**, because it is the only pass that
 knows where a value is at a given point.
@@ -430,7 +491,11 @@ knows where a value is at a given point.
 **The allocator gets a fuzzer, not a test suite.** Cranelift's experience is
 that this is what made a high-complexity allocator transition safe, and a
 register allocator is the one component here whose bugs are both easy to write
-and invisible in a conformance run.
+and invisible in a conformance run. This project has a second check the peers
+did not: the same low IR compiled through LLVM and through arm64 must produce
+identical output over the whole corpus, under `TURKEY_GC_STRESS=1`. That says
+*a program* is wrong where a checker would say *an instruction* is, so it wants
+the fuzzer beside it rather than instead of it.
 
 ## Register allocation, surveyed
 
@@ -903,6 +968,43 @@ Each phase runs and is verified before the next begins.
   moving is something a person looks at. Closing this deletes the entry, the
   assertion and this paragraph together.
 * **Phase 5.** Register allocation, stack maps, encoding, object emission.
+
+  **Measured before written, because the spiller is the expensive half.** On
+  SSA the registers a function needs are exactly the values live at once, so
+  "does the corpus need spilling at all" is a question with an answer rather
+  than a guess. `Turkey.Regalloc.pressureOf` reports it and `boot asm` prints
+  it:
+
+  | | max general | max vector | over budget |
+  |---|---|---|---|
+  | the corpus, 40 programs | **13** of 28 | 3 of 32 | **none** |
+  | `boot` compiling itself, 2,912 functions | **88** of 28 | 3 of 32 | **three** |
+
+  The corpus alone would have said no spiller is needed, and shipping on that
+  would have produced an allocator that compiles every test program and cannot
+  compile the compiler. The three that exceed the file are
+  `%module.initialize` at 88, `Turkey.Llvm#declareRuntime` at 57, and
+  `Turkey.Infer#genMethodBodies` at 29 -- and the first of those is 16,968
+  instructions across 431 blocks, which is what a module initializer computing
+  every global in one function looks like.
+
+  So the order is: **the colourer first**, which is enough for every corpus
+  program and is therefore enough to get native code running end to end and
+  differentially checked; **the spiller second**, which is what self-hosting
+  needs. Two milestones rather than one, and the measurement is what separates
+  them.
+
+  It also disposes of a guess that was worth an hour: those three are *not*
+  straight-line, so Belady's furthest-next-use is not optimal on them the way
+  it is within a single block. The spiller has to be the control-flow-graph
+  generalization -- Braun and Hack's, or QBE's cost times loop depth -- and not
+  the textbook one-block algorithm.
+
+  **`boot` needs stack arguments to compile itself.** The same run reports four
+  calls stopped for more than eight arguments in one register file, in the
+  compiler's own source. The gap recorded under phase 4 is not a hypothetical
+  a test program invented; it is on the path to M29.
+
 
 LLVM is transitional: it is what phase 5 is differentially checked against, so
 it outlives the allocator's first working version by however long that takes to

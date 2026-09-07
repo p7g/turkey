@@ -668,6 +668,30 @@ Each phase runs and is verified before the next begins.
     peephole for the encoder, where it is local and checkable, rather than a
     reason to give the CFG a second type parameter.
 
+  **Two register files.** `Reg` carries a `Bank` on its physical constructor
+  and not on its virtual one, which is the asymmetry the design earns: a
+  virtual register's file is already written down in `Func.reps` -- `F64` or
+  not -- and a second copy of that fact is a second copy that can disagree. A
+  physical register has no rep to consult, so `x0` and `d0` are
+  `Physical(Gp, 0)` and `Physical(Fp, 0)` and never the same value.
+
+  Three consequences worth having stated before the allocator is written:
+
+  * **AAPCS64 numbers the two files' argument registers separately.** `f(1,
+    2.0, 3)` passes `x0`, `d0`, `x1` -- two counters, not one. A single
+    counter produces code that assembles, links, runs, and reads the wrong
+    register.
+  * **The runtime boundary is the bit pattern, not the value.** `turkey_box`
+    and friends take an `i64`, so a double crosses through `fmov x, d` --
+    which is what `Turkey.Llvm.widened` spells `bitcast`. Loads and stores
+    need no such step, because `str d0, [x1]` writes the same bits `str x0,
+    [x1]` would.
+  * **ARM's `ne` is not LLVM's `one`.** After `fcmp`, `ne` is true when the
+    operands are unordered, which makes it LLVM's `une`. Ordered-not-equal
+    needs `lo` or `gt` and an `orr`. Nothing in the corpus compares a NaN, so
+    this is a rule that would have been wrong silently for as long as that
+    stayed true.
+
   The rule for *when* the neutral parts run is still Go's: **early if an
   optimization can use it, late if it can only be obstructed by it.**
 

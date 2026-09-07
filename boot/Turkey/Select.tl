@@ -35,7 +35,7 @@ import Turkey.Arm64 as A
 -- `Term` and an `Arm`, patterns cannot be qualified, and this module matches
 -- on the IR and constructs machine instructions. So the side being matched
 -- gets the unqualified names.
-import Turkey.Arm64 (Reg(..), Inst(..))
+import Turkey.Arm64 (Reg(..), Inst(..), Bank(..))
 import Turkey.LowIr as L
 import Turkey.LowIr (Op(..), Low(..), BinOp(..), CmpOp(..), Conv(..),
                      Callee(..))
@@ -96,25 +96,6 @@ fun widthOf(r : Rep) -> A.Width = match r.class_ {
     I64 -> A.W64
     Ptr -> A.W64
     _ -> A.W32
-}
-
--- Whether this instruction touches a double, in its result or in any operand.
---
--- There is no floating-point register class yet: `Reg` is `Virtual` or
--- `Physical` and `Width` is 32 or 64 bits, so a double has nowhere correct to
--- go. Selecting one anyway would emit an integer instruction on an integer
--- register and be wrong in the way FINDINGS 63 describes -- a plausible
--- instruction, no diagnostic, a wrong answer at run time.
---
--- So it is refused and reported. `const.float` is the only one the corpus
--- reaches today, and the histogram naming it is the argument for adding the
--- register class rather than a gap to be discovered later.
-fun floating(s : Sel, i : Low) -> Bool {
-    if Ssa.repOf(s.source, i.result).class_ == F64 { return True }
-    for v in Ssa.uses(i) {
-        if Ssa.repOf(s.source, v).class_ == F64 { return True }
-    }
-    False
 }
 
 -- -- selection ----------------------------------------------------------------------
@@ -219,26 +200,41 @@ fun block(s : Sel) -> Int {
 -- -- instructions -------------------------------------------------------------------
 
 fun selectInst(s : Sel, i : Low) -> Unit {
-    if floating(s, i) {
-        stop(s, "floating point, which has no register class yet")
-        return
-    }
     let d = A.reg(i.result)
     let r = Ssa.repOf(s.source, i.result)
     let w = widthOf(r)
     match i.op {
         ConstInt(n) -> constant(s, d, n)
         ConstUnit -> emit(s, A.Mov(d, A.xzr, A.W64))
-        Bin(o, a, b) -> match binOp(o) {
-            Some(make) -> emit(s, make(d, A.reg(a), A.reg(b), w))
-            None -> trapping(s, i, d, r, o, A.reg(a), A.reg(b), w)
-        }
+        Bin(o, a, b) ->
+            if r.class_ == F64 { floatBin(s, d, o, A.reg(a), A.reg(b)) }
+            else { match binOp(o) {
+                Some(make) -> emit(s, make(d, A.reg(a), A.reg(b), w))
+                None -> trapping(s, i, d, r, o, A.reg(a), A.reg(b), w)
+            } }
         Cmp(o, a, b) -> {
-            emit(s, A.Cmp(A.reg(a), A.reg(b),
-                        widthOf(Ssa.repOf(s.source, a))))
-            emit(s, A.CSet(d, condOf(o)))
+            let operand = Ssa.repOf(s.source, a)
+            if operand.class_ == F64 {
+                floatCmp(s, d, o, A.reg(a), A.reg(b))
+            } else {
+                emit(s, A.Cmp(A.reg(a), A.reg(b), widthOf(operand)))
+                emit(s, A.CSet(d, condOf(o)))
+            }
         }
-        Neg(a) -> emit(s, A.Sub(d, A.xzr, A.reg(a), w))
+        Neg(a) -> if r.class_ == F64 { emit(s, A.FNeg(d, A.reg(a))) }
+                  else { emit(s, A.Sub(d, A.xzr, A.reg(a), w)) }
+        -- A double's bit pattern, built in the general file and moved across.
+        -- No literal pool: `fmov` takes only a small set of immediates, and a
+        -- constant this compiler cannot spell as one would need a pool entry
+        -- the module emitter has to lay out. Four `mov`s and a transfer need
+        -- nothing from anybody.
+        ConstFloat(x) -> {
+            let bits = temp(s, Ssa.untraced(I64))
+            constant(s, bits, Float.bits(x))
+            emit(s, A.FMovIn(d, bits))
+        }
+        Convert(IntToFloat, a) -> emit(s, A.Scvtf(d, A.reg(a)))
+        Convert(FloatToInt, a) -> emit(s, A.Fcvtzs(d, A.reg(a)))
         -- Both directions are one bitfield extract. `Widen` is a *zero*
         -- extension -- `Turkey.Llvm` emits `zext`, not `sext` -- and `Narrow`
         -- keeps the low bits of the target's width, so the two differ only in
@@ -258,6 +254,9 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         CellLoad(target) -> emit(s, A.Ldr(d, A.Offset(A.reg(target), 0), A.W64))
         CellStore(target, v) -> {
             emit(s, A.Str(A.reg(v), A.Offset(A.reg(target), 0), A.W64))
+            -- A `str` of a `d` register stores the same bits a `str` of an
+            -- `x` would, so no transfer is needed here and none below: only
+            -- the *call* boundaries need one.
             emit(s, A.Mov(d, A.xzr, A.W64))
         }
         -- An array's elements start after the header, and are the element's
@@ -296,11 +295,14 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         -- the runtime's ABI by design (`Turkey.LowIr`'s header), so selecting
         -- them is choosing a symbol and marshalling arguments -- there is no
         -- instruction to pick.
-        Box(a) -> runtimeCall(s, d, runtimeSymbolOf("turkey_box"), [A.reg(a)],
+        -- The runtime's untyped interfaces take a raw 64-bit word, so a double
+        -- crosses as its bits rather than in its own file -- the same thing
+        -- `Turkey.Llvm.widened` does with a `bitcast`.
+        Box(a) -> runtimeCall(s, d, runtimeSymbolOf("turkey_box"), [raw(s, a)],
                               [immediate(s, Rt.layoutCode(Ssa.repOf(s.source, a)))])
         Unbox(a) -> runtimeCall(s, d, runtimeSymbolOf("turkey_unbox"), [A.reg(a)],
                                 [immediate(s, Rt.layoutCode(r))])
-        CellNew(a) -> runtimeCall(s, d, runtimeSymbolOf("turkey_cell_new"), [A.reg(a)],
+        CellNew(a) -> runtimeCall(s, d, runtimeSymbolOf("turkey_cell_new"), [raw(s, a)],
                                   [immediate(s, Rt.traceBit(Ssa.repOf(s.source, a)))])
         ObjectNew(kind, tag, count, bitmap) ->
             runtimeCall(s, d, runtimeSymbolOf("turkey_object_new"), [],
@@ -308,10 +310,10 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                          immediate(s, count), immediate(s, bitmap)])
         ObjectSet(target, index, v) ->
             runtimeCall(s, d, runtimeSymbolOf("turkey_object_set"),
-                        [A.reg(target)], [immediate(s, index), A.reg(v)])
+                        [A.reg(target)], [immediate(s, index), raw(s, v)])
         ArrayNew(length, initial, element) ->
             runtimeCall(s, d, runtimeSymbolOf("turkey_array_new"),
-                        [A.reg(length), A.reg(initial)],
+                        [A.reg(length), raw(s, initial)],
                         [immediate(s, Rt.elementWidth(element)),
                          immediate(s, Rt.layoutCode(Ssa.untraced(element)))])
         -- The code operand is the function's *address*, which is what the
@@ -322,14 +324,24 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                         [immediate(s, count), immediate(s, bitmap)])
         ClosureCapture(closure, index, v) ->
             runtimeCall(s, d, runtimeSymbolOf("turkey_closure_capture"),
-                        [A.reg(closure)], [immediate(s, index), A.reg(v)])
+                        [A.reg(closure)], [immediate(s, index), raw(s, v)])
         Call(callee, args) -> {
+            -- Each argument's file comes from its representation, which is the
+            -- one place that fact is written down. A `Float` parameter is a
+            -- `double` in the C signature too, so this agrees with the runtime
+            -- without either side stating it twice.
             let passed = []
-            for a in args { Array.push(passed, A.reg(a)) }
+            for a in args {
+                Array.push(passed, (A.reg(a), A.bankOf(Ssa.repOf(s.source, a))))
+            }
+            let want = A.bankOf(r)
             match callee {
-                Direct(name) -> call(s, d, Some(symbolFor(name)), A.xzr, passed)
+                Direct(name) ->
+                    call(s, d, want, want, Some(symbolFor(name)), A.xzr, passed)
                 Runtime(name) -> match runtimeSymbol(name) {
-                    Some(sym) -> call(s, d, Some(sym), A.xzr, passed)
+                    Some(sym) ->
+                        call(s, d, want, resultBank(name), Some(sym), A.xzr,
+                             passed)
                     -- A few primitives are a handful of compares, and a
                     -- runtime entry point per predicate would be a call where
                     -- a compare will do. The same ones `Turkey.Llvm` inlines,
@@ -346,7 +358,11 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                     let env = temp(s, Ssa.traced(Ptr))
                     emit(s, A.Ldr(code, A.Offset(A.reg(closure), 24), A.W64))
                     emit(s, A.Ldr(env, A.Offset(A.reg(closure), 32), A.W64))
-                    call(s, d, None, code, Array.append([env], passed))
+                    -- Every argument and the result of a closure call is
+                    -- boxed, so this one is entirely in the general file
+                    -- whatever the underlying function's types are.
+                    call(s, d, want, want, None, code,
+                         Array.append([(env, A.Gp)], passed))
                 }
             }
         }
@@ -363,27 +379,72 @@ fun immediate(s : Sel, n : Int) -> Reg {
 }
 
 
+-- A call to one of the runtime's untyped entry points: every argument and the
+-- result is a machine word, because `raw` has already moved any double's bits
+-- into the general file.
 fun runtimeCall(s : Sel, d : Reg, sym : String, first : Array Reg,
-                rest : Array Reg) -> Unit =
-    call(s, d, Some(sym), A.xzr, Array.append(first, rest))
+                rest : Array Reg) -> Unit {
+    let args = []
+    for a in Array.append(first, rest) { Array.push(args, (a, A.Gp)) }
+    call(s, d, A.Gp, A.Gp, Some(sym), A.xzr, args)
+}
 
--- The AAPCS64 sequence: arguments into x0..x7, the call, the result out of x0.
+-- A value as a general register holding its bits.
+--
+-- The runtime's untyped interfaces take an `i64`, so a double crosses as its
+-- bit pattern. `Turkey.Llvm` spells the same step `bitcast double ... to i64`.
+fun raw(s : Sel, v : Value) -> Reg {
+    if Ssa.repOf(s.source, v).class_ != F64 { return A.reg(v) }
+    let bits = temp(s, Ssa.untraced(I64))
+    emit(s, A.FMovOut(bits, A.reg(v)))
+    bits
+}
+
+-- A move between any two banks. The pair of banks is what picks the
+-- instruction, and `fmov` spells three of the four.
+fun move(s : Sel, d : Reg, dBank : A.Bank, a : Reg, aBank : A.Bank) -> Unit =
+    match dBank {
+        Gp -> match aBank {
+            Gp -> emit(s, A.Mov(d, a, A.W64))
+            Fp -> emit(s, A.FMovOut(d, a))
+        }
+        Fp -> match aBank {
+            Gp -> emit(s, A.FMovIn(d, a))
+            Fp -> emit(s, A.FMov(d, a))
+        }
+    }
+
+-- The AAPCS64 sequence: arguments into the argument registers, the call, the
+-- result out of the result register.
+--
+-- **The two files are numbered separately.** An integer argument takes the
+-- next `x` and a double the next `d`, so `f(1, 2.0, 3)` passes `x0`, `d0`,
+-- `x1` -- not `x0`, `d1`, `x2`. Two counters rather than one, which is the
+-- whole of the difference and the whole of what a single counter would get
+-- silently wrong.
 --
 -- The moves to and from the physical registers are ordinary instructions and
 -- the allocator will coalesce most of them away. `CallArgs` carries what the
 -- call reads and writes, because `Bl` names neither -- without it the
 -- allocator would see a call that uses nothing and keep nothing alive across
 -- it.
-fun call(s : Sel, d : Reg, sym : Option String, indirect : Reg,
-         args : Array Reg) -> Unit {
-    if len(args) > 8 {
-        stop(s, "a call with more than eight arguments")
-        return
-    }
+fun call(s : Sel, d : Reg, dBank : A.Bank, resultBank : A.Bank,
+         sym : Option String, indirect : Reg,
+         args : Array (Reg, A.Bank)) -> Unit {
     let ins = []
-    for var i = 0; i < len(args); i = i + 1 {
-        emit(s, A.Mov(A.argRegs[i], args[i], A.W64))
-        Array.push(ins, A.argRegs[i])
+    var general = 0
+    var vector = 0
+    for (a, bank) in args {
+        let into = match bank {
+            Gp -> { let at = general; general = general + 1; A.argRegs[at] }
+            Fp -> { let at = vector; vector = vector + 1; A.fpArgRegs[at] }
+        }
+        if general > 8 || vector > 8 {
+            stop(s, "a call with more than eight arguments in one file")
+            return
+        }
+        move(s, into, bank, a, bank)
+        Array.push(ins, into)
     }
     -- The *physical* registers the call reads and writes, not the virtuals
     -- either side of them. Passing the virtual destination here made it
@@ -396,12 +457,16 @@ fun call(s : Sel, d : Reg, sym : Option String, indirect : Reg,
     -- liveness today. That is correct rather than pointless: the fact is
     -- recorded where the allocator will read it, and the allocator is what
     -- teaches `uses`/`defs` about physical registers.
-    emit(s, A.CallArgs(ins, [A.x0]))
+    let out = match resultBank { Gp -> A.x0; Fp -> A.d0 }
+    emit(s, A.CallArgs(ins, [out]))
     match sym {
         Some(name) -> emit(s, A.Bl(name))
         None -> emit(s, A.Blr(indirect))
     }
-    emit(s, A.Mov(d, A.x0, A.W64))
+    -- The callee's result file and the destination's need not agree:
+    -- `turkey_unbox` answers a double's bits in `x0`, and the value being
+    -- built is a double.
+    move(s, d, dBank, out, resultBank)
 }
 
 -- Where a global lives: in the root array if the collector must scan it, in
@@ -625,8 +690,8 @@ fun guard(s : Sel, condition : Value, message : String) -> Unit {
                                      BlockId(carry))
     s.at = failed
     let text = address(s, Asm.messageSymbol(s.asm, message))
-    call(s, temp(s, Ssa.untraced(I64)),
-         Some(Asm.runtimeFor("turkey_panic")), A.xzr, [text])
+    call(s, temp(s, Ssa.untraced(I64)), A.Gp, A.Gp,
+         Some(Asm.runtimeFor("turkey_panic")), A.xzr, [(text, A.Gp)])
     let zero = tempValue(s, s.out.result)
     emit(s, A.Mov(A.reg(zero), A.xzr, A.W64))
     s.out.blocks[s.at].term = Ret(zero)
@@ -661,14 +726,16 @@ fun bits(r : Rep) -> Int = match r.class_ {
 -- Answers whether it handled the name, so that the caller reports the ones
 -- that have neither an entry point nor a rule instead of emitting something
 -- plausible for them (FINDINGS 63).
-fun inlinePrim(s : Sel, d : Reg, name : String, args : Array Reg) -> Bool =
+fun inlinePrim(s : Sel, d : Reg, name : String,
+               args : Array (Reg, A.Bank)) -> Bool =
     match name {
         -- A scalar value is a code point that is not a surrogate: at most
         -- U+10FFFF, and outside U+D800..U+DFFF.
         "Prim.charIsScalar" -> {
-            let big = flag(s, args[0], 1114111, A.Hi)
-            let atLeast = flag(s, args[0], 55296, A.Hs)
-            let atMost = flag(s, args[0], 57343, A.Ls)
+            let (point, _) = args[0]
+            let big = flag(s, point, 1114111, A.Hi)
+            let atLeast = flag(s, point, 55296, A.Hs)
+            let atMost = flag(s, point, 57343, A.Ls)
             let surrogate = temp(s, Ssa.untraced(I1))
             emit(s, A.And(surrogate, atLeast, atMost, A.W32))
             let bad = temp(s, Ssa.untraced(I1))
@@ -685,6 +752,67 @@ fun flag(s : Sel, a : Reg, n : Int, c : A.Cond) -> Reg {
     let out = temp(s, Ssa.untraced(I1))
     emit(s, A.CSet(out, c))
     out
+}
+
+-- Which file a runtime entry point answers in. `turkey_float_floor` returns a
+-- `double` and so answers in `d0`; everything else answers in `x0`.
+fun resultBank(name : String) -> A.Bank = match Rt.entryPoint(name) {
+    Some(entry) -> match entry.result {
+        Some(F64) -> A.Fp
+        _ -> A.Gp
+    }
+    None -> A.Gp
+}
+
+-- Floating point arithmetic, which does not trap.
+--
+-- `Int` overflow panics and float overflow does not: IEEE 754 answers an
+-- infinity, which is a value. So none of this is guarded, and the asymmetry is
+-- the language's rather than this backend's.
+fun floatBin(s : Sel, d : Reg, o : BinOp, a : Reg, b : Reg) -> Unit = match o {
+    Add -> emit(s, A.FAdd(d, a, b))
+    Sub -> emit(s, A.FSub(d, a, b))
+    Mul -> emit(s, A.FMul(d, a, b))
+    Div -> emit(s, A.FDiv(d, a, b))
+    -- arm64 has no remainder instruction for doubles, and LLVM's `frem` is
+    -- `fmod` by definition, so this is the call the other backend also
+    -- eventually becomes.
+    Rem -> call(s, d, A.Fp, A.Fp, Some(Asm.runtimeFor("turkey_float_fmod")),
+                A.xzr, [(a, A.Fp), (b, A.Fp)])
+    _ -> stop(s, "the binary operation " + show(o) + " on a double")
+}
+
+-- Comparing doubles, which is not comparing integers with a different
+-- mnemonic.
+--
+-- `Turkey.Llvm` emits the *ordered* predicates -- `oeq`, `olt` and so on --
+-- which are false when either side is NaN. ARM's condition codes do not line
+-- up with those one for one: after `fcmp`, `ne` means "not equal **or
+-- unordered**", which is LLVM's `une` and not its `one`. Every other ordered
+-- predicate has a single code -- `lo` for less-than, since `fcmp` clears the
+-- carry there, and `ls` for less-or-equal -- and `one` is the one that needs
+-- two and an `orr`.
+--
+-- Getting this wrong would be invisible until a NaN reached a comparison,
+-- which no corpus program does today.
+fun floatCmp(s : Sel, d : Reg, o : CmpOp, a : Reg, b : Reg) -> Unit {
+    emit(s, A.FCmp(a, b))
+    match o {
+        Eq -> emit(s, A.CSet(d, A.Eq))
+        Lt -> emit(s, A.CSet(d, A.Lo))
+        Le -> emit(s, A.CSet(d, A.Ls))
+        Gt -> emit(s, A.CSet(d, A.Gt))
+        Ge -> emit(s, A.CSet(d, A.Ge))
+        -- Ordered and not equal: less than, or greater than. Not `ne`, which
+        -- is also true of a NaN.
+        Ne -> {
+            let below = temp(s, Ssa.untraced(I1))
+            let above = temp(s, Ssa.untraced(I1))
+            emit(s, A.CSet(below, A.Lo))
+            emit(s, A.CSet(above, A.Gt))
+            emit(s, A.Orr(d, below, above, A.W32))
+        }
+    }
 }
 
 fun condOf(o : CmpOp) -> A.Cond = match o {

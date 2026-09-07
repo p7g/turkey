@@ -1,8 +1,8 @@
 module Turkey.Arm64 (
-    Reg(..), reg, physical, isPhysical, Cond(..), Width(..),
+    Reg(..), Bank(..), reg, physical, isPhysical, bankOf, Cond(..), Width(..),
     Mem(..), Arm(..), Inst(..),
-    xzr, sp, fp, lr, x0, argRegs, callerSaved, calleeSaved,
-    showReg, condName,
+    xzr, sp, fp, lr, x0, d0, argRegs, fpArgRegs, callerSaved, calleeSaved,
+    fpCallerSaved, fpCalleeSaved, showReg, condName,
 )
 
 -- The arm64 machine instruction set (`NATIVE-BACKEND.md`, M28 phase 4).
@@ -46,44 +46,87 @@ import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..),
 -- printer, verifier and encoder written twice, and the moment when a function
 -- stops containing virtual registers is a *fact about a pass having run*, not
 -- something the type system can usefully police at this size.
+-- Which file a register comes from. arm64 has two, and they are numbered
+-- independently: `x0` and `d0` are different registers that are both 0.
+--
+-- A *virtual* register's bank is not here, because it is already written down
+-- -- `Func.reps` says whether the value is `F64`, and a second copy of that
+-- fact is a second copy that can disagree. A *physical* register has no rep
+-- to consult, so it carries its bank.
+type Bank = Gp | Fp
+
 type Reg
     -- A value from selection. The number is an `Ssa.Value` id.
     = Virtual(Int)
-    -- `x0`..`x30`, and 31 meaning `xzr` or `sp` depending on the instruction.
-    | Physical(Int)
+    -- `x0`..`x30` and `d0`..`d31`; 31 in the general file means `xzr` or `sp`
+    -- depending on the instruction.
+    | Physical(Bank, Int)
 
 fun reg(v : Value) -> Reg = Virtual(Ssa.valueId(v))
 
-fun physical(n : Int) -> Reg = Physical(n)
+fun physical(n : Int) -> Reg = Physical(Gp, n)
 
 fun isPhysical(r : Reg) -> Bool = match r {
-    Physical(_) -> True
+    Physical(_, _) -> True
     Virtual(_) -> False
 }
 
-let xzr = Physical(31)
-let sp = Physical(31)
-let fp = Physical(29)
-let lr = Physical(30)
-let x0 = Physical(0)
+-- The file a value of this representation lives in.
+fun bankOf(r : Rep) -> Bank = match r.class_ {
+    F64 -> Fp
+    _ -> Gp
+}
+
+let xzr = Physical(Gp, 31)
+let sp = Physical(Gp, 31)
+let fp = Physical(Gp, 29)
+let lr = Physical(Gp, 30)
+let x0 = Physical(Gp, 0)
+let d0 = Physical(Fp, 0)
 
 -- The first eight are the argument and result registers, which is the whole of
 -- the calling convention this backend needs: nothing takes more than eight
 -- arguments after closure conversion, because a closure's captures travel in
 -- its environment rather than in registers.
-let argRegs = [Physical(0), Physical(1), Physical(2), Physical(3),
-               Physical(4), Physical(5), Physical(6), Physical(7)]
+-- AAPCS64 numbers the two files' argument registers separately: an integer
+-- argument takes the next `x` and a double the next `d`, so a call with one of
+-- each passes them in `x0` and `d0` rather than in `x0` and `x1`.
+let argRegs = [Physical(Gp, 0), Physical(Gp, 1), Physical(Gp, 2),
+               Physical(Gp, 3), Physical(Gp, 4), Physical(Gp, 5),
+               Physical(Gp, 6), Physical(Gp, 7)]
+let fpArgRegs = [Physical(Fp, 0), Physical(Fp, 1), Physical(Fp, 2),
+                 Physical(Fp, 3), Physical(Fp, 4), Physical(Fp, 5),
+                 Physical(Fp, 6), Physical(Fp, 7)]
 
 -- AAPCS64: x0-x17 are caller-saved, x19-x28 callee-saved. x18 is reserved by
 -- the platform on Darwin and is not in either list.
-let callerSaved = [Physical(0), Physical(1), Physical(2), Physical(3),
-                   Physical(4), Physical(5), Physical(6), Physical(7),
-                   Physical(8), Physical(9), Physical(10), Physical(11),
-                   Physical(12), Physical(13), Physical(14), Physical(15),
-                   Physical(16), Physical(17)]
-let calleeSaved = [Physical(19), Physical(20), Physical(21), Physical(22),
-                   Physical(23), Physical(24), Physical(25), Physical(26),
-                   Physical(27), Physical(28)]
+let callerSaved = [Physical(Gp, 0), Physical(Gp, 1), Physical(Gp, 2),
+                   Physical(Gp, 3), Physical(Gp, 4), Physical(Gp, 5),
+                   Physical(Gp, 6), Physical(Gp, 7), Physical(Gp, 8),
+                   Physical(Gp, 9), Physical(Gp, 10), Physical(Gp, 11),
+                   Physical(Gp, 12), Physical(Gp, 13), Physical(Gp, 14),
+                   Physical(Gp, 15), Physical(Gp, 16), Physical(Gp, 17)]
+let calleeSaved = [Physical(Gp, 19), Physical(Gp, 20), Physical(Gp, 21),
+                   Physical(Gp, 22), Physical(Gp, 23), Physical(Gp, 24),
+                   Physical(Gp, 25), Physical(Gp, 26), Physical(Gp, 27),
+                   Physical(Gp, 28)]
+
+-- The vector file's halves are the other way round from the general file's:
+-- `v0`-`v7` and `v16`-`v31` are caller-saved, and only the *low 64 bits* of
+-- `v8`-`v15` are callee-saved. Every double this compiler makes is 64 bits, so
+-- the distinction does not bite here -- but it is why these are named `d` and
+-- not `v`, and it would bite the moment anything vectorized.
+let fpCallerSaved = [Physical(Fp, 0), Physical(Fp, 1), Physical(Fp, 2),
+                     Physical(Fp, 3), Physical(Fp, 4), Physical(Fp, 5),
+                     Physical(Fp, 6), Physical(Fp, 7), Physical(Fp, 16),
+                     Physical(Fp, 17), Physical(Fp, 18), Physical(Fp, 19),
+                     Physical(Fp, 20), Physical(Fp, 21), Physical(Fp, 22),
+                     Physical(Fp, 23), Physical(Fp, 24), Physical(Fp, 25),
+                     Physical(Fp, 26), Physical(Fp, 27), Physical(Fp, 28),
+                     Physical(Fp, 29), Physical(Fp, 30), Physical(Fp, 31)]
+let fpCalleeSaved = [Physical(Fp, 8), Physical(Fp, 9), Physical(Fp, 10),
+                     Physical(Fp, 11), Physical(Fp, 12), Physical(Fp, 13),
+                     Physical(Fp, 14), Physical(Fp, 15)]
 
 -- The operand width. arm64 spells the same instruction `add w0, ...` at 32
 -- bits and `add x0, ...` at 64, so this is a field rather than two opcodes.
@@ -149,6 +192,28 @@ type Arm
     -- and an offset within it.
     | Adrp(Reg, String)
     | AddLo(Reg, Reg, String)
+    -- Floating point. One width only, because Turkey's `Float` is a double
+    -- and there is no `f32` to spell.
+    --
+    -- `FMov` moves between two `d`s; `FMovIn` and `FMovOut` move the *bits*
+    -- between a `d` and an `x`, which is how a double reaches the runtime's
+    -- untyped `i64` interfaces and comes back. All three are `fmov` to the
+    -- assembler, and they are three constructors here because the register
+    -- banks differ and a printer that guessed from the operands would be
+    -- guessing.
+    | FMov(Reg, Reg)
+    | FMovIn(Reg, Reg)
+    | FMovOut(Reg, Reg)
+    | FAdd(Reg, Reg, Reg)
+    | FSub(Reg, Reg, Reg)
+    | FMul(Reg, Reg, Reg)
+    | FDiv(Reg, Reg, Reg)
+    | FNeg(Reg, Reg)
+    | FCmp(Reg, Reg)
+    -- Signed integer to double, and back with truncation toward zero -- which
+    -- is what LLVM's `fptosi` does and so what this has to do.
+    | Scvtf(Reg, Reg)
+    | Fcvtzs(Reg, Reg)
     -- A 64-bit constant, as one instruction.
     --
     -- arm64 builds one out of a `movz` and up to three `movk`s, and every
@@ -229,6 +294,17 @@ fun usesOf(op : Arm) -> Array Value = match op {
     Adrp(_, _) -> []
     AddLo(_, a, _) -> virtualOf([a])
     MovConst(_, _) -> []
+    FMov(_, a) -> virtualOf([a])
+    FMovIn(_, a) -> virtualOf([a])
+    FMovOut(_, a) -> virtualOf([a])
+    FAdd(_, a, b) -> virtualOf([a, b])
+    FSub(_, a, b) -> virtualOf([a, b])
+    FMul(_, a, b) -> virtualOf([a, b])
+    FDiv(_, a, b) -> virtualOf([a, b])
+    FNeg(_, a) -> virtualOf([a])
+    FCmp(a, b) -> virtualOf([a, b])
+    Scvtf(_, a) -> virtualOf([a])
+    Fcvtzs(_, a) -> virtualOf([a])
     Bl(_) -> []
     Blr(a) -> virtualOf([a])
     CallArgs(ins, _) -> virtualOf(ins)
@@ -276,6 +352,19 @@ fun defsOf(op : Arm) -> Array Value = match op {
     Adrp(d, _) -> virtualOf([d])
     AddLo(d, _, _) -> virtualOf([d])
     MovConst(d, _) -> virtualOf([d])
+    FMov(d, _) -> virtualOf([d])
+    FMovIn(d, _) -> virtualOf([d])
+    FMovOut(d, _) -> virtualOf([d])
+    FAdd(d, _, _) -> virtualOf([d])
+    FSub(d, _, _) -> virtualOf([d])
+    FMul(d, _, _) -> virtualOf([d])
+    FDiv(d, _, _) -> virtualOf([d])
+    FNeg(d, _) -> virtualOf([d])
+    -- `fcmp` writes the flags and no register, which is exactly why the guard
+    -- that reads it has to stay adjacent.
+    FCmp(_, _) -> []
+    Scvtf(d, _) -> virtualOf([d])
+    Fcvtzs(d, _) -> virtualOf([d])
     Bl(_) -> []
     Blr(_) -> []
     CallArgs(_, outs) -> virtualOf(outs)
@@ -290,7 +379,7 @@ fun virtualOf(rs : Array Reg) -> Array Value {
     for r in rs {
         match r {
             Virtual(n) -> Array.push(out, Value(n))
-            Physical(_) -> {}
+            Physical(_, _) -> {}
         }
     }
     out
@@ -314,10 +403,13 @@ fun showReg(r : Reg, w : Width) -> String {
     }
     match r {
         Virtual(n) -> "%" + Int.toString(n)
-        Physical(31) -> "xzr"
-        Physical(n) -> if n == 29 { "x29" }
-                       else if n == 30 { "x30" }
-                       else { prefix + Int.toString(n) }
+        -- The bank decides the letter, not the width: a double is always
+        -- `d`, and only the general file has a narrow spelling.
+        Physical(Fp, n) -> "d" + Int.toString(n)
+        Physical(Gp, 31) -> "xzr"
+        Physical(Gp, n) -> if n == 29 { "x29" }
+                           else if n == 30 { "x30" }
+                           else { prefix + Int.toString(n) }
     }
 }
 
@@ -352,7 +444,7 @@ instance Show Mem {
 -- encoding, read differently by the instruction, which is why `Reg` cannot
 -- decide it alone.
 fun baseName(r : Reg) -> String = match r {
-    Physical(31) -> "sp"
+    Physical(Gp, 31) -> "sp"
     other -> showReg(other, W64)
 }
 
@@ -407,6 +499,19 @@ fun showArm(op : Arm) -> String = match op {
                           + ", [" + baseName(base) + ", #" + Int.toString(n)
                           + "]"
     MovConst(d, n) -> showConst(d, n)
+    -- A virtual register prints as `%n` whichever bank it is in, so these read
+    -- the same as their integer counterparts until the allocator has run.
+    FMov(d, a) -> "fmov " + fpName(d) + ", " + fpName(a)
+    FMovIn(d, a) -> "fmov " + fpName(d) + ", " + showReg(a, W64)
+    FMovOut(d, a) -> "fmov " + showReg(d, W64) + ", " + fpName(a)
+    FAdd(d, a, b) -> fp3("fadd", d, a, b)
+    FSub(d, a, b) -> fp3("fsub", d, a, b)
+    FMul(d, a, b) -> fp3("fmul", d, a, b)
+    FDiv(d, a, b) -> fp3("fdiv", d, a, b)
+    FNeg(d, a) -> "fneg " + fpName(d) + ", " + fpName(a)
+    FCmp(a, b) -> "fcmp " + fpName(a) + ", " + fpName(b)
+    Scvtf(d, a) -> "scvtf " + fpName(d) + ", " + showReg(a, W64)
+    Fcvtzs(d, a) -> "fcvtzs " + showReg(d, W64) + ", " + fpName(a)
     Adrp(d, sym) -> "adrp " + showReg(d, W64) + ", " + sym + "@PAGE"
     AddLo(d, a, sym) -> "add " + showReg(d, W64) + ", " + showReg(a, W64)
                         + ", " + sym + "@PAGEOFF"
@@ -431,6 +536,13 @@ fun imm(name : String, d : Reg, a : Reg, n : Int, w : Width) -> String =
 -- Local labels. `L` is the assembler's convention for a symbol that does not
 -- reach the symbol table, which is what a basic block should be.
 fun blockLabel(b : BlockId) -> String = "Lb" + Int.toString(Ssa.blockId(b))
+
+-- A register in the vector file. The width is not a parameter because there is
+-- only one: `W64` reaches `showReg`, which answers `d` for anything in `Fp`.
+fun fpName(r : Reg) -> String = showReg(r, W64)
+
+fun fp3(name : String, d : Reg, a : Reg, b : Reg) -> String =
+    name + " " + fpName(d) + ", " + fpName(a) + ", " + fpName(b)
 
 -- A constant, as the `movz` and `movk`s that build it.
 --

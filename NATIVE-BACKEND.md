@@ -40,10 +40,11 @@ every stage, and instruction selection rewrites that IL in place using a
 bottom-up tree-matching algorithm inherited from Ken Thompson's Plan 9 C
 compiler. Its optimization set is *copy elimination, sparse conditional
 constant propagation, dead instruction elimination, and registerization of
-small stack slots*, plus a loop-based spilling heuristic. Its allocator is
-linear scan with hinting, and it notes that SSA lets the spiller and the
-allocator be separate passes, which is "simpler and faster than graph
-coloring".
+small stack slots*, plus a loop-based spilling heuristic. It notes that SSA
+lets the spiller and the allocator be separate passes, which is "simpler and
+faster than graph coloring" -- a claim that is half right, and the half that is
+wrong is corrected under *Register allocation, surveyed* below, along with what
+its allocator turns out actually to be.
 
 That is the target shape. It is a complete backend, it is fast, and it is
 roughly the size budget this project can carry.
@@ -412,9 +413,16 @@ Handwritten selection is what ossified in Cranelift; a DSL with a generator is
 what they replaced it with, and is more machinery than this budget carries. A
 table interpreted at compile time is the middle, and it is what QBE ships.
 
-**Allocation is linear scan with hinting, with the spiller split out**, which
-SSA is what makes possible. It runs on the machine instantiation only, and
-assigns physical registers to the values a machine instruction already names.
+**Allocation is a single greedy pass with hinting, with the spiller split
+out**, which SSA is what makes possible. It runs on the machine instantiation
+only, and assigns physical registers to the values a machine instruction
+already names.
+
+It is deliberately *not* described as linear scan any more. That word was taken
+from QBE's project page, and reading `rega.c` shows QBE does not do it either
+-- see the survey below, which also gives the reason the distinction costs
+nothing to get right and something to get wrong: the algorithm name is not what
+predicts either the code quality or the size.
 
 **Stack maps come out of the allocator**, because it is the only pass that
 knows where a value is at a given point.
@@ -423,6 +431,115 @@ knows where a value is at a given point.
 that this is what made a high-complexity allocator transition safe, and a
 register allocator is the one component here whose bugs are both easy to write
 and invisible in a conformance run.
+
+## Register allocation, surveyed
+
+Written before the allocator, and it reversed two things this document already
+said. Five implementations, each one's algorithm read out of its *source*
+rather than its summary, with what it measured and what it cost in lines.
+
+| | algorithm | lines | what they measured |
+|---|---|---|---|
+| **QBE** `rega.c` + `spill.c` | backwards greedy, hint-driven, blocks ordered to peel loop nests inside-out; cost-based spiller (uses x loop depth) | **1,172** | nothing published |
+| **WebKit Air** | Iterated Register Coalescing -- graph colouring | **~1,300** | "no significant difference in the quality of code" vs LLVM Greedy |
+| **Go** `ssacompile/regalloc.go` | greedy over the whole function as one long block; spills the value whose next use is farthest away | **3,464** | -- |
+| **LLVM Greedy** | priority queue, eviction, global live-range splitting | **~5,000** | 1-2% smaller and up to 10% faster than the linear scan it replaced |
+| **Cranelift regalloc2** | backtracking, bundle merging, splitting | **>10,000** | ~20% off total compile time; 10-20% on register-pressure benchmarks |
+
+**QBE's allocator is not linear scan, and this document said it was.** The
+project page says "Linear register allocator with hinting", and that is where
+the claim came from. `rega.c` is a *backwards* walk over blocks sorted by loop
+depth, assigning from a hint table, with no intervals, no scan order over a
+linearised function, and no backtracking. Its own comments are the tell:
+`prio1` is a "trivial heuristic to begin with, later we can use the distance to
+the definition instruction", and the block order carries "todo, evaluate if
+this order is really better than the simple postorder". Neither file cites a
+paper. What *is* real and is worth taking is the split: the spiller
+(`spill.c`, 485 lines) runs first and decides what lives in memory, and the
+allocator never revisits that decision -- which SSA is what makes sound.
+
+**And the 70% is an aim, not a measurement.** "QBE is a compiler backend that
+*aims to provide* 70% of the performance of industrial optimizing compilers in
+10% of the code", with no benchmark cited anywhere on the page. It is a
+statement of budget, which is how this document has used it, and it is not
+evidence about output quality. The 10% half is checkable and holds; the 70%
+half is a goal nobody has published a number for.
+
+**Graph colouring is not the expensive option, and that is the counterexample
+that matters.** QBE's line -- a split spiller is "simpler and faster than graph
+coloring" -- reads as though colouring were what you pick when compile time
+does not matter. WebKit picked it *for a JIT*, where compile time is on the
+user's critical path, and gives the numbers: "IRC is around 1300 lines of code,
+LLVM's Greedy is close to 5000 lines", chosen because it is "very concise",
+needs little tuning, and "makes it easy to model the kinds of register
+constraints" Air has. Their throughput results "seem to indicate that there
+isn't a significant difference in the quality of code produced by B3's and
+LLVM's register allocators" -- graph colouring at a quarter of the size, at
+parity. So the axis is not colouring-versus-scan at all.
+
+**What sophistication actually buys is about 10%.** LLVM's own report on
+replacing linear scan with Greedy: "1-2% smaller, and up to 10% faster".
+That is the ceiling on this decision for a mature C compiler on real hardware,
+and it is the number to hold against any allocator design that costs more than
+a week.
+
+**Nobody's simple allocator is small.** Go runs the simplest algorithm in the
+table -- one greedy pass over the function as though it were a single block --
+and it is **3,464 lines**, three times QBE's. The algorithm does not predict
+the size; the number of target constraints, calling-convention cases and
+fixup paths does. Budgeting "linear scan, therefore small" would have been
+wrong by a factor of three. Plan for **1,200 to 3,500 lines**, and treat
+anything under that as a sign that a case has not been found yet.
+
+**Wimmer and Franz measured what SSA buys an allocator, and it is compile time,
+not code quality.** They rebuilt the HotSpot client compiler's linear scan to
+run on SSA: lifetime analysis got **25-31% faster** because it needs no global
+dataflow analysis, LIR construction **19-27% faster** because SSA deconstruction
+is gone, the whole backend **13-19% faster**, and the implementation ended up
+**about 200 lines shorter**. Output: machine code size changed by "1% or less",
+run-time differences were "generally below the random noise", and there was "no
+slowdown for any benchmark". Two details are worth more than the headline. The
+allocation loop itself was "mostly unchanged" -- SSA paid in the analysis
+around it, not in the assignment. And eliminating the interval-intersection
+tests that SSA makes provably redundant "does not gain a measurable speedup",
+which is a check this project would otherwise have built for the reason they
+built it.
+
+**Go recomputes flags rather than spilling them, and our situation differs.**
+Go models the condition flags as an ordinary SSA value with its own type and
+runs a 263-line `flagalloc` pass before allocation: "Flag values are recomputed
+if they need to be spilled/restored." It needs that machinery because a Go
+branch takes a flag value as a *control value*, so a flag can be live across a
+block boundary and reach a merge. Ours cannot. `Term` is not parameterized, so
+a condition is materialized into a register by `cset` and the branch reads the
+bit -- which means a flag's live range is always exactly one instruction pair
+inside one block. So the constraint stated earlier in this document stands, and
+now for a reason rather than a preference: **"never insert between a
+flag-setter and its `cset`" is a local invariant the allocator can hold, not an
+analysis it has to run.** The cost of the design that makes it local is the one
+extra instruction per guard, which is the trade already made and is cheaper
+than 263 lines. If flags ever become live across a block -- which would mean
+parameterizing `Term` -- Go's answer is the one to copy: recompute, do not
+spill.
+
+**The fuzzer is not optional, and this is the one place every peer agrees.**
+regalloc2 "had *only* ever performed register allocation for fuzz-target-
+generated inputs" for its first four months, with a purpose-built SSA validator
+and a symbolic checker, and since shipping "we haven't found any miscompiles
+caused by RA2 itself". Cranelift's own retrospective calls fuzzing what made a
+high-complexity allocator transition safe. No project in this table verifies
+its allocator with a conformance suite.
+
+**What this project has that none of them had.** regalloc2 needed a symbolic
+checker because there was no second implementation to disagree with. There is
+one here: LLVM stays until the allocator is trusted, and the same low IR
+compiled twice must produce two programs with identical output over the whole
+corpus, under `TURKEY_GC_STRESS=1`. That is a stronger oracle than a checker
+for the bugs that matter and a weaker one for locality -- it says a program is
+wrong, not which instruction -- so it wants the fuzzer beside it, not instead
+of it. It is also the argument, now evidenced, for the phase ordering already
+written down: LLVM outlives the allocator's first working version.
+
 
 ## Verification
 
@@ -743,6 +860,48 @@ Each phase runs and is verified before the next begins.
   the system assembler an instruction-by-instruction oracle for the byte
   encoder -- the part of a backend hardest to get right, and the part Cranelift
   says needs a fuzzer.
+
+  Status: **1866 of 1866 functions across the corpus select**, with
+  `Ssa.verify` silent on every one. One gap is open and is phase 5's to close.
+
+  **More than eight arguments in one register file does not work, either side
+  of the call.** AAPCS64 passes the ninth argument and beyond on the stack, and
+  there is no frame to put it in -- the prologue that would is the same pass
+  that has still to assign a register to anything. The two sides fail
+  differently and only one of them is safe:
+
+  * **The caller stops and says so.** `Turkey.Select.call` asks `general >=
+    len(A.argRegs)` *before* taking the register and reports "a call with more
+    than eight arguments in one register file, which would need stack
+    arguments". Until it did, the check ran one line after the array index and
+    a nine-argument call panicked inside the compiler -- `array index out of
+    bounds: read at index 8, length 8`. No corpus program had a function of
+    more than eight parameters, so nothing found it; `tests/programs/manyargs.tl`
+    exists now for that reason, and the callee has to be *recursive*, because
+    `opt` inlines and folds a call with constant arguments.
+  * **The callee is silent, which is the part to fix first.** `start` copies
+    `f.params` through as ordinary virtuals and nothing binds them to the
+    incoming ABI at all, so a nine-parameter *function* selects cleanly and
+    means nothing. There is no diagnostic because there is no code -- the
+    incoming convention is established by the prologue, which does not exist.
+    A stop on the caller and silence on the callee is not a consistent state;
+    it is safe only because nothing downstream consumes the result yet.
+
+  Measured rather than assumed. A module holding a nine-parameter `sum9` and a
+  `main` that calls it with constant arguments reports **`selected 9 of 9
+  functions`** and no complaint at all: `opt` inlines and folds the call away,
+  so the caller check never runs, and `sum9` survives as a top-level function
+  whose nine parameters are printed as ordinary virtuals -- `fun @Main#sum9(%0:
+  i64, ..., %8:i64)`. Nothing in the pipeline says this function has no
+  callable entry sequence. That is the shape to remember: the caller's stop is
+  a real diagnostic, and it is also the reason the callee's silence looks
+  covered when it is not.
+
+  `tests/test_select.py` holds the caller half as a ratchet: `KNOWN_REASONS`
+  has exactly this one entry, a reason outside the set fails the run, and
+  `stopped == 2` is asserted exactly rather than as a bound so that the number
+  moving is something a person looks at. Closing this deletes the entry, the
+  assertion and this paragraph together.
 * **Phase 5.** Register allocation, stack maps, encoding, object emission.
 
 LLVM is transitional: it is what phase 5 is differentially checked against, so
@@ -829,3 +988,16 @@ Already rejected in `LLVM-BACKEND.md`, for reasons that have not changed.
   <https://cfallin.org/blog/2023/01/20/cranelift-isle/>
 * Cranelift, part 4: a new register allocator,
   <https://cfallin.org/blog/2022/06/09/cranelift-regalloc2/>
+* Linear scan register allocation on SSA form, Wimmer and Franz, CGO 2010,
+  <https://dl.acm.org/doi/10.1145/1772954.1772979>
+* Greedy register allocation in LLVM 3.0, LLVM project blog,
+  <https://blog.llvm.org/2011/09/greedy-register-allocation-in-llvm-30.html>
+* Introducing the B3 JIT compiler, WebKit -- Air's IRC allocator and its line
+  count against LLVM Greedy, <https://webkit.org/blog/5852/introducing-the-b3-jit-compiler/>
+* Go's register allocator, read as source rather than as summary:
+  `src/cmd/compile/internal/ssa/regalloc.go` (the algorithm's documentation)
+  and `src/cmd/compile/internal/ssacompile/regalloc.go` (its 3,464 lines),
+  with `ssacompile/flagalloc.go` for the flag-rematerialization pass,
+  <https://github.com/golang/go/tree/master/src/cmd/compile/internal>
+* QBE's allocator and spiller, likewise as source: `rega.c`, `spill.c`,
+  <https://c9x.me/git/qbe.git>

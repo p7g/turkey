@@ -392,10 +392,15 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
     -- over is the whole answer.
     var maxGp = 0
     var maxFp = 0
+    var effGp = 0
+    var effFp = 0
     for f in selected {
         let p = Regalloc.pressureOf(f)
         if p.gp > maxGp { maxGp = p.gp }
         if p.fp > maxFp { maxFp = p.fp }
+        let e = Regalloc.effectivePressure(f)
+        if e.gp > effGp { effGp = e.gp }
+        if e.fp > effFp { effFp = e.fp }
         if p.gp > Regalloc.availableGp || p.fp > Regalloc.availableFp {
             String.push(b, "--   over budget  " + f.name + "  gp "
                            + Int.toString(p.gp) + "  fp "
@@ -406,6 +411,30 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
                    + Int.toString(Regalloc.availableGp) + "  fp "
                    + Int.toString(maxFp) + " of "
                    + Int.toString(Regalloc.availableFp) + "\n")
+    String.push(b, "-- effective  gp " + Int.toString(effGp) + " of "
+                   + Int.toString(Regalloc.availableGp) + "  fp "
+                   + Int.toString(effFp) + " of "
+                   + Int.toString(Regalloc.availableFp) + "\n")
+    -- And the tighter number: what is live *across* a call can only be in a
+    -- callee-saved register, of which there are ten. Total pressure can fit in
+    -- 28 and this can still not fit in 10.
+    var acUg = 0
+    var acTg = 0
+    var acUf = 0
+    var acTf = 0
+    for f in selected {
+        let a = Regalloc.acrossCalls(f)
+        if a.untracedGp > acUg { acUg = a.untracedGp }
+        if a.tracedGp > acTg { acTg = a.tracedGp }
+        if a.untracedFp > acUf { acUf = a.untracedFp }
+        if a.tracedFp > acTf { acTf = a.tracedFp }
+    }
+    String.push(b, "-- across calls  gp " + Int.toString(acUg)
+                   + " untraced + " + Int.toString(acTg) + " traced of "
+                   + Int.toString(Regalloc.calleeSavedGp) + "  fp "
+                   + Int.toString(acUf) + " untraced + "
+                   + Int.toString(acTf) + " traced of "
+                   + Int.toString(Regalloc.calleeSavedFp) + "\n")
     let counts = Map.new()
     for u in unsupported {
         Map.put(counts, u.what, Map.getOr(counts, u.what, 0) + 1)

@@ -1,5 +1,7 @@
 module Turkey.Regalloc (
-    Pressure(..), pressureOf, availableGp, availableFp,
+    Pressure(..), pressureOf, effectivePressure,
+    AcrossCalls(..), acrossCalls,
+    availableGp, availableFp, calleeSavedGp, calleeSavedFp,
 )
 
 -- Register allocation for arm64 (`NATIVE-BACKEND.md`, M28 phase 5).
@@ -48,6 +50,12 @@ let availableGp = 28
 -- it makes is 64 bits and nothing vectorizes yet.
 let availableFp = 32
 
+-- What survives a call, which is a much smaller set than what exists. A value
+-- live across a `bl` and held in a caller-saved register is destroyed by the
+-- callee, so it needs one of these or a spill slot -- and there are ten.
+let calleeSavedGp = 10
+let calleeSavedFp = 8
+
 -- The maximum number of values simultaneously live, per file.
 --
 -- Measured at two kinds of program point: after each instruction of a block,
@@ -90,6 +98,134 @@ fun countOf(f : Func A.Inst, live : Set.Set Int) -> (Int, Int) {
         match A.bankOf(f.reps[id]) {
             Gp -> { gp = gp + 1 }
             Fp -> { fp = fp + 1 }
+        }
+    }
+    (gp, fp)
+}
+
+
+-- How many values are live *across* a call, which is the second number the
+-- colourer's feasibility turns on and a tighter one than total pressure.
+--
+-- A call clobbers every caller-saved register, so a value live across one can
+-- be held only in a callee-saved register -- of which the general file has ten
+-- and the vector file eight -- or in memory. Total pressure can fit
+-- comfortably in 28 registers and this can still not fit in 10.
+--
+-- Traced and untraced are counted apart because they are not equally
+-- expensive to spill. A traced value live across a safepoint is *already*
+-- being written to the root array, because that is what rooting is; spilling
+-- it costs the reload and not the store. An untraced one has no such slot and
+-- pays for both. So the untraced count is the one that says whether a spiller
+-- is needed, and the traced count says how much cheaper the spilling is than
+-- it looks.
+type AcrossCalls = AcrossCalls {
+    untracedGp : Int, tracedGp : Int, untracedFp : Int, tracedFp : Int,
+    calls : Int,
+}
+
+fun acrossCalls(f : Func A.Inst) -> AcrossCalls {
+    var ug = 0
+    var tg = 0
+    var uf = 0
+    var tf = 0
+    var calls = 0
+    let liveOut = Ssa.liveness(f)
+    for var b = 0; b < len(f.blocks); b = b + 1 {
+        let block = f.blocks[b]
+        let after = Ssa.liveAfter(f, Ssa.BlockId(b), liveOut[b])
+        for var n = 0; n < len(block.insts); n = n + 1 {
+            if A.isCall(block.insts[n]) {
+                calls = calls + 1
+                var thisUg = 0
+                var thisTg = 0
+                var thisUf = 0
+                var thisTf = 0
+                for id in Set.elements(after[n]) {
+                    let rep = f.reps[id]
+                    match A.bankOf(rep) {
+                        Gp -> if rep.traced { thisTg = thisTg + 1 }
+                              else { thisUg = thisUg + 1 }
+                        Fp -> if rep.traced { thisTf = thisTf + 1 }
+                              else { thisUf = thisUf + 1 }
+                    }
+                }
+                if thisUg > ug { ug = thisUg }
+                if thisTg > tg { tg = thisTg }
+                if thisUf > uf { uf = thisUf }
+                if thisTf > tf { tf = thisTf }
+            }
+        }
+    }
+    AcrossCalls { untracedGp = ug, tracedGp = tg, untracedFp = uf,
+                  tracedFp = tf, calls = calls }
+}
+
+
+-- Pressure once the root array is counted as the spill slot it already is.
+--
+-- `Turkey.Roots` gives a stack slot to every traced value live across a
+-- safepoint, and the emitter *already* stores it there before the call --
+-- that store is what rooting is. So such a value need not hold a register
+-- across the call at all: it can be read back from its slot afterwards, at
+-- the cost of a load and no store. Its live range is split at every call, and
+-- between calls it is an ordinary value.
+--
+-- This is not a spiller. It is the observation that the spilling has already
+-- happened, for a different reason, and that the allocator may as well use it.
+-- The measurement it produces is the one the colourer's feasibility rests on:
+-- if effective pressure fits in the register file, no spiller is needed.
+--
+-- Approximated deliberately, and in the safe direction. A value that is live
+-- across *some* call is excluded from every live set here, not only from the
+-- ones spanning a call, so this under-counts the registers such a value uses
+-- between calls. What it cannot do is under-count a function that needs
+-- spilling for some other reason, because every value not in that set is
+-- counted in full. Read it as "is the colourer plausible", not as a
+-- register count.
+fun effectivePressure(f : Func A.Inst) -> Pressure {
+    let liveOut = Ssa.liveness(f)
+    -- The traced values live across some call: exactly what `Turkey.Roots`
+    -- gives a slot to, recomputed here on the machine graph because selection
+    -- keeps the value numbering and this module cannot see a `Func Low`.
+    let rooted = Set.new()
+    for var b = 0; b < len(f.blocks); b = b + 1 {
+        let block = f.blocks[b]
+        let after = Ssa.liveAfter(f, Ssa.BlockId(b), liveOut[b])
+        for var n = 0; n < len(block.insts); n = n + 1 {
+            if A.isCall(block.insts[n]) {
+                for id in Set.elements(after[n]) {
+                    if f.reps[id].traced { Set.add(rooted, id) }
+                }
+            }
+        }
+    }
+    var gp = 0
+    var fp = 0
+    for var b = 0; b < len(f.blocks); b = b + 1 {
+        let at = Ssa.BlockId(b)
+        let (og, of_) = countExcept(f, liveOut[b], rooted)
+        if og > gp { gp = og }
+        if of_ > fp { fp = of_ }
+        for live in Ssa.liveAfter(f, at, liveOut[b]) {
+            let (ig, if_) = countExcept(f, live, rooted)
+            if ig > gp { gp = ig }
+            if if_ > fp { fp = if_ }
+        }
+    }
+    Pressure { gp = gp, fp = fp }
+}
+
+fun countExcept(f : Func A.Inst, live : Set.Set Int,
+                skip : Set.Set Int) -> (Int, Int) {
+    var gp = 0
+    var fp = 0
+    for id in Set.elements(live) {
+        if !Set.contains(skip, id) {
+            match A.bankOf(f.reps[id]) {
+                Gp -> { gp = gp + 1 }
+                Fp -> { fp = fp + 1 }
+            }
         }
     }
     (gp, fp)

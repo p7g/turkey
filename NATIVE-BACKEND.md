@@ -483,7 +483,10 @@ rooting is. Spilling it therefore costs only the reload; the store is
 sunk cost. So traced values live across a call are the cheapest things in the
 function to spill, and pressure peaks at exactly those points. This is
 specific to having a shadow stack rather than stack maps, and it is the one
-place this design is cheaper than the peers rather than dearer.
+place this design is cheaper than the peers rather than dearer. Measured under
+phase 5 and it is stronger than this paragraph guessed: those values are not
+the cheapest things to spill, they are *already* spilt, and counting that takes
+`boot`'s own worst function from 88 live values to 10.
 
 **Stack maps come out of the allocator**, because it is the only pass that
 knows where a value is at a given point.
@@ -988,17 +991,39 @@ Each phase runs and is verified before the next begins.
   instructions across 431 blocks, which is what a module initializer computing
   every global in one function looks like.
 
-  So the order is: **the colourer first**, which is enough for every corpus
-  program and is therefore enough to get native code running end to end and
-  differentially checked; **the spiller second**, which is what self-hosting
-  needs. Two milestones rather than one, and the measurement is what separates
-  them.
+  **And then the root array turned out to be the spiller.** `Turkey.Roots`
+  already gives a stack slot to every traced value live across a safepoint,
+  and the emitter already stores it there before the call -- that store *is*
+  rooting. So such a value need not hold a register across the call at all: it
+  can be read back afterwards, for the price of a load and no store. Counting
+  that, pressure is not 88:
 
-  It also disposes of a guess that was worth an hour: those three are *not*
-  straight-line, so Belady's furthest-next-use is not optimal on them the way
-  it is within a single block. The spiller has to be the control-flow-graph
-  generalization -- Braun and Hack's, or QBE's cost times loop depth -- and not
-  the textbook one-block algorithm.
+  | | raw | with the root slots counted |
+  |---|---|---|
+  | the corpus | 13 of 28 | **10** of 28 |
+  | `boot` compiling itself | 88 of 28 | **10** of 28 |
+
+  And what is left holding registers across a call -- the untraced values,
+  which have no slot -- peaks at **6** against ten callee-saved registers, in
+  the corpus and in `boot` alike.
+
+  So there is **no spiller**, and the shadow stack is why. The design note
+  earlier in this document guessed that traced values live across a call would
+  be the cheapest things to spill; the measurement says they are not merely
+  cheapest, they are already spilt, and spilling anything else is unnecessary.
+  This is the one place this backend is cheaper than its peers rather than
+  dearer, and it is a direct consequence of the choice that makes it slower
+  everywhere else -- rooting by store rather than by stack map. QBE, Go and
+  LLVM all need a spiller because none of them has already written every live
+  pointer to memory.
+
+  The 10 is an approximation and honest about which way it errs: a value live
+  across *some* call is excluded from every live set, so it under-counts what
+  such values use between calls. The true figure is between 10 and 88, and 28
+  is the budget. The measurement that settles it is the colourer itself, which
+  will report when it cannot find a register the same way selection reports an
+  opcode it has no rule for -- so a spiller, if one is ever needed, arrives
+  with a histogram saying which functions need it.
 
   **`boot` needs stack arguments to compile itself.** The same run reports four
   calls stopped for more than eight arguments in one register file, in the

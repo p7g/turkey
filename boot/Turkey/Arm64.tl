@@ -2,7 +2,7 @@ module Turkey.Arm64 (
     Reg(..), Bank(..), reg, physical, isPhysical, bankOf, Cond(..), Width(..),
     Mem(..), Arm(..), Inst(..),
     xzr, sp, fp, lr, x0, d0, argRegs, fpArgRegs, callerSaved, calleeSaved,
-    fpCallerSaved, fpCalleeSaved, showReg, condName,
+    fpCallerSaved, fpCalleeSaved, showReg, condName, isCall,
 )
 
 -- The arm64 machine instruction set (`NATIVE-BACKEND.md`, M28 phase 4).
@@ -255,6 +255,23 @@ instance Ssa.Inst Inst {
     -- reads effects for anything but the register allocator's benefit -- and
     -- a conservative answer costs it nothing.
     fun effects(i) = Ssa.writes()
+}
+
+-- Whether this instruction is a call, which for the allocator means two
+-- things at once: every caller-saved register is clobbered here, so a value
+-- live across it needs a callee-saved one or a spill slot -- and it is a
+-- safepoint, so the collector may run and every live traced value must be
+-- somewhere the collector can see.
+--
+-- It lives here rather than in the allocator because which opcodes call is a
+-- fact about the instruction set. `Ssa.effects` cannot answer it: every
+-- machine instruction reports `writes`, deliberately, because the
+-- optimizations run above this level and a conservative answer costs them
+-- nothing.
+fun isCall(i : Inst) -> Bool = match i.op {
+    Bl(_) -> True
+    Blr(_) -> True
+    _ -> False
 }
 
 -- The `Value` ids an instruction reads. Physical registers are not `Value`s

@@ -650,6 +650,24 @@ Each phase runs and is verified before the next begins.
   is something LLVM *refuses*. Duplication a checker sees is not the dangerous
   kind.
 
+  **Two constraints the guards create, for the passes that do not exist yet.**
+
+  * **Nothing may come between a flag-setting instruction and the `cset` that
+    reads it.** `adds`/`subs`/`cmp` write NZCV and the `cset` consumes it, and
+    the register allocator is the pass that would insert a spill between them.
+    arm64 has no way to name the flags as an operand, so nothing in the graph
+    says these two are joined -- the allocator has to be told. LLVM models
+    NZCV as a register for exactly this reason; the cheaper answer here is to
+    treat the pair as indivisible when the allocator is written.
+  * **The condition is materialized into a register rather than branched on
+    directly.** `Term` is not parameterized the way the instruction type is,
+    so `b.vs` is not something the machine CFG can express as a terminator --
+    a `cset` and a branch on the bit is. That costs one instruction per guard
+    and keeps the graph a graph, which is the trade the CFG bug earlier in
+    this phase argued for. Folding `cset`+`cbnz` back into `b.cond` is a
+    peephole for the encoder, where it is local and checkable, rather than a
+    reason to give the CFG a second type parameter.
+
   The rule for *when* the neutral parts run is still Go's: **early if an
   optimization can use it, late if it can only be obstructed by it.**
 

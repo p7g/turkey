@@ -149,6 +149,15 @@ type Arm
     -- and an offset within it.
     | Adrp(Reg, String)
     | AddLo(Reg, Reg, String)
+    -- A 64-bit constant, as one instruction.
+    --
+    -- arm64 builds one out of a `movz` and up to three `movk`s, and every
+    -- `movk` reads the register it writes. That is not SSA: the value would be
+    -- defined four times, which `Ssa.verify` rejects and a register allocator
+    -- would believe. So the sequence is one instruction here and the printer
+    -- expands it -- the same answer QBE and Cranelift give a "load immediate",
+    -- and the reason a pseudo-instruction is a category the enum has at all.
+    | MovConst(Reg, Int)
     -- Calls. `Bl` is direct and `Blr` is through a register.
     | Bl(String)
     | Blr(Reg)
@@ -219,6 +228,7 @@ fun usesOf(op : Arm) -> Array Value = match op {
     Ldp(_, _, base, _) -> virtualOf([base])
     Adrp(_, _) -> []
     AddLo(_, a, _) -> virtualOf([a])
+    MovConst(_, _) -> []
     Bl(_) -> []
     Blr(a) -> virtualOf([a])
     CallArgs(ins, _) -> virtualOf(ins)
@@ -265,6 +275,7 @@ fun defsOf(op : Arm) -> Array Value = match op {
     Ldp(a, b, _, _) -> virtualOf([a, b])
     Adrp(d, _) -> virtualOf([d])
     AddLo(d, _, _) -> virtualOf([d])
+    MovConst(d, _) -> virtualOf([d])
     Bl(_) -> []
     Blr(_) -> []
     CallArgs(_, outs) -> virtualOf(outs)
@@ -395,6 +406,7 @@ fun showArm(op : Arm) -> String = match op {
     Ldp(a, b, base, n) -> "ldp " + showReg(a, W64) + ", " + showReg(b, W64)
                           + ", [" + baseName(base) + ", #" + Int.toString(n)
                           + "]"
+    MovConst(d, n) -> showConst(d, n)
     Adrp(d, sym) -> "adrp " + showReg(d, W64) + ", " + sym + "@PAGE"
     AddLo(d, a, sym) -> "add " + showReg(d, W64) + ", " + showReg(a, W64)
                         + ", " + sym + "@PAGEOFF"
@@ -419,3 +431,24 @@ fun imm(name : String, d : Reg, a : Reg, n : Int, w : Width) -> String =
 -- Local labels. `L` is the assembler's convention for a symbol that does not
 -- reach the symbol table, which is what a basic block should be.
 fun blockLabel(b : BlockId) -> String = "Lb" + Int.toString(Ssa.blockId(b))
+
+-- A constant, as the `movz` and `movk`s that build it.
+--
+-- Sixteen bits at a time, low half first, skipping the halves that are zero --
+-- and emitting one `movz` even for zero, so that the sequence is never empty.
+fun showConst(d : Reg, n : Int) -> String {
+    let out = []
+    var first = True
+    for var shift = 0; shift < 64; shift = shift + 16 {
+        let part = Int.and(Int.shr(n, shift), 65535)
+        if part != 0 {
+            let piece = Int.toString(part) + (if shift == 0 { "" }
+                                              else { ", lsl #" + Int.toString(shift) })
+            if first { Array.push(out, "movz " + showReg(d, W64) + ", #" + piece) }
+            else { Array.push(out, "movk " + showReg(d, W64) + ", #" + piece) }
+            first = False
+        }
+    }
+    if first { return "movz " + showReg(d, W64) + ", #0" }
+    String.join(out, "\n    ")
+}

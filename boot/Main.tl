@@ -367,9 +367,19 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
         return
     }
     String.push(b, "; === " + path + "\n")
-    let (selected, unsupported) = Select.selectModule(module_.functions)
+    let (selected, unsupported) = Select.selectModule(module_)
     for f in selected {
         String.push(b, Ssa.showFunc(f))
+        -- The same verifier the low IR gets, on the machine graph, because
+        -- `Turkey.Ssa` is parameterized over the instruction and not over the
+        -- CFG. Selection now *creates* blocks -- a guard splits the one it is
+        -- in -- so a terminator naming the wrong block, a value used outside
+        -- the blocks its definition dominates, and a jump whose arguments do
+        -- not match its target's parameters are all mistakes this pass can
+        -- newly make, and all ones this catches at the pass that made them.
+        for message in Ssa.verify(f) {
+            String.push(b, "  !! " + message + "\n")
+        }
     }
     String.push(b, "-- selected " + Int.toString(len(selected)) + " of "
                    + Int.toString(len(module_.functions)) + " functions\n")

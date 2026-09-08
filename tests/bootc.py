@@ -169,3 +169,68 @@ def split_before(text: str, marker: str) -> dict[str, str]:
     if name is not None:
         modules[name] = "".join(current)
     return modules
+
+
+# The Python implementation's own inputs. Deliberately *not* `boot/`: a
+# reference dump is keyed on these plus the source of the one program being
+# compiled, so changing `boot/Turkey/Regalloc.tl` invalidates the entry for
+# `boot/Main.tl` -- which genuinely changed -- and leaves the corpus entries
+# alone.
+_REFERENCE_INPUTS = (("turkey", "*.py"), ("lib", "*.tl"))
+
+
+@functools.lru_cache(maxsize=1)
+def _reference_fingerprint() -> str:
+    h = hashlib.sha256()
+    for directory, pattern in _REFERENCE_INPUTS:
+        for path in sorted((REPO_ROOT / directory).rglob(pattern)):
+            h.update(str(path.relative_to(REPO_ROOT)).encode())
+            h.update(path.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def reference(stage: str, path: Path, compute) -> str:
+    """One Python-side reference dump, cached on disk by content hash.
+
+    `turkey.driver.check` on `boot/Main.tl` takes about seventy seconds, and
+    `test_boot` runs it once per *stage* -- five times for one answer that
+    cannot have changed between them. Over the corpus it is another thirteen
+    seconds a stage. None of it depends on anything but the Python
+    implementation and the program being compiled, so none of it needs doing
+    twice.
+
+    Keyed per program rather than over the corpus as a whole, which is what
+    makes it useful during backend work: a change to `boot/` invalidates the
+    `boot/Main.tl` entry and nothing else, so the twenty-nine corpus entries
+    stay warm. A change to `turkey/` invalidates everything, which is correct
+    -- that is the side being compared against.
+
+    Strings, not the structures they came from: `check` answers a mutable
+    object and a cache that handed the same one to two tests would be a
+    cross-test aliasing bug of the worst kind, silent and order-dependent.
+    """
+    h = hashlib.sha256()
+    h.update(_reference_fingerprint().encode())
+    h.update(stage.encode())
+    h.update(str(path).encode())
+    # Every `.tl` beside the program, not just the program. `check` follows
+    # imports, so the reference for `boot/Main.tl` depends on all of
+    # `boot/Turkey/` -- and a key that hashed only `Main.tl` would have served
+    # a stale expectation after any change to a module it imports. That is the
+    # worst failure this project can have: the differential oracle comparing
+    # against the wrong answer and reporting agreement. Hashing the whole
+    # directory is coarse for `tests/programs`, where each program imports only
+    # the library, and exactly right for `boot`.
+    for sibling in sorted(path.parent.rglob("*.tl")):
+        h.update(str(sibling.relative_to(path.parent)).encode())
+        h.update(sibling.read_bytes())
+    cached = (Path(tempfile.gettempdir()) / "turkey-reference"
+              / h.hexdigest()[:24])
+    if cached.exists():
+        return cached.read_text(encoding="utf-8")
+    value = compute()
+    cached.parent.mkdir(parents=True, exist_ok=True)
+    staging = cached.with_suffix(f".{os.getpid()}")
+    staging.write_text(value, encoding="utf-8")
+    os.replace(staging, cached)
+    return value

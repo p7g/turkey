@@ -420,6 +420,8 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
     -- and computes a wrong answer -- so it is checked here rather than
     -- trusted, exactly as the machine graph is.
     var coloured = 0
+    var hintTaken = 0
+    var hintTotal = 0
     let colourStops = Map.new()
     for f in selected {
         let c = Regalloc.colour(f)
@@ -428,9 +430,22 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
                                  Map.getOr(colourStops, why, 0) + 1)
             None -> { coloured = coloured + 1 }
         }
-        for message in Regalloc.verifyColouring(f, c) {
-            String.push(b, "  !! " + f.name + ": " + message + "\n")
+        -- Only a colouring that finished. One that stopped has values with
+        -- no register *by construction* -- that is what stopping means -- so
+        -- verifying it reports hundreds of consequences of the one thing
+        -- already in the histogram. Selection has the same rule: a function it
+        -- could not select is not then checked for being badly selected.
+        match c.stopped {
+            Some(_) -> {}
+            None -> {
+                for message in Regalloc.verifyColouring(f, c) {
+                    String.push(b, "  !! " + f.name + ": " + message + "\n")
+                }
+            }
         }
+        let (got, want) = Regalloc.hintsTaken(f, c)
+        hintTaken = hintTaken + got
+        hintTotal = hintTotal + want
     }
     -- The two numbers that say whether a real spiller is ever needed. An
     -- untraced value has no root slot, so if those alone overflow the file a
@@ -450,6 +465,13 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
                    + Int.toString(Regalloc.calleeSavedGp) + "\n")
     String.push(b, "-- coloured " + Int.toString(coloured) + " of "
                    + Int.toString(len(selected)) + " functions\n")
+    -- Every missed hint is one `mov` the emitter keeps at the top of a
+    -- function. A miss is not a bug -- a parameter live across a call must
+    -- miss, its argument register being caller-saved -- so this is the first
+    -- number this backend reports that is about code quality rather than
+    -- about whether the thing works at all.
+    String.push(b, "-- argument hints  " + Int.toString(hintTaken) + " of "
+                   + Int.toString(hintTotal) + " taken\n")
     -- A different prefix from selection's histogram on purpose. Both are
     -- "-- <count> <reason>" and a reader can tell them apart by context, but
     -- `tests/test_select.py` parses the selection one by prefix, and two

@@ -1628,6 +1628,42 @@ would happily serve a stale artifact if the lifetime were longer than the
 session. Hashing the inputs is the only key that is neither.
 
 
+### 74. A metric that reads exactly zero is a bug, not a result
+**process.** M28 phase 5. The colourer hints each function parameter towards
+its argument register, and the hit rate was added purely as a code-quality
+number -- every miss is one `mov` the emitter keeps. It read **0 of 3714**.
+
+Zero is not a bad hint rate. A hint that never lands is not a preference being
+outvoted, it is a preference not being consulted, and the cause was worse than
+the metric: `Ssa.Func.params` and `Ssa.Block.params` are different fields, the
+walk coloured only the second, and **every function parameter was therefore
+assigned no register at all**.
+
+Nothing had noticed, and the reason is the part worth keeping. `verifyColouring`
+checked two things -- two live values sharing a register, and a value holding a
+register clobbered while live -- and an *unassigned* value took part in
+neither, because both loops skipped it. A checker that says nothing about the
+absence of an answer will happily bless a function where nothing was answered.
+It now complains about a live value with no register, which is the check that
+would have caught this on the first run.
+
+Two lessons, and the second is the general one:
+
+* **A metric added for quality found a correctness bug**, which is an argument
+  for adding them earlier than they seem worth it. This one cost four lines.
+* **Round numbers deserve suspicion in proportion to how round they are.** 38%
+  and 69% invite interpretation; 0.0% of 3714 is a sentence about the
+  measurement rather than about the thing measured. The instinct to explain a
+  zero is the instinct to be resisted.
+
+A third, smaller: the same run reported 4,471 verifier complaints that were all
+about *unreachable* blocks, and 414,664 more about functions whose colouring
+had already stopped. A checker has to agree with the pass it checks about which
+code exists -- the colourer walks reachable blocks and does not finish stopped
+functions, so the checker must do both too, or its output is noise that hides
+the four real complaints it might one day have.
+
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

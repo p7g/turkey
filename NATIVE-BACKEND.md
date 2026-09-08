@@ -1050,15 +1050,36 @@ Each phase runs and is verified before the next begins.
 
   **Status: the corpus colours completely; `boot` does not yet.**
 
-  | | coloured | out of registers |
+  | | coloured | argument hints taken |
   |---|---|---|
-  | the corpus | **1888 of 1888** | none |
-  | `boot` compiling itself | 2773 of 2929 | **156** |
+  | the corpus | **1885 of 1888** | 2556 of 3714, **68.8%** |
+  | `boot` compiling itself | 2681 of 2934 | 2363 of 6132, 38.5% |
 
   Zero complaints from `verifyColouring` on either, which is the check that
   matters: a colouring putting two simultaneously live values in one register
   prints, assembles, links, runs, and computes a wrong answer, and nothing
-  downstream can see it.
+  downstream can see it. It checks reachable blocks only, and only functions
+  whose colouring *finished* -- a stopped one has unassigned values by
+  construction, and verifying it reports hundreds of consequences of the one
+  fact already in the histogram.
+
+  **The hint rate is the first number here that is about quality rather than
+  about working at all.** A parameter is *hinted* to its argument register and
+  never pinned: the emitter opens each function with a move from `x`*i* into
+  wherever the parameter went, so a taken hint makes that move redundant and a
+  missed one makes it real. Neither can make the result wrong, which is the
+  point -- a pin can contradict, since a parameter fixed in `x0` and live
+  across a call has had `x0` destroyed by the callee, and a preference cannot.
+  The 31% and 61% that miss are mostly exactly that case, and they cost one
+  `mov` each.
+
+  **Dead blocks reach the machine graph, and the arm64 emitter will have to
+  drop them.** `SsaLower` emits a fallthrough panic block for every `match` --
+  `%4 = const "no match arm applied"; panic %4` -- and when the match is
+  exhaustive nothing branches to it. LLVM's own dead-code elimination deletes
+  these on that path, so they have never cost anything; nothing on this path
+  will unless the emitter skips unreachable blocks. Wasted bytes rather than
+  wrong code.
 
   The 156 are the gap between the approximation and the truth, and they are
   **not** an argument for a spiller. The colourer as written gives each value

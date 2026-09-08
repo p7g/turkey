@@ -3,7 +3,7 @@ module Turkey.Regalloc (
     AcrossCalls(..), acrossCalls,
     availableGp, availableFp, calleeSavedGp, calleeSavedFp,
     Colouring(..), colour, verifyColouring,
-    untracedPressure, worstCall,
+    untracedPressure, worstCall, argumentHints, hintsTaken,
 )
 
 -- Register allocation for arm64 (`NATIVE-BACKEND.md`, M28 phase 5).
@@ -280,7 +280,27 @@ fun colour(f : Func A.Inst) -> Colouring {
     let forbidden = forbiddenSets(f, liveOut)
     let of_ : Array Int = []
     for _ in f.reps { Array.push(of_, -1) }
+    let hints = argumentHints(f)
     var stopped = None
+
+    -- The function's own parameters, before anything else.
+    --
+    -- They are live from entry and are defined by nothing in any block --
+    -- `Func.params` and `Block.params` are different fields, and the walk
+    -- below only ever colours the second. Missing this left every parameter
+    -- with no register at all, which nothing downstream noticed because an
+    -- unassigned value simply does not appear in the checks. It was found by
+    -- the hint hit rate reading exactly 0 of 3714, which is not a bad hint
+    -- rate but an absent one.
+    let entryTaken = Set.new()
+    for p in f.params {
+        let id = Ssa.valueId(p)
+        let why = assign(f, of_, forbidden, entryTaken, id, hints[id])
+        match (why, stopped) {
+            (Some(w), None) -> { stopped = Some(w) }
+            _ -> {}
+        }
+    }
 
     for at in Ssa.reversePostorder(f) {
         let b = Ssa.blockId(at)
@@ -293,7 +313,8 @@ fun colour(f : Func A.Inst) -> Colouring {
             if of_[id] >= 0 { Set.add(taken, key(f, id, of_[id])) }
         }
         for p in block.params {
-            let why = assign(f, of_, forbidden, taken, Ssa.valueId(p))
+            let pid = Ssa.valueId(p)
+            let why = assign(f, of_, forbidden, taken, pid, hints[pid])
             match (why, stopped) {
                 (Some(w), None) -> { stopped = Some(w) }
                 _ -> {}
@@ -309,7 +330,8 @@ fun colour(f : Func A.Inst) -> Colouring {
                 if of_[id] >= 0 { Set.add(live, key(f, id, of_[id])) }
             }
             for d in Ssa.defs(block.insts[n]) {
-                let why = assign(f, of_, forbidden, live, Ssa.valueId(d))
+                let did = Ssa.valueId(d)
+                let why = assign(f, of_, forbidden, live, did, hints[did])
                 match (why, stopped) {
                     (Some(w), None) -> { stopped = Some(w) }
                     _ -> {}
@@ -332,14 +354,23 @@ fun key(f : Func A.Inst, id : Int, n : Int) -> String =
 -- Give one value the lowest register its bank allows that nothing live holds
 -- and nothing forbids. Answers why it could not, if it could not.
 fun assign(f : Func A.Inst, of_ : Array Int, forbidden : Array (Set.Set Int),
-           taken : Set.Set String, id : Int) -> Option String {
+           taken : Set.Set String, id : Int, hint : Int) -> Option String {
     if of_[id] >= 0 { return None }
     let bank = A.bankOf(f.reps[id])
     let pool = match bank {
         Gp -> gpPool
         Fp -> fpPool
     }
-    for n in pool {
+    -- The hint first, then the pool in order. A hint is only ever a
+    -- preference: taking it makes a move redundant and missing it makes the
+    -- move real, and neither can make the result wrong. That is the whole
+    -- reason parameters are *hinted* to their argument registers rather than
+    -- pinned to them -- a pin can contradict (a parameter in `x0` that is live
+    -- across a call has had `x0` destroyed), and a preference cannot.
+    let order : Array Int = []
+    if hint >= 0 { Array.push(order, hint) }
+    for n in pool { Array.push(order, n) }
+    for n in order {
         let k = match bank {
             Gp -> "x" + Int.toString(n)
             Fp -> "d" + Int.toString(n)
@@ -448,9 +479,18 @@ fun verifyColouring(f : Func A.Inst, c : Colouring) -> Array String {
     let out : Array String = []
     let (_, liveOut) = Ssa.livenessInOut(f)
     let forbidden = forbiddenSets(f, liveOut)
-    for var b = 0; b < len(f.blocks); b = b + 1 {
+    -- Reachable blocks only, which is what `colour` walks. An unreachable
+    -- block's values are never coloured and never executed, so checking them
+    -- reports a problem that does not exist -- and it reported thousands.
+    --
+    -- That the corpus *has* unreachable blocks is a separate matter and not a
+    -- happy one: they are the panic blocks a guard creates, which means the
+    -- branch to them went missing. Nothing executes selection's output yet, so
+    -- no test covers it. Tracked in NATIVE-BACKEND.md phase 4.
+    for at in Ssa.reversePostorder(f) {
+        let b = Ssa.blockId(at)
         let block = f.blocks[b]
-        let after = Ssa.liveAfter(f, Ssa.BlockId(b), liveOut[b])
+        let after = Ssa.liveAfter(f, at, liveOut[b])
         for var n = 0; n < len(block.insts); n = n + 1 {
             checkPoint(out, f, c, forbidden, after[n], b, n)
         }
@@ -465,6 +505,16 @@ fun checkPoint(out : Array String, f : Func A.Inst, c : Colouring,
     let seen = Map.new()
     for id in Set.elements(live) {
         let r = c.of_[id]
+        -- A value that is live and has no register is the failure this check
+        -- did not have and needed: it is not a collision, so the loop below
+        -- says nothing about it, and it is not a stop, so the histogram says
+        -- nothing either. Every function parameter was in this state and the
+        -- run reported a clean bill.
+        if r < 0 {
+            Array.push(out, "value %" + Int.toString(id)
+                            + " is live at " + where_(b, n)
+                            + " with no register assigned")
+        }
         if r >= 0 {
             let k = key(f, id, r)
             match Map.get(seen, k) {
@@ -542,4 +592,85 @@ fun worstCall(f : Func A.Inst) -> Int {
         }
     }
     worst
+}
+
+
+-- Which register each value would rather have, or `-1`.
+--
+-- Only the function's parameters have one today, and the reason they get a
+-- *hint* rather than a pin is the whole of this design's answer to the
+-- calling convention at a function's own boundary.
+--
+-- AAPCS64 delivers parameter *i* in `x`*i* (counting the two files
+-- separately). The emitter therefore begins every function with a move from
+-- the argument register into wherever the allocator put that parameter. If the
+-- allocator chose the argument register itself the move is `mov x0, x0` and is
+-- elided; if it chose something else the move is real and everything still
+-- works. So the convention is satisfied by construction and the hint only
+-- decides whether an instruction survives.
+--
+-- Pinning would be the alternative and it can *contradict*: a parameter fixed
+-- in `x0` and live across a call has had `x0` destroyed by the callee, and
+-- there is no assignment that satisfies both. That contradiction is exactly
+-- what the entry move exists to break, and once the move exists the pin has
+-- nothing left to do. A parameter live across a call simply takes a
+-- callee-saved register -- `forbiddenSets` already forces that -- and the
+-- entry move copies `x0` into it.
+--
+-- The return value is the same shape and needs nothing here: the emitter
+-- writes `mov x0, <wherever the result is>` before `ret`, elided when they
+-- agree.
+--
+-- Beyond eight parameters in one file AAPCS64 passes on the stack, and this
+-- says nothing rather than something wrong -- the ninth parameter gets no hint
+-- and no incoming move, which is the callee half of the gap phase 4 records.
+fun argumentHints(f : Func A.Inst) -> Array Int {
+    let out : Array Int = []
+    for _ in f.reps { Array.push(out, -1) }
+    var general = 0
+    var vector = 0
+    for p in f.params {
+        let id = Ssa.valueId(p)
+        match A.bankOf(f.reps[id]) {
+            Gp -> {
+                if general < len(A.argRegs) {
+                    out[id] = numberOf(A.argRegs[general])
+                    general = general + 1
+                }
+            }
+            Fp -> {
+                if vector < len(A.fpArgRegs) {
+                    out[id] = numberOf(A.fpArgRegs[vector])
+                    vector = vector + 1
+                }
+            }
+        }
+    }
+    out
+}
+
+fun numberOf(r : Reg) -> Int = match r {
+    Physical(_, n) -> n
+    Virtual(_) -> -1
+}
+
+-- How many parameters got the register the convention wanted for them.
+--
+-- The measurement the hint exists to move: every miss is one `mov` the
+-- emitter has to keep at the top of a function. A miss is not a bug -- a
+-- parameter live across a call *must* miss, since its argument register is
+-- caller-saved -- so this is a code-quality number, and the first one this
+-- backend has that is about quality rather than feasibility.
+fun hintsTaken(f : Func A.Inst, c : Colouring) -> (Int, Int) {
+    let hints = argumentHints(f)
+    var taken = 0
+    var total = 0
+    for p in f.params {
+        let id = Ssa.valueId(p)
+        if hints[id] >= 0 {
+            total = total + 1
+            if c.of_[id] == hints[id] { taken = taken + 1 }
+        }
+    }
+    (taken, total)
 }

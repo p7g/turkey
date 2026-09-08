@@ -103,6 +103,26 @@ def _boot(*args: str) -> str:
 
 
 
+def _checked(path: Path):
+    """The Python implementation's whole front end on one program."""
+    return check(path.read_text(encoding="utf-8"),
+                 str(path.relative_to(REPO_ROOT)), [path.parent])
+
+
+def _reference_dump(stage: str, paths: list[Path], of_checked) -> str:
+    """One stage's reference text over some programs, cached per program.
+
+    `check` on `boot/Main.tl` costs about seventy seconds and five stage tests
+    each wanted it; over the corpus it is thirteen seconds a stage. The answer
+    depends on `turkey/`, `lib/` and the one program, so `tests.bootc` keys the
+    cache on exactly those -- which means backend work invalidates the
+    `boot/Main.tl` entry, correctly, and leaves the corpus entries warm.
+    """
+    return "".join(
+        bootc.reference(stage, path, lambda p=path: of_checked(_checked(p)))
+        for path in paths)
+
+
 def _python_tokens(paths: list[Path]) -> str:
     out: list[str] = []
     for path in paths:
@@ -330,17 +350,19 @@ def test_boot_infers_the_same_types(boot_types: tuple[str, str]) -> None:
     accepting what the other rejects fails here as an exit status.
     """
     out, err = boot_types
-    expected_out: list[str] = []
-    expected_err: list[str] = []
-    for path in ENTRIES:
-        relative = str(path.relative_to(REPO_ROOT))
-        checked = check(path.read_text(encoding="utf-8"), relative, [path.parent])
-        for warning in checked.warnings:
-            expected_err.append(f"{relative}:{short(warning)}\n")
-        for name, scheme in checked.signatures:
-            expected_out.append(f"{name} : {show_scheme(scheme)}\n")
-    _first_difference(out, "".join(expected_out), "types")
-    _first_difference(err, "".join(expected_err), "warnings")
+    signatures = _reference_dump("types.out", ENTRIES, lambda c: "".join(
+        f"{name} : {show_scheme(scheme)}\n" for name, scheme in c.signatures))
+    # The warning prefix is the path as it was handed to `check`, not
+    # `checked.module` -- those may well be the same string and relying on it
+    # would be a guess, so `_reference_warnings` re-derives it the way the
+    # original loop did.
+    warnings = "".join(
+        bootc.reference("types.err", path, lambda p=path: "".join(
+            f"{p.relative_to(REPO_ROOT)}:{short(w)}\n"
+            for w in _checked(p).warnings))
+        for path in ENTRIES)
+    _first_difference(out, signatures, "types")
+    _first_difference(err, warnings, "warnings")
 
 
 def test_the_types_corpus_exercises_the_hard_cases() -> None:
@@ -374,13 +396,11 @@ def test_boot_elaborates_to_the_same_core(boot_core: str) -> None:
     text. That is not hypothetical: it is how the port's `get`/`set` collision
     was found, with every golden still matching.
     """
-    parts = []
-    for path in ENTRIES:
-        checked = check(path.read_text(encoding="utf-8"),
-                        str(path.relative_to(REPO_ROOT)), [path.parent])
-        parts.append(show_program(checked.core, checked.module))
-    expected = "".join(parts)
-    _first_difference(boot_core, expected, "core")
+    _first_difference(
+        boot_core,
+        _reference_dump("core", ENTRIES,
+                        lambda c: show_program(c.core, c.module)),
+        "core")
 
 
 def test_boot_specializes_the_same_way(boot_mono: str) -> None:
@@ -392,12 +412,11 @@ def test_boot_specializes_the_same_way(boot_mono: str) -> None:
     escape both. What this adds is the smaller failure -- a diff at the stage
     it happened in rather than at the stage after it.
     """
-    parts = []
-    for path in SAMPLE:
-        checked = check(path.read_text(encoding="utf-8"),
-                        str(path.relative_to(REPO_ROOT)), [path.parent])
-        parts.append(show_program(checked.mono, checked.module))
-    _first_difference(boot_mono, "".join(parts), "mono")
+    _first_difference(
+        boot_mono,
+        _reference_dump("mono", SAMPLE,
+                        lambda c: show_program(c.mono, c.module)),
+        "mono")
 
 
 def test_boot_optimizes_the_same_way(boot_opt: str) -> None:
@@ -421,12 +440,11 @@ def test_boot_optimizes_the_same_way(boot_opt: str) -> None:
     where the rule does not is a jump with nowhere to go, and that is an exit
     status rather than a diff.
     """
-    parts = []
-    for path in ENTRIES:
-        checked = check(path.read_text(encoding="utf-8"),
-                        str(path.relative_to(REPO_ROOT)), [path.parent])
-        parts.append(show_program(checked.opt, checked.module))
-    _first_difference(boot_opt, "".join(parts), "opt")
+    _first_difference(
+        boot_opt,
+        _reference_dump("opt", ENTRIES,
+                        lambda c: show_program(c.opt, c.module)),
+        "opt")
 
 
 def test_boot_reports_a_missing_file(tmp_path: Path) -> None:

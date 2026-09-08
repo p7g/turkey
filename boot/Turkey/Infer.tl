@@ -679,8 +679,11 @@ fun checkExhaustiveness(g : Generator) -> Unit {
                 -- useful to quote.
                 let detail = if missing == "_" { "it needs a catch-all arm" }
                              else { "'" + missing + "' is not handled" }
-                Array.push(g.warnings, showSpan(site.span)
-                    + ": warning: this match is not exhaustive; " + detail)
+                -- An error, not a warning: SPEC-DELTAS 61. See the note in
+                -- `turkey/infer.py`, which this side has to agree with
+                -- character for character.
+                oops("this match is not exhaustive; " + detail,
+                     Some(site.span))
             }
         }
     }

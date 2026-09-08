@@ -15,9 +15,22 @@ enough to run beside the suite they protect.
 
 from __future__ import annotations
 
+import uuid
 from pathlib import Path
 
 from tests import bootc
+
+
+def _stage(name: str) -> str:
+    """A stage name no previous run can have used.
+
+    The cache these tests exercise is on disk and survives the session, so a
+    fixed stage name makes a test that passes exactly once: cold, the first
+    call computes and the second reuses; warm, *neither* computes and an
+    assertion counting one call fails. Both of these tests were written that
+    way and both passed on the run that created their entries.
+    """
+    return f"{name}-{uuid.uuid4().hex}"
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -30,8 +43,9 @@ def test_a_reference_is_reused_when_nothing_changed() -> None:
         return f"value-{len(calls)}"
 
     main = REPO_ROOT / "boot" / "Main.tl"
-    first = bootc.reference("test-reuse", main, compute)
-    second = bootc.reference("test-reuse", main, compute)
+    stage = _stage("test-reuse")
+    first = bootc.reference(stage, main, compute)
+    second = bootc.reference(stage, main, compute)
     assert first == second
     assert len(calls) == 1, "the second call recomputed instead of reusing"
 
@@ -54,14 +68,15 @@ def test_a_reference_notices_a_change_to_a_module_the_program_imports() -> None:
     imported = REPO_ROOT / "boot" / "Turkey" / "Regalloc.tl"
     assert imported.is_file(), "the module this test perturbs is gone"
 
-    before = bootc.reference("test-imports", main, compute)
+    stage = _stage("test-imports")
+    before = bootc.reference(stage, main, compute)
     original = imported.read_bytes()
     try:
         imported.write_bytes(original + b"\n-- a change to an imported module\n")
-        during = bootc.reference("test-imports", main, compute)
+        during = bootc.reference(stage, main, compute)
     finally:
         imported.write_bytes(original)
-    after = bootc.reference("test-imports", main, compute)
+    after = bootc.reference(stage, main, compute)
 
     assert during != before, (
         "a change to an imported module did not invalidate the reference")

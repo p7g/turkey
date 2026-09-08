@@ -1124,7 +1124,13 @@ fun emitRuntimeCall(e : Emit, f : Func Low, dst : String, ty : String, r : Rep,
         Some((symbolName, resultType)) -> {
             if resultType == "void" {
                 let _ = call(symbolName, resultType)
-                line(e, "  " + dst + " = add i8 0, 0")
+                -- A value has to be defined even though the callee answered
+                -- nothing, because the IR gave the call a result and something
+                -- may name it. Its *type* is the one the IR declared and not
+                -- `i8`: `turkey_exit` answers void and `System.Env#exit`
+                -- returns `a`, so at the specialization where `a` is
+                -- pointer-shaped this was `ret ptr %v` naming an `i8`.
+                emitZero(e, dst, ty)
             } else if resultType == ty {
                 line(e, "  " + dst + " = call " + ty + " @" + symbolName + "("
                         + String.join(supplied, ", ") + ")")
@@ -1137,7 +1143,8 @@ fun emitRuntimeCall(e : Emit, f : Func Low, dst : String, ty : String, r : Rep,
                     line(e, "  " + dst + " = icmp ne " + resultType + " " + raw
                             + ", 0")
                 } else {
-                    line(e, "  " + dst + " = add i8 0, 0 ; unexpected result")
+                    line(e, "  ; unexpected result type " + resultType)
+                    emitZero(e, dst, ty)
                 }
             }
         }
@@ -1253,3 +1260,16 @@ fun emitEntry(e : Emit, m : Module, entry : String) -> Unit {
     line(e, "  ret i32 %status")
     line(e, "}")
 }
+
+
+-- Define `dst` as a zero of `ty`.
+--
+-- Not a constant: LLVM names values by the instruction that defines them, so a
+-- placeholder still has to be *computed*. `add <int> 0, 0` covers every integer
+-- width including `i1` and `i8`; a pointer and a double each need their own
+-- spelling, and getting that wrong is invisible until the one specialization
+-- where the type is not the one that was assumed.
+fun emitZero(e : Emit, dst : String, ty : String) -> Unit =
+    if ty == "ptr" { line(e, "  " + dst + " = inttoptr i64 0 to ptr") }
+    else if ty == "double" { line(e, "  " + dst + " = fadd double 0.0, 0.0") }
+    else { line(e, "  " + dst + " = add " + ty + " 0, 0") }

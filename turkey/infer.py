@@ -485,8 +485,13 @@ class Generator:
                 "it needs a catch-all arm" if missing == "_"
                 else f"'{missing}' is not handled"
             )
-            self.warnings.append(
-                f"{match.span}: warning: this match is not exhaustive; {detail}"
+            # An error, not a warning: SPEC-DELTAS 61. A missing case used to
+            # be a runtime panic in a program that is one enormous case
+            # analysis, which FINDINGS 11 called the single most likely source
+            # of a late bug here. It cost nothing to fix -- `boot` is 27k lines
+            # of Turkey and had not one non-exhaustive match.
+            raise TypeError_(
+                f"this match is not exhaustive; {detail}", match.span
             )
 
     @staticmethod

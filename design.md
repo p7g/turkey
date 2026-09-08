@@ -388,7 +388,7 @@ Standard Hindley-Milner (Algorithm W or constraint-based), extended with:
 
 - Bottom type `⊥` in unification.
 - Value restriction via non-expansiveness check.
-- Pattern matching exhaustiveness checking (warnings; non-exhaustive matches are a runtime error if reached).
+- Pattern matching exhaustiveness checking (a non-exhaustive `match` is a compile error; SPEC-DELTAS 61).
 
 ### 5.2 SCC-grouped inference for mutual recursion
 
@@ -452,7 +452,7 @@ What runs is the Core of section 5.4, not the surface tree (SPEC-DELTAS.md 50). 
 
 ### 6.1 Evaluation strategy
 
-Strict, call-by-value, left-to-right evaluation of arguments and record fields. Pattern matching is exhaustive-checked at compile time (warnings; runtime error on unhandled cases).
+Strict, call-by-value, left-to-right evaluation of arguments and record fields. Pattern matching is exhaustive-checked at compile time, and a non-exhaustive `match` is rejected (SPEC-DELTAS 61).
 
 ### 6.2 Runtime representation
 

@@ -635,10 +635,21 @@ fun runMono(m : Mono) -> CProgram {
     -- A ground binding is where every specialization starts: its body's type
     -- arguments are already types rather than variables. `main` is one of these,
     -- and so is every instance dictionary with no context.
+    --
+    -- A *generic* binding's body is rewritten too, which it did not used to be.
+    -- Its own binders are not ground, so `request` refuses every type
+    -- application mentioning one and leaves it exactly as it was -- but a
+    -- generic body can also hold a perfectly ground application, and those used
+    -- to reach the backend as a reference to the *generic* binding.
+    -- `Data.Map#new` is generic in `k` and `v` and calls `defaultSize[Int]`,
+    -- which mentions neither. Skipping it meant `opt` -- which this pass relies
+    -- on to inline generic bindings into ground call sites -- carried the
+    -- unspecialized reference along, and the backend saw a scalar at the
+    -- generic binding's pointer representation.
     let rewritten = Map.new()
     for group in [m.program.dicts, m.program.binds] {
         for b in group {
-            if len(b.binders) == 0 { Map.put(rewritten, b.name, rewriteTop(m, b)) }
+            Map.put(rewritten, b.name, rewriteTop(m, b))
         }
     }
     var at = 0

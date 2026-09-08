@@ -291,11 +291,20 @@ program can observe and no identity hash, so the parser stamps a monotone `Int`
 on every node and the tables key on that. Fine, and cheap -- but it has to be
 decided at the parser, since retrofitting it touches every node.
 
-### 11. Exhaustiveness is a warning
+### 11. Exhaustiveness is a warning -- **fixed**
 **design, pre-existing.** design.md 5.1. Every `match` in the compiler over a
 `Kind` or an `ExprKind` is a place where a missing case is a runtime panic
 rather than a compile error. In a program that is one enormous case analysis
 this is the single most likely source of a late bug.
+
+**Fixed in M28 by SPEC-DELTAS 61: it is an error.** The entry stood for eight
+milestones, and what it cost to close was nothing -- across `boot` and the
+whole corpus there were three non-exhaustive matches and all three were in the
+program that exists to trigger the warning. The finding was right that this was
+the most likely source of a late bug, and wrong by omission about the cheapest:
+nobody had measured how many violations there were, and the answer outside its
+own test was zero. A rule already followed by hand is a rule that can be
+enforced for free, and the measurement that says so takes a minute.
 
 ### 12. `Show String` is the identity
 **design, pre-existing.** PRIMITIVES.md 7.1. `show(["a,b"])` and
@@ -1662,6 +1671,56 @@ had already stopped. A checker has to agree with the pass it checks about which
 code exists -- the colourer walks reachable blocks and does not finish stopped
 functions, so the checker must do both too, or its output is noise that hides
 the four real complaints it might one day have.
+
+
+### 75. Three miscompiles below Core, and the C compiler found all three
+**correctness.** M28. `boot llvm boot/Main.tl` emits 66.7 MB of LLVM for the
+compiler itself, and `cc` refused it. Three bugs, each hidden behind the
+previous, each fixed only to reveal the next:
+
+* **`Turkey.Mono` did not rewrite a generic binding's body.** That was a stated
+  rule, not an oversight -- "only a ground binding and a specialized copy are"
+  -- and the reasoning was that a generic body's type applications mention its
+  own binders and cannot be specialized. True of *most* of them. `Data.Map#new`
+  is generic in `k` and `v` and calls `defaultSize[Int]`, which mentions
+  neither: a perfectly ground application sitting inside a generic body.
+  Skipping it left the reference pointing at the *generic* `defaultSize`, and
+  `opt` -- which this pass relies on to inline generic bindings into ground call
+  sites -- carried it into the output. `request` already refuses non-ground
+  arguments, so rewriting every body is safe with no new test; the rule was
+  costing correctness and buying nothing.
+* **A scalar constant was emitted at whatever representation was asked for.**
+  `let defaultSize = 16` generalizes -- a bare numeric literal is polymorphic in
+  its numeric type -- so the generic copy is a scalar wanted at `ptr`, and the
+  lowering produced `add ptr 0, 16`. Not an instruction, and it was stored into
+  the *root array*, so the collector would have traced `16` as a heap address.
+* **A void-returning runtime call's placeholder was hardcoded `i8`.** Right
+  whenever the result was `Unit`, which it always was until
+  `System.Env#exit : fun(Int) -> a` was specialized at a pointer-shaped `a` and
+  the function ended `ret ptr %v` naming an `i8`.
+
+**Every one is below Core, and the differential suite stops at Core.**
+`test_boot` compares both implementations up to `opt`; the low IR is `boot`'s
+own design with no Python counterpart, so nothing above could have caught any of
+this. Nor could the corpus: all three need a program large enough to generalize
+a library constant and instantiate it two ways, which is the compiler and
+nothing smaller. `test_native` runs 40 programs to byte-identical output and saw
+none of them.
+
+What found them was **`cc` type-checking 66 MB of generated IR** -- and the
+reason it could is worth stating precisely, because it is a property of this
+design rather than luck. Layout-keyed sharing puts every pointer-shaped value at
+one representation, so a representation bug is always a *scalar* appearing where
+a pointer belongs or the reverse. LLVM's type system sees exactly that class. A
+scan of the whole module for both directions found 210 sites in one and zero in
+the other, from five distinct sources: a complete census, not a sample.
+
+`NATIVE-BACKEND.md` has LLVM as transitional, to be dropped once the arm64
+backend is trusted. This is an argument for keeping it longer than that plan
+assumed, and a warning about what the arm64 path gives up: it has no type
+system, so this entire class becomes silent there. The `Ssa.verify` and
+`LowIr.checkCalls` checks are what has to stand in, and neither checks the thing
+that broke here.
 
 
 ## Library, still wanted

@@ -9,7 +9,7 @@ module Turkey.Ssa (
     freshValue, repOf, blockAt,
     predecessors, reversePostorder, dominators, dominates,
     verify, showFunc,
-    liveness, livenessInOut, liveAfter, termUses,
+    liveness, livenessInOut, liveAfter, termUses, pruneUnreachable,
 )
 
 -- The low IR: an SSA control-flow graph, parameterized over its instructions
@@ -771,4 +771,61 @@ fun liveAfter[Inst i](f : Func i, at : BlockId,
         for v in uses(block.insts[n]) { Set.add(live, valueId(v)) }
     }
     sets
+}
+
+-- The same function with unreachable blocks removed, and the rest in reverse
+-- postorder.
+--
+-- Lowering emits a fallthrough `panic "no match arm applied"` for every
+-- `match`, and since SPEC-DELTAS 61 made a non-exhaustive match an error, that
+-- block is unreachable in every program that compiles. It is not the only such
+-- block, which is the reason this prunes by *reachability* rather than by
+-- knowing where that panic came from: dropping a block because nothing
+-- branches to it is correct whatever made it unreachable, where dropping it
+-- because the checker called the match exhaustive would make the output depend
+-- on the checker being sound. A hole there would turn a clean panic into a
+-- fall-through into whatever block came next.
+--
+-- Blocks are renumbered, so this must run before anything records a `BlockId`
+-- elsewhere. It answers reverse postorder, which puts the entry first and each
+-- block after a predecessor -- the order the allocator wants to walk anyway.
+fun pruneUnreachable[Inst i](f : Func i) -> Func i {
+    let order = reversePostorder(f)
+    if len(order) == len(f.blocks) && blockId(order[0]) == blockId(f.entry) {
+        -- Nothing to drop and already in order. Answering `f` unchanged keeps
+        -- this free for the functions -- most of them -- that have no dead
+        -- block, and keeps the value numbering identical for them.
+        var same = True
+        for var k = 0; k < len(order); k = k + 1 {
+            if blockId(order[k]) != k { same = False }
+        }
+        if same { return f }
+    }
+    let remap : Array Int = []
+    for _ in f.blocks { Array.push(remap, -1) }
+    for var k = 0; k < len(order); k = k + 1 {
+        remap[blockId(order[k])] = k
+    }
+    let out = newFunc(f.name, f.result)
+    for r in f.reps { Array.push(out.reps, r) }
+    for p in f.params { Array.push(out.params, p) }
+    for at in order {
+        let block = f.blocks[blockId(at)]
+        let made = newBlock()
+        for p in block.params { Array.push(made.params, p) }
+        for inst in block.insts { Array.push(made.insts, inst) }
+        made.term = remapTerm(remap, block.term)
+        Array.push(out.blocks, made)
+    }
+    out.entry = BlockId(0)
+    out
+}
+
+fun remapTerm(remap : Array Int, t : Term) -> Term = match t {
+    Ret(v) -> Ret(v)
+    Jump(target, args) -> Jump(BlockId(remap[blockId(target)]), args)
+    Branch(c, yes, no) ->
+        Branch(c, BlockId(remap[blockId(yes)]), BlockId(remap[blockId(no)]))
+    Panic(v) -> Panic(v)
+    Unreachable -> Unreachable
 }

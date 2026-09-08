@@ -378,7 +378,12 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
     lower(l, body, ToReturn)
     match l.stopped {
         Some(why) -> (None, [], Some(why))
-        None -> (Some(f), l.lifted, None)
+        -- Dead blocks dropped here rather than left for each emitter. The
+        -- fallthrough panic every `match` gets is unreachable in any program
+        -- that compiles (SPEC-DELTAS 61), and LLVM's own dead-code pass has
+        -- been deleting it on that path all along -- which is exactly why it
+        -- went unnoticed until a second backend had no such pass.
+        None -> (Some(Ssa.pruneUnreachable(f)), pruneAll(l.lifted), None)
     }
 }
 
@@ -1365,12 +1370,36 @@ fun literal(l : Lower, lit : Lit, rep : Rep) -> Value = match lit {
     LInt(n) -> if rep.class_ == F64 {
         L.emit(l.b, ConstFloat(Float.fromInt(n)), rep)
     } else {
-        L.emit(l.b, ConstInt(n), rep)
+        scalar(l, ConstInt(n), Ssa.untraced(I64), rep)
     }
-    LFloat(x) -> L.emit(l.b, ConstFloat(x), rep)
+    LFloat(x) -> scalar(l, ConstFloat(x), Ssa.untraced(F64), rep)
     LString(s) -> L.emit(l.b, ConstString(s), Ssa.traced(Ptr))
-    LChar(c) -> L.emit(l.b, ConstInt(Char.toInt(c)), rep)
+    LChar(c) -> scalar(l, ConstInt(Char.toInt(c)), Ssa.untraced(I64), rep)
 }
+
+-- A scalar constant at whatever representation the context asked for, boxed if
+-- that representation is a pointer.
+--
+-- The constant used to be emitted at `rep` whatever `rep` was, which for a
+-- pointer-shaped context produced a scalar sitting in a pointer -- `add ptr 0,
+-- 16` in the LLVM, which is not an instruction, and worse, a global the
+-- collector would then try to trace as a heap address. It reached the backend
+-- because a *generic* binding is compiled at the uniform representation and
+-- `let defaultSize = 16` generalizes: a bare numeric literal is polymorphic in
+-- its numeric type, so the generic copy of it is a scalar asked for at `ptr`.
+--
+-- `Turkey.Mono` no longer leaves the reference that made this reachable, so
+-- this is a backstop rather than the fix. It is worth keeping as one because a
+-- polymorphic scalar binding is legitimate -- one used at two different numeric
+-- types cannot be specialized away -- and because the failure it prevents is
+-- silent everywhere the target has no type system to object.
+--
+-- `coerce` does the boxing rather than this emitting a `Box` itself: crossing
+-- between a scalar and the uniform representation is exactly what it is for,
+-- and it is the one place that decides what such a crossing costs.
+fun scalar(l : Lower, op : Op, natural : Rep, rep : Rep) -> Value =
+    if rep.class_ == Ptr { coerce(l, L.emit(l.b, op, natural), rep) }
+    else { L.emit(l.b, op, rep) }
 
 -- A call. The callee decides which of three shapes it is, and the arguments
 -- are lowered left to right in every one, because a call's arguments are
@@ -1891,4 +1920,13 @@ fun act(l : Lower, a : Action, held : Map String Rep) -> Unit = match a {
         L.into(l.b, after)
         L.effect(l.b, GlobalStore(name, arrived))
     }
+}
+
+
+-- The lifted functions get the same treatment: a lambda's body has the same
+-- `match` fallthroughs its parent's does.
+fun pruneAll(fs : Array (Ssa.Func Low)) -> Array (Ssa.Func Low) {
+    let out : Array (Ssa.Func Low) = []
+    for f in fs { Array.push(out, Ssa.pruneUnreachable(f)) }
+    out
 }

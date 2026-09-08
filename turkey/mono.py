@@ -65,11 +65,17 @@ and there is nothing here for a program to have gone wrong about.
 Two consequences of "survives unchanged" worth stating, because they are what
 keeps this pass small:
 
-* A **generic binding's body is not rewritten at all.** Only a ground binding
-  and a specialized copy are. So inside anything this pass rewrites, every type
-  argument that came from a binder is ground, and a `CTyApp` that is *not*
-  ground is one whose variable came from somewhere else -- an ambiguous
-  residual, or a method's own quantification -- and is left alone.
+* **Every body is rewritten, and groundness is what decides.** A ground
+  binding, a specialized copy and a *generic* binding alike: `request` refuses
+  any type application that is not ground, so a `CTyApp` mentioning the
+  binding's own binders -- or an ambiguous residual, or a method's own
+  quantification -- is left exactly as it was. What that buys is the ground
+  applications *inside* a generic body, which have nothing to do with its
+  binders and used to survive to the backend unspecialized: `Data.Map#new` is
+  generic in `k` and `v` and calls `defaultSize[Int]`. Skipping generic bodies
+  left that reference pointing at the generic binding, and `opt` -- which this
+  pass relies on to inline generic bindings into ground call sites -- carried
+  it into the output, where a scalar ended up at a pointer representation.
 * Nothing is deleted *by the specializer*. It emits a binding nothing reaches
   any more and leaves the question of liveness to `_reachable`, which asks it
   once, at the end, over the finished program -- so the specializer never has
@@ -693,9 +699,20 @@ class Monomorphizer:
         # A ground binding is where every specialization starts: its body's
         # type arguments are already types rather than variables. `main` is one
         # of these, and so is every instance dictionary with no context.
+        #
+        # A *generic* binding's body is rewritten too, which it did not used to
+        # be. Its own binders are not ground, so `request` refuses every type
+        # application that mentions one and leaves it exactly as it was -- but a
+        # generic body can also contain a perfectly ground application, and
+        # those used to survive to the backend as a reference to the generic
+        # binding. `Data.Map#new` is generic in `k` and `v` and calls
+        # `defaultSize[Int]`, which mentions neither; leaving it alone meant
+        # `opt` inlined the generic body into a ground call site and carried the
+        # unspecialized reference with it, so the backend saw a scalar at the
+        # generic binding's pointer representation.
         rewritten = {bind.name: self.rewrite_top(bind)
                      for group in (self.program.dicts, self.program.binds)
-                     for bind in group if not bind.binders}
+                     for bind in group}
         while self.queue:
             name, bind, targs, dicts = self.queue.pop(0)
             self.made.setdefault(bind.name, []).append(

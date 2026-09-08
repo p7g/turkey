@@ -2749,3 +2749,54 @@ And a block answers with its last statement, so a branch ending in
 answers `Unit`, and the two do not unify. Thirty-eight call sites in the parser
 wanted the call as a *statement*, which is what the local `skipToken` is for.
 Discarding a result is a thing that has to be said.
+
+### 61. A non-exhaustive `match` is an error
+
+design.md §5.1 and §9 say exhaustiveness is checked and *warned* about, and
+that a match reaching no arm is a runtime error. Neither section gives a reason
+for the warning, and it appears to be a default rather than a decision.
+
+**It is now a compile error.** `this match is not exhaustive; 'None' is not
+handled`, at the span of the `match`.
+
+The argument against the warning was already written down. FINDINGS 11, from
+M20: *"Every `match` in the compiler over a `Kind` or an `ExprKind` is a place
+where a missing case is a runtime panic rather than a compile error. In a
+program that is one enormous case analysis this is the single most likely
+source of a late bug."* That is a description of this compiler, which is now
+27,000 lines of Turkey and is nothing but case analysis over its own IRs.
+
+**What it cost: nothing.** Measured before the change rather than after --
+across `boot` and the whole corpus there were exactly three non-exhaustive
+matches, and all three were in `tests/programs/exhaustive.tl`, the program
+whose purpose is to trigger the warning. Not one line of the compiler or the
+library relied on it. A rule with no violations outside its own test is a rule
+that was already being followed by hand.
+
+Three consequences worth stating.
+
+**Exhaustiveness was the only warning in the compiler**, so this removes the
+category. `check(...).warnings` is now a channel nothing writes to. The
+plumbing stays -- the next real warning will want it, and a test asserting the
+list is still empty is what would notice one quietly reappearing -- but the
+differential comparison of warnings between the two implementations is now a
+comparison of two empty lists, which looks like a check and is not. Named here
+so it is not mistaken for coverage.
+
+**A false positive is now a rejected program**, where before it was a spurious
+warning on a working one. The cost of the checker being *incomplete* went up,
+so `exhaustive.tl` keeps its accepting half at full breadth -- a total match
+the checker must not reject -- and only the rejecting half moved out, to
+`err_exhaustive_option.tl`, `err_exhaustive_nested.tl` and
+`err_exhaustive_catchall.tl`.
+
+**The panic block does not go away, and should not.** Lowering still emits a
+fallthrough `panic "no match arm applied"` for every `match`, and it is now
+unreachable in every program that compiles. Deleting it *because* every match
+is exhaustive would make the code depend on the checker being sound -- on it
+never calling a match total when it is not -- and a hole there would turn a
+clean panic into a fall through into whatever block follows. Dropping the block
+because **nothing branches to it** is safe whatever made it unreachable, costs
+one reachability check the allocator already computes, and keeps the panic as
+the backstop it was always meant to be. The block goes; the reason it goes is
+the CFG, not the checker.

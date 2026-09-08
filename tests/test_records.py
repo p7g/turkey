@@ -37,6 +37,14 @@ def fails(src: str) -> str:
 
 
 def warnings(src: str) -> list[str]:
+    """Kept, and now always empty.
+
+    Exhaustiveness was the compiler's only warning, and SPEC-DELTAS 61 made it
+    an error -- so `check(...).warnings` is a channel nothing writes to. The
+    helper stays because a test asserting it is *still* empty is the thing that
+    would notice a warning quietly reappearing, and because the next real
+    warning will want the plumbing.
+    """
     return check(src).warnings
 
 
@@ -122,9 +130,7 @@ def test_a_record_pattern_on_a_positional_variant_is_still_refused():
 def test_the_exhaustiveness_witness_is_a_pattern_the_checker_accepts():
     """`render` prints positionally; before M9.1 its suggestion was rejected."""
     src = SHAPES + "fun f(s : Shape) -> Int = match s { Circle(r) -> r }"
-    assert warnings(src) == [
-        "3:27: warning: this match is not exhaustive; 'Rect(_, _)' is not handled"
-    ]
+    assert fails(src) == "this match is not exhaustive; 'Rect(_, _)' is not handled"
     # And the witness, written out, is what closes the match.
     patched = SHAPES + (
         "fun f(s : Shape) -> Int = match s {\n"
@@ -241,10 +247,9 @@ fun main() { print(flip(True)) }
 
 
 def test_a_one_armed_boolean_match_is_not_exhaustive():
+    """An error since SPEC-DELTAS 61, and `Bool` is the smallest case of it."""
     src = "fun f(b : Bool) -> Int = match b { True -> 1 }"
-    assert warnings(src) == [
-        "1:26: warning: this match is not exhaustive; 'False' is not handled"
-    ]
+    assert fails(src) == "this match is not exhaustive; 'False' is not handled"
 
 
 def test_both_boolean_arms_are_a_complete_signature():

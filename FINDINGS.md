@@ -1723,6 +1723,126 @@ system, so this entire class becomes silent there. The `Ssa.verify` and
 that broke here.
 
 
+### 76. A constructor callback was an empty object, not a closure
+
+**correctness, fixed.** Building `boot` with Python, then emitting and linking
+`boot llvm boot/Main.tl`, produced a `boot2` that crashed while desugaring its
+own source. `TURKEY_SEGV_FRAMES=1` located the failure in
+`Data.Array#map@Expr,Child`, called by `Turkey.Ast#exprChildren`.
+
+The AST walker passes `ChExpr` to `Array.map`. `SsaLower.value` lowered every
+bare `CCon` as a saturated constructor with no arguments, including constructors
+whose type was a function. The resulting zero-field object reached a closure
+call, which read its nonexistent code and environment slots and branched to
+garbage. LLVM could not reject this: both an object and a closure are `ptr`.
+
+The missing rule belongs in elaboration: Python's `lower.py` already expands
+constructor values into lambdas. `Turkey.Lower` now ports that rule using its
+existing `eta` helper, while saturated calls (including annotated constructors)
+retain `CApp(CCon, args)`. Ordinary closure conversion handles the resulting
+lambdas, and `SsaLower` rejects any function-typed bare constructor that escapes
+the frontend. Nullary constructors retain their ordinary value representation.
+The small `constructor_values.tl` regression crashes with the old bootstrap
+and passes with the fix, including collection at every allocation. It covers
+pointer and scalar fields, an erased single-field type, and multiple arguments;
+it also participates in the SSA verifier tests. A focused Core/mono/opt
+comparison against Python checks that the frontend itself performs the
+expansion, rather than relying on backend execution to reveal a missing rule.
+
+The full bootstrap now completes: Python builds `boot`, `boot` emits the LLVM
+linked as `boot2`, and `boot2` emits byte-identical LLVM for the next compiler.
+The native execution, GC-stress, and SSA tests pass (96 tests), both using the
+Python-built compiler and using the linked third-generation compiler.
+
+
+### 77. The bootstrapped compiler ran at Python speed, and the collector was why
+
+**performance, diagnosed.** The linked third-generation compiler took **100.6 s**
+for `opt boot/Main.tl`, the whole pipeline over its own source, while the Python
+host interpreting the same program took **293.3 s** for the same work and a
+byte-identical dump. Two-point-nine times faster, when the point of the native
+backend was an order of magnitude.
+
+Stack sampling (thirty one-second `sample` shots) put **75-80% of the process
+inside `turkey_collect`** -- runtime C, not generated code. The hottest
+generated frames were the rewrite closures (`Opt#instantiateTypes`,
+`Mono#rewrite`, `Opt#substituteNames`), each spending its samples in
+`heap_allocate` and, inside that, the collector. (The hot
+`module_initialize%lambdaNNN` symbols are those same closures wearing a
+misleading name: every top-level body is lowered through
+`finish_initializers`, so every lambda lifted from one is named after the
+initializer. They are not initialization work.)
+
+The runtime can now answer this with numbers instead of a profiler.
+`TURKEY_GC_STATS=1` prints the allocation count and bytes, the count by object
+kind, the peak live set, and the total time spent collecting, plus one line per
+collection. `TURKEY_GC_THRESHOLD_SCALE=n` scales the collection trigger, so the
+policy can be priced without editing the runtime. All of it is behind one flag
+check and costs nothing when unset.
+
+The numbers, for that same run:
+
+* **902,778,762 allocations**, 52.8 GB of traffic, **268 collections**, and
+  **79.9 s inside `turkey_collect`** -- 76% of the wall clock.
+* By kind: **box 340M (37.7%)**, **record 254M (28.1%)** (tagged records:
+  map buckets, array storages, dictionaries, the `Mapper` records the
+  rewrite passes build per call), **closure + closure environment 213M
+  (23.6%)**, constructor node 40M (the ADT tree itself), cell 5M, string 1M,
+  and ~50M arrays that the first version of this counter missed. Not newtype
+  wrappers: a newtype is its payload in the backend (`layout_of` erases it),
+  and only a recursive one is refused -- the 254M is records, not wrappers.
+* Per collection at steady state, ~12M objects are live and ~6M survive:
+  high-mortality churn, the workload a tracing collector handles worst when
+  it triggers often.
+
+The trigger is the bug. After the first collection the threshold becomes
+`heap_count`: collect again after allocating **once the live set**. At 6%
+survival that is 268 full mark-and-sweeps of a heap that is nearly all garbage
+every time. And the sweep is a linked-list walk over *every header allocated
+since the last collection*, so total sweep work is O(all allocations) no matter
+what survives -- 900M header visits, roughly a hundred times the objects the
+program ever kept alive at once.
+
+Priced with the knob, same binary, byte-identical output at every point:
+
+| threshold      | collections | in collect | wall    |
+|----------------|-------------|------------|---------|
+| 1x (shipped)   | 269         | 75.5 s     | 95.3 s  |
+| 4x             | 70          | 22.0 s     | 37.9 s  |
+| 16x            | 22          | 12.0 s     | 27.6 s  |
+
+At 16x the compiled compiler is **10.6x faster than the Python host** (27.6 s
+against 293.3 s) -- the order of magnitude it was supposed to be. The cost is
+peak memory: ~6.5 GB at the largest collection (104M objects at the measured
+~62 B average), on the 64 GB machine this was measured on. A 2x policy, the
+standard choice, lands near 60 s, which is to say the threshold alone is not
+the whole fix: at 16x the collector still costs 12 s, because sweeping stays
+O(allocations).
+
+What remains, in order of leverage:
+
+1. **Boxing at the closure ABI.** `backend_lower` compiles every lifted
+   lambda's parameters and result at `BOXED` layout, so a call through one
+   boxes each scalar argument at the call site and unboxes it in the thunk --
+   and the IR census puts 4,419 `turkey_box` sites in the module. The hot
+   mappers (`Opt#rebaseSpans`, `Opt#instantiateTypes`, `Mono#rewrite`) call
+   through this ABI per tree node. Known-closure devirtualization, or an ABI
+   that passes scalars raw, is where the 340M boxes mostly come from.
+2. **Closure pairs.** Every lifted `fun(x) = ...` mapper allocates two objects,
+   because `turkey_closure_new` always builds an environment object even at
+   capture count zero. A capture-free closure needs no environment; 213M
+   allocations say this rule is worth having.
+3. **The collector.** Mark work already scales with the live set; the sweep
+   does not. Page-granular sweeping or a generational split is the phase-5
+   collector's business, and this baseline is what it gets measured against.
+
+The shipped default now uses 2x, trading roughly 1 GB of peak memory for
+fewer full collections in this workload. The 16x policy remains an opt-in
+experiment because its roughly 6.5 GB peak needs evaluation across the corpus.
+Invalid threshold settings fall back to 2x, and large finite settings saturate
+the threshold at INT64_MAX. Allocation statistics include every string
+allocation path and initialize independently of the JIT stress override.
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

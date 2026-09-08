@@ -403,6 +403,20 @@ def test_boot_elaborates_to_the_same_core(boot_core: str) -> None:
         "core")
 
 
+@pytest.mark.parametrize("stage", ["core", "mono", "opt"])
+def test_constructor_values_match_the_frontend(stage: str) -> None:
+    """Constructor callbacks must become lambdas before backend lowering.
+
+    Comparing execution alone allowed SsaLower to repair malformed Core.
+    Compare elaboration and its optimized forms with the Python frontend,
+    including annotated saturated calls and nullary constructor values.
+    """
+    path = REPO_ROOT / "tests" / "programs" / "constructor_values.tl"
+    expected = _reference_dump(
+        stage, [path], lambda c: show_program(getattr(c, stage), c.module))
+    _first_difference(_boot(stage, *_relative([path])), expected, stage)
+
+
 def test_boot_specializes_the_same_way(boot_mono: str) -> None:
     """M24: monomorphization, and the checker run again on its output.
 

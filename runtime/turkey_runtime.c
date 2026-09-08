@@ -1,6 +1,9 @@
 #include "turkey_runtime.h"
 
 #include <inttypes.h>
+#include <errno.h>
+#include <ctype.h>
+#include <time.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -87,6 +90,43 @@ static int64_t allocations_since_collection;
 static int64_t collection_threshold = 1024;
 static int64_t collection_count;
 static int gc_stress = -1;
+static int gc_initialized;
+
+/* Opt-in accounting, printed by `turkey_gc_report` and, one line per
+   collection, by `turkey_collect` itself when TURKEY_GC_STATS is set. The
+   point is to answer "what is the collector costing and what is driving it"
+   with one run rather than with a profiler and a shrug. */
+static int64_t stats_allocations;
+static int64_t stats_bytes_allocated;
+static int64_t stats_traced;
+static int64_t stats_freed_total;
+static int64_t stats_live_total;
+static int64_t stats_live_peak;
+static int64_t stats_collect_clock;
+static FILE *stats_log;
+/* Scales the collection threshold: the collector runs again after this many
+   times the current live set has been allocated. 2 is the default because it
+   was measured, not chosen: at 1x the bootstrapped compiler spent 79% of its
+   wall clock inside turkey_collect (FINDINGS 77), collecting a heap that was
+   ~94% garbage every time; the same run at 2x halves the number of full
+   mark-and-sweeps for ~1GB of peak memory. TURKEY_GC_THRESHOLD_SCALE
+   overrides it for experiments. */
+static double threshold_scale = 2.0;
+/* Per-collection freed, since the running total is what the sweep knows. */
+static int64_t stats_freed_previous;
+/* Allocations by what the object is. Indexed by `turkey_object_new`'s kind:
+    0 an untagged constructor node (an ADT application -- the tree the rewrite
+    passes rebuild), 1 a tagged record (a `CRecord`: buckets, storages,
+    dictionaries), 2 an array, 3 a closure, 4 a closure environment, 5 a box,
+    6 a string, 7 a cell. Tells the 900M-object question ("what are they?")
+    apart from "who made them?". Counted only when TURKEY_GC_STATS is set, like
+    the rest of this: the constructor sites run after `heap_allocate`, which is
+    where the flag is resolved. */
+static int64_t stats_by_kind[8];
+static void stats_count_kind(int kind) {
+    if (stats_log != NULL)
+        stats_by_kind[kind >= 0 && kind < 8 ? kind : 0]++;
+}
 
 static void mark(void *value);
 static HeapHeader *header_of(void *value);
@@ -143,7 +183,22 @@ static HeapHeader *header_of(void *value) {
 }
 
 static void *heap_allocate(size_t size, uint32_t kind) {
-    if (gc_stress < 0) gc_stress = getenv("TURKEY_GC_STRESS") != NULL;
+    if (!gc_initialized) {
+        gc_initialized = 1;
+        if (gc_stress < 0) gc_stress = getenv("TURKEY_GC_STRESS") != NULL;
+        const char *scale = getenv("TURKEY_GC_THRESHOLD_SCALE");
+        if (scale != NULL) {
+            char *end;
+            errno = 0;
+            double parsed = strtod(scale, &end);
+            int has_number = end != scale;
+            while (isspace((unsigned char)*end)) end++;
+            if (has_number && *end == '\0' && errno != ERANGE &&
+                    isfinite(parsed) && parsed >= 1.0)
+                threshold_scale = parsed;
+        }
+        if (getenv("TURKEY_GC_STATS") != NULL) stats_log = stderr;
+    }
     if (gc_stress || allocations_since_collection >= collection_threshold)
         turkey_collect();
     if (size > SIZE_MAX - sizeof(HeapHeader)) {
@@ -158,6 +213,12 @@ static void *heap_allocate(size_t size, uint32_t kind) {
     heap = header;
     heap_count++;
     allocations_since_collection++;
+    if (stats_log != NULL) {
+        stats_allocations++;
+        stats_bytes_allocated += (int64_t)(size + sizeof(HeapHeader));
+        if (kind == HEAP_STRING) stats_count_kind(6);
+        if (kind == HEAP_CELL) stats_count_kind(7);
+    }
     return header + 1;
 }
 
@@ -238,6 +299,13 @@ static void mark(void *value) {
 }
 
 void turkey_collect(void) {
+    struct timespec stats_start, stats_end;
+    int64_t stats_live_before = heap_count;
+    /* Read before the sweep clears it: this is the allocation pressure the
+       collection is responding to. */
+    int64_t stats_allocs_since = allocations_since_collection;
+    int stats_wanted = stats_log != NULL;
+    if (stats_wanted) clock_gettime(CLOCK_MONOTONIC, &stats_start);
     for (RootFrame *frame = roots; frame != NULL; frame = frame->previous)
         for (int64_t index = 0; index < frame->count; ++index)
             if (index >= 64 || (frame->live >> index) & 1) {
@@ -255,14 +323,62 @@ void turkey_collect(void) {
             *link = header->next;
             free(header);
             heap_count--;
+            stats_freed_total++;
         } else {
             header->marked = 0;
             link = &header->next;
         }
     }
     allocations_since_collection = 0;
-    collection_threshold = heap_count > 1024 ? heap_count : 1024;
+    double next_threshold = (double)(heap_count > 1024 ? heap_count : 1024)
+        * threshold_scale;
+    /* INT64_MAX rounds up when converted to double; do not cast that bound. */
+    collection_threshold = next_threshold >= (double)INT64_MAX
+        ? INT64_MAX : (int64_t)next_threshold;
     collection_count++;
+    if (stats_wanted) {
+        clock_gettime(CLOCK_MONOTONIC, &stats_end);
+        int64_t nanos = (stats_end.tv_sec - stats_start.tv_sec) * 1000000000ll
+            + (stats_end.tv_nsec - stats_start.tv_nsec);
+        int64_t freed_now = stats_freed_total - stats_freed_previous;
+        int64_t survived = stats_live_before - freed_now;
+        stats_freed_previous = stats_freed_total;
+        stats_collect_clock += nanos;
+        stats_traced += survived > 0 ? survived : 0;
+        stats_live_total += heap_count;
+        if (heap_count > stats_live_peak) stats_live_peak = heap_count;
+        fprintf(stats_log,
+                "[gc %" PRId64 "] allocs-since %" PRId64 ", live-before %" PRId64
+                ", survived %" PRId64 ", freed %" PRId64
+                ", next threshold %" PRId64 ", %.3f ms\n",
+                collection_count, stats_allocs_since, stats_live_before,
+                survived, freed_now,
+                collection_threshold,
+                (double)nanos / 1e6);
+        fflush(stats_log);
+    }
+}
+
+void turkey_gc_report(void) {
+    if (stats_log == NULL) return;
+    fprintf(stderr,
+            "[gc] collections %" PRId64 ", allocations %" PRId64
+            ", bytes %" PRId64 " (%.1f MB)\n",
+            collection_count, stats_allocations, stats_bytes_allocated,
+            (double)stats_bytes_allocated / (1024.0 * 1024.0));
+    fprintf(stderr,
+            "[gc] by kind: string %" PRId64 ", constr %" PRId64
+            ", record %" PRId64 ", array %" PRId64 ", closure %" PRId64
+            ", closure-env %" PRId64 ", box %" PRId64 ", cell %" PRId64 "\n",
+            stats_by_kind[6], stats_by_kind[0], stats_by_kind[1],
+            stats_by_kind[2], stats_by_kind[3], stats_by_kind[4],
+            stats_by_kind[5], stats_by_kind[7]);
+    fprintf(stderr,
+            "[gc] final live %" PRId64 ", peak live %" PRId64
+            ", objects traced %" PRId64 ", freed %" PRId64
+            ", collect time %.3f s\n",
+            heap_count, stats_live_peak, stats_traced, stats_freed_total,
+            (double)stats_collect_clock / 1e9);
 }
 
 int64_t turkey_heap_objects(void) { return heap_count; }
@@ -655,6 +771,7 @@ void *turkey_object_new(int32_t kind, int32_t tag, int64_t count,
     TurkeyObject *object = heap_allocate(
         sizeof(TurkeyObject) + (size_t)count * sizeof(uint64_t), HEAP_OBJECT);
     if (object == NULL) return NULL;
+    stats_count_kind(kind);
     object->kind = kind;
     object->tag = tag;
     object->count = count;
@@ -709,6 +826,7 @@ void *turkey_array_new(int64_t length, uint64_t initial, int32_t element_width,
         sizeof(TurkeyObject) + (size_t)length * (uint32_t)element_width,
         HEAP_OBJECT);
     if (array == NULL) return NULL;
+    stats_count_kind(2);
     array->kind = 2;
     array->tag = element_layout;
     array->count = length;
@@ -1217,5 +1335,6 @@ int turkey_main(int argc, char **argv, void (*entry)(void)) {
         return 1;
     }
     turkey_collect();
+    turkey_gc_report();
     return 0;
 }

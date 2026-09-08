@@ -961,7 +961,9 @@ fun dispatch(l : Lowerer, e : Expr, scope : Scope) -> Core {
     match e.kind {
         ELit(lit) -> node(ty, where, CLit(lit))
         EUnit -> node(ty, where, CUnit)
-        ECon(name) -> node(ty, where, CCon(name))
+        -- Constructor values are ordinary functions in Core. Keep this in
+        -- elaboration, matching `lower.py`, so every backend sees the lambda.
+        ECon(name) -> eta(l, node(ty, where, CCon(name)), ty, where)
         EVar(_, _) -> var_(l, e, scope)
         ETuple(elems) -> node(ty, where,
             CTuple(Array.map(elems, fun(x) = expr(l, x, scope))))
@@ -978,8 +980,24 @@ fun dispatch(l : Lowerer, e : Expr, scope : Scope) -> Core {
             CIndex(expr(l, arr, scope), expr(l, index, scope)))
         ELambda(params, _, body) ->
             lambdaOf(l, params, body, ty, where, scope, "<anonymous>")
-        ECall(fn, args) -> node(ty, where, CApp(expr(l, fn, scope),
-            Array.map(args, fun(a) = expr(l, a, scope))))
+        ECall(fn, args) -> {
+            let supplied = Array.map(args, fun(a) = expr(l, a, scope))
+            var callee = fn
+            loop {
+                match callee.kind {
+                    EAnnot(inner, _) -> { callee = inner }
+                    _ -> break
+                }
+            }
+            match callee.kind {
+                -- A saturated constructor already has the allocation shape;
+                -- expanding it would build a lambda only to apply it again.
+                ECon(name) -> node(ty, where, CApp(
+                    node(typeOfExpr(l, callee), Some(callee.span), CCon(name)),
+                    supplied))
+                _ -> node(ty, where, CApp(expr(l, fn, scope), supplied))
+            }
+        }
         -- An annotation constrained inference and has nothing left to say.
         EAnnot(inner, _) -> expr(l, inner, scope)
         EUnary(_, operand, fn) -> {

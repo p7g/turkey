@@ -28,7 +28,8 @@ PROGRAMS = REPO_ROOT / "tests" / "programs"
 # `opt` plus a top-level function used as a value, which are the two cases
 # closure conversion exists for. A sample rather than the corpus because these
 # assertions are about *shape*; `test_boot` is what runs the whole corpus.
-SAMPLE = ["adt.tl", "loops.tl", "stack.tl", "generalization.tl"]
+SAMPLE = ["adt.tl", "loops.tl", "stack.tl", "generalization.tl",
+          "constructor_values.tl"]
 
 
 @functools.lru_cache(maxsize=None)

@@ -58,6 +58,7 @@ void turkey_root_leave(void *frame);
 void turkey_collect(void);
 int64_t turkey_heap_objects(void);
 int64_t turkey_collection_count(void);
+void turkey_gc_report(void);
 void turkey_gc_set_stress(int32_t enabled);
 
 /* The outside world: arguments, two file doors, the error stream and `exit`.

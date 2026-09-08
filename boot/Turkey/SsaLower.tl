@@ -933,7 +933,10 @@ fun value(l : Lower, e : Core) -> Value {
             aggregate(l, items, 1, Map.getOr(l.tags, con, -1))
         }
         CArray(elems) -> arrayLiteral(l, e, elems)
-        CCon(name) -> constructor(l, e, name, [], rep)
+        CCon(name) -> match Ty.prune(e.ty) {
+            TFun(_, _) -> stop(l, "the constructor '" + name + "' must be saturated")
+            _ -> constructor(l, e, name, [], rep)
+        }
         -- A call whose result type is bottom does not come back, so what
         -- follows it is unreachable rather than merely dead. Saying so keeps
         -- a `ret` or a jump from being built out of a value that never

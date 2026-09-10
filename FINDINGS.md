@@ -1907,6 +1907,41 @@ step-2 runtime it takes 79.77 s (51.194 s collecting). Those are separate backen
 costs, not residual closure-ABI boxing in the Python-built compiler. They are
 outside this four-step plan and must not be concealed by mixing build generations.
 
+### 79. Region allocation removes the sweep over dead objects
+
+**performance, measured.** The collector now allocates small objects in aligned
+64 KiB regions, with size-class slots and allocation/mark bitmaps. Larger objects
+own dedicated regions. Empty regions are freed wholesale; surviving regions
+rebuild their free slots from the mark bitmap. The payload/header layout and root
+protocol are unchanged. Stress-mode pointer validation checks exact allocated
+slot starts, including dedicated allocations.
+
+Mark epochs avoid clearing each surviving object's header after every collection.
+Epoch wrap explicitly resets allocated headers before tracing again. An initial
+region implementation that still cleared live headers took 24.40 s, including
+14.248 s collecting; the epoch version takes **18.22 s**, including **8.114 s
+collecting**. Collection is not the estimated low-single-digit cost: it still
+traces 269,782,108 live objects across 91 collections.
+
+On the same step-2 source and Python-built compiler, output is byte-identical and
+all by-kind counts remain exactly those in entry 78: 524,228,802 allocations,
+zero boxes. Wall time falls from 38.20 s to 18.22 s; collector time falls from
+23.871 s to 8.114 s. Peak RSS rises from 1,810,006,016 to 2,066,907,136 bytes
+(14.2%). Peak reserved region storage is 1,786,380,288 bytes; the final collection
+returns it to zero. A retained-object regression verifies bounded region reuse
+through repeated allocation batches, and a mixed-size regression covers large
+objects, stale/interior pointer rejection and forced epoch wrap. Both run with
+undefined-behavior sanitization in normal and collect-at-every-allocation modes.
+
+The self-hosted build benefits too: on the same step-2 source it falls from
+79.77 s to 34.18 s (15.817 s collecting), with unchanged 991,833,211 allocations.
+Peak RSS is 1,124,417,536 bytes. Its extra cells and records remain the separate
+backend issue described in entry 78.
+
+The complete suite on the final epoch allocator passed **1,499 tests**, with
+153 reference-fragment skips. The rebuilt compiler's optimizer dump is
+byte-identical to step 2 before committing this step.
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

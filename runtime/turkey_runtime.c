@@ -1,6 +1,7 @@
 #include "turkey_runtime.h"
 
 #include <inttypes.h>
+#include <stddef.h>
 #include <errno.h>
 #include <ctype.h>
 #include <time.h>
@@ -83,7 +84,69 @@ typedef struct RootFrame {
 } RootFrame;
 
 enum { HEAP_STRING = 1, HEAP_OBJECT = 2, HEAP_CELL = 3 };
-static HeapHeader *heap;
+/* A header remains immediately before each payload. Small objects occupy
+   fixed-size slots in aligned regions; the address of any header identifies
+   its region without a side table. Large objects own a dedicated region. */
+enum { REGION_BYTES = 65536, REGION_WORDS = 32, REGION_CLASSES = 22 };
+typedef struct HeapRegion {
+    struct HeapRegion *next;
+    struct HeapRegion *available_next;
+    size_t slot_size;
+    size_t reserved;
+    uint32_t capacity, used, live, search_word, size_class;
+    uint64_t allocated[REGION_WORDS];
+    uint64_t marked_slots[REGION_WORDS];
+    _Alignas(max_align_t) unsigned char data[];
+} HeapRegion;
+static HeapRegion *regions;
+static HeapRegion *available[REGION_CLASSES];
+static size_t region_bytes, region_bytes_peak;
+static uint32_t mark_epoch;
+
+static HeapRegion *region_of(HeapHeader *header) {
+    return (HeapRegion *)((uintptr_t)header & ~((uintptr_t)REGION_BYTES - 1));
+}
+
+static HeapHeader *region_allocate(size_t bytes) {
+    size_t slot = bytes <= 32 ? 32 : bytes <= 256 ? (bytes + 15) & ~(size_t)15 : 256;
+    unsigned cls = slot / 16 - 2;
+    while (slot < bytes && slot < REGION_BYTES / 2) { slot *= 2; cls++; }
+    int large = bytes > REGION_BYTES / 2;
+    HeapRegion *region = large ? NULL : available[cls];
+    if (region == NULL) {
+        size_t reserved = REGION_BYTES;
+        if (large) {
+            if (bytes > SIZE_MAX - sizeof(HeapRegion) - (REGION_BYTES - 1)) {
+                turkey_panic("allocation is too large"); return NULL;
+            }
+            reserved = (sizeof(HeapRegion) + bytes + REGION_BYTES - 1)
+                & ~((size_t)REGION_BYTES - 1);
+            slot = bytes;
+        }
+        region = aligned_alloc(REGION_BYTES, reserved);
+        if (region == NULL) { turkey_panic("out of memory"); return NULL; }
+        memset(region, 0, sizeof(HeapRegion));
+        region->slot_size = slot;
+        region->reserved = reserved;
+        region->capacity = large ? 1 : (REGION_BYTES - sizeof(HeapRegion)) / slot;
+        region->size_class = large ? REGION_CLASSES : cls;
+        region->next = regions;
+        regions = region;
+        if (!large) available[cls] = region;
+        region_bytes += reserved;
+        if (region_bytes > region_bytes_peak) region_bytes_peak = region_bytes;
+    }
+    unsigned word = region->search_word;
+    while (region->allocated[word] == UINT64_MAX) word++;
+    unsigned bit = (unsigned)__builtin_ctzll(~region->allocated[word]);
+    unsigned index = word * 64 + bit;
+    region->allocated[word] |= UINT64_C(1) << bit;
+    region->search_word = word;
+    region->used++;
+    if (!large && region->used == region->capacity)
+        available[cls] = region->available_next;
+    return (HeapHeader *)(region->data + index * region->slot_size);
+}
 static RootFrame *roots;
 static int64_t heap_count;
 static int64_t allocations_since_collection;
@@ -132,8 +195,17 @@ static void mark(void *value);
 static HeapHeader *header_of(void *value);
 
 static HeapHeader *find_header(void *value) {
-    for (HeapHeader *header = heap; header != NULL; header = header->next)
-        if ((void *)(header + 1) == value) return header;
+    uintptr_t address = (uintptr_t)value;
+    for (HeapRegion *region = regions; region != NULL; region = region->next) {
+        uintptr_t first = (uintptr_t)region->data + sizeof(HeapHeader);
+        if (address < first) continue;
+        size_t offset = address - first;
+        if (offset % region->slot_size != 0) continue;
+        size_t index = offset / region->slot_size;
+        if (index < region->capacity &&
+                (region->allocated[index / 64] & (UINT64_C(1) << (index % 64))))
+            return (HeapHeader *)(region->data + index * region->slot_size);
+    }
     return NULL;
 }
 
@@ -204,13 +276,12 @@ static void *heap_allocate(size_t size, uint32_t kind) {
     if (size > SIZE_MAX - sizeof(HeapHeader)) {
         turkey_panic("allocation is too large"); return NULL;
     }
-    HeapHeader *header = malloc(sizeof(HeapHeader) + size);
+    HeapHeader *header = region_allocate(sizeof(HeapHeader) + size);
     if (header == NULL) { turkey_panic("out of memory"); return NULL; }
-    header->next = heap;
+    header->next = NULL;
     header->size = size;
     header->kind = kind;
     header->marked = 0;
-    heap = header;
     heap_count++;
     allocations_since_collection++;
     if (stats_log != NULL) {
@@ -250,8 +321,12 @@ static void mark_grey(void *value, const char *what, int64_t index) {
         turkey_panic(message);
         return;
     }
-    if (header->marked) return;
-    header->marked = 1;
+    if (header->marked == mark_epoch) return;
+    header->marked = mark_epoch;
+    HeapRegion *region = region_of(header);
+    size_t slot = ((unsigned char *)header - region->data) / region->slot_size;
+    region->marked_slots[slot / 64] |= UINT64_C(1) << (slot % 64);
+    region->live++;
     if (mark_count == mark_capacity) {
         int64_t capacity = mark_capacity < 64 ? 64 : mark_capacity * 2;
         void **grown = realloc(mark_stack, (size_t)capacity * sizeof(void *));
@@ -306,6 +381,22 @@ void turkey_collect(void) {
     int64_t stats_allocs_since = allocations_since_collection;
     int stats_wanted = stats_log != NULL;
     if (stats_wanted) clock_gettime(CLOCK_MONOTONIC, &stats_start);
+    /* Epoch marks need no per-object clearing in an ordinary sweep. Handle
+       wrap explicitly, including stress runs that collect at every allocation. */
+    if (++mark_epoch == 0) {
+        for (HeapRegion *region = regions; region != NULL; region = region->next) {
+            for (unsigned word = 0; word < REGION_WORDS; word++) {
+                uint64_t bits = region->allocated[word];
+                while (bits) {
+                    unsigned slot = word * 64 + (unsigned)__builtin_ctzll(bits);
+                    HeapHeader *header = (HeapHeader *)(region->data + slot * region->slot_size);
+                    header->marked = 0;
+                    bits &= bits - 1;
+                }
+            }
+        }
+        mark_epoch = 1;
+    }
     for (RootFrame *frame = roots; frame != NULL; frame = frame->previous)
         for (int64_t index = 0; index < frame->count; ++index)
             if (index >= 64 || (frame->live >> index) & 1) {
@@ -316,18 +407,33 @@ void turkey_collect(void) {
                 mark_grey(frame->values[index], frame->function_name, index);
                 while (mark_count > 0) mark_children(mark_stack[--mark_count]);
             }
-    HeapHeader **link = &heap;
+    /* Empty regions cost one free, regardless of their allocation count.
+       Survivors rebuild availability by copying a fixed-size bitmap and
+       using epoch marks. No walk over individual object headers. */
+    memset(available, 0, sizeof(available));
+    HeapRegion **link = &regions;
     while (*link != NULL) {
-        HeapHeader *header = *link;
-        if (!header->marked) {
-            *link = header->next;
-            free(header);
-            heap_count--;
-            stats_freed_total++;
-        } else {
-            header->marked = 0;
-            link = &header->next;
+        HeapRegion *region = *link;
+        int64_t dead = region->used - region->live;
+        heap_count -= dead;
+        stats_freed_total += dead;
+        if (region->live == 0) {
+            *link = region->next;
+            region_bytes -= region->reserved;
+            free(region);
+            continue;
         }
+        memcpy(region->allocated, region->marked_slots, sizeof(region->allocated));
+        memset(region->marked_slots, 0, sizeof(region->marked_slots));
+        region->used = region->live;
+        region->live = 0;
+        region->search_word = 0;
+        if (region->used < region->capacity && region->size_class < REGION_CLASSES) {
+            unsigned cls = region->size_class;
+            region->available_next = available[cls];
+            available[cls] = region;
+        }
+        link = &region->next;
     }
     allocations_since_collection = 0;
     double next_threshold = (double)(heap_count > 1024 ? heap_count : 1024)
@@ -361,6 +467,7 @@ void turkey_collect(void) {
 
 void turkey_gc_report(void) {
     if (stats_log == NULL) return;
+    fprintf(stderr, "[gc] region bytes %zu, peak %zu\n", region_bytes, region_bytes_peak);
     fprintf(stderr,
             "[gc] collections %" PRId64 ", allocations %" PRId64
             ", bytes %" PRId64 " (%.1f MB)\n",

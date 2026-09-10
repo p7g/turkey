@@ -95,7 +95,7 @@ def _layout_width(layout: bir.Layout) -> int:
 # is a panic on the first collection rather than a rare corruption.
 _CALLING_OPS = frozenset({
     "call", "closure_call", "box", "unbox", "cell_new", "object_new",
-    "array_new", "closure_new", "function_closure", "closure_capture",
+    "array_new", "closure_new", "closure_capture",
 })
 _CALLING_PRIMS = frozenset({
     "intToString", "floatToString", "charToString", "stringConcat", "print",
@@ -351,7 +351,11 @@ class _Emitter:
                                  for function in source.functions}
         self.globals: dict[str, ir.GlobalVariable] = {}
         self.runtime: dict[str, ir.Function] = {}
-        self.closure_thunks: dict[str, ir.Function] = {}
+        # One static closure per symbol referenced as a value: the global it
+        # lives in, and its environment-first function body.
+        # Filled during body emission; `_enter_permanent_roots` allocates them
+        # all, which is sound because the entry function is emitted last.
+        self.static_closures: dict[str, tuple[ir.GlobalVariable, ir.Function]] = {}
         self.string_literals: dict[str, tuple[ir.GlobalVariable, ir.GlobalVariable, int]] = {}
         self._literal_frame: ir.Value | None = None
         self._current_frame: bir.Frame | None = None
@@ -786,20 +790,22 @@ class _Emitter:
             builder.store(ir.Constant(_I64, -1), pointer)
         literals = list(self.string_literals.values())
         nullaries = list(self.nullary_objects.items())
-        if not literals and not nullaries:
+        statics = list(self.static_closures.items())
+        if not literals and not nullaries and not statics:
             return
         # One frame of its own rather than slots in the function's, because
         # these are live at every safepoint in the program and would otherwise
         # have to appear in every bitmap the entry function emits.
         frame = builder.alloca(_ROOT_FRAME, name="literal_frame")
-        array_type = ir.ArrayType(_PTR, len(literals) + len(nullaries))
+        total = len(literals) + len(nullaries) + len(statics)
+        array_type = ir.ArrayType(_PTR, total)
         array = builder.alloca(array_type, name="literal_values")
-        for index in range(len(literals) + len(nullaries)):
+        for index in range(total):
             builder.store(ir.Constant(_PTR, None), builder.gep(
                 array, [ir.Constant(_I32, 0), ir.Constant(_I32, index)]))
         builder.call(self.runtime["turkey_root_enter"], [
             builder.bitcast(frame, _PTR), builder.bitcast(array, _PTR),
-            ir.Constant(_I64, len(literals) + len(nullaries)),
+            ir.Constant(_I64, total),
             self._c_string(builder, "<literals>", ".turkey.function"),
         ])
         builder.store(ir.Constant(_I64, -1), builder.gep(
@@ -819,6 +825,20 @@ class _Emitter:
             builder.store(made, builder.gep(array, [
                 ir.Constant(_I32, 0),
                 ir.Constant(_I32, len(literals) + offset)]))
+        # One closure per symbol referenced as a value, built here rather than
+        # at each reference. The environment count is zero and the runtime
+        # allocates no environment object for it, so a capture-free closure is
+        # a single object for the whole run -- and the registry is keyed by
+        # the same symbol the references load, so two references to one
+        # function share it, which is the point of the registry.
+        for offset, (symbol, (value_global, code)) in enumerate(statics):
+            made = builder.call(self.runtime["turkey_closure_new"], [
+                builder.ptrtoint(code, _I64),
+                ir.Constant(_I64, 0), ir.Constant(_I64, 0)])
+            builder.store(made, value_global)
+            builder.store(made, builder.gep(array, [
+                ir.Constant(_I32, 0),
+                ir.Constant(_I32, len(literals) + len(nullaries) + offset)]))
 
     def _leave_globals(self, builder: ir.IRBuilder) -> None:
         """Pop the permanent frames, on every path out of the entry function.
@@ -1038,12 +1058,8 @@ class _Emitter:
                 code, ir.Constant(_I64, int(instruction.args[1])),
                 ir.Constant(_I64, int(instruction.args[2])),
             ]), builder
-        if op == "function_closure":
-            thunk = self._closure_thunk(instruction.args[0])
-            code = builder.ptrtoint(thunk, _I64)
-            return builder.call(self.runtime["turkey_closure_new"], [
-                code, ir.Constant(_I64, 0), ir.Constant(_I64, 0),
-            ]), builder
+        if op in ("closure_static", "function_closure"):
+            return self._static_closure(builder, instruction.args[0]), builder
         if op == "closure_capture":
             builder.call(self.runtime["turkey_closure_capture"], [
                 args[0], ir.Constant(_I64, int(instruction.args[1])),
@@ -1074,42 +1090,26 @@ class _Emitter:
             return builder.icmp_unsigned("!=", value, ir.Constant(_I32, 0)), builder
         raise Unsupported(f"no LLVM emission rule for {op}")
 
-    def _closure_thunk(self, symbol: str) -> ir.Function:
-        found = self.closure_thunks.get(symbol)
-        if found is not None:
-            return found
-        target = self.functions[symbol]
-        source = self.source_functions[symbol]
-        original = target.function_type
-        thunk = ir.Function(
-            self.module,
-            ir.FunctionType(_PTR, [_PTR, *(_PTR for _ in original.args)]),
-            name=symbol + "_closure",
-        )
-        builder = ir.IRBuilder(thunk.append_basic_block("entry"))
-        arguments = []
-        for boxed, expected, parameter in zip(thunk.args[1:], original.args,
-                                              source.params):
-            if parameter.layout in (bir.Layout.PTR, bir.Layout.BOXED):
-                arguments.append(boxed)
-            else:
-                bits = builder.call(self.runtime["turkey_unbox"], [
-                    boxed, ir.Constant(_I32, _layout_code(parameter.layout)),
-                ])
-                arguments.append(self._from_i64_type(builder, bits, expected))
-        result = builder.call(target, arguments)
-        if source.result in (bir.Layout.PTR, bir.Layout.BOXED):
-            boxed_result = result
-        elif source.result is bir.Layout.UNIT:
-            boxed_result = ir.Constant(_PTR, None)
-        else:
-            boxed_result = builder.call(self.runtime["turkey_box"], [
-                self._to_i64(builder, result),
-                ir.Constant(_I32, _layout_code(source.result)),
-            ])
-        builder.ret(boxed_result)
-        self.closure_thunks[symbol] = thunk
-        return thunk
+    def _static_closure(self, builder: ir.IRBuilder, symbol: str) -> ir.Value:
+        """The closure a symbol referenced as a *value* is, as a load.
+
+        Built once at module entry and rooted for the whole run, exactly the
+        trade the nullary-constructor statics make: one allocation per symbol
+        ever, against one pair of objects per evaluation before. The registry
+        is filled lazily by body emission, which is complete by the time the
+        entry function -- emitted last -- reaches `_enter_permanent_roots`.
+        """
+        found = self.static_closures.get(symbol)
+        if found is None:
+            code = self.functions[symbol]
+            global_ = ir.GlobalVariable(
+                self.module, _PTR, name=".turkey.closure." + symbol)
+            global_.linkage = "internal"
+            global_.initializer = ir.Constant(_PTR, None)
+            found = (global_, code)
+            self.static_closures[symbol] = found
+        return builder.load(found[0], name="closure")
+
 
     def _primitive(self, function: ir.Function, builder: ir.IRBuilder, name: str,
                    args: list[ir.Value], layout: bir.Layout) -> tuple[ir.Value, ir.IRBuilder]:

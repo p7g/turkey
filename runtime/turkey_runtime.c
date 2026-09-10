@@ -950,6 +950,19 @@ TurkeyString *turkey_string_concat_all(void *wrapper) {
 
 void *turkey_closure_new(uint64_t code, int64_t capture_count,
                          uint64_t pointer_bitmap) {
+    /* A capture-free closure needs no environment object: nothing can read
+       one, because a body with no captures never touches its environment
+       parameter, and the marker skips a null second slot already. This is
+       what the emitter's static closures rely on -- and what a capture-free
+       closure built any other way still benefits from, one object instead of
+       a pair. */
+    if (capture_count == 0) {
+        TurkeyObject *closure = turkey_object_new(3, -1, 2, 2);
+        if (closure == NULL) return NULL;
+        closure->slots[0] = code;
+        closure->slots[1] = 0;
+        return closure;
+    }
     RootFrame frame;
     void *roots[1] = {NULL};
     turkey_root_enter(&frame, roots, 1, "turkey_closure_new");

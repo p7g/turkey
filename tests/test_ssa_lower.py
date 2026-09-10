@@ -29,7 +29,7 @@ PROGRAMS = REPO_ROOT / "tests" / "programs"
 # closure conversion exists for. A sample rather than the corpus because these
 # assertions are about *shape*; `test_boot` is what runs the whole corpus.
 SAMPLE = ["adt.tl", "loops.tl", "stack.tl", "generalization.tl",
-          "constructor_values.tl"]
+          "constructor_values.tl", "closure_abi.tl"]
 
 
 @functools.lru_cache(maxsize=None)
@@ -225,29 +225,18 @@ def test_a_lambda_becomes_a_lifted_function_and_a_closure():
     out = _ssa("generalization.tl")
     assert "closure.new @" in out
     assert "%lambda" in out
-    # The environment is the leading parameter, and every user parameter and
-    # the result are boxed -- one code pointer is reached from call sites at
-    # many types.
+    # The environment remains traced; specialized scalar results stay raw.
     lifted = [line for line in out.splitlines()
               if line.startswith("fun @") and "%lambda" in line]
     assert lifted, out
-    for line in lifted:
-        assert "-> ptr*" in line, line
+    assert any("-> i64" in line for line in lifted), lifted
+    assert all("%0:ptr*" in line for line in lifted), lifted
 
 
-def test_a_function_used_as_a_value_gets_a_boxing_adapter():
-    """Not a `GlobalLoad`, which would load a code address.
-
-    A closure's code is called at the uniform representation and a top-level
-    function's parameters are natural, so something has to convert. That
-    something is an ordinary function in this IR rather than an opcode every
-    emitter expands for itself.
-    """
+def test_a_function_value_uses_its_own_environment_first_signature():
     out = _ssa("generalization.tl")
-    assert "%closure" in out
-    adapters = [line for line in out.splitlines()
-                if line.startswith("fun @") and "%closure" in line]
-    assert adapters, out
+    assert "%closure" not in out
+    assert "closure.new @Main#identity" in out
 
 
 def test_the_calling_conventions_are_not_confused():
@@ -263,3 +252,12 @@ def test_the_calling_conventions_are_not_confused():
         for phrase in ("which is not a function here", "does not exist",
                        "which takes no environment", "arguments where it takes"):
             assert phrase not in out, (name, phrase)
+
+
+def test_closure_signatures_keep_each_scalar_register_class():
+    out = _ssa("closure_abi.tl")
+    signatures = [line for line in out.splitlines()
+                  if line.startswith("fun @Main#main%lambda")]
+    assert signatures
+    for scalar in ("i1", "i8", "i32", "i64", "f64", "unit"):
+        assert any(":" + scalar in line for line in signatures), (scalar, signatures)

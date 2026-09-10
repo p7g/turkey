@@ -236,8 +236,7 @@ class _FunctionLowerer:
         self.output_name = output_name or mangle(bind.name)
         function_type = prune(bind.ty)
         assert isinstance(function_type, TFun)
-        self.result_layout = (bir.Layout.BOXED if self.closure_abi
-                              else self.layout(function_type.ret))
+        self.result_layout = self.layout(function_type.ret)
         self.count = 0
         self.flat_refs = _flat_refs(lam.body)
         self.flat_records = _flat_records(lam.body)
@@ -250,13 +249,12 @@ class _FunctionLowerer:
             for param in lam.params
             if (hint := _free_variable_type(lam.body, param.name)) is not None
         }
-        self.params = ([bir.Value(self.fresh("environment"), bir.Layout.PTR)]
-                       if self.closure_abi else [])
+        self.params = [bir.Value(self.fresh("environment"), bir.Layout.PTR)]
         internal_layouts = [self.layout(parameter_hints.get(p.name, p.ty))
                             for p in lam.params]
         self.params += [bir.Value(
             self.fresh(p.name),
-            bir.Layout.BOXED if self.closure_abi else layout,
+            self.layout(p.ty) if self.closure_abi else layout,
         ) for p, layout in zip(lam.params, internal_layouts)]
         self.env: dict[str, bir.Value] = {}
         if self.closure_abi:
@@ -268,7 +266,7 @@ class _FunctionLowerer:
                 self.entry.instructions.append(
                     bir.Instruction("slot_store", (slot.name, loaded)))
                 self.env[name] = slot
-        visible_params = self.params[1:] if self.closure_abi else self.params
+        visible_params = self.params[1:]
         for core_param, param, layout in zip(lam.params, visible_params,
                                              internal_layouts):
             slot = self.new_slot(core_param.name, layout)
@@ -688,11 +686,18 @@ class _FunctionLowerer:
                 value = _erase_types(bind.value)
                 assert isinstance(value, CLam)
                 symbol, captures = self.lift(value, inner)
-                bitmap = sum(1 << i for i, (_, captured) in enumerate(captures)
-                             if _pointer_layout(captured.layout))
-                closure = self.emit(block, "closure_new",
-                                    (symbol, str(len(captures)), str(bitmap)),
-                                    bir.Layout.PTR)
+                # Capture-free siblings are static, like any other capture-free
+                # lambda; the shell slot still gets it, because a sibling or the
+                # body may mention the binding by name.
+                if not captures:
+                    closure = self.emit(block, "closure_static", (symbol,),
+                                        bir.Layout.PTR)
+                else:
+                    bitmap = sum(1 << i for i, (_, captured) in enumerate(captures)
+                                 if _pointer_layout(captured.layout))
+                    closure = self.emit(block, "closure_new",
+                                        (symbol, str(len(captures)), str(bitmap)),
+                                        bir.Layout.PTR)
                 block.instructions.append(
                     bir.Instruction("slot_store", (slot.name, closure)))
                 lambdas.append((bind, value, symbol, captures))
@@ -997,7 +1002,7 @@ class _FunctionLowerer:
                                              held_at(expected, callee, self.decls))
                                  for value, expected in zip(values,
                                                             function_type.params)]
-                    called = self.emit(at, "call", (symbol, *arguments),
+                    called = self.emit(at, "call", (symbol, bir.Constant(bir.Layout.PTR, 0), *arguments),
                                        held_at(function_type.ret, callee, self.decls),
                                        self.frame(expr.span),
                                        diverges=fn.name in self.bottoming)
@@ -1029,10 +1034,12 @@ class _FunctionLowerer:
                 self.lower_values(expr.args, env, joins, block, construct)
                 return
             def closure_call(at: bir.Block, values: list[bir.Operand]) -> None:
-                arguments = [values[0], *(self.coerce(at, value, bir.Layout.BOXED)
-                                           for value in values[1:])]
+                fn_type = prune(expr.fn.ty)
+                assert isinstance(fn_type, TFun)
+                arguments = [values[0], *(self.coerce(at, value, self.layout(ty))
+                             for value, ty in zip(values[1:], fn_type.params))]
                 called = self.emit(at, "closure_call", tuple(arguments),
-                                   bir.Layout.BOXED, self.frame(expr.span))
+                                   self.layout(fn_type.ret), self.frame(expr.span))
                 done(at, self.coerce(at, called, self.layout(expr.ty)))
             self.lower_values([expr.fn, *expr.args], env, joins, block,
                               closure_call)
@@ -1041,6 +1048,14 @@ class _FunctionLowerer:
             raise Unsupported("LLVM primitive values must be called directly", expr.span)
         if isinstance(expr, CLam):
             symbol, captures = self.lift(expr, env)
+            # A lambda with nothing to capture is one value for the whole run:
+            # the emitter builds it once at module entry and this is a load of
+            # it, the same trade the nullary-constructor statics make. Only a
+            # capturing lambda is a per-evaluation pair of objects.
+            if not captures:
+                done(block, self.emit(block, "closure_static", (symbol,),
+                                      bir.Layout.PTR))
+                return
             bitmap = sum(1 << i for i, (_, captured) in enumerate(captures)
                          if _pointer_layout(captured.layout))
             closure = self.emit(block, "closure_new",
@@ -1065,8 +1080,9 @@ class _FunctionLowerer:
         # free in a lambda anyway: `_flat_records` escapes any name a closure
         # reads a field of, precisely so that a record a closure shares stays
         # a record.
+        mentioned = names_of(lam)
         captures = [(name, value) for name, value in env.items()
-                    if isinstance(value, bir.Value)]
+                    if name in mentioned and isinstance(value, bir.Value)]
         number = self.lift_counter[0]
         self.lift_counter[0] += 1
         # `_25_` is the escape for `%`, and `%` is the compiler's own
@@ -1564,7 +1580,7 @@ def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
     result_layout = functions[main][1].ret
     result = bir.Value("result", held_at(result_layout, decls=decls))
     run_block.instructions.append(
-        bir.Instruction("call", (functions[main][0],), result))
+        bir.Instruction("call", (functions[main][0], bir.Constant(bir.Layout.PTR, 0)), result))
     run_block.terminator = bir.Return(result)
     runner = bir.Function(run_name, [], result.layout, [run_block])
 

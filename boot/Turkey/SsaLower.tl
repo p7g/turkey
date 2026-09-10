@@ -1,6 +1,6 @@
 module Turkey.SsaLower (
     Unsupported(..), Signature(..), Lifting(..), Module(..),
-    lowerBind, lowerProgram, tagsOf, signatures, signatureOf, adapterSymbol,
+    lowerBind, lowerProgram, tagsOf, signatures, signatureOf,
 )
 
 -- Core to the low IR (`NATIVE-BACKEND.md`, M27 phase 1).
@@ -74,16 +74,13 @@ type Signature = Signature {
 --
 -- Records have reference semantics (FINDINGS 10), so one of these passed to a
 -- parent and to the nested `Lower`s its lambdas make is one object -- which is
--- what keeps the symbols unique and the adapters memoized. That is the same
+-- what keeps the symbols unique. That is the same
 -- property FINDINGS 10 records the *downside* of, used deliberately here.
 type Lifting = Lifting {
     -- Names one lifted lambda apart from the next. Program-wide rather than
     -- per binding, so two lambdas in two bindings cannot collide.
     next     : Int,
-    -- The top-level functions someone used as a value, and so needs a boxing
-    -- adapter for. A set: `MkBox(identity)` in two places is one adapter, and
-    -- two would be one duplicate symbol.
-    adapters : Set.Set String,
+
 }
 
 -- A whole program's low IR: the functions, the storage the module initializer
@@ -196,7 +193,7 @@ fun lowerProgram(program : CProgram, decls : DeclTable)
     let fields = recordLayouts(program, decls)
     let tags = tagsOf(decls, fields)
     let sigs = signatures(program, decls)
-    let shared = Lifting { next = 0, adapters = Set.new() }
+    let shared = Lifting { next = 0 }
     for bind in Array.append(program.dicts, program.binds) {
         let (f, lifted, why) = lowerBind(bind, decls, globals, tags, fields,
                                          sigs, shared)
@@ -218,26 +215,11 @@ fun lowerProgram(program : CProgram, decls : DeclTable)
             }
         }
     }
-    -- The initializer before the adapters, because it lowers Core too: a
-    -- global's value may mention a top-level function, and the adapter for it
-    -- would then be requested after the loop that builds them. Its own lifted
-    -- lambdas come back the same way a binding's do.
+    -- Global initializers can also introduce lifted lambdas.
     let (init, lifted, storage) = initializer(program, decls, globals, tags,
                                               fields, sigs, shared)
     Array.push(done, init)
     for g in lifted { Array.push(done, g) }
-    -- The adapters last, and sorted, for the reason `tagsOf` sorts: what a run
-    -- produces should not depend on which binding happened to ask first. A
-    -- binding that stopped may have left a request behind, and the adapter is
-    -- then a symbol nothing calls -- cheaper than tracking requests per
-    -- binding to merge them on success.
-    for target in Array.sort(Set.elements(shared.adapters)) {
-        match Map.get(sigs, target) {
-            Some(sig) -> Array.push(done, adapter(decls, target, sig, globals,
-                                                  tags, fields, sigs, shared))
-            None -> {}
-        }
-    }
     (Module { functions = done, globals = storage,
               initial = initializerName }, skipped)
 }
@@ -364,6 +346,7 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
         None -> Signature { params = [], result = Ssa.traced(Ptr) }
     }
     let f = Ssa.newFunc(bind.name, sig.result)
+    Array.push(f.params, Ssa.freshValue(f, Ssa.traced(Ptr)))
     let l = newLower(decls, f, globals, tags, fields, sigs, bind.layouts, [],
                      shared)
     let entry = L.block(l.b)
@@ -860,11 +843,10 @@ fun value(l : Lower, e : Core) -> Value {
             -- A top-level *function* mentioned rather than called.
             -- `GlobalLoad` would load the symbol, which is a code address and
             -- not something anything can call; what is wanted is a closure
-            -- around it. See `adapter`.
+            -- around it, using the function's own environment-first signature.
             None -> match Map.get(l.sigs, name) {
                 Some(_) -> {
-                    Set.add(l.shared.adapters, name)
-                    L.emit(l.b, ClosureNew(adapterSymbol(name), 0, 0),
+                    L.emit(l.b, ClosureNew(name, 0, 0),
                            Ssa.traced(Ptr))
                 }
                 None -> if Set.contains(l.globals, name) {
@@ -957,7 +939,7 @@ fun value(l : Lower, e : Core) -> Value {
         -- *arrives* at one. Giving it a block whose parameter is where its
         -- value lands is the whole of it -- the same mechanism `if` already
         -- uses for its two arms, applied one level up.
-        CLam(params, body, _) -> lambda(l, params, body)
+        CLam(params, body, _) -> lambda(l, params, body, resultType(e.ty))
         CIf(_, _, _) -> control(l, e, rep)
         CMatch(_, _) -> control(l, e, rep)
         CLet(_, _, _, _, _) -> control(l, e, rep)
@@ -1110,7 +1092,7 @@ fun capturesOf(l : Lower, body : Core,
 -- rather than a saved and restored cursor. What it *shares* is the lifted
 -- array and the counter, which is what makes the symbols unique and the
 -- results collectable.
-fun lift(l : Lower, params : Array CParam, body : Core,
+fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
          captures : Array (String, Rep)) -> Option String {
     if len(captures) > 63 {
         let _ = stop(l, "a lambda with more than 63 captures")
@@ -1122,9 +1104,8 @@ fun lift(l : Lower, params : Array CParam, body : Core,
     -- top-level name here already carries `#` and `@`.
     let symbol = l.func.name + "%lambda" + Int.toString(l.shared.next)
     l.shared.next = l.shared.next + 1
-    -- Boxed, unconditionally: one code pointer is reached from call sites at
-    -- many types.
-    let g = Ssa.newFunc(symbol, Ssa.traced(Ptr))
+    -- The body and every call site derive the signature from its types.
+    let g = Ssa.newFunc(symbol, repIn(l.decls, l.layouts, result))
     -- The *parent's* layouts. A closure inside a layout-shared copy holds the
     -- copy's variables at the copy's layouts, and a synthetic binding that
     -- forgot them would read its captures at the boxed width -- FINDINGS 54,
@@ -1147,7 +1128,7 @@ fun lift(l : Lower, params : Array CParam, body : Core,
     Array.push(g.params, environment)
     let taken : Array Value = []
     for p in params {
-        let v = Ssa.freshValue(g, Ssa.traced(Ptr))
+        let v = Ssa.freshValue(g, repIn(l.decls, l.layouts, p.ty))
         Array.push(g.params, v)
         Array.push(taken, v)
     }
@@ -1195,9 +1176,9 @@ fun closureFor(l : Lower, symbol : String,
 }
 
 -- A lambda in value position: lift it, then build the closure.
-fun lambda(l : Lower, params : Array CParam, body : Core) -> Value {
+fun lambda(l : Lower, params : Array CParam, body : Core, result : Ty.Type) -> Value {
     let captures = capturesOf(l, body, Set.new())
-    match lift(l, params, body, captures) {
+    match lift(l, params, body, result, captures) {
         Some(symbol) -> closureFor(l, symbol, captures)
         None -> Ssa.freshValue(l.func, Ssa.untraced(Unit))
     }
@@ -1237,7 +1218,7 @@ fun letrec(l : Lower, binds : Array CBind, body : Core, dest : Dest) -> Unit {
             None -> bind.value
         }
         let captures = capturesOf(l, inner, siblings)
-        match lift(l, params, inner, captures) {
+        match lift(l, params, inner, resultType(bind.ty), captures) {
             Some(symbol) -> Array.push(plans, (bind.name, symbol, captures))
             None -> return
         }
@@ -1270,55 +1251,6 @@ fun letrec(l : Lower, binds : Array CBind, body : Core, dest : Dest) -> Unit {
     restore(l, was)
 }
 
--- The symbol a top-level function's boxing adapter has.
---
--- Derived from the target rather than counted, so that two mentions of one
--- function are one adapter.
-fun adapterSymbol(target : String) -> String = target + "%closure"
-
--- A top-level function used as a *value*, rather than called.
---
--- A closure's code is called at the uniform representation and a top-level
--- function's parameters are natural, so something has to convert. That is what
--- `turkey/llvmgen.py` generates a thunk per symbol for; here the thunk is
--- written in this IR instead: a function whose parameters are boxed, which
--- unboxes each to the callee's signature, calls it directly, and boxes the
--- result. It is then an ordinary lifted function with no captures, and
--- `ClosureNew(symbol, 0, 0)` is the value.
---
--- Nothing else in the compiler learns anything, and that is the argument.
--- `NATIVE-BACKEND.md`'s rule is that nothing in the low IR is shaped to suit
--- LLVM, and a `FunctionClosure` opcode would be exactly that shape: an
--- instruction with no machine meaning that every emitter expands for itself,
--- by generating a function body from inside a pass whose job is something
--- else. Making it here costs one `coerce` per parameter and buys the opcode
--- set staying at two dozen, which is what the exhaustive `match` design is
--- paid for with.
-fun adapter(decls : DeclTable, target : String, sig : Signature,
-            globals : Set.Set String, tags : Map String Int,
-            fields : Map String (Array String), sigs : Map String Signature,
-            shared : Lifting) -> Ssa.Func Low {
-    let g = Ssa.newFunc(adapterSymbol(target), Ssa.traced(Ptr))
-    let l = newLower(decls, g, globals, tags, fields, sigs, Map.new(), [], shared)
-    let entry = L.block(l.b)
-    L.into(l.b, entry)
-    -- The environment, which an adapter has no use for: it captures nothing.
-    -- It is a parameter anyway, because the closure ABI is one convention and
-    -- a call site cannot know which side of it a code pointer came from.
-    Array.push(g.params, Ssa.freshValue(g, Ssa.traced(Ptr)))
-    let supplied : Array Value = []
-    for r in sig.params {
-        let v = Ssa.freshValue(g, Ssa.traced(Ptr))
-        Array.push(g.params, v)
-        Array.push(supplied, coerce(l, v, r))
-    }
-    let called = L.emit(l.b, Call(Direct(target), supplied), sig.result)
-    L.terminate(l.b, Ret(coerce(l, called, Ssa.traced(Ptr))))
-    g
-}
-
--- An array literal. The element representation decides the stride, so it comes
--- from the type rather than from what happens to be in the first slot.
 fun arrayLiteral(l : Lower, e : Core, elems : Array Core) -> Value {
     let (_, args) = Ty.spine(Ty.prune(e.ty))
     let element = if len(args) > 0 { repOf(l, args[0]) } else { Ssa.traced(Ptr) }
@@ -1441,8 +1373,8 @@ fun call(l : Lower, e : Core, fn : Core, args : Array Core, rep : Rep) -> Value 
             }
         }
         CCon(name) -> constructor(l, e, name, args, rep)
-        CTyApp(_, _) -> call(l, e, erased(fn), args, rep)
-        CTyLam(_, _) -> call(l, e, erased(fn), args, rep)
+        CTyApp(_, _) -> call(l, e, Core.mkCore(fn.ty, fn.span, erased(fn).kind), args, rep)
+        CTyLam(_, _) -> call(l, e, Core.mkCore(fn.ty, fn.span, erased(fn).kind), args, rep)
         -- Anything else evaluates to a function *value*, which is a closure:
         -- a method out of a dictionary (`CField`), the result of another call,
         -- a field of a record. That is the common shape in this language --
@@ -1462,35 +1394,32 @@ fun call(l : Lower, e : Core, fn : Core, args : Array Core, rep : Rep) -> Value 
 -- own scheme would hand a boxed value to a body expecting a bare one.
 fun directCall(l : Lower, name : String, sig : Signature, args : Array Core,
                rep : Rep) -> Value {
-    let supplied : Array Value = []
+    let supplied = [L.emit(l.b, ConstInt(0), Ssa.traced(Ptr))]
     for var i = 0; i < len(args); i = i + 1 {
         Array.push(supplied, coerce(l, value(l, args[i]), sig.params[i]))
     }
     coerce(l, L.emit(l.b, Call(Direct(name), supplied), sig.result), rep)
 }
 
--- A call through a closure, at the uniform representation.
---
--- Everything is boxed and the result is boxed, because the callee is a
--- *lifted* function and a lifted function's parameters and result are boxed
--- whatever the expression's type says: one code pointer is reached from call
--- sites at many types, and the uniform representation is what makes that one
--- function rather than one per type.
---
--- The environment argument and the two slot loads are deliberately absent.
--- `Indirect` carries the closure and instruction selection expands it, the
--- same way `ClosureNew` expands into two allocations -- the level of this IR
--- is the runtime's ABI, not the machine's.
+-- The closure operand's function type defines the ABI at every call site.
+-- Scalars stay raw and pointer parameters remain traced, including while
+-- later arguments allocate. Layout-shared bodies use their layout mapping.
 fun closureCall(l : Lower, fn : Core, args : Array Core, rep : Rep) -> Value {
     -- The callee before the arguments: Core evaluates it first, and this is
     -- the phase where that stops being implicit.
     let closure = value(l, fn)
     let supplied : Array Value = []
-    for a in args {
-        Array.push(supplied, coerce(l, value(l, a), Ssa.traced(Ptr)))
+    match Ty.prune(fn.ty) {
+        TFun(params, result) -> {
+            for var i = 0; i < len(args); i = i + 1 {
+                Array.push(supplied, coerce(l, value(l, args[i]),
+                    repIn(l.decls, l.layouts, params[i])))
+            }
+            coerce(l, L.emit(l.b, Call(Indirect(closure), supplied),
+                repIn(l.decls, l.layouts, result)), rep)
+        }
+        _ -> stop(l, "a closure without a function type")
     }
-    coerce(l, L.emit(l.b, Call(Indirect(closure), supplied), Ssa.traced(Ptr)),
-           rep)
 }
 
 -- Past the type abstraction and application, which have no run-time content.

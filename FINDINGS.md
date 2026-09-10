@@ -1807,7 +1807,7 @@ Priced with the knob, same binary, byte-identical output at every point:
 
 | threshold      | collections | in collect | wall    |
 |----------------|-------------|------------|---------|
-| 1x (shipped)   | 269         | 75.5 s     | 95.3 s  |
+| 1x (then shipped) | 269         | 75.5 s     | 95.3 s  |
 | 4x             | 70          | 22.0 s     | 37.9 s  |
 | 16x            | 22          | 12.0 s     | 27.6 s  |
 
@@ -1837,11 +1837,75 @@ What remains, in order of leverage:
    collector's business, and this baseline is what it gets measured against.
 
 The shipped default now uses 2x, trading roughly 1 GB of peak memory for
-fewer full collections in this workload. The 16x policy remains an opt-in
-experiment because its roughly 6.5 GB peak needs evaluation across the corpus.
-Invalid threshold settings fall back to 2x, and large finite settings saturate
-the threshold at INT64_MAX. Allocation statistics include every string
-allocation path and initialize independently of the JIT stress override.
+fewer full collections in this workload. Measured after the change: **138
+collections instead of 268, 39.5 s in the collector instead of 77 s, 57.1 s
+wall instead of 100.6 s**, byte-identical output and the full corpus passing.
+The 16x policy remains an opt-in experiment because its roughly 6.5 GB peak
+needs evaluation across the corpus. Invalid threshold settings fall back to
+2x, and large finite settings saturate the threshold at INT64_MAX. Allocation
+statistics include every string allocation path and initialize independently
+of the JIT stress override.
+
+### 78. Typed closure calls remove the boxes; static closures remove repeated shells
+
+**performance, measured.** The unfinished raw-word ABI was replaced with the
+planned type-derived ABI in both lowerers. Scalars retain their register class,
+pointers retain tracing information, and every ordinary function takes the
+leading environment parameter. Function values therefore point to the original
+body: no boxing adapters or signature thunks. Capture-free lambdas and function
+values load permanent roots initialized once at module entry. The runtime omits
+the environment object when the capture count is zero. Python closure conversion
+also stops capturing unrelated local slots, matching the bootstrap's existing
+mentioned-name filter.
+
+The bootstrap had an additional agreement trap: call dispatch erased a
+`CTyApp` and then read the inner operand's type, which can be just a variable.
+The instantiated outer type must survive erasure. Without it, 151 compiler
+bindings refused to lower; retaining it restores self-compilation. Lifted result
+representations come from the lambda's declared type, including divergent bodies.
+The discarded raw-word version also introduced conversions with no native
+instruction-selection rules and could hide pointers while evaluating subsequent
+arguments. Typed boundaries need neither those conversions nor that rooting
+exception. Function values have no physical-equality operation; pointer-to-boxed
+coercions remain relabels, so sharing their capture-free shells changes no
+language-visible identity contract.
+
+All measurements below use `opt boot/Main.tl` on the same step-2 source. The
+baseline was rebuilt with the committed Python compiler and 2x runtime rather
+than using an older saved executable. Its counts differ slightly from entry 77
+because the compiler source being optimized has changed.
+
+| Python-built compiler | 2x baseline | typed/static closures |
+|---|---:|---:|
+| wall | 63.87 s | 38.20 s |
+| collector | 42.262 s | 23.871 s |
+| collections | 138 | 91 |
+| allocations | 907,090,717 | 524,228,802 |
+| string | 4,052,698 | 4,052,698 |
+| constructor | 40,237,587 | 40,237,587 |
+| record | 255,015,755 | 255,015,755 |
+| array | 46,504,053 | 46,504,053 |
+| closure | 106,984,491 | 86,605,058 |
+| closure environment | 106,984,491 | 86,604,990 |
+| box | 342,102,981 | 0 |
+| cell | 5,208,661 | 5,208,661 |
+
+Step 2 peaks at 1,810,006,016 bytes RSS. Optimizer output is byte-identical to
+the rebuilt baseline. The focused backend/SSA/native run passed 232 tests;
+the scalar regression additionally exercises Byte, Char, Bool and Unit alongside
+Int, Float and allocated String arguments under GC stress. `bf.tl`, compiled by
+boot, now allocates **25 closures and zero environments**, versus 106+106 in
+the original measurement. Successive self-hosted generations emit byte-identical
+LLVM for the compiler. The complete suite passed **1,497 tests**, with
+153 reference-fragment skips, before this step was committed.
+
+The build generations must be named when comparing numbers. The self-hosted
+compiler also produces byte-identical optimizer output, but its SSA backend still
+allocates more cells and records than the Python backend: 991,833,211 allocations,
+including 338,416,107 cells, 359,819,613 records and 29,592,793 boxes. With the
+step-2 runtime it takes 79.77 s (51.194 s collecting). Those are separate backend
+costs, not residual closure-ABI boxing in the Python-built compiler. They are
+outside this four-step plan and must not be concealed by mixing build generations.
 
 ## Library, still wanted
 

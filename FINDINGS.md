@@ -1942,6 +1942,59 @@ The complete suite on the final epoch allocator passed **1,499 tests**, with
 153 reference-fragment skips. The rebuilt compiler's optimizer dump is
 byte-identical to step 2 before committing this step.
 
+### 80. Known record lambdas reduce safely, but do not change this boot workload
+
+**optimizer, measured.** Both optimizers expose a lambda selected from a literal
+record at an application site, then use the existing beta rule. Every record
+field must be a value: dropping construction of a record with an effectful
+sibling would drop that effect. The regression checks both reduction of a pure
+record and preservation of a printing sibling. Existing inline limits stay in
+place, so this does not make out-of-line mapper dictionaries visible.
+
+On the same final compiler source, the step-3 compiler takes 18.44 s and the
+step-4 compiler takes 18.42 s. Both produce byte-identical optimizer dumps and
+exactly the same allocation counts: there is **no measurable boot benefit from
+this rule**. The slightly larger input source accounts for the count increase
+from entry 79. Collector time is 8.238 s, with 91 collections; peak RSS is
+2,073,116,672 bytes and peak reserved region storage is 1,787,232,256 bytes.
+
+Final by-kind counts for `opt boot/Main.tl`:
+
+| allocation kind | Python-built compiler | self-hosted compiler |
+|---|---:|---:|
+| string | 4,055,054 | 4,055,054 |
+| constructor | 40,251,483 | 40,251,483 |
+| record | 255,061,235 | 359,855,148 |
+| array | 46,512,576 | 46,512,579 |
+| closure | 86,617,128 | 86,617,437 |
+| closure environment | 86,617,060 | 86,617,060 |
+| box | 0 | 29,598,593 |
+| cell | 5,210,772 | 338,449,356 |
+| total | 524,325,308 | 991,956,710 |
+
+The Python host freshly measured on this same source takes 225.54 s, making
+the final Python-built native compiler **12.2x faster**. Its output matches the
+host byte for byte. The self-hosted compiler takes **34.14 s**, including
+15.778 s collecting, and peaks at 1,161,641,984 bytes RSS. It also produces the
+same optimizer output; successive self-hosted generations emit byte-identical
+LLVM. The self-hosted speedup over the current Python host is **6.6x**: the
+remaining backend allocation differences in entry 78 prevent claiming the
+order-of-magnitude target for that build generation.
+
+The completed trajectory for the Python-built compiler is the historical
+100.6 s baseline, a freshly measured 63.87 s with threshold 2x, 38.20 s with
+typed/static closures, 18.22 s with regions, and 18.42 s on the slightly larger
+final source. These are measured observations, not the plan's estimates.
+Capturing closure churn and record/constructor rebuilding remain deferred;
+per-site caching and copy-on-write passes still need the proposed `sameRef`
+language support. The allocator required neither a write barrier nor a
+generational collector.
+
+The complete suite on the final compiler and epoch allocator passed **1,509
+tests**, with 153 reference-fragment skips, before committing step 4. This
+includes the optimizer, cross-backend agreement, native and GC-stress corpus.
+
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

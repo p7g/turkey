@@ -372,6 +372,7 @@ fun step(r : Reducer, e : Core) -> Option Core {
     match e.kind {
         CApp(fn, _) -> return match fn.kind {
             CLam(_, _, _) -> beta(r, e)
+            CField(_, _) -> knownLambda(e)
             _ -> inline(r, e, inlineLimit)
         }
         CMatch(_, _) -> {
@@ -656,6 +657,30 @@ fun bodyOf(r : Reducer, name : String, key : String, lam : Core) -> Core =
             made
         }
     }
+
+-- Expose a literal record's lambda to beta. All sibling fields must be
+-- values: record construction evaluates them before the call.
+fun knownLambda(e : Core) -> Option Core = match e.kind {
+    CApp(fn, args) -> match fn.kind {
+        CField(target, name) -> match target.kind {
+            CRecord(_, fields) -> {
+                for (_, v) in fields { if !isValue(v) { return None } }
+                for (field, v) in fields {
+                    if field == name {
+                        return match v.kind {
+                            CLam(_, _, _) -> Some(mkCore(e.ty, e.span, CApp(v, args)))
+                            _ -> None
+                        }
+                    }
+                }
+                None
+            }
+            _ -> None
+        }
+        _ -> None
+    }
+    _ -> None
+}
 
 -- A lambda applied directly. What inlining a call site leaves behind when the
 -- callee's own body was itself a call.

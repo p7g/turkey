@@ -633,3 +633,18 @@ fun main() {
     assert not any("symbol" in n for n in read), (
         "the caller's `e` was captured by the callee's binder and is being "
         "read at the wrong field")
+
+
+def test_literal_record_lambda_is_exposed_to_beta_without_dropping_effects():
+    from pathlib import Path
+    from turkey.core import CField, CRecord
+
+    source = Path(__file__).parent / "programs" / "known_lambda.tl"
+    program = optimized(source.read_text())
+    main = named(program, "Main#main")
+    literal_calls = [n for n in nodes(main.value)
+                     if isinstance(n, CApp) and isinstance(n.fn, CField)
+                     and isinstance(n.fn.target, CRecord)]
+    # Only the record with an effectful sibling must retain its evaluation.
+    assert len(literal_calls) == 1
+    assert literal_calls[0].fn.target.con == "Main#Effect"

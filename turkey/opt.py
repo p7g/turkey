@@ -69,7 +69,7 @@ from dataclasses import fields as _dataclass_fields, replace
 
 from . import ast
 from .core import (
-    CAlt, CApp, CBind, CCon, CExpr, CIf,
+    CAlt, CApp, CBind, CCon, CExpr, CField, CRecord, CIf,
     CJoin, CJump, CLam, CLet, CLetRec, CLit, CMatch, CParam, CPrim, CProgram,
     CTuple, CTyApp, CUnit, CVar, names_of,
 )
@@ -295,6 +295,8 @@ class _Reducer:
         rules only rearrange terms that came from here.
         """
         if isinstance(e, CApp):
+            if isinstance(e.fn, CField):
+                return self.known_lambda(e)
             return self.beta(e) if isinstance(e.fn, CLam) else self.inline(e)
         if isinstance(e, CMatch):
             return (self.known_constructor(e) or self.inline_scrutinee(e)
@@ -535,6 +537,23 @@ class _Reducer:
         if bind is None or bind.binders or not isinstance(value, CLam):
             return
         self.reduced.setdefault((name, ()), value.body)
+
+    def known_lambda(self, e: CApp):
+        """Expose a literal record's lambda to the existing beta rule.
+
+        Other fields must be values: constructing the record evaluates all
+        fields before the call, so dropping an effectful sibling is unsound.
+        """
+        projection = e.fn
+        record = projection.target
+        if not isinstance(record, CRecord):
+            return None
+        if not all(_is_value(value) for _, value in record.fields):
+            return None
+        for name, value in record.fields:
+            if name == projection.name and isinstance(value, CLam):
+                return replace(e, fn=value)
+        return None
 
     def beta(self, e: CApp):
         """A lambda applied directly. What inlining a call site leaves behind

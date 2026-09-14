@@ -377,8 +377,11 @@ there from the first commit even though nothing reads it until phase 5.
 Four, taken from QBE's set because it is the one that has been measured against
 a stated goal:
 
-* **registerization of stack slots** -- mem2reg. The lowering emits slots for
-  what is genuinely mutable, and this promotes the rest.
+* **registerization of stack slots** -- implemented by `Turkey.Promote`.
+  `SsaLower` replaces non-escaping cells and record fields with private local
+  slots. Backward slot liveness, block parameters and load/store elimination
+  promote those slots before either LLVM emission or native selection. Captured
+  or escaping objects retain heap storage. See FINDINGS 81.
 * **sparse conditional constant propagation** -- subsumes constant folding and
   unreachable-block elimination in one pass, and after lowering it is what
   removes bounds checks against known lengths and tag tests on known

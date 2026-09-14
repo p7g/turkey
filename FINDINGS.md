@@ -1995,6 +1995,71 @@ tests**, with 153 reference-fragment skips, before committing step 4. This
 includes the optimizer, cross-backend agreement, native and GC-stress corpus.
 
 
+### 81. Local allocation elimination belongs before both emitters
+
+**backend, measured.** The Python and self-hosted compilers compiled the same
+Turkey source with different allocation optimizations. Python already replaced
+non-escaping `var` cells with local slots and split non-escaping records into
+local fields. The bootstrap now does both in `Turkey.SsaLower`, using
+`Turkey.LocalEscape` to conservatively reject escaping and captured bindings.
+Scoped environment identities distinguish flattened bindings from same-named
+ordinary values. Each lifted function receives its own analysis.
+
+The low IR's old `SlotLoad`/`SlotStore` operations had no executable emitter
+implementation. Rather than introducing separate stack storage and rooting
+paths, `Turkey.Promote` eliminates these compiler-private slots before either
+backend. Backward slot liveness determines block parameters; stores define SSA
+values and loads become aliases. Branch edges carrying values become jumps,
+and trivial added parameters are removed. Both LLVM and the WIP native
+selector consume the resulting ordinary SSA, with their existing liveness and
+root analysis. This is also the native plan's mem2reg step.
+
+The regression caught an existing Python escape-analysis bug: `_flat_refs`
+did not traverse tuple entries containing record fields, so it could overlook
+a capturing closure inside an array's backing record. That traversal now
+matches the record analysis. The bootstrap uses Core's shared child enumerator
+and includes those fields. The corpus regression exercises loop-carried Int,
+Float and String values, record fields, break/continue, captured shared state
+and an inlined binding that shadows a flattened record's name. SSA assertions
+check that local allocations disappear and no slot operations reach emitters.
+
+Same-source measurements of `opt boot/Main.tl` (the source now includes the
+new passes, so compare these columns rather than the earlier smaller inputs):
+
+| metric | previous self-hosted | new self-hosted | Python-built |
+|---|---:|---:|---:|
+| wall | 33.73 s | 27.83 s | 18.43 s |
+| collector | 15.274 s | 9.889 s | 8.160 s |
+| collections | 208 | 122 | 92 |
+| allocations | 1,031,212,775 | 669,827,010 | 546,068,131 |
+| string | 4,150,841 | 4,150,845 | 4,150,845 |
+| constructor/tuple | 41,157,528 | 41,157,528 | 41,157,528 |
+| record/tagged object | 375,300,089 | 359,019,311 | 266,136,927 |
+| array | 48,569,846 | 48,569,846 | 48,569,843 |
+| closure | 90,307,500 | 90,307,506 | 90,307,192 |
+| closure environment | 90,307,123 | 90,307,123 | 90,307,123 |
+| box | 30,876,178 | 30,876,178 | 0 |
+| cell | 350,543,670 | 5,438,673 | 5,438,673 |
+| peak RSS, bytes | 1,179,959,296 | 1,310,539,776 | 2,131,886,080 |
+
+The self-hosted run is 17.5% faster and allocates 35.0% fewer objects. Cells
+now match the Python-built compiler exactly. The remaining record/box gap is
+not evidence that these two passes alone achieve backend parity. In particular,
+Python's LLVM emitter shares nullary constructor objects while bootstrap LLVM
+still allocates them per use; bootstrap lowering also boxes zero when producing
+an initial value for pointer-element arrays, whereas Python can use zeroed
+storage. These are separate follow-ups; the by-kind totals alone do not assign
+the full remaining gap to either one.
+
+Optimizer dumps match byte for byte across the old self-hosted, new self-hosted
+and Python-built compilers. Successive self-hosted generations emit
+byte-identical LLVM. The focused SSA/selection/native run passed **217 tests**,
+including GC stress; the complete suite passed **1,523 tests**, with 153 skips,
+before committing. Native execution here is the LLVM-linked corpus; the WIP
+backend is checked through selection, graph verification and its existing
+assembler/register-allocation tests, not claimed as a finished executable
+backend.
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

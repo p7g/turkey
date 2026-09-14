@@ -1,6 +1,6 @@
 module Turkey.LowIr (
     BinOp(..), CmpOp(..), Conv(..), Callee(..), Op(..), Low(..),
-    low, effectsOf, opUses, opResultRep, checkReps, checkCalls, showOpName,
+    low, effectsOf, opUses, mapUses, opResultRep, checkReps, checkCalls, showOpName,
     Builder(..), builder, into, emit, effect, terminate, block, param,
 )
 
@@ -311,6 +311,44 @@ fun opUses(op : Op) -> Array Value = match op {
     GlobalStore(_, a) -> [a]
     SlotLoad(_) -> []
     SlotStore(_, a) -> [a]
+}
+
+-- Rewrite operands without changing the instruction or its result.
+fun mapUses(op : Op, f : fun(Value) -> Value) -> Op = match op {
+    ConstInt(a) -> ConstInt(a)
+    ConstFloat(a) -> ConstFloat(a)
+    ConstString(a) -> ConstString(a)
+    ConstUnit -> ConstUnit
+    Bin(a, b, c) -> Bin(a, f(b), f(c))
+    Cmp(a, b, c) -> Cmp(a, f(b), f(c))
+    Neg(a) -> Neg(f(a))
+    Not(a) -> Not(f(a))
+    Convert(a, b) -> Convert(a, f(b))
+    Box(a) -> Box(f(a))
+    Unbox(a) -> Unbox(f(a))
+    ObjectNew(a, b, c, d) -> ObjectNew(a, b, c, d)
+    ObjectGet(a, b) -> ObjectGet(f(a), b)
+    ObjectSet(a, b, c) -> ObjectSet(f(a), b, f(c))
+    ObjectTag(a) -> ObjectTag(f(a))
+    ArrayNew(a, b, c) -> ArrayNew(f(a), f(b), c)
+    ArrayGet(a, b) -> ArrayGet(f(a), f(b))
+    ArraySet(a, b, c) -> ArraySet(f(a), f(b), f(c))
+    ArrayLength(a) -> ArrayLength(f(a))
+    CellNew(a) -> CellNew(f(a))
+    CellLoad(a) -> CellLoad(f(a))
+    CellStore(a, b) -> CellStore(f(a), f(b))
+    ClosureNew(a, b, c) -> ClosureNew(a, b, c)
+    ClosureCapture(a, b, c) -> ClosureCapture(f(a), b, f(c))
+    Call(a, b) -> Call(mapCallee(a, f), Array.map(b, f))
+    GlobalLoad(a) -> GlobalLoad(a)
+    GlobalStore(a, b) -> GlobalStore(a, f(b))
+    SlotLoad(a) -> SlotLoad(a)
+    SlotStore(a, b) -> SlotStore(a, f(b))
+}
+
+fun mapCallee(c : Callee, f : fun(Value) -> Value) -> Callee = match c {
+    Indirect(v) -> Indirect(f(v))
+    _ -> c
 }
 
 instance Inst Low {

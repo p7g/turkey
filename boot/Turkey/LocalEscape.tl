@@ -1,0 +1,85 @@
+module Turkey.LocalEscape (analyze)
+
+-- Non-escaping references and records can become local SSA values. Analyze
+-- source names conservatively across shadowing; lowering checks the scoped
+-- binding identity as well. Any mention inside a closure keeps heap identity.
+import Data.Set as Set
+import Turkey.Core as Core
+import Turkey.Core (Core(..), CoreKind(..), Mapper(..))
+
+type Scan = Scan {
+    refs : Set.Set String,
+    records : Set.Set String,
+    escapedRefs : Set.Set String,
+    escapedRecords : Set.Set String,
+}
+
+fun analyze(body : Core) -> (Set.Set String, Set.Set String) {
+    let s = Scan { refs = Set.new(), records = Set.new(),
+                   escapedRefs = Set.new(), escapedRecords = Set.new() }
+    walk(s, body, False)
+    let refs = Set.new()
+    let records = Set.new()
+    for name in s.refs {
+        if !Set.contains(s.escapedRefs, name) { Set.add(refs, name) }
+    }
+    for name in s.records {
+        if !Set.contains(s.escapedRecords, name) { Set.add(records, name) }
+    }
+    (refs, records)
+}
+
+fun walk(s : Scan, e : Core, closed : Bool) -> Unit {
+    match e.kind {
+        CLet(name, _, bound, _, binders) -> match bound.kind {
+            CRef(_) -> {
+                if closed || len(binders) > 0 { Set.add(s.escapedRefs, name) }
+                Set.add(s.refs, name)
+            }
+            CRecord(_, _) -> {
+                if closed || len(binders) > 0 || Set.contains(s.records, name) {
+                    Set.add(s.escapedRecords, name)
+                }
+                Set.add(s.records, name)
+            }
+            _ -> {}
+        }
+        CVar(name) -> {
+            Set.add(s.escapedRefs, name)
+            Set.add(s.escapedRecords, name)
+            return
+        }
+        CDeref(target) -> match target.kind {
+            CVar(name) -> {
+                if closed { Set.add(s.escapedRefs, name) }
+                Set.add(s.escapedRecords, name)
+                return
+            }
+            _ -> {}
+        }
+        CAssign(target, assigned) -> match target.kind {
+            CVar(name) -> {
+                if closed { Set.add(s.escapedRefs, name) }
+                Set.add(s.escapedRecords, name)
+                walk(s, assigned, closed)
+                return
+            }
+            _ -> {}
+        }
+        CField(target, _) -> match target.kind {
+            CVar(name) -> {
+                if closed { Set.add(s.escapedRecords, name) }
+                Set.add(s.escapedRefs, name)
+                return
+            }
+            _ -> {}
+        }
+        _ -> {}
+    }
+    let nested = closed || match e.kind { CLam(_, _, _) -> True; _ -> False }
+    let _ = Core.mapKind(e.kind, Mapper {
+        expr = fun(x) = { walk(s, x, nested); x },
+        type_ = fun(t) = t,
+        bind = fun(b) = { walk(s, b.value, nested); b },
+    })
+}

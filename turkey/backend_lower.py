@@ -1337,6 +1337,10 @@ def _flat_refs(body) -> set[str]:
             for item in value if isinstance(value, list) else [value]:
                 if isinstance(item, (CExpr, CBind, CAlt)):
                     walk(item, closed)
+                elif isinstance(item, tuple):
+                    for part in item:
+                        if isinstance(part, (CExpr, CBind, CAlt)):
+                            walk(part, closed)
 
     def walk(node, closed: bool) -> None:
         if isinstance(node, CLet) and isinstance(node.value, CRef) and not closed:

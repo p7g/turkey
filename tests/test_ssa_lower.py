@@ -29,7 +29,7 @@ PROGRAMS = REPO_ROOT / "tests" / "programs"
 # closure conversion exists for. A sample rather than the corpus because these
 # assertions are about *shape*; `test_boot` is what runs the whole corpus.
 SAMPLE = ["adt.tl", "loops.tl", "stack.tl", "generalization.tl",
-          "constructor_values.tl", "closure_abi.tl"]
+          "constructor_values.tl", "closure_abi.tl", "local_values.tl"]
 
 
 @functools.lru_cache(maxsize=None)
@@ -261,3 +261,13 @@ def test_closure_signatures_keep_each_scalar_register_class():
     assert signatures
     for scalar in ("i1", "i8", "i32", "i64", "f64", "unit"):
         assert any(":" + scalar in line for line in signatures), (scalar, signatures)
+
+
+def test_local_storage_is_promoted_before_both_emitters():
+    out = _ssa("local_values.tl")
+    assert "slot.load" not in out and "slot.store" not in out, out
+    local = out.split("fun @Main#local(", 1)[1].split("\nfun ", 1)[0]
+    assert "cell.new" not in local, local
+    assert "object.new kind=1" not in local, local
+    # Captured mutable state still needs heap identity.
+    assert "cell.new" in out, out

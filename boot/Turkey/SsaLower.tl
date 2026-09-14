@@ -41,6 +41,8 @@ import Turkey.LowIr (Op(..), Low(..), BinOp(..), CmpOp(..), Conv(..),
                      Callee(..), Builder(..))
 import Turkey.Prelude as P
 import Turkey.Runtime as Rt
+import Turkey.LocalEscape as LocalEscape
+import Turkey.Promote as Promote
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..), Term(..),
                    Func(..), Block(..))
@@ -133,6 +135,11 @@ type Lower = Lower {
     shared  : Lifting,
     -- The first form that could not be lowered, if any.
     stopped : Option String,
+    flatRefs : Set.Set String,
+    flatRecords : Set.Set String,
+    localRefs : Map Int (Int, Rep),
+    localRecords : Map Int (Map String (Int, Rep)),
+    nextSlot : Int,
 }
 
 -- Where an expression's value goes.
@@ -358,6 +365,7 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
         Array.push(f.params, v)
         Map.put(l.env, params[i].name, v)
     }
+    prepareLocals(l, body)
     lower(l, body, ToReturn)
     match l.stopped {
         Some(why) -> (None, [], Some(why))
@@ -366,7 +374,7 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
         -- that compiles (SPEC-DELTAS 61), and LLVM's own dead-code pass has
         -- been deleting it on that path all along -- which is exactly why it
         -- went unnoticed until a second backend had no such pass.
-        None -> (Some(Ssa.pruneUnreachable(f)), pruneAll(l.lifted), None)
+        None -> (Some(Promote.run(f)), pruneAll(l.lifted), None)
     }
 }
 
@@ -380,7 +388,8 @@ fun newLower(decls : DeclTable, f : Ssa.Func Low, globals : Set.Set String,
     decls = decls, func = f, b = L.builder(f, BlockId(0)),
     env = Map.new(), joins = Map.new(), globals = globals, tags = tags,
     fields = fields, sigs = sigs, layouts = layouts, lifted = lifted,
-    shared = shared, stopped = None,
+    shared = shared, stopped = None, flatRefs = Set.new(), flatRecords = Set.new(),
+    localRefs = Map.new(), localRecords = Map.new(), nextSlot = 0,
 }
 
 -- Every constructor's fields, in the order its object holds them.
@@ -497,6 +506,64 @@ fun stop(l : Lower, what : String) -> Value {
     Ssa.freshValue(l.func, Ssa.untraced(Unit))
 }
 
+-- Bindings retain their scoped env identity. A marker is never emitted as a
+-- runtime value; shadowing therefore cannot mistake an ordinary pointer for a
+-- flattened binding with the same source name.
+fun prepareLocals(l : Lower, body : Core) -> Unit {
+    let (refs, records) = LocalEscape.analyze(body)
+    l.flatRefs = refs
+    l.flatRecords = records
+}
+
+fun localBinding(l : Lower, name : String, bound : Core) -> Value {
+    match bound.kind {
+        CRef(inner) -> if Set.contains(l.flatRefs, name) {
+            let v = value(l, inner)
+            let marker = Ssa.freshValue(l.func, Ssa.traced(Ptr))
+            Map.put(l.localRefs, Ssa.valueId(marker), localSlot(l, v))
+            return marker
+        }
+        CRecord(_, fields) -> if Set.contains(l.flatRecords, name) {
+            let slots = Map.new()
+            for (field, inner) in fields {
+                Map.put(slots, field, localSlot(l, value(l, inner)))
+            }
+            let marker = Ssa.freshValue(l.func, Ssa.traced(Ptr))
+            Map.put(l.localRecords, Ssa.valueId(marker), slots)
+            return marker
+        }
+        _ -> {}
+    }
+    value(l, bound)
+}
+
+fun localSlot(l : Lower, v : Value) -> (Int, Rep) {
+    let slot = l.nextSlot
+    l.nextSlot = slot + 1
+    L.effect(l.b, SlotStore(slot, v))
+    (slot, Ssa.repOf(l.func, v))
+}
+
+fun localRef(l : Lower, e : Core) -> Option (Int, Rep) = match e.kind {
+    CVar(name) -> match Map.get(l.env, name) {
+        Some(v) -> Map.get(l.localRefs, Ssa.valueId(v))
+        None -> None
+    }
+    _ -> None
+}
+
+fun localField(l : Lower, e : Core, field : String) -> Option (Int, Rep) =
+    match e.kind {
+        CVar(name) -> match Map.get(l.env, name) {
+            Some(v) -> match Map.get(l.localRecords, Ssa.valueId(v)) {
+                Some(slots) -> Map.get(slots, field)
+                None -> None
+            }
+            None -> None
+        }
+        _ -> None
+    }
+
 -- Lower `e`, sending its value to `dest`.
 fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
     match l.stopped {
@@ -520,7 +587,7 @@ fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
             }
         }
         CLet(name, ty, bound, body, _) -> {
-            let v = value(l, bound)
+            let v = localBinding(l, name, bound)
             let was = saving(l, [name])
             Map.put(l.env, name, v)
             lower(l, body, dest)
@@ -866,14 +933,19 @@ fun value(l : Lower, e : Core) -> Value {
         CTyApp(inner, _) -> value(l, inner)
         CTyLam(_, inner) -> value(l, inner)
         CRef(inner) -> L.emit(l.b, CellNew(value(l, inner)), Ssa.traced(Ptr))
-        CDeref(inner) -> L.emit(l.b, CellLoad(value(l, inner)), rep)
+        CDeref(inner) -> match localRef(l, inner) {
+            Some((slot, held)) -> coerce(l, L.emit(l.b, SlotLoad(slot), held), rep)
+            None -> L.emit(l.b, CellLoad(value(l, inner)), rep)
+        }
         -- An erased wrapper has nothing to read out of: the value in hand
         -- already is the payload, the way a pattern on one binds it directly.
         CProject(target, index) -> match Decls.erasedPayload(l.decls, target.ty) {
             Some(_) -> value(l, target)
             None -> L.emit(l.b, ObjectGet(value(l, target), index), rep)
         }
-        CField(target, name) -> match Decls.erasedPayload(l.decls, target.ty) {
+        CField(target, name) -> match localField(l, target, name) {
+            Some((slot, held)) -> coerce(l, L.emit(l.b, SlotLoad(slot), held), rep)
+            None -> match Decls.erasedPayload(l.decls, target.ty) {
             Some(_) -> value(l, target)
             None -> {
                 let object = value(l, target)
@@ -883,6 +955,7 @@ fun value(l : Lower, e : Core) -> Value {
                                     + Ty.typeKey(target.ty))
                 }
             }
+        }
         }
         CIndex(target, index) -> {
             let array = value(l, target)
@@ -968,7 +1041,9 @@ fun store(l : Lower, target : Core, x : Value) -> Unit = match target.kind {
         let a = value(l, array)
         L.effect(l.b, ArraySet(a, value(l, index), x))
     }
-    CField(receiver, name) -> {
+    CField(receiver, name) -> match localField(l, receiver, name) {
+        Some((slot, held)) -> L.effect(l.b, SlotStore(slot, coerce(l, x, held)))
+        None -> {
         let object = value(l, receiver)
         match fieldIndex(l, receiver.ty, name) {
             Some(index) -> L.effect(l.b, ObjectSet(object, index, x))
@@ -977,9 +1052,13 @@ fun store(l : Lower, target : Core, x : Value) -> Unit = match target.kind {
             }
         }
     }
+    }
     -- Anything else is a reference cell: a `var`, whose mentions are already
     -- `CDeref` and whose assignment is a store through the cell itself.
-    _ -> L.effect(l.b, CellStore(value(l, target), x))
+    _ -> match localRef(l, target) {
+        Some((slot, held)) -> L.effect(l.b, SlotStore(slot, coerce(l, x, held)))
+        None -> L.effect(l.b, CellStore(value(l, target), x))
+    }
 }
 
 -- A heap object with `count` fields, built and then filled.
@@ -1140,6 +1219,7 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
         let held = repIn(l.decls, l.layouts, params[i].ty)
         Map.put(child.env, params[i].name, coerce(child, taken[i], held))
     }
+    prepareLocals(child, body)
     lower(child, body, ToReturn)
     match child.stopped {
         Some(why) -> {
@@ -1808,7 +1888,7 @@ fun initializer(program : CProgram, decls : DeclTable,
         }
     }
     L.terminate(l.b, Ret(L.emit(l.b, ConstUnit, Ssa.untraced(Unit))))
-    (f, l.lifted, storage)
+    (Promote.run(f), pruneAll(l.lifted), storage)
 }
 
 fun ownerOf(a : Action) -> String = match a {
@@ -1859,6 +1939,6 @@ fun act(l : Lower, a : Action, held : Map String Rep) -> Unit = match a {
 -- `match` fallthroughs its parent's does.
 fun pruneAll(fs : Array (Ssa.Func Low)) -> Array (Ssa.Func Low) {
     let out : Array (Ssa.Func Low) = []
-    for f in fs { Array.push(out, Ssa.pruneUnreachable(f)) }
+    for f in fs { Array.push(out, Promote.run(f)) }
     out
 }

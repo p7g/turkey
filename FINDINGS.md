@@ -2115,6 +2115,19 @@ boxing assertion.
 
 The complete suite passed **1,538 tests**, with 153 skips, before committing.
 
+**Startup isolated.** A debugger breakpoint at the first instruction of each
+binary's Turkey `Main.main` reads `stats_by_kind` without changing the compiler
+or allocating in the target. The Python-built binary has allocated 1,746
+objects at that point; the self-hosted binary has allocated 2,280. The difference
+is exactly the 534 objects above: 214 tagged objects, 317 capture-free closures
+and three arrays. Subtracting these snapshots from the completed runs gives
+**547,161,627 execution allocations in each build, identical in every kind**:
+4,158,053 strings, 41,265,468 constructors/tuples, 266,674,608 tagged objects,
+48,663,989 arrays, 90,473,783 closures, 90,473,783 environments, zero boxes and
+5,451,943 cells. Both runs exit successfully with byte-identical output. Thus
+the residual allocation difference is entirely startup, not workload execution;
+matching totals do not imply identical allocation order or object lifetimes.
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

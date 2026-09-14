@@ -2060,6 +2060,61 @@ backend is checked through selection, graph verification and its existing
 assembler/register-allocation tests, not claimed as a finished executable
 backend.
 
+### 82. Nullary sharing and null array slots close the allocation gap
+
+**backend, measured.** `SsaLower` now interns zero-field objects by `(kind,
+tag)` across the module. Uses become ordinary traced global loads. A prefix
+in the module initializer builds each object once and immediately stores it
+in the permanent root array, before any user initializer runs. The prefix's
+entry is placed first in the graph, as LLVM emission requires. This is shared
+low IR, so the WIP native selector benefits without an emitter-specific cache
+or new opcode. Zero-field objects have no fields to mutate, and the language
+has no physical-equality operation.
+
+Uninitialized pointer arrays and empty pointer-array literals now use a null
+initial element instead of allocating a boxed integer zero. Null is already
+accepted by the collector. This changes storage initialization only: explicit
+filled-array values and ordinary generic-value coercions retain their existing
+behavior. The regression checks a nullary value used by a global initializer,
+repeated constructor values, partially filled pointer arrays, empty arrays and
+explicitly filled arrays, including GC stress. The old SSA boxing assertion
+was accidentally testing the unwanted boxed initialization zero; it now checks
+real Byte/Int width conversions, while a separate test requires zero boxes for
+the pointer-array regression.
+
+Same-source `opt boot/Main.tl` measurements:
+
+| metric | previous self-hosted | new self-hosted | Python-built |
+|---|---:|---:|---:|
+| wall | 29.58 s | 25.88 s | 19.77 s |
+| collector | 10.823 s | 8.598 s | 8.895 s |
+| collections | 122 | 111 | 92 |
+| allocations | 671,152,314 | 547,163,907 | 547,163,373 |
+| string | 4,159,526 | 4,159,527 | 4,159,527 |
+| constructor/tuple | 41,265,470 | 41,265,470 | 41,265,470 |
+| record/tagged object | 359,729,527 | 266,674,999 | 266,674,785 |
+| array | 48,664,016 | 48,664,016 | 48,664,013 |
+| closure | 90,474,166 | 90,474,169 | 90,473,852 |
+| closure environment | 90,473,783 | 90,473,783 | 90,473,783 |
+| box | 30,933,883 | 0 | 0 |
+| cell | 5,451,943 | 5,451,943 | 5,451,943 |
+| peak RSS, bytes | 1,321,975,808 | 1,193,033,728 | 2,134,278,144 |
+
+The new self-hosted run is 12.5% faster and allocates 18.5% fewer objects.
+The total is within **534 objects out of 547 million** of the Python-built
+compiler: the large allocation disparity is closed. The remaining 6.11 s wall
+gap is not explained by a large difference in allocation counts; non-collector
+time is 17.28 s versus 10.87 s. Further work should measure generated-code and
+root-management costs instead of assuming another missing allocation pass.
+
+Optimizer output is byte-identical across the old self-hosted, new self-hosted
+and Python-built compilers on this source. Successive self-hosted generations
+emit byte-identical LLVM. The native corpus, GC-stress tests and WIP instruction
+selection checks pass, as do all 46 SSA tests after replacing the obsolete
+boxing assertion.
+
+The complete suite passed **1,538 tests**, with 153 skips, before committing.
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

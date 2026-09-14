@@ -29,7 +29,7 @@ PROGRAMS = REPO_ROOT / "tests" / "programs"
 # closure conversion exists for. A sample rather than the corpus because these
 # assertions are about *shape*; `test_boot` is what runs the whole corpus.
 SAMPLE = ["adt.tl", "loops.tl", "stack.tl", "generalization.tl",
-          "constructor_values.tl", "closure_abi.tl", "local_values.tl"]
+          "constructor_values.tl", "closure_abi.tl", "local_values.tl", "shared_nullaries.tl"]
 
 
 @functools.lru_cache(maxsize=None)
@@ -137,15 +137,15 @@ def test_the_environment_is_scoped():
 
 
 def test_representations_are_converted_explicitly():
-    """A value crossing between a generic context and a concrete one.
+    """Byte/Int boundaries preserve explicit width conversions.
 
-    Parametricity is what creates these: a polymorphic body holds values at
-    the uniform representation, so a value whose type is a variable arrives
-    boxed where a concrete one is required. Every conversion is an
-    instruction rather than a `Rep` mismatch later passes must notice.
+    The old box assertion only exercised boxed zero used to initialize
+    pointer arrays. Those allocations are gone; typed numeric boundaries
+    still require real conversions rather than mismatched representations.
     """
-    out = "".join(_ssa(name) for name in SAMPLE)
-    assert "box %" in out
+    out = _ssa("closure_abi.tl")
+    assert "widen %" in out
+    assert "narrow %" in out
 
 
 def test_the_array_primitives_are_instructions():
@@ -271,3 +271,20 @@ def test_local_storage_is_promoted_before_both_emitters():
     assert "object.new kind=1" not in local, local
     # Captured mutable state still needs heap identity.
     assert "cell.new" in out, out
+
+
+def test_nullary_objects_are_rooted_once_before_user_initializers():
+    import re
+
+    out = _ssa("shared_nullaries.tl")
+    bodies = out.split("\nfun @")
+    allocations = []
+    for body in bodies:
+        empty = re.findall(r"object\.new [^\n]*count=0\b[^\n]*", body)
+        if empty:
+            assert body.startswith("%module.initialize("), body
+            allocations.extend(empty)
+    assert allocations
+    assert len(allocations) == len(set(allocations)), allocations
+    assert "global.load $%nullary." in out, out
+    assert "global.store $%nullary." in out, out

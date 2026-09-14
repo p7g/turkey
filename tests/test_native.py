@@ -23,6 +23,7 @@ module so that several can share a run even though they cannot share a file.
 import contextlib
 import functools
 import io
+import os
 import shutil
 import subprocess
 import tempfile
@@ -195,3 +196,13 @@ def test_symbols_are_the_compilers_own_names():
     """No mangling scheme. LLVM's quoted form takes every character Core uses."""
     text = _modules()["adt.tl"]
     assert '@"Main#main"' in text or '@"Main#main@' in text, text[:400]
+
+
+def test_pointer_array_initialization_does_not_allocate_boxes():
+    result = subprocess.run([str(_binary("shared_nullaries.tl"))],
+                            env=dict(os.environ, TURKEY_GC_STATS="1",
+                                     TURKEY_GC_STRESS="1"),
+                            capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == _reference("shared_nullaries.tl")
+    assert ", box 0," in result.stderr, result.stderr

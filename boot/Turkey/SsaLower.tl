@@ -227,8 +227,50 @@ fun lowerProgram(program : CProgram, decls : DeclTable)
                                               fields, sigs, shared)
     Array.push(done, init)
     for g in lifted { Array.push(done, g) }
-    (Module { functions = done, globals = storage,
-              initial = initializerName }, skipped)
+    let module_ = Module { functions = done, globals = storage,
+                           initial = initializerName }
+    internNullaries(module_, init)
+    (module_, skipped)
+}
+
+-- Empty objects have no fields to mutate and the language has no physical
+-- equality. Share one per (kind, tag), just as the Python emitter does. Do it
+-- in the shared IR so both emitters see ordinary rooted global loads.
+fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
+    let objects : Map String (Int, Int) = Map.new()
+    for f in m.functions {
+        for block in f.blocks {
+            for inst in block.insts {
+                match inst.op {
+                    ObjectNew(kind, tag, count, _) -> if count == 0 {
+                        let name = "%nullary." + Int.toString(kind) + "."
+                                   + Int.toString(tag)
+                        Map.put(objects, name, (kind, tag))
+                        inst.op = GlobalLoad(name)
+                    }
+                    _ -> {}
+                }
+            }
+        }
+    }
+    if len(objects) == 0 { return }
+    -- A new entry block runs before all user initializers. Publish each
+    -- object immediately: allocating the next one may collect under stress.
+    let b = L.builder(init, init.entry)
+    let start = L.block(b)
+    L.into(b, start)
+    for (name, shape) in objects {
+        Array.push(m.globals, (name, Ssa.traced(Ptr)))
+        let made = L.emit(b, ObjectNew(shape.0, shape.1, 0, 0), Ssa.traced(Ptr))
+        L.effect(b, GlobalStore(name, made))
+    }
+    L.terminate(b, Jump(init.entry, []))
+    init.entry = start
+    -- LLVM's first printed block is its entry; keep the shared graph in
+    -- reverse postorder after inserting the initialization prefix.
+    let ordered = Ssa.pruneUnreachable(init)
+    init.blocks = ordered.blocks
+    init.entry = ordered.entry
 }
 
 -- Where each global's value is kept, and at what representation.
@@ -1341,7 +1383,7 @@ fun arrayLiteral(l : Lower, e : Core, elems : Array Core) -> Value {
     -- filled over anyway, and an empty one has no slot to read, so a zero of
     -- the element's own representation is enough in both cases.
     let initial = if len(values) > 0 { values[0] }
-                  else { zero(l, element) }
+                  else { arrayZero(l, element) }
     let made = L.emit(l.b, ArrayNew(length, initial, element.class_),
                       Ssa.traced(Ptr))
     for var i = 1; i < len(values); i = i + 1 {
@@ -1350,6 +1392,12 @@ fun arrayLiteral(l : Lower, e : Core, elems : Array Core) -> Value {
     }
     made
 }
+
+-- An uninitialized pointer array needs null slots, not allocated boxes of
+-- integer zero. This is storage initialization, not a generic scalar value.
+fun arrayZero(l : Lower, r : Rep) -> Value =
+    if r.class_ == Ptr { L.emit(l.b, ConstInt(0), r) }
+    else { zero(l, r) }
 
 fun zero(l : Lower, r : Rep) -> Value = match r.class_ {
     Unit -> L.emit(l.b, ConstUnit, r)
@@ -1553,7 +1601,7 @@ fun primitive(l : Lower, e : Core, name : String, args : Array Value,
         -- collector may walk this array before anything writes to it, so a
         -- traced slot must hold something it can follow.
         let element = elementRep(l, e.ty)
-        return L.emit(l.b, ArrayNew(args[0], zero(l, element), element.class_),
+        return L.emit(l.b, ArrayNew(args[0], arrayZero(l, element), element.class_),
                       Ssa.traced(Ptr))
     }
     -- Three primitives answer raw *storage* where the language's type says

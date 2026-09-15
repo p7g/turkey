@@ -418,6 +418,7 @@ fun forbiddenSets(f : Func A.Inst,
     for var b = 0; b < len(f.blocks); b = b + 1 {
         let block = f.blocks[b]
         let after = Ssa.liveAfter(f, Ssa.BlockId(b), liveOut[b])
+        let (physical, _) = physicalLive(block)
         for var n = 0; n < len(block.insts); n = n + 1 {
             let clobbered = clobbersOf(block.insts[n])
             if len(clobbered) > 0 {
@@ -428,9 +429,77 @@ fun forbiddenSets(f : Func A.Inst,
                     }
                 }
             }
+            -- And the other half: a physical register that is *live* here --
+            -- written by an earlier instruction, read by a later one -- is
+            -- denied to everything live across this point and to whatever
+            -- this instruction defines, since defining a value writes its
+            -- register.
+            let held = physical[n]
+            if len(held.gp) > 0 || len(held.fp) > 0 {
+                for id in Set.elements(touched(block.insts[n], after[n])) {
+                    let taken = match A.bankOf(f.reps[id]) {
+                        Gp -> held.gp
+                        Fp -> held.fp
+                    }
+                    for r in Set.elements(taken) { Set.add(out[id], r) }
+                }
+            }
         }
     }
     out
+}
+
+-- The values live after an instruction, plus the ones it defines whether or
+-- not they are used. A dead definition still writes a register.
+fun touched(i : A.Inst, after : Set.Set Int) -> Set.Set Int {
+    let out = Set.new()
+    for id in Set.elements(after) { Set.add(out, id) }
+    for d in Ssa.defs(i) { Set.add(out, Ssa.valueId(d)) }
+    out
+}
+
+-- Physical registers live at a program point, per file.
+type PhysicalLive = PhysicalLive { gp : Set.Set Int, fp : Set.Set Int }
+
+-- The physical registers live *after* each instruction of a block, and the
+-- ones live on entry to it.
+--
+-- One backward walk: a register a later instruction reads is live until the
+-- instruction that writes it. Selection only ever writes a physical register
+-- and reads it back within one block -- arguments into `x0`-`x7` before a
+-- call, the result out of `x0` after it -- so nothing should be live on entry,
+-- and `verifyColouring` says so if it is. `x31` is not a register anything can
+-- hold: it is `xzr` or `sp`.
+fun physicalLive(block : Ssa.Block A.Inst) -> (Array PhysicalLive, PhysicalLive) {
+    let sets : Array PhysicalLive = []
+    for _ in block.insts {
+        Array.push(sets, PhysicalLive { gp = Set.new(), fp = Set.new() })
+    }
+    let gp = Set.new()
+    let fp = Set.new()
+    for var n = len(block.insts) - 1; n >= 0; n = n - 1 {
+        let hereGp = Set.new()
+        let hereFp = Set.new()
+        for r in Set.elements(gp) { Set.add(hereGp, r) }
+        for r in Set.elements(fp) { Set.add(hereFp, r) }
+        sets[n] = PhysicalLive { gp = hereGp, fp = hereFp }
+        let op = block.insts[n].op
+        for r in A.destRegs(op) {
+            match r {
+                Physical(Gp, k) -> { let _ = Set.remove(gp, k) }
+                Physical(Fp, k) -> { let _ = Set.remove(fp, k) }
+                Virtual(_) -> {}
+            }
+        }
+        for r in A.srcRegs(op) {
+            match r {
+                Physical(Gp, k) -> if k != 31 { Set.add(gp, k) }
+                Physical(Fp, k) -> Set.add(fp, k)
+                Virtual(_) -> {}
+            }
+        }
+    }
+    (sets, PhysicalLive { gp = gp, fp = fp })
 }
 
 fun sameBank(a : Bank, b : Bank) -> Bool = match (a, b) {
@@ -491,17 +560,26 @@ fun verifyColouring(f : Func A.Inst, c : Colouring) -> Array String {
         let b = Ssa.blockId(at)
         let block = f.blocks[b]
         let after = Ssa.liveAfter(f, at, liveOut[b])
-        for var n = 0; n < len(block.insts); n = n + 1 {
-            checkPoint(out, f, c, forbidden, after[n], b, n)
+        let (physical, entering) = physicalLive(block)
+        if len(entering.gp) > 0 || len(entering.fp) > 0 {
+            Array.push(out, "a physical register is live on entry to block b"
+                            + Int.toString(b))
         }
-        checkPoint(out, f, c, forbidden, liveOut[b], b, -1)
+        let none = PhysicalLive { gp = Set.new(), fp = Set.new() }
+        for var n = 0; n < len(block.insts); n = n + 1 {
+            checkPoint(out, f, c, forbidden, touched(block.insts[n], after[n]),
+                       physical[n], b, n)
+        }
+        checkPoint(out, f, c, forbidden, liveOut[b], none, b, -1)
     }
     out
 }
 
+-- One program point: the values live there and the ones just defined, which
+-- is every value holding a register at that moment.
 fun checkPoint(out : Array String, f : Func A.Inst, c : Colouring,
                forbidden : Array (Set.Set Int), live : Set.Set Int,
-               b : Int, n : Int) -> Unit {
+               physical : PhysicalLive, b : Int, n : Int) -> Unit {
     let seen = Map.new()
     for id in Set.elements(live) {
         let r = c.of_[id]
@@ -527,6 +605,15 @@ fun checkPoint(out : Array String, f : Func A.Inst, c : Colouring,
             if Set.contains(forbidden[id], r) {
                 Array.push(out, "value %" + Int.toString(id) + " holds " + k
                                 + ", which is clobbered while it is live, at "
+                                + where_(b, n))
+            }
+            let held = match A.bankOf(f.reps[id]) {
+                Gp -> physical.gp
+                Fp -> physical.fp
+            }
+            if Set.contains(held, r) {
+                Array.push(out, "value %" + Int.toString(id) + " holds " + k
+                                + " while the physical " + k + " is live, at "
                                 + where_(b, n))
             }
         }

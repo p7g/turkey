@@ -1,6 +1,6 @@
 module Turkey.Arm64 (
     Reg(..), Bank(..), reg, physical, isPhysical, bankOf, Cond(..), Width(..),
-    Mem(..), Arm(..), Inst(..), destRegs,
+    Mem(..), Arm(..), Inst(..), destRegs, srcRegs,
     xzr, sp, fp, lr, x0, d0, argRegs, fpArgRegs, callerSaved, calleeSaved,
     fpCallerSaved, fpCalleeSaved, showReg, condName, isCall,
 )
@@ -274,61 +274,70 @@ fun isCall(i : Inst) -> Bool = match i.op {
     _ -> False
 }
 
--- The `Value` ids an instruction reads. Physical registers are not `Value`s
--- and are absent from this: the allocator learns about them from `CallArgs`
--- and from the clobber list, not from a use.
-fun usesOf(op : Arm) -> Array Value = match op {
-    Mov(_, a, _) -> virtualOf([a])
+-- The `Value` ids an instruction reads: `srcRegs` with the physical registers
+-- dropped, which is what liveness and the verifier want.
+fun usesOf(op : Arm) -> Array Value = virtualOf(srcRegs(op))
+
+-- The registers an instruction *reads*, physical ones included.
+--
+-- The mirror of `destRegs`, and wanted for the mirror reason. The allocator
+-- knew what a `mov x0, %5` destroys but not that `x0` is then *live* until the
+-- `bl` reads it -- so a value defined in between could have been given `x0`
+-- and overwritten the argument. Selection never defines one there, which is
+-- why nothing broke; a spiller's reload in front of `mov x1, %6` is exactly
+-- such a value.
+fun srcRegs(op : Arm) -> Array Reg = match op {
+    Mov(_, a, _) -> [a]
     MovZ(_, _, _) -> []
-    MovK(d, _, _) -> virtualOf([d])
-    Add(_, a, b, _) -> virtualOf([a, b])
-    AddImm(_, a, _, _) -> virtualOf([a])
-    AddS(_, a, b, _) -> virtualOf([a, b])
-    Sub(_, a, b, _) -> virtualOf([a, b])
-    SubImm(_, a, _, _) -> virtualOf([a])
-    SubS(_, a, b, _) -> virtualOf([a, b])
-    Mul(_, a, b, _) -> virtualOf([a, b])
-    SMulH(_, a, b) -> virtualOf([a, b])
-    SDiv(_, a, b, _) -> virtualOf([a, b])
-    MSub(_, a, b, c, _) -> virtualOf([a, b, c])
-    And(_, a, b, _) -> virtualOf([a, b])
-    Orr(_, a, b, _) -> virtualOf([a, b])
-    Eor(_, a, b, _) -> virtualOf([a, b])
-    EorImm(_, a, _, _) -> virtualOf([a])
-    Lsl(_, a, b, _) -> virtualOf([a, b])
-    Lsr(_, a, b, _) -> virtualOf([a, b])
-    Asr(_, a, b, _) -> virtualOf([a, b])
-    Cmp(a, b, _) -> virtualOf([a, b])
-    CmpImm(a, _, _) -> virtualOf([a])
+    MovK(d, _, _) -> [d]
+    Add(_, a, b, _) -> [a, b]
+    AddImm(_, a, _, _) -> [a]
+    AddS(_, a, b, _) -> [a, b]
+    Sub(_, a, b, _) -> [a, b]
+    SubImm(_, a, _, _) -> [a]
+    SubS(_, a, b, _) -> [a, b]
+    Mul(_, a, b, _) -> [a, b]
+    SMulH(_, a, b) -> [a, b]
+    SDiv(_, a, b, _) -> [a, b]
+    MSub(_, a, b, c, _) -> [a, b, c]
+    And(_, a, b, _) -> [a, b]
+    Orr(_, a, b, _) -> [a, b]
+    Eor(_, a, b, _) -> [a, b]
+    EorImm(_, a, _, _) -> [a]
+    Lsl(_, a, b, _) -> [a, b]
+    Lsr(_, a, b, _) -> [a, b]
+    Asr(_, a, b, _) -> [a, b]
+    Cmp(a, b, _) -> [a, b]
+    CmpImm(a, _, _) -> [a]
     CSet(_, _) -> []
-    Sxtw(_, a) -> virtualOf([a])
-    Uxtb(_, a) -> virtualOf([a])
-    Uxth(_, a) -> virtualOf([a])
-    Ubfx(_, a, _, _) -> virtualOf([a])
-    Ldr(_, m, _) -> memUses(m)
-    Ldrb(_, m) -> memUses(m)
-    Ldrsw(_, m) -> memUses(m)
-    Str(v, m, _) -> Array.append(virtualOf([v]), memUses(m))
-    Strb(v, m) -> Array.append(virtualOf([v]), memUses(m))
-    Stp(a, b, base, _) -> virtualOf([a, b, base])
-    Ldp(_, _, base, _) -> virtualOf([base])
+    Sxtw(_, a) -> [a]
+    Uxtb(_, a) -> [a]
+    Uxth(_, a) -> [a]
+    Ubfx(_, a, _, _) -> [a]
+    Ldr(_, m, _) -> memRegs(m)
+    Ldrb(_, m) -> memRegs(m)
+    Ldrsw(_, m) -> memRegs(m)
+    Str(v, m, _) -> Array.append([v], memRegs(m))
+    Strb(v, m) -> Array.append([v], memRegs(m))
+    Stp(a, b, base, _) -> [a, b, base]
+    Ldp(_, _, base, _) -> [base]
     Adrp(_, _) -> []
-    AddLo(_, a, _) -> virtualOf([a])
+    AddLo(_, a, _) -> [a]
     MovConst(_, _) -> []
-    FMov(_, a) -> virtualOf([a])
-    FMovIn(_, a) -> virtualOf([a])
-    FMovOut(_, a) -> virtualOf([a])
-    FAdd(_, a, b) -> virtualOf([a, b])
-    FSub(_, a, b) -> virtualOf([a, b])
-    FMul(_, a, b) -> virtualOf([a, b])
-    FDiv(_, a, b) -> virtualOf([a, b])
-    FNeg(_, a) -> virtualOf([a])
-    FCmp(a, b) -> virtualOf([a, b])
-    Scvtf(_, a) -> virtualOf([a])
-    Fcvtzs(_, a) -> virtualOf([a])
+    FMov(_, a) -> [a]
+    FMovIn(_, a) -> [a]
+    FMovOut(_, a) -> [a]
+    FAdd(_, a, b) -> [a, b]
+    FSub(_, a, b) -> [a, b]
+    FMul(_, a, b) -> [a, b]
+    FDiv(_, a, b) -> [a, b]
+    FNeg(_, a) -> [a]
+    FCmp(a, b) -> [a, b]
+    Scvtf(_, a) -> [a]
+    Fcvtzs(_, a) -> [a]
     Bl(_) -> []
-    Blr(a) -> virtualOf([a])
-    CallArgs(ins, _) -> virtualOf(ins)
+    Blr(a) -> [a]
+    CallArgs(ins, _) -> ins
     Ret -> []
     B(_) -> []
     BCond(_, _) -> []
@@ -417,9 +426,9 @@ fun virtualOf(rs : Array Reg) -> Array Value {
     out
 }
 
-fun memUses(m : Mem) -> Array Value = match m {
-    Offset(base, _) -> virtualOf([base])
-    Indexed(base, index) -> virtualOf([base, index])
+fun memRegs(m : Mem) -> Array Reg = match m {
+    Offset(base, _) -> [base]
+    Indexed(base, index) -> [base, index]
 }
 
 -- -- printing -----------------------------------------------------------------------

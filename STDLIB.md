@@ -3,8 +3,9 @@
 Status: **draft for iteration.** Measured and prototyped at `d2b7a71`, and
 re-checked at `prim-types-rebased` (`5f09d4b`), where source files are `.gob`;
 facts that changed between the two say so.
-Nothing here is decided; section 6 is a
-recommendation and section 7 lists what is still open.
+Section 6 is the current recommendation; section 7 lists what is still open.
+Read those first for the proposed API. Section 4 records the survey and
+experiments, including superseded designs explicitly marked as historical.
 
 Two questions, which turn out to constrain each other:
 
@@ -159,7 +160,9 @@ These are not in the survey; they are why a peer's answer may not transfer.
   `Map.tl` beside it shadows the library's `Map` today if the library's module
   is called `Map`. A flat namespace makes this a real hazard (6.1).
 * **`Int` is 64-bit and traps.** No solution in the corpus has a literal of 12
-  or more digits; nothing measured needs bignums.
+  or more digits, but literal sizes do not bound computed counts, products,
+  LCMs or rational intermediates. Bignums are deferred, pending checks of
+  results and intermediate bounds in representative solutions.
 
 ---
 
@@ -241,8 +244,11 @@ Two things make classes cheaper in Turkey than in Rust:
   variable of the head, so FINDINGS 5 does not bite.
 
 And specialization (design.md 5.5) turns a known instance's method into a
-direct call, where a closure field stays an indirect one (FINDINGS 78). So:
-**a class for what the graph is, arguments for what this query asks.** Once an
+direct call, where a closure field stays an indirect one (FINDINGS 78).
+This motivates a candidate:
+**a class for what the graph is, arguments for what this query asks.**
+The final choice remains subject to the program comparison in 7.9, including
+a function-only baseline. Once an
 algorithm needs more than one fact about the structure -- successors, cost,
 node identity -- the class is what keeps those facts consistent across the
 algorithms that use the same graph.
@@ -281,13 +287,16 @@ sequence, so eager list functions cover the space. Turkey has in-place arrays
 and `for` already runs on `Iterator`, so the lazy protocol is already paid for
 -- what is missing is only the functions over it.
 
-The Turkey-specific cost is that each lazy adapter is a type and an instance.
-That is the same cost Rust pays. The library is designed for the code it wants
-people to write; making that code fast is the backend's job, and an adapter
-chain that does not fuse is a backend finding, not a reason to change the
-library.
+Under the original protocol proposal, each lazy adapter needs a type and an
+instance, as in Rust; 4.13 removes that cost through one concrete type. The
+library should support the code people want to write, but representation
+affects which optimizations are feasible. Adapter performance is an acceptance
+criterion for the design, measured against direct loops (6.5.2).
 
 #### 4.3.1 `Iterable` and `Iterator`
+
+**Historical design:** the two-class protocol below is superseded by 4.13.
+Its resumable-consumer experiments remain requirements for the current design.
 
 The case to support: one stateful iterator consumed by several loops, for
 example a recursive parser that hands the rest of its input to a recursive call.
@@ -427,7 +436,8 @@ defaults `Iterable`. And with the superclass equality `Iter i ~ i` there is only
 one valid `Iterable` instance for an iterator anyway, so the rule can be as
 simple as "always generated; a hand-written one is an error". The generated
 instance has a constructor head, so lookup, overlap and termination keep their
-current structure. This is the recommendation (6.5).
+current structure. This was the earlier recommendation; the concrete iterator
+in 4.13 supersedes it.
 
 ### 4.4 Text and Unicode
 
@@ -451,8 +461,8 @@ separate from `String` so the tables can move on their own. AoC needs none of
 it: the inputs are ASCII.
 
 What AoC does need that sounds like text is **parsing**, and it is split plus
-`Int.parse`, plus pulling every integer out of a line. That is `String`'s
-business, not `Text`'s.
+`Int.parse` and ordinary string operations. A helper extracting every integer
+is not supported by the measured corpus and is not proposed (section 5).
 
 ### 4.5 Time
 
@@ -628,7 +638,7 @@ Caveats:
   the result; mapping the *yielded* values is an iterator adapter.
 * Mutating a captured `var` is sound because a generator's continuation runs
   once. It would not be for `Array`'s `bind`.
-* The syntax warts are in 7.6.
+* The syntax warts are in 7.10.
 
 #### 4.9.1 Generators and the one iterator type
 
@@ -654,7 +664,8 @@ The prototype's `outer()` -- `counted([7, 8, 9])?`, then `yield(n * 100)`, then
 `yieldFrom([1, 2])`, then `yieldFrom(Some(5))` -- produced
 `[7, 8, 9, 300, 1, 2, 5]`.
 
-**Delegation depth is free, and in Python it is not.** CPython resumes every
+**No per-element traversal of the delegation chain in this benchmark.**
+CPython resumes every
 delegating frame for every value, so a chain of `yield from` costs time per
 level per element. With the codensity representation, binds associate to the
 right, and an inner `yield` returns straight to the consumer. Measured on
@@ -669,9 +680,11 @@ right, and an inner `yield` returns straight to the consumer. Measured on
 
 Turkey's times include compiling the program; the 200,000-element row is
 roughly that fixed cost. Depth 500 adds about 0.1 s over five million elements,
-where Python's depth 500 is 146 times its depth 0.
+where Python's depth 500 is 146 times its depth 0. These results do not
+establish that arbitrary delegation is free: compilation and execution must
+be measured separately, alongside allocation and memory use (6.5.2).
 
-**When the body runs: a trap, closed by types rather than a special case.**
+**When the body runs: a factory separates construction from execution.**
 Written as a plain function returning `Gen`, a generator's body runs up to its
 first `?` when the function is *called*. Its `var`s are allocated once per call,
 while each run replays the continuation chain. The first prototype showed both
@@ -705,10 +718,13 @@ was tested as a separate module with an abstract export list (2026-09-14):
   Int Unit)'".
 * **Building a `Gen` by hand is rejected:** "unknown constructor 'Gen'".
 
-One hole is left, and it takes intent. A `Body` built *outside* a run and
+Fresh body-local state does not guarantee independent runs. A `Body` built
+*outside* a run and
 captured -- `let b = between(1, 4); generator(fun() = b)` -- shares its state
 across runs. Types without linearity cannot see that. The natural spelling,
-`generator(fun() = between(1, 4))`, is safe.
+`generator(fun() = between(1, 4))`, allocates fresh local state. Capturing an
+external iterator or mutable cell can still couple runs; the factory does not
+clone captured values or make effects repeatable.
 
 Kotlin's `sequence { yield(x) }` is the precedent: the builder takes a block,
 `yield` exists only inside the block's scope, and the block runs when the
@@ -790,6 +806,9 @@ Turkey has no packages, so it has only that last defence -- disjoint leaves
 (6.3).
 
 ### 4.12 `Foldable`, `Functor` over iterators, and collecting
+
+**Historical design:** the restartable `Seq` below is superseded by 4.13.
+The collector experiments remain relevant; 6.5 defines the current API.
 
 **Where `sum` lives in Haskell.** With `Foldable`. `sum :: (Foldable t, Num a)
 => t a -> a` has been a method of `Foldable` since GHC 7.10 (the
@@ -965,8 +984,10 @@ giving up restartability.
 
 Under this proposal an `Iterator` is ephemeral: it is a stream. Restartability
 belongs to `Iterable` containers, and to functions that return a fresh
-iterator on each call, as Python's generator functions do. A `memoize` adapter
-covers replay.
+iterator on each call, as Python's generator functions do. Replay requires
+a separate `Memoized a` iterable with a shared cache and
+fresh cursors; an ordinary self-iterating `Iterator a` cannot provide it
+merely by caching values (6.5).
 
 **What it removes**, compared with 4.3.1, 4.3.2 and 4.12:
 
@@ -984,8 +1005,11 @@ covers replay.
 * **Half of every generic consumer's context.** `[Iterable c, Elem c ~ Int]`
   instead of `[Iterable c, Iterator (Iter c), Item (Iter c) ~ Int]`.
 
-**Functor laws on a one-shot type.** They hold when each iterator is used once.
-The hazard is aliasing: two `map`s over one iterator interleave.
+**Laws and effects on a one-shot type.** The intended list-like laws assume
+pure callbacks and no observable aliasing of consumed state. Turkey enforces
+neither restriction. Two `map`s over one iterator interleave, and callbacks
+can mutate shared state. These instances provide useful comprehension syntax;
+they do not justify unrestricted algebraic rewrites of effectful programs.
 
 * Java throws on reuse.
 * Rust's `map` takes `self` by value, so reuse does not compile.
@@ -1001,8 +1025,9 @@ Python's iterators.
   optional fields (a size hint) or wrapper records that are themselves
   `Iterable` (`Peekable a` holding an `Iterator a` and a one-element buffer).
 * **An indirect call per element**, unless the backend inlines a known closure.
-  That is the backend's job (6.5), and it already reduces calls to known
-  lambdas in literal records (commit 944e1ba).
+  Known lambdas in literal records are already reduced (commit 944e1ba),
+  but that does not establish fusion through general mutable closure chains.
+  Measure execution, allocations and memory before accepting the cost (6.5.2).
 * **The existential version adds a choice that the closure hides.** Either
   mutable state -- a shared cursor, which the resumable-loop requirement of
   4.3.1 needs -- or immutable state with `next : fun(s) -> Option (a, s)`,
@@ -1034,38 +1059,42 @@ This supersedes the iterator class of 4.3.1-4.3.2 and the `Seq` type of 4.12
 
 Evidence is the 2021-2025 column of section 2.
 
-**P0 -- most days are blocked without it.**
+**P0 -- establish the everyday iteration and collection API.**
+
+These are ergonomic gaps, not all expressiveness blockers: loops and eager
+arrays already express many of the programs. The first milestone is complete
+solutions using a small, specified API.
 
 * **Reading input.** `stdin` (a primitive) or `readFile` (exists). Reading a
   whole stream is enough; line-at-a-time is not measured.
 * **An iteration module** over `Iterator`: `range`, `count`, `enumerate`,
   `zip`, `map`, `filter`, `takeWhile`, `sum`, `product`, `min`/`max`/
   `minBy`/`maxBy`, `any`/`all`, `find`, `fold`, `collect` to `Array`/`Map`/`Set`.
-  Then the combinatorial ones: `pairwise`, `windows`, `chunks`, `product`
-  (cartesian), `combinations`, `permutations`.
+  Add `take` and `flatMap` with explicit short-circuit and consumption contracts.
+  Combinatorial adapters follow in P2; numeric `product` and
+  `cartesianProduct` have distinct names.
 * **Parsing** is already covered by `lines`, `split`, `splitOnce`, `trim`
   and `Int.parse`, once iteration can map over the pieces. That is how the
   corpus parses. (An earlier draft proposed a `String.ints`, a community AoC
   helper that pulls every integer out of a line. The corpus does not use it,
-  and it is withdrawn.) A parser monad is 7.7.
+  and it is withdrawn.) A parser monad is 7.11.
 * **`Set` in the Prelude** (FINDINGS 24), and a counter idiom on `Map`
-  (`Map.increment`, or `update` with a default -- check what `update` already
-  does).
+  using the existing `Map.update(counts, key, 0, fun(n) = n + 1)`.
+  `lib/Data/Map.gob` already documents and implements this idiom.
 * **`Int`**: `gcd`, `lcm`, `pow`, `sign`, `min`, `max`. **`Float.sqrt`** (a
   primitive).
 
 **P1 -- one day in seven (search) to one in three (grids).**
 
 * **`Deque`** and **`Heap`** (priority queue, min by `Ord` or by key).
-* **Search over successor functions**: `bfs`, `dijkstra`, `astar`,
-  `reachable`, with path reconstruction and "all shortest paths". Built on
-  `Deque`, `Heap`, `Map`.
+* **Search over successor functions**: `bfs`, `dijkstra`, `reachable`, with
+  distances, one path, and predecessor information. Built on `Deque`, `Heap`,
+  `Map`. A* and path enumeration follow only with explicit contracts (6.4).
 * **A grid**: a point with arithmetic and neighbours, and a rectangular grid
   built from any iterable of iterables. That keeps the `list[str]`-as-2D-array
   ergonomics without making strings an axis (4.3.1). This is what the `aoc.py`
   prelude grew into over three years -- the strongest signal in the corpus.
   Its names were chosen for typing speed and are not a constraint.
-* **Generators** (4.9).
 * **Memoization** works today, two ways, both run on 2026-09-14:
   * Python's mechanism. `@cache` works because recursive calls go through a
     late-bound global. A module-level `var fib` holding a closure, reassigned
@@ -1079,25 +1108,30 @@ Evidence is the 2021-2025 column of section 2.
   internal error at `d2b7a71` ("the variable 'x' should be Int but is k");
   `c1db094` fixed it, and it runs at `prim-types-rebased`.
 
-**P2 -- a few days a year.**
+**P2 -- expand when complete solutions demonstrate the need.**
 
+* `pairwise`, `windows`, `chunks`, `cartesianProduct`, `combinations`,
+  `permutations`; specify buffering and repeated traversal before shipping.
+* **Generators** (4.9), replay through `Memoized`, and A*.
 * Connected components and union-find; topological sort; cycle detection.
 * `Rational` over `Int` (2025/10). Homogeneous operators make it an ordinary
-  type with `Add`..`Div` instances.
+  type with `Add`..`Div` instances. Intermediate overflow remains possible
+  even when a reduced final answer fits; cancellation and checked arithmetic
+  need explicit design and tests.
 * An ordered map (`bisect`/`insort` at 8% of 2024).
 
 **Harness, not solutions.** An environment variable read (a primitive), or
 just `args`. HTTPS is not worth a primitive: fetch with `curl` in a shell
 wrapper and read the cached file.
 
-**Not needed.** Regex (nine calls in seven years), bignums (no evidence),
+**Deferred.** Regex (nine calls in seven years), bignums (bounds unverified),
 numpy, z3, time zones, Unicode segmentation.
 
 ---
 
 ## 6. Recommendation on layout
 
-Revised after four reviews.
+Revised after five reviews.
 
 ### 6.1 `Data` holds concrete types
 
@@ -1141,14 +1175,11 @@ differently:
   `Data.Map` is the type, its functions and its instances; `Protocol.Iterable`
   is the class and what is derived from it. The root is a second index on top
   of domain-shaped modules, not a replacement for them.
-* **The roots are the dependency order.** Turkey has no mutually recursive
-  modules (FINDINGS 31), so the library is a DAG, and the roots are its strata:
-  `Protocol` imports only types, `Data` imports `Protocol`, `Algorithm` imports
-  both, and `System` sits over `Data`. A domain root (`Graph.*` holding the
-  class, the representations and the search) would have to repeat that
-  layering inside every domain. The one leak is the `.Type` modules:
-  `Protocol.Iterable` needs `Option`'s type, which could move to
-  `Turkey.Internal`.
+* **Acyclicity is a module-level constraint.** Turkey has no mutually recursive
+  modules (FINDINGS 31). The category roots are not dependency strata:
+  protocols need types and types need protocols. Low-level declaration
+  modules, including `Turkey.Internal.*`, make the actual graph acyclic.
+  Validate that graph before implementing the namespace migration (6.3).
 * **Cross-cutting classes have no domain.** `Eq`, `Hash` and `Add` belong to
   everything. Rust's answer is to invent a domain per trait (`cmp`, `hash`,
   `ops`).
@@ -1167,22 +1198,28 @@ and Rust both put it with the container. `sum` is a `Foldable` method in
 `Data.Foldable`; `Iterator::sum` is a method, and its helper trait `Sum` lives
 in `std::iter`. The tie-breaker that fits both: **a function lives with the
 protocol whose structure it walks**, and classes it uses only on the elements
-are incidental. So `sum`, `min`, `zip` and the adapters are in
-`Protocol.Iterable` -- which is Turkey's `Foldable` (4.12), so this is
-Haskell's placement exactly -- and `hash` is in `Protocol.Hash`. When a function's
+are incidental. Consumers such as `sum`, `min` and `foldMap` therefore live
+in `Protocol.Iterable`, and `hash` in `Protocol.Hash`. Adapters such as `zip`
+and `filter` construct the concrete iterator type and live in `Data.Iterator`
+(6.5). This is a placement rule with an explicit adapter distinction. When a
+function's
 substance is a procedure rather than a traversal -- search, sorting,
 components -- it goes in `Algorithm.*` (4.2).
 
 `sum` also exposes a gap: it needs a zero. `Add` has none, and `Monoid Int`
 cannot choose between `+` and `*`. Rust's answer is a `Sum` trait. Haskell's is
 `Num`, and Turkey split `Num` into per-operator classes on purpose (7.2).
+The preference is an additive-identity class if generic numeric reductions
+are retained. An explicitly seeded reduction is already `fold`; multiplication
+needs its own identity, rather than an ambiguous `Monoid Int` instance.
 
 **What it settles.**
 
 * `Monad` is `Protocol.Monad`, beside `Protocol.Functor` and
   `Protocol.Applicative`. `Control` is not needed.
-* Graphs get petgraph's three-way split: the class is `Protocol.Graph`,
-  representations are `Data.Graph.*`, and algorithms are `Algorithm.Search`.
+* If the graph experiment supports a class, it lives in `Protocol.Graph`,
+  representations in `Data.Graph.*`, and algorithms in `Algorithm.Search`.
+  The class remains provisional; successor-function entry points are required.
 * Where a type can do an algorithm in place or better, it keeps its own API
   (`Array.sort`); the generic version stays in `Algorithm.*`.
 * Instances stay where the owner rule puts them: `Iterable (Option a)` is in
@@ -1213,11 +1250,45 @@ a name with a `lib/` module turns that into a compile error. The
 alternative is renaming boot to `Turkey.Compiler.*`, as GHC 9.0 renamed its
 compiler: a sed over 40 files and 287 import lines.
 
+**Proposed declaration dependencies** (arrows mean "imports"; names below
+are proposed modules, not existing files):
+
+```text
+Turkey.Internal.Iteration -> Turkey.Internal.Option.Type,
+                             Turkey.Internal.Functor,
+                             Turkey.Internal.Applicative,
+                             Turkey.Internal.Monad
+Protocol.Iterable -> Turkey.Internal.Iteration
+Data.Iterator     -> Protocol.Iterable, Turkey.Internal.Iteration
+Data.Array        -> Protocol.Iterable, Turkey.Internal.Array.Type
+```
+
+`Turkey.Internal.Iteration` declares both `Iterator` and `Iterable`, along
+with the iterator's instances and low-level pull operations. Keeping the two
+declarations together avoids a cycle while respecting instance ownership.
+Consumers in `Protocol.Iterable` use low-level operations without importing
+`Data.Iterator` back. Public protocol and type facades re-export the respective
+declarations; a facade re-export does not transfer ownership.
+
+This graph is a design sketch, not a verified module layout. Compile a minimal
+multi-module example with the real owner rule, export lists, instance loading,
+and both compilers before renaming the library. Public facade modules may
+re-export declarations, but must not introduce return dependencies.
+
 ### 6.4 `Algorithm.*`
 
-Classes for structure, arguments for the query (4.2). `Algorithm.Search`
+Implicit successors are required; classes for structure remain provisional
+(4.2). `Algorithm.Search`
 re-exports `Algorithm.Search.Bfs`, `.Dijkstra` and `.AStar`. The graph class's
-shape is found by experiment (7.4).
+shape, and whether it earns its place, are found by experiment (7.9).
+Keep a convenient successor-function entry point even if a class supports it.
+
+Before shipping, specify nonnegative costs for Dijkstra, cost-overflow behavior,
+A* heuristic requirements and reopening, and deterministic heap ties without
+an `Ord` constraint on nodes. Separate distance-only queries, one reconstructed
+path, and predecessor sets. Enumerating all shortest paths can be exponential;
+zero-cost cycles require a definition of simple paths versus walks. Enumeration
+is deferred until its termination and resource behavior are defined.
 
 ### 6.5 Iteration
 
@@ -1226,8 +1297,14 @@ One concrete iterator type (4.13).
 * **`Data.Iterator`**: `type Iterator a`, with its state hidden -- a closure
   now, an existential later, behind the same public type. It is a `Functor`,
   `Applicative` and `Monad`. The adapters (`take`, `filter`, `zip`,
-  `enumerate`, `memoize`) are its functions: they accept any `Iterable` and
-  answer an `Iterator`. An iterator is ephemeral -- a stream.
+  `enumerate`) are its functions: they accept any `Iterable` and
+  answer an `Iterator`. An iterator is ephemeral -- a stream. Its constructor
+  stays private; a public factory accepts a pull closure for custom sources.
+* **`Data.Memoized`** (P2): `memoize` accepts an iterable and returns a
+  `Memoized a`, sharing one source and cache. Each `iterate` creates a fresh
+  cursor starting at the cache beginning and extends it on demand. This
+  replays results without rerunning source effects. Retaining the memoized
+  value retains its cached prefix, potentially without bound.
 * **`Protocol.Iterable`**: `class Iterable c { type Elem c; fun iterate(c) ->
   Iterator (Elem c) }`, with `instance Iterable (Iterator a)` answering itself.
   The consumers (`sum`, `min`, `any`, `foldMap`) live here. `Foldable` is
@@ -1245,9 +1322,60 @@ One concrete iterator type (4.13).
 
 Generators are `Data.Generator` (4.9.1): a monadic `Body a r` with `yield`,
 `yieldFrom` and `delegate`, and an iterable `Gen a r` reachable only through
-`generator(fun() { ... })`, with neither constructor exported. The library
-is designed for the code it wants written; where the backend does not yet
-compile that code well, that is a backend finding to fix separately.
+`generator(fun() { ... })`, with neither constructor exported. Each iteration
+reruns the body with fresh local state, while captured values remain shared.
+The monadic laws assume pure callbacks and unaliased consumed state; the
+language does not enforce those conditions. Performance must satisfy 6.5.2.
+
+#### 6.5.1 Proposed consumption contract
+
+These are proposed API requirements, not claims about the prototypes:
+
+* **Permanent exhaustion:** after `next` returns `None`, subsequent calls
+  return `None` without calling the source again. The public pull factory
+  enforces this for custom sources.
+* **Lazy construction:** building an adapter pulls no elements and invokes no
+  element callback. Specify when it calls `iterate`; the default is on the
+  adapter's first pull, once per input.
+* **Short-circuiting:** `take(0)` never pulls; `take(n)` pulls at most `n`.
+  `any`, `all` and `find` consume the decisive element and stop immediately.
+  Collecting into `Option`/`Either` consumes the first failure and stops there.
+* **`takeWhile`:** consumes the first failing element. Callers needing that
+  delimiter afterward must use a peeking wrapper.
+* **`zip`:** pulls left first, then right, stopping at the first exhausted
+  input. If right ends first, one unmatched left element has been consumed.
+  Permanent exhaustion prevents further advancement after that point.
+* **Shared cursors:** `iterate(it)` returns `it`; several consumers advance
+  the same position. Breaking a loop preserves the remaining cursor.
+* **Mutable containers:** mutation during iteration is outside the supported
+  contract initially. The implementation must still preserve memory safety;
+  snapshot or mutation-detection semantics can be added explicitly later.
+* **Combinatorics:** each adapter must document which inputs it buffers or
+  re-iterates, its finite-input requirements, and retained memory. Accepting
+  `Iterable` does not imply that an input supports independent traversals.
+
+Specify boundary cases too: empty `min`/`max` return `Option`, range endpoints
+are exclusive, zero range steps are errors, and negative counts or nonpositive
+window/chunk sizes are rejected. Numeric overflow follows `Int`'s trapping
+contract. Tests must observe residual input and callback effects, not only the
+values returned by the adapter.
+
+#### 6.5.2 Acceptance evidence
+
+Before accepting the iteration representation, compare direct loops against
+`map`/`filter`/`fold`, nested `flatMap`, early termination, and graph-successor
+iteration on the native backend. Report execution separately from compilation,
+plus allocations and peak memory where instrumentation permits; explicitly
+label unavailable measurements. Include generator delegation depth and long
+left-associated binds. Establish acceptable costs from representative solution
+runtimes before adding optimization work; a prototype result alone is not a
+fusion or complexity guarantee.
+
+The delivery milestone is several complete AoC solutions on both compiler
+implementations, including ordinary parsing/aggregation, a grid search and a
+stateful weighted search. Check known answers, failure diagnostics, residual
+iterator state, runtime and memory. Preserve source programs and exact commands
+so these checks can be repeated after compiler changes.
 
 ### 6.6 Batteries included
 
@@ -1278,20 +1406,21 @@ Protocol.{Semigroup,Monoid,Index,Length}
 Protocol.Iterable               -- plus sum, min, any, foldMap (P0)
 Protocol.Collect                -- collect; Option/Either instances are traverse (P0)
 Protocol.{Functor,Applicative,Monad}
-Protocol.Graph                  -- P1
+Protocol.Graph                  -- provisional, P1 experiment
 Data.{Bool,Byte,Char,Int,Float,Option,Either,Ordering,Tuple}
 Data.{String,Array,Map,Set}
 Data.Iterator                   -- the one iterator type; Functor/Monad; adapters (P0)
-Data.Generator                  -- P1
+Data.Generator                  -- P2
+Data.Memoized                   -- replayable cache with fresh cursors (P2)
 Data.{Deque,Heap}               -- P1
 Data.{Point,Grid}               -- P1
 Data.Graph.*                    -- representations, when needed
 Data.Rational                   -- P2
 Algorithm.Hash
-Algorithm.Search                -- re-exports .Bfs .Dijkstra .AStar (P1)
+Algorithm.Search                -- .Bfs .Dijkstra (P1), .AStar (P2)
 Algorithm.Memo                  -- P1
 Algorithm.Components            -- P2
-System.IO                       -- plus stdin (P0)
+System.IO                       -- readFile suffices for P0; stdin when needed
 System.Env                      -- plus environment variables
 Time, Text                      -- planned
 ```
@@ -1302,18 +1431,19 @@ Time, Text                      -- planned
 
 1. **The derived-function rule.** "With the protocol whose structure it walks"
    (6.2) is a proposal, not a decision.
-2. **A zero for `sum`.** A `Sum`-like class, a `Zero` class, or a `sum` that
-   takes its initial value?
+2. **Numeric identities.** Prefer an additive-identity class for generic
+   `sum`; settle its laws and the multiplicative identity for `product`.
+   Explicit initial values are served by `fold`.
 3. **Collectors as values.** Java's `Collectors` or Haskell's `foldl` `Fold` as
    a `Data` type beside `collect`, for `groupBy`, `counts` and one-pass
    aggregates.
-4. **The iterator's representation.** A closure now. When existentials arrive:
-   mutable state (a shared cursor) or immutable `next : fun(s) -> Option (a,
-   s)`; and whether the constructor is exported at all.
+4. **The iterator's representation.** A closure now, with a private constructor
+   and public pull factory. Future existentials must preserve shared-cursor
+   semantics, even if the hidden step function uses immutable state.
 5. **Capabilities on one type.** Size hints, peeking, reverse iteration: fields
    or wrappers (4.13).
-6. **The comprehension gotcha.** Accept Python's behaviour, or detect reuse, as
-   OCaml's `Seq.once` does?
+6. **The comprehension gotcha.** Shared-cursor behavior is intentional. Can
+   optional diagnostics catch accidental reuse without rejecting valid resumption?
 7. **`for` over `Iterable`**, in both implementations.
 8. **The checker gap left.** A family application in a record field type is
    still rejected at `prim-types-rebased` ("unknown type 'Iterable.Iter'").
@@ -1322,7 +1452,8 @@ Time, Text                      -- planned
 9. **The graph class.** Write 2023/17, 2024/16 and 2025/08 against two or three
    candidate shapes -- `Int` costs; a `Cost g` family; separate `Graph` and
    `Weighted` classes; successors as an `Array` or an `Iterator` -- and compare
-   the programs and their run time on the native backend.
+   the programs and their run time on the native backend. Include a function-only
+   API as a baseline; a class is an outcome to justify, not a prerequisite.
 10. **Generator syntax.** The trailing `done()` after a loop, which is the
     no-auto-`pure` rule (design.md 6.9). With discarded values an error (`f794a62`),
     a discarding spelling for binds that answer a value (`let _ =`, `void`, or a
@@ -1333,3 +1464,7 @@ Time, Text                      -- planned
     `grid[y][x]`.
 13. **What the Prelude re-exports.** FINDINGS 24 asks for a rule.
 14. **Primitive budget.** `stdin` and `Float.sqrt`; an environment read.
+15. **Integration evidence.** Preserve the corpus-analysis script, input revision,
+    prototype sources and benchmark commands alongside the document. Recheck
+    numeric intermediate bounds, not only literals. Complete the dependency
+    experiment in 6.3 and acceptance measurements in 6.5.2.

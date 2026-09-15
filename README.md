@@ -23,7 +23,7 @@ strong enough to support reusable abstractions.
 
 Parse a few rectangles and add up their areas:
 
-```text
+```kotlin
 type Rectangle = Rectangle { width : Int, height : Int }
 
 fun parseRectangle(text) {
@@ -85,7 +85,7 @@ Use `python3 -m turkey types rectangles.gob` to inspect inferred types, or
 ## Project status
 
 Turkey is an experimental language under active development. This repository,
-`turkey-lite`, contains the Python implementation, an LLVM native backend, and
+`turkey`, contains the Python implementation, an LLVM native backend, and
 a compiler being written in Turkey itself. The standard library is written in
 Turkey over a small set of runtime primitives. A generated-Python backend and
 differential tests help check that the implementations agree.

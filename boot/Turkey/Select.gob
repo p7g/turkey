@@ -763,8 +763,61 @@ fun inlinePrim(s : Sel, d : Reg, name : String,
             emit(s, A.EorImm(d, bad, 1, A.W32))
             True
         }
+        -- A double's bit pattern and back: `Turkey.Llvm`'s `bitcast`, which on
+        -- arm64 is an `fmov` between the two files. `fmov` copies all 64 bits
+        -- and converts nothing, so the sign of a zero and a NaN's payload
+        -- survive -- which is the whole contract (PRIMITIVES.md 3.2c).
+        --
+        -- No corpus program reached these, so selection's ratchet stayed green
+        -- while three functions in the compiler's own source stopped here.
+        -- `tests/programs/float_bits.gob` is the regression.
+        "Prim.floatBits" -> {
+            let (x, _) = args[0]
+            emit(s, A.FMovOut(d, x))
+            True
+        }
+        "Prim.floatFromBits" -> {
+            let (n, _) = args[0]
+            emit(s, A.FMovIn(d, n))
+            True
+        }
+        -- `fcmp` of a value with itself is unordered exactly when it is a NaN,
+        -- and unordered is the one outcome that sets V. LLVM's `fcmp uno`.
+        "Prim.floatIsNaN" -> {
+            let (x, _) = args[0]
+            emit(s, A.FCmp(x, x))
+            emit(s, A.CSet(d, A.Vs))
+            True
+        }
+        -- In `[-2^63, 2^63)`, as `Turkey.Llvm` writes it -- but without its
+        -- separate ordered test. Both conditions here are false for a NaN:
+        -- `ge` needs N == V and an unordered compare sets V alone, and `lo`
+        -- needs C clear and an unordered compare sets C.
+        "Prim.floatFitsInt" -> {
+            let (x, _) = args[0]
+            let low = floatConstant(s, -4332462841530417152)
+            let high = floatConstant(s, 4890909195324358656)
+            emit(s, A.FCmp(x, low))
+            let atLeast = temp(s, Ssa.untraced(I1))
+            emit(s, A.CSet(atLeast, A.Ge))
+            emit(s, A.FCmp(x, high))
+            let below = temp(s, Ssa.untraced(I1))
+            emit(s, A.CSet(below, A.Lo))
+            emit(s, A.And(d, atLeast, below, A.W32))
+            True
+        }
         _ -> False
     }
+
+-- A double with the given bit pattern, in a fresh `d` register. The same
+-- sequence `ConstFloat` selects to.
+fun floatConstant(s : Sel, pattern : Int) -> Reg {
+    let bits = temp(s, Ssa.untraced(I64))
+    constant(s, bits, pattern)
+    let d = temp(s, Ssa.untraced(F64))
+    emit(s, A.FMovIn(d, bits))
+    d
+}
 
 -- One unsigned comparison against a constant, as a bit in a register.
 fun flag(s : Sel, a : Reg, n : Int, c : A.Cond) -> Reg {

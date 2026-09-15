@@ -60,6 +60,16 @@ KNOWN_REASONS = {
     "need stack arguments",
 }
 
+# What stops the colourer. There is no spiller yet, so a function whose values
+# outnumber the free registers at some point stops with this and is counted
+# rather than coloured wrongly. The same ratchet as selection's: a new reason
+# is an event, and the count below is exact so that it moving is too.
+KNOWN_COLOUR_REASONS = {
+    "a value with no free register in the general file",
+    "a value with no free register in the vector file",
+}
+COLOUR_STOPS = 10
+
 
 @functools.lru_cache(maxsize=None)
 def _all() -> dict[str, str]:
@@ -80,6 +90,28 @@ def _counts(text: str) -> tuple[int, int]:
     assert len(lines) == 1, lines
     parts = lines[0].split()
     return int(parts[2]), int(parts[4])
+
+
+def _coloured(text: str) -> tuple[int, int]:
+    lines = [line for line in text.splitlines()
+             if line.startswith("-- coloured ")]
+    assert len(lines) == 1, lines
+    parts = lines[0].split()
+    return int(parts[2]), int(parts[4])
+
+
+def _colour_reasons(text: str) -> dict[str, int]:
+    """Colouring's histogram: `-- colour  <count>  <reason>`.
+
+    A different prefix from selection's on purpose (`boot/Main.gob` says why),
+    so the two cannot be summed into each other by a parser that matched both.
+    """
+    out: dict[str, int] = {}
+    for line in text.splitlines():
+        if line.startswith("-- colour  "):
+            count, _, why = line[len("-- colour  "):].partition("  ")
+            out[why.strip()] = int(count)
+    return out
 
 
 def _reasons(text: str) -> dict[str, int]:
@@ -149,6 +181,91 @@ def test_a_nine_argument_call_is_reported_and_does_not_crash():
     assert set(reasons) <= KNOWN_REASONS, sorted(reasons)
 
 
+@pytest.mark.parametrize("name", CORPUS)
+def test_every_selected_function_colours_or_is_counted(name):
+    """The colourer's own accounting, which nothing checked until it had a gap.
+
+    Colouring runs over what selection produced, so its denominator is
+    selection's numerator -- and a function that neither colours nor appears in
+    the histogram is one the emitter would later be handed with no registers.
+    """
+    text = _asm(name)
+    coloured, total = _coloured(text)
+    selected, _ = _counts(text)
+    assert total == selected, (total, selected)
+    stopped = sum(_colour_reasons(text).values())
+    assert coloured + stopped == total, (coloured, stopped, total)
+
+
+@pytest.mark.parametrize("name", CORPUS)
+def test_no_unknown_colour_reason_appears(name):
+    found = set(_colour_reasons(_asm(name)))
+    assert found <= KNOWN_COLOUR_REASONS, sorted(found - KNOWN_COLOUR_REASONS)
+
+
+def test_the_corpus_colours_apart_from_the_known_gap():
+    """The allocation ratchet, and the one that has to reach zero.
+
+    Every stop here is a function that would need a spill or a split live
+    range. The count is exact rather than a bound: spilling lands, it goes
+    to zero, and this assertion changes with it.
+    """
+    stopped = sum(sum(_colour_reasons(_asm(name)).values()) for name in CORPUS)
+    assert stopped == COLOUR_STOPS, stopped
+
+
+def _function(text: str, name: str) -> tuple[str, list[str]]:
+    """One function's signature line and body lines from a module dump."""
+    lines = text.splitlines()
+    for at, line in enumerate(lines):
+        if line.startswith(f"fun @{name}("):
+            body = []
+            for inner in lines[at + 1:]:
+                if inner.startswith("}"):
+                    break
+                body.append(inner.strip())
+            return line, body
+    raise AssertionError(f"{name} is not in the dump")
+
+
+def test_the_float_primitives_select_without_a_call():
+    """`Prim.floatBits`, `floatFromBits`, `floatIsNaN` and `floatFitsInt`.
+
+    None has a runtime entry point, and no corpus program reached one until
+    `float_bits.gob` -- so selection's ratchet was green while three functions
+    in `boot`'s own source stopped at "the runtime function Prim.floatBits",
+    and the same program then found `Prim.floatIsNaN` missing from *both*
+    backends (FINDINGS 87).
+
+    Checked in the library wrappers, whose signatures say which file each
+    operand is in: virtual registers print as `%n`, so `fmov %2, %1` alone
+    cannot say which way the bits went, but `%1:f64 -> i64` can.
+    """
+    text = _asm("float_bits.gob")
+    assert not _reasons(text), _reasons(text)
+
+    head, body = _function(text, "Data.Float#bits")
+    assert "%1:f64" in head and head.endswith("-> i64 {"), head
+    assert "fmov %2, %1" in body, body
+
+    head, body = _function(text, "Data.Float#fromBits")
+    assert "%1:i64" in head and head.endswith("-> f64 {"), head
+    assert "fmov %2, %1" in body, body
+
+    _, body = _function(text, "Data.Float#isNaN")
+    assert "fcmp %1, %1" in body and any(
+        line.startswith("cset ") and line.endswith(", vs") for line in body), body
+
+    _, body = _function(text, "Data.Float#truncate")
+    assert sum(line.startswith("fcmp ") for line in body) >= 2, body
+    assert not any(line.startswith("bl ") and "float_fits" in line
+                   for line in body), body
+
+    # And inlined at a use, which is where `opt` would have folded a constant.
+    _, body = _function(text, "Main#patternsSurvive")
+    assert any(line.startswith("fmov ") for line in body), body
+
+
 def test_turkey_symbols_are_quoted():
     """`#` is ARM assembly's immediate prefix.
 
@@ -172,7 +289,8 @@ def test_a_double_lives_in_the_vector_file():
 
 
 @pytest.mark.skipif(shutil.which("as") is None, reason="no assembler")
-@pytest.mark.parametrize("name", ["adt.gob", "operators.gob"])
+@pytest.mark.parametrize("name", ["adt.gob", "operators.gob",
+                                  "float_bits.gob"])
 def test_the_printed_instructions_assemble(name):
     """`as` as an instruction-by-instruction oracle.
 

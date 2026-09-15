@@ -2347,6 +2347,33 @@ bootstrap compiler reading itself. It was found late because the new syntax
 was checked by compiling `boot` with Python, which is exactly the half of the
 comparison that could not fail.
 
+### 87. The selection ratchet was green while `boot` stopped at `Prim.floatBits`
+**bug, fixed.** M28. `tests/test_select.py` asserts that every corpus function
+either selects to arm64 or stops for a known reason, and the only known reason
+was stack arguments. It passed. `boot asm boot/Main.gob` meanwhile reported
+three functions stopped at "the runtime function Prim.floatBits": the primitive
+has no runtime entry point, `Select.inlinePrim` had no rule, and no corpus
+program called it anywhere `opt` did not fold it away. The rule is one `fmov`
+each way.
+
+The shape of FINDINGS 85 again, one layer down: a ratchet over the corpus
+measures the corpus, and the program M29 needs compiled is not in it. The fix
+added `float_bits.gob`, whose floats are computed at run time so that the
+primitive survives to selection -- and the test checks the `fmov`s are present,
+because a program `opt` had folded would have selected completely and proved
+nothing, which is what the first draft of `manyargs.gob` did too. Colouring had
+the same blind spot and no test at all; its histogram is ratcheted now.
+
+And the new program found the next one immediately: `Float.isNaN` stopped
+arm64 selection too, and `boot llvm` wrote `; FAILED: no rule for
+Prim.floatIsNaN` -- the *LLVM* emitter had never had the rule, though
+`turkey/llvmgen.py` had. That is FINDINGS 43's hazard in the flesh: the
+differential compares stages above Core, the two LLVM emitters are not
+diffed, and a rule present on one side only is invisible until a program
+asks. `Prim.floatFitsInt` was the last primitive with an LLVM rule and no
+arm64 one, found by listing both tables side by side, which is the check to
+repeat before calling selection complete.
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

@@ -902,7 +902,8 @@ class _Devirtualizer:
         self.used.add(made)
         self.state.derive(made, owner.name)
         self.hoisted.append(CBind(made, inner.ty, binders, inner, owner.span,
-                                  False, owner.module))
+                                  False, owner.module,
+                                  equations=list(owner.equations)))
         return made
 
     def abstraction(self, owner: CBind, name: str,

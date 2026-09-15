@@ -51,7 +51,7 @@ from .evidence import Abstraction, InstancePlan, MethodImpl, Use, dict_name
 from .errors import Span, TypeError_
 from .typed import TypeTable
 from .types import (
-    BOOL, BOTTOM, CHAR, FLOAT, INT, STRING, UNIT, Pred, Scheme, TBottom, TFam,
+    BOOL, BOTTOM, CHAR, EQUALS, FLOAT, INT, STRING, UNIT, Pred, Scheme, TBottom, TFam,
     TFun, TSet, TTuple, TVar, Type, apply, array_of, float_literal_set,
     int_literal_set, show, show_pred, vars_of,
 )
@@ -331,12 +331,16 @@ class Generator:
         # context. The two are given to the body for different reasons and
         # arrive by different routes: the first is the dictionary the body
         # belongs to, the rest are parameters of every call.
+        # An equality in that context is a given too, and not a parameter: it
+        # has no evidence, so only the class predicates are named as
+        # dictionaries (`MethodInfo.dict_preds`), as `check_signature` does.
         own = [skolems.apply_pred(p) for p in method.scheme.preds[1:]]
         self_name = self_name if self_name is not None else dict_name(method.cls)
-        params = [dict_name(p.name) for p in own]
+        names = [dict_name(p.name) for p in own]
+        params = [n for n, p in zip(names, own) if p.name != EQUALS]
         givens = (
             [(self_name, skolems.apply_pred(method.scheme.preds[0]))]
-            + list(zip(params, own))
+            + list(zip(names, own))
             + list(zip(context_names, context))
         )
 

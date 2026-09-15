@@ -83,7 +83,13 @@ fun resolve(classes : ClassTable, p : Pred, scopes : Array Scope,
     -- Normalized, not merely pruned: `Show (Elem (Array Int))` names an instance
     -- only once the family has been reduced. This is the last place a family can
     -- appear -- evidence is over types, and a family is not one until it is.
-    let target = Classes.normalize(classes, p.args[0])
+    -- Under the givens in scope, as the solver's discharge is: a predicate a
+    -- given equality let solving accept has to be proved under it too.
+    let givens = Array.new(8)
+    for scope in scopes {
+        for (_, g) in scope.givens { Array.push(givens, g) }
+    }
+    let target = Classes.normalizeUnder(classes, p.args[0], givens)
     match target {
         TBottom -> return Absent(p.name)
         _ -> {}

@@ -255,6 +255,66 @@ go(z : k)` inside a body whose signature also says `k`, is a fresh rigid `k` by
 delta 13's scoping -- reported as `expected k, found k`, which is correct and
 unreadable.
 
+### 84. A method's own equality was not a given to anything but unification
+**bug, fixed.** Found writing a `Collect` class whose method is
+`collect[Iterable s, Stream (Iter s), Elem (Iter s) ~ Part c](s) -> c`: the
+`Set a` instance, which needs `Hash a`, was told it could not determine a type
+satisfying `Hash (Stream.Elem (Iterable.Iter s))`. Not a restriction -- the
+equality is in the signature precisely so that instances can use it -- and not
+one bug but three, each hiding the next.
+
+The minimal program for the first is a one-method class
+`collect[Stream s, Elem s ~ Part c](s) -> c` and an instance
+`Collect (Option a) : Eq a` whose body calls a function needing `Eq` on
+`next(s)`. The same body as a top-level `fun` with an annotated parameter works.
+
+**Discharge did not read the givens.** Entry 47 found that entailment was four
+relations rather than one and moved the *wanted* rules to `ClassTable` so all
+four could see them. The *given* equalities stayed on the solver, read only by
+`Solver.reduce` -- unification's reducer. `_class`, `granted`, `_one_of`, the
+retry in `_equals`, and `evidence.resolve` all normalized through `ClassTable`
+alone. That is invisible whenever unification meets the family after the
+given's argument is known, because unification rewrites it in place; a method
+body is inferred first and meets its signature last, so `next(s)` is
+`Elem i` over a *variable*, bound into `Eq t` as the family application, and by
+the time `i` is the skolem `s` nothing that looks at `Eq t` asks the givens.
+The equation form of the same thing is the report's second symptom: `Some(None)`
+defers `Elem i ~ Option t`, and its retry could not see `Elem s ~ Part (Option
+c)`. Now `ClassTable.normalize_under(t, givens)` is the one reducer for
+discharge, `Solver.discharging` passes it the assumptions, `_equals` retries
+with the solver's own reducer (givens, no wanted rules), and `evidence.resolve`
+passes the equalities in its scopes -- they were already there, since
+`check_method` lists every given.
+
+**The lowering took the equality for a dictionary.** `check_method` named a
+dictionary parameter per predicate of the method's own context, `~` included,
+and the lowering built a `%Dict.~` for it: `KeyError: '~'`. The report's
+`instance Collect (Array a)` "type-checks" only because it never got further.
+`check_signature` already made the split -- every predicate a given, only class
+predicates passed -- and `MethodInfo.dict_preds` is that split for methods.
+Core then needed the equalities where it keeps them, on a `CBind`: the instance
+dictionary, the default method, and the binding `mono`'s devirtualizer hoists a
+field into all carry the method's own equalities now.
+
+**A wanted rule over a skolem fired in a sibling body.** The test program's
+default method `Sink.pushAll[..., Elem (Iter s) ~ Item c]` was checked by Core
+against `Option (Part b)` -- the answer the `Option` instance's body had
+deferred for *its* `Elem (Iter s)`. Entry 47's argument that a flat rule list is
+sound was "a rule names particular type variables, so no other binding mentions
+them". It names a variable when it is taught, and the variable is then bound to
+a skolem; `type_key` keyed a constructor by name, and skolem names are unique
+only within one scope (`boot` added the level, which `solve_let` lifts when the
+scope ends). Two signatures that each write `s` shared every rule about it. A
+skolem now carries a `uid`, part of its key and nothing else. Retiring a rule
+once its equation is proved was tried first and is wrong: exhaustiveness reads
+the scrutinee after solving, and the rule is the only thing left there that
+says `Elem (Iter s)` is an `Option`.
+
+`boot` had all three identically, and `test_boot` could not have said so: a
+stage that raises is a stage the oracle compares nothing about (the CLAUDE.md
+caveat, entry 43). `tests/programs/method_given_family.tl` covers the report,
+the `Option` instance, the unconstrained `Array` instance and a default body.
+
 ---
 
 ## Open, and accepted

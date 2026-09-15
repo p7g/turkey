@@ -330,6 +330,26 @@ fun instanceBind(l : Lowerer, inst : InstInfo) -> CBind {
     let b = newBind(instName(inst), value.ty, instanceBinders(inst), value,
                     Some(inst.decl.span))
     b.module_ = inst.module_
+    -- A method's own equalities, at this head. A binding is where Core keeps the
+    -- equalities a body was checked under, and a method body is a field of this
+    -- one; `Elem s ~ Part (Option a)` names the method's own `s`, so it cannot
+    -- fire in a sibling. FINDINGS 84.
+    let info = classNamed(l, inst.cls)
+    for (name, impl) in Map.entries(plan.methods) {
+        if !isDefaultOf(info, name, impl) {
+            match Map.get(info.methods, name) {
+                Some(mi) -> {
+                    let mapping = Map.new()
+                    Map.put(mapping, mi.classVar.id, inst.head)
+                    for (a, rt) in equationsOf(Some(mi.scheme)) {
+                        Array.push(b.equations, (Decls.substitute(a, mapping),
+                                                 Decls.substitute(rt, mapping)))
+                    }
+                }
+                None -> {}
+            }
+        }
+    }
     b
 }
 
@@ -424,7 +444,7 @@ fun methodType(l : Lowerer, info : MethodInfo, head : Ty.Type) -> Ty.Type {
     let mapping = Map.new()
     Map.put(mapping, info.classVar.id, head)
     let ty = Decls.substitute(info.scheme.body, mapping)
-    let own = Array.slice(info.scheme.preds, 1, len(info.scheme.preds))
+    let own = Classes.methodDicts(info)
     if len(own) == 0 { return ty }
     TFun(Array.map(own, fun(p) =
         dictType(l, p.name, Decls.substitute(p.args[0], mapping))), ty)
@@ -452,8 +472,7 @@ fun defaultMethod(l : Lowerer, cls : String, name : String,
     let saved = setSkolems(l, impl, mi, [cvar])
     var body = function(l, impl.decl, mi.scheme.body, newScope(),
                         Some(impl.dictParams),
-                        Some(Array.slice(mi.scheme.preds, 1,
-                                         len(mi.scheme.preds))))
+                        Some(Classes.methodDicts(mi)))
     l.rigid = saved
     body = methodAbstraction(mi, body, Some(impl.decl.span))
     let lam = node(TFun([selfTy], body.ty), Some(impl.decl.span),
@@ -462,6 +481,7 @@ fun defaultMethod(l : Lowerer, cls : String, name : String,
     let b = newBind(defaultName(cls, name), lam.ty, [cvar], lam,
                     Some(impl.decl.span))
     b.module_ = info.module_
+    b.equations = equationsOf(Some(mi.scheme))
     b
 }
 
@@ -499,8 +519,7 @@ fun methodBody(l : Lowerer, inst : InstInfo, name : String, impl : MethodImpl,
     let ty = Decls.substitute(mi.scheme.body, mapping)
     let saved = setSkolems(l, impl, mi, Ty.varsOf([inst.head]))
     var body = function(l, impl.decl, ty, newScope(), Some(impl.dictParams),
-                        Some(Array.slice(mi.scheme.preds, 1,
-                                         len(mi.scheme.preds))))
+                        Some(Classes.methodDicts(mi)))
     l.rigid = saved
     if impl.selfName != "" {
         body = bindSelf(l, inst, params, impl.selfName, body,

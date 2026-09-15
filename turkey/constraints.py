@@ -78,7 +78,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .classes import (ClassTable, field_family_owner, generated_index,
+from .classes import (ClassTable, field_family_owner, generated_index, given_rule,
                       generated_label, is_generated)
 from .decls import DeclTable
 from .evidence import Abstraction, Scope, Use, dict_name
@@ -87,7 +87,7 @@ from .typed import reduce_deep
 from .types import (
     EQUALS, INT, NO_SCOPE, Pred, Scheme, TBottom, TCon, TFam, TSet, TTuple, TVar,
     Type,
-    generalize, instantiate_qual, mono, numeric_order, numeric_type, prune, show,
+    generalize, instantiate_qual, mono, normalize, numeric_order, numeric_type, prune, show,
     short_name, show_pred, sort_numeric, spine, type_key, unify, vars_of,
 )
 
@@ -342,12 +342,9 @@ class Solver:
         application on the left and does not mention it on the right, so a
         family over a given skolem has one rule and rewriting terminates.
         """
-        key = type_key(t)
-        for pred in self.assumptions:
-            # Reflexive rules are skipped, not returned; see `coretc.Fams`.
-            if (pred.name == EQUALS and type_key(pred.args[0]) == key
-                    and type_key(pred.args[1]) != key):
-                return pred.args[1]
+        given = given_rule(t, self.assumptions)
+        if given is not None:
+            return given
         # Without the wanted rules. This reducer is what `unify` calls, and a
         # unification is irreversible: reducing `Container.Elem a` to `Int` by
         # an equation nobody has proved yet *binds* a variable to `Int`, and
@@ -355,6 +352,17 @@ class Solver:
         # it. The rules answer whether a predicate can be discharged, which
         # `_class` asks explicitly; they do not decide what a type is.
         return self.classes.settled_fam(t)
+
+    def discharging(self, t: Type) -> Type:
+        """`t` normalized for discharging a predicate over it.
+
+        Everything `reduce` consults and the wanted rules besides. The givens
+        are not optional here: a type that reached the predicate through a
+        variable bound before a given could rewrite it is still the family
+        application, and only the given says what it is. See
+        `ClassTable.normalize_under`, which the elaborator uses too.
+        """
+        return self.classes.normalize_under(t, self.assumptions)
 
     def defer(self, a: Type, b: Type, span: Span | None, context: str) -> None:
         """Take an equation unification could not decide.
@@ -747,9 +755,12 @@ class Solver:
         and hand it to the caller. Anything else is an ordinary unification.
         """
         # Without the wanted rules: an equation proved by a rule it supplied is
-        # proved by itself. See `ClassTable.settled`.
-        left = self.classes.settled(c.pred.args[0])
-        right = self.classes.settled(c.pred.args[1])
+        # proved by itself. See `ClassTable.settled`. With the givens, though,
+        # which is what `self` adds: the equation may have been deferred while
+        # its family's argument was a variable, and a given decides it now --
+        # `Elem s ~ Option a` under `Elem s ~ Part (Option c)`. FINDINGS 84.
+        left = normalize(c.pred.args[0], self)
+        right = normalize(c.pred.args[1], self)
         c.pred.args = [left, right]
         if type_key(left) == type_key(right):
             return True
@@ -765,9 +776,9 @@ class Solver:
         assumption is written down and a demand is discovered, and the two may
         name the same type by different routes.
         """
-        key = Pred(pred.name, [self.classes.normalize(pred.args[0])]).key()
+        key = Pred(pred.name, [self.discharging(pred.args[0])]).key()
         return any(
-            Pred(q.name, [self.classes.normalize(q.args[0])]).key() == key
+            Pred(q.name, [self.discharging(q.args[0])]).key() == key
             for a in self.assumptions for q in self.classes.by_super(a)
         )
 
@@ -785,7 +796,7 @@ class Solver:
         # binding retains the equation so every caller proves it. Asking
         # without them leaves the predicate stuck and rides it into the scheme
         # -- three of them, in `bf.tl`'s `move`. See FINDINGS 47.
-        t = self.classes.normalize(c.pred.args[0])
+        t = self.discharging(c.pred.args[0])
         if isinstance(t, TBottom):
             return True  # absorbed; there is no value to find a method for
         pred = Pred(c.pred.name, [t])
@@ -879,7 +890,7 @@ class Solver:
             unify(prune(t), numeric_type(next(iter(names))), c.span, c.context, self)
             return True
 
-        t = self.classes.normalize(t)
+        t = self.discharging(t)
         if isinstance(t, TBottom):
             return True  # absorbed; there is no value to represent
         if isinstance(t, (TVar, TFam)):

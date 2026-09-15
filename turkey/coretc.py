@@ -342,7 +342,7 @@ class Checker:
         """
         mapping = {method.class_var.id: head}
         ty = substitute(method.scheme.body, mapping)
-        own = method.scheme.preds[1:]
+        own = method.dict_preds
         if not own:
             return ty
         return TFun([self.dict_type(p.name, substitute(p.args[0], mapping))

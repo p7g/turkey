@@ -1066,7 +1066,8 @@ fun hoist(d : Devirt, owner : CBind, name : String,
     Array.push(d.hoisted, CBind {
         name = made, ty = inner.ty, binders = binders, value = inner,
         span = owner.span, mutable = False, module_ = owner.module_,
-        equations = Array.new(0), layouts = Map.new(),
+        equations = Array.slice(owner.equations, 0, len(owner.equations)),
+        layouts = Map.new(),
     })
     Some(made)
 }

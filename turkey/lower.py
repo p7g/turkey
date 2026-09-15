@@ -312,8 +312,21 @@ class Lowerer:
                       for p, pred in zip(plan.params, inst.context)]
             value = CLam(TFun([p.ty for p in params], result), inst.decl.span,
                          params, record, inst_name(inst))
+        # A method's own equalities, at this head. A binding is where Core
+        # keeps the equalities a body was checked under, and a method body is
+        # a field of this one; `Elem s ~ Part (Option a)` names the method's
+        # own `s`, so it cannot fire in a sibling. FINDINGS 84.
+        info = self.classes.classes[inst.cls]
+        equations = [
+            (substitute(a, {info.methods[name].class_var.id: inst.head}),
+             substitute(b, {info.methods[name].class_var.id: inst.head}))
+            for name, impl in plan.methods.items()
+            if impl is not info.defaults.get(name)
+            for a, b in self.equations(info.methods[name].scheme)
+        ]
         return CBind(inst_name(inst), value.ty, self.instance_binders(inst),
-                     value, inst.decl.span, module=inst.module)
+                     value, inst.decl.span, module=inst.module,
+                     equations=equations)
 
     def accessors(self, inst: InstInfo, result: Type) -> CBind:
         """The dictionary of a generated field or projection class.
@@ -383,7 +396,7 @@ class Lowerer:
         """
         mapping = {info.class_var.id: head}
         ty = substitute(info.scheme.body, mapping)
-        own = info.scheme.preds[1:]
+        own = info.dict_preds
         if not own:
             return ty
         return TFun([self.dict_type(p.name, substitute(p.args[0], mapping))
@@ -411,13 +424,14 @@ class Lowerer:
         with self.skolems_of(impl, method_info, [var]):
             body = self.function(impl.decl, method_info.scheme.body,
                                  Scope(set()), dict_params=impl.dict_params,
-                                 preds=method_info.scheme.preds[1:])
+                                 preds=method_info.dict_preds)
         body = self.method_abstraction(method_info, body, impl.decl.span)
         lam = CLam(TFun([self_ty], body.ty), impl.decl.span,
                    [CParam(impl.self_name, self_ty)], body,
                    self.default_name(cls, name))
         return CBind(self.default_name(cls, name), lam.ty, [var], lam,
-                     impl.decl.span, module=info.module)
+                     impl.decl.span, module=info.module,
+                     equations=self.equations(method_info.scheme))
 
     def method(self, inst: InstInfo, name: str, impl: MethodImpl,
                params: list[str]) -> CExpr:
@@ -453,7 +467,7 @@ class Lowerer:
         with self.skolems_of(impl, method_info, _free_vars(inst.head)):
             body = self.function(impl.decl, ty, Scope(set()),
                                  dict_params=impl.dict_params,
-                                 preds=method_info.scheme.preds[1:])
+                                 preds=method_info.dict_preds)
         if impl.self_name:
             body = self.bind_self(inst, params, impl.self_name, body,
                                   impl.decl.span)

@@ -152,6 +152,16 @@ class MethodInfo:
     def has_default(self) -> bool:
         return self.decl.body is not None
 
+    @property
+    def dict_preds(self) -> list[Pred]:
+        """The method's own context that arrives as dictionaries, per call.
+
+        Its class predicates, in order. A written equality is a fact the body
+        may use and a caller must prove, but it has no evidence, so it is not
+        a parameter -- the same split `check_signature` makes for a `fun`.
+        """
+        return [p for p in self.scheme.preds[1:] if p.name != EQUALS]
+
 
 @dataclass
 class ClassInfo:
@@ -235,7 +245,9 @@ class ClassTable:
         # A rule names particular type *variables*, and `type_key` prunes, so
         # one binding's rule cannot fire inside another: no other binding
         # mentions its variables. That is what makes a flat list correct where
-        # a scope stack would be needed for anything else.
+        # a scope stack would be needed for anything else. A variable bound to
+        # a *skolem* keeps the property only because a skolem's key carries
+        # its `uid`: by name, two signatures' `s` were one (FINDINGS 84).
         self.rules: list[tuple[Type, Type]] = []
         # Turned off while an equation is being retried. A wanted equality may
         # rewrite *other* constraints and must never discharge itself: reducing
@@ -665,9 +677,26 @@ class ClassTable:
 
     def normalize(self, t: Type) -> Type:
         """Reduce family applications at the head of `t` until one sticks."""
+        return self.normalize_under(t, [])
+
+    def normalize_under(self, t: Type, givens: list[Pred]) -> Type:
+        """`normalize`, with the given equalities among `givens` consulted first.
+
+        For a predicate being discharged, and for the evidence that proves it.
+        Unification's reducer, `Solver.reduce`, always read the givens; these
+        two did not, so a class predicate over a family application that only a
+        given decides was stuck -- whenever the family had reached it through a
+        variable bound before the given could apply. An instance method whose
+        own context says `Elem s ~ Part c` is that case: its body is inferred
+        first and meets the signature last. The two have to read the same
+        givens or solving accepts what elaboration cannot prove (FINDINGS 47,
+        and 84).
+        """
         t = prune(t)
         while isinstance(t, TFam):
-            reduced = self.reduce_fam(t)
+            reduced = given_rule(t, givens)
+            if reduced is None:
+                reduced = self.reduce_fam(t)
             if reduced is None:
                 return t
             t = prune(reduced)
@@ -1029,6 +1058,21 @@ def _surface_member(name: str) -> str:
     return name.rpartition(".")[2].rpartition("#")[2] or name
 
 
+def given_rule(t: TFam, givens: list[Pred]) -> Type | None:
+    """What a given equality among `givens` says `t` is, if one names it.
+
+    A given `Item c ~ Op` is a reduction rule for the family it names. A
+    reflexive one is skipped rather than returned, so the instance table still
+    gets its turn -- see `coretc.Fams`.
+    """
+    key = type_key(t)
+    for pred in givens:
+        if (pred.name == EQUALS and type_key(pred.args[0]) == key
+                and type_key(pred.args[1]) != key):
+            return pred.args[1]
+    return None
+
+
 def match(pattern: Type, target: Type) -> dict[int, Type] | None:
     """One-way matching: bind `pattern`'s variables so it becomes `target`.
 
@@ -1083,7 +1127,7 @@ class Skolems:
             n += 1
             candidate = f"{name}{n}"
         self.used.add(candidate)
-        con = TCon(candidate, kind_of(var))
+        con = TCon.skolem(candidate, kind_of(var))
         self.mapping[var.id] = con
         self.made.append(con)
         return con

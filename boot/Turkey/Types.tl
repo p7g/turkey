@@ -1,7 +1,7 @@
 module Turkey.Types (
     Kind(..), KCell(..),
     kstar, kvar, kprune, unifyKinds, defaultKind, kindArrow, showKind,
-    VarCell(..), ConCell(..), Type(..), Fresh, tcon,
+    VarCell(..), ConCell(..), Type(..), Fresh, tcon, skolemCon,
     noScope, ground, equals,
     newVar, freshVar, tvar,
     shortName, qualify, qualifyAll, clearQualified, display,
@@ -190,6 +190,11 @@ type ConCell = ConCell {
     name  : String,
     kind  : Kind,
     level : Int,
+    -- 0 for a real constructor and unique to each *skolem*. A skolem's name is
+    -- unique only within its scope and its level is lifted when the scope ends,
+    -- so by name and level two signatures' `s` are one type -- and a wanted
+    -- rule over one fired inside the other (FINDINGS 84).
+    uid   : Int,
 }
 
 type Type
@@ -255,9 +260,10 @@ let equals = "~"
 type Counters = Counters {
     kind : Int,
     tyvar : Int,
+    skolem : Int,
 }
 
-let counters = Counters { kind = 0, tyvar = 0 }
+let counters = Counters { kind = 0, tyvar = 0, skolem = 0 }
 
 fun newVar(level : Int, kind : Kind) -> VarCell {
     counters.tyvar = counters.tyvar + 1
@@ -269,7 +275,14 @@ fun freshVar(level : Int) -> VarCell = newVar(level, kvar())
 fun tvar(level : Int) -> Type = TVar(freshVar(level))
 
 fun tcon(name : String, kind : Kind, level : Int) -> Type =
-    TCon(ConCell { name = name, kind = kind, level = level })
+    TCon(ConCell { name = name, kind = kind, level = level, uid = 0 })
+
+-- A fresh skolem's cell: rigid, and a type distinct from every other skolem's
+-- whatever it is called.
+fun skolemCon(name : String, kind : Kind) -> ConCell {
+    counters.skolem = counters.skolem + 1
+    ConCell { name = name, kind = kind, level = noScope, uid = counters.skolem }
+}
 
 -- -- names --------------------------------------------------------------------------
 
@@ -978,6 +991,7 @@ fun sameType(a : Type, b : Type) -> Bool {
     match (x, y) {
         (TVar(c1), TVar(c2)) -> c1.id == c2.id
         (TCon(c1), TCon(c2)) -> c1.name == c2.name && c1.level == c2.level
+                                && c1.uid == c2.uid
         (TApp(f1, a1, _), TApp(f2, a2, _)) -> sameType(f1, f2) && sameType(a1, a2)
         (TFam(n1, a1, _), TFam(n2, a2, _)) -> n1 == n2 && sameType(a1, a2)
         (TFun(p1, r1), TFun(p2, r2)) -> sameTypes(p1, p2) && sameType(r1, r2)
@@ -1024,6 +1038,10 @@ fun typeKeyInto(b : String.Builder, t : Type) -> Unit = match prune(t) {
         String.push(b, c.name)
         String.push(b, "@")
         String.push(b, Int.toString(c.level))
+        if c.uid != 0 {
+            String.push(b, "#")
+            String.push(b, Int.toString(c.uid))
+        }
     }
     TApp(fn, arg, _) -> {
         String.push(b, "(a ")

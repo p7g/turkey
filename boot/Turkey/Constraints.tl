@@ -236,14 +236,12 @@ fun adopt(s : Solver, vars : Array VarCell) -> Unit {
 -- reduce through the instance table. So the assumptions are consulted first, and
 -- the rule they supply is applied exactly as an instance's would be.
 fun reduceFam(s : Solver, t : Ty.Type) -> Option Ty.Type {
-    for p in s.assumptions {
-        -- Reflexive rules are skipped, not returned: a rule from a family
-        -- application to itself is no rule, and returning it would leave
-        -- `Field.tag Auto` unreduced next to the `Int` it is.
-        if p.name == Ty.equals && Ty.sameType(p.args[0], t)
-                && !Ty.sameType(p.args[1], t) {
-            return Some(p.args[1])
-        }
+    -- Reflexive rules are skipped, not returned: a rule from a family
+    -- application to itself is no rule, and returning it would leave
+    -- `Field.tag Auto` unreduced next to the `Int` it is.
+    match Classes.givenRule(s.assumptions, t) {
+        Some(r) -> return Some(r)
+        None -> {}
     }
     -- Without the wanted rules. This reducer is what `unify` calls, and a
     -- unification is irreversible: reducing `Container.Elem a` to `Int` by an
@@ -685,9 +683,12 @@ fun entail(s : Solver, c : PredCell) -> Bool {
 -- *still* a stuck family means the equation is not yet decidable.
 fun equals(s : Solver, c : PredCell) -> Bool {
     -- Without the wanted rules: an equation proved by a rule it supplied is
-    -- proved by itself. See `Classes.settled`.
-    let left = Classes.settled(s.classes, c.pred.args[0])
-    let right = Classes.settled(s.classes, c.pred.args[1])
+    -- proved by itself. See `Classes.settled`. With the givens, though, which
+    -- is what the solver's own reducer adds: the equation may have been deferred
+    -- while its family's argument was a variable, and a given decides it now --
+    -- `Elem s ~ Option a` under `Elem s ~ Part (Option c)`. FINDINGS 84.
+    let left = Ty.normalize(c.pred.args[0], families(s))
+    let right = Ty.normalize(c.pred.args[1], families(s))
     c.pred = Ty.pred(c.pred.name, [left, right])
     if Ty.sameType(left, right) { return True }
     if isFam(left) || isFam(right) { return False }
@@ -695,18 +696,25 @@ fun equals(s : Solver, c : PredCell) -> Bool {
     True
 }
 
+-- A type normalized for discharging a predicate over it: everything the
+-- solver's reducer consults, and the wanted rules besides. The givens are not
+-- optional here: a type that reached the predicate through a variable bound
+-- before a given could rewrite it is still the family application, and only the
+-- given says what it is. See `Classes.normalizeUnder`, which elaboration uses
+-- too.
+fun discharging(s : Solver, t : Ty.Type) -> Ty.Type =
+    Classes.normalizeUnder(s.classes, t, s.assumptions)
+
 -- Is this a fact the enclosing declaration already assumed?
 --
 -- Both sides are normalized before they are compared, since an assumption is
 -- written down and a demand is discovered, and the two may name the same type by
 -- different routes.
 fun granted(s : Solver, p : Pred) -> Bool {
-    let key = Ty.predKey(Ty.pred(p.name,
-        [Classes.normalize(s.classes, p.args[0])]))
+    let key = Ty.predKey(Ty.pred(p.name, [discharging(s, p.args[0])]))
     for a in s.assumptions {
         for q in Classes.bySuper(s.classes, a) {
-            let qk = Ty.predKey(Ty.pred(q.name,
-                [Classes.normalize(s.classes, q.args[0])]))
+            let qk = Ty.predKey(Ty.pred(q.name, [discharging(s, q.args[0])]))
             if qk == key { return True }
         }
     }
@@ -720,7 +728,7 @@ fun granted(s : Solver, p : Pred) -> Bool {
 -- rigid is decided here and now, which is what keeps a missing instance a local
 -- error naming the type that lacks one.
 fun classRule(s : Solver, c : PredCell) -> Bool {
-    let t = Classes.normalize(s.classes, c.pred.args[0])
+    let t = discharging(s, c.pred.args[0])
     match t {
         -- Absorbed; there is no value to find a method for.
         TBottom -> return True
@@ -824,7 +832,7 @@ fun oneOfRule(s : Solver, c : PredCell) -> Bool {
                  c.context, families(s))
         return True
     }
-    let t = Classes.normalize(s.classes, c.pred.args[0])
+    let t = discharging(s, c.pred.args[0])
     match t {
         -- Absorbed; there is no value to represent.
         TBottom -> return True

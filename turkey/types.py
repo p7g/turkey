@@ -225,12 +225,25 @@ class TCon(Type):
     their own short name.
     """
 
-    __slots__ = ("name", "kind", "level")
+    __slots__ = ("name", "kind", "level", "uid")
 
-    def __init__(self, name: str, kind: Kind | None = None, level: int = NO_SCOPE):
+    # `uid` is 0 for a real constructor and unique to each *skolem*, for
+    # `type_key`. A skolem's name is unique only within its scope and its
+    # level is lifted when the scope ends, so by name two signatures' `s` are
+    # one key -- and a wanted rule over one fired inside the other
+    # (FINDINGS 84).
+    _uids = count(1)
+
+    def __init__(self, name: str, kind: Kind | None = None, level: int = NO_SCOPE,
+                 uid: int = 0):
         self.name = name
         self.kind: Kind = STAR if kind is None else kind
         self.level = level
+        self.uid = uid
+
+    @staticmethod
+    def skolem(name: str, kind: Kind) -> "TCon":
+        return TCon(name, kind, uid=next(TCon._uids))
 
     @property
     def display(self) -> str:
@@ -1036,7 +1049,7 @@ def type_key(t: Type) -> tuple:
     if isinstance(t, TVar):
         return ("var", t.id)
     if isinstance(t, TCon):
-        return ("con", t.name)
+        return ("con", t.name, t.uid) if t.uid else ("con", t.name)
     if isinstance(t, TApp):
         return ("app", type_key(t.fn), type_key(t.arg))
     if isinstance(t, TFam):

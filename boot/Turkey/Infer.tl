@@ -475,11 +475,18 @@ fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
         Some(n) -> n
         None -> dictName(m.cls)
     }
-    let params = Array.map(own, fun(p) = dictName(p.name))
+    -- An equality in that context is a given too, and not a parameter: it has
+    -- no evidence, so only the class predicates are named as dictionaries
+    -- (`Classes.methodDicts`), as a checked signature does.
+    let names = Array.map(own, fun(p) = dictName(p.name))
+    let params = Array.new(len(own))
+    for var i = 0; i < len(own); i = i + 1 {
+        if own[i].name != Ty.equals { Array.push(params, names[i]) }
+    }
     let givens = Array.new(4)
     Array.push(givens, (selfName, Classes.skolemApplyPred(sk, m.scheme.preds[0])))
     for var i = 0; i < len(own); i = i + 1 {
-        Array.push(givens, (params[i], own[i]))
+        Array.push(givens, (names[i], own[i]))
     }
     for var i = 0; i < len(context) && i < len(contextNames); i = i + 1 {
         Array.push(givens, (contextNames[i], context[i]))

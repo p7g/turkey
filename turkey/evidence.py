@@ -273,7 +273,10 @@ class Elaborator:
         # instance only once the family has been reduced. This is the last
         # place a family can appear -- evidence is over types, and a family is
         # not one until it is.
-        target: Type = self.classes.normalize(pred.args[0])
+        # Under the givens in scope, as `Solver.discharging` is: a predicate a
+        # given equality let solving accept has to be proved under it too.
+        target: Type = self.classes.normalize_under(
+            pred.args[0], [g for scope in scopes for _, g in scope.givens])
         if isinstance(target, TBottom):
             return Absent(pred.name)
         pred = Pred(pred.name, [target])

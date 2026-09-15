@@ -424,7 +424,7 @@ fun methodType(ck : Checker, m : MethodInfo, head : Ty.Type) -> Ty.Type {
     let mapping = Map.new()
     Map.put(mapping, m.classVar.id, head)
     let ty = Decls.substitute(m.scheme.body, mapping)
-    let own = Array.slice(m.scheme.preds, 1, len(m.scheme.preds))
+    let own = Classes.methodDicts(m)
     if len(own) == 0 { return ty }
     TFun(Array.map(own, fun(p) =
         dictType(ck, p.name, Decls.substitute(p.args[0], mapping))), ty)

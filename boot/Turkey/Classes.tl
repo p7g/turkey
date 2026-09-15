@@ -1,11 +1,12 @@
 module Turkey.Classes (
     Evidence(..), MethodImpl(..), InstancePlan(..), newInstancePlan,
-    MethodInfo(..), hasDefault,
+    MethodInfo(..), hasDefault, methodDicts,
     ClassInfo(..), classKind,
     InstInfo(..), instCon, instHeadKey,
     ClassTable(..), newClassTable,
     registerAll, resolveContext,
-    reduceFam, normalize, settled, settledFam, uncovered,
+    reduceFam, normalize, normalizeUnder, givenRule, settled, settledFam,
+    uncovered,
     bySuper, byInst, entail, isClass, method, simplify,
     fieldClass, fieldFamily, projectionClass, projectionFamily,
     generatedLabel, generatedIndex, fieldFamilyOwner, isGenerated, accessor,
@@ -153,6 +154,17 @@ type MethodInfo = MethodInfo {
 
 fun hasDefault(m : MethodInfo) -> Bool = Option.isSome(m.decl.body)
 
+-- The method's own context that arrives as dictionaries, per call: its class
+-- predicates, in order. A written equality is a fact the body may use and a
+-- caller must prove, but it has no evidence, so it is not a parameter.
+fun methodDicts(m : MethodInfo) -> Array Pred {
+    let out = Array.new(len(m.scheme.preds))
+    for var i = 1; i < len(m.scheme.preds); i = i + 1 {
+        if m.scheme.preds[i].name != Ty.equals { Array.push(out, m.scheme.preds[i]) }
+    }
+    out
+}
+
 type ClassInfo = ClassInfo {
     name     : String,
     param    : String,
@@ -231,7 +243,9 @@ type ClassTable = ClassTable {
     -- A rule names particular type *variables*, and `typeKey` prunes, so one
     -- binding's rule cannot fire inside another: no other binding mentions its
     -- variables. That is what makes a flat list correct where a scope stack
-    -- would be needed for anything else.
+    -- would be needed for anything else. A variable bound to a *skolem* keeps
+    -- the property only because a skolem's key carries its `uid`: by name and
+    -- level, two signatures' `s` were one (FINDINGS 84).
     rules     : Array (Ty.Type, Ty.Type),
     -- Turned off while an equation is being retried. A wanted equality may
     -- rewrite *other* constraints and must never discharge itself: reducing
@@ -1073,14 +1087,46 @@ fun reduceFam(t : ClassTable, name : String, arg : Ty.Type) -> Option Ty.Type {
 }
 
 -- Reduce family applications at the head of `t` until one sticks.
-fun normalize(t : ClassTable, ty : Ty.Type) -> Ty.Type {
+fun normalize(t : ClassTable, ty : Ty.Type) -> Ty.Type =
+    normalizeUnder(t, ty, Array.new(0))
+
+-- What a given equality among `givens` says a family application is, if one
+-- names it. A reflexive one is skipped rather than returned, so the instance
+-- table still gets its turn.
+fun givenRule(givens : Array Pred, ty : Ty.Type) -> Option Ty.Type {
+    for p in givens {
+        if p.name == Ty.equals && Ty.sameType(p.args[0], ty)
+                && !Ty.sameType(p.args[1], ty) {
+            return Some(p.args[1])
+        }
+    }
+    None
+}
+
+-- `normalize`, with the given equalities among `givens` consulted first.
+--
+-- For a predicate being discharged, and for the evidence that proves it.
+-- Unification's reducer always read the givens; these two did not, so a class
+-- predicate over a family application that only a given decides was stuck --
+-- whenever the family had reached it through a variable bound before the given
+-- could apply. An instance method whose own context says `Elem s ~ Part c` is
+-- that case: its body is inferred first and meets the signature last. The two
+-- have to read the same givens or solving accepts what elaboration cannot prove
+-- (FINDINGS 47, and 84).
+fun normalizeUnder(t : ClassTable, ty : Ty.Type, givens : Array Pred) -> Ty.Type {
     var out = Ty.prune(ty)
     var going = True
     while going {
         match out {
-            TFam(name, arg, _) -> match reduceFam(t, name, arg) {
-                None -> { going = False }
-                Some(reduced) -> { out = Ty.prune(reduced) }
+            TFam(name, arg, _) -> {
+                let reduced = match givenRule(givens, out) {
+                    Some(r) -> Some(r)
+                    None -> reduceFam(t, name, arg)
+                }
+                match reduced {
+                    None -> { going = False }
+                    Some(r) -> { out = Ty.prune(r) }
+                }
             }
             _ -> { going = False }
         }
@@ -1310,7 +1356,7 @@ fun skolemBind(s : Skolems, cell : VarCell, name : String) -> Ty.Type {
         candidate = name + Int.toString(n)
     }
     Set.add(s.used, candidate)
-    let con = ConCell { name = candidate, kind = cell.kind, level = Ty.noScope }
+    let con = Ty.skolemCon(candidate, cell.kind)
     Map.put(s.mapping, cell.id, TCon(con))
     Array.push(s.made, con)
     TCon(con)

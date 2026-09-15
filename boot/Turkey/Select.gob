@@ -41,6 +41,7 @@ import Turkey.LowIr (Op(..), Low(..), BinOp(..), CmpOp(..), Conv(..),
                      Callee(..))
 import Turkey.Asm as Asm
 import Turkey.Asm (Asm(..))
+import Turkey.Roots as Roots
 import Turkey.Runtime as Rt
 import Turkey.Runtime (Entry(..))
 import Turkey.Ssa as Ssa
@@ -61,6 +62,12 @@ type Sel = Sel {
     stopped : Option String,
     -- The module's names, shared by every function in it.
     asm     : Asm,
+    -- Which values the collector must find at each safepoint, from the low IR
+    -- -- the same analysis the LLVM path uses.
+    frame   : Roots.Frame,
+    -- The low IR safepoint being selected, until its call is emitted and
+    -- marked with a `SafepointMap`.
+    pending : Option (Int, Int),
 }
 
 fun emit(s : Sel, op : A.Arm) -> Unit {
@@ -147,14 +154,63 @@ fun start(f : Func Low, asm : Asm) -> Sel {
     -- The same value numbering, so a `Value` means the same thing on both
     -- sides and `reps` describes both. Selection only ever adds.
     for r in f.reps { Array.push(g.reps, r) }
-    for p in f.params { Array.push(g.params, p) }
     for block in f.blocks {
         let made = Ssa.newBlock()
         for p in block.params { Array.push(made.params, p) }
         Array.push(g.blocks, made)
     }
-    g.entry = f.entry
-    Sel { source = f, out = g, at = 0, stopped = None, asm = asm }
+    g.entry = incoming(f, g)
+    Sel { source = f, out = g, at = 0, stopped = None, asm = asm,
+          frame = Roots.analyze(f), pending = None }
+}
+
+-- A new entry block that moves each parameter out of where the caller put it,
+-- then jumps to the function's own entry.
+--
+-- **The parameters stop being `Func.params`.** Each is defined by its move,
+-- so the machine function's `params` is empty and every parameter has exactly
+-- one definition the allocator can see. Leaving the move to the emitter -- what
+-- this did before -- hid from the allocator that `x0`-`x7` hold arguments
+-- until each is copied, and there was no instruction to put anything between.
+--
+-- No parallel copy is needed. Each move reads an argument register nothing
+-- has written yet, and the allocator's physical liveness keeps every later
+-- argument register out of the hands of the values defined before it is read.
+--
+-- Past eight in a file, a parameter is on the stack: stack argument `k` in
+-- argument order, whatever its file, as `call` passes them.
+fun incoming(f : Func Low, g : Func Inst) -> BlockId {
+    let entry = Ssa.newBlock()
+    var general = 0
+    var vector = 0
+    var stack = 0
+    for p in f.params {
+        let into = A.reg(p)
+        let op = match A.bankOf(Ssa.repOf(f, p)) {
+            Gp -> if general < len(A.argRegs) {
+                let from = A.argRegs[general]
+                general = general + 1
+                A.Mov(into, from, A.W64)
+            } else {
+                let at = stack
+                stack = stack + 1
+                A.Ldr(into, A.IncomingArg(at), A.W64)
+            }
+            Fp -> if vector < len(A.fpArgRegs) {
+                let from = A.fpArgRegs[vector]
+                vector = vector + 1
+                A.FMov(into, from)
+            } else {
+                let at = stack
+                stack = stack + 1
+                A.Ldr(into, A.IncomingArg(at), A.W64)
+            }
+        }
+        Array.push(entry.insts, Inst { op = op })
+    }
+    entry.term = Jump(f.entry, [])
+    Array.push(g.blocks, entry)
+    BlockId(len(g.blocks) - 1)
 }
 
 -- Every source block, in order, into the block of the same index -- and then
@@ -166,10 +222,29 @@ fun start(f : Func Low, asm : Asm) -> Sel {
 -- terminator is `s.at` and not `b`. Blocks are only ever *appended*, never
 -- inserted, so every `BlockId` a terminator already names still means the
 -- block it meant.
+--
+-- Before a safepoint, every root live across it is stored into its slot --
+-- the same stores the LLVM path's `publish` writes, without the mask. What
+-- the mask said at run time, the frame table says as data: the call is marked
+-- with the low IR position `Roots.liveAt` answers for (`NATIVE-BACKEND.md`,
+-- "Frames, calls and roots, surveyed").
 fun run(s : Sel) -> Unit {
     for var b = 0; b < len(s.source.blocks); b = b + 1 {
         s.at = b
-        for i in s.source.blocks[b].insts { selectInst(s, i) }
+        let insts = s.source.blocks[b].insts
+        for var n = 0; n < len(insts); n = n + 1 {
+            let live = Roots.liveAt(s.frame, b, n)
+            if len(live) > 0 {
+                for (slot, id) in live {
+                    emit(s, A.Str(A.Virtual(id), A.RootSlot(slot), A.W64))
+                }
+                s.pending = Some((b, n))
+            }
+            selectInst(s, insts[n])
+            -- A safepoint selected without a call -- a closure capture is a
+            -- store -- has nothing to mark, and nothing can collect inside it.
+            s.pending = None
+        }
         s.out.blocks[s.at].term = s.source.blocks[b].term
     }
 }
@@ -345,9 +420,15 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                 Direct(name) ->
                     call(s, d, want, want, Some(symbolFor(name)), A.xzr, passed)
                 Runtime(name) -> match runtimeSymbol(name) {
-                    Some(sym) ->
+                    -- The stack arguments below are this compiler's own
+                    -- convention, and a C function would not read them the
+                    -- same way. No runtime entry point takes more than four.
+                    Some(sym) -> if overflows(passed) {
+                        stop(s, "a runtime call with stack arguments")
+                    } else {
                         call(s, d, want, resultBank(name), Some(sym), A.xzr,
                              passed)
+                    }
                     -- A few primitives are a handful of compares, and a
                     -- runtime entry point per predicate would be a call where
                     -- a compare will do. The same ones `Turkey.Llvm` inlines,
@@ -434,37 +515,39 @@ fun move(s : Sel, d : Reg, dBank : A.Bank, a : Reg, aBank : A.Bank) -> Unit =
 -- call reads and writes, because `Bl` names neither -- without it the
 -- allocator would see a call that uses nothing and keep nothing alive across
 -- it.
+--
+-- **Past eight in a file, arguments go on the stack**, into stack slot `k`
+-- counted in argument order whatever the file, eight bytes each. That is
+-- Apple's layout for word-sized arguments, and every value this compiler
+-- passes is a word; only Turkey functions receive more than eight, so the
+-- convention is this compiler's (`incoming` is the other half). The slots are
+-- a preallocated area at the bottom of the frame, so nothing moves `sp`.
 fun call(s : Sel, d : Reg, dBank : A.Bank, resultBank : A.Bank,
          sym : Option String, indirect : Reg,
          args : Array (Reg, A.Bank)) -> Unit {
     let ins = []
     var general = 0
     var vector = 0
+    var stack = 0
     for (a, bank) in args {
         -- Asked *before* the register is taken, not after. Asking after
-        -- indexes the array with the index that overflowed it, so a
-        -- nine-argument call panicked inside the compiler instead of being
-        -- reported by it -- a check that runs one line too late is not a
-        -- check.
+        -- indexed the array with the index that overflowed it, and a
+        -- nine-argument call panicked inside the compiler.
         let full = match bank {
             Gp -> general >= len(A.argRegs)
             Fp -> vector >= len(A.fpArgRegs)
         }
         if full {
-            -- AAPCS64 passes the rest on the stack, which needs a frame this
-            -- backend does not lay out yet: the prologue that would spill
-            -- them is the same pass that has still to assign a register to
-            -- anything. Reported rather than approximated.
-            stop(s, "a call with more than eight arguments in one register "
-                    + "file, which would need stack arguments")
-            return
+            emit(s, A.Str(a, A.OutgoingArg(stack), A.W64))
+            stack = stack + 1
+        } else {
+            let into = match bank {
+                Gp -> { let at = general; general = general + 1; A.argRegs[at] }
+                Fp -> { let at = vector; vector = vector + 1; A.fpArgRegs[at] }
+            }
+            move(s, into, bank, a, bank)
+            Array.push(ins, into)
         }
-        let into = match bank {
-            Gp -> { let at = general; general = general + 1; A.argRegs[at] }
-            Fp -> { let at = vector; vector = vector + 1; A.fpArgRegs[at] }
-        }
-        move(s, into, bank, a, bank)
-        Array.push(ins, into)
     }
     -- The *physical* registers the call reads and writes, not the virtuals
     -- either side of them. Passing the virtual destination here made it
@@ -482,6 +565,15 @@ fun call(s : Sel, d : Reg, dBank : A.Bank, resultBank : A.Bank,
     match sym {
         Some(name) -> emit(s, A.Bl(name))
         None -> emit(s, A.Blr(indirect))
+    }
+    -- The return address this call leaves is the one the collector will look
+    -- up, so the mark goes directly after it.
+    match s.pending {
+        Some((b, n)) -> {
+            emit(s, A.SafepointMap(b, n))
+            s.pending = None
+        }
+        None -> {}
     }
     -- The callee's result file and the destination's need not agree:
     -- `turkey_unbox` answers a double's bits in `x0`, and the value being
@@ -825,6 +917,19 @@ fun flag(s : Sel, a : Reg, n : Int, c : A.Cond) -> Reg {
     let out = temp(s, Ssa.untraced(I1))
     emit(s, A.CSet(out, c))
     out
+}
+
+-- Whether a call's arguments overflow either register file.
+fun overflows(args : Array (Reg, A.Bank)) -> Bool {
+    var general = 0
+    var vector = 0
+    for (_, bank) in args {
+        match bank {
+            Gp -> { general = general + 1 }
+            Fp -> { vector = vector + 1 }
+        }
+    }
+    general > len(A.argRegs) || vector > len(A.fpArgRegs)
 }
 
 -- Which file a runtime entry point answers in. `turkey_float_floor` returns a

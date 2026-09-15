@@ -48,16 +48,14 @@ CORPUS = sorted(
     if not path.name.startswith("err_")
 )
 
-# What selection is known not to reach yet. A reason outside this set fails the
-# run: the histogram is only a progress signal if a new entry is an event.
+# What selection can still refuse. A reason outside this set fails the run: the
+# histogram is only a progress signal if a new entry is an event.
 #
-# Stack arguments are the whole of it. AAPCS64 passes the ninth argument and
-# beyond on the stack, which needs a frame this backend does not lay out --
-# the prologue that would spill them is the same pass that has still to assign
-# a register to anything.
+# Stack arguments were the last gap and are closed; what remains is a guard that
+# should never fire -- the convention for them is this compiler's own, and no C
+# runtime entry point takes more than four arguments.
 KNOWN_REASONS = {
-    "a call with more than eight arguments in one register file, which would "
-    "need stack arguments",
+    "a runtime call with stack arguments",
 }
 
 # What stops the allocator. With spilling there should be nothing: a value
@@ -181,33 +179,67 @@ def test_no_unknown_reason_appears(name):
     assert found <= KNOWN_REASONS, sorted(found - KNOWN_REASONS)
 
 
-def test_the_corpus_selects_apart_from_the_known_gap():
-    """The ratchet. Everything but stack arguments reaches arm64."""
+def test_the_corpus_selects_completely():
+    """The ratchet. Everything reaches arm64, stack arguments included."""
     selected = stopped = 0
     for name in CORPUS:
         got, _ = _counts(_asm(name))
         selected += got
         stopped += sum(_reasons(_asm(name)).values())
     assert selected > 1800, selected
-    # `manyargs.gob` is the only program with a function over the eight-argument
-    # limit, and it stops two: the recursive call and the one in `main`.
-    assert stopped == 2, stopped
+    # `manyargs.gob` and `stackargs.gob` stopped here until stack arguments
+    # existed; nothing should stop now.
+    assert stopped == 0, stopped
 
 
-def test_a_nine_argument_call_is_reported_and_does_not_crash():
-    """The regression test for the panic that started this file.
+def test_a_nine_argument_call_passes_the_ninth_on_the_stack():
+    """Both halves of the convention, in the program that first needed it.
 
-    `argRegs` was indexed with the index that overflowed it and only then was
-    the bounds check asked, so `boot` died with "array index out of bounds:
-    read at index 8, length 8" instead of reporting the call.
-
-    It takes a *recursive* callee to reach: with constant arguments `opt`
-    inlines the call and folds it away, and the first attempt at this program
-    selected every function and proved nothing.
+    `argRegs` was once indexed with the index that overflowed it, and a
+    nine-argument call panicked inside the compiler; then the call was reported
+    and stopped; now it selects. The caller stores the overflow into its
+    outgoing area and the callee loads it from its incoming one. The callee has
+    to recurse, or `opt` inlines the call and folds it away.
     """
-    reasons = _reasons(_asm("manyargs.gob"))
-    assert reasons, "the nine-argument call was not reported at all"
-    assert set(reasons) <= KNOWN_REASONS, sorted(reasons)
+    text = _asm("manyargs.gob")
+    assert not _reasons(text), _reasons(text)
+    _, callee = _function(text, "Main#nine")
+    assert any("[incoming 0]" in line for line in callee), callee
+    assert any(line.startswith("str ") and "[outgoing 0]" in line
+               for line in callee), callee
+
+
+def test_parameters_are_moved_out_of_the_argument_registers():
+    """The callee's side of the calling convention is instructions now.
+
+    The allocator has to see that `x0`-`x7` hold arguments until each is
+    copied, so the entry block moves them, in order, and the machine
+    function has no `params` of its own.
+    """
+    text = _asm("stackargs.gob")
+    head, body = _function(text, "Main#mixed")
+    assert head.startswith("fun @Main#mixed() ->"), head
+    # The environment, then `n`, then the first double -- in their own files.
+    assert "mov %0, x0" in body and "mov %1, x1" in body, body
+    assert "fmov %2, d0" in body and "mov %3, x2" in body, body
+    assert any("[incoming 0]" in line for line in body), body[:20]
+
+
+def test_a_safepoint_stores_its_roots_and_is_mapped():
+    """Frame tables, not a shadow stack.
+
+    Before a call that may collect, every root live across it is stored into
+    its slot, and the call is followed by the map the frame table is built
+    from. Nothing enters or leaves a root frame.
+    """
+    text = _asm("pressure.gob")
+    _, body = _function(text, "Main#strings")
+    maps = [n for n, line in enumerate(body) if line.startswith("; safepoint ")]
+    assert maps, "no safepoint was mapped"
+    for n in maps:
+        assert body[n - 1].startswith(("bl ", "blr ")), body[n - 3:n + 1]
+    assert any("[root " in line and line.startswith("str ") for line in body)
+    assert "turkey_root_enter" not in text and "turkey_root_leave" not in text
 
 
 @pytest.mark.parametrize("name", CORPUS)
@@ -311,20 +343,18 @@ def test_the_float_primitives_select_without_a_call():
     and the same program then found `Prim.floatIsNaN` missing from *both*
     backends (FINDINGS 87).
 
-    Checked in the library wrappers, whose signatures say which file each
+    Checked in the library wrappers, whose entry moves say which file each
     operand is in: virtual registers print as `%n`, so `fmov %2, %1` alone
-    cannot say which way the bits went, but `%1:f64 -> i64` can.
+    cannot say which way the bits went, but `fmov %1, d0` before it can.
     """
     text = _asm("float_bits.gob")
     assert not _reasons(text), _reasons(text)
 
-    head, body = _function(text, "Data.Float#bits")
-    assert "%1:f64" in head and head.endswith("-> i64 {"), head
-    assert "fmov %2, %1" in body, body
+    _, body = _function(text, "Data.Float#bits")
+    assert "fmov %1, d0" in body and "fmov %2, %1" in body, body
 
-    head, body = _function(text, "Data.Float#fromBits")
-    assert "%1:i64" in head and head.endswith("-> f64 {"), head
-    assert "fmov %2, %1" in body, body
+    _, body = _function(text, "Data.Float#fromBits")
+    assert "mov %1, x1" in body and "fmov %2, %1" in body, body
 
     _, body = _function(text, "Data.Float#isNaN")
     assert "fcmp %1, %1" in body and any(

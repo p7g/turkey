@@ -1,6 +1,6 @@
 module Turkey.Arm64 (
     Reg(..), Bank(..), reg, physical, isPhysical, bankOf, Cond(..), Width(..),
-    Mem(..), Arm(..), Inst(..), destRegs, srcRegs, mapUses, setsFlags, isSlot, isRootSlot, slotLoad, slotStore, isCSet,
+    Mem(..), Arm(..), Inst(..), destRegs, srcRegs, mapUses, setsFlags, isSlot, isRootSlot, slotLoad, slotStore, isCSet, moveHint, safepointOf, memOf,
     xzr, sp, fp, lr, x0, d0, argRegs, fpArgRegs, callerSaved, calleeSaved,
     fpCallerSaved, fpCalleeSaved, showReg, condName, isCall,
 )
@@ -149,6 +149,12 @@ type Mem
     -- allocator's own. Frame layout turns both into `sp`-relative offsets.
     | RootSlot(Int)
     | SpillSlot(Int)
+    -- Stack argument `k`, counted from zero in argument order whatever its
+    -- file: `IncomingArg` is one this function was passed, at `x29 + 16 + 8k`;
+    -- `OutgoingArg` one it passes, at `sp + 8k` in its preallocated outgoing
+    -- area (`NATIVE-BACKEND.md`, "Frames, calls and roots, surveyed").
+    | IncomingArg(Int)
+    | OutgoingArg(Int)
 
 type Arm
     -- Moves and constants. `MovZ`/`MovK` build a 64-bit constant in up to four
@@ -240,6 +246,12 @@ type Arm
     -- answers in are not operands of `Bl`, so without this the allocator would
     -- see a call that uses and defines nothing. It carries no encoding.
     | CallArgs(Array Reg, Array Reg)
+    -- A pseudo-instruction directly after a call that may collect, naming the
+    -- low IR instruction -- block and index -- the call was selected from.
+    -- That is the key `Turkey.Roots.liveAt` answers the live roots for, so the
+    -- frame layout can turn it into this return address's frame-table entry.
+    -- It carries no encoding; the emitter gives the return address a label.
+    | SafepointMap(Int, Int)
     | Ret
     | B(BlockId)
     | BCond(Cond, BlockId)
@@ -298,6 +310,33 @@ fun slotLoad(op : Arm) -> Option (Int, Mem) = match op {
 -- The value a store to a frame slot writes, and the slot.
 fun slotStore(op : Arm) -> Option (Int, Mem) = match op {
     Str(Virtual(v), m, _) -> if isSlot(m) { Some((v, m)) } else { None }
+    _ -> None
+}
+
+-- A same-file move between a virtual and a physical register, as the value
+-- and the register number it would like: an incoming parameter, an argument
+-- moved into place, a result moved out. `xzr` is not a preference.
+fun moveHint(op : Arm) -> Option (Int, Int) = match op {
+    Mov(Virtual(d), Physical(Gp, n), _) -> if n == 31 { None } else { Some((d, n)) }
+    Mov(Physical(Gp, n), Virtual(a), _) -> if n == 31 { None } else { Some((a, n)) }
+    FMov(Virtual(d), Physical(Fp, n)) -> Some((d, n))
+    FMov(Physical(Fp, n), Virtual(a)) -> Some((a, n))
+    _ -> None
+}
+
+-- The low IR position a safepoint map names, if this is one.
+fun safepointOf(op : Arm) -> Option (Int, Int) = match op {
+    SafepointMap(b, n) -> Some((b, n))
+    _ -> None
+}
+
+-- The memory operand an instruction reads or writes, if it has one.
+fun memOf(op : Arm) -> Option Mem = match op {
+    Ldr(_, m, _) -> Some(m)
+    Ldrb(_, m) -> Some(m)
+    Ldrsw(_, m) -> Some(m)
+    Str(_, m, _) -> Some(m)
+    Strb(_, m) -> Some(m)
     _ -> None
 }
 
@@ -385,6 +424,7 @@ fun srcRegs(op : Arm) -> Array Reg = match op {
     Bl(_) -> []
     Blr(a) -> [a]
     CallArgs(ins, _) -> ins
+    SafepointMap(_, _) -> []
     Ret -> []
     B(_) -> []
     BCond(_, _) -> []
@@ -453,6 +493,7 @@ fun mapUses(op : Arm, g : fun(Reg) -> Reg) -> Arm = match op {
     Bl(k0) -> Bl(k0)
     Blr(a) -> Blr(g(a))
     CallArgs(ins, k1) -> CallArgs(Array.map(ins, g), k1)
+    SafepointMap(k0, k1) -> SafepointMap(k0, k1)
     Ret -> Ret
     B(k0) -> B(k0)
     BCond(k0, k1) -> BCond(k0, k1)
@@ -464,6 +505,8 @@ fun mapMem(m : Mem, g : fun(Reg) -> Reg) -> Mem = match m {
     Indexed(base, index) -> Indexed(g(base), g(index))
     RootSlot(n) -> RootSlot(n)
     SpillSlot(n) -> SpillSlot(n)
+    IncomingArg(k) -> IncomingArg(k)
+    OutgoingArg(k) -> OutgoingArg(k)
 }
 
 -- The registers an instruction *writes*, physical ones included.
@@ -528,6 +571,7 @@ fun destRegs(op : Arm) -> Array Reg = match op {
     Bl(_) -> []
     Blr(_) -> []
     CallArgs(_, outs) -> outs
+    SafepointMap(_, _) -> []
     Ret -> []
     B(_) -> []
     BCond(_, _) -> []
@@ -553,6 +597,8 @@ fun memRegs(m : Mem) -> Array Reg = match m {
     Indexed(base, index) -> [base, index]
     RootSlot(_) -> []
     SpillSlot(_) -> []
+    IncomingArg(_) -> []
+    OutgoingArg(_) -> []
 }
 
 -- -- printing -----------------------------------------------------------------------
@@ -604,6 +650,8 @@ instance Show Mem {
             "[" + baseName(base) + ", " + showReg(index, W64) + "]"
         RootSlot(n) -> "[root " + Int.toString(n) + "]"
         SpillSlot(n) -> "[spill " + Int.toString(n) + "]"
+        IncomingArg(k) -> "[incoming " + Int.toString(k) + "]"
+        OutgoingArg(k) -> "[outgoing " + Int.toString(k) + "]"
     }
 }
 
@@ -688,6 +736,7 @@ fun showArm(op : Arm) -> String = match op {
     -- allocator what a call reads and writes.
     CallArgs(ins, outs) -> "; call uses " + Int.toString(len(ins))
                            + " defs " + Int.toString(len(outs))
+    SafepointMap(b, n) -> "; safepoint " + Int.toString(b) + ":" + Int.toString(n)
     Ret -> "ret"
     B(target) -> "b " + blockLabel(target)
     BCond(c, target) -> "b." + condName(c) + " " + blockLabel(target)

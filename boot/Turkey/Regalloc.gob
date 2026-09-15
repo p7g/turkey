@@ -4,7 +4,7 @@ module Turkey.Regalloc (
     availableGp, availableFp, calleeSavedGp, calleeSavedFp,
     Colouring(..), colour, verifyColouring,
     Spills(..), Allocation(..), allocate, verifyAllocation,
-    untracedPressure, worstCall, argumentHints, hintsTaken,
+    untracedPressure, worstCall, moveHints, hintsTaken,
 )
 
 -- Register allocation for arm64 (`NATIVE-BACKEND.md`, M28 phase 5).
@@ -47,9 +47,9 @@ type Pressure = Pressure { gp : Int, fp : Int }
 -- The general file has 31 numbered registers. `x31` is `sp` or `xzr`
 -- depending on the instruction and is never allocatable; `x29` is the frame
 -- pointer and `x30` the link register, both of which the prologue owns; and
--- `x18` is reserved by the platform on Darwin. That leaves x0-x17 and
--- x19-x28.
-let availableGp = 28
+-- `x18` is reserved by the platform on Darwin, and `x16`/`x17` are this
+-- backend's scratch registers. That leaves x0-x15 and x19-x28.
+let availableGp = 26
 -- The vector file has 32 and this backend reserves none, because every double
 -- it makes is 64 bits and nothing vectorizes yet.
 let availableFp = 32
@@ -305,7 +305,7 @@ fun walk(f : Func A.Inst, spills : Spills, evict : Bool) -> Walk {
     -- and not ten: a call passing more than eight is one this backend cannot
     -- yet select, and the allocator should not be where `boot` gains one.
     let w = Walk { f = f, spills = spills, evict = evict, forbidden = forbidden,
-                   hints = argumentHints(f), of_ = of_, stopped = None,
+                   hints = moveHints(f), of_ = of_, stopped = None,
                    evicted = Set.new() }
     let entry = f.blocks[Ssa.blockId(f.entry)]
 
@@ -520,7 +520,12 @@ fun nextUse(block : Ssa.Block A.Inst, id : Int, from : Int) -> Int {
 -- across a call and a callee-saved register costs a save and a restore in the
 -- prologue. `x18` is reserved on Darwin, `x29` and `x30` are the frame and
 -- link registers, and `x31` is `sp` or `xzr`; none of the four is here.
-let gpPool = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17,
+--
+-- `x16` and `x17` are not here either: they are the scratch registers, for a
+-- frame or a slot offset too large for one instruction and for the cycle in a
+-- parallel copy -- QBE, Go and Cranelift all reserve one or both for the same
+-- jobs (`NATIVE-BACKEND.md`, "Frames, calls and roots, surveyed").
+let gpPool = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
               19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
 -- The vector file's callee-saved half is `d8`-`d15`, so the caller-saved ones
 -- go first here too -- from both ends, since `v0`-`v7` and `v16`-`v31` are the
@@ -684,7 +689,10 @@ fun verifyColouring(f : Func A.Inst, c : Colouring) -> Array String {
         let block = f.blocks[b]
         let after = Ssa.liveAfter(f, at, liveOut[b])
         let (physical, entering) = physicalLive(block)
-        if len(entering.gp) > 0 || len(entering.fp) > 0 {
+        -- The entry block is the exception, and the only one: it reads the
+        -- argument registers the caller wrote.
+        if (len(entering.gp) > 0 || len(entering.fp) > 0)
+           && b != Ssa.blockId(f.entry) {
             Array.push(out, "a physical register is live on entry to block b"
                             + Int.toString(b))
         }
@@ -807,52 +815,24 @@ fun worstCall(f : Func A.Inst) -> Int {
 
 -- Which register each value would rather have, or `-1`.
 --
--- Only the function's parameters have one today, and the reason they get a
--- *hint* rather than a pin is the whole of this design's answer to the
--- calling convention at a function's own boundary.
+-- A preference, never a pin: taking it makes a move redundant, and missing it
+-- keeps the move and is still correct. A pin could contradict -- a parameter
+-- fixed in `x0` and live across a call has had `x0` destroyed -- and a
+-- preference cannot, which is the whole reason the calling convention is
+-- written as moves (`Select.incoming`, `Select.call`) rather than as
+-- constraints.
 --
--- AAPCS64 delivers parameter *i* in `x`*i* (counting the two files
--- separately). The emitter therefore begins every function with a move from
--- the argument register into wherever the allocator put that parameter. If the
--- allocator chose the argument register itself the move is `mov x0, x0` and is
--- elided; if it chose something else the move is real and everything still
--- works. So the convention is satisfied by construction and the hint only
--- decides whether an instruction survives.
---
--- Pinning would be the alternative and it can *contradict*: a parameter fixed
--- in `x0` and live across a call has had `x0` destroyed by the callee, and
--- there is no assignment that satisfies both. That contradiction is exactly
--- what the entry move exists to break, and once the move exists the pin has
--- nothing left to do. A parameter live across a call simply takes a
--- callee-saved register -- `forbiddenSets` already forces that -- and the
--- entry move copies `x0` into it.
---
--- The return value is the same shape and needs nothing here: the emitter
--- writes `mov x0, <wherever the result is>` before `ret`, elided when they
--- agree.
---
--- Beyond eight parameters in one file AAPCS64 passes on the stack, and this
--- says nothing rather than something wrong -- the ninth parameter gets no hint
--- and no incoming move, which is the callee half of the gap phase 4 records.
-fun argumentHints(f : Func A.Inst) -> Array Int {
+-- Read off those moves: a value moved out of a physical register, or into
+-- one, would like that register. That covers the parameters, the arguments and
+-- the results at once, where the hints used to cover the parameters alone.
+fun moveHints(f : Func A.Inst) -> Array Int {
     let out : Array Int = []
     for _ in f.reps { Array.push(out, -1) }
-    var general = 0
-    var vector = 0
-    for p in f.params {
-        let id = Ssa.valueId(p)
-        match A.bankOf(f.reps[id]) {
-            Gp -> {
-                if general < len(A.argRegs) {
-                    out[id] = numberOf(A.argRegs[general])
-                    general = general + 1
-                }
-            }
-            Fp -> {
-                if vector < len(A.fpArgRegs) {
-                    out[id] = numberOf(A.fpArgRegs[vector])
-                    vector = vector + 1
-                }
+    for block in f.blocks {
+        for i in block.insts {
+            match A.moveHint(i.op) {
+                Some((id, n)) -> if out[id] < 0 { out[id] = n }
+                None -> {}
             }
         }
     }
@@ -864,19 +844,16 @@ fun numberOf(r : Reg) -> Int = match r {
     Virtual(_) -> -1
 }
 
--- How many parameters got the register the convention wanted for them.
+-- How many hinted values got the register their move wanted.
 --
--- The measurement the hint exists to move: every miss is one `mov` the
--- emitter has to keep at the top of a function. A miss is not a bug -- a
--- parameter live across a call *must* miss, since its argument register is
--- caller-saved -- so this is a code-quality number, and the first one this
--- backend has that is about quality rather than feasibility.
+-- Every miss is one `mov` the emitter keeps. A miss is not a bug -- a value
+-- live across a call *must* miss an argument register, which is caller-saved
+-- -- so this is a code-quality number rather than a correctness one.
 fun hintsTaken(f : Func A.Inst, c : Colouring) -> (Int, Int) {
-    let hints = argumentHints(f)
+    let hints = moveHints(f)
     var taken = 0
     var total = 0
-    for p in f.params {
-        let id = Ssa.valueId(p)
+    for var id = 0; id < len(hints) && id < len(c.of_); id = id + 1 {
         if hints[id] >= 0 {
             total = total + 1
             if c.of_[id] == hints[id] { taken = taken + 1 }
@@ -999,15 +976,16 @@ fun spill(g : Func A.Inst, ids : Set.Set Int, roots : Map Int Int,
         }
         Map.put(spills.slots, id, slot)
     }
-    let entry = Ssa.blockId(g.entry)
     for var b = 0; b < len(g.blocks); b = b + 1 {
         let block = g.blocks[b]
         let out : Array A.Inst = []
-        if b == entry {
-            for p in g.params { storeIfSpilled(out, spills, ids, Ssa.valueId(p)) }
-        }
         for p in block.params { storeIfSpilled(out, spills, ids, Ssa.valueId(p)) }
         for i in block.insts {
+            -- Selection stores every root into its slot before a safepoint. A
+            -- value spilled into that same slot was written there at its
+            -- definition, so the store is a reload and a write of what the slot
+            -- already holds -- and on `boot` it nearly tripled the reloads.
+            if isRootStoreOfSpilled(i.op, ids, spills) { continue }
             var op = i.op
             for id in Array.sort(Set.elements(usedSpilled(Ssa.uses(i), ids))) {
                 let t = reload(g, out, spills, id)
@@ -1025,6 +1003,13 @@ fun spill(g : Func A.Inst, ids : Set.Set Int, roots : Map Int Int,
         block.term = term
     }
 }
+
+fun isRootStoreOfSpilled(op : A.Arm, ids : Set.Set Int, spills : Spills) -> Bool =
+    match A.slotStore(op) {
+        Some((v, m)) -> A.isRootSlot(m) && Set.contains(ids, v)
+                        && show(m) == show(Map.getOr(spills.slots, v, A.SpillSlot(-1)))
+        None -> False
+    }
 
 fun usedSpilled(vs : Array Value, ids : Set.Set Int) -> Set.Set Int {
     let out = Set.new()

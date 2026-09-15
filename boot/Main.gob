@@ -54,6 +54,7 @@ import Turkey.Arm64 as Arm64
 import Turkey.Select as Select
 import Turkey.Regalloc as Regalloc
 import Turkey.Roots as Roots
+import Turkey.Frame as Frame
 import Turkey.Llvm as Llvm
 import Turkey.LowIr as LowIr
 import Turkey.Ssa as Ssa
@@ -435,12 +436,17 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
     var rootSpills = 0
     var spillSlots = 0
     var maxRounds = 0
+    var maxFrame = 0
+    var maxSavedGp = 0
+    var maxSavedFp = 0
+    var stackArgs = 0
+    var maps = 0
     for f in selected {
-        let roots = match Map.get(lows, f.name) {
-            Some(low) -> Roots.analyze(low).slots
-            None -> Map.new()
+        let frame = match Map.get(lows, f.name) {
+            Some(low) -> Roots.analyze(low)
+            None -> Roots.Frame { slots = Map.new(), at = Map.new() }
         }
-        let a = Regalloc.allocate(f, roots)
+        let a = Regalloc.allocate(f, frame.slots)
         match a.stopped {
             Some(why) -> Map.put(colourStops, why,
                                  Map.getOr(colourStops, why, 0) + 1)
@@ -467,6 +473,17 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
                 for message in Regalloc.verifyAllocation(a) {
                     String.push(b, "  !! " + f.name + ": " + message + "\n")
                 }
+                -- And the frame, which only means something once every value
+                -- has a register or a slot.
+                let l = Frame.layout(a, frame)
+                for message in Frame.verifyFrame(a, frame, l) {
+                    String.push(b, "  !! " + f.name + ": " + message + "\n")
+                }
+                if l.size > maxFrame { maxFrame = l.size }
+                if len(l.savedGp) > maxSavedGp { maxSavedGp = len(l.savedGp) }
+                if len(l.savedFp) > maxSavedFp { maxSavedFp = len(l.savedFp) }
+                if l.outgoing > 0 { stackArgs = stackArgs + 1 }
+                maps = maps + len(l.maps)
             }
         }
         let (got, want) = Regalloc.hintsTaken(a.func, a.colouring)
@@ -510,6 +527,12 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
                    + Int.toString(stores) + " stores  "
                    + Int.toString(reloads) + " reloads  rounds "
                    + Int.toString(maxRounds) + "\n")
+    -- The frames, and the frame tables that replace the shadow stack.
+    String.push(b, "-- frames  max size " + Int.toString(maxFrame)
+                   + "  saved gp " + Int.toString(maxSavedGp)
+                   + " fp " + Int.toString(maxSavedFp)
+                   + "  stack args in " + Int.toString(stackArgs)
+                   + " functions  maps " + Int.toString(maps) + "\n")
     -- Every missed hint is one `mov` the emitter keeps at the top of a
     -- function. A miss is not a bug -- a parameter live across a call must
     -- miss, its argument register being caller-saved -- so this is the first

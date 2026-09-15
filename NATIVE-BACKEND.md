@@ -1192,15 +1192,21 @@ The alternative is MLton's and Rust's: width follows the *instantiation*, so
 of a `Box t` to be a layout-keyed copy too, and `check_layouts` inspects only
 parameters today, not constructions or returns.
 
-### A hole to close first
+### A hole, closed
 
 `fun mk(x : a) -> Box a = Box(x)` is not transparent and calls nothing that is,
-so `layout.share` never copies it. Left generic past the specialization cap, it
-stores its field `BOXED`, a pointer to a box, while a ground reader of `Box
-Int` reads the same word as `i64`. That is FINDINGS 53's shape -- a field
-written one way and read another -- and it is unverified. It is independent of
-packing and should get a failing test before anything here is built on the
-current invariant.
+so `layout.share` never copied it. Left generic past the specialization cap, it
+stored its field `BOXED`, a pointer to a box, while a ground reader of `Box
+Int` read the same word as `i64` -- FINDINGS 53's shape, a field written one way
+and read another. Verified: a recursive `mk` printed `32067093649` for `42`.
+
+Closed by the producer's half of the transparency rule. A binding that builds a
+value whose field is *declared* at a bare type variable, from a value of one of
+its own variables, is shared per layout like one that reads such a field
+(`layout._constructs`, `Layout.constructs`). A field declared `Prim.Array a` is a
+pointer whatever `a` is and does not count, and a newtype is never built.
+`tests/test_layout.py::test_a_generic_producer_agrees_with_a_ground_reader` pins
+it.
 
 ### Decisions for when this is done
 

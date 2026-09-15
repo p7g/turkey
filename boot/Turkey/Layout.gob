@@ -51,7 +51,7 @@ import Turkey.Core (Core(..), CoreKind(..), CBind(..), CProgram(..), CParam(..),
                     Mapper(..), mapKind, namesOf, abstractionBinders,
                     transparentParameters)
 import Turkey.Decls as Decls
-import Turkey.Decls (DeclTable(..))
+import Turkey.Decls (DeclTable(..), ConInfo(..))
 import Turkey.Diag as Diag
 import Turkey.Types as Ty
 import Turkey.Types (TVar, TCon, TApp, TFam, TFun, TTuple, TSet, TBottom)
@@ -154,19 +154,121 @@ fun applications(e : Core, out : Array (String, Array Ty.Type)) -> Unit {
     }))
 }
 
+-- Whether a term builds a value whose field layout it cannot know.
+--
+-- A transparent body *reads* a field at a layout decided elsewhere; this is the
+-- other half, a body that *writes* one. `fun mk(x : a) -> Box a` left generic
+-- past the cap holds `x` boxed and stores the box, while a ground reader of
+-- `Box Int` loads the same word as an `i64`. The field that matters is one
+-- *declared* at a bare type variable and given a value of one of this body's
+-- own variables. A field declared `Prim.Array a` is a pointer whatever `a` is,
+-- and a newtype is never built at all. See `turkey/layout.py`, `_constructs`.
+fun constructs(decls : DeclTable, e : Core, abstracted : Set.Set Int) -> Bool {
+    let found = Array.new(1)
+    constructions(decls, e, abstracted, found)
+    len(found) > 0
+}
+
+fun constructions(decls : DeclTable, e : Core, abstracted : Set.Set Int,
+                  found : Array Bool) -> Unit {
+    if len(found) > 0 { return }
+    match e.kind {
+        CApp(fn, args) -> match fn.kind {
+            CCon(name) -> match Decls.con(decls, name) {
+                Some(info) -> {
+                    let given = Array.map(args, fun(a) = a.ty)
+                    if writesUnknown(decls, declaredFields(info), given,
+                                     abstracted, e.ty) {
+                        Array.push(found, True)
+                    }
+                }
+                None -> {}
+            }
+            _ -> {}
+        }
+        CRecord(name, fields) -> match Decls.con(decls, name) {
+            Some(info) -> {
+                let names = match info.fields {
+                    Some(ns) -> ns
+                    None -> []
+                }
+                let params = declaredFields(info)
+                let declared = Array.new(len(fields))
+                let given = Array.new(len(fields))
+                for (label, value) in fields {
+                    var i = 0
+                    while i < len(names) && names[i] != label { i = i + 1 }
+                    if i < len(names) && i < len(params) {
+                        Array.push(declared, params[i])
+                        Array.push(given, value.ty)
+                    }
+                }
+                if writesUnknown(decls, declared, given, abstracted, e.ty) {
+                    Array.push(found, True)
+                }
+            }
+            None -> {}
+        }
+        _ -> {}
+    }
+    discard(mapKind(e.kind, Mapper {
+        expr = fun(x) = {
+            constructions(decls, x, abstracted, found)
+            x
+        },
+        type_ = fun(t) = t,
+        bind = fun(b) = {
+            constructions(decls, b.value, abstracted, found)
+            b
+        },
+    }))
+}
+
+fun declaredFields(info : ConInfo) -> Array Ty.Type = match info.scheme.body {
+    TFun(params, _) -> params
+    _ -> []
+}
+
+fun writesUnknown(decls : DeclTable, declared : Array Ty.Type,
+                  given : Array Ty.Type, abstracted : Set.Set Int,
+                  built : Ty.Type) -> Bool {
+    match Decls.erasedPayload(decls, built) {
+        Some(_) -> return False
+        None -> {}
+    }
+    var i = 0
+    while i < len(declared) && i < len(given) {
+        match Ty.prune(declared[i]) {
+            TVar(_) -> match Ty.prune(given[i]) {
+                TVar(cell) -> if Set.contains(abstracted, cell.id) { return True }
+                _ -> {}
+            }
+            _ -> {}
+        }
+        i = i + 1
+    }
+    False
+}
+
 -- The bindings whose abstracted layouts have to be known.
 --
--- The transparent ones, and then whatever calls them at a type of its own.
+-- The transparent ones and the ones that build values they cannot lay out
+-- (`constructs`), and then whatever calls them at a type of its own.
 --
 -- Every binding, not even only the ones reachable from `main`: there is more
 -- than one notion of reachable here, and a binding this pass declined to share
 -- because one walk could not see it is a binding the other walk hands the
 -- backend with no layouts. Sharing an unreachable binding costs a copy nothing
 -- emits.
-fun needsLayouts(binds : Map String CBind) -> Set.Set String {
+fun needsLayouts(decls : DeclTable, binds : Map String CBind) -> Set.Set String {
     let found = Set.new()
     for (name, b) in Map.entries(binds) {
         if transparent(b) { Set.add(found, name) }
+        let abstracted = Set.new()
+        for v in abstractionBinders(b) { Set.add(abstracted, v.id) }
+        if len(Set.elements(abstracted)) > 0 && constructs(decls, b.value, abstracted) {
+            Set.add(found, name)
+        }
     }
     var grew = True
     while grew {
@@ -224,7 +326,7 @@ fun share(program : CProgram, decls : DeclTable) -> CProgram {
     for b in Array.append(program.dicts, program.binds) {
         Map.put(binds, b.name, b)
     }
-    let shared = needsLayouts(binds)
+    let shared = needsLayouts(decls, binds)
     if len(Set.elements(shared)) == 0 { return program }
     let used = Set.new()
     for (name, _) in Map.entries(binds) { Set.add(used, name) }

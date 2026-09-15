@@ -109,9 +109,6 @@ def test_a_record_polymorphic_body_compiles(capped):
     assert "%inst.%HasField.cap.Main#Box" in names(checked.core)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "NATIVE-BACKEND.md 'A hole to close first': a generic producer stores its "
-    "field BOXED and a ground reader reads the same word as i64"))
 def test_a_generic_producer_agrees_with_a_ground_reader(capped, tmp_path,
                                                         capfd):
     """The producer/consumer disagreement `check_layouts` cannot see.

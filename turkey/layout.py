@@ -65,10 +65,10 @@ from dataclasses import fields as _dataclass_fields, replace
 from . import ast
 from . import backend_ir as bir
 from .backend_lower import layout_of
-from .core import (CAlt, CApp, CBind, CCon, CExpr, CMatch, CProgram, CTyApp,
-                   CVar, abstraction_binders, names_of,
+from .core import (CAlt, CApp, CBind, CCon, CExpr, CMatch, CProgram, CRecord,
+                   CTyApp, CVar, abstraction_binders, names_of,
                    transparent_parameters as core_transparent)
-from .types import Type, vars_of
+from .types import Type, TVar, prune, vars_of
 
 #: PROTOTYPE (ERRORS.md, existential layouts): every layout a packed variable
 #: can have been stored at, in the order an opened arm is copied for them.
@@ -131,29 +131,59 @@ def _opens(node) -> bool:
     return False
 
 
-def _packs(node, abstracted: set[int], decls) -> bool:
-    """Whether a term packs an existential at a type mentioning `abstracted`.
+def _constructs(node, abstracted: set[int], decls) -> bool:
+    """Whether a term builds a value whose field layout it cannot know.
 
-    PROTOTYPE. Packing stores the hidden variable's layout in the value, so a
-    body left generic in that variable would store "boxed" for a value it
-    actually holds at `i64` -- and the arm that opens it would read the array
-    at the width the code names rather than the one it was built at. Such a
-    body needs its layouts known exactly as a transparent one does.
+    A transparent body *reads* a field at a layout decided elsewhere; this is
+    the other half, a body that *writes* one. `fun mk(x : a) -> Box a` left
+    generic past the cap holds `x` boxed and stores the box, while a ground
+    reader of `Box Int` loads the same word as an `i64` (NATIVE-BACKEND.md, "A
+    hole to close first"). Such a body needs its layouts known exactly as a
+    transparent one does, so it is shared too.
 
-    `NATIVE-BACKEND.md`'s `fun mk(x : a) -> Box a` is the non-existential form
-    of the same disagreement, and this rule does not cover it.
+    The field that matters is one *declared* at a bare type variable and given
+    a value of one of this body's own variables: that is the only place the
+    written layout depends on an instantiation this body does not know. A
+    field declared `Prim.Array a` is a pointer whatever `a` is, and a newtype
+    is never built at all.
+
+    Packing an existential is stricter (PROTOTYPE, ERRORS.md): the value
+    records its hidden variables' layouts, so *any* argument mentioning this
+    body's variables -- an `Array a` included -- makes the stored code a guess.
     """
-    if (isinstance(node, CApp) and isinstance(node.fn, CCon) and decls is not None):
+    if decls is not None and isinstance(node, CApp) and isinstance(node.fn, CCon):
         info = decls.constructors.get(node.fn.name)
-        if (info is not None and info.is_existential
-                and any({v.id for v in vars_of(arg.ty)} & abstracted
-                        for arg in node.args)):
+        if info is not None and _writes_unknown(
+                info, info.scheme.body.params, [a.ty for a in node.args],
+                abstracted, node.ty, decls):
+            return True
+    if (decls is not None and isinstance(node, CRecord)
+            and node.con in decls.constructors):
+        info = decls.constructors[node.con]
+        declared = dict(zip(info.field_names or [], info.scheme.body.params))
+        if _writes_unknown(info, [declared[name] for name, _ in node.fields],
+                           [value.ty for _, value in node.fields],
+                           abstracted, node.ty, decls):
             return True
     if isinstance(node, (CExpr, CAlt, CBind)):
-        return any(_packs(getattr(node, f.name), abstracted, decls)
+        return any(_constructs(getattr(node, f.name), abstracted, decls)
                    for f in _fields(node))
     if isinstance(node, (list, tuple)):
-        return any(_packs(item, abstracted, decls) for item in node)
+        return any(_constructs(item, abstracted, decls) for item in node)
+    return False
+
+
+def _writes_unknown(info, declared: list[Type], given: list[Type],
+                    abstracted: set[int], built: Type, decls) -> bool:
+    if info.is_existential:
+        return any({v.id for v in vars_of(t)} & abstracted for t in given)
+    if decls.erased_payload(built) is not None:
+        return False
+    for field_ty, value_ty in zip(declared, given):
+        value_ty = prune(value_ty)
+        if (isinstance(prune(field_ty), TVar) and isinstance(value_ty, TVar)
+                and value_ty.id in abstracted):
+            return True
     return False
 
 
@@ -173,7 +203,7 @@ def _needs_layouts(binds: dict[str, CBind], decls=None) -> set[str]:
     """
     found = {name for name, bind in binds.items() if transparent(bind)}
     found |= {name for name, bind in binds.items()
-              if abstraction_binders(bind) and _packs(
+              if abstraction_binders(bind) and _constructs(
                   bind.value, {v.id for v in abstraction_binders(bind)}, decls)}
     while True:
         grew = False

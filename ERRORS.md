@@ -393,8 +393,8 @@ What it found:
    past the cap. It held `x` boxed and stored "boxed", and the opened copy then
    called an `i64` method with a box. `layout._packs` adds such bindings to the
    shared set. It is the existential form of NATIVE-BACKEND.md's `mk : a -> Box
-   a` hole; the general form is still the xfail in `tests/test_layout.py` and
-   should be closed by the same rule extended to every construction.
+   a` hole, and the general form is now closed by the same rule extended to
+   every construction (`layout._constructs`, in both implementations).
 3. **Copies multiply under inlining.** In the `packed_arrays` program, measured
    in backend IR instructions, the cost of one layout is about 1,400
    instructions. Copying for all 8 layouts gives 11,767. Copying only for keys

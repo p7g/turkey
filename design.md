@@ -565,6 +565,13 @@ only a single condition is implemented; a `,` after one is a parse error
 
 A block `{ s₁; ...; sₙ }` evaluates each statement in order. Declarations (`let`, `var`, `fun`) are in scope for all subsequent statements. The value of the block is the value of the last statement. If the last statement is a declaration, the block's value is `Unit`.
 
+A value computed and not used is a type error (SPEC-DELTAS 66): every
+statement but the last, the last statement of a `while`, `for` or `loop` body,
+and the last statement of a one-armed `if` must have type `Unit`, or have no
+value at all -- bottom, or a call to a function whose result type none of its
+parameters mentions, which by parametricity cannot return. `let _ = e` discards
+a value on purpose.
+
 ### 6.9 `e?` elaboration
 
 `e?` is the `Monad` instance's `bind`, with the rest of the enclosing statement

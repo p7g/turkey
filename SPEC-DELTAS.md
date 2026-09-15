@@ -2981,3 +2981,55 @@ named a subset, and one of those stays a subset on purpose to show `..`. Adding
 `..` needed `..` in the newline rule's starting tokens, so the rest can sit on
 its own line; nothing continues an expression with `..`, so no expression can
 be split by it. `err_record_pattern_missing.gob` pins the error.
+
+### 66. A discarded value is an error
+
+`1 + 2` as a statement compiled with no diagnostic, and so did
+`Array.pop(xs)` where the popped element was the thing the author meant to use.
+
+**A value computed and not used is now a type error**, unless it has type
+`Unit` or has no value at all. The positions are the ones whose value nobody
+reads: every statement of a block but the last, the last statement of a
+`while`, `for` or `loop` body, and the last statement of a one-armed `if`. The
+error is `this expression's value has type 'Option Int' and is discarded; use
+it, or write 'let _ = ...'`. `let _ = e` already worked, since `_` is a pattern,
+so no `ignore` is needed.
+
+**Two schools, and this is the second.** Rust's `#[must_use]` and Swift's
+`@discardableResult` opt in per type, and Rust left the blanket
+`unused_results` lint allow-by-default on a signal-to-noise argument:
+`map.insert` returning the old value is discarded constantly. OCaml's warning
+10, `non-unit-statement`, and F#'s FS0020 are on by default with an explicit
+discard, and both are considered successes by their users. Turkey's noise floor
+is lower than Rust's -- it is procedural and mutates through records and arrays,
+so nearly every statement is already `Unit` -- and the measurement agrees. It is
+an error rather than a warning because there is no warning channel left to put
+it on (delta 61).
+
+**What has no value.** Bottom, first: `return`, `break`, a `loop` with no
+`break`. Beyond it, a *residual type variable is not exempt by itself*, because
+a genuinely generic value -- `Array.get(xs, i) : a` over `xs : Array a` -- is a
+variable too, and discarding it is exactly the bug. What is exempt is what
+parametricity says cannot return: a call whose resolved function type has a
+result variable that none of its parameter types mentions. A function of type
+`fun(String) -> a` has no way to make an `a`, so `outOfBounds`, and any `fail`
+written that way, diverges; `fun(Array a, Int) -> a` does not. A branch -- an
+`if` with an `else`, a `match`, a block -- has no value when every way through it
+has none. Everything else that resolves to a variable is an error.
+
+The imprecision that is left errs toward rejecting. A divergent call laundered
+through a generic function, `id(fail("x"))`, reads as a value of type `a`; a
+constrained phantom result, `fun zero[Num a]() -> a`, would too if its variable
+were still open. Both want `let _ =`, and neither occurs in the corpus.
+
+**What it cost.** 52 sites, every one in `boot`. 38 were the parser discarding
+the token `advance` returns, which is now `step(p)`, a `Unit` wrapper that says
+the parser has already looked at the token; nine were `Set.remove` and
+`Map.delete` answering whether something was there; the rest were an
+`expect`, an `eat` and an `Array.pop` used for their effect. The library and
+the test programs had none. The count is from the check itself: a measurement
+run beforehand, walking the typed tree from outside, found 44 and missed eight,
+which is a small argument for measuring with the thing being built.
+
+**Scope.** `discards.gob` accepts the exemptions; `err_discarded_value.gob`
+rejects. No existing golden moved.

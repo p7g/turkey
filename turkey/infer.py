@@ -51,7 +51,7 @@ from .evidence import Abstraction, InstancePlan, MethodImpl, Use, dict_name
 from .errors import Span, TypeError_
 from .typed import TypeTable
 from .types import (
-    BOOL, BOTTOM, CHAR, EQUALS, FLOAT, INT, STRING, UNIT, Pred, Scheme, TBottom, TFam,
+    BOOL, BOTTOM, CHAR, EQUALS, FLOAT, INT, STRING, UNIT, Pred, Scheme, TBottom, TCon, TFam,
     TFun, TSet, TTuple, TVar, Type, apply, array_of, float_literal_set,
     int_literal_set, show, show_pred, vars_of,
 )
@@ -127,6 +127,11 @@ class Generator:
         # without a second arm to fall to -- `let`, `var`, a parameter, a
         # `for ... in` element (SPEC-DELTAS 63).
         self.binder_sites: list[tuple[ast.Pattern, Type]] = []
+        # And every expression whose value is thrown away, so its solved type
+        # can be checked for having nothing to throw away (SPEC-DELTAS 66).
+        # Recorded after the expression is generated, in both implementations,
+        # so the first error reported is the same on either side.
+        self.discard_sites: list[ast.Expr] = []
 
     # -- building ----------------------------------------------------------
 
@@ -518,6 +523,51 @@ class Generator:
                 f"this pattern is refutable; {detail}. Use 'if let' or 'match'",
                 pattern.span,
             )
+        # A value computed and thrown away is an error unless there is no
+        # value (SPEC-DELTAS 66). OCaml's warning 10 and F#'s FS0020, made an
+        # error because there is no warning channel left to put it on.
+        for expr in self.discard_sites:
+            ty = self.types.of(expr)
+            if (isinstance(ty, TCon) and ty.name == UNIT.name) or self._diverges(expr):
+                continue
+            raise TypeError_(
+                f"this expression's value has type '{show(ty)}' and is "
+                f"discarded; use it, or write 'let _ = ...'",
+                expr.span,
+            )
+
+    def _discards_last(self, body: ast.Expr) -> None:
+        """A block whose value nobody reads -- a loop body, a one-armed `if`
+        -- discards its last statement's value."""
+        if (isinstance(body, ast.EBlock) and body.stmts
+                and isinstance(body.stmts[-1], ast.SExpr)):
+            self.discard_sites.append(body.stmts[-1].expr)
+
+    def _diverges(self, e: ast.Expr) -> bool:
+        """Whether `e` has no value to discard, by parametricity.
+
+        Bottom says so outright. Beyond it, a call whose result type is a
+        variable its parameters do not mention cannot return: a function of
+        type `fun(String) -> a` has no way to make an `a`, so `panic` and
+        `outOfBounds` diverge and `Array.get(xs, i) : a` over `xs : Array a`
+        does not. A branch diverges when every way through it does.
+        """
+        ty = self.types.of(e)
+        if isinstance(ty, TBottom):
+            return True
+        if isinstance(e, ast.ECall):
+            fn = self.types.of(e.fn)
+            return (isinstance(fn, TFun) and isinstance(fn.ret, TVar)
+                    and all(v.id != fn.ret.id for v in vars_of(*fn.params)))
+        if isinstance(e, ast.EIf):
+            return (e.otherwise is not None and self._diverges(e.then)
+                    and self._diverges(e.otherwise))
+        if isinstance(e, ast.EMatch):
+            return all(self._diverges(arm.body) for arm in e.arms)
+        if isinstance(e, ast.EBlock):
+            return (bool(e.stmts) and isinstance(e.stmts[-1], ast.SExpr)
+                    and self._diverges(e.stmts[-1].expr))
+        return False
 
     @staticmethod
     def _item_names(item: ast.Stmt) -> list[str]:
@@ -866,6 +916,8 @@ class Generator:
         if isinstance(stmt, (ast.SLet, ast.SVar, ast.SFun)):
             return self.bind_group([stmt], lambda: self.gen_sequence(rest))
         value = self.gen_stmt(stmt)
+        if rest and isinstance(stmt, ast.SExpr):
+            self.discard_sites.append(stmt.expr)
         return self.gen_sequence(rest) if rest else value
 
     def gen_stmt(self, stmt: ast.Stmt) -> Type:
@@ -1107,6 +1159,7 @@ class Generator:
         self.eq(self.gen_expr(e.cond), BOOL, e.cond.span, "an 'if' condition")
         then = self.gen_expr(e.then)
         if e.otherwise is None:
+            self._discards_last(e.then)
             return UNIT  # section 6.7: statement-style `if` has no value
         return self.join(then, self.gen_expr(e.otherwise), e.span, "the branches of an 'if'")
 
@@ -1114,6 +1167,7 @@ class Generator:
         self.eq(self.gen_expr(e.cond), BOOL, e.cond.span, "a 'while' condition")
         self.loop_stack.append(LoopCtx("while", UNIT))
         self.gen_expr(e.body)
+        self._discards_last(e.body)
         self.loop_stack.pop()
         return UNIT
 
@@ -1144,6 +1198,7 @@ class Generator:
         self.push()
         self.loop_stack.append(LoopCtx("for", UNIT))
         self.gen_expr(e.body)
+        self._discards_last(e.body)
         self.loop_stack.pop()
         body = self.pop()
         self.scopes.pop()
@@ -1155,6 +1210,7 @@ class Generator:
             self.eq(self.gen_expr(e.cond), BOOL, e.cond.span, "a 'for' condition")
             self.loop_stack.append(LoopCtx("for", UNIT))
             self.gen_expr(e.body)
+            self._discards_last(e.body)
             if e.step is not None:
                 self.gen_stmt(e.step)
             self.loop_stack.pop()
@@ -1173,6 +1229,7 @@ class Generator:
         ctx = LoopCtx("loop", self.fresh())
         self.loop_stack.append(ctx)
         self.gen_expr(e.body)
+        self._discards_last(e.body)
         self.loop_stack.pop()
         # Section 6.7: a `loop` never falls through, so its value comes only
         # from its breaks. With no break at all it never produces one.

@@ -82,9 +82,16 @@ fun advance(p : P) -> Token {
     tok
 }
 
+-- `advance` for its effect alone. A discarded value is an error (SPEC-DELTAS
+-- 66), and moving past a token the caller has already looked at is most of
+-- what a parser does.
+fun step(p : P) -> Unit {
+    let _ = advance(p)
+}
+
 fun eat(p : P, name : String) -> Bool {
     if at(p, name) {
-        advance(p)
+        step(p)
         True
     } else {
         False
@@ -98,12 +105,12 @@ fun expect(p : P, name : String) -> Token = expectWhat(p, name, "'" + name + "'"
 -- in a `while` answers `Unit`, and the two do not unify. This is the one-word
 -- fix, used wherever the token consumed is not the answer.
 fun skipToken(p : P, name : String) -> Unit {
-    expect(p, name)
+    let _ = expect(p, name)
     ()
 }
 
 fun skipWhat(p : P, name : String, what : String) -> Unit {
-    expectWhat(p, name, what)
+    let _ = expectWhat(p, name, what)
     ()
 }
 
@@ -139,7 +146,7 @@ fun text(tok : Token) -> String = match tok.value {
 }
 
 fun skipNewlines(p : P) -> Unit {
-    while at(p, "NEWLINE") { advance(p) }
+    while at(p, "NEWLINE") { step(p) }
 }
 
 fun setNoRecord(p : P, flag : Bool) -> Bool {
@@ -258,7 +265,7 @@ fun parseModuleHeader(p : P) -> ModuleHeader {
     var exports : Option (Array ExportItem) = None
     if at(p, "(") {
         let items = Array.new(8)
-        advance(p)
+        step(p)
         while !at(p, ")") {
             Array.push(items, parseExportItem(p))
             if !eat(p, ",") { break }
@@ -282,7 +289,7 @@ fun parseExportItem(p : P) -> ExportItem {
     }
     var subs : Option (Array String) = None
     if isConid(tok) && at(p, "(") {
-        advance(p)
+        step(p)
         let names = Array.new(4)
         while !at(p, ")") {
             Array.push(names, text(advance(p)))
@@ -315,7 +322,7 @@ fun parseImport(p : P) -> ImportDecl {
     -- the module and narrows what it brings. Aliased imports are
     -- qualified-only; unaliased ones bring both spellings.
     if at(p, "hiding") {
-        advance(p)
+        step(p)
         hidden = Some(parseParenNameList(p))
     } else if at(p, "(") {
         items = Some(parseParenNameList(p))
@@ -491,17 +498,17 @@ fun parseAtype(p : P) -> Type {
     let tok = cur(p)
     match kindOf(p) {
         "IDENT" -> {
-            advance(p)
+            step(p)
             mkType(p, tok.span, TEVar(text(tok)))
         }
         -- A qualified type constructor: `S.Node`. The dotted chain is one name,
         -- resolved as one.
         "CONID" -> {
-            advance(p)
+            step(p)
             mkType(p, tok.span, TECon(dottedFrom(p, tok), Array.new(0)))
         }
         "fun" -> {
-            advance(p)
+            step(p)
             skipToken(p, "(")
             let params = Array.new(2)
             while !at(p, ")") {
@@ -522,14 +529,14 @@ fun dottedFrom(p : P, first : Token) -> String {
     let parts = Array.new(2)
     Array.push(parts, text(first))
     while at(p, ".") && Token.kindName(peek(p, 1).kind) == "CONID" {
-        advance(p)
+        step(p)
         Array.push(parts, text(advance(p)))
     }
     String.join(parts, ".")
 }
 
 fun parseParenType(p : P, tok : Token) -> Type {
-    advance(p)
+    step(p)
     let elems = Array.new(2)
     Array.push(elems, parseTypeExpr(p))
     while eat(p, ",") {
@@ -628,7 +635,7 @@ fun parseSignature(p : P, s : Span, name : String, context : Array Pred) -> FunD
 -- `Show (Elem c)` begin identically and the `~` is two atypes away.
 fun parseContext(p : P) -> Array Pred {
     if !at(p, "[") { return Array.new(0) }
-    advance(p)
+    step(p)
     let preds = Array.new(2)
     loop {
         Array.push(preds, parsePredEntry(p))
@@ -817,7 +824,7 @@ fun parseStmt(p : P) -> Stmt {
     -- Assignment: the grammar puts these only in the C-style `for` header, but
     -- blocks plainly need them too.
     if at(p, "=") {
-        advance(p)
+        step(p)
         checkAssignable(p, e, s)
         let value = parseExpr(p)
         p.noRecord = saved
@@ -856,7 +863,7 @@ fun parseBlock(p : P) -> Expr {
 fun parsePattern(p : P) -> Pat {
     let pattern = parsePatternAtom(p)
     if at(p, ":") {
-        advance(p)
+        step(p)
         return mkPat(p, pattern.span, PAnnot(pattern, parseTypeExpr(p)))
     }
     pattern
@@ -866,7 +873,7 @@ fun parsePatternAtom(p : P) -> Pat {
     let tok = cur(p)
     match kindOf(p) {
         "IDENT" -> {
-            advance(p)
+            step(p)
             if text(tok) == "_" {
                 mkPat(p, tok.span, PWild)
             } else {
@@ -875,7 +882,7 @@ fun parsePatternAtom(p : P) -> Pat {
         }
         "CONID" -> parseConPattern(p)
         "INT" | "FLOAT" | "STRING" | "CHAR" -> {
-            advance(p)
+            step(p)
             mkPat(p, tok.span, PLit(literalOf(tok)))
         }
         "(" -> parseParenPattern(p, tok)
@@ -884,7 +891,7 @@ fun parsePatternAtom(p : P) -> Pat {
 }
 
 fun parseParenPattern(p : P, tok : Token) -> Pat {
-    advance(p)
+    step(p)
     let elems = Array.new(2)
     Array.push(elems, parsePattern(p))
     while eat(p, ",") {
@@ -912,7 +919,7 @@ fun literalOf(tok : Token) -> Lit = match tok.value {
 fun parseConPattern(p : P) -> Pat {
     let tok = expect(p, "CONID")
     if at(p, "{") {
-        advance(p)
+        step(p)
         skipNewlines(p)
         let fields = Array.new(4)
         var rest = False
@@ -920,7 +927,7 @@ fun parseConPattern(p : P) -> Pat {
             if eat(p, "..") {
                 -- The rest, deliberately unnamed; last, or it is not the rest.
                 rest = True
-                fieldSeparator(p)
+                let _ = fieldSeparator(p)
                 if !at(p, "}") {
                     oops(p, "'..' must be the last thing in a record pattern",
                          cur(p).span)
@@ -939,7 +946,7 @@ fun parseConPattern(p : P) -> Pat {
     }
     let args = Array.new(2)
     if at(p, "(") {
-        advance(p)
+        step(p)
         while !at(p, ")") {
             Array.push(args, parsePattern(p))
             if !eat(p, ",") { break }
@@ -957,7 +964,7 @@ fun parseConPattern(p : P) -> Pat {
 fun parseExpr(p : P) -> Expr {
     let e = parseBinary(p, 0)
     if at(p, ":") {
-        advance(p)
+        step(p)
         return mkExpr(p, e.span, EAnnot(e, parseTypeExpr(p)))
     }
     e
@@ -995,7 +1002,7 @@ fun parsePostfix(p : P) -> Expr {
     var e = parseAtom(p)
     loop {
         if at(p, "(") {
-            advance(p)
+            step(p)
             let saved = setNoRecord(p, False)
             let args = Array.new(4)
             while !at(p, ")") {
@@ -1006,14 +1013,14 @@ fun parsePostfix(p : P) -> Expr {
             p.noRecord = saved
             e = mkExpr(p, e.span, ECall(e, args))
         } else if at(p, "[") {
-            advance(p)
+            step(p)
             let saved = setNoRecord(p, False)
             let index = parseExpr(p)
             p.noRecord = saved
             skipToken(p, "]")
             e = mkExpr(p, e.span, EIndex(e, index, None, None))
         } else if at(p, ".") && memberFollows(p) {
-            advance(p)
+            step(p)
             let member = advance(p)
             match member.kind {
                 KInt -> { e = mkExpr(p, e.span, EProject(e, intOf(member))) }
@@ -1024,7 +1031,7 @@ fun parsePostfix(p : P) -> Expr {
             -- than any operator and chains with them. `bind` is
             -- marked, so a program's own `bind` is not what a `?`
             -- means.
-            advance(p)
+            step(p)
             e = mkExpr(p, e.span,
                        EQuestion(e, Some(method(p, e.span, "bind"))))
         } else {
@@ -1051,11 +1058,11 @@ fun parseAtom(p : P) -> Expr {
     let tok = cur(p)
     match kindOf(p) {
         "INT" | "FLOAT" | "STRING" | "CHAR" -> {
-            advance(p)
+            step(p)
             mkExpr(p, tok.span, ELit(literalOf(tok)))
         }
         "IDENT" -> {
-            advance(p)
+            step(p)
             mkExpr(p, tok.span, EVar(text(tok), False))
         }
         "CONID" -> parseConidAtom(p)
@@ -1063,11 +1070,11 @@ fun parseAtom(p : P) -> Expr {
         "[" -> parseArrayAtom(p, tok)
         "{" -> parseBlock(p)
         "do" -> {
-            advance(p)
+            step(p)
             mkExpr(p, tok.span, EDo(parseBlock(p)))
         }
         "fun" -> {
-            advance(p)
+            step(p)
             let params = parseParamList(p)
             var ret : Option Type = None
             if eat(p, "->") { ret = Some(parseTypeExpr(p)) }
@@ -1075,7 +1082,7 @@ fun parseAtom(p : P) -> Expr {
         }
         "if" -> parseIf(p)
         "while" -> {
-            advance(p)
+            step(p)
             if at(p, "let") || at(p, "var") {
                 -- `loop { match e { p -> A, _ -> break } }`, as in Python.
                 let s = tok.span
@@ -1093,20 +1100,20 @@ fun parseAtom(p : P) -> Expr {
         }
         "for" -> parseFor(p)
         "loop" -> {
-            advance(p)
+            step(p)
             mkExpr(p, tok.span, ELoop(parseBlock(p)))
         }
         "match" -> parseMatch(p)
         "return" -> {
-            advance(p)
+            step(p)
             mkExpr(p, tok.span, EReturn(parseOptionalValue(p)))
         }
         "break" -> {
-            advance(p)
+            step(p)
             mkExpr(p, tok.span, EBreak(parseOptionalValue(p)))
         }
         "continue" -> {
-            advance(p)
+            step(p)
             mkExpr(p, tok.span, EContinue)
         }
         _ -> oops(p, "expected an expression, found " + describe(tok), tok.span)
@@ -1115,9 +1122,9 @@ fun parseAtom(p : P) -> Expr {
 
 -- `()` is Unit, `(e)` is grouping, and `(e, ...)` is a tuple.
 fun parseParenAtom(p : P, tok : Token) -> Expr {
-    advance(p)
+    step(p)
     if at(p, ")") {
-        advance(p)
+        step(p)
         return mkExpr(p, tok.span, EUnit)
     }
     let saved = setNoRecord(p, False)
@@ -1139,7 +1146,7 @@ fun parseParenAtom(p : P, tok : Token) -> Expr {
 }
 
 fun parseArrayAtom(p : P, tok : Token) -> Expr {
-    advance(p)
+    step(p)
     let saved = setNoRecord(p, False)
     let elems = Array.new(4)
     while !at(p, "]") {
@@ -1159,11 +1166,11 @@ fun parseConidAtom(p : P) -> Expr {
     -- A trailing lowercase name makes the whole chain a qualified *variable*:
     -- `Data.Array.push`, not the constructor `Data.Array` applied to anything.
     if at(p, ".") && Token.kindName(peek(p, 1).kind) == "IDENT" {
-        advance(p)
+        step(p)
         return mkExpr(p, tok.span, EVar(name + "." + text(advance(p)), False))
     }
     if at(p, "{") && !p.noRecord {
-        advance(p)
+        step(p)
         skipNewlines(p)
         let fields = Array.new(4)
         let saved = setNoRecord(p, False)
@@ -1229,7 +1236,7 @@ fun parseIfLet(p : P, s : Span) -> Expr {
 fun parseBindingCondition(p : P) -> (Pat, Expr, Expr) {
     let s = cur(p).span
     let mutable = at(p, "var")
-    advance(p)
+    step(p)
     let saved = setNoRecord(p, False)
     let pat = parsePattern(p)
     skipToken(p, "=")
@@ -1341,7 +1348,7 @@ fun parseMatchArm(p : P) -> Arm {
     -- A leading `|` is allowed. Because a newline before `|` is always dropped,
     -- a `|` before the arm's `->` continues the pattern list while a `|` after a
     -- finished arm begins the next one, so the two readings never collide.
-    eat(p, "|")
+    let _ = eat(p, "|")
     let s = cur(p).span
     let patterns = Array.new(2)
     Array.push(patterns, parsePattern(p))

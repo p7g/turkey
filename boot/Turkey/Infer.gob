@@ -115,6 +115,9 @@ type Generator = Generator {
     -- And irrefutability: every pattern that binds with no second arm to fall
     -- to (SPEC-DELTAS 63).
     binderSites : Array (Pat, Ty.Type),
+    -- And every expression whose value is thrown away (SPEC-DELTAS 66),
+    -- recorded after it is generated, as `turkey/infer.py` does.
+    discardSites : Array Expr,
 }
 
 fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
@@ -126,7 +129,7 @@ fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
         scopes = [namesOf(builtins)], fnStack = Array.new(4),
         loopStack = Array.new(4), tyvarScopes = [Map.new()],
         warnings = Array.new(4), matchSites = Array.new(8),
-        binderSites = Array.new(8),
+        binderSites = Array.new(8), discardSites = Array.new(8),
     }
 }
 
@@ -711,6 +714,70 @@ fun checkExhaustiveness(g : Generator) -> Unit {
             }
         }
     }
+    -- A value computed and thrown away is an error unless there is no value
+    -- (SPEC-DELTAS 66).
+    for x in g.discardSites {
+        let ty = Typed.of_(g.types, x)
+        let unit = match ty {
+            TCon(c) -> c.name == "Unit"
+            _ -> False
+        }
+        if !unit && !diverges(g, x) {
+            oops("this expression's value has type '" + Ty.show(ty)
+                 + "' and is discarded; use it, or write 'let _ = ...'",
+                 Some(x.span))
+        }
+    }
+}
+
+-- A block whose value nobody reads -- a loop body, a one-armed `if` -- discards
+-- its last statement's value.
+fun discardsLast(g : Generator, body : Expr) -> Unit = match body.kind {
+    EBlock(stmts) -> if len(stmts) > 0 {
+        match stmts[len(stmts) - 1].kind {
+            SExpr(x) -> Array.push(g.discardSites, x)
+            _ -> {}
+        }
+    }
+    _ -> {}
+}
+
+-- Whether `e` has no value to discard, by parametricity: bottom, or a call whose
+-- result is a variable its parameters do not mention -- `fun(String) -> a` has no
+-- way to make an `a` -- or a branch every way through which diverges. See
+-- `turkey/infer.py`.
+fun diverges(g : Generator, e : Expr) -> Bool {
+    match Typed.of_(g.types, e) {
+        TBottom -> return True
+        _ -> {}
+    }
+    match e.kind {
+        ECall(fn, _) -> match Typed.of_(g.types, fn) {
+            TFun(params, ret) -> match Ty.prune(ret) {
+                TVar(cell) -> {
+                    for v in Ty.varsOf(params) { if v.id == cell.id { return False } }
+                    True
+                }
+                _ -> False
+            }
+            _ -> False
+        }
+        EIf(_, then, otherwise) -> match otherwise {
+            Some(o) -> diverges(g, then) && diverges(g, o)
+            None -> False
+        }
+        EMatch(_, arms) -> {
+            for arm in arms { if !diverges(g, armBody(arm)) { return False } }
+            True
+        }
+        EBlock(stmts) -> if len(stmts) == 0 { False } else {
+            match stmts[len(stmts) - 1].kind {
+                SExpr(x) -> diverges(g, x)
+                _ -> False
+            }
+        }
+        _ -> False
+    }
 }
 
 -- -- binders -----------------------------------------------------------------------
@@ -1107,7 +1174,13 @@ fun genSequence(g : Generator, stmts : Array Stmt, from : Int) -> Ty.Type {
         _ -> {}
     }
     let value = genStmt(g, stmt)
-    if from + 1 < len(stmts) { genSequence(g, stmts, from + 1) } else { value }
+    if from + 1 < len(stmts) {
+        match stmt.kind {
+            SExpr(x) -> Array.push(g.discardSites, x)
+            _ -> {}
+        }
+        genSequence(g, stmts, from + 1)
+    } else { value }
 }
 
 -- A statement that binds nothing. Binders go through `bindGroup`.
@@ -1286,7 +1359,10 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
         let thenType = genExpr(g, then)
         match otherwise {
             -- design.md 6.7: statement-style `if` has no value.
-            None -> Ty.tUnit()
+            None -> {
+                discardsLast(g, then)
+                Ty.tUnit()
+            }
             Some(o) -> join(g, thenType, genExpr(g, o), Some(e.span),
                             "the branches of an 'if'")
         }
@@ -1297,6 +1373,7 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
             kind = "while", result = Ty.tUnit(), sawBreak = False,
         })
         discard(genExpr(g, body))
+        discardsLast(g, body)
         discard(Array.pop(g.loopStack))
         Ty.tUnit()
     }
@@ -1309,6 +1386,7 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
                 kind = "for", result = Ty.tUnit(), sawBreak = False,
             })
             discard(genExpr(g, body))
+            discardsLast(g, body)
             match step {
                 Some(s) -> discard(genStmt(g, s))
                 None -> {}
@@ -1335,6 +1413,7 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
         let ctx = LoopCtx { kind = "loop", result = fresh(g), sawBreak = False }
         Array.push(g.loopStack, ctx)
         discard(genExpr(g, body))
+        discardsLast(g, body)
         discard(Array.pop(g.loopStack))
         -- design.md 6.7: a `loop` never falls through, so its value comes only
         -- from its breaks. With no break at all it never produces one.
@@ -1524,6 +1603,7 @@ fun genForIn(g : Generator, e : Expr, pat : Pat, iterable : Expr, body : Expr,
         kind = "for", result = Ty.tUnit(), sawBreak = False,
     })
     discard(genExpr(g, body))
+    discardsLast(g, body)
     discard(Array.pop(g.loopStack))
     let inner = pop(g)
     discard(Array.pop(g.scopes))

@@ -325,9 +325,12 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             runtimeCall(s, d, runtimeSymbolOf("turkey_closure_new"),
                         [address(s, symbolFor(code))],
                         [immediate(s, count), immediate(s, bitmap)])
-        ClosureCapture(closure, index, v) ->
-            runtimeCall(s, d, runtimeSymbolOf("turkey_closure_capture"),
-                        [A.reg(closure)], [immediate(s, index), raw(s, v)])
+        ClosureCapture(closure, index, v) -> {
+            let env = temp(s, Ssa.traced(Ptr))
+            emit(s, A.Ldr(env, A.Offset(A.reg(closure), 32), A.W64))
+            emit(s, A.Str(A.reg(v), A.Offset(env, 24 + 8 * index), A.W64))
+            emit(s, A.Mov(d, A.xzr, A.W64))
+        }
         Call(callee, args) -> {
             -- Each argument's file comes from its representation, which is the
             -- one place that fact is written down. A `Float` parameter is a

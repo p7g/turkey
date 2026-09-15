@@ -2189,6 +2189,27 @@ the Python-built compiler. Successive self-hosted generations emit
 byte-identical LLVM. The focused SSA/selection/native checks passed **235
 tests**; the complete suite passed **1,549 tests**, with 153 skips.
 
+**Follow-up cleanup.** The older accessor deletions (`2614c12`, `32791c5`)
+left `turkey_object_set` because `turkey_closure_capture` still called it.
+Closure capture initialization now emits an environment load and a direct
+slot store in Python LLVM, boot LLVM and native selection. Both runtime
+functions, their declarations and the orphaned `object_index` helper are
+deleted. No generic object-field runtime helper remains.
+
+A rebuilt self-hosted compiler preserves optimizer output byte for byte and
+successive self-hosted generations emit identical LLVM. A same-source spot
+check measured 18.60 s before and 18.45 s after (GC 8.678 / 8.681 s); these
+runs overlapped regression testing, so they establish no additional speedup.
+Allocations were 547,089,033 / 547,089,029: string 4,159,660 / 4,159,656;
+all other counts unchanged (constructor/tuple 41,274,187, record 266,629,898,
+array 48,654,366, closure 90,459,438, environment 90,459,052, box 0,
+cell 5,452,432). Both runs collected 111 times.
+
+Validation: **1,549 passed, 153 skipped**, including compiler agreement,
+native execution and GC stress. The suite ran against an isolated copy of
+`c63d765` plus this cleanup because unrelated type-system work was changing
+in the shared workspace. The focused native/selection/SSA run passed 235 tests.
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

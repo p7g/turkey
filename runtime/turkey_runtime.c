@@ -887,20 +887,6 @@ void *turkey_object_new(int32_t kind, int32_t tag, int64_t count,
     return object;
 }
 
-static int object_index(TurkeyObject *object, int64_t index) {
-    if (index < 0 || index >= object->count) {
-        turkey_panic("invalid object field");
-        return 0;
-    }
-    return 1;
-}
-
-void turkey_object_set(void *pointer, int64_t index, uint64_t value) {
-    if (!valid_heap_pointer(pointer)) return;
-    TurkeyObject *object = pointer;
-    if (object_index(object, index)) object->slots[index] = value;
-}
-
 void *turkey_box(uint64_t value, int32_t layout) {
     TurkeyObject *box = turkey_object_new(5, layout, 1, 0);
     if (box != NULL) box->slots[0] = value;
@@ -1084,12 +1070,6 @@ void *turkey_closure_new(uint64_t code, int64_t capture_count,
     closure->slots[1] = (uint64_t)(uintptr_t)environment;
     turkey_root_leave(&frame);
     return closure;
-}
-
-void turkey_closure_capture(void *pointer, int64_t index, uint64_t value) {
-    if (!valid_object_kind(pointer, 3)) return;
-    TurkeyObject *closure = pointer;
-    turkey_object_set((void *)(uintptr_t)closure->slots[1], index, value);
 }
 
 /* ------------------------------------------------------------ the outside world

@@ -289,12 +289,10 @@ fun declareRuntime(e : Emit) -> Unit {
         "declare i8 @turkey_write(ptr)",
         "declare ptr @turkey_cell_new(i64, i32)",
         "declare ptr @turkey_object_new(i32, i32, i64, i64)",
-        "declare void @turkey_object_set(ptr, i64, i64)",
         "declare ptr @turkey_box(i64, i32)",
         "declare i64 @turkey_unbox(ptr, i32)",
         "declare ptr @turkey_array_new(i64, i64, i32, i32)",
         "declare ptr @turkey_closure_new(i64, i64, i64)",
-        "declare void @turkey_closure_capture(ptr, i64, i64)",
         "declare void @turkey_panic(ptr)",
         "declare void @turkey_panic_string(ptr)",
         "declare i32 @turkey_panicked()",
@@ -826,8 +824,11 @@ fun emitInst(e : Emit, f : Func Low, i : Low) -> Unit {
         ClosureCapture(closure, index, v) -> {
             let held = Ssa.repOf(f, v)
             let raw = widened(e, f, v, held)
-            line(e, "  call void @turkey_closure_capture(ptr " + reg(closure)
-                    + ", i64 " + Int.toString(index) + ", i64 " + raw + ")")
+            let envSlot = slotAddress(e, reg(closure), "1")
+            let env = fresh(e)
+            line(e, "  " + env + " = load ptr, ptr " + envSlot)
+            let address = slotAddress(e, env, Int.toString(index))
+            line(e, "  store i64 " + raw + ", ptr " + address)
             line(e, "  " + dst + " = add i8 0, 0")
         }
         Call(callee, args) -> {

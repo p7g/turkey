@@ -37,7 +37,7 @@ def _runtime_entry_points() -> set[str]:
 
 ALLOWED_RUNTIME_CALLS = {
     "turkey_object_new", "turkey_array_new", "turkey_cell_new",
-    "turkey_closure_new", "turkey_closure_capture",
+    "turkey_closure_new",
     "turkey_box", "turkey_unbox",
     "turkey_string_new", "turkey_string_concat", "turkey_string_concat_all",
     "turkey_string_eq", "turkey_string_lt", "turkey_string_byte_length",

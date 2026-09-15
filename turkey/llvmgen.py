@@ -409,7 +409,6 @@ class _Emitter:
         self._runtime("turkey_unbox", _I64, [_PTR, _I32])
         self._runtime("turkey_array_new", _PTR, [_I64, _I64, _I32, _I32])
         self._runtime("turkey_closure_new", _PTR, [_I64, _I64, _I64])
-        self._runtime("turkey_closure_capture", ir.VoidType(), [_PTR, _I64, _I64])
         self._runtime("turkey_panic", ir.VoidType(), [_PTR])
         self._runtime("turkey_panic_string", ir.VoidType(), [_PTR])
         self._runtime("turkey_panicked", _I32, [])
@@ -1061,10 +1060,12 @@ class _Emitter:
         if op in ("closure_static", "function_closure"):
             return self._static_closure(builder, instruction.args[0]), builder
         if op == "closure_capture":
-            builder.call(self.runtime["turkey_closure_capture"], [
-                args[0], ir.Constant(_I64, int(instruction.args[1])),
-                self._to_i64(builder, args[1]),
-            ])
+            environment = builder.inttoptr(
+                self._heap_load(builder, self._object_slot(builder, args[0], 1)),
+                _PTR)
+            self._heap_store(
+                builder, self._to_i64(builder, args[1]),
+                self._object_slot(builder, environment, int(instruction.args[1])))
             return None, builder
         if op == "closure_call":
             closure = args[0]

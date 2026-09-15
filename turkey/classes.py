@@ -316,6 +316,7 @@ class ClassTable:
             for method in info.methods.values():
                 for var in method.scheme.quantified:
                     default_kind(var.kind)
+        self.check_constructor_contexts()
 
         registered = [self._resolve_instance(d, module) for d in instances]
         # Coverage is checked only once every instance is in the table, since
@@ -323,6 +324,29 @@ class ClassTable:
         # `Semigroup (Array a)` written further down the file.
         for inst in registered:
             self._check_instance(inst)
+
+    def check_constructor_contexts(self) -> None:
+        """The class half of an existential constructor's bracket.
+
+        `DeclTable` builds the predicates before any class is registered, so it
+        cannot know whether `Error` names one or what kind its variable has.
+        This is the same check `resolve_context` makes for a `fun`, made once
+        the classes exist (SPEC-DELTAS 68).
+        """
+        for con, written in self.decls.unchecked_contexts:
+            for pred, source in zip(con.context, written.context):
+                info = self.classes.get(pred.name)
+                if info is None:
+                    raise TypeError_(f"unknown class '{pred.name}'", source.span)
+                arg = pred.args[0]
+                if not unify_kinds(kind_of(arg), kind_of(info.var)):
+                    raise TypeError_(
+                        f"'{show(arg)}' has kind {show_kind(kind_of(arg))}, but "
+                        f"'{pred.name}' constrains a type of kind "
+                        f"{show_kind(kind_of(info.var))}",
+                        source.span,
+                    )
+        self.decls.unchecked_contexts.clear()
 
     def _declare_families(self, d: ast.ClassDecl) -> None:
         """Register a class's families before any signature is read.

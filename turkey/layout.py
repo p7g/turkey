@@ -255,7 +255,8 @@ def _packed_key(info, node: CApp, abstracted: dict[int, str],
     from .classes import match
     from .types import TVar, prune
     found: dict[int, Type] = {}
-    for param, argument in zip(info.scheme.body.params, node.args):
+    for param, argument in zip(info.scheme.body.params,
+                               node.args[len(info.context):]):
         found.update(match(param, prune(argument.ty)) or {})
     key = []
     for variable in info.exists:

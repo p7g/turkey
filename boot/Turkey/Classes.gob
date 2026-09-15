@@ -72,7 +72,7 @@ import Turkey.Ast
 -- written as is `Ast.Pred`.
 import Turkey.Ast as Ast
 import Turkey.Decls as Decls
-import Turkey.Decls (DeclTable(..), FamilyInfo(..))
+import Turkey.Decls (DeclTable(..), FamilyInfo(..), ConInfo(..))
 import Turkey.Diag as Diag
 import Turkey.Source as Source
 import Turkey.Source (Span)
@@ -320,12 +320,41 @@ fun registerAll(t : ClassTable, classes : Array ClassDecl,
             for v in m.scheme.quantified { discard(Ty.defaultKind(v.kind)) }
         }
     }
+    checkConstructorContexts(t)
 
     let registered = Array.map(instances, fun(d) = resolveInstance(t, d, owner))
     -- Coverage is checked only once every instance is in the table, since
     -- `instance Monoid (Array a)` is entitled to be satisfied by a
     -- `Semigroup (Array a)` written further down the file.
     for inst in registered { checkInstance(t, inst) }
+}
+
+-- The class half of an existential constructor's bracket. The declaration
+-- table builds the predicates before any class is registered, so it cannot know
+-- whether `Error` names one or what kind its variable has; this is the check
+-- `resolveContext` makes for a `fun`, made once the classes exist
+-- (SPEC-DELTAS 68).
+fun checkConstructorContexts(t : ClassTable) -> Unit {
+    for (con, written) in t.decls.uncheckedContexts {
+        var i = 0
+        while i < len(con.scheme.preds) && i < len(written.context) {
+            let p = con.scheme.preds[i]
+            let source = written.context[i]
+            let info = match Map.get(t.classes, p.name) {
+                Some(found) -> found
+                None -> oops("unknown class '" + p.name + "'", Some(source.span))
+            }
+            let arg = p.args[0]
+            if !Ty.unifyKinds(Ty.kindOf(arg), info.cvar.kind) {
+                oops("'" + Ty.show(arg) + "' has kind "
+                     + Ty.showKind(Ty.kindOf(arg)) + ", but '" + p.name
+                     + "' constrains a type of kind "
+                     + Ty.showKind(info.cvar.kind), Some(source.span))
+            }
+            i = i + 1
+        }
+    }
+    t.decls.uncheckedContexts = Array.new(0)
 }
 
 -- Register a class's families before any signature is read.

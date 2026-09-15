@@ -243,10 +243,12 @@ class Checker:
         # A nullary constructor stands alone rather than being applied
         # (`ast.ECon`), so what it is *worth* is the result rather than the
         # function -- `None` is an `Option a`, not a `fun() -> Option a`.
-        declared = info.scheme.body
-        if info.arity == 0 and isinstance(declared, TFun) and not declared.params:
+        scheme = self.constructor_scheme(info)
+        declared = scheme.body
+        if (info.runtime_arity == 0 and isinstance(declared, TFun)
+                and not declared.params):
             declared = declared.ret
-        if not self.instance_of(info.scheme, e.ty) and not compatible(
+        if not self.instance_of(scheme, e.ty) and not compatible(
                 declared, self.reduce(e.ty)):
             raise CoreError(
                 f"'{e.name}' is not usable at {show(e.ty)}; it is declared "
@@ -427,6 +429,18 @@ class Checker:
 
     def is_dict(self, ty: Type) -> bool:
         return dict_class(ty) is not None
+
+    def constructor_scheme(self, info):
+        """A constructor as Core applies it: one dictionary per predicate of
+        an existential's context, then its fields (SPEC-DELTAS 68)."""
+        if not info.context:
+            return info.scheme
+        from .types import Scheme
+        body = info.scheme.body
+        assert isinstance(body, TFun)
+        carried = [self.dict_type(p.name, p.args[0]) for p in info.context]
+        return Scheme(info.scheme.quantified,
+                      TFun(carried + list(body.params), body.ret))
 
     def dict_type(self, cls: str, arg: Type) -> Type:
         from .lower import dict_con
@@ -669,11 +683,10 @@ class Checker:
             mapping = _head_mapping(info.scheme, target)
             assert isinstance(info.scheme.body, TFun)
             out = {}
-            carried: list[Type] = []
             if info.is_existential:
-                # PROTOTYPE. The hidden variables are the pattern's rigid
-                # constants and nothing the scrutinee says; the dictionaries
-                # arrive under the names the pattern gives them.
+                # The hidden variables are the pattern's rigid constants and
+                # nothing the scrutinee says; the dictionaries arrive under the
+                # names the pattern gives them (SPEC-DELTAS 68).
                 if (not isinstance(pat, ast.PCon)
                         or len(pat.skolems) != len(info.exists)
                         or len(pat.evidence) != len(info.context)):
@@ -683,11 +696,10 @@ class Checker:
                 mapping = dict(mapping)
                 mapping.update({v.id: s for v, s in
                                 zip(info.exists, pat.skolems)})
-                carried = [substitute(p, mapping) for p in
-                           info.scheme.body.params[:len(info.context)]]
+                carried = [self.dict_type(p.name, substitute(p.args[0], mapping))
+                           for p in info.context]
                 out.update(zip(pat.evidence, carried))
-            fields = [substitute(p, mapping)
-                      for p in info.scheme.body.params[len(carried):]]
+            fields = [substitute(p, mapping) for p in info.scheme.body.params]
             if isinstance(pat, ast.PCon):
                 if len(pat.args) != len(fields):
                     raise CoreError(

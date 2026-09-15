@@ -36,8 +36,12 @@ type ConInfo = ConInfo {
     tycon  : String,
     fields : Option (Array String),
     arity  : Int,
-    -- Always `forall params. fun(args...) -> tycon params`.
+    -- Always `forall params. fun(args...) -> tycon params`. An existential's
+    -- context is the scheme's `preds` (SPEC-DELTAS 68).
     scheme : Scheme,
+    -- An existential constructor's hidden variables: the scheme's variables
+    -- that do not reach its result.
+    exists : Array VarCell,
 }
 
 fun isRecord(c : ConInfo) -> Bool = Option.isSome(c.fields)
@@ -52,9 +56,11 @@ type TyconInfo = TyconInfo {
     kind      : Kind,
 }
 
--- design.md 4.5: exactly one variant, carrying a record payload.
+-- design.md 4.5: exactly one variant, carrying a record payload -- unless it is
+-- existential (SPEC-DELTAS 68).
 fun isMutableRecord(t : TyconInfo) -> Bool =
     len(t.variants) == 1 && isRecord(t.variants[0])
+        && len(t.variants[0].exists) == 0
 
 -- An associated type family, as the type language sees it.
 --
@@ -93,6 +99,9 @@ type DeclTable = DeclTable {
     order        : Array String,
     -- `newtypes`, computed once the declarations are all in.
     newtypeNames : Option (Set.Set String),
+    -- Existential constructors whose contexts name classes, until the class
+    -- table has the classes to check them against.
+    uncheckedContexts : Array (ConInfo, ConDecl),
 }
 
 fun newDeclTable() -> DeclTable {
@@ -100,7 +109,7 @@ fun newDeclTable() -> DeclTable {
     let t = DeclTable {
         tycons = Map.new(), constructors = Map.new(), heads = Map.new(),
         families = Map.new(), shorts = Map.new(), order = Array.new(16),
-        newtypeNames = None,
+        newtypeNames = None, uncheckedContexts = Array.new(0),
     }
     for name in Ty.primitives() {
         Map.put(t.heads, name, Ty.tcon(name, KStar, Ty.noScope))
@@ -132,16 +141,48 @@ fun head(t : DeclTable, name : String) -> Ty.Type = match Map.get(t.heads, name)
 -- any order.
 fun registerAll(t : DeclTable, decls : Array TypeDecl) -> Unit {
     for d in decls {
-        let declared = Set.new()
-        for p in d.params { Set.add(declared, p) }
-        for te in declarationTypes(d) {
-            for v in typeVariables(te) {
-                match v.kind {
-                    TEVar(name) -> if !Set.contains(declared, name) {
-                        oops("type variable '" + name + "' is not declared by "
-                             + "type '" + d.name + "'", Some(v.span))
+        let params = Set.new()
+        for p in d.params { Set.add(params, p) }
+        let groups = Array.new(2)
+        match d.alias {
+            Some(body) -> Array.push(groups, (Set.new(), [body]))
+            None -> {}
+        }
+        match d.variants {
+            Some(variants) -> for c in variants {
+                -- A bracket's variables are this variant's alone, and none of
+                -- them may be a parameter (SPEC-DELTAS 68).
+                let hidden = hiddenVariables(c)
+                for name in hidden {
+                    if Set.contains(params, name) {
+                        oops("'" + name + "' is a parameter of type '" + d.name
+                             + "', so the bracket of '" + c.name
+                             + "' cannot hide it", Some(c.span))
                     }
-                    _ -> {}
+                }
+                let distinct = Set.new()
+                for b in c.binders { Set.add(distinct, b) }
+                if len(Set.elements(distinct)) != len(c.binders) {
+                    oops("the bracket of '" + c.name + "' binds a variable twice",
+                         Some(c.span))
+                }
+                let hiddenSet = Set.new()
+                for name in hidden { Set.add(hiddenSet, name) }
+                Array.push(groups, (hiddenSet, conTypes(c)))
+            }
+            None -> {}
+        }
+        for (hiddenSet, types) in groups {
+            for te in types {
+                for v in typeVariables(te) {
+                    match v.kind {
+                        TEVar(name) -> if !Set.contains(params, name)
+                                && !Set.contains(hiddenSet, name) {
+                            oops("type variable '" + name + "' is not declared by "
+                                 + "type '" + d.name + "'", Some(v.span))
+                        }
+                        _ -> {}
+                    }
                 }
             }
         }
@@ -259,20 +300,47 @@ fun resolveVariants(t : DeclTable, decl : TypeDecl) -> Unit {
                 Some(fs) -> Some(Array.map(fs, firstOfPair))
                 None -> None
             }
+            -- The bracket's variables are this variant's alone (SPEC-DELTAS 68).
+            let local = Map.new()
+            for (k, v) in Map.entries(tyvars) { Map.put(local, k, v) }
+            let hidden = Array.new(2)
+            for name in hiddenVariables(c) {
+                let cell = Ty.freshVar(1)
+                Map.put(local, name, TVar(cell))
+                Array.push(hidden, cell)
+            }
             let argTypes = Array.new(4)
             match c.fields {
                 Some(fs) -> for (_, te) in fs {
-                    Array.push(argTypes, star(t, te, tyvars, undeclared))
+                    Array.push(argTypes, star(t, te, local, undeclared))
                 }
                 None -> for te in c.args {
-                    Array.push(argTypes, star(t, te, tyvars, undeclared))
+                    Array.push(argTypes, star(t, te, local, undeclared))
                 }
             }
-            let s = Ty.generalize(TFun(argTypes, result), 0, Array.new(0))
+            -- Class names are checked, and kinds compared, once the classes
+            -- exist: `Turkey.Classes.checkConstructorContexts`.
+            let context = Array.new(len(c.context))
+            for p in c.context {
+                match p.kind {
+                    PClass(name, argTe) -> Array.push(context,
+                        Ty.pred(name, [toType(t, argTe, local, undeclared)]))
+                    _ -> {}
+                }
+            }
+            let s = Ty.generalize(TFun(argTypes, result), 0, context)
+            for cell in hidden {
+                var present = False
+                for q in s.quantified {
+                    if q.id == cell.id { present = True }
+                }
+                if !present { Array.push(s.quantified, cell) }
+            }
             let cinfo = ConInfo {
                 name = c.name, tycon = decl.name, fields = names,
-                arity = len(argTypes), scheme = s,
+                arity = len(argTypes), scheme = s, exists = hidden,
             }
+            if len(c.context) > 0 { Array.push(t.uncheckedContexts, (cinfo, c)) }
             Array.push(info.variants, cinfo)
             Map.put(t.constructors, c.name, cinfo)
         }
@@ -664,21 +732,38 @@ fun referencedInto(te : Type, out : Array String) -> Unit = match te.kind {
     TEVar(_) -> {}
 }
 
-fun declarationTypes(decl : TypeDecl) -> Array Type = match decl.alias {
-    Some(body) -> [body]
-    None -> {
-        let out = Array.new(4)
-        match decl.variants {
-            Some(variants) -> for c in variants {
-                match c.fields {
-                    Some(fs) -> for (_, te) in fs { Array.push(out, te) }
-                    None -> for te in c.args { Array.push(out, te) }
+-- The variables a constructor's bracket binds, in a fixed order: its bare
+-- variables as written, then those its class predicates mention, first
+-- occurrence first (SPEC-DELTAS 68).
+fun hiddenVariables(c : ConDecl) -> Array String {
+    let out = Array.new(2)
+    let seen = Set.new()
+    for b in c.binders {
+        if !Set.contains(seen, b) {
+            Set.add(seen, b)
+            Array.push(out, b)
+        }
+    }
+    for p in c.context {
+        match p.kind {
+            PClass(_, argTe) -> for v in typeVariables(argTe) {
+                match v.kind {
+                    TEVar(name) -> if !Set.contains(seen, name) {
+                        Set.add(seen, name)
+                        Array.push(out, name)
+                    }
+                    _ -> {}
                 }
             }
-            None -> {}
+            _ -> {}
         }
-        out
     }
+    out
+}
+
+fun conTypes(c : ConDecl) -> Array Type = match c.fields {
+    Some(fs) -> Array.map(fs, fun(f) = f.1)
+    None -> c.args
 }
 
 fun typeVariables(te : Type) -> Array Type {

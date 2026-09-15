@@ -1156,7 +1156,8 @@ class _FunctionLowerer:
         con_type = substitute(info.scheme.body, mapping)
         assert isinstance(con_type, TFun)
         unify(con_type.ret, expr.ty)
-        for param, argument in zip(con_type.params, expr.args):
+        carried = expr.args[:len(info.context)]
+        for param, argument in zip(con_type.params, expr.args[len(carried):]):
             unify(param, argument.ty)
         codes: list[bir.Operand] = []
         for variable in info.exists:
@@ -1169,7 +1170,8 @@ class _FunctionLowerer:
                         f"layout is not knowable here")
                 layout = bir.Layout.BOXED
             codes.append(bir.Constant(bir.Layout.I64, LAYOUT_CODES[layout]))
-        header = TFun([INT] * len(codes) + list(con_type.params), con_type.ret)
+        header = TFun([INT] * len(codes) + [a.ty for a in carried]
+                      + list(con_type.params), con_type.ret)
         return codes + list(values), header
 
     def lower_opened(self, pat: ast.PCon, value: bir.Operand, ty: Type,
@@ -1221,7 +1223,7 @@ class _FunctionLowerer:
             env[name] = slot
             at.instructions.append(
                 bir.Instruction("slot_store", (slot.name, dictionary)))
-        fields = con_type.params[carried:]
+        fields = con_type.params
         pieces = list(enumerate(pat.args))
         if not pieces:
             at.terminator = bir.Jump(success.name)

@@ -35,8 +35,9 @@ from turkey.core import (CApp, CBind, CCon, CExpr, CIf, CLam, CLet, CLit,
 from turkey.decls import ConInfo, substitute
 from turkey.errors import TurkeyError
 from turkey.eval import Evaluator
-from turkey.types import (INT, STAR, STRING, UNIT, Pred, Scheme, TCon, TFun,
-                          TVar, Type)
+from turkey.lower import dict_con
+from turkey.types import (INT, STAR, STRING, UNIT, Pred, Scheme, TApp, TCon,
+                          TFun, TVar, Type)
 
 
 # ---------------------------------------------------------------- building
@@ -87,13 +88,10 @@ class Program:
         """
         placeholder = self.decls.constructors[name]
         hidden = TVar(0, STAR)
-        carried = ([] if context is None
-                   else [self.dictionary(context[1], hidden)])
         preds = [] if context is None else [Pred(context[0], [hidden])]
-        body = TFun(carried + list(fields(hidden)),
-                    self.decls.heads[placeholder.tycon])
+        body = TFun(list(fields(hidden)), self.decls.heads[placeholder.tycon])
         info = ConInfo(name, placeholder.tycon, None, len(body.params),
-                       Scheme([hidden], body), exists=[hidden], context=preds)
+                       Scheme([hidden], body, preds), exists=[hidden])
         self.decls.constructors[name] = info
         variants = self.decls.tycons[placeholder.tycon].variants
         variants[variants.index(placeholder)] = info
@@ -118,7 +116,9 @@ class Program:
         info = self.decls.constructors[name]
         ty = substitute(info.scheme.body, {info.exists[0].id: packed})
         assert isinstance(ty, TFun)
-        return CApp(ty.ret, None, CCon(ty, None, name), list(args))
+        carried = [a.ty for a in args[:len(info.context)]]
+        con_ty = TFun(carried + list(ty.params), ty.ret)
+        return CApp(ty.ret, None, CCon(con_ty, None, name), list(args))
 
     def instance(self, cls: str, type_name: str) -> CExpr:
         """The ground dictionary `cls type_name`."""
@@ -145,8 +145,10 @@ class Program:
         skolem = TCon.skolem("s", STAR)
         ty = substitute(info.scheme.body, {info.exists[0].id: skolem})
         assert isinstance(ty, TFun)
-        carried = ty.params[:len(info.context)]
-        fields = ty.params[len(info.context):]
+        classes = self.checked.classes.classes
+        carried = [TApp(dict_con(p.name, classes[p.name].kind), skolem, STAR)
+                   for p in info.context]
+        fields = ty.params
         env = {n: CVar(t, None, n) for n, t in zip(names, fields)}
         env.update({n: CVar(t, None, n) for n, t in zip(evidence, carried)})
         result = body(skolem, env)

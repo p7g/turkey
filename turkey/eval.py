@@ -110,11 +110,12 @@ class Evaluator:
         self.functions = ["<module initialization>"]
         for name, info in decls.constructors.items():
             mutable = decls.tycons[info.tycon].is_mutable_record
-            if info.arity == 0:
+            if info.runtime_arity == 0:
                 self.globals.define(name, ConValue(name, ()))
             else:
                 self.globals.define(
-                    name, ConstructorFn(name, info.arity, info.field_names, mutable)
+                    name, ConstructorFn(name, info.runtime_arity,
+                                        info.field_names, mutable)
                 )
 
     # -- program ------------------------------------------------------------

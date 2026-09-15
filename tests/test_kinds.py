@@ -32,6 +32,35 @@ def test_a_type_declaration_rejects_an_undeclared_variable(src, variable):
         check(src)
 
 
+def test_an_existential_bracket_declares_its_variables():
+    table = DeclTable()
+    table.register_all([d for d in parse(
+        "type Some = Some[Show e](e)\n"
+        "type Counter = Counter[s] { state : s, read : fun(s) -> Int }\n"
+        "type Pair a = Pair[b](a, b)\n"
+    ).decls if isinstance(d, TypeDecl)])
+    some = table.constructors["Some"]
+    assert show_scheme(some.scheme) == "[Show a] fun(a) -> Some"
+    assert len(some.exists) == 1 and some.arity == 1
+    counter = table.constructors["Counter"]
+    assert counter.is_existential and counter.arity == 2
+    assert not table.tycons["Counter"].is_mutable_record
+    pair = table.constructors["Pair"]
+    assert show_scheme(pair.scheme) == "fun(a, b) -> Pair a"
+    assert [v.id for v in pair.exists] != []
+
+
+@pytest.mark.parametrize("src, message", [
+    ("type T a = T[a](a)", "'a' is a parameter of type 'T'"),
+    ("type T = T[s](b)", "type variable 'b' is not declared by type"),
+    ("type T = T[s, s](s)", "binds a variable twice"),
+    ("type T = T[Nope e](e)", "unknown class 'Nope'"),
+])
+def test_an_existential_bracket_is_checked(src, message):
+    with pytest.raises(TypeError_, match=message):
+        check(src)
+
+
 def test_a_declared_phantom_parameter_is_valid():
     checked = check("type Tagged a = Tagged(Int)\nfun tag(n) = Tagged(n)")
     assert dict(checked.signatures)["tag"] is not None

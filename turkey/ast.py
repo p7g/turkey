@@ -501,11 +501,14 @@ class TypeDecl(Node):
 
     @property
     def is_mutable_record(self) -> bool:
-        """Section 4.5: single-variant record types are the mutable ones."""
+        """Section 4.5: single-variant record types are the mutable ones --
+        unless the variant is existential (SPEC-DELTAS 68)."""
         return (
             self.variants is not None
             and len(self.variants) == 1
             and self.variants[0].is_record
+            and not self.variants[0].binders
+            and not self.variants[0].context
         )
 
 

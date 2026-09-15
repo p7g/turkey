@@ -695,10 +695,13 @@ def generate(program: CProgram, decls: DeclTable, main: str = "main") -> str:
         py = gen.fresh(name)
         gen.constructors[name] = py
         env[name] = _Name(py, True)
-        if info.arity == 0:
+        if info.runtime_arity == 0:
             runner.preamble.append(f"{py} = _ConValue({name!r}, ())")
             continue
-        args = [gen.fresh(field or "arg") for field in (info.field_names or [""] * info.arity)]
+        # An existential's carried dictionaries come first (SPEC-DELTAS 68).
+        args = ([gen.fresh("dict") for _ in info.context]
+                + [gen.fresh(field or "arg")
+                   for field in (info.field_names or [""] * info.arity)])
         if decls.tycons[info.tycon].is_mutable_record:
             fields = ", ".join(
                 f"{field!r}: {arg}" for field, arg in zip(info.field_names or [], args))

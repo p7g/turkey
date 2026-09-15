@@ -1,209 +1,101 @@
-# turkey-lite
+# Turkey
 
-A Python prototype of the language specified in [`design.md`](design.md): a
-small procedural language with an ML-style type system — Hindley-Milner
-inference with the value restriction, strict call-by-value evaluation,
-uncurried functions, and mutation through single-variant records and arrays.
+A small procedural language with an ML-style type system.
 
-The point of the prototype is to make the design *executable*, so it can be
-argued with. Reading a spec does not tell you that its worked example calls the
-wrong `push`, or that its grammar cannot express an assignment inside a block.
-Running one does. Every disagreement found along the way is recorded in
-[`SPEC-DELTAS.md`](SPEC-DELTAS.md), keyed to the section it amends.
+Turkey brings type inference, algebraic data types, and first-class functions
+to code with familiar loops, early returns, and mutable state. The aim is to
+make straightforward programs easy to write, while keeping the type system
+strong enough to support reusable abstractions.
 
-## Using it
+## Philosophy
 
-Install the project with Python 3.11 or newer; native execution requires a C
-compiler for the small runtime and uses `llvmlite` for code generation. From
-the repo root:
+- **Write the algorithm directly.** Evaluation is strict, functions take ordinary
+  argument lists, and loops and mutation are part of everyday code.
+- **Let the compiler connect the types.** Types are checked statically and inferred
+  across functions. Add annotations where they help explain an interface.
+- **Make alternatives explicit.** Model choices with algebraic data types,
+  handle them with pattern matching, and compose `Option` and `Either` with `?`.
+- **Build power in the library.** Operators, iteration, indexing, and generic
+  functions are defined through type classes. User-defined types can participate
+  in the same syntax as the standard library.
 
-```
-python3 -m turkey run    program.gob    # type-check and execute
-python3 -m turkey run    program.gob -- a b   # ... passing it arguments
-python3 -m turkey types  program.gob    # print each top-level binding's type
-python3 -m turkey tokens program.gob    # dump the token stream
-python3 -m turkey ast    program.gob    # dump the parse tree
-python3 -m turkey core   program.gob    # dump the typed Core the elaboration produces
-python3 -m turkey mono   program.gob    # dump that Core specialized -- what actually runs
-python3 -m turkey opt    program.gob    # dump the optimized Core
-python3 -m turkey python program.gob    # print generated Python without running it
-python3 -m turkey llvm   program.gob    # print verified LLVM IR
-python3 -m turkey run --backend python program.gob  # compatibility backend
-```
+## A taste
 
-A program is a single file. Execution lowers optimized typed Core to a checked
-control-flow IR, compiles it with LLVM, initializes top-level bindings, and
-calls `main` if one is defined. `--backend python` retains the previous
-generated-Python implementation as a compatibility and differential-testing
-backend. Everything after `--` is the program's own command line, reached
-through `System.Env.args`; under either backend the program runs with a large
-stack, because the host's default recursion limit is a fact about the host
-rather than about the language. The `llvm` and `python` commands expose their
-generated forms for inspection; neither is a standalone-file interface.
+Parse a few rectangles and add up their areas:
 
-```
-type Stack a = Stack {
-    data : Array a
-    top  : Int
+```text
+type Rectangle = Rectangle { width : Int, height : Int }
+
+fun parseRectangle(text) {
+    let (width, height) = String.splitOnce(text, "x")?
+    Some(Rectangle {
+        width = Int.parse(width)?,
+        height = Int.parse(height)?
+    })
 }
 
-fun newStack(capacity : Int) -> Stack a {
-    Stack { data = Array.new(capacity), top = 0 }
-}
-
-fun push(s : Stack a, x : a) -> Unit {
-    Array.push(s.data, x)
-    s.top = s.top + 1
-}
-
-fun drain(s : Stack a) -> Array a {
-    let out = [] : Array a
-    while let Some(x) = Array.pop(s.data) { Array.push(out, x) }
-    out
-}
+fun area(rect) = rect.width * rect.height
 
 fun main() {
-    let s = newStack(4)
-    push(s, 10)
-    push(s, 20)
-    for x in drain(s) { print(Int.toString(x)) }
+    var total = 0
+    for text in ["3x4", "5x2", "oops"] {
+        match parseRectangle(text) {
+            Some(rect) -> {
+                total = total + area(rect)
+            }
+            None -> print("Skipping: " + text)
+        }
+    }
+    print(total)
 }
 ```
 
-`python3 -m turkey types` on that file reports:
-
-```
-newStack : fun(Int) -> Stack a
-push : fun(Stack a, a) -> Unit
-drain : fun(Stack a) -> Array a
-main : fun() -> Unit
+```text
+Skipping: oops
+22
 ```
 
-## Layout
+The compiler infers `parseRectangle : fun(String) -> Option Rectangle`.
+Each `?` unwraps a successful result; a missing separator or invalid integer
+makes the parser produce `None`. The caller handles both cases explicitly.
+Tuple destructuring, named record fields, and an ordinary mutable accumulator
+work together without type annotations on the functions.
 
-| File | What it does |
-|---|---|
-| `turkey/lexer.py` | Tokens, comments, and §2.4's newline rule as a separate filter pass |
-| `turkey/ast.py` | Syntax tree |
-| `turkey/parser.py` | Recursive descent; §7 type-declaration disambiguation |
-| `turkey/types.py` | Semantic types, unification, the bottom type, generalization |
-| `turkey/decls.py` | Type and constructor declarations; alias expansion |
-| `turkey/deps.py` | Free variables and Tarjan SCC, for §5.2's grouped inference |
-| `turkey/infer.py` | Constraint generation: the value restriction, control-flow typing |
-| `turkey/constraints.py` | The constraint language and its solver; ranks, predicates |
-| `turkey/exhaustive.py` | Maranget's usefulness algorithm, for match warnings |
-| `turkey/values.py` | Runtime values, including the hidden primitive array storage |
-| `turkey/backend_ir.py` | Checked, layout-aware control-flow IR shared by native lowering |
-| `turkey/backend_lower.py` | Core-to-backend-IR lowering, closure conversion, and ABI bridges |
-| `turkey/llvmgen.py` | llvmlite emission, verification, JIT execution, and runtime loading |
-| `runtime/` | Native strings, arrays, closures, panic frames, and exact-root collector |
-| `turkey/pygen.py` | Retained generated-Python compatibility backend |
-| `turkey/eval.py` | Tree-walking differential-test oracle |
-| `turkey/builtins.py` | The machine primitives, and nothing else |
-| `turkey/modules.py` | The import graph, and what each module can see |
-| `turkey/resolve.py` | Rewrites a module's names so the program shares one namespace |
-| `lib/` | The library, written in the language: classes, Prelude, `Data.*` and `System.*` modules |
-| `boot/` | The compiler, written in the language: `Turkey.*` (`plan.txt` item 9) |
+## Try it
 
-Three things are worth knowing before reading the code, because they are where
-this language departs from a textbook implementation.
+From this checkout, with Python 3.11+ and a C compiler installed:
 
-**Bottom.** `return`, `break` and `continue` have type `⊥`, which unification
-absorbs (§4.3). Absorption alone is not enough: in
-`if c { return 1 } else { 2 }` the arms are `⊥` and `Int`, and unifying them is
-a no-op that leaves the caller no wiser. So `types.join` is used wherever two
-branches must agree, and it returns the surviving type.
-
-**Field access is a predicate.** `r.f` emits `HasField "f" typeof(r) a` and
-decides nothing; the solver settles it once the receiver is known, however much
-later that is. A demand still unresolved when its binding generalizes travels
-in the scheme, so `fun get(r) = r.n` is `[HasField "n" a b] fun(a) -> b` and
-reads from any record with an `n`. Records stay nominal and there are no rows:
-this is Gaster & Jones's `r \ l` without them, which is decidable here because
-entailment is a declaration lookup (SPEC-DELTAS.md 7).
-
-**Numeric projection is also a predicate.** `x.0` emits
-`HasProjection 0 typeof(x) a`. It works on tuples and immutable types with one
-positional constructor, can travel in an inferred scheme, and is read-only.
-The solver checks the index once the receiver shape is known.
-
-**The newline rule.** §2.4 as written is circular — newlines inside braces are
-"dropped except where the inner grammar uses it as a separator", which a lexer
-cannot decide. It is implemented as a concrete two-sided filter over the token
-stream (SPEC-DELTAS.md 11), which is why it lives in its own pass and has its
-own tests. Bracket nesting is tracked as a stack rather than a counter: `(` and
-`{` disagree about whether a line break matters, either can contain the other,
-and only the innermost one gets to decide.
-
-## The bootstrap compiler
-
-`boot/` is a Turkey compiler written in Turkey, whose modules are `Turkey.*`. `boot/STYLE.md` says how it is written. It is being built one stage at
-a time, and each stage is checked by diffing it against the Python
-implementation over every Turkey file in the repository -- the conformance
-programs, the standard library, and `boot/`'s own source:
-
-```
-python3 -m turkey run boot/Main.gob -- tokens FILE...
-python3 -m turkey run boot/Main.gob -- ast FILE...
+```sh
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install -e .
 ```
 
-The lexer and the parser are done, and agree with `turkey tokens` and
-`turkey ast` on every token and every node of all 82 of them, spans included.
-`tests/test_boot.py` is that comparison, and
-[`FINDINGS.md`](FINDINGS.md) is the running list of language bugs, design
-costs and missing library pieces that writing it has turned up -- which is
-what `plan.txt` item 9 says the exercise is *for*. Both dumps are deliberately *not*
-Python's `repr`: the float spelling is the one `PRIMITIVES.md` specifies and
-the escapes are the language's, so neither implementation can be right merely
-by being the host.
+Save the example as `rectangles.gob`, then run it or build an executable:
 
-## Tests
-
-```
-python3 -m pytest tests -q
+```sh
+python3 -m turkey run rectangles.gob
+python3 -m turkey build rectangles.gob -o rectangles
+./rectangles
 ```
 
-The generated-Python compatibility backend has a manual, non-CI comparison
-against the tree-walking evaluator. It reports generation, Python compilation,
-and median warm execution separately:
+Use `python3 -m turkey types rectangles.gob` to inspect inferred types, or
+`python3 -m turkey --help` for the compiler's other commands.
 
-```
-python3 -m benchmarks.python_backend --rounds 3
-```
+## Project status
 
-`tests/programs/` holds golden-file conformance programs: each `NAME.gob` is
-paired with a `NAME.expected` holding the exact combined output of running it.
-Programs whose names begin with `err_` are expected to fail. To add a case,
-write the two files — or write the `.gob` and run
-`python3 tests/regenerate_expected.py`, then read the diff to confirm the
-output is what you meant.
+Turkey is an experimental language under active development. This repository,
+`turkey-lite`, contains the Python implementation, an LLVM native backend, and
+a compiler being written in Turkey itself. The standard library is written in
+Turkey over a small set of runtime primitives. A generated-Python backend and
+differential tests help check that the implementations agree.
 
-`tests/programs/` also holds *directories*: one whose entry module is `Main.gob`
-is a multi-file program, run from inside that directory, with its golden in
-`Main.expected` beside it.
+For more depth:
 
-## Current boundaries
+- [Language design](design.md) and [changes to the specification](SPEC-DELTAS.md)
+- [Standard library](STDLIB.md) and [library design](LIBRARY-DESIGN.md)
+- [Compiler written in Turkey](boot/) and [lessons from building it](FINDINGS.md)
+- [Roadmap](plan.txt)
 
-Modules (§9) work for values, types, constructors, classes, methods, and
-associated families. A plain `import M` provides bare and `M.`-qualified names;
-`import M as A` is qualified-only. Classes and their members belong to their
-declaring module, while globally coherent instances are protected by the
-orphan and overlap rules. Any explicit Prelude import replaces the automatic
-one, and `import Prelude ()` removes its dependency edge entirely for low-level
-modules. Exhaustiveness remains a warning, per §5.1.
-
-A program can reach outside itself: `System.Env` has `args` and `exit`, and
-`System.IO` has `readFile`, `writeFile` and `stderr`. Files are read as bytes
-and turned into a `String` by the checked constructor, so `readFile` answers
-`Option String` -- a file is not guaranteed to be well-formed UTF-8 and a
-`String` is.
-
-`Data.String.Index` is an opaque position in a string. It is obtainable only
-from `start`, `end`, `step` or `find`, and no arithmetic on one is exposed, so
-every index names a character boundary and `slice` has nothing to validate. A
-raw byte offset never reaches the surface language.
-
-`Array` is an ordinary opaque growable library type backed by fixed-length
-`Prim.Array` storage. Indexing and `len` are the `Index` and `Length` class
-methods, so user-defined containers can support the same syntax. Storage
-capacity and the primitive backing value are not part of the surface API.
+To run the test suite, install the development dependencies with
+`python3 -m pip install -e '.[dev]'`, then run `python3 -m pytest tests -q`.

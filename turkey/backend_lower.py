@@ -1224,7 +1224,9 @@ class _FunctionLowerer:
             at.instructions.append(
                 bir.Instruction("slot_store", (slot.name, dictionary)))
         fields = con_type.params
-        pieces = list(enumerate(pat.args))
+        pieces = (list(enumerate(pat.args)) if isinstance(pat, ast.PCon)
+                  else [(info.field_names.index(name), sub)
+                        for name, sub in pat.fields])
         if not pieces:
             at.terminator = bir.Jump(success.name)
             return
@@ -1272,7 +1274,7 @@ class _FunctionLowerer:
             condition = self.emit(block, op, (value, literal), bir.Layout.I1)
             block.terminator = bir.Branch(condition, success.name, failure.name)
             return
-        if isinstance(pat, ast.PCon) and pat.skolems:
+        if isinstance(pat, (ast.PCon, ast.PRecord)) and pat.skolems:
             self.lower_opened(pat, value, ty, env, block, success, failure,
                               hints)
             return
@@ -1506,13 +1508,14 @@ LAYOUT_CODES = {
 def _opened_layouts(pat, outer: dict[int, str]) -> dict[int, str]:
     """`outer`, plus the layouts an existential arm's copy names for the
     skolems its pattern opens (PROTOTYPE; see `layout.open_arms`)."""
-    while isinstance(pat, ast.PAnnot):
-        pat = pat.pat
-    if not isinstance(pat, ast.PCon) or not pat.skolems or pat.layouts is None:
+    from .layout import _openings
+    openings = [p for p in _openings(pat) if p.layouts is not None]
+    if not openings:
         return outer
     inner = dict(outer)
-    inner.update({-skolem.uid: layout
-                  for skolem, layout in zip(pat.skolems, pat.layouts)})
+    for opened in openings:
+        inner.update({-skolem.uid: layout
+                      for skolem, layout in zip(opened.skolems, opened.layouts)})
     return inner
 
 

@@ -687,8 +687,7 @@ class Checker:
                 # The hidden variables are the pattern's rigid constants and
                 # nothing the scrutinee says; the dictionaries arrive under the
                 # names the pattern gives them (SPEC-DELTAS 68).
-                if (not isinstance(pat, ast.PCon)
-                        or len(pat.skolems) != len(info.exists)
+                if (len(pat.skolems) != len(info.exists)
                         or len(pat.evidence) != len(info.context)):
                     raise CoreError(
                         f"'{pat.name}' is existential, and this pattern does "

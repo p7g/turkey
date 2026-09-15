@@ -244,6 +244,11 @@ class CInstance(Constraint):
     type: Type
     span: Span | None = None
     use: Use | None = None
+    #: The scheme to instantiate, when `name` is not in the environment: an
+    #: existential constructor with a context is used like a constrained
+    #: function, but constructors are not values the environment binds
+    #: (SPEC-DELTAS 68).
+    scheme: Scheme | None = None
 
 
 # ------------------------------------------------------------- the environment
@@ -493,9 +498,12 @@ class Solver:
         "read": a scheme records which field it needs, not whether the access
         that produced the demand was a read or an assignment.
         """
-        binding = self.env.lookup(c.name)
-        assert binding is not None, f"generation let '{c.name}' through unbound"
-        preds, ty, type_args = instantiate_qual(binding.scheme, self.fresh)
+        scheme = c.scheme
+        if scheme is None:
+            binding = self.env.lookup(c.name)
+            assert binding is not None, f"generation let '{c.name}' through unbound"
+            scheme = binding.scheme
+        preds, ty, type_args = instantiate_qual(scheme, self.fresh)
         unify(ty, c.type, c.span, "", self)
         if c.use is not None:
             # Only the class predicates: `HasField` and `OneOf` are discharged

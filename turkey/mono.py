@@ -1152,11 +1152,8 @@ def _unshared_openings(program: CProgram) -> set[str]:
 
     def walk(node, owner: str) -> None:
         if isinstance(node, CAlt):
-            pat = node.pat
-            while isinstance(pat, ast.PAnnot):
-                pat = pat.pat
-            if (isinstance(pat, ast.PCon) and pat.skolems
-                    and pat.layouts is None):
+            from .layout import _openings
+            if any(p.layouts is None for p in _openings(node.pat)):
                 found.add(owner)
         if isinstance(node, (CExpr, CAlt)):
             for f in dataclass_fields(node):

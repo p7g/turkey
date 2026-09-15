@@ -391,10 +391,12 @@ def match_pattern(pat: ast.Pattern, value) -> dict[str, object] | None:
                 return None
             names = value.field_names
             args = value.args
-            get = lambda label: args[names.index(label)]  # noqa: E731
+            # An existential record's dictionaries come first.
+            offset = len(pat.evidence)
+            get = lambda label: args[offset + names.index(label)]  # noqa: E731
         else:
             return None
-        out = {}
+        out = dict(zip(pat.evidence, value.args)) if pat.evidence else {}
         for label, sub in pat.fields:
             inner = match_pattern(sub, get(label))
             if inner is None:

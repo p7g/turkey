@@ -15,7 +15,7 @@ from .errors import Span, TypeError_
 from .types import (
     RAW_ARRAY, PRIMITIVES, STAR, Fresh, KFun, Kind, Pred, Scheme, TApp, TCon, TFam, TFun,
     TTuple, TVar, Type, apply, default_kind, generalize, instantiate, kind_arrow,
-    QUALIFY, kind_of, short_name, show, show_kind, spine, unify_kinds,
+    OPENED, QUALIFY, kind_of, short_name, show, show_kind, spine, unify_kinds,
 )
 
 
@@ -35,6 +35,9 @@ class ConInfo:
     #: fields. Core applies the constructor to one dictionary per predicate
     #: ahead of them, and a packed value holds them in that order.
     exists: list[TVar] = field(default_factory=list)
+    #: The names the bracket wrote for them, which an opened pattern's rigid
+    #: constants are named after.
+    exists_names: list[str] = field(default_factory=list)
 
     @property
     def context(self) -> list[Pred]:
@@ -127,6 +130,7 @@ class DeclTable:
         # class name is global and unqualified.
         self.shorts: dict[str, str] = {name: name for name in PRIMITIVES}
         QUALIFY.clear()
+        OPENED.clear()
         self.tycons["Prim.Array"] = TyconInfo(
             "Prim.Array", ["a"], kind=RAW_ARRAY.kind)
         self.heads["Prim.Array"] = RAW_ARRAY
@@ -276,7 +280,7 @@ class DeclTable:
                 if all(variable is not q for q in scheme.quantified):
                     scheme.quantified.append(variable)
             cinfo = ConInfo(con.name, decl.name, names, len(arg_types), scheme,
-                            exists=hidden)
+                            exists=hidden, exists_names=_hidden_variables(con))
             if con.context:
                 self.unchecked_contexts.append((cinfo, con))
             info.variants.append(cinfo)

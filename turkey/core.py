@@ -693,7 +693,7 @@ def show_expr(e: CExpr | None, indent: int = 0,
     if isinstance(e, CMatch):
         out = [f"{pad}match {show_expr(e.scrutinee, 0, names, alias).strip()} {{"]
         for alt in e.alts:
-            out.append(f"{pad}  {_pattern(alt.pat)} ->")
+            out.append(f"{pad}  {_pattern(alt.pat, alias)} ->")
             out.append(show_expr(alt.body, indent + 2, names, alias))
         out.append(f"{pad}}}")
         return "\n".join(out)
@@ -724,7 +724,20 @@ def _call(fn, name: str, args, pad: str, indent: int, names, alias) -> str:
     return "\n".join(out)
 
 
-def _pattern(pat) -> str:
+def _opening(pat, alias=None) -> str:
+    """What opening an existential binds, as `[s@i64](%d1.Show)`: the rigid
+    constants, the layouts this copy of the arm was made for, and the
+    dictionaries (SPEC-DELTAS 68), named as the body will print them. Empty for
+    every other pattern."""
+    if not pat.skolems:
+        return ""
+    layouts = "" if pat.layouts is None else "@" + ",".join(pat.layouts)
+    evidence = [alias(n) if alias is not None else n for n in pat.evidence]
+    return (f"[{', '.join(s.name for s in pat.skolems)}{layouts}]"
+            f"({', '.join(evidence)})")
+
+
+def _pattern(pat, alias=None) -> str:
     """Patterns are `ast.Pattern`, so their rendering is small and local."""
     from . import ast
     if isinstance(pat, ast.PVar):
@@ -734,24 +747,20 @@ def _pattern(pat) -> str:
     if isinstance(pat, ast.PLit):
         return literal_text(pat.kind, pat.value)
     if isinstance(pat, ast.PCon):
-        opened = ""
-        if pat.skolems:
-            layouts = ("" if pat.layouts is None
-                       else "@" + ",".join(pat.layouts))
-            opened = (f"[{', '.join(s.name for s in pat.skolems)}{layouts}]"
-                      f"({', '.join(pat.evidence)})")
+        opened = _opening(pat, alias)
         if not pat.args:
             return pat.name + opened
-        return f"{pat.name}{opened}({', '.join(_pattern(a) for a in pat.args)})"
+        args = ", ".join(_pattern(a, alias) for a in pat.args)
+        return f"{pat.name}{opened}({args})"
     if isinstance(pat, ast.PRecord):
-        parts = [f"{n} = {_pattern(p)}" for n, p in pat.fields]
+        parts = [f"{n} = {_pattern(p, alias)}" for n, p in pat.fields]
         if pat.rest:
             parts.append("..")
-        return f"{pat.name} {{ {', '.join(parts)} }}"
+        return f"{pat.name}{_opening(pat, alias)} {{ {', '.join(parts)} }}"
     if isinstance(pat, ast.PTuple):
-        return f"({', '.join(_pattern(p) for p in pat.elems)})"
+        return f"({', '.join(_pattern(p, alias) for p in pat.elems)})"
     if isinstance(pat, ast.PAnnot):
-        return _pattern(pat.pat)
+        return _pattern(pat.pat, alias)
     raise AssertionError(f"unprintable pattern {type(pat).__name__}")
 
 

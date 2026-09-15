@@ -750,8 +750,38 @@ class Lowerer:
         left alone: it is already a value, and `eta` declines it for the same
         reason (its type is not a function).
         """
+        dicts = self.carried(e)
+        if dicts:
+            # An existential constructor with a context: every value it builds
+            # carries the dictionaries its use was elaborated with, so the
+            # function it stands for applies them ahead of the fields.
+            fn = prune(self.ty_of(e))
+            if not isinstance(fn, TFun):
+                return CApp(fn, e.span, self.packing(e, fn, dicts), dicts)
+            params = [CParam(fresh_name("eta"), p) for p in fn.params]
+            args: list[CExpr] = [CVar(p.ty, e.span, p.name) for p in params]
+            return CLam(fn, e.span, params,
+                        CApp(fn.ret, e.span, self.packing(e, fn, dicts),
+                             dicts + args))
         return self.eta(CCon(self.ty_of(e), e.span, e.name),
                         self.ty_of(e), e.span)
+
+    def carried(self, e) -> list[CExpr]:
+        """The dictionaries a use of an existential constructor packs
+        (SPEC-DELTAS 68); empty for every other constructor."""
+        use: Use | None = getattr(e, "use", None)  # type: ignore[assignment]
+        if use is None or not use.evidence:
+            return []
+        return [self.evidence(ev, self.pred_type(p), self.givens(use))
+                for ev, p in zip(use.evidence, use.preds)]
+
+    def packing(self, e, fn: Type, dicts: list[CExpr]) -> CCon:
+        """The constructor as Core applies it: dictionaries, then fields."""
+        name = e.name if isinstance(e, ast.ECon) else e.con
+        if isinstance(fn, TFun):
+            return CCon(TFun([d.ty for d in dicts] + list(fn.params), fn.ret),
+                        e.span, name)
+        return CCon(TFun([d.ty for d in dicts], fn), e.span, name)
 
     def _lower_EVar(self, e: ast.EVar, scope: Scope) -> CExpr:
         return self.var(e, scope)
@@ -905,8 +935,31 @@ class Lowerer:
         return CApp(public, e.span, constructor, [storage])
 
     def _lower_ERecord(self, e: ast.ERecord, scope: Scope) -> CExpr:
+        info = self.decls.constructors.get(e.con)
+        if info is not None and info.is_existential:
+            return self.existential_record(e, info, scope)
         return CRecord(self.ty_of(e), e.span, e.con,
                        [(n, self.expr(v, scope)) for n, v in e.fields])
+
+    def existential_record(self, e: ast.ERecord, info, scope: Scope) -> CExpr:
+        """`C { f = x, g = y }` for an existential `C`, as the positional
+        application every backend packs (SPEC-DELTAS 68).
+
+        The fields are evaluated in the order they were written (section 6.1)
+        and bound to fresh names first, then passed in declaration order.
+        """
+        result = self.ty_of(e)
+        values = {n: self.expr(v, scope) for n, v in e.fields}
+        held = {n: fresh_name("field") for n, _ in e.fields}
+        dicts = self.carried(e)
+        ordered = [CVar(values[n].ty, e.span, held[n])
+                   for n in info.field_names]
+        fn = TFun([v.ty for v in ordered], result)
+        out: CExpr = CApp(result, e.span, self.packing(e, fn, dicts),
+                          dicts + ordered)
+        for n, _ in reversed(e.fields):
+            out = CLet(result, e.span, held[n], values[n].ty, values[n], out)
+        return out
 
     def _lower_EField(self, e: ast.EField, scope: Scope) -> CExpr:
         return CField(self.ty_of(e), e.span, self.expr(e.obj, scope), e.name)
@@ -930,6 +983,11 @@ class Lowerer:
             # Named *and* applied, so the wrapper `_lower_ECon` would build is
             # one this would immediately undo. `CApp(CCon, args)` is what the
             # saturated case has always emitted and what the backends match on.
+            dicts = self.carried(callee)
+            if dicts:
+                return CApp(self.ty_of(e), e.span,
+                            self.packing(callee, self.ty_of(callee), dicts),
+                            dicts + args)
             return CApp(self.ty_of(e), e.span,
                         CCon(self.ty_of(callee), callee.span, callee.name),
                         args)

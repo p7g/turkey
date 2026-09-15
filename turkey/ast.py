@@ -115,6 +115,10 @@ class PRecord(Pattern):
     name: str
     fields: list[tuple[str, Pattern]]
     rest: bool = False
+    # As `PCon`'s: what opening an existential record binds (SPEC-DELTAS 68).
+    evidence: list[str] = field(default_factory=list)
+    skolems: list = field(default_factory=list)
+    layouts: tuple | None = None
 
 
 @dataclass(eq=False)
@@ -173,6 +177,9 @@ class ECon(Expr):
     are applied, and are typed as ordinary functions."""
 
     name: str
+    # `evidence.Use`, for an existential constructor with a context, which is
+    # used like a constrained function (SPEC-DELTAS 68). `None` otherwise.
+    use: object | None = None
 
 
 @dataclass(eq=False)
@@ -193,6 +200,8 @@ class ERecord(Expr):
 
     con: str
     fields: list[tuple[str, Expr]]
+    # As `ECon.use`.
+    use: object | None = None
 
 
 @dataclass(eq=False)

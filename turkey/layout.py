@@ -111,18 +111,52 @@ def _applications(node, out: list[CTyApp]) -> None:
             _applications(item, out)
 
 
-def _opened(pat) -> ast.PCon | None:
-    """The existential constructor pattern an arm opens, if it opens one."""
-    while isinstance(pat, ast.PAnnot):
-        pat = pat.pat
-    if isinstance(pat, ast.PCon) and pat.skolems:
-        return pat
-    return None
+def _openings(pat) -> list:
+    """Every existential constructor pattern inside a pattern, outermost and
+    leftmost first -- the order an arm's copies are keyed in (SPEC-DELTAS 68)."""
+    out: list = []
+
+    def walk(p) -> None:
+        if isinstance(p, ast.PAnnot):
+            walk(p.pat)
+        elif isinstance(p, ast.PTuple):
+            for elem in p.elems:
+                walk(elem)
+        elif isinstance(p, ast.PCon):
+            if p.skolems:
+                out.append(p)
+            for arg in p.args:
+                walk(arg)
+        elif isinstance(p, ast.PRecord):
+            if p.skolems:
+                out.append(p)
+            for _, sub in p.fields:
+                walk(sub)
+
+    walk(pat)
+    return out
+
+
+def _with_layouts(pat, keys: dict[int, tuple[str, ...]]):
+    """A copy of `pat` whose openings record the layouts `keys` gives them,
+    by the identity of the opening in the original."""
+    if isinstance(pat, ast.PAnnot):
+        return replace(pat, pat=_with_layouts(pat.pat, keys))
+    if isinstance(pat, ast.PTuple):
+        return replace(pat, elems=[_with_layouts(e, keys) for e in pat.elems])
+    if isinstance(pat, ast.PCon):
+        return replace(pat, args=[_with_layouts(a, keys) for a in pat.args],
+                       layouts=keys.get(id(pat), pat.layouts))
+    if isinstance(pat, ast.PRecord):
+        return replace(pat, fields=[(n, _with_layouts(s, keys))
+                                    for n, s in pat.fields],
+                       layouts=keys.get(id(pat), pat.layouts))
+    return pat
 
 
 def _opens(node) -> bool:
     """Whether an existential arm appears anywhere inside a term."""
-    if isinstance(node, CAlt) and _opened(node.pat) is not None:
+    if isinstance(node, CAlt) and _openings(node.pat):
         return True
     if isinstance(node, (CExpr, CAlt, CBind)):
         return any(_opens(getattr(node, f.name)) for f in _fields(node))
@@ -287,14 +321,15 @@ def _packed_layouts(program: CProgram, decls) -> dict[str, set[tuple[str, ...]]]
         if isinstance(node, CMatch):
             walk(node.scrutinee, abstracted, conditions)
             for alt in node.alts:
-                pat = _opened(alt.pat)
-                if pat is not None and pat.layouts is not None:
-                    inner = dict(abstracted)
+                inner = dict(abstracted)
+                held = set(conditions)
+                for pat in _openings(alt.pat):
+                    if pat.layouts is None:
+                        continue
                     inner.update({-s.uid: layout
                                   for s, layout in zip(pat.skolems, pat.layouts)})
-                    walk(alt.body, inner, conditions | {(pat.name, pat.layouts)})
-                else:
-                    walk(alt.body, abstracted, conditions)
+                    held.add((pat.name, pat.layouts))
+                walk(alt.body, inner, frozenset(held))
             return
         if isinstance(node, CApp) and isinstance(node.fn, CCon):
             info = decls.constructors.get(node.fn.name)
@@ -463,18 +498,25 @@ class _Sharer:
         """
         alts: list[CAlt] = []
         for alt in node.alts:
-            pat = _opened(alt.pat)
-            if pat is None or pat.layouts is not None:
+            openings = [p for p in _openings(alt.pat) if p.layouts is None]
+            if not openings:
                 alts.append(self.rewrite(alt, abstracted))
                 continue
-            allowed = None if self.packed is None else self.packed.get(pat.name, set())
-            for key in itertools.product(OPENED_LAYOUTS, repeat=len(pat.skolems)):
-                if allowed is not None and key not in allowed:
-                    continue
+            # One key per opening, and one copy per combination of them.
+            choices = []
+            for pat in openings:
+                allowed = (None if self.packed is None
+                           else self.packed.get(pat.name, set()))
+                choices.append([key for key in itertools.product(
+                                    OPENED_LAYOUTS, repeat=len(pat.skolems))
+                                if allowed is None or key in allowed])
+            for combination in itertools.product(*choices):
                 inner = dict(abstracted)
-                inner.update({-skolem.uid: layout
-                              for skolem, layout in zip(pat.skolems, key)})
-                alts.append(CAlt(replace(pat, layouts=key),
+                for pat, key in zip(openings, combination):
+                    inner.update({-skolem.uid: layout
+                                  for skolem, layout in zip(pat.skolems, key)})
+                keys = {id(pat): key for pat, key in zip(openings, combination)}
+                alts.append(CAlt(_with_layouts(alt.pat, keys),
                                  self.rewrite(alt.body, inner)))
         return replace(node, scrutinee=self.rewrite(node.scrutinee, abstracted),
                        alts=alts)

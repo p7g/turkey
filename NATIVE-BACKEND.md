@@ -1051,12 +1051,24 @@ Each phase runs and is verified before the next begins.
   values use between calls. It was optimistic by a factor of three and a half;
   the untraced figure above is the honest one.
 
-  **Status: the corpus colours completely; `boot` does not yet.**
+  **Status (measured 2026-09-15): neither the corpus nor `boot` colours
+  completely, and nothing yet emits runnable code.**
 
-  | | coloured | argument hints taken |
-  |---|---|---|
-  | the corpus | **1885 of 1888** | 2556 of 3714, **68.8%** |
-  | `boot` compiling itself | 2681 of 2934 | 2363 of 6132, 38.5% |
+  | | selected | coloured | argument hints taken |
+  |---|---|---|---|
+  | the corpus, 42 programs | 2697 of 2699 | **2687 of 2697** | 5649 of 6992, **80.8%** |
+  | `boot` compiling itself | 2984 of 3005 | 2735 of 2984 | 4746 of 8541, 55.6% |
+
+  Every colouring stop, in both, is "a value with no free register in the
+  general file": 10 in the corpus and 249 in `boot`. Every selection stop is a
+  stack-argument call: 2 in the corpus (`manyargs.gob`) and 21 in `boot`.
+  `tests/test_select.py` ratchets both histograms, the colouring one exactly.
+
+  The three `Prim.floatBits` stops `boot` had are closed, and so are
+  `Prim.floatFromBits`, `Prim.floatIsNaN` and `Prim.floatFitsInt`: each is a
+  few inline instructions with no runtime entry point, and no corpus program
+  reached any of them until `tests/programs/float_bits.gob` (FINDINGS 87).
+  `Prim.floatIsNaN` was missing from `Turkey.Llvm` as well.
 
   Zero complaints from `verifyColouring` on either, which is the check that
   matters: a colouring putting two simultaneously live values in one register
@@ -1107,7 +1119,7 @@ Each phase runs and is verified before the next begins.
     It has been invisible because no consumer of the selected code exists yet.
   * `Term.Ret(v)` names a virtual and nothing moves it to `x0`.
 
-  So the "corpus colours 1888 of 1888" above is a statement about the
+  So the colouring figures above are a statement about the
   *interior* of each function. The edges are missing, and they are what the
   prologue slice has to add. The shape is a copy in and a copy out: fresh
   values pinned to `x0`-`x7` and `d0`-`d7` at entry and to `x0` at exit, with
@@ -1118,8 +1130,8 @@ Each phase runs and is verified before the next begins.
   merely allocate badly, because a parameter pinned to `x0` and live across a
   call has a contradiction the copy exists to break.
 
-  **`boot` needs stack arguments to compile itself.** The same run reports four
-  calls stopped for more than eight arguments in one register file, in the
+  **`boot` needs stack arguments to compile itself.** The same run reports 21
+  functions stopped at a call with more than eight arguments in one register file, in the
   compiler's own source. The gap recorded under phase 4 is not a hypothetical
   a test program invented; it is on the path to M29.
 

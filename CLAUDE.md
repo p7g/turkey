@@ -70,3 +70,6 @@ FINDINGS 43.
 * `RUNTIME-IN-TURKEY.md` -- what replacing the C runtime would cost.
 * `CORE-OPT.md` -- optimizations on Core, and where the line to the backend is.
 * `STDLIB.md` -- what the standard library needs, and how it is named.
+* `ERRORS.md` -- error handling, existential constructors, and why not GADTs yet.
+* `LIBRARY-DESIGN.md` -- the agreed library direction: modules, imports, exports, operators.
+* `PROPOSALS.md` -- language changes argued before they are built; nothing there is decided.

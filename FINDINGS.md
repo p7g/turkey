@@ -2429,6 +2429,22 @@ runtime object, the compiled binary for types, and cache-key tests on copies.
 of `boot/Main.gob`'s, so a fully cold run lands between the two. `pytest` is now
 parallel by default.
 
+### 90. Two correct rules that together tripled the reloads
+**design, fixed.** M28. Frame tables need every root live across a safepoint to
+be in its slot at the call, so selection stores each one there first. Spilling
+stores a value into its slot once, at its definition, and reloads it before
+every use. Each rule is right alone. Together, a value spilled into its root
+slot has a *use* at every safepoint -- the root store -- so spill-everywhere
+reloads it from the slot in order to write it back to the slot. On `boot`,
+reloads went from 9,163 to 24,977 with every checker silent, because nothing was
+wrong except the count.
+
+`spill` now drops a root store whose value it is spilling into that same slot.
+Reloads: 10,001. The number that caught it was `boot asm`'s own `-- spilled`
+line, added one slice earlier as "the number splitting would be measured
+against" -- a cost metric doing a correctness metric's job, which is the
+argument for printing costs before anyone asks what they are for.
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

@@ -1140,44 +1140,15 @@ Each phase runs and is verified before the next begins.
   Status: **1866 of 1866 functions across the corpus select**, with
   `Ssa.verify` silent on every one. One gap is open and is phase 5's to close.
 
-  **More than eight arguments in one register file does not work, either side
-  of the call.** AAPCS64 passes the ninth argument and beyond on the stack, and
-  there is no frame to put it in -- the prologue that would is the same pass
-  that has still to assign a register to anything. The two sides fail
-  differently and only one of them is safe:
+  **More than eight arguments in one register file: closed in phase 5.** It
+  was open here in two unequal halves -- the caller stopped with a reason, and
+  a nine-parameter *callee* selected silently with no incoming convention at
+  all, which `opt` hid by folding every constant call to one. Both close with
+  the frame: `Select.call` stores the overflow into `[outgoing k]` and
+  `Select.incoming` loads it from `[incoming k]`. `tests/programs/manyargs.gob`
+  and `stackargs.gob` keep both halves honest; the callees recurse, because a
+  constant call folds away and proves nothing.
 
-  * **The caller stops and says so.** `Turkey.Select.call` asks `general >=
-    len(A.argRegs)` *before* taking the register and reports "a call with more
-    than eight arguments in one register file, which would need stack
-    arguments". Until it did, the check ran one line after the array index and
-    a nine-argument call panicked inside the compiler -- `array index out of
-    bounds: read at index 8, length 8`. No corpus program had a function of
-    more than eight parameters, so nothing found it; `tests/programs/manyargs.gob`
-    exists now for that reason, and the callee has to be *recursive*, because
-    `opt` inlines and folds a call with constant arguments.
-  * **The callee is silent, which is the part to fix first.** `start` copies
-    `f.params` through as ordinary virtuals and nothing binds them to the
-    incoming ABI at all, so a nine-parameter *function* selects cleanly and
-    means nothing. There is no diagnostic because there is no code -- the
-    incoming convention is established by the prologue, which does not exist.
-    A stop on the caller and silence on the callee is not a consistent state;
-    it is safe only because nothing downstream consumes the result yet.
-
-  Measured rather than assumed. A module holding a nine-parameter `sum9` and a
-  `main` that calls it with constant arguments reports **`selected 9 of 9
-  functions`** and no complaint at all: `opt` inlines and folds the call away,
-  so the caller check never runs, and `sum9` survives as a top-level function
-  whose nine parameters are printed as ordinary virtuals -- `fun @Main#sum9(%0:
-  i64, ..., %8:i64)`. Nothing in the pipeline says this function has no
-  callable entry sequence. That is the shape to remember: the caller's stop is
-  a real diagnostic, and it is also the reason the callee's silence looks
-  covered when it is not.
-
-  `tests/test_select.py` holds the caller half as a ratchet: `KNOWN_REASONS`
-  has exactly this one entry, a reason outside the set fails the run, and
-  `stopped == 2` is asserted exactly rather than as a bound so that the number
-  moving is something a person looks at. Closing this deletes the entry, the
-  assertion and this paragraph together.
 * **Phase 5.** Register allocation, stack maps, encoding, object emission.
 
   **Measured before written, because the spiller is the expensive half.** On
@@ -1288,12 +1259,13 @@ Each phase runs and is verified before the next begins.
   whether spilled code computes the right answer is not known until the frame
   and the emitter exist and the corpus runs against LLVM.
 
-  Selection stops only at stack arguments: 2 in the corpus (`manyargs.gob`),
-  21 in `boot`. Every function takes its closure environment as a hidden first
-  argument, so a helper with eight declared parameters is a nine-argument call
-  -- the first version of the spiller added two such stops to `boot` itself.
-  The three `Prim.floatBits` stops are closed, with `Prim.floatFromBits`,
-  `Prim.floatIsNaN` and `Prim.floatFitsInt` (FINDINGS 87).
+  Selection stops nowhere: 2781 of 2781 corpus functions and 3073 of 3073 in
+  `boot`, since stack arguments landed. Every function takes its closure
+  environment as a hidden first argument, so a helper with eight declared
+  parameters is a nine-argument call -- the first version of the spiller added
+  two such calls to `boot` itself (FINDINGS 88). The three `Prim.floatBits`
+  stops are closed, with `Prim.floatFromBits`, `Prim.floatIsNaN` and
+  `Prim.floatFitsInt` (FINDINGS 87).
 
   Zero complaints from `verifyColouring` on either, which was the check that
   mattered before spilling: a colouring putting two simultaneously live values in one register
@@ -1333,33 +1305,44 @@ Each phase runs and is verified before the next begins.
   The order is what the project does everywhere else: the corpus works and
   `boot` needs one more slice, and the histogram names it.
 
-  **The function boundary has no calling convention at all yet, on either
-  side.** Reading the code to write the prologue turned this up, and it is
-  wider than "there is no prologue":
+  **Boundaries and frames (measured 2026-09-15).** Each function now has both
+  halves of the calling convention as instructions, and a laid-out frame:
 
-  * `Select.start` copies `f.params` through as ordinary virtuals. Nothing
-    binds parameter *i* to `x`*i*. This is the callee half of the
-    stack-argument gap recorded under phase 4, and it is not specific to nine
-    parameters -- a *one*-parameter function has no incoming convention either.
-    It has been invisible because no consumer of the selected code exists yet.
-  * `Term.Ret(v)` names a virtual and nothing moves it to `x0`.
+  * `Select.incoming` gives every function a new entry block that moves each
+    parameter out of `x`*i*, `d`*i* or `[incoming k]`; the machine function has
+    no `params` of its own, so each parameter has one definition the allocator
+    sees. Hints read off those moves, and off argument and result moves too.
+  * `Select.call` passes arguments past eight in a file in `[outgoing k]`, a
+    preallocated area at the bottom of the frame.
+  * Before a safepoint, selection stores each live root into its slot and
+    marks the call with a `SafepointMap`; `Turkey.Frame` turns each mark into a
+    frame-table entry of `x29`-relative root offsets. Nothing enters or leaves
+    a root frame and no safepoint writes a mask -- the decision "Frames, calls
+    and roots, surveyed" measured.
+  * `Turkey.Frame.layout` places the frame record, the callee-saved registers
+    the colouring used, root slots, spill slots and the outgoing area, 16-byte
+    aligned; `verifyFrame` checks the regions, that no value holds a reserved
+    register (`x16`-`x18`, `x29`, `x30`), that every slot is in the frame, and
+    that every root a map lists is stored before its call.
 
-  So the colouring figures above are a statement about the
-  *interior* of each function. The edges are missing, and they are what the
-  prologue slice has to add. The shape is a copy in and a copy out: fresh
-  values pinned to `x0`-`x7` and `d0`-`d7` at entry and to `x0` at exit, with
-  an ordinary `mov` between them and the body's values, which the colourer's
-  hinting should then coalesce away in the common case. Pinning is what the
-  colourer gains for it -- a value whose register is fixed before the walk
-  begins -- and it is the one thing in this design that can *fail* rather than
-  merely allocate badly, because a parameter pinned to `x0` and live across a
-  call has a contradiction the copy exists to break.
+  | | selected | frames: largest | callee-saved used, most | functions with stack arguments | frame-table entries |
+  |---|---|---|---|---|---|
+  | the corpus, 44 programs | 2781 of 2781 | 2,576 bytes | 10 gp, 8 fp | 7 | 4,070 |
+  | `boot` compiling itself | 3073 of 3073 | 16,672 bytes | 10 gp, 1 fp | 22 | 45,097 |
 
-  **`boot` needs stack arguments to compile itself.** The same run reports 21
-  functions stopped at a call with more than eight arguments in one register file, in the
-  compiler's own source. The gap recorded under phase 4 is not a hypothetical
-  a test program invented; it is on the path to M29.
+  `verifyFrame`, `verifyAllocation`, `verifyColouring` and `Ssa.verify` report
+  nothing on either. As before, these are checkers: the prologue, epilogue and
+  table data are step 5's to print, and nothing here has run.
 
+  **Spilling after the root stores**, on `boot`: 5,702 values spilled (3,937 of
+  them into root slots), 5,702 stores and **10,001 reloads**. The first version
+  had 24,977 -- every root store before a safepoint read its value, and for a
+  value already spilled into that very slot the read was a reload of what the
+  slot held. `spill` now drops those stores (FINDINGS 90). The allocator's move
+  hints now cover argument and result moves as well as parameters: 153,525 of
+  184,766 taken. `boot asm boot/Main.gob` takes 126 seconds, up from 88;
+  selection runs every function twice (once for the function, once for its
+  stop reason) and each run now analyzes roots, which is the first place to look.
 
 LLVM is transitional: it is what phase 5 is differentially checked against, so
 it outlives the allocator's first working version by however long that takes to

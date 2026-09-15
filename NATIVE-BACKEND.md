@@ -1138,27 +1138,48 @@ Each phase runs and is verified before the next begins.
   values use between calls. It was optimistic by a factor of three and a half;
   the untraced figure above is the honest one.
 
-  **Status (measured 2026-09-15): neither the corpus nor `boot` colours
-  completely, and nothing yet emits runnable code.**
+  **Status (measured 2026-09-15): the allocator finishes on the corpus and on
+  `boot`; nothing yet emits runnable code.**
 
-  | | selected | coloured | argument hints taken |
-  |---|---|---|---|
-  | the corpus, 42 programs | 2697 of 2699 | **2687 of 2697** | 5649 of 6992, **80.8%** |
-  | `boot` compiling itself | 2984 of 3005 | 2735 of 2984 | 4746 of 8541, 55.6% |
+  | | selected | allocated | spilled (into root slots) | reloads | argument hints taken |
+  |---|---|---|---|---|---|
+  | the corpus, 43 programs | 2741 of 2743 | **2741 of 2741** | 60 (32) | 125 | 5761 of 7107, 81.1% |
+  | `boot` compiling itself | 3040 of 3061 | **3040 of 3040** | 5284 (3642) | 9163 | 4845 of 8708, 55.6% |
 
-  Every colouring stop, in both, is "a value with no free register in the
-  general file": 10 in the corpus and 249 in `boot`. Every selection stop is a
-  stack-argument call: 2 in the corpus (`manyargs.gob`) and 21 in `boot`.
-  `tests/test_select.py` ratchets both histograms, the colouring one exactly.
+  Spilling is spill-everywhere ("Spilling, surveyed" above): a value with no
+  register is stored once after its definition and reloaded before each use,
+  and every function finishes in one round of it. Before it, colouring
+  stopped in 10 corpus functions and 249 of `boot`'s. `boot asm boot/Main.gob`
+  went from 65 to 88 seconds.
 
-  The three `Prim.floatBits` stops `boot` had are closed, and so are
-  `Prim.floatFromBits`, `Prim.floatIsNaN` and `Prim.floatFitsInt`: each is a
-  few inline instructions with no runtime entry point, and no corpus program
-  reached any of them until `tests/programs/float_bits.gob` (FINDINGS 87).
-  `Prim.floatIsNaN` was missing from `Turkey.Llvm` as well.
+  **How a value is chosen, and the thing the plan got wrong.** The plan was
+  first come, first served: spill whichever value the walk could not place.
+  That is right for one kind of failure and does nothing for the other. When a
+  register is free but *forbidden* -- the value is live across a call or a
+  physical register in use -- spilling that value is exactly the fix. When
+  every register is *held*, spilling it frees nothing: it still needs a
+  register at its own definition, for the one instruction before its store.
+  So that case evicts the holder whose next use is furthest away, which is
+  Belady's rule applied at one point. Both are in `Regalloc.place`.
 
-  Zero complaints from `verifyColouring` on either, which is the check that
-  matters: a colouring putting two simultaneously live values in one register
+  **Three checks run on every allocated function**, because spilling rewrites
+  it: `Ssa.verify` (still a graph), `verifyColouring` (still a colouring, now
+  including physical registers as live), and `verifyAllocation` (one value per
+  slot, each store directly after its definition, each reload read only by the
+  instruction it was loaded for, every `cset` still reaching its flag setter).
+  None reports anything on either. **These are checkers, not an oracle**:
+  whether spilled code computes the right answer is not known until the frame
+  and the emitter exist and the corpus runs against LLVM.
+
+  Selection stops only at stack arguments: 2 in the corpus (`manyargs.gob`),
+  21 in `boot`. Every function takes its closure environment as a hidden first
+  argument, so a helper with eight declared parameters is a nine-argument call
+  -- the first version of the spiller added two such stops to `boot` itself.
+  The three `Prim.floatBits` stops are closed, with `Prim.floatFromBits`,
+  `Prim.floatIsNaN` and `Prim.floatFitsInt` (FINDINGS 87).
+
+  Zero complaints from `verifyColouring` on either, which was the check that
+  mattered before spilling: a colouring putting two simultaneously live values in one register
   prints, assembles, links, runs, and computes a wrong answer, and nothing
   downstream can see it. It checks reachable blocks only, and only functions
   whose colouring *finished* -- a stopped one has unassigned values by

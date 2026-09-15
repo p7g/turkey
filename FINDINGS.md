@@ -2374,6 +2374,28 @@ asks. `Prim.floatFitsInt` was the last primitive with an LLVM rule and no
 arm64 one, found by listing both tables side by side, which is the check to
 repeat before calling selection complete.
 
+### 88. The allocator added stack-argument calls to the compiler it allocates
+**bug, fixed.** M28. Spilling took `boot`'s colouring stops from 249 to 0 and
+its stack-argument stops from 21 to 24. The spiller's `place` took ten
+parameters, and two checker helpers took eight -- which looks like it fits in
+eight argument registers and does not, because every function also takes its
+closure environment as a hidden first argument. `boot asm` reports stops by
+reason and not by function, so finding them meant diffing the list of
+selected functions between two runs. The helpers now take a record or seven
+parameters.
+
+The gap being closed and the code closing it are in the same program, which
+is the bootstrap's usual shape and still easy to forget: every new function in
+`boot/` is also a new input to the backend being written. A limit that applies
+to the backend's input applies to the backend.
+
+And one design error, caught before it cost anything. The plan said "spill
+whichever value the colourer reaches with no register free". When every
+register is held that frees nothing -- the value still needs one at its own
+definition -- and the spill loop would have gone round forever on `boot`'s
+88-value module initializer. Failures are now told apart: a forbidden register
+spills the failing value, a full file evicts the holder used furthest ahead.
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

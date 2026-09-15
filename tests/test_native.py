@@ -206,3 +206,9 @@ def test_pointer_array_initialization_does_not_allocate_boxes():
     assert result.returncode == 0, result.stderr
     assert result.stdout == _reference("shared_nullaries.tl")
     assert ", box 0," in result.stderr, result.stderr
+
+
+def test_typed_record_stores_do_not_call_the_generic_runtime_setter():
+    text = _modules()["record_stores.tl"]
+    assert "call void @turkey_object_set(" not in text
+    assert "store i64 " in text

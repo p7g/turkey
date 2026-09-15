@@ -733,8 +733,10 @@ fun emitInst(e : Emit, f : Func Low, i : Low) -> Unit {
         ObjectSet(target, index, v) -> {
             let held = Ssa.repOf(f, v)
             let raw = widened(e, f, v, held)
-            line(e, "  call void @turkey_object_set(ptr " + reg(target)
-                    + ", i64 " + Int.toString(index) + ", i64 " + raw + ")")
+            -- The typed field index is fixed by lowering, just as for
+            -- ObjectGet. Avoid the generic runtime's call and validation.
+            let address = slotAddress(e, reg(target), Int.toString(index))
+            line(e, "  store i64 " + raw + ", ptr " + address)
             line(e, "  " + dst + " = add i8 0, 0")
         }
         -- The tag is `i32` at offset 4, which is what a pattern test compares.

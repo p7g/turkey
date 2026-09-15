@@ -308,9 +308,12 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             runtimeCall(s, d, runtimeSymbolOf("turkey_object_new"), [],
                         [immediate(s, kind), immediate(s, tag),
                          immediate(s, count), immediate(s, bitmap)])
-        ObjectSet(target, index, v) ->
-            runtimeCall(s, d, runtimeSymbolOf("turkey_object_set"),
-                        [A.reg(target)], [immediate(s, index), raw(s, v)])
+        ObjectSet(target, index, v) -> {
+            -- Typed, constant-index fields use the same layout as ObjectGet.
+            -- A floating register stores its bits directly, as CellStore does.
+            emit(s, A.Str(A.reg(v), A.Offset(A.reg(target), 24 + 8 * index), A.W64))
+            emit(s, A.Mov(d, A.xzr, A.W64))
+        }
         ArrayNew(length, initial, element) ->
             runtimeCall(s, d, runtimeSymbolOf("turkey_array_new"),
                         [A.reg(length), raw(s, initial)],

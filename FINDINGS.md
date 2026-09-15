@@ -2128,6 +2128,67 @@ and three arrays. Subtracting these snapshots from the completed runs gives
 the residual allocation difference is entirely startup, not workload execution;
 matching totals do not imply identical allocation order or object lifetimes.
 
+### 84. Profiling found the remaining gap in typed record-field stores
+
+**backend, measured.** Allocation parity did not imply generated-code parity.
+A macOS `sample` profile (1 ms interval, over `opt boot/Main.tl`) found 4,498
+leaf samples in `valid_heap_pointer` and 2,326 in `turkey_object_set` in the
+self-hosted build, roughly 31% of the worker thread's 22,172 samples combined.
+These helpers were not leading costs in the Python-built profile. The latter
+already emits direct field stores; bootstrap LLVM and native selection still
+called the generic runtime setter, including its pointer and index validation,
+for every typed constant-index write.
+
+Both bootstrap emitters now store directly at the object's fixed field offset,
+matching `ObjectGet` and the Python emitter. LLVM preserves each value's raw
+64-bit slot representation, including float bits and narrow integers; native
+selection emits the corresponding integer or floating-register store. The
+checked runtime API remains available. Collector root validation and
+collection-at-every-allocation mode remain in place; generated typed stores
+follow the same contract as existing direct loads and cell stores.
+
+The regression keeps a mixed-field record in an array so local-record
+elimination cannot hide the writes. It updates Int, Float, Byte, Char, Bool,
+String and Unit fields, including an allocated string while the target must
+remain rooted. Native execution and GC stress check the result; LLVM and
+native-selection assertions ensure the generic setter call is absent.
+
+Same-source measurements, with `TURKEY_GC_STATS=1`:
+
+| metric | previous self-hosted | direct stores | Python-built |
+|---|---:|---:|---:|
+| wall | 26.68 s | 18.83 s | 19.15 s |
+| collector | 9.107 s | 8.877 s | 8.534 s |
+| collections | 111 | 111 | 92 |
+| allocations | 547,063,873 | 547,063,871 | 547,063,337 |
+| string | 4,159,150 | 4,159,148 | 4,159,148 |
+| constructor/tuple | 41,263,750 | 41,263,750 | 41,263,750 |
+| record/tagged object | 266,621,959 | 266,621,959 | 266,621,745 |
+| array | 48,654,300 | 48,654,300 | 48,654,297 |
+| closure | 90,456,812 | 90,456,812 | 90,456,495 |
+| closure environment | 90,456,426 | 90,456,426 | 90,456,426 |
+| box | 0 | 0 | 0 |
+| cell | 5,451,476 | 5,451,476 | 5,451,476 |
+| peak RSS, bytes | 1,196,834,816 | 1,201,963,008 | 2,133,671,936 |
+
+This is a **29.4% wall-time reduction**, with almost unchanged GC time and
+allocation counts. The self-hosted and Python-built native compilers now have
+comparable runtime on this workload; the small difference between 18.83 and
+19.15 s should not be treated as a significant win for either backend.
+A follow-up profile reduced `valid_heap_pointer` to 78 leaf samples, and
+`turkey_object_set` ceased to be a leading hotspot. Marking and allocation now
+dominate, as in the Python-built profile.
+
+An independent `cc -O2 -flto` experiment on the previous emitted LLVM and
+runtime produced 25.75 s with byte-identical output. That modest gain did not
+substitute for direct stores; no link-policy change is included here. The
+committed self-hosted measurements use the usual `cc -O2` link without LTO.
+
+Optimizer output is byte-identical before and after the change and agrees with
+the Python-built compiler. Successive self-hosted generations emit
+byte-identical LLVM. The focused SSA/selection/native checks passed **235
+tests**; the complete suite passed **1,549 tests**, with 153 skips.
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

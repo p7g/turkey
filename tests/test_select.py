@@ -206,3 +206,9 @@ def test_the_printed_instructions_assemble(name):
              str(path)],
             capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_typed_record_stores_select_direct_memory_writes():
+    text = _asm("record_stores.tl")
+    assert "_turkey_object_set" not in text
+    assert "str " in text

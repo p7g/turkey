@@ -119,7 +119,13 @@ typaram      ::= IDENT
 type-rhs     ::= con-decl ("|" con-decl)*     -- data type (multi or single variant)
                | con-decl                       -- ambiguous: resolved by name resolution
                | type-expr                      -- type alias
-con-decl     ::= CONID con-arg*
+con-decl     ::= CONID con-context? con-arg*
+-- An existential constructor (delta 68). Every variable the bracket mentions
+-- is hidden by the constructor, bound there and not a type parameter: a bare
+-- IDENT binds one unconstrained, and a class-pred binds its variable and makes
+-- the value carry that instance. No equality.
+con-context  ::= "[" con-binder ("," con-binder)* "]"
+con-binder   ::= IDENT | class-pred
 con-arg      ::= atype
                | "{" record-fields? "}"        -- record payload (at most one per constructor)
 record-fields ::= field (record-sep field)* ","?
@@ -275,6 +281,14 @@ it leaves out. A record pattern that means to ignore the rest says so with a
 trailing `..` -- `R { x = a, .. }` -- so a field added to a declaration is an
 error at every site that takes the record apart without having opted out
 (SPEC-DELTAS 65). A positional `..`, `R(x, ..)`, is reserved.
+
+**A constructor pattern may open an existential** (SPEC-DELTAS 68). Matching
+`SomeError(e)` against `type SomeError = SomeError[Error e](e)` binds `e` at a
+fresh rigid type that exists only inside the arm or function that the pattern
+belongs to, and puts the carried `Error` instance in scope there. It may appear
+anywhere in a `match` arm's or a `fun` or lambda parameter's pattern, but not
+in a `let`, a `var`, a `for ... in` element, or an arm with `|` alternatives.
+Nothing whose type mentions the opened type may leave the arm.
 
 **A binding takes an irrefutable pattern.** `let`, `var`, a `fun` or lambda
 parameter, and the element of `for ... in` bind with no second arm to fall to,

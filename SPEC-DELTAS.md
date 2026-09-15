@@ -3112,3 +3112,76 @@ to: `g`'s annotation is complete, and delta 38 already repaired it.
 **What it cost.** Nothing in the corpus: no binding in `boot`, the library or
 the test programs was rejected. `partial_signatures.gob` accepts; the four
 rules each have an `err_partial_sig_*.gob`.
+
+---
+
+### 68. Existential constructors
+
+Delta 56 ended "existential types are still outside the language". ERRORS.md
+decided they come in, as a general feature rather than a special-cased
+`SomeError`, and step 1 of its plan settled their representation. This is the
+language half.
+
+**A constructor may hide type variables.** A bracket after the constructor's
+name binds them, in the position a `fun` writes its context:
+
+```
+type SomeError = SomeError[Error e](e)
+type Counter = Counter[s] { state : s, step : fun(s) -> s, read : fun(s) -> Int }
+```
+
+Every variable the bracket mentions is bound there. A bare variable binds one
+unconstrained; `Error e` binds `e` and makes every `SomeError` carry the
+`Error` instance its `e` was built at. A variable in a field must still be a
+type parameter or bound in the bracket, so a typo stays delta 56's
+undeclared-variable error rather than a silent existential. A bracket variable
+may not also be a type parameter, and the bracket may not hold an equality:
+equality givens are what cost GADTs principal types (ERRORS.md, "GADTs: not
+now"), and class givens over fresh constants do not (Läufer & Odersky 1994).
+
+**Packing is explicit.** A use of the constructor is a use of a constrained
+function: `SomeError(ParseError { line = 3 })` instantiates `e`, wants
+`Error ParseError`, and elaborates to a constructor applied to the dictionary
+and the field. Nothing converts implicitly; `?` still does not pack.
+
+**Opening is a pattern.** A constructor pattern against an existential binds
+each hidden variable to a fresh rigid constant, a skolem as in delta 40, that
+exists only for the arm or function the pattern belongs to, and puts the
+carried instances in scope there as givens. It may appear anywhere in a `match`
+arm's pattern or a `fun` or lambda parameter's, nested or not. It may not
+appear in a `let`, a `var` or a `for ... in` element, where there is no body for
+the constant to live in (GHC has the same rule), nor in an arm with `|`
+alternatives, whose openings would have to agree. Two openings, even of the same
+value, are distinct constants.
+
+This is the one amendment to `CAssume`, which said its assumptions came only
+from a declared type: a pattern is now a second source, and restricting the
+bracket to class predicates is why that keeps principal types.
+
+**Escape.** A type mentioning an opened constant may not leave its arm, by the
+delta-40 check: the arm's result, anything assigned to an enclosing `var`, and a
+function's return type are all older than the constant. The message says which
+pattern opened it: `the type of 'e' would escape the pattern that opened it`.
+
+**Fields.** Positional and record forms both work, and so do both pattern forms.
+`.field` on a value whose declared type is a hidden variable is an error, since
+the constant has no scope to live in. An existential record is not mutable,
+whether or not the record would otherwise be (section 4.5).
+
+**Representation** (ERRORS.md, "Result: contract 1"). A packed value stores one
+layout code per hidden variable, then the carried dictionaries, then its fields
+at their packed layouts. An opened arm is compiled once per layout some reachable
+packing stores, and a value takes the copy whose codes match. Nothing is
+converted at the boundary, so an opened array aliases the packed one. This is
+the backend's business rather than the language's, and is recorded here because
+it is why nothing about opening a value costs a conversion.
+
+**How others answered.** GHC's `data T = forall a. Show a => MkT a` is the
+model, including the `let` restriction. OCaml writes the same with GADT syntax,
+and naming the hidden type needs `(type a)`. Swift made existentials implicit and
+then walked it back with `any P` (SE-0335), because their costs did not show.
+Scala 3 dropped `forSome`. Rust's `dyn Trait` is the dictionary-only form, where
+the hidden type is reachable only through methods.
+
+**What it cost.** To be recorded when the implementation lands in both
+compilers.

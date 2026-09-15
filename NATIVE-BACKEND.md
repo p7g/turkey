@@ -699,6 +699,123 @@ Sources: [Braun & Hack, CC 2009](https://link.springer.com/chapter/10.1007/978-3
 [regalloc2 `ION.md`](https://github.com/bytecodealliance/regalloc2/blob/main/doc/ION.md);
 [Poletto & Sarkar, TOPLAS 1999](https://dl.acm.org/doi/10.1145/330249.330250).
 
+## Frames, calls and roots, surveyed
+
+Written before the frame, because the first draft of the plan for it copied the
+LLVM path's root registration into every arm64 prologue -- a *call* to
+`turkey_root_enter` on the way in and to `turkey_root_leave` on every way out --
+and nothing about arm64 required that. The LLVM path does it because it was the
+portable thing to write in IR; this backend owns its frames, and the question
+is what owning them buys.
+
+### How a collector finds the roots in a frame
+
+| | what it does at entry and exit | what a safepoint costs | what the collector reads | size |
+|---|---|---|---|---|
+| **This project, LLVM path** | a call each way; the runtime links a 5-word `RootFrame` into a chain | a store per live root, then a store of the live mask | the chain, and each frame's mask | `turkey_root_enter` is five stores, `leave` one (`turkey_runtime.c:228`) |
+| **LLVM `ShadowStackGCLowering`** | **no call**: a load of the chain head, a store of a per-function constant frame map, two stores to link | the root is written to its slot as it changes | the chain, and each frame's constant map | one pass |
+| **OCaml native** | nothing | nothing beyond a live value already being in a stack slot: `destroyed_at_oper` for a call is `all_phys_regs`, so no register survives one | `caml_frametable`: per return address, the live stack offsets; a linear-probing hash keyed on the return address | `frame_descriptors.c` ~400 lines |
+| **Go** | nothing for the maps | a PCDATA index per call site | a pointer bitmap per call site, found from the return PC through `funcdata`/`pcdata` tables | the runtime's stack scanner and the compiler's liveness pass |
+
+LLVM's own documentation states the trade: the shadow stack is "slower than
+using a stack map compiled into the executable as constant data", and its
+drawbacks are "high overhead per function call" and that it is "not
+thread-safe". Henderson's ISMM 2002 paper is where the shadow stack comes from,
+for Mercury's C back end; its overhead figures could not be extracted from the
+PDF for this survey, so the numbers below are this project's own.
+
+**Why OCaml's shape fits here better than it fits most compilers.** Frame tables
+are cheap only if the collector can find every live pointer from the stack
+alone. OCaml gets that by keeping nothing in a register across a call. This
+backend gets most of it already: every traced value live across a safepoint has
+a root slot (`Turkey.Roots`), and selection stores it there before the call. A
+copy of the same pointer may also stay in a callee-saved register, and that is
+safe *only because the collector does not move objects* -- which the LLVM path
+already relies on, since it keeps using the SSA value after the call rather
+than reloading it. A moving collector would need either OCaml's rule or register
+maps, and is not planned.
+
+**What frame tables cost this project that they do not cost OCaml.** The
+runtime is C and is shared with the LLVM path, which keeps its chain. So the
+collector would walk *both*: the chain, as today, and the native frames of arm64
+code -- following `x29` frame records, which Apple requires to be valid, and
+looking each return address up in a table the emitter writes. The C runtime's
+own frames in between are skipped because their return addresses are in no
+table. That is a runtime walker of perhaps a hundred lines and a data section in
+the emitter, against deleting the entry, exit and mask code from every function.
+
+**Measured on this project, through the LLVM path** (2026-09-15). Stage2 `boot`
+-- `Turkey.Llvm`'s own output for `boot/Main.gob`, 68 MB of IR -- running
+`boot asm` over the 43-program corpus, built with `cc -O2` on an M-series Mac.
+One run makes **455 million** frame enters. The module has 2,529 enter sites,
+40,835 leave sites, 251,292 root-slot stores and 45,252 mask stores.
+
+| variant | best | what it isolates |
+|---|---|---|
+| `turkey_root_enter`/`leave` are real calls (`.ll` and runtime compiled apart) | 8.88 s | today's LLVM path |
+| the same with `-flto`, so both inline | 8.91 s | the call itself: **noise** |
+| inline, collection never runs | 8.12 s | the shadow stack without GC time |
+| push/pop stubbed and mask stores deleted, root stores kept, no collection | **7.05 s** | what frame tables leave behind |
+| root stores deleted as well | 7.03 s | the stores rooting needs anyway |
+
+Best of seven for the first two and best of nine, interleaved, for the last
+three -- the machine was shared with another build, and the interleaved
+minima agree to within 0.1 s run to run. `benchmarks/shadow_stack.sh` rebuilds
+the variants and reruns the timings.
+
+So the shadow stack costs **13%** of this workload's time once collection is
+taken out, and *inlining it recovers none of that*: the call was never the
+expensive part. The expense is 455 million pushes and pops and the mask store
+before every safepoint. The root stores themselves cost 0.02 s -- which is why
+frame tables keep them without regret. Frame tables remove exactly the 13%, and
+an inline shadow stack removes nothing measurable over today's calls.
+
+**Decided: frame tables.** The arm64 backend registers roots OCaml's way.
+Selection keeps the store of each live root into its slot before a safepoint
+and marks the call; frame layout records, per safepoint, the fp-relative slots
+live across it; the emitter writes one table entry per return address; the
+runtime's collector walks `x29` frame records and looks each return address up,
+beside the chain the LLVM path and the C runtime go on using. No function enters
+or leaves anything, and no safepoint writes a mask.
+
+
+
+### Frames
+
+| | frame record and callee-saves | outgoing stack arguments | scratch registers | size |
+|---|---|---|---|---|
+| **Apple arm64 ABI** | "`x29` must always address a valid frame record"; `x18` is reserved | packed: an argument narrower than 8 bytes takes its own size; the *caller* extends arguments narrower than 32 bits | -- | -- |
+| **QBE** `arm64/emit.c`, `abi.c` | frame record at `x29`, then callee-saves, spill slots, locals; `stp x29, x30, [sp, -N]!` when N ≤ 512 | `sp` adjusted per call | `x16` for frames over 4095 bytes; a scratch register when a slot offset passes `4095 × size` | 693 + 852 |
+| **Go** `cmd/internal/obj/arm64` | frame pointer and link register saved at entry, 16-byte aligned; large frames store the record before moving `sp` so a signal never sees half a frame | -- | `REGTMP` for frame sizes past 12 bits | -- |
+| **Cranelift** `aarch64/abi.rs` | callee-saves as `stp` pairs "at the top of the frame, just below FP" | a **preallocated** outgoing area, `sp` adjusted once | `x16`/`x17` as spill temporaries | ~1,400 |
+
+The decisions these settle:
+
+* **A preallocated outgoing area, as Cranelift and Go do, not QBE's per-call
+  adjustment.** Root and spill slots are addressed from `sp`, and an `sp` that
+  moves around each call would move every one of those offsets with it.
+* **Stack arguments between Turkey functions take whole 8-byte slots.** Apple's
+  packing rule is for arguments narrower than a word, and every value this
+  compiler passes on the stack is passed as a word. Only Turkey code calls
+  Turkey code with more than eight arguments -- runtime calls take at most four,
+  and C enters Turkey only through `turkey_main`'s `void (*)(void)` -- so the
+  convention is this compiler's to define, and it is Apple's for words.
+* **`x16` and `x17` are reserved**, as QBE, Go and Cranelift all reserve one or
+  both: large frames, large slot offsets, and the cycle in a block-parameter
+  parallel copy each need a register nobody else holds.
+
+Sources: [LLVM `ShadowStackGCLowering.cpp`](https://github.com/llvm/llvm-project/blob/main/llvm/lib/CodeGen/ShadowStackGCLowering.cpp);
+[Garbage Collection with LLVM](https://llvm.org/docs/GarbageCollection.html);
+[OCaml arm64 `proc.ml`](https://github.com/ocaml/ocaml/blob/trunk/asmcomp/arm64/proc.ml),
+[`frame_descriptors.c`](https://github.com/ocaml/ocaml/blob/trunk/runtime/frame_descriptors.c);
+[Go `stkframe.go`](https://github.com/golang/go/blob/master/src/runtime/stkframe.go),
+[`obj7.go`](https://github.com/golang/go/blob/master/src/cmd/internal/obj/arm64/obj7.go);
+[Henderson, ISMM 2002](https://bernsteinbear.com/assets/img/gc-uncooperative.pdf);
+[Writing ARM64 code for Apple platforms](https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms);
+[QBE `arm64/emit.c`](https://c9x.me/git/qbe.git/tree/arm64/emit.c),
+[`abi.c`](https://c9x.me/git/qbe.git/tree/arm64/abi.c);
+[Cranelift `aarch64/abi.rs`](https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/codegen/src/isa/aarch64/abi.rs).
+
 
 ## Verification
 

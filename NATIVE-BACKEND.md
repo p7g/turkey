@@ -1129,6 +1129,92 @@ it outlives the allocator's first working version by however long that takes to
 trust, and is then dropped. What it must not become is a constraint -- nothing
 in the low IR is shaped to suit it, so the day it goes costs one module.
 
+## Record layout: what the representation is, and what a packed one needs
+
+Deferred, and written down so that the change is made once and from the facts.
+`PROPOSALS.md` 6 argued that a record's layout should follow from its field
+types, as an `Array Byte`'s already does. The argument stands; two of the
+proposal's premises do not, and the one rule it states is right for a reason
+other than the one it gives.
+
+### What the representation is today
+
+* **Header.** 24 bytes: `kind` and `tag` (`i32` each), `count` (`i64`),
+  `pointer_bitmap` (`u64`) -- `TurkeyObject` in `runtime/turkey_runtime.c`, `_OBJECT`
+  in `turkey/llvmgen.py`, and byte offsets in `boot/Turkey/Llvm.gob`.
+* **Slots.** One 8-byte word per field, in declaration order, at `24 + 8*i`.
+  Every backend computes a constant offset: `_object_slot`, `slotAddress`, and
+  `Select.gob`'s `Ldr/Str [target, #24+8*index], W64`. `field_index` and
+  `fieldIndex` answer the declaration position. Scalars are unboxed in the word
+  -- zero-extended, a `Float` bitcast -- and `record_stores.gob` pins the mixed
+  case.
+* **The collector's view.** `pointer_bitmap` is **three bits per slot**, a layout
+  code (`UNIT 0, I1 1, I8 2, I32 3, I64 4, F64 5, PTR 6, BOXED 7`), and
+  `mark_children` traces a slot whose code is 6 or more. It is written per
+  *object*, at the construction site, from the layouts of the values stored
+  (`_layout_metadata`, `SsaLower.metadata`). Three bits a slot is why
+  `turkey_object_new` caps a constructor at 21 fields.
+* **What reads positions.** `field_index`/`fieldIndex`, `_record_layouts`, the
+  metadata bit positions, the 21-field cap, and two hard-coded shapes in the
+  runtime: `array_parts` reads `Data.Array#ArrayStorage` as slots 0 and 1, and a
+  closure is `[code, env]`. Nothing else -- the Python evaluator, `pygen`, the
+  local-record flattening and nullary sharing all go by name.
+
+### Where the proposal was wrong
+
+**"Pointers first, so `pointer_bitmap` stays a bitmap over the leading N
+slots."** It is not a leading-N bitmap and never was: it is a code per slot, so
+the collector already handles pointers and scalars interleaved in any order.
+Reordering buys the collector nothing. What packing *does* need from it is a
+split between the words it scans and the bytes it skips, which is a different
+header change.
+
+**"A field whose type is a type variable is always one word, because `mono.py`
+is partial."** The guard against a partial specializer is not a uniform field.
+It is `layout.share`, which gives every body that reads a field through a
+transparent parameter one copy per layout of its type arguments, and
+`mono.check_layouts` (7e3479a), which refuses a program where such a parameter
+survives. A layout-keyed copy of `fun get(b : Box a) -> a` knows the width of
+`a` perfectly well.
+
+### Why the rule is still right, at first
+
+The reason to keep a type-variable field at one word is **agreement between
+producers and consumers without cross-body analysis**. If a field's offset is a
+function of its *declared* type alone, ground code, every layout-keyed copy and
+every body left generic compute the same offset for the same constructor,
+whatever they know about the instantiation. Only fields whose declared type is
+concrete -- `Bool`, `Byte`, `Char`, `Unit` -- could be narrower, and every
+reader agrees about those because nobody can see them at a different type.
+
+The alternative is MLton's and Rust's: width follows the *instantiation*, so
+`Box Byte` is one byte of payload and `Box Int` eight. That needs every producer
+of a `Box t` to be a layout-keyed copy too, and `check_layouts` inspects only
+parameters today, not constructions or returns.
+
+### A hole to close first
+
+`fun mk(x : a) -> Box a = Box(x)` is not transparent and calls nothing that is,
+so `layout.share` never copies it. Left generic past the specialization cap, it
+stores its field `BOXED`, a pointer to a box, while a ground reader of `Box
+Int` reads the same word as `i64`. That is FINDINGS 53's shape -- a field
+written one way and read another -- and it is unverified. It is independent of
+packing and should get a failing test before anything here is built on the
+current invariant.
+
+### Decisions for when this is done
+
+* Declared-type layout or instantiation layout -- the section above.
+* Whether tuples (kind 0, no declaration) and closure environments follow, and
+  by which rule.
+* The header: `count` as words scanned plus a byte size for the packed tail, or
+  a per-constructor descriptor in place of per-object metadata.
+* Selection: `Select.gob` has `Ldrb`/`Strb` and `W32`, and no `W16`.
+* The runtime's hard-coded `ArrayStorage` slots and the closure shape.
+* Measure first: what share of allocated bytes is `Bool`/`Byte`/`Char` payload
+  on the boot workload. The proposal said this is not a performance argument,
+  and it is not, but the cost of the change should be known before it is paid.
+
 ## Open decisions
 
 * **The first native target.** arm64, because it is what this is developed on

@@ -1478,11 +1478,17 @@ class Lowerer:
         from the type the generator bound it at.
         """
         scheme = self.local_scheme(decl)
+        # `resolved` rather than a bare `resolve`: a local `fun` inside a
+        # signature-checked body was inferred against that signature's
+        # skolems, so its type says `k` the constant where the enclosing
+        # binder says `k` the variable. Left as a constant it survives
+        # specialization, and `go : fun(k) -> v` inside `wrap@Int` is the
+        # first node the checker cannot excuse. FINDINGS 83.
         if scheme is not None:
-            fn_ty = self.types.resolve(scheme.body)
+            fn_ty = self.resolved(scheme.body)
             binders = list(scheme.quantified)
         else:
-            fn_ty = self.decl_type(decl)
+            fn_ty = self.rigidly(self.decl_type(decl))
             binders = []
         dicts = getattr(decl, "dicts", None)
         return CBind(decl.name, self.abstracted(fn_ty, dicts), binders,

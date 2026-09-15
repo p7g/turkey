@@ -1823,8 +1823,11 @@ fun funBinders(l : Lowerer, decl : FunDecl) -> Array VarCell =
 fun localFun(l : Lowerer, decl : FunDecl, scope : Scope) -> CBind {
     let s = localScheme(l, decl)
     let (fnTy, binders) = match s {
-        Some(sc) -> (Typed.resolve(l.types, sc.body), sc.quantified)
-        None -> (declType(l, decl), Array.new(0))
+        -- `resolved`, not a bare resolve: inside a signature-checked body the
+        -- local was inferred against that signature's skolems, and a constant
+        -- `k` left in its type survives specialization. FINDINGS 83.
+        Some(sc) -> (resolved(l, sc.body), sc.quantified)
+        None -> (rigidly(l, declType(l, decl)), Array.new(0))
     }
     let dicts = abstractionOf(l, decl.id)
     let b = newBind(decl.name, abstracted(l, fnTy, dicts), binders,

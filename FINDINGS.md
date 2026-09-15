@@ -209,6 +209,52 @@ Nothing in `tests/programs` is large enough for a per-call-site copy of a
 too-large body to cost anything measurable; `boot` is twelve thousand lines with
 a standard library behind it, and it made a constant factor into a wall.
 
+### 83. A local `fun` kept its enclosing signature's skolems, and specialization exposed them
+**bug, fixed.** Found writing a memoizing fixpoint -- `fun memoFix[Hash k](f :
+fun(fun(k) -> v, k) -> v) -> fun(k) -> v` with a local `fun go(x)` looking `x`
+up in a `Map` -- which died at `fib(80)` with `internal error: the variable 'x'
+should be Int but is k`. The same function written with a `var self = fun(x : k)
+{...}` cell ran.
+
+Neither recursion nor the constraint matters. The minimal program is
+
+    fun ident(y : k) -> k {
+        fun go() = y
+        return go()
+    }
+
+and all it needs is a *written* type variable and a local `fun` whose type
+mentions it. Unannotated, the same body generalizes normally and runs.
+
+A signature-checked body is inferred against skolems (delta 38): `k` is a rigid
+constant for the length of the body, and the lowering turns each node's type
+back into the binder's variable with `rigidly`. `Lowerer.local_fun` built the
+local's `CBind` type with a bare `types.resolve` instead, so `go : fun() -> k`
+carried the *constant* `k` inside a binding quantified over the variable.
+Nothing said so before specialization, because the checker's `compatible` lets
+a variable on either side match anything, and every place the constant met the
+enclosing binder it met a variable. `mono` substitutes variables, so in
+`ident@Int` the parameter became `Int` and the constant stayed `k`, and that is
+the first comparison with no variable in it. Now `local_fun` reads the scheme
+through `resolved` (and a scheme-less local through `rigidly`), the way every
+other type the lowering takes from the solver's records is read.
+
+`boot`'s `localFun` had the identical line, and this is entry 38's lesson again
+from the other side: `test_boot` compared the two `core` dumps byte for byte and
+they agreed -- on the wrong Core, both printing `go : fun() -> k` under a
+`forall a`. A differential cannot see a bug both implementations share; the
+checker, run after `mono`, is what did. Both sides are fixed, and
+`tests/programs/local_fun_signature.tl` covers the report and its reductions --
+at `fib(30)` rather than `fib(80)`, since `test_pygen`'s evaluator oracle runs
+without `run_deep` and a memoized `fib(80)` is eighty levels of it deep.
+
+Two papercuts turned up while writing that program. A local `fun` cannot call a
+*later* sibling (`'pong' is not defined`), although the lowering already binds
+consecutive local `fun`s as one `letrec`. And a local's own annotation, `fun
+go(z : k)` inside a body whose signature also says `k`, is a fresh rigid `k` by
+delta 13's scoping -- reported as `expected k, found k`, which is correct and
+unreadable.
+
 ---
 
 ## Open, and accepted

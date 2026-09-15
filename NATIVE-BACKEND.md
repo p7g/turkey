@@ -612,6 +612,93 @@ wrong, not which instruction -- so it wants the fuzzer beside it, not instead
 of it. It is also the argument, now evidenced, for the phase ordering already
 written down: LLVM outlives the allocator's first working version.
 
+## Spilling, surveyed
+
+Written before the spiller, once measurement had settled that one is needed:
+`boot` has 35 untraced values live at once against 28 registers, and up to 84
+traced plus 31 untraced live across a single call against ten callee-saved
+registers. The question is not whether to spill but what shape the first
+spiller takes, and the peers split on exactly one axis: **whether a reload
+creates a new definition that SSA has to be repaired for.**
+
+| | what it does | where spills and reloads go | size | measured |
+|---|---|---|---|---|
+| **Braun & Hack** (CC 2009), in libFirm | Belady's furthest-next-use generalized to a CFG, per block in reverse postorder | spill at the first eviction; reloads on first use in a block or on incoming edges; **SSA reconstructed** for every reloaded variable | libFirm `bespillbelady.c` + `bespillutil.c` (~800 lines, the latter) | executed reloads **-54.5%** (spills -61.5%) vs a linear-scan allocator, **-58.2%** (-41.9%) vs graph colouring, on CINT2000, x86 |
+| **libFirm** `bespillutil.c` | the placement back end for the above | spill after the definition by default, moved later when execution frequencies say it is cheaper; rematerializes where that beats a load | ~800 | -- |
+| **QBE** `spill.c` | loop-depth-weighted cost, runs after SSA is left | spills after definitions, reloads before the instruction needing the register | **531** | nothing published |
+| **Go** `regalloc.go` + `stackalloc.go` | greedy; restores made lazily at a use | "The spill of v must dominate that block" -- placed at a dominator of all restores where `v` is still in a register | 3,464 + ~450 | -- |
+| **regalloc2** | split at the first conflict, one split per iteration; leftovers go to a "spill bundle" | split points chosen by conflict; spillslots shared by non-overlapping spillsets | >10,000 | -- |
+| **Poletto & Sarkar** linear scan | spill the active interval that ends last | the whole interval, everywhere | small | "within 12%" of graph colouring with 31 registers |
+
+**The spill-everywhere shape is the one Braun & Hack measure against, and they
+are right about what it costs.** Their own description of the baseline is
+exact: in extreme cases a failure "results in spilling the whole live range of
+a variable: Stores will be put after each definition and loads in front of each
+use, regardless of their location in the program." A value defined before a
+loop and used inside it reloads every iteration; theirs reloads once in front
+of the loop. That is the 54.5%.
+
+**And what buys the 54.5% is SSA reconstruction.** Their algorithm "retains
+the SSA form" by recording "all inserted reload operations per variable" and
+reconstructing SSA for those variables -- "adding a reload causes a φ-function
+to be created". libFirm does the same through `be_ssa_construction_fix_users`.
+Go avoids it by not being in SSA at that point, and QBE by having left SSA
+before spilling.
+
+**Why this backend starts with spill-everywhere anyway, and what differs from
+the peers who did not.** Three facts of this design, none of which the peers
+share:
+
+* **A reload that needs a φ needs a block parameter, and a `Branch` cannot pass
+  one.** `Term` gives arguments to `Jump` only -- the property that made critical
+  edges a non-problem above. So SSA reconstruction here is also edge splitting,
+  which is a second transformation of the CFG, and a mistake in either is a
+  wrong program that `Ssa.verify` does not catch (it checks dominance, not
+  that the right definition reached the merge). libFirm has phis and splits
+  nothing.
+* **There is no execution oracle yet.** The spiller's output is not run until
+  the frame and the emitter exist. Spill-everywhere is checkable locally --
+  one slot per value, one store directly after its definition, every load used
+  by the very next instruction -- and a reconstruction is not.
+* **The ceiling on the whole question is already known.** LLVM's 1-2% smaller
+  and up to 10% faster for a world-class allocator over a plain one, and
+  Poletto and Sarkar's 12%, bound what spill placement can be worth, on
+  programs where every call is already followed by a panic test and every
+  pointer by a root store.
+
+So the first slice keeps SSA the cheap way: every reload dominates its only use.
+The chordal theorem still holds, colouring still cannot fail once pressure
+fits, and **splitting is a later pass that rewrites these reloads** -- reload once
+after a call rather than at every use -- when a measured load count says it
+pays. Braun & Hack's algorithm is the one to reach for then, and their numbers
+are the ones to hold it to.
+
+**The root array still counts, and more than before.** A rooted value spilled
+this way is written to its root slot once, at its definition, rather than at
+every safepoint; the safepoint then writes only the mask. That is the one place
+spill-everywhere is *cheaper* than the LLVM path's rooting. It needs slots at 64
+and above zeroed in the prologue, which LLVM already does.
+
+**Flags do not constrain reload placement.** The earlier worry was that a
+spiller would insert between a flag-setter and its `cset`. It would -- and
+`ldr` and `str` do not touch the flags, so nothing breaks. The invariant to
+check is narrower: nothing *flag-setting* is inserted there.
+
+**One hazard every spill shape shares, found by reading the colourer.**
+Physical registers are tracked as *clobbered* but not as *live*. Selection
+never defines a value between `mov x0, %a` and the `bl` that reads `x0`, so no
+bug has shown -- but a reload inserted in front of `mov x1, %b` is exactly such
+a value, and could be coloured `x0`. The allocator learns physical liveness
+before it learns to spill.
+
+Sources: [Braun & Hack, CC 2009](https://link.springer.com/chapter/10.1007/978-3-642-00722-4_13);
+[libFirm `bespillutil.c`](https://github.com/libfirm/libfirm/blob/master/ir/be/bespillutil.c);
+[QBE `spill.c`](https://c9x.me/git/qbe.git/tree/spill.c);
+[Go `regalloc.go`](https://github.com/golang/go/blob/master/src/cmd/compile/internal/ssa/regalloc.go),
+[`stackalloc.go`](https://github.com/golang/go/blob/master/src/cmd/compile/internal/ssa/stackalloc.go);
+[regalloc2 `ION.md`](https://github.com/bytecodealliance/regalloc2/blob/main/doc/ION.md);
+[Poletto & Sarkar, TOPLAS 1999](https://dl.acm.org/doi/10.1145/330249.330250).
+
 
 ## Verification
 

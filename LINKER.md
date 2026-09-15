@@ -38,7 +38,7 @@ There is no simpler artifact.
 
 ## What we would actually have to link
 
-Also measured. `boot`'s output for `adt.tl`, compiled to an object:
+Also measured. `boot`'s output for `adt.gob`, compiled to an object:
 
 ```
 $ nm -u adt.o | wc -l

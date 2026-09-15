@@ -117,7 +117,7 @@ three-argument shape it is GHC's `HasField x r a | x r -> a` (Gundry's
 dropping the rows is what makes the rule necessary rather than free. It is a
 built-in predicate, not a class -- there is no way to write an instance of it.
 
-Two consequences worth stating. A function like `bf.tl`'s `inc` becomes
+Two consequences worth stating. A function like `bf.gob`'s `inc` becomes
 structurally polymorphic over any record carrying the fields it reads, in a
 language whose records are otherwise nominal. And field names still need not
 be globally unique: the receiver, not the field name, is what resolves the
@@ -248,7 +248,7 @@ same-named local defs shadowing the seeded `Data.Array` builtins) so the
 example's intent is preserved.
 
 **Amended at delta 41.** Modules exist, and the shadowing this entry
-describes is exactly what `tests/programs/modules/Stack.tl` now relies on:
+describes is exactly what `tests/programs/modules/Stack.gob` now relies on:
 it defines `push` and `pop` of its own and calls `Array.push` qualified. The
 infinite recursion the spec's example would have had is a consequence of
 writing `import Data.Array (push)` *and* a local `push` and then calling the
@@ -509,7 +509,7 @@ monomorphic `1` would have reported line 4. Carrying an origin span into a
 predicate would recover the better message; that is deferred to the milestone
 that adds classes, which needs the same machinery.
 
-A literal's openness can also surface in an inferred signature. `bf.tl`'s
+A literal's openness can also surface in an inferred signature. `bf.gob`'s
 `move` pushes `0` onto `t.data` and nothing else pins the element type, so it
 generalizes to `[..., HasField "data" a (Array b), OneOf b {Int, Float}]`
 rather than `Array Int` -- correct, and more general than intended, which is
@@ -573,7 +573,7 @@ Two consequences worth stating:
 
 design.md has no classes at all -- §8.2 says only that `==`/`<` "can be unified
 under `Eq`/`Ord` classes" later. This adds them, with one parameter, in the
-syntax `Prelude.tl` already assumes:
+syntax `Prelude.gob` already assumes:
 
 ```
 class Semigroup a {
@@ -650,7 +650,7 @@ A method shares the value namespace with ordinary functions, so `fun eq` and a
 class method `eq` collide.
 
 Nothing runs yet: a method call has no dictionary to resolve it until
-dictionary passing lands (delta 30). `tests/programs/classes.tl` type-checks
+dictionary passing lands (delta 30). `tests/programs/classes.gob` type-checks
 and its `main` stays clear of methods.
 
 
@@ -802,7 +802,7 @@ belongs to turned out to be `Add`.)
 
 **Per-operator classes, not one `Num`.** `Add`, `Sub`, `Mul`, `Div`, `Rem` and
 `Neg` are separate, as in Rust's `std::ops`, so a type that adds is not thereby
-required to divide. `Money` in `tests/programs/operators.tl` has `Add`, `Neg`,
+required to divide. `Money` in `tests/programs/operators.gob` has `Add`, `Neg`,
 `Eq` and `Ord` and no arithmetic beyond them, and `a / a` on it is a missing
 instance.
 
@@ -823,15 +823,15 @@ fun inc(x) = x + 1      -- [OneOf a {Int, Float}, Add a] fun(a) -> a
 ```
 
 That generality is correct and is more than was intended, in exactly the sense
-delta 27 already accepted for `bf.tl`'s `move`. Two `.types` goldens changed
-for it and no `.expected` did: `bf.tl`'s `inc` and `fields.tl`'s `bump` are
+delta 27 already accepted for `bf.gob`'s `move`. Two `.types` goldens changed
+for it and no `.expected` did: `bf.gob`'s `inc` and `fields.gob`'s `bump` are
 polymorphic in the numeric type they increment.
 
 **`for x in xs` runs on a class.** `Iterator i` declares the associated family
 `Item i` (delta 31), and the loop is a call to its methods; the loop variable's
 type is `Item xs`, left to reduce like any other family application. `Array` is
 the instance that ships, and it is no longer the only sequence a `for` can walk
--- `tests/programs/iter.tl` walks a `Range` record, a linked list and a `Pair`.
+-- `tests/programs/iter.gob` walks a `Range` record, a linked list and a `Pair`.
 The cost is on the other side: a `String` is not an `Iterator`, so `for c in s`
 is a missing instance and the characters are still reached through
 `String.chars`. **Amended at delta 33:** the methods were `count` and `nth`,
@@ -853,7 +853,7 @@ One latent bug in delta 30 surfaced here and is fixed. A call from one member
 of a binding group to another -- or to itself -- is solved against the
 monomorphic placeholder the group binds, so it demands nothing, and at run time
 it was handed the undischarged binding rather than a function. No golden had a
-mutually recursive group with a class context until `adt.tl`'s `isEven`/`isOdd`
+mutually recursive group with a class context until `adt.gob`'s `isEven`/`isOdd`
 acquired one from `==` and `-`. Such a use now takes the group's own
 dictionaries, which is what the group's context always meant.
 
@@ -885,7 +885,7 @@ ends the loop by answering `None`. Nothing asks the container how long it is.
 That is the point: an indexed protocol can only describe containers that can
 produce their *k*th element, so a linked list, a stream, a generator or a
 file's lines could not be iterated at all, and a loop over a list that somehow
-could would be quadratic. `tests/programs/iter.tl` now walks a linked list for
+could would be quadratic. `tests/programs/iter.gob` now walks a linked list for
 exactly this reason, and `tests/test_prelude.py` iterates a source with no end.
 
 The cursor is a second associated family rather than a second class parameter,
@@ -1042,7 +1042,7 @@ a length that a bug moved. Naming `Option` from `turkey/builtins.py` needs no
 uninitialized slots, `Int.div` by zero and `error` all still panic: those
 report a program bug rather than an ordinary empty case, and turning them into
 `Option` is a language-wide decision about partiality, not a repair to one
-signature. The one golden that moved is `stack.tl`, whose `pop` now matches on
+signature. The one golden that moved is `stack.gob`, whose `pop` now matches on
 the answer; its `.expected` and `.types` are unchanged.
 
 **Declined while here: an exponentiation operator.** Two reasons, neither of
@@ -1127,7 +1127,7 @@ reported as stuck -- now naming `c`, the variable the signature wrote, rather
 than a letter `show` invented.
 
 **Scope.** One golden moved: `err_stuck_family.expected`, for that better name.
-`bf.tl` is unaffected here; it needs delta 39 as well. Erased predicates are
+`bf.gob` is unaffected here; it needs delta 39 as well. Erased predicates are
 untouched -- a signature's dictionary parameters are its class predicates in
 scheme order, which is the order a use site instantiates in.
 
@@ -1191,7 +1191,7 @@ and still travels in the scheme. No evidence, no elaboration case, no change to
 the evaluator.
 
 **A written equality is a rewrite rule.** Discharging `Item s ~ Op` is not
-enough on its own. In `bf.tl`'s `run` the scrutinee has type `Item s`, and
+enough on its own. In `bf.gob`'s `run` the scrutinee has type `Item s`, and
 `match op { Inc(n) -> ... }` cannot look up a constructor until `Item s`
 genuinely *becomes* `Op`. So a *given* equality is read as a reduction rule for
 the family it names: `Solver.reduce` consults the assumptions before the
@@ -1216,7 +1216,7 @@ result also enforces the one-argument rule the old `CONID atype` production
 enforced by shape. A carried equality is oriented family-first when it is
 built, so an inferred context reads the way a written one must be written.
 
-**This is what `bf.tl`'s `run` was missing**, and it needed both halves of M10:
+**This is what `bf.gob`'s `run` was missing**, and it needed both halves of M10:
 
 ```
 fun run[Iterator s, Item s ~ Op](tape : Tape, ops : s) -> Unit
@@ -1225,7 +1225,7 @@ fun run[Iterator s, Item s ~ Op](tape : Tape, ops : s) -> Unit
 Delta 39 is what lets the type be written and the `match` reduce; delta 38 is
 what stops the recursive `run(tape, loopOps)` from pinning `s` to `Array Op`.
 
-**Scope.** `bf.tl` and its `.types` moved; no other golden did. Declined while
+**Scope.** `bf.gob` and its `.types` moved; no other golden did. Declined while
 here: a general `σ ~ τ` between two arbitrary types. It is what would make this
 a rewrite system needing confluence rather than a table of family definitions,
 and it says nothing an annotation cannot. Equalities introduced by a *pattern*
@@ -1325,7 +1325,7 @@ and a program that defined any of them was told `'add' is already defined; a
 class method shares the namespace of ordinary functions`. M9 hit this on `add`
 and worked around it by renaming. This delta is the repayment.
 
-A program is now a directory. `turkey run Main.tl` loads `Main.tl`, follows its
+A program is now a directory. `turkey run Main.gob` loads `Main.gob`, follows its
 `import`s against that file's own directory and then the shipped library under
 `turkey/lib`, and checks each module in dependency order. §9's surface syntax
 was already lexed and parsed; what it means is here.
@@ -1379,7 +1379,7 @@ module here: the checker solves a whole module's bindings as one
 dependency-ordered pass, and nothing would interleave two. A cycle is reported
 by name (`imports form a cycle: Odd -> Even -> Odd`).
 
-**The prelude is a file.** `turkey/lib/Prelude.tl` is ordinary source, loaded
+**The prelude is a file.** `turkey/lib/Prelude.gob` is ordinary source, loaded
 like any other module and implicitly imported by every one. It is checked, not
 trusted — `class Add a` and `instance Add Int` go through exactly the machinery
 a user's would. `turkey/prelude.py` keeps only what the *compiler* has to know:
@@ -1402,7 +1402,7 @@ the name the CLI was given.
 
 **Scope.** No golden moved. `tests/programs/err_modules_unsupported` is gone,
 replaced by three multi-file programs — a directory under `tests/programs/`
-whose entry is `Main.tl` is now a program — and `tests/test_modules.py` covers
+whose entry is `Main.gob` is now a program — and `tests/test_modules.py` covers
 the scoping rules themselves. Three tests changed because what they asserted is
 what this delta reverses: a method and a top-level function may now share a
 name, and a program may define `add`.
@@ -1415,7 +1415,7 @@ still Python entries in the initial environment, registered under two spellings
 each (`Array.push` and `Data.Array.push`) because there was no module system to
 tell them apart. Delta 41 built the module system. This is the move.
 
-`turkey/lib/Data/{Array,Bool,Char,Float,Int,Option,String}.tl` are ordinary
+`turkey/lib/Data/{Array,Bool,Char,Float,Int,Option,String}.gob` are ordinary
 source, checked exactly as a program is. What is left in `turkey/builtins.py`
 is the floor they stand on: `Prim.arrayPush`, `Prim.intToString`,
 `Prim.stringChars` and the arithmetic, under names a module outside
@@ -1537,7 +1537,7 @@ demands the library's, which is what stops the shadow from being a way to break
 the language — `if A { ... }` over a local `Bool` is now
 `expected Main.Bool, found Data.Bool.Bool`. The same goes for `Option`.
 
-**Scope.** No golden moved except `tests/programs/modules/Main.tl`, which now
+**Scope.** No golden moved except `tests/programs/modules/Main.gob`, which now
 writes `G.Point` where it wrote `Point` — the deliberate change. Two tests
 changed because they pinned the redeclaration collision this delta removes.
 
@@ -1575,7 +1575,7 @@ add(x, y) = x + y` was `fun(String, String) -> String` when written with `++`
 and is `[Add a] fun(a, a) -> a` now, which is more general and more honest. One
 test that relied on that pinning writes the annotation instead.
 
-**Scope.** Every `.tl` that concatenated changed spelling; no `.expected` and no
+**Scope.** Every `.gob` that concatenated changed spelling; no `.expected` and no
 `.types` golden moved.
 
 ### 45. `Functor`, `Applicative` and `Monad`, and the library grows an `Either`
@@ -1601,9 +1601,9 @@ in its result, which is the shape `Monoid.empty` already had and the reason M6
 passes dictionaries rather than selecting them from an argument. `instance Monad
 (Either l)` is a partially applied head, which delta 29's Haskell 98 rule has
 always allowed. Three classes and nine instances, all of it ordinary source in
-`turkey/lib/Prelude.tl`, checked by the same machinery a program's own would be.
+`turkey/lib/Prelude.gob`, checked by the same machinery a program's own would be.
 
-**`Either` is declared beside its functions**, in `turkey/lib/Data/Either.tl`,
+**`Either` is declared beside its functions**, in `turkey/lib/Data/Either.gob`,
 the way delta 42 put `Option` in `Data.Option` — and re-exported by the Prelude
 both qualified (`Either.isRight`) and unqualified (`Either(..)`), so `Left` and
 `Right` need no import. `Option` earned its unqualified place by being named by
@@ -1641,11 +1641,11 @@ where a program declaring its own `Either` merely shadows and prints as
 instead. Whether classes should be qualified too is a real question and not this
 entry's to answer.
 
-**Scope.** `classes.tl` and `dicts.tl` lost their local `Functor` — the first
+**Scope.** `classes.gob` and `dicts.gob` lost their local `Functor` — the first
 keeps its `instance Functor (Either l)` over its own `Either`, which is still
 what shows a partially applied head — and both `.types` goldens lost their `map`
 line. `tests/test_classes.py` renamed its fixture class to `Mappable`/`over` and
-dropped the local `Either` its helpers prepended. New golden `monads.tl`, with
+dropped the local `Either` its helpers prepended. New golden `monads.gob`, with
 `.expected` and `.types`, writes the chains out by hand: it is what delta 46's
 sugar has to agree with, and worth reading in longhand once before any of it is
 hidden.
@@ -1698,7 +1698,7 @@ callback and the enclosing function is not monadic at all.
 
 Which settles the open question `plan.txt` left about an empty or `?`-free `do`:
 **it emits nothing whatsoever.** No `bind`, so no `Monad` obligation, so nothing
-for it to be ambiguous about. `question.tl`'s `plain` is `fun(Int) -> Int` in
+for it to be ambiguous about. `question.gob`'s `plain` is `fun(Int) -> Int` in
 the `.types` golden, and `do { }` is `Unit`. `do` is a scoping marker and not a
 mode.
 
@@ -1736,7 +1736,7 @@ reference over a shared mutable scope chain, and `Generator.is_mutable` walks
 scopes with no function barrier -- so a lambda that writes an enclosing `var`
 writes through to it. No document said so, because until `?` no program could
 easily notice. Now everything after a `?` is inside a lambda, and
-`question_capture.tl` pins what follows: under `Some` the write happens once,
+`question_capture.gob` pins what follows: under `Some` the write happens once,
 under `None` never, and under `Array` once per element *sharing one counter*, so
 `each([7, 8, 9])` is `[107, 208, 309]`. That is not a decision about `?`. It is
 the instance's `bind`, which is what `?` was defined to be.
@@ -1749,8 +1749,8 @@ operator, keyword, `CAN_END` and `CAN_START` tables; `EQuestion` and `EDo` in
 lowering straight to a Core IR will want a sugared tree to lower and this pass to
 check itself against; a suffix case in `parse_postfix` and an atom case in
 `parse_atom`; two passthrough cases in `turkey/resolve.py`; one line in
-`turkey/driver.py`. New goldens `question.tl` (with `.types`),
-`question_capture.tl`, and three `err_question_*.tl`, two of which record what
+`turkey/driver.py`. New goldens `question.gob` (with `.types`),
+`question_capture.gob`, and three `err_question_*.gob`, two of which record what
 delta 47 has yet to do. New `tests/test_desugar.py`. No existing golden moved.
 
 ### 47. What crosses a bind is a value
@@ -1791,7 +1791,7 @@ partial match.
 **Flow mode is not switched on for a block that does not need it.** The test is
 whether a transfer sits at or after the *first* statement holding a `?`:
 everything before that stays in the prefix, at the nesting the author wrote it
-at, where a `return` still is one. So `question.tl`'s `early` lowers exactly as
+at, where a `return` still is one. So `question.gob`'s `early` lowers exactly as
 it did before this entry, and the machinery here shows up only where the
 alternative was being wrong.
 
@@ -1839,7 +1839,7 @@ else { pure(x * 10) })`, with no `?` and no `Flow` anywhere, is the same thing.
 "Return" means "this branch's answer is that" because in a nondeterministic
 monad there is nothing else it could mean.
 
-The sharpest illustration is `question_control.tl`'s `spread`, which answers
+The sharpest illustration is `question_control.gob`'s `spread`, which answers
 `[90, 90, 90]`. Three, not four, because iteration is a cursor (delta 33) and a
 cursor is one mutable object: the list monad explores depth-first, the branches
 share the cursor, and the first to run exhausts it. All three are `90` because
@@ -1849,11 +1849,11 @@ beside it is the same loop with the recursion and the `bind` written out, no `?`
 anywhere, and it prints the same thing. That is the differential test `plan.txt`
 asked for, at the one point where the answer is surprising enough to want one.
 
-**Scope.** `Flow` added to `turkey/lib/Prelude.tl`, unexported;
+**Scope.** `Flow` added to `turkey/lib/Prelude.gob`, unexported;
 `turkey/desugar.py` gains flow mode and the loop lowering. `err_question_in_loop`
 and `err_question_escape` are **deleted** -- they recorded delta 46's gap, and
-the gap is closed. New golden `question_control.tl`, with `.expected` and
-`.types`. No other golden moved, and `question.tl`'s lowering is unchanged.
+the gap is closed. New golden `question_control.gob`, with `.expected` and
+`.types`. No other golden moved, and `question.gob`'s lowering is unchanged.
 
 ### 48. Every expression knows the type it was given
 
@@ -1905,7 +1905,7 @@ table something reads *whole* is the case that module did not have. `iter(xs)`
 answers `Cursor (Array Int)` and `next` answers `Option (Item (Array Int))`:
 both families sit under a constructor, and a Core term annotated with either
 would carry a type that was never reduced and would not check. So
-`TypeTable.resolve` reduces at every level, and `adt.tl`'s loop records
+`TypeTable.resolve` reduces at every level, and `adt.gob`'s loop records
 `fun(Array Int, ArrayCursor) -> Option Int`.
 
 **What must not survive, and what may.** Two things would make a recorded type
@@ -2018,7 +2018,7 @@ free variable matches anything, so a term that is *more* general than expected
 is not rejected. And an equality the binding's context states is a reduction
 rule while that binding is checked, consulted before the instance table exactly
 as `Solver.reduce` consults its assumptions first: `Item s` over a rigid `s`
-never reduces through an instance, and `bf.tl`'s `run[Iterator s, Item s ~ Op]`
+never reduces through an instance, and `bf.gob`'s `run[Iterator s, Item s ~ Op]`
 needs it to become `Op` for its `match` to typecheck at all.
 
 **What it costs.** A second traversal of every program at every compile, and
@@ -2118,7 +2118,7 @@ and writes a copy per answer.
 
 **The per-request dictionary rebuild is gone.** Delta 50 recorded it as the one
 thing that got slower: without the memo table, `%inst.Monoid.Array[Int](...)`
-constructs a fresh record every time it is evaluated, three times in `dicts.tl`
+constructs a fresh record every time it is evaluated, three times in `dicts.gob`
 alone. A ground instance application is now one top-level binding whose *value*
 is the record, built once by the two-pass loop that already binds dictionaries.
 Delta 50 said "the specialization `plan.txt` item 6 describes would remove it";
@@ -2148,7 +2148,7 @@ still in it.
 So there is a cap -- thirty-two copies per binding, and a bound on how large a
 type argument may be -- and when it trips the call site keeps its type
 application and goes on calling the generic binding, which therefore has to
-survive the pass. `tests/programs/polyrec.tl` is that program, and it says so:
+survive the pass. `tests/programs/polyrec.gob` is that program, and it says so:
 `warning: 'depth' is used at more than 32 types, so its remaining uses are left
 polymorphic`. A program whose performance quietly depends on something nobody
 was told about is worse than a slow one.
@@ -2194,7 +2194,7 @@ family reducer becomes public, since a specialization has to reduce the types it
 writes the same way the ones it replaces were reduced; one call and one field in
 `turkey/driver.py`; one subcommand in `turkey/cli.py`; a `.mono` case in
 `tests/test_programs.py` and `tests/regenerate_expected.py`. New goldens
-`polyrec.tl` and `dicts.mono`. **No existing golden moved.** The evaluator still
+`polyrec.gob` and `dicts.mono`. **No existing golden moved.** The evaluator still
 runs the unspecialized Core -- making the specialized one the program that runs
 is the next step, and it is kept separate for the reason delta 50 was kept
 separate from delta 49.
@@ -2292,7 +2292,7 @@ binding is named by whatever reaches that call site, and being named is all
 reachability asks for. That is a test rather than an argument
 (`test_the_capped_call_site_still_names_the_generic_binding`).
 
-**What it is worth.** On `tests/programs/dicts.tl`: 45 dictionary projections
+**What it is worth.** On `tests/programs/dicts.gob`: 45 dictionary projections
 become 6, and 77 top-level bindings become 61 -- fewer, *after* a pass whose
 only job is to make copies. The six that remain are inside the two bindings
 that are still genuinely polymorphic.
@@ -2341,12 +2341,12 @@ forced. The warnings already said, so a cap that trips in every round is
 reported once. And **the memo of what has already been built**: without it a
 second round re-asks for `Data.Array#new` at `Int`, does not find round one's
 answer, and builds a byte-identical second copy under the disambiguated name
-`Data.Array#new@Int~2`. Five of those on `dicts.tl`, seventeen across the
+`Data.Array#new@Int~2`. Five of those on `dicts.gob`, seventeen across the
 suite -- specialization as a source of duplication, which is the opposite of
 the point.
 
 **Two rounds, and why not a fixed point.** Two is what the measurement asks
-for: a third round changes nothing at all. On `tests/programs/dicts.tl` the
+for: a third round changes nothing at all. On `tests/programs/dicts.gob` the
 dictionary projections go 65 in the Core, 16 after one round, 14 after two, 14
 after three; four more methods are specialized and three of the generics they
 came from are then unreachable, for a net of one binding. It is a constant
@@ -2539,7 +2539,7 @@ design.md 8.1 and 8.4; PRIMITIVES.md 4.3.
 **The language had three I/O operations and no way to read a file.**
 `Prim.print`, `Prim.write` and `Prim.error` were the entire surface, so the
 only way to get data into a program was to compile it in as a string literal
--- which `tests/programs/bf.tl` does, and which is fine for a test and
+-- which `tests/programs/bf.gob` does, and which is fine for a test and
 impossible for a compiler. Roadmap item 9 is a compiler written in the
 language, and it cannot read its own source.
 
@@ -2768,7 +2768,7 @@ source of a late bug."* That is a description of this compiler, which is now
 
 **What it cost: nothing.** Measured before the change rather than after --
 across `boot` and the whole corpus there were exactly three non-exhaustive
-matches, and all three were in `tests/programs/exhaustive.tl`, the program
+matches, and all three were in `tests/programs/exhaustive.gob`, the program
 whose purpose is to trigger the warning. Not one line of the compiler or the
 library relied on it. A rule with no violations outside its own test is a rule
 that was already being followed by hand.
@@ -2785,10 +2785,10 @@ so it is not mistaken for coverage.
 
 **A false positive is now a rejected program**, where before it was a spurious
 warning on a working one. The cost of the checker being *incomplete* went up,
-so `exhaustive.tl` keeps its accepting half at full breadth -- a total match
+so `exhaustive.gob` keeps its accepting half at full breadth -- a total match
 the checker must not reject -- and only the rejecting half moved out, to
-`err_exhaustive_option.tl`, `err_exhaustive_nested.tl` and
-`err_exhaustive_catchall.tl`.
+`err_exhaustive_option.gob`, `err_exhaustive_nested.gob` and
+`err_exhaustive_catchall.gob`.
 
 **The panic block does not go away, and should not.** Lowering still emits a
 fallthrough `panic "no match arm applied"` for every `match`, and it is now
@@ -2800,3 +2800,36 @@ because **nothing branches to it** is safe whatever made it unreachable, costs
 one reachability check the allocator already computes, and keeps the panic as
 the backstop it was always meant to be. The block goes; the reason it goes is
 the CFG, not the checker.
+
+### 62. A source file is a `.gob`
+
+`.tl` is claimed twice in GitHub's Linguist, by Teal and by Twig, and is the
+extension of Telegram's Type Language schemas as well. Linguist is the concrete
+stake: an extension it already claims means every Turkey file on GitHub is
+highlighted as another language, counted as that language in the repository's
+language bar, and matched by that language's rules in code search.
+
+**Source files are now `.gob`.** `Data.String` is `Data/String.gob` under one
+of the search roots (`turkey/modules.py`, `boot/Turkey/Modules.gob`), and every
+file in the corpus moved.
+
+The candidates, run against `linguist/lib/linguist/languages.yml`:
+
+| Extension | Claimed in Linguist by | Other live collisions |
+| --- | --- | --- |
+| `.tl` | Teal, Twig | Telegram Type Language schemas |
+| `.gbl` | Genshi | Gerber Bottom Layer, emitted by every PCB CAD tool |
+| `.tu` | Turing | -- |
+| `.ki` | free | Ki, a live systems language |
+| `.tk` | free | Tcl/Tk scripts; the Tokelau ccTLD |
+| `.gob` | free | Jedi Engine archives (1995), GObject Builder -- both dead |
+| `.tky` | free | none found |
+
+`.gob` is free where it matters, collides only with formats that stopped being
+written decades ago, and is how the noise is spelled. `.tky` was the fallback.
+The full argument is in `PROPOSALS.md` 7.
+
+**Done first and alone** because it is the one change on that list that costs
+more the longer it waits: every golden and every delta written against `.tl` is
+one more thing to sweep. Earlier deltas were swept too: a delta that names a
+file nobody can open documents nothing.

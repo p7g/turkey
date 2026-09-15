@@ -840,6 +840,9 @@ name, so element zero is its first real argument (SPEC-DELTAS.md 58).
 
 ### 9.1 Module declaration
 
+A source file has the extension `.gob` (SPEC-DELTAS.md 62), and module
+`A.B` is the file `A/B.gob` under one of the search roots.
+
 Each file begins with an optional module header:
 
 ```

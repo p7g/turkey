@@ -34,7 +34,7 @@ fun secret() -> Int = 7
 
 def write(tmp_path: Path, **modules: str) -> list[Path]:
     for name, source in modules.items():
-        (tmp_path / f"{name}.tl").write_text(source, encoding="utf-8")
+        (tmp_path / f"{name}.gob").write_text(source, encoding="utf-8")
     return [tmp_path]
 
 
@@ -269,7 +269,7 @@ def test_a_diagnostic_in_an_imported_module_names_that_module(tmp_path):
     with pytest.raises(TurkeyError) as exc:
         check("import Wrong", None, search)
     assert exc.value.span is not None
-    assert exc.value.span.file == str(tmp_path / "Wrong.tl")
+    assert exc.value.span.file == str(tmp_path / "Wrong.gob")
 
 
 def test_a_diagnostic_never_shows_an_internal_name(tmp_path):
@@ -303,7 +303,7 @@ def test_two_modules_may_each_define_the_same_name(tmp_path, capsys):
 
 def test_run_from_a_file_searches_beside_it(tmp_path, capsys):
     write(tmp_path, Helper=HELPER)
-    entry = tmp_path / "Main.tl"
+    entry = tmp_path / "Main.gob"
     entry.write_text('import Helper\nfun main() { print(greet("you")) }',
                      encoding="utf-8")
     run(entry.read_text(), str(entry))

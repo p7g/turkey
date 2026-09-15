@@ -1,4 +1,4 @@
-"""`boot/Turkey/SsaLower.tl`: Core to the low IR.
+"""`boot/Turkey/SsaLower.gob`: Core to the low IR.
 
 M27 phase 1, and incomplete on purpose. A Core form nothing handles yet stops
 one binding rather than the run, and `boot ssa` reports the count -- which is
@@ -20,16 +20,16 @@ import pytest
 from tests import bootc
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-BOOT_MAIN = REPO_ROOT / "boot" / "Main.tl"
+BOOT_MAIN = REPO_ROOT / "boot" / "Main.gob"
 PROGRAMS = REPO_ROOT / "tests" / "programs"
 
 # Small, and between them they reach an ordinary function, a loop, a
-# user-defined type, and -- `generalization.tl` -- a lambda that survives
+# user-defined type, and -- `generalization.gob` -- a lambda that survives
 # `opt` plus a top-level function used as a value, which are the two cases
 # closure conversion exists for. A sample rather than the corpus because these
 # assertions are about *shape*; `test_boot` is what runs the whole corpus.
-SAMPLE = ["adt.tl", "loops.tl", "stack.tl", "generalization.tl",
-          "constructor_values.tl", "closure_abi.tl", "local_values.tl", "shared_nullaries.tl"]
+SAMPLE = ["adt.gob", "loops.gob", "stack.gob", "generalization.gob",
+          "constructor_values.gob", "closure_abi.gob", "local_values.gob", "shared_nullaries.gob"]
 
 
 @functools.lru_cache(maxsize=None)
@@ -76,7 +76,7 @@ def test_something_lowers(name):
 
 def test_the_dump_is_the_low_ir():
     """Blocks, block parameters, representations and the instruction set."""
-    out = _ssa("adt.tl")
+    out = _ssa("adt.gob")
     assert "fun @" in out
     assert "; entry:" in out
     assert "ret %" in out
@@ -92,7 +92,7 @@ def test_a_direct_call_names_its_callee():
     A call to a known top-level binding is a symbol; a call to a value is
     through a closure. Instruction selection matches on which.
     """
-    out = _ssa("adt.tl")
+    out = _ssa("adt.gob")
     assert "call @" in out
 
 
@@ -101,9 +101,9 @@ def test_a_pattern_match_becomes_a_tag_test_and_a_branch():
 
     A single-variant type has nothing to distinguish and gets no tag test --
     that case is `test_a_single_variant_pattern_reads_no_tag` -- so this asks
-    for the multi-variant one, which `adt.tl` has.
+    for the multi-variant one, which `adt.gob` has.
     """
-    out = _ssa("adt.tl")
+    out = _ssa("adt.gob")
     assert "object.tag " in out
     # Exhaustiveness has already decided this arm is unreachable. It is
     # emitted anyway so that a bug in an earlier pass stops with a name.
@@ -118,7 +118,7 @@ def test_a_single_variant_pattern_reads_no_tag():
     load, a compare and a branch on the hot path, and the arm it branches to
     is unreachable.
     """
-    out = _ssa("stack.tl")
+    out = _ssa("stack.gob")
     body = out.split("fun @Data.Array#state@Int")[1].split("\nfun ")[0]
     assert "object.tag" not in body, body
 
@@ -143,7 +143,7 @@ def test_representations_are_converted_explicitly():
     pointer arrays. Those allocations are gone; typed numeric boundaries
     still require real conversions rather than mismatched representations.
     """
-    out = _ssa("closure_abi.tl")
+    out = _ssa("closure_abi.gob")
     assert "widen %" in out
     assert "narrow %" in out
 
@@ -155,7 +155,7 @@ def test_the_array_primitives_are_instructions():
     callee, which is why `NATIVE-BACKEND.md` puts the heap operations in the
     opcode and leaves the rest as symbols.
     """
-    out = _ssa("stack.tl")
+    out = _ssa("stack.gob")
     assert "array.get " in out
     assert "array.new " in out
     assert "array.length " in out
@@ -202,7 +202,7 @@ def test_a_dictionary_is_allocated_before_its_fields():
     its own address before it had one. Every record-shaped dictionary is
     therefore allocated and published first and filled afterwards.
     """
-    out = _ssa("adt.tl")
+    out = _ssa("adt.gob")
     body = out.split("fun @%module.initialize()")[1].split("\nfun ")[0]
     # The property per dictionary, rather than a global ordering of opcodes:
     # a method's own body allocates objects too, so counting `object.new`
@@ -222,7 +222,7 @@ def test_a_dictionary_is_allocated_before_its_fields():
 
 
 def test_a_lambda_becomes_a_lifted_function_and_a_closure():
-    out = _ssa("generalization.tl")
+    out = _ssa("generalization.gob")
     assert "closure.new @" in out
     assert "%lambda" in out
     # The environment remains traced; specialized scalar results stay raw.
@@ -234,7 +234,7 @@ def test_a_lambda_becomes_a_lifted_function_and_a_closure():
 
 
 def test_a_function_value_uses_its_own_environment_first_signature():
-    out = _ssa("generalization.tl")
+    out = _ssa("generalization.gob")
     assert "%closure" not in out
     assert "closure.new @Main#identity" in out
 
@@ -255,7 +255,7 @@ def test_the_calling_conventions_are_not_confused():
 
 
 def test_closure_signatures_keep_each_scalar_register_class():
-    out = _ssa("closure_abi.tl")
+    out = _ssa("closure_abi.gob")
     signatures = [line for line in out.splitlines()
                   if line.startswith("fun @Main#main%lambda")]
     assert signatures
@@ -264,7 +264,7 @@ def test_closure_signatures_keep_each_scalar_register_class():
 
 
 def test_local_storage_is_promoted_before_both_emitters():
-    out = _ssa("local_values.tl")
+    out = _ssa("local_values.gob")
     assert "slot.load" not in out and "slot.store" not in out, out
     local = out.split("fun @Main#local(", 1)[1].split("\nfun ", 1)[0]
     assert "cell.new" not in local, local
@@ -276,7 +276,7 @@ def test_local_storage_is_promoted_before_both_emitters():
 def test_nullary_objects_are_rooted_once_before_user_initializers():
     import re
 
-    out = _ssa("shared_nullaries.tl")
+    out = _ssa("shared_nullaries.gob")
     bodies = out.split("\nfun @")
     allocations = []
     for body in bodies:

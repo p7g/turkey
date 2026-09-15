@@ -1,6 +1,6 @@
 """Classes and instances: what the goldens reach awkwardly or not at all.
 
-`classes.tl` pins the shape of a working program and `err_no_instance.tl` pins
+`classes.gob` pins the shape of a working program and `err_no_instance.gob` pins
 one error. The rest of the surface is here -- the declaration-time checks, the
 signature/definition split in the parser, the class variable's kind, and the
 rigidity that stops an instance method from quietly narrowing the type its

@@ -401,7 +401,7 @@ class Solver:
         # And it is a rewrite rule from here on. `x.pos` used where an `Int` is
         # wanted leaves `Field.pos a ~ Int`, and without this every predicate
         # about the field's type stays stuck and rides into the scheme --
-        # `bf.tl`'s `move` collected `Add (Field.pos a)`, `Ord (Field.pos a)`
+        # `bf.gob`'s `move` collected `Add (Field.pos a)`, `Ord (Field.pos a)`
         # and `Length (Field.data a)` that way -- while exhaustiveness reads a
         # scrutinee type the equality would have decided. See FINDINGS 47.
         # Only a rule that makes progress. `Field.pos a ~ Int` says what the
@@ -795,7 +795,7 @@ class Solver:
         # `Add (Field.pos a)` under `Field.pos a ~ Int` is `Add Int`, and the
         # binding retains the equation so every caller proves it. Asking
         # without them leaves the predicate stuck and rides it into the scheme
-        # -- three of them, in `bf.tl`'s `move`. See FINDINGS 47.
+        # -- three of them, in `bf.gob`'s `move`. See FINDINGS 47.
         t = self.discharging(c.pred.args[0])
         if isinstance(t, TBottom):
             return True  # absorbed; there is no value to find a method for
@@ -1089,7 +1089,7 @@ def reach(preds: list[CPred], types: list[Type]) -> set[int]:
     Membership is transitive because a `HasField` is a *function* of its
     receiver: fix the record and the field type follows. So a variable that
     appears nowhere in the type is still determined, as long as some chain of
-    predicates connects it to one that is. `t.data.length` in bf.tl is exactly
+    predicates connects it to one that is. `t.data.length` in bf.gob is exactly
     that -- it demands `HasField "length" d n` where `d` is reachable only
     through `HasField "data" t d` -- and it is why this is a closure rather
     than a single intersection.

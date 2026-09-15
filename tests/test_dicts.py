@@ -1,6 +1,6 @@
 """Dictionary passing: the evidence, and the programs it makes run.
 
-`dicts.tl` is the golden that runs; this file is what a golden cannot display --
+`dicts.gob` is the golden that runs; this file is what a golden cannot display --
 the *shape* of the evidence that produced the output. The two questions are
 separate on purpose: whether a program prints the right thing, and whether it
 got there by selecting a superclass rather than by passing a second dictionary.

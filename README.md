@@ -18,17 +18,17 @@ compiler for the small runtime and uses `llvmlite` for code generation. From
 the repo root:
 
 ```
-python3 -m turkey run    program.tl    # type-check and execute
-python3 -m turkey run    program.tl -- a b   # ... passing it arguments
-python3 -m turkey types  program.tl    # print each top-level binding's type
-python3 -m turkey tokens program.tl    # dump the token stream
-python3 -m turkey ast    program.tl    # dump the parse tree
-python3 -m turkey core   program.tl    # dump the typed Core the elaboration produces
-python3 -m turkey mono   program.tl    # dump that Core specialized -- what actually runs
-python3 -m turkey opt    program.tl    # dump the optimized Core
-python3 -m turkey python program.tl    # print generated Python without running it
-python3 -m turkey llvm   program.tl    # print verified LLVM IR
-python3 -m turkey run --backend python program.tl  # compatibility backend
+python3 -m turkey run    program.gob    # type-check and execute
+python3 -m turkey run    program.gob -- a b   # ... passing it arguments
+python3 -m turkey types  program.gob    # print each top-level binding's type
+python3 -m turkey tokens program.gob    # dump the token stream
+python3 -m turkey ast    program.gob    # dump the parse tree
+python3 -m turkey core   program.gob    # dump the typed Core the elaboration produces
+python3 -m turkey mono   program.gob    # dump that Core specialized -- what actually runs
+python3 -m turkey opt    program.gob    # dump the optimized Core
+python3 -m turkey python program.gob    # print generated Python without running it
+python3 -m turkey llvm   program.gob    # print verified LLVM IR
+python3 -m turkey run --backend python program.gob  # compatibility backend
 ```
 
 A program is a single file. Execution lowers optimized typed Core to a checked
@@ -147,8 +147,8 @@ implementation over every Turkey file in the repository -- the conformance
 programs, the standard library, and `boot/`'s own source:
 
 ```
-python3 -m turkey run boot/Main.tl -- tokens FILE...
-python3 -m turkey run boot/Main.tl -- ast FILE...
+python3 -m turkey run boot/Main.gob -- tokens FILE...
+python3 -m turkey run boot/Main.gob -- ast FILE...
 ```
 
 The lexer and the parser are done, and agree with `turkey tokens` and
@@ -175,14 +175,14 @@ and median warm execution separately:
 python3 -m benchmarks.python_backend --rounds 3
 ```
 
-`tests/programs/` holds golden-file conformance programs: each `NAME.tl` is
+`tests/programs/` holds golden-file conformance programs: each `NAME.gob` is
 paired with a `NAME.expected` holding the exact combined output of running it.
 Programs whose names begin with `err_` are expected to fail. To add a case,
-write the two files — or write the `.tl` and run
+write the two files — or write the `.gob` and run
 `python3 tests/regenerate_expected.py`, then read the diff to confirm the
 output is what you meant.
 
-`tests/programs/` also holds *directories*: one whose entry module is `Main.tl`
+`tests/programs/` also holds *directories*: one whose entry module is `Main.gob`
 is a multi-file program, run from inside that directory, with its golden in
 `Main.expected` beside it.
 

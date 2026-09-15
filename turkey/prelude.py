@@ -1,6 +1,6 @@
 """The compiler's half of the prelude.
 
-The prelude itself is ordinary source and lives in `turkey/lib/Prelude.tl`,
+The prelude itself is ordinary source and lives in `turkey/lib/Prelude.gob`,
 loaded like any other module (M11a). What stays here is the handful of names
 the *compiler* has to know: which method an operator desugars to, and what a
 `for` loop is written in terms of. Those are not source, and a program cannot

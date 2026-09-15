@@ -168,7 +168,7 @@ def test_a_return_out_of_a_loop_leaves_the_function():
 
 
 def test_a_transfer_inside_a_call_argument_keeps_evaluation_order():
-    """`bf.tl` writes `Array.push(ops, match c { ']' -> break, _ -> ... })`.
+    """`bf.gob` writes `Array.push(ops, match c { ']' -> break, _ -> ... })`.
 
     A transfer in an operand cannot simply be hoisted out: the arguments
     beside it would then be evaluated after it, and the evaluator is strict
@@ -225,7 +225,7 @@ def test_every_program_lowers_to_joins_with_nothing_declined():
     outside a tail position fails here too, on every program, on every run.
     """
     jumped = 0
-    for source in sorted(PROGRAMS.glob("*.tl")):
+    for source in sorted(PROGRAMS.glob("*.gob")):
         if source.name.startswith("err_"):
             continue  # these are the programs that are supposed to be rejected
         checked = check(source.read_text(), str(source), [source.parent])
@@ -235,7 +235,7 @@ def test_every_program_lowers_to_joins_with_nothing_declined():
 
 def test_a_program_with_loops_lowers_to_joins_and_jumps():
     """The positive form of the same claim, on the fixture built for it."""
-    source = PROGRAMS / "loops.tl"
+    source = PROGRAMS / "loops.gob"
     checked = check(source.read_text(), str(source), [source.parent])
     for stage in (checked.core, checked.mono, checked.opt):
         assert count(stage, CJoin) > 0

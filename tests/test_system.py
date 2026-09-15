@@ -1,6 +1,6 @@
 """`System.Env` and `System.IO`, and the recursion depth a compiler needs.
 
-What `tests/programs/system.tl` cannot check, because a golden file is run with
+What `tests/programs/system.gob` cannot check, because a golden file is run with
 no arguments, in a fixed directory, and is compared on its output alone: the
 arguments a program is handed, the status it chooses to exit with, the file it
 writes, and how deep it may recurse before the host gives out.
@@ -38,7 +38,7 @@ def backend(request) -> str:
 
 def _run(program: str, tmp_path: Path, *args: str,
          backend: str = "llvm") -> subprocess.CompletedProcess[str]:
-    source = tmp_path / "prog.tl"
+    source = tmp_path / "prog.gob"
     source.write_text(program, encoding="utf-8")
     return subprocess.run(
         [sys.executable, "-m", "turkey", "run", "--backend", backend,
@@ -66,9 +66,9 @@ def test_arguments_reach_the_program(tmp_path: Path, backend: str) -> None:
     # backend hands over `argv + 1` for the same reason: the two hosts have to
     # agree on this, or a self-compiled compiler reads a different command line
     # than the one that built it (M26).
-    result = _run(ARGS, tmp_path, "input.tl", "-o", "out.c", backend=backend)
+    result = _run(ARGS, tmp_path, "input.gob", "-o", "out.c", backend=backend)
     assert result.returncode == 0, result.stderr
-    assert result.stdout == "3\ninput.tl\n-o\nout.c\n"
+    assert result.stdout == "3\ninput.gob\n-o\nout.c\n"
 
 
 def test_no_arguments_is_an_empty_array(tmp_path: Path, backend: str) -> None:

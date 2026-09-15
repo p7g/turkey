@@ -66,7 +66,7 @@ Already decided (SPEC-DELTAS.md 18) and unchanged, but state the identity:
 
 `%` is **remainder, not modulus**. Because the difference bites exactly where
 people reach for it -- `i % n` as a bucket index, which is what
-`Data/Map.tl:180` does -- `Data.Int` gains `mod(a, b)`, floored, whose result
+`Data/Map.gob:180` does -- `Data.Int` gains `mod(a, b)`, floored, whose result
 always has the sign of the divisor and is therefore always a valid index for
 positive `b`. `Data.Map` should use it.
 
@@ -192,7 +192,7 @@ Three consequences, and they must be written into `design.md` rather than
 discovered:
 
 **(a) `Ord Float` breaks the class defaults, and does so today.**
-`Std/Classes.tl` derives `gte(x, y) = !lt(x, y)`, so `gte(NaN, 1.0)` is
+`Std/Classes.gob` derives `gte(x, y) = !lt(x, y)`, so `gte(NaN, 1.0)` is
 currently `True` while `lte(NaN, 1.0)` is `False`. That is not IEEE and not
 anything else. `instance Ord Float` must **override all four methods**
 (`lt`, `lte`, `gt`, `gte`) with the primitive comparisons instead of

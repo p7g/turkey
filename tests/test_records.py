@@ -1,6 +1,6 @@
 """M9: record symmetry, punning, mutable parameters, `Bool`, and a total `pop`.
 
-`records.tl`, `err_record_arity.tl` and `mutation.tl` are the goldens. This
+`records.gob`, `err_record_arity.gob` and `mutation.gob` are the goldens. This
 file is the part a golden cannot show: that the two declaration forms and the
 two pattern forms are genuinely independent of each other, that the
 exhaustiveness checker's witness is now a pattern the checker would accept,

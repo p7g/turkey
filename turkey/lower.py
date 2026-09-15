@@ -1141,7 +1141,7 @@ class Lowerer:
     def anf(self, e: ast.Expr, scope: Scope, k: str | None) -> CExpr:
         """A node whose *operands* hold a transfer: `push(ops, match c {...})`.
 
-        `bf.tl` writes exactly that, with a `break` and a `continue` among the
+        `bf.gob` writes exactly that, with a `break` and a `continue` among the
         arms, and it is the one shape in the suite that none of the rules
         above covers. What makes it awkward is evaluation order: hoisting the
         `match` out and leaving `ops` in place would evaluate `ops` after it,
@@ -1583,7 +1583,7 @@ class Lowerer:
     def celled(self, pat, body: ast.Expr, lower, scope: Scope, span) -> CExpr:
         """Lower a pattern's body, making a cell of any binder it assigns.
 
-        A pattern binder is reassignable like any other -- `mutation.tl`'s
+        A pattern binder is reassignable like any other -- `mutation.gob`'s
         `fun ignore(Cell { value })` writes to `value`, and the file's own
         comment says what that means: "reassigning a destructured parameter
         rebinds the local name and nothing else: patterns bind, they do not

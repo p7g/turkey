@@ -1,7 +1,7 @@
 # What writing the compiler in the language has turned up
 
 `plan.txt` item 9 says the bootstrap compiler is "the only forcing function that
-finds papercuts at a scale test.tl cannot". This is the list of what it has
+finds papercuts at a scale test.gob cannot". This is the list of what it has
 found. It is kept as work proceeds rather than written up afterwards, because
 the interesting part of a papercut is the moment it bites and what was being
 written at the time.
@@ -244,7 +244,7 @@ from the other side: `test_boot` compared the two `core` dumps byte for byte and
 they agreed -- on the wrong Core, both printing `go : fun() -> k` under a
 `forall a`. A differential cannot see a bug both implementations share; the
 checker, run after `mono`, is what did. Both sides are fixed, and
-`tests/programs/local_fun_signature.tl` covers the report and its reductions --
+`tests/programs/local_fun_signature.gob` covers the report and its reductions --
 at `fib(30)` rather than `fib(80)`, since `test_pygen`'s evaluator oracle runs
 without `run_deep` and a memoized `fib(80)` is eighty levels of it deep.
 
@@ -312,7 +312,7 @@ says `Elem (Iter s)` is an `Option`.
 
 `boot` had all three identically, and `test_boot` could not have said so: a
 stage that raises is a stage the oracle compares nothing about (the CLAUDE.md
-caveat, entry 43). `tests/programs/method_given_family.tl` covers the report,
+caveat, entry 43). `tests/programs/method_given_family.gob` covers the report,
 the `Option` instance, the unconstrained `Array` instance and a default body.
 
 ---
@@ -488,7 +488,7 @@ nothing has ever printed it. The port spells it the language's way; the Python
 still does not, and the branch stays dead in both.
 
 ### 35. A panic trace golden pins a *library* line number
-**design.** M22. `err_out_of_bounds.expected` names `Data/Array.tl:78:9`, so
+**design.** M22. `err_out_of_bounds.expected` names `Data/Array.gob:78:9`, so
 adding `Array.clear` above `bounds` broke two conformance tests that have
 nothing to do with either. The frame is the right thing to print -- a panic
 trace naming only the user's file would be much worse -- but it couples every
@@ -634,7 +634,7 @@ question that would have made it unnecessary:
   each other in the order `deps.sccs` already sorts them into -- the same
   arbitrary-but-stable choice the loop breaker makes.
 
-`turkey opt boot/Main.tl` finishes in 44 seconds, and no golden moves: the
+`turkey opt boot/Main.gob` finishes in 44 seconds, and no golden moves: the
 whole corpus reaches neither declined case.
 
 Speculation also restores its flag to what it was rather than to `False` --
@@ -650,8 +650,8 @@ through a request queue, as `mono` already has, would remove the exemption
 rather than state it.
 
 **And the port needed every one of them.** None of these three reached
-`boot/Turkey/Opt.tl`, which still carried the comment stating the pre-fix
-rationale -- so `boot opt boot/Main.tl` died the same death a milestone later,
+`boot/Turkey/Opt.gob`, which still carried the comment stating the pre-fix
+rationale -- so `boot opt boot/Main.gob` died the same death a milestone later,
 and looked like a stack limit rather than a missing fix. What settled it was
 one measurement rather than any amount of reading: the reference recurses
 **106 levels** on that program and `boot` reached **481,650 frames**. A 1,500x
@@ -808,7 +808,7 @@ body is one node -- leaving exactly the `CField` that used to be emitted
 directly.
 
 What it cost is entry 47, which arrived with the fix rather than surviving it.
-`lib/Data/Map.tl` keeps its two annotations because of that, but they are a
+`lib/Data/Map.gob` keeps its two annotations because of that, but they are a
 choice now rather than a workaround: the receiver is a `Map` at every call
 site, so saying so costs nothing and keeps both the exhaustiveness check and
 the specialization sharp.
@@ -847,7 +847,7 @@ downstream knew it. `Field.pos a ~ Int` says the same thing and does not
 substitute, because a family application is not a variable. Two symptoms, one
 cause:
 
-* `bf.tl`'s `move` retains `Add (Field.pos a)`, `Ord (Field.pos a)` and
+* `bf.gob`'s `move` retains `Add (Field.pos a)`, `Ord (Field.pos a)` and
   `Length (Field.data a)`, which used to discharge. They are correct, and they
   are three dictionaries a caller now passes for nothing.
 * an un-annotated `Data.Map#resize` has its `match` reported non-exhaustive.
@@ -903,9 +903,9 @@ thinking:
   reduced with the rules dropped the equation as trivial, and a scheme that
   drops an equation stops making its callers prove it.
 
-`bf.tl`'s `move` loses all three of the predicates it had picked up, and an
+`bf.gob`'s `move` loses all three of the predicates it had picked up, and an
 un-annotated `Data.Map#resize` no longer reports its `match` non-exhaustive.
-`lib/Data/Map.tl` keeps its annotations, but they are now only worth what an
+`lib/Data/Map.gob` keeps its annotations, but they are now only worth what an
 annotation is normally worth.
 
 ### 24. `Data.Set` is not one of the modules the Prelude re-exports
@@ -1309,7 +1309,7 @@ jump lands in the inner copy's block -- and it surfaced identically:
 Main#depth@Pair(Int): value 24 is used outside the blocks its definition dominates
 ```
 
-Eleven of those, all in `polyrec.tl`, which is the program that inlines a
+Eleven of those, all in `polyrec.gob`, which is the program that inlines a
 function into itself thirteen deep. The lesson is not "scope your maps". It is
 that **fixing one instance of a bug is not fixing the bug**: `env` and `joins`
 are the two scoped things in that record, the reasoning that condemned one
@@ -1359,7 +1359,7 @@ fixed part is `boot` itself: running it means the Python implementation
 typechecks and then *interprets* the whole bootstrap compiler before it looks
 at the target at all.
 
-`boot/Main.tl` already takes any number of files, and its header already said
+`boot/Main.gob` already takes any number of files, and its header already said
 why -- "not a convenience for the test -- it is what keeps the milestone's diff
 to one process, since starting this program currently means compiling it". The
 design note was there, in the file I was invoking, and I wrote the loop anyway.
@@ -1383,7 +1383,7 @@ The user asked why it was twenty minutes. It did not have to be. Two modules
 cannot share a `.ll` *file* -- the symbols collide -- but they can share a
 *run*, and `boot llvm` now prints `; === <path>` before each module so a
 caller splits them afterwards. That is the same trick every other dump in
-`Main.tl` already uses, described in its header, which is where FINDINGS 61
+`Main.gob` already uses, described in its header, which is where FINDINGS 61
 found it the first time.
 
 **3:34** for the whole corpus, against twenty minutes. The lesson is not the
@@ -1400,7 +1400,7 @@ rule. It is not: `Int` is the *only* signed type the language has. `Bool` is
 `i1`, `Byte` is `i8`, `Char` is `i32`, and all three are ordered as magnitudes.
 
 A signed one-bit integer holds 0 and -1, so `False < True` became
-`icmp slt i1 0, -1` and answered **false**. One line of `operators.tl`'s output
+`icmp slt i1 0, -1` and answered **false**. One line of `operators.gob`'s output
 was wrong and the other twenty-five programs were right, which is exactly the
 shape of bug that a spot check misses and a corpus catches.
 
@@ -1435,7 +1435,7 @@ because the compiler stops catching it.
 ### 64. Compiling a program is not running it, and `.expected` knows the difference
 
 **testing.** M27 phase 2. The first corpus check diffed each native binary's
-output against `tests/programs/*.expected` and reported `exhaustive.tl` as a
+output against `tests/programs/*.expected` and reported `exhaustive.gob` as a
 failure. It was not: that file contains three *compile-time warnings*, which
 `turkey run` prints because it compiles and runs in one process, and which a
 compiled binary cannot print because its compile time was hours ago.
@@ -1476,7 +1476,7 @@ Two more, and then it was done:
   have been read from rather than reasoned out.
 * **The slots past 64.** The live mask is 64 bits and the runtime scans every
   slot from 64 up unconditionally, so those have to start null rather than
-  holding whatever the stack left. `Main#main` in `question.tl` read a `0x1`
+  holding whatever the stack left. `Main#main` in `question.gob` read a `0x1`
   out of slot 64. The runtime's own comment prescribes the fix, one paragraph
   above the field. 22 to 28.
 
@@ -1572,7 +1572,7 @@ that immediately showed what is *not* in it.
 Overflow checks, division-by-zero checks, panic propagation after every call,
 and the whole GC root apparatus -- liveness at safepoints, slot assignment, the
 live mask, `turkey_root_enter`/`leave` -- are all in the **LLVM emitter**, about
-300 lines of `Llvm.tl`'s 1,388. None of it is in the IR. `boot ssa` prints a
+300 lines of `Llvm.gob`'s 1,388. None of it is in the IR. `boot ssa` prints a
 `Bin(Add, x, y)` that does not overflow-check and a `Call` that does not
 propagate a panic, and those are not the semantics of the language.
 
@@ -1621,7 +1621,7 @@ it was finished as *input to LLVM*, which is a weaker claim than it appeared.
 constants into `Turkey.Runtime` made `boot` stop typechecking, at a line eighty
 lines from anything the change touched:
 
-    Llvm.tl:1127:22: internal error: the variable 'e' should be Emit
+    Llvm.gob:1127:22: internal error: the variable 'e' should be Emit
                      but is Turkey.Runtime.Entry
 
 Line 1127 is inside `emitRuntimeCall`, whose parameter `e` is an `Emit`. The
@@ -1677,7 +1677,7 @@ identifiable in one experiment rather than by bisection.
 
 **Third capture bug, and the first in a shared algorithm.** FINDINGS 56 and 59
 were both `SsaLower` failing to scope an environment, and both were mine. This
-one is older than either, lives in `turkey/opt.py` and `boot/Turkey/Opt.tl`
+one is older than either, lives in `turkey/opt.py` and `boot/Turkey/Opt.gob`
 both, and had to be fixed twice -- the tax CLAUDE.md's "two implementations"
 section describes, paid in full. The corpus never produced the shape, so
 `test_boot` was never going to find it; what found it was writing a module
@@ -1780,7 +1780,7 @@ the four real complaints it might one day have.
 
 
 ### 75. Three miscompiles below Core, and the C compiler found all three
-**correctness.** M28. `boot llvm boot/Main.tl` emits 66.7 MB of LLVM for the
+**correctness.** M28. `boot llvm boot/Main.gob` emits 66.7 MB of LLVM for the
 compiler itself, and `cc` refused it. Three bugs, each hidden behind the
 previous, each fixed only to reveal the next:
 
@@ -1832,7 +1832,7 @@ that broke here.
 ### 76. A constructor callback was an empty object, not a closure
 
 **correctness, fixed.** Building `boot` with Python, then emitting and linking
-`boot llvm boot/Main.tl`, produced a `boot2` that crashed while desugaring its
+`boot llvm boot/Main.gob`, produced a `boot2` that crashed while desugaring its
 own source. `TURKEY_SEGV_FRAMES=1` located the failure in
 `Data.Array#map@Expr,Child`, called by `Turkey.Ast#exprChildren`.
 
@@ -1848,7 +1848,7 @@ existing `eta` helper, while saturated calls (including annotated constructors)
 retain `CApp(CCon, args)`. Ordinary closure conversion handles the resulting
 lambdas, and `SsaLower` rejects any function-typed bare constructor that escapes
 the frontend. Nullary constructors retain their ordinary value representation.
-The small `constructor_values.tl` regression crashes with the old bootstrap
+The small `constructor_values.gob` regression crashes with the old bootstrap
 and passes with the fix, including collection at every allocation. It covers
 pointer and scalar fields, an erased single-field type, and multiple arguments;
 it also participates in the SSA verifier tests. A focused Core/mono/opt
@@ -1864,7 +1864,7 @@ Python-built compiler and using the linked third-generation compiler.
 ### 77. The bootstrapped compiler ran at Python speed, and the collector was why
 
 **performance, diagnosed.** The linked third-generation compiler took **100.6 s**
-for `opt boot/Main.tl`, the whole pipeline over its own source, while the Python
+for `opt boot/Main.gob`, the whole pipeline over its own source, while the Python
 host interpreting the same program took **293.3 s** for the same work and a
 byte-identical dump. Two-point-nine times faster, when the point of the native
 backend was an order of magnitude.
@@ -1976,7 +1976,7 @@ exception. Function values have no physical-equality operation; pointer-to-boxed
 coercions remain relabels, so sharing their capture-free shells changes no
 language-visible identity contract.
 
-All measurements below use `opt boot/Main.tl` on the same step-2 source. The
+All measurements below use `opt boot/Main.gob` on the same step-2 source. The
 baseline was rebuilt with the committed Python compiler and 2x runtime rather
 than using an older saved executable. Its counts differ slightly from entry 77
 because the compiler source being optimized has changed.
@@ -1999,7 +1999,7 @@ because the compiler source being optimized has changed.
 Step 2 peaks at 1,810,006,016 bytes RSS. Optimizer output is byte-identical to
 the rebuilt baseline. The focused backend/SSA/native run passed 232 tests;
 the scalar regression additionally exercises Byte, Char, Bool and Unit alongside
-Int, Float and allocated String arguments under GC stress. `bf.tl`, compiled by
+Int, Float and allocated String arguments under GC stress. `bf.gob`, compiled by
 boot, now allocates **25 closures and zero environments**, versus 106+106 in
 the original measurement. Successive self-hosted generations emit byte-identical
 LLVM for the compiler. The complete suite passed **1,497 tests**, with
@@ -2064,7 +2064,7 @@ this rule**. The slightly larger input source accounts for the count increase
 from entry 79. Collector time is 8.238 s, with 91 collections; peak RSS is
 2,073,116,672 bytes and peak reserved region storage is 1,787,232,256 bytes.
 
-Final by-kind counts for `opt boot/Main.tl`:
+Final by-kind counts for `opt boot/Main.gob`:
 
 | allocation kind | Python-built compiler | self-hosted compiler |
 |---|---:|---:|
@@ -2129,7 +2129,7 @@ Float and String values, record fields, break/continue, captured shared state
 and an inlined binding that shadows a flattened record's name. SSA assertions
 check that local allocations disappear and no slot operations reach emitters.
 
-Same-source measurements of `opt boot/Main.tl` (the source now includes the
+Same-source measurements of `opt boot/Main.gob` (the source now includes the
 new passes, so compare these columns rather than the earlier smaller inputs):
 
 | metric | previous self-hosted | new self-hosted | Python-built |
@@ -2188,7 +2188,7 @@ was accidentally testing the unwanted boxed initialization zero; it now checks
 real Byte/Int width conversions, while a separate test requires zero boxes for
 the pointer-array regression.
 
-Same-source `opt boot/Main.tl` measurements:
+Same-source `opt boot/Main.gob` measurements:
 
 | metric | previous self-hosted | new self-hosted | Python-built |
 |---|---:|---:|---:|
@@ -2237,7 +2237,7 @@ matching totals do not imply identical allocation order or object lifetimes.
 ### 84. Profiling found the remaining gap in typed record-field stores
 
 **backend, measured.** Allocation parity did not imply generated-code parity.
-A macOS `sample` profile (1 ms interval, over `opt boot/Main.tl`) found 4,498
+A macOS `sample` profile (1 ms interval, over `opt boot/Main.gob`) found 4,498
 leaf samples in `valid_heap_pointer` and 2,326 in `turkey_object_set` in the
 self-hosted build, roughly 31% of the worker thread's 22,172 samples combined.
 These helpers were not leading costs in the Python-built profile. The latter

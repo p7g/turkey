@@ -133,7 +133,7 @@ class ModuleLoader:
                          stack=[*stack, name])
 
     def _resolve(self, name: str) -> Path:
-        relative = Path(*name.split(".")).with_suffix(".tl")
+        relative = Path(*name.split(".")).with_suffix(".gob")
         for root in self.search:
             candidate = root / relative
             if candidate.is_file():

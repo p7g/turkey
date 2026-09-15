@@ -72,7 +72,7 @@ def test_an_inlined_body_blames_the_call_site_but_arguments_keep_theirs():
     checked = check(
         "fun bump(x : Int) -> Int = x + 1\n"
         "fun main() { print(bump(41)) }\n",
-        "inline_test.tl",
+        "inline_test.gob",
     )
     literals = {n.value: n.span for n in nodes(
         named(checked.opt, "Main#main").value) if isinstance(n, CLit)}
@@ -156,7 +156,7 @@ def test_a_body_that_used_to_hold_a_return_is_inlined_now():
     """The debt M15e settles, written as the test that used to assert it.
 
     `return` named its target by where it was, so a body holding one could not
-    be moved: dropped into a caller it returned from the caller, and `polyrec.tl`
+    be moved: dropped into a caller it returned from the caller, and `polyrec.gob`
     printed one line of four. The pass refused to inline any such body, which
     was one function in eight across the suite.
 
@@ -181,7 +181,7 @@ fun main() {
 
 
 def test_an_argument_is_not_captured_by_a_loop_variable():
-    """Found the hard way, on `monads.tl`.
+    """Found the hard way, on `monads.gob`.
 
     `Array`'s `bind` walks its elements in a `for`, so its loop variable is a
     binder -- and `opt._binders_of` did not know that, so the continuation was
@@ -409,7 +409,7 @@ fun main() { print(quarter(8)) }
 
 
 def test_type_applied_methods_inline_and_the_remaining_flow_is_tracked():
-    """The first obstruction in `question_control.tl`, and what lies past it.
+    """The first obstruction in `question_control.gob`, and what lies past it.
 
     The old answer written here was wrong, and worth recording as wrong: it
     said item 6's specializer left the `bind` polymorphic. Every top-level
@@ -453,7 +453,7 @@ def test_type_applied_methods_inline_and_the_remaining_flow_is_tracked():
 
     The size this costs, measured on this fixture: opt bindings 112 -> 158,
     emitted IR 52208 -> 57679 lines (+10.5%), warm backend compile 889 -> 983ms
-    (+10.6%). `monads.tl` and `dicts.tl` are unchanged on all three. That is the
+    (+10.6%). `monads.gob` and `dicts.gob` are unchanged on all three. That is the
     trade this milestone is making on purpose: a generic body reached through a
     generic dictionary is compiled at `BOXED` and read through runtime layout
     checks, and removing it is what lets field access become a load.
@@ -472,15 +472,15 @@ def test_type_applied_methods_inline_and_the_remaining_flow_is_tracked():
     emitted IR 35348 -> 40377 lines (+14.2%), front end 2420 -> 1864ms. The
     brainfuck benchmark's inner loop went 3.22s -> 2.51s over the same change,
     which is what the IR is being spent on. Note the fusion this guards cannot
-    be switched off to be measured against: without it `question_control.tl`
+    be switched off to be measured against: without it `question_control.gob`
     does not typecheck in Core at all, because a jump escapes its join.
     """
     from pathlib import Path
     from turkey.core import CLetRec
 
     root = Path(__file__).parent / "programs"
-    checked = check((root / "question_control.tl").read_text(),
-                    str(root / "question_control.tl"), [root])
+    checked = check((root / "question_control.gob").read_text(),
+                    str(root / "question_control.gob"), [root])
     lifted = [b for bind in checked.core.binds
               for n in nodes(bind.value) if isinstance(n, CLetRec)
               for b in n.binds if b.name.startswith("%loop")]
@@ -578,7 +578,7 @@ def test_a_bare_panicking_forwarder_is_still_inlined():
     """`fun error(message) = Prim.error(message)` carries nothing.
 
     Declining it would put a standard-library frame in every panic trace,
-    pointing at `Std/Classes.tl` rather than at the code that failed --
+    pointing at `Std/Classes.gob` rather than at the code that failed --
     which is what `test_a_panic_stack_does_not_invent_inlined_frames` is
     about. The rule is about what a bottoming callee *carries*, not about
     its bottoming.
@@ -639,7 +639,7 @@ def test_literal_record_lambda_is_exposed_to_beta_without_dropping_effects():
     from pathlib import Path
     from turkey.core import CField, CRecord
 
-    source = Path(__file__).parent / "programs" / "known_lambda.tl"
+    source = Path(__file__).parent / "programs" / "known_lambda.gob"
     program = optimized(source.read_text())
     main = named(program, "Main#main")
     literal_calls = [n for n in nodes(main.value)

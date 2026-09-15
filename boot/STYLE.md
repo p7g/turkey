@@ -132,5 +132,5 @@ which language rule forced it.
 Write it down. `FINDINGS.md` at the repo root is the running list of what
 writing this compiler has turned up about the language -- bugs, design costs,
 friction, and library pieces that were missing. `plan.txt` item 9 says the
-bootstrap is the forcing function that finds papercuts at a scale `test.tl`
+bootstrap is the forcing function that finds papercuts at a scale `test.gob`
 cannot; a papercut nobody recorded was not found.

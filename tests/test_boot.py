@@ -43,15 +43,15 @@ from turkey.core import show_program
 from turkey.types import show_scheme
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BOOT_MAIN = REPO_ROOT / "boot" / "Main.tl"
+BOOT_MAIN = REPO_ROOT / "boot" / "Main.gob"
 
 
 def _corpus() -> list[Path]:
     """Every Turkey file in the repository, in a stable order."""
     found = sorted(
-        set(REPO_ROOT.glob("tests/programs/**/*.tl"))
-        | set(REPO_ROOT.glob("lib/**/*.tl"))
-        | set(REPO_ROOT.glob("boot/**/*.tl"))
+        set(REPO_ROOT.glob("tests/programs/**/*.gob"))
+        | set(REPO_ROOT.glob("lib/**/*.gob"))
+        | set(REPO_ROOT.glob("boot/**/*.gob"))
     )
     assert found, "no Turkey source found to compare against"
     return found
@@ -64,12 +64,12 @@ def _entries() -> list[Path]:
     """The corpus files that can be an *entry* module.
 
     A library module resolves its own imports against its own directory, so
-    `lib/Data/Array.tl` alone is not a program and neither implementation can
+    `lib/Data/Array.gob` alone is not a program and neither implementation can
     load it as one. Every library module is still covered by the milestone
     below, as an import of every program that is here.
     """
     found = sorted(
-        p for p in REPO_ROOT.glob("tests/programs/**/*.tl")
+        p for p in REPO_ROOT.glob("tests/programs/**/*.gob")
         if "err_" not in str(p))
     found.append(BOOT_MAIN)
     return found
@@ -89,7 +89,7 @@ def _sample() -> list[Path]:
     passing, `?`, and the compiler itself.
     """
     names = ["adt", "classes", "families", "dicts", "question", "records"]
-    found = [REPO_ROOT / "tests" / "programs" / f"{n}.tl" for n in names]
+    found = [REPO_ROOT / "tests" / "programs" / f"{n}.gob" for n in names]
     missing = [p for p in found if not p.is_file()]
     assert not missing, f"sample programs are gone: {missing}"
     return [*found, BOOT_MAIN]
@@ -112,11 +112,11 @@ def _checked(path: Path):
 def _reference_dump(stage: str, paths: list[Path], of_checked) -> str:
     """One stage's reference text over some programs, cached per program.
 
-    `check` on `boot/Main.tl` costs about seventy seconds and five stage tests
+    `check` on `boot/Main.gob` costs about seventy seconds and five stage tests
     each wanted it; over the corpus it is thirteen seconds a stage. The answer
     depends on `turkey/`, `lib/` and the one program, so `tests.bootc` keys the
     cache on exactly those -- which means backend work invalidates the
-    `boot/Main.tl` entry, correctly, and leaves the corpus entries warm.
+    `boot/Main.gob` entry, correctly, and leaves the corpus entries warm.
     """
     return "".join(
         bootc.reference(stage, path, lambda p=path: of_checked(_checked(p)))
@@ -234,8 +234,8 @@ def _python_desugar(paths: list[Path]) -> str:
 def test_the_corpus_is_the_whole_repository() -> None:
     # A shrinking corpus would silently weaken every test below it.
     names = {p.name for p in CORPUS}
-    assert "Main.tl" in names, "boot's own source must be in the corpus"
-    assert "String.tl" in names, "the standard library must be in the corpus"
+    assert "Main.gob" in names, "boot's own source must be in the corpus"
+    assert "String.gob" in names, "the standard library must be in the corpus"
     assert len(CORPUS) > 60
 
 
@@ -273,7 +273,7 @@ def test_boot_resolves_and_desugars_the_corpus_exactly_as_python_does(
     Every module of every program, not just the entry one: what resolution does
     to a module depends on what it imported, so a dump of the entry alone would
     check the interesting half of the stage against nothing. Between them these
-    programs pull in the whole of `lib/`, and `boot/Main.tl` pulls in the whole
+    programs pull in the whole of `lib/`, and `boot/Main.gob` pulls in the whole
     of `boot/`.
 
     The tree is the M20 dump, so what this adds over that milestone is exactly
@@ -338,7 +338,7 @@ def test_boot_infers_the_same_types(boot_types: tuple[str, str]) -> None:
     """M22, the milestone: the whole front end, end to end.
 
     Every entry program in the corpus, at full breadth -- so the library is
-    inferred thirty-two times over and `boot/Main.tl` puts the compiler itself
+    inferred thirty-two times over and `boot/Main.gob` puts the compiler itself
     through it. What is compared is the entry module's schemes and the warnings
     exhaustiveness produced, which between them cover unification, ranks and
     generalization, the value restriction, class entailment and superclass
@@ -411,7 +411,7 @@ def test_constructor_values_match_the_frontend(stage: str) -> None:
     Compare elaboration and its optimized forms with the Python frontend,
     including annotated saturated calls and nullary constructor values.
     """
-    path = REPO_ROOT / "tests" / "programs" / "constructor_values.tl"
+    path = REPO_ROOT / "tests" / "programs" / "constructor_values.gob"
     expected = _reference_dump(
         stage, [path], lambda c: show_program(getattr(c, stage), c.module))
     _first_difference(_boot(stage, *_relative([path])), expected, stage)
@@ -463,7 +463,7 @@ def test_boot_optimizes_the_same_way(boot_opt: str) -> None:
 
 def test_boot_reports_a_missing_file(tmp_path: Path) -> None:
     result = subprocess.run(
-        [str(bootc.binary()), "tokens", str(tmp_path / "absent.tl")],
+        [str(bootc.binary()), "tokens", str(tmp_path / "absent.gob")],
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,

@@ -467,7 +467,7 @@ class _Emitter:
         # never registered as one: what kept these alive was that
         # `_root_slots` rooted every pointer in a function and never cleared a
         # slot, so the frame that built them held them by accident. Rooting by
-        # liveness removes that accident, and `dicts.tl` collects its own
+        # liveness removes that accident, and `dicts.gob` collects its own
         # instance dictionaries out from under itself under GC stress.
         #
         # So the storage *is* the root array: one module-level array of

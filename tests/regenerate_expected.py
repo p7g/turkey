@@ -29,14 +29,14 @@ def run_program(source: pathlib.Path) -> tuple[str, int]:
 
 
 def sources() -> list[pathlib.Path]:
-    """Every program: a single `.tl` file, or a directory's `Main.tl` (M11a)."""
-    bundles = [p / "Main.tl" for p in sorted(PROGRAMS.iterdir())
-               if p.is_dir() and (p / "Main.tl").is_file()]
-    return sorted(PROGRAMS.glob("*.tl")) + bundles
+    """Every program: a single `.gob` file, or a directory's `Main.gob` (M11a)."""
+    bundles = [p / "Main.gob" for p in sorted(PROGRAMS.iterdir())
+               if p.is_dir() and (p / "Main.gob").is_file()]
+    return sorted(PROGRAMS.glob("*.gob")) + bundles
 
 
 def name_of(source: pathlib.Path) -> str:
-    return source.parent.name if source.name == "Main.tl" else source.stem
+    return source.parent.name if source.name == "Main.gob" else source.stem
 
 
 def main() -> int:
@@ -57,7 +57,7 @@ def main() -> int:
         for golden in sorted(PROGRAMS.glob(f"*{suffix}")):
             result = subprocess.run(
                 [sys.executable, "-m", "turkey", command,
-                 golden.with_suffix(".tl").name],
+                 golden.with_suffix(".gob").name],
                 cwd=PROGRAMS, env=dict(os.environ, PYTHONPATH=str(ROOT)),
                 capture_output=True, text=True,
             )

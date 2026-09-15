@@ -1,6 +1,6 @@
 """What `?` and `do` turn into (delta 46).
 
-`question.tl` pins the behaviour and `monads.tl` writes the chains out by hand.
+`question.gob` pins the behaviour and `monads.gob` writes the chains out by hand.
 Neither can show the thing this feature actually is: the tree the pass produces.
 So the tests here read it back as source-ish text and assert on it, because
 "`?` is sugar for `bind` plus a lambda" is a claim about a *shape*, and a claim

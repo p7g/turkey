@@ -761,7 +761,7 @@ class Fams:
     The order is `Solver.reduce`'s, and copied deliberately. A given equality
     is a reduction rule for the family it names, and it has to be consulted
     first because a family over a rigid variable never reduces through the
-    instance table at all -- `bf.tl`'s `run[Iterator s, Item s ~ Op]` is the
+    instance table at all -- `bf.gob`'s `run[Iterator s, Item s ~ Op]` is the
     case, and its `match op { Inc(n) -> ... }` needs `Item s` to genuinely
     *become* `Op`.
     """

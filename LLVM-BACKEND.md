@@ -613,7 +613,7 @@ Replace the current single ratio gate with separately reported measurements:
 - warm execution; and
 - peak heap use and collection time.
 
-Keep the join loop and `bf.tl`, then add allocation-heavy, closure-heavy,
+Keep the join loop and `bf.gob`, then add allocation-heavy, closure-heavy,
 string-heavy, and polymorphic workloads. The correctness gate is mandatory;
 performance gates should prevent gross regressions but should not encourage
 unsafe removal of checks.
@@ -739,7 +739,7 @@ The replacement is complete when:
 - recursive joins and tail-recursive discovered joins remain stack safe;
 - GC stress, ASan, and UBSan runs are clean;
 - layout discovery terminates on polymorphic recursion;
-- warm native execution beats `pygen` on the join-loop and `bf.tl` benchmarks,
+- warm native execution beats `pygen` on the join-loop and `bf.gob` benchmarks,
   with compile time reported separately;
 - the emitted LLVM IR is deterministic and verifiable; and
 - the runtime ABI is documented independently enough for the bootstrap

@@ -1,6 +1,6 @@
 """Operators as class methods, and the prelude that declares them.
 
-`operators.tl` and `iter.tl` are the goldens that run. This file is the part a
+`operators.gob` and `iter.gob` are the goldens that run. This file is the part a
 golden cannot show: that `+` is *nothing but* a call to `Add.add` -- no table,
 no special case, no privilege -- and what follows from that. It also pins the
 two boundaries the prelude draws: `Prim.*` is not in the surface language, and

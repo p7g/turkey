@@ -1,6 +1,6 @@
 """Associated type families: reduction, deferral, and what they let a class say.
 
-`families.tl` is the golden that runs. This file is the part a golden cannot
+`families.gob` is the golden that runs. This file is the part a golden cannot
 display -- that an equation over a family *waits* rather than succeeding or
 failing, which is the third outcome M7 gives unification, and that everything
 downstream (schemes, dictionaries, the evaluator) sees a family only after it

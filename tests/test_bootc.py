@@ -42,7 +42,7 @@ def test_a_reference_is_reused_when_nothing_changed() -> None:
         calls.append(1)
         return f"value-{len(calls)}"
 
-    main = REPO_ROOT / "boot" / "Main.tl"
+    main = REPO_ROOT / "boot" / "Main.gob"
     stage = _stage("test-reuse")
     first = bootc.reference(stage, main, compute)
     second = bootc.reference(stage, main, compute)
@@ -54,7 +54,7 @@ def test_a_reference_notices_a_change_to_a_module_the_program_imports() -> None:
     """The bug this test exists for, and it was real.
 
     The key hashed the program's own bytes. `check` follows imports, so the
-    reference for `boot/Main.tl` depends on all of `boot/Turkey/` -- and
+    reference for `boot/Main.gob` depends on all of `boot/Turkey/` -- and
     editing a module it imports left the key unchanged and the cached answer
     served. Every backend commit in this repository edits such a module.
     """
@@ -64,8 +64,8 @@ def test_a_reference_notices_a_change_to_a_module_the_program_imports() -> None:
         calls.append(1)
         return f"value-{len(calls)}"
 
-    main = REPO_ROOT / "boot" / "Main.tl"
-    imported = REPO_ROOT / "boot" / "Turkey" / "Regalloc.tl"
+    main = REPO_ROOT / "boot" / "Main.gob"
+    imported = REPO_ROOT / "boot" / "Turkey" / "Regalloc.gob"
     assert imported.is_file(), "the module this test perturbs is gone"
 
     stage = _stage("test-imports")
@@ -87,7 +87,7 @@ def test_a_reference_notices_a_change_to_a_module_the_program_imports() -> None:
 def test_the_build_fingerprint_covers_boot_and_the_python_compiler() -> None:
     """`binary()` is keyed on this, and a miss here is a stale executable."""
     before = bootc._fingerprint()
-    for target in (REPO_ROOT / "boot" / "Turkey" / "Regalloc.tl",
+    for target in (REPO_ROOT / "boot" / "Turkey" / "Regalloc.gob",
                    REPO_ROOT / "turkey" / "driver.py"):
         assert target.is_file(), f"{target} is gone"
         original = target.read_bytes()

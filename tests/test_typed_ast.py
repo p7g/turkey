@@ -154,7 +154,7 @@ def test_no_golden_program_leaves_a_type_undecided(name):
     fixtures above do not reach -- inside a class method's default, say, or a
     lifted loop's generated arithmetic.
     """
-    source = PROGRAMS / f"{name}.tl"
+    source = PROGRAMS / f"{name}.gob"
     checked = check(source.read_text(), str(source), [PROGRAMS])
     assert checked.types.unresolved() == []
     assert len(checked.types) > 0
@@ -167,9 +167,9 @@ def test_a_family_over_a_known_type_is_reduced_everywhere_not_only_at_the_head()
     """`types.normalize` reduces the head only, and says so. That is right for
     unification, which only ever compares heads. It is not enough for a table
     something reads whole, so `TypeTable.resolve` reduces throughout."""
-    source = PROGRAMS / "adt.tl"
+    source = PROGRAMS / "adt.gob"
     checked = check(source.read_text(), str(source), [PROGRAMS])
-    # `adt.tl:23` is `for x in xs`, which elaborates to `iter`/`next`
+    # `adt.gob:23` is `for x in xs`, which elaborates to `iter`/`next`
     # (design.md 6.5). `next` answers `Option (Item (Array Int))` and `iter`
     # answers `Cursor (Array Int)`: both families sit *under* a constructor, so
     # a head-only reduction would leave them both standing.
@@ -187,14 +187,14 @@ def test_a_family_over_a_signature_variable_survives_and_should():
     not survive is a family still *waiting* on an instance, which is a
     different thing and is rejected during solving, not here.
     """
-    src = (PROGRAMS / "families.tl").read_text()
-    checked = check(src, str(PROGRAMS / "families.tl"), [PROGRAMS])
+    src = (PROGRAMS / "families.gob").read_text()
+    checked = check(src, str(PROGRAMS / "families.gob"), [PROGRAMS])
     stuck = [
         show(checked.types.resolve(ty))
         for node, ty in checked.types._exprs.values()
         if contains(checked.types.resolve(ty), TFam)
     ]
-    assert stuck, "families.tl should have at least one rigid family"
+    assert stuck, "families.gob should have at least one rigid family"
     # `Field.n` and `Elem.0` belong on this list too: a field access is a class
     # method whose result is an associated family, so a record-polymorphic
     # receiver leaves one behind exactly as `Container.Elem c` does.

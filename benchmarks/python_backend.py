@@ -66,7 +66,7 @@ def main() -> int:
     parser.add_argument("--rounds", type=int, default=3)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
-    bf = root / "tests/programs/bf.tl"
+    bf = root / "tests/programs/bf.gob"
     ratios = [
         benchmark("join-loop", LOOP, "<join-loop>", None, args.rounds),
         benchmark("bf", bf.read_text(encoding="utf-8"), str(bf),

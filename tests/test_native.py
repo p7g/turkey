@@ -35,7 +35,7 @@ from tests import bootc
 from turkey.driver import run
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-BOOT_MAIN = REPO_ROOT / "boot" / "Main.tl"
+BOOT_MAIN = REPO_ROOT / "boot" / "Main.gob"
 PROGRAMS = REPO_ROOT / "tests" / "programs"
 RUNTIME = REPO_ROOT / "runtime" / "turkey_runtime.c"
 
@@ -45,7 +45,7 @@ RUNTIME = REPO_ROOT / "runtime" / "turkey_runtime.c"
 UNSUPPORTED: set[str] = set()
 
 CORPUS = sorted(
-    path.name for path in PROGRAMS.glob("*.tl")
+    path.name for path in PROGRAMS.glob("*.gob")
     if not path.name.startswith("err_")
 )
 COMPILABLE = [name for name in CORPUS if name not in UNSUPPORTED]
@@ -138,7 +138,7 @@ def test_integer_overflow_panics():
     backend that could not tell them apart put an overflow check on
     `Data.Map`'s hashing and panicked on a subtraction the language says wraps.
     """
-    text = _modules()["operators.tl"]
+    text = _modules()["operators.gob"]
     assert "llvm.sadd.with.overflow.i64" in text
     assert "integer overflow in +" in text
 
@@ -149,7 +149,7 @@ def test_a_panic_in_a_callee_stops_the_caller():
     So a caller that did not look would carry on with a value the callee never
     produced. Every call is followed by a check.
     """
-    text = _modules()["adt.tl"]
+    text = _modules()["adt.gob"]
     assert "@turkey_has_panicked" in text
 
 
@@ -188,27 +188,27 @@ def test_block_parameters_became_phis():
     a `Jump` carries arguments, so a block's phis are read off its
     predecessors and no critical edge has to be split.
     """
-    text = _modules()["loops.tl"]
+    text = _modules()["loops.gob"]
     assert " = phi " in text
 
 
 def test_symbols_are_the_compilers_own_names():
     """No mangling scheme. LLVM's quoted form takes every character Core uses."""
-    text = _modules()["adt.tl"]
+    text = _modules()["adt.gob"]
     assert '@"Main#main"' in text or '@"Main#main@' in text, text[:400]
 
 
 def test_pointer_array_initialization_does_not_allocate_boxes():
-    result = subprocess.run([str(_binary("shared_nullaries.tl"))],
+    result = subprocess.run([str(_binary("shared_nullaries.gob"))],
                             env=dict(os.environ, TURKEY_GC_STATS="1",
                                      TURKEY_GC_STRESS="1"),
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    assert result.stdout == _reference("shared_nullaries.tl")
+    assert result.stdout == _reference("shared_nullaries.gob")
     assert ", box 0," in result.stderr, result.stderr
 
 
 def test_typed_record_stores_do_not_call_the_generic_runtime_setter():
-    text = _modules()["record_stores.tl"]
+    text = _modules()["record_stores.gob"]
     assert "call void @turkey_object_set(" not in text
     assert "store i64 " in text

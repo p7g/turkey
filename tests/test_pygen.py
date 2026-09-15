@@ -46,7 +46,7 @@ def test_generated_source_is_internal_python_not_a_serialized_evaluator():
 
 
 def test_python_command_prints_compilable_source_without_running_it(tmp_path, capsys):
-    program = tmp_path / "program.tl"
+    program = tmp_path / "program.gob"
     program.write_text("fun main() { print(12345) }", encoding="utf-8")
 
     assert cli_main(["python", str(program)]) == 0
@@ -179,15 +179,15 @@ fun main() {
 
 
 SUCCESSFUL = sorted(
-    p for p in PROGRAMS.glob("*.tl") if not p.name.startswith("err_"))
+    p for p in PROGRAMS.glob("*.gob") if not p.name.startswith("err_"))
 SUCCESSFUL += sorted(
-    p / "Main.tl" for p in PROGRAMS.iterdir()
-    if p.is_dir() and not p.name.startswith("err_") and (p / "Main.tl").is_file()
+    p / "Main.gob" for p in PROGRAMS.iterdir()
+    if p.is_dir() and not p.name.startswith("err_") and (p / "Main.gob").is_file()
 )
 
 
 @pytest.mark.parametrize("program", SUCCESSFUL,
-                         ids=lambda p: p.parent.name if p.name == "Main.tl" else p.stem)
+                         ids=lambda p: p.parent.name if p.name == "Main.gob" else p.stem)
 def test_generated_python_agrees_with_the_evaluator(program: Path):
     src = program.read_text(encoding="utf-8")
     checked = check(src, str(program), [program.parent.resolve()])
@@ -231,21 +231,21 @@ def test_optimized_panic_frames_agree_between_backends():
 }
 fun main() { print(descend(2)) }
 """
-    checked = check(src, "trace.tl")
+    checked = check(src, "trace.gob")
 
     with pytest.raises(TurkeyPanic) as compiled_panic:
-        execute(checked.opt, checked.decls, checked.main, "trace.tl")
+        execute(checked.opt, checked.decls, checked.main, "trace.gob")
     with pytest.raises(TurkeyPanic) as interpreted_panic:
         Evaluator(checked.decls, initial_values()).run(
             checked.opt, checked.main)
 
     expected = """panic: boom
-  at descend (trace.tl:2:24)
-  at descend (trace.tl:3:5)
-  at descend (trace.tl:3:5)
-  at main (trace.tl:5:20)"""
-    assert compiled_panic.value.render("trace.tl") == expected
-    assert interpreted_panic.value.render("trace.tl") == expected
+  at descend (trace.gob:2:24)
+  at descend (trace.gob:3:5)
+  at descend (trace.gob:3:5)
+  at main (trace.gob:5:20)"""
+    assert compiled_panic.value.render("trace.gob") == expected
+    assert interpreted_panic.value.render("trace.gob") == expected
 
 
 def test_a_panic_stack_does_not_invent_inlined_frames():
@@ -253,9 +253,9 @@ def test_a_panic_stack_does_not_invent_inlined_frames():
 fun middle(n : Int) -> Int = boom(n)
 fun main() { print(middle(3)) }
 """
-    checked = check(src, "inline.tl")
+    checked = check(src, "inline.gob")
     with pytest.raises(TurkeyPanic) as panic:
-        execute(checked.opt, checked.decls, checked.main, "inline.tl")
-    assert panic.value.render("inline.tl") == (
-        "panic: bad\n  at main (inline.tl:3:20)"
+        execute(checked.opt, checked.decls, checked.main, "inline.gob")
+    assert panic.value.render("inline.gob") == (
+        "panic: bad\n  at main (inline.gob:3:20)"
     )

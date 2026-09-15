@@ -948,7 +948,7 @@ Each phase runs and is verified before the next begins.
     arguments". Until it did, the check ran one line after the array index and
     a nine-argument call panicked inside the compiler -- `array index out of
     bounds: read at index 8, length 8`. No corpus program had a function of
-    more than eight parameters, so nothing found it; `tests/programs/manyargs.tl`
+    more than eight parameters, so nothing found it; `tests/programs/manyargs.gob`
     exists now for that reason, and the callee has to be *recursive*, because
     `opt` inlines and folds a call with constant arguments.
   * **The callee is silent, which is the part to fix first.** `start` copies

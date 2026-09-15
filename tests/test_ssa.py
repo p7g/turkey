@@ -1,8 +1,8 @@
-"""`boot/Turkey/Ssa.tl` and `Turkey/LowIr.tl`: the low IR.
+"""`boot/Turkey/Ssa.gob` and `Turkey/LowIr.gob`: the low IR.
 
 M27 phase 0. Nothing imports the module yet -- the lowering into it is the
 next phase -- so this is what type-checks it and what exercises the analyses.
-`boot/SsaCheck.tl` is the driver; see its header for why it lives there.
+`boot/SsaCheck.gob` is the driver; see its header for why it lives there.
 
 Run through the Python implementation, which is the host `boot` is compiled by
 today. That is the point at which this is a test of the Turkey code rather
@@ -14,7 +14,7 @@ from pathlib import Path
 from turkey.driver import run
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DRIVER = REPO_ROOT / "boot" / "SsaCheck.tl"
+DRIVER = REPO_ROOT / "boot" / "SsaCheck.gob"
 
 
 def _output(capfd) -> str:
@@ -88,7 +88,7 @@ def test_an_operand_count_cannot_be_wrong(capfd):
     is unrepresentable, which is the concrete payoff of writing the
     instruction set as an ADT rather than an opcode string and a list.
     """
-    source = (REPO_ROOT / "boot" / "Turkey" / "LowIr.tl").read_text()
+    source = (REPO_ROOT / "boot" / "Turkey" / "LowIr.gob").read_text()
     assert "Bin(BinOp, Value, Value)" in source
     assert "ArraySet(Value, Value, Value)" in source
 

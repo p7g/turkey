@@ -1,8 +1,8 @@
 """The machine operations, and nothing else.
 
 Everything a program can name is written in the language now: the classes and
-`print` in `turkey/lib/Prelude.tl`, and `Array.push`, `Int.toString` and the
-rest in `turkey/lib/Data/*.tl` (SPEC-DELTAS.md entry 42). What is left here is
+`print` in `turkey/lib/Prelude.gob`, and `Array.push`, `Int.toString` and the
+rest in `turkey/lib/Data/*.gob` (SPEC-DELTAS.md entry 42). What is left here is
 the floor they stand on -- integer addition, the comparison that reads one
 string against another, the two writes to stdout -- under names that begin
 `Prim.`.

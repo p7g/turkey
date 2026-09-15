@@ -24,7 +24,7 @@ def main(argv: list[str] | None = None) -> int:
     `run` has needed that since a compiler became a thing this could be asked
     to execute, and the dumps need it for the same reason one step earlier:
     *compiling* a program the size of the bootstrap compiler recurses over its
-    Core about as deeply as running one does, and `turkey types boot/Main.tl`
+    Core about as deeply as running one does, and `turkey types boot/Main.gob`
     reached the host's limit inside the inliner.
     """
     box: list[int] = []

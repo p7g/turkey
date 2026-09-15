@@ -60,11 +60,11 @@ ALLOWED_RUNTIME_CALLS = {
     "turkey_frame_enter", "turkey_frame_leave",
 }
 NATIVE_PROGRAMS = sorted(
-    path.stem for path in PROGRAMS_DIR.glob("*.tl")
+    path.stem for path in PROGRAMS_DIR.glob("*.gob")
     if not path.stem.startswith("err_") and path.with_suffix(".expected").exists()
 )
 ERROR_PROGRAMS = sorted(
-    path.stem for path in PROGRAMS_DIR.glob("err_*.tl")
+    path.stem for path in PROGRAMS_DIR.glob("err_*.gob")
     if path.with_suffix(".expected").exists()
 )
 
@@ -261,14 +261,14 @@ def test_native_panic_frames_match_the_optimized_backend():
 }
 fun main() { print(descend(2)) }
 """
-    checked = check(source, "trace.tl")
+    checked = check(source, "trace.gob")
     with pytest.raises(TurkeyPanic) as raised:
-        execute(checked.opt, checked.decls, checked.main, "trace.tl")
-    assert raised.value.render("trace.tl") == """panic: boom
-  at descend (trace.tl:2:24)
-  at descend (trace.tl:3:5)
-  at descend (trace.tl:3:5)
-  at main (trace.tl:5:20)"""
+        execute(checked.opt, checked.decls, checked.main, "trace.gob")
+    assert raised.value.render("trace.gob") == """panic: boom
+  at descend (trace.gob:2:24)
+  at descend (trace.gob:3:5)
+  at descend (trace.gob:3:5)
+  at main (trace.gob:5:20)"""
 
 
 def test_native_float_division_is_ieee(capfd):
@@ -469,14 +469,14 @@ fun main() {
 
 
 def test_llvm_command_prints_verified_ir(tmp_path, capsys):
-    program = tmp_path / "program.tl"
+    program = tmp_path / "program.gob"
     program.write_text("fun main() { print(3) }", encoding="utf-8")
     assert cli_main(["llvm", str(program)]) == 0
     assert "define i8 @turkeyfn_Main_23_main" in capsys.readouterr().out
 
 
 def test_run_accepts_opt_in_llvm_backend(tmp_path, capfd):
-    program = tmp_path / "program.tl"
+    program = tmp_path / "program.gob"
     program.write_text("fun main() { print(7) }", encoding="utf-8")
     assert cli_main(["run", "--backend", "llvm", str(program)]) == 0
     assert capfd.readouterr().out == "7\n"
@@ -484,7 +484,7 @@ def test_run_accepts_opt_in_llvm_backend(tmp_path, capfd):
 
 @pytest.mark.parametrize("name", NATIVE_PROGRAMS)
 def test_native_programs_match_conformance_output(name, monkeypatch, capfd):
-    program = PROGRAMS_DIR / f"{name}.tl"
+    program = PROGRAMS_DIR / f"{name}.gob"
     monkeypatch.chdir(PROGRAMS_DIR)
     assert cli_main(["run", "--backend", "llvm", program.name]) == 0
     expected = (program.with_suffix(".expected")
@@ -495,7 +495,7 @@ def test_native_programs_match_conformance_output(name, monkeypatch, capfd):
 
 @pytest.mark.parametrize("name", ERROR_PROGRAMS)
 def test_native_error_programs_match_conformance_output(name, monkeypatch, capfd):
-    program = PROGRAMS_DIR / f"{name}.tl"
+    program = PROGRAMS_DIR / f"{name}.gob"
     monkeypatch.chdir(PROGRAMS_DIR)
     assert cli_main(["run", "--backend", "llvm", program.name]) != 0
     expected = program.with_suffix(".expected").read_text(encoding="utf-8")
@@ -534,7 +534,7 @@ def test_field_and_element_access_is_emitted_inline(name, monkeypatch):
     reintroduced an accessor to reach for -- fails here rather than passing a
     check that has quietly stopped being able to fail.
     """
-    program = PROGRAMS_DIR / f"{name}.tl"
+    program = PROGRAMS_DIR / f"{name}.gob"
     monkeypatch.chdir(PROGRAMS_DIR)
     checked = check(program.read_text(encoding="utf-8"), str(program),
                     [program.parent.resolve()])
@@ -591,7 +591,7 @@ fun main() { print(show(depth(build(500000)))) }
 def test_top_level_dictionaries_survive_gc_stress(monkeypatch, capfd):
     """A pointer-typed module global is a root in its own right.
 
-    `dicts.tl` keeps seven of them, each an instance dictionary built once by
+    `dicts.gob` keeps seven of them, each an instance dictionary built once by
     the module initializer and read for the rest of the run. Nothing registered
     them: what kept them alive was that the root frame held every pointer in
     the function that built them and never cleared a slot, so they were rooted
@@ -603,7 +603,7 @@ def test_top_level_dictionaries_survive_gc_stress(monkeypatch, capfd):
     it.
     """
     monkeypatch.setenv("TURKEY_GC_STRESS", "1")
-    program = PROGRAMS_DIR / "dicts.tl"
+    program = PROGRAMS_DIR / "dicts.gob"
     checked = check(program.read_text(encoding="utf-8"), str(program),
                     [program.parent.resolve()])
     execute(checked.opt, checked.decls, checked.main, str(program))
@@ -613,7 +613,7 @@ def test_top_level_dictionaries_survive_gc_stress(monkeypatch, capfd):
 
 def test_generic_layout_bridges_survive_gc_stress(monkeypatch, capfd):
     monkeypatch.setenv("TURKEY_GC_STRESS", "1")
-    program = PROGRAMS_DIR / "question_control.tl"
+    program = PROGRAMS_DIR / "question_control.gob"
     checked = check(program.read_text(encoding="utf-8"), str(program),
                     [program.parent.resolve()])
     execute(checked.opt, checked.decls, checked.main, str(program))
@@ -757,8 +757,8 @@ def test_a_specialized_method_states_the_forall_it_kept():
     `layout.share` cannot key a copy on.
     """
     from turkey.core import CTyLam
-    source = (PROGRAMS_DIR / "dicts.tl").read_text(encoding="utf-8")
-    checked = check(source, "dicts.tl", [PROGRAMS_DIR])
+    source = (PROGRAMS_DIR / "dicts.gob").read_text(encoding="utf-8")
+    checked = check(source, "dicts.gob", [PROGRAMS_DIR])
     for bind in checked.opt.dicts + checked.opt.binds:
         if isinstance(bind.value, CTyLam):
             assert bind.binders, bind.name
@@ -779,8 +779,8 @@ def test_the_backend_is_handed_no_stuck_type_family():
     from turkey.core import CAlt, CExpr, CParam
     from turkey.types import TFam, prune
 
-    source = (PROGRAMS_DIR / "dicts.tl").read_text(encoding="utf-8")
-    checked = check(source, "dicts.tl", [PROGRAMS_DIR])
+    source = (PROGRAMS_DIR / "dicts.gob").read_text(encoding="utf-8")
+    checked = check(source, "dicts.gob", [PROGRAMS_DIR])
     found: list[str] = []
 
     def walk(node, owner: str) -> None:
@@ -1005,7 +1005,7 @@ def test_build_produces_an_executable_that_runs_on_its_own(tmp_path):
     prints is what it printed under the JIT, and the status it chose is the
     process's.
     """
-    source = tmp_path / "prog.tl"
+    source = tmp_path / "prog.gob"
     source.write_text("""
 import System.Env as Env
 
@@ -1032,7 +1032,7 @@ fun main() {
 
 def test_a_built_program_reports_a_panic_and_fails(tmp_path):
     """The other half of what `turkey_main` took over from the JIT boundary."""
-    source = tmp_path / "boom.tl"
+    source = tmp_path / "boom.gob"
     source.write_text(
         "fun main() { let xs = [1]\n print(xs[4]) }\n", encoding="utf-8")
     output = tmp_path / "boom"
@@ -1045,4 +1045,4 @@ def test_a_built_program_reports_a_panic_and_fails(tmp_path):
     assert ran.returncode == 1
     assert "panic:" in ran.stderr
     # The frames come from the same shadow stack the JIT boundary reads.
-    assert "boom.tl" in ran.stderr
+    assert "boom.gob" in ran.stderr

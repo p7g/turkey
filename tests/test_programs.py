@@ -1,12 +1,12 @@
 """Golden-file conformance runner.
 
-For every `tests/programs/NAME.tl` there is a `NAME.expected` holding the
+For every `tests/programs/NAME.gob` there is a `NAME.expected` holding the
 combined stdout+stderr (in that order) of running the program. Each program is
 executed in a subprocess with its cwd set to `tests/programs`, so error messages
 that quote the source file do so by its bare name.
 
 A program may also be a *directory*: `tests/programs/NAME/` whose entry module
-is `Main.tl` and whose golden is `Main.expected` beside it (M11a). It is run
+is `Main.gob` and whose golden is `Main.expected` beside it (M11a). It is run
 from inside that directory, so its imports resolve against it and its
 diagnostics quote bare file names the same way.
 """
@@ -24,15 +24,15 @@ TESTS_DIR = Path(__file__).resolve().parent
 PROGRAMS_DIR = TESTS_DIR / "programs"
 REPO_ROOT = TESTS_DIR.parent
 
-PROGRAMS = sorted(PROGRAMS_DIR.glob("*.tl"))
-# A multi-file program: a directory with a `Main.tl` in it.
-BUNDLES = sorted(p / "Main.tl" for p in PROGRAMS_DIR.iterdir()
-                 if p.is_dir() and (p / "Main.tl").is_file())
+PROGRAMS = sorted(PROGRAMS_DIR.glob("*.gob"))
+# A multi-file program: a directory with a `Main.gob` in it.
+BUNDLES = sorted(p / "Main.gob" for p in PROGRAMS_DIR.iterdir()
+                 if p.is_dir() and (p / "Main.gob").is_file())
 
 
 def _id(program: Path) -> str:
     """A bundle is named by its directory; a single file, by its stem."""
-    return program.parent.name if program.name == "Main.tl" else program.stem
+    return program.parent.name if program.name == "Main.gob" else program.stem
 
 
 def _run(args: list[str], cwd: Path = PROGRAMS_DIR) -> subprocess.CompletedProcess[str]:
@@ -82,14 +82,14 @@ SIGNATURES = sorted(PROGRAMS_DIR.glob("*.types"))
 
 @pytest.mark.parametrize("golden", SIGNATURES, ids=[p.stem for p in SIGNATURES])
 def test_types_command(golden: Path) -> None:
-    """`NAME.types` pins what `turkey types NAME.tl` prints.
+    """`NAME.types` pins what `turkey types NAME.gob` prints.
 
     A program only needs one when its inferred signatures are the point --
     which now includes any program whose functions carry a predicate context,
     since that is where a change in the solver would show up first.
     """
     expected = golden.read_text()
-    result = _run(["types", golden.with_suffix(".tl").name])
+    result = _run(["types", golden.with_suffix(".gob").name])
     actual = result.stdout + result.stderr
     assert actual == expected, _diff_message(expected, actual, result.returncode)
     assert result.returncode == 0
@@ -100,7 +100,7 @@ CORE = sorted(PROGRAMS_DIR.glob("*.core"))
 
 @pytest.mark.parametrize("golden", CORE, ids=[p.stem for p in CORE])
 def test_core_command(golden: Path) -> None:
-    """`NAME.core` pins what `turkey core NAME.tl` prints (M13b).
+    """`NAME.core` pins what `turkey core NAME.gob` prints (M13b).
 
     A `.expected` cannot see any of this. Whether a method was reached by
     selecting a superclass or by taking a second dictionary, whether an
@@ -114,7 +114,7 @@ def test_core_command(golden: Path) -> None:
     anyway, because `driver.check` runs it unconditionally.
     """
     expected = golden.read_text()
-    result = _run(["core", golden.with_suffix(".tl").name])
+    result = _run(["core", golden.with_suffix(".gob").name])
     actual = result.stdout + result.stderr
     assert actual == expected, _diff_message(expected, actual, result.returncode)
     assert result.returncode == 0
@@ -125,7 +125,7 @@ OPT = sorted(PROGRAMS_DIR.glob("*.opt"))
 
 @pytest.mark.parametrize("golden", OPT, ids=[p.stem for p in OPT])
 def test_opt_command(golden: Path) -> None:
-    """`NAME.opt` pins what `turkey opt NAME.tl` prints (M15b).
+    """`NAME.opt` pins what `turkey opt NAME.gob` prints (M15b).
 
     The third of the trio, and the one that shows an *analysis* rather than a
     translation: which local function became a label and which stayed a
@@ -133,7 +133,7 @@ def test_opt_command(golden: Path) -> None:
     pass that only writes a fact down must not change any answer.
     """
     expected = golden.read_text()
-    result = _run(["opt", golden.with_suffix(".tl").name])
+    result = _run(["opt", golden.with_suffix(".gob").name])
     actual = result.stdout + result.stderr
     assert actual == expected, _diff_message(expected, actual, result.returncode)
     assert result.returncode == 0
@@ -144,7 +144,7 @@ MONO = sorted(PROGRAMS_DIR.glob("*.mono"))
 
 @pytest.mark.parametrize("golden", MONO, ids=[p.stem for p in MONO])
 def test_mono_command(golden: Path) -> None:
-    """`NAME.mono` pins what `turkey mono NAME.tl` prints (M14a).
+    """`NAME.mono` pins what `turkey mono NAME.gob` prints (M14a).
 
     Beside the `.core` golden rather than instead of it, because the pair is
     the point: the same program before and after specialization, so a reader
@@ -152,7 +152,7 @@ def test_mono_command(golden: Path) -> None:
     and which type application survived because it is a method's own.
     """
     expected = golden.read_text()
-    result = _run(["mono", golden.with_suffix(".tl").name])
+    result = _run(["mono", golden.with_suffix(".gob").name])
     actual = result.stdout + result.stderr
     assert actual == expected, _diff_message(expected, actual, result.returncode)
     assert result.returncode == 0

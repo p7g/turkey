@@ -1,6 +1,6 @@
 """Kinds: inference over declarations, defaulting, and application checking.
 
-The golden `hkt.tl` shows a higher-kinded program working end to end; what it
+The golden `hkt.gob` shows a higher-kinded program working end to end; what it
 cannot show is the *shape* the checker inferred, or the cases the surface
 language reaches only awkwardly. Those are here.
 """

@@ -43,7 +43,7 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BOOT_MAIN = REPO_ROOT / "boot" / "Main.tl"
+BOOT_MAIN = REPO_ROOT / "boot" / "Main.gob"
 
 
 # Everything whose contents can change what `boot` compiles to: its own
@@ -51,7 +51,7 @@ BOOT_MAIN = REPO_ROOT / "boot" / "Main.tl"
 # the C runtime it is linked with. Hashing these is what lets a build be
 # reused; missing one would mean serving a stale binary, which is worse than
 # rebuilding, so this list errs wide.
-_INPUTS = (("boot", "*.tl"), ("lib", "*.tl"),
+_INPUTS = (("boot", "*.gob"), ("lib", "*.gob"),
            ("turkey", "*.py"), ("runtime", "*.c"), ("runtime", "*.h"))
 
 
@@ -173,10 +173,10 @@ def split_before(text: str, marker: str) -> dict[str, str]:
 
 # The Python implementation's own inputs. Deliberately *not* `boot/`: a
 # reference dump is keyed on these plus the source of the one program being
-# compiled, so changing `boot/Turkey/Regalloc.tl` invalidates the entry for
-# `boot/Main.tl` -- which genuinely changed -- and leaves the corpus entries
+# compiled, so changing `boot/Turkey/Regalloc.gob` invalidates the entry for
+# `boot/Main.gob` -- which genuinely changed -- and leaves the corpus entries
 # alone.
-_REFERENCE_INPUTS = (("turkey", "*.py"), ("lib", "*.tl"))
+_REFERENCE_INPUTS = (("turkey", "*.py"), ("lib", "*.gob"))
 
 
 @functools.lru_cache(maxsize=1)
@@ -192,7 +192,7 @@ def _reference_fingerprint() -> str:
 def reference(stage: str, path: Path, compute) -> str:
     """One Python-side reference dump, cached on disk by content hash.
 
-    `turkey.driver.check` on `boot/Main.tl` takes about seventy seconds, and
+    `turkey.driver.check` on `boot/Main.gob` takes about seventy seconds, and
     `test_boot` runs it once per *stage* -- five times for one answer that
     cannot have changed between them. Over the corpus it is another thirteen
     seconds a stage. None of it depends on anything but the Python
@@ -201,7 +201,7 @@ def reference(stage: str, path: Path, compute) -> str:
 
     Keyed per program rather than over the corpus as a whole, which is what
     makes it useful during backend work: a change to `boot/` invalidates the
-    `boot/Main.tl` entry and nothing else, so the twenty-nine corpus entries
+    `boot/Main.gob` entry and nothing else, so the twenty-nine corpus entries
     stay warm. A change to `turkey/` invalidates everything, which is correct
     -- that is the side being compared against.
 
@@ -213,15 +213,15 @@ def reference(stage: str, path: Path, compute) -> str:
     h.update(_reference_fingerprint().encode())
     h.update(stage.encode())
     h.update(str(path).encode())
-    # Every `.tl` beside the program, not just the program. `check` follows
-    # imports, so the reference for `boot/Main.tl` depends on all of
-    # `boot/Turkey/` -- and a key that hashed only `Main.tl` would have served
+    # Every `.gob` beside the program, not just the program. `check` follows
+    # imports, so the reference for `boot/Main.gob` depends on all of
+    # `boot/Turkey/` -- and a key that hashed only `Main.gob` would have served
     # a stale expectation after any change to a module it imports. That is the
     # worst failure this project can have: the differential oracle comparing
     # against the wrong answer and reporting agreement. Hashing the whole
     # directory is coarse for `tests/programs`, where each program imports only
     # the library, and exactly right for `boot`.
-    for sibling in sorted(path.parent.rglob("*.tl")):
+    for sibling in sorted(path.parent.rglob("*.gob")):
         h.update(str(sibling.relative_to(path.parent)).encode())
         h.update(sibling.read_bytes())
     cached = (Path(tempfile.gettempdir()) / "turkey-reference"

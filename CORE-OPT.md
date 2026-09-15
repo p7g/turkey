@@ -122,12 +122,12 @@ with a reference to an earlier binding already in scope, and move nothing.
 
 The survey said both passes were sound and where they belonged. It did not say
 whether they would ever fire, and a constant folder in Core carries a cost the
-survey surfaced: `boot/Turkey/Prims.tl` holds primitive *names* and says so
+survey surfaced: `boot/Turkey/Prims.gob` holds primitive *names* and says so
 deliberately -- "what one *means* is the Python's business until the C runtime
 arrives". Folding would be the first thing to need semantics there, so it is
 worth knowing what it buys before paying.
 
-Counted over `tests/programs` and `boot/Main.tl` -- the whole corpus, including
+Counted over `tests/programs` and `boot/Main.gob` -- the whole corpus, including
 the compiler compiling itself -- on the program `opt` produces:
 
 | | Core | backend IR |
@@ -221,7 +221,7 @@ propagate to*, and lowering is what creates them.
 ## What this costs and saves
 
 Not writing them saves two passes in two implementations, a golden
-regeneration, and the semantics module `Prims.tl` has so far not needed. It
+regeneration, and the semantics module `Prims.gob` has so far not needed. It
 keeps `boot` ignorant of what a primitive *means* until the native backend
 makes that unavoidable, which is the point at which it has to know anyway.
 

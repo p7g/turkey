@@ -12,7 +12,7 @@ What that buys, in the order `plan.txt` asks for it:
 * **A dictionary is built once.** `%inst.Monoid.Array` is a *function* from a
   `Semigroup a` dictionary to a `Monoid (Array a)` one, so
   `%inst.Monoid.Array[Int](%inst.Semigroup.Int)` allocates a fresh record every
-  time it is evaluated -- three times in `dicts.tl` alone. M13's note called
+  time it is evaluated -- three times in `dicts.gob` alone. M13's note called
   this "correct, terminating, and work 6 should remove". It is removed here:
   a ground instance application becomes one top-level binding of a record.
 * **Every dictionary at a call site is a name.** Not the projection of a
@@ -22,7 +22,7 @@ What that buys, in the order `plan.txt` asks for it:
   dictionary is a projection out of a record whose definition is right here, so
   it is replaced by a binding: `%inst.Ord.Int#lt`. That is the second half of
   the file (`_Devirtualizer`), it is what item 4's fast lowering needs before
-  it can inline an instance's `bind`, and on `tests/programs/dicts.tl` it takes
+  it can inline an instance's `bind`, and on `tests/programs/dicts.gob` it takes
   the dictionary projections from forty-five to six.
 * **And what nothing reaches is dropped.** Specialization only ever adds
   bindings; after it, most of what it copied from is unreachable, and so is
@@ -104,7 +104,7 @@ of one round of it, and would stay true if `ROUNDS` were raised.
 It is two rounds and not a genuine fixed point because the cap is what stands
 between this pass and the undecidability above, and "iterate until nothing
 changes" is a promise about a number this pass is not in a position to make.
-Two is what the measurement asks for: on `tests/programs/dicts.tl` a third
+Two is what the measurement asks for: on `tests/programs/dicts.gob` a third
 round changes nothing at all, and a second takes the dictionary projections
 from sixteen to fourteen and specializes four more methods.
 
@@ -143,7 +143,7 @@ from .types import (TApp, TCon, TFam, TFun, TTuple, TVar, Type, prune,
 # argument may be. Either limit stops the unrolling a polymorphically recursive
 # binding would otherwise ask for. The numbers are deliberately generous, but
 # "no program in the suite comes near them" -- which this said until it was
-# measured -- is false: `polyrec.tl` trips MAX_SPECIALIZATIONS on `Main#depth`,
+# measured -- is false: `polyrec.gob` trips MAX_SPECIALIZATIONS on `Main#depth`,
 # which is the whole point of that fixture. It is the only one in the suite that
 # does, so tripping one is still a signal rather than a routine event.
 MAX_SPECIALIZATIONS = 32

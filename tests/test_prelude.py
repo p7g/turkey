@@ -1,6 +1,6 @@
 """`Show`, `Option`, and iteration as a cursor.
 
-`iter.tl` is the golden that runs one of each. This file is what a golden
+`iter.gob` is the golden that runs one of each. This file is what a golden
 cannot show: that `print` is an ordinary constrained function rather than a
 builtin that happens to take a `String`, and that the `for` loop never asks a
 container how long it is -- which is the whole reason the protocol is a cursor

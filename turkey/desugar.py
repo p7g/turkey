@@ -743,7 +743,7 @@ def _fun(name: str, body: ast.Expr, span: Span) -> ast.Stmt:
     Not generalized (`FunDecl.monomorphic`). It has one use site -- the `call`
     that `_loop` builds beside it -- plus its own recursion, so there is
     nothing for a scheme to be used at more than one type, and generalizing it
-    is what made the loops in `question_control.tl` survive every pass.
+    is what made the loops in `question_control.gob` survive every pass.
 
     The helper answers with the enclosing block's `Flow`, and the arms above
     only ever build `Fall` and `Ret` at that type: a `Brk` becomes the

@@ -577,13 +577,13 @@ def test_a_second_round_reuses_the_first_rounds_copies():
     the answer the existing copy rather than a byte-identical second one under
     a disambiguated name -- which `fresh` would happily have supplied.
 
-    Against `dicts.tl` rather than `MULTIROUND`, because it has to be a program
+    Against `dicts.gob` rather than `MULTIROUND`, because it has to be a program
     big enough for the second round to re-ask at all: with a per-round memo
     this one grows five duplicate copies (`Data.Array#new@Int~2` and friends)
     and `MULTIROUND` grows none. A `~` in a name is `fresh` disambiguating a
     collision, and after this pass there should be nothing to collide with.
     """
-    path = Path(__file__).parent / "programs" / "dicts.tl"
+    path = Path(__file__).parent / "programs" / "dicts.gob"
     checked = check(path.read_text(), str(path))
     dups = [n for n in names(checked.mono) if "~" in n]
     assert not dups, f"round two duplicated round one's work: {dups}"
@@ -643,7 +643,7 @@ PROGRAMS_DIR = Path(__file__).parent / "programs"
 
 
 def _conformance_programs():
-    return sorted(path for path in PROGRAMS_DIR.glob("*.tl")
+    return sorted(path for path in PROGRAMS_DIR.glob("*.gob")
                   if not path.stem.startswith("err_"))
 
 
@@ -687,7 +687,7 @@ def test_the_layout_invariant_is_not_vacuous():
     """
     from turkey import mono
 
-    program = PROGRAMS_DIR / "dicts.tl"
+    program = PROGRAMS_DIR / "dicts.gob"
     checked = check(program.read_text(encoding="utf-8"), str(program),
                     [PROGRAMS_DIR])
 

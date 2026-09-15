@@ -1,10 +1,10 @@
-"""`boot/Turkey/Select.tl`: the low IR to arm64 (M28 phase 4).
+"""`boot/Turkey/Select.gob`: the low IR to arm64 (M28 phase 4).
 
 Until this file existed, selection was checked by a person running `boot asm`
 and reading the histogram. That is not a test, and it showed: a call with nine
 arguments panicked *inside the compiler* -- `argRegs` indexed at 8 -- and
 nothing would have caught it, because no corpus program had a function with
-more than eight parameters until `manyargs.tl` was added below.
+more than eight parameters until `manyargs.gob` was added below.
 
 Three things are asserted, and they are deliberately not "the output is this
 text". There is no oracle for arm64 the way `test_boot` has one for everything
@@ -44,7 +44,7 @@ PROGRAMS = REPO_ROOT / "tests" / "programs"
 
 # The corpus, minus the programs whose point is to fail to typecheck.
 CORPUS = sorted(
-    path.name for path in PROGRAMS.glob("*.tl")
+    path.name for path in PROGRAMS.glob("*.gob")
     if not path.name.startswith("err_")
 )
 
@@ -128,7 +128,7 @@ def test_the_corpus_selects_apart_from_the_known_gap():
         selected += got
         stopped += sum(_reasons(_asm(name)).values())
     assert selected > 1800, selected
-    # `manyargs.tl` is the only program with a function over the eight-argument
+    # `manyargs.gob` is the only program with a function over the eight-argument
     # limit, and it stops two: the recursive call and the one in `main`.
     assert stopped == 2, stopped
 
@@ -144,7 +144,7 @@ def test_a_nine_argument_call_is_reported_and_does_not_crash():
     inlines the call and folds it away, and the first attempt at this program
     selected every function and proved nothing.
     """
-    reasons = _reasons(_asm("manyargs.tl"))
+    reasons = _reasons(_asm("manyargs.gob"))
     assert reasons, "the nine-argument call was not reported at all"
     assert set(reasons) <= KNOWN_REASONS, sorted(reasons)
 
@@ -156,7 +156,7 @@ def test_turkey_symbols_are_quoted():
     every Turkey-derived symbol is quoted. The runtime's own C identifiers are
     quoted too -- one rule beats two and a test for which applies.
     """
-    text = _asm("adt.tl")
+    text = _asm("adt.gob")
     calls = [line.strip() for line in text.splitlines()
              if line.strip().startswith("bl ")]
     assert calls
@@ -166,13 +166,13 @@ def test_turkey_symbols_are_quoted():
 
 def test_a_double_lives_in_the_vector_file():
     """Float arithmetic selects to `f`-prefixed mnemonics, not integer ones."""
-    text = _asm("operators.tl")
+    text = _asm("operators.gob")
     assert "fadd " in text
     assert "fcmp " in text
 
 
 @pytest.mark.skipif(shutil.which("as") is None, reason="no assembler")
-@pytest.mark.parametrize("name", ["adt.tl", "operators.tl"])
+@pytest.mark.parametrize("name", ["adt.gob", "operators.gob"])
 def test_the_printed_instructions_assemble(name):
     """`as` as an instruction-by-instruction oracle.
 
@@ -209,6 +209,6 @@ def test_the_printed_instructions_assemble(name):
 
 
 def test_typed_record_stores_select_direct_memory_writes():
-    text = _asm("record_stores.tl")
+    text = _asm("record_stores.gob")
     assert "_turkey_object_set" not in text
     assert "str " in text

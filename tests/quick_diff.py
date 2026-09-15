@@ -12,10 +12,10 @@ import subprocess
 import sys
 
 FILES = [
-    "tests/programs/adt.tl",
-    "tests/programs/classes.tl",
-    "tests/programs/families.tl",
-    "tests/programs/question_control.tl",
+    "tests/programs/adt.gob",
+    "tests/programs/classes.gob",
+    "tests/programs/families.gob",
+    "tests/programs/question_control.gob",
 ]
 STAGES = sys.argv[1:] or ["desugar", "decls", "deps", "classes",
                           "types", "core"]
@@ -23,7 +23,7 @@ STAGES = sys.argv[1:] or ["desugar", "decls", "deps", "classes",
 failed = False
 for stage in STAGES:
     boot = subprocess.run(
-        ["python3", "-m", "turkey", "run", "boot/Main.tl", "--", stage, *FILES],
+        ["python3", "-m", "turkey", "run", "boot/Main.gob", "--", stage, *FILES],
         capture_output=True, text=True)
     if boot.returncode != 0:
         print(f"{stage}: boot exited {boot.returncode}\n{boot.stderr[-2000:]}")

@@ -79,14 +79,45 @@ typedef struct RootFrame {
 enum { HEAP_STRING = 1, HEAP_OBJECT = 2, HEAP_CELL = 3 };
 static HeapHeader *heap;
 static RootFrame *roots;
+#define FREE_CLASS_COUNT (sizeof(size_t) * 8)
+static HeapHeader *free_lists[FREE_CLASS_COUNT];
 static int64_t heap_count;
 static int64_t allocations_since_collection;
 static int64_t collection_threshold = 1024;
 static int64_t collection_count;
+static int64_t heap_system_allocations;
 static int gc_stress = -1;
 
 static void mark(void *value);
 static HeapHeader *header_of(void *value);
+static int cleanup_registered;
+
+static int allocation_class(size_t size, size_t *capacity) {
+    size_t rounded = 32;
+    size_t class_index = 0;
+    while (rounded < size) {
+        if (rounded > SIZE_MAX / 2 || class_index + 1 >= FREE_CLASS_COUNT)
+            return -1;
+        rounded *= 2;
+        class_index++;
+    }
+    *capacity = rounded;
+    return (int)class_index;
+}
+
+static void release_runtime_heap(void) {
+    while (heap != NULL) {
+        HeapHeader *next = heap->next;
+        free(heap);
+        heap = next;
+    }
+    for (size_t index = 0; index < FREE_CLASS_COUNT; ++index)
+        while (free_lists[index] != NULL) {
+            HeapHeader *next = free_lists[index]->next;
+            free(free_lists[index]);
+            free_lists[index] = next;
+        }
+}
 
 static HeapHeader *find_header(void *value) {
     for (HeapHeader *header = heap; header != NULL; header = header->next)
@@ -146,10 +177,29 @@ static void *heap_allocate(size_t size, uint32_t kind) {
     if (size > SIZE_MAX - sizeof(HeapHeader)) {
         turkey_panic("allocation is too large"); return NULL;
     }
-    HeapHeader *header = malloc(sizeof(HeapHeader) + size);
+    size_t capacity;
+    int class_index = allocation_class(size, &capacity);
+    if (class_index < 0 || capacity > SIZE_MAX - sizeof(HeapHeader)) {
+        turkey_panic("allocation is too large"); return NULL;
+    }
+    HeapHeader *header = free_lists[class_index];
+    if (header != NULL) {
+        free_lists[class_index] = header->next;
+    } else {
+        header = malloc(sizeof(HeapHeader) + capacity);
+        if (header != NULL) heap_system_allocations++;
+    }
     if (header == NULL) { turkey_panic("out of memory"); return NULL; }
+    if (!cleanup_registered) {
+        if (atexit(release_runtime_heap) != 0) {
+            free(header);
+            turkey_panic("could not register runtime cleanup");
+            return NULL;
+        }
+        cleanup_registered = 1;
+    }
     header->next = heap;
-    header->size = size;
+    header->size = capacity;
     header->kind = kind;
     header->marked = 0;
     heap = header;
@@ -244,7 +294,14 @@ void turkey_collect(void) {
         HeapHeader *header = *link;
         if (!header->marked) {
             *link = header->next;
-            free(header);
+            size_t capacity;
+            int class_index = allocation_class(header->size, &capacity);
+            if (class_index < 0 || capacity != header->size) {
+                turkey_panic("invalid heap allocation class");
+                return;
+            }
+            header->next = free_lists[class_index];
+            free_lists[class_index] = header;
             heap_count--;
         } else {
             header->marked = 0;
@@ -258,6 +315,9 @@ void turkey_collect(void) {
 
 int64_t turkey_heap_objects(void) { return heap_count; }
 int64_t turkey_collection_count(void) { return collection_count; }
+int64_t turkey_heap_system_allocation_count(void) {
+    return heap_system_allocations;
+}
 void turkey_gc_set_stress(int32_t enabled) { gc_stress = enabled != 0; }
 
 static void capture_panic_trace(void) {

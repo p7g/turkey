@@ -58,6 +58,7 @@ void turkey_root_leave(void *frame);
 void turkey_collect(void);
 int64_t turkey_heap_objects(void);
 int64_t turkey_collection_count(void);
+int64_t turkey_heap_system_allocation_count(void);
 void turkey_gc_set_stress(int32_t enabled);
 
 void turkey_panic(const char *message);

@@ -1457,6 +1457,7 @@ _RUNTIME_CALLS: dict[str, tuple[object, tuple]] = {
     "turkey_gc_set_stress": (None, (ctypes.c_int32,)),
     "turkey_heap_objects": (ctypes.c_int64, ()),
     "turkey_collection_count": (ctypes.c_int64, ()),
+    "turkey_heap_system_allocation_count": (ctypes.c_int64, ()),
 }
 _runtime_ir: str | None = None
 

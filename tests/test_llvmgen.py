@@ -415,6 +415,23 @@ fun main() {
     assert module.runtime.turkey_heap_objects() == 0
 
 
+def test_collected_objects_are_reused_without_returning_to_system_malloc():
+    checked = check("""
+fun main() {
+    var value = Some(0)
+    var i = 0
+    while i < 10000 {
+        value = Some(i)
+        i = i + 1
+    }
+}
+""")
+    module = compile(checked.opt, checked.decls, checked.main)
+    before = module.runtime.turkey_heap_system_allocation_count()
+    module.execute()
+    assert module.runtime.turkey_heap_system_allocation_count() - before < 2048
+
+
 def test_pointer_arrays_are_traced_under_gc_stress(monkeypatch, capfd):
     monkeypatch.setenv("TURKEY_GC_STRESS", "1")
     native("""

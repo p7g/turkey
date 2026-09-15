@@ -79,7 +79,7 @@ fun collect(s : String) -> Array Char {
 }
 
 fun main() {
-    let source = collect(hello)
+    let source = collect(bench)
     let (ops, _) = parse(source, 0)
     let tape = newTape()
     run(tape, ops)

@@ -97,10 +97,15 @@ class PCon(Pattern):
 
 @dataclass(eq=False)
 class PRecord(Pattern):
-    """`C { f = p, g }` -- the punning form `g` is expanded to `g = g` by the parser."""
+    """`C { f = p, g }` -- the punning form `g` is expanded to `g = g` by the parser.
+
+    `rest` is a trailing `..`: the pattern names only some fields, on purpose.
+    Without it every field must be named (SPEC-DELTAS 65).
+    """
 
     name: str
     fields: list[tuple[str, Pattern]]
+    rest: bool = False
 
 
 @dataclass(eq=False)

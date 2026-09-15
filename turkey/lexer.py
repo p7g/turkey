@@ -55,6 +55,9 @@ CAN_START = (
         "while", "for", "loop", "return", "break", "continue", "module",
         "import", "do",
         "IDENT", "CONID", "(", "[", "{", "-", "!",
+        # A record pattern's `..` on its own line (SPEC-DELTAS 65). Nothing
+        # continues an expression with `..`, so this cannot split one.
+        "..",
     }
 )
 

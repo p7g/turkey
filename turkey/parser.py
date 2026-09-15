@@ -319,7 +319,7 @@ class Parser:
         if not self.at("NEWLINE"):
             return False
         self.skip_newlines()
-        if not self.at("IDENT", "}"):
+        if not self.at("IDENT", "..", "}"):
             raise ParseError(
                 "a line break separates fields here, so this line must begin "
                 f"a field; found {self._describe(self.cur)}",
@@ -717,7 +717,19 @@ class Parser:
             self.advance()
             self.skip_newlines()
             fields: list[tuple[str, ast.Pattern]] = []
+            rest = False
             while not self.at("}"):
+                if self.eat(".."):
+                    # The rest, deliberately unnamed. Last, or it would not be
+                    # the rest.
+                    rest = True
+                    self.field_separator()
+                    if not self.at("}"):
+                        raise ParseError(
+                            "'..' must be the last thing in a record pattern",
+                            self.cur.span,
+                        )
+                    break
                 name = self.expect("IDENT", "a field name")
                 # Punning: `C { x }` binds `x` from field `x`.
                 sub = self.parse_pattern() if self.eat("=") else ast.PVar(name.span, name.text)
@@ -725,7 +737,7 @@ class Parser:
                 if not self.field_separator():
                     break
             self.expect("}")
-            return ast.PRecord(tok.span, tok.text, fields)
+            return ast.PRecord(tok.span, tok.text, fields, rest)
 
         args: list[ast.Pattern] = []
         if self.at("("):

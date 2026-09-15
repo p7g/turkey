@@ -127,6 +127,22 @@ Where the language forces a difference -- no exceptions, so speculation is a
 token scan rather than a caught failure -- the difference gets a comment saying
 which language rule forced it.
 
+## Taking a record apart
+
+A record pattern names every field or ends in `..` (SPEC-DELTAS 65), and which
+of the two a site writes is a statement about the site.
+
+A function whose contract is *every field of this node* -- a child enumerator,
+a map or rebuild, a substitution, a free-variable scan, a dump -- takes the node
+apart with a full pattern and no `..`, writing `field = _` for a field it has
+considered and does not need. Then a field added to the declaration is a
+compile error in exactly the functions that have to decide about it. Reading
+the same node by projection (`arm.body`) compiles on regardless, which is how a
+walker comes to skip a new child silently (FINDINGS 25).
+
+A function that reads a few fields on purpose -- an accessor, a diagnostic, a
+one-field test -- projects, or writes `..`.
+
 ## When something is awkward
 
 Write it down. `FINDINGS.md` at the repo root is the running list of what

@@ -256,10 +256,12 @@ stmt-no-block ::= "let" pat "=" expr
 pat          ::= IDENT                          -- variable binder
                | "_"                             -- wildcard
                | CONID pat*                      -- constructor (positional)
-               | CONID "{" field-pat (record-sep field-pat)* ","? "}"  -- constructor (record)
+               | CONID "{" field-pats "}"          -- constructor (record)
                | INT | FLOAT | STRING | CHAR    -- literal
                | "(" pat ("," pat)* ")"         -- tuple or grouping
                | pat ":" type-expr              -- annotated pattern
+field-pats   ::= field-pat (record-sep field-pat)* (record-sep "..")? ","?
+               | ".."                            -- (delta 65)
 field-pat    ::= IDENT "=" pat
                | IDENT                           -- punning: binds same-name variable
 ```
@@ -267,10 +269,12 @@ field-pat    ::= IDENT "=" pat
 **Either form matches either declaration.** A record variant is a positional
 variant plus a list of field names, so `Circle(r)` and `Circle { radius = r }`
 match the same value, exactly as `Circle(2)` and `Circle { radius = 2 }` both
-construct one (decision 28). The two forms differ in one respect only: the
-record form may name a subset of the fields, and the positional form may not --
-`R(x)` for a two-field `R` is an arity error, because a position is not
-self-describing the way a name is.
+construct one (decision 28). Both forms name every field: `R(x)` for a
+two-field `R` is an arity error, and `R { x = a }` is an error naming the field
+it leaves out. A record pattern that means to ignore the rest says so with a
+trailing `..` -- `R { x = a, .. }` -- so a field added to a declaration is an
+error at every site that takes the record apart without having opted out
+(SPEC-DELTAS 65). A positional `..`, `R(x, ..)`, is reserved.
 
 **A binding takes an irrefutable pattern.** `let`, `var`, a `fun` or lambda
 parameter, and the element of `for ... in` bind with no second arm to fall to,

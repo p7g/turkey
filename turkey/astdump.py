@@ -171,7 +171,7 @@ def _rules():
         w.kids(lambda: w.items(n.args))
 
     def precord(w: _Writer, n: ast.PRecord) -> None:
-        w.head("precord", n, quote(n.name))
+        w.head("precord", n, quote(n.name), _bool(n.rest))
         w.kids(lambda: w.pairs(n.fields))
 
     def plit(w: _Writer, n: ast.PLit) -> None:

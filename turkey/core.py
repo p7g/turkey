@@ -738,8 +738,10 @@ def _pattern(pat) -> str:
             return pat.name
         return f"{pat.name}({', '.join(_pattern(a) for a in pat.args)})"
     if isinstance(pat, ast.PRecord):
-        inner = ", ".join(f"{n} = {_pattern(p)}" for n, p in pat.fields)
-        return f"{pat.name} {{ {inner} }}"
+        parts = [f"{n} = {_pattern(p)}" for n, p in pat.fields]
+        if pat.rest:
+            parts.append("..")
+        return f"{pat.name} {{ {', '.join(parts)} }}"
     if isinstance(pat, ast.PTuple):
         return f"({', '.join(_pattern(p) for p in pat.elems)})"
     if isinstance(pat, ast.PAnnot):

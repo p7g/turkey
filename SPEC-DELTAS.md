@@ -2923,3 +2923,61 @@ line break separates fields here, so this line must begin a field; found '-'`.
 are where Go's rules get awkward -- the mandatory trailing comma before a `)` on
 its own line -- and nothing here asks for them. `record_newlines.gob` accepts all
 three forms; `err_record_newline.gob` pins the unary-minus error.
+
+### 65. A record pattern names every field, or ends in `..`
+
+A record pattern could name a subset, silently. `Node { name, children }`
+compiled against a three-field `Node`, so adding a field to a declaration
+changed nothing at any site that took the record apart -- which is the child-list
+finding (FINDINGS 25) from the other side: the sites that should have to decide
+about a new field went on compiling.
+
+**Every field is named, or the pattern ends in `..`.** `Node { name, .. }`
+ignores the rest on purpose; `Node { name, children }` for a three-field `Node`
+is `the pattern 'Node' does not mention field 'weight'; name it, or write '..'
+to ignore the rest`. A field that is deliberately unused but still considered is
+written `weight = _`. This is Rust's E0027 and Rust's spelling; OCaml has the
+same idea at lower intensity, warning 9, off by default, silenced with `{ x; _ }`.
+
+It also deletes the one respect in which design.md 3.6 said the record and
+positional forms differ. Both now name every field, and each has a way to say
+otherwise that the other lacks only because a positional `..` is not built yet.
+
+**Why `..` and not `_`.** `PROPOSALS.md` argued for OCaml's `_`, on two grounds:
+that `..` already means *all of them* in `import M (T(..))`, and that `_`
+already means "don't care". Both are weaker than they look.
+
+* **`_` means one value, and should keep meaning it.** `C(x, _)` ignores one
+  position. The record and positional forms are symmetric (delta 34), so a rest
+  marker will be wanted positionally too -- `C(x, ..)` -- and there `_` cannot
+  serve, because it already means exactly one. Rust keeps `_` and `..` apart for
+  this reason, and uses `..` for the rest of a struct, a tuple and a slice
+  alike.
+* **The two `..` are the same `..`.** In `T(..)` and in `P { x, .. }` the token
+  means *the remainder, unspelled*: one brings it into scope and one ignores it,
+  and neither lists it. OCaml's object types agree -- `< m : int; .. >` is "and
+  possibly more". The genuine misreading is Haskell's `C{..}`, RecordWildCards,
+  which *binds* every field; it is worth knowing about and not worth choosing a
+  worse token over.
+* **It leaves room.** `P { x = 1, ..p }` is the natural functional update, and
+  `_` has no counterpart there.
+* **The cost is a wash.** `..` was already a token in both lexers; `_` would
+  have been an `IDENT` special-cased in field position.
+
+Only `..` is accepted; an alias would put two spellings in every reader's path.
+
+**Where `..` goes, and where it deliberately does not.** The rule reaches only
+code that *destructures*. The Python compiler's walks are generic over dataclass
+fields and never had the hazard. The bootstrap's hand-written enumerators did,
+and they read record-shaped nodes by projection -- `ChArm(a) -> [ChExpr(a.body)]`
+-- which this rule cannot see: give `Arm` a guard and they still compile. So they
+were rewritten to destructure with full patterns, and `boot/STYLE.md` states the
+policy: no `..` in a function whose contract is every field of a node (children,
+maps, rebuilds, substitution, free variables, dumps), with unused fields written
+`field = _`; `..` where a site reads a few fields by intent.
+
+**What it cost.** The corpus had four record patterns, all in `records.gob`; two
+named a subset, and one of those stays a subset on purpose to show `..`. Adding
+`..` needed `..` in the newline rule's starting tokens, so the rest can sit on
+its own line; nothing continues an expression with `..`, so no expression can
+be split by it. `err_record_pattern_missing.gob` pins the error.

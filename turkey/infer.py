@@ -828,6 +828,19 @@ class Generator:
                     )
                 index = info.field_names.index(label)
                 self._merge(out, self.match_pattern(sub, con.params[index]), pat.span)
+            # A record pattern names every field or says it is not going to
+            # (SPEC-DELTAS 65), so a field added to the declaration is an error
+            # at every site that takes the record apart without saying so.
+            if not pat.rest:
+                named = {label for label, _ in pat.fields}
+                for field_name in info.field_names:
+                    if field_name not in named:
+                        raise TypeError_(
+                            f"the pattern '{pat.name}' does not mention field "
+                            f"'{field_name}'; name it, or write '..' to ignore "
+                            f"the rest",
+                            pat.span,
+                        )
             return out
         raise AssertionError(f"unhandled pattern {type(pat).__name__}")
 

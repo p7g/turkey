@@ -18,7 +18,7 @@ module Turkey.Ast (
     ImportDecl(..),
     Decl(..),
     Program(..),
-    patternVars, freshNodeId,
+    patternVars, freshNodeId, armBody, declBody,
     Child(..), children, exprChildren, stmtChildren,
 )
 
@@ -135,7 +135,9 @@ type PatKind
     | PCon(String, Array Pat)
     -- The punning form `C { x }` is expanded to `x = x` by the parser, so a
     -- field is always a pair.
-    | PRecord(String, Array (String, Pat))
+    -- The flag is a trailing `..`: the fields left unnamed are ignored on
+    -- purpose. Without it every field must be named (SPEC-DELTAS 65).
+    | PRecord(String, Array (String, Pat), Bool)
     | PLit(Lit)
     | PTuple(Array Pat)
     | PAnnot(Pat, Type)
@@ -362,7 +364,7 @@ fun collectPatternVars(p : Pat, out : Array String) -> Unit = match p.kind {
     PWild -> {}
     PLit(_) -> {}
     PCon(_, args) -> for a in args { collectPatternVars(a, out) }
-    PRecord(_, fields) -> for (_, sub) in fields { collectPatternVars(sub, out) }
+    PRecord(_, fields, _) -> for (_, sub) in fields { collectPatternVars(sub, out) }
     PTuple(elems) -> for e in elems { collectPatternVars(e, out) }
     PAnnot(inner, _) -> collectPatternVars(inner, out)
 }
@@ -384,8 +386,8 @@ type Child
 fun children(c : Child) -> Array Child = match c {
     ChExpr(e) -> exprChildren(e)
     ChStmt(s) -> stmtChildren(s)
-    ChArm(a) -> [ChExpr(a.body)]
-    ChFun(f) -> match f.body {
+    ChArm(a) -> [ChExpr(armBody(a))]
+    ChFun(f) -> match declBody(f) {
         Some(b) -> [ChExpr(b)]
         None -> Array.new(0)
     }
@@ -431,6 +433,23 @@ fun stmtChildren(s : Stmt) -> Array Child = match s.kind {
     SFun(d) -> [ChFun(d)]
     SAssign(target, value) -> [ChExpr(target), ChExpr(value)]
     SExpr(e) -> [ChExpr(e)]
+}
+
+-- The expression an arm holds, and the body a declaration holds. Each takes its
+-- record apart with a full pattern, so a field added to `Arm` or `FunDecl` is a
+-- compile error here -- in the one place the walkers ask -- rather than a child
+-- every walker skips in silence (FINDINGS 25, boot/STYLE.md, SPEC-DELTAS 65).
+fun armBody(a : Arm) -> Expr {
+    let Arm { span = _, patterns = _, body } = a
+    body
+}
+
+fun declBody(d : FunDecl) -> Option Expr {
+    let FunDecl {
+        id = _, span = _, name = _, params = _, ret = _, body, context = _,
+        monomorphic = _,
+    } = d
+    body
 }
 
 fun fieldChildren(fields : Array (String, Expr)) -> Array Child {

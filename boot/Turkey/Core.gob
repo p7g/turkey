@@ -2,7 +2,7 @@ module Turkey.Core (
     refName, refOf, isRef, refElem,
     Core(..), CoreKind(..), CParam(..), CAlt(..), CBind(..), CProgram(..),
     mkCore, tailParts, tailFieldNames,
-    Mapper(..), mapKind,
+    Mapper(..), mapKind, bindValue, altBody,
     namesOf, namesInto,
     dictName, classOfDict, dictClass, isDictionary,
     abstractionBinders, abstractionParameters, transparentParameters,
@@ -312,6 +312,22 @@ fun mapKind(k : CoreKind, m : Mapper) -> CoreKind = match k {
         Array.map(alts, fun(a) = CAlt { pat = a.pat, body = m.expr(a.body) }))
 }
 
+-- The term a binding holds, and the term an arm holds, each taken apart with a
+-- full pattern: a Core-valued field added to `CBind` or `CAlt` is then a compile
+-- error in the one place every child enumerator asks (boot/STYLE.md).
+fun bindValue(b : CBind) -> Core {
+    let CBind {
+        name = _, ty = _, binders = _, value, span = _, mutable = _, module_ = _,
+        equations = _, layouts = _,
+    } = b
+    value
+}
+
+fun altBody(a : CAlt) -> Core {
+    let CAlt { pat = _, body } = a
+    body
+}
+
 -- -- names --------------------------------------------------------------------------
 
 -- Every term name mentioned anywhere inside a term.
@@ -504,7 +520,7 @@ fun namesInto(e : Core, out : Set.Set String) -> Unit = match e.kind {
         namesInto(body, out)
     }
     CLetRec(binds, body) -> {
-        for b in binds { namesInto(b.value, out) }
+        for b in binds { namesInto(bindValue(b), out) }
         namesInto(body, out)
     }
     CJoin(_, _, body, rest, _) -> {
@@ -528,7 +544,7 @@ fun namesInto(e : Core, out : Set.Set String) -> Unit = match e.kind {
     }
     CMatch(scrutinee, alts) -> {
         namesInto(scrutinee, out)
-        for a in alts { namesInto(a.body, out) }
+        for a in alts { namesInto(altBody(a), out) }
     }
 }
 
@@ -775,11 +791,12 @@ fun showPattern(p : Pat) -> String = match p.kind {
     PCon(name, args) -> if len(args) == 0 { name } else {
         name + "(" + String.join(Array.map(args, showPattern), ", ") + ")"
     }
-    PRecord(name, fields) -> {
+    PRecord(name, fields, rest) -> {
         let inner = Array.map(fields, fun(f) = {
             let (label, sub) = f
             label + " = " + showPattern(sub)
         })
+        if rest { Array.push(inner, "..") }
         name + " { " + String.join(inner, ", ") + " }"
     }
     PTuple(elems) -> "(" + String.join(Array.map(elems, showPattern), ", ") + ")"

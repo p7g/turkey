@@ -175,7 +175,9 @@ pat-list     ::= pat ("," pat)*
 ```
 
 Comma-separated forms accept a trailing comma. In a multiline record payload,
-a significant newline is also a field separator, so commas are optional.
+a significant newline is also a field separator, so commas are optional -- and
+the same `record-sep` separates the fields of a record construction and a record
+pattern (SPEC-DELTAS 64).
 Parenthesized singleton tuples do not exist: `(x)` is grouping and `(x,)` is
 rejected.
 
@@ -218,7 +220,7 @@ expr-atom    ::= INT | FLOAT | STRING | CHAR
                | "(" expr ("," expr)* ")"       -- tuple (if >1) or grouping
                | "[" expr ("," expr)* "]"       -- array literal
                | "[]"                            -- empty array literal
-               | CONID "{" field-init ("," field-init)* "}"  -- record construction
+               | CONID "{" field-init (record-sep field-init)* ","? "}"  -- record construction
                | "fun" "(" pat-list? ")" fun-ret? fun-body   -- anonymous function
                | "if" if-cond ("," if-cond)* block ("else" (if-expr | block))?
                | "while" if-cond ("," if-cond)* block
@@ -254,7 +256,7 @@ stmt-no-block ::= "let" pat "=" expr
 pat          ::= IDENT                          -- variable binder
                | "_"                             -- wildcard
                | CONID pat*                      -- constructor (positional)
-               | CONID "{" field-pat ("," field-pat)* "}"  -- constructor (record)
+               | CONID "{" field-pat (record-sep field-pat)* ","? "}"  -- constructor (record)
                | INT | FLOAT | STRING | CHAR    -- literal
                | "(" pat ("," pat)* ")"         -- tuple or grouping
                | pat ":" type-expr              -- annotated pattern

@@ -302,6 +302,31 @@ class Parser:
             )
         return ast.ConDecl(tok.span, tok.text, args, None)
 
+    def field_separator(self) -> bool:
+        """Consume what separates two fields in braces, or answer False.
+
+        A comma, or a significant newline, or both (SPEC-DELTAS 64) -- in a
+        declaration, a construction and a pattern alike, since `record-sep` is
+        one production. The newline rule has already dropped every line break
+        that continues an expression, so one that survives to here ended the
+        field. What follows it must then be a field or the closing brace, and
+        the complaint says why the parser thought so: in `P { x = a` / `-b }`
+        the line break made `-b` a new field, not a continuation of `a`.
+        """
+        if self.eat(","):
+            self.skip_newlines()
+            return True
+        if not self.at("NEWLINE"):
+            return False
+        self.skip_newlines()
+        if not self.at("IDENT", "}"):
+            raise ParseError(
+                "a line break separates fields here, so this line must begin "
+                f"a field; found {self._describe(self.cur)}",
+                self.cur.span,
+            )
+        return True
+
     def parse_record_payload(self) -> list[tuple[str, ast.TypeExpr]]:
         self.expect("{")
         self.skip_newlines()
@@ -314,10 +339,8 @@ class Parser:
             seen.add(tok.text)
             self.expect(":")
             fields.append((tok.text, self.parse_type_expr()))
-            self.skip_newlines()
-            if not self.eat(","):
+            if not self.field_separator():
                 break
-            self.skip_newlines()
         self.expect("}")
         return fields
 
@@ -699,10 +722,8 @@ class Parser:
                 # Punning: `C { x }` binds `x` from field `x`.
                 sub = self.parse_pattern() if self.eat("=") else ast.PVar(name.span, name.text)
                 fields.append((name.text, sub))
-                self.skip_newlines()
-                if not self.eat(","):
+                if not self.field_separator():
                     break
-                self.skip_newlines()
             self.expect("}")
             return ast.PRecord(tok.span, tok.text, fields)
 
@@ -899,10 +920,8 @@ class Parser:
                     value = (self.parse_expr() if self.eat("=")
                              else ast.EVar(fname.span, fname.text))
                     fields.append((fname.text, value))
-                    self.skip_newlines()
-                    if not self.eat(","):
+                    if not self.field_separator():
                         break
-                    self.skip_newlines()
             self.expect("}")
             return ast.ERecord(tok.span, name, fields)
         return ast.ECon(tok.span, name)

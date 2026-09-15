@@ -2883,3 +2883,43 @@ warning channel here to lint with, and it is not wrong.
 
 **Scope.** `if_let.gob` accepts; `err_refutable_let.gob` and
 `err_refutable_param.gob` reject. No existing golden moved.
+
+### 64. A newline separates fields in a construction and a pattern too
+
+`design.md` 3.2 gave record declarations `record-sep ::= "," NEWLINE? |
+NEWLINE`, and construction and patterns a comma only. In fact neither
+implementation honoured the declaration rule either (FINDINGS 85): the parser
+skipped the newline and then demanded a comma. So
+
+```
+let p = P {
+    x = 1
+    y = 2
+}
+```
+
+was `expected '}', found IDENT 'y'`, and so was the declaration of `P` written
+the same way.
+
+**`record-sep` now separates the fields of all three.** One helper decides it
+for the declaration, the construction and the pattern: a comma with optional
+newlines after it, or a significant newline alone.
+
+**Why a continuation line is not misread.** Field punning makes a bare `IDENT`
+a whole field, so the question is whether a line that continues an expression
+could be taken for a new field. It cannot. Section 2.4 keeps a newline only if
+the token before it can end a production *and* the token after can start one,
+so `x = 1 +` / `2` has no newline to separate on, and neither does a line
+beginning with `.` or a binary operator. No expression continues with a bare
+`IDENT`.
+
+The one live case is unary minus. In `P { x = a` / `-b }` the newline is
+significant -- `a` can end a production and `-` can start one -- so `-b` is a
+new field, and it is not a valid one. That is a parse error rather than a silent
+misparse, which is the right outcome; the error says what the newline did: `a
+line break separates fields here, so this line must begin a field; found '-'`.
+
+**Scope.** Brace-delimited field lists only. Newline-separated call arguments
+are where Go's rules get awkward -- the mandatory trailing comma before a `)` on
+its own line -- and nothing here asks for them. `record_newlines.gob` accepts all
+three forms; `err_record_newline.gob` pins the unary-minus error.

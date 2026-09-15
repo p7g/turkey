@@ -2316,6 +2316,20 @@ native execution and GC stress. The suite ran against an isolated copy of
 `c63d765` plus this cleanup because unrelated type-system work was changing
 in the shared workspace. The focused native/selection/SSA run passed 235 tests.
 
+### 85. The grammar had newline separators in declarations, and the parser did not
+**bug, fixed.** SPEC-DELTAS 64. `design.md` 3.2 gives `record-sep ::= "," NEWLINE?
+| NEWLINE`, and 3.3 says in prose that "in a multiline record payload, a
+significant newline is also a field separator, so commas are optional". Neither
+implementation ever did it: `parse_record_payload` skipped the newline and then
+required a comma, and `boot` ported the loop faithfully. A proposal to extend
+the feature to constructions and patterns took the spec's word for it, and only
+running the compiler on the claim showed there was nothing to extend.
+
+Nothing noticed because nothing in the corpus wrote it: every multi-line record
+declaration in `boot` has its commas. A grammar production with no program
+exercising it is a sentence, not a feature, and the differential cannot tell
+the two apart -- both implementations agreed, byte for byte, on rejecting it.
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

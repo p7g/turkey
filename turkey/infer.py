@@ -132,6 +132,10 @@ class Generator:
         # Recorded after the expression is generated, in both implementations,
         # so the first error reported is the same on either side.
         self.discard_sites: list[ast.Expr] = []
+        # What a partially annotated `fun`'s header wrote, by declaration: its
+        # variables and its context, for the solver to hold it to (SPEC-DELTAS
+        # 67). Keyed by identity, as the boot side keys by node id.
+        self.partial_headers: dict[int, tuple[dict[str, TVar], list[Pred]]] = {}
 
     # -- building ----------------------------------------------------------
 
@@ -651,7 +655,13 @@ class Generator:
                         item.decl.dicts = dicts
                 else:
                     item.dicts = dicts
-            node = CLet(binds, defn, body, group[0].span, top_level, dicts)
+            rigid = [
+                (item.decl.name, item.decl.span, *self.partial_headers[id(item.decl)])
+                for item in group
+                if isinstance(item, ast.SFun) and id(item.decl) in self.partial_headers
+            ]
+            node = CLet(binds, defn, body, group[0].span, top_level, dicts,
+                        rigid=rigid)
         else:
             # No generalization means no new rank, so the definition is solved
             # right here and only the names are scoped. Nothing needs its rank
@@ -733,14 +743,16 @@ class Generator:
         for decl, scheme, tyvars in checks:
             self.emit(self.check_signature(decl, scheme, tyvars))
         for decl, (_, placeholder) in zip(inferred, binds):
-            self.eq(placeholder, self.gen_function(decl), decl.span)
+            self.eq(placeholder, self.gen_function(decl, record_header=True),
+                    decl.span)
         inner = self.pop()
         self.scopes.pop()
         self.emit(CDef(binds, inner))
         return binds, self.pop(), sigs
 
     def gen_function(
-        self, decl: ast.FunDecl | ast.ELambda, rigid: dict[str, Type] | None = None
+        self, decl: ast.FunDecl | ast.ELambda, rigid: dict[str, Type] | None = None,
+        record_header: bool = False,
     ) -> TFun:
         """A function's own constraint. Parameters bind monomorphically.
 
@@ -780,10 +792,19 @@ class Generator:
         # (`check_signature`), so re-emitting it here would demand of the body
         # exactly what the caller has been made to promise.
         if rigid is None:
-            for pred in self.classes.resolve_context(
+            written = self.classes.resolve_context(
                 getattr(decl, "context", []), self.tyvar_scopes[-1], self.fresh
-            ):
+            )
+            for pred in written:
                 self.emit(CPred(pred, decl.span, "read"))
+            # The header has been read and the body has not, so the scope holds
+            # exactly the variables the header wrote. An inferred `fun` that
+            # wrote some is a partial annotation, held to them at its binder.
+            if record_header:
+                header = {n: v for n, v in self.tyvar_scopes[-1].items()
+                          if isinstance(v, TVar)}
+                if header:
+                    self.partial_headers[id(decl)] = (header, written)
 
         # Parameters are reassignable (`fun gcd(a, b) { a = b ... }`). `CDef`
         # binds them monomorphically, so the value restriction that makes a

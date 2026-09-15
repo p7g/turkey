@@ -422,6 +422,13 @@ A `fun` that calls itself is an SCC of size 1.
 
 Wherever a type annotation appears (expression `e : τ`, parameter pattern `pat : τ`, return type `-> τ`), the inferred type is unified with `τ` before generalization. Annotations never cause generalization themselves; they only constrain.
 
+A `fun` that annotates only part of its type is held to what it wrote
+(SPEC-DELTAS 67): every type variable its header writes is still "any type".
+The body is inferred, and when the binding generalizes each such variable must
+still be a variable, distinct from the header's others, quantified by that
+binding, and constrained only by the header's context. Otherwise the error is
+reported at the declaration.
+
 ### 5.4 Elaboration: the typed Core (SPEC-DELTAS.md 48, 49)
 
 Inference does not only decide types. It decides which instance every class predicate is discharged by, and a program cannot run without that answer. The result is a **typed Core**: the same term language with three things made explicit that the surface language leaves implicit.

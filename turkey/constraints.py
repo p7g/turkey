@@ -201,6 +201,11 @@ class CLet(Constraint):
     #: are the solver's business at all: this is the one place that knows how
     #: deep the definition sits, so this is where they can be stamped.
     skolems: list[TCon] = field(default_factory=list)
+    #: The partial annotations in the group (SPEC-DELTAS 67): for each member
+    #: that writes a type but not a whole one, its name, span, the variables
+    #: its header wrote, and the context it wrote. Checked for rigidity when
+    #: the group generalizes, since that is when "any type" can be decided.
+    rigid: list[tuple] = field(default_factory=list)
 
 
 @dataclass
@@ -548,6 +553,7 @@ class Solver:
         # for the same reason: an equation and a predicate are both waiting on
         # the same variables.
         self.discharge_pool(self.pools.pop())
+        self.check_rigid(c, retained)
 
         # The class predicates are shared across the group, and the dictionary
         # parameters with them. One member's body may call another's, so a
@@ -610,6 +616,49 @@ class Solver:
                 if c.top_level:
                     self.top_level.define(name, binding)
             self.solve(c.body)
+
+    def check_rigid(self, c: CLet, retained: list[CPred]) -> None:
+        """A partial annotation is an assertion too (SPEC-DELTAS 67).
+
+        A variable a `fun`'s header writes promises *any type*, whether or not
+        the rest of the header is written. Delta 38 made that promise binding
+        for a complete annotation by checking against skolems; for a partial
+        one the body is still inferred, so the promise is checked here, where
+        the group is about to generalize: each variable must still be a
+        variable, distinct from the header's others, about to be quantified by
+        this binder, and constrained only by what the header's context wrote.
+        Blame goes to the declaration, which is where the claim was written.
+        """
+        for name, span, header, written in c.rigid:
+            seen: dict[int, str] = {}
+            for var_name in sorted(header):
+                t = prune(header[var_name])
+                if not isinstance(t, TVar):
+                    raise TypeError_(
+                        f"the annotation on '{name}' says '{var_name}' is any "
+                        f"type, but its body makes it '{show(t)}'", span)
+                if t.id in seen:
+                    raise TypeError_(
+                        f"the annotation on '{name}' says '{seen[t.id]}' and "
+                        f"'{var_name}' are separate types, but its body makes "
+                        f"them the same", span)
+                seen[t.id] = var_name
+                if t.level <= self.rank:
+                    raise TypeError_(
+                        f"the annotation on '{name}' says '{var_name}' is any "
+                        f"type, but its body ties it to a type from outside "
+                        f"'{name}'", span)
+            allowed = {_pred_key(q) for p in written
+                       for q in self.classes.by_super(p)}
+            for cp in retained:
+                if not any(v.id in seen for v in vars_of(*cp.pred.args)):
+                    continue
+                if _pred_key(cp.pred) in allowed:
+                    continue
+                raise TypeError_(
+                    f"the body of '{name}' needs '{show_pred(cp.pred, seen)}', "
+                    f"which the context its annotation writes does not state; "
+                    f"add it, or complete the signature", span)
 
     def split(self, types: list[Type]) -> list[CPred]:
         """The predicates the schemes about to be built will carry.
@@ -1109,6 +1158,10 @@ def reach(preds: list[CPred], types: list[Type]) -> set[int]:
                         ids.add(v.id)
                         changed = True
     return ids
+
+
+def _pred_key(p: Pred) -> tuple:
+    return (p.name, tuple(type_key(a) for a in p.args))
 
 
 def _constrain(preds: list[CPred], t: Type) -> list[Pred]:

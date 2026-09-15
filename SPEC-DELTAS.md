@@ -1131,7 +1131,7 @@ than a letter `show` invented.
 untouched -- a signature's dictionary parameters are its class predicates in
 scheme order, which is the order a use site instantiates in.
 
-**Still open, deliberately.** Delta 13's own example is *not* repaired: `fun
+**Still open, deliberately** -- and closed since, by delta 67. Delta 13's own example is *not* repaired: `fun
 f(x) -> a { 5 }` has an unannotated parameter, so it is not a signature and
 stays on the soft path. Closing that needs a body's inferred predicates
 re-abstracted over the skolems a partial annotation fixed, which is a different
@@ -3033,3 +3033,72 @@ which is a small argument for measuring with the thing being built.
 
 **Scope.** `discards.gob` accepts the exemptions; `err_discarded_value.gob`
 rejects. No existing golden moved.
+
+### 67. A partial annotation is an assertion too
+
+Delta 38 made a *complete* annotation a claim the body has to keep, and left
+one parameter short of complete exactly as it was. `fun f(x) -> a { 5 }`
+type-checked, with `a` unified away to a number, and `fun count(xs : a, n) ->
+Int` quietly became `fun(String, Int) -> Int` when its recursive call passed a
+string. The delta called the repair "a different and larger change", because a
+body's inferred predicates would have to be re-abstracted over skolems.
+
+**Every type variable a `fun`'s header writes now means any type**, whether or
+not the rest of the header is written. An unannotated parameter is still
+inferred; what was written is held to.
+
+**How others answered.** Haskell annotations are always rigid, and partial ones
+need `PartialTypeSignatures`, explicit `_` holes and a report of what each hole
+became. Rust's signatures are mandatory; Scala, Kotlin and TypeScript check an
+annotation as a bound and never rewrite it. Only OCaml behaves the way Turkey
+did -- `let f (x : 'a) = 5` unifies `'a` away, and rigidity needs an explicit
+`'a.` -- and that is regarded as a wart rather than a model.
+
+**Not by skolemizing.** `PROPOSALS.md` suggested the cheap half of delta 38's
+repair: skolemize the variables a partial annotation writes, as `check_method`
+does, and reject any inferred predicate on them. That does not work as stated.
+A partial annotation takes the inference path, and there `generalize`
+quantifies only unification variables. A skolem is a constructor, so it would
+stay in the scheme as a constant, and `fun h(x) -> a` would be callable only at
+a rigid `a` no caller can name. Making it work needs inverting the skolems in
+the scheme, a skolem map for the lowering, and one dictionary abstraction
+merging written givens with inferred retained predicates -- the whole of the
+larger change, not half of it.
+
+**Checked at generalization instead.** Nothing about inference, elaboration or
+Core changes. The generator records the variables a header wrote, and the
+context it wrote, for each partially annotated member of a binding group; the
+group's `CLet` carries them; and `Solver._let`, once the definition is solved
+and the pool discharged, checks four things, in written-name order:
+
+1. each variable is still a variable -- `the annotation on 'count' says 'a' is
+   any type, but its body makes it 'String'`;
+2. no two are the same variable -- `says 'a' and 'b' are separate types, but
+   its body makes them the same`;
+3. each is about to be quantified by this binder, by the same level test
+   `generalize` uses, so none was tied to something older -- delta 40's `cell`,
+   one annotation short: `its body ties it to a type from outside 'keep'`;
+4. every retained predicate that mentions one is entailed by the written
+   context and its superclasses -- `the body of 'describe' needs 'Show a', which
+   the context its annotation writes does not state; add it, or complete the
+   signature`. Delta 13's `fun f(x) -> a { 5 }` fails here, on `OneOf a`.
+
+The error is reported at the declaration, which is where the claim was written.
+That is the part of the complaint the old behaviour got most wrong: when an
+error came at all, it came at some later use, far from the annotation that had
+been rewritten.
+
+**What it does not do.** Polymorphic recursion still needs a complete
+signature: a partial annotation has no scheme for a recursive call to
+instantiate, so the call is checked against the monomorphic placeholder and rule
+1 reports what it made the variable. A lambda's annotation is untouched, since
+a lambda does not generalize and so has nothing to be "any type" over. And
+this is not a soundness fix -- type safety was fine before. What was broken was
+that an annotation did not mean what it said.
+
+`PROPOSALS.md` also claimed this would repair delta 38's `g`. It would not need
+to: `g`'s annotation is complete, and delta 38 already repaired it.
+
+**What it cost.** Nothing in the corpus: no binding in `boot`, the library or
+the test programs was rejected. `partial_signatures.gob` accepts; the four
+rules each have an `err_partial_sig_*.gob`.

@@ -129,6 +129,10 @@ type LetCell = LetCell {
     -- ranks are the solver's business at all: this is the one place that knows
     -- how deep the definition sits, so this is where they can be stamped.
     skolems  : Array ConCell,
+    -- The partial annotations in the group (SPEC-DELTAS 67): each member's
+    -- name, span, the variables its header wrote and the context it wrote,
+    -- checked for rigidity when the group generalizes.
+    rigid    : Array (String, Span, Array (String, Ty.Type), Array Ty.Pred),
 }
 
 -- -- the environment ---------------------------------------------------------------
@@ -457,6 +461,7 @@ fun letBody(s : Solver, c : LetCell) -> Unit {
         Some(young) -> dischargePool(s, young)
         None -> {}
     }
+    checkRigid(s, c, retainedPreds)
 
     -- The class predicates are shared across the group, and the dictionary
     -- parameters with them. One member's body may call another's, so a per-name
@@ -535,6 +540,62 @@ fun letBody(s : Solver, c : LetCell) -> Unit {
     solve(s, c.body)
     s.env = saved
 }
+
+-- A partial annotation is an assertion too (SPEC-DELTAS 67): each variable its
+-- header wrote must still be a variable, distinct from the header's others,
+-- about to be quantified by this binder, and constrained only by the context
+-- the header wrote. See `Solver.check_rigid` in `turkey/constraints.py`.
+fun checkRigid(s : Solver, c : LetCell, retainedPreds : Array PredCell) -> Unit {
+    for (qualified, where, header, written) in c.rigid {
+        -- Blamed as the author wrote it, as Python's messages are once printed.
+        let name = Ty.shortName(qualified)
+        let varNames = Array.new(len(header))
+        for (n, _) in header { Array.push(varNames, n) }
+        let seen = Ty.namer("")
+        for varName in Array.sort(varNames) {
+            var t = Ty.tUnit()
+            for (n, v) in header { if n == varName { t = v } }
+            match Ty.prune(t) {
+                TVar(cell) -> {
+                    match Map.get(seen.names, cell.id) {
+                        Some(other) -> oops("the annotation on '" + name + "' says '"
+                            + other + "' and '" + varName + "' are separate types, "
+                            + "but its body makes them the same", Some(where))
+                        None -> {}
+                    }
+                    Map.put(seen.names, cell.id, varName)
+                    if cell.level <= rank(s) {
+                        oops("the annotation on '" + name + "' says '" + varName
+                             + "' is any type, but its body ties it to a type from "
+                             + "outside '" + name + "'", Some(where))
+                    }
+                }
+                other -> oops("the annotation on '" + name + "' says '" + varName
+                              + "' is any type, but its body makes it '"
+                              + Ty.show(other) + "'", Some(where))
+            }
+        }
+        let allowed = Set.new()
+        for p in written {
+            for q in Classes.bySuper(s.classes, p) { Set.add(allowed, predKey(q)) }
+        }
+        for cp in retainedPreds {
+            var touches = False
+            for v in Ty.varsOf(cp.pred.args) {
+                if Map.contains(seen.names, v.id) { touches = True }
+            }
+            if touches && !Set.contains(allowed, predKey(cp.pred)) {
+                oops("the body of '" + name + "' needs '"
+                     + Ty.showPredWith(cp.pred, seen) + "', which the context its "
+                     + "annotation writes does not state; add it, or complete the "
+                     + "signature", Some(where))
+            }
+        }
+    }
+}
+
+fun predKey(p : Ty.Pred) -> String =
+    p.name + "(" + String.join(Array.map(p.args, Ty.typeKey), ",") + ")"
 
 -- Python asks `any(s is scope for s in use.scopes)`. There is no identity to
 -- compare here, so a scope carries one.

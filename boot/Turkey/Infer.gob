@@ -118,6 +118,9 @@ type Generator = Generator {
     -- And every expression whose value is thrown away (SPEC-DELTAS 66),
     -- recorded after it is generated, as `turkey/infer.py` does.
     discardSites : Array Expr,
+    -- What a partially annotated `fun`'s header wrote, by declaration id: its
+    -- variables and its context (SPEC-DELTAS 67).
+    partialHeaders : Map Int (Array (String, Ty.Type), Array Ty.Pred),
 }
 
 fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
@@ -130,6 +133,7 @@ fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
         loopStack = Array.new(4), tyvarScopes = [Map.new()],
         warnings = Array.new(4), matchSites = Array.new(8),
         binderSites = Array.new(8), discardSites = Array.new(8),
+        partialHeaders = Map.new(),
     }
 }
 
@@ -505,7 +509,7 @@ fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
     }
     push(g)
     let inferred = genFunction(g, decl.params, decl.ret, decl.body, decl.span,
-                               decl.context, None)
+                               decl.context, None, -1)
     eq(g, inferred, expected, Some(decl.span),
        "the type class '" + m.cls + "' declares for '" + m.name + "'")
     let defn = pop(g)
@@ -516,7 +520,7 @@ fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
     emit(g, CAssume(givens, CLet(LetCell {
         binds = [("%" + what + "." + m.name, expected)], defn = defn,
         body = CAnd(Array.new(0)), span = Some(decl.span), topLevel = False,
-        dicts = None, skolems = sk.made,
+        dicts = None, skolems = sk.made, rigid = Array.new(0),
     })))
     -- Only the constants this scope actually *made*. The mapping also holds the
     -- class variable, whose entry is the instance head rather than a skolem, and
@@ -663,14 +667,14 @@ fun checkSignature(g : Generator, decl : FunDecl, s : Scheme,
 
     push(g)
     let inferred = genFunction(g, decl.params, decl.ret, decl.body, decl.span,
-                               decl.context, Some(rigid))
+                               decl.context, Some(rigid), -1)
     eq(g, inferred, expected, Some(decl.span),
        "the declared type of '" + decl.name + "'")
     let defn = pop(g)
     CAssume(givens, CLet(LetCell {
         binds = [("%sig." + decl.name, expected)], defn = defn,
         body = CAnd(Array.new(0)), span = Some(decl.span), topLevel = False,
-        dicts = None, skolems = sk.made,
+        dicts = None, skolems = sk.made, rigid = Array.new(0),
     }))
 }
 
@@ -837,9 +841,23 @@ fun bindGroup(g : Generator, group : Array Stmt, rest : fun() -> a,
                 _ -> Map.put(g.types.abstractions, item.id, dicts)
             }
         }
+        -- The partial annotations among the group's members, for the solver
+        -- to hold to their headers when it generalizes (SPEC-DELTAS 67).
+        let rigid = Array.new(0)
+        for item in group {
+            match item.kind {
+                SFun(d) -> match Map.get(g.partialHeaders, d.id) {
+                    Some((header, written)) ->
+                        Array.push(rigid, (d.name, d.span, header, written))
+                    None -> {}
+                }
+                _ -> {}
+            }
+        }
         node = CLet(LetCell {
             binds = binds, defn = defn, body = body, span = Some(group[0].span),
             topLevel = top, dicts = Some(dicts), skolems = Array.new(0),
+            rigid = rigid,
         })
     } else {
         -- No generalization means no new rank, so the definition is solved right
@@ -946,7 +964,7 @@ fun buildFunGroup(g : Generator, decls : Array FunDecl)
         let (_, placeholder) = binds[i]
         eq(g, placeholder,
            genFunction(g, decl.params, decl.ret, decl.body, decl.span,
-                       decl.context, None),
+                       decl.context, None, decl.id),
            Some(decl.span), "")
     }
     let inner = pop(g)
@@ -965,9 +983,11 @@ fun buildFunGroup(g : Generator, decls : Array FunDecl)
 -- quantifies to a skolem constant, so every annotation in the body reads the
 -- *same* rigid type the signature promised -- and, since the context is then a
 -- fact rather than an obligation, it is not emitted here.
+-- `key` is the declaration's id when the caller wants a partial annotation's
+-- header recorded (an inferred member of a binding group), and -1 otherwise.
 fun genFunction(g : Generator, params : Array Pat, retAnnot : Option Type,
                 bodyExpr : Option Expr, where : Span, context : Array Ast.Pred,
-                rigid : Option (Map String Ty.Type)) -> Ty.Type {
+                rigid : Option (Map String Ty.Type), key : Int) -> Ty.Type {
     let scope = Map.new()
     match rigid {
         Some(r) -> for (n, t) in Map.entries(r) { Map.put(scope, n, t) }
@@ -999,10 +1019,22 @@ fun genFunction(g : Generator, params : Array Pat, retAnnot : Option Type,
     -- already become a given, so re-emitting it would demand of the body exactly
     -- what the caller has been made to promise.
     match rigid {
-        None -> for p in Classes.resolveContext(g.classes, context,
-                    g.tyvarScopes[len(g.tyvarScopes) - 1],
-                    Some(fun() = freshCell(g))) {
-            emit(g, C.cpredOf(p, Some(where), "read"))
+        None -> {
+            let written = Classes.resolveContext(g.classes, context,
+                g.tyvarScopes[len(g.tyvarScopes) - 1], Some(fun() = freshCell(g)))
+            for p in written { emit(g, C.cpredOf(p, Some(where), "read")) }
+            -- The header has been read and the body has not, so the scope holds
+            -- exactly the variables the header wrote.
+            if key >= 0 {
+                let header = Array.new(4)
+                for (n, t) in Map.entries(g.tyvarScopes[len(g.tyvarScopes) - 1]) {
+                    match t {
+                        TVar(_) -> Array.push(header, (n, t))
+                        _ -> {}
+                    }
+                }
+                if len(header) > 0 { Map.put(g.partialHeaders, key, (header, written)) }
+            }
         }
         Some(_) -> {}
     }
@@ -1302,7 +1334,7 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
     }
     ERecord(conName, fields) -> genRecord(g, e, conName, fields)
     ELambda(params, ret, body) ->
-        genFunction(g, params, ret, Some(body), e.span, Array.new(0), None)
+        genFunction(g, params, ret, Some(body), e.span, Array.new(0), None, -1)
     ECall(fn, args) -> {
         let fnType = genExpr(g, fn)
         let argTypes = Array.map(args, fun(a) = genExpr(g, a))

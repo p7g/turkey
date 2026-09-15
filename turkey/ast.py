@@ -473,6 +473,11 @@ class ConDecl(Node):
     name: str
     args: list[TypeExpr] = field(default_factory=list)
     fields: list[tuple[str, TypeExpr]] | None = None
+    # An existential constructor's bracket (SPEC-DELTAS 68), as written: the
+    # bare variables it binds unconstrained, and its class predicates, whose
+    # variables it binds too. Which variables are hidden is `decls`'s to say.
+    binders: list[str] = field(default_factory=list)
+    context: list[ClassPred] = field(default_factory=list)
 
     @property
     def is_record(self) -> bool:

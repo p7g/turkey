@@ -407,12 +407,47 @@ fun parseDataRhs(p : P, s : Span, name : String, params : Array String) -> TypeD
     TypeDecl { span = s, name = name, params = params, variants = Some(variants), alias = None }
 }
 
+-- `[s, Error e]` -- the variables an existential constructor hides. Read like a
+-- `fun`'s context, with a bare variable as one more form and an equality
+-- refused (SPEC-DELTAS 68).
+fun parseConContext(p : P) -> (Array String, Array Pred) {
+    let binders = Array.new(1)
+    let preds = Array.new(1)
+    if !at(p, "[") { return (binders, preds) }
+    step(p)
+    loop {
+        let s = cur(p).span
+        let written = parseTypeExpr(p)
+        if at(p, "~") {
+            oops(p, "a constructor's bracket may not state an equality", s)
+        }
+        match written.kind {
+            TEVar(name) -> Array.push(binders, name)
+            TECon(name, args) -> {
+                if len(args) != 1 { oops(p, conContextShape, s) }
+                Array.push(preds, Pred { span = s, kind = PClass(name, args[0]) })
+            }
+            _ -> oops(p, conContextShape, s)
+        }
+        if !eat(p, ",") { break }
+        if at(p, "]") { break }
+    }
+    skipToken(p, "]")
+    (binders, preds)
+}
+
+let conContextShape =
+    "a constructor's bracket holds type variables, as in 's', and classes "
+    + "applied to one type, as in 'Error e'"
+
 fun parseConDecl(p : P) -> ConDecl {
     let tok = expectWhat(p, "CONID", "a constructor name")
+    let (binders, context) = parseConContext(p)
     if at(p, "{") {
         return ConDecl {
             span = tok.span, name = text(tok), args = Array.new(0),
             fields = Some(parseRecordPayload(p)),
+            binders = binders, context = context,
         }
     }
     let args = Array.new(2)
@@ -429,7 +464,10 @@ fun parseConDecl(p : P) -> ConDecl {
         oops(p, "constructor '" + text(tok) + "' must parenthesize its payload: write '"
                 + text(tok) + "(...)'", cur(p).span)
     }
-    ConDecl { span = tok.span, name = text(tok), args = args, fields = None }
+    ConDecl {
+        span = tok.span, name = text(tok), args = args, fields = None,
+        binders = binders, context = context,
+    }
 }
 
 -- What separates two fields in braces: a comma, a significant newline, or both

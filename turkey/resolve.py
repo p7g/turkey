@@ -141,6 +141,7 @@ class Resolver:
                     self.type_expr(decl.alias)
                 for variant in decl.variants or []:
                     variant.name = self.con(variant.name)
+                    self.context(variant.context)
                     for arg in variant.args:
                         self.type_expr(arg)
                     for _label, te in variant.fields or []:

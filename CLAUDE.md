@@ -69,3 +69,4 @@ FINDINGS 43.
 * `LINKER.md` -- what producing an executable without `cc` would cost.
 * `RUNTIME-IN-TURKEY.md` -- what replacing the C runtime would cost.
 * `CORE-OPT.md` -- optimizations on Core, and where the line to the backend is.
+* `STDLIB.md` -- what the standard library needs, and how it is named.

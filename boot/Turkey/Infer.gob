@@ -121,6 +121,10 @@ type Generator = Generator {
     -- What a partially annotated `fun`'s header wrote, by declaration id: its
     -- variables and its context (SPEC-DELTAS 67).
     partialHeaders : Map Int (Array (String, Ty.Type), Array Ty.Pred),
+    -- What the patterns being matched have opened (SPEC-DELTAS 68): one list
+    -- per `match` arm or function whose patterns may open an existential, and
+    -- `None` for a binding that may not.
+    openings : Array (Option (Array (Array (String, Pred), Array ConCell))),
 }
 
 fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
@@ -133,7 +137,7 @@ fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
         loopStack = Array.new(4), tyvarScopes = [Map.new()],
         warnings = Array.new(4), matchSites = Array.new(8),
         binderSites = Array.new(8), discardSites = Array.new(8),
-        partialHeaders = Map.new(),
+        partialHeaders = Map.new(), openings = Array.new(4),
     }
 }
 
@@ -915,7 +919,9 @@ fun letDefinition(g : Generator, stmt : Stmt, pat : Pat, value : Expr,
                                     Bool, Array (String, Scheme)) {
     push(g)
     let t = genExpr(g, value)
+    Array.push(g.openings, None)
     let bound = matchPattern(g, pat, t)
+    discard(Array.pop(g.openings))
     Array.push(g.binderSites, (pat, t))
     let binds = Array.new(4)
     for (n, ty) in Map.entries(bound) { Array.push(binds, (n, ty)) }
@@ -998,12 +1004,14 @@ fun genFunction(g : Generator, params : Array Pat, retAnnot : Option Type,
 
     let paramTypes = Array.new(len(params))
     let binds = Map.new()
+    Array.push(g.openings, Some(Array.new(2)))
     for param in params {
         let tv = fresh(g)
         mergeInto(binds, matchPattern(g, param, tv), param.span)
         Array.push(g.binderSites, (param, tv))
         Array.push(paramTypes, tv)
     }
+    let openings = popOpenings(g)
 
     let ret = fresh(g)
     match retAnnot {
@@ -1064,7 +1072,15 @@ fun genFunction(g : Generator, params : Array Pat, retAnnot : Option Type,
 
     let bindList = Array.new(4)
     for (n, t) in Map.entries(binds) { Array.push(bindList, (n, t)) }
-    emit(g, CDef(bindList, inner, False))
+    -- A parameter that opened an existential scopes its rigid constants over
+    -- the body and its `return`s; `ret` was made outside, so neither can hand
+    -- one back (SPEC-DELTAS 68).
+    let defined = CDef(bindList, inner, False)
+    if len(openings) > 0 {
+        emit(g, openedConstraint(openings, defined, Some(where)))
+    } else {
+        emit(g, defined)
+    }
     emit(g, pop(g))
     discard(Array.pop(g.tyvarScopes))
     TFun(paramTypes, ret)
@@ -1120,8 +1136,7 @@ fun matchPatternInner(g : Generator, pat : Pat, t : Ty.Type) -> Map String Ty.Ty
         -- are in declaration order for both forms, so nothing here cares which
         -- form declared it. Only the record form may omit fields, which is why
         -- the arity check stays unconditional.
-        PCon(name, args) -> match Decls.instantiateCon(g.decls, name,
-                fun() = freshCell(g), Some(pat.span)) {
+        PCon(name, args) -> match openedCon(g, pat, name) {
             TFun(conParams, conRet) -> {
                 if len(args) != len(conParams) {
                     oops("constructor '" + name + "' takes "
@@ -1138,8 +1153,7 @@ fun matchPatternInner(g : Generator, pat : Pat, t : Ty.Type) -> Map String Ty.Ty
             }
             _ -> Map.new()
         }
-        PRecord(name, fields, rest) -> match Decls.instantiateCon(g.decls, name,
-                fun() = freshCell(g), Some(pat.span)) {
+        PRecord(name, fields, rest) -> match openedCon(g, pat, name) {
             TFun(conParams, conRet) -> {
                 let info = match Decls.con(g.decls, name) {
                     Some(i) -> i
@@ -1281,7 +1295,7 @@ fun use(g : Generator, name : String, where : Option Span,
         }
         None -> None
     }
-    emit(g, CInstance(name, t, where, marker))
+    emit(g, CInstance(name, t, where, marker, None))
     t
 }
 
@@ -1317,8 +1331,7 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
         }
         use(g, name, Some(e.span), Some(e))
     }
-    ECon(name) -> match Decls.instantiateCon(g.decls, name, fun() = freshCell(g),
-                                             Some(e.span)) {
+    ECon(name) -> match conType(g, e, name) {
         -- A nullary constructor is a value; anything else is a function.
         TFun(params, ret) -> if len(params) == 0 { ret } else { TFun(params, ret) }
         other -> other
@@ -1492,10 +1505,103 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
     EDo(_) -> oops("'do' survived desugaring", Some(e.span))
 }
 
+-- A constructor's type at a use: an existential with a context is used like a
+-- constrained function, so its predicates are wanted here and the `Use` its node
+-- carries is where elaboration puts the dictionaries (SPEC-DELTAS 68).
+fun conType(g : Generator, e : Expr, name : String) -> Ty.Type {
+    let info = match Decls.con(g.decls, name) {
+        Some(i) -> i
+        None -> return Decls.instantiateCon(g.decls, name, fun() = freshCell(g),
+                                            Some(e.span))
+    }
+    if len(info.scheme.preds) == 0 {
+        return Decls.instantiateCon(g.decls, name, fun() = freshCell(g),
+                                    Some(e.span))
+    }
+    let params = Array.new(info.arity)
+    for var i = 0; i < info.arity; i = i + 1 { Array.push(params, fresh(g)) }
+    let con = TFun(params, fresh(g))
+    let u = newUse(name, Some(e.span), None)
+    Map.put(g.types.uses, e.id, u)
+    emit(g, CInstance(name, con, Some(e.span), Some(u), Some(info.scheme)))
+    con
+}
+
+-- A constructor pattern's type, opening the constructor if it is existential
+-- (SPEC-DELTAS 68). Each hidden variable becomes a rigid constant named for the
+-- one the bracket wrote, and each predicate a given under a fresh dictionary
+-- name; both are recorded on the pattern, for Core, and on the enclosing arm or
+-- function, which is what scopes them.
+fun openedCon(g : Generator, pat : Pat, name : String) -> Ty.Type {
+    let info = match Decls.con(g.decls, name) {
+        Some(i) -> i
+        None -> return Decls.instantiateCon(g.decls, name, fun() = freshCell(g),
+                                            Some(pat.span))
+    }
+    if len(info.exists) == 0 {
+        return Decls.instantiateCon(g.decls, name, fun() = freshCell(g),
+                                    Some(pat.span))
+    }
+    let top = if len(g.openings) == 0 { None } else {
+        g.openings[len(g.openings) - 1]
+    }
+    let pending = match top {
+        Some(list) -> list
+        None -> oops("the pattern '" + name + "' opens an existential "
+            + "constructor, which only a 'match' arm or a function parameter "
+            + "may do: a 'let', 'var' or 'for' has no body for the type it "
+            + "hides to live in", Some(pat.span))
+    }
+    let sk = Classes.newSkolems()
+    let mapping = Map.new()
+    for q in info.scheme.quantified { Map.put(mapping, q.id, fresh(g)) }
+    for var i = 0; i < len(info.exists) && i < len(info.existsNames); i = i + 1 {
+        Map.put(mapping, info.exists[i].id,
+                Classes.skolemBind(sk, info.exists[i], info.existsNames[i]))
+    }
+    for made in sk.made { Ty.markOpened(made.uid, name) }
+    let con = Decls.substitute(info.scheme.body, mapping)
+    let givens = Array.new(len(info.scheme.preds))
+    for p in info.scheme.preds {
+        Array.push(givens, (dictName(p.name), Ty.pred(p.name,
+            Array.map(p.args, fun(a) = Decls.substitute(a, mapping)))))
+    }
+    pat.opening = Some(Opening {
+        evidence = Array.map(givens, fun(gv) = gv.0), skolems = sk.made,
+        layouts = None,
+    })
+    Array.push(pending, (givens, sk.made))
+    con
+}
+
+-- `inner`, under what its patterns opened: one rank for the rigid constants to
+-- live at, and the carried instances as givens -- the shape `checkSignature`
+-- builds for a declared type, with a pattern as the second source of
+-- assumptions (SPEC-DELTAS 68).
+fun openedConstraint(openings : Array (Array (String, Pred), Array ConCell),
+                     inner : Constraint, where : Option Span) -> Constraint {
+    let givens = Array.new(2)
+    let skolems = Array.new(2)
+    for (gs, made) in openings {
+        for gv in gs { Array.push(givens, gv) }
+        for s in made { Array.push(skolems, s) }
+    }
+    CAssume(givens, CLet(LetCell {
+        binds = [("%opened", Ty.tUnit())], defn = inner,
+        body = CAnd(Array.new(0)), span = where, topLevel = False,
+        dicts = None, skolems = skolems, rigid = Array.new(0),
+    }))
+}
+
+fun popOpenings(g : Generator) -> Array (Array (String, Pred), Array ConCell) =
+    match Array.pop(g.openings) {
+        Some(Some(list)) -> list
+        _ -> Array.new(0)
+    }
+
 fun genRecord(g : Generator, e : Expr, conName : String,
               fields : Array (String, Expr)) -> Ty.Type =
-    match Decls.instantiateCon(g.decls, conName, fun() = freshCell(g),
-                               Some(e.span)) {
+    match conType(g, e, conName) {
         TFun(conParams, conRet) -> {
             let info = match Decls.con(g.decls, conName) {
                 Some(i) -> i
@@ -1625,7 +1731,9 @@ fun genForIn(g : Generator, e : Expr, pat : Pat, iterable : Expr, body : Expr,
             Ty.applyTo(Decls.head(g.decls, P.optionType), [element], None)),
        Some(iterable.span), where)
     -- design.md 6.5: `x` is a fresh immutable binding each iteration.
+    Array.push(g.openings, None)
     let binds = matchPattern(g, pat, element)
+    discard(Array.pop(g.openings))
     Array.push(g.binderSites, (pat, element))
     let scope = Map.new()
     for (n, _) in Map.entries(binds) { Map.put(scope, n, False) }
@@ -1651,6 +1759,7 @@ fun genMatch(g : Generator, e : Expr, scrutinee : Expr,
     Array.push(g.matchSites, (e, scrutineeType))
     var result = TBottom
     for arm in arms {
+        Array.push(g.openings, Some(Array.new(2)))
         let bindings = matchPattern(g, arm.patterns[0], scrutineeType)
         for var i = 1; i < len(arm.patterns); i = i + 1 {
             let alt = arm.patterns[i]
@@ -1664,16 +1773,42 @@ fun genMatch(g : Generator, e : Expr, scrutinee : Expr,
                    "the binding '" + name + "'")
             }
         }
+        let openings = popOpenings(g)
+        if len(openings) > 0 && len(arm.patterns) > 1 {
+            oops("an arm with alternatives cannot open an existential "
+                 + "constructor: each alternative would hide a different type",
+                 Some(arm.span))
+        }
         let scope = Map.new()
         for (n, _) in Map.entries(bindings) { Map.put(scope, n, False) }
         Array.push(g.scopes, scope)
+        -- The arm's value is joined with the others *inside* the rank its
+        -- patterns opened, so a type it hides cannot leave through it: the
+        -- variable standing for the result is made out here, older than the
+        -- rigid constants (SPEC-DELTAS 68).
+        let answer = if len(openings) > 0 { Some(fresh(g)) } else { None }
         push(g)
-        let body = genExpr(g, arm.body)
+        var body = genExpr(g, arm.body)
+        match answer {
+            Some(ans) -> match body {
+                TBottom -> {}
+                _ -> {
+                    eq(g, ans, body, Some(arm.span), "the arms of a 'match'")
+                    body = ans
+                }
+            }
+            None -> {}
+        }
         let armC = pop(g)
         discard(Array.pop(g.scopes))
         let bindList = Array.new(4)
         for (n, t) in Map.entries(bindings) { Array.push(bindList, (n, t)) }
-        emit(g, CDef(bindList, armC, False))
+        let defined = CDef(bindList, armC, False)
+        if len(openings) > 0 {
+            emit(g, openedConstraint(openings, defined, Some(arm.span)))
+        } else {
+            emit(g, defined)
+        }
         result = join(g, result, body, Some(arm.span), "the arms of a 'match'")
     }
     result

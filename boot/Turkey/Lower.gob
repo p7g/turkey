@@ -539,6 +539,92 @@ fun isDefaultOf(info : ClassInfo, name : String, impl : MethodImpl) -> Bool =
     }
 
 -- `f` as `fun(x, ...) { f(x, ...) }`, to defer evaluating `f`.
+-- The dictionaries a use of an existential constructor packs (SPEC-DELTAS 68);
+-- empty for every other constructor.
+fun carried(l : Lowerer, e : Expr) -> Array Core = match Map.get(l.types.uses, e.id) {
+    None -> Array.new(0)
+    Some(u) -> {
+        let out = Array.new(len(u.evidence))
+        if len(u.evidence) == 0 { return out }
+        let givens = givensOf(l, u)
+        for var i = 0; i < len(u.evidence) && i < len(u.preds); i = i + 1 {
+            Array.push(out, evidence(l, u.evidence[i], predType(l, u.preds[i]),
+                                     givens))
+        }
+        out
+    }
+}
+
+-- The constructor as Core applies it: dictionaries, then fields.
+fun packing(dicts : Array Core, fnTy : Ty.Type, name : String,
+            where : Option Span) -> Core {
+    let dictTypes = Array.map(dicts, fun(d) = d.ty)
+    match Ty.prune(fnTy) {
+        TFun(params, ret) ->
+            node(TFun(Array.append(dictTypes, params), ret), where, CCon(name))
+        other -> node(TFun(dictTypes, other), where, CCon(name))
+    }
+}
+
+-- A constructor named rather than applied. An existential with a context
+-- carries the dictionaries its use was elaborated with, so the function it
+-- stands for applies them ahead of the fields.
+fun conValue(l : Lowerer, e : Expr, name : String, ty : Ty.Type,
+             where : Option Span) -> Core {
+    let dicts = carried(l, e)
+    if len(dicts) == 0 { return eta(l, node(ty, where, CCon(name)), ty, where) }
+    match Ty.prune(ty) {
+        TFun(params, ret) -> {
+            let ps = Array.map(params, fun(p) =
+                CParam { name = freshName(l, "eta"), ty = p })
+            let args = Array.map(ps, fun(p) = node(p.ty, where, CVar(p.name)))
+            node(TFun(params, ret), where, CLam(ps, node(ret, where,
+                CApp(packing(dicts, ty, name, where), Array.append(dicts, args))),
+                "<anonymous>"))
+        }
+        other -> node(other, where, CApp(packing(dicts, other, name, where), dicts))
+    }
+}
+
+-- `C { f = x, g = y }` for an existential `C`, as the positional application
+-- every backend packs. The fields are evaluated in the order they were written
+-- (design.md 6.1) and bound to fresh names first, then passed in declaration
+-- order.
+fun existentialRecord(l : Lowerer, e : Expr, info : ConInfo, con : String,
+                      fields : Array (String, Expr), ty : Ty.Type,
+                      where : Option Span, scope : Scope) -> Core {
+    let values = Map.new()
+    for (n, v) in fields { Map.put(values, n, expr(l, v, scope)) }
+    let held = Map.new()
+    for (n, _) in fields { Map.put(held, n, freshName(l, "field")) }
+    let dicts = carried(l, e)
+    let names = match info.fields {
+        Some(ns) -> ns
+        None -> Array.new(0)
+    }
+    let ordered = Array.new(len(names))
+    for n in names {
+        let v = match Map.get(values, n) {
+            Some(x) -> x
+            None -> oops("the field '" + n + "' vanished", where)
+        }
+        Array.push(ordered, node(v.ty, where, CVar(Map.getOr(held, n, n))))
+    }
+    let fnTy = TFun(Array.map(ordered, fun(o) = o.ty), ty)
+    var out = node(ty, where, CApp(packing(dicts, fnTy, con, where),
+                                   Array.append(dicts, ordered)))
+    for var i = len(fields) - 1; i >= 0; i = i - 1 {
+        let (n, _) = fields[i]
+        let v = match Map.get(values, n) {
+            Some(x) -> x
+            None -> oops("the field '" + n + "' vanished", where)
+        }
+        out = node(ty, where, CLet(Map.getOr(held, n, n), v.ty, v, out,
+                                   Array.new(0)))
+    }
+    out
+}
+
 fun eta(l : Lowerer, called : Core, result : Ty.Type, where : Option Span) -> Core =
     match Ty.prune(result) {
         TFun(params, ret) -> {
@@ -982,12 +1068,19 @@ fun dispatch(l : Lowerer, e : Expr, scope : Scope) -> Core {
         EUnit -> node(ty, where, CUnit)
         -- Constructor values are ordinary functions in Core. Keep this in
         -- elaboration, matching `lower.py`, so every backend sees the lambda.
-        ECon(name) -> eta(l, node(ty, where, CCon(name)), ty, where)
+        ECon(name) -> conValue(l, e, name, ty, where)
         EVar(_, _) -> var_(l, e, scope)
         ETuple(elems) -> node(ty, where,
             CTuple(Array.map(elems, fun(x) = expr(l, x, scope))))
         EArray(elems) -> arrayLiteral(l, e, ty, elems, scope)
         ERecord(con, fields) -> {
+            match Decls.con(l.decls, con) {
+                Some(info) -> if len(info.exists) > 0 {
+                    return existentialRecord(l, e, info, con, fields, ty, where,
+                                             scope)
+                }
+                None -> {}
+            }
             let out = Array.new(len(fields))
             for (n, v) in fields { Array.push(out, (n, expr(l, v, scope))) }
             node(ty, where, CRecord(con, out))
@@ -1011,9 +1104,20 @@ fun dispatch(l : Lowerer, e : Expr, scope : Scope) -> Core {
             match callee.kind {
                 -- A saturated constructor already has the allocation shape;
                 -- expanding it would build a lambda only to apply it again.
-                ECon(name) -> node(ty, where, CApp(
-                    node(typeOfExpr(l, callee), Some(callee.span), CCon(name)),
-                    supplied))
+                ECon(name) -> {
+                    let dicts = carried(l, callee)
+                    if len(dicts) > 0 {
+                        node(ty, where, CApp(
+                            packing(dicts, typeOfExpr(l, callee), name,
+                                    Some(callee.span)),
+                            Array.append(dicts, supplied)))
+                    } else {
+                        node(ty, where, CApp(
+                            node(typeOfExpr(l, callee), Some(callee.span),
+                                 CCon(name)),
+                            supplied))
+                    }
+                }
                 _ -> node(ty, where, CApp(expr(l, fn, scope), supplied))
             }
         }
@@ -1587,7 +1691,7 @@ fun forIn(l : Lowerer, e : Expr, pat : Pat, iterable : Expr, body : Expr,
 }
 
 fun mkPat(e : Expr, k : PatKind) -> Pat =
-    Pat { id = freshNodeId(), span = e.span, kind = k }
+    Pat { id = freshNodeId(), span = e.span, kind = k, opening = None }
 
 -- The `Option` constructors, found from the type `next` answers.
 --

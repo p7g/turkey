@@ -15,6 +15,7 @@ module Turkey.Types (
     Scheme(..), mono, scheme,
     Families(..),
     prune, normalize, occursAndAdjust, escaping,
+    skolemsOf, markOpened, clearOpened,
     unify, join, generalize, instantiate, instantiateQual,
     typeKey, sameType, subterms, varsOf, freeVars,
     Namer(..), namer, namerFrom, show, showAt, showScheme, showPred,
@@ -264,6 +265,20 @@ type Counters = Counters {
 }
 
 let counters = Counters { kind = 0, tyvar = 0, skolem = 0 }
+
+-- The rigid constants an existential pattern opened, by `uid`, and the
+-- constructor that opened each (SPEC-DELTAS 68). A signature's constants are not
+-- here, which is what lets an escape say which of the two it was.
+type Opened = Opened { names : Map Int String }
+
+let opened = Opened { names = Map.new() }
+
+fun markOpened(uid : Int, constructor : String) -> Unit =
+    Map.put(opened.names, uid, constructor)
+
+fun clearOpened() -> Unit {
+    opened.names = Map.new()
+}
 
 fun newVar(level : Int, kind : Kind) -> VarCell {
     counters.tyvar = counters.tyvar + 1
@@ -712,6 +727,47 @@ fun occursAndAdjust(slot : VarCell, t : Type) -> Bool = match prune(t) {
 -- skolem carries the rank of its binder, `var` carries its own, and a skolem
 -- younger than the variable it would bind is out of scope. Run before
 -- `occursAndAdjust`, which lowers levels and would erase the evidence.
+-- The rigid constants reachable from `types`, first occurrence first.
+fun skolemsOf(types : Array Type) -> Array ConCell {
+    let out = Array.new(2)
+    let seen = Set.new()
+    for t in types { skolemsInto(t, out, seen) }
+    out
+}
+
+fun skolemsInto(t : Type, out : Array ConCell, seen : Set.Set Int) -> Unit =
+    match prune(t) {
+        TCon(c) -> if c.uid != 0 && !Set.contains(seen, c.uid) {
+            Set.add(seen, c.uid)
+            Array.push(out, c)
+        }
+        TApp(fn, arg, _) -> {
+            skolemsInto(fn, out, seen)
+            skolemsInto(arg, out, seen)
+        }
+        TFam(_, arg, _) -> skolemsInto(arg, out, seen)
+        TFun(params, ret) -> {
+            for p in params { skolemsInto(p, out, seen) }
+            skolemsInto(ret, out, seen)
+        }
+        TTuple(elems) -> for e in elems { skolemsInto(e, out, seen) }
+        _ -> {}
+    }
+
+-- The constructor whose pattern opened the constant `name` that escapes past
+-- `level`, if a pattern opened it rather than a signature.
+fun openedEscape(t : Type, name : String, level : Int) -> Option String {
+    for c in skolemsOf([t]) {
+        if c.name == name && c.level > level {
+            match Map.get(opened.names, c.uid) {
+                Some(constructor) -> return Some(constructor)
+                None -> {}
+            }
+        }
+    }
+    None
+}
+
 fun escaping(slot : VarCell, t : Type) -> Option String = match prune(t) {
     TCon(c) -> if c.level > slot.level { Some(c.name) } else { None }
     TApp(fn, arg, _) -> firstOf(escaping(slot, fn), escaping(slot, arg))
@@ -772,6 +828,16 @@ fun unify(a : Type, b : Type, where : Option Span, context : String,
 
     match x {
         TVar(cell) -> {
+            match escaping(cell, y) {
+                Some(out) -> match openedEscape(y, out, cell.level) {
+                    Some(opener) -> oops("the type '" + out + "' cannot escape "
+                        + "the pattern '" + shortName(opener) + "' that opened "
+                        + "it: it stands for whatever type was packed there, so "
+                        + "nothing outside can be equal to it", where)
+                    None -> {}
+                }
+                None -> {}
+            }
             match escaping(cell, y) {
                 Some(out) -> oops("the type '" + out + "' cannot escape the "
                     + "signature that declares it: it stands for whatever a "

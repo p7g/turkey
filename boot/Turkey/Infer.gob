@@ -112,6 +112,9 @@ type Generator = Generator {
     warnings    : Array String,
     -- Exhaustiveness runs after solving, when scrutinee types are known.
     matchSites  : Array (Expr, Ty.Type),
+    -- And irrefutability: every pattern that binds with no second arm to fall
+    -- to (SPEC-DELTAS 63).
+    binderSites : Array (Pat, Ty.Type),
 }
 
 fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
@@ -123,6 +126,7 @@ fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
         scopes = [namesOf(builtins)], fnStack = Array.new(4),
         loopStack = Array.new(4), tyvarScopes = [Map.new()],
         warnings = Array.new(4), matchSites = Array.new(8),
+        binderSites = Array.new(8),
     }
 }
 
@@ -667,9 +671,9 @@ fun checkSignature(g : Generator, decl : FunDecl, s : Scheme,
     }))
 }
 
--- design.md 5.1: a non-exhaustive match is a warning, not an error -- reaching
--- an unhandled case is a runtime panic. Runs after solving, since it needs the
--- scrutinee types resolved.
+-- design.md 5.1: a non-exhaustive match is an error (SPEC-DELTAS 61), and so is
+-- a refutable binding pattern (SPEC-DELTAS 63). Runs after solving, since it
+-- needs the scrutinee types resolved.
 fun checkExhaustiveness(g : Generator) -> Unit {
     for (site, scrutinee) in g.matchSites {
         let arms = match site.kind {
@@ -691,6 +695,19 @@ fun checkExhaustiveness(g : Generator) -> Unit {
                 -- character for character.
                 oops("this match is not exhaustive; " + detail,
                      Some(site.span))
+            }
+        }
+    }
+    -- After every match, as in `turkey/infer.py`, so a program with both faults
+    -- reports the same one first on either side.
+    for (pat, bound) in g.binderSites {
+        match Exhaustive.checkPattern(g.decls, pat, Typed.resolve(g.types, bound)) {
+            None -> {}
+            Some(missing) -> {
+                let detail = if missing == "_" { "it does not match every value" }
+                             else { "'" + missing + "' is not matched" }
+                oops("this pattern is refutable; " + detail
+                     + ". Use 'if let' or 'match'", Some(pat.span))
             }
         }
     }
@@ -814,6 +831,7 @@ fun letDefinition(g : Generator, stmt : Stmt, pat : Pat, value : Expr,
     push(g)
     let t = genExpr(g, value)
     let bound = matchPattern(g, pat, t)
+    Array.push(g.binderSites, (pat, t))
     let binds = Array.new(4)
     for (n, ty) in Map.entries(bound) { Array.push(binds, (n, ty)) }
     let defn = pop(g)
@@ -896,6 +914,7 @@ fun genFunction(g : Generator, params : Array Pat, retAnnot : Option Type,
     for param in params {
         let tv = fresh(g)
         mergeInto(binds, matchPattern(g, param, tv), param.span)
+        Array.push(g.binderSites, (param, tv))
         Array.push(paramTypes, tv)
     }
 
@@ -1484,6 +1503,7 @@ fun genForIn(g : Generator, e : Expr, pat : Pat, iterable : Expr, body : Expr,
        Some(iterable.span), where)
     -- design.md 6.5: `x` is a fresh immutable binding each iteration.
     let binds = matchPattern(g, pat, element)
+    Array.push(g.binderSites, (pat, element))
     let scope = Map.new()
     for (n, _) in Map.entries(binds) { Map.put(scope, n, False) }
     Array.push(g.scopes, scope)

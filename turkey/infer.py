@@ -123,6 +123,10 @@ class Generator:
         self.warnings: list[str] = []
         # Exhaustiveness runs after solving, when scrutinee types are known.
         self.match_sites: list[tuple[ast.EMatch, Type]] = []
+        # And irrefutability, for the same reason: every pattern that binds
+        # without a second arm to fall to -- `let`, `var`, a parameter, a
+        # `for ... in` element (SPEC-DELTAS 63).
+        self.binder_sites: list[tuple[ast.Pattern, Type]] = []
 
     # -- building ----------------------------------------------------------
 
@@ -469,8 +473,9 @@ class Generator:
                                     skolems=list(skolems.made)))
 
     def check_exhaustiveness(self) -> None:
-        """Section 5.1: a non-exhaustive match is a warning, not an error --
-        reaching an unhandled case is a runtime panic.
+        """Section 5.1: a non-exhaustive match is an error (SPEC-DELTAS 61), and
+        so is a refutable pattern where nothing catches the value it refuses
+        (SPEC-DELTAS 63).
 
         Runs after solving, since it needs the scrutinee types resolved.
         """
@@ -496,6 +501,22 @@ class Generator:
             # of Turkey and had not one non-exhaustive match.
             raise TypeError_(
                 f"this match is not exhaustive; {detail}", match.span
+            )
+        # After every match, in both implementations, so a program with both
+        # faults reports the same one first on either side.
+        for pattern, bound in self.binder_sites:
+            missing = checker.check_pattern(pattern, self.types.resolve(bound))
+            if missing is None:
+                continue
+            # Rust's rule: `let` takes an irrefutable pattern and `if let` takes
+            # the rest. A refutable `let` used to lower to a match that panics.
+            detail = (
+                "it does not match every value" if missing == "_"
+                else f"'{missing}' is not matched"
+            )
+            raise TypeError_(
+                f"this pattern is refutable; {detail}. Use 'if let' or 'match'",
+                pattern.span,
             )
 
     @staticmethod
@@ -616,6 +637,7 @@ class Generator:
         self.push()
         value = self.gen_expr(stmt.value)
         binds = list(self.match_pattern(stmt.pat, value).items())
+        self.binder_sites.append((stmt.pat, value))
         defn = self.pop()
         # Section 4.4: only a `let` bound to a syntactic value generalizes.
         generalizes = isinstance(stmt, ast.SLet) and self.is_nonexpansive(stmt.value)
@@ -689,6 +711,7 @@ class Generator:
         for param in decl.params:
             tv = self.fresh()
             self._merge(binds, self.match_pattern(param, tv), param.span)
+            self.binder_sites.append((param, tv))
             param_types.append(tv)
 
         ret = self.fresh()
@@ -1103,6 +1126,7 @@ class Generator:
         )
         # Section 6.5: `x` is a fresh immutable binding each iteration.
         binds = self.match_pattern(e.pat, element)
+        self.binder_sites.append((e.pat, element))
         self.scopes.append({name: False for name in binds})
         self.push()
         self.loop_stack.append(LoopCtx("for", UNIT))

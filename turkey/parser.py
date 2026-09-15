@@ -842,7 +842,18 @@ class Parser:
             return self.parse_if()
         if kind == "while":
             self.advance()
+            if self.at("let", "var"):
+                # `while let p = e { A }` is `loop { match e { p -> A, _ ->
+                # break } }`, so a `continue` in `A` evaluates `e` again.
+                pat, value, body = self.parse_binding_condition()
+                span = tok.span
+                return ast.ELoop(span, ast.EBlock(span, [ast.SExpr(span, ast.EMatch(
+                    span, value, [
+                        ast.MatchArm(span, [pat], body),
+                        ast.MatchArm(span, [ast.PWild(span)], ast.EBreak(span, None)),
+                    ]))]))
             cond = self.parse_scrutinee()
+            self.refuse_chained_condition()
             return ast.EWhile(tok.span, cond, self.parse_block())
         if kind == "for":
             return self.parse_for()
@@ -907,12 +918,68 @@ class Parser:
 
     def parse_if(self) -> ast.Expr:
         span = self.expect("if").span
+        if self.at("let", "var"):
+            return self.parse_if_let(span)
         cond = self.parse_scrutinee()
+        self.refuse_chained_condition()
         then = self.parse_block()
         otherwise: ast.Expr | None = None
         if self.eat("else"):
             otherwise = self.parse_if() if self.at("if") else self.parse_block()
         return ast.EIf(span, cond, then, otherwise)
+
+    def parse_if_let(self, span: Span) -> ast.Expr:
+        """`if let p = e { A } else { B }` is `match e { p -> A, _ -> B }`.
+
+        Desugared here rather than carried as a node (SPEC-DELTAS 63): a
+        `match` with a wildcard arm is exactly its meaning, so resolution,
+        inference, exhaustiveness and both lowerings need nothing new, and the
+        binder scopes over the then-block and nothing else because that is what
+        an arm's binder already does. Without an `else` the other arm is `()`.
+        """
+        pat, value, then = self.parse_binding_condition()
+        otherwise: ast.Expr = ast.EUnit(span)
+        if self.eat("else"):
+            otherwise = self.parse_if() if self.at("if") else self.parse_block()
+        return ast.EMatch(span, value, [
+            ast.MatchArm(span, [pat], then),
+            ast.MatchArm(span, [ast.PWild(span)], otherwise),
+        ])
+
+    def parse_binding_condition(
+        self,
+    ) -> tuple[ast.Pattern, ast.Expr, ast.Expr]:
+        """`let p = e { body }` or `var p = e { body }`, after `if` or `while`.
+
+        `var` makes the binders reassignable the way `var` does anywhere else:
+        the block is prefixed with `var x = x` for each one, in the order the
+        pattern binds them.
+        """
+        span = self.cur.span
+        mutable = self.advance().kind == "var"
+        with self._with_no_record(False):
+            pat = self.parse_pattern()
+            self.expect("=")
+        value = self.parse_scrutinee()
+        self.refuse_chained_condition()
+        body = self.parse_block()
+        if mutable:
+            rebinds: list[ast.Stmt] = [
+                ast.SVar(span, ast.PVar(span, name), ast.EVar(span, name))
+                for name in _binders(pat)
+            ]
+            body = ast.EBlock(body.span, rebinds + body.stmts)
+        return pat, value, body
+
+    def refuse_chained_condition(self) -> None:
+        """The condition of an `if` is a list in the grammar (SPEC-DELTAS 63),
+        so that `if let Some(x) = a, x > 0` can be added without a retrofit.
+        Only the one-element list is implemented."""
+        if self.at(","):
+            raise ParseError(
+                "a condition cannot be chained with ',' yet; nest the 'if' instead",
+                self.cur.span,
+            )
 
     def parse_for(self) -> ast.Expr:
         span = self.expect("for").span
@@ -999,6 +1066,21 @@ def collect_tycons(tokens: list[Token]) -> frozenset[str]:
         if tok.kind == "type" and tokens[i + 1].kind == "CONID":
             names.add(tokens[i + 1].text)
     return frozenset(names)
+
+
+def _binders(pat: ast.Pattern) -> list[str]:
+    """The names a pattern binds, in the order it binds them."""
+    if isinstance(pat, ast.PVar):
+        return [pat.name]
+    if isinstance(pat, ast.PAnnot):
+        return _binders(pat.pat)
+    if isinstance(pat, ast.PCon):
+        return [n for arg in pat.args for n in _binders(arg)]
+    if isinstance(pat, ast.PRecord):
+        return [n for _, sub in pat.fields for n in _binders(sub)]
+    if isinstance(pat, ast.PTuple):
+        return [n for elem in pat.elems for n in _binders(elem)]
+    return []
 
 
 def parse(src: str, known: frozenset[str] = frozenset(),

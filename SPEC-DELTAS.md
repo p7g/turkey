@@ -2833,3 +2833,53 @@ The full argument is in `PROPOSALS.md` 7.
 more the longer it waits: every golden and every delta written against `.tl` is
 one more thing to sweep. Earlier deltas were swept too: a delta that names a
 file nobody can open documents nothing.
+
+### 63. `if let`, `while let`, and a binding's pattern is irrefutable
+
+Delta 61 made a non-exhaustive `match` an error and left the same hole open one
+statement over: `let Yes(n) = o` compiled with no diagnostic of any kind and
+lowered to a match that panicked on `No`. So did `fun f(Yes(n))`. That is
+OCaml's warning 8 without the warning.
+
+**A binding's pattern must be irrefutable.** `let`, `var`, a `fun` or lambda
+parameter, and the element of a `for ... in` loop: every position that binds
+with no second arm to fall to. The check is the exhaustiveness checker's, run
+on a one-row matrix after solving, and the error names the refused value the
+way a match's does -- `this pattern is refutable; 'None' is not matched. Use
+'if let' or 'match'`. Rust applies the rule to exactly these positions; Swift
+routes the rest through `if case let` and `guard let`.
+
+**What it cost: nothing.** Measured before the check existed, over every entry
+program in the corpus with its solved types: zero refutable binding patterns.
+
+**And the form that makes the rule bearable.** A refutable `let` is only
+tolerable to forbid if the one-armed match has a short spelling:
+
+```
+if let Some(x) = o { ... } else { ... }
+while let Some(x) = Array.pop(xs) { ... }
+```
+
+`if let p = e { A } else { B }` is `match e { p -> A, _ -> B }`, with `()` for
+a missing `else`; `while let p = e { A }` is `loop { match e { p -> A, _ ->
+break } }`, so `continue` evaluates `e` again. Both are desugared by the parser.
+A `match` with a wildcard arm is exactly what they mean, so resolution,
+inference, exhaustiveness and both lowerings need nothing new, and the binders
+scope over the then-block and nowhere else because that is what an arm's
+binders already do. Rust added `if let` and `while let` in one RFC because the
+second is the more valuable; the README's `drain` went from five lines to one.
+
+`if var` and `while var` are the same forms with reassignable binders, since
+Turkey puts mutability on the keyword rather than the binder: the block is
+prefixed with `var x = x` for each binder, in pattern order.
+
+**The condition is a list in the grammar and a singleton in the parser.**
+`if let Some(x) = a, x > 0` is the obvious next step; Rust's chained conditions
+took years to retrofit, so the comma is claimed now and is a parse error saying
+so. `let ... else` is a separate question and waits.
+
+An irrefutable `if let` is accepted silently. Rust lints it; there is no
+warning channel here to lint with, and it is not wrong.
+
+**Scope.** `if_let.gob` accepts; `err_refutable_let.gob` and
+`err_refutable_param.gob` reject. No existing golden moved.

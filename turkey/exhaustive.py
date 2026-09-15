@@ -172,6 +172,12 @@ class Checker:
 
     # -- reporting ----------------------------------------------------------
 
+    def check_pattern(self, pattern: ast.Pattern, scrutinee: Type) -> str | None:
+        """A value one binding pattern does not match, or None when it is
+        irrefutable -- the one-row case of `check`. See SPEC-DELTAS 63."""
+        found = self.witness([[_normalize(pattern, self.decls)]], [scrutinee])
+        return None if found is None else render(found[0])
+
     def check(self, match: ast.EMatch, scrutinee: Type) -> str | None:
         matrix = [
             [_normalize(pattern, self.decls)]

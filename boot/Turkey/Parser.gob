@@ -1051,7 +1051,19 @@ fun parseAtom(p : P) -> Expr {
         "if" -> parseIf(p)
         "while" -> {
             advance(p)
+            if at(p, "let") || at(p, "var") {
+                -- `loop { match e { p -> A, _ -> break } }`, as in Python.
+                let s = tok.span
+                let (pat, value, body) = parseBindingCondition(p)
+                let m = mkExpr(p, s, EMatch(value, [
+                    Arm { span = s, patterns = [pat], body = body },
+                    Arm { span = s, patterns = [mkPat(p, s, PWild)],
+                          body = mkExpr(p, s, EBreak(None)) },
+                ]))
+                return mkExpr(p, s, ELoop(mkExpr(p, s, EBlock([mkStmt(p, s, SExpr(m))]))))
+            }
             let cond = parseScrutinee(p)
+            refuseChainedCondition(p)
             mkExpr(p, tok.span, EWhile(cond, parseBlock(p)))
         }
         "for" -> parseFor(p)
@@ -1161,7 +1173,9 @@ fun parseScrutinee(p : P) -> Expr {
 
 fun parseIf(p : P) -> Expr {
     let s = expect(p, "if").span
+    if at(p, "let") || at(p, "var") { return parseIfLet(p, s) }
     let cond = parseScrutinee(p)
+    refuseChainedCondition(p)
     let then = parseBlock(p)
     var otherwise : Option Expr = None
     if eat(p, "else") {
@@ -1169,6 +1183,59 @@ fun parseIf(p : P) -> Expr {
         else { otherwise = Some(parseBlock(p)) }
     }
     mkExpr(p, s, EIf(cond, then, otherwise))
+}
+
+-- `if let p = e { A } else { B }` is `match e { p -> A, _ -> B }`, desugared
+-- here for the reason `turkey/parser.py` gives (SPEC-DELTAS 63). Without an
+-- `else` the other arm is `()`.
+fun parseIfLet(p : P, s : Span) -> Expr {
+    let (pat, value, then) = parseBindingCondition(p)
+    var otherwise = mkExpr(p, s, EUnit)
+    if eat(p, "else") {
+        if at(p, "if") { otherwise = parseIf(p) }
+        else { otherwise = parseBlock(p) }
+    }
+    mkExpr(p, s, EMatch(value, [
+        Arm { span = s, patterns = [pat], body = then },
+        Arm { span = s, patterns = [mkPat(p, s, PWild)], body = otherwise },
+    ]))
+}
+
+-- `let p = e { body }` or `var p = e { body }`, after `if` or `while`. `var`
+-- prefixes the block with `var x = x` for each binder, in pattern order.
+fun parseBindingCondition(p : P) -> (Pat, Expr, Expr) {
+    let s = cur(p).span
+    let mutable = at(p, "var")
+    advance(p)
+    let saved = setNoRecord(p, False)
+    let pat = parsePattern(p)
+    skipToken(p, "=")
+    p.noRecord = saved
+    let value = parseScrutinee(p)
+    refuseChainedCondition(p)
+    var body = parseBlock(p)
+    if mutable {
+        let stmts = Array.new(4)
+        for name in patternVars(pat) {
+            Array.push(stmts, mkStmt(p, s, SVar(mkPat(p, s, PVar(name)),
+                                                mkExpr(p, s, EVar(name, False)))))
+        }
+        match body.kind {
+            EBlock(inner) -> for st in inner { Array.push(stmts, st) }
+            _ -> {}
+        }
+        body = mkExpr(p, body.span, EBlock(stmts))
+    }
+    (pat, value, body)
+}
+
+-- The condition is a list in the grammar so that chaining can be added without
+-- a retrofit; only the one-element list is implemented (SPEC-DELTAS 63).
+fun refuseChainedCondition(p : P) -> Unit {
+    if at(p, ",") {
+        oops(p, "a condition cannot be chained with ',' yet; nest the 'if' instead",
+             cur(p).span)
+    }
 }
 
 -- `for pat in expr` and the C-style header are told apart by `in`, and Python

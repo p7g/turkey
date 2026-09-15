@@ -220,8 +220,8 @@ expr-atom    ::= INT | FLOAT | STRING | CHAR
                | "[]"                            -- empty array literal
                | CONID "{" field-init ("," field-init)* "}"  -- record construction
                | "fun" "(" pat-list? ")" fun-ret? fun-body   -- anonymous function
-               | "if" expr block ("else" (if-expr | block))?
-               | "while" expr block
+               | "if" if-cond ("," if-cond)* block ("else" (if-expr | block))?
+               | "while" if-cond ("," if-cond)* block
                | "for" for-header block
                | "loop" block
                | "match" expr "{" match-arm+ "}"
@@ -231,6 +231,9 @@ expr-atom    ::= INT | FLOAT | STRING | CHAR
                | "do" block                      -- monadic context (§6.9)
                | block
 block        ::= "{" stmt* "}"
+if-cond      ::= expr
+               | "let" pat "=" expr               -- (delta 63)
+               | "var" pat "=" expr
 field-init   ::= IDENT "=" expr
                | IDENT                           -- punning: `C { x }` is `C { x = x }`
 for-header   ::= stmt-no-block ";" expr ";" stmt-no-block    -- C-style
@@ -266,6 +269,12 @@ construct one (decision 28). The two forms differ in one respect only: the
 record form may name a subset of the fields, and the positional form may not --
 `R(x)` for a two-field `R` is an arity error, because a position is not
 self-describing the way a name is.
+
+**A binding takes an irrefutable pattern.** `let`, `var`, a `fun` or lambda
+parameter, and the element of `for ... in` bind with no second arm to fall to,
+so their pattern must match every value of its type: `let (a, b) = pair` is
+accepted and `let Some(x) = o` is a type error naming the value it refuses. A
+refutable pattern belongs in `match`, `if let` or `while let` (SPEC-DELTAS 63).
 
 ### 3.7 Assignment
 
@@ -528,7 +537,9 @@ container walks with is computed from the container, like its element type.
 |---|---|---|
 | `if c { b1 } else { b2 }` | `unify(typeof(b1), typeof(b2))` | `else` required if result is used |
 | `if c { b1 }` | `Unit` | statement-style if |
+| `if let p = e { b1 } else { b2 }` | as `match e { p -> b1, _ -> b2 }` | binders scope over `b1` only; no `else` means `_ -> ()` |
 | `while c { b }` | `Unit` | `break` (no value) exits |
+| `while let p = e { b }` | as `loop { match e { p -> b, _ -> break } }` | `continue` evaluates `e` again |
 | `for init; c; step { b }` | `Unit` | C-style; `break`/`continue` allowed |
 | `for x in arr { b }` | `Unit` | array iteration |
 | `loop { b }` | `α_loop` | `break e` returns value; infinite if no break |
@@ -536,6 +547,11 @@ container walks with is computed from the container, like its element type.
 | `break e` | `⊥` | exits enclosing `loop` with value `e` |
 | `break` | `⊥` | exits enclosing `loop`/`while`/`for` |
 | `continue` | `⊥` | skips to next iteration of `while`/`for`/`loop` |
+
+`if var` and `while var` are the same forms with the binders reassignable, as
+`var` makes them anywhere else. The condition is a list in the grammar, but
+only a single condition is implemented; a `,` after one is a parse error
+(SPEC-DELTAS 63).
 
 `return` is only valid inside a `fun`. `break`/`continue` are only valid inside `loop`/`while`/`for`.
 

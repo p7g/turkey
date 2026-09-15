@@ -58,12 +58,8 @@ fun push(s : Stack a, x : a) -> Unit {
 
 fun drain(s : Stack a) -> Array a {
     let out = [] : Array a
-    loop {
-        match Array.pop(s.data) {
-            Some(x) -> Array.push(out, x)
-            None -> break out
-        }
-    }
+    while let Some(x) = Array.pop(s.data) { Array.push(out, x) }
+    out
 }
 
 fun main() {

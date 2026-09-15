@@ -2396,6 +2396,39 @@ definition -- and the spill loop would have gone round forever on `boot`'s
 88-value module initializer. Failures are now told apart: a forbidden register
 spills the failing value, a full file evicts the holder used furthest ahead.
 
+### 89. The suite ran `boot` interpreted, the thing its own harness forbids
+**bug, fixed.** `pytest -n auto --durations` on a 16-core machine: 15:09 of wall
+time at 2.3 cores. The slowest item was `test_boot`'s types milestone -- 233
+seconds of fixture setup and 203 of call -- and the fixture ran
+`python -m turkey run boot/Main.gob -- types`: the bootstrap compiler under the
+interpreter. `tests/bootc.py` exists to stop exactly that, and says so in its
+header. The fixture went around it for a mundane reason: it needs stderr, and
+`bootc.boot` threw stderr away.
+
+That is FINDINGS 61, 65 and `bootc`'s own "the fix was made in one module and
+never reached the others", a fourth time. The pattern is not carelessness about
+cost; it is that a harness which does 90% of a job invites the remaining 10% to
+be done beside it.
+
+The rest was ordinary and multiplied by parallelism:
+
+* `lru_cache`d corpus runs (`boot asm`, `boot llvm`, `boot ssa`) were one run per
+  xdist *worker*, so sixteen of each;
+* `test_native` compiled `turkey_runtime.c` into every test binary, per worker;
+* three `test_boot` Python sides ran `check` uncached every time, one of them
+  over `boot/Main.gob`;
+* two corpus loops sat inside single test items.
+
+And one that was a correctness bug, not a cost: `test_bootc` edited
+`boot/Turkey/Regalloc.gob` and `turkey/driver.py` in place to test cache keys,
+which under xdist lets another worker import a truncated file.
+
+After: per-program disk caches for `boot` output, a locked `boot` build, one
+runtime object, the compiled binary for types, and cache-key tests on copies.
+**2:13 at ~7 cores** with warm references -- the baseline had to recompute some
+of `boot/Main.gob`'s, so a fully cold run lands between the two. `pytest` is now
+parallel by default.
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

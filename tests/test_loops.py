@@ -210,7 +210,11 @@ def test_the_loop_nodes_are_gone_from_the_ir():
         assert name not in core.__all__
 
 
-def test_every_program_lowers_to_joins_with_nothing_declined():
+@pytest.mark.parametrize(
+    "source",
+    sorted(p for p in PROGRAMS.glob("*.gob") if not p.name.startswith("err_")),
+    ids=lambda p: p.stem)
+def test_every_program_lowers_to_joins_with_nothing_declined(source):
     """`loops.collapse` was partial by construction -- a shape its rules did
     not cover left the binding alone rather than being guessed at -- and
     `Checked.unlooped` counted how partial. The count is gone because the
@@ -223,14 +227,12 @@ def test_every_program_lowers_to_joins_with_nothing_declined():
     program is how that is noticed. `driver.check` also runs
     `coretc.check_program` on all three stages, so a jump this pass put
     outside a tail position fails here too, on every program, on every run.
+
+    One item per program, so `pytest -n auto` spreads them; the corpus-wide
+    "something lowered a transfer" guard is the next test, on the fixture
+    built to have one.
     """
-    jumped = 0
-    for source in sorted(PROGRAMS.glob("*.gob")):
-        if source.name.startswith("err_"):
-            continue  # these are the programs that are supposed to be rejected
-        checked = check(source.read_text(), str(source), [source.parent])
-        jumped += count(checked.core, CJump)
-    assert jumped > 0, "no program in the suite lowered a transfer at all"
+    check(source.read_text(), str(source), [source.parent])
 
 
 def test_a_program_with_loops_lowers_to_joins_and_jumps():

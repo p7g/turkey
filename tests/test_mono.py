@@ -19,6 +19,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from turkey import core
 from turkey.core import CApp, CBind, CProgram, CRecord, CTyApp, CVar
 from turkey.driver import check
@@ -647,7 +649,9 @@ def _conformance_programs():
                   if not path.stem.startswith("err_"))
 
 
-def test_no_reachable_generic_body_can_destructure_polymorphic_data():
+@pytest.mark.parametrize("program", _conformance_programs(),
+                         ids=lambda p: p.stem)
+def test_no_reachable_generic_body_can_destructure_polymorphic_data(program):
     """The invariant that lets field access be a load.
 
     A generic body may hold an abstracted value and pass it on -- that is
@@ -665,12 +669,10 @@ def test_no_reachable_generic_body_can_destructure_polymorphic_data():
     """
     from turkey import mono
 
-    for program in _conformance_programs():
-        checked = check(program.read_text(encoding="utf-8"), str(program),
-                        [PROGRAMS_DIR])
-        found = mono.transparent_parameters(checked.opt)
-        assert not found, (
-            f"{program.stem}: {found}")
+    checked = check(program.read_text(encoding="utf-8"), str(program),
+                    [PROGRAMS_DIR])
+    found = mono.transparent_parameters(checked.opt)
+    assert not found, f"{program.stem}: {found}"
 
 
 def test_the_layout_invariant_is_not_vacuous():

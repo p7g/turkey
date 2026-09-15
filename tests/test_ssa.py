@@ -9,17 +9,37 @@ today. That is the point at which this is a test of the Turkey code rather
 than of the two implementations agreeing, which is `test_boot`'s job.
 """
 
+import contextlib
+import functools
+import io
 from pathlib import Path
 
+from tests import bootc
 from turkey.driver import run
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DRIVER = REPO_ROOT / "boot" / "SsaCheck.gob"
 
 
+@functools.lru_cache(maxsize=None)
+def _dump() -> str:
+    """The driver's output, computed once and kept on disk.
+
+    Every test here asserts on the same eight seconds of interpreted output,
+    and each used to run the driver again for it. The reference cache's key
+    covers `turkey/`, `lib/` and every `.gob` under `boot/`, which is
+    everything the run depends on.
+    """
+    def compute() -> str:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            run(DRIVER.read_text(encoding="utf-8"), str(DRIVER))
+        return out.getvalue()
+    return bootc.reference("ssacheck", DRIVER, compute)
+
+
 def _output(capfd) -> str:
-    run(DRIVER.read_text(encoding="utf-8"), str(DRIVER))
-    return capfd.readouterr().out
+    return _dump()
 
 
 def test_the_module_type_checks_and_the_analyses_run(capfd):

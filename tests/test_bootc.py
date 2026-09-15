@@ -11,6 +11,13 @@ rather than reasoned about.
 Neither test compiles anything. They substitute a counter for the expensive
 computation and check only which calls happen, which is what makes them cheap
 enough to run beside the suite they protect.
+
+**Neither touches the repository.** Both used to perturb real files --
+`boot/Turkey/Regalloc.gob` and `turkey/driver.py` -- and restore them, which is
+harmless in a serial run and not under `pytest -n auto`: another worker could
+import a truncated `driver.py`, start a spurious three-minute build of `boot`,
+or cache a fingerprint of the edited tree for the rest of its life. They work on
+copies in `tmp_path` now.
 """
 
 from __future__ import annotations
@@ -32,17 +39,25 @@ def _stage(name: str) -> str:
     """
     return f"{name}-{uuid.uuid4().hex}"
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
+
+def _program(root: Path) -> tuple[Path, Path]:
+    """A program and a module it imports, in the layout `boot/` has."""
+    main = root / "Main.gob"
+    imported = root / "Turkey" / "Regalloc.gob"
+    imported.parent.mkdir(parents=True)
+    main.write_text("import Turkey.Regalloc as Regalloc\nfun main() {}\n")
+    imported.write_text("module Turkey.Regalloc ()\n")
+    return main, imported
 
 
-def test_a_reference_is_reused_when_nothing_changed() -> None:
+def test_a_reference_is_reused_when_nothing_changed(tmp_path: Path) -> None:
     calls: list[int] = []
 
     def compute() -> str:
         calls.append(1)
         return f"value-{len(calls)}"
 
-    main = REPO_ROOT / "boot" / "Main.gob"
+    main, _ = _program(tmp_path)
     stage = _stage("test-reuse")
     first = bootc.reference(stage, main, compute)
     second = bootc.reference(stage, main, compute)
@@ -50,7 +65,8 @@ def test_a_reference_is_reused_when_nothing_changed() -> None:
     assert len(calls) == 1, "the second call recomputed instead of reusing"
 
 
-def test_a_reference_notices_a_change_to_a_module_the_program_imports() -> None:
+def test_a_reference_notices_a_change_to_a_module_the_program_imports(
+        tmp_path: Path) -> None:
     """The bug this test exists for, and it was real.
 
     The key hashed the program's own bytes. `check` follows imports, so the
@@ -64,18 +80,13 @@ def test_a_reference_notices_a_change_to_a_module_the_program_imports() -> None:
         calls.append(1)
         return f"value-{len(calls)}"
 
-    main = REPO_ROOT / "boot" / "Main.gob"
-    imported = REPO_ROOT / "boot" / "Turkey" / "Regalloc.gob"
-    assert imported.is_file(), "the module this test perturbs is gone"
-
+    main, imported = _program(tmp_path)
     stage = _stage("test-imports")
     before = bootc.reference(stage, main, compute)
     original = imported.read_bytes()
-    try:
-        imported.write_bytes(original + b"\n-- a change to an imported module\n")
-        during = bootc.reference(stage, main, compute)
-    finally:
-        imported.write_bytes(original)
+    imported.write_bytes(original + b"\n-- a change to an imported module\n")
+    during = bootc.reference(stage, main, compute)
+    imported.write_bytes(original)
     after = bootc.reference(stage, main, compute)
 
     assert during != before, (
@@ -84,17 +95,22 @@ def test_a_reference_notices_a_change_to_a_module_the_program_imports() -> None:
         "reverting the change did not return the original key")
 
 
-def test_the_build_fingerprint_covers_boot_and_the_python_compiler() -> None:
+def test_the_build_fingerprint_covers_boot_and_the_python_compiler(
+        tmp_path: Path) -> None:
     """`binary()` is keyed on this, and a miss here is a stale executable."""
-    before = bootc._fingerprint()
-    for target in (REPO_ROOT / "boot" / "Turkey" / "Regalloc.gob",
-                   REPO_ROOT / "turkey" / "driver.py"):
-        assert target.is_file(), f"{target} is gone"
+    for relative in ("boot/Main.gob", "boot/Turkey/Regalloc.gob",
+                     "lib/Prelude.gob", "turkey/driver.py",
+                     "runtime/turkey_runtime.c", "runtime/turkey_runtime.h"):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"-- {relative}\n")
+    before = bootc._fingerprint(tmp_path)
+    for relative in ("boot/Turkey/Regalloc.gob", "turkey/driver.py"):
+        target = tmp_path / relative
         original = target.read_bytes()
-        try:
-            target.write_bytes(original + b"\n")
-            assert bootc._fingerprint() != before, (
-                f"a change to {target.name} did not change the build key")
-        finally:
-            target.write_bytes(original)
-    assert bootc._fingerprint() == before, "the fingerprint did not settle back"
+        target.write_bytes(original + b"\n")
+        assert bootc._fingerprint(tmp_path) != before, (
+            f"a change to {target.name} did not change the build key")
+        target.write_bytes(original)
+    assert bootc._fingerprint(tmp_path) == before, (
+        "the fingerprint did not settle back")

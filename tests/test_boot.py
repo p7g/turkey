@@ -15,11 +15,11 @@ means compiling it, which is about two seconds; per-file that would be minutes,
 and once per suite it is once. The Python side needs no subprocess at all,
 being an ordinary function call.
 
-The M21 milestone is the slow one, and knowingly: it loads a whole module graph
-per entry program, so the library is parsed once per program on both sides. The
-Python side does that in under three seconds and `boot` takes minutes, because
-`boot` is a Turkey program running on generated Python. That ratio is the thing
-M26 removes rather than a reason to shrink the corpus.
+Every `boot` side runs the compiled binary from `tests.bootc`, and every Python
+side goes through its on-disk reference cache, one `check` per program shared by
+every stage. Both were true of most stages and not of all of them: the types
+milestone ran `boot` interpreted and several stages recomputed the Python side
+uncached, and between them they were most of the suite's wall time (FINDINGS 89).
 """
 
 from __future__ import annotations
@@ -103,8 +103,14 @@ def _boot(*args: str) -> str:
 
 
 
+@functools.lru_cache(maxsize=None)
 def _checked(path: Path):
-    """The Python implementation's whole front end on one program."""
+    """The Python implementation's whole front end on one program.
+
+    Memoized in the process as well as on disk: on a cold reference cache, the
+    types, warnings, core, mono and opt stages would otherwise each run `check`
+    on `boot/Main.gob` -- seventy seconds apiece -- for one answer.
+    """
     return check(path.read_text(encoding="utf-8"),
                  str(path.relative_to(REPO_ROOT)), [path.parent])
 
@@ -186,18 +192,10 @@ def boot_classes() -> str:
 
 @pytest.fixture(scope="module")
 def boot_types() -> tuple[str, str]:
-    result = subprocess.run(
-        [sys.executable, "-m", "turkey", "run", str(BOOT_MAIN), "--",
-         "types", *_relative(ENTRIES)],
-        cwd=REPO_ROOT,
-        env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)),
-        capture_output=True,
-    )
-    out = result.stdout.decode("utf-8")
-    err = result.stderr.decode("utf-8")
-    assert result.returncode == 0, (
-        f"boot exited {result.returncode}\n{out}\n{err}")
-    return out, err
+    # The compiled binary. This fixture ran `boot` through `turkey run` -- the
+    # interpreter -- because it needs stderr and `bootc.boot` dropped it: 233
+    # seconds of setup and 203 of call, the slowest item in the suite.
+    return bootc.boot_with_stderr("types", *_relative(ENTRIES))
 
 
 @pytest.fixture(scope="module")
@@ -221,14 +219,18 @@ def boot_desugar() -> str:
 
 
 def _python_desugar(paths: list[Path]) -> str:
-    out: list[str] = []
-    for path in paths:
+    def one(path: Path) -> str:
         relative = str(path.relative_to(REPO_ROOT))
         src = path.read_text(encoding="utf-8")
-        for module in desugared(src, relative, [path.parent]):
-            out.append(f"module {module.name}\n")
-            out.append(dump_ast(module.program))
-    return "".join(out)
+        return "".join(f"module {module.name}\n{dump_ast(module.program)}"
+                       for module in desugared(src, relative, [path.parent]))
+    return "".join(bootc.reference("desugar", path, lambda p=path: one(p))
+                   for path in paths)
+
+
+def _signatures(checked) -> str:
+    return "".join(f"{name} : {show_scheme(scheme)}\n"
+                   for name, scheme in checked.signatures)
 
 
 def test_the_corpus_is_the_whole_repository() -> None:
@@ -300,9 +302,9 @@ def test_boot_builds_the_same_declaration_table(boot_decls: str) -> None:
     """M22a: every type constructor's inferred kind and every value
     constructor's generalized scheme, for the whole program's table."""
     expected = "".join(
-        show_declarations(declared(
+        bootc.reference("decls", p, lambda p=p: show_declarations(declared(
             p.read_text(encoding="utf-8"), str(p.relative_to(REPO_ROOT)),
-            [p.parent])[0])
+            [p.parent])[0]))
         for p in SAMPLE)
     _first_difference(boot_decls, expected, "decls")
 
@@ -316,9 +318,9 @@ def test_boot_orders_binding_groups_the_same_way(boot_deps: str) -> None:
     about it demonstrates.
     """
     expected = "".join(
-        show_binding_groups(desugared(
+        bootc.reference("deps", p, lambda p=p: show_binding_groups(desugared(
             p.read_text(encoding="utf-8"), str(p.relative_to(REPO_ROOT)),
-            [p.parent]))
+            [p.parent])))
         for p in SAMPLE)
     _first_difference(boot_deps, expected, "deps")
 
@@ -327,9 +329,9 @@ def test_boot_builds_the_same_class_table(boot_classes: str) -> None:
     """M22b: classes, their kinds, superclasses, families and method schemes,
     and every instance's head, context, family bindings and home module."""
     expected = "".join(
-        show_classes(*registered(
+        bootc.reference("classes", p, lambda p=p: show_classes(*registered(
             p.read_text(encoding="utf-8"), str(p.relative_to(REPO_ROOT)),
-            [p.parent]))
+            [p.parent])))
         for p in SAMPLE)
     _first_difference(boot_classes, expected, "classes")
 
@@ -350,8 +352,7 @@ def test_boot_infers_the_same_types(boot_types: tuple[str, str]) -> None:
     accepting what the other rejects fails here as an exit status.
     """
     out, err = boot_types
-    signatures = _reference_dump("types.out", ENTRIES, lambda c: "".join(
-        f"{name} : {show_scheme(scheme)}\n" for name, scheme in c.signatures))
+    signatures = _reference_dump("types.out", ENTRIES, _signatures)
     # The warning prefix is the path as it was handed to `check`, not
     # `checked.module` -- those may well be the same string and relying on it
     # would be a guess, so `_reference_warnings` re-derives it the way the
@@ -367,11 +368,9 @@ def test_boot_infers_the_same_types(boot_types: tuple[str, str]) -> None:
 
 def test_the_types_corpus_exercises_the_hard_cases() -> None:
     """Again, the milestone is only worth its runtime if the shapes are in it."""
-    seen = "".join(
-        f"{n} : {show_scheme(s)}\n"
-        for p in ENTRIES
-        for n, s in check(p.read_text(encoding="utf-8"),
-                          str(p.relative_to(REPO_ROOT)), [p.parent]).signatures)
+    # The milestone's own cached reference, rather than `check` over every
+    # entry again: that was eighty-five seconds on every run, warm or cold.
+    seen = _reference_dump("types.out", ENTRIES, _signatures)
     assert "[" in seen, "no scheme carried a context"
     assert "OneOf" in seen, "no numeric literal set survived into a scheme"
     assert "Container.Elem" in seen, "no associated family reached a signature"

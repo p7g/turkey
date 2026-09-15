@@ -73,13 +73,23 @@ KNOWN_COLOUR_REASONS = {
 COLOUR_STOPS = 0
 
 
+def _split_asm(text: str, paths: list[Path]) -> list[str]:
+    modules = bootc.split_before(text, "; === ")
+    assert set(modules) == {p.name for p in paths}, (
+        sorted({p.name for p in paths} - set(modules)))
+    return [modules[p.name] for p in paths]
+
+
 @functools.lru_cache(maxsize=None)
 def _all() -> dict[str, str]:
-    """`boot asm` over the whole corpus, in one run of a compiled `boot`."""
-    text = bootc.boot("asm", *(str(PROGRAMS / name) for name in CORPUS))
-    modules = bootc.split_before(text, "; === ")
-    assert set(modules) == set(CORPUS), sorted(set(CORPUS) - set(modules))
-    return modules
+    """`boot asm` over the whole corpus, cached on disk per program.
+
+    One `boot` run fills the cache and every worker of `pytest -n auto` reads
+    it; kept only in this process, it was one corpus run per worker.
+    """
+    paths = [PROGRAMS / name for name in CORPUS]
+    texts = bootc.boot_each("asm", paths, _split_asm)
+    return {path.name: texts[path] for path in paths}
 
 
 def _asm(name: str) -> str:
@@ -254,10 +264,13 @@ def test_pressure_spills_into_both_kinds_of_slot():
 
 @functools.lru_cache(maxsize=None)
 def _boot_asm() -> str:
-    text = bootc.boot("asm", str(REPO_ROOT / "boot" / "Main.gob"))
-    modules = bootc.split_before(text, "; === ")
-    assert list(modules) == ["Main.gob"], list(modules)
-    return modules["Main.gob"]
+    """`boot asm boot/Main.gob`: one process, about ninety seconds, so cached.
+
+    The build fingerprint covers all of `boot/`, which is what the output
+    depends on besides `Main.gob` itself.
+    """
+    main = REPO_ROOT / "boot" / "Main.gob"
+    return bootc.boot_each("asm", [main], _split_asm)[main]
 
 
 def test_boot_allocates_completely():

@@ -34,12 +34,14 @@ driver.
 
 from __future__ import annotations
 
+import fcntl
 import functools
 import hashlib
 import os
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -55,12 +57,17 @@ _INPUTS = (("boot", "*.gob"), ("lib", "*.gob"),
            ("turkey", "*.py"), ("runtime", "*.c"), ("runtime", "*.h"))
 
 
-def _fingerprint() -> str:
-    """A digest of every input to the build, for use as a cache key."""
+def _fingerprint(root: Path = REPO_ROOT) -> str:
+    """A digest of every input to the build, for use as a cache key.
+
+    Takes the root so that `tests/test_bootc.py` can check the key against a
+    copy. It used to edit the real `boot/` and `turkey/` to do it, which under
+    `pytest -n auto` is a truncated `driver.py` imported by some other worker.
+    """
     h = hashlib.sha256()
     for directory, pattern in _INPUTS:
-        for path in sorted((REPO_ROOT / directory).rglob(pattern)):
-            h.update(str(path.relative_to(REPO_ROOT)).encode())
+        for path in sorted((root / directory).rglob(pattern)):
+            h.update(str(path.relative_to(root)).encode())
             h.update(path.read_bytes())
     return h.hexdigest()[:16]
 
@@ -93,7 +100,18 @@ def binary() -> Path:
     if output.exists():
         return output
     cached.mkdir(parents=True, exist_ok=True)
-    staging = cached / f"boot.{os.getpid()}"
+    # One builder at a time. Racing builders produced the same bytes, so the
+    # race was safe -- but under `pytest -n auto` a cold cache meant sixteen
+    # three-minute builds of one binary. The others wait and find it built.
+    with open(cached / ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if output.exists():
+            return output
+        return _build(output)
+
+
+def _build(output: Path) -> Path:
+    staging = output.parent / f"boot.{os.getpid()}"
     result = subprocess.run(
         [sys.executable, "-m", "turkey", "build", str(BOOT_MAIN),
          "-o", str(staging)],
@@ -119,6 +137,18 @@ def boot(*args: str) -> str:
     dumps are compared line by line, so it lands as a mismatch several thousand
     lines from anything that is actually wrong.
     """
+    out, _ = boot_with_stderr(*args)
+    return out
+
+
+def boot_with_stderr(*args: str) -> tuple[str, str]:
+    """`boot`, answering stdout and stderr both.
+
+    `boot types` reports exhaustiveness warnings on stderr, and `boot` above
+    threw stderr away -- which is how `test_boot`'s types milestone came to run
+    `boot` *interpreted* instead, the one thing this module's header forbids,
+    for six minutes a run (FINDINGS 89).
+    """
     result = subprocess.run(
         [str(binary()), *args],
         cwd=REPO_ROOT,
@@ -128,7 +158,69 @@ def boot(*args: str) -> str:
     err = result.stderr.decode("utf-8")
     assert result.returncode == 0, (
         f"boot exited {result.returncode}\n{out}\n{err}")
-    return out
+    return out, err
+
+
+@functools.lru_cache(maxsize=1)
+def _build_key() -> str:
+    return _fingerprint()
+
+
+def boot_each(command: str, paths: list[Path],
+              split: Callable[[str, list[Path]], list[str]]) -> dict[Path, str]:
+    """`boot <command>` over some programs, cached on disk per program.
+
+    The test modules that run `boot` over the corpus kept the result in an
+    `lru_cache`, which is one run per *process* -- and under `pytest -n auto`
+    every worker that drew one of their tests paid the whole corpus run again.
+    `test_select`'s cost ~22 s a worker, sixteen times.
+
+    Keyed on the build fingerprint -- `boot`, `lib/`, `turkey/`, the runtime --
+    plus the command and the program's own bytes. Corpus programs import only
+    the library, which the fingerprint covers; a program that imported a
+    sibling would need its directory hashed too, as `reference` does.
+
+    The missing programs are computed in one `boot` run under a lock, so a cold
+    cache is filled once while the other workers wait. `split` cuts that run's
+    output into one text per path, in order.
+    """
+    directory = Path(tempfile.gettempdir()) / "turkey-bootout" / _build_key() / command
+    directory.mkdir(parents=True, exist_ok=True)
+
+    def entry(path: Path) -> Path:
+        h = hashlib.sha256()
+        h.update(str(path).encode())
+        h.update(path.read_bytes())
+        return directory / h.hexdigest()[:24]
+
+    def load() -> tuple[dict[Path, str], list[Path]]:
+        found, missing = {}, []
+        for path in paths:
+            cached = entry(path)
+            if cached.exists():
+                found[path] = cached.read_text(encoding="utf-8")
+            else:
+                missing.append(path)
+        return found, missing
+
+    found, missing = load()
+    if not missing:
+        return found
+    with open(directory / ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        found, missing = load()
+        if missing:
+            text = boot(command, *(str(path) for path in missing))
+            chunks = split(text, missing)
+            assert len(chunks) == len(missing), (
+                f"{len(chunks)} dumps for {len(missing)} programs")
+            for path, chunk in zip(missing, chunks):
+                cached = entry(path)
+                staging = cached.with_suffix(f".{os.getpid()}")
+                staging.write_text(chunk, encoding="utf-8")
+                os.replace(staging, cached)
+                found[path] = chunk
+    return found
 
 
 def split_on(text: str, marker: str) -> list[str]:

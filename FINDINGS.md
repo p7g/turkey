@@ -2330,6 +2330,23 @@ declaration in `boot` has its commas. A grammar production with no program
 exercising it is a sentence, not a feature, and the differential cannot tell
 the two apart -- both implementations agreed, byte for byte, on rejecting it.
 
+### 86. A record pattern in a `for` header parsed in one implementation
+**bug, fixed.** SPEC-DELTAS 65's sweep wrote `for Arm { span = _, patterns, body }
+in arms` into `boot` itself. Python parsed it and compiled `boot` with it; the
+compiled `boot` then refused its own source: `expected ';' after the loop
+initializer, found 'in'`. The two parsers tell `for pat in e` from the C-style
+header differently -- Python parses a pattern and backtracks, `boot` scans for
+`in` at bracket depth zero and gives up at the first `{`, which it takes for the
+loop body. A record pattern's `{` is neither.
+
+The scan now treats a `{` straight after a constructor name as a bracket.
+Nothing in the corpus had written a record pattern in that position before, so
+the differential had nothing to disagree about -- the shape of FINDINGS 85, a
+form the grammar allows and no program exercised, found this time by the
+bootstrap compiler reading itself. It was found late because the new syntax
+was checked by compiling `boot` with Python, which is exactly the half of the
+comparison that could not fail.
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

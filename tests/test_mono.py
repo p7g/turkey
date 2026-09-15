@@ -264,7 +264,7 @@ instance Semigroup (Pair a) : Semigroup a {
 
 fun grow[Semigroup a](x : a, n : Int) -> a {
     if n <= 0 { return combine(x, x) }
-    grow(Pair(x, x), n - 1)
+    let _ = grow(Pair(x, x), n - 1)
     return combine(x, x)
 }
 
@@ -360,8 +360,8 @@ fun bump[Semigroup a](x : a) -> a {
 }
 
 fun main() {
-    bump(1)
-    bump("a")
+    let _ = bump(1)
+    let _ = bump("a")
     print(Int.toString(counter.n))
 }
 """)

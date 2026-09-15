@@ -2922,7 +2922,9 @@ line break separates fields here, so this line must begin a field; found '-'`.
 **Scope.** Brace-delimited field lists only. Newline-separated call arguments
 are where Go's rules get awkward -- the mandatory trailing comma before a `)` on
 its own line -- and nothing here asks for them. `record_newlines.gob` accepts all
-three forms; `err_record_newline.gob` pins the unary-minus error.
+three forms; the unary-minus error is pinned in `test_parser.py` and compared
+between the implementations in `test_boot.py`, since a program that fails to
+parse cannot sit in the corpus the differential parses in one run.
 
 ### 65. A record pattern names every field, or ends in `..`
 
@@ -3095,6 +3097,14 @@ instantiate, so the call is checked against the monomorphic placeholder and rule
 a lambda does not generalize and so has nothing to be "any type" over. And
 this is not a soundness fix -- type safety was fine before. What was broken was
 that an annotation did not mean what it said.
+
+**One behaviour of delta 38 goes.** It said "dropping the return type is enough
+to ask for inference back", and that included the context: `fun heads(xs :
+Array a, ys : Array a) = egal(xs, ys)` was inferred as `[Egal a]`. It is now
+rule 4's error, and the context is written -- `fun heads[Egal a](...)`. The
+return type is still inferred; what the header says about `a` is not. That was
+the point of the change, but it is a visible one, and two tests that pinned the
+old reading were rewritten rather than deleted.
 
 `PROPOSALS.md` also claimed this would repair delta 38's `g`. It would not need
 to: `g`'s annotation is complete, and delta 38 already repaired it.

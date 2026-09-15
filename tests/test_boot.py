@@ -470,3 +470,19 @@ def test_boot_reports_a_missing_file(tmp_path: Path) -> None:
     )
     assert result.returncode == 2
     assert "cannot read" in result.stderr
+
+
+def test_boot_reports_a_field_line_break_as_python_does(tmp_path: Path) -> None:
+    """A parse error cannot live in the corpus -- the corpus is parsed in one
+    `boot` run -- so SPEC-DELTAS 64's error is compared here instead."""
+    src = tmp_path / "fields.gob"
+    src.write_text("type P = P { x : Int, y : Int }\n"
+                   "fun f(a : Int, b : Int) -> P = P { x = a\n    -b }\n")
+    booted = subprocess.run([str(bootc.binary()), "ast", str(src)],
+                            cwd=REPO_ROOT, capture_output=True, text=True)
+    python = subprocess.run([sys.executable, "-m", "turkey", "ast", str(src)],
+                            cwd=REPO_ROOT, capture_output=True, text=True,
+                            env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)))
+    assert booted.returncode != 0 and python.returncode != 0
+    assert "a line break separates fields here" in booted.stderr
+    assert booted.stderr == python.stderr

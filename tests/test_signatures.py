@@ -198,9 +198,10 @@ def test_a_context_reaching_the_type_through_a_family_is_accepted():
 
 
 def test_an_omitted_return_type_leaves_the_function_inferred():
-    """One missing piece and the whole annotation is soft again."""
+    """One missing piece and the rest of the type is inferred -- but what the
+    header did write is held to (SPEC-DELTAS 67), context included."""
     src = """
-    fun size(xs : a) {
+    fun size[Iterator a](xs : a) {
         var n = 0
         for x in xs { n = n + 1 }
         n
@@ -208,6 +209,23 @@ def test_an_omitted_return_type_leaves_the_function_inferred():
     """
     assert scheme(src, "size") == \
         "[OneOf b {Int, Float}, Iterator a, Add b] fun(a) -> b"
+
+
+def test_an_omitted_return_type_no_longer_infers_a_written_variables_context():
+    """Delta 38 said dropping the return type asked for inference back, context
+    and all. Delta 67 keeps the inference and not the context: `a` was written,
+    so what may be assumed of it is what was written."""
+    from turkey.errors import TypeError_
+    src = """
+    fun size(xs : a) {
+        var n = 0
+        for x in xs { n = n + 1 }
+        n
+    }
+    fun main() { print(Int.toString(size([1]))) }
+    """
+    with pytest.raises(TypeError_, match="needs 'Iterator a', which the context"):
+        scheme(src, "size")
 
 
 def test_an_unannotated_parameter_leaves_the_function_inferred():

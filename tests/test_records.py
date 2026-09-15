@@ -109,11 +109,16 @@ def test_a_positional_pattern_must_supply_every_field():
     )
 
 
-def test_a_record_pattern_may_still_name_a_subset(capsys):
+def test_a_record_pattern_names_a_subset_only_with_rest(capsys):
+    """SPEC-DELTAS 65: a subset is still allowed, but it has to say so."""
+    silent = SHAPES + "fun f(s : Shape) -> Int = match s {\n    Rect { height } -> height\n    Circle(r) -> r\n}"
+    assert fails(silent) == (
+        "the pattern 'Rect' does not mention field 'width'; name it, or write "
+        "'..' to ignore the rest")
     src = SHAPES + """
 fun main() {
     print(Int.toString(match Rect(3, 4) {
-        Rect { height } -> height
+        Rect { height, .. } -> height
         Circle { radius } -> radius
     }))
 }

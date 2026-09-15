@@ -882,15 +882,20 @@ def test_an_array_element_is_one_indirection_closer():
 def test_a_one_armed_if_discards_a_branch_that_answers_something(capfd):
     """`if c { e }` is `Unit` whatever `e` is (section 6.7, `infer._gen_EIf`).
 
-    The branch here answers an `Option`, held at `PTR`, where the `if` answers
-    `Unit`. Lowering the branch straight into the `if`'s destination made that
-    a `ptr` arriving where a `unit` was expected; the value is simply not
-    wanted, and nothing had said so.
+    The branch here answers a value the `if` does not: once an `Option` held at
+    `PTR`, and since SPEC-DELTAS 66 made discarding one an error, the result of
+    a call that cannot return, whose type is a bare variable. Lowering the
+    branch straight into the `if`'s destination made that a value arriving
+    where a `unit` was expected; the value is simply not wanted, and nothing
+    had said so.
     """
     native("""
+fun stop() -> a { loop {} }
+
 fun main() {
     let xs = [1, 2, 3]
-    if len(xs) > 0 { Array.pop(xs) }
+    if len(xs) > 5 { stop() }
+    let _ = Array.pop(xs)
     print(len(xs))
 }
 """)

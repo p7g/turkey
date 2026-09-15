@@ -101,7 +101,7 @@ def test_an_ambiguous_literal_defaults_at_the_binder() -> None:
     defaulting is that ambiguity is exactly the condition that licenses a
     choice.
     """
-    assert sigs('fun main() { 1\n  print("hi") }\n') == {"main": "fun() -> Unit"}
+    assert sigs('fun main() { let _ = 1\n  print("hi") }\n') == {"main": "fun() -> Unit"}
 
 
 def test_defaulting_prefers_the_head_of_the_tower(monkeypatch) -> None:

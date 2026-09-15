@@ -264,3 +264,24 @@ def test_record_pattern_punning_expands_to_a_pvar():
     name, sub = p.fields[0]
     assert name == "n"
     assert isinstance(sub, ast.PVar) and sub.name == "n"
+
+
+# -- SPEC-DELTAS 64: a newline separates fields ------------------------------
+
+
+@pytest.mark.parametrize("src", [
+    "type P = P {\n    x : Int\n    y : Int\n}\n",
+    "fun f() = P {\n    x = 1\n    y = 2\n}\n",
+    "fun f(p) = match p {\n    P {\n        x\n        ..\n    } -> x\n}\n",
+])
+def test_a_newline_separates_fields_in_every_brace_list(src):
+    parse(src)
+
+
+def test_a_line_break_that_ends_a_field_says_so():
+    """`-b` on its own line is a new field, not `a - b` (SPEC-DELTAS 64). The
+    corpus cannot hold this case: `test_boot` parses every corpus file in one
+    run, so a program that fails to parse stops it; see `test_boot`."""
+    src = "fun f(a, b) = P { x = a\n    -b }\n"
+    with pytest.raises(ParseError, match="a line break separates fields here"):
+        parse(src)

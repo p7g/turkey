@@ -157,14 +157,15 @@ def test_a_missing_instance_names_the_type_that_lacks_one():
 def test_an_instance_context_becomes_the_use_site_obligation():
     """`Egal (Array a)` holds only where `Egal a` does, and says so.
 
-    No return type, so this is inferred rather than checked (delta 38) and the
-    context is the solver's to discover.
+    No return type, so this is inferred rather than checked (delta 38); the
+    written `a` is held to its written context (delta 67), and the solver
+    discovers that the instance's `Egal a` is what that context has to say.
     """
     src = EQ + """
     instance Egal (Array a) : Egal a {
         fun egal(xs, ys) = egal(xs[0], ys[0])
     }
-    fun heads(xs : Array a, ys : Array a) = egal(xs, ys)
+    fun heads[Egal a](xs : Array a, ys : Array a) = egal(xs, ys)
     """
     assert sigs(src)["heads"] == "[Egal a] fun(Array a, Array a) -> Bool"
 

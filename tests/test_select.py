@@ -60,15 +60,17 @@ KNOWN_REASONS = {
     "need stack arguments",
 }
 
-# What stops the colourer. There is no spiller yet, so a function whose values
-# outnumber the free registers at some point stops with this and is counted
-# rather than coloured wrongly. The same ratchet as selection's: a new reason
-# is an event, and the count below is exact so that it moving is too.
+# What stops the allocator. With spilling there should be nothing: a value
+# with no register goes to memory instead. These are the reasons it can still
+# give up, and the count below is exact so that one appearing is an event.
 KNOWN_COLOUR_REASONS = {
     "a value with no free register in the general file",
     "a value with no free register in the vector file",
+    "a reload or store with no free register in the general file",
+    "a reload or store with no free register in the vector file",
+    "spilling did not finish in 16 rounds",
 }
-COLOUR_STOPS = 10
+COLOUR_STOPS = 0
 
 
 @functools.lru_cache(maxsize=None)
@@ -114,10 +116,27 @@ def _colour_reasons(text: str) -> dict[str, int]:
     return out
 
 
+def _spilled(text: str) -> dict[str, int]:
+    """`-- spilled V values  R into root slots  S spill slots  ...  rounds N`."""
+    lines = [line for line in text.splitlines()
+             if line.startswith("-- spilled ")]
+    assert len(lines) == 1, lines
+    words = lines[0].split()
+    return {"values": int(words[2]), "root": int(words[4]),
+            "slots": int(words[8]), "stores": int(words[11]),
+            "reloads": int(words[13]), "rounds": int(words[16])}
+
+
 def _reasons(text: str) -> dict[str, int]:
+    """Selection's histogram: `--   <count>  <reason>`.
+
+    `--   over budget  <function>` shares the prefix and is not a reason; it
+    first appeared in the corpus with `pressure.gob`, whose point is to be
+    over budget, and crashed this parser.
+    """
     out: dict[str, int] = {}
     for line in text.splitlines():
-        if line.startswith("--   "):
+        if line.startswith("--   ") and not line.startswith("--   over budget"):
             count, _, why = line[5:].strip().partition("  ")
             out[why.strip()] = int(count)
     return out
@@ -203,15 +222,57 @@ def test_no_unknown_colour_reason_appears(name):
     assert found <= KNOWN_COLOUR_REASONS, sorted(found - KNOWN_COLOUR_REASONS)
 
 
-def test_the_corpus_colours_apart_from_the_known_gap():
-    """The allocation ratchet, and the one that has to reach zero.
+def test_the_corpus_colours_completely():
+    """The allocation ratchet, which spilling took from 10 to 0.
 
-    Every stop here is a function that would need a spill or a split live
-    range. The count is exact rather than a bound: spilling lands, it goes
-    to zero, and this assertion changes with it.
+    Every stop was a function whose values outnumbered the registers free at
+    some point -- all of them across a call, in the corpus. Exact rather than
+    a bound, so that one coming back is noticed.
     """
     stopped = sum(sum(_colour_reasons(_asm(name)).values()) for name in CORPUS)
     assert stopped == COLOUR_STOPS, stopped
+
+
+def test_pressure_spills_into_both_kinds_of_slot():
+    """`pressure.gob` exists to take every spilling path.
+
+    Thirty-two integers live at once, twelve doubles and twelve pointers live
+    across calls. The pointers are rooted, so some spilled value must land in
+    a root slot; the integers and doubles are not, so some must need a spill
+    slot of their own. A program that spilled nothing, or only one kind, would
+    be a program `opt` had simplified out from under the test.
+    """
+    text = _asm("pressure.gob")
+    spilled = _spilled(text)
+    assert spilled["values"] > 0, spilled
+    assert spilled["root"] > 0, spilled
+    assert spilled["slots"] > 0, spilled
+    assert spilled["stores"] == spilled["values"], spilled
+    assert spilled["reloads"] >= spilled["values"], spilled
+    assert not _colour_reasons(text), _colour_reasons(text)
+
+
+@functools.lru_cache(maxsize=None)
+def _boot_asm() -> str:
+    text = bootc.boot("asm", str(REPO_ROOT / "boot" / "Main.gob"))
+    modules = bootc.split_before(text, "; === ")
+    assert list(modules) == ["Main.gob"], list(modules)
+    return modules["Main.gob"]
+
+
+def test_boot_allocates_completely():
+    """The compiler's own source, which is what the spiller is for.
+
+    Before spilling, 249 of `boot`'s functions stopped: 88 values live at once
+    in `%module.initialize`, 35 of them untraced, and 84 live across one call
+    against ten callee-saved registers. The corpus alone never needed a
+    spiller, so this is the test that says it works on the program M29 needs.
+    """
+    text = _boot_asm()
+    assert not _colour_reasons(text), _colour_reasons(text)
+    complaints = [line for line in text.splitlines() if "!!" in line]
+    assert not complaints, complaints[:20]
+    assert set(_reasons(text)) <= KNOWN_REASONS, sorted(_reasons(text))
 
 
 def _function(text: str, name: str) -> tuple[str, list[str]]:

@@ -53,6 +53,7 @@ import Turkey.Layout as Layout
 import Turkey.Arm64 as Arm64
 import Turkey.Select as Select
 import Turkey.Regalloc as Regalloc
+import Turkey.Roots as Roots
 import Turkey.Llvm as Llvm
 import Turkey.LowIr as LowIr
 import Turkey.Ssa as Ssa
@@ -423,29 +424,65 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
     var hintTaken = 0
     var hintTotal = 0
     let colourStops = Map.new()
+    -- Spilling needs each function's root slots, which `Turkey.Roots` computes
+    -- from the low IR. Selection keeps the value numbering, so a slot found
+    -- there names the same value here.
+    let lows = Map.new()
+    for low in module_.functions { Map.put(lows, low.name, low) }
+    var spilled = 0
+    var stores = 0
+    var reloads = 0
+    var rootSpills = 0
+    var spillSlots = 0
+    var maxRounds = 0
     for f in selected {
-        let c = Regalloc.colour(f)
-        match c.stopped {
+        let roots = match Map.get(lows, f.name) {
+            Some(low) -> Roots.analyze(low).slots
+            None -> Map.new()
+        }
+        let a = Regalloc.allocate(f, roots)
+        match a.stopped {
             Some(why) -> Map.put(colourStops, why,
                                  Map.getOr(colourStops, why, 0) + 1)
             None -> { coloured = coloured + 1 }
         }
-        -- Only a colouring that finished. One that stopped has values with
+        -- Only an allocation that finished. One that stopped has values with
         -- no register *by construction* -- that is what stopping means -- so
         -- verifying it reports hundreds of consequences of the one thing
         -- already in the histogram. Selection has the same rule: a function it
         -- could not select is not then checked for being badly selected.
-        match c.stopped {
+        --
+        -- Three checks, because spilling rewrote the function: the graph is
+        -- still a graph, the colouring is still a colouring, and the spill
+        -- code is where it claims to be.
+        match a.stopped {
             Some(_) -> {}
             None -> {
-                for message in Regalloc.verifyColouring(f, c) {
+                for message in Ssa.verify(a.func) {
+                    String.push(b, "  !! " + f.name + ": " + message + "\n")
+                }
+                for message in Regalloc.verifyColouring(a.func, a.colouring) {
+                    String.push(b, "  !! " + f.name + ": " + message + "\n")
+                }
+                for message in Regalloc.verifyAllocation(a) {
                     String.push(b, "  !! " + f.name + ": " + message + "\n")
                 }
             }
         }
-        let (got, want) = Regalloc.hintsTaken(f, c)
+        let (got, want) = Regalloc.hintsTaken(a.func, a.colouring)
         hintTaken = hintTaken + got
         hintTotal = hintTotal + want
+        for id in Map.keys(a.spills.slots) {
+            spilled = spilled + 1
+            match Map.get(a.spills.slots, id) {
+                Some(slot) -> if Arm64.isRootSlot(slot) { rootSpills = rootSpills + 1 }
+                None -> {}
+            }
+        }
+        stores = stores + a.spills.stores
+        reloads = reloads + len(Map.keys(a.spills.reloadOf))
+        spillSlots = spillSlots + a.spills.spillSlots
+        if a.rounds > maxRounds { maxRounds = a.rounds }
     }
     -- The two numbers that say whether a real spiller is ever needed. An
     -- untraced value has no root slot, so if those alone overflow the file a
@@ -465,6 +502,14 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
                    + Int.toString(Regalloc.calleeSavedGp) + "\n")
     String.push(b, "-- coloured " + Int.toString(coloured) + " of "
                    + Int.toString(len(selected)) + " functions\n")
+    -- What spilling cost, which is the number splitting would be measured
+    -- against: every reload here is one load a split live range might save.
+    String.push(b, "-- spilled " + Int.toString(spilled) + " values  "
+                   + Int.toString(rootSpills) + " into root slots  "
+                   + Int.toString(spillSlots) + " spill slots  "
+                   + Int.toString(stores) + " stores  "
+                   + Int.toString(reloads) + " reloads  rounds "
+                   + Int.toString(maxRounds) + "\n")
     -- Every missed hint is one `mov` the emitter keeps at the top of a
     -- function. A miss is not a bug -- a parameter live across a call must
     -- miss, its argument register being caller-saved -- so this is the first

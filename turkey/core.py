@@ -734,9 +734,15 @@ def _pattern(pat) -> str:
     if isinstance(pat, ast.PLit):
         return literal_text(pat.kind, pat.value)
     if isinstance(pat, ast.PCon):
+        opened = ""
+        if pat.skolems:
+            layouts = ("" if pat.layouts is None
+                       else "@" + ",".join(pat.layouts))
+            opened = (f"[{', '.join(s.name for s in pat.skolems)}{layouts}]"
+                      f"({', '.join(pat.evidence)})")
         if not pat.args:
-            return pat.name
-        return f"{pat.name}({', '.join(_pattern(a) for a in pat.args)})"
+            return pat.name + opened
+        return f"{pat.name}{opened}({', '.join(_pattern(a) for a in pat.args)})"
     if isinstance(pat, ast.PRecord):
         parts = [f"{n} = {_pattern(p)}" for n, p in pat.fields]
         if pat.rest:

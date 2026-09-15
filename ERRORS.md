@@ -1,6 +1,7 @@
 # Error handling
 
-Status: **direction decided; layout and recovery contracts open; nothing built.** The plan is at the end. The
+Status: **direction decided; layout contract selected and prototyped (Python,
+Core down); recovery contract open; nothing built.** The plan is at the end. The
 survey is kept because it is what would otherwise be redone, and because it
 reversed the question this started from.
 
@@ -242,10 +243,12 @@ Every item below is in both `turkey/` and `boot/`.
   keeps its `CTyApp` and dictionary and calls the generic binding -- the exit the
   polymorphic-recursion cap already uses. The devirtualizer must not collapse a
   selection off a pattern-bound dictionary.
-* **`layout`:** an existential field is always stored at the uniform,
-  pointer-shaped representation when its type is a bare hidden variable;
-  construction boxes a scalar. This alone does not settle fields such as
-  `Array s` or `Option s`. See the layout milestone below.
+* **`layout`:** fields are stored at the packed type's own layout, and the
+  packed value records one layout code per hidden variable. `share` copies
+  each opened arm per packed layout key, shares bindings that pack at their
+  own binders, and prunes to the keys reachable packings store. Boxing the bare
+  field was the earlier proposal and does not work even for `SomeError`; see
+  the layout milestone below.
 * **`opt`:** case-of-known-constructor substitutes the type and the dictionary,
   so pack-then-match in one function specializes and devirtualizes fully.
 * **Backends:** dictionaries add traced pointer fields, but the work for hidden
@@ -334,8 +337,83 @@ value's representation does with one.
    mutation through the opened array is invisible to the original. Rejected
    unless the prototype finds a reason to revisit.
 
-Going into the prototype the working choice is **1**. The prototype's job is
-to show it handles every acceptance case above and to measure its code size.
+### Result: contract 1, prototyped
+
+**Selected: layout evidence plus dispatch to layout-keyed copies.** A
+Python-only prototype passes every acceptance case above on the native
+backend, the Python backend and the evaluator, at the default specialization
+cap and at zero, with and without `TURKEY_GC_STRESS`
+(`tests/test_existential_layout.py`). There is no syntax or inference yet:
+each program is an ordinary source file for the helpers plus hand-built Core for
+the pack and open sites, which is the elaboration step 2's front end has to
+produce.
+
+What the prototype is:
+
+* **Representation.** A packed object is one `i64` layout code per hidden
+  variable, then the carried dictionaries, then the declared fields. Codes
+  are the collector's 3-bit layout codes. `ConInfo` gains `exists` and
+  `context`, and its scheme is `forall params exists. fun(dicts..., fields...)
+  -> T`; the evaluators see the dictionaries as leading arguments and no codes.
+* **Opening.** `ast.PCon` carries the arm's `evidence` names, its `skolems`,
+  and, after sharing, the `layouts` that copy was made for (the prototype's
+  stand-in for `CAlt`'s evidence list). `layout.share` copies each opened arm
+  once per layout key and rewrites the copy's body with the skolem's layout
+  known, keyed `-uid` in `abstracted`, so calls at the skolem find `f@[i64]`
+  like any other layout-keyed call. The backend takes a copy when the stored
+  codes match its key.
+* **Refusal instead of guessing.** `layout_of` answers "unknown" for a skolem
+  with no layout, `held_at` then refuses, and `check_layouts` refuses an
+  existential arm that reached the backend uncopied.
+
+Test coverage: scalar payloads of every layout through a bare-variable generic
+(`pick`) and repacked at the skolem; arrays of `Int`, `Bool`, `Float`, `String`,
+`Byte` and `Char` through generic helpers; `Array (Option a)` and
+`Array (Array a)`; a closure `fun(a) -> a` whose results are written back into
+the flat array; a carried `Show` dictionary called on elements (the
+`SomeError`-at-`Int` case); aliasing through two packings of one array; packing
+in a generic body past the cap, both through `Array a` and through a bare `a`
+with a dictionary; and escape of a skolem from its arm, refused in Core.
+
+Each safety property was checked by breaking it. With dispatch removed the
+compiler refuses the program. With every packing storing "boxed" the output is
+wrong (`0.0`, `60`, a stray code point). With `layout._packs` removed the
+bare-variable generic packing prints wrong values.
+
+What it found:
+
+1. **An unknown layout must not fall back to `ptr`.** The first version answered
+   `ptr` for a skolem with no layout, like every other `TCon`. With dispatch
+   disabled the `Int`, `Bool`, `Float` and `String` tests still passed:
+   `i64`, `i1` and `ptr` are all 8-byte words, and the wrong name read the right
+   bits. Only `Byte` (1 byte) and `Char` (4 bytes) payloads could have
+   noticed. The fix is the refusal above, and the tests keep narrow payloads.
+2. **A body that packs needs its layouts as much as one that destructures.**
+   `packOne[a](d, x : a)` is not transparent, so `layout.share` left it generic
+   past the cap. It held `x` boxed and stored "boxed", and the opened copy then
+   called an `i64` method with a box. `layout._packs` adds such bindings to the
+   shared set. It is the existential form of NATIVE-BACKEND.md's `mk : a -> Box
+   a` hole; the general form is still the xfail in `tests/test_layout.py` and
+   should be closed by the same rule extended to every construction.
+3. **Copies multiply under inlining.** In the `packed_arrays` program, measured
+   in backend IR instructions, the cost of one layout is about 1,400
+   instructions. Copying for all 8 layouts gives 11,767. Copying only for keys
+   some reachable packing stores gives 8,919 (6 layouts; `layout._packed_layouts`
+   counts a packing inside an arm copy only if that copy's own key is packed).
+   The same program written as a generic function, with no existential, is
+   3,759 fully specialized or 3,257 at cap zero. Almost all of the difference is
+   `main` (8,726 against 1,520): `opt` inlined the opener at six call sites, and
+   each inlined `match` kept every copy, because case-of-known-constructor is
+   disabled for existential patterns in the prototype. Step 2's `opt` item
+   (substitute the packed type and dictionary on pack-then-match) is therefore
+   a size requirement, not only a speed one. Without inlining, the dispatch
+   itself costs one load and compare per hidden variable per arm.
+4. **Evaluators need nothing but the evidence names.** Layouts are the native
+   backend's; `pygen` and `eval` take the first matching copy.
+
+Not established by the prototype: nested *existential* openings of two hidden
+variables at once (the product of keys is implemented but untested), recursive
+existential types, and anything in `boot/`.
 
 Sources for this section:
 [Kennedy & Syme, Design and Implementation of Generics for the .NET CLR](https://www.microsoft.com/en-us/research/publication/design-and-implementation-of-generics-for-the-net-common-language-runtime/),
@@ -486,9 +564,16 @@ would reopen this is a FINDINGS entry where a type-indexed structure is wanted.
 
 ## Plan
 
-1. **Resolve existential layouts.** Prove the nested-container and closure
-   cases above, selecting a representation/evidence contract before estimating
-   the full implementation. Scalar boxing alone is not acceptance.
+1. **Resolve existential layouts.** *Done as a prototype:* contract 1, see
+   "Result: contract 1, prototyped". What moves to step 2 from it: `ConInfo`'s
+   `exists`/`context`; evidence and layouts on the opened pattern (or `CAlt`);
+   `coretc`'s pattern rule and escape check; `mono._ground` refusing skolems;
+   `layout.open_arms`, `_packs` and `_packed_layouts`; `backend_lower.packed`,
+   `lower_opened` and the skolem case of `layout_of`; evidence binding in
+   `pygen` and `eval`. Every one needs its `boot/` mirror (`Core.gob`,
+   `CoreTc`, `Mono.gob`, `Layout.gob`, `SsaLower.gob`, the evaluator), and
+   `opt`'s pack-then-match rule is required before any real program uses
+   existentials, per finding 3.
 2. **Existential constructors.** A SPEC-DELTAS entry, then the implementation
    list above on both sides, with goldens regenerated for `CAlt`'s evidence.
    Tests: escape rejected (including through enclosing variables), `let` pattern

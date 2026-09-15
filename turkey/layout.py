@@ -59,14 +59,20 @@ is a fixed point, reached below.
 
 from __future__ import annotations
 
+import itertools
 from dataclasses import fields as _dataclass_fields, replace
 
+from . import ast
 from . import backend_ir as bir
 from .backend_lower import layout_of
-from .core import (CAlt, CBind, CExpr, CProgram, CTyApp, CVar,
-                   abstraction_binders, names_of,
+from .core import (CAlt, CApp, CBind, CCon, CExpr, CMatch, CProgram, CTyApp,
+                   CVar, abstraction_binders, names_of,
                    transparent_parameters as core_transparent)
 from .types import Type, vars_of
+
+#: PROTOTYPE (ERRORS.md, existential layouts): every layout a packed variable
+#: can have been stored at, in the order an opened arm is copied for them.
+OPENED_LAYOUTS = tuple(layout.value for layout in bir.Layout)
 
 _FIELDS: dict[type, tuple] = {}
 
@@ -105,7 +111,53 @@ def _applications(node, out: list[CTyApp]) -> None:
             _applications(item, out)
 
 
-def _needs_layouts(binds: dict[str, CBind]) -> set[str]:
+def _opened(pat) -> ast.PCon | None:
+    """The existential constructor pattern an arm opens, if it opens one."""
+    while isinstance(pat, ast.PAnnot):
+        pat = pat.pat
+    if isinstance(pat, ast.PCon) and pat.skolems:
+        return pat
+    return None
+
+
+def _opens(node) -> bool:
+    """Whether an existential arm appears anywhere inside a term."""
+    if isinstance(node, CAlt) and _opened(node.pat) is not None:
+        return True
+    if isinstance(node, (CExpr, CAlt, CBind)):
+        return any(_opens(getattr(node, f.name)) for f in _fields(node))
+    if isinstance(node, (list, tuple)):
+        return any(_opens(item) for item in node)
+    return False
+
+
+def _packs(node, abstracted: set[int], decls) -> bool:
+    """Whether a term packs an existential at a type mentioning `abstracted`.
+
+    PROTOTYPE. Packing stores the hidden variable's layout in the value, so a
+    body left generic in that variable would store "boxed" for a value it
+    actually holds at `i64` -- and the arm that opens it would read the array
+    at the width the code names rather than the one it was built at. Such a
+    body needs its layouts known exactly as a transparent one does.
+
+    `NATIVE-BACKEND.md`'s `fun mk(x : a) -> Box a` is the non-existential form
+    of the same disagreement, and this rule does not cover it.
+    """
+    if (isinstance(node, CApp) and isinstance(node.fn, CCon) and decls is not None):
+        info = decls.constructors.get(node.fn.name)
+        if (info is not None and info.is_existential
+                and any({v.id for v in vars_of(arg.ty)} & abstracted
+                        for arg in node.args)):
+            return True
+    if isinstance(node, (CExpr, CAlt, CBind)):
+        return any(_packs(getattr(node, f.name), abstracted, decls)
+                   for f in _fields(node))
+    if isinstance(node, (list, tuple)):
+        return any(_packs(item, abstracted, decls) for item in node)
+    return False
+
+
+def _needs_layouts(binds: dict[str, CBind], decls=None) -> set[str]:
     """The bindings whose abstracted layouts have to be known.
 
     The transparent ones, and then whatever calls them at a type of its own.
@@ -120,6 +172,9 @@ def _needs_layouts(binds: dict[str, CBind]) -> set[str]:
     walk. Sharing an unreachable binding costs a copy nothing emits.
     """
     found = {name for name, bind in binds.items() if transparent(bind)}
+    found |= {name for name, bind in binds.items()
+              if abstraction_binders(bind) and _packs(
+                  bind.value, {v.id for v in abstraction_binders(bind)}, decls)}
     while True:
         grew = False
         for name in binds:
@@ -163,11 +218,96 @@ def _key(args: list[Type], abstracted: dict[int, str],
     return tuple(out)
 
 
+def _packed_key(info, node: CApp, abstracted: dict[int, str],
+                decls) -> tuple[str, ...] | None:
+    """The layouts one packing stores for its hidden variables, or None if
+    they are not knowable here. Matched one way, so no type is changed."""
+    from .classes import match
+    from .types import TVar, prune
+    found: dict[int, Type] = {}
+    for param, argument in zip(info.scheme.body.params, node.args):
+        found.update(match(param, prune(argument.ty)) or {})
+    key = []
+    for variable in info.exists:
+        packed = found.get(variable.id)
+        if packed is None:
+            return None
+        chosen = layout_of(packed, abstracted, decls)
+        if chosen is None:
+            if not isinstance(prune(packed), TVar):
+                return None
+            chosen = bir.Layout.BOXED
+        key.append(chosen.value)
+    return tuple(key)
+
+
+def _packed_layouts(program: CProgram, decls) -> dict[str, set[tuple[str, ...]]]:
+    """For each existential constructor, the layout keys some reachable
+    packing stores.
+
+    PROTOTYPE. A packing inside a copy of an opened arm happens only if that
+    copy is ever taken, so it counts only once the key its arm was copied for
+    is itself packed somewhere. Counting it unconditionally would let a repack
+    at the skolem in the `unit` copy of an arm justify keeping the `unit` copy.
+    """
+    records: list[tuple[str, tuple[str, ...] | None, frozenset]] = []
+
+    def walk(node, abstracted: dict[int, str], conditions: frozenset) -> None:
+        if isinstance(node, CMatch):
+            walk(node.scrutinee, abstracted, conditions)
+            for alt in node.alts:
+                pat = _opened(alt.pat)
+                if pat is not None and pat.layouts is not None:
+                    inner = dict(abstracted)
+                    inner.update({-s.uid: layout
+                                  for s, layout in zip(pat.skolems, pat.layouts)})
+                    walk(alt.body, inner, conditions | {(pat.name, pat.layouts)})
+                else:
+                    walk(alt.body, abstracted, conditions)
+            return
+        if isinstance(node, CApp) and isinstance(node.fn, CCon):
+            info = decls.constructors.get(node.fn.name)
+            if info is not None and info.is_existential:
+                records.append((info.name,
+                                _packed_key(info, node, abstracted, decls),
+                                conditions))
+        if isinstance(node, (CExpr, CAlt, CBind)):
+            for f in _fields(node):
+                walk(getattr(node, f.name), abstracted, conditions)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item, abstracted, conditions)
+
+    for bind in program.dicts + program.binds:
+        walk(bind.value, bind.layouts, frozenset())
+    live: dict[str, set[tuple[str, ...]]] = {}
+    changed = True
+    while changed:
+        changed = False
+        for name, key, conditions in records:
+            if not all(want in live.get(con, set()) for con, want in conditions):
+                continue
+            arity = len(decls.constructors[name].exists)
+            keys = ([key] if key is not None else
+                    list(itertools.product(OPENED_LAYOUTS, repeat=arity)))
+            have = live.setdefault(name, set())
+            for one in keys:
+                if one not in have:
+                    have.add(one)
+                    changed = True
+    return live
+
+
 class _Sharer:
-    def __init__(self, program: CProgram, decls) -> None:
+    def __init__(self, program: CProgram, decls,
+                 packed: dict[str, set[tuple[str, ...]]] | None = None) -> None:
         self.decls = decls
+        #: Which layout keys each existential constructor is packed at, when
+        #: known; an opened arm is copied for those alone. None copies every
+        #: layout, which is the first of `share`'s two runs.
+        self.packed = packed
         self.binds = {b.name: b for b in program.dicts + program.binds}
-        self.shared = _needs_layouts(self.binds)
+        self.shared = _needs_layouts(self.binds, decls)
         # key -> the name built for it, and the copies in request order.
         self.done: dict[tuple[str, tuple[str, ...]], str] = {}
         self.made: dict[str, list[CBind]] = {}
@@ -175,7 +315,7 @@ class _Sharer:
         self.used = set(self.binds)
 
     def run(self, program: CProgram) -> CProgram:
-        if not self.shared:
+        if not self.shared and not _opens(program.dicts + program.binds):
             return program
         rewritten = {
             name: replace(bind, value=self.rewrite(bind.value, bind.layouts))
@@ -264,6 +404,8 @@ class _Sharer:
                 if key is not None:
                     made = self.request(node.fn.name, key)
                     return replace(node, fn=replace(node.fn, name=made))
+        if isinstance(node, CMatch):
+            return self.open_arms(node, abstracted)
         if isinstance(node, (CExpr, CAlt, CBind)):
             return type(node)(**{
                 f.name: self.rewrite(getattr(node, f.name), abstracted)
@@ -276,9 +418,50 @@ class _Sharer:
         return node
 
 
+    def open_arms(self, node: CMatch, abstracted: dict[int, str]) -> CMatch:
+        """One copy of each existential arm per layout it may have been packed at.
+
+        PROTOTYPE of contract 1 in ERRORS.md, "Contracts considered". Inside a
+        copy the opened skolems have a layout -- keyed by `-uid`, so that
+        `layout_of` can tell them from the binding's own variables -- and the
+        body is rewritten under it like any layout-keyed copy: a call at the
+        skolem finds `f@[i64]`, an element read is at `i64`, a closure is
+        called at `i64`. The copy's pattern records its layouts, and the
+        backend takes the arm only when the value's stored codes match them.
+        Nothing is converted, so an opened array is the array that was packed.
+        """
+        alts: list[CAlt] = []
+        for alt in node.alts:
+            pat = _opened(alt.pat)
+            if pat is None or pat.layouts is not None:
+                alts.append(self.rewrite(alt, abstracted))
+                continue
+            allowed = None if self.packed is None else self.packed.get(pat.name, set())
+            for key in itertools.product(OPENED_LAYOUTS, repeat=len(pat.skolems)):
+                if allowed is not None and key not in allowed:
+                    continue
+                inner = dict(abstracted)
+                inner.update({-skolem.uid: layout
+                              for skolem, layout in zip(pat.skolems, key)})
+                alts.append(CAlt(replace(pat, layouts=key),
+                                 self.rewrite(alt.body, inner)))
+        return replace(node, scrutinee=self.rewrite(node.scrutinee, abstracted),
+                       alts=alts)
+
+
 def share(program: CProgram, decls) -> CProgram:
-    """The program with one body per layout of every binding that needs one."""
-    return _Sharer(program, decls).run(program)
+    """The program with one body per layout of every binding that needs one.
+
+    Twice when the program opens an existential (PROTOTYPE): once copying every
+    opened arm for every layout, which is what makes every packing's layouts
+    knowable, and again copying each arm only for the keys some reachable
+    packing stores. The second run can only drop copies, so the keys the
+    first found are still a superset of what the second can pack.
+    """
+    first = _Sharer(program, decls).run(program)
+    if not _opens(program.dicts + program.binds):
+        return first
+    return _Sharer(program, decls, _packed_layouts(first, decls)).run(program)
 
 
 __all__ = ["share", "transparent"]

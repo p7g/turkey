@@ -93,6 +93,15 @@ class PCon(Pattern):
 
     name: str
     args: list[Pattern] = field(default_factory=list)
+    # PROTOTYPE (ERRORS.md, existential layouts). Opening an existential
+    # constructor binds more than its sub-patterns say: the dictionaries it
+    # carries, under `evidence`, and one rigid constant per hidden variable,
+    # under `skolems`. `layouts` is `layout.share`'s: the layout each skolem
+    # stands for in this copy of the arm, which the value's stored layout codes
+    # must match for the arm to be taken. None before sharing.
+    evidence: list[str] = field(default_factory=list)
+    skolems: list = field(default_factory=list)
+    layouts: tuple | None = None
 
 
 @dataclass(eq=False)

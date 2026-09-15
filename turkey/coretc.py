@@ -573,6 +573,7 @@ class Checker:
             for name, ty in self.pattern(alt.pat, scrutinee, e.span).items():
                 inner.define(name, [], ty)
             got = self.check(alt.body, inner, joins)
+            _refuse_escape(alt.pat, got, e.span)
             result = got if result is None else _join(result, got)
         return e.ty if result is None else result
 
@@ -667,8 +668,26 @@ class Checker:
                     f"matched against {show(target)}", span)
             mapping = _head_mapping(info.scheme, target)
             assert isinstance(info.scheme.body, TFun)
-            fields = [substitute(p, mapping) for p in info.scheme.body.params]
             out = {}
+            carried: list[Type] = []
+            if info.is_existential:
+                # PROTOTYPE. The hidden variables are the pattern's rigid
+                # constants and nothing the scrutinee says; the dictionaries
+                # arrive under the names the pattern gives them.
+                if (not isinstance(pat, ast.PCon)
+                        or len(pat.skolems) != len(info.exists)
+                        or len(pat.evidence) != len(info.context)):
+                    raise CoreError(
+                        f"'{pat.name}' is existential, and this pattern does "
+                        f"not open it", span)
+                mapping = dict(mapping)
+                mapping.update({v.id: s for v, s in
+                                zip(info.exists, pat.skolems)})
+                carried = [substitute(p, mapping) for p in
+                           info.scheme.body.params[:len(info.context)]]
+                out.update(zip(pat.evidence, carried))
+            fields = [substitute(p, mapping)
+                      for p in info.scheme.body.params[len(carried):]]
             if isinstance(pat, ast.PCon):
                 if len(pat.args) != len(fields):
                     raise CoreError(
@@ -844,6 +863,27 @@ def _class_method(methods: dict[str, object], written: str):
 
 def _member_surface(name: str) -> str:
     return name.rpartition(".")[2].rpartition("#")[2] or name
+
+
+def _refuse_escape(pat, got: Type, span: Span | None) -> None:
+    """An arm's type may not mention a constant its own pattern opened.
+
+    PROTOTYPE, and the Core half of the check ERRORS.md gives inference: the
+    constant stands for a type chosen at each packing, so a value of it leaving
+    the arm is a value of no type the context can name.
+    """
+    from .types import skolems_of
+    while isinstance(pat, ast.PAnnot):
+        pat = pat.pat
+    if not isinstance(pat, ast.PCon) or not pat.skolems:
+        return
+    opened = {s.uid for s in pat.skolems}
+    escaped = [s for s in skolems_of(got) if s.uid in opened]
+    if escaped:
+        raise CoreError(
+            f"the type of this arm, {show(got)}, mentions '{escaped[0].name}', "
+            f"which only exists inside the pattern '{pat.name}' that opened it",
+            span)
 
 
 def _head_mapping(scheme, target: Type) -> dict[int, Type]:

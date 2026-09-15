@@ -28,10 +28,30 @@ class ConInfo:
     field_names: list[str] | None  # None for the positional form
     arity: int
     scheme: Scheme  # always forall params. fun(args...) -> tycon params
+    #: PROTOTYPE (ERRORS.md, "Correctness milestone: nested layouts"). The
+    #: scheme's variables that do not reach its result, and the class
+    #: predicates over them whose dictionaries the value carries. An
+    #: existential constructor's scheme is `forall params exists. fun(dicts...,
+    #: fields...) -> T params`, so `arity` counts the dictionaries: that is the
+    #: argument list Core applies it to and the runtime value the evaluators
+    #: hold. No surface syntax or inference makes one yet.
+    exists: list[TVar] = field(default_factory=list)
+    context: list = field(default_factory=list)
 
     @property
     def is_record(self) -> bool:
         return self.field_names is not None
+
+    @property
+    def is_existential(self) -> bool:
+        return bool(self.exists)
+
+    @property
+    def field_types(self) -> list[Type]:
+        """The declared payload, without the carried dictionaries."""
+        body = self.scheme.body
+        assert isinstance(body, TFun)
+        return body.params[len(self.context):]
 
 
 @dataclass
@@ -405,6 +425,9 @@ class DeclTable:
             name for name, info in self.tycons.items()
             if len(info.variants) == 1 and not info.variants[0].is_record
             and info.variants[0].arity == 1
+            # A packed value carries its hidden variables' layouts, so there
+            # is always a wrapper to hold them in.
+            and not info.variants[0].is_existential
         }
         graph: dict[str, set[str]] = {}
         for name in candidates:

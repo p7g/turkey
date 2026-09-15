@@ -174,8 +174,15 @@ ROUNDS = 2
 
 def _ground(t: Type) -> bool:
     """No unbound variable anywhere in it, so it names one type and not a
-    family of them. The test a specialization request has to pass."""
-    return not vars_of(t)
+    family of them. The test a specialization request has to pass.
+
+    A skolem an existential pattern opened is not ground either (PROTOTYPE,
+    ERRORS.md): it stands for whichever type was packed, and a copy at it would
+    be one body for every one of them -- at whatever layout the copy guessed.
+    Left generic, the call is keyed by `layout.share` inside each copy of the
+    arm, where the skolem's layout is known."""
+    from .types import skolems_of
+    return not vars_of(t) and not skolems_of(t)
 
 
 def _promoted(bind: CBind, dicts: list[str] | None) -> list[TVar]:
@@ -1130,6 +1137,39 @@ def reduce_types(program: CProgram, classes: ClassTable) -> CProgram:
     return out
 
 
+def _unshared_openings(program: CProgram) -> set[str]:
+    """The bindings holding an existential arm `layout.share` did not copy.
+
+    PROTOTYPE. The arm's field layouts depend on what was packed, so an arm
+    with no `layouts` is one the backend would read at a guess -- the same
+    refusal `transparent_parameters` makes for a generic parameter, for the
+    binder it cannot see: a pattern's.
+    """
+    from dataclasses import fields as dataclass_fields
+    from . import ast
+    from .core import CAlt, CExpr
+    found: set[str] = set()
+
+    def walk(node, owner: str) -> None:
+        if isinstance(node, CAlt):
+            pat = node.pat
+            while isinstance(pat, ast.PAnnot):
+                pat = pat.pat
+            if (isinstance(pat, ast.PCon) and pat.skolems
+                    and pat.layouts is None):
+                found.add(owner)
+        if isinstance(node, (CExpr, CAlt)):
+            for f in dataclass_fields(node):
+                walk(getattr(node, f.name), owner)
+        elif isinstance(node, (list, tuple)):
+            for item in node:
+                walk(item, owner)
+
+    for bind in program.dicts + program.binds:
+        walk(bind.value, bind.name)
+    return found
+
+
 def check_layouts(program: CProgram) -> None:
     """Refuse to compile a program whose layouts cannot all be known.
 
@@ -1137,6 +1177,11 @@ def check_layouts(program: CProgram) -> None:
     reads a field at the layout it computes, and if a generic body disagreed
     the result would be a wrong value rather than an error.
     """
+    unopened = _unshared_openings(program)
+    if unopened:
+        raise Unsupported(
+            "an existential pattern reached the backend with no layout for "
+            "what it opens: " + ", ".join(sorted(unopened)))
     leaks = transparent_parameters(program)
     if not leaks:
         return

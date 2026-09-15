@@ -1086,6 +1086,32 @@ def subterms(t: Type):
             yield from subterms(e)
 
 
+def skolems_of(*types: Type) -> list[TCon]:
+    """The rigid constants reachable from `types`, first occurrence first."""
+    seen: dict[int, TCon] = {}
+
+    def walk(ty: Type) -> None:
+        ty = prune(ty)
+        if isinstance(ty, TCon) and ty.uid:
+            seen.setdefault(ty.uid, ty)
+        elif isinstance(ty, TApp):
+            walk(ty.fn)
+            walk(ty.arg)
+        elif isinstance(ty, TFam):
+            walk(ty.arg)
+        elif isinstance(ty, TFun):
+            for p in ty.params:
+                walk(p)
+            walk(ty.ret)
+        elif isinstance(ty, TTuple):
+            for e in ty.elems:
+                walk(e)
+
+    for t in types:
+        walk(t)
+    return list(seen.values())
+
+
 def vars_of(*types: Type) -> list[TVar]:
     """The unbound variables reachable from `types`, first occurrence first."""
     seen: dict[int, TVar] = {}

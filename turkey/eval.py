@@ -367,6 +367,13 @@ def match_pattern(pat: ast.Pattern, value) -> dict[str, object] | None:
         if value.con != pat.name:
             return None
         out = {}
+        # An existential value carries its dictionaries ahead of its fields.
+        # Layouts are the native backend's business, so every copy of an
+        # opened arm is the same arm here and the first one is taken.
+        carried = len(pat.evidence)
+        for name, item in zip(pat.evidence, args):
+            out[name] = item
+        args = args[carried:]
         for sub, item in zip(pat.args, args):
             inner = match_pattern(sub, item)
             if inner is None:

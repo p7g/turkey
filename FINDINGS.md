@@ -2347,6 +2347,25 @@ bootstrap compiler reading itself. It was found late because the new syntax
 was checked by compiling `boot` with Python, which is exactly the half of the
 comparison that could not fail.
 
+### 87. The existential layout prototype is one-sided, and a word hid a bug
+**design, open.** ERRORS.md step 1. The layout contract for existential
+constructors was prototyped in `turkey/` alone, under
+`tests/test_existential_layout.py`, and deliberately kept out of
+`tests/programs`: `test_boot` would diff a stage `boot/` has no rule for. This
+is FINDINGS 43's failure mode by construction. The differential says nothing
+about any of it until step 2 ports it. Every prototype change is marked
+`PROTOTYPE` in the source so the port can find them.
+
+The papercut came while writing the tests. The first opening lowered a skolem
+with no layout as `ptr`, the answer `layout_of` gives every declared type, and
+the `Int`, `Bool`, `Float` and `String` payload tests passed with dispatch
+switched off. An `i64`, an `i1` and a pointer are all one 8-byte word, so a read
+under the wrong name returned the right bits, and a closure call passed them
+through. It took `Byte` and `Char` arrays, one and four bytes wide, to make a
+wrong layout read a wrong *number* of bytes. The lesson is FINDINGS 53's again
+from the other side: "I do not know" has to be its own answer. Here the
+fallback was not `BOXED` but `ptr`, and it hid more.
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

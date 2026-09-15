@@ -575,9 +575,15 @@ class _Function:
             assignments: list[tuple[str, str]] = []
             if isinstance(pat, ast.PCon):
                 fields = info.field_names or []
+                # Carried dictionaries first; see `eval.match_pattern`.
+                carried = len(pat.evidence)
+                for index, name in enumerate(pat.evidence):
+                    py = self.gen.fresh(name)
+                    env[name] = _Name(py, False)
+                    assignments.append((py, f"{value}.args[{index}]"))
                 pieces = list(enumerate(pat.args))
                 access = lambda i: (f"{value}.fields[{fields[i]!r}]" if mutable
-                                    else f"{value}.args[{i}]")
+                                    else f"{value}.args[{carried + i}]")
             else:
                 pieces = [(name, sub) for name, sub in pat.fields]
                 if mutable:

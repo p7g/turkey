@@ -273,6 +273,83 @@ type, as well as the scalar round trip. Verify optimized and generic paths and
 GC tracing. This milestone determines the representation contract and the
 remaining backend work.
 
+### Why boxing the bare field is not enough, even for `SomeError`
+
+The native backend has no uniform representation to fall back on. A producer
+and a consumer each compute a layout from the static type in front of them and
+must agree: `layout_of` answers from the type, arrays are flat at the element
+layout fixed when they were created (`turkey_array_new` records it in the
+header, but compiled reads never consult it), closure calls coerce arguments to
+the static parameter layout, and a dictionary's methods are compiled at the
+instance's layout. `layout.share` keeps generic bodies honest by making one
+copy per layout *of a type argument at a call site*, and `check_layouts`
+refuses a transparent lambda parameter nothing gave a layout.
+
+An arm opening `Packed(xs)` defeats both. The hidden variable is never a type
+argument, so sharing has nothing to key on; `xs` is a pattern binder, not a
+lambda parameter, so the check never sees it; and a read falls back to `BOXED`
+against an array of `i64`. Nor does the minimal `SomeError[Error e](e)` escape:
+boxing the field stores `e` safely, but `message` from an `Error Int` instance
+takes an `i64`, and the arm holding the box calls it.
+
+The same producer/consumer disagreement already exists without existentials.
+A generic `fun mk(x : a, n : Int) -> Box a` left past the specialization cap
+writes a boxed pointer into a field that a ground `Box Int` reader loads as an
+integer, and prints `32067093649` for `42`. It is pinned as a strict xfail in
+`tests/test_layout.py` (NATIVE-BACKEND.md, "A hole to close first").
+
+### Survey: representation-polymorphic code in peers
+
+The question each peer answers is what code that does not statically know a
+value's representation does with one.
+
+| Peer | What they built | Measured / budget | Lesson for Turkey |
+|---|---|---|---|
+| .NET CLR (Kennedy & Syme 2001) | JIT-time sharing by representation: "all reference types are compatible", "primitive types are mutually incompatible, even if they have the same size", structs compatible when they "share the same pattern of traced pointers". Shared code receives precomputed dictionaries of type handles. | Stack benchmark, seconds, object-based / shared-polymorphic / hand-specialized: `int` 8.5 / 1.8 / 2.0, `double` 10.4 / 2.0 / 2.0, `Point` 10.5 / 4.3 / 4.3. Creating `List<T>` in shared code: specialized 4.2, runtime type lookup **288**, lazily filled dictionary 4.9. | Layout-keyed sharing is `layout.share` already, and it costs nothing against specialization. The expensive thing is *computing* representation information at the use; precomputing it where the type is known is the whole difference. |
+| Go 1.18 (GC-shape stenciling) | One body per GC shape ("same underlying type or they are both pointer types"), plus a dictionary of type descriptors, sub-dictionaries and itabs for everything shape does not settle. | Compile time "roughly 15% slower" in 1.18, recovered by 1.20. No published runtime numbers in the design; PlanetScale's 2022 analysis reports method calls through a type parameter as a double indirection, slower than an interface call. | Same split as the dispatch contract below: shape picks the code, a dictionary carries the rest. Go's cost is method calls through the dictionary; Turkey's devirtualizer already removes those whenever the dictionary is ground. |
+| Swift | Unspecialized generic code receives type metadata; a value witness table gives size, alignment, copy, destroy, and code does `alloca(T->vwt->size)`. Existential containers are a three-word inline buffer plus metadata and witness tables; specialization is an optimization, not the model. | Budget is separate compilation and a stable ABI across library versions; specialization "can only [happen] if the definition … is visible in the current Module". | Fully dynamic layout is what a language pays when it cannot see the whole program. Turkey is whole-program and already refuses unknown layouts, so it would buy Swift's cost without Swift's constraint. |
+| GHC | Existential variables must be of lifted (boxed) kind; levity polymorphism forbids binders and arguments whose representation is unknown, because "the code generator needs to know the runtime representation of every bound variable". | Uniform boxed representation for anything polymorphic. | Sidesteps the question by never unboxing a polymorphic value. Turkey unboxes `Array Int` and closure arguments by layout, so the sidestep is not available without undoing FINDINGS 77/78. |
+| OCaml | Uniform representation with one dynamic exception: `float array` is flat, and polymorphic array code tests the header tag (254) on every access. | LexiFi: a runtime cost and code size that "greatly increases"; no numbers. The exception forces every type to be *separable*, which is why OCaml rejects unboxed existentials; OxCaml (OCaml 2025) added a separability axis to the type system to recover them. | The closest analogue of reading `array->tag` at runtime. One dynamic layout case cost a type-system restriction on exactly the feature being built here. |
+| Rust `dyn Trait` | A trait object is a data pointer plus a vtable of the concrete type's methods; generic methods and by-value `Self` methods are not callable through it. | Full monomorphization elsewhere. | The hidden type is reachable only through code compiled at the concrete type. Turkey's arms can index an `Array a` directly, which a vtable-only design would have to forbid. |
+
+### Contracts considered
+
+1. **Layout evidence plus dispatch to layout-keyed copies.** Packing stores a
+   layout code for each hidden variable next to the dictionaries. Opening
+   lifts the arm into a binding abstracted over the hidden variable and
+   switches on the stored code, calling the copy `layout.share` would build for
+   that layout. Inside each copy the variable has a concrete layout, so arrays,
+   closures, dictionary methods and nested containers take existing paths, and
+   nothing is copied, so aliasing holds. Whole-program compilation bounds the
+   switch to the layouts actually packed. Cost: code size, one arm copy per
+   reachable layout per hidden variable. This is .NET's and Go's split with the
+   dictionary filled at the pack site, which is where .NET measured 4.9 against
+   288.
+2. **Dynamic layout in generic code.** Swift's model: operations read the
+   layout at runtime. Touches every backend operation on both native backends,
+   slows code that never uses an existential, and OCaml's single dynamic case
+   shows the restriction it can force.
+3. **Uniform representation at the packing boundary.** Convert `Array Int` to
+   an array of boxes and wrap closures when packing. Breaks aliasing: a
+   mutation through the opened array is invisible to the original. Rejected
+   unless the prototype finds a reason to revisit.
+
+Going into the prototype the working choice is **1**. The prototype's job is
+to show it handles every acceptance case above and to measure its code size.
+
+Sources for this section:
+[Kennedy & Syme, Design and Implementation of Generics for the .NET CLR](https://www.microsoft.com/en-us/research/publication/design-and-implementation-of-generics-for-the-net-common-language-runtime/),
+[Go GC shape stenciling](https://go.googlesource.com/proposal/+/refs/heads/master/design/generics-implementation-gcshape.md),
+[Go 1.18 dictionaries](https://go.googlesource.com/proposal/+/master/design/generics-implementation-dictionaries-go1.18.md),
+[PlanetScale, Generics can make your Go code slower](https://planetscale.com/blog/generics-can-make-your-go-code-slower),
+[Pestov & McCall, Implementing Swift Generics](https://llvm.org/devmtg/2017-10/slides/Pestov-McCall-ImplementingGenerics.pdf),
+[Swift TypeLayout](https://github.com/swiftlang/swift/blob/main/docs/ABI/TypeLayout.rst),
+[Swift OptimizationTips](https://github.com/swiftlang/swift/blob/main/docs/OptimizationTips.rst),
+[Eisenberg & Peyton Jones, Levity Polymorphism](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/11/levity-pldi17.pdf),
+[LexiFi, About unboxed float arrays](https://www.lexifi.com/blog/ocaml/about-unboxed-float-arrays/),
+[Taming the Flat Float Array Optimization (OCaml 2025)](https://conf.researchr.org/details/icfp-splash-2025/ocaml-2025-papers/6/Taming-the-Flat-Float-Array-Optimization-Tracking-Separability-in-the-Type-System),
+[Rust reference, trait objects](https://doc.rust-lang.org/reference/types/trait-object.html).
+
 ## Stack traces
 
 Capture once when a concrete error enters the shared error channel. Provide a

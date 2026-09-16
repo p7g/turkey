@@ -1510,11 +1510,13 @@ need both paths on the same root scheme.
 
 **Under GC stress.** All 44 corpus programs pass. stage2-arm64 itself passes
 `tokens` in 3.4 s -- the self-compiled compiler collecting at every allocation
-and walking frame tables it emitted for itself. `types` on the same input did
-**not** finish inside fifteen minutes and was killed, so it says nothing either
-way: stress collects at every allocation with a full mark and sweep, and `boot`
-allocates at a scale that makes that quadratic in practice. The probe's cost,
-not a result.
+and walking frame tables it emitted for itself. `types` did **not** finish inside fifteen
+minutes and was killed, and neither did the same command on the *smallest*
+corpus program (299 bytes) inside ten -- so the cost is `boot`'s own startup,
+not the input: the prelude is parsed and typechecked before any of it is
+reached, and stress collects at every allocation with a full mark and sweep.
+Stress at compiler scale needs a cheaper collector or a sampled stress mode,
+and until then it says nothing either way. The probe's cost, not a result.
 
   **Spilling after the root stores**, on `boot`: 5,702 values spilled (3,937 of
   them into root slots), 5,702 stores and **10,001 reloads**. The first version

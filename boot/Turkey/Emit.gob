@@ -1,5 +1,5 @@
 module Turkey.Emit (
-    emitFunc, emitMessages, emitData,
+    emitFunc, emitMessages, emitData, emitEntry,
 )
 
 -- One allocated function as arm64 assembly (`NATIVE-BACKEND.md`, M28 phase 5).
@@ -448,4 +448,116 @@ fun emitBytes(text : String, b : String.Builder) -> Unit {
         String.push(out, Int.toString(Byte.toInt(byte)))
     }
     if any { line(b, String.build(out)) }
+}
+
+-- -- the entry sequence ------------------------------------------------------
+
+-- What has to happen before the program's own code, and `main`.
+--
+-- The only hand-written assembly in the backend, and the order is
+-- `Turkey.Llvm.emitEntry`'s because that is the order that has been running
+-- for a milestone: the root array is registered first, then the literals are
+-- interned into it, then the module initializer computes every global, then
+-- `main`. The literals come first because an initializer's value may be one.
+--
+-- `turkey_main` wraps the lot: argument handling, the panic report and the
+-- final collection are the runtime's, written once in C rather than emitted
+-- here in two backends.
+fun emitEntry(asm : Asm.Asm, main : String, b : String.Builder) -> Unit {
+    line(b, "    .text")
+    line(b, "    .p2align 2")
+    line(b, Asm.entrySymbol + ":")
+    -- A frame of its own, because everything below is a call. Thirty-two
+    -- bytes: the record, and the alignment Apple requires.
+    line(b, "    sub sp, sp, #32")
+    instruction(b, A.Str(Physical(Gp, 29), Offset(A.sp, 16), A.W64))
+    instruction(b, A.Str(Physical(Gp, 30), Offset(A.sp, 24), A.W64))
+    line(b, "    add x29, sp, #16")
+
+    -- The permanent frame, before anything allocates. It is never left: every
+    -- global and every literal is live for the whole run, so the mask is all
+    -- ones and this frame sits at the bottom of the chain until the process
+    -- exits.
+    symbolInto(b, A.x0, Asm.globalsFrame)
+    symbolInto(b, Physical(Gp, 1), Asm.rootsSymbol)
+    instruction(b, A.MovConst(Physical(Gp, 2), asm.roots))
+    symbolInto(b, Physical(Gp, 3), Asm.messageSymbol(asm, "<globals>"))
+    call(b, "turkey_root_enter")
+    symbolInto(b, A.x0, Asm.globalsFrame)
+    -- Not `mov x1, #-1`: `movn` is the instruction that spells it, and going
+    -- through the assembler's alias would be one more thing to be wrong about.
+    line(b, "    movn x1, #0")
+    instruction(b, A.Str(Physical(Gp, 1), Offset(A.x0, 32), A.W64))
+
+    -- Each literal's `TurkeyString`, built once and cached in its slot. This
+    -- is what makes `ConstString` a load rather than an allocation, and what
+    -- makes it not a safepoint.
+    let ordered = byIndex(asm.literals)
+    for var i = 0; i < len(ordered); i = i + 1 {
+        symbolInto(b, A.x0, Asm.literalName(i))
+        instruction(b, A.MovConst(Physical(Gp, 1), byteLength(ordered[i])))
+        call(b, "turkey_string_new")
+        symbolInto(b, Physical(Gp, 1), Asm.rootsSymbol)
+        storeAt(b, A.x0, Physical(Gp, 1), 8 * Asm.literalSlot(asm, ordered[i]))
+    }
+
+    line(b, "    bl " + Asm.symbolFor(Asm.initializerName))
+    -- `main` takes the closure environment every Turkey function takes, and
+    -- has none.
+    instruction(b, A.Mov(A.x0, A.xzr, A.W64))
+    line(b, "    bl " + Asm.symbolFor(main))
+
+    instruction(b, A.Ldr(Physical(Gp, 29), Offset(A.sp, 16), A.W64))
+    instruction(b, A.Ldr(Physical(Gp, 30), Offset(A.sp, 24), A.W64))
+    line(b, "    add sp, sp, #32")
+    line(b, "    ret")
+
+    -- `main` itself: the runtime's, with the entry handed to it. `argc` and
+    -- `argv` are already in `x0` and `x1`.
+    line(b, "    .globl " + Asm.runtimeFor("main"))
+    line(b, "    .p2align 2")
+    line(b, Asm.runtimeFor("main") + ":")
+    line(b, "    sub sp, sp, #16")
+    instruction(b, A.Str(Physical(Gp, 29), Offset(A.sp, 0), A.W64))
+    instruction(b, A.Str(Physical(Gp, 30), Offset(A.sp, 8), A.W64))
+    line(b, "    mov x29, sp")
+    symbolInto(b, Physical(Gp, 2), Asm.entrySymbol)
+    call(b, "turkey_main")
+    instruction(b, A.Ldr(Physical(Gp, 29), Offset(A.sp, 0), A.W64))
+    instruction(b, A.Ldr(Physical(Gp, 30), Offset(A.sp, 8), A.W64))
+    line(b, "    add sp, sp, #16")
+    line(b, "    ret")
+}
+
+-- A symbol's address, in a register: the page, then the offset within it.
+-- The same pair `Turkey.Select.address` emits, spelled here because the entry
+-- sequence is text rather than selected instructions.
+fun symbolInto(b : String.Builder, d : Reg, sym : String) -> Unit {
+    let r = A.showReg(d, A.W64)
+    line(b, "    adrp " + r + ", " + sym + "@PAGE")
+    line(b, "    add " + r + ", " + r + ", " + sym + "@PAGEOFF")
+}
+
+fun call(b : String.Builder, name : String) -> Unit =
+    line(b, "    bl " + Asm.runtimeFor(name))
+
+-- A store through a register base, with the offset in `scratch` when the
+-- immediate does not reach. `boot` interns thousands of literals, so the root
+-- array is past 32,760 bytes long before the corpus is.
+fun storeAt(b : String.Builder, r : Reg, base : Reg, offset : Int) -> Unit {
+    if offset <= widestOffset {
+        instruction(b, A.Str(r, Offset(base, offset), A.W64))
+        return
+    }
+    instruction(b, A.MovConst(scratch, offset))
+    instruction(b, A.Str(r, Indexed(base, scratch), A.W64))
+}
+
+-- A string's length in bytes, which is what `turkey_string_new` is given.
+-- Counted rather than measured: `String.bytes` answers a `Bytes`, which has no
+-- `len`.
+fun byteLength(text : String) -> Int {
+    var n = 0
+    for _ in String.bytes(text) { n = n + 1 }
+    n
 }

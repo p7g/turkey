@@ -1,5 +1,5 @@
 module Turkey.Emit (
-    emitFunc, emitMessages,
+    emitFunc, emitMessages, emitData,
 )
 
 -- One allocated function as arm64 assembly (`NATIVE-BACKEND.md`, M28 phase 5).
@@ -29,7 +29,9 @@ import Turkey.Asm as Asm
 import Turkey.Frame as Frame
 import Turkey.Regalloc as Regalloc
 import Turkey.Ssa as Ssa
-import Turkey.Ssa (Value(..), BlockId(..), Term(..), Func(..), Block(..))
+import Turkey.Ssa (Value(..), BlockId(..), Term(..), Func(..), Block(..), Rep(..))
+import Turkey.SsaLower as SsaLower
+import Turkey.SsaLower (Module(..))
 
 -- `x16` and `x17` are the allocator's reserved scratch (`Turkey.Regalloc`'s
 -- `gpPool`), which is what makes them safe here: a large offset, a frame too
@@ -353,11 +355,8 @@ fun move(b : String.Builder, d : Reg, s : Reg) -> Unit = match (d, s) {
 -- `turkey_panic` takes a C string (`runtime/turkey_runtime.h`), so each one
 -- ends in a zero.
 fun emitMessages(asm : Asm.Asm, b : String.Builder) -> Unit {
-    let texts = Map.entries(asm.messages)
-    if len(texts) == 0 { return }
-    let ordered : Array String = []
-    for _ in texts { Array.push(ordered, "") }
-    for (text, index) in texts { ordered[index] = text }
+    let ordered = byIndex(asm.messages)
+    if len(ordered) == 0 { return }
     line(b, "    .section __TEXT,__cstring,cstring_literals")
     for var i = 0; i < len(ordered); i = i + 1 {
         line(b, Asm.messageName(i) + ":")
@@ -370,4 +369,83 @@ fun emitMessages(asm : Asm.Asm, b : String.Builder) -> Unit {
         String.push(out, "0")
         line(b, String.build(out))
     }
+}
+
+-- -- the module's data -------------------------------------------------------
+
+-- What a function is not: the bytes behind each string literal, the storage
+-- behind each global, and the permanent root array that holds both the traced
+-- globals and the literals' cached `TurkeyString`s.
+--
+-- Every name and every slot here was decided by `Turkey.Asm` before selection
+-- ran, which is what lets `ConstString` be a load of slot *n* emitted long
+-- before anything defined slot *n*.
+fun emitData(m : Module, asm : Asm.Asm, b : String.Builder) -> Unit {
+    emitLiterals(asm, b)
+    line(b, "    .section __DATA,__data")
+    -- An untraced global is a word of ordinary storage. A traced one is a slot
+    -- of the root array instead -- storing to it and rooting it are the same
+    -- store -- so this defines nothing for it.
+    for (name, r) in m.globals {
+        match Asm.globalSlot(asm, name) {
+            Some(_) -> {}
+            None -> {
+                line(b, "    .p2align 3")
+                line(b, Asm.globalSymbol(name) + ":")
+                line(b, "    .quad 0")
+            }
+        }
+    }
+    line(b, "    .p2align 3")
+    line(b, Asm.rootsSymbol + ":")
+    -- At least one word even when the module roots nothing: the entry sequence
+    -- hands this address to `turkey_root_enter`, which refuses a null one, and
+    -- a symbol with no storage is a symbol that may land on top of the next.
+    let bytes = if asm.roots > 0 { 8 * asm.roots } else { 8 }
+    line(b, "    .space " + Int.toString(bytes))
+    line(b, "    .p2align 3")
+    line(b, Asm.globalsFrame + ":")
+    -- The `RootFrame` covering it: previous, function_name, count, values,
+    -- live. Five words, and the layout is `runtime/turkey_runtime.c`'s.
+    line(b, "    .space 40")
+}
+
+-- Each literal's bytes, and nothing else. The `TurkeyString` is built once by
+-- the entry sequence and cached in the root array, so what the data section
+-- holds is the *input* to `turkey_string_new`.
+--
+-- Not `__TEXT,__cstring`, where the panic messages go. That section is for
+-- NUL-terminated C strings, and a Turkey string is bytes and a length: it may
+-- contain a zero byte, and there is no terminator to write.
+fun emitLiterals(asm : Asm.Asm, b : String.Builder) -> Unit {
+    let ordered = byIndex(asm.literals)
+    if len(ordered) == 0 { return }
+    line(b, "    .section __TEXT,__const")
+    for var i = 0; i < len(ordered); i = i + 1 {
+        line(b, "    .p2align 3")
+        line(b, Asm.literalName(i) + ":")
+        emitBytes(ordered[i], b)
+    }
+}
+
+-- A `text -> index` interning table as an array in index order.
+fun byIndex(table : Map.Map String Int) -> Array String {
+    let out : Array String = []
+    for _ in Map.entries(table) { Array.push(out, "") }
+    for (text, index) in Map.entries(table) { out[index] = text }
+    out
+}
+
+-- A string as a `.byte` directive, and nothing at all when it is empty: `.byte`
+-- with no operands is a syntax error, and a zero-length literal is a program
+-- writing `""`.
+fun emitBytes(text : String, b : String.Builder) -> Unit {
+    let out = String.builder()
+    var any = False
+    for byte in String.bytes(text) {
+        if any { String.push(out, ", ") } else { String.push(out, "    .byte ") }
+        any = True
+        String.push(out, Int.toString(Byte.toInt(byte)))
+    }
+    if any { line(b, String.build(out)) }
 }

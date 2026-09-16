@@ -539,6 +539,95 @@ runtime change, and no per-backend agreement -- the three things that make
 the capture route expensive here. It buys a shallower trace than a real walk.
 GHC ships both, and ranks `HasCallStack` first among its four mechanisms.
 
+### Threading the call site instead of walking the stack
+
+The chosen direction for step 4, surveyed but **not implemented**: no
+`HasStack` exists in either compiler, and nothing below is code. Two defaults
+were picked while surveying and are worth revisiting rather than inheriting:
+GHC's rule 2, which infers the constraint for an unsignatured definition, is
+skipped in favour of requiring the declaration; and `fail` keeps its current
+type, with a traced sibling rather than a stack on every packed error.
+
+Four peers pass the caller's location *into*
+the callee rather than recovering it from the machine stack, and they differ in
+what carries it.
+
+| Peer | Carrier | How far it reaches | Opt-in |
+| --- | --- | --- | --- |
+| GHC | `HasCallStack`, an implicit-parameter constraint | A chain, through every annotated function | Constraint in the signature |
+| Rust | `#[track_caller]`, a MIR-level shim | Propagates callee-to-callee, but one `Location` | Attribute on the function |
+| C# | Compiler-filled *optional arguments* | The immediate caller only | Attribute on the parameter |
+| Swift | `#file`/`#line` as default arguments | The immediate caller only | Default argument |
+
+**GHC is the only one that accumulates a chain**, and its rules are the design
+being copied. A `HasCallStack` wanted is solved in three ways: with a
+`CallStack` already in scope, "GHC will append the new call-site to the
+existing `CallStack`"; with none and no explicit signature, it "will infer a
+`HasCallStack` constraint for the enclosing definition"; with none and an
+explicit signature, it "will solve the `HasCallStack` constraint for the
+singleton `CallStack` containing just the current call-site". The third rule is
+what stops the chain, and it is not optional -- without it the constraint has
+nowhere to terminate.
+
+**Rust chose this route by explicitly rejecting the other one.** RFC 2091
+rejects backtraces because "the stack backtrace is not suitable as the only
+solution for systems languages like Rust because optimization often collapses
+multiple levels of function calls. In some embedded systems, the backtrace may
+even be unavailable!" That argument transfers directly: Turkey's existing panic
+traces already omit inlined frames on purpose, and `boot`'s native backend
+emits no frames at all.
+
+The costs the peers report are worth having in advance. Rust's is code size:
+"the number of instructions per `unwrap()`/`expect()` will increase", because
+call sites that previously shared one panic branch now each carry their own
+location. Rust also cannot apply it through function pointers or trait objects
+-- "no inlining will occur, and thus it cannot take the location of the
+caller" -- which is the same hole Turkey would have at a closure call or a
+class method. C#'s limitation is different and worth noting because it is a
+*correctness* one: the caller may pass the argument explicitly "to control the
+caller information or to hide caller information", so the location is a
+default, not a guarantee.
+
+And GHC's own documentation concedes the encoding is not load-bearing:
+`HasCallStack` "is just an alias for an implicit parameter `?callStack ::
+CallStack`. This is an implementation detail and **should not** be considered
+part of the `CallStack` API". So the shape to copy is the three rules, not the
+implicit parameter.
+
+**What this costs in Turkey, concretely.** A predicate with no type argument
+does not currently exist, and the machinery assumes one everywhere:
+
+* `parse_context` requires "a class applied to one type".
+* `ClassInfo` holds a single `param`, so a class is unary by construction.
+* `Solver._class` reads `c.pred.args[0]` before doing anything else; there are
+  119 `args[0]` sites across eleven modules in `turkey/` alone.
+* Worse than a crash, the silent case: `retained` keeps a predicate whose level
+  exceeds the binder's, and `Types.predLevel` is the minimum level over the
+  predicate's *variables*. A predicate with none takes the `ground` sentinel
+  and is therefore always retained -- and then `_let` drops it, because
+  `shared` keeps only class predicates and the per-name `own` keeps only
+  predicates that mention the type being generalized. A nullary predicate would
+  disappear between the two.
+
+So `HasStack` cannot be an ordinary class. It has to be a bespoke predicate
+discharged by its own rule, which is a road the solver already has: `HasField`
+is "discharged by a declaration lookup" and `OneOf` "by a decision", both
+intercepted before `_class` ever indexes an argument. `HasStack` is a third,
+and the one difference that matters is that the other two are *erased* while
+this one must leave a value behind. That needs a new `Evidence` variant
+alongside `FromDict`/`FromInstance`/`Absent`, lowered to a literal rather than
+to a dictionary lookup, and `CLet` already carries the `skolems` and `rigid`
+that say whether a binding was signature-checked -- which is exactly what
+GHC's third rule keys on.
+
+**One consequence to decide deliberately.** A threaded stack is built during
+elaboration, from source spans, *before* `opt` runs. The existing panic trace
+is built from frames that survive optimization, and `test_pygen` pins that it
+"does not invent inlined frames". The two would therefore disagree on the same
+program: a function inlined away is absent from a panic trace and present in a
+threaded one. Neither is wrong, but they are different claims, and a test
+should pin the difference rather than let it be discovered.
+
 ### Why capture is expensive *here* specifically
 
 The four backends do not agree on what a stack is, and the differential

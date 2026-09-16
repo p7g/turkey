@@ -20,12 +20,11 @@ module Turkey.Select (
 -- allocator replaces it later through a side table rather than by rewriting
 -- what is emitted here.
 --
--- What is *not* here, deliberately: the overflow and division checks, and the
--- panic test after a call. Those are emitted per target because each target
--- writes a different and better sequence -- arm64 reads a flag register the IR
--- cannot name -- and they are the job rather than the hazard. The GC roots are
--- not here either, but for the opposite reason: their *analysis* is shared,
--- in `Turkey.Roots`.
+-- The overflow and division checks, and the panic test after a call, are here
+-- rather than in the IR: each target writes a different and better sequence --
+-- arm64 reads a flag register the IR cannot name -- and they are the job
+-- rather than the hazard. The GC roots are the opposite case, and their
+-- *analysis* is shared, in `Turkey.Roots`.
 
 import Data.Map as Map
 import Data.Set as Set
@@ -68,6 +67,10 @@ type Sel = Sel {
     -- The low IR safepoint being selected, until its call is emitted and
     -- marked with a `SafepointMap`.
     pending : Option (Int, Int),
+    -- Whether the call being emitted is itself a panic. Every other call is
+    -- followed by a test of the panic flag, and a panic call must not be: it
+    -- would test the flag it just set and branch to itself, forever.
+    panicking : Bool,
 }
 
 fun emit(s : Sel, op : A.Arm) -> Unit {
@@ -107,7 +110,14 @@ fun widthOf(r : Rep) -> A.Width = match r.class_ {
 
 -- -- selection ----------------------------------------------------------------------
 
-fun selectModule(m : Module) -> (Array (Func Inst), Array Unsupported) {
+-- The selected functions, what stopped the rest, and the module's names.
+--
+-- The names come back because they are not all decided before selection: a
+-- panic message is interned when the guard that raises it is emitted, so the
+-- table is complete only once every function has been walked. `Turkey.Llvm`
+-- learned the same thing the hard way and says so -- its message table is
+-- emitted after the code for exactly this reason.
+fun selectModule(m : Module) -> (Array (Func Inst), Array Unsupported, Asm) {
     -- One `Asm` for the module, because a literal interned by one function is
     -- the same literal in the next and the root array is one array.
     let asm = Asm.newAsm(m)
@@ -126,7 +136,7 @@ fun selectModule(m : Module) -> (Array (Func Inst), Array Unsupported) {
             None -> {}
         }
     }
-    (done, skipped)
+    (done, skipped, asm)
 }
 
 -- Why a function could not be selected, or `None` if it could.
@@ -161,7 +171,7 @@ fun start(f : Func Low, asm : Asm) -> Sel {
     }
     g.entry = incoming(f, g)
     Sel { source = f, out = g, at = 0, stopped = None, asm = asm,
-          frame = Roots.analyze(f), pending = None }
+          frame = Roots.analyze(f), pending = None, panicking = False }
 }
 
 -- A new entry block that moves each parameter out of where the caller put it,
@@ -245,8 +255,28 @@ fun run(s : Sel) -> Unit {
             -- store -- has nothing to mark, and nothing can collect inside it.
             s.pending = None
         }
-        s.out.blocks[s.at].term = s.source.blocks[b].term
+        terminate(s, s.source.blocks[b].term)
     }
+}
+
+-- A block's terminator, as the machine graph ends a block.
+--
+-- All of them pass through but one. `Panic(v)` is a *call* --
+-- `turkey_panic_string` takes the message the program built -- and a call is
+-- not something a terminator can be, so it becomes that call and a return of
+-- zero, which is what `Turkey.Llvm` answers for it too. `Unreachable` stays a
+-- terminator: the emitter answers it with the same zero, and there is no call
+-- to make.
+fun terminate(s : Sel, t : Term) -> Unit = match t {
+    Panic(v) -> {
+        s.panicking = True
+        call(s, temp(s, Ssa.untraced(I64)), A.Gp, A.Gp,
+             Some(Asm.runtimeFor("turkey_panic_string")), A.xzr,
+             [(A.reg(v), A.Gp)])
+        s.panicking = False
+        s.out.blocks[s.at].term = Ret(zeroResult(s))
+    }
+    _ -> { s.out.blocks[s.at].term = t }
 }
 
 -- A new block at the end, and its id.
@@ -579,6 +609,53 @@ fun call(s : Sel, d : Reg, dBank : A.Bank, resultBank : A.Bank,
     -- `turkey_unbox` answers a double's bits in `x0`, and the value being
     -- built is a double.
     move(s, d, dBank, out, resultBank)
+    propagate(s)
+}
+
+-- After a call: if the callee panicked, leave.
+--
+-- `turkey_panic` sets a flag and returns -- there is no unwinding -- so a
+-- caller that did not look would carry on with a value the callee never
+-- produced. Every call, without exception, because a callee that cannot panic
+-- itself may call one that can. `Turkey.Llvm.propagate` is the same test on
+-- the other path, and reads the flag as a plain load for the same reason: a
+-- call to `turkey_panicked()` would be one more call to test the flag of.
+fun propagate(s : Sel) -> Unit {
+    if s.panicking { return }
+    let flag = temp(s, Ssa.untraced(I32))
+    emit(s, A.Ldr(flag, A.Offset(got(s, Asm.runtimeFor("turkey_has_panicked")), 0),
+                  A.W32))
+    emit(s, A.CmpImm(flag, 0, A.W32))
+    let failed = tempValue(s, Ssa.untraced(I1))
+    emit(s, A.CSet(A.reg(failed), A.Ne))
+    -- The empty message: this path propagates a panic that already happened
+    -- and raises nothing new. It returns zero, as every panic path does.
+    guard(s, failed, "")
+}
+
+-- The address of a symbol this module does not define, which is one
+-- indirection further than one it does: the linker fills a global offset
+-- table entry, and the code loads the address out of it.
+fun got(s : Sel, sym : String) -> Reg {
+    let page = temp(s, Ssa.untraced(Ptr))
+    let full = temp(s, Ssa.untraced(Ptr))
+    emit(s, A.AdrpGot(page, sym))
+    emit(s, A.LdrGot(full, page, sym))
+    full
+}
+
+-- A zero of the function's result, which is what every path that leaves
+-- without a value answers.
+--
+-- A double's zero is not a `mov`: `mov d0, xzr` is not an instruction, and
+-- `fmov d0, xzr` is. Nothing caught this until whole functions were assembled,
+-- because a panic path in a `Float` function is not on any corpus program's
+-- ordinary route.
+fun zeroResult(s : Sel) -> Value {
+    let zero = tempValue(s, s.out.result)
+    if s.out.result.class_ == F64 { emit(s, A.FMovIn(A.reg(zero), A.xzr)) }
+    else { emit(s, A.Mov(A.reg(zero), A.xzr, A.W64)) }
+    zero
 }
 
 -- Where a global lives: in the root array if the collector must scan it, in
@@ -801,12 +878,16 @@ fun guard(s : Sel, condition : Value, message : String) -> Unit {
     s.out.blocks[s.at].term = Branch(condition, BlockId(failed),
                                      BlockId(carry))
     s.at = failed
-    let text = address(s, Asm.messageSymbol(s.asm, message))
-    call(s, temp(s, Ssa.untraced(I64)), A.Gp, A.Gp,
-         Some(Asm.runtimeFor("turkey_panic")), A.xzr, [(text, A.Gp)])
-    let zero = tempValue(s, s.out.result)
-    emit(s, A.Mov(A.reg(zero), A.xzr, A.W64))
-    s.out.blocks[s.at].term = Ret(zero)
+    -- An empty message means the panic is already raised and is being
+    -- propagated out of a callee: this path adds a return, not a diagnosis.
+    if message != "" {
+        let text = address(s, Asm.messageSymbol(s.asm, message))
+        s.panicking = True
+        call(s, temp(s, Ssa.untraced(I64)), A.Gp, A.Gp,
+             Some(Asm.runtimeFor("turkey_panic")), A.xzr, [(text, A.Gp)])
+        s.panicking = False
+    }
+    s.out.blocks[s.at].term = Ret(zeroResult(s))
     s.at = carry
 }
 

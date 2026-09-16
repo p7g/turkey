@@ -234,7 +234,7 @@ def test_a_safepoint_stores_its_roots_and_is_mapped():
     """
     text = _asm("pressure.gob")
     _, body = _function(text, "Main#strings")
-    maps = [n for n, line in enumerate(body) if line.startswith("; safepoint ")]
+    maps = [n for n, line in enumerate(body) if line.startswith("// safepoint ")]
     assert maps, "no safepoint was mapped"
     for n in maps:
         assert body[n - 1].startswith(("bl ", "blr ")), body[n - 3:n + 1]

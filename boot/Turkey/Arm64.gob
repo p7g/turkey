@@ -1,6 +1,7 @@
 module Turkey.Arm64 (
     Reg(..), Bank(..), reg, physical, isPhysical, bankOf, Cond(..), Width(..),
-    Mem(..), Arm(..), Inst(..), destRegs, srcRegs, mapUses, setsFlags, isSlot, isRootSlot, slotLoad, slotStore, isCSet, moveHint, safepointOf, memOf,
+    Mem(..), Arm(..), Inst(..), destRegs, srcRegs, mapUses, rewrite, setsFlags, isSlot, isRootSlot, slotLoad, slotStore, isCSet, redundantMove,
+    sameRegister, moveHint, safepointOf, memOf,
     xzr, sp, fp, lr, x0, d0, argRegs, fpArgRegs, callerSaved, calleeSaved,
     fpCallerSaved, fpCalleeSaved, showReg, condName, isCall,
 )
@@ -208,6 +209,13 @@ type Arm
     -- and an offset within it.
     | Adrp(Reg, String)
     | AddLo(Reg, Reg, String)
+    -- The address of a symbol *another* object defines, which is one
+    -- indirection further: the linker puts the address in the global offset
+    -- table, and the code loads it from there. `_turkey_has_panicked` is the
+    -- runtime's, so `@PAGE` would relocate against a definition this module
+    -- does not have.
+    | AdrpGot(Reg, String)
+    | LdrGot(Reg, Reg, String)
     -- Floating point. One width only, because Turkey's `Float` is a double
     -- and there is no `f32` to spell.
     --
@@ -340,6 +348,17 @@ fun memOf(op : Arm) -> Option Mem = match op {
     _ -> None
 }
 
+-- A move from a register into itself, which is what a taken hint looks like
+-- once the colouring is substituted.
+fun redundantMove(op : Arm) -> Bool = match op {
+    Mov(d, s, _) -> sameRegister(d, s)
+    FMov(d, s) -> sameRegister(d, s)
+    _ -> False
+}
+
+fun sameRegister(a : Reg, b : Reg) -> Bool =
+    showReg(a, W64) == showReg(b, W64)
+
 fun isCSet(op : Arm) -> Bool = match op {
     CSet(_, _) -> True
     _ -> False
@@ -409,6 +428,8 @@ fun srcRegs(op : Arm) -> Array Reg = match op {
     Ldp(_, _, base, _) -> [base]
     Adrp(_, _) -> []
     AddLo(_, a, _) -> [a]
+    AdrpGot(_, _) -> []
+    LdrGot(_, a, _) -> [a]
     MovConst(_, _) -> []
     FMov(_, a) -> [a]
     FMovIn(_, a) -> [a]
@@ -478,6 +499,8 @@ fun mapUses(op : Arm, g : fun(Reg) -> Reg) -> Arm = match op {
     Ldp(k0, k1, base, k3) -> Ldp(k0, k1, g(base), k3)
     Adrp(k0, k1) -> Adrp(k0, k1)
     AddLo(k0, a, k2) -> AddLo(k0, g(a), k2)
+    AdrpGot(k0, k1) -> AdrpGot(k0, k1)
+    LdrGot(k0, a, k2) -> LdrGot(k0, g(a), k2)
     MovConst(k0, k1) -> MovConst(k0, k1)
     FMov(k0, a) -> FMov(k0, g(a))
     FMovIn(k0, a) -> FMovIn(k0, g(a))
@@ -507,6 +530,77 @@ fun mapMem(m : Mem, g : fun(Reg) -> Reg) -> Mem = match m {
     SpillSlot(n) -> SpillSlot(n)
     IncomingArg(k) -> IncomingArg(k)
     OutgoingArg(k) -> OutgoingArg(k)
+}
+
+
+-- The same instruction with every register through `g` and every memory
+-- operand through `m`.
+--
+-- What the emitter needs and `mapUses` is not: the allocator's colouring
+-- replaces the registers an instruction *writes* as well as the ones it reads,
+-- and the frame layout replaces a slot with an offset from `sp`. Generated
+-- from the opcode declaration field by field, so a new instruction cannot be
+-- half-covered. `m` runs before `g`, so a rewritten memory operand's own base
+-- register is still coloured.
+fun rewrite(op : Arm, g : fun(Reg) -> Reg, m : fun(Mem) -> Mem) -> Arm = match op {
+    Mov(f0, f1, f2) -> Mov(g(f0), g(f1), f2)
+    MovZ(f0, f1, f2) -> MovZ(g(f0), f1, f2)
+    MovK(f0, f1, f2) -> MovK(g(f0), f1, f2)
+    Add(f0, f1, f2, f3) -> Add(g(f0), g(f1), g(f2), f3)
+    AddImm(f0, f1, f2, f3) -> AddImm(g(f0), g(f1), f2, f3)
+    AddS(f0, f1, f2, f3) -> AddS(g(f0), g(f1), g(f2), f3)
+    Sub(f0, f1, f2, f3) -> Sub(g(f0), g(f1), g(f2), f3)
+    SubImm(f0, f1, f2, f3) -> SubImm(g(f0), g(f1), f2, f3)
+    SubS(f0, f1, f2, f3) -> SubS(g(f0), g(f1), g(f2), f3)
+    Mul(f0, f1, f2, f3) -> Mul(g(f0), g(f1), g(f2), f3)
+    SMulH(f0, f1, f2) -> SMulH(g(f0), g(f1), g(f2))
+    SDiv(f0, f1, f2, f3) -> SDiv(g(f0), g(f1), g(f2), f3)
+    MSub(f0, f1, f2, f3, f4) -> MSub(g(f0), g(f1), g(f2), g(f3), f4)
+    And(f0, f1, f2, f3) -> And(g(f0), g(f1), g(f2), f3)
+    Orr(f0, f1, f2, f3) -> Orr(g(f0), g(f1), g(f2), f3)
+    Eor(f0, f1, f2, f3) -> Eor(g(f0), g(f1), g(f2), f3)
+    EorImm(f0, f1, f2, f3) -> EorImm(g(f0), g(f1), f2, f3)
+    Lsl(f0, f1, f2, f3) -> Lsl(g(f0), g(f1), g(f2), f3)
+    Lsr(f0, f1, f2, f3) -> Lsr(g(f0), g(f1), g(f2), f3)
+    Asr(f0, f1, f2, f3) -> Asr(g(f0), g(f1), g(f2), f3)
+    Cmp(f0, f1, f2) -> Cmp(g(f0), g(f1), f2)
+    CmpImm(f0, f1, f2) -> CmpImm(g(f0), f1, f2)
+    CSet(f0, f1) -> CSet(g(f0), f1)
+    Sxtw(f0, f1) -> Sxtw(g(f0), g(f1))
+    Uxtb(f0, f1) -> Uxtb(g(f0), g(f1))
+    Uxth(f0, f1) -> Uxth(g(f0), g(f1))
+    Ubfx(f0, f1, f2, f3) -> Ubfx(g(f0), g(f1), f2, f3)
+    Ldr(f0, f1, f2) -> Ldr(g(f0), mapMem(m(f1), g), f2)
+    Ldrb(f0, f1) -> Ldrb(g(f0), mapMem(m(f1), g))
+    Ldrsw(f0, f1) -> Ldrsw(g(f0), mapMem(m(f1), g))
+    Str(f0, f1, f2) -> Str(g(f0), mapMem(m(f1), g), f2)
+    Strb(f0, f1) -> Strb(g(f0), mapMem(m(f1), g))
+    Stp(f0, f1, f2, f3) -> Stp(g(f0), g(f1), g(f2), f3)
+    Ldp(f0, f1, f2, f3) -> Ldp(g(f0), g(f1), g(f2), f3)
+    Adrp(f0, f1) -> Adrp(g(f0), f1)
+    AddLo(f0, f1, f2) -> AddLo(g(f0), g(f1), f2)
+    AdrpGot(f0, f1) -> AdrpGot(g(f0), f1)
+    LdrGot(f0, f1, f2) -> LdrGot(g(f0), g(f1), f2)
+    FMov(f0, f1) -> FMov(g(f0), g(f1))
+    FMovIn(f0, f1) -> FMovIn(g(f0), g(f1))
+    FMovOut(f0, f1) -> FMovOut(g(f0), g(f1))
+    FAdd(f0, f1, f2) -> FAdd(g(f0), g(f1), g(f2))
+    FSub(f0, f1, f2) -> FSub(g(f0), g(f1), g(f2))
+    FMul(f0, f1, f2) -> FMul(g(f0), g(f1), g(f2))
+    FDiv(f0, f1, f2) -> FDiv(g(f0), g(f1), g(f2))
+    FNeg(f0, f1) -> FNeg(g(f0), g(f1))
+    FCmp(f0, f1) -> FCmp(g(f0), g(f1))
+    Scvtf(f0, f1) -> Scvtf(g(f0), g(f1))
+    Fcvtzs(f0, f1) -> Fcvtzs(g(f0), g(f1))
+    MovConst(f0, f1) -> MovConst(g(f0), f1)
+    Bl(f0) -> Bl(f0)
+    Blr(f0) -> Blr(g(f0))
+    CallArgs(f0, f1) -> CallArgs(Array.map(f0, g), Array.map(f1, g))
+    SafepointMap(f0, f1) -> SafepointMap(f0, f1)
+    Ret -> Ret
+    B(f0) -> B(f0)
+    BCond(f0, f1) -> BCond(f0, f1)
+    Brk(f0) -> Brk(f0)
 }
 
 -- The registers an instruction *writes*, physical ones included.
@@ -554,6 +648,8 @@ fun destRegs(op : Arm) -> Array Reg = match op {
     Ldp(a, b, _, _) -> [a, b]
     Adrp(d, _) -> [d]
     AddLo(d, _, _) -> [d]
+    AdrpGot(d, _) -> [d]
+    LdrGot(d, _, _) -> [d]
     MovConst(d, _) -> [d]
     FMov(d, _) -> [d]
     FMovIn(d, _) -> [d]
@@ -730,13 +826,16 @@ fun showArm(op : Arm) -> String = match op {
     Adrp(d, sym) -> "adrp " + showReg(d, W64) + ", " + sym + "@PAGE"
     AddLo(d, a, sym) -> "add " + showReg(d, W64) + ", " + showReg(a, W64)
                         + ", " + sym + "@PAGEOFF"
+    AdrpGot(d, sym) -> "adrp " + showReg(d, W64) + ", " + sym + "@GOTPAGE"
+    LdrGot(d, a, sym) -> "ldr " + showReg(d, W64) + ", [" + showReg(a, W64)
+                         + ", " + sym + "@GOTPAGEOFF]"
     Bl(sym) -> "bl " + sym
     Blr(a) -> "blr " + showReg(a, W64)
     -- Printed as a comment: it has no encoding and exists to tell the register
     -- allocator what a call reads and writes.
-    CallArgs(ins, outs) -> "; call uses " + Int.toString(len(ins))
+    CallArgs(ins, outs) -> "// call uses " + Int.toString(len(ins))
                            + " defs " + Int.toString(len(outs))
-    SafepointMap(b, n) -> "; safepoint " + Int.toString(b) + ":" + Int.toString(n)
+    SafepointMap(b, n) -> "// safepoint " + Int.toString(b) + ":" + Int.toString(n)
     Ret -> "ret"
     B(target) -> "b " + blockLabel(target)
     BCond(c, target) -> "b." + condName(c) + " " + blockLabel(target)

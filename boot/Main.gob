@@ -55,6 +55,7 @@ import Turkey.Select as Select
 import Turkey.Regalloc as Regalloc
 import Turkey.Roots as Roots
 import Turkey.Frame as Frame
+import Turkey.Emit as Emit
 import Turkey.Llvm as Llvm
 import Turkey.LowIr as LowIr
 import Turkey.Ssa as Ssa
@@ -74,7 +75,7 @@ fun main() {
     let command = args[0]
     if !Array.contains(["tokens", "ast", "desugar", "decls", "deps",
                     "classes", "types", "core", "mono", "opt", "ssa",
-                    "llvm", "asm"], command) {
+                    "llvm", "asm", "native"], command) {
         die("unknown command '" + command + "'")
     }
     -- One builder for every file: a `print` per token is a flush per token,
@@ -96,6 +97,7 @@ fun main() {
             "ssa" -> dumpSsa(b, path)
             "llvm" -> dumpLlvm(b, path)
             "asm" -> dumpAsm(b, path)
+            "native" -> dumpNative(b, path)
             _ -> dumpOpt(b, path)
         }
     }
@@ -360,6 +362,51 @@ fun dumpOpt(b : String.Builder, path : String) -> Unit {
 -- end is the plan for the next slice. What it prints is what the system
 -- assembler accepts, because `as` is the oracle the encoder will be checked
 -- against once there is one (`LINKER.md`).
+-- The program as arm64 assembly (`NATIVE-BACKEND.md` M28 phase 5).
+--
+-- `asm` above prints the machine IR and its measurements -- virtual
+-- registers, the verifiers, the histograms -- and this prints what the
+-- assembler reads. Two commands rather than a flag, because they answer
+-- different questions and every test of the first parses its numbers.
+--
+-- **Functions only, so far.** The module's data -- globals, the string
+-- literals, the panic messages, the permanent root array, the entry sequence
+-- and the frame tables -- is the next slice, so what this prints assembles and
+-- does not yet link.
+fun dumpNative(b : String.Builder, path : String) -> Unit {
+    let (checked, entry) = checkProgram(path)
+    let program = optimized(checked, entry)
+    let (module_, skipped) = SsaLower.lowerProgram(program, checked.decls)
+    if len(skipped) > 0 {
+        String.push(b, "// === " + path + "\n// FAILED: "
+                       + Int.toString(len(skipped)) + " bindings did not lower\n")
+        return
+    }
+    String.push(b, "// === " + path + "\n")
+    String.push(b, "    .text\n")
+    let (selected, unsupported, asm) = Select.selectModule(module_)
+    for u in unsupported {
+        String.push(b, "// skipped " + u.name + ": " + u.what + "\n")
+    }
+    let lows = Map.new()
+    for low in module_.functions { Map.put(lows, low.name, low) }
+    for var i = 0; i < len(selected); i = i + 1 {
+        let f = selected[i]
+        let frame = match Map.get(lows, f.name) {
+            Some(low) -> Roots.analyze(low)
+            None -> Roots.Frame { slots = Map.new(), at = Map.new() }
+        }
+        let a = Regalloc.allocate(f, frame.slots)
+        match a.stopped {
+            Some(why) -> String.push(b, "// skipped " + f.name + ": " + why + "\n")
+            None -> Emit.emitFunc(a.func, a, Frame.layout(a, frame), i, b)
+        }
+    }
+    -- After the code: a message is interned by the guard that raises it, so
+    -- the table is only complete once every function has been emitted.
+    Emit.emitMessages(asm, b)
+}
+
 fun dumpAsm(b : String.Builder, path : String) -> Unit {
     let (checked, entry) = checkProgram(path)
     let program = optimized(checked, entry)
@@ -370,7 +417,7 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
         return
     }
     String.push(b, "; === " + path + "\n")
-    let (selected, unsupported) = Select.selectModule(module_)
+    let (selected, unsupported, _) = Select.selectModule(module_)
     for f in selected {
         String.push(b, Ssa.showFunc(f))
         -- The same verifier the low IR gets, on the machine graph, because
@@ -819,8 +866,8 @@ fun readOrDie(path : String) -> Source = match Source.read(path) {
 
 fun usage() -> a =
     die("usage: boot "
-        + "<tokens|ast|desugar|decls|deps|classes|types|core|mono|opt> "
-        + "FILE...")
+        + "<tokens|ast|desugar|decls|deps|classes|types|core|mono|opt"
+        + "|ssa|llvm|asm|native> FILE...")
 
 fun die(message : String) -> a {
     IO.stderr("boot: " + message + "\n")

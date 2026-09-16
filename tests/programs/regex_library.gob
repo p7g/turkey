@@ -1,0 +1,184 @@
+import Regex
+
+type Assignment = Assignment { key : String, value : String }
+type Counter = Counter { value : Int }
+fun check(condition, label) {
+    if !condition { error("FAIL: " + label) }
+    print("PASS: " + label)
+}
+
+-- Array deliberately has no Eq instance in the current standard library.
+-- These expected values contain only strings, characters, sums and arrays.
+fun checkValue[Show a](actual : a, expected : a, label : String) {
+    check(show(actual) == show(expected), label)
+}
+
+fun main() {
+    let word = some(satisfy(fun(c) = c >= 'a' && c <= 'z'))
+    let built = Counter { value = 0 }
+    let extracted = Counter { value = 0 }
+    let assignment = do {
+        let key = capture(word)?
+        built.value = built.value + 1
+        literal("=")?
+        let value = capture(word)?
+        pure(map2(key, value, fun(k, v) {
+            extracted.value = extracted.value + 1
+            Assignment { key = k, value = v }
+        }))
+    }
+    check(built.value == 1 && extracted.value == 0, "construction is eager; extraction is deferred")
+    match fullMatch(assignment, "hello=world") {
+        Some(a) -> {
+            check(a.key == "hello" && a.value == "world", "typed Assignment")
+            print(a.key + "=" + a.value)
+        }
+        None -> error("expected Assignment")
+    }
+    match fullMatch(assignment, "foo=bar") {
+        Some(a) -> check(a.key == "foo" && a.value == "bar", "reuse constructed NFA")
+        None -> error("expected second Assignment")
+    }
+    check(Option.isNone(fullMatch(assignment, "hello=")), "missing value fails")
+    check(Option.isNone(fullMatch(assignment, "hello=world!")), "full match rejects suffix")
+    check(built.value == 1 && extracted.value == 2, "matching never reruns bind; failures never extract")
+
+    let pair = do {
+        let key = capture(word)?
+        literal("=")?
+        let value = capture(word)?
+        pure((key, value))
+    }
+    checkValue(fullMatch(pair, "hello=world"), Some(("hello", "world")), "tuple associated-family result")
+    let nested = map(pair, fun((key, value)) = (key, (value, key)))
+    checkValue(fullMatch(nested, "a=b"), Some(("a", ("b", "a"))), "recursive tuple resolution")
+
+    let unicode = capture(some(satisfy(fun(c) = c != '=')))
+    checkValue(fullMatch(unicode, "hé🙂"), Some("hé🙂"), "UTF-8 capture boundaries")
+    let empty = capture(many(literal("")))
+    checkValue(fullMatch(empty, ""), Some(""), "nullable repetition terminates")
+    let alternatives = capture(choice(literal("a"), literal("ab")))
+    checkValue(fullMatch(alternatives, "ab"), Some("ab"), "left alternative cannot commit prematurely")
+
+    let greedy = do {
+        let first = capture(many(literal("a")))?
+        let second = capture(many(literal("a")))?
+        pure((first, second))
+    }
+    checkValue(fullMatch(greedy, "aaa"), Some(("aaa", "")), "greedy capture priority")
+    -- Later construction must not invalidate previously returned handles.
+    checkValue(fullMatch(pair, "x=y"), Some(("x", "y")), "capture handles survive later construction")
+
+    var hard = do { literal("")?; pure(()) }
+    for var i = 0; i < 24; i = i + 1 {
+        hard = do { hard?; choice(literal("a"), literal(""))?; pure(()) }
+    }
+    for var i = 0; i < 24; i = i + 1 {
+        hard = do { hard?; literal("a")?; pure(()) }
+    }
+    check(Option.isSome(fullMatch(hard, String.repeat("a", 24))), "ambiguous optional-prefix NFA")
+
+    checkValue(fullMatch(choice(literal("yes"), satisfy(fun(c) = c == 'n')), "yes"), Some(Left("yes")), "choice returns Left String")
+    checkValue(fullMatch(choice(literal("yes"), satisfy(fun(c) = c == 'n')), "n"), Some(Right('n')), "choice returns Right Char")
+    checkValue(fullMatch(choice(literal("a"), literal("a")), "a"), Some(Left("a")), "choice is left biased")
+    checkValue(fullMatch(orElse(literal("a"), literal("ab")), "ab"), Some("ab"), "orElse shares result type")
+
+    let maybeWord = optional(capture(word))
+    checkValue(fullMatch(maybeWord, ""), Some(None), "optional absent")
+    checkValue(fullMatch(maybeWord, "hello"), Some(Some("hello")), "optional present")
+    checkValue(fullMatch(optional(literal("")), ""), Some(Some("")), "optional empty participation")
+    let optionalThenRequired = do {
+        let first = optional(literal("a"))?
+        literal("a")?
+        pure(first)
+    }
+    checkValue(fullMatch(optionalThenRequired, "a"), Some(None), "optional abandons unsuccessful present branch")
+    checkValue(fullMatch(optionalThenRequired, "aa"), Some(Some("a")), "optional prefers participating branch")
+
+    let letters = some(satisfy(fun(c) = c >= 'a' && c <= 'z'))
+    checkValue(fullMatch(letters, "abc"), Some(['a', 'b', 'c']), "some returns all iterations")
+    check(Option.isNone(fullMatch(letters, "")), "some requires an iteration")
+    checkValue(fullMatch(many(literal("a")), ""), Some([]), "many returns empty array")
+    checkValue(fullMatch(many(literal("a")), "aaa"), Some(["a", "a", "a"]), "many returns strings")
+    checkValue(fullMatch(many(literal("")), ""), Some([]), "many omits empty cycles")
+    checkValue(fullMatch(some(literal("")), ""), Some([""]), "some retains required empty iteration")
+
+    let row = do {
+        let result = assignment?
+        literal(";")?
+        pure(result)
+    }
+    let beforeRows = extracted.value
+    match fullMatch(some(row), "a=b;c=d;") {
+        Some(rows) -> {
+            check(len(rows) == 2 && rows[0].key == "a" && rows[0].value == "b"
+                && rows[1].key == "c" && rows[1].value == "d", "some returns typed Assignments")
+        }
+        None -> error("expected Assignment array")
+    }
+    check(extracted.value == beforeRows + 2, "one recipe evaluation per selected iteration")
+    check(Option.isNone(fullMatch(some(row), "a=b;c=")), "failed repeated pattern")
+    check(extracted.value == beforeRows + 2, "failed repetition runs no result callbacks")
+
+    let groups = some(do {
+        let chars = letters?
+        literal(";")?
+        pure(chars)
+    })
+    checkValue(fullMatch(groups, "ab;c;"), Some([['a', 'b'], ['c']]), "nested repetition preserves iteration boundaries")
+    let tokens = many(choice(literal("a"), satisfy(fun(c) = c == 'b')))
+    checkValue(fullMatch(tokens, "abba"), Some([Left("a"), Right('b'), Right('b'), Left("a")]),
+        "repeated choice preserves each branch")
+    let optionals = some(do {
+        let x = optional(literal("a"))?
+        literal(";")?
+        pure(x)
+    })
+    checkValue(fullMatch(optionals, "a;;a;"), Some([Some("a"), None, Some("a")]),
+        "optional captures do not leak between iterations")
+    let repeatedPair = some(do {
+        let x = literal("a")?
+        let y = optional(literal("b"))?
+        pure((x, y))
+    })
+    checkValue(fullMatch(repeatedPair, "aba"), Some([("a", Some("b")), ("a", None)]),
+        "repetition resolves tuple recipes")
+    let backoff = do {
+        let xs = many(literal("a"))?
+        literal("a")?
+        pure(xs)
+    }
+    checkValue(fullMatch(backoff, "aaa"), Some(["a", "a"]), "greedy repetition gives way to suffix")
+    checkValue(fullMatch(many(satisfy(fun(c) = True)), "hé🙂"), Some(['h', 'é', '🙂']),
+        "repeated Unicode scalars")
+
+    let branchCalls = Counter { value = 0 }
+    let counted = map(literal("a"), fun(recipe) = map(recipe, fun(text) {
+        branchCalls.value = branchCalls.value + 1
+        text
+    }))
+    checkValue(fullMatch(choice(counted, counted), "a"), Some(Left("a")), "shared fragment branch scope")
+    check(branchCalls.value == 1, "losing branch recipe never runs")
+    let triple = do {
+        let a = literal("a")?
+        let b = literal("b")?
+        let c = literal("c")?
+        pure((a, b, c))
+    }
+    checkValue(fullMatch(triple, "abc"), Some(("a", "b", "c")), "triple capture resolution")
+    checkValue(fullMatch(orElse(pair, pair), "a=b"), Some(("a", "b")), "orElse resolves tuple recipes")
+    checkValue(fullMatch(many(many(literal("a"))), "aaa"), Some([["a", "a", "a"]]),
+        "nested nullable repetition")
+    checkValue(fullMatch(many(choice(literal(""), literal("a"))), "aa"),
+        Some([Right("a"), Right("a")]), "nullable alternative repetition makes progress")
+    checkValue(fullMatch(some(optional(literal("a"))), ""), Some([None]),
+        "required nullable iteration retains absence")
+    let shared = literal("a")
+    let duplicated = do { let x = shared?; let y = shared?; pure((x, y)) }
+    checkValue(fullMatch(duplicated, "aa"), Some(("a", "a")), "reused captured fragment remains executable")
+    let large = fullMatch(many(literal("a")), String.repeat("a", 2000))
+    match large {
+        Some(xs) -> check(len(xs) == 2000 && xs[1999] == "a", "long repeated capture history")
+        None -> error("expected long capture history")
+    }
+}

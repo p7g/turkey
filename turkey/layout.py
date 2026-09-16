@@ -311,7 +311,19 @@ def _packed_layouts(program: CProgram, decls) -> dict[str, set[tuple[str, ...]]]
                 records.append((info.name,
                                 _packed_key(info, node, abstracted, decls),
                                 conditions))
-        if isinstance(node, (CExpr, CAlt, CBind)):
+        if isinstance(node, CBind):
+            # A nested binding abstracts over its *own* variables, so its body
+            # reads its own map rather than the enclosing one -- the same rule
+            # the top-level loop below applies, and what boot's `packingsInto`
+            # does. Keying a nested packing by the enclosing map makes the two
+            # implementations disagree about which copy of an arm a layout
+            # belongs to, and `share` then drops the copy whose codes match.
+            walk(node.value, node.layouts, conditions)
+            for f in _fields(node):
+                if f.name != "value":
+                    walk(getattr(node, f.name), abstracted, conditions)
+            return
+        if isinstance(node, (CExpr, CAlt)):
             for f in _fields(node):
                 walk(getattr(node, f.name), abstracted, conditions)
         elif isinstance(node, (list, tuple)):

@@ -1,0 +1,130 @@
+"""Solver-derived `Typed` instances (ERRORS.md step 5).
+
+A type as a value, so that a packed payload can be asked what it is. This is
+the half `cast` rests on: the rep is what a cast compares, so the two things
+that matter are that a derived rep names the type exactly -- delta 43's
+qualified constructor name, with its arguments -- and that no program can write
+an instance of its own, because one that lied would make a cast return a value
+of a type it is not.
+"""
+
+from __future__ import annotations
+
+import io
+from contextlib import redirect_stdout
+
+import pytest
+
+from turkey import driver, llvmgen
+from turkey.errors import TurkeyError
+
+
+def outputs(source: str, capfd) -> str:
+    checked = driver.check(source)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        driver.run(source, backend="python")
+    python = out.getvalue()
+    capfd.readouterr()
+    llvmgen.execute(checked.opt, checked.decls, checked.main)
+    native = capfd.readouterr().out
+    assert python == native
+    return python
+
+
+def fails(source: str) -> str:
+    with pytest.raises(TurkeyError) as caught:
+        driver.check(source)
+    return caught.value.message
+
+
+PROXIES = """
+import Data.Typed (TypeRep(..), Proxy(..), describe)
+
+type Box a = Box(a)
+
+fun shown[Typed a](p : Proxy a) -> String = describe(typeRep(p))
+fun repOf[Typed a](p : Proxy a) -> TypeRep = typeRep(p)
+
+fun intP() -> Proxy Int = Proxy
+fun strP() -> Proxy String = Proxy
+fun boxIntP() -> Proxy (Box Int) = Proxy
+"""
+
+
+def test_a_rep_names_the_qualified_constructor(capfd):
+    """Delta 43 made the name unique, which is the whole basis for comparing
+    two reps: a bare `Box` could be two different types from two modules."""
+    source = PROXIES + """
+fun main() {
+    print(shown(intP()))
+    print(shown(boxIntP()))
+}
+"""
+    assert outputs(source, capfd) == "Int\nMain#Box Int\n"
+
+
+def test_arguments_come_from_the_dictionaries_passed_in(capfd):
+    """The instance head is general -- `Box a`, not `Box Int` -- so the rep of
+    an argument cannot be known to it. It comes from the caller's dictionary,
+    which is what makes one derived instance serve every use."""
+    source = PROXIES + """
+fun deepP() -> Proxy (Box (Box (Box Int))) = Proxy
+fun main() { print(shown(deepP())) }
+"""
+    assert outputs(source, capfd) == "Main#Box (Main#Box (Main#Box Int))\n"
+
+
+def test_a_tuple_carries_its_elements(capfd):
+    """`spine` answers no arguments for a tuple, so a rep built off the spine
+    would call every pair `Tuple2` and compare them all equal."""
+    source = PROXIES + """
+fun pairP() -> Proxy (Int, String) = Proxy
+fun otherP() -> Proxy (String, Int) = Proxy
+fun main() {
+    print(shown(pairP()))
+    print(repOf(pairP()) == repOf(otherP()))
+}
+"""
+    assert outputs(source, capfd) == "Tuple2 Int String\nFalse\n"
+
+
+def test_identity_is_structural(capfd):
+    source = PROXIES + """
+fun boxStrP() -> Proxy (Box String) = Proxy
+fun main() {
+    print(repOf(intP()) == repOf(intP()))
+    print(repOf(intP()) == repOf(strP()))
+    print(repOf(boxIntP()) == repOf(boxStrP()))
+}
+"""
+    assert outputs(source, capfd) == "True\nFalse\nFalse\n"
+
+
+def test_a_program_may_not_write_a_typed_instance():
+    """The one class that is named but not instanced. A hand-written instance
+    is the forged evidence a checked cast has no way to detect, because the
+    comparison it performs *is* the check."""
+    source = """
+type Evil = Evil(Int)
+
+instance Typed Evil { }
+
+fun main() { print(1) }
+"""
+    message = fails(source)
+    assert "derived by the compiler" in message
+    assert "may not declare one" in message
+
+
+def test_a_type_with_no_constructor_has_no_rep():
+    """A derived instance reads its parameters off a constructor's scheme, so a
+    type with none is refused rather than guessed at."""
+    source = """
+import Data.Typed (Proxy(..), describe)
+
+fun shown[Typed a](p : Proxy a) -> String = describe(typeRep(p))
+fun fnP() -> Proxy (fun(Int) -> Int) = Proxy
+fun main() { print(shown(fnP())) }
+"""
+    assert "no instance for" in fails(source)

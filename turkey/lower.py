@@ -82,7 +82,8 @@ from .evidence import (
     Absent, Evidence, FromDict, FromInstance, InstancePlan, MethodImpl, Use,
 )
 from .types import (
-    BOOL, EQUALS, INT, KFun, STAR, TApp, TBottom, TCon, TFam, TFun, TTuple, TVar,
+    BOOL, EQUALS, INT, KFun, STAR, STRING, TApp, TBottom, TCon, TFam, TFun,
+    TTuple, TVar,
     Type, apply, prune, raw_array_of, spine,
 )
 
@@ -296,6 +297,8 @@ class Lowerer:
         result = self.dict_type(inst.cls, inst.head)
         if is_generated(inst.cls):
             return self.accessors(inst, result)
+        if inst.cls == prelude.TYPED_CLASS:
+            return self.type_rep(inst, result)
         fields: list[tuple[str, CExpr]] = []
         for sup, evidence in plan.supers.items():
             fields.append((super_field(sup),
@@ -366,6 +369,59 @@ class Lowerer:
         record = CRecord(result, span, dict_name(inst.cls), fields)
         return CBind(inst_name(inst), result, self.instance_binders(inst),
                      record, span, module=inst.module)
+
+    def type_rep(self, inst: InstInfo, result: Type) -> CBind:
+        """The dictionary of a derived `Typed` instance.
+
+        Written in Core for the same reason `accessors` is: the surface
+        language cannot say it. `typeRep` answers the constructor's *qualified*
+        name, which delta 43 made unique and which no Turkey expression can ask
+        for, and the arguments' reps come from the dictionaries this instance
+        was handed -- so a rep is built the same way a type is, by application.
+
+        The `Proxy` argument carries nothing and is ignored. It exists so that
+        a call can say which instance it means, since the answer depends on the
+        type and not on any value of it.
+        """
+        span = None
+        plan = inst.plan
+        assert isinstance(plan, InstancePlan)
+        rep_ty = self.decls.head(prelude.TYPE_REP)
+        head, _ = spine(inst.head)
+        name = (head.name if isinstance(head, TCon)
+                else f"Tuple{len(head.elems)}")
+        elems: list[CExpr] = []
+        for param, pred in zip(plan.params, inst.context):
+            argument = pred.args[0]
+            proxy_ty = apply(self.decls.head(prelude.PROXY), [argument], span)
+            dict_ty = self.dict_type(pred.name, argument)
+            method = CField(TFun([proxy_ty], rep_ty), span,
+                            CVar(dict_ty, span, param), "typeRep")
+            elems.append(CApp(rep_ty, span, method,
+                              [CCon(proxy_ty, span, prelude.PROXY)]))
+        array_ty = raw_array_of(rep_ty)
+        made = CApp(rep_ty, span,
+                    CCon(TFun([STRING, array_ty], rep_ty), span,
+                         prelude.TYPE_REP),
+                    [CLit(STRING, span, "String", name),
+                     CArray(array_ty, span, elems)])
+        own_proxy = apply(self.decls.head(prelude.PROXY), [inst.head], span)
+        body = CLam(TFun([own_proxy], rep_ty), span,
+                    [CParam("%p", own_proxy)], made,
+                    f"{inst_name(inst)}#typeRep")
+        record = CRecord(result, span, dict_name(inst.cls),
+                         [("typeRep", body)])
+        value: CExpr = record
+        if plan.params:
+            params = [CParam(p, self.dict_type(pred.name, pred.args[0]))
+                      for p, pred in zip(plan.params, inst.context)]
+            value = CLam(TFun([p.ty for p in params], result), span,
+                         params, record, inst_name(inst))
+        # `value.ty`, not `result`: with a context the dictionary *is* a
+        # function from its arguments' dictionaries, and the binding has to say
+        # so or Core's checker sees a lambda where a record was promised.
+        return CBind(inst_name(inst), value.ty, self.instance_binders(inst),
+                     value, span, module=inst.module)
 
     def self_dict(self, inst: InstInfo, params: list[str]) -> CExpr:
         """The instance's own dictionary, as seen from inside one of its

@@ -302,6 +302,7 @@ fun instanceBind(l : Lowerer, inst : InstInfo) -> CBind {
     }
     let result = dictType(l, inst.cls, inst.head)
     if Classes.isGenerated(inst.cls) { return accessors(l, inst, result) }
+    if inst.cls == P.typedClass { return typeRepDict(l, inst, result) }
     let fields = Array.new(8)
     let givens = instanceGivens(l, inst, plan)
     for (sup, ev) in Map.entries(plan.supers) {
@@ -365,6 +366,72 @@ fun instanceBind(l : Lowerer, inst : InstInfo) -> CBind {
 -- That is what lets the devirtualizer hoist these accessors and the inliner
 -- collapse them: wherever specialization reaches, a field access ends up the
 -- same `CField` it always was.
+-- The dictionary of a derived `Typed` instance.
+--
+-- Written in Core for the same reason `accessors` is: the surface language
+-- cannot say it. `typeRep` answers the constructor's *qualified* name, which
+-- delta 43 made unique and which no Turkey expression can ask for, and the
+-- arguments' reps come from the dictionaries this instance was handed -- so a
+-- rep is built the same way a type is, by application.
+--
+-- The `Proxy` argument carries nothing and is ignored. It exists so a call can
+-- say which instance it means, since the answer depends on the type and not on
+-- any value of it.
+fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
+    let plan = match inst.plan {
+        Some(pl) -> pl
+        None -> oops("a derived 'Typed' instance has no plan",
+                     Some(inst.decl.span))
+    }
+    let span = Some(inst.decl.span)
+    let repTy = Decls.head(l.decls, P.typeRepCon)
+    let (head, _) = Ty.spine(inst.head)
+    let name = match head {
+        TCon(c) -> c.name
+        TTuple(elems) -> "Tuple" + Int.toString(len(elems))
+        _ -> oops("a derived 'Typed' instance has no constructor", span)
+    }
+    let elems = Array.new(len(plan.params))
+    for var i = 0; i < len(plan.params) && i < len(inst.context); i = i + 1 {
+        let pred = inst.context[i]
+        let argument = pred.args[0]
+        let proxyTy = Ty.applyTo(Decls.head(l.decls, P.proxyCon),
+                                 [argument], span)
+        let dictTy = dictType(l, pred.name, argument)
+        let method = node(TFun([proxyTy], repTy), span,
+                          CField(node(dictTy, span, CVar(plan.params[i])),
+                                 "typeRep"))
+        Array.push(elems, node(repTy, span,
+            CApp(method, [node(proxyTy, span, CCon(P.proxyCon))])))
+    }
+    let arrayTy = Ty.rawArrayOf(repTy)
+    let made = node(repTy, span, CApp(
+        node(TFun([Ty.tString(), arrayTy], repTy), span, CCon(P.typeRepCon)),
+        [node(Ty.tString(), span, CLit(LString(name))),
+         node(arrayTy, span, CArray(elems))]))
+    let ownProxy = Ty.applyTo(Decls.head(l.decls, P.proxyCon), [inst.head], span)
+    let body = node(TFun([ownProxy], repTy), span,
+                    CLam([CParam { name = "%p", ty = ownProxy }], made,
+                         instName(inst) + "#typeRep"))
+    let record = node(result, span,
+                      CRecord(dictConName(inst.cls), [("typeRep", body)]))
+    var value = record
+    if len(plan.params) > 0 {
+        let params = Array.new(len(plan.params))
+        for var i = 0; i < len(plan.params) && i < len(inst.context); i = i + 1 {
+            let pr = inst.context[i]
+            Array.push(params, CParam {
+                name = plan.params[i], ty = dictType(l, pr.name, pr.args[0]),
+            })
+        }
+        value = node(TFun(Array.map(params, fun(pm) = pm.ty), result), span,
+                     CLam(params, record, instName(inst)))
+    }
+    let b = newBind(instName(inst), value.ty, instanceBinders(inst), value, span)
+    b.module_ = inst.module_
+    b
+}
+
 fun accessors(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
     let label = Classes.generatedLabel(inst.cls)
     var fam = ""

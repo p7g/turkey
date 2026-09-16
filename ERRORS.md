@@ -866,9 +866,30 @@ would reopen this is a FINDINGS entry where a type-indexed structure is wanted.
    predicate threaded by the solver -- which needs no runtime frame machinery
    at all, and which Turkey's dictionary passing is unusually well placed to
    take -- and always-on. Undecided.
-5. **Checked downcasting.** Add solver-derived `Typed` instances and trustworthy
-   type evidence; reject user instances. Implement checked `cast` with the
-   positive and negative cases above, without exposing `unboxAs`.
+5. **Checked downcasting.** *Type evidence done; `cast` not started.*
+   `TypeRep` and `Proxy` are in `Data.Typed.Type`, low enough in the graph for
+   `Std.Classes` to declare `class Typed a` over them -- which it has to be,
+   since `class Error e : Typed e` puts `Typed` above `Error`, and
+   `Data.Array` imports `Std.Classes` (FINDINGS 31 -- no module cycles). That
+   is why a rep's arguments are a `Prim.Array` rather than the library one.
+
+   Instances are derived on demand, one per type constructor, through the same
+   `by_inst` path that manufactures `%HasField` instances, and the dictionary
+   is written in Core beside `accessors` for the same reason: `typeRep` answers
+   the constructor's qualified name (delta 43), which no Turkey expression can
+   ask for. A derived instance's head is general -- `Box a`, not `Box Int` --
+   so its context is `Typed` over each parameter and the dictionary is a
+   function of its arguments' dictionaries. A program may not write an
+   instance: `_resolve_instance` refuses one, as GHC has refused user
+   `Typeable` since 7.10, because the comparison of reps *is* the check a cast
+   performs and forged evidence has nothing downstream to catch it.
+   `tests/programs/typed_reps.gob` and `tests/test_typed.py` cover it.
+
+   What remains: `cast[Typed a](err : SomeError) -> Option a`, and the trusted
+   primitive it converts through. Nothing like that primitive exists yet, and
+   PRIMITIVES.md's rule is that each one is paid twice. Open, and answered "no"
+   for now: whether `cast` searches the cause chain as Go's `errors.As` does,
+   or only inspects the outermost payload.
 6. **Recoverable panics, deferred.** First specify a concrete boundary's state,
    cleanup, nesting, and fatal-failure contract. Then implement a rooted heap
    payload and recovery using the flag. Clearing the flag alone is not task

@@ -141,3 +141,38 @@ fun main() {
 ])
 def test_what_an_opening_may_not_do(source, message):
     assert message in fails(source)
+
+
+@pytest.mark.parametrize("source, message", [
+    # Two openings in one arm. Each gets its own `Skolems`, but they share the
+    # rank the arm's `CLet` stamps them with, and `unify` tells rigid constants
+    # apart by name and rank alone -- so naming them both `a` made two unrelated
+    # hidden types equal. The `if` is what asks for that equality.
+    ("type Some = Some[Show a](a)\n"
+     "fun both(v : (Some, Some)) -> String = match v {\n"
+     "    (Some(x), Some(y)) -> show(if False { x } else { y })\n"
+     "}\nfun main() {}\n",
+     "expected a, found a2"),
+    # The same, opened by a parameter list rather than an arm: one opening scope
+    # either way, so one pool of names either way.
+    ("type Some = Some[Show a](a)\n"
+     "fun both(Some(x), Some(y)) -> String = show(if False { x } else { y })\n"
+     "fun main() {}\n",
+     "expected a, found a2"),
+])
+def test_two_openings_in_one_scope_hide_different_types(source, message):
+    assert message in fails(source)
+
+
+@pytest.mark.parametrize("source", [
+    # A record pattern opens an existential as readily as a positional one, and
+    # `lib/Data/Error.gob` uses no other form -- so the escape check has to see
+    # through it, and through a tuple that holds one.
+    "type Box = Box[Show s] { item : s }\n"
+    "fun leak(Box { item = p }) = p\nfun main() {}\n",
+    "type Box = Box[Show s] { item : s }\n"
+    "fun leak(v : (Box, Int)) = match v {\n"
+    "    (Box { item = p }, _) -> p\n}\nfun main() {}\n",
+])
+def test_a_record_opening_may_not_leak_either(source):
+    assert "cannot escape the pattern 'Box' that opened it" in fails(source)

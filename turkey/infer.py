@@ -946,7 +946,16 @@ class Generator:
                 f"only a 'match' arm or a function parameter may do: a 'let', "
                 f"'var' or 'for' has no body for the type it hides to live in",
                 span)
+        # One `Skolems` per pattern, but the names have to be unique across the
+        # whole opening scope, not just this pattern: every opening in an arm or
+        # a parameter list shares the rank that `opened` stamps them with, and
+        # `unify` tells two rigid constants apart by name and rank alone. Two
+        # patterns that both write `a` would otherwise hand out the same
+        # constant for two unrelated hidden types.
         skolems = Skolems()
+        skolems.used.update(made.name
+                            for _, earlier in self.openings[-1]
+                            for made in earlier)
         mapping: dict[int, Type] = {v.id: self.fresh()
                                     for v in info.scheme.quantified}
         for variable, written in zip(info.exists, info.exists_names):

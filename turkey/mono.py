@@ -1147,7 +1147,7 @@ def _unshared_openings(program: CProgram) -> set[str]:
     """
     from dataclasses import fields as dataclass_fields
     from . import ast
-    from .core import CAlt, CExpr
+    from .core import CAlt, CBind, CExpr
     found: set[str] = set()
 
     def walk(node, owner: str) -> None:
@@ -1155,7 +1155,12 @@ def _unshared_openings(program: CProgram) -> set[str]:
             from .core import openings
             if any(p.layouts is None for p in openings(node.pat)):
                 found.add(owner)
-        if isinstance(node, (CExpr, CAlt)):
+        # `CBind` too: a `CLetRec`'s bindings hold arms like any other body, and
+        # skipping them let an unshared opening inside one reach the backend.
+        # Boot's `unsharedInto` descends into binds, and so does every sibling
+        # walker in `layout.py`. The hit is still reported against the top-level
+        # binding that contains it, which is the name a reader can find.
+        if isinstance(node, (CExpr, CAlt, CBind)):
             for f in dataclass_fields(node):
                 walk(getattr(node, f.name), owner)
         elif isinstance(node, (list, tuple)):

@@ -778,6 +778,68 @@ runtime's collector walks `x29` frame records and looks each return address up,
 beside the chain the LLVM path and the C runtime go on using. No function enters
 or leaves anything, and no safepoint writes a mask.
 
+#### The table's encoding, surveyed
+
+"Frame tables rather than a shadow stack" is decided above and measured. What
+that leaves open is the part both the emitter and the C runtime have to agree
+on for good: what a table entry is keyed by, who builds the lookup structure,
+and how wide an offset is.
+
+| | keyed by | who builds the lookup | entry shape |
+|---|---|---|---|
+| **OCaml** `runtime/frame_descriptors.c`, `caml/frame_descriptors.h` | the **return address** (`uintnat retaddr`) | the runtime, at startup: `caml_init_frame_descriptors` walks the compiler-emitted `caml_frametable[]` and fills an open-addressed hash table, linear probing, capacity a power of two and `num_desc * 2 <= capacity` | `{uintnat retaddr; uint16_t frame_data; uint16_t num_live; uint16_t live_ofs[]}` -- variable length, walked by `next_frame_descr`; `frame_data` packs the frame size with two flag bits |
+| **Go** `runtime/stkframe.go`, `cmd/link` pclntab | the **pc offset within a function**, and a `pcdata` index derived from it | the **linker**, which is the only thing that knows final addresses; the runtime indexes `FUNCDATA_LocalsPointerMaps`/`ArgsPointerMaps` by the decoded `pcdata` value | one bitmap per distinct safepoint, indexed rather than searched -- and the pc must be backed up to the call: "Back up to the CALL. If we're at the function entry point, we want to use the entry map (-1)" |
+| **LLVM** `__llvm_stackmaps` (`StackMaps.html`) | an ID plus "the offset within the code from the beginning of the enclosing function" | the runtime, explicitly: "compactness of the representation is secondary because the runtime is expected to parse the data immediately after compiling a module and encode the information in its own format" | fixed header per record -- `uint64` ID, `uint32` instruction offset, `uint16` flags, `uint16` NumLocations -- then 12-byte locations |
+| **LLVM** shadow stack, for contrast (`GarbageCollection.html`) | -- | -- | the strategy this project measured at 13%: "slower than using a stack map compiled into the executable as constant data, but has a significant portability advantage because it requires no special support from the target code generator" |
+
+**Go is the counterexample, and it does not transfer.** Keying on a pc offset
+is better than keying on a return address -- it is denser, it needs no
+relocation, and the lookup is an index rather than a probe -- but it costs a
+linker that sorts every function by final address and writes the table. This
+backend emits assembly and hands it to `cc` (LINKER.md, option B); it does not
+know a final address and cannot sort by one. The emitter can write
+`.quad <label>` and let the linker relocate it, which is exactly the shape
+OCaml's `retaddr` has. So: **keyed by return address**, because the alternative
+presupposes a linker this project chose not to write.
+
+**The runtime builds the lookup, at startup.** All three peers agree and LLVM
+says why outright: the compiler's format is for getting the facts across, not
+for being queried. A table registered once and probed on every frame of every
+collection should be shaped by the reader.
+
+**What is being started simple, deliberately.** OCaml packs `frame_data` and
+`live_ofs` into `uint16_t` and walks entries variable-length; `boot`'s largest
+frame is 16,672 bytes and its largest root set is small, so 16-bit offsets fit
+with room. That would quarter a table of 45,097 entries. It is also entirely
+reversible -- the format has one producer and one consumer, both in this
+repository -- whereas the two decisions above are not. So the first version
+writes `.quad` throughout and the section's measured size is what argues for or
+against packing it. Likewise the lookup: a sorted copy and a binary search is
+fewer lines than a hash table, and the collection time is what decides whether
+OCaml's probe is worth writing.
+
+**The format, then.** One flat array, `_turkey_frame_table`, emitted after the
+functions and registered once by the entry sequence:
+
+    _turkey_frame_table:
+        .quad   <number of entries>
+        ;; per entry, in any order:
+        .quad   <return-address label>      ;; the label after the `bl`
+        .quad   <number of live roots>
+        .quad   <offset from x29>           ;; × that many
+
+The return-address label is the address *after* the call, which is what `x30`
+holds and what a walker reads out of a frame record -- so the emitter has
+nothing to compute: selection already marks the position with `SafepointMap`,
+directly after the `bl`, and a label printed there is the key. The offsets are
+`x29`-relative and signed, which `Turkey.Frame.layout` has been computing since
+phase 4 (`rootsAt + 8·slot - recordAt`).
+
+`turkey_frame_table_register(const int64_t *table)` is called before anything
+allocates. A binary that registers nothing -- every LLVM-path binary, which
+links this same runtime -- walks no frames, which is what lets one runtime serve
+both backends.
+
 
 
 ### Frames

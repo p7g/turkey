@@ -53,6 +53,13 @@ void *turkey_closure_new(uint64_t code, int64_t capture_count,
 void turkey_root_enter(void *frame, void *values, int64_t count,
                        const char *function_name);
 void turkey_root_leave(void *frame);
+/* The arm64 backend's roots: one table for the module, keyed by return
+   address, registered by its entry sequence before anything allocates. Spelled
+   `const void *` because the entry is generated code building the constant
+   itself, matching the layout rather than the name -- the same reason
+   `turkey_frame_enter` takes one. A program that never calls this (every
+   LLVM-path binary) is unaffected. */
+void turkey_frame_table_register(const void *table);
 void turkey_collect(void);
 int64_t turkey_heap_objects(void);
 int64_t turkey_collection_count(void);

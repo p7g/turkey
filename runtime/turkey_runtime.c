@@ -373,6 +373,107 @@ static void mark(void *value) {
     while (mark_count > 0) mark_children(mark_stack[--mark_count]);
 }
 
+
+/* -- frame tables ------------------------------------------------------------
+
+   The arm64 backend registers roots OCaml's way: no function pushes or pops
+   anything, and each call site that may collect has a table entry naming the
+   frame offsets of the roots live across it, keyed by the return address
+   (`NATIVE-BACKEND.md`, "The table's encoding, surveyed"). The collector walks
+   `x29` frame records -- which Apple's ABI requires to be valid at all times --
+   and looks each return address up.
+
+   Both root schemes run at once, and that is the point: a C frame and an
+   LLVM-path frame have return addresses in no table, so they are skipped, and
+   the shadow-stack chain above goes on covering them. A binary that registers
+   no table walks no frames at all. */
+
+typedef struct FrameEntry {
+    uintptr_t retaddr;
+    int64_t count;
+    const int64_t *offsets; /* from x29, signed */
+} FrameEntry;
+
+static FrameEntry *frame_entries;
+static int64_t frame_entry_count;
+
+static int compare_frame_entries(const void *a, const void *b) {
+    uintptr_t x = ((const FrameEntry *)a)->retaddr;
+    uintptr_t y = ((const FrameEntry *)b)->retaddr;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+
+/* The emitter writes a flat array -- count, then {return address, n, n
+   offsets} -- because it cannot sort by an address the linker has not assigned
+   yet. Sorting it once here is what makes the lookup a binary search. */
+void turkey_frame_table_register(const void *table) {
+    const int64_t *words = table;
+    if (words == NULL) return;
+    int64_t count = words[0];
+    if (count <= 0) return;
+    FrameEntry *entries = malloc((size_t)count * sizeof *entries);
+    if (entries == NULL) {
+        turkey_panic("out of memory registering the frame table");
+        return;
+    }
+    const int64_t *p = words + 1;
+    for (int64_t index = 0; index < count; ++index) {
+        entries[index].retaddr = (uintptr_t)p[0];
+        entries[index].count = p[1];
+        entries[index].offsets = p + 2;
+        p += 2 + p[1];
+    }
+    qsort(entries, (size_t)count, sizeof *entries, compare_frame_entries);
+    free(frame_entries);
+    frame_entries = entries;
+    frame_entry_count = count;
+}
+
+static const FrameEntry *frame_entry_for(uintptr_t retaddr) {
+    int64_t low = 0, high = frame_entry_count - 1;
+    while (low <= high) {
+        int64_t middle = low + (high - low) / 2;
+        uintptr_t found = frame_entries[middle].retaddr;
+        if (found == retaddr) return &frame_entries[middle];
+        if (found < retaddr) low = middle + 1; else high = middle - 1;
+    }
+    return NULL;
+}
+
+/* Every frame of the current stack, from this one outwards.
+
+   The stop conditions matter more than the loop: a walk that runs off the end
+   of the chain marks whatever the words beyond it happen to hold, which would
+   surface as a corruption a long way from here and look exactly like a
+   miscompile. So the frame pointer must stay inside this thread's stack, stay
+   16-byte aligned, and strictly increase. */
+static void scan_native_frames(void) {
+    if (frame_entry_count == 0) return;
+    pthread_t self = pthread_self();
+    char *high = pthread_get_stackaddr_np(self);
+    char *low = high - pthread_get_stacksize_np(self);
+    void **frame = __builtin_frame_address(0);
+    while ((char *)frame >= low && (char *)frame + 16 <= high
+           && ((uintptr_t)frame & 15) == 0) {
+        /* The return address in *this* record is an address in the *caller*,
+           so the entry it finds describes the caller's frame -- whose `x29` is
+           this record's saved one. Applying the offsets to this frame instead
+           reads whatever the callee happens to have at those offsets, which is
+           how this was wrong the first time. */
+        void **next = frame[0];
+        if (next <= frame || (char *)next + 16 > high
+                || ((uintptr_t)next & 15) != 0) break;
+        const FrameEntry *entry = frame_entry_for((uintptr_t)frame[1]);
+        if (entry != NULL)
+            for (int64_t index = 0; index < entry->count; ++index) {
+                mark_grey(*(void **)((char *)next + entry->offsets[index]),
+                          "arm64 frame", index);
+                while (mark_count > 0) mark_children(mark_stack[--mark_count]);
+            }
+        frame = next;
+    }
+}
+
 void turkey_collect(void) {
     struct timespec stats_start, stats_end;
     int64_t stats_live_before = heap_count;
@@ -407,6 +508,9 @@ void turkey_collect(void) {
                 mark_grey(frame->values[index], frame->function_name, index);
                 while (mark_count > 0) mark_children(mark_stack[--mark_count]);
             }
+    /* Beside the chain, not instead of it: the arm64 backend's frames are
+       here and everything else's are above. */
+    scan_native_frames();
     /* Empty regions cost one free, regardless of their allocation count.
        Survivors rebuild availability by copying a fixed-size bitmap and
        using epoch marks. No walk over individual object headers. */

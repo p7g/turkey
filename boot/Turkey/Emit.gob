@@ -1,5 +1,5 @@
 module Turkey.Emit (
-    emitFunc, emitMessages, emitData, emitEntry,
+    emitFunc, emitMessages, emitData, emitEntry, emitFrameTable,
 )
 
 -- One allocated function as arm64 assembly (`NATIVE-BACKEND.md`, M28 phase 5).
@@ -69,10 +69,16 @@ fun emitFunc(f : Func Inst, a : Regalloc.Allocation, l : Frame.Layout,
         let at = Ssa.blockId(order[k])
         let next = if k + 1 < len(order) { Ssa.blockId(order[k + 1]) } else { -1 }
         line(b, blockLabel(tag, at) + ":")
-        for i in f.blocks[at].insts { emitInst(b, f, a, l, i) }
+        for i in f.blocks[at].insts { emitInst(b, f, a, l, tag, i) }
         emitTerm(b, f, a, l, tag, f.blocks[at].term, next)
     }
 }
+
+-- The return address of the call at this safepoint: the label goes directly
+-- after the `bl`, which is where selection put the `SafepointMap` mark.
+fun safepointLabel(tag : Int, block : Int, index : Int) -> String =
+    "Lsp" + Int.toString(tag) + "b" + Int.toString(block)
+        + "i" + Int.toString(index)
 
 fun blockLabel(tag : Int, block : Int) -> String =
     "Lf" + Int.toString(tag) + "b" + Int.toString(block)
@@ -159,7 +165,17 @@ fun at(b : String.Builder, offset : Int) -> Mem {
 -- -- instructions ------------------------------------------------------------
 
 fun emitInst(b : String.Builder, f : Func Inst, a : Regalloc.Allocation,
-             l : Frame.Layout, i : Inst) -> Unit {
+             l : Frame.Layout, tag : Int, i : Inst) -> Unit {
+    -- A safepoint is not an instruction: it is the *position* after the call,
+    -- which is the return address the collector will look up. So it becomes a
+    -- label, and `Turkey.Frame`'s entry for the same (block, index) names it.
+    match A.safepointOf(i.op) {
+        Some((sb, sn)) -> {
+            line(b, safepointLabel(tag, sb, sn) + ":")
+            return
+        }
+        None -> {}
+    }
     -- A slot whose offset is too wide is the one case that needs an extra
     -- instruction, so it is settled before the rewrite rather than inside it.
     let wide = wideSlot(l, i.op)
@@ -489,6 +505,12 @@ fun emitEntry(asm : Asm.Asm, main : String, b : String.Builder) -> Unit {
     line(b, "    movn x1, #0")
     instruction(b, A.Str(Physical(Gp, 1), Offset(A.x0, 32), A.W64))
 
+    -- The frame table, before anything allocates: the first collection may
+    -- happen inside the first `turkey_string_new` below, and a collection that
+    -- cannot read the table sees no frame's roots at all.
+    symbolInto(b, A.x0, Asm.frameTableSymbol)
+    call(b, "turkey_frame_table_register")
+
     -- Each literal's `TurkeyString`, built once and cached in its slot. This
     -- is what makes `ConstString` a load rather than an allocation, and what
     -- makes it not a safepoint.
@@ -560,4 +582,35 @@ fun byteLength(text : String) -> Int {
     var n = 0
     for _ in String.bytes(text) { n = n + 1 }
     n
+}
+
+-- -- the frame table ---------------------------------------------------------
+
+-- Every safepoint's live roots, keyed by return address
+-- (`NATIVE-BACKEND.md`, "The table's encoding, surveyed").
+--
+-- The emitter cannot sort this: the addresses do not exist until the linker
+-- has run, and all it can write is `.quad <label>` for the linker to
+-- relocate. So the runtime owns the lookup structure, which is OCaml's
+-- division and the one LLVM states outright -- the compiler's format is for
+-- getting the facts across, not for being queried.
+--
+-- The offsets are from `x29`, signed, and `Turkey.Frame.layout` has been
+-- computing them since phase 4.
+fun emitFrameTable(layouts : Array (Int, Frame.Layout),
+                   b : String.Builder) -> Unit {
+    line(b, "    .section __DATA,__const")
+    line(b, "    .p2align 3")
+    line(b, "    .globl " + Asm.frameTableSymbol)
+    line(b, Asm.frameTableSymbol + ":")
+    var n = 0
+    for (_, l) in layouts { n = n + len(l.maps) }
+    line(b, "    .quad " + Int.toString(n))
+    for (tag, l) in layouts {
+        for m in l.maps {
+            line(b, "    .quad " + safepointLabel(tag, m.block, m.index))
+            line(b, "    .quad " + Int.toString(len(m.offsets)))
+            for o in m.offsets { line(b, "    .quad " + Int.toString(o)) }
+        }
+    }
 }

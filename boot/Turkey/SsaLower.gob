@@ -1772,6 +1772,29 @@ fun primitive(l : Lower, e : Core, name : String, args : Array Value,
         return storageArray(l, L.emit(l.b, Call(Runtime("Prim.readFileStorage"),
                                                 args), Ssa.traced(Ptr)))
     }
+    if name == "Prim.castAs" && len(args) == 1 {
+        -- The conversion half of a checked cast. `Data.Error.cast` compared the
+        -- two type reps first, so equal reps mean equal types mean equal
+        -- layouts: a legitimate cast is the identity and never converts.
+        --
+        -- Deliberately not `coerce`. That one boxes a scalar into a pointer,
+        -- and this is the one place where doing so would *compile* the
+        -- combination the rep check exists to rule out. `turkey/backend_lower.py`
+        -- keeps to the same rule, so the two agree here rather than each
+        -- inheriting whatever its own `coerce` permits.
+        if Ssa.repOf(l.func, args[0]) == rep { return args[0] }
+        -- Dead, and provably so -- but contract 1 copies an opened arm per
+        -- packed layout, so this copy can be the one whose payload is an `i64`
+        -- while the result type is a pointer. Something must still be emitted.
+        -- A trap, not a zero: if the reasoning above is ever wrong, this says
+        -- so instead of reading a pointer out of an integer.
+        let message = L.emit(l.b, ConstString(
+            "a cast reached a conversion its type check had ruled out"),
+            Ssa.traced(Ptr))
+        L.terminate(l.b, Panic(message))
+        L.into(l.b, L.block(l.b))
+        return zero(l, rep)
+    }
     if name == "Prim.stringToBytes" && len(args) == 1 {
         -- The length is the *string's* byte length rather than the storage's
         -- element count. They agree here, and asking the string is what the

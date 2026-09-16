@@ -890,11 +890,18 @@ would reopen this is a FINDINGS entry where a type-indexed structure is wanted.
    `SomeError` can ask the payload what it is without ever having seen the
    type. That is `cast` minus the comparison, and it is pinned by a test.
 
-   What remains: `cast[Typed a](err : SomeError) -> Option a`, and the trusted
-   primitive it converts through. Nothing like that primitive exists yet, and
-   PRIMITIVES.md's rule is that each one is paid twice. Open, and answered "no"
-   for now: whether `cast` searches the cause chain as Go's `errors.As` does,
-   or only inspects the outermost payload.
+   *Done* (SPEC-DELTAS 70). `cast[Typed a](err : SomeError) -> Option a`
+   compares the reps in ordinary Turkey and converts through `Prim.castAs`
+   only when they agree -- the predicate-plus-total-primitive split of
+   PRIMITIVES.md 7.2. A legitimate cast is the identity, because equal reps
+   mean equal layouts, and both backends require that and trap otherwise.
+   `tests/programs/cast_payload.gob` and `tests/test_errors.py` cover it.
+
+   Two questions this answered. A signature's variables *do* scope into the
+   body, so `let want : Proxy a = Proxy` works and SPEC-DELTAS 13 was not an
+   obstacle. And `cast` inspects the outermost payload only; the cause chain
+   stays reachable through `causeOf`, so searching it as Go's `errors.As` does
+   remains additive.
 6. **Recoverable panics, deferred.** First specify a concrete boundary's state,
    cleanup, nesting, and fatal-failure contract. Then implement a rooted heap
    payload and recovery using the flag. Clearing the flag alone is not task

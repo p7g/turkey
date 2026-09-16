@@ -3251,3 +3251,56 @@ not where it was. Capture is separable and is not in this delta: the peers
 split the same way, Go shipping causes with no traces and Zig traces with no
 causes. ERRORS.md's survey has the reasons, the cost, and what the four
 backends would each have to agree on first.
+
+---
+
+### 70. Checked downcasting
+
+Delta 69 put every concrete error into one `SomeError`. This takes one back
+out, and the whole of what makes it sound is that the compiler, and only the
+compiler, says what a type is called.
+
+```
+class Typed a { fun typeRep(Proxy a) -> TypeRep }
+class Error e : Typed e { fun message(e) -> String }
+
+fun cast[Typed a](err : SomeError) -> Option a
+```
+
+**A type is a value.** `TypeRep` is the constructor's qualified name (delta 43)
+and the reps of its arguments, so two reps are equal exactly when the types
+are, and nothing new decides type identity. `Proxy` names a type without a
+value of one.
+
+**Instances are derived, and a program may not write one.** They are
+manufactured on demand, one per type constructor, through the path that already
+manufactures `%HasField` instances, and the dictionary is written in Core
+because `typeRep`'s answer is the qualified name -- something no Turkey
+expression can ask for. A derived head is general (`Box a`, not `Box Int`), so
+its context is `Typed` over each parameter and the dictionary is a function of
+its arguments' dictionaries. An `instance Typed ...` in a program is refused,
+as GHC has refused user `Typeable` since 7.10: the comparison of reps *is* the
+check, so forged evidence has nothing downstream to catch it.
+
+**`Typed` is a superclass of `Error`,** so the rep rides inside the dictionary
+an existential packs and an arm that opens a `SomeError` can ask the payload
+what it is without ever having seen the type.
+
+**The conversion is a predicate plus a total primitive,** the split
+PRIMITIVES.md 7.2 already uses for `floatParse` and `charFromInt`: `cast`
+compares the reps in ordinary Turkey and calls `Prim.castAs` only when they
+agree. That primitive is total and unchecked, and like every `Prim.` name it is
+spellable only from a library module, so no unchecked coercion reaches ordinary
+Turkey.
+
+**A legitimate cast is the identity.** Equal reps mean equal types mean equal
+layouts, so `Prim.castAs` converts nothing; both backends require exactly that
+and trap otherwise. The trap is reachable code that cannot run: contract 1
+copies an opened arm per *packed* layout, so one copy can have an `i64` payload
+and a pointer result type -- a pairing the rep check rules out at run time and
+the backend must still emit something for. It is a panic rather than a zero so
+that a wrong assumption says so.
+
+**`cast` inspects the outermost payload only.** Go's `errors.As` walks the
+cause chain; this does not. The chain stays reachable through `causeOf`, and
+searching it is an additive choice rather than one this forecloses.

@@ -2406,6 +2406,30 @@ reason with complete confidence. Both implementations now ask
 FINDINGS 53's again: a predicate that answers "no" for two different reasons
 will eventually be asked which one.
 
+### 90. A branch the type check rules out still has to be compiled
+
+**backend, fixed.** ERRORS.md step 5. `cast` compares two type reps and
+converts only when they are equal, so the conversion runs only on values whose
+type is the one asked for. The backend does not get to know that. Contract 1
+copies an opened arm per *packed* layout, so the copy where the payload is an
+`i64` is compiled with the result type the caller asked for -- and for
+`cast[ParseError]` that is a pointer. LLVM refused: "cannot convert i64 to
+ptr", on a branch that cannot run.
+
+Three answers were available and only one is honest. Emitting an undef would
+compile; it also hides the case where the reasoning is wrong. Widening
+`coerce` to box the scalar would compile *and* run, reading a pointer out of an
+integer if a rep ever compared equal when the types differed. What ships is a
+trap: the branch is emitted as a panic naming what happened, so the impossible
+case stays impossible and says so if it is not.
+
+The second half is that the two implementations disagreed about it silently.
+Python's `coerce` refuses `i64 -> ptr`; boot's *boxes*, which would have
+compiled the ruled-out combination on one side and trapped on the other, with
+no test to notice -- the differential stops at `opt`, and neither backend is
+under it (FINDINGS 43 again). Both now keep to one rule that needs no
+`coerce` at all: a legitimate cast is the identity, and anything else traps.
+
 ### 13. `Option.isSome` existed and was reimplemented anyway
 **library, discoverability.** M20. `Turkey.Parser` grew its own `isSome` because
 the Prelude's re-export of `module Option` was not where it was looked for. Now

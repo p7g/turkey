@@ -165,3 +165,81 @@ def test_the_channel_comes_from_the_prelude(capfd):
 fun main() { print(Error.describe(fail(IoError(3)))) }
 """
     assert outputs(source, capfd) == "io 3\n"
+
+
+CASTABLE = PAYLOADS + """
+type Code = Code(Int)
+instance Error Code { fun message(Code(n)) = "code " + Int.toString(n) }
+
+fun asParse(e : SomeError) -> Option ParseError = Error.cast(e)
+fun asIo(e : SomeError) -> Option IoError = Error.cast(e)
+fun asCode(e : SomeError) -> Option Code = Error.cast(e)
+"""
+
+
+def test_a_payload_comes_back_as_the_type_it_is(capfd):
+    source = CASTABLE + """
+fun main() {
+    match asParse(fail(ParseError("eof"))) {
+        Some(ParseError(s)) -> print("parse " + s)
+        None -> print("no")
+    }
+}
+"""
+    assert outputs(source, capfd) == "parse eof\n"
+
+
+def test_a_payload_does_not_come_back_as_another_type(capfd):
+    """The negative case is the one that matters: the packed rep and the
+    wanted rep disagree, so nothing is converted."""
+    source = CASTABLE + """
+fun main() {
+    match asIo(fail(ParseError("eof"))) {
+        Some(IoError(n)) -> print(n)
+        None -> print("not an io error")
+    }
+}
+"""
+    assert outputs(source, capfd) == "not an io error\n"
+
+
+def test_a_scalar_payload_casts(capfd):
+    """A single-field type is held as a scalar rather than a pointer, so this
+    is the case where the packed layout and a pointer-shaped result differ --
+    which is exactly the combination the rep check has to rule out."""
+    source = CASTABLE + """
+fun main() {
+    match asCode(fail(Code(42))) {
+        Some(Code(n)) -> print(n)
+        None -> print("not a code")
+    }
+    match asParse(fail(Code(42))) {
+        Some(ParseError(s)) -> print("wrong " + s)
+        None -> print("not a parse error")
+    }
+}
+"""
+    assert outputs(source, capfd) == "42\nnot a parse error\n"
+
+
+def test_cast_looks_at_the_outer_payload_only(capfd):
+    """Not a chain search. Go's `errors.As` walks the cause chain; this does
+    not, and the chain stays reachable through `causeOf` for a caller that
+    wants it."""
+    source = CASTABLE + """
+fun main() {
+    let wrapped = Error.context(fail(IoError(9)), Code(1))
+    match asIo(wrapped) {
+        Some(IoError(n)) -> print(n)
+        None -> print("outer is not an io error")
+    }
+    match Error.causeOf(wrapped) {
+        None -> print("no cause")
+        Some(inner) -> match asIo(inner) {
+            Some(IoError(n)) -> print(n)
+            None -> print("cause is not an io error")
+        }
+    }
+}
+"""
+    assert outputs(source, capfd) == "outer is not an io error\n9\n"

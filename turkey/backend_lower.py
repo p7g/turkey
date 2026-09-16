@@ -987,6 +987,40 @@ class _FunctionLowerer:
                         done(at, self.wrap_array(at, raw, length))
                     self.lower_values(expr.args, env, joins, block, from_storage)
                     return
+                if primitive == "Prim.castAs":
+                    # The conversion half of a checked cast. `Data.Error.cast`
+                    # has already compared the two type reps, so the value in
+                    # hand *is* of the result type; what can still differ is
+                    # how the two are held, which is exactly what `coerce`
+                    # settles -- a relabel between pointer layouts, or an
+                    # unbox into a scalar one. If the result's layout is not
+                    # known -- a `cast` past `MAX_SPECIALIZATIONS`, where the
+                    # type argument never became concrete -- `self.layout`
+                    # refuses rather than guessing, which is FINDINGS 53's rule.
+                    def cast_as(at: bir.Block, values: list[bir.Operand]) -> None:
+                        # Identity, or nothing. Equal reps mean equal types
+                        # mean equal layouts, so a legitimate cast never
+                        # converts -- and requiring that keeps the two
+                        # implementations to one rule rather than to whatever
+                        # each one's `coerce` happens to permit.
+                        if values[0].layout is self.layout(expr.ty):
+                            done(at, values[0])
+                        else:
+                            # Dead, and provably so: the reps were equal, so
+                            # the types were, so the layouts are. But contract 1
+                            # copies an opened arm per *packed* layout, so this
+                            # copy can be the one where the payload is an `i64`
+                            # and the result type a pointer -- a combination the
+                            # rep check rules out at run time and the backend
+                            # still has to emit something for. A trap, not an
+                            # undef: if the reasoning above is ever wrong, this
+                            # says so instead of reading a pointer out of an
+                            # integer.
+                            at.terminator = bir.Panic(
+                                "a cast reached a conversion its type check "
+                                "had ruled out", self.frame(expr.span))
+                    self.lower_values(expr.args, env, joins, block, cast_as)
+                    return
                 operation = "prim." + primitive.removeprefix("Prim.")
                 array_element_layout = None
                 if primitive in ("Prim.arrayNew", "Prim.arrayNewUninit"):

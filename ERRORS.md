@@ -574,11 +574,25 @@ would reopen this is a FINDINGS entry where a type-indexed structure is wanted.
    `CoreTc`, `Mono.gob`, `Layout.gob`, `SsaLower.gob`, the evaluator), and
    `opt`'s pack-then-match rule is required before any real program uses
    existentials, per finding 3.
-2. **Existential constructors.** A SPEC-DELTAS entry, then the implementation
-   list above on both sides, with goldens regenerated for `CAlt`'s evidence.
-   Tests: escape rejected (including through enclosing variables), `let` pattern
-   rejected, `~` rejected, independent openings remain distinct, pack-then-match
-   specializes, and the agreed nested-layout cases pass through generic code.
+2. **Existential constructors.** *Done*, in both implementations
+   (SPEC-DELTAS 68). Syntax, declarations, inference, elaboration and the
+   Core-down passes; positional and record forms; openings anywhere in a match
+   arm's or a parameter's pattern; the refusals for `let`, `var`, `for`,
+   alternatives, `~`, a hidden variable that is also a parameter, and a type
+   that escapes its arm. `tests/programs/existential_*.gob` and
+   `err_existential_*.gob` are the corpus half, so `test_programs`,
+   `test_llvmgen`, `test_pygen`, `test_native` (with GC stress) and `test_boot`
+   all cover them; `tests/test_existentials.py` is the language half and
+   `tests/test_existential_layout.py` the representation half.
+
+   One item moved. ERRORS.md's `opt` bullet wanted case-of-known-constructor to
+   substitute the packed type through an opened arm. What ships instead is the
+   same win where it was needed: `layout.share` narrows an arm whose scrutinee
+   is a packing written right there to that packing's one key. On a program
+   whose opener is inlined at three call sites that is 207 backend instructions
+   against 369, and the arms drop from 16 to 10. Substituting the type as well
+   would also devirtualize the carried dictionary; it is not done, and `opt`
+   still declines to select an opened arm.
 3. **`Error`, `SomeError`, and stack capture.** Add the standard packing function
    and independently owned traces. Use `Either SomeError a` for library paths
    combining heterogeneous failures; retain concrete sums where exhaustive

@@ -724,6 +724,37 @@ def _call(fn, name: str, args, pad: str, indent: int, names, alias) -> str:
     return "\n".join(out)
 
 
+def openings(pat) -> list:
+    """Every existential constructor pattern inside a pattern, outermost and
+    leftmost first -- the order an arm's copies are keyed in (SPEC-DELTAS 68).
+
+    Here rather than in `layout`, because `mono.check_layouts` asks the same
+    question to refuse what `layout.share` did not copy.
+    """
+    from . import ast
+    out: list = []
+
+    def walk(p) -> None:
+        if isinstance(p, ast.PAnnot):
+            walk(p.pat)
+        elif isinstance(p, ast.PTuple):
+            for elem in p.elems:
+                walk(elem)
+        elif isinstance(p, ast.PCon):
+            if p.skolems:
+                out.append(p)
+            for arg in p.args:
+                walk(arg)
+        elif isinstance(p, ast.PRecord):
+            if p.skolems:
+                out.append(p)
+            for _, sub in p.fields:
+                walk(sub)
+
+    walk(pat)
+    return out
+
+
 def _opening(pat, alias=None) -> str:
     """What opening an existential binds, as `[s@i64](%d1.Show)`: the rigid
     constants, the layouts this copy of the arm was made for, and the

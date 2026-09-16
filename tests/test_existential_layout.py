@@ -1,10 +1,10 @@
-"""PROTOTYPE: the layout contract for existential constructors (ERRORS.md,
-"Correctness milestone: nested layouts").
+"""The layout contract for existential constructors (ERRORS.md, "Correctness
+milestone: nested layouts"; SPEC-DELTAS 68).
 
-Existential constructors have no syntax and no inference yet; that is step 2,
-in both implementations. What is being decided here is the representation, and
-the representation lives from Core down, so each program is written the way
-the front end *would* elaborate it:
+Existential constructors have syntax now, and `tests/programs/existential_*.gob`
+is where an ordinary program exercises them. This file is the half a source
+program cannot reach: each case is assembled as *Core*, which is what lets it
+force the configurations the surface language never produces --
 
 * an ordinary source program supplies the helpers, instances and `print`s,
   and declares a placeholder `type Packed = Packed(Int, Int)`;
@@ -12,12 +12,13 @@ the front end *would* elaborate it:
 * the pack and open sites are hand-built Core, spliced in before `mono`,
   and the rest of the pipeline is `driver.check`'s from there down.
 
+-- so that a packing can be put inside a body the specialization cap leaves
+generic, and a mutant can break one rule at a time and be shown to fail.
+
 Every program runs on the native backend (the one with layouts), the Python
 backend and the evaluator, and all three must agree with the expected output.
 The native run is repeated under `TURKEY_GC_STRESS` and with the
-specialization cap at zero. Nothing here is in `tests/programs`, which
-`tests/test_boot.py` diffs against `boot/`: the prototype is one-sided on
-purpose, and FINDINGS says so.
+specialization cap at zero.
 """
 
 from __future__ import annotations

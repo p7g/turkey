@@ -72,7 +72,7 @@ def layout_of(ty: Type, abstracted: dict[int, str] | None = None,
     ty = prune(ty)
     if abstracted and isinstance(ty, TVar) and ty.id in abstracted:
         return bir.Layout(abstracted[ty.id])
-    # PROTOTYPE: a skolem an existential arm opened, in the copy of that arm
+    # A skolem an existential arm opened (SPEC-DELTAS 68), in the copy of that arm
     # `layout.share` made for one layout. Keyed by `-uid` so it cannot collide
     # with a variable id.
     # A skolem with no layout is *unknown*, not a heap object: answering `ptr`
@@ -643,7 +643,7 @@ class _FunctionLowerer:
                     if (hint := _free_variable_type(alt.body, name)) is not None
                 }
                 # An existential arm's copy is lowered under the layouts its
-                # pattern names for the skolems it opens (PROTOTYPE).
+                # pattern names for the skolems it opens (SPEC-DELTAS 68).
                 outer = self.abstracted
                 self.abstracted = _opened_layouts(alt.pat, outer)
                 try:
@@ -1139,7 +1139,7 @@ class _FunctionLowerer:
                         return con.field_names.index(name)
         raise Unsupported(f"LLVM backend has no layout for field '{name}'")
 
-    # -- existential constructors (PROTOTYPE, ERRORS.md) ---------------------
+    # -- existential constructors (SPEC-DELTAS 68) ---------------------------
     #
     # A packed object is laid out as one `i64` layout code per hidden
     # variable, then the carried dictionaries, then the declared fields. The
@@ -1507,13 +1507,13 @@ LAYOUT_CODES = {
 
 def _opened_layouts(pat, outer: dict[int, str]) -> dict[int, str]:
     """`outer`, plus the layouts an existential arm's copy names for the
-    skolems its pattern opens (PROTOTYPE; see `layout.open_arms`)."""
-    from .layout import _openings
-    openings = [p for p in _openings(pat) if p.layouts is not None]
-    if not openings:
+    skolems its pattern opens (SPEC-DELTAS 68; see `layout.open_arms`)."""
+    from .core import openings
+    opened_here = [p for p in openings(pat) if p.layouts is not None]
+    if not opened_here:
         return outer
     inner = dict(outer)
-    for opened in openings:
+    for opened in opened_here:
         inner.update({-skolem.uid: layout
                       for skolem, layout in zip(opened.skolems, opened.layouts)})
     return inner

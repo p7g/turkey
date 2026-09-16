@@ -93,7 +93,7 @@ class PCon(Pattern):
 
     name: str
     args: list[Pattern] = field(default_factory=list)
-    # PROTOTYPE (ERRORS.md, existential layouts). Opening an existential
+    # Opening an existential
     # constructor binds more than its sub-patterns say: the dictionaries it
     # carries, under `evidence`, and one rigid constant per hidden variable,
     # under `skolems`. `layouts` is `layout.share`'s: the layout each skolem

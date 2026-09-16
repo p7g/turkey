@@ -3183,5 +3183,12 @@ then walked it back with `any P` (SE-0335), because their costs did not show.
 Scala 3 dropped `forSome`. Rust's `dyn Trait` is the dictionary-only form, where
 the hidden type is reachable only through methods.
 
-**What it cost.** To be recorded when the implementation lands in both
-compilers.
+**What it cost.** Nothing in the corpus: no existing program changed, and no
+golden moved. The feature is about 900 lines across the two compilers, in the
+proportion the design predicted -- the front end is a bracket in each parser,
+one pass over each declaration table, an opening in each `matchPattern` and the
+`CAssume`/`CLet` that scopes it, while the Core-down half is the representation
+work step 1 had already settled. The one surprise was the printer: a pattern
+prints the dictionaries it binds, and those names are renumbered per binding
+for stable goldens, so the pattern had to be told about the renumbering that
+every other binder already went through.

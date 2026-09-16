@@ -176,8 +176,8 @@ def _ground(t: Type) -> bool:
     """No unbound variable anywhere in it, so it names one type and not a
     family of them. The test a specialization request has to pass.
 
-    A skolem an existential pattern opened is not ground either (PROTOTYPE,
-    ERRORS.md): it stands for whichever type was packed, and a copy at it would
+    A skolem an existential pattern opened is not ground either
+    (SPEC-DELTAS 68): it stands for whichever type was packed, and a copy at it would
     be one body for every one of them -- at whatever layout the copy guessed.
     Left generic, the call is keyed by `layout.share` inside each copy of the
     arm, where the skolem's layout is known."""
@@ -1140,7 +1140,7 @@ def reduce_types(program: CProgram, classes: ClassTable) -> CProgram:
 def _unshared_openings(program: CProgram) -> set[str]:
     """The bindings holding an existential arm `layout.share` did not copy.
 
-    PROTOTYPE. The arm's field layouts depend on what was packed, so an arm
+    The arm's field layouts depend on what was packed, so an arm
     with no `layouts` is one the backend would read at a guess -- the same
     refusal `transparent_parameters` makes for a generic parameter, for the
     binder it cannot see: a pattern's.
@@ -1152,8 +1152,8 @@ def _unshared_openings(program: CProgram) -> set[str]:
 
     def walk(node, owner: str) -> None:
         if isinstance(node, CAlt):
-            from .layout import _openings
-            if any(p.layouts is None for p in _openings(node.pat)):
+            from .core import openings
+            if any(p.layouts is None for p in openings(node.pat)):
                 found.add(owner)
         if isinstance(node, (CExpr, CAlt)):
             for f in dataclass_fields(node):

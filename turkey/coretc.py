@@ -879,7 +879,7 @@ def _member_surface(name: str) -> str:
 def _refuse_escape(pat, got: Type, span: Span | None) -> None:
     """An arm's type may not mention a constant its own pattern opened.
 
-    PROTOTYPE, and the Core half of the check ERRORS.md gives inference: the
+    The Core half of the check inference makes (SPEC-DELTAS 68): the
     constant stands for a type chosen at each packing, so a value of it leaving
     the arm is a value of no type the context can name.
     """

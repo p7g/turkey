@@ -2366,6 +2366,14 @@ wrong layout read a wrong *number* of bytes. The lesson is FINDINGS 53's again
 from the other side: "I do not know" has to be its own answer. Here the
 fallback was not `BOXED` but `ptr`, and it hid more.
 
+**Closed.** Step 2 ported every part of it to `boot` and moved the programs into
+`tests/programs`, so the differential covers existentials at every stage:
+tokens, ast, desugar, decls, classes, types, core, mono and opt are
+byte-identical on them, and `test_native` runs them compiled by `boot`. The
+`PROTOTYPE` markers are gone. What the port did *not* inherit is the Core-level
+harness's reach: `tests/test_existential_layout.py` still builds Core by hand to
+reach the capped and mutant cases no source program produces.
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

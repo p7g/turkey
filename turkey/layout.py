@@ -66,12 +66,12 @@ from . import ast
 from . import backend_ir as bir
 from .backend_lower import layout_of
 from .core import (CAlt, CApp, CBind, CCon, CExpr, CMatch, CProgram, CRecord,
-                   CTyApp, CVar, abstraction_binders, names_of,
+                   CTyApp, CVar, abstraction_binders, names_of, openings,
                    transparent_parameters as core_transparent)
 from .types import Type, TVar, prune, vars_of
 
-#: PROTOTYPE (ERRORS.md, existential layouts): every layout a packed variable
-#: can have been stored at, in the order an opened arm is copied for them.
+#: Every layout a packed variable can have been stored at, in the order an
+#: opened arm is copied for them (SPEC-DELTAS 68).
 OPENED_LAYOUTS = tuple(layout.value for layout in bir.Layout)
 
 _FIELDS: dict[type, tuple] = {}
@@ -111,32 +111,6 @@ def _applications(node, out: list[CTyApp]) -> None:
             _applications(item, out)
 
 
-def _openings(pat) -> list:
-    """Every existential constructor pattern inside a pattern, outermost and
-    leftmost first -- the order an arm's copies are keyed in (SPEC-DELTAS 68)."""
-    out: list = []
-
-    def walk(p) -> None:
-        if isinstance(p, ast.PAnnot):
-            walk(p.pat)
-        elif isinstance(p, ast.PTuple):
-            for elem in p.elems:
-                walk(elem)
-        elif isinstance(p, ast.PCon):
-            if p.skolems:
-                out.append(p)
-            for arg in p.args:
-                walk(arg)
-        elif isinstance(p, ast.PRecord):
-            if p.skolems:
-                out.append(p)
-            for _, sub in p.fields:
-                walk(sub)
-
-    walk(pat)
-    return out
-
-
 def _with_layouts(pat, keys: dict[int, tuple[str, ...]]):
     """A copy of `pat` whose openings record the layouts `keys` gives them,
     by the identity of the opening in the original."""
@@ -156,7 +130,7 @@ def _with_layouts(pat, keys: dict[int, tuple[str, ...]]):
 
 def _opens(node) -> bool:
     """Whether an existential arm appears anywhere inside a term."""
-    if isinstance(node, CAlt) and _openings(node.pat):
+    if isinstance(node, CAlt) and openings(node.pat):
         return True
     if isinstance(node, (CExpr, CAlt, CBind)):
         return any(_opens(getattr(node, f.name)) for f in _fields(node))
@@ -181,7 +155,7 @@ def _constructs(node, abstracted: set[int], decls) -> bool:
     field declared `Prim.Array a` is a pointer whatever `a` is, and a newtype
     is never built at all.
 
-    Packing an existential is stricter (PROTOTYPE, ERRORS.md): the value
+    Packing an existential is stricter (SPEC-DELTAS 68): the value
     records its hidden variables' layouts, so *any* argument mentioning this
     body's variables -- an `Array a` included -- makes the stored code a guess.
     """
@@ -310,7 +284,7 @@ def _packed_layouts(program: CProgram, decls) -> dict[str, set[tuple[str, ...]]]
     """For each existential constructor, the layout keys some reachable
     packing stores.
 
-    PROTOTYPE. A packing inside a copy of an opened arm happens only if that
+    A packing inside a copy of an opened arm happens only if that
     copy is ever taken, so it counts only once the key its arm was copied for
     is itself packed somewhere. Counting it unconditionally would let a repack
     at the skolem in the `unit` copy of an arm justify keeping the `unit` copy.
@@ -323,7 +297,7 @@ def _packed_layouts(program: CProgram, decls) -> dict[str, set[tuple[str, ...]]]
             for alt in node.alts:
                 inner = dict(abstracted)
                 held = set(conditions)
-                for pat in _openings(alt.pat):
+                for pat in openings(alt.pat):
                     if pat.layouts is None:
                         continue
                     inner.update({-s.uid: layout
@@ -484,10 +458,32 @@ class _Sharer:
         return node
 
 
+    def _known_key(self, scrutinee, whole, pat,
+                   abstracted: dict[int, str]) -> tuple[str, ...] | None:
+        """The layouts an opening must be for, when what it opens is a packing
+        written right here -- `match C(d, xs) { C(ys) -> ... }`, which is what
+        an inlined opener leaves behind. None when the value comes from
+        anywhere else, or when the opening is nested inside a larger pattern,
+        where nothing lines the two up.
+        """
+        top = whole
+        while isinstance(top, ast.PAnnot):
+            top = top.pat
+        if top is not pat:
+            return None
+        if not (isinstance(scrutinee, CApp) and isinstance(scrutinee.fn, CCon)):
+            return None
+        if scrutinee.fn.name != pat.name:
+            return None
+        info = self.decls.constructors.get(pat.name)
+        if info is None or not info.is_existential:
+            return None
+        return _packed_key(info, scrutinee, abstracted, self.decls)
+
     def open_arms(self, node: CMatch, abstracted: dict[int, str]) -> CMatch:
         """One copy of each existential arm per layout it may have been packed at.
 
-        PROTOTYPE of contract 1 in ERRORS.md, "Contracts considered". Inside a
+        Contract 1 of ERRORS.md, "Contracts considered". Inside a
         copy the opened skolems have a layout -- keyed by `-uid`, so that
         `layout_of` can tell them from the binding's own variables -- and the
         body is rewritten under it like any layout-keyed copy: a call at the
@@ -498,13 +494,22 @@ class _Sharer:
         """
         alts: list[CAlt] = []
         for alt in node.alts:
-            openings = [p for p in _openings(alt.pat) if p.layouts is None]
-            if not openings:
+            opened = [p for p in openings(alt.pat) if p.layouts is None]
+            if not opened:
                 alts.append(self.rewrite(alt, abstracted))
                 continue
-            # One key per opening, and one copy per combination of them.
+            # One key per opening, and one copy per combination of them --
+            # unless the value being opened is a packing right here, in which
+            # case it is the one key that packing stores. That is the
+            # pack-then-match case, and it is what keeps an opener inlined at
+            # several call sites from carrying every layout at each of them
+            # (ERRORS.md, finding 3).
             choices = []
-            for pat in openings:
+            for pat in opened:
+                known = self._known_key(node.scrutinee, alt.pat, pat, abstracted)
+                if known is not None:
+                    choices.append([known])
+                    continue
                 allowed = (None if self.packed is None
                            else self.packed.get(pat.name, set()))
                 choices.append([key for key in itertools.product(
@@ -512,10 +517,10 @@ class _Sharer:
                                 if allowed is None or key in allowed])
             for combination in itertools.product(*choices):
                 inner = dict(abstracted)
-                for pat, key in zip(openings, combination):
+                for pat, key in zip(opened, combination):
                     inner.update({-skolem.uid: layout
                                   for skolem, layout in zip(pat.skolems, key)})
-                keys = {id(pat): key for pat, key in zip(openings, combination)}
+                keys = {id(pat): key for pat, key in zip(opened, combination)}
                 alts.append(CAlt(_with_layouts(alt.pat, keys),
                                  self.rewrite(alt.body, inner)))
         return replace(node, scrutinee=self.rewrite(node.scrutinee, abstracted),
@@ -525,7 +530,7 @@ class _Sharer:
 def share(program: CProgram, decls) -> CProgram:
     """The program with one body per layout of every binding that needs one.
 
-    Twice when the program opens an existential (PROTOTYPE): once copying every
+    Twice when the program opens an existential (SPEC-DELTAS 68): once copying every
     opened arm for every layout, which is what makes every packing's layouts
     knowable, and again copying each arm only for the keys some reachable
     packing stores. The second run can only drop copies, so the keys the

@@ -73,7 +73,12 @@ let dictPrefix = "%Dict."
 
 -- No unbound variable anywhere in it, so it names one type and not a family of
 -- them. The test a specialization request has to pass.
-fun ground(t : Ty.Type) -> Bool = len(Ty.varsOf([t])) == 0
+-- A skolem an existential pattern opened is not ground either (SPEC-DELTAS 68):
+-- it stands for whichever type was packed, and a copy at it would be one body
+-- for every one of them. Left generic, the call is keyed by `Turkey.Layout`
+-- inside each copy of the arm, where the skolem's layout is known.
+fun ground(t : Ty.Type) -> Bool =
+    len(Ty.varsOf([t])) == 0 && len(Ty.skolemsOf([t])) == 0
 
 fun typeSize(t : Ty.Type) -> Int = match Ty.prune(t) {
     TApp(fn, arg, _) -> 1 + typeSize(fn) + typeSize(arg)
@@ -920,12 +925,62 @@ fun leakedParameters(program : CProgram) -> Array (String, String, Ty.Type) {
     found
 }
 
+-- The bindings holding an existential arm `Turkey.Layout` did not copy.
+--
+-- The arm's field layouts depend on what was packed, so an arm with no layouts
+-- is one the backend would read at a guess -- the same refusal
+-- `leakedParameters` makes for a generic parameter, for the binder it cannot
+-- see: a pattern's (SPEC-DELTAS 68).
+fun unsharedOpenings(program : CProgram) -> Array String {
+    let found = Array.new(2)
+    for b in Array.append(program.dicts, program.binds) {
+        let hits = Array.new(1)
+        unsharedInto(b.value, hits)
+        if len(hits) > 0 { Array.push(found, b.name) }
+    }
+    found
+}
+
+fun unsharedInto(e : Core, found : Array Bool) -> Unit {
+    if len(found) > 0 { return {} }
+    match e.kind {
+        CMatch(_, alts) -> for alt in alts {
+            for p in openings(alt.pat) {
+                match p.opening {
+                    Some(o) -> match o.layouts {
+                        None -> Array.push(found, True)
+                        Some(_) -> {}
+                    }
+                    None -> {}
+                }
+            }
+        }
+        _ -> {}
+    }
+    discard(mapKind(e.kind, Mapper {
+        expr = fun(x) = {
+            unsharedInto(x, found)
+            x
+        },
+        type_ = fun(t) = t,
+        bind = fun(b) = {
+            unsharedInto(b.value, found)
+            b
+        },
+    }))
+}
+
 -- Refuse to compile a program whose layouts cannot all be known.
 --
 -- Refusing rather than warning because the alternative is silence: the backend
 -- reads a field at the layout it computes, and if a generic body disagreed the
 -- result would be a wrong value rather than an error.
 fun checkLayouts(program : CProgram) -> Unit {
+    let unopened = unsharedOpenings(program)
+    if len(unopened) > 0 {
+        oops("an existential pattern reached the backend with no layout for "
+             + "what it opens: " + String.join(Array.sort(unopened), ", "), None)
+    }
     let leaks = leakedParameters(program)
     if len(leaks) == 0 { return {} }
     let parts = Array.new(len(leaks))

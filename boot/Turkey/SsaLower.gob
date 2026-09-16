@@ -33,7 +33,7 @@ import Turkey.Core as Core
 import Turkey.Core (Core(..), CoreKind(..), CParam(..), CBind(..), CProgram(..),
                     Mapper(..))
 import Turkey.Decls as Decls
-import Turkey.Decls (DeclTable(..))
+import Turkey.Decls (DeclTable(..), ConInfo(..))
 import Turkey.Diag as Diag
 import Turkey.Layout as Layout
 import Turkey.LowIr as L
@@ -49,7 +49,7 @@ import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..), Term(..),
 import Turkey.Types as Ty
 import Turkey.Types (TCon, TTuple, TFun, TBottom)
 import Turkey.Ast as Ast
-import Turkey.Ast (Lit(..), Pat(..), PatKind(..), patternVars)
+import Turkey.Ast (Lit(..), Pat(..), PatKind(..), Opening(..), patternVars)
 
 -- What is not lowered yet: the binding, and the form that stopped it.
 -- Carried rather than thrown so a driver can report coverage over a corpus --
@@ -702,9 +702,14 @@ fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
                 let failure = if i + 1 == len(alts) { failed } else { L.block(l.b) }
                 L.into(l.b, test)
                 let was = saving(l, patternVars(alts[i].pat))
+                -- An existential arm's copy is lowered under the layouts its
+                -- pattern names for the constants it opens (SPEC-DELTAS 68).
+                let outer = l.layouts
+                l.layouts = openedLayoutsFor(alts[i].pat, outer)
                 pattern(l, alts[i].pat, v, scrutinee.ty, success, failure)
                 L.into(l.b, success)
                 lower(l, alts[i].body, dest)
+                l.layouts = outer
                 restore(l, was)
                 test = failure
             }
@@ -735,6 +740,13 @@ fun pattern(l : Lower, p : Pat, v : Value, ty : Ty.Type,
             success : BlockId, failure : BlockId) -> Unit {
     match l.stopped {
         Some(_) -> return
+        None -> {}
+    }
+    match p.opening {
+        Some(o) -> {
+            opened(l, p, o, v, ty, success, failure)
+            return
+        }
         None -> {}
     }
     match p.kind {
@@ -811,6 +823,105 @@ fun pattern(l : Lower, p : Pat, v : Value, ty : Ty.Type,
             tested(l, v, name, ty, pieces, success, failure)
         }
     }
+}
+
+-- Opening a packed existential: the tag, then the stored layout codes against
+-- the ones this copy of the arm was lowered for, then the carried dictionaries,
+-- then the fields (SPEC-DELTAS 68).
+fun opened(l : Lower, p : Pat, o : Opening, v : Value, ty : Ty.Type,
+           success : BlockId, failure : BlockId) -> Unit {
+    let name = match p.kind {
+        PCon(n, _) -> n
+        PRecord(n, _, _) -> n
+        _ -> return stop1(l, "an opening that is not a constructor pattern")
+    }
+    let layouts = match o.layouts {
+        Some(ls) -> ls
+        None -> return stop1(l, "an arm opening '" + name
+                             + "' reached the backend without its layouts")
+    }
+    let info = match Decls.con(l.decls, name) {
+        Some(i) -> i
+        None -> return stop1(l, "unknown constructor '" + name + "'")
+    }
+    if Decls.variantCount(l.decls, name) > 1 {
+        match Map.get(l.tags, name) {
+            Some(tag) -> {
+                let seen = L.emit(l.b, ObjectTag(v), Ssa.untraced(I32))
+                let want = L.emit(l.b, ConstInt(tag), Ssa.untraced(I32))
+                let test = L.emit(l.b, Cmp(Eq, seen, want), Ssa.untraced(I1))
+                let next = L.block(l.b)
+                L.terminate(l.b, Branch(test, next, failure))
+                L.into(l.b, next)
+            }
+            None -> return stop1(l, "the constructor '" + name + "' has no tag")
+        }
+    }
+    for var i = 0; i < len(layouts); i = i + 1 {
+        let code = L.emit(l.b, ObjectGet(v, i), Ssa.untraced(I64))
+        let want = L.emit(l.b, ConstInt(keyCode(layouts[i])), Ssa.untraced(I64))
+        let test = L.emit(l.b, Cmp(Eq, code, want), Ssa.untraced(I1))
+        let next = L.block(l.b)
+        L.terminate(l.b, Branch(test, next, failure))
+        L.into(l.b, next)
+    }
+    let exists = len(info.exists)
+    for var i = 0; i < len(o.evidence); i = i + 1 {
+        Map.put(l.env, o.evidence[i],
+                L.emit(l.b, ObjectGet(v, exists + i), Ssa.traced(Ptr)))
+    }
+    let carried = len(o.evidence)
+    let skolemTypes = Array.map(o.skolems, fun(c) = TCon(c))
+    let types = match Decls.conFieldTypesOpened(l.decls, ty, name, skolemTypes) {
+        Some(ts) -> ts
+        None -> []
+    }
+    let pieces = []
+    match p.kind {
+        PCon(_, args) -> for var i = 0; i < len(args) && i < len(types); i = i + 1 {
+            Array.push(pieces, (exists + carried + i, args[i], types[i]))
+        }
+        PRecord(_, fields, _) -> {
+            let order = match info.fields {
+                Some(names) -> names
+                None -> []
+            }
+            for (label, sub) in fields {
+                match Array.indexOf(order, label) {
+                    Some(i) -> if i < len(types) {
+                        Array.push(pieces, (exists + carried + i, sub, types[i]))
+                    }
+                    None -> {}
+                }
+            }
+        }
+        _ -> {}
+    }
+    destructure(l, v, pieces, success, failure)
+}
+
+fun stop1(l : Lower, message : String) -> Unit {
+    let _ = stop(l, message)
+    {}
+}
+
+-- The layouts an arm's openings name, over the ones already in force.
+fun openedLayoutsFor(p : Pat, outer : Map Int String) -> Map Int String {
+    let inner = Map.new()
+    for (id_, layout) in Map.entries(outer) { Map.put(inner, id_, layout) }
+    for opening in Core.openings(p) {
+        match opening.opening {
+            Some(o) -> match o.layouts {
+                Some(ls) -> for var i = 0; i < len(o.skolems) && i < len(ls);
+                                i = i + 1 {
+                    Map.put(inner, 0 - o.skolems[i].uid, ls[i])
+                }
+                None -> {}
+            }
+            None -> {}
+        }
+    }
+    inner
 }
 
 -- The tag test a constructor pattern needs, and then its contents.
@@ -1419,9 +1530,51 @@ fun constructor(l : Lower, e : Core, name : String, args : Array Core,
         None -> {}
     }
     match Map.get(l.tags, name) {
-        Some(tag) -> aggregate(l, args, 1, tag)
+        Some(tag) -> match Decls.con(l.decls, name) {
+            Some(info) -> if len(info.exists) > 0 {
+                packed(l, info, name, args, tag)
+            } else {
+                aggregate(l, args, 1, tag)
+            }
+            None -> aggregate(l, args, 1, tag)
+        }
         None -> stop(l, "the constructor '" + name + "' has no tag")
     }
+}
+
+-- A packed existential: one layout code per hidden variable, then the carried
+-- dictionaries, then the fields (SPEC-DELTAS 68). The codes are what an opening
+-- compares against the layouts its arm's copy was lowered for.
+fun packed(l : Lower, info : ConInfo, name : String, args : Array Core,
+           tag : Int) -> Value {
+    let parts = match Layout.packedKeyParts(l.decls, info, args, l.layouts) {
+        Some(ps) -> ps
+        None -> return stop(l, "packing '" + name
+                            + "' at a layout that is not knowable here")
+    }
+    let values = []
+    for p in parts {
+        Array.push(values, L.emit(l.b, ConstInt(keyCode(p)), Ssa.untraced(I64)))
+    }
+    for x in args { Array.push(values, value(l, x)) }
+    let reps = Array.map(values, fun(x) = Ssa.repOf(l.func, x))
+    let made = L.emit(l.b, ObjectNew(1, tag, len(values), metadata(reps)),
+                      Ssa.traced(Ptr))
+    for var i = 0; i < len(values); i = i + 1 {
+        L.effect(l.b, ObjectSet(made, i, values[i]))
+    }
+    made
+}
+
+-- A layout's code as a packed value stores it: its position in the fixed list
+-- the arms are copied for, so a code names one layout and nothing else.
+fun keyCode(name : String) -> Int {
+    var i = 0
+    for layout in Layout.openedLayouts {
+        if layout == name { return i }
+        i = i + 1
+    }
+    0
 }
 
 fun literal(l : Lower, lit : Lit, rep : Rep) -> Value = match lit {

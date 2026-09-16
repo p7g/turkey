@@ -922,7 +922,7 @@ class _Reducer:
                 if pat.name != con:
                     continue  # a different constructor: cannot match
                 if pat.skolems:
-                    # PROTOTYPE: selecting the arm would have to substitute
+                    # Selecting the arm would have to substitute
                     # the packed type for the skolems throughout its body,
                     # which ERRORS.md lists as `opt`'s part of step 2.
                     return None

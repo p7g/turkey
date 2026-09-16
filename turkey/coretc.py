@@ -876,6 +876,30 @@ def _member_surface(name: str) -> str:
     return name.rpartition(".")[2].rpartition("#")[2] or name
 
 
+def _openings_in(pat) -> list[tuple[str, list]]:
+    """Every opening in a pattern, however deep, as `(constructor, skolems)`.
+
+    A whole tree rather than the top node: an existential is opened just as
+    readily by a record pattern or from inside a tuple, and those forms have to
+    reach the escape check too -- `lib/Data/Error.gob` opens only records.
+    """
+    t = type(pat)
+    if t is ast.PAnnot:
+        return _openings_in(pat.pat)
+    if t is ast.PTuple:
+        return [o for elem in pat.elems for o in _openings_in(elem)]
+    if t is ast.PCon:
+        out = [(pat.name, pat.skolems)] if pat.skolems else []
+        return out + [o for arg in pat.args for o in _openings_in(arg)]
+    if t is ast.PRecord:
+        out = [(pat.name, pat.skolems)] if pat.skolems else []
+        return out + [o for _label, sub in pat.fields for o in _openings_in(sub)]
+    if t is ast.PVar or t is ast.PWild or t is ast.PLit:
+        return []
+    raise AssertionError(
+        f"_openings_in: unrecognized pattern node {t.__name__}")
+
+
 def _refuse_escape(pat, got: Type, span: Span | None) -> None:
     """An arm's type may not mention a constant its own pattern opened.
 
@@ -884,16 +908,16 @@ def _refuse_escape(pat, got: Type, span: Span | None) -> None:
     the arm is a value of no type the context can name.
     """
     from .types import skolems_of
-    while isinstance(pat, ast.PAnnot):
-        pat = pat.pat
-    if not isinstance(pat, ast.PCon) or not pat.skolems:
+    openings = _openings_in(pat)
+    if not openings:
         return
-    opened = {s.uid for s in pat.skolems}
+    opened = {s.uid: name for name, made in openings for s in made}
     escaped = [s for s in skolems_of(got) if s.uid in opened]
     if escaped:
         raise CoreError(
             f"the type of this arm, {show(got)}, mentions '{escaped[0].name}', "
-            f"which only exists inside the pattern '{pat.name}' that opened it",
+            f"which only exists inside the pattern "
+            f"'{opened[escaped[0].uid]}' that opened it",
             span)
 
 

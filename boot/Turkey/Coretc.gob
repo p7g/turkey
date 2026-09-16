@@ -64,7 +64,7 @@ import Turkey.Diag as Diag
 import Turkey.Source (Span)
 import Turkey.Typed as Typed
 import Turkey.Types as Ty
-import Turkey.Types (Kind(..), VarCell(..), Scheme(..), Pred(..),
+import Turkey.Types (Kind(..), VarCell(..), ConCell(..), Scheme(..), Pred(..),
                      TVar, TCon, TApp, TFam, TFun, TTuple, TBottom)
 
 let dictPrefix = "%Dict."
@@ -334,26 +334,52 @@ fun constructorScheme(ck : Checker, info : ConInfo) -> Scheme {
     }
 }
 
+-- Every opening in a pattern, however deep, collected as `(constructor, skolems)`.
+--
+-- A whole tree rather than the top node: an existential is opened just as
+-- readily by a record pattern or from inside a tuple, and those forms have to
+-- reach the escape check too -- `lib/Data/Error.gob` opens only records.
+fun collectOpenings(p : Pat, out : Array (String, Array ConCell)) -> Unit {
+    match p.kind {
+        PVar(_) -> {}
+        PWild -> {}
+        PLit(_) -> {}
+        PAnnot(inner, _) -> collectOpenings(inner, out)
+        PTuple(elems) -> for e in elems { collectOpenings(e, out) }
+        PCon(n, args) -> {
+            match p.opening {
+                None -> {}
+                Some(o) -> Array.push(out, (n, o.skolems))
+            }
+            for a in args { collectOpenings(a, out) }
+        }
+        PRecord(n, fields, _) -> {
+            match p.opening {
+                None -> {}
+                Some(o) -> Array.push(out, (n, o.skolems))
+            }
+            for (_, sub) in fields { collectOpenings(sub, out) }
+        }
+    }
+}
+
 -- An arm's type may not mention a constant its own pattern opened: the constant
 -- stands for a type chosen at each packing (SPEC-DELTAS 68).
 fun refuseEscape(p : Pat, got : Ty.Type, where : Option Span) -> Unit {
-    let bare = unannot(p)
-    let name = match bare.kind {
-        PCon(n, _) -> n
-        _ -> return {}
+    let openings = Array.new(2)
+    collectOpenings(p, openings)
+    if len(openings) == 0 { return {} }
+    let opened = Map.new()
+    for (name, made) in openings {
+        for s in made { Map.put(opened, s.uid, name) }
     }
-    match bare.opening {
-        None -> {}
-        Some(o) -> {
-            let opened = Set.new()
-            for s in o.skolems { Set.add(opened, s.uid) }
-            for s in Ty.skolemsOf([got]) {
-                if Set.contains(opened, s.uid) {
-                    fail("the type of this arm, " + Ty.show(got) + ", mentions '"
-                         + s.name + "', which only exists inside the pattern '"
-                         + name + "' that opened it", where)
-                }
-            }
+    for s in Ty.skolemsOf([got]) {
+        match Map.get(opened, s.uid) {
+            None -> {}
+            Some(name) ->
+                fail("the type of this arm, " + Ty.show(got) + ", mentions '"
+                     + s.name + "', which only exists inside the pattern '"
+                     + name + "' that opened it", where)
         }
     }
 }

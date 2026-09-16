@@ -885,6 +885,11 @@ would reopen this is a FINDINGS entry where a type-indexed structure is wanted.
    performs and forged evidence has nothing downstream to catch it.
    `tests/programs/typed_reps.gob` and `tests/test_typed.py` cover it.
 
+   `class Error e : Typed e` is in, so the dictionary an existential packs
+   carries the rep inside it as a superclass field, and an arm that opens a
+   `SomeError` can ask the payload what it is without ever having seen the
+   type. That is `cast` minus the comparison, and it is pinned by a test.
+
    What remains: `cast[Typed a](err : SomeError) -> Option a`, and the trusted
    primitive it converts through. Nothing like that primitive exists yet, and
    PRIMITIVES.md's rule is that each one is paid twice. Open, and answered "no"

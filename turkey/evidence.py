@@ -247,7 +247,13 @@ class Elaborator:
         rebound per instance when the dictionary is built, which is the whole of
         what makes one body serve them all.
         """
-        for insts in self.classes.instances.values():
+        # Materialized, because completing an instance can *add* one: a
+        # superclass of `Error` is `Typed`, and resolving it derives the
+        # `Typed` instance for that head if solving never demanded one. That
+        # appends to the table being walked, and when the class has no entry
+        # yet it adds a key -- which is a mutation during iteration, not a
+        # tolerable one. Any instance added here needs no completing itself.
+        for insts in list(self.classes.instances.values()):
             for inst in insts:
                 info = self.classes.classes[inst.cls]
                 if is_generated(inst.cls):

@@ -128,3 +128,34 @@ fun fnP() -> Proxy (fun(Int) -> Int) = Proxy
 fun main() { print(shown(fnP())) }
 """
     assert "no instance for" in fails(source)
+
+
+def test_a_packed_payload_can_be_asked_what_it_is(capfd):
+    """Why `Typed` is a superclass of `Error`.
+
+    The dictionary an existential packs is the `Error` one, and `Typed` rides
+    inside it as a superclass field. So an arm that opens a `SomeError` can ask
+    the payload for its rep without ever having seen the type -- which is the
+    whole of what `cast` will do, minus the comparison.
+    """
+    source = """
+import Data.Typed (Proxy(..), describe)
+
+type ParseError = ParseError(String)
+type IoError = IoError(Int)
+
+instance Error ParseError { fun message(ParseError(s)) = "parse " + s }
+instance Error IoError { fun message(IoError(n)) = "io " + Int.toString(n) }
+
+fun proxyOf[Typed a](x : a) -> Proxy a = Proxy
+
+fun payloadRep(e : SomeError) -> String = match e {
+    SomeError { payload = p, cause = _ } -> describe(typeRep(proxyOf(p)))
+}
+
+fun main() {
+    print(payloadRep(fail(ParseError("x"))))
+    print(payloadRep(fail(IoError(2))))
+}
+"""
+    assert outputs(source, capfd) == "Main#ParseError\nMain#IoError\n"

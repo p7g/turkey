@@ -440,21 +440,43 @@ static const FrameEntry *frame_entry_for(uintptr_t retaddr) {
     return NULL;
 }
 
+/* The frame `entry_thread` runs the program from, which is the outermost frame
+   any walk of the mutator stack can reach.
+
+   Asking pthread for the bounds instead is what this used to do, and it is
+   both unportable and less precise: `pthread_get_stackaddr_np` is Darwin's
+   spelling, glibc's `pthread_getattr_np` returns the *low* address rather
+   than the high one, and neither says where the program's frames actually
+   begin -- only where the thread's stack was mapped. Deriving the bound from
+   `TURKEY_STACK_BYTES` is no better, since `pthread_attr_setstacksize` may
+   round up or carve out a guard page. The one frame this runtime creates the
+   thread for is a bound it knows exactly. */
+static char *entry_stack_high;
+
 /* Every frame of the current stack, from this one outwards.
 
    The stop conditions matter more than the loop: a walk that runs off the end
    of the chain marks whatever the words beyond it happen to hold, which would
    surface as a corruption a long way from here and look exactly like a
    miscompile. So the frame pointer must stay inside this thread's stack, stay
-   16-byte aligned, and strictly increase. */
+   16-byte aligned, and strictly increase.
+
+   There is no low bound to check. The walk starts at this function's own live
+   frame and `frame` only ever increases, so nothing it reaches can be below
+   the stack; the high bound and the strict increase are what confine it. */
 static void scan_native_frames(void) {
     if (frame_entry_count == 0) return;
-    pthread_t self = pthread_self();
-    char *high = pthread_get_stackaddr_np(self);
-    char *low = high - pthread_get_stacksize_np(self);
+    char *high = entry_stack_high;
+    if (high == NULL) {
+        /* Reachable only when `pthread_create` failed and the entry ran on the
+           main thread. Scanning from an unknown outer bound is how a walk runs
+           off the end; not scanning drops live roots silently, which is worse.
+           So say so instead of doing either. */
+        turkey_panic("no entry stack bound: the frame walker cannot run");
+        return;
+    }
     void **frame = __builtin_frame_address(0);
-    while ((char *)frame >= low && (char *)frame + 16 <= high
-           && ((uintptr_t)frame & 15) == 0) {
+    while ((char *)frame + 16 <= high && ((uintptr_t)frame & 15) == 0) {
         /* The return address in *this* record is an address in the *caller*,
            so the entry it finds describes the caller's frame -- whose `x29` is
            this record's saved one. Applying the offsets to this frame instead
@@ -1464,6 +1486,9 @@ void turkey_install_crash_handler(void) {
 #define TURKEY_STACK_BYTES ((size_t)512 * 1024 * 1024)
 
 static void *entry_thread(void *argument) {
+    /* Before the program runs, so that a collection at any depth below has it:
+       this frame is the outer bound of every mutator stack walk. */
+    entry_stack_high = (char *)__builtin_frame_address(0);
     ((void (*)(void))argument)();
     return NULL;
 }

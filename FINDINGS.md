@@ -2474,6 +2474,42 @@ The same reading pass found the other half: `mov x0, x0` printed wherever a
 hint had been taken, which is the calling convention being satisfied by doing
 nothing. Those are dropped now.
 
+### 92. The corpus passed without a collector that could see a single root
+**bug, fixed.** M28 phase 5b. The arm64 backend emitted its module data and its
+entry sequence, and all 44 corpus programs compiled, linked and printed exactly
+what the reference implementation prints. The frame tables were not emitted at
+all -- `Turkey.Frame` had been computing them since phase 4 and the emitter was
+dropping them on the floor -- so the collector could not see the roots of a
+single stack frame. Every one of those programs was one collection away from
+freeing a live object, and the suite was green.
+
+Under `TURKEY_GC_STRESS`, which collects at every allocation, **7 of 44**
+passed.
+
+The reason the plain run says nothing is that it barely collects: a corpus
+program allocates little, the threshold starts at 1024 objects, and a root the
+collector cannot see is only a bug once something frees it while it is still
+in use. So the ordinary differential run is an oracle for the code and *not*
+for the root machinery, and the two look identical from the outside -- 44 of 44
+either way.
+
+This is FINDINGS 91 one level up. There the assembler accepted a parallel copy
+that lost half its values; here execution itself accepted a program whose GC
+metadata was entirely absent. Each new oracle is complete for what it checks
+and silent about the next thing, and the way to find out which is which is to
+break the thing deliberately and see whether anything goes red. Running the
+corpus under stress as a test, rather than as an occasional check, is the
+cheapest form of that.
+
+The bug the stress run then found is worth its own line, because it was silent
+in the other direction -- it fired everywhere at once. A frame record holds the
+return address of the function that *owns* it, which is an address in that
+function's caller; so the table entry a return address finds describes the
+**caller's** frame, whose `x29` is the saved one in the record, not the frame
+the address was read from. Getting that backwards reads whatever the callee
+happens to keep at those offsets: "arm64 frame 0 is not a heap pointer", on
+nearly every program.
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

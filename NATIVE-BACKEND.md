@@ -1432,6 +1432,51 @@ Each phase runs and is verified before the next begins.
   permanent root array, module initialization, the entry point, the frame table
   as data, and the collector walking `x29` records beside the chain it has.
 
+  **The module, and the first programs that run (measured 2026-09-16).**
+  `boot native` now prints a whole module: each literal's bytes, a word of
+  storage per untraced global, the permanent root array and the `RootFrame`
+  covering it, the entry sequence, and the frame table. `cc` links the result
+  against the C runtime and it runs.
+
+  | | assembly | frame-table entries | against the reference | under `TURKEY_GC_STRESS` |
+  |---|---|---|---|---|
+  | the corpus, 44 programs | 327,238 lines | 4,070 | **44 of 44** | **44 of 44** |
+  | `boot` compiling itself | 2,658,647 lines, 54 MB, 67 s | 46,595 | not yet | -- |
+
+  The entry sequence is `Turkey.Llvm.emitEntry`'s, in the same order and for
+  the same reasons -- register the permanent frame with an all-ones mask, build
+  each literal's `TurkeyString` into its slot, run `%module.initialize`, call
+  `main` with a null environment -- with `main` itself a call to `turkey_main`,
+  so argument handling, the panic report and the final collection stay written
+  once in C. It is the only hand-written assembly in the backend, and it goes
+  through the instruction printer wherever there is an instruction to print.
+
+  **What the plain run does not check, and stress does.** With no frame table
+  emitted and no walker written, all 44 programs already passed the
+  differential run: a corpus program collects a handful of times or not at all,
+  and a root the collector cannot see is usually a root nothing frees in time
+  to matter. Under `TURKEY_GC_STRESS`, which collects at every allocation,
+  **seven** of the 44 passed -- SIGSEGV, SIGBUS, and panics holding values that
+  were never pointers. That ratio is the argument for running the stress suite
+  as a test rather than as an occasional check: it is the difference between an
+  oracle that reads the root machinery and one that steps over it.
+
+  **The walker.** `turkey_frame_table_register` sorts the module's table once
+  at startup, because the emitter cannot -- the addresses do not exist until
+  the linker assigns them, and `.quad <label>` is all it can write (see "The
+  table's encoding, surveyed"). `turkey_collect` then walks `x29` records and
+  binary searches, *beside* the shadow-stack chain and not instead of it: a C
+  frame or an LLVM-path frame has a return address in no table and is skipped,
+  which is what lets one runtime serve both backends, and a binary that
+  registers no table walks nothing.
+
+  The bug worth recording is which frame the offsets apply to. A frame record
+  holds the return address of the function that owns it, which is an address in
+  its *caller* -- so the entry that address finds describes the caller's frame,
+  whose `x29` is the record's saved one. Applying the offsets to the frame the
+  address was read from reads whatever the callee happens to hold there, and
+  said so on nearly every program at once.
+
   **Spilling after the root stores**, on `boot`: 5,702 values spilled (3,937 of
   them into root slots), 5,702 stores and **10,001 reloads**. The first version
   had 24,977 -- every root store before a safepoint read its value, and for a

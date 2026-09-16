@@ -1,0 +1,73 @@
+-- The shared recoverable-error channel (SPEC-DELTAS 69). Two sources with
+-- unrelated payload types pack into one `SomeError`, `?` propagates them
+-- without converting anything, and `context` adds an outer message while
+-- keeping the original reachable as a cause.
+
+type ParseError = ParseError { field : String, line : Int }
+type IoError = IoError(Int)
+type Missing = Missing
+
+instance Error ParseError {
+    fun message(e) = match e {
+        ParseError { field, line } ->
+            "bad " + field + " on line " + Int.toString(line)
+    }
+}
+instance Error IoError { fun message(IoError(code)) = "io error " + Int.toString(code) }
+instance Error Missing { fun message(_) = "missing" }
+
+fun readConfig(ok : Bool) -> Either SomeError String =
+    if ok { Right("port=8080") } else { Left(fail(IoError(2))) }
+
+fun parsePort(text : String) -> Either SomeError Int = match String.splitOnce(text, "=") {
+    None -> Left(fail(ParseError { field = "port", line = 1 }))
+    Some((_, value)) -> match Int.parse(value) {
+        None -> Left(fail(ParseError { field = "port", line = 1 }))
+        Some(n) -> Right(n)
+    }
+}
+
+-- Neither `?` nor the caller converts anything: both failures are already
+-- `SomeError`, packed once at the source that knew the concrete type.
+fun load(ok : Bool) -> Either SomeError Int {
+    let text = readConfig(ok)?
+    let port = parsePort(text)?
+    Right(port)
+}
+
+-- Context wraps rather than repacks, so the origin survives underneath.
+fun loadFor(host : String, ok : Bool) -> Either SomeError Int = match load(ok) {
+    Right(n) -> Right(n)
+    Left(e) -> Left(Error.context(e, ParseError { field = host, line = 0 }))
+}
+
+fun chain(e : SomeError) -> Int = match Error.causeOf(e) {
+    None -> 1
+    Some(inner) -> 1 + chain(inner)
+}
+
+fun main() {
+    match load(True) {
+        Right(n) -> print(n)
+        Left(e) -> print(e)
+    }
+    match load(False) {
+        Right(n) -> print(n)
+        Left(e) -> {
+            -- `Show SomeError` is the whole chain; `messageOf` is just the top.
+            print(e)
+            print(Error.messageOf(e))
+            print(chain(e))
+        }
+    }
+    match loadFor("db", False) {
+        Right(n) -> print(n)
+        Left(e) -> {
+            print(e)
+            print(Error.messageOf(e))
+            print(chain(e))
+        }
+    }
+    -- A payload with no fields at all still carries its dictionary.
+    print(Error.describe(fail(Missing)))
+}

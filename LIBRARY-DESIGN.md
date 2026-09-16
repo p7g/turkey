@@ -464,7 +464,11 @@ prototype alone establishes general fusion, asymptotic, or lifetime guarantees.
 - Collision detection scope, exact-case checking, canonical entry identity, and
   eventual package-qualified type identity.
 - The small implicit Prelude and canonical documentation/re-export policy.
-- Error context/cause APIs and outer casting versus searching a cause chain.
+- Outer casting versus searching a cause chain. The context/cause API is
+  settled (SPEC-DELTAS 69): one explicit chain, `context` wrapping rather
+  than repacking, walked with `causeOf`. Whether `cast` inspects only the
+  outermost payload or searches the chain, as Go's `errors.As` does, waits
+  on checked downcasting -- ERRORS.md step 5.
 - Resource acquisition/result types, cleanup failures on control-flow exits,
   cancellation, runtime invalidation, and suspended-builder finalization.
 - Applicative/product operations and ergonomic bidirectional builder notation.

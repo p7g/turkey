@@ -3112,3 +3112,195 @@ to: `g`'s annotation is complete, and delta 38 already repaired it.
 **What it cost.** Nothing in the corpus: no binding in `boot`, the library or
 the test programs was rejected. `partial_signatures.gob` accepts; the four
 rules each have an `err_partial_sig_*.gob`.
+
+---
+
+### 68. Existential constructors
+
+Delta 56 ended "existential types are still outside the language". ERRORS.md
+decided they come in, as a general feature rather than a special-cased
+`SomeError`, and step 1 of its plan settled their representation. This is the
+language half.
+
+**A constructor may hide type variables.** A bracket after the constructor's
+name binds them, in the position a `fun` writes its context:
+
+```
+type SomeError = SomeError[Error e](e)
+type Counter = Counter[s] { state : s, step : fun(s) -> s, read : fun(s) -> Int }
+```
+
+Every variable the bracket mentions is bound there. A bare variable binds one
+unconstrained; `Error e` binds `e` and makes every `SomeError` carry the
+`Error` instance its `e` was built at. A variable in a field must still be a
+type parameter or bound in the bracket, so a typo stays delta 56's
+undeclared-variable error rather than a silent existential. A bracket variable
+may not also be a type parameter, and the bracket may not hold an equality:
+equality givens are what cost GADTs principal types (ERRORS.md, "GADTs: not
+now"), and class givens over fresh constants do not (Läufer & Odersky 1994).
+
+**Packing is explicit.** A use of the constructor is a use of a constrained
+function: `SomeError(ParseError { line = 3 })` instantiates `e`, wants
+`Error ParseError`, and elaborates to a constructor applied to the dictionary
+and the field. Nothing converts implicitly; `?` still does not pack.
+
+**Opening is a pattern.** A constructor pattern against an existential binds
+each hidden variable to a fresh rigid constant, a skolem as in delta 40, that
+exists only for the arm or function the pattern belongs to, and puts the
+carried instances in scope there as givens. It may appear anywhere in a `match`
+arm's pattern or a `fun` or lambda parameter's, nested or not. It may not
+appear in a `let`, a `var` or a `for ... in` element, where there is no body for
+the constant to live in (GHC has the same rule), nor in an arm with `|`
+alternatives, whose openings would have to agree. Two openings, even of the same
+value, are distinct constants.
+
+This is the one amendment to `CAssume`, which said its assumptions came only
+from a declared type: a pattern is now a second source, and restricting the
+bracket to class predicates is why that keeps principal types.
+
+**Escape.** A type mentioning an opened constant may not leave its arm, by the
+delta-40 check: the arm's result, anything assigned to an enclosing `var`, and a
+function's return type are all older than the constant. The message says which
+pattern opened it: `the type of 'e' would escape the pattern that opened it`.
+
+**Fields.** Positional and record forms both work, and so do both pattern forms.
+`.field` on a value whose declared type is a hidden variable is an error, since
+the constant has no scope to live in. An existential record is not mutable,
+whether or not the record would otherwise be (section 4.5).
+
+**Representation** (ERRORS.md, "Result: contract 1"). A packed value stores one
+layout code per hidden variable, then the carried dictionaries, then its fields
+at their packed layouts. An opened arm is compiled once per layout some reachable
+packing stores, and a value takes the copy whose codes match. Nothing is
+converted at the boundary, so an opened array aliases the packed one. This is
+the backend's business rather than the language's, and is recorded here because
+it is why nothing about opening a value costs a conversion.
+
+**How others answered.** GHC's `data T = forall a. Show a => MkT a` is the
+model, including the `let` restriction. OCaml writes the same with GADT syntax,
+and naming the hidden type needs `(type a)`. Swift made existentials implicit and
+then walked it back with `any P` (SE-0335), because their costs did not show.
+Scala 3 dropped `forSome`. Rust's `dyn Trait` is the dictionary-only form, where
+the hidden type is reachable only through methods.
+
+**What it cost.** Nothing in the corpus: no existing program changed, and no
+golden moved. The feature is about 900 lines across the two compilers, in the
+proportion the design predicted -- the front end is a bracket in each parser,
+one pass over each declaration table, an opening in each `matchPattern` and the
+`CAssume`/`CLet` that scopes it, while the Core-down half is the representation
+work step 1 had already settled. The one surprise was the printer: a pattern
+prints the dictionaries it binds, and those names are renumbered per binding
+for stable goldens, so the pattern had to be told about the renumbering that
+every other binder already went through.
+
+---
+
+### 69. The shared recoverable-error channel
+
+Delta 68 added existential constructors as a general feature. This is the first
+thing built on them, and ERRORS.md decision 2's concrete form: one error type
+that any concrete payload can enter, carried by `Either SomeError a` and moved
+by the existing `?`.
+
+```
+class Error e { fun message(e) -> String }
+
+type SomeError = SomeError[Error e] { payload : e, cause : Option SomeError }
+
+fun fail[Error e](value : e) -> SomeError
+fun context[Error e](inner : SomeError, value : e) -> SomeError
+```
+
+`Error` is in `Std.Classes` beside every other class; `SomeError`, `fail` and
+the rest are `Data.Error`. The Prelude exports `Error(..)`, `SomeError(..)` and
+`fail`, and aliases the module as `Error`, so `Error.context`, `Error.causeOf`,
+`Error.messageOf` and `Error.describe` need no import.
+
+**A source packs once; nobody in between converts anything.** `fail` is where a
+concrete error enters the channel. Every caller above it propagates the result
+with `?`, and because both sides are already `SomeError` there is no wrapper sum
+and no conversion at the intermediate frames. Concrete error sums remain the
+right answer where a caller needs exhaustive recovery; entering the shared
+channel from one of those is still an explicit `fail`.
+
+**Context wraps, and never repacks.** `context` builds a new error *around* the
+one it is given, putting it in `cause`. The inner payload and everything below
+it stay reachable through `causeOf`, and `describe` renders the chain outermost
+first. This is deliberate, and the survey is why: GHC's exception annotations
+are cleared by `toException` on a rethrow, so an annotated exception caught and
+rethrown anywhere -- through `bracket`, through `onException` -- silently loses
+them, two releases after the mechanism was approved. A `cause` field only ever
+written by `context` cannot lose anything that way.
+
+**One chain, not two.** Python keeps `__cause__` and `__context__` because an
+exception can be raised *while handling* another one. Turkey has no such
+moment: `?` propagates a `Left` by returning it, and there is no dynamic
+handler frame in which a second error can arise. So the explicit chain is the
+only one, and the implicit one is not built.
+
+**A packed payload is read by opening it.** `.payload` is refused, because the
+field's type is the hidden one and there is no type at which to read it
+(delta 68, restriction 3). `messageOf`, `causeOf` and `describe` each open the
+value in a `match` arm, and are the whole accessible surface. The refusal used
+to be reported as "`SomeError` is not a single-variant record type", which is
+false -- it is one, which is why it has a field worth asking about -- and now
+names the real reason.
+
+**No stack traces.** An error records what went wrong and what it was doing,
+not where it was. Capture is separable and is not in this delta: the peers
+split the same way, Go shipping causes with no traces and Zig traces with no
+causes. ERRORS.md's survey has the reasons, the cost, and what the four
+backends would each have to agree on first.
+
+---
+
+### 70. Checked downcasting
+
+Delta 69 put every concrete error into one `SomeError`. This takes one back
+out, and the whole of what makes it sound is that the compiler, and only the
+compiler, says what a type is called.
+
+```
+class Typed a { fun typeRep(Proxy a) -> TypeRep }
+class Error e : Typed e { fun message(e) -> String }
+
+fun cast[Typed a](err : SomeError) -> Option a
+```
+
+**A type is a value.** `TypeRep` is the constructor's qualified name (delta 43)
+and the reps of its arguments, so two reps are equal exactly when the types
+are, and nothing new decides type identity. `Proxy` names a type without a
+value of one.
+
+**Instances are derived, and a program may not write one.** They are
+manufactured on demand, one per type constructor, through the path that already
+manufactures `%HasField` instances, and the dictionary is written in Core
+because `typeRep`'s answer is the qualified name -- something no Turkey
+expression can ask for. A derived head is general (`Box a`, not `Box Int`), so
+its context is `Typed` over each parameter and the dictionary is a function of
+its arguments' dictionaries. An `instance Typed ...` in a program is refused,
+as GHC has refused user `Typeable` since 7.10: the comparison of reps *is* the
+check, so forged evidence has nothing downstream to catch it.
+
+**`Typed` is a superclass of `Error`,** so the rep rides inside the dictionary
+an existential packs and an arm that opens a `SomeError` can ask the payload
+what it is without ever having seen the type.
+
+**The conversion is a predicate plus a total primitive,** the split
+PRIMITIVES.md 7.2 already uses for `floatParse` and `charFromInt`: `cast`
+compares the reps in ordinary Turkey and calls `Prim.castAs` only when they
+agree. That primitive is total and unchecked, and like every `Prim.` name it is
+spellable only from a library module, so no unchecked coercion reaches ordinary
+Turkey.
+
+**A legitimate cast is the identity.** Equal reps mean equal types mean equal
+layouts, so `Prim.castAs` converts nothing; both backends require exactly that
+and trap otherwise. The trap is reachable code that cannot run: contract 1
+copies an opened arm per *packed* layout, so one copy can have an `i64` payload
+and a pointer result type -- a pairing the rep check rules out at run time and
+the backend must still emit something for. It is a panic rather than a zero so
+that a wrong assumption says so.
+
+**`cast` inspects the outermost payload only.** Go's `errors.As` walks the
+cause chain; this does not. The chain stays reachable through `causeOf`, and
+searching it is an additive choice rather than one this forecloses.

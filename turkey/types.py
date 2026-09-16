@@ -847,6 +847,14 @@ def unify(a: Type, b: Type, span: Span | None = None, context: str = "",
 
     if isinstance(a, TVar):
         out = escaping(a, b)
+        if out is not None and out.uid in OPENED:
+            raise TypeError_(
+                f"the type '{out.name}' cannot escape the pattern "
+                f"'{short_name(OPENED[out.uid])}' that opened it: it stands for "
+                f"whatever type was packed there, so nothing outside can be "
+                f"equal to it",
+                span,
+            )
         if out is not None:
             raise TypeError_(
                 f"the type '{out.name}' cannot escape the signature that "
@@ -1084,6 +1092,38 @@ def subterms(t: Type):
     elif isinstance(t, TTuple):
         for e in t.elems:
             yield from subterms(e)
+
+
+#: The rigid constants an existential pattern opened, by `uid`, and the
+#: constructor that opened each (SPEC-DELTAS 68). A signature's constants are
+#: not here, which is what lets an escape say which of the two it was.
+OPENED: dict[int, str] = {}
+
+
+def skolems_of(*types: Type) -> list[TCon]:
+    """The rigid constants reachable from `types`, first occurrence first."""
+    seen: dict[int, TCon] = {}
+
+    def walk(ty: Type) -> None:
+        ty = prune(ty)
+        if isinstance(ty, TCon) and ty.uid:
+            seen.setdefault(ty.uid, ty)
+        elif isinstance(ty, TApp):
+            walk(ty.fn)
+            walk(ty.arg)
+        elif isinstance(ty, TFam):
+            walk(ty.arg)
+        elif isinstance(ty, TFun):
+            for p in ty.params:
+                walk(p)
+            walk(ty.ret)
+        elif isinstance(ty, TTuple):
+            for e in ty.elems:
+                walk(e)
+
+    for t in types:
+        walk(t)
+    return list(seen.values())
 
 
 def vars_of(*types: Type) -> list[TVar]:

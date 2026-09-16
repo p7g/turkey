@@ -194,6 +194,45 @@ def test_class_and_instance_predicates_accept_qualified_class_names():
     assert inst.cls == "Foreign.Base"
 
 
+# -- existential constructors (SPEC-DELTAS 68) --------------------------
+
+
+def test_a_constructor_bracket_binds_variables_and_names_classes():
+    decls = type_decls(
+        "type SomeError = SomeError[Error e](e)\n"
+        "type Pair a = Pair[b, Show b, Eq b](a, b)\n"
+    )
+    some_error = decls["SomeError"].variants[0]
+    assert some_error.binders == []
+    assert [(p.name, p.arg.name) for p in some_error.context] == [("Error", "e")]
+    pair = decls["Pair"].variants[0]
+    assert pair.binders == ["b"]
+    assert [p.name for p in pair.context] == ["Show", "Eq"]
+    assert pair.arity == 2
+
+
+def test_a_record_constructor_takes_a_bracket_too():
+    counter = type_decls(
+        "type Counter = Counter[s] { state : s, read : fun(s) -> Int }\n"
+    )["Counter"].variants[0]
+    assert counter.is_record and counter.binders == ["s"]
+
+
+def test_a_constructor_without_a_bracket_binds_nothing():
+    plain = type_decls("type Box a = Box(a)\n")["Box"].variants[0]
+    assert plain.binders == [] and plain.context == []
+
+
+@pytest.mark.parametrize("source, message", [
+    ("type T = T[Item c ~ Op](c)\n", "may not state an equality"),
+    ("type T = T[Map k v](k)\n", "classes applied to one type"),
+    ("type T = T[fun(a) -> a](a)\n", "classes applied to one type"),
+])
+def test_a_constructor_bracket_refuses_what_is_not_a_binder(source, message):
+    with pytest.raises(ParseError, match=message):
+        parse(source)
+
+
 # -- for loops ----------------------------------------------------------
 
 

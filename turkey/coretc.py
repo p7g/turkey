@@ -243,10 +243,12 @@ class Checker:
         # A nullary constructor stands alone rather than being applied
         # (`ast.ECon`), so what it is *worth* is the result rather than the
         # function -- `None` is an `Option a`, not a `fun() -> Option a`.
-        declared = info.scheme.body
-        if info.arity == 0 and isinstance(declared, TFun) and not declared.params:
+        scheme = self.constructor_scheme(info)
+        declared = scheme.body
+        if (info.runtime_arity == 0 and isinstance(declared, TFun)
+                and not declared.params):
             declared = declared.ret
-        if not self.instance_of(info.scheme, e.ty) and not compatible(
+        if not self.instance_of(scheme, e.ty) and not compatible(
                 declared, self.reduce(e.ty)):
             raise CoreError(
                 f"'{e.name}' is not usable at {show(e.ty)}; it is declared "
@@ -428,6 +430,18 @@ class Checker:
     def is_dict(self, ty: Type) -> bool:
         return dict_class(ty) is not None
 
+    def constructor_scheme(self, info):
+        """A constructor as Core applies it: one dictionary per predicate of
+        an existential's context, then its fields (SPEC-DELTAS 68)."""
+        if not info.context:
+            return info.scheme
+        from .types import Scheme
+        body = info.scheme.body
+        assert isinstance(body, TFun)
+        carried = [self.dict_type(p.name, p.args[0]) for p in info.context]
+        return Scheme(info.scheme.quantified,
+                      TFun(carried + list(body.params), body.ret))
+
     def dict_type(self, cls: str, arg: Type) -> Type:
         from .lower import dict_con
         return TApp(dict_con(cls, self.classes.classes[cls].kind), arg, STAR)
@@ -573,6 +587,7 @@ class Checker:
             for name, ty in self.pattern(alt.pat, scrutinee, e.span).items():
                 inner.define(name, [], ty)
             got = self.check(alt.body, inner, joins)
+            _refuse_escape(alt.pat, got, e.span)
             result = got if result is None else _join(result, got)
         return e.ty if result is None else result
 
@@ -667,8 +682,23 @@ class Checker:
                     f"matched against {show(target)}", span)
             mapping = _head_mapping(info.scheme, target)
             assert isinstance(info.scheme.body, TFun)
-            fields = [substitute(p, mapping) for p in info.scheme.body.params]
             out = {}
+            if info.is_existential:
+                # The hidden variables are the pattern's rigid constants and
+                # nothing the scrutinee says; the dictionaries arrive under the
+                # names the pattern gives them (SPEC-DELTAS 68).
+                if (len(pat.skolems) != len(info.exists)
+                        or len(pat.evidence) != len(info.context)):
+                    raise CoreError(
+                        f"'{pat.name}' is existential, and this pattern does "
+                        f"not open it", span)
+                mapping = dict(mapping)
+                mapping.update({v.id: s for v, s in
+                                zip(info.exists, pat.skolems)})
+                carried = [self.dict_type(p.name, substitute(p.args[0], mapping))
+                           for p in info.context]
+                out.update(zip(pat.evidence, carried))
+            fields = [substitute(p, mapping) for p in info.scheme.body.params]
             if isinstance(pat, ast.PCon):
                 if len(pat.args) != len(fields):
                     raise CoreError(
@@ -844,6 +874,51 @@ def _class_method(methods: dict[str, object], written: str):
 
 def _member_surface(name: str) -> str:
     return name.rpartition(".")[2].rpartition("#")[2] or name
+
+
+def _openings_in(pat) -> list[tuple[str, list]]:
+    """Every opening in a pattern, however deep, as `(constructor, skolems)`.
+
+    A whole tree rather than the top node: an existential is opened just as
+    readily by a record pattern or from inside a tuple, and those forms have to
+    reach the escape check too -- `lib/Data/Error.gob` opens only records.
+    """
+    t = type(pat)
+    if t is ast.PAnnot:
+        return _openings_in(pat.pat)
+    if t is ast.PTuple:
+        return [o for elem in pat.elems for o in _openings_in(elem)]
+    if t is ast.PCon:
+        out = [(pat.name, pat.skolems)] if pat.skolems else []
+        return out + [o for arg in pat.args for o in _openings_in(arg)]
+    if t is ast.PRecord:
+        out = [(pat.name, pat.skolems)] if pat.skolems else []
+        return out + [o for _label, sub in pat.fields for o in _openings_in(sub)]
+    if t is ast.PVar or t is ast.PWild or t is ast.PLit:
+        return []
+    raise AssertionError(
+        f"_openings_in: unrecognized pattern node {t.__name__}")
+
+
+def _refuse_escape(pat, got: Type, span: Span | None) -> None:
+    """An arm's type may not mention a constant its own pattern opened.
+
+    The Core half of the check inference makes (SPEC-DELTAS 68): the
+    constant stands for a type chosen at each packing, so a value of it leaving
+    the arm is a value of no type the context can name.
+    """
+    from .types import skolems_of
+    openings = _openings_in(pat)
+    if not openings:
+        return
+    opened = {s.uid: name for name, made in openings for s in made}
+    escaped = [s for s in skolems_of(got) if s.uid in opened]
+    if escaped:
+        raise CoreError(
+            f"the type of this arm, {show(got)}, mentions '{escaped[0].name}', "
+            f"which only exists inside the pattern "
+            f"'{opened[escaped[0].uid]}' that opened it",
+            span)
 
 
 def _head_mapping(scheme, target: Type) -> dict[int, Type]:

@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from . import ast
 from .classes import ClassTable, is_generated, InstInfo, MethodInfo, match
 from .decls import substitute
+from .prelude import TYPED_CLASS
 from .errors import Span, TypeError_
 from .types import Pred, Scheme, TBottom, Type, show_pred
 
@@ -246,7 +247,13 @@ class Elaborator:
         rebound per instance when the dictionary is built, which is the whole of
         what makes one body serve them all.
         """
-        for insts in self.classes.instances.values():
+        # Materialized, because completing an instance can *add* one: a
+        # superclass of `Error` is `Typed`, and resolving it derives the
+        # `Typed` instance for that head if solving never demanded one. That
+        # appends to the table being walked, and when the class has no entry
+        # yet it adds a key -- which is a mutation during iteration, not a
+        # tolerable one. Any instance added here needs no completing itself.
+        for insts in list(self.classes.instances.values()):
             for inst in insts:
                 info = self.classes.classes[inst.cls]
                 if is_generated(inst.cls):
@@ -255,6 +262,18 @@ class Elaborator:
                     # primitive `CField` the class is the interface to. There
                     # is nothing here to complete.
                     inst.plan = InstancePlan()
+                    continue
+                if inst.cls == TYPED_CLASS and inst.plan is None:
+                    # A derived `Typed` instance never passed through the
+                    # generator, so nothing has given it a plan. Its context is
+                    # its head's parameters -- `Typed (Map k v)` wants `Typed k`
+                    # and `Typed v` -- so the dictionary is a function of those,
+                    # named the way the generator names them. There is no body
+                    # to complete either: `lower` writes `typeRep` out of the
+                    # head's own name, which is the one thing the surface
+                    # language could not have said.
+                    inst.plan = InstancePlan(
+                        [dict_name(q.name) for q in inst.context])
                     continue
                 plan = inst.plan
                 scopes = (Scope(list(zip(plan.params, inst.context))),)

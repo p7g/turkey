@@ -1,5 +1,5 @@
 module Turkey.Layout (
-    layoutOf, transparent, share,
+    layoutOf, transparent, share, packedKeyParts, openedLayouts,
 )
 
 -- One compiled body per distinct *layout* of the type arguments
@@ -47,14 +47,16 @@ module Turkey.Layout (
 
 import Data.Set as Set
 import Turkey.Core
-import Turkey.Core (Core(..), CoreKind(..), CBind(..), CProgram(..), CParam(..),
-                    Mapper(..), mapKind, namesOf, abstractionBinders,
-                    transparentParameters)
+import Turkey.Ast (Pat(..), PatKind(..), Opening(..))
+import Turkey.Core (Core(..), CoreKind(..), CAlt(..), CBind(..), CProgram(..),
+                    CParam(..), Mapper(..), mapKind, namesOf, openings,
+                    abstractionBinders, transparentParameters)
 import Turkey.Decls as Decls
-import Turkey.Decls (DeclTable(..))
+import Turkey.Decls (DeclTable(..), ConInfo(..))
 import Turkey.Diag as Diag
 import Turkey.Types as Ty
-import Turkey.Types (TVar, TCon, TApp, TFam, TFun, TTuple, TSet, TBottom)
+import Turkey.Types (VarCell(..), ConCell(..), TVar, TCon, TApp, TFam, TFun,
+                     TTuple, TSet, TBottom)
 
 -- The eight representations, as the strings `CBind.layouts` is keyed by. A
 -- name rather than a constructor because that is what a copy's name is built
@@ -66,6 +68,11 @@ let i32 = "i32"
 let i64 = "i64"
 let f64 = "f64"
 let ptr = "ptr"
+let boxed = "boxed"
+
+-- Every layout a packed variable can have been stored at, in the order an
+-- opened arm is copied for them (SPEC-DELTAS 68).
+let openedLayouts = [unit_, i1, i8, i32, i64, f64, ptr, boxed]
 
 -- The layout a value of `ty` is held at, or `None` if that is not known.
 --
@@ -83,6 +90,11 @@ fun layoutOf(decls : DeclTable, ty : Ty.Type,
     match t {
         TVar(cell) -> return Map.get(abstracted, cell.id)
         TBottom -> return Some(unit_)
+        -- A skolem an existential arm opened, in the copy of that arm made for
+        -- one layout. Keyed by the negated `uid` so it cannot collide with a
+        -- variable id, and *unknown* rather than a heap object when the copy
+        -- does not name it (SPEC-DELTAS 68).
+        TCon(c) -> if c.uid != 0 { return Map.get(abstracted, 0 - c.uid) }
         _ -> {}
     }
     -- A newtype is its payload, so its representation is its payload's. See
@@ -154,19 +166,132 @@ fun applications(e : Core, out : Array (String, Array Ty.Type)) -> Unit {
     }))
 }
 
+-- Whether a term builds a value whose field layout it cannot know.
+--
+-- A transparent body *reads* a field at a layout decided elsewhere; this is the
+-- other half, a body that *writes* one. `fun mk(x : a) -> Box a` left generic
+-- past the cap holds `x` boxed and stores the box, while a ground reader of
+-- `Box Int` loads the same word as an `i64`. The field that matters is one
+-- *declared* at a bare type variable and given a value of one of this body's
+-- own variables. A field declared `Prim.Array a` is a pointer whatever `a` is,
+-- and a newtype is never built at all. See `turkey/layout.py`, `_constructs`.
+fun constructs(decls : DeclTable, e : Core, abstracted : Set.Set Int) -> Bool {
+    let found = Array.new(1)
+    constructions(decls, e, abstracted, found)
+    len(found) > 0
+}
+
+fun constructions(decls : DeclTable, e : Core, abstracted : Set.Set Int,
+                  found : Array Bool) -> Unit {
+    if len(found) > 0 { return }
+    match e.kind {
+        CApp(fn, args) -> match fn.kind {
+            CCon(name) -> match Decls.con(decls, name) {
+                Some(info) -> {
+                    let given = Array.map(args, fun(a) = a.ty)
+                    if writesUnknown(decls, info, declaredFields(info), given,
+                                     abstracted, e.ty) {
+                        Array.push(found, True)
+                    }
+                }
+                None -> {}
+            }
+            _ -> {}
+        }
+        CRecord(name, fields) -> match Decls.con(decls, name) {
+            Some(info) -> {
+                let names = match info.fields {
+                    Some(ns) -> ns
+                    None -> []
+                }
+                let params = declaredFields(info)
+                let declared = Array.new(len(fields))
+                let given = Array.new(len(fields))
+                for (label, value) in fields {
+                    var i = 0
+                    while i < len(names) && names[i] != label { i = i + 1 }
+                    if i < len(names) && i < len(params) {
+                        Array.push(declared, params[i])
+                        Array.push(given, value.ty)
+                    }
+                }
+                if writesUnknown(decls, info, declared, given, abstracted, e.ty) {
+                    Array.push(found, True)
+                }
+            }
+            None -> {}
+        }
+        _ -> {}
+    }
+    discard(mapKind(e.kind, Mapper {
+        expr = fun(x) = {
+            constructions(decls, x, abstracted, found)
+            x
+        },
+        type_ = fun(t) = t,
+        bind = fun(b) = {
+            constructions(decls, b.value, abstracted, found)
+            b
+        },
+    }))
+}
+
+fun declaredFields(info : ConInfo) -> Array Ty.Type = match info.scheme.body {
+    TFun(params, _) -> params
+    _ -> []
+}
+
+fun writesUnknown(decls : DeclTable, info : ConInfo, declared : Array Ty.Type,
+                  given : Array Ty.Type, abstracted : Set.Set Int,
+                  built : Ty.Type) -> Bool {
+    -- Packing an existential is stricter: the value records its hidden
+    -- variables' layouts, so *any* argument mentioning this body's variables
+    -- makes the stored code a guess (SPEC-DELTAS 68).
+    if len(info.exists) > 0 {
+        for t in given {
+            for v in Ty.varsOf([t]) {
+                if Set.contains(abstracted, v.id) { return True }
+            }
+        }
+        return False
+    }
+    match Decls.erasedPayload(decls, built) {
+        Some(_) -> return False
+        None -> {}
+    }
+    var i = 0
+    while i < len(declared) && i < len(given) {
+        match Ty.prune(declared[i]) {
+            TVar(_) -> match Ty.prune(given[i]) {
+                TVar(cell) -> if Set.contains(abstracted, cell.id) { return True }
+                _ -> {}
+            }
+            _ -> {}
+        }
+        i = i + 1
+    }
+    False
+}
+
 -- The bindings whose abstracted layouts have to be known.
 --
--- The transparent ones, and then whatever calls them at a type of its own.
+-- The transparent ones and the ones that build values they cannot lay out
+-- (`constructs`), and then whatever calls them at a type of its own.
 --
 -- Every binding, not even only the ones reachable from `main`: there is more
 -- than one notion of reachable here, and a binding this pass declined to share
 -- because one walk could not see it is a binding the other walk hands the
 -- backend with no layouts. Sharing an unreachable binding costs a copy nothing
 -- emits.
-fun needsLayouts(binds : Map String CBind) -> Set.Set String {
+fun needsLayouts(decls : DeclTable, binds : Map String CBind) -> Set.Set String {
     let found = Set.new()
     for (name, b) in Map.entries(binds) {
         if transparent(b) { Set.add(found, name) }
+        let abstracted = Set.new()
+        for v in abstractionBinders(b) { Set.add(abstracted, v.id) }
+        if len(Set.elements(abstracted)) > 0 && constructs(decls, b.value, abstracted) {
+            Set.add(found, name)
+        }
     }
     var grew = True
     while grew {
@@ -210,6 +335,10 @@ type Sharer = Sharer {
     decls  : DeclTable,
     binds  : Map String CBind,
     shared : Set.Set String,
+    -- Which layout keys each existential constructor is packed at, when known;
+    -- an opened arm is copied for those alone. `None` copies every layout,
+    -- which is the first of `share`'s two runs (SPEC-DELTAS 68).
+    packed : Option (Map String (Set.Set String)),
     -- "original|key" -> the name built for it.
     done   : Map String String,
     -- original -> the copies, in request order.
@@ -219,18 +348,60 @@ type Sharer = Sharer {
 }
 
 -- The program with one body per layout of every binding that needs one.
+--
+-- Twice when the program opens an existential (SPEC-DELTAS 68): once copying
+-- every opened arm for every layout, which is what makes every packing's
+-- layouts knowable, and again copying each arm only for the keys some reachable
+-- packing stores. The second run can only drop copies, so the keys the first
+-- found are still a superset of what the second can pack.
 fun share(program : CProgram, decls : DeclTable) -> CProgram {
+    let first = shareOnce(program, decls, None)
+    if !opensAnywhere(program) { return first }
+    shareOnce(program, decls, Some(packedLayouts(first, decls)))
+}
+
+fun opensAnywhere(program : CProgram) -> Bool {
+    let found = Array.new(1)
+    for b in Array.append(program.dicts, program.binds) {
+        opensInto(b.value, found)
+    }
+    len(found) > 0
+}
+
+fun opensInto(e : Core, found : Array Bool) -> Unit {
+    if len(found) > 0 { return {} }
+    match e.kind {
+        CMatch(_, alts) -> for alt in alts {
+            if len(openings(alt.pat)) > 0 { Array.push(found, True) }
+        }
+        _ -> {}
+    }
+    discard(mapKind(e.kind, Mapper {
+        expr = fun(x) = {
+            opensInto(x, found)
+            x
+        },
+        type_ = fun(t) = t,
+        bind = fun(b) = {
+            opensInto(b.value, found)
+            b
+        },
+    }))
+}
+
+fun shareOnce(program : CProgram, decls : DeclTable,
+              packed : Option (Map String (Set.Set String))) -> CProgram {
     let binds = Map.new()
     for b in Array.append(program.dicts, program.binds) {
         Map.put(binds, b.name, b)
     }
-    let shared = needsLayouts(binds)
-    if len(Set.elements(shared)) == 0 { return program }
+    let shared = needsLayouts(decls, binds)
+    if len(Set.elements(shared)) == 0 && !opensAnywhere(program) { return program }
     let used = Set.new()
     for (name, _) in Map.entries(binds) { Set.add(used, name) }
     let s = Sharer {
-        decls = decls, binds = binds, shared = shared, done = Map.new(),
-        made = Map.new(), queue = Array.new(8), used = used,
+        decls = decls, binds = binds, shared = shared, packed = packed,
+        done = Map.new(), made = Map.new(), queue = Array.new(8), used = used,
     }
 
     let rewritten = Map.new()
@@ -379,10 +550,390 @@ fun rewrite(s : Sharer, e : Core, abstracted : Map Int String) -> Core {
         Some(made) -> return made
         None -> {}
     }
+    match e.kind {
+        CMatch(scrutinee, alts) -> return openArms(s, e, scrutinee, alts, abstracted)
+        _ -> {}
+    }
     mkCore(e.ty, e.span, mapKind(e.kind, Mapper {
         expr = fun(x) = rewrite(s, x, abstracted),
         type_ = fun(t) = t,
         bind = fun(b) = withValue(b, rewrite(s, b.value, abstracted)),
+    }))
+}
+
+-- One copy of each existential arm per layout it may have been packed at.
+--
+-- Inside a copy the opened skolems have a layout -- keyed by the negated `uid`,
+-- so `layoutOf` can tell them from the binding's own variables -- and the body
+-- is rewritten under it like any layout-keyed copy. The copy's pattern records
+-- its layouts, and the backend takes the arm only when the value's stored codes
+-- match them. Nothing is converted, so an opened array is the array that was
+-- packed (SPEC-DELTAS 68).
+fun openArms(s : Sharer, e : Core, scrutinee : Core, alts : Array CAlt,
+             abstracted : Map Int String) -> Core {
+    let out = Array.new(len(alts))
+    for alt in alts {
+        let opened = Array.new(2)
+        for p in openings(alt.pat) {
+            match p.opening {
+                Some(o) -> match o.layouts {
+                    None -> Array.push(opened, p)
+                    Some(_) -> {}
+                }
+                None -> {}
+            }
+        }
+        if len(opened) == 0 {
+            Array.push(out, CAlt { pat = alt.pat,
+                                   body = rewrite(s, alt.body, abstracted) })
+            continue
+        }
+        -- One key per opening, and one copy per combination of them -- unless
+        -- the value being opened is a packing right here, in which case it is
+        -- the one key that packing stores.
+        let choices = Array.new(len(opened))
+        for p in opened {
+            match knownKey(s, scrutinee, alt.pat, p, abstracted) {
+                Some(k) -> Array.push(choices, [k])
+                None -> {
+                    let allowed = match s.packed {
+                        None -> None
+                        Some(table) -> Some(Map.getOr(table, conName(p),
+                                                      Set.new()))
+                    }
+                    let keys = Array.new(8)
+                    for k in keyChoices(countSkolems(p)) {
+                        let take = match allowed {
+                            None -> True
+                            Some(set) -> Set.contains(set, k)
+                        }
+                        if take { Array.push(keys, k) }
+                    }
+                    Array.push(choices, keys)
+                }
+            }
+        }
+        for combination in combinations(choices) {
+            let inner = Map.new()
+            for (id_, layout) in Map.entries(abstracted) {
+                Map.put(inner, id_, layout)
+            }
+            let keys = Map.new()
+            for var i = 0; i < len(opened) && i < len(combination); i = i + 1 {
+                let p = opened[i]
+                let parts = String.split(combination[i], ",")
+                match p.opening {
+                    Some(o) -> for var j = 0; j < len(o.skolems) && j < len(parts);
+                                   j = j + 1 {
+                        Map.put(inner, 0 - o.skolems[j].uid, parts[j])
+                    }
+                    None -> {}
+                }
+                Map.put(keys, p.id, combination[i])
+            }
+            Array.push(out, CAlt { pat = withLayouts(alt.pat, keys),
+                                   body = rewrite(s, alt.body, inner) })
+        }
+    }
+    mkCore(e.ty, e.span, CMatch(rewrite(s, scrutinee, abstracted), out))
+}
+
+fun conName(p : Pat) -> String = match p.kind {
+    PCon(name, _) -> name
+    PRecord(name, _, _) -> name
+    _ -> ""
+}
+
+fun countSkolems(p : Pat) -> Int = match p.opening {
+    Some(o) -> len(o.skolems)
+    None -> 0
+}
+
+-- Every key of `n` layouts, as the comma-joined strings the copies are named by.
+fun keyChoices(n : Int) -> Array String {
+    var out = [""]
+    for var i = 0; i < n; i = i + 1 {
+        let next = Array.new(len(out) * len(openedLayouts))
+        for prefix in out {
+            for layout in openedLayouts {
+                Array.push(next, if prefix == "" { layout }
+                                 else { prefix + "," + layout })
+            }
+        }
+        out = next
+    }
+    out
+}
+
+fun combinations(choices : Array (Array String)) -> Array (Array String) {
+    var out = [Array.new(0)]
+    for options in choices {
+        let next = Array.new(len(out))
+        for prefix in out {
+            for one in options {
+                let made = Array.new(len(prefix) + 1)
+                for x in prefix { Array.push(made, x) }
+                Array.push(made, one)
+                Array.push(next, made)
+            }
+        }
+        out = next
+    }
+    out
+}
+
+-- A copy of `p` whose openings record the layouts `keys` gives them, by the id
+-- of the opening in the original.
+fun withLayouts(p : Pat, keys : Map Int String) -> Pat = match p.kind {
+    PAnnot(inner, te) -> Pat {
+        id = p.id, span = p.span, kind = PAnnot(withLayouts(inner, keys), te),
+        opening = p.opening,
+    }
+    PTuple(elems) -> Pat {
+        id = p.id, span = p.span,
+        kind = PTuple(Array.map(elems, fun(x) = withLayouts(x, keys))),
+        opening = p.opening,
+    }
+    PCon(name, args) -> Pat {
+        id = p.id, span = p.span,
+        kind = PCon(name, Array.map(args, fun(x) = withLayouts(x, keys))),
+        opening = openingWith(p, keys),
+    }
+    PRecord(name, fields, rest) -> Pat {
+        id = p.id, span = p.span,
+        kind = PRecord(name, Array.map(fields, fun(f) = (f.0,
+            withLayouts(f.1, keys))), rest),
+        opening = openingWith(p, keys),
+    }
+    _ -> p
+}
+
+fun openingWith(p : Pat, keys : Map Int String) -> Option Opening = match p.opening {
+    None -> None
+    Some(o) -> match Map.get(keys, p.id) {
+        Some(k) -> Some(Opening { evidence = o.evidence, skolems = o.skolems,
+                                  layouts = Some(String.split(k, ",")) })
+        None -> Some(o)
+    }
+}
+
+-- The layouts an opening must be for, when what it opens is a packing written
+-- right here -- `match C(d, xs) { C(ys) -> ... }`, which is what an inlined
+-- opener leaves behind.
+fun knownKey(s : Sharer, scrutinee : Core, whole : Pat, p : Pat,
+             abstracted : Map Int String) -> Option String {
+    var top = whole
+    loop {
+        match top.kind {
+            PAnnot(inner, _) -> { top = inner }
+            _ -> break
+        }
+    }
+    if top.id != p.id { return None }
+    match scrutinee.kind {
+        CApp(fn, args) -> match fn.kind {
+            CCon(name) -> {
+                if name != conName(p) { return None }
+                match Decls.con(s.decls, name) {
+                    Some(info) -> if len(info.exists) > 0 {
+                        return packedKey(s.decls, info, args, abstracted)
+                    }
+                    None -> {}
+                }
+                None
+            }
+            _ -> None
+        }
+        _ -> None
+    }
+}
+
+-- The layouts one packing stores for its hidden variables, or `None` if they
+-- are not knowable here. Matched one way, so no type is changed.
+fun packedKey(decls : DeclTable, info : ConInfo, args : Array Core,
+              abstracted : Map Int String) -> Option String =
+    match packedKeyParts(decls, info, args, abstracted) {
+        Some(parts) -> Some(String.join(parts, ","))
+        None -> None
+    }
+
+fun packedKeyParts(decls : DeclTable, info : ConInfo, args : Array Core,
+                   abstracted : Map Int String) -> Option (Array String) {
+    let found = Map.new()
+    let declared = declaredFields(info)
+    let carried = len(info.scheme.preds)
+    for var i = 0; i < len(declared) && carried + i < len(args); i = i + 1 {
+        discard(matchTypes(declared[i], Ty.prune(args[carried + i].ty), found))
+    }
+    let out = Array.new(len(info.exists))
+    for v in info.exists {
+        match Map.get(found, v.id) {
+            None -> return None
+            Some(packedTy) -> match layoutOf(decls, packedTy, abstracted) {
+                Some(l) -> Array.push(out, l)
+                None -> match Ty.prune(packedTy) {
+                    TVar(_) -> Array.push(out, boxed)
+                    _ -> return None
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
+-- One-way matching: bind the pattern type's variables to what the target has.
+fun matchTypes(pattern : Ty.Type, target : Ty.Type,
+               out : Map Int Ty.Type) -> Bool = match Ty.prune(pattern) {
+    TVar(cell) -> match Map.get(out, cell.id) {
+        Some(had) -> Ty.sameType(had, target)
+        None -> {
+            Map.put(out, cell.id, target)
+            True
+        }
+    }
+    TCon(c) -> match target {
+        TCon(d) -> c.name == d.name && c.level == d.level
+        _ -> False
+    }
+    TApp(pf, pa, _) -> match target {
+        TApp(tf, ta, _) -> matchTypes(pf, tf, out) && matchTypes(pa, ta, out)
+        _ -> False
+    }
+    TFam(pn, pa, _) -> match target {
+        TFam(tn, ta, _) -> pn == tn && matchTypes(pa, ta, out)
+        _ -> False
+    }
+    TFun(pp, pr) -> match target {
+        TFun(tp, tr) -> {
+            if len(pp) != len(tp) { return False }
+            for var i = 0; i < len(pp); i = i + 1 {
+                if !matchTypes(pp[i], tp[i], out) { return False }
+            }
+            matchTypes(pr, tr, out)
+        }
+        _ -> False
+    }
+    TTuple(pe) -> match target {
+        TTuple(te) -> {
+            if len(pe) != len(te) { return False }
+            for var i = 0; i < len(pe); i = i + 1 {
+                if !matchTypes(pe[i], te[i], out) { return False }
+            }
+            True
+        }
+        _ -> False
+    }
+    _ -> False
+}
+
+-- For each existential constructor, the layout keys some reachable packing
+-- stores. A packing inside a copy of an opened arm happens only if that copy is
+-- ever taken, so it counts once the key its arm was copied for is itself packed
+-- somewhere (SPEC-DELTAS 68).
+fun packedLayouts(program : CProgram,
+                  decls : DeclTable) -> Map String (Set.Set String) {
+    let records = Array.new(8)
+    for b in Array.append(program.dicts, program.binds) {
+        packingsInto(decls, b.value, b.layouts, Array.new(0), records)
+    }
+    let live = Map.new()
+    var grew = True
+    while grew {
+        grew = False
+        for (name, key, conditions) in records {
+            var ready = True
+            for cond in conditions {
+                let (con, want) = cond
+                if !Set.contains(Map.getOr(live, con, Set.new()), want) {
+                    ready = False
+                }
+            }
+            if !ready { continue }
+            let have = match Map.get(live, name) {
+                Some(found) -> found
+                None -> {
+                    let made = Set.new()
+                    Map.put(live, name, made)
+                    made
+                }
+            }
+            let keys = match key {
+                Some(one) -> [one]
+                None -> keyChoices(len(existsOf(decls, name)))
+            }
+            for one in keys {
+                if !Set.contains(have, one) {
+                    Set.add(have, one)
+                    grew = True
+                }
+            }
+        }
+    }
+    live
+}
+
+fun existsOf(decls : DeclTable, name : String) -> Array VarCell =
+    match Decls.con(decls, name) {
+        Some(info) -> info.exists
+        None -> Array.new(0)
+    }
+
+fun packingsInto(decls : DeclTable, e : Core, abstracted : Map Int String,
+                 conditions : Array (String, String),
+                 out : Array (String, Option String,
+                              Array (String, String))) -> Unit {
+    match e.kind {
+        CMatch(scrutinee, alts) -> {
+            packingsInto(decls, scrutinee, abstracted, conditions, out)
+            for alt in alts {
+                let inner = Map.new()
+                for (id_, layout) in Map.entries(abstracted) {
+                    Map.put(inner, id_, layout)
+                }
+                let held = Array.new(len(conditions))
+                for c in conditions { Array.push(held, c) }
+                for p in openings(alt.pat) {
+                    match p.opening {
+                        Some(o) -> match o.layouts {
+                            Some(ls) -> {
+                                for var j = 0; j < len(o.skolems) && j < len(ls);
+                                    j = j + 1 {
+                                    Map.put(inner, 0 - o.skolems[j].uid, ls[j])
+                                }
+                                Array.push(held, (conName(p),
+                                                  String.join(ls, ",")))
+                            }
+                            None -> {}
+                        }
+                        None -> {}
+                    }
+                }
+                packingsInto(decls, alt.body, inner, held, out)
+            }
+            return {}
+        }
+        CApp(fn, args) -> match fn.kind {
+            CCon(name) -> match Decls.con(decls, name) {
+                Some(info) -> if len(info.exists) > 0 {
+                    Array.push(out, (name, packedKey(decls, info, args,
+                                                     abstracted), conditions))
+                }
+                None -> {}
+            }
+            _ -> {}
+        }
+        _ -> {}
+    }
+    discard(mapKind(e.kind, Mapper {
+        expr = fun(x) = {
+            packingsInto(decls, x, abstracted, conditions, out)
+            x
+        },
+        type_ = fun(t) = t,
+        bind = fun(b) = {
+            packingsInto(decls, b.value, b.layouts, conditions, out)
+            b
+        },
     }))
 }
 

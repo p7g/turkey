@@ -109,6 +109,46 @@ def test_a_record_polymorphic_body_compiles(capped):
     assert "%inst.%HasField.cap.Main#Box" in names(checked.core)
 
 
+def test_a_generic_producer_agrees_with_a_ground_reader(capped, tmp_path,
+                                                        capfd):
+    """The producer/consumer disagreement `check_layouts` cannot see.
+
+    `mk` is not transparent -- it takes an `a` apart nowhere -- so
+    `layout.share` makes no copy of it, and past the cap it is the generic
+    body that builds the `Box`. It holds `x` at `BOXED` and writes that
+    pointer into the field. `get` is ground and reads the field as the `i64`
+    its declaration says `Box Int` holds. The recursion is only there so that
+    `opt` cannot inline `mk` into `main` and hide the disagreement; the second
+    field so that `Box` is not a newtype, whose erasure refuses instead.
+
+    This is the shape existential constructors hit on every opening (ERRORS.md,
+    "Correctness milestone: nested layouts"), which is why it is pinned before
+    they are built.
+    """
+    from turkey.cli import main as cli_main
+    program = tmp_path / "program.gob"
+    program.write_text("""
+type Box a = Box(a, Int)
+
+fun mk(x : a, n : Int) -> Box a {
+    if n <= 0 {
+        return Box(x, 0)
+    }
+    return mk(x, n - 1)
+}
+
+fun get(b : Box Int) -> Int = match b {
+    Box(n, _) -> n
+}
+
+fun main() {
+    print(Int.toString(get(mk(41, 3)) + 1))
+}
+""", encoding="utf-8")
+    assert cli_main(["run", "--backend", "llvm", str(program)]) == 0
+    assert capfd.readouterr().out == "42\n"
+
+
 def test_a_capped_field_access_reaches_the_right_field(capped, capsys):
     """And it runs. None of this is checkable by inspection alone: the hazard
     was a body that compiled and read the wrong bytes."""

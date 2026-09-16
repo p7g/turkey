@@ -93,6 +93,15 @@ class PCon(Pattern):
 
     name: str
     args: list[Pattern] = field(default_factory=list)
+    # Opening an existential
+    # constructor binds more than its sub-patterns say: the dictionaries it
+    # carries, under `evidence`, and one rigid constant per hidden variable,
+    # under `skolems`. `layouts` is `layout.share`'s: the layout each skolem
+    # stands for in this copy of the arm, which the value's stored layout codes
+    # must match for the arm to be taken. None before sharing.
+    evidence: list[str] = field(default_factory=list)
+    skolems: list = field(default_factory=list)
+    layouts: tuple | None = None
 
 
 @dataclass(eq=False)
@@ -106,6 +115,10 @@ class PRecord(Pattern):
     name: str
     fields: list[tuple[str, Pattern]]
     rest: bool = False
+    # As `PCon`'s: what opening an existential record binds (SPEC-DELTAS 68).
+    evidence: list[str] = field(default_factory=list)
+    skolems: list = field(default_factory=list)
+    layouts: tuple | None = None
 
 
 @dataclass(eq=False)
@@ -164,6 +177,9 @@ class ECon(Expr):
     are applied, and are typed as ordinary functions."""
 
     name: str
+    # `evidence.Use`, for an existential constructor with a context, which is
+    # used like a constrained function (SPEC-DELTAS 68). `None` otherwise.
+    use: object | None = None
 
 
 @dataclass(eq=False)
@@ -184,6 +200,8 @@ class ERecord(Expr):
 
     con: str
     fields: list[tuple[str, Expr]]
+    # As `ECon.use`.
+    use: object | None = None
 
 
 @dataclass(eq=False)
@@ -464,6 +482,11 @@ class ConDecl(Node):
     name: str
     args: list[TypeExpr] = field(default_factory=list)
     fields: list[tuple[str, TypeExpr]] | None = None
+    # An existential constructor's bracket (SPEC-DELTAS 68), as written: the
+    # bare variables it binds unconstrained, and its class predicates, whose
+    # variables it binds too. Which variables are hidden is `decls`'s to say.
+    binders: list[str] = field(default_factory=list)
+    context: list[ClassPred] = field(default_factory=list)
 
     @property
     def is_record(self) -> bool:
@@ -487,11 +510,14 @@ class TypeDecl(Node):
 
     @property
     def is_mutable_record(self) -> bool:
-        """Section 4.5: single-variant record types are the mutable ones."""
+        """Section 4.5: single-variant record types are the mutable ones --
+        unless the variant is existential (SPEC-DELTAS 68)."""
         return (
             self.variants is not None
             and len(self.variants) == 1
             and self.variants[0].is_record
+            and not self.variants[0].binders
+            and not self.variants[0].context
         )
 
 

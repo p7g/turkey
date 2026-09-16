@@ -64,7 +64,7 @@ import Turkey.Diag as Diag
 import Turkey.Source (Span)
 import Turkey.Typed as Typed
 import Turkey.Types as Ty
-import Turkey.Types (Kind(..), VarCell(..), Scheme(..), Pred(..),
+import Turkey.Types (Kind(..), VarCell(..), ConCell(..), Scheme(..), Pred(..),
                      TVar, TCon, TApp, TFam, TFun, TTuple, TBottom)
 
 let dictPrefix = "%Dict."
@@ -303,6 +303,7 @@ fun rule(ck : Checker, e : Core, env : CEnv) -> Ty.Type = match e.kind {
                 defineC(inner, name, Array.new(0), ty)
             }
             let got = check(ck, alt.body, inner, joins)
+            refuseEscape(alt.pat, got, e.span)
             result = match result {
                 None -> Some(got)
                 Some(had) -> Some(joinTypes(had, got))
@@ -318,6 +319,71 @@ fun rule(ck : Checker, e : Core, env : CEnv) -> Ty.Type = match e.kind {
     CJump(name, args) -> checkJump(ck, e, name, args, env)
 }
 
+-- A constructor as Core applies it: one dictionary per predicate of an
+-- existential's context, then its fields (SPEC-DELTAS 68).
+fun constructorScheme(ck : Checker, info : ConInfo) -> Scheme {
+    if len(info.scheme.preds) == 0 { return info.scheme }
+    match info.scheme.body {
+        TFun(params, ret) -> Scheme {
+            quantified = info.scheme.quantified,
+            body = TFun(Array.append(Array.map(info.scheme.preds,
+                fun(pr) = dictType(ck, pr.name, pr.args[0])), params), ret),
+            preds = Array.new(0),
+        }
+        _ -> info.scheme
+    }
+}
+
+-- Every opening in a pattern, however deep, collected as `(constructor, skolems)`.
+--
+-- A whole tree rather than the top node: an existential is opened just as
+-- readily by a record pattern or from inside a tuple, and those forms have to
+-- reach the escape check too -- `lib/Data/Error.gob` opens only records.
+fun collectOpenings(p : Pat, out : Array (String, Array ConCell)) -> Unit {
+    match p.kind {
+        PVar(_) -> {}
+        PWild -> {}
+        PLit(_) -> {}
+        PAnnot(inner, _) -> collectOpenings(inner, out)
+        PTuple(elems) -> for e in elems { collectOpenings(e, out) }
+        PCon(n, args) -> {
+            match p.opening {
+                None -> {}
+                Some(o) -> Array.push(out, (n, o.skolems))
+            }
+            for a in args { collectOpenings(a, out) }
+        }
+        PRecord(n, fields, _) -> {
+            match p.opening {
+                None -> {}
+                Some(o) -> Array.push(out, (n, o.skolems))
+            }
+            for (_, sub) in fields { collectOpenings(sub, out) }
+        }
+    }
+}
+
+-- An arm's type may not mention a constant its own pattern opened: the constant
+-- stands for a type chosen at each packing (SPEC-DELTAS 68).
+fun refuseEscape(p : Pat, got : Ty.Type, where : Option Span) -> Unit {
+    let openings = Array.new(2)
+    collectOpenings(p, openings)
+    if len(openings) == 0 { return {} }
+    let opened = Map.new()
+    for (name, made) in openings {
+        for s in made { Map.put(opened, s.uid, name) }
+    }
+    for s in Ty.skolemsOf([got]) {
+        match Map.get(opened, s.uid) {
+            None -> {}
+            Some(name) ->
+                fail("the type of this arm, " + Ty.show(got) + ", mentions '"
+                     + s.name + "', which only exists inside the pattern '"
+                     + name + "' that opened it", where)
+        }
+    }
+}
+
 fun checkCon(ck : Checker, e : Core, name : String) -> Ty.Type {
     let info = match Map.get(ck.decls.constructors, name) {
         Some(i) -> i
@@ -326,14 +392,16 @@ fun checkCon(ck : Checker, e : Core, name : String) -> Ty.Type {
     -- A nullary constructor stands alone rather than being applied, so what it
     -- is *worth* is the result rather than the function -- `None` is an
     -- `Option a`, not a `fun() -> Option a`.
-    var declared = info.scheme.body
+    let scheme = constructorScheme(ck, info)
+    var declared = scheme.body
     match declared {
-        TFun(params, ret) -> if info.arity == 0 && len(params) == 0 {
+        TFun(params, ret) -> if info.arity + len(info.scheme.preds) == 0
+                && len(params) == 0 {
             declared = ret
         }
         _ -> {}
     }
-    if !instanceOf(info.scheme, e.ty) && !compatible(declared, reduce(ck, e.ty)) {
+    if !instanceOf(scheme, e.ty) && !compatible(declared, reduce(ck, e.ty)) {
         fail("'" + name + "' is not usable at " + Ty.show(e.ty)
              + "; it is declared " + Ty.show(declared), e.span)
     }
@@ -792,12 +860,37 @@ fun conPattern(ck : Checker, p : Pat, name : String, args : Option (Array Pat),
              + "', matched against " + Ty.show(target), where)
     }
     let mapping = headMapping(info.scheme, target)
+    -- The hidden variables are the pattern's rigid constants and nothing the
+    -- scrutinee says; the dictionaries arrive under the names the pattern gives
+    -- them (SPEC-DELTAS 68).
+    let carriedTypes = Array.new(0)
+    if len(info.exists) > 0 {
+        let opening = match p.opening {
+            Some(o) -> o
+            None -> fail("'" + name + "' is existential, and this pattern does "
+                         + "not open it", where)
+        }
+        if len(opening.skolems) != len(info.exists)
+                || len(opening.evidence) != len(info.scheme.preds) {
+            fail("'" + name + "' is existential, and this pattern does not open it",
+                 where)
+        }
+        for var i = 0; i < len(info.exists); i = i + 1 {
+            Map.put(mapping, info.exists[i].id, TCon(opening.skolems[i]))
+        }
+        for var i = 0; i < len(info.scheme.preds); i = i + 1 {
+            let pr = info.scheme.preds[i]
+            Array.push(carriedTypes, (opening.evidence[i],
+                dictType(ck, pr.name, Decls.substitute(pr.args[0], mapping))))
+        }
+    }
     let params = match info.scheme.body {
         TFun(ps, _) -> ps
         _ -> Array.new(0)
     }
     let fieldTypes = Array.map(params, fun(t) = Decls.substitute(t, mapping))
     let out = Map.new()
+    for (n, t) in carriedTypes { Map.put(out, n, t) }
     match args {
         Some(sub) -> {
             if len(sub) != len(fieldTypes) {

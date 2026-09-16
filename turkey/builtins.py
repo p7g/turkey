@@ -518,6 +518,18 @@ _PRIM: dict[str, tuple] = {
                       _bi("Prim.arrayNew", 2, lambda n, value: ArrayObj(n, value))),
     "Prim.arrayNewUninit": (_scheme(lambda a: TFun([INT], raw_array_of(a))),
                             _bi("Prim.arrayNewUninit", 1, lambda n: ArrayObj(n))),
+    # The conversion half of a checked cast (ERRORS.md step 5). Total, and
+    # unchecked on purpose: `Data.Error.cast` compares the two type reps first
+    # and calls this only when they are equal, which is the predicate-plus-
+    # total-primitive split PRIMITIVES.md 7.2 already uses for `floatParse` and
+    # `charFromInt`. It is spellable only from a library module, like every
+    # other `Prim.` name, so no unchecked coercion reaches ordinary Turkey.
+    #
+    # Here it is the identity: the evaluator's values carry their own tags, so
+    # there is no representation to change. The native backend is where this
+    # does work, converting to the layout the result type is held at.
+    "Prim.castAs": (generalize(TFun([TVar(1)], TVar(1)), 0),
+                    _bi("Prim.castAs", 1, lambda x: x)),
     "Prim.arrayGet": (_scheme(lambda a: TFun([raw_array_of(a), INT], a)),
                       _bi("Prim.arrayGet", 2, lambda xs, i: xs.get(i))),
     "Prim.arraySet": (_scheme(lambda a: TFun([raw_array_of(a), INT, a], UNIT)),

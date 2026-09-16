@@ -47,6 +47,7 @@ from dataclasses import dataclass, field
 from . import ast
 from .decls import DeclTable, FamilyInfo, substitute
 from .errors import Span, TypeError_
+from .prelude import TYPED_CLASS
 from .types import (
     EQUALS, KVar, Kind, Pred, STAR, Scheme, TApp, TCon, TFam, TFun, TTuple,
     TVar, Type, UNIT, default_kind, generalize, kind_of, prune, show,
@@ -316,6 +317,7 @@ class ClassTable:
             for method in info.methods.values():
                 for var in method.scheme.quantified:
                     default_kind(var.kind)
+        self.check_constructor_contexts()
 
         registered = [self._resolve_instance(d, module) for d in instances]
         # Coverage is checked only once every instance is in the table, since
@@ -323,6 +325,29 @@ class ClassTable:
         # `Semigroup (Array a)` written further down the file.
         for inst in registered:
             self._check_instance(inst)
+
+    def check_constructor_contexts(self) -> None:
+        """The class half of an existential constructor's bracket.
+
+        `DeclTable` builds the predicates before any class is registered, so it
+        cannot know whether `Error` names one or what kind its variable has.
+        This is the same check `resolve_context` makes for a `fun`, made once
+        the classes exist (SPEC-DELTAS 68).
+        """
+        for con, written in self.decls.unchecked_contexts:
+            for pred, source in zip(con.context, written.context):
+                info = self.classes.get(pred.name)
+                if info is None:
+                    raise TypeError_(f"unknown class '{pred.name}'", source.span)
+                arg = pred.args[0]
+                if not unify_kinds(kind_of(arg), kind_of(info.var)):
+                    raise TypeError_(
+                        f"'{show(arg)}' has kind {show_kind(kind_of(arg))}, but "
+                        f"'{pred.name}' constrains a type of kind "
+                        f"{show_kind(kind_of(info.var))}",
+                        source.span,
+                    )
+        self.decls.unchecked_contexts.clear()
 
     def _declare_families(self, d: ast.ClassDecl) -> None:
         """Register a class's families before any signature is read.
@@ -520,6 +545,18 @@ class ClassTable:
         info = self.classes.get(d.cls)
         if info is None:
             raise TypeError_(f"unknown class '{d.cls}'", d.span)
+        if d.cls == TYPED_CLASS:
+            # The one class a program may name but not instance. `typeRep` is
+            # what `cast` compares, so an instance that lied about a type would
+            # make the cast return a value of a type it is not -- there is no
+            # check downstream that would catch it, because the comparison *is*
+            # the check. Derived instances cannot lie: the compiler reads the
+            # name off the type it is deriving for.
+            raise TypeError_(
+                "'Typed' instances are derived by the compiler, and a program "
+                "may not declare one: its answer is what 'cast' trusts.",
+                d.span,
+            )
         tyvars: dict[str, TVar] = {}
         fresh = lambda: TVar(1)  # noqa: E731
         head = self.decls.to_type(d.head, tyvars, fresh)
@@ -910,10 +947,62 @@ class ClassTable:
         self.instances.setdefault(cls, []).append(inst)
         return inst
 
+    def derive_typed(self, p: Pred) -> InstInfo | None:
+        """The `Typed` instance for one type constructor, on demand.
+
+        Coherent for the same reason `synthesize` is: there is one instance per
+        constructor and the compiler is the only thing that may write one, so
+        nothing overlaps and nothing can disagree about what a type is called.
+
+        The head is the *general* one -- `Map k v`, not `Map String Int` -- so
+        one instance serves every use, and its context is `Typed` over each
+        parameter. That is what makes the dictionary a function: the rep of
+        `Map String Int` is built from the reps its caller passes in, which is
+        the only way a rep can describe a type the instance never saw.
+        """
+        receiver = prune(p.args[0])
+        head, args = spine(receiver)
+        if isinstance(head, TTuple):
+            general: Type = TTuple([TVar(1) for _ in head.elems])
+            key: tuple[str, object] = ("tuple", len(head.elems))
+        elif isinstance(head, TCon):
+            if not args:
+                general, key = head, ("con", head.name)
+            else:
+                info = self.decls.tycons.get(head.name)
+                # The general form is read off a constructor's own scheme, as
+                # `synthesize` reads it, because that is where the parameters
+                # live with their kinds already right. A type with no
+                # constructor to read -- `Prim.Array` -- has no instance yet,
+                # and says so rather than guessing at kinds.
+                if info is None or not info.variants:
+                    return None
+                body = info.variants[0].scheme.body
+                if not isinstance(body, TFun):
+                    return None
+                general, key = body.ret, ("con", head.name)
+        else:
+            return None
+        for inst in self.instances.get(TYPED_CLASS, []):
+            if inst.head_key == key:
+                return inst
+        # A tuple's arguments are its elements, not a spine: `spine` answers
+        # no arguments for one, which would leave `(Int, String)` describing
+        # itself as a bare `Tuple2` and comparing equal to every other pair.
+        general_args = (general.elems if isinstance(general, TTuple)
+                        else spine(general)[1])
+        context = [Pred(TYPED_CLASS, [a]) for a in general_args]
+        inst = InstInfo(TYPED_CLASS, general, context,
+                        ast.InstanceDecl(None, TYPED_CLASS, None, [], []), {})
+        self.instances.setdefault(TYPED_CLASS, []).append(inst)
+        return inst
+
     def by_inst(self, p: Pred) -> list[Pred] | None:
         """The obligations of the instance that covers `p`, or None if none does."""
         if is_generated(p.name):
             self.synthesize(p)
+        if p.name == TYPED_CLASS:
+            self.derive_typed(p)
         for inst in self.instances.get(p.name, []):
             mapping = match(inst.head, p.args[0])
             if mapping is not None:

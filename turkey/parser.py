@@ -279,10 +279,46 @@ class Parser:
             variants.append(self.parse_con_decl())
         return ast.TypeDecl(span, name, params, variants, None)
 
+    def parse_con_context(self) -> tuple[list[str], list[ast.ClassPred]]:
+        """`[s, Error e]` -- the variables an existential constructor hides.
+
+        Read like a `fun`'s context, entry by entry as a type expression, with
+        one more form and one fewer: a bare variable binds one unconstrained,
+        and an equality is refused, since equality givens are what GADTs are
+        made of (SPEC-DELTAS 68).
+        """
+        if not self.at("["):
+            return [], []
+        self.advance()
+        binders: list[str] = []
+        preds: list[ast.ClassPred] = []
+        while True:
+            start = self.cur.span
+            written = self.parse_type_expr()
+            if self.at("~"):
+                raise ParseError(
+                    "a constructor's bracket may not state an equality", start)
+            if isinstance(written, ast.TEVar):
+                binders.append(written.name)
+            elif isinstance(written, ast.TECon) and len(written.args) == 1:
+                preds.append(ast.ClassPred(start, written.name, written.args[0]))
+            else:
+                raise ParseError(
+                    "a constructor's bracket holds type variables, as in 's', "
+                    "and classes applied to one type, as in 'Error e'",
+                    start,
+                )
+            if not self.eat(",") or self.at("]"):
+                break
+        self.expect("]")
+        return binders, preds
+
     def parse_con_decl(self) -> ast.ConDecl:
         tok = self.expect("CONID", "a constructor name")
+        binders, context = self.parse_con_context()
         if self.at("{"):
-            return ast.ConDecl(tok.span, tok.text, [], self.parse_record_payload())
+            return ast.ConDecl(tok.span, tok.text, [], self.parse_record_payload(),
+                               binders, context)
         args: list[ast.TypeExpr] = []
         if self.eat("("):
             # A value constructor is an uncurried function, so it declares its
@@ -300,7 +336,7 @@ class Parser:
                 f"'{tok.text}(...)'",
                 self.cur.span,
             )
-        return ast.ConDecl(tok.span, tok.text, args, None)
+        return ast.ConDecl(tok.span, tok.text, args, None, binders, context)
 
     def field_separator(self) -> bool:
         """Consume what separates two fields in braces, or answer False.

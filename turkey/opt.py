@@ -921,6 +921,11 @@ class _Reducer:
             if isinstance(pat, ast.PCon):
                 if pat.name != con:
                     continue  # a different constructor: cannot match
+                if pat.skolems:
+                    # Selecting the arm would have to substitute
+                    # the packed type for the skolems throughout its body,
+                    # which ERRORS.md lists as `opt`'s part of step 2.
+                    return None
                 subs = [_unannot(a) for a in pat.args]
                 if not all(isinstance(p, (ast.PVar, ast.PWild)) for p in subs):
                     return None

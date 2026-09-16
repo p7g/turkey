@@ -573,18 +573,25 @@ class _Function:
             conds = [f"isinstance({value}, (_ConValue, _RecordObj))",
                      f"{value}.con == {pat.name!r}"]
             assignments: list[tuple[str, str]] = []
+            # Carried dictionaries first; see `eval.match_pattern`.
+            carried = len(pat.evidence)
+            for index, name in enumerate(pat.evidence):
+                py = self.gen.fresh(name)
+                env[name] = _Name(py, False)
+                assignments.append((py, f"{value}.args[{index}]"))
             if isinstance(pat, ast.PCon):
                 fields = info.field_names or []
                 pieces = list(enumerate(pat.args))
                 access = lambda i: (f"{value}.fields[{fields[i]!r}]" if mutable
-                                    else f"{value}.args[{i}]")
+                                    else f"{value}.args[{carried + i}]")
             else:
                 pieces = [(name, sub) for name, sub in pat.fields]
                 if mutable:
                     access = lambda name: f"{value}.fields[{name!r}]"
                 else:
                     fields = info.field_names or []
-                    access = lambda name: f"{value}.args[{fields.index(name)}]"
+                    access = lambda name: (
+                        f"{value}.args[{carried + fields.index(name)}]")
             for key, sub in pieces:
                 cond, made = self.pattern(sub, access(key), env)
                 conds.append(cond)
@@ -689,10 +696,13 @@ def generate(program: CProgram, decls: DeclTable, main: str = "main") -> str:
         py = gen.fresh(name)
         gen.constructors[name] = py
         env[name] = _Name(py, True)
-        if info.arity == 0:
+        if info.runtime_arity == 0:
             runner.preamble.append(f"{py} = _ConValue({name!r}, ())")
             continue
-        args = [gen.fresh(field or "arg") for field in (info.field_names or [""] * info.arity)]
+        # An existential's carried dictionaries come first (SPEC-DELTAS 68).
+        args = ([gen.fresh("dict") for _ in info.context]
+                + [gen.fresh(field or "arg")
+                   for field in (info.field_names or [""] * info.arity)])
         if decls.tycons[info.tycon].is_mutable_record:
             fields = ", ".join(
                 f"{field!r}: {arg}" for field, arg in zip(info.field_names or [], args))

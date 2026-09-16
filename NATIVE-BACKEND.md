@@ -1477,6 +1477,45 @@ Each phase runs and is verified before the next begins.
   address was read from reads whatever the callee happens to hold there, and
   said so on nearly every program at once.
 
+### Phase 6: the backend compiles itself (measured 2026-09-16)
+
+Three checks, in increasing strength.
+
+**The corpus, against the LLVM path.** Both compilers run `asm` over all 44
+programs and the output is byte-identical: 264,606 lines, `cmp` clean. One
+program, two compilers.
+
+**stage2-arm64 exists.** `boot native boot/Main.gob` gives 2,658,647 lines in
+67 s, which `cc` links against the runtime into an 11 MB executable in 8 s, and
+that binary compiles programs.
+
+**The fixed point, and it is the strong form.** stage2-arm64 compiles
+`boot/Main.gob` again in 63 s and emits output **byte-for-byte identical** to
+stage1's. The ordinary bootstrap check is stage3 against a fourth stage; this
+is the compiler source compiled by two *different* compilers -- one built by
+LLVM, one built by this backend -- agreeing exactly. M29's outstanding question
+for the LLVM path ("stage2 against stage3 has not been compared") is answered
+here for the arm64 path.
+
+**Speed, best of three, interleaved.** stage2-arm64 runs the corpus in
+**12.84 s** against stage1's **13.83 s**.
+
+This is not evidence that the backend out-selects LLVM, and should not be read
+that way. The LLVM path still registers roots with the shadow stack, which
+"Frames, calls and roots, surveyed" measured at 13% of this very workload, and
+the arm64 path replaced it with frame tables. The ~7% gap is about the size of
+what that predicts, so what is being measured is the root strategy, with
+codegen quality unresolved either way. A comparison that isolated codegen would
+need both paths on the same root scheme.
+
+**Under GC stress.** All 44 corpus programs pass. stage2-arm64 itself passes
+`tokens` in 3.4 s -- the self-compiled compiler collecting at every allocation
+and walking frame tables it emitted for itself. `types` on the same input did
+**not** finish inside fifteen minutes and was killed, so it says nothing either
+way: stress collects at every allocation with a full mark and sweep, and `boot`
+allocates at a scale that makes that quadratic in practice. The probe's cost,
+not a result.
+
   **Spilling after the root stores**, on `boot`: 5,702 values spilled (3,937 of
   them into root slots), 5,702 stores and **10,001 reloads**. The first version
   had 24,977 -- every root store before a safepoint read its value, and for a

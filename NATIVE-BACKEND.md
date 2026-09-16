@@ -1331,8 +1331,44 @@ Each phase runs and is verified before the next begins.
   | `boot` compiling itself | 3073 of 3073 | 16,672 bytes | 10 gp, 1 fp | 22 | 45,097 |
 
   `verifyFrame`, `verifyAllocation`, `verifyColouring` and `Ssa.verify` report
-  nothing on either. As before, these are checkers: the prologue, epilogue and
-  table data are step 5's to print, and nothing here has run.
+  nothing on either. These are checkers rather than an oracle, which FINDINGS 91
+  is the demonstration of.
+
+  **The emitter prints functions (`boot native`, measured 2026-09-15).**
+  `boot asm` keeps the machine IR and its histograms; `boot native` prints what
+  the assembler reads. `Turkey.Emit` adds only what had no instruction before:
+  the prologue and epilogue from `Turkey.Frame.Layout`, the branch a terminator
+  becomes (with the next block falling through), the parallel copy a jump's
+  arguments become on the edge, and the substitution of the colouring and the
+  slot offsets. A move into the register a value already holds is dropped,
+  which is what a taken hint looks like from here.
+
+  | | assembly | `as` | nothing skipped |
+  |---|---|---|---|
+  | the corpus, 44 programs | 302,146 lines | all 44 assemble | yes |
+  | `boot` compiling itself | 2,271,163 lines, 49 MB, 203 s | 8 s, a 10 MB object | yes |
+
+  Two things moved into selection to make that possible, both of which the
+  LLVM path already had and the arm64 path did not:
+
+  * **The panic test after every call.** `turkey_panic` sets a flag and
+    returns, so a caller that did not look would carry on with a value the
+    callee never produced. `Select.propagate` reads
+    `turkey_has_panicked` -- through the global offset table, since the runtime
+    defines it -- and reuses `guard` to return a zero. 12,614 of them in the
+    corpus.
+  * **`Panic(v)` as a terminator**, which is `turkey_panic_string` and a return
+    of zero. And the zero itself: `mov d0, xzr` is not an instruction, so a
+    `Float` function's panic path needs `fmov`, which nothing had exercised
+    until whole functions were assembled.
+
+  **`as` is an oracle for spelling and not for meaning.** It accepted a
+  parallel copy that lost half its values (FINDINGS 91), and it will accept
+  anything else this backend decides wrongly. The oracle for meaning is running
+  the program against LLVM, which needs the module data and the runtime walker
+  -- the next slice, sketched under phase 5b: globals, string literals, the
+  permanent root array, module initialization, the entry point, the frame table
+  as data, and the collector walking `x29` records beside the chain it has.
 
   **Spilling after the root stores**, on `boot`: 5,702 values spilled (3,937 of
   them into root slots), 5,702 stores and **10,001 reloads**. The first version

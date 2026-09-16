@@ -2445,6 +2445,35 @@ line, added one slice earlier as "the number splitting would be measured
 against" -- a cost metric doing a correctness metric's job, which is the
 argument for printing costs before anyone asks what they are for.
 
+### 91. The assembler is an oracle for syntax, and says nothing about meaning
+**bug, fixed.** M28 phase 5. The first emitter's parallel copy -- the moves a
+jump's arguments become on the way into a block's parameters -- broke a cycle
+by parking *every* remaining source in the scratch register instead of one:
+
+```
+    mov x16, x2
+    mov x16, x0      // the first park is gone
+    mov x0, x16
+    mov x2, x16      // both parameters now hold the same value
+```
+
+`as` assembles that without complaint, because every line is a real
+instruction. So does the rest of the pipeline: `Ssa.verify` had passed,
+`verifyColouring` had passed, `verifyAllocation` and `verifyFrame` had passed,
+and the corpus assembled 44 of 44 programs. What found it was reading the
+output of one small loop and asking what the four moves did.
+
+That is worth keeping straight about what `as` buys. It is a complete oracle
+for *spelling* -- immediate ranges, register files, addressing modes, the
+things a printer written against a manual gets wrong -- and it is not an oracle
+for anything this backend decides. The only oracle for meaning is running the
+program, which is why the differential against LLVM is the next milestone and
+not an optional extra.
+
+The same reading pass found the other half: `mov x0, x0` printed wherever a
+hint had been taken, which is the calling convention being satisfied by doing
+nothing. Those are dropped now.
+
 ## Library, still wanted
 
 ### 13. `Option.isSome` existed and was reimplemented anyway

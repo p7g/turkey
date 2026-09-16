@@ -3192,3 +3192,62 @@ work step 1 had already settled. The one surprise was the printer: a pattern
 prints the dictionaries it binds, and those names are renumbered per binding
 for stable goldens, so the pattern had to be told about the renumbering that
 every other binder already went through.
+
+---
+
+### 69. The shared recoverable-error channel
+
+Delta 68 added existential constructors as a general feature. This is the first
+thing built on them, and ERRORS.md decision 2's concrete form: one error type
+that any concrete payload can enter, carried by `Either SomeError a` and moved
+by the existing `?`.
+
+```
+class Error e { fun message(e) -> String }
+
+type SomeError = SomeError[Error e] { payload : e, cause : Option SomeError }
+
+fun fail[Error e](value : e) -> SomeError
+fun context[Error e](inner : SomeError, value : e) -> SomeError
+```
+
+`Error` is in `Std.Classes` beside every other class; `SomeError`, `fail` and
+the rest are `Data.Error`. The Prelude exports `Error(..)`, `SomeError(..)` and
+`fail`, and aliases the module as `Error`, so `Error.context`, `Error.causeOf`,
+`Error.messageOf` and `Error.describe` need no import.
+
+**A source packs once; nobody in between converts anything.** `fail` is where a
+concrete error enters the channel. Every caller above it propagates the result
+with `?`, and because both sides are already `SomeError` there is no wrapper sum
+and no conversion at the intermediate frames. Concrete error sums remain the
+right answer where a caller needs exhaustive recovery; entering the shared
+channel from one of those is still an explicit `fail`.
+
+**Context wraps, and never repacks.** `context` builds a new error *around* the
+one it is given, putting it in `cause`. The inner payload and everything below
+it stay reachable through `causeOf`, and `describe` renders the chain outermost
+first. This is deliberate, and the survey is why: GHC's exception annotations
+are cleared by `toException` on a rethrow, so an annotated exception caught and
+rethrown anywhere -- through `bracket`, through `onException` -- silently loses
+them, two releases after the mechanism was approved. A `cause` field only ever
+written by `context` cannot lose anything that way.
+
+**One chain, not two.** Python keeps `__cause__` and `__context__` because an
+exception can be raised *while handling* another one. Turkey has no such
+moment: `?` propagates a `Left` by returning it, and there is no dynamic
+handler frame in which a second error can arise. So the explicit chain is the
+only one, and the implicit one is not built.
+
+**A packed payload is read by opening it.** `.payload` is refused, because the
+field's type is the hidden one and there is no type at which to read it
+(delta 68, restriction 3). `messageOf`, `causeOf` and `describe` each open the
+value in a `match` arm, and are the whole accessible surface. The refusal used
+to be reported as "`SomeError` is not a single-variant record type", which is
+false -- it is one, which is why it has a field worth asking about -- and now
+names the real reason.
+
+**No stack traces.** An error records what went wrong and what it was doing,
+not where it was. Capture is separable and is not in this delta: the peers
+split the same way, Go shipping causes with no traces and Zig traces with no
+causes. ERRORS.md's survey has the reasons, the cost, and what the four
+backends would each have to agree on first.

@@ -428,6 +428,160 @@ Sources for this section:
 [Taming the Flat Float Array Optimization (OCaml 2025)](https://conf.researchr.org/details/icfp-splash-2025/ocaml-2025-papers/6/Taming-the-Flat-Float-Array-Optimization-Tracking-Separability-in-the-Type-System),
 [Rust reference, trait objects](https://doc.rust-lang.org/reference/types/trait-object.html).
 
+## Survey: what an error carries, in peers
+
+Step 3 adds two things that look like one: a **trace** saying where an error
+came from, and a **cause chain** saying what it was wrapped in on the way out.
+The peers show these are independent -- Go shipped causes with no traces, Zig
+shipped traces with no causes -- and that the trace is much the more expensive
+half. This section is the evidence for treating them as separate pieces of
+work.
+
+### What capture costs
+
+| Peer | What it captures | When | Measured |
+| --- | --- | --- | --- |
+| Java | Full stack, in `Throwable`'s constructor, via native `fillInStackTrace` | Always, on every exception construction | Throw 937.8 +/- 46.7 ns/op; `getStackTrace()` 10,513 +/- 213 ns/op (JMH, JDK 10.0.1) |
+| Rust | Frames, via `Backtrace::capture` | Only if `RUST_BACKTRACE`/`RUST_LIB_BACKTRACE` is set; otherwise a documented no-op | Not quantified; "can be both memory intensive and slow" |
+| Go | `Frame` in `errors.New`/`fmt.Errorf` -- *proposed* | At construction | "We benchmarked the slowdown from fetching stack information and felt that it was tolerable" |
+| Zig | Error *return* trace: instruction pointers in a fixed circular buffer, 31 frames / 256 bytes on 64-bit | At each `return error`, no unwinding | Proposal: "2 math operations plus some memory reads and writes" |
+| Swift | Nothing | -- | -- |
+| GHC >= 9.10 | Backtrace into `ExceptionContext` at `throw`, from any of four mechanisms | At throw, per enabled mechanism, opt-out via `backtraceDesired` | Not quantified |
+
+Three numbers matter here.
+
+**The expensive half is not the walk, it is the conversion.** Balosin's
+benchmark separates them: recording the stack is comparatively cheap, and
+"not filling the stack trace itself takes the majority amount of time, but
+converting it to a Java representation". That is exactly the step this design
+needs -- `capture_panic_trace` already walks a linked list of `PanicSite`
+pointers in about as little work as Zig's, and what step 3 adds on top is
+materializing it as a *Turkey* value on the GC heap. The Java figure says the
+materialization, not the walk, is what to budget for and what to defer.
+
+**Rust's gate is the cheap way to have it both ways.** `Backtrace::capture`
+is written unconditionally at every call site and is "a noop if the
+`RUST_BACKTRACE` or `RUST_LIB_BACKTRACE` backtrace variables are both not
+set", precisely "so these environment variables allow liberally using
+`Backtrace::capture` and only incurring a slowdown when the environment
+variables are set". A library can therefore capture on every error without
+imposing a cost on programs that never print one.
+
+(A secondary source claims `anyhow` defers capture until the backtrace is
+read. The primary documentation does not say so, and nothing here relies on
+it.)
+
+**The strongest counterexample is Go, which measured capture as affordable
+and shipped without it anyway.** The Go 2 error-values proposal put a `Frame`
+in `errors.New` and `fmt.Errorf` and judged the cost "unlikely to affect
+practical programs" -- and then Go 1.13 took `Unwrap`, `Is`, `As` and `%w`
+from `xerrors` and left the `Frame` behind, with "at present there are no
+plans to include any of them". A peer that benchmarked the feature as cheap
+still declined to make it standard. The reason is not cost, it is that a
+trace in every error is a commitment about what errors *are*; Go kept errors
+as plain values.
+
+### Cause chains
+
+| Peer | Mechanism | Opt-in? | Two chains? |
+| --- | --- | --- | --- |
+| Go | `Unwrap() error`, walked by `errors.Is`/`errors.As`; `%w` wraps | Yes, per call site | No |
+| Python | `__cause__` (`raise X from Y`) and `__context__` (implicit) | `__cause__` explicit, `__context__` automatic | Yes |
+| Java/.NET | `getCause`/`initCause`, `InnerException` | Explicit | No |
+| GHC >= 9.10 | `ExceptionContext` annotations; `WhileHandling` added by `catch` | Annotations explicit, `WhileHandling` automatic | Yes |
+
+**Wrapping is an API commitment, not a convenience.** Go's rule is stated
+flatly: "Wrap an error to expose it to callers. Do not wrap an error when
+doing so would expose implementation details", and `Opaque` exists to add
+context *without* exposing the cause. The proposal names the hazard directly:
+"indiscriminate wrapping can expose implementation details, introducing
+undesired coupling between packages". So `promote`-style context should not
+make the inner error part of the outer API by default.
+
+**Two chains exist because two different things happen.** PEP 3134 kept both
+because "to handle the unexpected raising of a secondary exception, the
+exception must be retained implicitly. To support intentional translation of
+an exception, there must be a way to chain exceptions explicitly." GHC
+reached the same split independently, adding `WhileHandling` when a handler
+itself throws. **This distinction does not apply to Turkey.** Turkey has no
+handler that can fail while handling: `?` propagates a `Left` by returning
+it, and there is no dynamic handler frame in which a second error can arise.
+Turkey therefore needs only the explicit chain -- Python's `__cause__`, Go's
+`%w` -- and should not build the implicit one.
+
+**The warning is that context attached to a wrapper gets lost.** Well-Typed's
+2026 retrospective on GHC's annotations reports that "if an exception with
+annotations is _ever_ caught and rethrown anywhere ... those annotations will
+be lost", because `toException` for `SomeException` clears the context; it
+catches `bracket` and `onException`, and 9.10 also shipped a bug that
+duplicated the context into a nested `SomeException`. The mechanism was
+approved, implemented and still lost data in ordinary use two releases later.
+The lesson for contract 1 is specific: a cause or trace must live where
+re-packing cannot drop it, and `SomeError -> SomeError` context must be
+*defined* as preserving the inner value rather than repacking it.
+
+### The alternative nobody would reach from inside Turkey
+
+GHC's `HasCallStack` is **not a stack walk at all**. It is
+`?callStack :: CallStack`, an implicit-parameter constraint that the compiler
+solves by threading a value through calls: a call site in a function that has
+the constraint appends itself, and one that lacks it starts a fresh
+singleton. Its documented advantage is exactly the one Turkey wants --
+"CallStacks do not interact with the RTS and do not require compilation with
+`-prof`" -- and its documented limitation is that only annotated functions
+appear, so an un-annotated caller breaks the chain.
+
+This matters because **Turkey is a dictionary-passing language with a
+constraint solver already doing this shape of work**. A `HasStack`-style
+predicate solved by the elaborator would put the call site into the packing
+function as an ordinary argument, needing no runtime frame machinery, no C
+runtime change, and no per-backend agreement -- the three things that make
+the capture route expensive here. It buys a shallower trace than a real walk.
+GHC ships both, and ranks `HasCallStack` first among its four mechanisms.
+
+### Why capture is expensive *here* specifically
+
+The four backends do not agree on what a stack is, and the differential
+oracle does not reach any of them:
+
+* **The evaluator** keeps a live stack of function *names* (`self.functions`)
+  and no spans; a frame's position comes from the call expression at unwind
+  time.
+* **`pygen`** keeps no live stack at all. Its `turkey_name` is a compile-time
+  constant per generated function and frames are attached to a `TurkeyPanic`
+  as it propagates. Capture at an arbitrary point has nothing to read.
+* **`llvmgen`** registers a panic frame only across `_frame_region` -- the
+  blocks that can panic, plus cycles through them -- and a cold check
+  registers one *in its own failure block*. `test_llvmgen` pins the hot path
+  as frame-free. So at an arbitrary point the ancestor chain is deliberately
+  incomplete.
+* **boot's native backend emits no panic frames at all**: `turkey_frame_enter`
+  appears nowhere in `boot/`.
+
+And `test_boot` diffs stages through `opt`, "the last stage before a
+backend". Everything below it is outside the oracle -- the FINDINGS 43 shape,
+where a change applied to one side only has no test that notices.
+
+A `captureStack()` that must see a complete stack therefore either forces
+frame registration onto the hot paths `llvmgen` just cleared, or returns a
+different answer per backend. The one cheap reconciliation is to treat a
+capture call as a frame reader, exactly as a panic site is: it joins
+`panic_present`, the existing region analysis puts the frame where it is
+needed, and nothing changes on paths that never capture. That is a small
+change in `llvmgen` and a new one in boot, which has no such analysis yet.
+
+**Sources.**
+[Go 1.13 errors](https://go.dev/blog/go1.13-errors),
+[Go 2 error inspection proposal](https://go.googlesource.com/proposal/+/master/design/29934-error-values.md),
+[PEP 3134](https://peps.python.org/pep-3134/),
+[Balosin, stack trace versus exception](https://ionutbalosin.com/2018/06/getting-the-stack-trace-versus-throwing-an-exception-what-is-common-and-what-is-different/),
+[Rust `std::backtrace::Backtrace`](https://doc.rust-lang.org/std/backtrace/struct.Backtrace.html),
+[Zig issue 651, stack traces for errors](https://github.com/ziglang/zig/issues/651),
+[GHC proposal 0330, exception backtraces](https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0330-exception-backtraces.rst),
+[Well-Typed, Exception annotations: lay of the land](https://well-typed.com/blog/2026/05/lay-annotation-land/),
+[GHC.Stack](https://hackage.haskell.org/package/base/docs/GHC-Stack.html),
+[Swift error handling rationale](https://apple-swift.readthedocs.io/en/latest/ErrorHandlingRationale.html).
+
 ## Stack traces
 
 Capture once when a concrete error enters the shared error channel. Provide a
@@ -593,19 +747,44 @@ would reopen this is a FINDINGS entry where a type-indexed structure is wanted.
    against 369, and the arms drop from 16 to 10. Substituting the type as well
    would also devirtualize the carried dictionary; it is not done, and `opt`
    still declines to select an opened arm.
-3. **`Error`, `SomeError`, and stack capture.** Add the standard packing function
-   and independently owned traces. Use `Either SomeError a` for library paths
-   combining heterogeneous failures; retain concrete sums where exhaustive
-   recovery is useful. Verify propagation preserves the original trace and
-   optimized capture respects its effect and lifetime contract.
-4. **Checked downcasting.** Add solver-derived `Typed` instances and trustworthy
+3. **`Error`, `SomeError`, and causes.** *Library half done*
+   (SPEC-DELTAS 69). `class Error` in `Std.Classes`, and `SomeError`, `fail`,
+   `context`, `causeOf`, `messageOf` and `describe` in `Data.Error`, all
+   re-exported by the Prelude. `Either SomeError a` carries heterogeneous
+   failures and the existing `?` moves them with no conversion at the
+   intermediate frames; concrete sums stay where exhaustive recovery is
+   wanted. Context wraps rather than repacks, so a cause and everything under
+   it survive. `tests/programs/error_channel.gob` is the corpus half and
+   `tests/test_errors.py` the language half.
+
+   **Split, on the survey's evidence.** Capture and causes are independent --
+   Go shipped causes with no traces, Zig traces with no causes -- and capture
+   is much the more expensive half *here*: the evaluator keeps a live stack of
+   names without spans, `pygen` keeps none at all, `llvmgen` registers a panic
+   frame only across the region of blocks that can panic (and `test_llvmgen`
+   pins the hot path as frame-free), and `boot`'s native backend emits no
+   panic frames at all. The differential stops at `opt`, so none of that is
+   covered by the oracle. See "Survey: what an error carries, in peers".
+
+4. **Stack capture.** Not started. A `captureStack()` primitive, an
+   independently owned GC-rooted trace generalizing `capture_panic_trace`, and
+   the four backends made to agree. The cheap reconciliation for `llvmgen` is
+   to let a capture call join `panic_present`, so the existing region analysis
+   puts a frame where it is needed and nothing changes on paths that never
+   capture; `boot` has no such analysis yet. **Open: the capture policy.** The
+   live options are Rust's environment gate (capture written unconditionally,
+   a documented no-op unless a variable is set), a `HasCallStack`-style
+   predicate threaded by the solver -- which needs no runtime frame machinery
+   at all, and which Turkey's dictionary passing is unusually well placed to
+   take -- and always-on. Undecided.
+5. **Checked downcasting.** Add solver-derived `Typed` instances and trustworthy
    type evidence; reject user instances. Implement checked `cast` with the
    positive and negative cases above, without exposing `unboxAs`.
-5. **Recoverable panics, deferred.** First specify a concrete boundary's state,
+6. **Recoverable panics, deferred.** First specify a concrete boundary's state,
    cleanup, nesting, and fatal-failure contract. Then implement a rooted heap
    payload and recovery using the flag. Clearing the flag alone is not task
    isolation. Open: whether `panic` should also accept a `SomeError`.
-6. **Collect evidence throughout.** Fallible closures that force
+7. **Collect evidence throughout.** Fallible closures that force
    `traverse`-shaped duplicates go in FINDINGS. Revisit option C if they form a
    pattern.
 

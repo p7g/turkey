@@ -425,6 +425,23 @@ class DeclTable:
             return None
         return info.variants[0].field_names
 
+    def existential_fields(self, name: str) -> list[str] | None:
+        """The field names of a one-variant existential record, or None.
+
+        `record_fields` answers None for one of these, because an existential
+        record is not a mutable record: assigning a field would let a hidden
+        variable out, and reading one has no type to read it at. But "not a
+        single-variant record type" is then the wrong thing to say, since it
+        *is* one -- which is exactly why it has a field worth asking about.
+        """
+        info = self.tycons.get(name)
+        if info is None or len(info.variants) != 1:
+            return None
+        variant = info.variants[0]
+        if not variant.is_existential or not variant.field_names:
+            return None
+        return variant.field_names
+
     def field_type(self, receiver: Type, label: str) -> Type:
         """The type of `receiver.label`, for a receiver already resolved.
 

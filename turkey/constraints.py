@@ -899,6 +899,15 @@ class Solver:
                         f"(it has: {', '.join(names)})",
                         c.span,
                     )
+                hidden = self.decls.existential_fields(head.name)
+                if hidden is not None and label in hidden:
+                    raise TypeError_(
+                        f"cannot {c.context} field '{label}': "
+                        f"'{show(receiver)}' is existential, so the field's "
+                        f"type is one that only opening the value in a "
+                        f"'match' arm can name.",
+                        c.span,
+                    )
             raise TypeError_(
                 f"cannot {c.context} field '{label}': '{show(receiver)}' is not "
                 f"a single-variant record type. Multi-variant types are "

@@ -2376,6 +2376,36 @@ reach the capped and mutant cases no source program produces.
 
 ## Library, still wanted
 
+### 88. A new library module could not add two strings
+
+**library, fixed diagnostics.** ERRORS.md step 3, writing `lib/Data/Error.gob`.
+The module imported what it used -- `Std.Classes` for the classes,
+`Data.Option.Type` for `Option` -- and then `message(p) + ": " + describe(inner)`
+failed with `no instance for 'Add String'`. The instance exists, in
+`Data.String`; what was missing was the *edge*. An instance is only in scope
+when its module is in the graph, so a module that wants `+` on a `String`
+without naming anything from `Data.String` still has to write
+`import Data.String ()` (delta 56). `Data.Map` already does exactly that, which
+is the tell that this is a step everyone rediscovers.
+
+The message names the class and not the fix. It is right that an instance-only
+dependency is explicit -- that is what keeps the shipped modules under the
+Prelude acyclic -- but "no instance for `Add String`" is what you see when the
+instance is two lines away in a module you did not import, and it reads like
+the instance does not exist. Worth an enrichment: when a wanted predicate has
+an instance in a module that is not a dependency, say which module.
+
+The second papercut was a lie rather than a gap. Reading `.payload` off a
+`SomeError` is refused, which is right -- the field's type is the hidden one
+and there is no type at which to read it -- but the refusal said `SomeError`
+"is not a single-variant record type". It is one. `record_fields` answers
+`None` for an existential record because it is not a *mutable* record, and the
+message downstream had only that one bit to go on, so it reported the wrong
+reason with complete confidence. Both implementations now ask
+`existential_fields` first and name the real cause. The general shape is
+FINDINGS 53's again: a predicate that answers "no" for two different reasons
+will eventually be asked which one.
+
 ### 13. `Option.isSome` existed and was reimplemented anyway
 **library, discoverability.** M20. `Turkey.Parser` grew its own `isSome` because
 the Prelude's re-export of `module Option` was not where it was looked for. Now

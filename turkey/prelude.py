@@ -44,6 +44,20 @@ FLOW_BRK = "Prelude#Brk"
 FLOW_CONT = "Prelude#Cont"
 FLOW_RET = "Prelude#Ret"
 
+# Checked downcasting (ERRORS.md step 5). `Typed` is an ordinary class a
+# program may *name* -- `cast[Typed a]` -- but not instance: its instances are
+# derived by the solver, one per type constructor, because a hand-written one
+# could claim any type for any value and that is exactly what would make a cast
+# unsound. GHC has rejected user `Typeable` instances since 7.10.
+#
+# The names are here for the same reason the `Flow` ones are: the compiler
+# builds values of these types itself, so one place should say what they are
+# called.
+TYPED_CLASS = "Std.Classes#Typed"
+TYPED_METHOD = "Std.Classes#Typed.typeRep"
+TYPE_REP = "Data.Typed.Type#TypeRep"
+PROXY = "Data.Typed.Type#Proxy"
+
 # `error` diverges, so it can stand in for a `Flow` arm the language's own rules
 # make unreachable -- a `break` where there is no loop -- which the exhaustive-
 # ness checker has no way to know is unreachable.

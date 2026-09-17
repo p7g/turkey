@@ -104,7 +104,10 @@ type Constraint
     -- `name <= t`: instantiate the scheme bound to `name` at `t`. The generator
     -- emits this instead of looking the name up, which is what lets it run
     -- without a type environment at all.
-    | CInstance(String, Ty.Type, Option Span, Option Use)
+    -- The scheme, when the name is not in the environment: an existential
+    -- constructor with a context is used like a constrained function
+    -- (SPEC-DELTAS 68).
+    | CInstance(String, Ty.Type, Option Span, Option Use, Option Scheme)
 
 -- A deferred predicate keeps its identity across rounds, and `improve` rewrites
 -- its arguments where it stands, so it is a record rather than a variant field.
@@ -383,7 +386,8 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
         s.env = saved
     }
     CLet(cell) -> solveLet(s, cell)
-    CInstance(name, ty, where, use) -> solveInstance(s, name, ty, where, use)
+    CInstance(name, ty, where, use, given) ->
+        solveInstance(s, name, ty, where, use, given)
 }
 
 -- `name <= t`: instantiate, and re-emit the scheme's obligations.
@@ -393,13 +397,16 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
 -- scheme records which field it needs, not whether the access that produced the
 -- demand was a read or an assignment.
 fun solveInstance(s : Solver, name : String, ty : Ty.Type, where : Option Span,
-                  use : Option Use) -> Unit {
-    let binding = match lookup_(s.env, name) {
-        Some(b) -> b
-        None -> oops("generation let '" + name + "' through unbound", where)
+                  use : Option Use, given : Option Scheme) -> Unit {
+    let scheme = match given {
+        Some(sc) -> sc
+        None -> match lookup_(s.env, name) {
+            Some(b) -> b.scheme
+            None -> oops("generation let '" + name + "' through unbound", where)
+        }
     }
     let (preds, instantiated, typeArgs) =
-        Ty.instantiateQual(binding.scheme, fun() = fresh(s))
+        Ty.instantiateQual(scheme, fun() = fresh(s))
     Ty.unify(instantiated, ty, where, "", families(s))
     match use {
         Some(u) -> {
@@ -833,13 +840,25 @@ fun noField(s : Solver, p : Pred, receiver : Ty.Type, c : PredCell) -> Unit {
     match Classes.generatedLabel(p.name) {
         Some(label) -> {
             match h {
-                TCon(con) -> match Decls.recordFields(s.decls, con.name) {
-                    Some(names) -> if !Array.contains(names, label) {
-                        oops("type '" + con.name + "' has no field '" + label
-                             + "' (it has: " + String.join(names, ", ") + ")",
-                             c.span)
+                TCon(con) -> {
+                    match Decls.recordFields(s.decls, con.name) {
+                        Some(names) -> if !Array.contains(names, label) {
+                            oops("type '" + con.name + "' has no field '" + label
+                                 + "' (it has: " + String.join(names, ", ") + ")",
+                                 c.span)
+                        }
+                        None -> {}
                     }
-                    None -> {}
+                    match Decls.existentialFields(s.decls, con.name) {
+                        Some(hidden) -> if Array.contains(hidden, label) {
+                            oops("cannot " + c.context + " field '" + label
+                                 + "': '" + Ty.show(receiver) + "' is "
+                                 + "existential, so the field's type is one "
+                                 + "that only opening the value in a 'match' "
+                                 + "arm can name.", c.span)
+                        }
+                        None -> {}
+                    }
                 }
                 _ -> {}
             }

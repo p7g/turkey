@@ -3,7 +3,7 @@
 M28 phase 5b, and the first oracle this backend has had that checks *meaning*.
 `tests/test_emit.py` checks that `as` accepts what is printed, which catches an
 immediate out of range and a register spelled for the wrong file -- and accepts
-a parallel copy that loses half its values (FINDINGS 91). Everything the
+a parallel copy that loses half its values (FINDINGS 95). Everything the
 allocator, the frame layout and the emitter actually decide is invisible to it.
 
 So: compile each program with `boot native`, assemble it, link it against the
@@ -97,6 +97,10 @@ def test_the_corpus_runs_and_agrees_with_the_reference(name):
     """
     binary = _binary(name)
     result = subprocess.run([str(binary)], capture_output=True, text=True)
+    # Before the output, as the stress twin below does: a panic or a fault
+    # after the last write leaves stdout correct and complete, so comparing
+    # only stdout passes a program that died on its way out.
+    assert result.returncode == 0, result.stderr[:2000]
     assert result.stdout == _reference(name), (
         f"{name}: arm64 output differs from the reference implementation")
 

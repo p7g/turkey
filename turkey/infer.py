@@ -45,13 +45,13 @@ from .constraints import (
     HAS_FIELD, HAS_PROJECTION, ONE_OF, Binding, CAnd, CAssume, CDef, CEq, CExists, CInstance,
     CBind, CLet, CPred, Constraint, Env, reach,
 )
-from .decls import DeclTable
+from .decls import DeclTable, substitute
 from .deps import free_names, pattern_vars, sccs
 from .evidence import Abstraction, InstancePlan, MethodImpl, Use, dict_name
 from .errors import Span, TypeError_
 from .typed import TypeTable
 from .types import (
-    BOOL, BOTTOM, CHAR, EQUALS, FLOAT, INT, STRING, UNIT, Pred, Scheme, TBottom, TCon, TFam,
+    BOOL, BOTTOM, CHAR, EQUALS, FLOAT, INT, OPENED, STRING, UNIT, Pred, Scheme, TBottom, TCon, TFam,
     TFun, TSet, TTuple, TVar, Type, apply, array_of, float_literal_set,
     int_literal_set, show, show_pred, vars_of,
 )
@@ -123,6 +123,10 @@ class Generator:
         self.warnings: list[str] = []
         # Exhaustiveness runs after solving, when scrutinee types are known.
         self.match_sites: list[tuple[ast.EMatch, Type]] = []
+        #: What the patterns being matched have opened (SPEC-DELTAS 68): one
+        #: list per `match` arm or function whose patterns may open an
+        #: existential, and `None` for a binding that may not.
+        self.openings: list[list[tuple[list, list]] | None] = []
         # And irrefutability, for the same reason: every pattern that binds
         # without a second arm to fall to -- `let`, `var`, a parameter, a
         # `for ... in` element (SPEC-DELTAS 63).
@@ -696,7 +700,9 @@ class Generator:
         assert isinstance(stmt, (ast.SLet, ast.SVar))
         self.push()
         value = self.gen_expr(stmt.value)
+        self.openings.append(None)
         binds = list(self.match_pattern(stmt.pat, value).items())
+        self.openings.pop()
         self.binder_sites.append((stmt.pat, value))
         defn = self.pop()
         # Section 4.4: only a `let` bound to a syntactic value generalizes.
@@ -770,11 +776,13 @@ class Generator:
 
         param_types: list[Type] = []
         binds: dict[str, Type] = {}
+        self.openings.append([])
         for param in decl.params:
             tv = self.fresh()
             self._merge(binds, self.match_pattern(param, tv), param.span)
             self.binder_sites.append((param, tv))
             param_types.append(tv)
+        openings = self.openings.pop()
 
         ret = self.fresh()
         if decl.ret is not None:
@@ -822,7 +830,12 @@ class Generator:
         inner = self.pop()
         self.scopes.pop()
 
-        self.emit(CDef(list(binds.items()), inner))
+        # A parameter that opened an existential scopes its rigid constants
+        # over the body and its `return`s; `ret` was made outside, so neither
+        # can hand one back (SPEC-DELTAS 68).
+        defined = CDef(list(binds.items()), inner)
+        self.emit(self.opened(openings, defined, decl.span) if openings
+                  else defined)
         self.emit(self.pop())
         self.tyvar_scopes.pop()
         return TFun(param_types, ret)
@@ -870,7 +883,7 @@ class Generator:
             # declaration order for both forms, so nothing here cares which
             # form declared it. Only the record form may omit fields, which
             # is why the arity check below stays unconditional.
-            con = self.decls.instantiate_con(pat.name, self.fresh, pat.span)
+            con = self.opened_con(pat, pat.name, pat.span)
             if len(pat.args) != len(con.params):
                 raise TypeError_(
                     f"constructor '{pat.name}' takes {len(con.params)} argument(s), "
@@ -883,7 +896,7 @@ class Generator:
                 self._merge(out, self.match_pattern(sub, ty), pat.span)
             return out
         if isinstance(pat, ast.PRecord):
-            con = self.decls.instantiate_con(pat.name, self.fresh, pat.span)
+            con = self.opened_con(pat, pat.name, pat.span)
             info = self.decls.con(pat.name)
             if not info.is_record:
                 raise TypeError_(
@@ -914,6 +927,61 @@ class Generator:
                         )
             return out
         raise AssertionError(f"unhandled pattern {type(pat).__name__}")
+
+    def opened_con(self, pat, name: str, span: Span | None) -> TFun:
+        """A constructor pattern's type, opening the constructor if it is
+        existential (SPEC-DELTAS 68).
+
+        Each hidden variable becomes a rigid constant named for the one the
+        bracket wrote, and each predicate a given under a fresh dictionary
+        name. Both are recorded on the pattern, for Core, and on the enclosing
+        arm or function, which is what scopes them.
+        """
+        info = self.decls.con(name)
+        if info is None or not info.is_existential:
+            return self.decls.instantiate_con(name, self.fresh, span)
+        if not self.openings or self.openings[-1] is None:
+            raise TypeError_(
+                f"the pattern '{name}' opens an existential constructor, which "
+                f"only a 'match' arm or a function parameter may do: a 'let', "
+                f"'var' or 'for' has no body for the type it hides to live in",
+                span)
+        # One `Skolems` per pattern, but the names have to be unique across the
+        # whole opening scope, not just this pattern: every opening in an arm or
+        # a parameter list shares the rank that `opened` stamps them with, and
+        # `unify` tells two rigid constants apart by name and rank alone. Two
+        # patterns that both write `a` would otherwise hand out the same
+        # constant for two unrelated hidden types.
+        skolems = Skolems()
+        skolems.used.update(made.name
+                            for _, earlier in self.openings[-1]
+                            for made in earlier)
+        mapping: dict[int, Type] = {v.id: self.fresh()
+                                    for v in info.scheme.quantified}
+        for variable, written in zip(info.exists, info.exists_names):
+            mapping[variable.id] = skolems.bind(variable, written)
+        for made in skolems.made:
+            OPENED[made.uid] = name
+        con = substitute(info.scheme.body, mapping)
+        assert isinstance(con, TFun)
+        givens = [(dict_name(p.name), Pred(p.name, [substitute(a, mapping)
+                                                    for a in p.args]))
+                  for p in info.context]
+        pat.skolems = list(skolems.made)
+        pat.evidence = [n for n, _ in givens]
+        self.openings[-1].append((givens, list(skolems.made)))
+        return con
+
+    def opened(self, openings: list, inner: Constraint,
+               span: Span | None) -> Constraint:
+        """`inner`, under what its patterns opened: one rank for the rigid
+        constants to live at, and the carried instances as givens -- the shape
+        `check_signature` builds for a declared type, with a pattern as the
+        second source of assumptions (SPEC-DELTAS 68)."""
+        givens = [g for opened, _ in openings for g in opened]
+        skolems = [s for _, made in openings for s in made]
+        return CAssume(givens, CLet([("%opened", UNIT)], inner, CAnd([]), span,
+                                    skolems=skolems))
 
     @staticmethod
     def _merge(into: dict[str, Type], new: dict[str, Type], span: Span) -> None:
@@ -1043,9 +1111,25 @@ class Generator:
         return self.use(e.name, e.span, e)
 
     def _gen_ECon(self, e: ast.ECon) -> Type:
-        con = self.decls.instantiate_con(e.name, self.fresh, e.span)
+        info = self.decls.con(e.name)
+        if info is not None and info.context:
+            con = self.constructor_use(e.name, e.span, e)
+        else:
+            con = self.decls.instantiate_con(e.name, self.fresh, e.span)
         # A nullary constructor is a value; anything else is a function.
         return con.ret if not con.params else con
+
+    def constructor_use(self, name: str, span: Span | None, node) -> TFun:
+        """An existential constructor with a context, used like a constrained
+        function: its predicates are wanted here, and the `Use` the node
+        carries is where elaboration puts the dictionaries a value will hold
+        (SPEC-DELTAS 68)."""
+        info = self.decls.con(name)
+        con = TFun([self.fresh() for _ in range(info.arity)], self.fresh())
+        marker = Use(name, span)
+        node.use = marker
+        self.emit(CInstance(name, con, span, marker, info.scheme))
+        return con
 
     def _gen_ETuple(self, e: ast.ETuple) -> Type:
         return TTuple([self.gen_expr(x) for x in e.elems])
@@ -1057,8 +1141,10 @@ class Generator:
         return array_of(element)
 
     def _gen_ERecord(self, e: ast.ERecord) -> Type:
-        con = self.decls.instantiate_con(e.con, self.fresh, e.span)
         info = self.decls.con(e.con)
+        con = (self.constructor_use(e.con, e.span, e)
+               if info is not None and info.context
+               else self.decls.instantiate_con(e.con, self.fresh, e.span))
         if not info.is_record:
             raise TypeError_(
                 f"constructor '{e.con}' takes positional arguments; write "
@@ -1213,7 +1299,9 @@ class Generator:
             e.iterable.span, where,
         )
         # Section 6.5: `x` is a fresh immutable binding each iteration.
+        self.openings.append(None)
         binds = self.match_pattern(e.pat, element)
+        self.openings.pop()
         self.binder_sites.append((e.pat, element))
         self.scopes.append({name: False for name in binds})
         self.push()
@@ -1261,6 +1349,7 @@ class Generator:
         self.match_sites.append((e, scrutinee))
         result: Type = BOTTOM
         for arm in e.arms:
+            self.openings.append([])
             bindings = self.match_pattern(arm.patterns[0], scrutinee)
             for alt in arm.patterns[1:]:
                 other = self.match_pattern(alt, scrutinee)
@@ -1272,12 +1361,28 @@ class Generator:
                     )
                 for name, ty in other.items():
                     self.eq(bindings[name], ty, alt.span, f"the binding '{name}'")
+            openings = self.openings.pop()
+            if openings and len(arm.patterns) > 1:
+                raise TypeError_(
+                    "an arm with alternatives cannot open an existential "
+                    "constructor: each alternative would hide a different type",
+                    arm.span)
             self.scopes.append({name: False for name in bindings})
+            # The arm's value is joined with the others *inside* the rank its
+            # patterns opened, so a type it hides cannot leave through it: the
+            # variable standing for the result is made out here, older than the
+            # rigid constants, and delta 40's check refuses the binding.
+            answer = self.fresh() if openings else None
             self.push()
             body = self.gen_expr(arm.body)
+            if answer is not None and not isinstance(body, TBottom):
+                self.eq(answer, body, arm.span, "the arms of a 'match'")
+                body = answer
             arm_c = self.pop()
             self.scopes.pop()
-            self.emit(CDef(list(bindings.items()), arm_c))
+            defined = CDef(list(bindings.items()), arm_c)
+            self.emit(self.opened(openings, defined, arm.span) if openings
+                      else defined)
             result = self.join(result, body, arm.span, "the arms of a 'match'")
         return result
 

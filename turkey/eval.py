@@ -110,11 +110,12 @@ class Evaluator:
         self.functions = ["<module initialization>"]
         for name, info in decls.constructors.items():
             mutable = decls.tycons[info.tycon].is_mutable_record
-            if info.arity == 0:
+            if info.runtime_arity == 0:
                 self.globals.define(name, ConValue(name, ()))
             else:
                 self.globals.define(
-                    name, ConstructorFn(name, info.arity, info.field_names, mutable)
+                    name, ConstructorFn(name, info.runtime_arity,
+                                        info.field_names, mutable)
                 )
 
     # -- program ------------------------------------------------------------
@@ -367,6 +368,13 @@ def match_pattern(pat: ast.Pattern, value) -> dict[str, object] | None:
         if value.con != pat.name:
             return None
         out = {}
+        # An existential value carries its dictionaries ahead of its fields.
+        # Layouts are the native backend's business, so every copy of an
+        # opened arm is the same arm here and the first one is taken.
+        carried = len(pat.evidence)
+        for name, item in zip(pat.evidence, args):
+            out[name] = item
+        args = args[carried:]
         for sub, item in zip(pat.args, args):
             inner = match_pattern(sub, item)
             if inner is None:
@@ -383,10 +391,12 @@ def match_pattern(pat: ast.Pattern, value) -> dict[str, object] | None:
                 return None
             names = value.field_names
             args = value.args
-            get = lambda label: args[names.index(label)]  # noqa: E731
+            # An existential record's dictionaries come first.
+            offset = len(pat.evidence)
+            get = lambda label: args[offset + names.index(label)]  # noqa: E731
         else:
             return None
-        out = {}
+        out = dict(zip(pat.evidence, value.args)) if pat.evidence else {}
         for label, sub in pat.fields:
             inner = match_pattern(sub, get(label))
             if inner is None:

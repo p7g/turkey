@@ -1,6 +1,7 @@
 # Error handling
 
-Status: **direction decided; layout and recovery contracts open; nothing built.** The plan is at the end. The
+Status: **direction decided; layout contract selected and prototyped (Python,
+Core down); recovery contract open; nothing built.** The plan is at the end. The
 survey is kept because it is what would otherwise be redone, and because it
 reversed the question this started from.
 
@@ -242,10 +243,12 @@ Every item below is in both `turkey/` and `boot/`.
   keeps its `CTyApp` and dictionary and calls the generic binding -- the exit the
   polymorphic-recursion cap already uses. The devirtualizer must not collapse a
   selection off a pattern-bound dictionary.
-* **`layout`:** an existential field is always stored at the uniform,
-  pointer-shaped representation when its type is a bare hidden variable;
-  construction boxes a scalar. This alone does not settle fields such as
-  `Array s` or `Option s`. See the layout milestone below.
+* **`layout`:** fields are stored at the packed type's own layout, and the
+  packed value records one layout code per hidden variable. `share` copies
+  each opened arm per packed layout key, shares bindings that pack at their
+  own binders, and prunes to the keys reachable packings store. Boxing the bare
+  field was the earlier proposal and does not work even for `SomeError`; see
+  the layout milestone below.
 * **`opt`:** case-of-known-constructor substitutes the type and the dictionary,
   so pack-then-match in one function specializes and devirtualizes fully.
 * **Backends:** dictionaries add traced pointer fields, but the work for hidden
@@ -272,6 +275,401 @@ payloads through generic code, nested containers, and closures over the hidden
 type, as well as the scalar round trip. Verify optimized and generic paths and
 GC tracing. This milestone determines the representation contract and the
 remaining backend work.
+
+### Why boxing the bare field is not enough, even for `SomeError`
+
+The native backend has no uniform representation to fall back on. A producer
+and a consumer each compute a layout from the static type in front of them and
+must agree: `layout_of` answers from the type, arrays are flat at the element
+layout fixed when they were created (`turkey_array_new` records it in the
+header, but compiled reads never consult it), closure calls coerce arguments to
+the static parameter layout, and a dictionary's methods are compiled at the
+instance's layout. `layout.share` keeps generic bodies honest by making one
+copy per layout *of a type argument at a call site*, and `check_layouts`
+refuses a transparent lambda parameter nothing gave a layout.
+
+An arm opening `Packed(xs)` defeats both. The hidden variable is never a type
+argument, so sharing has nothing to key on; `xs` is a pattern binder, not a
+lambda parameter, so the check never sees it; and a read falls back to `BOXED`
+against an array of `i64`. Nor does the minimal `SomeError[Error e](e)` escape:
+boxing the field stores `e` safely, but `message` from an `Error Int` instance
+takes an `i64`, and the arm holding the box calls it.
+
+The same producer/consumer disagreement already exists without existentials.
+A generic `fun mk(x : a, n : Int) -> Box a` left past the specialization cap
+writes a boxed pointer into a field that a ground `Box Int` reader loads as an
+integer, and prints `32067093649` for `42`. It is pinned as a strict xfail in
+`tests/test_layout.py` (NATIVE-BACKEND.md, "A hole to close first").
+
+### Survey: representation-polymorphic code in peers
+
+The question each peer answers is what code that does not statically know a
+value's representation does with one.
+
+| Peer | What they built | Measured / budget | Lesson for Turkey |
+|---|---|---|---|
+| .NET CLR (Kennedy & Syme 2001) | JIT-time sharing by representation: "all reference types are compatible", "primitive types are mutually incompatible, even if they have the same size", structs compatible when they "share the same pattern of traced pointers". Shared code receives precomputed dictionaries of type handles. | Stack benchmark, seconds, object-based / shared-polymorphic / hand-specialized: `int` 8.5 / 1.8 / 2.0, `double` 10.4 / 2.0 / 2.0, `Point` 10.5 / 4.3 / 4.3. Creating `List<T>` in shared code: specialized 4.2, runtime type lookup **288**, lazily filled dictionary 4.9. | Layout-keyed sharing is `layout.share` already, and it costs nothing against specialization. The expensive thing is *computing* representation information at the use; precomputing it where the type is known is the whole difference. |
+| Go 1.18 (GC-shape stenciling) | One body per GC shape ("same underlying type or they are both pointer types"), plus a dictionary of type descriptors, sub-dictionaries and itabs for everything shape does not settle. | Compile time "roughly 15% slower" in 1.18, recovered by 1.20. No published runtime numbers in the design; PlanetScale's 2022 analysis reports method calls through a type parameter as a double indirection, slower than an interface call. | Same split as the dispatch contract below: shape picks the code, a dictionary carries the rest. Go's cost is method calls through the dictionary; Turkey's devirtualizer already removes those whenever the dictionary is ground. |
+| Swift | Unspecialized generic code receives type metadata; a value witness table gives size, alignment, copy, destroy, and code does `alloca(T->vwt->size)`. Existential containers are a three-word inline buffer plus metadata and witness tables; specialization is an optimization, not the model. | Budget is separate compilation and a stable ABI across library versions; specialization "can only [happen] if the definition … is visible in the current Module". | Fully dynamic layout is what a language pays when it cannot see the whole program. Turkey is whole-program and already refuses unknown layouts, so it would buy Swift's cost without Swift's constraint. |
+| GHC | Existential variables must be of lifted (boxed) kind; levity polymorphism forbids binders and arguments whose representation is unknown, because "the code generator needs to know the runtime representation of every bound variable". | Uniform boxed representation for anything polymorphic. | Sidesteps the question by never unboxing a polymorphic value. Turkey unboxes `Array Int` and closure arguments by layout, so the sidestep is not available without undoing FINDINGS 77/78. |
+| OCaml | Uniform representation with one dynamic exception: `float array` is flat, and polymorphic array code tests the header tag (254) on every access. | LexiFi: a runtime cost and code size that "greatly increases"; no numbers. The exception forces every type to be *separable*, which is why OCaml rejects unboxed existentials; OxCaml (OCaml 2025) added a separability axis to the type system to recover them. | The closest analogue of reading `array->tag` at runtime. One dynamic layout case cost a type-system restriction on exactly the feature being built here. |
+| Rust `dyn Trait` | A trait object is a data pointer plus a vtable of the concrete type's methods; generic methods and by-value `Self` methods are not callable through it. | Full monomorphization elsewhere. | The hidden type is reachable only through code compiled at the concrete type. Turkey's arms can index an `Array a` directly, which a vtable-only design would have to forbid. |
+
+### Contracts considered
+
+1. **Layout evidence plus dispatch to layout-keyed copies.** Packing stores a
+   layout code for each hidden variable next to the dictionaries. Opening
+   lifts the arm into a binding abstracted over the hidden variable and
+   switches on the stored code, calling the copy `layout.share` would build for
+   that layout. Inside each copy the variable has a concrete layout, so arrays,
+   closures, dictionary methods and nested containers take existing paths, and
+   nothing is copied, so aliasing holds. Whole-program compilation bounds the
+   switch to the layouts actually packed. Cost: code size, one arm copy per
+   reachable layout per hidden variable. This is .NET's and Go's split with the
+   dictionary filled at the pack site, which is where .NET measured 4.9 against
+   288.
+2. **Dynamic layout in generic code.** Swift's model: operations read the
+   layout at runtime. Touches every backend operation on both native backends,
+   slows code that never uses an existential, and OCaml's single dynamic case
+   shows the restriction it can force.
+3. **Uniform representation at the packing boundary.** Convert `Array Int` to
+   an array of boxes and wrap closures when packing. Breaks aliasing: a
+   mutation through the opened array is invisible to the original. Rejected
+   unless the prototype finds a reason to revisit.
+
+### Result: contract 1, prototyped
+
+**Selected: layout evidence plus dispatch to layout-keyed copies.** A
+Python-only prototype passes every acceptance case above on the native
+backend, the Python backend and the evaluator, at the default specialization
+cap and at zero, with and without `TURKEY_GC_STRESS`
+(`tests/test_existential_layout.py`). There is no syntax or inference yet:
+each program is an ordinary source file for the helpers plus hand-built Core for
+the pack and open sites, which is the elaboration step 2's front end has to
+produce.
+
+What the prototype is:
+
+* **Representation.** A packed object is one `i64` layout code per hidden
+  variable, then the carried dictionaries, then the declared fields. Codes
+  are the collector's 3-bit layout codes. `ConInfo` gains `exists` and
+  `context`, and its scheme is `forall params exists. fun(dicts..., fields...)
+  -> T`; the evaluators see the dictionaries as leading arguments and no codes.
+* **Opening.** `ast.PCon` carries the arm's `evidence` names, its `skolems`,
+  and, after sharing, the `layouts` that copy was made for (the prototype's
+  stand-in for `CAlt`'s evidence list). `layout.share` copies each opened arm
+  once per layout key and rewrites the copy's body with the skolem's layout
+  known, keyed `-uid` in `abstracted`, so calls at the skolem find `f@[i64]`
+  like any other layout-keyed call. The backend takes a copy when the stored
+  codes match its key.
+* **Refusal instead of guessing.** `layout_of` answers "unknown" for a skolem
+  with no layout, `held_at` then refuses, and `check_layouts` refuses an
+  existential arm that reached the backend uncopied.
+
+Test coverage: scalar payloads of every layout through a bare-variable generic
+(`pick`) and repacked at the skolem; arrays of `Int`, `Bool`, `Float`, `String`,
+`Byte` and `Char` through generic helpers; `Array (Option a)` and
+`Array (Array a)`; a closure `fun(a) -> a` whose results are written back into
+the flat array; a carried `Show` dictionary called on elements (the
+`SomeError`-at-`Int` case); aliasing through two packings of one array; packing
+in a generic body past the cap, both through `Array a` and through a bare `a`
+with a dictionary; and escape of a skolem from its arm, refused in Core.
+
+Each safety property was checked by breaking it. With dispatch removed the
+compiler refuses the program. With every packing storing "boxed" the output is
+wrong (`0.0`, `60`, a stray code point). With `layout._packs` removed the
+bare-variable generic packing prints wrong values.
+
+What it found:
+
+1. **An unknown layout must not fall back to `ptr`.** The first version answered
+   `ptr` for a skolem with no layout, like every other `TCon`. With dispatch
+   disabled the `Int`, `Bool`, `Float` and `String` tests still passed:
+   `i64`, `i1` and `ptr` are all 8-byte words, and the wrong name read the right
+   bits. Only `Byte` (1 byte) and `Char` (4 bytes) payloads could have
+   noticed. The fix is the refusal above, and the tests keep narrow payloads.
+2. **A body that packs needs its layouts as much as one that destructures.**
+   `packOne[a](d, x : a)` is not transparent, so `layout.share` left it generic
+   past the cap. It held `x` boxed and stored "boxed", and the opened copy then
+   called an `i64` method with a box. `layout._packs` adds such bindings to the
+   shared set. It is the existential form of NATIVE-BACKEND.md's `mk : a -> Box
+   a` hole, and the general form is now closed by the same rule extended to
+   every construction (`layout._constructs`, in both implementations).
+3. **Copies multiply under inlining.** In the `packed_arrays` program, measured
+   in backend IR instructions, the cost of one layout is about 1,400
+   instructions. Copying for all 8 layouts gives 11,767. Copying only for keys
+   some reachable packing stores gives 8,919 (6 layouts; `layout._packed_layouts`
+   counts a packing inside an arm copy only if that copy's own key is packed).
+   The same program written as a generic function, with no existential, is
+   3,759 fully specialized or 3,257 at cap zero. Almost all of the difference is
+   `main` (8,726 against 1,520): `opt` inlined the opener at six call sites, and
+   each inlined `match` kept every copy, because case-of-known-constructor is
+   disabled for existential patterns in the prototype. Step 2's `opt` item
+   (substitute the packed type and dictionary on pack-then-match) is therefore
+   a size requirement, not only a speed one. Without inlining, the dispatch
+   itself costs one load and compare per hidden variable per arm.
+4. **Evaluators need nothing but the evidence names.** Layouts are the native
+   backend's; `pygen` and `eval` take the first matching copy.
+
+Not established by the prototype: nested *existential* openings of two hidden
+variables at once (the product of keys is implemented but untested), recursive
+existential types, and anything in `boot/`.
+
+Sources for this section:
+[Kennedy & Syme, Design and Implementation of Generics for the .NET CLR](https://www.microsoft.com/en-us/research/publication/design-and-implementation-of-generics-for-the-net-common-language-runtime/),
+[Go GC shape stenciling](https://go.googlesource.com/proposal/+/refs/heads/master/design/generics-implementation-gcshape.md),
+[Go 1.18 dictionaries](https://go.googlesource.com/proposal/+/master/design/generics-implementation-dictionaries-go1.18.md),
+[PlanetScale, Generics can make your Go code slower](https://planetscale.com/blog/generics-can-make-your-go-code-slower),
+[Pestov & McCall, Implementing Swift Generics](https://llvm.org/devmtg/2017-10/slides/Pestov-McCall-ImplementingGenerics.pdf),
+[Swift TypeLayout](https://github.com/swiftlang/swift/blob/main/docs/ABI/TypeLayout.rst),
+[Swift OptimizationTips](https://github.com/swiftlang/swift/blob/main/docs/OptimizationTips.rst),
+[Eisenberg & Peyton Jones, Levity Polymorphism](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/11/levity-pldi17.pdf),
+[LexiFi, About unboxed float arrays](https://www.lexifi.com/blog/ocaml/about-unboxed-float-arrays/),
+[Taming the Flat Float Array Optimization (OCaml 2025)](https://conf.researchr.org/details/icfp-splash-2025/ocaml-2025-papers/6/Taming-the-Flat-Float-Array-Optimization-Tracking-Separability-in-the-Type-System),
+[Rust reference, trait objects](https://doc.rust-lang.org/reference/types/trait-object.html).
+
+## Survey: what an error carries, in peers
+
+Step 3 adds two things that look like one: a **trace** saying where an error
+came from, and a **cause chain** saying what it was wrapped in on the way out.
+The peers show these are independent -- Go shipped causes with no traces, Zig
+shipped traces with no causes -- and that the trace is much the more expensive
+half. This section is the evidence for treating them as separate pieces of
+work.
+
+### What capture costs
+
+| Peer | What it captures | When | Measured |
+| --- | --- | --- | --- |
+| Java | Full stack, in `Throwable`'s constructor, via native `fillInStackTrace` | Always, on every exception construction | Throw 937.8 +/- 46.7 ns/op; `getStackTrace()` 10,513 +/- 213 ns/op (JMH, JDK 10.0.1) |
+| Rust | Frames, via `Backtrace::capture` | Only if `RUST_BACKTRACE`/`RUST_LIB_BACKTRACE` is set; otherwise a documented no-op | Not quantified; "can be both memory intensive and slow" |
+| Go | `Frame` in `errors.New`/`fmt.Errorf` -- *proposed* | At construction | "We benchmarked the slowdown from fetching stack information and felt that it was tolerable" |
+| Zig | Error *return* trace: instruction pointers in a fixed circular buffer, 31 frames / 256 bytes on 64-bit | At each `return error`, no unwinding | Proposal: "2 math operations plus some memory reads and writes" |
+| Swift | Nothing | -- | -- |
+| GHC >= 9.10 | Backtrace into `ExceptionContext` at `throw`, from any of four mechanisms | At throw, per enabled mechanism, opt-out via `backtraceDesired` | Not quantified |
+
+Three numbers matter here.
+
+**The expensive half is not the walk, it is the conversion.** Balosin's
+benchmark separates them: recording the stack is comparatively cheap, and
+"not filling the stack trace itself takes the majority amount of time, but
+converting it to a Java representation". That is exactly the step this design
+needs -- `capture_panic_trace` already walks a linked list of `PanicSite`
+pointers in about as little work as Zig's, and what step 3 adds on top is
+materializing it as a *Turkey* value on the GC heap. The Java figure says the
+materialization, not the walk, is what to budget for and what to defer.
+
+**Rust's gate is the cheap way to have it both ways.** `Backtrace::capture`
+is written unconditionally at every call site and is "a noop if the
+`RUST_BACKTRACE` or `RUST_LIB_BACKTRACE` backtrace variables are both not
+set", precisely "so these environment variables allow liberally using
+`Backtrace::capture` and only incurring a slowdown when the environment
+variables are set". A library can therefore capture on every error without
+imposing a cost on programs that never print one.
+
+(A secondary source claims `anyhow` defers capture until the backtrace is
+read. The primary documentation does not say so, and nothing here relies on
+it.)
+
+**The strongest counterexample is Go, which measured capture as affordable
+and shipped without it anyway.** The Go 2 error-values proposal put a `Frame`
+in `errors.New` and `fmt.Errorf` and judged the cost "unlikely to affect
+practical programs" -- and then Go 1.13 took `Unwrap`, `Is`, `As` and `%w`
+from `xerrors` and left the `Frame` behind, with "at present there are no
+plans to include any of them". A peer that benchmarked the feature as cheap
+still declined to make it standard. The reason is not cost, it is that a
+trace in every error is a commitment about what errors *are*; Go kept errors
+as plain values.
+
+### Cause chains
+
+| Peer | Mechanism | Opt-in? | Two chains? |
+| --- | --- | --- | --- |
+| Go | `Unwrap() error`, walked by `errors.Is`/`errors.As`; `%w` wraps | Yes, per call site | No |
+| Python | `__cause__` (`raise X from Y`) and `__context__` (implicit) | `__cause__` explicit, `__context__` automatic | Yes |
+| Java/.NET | `getCause`/`initCause`, `InnerException` | Explicit | No |
+| GHC >= 9.10 | `ExceptionContext` annotations; `WhileHandling` added by `catch` | Annotations explicit, `WhileHandling` automatic | Yes |
+
+**Wrapping is an API commitment, not a convenience.** Go's rule is stated
+flatly: "Wrap an error to expose it to callers. Do not wrap an error when
+doing so would expose implementation details", and `Opaque` exists to add
+context *without* exposing the cause. The proposal names the hazard directly:
+"indiscriminate wrapping can expose implementation details, introducing
+undesired coupling between packages". So `promote`-style context should not
+make the inner error part of the outer API by default.
+
+**Two chains exist because two different things happen.** PEP 3134 kept both
+because "to handle the unexpected raising of a secondary exception, the
+exception must be retained implicitly. To support intentional translation of
+an exception, there must be a way to chain exceptions explicitly." GHC
+reached the same split independently, adding `WhileHandling` when a handler
+itself throws. **This distinction does not apply to Turkey.** Turkey has no
+handler that can fail while handling: `?` propagates a `Left` by returning
+it, and there is no dynamic handler frame in which a second error can arise.
+Turkey therefore needs only the explicit chain -- Python's `__cause__`, Go's
+`%w` -- and should not build the implicit one.
+
+**The warning is that context attached to a wrapper gets lost.** Well-Typed's
+2026 retrospective on GHC's annotations reports that "if an exception with
+annotations is _ever_ caught and rethrown anywhere ... those annotations will
+be lost", because `toException` for `SomeException` clears the context; it
+catches `bracket` and `onException`, and 9.10 also shipped a bug that
+duplicated the context into a nested `SomeException`. The mechanism was
+approved, implemented and still lost data in ordinary use two releases later.
+The lesson for contract 1 is specific: a cause or trace must live where
+re-packing cannot drop it, and `SomeError -> SomeError` context must be
+*defined* as preserving the inner value rather than repacking it.
+
+### The alternative nobody would reach from inside Turkey
+
+GHC's `HasCallStack` is **not a stack walk at all**. It is
+`?callStack :: CallStack`, an implicit-parameter constraint that the compiler
+solves by threading a value through calls: a call site in a function that has
+the constraint appends itself, and one that lacks it starts a fresh
+singleton. Its documented advantage is exactly the one Turkey wants --
+"CallStacks do not interact with the RTS and do not require compilation with
+`-prof`" -- and its documented limitation is that only annotated functions
+appear, so an un-annotated caller breaks the chain.
+
+This matters because **Turkey is a dictionary-passing language with a
+constraint solver already doing this shape of work**. A `HasStack`-style
+predicate solved by the elaborator would put the call site into the packing
+function as an ordinary argument, needing no runtime frame machinery, no C
+runtime change, and no per-backend agreement -- the three things that make
+the capture route expensive here. It buys a shallower trace than a real walk.
+GHC ships both, and ranks `HasCallStack` first among its four mechanisms.
+
+### Threading the call site instead of walking the stack
+
+The chosen direction for step 4, surveyed but **not implemented**: no
+`HasStack` exists in either compiler, and nothing below is code. Two defaults
+were picked while surveying and are worth revisiting rather than inheriting:
+GHC's rule 2, which infers the constraint for an unsignatured definition, is
+skipped in favour of requiring the declaration; and `fail` keeps its current
+type, with a traced sibling rather than a stack on every packed error.
+
+Four peers pass the caller's location *into*
+the callee rather than recovering it from the machine stack, and they differ in
+what carries it.
+
+| Peer | Carrier | How far it reaches | Opt-in |
+| --- | --- | --- | --- |
+| GHC | `HasCallStack`, an implicit-parameter constraint | A chain, through every annotated function | Constraint in the signature |
+| Rust | `#[track_caller]`, a MIR-level shim | Propagates callee-to-callee, but one `Location` | Attribute on the function |
+| C# | Compiler-filled *optional arguments* | The immediate caller only | Attribute on the parameter |
+| Swift | `#file`/`#line` as default arguments | The immediate caller only | Default argument |
+
+**GHC is the only one that accumulates a chain**, and its rules are the design
+being copied. A `HasCallStack` wanted is solved in three ways: with a
+`CallStack` already in scope, "GHC will append the new call-site to the
+existing `CallStack`"; with none and no explicit signature, it "will infer a
+`HasCallStack` constraint for the enclosing definition"; with none and an
+explicit signature, it "will solve the `HasCallStack` constraint for the
+singleton `CallStack` containing just the current call-site". The third rule is
+what stops the chain, and it is not optional -- without it the constraint has
+nowhere to terminate.
+
+**Rust chose this route by explicitly rejecting the other one.** RFC 2091
+rejects backtraces because "the stack backtrace is not suitable as the only
+solution for systems languages like Rust because optimization often collapses
+multiple levels of function calls. In some embedded systems, the backtrace may
+even be unavailable!" That argument transfers directly: Turkey's existing panic
+traces already omit inlined frames on purpose, and `boot`'s native backend
+emits no frames at all.
+
+The costs the peers report are worth having in advance. Rust's is code size:
+"the number of instructions per `unwrap()`/`expect()` will increase", because
+call sites that previously shared one panic branch now each carry their own
+location. Rust also cannot apply it through function pointers or trait objects
+-- "no inlining will occur, and thus it cannot take the location of the
+caller" -- which is the same hole Turkey would have at a closure call or a
+class method. C#'s limitation is different and worth noting because it is a
+*correctness* one: the caller may pass the argument explicitly "to control the
+caller information or to hide caller information", so the location is a
+default, not a guarantee.
+
+And GHC's own documentation concedes the encoding is not load-bearing:
+`HasCallStack` "is just an alias for an implicit parameter `?callStack ::
+CallStack`. This is an implementation detail and **should not** be considered
+part of the `CallStack` API". So the shape to copy is the three rules, not the
+implicit parameter.
+
+**What this costs in Turkey, concretely.** A predicate with no type argument
+does not currently exist, and the machinery assumes one everywhere:
+
+* `parse_context` requires "a class applied to one type".
+* `ClassInfo` holds a single `param`, so a class is unary by construction.
+* `Solver._class` reads `c.pred.args[0]` before doing anything else; there are
+  119 `args[0]` sites across eleven modules in `turkey/` alone.
+* Worse than a crash, the silent case: `retained` keeps a predicate whose level
+  exceeds the binder's, and `Types.predLevel` is the minimum level over the
+  predicate's *variables*. A predicate with none takes the `ground` sentinel
+  and is therefore always retained -- and then `_let` drops it, because
+  `shared` keeps only class predicates and the per-name `own` keeps only
+  predicates that mention the type being generalized. A nullary predicate would
+  disappear between the two.
+
+So `HasStack` cannot be an ordinary class. It has to be a bespoke predicate
+discharged by its own rule, which is a road the solver already has: `HasField`
+is "discharged by a declaration lookup" and `OneOf` "by a decision", both
+intercepted before `_class` ever indexes an argument. `HasStack` is a third,
+and the one difference that matters is that the other two are *erased* while
+this one must leave a value behind. That needs a new `Evidence` variant
+alongside `FromDict`/`FromInstance`/`Absent`, lowered to a literal rather than
+to a dictionary lookup, and `CLet` already carries the `skolems` and `rigid`
+that say whether a binding was signature-checked -- which is exactly what
+GHC's third rule keys on.
+
+**One consequence to decide deliberately.** A threaded stack is built during
+elaboration, from source spans, *before* `opt` runs. The existing panic trace
+is built from frames that survive optimization, and `test_pygen` pins that it
+"does not invent inlined frames". The two would therefore disagree on the same
+program: a function inlined away is absent from a panic trace and present in a
+threaded one. Neither is wrong, but they are different claims, and a test
+should pin the difference rather than let it be discovered.
+
+### Why capture is expensive *here* specifically
+
+The four backends do not agree on what a stack is, and the differential
+oracle does not reach any of them:
+
+* **The evaluator** keeps a live stack of function *names* (`self.functions`)
+  and no spans; a frame's position comes from the call expression at unwind
+  time.
+* **`pygen`** keeps no live stack at all. Its `turkey_name` is a compile-time
+  constant per generated function and frames are attached to a `TurkeyPanic`
+  as it propagates. Capture at an arbitrary point has nothing to read.
+* **`llvmgen`** registers a panic frame only across `_frame_region` -- the
+  blocks that can panic, plus cycles through them -- and a cold check
+  registers one *in its own failure block*. `test_llvmgen` pins the hot path
+  as frame-free. So at an arbitrary point the ancestor chain is deliberately
+  incomplete.
+* **boot's native backend emits no panic frames at all**: `turkey_frame_enter`
+  appears nowhere in `boot/`.
+
+And `test_boot` diffs stages through `opt`, "the last stage before a
+backend". Everything below it is outside the oracle -- the FINDINGS 43 shape,
+where a change applied to one side only has no test that notices.
+
+A `captureStack()` that must see a complete stack therefore either forces
+frame registration onto the hot paths `llvmgen` just cleared, or returns a
+different answer per backend. The one cheap reconciliation is to treat a
+capture call as a frame reader, exactly as a panic site is: it joins
+`panic_present`, the existing region analysis puts the frame where it is
+needed, and nothing changes on paths that never capture. That is a small
+change in `llvmgen` and a new one in boot, which has no such analysis yet.
+
+**Sources.**
+[Go 1.13 errors](https://go.dev/blog/go1.13-errors),
+[Go 2 error inspection proposal](https://go.googlesource.com/proposal/+/master/design/29934-error-values.md),
+[PEP 3134](https://peps.python.org/pep-3134/),
+[Balosin, stack trace versus exception](https://ionutbalosin.com/2018/06/getting-the-stack-trace-versus-throwing-an-exception-what-is-common-and-what-is-different/),
+[Rust `std::backtrace::Backtrace`](https://doc.rust-lang.org/std/backtrace/struct.Backtrace.html),
+[Zig issue 651, stack traces for errors](https://github.com/ziglang/zig/issues/651),
+[GHC proposal 0330, exception backtraces](https://github.com/ghc-proposals/ghc-proposals/blob/master/proposals/0330-exception-backtraces.rst),
+[Well-Typed, Exception annotations: lay of the land](https://well-typed.com/blog/2026/05/lay-annotation-land/),
+[GHC.Stack](https://hackage.haskell.org/package/base/docs/GHC-Stack.html),
+[Swift error handling rationale](https://apple-swift.readthedocs.io/en/latest/ErrorHandlingRationale.html).
 
 ## Stack traces
 
@@ -409,27 +807,106 @@ would reopen this is a FINDINGS entry where a type-indexed structure is wanted.
 
 ## Plan
 
-1. **Resolve existential layouts.** Prove the nested-container and closure
-   cases above, selecting a representation/evidence contract before estimating
-   the full implementation. Scalar boxing alone is not acceptance.
-2. **Existential constructors.** A SPEC-DELTAS entry, then the implementation
-   list above on both sides, with goldens regenerated for `CAlt`'s evidence.
-   Tests: escape rejected (including through enclosing variables), `let` pattern
-   rejected, `~` rejected, independent openings remain distinct, pack-then-match
-   specializes, and the agreed nested-layout cases pass through generic code.
-3. **`Error`, `SomeError`, and stack capture.** Add the standard packing function
-   and independently owned traces. Use `Either SomeError a` for library paths
-   combining heterogeneous failures; retain concrete sums where exhaustive
-   recovery is useful. Verify propagation preserves the original trace and
-   optimized capture respects its effect and lifetime contract.
-4. **Checked downcasting.** Add solver-derived `Typed` instances and trustworthy
-   type evidence; reject user instances. Implement checked `cast` with the
-   positive and negative cases above, without exposing `unboxAs`.
-5. **Recoverable panics, deferred.** First specify a concrete boundary's state,
+1. **Resolve existential layouts.** *Done as a prototype:* contract 1, see
+   "Result: contract 1, prototyped". What moves to step 2 from it: `ConInfo`'s
+   `exists`/`context`; evidence and layouts on the opened pattern (or `CAlt`);
+   `coretc`'s pattern rule and escape check; `mono._ground` refusing skolems;
+   `layout.open_arms`, `_packs` and `_packed_layouts`; `backend_lower.packed`,
+   `lower_opened` and the skolem case of `layout_of`; evidence binding in
+   `pygen` and `eval`. Every one needs its `boot/` mirror (`Core.gob`,
+   `CoreTc`, `Mono.gob`, `Layout.gob`, `SsaLower.gob`, the evaluator), and
+   `opt`'s pack-then-match rule is required before any real program uses
+   existentials, per finding 3.
+2. **Existential constructors.** *Done*, in both implementations
+   (SPEC-DELTAS 68). Syntax, declarations, inference, elaboration and the
+   Core-down passes; positional and record forms; openings anywhere in a match
+   arm's or a parameter's pattern; the refusals for `let`, `var`, `for`,
+   alternatives, `~`, a hidden variable that is also a parameter, and a type
+   that escapes its arm. `tests/programs/existential_*.gob` and
+   `err_existential_*.gob` are the corpus half, so `test_programs`,
+   `test_llvmgen`, `test_pygen`, `test_native` (with GC stress) and `test_boot`
+   all cover them; `tests/test_existentials.py` is the language half and
+   `tests/test_existential_layout.py` the representation half.
+
+   One item moved. ERRORS.md's `opt` bullet wanted case-of-known-constructor to
+   substitute the packed type through an opened arm. What ships instead is the
+   same win where it was needed: `layout.share` narrows an arm whose scrutinee
+   is a packing written right there to that packing's one key. On a program
+   whose opener is inlined at three call sites that is 207 backend instructions
+   against 369, and the arms drop from 16 to 10. Substituting the type as well
+   would also devirtualize the carried dictionary; it is not done, and `opt`
+   still declines to select an opened arm.
+3. **`Error`, `SomeError`, and causes.** *Library half done*
+   (SPEC-DELTAS 69). `class Error` in `Std.Classes`, and `SomeError`, `fail`,
+   `context`, `causeOf`, `messageOf` and `describe` in `Data.Error`, all
+   re-exported by the Prelude. `Either SomeError a` carries heterogeneous
+   failures and the existing `?` moves them with no conversion at the
+   intermediate frames; concrete sums stay where exhaustive recovery is
+   wanted. Context wraps rather than repacks, so a cause and everything under
+   it survive. `tests/programs/error_channel.gob` is the corpus half and
+   `tests/test_errors.py` the language half.
+
+   **Split, on the survey's evidence.** Capture and causes are independent --
+   Go shipped causes with no traces, Zig traces with no causes -- and capture
+   is much the more expensive half *here*: the evaluator keeps a live stack of
+   names without spans, `pygen` keeps none at all, `llvmgen` registers a panic
+   frame only across the region of blocks that can panic (and `test_llvmgen`
+   pins the hot path as frame-free), and `boot`'s native backend emits no
+   panic frames at all. The differential stops at `opt`, so none of that is
+   covered by the oracle. See "Survey: what an error carries, in peers".
+
+4. **Stack capture.** Not started. A `captureStack()` primitive, an
+   independently owned GC-rooted trace generalizing `capture_panic_trace`, and
+   the four backends made to agree. The cheap reconciliation for `llvmgen` is
+   to let a capture call join `panic_present`, so the existing region analysis
+   puts a frame where it is needed and nothing changes on paths that never
+   capture; `boot` has no such analysis yet. **Open: the capture policy.** The
+   live options are Rust's environment gate (capture written unconditionally,
+   a documented no-op unless a variable is set), a `HasCallStack`-style
+   predicate threaded by the solver -- which needs no runtime frame machinery
+   at all, and which Turkey's dictionary passing is unusually well placed to
+   take -- and always-on. Undecided.
+5. **Checked downcasting.** *Type evidence done; `cast` not started.*
+   `TypeRep` and `Proxy` are in `Data.Typed.Type`, low enough in the graph for
+   `Std.Classes` to declare `class Typed a` over them -- which it has to be,
+   since `class Error e : Typed e` puts `Typed` above `Error`, and
+   `Data.Array` imports `Std.Classes` (FINDINGS 31 -- no module cycles). That
+   is why a rep's arguments are a `Prim.Array` rather than the library one.
+
+   Instances are derived on demand, one per type constructor, through the same
+   `by_inst` path that manufactures `%HasField` instances, and the dictionary
+   is written in Core beside `accessors` for the same reason: `typeRep` answers
+   the constructor's qualified name (delta 43), which no Turkey expression can
+   ask for. A derived instance's head is general -- `Box a`, not `Box Int` --
+   so its context is `Typed` over each parameter and the dictionary is a
+   function of its arguments' dictionaries. A program may not write an
+   instance: `_resolve_instance` refuses one, as GHC has refused user
+   `Typeable` since 7.10, because the comparison of reps *is* the check a cast
+   performs and forged evidence has nothing downstream to catch it.
+   `tests/programs/typed_reps.gob` and `tests/test_typed.py` cover it.
+
+   `class Error e : Typed e` is in, so the dictionary an existential packs
+   carries the rep inside it as a superclass field, and an arm that opens a
+   `SomeError` can ask the payload what it is without ever having seen the
+   type. That is `cast` minus the comparison, and it is pinned by a test.
+
+   *Done* (SPEC-DELTAS 70). `cast[Typed a](err : SomeError) -> Option a`
+   compares the reps in ordinary Turkey and converts through `Prim.castAs`
+   only when they agree -- the predicate-plus-total-primitive split of
+   PRIMITIVES.md 7.2. A legitimate cast is the identity, because equal reps
+   mean equal layouts, and both backends require that and trap otherwise.
+   `tests/programs/cast_payload.gob` and `tests/test_errors.py` cover it.
+
+   Two questions this answered. A signature's variables *do* scope into the
+   body, so `let want : Proxy a = Proxy` works and SPEC-DELTAS 13 was not an
+   obstacle. And `cast` inspects the outermost payload only; the cause chain
+   stays reachable through `causeOf`, so searching it as Go's `errors.As` does
+   remains additive.
+6. **Recoverable panics, deferred.** First specify a concrete boundary's state,
    cleanup, nesting, and fatal-failure contract. Then implement a rooted heap
    payload and recovery using the flag. Clearing the flag alone is not task
    isolation. Open: whether `panic` should also accept a `SomeError`.
-6. **Collect evidence throughout.** Fallible closures that force
+7. **Collect evidence throughout.** Fallible closures that force
    `traverse`-shaped duplicates go in FINDINGS. Revisit option C if they form a
    pattern.
 

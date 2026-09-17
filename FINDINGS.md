@@ -2347,7 +2347,34 @@ bootstrap compiler reading itself. It was found late because the new syntax
 was checked by compiling `boot` with Python, which is exactly the half of the
 comparison that could not fail.
 
-### 87. The selection ratchet was green while `boot` stopped at `Prim.floatBits`
+### 87. The existential layout prototype is one-sided, and a word hid a bug
+**design, open.** ERRORS.md step 1. The layout contract for existential
+constructors was prototyped in `turkey/` alone, under
+`tests/test_existential_layout.py`, and deliberately kept out of
+`tests/programs`: `test_boot` would diff a stage `boot/` has no rule for. This
+is FINDINGS 43's failure mode by construction. The differential says nothing
+about any of it until step 2 ports it. Every prototype change is marked
+`PROTOTYPE` in the source so the port can find them.
+
+The papercut came while writing the tests. The first opening lowered a skolem
+with no layout as `ptr`, the answer `layout_of` gives every declared type, and
+the `Int`, `Bool`, `Float` and `String` payload tests passed with dispatch
+switched off. An `i64`, an `i1` and a pointer are all one 8-byte word, so a read
+under the wrong name returned the right bits, and a closure call passed them
+through. It took `Byte` and `Char` arrays, one and four bytes wide, to make a
+wrong layout read a wrong *number* of bytes. The lesson is FINDINGS 53's again
+from the other side: "I do not know" has to be its own answer. Here the
+fallback was not `BOXED` but `ptr`, and it hid more.
+
+**Closed.** Step 2 ported every part of it to `boot` and moved the programs into
+`tests/programs`, so the differential covers existentials at every stage:
+tokens, ast, desugar, decls, classes, types, core, mono and opt are
+byte-identical on them, and `test_native` runs them compiled by `boot`. The
+`PROTOTYPE` markers are gone. What the port did *not* inherit is the Core-level
+harness's reach: `tests/test_existential_layout.py` still builds Core by hand to
+reach the capped and mutant cases no source program produces.
+
+### 91. The selection ratchet was green while `boot` stopped at `Prim.floatBits`
 **bug, fixed.** M28. `tests/test_select.py` asserts that every corpus function
 either selects to arm64 or stops for a known reason, and the only known reason
 was stack arguments. It passed. `boot asm boot/Main.gob` meanwhile reported
@@ -2374,7 +2401,7 @@ asks. `Prim.floatFitsInt` was the last primitive with an LLVM rule and no
 arm64 one, found by listing both tables side by side, which is the check to
 repeat before calling selection complete.
 
-### 88. The allocator added stack-argument calls to the compiler it allocates
+### 92. The allocator added stack-argument calls to the compiler it allocates
 **bug, fixed.** M28. Spilling took `boot`'s colouring stops from 249 to 0 and
 its stack-argument stops from 21 to 24. The spiller's `place` took ten
 parameters, and two checker helpers took eight -- which looks like it fits in
@@ -2396,7 +2423,7 @@ definition -- and the spill loop would have gone round forever on `boot`'s
 88-value module initializer. Failures are now told apart: a forbidden register
 spills the failing value, a full file evicts the holder used furthest ahead.
 
-### 89. The suite ran `boot` interpreted, the thing its own harness forbids
+### 93. The suite ran `boot` interpreted, the thing its own harness forbids
 **bug, fixed.** `pytest -n auto --durations` on a 16-core machine: 15:09 of wall
 time at 2.3 cores. The slowest item was `test_boot`'s types milestone -- 233
 seconds of fixture setup and 203 of call -- and the fixture ran
@@ -2429,7 +2456,7 @@ runtime object, the compiled binary for types, and cache-key tests on copies.
 of `boot/Main.gob`'s, so a fully cold run lands between the two. `pytest` is now
 parallel by default.
 
-### 90. Two correct rules that together tripled the reloads
+### 94. Two correct rules that together tripled the reloads
 **design, fixed.** M28. Frame tables need every root live across a safepoint to
 be in its slot at the call, so selection stores each one there first. Spilling
 stores a value into its slot once, at its definition, and reloads it before
@@ -2445,7 +2472,7 @@ line, added one slice earlier as "the number splitting would be measured
 against" -- a cost metric doing a correctness metric's job, which is the
 argument for printing costs before anyone asks what they are for.
 
-### 91. The assembler is an oracle for syntax, and says nothing about meaning
+### 95. The assembler is an oracle for syntax, and says nothing about meaning
 **bug, fixed.** M28 phase 5. The first emitter's parallel copy -- the moves a
 jump's arguments become on the way into a block's parameters -- broke a cycle
 by parking *every* remaining source in the scratch register instead of one:
@@ -2474,7 +2501,7 @@ The same reading pass found the other half: `mov x0, x0` printed wherever a
 hint had been taken, which is the calling convention being satisfied by doing
 nothing. Those are dropped now.
 
-### 92. The corpus passed without a collector that could see a single root
+### 96. The corpus passed without a collector that could see a single root
 **bug, fixed.** M28 phase 5b. The arm64 backend emitted its module data and its
 entry sequence, and all 44 corpus programs compiled, linked and printed exactly
 what the reference implementation prints. The frame tables were not emitted at
@@ -2493,7 +2520,7 @@ in use. So the ordinary differential run is an oracle for the code and *not*
 for the root machinery, and the two look identical from the outside -- 44 of 44
 either way.
 
-This is FINDINGS 91 one level up. There the assembler accepted a parallel copy
+This is FINDINGS 95 one level up. There the assembler accepted a parallel copy
 that lost half its values; here execution itself accepted a program whose GC
 metadata was entirely absent. Each new oracle is complete for what it checks
 and silent about the next thing, and the way to find out which is which is to
@@ -2511,6 +2538,60 @@ happens to keep at those offsets: "arm64 frame 0 is not a heap pointer", on
 nearly every program.
 
 ## Library, still wanted
+
+### 88. A new library module could not add two strings
+
+**library, fixed diagnostics.** ERRORS.md step 3, writing `lib/Data/Error.gob`.
+The module imported what it used -- `Std.Classes` for the classes,
+`Data.Option.Type` for `Option` -- and then `message(p) + ": " + describe(inner)`
+failed with `no instance for 'Add String'`. The instance exists, in
+`Data.String`; what was missing was the *edge*. An instance is only in scope
+when its module is in the graph, so a module that wants `+` on a `String`
+without naming anything from `Data.String` still has to write
+`import Data.String ()` (delta 56). `Data.Map` already does exactly that, which
+is the tell that this is a step everyone rediscovers.
+
+The message names the class and not the fix. It is right that an instance-only
+dependency is explicit -- that is what keeps the shipped modules under the
+Prelude acyclic -- but "no instance for `Add String`" is what you see when the
+instance is two lines away in a module you did not import, and it reads like
+the instance does not exist. Worth an enrichment: when a wanted predicate has
+an instance in a module that is not a dependency, say which module.
+
+The second papercut was a lie rather than a gap. Reading `.payload` off a
+`SomeError` is refused, which is right -- the field's type is the hidden one
+and there is no type at which to read it -- but the refusal said `SomeError`
+"is not a single-variant record type". It is one. `record_fields` answers
+`None` for an existential record because it is not a *mutable* record, and the
+message downstream had only that one bit to go on, so it reported the wrong
+reason with complete confidence. Both implementations now ask
+`existential_fields` first and name the real cause. The general shape is
+FINDINGS 53's again: a predicate that answers "no" for two different reasons
+will eventually be asked which one.
+
+### 90. A branch the type check rules out still has to be compiled
+
+**backend, fixed.** ERRORS.md step 5. `cast` compares two type reps and
+converts only when they are equal, so the conversion runs only on values whose
+type is the one asked for. The backend does not get to know that. Contract 1
+copies an opened arm per *packed* layout, so the copy where the payload is an
+`i64` is compiled with the result type the caller asked for -- and for
+`cast[ParseError]` that is a pointer. LLVM refused: "cannot convert i64 to
+ptr", on a branch that cannot run.
+
+Three answers were available and only one is honest. Emitting an undef would
+compile; it also hides the case where the reasoning is wrong. Widening
+`coerce` to box the scalar would compile *and* run, reading a pointer out of an
+integer if a rep ever compared equal when the types differed. What ships is a
+trap: the branch is emitted as a panic naming what happened, so the impossible
+case stays impossible and says so if it is not.
+
+The second half is that the two implementations disagreed about it silently.
+Python's `coerce` refuses `i64 -> ptr`; boot's *boxes*, which would have
+compiled the ruled-out combination on one side and trapped on the other, with
+no test to notice -- the differential stops at `opt`, and neither backend is
+under it (FINDINGS 43 again). Both now keep to one rule that needs no
+`coerce` at all: a legitimate cast is the identity, and anything else traps.
 
 ### 13. `Option.isSome` existed and was reimplemented anyway
 **library, discoverability.** M20. `Turkey.Parser` grew its own `isSome` because

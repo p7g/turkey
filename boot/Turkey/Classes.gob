@@ -72,8 +72,9 @@ import Turkey.Ast
 -- written as is `Ast.Pred`.
 import Turkey.Ast as Ast
 import Turkey.Decls as Decls
-import Turkey.Decls (DeclTable(..), FamilyInfo(..))
+import Turkey.Decls (DeclTable(..), FamilyInfo(..), ConInfo(..))
 import Turkey.Diag as Diag
+import Turkey.Prelude as P
 import Turkey.Source as Source
 import Turkey.Source (Span)
 import Turkey.Types as Ty
@@ -320,12 +321,41 @@ fun registerAll(t : ClassTable, classes : Array ClassDecl,
             for v in m.scheme.quantified { discard(Ty.defaultKind(v.kind)) }
         }
     }
+    checkConstructorContexts(t)
 
     let registered = Array.map(instances, fun(d) = resolveInstance(t, d, owner))
     -- Coverage is checked only once every instance is in the table, since
     -- `instance Monoid (Array a)` is entitled to be satisfied by a
     -- `Semigroup (Array a)` written further down the file.
     for inst in registered { checkInstance(t, inst) }
+}
+
+-- The class half of an existential constructor's bracket. The declaration
+-- table builds the predicates before any class is registered, so it cannot know
+-- whether `Error` names one or what kind its variable has; this is the check
+-- `resolveContext` makes for a `fun`, made once the classes exist
+-- (SPEC-DELTAS 68).
+fun checkConstructorContexts(t : ClassTable) -> Unit {
+    for (con, written) in t.decls.uncheckedContexts {
+        var i = 0
+        while i < len(con.scheme.preds) && i < len(written.context) {
+            let p = con.scheme.preds[i]
+            let source = written.context[i]
+            let info = match Map.get(t.classes, p.name) {
+                Some(found) -> found
+                None -> oops("unknown class '" + p.name + "'", Some(source.span))
+            }
+            let arg = p.args[0]
+            if !Ty.unifyKinds(Ty.kindOf(arg), info.cvar.kind) {
+                oops("'" + Ty.show(arg) + "' has kind "
+                     + Ty.showKind(Ty.kindOf(arg)) + ", but '" + p.name
+                     + "' constrains a type of kind "
+                     + Ty.showKind(info.cvar.kind), Some(source.span))
+            }
+            i = i + 1
+        }
+    }
+    t.decls.uncheckedContexts = Array.new(0)
 }
 
 -- Register a class's families before any signature is read.
@@ -541,6 +571,17 @@ fun resolveInstance(t : ClassTable, d : InstanceDecl, owner : String) -> InstInf
     let info = match Map.get(t.classes, d.cls) {
         Some(i) -> i
         None -> oops("unknown class '" + d.cls + "'", Some(d.span))
+    }
+    if d.cls == P.typedClass {
+        -- The one class a program may name but not instance. `typeRep` is what
+        -- a cast compares, so an instance that lied about a type would make the
+        -- cast return a value of a type it is not -- there is nothing
+        -- downstream that would catch it, because the comparison *is* the
+        -- check. A derived instance cannot lie: the compiler reads the name off
+        -- the type it is deriving for.
+        oops("'Typed' instances are derived by the compiler, and a program may "
+             + "not declare one: its answer is what 'cast' trusts.",
+             Some(d.span))
     }
     let tyvars = Map.new()
     let fresh = fun() = Ty.freshVar(1)
@@ -1171,8 +1212,80 @@ fun bySuper(t : ClassTable, p : Pred) -> Array Pred {
 }
 
 -- The obligations of the instance that covers `p`, or `None` if none does.
+-- The arguments a rep describes. A tuple's are its elements, not a spine:
+-- `spine` answers none for one, which would leave `(Int, String)` describing
+-- itself as a bare `Tuple2` and comparing equal to every other pair.
+fun typedArgs(general : Ty.Type) -> Array Ty.Type = match general {
+    TTuple(elems) -> elems
+    _ -> match Ty.spine(general) {
+        (_, args) -> args
+    }
+}
+
+-- The `Typed` instance for one type constructor, on demand.
+--
+-- Coherent for the same reason `synthesize` is: one instance per constructor,
+-- and the compiler is the only thing that may write one, so nothing overlaps
+-- and nothing can disagree about what a type is called.
+--
+-- The head is the *general* one -- `Map k v`, not `Map String Int` -- so one
+-- instance serves every use, and its context is `Typed` over each parameter.
+-- That is what makes the dictionary a function: the rep of `Map String Int` is
+-- built from the reps its caller passes in, which is the only way a rep can
+-- describe a type the instance never saw.
+fun deriveTyped(t : ClassTable, p : Pred) -> Option InstInfo {
+    let receiver = Ty.prune(p.args[0])
+    let (head, args) = Ty.spine(receiver)
+    let general = match head {
+        TTuple(elems) -> {
+            let fresh_ = Array.new(len(elems))
+            for _ in elems { Array.push(fresh_, Ty.tvar(1)) }
+            TTuple(fresh_)
+        }
+        TCon(c) -> if len(args) == 0 { receiver } else {
+            match Map.get(t.decls.tycons, c.name) {
+                None -> return None
+                Some(info) -> if len(info.variants) == 0 { return None } else {
+                    -- Read off a constructor's own scheme, as `synthesize`
+                    -- reads it, because that is where the parameters live with
+                    -- their kinds already right. A type with no constructor to
+                    -- read has no instance, and says so rather than guessing.
+                    match Ty.prune(info.variants[0].scheme.body) {
+                        TFun(_, ret) -> ret
+                        _ -> return None
+                    }
+                }
+            }
+        }
+        _ -> return None
+    }
+    let key = instHeadKey(general)
+    for inst in instancesOf(t, P.typedClass) {
+        if instHeadKey(inst.head) == key { return Some(inst) }
+    }
+    let context = Array.map(typedArgs(general),
+                            fun(a) = Ty.pred(P.typedClass, [a]))
+    let inst = InstInfo {
+        cls = P.typedClass, head = general, context = context,
+        decl = InstanceDecl {
+            span = generatedSpan(), cls = P.typedClass,
+            head = Type { id = 0, span = generatedSpan(),
+                          kind = TECon(P.typedClass, Array.new(1)) },
+            context = Array.new(1), methods = Array.new(1),
+            families = Array.new(1),
+        },
+        names = Map.new(), families = Map.new(), plan = None, module_ = "",
+    }
+    match Map.get(t.instances, P.typedClass) {
+        Some(found) -> Array.push(found, inst)
+        None -> Map.put(t.instances, P.typedClass, [inst])
+    }
+    Some(inst)
+}
+
 fun byInst(t : ClassTable, p : Pred) -> Option (Array Pred) {
     if isGenerated(p.name) { discard(synthesize(t, p)) }
+    if p.name == P.typedClass { discard(deriveTyped(t, p)) }
     for inst in instancesOf(t, p.name) {
         match match_(inst.head, p.args[0]) {
             Some(mapping) -> return Some(Array.map(inst.context, fun(q) =

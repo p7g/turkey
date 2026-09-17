@@ -1,0 +1,80 @@
+module Data.Error (SomeError(..), fail, context, causeOf, messageOf,
+                   describe, cast)
+
+import Prelude ()
+import Std.Classes
+import Data.Option.Type (Option(..))
+import Data.Typed (TypeRep(..), Proxy(..))
+import Data.String ()
+
+-- The shared recoverable-error channel (ERRORS.md, decision 2). A source packs
+-- its own concrete payload once, with `fail`; every caller in between
+-- propagates the result with `?` and never converts anything. What makes that
+-- possible is the constructor's `[Error e]` bracket: the payload's type is
+-- hidden, and its `Error` dictionary travels with the value, so a caller that
+-- knows nothing about the source can still ask for its message.
+--
+-- `cause` is how context is added without losing an origin. `context` builds a
+-- new error *around* the one it is given rather than repacking it, so the inner
+-- payload and everything below it stay reachable through `causeOf`. GHC's
+-- annotations went the other way -- a rethrow cleared the context and silently
+-- dropped it (Well-Typed, 2026) -- and a field that is only ever written by
+-- `context` cannot lose anything that way.
+type SomeError = SomeError[Error e] { payload : e, cause : Option SomeError }
+
+-- Enter the channel. `Left(fail(ParseError { .. }))` is the shape at a source.
+fun fail[Error e](value : e) -> SomeError =
+    SomeError { payload = value, cause = None }
+
+-- Add context, keeping `inner` as the cause. The new payload is what a reader
+-- sees first; the original is one `causeOf` away and still carries its own.
+fun context[Error e](inner : SomeError, value : e) -> SomeError =
+    SomeError { payload = value, cause = Some(inner) }
+
+-- A packed payload is read by opening it, never by `.field`: the field's type
+-- is the hidden one, so `.payload` has no type to have. These three are the
+-- whole accessible surface, and each opens the value in a `match` arm.
+fun causeOf(s : SomeError) -> Option SomeError = match s {
+    SomeError { payload = _, cause = c } -> c
+}
+
+fun messageOf(s : SomeError) -> String = match s {
+    SomeError { payload = p, cause = _ } -> message(p)
+}
+
+-- The whole chain, outermost first.
+fun describe(s : SomeError) -> String = match s {
+    SomeError { payload = p, cause = c } -> match c {
+        None -> message(p)
+        Some(inner) -> message(p) + ": " + describe(inner)
+    }
+}
+
+instance Show SomeError { fun show(s) = describe(s) }
+
+-- A type named without a value of it, for a payload whose type is hidden.
+fun proxyOf[Typed a](x : a) -> Proxy a = Proxy
+
+-- Recover the concrete payload, if it is the type asked for.
+--
+-- This is the whole reason `Typed` is a superclass of `Error`: opening the
+-- error gives a payload whose type nothing here knows, and the dictionary
+-- packed beside it answers what that type was. Comparing that rep with the
+-- caller's is the check -- there is nothing downstream that would catch a
+-- wrong answer, which is why a program may not write a `Typed` instance.
+--
+-- The conversion runs only on equality, and is the predicate-plus-total
+-- primitive split of PRIMITIVES.md 7.2: `Prim.castAs` is total and unchecked,
+-- and is spellable only from a library module, so no unchecked coercion
+-- reaches ordinary Turkey.
+fun cast[Typed a](err : SomeError) -> Option a {
+    let want : Proxy a = Proxy
+    match err {
+        SomeError { payload = p, cause = _ } ->
+            if typeRep(want) == typeRep(proxyOf(p)) {
+                Some(Prim.castAs(p))
+            } else {
+                None
+            }
+    }
+}

@@ -13,9 +13,9 @@ from dataclasses import dataclass, field
 from . import ast
 from .errors import Span, TypeError_
 from .types import (
-    RAW_ARRAY, PRIMITIVES, STAR, Fresh, KFun, Kind, Scheme, TApp, TCon, TFam, TFun,
+    RAW_ARRAY, PRIMITIVES, STAR, Fresh, KFun, Kind, Pred, Scheme, TApp, TCon, TFam, TFun,
     TTuple, TVar, Type, apply, default_kind, generalize, instantiate, kind_arrow,
-    QUALIFY, kind_of, short_name, show, show_kind, spine, unify_kinds,
+    OPENED, QUALIFY, kind_of, short_name, show, show_kind, spine, unify_kinds,
 )
 
 
@@ -28,10 +28,40 @@ class ConInfo:
     field_names: list[str] | None  # None for the positional form
     arity: int
     scheme: Scheme  # always forall params. fun(args...) -> tycon params
+    #: An existential constructor's hidden variables (SPEC-DELTAS 68): the
+    #: scheme's variables that do not reach its result. Its `context` is the
+    #: scheme's `preds`, the instances a value carries, so the scheme reads
+    #: `forall e. [Error e] fun(e) -> SomeError` and `arity` still counts
+    #: fields. Core applies the constructor to one dictionary per predicate
+    #: ahead of them, and a packed value holds them in that order.
+    exists: list[TVar] = field(default_factory=list)
+    #: The names the bracket wrote for them, which an opened pattern's rigid
+    #: constants are named after.
+    exists_names: list[str] = field(default_factory=list)
+
+    @property
+    def context(self) -> list[Pred]:
+        return self.scheme.preds
 
     @property
     def is_record(self) -> bool:
         return self.field_names is not None
+
+    @property
+    def is_existential(self) -> bool:
+        return bool(self.exists)
+
+    @property
+    def field_types(self) -> list[Type]:
+        body = self.scheme.body
+        assert isinstance(body, TFun)
+        return body.params
+
+    @property
+    def runtime_arity(self) -> int:
+        """How many values the constructor is applied to: dictionaries, then
+        fields."""
+        return len(self.context) + self.arity
 
 
 @dataclass
@@ -46,8 +76,13 @@ class TyconInfo:
 
     @property
     def is_mutable_record(self) -> bool:
-        """Section 4.5: exactly one variant, carrying a record payload."""
-        return len(self.variants) == 1 and self.variants[0].is_record
+        """Section 4.5: exactly one variant, carrying a record payload.
+
+        Unless it is existential (SPEC-DELTAS 68): a field of a hidden type can
+        be neither read nor written through `.field`, so the record is a value.
+        """
+        return (len(self.variants) == 1 and self.variants[0].is_record
+                and not self.variants[0].is_existential)
 
 
 @dataclass
@@ -85,6 +120,9 @@ class DeclTable:
         self.families: dict[str, FamilyInfo] = {}
         # `newtypes`, once the declarations are all in.
         self._newtypes: set[str] | None = None
+        # Existential constructors whose contexts name classes, until
+        # `ClassTable.register_all` has the classes to check them against.
+        self.unchecked_contexts: list[tuple[ConInfo, ast.ConDecl]] = []
         # Short name -> the qualified name that claimed it first. Two modules
         # may each declare a `Node`; this is what notices, so that both print
         # qualified rather than both printing `Node` (delta 43). It is also
@@ -92,6 +130,7 @@ class DeclTable:
         # class name is global and unqualified.
         self.shorts: dict[str, str] = {name: name for name in PRIMITIVES}
         QUALIFY.clear()
+        OPENED.clear()
         self.tycons["Prim.Array"] = TyconInfo(
             "Prim.Array", ["a"], kind=RAW_ARRAY.kind)
         self.heads["Prim.Array"] = RAW_ARRAY
@@ -105,15 +144,33 @@ class DeclTable:
         """Declare every type before resolving any, so they may refer to each
         other in any order."""
         for d in decls:
-            declared = set(d.params)
-            for te in _declaration_types(d):
-                for var in _type_variables(te):
-                    if var.name not in declared:
+            params = set(d.params)
+            groups = ([(set(), [d.alias])] if d.alias is not None else [])
+            for con in d.variants or []:
+                hidden = _hidden_variables(con)
+                for name in hidden:
+                    if name in params:
                         raise TypeError_(
-                            f"type variable '{var.name}' is not declared by "
-                            f"type '{d.name}'",
-                            var.span,
+                            f"'{name}' is a parameter of type '{d.name}', so "
+                            f"the bracket of '{con.name}' cannot hide it",
+                            con.span,
                         )
+                if len(set(con.binders)) != len(con.binders):
+                    raise TypeError_(
+                        f"the bracket of '{con.name}' binds a variable twice",
+                        con.span,
+                    )
+                groups.append((set(hidden), _con_types(con)))
+            for hidden, types in groups:
+                declared = params | hidden
+                for te in types:
+                    for var in _type_variables(te):
+                        if var.name not in declared:
+                            raise TypeError_(
+                                f"type variable '{var.name}' is not declared by "
+                                f"type '{d.name}'",
+                                var.span,
+                            )
         for d in decls:
             short = short_name(d.name)
             if short in PRIMITIVES:
@@ -198,16 +255,34 @@ class DeclTable:
                     f"constructor '{con.name}' is already declared by type '{other}'",
                     con.span,
                 )
+            # The bracket's variables are this variant's alone (SPEC-DELTAS 68).
+            local: dict[str, Type] = dict(tyvars)
+            hidden: list[TVar] = []
+            for name in _hidden_variables(con):
+                variable = TVar(1)
+                local[name] = variable
+                hidden.append(variable)
             if con.is_record:
                 names = [n for n, _ in con.fields]
-                arg_types = [self.star(t, tyvars, _unexpected_type_variable)
+                arg_types = [self.star(t, local, _unexpected_type_variable)
                              for _, t in con.fields]
             else:
                 names = None
-                arg_types = [self.star(t, tyvars, _unexpected_type_variable)
+                arg_types = [self.star(t, local, _unexpected_type_variable)
                              for t in con.args]
-            scheme = generalize(TFun(arg_types, result), 0)
-            cinfo = ConInfo(con.name, decl.name, names, len(arg_types), scheme)
+            # Class names are checked, and kinds compared, once the classes
+            # exist: `ClassTable.check_constructor_contexts`.
+            context = [Pred(p.name, [self.to_type(p.arg, local,
+                                                  _unexpected_type_variable)])
+                       for p in con.context]
+            scheme = generalize(TFun(arg_types, result), 0, context)
+            for variable in hidden:
+                if all(variable is not q for q in scheme.quantified):
+                    scheme.quantified.append(variable)
+            cinfo = ConInfo(con.name, decl.name, names, len(arg_types), scheme,
+                            exists=hidden, exists_names=_hidden_variables(con))
+            if con.context:
+                self.unchecked_contexts.append((cinfo, con))
             info.variants.append(cinfo)
             self.constructors[con.name] = cinfo
 
@@ -350,6 +425,23 @@ class DeclTable:
             return None
         return info.variants[0].field_names
 
+    def existential_fields(self, name: str) -> list[str] | None:
+        """The field names of a one-variant existential record, or None.
+
+        `record_fields` answers None for one of these, because an existential
+        record is not a mutable record: assigning a field would let a hidden
+        variable out, and reading one has no type to read it at. But "not a
+        single-variant record type" is then the wrong thing to say, since it
+        *is* one -- which is exactly why it has a field worth asking about.
+        """
+        info = self.tycons.get(name)
+        if info is None or len(info.variants) != 1:
+            return None
+        variant = info.variants[0]
+        if not variant.is_existential or not variant.field_names:
+            return None
+        return variant.field_names
+
     def field_type(self, receiver: Type, label: str) -> Type:
         """The type of `receiver.label`, for a receiver already resolved.
 
@@ -405,6 +497,9 @@ class DeclTable:
             name for name, info in self.tycons.items()
             if len(info.variants) == 1 and not info.variants[0].is_record
             and info.variants[0].arity == 1
+            # A packed value carries its hidden variables' layouts, so there
+            # is always a wrapper to hold them in.
+            and not info.variants[0].is_existential
         }
         graph: dict[str, set[str]] = {}
         for name in candidates:
@@ -478,16 +573,21 @@ def _referenced_tycons(te: ast.TypeExpr | None) -> list[str]:
     return []
 
 
-def _declaration_types(decl: ast.TypeDecl) -> list[ast.TypeExpr]:
-    if decl.alias is not None:
-        return [decl.alias]
-    out: list[ast.TypeExpr] = []
-    for con in decl.variants or []:
-        if con.fields is not None:
-            out.extend(t for _, t in con.fields)
-        else:
-            out.extend(con.args)
+def _hidden_variables(con: ast.ConDecl) -> list[str]:
+    """The variables a constructor's bracket binds, in a fixed order: its bare
+    variables as written, then those its class predicates mention, first
+    occurrence first (SPEC-DELTAS 68)."""
+    out = list(dict.fromkeys(con.binders))
+    for pred in con.context:
+        for var in _type_variables(pred.arg):
+            if var.name not in out:
+                out.append(var.name)
     return out
+
+
+def _con_types(con: ast.ConDecl) -> list[ast.TypeExpr]:
+    return ([t for _, t in con.fields] if con.fields is not None
+            else list(con.args))
 
 
 def _type_variables(te: ast.TypeExpr) -> list[ast.TEVar]:

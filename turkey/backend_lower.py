@@ -72,6 +72,15 @@ def layout_of(ty: Type, abstracted: dict[int, str] | None = None,
     ty = prune(ty)
     if abstracted and isinstance(ty, TVar) and ty.id in abstracted:
         return bir.Layout(abstracted[ty.id])
+    # A skolem an existential arm opened (SPEC-DELTAS 68), in the copy of that arm
+    # `layout.share` made for one layout. Keyed by `-uid` so it cannot collide
+    # with a variable id.
+    # A skolem with no layout is *unknown*, not a heap object: answering `ptr`
+    # here read an `i64` array through a pointer-typed slot and got the right
+    # bits back by coincidence, which is how a missing dispatch went unseen.
+    if isinstance(ty, TCon) and ty.uid:
+        found = (abstracted or {}).get(-ty.uid)
+        return None if found is None else bir.Layout(found)
     if ty is BOTTOM:
         return bir.Layout.UNIT
     if decls is not None:
@@ -633,9 +642,16 @@ class _FunctionLowerer:
                     for name in _pattern_names(alt.pat)
                     if (hint := _free_variable_type(alt.body, name)) is not None
                 }
-                self.lower_pattern(alt.pat, value, expr.scrutinee.ty,
-                                   inner, test, success, failure, hints)
-                self.lower(alt.body, inner, joins, success, dest)
+                # An existential arm's copy is lowered under the layouts its
+                # pattern names for the skolems it opens (SPEC-DELTAS 68).
+                outer = self.abstracted
+                self.abstracted = _opened_layouts(alt.pat, outer)
+                try:
+                    self.lower_pattern(alt.pat, value, expr.scrutinee.ty,
+                                       inner, test, success, failure, hints)
+                    self.lower(alt.body, inner, joins, success, dest)
+                finally:
+                    self.abstracted = outer
                 test = failure
             self.lower(expr.scrutinee, env, joins, block,
                        _Destination(after_scrutinee))
@@ -971,6 +987,40 @@ class _FunctionLowerer:
                         done(at, self.wrap_array(at, raw, length))
                     self.lower_values(expr.args, env, joins, block, from_storage)
                     return
+                if primitive == "Prim.castAs":
+                    # The conversion half of a checked cast. `Data.Error.cast`
+                    # has already compared the two type reps, so the value in
+                    # hand *is* of the result type; what can still differ is
+                    # how the two are held, which is exactly what `coerce`
+                    # settles -- a relabel between pointer layouts, or an
+                    # unbox into a scalar one. If the result's layout is not
+                    # known -- a `cast` past `MAX_SPECIALIZATIONS`, where the
+                    # type argument never became concrete -- `self.layout`
+                    # refuses rather than guessing, which is FINDINGS 53's rule.
+                    def cast_as(at: bir.Block, values: list[bir.Operand]) -> None:
+                        # Identity, or nothing. Equal reps mean equal types
+                        # mean equal layouts, so a legitimate cast never
+                        # converts -- and requiring that keeps the two
+                        # implementations to one rule rather than to whatever
+                        # each one's `coerce` happens to permit.
+                        if values[0].layout is self.layout(expr.ty):
+                            done(at, values[0])
+                        else:
+                            # Dead, and provably so: the reps were equal, so
+                            # the types were, so the layouts are. But contract 1
+                            # copies an opened arm per *packed* layout, so this
+                            # copy can be the one where the payload is an `i64`
+                            # and the result type a pointer -- a combination the
+                            # rep check rules out at run time and the backend
+                            # still has to emit something for. A trap, not an
+                            # undef: if the reasoning above is ever wrong, this
+                            # says so instead of reading a pointer out of an
+                            # integer.
+                            at.terminator = bir.Panic(
+                                "a cast reached a conversion its type check "
+                                "had ruled out", self.frame(expr.span))
+                    self.lower_values(expr.args, env, joins, block, cast_as)
+                    return
                 operation = "prim." + primitive.removeprefix("Prim.")
                 array_element_layout = None
                 if primitive in ("Prim.arrayNew", "Prim.arrayNewUninit"):
@@ -1018,14 +1068,18 @@ class _FunctionLowerer:
                     self.lower_values(expr.args, env, joins, block, wrap)
                     return
                 def construct(at: bir.Block, values: list[bir.Operand]) -> None:
-                    con_type = instantiate(info.scheme, lambda: TVar(1))
-                    assert isinstance(con_type, TFun)
-                    unify(con_type.ret, expr.ty)
-                    values = [self.coerce(at, value, self.layout(expected))
+                    if info.is_existential:
+                        values, con_type = self.packed(at, info, expr, values)
+                    else:
+                        con_type = instantiate(info.scheme, lambda: TVar(1))
+                        assert isinstance(con_type, TFun)
+                        unify(con_type.ret, expr.ty)
+                    values = [value if isinstance(value, bir.Constant)
+                              else self.coerce(at, value, self.layout(expected))
                               for value, expected in zip(values, con_type.params)]
                     metadata = _layout_metadata(value.layout for value in values)
                     made = self.emit(at, "object_new",
-                                     ("1", str(self.tags[fn.name]), str(info.arity),
+                                     ("1", str(self.tags[fn.name]), str(len(values)),
                                       str(metadata)), bir.Layout.PTR)
                     for index, value in enumerate(values):
                         at.instructions.append(bir.Instruction(
@@ -1119,6 +1173,110 @@ class _FunctionLowerer:
                         return con.field_names.index(name)
         raise Unsupported(f"LLVM backend has no layout for field '{name}'")
 
+    # -- existential constructors (SPEC-DELTAS 68) ---------------------------
+    #
+    # A packed object is laid out as one `i64` layout code per hidden
+    # variable, then the carried dictionaries, then the declared fields. The
+    # codes are what an opening compares against the layouts its arm's copy
+    # was lowered for; the dictionaries are ordinary pointers.
+
+    def packed(self, at: bir.Block, info, expr: CApp,
+               values: list[bir.Operand]) -> tuple[list[bir.Operand], TFun]:
+        """The layout codes and the argument values of one packing, and the
+        constructor's type with its hidden variables resolved to what was
+        packed here."""
+        from .decls import substitute
+        mapping = {v.id: TVar(1) for v in info.scheme.quantified}
+        con_type = substitute(info.scheme.body, mapping)
+        assert isinstance(con_type, TFun)
+        unify(con_type.ret, expr.ty)
+        carried = expr.args[:len(info.context)]
+        for param, argument in zip(con_type.params, expr.args[len(carried):]):
+            unify(param, argument.ty)
+        codes: list[bir.Operand] = []
+        for variable in info.exists:
+            packed_ty = prune(mapping[variable.id])
+            layout = layout_of(packed_ty, self.abstracted, self.decls)
+            if layout is None:
+                if not isinstance(packed_ty, TVar):
+                    raise Unsupported(
+                        f"packing '{info.name}' at {show(packed_ty)}, whose "
+                        f"layout is not knowable here")
+                layout = bir.Layout.BOXED
+            codes.append(bir.Constant(bir.Layout.I64, LAYOUT_CODES[layout]))
+        header = TFun([INT] * len(codes) + [a.ty for a in carried]
+                      + list(con_type.params), con_type.ret)
+        return codes + list(values), header
+
+    def lower_opened(self, pat: ast.PCon, value: bir.Operand, ty: Type,
+                     env: dict[str, bir.Value], block: bir.Block,
+                     success: bir.Block, failure: bir.Block,
+                     hints: dict[str, Type]) -> None:
+        from .decls import substitute
+        if pat.layouts is None:
+            raise Unsupported(
+                f"an arm opening '{pat.name}' reached the backend without the "
+                f"layouts `layout.share` copies it for")
+        info = self.decls.constructors[pat.name]
+        held = self.new_slot("opened_value", value.layout)
+        block.instructions.append(bir.Instruction("slot_store", (held.name, value)))
+        at = block
+        variants = self.decls.tycons[info.tycon].variants
+        if len(variants) > 1:
+            tag = self.emit(at, "object_tag", (value,), bir.Layout.I32)
+            condition = self.emit(
+                at, "scalar_eq",
+                (tag, bir.Constant(bir.Layout.I32, self.tags[pat.name])),
+                bir.Layout.I1)
+            following = self.new_block("opened_tag")
+            at.terminator = bir.Branch(condition, following.name, failure.name)
+            at = following
+        exists, carried = len(info.exists), len(info.context)
+        for index, layout in enumerate(pat.layouts):
+            loaded = self.emit(at, "slot_load", (held.name,), held.layout)
+            code = self.emit(at, "object_get", (loaded, str(index)),
+                             bir.Layout.I64)
+            condition = self.emit(
+                at, "scalar_eq",
+                (code, bir.Constant(bir.Layout.I64,
+                                    LAYOUT_CODES[bir.Layout(layout)])),
+                bir.Layout.I1)
+            following = self.new_block("opened_layout")
+            at.terminator = bir.Branch(condition, following.name, failure.name)
+            at = following
+        mapping: dict[int, Type] = {v.id: TVar(1) for v in info.scheme.quantified}
+        mapping.update({v.id: skolem for v, skolem in zip(info.exists, pat.skolems)})
+        con_type = substitute(info.scheme.body, mapping)
+        assert isinstance(con_type, TFun)
+        unify(con_type.ret, ty)
+        for index, name in enumerate(pat.evidence):
+            loaded = self.emit(at, "slot_load", (held.name,), held.layout)
+            dictionary = self.emit(at, "object_get",
+                                   (loaded, str(exists + index)), bir.Layout.PTR)
+            slot = self.new_slot(name, bir.Layout.PTR)
+            env[name] = slot
+            at.instructions.append(
+                bir.Instruction("slot_store", (slot.name, dictionary)))
+        fields = con_type.params
+        pieces = (list(enumerate(pat.args)) if isinstance(pat, ast.PCon)
+                  else [(info.field_names.index(name), sub)
+                        for name, sub in pat.fields])
+        if not pieces:
+            at.terminator = bir.Jump(success.name)
+            return
+        for index, (field, sub) in enumerate(pieces):
+            field_ty = fields[field]
+            field_layout = _pattern_layout(sub, field_ty, hints,
+                                           self.abstracted, self.decls)
+            loaded = self.emit(at, "slot_load", (held.name,), held.layout)
+            got = self.emit(at, "object_get",
+                            (loaded, str(exists + carried + field)), field_layout)
+            following = (success if index + 1 == len(pieces)
+                         else self.new_block("opened_field"))
+            self.lower_pattern(sub, got, field_ty, env, at, following,
+                               failure, hints)
+            at = following
+
     def lower_pattern(self, pat, value: bir.Operand, ty: Type,
                       env: dict[str, bir.Value],
                       block: bir.Block, success: bir.Block,
@@ -1149,6 +1307,10 @@ class _FunctionLowerer:
                 "float_eq" if value.layout is bir.Layout.F64 else "scalar_eq")
             condition = self.emit(block, op, (value, literal), bir.Layout.I1)
             block.terminator = bir.Branch(condition, success.name, failure.name)
+            return
+        if isinstance(pat, (ast.PCon, ast.PRecord)) and pat.skolems:
+            self.lower_opened(pat, value, ty, env, block, success, failure,
+                              hints)
             return
         if isinstance(pat, ast.PCon) and pat.name in (BOOL_FALSE, BOOL_TRUE):
             wanted = bir.Constant(bir.Layout.I1, pat.name == BOOL_TRUE)
@@ -1370,13 +1532,29 @@ def _pointer_layout(layout: bir.Layout) -> bool:
     return layout in (bir.Layout.PTR, bir.Layout.BOXED)
 
 
+LAYOUT_CODES = {
+    bir.Layout.UNIT: 0, bir.Layout.I1: 1, bir.Layout.I8: 2,
+    bir.Layout.I32: 3, bir.Layout.I64: 4, bir.Layout.F64: 5,
+    bir.Layout.PTR: 6, bir.Layout.BOXED: 7,
+}
+
+
+def _opened_layouts(pat, outer: dict[int, str]) -> dict[int, str]:
+    """`outer`, plus the layouts an existential arm's copy names for the
+    skolems its pattern opens (SPEC-DELTAS 68; see `layout.open_arms`)."""
+    from .core import openings
+    opened_here = [p for p in openings(pat) if p.layouts is not None]
+    if not opened_here:
+        return outer
+    inner = dict(outer)
+    for opened in opened_here:
+        inner.update({-skolem.uid: layout
+                      for skolem, layout in zip(opened.skolems, opened.layouts)})
+    return inner
+
+
 def _layout_metadata(layouts) -> int:
-    codes = {
-        bir.Layout.UNIT: 0, bir.Layout.I1: 1, bir.Layout.I8: 2,
-        bir.Layout.I32: 3, bir.Layout.I64: 4, bir.Layout.F64: 5,
-        bir.Layout.PTR: 6, bir.Layout.BOXED: 7,
-    }
-    return sum(codes[layout] << (3 * index)
+    return sum(LAYOUT_CODES[layout] << (3 * index)
                for index, layout in enumerate(layouts))
 
 

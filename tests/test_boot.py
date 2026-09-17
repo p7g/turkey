@@ -19,7 +19,7 @@ Every `boot` side runs the compiled binary from `tests.bootc`, and every Python
 side goes through its on-disk reference cache, one `check` per program shared by
 every stage. Both were true of most stages and not of all of them: the types
 milestone ran `boot` interpreted and several stages recomputed the Python side
-uncached, and between them they were most of the suite's wall time (FINDINGS 89).
+uncached, and between them they were most of the suite's wall time (FINDINGS 93).
 """
 
 from __future__ import annotations

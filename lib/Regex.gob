@@ -1,0 +1,349 @@
+module Regex (
+    Builder, Capture, Captures, Resolve(..), Combining(..),
+    literal, satisfy, capture, choice, orElse, optional, many, some, fullMatch,
+)
+
+-- Construction is eager: bind joins materialized Thompson NFA fragments.
+-- Capture values are recipes evaluated only after a successful full match.
+-- See prototypes/regex/README.md for semantics, examples, and current limits.
+
+type Instruction
+    = Consume(fun(Char) -> Bool)
+    | Jump(Int)
+    | Split(Int, Int)
+    | Open(Int)
+    | Close(Int)
+
+type Builder a = Builder { code : Array Instruction, value : a }
+type Capture a = Capture(fun(Captures) -> a)
+type Captures = Captures { text : String, nodes : Array Node }
+type Node = Node {
+    tag : Int, start : String.Index, end : String.Index, children : Array Node
+}
+type Supply = Supply { next : Int }
+let supply = Supply { next = 0 }
+
+fun fresh() {
+    let tag = supply.next
+    supply.next = tag + 1
+    tag
+}
+
+fun shifted(inst : Instruction, offset : Int) -> Instruction = match inst {
+    Jump(pc) -> Jump(pc + offset)
+    Split(a, b) -> Split(a + offset, b + offset)
+    _ -> inst
+}
+
+fun appendCode(left : Array Instruction, right : Array Instruction) -> Array Instruction {
+    let out = Array.new(len(left) + len(right))
+    for inst in left { Array.push(out, inst) }
+    for inst in right { Array.push(out, shifted(inst, len(left))) }
+    out
+}
+
+instance Functor Builder {
+    fun map(b, f) = Builder { code = b.code, value = f(b.value) }
+}
+instance Applicative Builder {
+    fun pure(x) = Builder { code = [], value = x }
+}
+instance Monad Builder {
+    fun bind(b, f) {
+        let next = f(b.value)
+        Builder { code = appendCode(b.code, next.code), value = next.value }
+    }
+}
+
+instance Functor Capture {
+    fun map(Capture(read), f) = Capture(fun(captures) = f(read(captures)))
+}
+instance Applicative Capture {
+    fun pure(x) = Capture(fun(captures) = x)
+}
+-- Applicative currently supplies only pure. This extension keeps map2 local
+-- until the independent Applicative change (TIX-24) is settled.
+class Combining f : Applicative f {
+    fun map2(f a, f b, fun(a, b) -> c) -> f c
+}
+instance Combining Capture {
+    fun map2(Capture(left), Capture(right), f) =
+        Capture(fun(captures) = f(left(captures), right(captures)))
+}
+
+class Resolve r {
+    type Output r
+    fun resolve(r, Captures) -> Output r
+}
+instance Resolve (Capture a) {
+    type Output = a
+    fun resolve(Capture(read), captures) = read(captures)
+}
+instance Resolve (a, b) : Resolve a, Resolve b {
+    type Output = (Output a, Output b)
+    fun resolve((a, b), captures) = (resolve(a, captures), resolve(b, captures))
+}
+instance Resolve (a, b, c) : Resolve a, Resolve b, Resolve c {
+    type Output = (Output a, Output b, Output c)
+    fun resolve((a, b, c), captures) =
+        (resolve(a, captures), resolve(b, captures), resolve(c, captures))
+}
+instance Resolve Unit {
+    type Output = Unit
+    fun resolve(value, captures) = ()
+}
+
+fun scopedCode(code : Array Instruction, tag : Int) -> Array Instruction {
+    let out = [Open(tag)]
+    for inst in code { Array.push(out, shifted(inst, 1)) }
+    Array.push(out, Close(tag))
+    out
+}
+
+fun findNode(captures : Captures, tag : Int) -> Option Node {
+    -- Sequential reuse of the same handle means the last occurrence wins.
+    var i = len(captures.nodes)
+    while i > 0 {
+        i = i - 1
+        let node = captures.nodes[i]
+        if node.tag == tag { return Some(node) }
+    }
+    None
+}
+
+fun requiredNode(captures : Captures, tag : Int) -> Node = match findNode(captures, tag) {
+    Some(node) -> node
+    None -> error("Regex: capture did not participate in this match")
+}
+
+fun nested(captures : Captures, node : Node) -> Captures =
+    Captures { text = captures.text, nodes = node.children }
+
+-- Capture the complete text of a fragment, ignoring its extraction recipe.
+fun capture(body : Builder a) -> Builder (Capture String) {
+    let tag = fresh()
+    Builder {
+        code = scopedCode(body.code, tag),
+        value = Capture(fun(captures) {
+            let node = requiredNode(captures, tag)
+            String.slice(captures.text, node.start, node.end)
+        })
+    }
+}
+
+fun literal(text : String) -> Builder (Capture String) {
+    let code = Array.new(0)
+    for c in String.codePoints(text) {
+        Array.push(code, Consume(fun(other) = other == c))
+    }
+    capture(Builder { code = code, value = () })
+}
+
+fun satisfy(predicate : fun(Char) -> Bool) -> Builder (Capture Char) {
+    let tag = fresh()
+    Builder {
+        code = scopedCode([Consume(predicate)], tag),
+        value = Capture(fun(captures) {
+            let node = requiredNode(captures, tag)
+            match String.decode(captures.text, node.start) {
+                Some(c) -> c
+                None -> error("Regex: missing character in successful capture")
+            }
+        })
+    }
+}
+
+fun choiceCode(left : Array Instruction, right : Array Instruction) -> Array Instruction {
+    let out = [Split(1, len(left) + 2)]
+    for inst in left { Array.push(out, shifted(inst, 1)) }
+    Array.push(out, Jump(len(left) + len(right) + 2))
+    for inst in right { Array.push(out, shifted(inst, len(left) + 2)) }
+    out
+}
+
+fun choice[Resolve a, Resolve b](left : Builder a, right : Builder b)
+    -> Builder (Capture (Either (Output a) (Output b))) {
+    let leftTag = fresh()
+    let rightTag = fresh()
+    Builder {
+        code = choiceCode(scopedCode(left.code, leftTag), scopedCode(right.code, rightTag)),
+        value = Capture(fun(captures) = match findNode(captures, leftTag) {
+            Some(node) -> Left(resolve(left.value, nested(captures, node)))
+            None -> Right(resolve(right.value, nested(captures, requiredNode(captures, rightTag))))
+        })
+    }
+}
+
+fun orElse[Resolve a](left : Builder a, right : Builder a) -> Builder (Capture (Output a)) {
+    let result = choice(left, right)
+    map(result, fun(recipe) = map(recipe, fun(value) = match value {
+        Left(x) -> x
+        Right(x) -> x
+    }))
+}
+
+fun optional[Resolve a](body : Builder a) -> Builder (Capture (Option (Output a))) {
+    let tag = fresh()
+    let branch = scopedCode(body.code, tag)
+    let code = [Split(1, len(branch) + 1)]
+    for inst in branch { Array.push(code, shifted(inst, 1)) }
+    Builder {
+        code = code,
+        value = Capture(fun(captures) = match findNode(captures, tag) {
+            Some(node) -> Some(resolve(body.value, nested(captures, node)))
+            None -> None
+        })
+    }
+}
+
+fun repeated[Resolve a](body : Builder a, atLeastOne : Bool)
+    -> Builder (Capture (Array (Output a))) {
+    let tag = fresh()
+    let branch = scopedCode(body.code, tag)
+    let code = Array.new(len(branch) + 2)
+    if !atLeastOne { Array.push(code, Split(1, len(branch) + 2)) }
+    let offset = len(code)
+    for inst in branch { Array.push(code, shifted(inst, offset)) }
+    if atLeastOne {
+        Array.push(code, Split(0, len(code) + 1))
+    } else {
+        Array.push(code, Jump(0))
+    }
+    Builder {
+        code = code,
+        value = Capture(fun(captures) {
+            let values = Array.new(0)
+            for node in captures.nodes {
+                if node.tag == tag {
+                    Array.push(values, resolve(body.value, nested(captures, node)))
+                }
+            }
+            values
+        })
+    }
+}
+
+fun many[Resolve a](body : Builder a) -> Builder (Capture (Array (Output a))) =
+    repeated(body, False)
+
+fun some[Resolve a](body : Builder a) -> Builder (Capture (Array (Output a))) =
+    repeated(body, True)
+
+-- Persistent event histories share prefixes across threads. Branches do not
+-- mutate each other's captures. Build the capture tree only for the winner.
+type History = Empty | Event(Bool, Int, String.Index, History)
+type Thread = Thread { pc : Int, history : History }
+type Frame = Frame { tag : Int, start : String.Index, children : Array Node }
+
+fun materialize(text : String, history : History) -> Captures {
+    let events = Array.new(0)
+    var rest = history
+    loop {
+        match rest {
+            Empty -> break
+            Event(opening, tag, at, previous) -> {
+                Array.push(events, (opening, tag, at))
+                rest = previous
+            }
+        }
+    }
+    let root = Frame { tag = -1, start = String.start(text), children = [] }
+    let stack = [root]
+    var i = len(events)
+    while i > 0 {
+        i = i - 1
+        let (opening, tag, at) = events[i]
+        if opening {
+            Array.push(stack, Frame { tag = tag, start = at, children = [] })
+        } else {
+            let frame = match Array.pop(stack) {
+                Some(value) -> value
+                None -> error("Regex: unbalanced capture history")
+            }
+            if frame.tag != tag || len(stack) == 0 {
+                error("Regex: unbalanced capture history")
+            }
+            Array.push(stack[len(stack) - 1].children, Node {
+                tag = tag, start = frame.start, end = at, children = frame.children
+            })
+        }
+    }
+    if len(stack) != 1 { error("Regex: unclosed capture history") }
+    Captures { text = text, nodes = root.children }
+}
+
+fun unseen(code : Array Instruction) -> Array Bool {
+    let seen = Array.new(len(code) + 1)
+    for var i = 0; i <= len(code); i = i + 1 { Array.push(seen, False) }
+    seen
+}
+
+-- Explicit stack avoids recursive epsilon traversal. Push right before left
+-- to process the left branch first. Each PC is visited once per input position.
+fun addThread(code : Array Instruction, threads : Array Thread, seen : Array Bool,
+    pc : Int, history : History, at : String.Index) -> Unit {
+    let pending = [Thread { pc = pc, history = history }]
+    while len(pending) > 0 {
+        let thread = match Array.pop(pending) {
+            Some(value) -> value
+            None -> error("Regex: empty thread stack")
+        }
+        let current = thread.pc
+        if seen[current] { continue }
+        seen[current] = True
+        if current == len(code) {
+            Array.push(threads, thread)
+            continue
+        }
+        match code[current] {
+            Jump(target) -> Array.push(pending, Thread { pc = target, history = thread.history })
+            Split(left, right) -> {
+                Array.push(pending, Thread { pc = right, history = thread.history })
+                Array.push(pending, Thread { pc = left, history = thread.history })
+            }
+            Open(tag) -> Array.push(pending, Thread {
+                pc = current + 1, history = Event(True, tag, at, thread.history)
+            })
+            Close(tag) -> Array.push(pending, Thread {
+                pc = current + 1, history = Event(False, tag, at, thread.history)
+            })
+            Consume(_) -> Array.push(threads, thread)
+        }
+    }
+}
+
+fun fullMatch[Resolve r](pattern : Builder r, text : String) -> Option (Output r) {
+    var current = []
+    var at = String.start(text)
+    addThread(pattern.code, current, unseen(pattern.code), 0, Empty, at)
+    loop {
+        match String.step(text, at) {
+            None -> break
+            Some((c, next)) -> {
+                let following = []
+                let seen = unseen(pattern.code)
+                for thread in current {
+                    if thread.pc < len(pattern.code) {
+                        match pattern.code[thread.pc] {
+                            Consume(predicate) -> {
+                                if predicate(c) {
+                                    addThread(pattern.code, following, seen,
+                                        thread.pc + 1, thread.history, next)
+                                }
+                            }
+                            _ -> ()
+                        }
+                    }
+                }
+                current = following
+                at = next
+            }
+        }
+    }
+    for thread in current {
+        if thread.pc == len(pattern.code) {
+            return Some(resolve(pattern.value, materialize(text, thread.history)))
+        }
+    }
+    None
+}

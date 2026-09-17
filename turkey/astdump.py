@@ -349,7 +349,9 @@ def _rules():
     def condecl(w: _Writer, n: ast.ConDecl) -> None:
         w.head("con", n, quote(n.name))
         w.kids(lambda: w.items(n.args),
-               lambda: w.pairs(n.fields) if n.fields is not None else w.none())
+               lambda: w.pairs(n.fields) if n.fields is not None else w.none(),
+               lambda: w.names(n.binders),
+               lambda: w.items(n.context))
 
     def typedecl(w: _Writer, n: ast.TypeDecl) -> None:
         w.head("type", n, quote(n.name))

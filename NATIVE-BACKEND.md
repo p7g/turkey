@@ -1325,9 +1325,9 @@ Each phase runs and is verified before the next begins.
   `boot`, since stack arguments landed. Every function takes its closure
   environment as a hidden first argument, so a helper with eight declared
   parameters is a nine-argument call -- the first version of the spiller added
-  two such calls to `boot` itself (FINDINGS 88). The three `Prim.floatBits`
+  two such calls to `boot` itself (FINDINGS 92). The three `Prim.floatBits`
   stops are closed, with `Prim.floatFromBits`, `Prim.floatIsNaN` and
-  `Prim.floatFitsInt` (FINDINGS 87).
+  `Prim.floatFitsInt` (FINDINGS 91).
 
   Zero complaints from `verifyColouring` on either, which was the check that
   mattered before spilling: a colouring putting two simultaneously live values in one register
@@ -1393,7 +1393,7 @@ Each phase runs and is verified before the next begins.
   | `boot` compiling itself | 3073 of 3073 | 16,672 bytes | 10 gp, 1 fp | 22 | 45,097 |
 
   `verifyFrame`, `verifyAllocation`, `verifyColouring` and `Ssa.verify` report
-  nothing on either. These are checkers rather than an oracle, which FINDINGS 91
+  nothing on either. These are checkers rather than an oracle, which FINDINGS 95
   is the demonstration of.
 
   **The emitter prints functions (`boot native`, measured 2026-09-15).**
@@ -1425,7 +1425,7 @@ Each phase runs and is verified before the next begins.
     until whole functions were assembled.
 
   **`as` is an oracle for spelling and not for meaning.** It accepted a
-  parallel copy that lost half its values (FINDINGS 91), and it will accept
+  parallel copy that lost half its values (FINDINGS 95), and it will accept
   anything else this backend decides wrongly. The oracle for meaning is running
   the program against LLVM, which needs the module data and the runtime walker
   -- the next slice, sketched under phase 5b: globals, string literals, the
@@ -1522,7 +1522,7 @@ and until then it says nothing either way. The probe's cost, not a result.
   them into root slots), 5,702 stores and **10,001 reloads**. The first version
   had 24,977 -- every root store before a safepoint read its value, and for a
   value already spilled into that very slot the read was a reload of what the
-  slot held. `spill` now drops those stores (FINDINGS 90). The allocator's move
+  slot held. `spill` now drops those stores (FINDINGS 94). The allocator's move
   hints now cover argument and result moves as well as parameters: 153,525 of
   184,766 taken. `boot asm boot/Main.gob` takes 126 seconds, up from 88;
   selection runs every function twice (once for the function, once for its
@@ -1596,15 +1596,21 @@ The alternative is MLton's and Rust's: width follows the *instantiation*, so
 of a `Box t` to be a layout-keyed copy too, and `check_layouts` inspects only
 parameters today, not constructions or returns.
 
-### A hole to close first
+### A hole, closed
 
 `fun mk(x : a) -> Box a = Box(x)` is not transparent and calls nothing that is,
-so `layout.share` never copies it. Left generic past the specialization cap, it
-stores its field `BOXED`, a pointer to a box, while a ground reader of `Box
-Int` reads the same word as `i64`. That is FINDINGS 53's shape -- a field
-written one way and read another -- and it is unverified. It is independent of
-packing and should get a failing test before anything here is built on the
-current invariant.
+so `layout.share` never copied it. Left generic past the specialization cap, it
+stored its field `BOXED`, a pointer to a box, while a ground reader of `Box
+Int` read the same word as `i64` -- FINDINGS 53's shape, a field written one way
+and read another. Verified: a recursive `mk` printed `32067093649` for `42`.
+
+Closed by the producer's half of the transparency rule. A binding that builds a
+value whose field is *declared* at a bare type variable, from a value of one of
+its own variables, is shared per layout like one that reads such a field
+(`layout._constructs`, `Layout.constructs`). A field declared `Prim.Array a` is a
+pointer whatever `a` is and does not count, and a newtype is never built.
+`tests/test_layout.py::test_a_generic_producer_agrees_with_a_ground_reader` pins
+it.
 
 ### Decisions for when this is done
 

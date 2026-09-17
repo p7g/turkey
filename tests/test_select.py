@@ -341,7 +341,7 @@ def test_the_float_primitives_select_without_a_call():
     `float_bits.gob` -- so selection's ratchet was green while three functions
     in `boot`'s own source stopped at "the runtime function Prim.floatBits",
     and the same program then found `Prim.floatIsNaN` missing from *both*
-    backends (FINDINGS 87).
+    backends (FINDINGS 91).
 
     Checked in the library wrappers, whose entry moves say which file each
     operand is in: virtual registers print as `%n`, so `fmov %2, %1` alone

@@ -1,6 +1,7 @@
 module Turkey.Core (
     refName, refOf, isRef, refElem,
     Core(..), CoreKind(..), CParam(..), CAlt(..), CBind(..), CProgram(..),
+    openings,
     mkCore, tailParts, tailFieldNames,
     Mapper(..), mapKind, bindValue, altBody,
     namesOf, namesInto,
@@ -60,7 +61,7 @@ import Turkey.Ast as Ast
 import Turkey.Diag as Diag
 import Turkey.Source (Span)
 import Turkey.Types as Ty
-import Turkey.Types (Kind(..), VarCell(..), Namer(..), TVar, TCon, TApp)
+import Turkey.Types (Kind(..), VarCell(..), ConCell(..), Namer(..), TVar, TCon, TApp)
 
 -- The reference-cell constructor. `%` cannot start a source identifier, so this
 -- can never collide with a declared type, and no program can write it.
@@ -735,7 +736,7 @@ fun showExpr(e : Core, indent : Int, n : Namer, a : Aliases) -> String {
             let out = Array.new(len(alts) * 2 + 2)
             Array.push(out, p + "match " + flat(scrutinee, n, a) + " {")
             for alt in alts {
-                Array.push(out, p + "  " + showPattern(alt.pat) + " ->")
+                Array.push(out, p + "  " + showPattern(alt.pat, a) + " ->")
                 Array.push(out, showExpr(alt.body, indent + 2, n, a))
             }
             Array.push(out, p + "}")
@@ -784,23 +785,72 @@ fun call(fn : Option Core, name : String, args : Array Core, indent : Int,
 }
 
 -- Patterns are surface patterns, so their rendering is small and local.
-fun showPattern(p : Pat) -> String = match p.kind {
+fun showPattern(p : Pat, a : Aliases) -> String = match p.kind {
     PVar(name) -> name
     PWild -> "_"
     PLit(l) -> showLit(l)
-    PCon(name, args) -> if len(args) == 0 { name } else {
-        name + "(" + String.join(Array.map(args, showPattern), ", ") + ")"
+    PCon(name, args) -> if len(args) == 0 { name + showOpening(p, a) } else {
+        name + showOpening(p, a) + "("
+            + String.join(Array.map(args, fun(x) = showPattern(x, a)), ", ") + ")"
     }
     PRecord(name, fields, rest) -> {
         let inner = Array.map(fields, fun(f) = {
             let (label, sub) = f
-            label + " = " + showPattern(sub)
+            label + " = " + showPattern(sub, a)
         })
         if rest { Array.push(inner, "..") }
-        name + " { " + String.join(inner, ", ") + " }"
+        name + showOpening(p, a) + " { " + String.join(inner, ", ") + " }"
     }
-    PTuple(elems) -> "(" + String.join(Array.map(elems, showPattern), ", ") + ")"
-    PAnnot(inner, _) -> showPattern(inner)
+    PTuple(elems) ->
+        "(" + String.join(Array.map(elems, fun(x) = showPattern(x, a)), ", ") + ")"
+    PAnnot(inner, _) -> showPattern(inner, a)
+}
+
+-- Every existential constructor pattern inside a pattern, outermost and
+-- leftmost first -- the order an arm's copies are keyed in (SPEC-DELTAS 68).
+--
+-- Here rather than in `Turkey.Layout`, because `Turkey.Mono.checkLayouts` asks
+-- the same question to refuse what `share` did not copy.
+fun openings(p : Pat) -> Array Pat {
+    let out = Array.new(2)
+    openingsInto(p, out)
+    out
+}
+
+fun openingsInto(p : Pat, out : Array Pat) -> Unit = match p.kind {
+    PAnnot(inner, _) -> openingsInto(inner, out)
+    PTuple(elems) -> for e in elems { openingsInto(e, out) }
+    PCon(_, args) -> {
+        match p.opening {
+            Some(_) -> Array.push(out, p)
+            None -> {}
+        }
+        for a in args { openingsInto(a, out) }
+    }
+    PRecord(_, fields, _) -> {
+        match p.opening {
+            Some(_) -> Array.push(out, p)
+            None -> {}
+        }
+        for (_, sub) in fields { openingsInto(sub, out) }
+    }
+    _ -> {}
+}
+
+-- What opening an existential binds, as `[s@i64](%d1.Show)`: the rigid
+-- constants, the layouts this copy of the arm was made for, and the
+-- dictionaries, named as the body will print them (SPEC-DELTAS 68).
+fun showOpening(p : Pat, a : Aliases) -> String = match p.opening {
+    None -> ""
+    Some(o) -> {
+        let layouts = match o.layouts {
+            None -> ""
+            Some(ls) -> "@" + String.join(ls, ",")
+        }
+        "[" + String.join(Array.map(o.skolems, fun(s) = s.name), ", ") + layouts
+            + "](" + String.join(Array.map(o.evidence, fun(n) = alias(a, n)), ", ")
+            + ")"
+    }
 }
 
 -- One binding. The namer starts here and is shared by every type printed under

@@ -612,6 +612,272 @@ wrong, not which instruction -- so it wants the fuzzer beside it, not instead
 of it. It is also the argument, now evidenced, for the phase ordering already
 written down: LLVM outlives the allocator's first working version.
 
+## Spilling, surveyed
+
+Written before the spiller, once measurement had settled that one is needed:
+`boot` has 35 untraced values live at once against 28 registers, and up to 84
+traced plus 31 untraced live across a single call against ten callee-saved
+registers. The question is not whether to spill but what shape the first
+spiller takes, and the peers split on exactly one axis: **whether a reload
+creates a new definition that SSA has to be repaired for.**
+
+| | what it does | where spills and reloads go | size | measured |
+|---|---|---|---|---|
+| **Braun & Hack** (CC 2009), in libFirm | Belady's furthest-next-use generalized to a CFG, per block in reverse postorder | spill at the first eviction; reloads on first use in a block or on incoming edges; **SSA reconstructed** for every reloaded variable | libFirm `bespillbelady.c` + `bespillutil.c` (~800 lines, the latter) | executed reloads **-54.5%** (spills -61.5%) vs a linear-scan allocator, **-58.2%** (-41.9%) vs graph colouring, on CINT2000, x86 |
+| **libFirm** `bespillutil.c` | the placement back end for the above | spill after the definition by default, moved later when execution frequencies say it is cheaper; rematerializes where that beats a load | ~800 | -- |
+| **QBE** `spill.c` | loop-depth-weighted cost, runs after SSA is left | spills after definitions, reloads before the instruction needing the register | **531** | nothing published |
+| **Go** `regalloc.go` + `stackalloc.go` | greedy; restores made lazily at a use | "The spill of v must dominate that block" -- placed at a dominator of all restores where `v` is still in a register | 3,464 + ~450 | -- |
+| **regalloc2** | split at the first conflict, one split per iteration; leftovers go to a "spill bundle" | split points chosen by conflict; spillslots shared by non-overlapping spillsets | >10,000 | -- |
+| **Poletto & Sarkar** linear scan | spill the active interval that ends last | the whole interval, everywhere | small | "within 12%" of graph colouring with 31 registers |
+
+**The spill-everywhere shape is the one Braun & Hack measure against, and they
+are right about what it costs.** Their own description of the baseline is
+exact: in extreme cases a failure "results in spilling the whole live range of
+a variable: Stores will be put after each definition and loads in front of each
+use, regardless of their location in the program." A value defined before a
+loop and used inside it reloads every iteration; theirs reloads once in front
+of the loop. That is the 54.5%.
+
+**And what buys the 54.5% is SSA reconstruction.** Their algorithm "retains
+the SSA form" by recording "all inserted reload operations per variable" and
+reconstructing SSA for those variables -- "adding a reload causes a φ-function
+to be created". libFirm does the same through `be_ssa_construction_fix_users`.
+Go avoids it by not being in SSA at that point, and QBE by having left SSA
+before spilling.
+
+**Why this backend starts with spill-everywhere anyway, and what differs from
+the peers who did not.** Three facts of this design, none of which the peers
+share:
+
+* **A reload that needs a φ needs a block parameter, and a `Branch` cannot pass
+  one.** `Term` gives arguments to `Jump` only -- the property that made critical
+  edges a non-problem above. So SSA reconstruction here is also edge splitting,
+  which is a second transformation of the CFG, and a mistake in either is a
+  wrong program that `Ssa.verify` does not catch (it checks dominance, not
+  that the right definition reached the merge). libFirm has phis and splits
+  nothing.
+* **There is no execution oracle yet.** The spiller's output is not run until
+  the frame and the emitter exist. Spill-everywhere is checkable locally --
+  one slot per value, one store directly after its definition, every load used
+  by the very next instruction -- and a reconstruction is not.
+* **The ceiling on the whole question is already known.** LLVM's 1-2% smaller
+  and up to 10% faster for a world-class allocator over a plain one, and
+  Poletto and Sarkar's 12%, bound what spill placement can be worth, on
+  programs where every call is already followed by a panic test and every
+  pointer by a root store.
+
+So the first slice keeps SSA the cheap way: every reload dominates its only use.
+The chordal theorem still holds, colouring still cannot fail once pressure
+fits, and **splitting is a later pass that rewrites these reloads** -- reload once
+after a call rather than at every use -- when a measured load count says it
+pays. Braun & Hack's algorithm is the one to reach for then, and their numbers
+are the ones to hold it to.
+
+**The root array still counts, and more than before.** A rooted value spilled
+this way is written to its root slot once, at its definition, rather than at
+every safepoint; the safepoint then writes only the mask. That is the one place
+spill-everywhere is *cheaper* than the LLVM path's rooting. It needs slots at 64
+and above zeroed in the prologue, which LLVM already does.
+
+**Flags do not constrain reload placement.** The earlier worry was that a
+spiller would insert between a flag-setter and its `cset`. It would -- and
+`ldr` and `str` do not touch the flags, so nothing breaks. The invariant to
+check is narrower: nothing *flag-setting* is inserted there.
+
+**One hazard every spill shape shares, found by reading the colourer.**
+Physical registers are tracked as *clobbered* but not as *live*. Selection
+never defines a value between `mov x0, %a` and the `bl` that reads `x0`, so no
+bug has shown -- but a reload inserted in front of `mov x1, %b` is exactly such
+a value, and could be coloured `x0`. The allocator learns physical liveness
+before it learns to spill.
+
+Sources: [Braun & Hack, CC 2009](https://link.springer.com/chapter/10.1007/978-3-642-00722-4_13);
+[libFirm `bespillutil.c`](https://github.com/libfirm/libfirm/blob/master/ir/be/bespillutil.c);
+[QBE `spill.c`](https://c9x.me/git/qbe.git/tree/spill.c);
+[Go `regalloc.go`](https://github.com/golang/go/blob/master/src/cmd/compile/internal/ssa/regalloc.go),
+[`stackalloc.go`](https://github.com/golang/go/blob/master/src/cmd/compile/internal/ssa/stackalloc.go);
+[regalloc2 `ION.md`](https://github.com/bytecodealliance/regalloc2/blob/main/doc/ION.md);
+[Poletto & Sarkar, TOPLAS 1999](https://dl.acm.org/doi/10.1145/330249.330250).
+
+## Frames, calls and roots, surveyed
+
+Written before the frame, because the first draft of the plan for it copied the
+LLVM path's root registration into every arm64 prologue -- a *call* to
+`turkey_root_enter` on the way in and to `turkey_root_leave` on every way out --
+and nothing about arm64 required that. The LLVM path does it because it was the
+portable thing to write in IR; this backend owns its frames, and the question
+is what owning them buys.
+
+### How a collector finds the roots in a frame
+
+| | what it does at entry and exit | what a safepoint costs | what the collector reads | size |
+|---|---|---|---|---|
+| **This project, LLVM path** | a call each way; the runtime links a 5-word `RootFrame` into a chain | a store per live root, then a store of the live mask | the chain, and each frame's mask | `turkey_root_enter` is five stores, `leave` one (`turkey_runtime.c:228`) |
+| **LLVM `ShadowStackGCLowering`** | **no call**: a load of the chain head, a store of a per-function constant frame map, two stores to link | the root is written to its slot as it changes | the chain, and each frame's constant map | one pass |
+| **OCaml native** | nothing | nothing beyond a live value already being in a stack slot: `destroyed_at_oper` for a call is `all_phys_regs`, so no register survives one | `caml_frametable`: per return address, the live stack offsets; a linear-probing hash keyed on the return address | `frame_descriptors.c` ~400 lines |
+| **Go** | nothing for the maps | a PCDATA index per call site | a pointer bitmap per call site, found from the return PC through `funcdata`/`pcdata` tables | the runtime's stack scanner and the compiler's liveness pass |
+
+LLVM's own documentation states the trade: the shadow stack is "slower than
+using a stack map compiled into the executable as constant data", and its
+drawbacks are "high overhead per function call" and that it is "not
+thread-safe". Henderson's ISMM 2002 paper is where the shadow stack comes from,
+for Mercury's C back end; its overhead figures could not be extracted from the
+PDF for this survey, so the numbers below are this project's own.
+
+**Why OCaml's shape fits here better than it fits most compilers.** Frame tables
+are cheap only if the collector can find every live pointer from the stack
+alone. OCaml gets that by keeping nothing in a register across a call. This
+backend gets most of it already: every traced value live across a safepoint has
+a root slot (`Turkey.Roots`), and selection stores it there before the call. A
+copy of the same pointer may also stay in a callee-saved register, and that is
+safe *only because the collector does not move objects* -- which the LLVM path
+already relies on, since it keeps using the SSA value after the call rather
+than reloading it. A moving collector would need either OCaml's rule or register
+maps, and is not planned.
+
+**What frame tables cost this project that they do not cost OCaml.** The
+runtime is C and is shared with the LLVM path, which keeps its chain. So the
+collector would walk *both*: the chain, as today, and the native frames of arm64
+code -- following `x29` frame records, which Apple requires to be valid, and
+looking each return address up in a table the emitter writes. The C runtime's
+own frames in between are skipped because their return addresses are in no
+table. That is a runtime walker of perhaps a hundred lines and a data section in
+the emitter, against deleting the entry, exit and mask code from every function.
+
+**Measured on this project, through the LLVM path** (2026-09-15). Stage2 `boot`
+-- `Turkey.Llvm`'s own output for `boot/Main.gob`, 68 MB of IR -- running
+`boot asm` over the 43-program corpus, built with `cc -O2` on an M-series Mac.
+One run makes **455 million** frame enters. The module has 2,529 enter sites,
+40,835 leave sites, 251,292 root-slot stores and 45,252 mask stores.
+
+| variant | best | what it isolates |
+|---|---|---|
+| `turkey_root_enter`/`leave` are real calls (`.ll` and runtime compiled apart) | 8.88 s | today's LLVM path |
+| the same with `-flto`, so both inline | 8.91 s | the call itself: **noise** |
+| inline, collection never runs | 8.12 s | the shadow stack without GC time |
+| push/pop stubbed and mask stores deleted, root stores kept, no collection | **7.05 s** | what frame tables leave behind |
+| root stores deleted as well | 7.03 s | the stores rooting needs anyway |
+
+Best of seven for the first two and best of nine, interleaved, for the last
+three -- the machine was shared with another build, and the interleaved
+minima agree to within 0.1 s run to run. `benchmarks/shadow_stack.sh` rebuilds
+the variants and reruns the timings.
+
+So the shadow stack costs **13%** of this workload's time once collection is
+taken out, and *inlining it recovers none of that*: the call was never the
+expensive part. The expense is 455 million pushes and pops and the mask store
+before every safepoint. The root stores themselves cost 0.02 s -- which is why
+frame tables keep them without regret. Frame tables remove exactly the 13%, and
+an inline shadow stack removes nothing measurable over today's calls.
+
+**Decided: frame tables.** The arm64 backend registers roots OCaml's way.
+Selection keeps the store of each live root into its slot before a safepoint
+and marks the call; frame layout records, per safepoint, the fp-relative slots
+live across it; the emitter writes one table entry per return address; the
+runtime's collector walks `x29` frame records and looks each return address up,
+beside the chain the LLVM path and the C runtime go on using. No function enters
+or leaves anything, and no safepoint writes a mask.
+
+#### The table's encoding, surveyed
+
+"Frame tables rather than a shadow stack" is decided above and measured. What
+that leaves open is the part both the emitter and the C runtime have to agree
+on for good: what a table entry is keyed by, who builds the lookup structure,
+and how wide an offset is.
+
+| | keyed by | who builds the lookup | entry shape |
+|---|---|---|---|
+| **OCaml** `runtime/frame_descriptors.c`, `caml/frame_descriptors.h` | the **return address** (`uintnat retaddr`) | the runtime, at startup: `caml_init_frame_descriptors` walks the compiler-emitted `caml_frametable[]` and fills an open-addressed hash table, linear probing, capacity a power of two and `num_desc * 2 <= capacity` | `{uintnat retaddr; uint16_t frame_data; uint16_t num_live; uint16_t live_ofs[]}` -- variable length, walked by `next_frame_descr`; `frame_data` packs the frame size with two flag bits |
+| **Go** `runtime/stkframe.go`, `cmd/link` pclntab | the **pc offset within a function**, and a `pcdata` index derived from it | the **linker**, which is the only thing that knows final addresses; the runtime indexes `FUNCDATA_LocalsPointerMaps`/`ArgsPointerMaps` by the decoded `pcdata` value | one bitmap per distinct safepoint, indexed rather than searched -- and the pc must be backed up to the call: "Back up to the CALL. If we're at the function entry point, we want to use the entry map (-1)" |
+| **LLVM** `__llvm_stackmaps` (`StackMaps.html`) | an ID plus "the offset within the code from the beginning of the enclosing function" | the runtime, explicitly: "compactness of the representation is secondary because the runtime is expected to parse the data immediately after compiling a module and encode the information in its own format" | fixed header per record -- `uint64` ID, `uint32` instruction offset, `uint16` flags, `uint16` NumLocations -- then 12-byte locations |
+| **LLVM** shadow stack, for contrast (`GarbageCollection.html`) | -- | -- | the strategy this project measured at 13%: "slower than using a stack map compiled into the executable as constant data, but has a significant portability advantage because it requires no special support from the target code generator" |
+
+**Go is the counterexample, and it does not transfer.** Keying on a pc offset
+is better than keying on a return address -- it is denser, it needs no
+relocation, and the lookup is an index rather than a probe -- but it costs a
+linker that sorts every function by final address and writes the table. This
+backend emits assembly and hands it to `cc` (LINKER.md, option B); it does not
+know a final address and cannot sort by one. The emitter can write
+`.quad <label>` and let the linker relocate it, which is exactly the shape
+OCaml's `retaddr` has. So: **keyed by return address**, because the alternative
+presupposes a linker this project chose not to write.
+
+**The runtime builds the lookup, at startup.** All three peers agree and LLVM
+says why outright: the compiler's format is for getting the facts across, not
+for being queried. A table registered once and probed on every frame of every
+collection should be shaped by the reader.
+
+**What is being started simple, deliberately.** OCaml packs `frame_data` and
+`live_ofs` into `uint16_t` and walks entries variable-length; `boot`'s largest
+frame is 16,672 bytes and its largest root set is small, so 16-bit offsets fit
+with room. That would quarter a table of 45,097 entries. It is also entirely
+reversible -- the format has one producer and one consumer, both in this
+repository -- whereas the two decisions above are not. So the first version
+writes `.quad` throughout and the section's measured size is what argues for or
+against packing it. Likewise the lookup: a sorted copy and a binary search is
+fewer lines than a hash table, and the collection time is what decides whether
+OCaml's probe is worth writing.
+
+**The format, then.** One flat array, `_turkey_frame_table`, emitted after the
+functions and registered once by the entry sequence:
+
+    _turkey_frame_table:
+        .quad   <number of entries>
+        ;; per entry, in any order:
+        .quad   <return-address label>      ;; the label after the `bl`
+        .quad   <number of live roots>
+        .quad   <offset from x29>           ;; × that many
+
+The return-address label is the address *after* the call, which is what `x30`
+holds and what a walker reads out of a frame record -- so the emitter has
+nothing to compute: selection already marks the position with `SafepointMap`,
+directly after the `bl`, and a label printed there is the key. The offsets are
+`x29`-relative and signed, which `Turkey.Frame.layout` has been computing since
+phase 4 (`rootsAt + 8·slot - recordAt`).
+
+`turkey_frame_table_register(const int64_t *table)` is called before anything
+allocates. A binary that registers nothing -- every LLVM-path binary, which
+links this same runtime -- walks no frames, which is what lets one runtime serve
+both backends.
+
+
+
+### Frames
+
+| | frame record and callee-saves | outgoing stack arguments | scratch registers | size |
+|---|---|---|---|---|
+| **Apple arm64 ABI** | "`x29` must always address a valid frame record"; `x18` is reserved | packed: an argument narrower than 8 bytes takes its own size; the *caller* extends arguments narrower than 32 bits | -- | -- |
+| **QBE** `arm64/emit.c`, `abi.c` | frame record at `x29`, then callee-saves, spill slots, locals; `stp x29, x30, [sp, -N]!` when N ≤ 512 | `sp` adjusted per call | `x16` for frames over 4095 bytes; a scratch register when a slot offset passes `4095 × size` | 693 + 852 |
+| **Go** `cmd/internal/obj/arm64` | frame pointer and link register saved at entry, 16-byte aligned; large frames store the record before moving `sp` so a signal never sees half a frame | -- | `REGTMP` for frame sizes past 12 bits | -- |
+| **Cranelift** `aarch64/abi.rs` | callee-saves as `stp` pairs "at the top of the frame, just below FP" | a **preallocated** outgoing area, `sp` adjusted once | `x16`/`x17` as spill temporaries | ~1,400 |
+
+The decisions these settle:
+
+* **A preallocated outgoing area, as Cranelift and Go do, not QBE's per-call
+  adjustment.** Root and spill slots are addressed from `sp`, and an `sp` that
+  moves around each call would move every one of those offsets with it.
+* **Stack arguments between Turkey functions take whole 8-byte slots.** Apple's
+  packing rule is for arguments narrower than a word, and every value this
+  compiler passes on the stack is passed as a word. Only Turkey code calls
+  Turkey code with more than eight arguments -- runtime calls take at most four,
+  and C enters Turkey only through `turkey_main`'s `void (*)(void)` -- so the
+  convention is this compiler's to define, and it is Apple's for words.
+* **`x16` and `x17` are reserved**, as QBE, Go and Cranelift all reserve one or
+  both: large frames, large slot offsets, and the cycle in a block-parameter
+  parallel copy each need a register nobody else holds.
+
+Sources: [LLVM `ShadowStackGCLowering.cpp`](https://github.com/llvm/llvm-project/blob/main/llvm/lib/CodeGen/ShadowStackGCLowering.cpp);
+[Garbage Collection with LLVM](https://llvm.org/docs/GarbageCollection.html);
+[OCaml arm64 `proc.ml`](https://github.com/ocaml/ocaml/blob/trunk/asmcomp/arm64/proc.ml),
+[`frame_descriptors.c`](https://github.com/ocaml/ocaml/blob/trunk/runtime/frame_descriptors.c);
+[Go `stkframe.go`](https://github.com/golang/go/blob/master/src/runtime/stkframe.go),
+[`obj7.go`](https://github.com/golang/go/blob/master/src/cmd/internal/obj/arm64/obj7.go);
+[Henderson, ISMM 2002](https://bernsteinbear.com/assets/img/gc-uncooperative.pdf);
+[Writing ARM64 code for Apple platforms](https://developer.apple.com/documentation/xcode/writing-arm64-code-for-apple-platforms);
+[QBE `arm64/emit.c`](https://c9x.me/git/qbe.git/tree/arm64/emit.c),
+[`abi.c`](https://c9x.me/git/qbe.git/tree/arm64/abi.c);
+[Cranelift `aarch64/abi.rs`](https://github.com/bytecodealliance/wasmtime/blob/main/cranelift/codegen/src/isa/aarch64/abi.rs).
+
 
 ## Verification
 
@@ -936,44 +1202,15 @@ Each phase runs and is verified before the next begins.
   Status: **1866 of 1866 functions across the corpus select**, with
   `Ssa.verify` silent on every one. One gap is open and is phase 5's to close.
 
-  **More than eight arguments in one register file does not work, either side
-  of the call.** AAPCS64 passes the ninth argument and beyond on the stack, and
-  there is no frame to put it in -- the prologue that would is the same pass
-  that has still to assign a register to anything. The two sides fail
-  differently and only one of them is safe:
+  **More than eight arguments in one register file: closed in phase 5.** It
+  was open here in two unequal halves -- the caller stopped with a reason, and
+  a nine-parameter *callee* selected silently with no incoming convention at
+  all, which `opt` hid by folding every constant call to one. Both close with
+  the frame: `Select.call` stores the overflow into `[outgoing k]` and
+  `Select.incoming` loads it from `[incoming k]`. `tests/programs/manyargs.gob`
+  and `stackargs.gob` keep both halves honest; the callees recurse, because a
+  constant call folds away and proves nothing.
 
-  * **The caller stops and says so.** `Turkey.Select.call` asks `general >=
-    len(A.argRegs)` *before* taking the register and reports "a call with more
-    than eight arguments in one register file, which would need stack
-    arguments". Until it did, the check ran one line after the array index and
-    a nine-argument call panicked inside the compiler -- `array index out of
-    bounds: read at index 8, length 8`. No corpus program had a function of
-    more than eight parameters, so nothing found it; `tests/programs/manyargs.gob`
-    exists now for that reason, and the callee has to be *recursive*, because
-    `opt` inlines and folds a call with constant arguments.
-  * **The callee is silent, which is the part to fix first.** `start` copies
-    `f.params` through as ordinary virtuals and nothing binds them to the
-    incoming ABI at all, so a nine-parameter *function* selects cleanly and
-    means nothing. There is no diagnostic because there is no code -- the
-    incoming convention is established by the prologue, which does not exist.
-    A stop on the caller and silence on the callee is not a consistent state;
-    it is safe only because nothing downstream consumes the result yet.
-
-  Measured rather than assumed. A module holding a nine-parameter `sum9` and a
-  `main` that calls it with constant arguments reports **`selected 9 of 9
-  functions`** and no complaint at all: `opt` inlines and folds the call away,
-  so the caller check never runs, and `sum9` survives as a top-level function
-  whose nine parameters are printed as ordinary virtuals -- `fun @Main#sum9(%0:
-  i64, ..., %8:i64)`. Nothing in the pipeline says this function has no
-  callable entry sequence. That is the shape to remember: the caller's stop is
-  a real diagnostic, and it is also the reason the callee's silence looks
-  covered when it is not.
-
-  `tests/test_select.py` holds the caller half as a ratchet: `KNOWN_REASONS`
-  has exactly this one entry, a reason outside the set fails the run, and
-  `stopped == 2` is asserted exactly rather than as a bound so that the number
-  moving is something a person looks at. Closing this deletes the entry, the
-  assertion and this paragraph together.
 * **Phase 5.** Register allocation, stack maps, encoding, object emission.
 
   **Measured before written, because the spiller is the expensive half.** On
@@ -1051,15 +1288,49 @@ Each phase runs and is verified before the next begins.
   values use between calls. It was optimistic by a factor of three and a half;
   the untraced figure above is the honest one.
 
-  **Status: the corpus colours completely; `boot` does not yet.**
+  **Status (measured 2026-09-15): the allocator finishes on the corpus and on
+  `boot`; nothing yet emits runnable code.**
 
-  | | coloured | argument hints taken |
-  |---|---|---|
-  | the corpus | **1885 of 1888** | 2556 of 3714, **68.8%** |
-  | `boot` compiling itself | 2681 of 2934 | 2363 of 6132, 38.5% |
+  | | selected | allocated | spilled (into root slots) | reloads | argument hints taken |
+  |---|---|---|---|---|---|
+  | the corpus, 43 programs | 2741 of 2743 | **2741 of 2741** | 60 (32) | 125 | 5761 of 7107, 81.1% |
+  | `boot` compiling itself | 3040 of 3061 | **3040 of 3040** | 5284 (3642) | 9163 | 4845 of 8708, 55.6% |
 
-  Zero complaints from `verifyColouring` on either, which is the check that
-  matters: a colouring putting two simultaneously live values in one register
+  Spilling is spill-everywhere ("Spilling, surveyed" above): a value with no
+  register is stored once after its definition and reloaded before each use,
+  and every function finishes in one round of it. Before it, colouring
+  stopped in 10 corpus functions and 249 of `boot`'s. `boot asm boot/Main.gob`
+  went from 65 to 88 seconds.
+
+  **How a value is chosen, and the thing the plan got wrong.** The plan was
+  first come, first served: spill whichever value the walk could not place.
+  That is right for one kind of failure and does nothing for the other. When a
+  register is free but *forbidden* -- the value is live across a call or a
+  physical register in use -- spilling that value is exactly the fix. When
+  every register is *held*, spilling it frees nothing: it still needs a
+  register at its own definition, for the one instruction before its store.
+  So that case evicts the holder whose next use is furthest away, which is
+  Belady's rule applied at one point. Both are in `Regalloc.place`.
+
+  **Three checks run on every allocated function**, because spilling rewrites
+  it: `Ssa.verify` (still a graph), `verifyColouring` (still a colouring, now
+  including physical registers as live), and `verifyAllocation` (one value per
+  slot, each store directly after its definition, each reload read only by the
+  instruction it was loaded for, every `cset` still reaching its flag setter).
+  None reports anything on either. **These are checkers, not an oracle**:
+  whether spilled code computes the right answer is not known until the frame
+  and the emitter exist and the corpus runs against LLVM.
+
+  Selection stops nowhere: 2781 of 2781 corpus functions and 3073 of 3073 in
+  `boot`, since stack arguments landed. Every function takes its closure
+  environment as a hidden first argument, so a helper with eight declared
+  parameters is a nine-argument call -- the first version of the spiller added
+  two such calls to `boot` itself (FINDINGS 92). The three `Prim.floatBits`
+  stops are closed, with `Prim.floatFromBits`, `Prim.floatIsNaN` and
+  `Prim.floatFitsInt` (FINDINGS 91).
+
+  Zero complaints from `verifyColouring` on either, which was the check that
+  mattered before spilling: a colouring putting two simultaneously live values in one register
   prints, assembles, links, runs, and computes a wrong answer, and nothing
   downstream can see it. It checks reachable blocks only, and only functions
   whose colouring *finished* -- a stopped one has unassigned values by
@@ -1096,33 +1367,166 @@ Each phase runs and is verified before the next begins.
   The order is what the project does everywhere else: the corpus works and
   `boot` needs one more slice, and the histogram names it.
 
-  **The function boundary has no calling convention at all yet, on either
-  side.** Reading the code to write the prologue turned this up, and it is
-  wider than "there is no prologue":
+  **Boundaries and frames (measured 2026-09-15).** Each function now has both
+  halves of the calling convention as instructions, and a laid-out frame:
 
-  * `Select.start` copies `f.params` through as ordinary virtuals. Nothing
-    binds parameter *i* to `x`*i*. This is the callee half of the
-    stack-argument gap recorded under phase 4, and it is not specific to nine
-    parameters -- a *one*-parameter function has no incoming convention either.
-    It has been invisible because no consumer of the selected code exists yet.
-  * `Term.Ret(v)` names a virtual and nothing moves it to `x0`.
+  * `Select.incoming` gives every function a new entry block that moves each
+    parameter out of `x`*i*, `d`*i* or `[incoming k]`; the machine function has
+    no `params` of its own, so each parameter has one definition the allocator
+    sees. Hints read off those moves, and off argument and result moves too.
+  * `Select.call` passes arguments past eight in a file in `[outgoing k]`, a
+    preallocated area at the bottom of the frame.
+  * Before a safepoint, selection stores each live root into its slot and
+    marks the call with a `SafepointMap`; `Turkey.Frame` turns each mark into a
+    frame-table entry of `x29`-relative root offsets. Nothing enters or leaves
+    a root frame and no safepoint writes a mask -- the decision "Frames, calls
+    and roots, surveyed" measured.
+  * `Turkey.Frame.layout` places the frame record, the callee-saved registers
+    the colouring used, root slots, spill slots and the outgoing area, 16-byte
+    aligned; `verifyFrame` checks the regions, that no value holds a reserved
+    register (`x16`-`x18`, `x29`, `x30`), that every slot is in the frame, and
+    that every root a map lists is stored before its call.
 
-  So the "corpus colours 1888 of 1888" above is a statement about the
-  *interior* of each function. The edges are missing, and they are what the
-  prologue slice has to add. The shape is a copy in and a copy out: fresh
-  values pinned to `x0`-`x7` and `d0`-`d7` at entry and to `x0` at exit, with
-  an ordinary `mov` between them and the body's values, which the colourer's
-  hinting should then coalesce away in the common case. Pinning is what the
-  colourer gains for it -- a value whose register is fixed before the walk
-  begins -- and it is the one thing in this design that can *fail* rather than
-  merely allocate badly, because a parameter pinned to `x0` and live across a
-  call has a contradiction the copy exists to break.
+  | | selected | frames: largest | callee-saved used, most | functions with stack arguments | frame-table entries |
+  |---|---|---|---|---|---|
+  | the corpus, 44 programs | 2781 of 2781 | 2,576 bytes | 10 gp, 8 fp | 7 | 4,070 |
+  | `boot` compiling itself | 3073 of 3073 | 16,672 bytes | 10 gp, 1 fp | 22 | 45,097 |
 
-  **`boot` needs stack arguments to compile itself.** The same run reports four
-  calls stopped for more than eight arguments in one register file, in the
-  compiler's own source. The gap recorded under phase 4 is not a hypothetical
-  a test program invented; it is on the path to M29.
+  `verifyFrame`, `verifyAllocation`, `verifyColouring` and `Ssa.verify` report
+  nothing on either. These are checkers rather than an oracle, which FINDINGS 95
+  is the demonstration of.
 
+  **The emitter prints functions (`boot native`, measured 2026-09-15).**
+  `boot asm` keeps the machine IR and its histograms; `boot native` prints what
+  the assembler reads. `Turkey.Emit` adds only what had no instruction before:
+  the prologue and epilogue from `Turkey.Frame.Layout`, the branch a terminator
+  becomes (with the next block falling through), the parallel copy a jump's
+  arguments become on the edge, and the substitution of the colouring and the
+  slot offsets. A move into the register a value already holds is dropped,
+  which is what a taken hint looks like from here.
+
+  | | assembly | `as` | nothing skipped |
+  |---|---|---|---|
+  | the corpus, 44 programs | 302,146 lines | all 44 assemble | yes |
+  | `boot` compiling itself | 2,271,163 lines, 49 MB, 203 s | 8 s, a 10 MB object | yes |
+
+  Two things moved into selection to make that possible, both of which the
+  LLVM path already had and the arm64 path did not:
+
+  * **The panic test after every call.** `turkey_panic` sets a flag and
+    returns, so a caller that did not look would carry on with a value the
+    callee never produced. `Select.propagate` reads
+    `turkey_has_panicked` -- through the global offset table, since the runtime
+    defines it -- and reuses `guard` to return a zero. 12,614 of them in the
+    corpus.
+  * **`Panic(v)` as a terminator**, which is `turkey_panic_string` and a return
+    of zero. And the zero itself: `mov d0, xzr` is not an instruction, so a
+    `Float` function's panic path needs `fmov`, which nothing had exercised
+    until whole functions were assembled.
+
+  **`as` is an oracle for spelling and not for meaning.** It accepted a
+  parallel copy that lost half its values (FINDINGS 95), and it will accept
+  anything else this backend decides wrongly. The oracle for meaning is running
+  the program against LLVM, which needs the module data and the runtime walker
+  -- the next slice, sketched under phase 5b: globals, string literals, the
+  permanent root array, module initialization, the entry point, the frame table
+  as data, and the collector walking `x29` records beside the chain it has.
+
+  **The module, and the first programs that run (measured 2026-09-16).**
+  `boot native` now prints a whole module: each literal's bytes, a word of
+  storage per untraced global, the permanent root array and the `RootFrame`
+  covering it, the entry sequence, and the frame table. `cc` links the result
+  against the C runtime and it runs.
+
+  | | assembly | frame-table entries | against the reference | under `TURKEY_GC_STRESS` |
+  |---|---|---|---|---|
+  | the corpus, 44 programs | 327,238 lines | 4,070 | **44 of 44** | **44 of 44** |
+  | `boot` compiling itself | 2,658,647 lines, 54 MB, 67 s | 46,595 | not yet | -- |
+
+  The entry sequence is `Turkey.Llvm.emitEntry`'s, in the same order and for
+  the same reasons -- register the permanent frame with an all-ones mask, build
+  each literal's `TurkeyString` into its slot, run `%module.initialize`, call
+  `main` with a null environment -- with `main` itself a call to `turkey_main`,
+  so argument handling, the panic report and the final collection stay written
+  once in C. It is the only hand-written assembly in the backend, and it goes
+  through the instruction printer wherever there is an instruction to print.
+
+  **What the plain run does not check, and stress does.** With no frame table
+  emitted and no walker written, all 44 programs already passed the
+  differential run: a corpus program collects a handful of times or not at all,
+  and a root the collector cannot see is usually a root nothing frees in time
+  to matter. Under `TURKEY_GC_STRESS`, which collects at every allocation,
+  **seven** of the 44 passed -- SIGSEGV, SIGBUS, and panics holding values that
+  were never pointers. That ratio is the argument for running the stress suite
+  as a test rather than as an occasional check: it is the difference between an
+  oracle that reads the root machinery and one that steps over it.
+
+  **The walker.** `turkey_frame_table_register` sorts the module's table once
+  at startup, because the emitter cannot -- the addresses do not exist until
+  the linker assigns them, and `.quad <label>` is all it can write (see "The
+  table's encoding, surveyed"). `turkey_collect` then walks `x29` records and
+  binary searches, *beside* the shadow-stack chain and not instead of it: a C
+  frame or an LLVM-path frame has a return address in no table and is skipped,
+  which is what lets one runtime serve both backends, and a binary that
+  registers no table walks nothing.
+
+  The bug worth recording is which frame the offsets apply to. A frame record
+  holds the return address of the function that owns it, which is an address in
+  its *caller* -- so the entry that address finds describes the caller's frame,
+  whose `x29` is the record's saved one. Applying the offsets to the frame the
+  address was read from reads whatever the callee happens to hold there, and
+  said so on nearly every program at once.
+
+### Phase 6: the backend compiles itself (measured 2026-09-16)
+
+Three checks, in increasing strength.
+
+**The corpus, against the LLVM path.** Both compilers run `asm` over all 44
+programs and the output is byte-identical: 264,606 lines, `cmp` clean. One
+program, two compilers.
+
+**stage2-arm64 exists.** `boot native boot/Main.gob` gives 2,658,647 lines in
+67 s, which `cc` links against the runtime into an 11 MB executable in 8 s, and
+that binary compiles programs.
+
+**The fixed point, and it is the strong form.** stage2-arm64 compiles
+`boot/Main.gob` again in 63 s and emits output **byte-for-byte identical** to
+stage1's. The ordinary bootstrap check is stage3 against a fourth stage; this
+is the compiler source compiled by two *different* compilers -- one built by
+LLVM, one built by this backend -- agreeing exactly. M29's outstanding question
+for the LLVM path ("stage2 against stage3 has not been compared") is answered
+here for the arm64 path.
+
+**Speed, best of three, interleaved.** stage2-arm64 runs the corpus in
+**12.84 s** against stage1's **13.83 s**.
+
+This is not evidence that the backend out-selects LLVM, and should not be read
+that way. The LLVM path still registers roots with the shadow stack, which
+"Frames, calls and roots, surveyed" measured at 13% of this very workload, and
+the arm64 path replaced it with frame tables. The ~7% gap is about the size of
+what that predicts, so what is being measured is the root strategy, with
+codegen quality unresolved either way. A comparison that isolated codegen would
+need both paths on the same root scheme.
+
+**Under GC stress.** All 44 corpus programs pass. stage2-arm64 itself passes
+`tokens` in 3.4 s -- the self-compiled compiler collecting at every allocation
+and walking frame tables it emitted for itself. `types` did **not** finish inside fifteen
+minutes and was killed, and neither did the same command on the *smallest*
+corpus program (299 bytes) inside ten -- so the cost is `boot`'s own startup,
+not the input: the prelude is parsed and typechecked before any of it is
+reached, and stress collects at every allocation with a full mark and sweep.
+Stress at compiler scale needs a cheaper collector or a sampled stress mode,
+and until then it says nothing either way. The probe's cost, not a result.
+
+  **Spilling after the root stores**, on `boot`: 5,702 values spilled (3,937 of
+  them into root slots), 5,702 stores and **10,001 reloads**. The first version
+  had 24,977 -- every root store before a safepoint read its value, and for a
+  value already spilled into that very slot the read was a reload of what the
+  slot held. `spill` now drops those stores (FINDINGS 94). The allocator's move
+  hints now cover argument and result moves as well as parameters: 153,525 of
+  184,766 taken. `boot asm boot/Main.gob` takes 126 seconds, up from 88;
+  selection runs every function twice (once for the function, once for its
+  stop reason) and each run now analyzes roots, which is the first place to look.
 
 LLVM is transitional: it is what phase 5 is differentially checked against, so
 it outlives the allocator's first working version by however long that takes to

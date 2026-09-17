@@ -22,6 +22,7 @@ module so that several can share a run even though they cannot share a file.
 
 import contextlib
 import functools
+import hashlib
 import io
 import os
 import shutil
@@ -38,6 +39,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 BOOT_MAIN = REPO_ROOT / "boot" / "Main.gob"
 PROGRAMS = REPO_ROOT / "tests" / "programs"
 RUNTIME = REPO_ROOT / "runtime" / "turkey_runtime.c"
+RUNTIME_HEADER = REPO_ROOT / "runtime" / "turkey_runtime.h"
 
 # Every corpus program compiles and runs. The set is kept because naming what
 # does not work is how the previous gaps got closed: a program listed here is a
@@ -50,56 +52,98 @@ CORPUS = sorted(
 )
 COMPILABLE = [name for name in CORPUS if name not in UNSUPPORTED]
 
+# Binaries and the runtime object, shared by every worker and every session.
+# Each file is keyed by the hash of what it was built from, so a stale one is
+# never served and a warm one is never rebuilt.
+CACHE = Path(tempfile.gettempdir()) / "turkey-native"
+
 
 def _cc() -> str | None:
     return shutil.which("cc")
 
 
+def _split_llvm(text: str, paths: list[Path]) -> list[str]:
+    modules = bootc.split_before(text, "; === ")
+    assert set(modules) == {p.name for p in paths}, (
+        sorted({p.name for p in paths} - set(modules)))
+    return [modules[p.name] for p in paths]
+
+
 @functools.lru_cache(maxsize=None)
 def _modules() -> dict[str, str]:
-    """Every corpus program's LLVM IR, from one run of a compiled `boot`.
+    """Every corpus program's LLVM IR, cached on disk per program.
 
     Interpreting `boot` here instead cost this module forty-six minutes to do
-    about ten seconds of work; see `tests.bootc`.
+    about ten seconds of work; see `tests.bootc`. And keeping the result only in
+    this process cost one corpus run per `pytest -n auto` worker.
     """
-    text = bootc.boot("llvm", *(str(PROGRAMS / name) for name in CORPUS))
-    modules = bootc.split_before(text, "; === ")
-    assert set(modules) == set(CORPUS), sorted(set(CORPUS) - set(modules))
-    return modules
+    paths = [PROGRAMS / name for name in CORPUS]
+    texts = bootc.boot_each("llvm", paths, _split_llvm)
+    return {path.name: texts[path] for path in paths}
+
+
+def _digest(*parts: bytes) -> str:
+    h = hashlib.sha256()
+    for part in parts:
+        h.update(part)
+    return h.hexdigest()[:24]
+
+
+def _replace_built(command: list[str], output: Path) -> None:
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[:4000]
+    os.replace(command[command.index("-o") + 1], output)
 
 
 @functools.lru_cache(maxsize=None)
-def _workspace() -> Path:
-    """One directory for every module and binary in this module's tests.
+def _runtime_object() -> Path:
+    """`turkey_runtime.c`, compiled once rather than once per program.
 
-    Not a `tmp_path` fixture: those are per test, and `_binary` is cached
-    across tests precisely so that linking happens once per program.
+    Every test binary used to compile the runtime from source beside its module
+    -- the largest C file here, forty-odd times per worker.
     """
-    return Path(tempfile.mkdtemp(prefix="turkey-native-"))
+    key = _digest(RUNTIME.read_bytes(), RUNTIME_HEADER.read_bytes())
+    output = CACHE / f"runtime-{key}.o"
+    if not output.exists():
+        CACHE.mkdir(parents=True, exist_ok=True)
+        staging = CACHE / f"runtime-{key}.{os.getpid()}.o"
+        _replace_built(["cc", "-std=c11", "-O1", "-c", "-o", str(staging),
+                        str(RUNTIME)], output)
+    return output
 
 
 @functools.lru_cache(maxsize=None)
 def _binary(name: str) -> Path:
-    """One program, linked against the runtime."""
-    directory = _workspace()
-    source = directory / (name + ".ll")
-    source.write_text(_modules()[name], encoding="utf-8")
-    binary = directory / (name + ".bin")
-    result = subprocess.run(
-        ["cc", "-std=c11", "-O1", "-o", str(binary), str(source), str(RUNTIME)],
-        capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr[:4000]
-    return binary
+    """One program, linked against the runtime, cached by what it is built from."""
+    module = _modules()[name].encode("utf-8")
+    runtime = _runtime_object()
+    output = CACHE / f"{Path(name).stem}-{_digest(module, runtime.read_bytes())}.bin"
+    if not output.exists():
+        CACHE.mkdir(parents=True, exist_ok=True)
+        stem = output.with_suffix(f".{os.getpid()}")
+        source = stem.with_suffix(stem.suffix + ".ll")
+        source.write_bytes(module)
+        staging = stem.with_suffix(stem.suffix + ".bin")
+        try:
+            _replace_built(["cc", "-O1", "-o", str(staging), str(source),
+                            str(runtime)], output)
+        finally:
+            source.unlink(missing_ok=True)
+    return output
 
 
 @functools.lru_cache(maxsize=None)
 def _reference(name: str) -> str:
-    out = io.StringIO()
+    """What the reference implementation prints, cached like `test_boot`'s."""
     source = PROGRAMS / name
-    with contextlib.redirect_stdout(out):
-        with contextlib.suppress(SystemExit):
-            run(source.read_text(encoding="utf-8"), str(source), [])
-    return out.getvalue()
+
+    def compute() -> str:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with contextlib.suppress(SystemExit):
+                run(source.read_text(encoding="utf-8"), str(source), [])
+        return out.getvalue()
+    return bootc.reference("run", source, compute)
 
 
 @pytest.mark.parametrize("name", COMPILABLE)

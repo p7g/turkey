@@ -20,12 +20,11 @@ module Turkey.Select (
 -- allocator replaces it later through a side table rather than by rewriting
 -- what is emitted here.
 --
--- What is *not* here, deliberately: the overflow and division checks, and the
--- panic test after a call. Those are emitted per target because each target
--- writes a different and better sequence -- arm64 reads a flag register the IR
--- cannot name -- and they are the job rather than the hazard. The GC roots are
--- not here either, but for the opposite reason: their *analysis* is shared,
--- in `Turkey.Roots`.
+-- The overflow and division checks, and the panic test after a call, are here
+-- rather than in the IR: each target writes a different and better sequence --
+-- arm64 reads a flag register the IR cannot name -- and they are the job
+-- rather than the hazard. The GC roots are the opposite case, and their
+-- *analysis* is shared, in `Turkey.Roots`.
 
 import Data.Map as Map
 import Data.Set as Set
@@ -41,6 +40,7 @@ import Turkey.LowIr (Op(..), Low(..), BinOp(..), CmpOp(..), Conv(..),
                      Callee(..))
 import Turkey.Asm as Asm
 import Turkey.Asm (Asm(..))
+import Turkey.Roots as Roots
 import Turkey.Runtime as Rt
 import Turkey.Runtime (Entry(..))
 import Turkey.Ssa as Ssa
@@ -61,6 +61,16 @@ type Sel = Sel {
     stopped : Option String,
     -- The module's names, shared by every function in it.
     asm     : Asm,
+    -- Which values the collector must find at each safepoint, from the low IR
+    -- -- the same analysis the LLVM path uses.
+    frame   : Roots.Frame,
+    -- The low IR safepoint being selected, until its call is emitted and
+    -- marked with a `SafepointMap`.
+    pending : Option (Int, Int),
+    -- Whether the call being emitted is itself a panic. Every other call is
+    -- followed by a test of the panic flag, and a panic call must not be: it
+    -- would test the flag it just set and branch to itself, forever.
+    panicking : Bool,
 }
 
 fun emit(s : Sel, op : A.Arm) -> Unit {
@@ -100,7 +110,14 @@ fun widthOf(r : Rep) -> A.Width = match r.class_ {
 
 -- -- selection ----------------------------------------------------------------------
 
-fun selectModule(m : Module) -> (Array (Func Inst), Array Unsupported) {
+-- The selected functions, what stopped the rest, and the module's names.
+--
+-- The names come back because they are not all decided before selection: a
+-- panic message is interned when the guard that raises it is emitted, so the
+-- table is complete only once every function has been walked. `Turkey.Llvm`
+-- learned the same thing the hard way and says so -- its message table is
+-- emitted after the code for exactly this reason.
+fun selectModule(m : Module) -> (Array (Func Inst), Array Unsupported, Asm) {
     -- One `Asm` for the module, because a literal interned by one function is
     -- the same literal in the next and the root array is one array.
     let asm = Asm.newAsm(m)
@@ -119,7 +136,7 @@ fun selectModule(m : Module) -> (Array (Func Inst), Array Unsupported) {
             None -> {}
         }
     }
-    (done, skipped)
+    (done, skipped, asm)
 }
 
 -- Why a function could not be selected, or `None` if it could.
@@ -147,14 +164,63 @@ fun start(f : Func Low, asm : Asm) -> Sel {
     -- The same value numbering, so a `Value` means the same thing on both
     -- sides and `reps` describes both. Selection only ever adds.
     for r in f.reps { Array.push(g.reps, r) }
-    for p in f.params { Array.push(g.params, p) }
     for block in f.blocks {
         let made = Ssa.newBlock()
         for p in block.params { Array.push(made.params, p) }
         Array.push(g.blocks, made)
     }
-    g.entry = f.entry
-    Sel { source = f, out = g, at = 0, stopped = None, asm = asm }
+    g.entry = incoming(f, g)
+    Sel { source = f, out = g, at = 0, stopped = None, asm = asm,
+          frame = Roots.analyze(f), pending = None, panicking = False }
+}
+
+-- A new entry block that moves each parameter out of where the caller put it,
+-- then jumps to the function's own entry.
+--
+-- **The parameters stop being `Func.params`.** Each is defined by its move,
+-- so the machine function's `params` is empty and every parameter has exactly
+-- one definition the allocator can see. Leaving the move to the emitter -- what
+-- this did before -- hid from the allocator that `x0`-`x7` hold arguments
+-- until each is copied, and there was no instruction to put anything between.
+--
+-- No parallel copy is needed. Each move reads an argument register nothing
+-- has written yet, and the allocator's physical liveness keeps every later
+-- argument register out of the hands of the values defined before it is read.
+--
+-- Past eight in a file, a parameter is on the stack: stack argument `k` in
+-- argument order, whatever its file, as `call` passes them.
+fun incoming(f : Func Low, g : Func Inst) -> BlockId {
+    let entry = Ssa.newBlock()
+    var general = 0
+    var vector = 0
+    var stack = 0
+    for p in f.params {
+        let into = A.reg(p)
+        let op = match A.bankOf(Ssa.repOf(f, p)) {
+            Gp -> if general < len(A.argRegs) {
+                let from = A.argRegs[general]
+                general = general + 1
+                A.Mov(into, from, A.W64)
+            } else {
+                let at = stack
+                stack = stack + 1
+                A.Ldr(into, A.IncomingArg(at), A.W64)
+            }
+            Fp -> if vector < len(A.fpArgRegs) {
+                let from = A.fpArgRegs[vector]
+                vector = vector + 1
+                A.FMov(into, from)
+            } else {
+                let at = stack
+                stack = stack + 1
+                A.Ldr(into, A.IncomingArg(at), A.W64)
+            }
+        }
+        Array.push(entry.insts, Inst { op = op })
+    }
+    entry.term = Jump(f.entry, [])
+    Array.push(g.blocks, entry)
+    BlockId(len(g.blocks) - 1)
 }
 
 -- Every source block, in order, into the block of the same index -- and then
@@ -166,12 +232,51 @@ fun start(f : Func Low, asm : Asm) -> Sel {
 -- terminator is `s.at` and not `b`. Blocks are only ever *appended*, never
 -- inserted, so every `BlockId` a terminator already names still means the
 -- block it meant.
+--
+-- Before a safepoint, every root live across it is stored into its slot --
+-- the same stores the LLVM path's `publish` writes, without the mask. What
+-- the mask said at run time, the frame table says as data: the call is marked
+-- with the low IR position `Roots.liveAt` answers for (`NATIVE-BACKEND.md`,
+-- "Frames, calls and roots, surveyed").
 fun run(s : Sel) -> Unit {
     for var b = 0; b < len(s.source.blocks); b = b + 1 {
         s.at = b
-        for i in s.source.blocks[b].insts { selectInst(s, i) }
-        s.out.blocks[s.at].term = s.source.blocks[b].term
+        let insts = s.source.blocks[b].insts
+        for var n = 0; n < len(insts); n = n + 1 {
+            let live = Roots.liveAt(s.frame, b, n)
+            if len(live) > 0 {
+                for (slot, id) in live {
+                    emit(s, A.Str(A.Virtual(id), A.RootSlot(slot), A.W64))
+                }
+                s.pending = Some((b, n))
+            }
+            selectInst(s, insts[n])
+            -- A safepoint selected without a call -- a closure capture is a
+            -- store -- has nothing to mark, and nothing can collect inside it.
+            s.pending = None
+        }
+        terminate(s, s.source.blocks[b].term)
     }
+}
+
+-- A block's terminator, as the machine graph ends a block.
+--
+-- All of them pass through but one. `Panic(v)` is a *call* --
+-- `turkey_panic_string` takes the message the program built -- and a call is
+-- not something a terminator can be, so it becomes that call and a return of
+-- zero, which is what `Turkey.Llvm` answers for it too. `Unreachable` stays a
+-- terminator: the emitter answers it with the same zero, and there is no call
+-- to make.
+fun terminate(s : Sel, t : Term) -> Unit = match t {
+    Panic(v) -> {
+        s.panicking = True
+        call(s, temp(s, Ssa.untraced(I64)), A.Gp, A.Gp,
+             Some(Asm.runtimeFor("turkey_panic_string")), A.xzr,
+             [(A.reg(v), A.Gp)])
+        s.panicking = False
+        s.out.blocks[s.at].term = Ret(zeroResult(s))
+    }
+    _ -> { s.out.blocks[s.at].term = t }
 }
 
 -- A new block at the end, and its id.
@@ -345,9 +450,15 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                 Direct(name) ->
                     call(s, d, want, want, Some(symbolFor(name)), A.xzr, passed)
                 Runtime(name) -> match runtimeSymbol(name) {
-                    Some(sym) ->
+                    -- The stack arguments below are this compiler's own
+                    -- convention, and a C function would not read them the
+                    -- same way. No runtime entry point takes more than four.
+                    Some(sym) -> if overflows(passed) {
+                        stop(s, "a runtime call with stack arguments")
+                    } else {
                         call(s, d, want, resultBank(name), Some(sym), A.xzr,
                              passed)
+                    }
                     -- A few primitives are a handful of compares, and a
                     -- runtime entry point per predicate would be a call where
                     -- a compare will do. The same ones `Turkey.Llvm` inlines,
@@ -434,37 +545,39 @@ fun move(s : Sel, d : Reg, dBank : A.Bank, a : Reg, aBank : A.Bank) -> Unit =
 -- call reads and writes, because `Bl` names neither -- without it the
 -- allocator would see a call that uses nothing and keep nothing alive across
 -- it.
+--
+-- **Past eight in a file, arguments go on the stack**, into stack slot `k`
+-- counted in argument order whatever the file, eight bytes each. That is
+-- Apple's layout for word-sized arguments, and every value this compiler
+-- passes is a word; only Turkey functions receive more than eight, so the
+-- convention is this compiler's (`incoming` is the other half). The slots are
+-- a preallocated area at the bottom of the frame, so nothing moves `sp`.
 fun call(s : Sel, d : Reg, dBank : A.Bank, resultBank : A.Bank,
          sym : Option String, indirect : Reg,
          args : Array (Reg, A.Bank)) -> Unit {
     let ins = []
     var general = 0
     var vector = 0
+    var stack = 0
     for (a, bank) in args {
         -- Asked *before* the register is taken, not after. Asking after
-        -- indexes the array with the index that overflowed it, so a
-        -- nine-argument call panicked inside the compiler instead of being
-        -- reported by it -- a check that runs one line too late is not a
-        -- check.
+        -- indexed the array with the index that overflowed it, and a
+        -- nine-argument call panicked inside the compiler.
         let full = match bank {
             Gp -> general >= len(A.argRegs)
             Fp -> vector >= len(A.fpArgRegs)
         }
         if full {
-            -- AAPCS64 passes the rest on the stack, which needs a frame this
-            -- backend does not lay out yet: the prologue that would spill
-            -- them is the same pass that has still to assign a register to
-            -- anything. Reported rather than approximated.
-            stop(s, "a call with more than eight arguments in one register "
-                    + "file, which would need stack arguments")
-            return
+            emit(s, A.Str(a, A.OutgoingArg(stack), A.W64))
+            stack = stack + 1
+        } else {
+            let into = match bank {
+                Gp -> { let at = general; general = general + 1; A.argRegs[at] }
+                Fp -> { let at = vector; vector = vector + 1; A.fpArgRegs[at] }
+            }
+            move(s, into, bank, a, bank)
+            Array.push(ins, into)
         }
-        let into = match bank {
-            Gp -> { let at = general; general = general + 1; A.argRegs[at] }
-            Fp -> { let at = vector; vector = vector + 1; A.fpArgRegs[at] }
-        }
-        move(s, into, bank, a, bank)
-        Array.push(ins, into)
     }
     -- The *physical* registers the call reads and writes, not the virtuals
     -- either side of them. Passing the virtual destination here made it
@@ -483,10 +596,66 @@ fun call(s : Sel, d : Reg, dBank : A.Bank, resultBank : A.Bank,
         Some(name) -> emit(s, A.Bl(name))
         None -> emit(s, A.Blr(indirect))
     }
+    -- The return address this call leaves is the one the collector will look
+    -- up, so the mark goes directly after it.
+    match s.pending {
+        Some((b, n)) -> {
+            emit(s, A.SafepointMap(b, n))
+            s.pending = None
+        }
+        None -> {}
+    }
     -- The callee's result file and the destination's need not agree:
     -- `turkey_unbox` answers a double's bits in `x0`, and the value being
     -- built is a double.
     move(s, d, dBank, out, resultBank)
+    propagate(s)
+}
+
+-- After a call: if the callee panicked, leave.
+--
+-- `turkey_panic` sets a flag and returns -- there is no unwinding -- so a
+-- caller that did not look would carry on with a value the callee never
+-- produced. Every call, without exception, because a callee that cannot panic
+-- itself may call one that can. `Turkey.Llvm.propagate` is the same test on
+-- the other path, and reads the flag as a plain load for the same reason: a
+-- call to `turkey_panicked()` would be one more call to test the flag of.
+fun propagate(s : Sel) -> Unit {
+    if s.panicking { return }
+    let flag = temp(s, Ssa.untraced(I32))
+    emit(s, A.Ldr(flag, A.Offset(got(s, Asm.runtimeFor("turkey_has_panicked")), 0),
+                  A.W32))
+    emit(s, A.CmpImm(flag, 0, A.W32))
+    let failed = tempValue(s, Ssa.untraced(I1))
+    emit(s, A.CSet(A.reg(failed), A.Ne))
+    -- The empty message: this path propagates a panic that already happened
+    -- and raises nothing new. It returns zero, as every panic path does.
+    guard(s, failed, "")
+}
+
+-- The address of a symbol this module does not define, which is one
+-- indirection further than one it does: the linker fills a global offset
+-- table entry, and the code loads the address out of it.
+fun got(s : Sel, sym : String) -> Reg {
+    let page = temp(s, Ssa.untraced(Ptr))
+    let full = temp(s, Ssa.untraced(Ptr))
+    emit(s, A.AdrpGot(page, sym))
+    emit(s, A.LdrGot(full, page, sym))
+    full
+}
+
+-- A zero of the function's result, which is what every path that leaves
+-- without a value answers.
+--
+-- A double's zero is not a `mov`: `mov d0, xzr` is not an instruction, and
+-- `fmov d0, xzr` is. Nothing caught this until whole functions were assembled,
+-- because a panic path in a `Float` function is not on any corpus program's
+-- ordinary route.
+fun zeroResult(s : Sel) -> Value {
+    let zero = tempValue(s, s.out.result)
+    if s.out.result.class_ == F64 { emit(s, A.FMovIn(A.reg(zero), A.xzr)) }
+    else { emit(s, A.Mov(A.reg(zero), A.xzr, A.W64)) }
+    zero
 }
 
 -- Where a global lives: in the root array if the collector must scan it, in
@@ -709,12 +878,16 @@ fun guard(s : Sel, condition : Value, message : String) -> Unit {
     s.out.blocks[s.at].term = Branch(condition, BlockId(failed),
                                      BlockId(carry))
     s.at = failed
-    let text = address(s, Asm.messageSymbol(s.asm, message))
-    call(s, temp(s, Ssa.untraced(I64)), A.Gp, A.Gp,
-         Some(Asm.runtimeFor("turkey_panic")), A.xzr, [(text, A.Gp)])
-    let zero = tempValue(s, s.out.result)
-    emit(s, A.Mov(A.reg(zero), A.xzr, A.W64))
-    s.out.blocks[s.at].term = Ret(zero)
+    -- An empty message means the panic is already raised and is being
+    -- propagated out of a callee: this path adds a return, not a diagnosis.
+    if message != "" {
+        let text = address(s, Asm.messageSymbol(s.asm, message))
+        s.panicking = True
+        call(s, temp(s, Ssa.untraced(I64)), A.Gp, A.Gp,
+             Some(Asm.runtimeFor("turkey_panic")), A.xzr, [(text, A.Gp)])
+        s.panicking = False
+    }
+    s.out.blocks[s.at].term = Ret(zeroResult(s))
     s.at = carry
 }
 
@@ -763,8 +936,61 @@ fun inlinePrim(s : Sel, d : Reg, name : String,
             emit(s, A.EorImm(d, bad, 1, A.W32))
             True
         }
+        -- A double's bit pattern and back: `Turkey.Llvm`'s `bitcast`, which on
+        -- arm64 is an `fmov` between the two files. `fmov` copies all 64 bits
+        -- and converts nothing, so the sign of a zero and a NaN's payload
+        -- survive -- which is the whole contract (PRIMITIVES.md 3.2c).
+        --
+        -- No corpus program reached these, so selection's ratchet stayed green
+        -- while three functions in the compiler's own source stopped here.
+        -- `tests/programs/float_bits.gob` is the regression.
+        "Prim.floatBits" -> {
+            let (x, _) = args[0]
+            emit(s, A.FMovOut(d, x))
+            True
+        }
+        "Prim.floatFromBits" -> {
+            let (n, _) = args[0]
+            emit(s, A.FMovIn(d, n))
+            True
+        }
+        -- `fcmp` of a value with itself is unordered exactly when it is a NaN,
+        -- and unordered is the one outcome that sets V. LLVM's `fcmp uno`.
+        "Prim.floatIsNaN" -> {
+            let (x, _) = args[0]
+            emit(s, A.FCmp(x, x))
+            emit(s, A.CSet(d, A.Vs))
+            True
+        }
+        -- In `[-2^63, 2^63)`, as `Turkey.Llvm` writes it -- but without its
+        -- separate ordered test. Both conditions here are false for a NaN:
+        -- `ge` needs N == V and an unordered compare sets V alone, and `lo`
+        -- needs C clear and an unordered compare sets C.
+        "Prim.floatFitsInt" -> {
+            let (x, _) = args[0]
+            let low = floatConstant(s, -4332462841530417152)
+            let high = floatConstant(s, 4890909195324358656)
+            emit(s, A.FCmp(x, low))
+            let atLeast = temp(s, Ssa.untraced(I1))
+            emit(s, A.CSet(atLeast, A.Ge))
+            emit(s, A.FCmp(x, high))
+            let below = temp(s, Ssa.untraced(I1))
+            emit(s, A.CSet(below, A.Lo))
+            emit(s, A.And(d, atLeast, below, A.W32))
+            True
+        }
         _ -> False
     }
+
+-- A double with the given bit pattern, in a fresh `d` register. The same
+-- sequence `ConstFloat` selects to.
+fun floatConstant(s : Sel, pattern : Int) -> Reg {
+    let bits = temp(s, Ssa.untraced(I64))
+    constant(s, bits, pattern)
+    let d = temp(s, Ssa.untraced(F64))
+    emit(s, A.FMovIn(d, bits))
+    d
+}
 
 -- One unsigned comparison against a constant, as a bit in a register.
 fun flag(s : Sel, a : Reg, n : Int, c : A.Cond) -> Reg {
@@ -772,6 +998,19 @@ fun flag(s : Sel, a : Reg, n : Int, c : A.Cond) -> Reg {
     let out = temp(s, Ssa.untraced(I1))
     emit(s, A.CSet(out, c))
     out
+}
+
+-- Whether a call's arguments overflow either register file.
+fun overflows(args : Array (Reg, A.Bank)) -> Bool {
+    var general = 0
+    var vector = 0
+    for (_, bank) in args {
+        match bank {
+            Gp -> { general = general + 1 }
+            Fp -> { vector = vector + 1 }
+        }
+    }
+    general > len(A.argRegs) || vector > len(A.fpArgRegs)
 }
 
 -- Which file a runtime entry point answers in. `turkey_float_floor` returns a

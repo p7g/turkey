@@ -2374,6 +2374,169 @@ byte-identical on them, and `test_native` runs them compiled by `boot`. The
 harness's reach: `tests/test_existential_layout.py` still builds Core by hand to
 reach the capped and mutant cases no source program produces.
 
+### 91. The selection ratchet was green while `boot` stopped at `Prim.floatBits`
+**bug, fixed.** M28. `tests/test_select.py` asserts that every corpus function
+either selects to arm64 or stops for a known reason, and the only known reason
+was stack arguments. It passed. `boot asm boot/Main.gob` meanwhile reported
+three functions stopped at "the runtime function Prim.floatBits": the primitive
+has no runtime entry point, `Select.inlinePrim` had no rule, and no corpus
+program called it anywhere `opt` did not fold it away. The rule is one `fmov`
+each way.
+
+The shape of FINDINGS 85 again, one layer down: a ratchet over the corpus
+measures the corpus, and the program M29 needs compiled is not in it. The fix
+added `float_bits.gob`, whose floats are computed at run time so that the
+primitive survives to selection -- and the test checks the `fmov`s are present,
+because a program `opt` had folded would have selected completely and proved
+nothing, which is what the first draft of `manyargs.gob` did too. Colouring had
+the same blind spot and no test at all; its histogram is ratcheted now.
+
+And the new program found the next one immediately: `Float.isNaN` stopped
+arm64 selection too, and `boot llvm` wrote `; FAILED: no rule for
+Prim.floatIsNaN` -- the *LLVM* emitter had never had the rule, though
+`turkey/llvmgen.py` had. That is FINDINGS 43's hazard in the flesh: the
+differential compares stages above Core, the two LLVM emitters are not
+diffed, and a rule present on one side only is invisible until a program
+asks. `Prim.floatFitsInt` was the last primitive with an LLVM rule and no
+arm64 one, found by listing both tables side by side, which is the check to
+repeat before calling selection complete.
+
+### 92. The allocator added stack-argument calls to the compiler it allocates
+**bug, fixed.** M28. Spilling took `boot`'s colouring stops from 249 to 0 and
+its stack-argument stops from 21 to 24. The spiller's `place` took ten
+parameters, and two checker helpers took eight -- which looks like it fits in
+eight argument registers and does not, because every function also takes its
+closure environment as a hidden first argument. `boot asm` reports stops by
+reason and not by function, so finding them meant diffing the list of
+selected functions between two runs. The helpers now take a record or seven
+parameters.
+
+The gap being closed and the code closing it are in the same program, which
+is the bootstrap's usual shape and still easy to forget: every new function in
+`boot/` is also a new input to the backend being written. A limit that applies
+to the backend's input applies to the backend.
+
+And one design error, caught before it cost anything. The plan said "spill
+whichever value the colourer reaches with no register free". When every
+register is held that frees nothing -- the value still needs one at its own
+definition -- and the spill loop would have gone round forever on `boot`'s
+88-value module initializer. Failures are now told apart: a forbidden register
+spills the failing value, a full file evicts the holder used furthest ahead.
+
+### 93. The suite ran `boot` interpreted, the thing its own harness forbids
+**bug, fixed.** `pytest -n auto --durations` on a 16-core machine: 15:09 of wall
+time at 2.3 cores. The slowest item was `test_boot`'s types milestone -- 233
+seconds of fixture setup and 203 of call -- and the fixture ran
+`python -m turkey run boot/Main.gob -- types`: the bootstrap compiler under the
+interpreter. `tests/bootc.py` exists to stop exactly that, and says so in its
+header. The fixture went around it for a mundane reason: it needs stderr, and
+`bootc.boot` threw stderr away.
+
+That is FINDINGS 61, 65 and `bootc`'s own "the fix was made in one module and
+never reached the others", a fourth time. The pattern is not carelessness about
+cost; it is that a harness which does 90% of a job invites the remaining 10% to
+be done beside it.
+
+The rest was ordinary and multiplied by parallelism:
+
+* `lru_cache`d corpus runs (`boot asm`, `boot llvm`, `boot ssa`) were one run per
+  xdist *worker*, so sixteen of each;
+* `test_native` compiled `turkey_runtime.c` into every test binary, per worker;
+* three `test_boot` Python sides ran `check` uncached every time, one of them
+  over `boot/Main.gob`;
+* two corpus loops sat inside single test items.
+
+And one that was a correctness bug, not a cost: `test_bootc` edited
+`boot/Turkey/Regalloc.gob` and `turkey/driver.py` in place to test cache keys,
+which under xdist lets another worker import a truncated file.
+
+After: per-program disk caches for `boot` output, a locked `boot` build, one
+runtime object, the compiled binary for types, and cache-key tests on copies.
+**2:13 at ~7 cores** with warm references -- the baseline had to recompute some
+of `boot/Main.gob`'s, so a fully cold run lands between the two. `pytest` is now
+parallel by default.
+
+### 94. Two correct rules that together tripled the reloads
+**design, fixed.** M28. Frame tables need every root live across a safepoint to
+be in its slot at the call, so selection stores each one there first. Spilling
+stores a value into its slot once, at its definition, and reloads it before
+every use. Each rule is right alone. Together, a value spilled into its root
+slot has a *use* at every safepoint -- the root store -- so spill-everywhere
+reloads it from the slot in order to write it back to the slot. On `boot`,
+reloads went from 9,163 to 24,977 with every checker silent, because nothing was
+wrong except the count.
+
+`spill` now drops a root store whose value it is spilling into that same slot.
+Reloads: 10,001. The number that caught it was `boot asm`'s own `-- spilled`
+line, added one slice earlier as "the number splitting would be measured
+against" -- a cost metric doing a correctness metric's job, which is the
+argument for printing costs before anyone asks what they are for.
+
+### 95. The assembler is an oracle for syntax, and says nothing about meaning
+**bug, fixed.** M28 phase 5. The first emitter's parallel copy -- the moves a
+jump's arguments become on the way into a block's parameters -- broke a cycle
+by parking *every* remaining source in the scratch register instead of one:
+
+```
+    mov x16, x2
+    mov x16, x0      // the first park is gone
+    mov x0, x16
+    mov x2, x16      // both parameters now hold the same value
+```
+
+`as` assembles that without complaint, because every line is a real
+instruction. So does the rest of the pipeline: `Ssa.verify` had passed,
+`verifyColouring` had passed, `verifyAllocation` and `verifyFrame` had passed,
+and the corpus assembled 44 of 44 programs. What found it was reading the
+output of one small loop and asking what the four moves did.
+
+That is worth keeping straight about what `as` buys. It is a complete oracle
+for *spelling* -- immediate ranges, register files, addressing modes, the
+things a printer written against a manual gets wrong -- and it is not an oracle
+for anything this backend decides. The only oracle for meaning is running the
+program, which is why the differential against LLVM is the next milestone and
+not an optional extra.
+
+The same reading pass found the other half: `mov x0, x0` printed wherever a
+hint had been taken, which is the calling convention being satisfied by doing
+nothing. Those are dropped now.
+
+### 96. The corpus passed without a collector that could see a single root
+**bug, fixed.** M28 phase 5b. The arm64 backend emitted its module data and its
+entry sequence, and all 44 corpus programs compiled, linked and printed exactly
+what the reference implementation prints. The frame tables were not emitted at
+all -- `Turkey.Frame` had been computing them since phase 4 and the emitter was
+dropping them on the floor -- so the collector could not see the roots of a
+single stack frame. Every one of those programs was one collection away from
+freeing a live object, and the suite was green.
+
+Under `TURKEY_GC_STRESS`, which collects at every allocation, **7 of 44**
+passed.
+
+The reason the plain run says nothing is that it barely collects: a corpus
+program allocates little, the threshold starts at 1024 objects, and a root the
+collector cannot see is only a bug once something frees it while it is still
+in use. So the ordinary differential run is an oracle for the code and *not*
+for the root machinery, and the two look identical from the outside -- 44 of 44
+either way.
+
+This is FINDINGS 95 one level up. There the assembler accepted a parallel copy
+that lost half its values; here execution itself accepted a program whose GC
+metadata was entirely absent. Each new oracle is complete for what it checks
+and silent about the next thing, and the way to find out which is which is to
+break the thing deliberately and see whether anything goes red. Running the
+corpus under stress as a test, rather than as an occasional check, is the
+cheapest form of that.
+
+The bug the stress run then found is worth its own line, because it was silent
+in the other direction -- it fired everywhere at once. A frame record holds the
+return address of the function that *owns* it, which is an address in that
+function's caller; so the table entry a return address finds describes the
+**caller's** frame, whose `x29` is the saved one in the record, not the frame
+the address was read from. Getting that backwards reads whatever the callee
+happens to keep at those offsets: "arm64 frame 0 is not a heap pointer", on
+nearly every program.
+
 ## Library, still wanted
 
 ### 88. A new library module could not add two strings

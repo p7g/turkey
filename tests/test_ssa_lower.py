@@ -41,11 +41,17 @@ def _all() -> dict[str, str]:
     has no separator between programs, by design: every one ends with its own
     count line, so splitting on that line recovers them.
     """
-    text = bootc.boot("ssa", *(str(PROGRAMS / name) for name in SAMPLE))
-    chunks = bootc.split_on(text, "-- lowered")
-    assert len(chunks) == len(SAMPLE), (
-        f"{len(chunks)} dumps for {len(SAMPLE)} programs:\n{text[-2000:]}")
-    return dict(zip(SAMPLE, chunks))
+    paths = [PROGRAMS / name for name in SAMPLE]
+
+    def split(text: str, wanted: list[Path]) -> list[str]:
+        chunks = bootc.split_on(text, "-- lowered")
+        assert len(chunks) == len(wanted), (
+            f"{len(chunks)} dumps for {len(wanted)} programs:\n{text[-2000:]}")
+        return chunks
+
+    # On disk per program, so the workers of `pytest -n auto` share one run.
+    texts = bootc.boot_each("ssa", paths, split)
+    return {path.name: texts[path] for path in paths}
 
 
 def _ssa(name: str) -> str:

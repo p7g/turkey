@@ -1,0 +1,616 @@
+module Turkey.Emit (
+    emitFunc, emitMessages, emitData, emitEntry, emitFrameTable,
+)
+
+-- One allocated function as arm64 assembly (`NATIVE-BACKEND.md`, M28 phase 5).
+--
+-- **Nothing here rewrites anything.** Selection built the instructions, the
+-- allocator chose the registers and `Turkey.Frame` placed the slots; this
+-- prints what those three decided. That is the same division regalloc2 draws
+-- and for the same reason -- a pass that does not mutate its input is one
+-- whose input can still be printed, verified and re-run -- and it is why the
+-- printer can be an ordinary `Show` instance rather than a second emitter.
+--
+-- What is added rather than printed is what has no instruction until now:
+--
+-- * the prologue and epilogue, from the layout;
+-- * the moves a block parameter becomes, as a parallel copy on the edge;
+-- * the branch a terminator becomes, and the fallthrough that lets one edge
+--   cost nothing.
+--
+-- `as` is the oracle. Every instruction this prints is one the system
+-- assembler either accepts or refuses, which is the argument `LINKER.md` makes
+-- for a text printer even when the encoder eventually replaces it.
+
+import Data.Map as Map
+import Turkey.Arm64 as A
+import Turkey.Arm64 (Reg(..), Bank(..), Mem(..), Inst(..))
+import Turkey.Asm as Asm
+import Turkey.Frame as Frame
+import Turkey.Regalloc as Regalloc
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (Value(..), BlockId(..), Term(..), Func(..), Block(..), Rep(..))
+import Turkey.SsaLower as SsaLower
+import Turkey.SsaLower (Module(..))
+
+-- `x16` and `x17` are the allocator's reserved scratch (`Turkey.Regalloc`'s
+-- `gpPool`), which is what makes them safe here: a large offset, a frame too
+-- big for an immediate, and the cycle in a parallel copy each need a register
+-- no value holds.
+let scratch = Physical(Gp, 16)
+
+-- The largest byte offset a scaled unsigned immediate reaches on a 64-bit
+-- load or store. Past it the offset goes into `scratch` and the access uses
+-- the register form.
+let widestOffset = 32760
+
+-- The largest immediate `add` and `sub` take without a shift.
+let widestImmediate = 4095
+
+fun line(b : String.Builder, text : String) -> Unit {
+    String.push(b, text)
+    String.push(b, "\n")
+}
+
+fun instruction(b : String.Builder, op : A.Arm) -> Unit =
+    line(b, "    " + show(Inst { op = op }))
+
+fun emitFunc(f : Func Inst, a : Regalloc.Allocation, l : Frame.Layout,
+             tag : Int, b : String.Builder) -> Unit {
+    let symbol = Asm.symbolFor(f.name)
+    line(b, "    .globl " + symbol)
+    line(b, "    .p2align 2")
+    line(b, symbol + ":")
+    prologue(b, l)
+    -- Reverse postorder, so a block's most likely successor is the next block
+    -- and its edge costs no instruction at all.
+    let order = Ssa.reversePostorder(f)
+    for var k = 0; k < len(order); k = k + 1 {
+        let at = Ssa.blockId(order[k])
+        let next = if k + 1 < len(order) { Ssa.blockId(order[k + 1]) } else { -1 }
+        line(b, blockLabel(tag, at) + ":")
+        for i in f.blocks[at].insts { emitInst(b, f, a, l, tag, i) }
+        emitTerm(b, f, a, l, tag, f.blocks[at].term, next)
+    }
+}
+
+-- The return address of the call at this safepoint: the label goes directly
+-- after the `bl`, which is where selection put the `SafepointMap` mark.
+fun safepointLabel(tag : Int, block : Int, index : Int) -> String =
+    "Lsp" + Int.toString(tag) + "b" + Int.toString(block)
+        + "i" + Int.toString(index)
+
+fun blockLabel(tag : Int, block : Int) -> String =
+    "Lf" + Int.toString(tag) + "b" + Int.toString(block)
+
+-- -- the frame ---------------------------------------------------------------
+
+-- `sp` moves once, on the way in, and nothing moves it again: every slot is
+-- addressed from it, and the outgoing arguments sit at the bottom where a call
+-- can reach them without touching it.
+--
+-- The frame record is written with two stores rather than an `stp` because
+-- `stp`'s immediate is a signed seven bits scaled -- it reaches 504 bytes, and
+-- `boot`'s largest frame is 16,672. A store's unsigned twelve bits reach
+-- 32,760, which covers every frame the compiler has produced; past that the
+-- offset goes through `scratch` like any other.
+fun prologue(b : String.Builder, l : Frame.Layout) -> Unit {
+    adjust(b, l.size, "sub")
+    store(b, Physical(Gp, 29), l.recordAt, A.W64)
+    store(b, Physical(Gp, 30), l.recordAt + 8, A.W64)
+    address(b, Physical(Gp, 29), l.recordAt)
+    saves(b, l, True)
+}
+
+fun epilogue(b : String.Builder, l : Frame.Layout) -> Unit {
+    saves(b, l, False)
+    load(b, Physical(Gp, 29), l.recordAt, A.W64)
+    load(b, Physical(Gp, 30), l.recordAt + 8, A.W64)
+    adjust(b, l.size, "add")
+    line(b, "    ret")
+}
+
+-- The callee-saved registers the colouring actually used, saved on the way in
+-- and restored on the way out. One store each rather than pairs: a pair's
+-- offset is the narrow immediate again, and the frames here are not small.
+fun saves(b : String.Builder, l : Frame.Layout, saving : Bool) -> Unit {
+    var at = l.savesAt
+    for n in l.savedGp {
+        if saving { store(b, Physical(Gp, n), at, A.W64) }
+        else { load(b, Physical(Gp, n), at, A.W64) }
+        at = at + 8
+    }
+    for n in l.savedFp {
+        if saving { store(b, Physical(Fp, n), at, A.W64) }
+        else { load(b, Physical(Fp, n), at, A.W64) }
+        at = at + 8
+    }
+}
+
+fun adjust(b : String.Builder, size : Int, what : String) -> Unit {
+    if size == 0 { return }
+    if size <= widestImmediate {
+        line(b, "    " + what + " sp, sp, #" + Int.toString(size))
+    } else {
+        instruction(b, A.MovConst(scratch, size))
+        line(b, "    " + what + " sp, sp, " + A.showReg(scratch, A.W64))
+    }
+}
+
+-- `add d, sp, #offset`, for the frame pointer.
+fun address(b : String.Builder, d : Reg, offset : Int) -> Unit {
+    if offset <= widestImmediate {
+        line(b, "    add " + A.showReg(d, A.W64) + ", sp, #" + Int.toString(offset))
+    } else {
+        instruction(b, A.MovConst(scratch, offset))
+        line(b, "    add " + A.showReg(d, A.W64) + ", sp, "
+                + A.showReg(scratch, A.W64))
+    }
+}
+
+fun store(b : String.Builder, r : Reg, offset : Int, w : A.Width) -> Unit =
+    instruction(b, A.Str(r, at(b, offset), w))
+
+fun load(b : String.Builder, r : Reg, offset : Int, w : A.Width) -> Unit =
+    instruction(b, A.Ldr(r, at(b, offset), w))
+
+-- A frame offset as a memory operand, through `scratch` when the immediate
+-- does not reach.
+fun at(b : String.Builder, offset : Int) -> Mem {
+    if offset <= widestOffset { return Offset(A.sp, offset) }
+    instruction(b, A.MovConst(scratch, offset))
+    Indexed(A.sp, scratch)
+}
+
+-- -- instructions ------------------------------------------------------------
+
+fun emitInst(b : String.Builder, f : Func Inst, a : Regalloc.Allocation,
+             l : Frame.Layout, tag : Int, i : Inst) -> Unit {
+    -- A safepoint is not an instruction: it is the *position* after the call,
+    -- which is the return address the collector will look up. So it becomes a
+    -- label, and `Turkey.Frame`'s entry for the same (block, index) names it.
+    match A.safepointOf(i.op) {
+        Some((sb, sn)) -> {
+            line(b, safepointLabel(tag, sb, sn) + ":")
+            return
+        }
+        None -> {}
+    }
+    -- A slot whose offset is too wide is the one case that needs an extra
+    -- instruction, so it is settled before the rewrite rather than inside it.
+    let wide = wideSlot(l, i.op)
+    match wide {
+        Some(offset) -> instruction(b, A.MovConst(scratch, offset))
+        None -> {}
+    }
+    let op = A.rewrite(i.op, fun(r) = coloured(f, a, r),
+                       fun(m) = placed(l, m, wide))
+    -- A move into the register the value already holds is what a taken hint
+    -- looks like from here: the parameter the caller put in `x0` was coloured
+    -- `x0`, so `mov x0, x0` is the convention being satisfied by doing nothing.
+    if !A.redundantMove(op) { instruction(b, op) }
+}
+
+-- Where the allocator put a value. A physical register is already itself --
+-- selection pins the argument registers, and the emitter's own additions are
+-- physical from the start.
+fun coloured(f : Func Inst, a : Regalloc.Allocation, r : Reg) -> Reg = match r {
+    Virtual(n) -> Physical(A.bankOf(f.reps[n]), a.colouring.of_[n])
+    Physical(bank, n) -> Physical(bank, n)
+}
+
+fun placed(l : Frame.Layout, m : Mem, wide : Option Int) -> Mem =
+    match Frame.offsetOf(l, m) {
+        Some(offset) -> match wide {
+            Some(_) -> Indexed(A.sp, scratch)
+            None -> Offset(A.sp, offset)
+        }
+        None -> m
+    }
+
+fun wideSlot(l : Frame.Layout, op : A.Arm) -> Option Int = match A.memOf(op) {
+    Some(m) -> match Frame.offsetOf(l, m) {
+        Some(offset) -> if offset > widestOffset { Some(offset) } else { None }
+        None -> None
+    }
+    None -> None
+}
+
+-- -- terminators -------------------------------------------------------------
+
+fun emitTerm(b : String.Builder, f : Func Inst, a : Regalloc.Allocation,
+             l : Frame.Layout, tag : Int, t : Term, next : Int) -> Unit =
+    match t {
+        -- The result into the register the convention answers in, then the
+        -- frame comes down. Every return does its own epilogue: a shared exit
+        -- block would need the result in place before the jump anyway, and
+        -- would cost a branch to save the stores.
+        Ret(v) -> {
+            result(b, coloured(f, a, A.reg(v)))
+            epilogue(b, l)
+        }
+        Jump(target, args) -> {
+            copies(b, f, a, Ssa.blockAt(f, target).params, args)
+            if Ssa.blockId(target) != next {
+                line(b, "    b " + blockLabel(tag, Ssa.blockId(target)))
+            }
+        }
+        -- `cbnz` on the bit the comparison materialized. Whichever arm is the
+        -- next block falls through; if neither is, both get a branch.
+        Branch(c, yes, no) -> {
+            let bit = A.showReg(coloured(f, a, A.reg(c)), A.W32)
+            if Ssa.blockId(yes) == next {
+                line(b, "    cbz " + bit + ", " + blockLabel(tag, Ssa.blockId(no)))
+            } else {
+                line(b, "    cbnz " + bit + ", " + blockLabel(tag, Ssa.blockId(yes)))
+                if Ssa.blockId(no) != next {
+                    line(b, "    b " + blockLabel(tag, Ssa.blockId(no)))
+                }
+            }
+        }
+        -- Selection turns a panic into a call and a return, so one here is a
+        -- selection bug rather than a shape to emit. `brk` says so at run time
+        -- instead of falling into the next function.
+        Panic(_) -> line(b, "    brk #1")
+        -- Not a trap: this is reached only where the lowering proved no value
+        -- arrives, and the same zero every panic path returns is the same
+        -- claim made unexploitably (`Turkey.Llvm` says the same of `ret`).
+        Unreachable -> {
+            zero(b, f)
+            epilogue(b, l)
+        }
+    }
+
+fun result(b : String.Builder, r : Reg) -> Unit = match r {
+    Physical(Gp, n) -> if n != 0 { instruction(b, A.Mov(A.x0, r, A.W64)) }
+    Physical(Fp, n) -> if n != 0 { instruction(b, A.FMov(A.d0, r)) }
+    Virtual(_) -> line(b, "    // an unallocated result reached the emitter")
+}
+
+fun zero(b : String.Builder, f : Func Inst) -> Unit =
+    match A.bankOf(f.result) {
+        Gp -> instruction(b, A.Mov(A.x0, A.xzr, A.W64))
+        Fp -> instruction(b, A.FMovIn(A.d0, A.xzr))
+    }
+
+-- -- parallel copies ---------------------------------------------------------
+
+-- A jump's arguments into its target's parameters, all at once.
+--
+-- They are simultaneous: `jump b1(%2, %1)` into parameters that happen to hold
+-- the other's register is a swap, and doing the moves in order would write one
+-- before reading it. So a move whose destination nothing else still needs to
+-- read goes first, and when no such move is left the remainder is a cycle,
+-- which one temporary breaks.
+--
+-- This is the one place the block-parameter design costs an algorithm, and it
+-- is the same one every allocator that shuffles registers at a merge writes.
+fun copies(b : String.Builder, f : Func Inst, a : Regalloc.Allocation,
+           params : Array Value, args : Array Value) -> Unit {
+    let dsts : Array Reg = []
+    let srcs : Array Reg = []
+    for var i = 0; i < len(params) && i < len(args); i = i + 1 {
+        let d = coloured(f, a, A.reg(params[i]))
+        let s = coloured(f, a, A.reg(args[i]))
+        if A.showReg(d, A.W64) != A.showReg(s, A.W64) {
+            Array.push(dsts, d)
+            Array.push(srcs, s)
+        }
+    }
+    let done : Array Bool = []
+    for _ in dsts { Array.push(done, False) }
+    var left = len(dsts)
+    while left > 0 {
+        var moved = False
+        for var i = 0; i < len(dsts); i = i + 1 {
+            if !done[i] && !isSource(dsts[i], srcs, done) {
+                move(b, dsts[i], srcs[i])
+                done[i] = True
+                left = left - 1
+                moved = True
+            }
+        }
+        if !moved {
+            -- Every remaining destination is somebody's source: a cycle. Park
+            -- *one* of them in the scratch register and the rest unwinds --
+            -- parking each in turn writes the same register twice and loses
+            -- the first, which is what the first version of this did.
+            var parked = False
+            for var i = 0; i < len(dsts); i = i + 1 {
+                if !done[i] && !parked {
+                    parked = True
+                    let from = srcs[i]
+                    move(b, scratch, from)
+                    for var k = 0; k < len(srcs); k = k + 1 {
+                        if !done[k] && sameReg(srcs[k], from) {
+                            srcs[k] = scratch
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fun isSource(r : Reg, srcs : Array Reg, done : Array Bool) -> Bool {
+    for var i = 0; i < len(srcs); i = i + 1 {
+        if !done[i] && sameReg(srcs[i], r) { return True }
+    }
+    False
+}
+
+fun sameReg(a : Reg, b : Reg) -> Bool = A.sameRegister(a, b)
+
+-- A move between two registers of the same file, or through the general file
+-- when a double has to travel in the scratch register -- there is no reserved
+-- `d` scratch, and `fmov` crosses the files without converting.
+fun move(b : String.Builder, d : Reg, s : Reg) -> Unit = match (d, s) {
+    (Physical(Gp, _), Physical(Gp, _)) -> instruction(b, A.Mov(d, s, A.W64))
+    (Physical(Fp, _), Physical(Fp, _)) -> instruction(b, A.FMov(d, s))
+    (Physical(Gp, _), Physical(Fp, _)) -> instruction(b, A.FMovOut(d, s))
+    (Physical(Fp, _), Physical(Gp, _)) -> instruction(b, A.FMovIn(d, s))
+    _ -> line(b, "    // an unallocated register reached a parallel copy")
+}
+
+
+-- -- data --------------------------------------------------------------------
+
+-- The panic messages, which are the only data the functions name *locally*.
+--
+-- A local symbol -- `L` prefixed, so it never reaches the symbol table -- has
+-- to be defined in the file that mentions it, which is what makes this part of
+-- the function slice rather than of the module slice to come: without it the
+-- assembler refuses the whole file. The globals and the root array are named
+-- with ordinary symbols, so they can stay undefined until they are emitted.
+--
+-- Emitted as bytes rather than as a quoted string: a message contains
+-- whatever the program's source did, and `.asciz` would need every quote,
+-- backslash and newline escaped the way the assembler reads them. The bytes
+-- need nothing read back.
+--
+-- `turkey_panic` takes a C string (`runtime/turkey_runtime.h`), so each one
+-- ends in a zero.
+fun emitMessages(asm : Asm.Asm, b : String.Builder) -> Unit {
+    let ordered = byIndex(asm.messages)
+    if len(ordered) == 0 { return }
+    line(b, "    .section __TEXT,__cstring,cstring_literals")
+    for var i = 0; i < len(ordered); i = i + 1 {
+        line(b, Asm.messageName(i) + ":")
+        let out = String.builder()
+        String.push(out, "    .byte ")
+        for byte in String.bytes(ordered[i]) {
+            String.push(out, Int.toString(Byte.toInt(byte)))
+            String.push(out, ", ")
+        }
+        String.push(out, "0")
+        line(b, String.build(out))
+    }
+}
+
+-- -- the module's data -------------------------------------------------------
+
+-- What a function is not: the bytes behind each string literal, the storage
+-- behind each global, and the permanent root array that holds both the traced
+-- globals and the literals' cached `TurkeyString`s.
+--
+-- Every name and every slot here was decided by `Turkey.Asm` before selection
+-- ran, which is what lets `ConstString` be a load of slot *n* emitted long
+-- before anything defined slot *n*.
+fun emitData(m : Module, asm : Asm.Asm, b : String.Builder) -> Unit {
+    emitLiterals(asm, b)
+    line(b, "    .section __DATA,__data")
+    -- An untraced global is a word of ordinary storage. A traced one is a slot
+    -- of the root array instead -- storing to it and rooting it are the same
+    -- store -- so this defines nothing for it.
+    for (name, r) in m.globals {
+        match Asm.globalSlot(asm, name) {
+            Some(_) -> {}
+            None -> {
+                line(b, "    .p2align 3")
+                line(b, Asm.globalSymbol(name) + ":")
+                line(b, "    .quad 0")
+            }
+        }
+    }
+    line(b, "    .p2align 3")
+    line(b, Asm.rootsSymbol + ":")
+    -- At least one word even when the module roots nothing: the entry sequence
+    -- hands this address to `turkey_root_enter`, which refuses a null one, and
+    -- a symbol with no storage is a symbol that may land on top of the next.
+    let bytes = if asm.roots > 0 { 8 * asm.roots } else { 8 }
+    line(b, "    .space " + Int.toString(bytes))
+    line(b, "    .p2align 3")
+    line(b, Asm.globalsFrame + ":")
+    -- The `RootFrame` covering it: previous, function_name, count, values,
+    -- live. Five words, and the layout is `runtime/turkey_runtime.c`'s.
+    line(b, "    .space 40")
+}
+
+-- Each literal's bytes, and nothing else. The `TurkeyString` is built once by
+-- the entry sequence and cached in the root array, so what the data section
+-- holds is the *input* to `turkey_string_new`.
+--
+-- Not `__TEXT,__cstring`, where the panic messages go. That section is for
+-- NUL-terminated C strings, and a Turkey string is bytes and a length: it may
+-- contain a zero byte, and there is no terminator to write.
+fun emitLiterals(asm : Asm.Asm, b : String.Builder) -> Unit {
+    let ordered = byIndex(asm.literals)
+    if len(ordered) == 0 { return }
+    line(b, "    .section __TEXT,__const")
+    for var i = 0; i < len(ordered); i = i + 1 {
+        line(b, "    .p2align 3")
+        line(b, Asm.literalName(i) + ":")
+        emitBytes(ordered[i], b)
+    }
+}
+
+-- A `text -> index` interning table as an array in index order.
+fun byIndex(table : Map.Map String Int) -> Array String {
+    let out : Array String = []
+    for _ in Map.entries(table) { Array.push(out, "") }
+    for (text, index) in Map.entries(table) { out[index] = text }
+    out
+}
+
+-- A string as a `.byte` directive, and nothing at all when it is empty: `.byte`
+-- with no operands is a syntax error, and a zero-length literal is a program
+-- writing `""`.
+fun emitBytes(text : String, b : String.Builder) -> Unit {
+    let out = String.builder()
+    var any = False
+    for byte in String.bytes(text) {
+        if any { String.push(out, ", ") } else { String.push(out, "    .byte ") }
+        any = True
+        String.push(out, Int.toString(Byte.toInt(byte)))
+    }
+    if any { line(b, String.build(out)) }
+}
+
+-- -- the entry sequence ------------------------------------------------------
+
+-- What has to happen before the program's own code, and `main`.
+--
+-- The only hand-written assembly in the backend, and the order is
+-- `Turkey.Llvm.emitEntry`'s because that is the order that has been running
+-- for a milestone: the root array is registered first, then the literals are
+-- interned into it, then the module initializer computes every global, then
+-- `main`. The literals come first because an initializer's value may be one.
+--
+-- `turkey_main` wraps the lot: argument handling, the panic report and the
+-- final collection are the runtime's, written once in C rather than emitted
+-- here in two backends.
+fun emitEntry(asm : Asm.Asm, main : String, b : String.Builder) -> Unit {
+    line(b, "    .text")
+    line(b, "    .p2align 2")
+    line(b, Asm.entrySymbol + ":")
+    -- A frame of its own, because everything below is a call. Thirty-two
+    -- bytes: the record, and the alignment Apple requires.
+    line(b, "    sub sp, sp, #32")
+    instruction(b, A.Str(Physical(Gp, 29), Offset(A.sp, 16), A.W64))
+    instruction(b, A.Str(Physical(Gp, 30), Offset(A.sp, 24), A.W64))
+    line(b, "    add x29, sp, #16")
+
+    -- The permanent frame, before anything allocates. It is never left: every
+    -- global and every literal is live for the whole run, so the mask is all
+    -- ones and this frame sits at the bottom of the chain until the process
+    -- exits.
+    symbolInto(b, A.x0, Asm.globalsFrame)
+    symbolInto(b, Physical(Gp, 1), Asm.rootsSymbol)
+    instruction(b, A.MovConst(Physical(Gp, 2), asm.roots))
+    symbolInto(b, Physical(Gp, 3), Asm.messageSymbol(asm, "<globals>"))
+    call(b, "turkey_root_enter")
+    symbolInto(b, A.x0, Asm.globalsFrame)
+    -- Not `mov x1, #-1`: `movn` is the instruction that spells it, and going
+    -- through the assembler's alias would be one more thing to be wrong about.
+    line(b, "    movn x1, #0")
+    instruction(b, A.Str(Physical(Gp, 1), Offset(A.x0, 32), A.W64))
+
+    -- The frame table, before anything allocates: the first collection may
+    -- happen inside the first `turkey_string_new` below, and a collection that
+    -- cannot read the table sees no frame's roots at all.
+    symbolInto(b, A.x0, Asm.frameTableSymbol)
+    call(b, "turkey_frame_table_register")
+
+    -- Each literal's `TurkeyString`, built once and cached in its slot. This
+    -- is what makes `ConstString` a load rather than an allocation, and what
+    -- makes it not a safepoint.
+    let ordered = byIndex(asm.literals)
+    for var i = 0; i < len(ordered); i = i + 1 {
+        symbolInto(b, A.x0, Asm.literalName(i))
+        instruction(b, A.MovConst(Physical(Gp, 1), byteLength(ordered[i])))
+        call(b, "turkey_string_new")
+        symbolInto(b, Physical(Gp, 1), Asm.rootsSymbol)
+        storeAt(b, A.x0, Physical(Gp, 1), 8 * Asm.literalSlot(asm, ordered[i]))
+    }
+
+    line(b, "    bl " + Asm.symbolFor(Asm.initializerName))
+    -- `main` takes the closure environment every Turkey function takes, and
+    -- has none.
+    instruction(b, A.Mov(A.x0, A.xzr, A.W64))
+    line(b, "    bl " + Asm.symbolFor(main))
+
+    instruction(b, A.Ldr(Physical(Gp, 29), Offset(A.sp, 16), A.W64))
+    instruction(b, A.Ldr(Physical(Gp, 30), Offset(A.sp, 24), A.W64))
+    line(b, "    add sp, sp, #32")
+    line(b, "    ret")
+
+    -- `main` itself: the runtime's, with the entry handed to it. `argc` and
+    -- `argv` are already in `x0` and `x1`.
+    line(b, "    .globl " + Asm.runtimeFor("main"))
+    line(b, "    .p2align 2")
+    line(b, Asm.runtimeFor("main") + ":")
+    line(b, "    sub sp, sp, #16")
+    instruction(b, A.Str(Physical(Gp, 29), Offset(A.sp, 0), A.W64))
+    instruction(b, A.Str(Physical(Gp, 30), Offset(A.sp, 8), A.W64))
+    line(b, "    mov x29, sp")
+    symbolInto(b, Physical(Gp, 2), Asm.entrySymbol)
+    call(b, "turkey_main")
+    instruction(b, A.Ldr(Physical(Gp, 29), Offset(A.sp, 0), A.W64))
+    instruction(b, A.Ldr(Physical(Gp, 30), Offset(A.sp, 8), A.W64))
+    line(b, "    add sp, sp, #16")
+    line(b, "    ret")
+}
+
+-- A symbol's address, in a register: the page, then the offset within it.
+-- The same pair `Turkey.Select.address` emits, spelled here because the entry
+-- sequence is text rather than selected instructions.
+fun symbolInto(b : String.Builder, d : Reg, sym : String) -> Unit {
+    let r = A.showReg(d, A.W64)
+    line(b, "    adrp " + r + ", " + sym + "@PAGE")
+    line(b, "    add " + r + ", " + r + ", " + sym + "@PAGEOFF")
+}
+
+fun call(b : String.Builder, name : String) -> Unit =
+    line(b, "    bl " + Asm.runtimeFor(name))
+
+-- A store through a register base, with the offset in `scratch` when the
+-- immediate does not reach. `boot` interns thousands of literals, so the root
+-- array is past 32,760 bytes long before the corpus is.
+fun storeAt(b : String.Builder, r : Reg, base : Reg, offset : Int) -> Unit {
+    if offset <= widestOffset {
+        instruction(b, A.Str(r, Offset(base, offset), A.W64))
+        return
+    }
+    instruction(b, A.MovConst(scratch, offset))
+    instruction(b, A.Str(r, Indexed(base, scratch), A.W64))
+}
+
+-- A string's length in bytes, which is what `turkey_string_new` is given.
+-- Counted rather than measured: `String.bytes` answers a `Bytes`, which has no
+-- `len`.
+fun byteLength(text : String) -> Int {
+    var n = 0
+    for _ in String.bytes(text) { n = n + 1 }
+    n
+}
+
+-- -- the frame table ---------------------------------------------------------
+
+-- Every safepoint's live roots, keyed by return address
+-- (`NATIVE-BACKEND.md`, "The table's encoding, surveyed").
+--
+-- The emitter cannot sort this: the addresses do not exist until the linker
+-- has run, and all it can write is `.quad <label>` for the linker to
+-- relocate. So the runtime owns the lookup structure, which is OCaml's
+-- division and the one LLVM states outright -- the compiler's format is for
+-- getting the facts across, not for being queried.
+--
+-- The offsets are from `x29`, signed, and `Turkey.Frame.layout` has been
+-- computing them since phase 4.
+fun emitFrameTable(layouts : Array (Int, Frame.Layout),
+                   b : String.Builder) -> Unit {
+    line(b, "    .section __DATA,__const")
+    line(b, "    .p2align 3")
+    line(b, "    .globl " + Asm.frameTableSymbol)
+    line(b, Asm.frameTableSymbol + ":")
+    var n = 0
+    for (_, l) in layouts { n = n + len(l.maps) }
+    line(b, "    .quad " + Int.toString(n))
+    for (tag, l) in layouts {
+        for m in l.maps {
+            line(b, "    .quad " + safepointLabel(tag, m.block, m.index))
+            line(b, "    .quad " + Int.toString(len(m.offsets)))
+            for o in m.offsets { line(b, "    .quad " + Int.toString(o)) }
+        }
+    }
+}

@@ -1,0 +1,90 @@
+-- `Float.bits` and `Float.fromBits`: the only way to see a double's exact
+-- representation (PRIMITIVES.md 3.2c).
+--
+-- `Float.isNaN` and `Float.truncate` are here for the same reason: their
+-- primitives are inline instructions on both native backends.
+--
+-- Every double below is computed at run time, and every function taking one
+-- loops or recurses. With constants, `opt` folds the primitive away and the program
+-- proves nothing about a backend -- which is how the arm64 selector went on
+-- stopping at `Prim.floatBits` in the compiler's own source while the corpus
+-- selected completely.
+--
+-- No arithmetic NaN's bits are printed: which sign `0.0 / 0.0` produces is the
+-- hardware's choice, not the language's. A NaN written with `fromBits` has
+-- the bits it was given, and that is what is checked.
+
+-- A loop rather than recursion: reaching infinity takes 1100 steps, which is
+-- deeper than the Python evaluator's stack.
+fun scaled(x : Float, times : Int, by : Float) -> Float {
+    var result = x
+    var left = times
+    while left > 0 {
+        result = result * by
+        left = left - 1
+    }
+    result
+}
+
+fun showBits(label : String, x : Float) -> Unit {
+    print(label + " " + Int.toString(Float.bits(x)))
+}
+
+fun roundTrips(xs : Array Float, at : Int) -> Bool =
+    if at >= len(xs) { True }
+    else {
+        let x = xs[at]
+        Float.bits(Float.fromBits(Float.bits(x))) == Float.bits(x)
+            && roundTrips(xs, at + 1)
+    }
+
+fun patternsSurvive(ns : Array Int, at : Int) -> Bool =
+    if at >= len(ns) { True }
+    else {
+        Float.bits(Float.fromBits(ns[at])) == ns[at] && patternsSurvive(ns, at + 1)
+    }
+
+fun main() -> Unit {
+    let one = scaled(1.0, 3, 1.0)
+    let negativeZero = scaled(0.0, 1, -1.0)
+    let big = scaled(1.5, 20, -2.5)
+    let infinite = scaled(2.0, 1100, 2.0)
+    let negativeInfinite = scaled(-2.0, 1100, 2.0)
+    let subnormal = scaled(1.0, 1074, 0.5)
+    showBits("one", one)
+    showBits("zero", scaled(0.0, 2, 1.0))
+    showBits("negative zero", negativeZero)
+    showBits("big", big)
+    showBits("infinity", infinite)
+    showBits("negative infinity", negativeInfinite)
+    showBits("smallest subnormal", subnormal)
+    print(Float.toString(Float.fromBits(Float.bits(big))))
+    print(Float.toString(Float.abs(negativeZero)))
+    print(Float.toString(Float.abs(big)))
+
+    -- A signalling NaN's payload, a quiet NaN with the sign set, and the
+    -- largest finite double: patterns no arithmetic here would produce.
+    let signalling = Int.or(Int.shl(2047, 52), 1)
+    let quietNegative = Int.or(Int.shl(4095, 52), 12345)
+    let largest = Int.shl(2047, 52) - 1
+    print(Float.isNaN(Float.fromBits(signalling)))
+    print(patternsSurvive([signalling, quietNegative, largest, 0, 1], 0))
+    print(roundTrips([one, negativeZero, big, infinite, subnormal], 0))
+    print(Float.bits(Float.abs(Float.fromBits(quietNegative)))
+          == Int.and(quietNegative, 9223372036854775807))
+
+    -- `Float.truncate` asks `Prim.floatFitsInt` first, and its edges are the
+    -- two powers of two either side of `Int`: -2^63 fits and 2^63 does not.
+    showTruncated(big)
+    showTruncated(scaled(-1.0, 63, 2.0))
+    showTruncated(scaled(1.0, 63, 2.0))
+    showTruncated(scaled(-0.75, 1, 1.0))
+    showTruncated(infinite)
+    showTruncated(Float.fromBits(signalling))
+    print(Float.isNaN(scaled(0.0, 1, 1.0)))
+}
+
+fun showTruncated(x : Float) -> Unit = match Float.truncate(x) {
+    Some(n) -> print("fits " + Int.toString(n))
+    None -> print("does not fit")
+}

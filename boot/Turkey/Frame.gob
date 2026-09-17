@@ -1,0 +1,246 @@
+module Turkey.Frame (
+    Layout(..), SafepointMap(..), layout, offsetOf, verifyFrame,
+)
+
+-- A function's frame, laid out after allocation (`NATIVE-BACKEND.md`, M28
+-- phase 5, and "Frames, calls and roots, surveyed").
+--
+-- **A description, not code.** What comes out is where each region of the
+-- frame is and how big the whole is; the emitter prints the prologue, the
+-- epilogue and the frame-table entries from it. Everything that needs an
+-- instruction the allocator must see -- the parameter moves, the root stores
+-- before a safepoint, the outgoing stack arguments -- was emitted by
+-- selection, which is why this pass has nothing to insert.
+--
+-- The frame, from the top, with every offset positive from `sp` and `sp` fixed
+-- for the whole body:
+--
+--     sp + size + 8k    incoming stack argument k (the caller's outgoing area)
+--     recordAt          the frame record: saved x29, then x30; x29 points here
+--     savesAt           callee-saved registers the colouring used, in pairs
+--     rootsAt           root slots, one per rooted value (`Turkey.Roots`)
+--     spillsAt          spill slots, one per spilled untraced value
+--     (padding)         to the 16-byte alignment Apple requires
+--     sp + 8k           outgoing stack argument k
+--
+-- The outgoing area is preallocated, as in Go and Cranelift and unlike QBE's
+-- per-call `sp` adjustment, because every slot above is addressed from `sp` and
+-- an `sp` that moved around each call would move all of them.
+--
+-- **Frame tables.** For each call that may collect, the fp-relative offsets of
+-- the root slots live across it. The collector walks `x29` frame records and
+-- looks up each return address; nothing is registered at run time, which is
+-- the 13% the survey measured the shadow stack costing.
+
+import Data.Map as Map
+import Data.Set as Set
+import Turkey.Arm64 as A
+import Turkey.Arm64 (Bank(..), Mem(..))
+import Turkey.Regalloc as Regalloc
+import Turkey.Roots as Roots
+import Turkey.Ssa as Ssa
+
+-- One frame-table entry: the low IR safepoint the call came from, and the
+-- offsets from `x29` of the root slots live across it.
+type SafepointMap = SafepointMap { block : Int, index : Int, offsets : Array Int }
+
+type Layout = Layout {
+    size     : Int,
+    recordAt : Int,
+    savesAt  : Int,
+    savedGp  : Array Int,
+    savedFp  : Array Int,
+    rootsAt  : Int,
+    roots    : Int,
+    spillsAt : Int,
+    spills   : Int,
+    -- Bytes, not slots.
+    outgoing : Int,
+    maps     : Array SafepointMap,
+}
+
+fun layout(a : Regalloc.Allocation, frame : Roots.Frame) -> Layout {
+    let f = a.func
+    let (savedGp, savedFp) = calleeSaved(a)
+    var outgoing = 0
+    for block in f.blocks {
+        for i in block.insts {
+            match A.memOf(i.op) {
+                Some(m) -> match m {
+                    OutgoingArg(k) -> if 8 * (k + 1) > outgoing {
+                        outgoing = 8 * (k + 1)
+                    }
+                    _ -> {}
+                }
+                None -> {}
+            }
+        }
+    }
+    let roots = Roots.slotCount(frame)
+    let spills = a.spills.spillSlots
+    let saves = 8 * even(len(savedGp)) + 8 * even(len(savedFp))
+    let raw = outgoing + 8 * spills + 8 * roots + saves + 16
+    let size = (raw + 15) / 16 * 16
+    let spillsAt = outgoing + (size - raw)
+    let rootsAt = spillsAt + 8 * spills
+    let savesAt = rootsAt + 8 * roots
+    let recordAt = savesAt + saves
+    let l = Layout {
+        size = size, recordAt = recordAt, savesAt = savesAt,
+        savedGp = savedGp, savedFp = savedFp, rootsAt = rootsAt, roots = roots,
+        spillsAt = spillsAt, spills = spills, outgoing = outgoing, maps = [],
+    }
+    for block in f.blocks {
+        for i in block.insts {
+            match A.safepointOf(i.op) {
+                Some((b, n)) -> {
+                    let offsets = []
+                    for (slot, _) in Roots.liveAt(frame, b, n) {
+                        Array.push(offsets, rootsAt + 8 * slot - recordAt)
+                    }
+                    Array.push(l.maps, SafepointMap { block = b, index = n,
+                                                      offsets = offsets })
+                }
+                None -> {}
+            }
+        }
+    }
+    l
+}
+
+fun even(n : Int) -> Int = n + n % 2
+
+-- The callee-saved registers some value was coloured into, in each file,
+-- ascending. `x19`-`x28` and `d8`-`d15`; only the low 64 bits of a `d` are
+-- preserved, which is all a double has.
+fun calleeSaved(a : Regalloc.Allocation) -> (Array Int, Array Int) {
+    let gp = Set.new()
+    let fp = Set.new()
+    let of_ = a.colouring.of_
+    for var id = 0; id < len(of_); id = id + 1 {
+        let r = of_[id]
+        if r >= 0 {
+            match A.bankOf(a.func.reps[id]) {
+                Gp -> if r >= 19 && r <= 28 { Set.add(gp, r) }
+                Fp -> if r >= 8 && r <= 15 { Set.add(fp, r) }
+            }
+        }
+    }
+    (Array.sort(Set.elements(gp)), Array.sort(Set.elements(fp)))
+}
+
+-- Where a frame slot is, from `sp`. `None` for memory that is not a frame slot.
+--
+-- Every constructor is named, and a wildcard would be wrong here rather than
+-- merely loose. `Mem` holds the symbolic slots and the real addressing modes
+-- in one type, so the only thing that says a symbolic slot has been resolved
+-- is that this function resolved it. Under `_ -> None` a slot kind added later
+-- compiles clean, answers `None`, and is emitted as though it were already an
+-- address -- which assembles, links, and reads the wrong word. `verifyFrame`
+-- would not catch it either: it range-checks the kinds it knows.
+fun offsetOf(l : Layout, m : Mem) -> Option Int = match m {
+    RootSlot(i) -> Some(l.rootsAt + 8 * i)
+    SpillSlot(i) -> Some(l.spillsAt + 8 * i)
+    OutgoingArg(k) -> Some(8 * k)
+    IncomingArg(k) -> Some(l.size + 8 * k)
+    Offset(_, _) -> None
+    Indexed(_, _) -> None
+}
+
+-- Whether the layout is a frame, and the frame tables tell the truth.
+--
+-- A wrong offset here assembles, links and runs, and reads or writes some
+-- other slot -- and a wrong frame-table entry is worse: the collector frees
+-- something live, or reads a stale slot as a pointer, and only a collection at
+-- that exact call finds out. So both are checked where they are made.
+fun verifyFrame(a : Regalloc.Allocation, frame : Roots.Frame,
+                l : Layout) -> Array String {
+    let out : Array String = []
+    let f = a.func
+    if l.size % 16 != 0 {
+        Array.push(out, "the frame is " + Int.toString(l.size)
+                        + " bytes, not a multiple of 16")
+    }
+    if l.recordAt + 16 != l.size {
+        Array.push(out, "the frame record is not at the top of the frame")
+    }
+    if l.outgoing > l.spillsAt || l.spillsAt + 8 * l.spills != l.rootsAt
+       || l.rootsAt + 8 * l.roots != l.savesAt {
+        Array.push(out, "the frame's regions overlap or leave a gap")
+    }
+    -- Reserved registers: the scratch pair, the platform register, the frame
+    -- record's two. The colourer's pool excludes them; this is the check that
+    -- it still does.
+    let of_ = a.colouring.of_
+    for var id = 0; id < len(of_); id = id + 1 {
+        let r = of_[id]
+        match A.bankOf(f.reps[id]) {
+            Gp -> if r == 16 || r == 17 || r == 18 || r == 29 || r == 30 {
+                Array.push(out, "value %" + Int.toString(id)
+                                + " is coloured into reserved x" + Int.toString(r))
+            }
+            Fp -> {}
+        }
+    }
+    for var b = 0; b < len(f.blocks); b = b + 1 {
+        let insts = f.blocks[b].insts
+        for var n = 0; n < len(insts); n = n + 1 {
+            match A.memOf(insts[n].op) {
+                Some(m) -> checkSlot(out, l, m, b, n)
+                None -> {}
+            }
+            match A.safepointOf(insts[n].op) {
+                Some((lb, ln)) -> checkMap(out, a, frame, insts, b, n, lb, ln)
+                None -> {}
+            }
+        }
+    }
+    out
+}
+
+fun checkSlot(out : Array String, l : Layout, m : Mem, b : Int, n : Int) -> Unit {
+    let within = match m {
+        RootSlot(i) -> i >= 0 && i < l.roots
+        SpillSlot(i) -> i >= 0 && i < l.spills
+        OutgoingArg(k) -> k >= 0 && 8 * (k + 1) <= l.outgoing
+        IncomingArg(k) -> k >= 0
+        -- Named rather than a wildcard, for the reason `offsetOf` gives: a
+        -- slot kind added later would default to "inside the frame", which is
+        -- the answer that keeps this verifier quiet about it.
+        Offset(_, _) -> True
+        Indexed(_, _) -> True
+    }
+    if !within {
+        Array.push(out, show(m) + " at b" + Int.toString(b) + " instruction "
+                        + Int.toString(n) + " is outside the frame")
+    }
+}
+
+-- A frame-table entry is true if the call before it is a call, and every root
+-- it lists holds its value by then: stored in this block before the call, or
+-- spilled into that slot at its definition, which dominates every use.
+fun checkMap(out : Array String, a : Regalloc.Allocation, frame : Roots.Frame,
+             insts : Array A.Inst, b : Int, n : Int, lb : Int, ln : Int) -> Unit {
+    let at = "b" + Int.toString(b) + " instruction " + Int.toString(n)
+    if n == 0 || !A.isCall(insts[n - 1]) {
+        Array.push(out, "the safepoint map at " + at + " does not follow a call")
+    }
+    for (slot, id) in Roots.liveAt(frame, lb, ln) {
+        let want = show(RootSlot(slot))
+        var stored = match Map.get(a.spills.slots, id) {
+            Some(m) -> show(m) == want
+            None -> False
+        }
+        for var k = 0; k < n; k = k + 1 {
+            match A.slotStore(insts[k].op) {
+                Some((_, m)) -> if show(m) == want { stored = True }
+                None -> {}
+            }
+        }
+        if !stored {
+            Array.push(out, "root slot " + Int.toString(slot) + " (%"
+                            + Int.toString(id) + ") is in the map at " + at
+                            + " but nothing stores it first")
+        }
+    }
+}

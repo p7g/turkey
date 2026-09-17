@@ -500,6 +500,19 @@ def _bin(name, left, right, ret, fn):
     return (mono(TFun([left, right], ret)), _bi(name, 2, fn))
 
 
+_U64 = (1 << 64) - 1
+
+
+def _signed64(value: int) -> int:
+    """The `Int` an address or a difference of addresses is seen as.
+
+    Two's complement, because `Int` is signed 64-bit and the native side does
+    nothing at all here -- the bits are the bits.
+    """
+    value &= _U64
+    return value - (1 << 64) if value >= (1 << 63) else value
+
+
 def _ptr_free(address):
     RAW_HEAP.free(address)
     return UNIT_VALUE
@@ -708,6 +721,20 @@ _PRIM: dict[str, tuple] = {
                       _bi("Prim.ptrAlloc", 1, RAW_HEAP.allocate)),
     "Prim.ptrFree": (mono(TFun([RAW_PTR], UNIT)),
                      _bi("Prim.ptrFree", 1, _ptr_free)),
+
+    # Pointer arithmetic. Wrapping at 64 bits, not trapping: an address near
+    # the top of the space is not an overflow, and the language's checked `+`
+    # is not what these spell. The integer an address maps to is unspecified
+    # beyond round-tripping, so nothing may print one.
+    "Prim.ptrAdd": _bin("Prim.ptrAdd", RAW_PTR, INT, RAW_PTR,
+                        lambda p, n: (p + n) & _U64),
+    "Prim.ptrDiff": _bin("Prim.ptrDiff", RAW_PTR, RAW_PTR, INT,
+                         lambda a, b: _signed64(a - b)),
+    "Prim.ptrNull": (mono(TFun([], RAW_PTR)), _bi("Prim.ptrNull", 0, lambda: 0)),
+    "Prim.ptrIsNull": _pred("Prim.ptrIsNull", RAW_PTR, lambda p: p == 0),
+    "Prim.ptrEq": _cmp("Prim.ptrEq", RAW_PTR, lambda a, b: a == b),
+    "Prim.ptrToInt": _un("Prim.ptrToInt", RAW_PTR, INT, _signed64),
+    "Prim.ptrFromInt": _un("Prim.ptrFromInt", INT, RAW_PTR, lambda n: n & _U64),
 }
 
 # The names a library module may write, and no other module may.

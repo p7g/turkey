@@ -66,6 +66,13 @@ type Conv
     -- obligation on the collector. A no-op at run time, and not a no-op to the
     -- verifier, which is the point of `Rep` carrying both facts.
     | Retag
+    -- Between an untraced `ptr` and `i64`. Also the same machine value, and
+    -- also not a no-op to the verifier -- but for the other reason: an
+    -- address and an integer are the same bits at different *classes*, where
+    -- `Retag` is one class at two trace bits. Pointer arithmetic is the only
+    -- producer, and it is the pair rather than arithmetic-on-pointers because
+    -- `Bin` requires both operands at one representation (TIX-61).
+    | PtrToInt | IntToPtr
 
 type Callee
     -- A Turkey function, by its mangled symbol.
@@ -419,6 +426,22 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Array String {
         }
         ClosureCapture(c, _, _) ->
             wantClass(f, out, c, Ptr, "the target of a closure capture")
+        -- An address and an integer are the same bits, so nothing at run time
+        -- distinguishes a wrong pairing here. And a *traced* pointer turned
+        -- into an integer is a root the collector stops seeing, so the trace
+        -- bit is checked and not only the class.
+        Convert(PtrToInt, a) -> {
+            wantClass(f, out, a, Ptr, "the operand of a pointer-to-integer")
+            if Ssa.repOf(f, a).traced {
+                Array.push(out, "a traced pointer is converted to an integer")
+            }
+        }
+        Convert(IntToPtr, a) -> {
+            wantClass(f, out, a, I64, "the operand of an integer-to-pointer")
+            if Ssa.repOf(f, i.result).traced {
+                Array.push(out, "an integer is converted to a traced pointer")
+            }
+        }
         Call(callee, _) -> match callee {
             Indirect(fn) -> wantClass(f, out, fn, Ptr, "an indirect callee")
             _ -> {}
@@ -654,6 +677,8 @@ instance Show Conv {
     Widen -> "widen"
     Narrow -> "narrow"
     Retag -> "retag"
+    PtrToInt -> "ptrtoint"
+    IntToPtr -> "inttoptr"
   }
 }
 

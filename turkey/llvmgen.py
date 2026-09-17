@@ -1186,6 +1186,29 @@ class _Emitter:
                                   "shift amount is not in 0..63")
             return (builder.shl(args[0], args[1]) if name == "intShl"
                     else builder.ashr(args[0], args[1])), builder
+        # Pointer arithmetic (TIX-61). An address is an integer at another
+        # LLVM type, so each of these is a `ptrtoint`, integer work, and an
+        # `inttoptr` back. Wrapping, never checked: an address near the top of
+        # the space is not an overflow.
+        if name == "ptrAdd":
+            return builder.inttoptr(
+                builder.add(builder.ptrtoint(args[0], _I64), args[1]), _PTR), builder
+        if name == "ptrDiff":
+            return builder.sub(builder.ptrtoint(args[0], _I64),
+                               builder.ptrtoint(args[1], _I64)), builder
+        if name == "ptrNull":
+            return ir.Constant(_PTR, None), builder
+        if name == "ptrIsNull":
+            return builder.icmp_unsigned(
+                "==", builder.ptrtoint(args[0], _I64), ir.Constant(_I64, 0)), builder
+        if name == "ptrEq":
+            return builder.icmp_unsigned(
+                "==", builder.ptrtoint(args[0], _I64),
+                builder.ptrtoint(args[1], _I64)), builder
+        if name == "ptrToInt":
+            return builder.ptrtoint(args[0], _I64), builder
+        if name == "ptrFromInt":
+            return builder.inttoptr(args[0], _PTR), builder
         binary = {
             "intAddWrapping": builder.add, "intSubWrapping": builder.sub,
             "intMulWrapping": builder.mul, "intAnd": builder.and_, "intOr": builder.or_,

@@ -404,6 +404,28 @@ def _qualified(name: str) -> str:
 QUALIFY: set[str] = set()
 
 
+def install_qualified(names: set[str]) -> None:
+    """Make `names` the set `TCon.display` qualifies against, right now.
+
+    `QUALIFY` is global because `TCon.display` has no program to ask, and it is
+    filled by `DeclTable.__init__` -- so it describes *the program checked most
+    recently*, not the one being rendered. One program per process, which is
+    every `turkey` command, cannot tell the difference. A process that checks
+    two programs and then renders the first one can: `tests/test_boot.py`
+    memoizes `check` across stages, and the Core it printed for `boot/Main.gob`
+    named `Data.Map.Entry` as plain `Entry` -- dropping delta 43's
+    disambiguation, because the corpus program checked in between had no second
+    `Entry` and cleared the set. The oracle then reported a difference that was
+    the renderer's, not the compiler's.
+
+    A renderer that has the program's own `DeclTable` calls this first. The
+    underlying fix is for the set to stop being global, which is a change to
+    both implementations and is tracked separately.
+    """
+    QUALIFY.clear()
+    QUALIFY.update(names)
+
+
 INT = TCon("Int")
 BYTE = TCon("Byte")
 FLOAT = TCon("Float")

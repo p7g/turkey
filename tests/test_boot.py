@@ -40,7 +40,7 @@ from turkey.errors import short
 from turkey.lexer import tokenize
 from turkey.parser import parse
 from turkey.core import show_program
-from turkey.types import show_scheme
+from turkey.types import install_qualified, show_scheme
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BOOT_MAIN = REPO_ROOT / "boot" / "Main.gob"
@@ -115,6 +115,20 @@ def _checked(path: Path):
                  str(path.relative_to(REPO_ROOT)), [path.parent])
 
 
+def _rendered(of_checked, checked) -> str:
+    """Render one checked program, with *its* qualification set installed.
+
+    `_checked` is memoized across stages, so by the time `opt` renders
+    `boot/Main.gob` the global `QUALIFY` holds whatever corpus program was
+    checked last -- and the dump loses delta 43's `Data.Map.Entry`
+    disambiguation, which the boot side, one program per process, keeps. The
+    oracle then reports a difference neither compiler has. See
+    `types.install_qualified`.
+    """
+    install_qualified(checked.decls.qualified)
+    return of_checked(checked)
+
+
 def _reference_dump(stage: str, paths: list[Path], of_checked) -> str:
     """One stage's reference text over some programs, cached per program.
 
@@ -125,7 +139,8 @@ def _reference_dump(stage: str, paths: list[Path], of_checked) -> str:
     `boot/Main.gob` entry, correctly, and leaves the corpus entries warm.
     """
     return "".join(
-        bootc.reference(stage, path, lambda p=path: of_checked(_checked(p)))
+        bootc.reference(stage, path,
+                        lambda p=path: _rendered(of_checked, _checked(p)))
         for path in paths)
 
 

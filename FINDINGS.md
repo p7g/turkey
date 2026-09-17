@@ -319,6 +319,49 @@ the `Option` instance, the unconstrained `Array` instance and a default body.
 
 ## Open, and accepted
 
+### 97. The differential oracle disagreed about a name neither compiler got wrong
+**bug, fixed.** TIX-15. Adding a module to `lib/` turned `test_boot`'s `opt`
+stage red on one line out of 37000: the Python side printed `Prim.Array (Entry
+String Binding)` where `boot` printed `Prim.Array (Data.Map.Entry String
+Binding)`. `boot` was right -- `boot/Main.gob` contains both `Data.Map.Entry`
+and `Turkey.Runtime.Entry`, and delta 43 says neither keeps the short name.
+
+Neither compiler had a bug in it. `QUALIFY` is a module-level global in
+`turkey/types.py`, filled by `DeclTable.__init__` and read by `TCon.display` at
+*render* time, so it describes the program checked most recently rather than
+the one being printed. One program per process cannot tell, and every `turkey`
+command is one program per process -- a fresh `turkey opt boot/Main.gob` prints
+`Data.Map.Entry` correctly. `test_boot` is the only caller that checks several
+programs in one process, and it memoizes `check` across its five stages, so by
+the time `opt` rendered `boot/Main.gob` the set belonged to whichever corpus
+program was checked last. The same `CProgram` renders two different ways:
+
+```
+first  = show_program(b.opt, b.module)          # Data.Map.Entry
+check(some_other_program)                        # clears and refills QUALIFY
+second = show_program(b.opt, b.module)          # Entry
+first == second                                  # False
+```
+
+Two things kept it hidden for as long as it was. `bootc.reference` caches each
+dump on disk keyed on `turkey/` and `lib/`, so the stale-but-matching answer
+was served from disk until something in `lib/` changed -- *any* change would
+have done it, and the one that did had nothing to do with names. And the boot
+side, being one program per process, is never wrong here, so the diff always
+pointed at the half that was right.
+
+This is FINDINGS 43's shape once more: the oracle reported a difference that
+belonged to neither implementation. There it was a stage that crashed saying
+nothing; here it is a renderer that reads global state the compared text was
+not produced under. The guard is the same both times -- ask what the oracle is
+actually comparing, not whether it is green.
+
+Fixed by giving each `DeclTable` its own `qualified` set and having
+`test_boot` install the program's own before rendering it
+(`types.install_qualified`). The global remains, and remains the real defect:
+a renderer should take what to qualify from the program it is handed. That is
+a change to both implementations and is tracked separately.
+
 ### 5. An associated family cannot be defined as a family of a concrete type
 **design.** M18, writing `Data.Set` over `Map k Unit`. An instance may define
 its associated family as a family applied to a *variable of the instance head*,

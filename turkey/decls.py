@@ -129,6 +129,10 @@ class DeclTable:
         # what the class and family namespaces are checked against, since a
         # class name is global and unqualified.
         self.shorts: dict[str, str] = {name: name for name in PRIMITIVES}
+        # This table's own copy of what `QUALIFY` holds while it is the one
+        # being rendered. See `types.install_qualified` for why a renderer
+        # cannot just trust the global.
+        self.qualified: set[str] = set()
         QUALIFY.clear()
         OPENED.clear()
         self.tycons["Prim.Array"] = TyconInfo(
@@ -192,6 +196,8 @@ class DeclTable:
                 # Two modules declare this short name. Neither may keep it.
                 QUALIFY.add(claimed)
                 QUALIFY.add(d.name)
+                self.qualified.add(claimed)
+                self.qualified.add(d.name)
             else:
                 self.shorts[short] = d.name
         for d in decls:

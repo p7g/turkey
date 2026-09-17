@@ -1,0 +1,84 @@
+-- Raw memory under collection (TIX-61). This is the test that matters, and
+-- what it is testing is the *absence* of an obligation: an untraced pointer
+-- must be invisible to the collector, and every way of getting that wrong is
+-- silent until something collects.
+--
+-- Under `TURKEY_GC_STRESS=1` the collector runs at every allocation, so each
+-- of the four failures below fires on the first iteration rather than rarely.
+
+import Unsafe.Ptr as Ptr
+import Unsafe.Ptr (Load, Store)
+import Data.Array as Array
+import Data.String as String
+
+-- Allocation, and enough of it. The array and the strings are what force
+-- collections; the values are never read, so the only thing that can be
+-- observed is what the collections did to everything else.
+fun churn(rounds : Int) -> Int {
+    var total = 0
+    for var i = 0; i < rounds; i = i + 1 {
+        let xs : Array String = []
+        for var j = 0; j < 8; j = j + 1 { Array.push(xs, Int.toString(i + j)) }
+        total = total + len(xs) + String.byteLength(Int.toString(i) + "x")
+    }
+    total
+}
+
+fun main() -> Unit {
+    -- 1. The address is not a root. If `Prim.Ptr` erased to a traced
+    --    representation, the collector would walk a malloc'd address as a
+    --    heap object -- a crash, or a pattern overwritten by a forwarding
+    --    word. The block is live across every allocation below.
+    let p = Ptr.alloc(128)
+    for var i = 0; i < 16; i = i + 1 { Ptr.store(p, i * 8, i * 7 + 1) }
+    let held = churn(64)
+
+    var sum = 0
+    for var i = 0; i < 16; i = i + 1 {
+        let v : Int = Ptr.load(p, i * 8)
+        sum = sum + v
+    }
+    print("pattern " + Int.toString(sum))
+
+    -- 2. Several live at once, so that some are spilled. An untraced value
+    --    has no root slot, so a spill of one needs a real stack slot; a root
+    --    slot would be overwritten with a forwarded pointer.
+    let a = Ptr.alloc(32)
+    let b = Ptr.alloc(32)
+    let c = Ptr.alloc(32)
+    let d = Ptr.alloc(32)
+    Ptr.store(a, 0, 11)
+    Ptr.store(b, 0, 22)
+    Ptr.store(c, 0, 33)
+    Ptr.store(d, 0, 44)
+    let more = churn(64)
+    let av : Int = Ptr.load(a, 0)
+    let bv : Int = Ptr.load(b, 0)
+    let cv : Int = Ptr.load(c, 0)
+    let dv : Int = Ptr.load(d, 0)
+    print("spilled " + Int.toString(av + bv + cv + dv))
+
+    -- 3. A pointer stored *into* raw memory. The block is not scanned, so
+    --    the address is neither followed nor rewritten, and reading through
+    --    it afterwards still works.
+    Ptr.store(a, 8, b)
+    let again = churn(64)
+    let indirect : Ptr.Ptr = Ptr.load(a, 8)
+    let through : Int = Ptr.load(indirect, 0)
+    print("through " + Int.toString(through))
+    print("same " + Bool.toString(indirect == b))
+
+    -- 4. And ordinary roots still work in the same frames. A plausible but
+    --    wrong fix -- "nothing in a function that touches raw memory is a
+    --    root" -- passes 1 to 3 and garbles this.
+    let message = "kept " + Int.toString(held + more + again)
+    let final = churn(64)
+    print(message + " " + Int.toString(final))
+
+    Ptr.free(a)
+    Ptr.free(b)
+    Ptr.free(c)
+    Ptr.free(d)
+    Ptr.free(p)
+    print("done")
+}

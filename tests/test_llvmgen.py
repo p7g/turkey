@@ -38,6 +38,12 @@ def _runtime_entry_points() -> set[str]:
 ALLOWED_RUNTIME_CALLS = {
     "turkey_object_new", "turkey_array_new", "turkey_cell_new",
     "turkey_closure_new",
+    # `malloc` and `free`, and only those two: a raw *load* or *store* is a
+    # `getelementptr` and a `load`, which is exactly what this test is for
+    # (TIX-61). If either of those ever appears here, the feature has
+    # regressed into runtime calls and stopped being usable in TIX-63's
+    # non-allocating subset.
+    "turkey_ptr_alloc", "turkey_ptr_free",
     "turkey_box", "turkey_unbox",
     "turkey_string_new", "turkey_string_concat", "turkey_string_concat_all",
     "turkey_string_eq", "turkey_string_lt", "turkey_string_byte_length",

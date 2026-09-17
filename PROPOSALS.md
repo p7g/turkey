@@ -1,10 +1,13 @@
 # Proposals
 
-Eight changes to the language, from `notes.txt`, each measured against what the
-compiler does today and against how other languages answered the same question.
-Nothing here is decided; the point is to have the argument written down before
-any of it is built. Where a note makes a claim about the current implementation,
-that claim was checked by running the compiler, and what it printed is quoted.
+Eight changes to the language from `notes.txt`, and one that is not -- item 8
+comes from the runtime sequence and is argued here because
+`RUNTIME-IN-TURKEY.md` asks for it to be justified as a language feature rather
+than as a means to that sequence. Each is measured against what the compiler
+does today and against how other languages answered the same question. Nothing
+here is decided; the point is to have the argument written down before any of
+it is built. Where a note makes a claim about the current implementation, that
+claim was checked by running the compiler, and what it printed is quoted.
 
 Ordered by what should be built first, not by the order they were written in.
 
@@ -461,6 +464,424 @@ the language changes start adding files.
 
 ---
 
+## 8. `foreign`: a declaration form for the symbols libSystem forces on us
+
+Not from `notes.txt`. This one comes from TIX-62, and
+`RUNTIME-IN-TURKEY.md`'s recommendation is the reason it is argued here rather
+than simply built: *"An FFI is worth having regardless of the runtime. Turkey
+today cannot call C at all, which is a limitation of the language and not of
+the runtime."*
+
+### What is already decided, and it is only this
+
+The *emission* is done. `Callee` has a `Runtime(String)` shape, `Select.gob`
+already dispatches it through `runtimeSymbol`, and `call` already lays
+arguments out by register bank. `Runtime.gob` already owns a table from
+primitive name to C symbol and result class. What is missing is a surface
+syntax, a type mapping, and an answer for the Python side.
+
+TIX-61 also left two things for this: `Prim.ptrAlloc` and `Prim.ptrFree` are
+`malloc` and `free` behind runtime calls, standing in until there is an FFI.
+
+### The framing that makes this small
+
+The ticket sizes itself against thirty-five libc functions and asks whether an
+FFI that expresses exactly them is too narrow to justify. That is the wrong
+axis, because the goal is not to call C well -- it is to depend on libc as
+little as possible and write the rest in Turkey.
+
+Under that framing the thirty-five sort into four piles and only one of them
+is an FFI problem:
+
+| group | today | under this proposal |
+|---|---|---|
+| `floor` `ceil` `round` `trunc` `isnan` | libm calls | **instruction selection.** arm64 has `frintm`/`frintp`/`frintn`/`frintz`; LLVM has the intrinsics. A `Select.gob` change, and its own ticket |
+| `snprintf` `fprintf` `fputs` `fwrite` `fread` `fopen` `fclose` `strlen` `strtod` | libc stdio and string | **Turkey, over `read` and `write`** |
+| `getenv` | libc | **Turkey.** `environ` is a pointer array handed to the process at startup |
+| `malloc` `free` `realloc` | libc | **Turkey, over `mmap`** -- eventually |
+| `memcpy` `memmove` `memset` `memcmp` | libc | **see 8.7** |
+| `read` `write` `exit` `signal` and the five `pthread_*` | libc | **the FFI.** About ten entry points |
+
+So the answer to the ticket's question is: the *mechanism* is general -- any C
+ABI signature over scalars and `Ptr` -- and what is narrow is the list of
+symbols anyone has a reason to declare. That is the right way round.
+
+### 8.1 The survey
+
+Six axes, and on five of them the peers agree closely enough that the
+disagreement is the interesting part.
+
+#### Strings are decided by whether the collector moves
+
+Every peer with a **moving** collector copies at the boundary, and says why.
+Go's `C.CString` mallocs a copy the caller frees, and cgo's rules go further:
+C code "may not keep a copy of the Go pointer after the call returns", checked
+at run time and fatal, because "after the cgo call returns, the Go garbage
+collector is free to move memory around as necessary, but it cannot update any
+pointers in C/C++ when it does this."
+
+JNI prices the same trade out loud and sells both halves. `GetStringUTFChars`
+copies; `GetStringCritical` pins and is faster only "on some platforms", since
+"while an object is pinned it cannot be moved, potentially impeding many
+Garbage Collector techniques which require object movement." Android's move to
+a moving collector "greatly reduces the number of cases where direct pointers
+can be provided ... even for `GetStringCritical`", and JEP 423 exists to give
+G1 region pinning back.
+
+The two systems with **non-moving** heaps hand the pointer over instead.
+OCaml pads its strings with a NUL *precisely* so `String_val` is a valid
+`char*` for free -- with the documented caveat that OCaml strings may contain
+NUL bytes, so C functions must "cope with arbitrary bytes within the buffer
+contents and are not expecting C strings." Modula-3 makes the same claim for
+untraced references generally: "In most other respects, traced and untraced
+references behave identically."
+
+Rust, with no collector at all, shows where the cost goes when movement is not
+the problem: `CString::new` *fails* on an interior NUL and reports its position.
+
+**Turkey's collector does not move.** So OCaml's route is open and nobody
+else's obstacle applies -- the only thing in the way is that `TurkeyString` is
+`{int64_t length; unsigned char bytes[]}` with no terminator, and the fix is
+one byte at every construction site.
+
+#### Ownership is documented everywhere and expressed nowhere
+
+Go's two cgo rules are run-time checks that crash the program. Haskell's
+`ForeignPtr` plus `touchForeignPtr` is a finalizer and a manual liveness
+marker. Modula-3 just splits the heap and concedes that matching references to
+C "is complicated ... the traced heap is automatically managed in ways that
+are not compatible with sharing of memory between safe and unsafe languages."
+
+Nobody puts it in the type system, and that is the finding.
+
+#### The variadic escape hatch that every peer uses is closed here
+
+Go: "Calling variadic C functions is not supported. The arguments must be
+written out in the calling C code" -- the remedy is a static C wrapper.
+Haskell: varargs "are unsupported by the `ccall` calling convention. Foreign
+imports needing to call such functions should rather use the `capi`
+convention", which generates a wrapper from the header.
+
+**Both answers are a C compiler**, which is the thing this sequence exists to
+remove.
+
+And declining is not neutral, because a fixed-arity declaration does not fail
+to work -- it miscompiles. Darwin's arm64 convention passes **every** variadic
+argument on the stack where AAPCS64 passes them in registers, a deliberate
+divergence that "greatly simplifies the underlying implementation of `va_list`
+and related macros." So a fixed-arity `snprintf` puts an argument in a register
+the callee reads off the stack.
+
+#### The declaration form: Rust 2024 re-derived Modula-3's argument
+
+Modula-3's `EXTERNAL` pragma "can only be used within unsafe interfaces",
+because "since the type of the function or data structure may in fact be
+specified by the C implementation, Modula-3 cannot enforce type safety of safe
+modules that use EXTERNAL."
+
+Rust 2024 made every `extern` block an `unsafe extern` block, and RFC 3484's
+reasoning is the same argument reached independently thirty-five years later:
+*"When we declare the signature of items within extern blocks, we are asserting
+to the compiler that these declarations are correct. The compiler cannot itself
+verify these assertions ... It's unreasonable to expect the caller (in the case
+of function items) to have to prove that the signature is valid. Instead, it's
+the responsibility of the person writing the extern block."*
+
+The piece worth taking is what Rust added alongside it: items inside an
+`unsafe extern` block "may be marked as safe to use." The declarer carries the
+risk once; the caller does not carry it again.
+
+#### errno is a library, with one catch that bites
+
+Go exposes it as an optional second return value from any C call. Haskell makes
+it a library -- `throwErrno`, `throwErrnoIfMinus1Retry` -- and the RTS keeps a
+`saved_errno` per Haskell thread and restores it on reschedule.
+
+The catch: on Darwin `errno` is a macro for `*__error()`, which is a **call**.
+glibc's is `__errno_location()`. So reading errno is an ordinary foreign
+declaration, and "declare `errno` as an extern global" silently does not work.
+
+#### The constraint no peer has
+
+None of these systems has a second implementation acting as an oracle.
+`turkey/values.py`'s `RawHeap` hands out *simulated* addresses from 4096, and
+`PRIMITIVES.md` 9.4 states its job: to agree with `malloc` on everything
+defined and to disagree loudly everywhere the section says "undefined". A real
+call cannot be handed a simulated address. 8.9 is what follows from that.
+
+### 8.2 The declaration form
+
+A top-level declaration naming a C symbol and a signature, legal only in
+modules under `lib/Unsafe/`.
+
+```
+foreign "read" fun read(fd : Int, buf : Ptr, count : Int) -> Int
+```
+
+Modula-3's rule and Rust's, with the gate Turkey already has rather than a new
+one: `Prim.` is spellable only from `lib/`, and `lib/Unsafe/Ptr.gob` already
+puts the subject in the import list of everything that touches raw memory,
+which is Oberon's `SYSTEM` gesture. A `foreign` declaration is the same kind of
+assertion and belongs behind the same name.
+
+Rust's `safe fn` is the shape of the exported surface: the declaration is
+unsafe and lives once, and what `System.IO` exports is ordinary Turkey. That
+boundary is load-bearing beyond tidiness -- see 8.8.
+
+### 8.3 The type mapping
+
+`Unit`, `Bool`, `Byte`, `Char`, `Int`, `Float`, `Ptr`. Nothing else crosses in
+either direction: no `String`, no `Array`, no records, no closures, no type
+variables.
+
+Each of those already erases to exactly one `RepClass`, which is the whole
+reason the list is what it is -- `PRIMITIVES.md` 9.3 had to make the same
+choice for raw load and store and made it the same way, for the same reason.
+A type outside the mapping is a compile error at the declaration, not at the
+call.
+
+Callbacks are the one absence that is a deferral rather than a decision, and
+they belong to TIX-65 and TIX-67 because they need the non-allocating
+convention that TIX-63 has not built.
+
+### 8.4 Strings copy, and only paths need one
+
+OCaml's route is open to Turkey and this proposal declines it anyway.
+
+Under 8.3's scope the only NUL-terminated arguments that appear are paths --
+`open`, and later `stat` and `execve`. Everything else in the residue takes
+`(ptr, len)`, because that is what a POSIX call takes. Padding every
+`TurkeyString` in the program to serve a handful of call sites is a cost paid
+everywhere for a benefit collected in three places.
+
+So `Unsafe.Ptr` grows a copying `toCString` and a `fromCString`, which is
+Haskell's `withCString` and Go's `C.CString` at a tenth of their traffic.
+
+**What would reopen this.** A section of the runtime that hands strings to C
+in a loop. If the measurement ever shows the copy on a hot path, OCaml's
+padding is the answer and it is a one-byte change in
+`runtime/turkey_runtime.c` that no other implementation can see -- the padding
+is invisible to `length`. Recording it here so the option is not rediscovered.
+
+### 8.5 No variadics
+
+Declined, and the two functions that wanted them leave the list under the
+framing above. Go and Haskell both decline and both route to a C wrapper, and
+that remedy is unavailable here for the reason the whole sequence exists.
+
+**The consequence to state plainly**, because it is a real bill and not a
+footnote: `%.17g` float formatting and `strtod` become Turkey work on the
+critical path. That is Ryu or Grisu, it is its own ticket, and it is owed the
+moment `turkey_float_to_string` is rewritten whether or not variadics are ever
+added.
+
+### 8.6 At most eight general and eight floating arguments, and none on the stack
+
+`Select.gob` says it already: the stack arguments it emits "are this compiler's
+own convention, and a C function would not read them the same way", and a
+runtime call that overflows calls `stop`. AAPCS64's stack rules are
+unimplemented.
+
+Every function in the residue takes six arguments or fewer -- `mmap` is the
+widest and it fits. So the restriction costs nothing today, and the reason to
+write it down as a *rule* rather than leave it as a `stop` is that a
+declaration is user-written and a runtime entry point was not. A ninth argument
+must be rejected at the declaration with an error that says why, rather than
+selected into a convention the callee does not share.
+
+### 8.7 `memcpy`, `memmove`, `memset`, `memcmp`, and why the residue is LLVM's
+
+These cannot be declined by declining to declare them. LLVM is free to
+recognise a copy loop and replace it with `llvm.memcpy`, which lowers to a
+call, and the situation is worse than a flag can fix: *"Clang (as well as gcc)
+requires that freestanding environment provides memcpy, memmove, memset and
+memcmp. None of `-fno-builtin-memcpy`, `-ffreestanding` nor `-nostdlib`
+provide a satisfactory answer to the problem."* A C implementation of `memcpy`
+is itself a candidate for being rewritten into a call to `memcpy`. Rust's
+`no_std` ships `compiler_builtins` for exactly this.
+
+So they stay linked, named here as residue rather than discovered at link time.
+
+**But the residue belongs to LLVM and not to Turkey**, which is worth checking
+rather than assuming, and it checks out: the arm64 backend emits no reference
+to any of the four. It is a `Ldr`/`Str` machine. The only reach for one in the
+whole toolchain is `Llvm.gob`'s `llvm.memset` zeroing a root frame, plus
+whatever LLVM synthesises unbidden; `runtime/turkey_runtime.c` uses them twenty
+times and is the thing being rewritten.
+
+Both causes are scheduled to go. This entry expires with the LLVM backend.
+
+### 8.8 What this must not foreclose
+
+Zig and Go converged on the same split: raw syscalls on Linux, where "Linux
+syscalls are a stable ABI across kernel versions", and the platform libc on
+Darwin. Zig "always links dynamically against libSystem ... because this is the
+stable syscall interface." Go reached it the expensive way -- it did raw Darwin
+syscalls until "binaries were occasionally broken by kernel updates", because
+"Apple doesn't commit to a particular syscall ABI", and 1.12 moved to libSystem
+"ensuring forward-compatibility with future versions of macOS and iOS" at a
+performance loss taken deliberately. Two second-order costs came with it that
+are worth knowing before copying it: the switch "triggered additional App Store
+checks for private API usage", and `Getdirentries` now fails with `ENOSYS` on
+iOS.
+
+Darwin is the host, so the syscall instruction is out of scope and Linux gets
+the same treatment through glibc: one mechanism, two symbol tables.
+
+Three decisions above are what keep the other door open, and they are decided
+partly *for* that reason rather than incidentally:
+
+* **8.2's safe wrappers are the only public surface.** `System.IO.read` must
+  not reveal whether it went through `read@libSystem` or `svc #0`. That
+  boundary is the swap point, and it is the whole mechanism by which the
+  substrate can change without the library changing.
+* **8.5 and the errno decision keep errno out of the call form.** A raw Linux
+  syscall returns `-errno` in the result register and has no global at all. Had
+  errno been built into the call the way cgo builds it into a second return
+  value, a syscall would have needed a different call form rather than a
+  different library.
+* **File descriptors and `(ptr, len)`, never `FILE*`.** Declining stdio means
+  the safe layer already speaks the shapes a syscall takes.
+
+A syscall primitive is then *additive*: `Prim.syscall6` is shaped like the
+`Prim.loadI64` family TIX-61 added, not like a `foreign` declaration, and
+nothing here has to be revised to admit it.
+
+Unbuilt and blocked by nothing here: no libc on Linux means no `crt1.o`, so
+`_start`, the initial stack and `environ`/`auxv` become ours. That is
+`LINKER.md`'s problem.
+
+### 8.9 The Python side delegates to POSIX, and does not use `ctypes`
+
+`ctypes` is the obvious answer and it is wrong, for a reason particular to this
+project rather than for effort.
+
+`tests/test_native.py`'s premise is that there is no byte-identical oracle
+below Core and that **differential execution** replaces it. Back raw memory
+with `ctypes` and real `malloc`, and the two arms of that differential stop
+being independent implementations -- they become the host's libc, called twice.
+A differential whose arms are the same code catches nothing, which is
+FINDINGS 43's failure mode generalized.
+
+`PRIMITIVES.md` 9.4 has already argued the specific case. Fresh memory is
+poisoned rather than zeroed because "a zero fill would make 'reads back as
+zero' an accidental guarantee, and since this side is the oracle, the
+differential would then *enforce* the accident." Real `malloc` is worse than a
+zero fill, not better: it is plausible garbage that matches often enough to
+make the test flaky instead of wrong.
+
+Three further costs follow. Addresses stop being deterministic, and
+`RawHeap.reset` exists precisely so that "a program's addresses are a function
+of its own allocation sequence and not of what ran before it in this process",
+with byte-exact goldens downstream of that. Undefined behaviour stops raising
+`TurkeyPanic` and starts segfaulting a pytest worker, in a suite that runs in
+parallel. And `tests/test_primitives.py`'s raw-memory tests only mean anything
+against a simulation.
+
+**The alternative is not hand-written C semantics.** The residue is about ten
+POSIX calls and Python already has every one of them -- `os.read`, `os.write`,
+`os.open`, `os.close`, `os.environ`, `os._exit`, the `mmap` module. Each
+foreign symbol is a delegation plus a buffer copied in or out of `RawHeap`.
+The oracle stays independent, and a symbol with no delegation is a clean
+"cannot run this program on this host" with the differential still covering
+every stage up to execution.
+
+What this leaves, stated rather than hidden: **the Python implementation
+supports the symbols it delegates, not the general feature.** That is an
+asymmetry of the same kind as the Python side not having an arm64 backend, and
+a general FFI has no user outside the runtime today. If one ever arrives,
+`ctypes` behind a flag that the suite never sets is the shape of the answer.
+
+Two properties of this choice are worth noticing. The delegation is to POSIX
+*semantics* rather than to libc, so it is reusable verbatim if Linux ever goes
+direct to syscalls. And an `mmap`-based allocator written in Turkey would run
+against exactly the simulation `RawHeap` already is, which is the one place
+where the oracle gets easier rather than harder.
+
+### 8.10 Ownership stays documented
+
+Nobody expresses it in a type system, and Turkey should not be the first to
+try on the strength of ten symbols.
+
+Half of it is already enforced, for free and statically: `LowIr.checkReps`
+rejects storing a traced pointer through a raw pointer, which is cgo's first
+rule caught at compile time instead of at run time. `PRIMITIVES.md` 9.3 gives
+the reason -- the block has no header and is not scanned, so "nothing at run
+time could tell the two stores apart".
+
+The other half -- that C must not retain a pointer past the call -- needs
+lifetimes and gets a sentence in `PRIMITIVES.md` 9.1 alongside the rest of what
+is undefined there. The pinning problem that Go, JNI and the JVM all spend
+real machinery on does not arise, because the collector does not move objects.
+
+### 8.11 The work
+
+Both implementations, per `CLAUDE.md`, so each item is two edits and a golden
+regeneration.
+
+* **Surface.** A `foreign-decl` production in `design.md` 3.1 and 3.3; the
+  parser, AST, declaration collection and name resolution on both sides, with
+  the `lib/Unsafe/` gate where `Prim.`'s already is; and inference giving the
+  declaration a monotype and rejecting anything outside 8.3.
+* **Lowering.** `Runtime.gob`'s `Entry` and `entryPoint` are a fixed table
+  keyed by primitive name; generalise them so a declaration produces the same
+  data. `Select.gob` already dispatches `Runtime(name)` and already lays
+  arguments out by bank -- what is new is 8.6's arity check and a result bank
+  that comes from the declaration rather than from `resultBank`. `Llvm.gob`'s
+  `declareRuntime` and `llvmgen.py` gain the declared signatures.
+* **Delegations.** `builtins.py` gains the symbol table of 8.9.
+* **Library.** The declarations in `lib/Unsafe/`, with safe wrappers in
+  `System.*`. `Prim.ptrAlloc` and `Prim.ptrFree` are deleted from
+  `PrimTypes.gob`, `Prims.gob`, `Runtime.gob`, `builtins.py` and `llvmgen.py`,
+  and `Unsafe.Ptr.alloc`/`free` point at declared `malloc`/`free` -- which is
+  what `RUNTIME-IN-TURKEY.md` says this ticket is for.
+* **Docs.** `PRIMITIVES.md` 9.1 gains 8.10's sentence; `SPEC-DELTAS.md` gains
+  the numbered decision.
+
+Verification is `test_boot`'s byte diff for everything above Core, and
+`test_native`'s differential execution for the ABI, which is the only thing
+that actually checks a calling convention. A conformance program that reads an
+environment variable and one that allocates, stores at each representation,
+reloads and frees are the two that matter, and the second wants a
+`TURKEY_GC_STRESS=1` run because the failure mode is the collector following
+something it must not. A declaration with nine general arguments must be
+rejected with 8.6's error rather than miscompiled.
+
+### 8.12 Sources
+
+- cgo, its pointer-passing rules and the variadic limitation:
+  <https://pkg.go.dev/cmd/cgo>, and the proposal that fixed the rules:
+  <https://go.googlesource.com/proposal/+/master/design/12416-cgo-pointers.md>
+- Go 1.12 moving Darwin to libSystem: <https://go.dev/doc/go1.12>, and the
+  issue that argued it: <https://github.com/golang/go/issues/17490>
+- GHC's FFI, `capi` for varargs, and safe versus unsafe calls:
+  <https://ghc.gitlab.haskell.org/ghc/doc/users_guide/exts/ffi.html>
+- Haskell's errno as a library, and the RTS's per-thread `saved_errno`:
+  <https://hackage.haskell.org/package/base/docs/Foreign-C-Error.html>
+- OCaml's NUL-padded strings and the caveat that comes with them:
+  <https://ocaml.org/manual/5.4/intfc.html>,
+  <https://dev.realworldocaml.org/runtime-memory-layout.html>
+- Modula-3's `EXTERNAL` in unsafe interfaces, and traced versus untraced
+  references: <https://en.wikipedia.org/wiki/Modula-3>,
+  <https://www.opencm3.net/doc/reference/intro.html>
+- Rust's RFC 3484, `unsafe extern` and `safe fn` within it:
+  <https://rust-lang.github.io/rfcs/3484-unsafe-extern-blocks.html>
+- Rust's `CString` and its interior-NUL error:
+  <https://doc.rust-lang.org/std/ffi/struct.CString.html>
+- JNI copying versus pinning, and what a moving collector costs it:
+  <https://www.ibm.com/docs/en/sdk-java-technology/8?topic=jni-copying-pinning>,
+  <https://openjdk.org/jeps/423>
+- LLVM's synthesis of `memcpy` and why no flag prevents it:
+  <https://lists.llvm.org/pipermail/llvm-dev/2019-April/131973.html>,
+  <https://github.com/llvm/llvm-project/issues/56467>
+- Zig's `syscall0`..`syscall7` on Linux and libSystem on Darwin:
+  <https://github.com/ziglang/zig/blob/master/lib/std/os/linux.zig>,
+  <https://deepwiki.com/ziglang/zig/4.5.2-platform-specific-implementations>
+- Darwin's arm64 divergence on variadic arguments:
+  <https://dyncall.org/docs/manual/manualse11.html>
+
+---
+
 ## Order
 
 1. **The extension rename** -- mechanical, gets more expensive the longer it
@@ -481,3 +902,9 @@ the language changes start adding files.
 7. **Records lay out by field type** -- the largest change, and the one whose
    argument is about what the language claims to know rather than about what it
    costs.
+
+Item 8 is not in this sequence and does not interact with it. It is ordered by
+the ticket graph of the runtime work instead: TIX-61 is its prerequisite and is
+done, and TIX-65 and TIX-67 wait on it. The only coupling to the list above is
+that it adds a declaration form, so the grammar work in (2) and (3) should not
+be in flight at the same time.

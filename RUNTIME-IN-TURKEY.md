@@ -12,6 +12,13 @@ until there is an FFI: TIX-62 declares both directly and deletes them. And the
 module gate is a gesture -- `lib/Unsafe/Ptr.gob` puts the name in the import
 list of anything touching raw memory -- not the checker TIX-63 will build.
 
+The FFI is now argued, per the recommendation at the foot of this document, as
+`PROPOSALS.md` item 8. It is smaller than the thirty-five below suggest: under
+"depend on libc as little as possible" only about ten of them are an FFI
+problem at all, five are instruction selection, and the rest are Turkey written
+over `read`, `write` and `mmap`. That proposal also carries the survey of how
+peers answer the string and ownership questions.
+
 `LINKER.md` ends by noting that no way of producing an executable removes the C
 dependency, because `runtime/turkey_runtime.c` is C and `boot` cannot compile C.
 This asks the follow-on question: could pointer primitives and a small FFI let

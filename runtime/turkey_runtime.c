@@ -350,14 +350,18 @@ static void mark_children(void *value) {
     }
     if (header->kind != HEAP_OBJECT) return;
     TurkeyObject *object = value;
+    /* Code 7 is a traced pointer and 6 is a pointer-sized word the collector
+       must not follow -- a raw address (TIX-61). The test used to be `>= 6`,
+       which was right only while every pointer was traced and so nothing was
+       ever written as 6. */
     if (object->kind == 2) {
-        if (object->tag >= 6)
+        if (object->tag == 7)
             for (int64_t index = 0; index < object->count; ++index)
                 mark_grey((void *)(uintptr_t)object->slots[index],
                           "array pointer field", index);
     } else if (object->kind == 0 || object->kind == 1) {
         for (int64_t index = 0; index < object->count; ++index)
-            if (((object->pointer_bitmap >> (3 * index)) & 7) >= 6)
+            if (((object->pointer_bitmap >> (3 * index)) & 7) == 7)
                 mark_grey((void *)(uintptr_t)object->slots[index],
                           "object pointer field", index);
     } else {
@@ -1264,7 +1268,9 @@ void *turkey_args_storage(void) {
     /* Rooted before the first string is built: every `turkey_string_new` can
        collect, and the array is the only thing holding the strings made
        before it. */
-    TurkeyObject *storage = turkey_array_new(argument_count, 0, 8, 6);
+    /* Element layout 7: an array of `TurkeyString *`, which the collector
+       must follow. It read 6 while 6 and 7 were both traced. */
+    TurkeyObject *storage = turkey_array_new(argument_count, 0, 8, 7);
     if (storage == NULL) { turkey_root_leave(&frame); return NULL; }
     roots[0] = storage;
     frame.live = 1;

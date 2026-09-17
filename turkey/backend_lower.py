@@ -1532,10 +1532,17 @@ def _pointer_layout(layout: bir.Layout) -> bool:
     return layout in (bir.Layout.PTR, bir.Layout.BOXED)
 
 
+#: The collector's three-bit-per-slot layout code.
+#:
+#: 7 means *traced pointer* and 6 means a pointer-sized word the collector must
+#: not follow. `PTR` and `BOXED` are both traced -- `BOXED` is "a pointer, and
+#: which kind is not known here" -- so both are 7, and 6 is what an untraced
+#: pointer will be written as (TIX-61). They used to be 6 and 7, which worked
+#: only because `mark_children` tested `>= 6` and so could not tell them apart.
 LAYOUT_CODES = {
     bir.Layout.UNIT: 0, bir.Layout.I1: 1, bir.Layout.I8: 2,
     bir.Layout.I32: 3, bir.Layout.I64: 4, bir.Layout.F64: 5,
-    bir.Layout.PTR: 6, bir.Layout.BOXED: 7,
+    bir.Layout.PTR: 7, bir.Layout.BOXED: 7,
 }
 
 

@@ -66,10 +66,13 @@ def _llvm_type(layout: bir.Layout) -> ir.Type:
 
 
 def _layout_code(layout: bir.Layout) -> int:
+    """The same table as `backend_lower.LAYOUT_CODES`, and it has to stay the
+    same: that one writes an object's metadata and this one writes an array's
+    element tag, and the collector reads both with one rule."""
     return {
         bir.Layout.UNIT: 0, bir.Layout.I1: 1, bir.Layout.I8: 2,
         bir.Layout.I32: 3, bir.Layout.I64: 4, bir.Layout.F64: 5,
-        bir.Layout.PTR: 6, bir.Layout.BOXED: 7,
+        bir.Layout.PTR: 7, bir.Layout.BOXED: 7,
     }[layout]
 
 

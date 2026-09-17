@@ -243,3 +243,35 @@ fun main() {
 }
 """
     assert outputs(source, capfd) == "outer is not an io error\n9\n"
+
+
+PARAMETERIZED = PAYLOADS + """
+type Tagged a = Tagged(a)
+
+instance Error (Tagged a) : Show a, Typed a {
+    fun message(Tagged(x)) = "tagged " + show(x)
+}
+
+fun asTaggedInt(e : SomeError) -> Option (Tagged Int) = Error.cast(e)
+fun asTaggedString(e : SomeError) -> Option (Tagged String) = Error.cast(e)
+"""
+
+
+def test_a_parameterized_payload_casts_at_its_argument(capfd):
+    """`Tagged Int` and `Tagged String` are one constructor and one derived
+    instance, whose head is general, so the argument's rep is the only thing
+    telling the two apart -- and a cast that compared constructors alone would
+    hand a `String` back as an `Int`."""
+    source = PARAMETERIZED + """
+fun main() {
+    match asTaggedInt(fail(Tagged(7))) {
+        Some(Tagged(n)) -> print(n + 1)
+        None -> print("not a tagged int")
+    }
+    match asTaggedString(fail(Tagged(7))) {
+        Some(Tagged(s)) -> print("wrong " + s)
+        None -> print("not a tagged string")
+    }
+}
+"""
+    assert outputs(source, capfd) == "8\nnot a tagged string\n"

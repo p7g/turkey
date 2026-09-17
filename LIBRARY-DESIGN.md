@@ -275,19 +275,75 @@ is intended.
 Retain the [ERRORS.md](ERRORS.md) direction: typed error values, existential
 `SomeError`, existing monadic `?`, and panics for bugs with recovery at isolation
 boundaries. No implicit `From` mechanism or error-specific rewrite of `?` is added.
+Re-examined on 2026-09-17 against the associated-family and multi-parameter
+routes, and unchanged: a conversion class is not part of this work. ERRORS.md
+decision 5 and plan.txt both stand.
 
-Promotion is an ordinary library operation. Illustrative API:
+Promotion is an ordinary library operation, built from two pieces that each
+belong somewhere other than "errors on `Either`".
+
+**Mapping the left is `Bifunctor`, not an error operation.** An earlier draft of
+this section gave the operation as `mapError : fun(Either e a, fun(e) -> f) ->
+Either f a`. That name presumes the left is an error, which is exactly the
+assumption `Either` declines to make -- `Either` is not `Result`. The general
+operation is Haskell's `Data.Bifunctor.first`. (`Control.Arrow.left` is the same
+function reached through `ArrowChoice` at `(->)`; it is an accident of the arrow
+hierarchy rather than the thing meant, and is not the precedent to follow.)
 
 ```text
-mapError : fun(Either e a, fun(e) -> f) -> Either f a
-promote[Error e] : fun(Either e a) -> Either SomeError a
+class Bifunctor f {
+    fun bimap(f a b, fun(a) -> c, fun(b) -> d) -> f c d
+}
+
+instance Bifunctor Either { ... }
+
+first[Bifunctor f]  : fun(f a b, fun(a) -> c) -> f c b
+second[Bifunctor f] : fun(f a b, fun(b) -> d) -> f a d
 ```
 
-`promote` maps `Left(e)` to `Left(SomeError(e))` and preserves successes:
+This is expressible today, with no language change. Kind `* -> * -> *` class
+variables are inferred from the method signature exactly as `Monad`'s `* -> *`
+is, written down nowhere; the class and the `Either` instance above compile and
+run (checked 2026-09-17). `second` must agree with `Functor.map (Either l)`, a
+law nothing checks.
+
+`Either.mapLeft` is then the thin, discoverable wrapper on the module that owns
+the type:
+
+```text
+mapLeft : fun(Either l r, fun(l) -> m) -> Either m r
+```
+
+**A pair should be a `Bifunctor`, and today it cannot be.** Not because of the
+class system -- saturated tuple instance heads such as `instance Flip (a, b)`
+already work -- but because `TTuple` is its own type former of kind `*` rather
+than a constructor that can be partially applied, and type aliases are saturated
+(delta 28) so `type Pair a b = (a, b)` does not provide a head either. That is a
+type-representation change, tracked separately as TIX-43. `Bifunctor` does not
+wait on it; `Either` is a legal instance now, and user-defined types such as
+`Validation e a` are the other instances the class serves.
+
+**Promotion is `mapLeft` through the packing function**, and so belongs in
+`Error` rather than on `Either`:
+
+```text
+promote[Error e] : fun(Either e a) -> Either SomeError a
+promote(x) = Either.mapLeft(x, fail)
+```
 
 ```text
 let contents = promote(File.readText(path))?
 ```
+
+Whether it earns a name at all is open: `Either.mapLeft(x, fail)` is already
+short and composes, and a named wrapper is worth adding only once call sites
+show it repeated. If it does earn one, `promote` is the spelling to use --
+`lift` will be read as the monad-transformer operation, and `liftEither` already
+means `Either e a -> m a` in `Control.Monad.Except`, a different operation.
+`Error` owns `fail` and knows nothing about `Either`; `Either` owns `mapLeft`
+and knows nothing about errors. The rule that packing goes through the one
+standard packing function, so a trace is captured once and an already-packed
+`SomeError` is not wrapped again, then has a single home in `fail`.
 
 APIs may retain concrete errors where exhaustive handling is useful. Integration
 boundaries can use `SomeError`. The existing plan to convert standard-library

@@ -1553,8 +1553,12 @@ other than the one it gives.
   -- zero-extended, a `Float` bitcast -- and `record_stores.gob` pins the mixed
   case.
 * **The collector's view.** `pointer_bitmap` is **three bits per slot**, a layout
-  code (`UNIT 0, I1 1, I8 2, I32 3, I64 4, F64 5, PTR 6, BOXED 7`), and
-  `mark_children` traces a slot whose code is 6 or more. It is written per
+  code (`UNIT 0, I1 1, I8 2, I32 3, I64 4, F64 5, ADDR 6, PTR/BOXED 7`), and
+  `mark_children` traces a slot whose code is **exactly 7**. It read `>= 6`
+  until TIX-61, when an untraced pointer became reachable and 6 and 7 stopped
+  meaning the same thing; `ArrayNew` had to start carrying a `Rep` rather than
+  a `RepClass` in the same change, because the element's trace bit was being
+  discarded before it reached the tag. It is written per
   *object*, at the construction site, from the layouts of the values stored
   (`_layout_metadata`, `SsaLower.metadata`). Three bits a slot is why
   `turkey_object_new` caps a constructor at 21 fields.
@@ -1619,7 +1623,10 @@ it.
   by which rule.
 * The header: `count` as words scanned plus a byte size for the packed tail, or
   a per-constructor descriptor in place of per-object metadata.
-* Selection: `Select.gob` has `Ldrb`/`Strb` and `W32`, and no `W16`.
+* Selection: `Select.gob` has `Ldrb`/`Strb` and `W32`, and no `W16`. Still
+  true after TIX-61, which decided to inherit the gap rather than widen
+  `Arm64.Width` -- so raw memory cannot read a C `short` a field at a time
+  either, and the two now want the same fix. TIX-74.
 * The runtime's hard-coded `ArrayStorage` slots and the closure shape.
 * Measure first: what share of allocated bytes is `Bool`/`Byte`/`Char` payload
   on the boot workload. The proposal said this is not a performance argument,

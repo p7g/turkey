@@ -1,6 +1,16 @@
 # Replacing the C runtime
 
-Status: surveyed, not decided. Nothing depends on it; M28 and M29 do not.
+Status: surveyed, and the first piece is built. TIX-61 landed raw pointers --
+`Prim.Ptr`, load and store at each representation, and pointer arithmetic --
+which is the ordering constraint this document identifies below and a
+prerequisite of both halves. The rest is still undecided; M28 and M29 do not
+depend on any of it.
+
+Two things TIX-61 leaves for the tickets after it. `Prim.ptrAlloc` and
+`Prim.ptrFree` are `malloc` and `free` behind two runtime calls, standing in
+until there is an FFI: TIX-62 declares both directly and deletes them. And the
+module gate is a gesture -- `lib/Unsafe/Ptr.gob` puts the name in the import
+list of anything touching raw memory -- not the checker TIX-63 will build.
 
 `LINKER.md` ends by noting that no way of producing an executable removes the C
 dependency, because `runtime/turkey_runtime.c` is C and `boot` cannot compile C.

@@ -554,3 +554,111 @@ unattended: `Int` overflow (Python won't trap unless the primitive checks),
 - No normalization, collation, case mapping, or grapheme segmentation in the
   first cut -- but the API shapes above all leave room, and none of them will
   need a breaking change to land.
+
+---
+
+## 9. Raw pointers
+
+**`Prim.Ptr` is a machine address that is not a managed reference**, and the
+collector must not follow it. Opaque and nullary; `lib/Unsafe/Ptr.gob` exports
+it as `Ptr`. Added by TIX-61, and the section is appended rather than inserted
+because `builtins.py` cites 7.2 by number.
+
+It exists so that the runtime can be written in Turkey
+(`RUNTIME-IN-TURKEY.md`), and it has a use independent of that: anything that
+reads a C struct needs one. It is the first thing in the language whose answer
+to "what happens if you get it wrong" is not "it panics".
+
+### 9.1 What is undefined, and why it is not checked
+
+Undefined, in the C sense -- the implementation may do anything at all, and
+neither backend checks:
+
+- reading or writing outside the block the address came from, including past
+  its end;
+- reading or writing through an address that was freed, or that did not come
+  from `alloc` at all;
+- an access at an alignment the target does not permit;
+- reading a location before anything has written it. The bytes are whatever
+  `malloc` left there. They are **not** zero, and a program that finds zeroes
+  has found an accident;
+- `free` of an address that is not a live block, including a second `free`
+  and an interior pointer.
+
+This is not laziness about checking. A check needs to know the bounds, and an
+address does not carry them -- that is what makes it a raw pointer rather than
+an `Array`, which does carry a length and does check. Adding a bound would be
+inventing a different type.
+
+What does contain it is that `Prim.` is spellable only from a library module,
+so none of this reaches ordinary Turkey except through `Unsafe.Ptr`, whose
+name is then in the import list of every module that touches raw memory --
+Oberon's `SYSTEM` rule, and the same containment delta 70 relies on for
+`Prim.castAs`. TIX-63's checker is what will make it a property rather than a
+convention.
+
+### 9.2 What *is* defined
+
+- Arithmetic. `ptrAdd` and `ptrDiff` wrap at 64 bits and never trap: an
+  address near the top of the space is not an overflow, and the language's
+  checked `+` is not what they spell. Any offset is defined; *dereferencing*
+  the result is what is undefined if it left the block.
+- `ptrNull` is address 0, `ptrIsNull` tests for it, and `free` of it does
+  nothing -- as C's does.
+- `ptrToInt` round-trips through `ptrFromInt`. The integer itself is
+  **unspecified**: it is deterministic within a run on both hosts and not the
+  same number between them, so a program that prints one prints something
+  neither host promises. It is there for alignment tests and hashing.
+- A pointer written into raw memory reads back as itself. No provenance is
+  carried and none is checked.
+
+### 9.3 Load and store
+
+Twelve primitives, `Prim.loadI64(p, offset)` and its siblings, one per
+representation, with byte offsets. One name per representation rather than one
+name taking a witness, because the low IR attaches a representation to every
+value when the instruction is emitted: a load whose width were known only at
+run time would have nothing to tell the register allocator. `Unsafe.Ptr` puts
+`class Load a` / `class Store a` above them, dispatched on the result the way
+`Monoid.empty` is, and `mono` erases the dictionary at a ground call site.
+
+One language type per representation, which is forced -- there is exactly one
+of each:
+
+```
+i1   Bool     one byte, as LLVM's `load i1` touches one
+i8   Byte     unsigned
+i32  Char     a scalar value; another bit pattern is undefined
+i64  Int      signed, two's complement
+f64  Float    every bit pattern is a valid double, NaN payloads included
+ptr  Ptr      another raw address
+```
+
+Little-endian, because arm64 is. Note `i1` is one byte and an `Array Bool`
+element is eight: an array slot is this compiler's layout and raw memory is
+someone else's.
+
+**There is no 16-bit access.** `Select.gob` has `Ldrb`/`Strb` and `W32` and no
+`W16`, which `NATIVE-BACKEND.md`'s record-layout section already listed as a
+gap. A C struct with a `short` in it cannot be read a field at a time yet.
+
+**A traced pointer may not be stored through a raw pointer**, and this one *is*
+checked -- statically, by `LowIr.checkReps`. The block has no header and is
+not scanned, so the collector would never see the reference and would free
+what it points at. Nothing at run time could tell the two stores apart, which
+is why it has to be caught here or not at all.
+
+### 9.4 The two hosts
+
+The Python implementation simulates an address space, and it is the oracle
+`tests/test_native.py` diffs each compiled binary against -- so its job is to
+agree with `malloc` on everything defined above and to *disagree* loudly
+everywhere this section says "undefined". It poisons fresh memory rather than
+zeroing it, poisons freed blocks, and never reuses an address.
+
+It also panics on some of the undefined cases: leaving the address space,
+freeing something that is not a live block, loading a non-scalar `Char`. Those
+panics are **a debugging aid and not a semantics.** The native backend performs
+none of them, a program that trips one is undefined either way, and no
+conformance program may depend on one. What the simulation must never do is
+give a *defined* answer where this section says there is none.

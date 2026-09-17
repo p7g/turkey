@@ -319,6 +319,68 @@ the `Option` instance, the unconstrained `Array` instance and a default body.
 
 ## Open, and accepted
 
+### 98. Two codes that meant the same thing, and a bit thrown away before it was read
+**bug, fixed.** TIX-61. The collector traced a slot whose three-bit layout code
+was `>= 6`, and 6 and 7 were `PTR` and `BOXED` -- both traced. So the two codes
+were one code, and all eight values were taken. Adding an untraced pointer had
+nowhere to put it.
+
+That much was findable by reading. The half that was not is that the trace bit
+was discarded before it ever reached the metadata: `LowIr.ArrayNew` carried a
+`RepClass`, `SsaLower` had a full `Rep` in hand and passed `element.class_`,
+and both emitters then re-synthesised one with `layoutCode(untraced(element))`.
+An array's element tag was therefore *always* written as untraced, and
+`Array String` worked only because the reader could not tell 6 from 7. The two
+mistakes cancelled.
+
+The shape is FINDINGS 43's and 97's once more -- a thing the oracle cannot see
+because both answers are wrong in the same direction -- and here it is
+literally that: **boot and the Python implementation had been writing different
+codes for a traced pointer all along**, 7 and 6, and nothing noticed, because
+the only consumer accepted both.
+
+What it cost to fix was one literal in C. `turkey_args_storage` builds an array
+of `TurkeyString *` and asked for element layout 6; under the corrected rule
+the argv strings were collected out from under `Data.String#split`, which
+surfaced as `string slice 28642..28929 does not fall on character boundaries`.
+A lost root does not look like a lost root from the outside.
+
+Two smaller ones found in the same ticket, both the same kind of hazard -- one
+side derives a list and the other writes it out:
+
+* `turkey/layout.OPENED_LAYOUTS` was `tuple(layout.value for layout in
+  bir.Layout)` while `Layout.openedLayouts` in `boot/` is a literal. A member
+  added to the enum joins one and not the other, which is a different number of
+  existential arm copies per side and a differential that moves for a reason in
+  neither implementation. Now written out on both sides, with a comment saying
+  they are one decision.
+* `SsaLower.repOfName` ended in `_ -> traced(Ptr)`, which answers correctly for
+  the two names it was written for and would have made a raw address a GC root
+  silently. Every name is now named and the last arm is a refusal. The general
+  version: a catch-all that is right for every input that exists today is a
+  catch-all that will be wrong for the first one that does not.
+
+### 99. A type alias cannot name a qualified type unless the qualifier is a module
+**design.** TIX-61. `type Ptr = Prim.Ptr` does not parse:
+
+```
+Unsafe/Ptr.gob:5:16: parse error: expected end of statement, found '.'
+```
+
+Section 7's alias-vs-data question is decided by a token pre-pass
+(`parser.collect_tycons`), which knows the type names declared in *this* file
+plus the ones its imports put in scope. `Prim` is neither -- it is a namespace,
+not a module -- so the parser sees a bare `CONID` that does not name a known
+tycon, commits to a data declaration, and then meets the dot. `type Pos =
+String.Index` in the same position works, because `String` is an import alias.
+
+Not fixed, and the workaround costs nothing: `type Ptr = Ptr(Prim.Ptr)` is a
+newtype, erases through `DeclTable.erasedPayload` to the same layout, and is
+arguably the better spelling anyway since it keeps `Prim.Ptr` and `Ptr`
+distinct nominal types at the library boundary. It is recorded because the
+error message is about a dot and the cause is a lookahead table, which is a
+long way to travel.
+
 ### 97. The differential oracle disagreed about a name neither compiler got wrong
 **bug, fixed.** TIX-15. Adding a module to `lib/` turned `test_boot`'s `opt`
 stage red on one line out of 37000: the Python side printed `Prim.Array (Entry

@@ -3304,3 +3304,64 @@ that a wrong assumption says so.
 **`cast` inspects the outermost payload only.** Go's `errors.As` walks the
 cause chain; this does not. The chain stays reachable through `causeOf`, and
 searching it is an additive choice rather than one this forecloses.
+
+---
+
+### 71. Raw pointers, and the first undefined behaviour
+
+`design.md` §8.1 has six primitive types and every one of them is safe: the
+worst a program can do is panic. This adds a seventh that is not, because
+`RUNTIME-IN-TURKEY.md` asks for a runtime written in the language and a
+managed reference cannot describe a heap that has not been built yet.
+
+```
+Prim.Ptr                      -- a machine address, library-only
+Prim.loadI64(p, offset)       -- and eleven siblings, one per representation
+Prim.ptrAdd(p, n)             -- and the rest of the arithmetic
+```
+
+**The bit was already in the IR.** `Rep` is a register class *plus* `traced`,
+`untraced(Ptr)` was constructible and unused, and `Ssa.verify` already enforced
+that only a pointer may be traced -- for a reason its comment gave, that a code
+address is a pointer the collector must not follow. So this delta adds a
+surface for a distinction the low IR was built with, rather than a distinction.
+
+**Containment is delta 70's, not a new mechanism.** `Prim.Ptr` is registered
+the way `Prim.Array` is, so it is spellable only from a library module; what
+reaches the rest of the language is `lib/Unsafe/Ptr.gob`, whose name is then in
+the import list of every module that touches raw memory. That is Oberon's
+`SYSTEM` rule and Modula-3's unsafe module, obtained from the module system
+that already exists. It is a gesture and not a check: TIX-63's subset checker
+is what will make it a property.
+
+**Undefined rather than checked, and the reason is not cost.** A bounds check
+needs bounds, and an address does not carry any -- that is exactly what
+distinguishes it from `Array`, which does carry a length and does check.
+Checking would mean inventing a different type. `PRIMITIVES.md` 9.1 lists what
+is undefined; the short version is everything about *which* memory an address
+names, and nothing about the arithmetic, which is total and wrapping.
+
+**One rule is checked, and statically.** A traced pointer may not be stored
+through a raw pointer. A malloc'd block has no header and is not scanned, so
+the collector would never see the reference and would free what it points at;
+nothing at run time distinguishes that store from a safe one, because the bits
+are the same bits. `LowIr.checkReps` is therefore the only place it can be
+caught, and it is.
+
+**`Typed Prim.Ptr` is refused**, which delta 70 makes load-bearing: `Typed` is
+what admits a value to existential packing and to `cast`, and `addr` is
+deliberately not one of `Layout.openedLayouts`, so a packed pointer would
+type-check with no arm copy to run. It is unreachable **by decision** and not
+by accident, which is why it is written here. A `cast` recovering a pointer
+from a dynamic value would also be an address forged from data whose
+provenance the checker gave up on.
+
+**No 16-bit access.** `Select.gob` has `Ldrb`/`Strb` and `W32` and no `W16`,
+which `NATIVE-BACKEND.md` already listed as a gap; it stays one, and a C struct
+with a `short` cannot be read a field at a time yet.
+
+**And `Prim.ptrAlloc`/`Prim.ptrFree` are temporary.** They are `malloc` and
+`free` behind two `Runtime(name)` calls, so that the type has a source of
+memory before there is an FFI. TIX-62 declares both through the FFI and deletes
+the primitives and the C wrappers, which makes replacing them that ticket's
+first real test.

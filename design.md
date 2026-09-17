@@ -692,6 +692,7 @@ Records (constructor payload using `{ ... }`) are only mutable when the data typ
 | `Char` | `'a'`, `'\n'`, ... | a Unicode **scalar value**: `0..10FFFF` excluding the surrogates `D800..DFFF` |
 | `Bool` | `True`, `False` | declared in the prelude as `type Bool = False \| True`, not built in |
 | `Unit` | `()` | singleton type |
+| `Prim.Ptr` | `Unsafe.Ptr.alloc(n)` | a raw machine address; library-only, untraced, and the one type with undefined behaviour |
 
 `PRIMITIVES.md` is the full semantics; what follows is the part that changes
 how ordinary code reads.
@@ -738,6 +739,17 @@ a grapheme cluster, which may be several scalar values — so `codePoints` is
 not "the characters". There is no `Char.toUpper`: case mapping is not a
 per-scalar-value function (`ß` uppercases to two characters), so case will
 live on `String` when there is a Unicode table to do it correctly.
+
+**`Prim.Ptr` is unsafe and says so in the import list.** A raw machine
+address: not a managed reference, not followed by the collector, no length and
+no bounds. Like `Prim.Array` it is spellable only from a library module, and
+the module that exports it to the rest of the language is called `Unsafe.Ptr`,
+so its name appears wherever raw memory is touched. It is the only place in
+the language where getting it wrong is *undefined* rather than a panic --
+reading past a block, using a freed address, or reading before writing may do
+anything at all. `PRIMITIVES.md` 9 has the full list and the reason a bound
+cannot be checked. It exists so that the runtime can be written in Turkey, and
+for reading C structs.
 
 ### 8.2 Operators
 

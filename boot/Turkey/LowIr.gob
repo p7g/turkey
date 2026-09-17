@@ -113,6 +113,19 @@ type Op
     | ArrayGet(Value, Value)
     | ArraySet(Value, Value, Value)
     | ArrayLength(Value)
+    -- Raw memory (TIX-61): base, a *byte* offset, and the class to access at.
+    --
+    -- Instructions and not runtime calls, which is the whole point. A `Call`
+    -- is `everything()` below and a safepoint in `Turkey.Roots`, so a load
+    -- routed through one would store every live root before every read of a
+    -- struct field -- and could never appear in TIX-63's subset, which is
+    -- what the collector is to be written in.
+    --
+    -- Byte offsets rather than element-scaled, so that one rule covers these
+    -- and `ptrAdd`, and because arm64's `Indexed` addressing is unscaled --
+    -- `ArrayGet` has to emit an `Lsl` first and these do not.
+    | PtrLoad(Value, Value, RepClass)
+    | PtrStore(Value, Value, Value, RepClass)
     -- A `var`'s cell.
     | CellNew(Value)
     | CellLoad(Value)
@@ -258,6 +271,11 @@ fun effectsOf(op : Op) -> Effects = match op {
     ArrayGet(_, _) -> combine(Ssa.reads_(), Ssa.traps())
     ArraySet(_, _, _) -> combine(Ssa.writes(), Ssa.traps())
     ArrayLength(_) -> Ssa.reads_()
+    -- Reads and writes, and deliberately *not* `traps`. An access off the end
+    -- of a block is undefined and not checked, so claiming it can trap would
+    -- make a dead load undeletable to buy a guarantee that is not being made.
+    PtrLoad(_, _, _) -> Ssa.reads_()
+    PtrStore(_, _, _, _) -> Ssa.writes()
     CellNew(_) -> Ssa.allocates()
     CellLoad(_) -> Ssa.reads_()
     CellStore(_, _) -> Ssa.writes()
@@ -301,6 +319,8 @@ fun opUses(op : Op) -> Array Value = match op {
     ObjectSet(a, _, b) -> [a, b]
     ObjectTag(a) -> [a]
     ArrayNew(a, b, _) -> [a, b]
+    PtrLoad(a, b, _) -> [a, b]
+    PtrStore(a, b, c, _) -> [a, b, c]
     ArrayGet(a, b) -> [a, b]
     ArraySet(a, b, c) -> [a, b, c]
     ArrayLength(a) -> [a]
@@ -342,6 +362,8 @@ fun mapUses(op : Op, f : fun(Value) -> Value) -> Op = match op {
     ObjectSet(a, b, c) -> ObjectSet(f(a), b, f(c))
     ObjectTag(a) -> ObjectTag(f(a))
     ArrayNew(a, b, c) -> ArrayNew(f(a), f(b), c)
+    PtrLoad(a, b, c) -> PtrLoad(f(a), f(b), c)
+    PtrStore(a, b, c, d) -> PtrStore(f(a), f(b), f(c), d)
     ArrayGet(a, b) -> ArrayGet(f(a), f(b))
     ArraySet(a, b, c) -> ArraySet(f(a), f(b), f(c))
     ArrayLength(a) -> ArrayLength(f(a))
@@ -383,6 +405,11 @@ fun opResultRep(op : Op) -> Option Rep = match op {
     ObjectNew(_, _, _, _) -> Some(Ssa.traced(Ptr))
     ObjectTag(_) -> Some(Ssa.untraced(I32))
     ArrayNew(_, _, _) -> Some(Ssa.traced(Ptr))
+    -- Untraced is not a default here. A pointer read out of raw memory is an
+    -- address with no header, so answering `traced` would hand the collector
+    -- one to follow.
+    PtrLoad(_, _, c) -> Some(Ssa.untraced(c))
+    PtrStore(_, _, _, _) -> Some(Ssa.untraced(Unit))
     ArrayLength(_) -> Some(Ssa.untraced(I64))
     CellNew(_) -> Some(Ssa.traced(Ptr))
     ClosureNew(_, _, _) -> Some(Ssa.traced(Ptr))
@@ -430,6 +457,22 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Array String {
         -- distinguishes a wrong pairing here. And a *traced* pointer turned
         -- into an integer is a root the collector stops seeing, so the trace
         -- bit is checked and not only the class.
+        -- The safety property of raw memory, and it is statically checkable
+        -- right here: a *traced* pointer may not be stored through one. The
+        -- block has no header and is not scanned, so the collector would
+        -- never see the reference and would free what it points at.
+        PtrStore(base, off, stored, c) -> {
+            wantClass(f, out, base, Ptr, "the base of a raw store")
+            wantClass(f, out, off, I64, "a raw offset")
+            wantClass(f, out, stored, c, "the value of a raw store")
+            if Ssa.repOf(f, stored).traced {
+                Array.push(out, "a traced pointer is stored through a raw pointer")
+            }
+        }
+        PtrLoad(base, off, _) -> {
+            wantClass(f, out, base, Ptr, "the base of a raw load")
+            wantClass(f, out, off, I64, "a raw offset")
+        }
         Convert(PtrToInt, a) -> {
             wantClass(f, out, a, Ptr, "the operand of a pointer-to-integer")
             if Ssa.repOf(f, a).traced {
@@ -558,6 +601,8 @@ fun showOpName(op : Op) -> String = match op {
     ObjectSet(_, _, _) -> "object.set"
     ObjectTag(_) -> "object.tag"
     ArrayNew(_, _, _) -> "array.new"
+    PtrLoad(_, _, _) -> "ptr.load"
+    PtrStore(_, _, _, _) -> "ptr.store"
     ArrayGet(_, _) -> "array.get"
     ArraySet(_, _, _) -> "array.set"
     ArrayLength(_) -> "array.length"
@@ -606,6 +651,10 @@ instance Show Op {
     ObjectTag(a) -> "object.tag " + v(a)
     ArrayNew(n, init, c) ->
         "array.new " + v(n) + ", " + v(init) + ", " + show(c)
+    PtrLoad(a, off, c) ->
+        "ptr.load " + v(a) + ", " + v(off) + ", " + show(c)
+    PtrStore(a, off, x, c) ->
+        "ptr.store " + v(a) + ", " + v(off) + ", " + v(x) + ", " + show(c)
     ArrayGet(a, i) -> "array.get " + v(a) + ", " + v(i)
     ArraySet(a, i, x) -> "array.set " + v(a) + ", " + v(i) + ", " + v(x)
     ArrayLength(a) -> "array.length " + v(a)

@@ -115,6 +115,17 @@ _CALLING_PRIMS = frozenset({
     # this set is about what may run before the call returns.
     "ptrAlloc", "ptrFree",
 })
+#: `Prim.load*` / `Prim.store*` to the LLVM type the access is at. One name
+#: per representation because the width has to be known where the instruction
+#: is emitted, not carried in a value.
+_RAW_ACCESS = {
+    "loadI1": ("load", _I1), "loadI8": ("load", _I8),
+    "loadI32": ("load", _I32), "loadI64": ("load", _I64),
+    "loadF64": ("load", _F64), "loadPtr": ("load", _PTR),
+    "storeI1": ("store", _I1), "storeI8": ("store", _I8),
+    "storeI32": ("store", _I32), "storeI64": ("store", _I64),
+    "storeF64": ("store", _F64), "storePtr": ("store", _PTR),
+}
 _LAYOUT_SUFFIXES = frozenset(layout.value for layout in bir.Layout)
 
 
@@ -1186,6 +1197,25 @@ class _Emitter:
                                   "shift amount is not in 0..63")
             return (builder.shl(args[0], args[1]) if name == "intShl"
                     else builder.ashr(args[0], args[1])), builder
+        # Raw load and store (TIX-61). Deliberately absent from
+        # `_CALLING_PRIMS`: these are one machine instruction, so nothing can
+        # collect inside one and nothing has to be rooted around one. That
+        # absence is the whole reason they are not runtime calls.
+        #
+        # The access is at the exact type -- `i1` touches one byte the way
+        # LLVM's `load i1` does -- because raw memory is someone else's
+        # layout, unlike an array slot, which this compiler widens to a word.
+        raw = _RAW_ACCESS.get(name)
+        if raw is not None:
+            kind, element = raw
+            # `args[0]` is already `i8*`, so the byte offset is one `gep` and
+            # the bitcast is what gives the access its width.
+            address = builder.bitcast(builder.gep(args[0], [args[1]]),
+                                      element.as_pointer())
+            if kind == "load":
+                return builder.load(address), builder
+            builder.store(args[2], address)
+            return ir.Constant(_I8, 0), builder
         # Pointer arithmetic (TIX-61). An address is an integer at another
         # LLVM type, so each of these is a `ptrtoint`, integer work, and an
         # `inttoptr` back. Wrapping, never checked: an address near the top of

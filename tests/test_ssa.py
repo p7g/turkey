@@ -147,3 +147,25 @@ def test_allocation_is_what_makes_a_safepoint(capfd):
     out = _output(capfd)
     assert "object.new is a safepoint: yes" in out
     assert "array.get is a safepoint: no" in out
+
+
+def test_a_traced_pointer_may_not_be_stored_through_a_raw_pointer():
+    """The safety property of raw memory, and the verifier can state it.
+
+    A malloc'd block has no header and is not scanned, so a managed reference
+    written into one is a reference the collector never sees -- it frees what
+    the block points at and the program reads a dangling pointer. Nothing at
+    run time tells the two stores apart, because the bits are the same bits,
+    so this is the only place it can be caught (TIX-61).
+    """
+    dump = _dump()
+    assert "a raw store of an untraced pointer: 0" in dump
+    assert "a raw store of a traced pointer: 1" in dump
+    assert "a traced pointer is stored through a raw pointer" in dump
+
+
+def test_a_raw_load_is_not_a_safepoint():
+    """Nothing can collect inside one machine instruction, so nothing has to
+    be rooted around it -- which is the whole reason raw access is an opcode
+    rather than a runtime call."""
+    assert "a raw load is a safepoint: 0" in _dump()

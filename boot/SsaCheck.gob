@@ -17,7 +17,7 @@ import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..), Term(..),
                    Block(..), Func(..), Inst(..), Effects(..))
 import Turkey.LowIr as L
-import Turkey.LowIr (Op(..), Low(..), BinOp(..), CmpOp(..), Callee(..))
+import Turkey.LowIr (Op(..), Low(..), BinOp(..), CmpOp(..), Conv(..), Callee(..))
 import Turkey.SsaLower as SsaLower
 
 fun main() {
@@ -86,6 +86,25 @@ fun main() {
     let _ = L.emit(b, Cmp(Lt, zero, cond), i1)
     report("verify after breaking it", Ssa.verify(f))
     report("reps after breaking it", repComplaints(f))
+
+    -- Raw memory (TIX-61). The rule that makes it safe is one the verifier
+    -- can state: a *traced* pointer may not be stored through a raw pointer.
+    -- The block has no header and is not scanned, so the collector would
+    -- never see the reference and would free what it points at -- and nothing
+    -- at run time distinguishes the two, because the bits are the same bits.
+    L.into(b, b0)
+    let raw = L.emit(b, Convert(IntToPtr, zero), Ssa.untraced(Ptr))
+    let managed = L.emit(b, ConstString("held"), Ssa.traced(Ptr))
+    report("a raw store of an untraced pointer",
+           L.checkReps(f, L.low(L.emit(b, ConstUnit, Ssa.untraced(Unit)),
+                                PtrStore(raw, zero, raw, Ptr))))
+    report("a raw store of a traced pointer",
+           L.checkReps(f, L.low(L.emit(b, ConstUnit, Ssa.untraced(Unit)),
+                                PtrStore(raw, zero, managed, Ptr))))
+    report("a raw load is a safepoint",
+           if Ssa.isSafepoint(L.effectsOf(PtrLoad(raw, zero, I64))) {
+               ["it is, and it must not be"]
+           } else { [] })
 
     -- A block nothing branches to has no immediate dominator, which is what
     -- `None` says and what a sentinel index could not say apart from a real

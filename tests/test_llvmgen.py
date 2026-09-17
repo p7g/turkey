@@ -1051,3 +1051,50 @@ def test_a_built_program_reports_a_panic_and_fails(tmp_path):
     assert "panic:" in ran.stderr
     # The frames come from the same shadow stack the JIT boundary reads.
     assert "boom.gob" in ran.stderr
+
+
+def test_a_raw_load_is_not_a_safepoint():
+    """The whole reason raw access is an opcode and not a runtime call.
+
+    `_CALLING_PRIMS` is what makes a primitive a safepoint: every live traced
+    value is stored to its root slot before one. A load routed through a
+    runtime call would pay that on every read of a struct field, and could
+    never appear in TIX-63's non-allocating subset, which is what the
+    collector is to be written in.
+    """
+    from turkey import llvmgen
+
+    for name in ("loadI1", "loadI8", "loadI32", "loadI64", "loadF64", "loadPtr",
+                 "storeI1", "storeI8", "storeI32", "storeI64", "storeF64",
+                 "storePtr", "ptrAdd", "ptrDiff", "ptrNull", "ptrIsNull",
+                 "ptrEq", "ptrToInt", "ptrFromInt"):
+        assert name not in llvmgen._CALLING_PRIMS, name
+    # And the two that genuinely are calls still are.
+    assert "ptrAlloc" in llvmgen._CALLING_PRIMS
+    assert "ptrFree" in llvmgen._CALLING_PRIMS
+
+
+def test_a_raw_load_emits_a_bare_load():
+    """One instruction, at the access's own width, with no call beside it."""
+    from turkey import driver, llvmgen
+
+    source = """
+    import Unsafe.Ptr as Ptr
+    import Unsafe.Ptr (Load, Store)
+    fun main() -> Unit {
+        let p = Ptr.alloc(16)
+        Ptr.store(p, 0, 7)
+        let n : Int = Ptr.load(p, 0)
+        print(Int.toString(n))
+        Ptr.free(p)
+    }
+    """
+    checked = driver.check(source)
+    # The emitter's own text, before the JIT consumes the module.
+    source_ir = llvmgen.lower(checked.opt, checked.decls, checked.main)
+    text, _machine = llvmgen._Emitter(source_ir).emit()
+    assert "load i64" in text
+    assert "store i64" in text
+    # And the access went nowhere near a runtime call.
+    assert "turkey_ptr_load" not in text
+    assert "turkey_ptr_store" not in text

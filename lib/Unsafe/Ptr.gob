@@ -1,6 +1,7 @@
 module Unsafe.Ptr (
     Ptr(..), alloc, free,
     add, diff, null, isNull, toInt, fromInt,
+    Load, load, Store, store,
 )
 
 -- Raw memory (TIX-61).
@@ -60,4 +61,61 @@ fun fromInt(n : Int) -> Ptr = Ptr(Prim.ptrFromInt(n))
 
 instance Eq Ptr {
     fun eq(a, b) = match (a, b) { (Ptr(x), Ptr(y)) -> Prim.ptrEq(x, y) }
+}
+
+-- -- reading and writing ---------------------------------------------------------------
+
+-- A load and a store at the representation the value's type erases to.
+--
+-- The floor under these is twelve names, `Prim.loadI64` and its siblings, and
+-- it has to be: the low IR attaches a representation to every value when the
+-- instruction is emitted, so a load whose width were known only at run time
+-- would have nothing to tell the register allocator. A witness *value* cannot
+-- reach down there. A witness *type* can, which is what these are.
+--
+-- So `load` is one name and `mono` erases the dictionary: a selection off a
+-- ground dictionary becomes a top-level binding, and `opt` inlines the body,
+-- which is one `Prim.` call. Nothing is built and nothing allocates, and that
+-- is the ordinary case -- runtime code should use these rather than the floor.
+--
+-- The two exceptions, and they are the reason the `Prim.` names stay
+-- reachable from `lib/`: a call site past `mono`'s specialization cap, and a
+-- caller that is itself polymorphic. Both keep a dictionary, which is a heap
+-- value, which puts the code outside TIX-63's non-allocating subset. Code in
+-- that subset drops to the floor; everything else should not.
+--
+-- Dispatch is on the *result*, as `Monoid.empty` is, so a call site annotates:
+-- `let n : Int = Ptr.load(p, 0)`.
+--
+-- Offsets are bytes. An access that leaves the block, or one at an alignment
+-- the target does not allow, is undefined behaviour and is not checked.
+class Load a { fun load(Ptr, Int) -> a }
+class Store a { fun store(Ptr, Int, a) -> Unit }
+
+instance Load Int { fun load(p, off) = match p { Ptr(r) -> Prim.loadI64(r, off) } }
+instance Load Byte { fun load(p, off) = match p { Ptr(r) -> Prim.loadI8(r, off) } }
+instance Load Char { fun load(p, off) = match p { Ptr(r) -> Prim.loadI32(r, off) } }
+instance Load Float { fun load(p, off) = match p { Ptr(r) -> Prim.loadF64(r, off) } }
+instance Load Bool { fun load(p, off) = match p { Ptr(r) -> Prim.loadI1(r, off) } }
+instance Load Ptr { fun load(p, off) = match p { Ptr(r) -> Ptr(Prim.loadPtr(r, off)) } }
+
+instance Store Int {
+    fun store(p, off, v) = match p { Ptr(r) -> Prim.storeI64(r, off, v) }
+}
+instance Store Byte {
+    fun store(p, off, v) = match p { Ptr(r) -> Prim.storeI8(r, off, v) }
+}
+instance Store Char {
+    fun store(p, off, v) = match p { Ptr(r) -> Prim.storeI32(r, off, v) }
+}
+instance Store Float {
+    fun store(p, off, v) = match p { Ptr(r) -> Prim.storeF64(r, off, v) }
+}
+instance Store Bool {
+    fun store(p, off, v) = match p { Ptr(r) -> Prim.storeI1(r, off, v) }
+}
+instance Store Ptr {
+    fun store(p, off, v) = match (p, v) {
+        (Ptr(r), Ptr(x)) -> Prim.storePtr(r, off, x)
+    }
 }

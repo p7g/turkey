@@ -513,6 +513,26 @@ def _signed64(value: int) -> int:
     return value - (1 << 64) if value >= (1 << 63) else value
 
 
+def _raw_char(code: int):
+    if not is_scalar_value(code):
+        raise TurkeyPanic(
+            f"raw pointer: {code} is not a Unicode scalar value")
+    return chr(code)
+
+
+def _raw_load(address, offset, width, signed=False):
+    return RAW_HEAP.load(address + offset, width, signed=signed)
+
+
+def _raw_store_prim(name, ty, width, encode):
+    """One `Prim.store*`. The encoder is what turns the language's value into
+    the bits the native backend would have stored."""
+    def store(address, offset, value):
+        RAW_HEAP.store(address + offset, width, encode(value))
+        return UNIT_VALUE
+    return (mono(TFun([RAW_PTR, INT, ty], UNIT)), _bi(name, 3, store))
+
+
 def _ptr_free(address):
     RAW_HEAP.free(address)
     return UNIT_VALUE
@@ -735,6 +755,41 @@ _PRIM: dict[str, tuple] = {
     "Prim.ptrEq": _cmp("Prim.ptrEq", RAW_PTR, lambda a, b: a == b),
     "Prim.ptrToInt": _un("Prim.ptrToInt", RAW_PTR, INT, _signed64),
     "Prim.ptrFromInt": _un("Prim.ptrFromInt", INT, RAW_PTR, lambda n: n & _U64),
+
+    # Raw load and store, one name per representation, because the width has
+    # to be known where the instruction is emitted. One language type per
+    # class, which is forced: there is exactly one of each.
+    #
+    # Little-endian and two's complement, which is arm64 and LLVM on the only
+    # target. `i1` touches one byte, as LLVM's `load i1` does -- not the eight
+    # an `Array Bool` element gets, because raw memory is someone else's
+    # layout and an array slot is this compiler's.
+    "Prim.loadI1": _bin("Prim.loadI1", RAW_PTR, INT, BOOL,
+                        lambda p, o: from_bool(_raw_load(p, o, 1) != 0)),
+    "Prim.loadI8": _bin("Prim.loadI8", RAW_PTR, INT, BYTE,
+                        lambda p, o: _raw_load(p, o, 1)),
+    # A `Char` is a one-character `str` on this host and a scalar value in
+    # the language, so the bits go through `chr`/`ord`. A stored pattern that
+    # is not a scalar value is undefined natively and panics here.
+    "Prim.loadI32": _bin("Prim.loadI32", RAW_PTR, INT, CHAR,
+                         lambda p, o: _raw_char(_raw_load(p, o, 4))),
+    "Prim.loadI64": _bin("Prim.loadI64", RAW_PTR, INT, INT,
+                         lambda p, o: _raw_load(p, o, 8, signed=True)),
+    "Prim.loadF64": _bin("Prim.loadF64", RAW_PTR, INT, FLOAT,
+                         lambda p, o: struct.unpack(
+                             "<d", _raw_load(p, o, 8).to_bytes(8, "little"))[0]),
+    "Prim.loadPtr": _bin("Prim.loadPtr", RAW_PTR, INT, RAW_PTR,
+                         lambda p, o: _raw_load(p, o, 8)),
+
+    "Prim.storeI1": _raw_store_prim("Prim.storeI1", BOOL, 1,
+                                    lambda v: 1 if truth(v) else 0),
+    "Prim.storeI8": _raw_store_prim("Prim.storeI8", BYTE, 1, lambda v: v),
+    "Prim.storeI32": _raw_store_prim("Prim.storeI32", CHAR, 4, ord),
+    "Prim.storeI64": _raw_store_prim("Prim.storeI64", INT, 8, lambda v: v),
+    "Prim.storeF64": _raw_store_prim(
+        "Prim.storeF64", FLOAT, 8,
+        lambda v: int.from_bytes(struct.pack("<d", v), "little")),
+    "Prim.storePtr": _raw_store_prim("Prim.storePtr", RAW_PTR, 8, lambda v: v),
 }
 
 # The names a library module may write, and no other module may.

@@ -275,3 +275,89 @@ fun main() {
 }
 """
     assert outputs(source, capfd) == "8\nnot a tagged string\n"
+
+
+def test_promote_packs_once_and_keeps_the_payload_reachable(capfd):
+    """`promote` is `Either.mapLeft` through `fail`, so it is the same entry to
+    the channel a source would write by hand: one wrapper, no cause, and the
+    concrete payload still there for `cast`."""
+    source = PAYLOADS + """
+fun openPort(n : Int) -> Either IoError Int =
+    if n > 0 { Right(n) } else { Left(IoError(13)) }
+
+fun dial(n : Int) -> Either SomeError Int {
+    let port = Error.promote(openPort(n))?
+    Right(port)
+}
+
+fun depth(e : SomeError) -> Int = match Error.causeOf(e) {
+    None -> 1
+    Some(inner) -> 1 + depth(inner)
+}
+
+fun main() {
+    match dial(80) {
+        Right(n) -> print(n)
+        Left(e) -> print(Error.messageOf(e))
+    }
+    match dial(0) {
+        Right(n) -> print(n)
+        Left(e) -> {
+            print(Error.messageOf(e))
+            print(depth(e))
+            match Error.cast(e) {
+                Some(IoError(code)) -> print(code)
+                None -> print("not an IoError")
+            }
+        }
+    }
+}
+"""
+    assert outputs(source, capfd) == "80\nio 13\n1\n13\n"
+
+
+def test_promote_demands_an_error_payload():
+    """The `[Error e]` context is what makes promotion safe to be generic: a
+    left half that is not an error has nothing to pack."""
+    message = fails(PAYLOADS + """
+type Plain = Plain(Int)
+
+fun main() {
+    let x : Either Plain Int = Left(Plain(1))
+    match Error.promote(x) {
+        Right(n) -> print(n)
+        Left(e) -> print(Error.messageOf(e))
+    }
+}
+""")
+    assert "Error Plain" in message
+
+
+def test_bifunctor_reaches_the_left_that_functor_cannot(capfd):
+    """`Functor (Either l)` fixes the left and varies the right. `bimap` is the
+    one that reaches both, and `Data.Bifunctor.first` is the half of it this
+    library had no name for."""
+    source = """
+fun main() {
+    let bad : Either Int String = Left(3)
+    let good : Either Int String = Right("ok")
+    print(bimap(bad, fun(n) = n + 1, String.byteLength))
+    print(bimap(good, fun(n) = n + 1, String.byteLength))
+    print(Bifunctor.first(bad, fun(n) = n + 1))
+    print(Either.mapLeft(bad, fun(n) = n + 1))
+}
+"""
+    assert outputs(source, capfd) == "Left(4)\nRight(2)\nLeft(4)\nLeft(4)\n"
+
+
+def test_second_agrees_with_map(capfd):
+    """The law nothing checks. `Either` is both a `Functor` in its right half
+    and a `Bifunctor`, and the two had better say the same thing."""
+    source = """
+fun main() {
+    for e in [Left(1), Right(2)] {
+        print(Bifunctor.second(e, fun(n) = n * 10) == map(e, fun(n) = n * 10))
+    }
+}
+"""
+    assert outputs(source, capfd) == "True\nTrue\n"

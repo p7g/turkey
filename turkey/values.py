@@ -225,3 +225,104 @@ def get_field(obj, name: str):
 def set_field(obj, name: str, value) -> None:
     """Write a record field after static field checking."""
     obj.fields[name] = value
+
+
+class RawHeap:
+    """The address space `Prim.ptrAlloc` hands out, simulated.
+
+    Raw memory has to mean something on this host, because the Python backend
+    is not only how `tests/programs/*.expected` is produced -- it is the
+    reference `tests/test_native.py` diffs each compiled binary against. So
+    this stands in for `malloc` and its job is to agree with malloc on every
+    observable a program can print, and to *disagree* loudly everywhere the
+    native behaviour is undefined.
+
+    Which is the one decision in here worth arguing. Fresh memory is poisoned
+    rather than zeroed. `malloc` returns uninitialized bytes; a zero fill would
+    make "reads back as zero" an accidental guarantee, and since this side is
+    the oracle, the differential would then *enforce* the accident. Poison
+    makes a read-before-write differ between the two hosts, so it lands as a
+    failure instead of being blessed. A freed block is poisoned with a second
+    pattern and its address is never reused, so a use-after-free reads neither
+    the old value nor a new object's.
+
+    The checks below panic where the native backend does nothing at all. They
+    are a debugging aid and not a semantics: PRIMITIVES.md says so, and no
+    golden program may depend on one. What this must never do is give a
+    *defined* answer where the native side is undefined.
+    """
+
+    #: Not zero, so that null is never a live address, and far enough from it
+    #: that a small negative offset off a real block cannot reach null either.
+    FIRST = 4096
+    #: What `malloc` guarantees, so an alignment-sensitive program behaves the
+    #: same on both hosts.
+    ALIGN = 16
+    FRESH = 0xA5
+    FREED = 0xDE
+
+    __slots__ = ("bytes", "live", "next")
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self) -> None:
+        """Called once per run, so a program's addresses are a function of its
+        own allocation sequence and not of what ran before it in this process."""
+        self.bytes = bytearray()
+        self.live: dict[int, int] = {}
+        self.next = self.FIRST
+
+    # -- allocation --------------------------------------------------------
+
+    def allocate(self, size: int) -> int:
+        if size < 0:
+            # What the C wrapper answers rather than calling `malloc` with a
+            # length that wrapped.
+            return 0
+        base = self.next
+        # A zero-length request still answers a unique non-null address, which
+        # is what malloc does in practice and what a caller can test.
+        span = max(size, 1)
+        end = base + span
+        if end > len(self.bytes) + self.FIRST:
+            self.bytes.extend(bytes([self.FRESH]) * (end - self.FIRST - len(self.bytes)))
+        self.bytes[base - self.FIRST:end - self.FIRST] = bytes([self.FRESH]) * span
+        self.live[base] = size
+        self.next = base + ((span + self.ALIGN - 1) // self.ALIGN) * self.ALIGN
+        return base
+
+    def free(self, base: int) -> None:
+        if base == 0:
+            return
+        size = self.live.pop(base, None)
+        if size is None:
+            raise TurkeyPanic(
+                f"raw pointer: free of {base:#x}, which is not a live block")
+        span = max(size, 1)
+        self.bytes[base - self.FIRST:base - self.FIRST + span] = (
+            bytes([self.FREED]) * span)
+
+    # -- access ------------------------------------------------------------
+
+    def _at(self, address: int, width: int, what: str) -> int:
+        low = address - self.FIRST
+        if address < self.FIRST or low + width > len(self.bytes):
+            raise TurkeyPanic(
+                f"raw pointer: {what} of {width} bytes at {address:#x} "
+                "is outside the address space")
+        return low
+
+    def load(self, address: int, width: int, signed: bool = False) -> int:
+        low = self._at(address, width, "read")
+        return int.from_bytes(self.bytes[low:low + width], "little", signed=signed)
+
+    def store(self, address: int, width: int, value: int,
+              signed: bool = False) -> None:
+        low = self._at(address, width, "write")
+        self.bytes[low:low + width] = (value & ((1 << (8 * width)) - 1)).to_bytes(
+            width, "little")
+
+
+#: The one address space. `builtins.set_args` resets it per run.
+RAW_HEAP = RawHeap()

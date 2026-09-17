@@ -50,6 +50,13 @@ void *turkey_array_new(int64_t length, uint64_t initial, int32_t element_width,
 void *turkey_closure_new(uint64_t code, int64_t capture_count,
                          uint64_t pointer_bitmap);
 
+/* Raw memory: `malloc` and `free`, and deliberately nothing more (TIX-61).
+   Not heap objects -- these have no header, are never collected, and the
+   collector must not be handed one. Temporary: TIX-62's FFI declares `malloc`
+   and `free` directly and both of these go. */
+void *turkey_ptr_alloc(int64_t size);
+void turkey_ptr_free(void *address);
+
 void turkey_root_enter(void *frame, void *values, int64_t count,
                        const char *function_name);
 void turkey_root_leave(void *frame);

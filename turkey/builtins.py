@@ -33,12 +33,13 @@ from .errors import TurkeyPanic
 from .constraints import Binding, Env
 from .prelude import BOOL_FALSE, BOOL_TRUE
 from .types import (
-    BOOL, BYTE, BYTE_MAX, BYTE_MIN, CHAR, FLOAT, INT, INT_MAX, INT_MIN, STRING,
-    UNIT, TFun, TVar, array_of, float_to_string, generalize,
+    BOOL, BYTE, BYTE_MAX, BYTE_MIN, CHAR, FLOAT, INT, INT_MAX, INT_MIN,
+    RAW_PTR, STRING, UNIT, TFun, TVar, array_of, float_to_string, generalize,
     is_scalar_value, mono, raw_array_of,
 )
 from .values import (
-    UNIT as UNIT_VALUE, ArrayObj, Builtin, ConValue, RecordObj, from_bool, truth,
+    RAW_HEAP, UNIT as UNIT_VALUE, ArrayObj, Builtin, ConValue, RecordObj,
+    from_bool, truth,
 )
 
 
@@ -95,8 +96,15 @@ _ARGS: list[str] = []
 
 
 def set_args(args) -> None:
-    """Record the arguments a program will see through `Prim.args`."""
+    """Record the arguments a program will see through `Prim.args`.
+
+    And clear the raw heap, which is the other thing a run starts with. It is
+    reset here rather than in `driver.run` because this is already the
+    once-per-run hook and `tests/test_native.py` builds its reference in
+    process: without it, an address would depend on which programs ran first.
+    """
     _ARGS[:] = list(args)
+    RAW_HEAP.reset()
 
 
 def program_args() -> list[str]:
@@ -492,6 +500,11 @@ def _bin(name, left, right, ret, fn):
     return (mono(TFun([left, right], ret)), _bi(name, 2, fn))
 
 
+def _ptr_free(address):
+    RAW_HEAP.free(address)
+    return UNIT_VALUE
+
+
 _PRIM: dict[str, tuple] = {
     # Output. `print` and `write` themselves are prelude functions, one `show`
     # away; these are the two writes underneath.
@@ -686,6 +699,15 @@ _PRIM: dict[str, tuple] = {
     "Prim.boolEq": _cmp("Prim.boolEq", BOOL, lambda a, b: a.con == b.con),
     "Prim.boolLt": _cmp(
         "Prim.boolLt", BOOL, lambda a, b: a.con == BOOL_FALSE and b.con == BOOL_TRUE),
+
+    # Raw memory (TIX-61). These two are `malloc` and `free` and nothing more,
+    # and they are temporary: TIX-62's FFI re-derives them as declarations and
+    # deletes both the primitives and the C wrappers. A negative size answers
+    # null rather than panicking, because that is what the wrapper does.
+    "Prim.ptrAlloc": (mono(TFun([INT], RAW_PTR)),
+                      _bi("Prim.ptrAlloc", 1, RAW_HEAP.allocate)),
+    "Prim.ptrFree": (mono(TFun([RAW_PTR], UNIT)),
+                     _bi("Prim.ptrFree", 1, _ptr_free)),
 }
 
 # The names a library module may write, and no other module may.

@@ -1017,6 +1017,19 @@ void *turkey_object_new(int32_t kind, int32_t tag, int64_t count,
     return object;
 }
 
+void *turkey_ptr_alloc(int64_t size) {
+    /* Negative answers NULL rather than panicking: the caller can test for
+       null, and `malloc((size_t)-1)` would ask for the address space. */
+    if (size < 0) return NULL;
+    /* A zero-length request still answers a distinct non-null address, which
+       is what the simulated heap in `turkey/values.py` does too. */
+    return malloc(size == 0 ? 1 : (size_t)size);
+}
+
+void turkey_ptr_free(void *address) {
+    free(address);
+}
+
 void *turkey_box(uint64_t value, int32_t layout) {
     TurkeyObject *box = turkey_object_new(5, layout, 1, 0);
     if (box != NULL) box->slots[0] = value;

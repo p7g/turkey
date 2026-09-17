@@ -110,6 +110,10 @@ _CALLING_PRIMS = frozenset({
     "arrayNew", "arrayNewUninit", "error", "stderrWrite", "exit",
     "argsStorage", "fileCanRead", "readFileStorage",
     "writeFileBytes",
+    # `malloc` and `free` are calls, so a collection can happen inside one --
+    # not because they allocate on the turkey heap (they do not) but because
+    # this set is about what may run before the call returns.
+    "ptrAlloc", "ptrFree",
 })
 _LAYOUT_SUFFIXES = frozenset(layout.value for layout in bir.Layout)
 
@@ -376,6 +380,9 @@ class _Emitter:
         self.runtime[name] = ir.Function(self.module, ir.FunctionType(ret, args), name=name)
 
     def _declare_runtime(self) -> None:
+        # Raw memory (TIX-61), deleted by TIX-62's FFI.
+        self._runtime("turkey_ptr_alloc", _PTR, [_I64])
+        self._runtime("turkey_ptr_free", ir.VoidType(), [_PTR])
         self._runtime("turkey_string_new", _PTR, [_PTR, _I64])
         self._runtime("turkey_string_concat", _PTR, [_PTR, _PTR])
         self._runtime("turkey_int_to_string", _PTR, [_I64])
@@ -1240,6 +1247,12 @@ class _Emitter:
                                   builder.not_(builder.and_(ordered, builder.and_(low, high))),
                                   "Float is not representable as an Int")
             return builder.fptosi(args[0], _I64), builder
+        if name == "ptrFree":
+            # C says `void`, which is not the language's unit: a void call has
+            # no value to name, and every primitive here has a result. So the
+            # call is made and the unit is produced separately.
+            builder.call(self.runtime["turkey_ptr_free"], args)
+            return ir.Constant(_I8, 0), self._propagate(function, builder)
         runtime = {
             "intToString": "turkey_int_to_string", "floatToString": "turkey_float_to_string",
             "charToString": "turkey_char_to_string", "stringConcat": "turkey_string_concat",
@@ -1264,6 +1277,7 @@ class _Emitter:
             "floatCeil": "turkey_float_ceil",
             "floatRound": "turkey_float_round",
             "floatTrunc": "turkey_float_trunc",
+            "ptrAlloc": "turkey_ptr_alloc",
         }.get(name)
         if runtime:
             value = builder.call(self.runtime[runtime], args)

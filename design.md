@@ -789,9 +789,14 @@ The last three are what `?` means (SPEC-DELTAS.md 45). Their class variable has
 kind `* -> *`, discovered from `m a` in `bind`'s own signature and written down
 nowhere. `Monad (Either l)` fixes the left parameter and varies the right, which
 is why `Either` is right-biased — the same one-parameter constraint the
-homogeneity paragraph above describes, seen from the other side. Unlike the
-operator classes, these three claim their method names: `map`, `pure` and `bind`
-are the prelude's, and a program cannot define its own.
+homogeneity paragraph above describes, seen from the other side.
+
+`map`, `pure` and `bind` are the prelude's, and a program may shadow any of
+them: a top-level definition beats an import and an import beats the prelude
+(M11a), so `fun map(x : Int) = x + 1` is accepted and means what it says.
+Shadowing `add` does not stop `+` meaning `Add.add`, because the parser
+resolves an operator through the method namespace rather than through the
+value one.
 
 `print` and `write` are not builtins. Both are `[Show a] fun(a) -> Unit`,
 written in the prelude as `Prim.print(show(x))`, and `Prim.print` is the only

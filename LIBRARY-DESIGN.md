@@ -291,21 +291,46 @@ function reached through `ArrowChoice` at `(->)`; it is an accident of the arrow
 hierarchy rather than the thing meant, and is not the precedent to follow.)
 
 ```text
+-- Data.Bifunctor
 class Bifunctor f {
     fun bimap(f a b, fun(a) -> c, fun(b) -> d) -> f c d
 }
 
-instance Bifunctor Either { ... }
-
 first[Bifunctor f]  : fun(f a b, fun(a) -> c) -> f c b
 second[Bifunctor f] : fun(f a b, fun(b) -> d) -> f a d
+
+-- Data.Either
+instance Bifunctor Either { ... }
+```
+
+The class lives in `Data.Bifunctor`, and the Prelude does not mention that
+module in either tier -- neither among the `Std.Classes` names it puts in every
+file, nor among the ten modules it re-exports qualified. `Functor`,
+`Applicative` and `Monad` are in the first because `?` is written in terms of
+them; `Array`, `Int` and `String` are in the second because everything reaches
+for them. Nothing in the language names `Bifunctor` and most programs never
+touch it, so it earns a slot in neither namespace and is imported like any
+other module. A program that writes an instance needs the class name bare, and
+a selective import narrows the qualified names too, so the two access paths are
+two imports:
+
+```text
+import Data.Bifunctor as Bifunctor          -- Bifunctor.first, Bifunctor.bimap
+import Data.Bifunctor (Bifunctor(..))       -- the class name, for an instance head
 ```
 
 This is expressible today, with no language change. Kind `* -> * -> *` class
 variables are inferred from the method signature exactly as `Monad`'s `* -> *`
-is, written down nowhere; the class and the `Either` instance above compile and
-run (checked 2026-09-17). `second` must agree with `Functor.map (Either l)`, a
+is, written down nowhere. `second` must agree with `Functor.map (Either l)`, a
 law nothing checks.
+
+`first` and `second` are functions rather than defaulted methods, which is a
+weak preference and not a constraint: a class method does *not* claim its name
+against other code. A top-level definition beats an import and an import beats
+the Prelude, so a program may shadow `map` or `bimap` and say so, and shadowing
+`add` still leaves `+` meaning `Add.add` because an operator resolves through
+the method namespace. Making them methods, with `bimap` required and the two
+defaulted in terms of it, remains available.
 
 `Either.mapLeft` is then the thin, discoverable wrapper on the module that owns
 the type:

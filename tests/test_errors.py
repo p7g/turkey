@@ -336,13 +336,18 @@ fun main() {
 def test_bifunctor_reaches_the_left_that_functor_cannot(capfd):
     """`Functor (Either l)` fixes the left and varies the right. `bimap` is the
     one that reaches both, and `Data.Bifunctor.first` is the half of it this
-    library had no name for."""
+    library had no name for.
+
+    The Prelude does not re-export `Data.Bifunctor`, in either tier, so even
+    the qualifier has to be imported."""
     source = """
+import Data.Bifunctor as Bifunctor
+
 fun main() {
     let bad : Either Int String = Left(3)
     let good : Either Int String = Right("ok")
-    print(bimap(bad, fun(n) = n + 1, String.byteLength))
-    print(bimap(good, fun(n) = n + 1, String.byteLength))
+    print(Bifunctor.bimap(bad, fun(n) = n + 1, String.byteLength))
+    print(Bifunctor.bimap(good, fun(n) = n + 1, String.byteLength))
     print(Bifunctor.first(bad, fun(n) = n + 1))
     print(Either.mapLeft(bad, fun(n) = n + 1))
 }
@@ -354,6 +359,8 @@ def test_second_agrees_with_map(capfd):
     """The law nothing checks. `Either` is both a `Functor` in its right half
     and a `Bifunctor`, and the two had better say the same thing."""
     source = """
+import Data.Bifunctor as Bifunctor
+
 fun main() {
     for e in [Left(1), Right(2)] {
         print(Bifunctor.second(e, fun(n) = n * 10) == map(e, fun(n) = n * 10))

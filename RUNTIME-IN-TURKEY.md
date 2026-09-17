@@ -71,6 +71,124 @@ analysis**, and that is the real cost.
 **4. Callbacks.** A Turkey function usable as a C function pointer, for the
 signal handler and the thread entry. Needs the non-GC convention from (3).
 
+## Defining the subset, and what enforcing it costs
+
+Two questions hide inside (3), they have different answers, and the second is
+where the cost estimate above came from. **What does the subset forbid**, and
+**how does the compiler know**.
+
+### The leaf facts are already in the IR; the join is not
+
+`LowIr.effectsOf` classifies every opcode, and `allocates` is the load-bearing
+one, for a reason `Turkey.Ssa` states: "allocation is the only thing that can
+trigger a collection, so an allocating instruction is a **safepoint**". It has
+been there "from the first commit even though nothing reads it until allocation
+exists". So `ObjectNew`, `ArrayNew`, `CellNew`, `ClosureNew` and `Box` already
+say what they do, for free.
+
+What is missing is one line, and it is deliberate:
+
+```
+Call(_, _) -> everything()
+```
+
+> A call may do anything the callee does, which is everything. Knowing better
+> than this per callee is an interprocedural summary and is not something this
+> phase has.
+
+That summary *is* the enforcement pass, and three things make it cheaper here
+than Go's flood:
+
+* the whole program is already in one array -- `LowIr.checkCalls` takes
+  `Array (Ssa.Func Low)`, which is exactly the shape a summary needs, so there
+  is nothing to collect;
+* it runs after `mono`, so a direct call names a symbol rather than a
+  type-directed choice;
+* the property is a bit on an opcode rather than something to be discovered.
+  Go's flood is expensive because `//go:nowritebarrierrec` is a *source*
+  annotation and write barriers are introduced long afterwards.
+
+What it is not free of is `Callee`, which has three shapes -- `Direct(String)`,
+`Runtime(String)` and `Indirect(Value)` -- and the third is a closure call with
+no known target. A summary must either call every indirect call allocating,
+which makes closures unusable inside the subset, or work out which closures
+reach which call site, which is the expensive analysis Go's flood is an
+instance of.
+
+That one fact is most of the argument for the next section.
+
+### By effect, or by type
+
+Go defines its subset as an **effect on functions**. Modula-3, Oberon and
+RPython all define theirs by **which types may be named**. The choice decides
+whether enforcement is a whole-program flood or a local check.
+
+| the subset is | enforcement | who |
+|---|---|---|
+| "this function does not allocate" | interprocedural, transitive, imprecise at indirect calls | Go |
+| "this code holds no traced reference" | local and syntactic: a signature either mentions a managed type or it does not | Modula-3, Oberon, RPython |
+
+Turkey can have the second, and the bit it needs is already spelled. `Rep` is a
+register class *plus* `traced`; `untraced(Ptr)` is expressible today and
+unused; and `Ssa.verify` already enforces the invariant that keeps the bit
+honest -- only a pointer may be traced -- for a reason its comment gives: "a
+code address is a pointer the collector must *not* follow, and instruction
+selection is where the first one appears."
+
+If the collector is written against untraced pointers and raw load/store and
+names no managed type, then **it allocates nothing because there is nothing to
+allocate**: no records, no constructors, no arrays, no closures, no strings.
+The interprocedural summary becomes unnecessary, and so does the indirect-call
+problem, because there are no closures to call.
+
+**Why this fits here and does not fit Go.** Go's runtime manipulates Go's own
+types constantly -- slices, maps, interfaces -- so a subset that forbade them
+would forbid the runtime, and an effect on functions is the only line left to
+draw. Our collector manipulates the heap as bytes: headers, mark bits, the free
+list, the frame table, root slots. That is a property of this collector rather
+than a general truth, and it is what buys the cheaper enforcement.
+
+**What must be verified before betting on it**, because the route stands on it:
+that the collector really is all-raw. The heap walk, the headers, the mark
+bits, the free list and the frame table all look it. The suspects are the panic
+and diagnostic path, which handles strings, and the hard-coded `ArrayStorage`
+slots and closure shape -- the same two that `NATIVE-BACKEND.md`'s record-layout
+section flags.
+
+**What it costs is ergonomics inside the subset.** No `SomeError`, because
+packing allocates; no `?`; no `Show`; sentinel returns and raw pointer
+arithmetic. Against idiomatic Turkey that is a severe dialect. Against the 310
+lines of C it replaces it is a wash -- and Modula-3's claim is that it need not
+even be that: "In most other respects, traced and untraced references behave
+identically."
+
+### The spectrum
+
+Five positions. The first is untenable and the last is unaffordable, for
+different reasons.
+
+| | what it is | what it costs | what it buys |
+|---|---|---|---|
+| **0** | nothing: discipline, review, `GC_STRESS` | zero | nothing -- and this is the one section where being wrong is silent |
+| **1** | a post-lowering checker: mark the entry points, join `effectsOf` over the call graph, report | one pass over a function array that already exists | a real check, with errors naming a monomorphized function and often a call that *lowering* introduced |
+| **2** | the same, with provenance back to source | plumbing spans through lowering | makes the failures that will actually bite readable -- dictionaries past `mono`'s cap, existential packing, a capturing closure. None of those are written by anyone |
+| **3** | a declared subset on function types: a `nogc` function may call only `nogc` functions | a contract that closures, class methods and polymorphism must all answer to | errors at the call site, in source, early |
+| **4** | the bit inferred on arrows, so `map` is `nogc` exactly when its argument is | an effect system, in two implementations, plus golden regeneration | the best ergonomics available |
+
+Levels 3 and 4 buy ergonomics across a *body* of code. The body here is the
+collector's 310 lines and the callback boundary's handful, written once by one
+person. **Two consumers totalling a few hundred lines do not pay for an
+inferred effect system**, which is why the effort curve is unusually flat at
+the top.
+
+What would move it is a third consumer that users write: latency-sensitive
+code, a `nosplit` equivalent, or an FFI callback form. If one arrives, the
+thing to notice is that arrow-bit inference is already described elsewhere for
+a *throws* bit, in Swift's `rethrows` shape. An allocation bit is the same
+machinery instantiated a second time -- which is an argument for designing the
+bit once and generically if it is ever designed, and an argument against
+building it for the collector alone.
+
 ## Prior art
 
 **Go** is the most honest estimate of (3), because it has exactly this problem:
@@ -95,6 +213,12 @@ that rewrites the flow graphs of everything else** while the collector itself
 stays outside the transform. Structurally the same answer as (3): a subset that
 the managed-code transformation does not apply to.
 
+RPython also draws its line by type rather than by effect, which is the part
+worth taking: `lltype` distinguishes a `GcStruct`, which carries "a
+platform-specific GC header" and is collected, from a plain `Struct`, which has
+no header and is "suitable for being embedded inside other structures", and raw
+memory is `lltype.malloc(..., flavor='raw')` with a matching `lltype.free`.
+
 With a caveat that matters here: **RPython translates to C.** So does Squeak's
 VM, written in Slang, a Smalltalk subset, and then translated to C. Both prove
 the *subset* idea and neither escapes the C toolchain -- they generate C rather
@@ -105,6 +229,31 @@ precedents for it.
 included, in Oberon, compiled by its own compiler, no C anywhere. It is also
 from an era with a much smaller platform contract to satisfy -- no dyld, no
 code signature, no libc ABI.
+
+And it is the precedent for *how the line is drawn*, which is by import rather
+than by analysis. The low-level facilities live in a pseudo-module, `SYSTEM`,
+whose name "would appear in the prominently visible import list of every module
+making use of such low-level facilities", with the recommendation to "restrict
+their use to specific modules (called low-level modules)", which are then
+"easily recognized due to the identifier SYSTEM appearing in their import
+list." Enforcement is social and the compiler's whole contribution is making
+the fact visible. Turkey has modules and import lists, so this is available at
+no cost at all -- and it is the floor under level 1 below, not a substitute
+for it.
+
+**Modula-3** is the closest precedent to the route recommended below, and it
+draws *both* of the lines this document separates. Safety is per module: "In a
+safe module, the compiler prevents any errors that could corrupt the runtime
+system; in an unsafe module, it is the programmer's responsibility to avoid
+them", and "unsafe operations are allowed only in modules explicitly labeled
+unsafe." And the heap is split by *type*: "For programs that cannot afford
+garbage collection, Modula-3 provides a set of reference types that are not
+traced by the garbage collector. In most other respects, traced and untraced
+references behave identically."
+
+Traced and untraced references, which is exactly `Rep.traced`, in a language
+from 1989. The last sentence is also the ergonomic claim the subset-by-types
+route is betting on, from the one system that shipped it.
 
 **Zig** has no GC, so it answers (1) and (2) and says nothing about (3), which
 is the part that decides this.
@@ -164,6 +313,25 @@ collector is in.
 halves and are the smallest of the three pieces, and the `traced` bit that makes
 them expressible is already in the IR. If any of this is done, it is first.
 
+**The subset is defined by types, not by an effect on functions.** Decided, on
+the reasoning under "By effect, or by type": the collector manipulates the heap
+as bytes rather than as Turkey values, so "names no traced type" forbids
+everything "does not allocate" was meant to forbid, and it is checked locally
+instead of by an interprocedural summary that `Callee.Indirect` would make
+imprecise anyway. Modula-3 is the precedent and `Rep.traced` is the bit. The
+claim this rests on -- that the collector is genuinely all-raw -- is a
+measurement to take before the route is committed to, and the suspects are
+named above.
+
+**Enforcement stops at a checker.** Levels 1 and 2 of the spectrum: an
+allocation summary over the low IR, and then the provenance that makes its
+errors readable. Levels 3 and 4 are declined for now, not deferred vaguely --
+an inferred effect on arrows is an effect system in two implementations, and
+the code it would serve is a few hundred lines with two consumers. The
+condition that would reopen it is a third consumer that users write, and the
+design to reach for then is the *throws* bit's, generalized, rather than a
+second one built alongside.
+
 ## Sources
 
 - Go runtime pragmas and the call-graph flood that enforces them:
@@ -173,3 +341,11 @@ them expressible is already in the IR. If any of this is done, it is first.
   <https://rpython.readthedocs.io/en/latest/garbage_collection.html>
 - PyPy architecture, translation to C:
   <https://aosabook.org/en/v2/pypy.html>
+- RPython, `lltype` and raw-flavour memory:
+  <https://rpython.readthedocs.io/en/latest/rtyper.html>,
+  <https://rpython.readthedocs.io/en/latest/rffi.html>
+- Modula-3, safe and unsafe modules, traced and untraced references:
+  <https://www.opencm3.net/doc/reference/intro.html>
+- Oberon, the SYSTEM pseudo-module: <http://www.ethoberon.ethz.ch/SYSTEM.html>,
+  and Wirth on why it is a module:
+  <https://people.inf.ethz.ch/wirth/Articles/Modula-Oberon-June.doc>

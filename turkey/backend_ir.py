@@ -20,6 +20,10 @@ class Layout(Enum):
     F64 = "f64"
     PTR = "ptr"
     BOXED = "boxed"
+    #: A raw machine address (TIX-61).  Pointer-shaped and pointer-sized, and
+    #: the collector must not follow it -- which is the whole difference from
+    #: `PTR`, and why it is a member here rather than a flag beside one.
+    ADDR = "addr"
 
 
 @dataclass(frozen=True)

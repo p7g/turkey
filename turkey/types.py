@@ -464,6 +464,11 @@ def is_scalar_value(code: int) -> bool:
 
 ARRAY = TCon("Data.Array#Array", KFun(STAR, STAR))
 RAW_ARRAY = TCon("Prim.Array", KFun(STAR, STAR))
+#: A raw machine address: not a managed reference, and the collector must not
+#: follow it (TIX-61).  Opaque and nullary, registered the way `Prim.Array` is
+#: rather than the way `Byte` is, so that it is spellable only from a library
+#: module.  `lib/Unsafe/Ptr.gob` re-exports it as `Ptr`.
+RAW_PTR = TCon("Prim.Ptr", STAR)
 
 
 # ------------------------------------------------------- application and spines

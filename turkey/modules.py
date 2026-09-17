@@ -186,6 +186,7 @@ class ModuleLoader:
         if module.library:
             scope.values.update({name: name for name in PRIM_NAMES})
             scope.types["Prim.Array"] = "Prim.Array"
+            scope.types["Prim.Ptr"] = "Prim.Ptr"
         # So are the built-in type constructors, which no module declares.
         scope.types.update({name: name for name in BUILTIN_TYCONS})
 

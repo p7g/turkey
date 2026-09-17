@@ -61,7 +61,7 @@ def _llvm_type(layout: bir.Layout) -> ir.Type:
     return {
         bir.Layout.UNIT: _I8, bir.Layout.I1: _I1, bir.Layout.I8: _I8,
         bir.Layout.I32: _I32, bir.Layout.I64: _I64, bir.Layout.F64: _F64,
-        bir.Layout.PTR: _PTR, bir.Layout.BOXED: _PTR,
+        bir.Layout.PTR: _PTR, bir.Layout.BOXED: _PTR, bir.Layout.ADDR: _PTR,
     }[layout]
 
 
@@ -72,7 +72,7 @@ def _layout_code(layout: bir.Layout) -> int:
     return {
         bir.Layout.UNIT: 0, bir.Layout.I1: 1, bir.Layout.I8: 2,
         bir.Layout.I32: 3, bir.Layout.I64: 4, bir.Layout.F64: 5,
-        bir.Layout.PTR: 7, bir.Layout.BOXED: 7,
+        bir.Layout.PTR: 7, bir.Layout.BOXED: 7, bir.Layout.ADDR: 6,
     }[layout]
 
 
@@ -170,6 +170,10 @@ def _safepoint_live(function: bir.Function) -> dict[tuple[str, int], frozenset[s
     at the top of the block that declares it.
     """
     layouts = _value_layouts(function)
+    # `ADDR` is pointer-shaped and excluded on purpose: it is a raw address,
+    # and rooting one would hand the collector something with no header to
+    # read (TIX-61). This set naming the traced layouts rather than testing
+    # for a pointer is what makes that exclusion a statement.
     tracked = {name for name, layout in layouts.items()
                if layout in (bir.Layout.PTR, bir.Layout.BOXED)}
     if not tracked:
@@ -477,6 +481,7 @@ class _Emitter:
         # pointers, registered once with a frame that is never left, and
         # `global_load`/`global_store` index into it. A separate global plus a
         # shadow copy would need every store to update both.
+        # `ADDR` excluded, as in `_safepoint_live`: a raw address is not a root.
         pointers = [source for source in self.source.globals
                     if source.layout in (bir.Layout.PTR, bir.Layout.BOXED)]
         self.global_roots = {source.name: index

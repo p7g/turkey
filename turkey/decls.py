@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from . import ast
 from .errors import Span, TypeError_
 from .types import (
-    RAW_ARRAY, PRIMITIVES, STAR, Fresh, KFun, Kind, Pred, Scheme, TApp, TCon, TFam, TFun,
+    RAW_ARRAY, RAW_PTR, PRIMITIVES, STAR, Fresh, KFun, Kind, Pred, Scheme, TApp, TCon, TFam, TFun,
     TTuple, TVar, Type, apply, default_kind, generalize, instantiate, kind_arrow,
     OPENED, QUALIFY, kind_of, short_name, show, show_kind, spine, unify_kinds,
 )
@@ -138,6 +138,8 @@ class DeclTable:
         self.tycons["Prim.Array"] = TyconInfo(
             "Prim.Array", ["a"], kind=RAW_ARRAY.kind)
         self.heads["Prim.Array"] = RAW_ARRAY
+        self.tycons["Prim.Ptr"] = TyconInfo("Prim.Ptr", [], kind=RAW_PTR.kind)
+        self.heads["Prim.Ptr"] = RAW_PTR
 
     def head(self, name: str) -> TCon:
         return self.heads[name]

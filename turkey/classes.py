@@ -966,6 +966,15 @@ class ClassTable:
             general: Type = TTuple([TVar(1) for _ in head.elems])
             key: tuple[str, object] = ("tuple", len(head.elems))
         elif isinstance(head, TCon):
+            # A raw address has no `Typed` instance (TIX-61). `Typed` is what
+            # admits a value to existential packing and to `Data.Error.cast`,
+            # and `addr` is deliberately not one of `layout.OPENED_LAYOUTS` --
+            # so a packed `Ptr` would type-check with no arm copy to run. The
+            # other half is that recovering a pointer out of a dynamic value
+            # is a pointer forged from data whose provenance the checker gave
+            # up on.
+            if head.name == "Prim.Ptr":
+                return None
             if not args:
                 general, key = head, ("con", head.name)
             else:

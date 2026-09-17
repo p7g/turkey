@@ -72,7 +72,17 @@ from .types import Type, TVar, prune, vars_of
 
 #: Every layout a packed variable can have been stored at, in the order an
 #: opened arm is copied for them (SPEC-DELTAS 68).
-OPENED_LAYOUTS = tuple(layout.value for layout in bir.Layout)
+#:
+#: Listed rather than derived from `bir.Layout`, because `Layout.openedLayouts`
+#: in `boot/` is a list and the two are one decision: a member added to the
+#: enum used to join this tuple silently, giving the two implementations a
+#: different number of copies per opened skolem and moving every existential
+#: `opt` golden on one side only.
+#:
+#: `addr` is deliberately absent. `keyChoices` is `len(OPENED_LAYOUTS) ** arity`,
+#: so a ninth entry is paid for by every existential in the corpus, and nothing
+#: packs a raw pointer into one (TIX-61).
+OPENED_LAYOUTS = ("unit", "i1", "i8", "i32", "i64", "f64", "ptr", "boxed")
 
 _FIELDS: dict[type, tuple] = {}
 

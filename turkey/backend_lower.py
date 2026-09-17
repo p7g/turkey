@@ -107,6 +107,8 @@ def layout_of(ty: Type, abstracted: dict[int, str] | None = None,
             return bir.Layout.UNIT
         if ty.name == "Data.Bool.Type#Bool":
             return bir.Layout.I1
+        if ty.name == "Prim.Ptr":
+            return bir.Layout.ADDR
         # Every other declared type is a heap object, and a heap object is
         # reached by pointer. Said here rather than left to a catch-all at the
         # end, so that the end can be a refusal.
@@ -1529,6 +1531,11 @@ def _flat_refs(body) -> set[str]:
 
 
 def _pointer_layout(layout: bir.Layout) -> bool:
+    """Whether the collector must follow a slot held at this layout.
+
+    Not "is it pointer-shaped": `ADDR` is, and is excluded, because a raw
+    address has no header for the collector to read (TIX-61).
+    """
     return layout in (bir.Layout.PTR, bir.Layout.BOXED)
 
 
@@ -1542,7 +1549,7 @@ def _pointer_layout(layout: bir.Layout) -> bool:
 LAYOUT_CODES = {
     bir.Layout.UNIT: 0, bir.Layout.I1: 1, bir.Layout.I8: 2,
     bir.Layout.I32: 3, bir.Layout.I64: 4, bir.Layout.F64: 5,
-    bir.Layout.PTR: 7, bir.Layout.BOXED: 7,
+    bir.Layout.PTR: 7, bir.Layout.BOXED: 7, bir.Layout.ADDR: 6,
 }
 
 

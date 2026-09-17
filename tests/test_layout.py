@@ -164,3 +164,24 @@ def test_a_capped_field_access_reaches_the_right_field(capped, capsys):
     """
     driver.run(source, backend="python")
     assert capsys.readouterr().out == "7\nseven\n"
+
+
+def test_a_raw_pointer_is_held_untraced_and_is_not_packable():
+    """`Prim.Ptr` erases to `addr`, which is pointer-shaped and not traced.
+
+    Two separate facts, and the second is the one with no other test: `addr`
+    is deliberately absent from `OPENED_LAYOUTS`, so an existential never
+    copies an arm for it. That list is written out rather than derived from
+    `bir.Layout` precisely so adding a member cannot change it by accident --
+    `boot/Turkey/Layout.gob` has it as a literal and the two are one decision.
+    """
+    from turkey import backend_ir as bir, backend_lower, decls as decls_mod
+
+    table = decls_mod.DeclTable()
+    ptr = table.head("Prim.Ptr")
+    assert backend_lower.layout_of(ptr, {}, table) is bir.Layout.ADDR
+    assert backend_lower.LAYOUT_CODES[bir.Layout.ADDR] == 6
+    assert backend_lower.LAYOUT_CODES[bir.Layout.PTR] == 7
+    assert not backend_lower._pointer_layout(bir.Layout.ADDR)
+    assert bir.Layout.ADDR.value not in layout.OPENED_LAYOUTS
+    assert len(layout.OPENED_LAYOUTS) == 8

@@ -393,6 +393,27 @@ and compiling it. Rewriting the file doors in Turkey is what surfaced it --
 `canRead` was one line over a primitive, and only became visible as a race when
 it had to be written as an `open` and a `close` with nothing between them.
 
+### 104. An argument was the one door into `String` that did not check
+**bug, fixed.** TIX-65. PRIMITIVES.md 4.7 makes `String.fromBytes` the only way
+in, and a file, an environment variable and a byte array all go through it.
+The arguments did not: `turkey_args_storage` called `turkey_string_new` on
+whatever the operating system handed over, so `prog $'\xff'` produced a
+`String` that was not UTF-8, and every string operation after it was entitled
+to misbehave. Nobody wrote that down as a decision; it was simply the C
+function a string could be made with.
+
+Porting it to Turkey made the choice visible, because in Turkey there is no
+unchecked constructor to reach for. `System.Env.args` now builds each argument
+with `Prim.stringFromBytes`, which panics on ill-formed input. A panic rather
+than an `Option` per argument because a program cannot do anything useful with
+half an argument list, and a caller that must accept arbitrary bytes wants an
+`argBytes` beside `args`, which nothing needs yet.
+
+The port also showed the two hosts disagreeing about that panic's wording --
+"not well-formed UTF-8" in Python, "not valid UTF-8" in C -- which no golden
+had reason to reach until a program could hit it at startup. The C now says
+"well-formed", which is PRIMITIVES.md's word.
+
 ### 98. Two codes that meant the same thing, and a bit thrown away before it was read
 **bug, fixed.** TIX-61. The collector traced a slot whose three-bit layout code
 was `>= 6`, and 6 and 7 were `PTR` and `BOXED` -- both traced. So the two codes

@@ -1121,7 +1121,7 @@ TurkeyString *turkey_string_from_bytes(void *wrapper) {
     if (!array_parts(wrapper, &array, &length)) return NULL;
     unsigned char *bytes = (unsigned char *)array->slots;
     if (!valid_utf8_bytes(bytes, length)) {
-        turkey_panic("bytes are not valid UTF-8");
+        turkey_panic("bytes are not well-formed UTF-8");
         return NULL;
     }
     return turkey_string_new(bytes, length);
@@ -1191,12 +1191,19 @@ void *turkey_closure_new(uint64_t code, int64_t capture_count,
     return closure;
 }
 
-/* ------------------------------------------------------------ the outside world
+/* --------------------------------------------------- what the host hands over
  *
- * The floor `turkey/builtins.py` describes: arguments and `exit`. Both are
- * written twice -- once there for the Python host and once here. The streams
- * and the two file doors were here too, until TIX-65 wrote them in Turkey over
- * `open`, `read`, `write` and `close` (`lib/System/IO.gob`).
+ * The arguments going in and the exit status coming out. Everything else the
+ * outside world was -- the streams and the two file doors -- is Turkey now,
+ * over `open`, `read`, `write` and `close` (`lib/System/IO.gob`, TIX-65); the
+ * arguments are built into strings in Turkey too (`System.Env.args`).
+ *
+ * What is left is *state*, and it is here because both hosts reach it from
+ * outside the program: `turkey_main` below and the JIT's `ctypes` call write
+ * the arguments before any Turkey runs, and read the exit flag after the last
+ * of it has returned. That makes it the entry section's -- staging step 3 in
+ * `RUNTIME-IN-TURKEY.md` -- and it moves when the entry does. `Unsafe.Runtime`
+ * is the other side of this seam and shrinks with it.
  */
 
 static unsigned char **argument_bytes;
@@ -1208,8 +1215,8 @@ void turkey_args_set(int64_t count, const unsigned char *const *bytes,
     /* Copied out of the host's memory and held outside the Turkey heap. A
        `TurkeyString` per argument would have to stay reachable for the life
        of the program from a root the collector scans, and there is no such
-       root; plain bytes need none, and `turkey_args_storage` builds the
-       strings on demand. */
+       root; plain bytes need none, and `System.Env.args` builds the strings
+       on demand. */
     for (int64_t index = 0; index < argument_count; ++index)
         free(argument_bytes[index]);
     free(argument_bytes);
@@ -1244,28 +1251,17 @@ void turkey_args_set(int64_t count, const unsigned char *const *bytes,
     argument_count = count;
 }
 
-void *turkey_args_storage(void) {
-    RootFrame frame;
-    void *roots[1] = {NULL};
-    turkey_root_enter(&frame, roots, 1, "turkey_args_storage");
-    /* Rooted before the first string is built: every `turkey_string_new` can
-       collect, and the array is the only thing holding the strings made
-       before it. */
-    /* Element layout 7: an array of `TurkeyString *`, which the collector
-       must follow. It read 6 while 6 and 7 were both traced. */
-    TurkeyObject *storage = turkey_array_new(argument_count, 0, 8, 7);
-    if (storage == NULL) { turkey_root_leave(&frame); return NULL; }
-    roots[0] = storage;
-    frame.live = 1;
-    for (int64_t index = 0; index < argument_count; ++index) {
-        TurkeyString *value = turkey_string_new(argument_bytes[index],
-                                                argument_lengths[index]);
-        if (value == NULL) { turkey_root_leave(&frame); return NULL; }
-        storage->slots[index] = (uint64_t)(uintptr_t)value;
-    }
-    turkey_root_leave(&frame);
-    return storage;
+/* One argument at a time, for `Unsafe.Runtime`: a count, and each one's bytes
+   and length. Raw bytes rather than strings, so that nothing here allocates
+   and the collector never has to know these exist. An index out of range is
+   undefined, as any raw read is; `System.Env.args` asks only below the count. */
+int64_t turkey_arg_count(void) { return argument_count; }
+
+const unsigned char *turkey_arg_bytes(int64_t index) {
+    return argument_bytes[index];
 }
+
+int64_t turkey_arg_length(int64_t index) { return argument_lengths[index]; }
 
 static int32_t exit_requested;
 static int64_t exit_status;

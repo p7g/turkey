@@ -419,7 +419,7 @@ def run(src: str, filename: str = "<input>", args: list[str] | None = None,
     search = [Path(filename).resolve().parent] if filename != "<input>" else None
     checked = check(src, None if filename == "<input>" else filename, search)
     report_warnings(checked.warnings, filename)
-    # What the program will see through `Prim.args`: its own arguments, with
+    # What the program will see through `System.Env.args`: its own arguments, with
     # neither the interpreter nor the file name in front of them. The native
     # backend hands over `argv + 1`, so the two hosts agree on element zero --
     # which M26's stage2/stage3 comparison needs, since the compiler reads its

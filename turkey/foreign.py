@@ -69,6 +69,7 @@ def reset() -> None:
     """Forget the per-run caches. Called where the heap itself is reset, so
     that an address is a function of the program's own allocation sequence."""
     _ENVIRON.clear()
+    _ARGUMENTS.clear()
 
 
 def model(symbol: str) -> Callable | None:
@@ -240,6 +241,48 @@ def _close(fd: int) -> int:
     except OSError as exc:
         return -_errno(exc)
     return 0
+
+
+# -- what the host hands over ------------------------------------------------
+#
+# Not libc: the C runtime's own accessors for the arguments it was handed
+# (`lib/Unsafe/Runtime.gob`). Modelled from `builtins.program_args`, which is
+# what the native host hands the runtime too, so both read the same list.
+
+
+#: Each argument copied into the simulated heap once, like `_ENVIRON`: the
+#: runtime answers the same bytes every time it is asked.
+_ARGUMENTS: dict[int, int] = {}
+
+
+def _program_args() -> list[str]:
+    # Imported here rather than at the top: `builtins` imports this module.
+    from .builtins import program_args
+    return program_args()
+
+
+def _argument(index: int) -> bytes:
+    return _program_args()[index].encode("utf-8", "surrogateescape")
+
+
+@_entry("turkey_arg_count")
+def _arg_count() -> int:
+    return len(_program_args())
+
+
+@_entry("turkey_arg_bytes")
+def _arg_bytes(index: int) -> int:
+    if index not in _ARGUMENTS:
+        payload = _argument(index)
+        address = RAW_HEAP.allocate(max(len(payload), 1))
+        _store_bytes(address, payload)
+        _ARGUMENTS[index] = address
+    return _ARGUMENTS[index]
+
+
+@_entry("turkey_arg_length")
+def _arg_length(index: int) -> int:
+    return len(_argument(index))
 
 
 # -- the values that cross ---------------------------------------------------

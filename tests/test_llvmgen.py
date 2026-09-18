@@ -49,10 +49,11 @@ ALLOWED_RUNTIME_CALLS = {
     "turkey_float_parse", "turkey_float_can_parse", "turkey_float_fmod",
     "turkey_float_remainder", "turkey_float_floor", "turkey_float_ceil",
     "turkey_float_round", "turkey_float_trunc",
-    # The outside world: arguments, the error stream and `exit`. Each is one
-    # call by construction, so they belong here rather than being made into
-    # loads. The file doors were here until TIX-65 wrote them in Turkey.
-    "turkey_args_storage", "turkey_exit",
+    # What the host hands over: `exit`, whose state the host reads after the
+    # program returns, and the arguments it wrote before, read back through
+    # `Unsafe.Runtime`. The streams and the file doors were here until TIX-65
+    # wrote them in Turkey.
+    "turkey_exit", "turkey_arg_count", "turkey_arg_bytes", "turkey_arg_length",
     "turkey_panic", "turkey_panic_string", "turkey_panicked",
     "turkey_root_enter", "turkey_root_leave",
     "turkey_frame_enter", "turkey_frame_leave",

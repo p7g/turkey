@@ -15,9 +15,24 @@ list of anything touching raw memory -- not the checker TIX-63 will build.
 The FFI is now argued, per the recommendation at the foot of this document, as
 `PROPOSALS.md` item 8, and built: TIX-62 landed `foreign` as SPEC-DELTAS 71,
 declared the symbols in `lib/Unsafe/Libc.gob`, and deleted `Prim.ptrAlloc`,
-`Prim.ptrFree` and the two C wrappers underneath them. So step 1 of the staging
-below -- the FFI itself -- is done, and `System.Env.get` is the first safe
-wrapper over it.
+`Prim.ptrFree` and the two C wrappers underneath them. So the FFI itself is
+done, and `System.Env.get` is the first safe wrapper over it.
+
+**Staging step 1 is done (TIX-65), with one piece reclassified.** The streams
+(`print`, `write`, `stderr`), both file doors and the construction of the
+argument strings are Turkey in `lib/System/IO.gob` and `lib/System/Env.gob`,
+over `open`, `creat`, `read`, `write` and `close`. Seven primitives are gone
+from both compilers, and `runtime/turkey_runtime.c` went from 1575 lines to
+1451. What did not move is the *state* the host hands across: the copied
+arguments, which `turkey_main` and the JIT's `ctypes` call write before any
+Turkey runs, and the exit flag they read after the last of it returns. That is
+the entry section's business rather than the outside world's, so it sits under
+its own banner in the C, is reached from Turkey through `lib/Unsafe/Runtime.gob`,
+and moves with step 3. Measured cost: none -- `boot` compiling itself, 44MB of
+assembly out through `print`, took 159s before and after. Three findings came
+out of the port: a C `int` result is only half defined in an `Int`
+(FINDINGS 102), `canRead` was a race and is gone (103), and arguments were the
+one door into `String` that skipped the UTF-8 check (104).
 
 It is smaller than the thirty-five below suggest. Under "depend on libc as
 little as possible" only about ten of them are an FFI problem at all, five are
@@ -46,7 +61,7 @@ Measured, by section:
 |---|---:|---|
 | Values: strings, objects, arrays, boxes, closures | 546 | Raw loads and stores at an address |
 | GC: heap list, mark, sweep, root frames | 310 | Raw memory, **and must not allocate** |
-| The outside world: args, files, print, exit | 205 | Nothing but FFI |
+| The outside world: args, files, print, exit | 205 | Nothing but FFI -- **done**, bar the host's handoff state |
 | Entry and the big-stack thread | 106 | FFI, and a Turkey function as a C callback |
 | Crash diagnostics | 54 | Signal handlers, so also a C callback |
 | **Total** | **1221** | |
@@ -293,7 +308,7 @@ at any point with the rest still in C.
 
 1. **The outside world, 205 lines.** Pure FFI: no raw memory, no allocation, no
    GC interaction. Moving it proves the FFI on real code and removes a sixth of
-   the C.
+   the C. *Done (TIX-65); the argument and exit state stayed, as step 3's.*
 2. **Values, 546 lines.** Needs raw loads and stores but allocates normally, so
    it is ordinary managed Turkey with a pointer type. The largest section and
    the second easiest.

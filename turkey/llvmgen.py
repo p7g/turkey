@@ -108,7 +108,6 @@ _CALLING_PRIMS = frozenset({
     "floatFmod", "floatRemainder", "floatFloor", "floatCeil", "floatRound",
     "floatTrunc", "stringIsValidUtf8", "floatCanParse", "stringEq", "stringLt",
     "arrayNew", "arrayNewUninit", "error", "exit",
-    "argsStorage",
 })
 #: `Prim.load*` / `Prim.store*` to the LLVM type the access is at. One name
 #: per representation because the width has to be known where the instruction
@@ -460,7 +459,6 @@ class _Emitter:
         self._runtime("turkey_string_concat_all", _PTR, [_PTR])
         self._runtime("turkey_string_eq", _I32, [_PTR, _PTR])
         self._runtime("turkey_string_lt", _I32, [_PTR, _PTR])
-        self._runtime("turkey_args_storage", _PTR, [])
         self._runtime("turkey_exit", ir.VoidType(), [_I64])
         self._runtime("turkey_cell_new", _PTR, [_I64, _I32])
         self._runtime("turkey_object_new", _PTR, [_I32, _I32, _I64, _I64])
@@ -1348,7 +1346,6 @@ class _Emitter:
         runtime = {
             "intToString": "turkey_int_to_string", "floatToString": "turkey_float_to_string",
             "charToString": "turkey_char_to_string", "stringConcat": "turkey_string_concat",
-            "argsStorage": "turkey_args_storage",
             "stringByteLength": "turkey_string_byte_length",
             "stringByteAt": "turkey_string_byte_at",
             "stringDecodeAt": "turkey_string_decode_at",
@@ -1700,7 +1697,7 @@ class NativeModule:
     result: bir.Layout
 
     def _set_args(self, args: list[str]) -> None:
-        """Hand the runtime what the program will see through `Prim.args`.
+        """Hand the runtime what the program will see through `System.Env.args`.
 
         As bytes with explicit lengths rather than as C strings: an argument
         may contain anything the operating system allowed, and truncating one

@@ -80,7 +80,7 @@ _ARGS: list[str] = []
 
 
 def set_args(args) -> None:
-    """Record the arguments a program will see through `Prim.args`.
+    """Record the arguments a program will see through `System.Env.args`.
 
     And clear the raw heap, which is the other thing a run starts with. It is
     reset here rather than in `driver.run` because this is already the
@@ -95,15 +95,11 @@ def set_args(args) -> None:
 def program_args() -> list[str]:
     """What `set_args` recorded, for a host that runs the program natively.
 
-    The native backend cannot read `_ARGS` the way `_args` does -- it hands
+    The native backend cannot read `_ARGS` the way `turkey/foreign.py` does -- it hands
     the bytes to the runtime before the program starts -- so the two hosts
     share the setter and this is the other half of it.
     """
     return list(_ARGS)
-
-
-def _args() -> ConValue:
-    return _array_of_values(list(_ARGS))
 
 
 def _exit(status: int):
@@ -488,7 +484,6 @@ _PRIM: dict[str, tuple] = {
 
     # The outside world. `exit` diverges, so like `error` it claims any result.
     "Prim.exit": (_scheme(lambda a: TFun([INT], a)), _bi("Prim.exit", 1, _exit)),
-    "Prim.args": (mono(TFun([], array_of(STRING))), _bi("Prim.args", 0, _args)),
 
     # Fixed-length storage. Dynamic length and capacity are `Data.Array` policy.
     "Prim.arrayNew": (_scheme(lambda a: TFun([INT, a], raw_array_of(a))),

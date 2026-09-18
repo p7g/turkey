@@ -992,23 +992,6 @@ class _FunctionLowerer:
                         done(at, self.wrap_array(at, raw, length))
                     self.lower_values(expr.args, env, joins, block, to_bytes)
                     return
-                if primitive == "Prim.args":
-                    # The runtime answers raw storage; the `Array` around it is
-                    # built here, where the constructor tags are. `array_parts`
-                    # reads that shape structurally on the way back in, but
-                    # building one needs tags the runtime has no way to know.
-                    storage_prim = "prim.argsStorage"
-                    def from_storage(at: bir.Block,
-                                     values: list[bir.Operand]) -> None:
-                        raw = self.emit(at, storage_prim, tuple(values),
-                                        bir.Layout.PTR, self.frame(expr.span))
-                        # The storage is allocated at exactly the length it
-                        # holds, so its own element count is the length.
-                        length = self.emit(at, "prim.arrayLength", (raw,),
-                                           bir.Layout.I64)
-                        done(at, self.wrap_array(at, raw, length))
-                    self.lower_values(expr.args, env, joins, block, from_storage)
-                    return
                 if primitive == "Prim.castAs":
                     # The conversion half of a checked cast. `Data.Error.cast`
                     # has already compared the two type reps, so the value in

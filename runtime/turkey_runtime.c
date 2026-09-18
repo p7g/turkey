@@ -22,6 +22,16 @@ typedef struct TurkeyObject {
     uint64_t slots[];
 } TurkeyObject;
 
+/* A `String` is its bytes (TIX-66): a kind-2 array object, `count` bytes long,
+   the bytes where the slots begin. `lib/Data/String/Type.gob` declares it and
+   both backends erase the newtype, so what C is handed is the array itself. */
+static int64_t string_length(void *string) {
+    return ((TurkeyObject *)string)->count;
+}
+static const unsigned char *string_bytes(void *string) {
+    return (const unsigned char *)((TurkeyObject *)string)->slots;
+}
+
 static char panic_buffer[256];
 int32_t turkey_has_panicked;
 
@@ -83,7 +93,7 @@ typedef struct RootFrame {
     int64_t live;
 } RootFrame;
 
-enum { HEAP_STRING = 1, HEAP_OBJECT = 2, HEAP_CELL = 3 };
+enum { HEAP_OBJECT = 2, HEAP_CELL = 3 };
 /* A header remains immediately before each payload. Small objects occupy
    fixed-size slots in aligned regions; the address of any header identifies
    its region without a side table. Large objects own a dedicated region. */
@@ -180,8 +190,8 @@ static int64_t stats_freed_previous;
 /* Allocations by what the object is. Indexed by `turkey_object_new`'s kind:
     0 an untagged constructor node (an ADT application -- the tree the rewrite
     passes rebuild), 1 a tagged record (a `CRecord`: buckets, storages,
-    dictionaries), 2 an array, 3 a closure, 4 a closure environment, 5 a box,
-    6 a string, 7 a cell. Tells the 900M-object question ("what are they?")
+    dictionaries), 2 an array -- strings among them since TIX-66 -- 3 a
+    closure, 4 a closure environment, 5 a box, 7 a cell. Tells the 900M-object question ("what are they?")
     apart from "who made them?". Counted only when TURKEY_GC_STATS is set, like
     the rest of this: the constructor sites run after `heap_allocate`, which is
     where the flag is resolved. */
@@ -287,7 +297,6 @@ static void *heap_allocate(size_t size, uint32_t kind) {
     if (stats_log != NULL) {
         stats_allocations++;
         stats_bytes_allocated += (int64_t)(size + sizeof(HeapHeader));
-        if (kind == HEAP_STRING) stats_count_kind(6);
         if (kind == HEAP_CELL) stats_count_kind(7);
     }
     return header + 1;
@@ -604,10 +613,10 @@ void turkey_gc_report(void) {
             collection_count, stats_allocations, stats_bytes_allocated,
             (double)stats_bytes_allocated / (1024.0 * 1024.0));
     fprintf(stderr,
-            "[gc] by kind: string %" PRId64 ", constr %" PRId64
+            "[gc] by kind: constr %" PRId64
             ", record %" PRId64 ", array %" PRId64 ", closure %" PRId64
             ", closure-env %" PRId64 ", box %" PRId64 ", cell %" PRId64 "\n",
-            stats_by_kind[6], stats_by_kind[0], stats_by_kind[1],
+            stats_by_kind[0], stats_by_kind[1],
             stats_by_kind[2], stats_by_kind[3], stats_by_kind[4],
             stats_by_kind[5], stats_by_kind[7]);
     fprintf(stderr,
@@ -649,12 +658,13 @@ void turkey_panic(const char *message) {
     }
 }
 
-void turkey_panic_string(TurkeyString *message) {
+void turkey_panic_string(void *message) {
     if (turkey_has_panicked) return;
     if (message == NULL) { turkey_panic("error"); return; }
-    int length = message->length < (int64_t)sizeof(panic_buffer) - 1
-        ? (int)message->length : (int)sizeof(panic_buffer) - 1;
-    memcpy(panic_buffer, message->bytes, (size_t)length);
+    int64_t size = string_length(message);
+    int length = size < (int64_t)sizeof(panic_buffer) - 1
+        ? (int)size : (int)sizeof(panic_buffer) - 1;
+    memcpy(panic_buffer, string_bytes(message), (size_t)length);
     panic_buffer[length] = '\0';
     turkey_has_panicked = 1;
     capture_panic_trace();
@@ -711,268 +721,20 @@ int64_t turkey_frame_col(int64_t index) {
     return frame == NULL ? 0 : frame->col;
 }
 
-TurkeyString *turkey_string_new(const unsigned char *bytes, int64_t length) {
-    if (length < 0 || (uint64_t)length > SIZE_MAX - sizeof(TurkeyString)) {
-        turkey_panic("invalid string length");
-        return NULL;
-    }
-    TurkeyString *result = heap_allocate(sizeof(TurkeyString) + (size_t)length,
-                                         HEAP_STRING);
-    if (result == NULL) return NULL;
-    result->length = length;
-    memcpy(result->bytes, bytes, (size_t)length);
-    return result;
-}
-
-TurkeyString *turkey_string_concat(TurkeyString *left, TurkeyString *right) {
-    if (left == NULL || right == NULL || left->length > INT64_MAX - right->length) {
-        turkey_panic("string is too large");
-        return NULL;
-    }
-    int64_t length = left->length + right->length;
-    TurkeyString *result = heap_allocate(sizeof(TurkeyString) + (size_t)length,
-                                         HEAP_STRING);
-    if (result == NULL) return NULL;
-    result->length = length;
-    memcpy(result->bytes, left->bytes, (size_t)left->length);
-    memcpy(result->bytes + left->length, right->bytes, (size_t)right->length);
-    return result;
-}
-
-TurkeyString *turkey_int_to_string(int64_t value) {
-    char buffer[32];
-    int length = snprintf(buffer, sizeof(buffer), "%" PRId64, value);
-    return turkey_string_new((const unsigned char *)buffer, length);
-}
-
-TurkeyString *turkey_float_to_string(double value) {
-    char buffer[64];
-    int length;
-    if (isnan(value)) length = snprintf(buffer, sizeof(buffer), "NaN");
-    else if (isinf(value)) length = snprintf(buffer, sizeof(buffer),
-                                             signbit(value) ? "-Infinity" : "Infinity");
-    else if (value == 0.0) {
-        length = snprintf(buffer, sizeof(buffer), signbit(value) ? "-0.0" : "0.0");
-    } else {
-        union { double number; uint64_t bits; } original = { .number = value }, parsed;
-        char trial[64];
-        int precision;
-        for (precision = 1; precision < 17; ++precision) {
-            snprintf(trial, sizeof(trial), "%.*g", precision, value);
-            parsed.number = strtod(trial, NULL);
-            if (parsed.bits == original.bits) break;
-        }
-        int exponent = (int)floor(log10(fabs(value)));
-        if (exponent >= -4 && exponent < 16) {
-            int decimals = precision - exponent - 1;
-            if (decimals < 0) decimals = 0;
-            length = snprintf(buffer, sizeof(buffer), "%.*f", decimals, value);
-        } else {
-            length = snprintf(buffer, sizeof(buffer), "%.*e", precision - 1, value);
-            length = (int)strlen(buffer);
-        }
-        char *marker = strchr(buffer, 'e');
-        if (strchr(buffer, '.') == NULL || (marker != NULL && strchr(buffer, '.') > marker)) {
-            size_t position = marker == NULL ? (size_t)length : (size_t)(marker - buffer);
-            memmove(buffer + position + 2, buffer + position,
-                    (size_t)length - position + 1);
-            buffer[position] = '.';
-            buffer[position + 1] = '0';
-            length += 2;
-        }
-    }
-    return turkey_string_new((const unsigned char *)buffer, length);
-}
-
-static int parse_float(TurkeyString *value, double *result) {
-    if (value == NULL) return 0;
-    if (value->length == 3 && memcmp(value->bytes, "NaN", 3) == 0) {
-        *result = NAN; return 1;
-    }
-    if (value->length == 8 && memcmp(value->bytes, "Infinity", 8) == 0) {
-        *result = INFINITY; return 1;
-    }
-    if (value->length == 9 && memcmp(value->bytes, "-Infinity", 9) == 0) {
-        *result = -INFINITY; return 1;
-    }
-    int64_t index = 0;
-    if (index < value->length &&
-            (value->bytes[index] == '+' || value->bytes[index] == '-')) index++;
-    int64_t whole = index;
-    while (index < value->length && value->bytes[index] >= '0' &&
-           value->bytes[index] <= '9') index++;
-    if (index == whole || index >= value->length || value->bytes[index++] != '.') return 0;
-    int64_t fraction = index;
-    while (index < value->length && value->bytes[index] >= '0' &&
-           value->bytes[index] <= '9') index++;
-    if (index == fraction) return 0;
-    if (index < value->length &&
-            (value->bytes[index] == 'e' || value->bytes[index] == 'E')) {
-        index++;
-        if (index < value->length &&
-                (value->bytes[index] == '+' || value->bytes[index] == '-')) index++;
-        int64_t exponent = index;
-        while (index < value->length && value->bytes[index] >= '0' &&
-               value->bytes[index] <= '9') index++;
-        if (index == exponent) return 0;
-    }
-    if (index != value->length || (uint64_t)value->length >= SIZE_MAX) return 0;
-    char *text = malloc((size_t)value->length + 1);
-    if (text == NULL) { turkey_panic("out of memory"); return 0; }
-    memcpy(text, value->bytes, (size_t)value->length);
-    text[value->length] = '\0';
-    *result = strtod(text, NULL);
-    free(text);
-    return 1;
-}
-
-double turkey_float_parse(TurkeyString *value) {
-    double result = 0.0;
-    if (!parse_float(value, &result)) turkey_panic("string is not a Float");
-    return result;
-}
-
-int32_t turkey_float_can_parse(TurkeyString *value) {
-    double ignored;
-    return parse_float(value, &ignored);
-}
-
-
-TurkeyString *turkey_char_to_string(uint32_t value) {
-    unsigned char out[4];
-    int64_t n;
-    if (value <= 0x7f) { out[0] = value; n = 1; }
-    else if (value <= 0x7ff) {
-        out[0] = 0xc0 | (value >> 6); out[1] = 0x80 | (value & 0x3f); n = 2;
-    } else if (value <= 0xffff && !(value >= 0xd800 && value <= 0xdfff)) {
-        out[0] = 0xe0 | (value >> 12); out[1] = 0x80 | ((value >> 6) & 0x3f);
-        out[2] = 0x80 | (value & 0x3f); n = 3;
-    } else if (value <= 0x10ffff) {
-        out[0] = 0xf0 | (value >> 18); out[1] = 0x80 | ((value >> 12) & 0x3f);
-        out[2] = 0x80 | ((value >> 6) & 0x3f); out[3] = 0x80 | (value & 0x3f); n = 4;
-    } else {
-        turkey_panic("invalid Unicode scalar value"); return NULL;
-    }
-    return turkey_string_new(out, n);
-}
-
-int64_t turkey_string_byte_length(TurkeyString *value) { return value->length; }
-
-static int string_index(TurkeyString *value, int64_t index) {
-    if (value != NULL && index >= 0 && index < value->length) return 1;
-    char message[128];
-    snprintf(message, sizeof(message),
-             "string byte index out of bounds: %" PRId64 ", length %" PRId64,
-             index, value == NULL ? 0 : value->length);
-    turkey_panic(message);
-    return 0;
-}
-
-static int utf8_width(unsigned char lead) {
-    if (lead < 0x80) return 1;
-    if (lead >= 0xf0) return 4;
-    if (lead >= 0xe0) return 3;
-    return 2;
-}
-
-static int utf8_boundary(TurkeyString *value, int64_t index) {
-    return index == 0 || index == value->length ||
-        (index > 0 && index < value->length &&
-         (value->bytes[index] & 0xc0) != 0x80);
-}
-
-uint8_t turkey_string_byte_at(TurkeyString *value, int64_t index) {
-    return string_index(value, index) ? value->bytes[index] : 0;
-}
-
-uint32_t turkey_string_decode_at(TurkeyString *value, int64_t index) {
-    if (!string_index(value, index)) return 0;
-    unsigned char lead = value->bytes[index];
-    if ((lead & 0xc0) == 0x80) {
-        char message[96];
-        snprintf(message, sizeof(message),
-                 "byte offset %" PRId64 " is not a character boundary", index);
-        turkey_panic(message);
-        return 0;
-    }
-    int width = utf8_width(lead);
-    uint32_t scalar = width == 1 ? lead : lead & (0x7f >> width);
-    for (int offset = 1; offset < width; ++offset)
-        scalar = (scalar << 6) | (value->bytes[index + offset] & 0x3f);
-    return scalar;
-}
-
-int64_t turkey_string_next_index(TurkeyString *value, int64_t index) {
-    if (!string_index(value, index)) return 0;
-    if ((value->bytes[index] & 0xc0) == 0x80) {
-        char message[96];
-        snprintf(message, sizeof(message),
-                 "byte offset %" PRId64 " is not a character boundary", index);
-        turkey_panic(message);
-        return 0;
-    }
-    return index + utf8_width(value->bytes[index]);
-}
-
-TurkeyString *turkey_string_slice(TurkeyString *value, int64_t start, int64_t stop) {
-    if (value == NULL || start < 0 || start > stop || stop > value->length) {
-        char message[128];
-        snprintf(message, sizeof(message),
-                 "string slice %" PRId64 "..%" PRId64 " is out of bounds", start, stop);
-        turkey_panic(message);
-        return NULL;
-    }
-    if (!utf8_boundary(value, start) || !utf8_boundary(value, stop)) {
-        char message[160];
-        snprintf(message, sizeof(message),
-                 "string slice %" PRId64 "..%" PRId64
-                 " does not fall on character boundaries", start, stop);
-        turkey_panic(message);
-        return NULL;
-    }
-    return turkey_string_new(value->bytes + start, stop - start);
-}
-
-static int64_t byte_find(TurkeyString *haystack, TurkeyString *needle,
-                         int64_t start, int reverse) {
-    if (haystack == NULL || needle == NULL) return -1;
-    if (needle->length == 0)
-        return reverse ? haystack->length :
-            (start < 0 ? 0 : start > haystack->length ? -1 : start);
-    if (needle->length > haystack->length) return -1;
-    int64_t last = haystack->length - needle->length;
-    if (reverse) {
-        for (int64_t index = last; index >= 0; --index)
-            if (memcmp(haystack->bytes + index, needle->bytes,
-                       (size_t)needle->length) == 0) return index;
-    } else {
-        if (start < 0) start = 0;
-        for (int64_t index = start; index <= last; ++index)
-            if (memcmp(haystack->bytes + index, needle->bytes,
-                       (size_t)needle->length) == 0) return index;
-    }
-    return -1;
-}
-
-int64_t turkey_string_find(TurkeyString *haystack, TurkeyString *needle,
-                           int64_t start) {
-    return byte_find(haystack, needle, start, 0);
-}
-
-int64_t turkey_string_rfind(TurkeyString *haystack, TurkeyString *needle) {
-    return byte_find(haystack, needle, 0, 1);
-}
-
-int32_t turkey_string_eq(TurkeyString *left, TurkeyString *right) {
-    return left->length == right->length &&
-        memcmp(left->bytes, right->bytes, (size_t)left->length) == 0;
-}
-
-int32_t turkey_string_lt(TurkeyString *left, TurkeyString *right) {
-    size_t common = (size_t)(left->length < right->length ? left->length : right->length);
-    int order = memcmp(left->bytes, right->bytes, common);
-    return order < 0 || (order == 0 && left->length < right->length);
-}
+/* ------------------------------------------- the collector's allocation interface
+ *
+ * What generated code calls to make a heap object, and so what the collector
+ * hands out: each of these fills a header over `heap_allocate`, which is the
+ * safepoint and the region allocator. They stay in C with the collector and
+ * move with it (`RUNTIME-IN-TURKEY.md`, staging step 4, TIX-68) -- a managed
+ * object cannot come from `malloc`, because it needs a header and an
+ * allocation bit in a region this file owns.
+ *
+ * Two shapes are pinned here rather than stated anywhere a layout change could
+ * see them: a closure is `[code, environment]`, and a `String` is a byte array
+ * -- `lib/Data/String/Type.gob` erases to one, so `turkey_string_new` below is
+ * what interns a literal.
+ */
 
 void *turkey_cell_new(uint64_t value, int32_t pointer_value) {
     TurkeyCell *cell = heap_allocate(sizeof(TurkeyCell), HEAP_CELL);
@@ -1057,103 +819,6 @@ void *turkey_array_new(int64_t length, uint64_t initial, int32_t element_width,
     return array;
 }
 
-/* `Data.Array#Array` is a newtype (`DeclTable.newtypes`), so the value handed
-   over here is the `ArrayStorage` record itself: the constructor around it is
-   not built by `wrap_array` and is not there to be read back. */
-static int array_parts(void *wrapper, TurkeyObject **data, int64_t *length) {
-    if (!valid_object_kind(wrapper, 1)) return 0;
-    TurkeyObject *storage = wrapper;
-    if (storage->count < 2) { turkey_panic("invalid Array storage"); return 0; }
-    void *data_pointer = (void *)(uintptr_t)storage->slots[0];
-    if (!valid_object_kind(data_pointer, 2)) return 0;
-    *data = data_pointer;
-    *length = (int64_t)storage->slots[1];
-    if (*length < 0 || *length > (*data)->count) {
-        turkey_panic("invalid Array length");
-        return 0;
-    }
-    return 1;
-}
-
-static int valid_utf8_bytes(const unsigned char *bytes, int64_t length) {
-    for (int64_t index = 0; index < length;) {
-        unsigned char lead = bytes[index];
-        int width;
-        uint32_t scalar;
-        if (lead < 0x80) { width = 1; scalar = lead; }
-        else if (lead >= 0xc2 && lead <= 0xdf) { width = 2; scalar = lead & 0x1f; }
-        else if (lead >= 0xe0 && lead <= 0xef) { width = 3; scalar = lead & 0x0f; }
-        else if (lead >= 0xf0 && lead <= 0xf4) { width = 4; scalar = lead & 0x07; }
-        else return 0;
-        if (index > length - width) return 0;
-        for (int offset = 1; offset < width; ++offset) {
-            unsigned char byte = bytes[index + offset];
-            if ((byte & 0xc0) != 0x80) return 0;
-            scalar = (scalar << 6) | (byte & 0x3f);
-        }
-        if ((width == 2 && scalar < 0x80) ||
-                (width == 3 && scalar < 0x800) ||
-                (width == 4 && scalar < 0x10000) ||
-                (scalar >= 0xd800 && scalar <= 0xdfff) || scalar > 0x10ffff)
-            return 0;
-        index += width;
-    }
-    return 1;
-}
-
-void *turkey_string_to_byte_storage(TurkeyString *value) {
-    if (value == NULL) return NULL;
-    TurkeyObject *array = turkey_array_new(value->length, 0, 1, 2);
-    if (array != NULL)
-        memcpy(array->slots, value->bytes, (size_t)value->length);
-    return array;
-}
-
-TurkeyString *turkey_string_from_bytes(void *wrapper) {
-    TurkeyObject *array;
-    int64_t length;
-    if (!array_parts(wrapper, &array, &length)) return NULL;
-    unsigned char *bytes = (unsigned char *)array->slots;
-    if (!valid_utf8_bytes(bytes, length)) {
-        turkey_panic("bytes are not well-formed UTF-8");
-        return NULL;
-    }
-    return turkey_string_new(bytes, length);
-}
-
-int32_t turkey_string_is_valid_utf8(void *wrapper) {
-    TurkeyObject *array;
-    int64_t length;
-    if (!array_parts(wrapper, &array, &length)) return 0;
-    return valid_utf8_bytes((unsigned char *)array->slots, length);
-}
-
-TurkeyString *turkey_string_concat_all(void *wrapper) {
-    TurkeyObject *array;
-    int64_t count;
-    if (!array_parts(wrapper, &array, &count)) return NULL;
-    int64_t length = 0;
-    for (int64_t index = 0; index < count; ++index) {
-        TurkeyString *part = (TurkeyString *)(uintptr_t)array->slots[index];
-        if (part == NULL || part->length > INT64_MAX - length) {
-            turkey_panic("string is too large");
-            return NULL;
-        }
-        length += part->length;
-    }
-    TurkeyString *result = heap_allocate(sizeof(TurkeyString) + (size_t)length,
-                                         HEAP_STRING);
-    if (result == NULL) return NULL;
-    result->length = length;
-    int64_t offset = 0;
-    for (int64_t index = 0; index < count; ++index) {
-        TurkeyString *part = (TurkeyString *)(uintptr_t)array->slots[index];
-        memcpy(result->bytes + offset, part->bytes, (size_t)part->length);
-        offset += part->length;
-    }
-    return result;
-}
-
 void *turkey_closure_new(uint64_t code, int64_t capture_count,
                          uint64_t pointer_bitmap) {
     /* A capture-free closure needs no environment object: nothing can read
@@ -1185,6 +850,119 @@ void *turkey_closure_new(uint64_t code, int64_t capture_count,
     return closure;
 }
 
+
+/* A literal, as the entry interns it: a byte array holding a copy. */
+void *turkey_string_new(const unsigned char *bytes, int64_t length) {
+    TurkeyObject *array = turkey_array_new(length, 0, 1, 2);
+    if (array != NULL && length > 0)
+        memcpy(array->slots, bytes, (size_t)length);
+    return array;
+}
+
+/* --------------------------------------------------- float text, until TIX-75
+ *
+ * `snprintf` and `strtod` never become foreign declarations -- SPEC-DELTAS 71
+ * declines variadics -- so these three stay C until TIX-75 writes shortest
+ * round-trip formatting and correctly rounded parsing in Turkey. They read and
+ * build strings as byte arrays like everything else now does.
+ */
+
+void *turkey_float_to_string(double value) {
+    char buffer[64];
+    int length;
+    if (isnan(value)) length = snprintf(buffer, sizeof(buffer), "NaN");
+    else if (isinf(value)) length = snprintf(buffer, sizeof(buffer),
+                                             signbit(value) ? "-Infinity" : "Infinity");
+    else if (value == 0.0) {
+        length = snprintf(buffer, sizeof(buffer), signbit(value) ? "-0.0" : "0.0");
+    } else {
+        union { double number; uint64_t bits; } original = { .number = value }, parsed;
+        char trial[64];
+        int precision;
+        for (precision = 1; precision < 17; ++precision) {
+            snprintf(trial, sizeof(trial), "%.*g", precision, value);
+            parsed.number = strtod(trial, NULL);
+            if (parsed.bits == original.bits) break;
+        }
+        int exponent = (int)floor(log10(fabs(value)));
+        if (exponent >= -4 && exponent < 16) {
+            int decimals = precision - exponent - 1;
+            if (decimals < 0) decimals = 0;
+            length = snprintf(buffer, sizeof(buffer), "%.*f", decimals, value);
+        } else {
+            length = snprintf(buffer, sizeof(buffer), "%.*e", precision - 1, value);
+            length = (int)strlen(buffer);
+        }
+        char *marker = strchr(buffer, 'e');
+        if (strchr(buffer, '.') == NULL || (marker != NULL && strchr(buffer, '.') > marker)) {
+            size_t position = marker == NULL ? (size_t)length : (size_t)(marker - buffer);
+            memmove(buffer + position + 2, buffer + position,
+                    (size_t)length - position + 1);
+            buffer[position] = '.';
+            buffer[position + 1] = '0';
+            length += 2;
+        }
+    }
+    return turkey_string_new((const unsigned char *)buffer, length);
+}
+
+static int parse_float(void *string, double *result) {
+    if (string == NULL) return 0;
+    struct { int64_t length; const unsigned char *bytes; } view = {
+        string_length(string), string_bytes(string) }, *value = &view;
+    if (value->length == 3 && memcmp(value->bytes, "NaN", 3) == 0) {
+        *result = NAN; return 1;
+    }
+    if (value->length == 8 && memcmp(value->bytes, "Infinity", 8) == 0) {
+        *result = INFINITY; return 1;
+    }
+    if (value->length == 9 && memcmp(value->bytes, "-Infinity", 9) == 0) {
+        *result = -INFINITY; return 1;
+    }
+    int64_t index = 0;
+    if (index < value->length &&
+            (value->bytes[index] == '+' || value->bytes[index] == '-')) index++;
+    int64_t whole = index;
+    while (index < value->length && value->bytes[index] >= '0' &&
+           value->bytes[index] <= '9') index++;
+    if (index == whole || index >= value->length || value->bytes[index++] != '.') return 0;
+    int64_t fraction = index;
+    while (index < value->length && value->bytes[index] >= '0' &&
+           value->bytes[index] <= '9') index++;
+    if (index == fraction) return 0;
+    if (index < value->length &&
+            (value->bytes[index] == 'e' || value->bytes[index] == 'E')) {
+        index++;
+        if (index < value->length &&
+                (value->bytes[index] == '+' || value->bytes[index] == '-')) index++;
+        int64_t exponent = index;
+        while (index < value->length && value->bytes[index] >= '0' &&
+               value->bytes[index] <= '9') index++;
+        if (index == exponent) return 0;
+    }
+    if (index != value->length || (uint64_t)value->length >= SIZE_MAX) return 0;
+    char *text = malloc((size_t)value->length + 1);
+    if (text == NULL) { turkey_panic("out of memory"); return 0; }
+    memcpy(text, value->bytes, (size_t)value->length);
+    text[value->length] = '\0';
+    *result = strtod(text, NULL);
+    free(text);
+    return 1;
+}
+
+double turkey_float_parse(void *value) {
+    double result = 0.0;
+    if (!parse_float(value, &result)) turkey_panic("string is not a Float");
+    return result;
+}
+
+int32_t turkey_float_can_parse(void *value) {
+    double ignored;
+    return parse_float(value, &ignored);
+}
+
+
+
 /* --------------------------------------------------- what the host hands over
  *
  * The arguments going in and the exit status coming out. Everything else the
@@ -1207,7 +985,7 @@ static int64_t argument_count;
 void turkey_args_set(int64_t count, const unsigned char *const *bytes,
                      const int64_t *lengths) {
     /* Copied out of the host's memory and held outside the Turkey heap. A
-       `TurkeyString` per argument would have to stay reachable for the life
+       `String` per argument would have to stay reachable for the life
        of the program from a root the collector scans, and there is no such
        root; plain bytes need none, and `System.Env.args` builds the strings
        on demand. */

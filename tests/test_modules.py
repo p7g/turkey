@@ -484,10 +484,10 @@ def test_an_orphan_instance_is_rejected(tmp_path):
 
 
 def test_an_instance_for_a_built_in_type_over_a_library_class_is_an_orphan(tmp_path):
-    """`Neg` is the Prelude's and `String` is the language's, so this module
+    """`Neg` is the Prelude's and `Char` is the language's, so this module
     owns neither end of it."""
-    message = fails("instance Neg String { fun neg(s) = s }", [tmp_path])
-    assert message.startswith("orphan instance: 'Neg String'")
+    message = fails("instance Neg Char { fun neg(c) = c }", [tmp_path])
+    assert message.startswith("orphan instance: 'Neg Char'")
     assert "the language itself" in message
 
 

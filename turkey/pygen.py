@@ -22,7 +22,8 @@ from .core import (class_of_dict,
 from .decls import DeclTable
 from .types import TCon, spine
 from .values import (
-    UNIT, ArrayObj, Cell, ConValue, RecordObj, get_field, set_field, truth,
+    UNIT, ArrayObj, Cell, ConValue, RecordObj, get_field, make_string, set_field,
+    string_bytes, truth,
 )
 from .errors import Span, TurkeyPanic
 
@@ -308,6 +309,8 @@ class _Function:
               joins: dict[str, _Dest], block: int) -> str:
         assert self.can_value(e), type(e).__name__
         if isinstance(e, CLit):
+            if e.kind == "String":
+                return f"_make_string({e.value!r})"
             return repr(e.value)
         if isinstance(e, CUnit):
             return "_UNIT"
@@ -559,6 +562,8 @@ class _Function:
         if isinstance(pat, ast.PAnnot):
             return self.pattern(pat.pat, value, env)
         if isinstance(pat, ast.PLit):
+            if pat.kind == "String":
+                return f"(_string_bytes({value}) == {pat.value.encode('utf-8')!r})", []
             return f"({value} == {pat.value!r} and type({value}) is type({pat.value!r}))", []
         if isinstance(pat, ast.PTuple):
             conds = [f"isinstance({value}, tuple)", f"len({value}) == {len(pat.elems)}"]
@@ -779,6 +784,8 @@ def _runtime_namespace(decls: DeclTable | None = None) -> dict[str, object]:
                   in foreign.bindings(decls).items()}  # type: ignore[attr-defined]
     return {
         "_UNIT": UNIT,
+        "_make_string": make_string,
+        "_string_bytes": string_bytes,
         "_ArrayObj": ArrayObj,
         "_Cell": Cell,
         "_ConValue": ConValue,

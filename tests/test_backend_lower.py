@@ -7,7 +7,8 @@ def test_scalar_program_lowers_to_checked_cfg():
     checked = check("fun main() { print(1 + 2) }")
     text = format_module(lower(checked.opt, checked.decls, checked.main))
     assert "prim.intAdd" in text
-    assert "prim.intToString" in text
+    # Formatting the number is Turkey too (TIX-66): nothing reaches C for it.
+    assert "prim.intToString" not in text
     # `print` is library code over `write(2)` now (TIX-65), so the output
     # leaves through a foreign call rather than a primitive.
     assert "foreign.write" in text

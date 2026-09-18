@@ -32,6 +32,7 @@ from .builtins import PRIM_NAMES
 from .deps import pattern_vars
 from .errors import Span, TypeError_
 from .parser import BUILTIN_TYCONS, parse
+from .types import STRING
 
 # The library is ordinary Turkey source and sits beside the implementation
 # rather than inside it: it is what the language ships, not part of the
@@ -190,6 +191,10 @@ class ModuleLoader:
             scope.types["Prim.Ptr"] = "Prim.Ptr"
         # So are the built-in type constructors, which no module declares.
         scope.types.update({name: name for name in BUILTIN_TYCONS})
+        # `String` is declared in a library module but spelled everywhere, the
+        # way it was when it was primitive; a module that declares its own
+        # shadows it like any other name (TIX-66).
+        scope.types["String"] = STRING.name
 
         explicit_prelude = any(
             imp.name == PRELUDE for imp in module.program.imports

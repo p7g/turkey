@@ -1563,10 +1563,12 @@ other than the one it gives.
   (`_layout_metadata`, `SsaLower.metadata`). Three bits a slot is why
   `turkey_object_new` caps a constructor at 21 fields.
 * **What reads positions.** `field_index`/`fieldIndex`, `_record_layouts`, the
-  metadata bit positions, the 21-field cap, and two hard-coded shapes in the
-  runtime: `array_parts` reads `Data.Array#ArrayStorage` as slots 0 and 1, and a
-  closure is `[code, env]`. Nothing else -- the Python evaluator, `pygen`, the
-  local-record flattening and nullary sharing all go by name.
+  metadata bit positions, the 21-field cap, and one hard-coded shape in the
+  runtime: a closure is `[code, env]`. There were two until TIX-66 deleted
+  `array_parts`, which read `Data.Array#ArrayStorage` as slots 0 and 1, along
+  with the string functions that called it. Nothing else -- the Python
+  evaluator, `pygen`, the local-record flattening and nullary sharing all go by
+  name.
 
 ### Where the proposal was wrong
 
@@ -1627,7 +1629,9 @@ it.
   true after TIX-61, which decided to inherit the gap rather than widen
   `Arm64.Width` -- so raw memory cannot read a C `short` a field at a time
   either, and the two now want the same fix. TIX-74.
-* The runtime's hard-coded `ArrayStorage` slots and the closure shape.
+* The runtime's hard-coded closure shape, which stays with the allocators in
+  C until the collector moves (TIX-68). The `ArrayStorage` slots were the
+  other one, and are gone (TIX-66).
 * Measure first: what share of allocated bytes is `Bool`/`Byte`/`Char` payload
   on the boot workload. The proposal said this is not a performance argument,
   and it is not, but the cost of the change should be known before it is paid.

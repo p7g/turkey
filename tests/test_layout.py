@@ -43,8 +43,10 @@ def test_a_capped_generic_body_is_copied_once_per_layout(capped):
               if name.startswith("Data.Array#push@[")]
     # One per layout its call sites reach, and no more: `Int` is `i64`,
     # `Float` is `f64`, and `String` is a pointer like every other heap value.
+    # `i8` is `print`'s own, which copies a `String`'s bytes out through
+    # `String.toBytes` (TIX-66).
     assert sorted(copies) == ["Data.Array#push@[f64]", "Data.Array#push@[i64]",
-                              "Data.Array#push@[ptr]"]
+                              "Data.Array#push@[i8]", "Data.Array#push@[ptr]"]
 
 
 def test_a_copy_knows_the_layout_its_variable_stands_for(capped):

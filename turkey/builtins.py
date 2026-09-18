@@ -24,7 +24,6 @@ evaluator and the native backend can be held to the same statements.
 
 from __future__ import annotations
 
-import functools
 import math
 import struct
 
@@ -34,12 +33,12 @@ from .constraints import Binding, Env
 from .prelude import BOOL_FALSE, BOOL_TRUE
 from .types import (
     BOOL, BYTE, BYTE_MAX, BYTE_MIN, CHAR, FLOAT, INT, INT_MAX, INT_MIN,
-    RAW_PTR, STRING, UNIT, TFun, TVar, array_of, float_to_string, generalize,
+    RAW_PTR, STRING, UNIT, TFun, TVar, float_to_string, generalize,
     is_scalar_value, mono, raw_array_of,
 )
 from .values import (
-    RAW_HEAP, UNIT as UNIT_VALUE, ArrayObj, Builtin, ConValue, RecordObj,
-    from_bool, truth,
+    RAW_HEAP, UNIT as UNIT_VALUE, ArrayObj, Builtin,
+    from_bool, make_string, string_text, truth,
 )
 
 
@@ -59,7 +58,7 @@ def _set(arr, index, value):
 
 
 def _error(message):
-    raise TurkeyPanic(message)
+    raise TurkeyPanic(string_text(message))
 
 
 # ------------------------------------------------------------- the outside world
@@ -255,142 +254,6 @@ def _float_truncate(x: float) -> int:
     return math.trunc(x)
 
 
-# --------------------------------------------------------------------- string
-#
-# A `String` is an immutable, well-formed UTF-8 byte sequence (PRIMITIVES.md
-# 4). The evaluator still holds a Python `str`, which is isomorphic to exactly
-# that once surrogates are excluded -- and they are, by `Char` being a scalar
-# value and by the lexer rejecting surrogate escapes. What is *not* inherited
-# is the addressing: every primitive below is defined over the UTF-8 encoding,
-# so no operation can observe Python's code-point indexing.
-
-
-@functools.lru_cache(maxsize=4096)
-def _utf8(s: str) -> bytes:
-    """The encoding, memoized so that iterating a string stays linear."""
-    return s.encode("utf-8")
-
-
-def _string_byte_length(s: str) -> int:
-    return len(_utf8(s))
-
-
-def _string_byte_at(s: str, i: int) -> int:
-    data = _utf8(s)
-    if not 0 <= i < len(data):
-        raise TurkeyPanic(f"string byte index out of bounds: {i}, length {len(data)}")
-    return data[i]
-
-
-def _utf8_width(lead: int) -> int:
-    if lead < 0x80:
-        return 1
-    if lead >= 0xF0:
-        return 4
-    if lead >= 0xE0:
-        return 3
-    return 2
-
-
-def _string_decode_at(s: str, i: int) -> str:
-    """The scalar value beginning at byte offset `i`.
-
-    Offsets come only from `Prim.stringNextIndex` and from searches, so they
-    are always boundaries; landing mid-sequence is a library bug and panics
-    rather than producing a replacement character.
-    """
-    data = _utf8(s)
-    if not 0 <= i < len(data):
-        raise TurkeyPanic(f"string byte index out of bounds: {i}, length {len(data)}")
-    if 0x80 <= data[i] < 0xC0:  # a continuation byte is never a boundary
-        raise TurkeyPanic(f"byte offset {i} is not a character boundary")
-    return data[i : i + _utf8_width(data[i])].decode("utf-8")
-
-
-def _string_next_index(s: str, i: int) -> int:
-    data = _utf8(s)
-    if not 0 <= i < len(data):
-        raise TurkeyPanic(f"string byte index out of bounds: {i}, length {len(data)}")
-    return i + _utf8_width(data[i])
-
-
-def _string_slice(s: str, start: int, stop: int) -> str:
-    data = _utf8(s)
-    if not 0 <= start <= stop <= len(data):
-        raise TurkeyPanic(f"string slice {start}..{stop} is out of bounds")
-    try:
-        return data[start:stop].decode("utf-8")
-    except UnicodeDecodeError:
-        raise TurkeyPanic(
-            f"string slice {start}..{stop} does not fall on character boundaries"
-        ) from None
-
-
-def _string_find(haystack: str, needle: str, start: int) -> int:
-    """Byte offset of the first occurrence at or after `start`, or -1.
-
-    Searching bytes for bytes cannot land mid-sequence: UTF-8 is
-    self-synchronizing, so a well-formed needle only ever matches at a
-    boundary. That property is why the search API needs no index type
-    (PRIMITIVES.md 4.3).
-    """
-    return _utf8(haystack).find(_utf8(needle), start)
-
-
-def _string_rfind(haystack: str, needle: str) -> int:
-    return _utf8(haystack).rfind(_utf8(needle))
-
-
-def _array_of_values(values) -> ConValue:
-    """Wrap a Python list as a `Data.Array.Array`."""
-    arr = ArrayObj(len(values))
-    for index, value in enumerate(values):
-        arr.set(index, value)
-    storage = RecordObj(
-        "Data.Array#ArrayStorage", {"storage": arr, "length": len(values)})
-    return ConValue("Data.Array#Array", (storage,), None)
-
-
-def _string_to_bytes(s: str) -> ConValue:
-    return _array_of_values(list(_utf8(s)))
-
-
-def _array_values(xs: ConValue) -> list:
-    storage = xs.args[0]
-    data = storage.fields["storage"]
-    return [data.get(i) for i in range(storage.fields["length"])]
-
-
-def _string_concat_all(xs: ConValue) -> str:
-    """Join many strings in one pass.
-
-    Without this, building a string means `+` in a loop, which is quadratic
-    -- which is exactly what `Data.String.fromChars` and `join` used to be.
-    `Data.String.Builder` is this primitive plus an array (PRIMITIVES.md 4.2).
-    """
-    return "".join(_array_values(xs))
-
-
-def _array_bytes(xs: ConValue) -> bytes:
-    """Read a `Data.Array.Array Byte` back out as Python bytes."""
-    return bytes(_array_values(xs))
-
-
-def _string_is_valid_utf8(xs: ConValue) -> object:
-    try:
-        _array_bytes(xs).decode("utf-8")
-    except UnicodeDecodeError:
-        return from_bool(False)
-    return from_bool(True)
-
-
-def _string_from_bytes(xs: ConValue) -> str:
-    try:
-        return _array_bytes(xs).decode("utf-8")
-    except UnicodeDecodeError:
-        raise TurkeyPanic("bytes are not well-formed UTF-8") from None
-
-
 # ----------------------------------------------------------------------- char
 #
 # A `Char` is a Unicode *scalar value*: 0..10FFFF with the surrogate range
@@ -403,10 +266,6 @@ def _char_from_int(n):
     if not is_scalar_value(n):
         raise TurkeyPanic(f"{n} is not a Unicode scalar value")
     return chr(n)
-
-
-def _char_to_string(c):
-    return c
 
 
 def _num(name, ty, fn):
@@ -496,44 +355,10 @@ _PRIM: dict[str, tuple] = {
     "Prim.arrayLength": (_scheme(lambda a: TFun([raw_array_of(a)], INT)),
                          _bi("Prim.arrayLength", 1, lambda xs: xs.length)),
 
-    # -- strings, addressed by byte -------------------------------------------
-    #
-    # There is no `Prim.stringLength` and no `Prim.stringChars`. The first was
-    # Python's code-point count wearing a name that promised one answer to a
-    # three-answer question; the second materialized an `Array Char` per
-    # iteration site. Both are replaced by byte addressing plus a decode step,
-    # which is what a lazy code-point view is made of (PRIMITIVES.md 4.1, 4.2).
-    "Prim.stringConcat": (mono(TFun([STRING, STRING], STRING)),
-                          _bi("Prim.stringConcat", 2, lambda a, b: a + b)),
-    "Prim.stringConcatAll": _un(
-        "Prim.stringConcatAll", array_of(STRING), STRING, _string_concat_all),
-    "Prim.stringByteLength": _un(
-        "Prim.stringByteLength", STRING, INT, _string_byte_length),
-    "Prim.stringByteAt": _bin(
-        "Prim.stringByteAt", STRING, INT, BYTE, _string_byte_at),
-    "Prim.stringDecodeAt": _bin(
-        "Prim.stringDecodeAt", STRING, INT, CHAR, _string_decode_at),
-    "Prim.stringNextIndex": _bin(
-        "Prim.stringNextIndex", STRING, INT, INT, _string_next_index),
-    "Prim.stringSlice": (mono(TFun([STRING, INT, INT], STRING)),
-                         _bi("Prim.stringSlice", 3, _string_slice)),
-    "Prim.stringFind": (mono(TFun([STRING, STRING, INT], INT)),
-                        _bi("Prim.stringFind", 3, _string_find)),
-    "Prim.stringRfind": _bin(
-        "Prim.stringRfind", STRING, STRING, INT, _string_rfind),
-    "Prim.stringToBytes": _un(
-        "Prim.stringToBytes", STRING, array_of(BYTE), _string_to_bytes),
-    "Prim.stringFromBytes": _un(
-        "Prim.stringFromBytes", array_of(BYTE), STRING, _string_from_bytes),
-    "Prim.stringIsValidUtf8": (mono(TFun([array_of(BYTE)], BOOL)),
-                               _bi("Prim.stringIsValidUtf8", 1,
-                                   _string_is_valid_utf8)),
-
     # -- chars ----------------------------------------------------------------
     "Prim.charFromInt": _un("Prim.charFromInt", INT, CHAR, _char_from_int),
     "Prim.charIsScalar": _pred("Prim.charIsScalar", INT, is_scalar_value),
     "Prim.charToInt": _un("Prim.charToInt", CHAR, INT, ord),
-    "Prim.charToString": _un("Prim.charToString", CHAR, STRING, _char_to_string),
 
     # -- bytes ----------------------------------------------------------------
     #
@@ -546,14 +371,18 @@ _PRIM: dict[str, tuple] = {
     "Prim.byteLt": _cmp("Prim.byteLt", BYTE, lambda a, b: a < b),
 
     # -- conversions ----------------------------------------------------------
-    "Prim.intToString": _un("Prim.intToString", INT, STRING, str),
     # Exact only to 2^53; past that it rounds to nearest, ties to even, which
     # is what Python's `float(int)` already does (PRIMITIVES.md 3.4).
     "Prim.intToFloat": _un("Prim.intToFloat", INT, FLOAT, float),
+    # Host-side until TIX-75 writes them in Turkey: the one place left where
+    # a `String` crosses into Python and back.
     "Prim.floatToString": _un(
-        "Prim.floatToString", FLOAT, STRING, float_to_string),
-    "Prim.floatParse": _un("Prim.floatParse", STRING, FLOAT, _float_parse),
-    "Prim.floatCanParse": _pred("Prim.floatCanParse", STRING, _float_can_parse),
+        "Prim.floatToString", FLOAT, STRING,
+        lambda x: make_string(float_to_string(x))),
+    "Prim.floatParse": _un(
+        "Prim.floatParse", STRING, FLOAT, lambda s: _float_parse(string_text(s))),
+    "Prim.floatCanParse": _pred(
+        "Prim.floatCanParse", STRING, lambda s: _float_can_parse(string_text(s))),
     "Prim.floatTruncate": _un(
         "Prim.floatTruncate", FLOAT, INT, _float_truncate),
     "Prim.floatFitsInt": _pred("Prim.floatFitsInt", FLOAT, _float_fits_int),
@@ -622,12 +451,6 @@ _PRIM: dict[str, tuple] = {
     "Prim.floatGt": _cmp("Prim.floatGt", FLOAT, lambda a, b: a > b),
     "Prim.floatGte": _cmp("Prim.floatGte", FLOAT, lambda a, b: a >= b),
 
-    "Prim.stringEq": _cmp("Prim.stringEq", STRING, lambda a, b: a == b),
-    # Byte-lexicographic. For well-formed UTF-8 that is exactly
-    # code-point-lexicographic, which is why comparing Python strings agrees
-    # (PRIMITIVES.md 4.4).
-    "Prim.stringLt": _cmp(
-        "Prim.stringLt", STRING, lambda a, b: _utf8(a) < _utf8(b)),
     "Prim.charEq": _cmp("Prim.charEq", CHAR, lambda a, b: a == b),
     "Prim.charLt": _cmp("Prim.charLt", CHAR, lambda a, b: a < b),
     "Prim.boolEq": _cmp("Prim.boolEq", BOOL, lambda a, b: a.con == b.con),

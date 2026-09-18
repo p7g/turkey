@@ -37,6 +37,26 @@ out of the port: a C `int` result is only half defined in an `Int`
 (FINDINGS 102), `canRead` was a race and is gone (103), and arguments were the
 one door into `String` that skipped the UTF-8 check (104).
 
+**Staging step 2 is done (TIX-66), smaller than planned and cheaper than
+feared.** The section was mostly strings, and rather than give Turkey the
+intrinsics to reach inside a `TurkeyString`, `String` stopped being primitive:
+it is `type String = String(Prim.Array Byte)` in `lib/Data/String/Type.gob`,
+erased by both backends, and every string operation is Turkey in `Data.String`,
+`Data.Int` and `Data.Char` -- run by the Python oracle rather than written a
+second time in it (FINDINGS 106). The reasoning and the survey are "Step 2"
+below. Sixteen string primitives are gone from both compilers with their C
+bodies, six libm wrappers became `foreign` declarations, a string literal pattern
+compares inline, and `array_parts` went with its callers, so C no longer reads
+`Data.Array`'s record. Two things stayed and were reclassified: the allocators,
+which fill headers over `heap_allocate` and so are the collector's interface
+(step 4, TIX-68), and float formatting and parsing (TIX-75).
+`runtime/turkey_runtime.c` went from 1451 lines to 1223. Measured cost, not
+optimized: `boot` compiling itself went from 165s to 204s, the byte loops now
+being Turkey where they were C; the Python oracle, running every corpus
+program with `--backend python`, went from 62s to 82s of CPU over the same 91
+programs, because a string operation there is interpreted Turkey over a list of
+ints where it was a Python `str` method.
+
 It is smaller than the thirty-five below suggest. Under "depend on libc as
 little as possible" only about ten of them are an FFI problem at all, five are
 instruction selection (`frintm`/`frintp`/`frintn`/`frintz`), and the rest are
@@ -62,7 +82,7 @@ Measured, by section:
 
 | Section | Lines | What it needs beyond ordinary Turkey |
 |---|---:|---|
-| Values: strings, objects, arrays, boxes, closures | 546 | Raw loads and stores at an address |
+| Values: strings, objects, arrays, boxes, closures | 546 | Nothing, once `String` is a library type -- **done**, bar the allocators and float text |
 | GC: heap list, mark, sweep, root frames | 310 | Raw memory, **and must not allocate** |
 | The outside world: args, files, print, exit | 205 | Nothing but FFI -- **done**, bar the host's handoff state |
 | Entry and the big-stack thread | 106 | FFI, and a Turkey function as a C callback |
@@ -314,7 +334,9 @@ at any point with the rest still in C.
    the C. *Done (TIX-65); the argument and exit state stayed, as step 3's.*
 2. **Values, 546 lines.** Needs raw loads and stores but allocates normally, so
    it is ordinary managed Turkey with a pointer type. The largest section and
-   the second easiest.
+   the second easiest. *Done (TIX-66), and it needed no raw memory at all:
+   `String` became a library type over a byte array. The allocators and the
+   float text stayed, as step 4's and TIX-75's.*
 3. **Entry and crash diagnostics, 160 lines.** Needs callbacks.
 4. **The collector, 310 lines.** Needs the low-level subset and its
    enforcement. Last, and the only one that requires (3).

@@ -159,6 +159,49 @@ def from_bool(b: bool) -> ConValue:
     return TRUE if b else FALSE
 
 
+# `String` is a declared type too since TIX-66 -- `type String =
+# String(Prim.Array Byte)` in `lib/Data/String/Type.gob` -- so a string here is
+# what the library's own code builds and takes apart: the newtype's
+# constructor around an array of byte-valued ints. Newtypes are erased by the
+# backends and not by this host, which is why the wrapper is here at all.
+#
+# These are the seams where a Python `str` still has to cross: a literal, a
+# panic's message, and the float formatting and parsing that stays host-side
+# until TIX-75. Everything else about strings is Turkey, run here the same way
+# it is compiled there.
+STRING_CON = "Data.String.Type#String"
+
+
+def string_of_bytes(data: bytes) -> ConValue:
+    array = ArrayObj(len(data))
+    array.slots = list(data)
+    return ConValue(STRING_CON, (array,))
+
+
+_LITERALS: dict[str, ConValue] = {}
+
+
+def make_string(text: str) -> ConValue:
+    """A `String` holding `text`'s UTF-8.
+
+    Memoized, and so shared: a literal is one value however often it is
+    evaluated, as it is natively, where the entry interns each one once. That
+    is safe only because nothing writes a `String`'s bytes after it is made.
+    """
+    value = _LITERALS.get(text)
+    if value is None:
+        value = _LITERALS[text] = string_of_bytes(text.encode("utf-8"))
+    return value
+
+
+def string_bytes(value: ConValue) -> bytes:
+    return bytes(value.args[0].slots)
+
+
+def string_text(value: ConValue) -> str:
+    return string_bytes(value).decode("utf-8")
+
+
 def truth(value) -> bool:
     """Read a turkey `Bool` back as a Python one, for `if` and friends."""
     return value.con == TRUE.con

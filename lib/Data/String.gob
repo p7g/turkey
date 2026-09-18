@@ -45,9 +45,13 @@ import Data.Array (Array)
 import Data.Array as Array
 import Data.Bool.Type (Bool(..))
 import Data.Byte ()
+import Data.Byte as Byte
 import Data.Char as Char
 import Data.Int ()
+import Data.Int as Int
 import Data.Option.Type (Option(..))
+import Data.String.Type (String(..))
+import Data.String.Type as Type
 import Data.Tuple ()
 
 -- A `String` is an immutable sequence of bytes that is guaranteed to be
@@ -64,7 +68,7 @@ import Data.Tuple ()
 -- there is no way to construct a slice that cuts a character in half.
 
 -- O(1). The only cheap count a string has.
-fun byteLength(s : String) -> Int = Prim.stringByteLength(s)
+fun byteLength(s : String) -> Int = Type.byteLength(s)
 
 fun isEmpty(s : String) -> Bool = byteLength(s) == 0
 
@@ -98,8 +102,8 @@ instance Iterator Bytes {
     type Cursor = ByteCursor
     fun iter(b) = ByteCursor { at = 0 }
     fun next(b, cur) {
-        if cur.at >= Prim.stringByteLength(b.source) { return None }
-        let x = Prim.stringByteAt(b.source, cur.at)
+        if cur.at >= byteLength(b.source) { return None }
+        let x = byteAt(b.source, cur.at)
         cur.at = cur.at + 1
         Some(x)
     }
@@ -110,9 +114,9 @@ instance Iterator CodePoints {
     type Cursor = ByteCursor
     fun iter(cp) = ByteCursor { at = 0 }
     fun next(cp, cur) {
-        if cur.at >= Prim.stringByteLength(cp.source) { return None }
-        let c = Prim.stringDecodeAt(cp.source, cur.at)
-        cur.at = Prim.stringNextIndex(cp.source, cur.at)
+        if cur.at >= byteLength(cp.source) { return None }
+        let c = decodeAt(cp.source, cur.at)
+        cur.at = nextIndex(cp.source, cur.at)
         Some(c)
     }
 }
@@ -144,30 +148,30 @@ type Index = Index(Int)
 
 fun start(s : String) -> Index = Index(0)
 
-fun end(s : String) -> Index = Index(Prim.stringByteLength(s))
+fun end(s : String) -> Index = Index(byteLength(s))
 
-fun atEnd(s : String, Index(at)) -> Bool = at >= Prim.stringByteLength(s)
+fun atEnd(s : String, Index(at)) -> Bool = at >= byteLength(s)
 
 -- Decode one scalar value and answer where the next one begins. This is the
 -- whole of forward motion: `None` at the end, and otherwise a character and
 -- an index strictly greater than the one handed in, so a loop written on it
 -- terminates.
 fun step(s : String, Index(at)) -> Option (Char, Index) {
-    if at >= Prim.stringByteLength(s) { return None }
-    Some((Prim.stringDecodeAt(s, at), Index(Prim.stringNextIndex(s, at))))
+    if at >= byteLength(s) { return None }
+    Some((decodeAt(s, at), Index(nextIndex(s, at))))
 }
 
 -- The character at an index, without moving. What a lexer's `peek` is.
 fun decode(s : String, Index(at)) -> Option Char {
-    if at >= Prim.stringByteLength(s) { return None }
-    Some(Prim.stringDecodeAt(s, at))
+    if at >= byteLength(s) { return None }
+    Some(decodeAt(s, at))
 }
 
 fun slice(s : String, Index(from), Index(to)) -> String =
-    Prim.stringSlice(s, from, to)
+    sliceBytes(s, from, to)
 
 fun find(s : String, needle : String, Index(from)) -> Option Index {
-    let found = Prim.stringFind(s, needle, from)
+    let found = byteFind(s, needle, from)
     if found < 0 { None } else { Some(Index(found)) }
 }
 
@@ -181,10 +185,64 @@ instance Ord Index { fun lt(Index(a), Index(b)) = a < b }
 -- The only door in and out, and the entire reason `Byte` exists. Going out is
 -- total; coming in is checked, because arbitrary bytes are not a string.
 
-fun toBytes(s : String) -> Array Byte = Prim.stringToBytes(s)
+-- Both copy. A `String` is never written after it is made and an `Array` can
+-- be, so the two must not share storage in either direction.
+fun toBytes(s : String) -> Array Byte {
+    let n = byteLength(s)
+    let out = Array.new(n)
+    for var i = 0; i < n; i = i + 1 { Array.push(out, byteAt(s, i)) }
+    out
+}
 
-fun fromBytes(bs : Array Byte) -> Option String =
-    if Prim.stringIsValidUtf8(bs) { Some(Prim.stringFromBytes(bs)) } else { None }
+fun fromBytes(bs : Array Byte) -> Option String {
+    let n = len(bs)
+    let raw = Prim.arrayNewUninit(n)
+    for var i = 0; i < n; i = i + 1 { Prim.arraySet(raw, i, bs[i]) }
+    if wellFormed(raw) { Some(String(raw)) } else { None }
+}
+
+-- Whether `bytes` is well-formed UTF-8: the shortest encoding of a scalar
+-- value, each time, to the end. Overlong forms, surrogates, code points past
+-- 10FFFF and truncated sequences all fail. The one validator every door into
+-- `String` goes through -- `fromBytes`, and through it the arguments, the
+-- environment and every file read.
+fun wellFormed(bytes : Prim.Array Byte) -> Bool {
+    let n = Prim.arrayLength(bytes)
+    var i = 0
+    while i < n {
+        let lead = Byte.toInt(Prim.arrayGet(bytes, i))
+        var width = 0
+        var scalar = 0
+        if lead < 128 {
+            width = 1
+            scalar = lead
+        } else if lead >= 194 && lead <= 223 {
+            width = 2
+            scalar = Int.and(lead, 31)
+        } else if lead >= 224 && lead <= 239 {
+            width = 3
+            scalar = Int.and(lead, 15)
+        } else if lead >= 240 && lead <= 244 {
+            width = 4
+            scalar = Int.and(lead, 7)
+        } else {
+            return False
+        }
+        if i > n - width { return False }
+        for var k = 1; k < width; k = k + 1 {
+            let b = Byte.toInt(Prim.arrayGet(bytes, i + k))
+            if Int.and(b, 192) != 128 { return False }
+            scalar = Int.or(Int.shl(scalar, 6), Int.and(b, 63))
+        }
+        if width == 2 && scalar < 128 { return False }
+        if width == 3 && scalar < 2048 { return False }
+        if width == 4 && scalar < 65536 { return False }
+        if scalar >= 55296 && scalar <= 57343 { return False }
+        if scalar > 1114111 { return False }
+        i = i + width
+    }
+    True
+}
 
 -- -- building ----------------------------------------------------------------
 --
@@ -197,7 +255,22 @@ fun builder() -> Builder = Builder { parts = Array.new(8) }
 
 fun push(b : Builder, part : String) -> Unit = Array.push(b.parts, part)
 
-fun build(b : Builder) -> String = Prim.stringConcatAll(b.parts)
+-- One allocation, however many parts: the lengths first, then the copy.
+fun build(b : Builder) -> String {
+    var total = 0
+    for part in b.parts { total = total + byteLength(part) }
+    let out = Prim.arrayNewUninit(total)
+    var at = 0
+    for part in b.parts {
+        let from = Type.bytesOf(part)
+        let n = Prim.arrayLength(from)
+        for var i = 0; i < n; i = i + 1 {
+            Prim.arraySet(out, at + i, Prim.arrayGet(from, i))
+        }
+        at = at + n
+    }
+    String(out)
+}
 
 fun fromCodePoints(cs : Array Char) -> String {
     let b = builder()
@@ -224,9 +297,8 @@ fun repeat(s : String, times : Int) -> String {
 
 -- -- searching and cutting ----------------------------------------------------
 --
--- Search-shaped, with no index type. `Prim.stringFind` answers in byte
--- offsets and `Prim.stringSlice` consumes them, but neither escapes this
--- module: an offset a program could compute is the one decision that cannot
+-- Search-shaped, with no index type. `byteFind` answers in byte offsets and
+-- `sliceBytes` consumes them, but neither escapes this module: an offset a program could compute is the one decision that cannot
 -- be taken back, because `slice` would then have to either validate or admit
 -- ill-formed strings. An opaque `String.Index` can be added when something
 -- genuinely needs it (PRIMITIVES.md 4.3).
@@ -236,29 +308,29 @@ fun repeat(s : String, times : Int) -> String {
 
 -- Both ask the byte search, rather than slicing off a prefix of the right
 -- length and comparing. Slicing would be wrong: `startsWith("é", "a")` would
--- cut the two-byte `é` in half, and `Prim.stringSlice` panics on a
--- non-boundary offset rather than inventing a replacement character. The
+-- cut the two-byte `é` in half, and `sliceBytes` panics on a non-boundary
+-- offset rather than inventing a replacement character. The
 -- search cannot make that mistake, because a well-formed needle only ever
 -- matches at a boundary.
 fun startsWith(s : String, prefix : String) -> Bool =
-    Prim.stringFind(s, prefix, 0) == 0
+    byteFind(s, prefix, 0) == 0
 
 fun endsWith(s : String, suffix : String) -> Bool =
-    Prim.stringRfind(s, suffix) == byteLength(s) - byteLength(suffix)
+    byteRfind(s, suffix) == byteLength(s) - byteLength(suffix)
 
 fun contains(s : String, needle : String) -> Bool =
-    Prim.stringFind(s, needle, 0) >= 0
+    byteFind(s, needle, 0) >= 0
 
 fun stripPrefix(s : String, prefix : String) -> Option String =
     if startsWith(s, prefix) {
-        Some(Prim.stringSlice(s, byteLength(prefix), byteLength(s)))
+        Some(sliceBytes(s, byteLength(prefix), byteLength(s)))
     } else {
         None
     }
 
 fun stripSuffix(s : String, suffix : String) -> Option String =
     if endsWith(s, suffix) {
-        Some(Prim.stringSlice(s, 0, byteLength(s) - byteLength(suffix)))
+        Some(sliceBytes(s, 0, byteLength(s) - byteLength(suffix)))
     } else {
         None
     }
@@ -274,36 +346,35 @@ fun split(s : String, separator : String) -> Array String {
     let width = byteLength(separator)
     var start = 0
     loop {
-        let at = Prim.stringFind(s, separator, start)
+        let at = byteFind(s, separator, start)
         if at < 0 { break }
-        Array.push(out, Prim.stringSlice(s, start, at))
+        Array.push(out, sliceBytes(s, start, at))
         start = at + width
     }
-    Array.push(out, Prim.stringSlice(s, start, byteLength(s)))
+    Array.push(out, sliceBytes(s, start, byteLength(s)))
     out
 }
 
 fun splitOnce(s : String, separator : String) -> Option (String, String) {
     if isEmpty(separator) { return None }
-    let at = Prim.stringFind(s, separator, 0)
+    let at = byteFind(s, separator, 0)
     if at < 0 { return None }
     Some((
-        Prim.stringSlice(s, 0, at),
-        Prim.stringSlice(s, at + byteLength(separator), byteLength(s)),
+        sliceBytes(s, 0, at),
+        sliceBytes(s, at + byteLength(separator), byteLength(s)),
     ))
 }
 
 -- The same, splitting at the *last* occurrence. `"M#C.eq"` split on `"#"` is
 -- how an internal name is taken apart, and the qualification is the part after
--- the last separator whatever the name before it contains. The primitive was
--- already there for this; only the wrapper was missing.
+-- the last separator whatever the name before it contains.
 fun rsplitOnce(s : String, separator : String) -> Option (String, String) {
     if isEmpty(separator) { return None }
-    let at = Prim.stringRfind(s, separator)
+    let at = byteRfind(s, separator)
     if at < 0 { return None }
     Some((
-        Prim.stringSlice(s, 0, at),
-        Prim.stringSlice(s, at + byteLength(separator), byteLength(s)),
+        sliceBytes(s, 0, at),
+        sliceBytes(s, at + byteLength(separator), byteLength(s)),
     ))
 }
 
@@ -331,13 +402,13 @@ fun lines(s : String) -> Array String {
     let n = byteLength(s)
     var start = 0
     while start < n {
-        var stop = Prim.stringFind(s, "\n", start)
+        var stop = byteFind(s, "\n", start)
         if stop < 0 { stop = n }
         var cut = stop
         if cut > start {
-            if Prim.stringByteAt(s, cut - 1) == carriageReturn() { cut = cut - 1 }
+            if byteAt(s, cut - 1) == carriageReturn() { cut = cut - 1 }
         }
-        Array.push(out, Prim.stringSlice(s, start, cut))
+        Array.push(out, sliceBytes(s, start, cut))
         start = stop + 1
     }
     out
@@ -355,16 +426,16 @@ fun words(s : String) -> Array String {
     var i = 0
     while i < n {
         while i < n {
-            if !Char.isSpace(Prim.stringDecodeAt(s, i)) { break }
-            i = Prim.stringNextIndex(s, i)
+            if !Char.isSpace(decodeAt(s, i)) { break }
+            i = nextIndex(s, i)
         }
         if i >= n { break }
         let start = i
         while i < n {
-            if Char.isSpace(Prim.stringDecodeAt(s, i)) { break }
-            i = Prim.stringNextIndex(s, i)
+            if Char.isSpace(decodeAt(s, i)) { break }
+            i = nextIndex(s, i)
         }
-        Array.push(out, Prim.stringSlice(s, start, i))
+        Array.push(out, sliceBytes(s, start, i))
     }
     out
 }
@@ -373,10 +444,10 @@ fun trimStart(s : String) -> String {
     let n = byteLength(s)
     var i = 0
     while i < n {
-        if !Char.isSpace(Prim.stringDecodeAt(s, i)) { break }
-        i = Prim.stringNextIndex(s, i)
+        if !Char.isSpace(decodeAt(s, i)) { break }
+        i = nextIndex(s, i)
     }
-    Prim.stringSlice(s, i, n)
+    sliceBytes(s, i, n)
 }
 
 fun trimEnd(s : String) -> String {
@@ -384,11 +455,11 @@ fun trimEnd(s : String) -> String {
     var i = 0
     var end = 0
     while i < n {
-        let next = Prim.stringNextIndex(s, i)
-        if !Char.isSpace(Prim.stringDecodeAt(s, i)) { end = next }
+        let next = nextIndex(s, i)
+        if !Char.isSpace(decodeAt(s, i)) { end = next }
         i = next
     }
-    Prim.stringSlice(s, 0, end)
+    sliceBytes(s, 0, end)
 }
 
 fun trim(s : String) -> String = trimEnd(trimStart(s))
@@ -405,9 +476,31 @@ fun trim(s : String) -> String = trimEnd(trimStart(s))
 -- coincides with code-point-lexicographic -- and which is not a collation:
 -- it sorts `Z` before `a` and has no opinion about locale (PRIMITIVES.md 4.4).
 
-instance Eq String { fun eq(x, y) = Prim.stringEq(x, y) }
-instance Ord String { fun lt(x, y) = Prim.stringLt(x, y) }
-instance Add String { fun add(x, y) = Prim.stringConcat(x, y) }
+instance Eq String {
+    fun eq(x, y) {
+        let n = byteLength(x)
+        if n != byteLength(y) { return False }
+        for var i = 0; i < n; i = i + 1 {
+            if byteAt(x, i) != byteAt(y, i) { return False }
+        }
+        True
+    }
+}
+
+instance Ord String {
+    fun lt(x, y) {
+        let n = byteLength(x)
+        let m = byteLength(y)
+        for var i = 0; i < n && i < m; i = i + 1 {
+            let a = byteAt(x, i)
+            let b = byteAt(y, i)
+            if a != b { return a < b }
+        }
+        n < m
+    }
+}
+
+instance Add String { fun add(x, y) = Type.concat(x, y) }
 instance Show String { fun show(x) = x }
 instance Semigroup String { fun combine(x, y) = add(x, y) }
 instance Monoid String { fun empty() = "" }
@@ -422,7 +515,115 @@ instance Hash String {
         -- `Array Char` on every hash.
         let n = byteLength(s)
         for var i = 0; i < n; i = i + 1 {
-            update(d, Prim.byteToInt(Prim.stringByteAt(s, i)))
+            update(d, Byte.toInt(byteAt(s, i)))
         }
     }
+}
+
+-- -- the bytes, privately ------------------------------------------------------
+--
+-- Byte offsets never leave this module, and these are what every operation
+-- above is written on. They were C until TIX-66, behind a `Prim.` name each;
+-- the panics say what the C said.
+
+-- The byte at an offset the caller has already checked.
+fun byteAt(s : String, i : Int) -> Byte = Prim.arrayGet(Type.bytesOf(s), i)
+
+fun checkIndex(s : String, i : Int) -> Unit {
+    if i < 0 || i >= byteLength(s) {
+        error("string byte index out of bounds: " + Int.toString(i)
+              + ", length " + Int.toString(byteLength(s)))
+    }
+}
+
+fun isContinuation(b : Byte) -> Bool = Int.and(Byte.toInt(b), 192) == 128
+
+fun checkBoundary(s : String, i : Int) -> Unit {
+    if isContinuation(byteAt(s, i)) {
+        error("byte offset " + Int.toString(i) + " is not a character boundary")
+    }
+}
+
+-- How many bytes long the sequence a lead byte begins is.
+fun sequenceWidth(lead : Byte) -> Int {
+    let b = Byte.toInt(lead)
+    if b < 128 { 1 } else if b >= 240 { 4 } else if b >= 224 { 3 } else { 2 }
+}
+
+-- The scalar value beginning at a boundary.
+fun decodeAt(s : String, i : Int) -> Char {
+    checkIndex(s, i)
+    checkBoundary(s, i)
+    let lead = Byte.toInt(byteAt(s, i))
+    let w = sequenceWidth(byteAt(s, i))
+    var scalar = if w == 1 { lead } else { Int.and(lead, Int.shr(127, w)) }
+    for var k = 1; k < w; k = k + 1 {
+        let b = Byte.toInt(byteAt(s, i + k))
+        scalar = Int.or(Int.shl(scalar, 6), Int.and(b, 63))
+    }
+    Prim.charFromInt(scalar)
+}
+
+-- Where the scalar value after the one at `i` begins.
+fun nextIndex(s : String, i : Int) -> Int {
+    checkIndex(s, i)
+    checkBoundary(s, i)
+    i + sequenceWidth(byteAt(s, i))
+}
+
+fun isBoundary(s : String, i : Int) -> Bool {
+    let n = byteLength(s)
+    if i == 0 || i == n { return True }
+    i > 0 && i < n && !isContinuation(byteAt(s, i))
+}
+
+-- The bytes from `start` to `stop`, which must both be boundaries: a cut
+-- anywhere else would make a string that is not UTF-8.
+fun sliceBytes(s : String, start : Int, stop : Int) -> String {
+    let span = Int.toString(start) + ".." + Int.toString(stop)
+    if start < 0 || start > stop || stop > byteLength(s) {
+        error("string slice " + span + " is out of bounds")
+    }
+    if !isBoundary(s, start) || !isBoundary(s, stop) {
+        error("string slice " + span + " does not fall on character boundaries")
+    }
+    let from = Type.bytesOf(s)
+    let out = Prim.arrayNewUninit(stop - start)
+    for var i = start; i < stop; i = i + 1 {
+        Prim.arraySet(out, i - start, Prim.arrayGet(from, i))
+    }
+    String(out)
+}
+
+-- Whether `needle` occurs in `haystack` at byte offset `at`.
+fun matchesAt(haystack : String, needle : String, at : Int) -> Bool {
+    let m = byteLength(needle)
+    for var k = 0; k < m; k = k + 1 {
+        if byteAt(haystack, at + k) != byteAt(needle, k) { return False }
+    }
+    True
+}
+
+-- The first offset at or after `start` where `needle` occurs, or -1. An empty
+-- needle occurs everywhere, the end included.
+fun byteFind(haystack : String, needle : String, start : Int) -> Int {
+    let n = byteLength(haystack)
+    let m = byteLength(needle)
+    let from = if start < 0 { 0 } else { start }
+    if m == 0 { return if from > n { -1 } else { from } }
+    for var at = from; at <= n - m; at = at + 1 {
+        if matchesAt(haystack, needle, at) { return at }
+    }
+    -1
+}
+
+-- The last offset where `needle` occurs, or -1.
+fun byteRfind(haystack : String, needle : String) -> Int {
+    let n = byteLength(haystack)
+    let m = byteLength(needle)
+    if m == 0 { return n }
+    for var at = n - m; at >= 0; at = at - 1 {
+        if matchesAt(haystack, needle, at) { return at }
+    }
+    -1
 }

@@ -39,14 +39,10 @@ ALLOWED_RUNTIME_CALLS = {
     "turkey_object_new", "turkey_array_new", "turkey_cell_new",
     "turkey_closure_new",
     "turkey_box", "turkey_unbox",
-    "turkey_string_new", "turkey_string_concat", "turkey_string_concat_all",
-    "turkey_string_eq", "turkey_string_lt", "turkey_string_byte_length",
-    "turkey_string_byte_at", "turkey_string_decode_at",
-    "turkey_string_next_index", "turkey_string_slice", "turkey_string_find",
-    "turkey_string_rfind", "turkey_string_to_byte_storage",
-    "turkey_string_from_bytes", "turkey_string_is_valid_utf8",
-    "turkey_int_to_string", "turkey_float_to_string", "turkey_char_to_string",
-    "turkey_float_parse", "turkey_float_can_parse",
+    # A literal's interning, and the float text TIX-75 owes. Every other
+    # string operation is Turkey since TIX-66.
+    "turkey_string_new",
+    "turkey_float_to_string", "turkey_float_parse", "turkey_float_can_parse",
     # What the host hands over: `exit`, whose state the host reads after the
     # program returns, and the arguments it wrote before, read back through
     # `Unsafe.Runtime`. The streams and the file doors were here until TIX-65
@@ -75,7 +71,8 @@ def test_generated_llvm_is_verified_and_contains_native_arithmetic():
     checked = check("fun main() { print(1 + 2) }")
     text = generate(checked.opt, checked.decls, checked.main)
     assert "llvm.sadd.with.overflow.i64" in text
-    assert "turkey_int_to_string" in text
+    # Decimal formatting is Turkey (TIX-66), so no runtime entry is named.
+    assert "turkey_int_to_string" not in text
 
 
 def test_shadow_roots_use_stack_storage_and_direct_stores():

@@ -765,6 +765,7 @@ fun pattern(l : Lower, p : Pat, v : Value, ty : Ty.Type,
             Map.put(l.env, name, v)
             L.terminate(l.b, Jump(success, []))
         }
+        PLit(LString(text)) -> stringTest(l, text, v, success, failure)
         PLit(lit) -> {
             let test = literalTest(l, lit, v)
             L.terminate(l.b, Branch(test, success, failure))
@@ -981,22 +982,36 @@ fun destructure(l : Lower, object : Value, pieces : Array (Int, Pat, Ty.Type),
     }
 }
 
--- A literal pattern's test. A string is a runtime call and everything else is
--- a machine comparison; a float comparison is the same constructor with `f64`
--- operands, which is what instruction selection reads it off.
+-- A literal pattern's test: a machine comparison, and a float comparison is
+-- the same constructor with `f64` operands, which is what instruction
+-- selection reads it off. A string has `stringTest` instead.
 fun literalTest(l : Lower, lit : Lit, v : Value) -> Value {
-    let rep = Ssa.repOf(l.func, v)
-    match lit {
-        LString(text) -> {
-            let want = L.emit(l.b, ConstString(text), Ssa.traced(Ptr))
-            L.emit(l.b, Call(Runtime("Prim.stringEq"), [v, want]),
-                   Ssa.untraced(I1))
-        }
-        _ -> {
-            let want = literal(l, lit, rep)
-            L.emit(l.b, Cmp(Eq, v, want), Ssa.untraced(I1))
-        }
+    let want = literal(l, lit, Ssa.repOf(l.func, v))
+    L.emit(l.b, Cmp(Eq, v, want), Ssa.untraced(I1))
+}
+
+-- A string literal pattern, compared inline (TIX-66). A `String` is its byte
+-- array, so this is a length test and then one byte test per byte of the
+-- literal -- what a C compiler makes of a `memcmp` against a short constant,
+-- and the literals in patterns are keywords. No call and no safepoint.
+-- `turkey/backend_lower.py`'s `lower_string_literal` builds the same chain.
+fun stringTest(l : Lower, text : String, v : Value, success : BlockId,
+               failure : BlockId) -> Unit {
+    let bytes = String.toBytes(text)
+    let length = L.emit(l.b, ArrayLength(v), Ssa.untraced(I64))
+    let want = L.emit(l.b, ConstInt(len(bytes)), Ssa.untraced(I64))
+    var same = L.emit(l.b, Cmp(Eq, length, want), Ssa.untraced(I1))
+    for var i = 0; i < len(bytes); i = i + 1 {
+        let next = L.block(l.b)
+        L.terminate(l.b, Branch(same, next, failure))
+        L.into(l.b, next)
+        let index = L.emit(l.b, ConstInt(i), Ssa.untraced(I64))
+        let got = L.emit(l.b, ArrayGet(v, index), Ssa.untraced(I8))
+        let byte = scalar(l, ConstInt(Byte.toInt(bytes[i])), Ssa.untraced(I64),
+                          Ssa.untraced(I8))
+        same = L.emit(l.b, Cmp(Eq, got, byte), Ssa.untraced(I1))
     }
+    L.terminate(l.b, Branch(same, success, failure))
 }
 
 fun finish(l : Lower, v : Value, dest : Dest) -> Unit = match dest {
@@ -1853,16 +1868,6 @@ fun primitive(l : Lower, e : Core, name : String, args : Array Value,
         L.into(l.b, L.block(l.b))
         return zero(l, rep)
     }
-    if name == "Prim.stringToBytes" && len(args) == 1 {
-        -- The length is the *string's* byte length rather than the storage's
-        -- element count. They agree here, and asking the string is what the
-        -- Python backend does; the storage's own count is the allocation's.
-        let raw = L.emit(l.b, Call(Runtime("Prim.stringToByteStorage"), args),
-                         Ssa.traced(Ptr))
-        let length = L.emit(l.b, Call(Runtime("Prim.stringByteLength"), args),
-                            Ssa.untraced(I64))
-        return wrapArray(l, raw, length)
-    }
     match binOp(name) {
         Some(o) -> if len(args) == 2 {
             return L.emit(l.b, Bin(o, args[0], args[1]), rep)
@@ -1894,44 +1899,6 @@ fun primitive(l : Lower, e : Core, name : String, args : Array Value,
         return L.emit(l.b, Not(args[0]), rep)
     }
     L.emit(l.b, Call(Runtime(name), args), rep)
-}
-
--- `Data.Array#Array` around raw storage and the length it holds.
---
--- The `Array` constructor is a newtype and is usually not built at all: what a
--- value of `Array a` *is* is the `ArrayStorage a` record. The outer object is
--- emitted only when the erasure did not happen, which keeps this one place
--- from being a second opinion about `Decls.newtypes`.
-fun wrapArray(l : Lower, storage : Value, length : Value) -> Value {
-    let order = Map.getOr(l.fields, "Data.Array#ArrayStorage", [])
-    let by = Map.new()
-    Map.put(by, "storage", storage)
-    Map.put(by, "length", length)
-    let ordered = []
-    for field in order {
-        match Map.get(by, field) {
-            Some(v) -> Array.push(ordered, v)
-            None -> {}
-        }
-    }
-    if len(ordered) != 2 {
-        return stop(l, "'Data.Array#ArrayStorage' does not have the fields "
-                       + "raw storage is wrapped in")
-    }
-    let reps = Array.map(ordered, fun(v) = Ssa.repOf(l.func, v))
-    let inner = L.emit(l.b, ObjectNew(1, Map.getOr(l.tags,
-                                                   "Data.Array#ArrayStorage", -1),
-                                      len(ordered), metadata(reps)),
-                       Ssa.traced(Ptr))
-    for var i = 0; i < len(ordered); i = i + 1 {
-        L.effect(l.b, ObjectSet(inner, i, ordered[i]))
-    }
-    if Set.contains(Decls.newtypes(l.decls), "Data.Array#Array") { return inner }
-    let outer = L.emit(l.b, ObjectNew(1, Map.getOr(l.tags, "Data.Array#Array", -1),
-                                      1, metadata([Ssa.traced(Ptr)])),
-                       Ssa.traced(Ptr))
-    L.effect(l.b, ObjectSet(outer, 0, inner))
-    outer
 }
 
 -- The element representation of an array type.

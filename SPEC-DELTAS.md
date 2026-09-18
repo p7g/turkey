@@ -3453,3 +3453,26 @@ libc called twice. Each symbol is a delegation to Python's own POSIX layer with
 buffers copied in and out of the simulated heap, and a symbol with no
 delegation is a clean refusal at the moment this host is asked to call it. The
 declaration is still checked, still lowered, and still runs natively.
+
+### 72. `String` is a library type
+
+TIX-66. `String` is declared in `lib/Data/String/Type.gob` as
+`type String = String(Prim.Array Byte)`, and every operation on one is
+Turkey over the bytes. The model is unchanged: immutable, well-formed UTF-8,
+byte equality and byte order (PRIMITIVES.md 4). What changed is who keeps it --
+the library rather than a runtime section in C -- and the argument is in
+`RUNTIME-IN-TURKEY.md`, "Step 2".
+
+**Still spelled `String` everywhere, without an import.** Every module's scope
+maps the name to the declared type the way it did the primitive, and a module
+that declares its own `String` shadows it rather than being refused.
+
+**Two things a program can see.** A type rep names it by its declaration,
+`Data.String.Type#String`, as it already named `Data.Option.Type#Option`; and
+an instance for `String` belongs to `Data.String` by the facade rule that
+already gave `Data.Bool` the instances of `Data.Bool.Type#Bool`, not by a
+table of built-in homes.
+
+**Exact-sized, not shared.** Slicing copies, as it did. A shared backing
+store with an offset buys O(1) slicing and a leak -- Java removed it in 7u6,
+and Go added `strings.Clone` to escape it.

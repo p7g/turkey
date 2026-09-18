@@ -20,7 +20,7 @@ from .errors import Unsupported
 from .opt import bottoming
 from .prelude import BOOL_FALSE, BOOL_TRUE
 from .types import (
-    BOTTOM, BYTE, CHAR, FLOAT, INT, STRING, UNIT, TApp, TCon, TFam, TFun,
+    BOTTOM, BYTE, CHAR, FLOAT, INT, UNIT, TApp, TCon, TFam, TFun,
     TTuple, Type, TVar, instantiate, prune, show, spine, unify,
 )
 
@@ -101,8 +101,6 @@ def layout_of(ty: Type, abstracted: dict[int, str] | None = None,
             return bir.Layout.I32
         if ty.name == FLOAT.name:
             return bir.Layout.F64
-        if ty.name == STRING.name:
-            return bir.Layout.PTR
         if ty.name == UNIT.name:
             return bir.Layout.UNIT
         if ty.name == "Data.Bool.Type#Bool":
@@ -524,39 +522,6 @@ class _FunctionLowerer:
             return None
         found = env.get(target.name)
         return found.fields if isinstance(found, _Scattered) else None
-
-    def wrap_array(self, block: bir.Block, storage: bir.Operand,
-                   length: bir.Operand) -> bir.Operand:
-        """`Data.Array#Array` around raw storage and the length it holds.
-
-        Three primitives answer a `Data.Array.Array` that the runtime can only
-        build the *contents* of: it allocates the flat storage, and the record
-        around it carries a tag that lives in this table. The runtime reads
-        the same shape back structurally (`array_parts`), which needs no tags
-        -- only building one does.
-
-        The `Array` constructor itself is a newtype and is not built, here or
-        anywhere: what a value of `Array a` *is* is the `ArrayStorage a`
-        record. `array_parts` reads it at that shape for the same reason.
-        """
-        fields = self.record_fields["Data.Array#ArrayStorage"]
-        by_name = {"storage": storage, "length": length}
-        ordered = [by_name[name] for name in fields]
-        inner = self.emit(block, "object_new", (
-            "1", str(self.tags["Data.Array#ArrayStorage"]), str(len(ordered)),
-            str(_layout_metadata(item.layout for item in ordered)),
-        ), bir.Layout.PTR)
-        for index, item in enumerate(ordered):
-            block.instructions.append(bir.Instruction(
-                "object_set", (inner, str(index), item)))
-        if "Data.Array#Array" in self.decls.newtypes():
-            return inner
-        outer = self.emit(block, "object_new", (
-            "1", str(self.tags["Data.Array#Array"]), "1",
-            str(_layout_metadata([bir.Layout.PTR])),
-        ), bir.Layout.PTR)
-        block.instructions.append(bir.Instruction("object_set", (outer, "0", inner)))
-        return outer
 
     def transfer(self, block: bir.Block, dest: _Destination,
                  value: bir.Operand) -> None:
@@ -982,16 +947,6 @@ class _FunctionLowerer:
                         at.terminator = bir.Panic(values[0], self.frame(expr.span))
                     self.lower_values(expr.args, env, joins, block, panic)
                     return
-                if primitive == "Prim.stringToBytes":
-                    def to_bytes(at: bir.Block, values: list[bir.Operand]) -> None:
-                        string = values[0]
-                        raw = self.emit(at, "prim.stringToByteStorage", (string,),
-                                        bir.Layout.PTR, self.frame(expr.span))
-                        length = self.emit(at, "prim.stringByteLength", (string,),
-                                           bir.Layout.I64)
-                        done(at, self.wrap_array(at, raw, length))
-                    self.lower_values(expr.args, env, joins, block, to_bytes)
-                    return
                 if primitive == "Prim.castAs":
                     # The conversion half of a checked cast. `Data.Error.cast`
                     # has already compared the two type reps, so the value in
@@ -1282,6 +1237,39 @@ class _FunctionLowerer:
                                failure, hints)
             at = following
 
+    def lower_string_literal(self, text: str, value: bir.Value,
+                             block: bir.Block, success: bir.Block,
+                             failure: bir.Block) -> None:
+        """A string literal pattern, compared inline (TIX-66).
+
+        A `String` is its byte array, so this is a length test and then one
+        byte test per byte of the literal -- what a C compiler makes of a
+        `memcmp` against a short constant, and the literals in patterns are
+        keywords. No call and no safepoint. `Turkey.SsaLower.literalTest`
+        emits the same chain.
+        """
+        data = text.encode("utf-8")
+        # A value belongs to its block here, so the string is kept in a slot
+        # and read back in each block of the chain.
+        slot = self.new_slot("literal", value.layout)
+        block.instructions.append(bir.Instruction("slot_store", (slot.name, value)))
+        length = self.emit(block, "prim.arrayLength", (value,), bir.Layout.I64)
+        same = self.emit(block, "scalar_eq",
+                         (length, bir.Constant(bir.Layout.I64, len(data))),
+                         bir.Layout.I1)
+        for index, byte in enumerate(data):
+            following = self.new_block("literal")
+            block.terminator = bir.Branch(same, following.name, failure.name)
+            block = following
+            string = self.emit(block, "slot_load", (slot.name,), slot.layout)
+            got = self.emit(block, "prim.arrayGet." + bir.Layout.I8.value,
+                            (string, bir.Constant(bir.Layout.I64, index)),
+                            bir.Layout.I8)
+            same = self.emit(block, "scalar_eq",
+                             (got, bir.Constant(bir.Layout.I8, byte)),
+                             bir.Layout.I1)
+        block.terminator = bir.Branch(same, success.name, failure.name)
+
     def lower_pattern(self, pat, value: bir.Operand, ty: Type,
                       env: dict[str, bir.Value],
                       block: bir.Block, success: bir.Block,
@@ -1302,14 +1290,13 @@ class _FunctionLowerer:
             block.instructions.append(bir.Instruction("slot_store", (slot.name, stored)))
             block.terminator = bir.Jump(success.name)
             return
+        if isinstance(pat, ast.PLit) and pat.kind == "String":
+            self.lower_string_literal(pat.value, value, block, success, failure)
+            return
         if isinstance(pat, ast.PLit):
-            literal = (self.emit(block, "string_const", (str(pat.value),), bir.Layout.PTR)
-                       if pat.kind == "String" else bir.Constant(
-                           value.layout,
-                           ord(pat.value) if pat.kind == "Char" else pat.value,
-                       ))
-            op = "string_eq" if pat.kind == "String" else (
-                "float_eq" if value.layout is bir.Layout.F64 else "scalar_eq")
+            literal = bir.Constant(
+                value.layout, ord(pat.value) if pat.kind == "Char" else pat.value)
+            op = "float_eq" if value.layout is bir.Layout.F64 else "scalar_eq"
             condition = self.emit(block, op, (value, literal), bir.Layout.I1)
             block.terminator = bir.Branch(condition, success.name, failure.name)
             return

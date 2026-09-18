@@ -414,6 +414,41 @@ The port also showed the two hosts disagreeing about that panic's wording --
 had reason to reach until a program could hit it at startup. The C now says
 "well-formed", which is PRIMITIVES.md's word.
 
+### 105. The oracle's `round` was wrong, and only a second model of it noticed
+**bug, fixed.** TIX-66. `Float.round` was `floor(abs(x) + 0.5)` with the sign
+put back, in `builtins.py`, while the native side called C's `round`. The
+addition rounds: the largest double below one half, 0.49999999999999994, plus
+0.5 is exactly 1.0 in binary64, so the oracle said 1.0 and C said 0.0. No
+golden rounds a number that close to a half, so the differential never met it.
+
+It surfaced because moving the libm wrappers to `foreign` meant writing a
+*model* of `round` in `turkey/foreign.py`, and a model is written against C's
+definition rather than copied from the old primitive. The fraction is now taken
+exactly -- `abs(x) - floor(abs(x))`, a difference of two doubles within a
+factor of two of each other -- and both sides pin the case.
+
+### 106. The strings were two implementations the differential never compared
+**design, fixed.** TIX-66. Every string operation had a C body and a Python
+body, written separately, and `test_native` compares the two only through what
+a program prints. So the pair agreed wherever the corpus happened to look and
+nowhere else was checked -- the same shape as FINDINGS 43, one level down.
+`find` with a negative start is the example: Python's `str.find` counts a
+negative start from the *end*, the C clamped it to zero, and no caller passed
+one, so the disagreement was real and unreachable.
+
+Making `String` a library type over its bytes removed both bodies. The
+operations are Turkey in `Data.String`, which the Python oracle *runs* and
+`boot` compiles, so `test_boot` diffs the string code itself stage by stage
+instead of two unrelated programs' output. The oracle's own string
+implementation is now four seams -- a literal, a panic's message, and the two
+float conversions TIX-75 owes -- rather than a second copy of the semantics.
+
+Two smaller things fell out. The oracle had told a `Char` pattern from a
+`String` one by comparing Python types, since both were `str`; they are now
+different values. And the arm64 backend's float `Rem` called
+`turkey_float_fmod`, a wrapper the libm move deleted -- latent, because
+`SsaLower` never emits a float `Rem`, and caught only by grepping for the name.
+
 ### 98. Two codes that meant the same thing, and a bit thrown away before it was read
 **bug, fixed.** TIX-61. The collector traced a slot whose three-bit layout code
 was `>= 6`, and 6 and 7 were `PTR` and `BOXED` -- both traced. So the two codes

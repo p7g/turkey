@@ -429,18 +429,21 @@ def install_qualified(names: set[str]) -> None:
 INT = TCon("Int")
 BYTE = TCon("Byte")
 FLOAT = TCon("Float")
-STRING = TCon("String")
+#: Declared in `lib/Data/String/Type.gob` since TIX-66, as `Bool` is in its
+#: own module: a newtype over the bytes, named here because literals and a
+#: handful of primitives are typed at it before any declaration is read.
+STRING = TCon("Data.String.Type#String")
 CHAR = TCon("Char")
 BOOL = TCon("Data.Bool.Type#Bool")
 UNIT = TCon("Unit")
 
 # The types the checker seeds itself with, and therefore also the ones a
-# program may not redefine. `Bool` is deliberately absent: it is declared in
-# the prelude as `type Bool = False | True`, and `BOOL` above still names it
-# because a `TCon` is compared by name (see `TCon.__eq__`), so every builtin
-# written in terms of `BOOL` meets the declared type without knowing it.
-PRIMITIVES = {"Int": INT, "Byte": BYTE, "Float": FLOAT, "String": STRING,
-              "Char": CHAR, "Unit": UNIT}
+# program may not redefine. `Bool` and `String` are deliberately absent: each
+# is declared in a library module, and `BOOL` and `STRING` above still name
+# them because a `TCon` is compared by name (see `TCon.__eq__`), so every
+# builtin written in terms of them meets the declared type without knowing it.
+PRIMITIVES = {"Int": INT, "Byte": BYTE, "Float": FLOAT, "Char": CHAR,
+              "Unit": UNIT}
 
 # The ranges the primitives actually have, now that they have some. `Int` is
 # two's-complement 64-bit and `Byte` is unsigned 8-bit on every target; neither
@@ -478,10 +481,10 @@ RAW_PTR = TCon("Prim.Ptr", STAR)
 #: same list, for the same reason, as the one raw load and store is built on
 #: (PRIMITIVES.md 9.3).
 #:
-#: `String` is the conspicuous absence. It is a `TurkeyString`, which is a
-#: length and its bytes and no terminator, and the C functions that want a
-#: string want a `char *`; a caller copies one into raw memory rather than the
-#: boundary doing it invisibly.
+#: `String` is the conspicuous absence. It is a heap array of bytes with no
+#: terminator, and the C functions that want a string want a `char *`; a
+#: caller copies one into raw memory rather than the boundary doing it
+#: invisibly.
 FOREIGN_TYPES: dict[str, TCon] = {
     UNIT.name: UNIT, BOOL.name: BOOL, BYTE.name: BYTE, CHAR.name: CHAR,
     INT.name: INT, FLOAT.name: FLOAT, RAW_PTR.name: RAW_PTR,

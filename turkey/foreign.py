@@ -98,8 +98,8 @@ def _entry(symbol: str):
 #
 # Every buffer a POSIX call touches is `(pointer, length)`, so these two are
 # the whole of the marshalling. A C string appears only in a path or an
-# environment name, which is `PROPOSALS.md` 8.4's reason for not padding
-# `TurkeyString`: the NUL-terminated argument is the exception here, not the
+# environment name, which is `PROPOSALS.md` 8.4's reason for not padding every
+# `String`: the NUL-terminated argument is the exception here, not the
 # rule.
 
 

@@ -41,6 +41,7 @@ every stage up to execution and says plainly which symbol is missing.
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 from collections.abc import Callable
@@ -241,6 +242,40 @@ def _close(fd: int) -> int:
     except OSError as exc:
         return -_errno(exc)
     return 0
+
+
+# -- arithmetic --------------------------------------------------------------
+#
+# libm's exact operations. Python's `math` agrees with C's on every one of
+# them except at the edges, which are spelled out: `math.floor` and friends
+# answer an `int` and raise on NaN and the infinities, where C answers the
+# argument; and Python's `round` is ties-to-even where C's is ties-away.
+
+
+def _integral(fn):
+    return lambda x: x if (x != x or math.isinf(x)) else float(fn(x))
+
+
+_MODELS["floor"] = _integral(math.floor)
+_MODELS["ceil"] = _integral(math.ceil)
+_MODELS["trunc"] = _integral(math.trunc)
+_MODELS["fmod"] = math.fmod
+_MODELS["remainder"] = math.remainder
+
+
+@_entry("round")
+def _round(x: float) -> float:
+    if x != x or math.isinf(x):
+        return x
+    # Half away from zero, keeping the sign of a result that rounds to zero.
+    # Not `floor(abs(x) + 0.5)`, which is what this was in `builtins.py`: the
+    # addition rounds, so 0.49999999999999994 came out 1.0 where C says 0.0.
+    # The fraction below is exact, being a difference of two doubles within a
+    # factor of two of each other.
+    whole = math.floor(abs(x))
+    if abs(x) - whole >= 0.5:
+        whole += 1
+    return math.copysign(float(whole), x)
 
 
 # -- what the host hands over ------------------------------------------------

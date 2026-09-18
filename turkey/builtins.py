@@ -255,19 +255,6 @@ def _float_truncate(x: float) -> int:
     return math.trunc(x)
 
 
-def _float_round(x: float) -> float:
-    """Round half away from zero, staying in `Float`.
-
-    Not Python's `round`, which is half-to-even; ties-away is what `round`
-    means to everyone who has not read the floating-point standard, and the
-    ties-to-even rounding that IEEE mandates applies to the *results of
-    arithmetic*, not to this function.
-    """
-    if x != x or x in (math.inf, -math.inf):
-        return x
-    return math.copysign(math.floor(abs(x) + 0.5), x)
-
-
 # --------------------------------------------------------------------- string
 #
 # A `String` is an immutable, well-formed UTF-8 byte sequence (PRIMITIVES.md
@@ -621,18 +608,6 @@ _PRIM: dict[str, tuple] = {
     # Flips the sign bit, NaN included -- which is IEEE `negate`, and is what
     # Python's unary minus already does.
     "Prim.floatNeg": _un("Prim.floatNeg", FLOAT, FLOAT, lambda a: -a),
-    "Prim.floatFmod": _num("Prim.floatFmod", FLOAT, math.fmod),
-    "Prim.floatRemainder": _num("Prim.floatRemainder", FLOAT, math.remainder),
-    "Prim.floatFloor": _un(
-        "Prim.floatFloor", FLOAT, FLOAT,
-        lambda x: x if (x != x or math.isinf(x)) else float(math.floor(x))),
-    "Prim.floatCeil": _un(
-        "Prim.floatCeil", FLOAT, FLOAT,
-        lambda x: x if (x != x or math.isinf(x)) else float(math.ceil(x))),
-    "Prim.floatRound": _un("Prim.floatRound", FLOAT, FLOAT, _float_round),
-    "Prim.floatTrunc": _un(
-        "Prim.floatTrunc", FLOAT, FLOAT,
-        lambda x: x if (x != x or math.isinf(x)) else float(math.trunc(x))),
     "Prim.floatBits": _un("Prim.floatBits", FLOAT, INT, _float_bits),
     "Prim.floatFromBits": _un(
         "Prim.floatFromBits", INT, FLOAT, _float_from_bits),

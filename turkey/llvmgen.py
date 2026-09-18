@@ -105,8 +105,7 @@ _CALLING_PRIMS = frozenset({
     "stringByteLength", "stringByteAt", "stringDecodeAt",
     "stringNextIndex", "stringSlice", "stringFind", "stringRfind",
     "stringToByteStorage", "stringFromBytes", "stringConcatAll", "floatParse",
-    "floatFmod", "floatRemainder", "floatFloor", "floatCeil", "floatRound",
-    "floatTrunc", "stringIsValidUtf8", "floatCanParse", "stringEq", "stringLt",
+    "stringIsValidUtf8", "floatCanParse", "stringEq", "stringLt",
     "arrayNew", "arrayNewUninit", "error", "exit",
 })
 #: `Prim.load*` / `Prim.store*` to the LLVM type the access is at. One name
@@ -439,12 +438,6 @@ class _Emitter:
         self._runtime("turkey_float_to_string", _PTR, [_F64])
         self._runtime("turkey_float_parse", _F64, [_PTR])
         self._runtime("turkey_float_can_parse", _I32, [_PTR])
-        self._runtime("turkey_float_fmod", _F64, [_F64, _F64])
-        self._runtime("turkey_float_remainder", _F64, [_F64, _F64])
-        self._runtime("turkey_float_floor", _F64, [_F64])
-        self._runtime("turkey_float_ceil", _F64, [_F64])
-        self._runtime("turkey_float_round", _F64, [_F64])
-        self._runtime("turkey_float_trunc", _F64, [_F64])
         self._runtime("turkey_char_to_string", _PTR, [_I32])
         self._runtime("turkey_string_byte_length", _I64, [_PTR])
         self._runtime("turkey_string_byte_at", _I8, [_PTR, _I64])
@@ -1357,12 +1350,6 @@ class _Emitter:
             "stringFromBytes": "turkey_string_from_bytes",
             "stringConcatAll": "turkey_string_concat_all",
             "floatParse": "turkey_float_parse",
-            "floatFmod": "turkey_float_fmod",
-            "floatRemainder": "turkey_float_remainder",
-            "floatFloor": "turkey_float_floor",
-            "floatCeil": "turkey_float_ceil",
-            "floatRound": "turkey_float_round",
-            "floatTrunc": "turkey_float_trunc",
         }.get(name)
         if runtime:
             value = builder.call(self.runtime[runtime], args)

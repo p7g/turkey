@@ -837,12 +837,6 @@ int32_t turkey_float_can_parse(TurkeyString *value) {
     return parse_float(value, &ignored);
 }
 
-double turkey_float_fmod(double left, double right) { return fmod(left, right); }
-double turkey_float_remainder(double left, double right) { return remainder(left, right); }
-double turkey_float_floor(double value) { return floor(value); }
-double turkey_float_ceil(double value) { return ceil(value); }
-double turkey_float_round(double value) { return round(value); }
-double turkey_float_trunc(double value) { return trunc(value); }
 
 TurkeyString *turkey_char_to_string(uint32_t value) {
     unsigned char out[4];

@@ -322,6 +322,99 @@ at any point with the rest still in C.
 Stopping after 1 and 2 leaves 470 lines of C -- the collector, the entry, the
 signal handler -- and is 60% of the way with none of the hard machinery.
 
+## Step 2: `String` stops being primitive
+
+The values section is mostly strings: twenty-odd C functions behind as many
+`Prim.string*` names, over a `TurkeyString` layout nothing else in the program
+can see. Writing those functions in Turkey over raw pointers would need a way
+from a `String` to its address, an uninitialized-string allocator and a store
+into one -- intrinsics, every one, and each a thing the Python oracle would have
+to model a second time, since its strings are host `str`s.
+
+**Decided instead: `String` is a library type over a byte array, and keeps its
+own invariants.**
+
+```
+type String = String(Prim.Array Byte)     -- lib/Data/String/Type.gob
+```
+
+Immutable and well-formed UTF-8 by construction, the way `Data.String`'s doors
+already promise, with the constructor reachable only from `lib/` because
+`Prim.Array` is. Every operation is then ordinary Turkey over an array, the C
+and the primitives go, and the oracle runs the *same* Turkey instead of its own
+`str` implementations -- so the differential covers the string code for the
+first time rather than comparing two unrelated implementations of it. `Bool` is
+the precedent for a type declared in `lib/` that both compilers still name.
+
+Performance is not an input. A byte loop is what `memcmp` is too, inlining is
+aggressive here, and vectorizing it is a later change inside one module.
+
+### The one representation question, surveyed
+
+Exact-sized array, or `(array, offset, length)` with shared backing? The second
+buys O(1) slicing. The peers split, and the split has a history:
+
+* **Rust.** `String` is "a pointer to some bytes, a length, and a capacity" --
+  a `Vec<u8>` -- and "`String`s are always valid UTF-8", an invariant the type
+  keeps and `from_utf8_unchecked` is `unsafe` for bypassing: violating it "may
+  cause memory unsafety issues with future users of the `String`, as the rest
+  of the standard library assumes that `String`s are valid UTF-8". Owned, not
+  shared; sharing is `&str`, a borrow, which Turkey does not have.
+* **Haskell `text`.** `Text` is an array, an offset and a length, so slicing is
+  O(1). 2.0 moved the array from UTF-16 to UTF-8; Channable's data set went from
+  3.08 GiB to 1.55 GiB. A library type over a byte array, exactly this shape,
+  with sharing.
+* **Java.** A library class over an array, and the counterexample: 7u6
+  *removed* `offset` and `count` and made `substring` copy, because a small
+  substring kept its whole parent alive -- sharing turned O(1) slicing into a
+  leak. JEP 254 (compact strings) then measured `char[]` at 10–45% of live data
+  across 960 heap dumps, and got 5–15% back by going to `byte[]`.
+* **Go.** A built-in `(pointer, length)` header, substrings share, and Go 1.18
+  added `strings.Clone` for the leak Java removed sharing over: "it guarantees
+  to make a copy of s into a new allocation, which can be important when
+  retaining only a small substring of a much larger string."
+* **OCaml.** A primitive block; `Bytes.create` then `Bytes.unsafe_to_string` is
+  the mutate-then-freeze route this design gets for free, because a `String`
+  is built into an array the builder owns and nothing else sees.
+
+Go and OCaml differ because their strings are primitive and their runtimes are
+C and assembly -- the arrangement this step exists to leave.
+
+**Exact-sized, in a newtype.** Both backends erase a single-field newtype
+(`DeclTable.newtypes`), so a `String` *is* a kind-2 byte array at run time with
+no wrapper object -- `(array, offset, length)` would be a three-field record, an
+extra object on every string, and Java's leak. Slicing copies, as it does today.
+The cost, recorded rather than optimized: the header goes from `TurkeyString`'s
+8 bytes to an array's 24.
+
+### Literal patterns
+
+`match s { "let" -> … }` compares against a string the compiler knows. Today it
+is a call to `turkey_string_eq`, and with the C gone there are three routes: a
+Core rewrite to an equality test, a call to the Turkey `eq` by symbol, or
+comparing inline. Core keeps patterns as nested AST (`CMatch`'s note declines
+exactly this rewrite), and a call by symbol needs a binding kept alive past
+`mono` and `opt` that no program references. **Inline:** a length test, then one
+byte compare per byte of the literal -- what a C compiler makes of `memcmp`
+against a short constant. No call, no safepoint, and the literals in patterns
+are keywords.
+
+### What stays in C, and whose it is
+
+* **The allocators** -- `object_new`, `array_new`, `cell_new`, `box`/`unbox`,
+  `closure_new` and the entry's literal interning. They fill headers over
+  `heap_allocate`, which is the collector's safepoint and its region allocator,
+  and a managed object cannot come from `malloc`: it needs a header and an
+  allocation bit in a region the collector owns. They are the collector's
+  allocation interface and move with step 4. The closure shape, `[code, env]`,
+  stays pinned there.
+* **Float formatting and parsing** -- `float_to_string`, `float_parse` and
+  `float_can_parse`, TIX-75's, because `snprintf` and `strtod` never become
+  foreign declarations. They read and build the new representation meanwhile.
+
+`array_parts` and its hard-coded `ArrayStorage` slots go with their three
+callers, so nothing in C reads `Data.Array`'s record any more.
+
 ## The risk worth naming
 
 The collector manages roots that this compiler emits, and writing it in the
@@ -391,6 +484,14 @@ second one built alongside.
   <https://rpython.readthedocs.io/en/latest/rffi.html>
 - Modula-3, safe and unsafe modules, traced and untraced references:
   <https://www.opencm3.net/doc/reference/intro.html>
+- Rust's `String` and its UTF-8 invariant:
+  <https://doc.rust-lang.org/std/string/struct.String.html>
+- Haskell `text`, and its move to UTF-8: <https://hackage.haskell.org/package/text>,
+  <https://www.channable.com/tech/so-long-surrogatesa>
+- Java's `substring` stopping sharing in 7u6:
+  <https://www.infoq.com/news/2013/12/oracle-tunes-java-string>; compact strings
+  and their measurement: <https://openjdk.org/jeps/254>
+- Go's `strings.Clone`: <https://pkg.go.dev/strings#Clone>
 - Oberon, the SYSTEM pseudo-module: <http://www.ethoberon.ethz.ch/SYSTEM.html>,
   and Wirth on why it is a module:
   <https://people.inf.ethz.ch/wirth/Articles/Modula-Oberon-June.doc>

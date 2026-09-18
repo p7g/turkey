@@ -980,17 +980,6 @@ int32_t turkey_string_lt(TurkeyString *left, TurkeyString *right) {
     return order < 0 || (order == 0 && left->length < right->length);
 }
 
-uint8_t turkey_write(TurkeyString *value) {
-    if (value == NULL) return 0;
-    fwrite(value->bytes, 1, (size_t)value->length, stdout);
-    fflush(stdout);
-    return 0;
-}
-
-uint8_t turkey_print(TurkeyString *value) {
-    turkey_write(value); fputc('\n', stdout); fflush(stdout); return 0;
-}
-
 void *turkey_cell_new(uint64_t value, int32_t pointer_value) {
     TurkeyCell *cell = heap_allocate(sizeof(TurkeyCell), HEAP_CELL);
     if (cell != NULL) { cell->value = value; cell->pointer_value = pointer_value; }
@@ -1204,16 +1193,10 @@ void *turkey_closure_new(uint64_t code, int64_t capture_count,
 
 /* ------------------------------------------------------------ the outside world
  *
- * The floor `turkey/builtins.py` describes: arguments, two file doors, the
- * error stream and `exit`. Every one of them is written twice -- once there
- * for the Python host and once here -- so the cost of a primitive is paid
- * twice and the set is deliberately small.
- *
- * Bytes, not text, on both file doors: a file is not guaranteed to be
- * well-formed UTF-8 and a `String` is, so the validating constructor stays in
- * the library where `Some` and `None` are in scope. Reading is total only
- * after `turkey_file_can_read` says so, the same predicate-plus-total split
- * `turkey_float_can_parse`/`turkey_float_parse` already uses.
+ * The floor `turkey/builtins.py` describes: arguments and `exit`. Both are
+ * written twice -- once there for the Python host and once here. The streams
+ * and the two file doors were here too, until TIX-65 wrote them in Turkey over
+ * `open`, `read`, `write` and `close` (`lib/System/IO.gob`).
  */
 
 static unsigned char **argument_bytes;
@@ -1282,109 +1265,6 @@ void *turkey_args_storage(void) {
     }
     turkey_root_leave(&frame);
     return storage;
-}
-
-/* A `TurkeyString` is length-delimited and a path is a C string, so every
-   door here needs a NUL-terminated copy. An embedded NUL is rejected rather
-   than truncated at: a path that names one file to Turkey and another to the
-   operating system is the shape of a directory-traversal bug. */
-static char *path_of(TurkeyString *value) {
-    if (value == NULL) return NULL;
-    if (memchr(value->bytes, '\0', (size_t)value->length) != NULL) {
-        turkey_panic("a path cannot contain a NUL byte");
-        return NULL;
-    }
-    char *path = malloc((size_t)value->length + 1);
-    if (path == NULL) { turkey_panic("out of memory"); return NULL; }
-    memcpy(path, value->bytes, (size_t)value->length);
-    path[value->length] = '\0';
-    return path;
-}
-
-int32_t turkey_file_can_read(TurkeyString *value) {
-    char *path = path_of(value);
-    if (path == NULL) return 0;
-    FILE *handle = fopen(path, "rb");
-    free(path);
-    if (handle == NULL) return 0;
-    fclose(handle);
-    return 1;
-}
-
-void *turkey_read_file_bytes(TurkeyString *value) {
-    char *path = path_of(value);
-    if (path == NULL) return NULL;
-    FILE *handle = fopen(path, "rb");
-    if (handle == NULL) {
-        snprintf(panic_buffer, sizeof panic_buffer, "cannot read %s", path);
-        free(path);
-        turkey_panic(panic_buffer);
-        return NULL;
-    }
-    /* Grown rather than sized by `fseek` first: a pipe or a device has no
-       length to ask for, and a regular file can change between the two
-       calls. */
-    size_t capacity = 4096, length = 0;
-    unsigned char *bytes = malloc(capacity);
-    if (bytes == NULL) {
-        fclose(handle); free(path); turkey_panic("out of memory"); return NULL;
-    }
-    for (;;) {
-        if (length == capacity) {
-            size_t grown = capacity * 2;
-            unsigned char *bigger = realloc(bytes, grown);
-            if (bigger == NULL) {
-                free(bytes); fclose(handle); free(path);
-                turkey_panic("out of memory");
-                return NULL;
-            }
-            bytes = bigger;
-            capacity = grown;
-        }
-        size_t read = fread(bytes + length, 1, capacity - length, handle);
-        length += read;
-        if (read == 0) break;
-    }
-    int failed = ferror(handle);
-    fclose(handle);
-    if (failed) {
-        snprintf(panic_buffer, sizeof panic_buffer, "cannot read %s", path);
-        free(bytes); free(path);
-        turkey_panic(panic_buffer);
-        return NULL;
-    }
-    free(path);
-    TurkeyObject *storage = turkey_array_new((int64_t)length, 0, 1, 2);
-    if (storage != NULL && length > 0) memcpy(storage->slots, bytes, length);
-    free(bytes);
-    return storage;
-}
-
-int32_t turkey_write_file_bytes(TurkeyString *value, void *wrapper) {
-    /* Answers whether it worked rather than panicking. A failed write is an
-       ordinary thing to want to report -- a full disk, a read-only directory
-       -- and unlike a failed read there is no predicate that could be asked
-       first without lying about the race. */
-    TurkeyObject *array;
-    int64_t length;
-    if (!array_parts(wrapper, &array, &length)) return 0;
-    char *path = path_of(value);
-    if (path == NULL) return 0;
-    FILE *handle = fopen(path, "wb");
-    free(path);
-    if (handle == NULL) return 0;
-    size_t written = length == 0 ? 0
-        : fwrite(array->slots, 1, (size_t)length, handle);
-    int failed = written != (size_t)length || ferror(handle);
-    if (fclose(handle) != 0) failed = 1;
-    return failed ? 0 : 1;
-}
-
-uint8_t turkey_stderr_write(TurkeyString *value) {
-    if (value == NULL) return 0;
-    fwrite(value->bytes, 1, (size_t)value->length, stderr);
-    fflush(stderr);
-    return 0;
 }
 
 static int32_t exit_requested;

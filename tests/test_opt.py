@@ -70,15 +70,17 @@ fun main() { print(addOne(4)) }
 
 def test_an_inlined_body_blames_the_call_site_but_arguments_keep_theirs():
     checked = check(
-        "fun bump(x : Int) -> Int = x + 1\n"
+        "fun bump(x : Int) -> Int = x + 7\n"
         "fun main() { print(bump(41)) }\n",
         "inline_test.gob",
     )
     literals = {n.value: n.span for n in nodes(
         named(checked.opt, "Main#main").value) if isinstance(n, CLit)}
-    # `1` came from the callee, so any error in the copied residual points at
+    # `7` came from the callee, so any error in the copied residual points at
     # `bump(41)`.  The caller-supplied `41` retains its more precise location.
-    assert (literals[1].line, literals[1].col) == (2, 20)
+    # (Not `1`: `print` inlines to a write to descriptor 1, which is a literal
+    # of its own.)
+    assert (literals[7].line, literals[7].col) == (2, 20)
     assert (literals[41].line, literals[41].col) == (2, 25)
 
 
@@ -239,8 +241,11 @@ def test_a_let_whose_value_does_work_is_kept_even_if_nothing_reads_it():
     """Which is what every statement in a block is: a `CLet` named `%seq`
     that nothing reads. Dropping those would drop the program."""
     program = optimized('fun main() { print("a"); print("b") }')
+    # `print` inlines to the write underneath it (TIX-65), so the two writes
+    # are what must survive.
     printed = [n for n in nodes(named(program, "Main#main").value)
-               if isinstance(n, (CPrim, CVar)) and n.name == "Prim.print"]
+               if isinstance(n, (CPrim, CVar))
+               and n.name == "System.IO#writeString"]
     assert len(printed) == 2
 
 

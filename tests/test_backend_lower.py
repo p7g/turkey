@@ -8,7 +8,9 @@ def test_scalar_program_lowers_to_checked_cfg():
     text = format_module(lower(checked.opt, checked.decls, checked.main))
     assert "prim.intAdd" in text
     assert "prim.intToString" in text
-    assert "prim.print" in text
+    # `print` is library code over `write(2)` now (TIX-65), so the output
+    # leaves through a foreign call rather than a primitive.
+    assert "foreign.write" in text
 
 
 def test_recursive_core_join_lowers_to_a_back_edge():

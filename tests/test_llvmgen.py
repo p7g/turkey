@@ -49,12 +49,10 @@ ALLOWED_RUNTIME_CALLS = {
     "turkey_float_parse", "turkey_float_can_parse", "turkey_float_fmod",
     "turkey_float_remainder", "turkey_float_floor", "turkey_float_ceil",
     "turkey_float_round", "turkey_float_trunc",
-    "turkey_print", "turkey_write",
-    # The outside world: arguments, the two file doors, the error stream and
-    # `exit`. Each is one call by construction -- there is no inline form of
-    # opening a file -- so they belong here rather than being made into loads.
-    "turkey_args_storage", "turkey_file_can_read", "turkey_read_file_bytes",
-    "turkey_write_file_bytes", "turkey_stderr_write", "turkey_exit",
+    # The outside world: arguments, the error stream and `exit`. Each is one
+    # call by construction, so they belong here rather than being made into
+    # loads. The file doors were here until TIX-65 wrote them in Turkey.
+    "turkey_args_storage", "turkey_exit",
     "turkey_panic", "turkey_panic_string", "turkey_panicked",
     "turkey_root_enter", "turkey_root_leave",
     "turkey_frame_enter", "turkey_frame_leave",
@@ -206,13 +204,21 @@ def test_language_string_literals_are_allocated_once_at_module_entry():
     # rendering of the module, so a typed-pointer LLVM writes `i8*` where an
     # opaque-pointer one writes `ptr`. What this test is about is how many
     # times the literal is built and read, which neither spelling changes.
+    #
+    # `print` is library code that has literals of its own (TIX-65), so the
+    # count is one construction per distinct literal rather than one in all,
+    # and the two reads are looked for in `main` itself.
     calls = [line for line in text.splitlines()
              if "@turkey_string_new(" in line and " call " in f" {line} "]
-    assert len(calls) == 1
-    assert text.count("@.turkey.literal.bytes.0") >= 1
-    loads = [line for line in text.splitlines()
-             if line.lstrip().startswith("%")
-             and " load " in line and "@.turkey.literal.value.0" in line]
+    literals = re.findall(r"^@\.turkey\.literal\.bytes\.(\d+) = .*c\"(.*)\"",
+                          text, re.MULTILINE)
+    assert len(calls) == len(literals)
+    same = [index for index, spelled in literals if spelled == "same\\00"]
+    assert len(same) == 1
+    main = _body(text, "Main_23_main")
+    loads = [line for line in main.splitlines()
+             if line.lstrip().startswith("%") and " load " in line
+             and f"@.turkey.literal.value.{same[0]}," in line]
     assert len(loads) == 2
 
 
@@ -353,10 +359,11 @@ def test_a_var_no_closure_sees_is_a_slot_rather_than_a_cell():
     def allocates_a_cell(source: str) -> bool:
         # Call sites only: the declaration is in the module either way.
         checked = check(source)
+        main = _body(generate(checked.opt, checked.decls, checked.main),
+                     "Main_23_main")
         return any(
             "@turkey_cell_new(" in line and " call " in f" {line} "
-            for line in generate(
-                checked.opt, checked.decls, checked.main).splitlines())
+            for line in main.splitlines())
 
     assert not allocates_a_cell("""
 fun main() {
@@ -819,7 +826,7 @@ fun main() { let w = W(7); match w { W(n) -> print(n) } }
 """)
     assert "Main#Wrapped" in checked.decls.newtypes()
     text = generate(checked.opt, checked.decls, checked.main)
-    assert "call ptr @turkey_object_new" not in text
+    assert "call ptr @turkey_object_new" not in _body(text, "Main_23_main")
 
 
 def test_an_erased_wrapper_still_answers_its_payload(capfd):

@@ -3402,6 +3402,12 @@ has to know what register file every argument travels in at the point the
 instruction is emitted. Nothing is marshalled, and a type outside the list is
 rejected at the declaration rather than at a call.
 
+One consequence is the caller's to handle. A C `int` result is declared `Int`,
+and AAPCS64 leaves the upper half of the register undefined for a 32-bit
+return, so the answer has to be sign-extended from its low half before it is
+compared -- `System.IO.cInt` is the one place that does it (FINDINGS 102). An
+`int` *argument* needs nothing: the callee reads only the low half.
+
 **`String` does not cross.** The survey's finding is that the boundary is
 decided by whether the collector moves -- Go and the JVM copy because theirs
 do, and OCaml pads its strings so `String_val` is a `char *` for free because

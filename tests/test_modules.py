@@ -252,8 +252,8 @@ def test_a_type_declared_in_another_module_is_usable(tmp_path):
 def test_the_primitives_stay_out_of_a_user_module(tmp_path):
     """`Prim.*` is in the shared environment so the Prelude can be checked;
     what keeps it out of the language is the module's scope."""
-    assert fails('fun f() { Prim.print("x") }', [tmp_path]) == \
-        "'Prim.print' is not defined"
+    assert fails('fun f() { Prim.intToString(1) }', [tmp_path]) == \
+        "'Prim.intToString' is not defined"
 
 
 def test_the_prelude_is_imported_without_being_asked_for(tmp_path):

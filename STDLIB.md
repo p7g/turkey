@@ -33,7 +33,7 @@ is good if the modules AoC needs land somewhere a reader would look.
 | `Data.Map`, `Data.Set` | insertion-ordered open-addressed hash map; set over `Map k Unit` |
 | `Data.String` | UTF-8 views, `split` `splitOnce` `lines` `words` `trim` `find` `replace`, `Builder` |
 | `Algorithm.Hash` | FNV-1a |
-| `System.IO` | `readFile` `writeFile` `canRead` `stderr` |
+| `System.IO` | `readFile` `readBytes` `writeFile` `stderr` `print` `write` |
 | `System.Env` | `args` `exit` `get` |
 | `Unsafe.Ptr`, `Unsafe.Libc` | raw memory, and the C symbols declared through it (SPEC-DELTAS 70, 71). Not part of the surface this document is about: they exist so that `System.*` has something to be a wrapper over, and a module that imports one says so in its import list |
 

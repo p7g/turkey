@@ -94,8 +94,9 @@ def test_the_container_instances_nest(capsys):
     assert output(src, capsys) == ["[Some(1), None]", "[[a]]"]
 
 
-def test_the_machine_write_is_not_in_the_surface_language():
-    assert fails('fun main() { Prim.print("x") }') == "'Prim.print' is not defined"
+def test_a_primitive_is_not_in_the_surface_language():
+    assert fails('fun main() { Prim.intToString(1) }') == \
+        "'Prim.intToString' is not defined"
 
 
 def test_the_prelude_exports_its_bindings_and_nothing_else():
@@ -103,9 +104,9 @@ def test_the_prelude_exports_its_bindings_and_nothing_else():
     M11a every builtin lives in one environment and resolution is what
     decides which of them a given module can name."""
     scope = check("fun main() {}").scope
-    assert scope["print"] == "Std.Classes#print"
+    assert scope["print"] == "System.IO#print"
     assert scope["show"] == "Std.Classes#Show.show"
-    assert "Prim.print" not in scope
+    assert "Prim.intToString" not in scope
     assert "Prim.intAdd" not in scope
 
 

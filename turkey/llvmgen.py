@@ -101,15 +101,14 @@ _CALLING_OPS = frozenset({
     "array_new", "closure_new", "closure_capture",
 })
 _CALLING_PRIMS = frozenset({
-    "intToString", "floatToString", "charToString", "stringConcat", "print",
-    "write", "stringByteLength", "stringByteAt", "stringDecodeAt",
+    "intToString", "floatToString", "charToString", "stringConcat",
+    "stringByteLength", "stringByteAt", "stringDecodeAt",
     "stringNextIndex", "stringSlice", "stringFind", "stringRfind",
     "stringToByteStorage", "stringFromBytes", "stringConcatAll", "floatParse",
     "floatFmod", "floatRemainder", "floatFloor", "floatCeil", "floatRound",
     "floatTrunc", "stringIsValidUtf8", "floatCanParse", "stringEq", "stringLt",
-    "arrayNew", "arrayNewUninit", "error", "stderrWrite", "exit",
-    "argsStorage", "fileCanRead", "readFileStorage",
-    "writeFileBytes",
+    "arrayNew", "arrayNewUninit", "error", "exit",
+    "argsStorage",
 })
 #: `Prim.load*` / `Prim.store*` to the LLVM type the access is at. One name
 #: per representation because the width has to be known where the instruction
@@ -462,13 +461,7 @@ class _Emitter:
         self._runtime("turkey_string_eq", _I32, [_PTR, _PTR])
         self._runtime("turkey_string_lt", _I32, [_PTR, _PTR])
         self._runtime("turkey_args_storage", _PTR, [])
-        self._runtime("turkey_file_can_read", _I32, [_PTR])
-        self._runtime("turkey_read_file_bytes", _PTR, [_PTR])
-        self._runtime("turkey_write_file_bytes", _I32, [_PTR, _PTR])
-        self._runtime("turkey_stderr_write", _I8, [_PTR])
         self._runtime("turkey_exit", ir.VoidType(), [_I64])
-        self._runtime("turkey_print", _I8, [_PTR])
-        self._runtime("turkey_write", _I8, [_PTR])
         self._runtime("turkey_cell_new", _PTR, [_I64, _I32])
         self._runtime("turkey_object_new", _PTR, [_I32, _I32, _I64, _I64])
         self._runtime("turkey_box", _PTR, [_I64, _I32])
@@ -1355,10 +1348,7 @@ class _Emitter:
         runtime = {
             "intToString": "turkey_int_to_string", "floatToString": "turkey_float_to_string",
             "charToString": "turkey_char_to_string", "stringConcat": "turkey_string_concat",
-            "print": "turkey_print", "write": "turkey_write",
-            "stderrWrite": "turkey_stderr_write",
             "argsStorage": "turkey_args_storage",
-            "readFileStorage": "turkey_read_file_bytes",
             "stringByteLength": "turkey_string_byte_length",
             "stringByteAt": "turkey_string_byte_at",
             "stringDecodeAt": "turkey_string_decode_at",
@@ -1382,12 +1372,6 @@ class _Emitter:
             return value, self._propagate(function, builder)
         if name == "stringIsValidUtf8":
             raw = builder.call(self.runtime["turkey_string_is_valid_utf8"], args)
-            value = builder.icmp_unsigned("!=", raw, ir.Constant(_I32, 0))
-            return value, self._propagate(function, builder)
-        if name in ("fileCanRead", "writeFileBytes"):
-            raw = builder.call(self.runtime[
-                "turkey_file_can_read" if name == "fileCanRead"
-                else "turkey_write_file_bytes"], args)
             value = builder.icmp_unsigned("!=", raw, ir.Constant(_I32, 0))
             return value, self._propagate(function, builder)
         if name == "exit":

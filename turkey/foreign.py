@@ -29,9 +29,9 @@ out of the simulated heap, which is also why the work survives a move to raw
 Linux syscalls: it is a delegation to POSIX *semantics*, not to libc.
 
 There is one entry per symbol `lib/Unsafe/Libc.gob` declares and no more. The
-rest of the residue -- `read`, `open`, `close`, `mmap`, the `pthread_*` five --
-arrives with the runtime sections that need it, because a model with no caller
-is a second unverified signature sitting beside the first.
+rest of the residue -- `mmap`, the `pthread_*` five -- arrives with the
+runtime sections that need it, because a model with no caller is a second
+unverified signature sitting beside the first.
 
 A symbol with no entry here is not an error at compile time -- the declaration
 is still checked, still lowered, and still runs natively. It is an error at the
@@ -195,6 +195,51 @@ def _write(fd: int, buf: int, count: int) -> int:
         return os.write(fd, payload)
     except OSError as exc:
         return -_errno(exc)
+
+
+# -- files -------------------------------------------------------------------
+#
+# `System.IO` over POSIX descriptors (TIX-65). A descriptor here is the host's
+# own, from `os.open`, so a program that leaks one leaks it for real -- the
+# same thing it would do natively, and not something to paper over.
+
+
+@_entry("open")
+def _open(path: int, flags: int) -> int:
+    # Only `O_RDONLY` has a caller, and it is 0 on every platform, so the flag
+    # passes straight through rather than being translated.
+    try:
+        return os.open(_c_string(path), flags)
+    except OSError as exc:
+        return -_errno(exc)
+
+
+@_entry("creat")
+def _creat(path: int, mode: int) -> int:
+    try:
+        return os.open(_c_string(path),
+                       os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    except OSError as exc:
+        return -_errno(exc)
+
+
+@_entry("read")
+def _read(fd: int, buf: int, count: int) -> int:
+    try:
+        payload = os.read(fd, count)
+    except OSError as exc:
+        return -_errno(exc)
+    _store_bytes(buf, payload)
+    return len(payload)
+
+
+@_entry("close")
+def _close(fd: int) -> int:
+    try:
+        os.close(fd)
+    except OSError as exc:
+        return -_errno(exc)
+    return 0
 
 
 # -- the values that cross ---------------------------------------------------

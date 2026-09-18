@@ -1,5 +1,6 @@
 module Unsafe.Libc (
     malloc, free, strlen, getenv, write,
+    open, creat, read, close,
 )
 
 -- The C symbols this system cannot avoid (TIX-62).
@@ -26,9 +27,10 @@ module Unsafe.Libc (
 -- because Apple does not commit to a syscall ABI.
 --
 -- **Only what has a caller.** The residue an FFI has to cover is about ten
--- POSIX entry points, and the rest of them -- `read`, `open`, `close`, `mmap`,
--- `munmap`, the `pthread_*` five -- arrive with the runtime sections that need
--- them rather than sitting here unused. A declaration nothing calls is not free
+-- POSIX entry points, and the rest of them -- `mmap`, `munmap`, the
+-- `pthread_*` five -- arrive with the runtime sections that need them rather
+-- than sitting here unused. `open`, `creat`, `read` and `close` arrived with
+-- `System.IO` (TIX-65). A declaration nothing calls is not free
 -- to keep: it is a signature nobody has checked against a header, which is
 -- exactly the thing this form cannot verify.
 
@@ -57,3 +59,35 @@ foreign "getenv" fun getenv(name : Prim.Ptr) -> Prim.Ptr
 -- owns -- nothing about this pointer is known to the collector, and what `write`
 -- does with it after returning is undefined (PRIMITIVES.md 9.1).
 foreign "write" fun write(fd : Int, buf : Prim.Ptr, count : Int) -> Int
+
+-- -- files ----------------------------------------------------------------------------
+--
+-- Three of these answer a C `int`, and `Int` is 64 bits: the value is in the
+-- low half of the register and the high half is whatever the callee left
+-- there, which AAPCS64 does not promise is a sign extension. So the answer is
+-- not `-1` on failure but "something whose low 32 bits are -1", and a caller
+-- reads it through `System.IO`'s `cInt` rather than comparing it directly.
+-- That is the cost of a type mapping with one integer in it, and the reason it
+-- is paid at the call rather than in the mapping: an `Int32` that crossed would
+-- be a type the language does not otherwise have.
+
+-- A descriptor, or negative. `open` is variadic in C -- the mode is a third
+-- argument read only under `O_CREAT` -- and is declared here with its two
+-- fixed arguments, which is ABI-correct on both targets because no variadic
+-- argument is passed: Darwin's arm64 convention puts variadics on the stack,
+-- and a call with none leaves nothing there for the callee to read. `flags` is
+-- only ever `O_RDONLY`, which is 0 on every platform.
+foreign "open" fun open(path : Prim.Ptr, flags : Int) -> Int
+
+-- `open(path, O_WRONLY | O_CREAT | O_TRUNC, mode)`, with the mode a fixed
+-- argument. It exists so that nothing here needs `O_CREAT`, whose value
+-- differs between Darwin and Linux and whose mode would be variadic.
+foreign "creat" fun creat(path : Prim.Ptr, mode : Int) -> Int
+
+-- Bytes read, 0 at end of file, or negative. `ssize_t`, so all 64 bits mean
+-- something.
+foreign "read" fun read(fd : Int, buf : Prim.Ptr, count : Int) -> Int
+
+-- 0, or negative if the descriptor could not be closed -- which for a file
+-- just written can be where a deferred write error is first reported.
+foreign "close" fun close(fd : Int) -> Int

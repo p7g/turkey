@@ -27,7 +27,6 @@ from __future__ import annotations
 import functools
 import math
 import struct
-import sys
 
 from . import foreign
 from .errors import TurkeyPanic
@@ -59,39 +58,23 @@ def _set(arr, index, value):
     return UNIT_VALUE
 
 
-def _print(text):
-    sys.stdout.write(text + "\n")
-    sys.stdout.flush()
-    return UNIT_VALUE
-
-
-def _write(text):
-    """`print` without the newline. Flushes, so it interleaves correctly."""
-    sys.stdout.write(text)
-    sys.stdout.flush()
-    return UNIT_VALUE
-
-
 def _error(message):
     raise TurkeyPanic(message)
 
 
 # ------------------------------------------------------------- the outside world
 #
-# `print`, `write` and `error` were the whole of the language's contact with
-# anything outside itself, which meant a Turkey program could not read a file
-# and so could not be a compiler (plan.txt item 9). These are the rest of the
-# floor, and they are deliberately few: every one of them has to be written a
-# second time in the C runtime, so the cost of a primitive is paid twice.
+# `print`, `write` and `error` were once the whole of the language's contact
+# with anything outside itself, which meant a Turkey program could not read a
+# file and so could not be a compiler (plan.txt item 9). Arguments, `exit`, the
+# error stream and two file doors followed, each written a second time in the C
+# runtime, so the cost of a primitive was paid twice.
 #
-# Bytes, not text, on both doors. A file is not guaranteed to be well-formed
-# UTF-8 and a `String` is, so the validating constructor stays where
-# PRIMITIVES.md 4.7 puts it -- `String.fromBytes` in the library -- rather than
-# being hidden inside a read. `Prim.readFileBytes` is total only after
-# `Prim.fileCanRead` says so, which is the same predicate-plus-total-primitive
-# split `Prim.floatCanParse`/`Prim.floatParse` already uses (PRIMITIVES.md 7.2)
-# and for the same reason: the `Option` is built in the library, where `Some`
-# and `None` are in scope.
+# TIX-65 wrote the streams and the file doors in Turkey (`lib/System/IO.gob`)
+# over `open`, `read`, `write` and `close`, so what reaches a file or a stream
+# now reaches it through `turkey/foreign.py`'s models and nothing here is
+# written twice. What is left is `exit` and the arguments, whose state lives
+# where the host starts the program.
 
 _ARGS: list[str] = []
 
@@ -121,43 +104,6 @@ def program_args() -> list[str]:
 
 def _args() -> ConValue:
     return _array_of_values(list(_ARGS))
-
-
-def _file_can_read(path: str) -> bool:
-    try:
-        with open(path, "rb"):
-            return True
-    except OSError:
-        return False
-
-
-def _read_file_bytes(path: str) -> ConValue:
-    try:
-        with open(path, "rb") as handle:
-            return _array_of_values(list(handle.read()))
-    except OSError as exc:
-        raise TurkeyPanic(f"cannot read {path}: {exc.strerror}") from None
-
-
-def _write_file_bytes(path: str, data: ConValue):
-    """Answers whether it worked, rather than panicking.
-
-    A failed write is an ordinary thing for a program to want to report --
-    a full disk, a read-only directory -- and unlike a failed read there is
-    no predicate that could be asked first without lying about the race.
-    """
-    try:
-        with open(path, "wb") as handle:
-            handle.write(_array_bytes(data))
-        return from_bool(True)
-    except OSError:
-        return from_bool(False)
-
-
-def _stderr_write(text):
-    sys.stderr.write(text)
-    sys.stderr.flush()
-    return UNIT_VALUE
 
 
 def _exit(status: int):
@@ -536,25 +482,13 @@ def _raw_store_prim(name, ty, width, encode):
 
 
 _PRIM: dict[str, tuple] = {
-    # Output. `print` and `write` themselves are prelude functions, one `show`
-    # away; these are the two writes underneath.
-    "Prim.print": (mono(TFun([STRING], UNIT)), _bi("Prim.print", 1, _print)),
-    "Prim.write": (mono(TFun([STRING], UNIT)), _bi("Prim.write", 1, _write)),
-
     # Section 10: `error` diverges, so it can claim any result type.
     "Prim.error": (_scheme(lambda a: TFun([STRING], a)),
                    _bi("Prim.error", 1, _error)),
 
     # The outside world. `exit` diverges, so like `error` it claims any result.
-    "Prim.stderrWrite": (mono(TFun([STRING], UNIT)),
-                         _bi("Prim.stderrWrite", 1, _stderr_write)),
     "Prim.exit": (_scheme(lambda a: TFun([INT], a)), _bi("Prim.exit", 1, _exit)),
     "Prim.args": (mono(TFun([], array_of(STRING))), _bi("Prim.args", 0, _args)),
-    "Prim.fileCanRead": _pred("Prim.fileCanRead", STRING, _file_can_read),
-    "Prim.readFileBytes": _un(
-        "Prim.readFileBytes", STRING, array_of(BYTE), _read_file_bytes),
-    "Prim.writeFileBytes": (mono(TFun([STRING, array_of(BYTE)], BOOL)),
-                            _bi("Prim.writeFileBytes", 2, _write_file_bytes)),
 
     # Fixed-length storage. Dynamic length and capacity are `Data.Array` policy.
     "Prim.arrayNew": (_scheme(lambda a: TFun([INT, a], raw_array_of(a))),

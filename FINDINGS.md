@@ -98,6 +98,8 @@ read only the one that is there, and `readFile` answering `None` conflates "no
 such file" with "not UTF-8". `System.IO.canRead` is the predicate; the
 primitive behind it was already there for `readFile` to use.
 
+*Reversed by 103.* The predicate was the wrong fix for a real problem.
+
 ### 27. A module-level `let` is process state, and the compiler is one process
 **bug, fixed.** M22. `types.QUALIFY` is a program-wide set of the names that
 must print qualified because two modules claimed one short name, and
@@ -356,6 +358,40 @@ assembly by eye, not a test: `test_arm64_native` links, so it would have caught
 it too, but only after a three-minute rebuild. The cheap check is that there is
 exactly one way a symbol is written in this backend, and any new callee shape
 has to go through it.
+
+### 102. A C `int` comes back in a 64-bit register with half of it undefined
+**design, accepted.** TIX-65. `open`, `creat` and `close` answer `int`, and the
+FFI's one integer is `Int`, which is 64 bits. AAPCS64 says a 32-bit result is
+in `w0` and says nothing about the upper half of `x0`, so "failed" is not `-1`
+but "anything whose low 32 bits are -1", and `fd < 0` can be false for a
+failure. Nothing in the corpus would notice: whether a given libc happens to
+write the whole register is its habit, not a promise, and a test only sees the
+habit.
+
+The fix is `System.IO.cInt`, which sign-extends the low half at each call site
+that reads one. The alternative was a 32-bit type in the foreign mapping, and
+declined: it would be a type the language has nowhere else, for three call
+sites. The seven-type mapping in SPEC-DELTAS 71 is what made this the caller's
+problem, and the trade still looks right -- but it should be written next to
+the mapping rather than rediscovered at the next `int`-returning symbol.
+
+### 103. `canRead` was a check-then-use race with a public name
+**library, fixed.** TIX-65, reversing 21. The module loader asked `canRead` of
+each candidate and then read the first one that said yes, which is the
+`access(2)`-then-`open(2)` shape POSIX's own documentation warns about: the
+answer is stale by the time anything acts on it. The loader could live with it,
+but the function was exported, and an API whose only use is to race is not one
+to offer.
+
+What 21 needed was never a predicate. It was to tell "no such file" from "not
+UTF-8", and `readFile` could not because it answered one `None` for both. So
+the split moved one layer down instead: `readBytes` answers `None` only when
+the file cannot be opened or read, and a caller that cares decodes the bytes
+itself. The loader now reads each candidate, keeps the first `Some`, and hands
+those same bytes to the parser, so there is no window between finding a module
+and compiling it. Rewriting the file doors in Turkey is what surfaced it --
+`canRead` was one line over a primitive, and only became visible as a race when
+it had to be written as an `open` and a `close` with nothing between them.
 
 ### 98. Two codes that meant the same thing, and a bit thrown away before it was read
 **bug, fixed.** TIX-61. The collector traced a slot whose three-bit layout code

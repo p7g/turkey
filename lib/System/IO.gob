@@ -1,33 +1,163 @@
-module System.IO (readFile, writeFile, canRead, stderr)
+module System.IO (readFile, readBytes, writeFile, stderr, print, write)
 
--- Files, addressed as bytes.
+-- Files, addressed as bytes, and the two standard streams.
 --
 -- Reading answers `Option String` rather than `String` because a file is not
 -- guaranteed to be well-formed UTF-8 and a `String` is. The validation is
 -- `String.fromBytes` -- the checked constructor PRIMITIVES.md 4.7 calls the
 -- only door in -- rather than something hidden inside the read, so a program
 -- that wants the bytes themselves is not made to go through text to get them.
+--
+-- Turkey over `open`, `creat`, `read`, `write` and `close` (TIX-65), where
+-- this was three primitives written twice, once in `turkey/builtins.py` and
+-- once in the C runtime over `stdio`. It is the first section of the runtime
+-- to move (`RUNTIME-IN-TURKEY.md`, staging step 1), and it needs nothing but
+-- the FFI: the raw memory below is scratch this module allocates and frees,
+-- and nothing the collector knows about ever crosses.
 
 import Prelude ()
 import Std.Classes
+import Data.Array (Array)
+import Data.Array as Array
 import Data.Bool.Type (Bool(..))
+import Data.Byte as Byte
+import Data.Int as Int
 import Data.Option.Type (Option(..))
 import Data.String as String
+import Unsafe.Libc as Libc
+import Unsafe.Ptr as Ptr
 
-fun readFile(path : String) -> Option String {
-    if Prim.fileCanRead(path) {
-        String.fromBytes(Prim.readFileBytes(path))
-    } else {
-        None
-    }
+-- The file's contents, or `None` if it cannot be read or is not well-formed
+-- UTF-8.
+fun readFile(path : String) -> Option String = match readBytes(path) {
+    Some(bs) -> String.fromBytes(bs)
+    None -> None
 }
 
--- Is there a file here this program may read? A search path needs to ask
--- before it reads, since the answer decides *which* file to read and the
--- reading is what costs.
-fun canRead(path : String) -> Bool = Prim.fileCanRead(path)
+-- The file's bytes, or `None` if it cannot be opened or read -- missing,
+-- forbidden, a directory, a device that failed.
+--
+-- There is deliberately no "can this be read?" predicate beside it. There was
+-- one, `canRead`, for a module search path that has to tell "no such file"
+-- from "not UTF-8" (FINDINGS 21); but its answer is stale by the time anything
+-- acts on it, which is the check-then-use race POSIX's own `access` is
+-- documented as. Reading *is* the question: a search path asks this, keeps
+-- the first `Some`, and decodes it, so the two failures stay apart and there
+-- is no window between asking and using.
+fun readBytes(path : String) -> Option (Array Byte) {
+    let fd = openForReading(path)
+    if fd < 0 { return None }
+    readAll(fd)
+}
 
-fun writeFile(path : String, contents : String) -> Bool =
-    Prim.writeFileBytes(path, String.toBytes(contents))
+-- Whether every byte was written. A failed write is an ordinary thing to want
+-- to report -- a full disk, a read-only directory -- and unlike a failed read
+-- there is no predicate that could be asked first without lying about the race.
+fun writeFile(path : String, contents : String) -> Bool {
+    let name = cPath(path)
+    -- 0o666, narrowed by the umask the way `fopen(path, "wb")` narrows it.
+    let fd = cInt(Libc.creat(Ptr.raw(name), 438))
+    Ptr.free(name)
+    if fd < 0 { return False }
+    let written = writeString(fd, contents, False)
+    let closed = cInt(Libc.close(fd)) == 0
+    written && closed
+}
 
-fun stderr(text : String) -> Unit = Prim.stderrWrite(text)
+-- The standard streams. `print` and `write` are the Prelude's, re-exported
+-- from here because this is where a descriptor can be written; `Std.Classes`
+-- held them while they were one primitive call, and cannot now, because the
+-- raw memory underneath imports it.
+--
+-- A failed write to either stream is not reported, as it never was: there is
+-- nowhere to report it to, and a program whose stdout is a closed pipe should
+-- not have to test every line it prints.
+fun print(x) { let _ = writeString(1, show(x), True) }
+fun write(x) { let _ = writeString(1, show(x), False) }
+fun stderr(text : String) -> Unit { let _ = writeString(2, text, False) }
+
+-- -- underneath -----------------------------------------------------------------------
+
+-- A C `int` read out of a 64-bit register: the low half, sign-extended. See
+-- `Unsafe.Libc` for why the high half cannot be trusted.
+fun cInt(r : Int) -> Int {
+    let low = Int.and(r, 4294967295)
+    if low >= 2147483648 { low - 4294967296 } else { low }
+}
+
+-- A NUL-terminated copy the caller frees. An embedded NUL is rejected rather
+-- than truncated at: a path that names one file to Turkey and another to the
+-- operating system is the shape of a directory-traversal bug.
+fun cPath(path : String) -> Ptr.Ptr {
+    for b in String.toBytes(path) {
+        if Byte.toInt(b) == 0 { error("a path cannot contain a NUL byte") }
+    }
+    let name = Ptr.toCString(path)
+    if Ptr.isNull(name) { error("out of memory") }
+    name
+}
+
+fun openForReading(path : String) -> Int {
+    let name = cPath(path)
+    let fd = cInt(Libc.open(Ptr.raw(name), 0))
+    Ptr.free(name)
+    fd
+}
+
+-- Everything left on `fd`, which is closed afterwards, or `None` if a read
+-- failed. Read in chunks until `read` answers 0 rather than sized by `fstat`
+-- first: a pipe or a device has no length to ask for, and a regular file can
+-- change between the two calls.
+fun readAll(fd : Int) -> Option (Array Byte) {
+    let chunk = 65536
+    let buffer = Ptr.alloc(chunk)
+    if Ptr.isNull(buffer) { let _ = Libc.close(fd); error("out of memory") }
+    let out = []
+    loop {
+        let n = Libc.read(fd, Ptr.raw(buffer), chunk)
+        if n < 0 {
+            Ptr.free(buffer)
+            let _ = Libc.close(fd)
+            return None
+        }
+        if n == 0 { break }
+        for var i = 0; i < n; i = i + 1 {
+            let b : Byte = Ptr.load(buffer, i)
+            Array.push(out, b)
+        }
+    }
+    Ptr.free(buffer)
+    let _ = Libc.close(fd)
+    Some(out)
+}
+
+-- `text`'s bytes, and a newline if asked, to `fd` in one `write` where the
+-- kernel allows it: a line is one call, so two processes sharing a terminal
+-- interleave by line and not by fragment. Copied into scratch first, because
+-- a `String` is not a `char *` (`PROPOSALS.md` item 8).
+fun writeString(fd : Int, text : String, newline : Bool) -> Bool {
+    let bs = String.toBytes(text)
+    let n = len(bs)
+    let size = if newline { n + 1 } else { n }
+    if size == 0 { return True }
+    let buffer = Ptr.alloc(size)
+    if Ptr.isNull(buffer) { error("out of memory") }
+    for var i = 0; i < n; i = i + 1 { Ptr.store(buffer, i, bs[i]) }
+    if newline { Ptr.store(buffer, n, Byte.truncate(10)) }
+    let ok = writeAll(fd, buffer, size)
+    Ptr.free(buffer)
+    ok
+}
+
+-- `write` may take fewer bytes than it was offered -- a pipe, a signal -- so
+-- it is asked again from where it stopped. A negative answer is a failure and
+-- ends it; so does 0, which for a non-empty request would otherwise loop.
+fun writeAll(fd : Int, buffer : Ptr.Ptr, size : Int) -> Bool {
+    var done = 0
+    while done < size {
+        let n = Libc.write(fd, Ptr.raw(Ptr.add(buffer, done)), size - done)
+        if n <= 0 { return False }
+        done = done + n
+    }
+    True
+}

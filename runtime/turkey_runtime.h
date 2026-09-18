@@ -36,8 +36,6 @@ int32_t turkey_string_is_valid_utf8(void *array);
 TurkeyString *turkey_string_concat_all(void *array);
 int32_t turkey_string_eq(TurkeyString *left, TurkeyString *right);
 int32_t turkey_string_lt(TurkeyString *left, TurkeyString *right);
-uint8_t turkey_print(TurkeyString *value);
-uint8_t turkey_write(TurkeyString *value);
 
 void *turkey_cell_new(uint64_t value, int32_t pointer_value);
 
@@ -71,7 +69,7 @@ int64_t turkey_collection_count(void);
 void turkey_gc_report(void);
 void turkey_gc_set_stress(int32_t enabled);
 
-/* The outside world: arguments, two file doors, the error stream and `exit`.
+/* The outside world: arguments and `exit`.
    `turkey_args_set` is called by the host before the program runs and copies
    what it is given; `turkey_args_storage` builds the `TurkeyString`s on
    demand. `turkey_exit` unwinds through the panic flag, and `turkey_exiting`
@@ -79,10 +77,6 @@ void turkey_gc_set_stress(int32_t enabled);
 void turkey_args_set(int64_t count, const unsigned char *const *bytes,
                      const int64_t *lengths);
 void *turkey_args_storage(void);
-int32_t turkey_file_can_read(TurkeyString *path);
-void *turkey_read_file_bytes(TurkeyString *path);
-int32_t turkey_write_file_bytes(TurkeyString *path, void *array);
-uint8_t turkey_stderr_write(TurkeyString *value);
 void turkey_exit(int64_t status);
 int32_t turkey_exiting(void);
 int64_t turkey_exit_status(void);

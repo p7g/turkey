@@ -28,8 +28,11 @@ arguments, which `turkey_main` and the JIT's `ctypes` call write before any
 Turkey runs, and the exit flag they read after the last of it returns. That is
 the entry section's business rather than the outside world's, so it sits under
 its own banner in the C, is reached from Turkey through `lib/Unsafe/Runtime.gob`,
-and moves with step 3. Measured cost: none -- `boot` compiling itself, 44MB of
-assembly out through `print`, took 159s before and after. Three findings came
+and moves with step 3. Measured cost: none natively -- `boot` compiling itself,
+44MB of assembly out through `print`, took 159s before and after. The Python
+oracle pays instead, because its `print` is now interpreted Turkey storing a
+byte at a time into the simulated heap: the conformance corpus went from 111s
+to 131s of CPU. Three findings came
 out of the port: a C `int` result is only half defined in an `Int`
 (FINDINGS 102), `canRead` was a race and is gone (103), and arguments were the
 one door into `String` that skipped the UTF-8 check (104).

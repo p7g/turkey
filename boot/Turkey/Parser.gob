@@ -237,6 +237,8 @@ fun parseProgram(p : P) -> Program {
             Array.push(decls, DClass(parseClassDecl(p)))
         } else if at(p, "instance") {
             Array.push(decls, DInstance(parseInstanceDecl(p)))
+        } else if at(p, "foreign") {
+            Array.push(decls, DForeign(parseForeignDecl(p)))
         } else if at(p, "fun") {
             let s2 = cur(p).span
             Array.push(decls, DStmt(mkStmt(p, s2, SFun(parseFunDecl(p, False)))))
@@ -664,6 +666,71 @@ fun parseSignature(p : P, s : Span, name : String, context : Array Pred) -> FunD
         id = freshId(p), span = s, name = name, params = params,
         ret = Some(ret), body = None, context = context, monomorphic = False,
     }
+}
+
+-- `foreign "symbol" fun name(params) -> ret` (TIX-62).
+--
+-- The C symbol is always written, even when it is the Turkey name spelled the
+-- same way, so which of the two names is which is never something a reader has
+-- to work out.
+--
+-- There is no body and no context, and a return type is required: a C function
+-- that returns nothing writes `-> Unit`, because "the signature is stated in
+-- full" is the only property that makes the declaration worth trusting.
+fun parseForeignDecl(p : P) -> ForeignDecl {
+    let s = expect(p, "foreign").span
+    let tok = cur(p)
+    if Token.kindName(tok.kind) != "STRING" {
+        oops(p, "expected the C symbol as a string, found " + describe(tok),
+             tok.span)
+    }
+    step(p)
+    let symbol = text(tok)
+    if symbol == "" {
+        oops(p, "a foreign declaration needs a C symbol", tok.span)
+    }
+    skipToken(p, "fun")
+    let name = text(expectWhat(p, "IDENT", "a function name"))
+    let params = parseForeignParams(p)
+    if !eat(p, "->") {
+        oops(p, "foreign '" + name + "' has no body, so it must state a return "
+                + "type; a C function that returns nothing writes '-> Unit'",
+             cur(p).span)
+    }
+    ForeignDecl {
+        span = s, name = name, symbol = symbol, params = params,
+        ret = parseTypeExpr(p),
+    }
+}
+
+-- `(fd : Int, buf : Prim.Ptr)`, or `(Int, Prim.Ptr)`, or a mix.
+--
+-- Stored the way a signature's parameters are -- an annotated pattern -- so
+-- everything downstream reads a parameter's type off one shape whether it was
+-- named or not. Naming is allowed here and not there because the ambiguity
+-- `looksLikeSignature` exists to settle cannot arise: a foreign declaration
+-- never has a body.
+fun parseForeignParams(p : P) -> Array Pat {
+    skipToken(p, "(")
+    let params = Array.new(2)
+    while !at(p, ")") {
+        let tok = cur(p)
+        if Token.kindName(tok.kind) == "IDENT"
+                && Token.kindName(peek(p, 1).kind) == ":" {
+            step(p)
+            step(p)
+            let ty = parseTypeExpr(p)
+            Array.push(params, mkPat(p, tok.span,
+                                     PAnnot(mkPat(p, tok.span, PVar(text(tok))), ty)))
+        } else {
+            let ty = parseTypeExpr(p)
+            Array.push(params, mkPat(p, ty.span,
+                                     PAnnot(mkPat(p, ty.span, PWild), ty)))
+        }
+        if !eat(p, ",") { break }
+    }
+    skipToken(p, ")")
+    params
 }
 
 -- `[C a, Item c ~ Op]` -- a context, not a binder.

@@ -1,0 +1,59 @@
+module Unsafe.Libc (
+    malloc, free, strlen, getenv, write,
+)
+
+-- The C symbols this system cannot avoid (TIX-62).
+--
+-- `RUNTIME-IN-TURKEY.md` recommends justifying an FFI as a language feature
+-- rather than as a means to the runtime rewrite, and `PROPOSALS.md` item 8 is
+-- that argument. What arrives here is its consequence: the symbols left over
+-- once the libc surface is sorted into what is instruction selection, what is
+-- Turkey written over `read` and `write`, and what genuinely has to be called.
+--
+-- The module's name is the gate. A `foreign` declaration is an assertion about
+-- a signature that nothing can check, which is Modula-3's reason for allowing
+-- `EXTERNAL` only in unsafe interfaces and Rust 2024's for `unsafe extern`;
+-- putting it under `Unsafe.` means the name is in the import list of every
+-- module that reaches a C function, which is Oberon's `SYSTEM` gesture and the
+-- same containment `Prim.` already has. Nothing here is exported to ordinary
+-- Turkey directly -- `Unsafe.Ptr` and `System.*` wrap these, and what they
+-- export is safe.
+--
+-- On Darwin these resolve through libSystem, which `LINKER.md` establishes was
+-- never optional; on Linux they resolve through the platform libc. One
+-- mechanism, two symbol tables. The syscall instruction is deliberately not
+-- here: Go did raw Darwin syscalls until kernel updates broke its binaries,
+-- because Apple does not commit to a syscall ABI.
+--
+-- **Only what has a caller.** The residue an FFI has to cover is about ten
+-- POSIX entry points, and the rest of them -- `read`, `open`, `close`, `mmap`,
+-- `munmap`, the `pthread_*` five -- arrive with the runtime sections that need
+-- them rather than sitting here unused. A declaration nothing calls is not free
+-- to keep: it is a signature nobody has checked against a header, which is
+-- exactly the thing this form cannot verify.
+
+import Prelude ()
+
+-- -- memory ---------------------------------------------------------------------------
+
+-- `size` bytes, uninitialized, or null if the allocation failed. These two
+-- replace `Prim.ptrAlloc` and `Prim.ptrFree`, which were `malloc` and `free`
+-- behind C wrappers written only because there was no way to declare them.
+foreign "malloc" fun malloc(size : Int) -> Prim.Ptr
+
+foreign "free" fun free(p : Prim.Ptr) -> Unit
+
+-- The bytes before the first NUL. The one C function here that wants a
+-- terminated string rather than a pointer and a length.
+foreign "strlen" fun strlen(s : Prim.Ptr) -> Int
+
+-- -- the outside world ----------------------------------------------------------------
+
+-- A pointer into the environment block, or null. C promises the pointer stays
+-- good until something rewrites that variable, and nothing here rewrites one.
+foreign "getenv" fun getenv(name : Prim.Ptr) -> Prim.Ptr
+
+-- Bytes written, or a negative errno. `count` bytes at `buf`, which the caller
+-- owns -- nothing about this pointer is known to the collector, and what `write`
+-- does with it after returning is undefined (PRIMITIVES.md 9.1).
+foreign "write" fun write(fd : Int, buf : Prim.Ptr, count : Int) -> Int

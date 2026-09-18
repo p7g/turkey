@@ -45,15 +45,16 @@ from .constraints import (
     HAS_FIELD, HAS_PROJECTION, ONE_OF, Binding, CAnd, CAssume, CDef, CEq, CExists, CInstance,
     CBind, CLet, CPred, Constraint, Env, reach,
 )
-from .decls import DeclTable, substitute
+from .decls import DeclTable, ForeignInfo, substitute
 from .deps import free_names, pattern_vars, sccs
 from .evidence import Abstraction, InstancePlan, MethodImpl, Use, dict_name
 from .errors import Span, TypeError_
 from .typed import TypeTable
 from .types import (
-    BOOL, BOTTOM, CHAR, EQUALS, FLOAT, INT, OPENED, STRING, UNIT, Pred, Scheme, TBottom, TCon, TFam,
-    TFun, TSet, TTuple, TVar, Type, apply, array_of, float_literal_set,
-    int_literal_set, show, show_pred, vars_of,
+    BOOL, BOTTOM, CHAR, EQUALS, FLOAT, FOREIGN_ARG_REGS, FOREIGN_NAMES,
+    FOREIGN_TYPES, INT, OPENED, STRING, UNIT, Pred, Scheme, TBottom, TCon,
+    TFam, TFun, TSet, TTuple, TVar, Type, apply, array_of, float_literal_set,
+    int_literal_set, mono, prune, show, show_pred, vars_of,
 )
 
 LITERAL_TYPES = {"Int": INT, "Float": FLOAT, "String": STRING, "Char": CHAR}
@@ -209,10 +210,12 @@ class Generator:
         type_decls = [d for d in program.decls if isinstance(d, ast.TypeDecl)]
         class_decls = [d for d in program.decls if isinstance(d, ast.ClassDecl)]
         inst_decls = [d for d in program.decls if isinstance(d, ast.InstanceDecl)]
+        foreigns = [d for d in program.decls if isinstance(d, ast.ForeignDecl)]
         items = [d for d in program.decls if isinstance(d, ast.Stmt)]
         self.decls.register_all(type_decls)
         self.classes.register_all(class_decls, inst_decls, self.module)
         self.bind_methods()
+        self.bind_foreigns(foreigns)
 
         # The graph is keyed by item, not by bound name: a single binding may
         # introduce several names (`let (a, b) = ...`), and keying by name would
@@ -227,6 +230,13 @@ class Generator:
             for name in names_of[keys[id(item)]]:
                 if name in owner:
                     raise TypeError_(f"'{name}' is declared more than once", item.span)
+                if name in self.decls.foreigns:
+                    raise TypeError_(
+                        f"'{name}' is already defined: it is a foreign "
+                        f"declaration, which binds the name the same way a "
+                        f"'fun' does",
+                        item.span,
+                    )
                 if name in self.classes.owner:
                     raise TypeError_(
                         f"'{name}' is already defined: it is a method of class "
@@ -261,6 +271,91 @@ class Generator:
 
         nest(0)
         return ordered, self.pop()
+
+    def bind_foreigns(self, decls: list[ast.ForeignDecl]) -> None:
+        """Put each declared C symbol in the environment, monomorphically.
+
+        A foreign declaration states its type in full and has no body, so
+        there is nothing to infer and nothing to generalize: it goes straight
+        into the environment the way a `Prim.` builtin does, which is exactly
+        what it is -- an entry in that table, written in source instead of in
+        `builtins.py`.
+
+        That also keeps it out of the binding groups below. A group exists to
+        decide what a set of mutually recursive definitions is; a declaration
+        with no definition has nothing to contribute to one, and giving it a
+        group would make the dependency graph carry a node with no edges for
+        no reason.
+        """
+        for decl in decls:
+            if decl.name in self.decls.foreigns:
+                raise TypeError_(
+                    f"'{decl.name}' is declared more than once", decl.span)
+            params = [self.foreign_type(p.type_expr, decl)
+                      for p in decl.params]
+            ret = self.foreign_type(decl.ret, decl)
+            self.check_foreign_arity(decl, params, ret)
+            self.decls.foreigns[decl.name] = ForeignInfo(
+                decl.name, decl.symbol, params, ret, decl.span)
+            self.env.define(decl.name, Binding(mono(TFun(params, ret)), False))
+            # And into scope, not only into the environment. `bound` is what
+            # decides whether a mention resolves, and it reads the scopes;
+            # `bind_methods` does the same pair of writes for the same reason.
+            # Without this a module that calls its *own* declaration is told
+            # the name is not defined, while every other module sees it.
+            self.scopes[0][decl.name] = False
+
+    def foreign_type(self, te: ast.TypeExpr, decl: ast.ForeignDecl) -> Type:
+        """One argument or result type, checked against what can cross.
+
+        The list is the seven types that each erase to exactly one machine
+        representation, which is the same list and the same reason
+        `PRIMITIVES.md` 9.3 gives for raw load and store: a call has to know
+        what file every argument travels in when the instruction is emitted,
+        and nothing whose representation depends on a type argument can say.
+
+        Nothing is marshalled. A `String` does not cross, and a caller that
+        wants a `char *` copies one into raw memory itself -- which is
+        `withCString` in Haskell and `C.CString` in Go, and it is only needed
+        for the path arguments, since everything else a POSIX call takes is a
+        pointer and a length.
+        """
+        ty = prune(self.decls.star(te, {}, self.fresh))
+        if not isinstance(ty, TCon) or ty.name not in FOREIGN_TYPES:
+            allowed = ", ".join(FOREIGN_NAMES)
+            raise TypeError_(
+                f"'{show(ty)}' cannot cross a foreign boundary in "
+                f"'{decl.name}'; a foreign signature is written over "
+                f"{allowed}, and anything else is copied into raw memory by "
+                f"its caller",
+                te.span,
+            )
+        return ty
+
+    @staticmethod
+    def check_foreign_arity(decl: ast.ForeignDecl, params: list[Type],
+                            ret: Type) -> None:
+        """At most eight arguments per register file, and none on the stack.
+
+        `Turkey.Select` says its outgoing stack slots "are this compiler's own
+        convention, and a C function would not read them the same way", and
+        AAPCS64's stack rules are not implemented. A runtime entry point that
+        overflowed was a compiler bug and stopped the function; a *declaration*
+        is written by someone, so it is rejected here, saying which file filled
+        up rather than which instruction could not be selected.
+        """
+        general = sum(1 for p in params if p.name != FLOAT.name)
+        vector = len(params) - general
+        for count, file, regs in ((general, "general", "x0-x7"),
+                                  (vector, "floating-point", "d0-d7")):
+            if count > FOREIGN_ARG_REGS:
+                raise TypeError_(
+                    f"'{decl.name}' takes {count} {file} arguments, and only "
+                    f"{FOREIGN_ARG_REGS} fit in {regs}; arguments past the "
+                    f"registers go on the stack by a convention this compiler "
+                    f"does not implement",
+                    decl.span,
+                )
 
     def bind_methods(self) -> None:
         """Put every class method in scope, under the scheme its class gives it."""

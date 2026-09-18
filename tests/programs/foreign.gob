@@ -1,0 +1,62 @@
+-- An FFI to C (TIX-62): a declared symbol called, on both hosts.
+--
+-- What makes this worth a conformance program rather than a unit test is that
+-- the two hosts answer a foreign call by completely different means. The
+-- native side calls libSystem. The Python side *models* the symbol against the
+-- simulated address space in `turkey/values.py`, because a real `getenv`
+-- cannot be handed a simulated address -- the argument for which is
+-- `turkey/foreign.py`'s header and `PROPOSALS.md` 8.9. So this is the one
+-- place the two implementations are not the same algorithm twice, and the
+-- differential is the only thing that says they agree.
+--
+-- Nothing here prints an environment value. A value is the machine's, and a
+-- golden is this repository's; what is checked is the shape of the answer,
+-- which is the same on any machine that has a `PATH`.
+
+import System.Env as Env
+import Unsafe.Libc as Libc
+import Unsafe.Ptr as Ptr
+
+fun main() {
+    -- A safe wrapper over a declaration. `Unsafe.` is in `System.Env`'s import
+    -- list and not in this program's, which is the whole of what the gate buys.
+    print(Bool.toString(Option.isSome(Env.get("PATH"))))
+    print(Bool.toString(Option.isSome(Env.get("TURKEY_NO_SUCH_VARIABLE"))))
+
+    -- A string across the boundary and back. The copy is deliberate; see
+    -- `Unsafe.Ptr.toCString`.
+    let p = Ptr.toCString("héllo, wörld")
+    match Ptr.fromCString(p) {
+        Some(s) -> {
+            print(s)
+            print(Int.toString(String.byteLength(s)))
+        }
+        None -> print("not well-formed")
+    }
+    Ptr.free(p)
+
+    -- The empty string is a block holding one NUL, not a null pointer.
+    let empty = Ptr.toCString("")
+    print(Bool.toString(Ptr.isNull(empty)))
+    match Ptr.fromCString(empty) {
+        Some(s) -> print("[" + s + "]")
+        None -> print("not well-formed")
+    }
+    Ptr.free(empty)
+
+    -- `fromCString` of null is `None` rather than a panic: a C function that
+    -- failed answers null, and a caller should not have to test twice.
+    print(Bool.toString(Option.isSome(Ptr.fromCString(Ptr.null()))))
+
+    -- A three-argument call, which is where an argument-order mistake would
+    -- live: the two integers travel in x0 and x2 with a pointer between them,
+    -- so a backend that laid them out by position rather than by register file
+    -- would put the count where the buffer goes. Importing `Unsafe.Libc` here
+    -- is also the demonstration that the gate is on *declaring* a symbol and
+    -- not on calling one.
+    let line = Ptr.toCString("written through write(2)\n")
+    let n = Libc.strlen(Ptr.raw(line))
+    let sent = Libc.write(1, Ptr.raw(line), n)
+    print(Int.toString(n) + " " + Int.toString(sent))
+    Ptr.free(line)
+}

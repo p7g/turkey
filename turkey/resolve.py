@@ -146,6 +146,11 @@ class Resolver:
                         self.type_expr(arg)
                     for _label, te in variant.fields or []:
                         self.type_expr(te)
+            elif isinstance(decl, ast.ForeignDecl):
+                decl.name = self.scope.get(decl.name, decl.name)
+                for param in decl.params:
+                    self.pattern(param)
+                self.type_expr(decl.ret)
             elif isinstance(decl, ast.ClassDecl):
                 decl.name = self.cls(decl.name)
                 self.context(decl.supers)

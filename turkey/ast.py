@@ -476,6 +476,31 @@ class FunDecl(Node):
 
 
 @dataclass(eq=False)
+class ForeignDecl(Node):
+    """`foreign "read" fun read(fd : Int, buf : Ptr, count : Int) -> Int`.
+
+    A function this compiler does not compile: a C symbol, and an assertion
+    about its signature that nothing can check. That is why it is its own
+    declaration rather than a `FunDecl` with no body -- a bodiless `FunDecl` is
+    a class method's signature, and the two mean opposite things about who
+    supplies the code.
+
+    Parameters may be named, which a `FunDecl`'s signature form cannot allow.
+    The reason that form forbids it is the ambiguity `Parser.parse_fun_decl`
+    describes -- a bare identifier is both a parameter name and a type variable,
+    and only the presence of a body decides which. A `foreign` declaration can
+    never have a body, so there is nothing to decide, and a declaration whose
+    whole hazard is getting the argument order wrong should be allowed to say
+    what its arguments are.
+    """
+
+    name: str
+    symbol: str
+    params: list[Pattern]
+    ret: TypeExpr
+
+
+@dataclass(eq=False)
 class ConDecl(Node):
     """One variant of a data type. Exactly one of `args` / `fields` is meaningful."""
 
@@ -608,4 +633,4 @@ class ImportDecl(Node):
 class Program(Node):
     header: ModuleHeader | None
     imports: list[ImportDecl]
-    decls: list[Stmt | TypeDecl | ClassDecl | InstanceDecl]
+    decls: list[Stmt | TypeDecl | ClassDecl | InstanceDecl | ForeignDecl]

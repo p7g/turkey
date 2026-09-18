@@ -346,6 +346,10 @@ def _rules():
                lambda: w.maybe(n.body),
                lambda: w.items(n.context))
 
+    def foreigndecl(w: _Writer, n: ast.ForeignDecl) -> None:
+        w.head("foreign", n, quote(n.name), quote(n.symbol))
+        w.kids(lambda: w.items(n.params), lambda: w.node(n.ret))
+
     def condecl(w: _Writer, n: ast.ConDecl) -> None:
         w.head("con", n, quote(n.name))
         w.kids(lambda: w.items(n.args),
@@ -399,7 +403,8 @@ def _rules():
         ast.SLet: slet, ast.SVar: svar, ast.SFun: sfun,
         ast.SAssign: sassign, ast.SExpr: sexpr,
         ast.ClassPred: classpred, ast.EqPred: eqpred,
-        ast.FunDecl: fundecl, ast.ConDecl: condecl, ast.TypeDecl: typedecl,
+        ast.FunDecl: fundecl, ast.ForeignDecl: foreigndecl,
+        ast.ConDecl: condecl, ast.TypeDecl: typedecl,
         ast.FamDecl: famdecl, ast.FamBind: fambind,
         ast.ClassDecl: classdecl, ast.InstanceDecl: instancedecl,
     }

@@ -132,6 +132,8 @@ class Parser:
                 decls.append(self.parse_class_decl())
             elif self.at("instance"):
                 decls.append(self.parse_instance_decl())
+            elif self.at("foreign"):
+                decls.append(self.parse_foreign_decl())
             elif self.at("fun"):
                 decls.append(ast.SFun(self.cur.span, self.parse_fun_decl()))
             elif self.at("let", "var"):
@@ -467,6 +469,69 @@ class Parser:
         ret = self.parse_type_expr() if self.eat("->") else None
         body = self.parse_fun_body()
         return ast.FunDecl(span, name, params, ret, body, context)
+
+    def parse_foreign_decl(self) -> ast.ForeignDecl:
+        """`foreign "symbol" fun name(params) -> ret`.
+
+        The C symbol is always written, even when it is the Turkey name spelled
+        the same way. Which of the two names is which is then never something a
+        reader has to work out, and the declaration that says
+        `foreign "__error" fun errnoLocation() -> Ptr` reads no differently from
+        the one that says `foreign "read" fun read(...)`.
+
+        There is no body and no context. A return type is required -- a C
+        function that returns nothing writes `-> Unit`, because "the signature
+        is stated in full" is the only property that makes the declaration
+        worth trusting.
+        """
+        span = self.expect("foreign").span
+        tok = self.cur
+        if tok.kind != "STRING":
+            raise ParseError(
+                f"expected the C symbol as a string, found {self._describe(tok)}",
+                tok.span,
+            )
+        self.advance()
+        assert isinstance(tok.value, str)
+        symbol = tok.value
+        if not symbol:
+            raise ParseError("a foreign declaration needs a C symbol", tok.span)
+        self.expect("fun")
+        name = self.expect("IDENT", "a function name").text
+        params = self.parse_foreign_params()
+        if not self.eat("->"):
+            raise ParseError(
+                f"foreign '{name}' has no body, so it must state a return "
+                f"type; a C function that returns nothing writes '-> Unit'",
+                self.cur.span,
+            )
+        ret = self.parse_type_expr()
+        return ast.ForeignDecl(span, name, symbol, params, ret)
+
+    def parse_foreign_params(self) -> list[ast.Pattern]:
+        """`(fd : Int, buf : Ptr)`, or `(Int, Ptr)`, or a mix.
+
+        Stored as `FunDecl` stores a signature's parameters -- an annotated
+        pattern -- so that everything downstream reads a parameter's type off
+        one shape whether it was named or not.
+        """
+        self.expect("(")
+        params: list[ast.Pattern] = []
+        while not self.at(")"):
+            start = self.cur
+            if start.kind == "IDENT" and self.peek(1).kind == ":":
+                self.advance()
+                self.advance()
+                ty = self.parse_type_expr()
+                params.append(ast.PAnnot(
+                    start.span, ast.PVar(start.span, start.text), ty))
+            else:
+                ty = self.parse_type_expr()
+                params.append(ast.PAnnot(ty.span, ast.PWild(ty.span), ty))
+            if not self.eat(","):
+                break
+        self.expect(")")
+        return params
 
     def parse_context(self) -> list[ast.ClassPred | ast.EqPred]:
         """`[C a, Item c ~ Op]` -- a context, not a binder.

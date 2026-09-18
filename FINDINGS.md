@@ -319,6 +319,44 @@ the `Option` instance, the unconstrained `Array` instance and a default body.
 
 ## Open, and accepted
 
+### 100. A name in the environment but not in the scopes is visible everywhere except where it was written
+**bug, fixed.** TIX-62. `Infer` keeps two tables that both answer "is this name
+in scope": `env`, which holds the scheme, and `scopes`, which `bound` reads to
+decide whether a mention resolves at all. A `foreign` declaration was written
+into the first and not the second.
+
+The failure that produced is the interesting part. **Every module could call
+the declaration except the one that declared it.** `lib/Unsafe/Ptr.gob` calls
+`Libc.malloc` and worked; `lib/Unsafe/Libc.gob` calling its own `strlen` was
+told `'strlen' is not defined`. So the whole library built, the conformance
+program ran on both hosts, and the bug was invisible until a unit test wrote a
+declaration and a use into one file -- which no real module had yet had a
+reason to do.
+
+`bindMethods` gets this right and has done since classes landed: it writes
+`C.define` and `Map.put(g.scopes[0], ...)` on adjacent lines. Reading it as the
+model and copying only the first line is the whole mistake, and it is the same
+shape as FINDINGS 93 -- the fix exists, in a function two screens away, and the
+copy took the half that looked load-bearing.
+
+What would have caught it earlier is a test written before the library: the
+library is a bad first caller for a feature like this precisely because a
+library module tends to declare things *for* other modules, so the
+self-reference case never arises.
+
+### 101. `foreign` was the first thing to need a Mach-O underscore it did not get
+**bug, fixed.** TIX-62. `Turkey.Select` formats a `Direct` callee with
+`Asm.symbolFor` and a runtime callee with `Asm.runtimeFor`, both of which add
+the leading underscore Mach-O wants. A foreign callee got neither -- the symbol
+arrived already correct from the programmer, and "already correct" read as
+"needs nothing done to it". `bl malloc` assembles and fails at the link.
+
+Worth recording because the check that caught it was reading the emitted
+assembly by eye, not a test: `test_arm64_native` links, so it would have caught
+it too, but only after a three-minute rebuild. The cheap check is that there is
+exactly one way a symbol is written in this backend, and any new callee shape
+has to go through it.
+
 ### 98. Two codes that meant the same thing, and a bit thrown away before it was read
 **bug, fixed.** TIX-61. The collector traced a slot whose three-bit layout code
 was `>= 6`, and 6 and 7 were `PTR` and `BOXED` -- both traced. So the two codes

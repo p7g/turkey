@@ -187,6 +187,7 @@ fun add(l : Loader, name : String, source : Source, library : Bool,
         }
     }
 
+    checkForeignPlacement(name, program, library)
     let m = Module {
         name = name, program = program, library = library,
         scope = newScope(), exports = newScope(),
@@ -478,6 +479,38 @@ fun isLower(name : String) -> Bool = match String.decode(name, String.start(name
     None -> False
 }
 
+-- Where a `foreign` declaration may appear (TIX-62): under `Unsafe.` in the
+-- shipped standard library, which is exactly where `Prim.` may be spelled.
+--
+-- The subject of `Unsafe.` is "the collector does not know about this", and a
+-- foreign symbol is the largest instance of it: the signature is an assertion
+-- nothing can check, which is Modula-3's reason for allowing `EXTERNAL` only in
+-- unsafe interfaces and Rust 2024's for `unsafe extern`. The name is then in
+-- the import list of every module that reaches a C function, which is Oberon's
+-- `SYSTEM` gesture.
+--
+-- Two things this deliberately is not. It is not a check on the module's
+-- declared *name*: only the loader knows where a file came from, and a program
+-- that called its own module `Unsafe.Libc` and put it beside itself would
+-- otherwise let itself in. And it is not "any directory named lib" -- the first
+-- search root is the entry file's own directory, so that would be the same hole
+-- wearing a different hat.
+let unsafePrefix = "Unsafe."
+
+fun checkForeignPlacement(name : String, program : Program,
+                          library : Bool) -> Unit {
+    if library && String.startsWith(name, unsafePrefix) { return }
+    for d in program.decls {
+        match d {
+            DForeign(f) -> oopsAt("a foreign declaration may only appear in a "
+                + "standard library module under '" + unsafePrefix + "', and '"
+                + name + "' is not one; declare the symbol there and export a "
+                + "wrapper", Some(f.span))
+            _ -> {}
+        }
+    }
+}
+
 -- -- what a module declares ---------------------------------------------------------
 
 -- What a module declares, in each of `Scope`'s five namespaces, before class
@@ -516,6 +549,7 @@ fun ownDeclared(program : Program) -> Array (Array String) {
                 for fam in c.families { Array.push(types, fam.name) }
             }
             DInstance(_) -> {}
+            DForeign(f) -> Array.push(values, f.name)
         }
     }
     [values, types, cons, classes, methods]
@@ -565,6 +599,8 @@ fun ownScope(name : String, program : Program) -> Scope {
                 }
                 _ -> {}
             }
+            DForeign(f) -> Map.put(scope.values, f.name,
+                                   Prelude.internal(name, f.name))
             _ -> {}
         }
     }

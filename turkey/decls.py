@@ -104,6 +104,25 @@ class FamilyInfo:
     span: Span | None = None
 
 
+@dataclass
+class ForeignInfo:
+    """What a `foreign` declaration says, once its types are resolved.
+
+    The same three facts a `Prim.` entry carries -- a C symbol, what it takes
+    and what it answers -- which is the point: a declaration is an entry in
+    that table written in source. It lives in the declaration table because
+    that is the one thing threaded from the front end to both backends, and a
+    call site needs the symbol and the result's representation at the moment
+    the instruction is emitted.
+    """
+
+    name: str
+    symbol: str
+    params: list[Type]
+    ret: Type
+    span: Span | None = None
+
+
 class DeclTable:
     def __init__(self) -> None:
         self.tycons: dict[str, TyconInfo] = {}
@@ -118,6 +137,10 @@ class DeclTable:
         # resolved, since a method's type may mention a family of a class
         # declared further down the file.
         self.families: dict[str, FamilyInfo] = {}
+        # Every `foreign` declaration in the program, by the name it was
+        # bound under. Written by `infer.Generator.bind_foreigns` and read by
+        # the backends, which is why it is here rather than on a module.
+        self.foreigns: dict[str, ForeignInfo] = {}
         # `newtypes`, once the declarations are all in.
         self._newtypes: set[str] | None = None
         # Existential constructors whose contexts name classes, until

@@ -2,6 +2,8 @@ module Unsafe.Ptr (
     Ptr(..), alloc, free,
     add, diff, null, isNull, toInt, fromInt,
     Load, load, Store, store,
+    toCString, fromCString,
+    raw, wrap,
 )
 
 -- Raw memory (TIX-61).
@@ -15,23 +17,28 @@ module Unsafe.Ptr (
 -- `Ptr` is a newtype over `Prim.Ptr` and erases to it, so the wrapper costs
 -- nothing at run time. `Prim.Ptr` itself is spellable only from `lib/`.
 --
--- `alloc` and `free` are `malloc` and `free` and are temporary: TIX-62's FFI
--- declares both directly and this pair goes with the primitives underneath.
+-- `alloc` and `free` are `malloc` and `free`, and now say so: TIX-62 declares
+-- both in `Unsafe.Libc` and the two C wrappers underneath them are gone.
 
 import Prelude ()
 import Std.Classes
+import Data.Array as Array
 import Data.Bool.Type (Bool(..))
+import Data.Byte as Byte
+import Data.Option.Type (Option(..))
+import Data.String as String
+import Unsafe.Libc as Libc
 
 type Ptr = Ptr(Prim.Ptr)
 
 -- `size` bytes of uninitialized memory, or a null pointer if the allocation
 -- failed. The contents are undefined -- not zero -- and reading before writing
 -- is undefined behaviour rather than a panic.
-fun alloc(size : Int) -> Ptr = Ptr(Prim.ptrAlloc(size))
+fun alloc(size : Int) -> Ptr = Ptr(Libc.malloc(size))
 
 -- Freeing a pointer this module did not answer, or one already freed, is
 -- undefined behaviour. Freeing a null pointer does nothing.
-fun free(p : Ptr) = match p { Ptr(raw) -> Prim.ptrFree(raw) }
+fun free(p : Ptr) = match p { Ptr(address) -> Libc.free(address) }
 
 -- -- arithmetic ------------------------------------------------------------------------
 
@@ -118,4 +125,71 @@ instance Store Ptr {
     fun store(p, off, v) = match (p, v) {
         (Ptr(r), Ptr(x)) -> Prim.storePtr(r, off, x)
     }
+}
+
+-- -- crossing to a declaration --------------------------------------------------------
+
+-- The address inside, and the wrapper around one.
+--
+-- A `foreign` declaration is written over `Prim.Ptr`, because the type mapping
+-- is the seven types that each erase to one representation and a newtype is
+-- not one of them by name. These two are the seam, and they are free: `Ptr` is
+-- a newtype and erases to exactly what it wraps.
+--
+-- They are exported rather than kept private because that seam is the whole
+-- job of an `Unsafe.` module -- the containment is the module's name being in
+-- an import list, not a value being out of reach inside it.
+fun raw(p : Ptr) -> Prim.Ptr = match p { Ptr(address) -> address }
+
+fun wrap(address : Prim.Ptr) -> Ptr = Ptr(address)
+
+-- -- C strings ------------------------------------------------------------------------
+
+-- A `String` copied into a NUL-terminated block the caller must `free`, or
+-- null if the allocation failed (TIX-62).
+--
+-- **A copy, and deliberately.** The survey behind `PROPOSALS.md` item 8 found
+-- that the boundary is decided by whether the collector moves: Go and the JVM
+-- copy because theirs do, and OCaml pads its strings so that `String_val` is a
+-- `char *` for free because its heap does not move. Turkey's does not move
+-- either, so that route was open -- and it is declined, because under this
+-- FFI's scope the only NUL-terminated arguments are paths and environment
+-- names. Paying a byte on every string in the program to save a copy at a
+-- handful of call sites is the wrong trade. If a measurement ever says
+-- otherwise, OCaml's padding is one byte in `turkey_string_new` and nothing
+-- above the runtime can see it.
+--
+-- A `String` containing a NUL byte is truncated on the C side, which is
+-- exactly OCaml's documented caveat and is not checked here: the block holds
+-- the whole string, and it is C's reader that stops early.
+fun toCString(s : String) -> Ptr {
+    let bs = String.toBytes(s)
+    let p = alloc(len(bs) + 1)
+    if isNull(p) { return p }
+    for var i = 0; i < len(bs); i = i + 1 {
+        store(add(p, i), 0, bs[i])
+    }
+    store(add(p, len(bs)), 0, Byte.truncate(0))
+    p
+}
+
+-- The bytes up to the first NUL, as a `String`, or `None` if they are not
+-- well-formed UTF-8 -- the same validating boundary `String.fromBytes` is, and
+-- for the same reason: a C string is bytes and a `String` is not.
+--
+-- Reading a pointer that is not NUL-terminated runs off the end of the block,
+-- which is undefined (PRIMITIVES.md 9.1). Reading null is not: it answers
+-- `None`, because a C function that failed answers null and a caller should
+-- not have to test twice.
+fun fromCString(p : Ptr) -> Option String {
+    if isNull(p) { return None }
+    let bs = []
+    var i = 0
+    loop {
+        let b : Byte = load(add(p, i), 0)
+        if Byte.toInt(b) == 0 { break }
+        Array.push(bs, b)
+        i = i + 1
+    }
+    String.fromBytes(bs)
 }

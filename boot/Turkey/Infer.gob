@@ -40,7 +40,7 @@ import Turkey.Constraints as C
 import Turkey.Constraints (Constraint(..), Binding(..), Env(..), PredCell(..),
                            LetCell(..))
 import Turkey.Decls as Decls
-import Turkey.Decls (DeclTable(..), ConInfo(..), TyconInfo(..))
+import Turkey.Decls (DeclTable(..), ConInfo(..), TyconInfo(..), ForeignInfo(..))
 import Turkey.Deps as Deps
 import Turkey.Diag as Diag
 import Turkey.Exhaustive as Exhaustive
@@ -247,6 +247,7 @@ fun generate(g : Generator, program : Program) -> (Array Stmt, Constraint) {
     let typeDecls = Array.new(8)
     let classDecls = Array.new(4)
     let instDecls = Array.new(4)
+    let foreigns = Array.new(4)
     let items = Array.new(16)
     for d in program.decls {
         match d {
@@ -254,11 +255,13 @@ fun generate(g : Generator, program : Program) -> (Array Stmt, Constraint) {
             DClass(c) -> Array.push(classDecls, c)
             DInstance(i) -> Array.push(instDecls, i)
             DStmt(s) -> Array.push(items, s)
+            DForeign(f) -> Array.push(foreigns, f)
         }
     }
     Decls.registerAll(g.decls, typeDecls)
     Classes.registerAll(g.classes, classDecls, instDecls, g.module_)
     bindMethods(g)
+    bindForeigns(g, foreigns)
 
     -- The graph is keyed by item, not by bound name: a single binding may
     -- introduce several names, and keying by name would split one item across
@@ -277,6 +280,11 @@ fun generate(g : Generator, program : Program) -> (Array Stmt, Constraint) {
             if Map.contains(owner, name) {
                 oops("'" + name + "' is declared more than once",
                      Some(items[i].span))
+            }
+            if Map.contains(g.decls.foreigns, name) {
+                oops("'" + name + "' is already defined: it is a foreign "
+                     + "declaration, which binds the name the same way a "
+                     + "'fun' does", Some(items[i].span))
             }
             match Map.get(g.classes.owner, name) {
                 Some(cls) -> oops("'" + name + "' is already defined: it is a "
@@ -372,6 +380,95 @@ fun checkGroupRecursion(group : Array Stmt, boundNames : Array String,
 }
 
 -- Put every class method in scope, under the scheme its class gives it.
+-- Put each declared C symbol in the environment, monomorphically (TIX-62).
+--
+-- A foreign declaration states its type in full and has no body, so there is
+-- nothing to infer and nothing to generalize: it goes straight into the
+-- environment the way a `Prim.` builtin does, which is exactly what it is.
+--
+-- That also keeps it out of the binding groups. A group exists to decide what
+-- a set of mutually recursive definitions is; a declaration with no definition
+-- has nothing to contribute to one.
+fun bindForeigns(g : Generator, decls : Array ForeignDecl) -> Unit {
+    for d in decls {
+        if Map.contains(g.decls.foreigns, d.name) {
+            oops("'" + d.name + "' is declared more than once", Some(d.span))
+        }
+        let params = Array.new(len(d.params))
+        for param in d.params {
+            match param.kind {
+                PAnnot(_, te) -> Array.push(params, foreignType(g, te, d.name))
+                -- The parser builds every one of these, so this cannot
+                -- happen; saying so beats a silent wrong type.
+                _ -> oops("a foreign parameter must state its type",
+                          Some(param.span))
+            }
+        }
+        let ret = foreignType(g, d.ret, d.name)
+        checkForeignArity(d, params)
+        Map.put(g.decls.foreigns, d.name, ForeignInfo {
+            name = d.name, symbol = d.symbol, params = params, ret = ret,
+            span = Some(d.span),
+        })
+        C.define(g.env, d.name, Binding {
+            scheme = Ty.mono(TFun(params, ret)), mutable = False,
+        })
+        -- And into scope, not only into the environment. `bound` is what
+        -- decides whether a mention resolves and it reads the scopes;
+        -- `bindMethods` does the same pair of writes for the same reason.
+        -- Without this a module that calls its *own* declaration is told the
+        -- name is not defined, while every other module sees it.
+        Map.put(g.scopes[0], d.name, False)
+    }
+}
+
+-- One argument or result type, checked against what can cross.
+--
+-- Nothing is marshalled. A `String` does not cross, and a caller that wants a
+-- `char *` copies one into raw memory itself -- which is `withCString` in
+-- Haskell and `C.CString` in Go, and is needed only for path arguments, since
+-- everything else a POSIX call takes is a pointer and a length.
+fun foreignType(g : Generator, te : Type, who : String) -> Ty.Type {
+    let ty = Ty.prune(Decls.star(g.decls, te, Map.new(),
+                                 fun() = freshCell(g)))
+    match ty {
+        TCon(cell) -> if Ty.isForeignType(cell.name) { return ty }
+        _ -> {}
+    }
+    oops("'" + Ty.show(ty) + "' cannot cross a foreign boundary in '" + who
+         + "'; a foreign signature is written over " + Ty.foreignTypes()
+         + ", and anything else is copied into raw memory by its caller",
+         Some(te.span))
+}
+
+-- At most eight arguments per register file, and none on the stack.
+--
+-- `Turkey.Select` says its outgoing stack slots "are this compiler's own
+-- convention, and a C function would not read them the same way", and
+-- AAPCS64's stack rules are not implemented. A runtime entry point that
+-- overflowed was a compiler bug and stopped the function; a *declaration* is
+-- written by someone, so it is rejected here, saying which file filled up
+-- rather than which instruction could not be selected.
+fun checkForeignArity(d : ForeignDecl, params : Array Ty.Type) -> Unit {
+    var general = 0
+    var vector = 0
+    for p in params {
+        if Ty.sameType(p, Ty.tFloat()) { vector = vector + 1 }
+        else { general = general + 1 }
+    }
+    let limit = Ty.foreignArgLimit()
+    for (count, file, regs) in [(general, "general", "x0-x7"),
+                                (vector, "floating-point", "d0-d7")] {
+        if count > limit {
+            oops("'" + d.name + "' takes " + Int.toString(count) + " " + file
+                 + " arguments, and only " + Int.toString(limit) + " fit in "
+                 + regs + "; arguments past the registers go on the stack by a "
+                 + "convention this compiler does not implement",
+                 Some(d.span))
+        }
+    }
+}
+
 fun bindMethods(g : Generator) -> Unit {
     for (_, info) in Map.entries(g.classes.classes) {
         for (_, m) in Map.entries(info.methods) {

@@ -3364,4 +3364,86 @@ with a `short` cannot be read a field at a time yet.
 `free` behind two `Runtime(name)` calls, so that the type has a source of
 memory before there is an FFI. TIX-62 declares both through the FFI and deletes
 the primitives and the C wrappers, which makes replacing them that ticket's
-first real test.
+first real test. Delta 71 is that ticket, and it did.
+
+---
+
+### 71. `foreign`: calling C
+
+Turkey could not call C at all, which was a limitation of the language and not
+of the runtime. The argument is `PROPOSALS.md` item 8, with the survey behind
+it; this is what it decided.
+
+```
+foreign "read" fun read(fd : Int, buf : Prim.Ptr, count : Int) -> Int
+```
+
+A top-level declaration naming a C symbol and a signature, lowered to a direct
+call at the platform C ABI. The symbol is always written, even when it is the
+Turkey name spelled the same way, so which of the two names is which is never
+something a reader works out. There is no body and no context, and a return
+type is required -- a C function that returns nothing writes `-> Unit`.
+
+**Legal only in a library module under `Unsafe.`**, and checked where the file
+is loaded rather than against the module's declared name, so that a program
+cannot let itself in by naming its own module `Unsafe.Libc`. Modula-3 allows
+`EXTERNAL` only in unsafe interfaces because it "cannot enforce type safety of
+safe modules that use EXTERNAL", and Rust 2024 reached the same rule
+independently: a signature in an `extern` block is an assertion the compiler
+cannot verify, and it is the declarer's to make, not the caller's to prove.
+What Rust adds is the piece taken here -- items inside the unsafe block may be
+`safe` to use -- which is why `System.Env.get` is ordinary Turkey and has
+`Unsafe.Libc` in its import list.
+
+**Seven types cross**: `Unit`, `Bool`, `Byte`, `Char`, `Int`, `Float` and
+`Prim.Ptr`. Each erases to exactly one machine representation, which is the
+same list and the same reason delta 70's raw load and store is built on: a call
+has to know what register file every argument travels in at the point the
+instruction is emitted. Nothing is marshalled, and a type outside the list is
+rejected at the declaration rather than at a call.
+
+**`String` does not cross.** The survey's finding is that the boundary is
+decided by whether the collector moves -- Go and the JVM copy because theirs
+do, and OCaml pads its strings so `String_val` is a `char *` for free because
+its heap does not. Turkey's does not move either, so OCaml's route was open and
+is declined: under this FFI's scope the only NUL-terminated arguments are paths
+and environment names, and paying a byte on every string in the program to save
+a copy at a handful of call sites is the wrong trade. `Unsafe.Ptr.toCString`
+and `fromCString` copy instead. The option stays open -- the padding is one
+byte in `turkey_string_new` that nothing above the runtime can see.
+
+**No variadics.** Go and Haskell both decline them and route to a C wrapper,
+and a C wrapper is the C compiler this whole sequence exists to remove. And
+declining is not neutral on the target that matters: Darwin's arm64 convention
+passes every variadic argument on the stack where AAPCS64 uses registers, so a
+fixed-arity `snprintf` would miscompile rather than fail to build. The price is
+that `%.17g` formatting and `strtod` become Turkey work, which is owed anyway.
+
+**At most eight arguments per register file, and none on the stack.**
+`Turkey.Select` says its outgoing stack slots are its own convention and not
+one a C function would read, and AAPCS64's stack rules are unimplemented. Every
+function the runtime sequence needs takes six or fewer, so this costs nothing
+today -- and it is a rule with an error rather than a compiler stop, because a
+declaration is written by someone and a runtime entry point was not.
+
+**errno is a library, not a call form**, unlike cgo's optional second return
+value. The catch worth writing down: on Darwin `errno` is a macro for
+`*__error()`, a *call*, so reading it is an ordinary foreign declaration and
+declaring `errno` as an extern global silently does not work. glibc's is
+`__errno_location()`.
+
+**What C does with a pointer after the call is undefined**, in the sense 9.1
+already uses. The half that can be checked already is: `LowIr.checkReps`
+rejects storing a traced pointer through a raw one, which is cgo's first rule
+caught at compile time instead of at run time. The other half needs lifetimes,
+and no peer expresses it either. The pinning problem that Go, JNI and the JVM
+all spend machinery on does not arise here, because the collector does not move
+objects.
+
+**The Python side models a symbol rather than calling it.** Its addresses are
+simulated (9.4), so a real call cannot be handed one; `ctypes` was rejected
+because it would make the two arms of `test_native`'s differential the host's
+libc called twice. Each symbol is a delegation to Python's own POSIX layer with
+buffers copied in and out of the simulated heap, and a symbol with no
+delegation is a clean refusal at the moment this host is asked to call it. The
+declaration is still checked, still lowered, and still runs natively.

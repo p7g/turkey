@@ -38,12 +38,6 @@ def _runtime_entry_points() -> set[str]:
 ALLOWED_RUNTIME_CALLS = {
     "turkey_object_new", "turkey_array_new", "turkey_cell_new",
     "turkey_closure_new",
-    # `malloc` and `free`, and only those two: a raw *load* or *store* is a
-    # `getelementptr` and a `load`, which is exactly what this test is for
-    # (TIX-61). If either of those ever appears here, the feature has
-    # regressed into runtime calls and stopped being usable in TIX-63's
-    # non-allocating subset.
-    "turkey_ptr_alloc", "turkey_ptr_free",
     "turkey_box", "turkey_unbox",
     "turkey_string_new", "turkey_string_concat", "turkey_string_concat_all",
     "turkey_string_eq", "turkey_string_lt", "turkey_string_byte_length",
@@ -1075,9 +1069,12 @@ def test_a_raw_load_is_not_a_safepoint():
                  "storePtr", "ptrAdd", "ptrDiff", "ptrNull", "ptrIsNull",
                  "ptrEq", "ptrToInt", "ptrFromInt"):
         assert name not in llvmgen._CALLING_PRIMS, name
-    # And the two that genuinely are calls still are.
-    assert "ptrAlloc" in llvmgen._CALLING_PRIMS
-    assert "ptrFree" in llvmgen._CALLING_PRIMS
+    # `malloc` and `free` were the two that genuinely were calls, and they are
+    # no longer primitives at all: TIX-62 declares them in `lib/Unsafe/Libc.gob`
+    # and the C wrappers are gone. A raw load or store stays what this test is
+    # about -- a `getelementptr` and a `load` -- so nothing here became a call.
+    assert "ptrAlloc" not in llvmgen._CALLING_PRIMS
+    assert "ptrFree" not in llvmgen._CALLING_PRIMS
 
 
 def test_a_raw_load_emits_a_bare_load():

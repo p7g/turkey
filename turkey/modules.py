@@ -159,6 +159,7 @@ class ModuleLoader:
             # the pre-pass that decides it already ran. Read it again, knowing.
             program = parse(src, frozenset(self.tycons), file)
 
+        _check_foreign_placement(name, program, library)
         module = Module(name, program, library)
         self.tycons |= {d.name for d in program.decls
                         if isinstance(d, ast.TypeDecl)}
@@ -325,6 +326,46 @@ class ModuleLoader:
         return target
 
 
+#: Where a `foreign` declaration may appear: under `Unsafe.` in the shipped
+#: standard library, which is exactly where `Prim.` may be spelled.
+#:
+#: The subject of `Unsafe.` is "the collector does not know about this", and a
+#: foreign symbol is the largest instance of it: the signature is an assertion
+#: nothing can check, which is Modula-3's reason for allowing `EXTERNAL` only
+#: in unsafe interfaces and Rust 2024's for `unsafe extern`. The name is then
+#: in the import list of every module that reaches a C function, which is
+#: Oberon's `SYSTEM` gesture.
+#:
+#: Two things this deliberately is not. It is not a check on the module's
+#: declared *name*: only the loader knows where a file came from, and a program
+#: that called its own module `Unsafe.Libc` and put it beside itself would
+#: otherwise let itself in. And it is not "any directory named lib" -- the
+#: first search root is the entry file's own directory, so that would be the
+#: same hole wearing a different hat. `library` means this repository's `lib`,
+#: and nothing else.
+#:
+#: What that costs is that a *user* cannot declare a symbol yet, only use the
+#: wrappers over the ones declared here. That is the same position `Prim.` is
+#: in and is not the FFI's decision to reverse; the thing that would reverse it
+#: is a story for where a third-party library lives, which this compiler does
+#: not have.
+UNSAFE = "Unsafe."
+
+
+def _check_foreign_placement(name: str, program: ast.Program,
+                             library: bool) -> None:
+    if library and name.startswith(UNSAFE):
+        return
+    for decl in program.decls:
+        if isinstance(decl, ast.ForeignDecl):
+            raise TypeError_(
+                f"a foreign declaration may only appear in a standard library "
+                f"module under '{UNSAFE}', and '{name}' is not one; declare "
+                f"the symbol there and export a wrapper",
+                decl.span,
+            )
+
+
 def own_declared(program: ast.Program) -> tuple[list[str], ...]:
     """What a module declares in each of `Scope`'s namespaces."""
     values: list[str] = []
@@ -335,6 +376,8 @@ def own_declared(program: ast.Program) -> tuple[list[str], ...]:
     for decl in program.decls:
         if isinstance(decl, ast.SFun):
             values.append(decl.decl.name)
+        elif isinstance(decl, ast.ForeignDecl):
+            values.append(decl.name)
         elif isinstance(decl, (ast.SLet, ast.SVar)):
             values.extend(sorted(pattern_vars(decl.pat)))
         elif isinstance(decl, ast.TypeDecl):
@@ -371,6 +414,8 @@ def _own_scope(module: str, program: ast.Program) -> Scope:
     for decl in program.decls:
         if isinstance(decl, ast.SFun):
             scope.values[decl.decl.name] = internal(module, decl.decl.name)
+        elif isinstance(decl, ast.ForeignDecl):
+            scope.values[decl.name] = internal(module, decl.name)
         elif isinstance(decl, (ast.SLet, ast.SVar)):
             for name in pattern_vars(decl.pat):
                 scope.values[name] = internal(module, name)

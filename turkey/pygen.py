@@ -12,6 +12,7 @@ import re
 from dataclasses import dataclass, field
 
 from . import ast
+from . import foreign
 from .builtins import PRIM_NAMES, initial_primitives
 from .core import (class_of_dict, 
     CApp, CArray, CAssign, CCon, CDeref, CExpr, CField, CIf, CIndex, CProject,
@@ -686,7 +687,10 @@ def generate(program: CProgram, decls: DeclTable, main: str = "main") -> str:
     for bind in program.dicts + program.binds:
         env.setdefault(bind.name, _Name(gen.fresh(bind.name), True))
 
-    for name in sorted(PRIM_NAMES):
+    # A `foreign` declaration is a `Prim.` entry written in source, so it
+    # arrives the same way: a name bound to a callable this module did not
+    # compile. `_PRIMS` carries both, which is why the two loops are one.
+    for name in sorted(set(PRIM_NAMES) | set(decls.foreigns)):
         py = gen.fresh(name)
         gen.primitives[name] = py
         env[name] = _Name(py, True)
@@ -762,13 +766,17 @@ def execute(program: CProgram, decls: DeclTable, main: str = "main",
             filename: str = "<input>") -> None:
     """Compile generated source in memory and execute its runner."""
     source = generate(program, decls, main)
-    namespace = _runtime_namespace()
+    namespace = _runtime_namespace(decls)
     exec(compile(source, filename, "exec"), namespace)
     namespace["__turkey_run"]()
 
 
-def _runtime_namespace() -> dict[str, object]:
+def _runtime_namespace(decls: DeclTable | None = None) -> dict[str, object]:
     """Fresh globals for one generated module (also used by the benchmark)."""
+    prims = initial_primitives()
+    if decls is not None:
+        prims |= {name: fn.fn for name, fn
+                  in foreign.bindings(decls).items()}  # type: ignore[attr-defined]
     return {
         "_UNIT": UNIT,
         "_ArrayObj": ArrayObj,
@@ -781,7 +789,7 @@ def _runtime_namespace() -> dict[str, object]:
         "_TurkeyPanic": TurkeyPanic,
         "_panic_call": _panic_call,
         "_panic": _panic,
-        "_PRIMS": initial_primitives(),
+        "_PRIMS": prims,
     }
 
 

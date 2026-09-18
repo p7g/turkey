@@ -110,10 +110,6 @@ _CALLING_PRIMS = frozenset({
     "arrayNew", "arrayNewUninit", "error", "stderrWrite", "exit",
     "argsStorage", "fileCanRead", "readFileStorage",
     "writeFileBytes",
-    # `malloc` and `free` are calls, so a collection can happen inside one --
-    # not because they allocate on the turkey heap (they do not) but because
-    # this set is about what may run before the call returns.
-    "ptrAlloc", "ptrFree",
 })
 #: `Prim.load*` / `Prim.store*` to the LLVM type the access is at. One name
 #: per representation because the width has to be known where the instruction
@@ -129,7 +125,25 @@ _RAW_ACCESS = {
 _LAYOUT_SUFFIXES = frozenset(layout.value for layout in bir.Layout)
 
 
+def _foreign_type(layout: bir.Layout) -> ir.Type:
+    """The LLVM type a declared argument or result travels in.
+
+    Total on the seven layouts a foreign signature can produce, and no others:
+    `BOXED` cannot appear, because the type mapping admits nothing whose
+    representation depends on a type argument.
+    """
+    if layout is bir.Layout.UNIT:
+        return ir.VoidType()
+    return _llvm_type(layout)
+
+
 def _is_safepoint(op: str) -> bool:
+    if op.startswith("foreign."):
+        # Not because a C function allocates on the Turkey heap -- it does
+        # not -- but because this is about what may run before the call
+        # returns, which for a symbol this compiler did not compile is
+        # anything at all.
+        return True
     if op in _CALLING_OPS:
         return True
     if not op.startswith("prim."):
@@ -386,14 +400,41 @@ class _Emitter:
         self.panic_sites: dict[bir.Frame, ir.GlobalVariable] = {}
         self.nullary_objects: dict[tuple[int, int], ir.GlobalVariable] = {}
         self._declare_runtime()
+        self._declare_foreigns()
+
+    def _declare_foreigns(self) -> None:
+        """One `declare` per C symbol the module actually calls (TIX-62).
+
+        Beside the runtime's own, and for the reason `Turkey.Runtime`'s header
+        gives for keeping LLVM's `declare` lines where they are: they carry
+        argument types the entry-point table does not have, and an undeclared
+        or mistyped symbol is something LLVM refuses rather than miscompiles.
+        A foreign declaration is the same bargain with the signature supplied
+        by a person instead of by a header.
+
+        A symbol declared but never called is not declared here, and the set
+        is sorted, because `Turkey.Llvm` derives the same set by scanning the
+        module it is handed and the two emitters are diffed line for line.
+        """
+        called = {
+            instruction.op[len("foreign."):]
+            for function in self.source.functions
+            for block in function.blocks
+            for instruction in block.instructions
+            if instruction.op.startswith("foreign.")
+        }
+        for symbol in sorted(called):
+            info = self.source.foreigns[symbol]
+            self.runtime[symbol] = ir.Function(
+                self.module,
+                ir.FunctionType(_foreign_type(info.ret),
+                                [_foreign_type(p) for p in info.params]),
+                name=symbol)
 
     def _runtime(self, name: str, ret: ir.Type, args: list[ir.Type]) -> None:
         self.runtime[name] = ir.Function(self.module, ir.FunctionType(ret, args), name=name)
 
     def _declare_runtime(self) -> None:
-        # Raw memory (TIX-61), deleted by TIX-62's FFI.
-        self._runtime("turkey_ptr_alloc", _PTR, [_I64])
-        self._runtime("turkey_ptr_free", ir.VoidType(), [_PTR])
         self._runtime("turkey_string_new", _PTR, [_PTR, _I64])
         self._runtime("turkey_string_concat", _PTR, [_PTR, _PTR])
         self._runtime("turkey_int_to_string", _PTR, [_I64])
@@ -1022,6 +1063,17 @@ class _Emitter:
             return value, self._propagate(function, builder)
         if op.startswith("prim."):
             return self._primitive(function, builder, op[5:], args, instruction.result.layout)
+        if op.startswith("foreign."):
+            symbol = op[len("foreign."):]
+            info = self.source.foreigns[symbol]
+            called = builder.call(self.runtime[symbol], args)
+            # C's `void` is not the language's unit: a void call names no
+            # value and every instruction here has a result, so the unit the
+            # instruction promises is produced separately. `turkey_ptr_free`
+            # needed the same split back when `free` was a primitive.
+            value = (ir.Constant(_I8, 0) if info.ret is bir.Layout.UNIT
+                     else called)
+            return value, self._propagate(function, builder)
         if op == "cell_new":
             bits = self._to_i64(builder, args[0])
             pointer = int(instruction.args[0].layout in (bir.Layout.PTR, bir.Layout.BOXED))
@@ -1300,12 +1352,6 @@ class _Emitter:
                                   builder.not_(builder.and_(ordered, builder.and_(low, high))),
                                   "Float is not representable as an Int")
             return builder.fptosi(args[0], _I64), builder
-        if name == "ptrFree":
-            # C says `void`, which is not the language's unit: a void call has
-            # no value to name, and every primitive here has a result. So the
-            # call is made and the unit is produced separately.
-            builder.call(self.runtime["turkey_ptr_free"], args)
-            return ir.Constant(_I8, 0), self._propagate(function, builder)
         runtime = {
             "intToString": "turkey_int_to_string", "floatToString": "turkey_float_to_string",
             "charToString": "turkey_char_to_string", "stringConcat": "turkey_string_concat",
@@ -1330,7 +1376,6 @@ class _Emitter:
             "floatCeil": "turkey_float_ceil",
             "floatRound": "turkey_float_round",
             "floatTrunc": "turkey_float_trunc",
-            "ptrAlloc": "turkey_ptr_alloc",
         }.get(name)
         if runtime:
             value = builder.call(self.runtime[runtime], args)

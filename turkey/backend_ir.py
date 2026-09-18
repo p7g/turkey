@@ -112,11 +112,30 @@ class Function:
     slots: list[Value] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class Foreign:
+    """A C symbol this module calls, and the shape of the call (TIX-62).
+
+    The same three facts the runtime's own entry-point table carries, which is
+    the point of the declaration form: a `foreign` declaration is an entry in
+    that table written in source. It rides on the module because that is what
+    an emitter is handed, and because both emitters need it for the same two
+    reasons -- a `declare` line, and what register file each argument travels
+    in when the call is selected.
+    """
+
+    symbol: str
+    params: tuple[Layout, ...]
+    ret: Layout
+
+
 @dataclass
 class Module:
     functions: list[Function]
     entry: str
     globals: list[Value] = field(default_factory=list)
+    #: Every declared C symbol the program mentions, by symbol.
+    foreigns: dict[str, Foreign] = field(default_factory=dict)
 
 
 class CheckError(ValueError):

@@ -20,7 +20,7 @@ HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
 KEYWORDS = frozenset(
     """type class instance fun let var match if else while for in loop return
     break continue module import export as hiding
-    do""".split()
+    do foreign""".split()
 )
 
 # Longest match first: `<=` must beat `<`, `->` must beat `-`. `?` is a suffix
@@ -53,7 +53,7 @@ CAN_START = (
     | {
         "let", "var", "fun", "type", "class", "instance", "if", "match",
         "while", "for", "loop", "return", "break", "continue", "module",
-        "import", "do",
+        "import", "do", "foreign",
         "IDENT", "CONID", "(", "[", "{", "-", "!",
         # A record pattern's `..` on its own line (SPEC-DELTAS 65). Nothing
         # continues an expression with `..`, so this cannot split one.

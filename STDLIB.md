@@ -34,7 +34,8 @@ is good if the modules AoC needs land somewhere a reader would look.
 | `Data.String` | UTF-8 views, `split` `splitOnce` `lines` `words` `trim` `find` `replace`, `Builder` |
 | `Algorithm.Hash` | FNV-1a |
 | `System.IO` | `readFile` `writeFile` `canRead` `stderr` |
-| `System.Env` | `args` `exit` |
+| `System.Env` | `args` `exit` `get` |
+| `Unsafe.Ptr`, `Unsafe.Libc` | raw memory, and the C symbols declared through it (SPEC-DELTAS 70, 71). Not part of the surface this document is about: they exist so that `System.*` has something to be a wrapper over, and a module that imports one says so in its import list |
 
 Prefix use across `boot/`, `lib/` and `tests/programs/`: 112 imports of
 `Data.*`, 17 of `Std.*`, 8 of `System.*`, 2 of `Algorithm.*`, in 49 files; 42
@@ -1389,6 +1390,12 @@ Decided (4.8).
 ### 6.8 `System.IO` and `System.Env` stay
 
 Haskell and .NET both nest IO under `System`, and those are the current names.
+
+`System.Env.get` arrived with the FFI (SPEC-DELTAS 71) and is the shape the
+rest of this layer should take: `Unsafe.Libc` declares `getenv`, `System.Env`
+copies the name into a NUL-terminated block, calls it, reads the answer back
+and frees what it owns, and what it exports is an `Option String`. The unsafe
+module's name is in the wrapper's import list and in nothing above it.
 
 ### 6.9 `Time` and `Text`
 

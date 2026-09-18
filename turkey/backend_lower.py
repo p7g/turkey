@@ -794,6 +794,13 @@ class _FunctionLowerer:
                                        (global_.name,), global_.layout)
                     done(block, self.coerce(block, loaded, self.expr_layout(expr)))
                     return
+                if expr.name in self.decls.foreigns:
+                    # The same rule a primitive gets, for the same reason:
+                    # there is no code here to take the address of. A wrapper
+                    # in the declaring module is what makes one a value.
+                    raise Unsupported(
+                        f"foreign '{expr.name}' must be called directly, not "
+                        f"used as a value", expr.span)
                 raise Unsupported(f"LLVM backend cannot use top-level value '{expr.name}'", expr.span)
             loaded = self.emit(block, "slot_load", (found.name,), found.layout)
             done(block, self.coerce(block, loaded, self.expr_layout(expr)))
@@ -953,6 +960,20 @@ class _FunctionLowerer:
             # Function expression precedes arguments. Direct names and
             # primitives have no runtime evaluation, but this still sequences
             # every actual argument left-to-right.
+            if isinstance(fn, CVar) and fn.name in self.decls.foreigns:
+                # A declared C symbol. Everything a primitive call needs is
+                # here and nothing else is: no marshalling, because the type
+                # mapping is the seven types that each erase to one
+                # representation, and no layout suffix, because the
+                # declaration already fixed every one of them.
+                info = self.decls.foreigns[fn.name]
+                def foreign_call(at: bir.Block,
+                                 values: list[bir.Operand]) -> None:
+                    done(at, self.emit(
+                        at, "foreign." + info.symbol, tuple(values),
+                        self.layout(expr.ty), self.frame(expr.span)))
+                self.lower_values(expr.args, env, joins, block, foreign_call)
+                return
             if isinstance(fn, CPrim) or (
                     isinstance(fn, CVar) and fn.name in PRIM_NAMES):
                 primitive = fn.name
@@ -1783,6 +1804,11 @@ def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
     module = bir.Module(
         [initializer, *top, *lifted, runner], run_name,
         list(globals_.values()),
+        {info.symbol: bir.Foreign(
+            info.symbol,
+            tuple(held_at(p, decls=decls) for p in info.params),
+            held_at(info.ret, decls=decls))
+         for info in decls.foreigns.values()},
     )
     bir.check(module)
     return module

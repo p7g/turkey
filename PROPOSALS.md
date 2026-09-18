@@ -611,8 +611,9 @@ call cannot be handed a simulated address. 8.9 is what follows from that.
 
 ### 8.2 The declaration form
 
-A top-level declaration naming a C symbol and a signature, legal only in
-modules under `lib/Unsafe/`.
+A top-level declaration naming a C symbol and a signature, legal only in a
+*standard library* module under `Unsafe.` -- which is exactly where `Prim.` may
+be spelled, and the same rule rather than a second one.
 
 ```
 foreign "read" fun read(fd : Int, buf : Ptr, count : Int) -> Int
@@ -625,8 +626,21 @@ which is Oberon's `SYSTEM` gesture. A `foreign` declaration is the same kind of
 assertion and belongs behind the same name.
 
 Rust's `safe fn` is the shape of the exported surface: the declaration is
-unsafe and lives once, and what `System.IO` exports is ordinary Turkey. That
+unsafe and lives once, and what `System.Env` exports is ordinary Turkey. That
 boundary is load-bearing beyond tidiness -- see 8.8.
+
+Two things the gate deliberately is not, because each is a way of having no
+gate at all. It is not a check on the module's declared *name*: only the loader
+knows where a file came from, and a program that called its own module
+`Unsafe.Libc` and put it beside itself would let itself in. And it is not "any
+directory called `lib`" -- the first search root is the entry file's own
+directory, which is the same hole wearing a different hat.
+
+What that costs is worth saying plainly: **a user cannot declare a symbol yet**,
+only call the wrappers over the ones the standard library declares. That is the
+same position `Prim.` is in and it is not this proposal's to reverse -- what
+would reverse it is a story for where a third-party library lives, which this
+compiler does not have.
 
 ### 8.3 The type mapping
 

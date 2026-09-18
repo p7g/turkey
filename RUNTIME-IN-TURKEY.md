@@ -13,11 +13,21 @@ module gate is a gesture -- `lib/Unsafe/Ptr.gob` puts the name in the import
 list of anything touching raw memory -- not the checker TIX-63 will build.
 
 The FFI is now argued, per the recommendation at the foot of this document, as
-`PROPOSALS.md` item 8. It is smaller than the thirty-five below suggest: under
-"depend on libc as little as possible" only about ten of them are an FFI
-problem at all, five are instruction selection, and the rest are Turkey written
-over `read`, `write` and `mmap`. That proposal also carries the survey of how
-peers answer the string and ownership questions.
+`PROPOSALS.md` item 8, and built: TIX-62 landed `foreign` as SPEC-DELTAS 71,
+declared the symbols in `lib/Unsafe/Libc.gob`, and deleted `Prim.ptrAlloc`,
+`Prim.ptrFree` and the two C wrappers underneath them. So step 1 of the staging
+below -- the FFI itself -- is done, and `System.Env.get` is the first safe
+wrapper over it.
+
+It is smaller than the thirty-five below suggest. Under "depend on libc as
+little as possible" only about ten of them are an FFI problem at all, five are
+instruction selection (`frintm`/`frintp`/`frintn`/`frintz`), and the rest are
+Turkey written over `read`, `write` and `mmap`. Two consequences worth carrying
+forward: float formatting and `strtod` are now owed in Turkey, because
+declining variadics means `snprintf` never arrives; and the `memcpy` family
+stays linked, because LLVM synthesises calls to it -- a residue that belongs to
+the LLVM backend and to the C runtime, both of which are scheduled to go, since
+the arm64 backend emits no reference to any of the four.
 
 `LINKER.md` ends by noting that no way of producing an executable removes the C
 dependency, because `runtime/turkey_runtime.c` is C and `boot` cannot compile C.

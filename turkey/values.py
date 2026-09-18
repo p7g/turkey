@@ -228,7 +228,7 @@ def set_field(obj, name: str, value) -> None:
 
 
 class RawHeap:
-    """The address space `Prim.ptrAlloc` hands out, simulated.
+    """The address space `malloc` hands out, simulated.
 
     Raw memory has to mean something on this host, because the Python backend
     is not only how `tests/programs/*.expected` is produced -- it is the
@@ -236,6 +236,11 @@ class RawHeap:
     this stands in for `malloc` and its job is to agree with malloc on every
     observable a program can print, and to *disagree* loudly everywhere the
     native behaviour is undefined.
+
+    Since TIX-62 the caller is a declared `foreign "malloc"` rather than a
+    primitive, and `turkey/foreign.py` is what routes it here -- which changes
+    nothing about this class's job, and is the reason that module explains at
+    length why it models a symbol instead of reaching for `ctypes`.
 
     Which is the one decision in here worth arguing. Fresh memory is poisoned
     rather than zeroed. `malloc` returns uninitialized bytes; a zero fill would

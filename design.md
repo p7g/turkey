@@ -101,6 +101,7 @@ export        ::= IDENT
 toplevel      ::= type-decl
                | class-decl                      -- (delta 29)
                | instance-decl                   -- (delta 29)
+               | foreign-decl                    -- (delta 71)
                | fun-decl
                | let-decl
                | var-decl
@@ -178,6 +179,19 @@ type-list    ::= type-expr ("," type-expr)*
 let-decl     ::= "let" pat "=" expr
 var-decl     ::= "var" pat "=" expr
 pat-list     ::= pat ("," pat)*
+-- A function this compiler does not compile: a C symbol and a signature
+-- (delta 71). Legal only in a library module under `Unsafe.`, because the
+-- signature is an assertion nothing can check. There is no body and no
+-- context, and a return type is required -- a C function that returns nothing
+-- writes `-> Unit`. Parameters may be named, which a class method's signature
+-- may not: the ambiguity that forbids it there is between a parameter name and
+-- a type variable and is settled only by the presence of a body, and a foreign
+-- declaration can never have one.
+foreign-decl ::= "foreign" STRING "fun" IDENT "(" foreign-params? ")"
+                 "->" type-expr
+foreign-params ::= foreign-param ("," foreign-param)*
+foreign-param  ::= IDENT ":" type-expr
+               | type-expr
 ```
 
 Comma-separated forms accept a trailing comma. In a multiline record payload,

@@ -29,6 +29,7 @@ import math
 import struct
 import sys
 
+from . import foreign
 from .errors import TurkeyPanic
 from .constraints import Binding, Env
 from .prelude import BOOL_FALSE, BOOL_TRUE
@@ -105,6 +106,7 @@ def set_args(args) -> None:
     """
     _ARGS[:] = list(args)
     RAW_HEAP.reset()
+    foreign.reset()
 
 
 def program_args() -> list[str]:
@@ -533,11 +535,6 @@ def _raw_store_prim(name, ty, width, encode):
     return (mono(TFun([RAW_PTR, INT, ty], UNIT)), _bi(name, 3, store))
 
 
-def _ptr_free(address):
-    RAW_HEAP.free(address)
-    return UNIT_VALUE
-
-
 _PRIM: dict[str, tuple] = {
     # Output. `print` and `write` themselves are prelude functions, one `show`
     # away; these are the two writes underneath.
@@ -733,14 +730,9 @@ _PRIM: dict[str, tuple] = {
     "Prim.boolLt": _cmp(
         "Prim.boolLt", BOOL, lambda a, b: a.con == BOOL_FALSE and b.con == BOOL_TRUE),
 
-    # Raw memory (TIX-61). These two are `malloc` and `free` and nothing more,
-    # and they are temporary: TIX-62's FFI re-derives them as declarations and
-    # deletes both the primitives and the C wrappers. A negative size answers
-    # null rather than panicking, because that is what the wrapper does.
-    "Prim.ptrAlloc": (mono(TFun([INT], RAW_PTR)),
-                      _bi("Prim.ptrAlloc", 1, RAW_HEAP.allocate)),
-    "Prim.ptrFree": (mono(TFun([RAW_PTR], UNIT)),
-                     _bi("Prim.ptrFree", 1, _ptr_free)),
+    # Raw memory (TIX-61). `malloc` and `free` were primitives here too,
+    # behind C wrappers written only because there was no way to declare them;
+    # TIX-62 declares them in `lib/Unsafe/Libc.gob` and they are gone.
 
     # Pointer arithmetic. Wrapping at 64 bits, not trapping: an address near
     # the top of the space is not an overflow, and the language's checked `+`

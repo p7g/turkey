@@ -44,7 +44,7 @@ same reason, in the one place it is still needed.
 
 from __future__ import annotations
 
-from . import ast
+from . import ast, foreign
 from .core import (
     CApp, CArray, CAssign, CCon, CDeref, CExpr, CField,
     CIf, CIndex, CJoin, CJump, CLam, CLet, CLetRec, CLit, CMatch, CProject,
@@ -106,7 +106,11 @@ class REnv:
 class Evaluator:
     def __init__(self, decls: DeclTable, globals_: dict):
         self.decls = decls
-        self.globals = REnv(None, dict(globals_))
+        # A `foreign` declaration reaches the evaluator the way a `Prim.` one
+        # does -- a name in the global environment holding something with an
+        # arity -- which is why it is merged here rather than handed in: the
+        # caller supplies the builtins, and these come from the program.
+        self.globals = REnv(None, dict(globals_) | foreign.bindings(decls))
         self.functions = ["<module initialization>"]
         for name, info in decls.constructors.items():
             mutable = decls.tycons[info.tycon].is_mutable_record

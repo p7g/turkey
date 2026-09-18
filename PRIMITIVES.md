@@ -597,6 +597,17 @@ Oberon's `SYSTEM` rule, and the same containment delta 70 relies on for
 `Prim.castAs`. TIX-63's checker is what will make it a property rather than a
 convention.
 
+One more thing is undefined, and it arrives with delta 71's FFI: **what a C
+function does with a pointer after the call returns.** Handing one to `write`
+is defined for the duration of the call and nothing longer; a C function that
+retains the address and reads it later is reading storage the program may have
+freed. Go checks the same rule at run time and crashes on a violation, and
+Haskell leaves it to `touchForeignPtr`; nobody expresses it in a type system,
+and Turkey does not either. What *is* checked, statically, is the other half
+-- a traced pointer may not be stored through a raw one (9.3) -- and the
+pinning problem every peer with a moving collector has does not arise, because
+this one does not move objects.
+
 ### 9.2 What *is* defined
 
 - Arithmetic. `ptrAdd` and `ptrDiff` wrap at 64 bits and never trap: an
@@ -604,7 +615,10 @@ convention.
   checked `+` is not what they spell. Any offset is defined; *dereferencing*
   the result is what is undefined if it left the block.
 - `ptrNull` is address 0, `ptrIsNull` tests for it, and `free` of it does
-  nothing -- as C's does.
+  nothing -- as C's does. `Unsafe.Ptr.alloc` and `free` are `malloc` and
+  `free`, declared through delta 71's FFI rather than wrapped in C: a request
+  the allocator cannot satisfy answers null, which is what a negative size does
+  too.
 - `ptrToInt` round-trips through `ptrFromInt`. The integer itself is
   **unspecified**: it is deterministic within a run on both hosts and not the
   same number between them, so a program that prints one prints something

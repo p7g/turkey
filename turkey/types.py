@@ -470,6 +470,31 @@ RAW_ARRAY = TCon("Prim.Array", KFun(STAR, STAR))
 #: module.  `lib/Unsafe/Ptr.gob` re-exports it as `Ptr`.
 RAW_PTR = TCon("Prim.Ptr", STAR)
 
+#: The types a `foreign` signature is written over, in the order an error
+#: lists them. Each erases to exactly one machine representation, which is why
+#: the list is this and not longer: a call has to know what register file
+#: every argument travels in at the point the instruction is emitted, and a
+#: type whose representation depends on a type argument cannot say. It is the
+#: same list, for the same reason, as the one raw load and store is built on
+#: (PRIMITIVES.md 9.3).
+#:
+#: `String` is the conspicuous absence. It is a `TurkeyString`, which is a
+#: length and its bytes and no terminator, and the C functions that want a
+#: string want a `char *`; a caller copies one into raw memory rather than the
+#: boundary doing it invisibly.
+FOREIGN_TYPES: dict[str, TCon] = {
+    UNIT.name: UNIT, BOOL.name: BOOL, BYTE.name: BYTE, CHAR.name: CHAR,
+    INT.name: INT, FLOAT.name: FLOAT, RAW_PTR.name: RAW_PTR,
+}
+
+#: Their short spellings, for the message that lists them.
+FOREIGN_NAMES = ("Unit", "Bool", "Byte", "Char", "Int", "Float", "Prim.Ptr")
+
+#: Arguments per register file on AAPCS64: x0-x7 and d0-d7. A declaration that
+#: needs more would be passed partly on the stack, which `Turkey.Select` does
+#: not implement for a C callee.
+FOREIGN_ARG_REGS = 8
+
 
 # ------------------------------------------------------- application and spines
 

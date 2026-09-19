@@ -49,12 +49,14 @@ that each use of it may pick different types for its type variables.
 
 * **Top-level functions** and **local `fun` declarations** are always
   generalized.
-* **`let` and `var` bindings** are generalized only when the right-hand side
-  is a *value*: a literal, a variable, a lambda, a constructor applied to
-  values, or a tuple of values. This is the **value restriction**. A
-  right-hand side that calls a function, or creates an array, is not
-  generalized, because what it creates might be mutable, and a polymorphic
-  mutable object could be written at one type and read at another.
+* **`let` bindings** are generalized only when the right-hand side is a
+  *value*: a literal, a variable, a lambda, a constructor applied to values,
+  or a tuple of values. This is the **value restriction**. A right-hand side
+  that calls a function, or creates an array, is not generalized, because
+  what it creates might be mutable, and a polymorphic mutable object could be
+  written at one type and read at another.
+* **`var` bindings** are never generalized. A `var` can be assigned, and
+  every value assigned to it must have its one type.
 * **Parameters** are never generalized. A parameter has one type for the
   whole body of its function.
 
@@ -116,9 +118,26 @@ fun main() {
 3.0
 ```
 
-`count` is bound to a value, so it is generalized, and each use picks a type:
-`Int` in `count + 1` and `Float` in `count + 1.5`. In `1.0 + 2`, both operands
-of `+` have the same type, so the `2` is a `Float`.
+`count` is bound to a value with `let`, so it is generalized, and each use
+picks a type: `Int` in `count + 1` and `Float` in `count + 1.5`. In `1.0 + 2`,
+both operands of `+` have the same type, so the `2` is a `Float`.
+
+A `var` is not generalized, so every use of it must agree. Here `total + 0.5`
+makes `total` a `Float`, including in the line before it:
+
+<!-- run -->
+```kotlin
+fun main() {
+    var total = 3
+    print(total + 1)
+    print(total + 0.5)
+}
+```
+
+```text
+4.0
+3.5
+```
 
 Whether a literal can have a type depends on its value. It must be exactly
 representable, so `9007199254740993`, which is too precise for a `Float`, can

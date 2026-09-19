@@ -56,9 +56,40 @@ stage that crashes is a stage the oracle says nothing about, and a fix to a
 shared algorithm has no test that notices it was applied to only one side. See
 FINDINGS 43.
 
+## Keep the language reference true
+
+`docs/ref/` is the language as its users see it. After any change a program
+could notice -- syntax, a type rule, a diagnostic the reference quotes, a
+panic, what the Prelude provides -- update the chapters it touches in the same
+commit, and fix any sentence a bug fix has made wrong. `tests/test_reference.py`
+compiles and runs every example, so a stale example goes red; stale prose does
+not, so grep the chapters for the feature you changed.
+
+How the reference is written:
+
+* **What the compiler does today, and nothing else.** No compiler internals
+  (Core, dictionaries, passes, layouts), no planned or reserved features, no
+  citations of SPEC-DELTAS. Library only where the language leans on it
+  (`builtins.md`). Check a claim by running it, not by reading `design.md`.
+* **Each section:** a small **Syntax** block, the rules in plain prose, then
+  examples. Sugar is explained by an approximately equivalent desugaring into
+  plain Turkey, with `$`-prefixed hidden names.
+* **Two audiences.** Use the real terminology (principal type, value
+  restriction, existential type) with a short "For readers new to this" note,
+  and add "Coming from Rust" / "Coming from Haskell" notes where those readers
+  would guess wrong.
+* **Idiomatic examples.** Small realistic programs, one idea each: `let` or a
+  parameter pattern rather than a one-armed `match`, `for ... in` rather than
+  an index loop, `[]` rather than `Array.new`, annotations only where they
+  explain an interface. Every `kotlin` fence carries a directive (`run`,
+  `check`, `error: TEXT`, `panic: TEXT`, `module: F.gob`); see
+  `docs/ref/README.md`.
+
 ## Documents
 
-* `design.md` -- the language.
+* `docs/ref/` -- the language reference: syntax and semantics for people
+  writing Turkey, every example compiled and run by `tests/test_reference.py`.
+* `design.md` -- the original language design, with its rationale.
 * `PRIMITIVES.md` -- primitive types and their semantics.
 * `SPEC-DELTAS.md` -- numbered decisions that changed the spec.
 * `plan.txt` -- the roadmap and its milestones.

@@ -111,7 +111,10 @@ must be preceded by an HTML comment that says how to check it:
 | `<!-- panic: TEXT -->` | Must compile and then panic with a message containing `TEXT`. An optional `text` fence gives the output printed before the panic. |
 | `<!-- module: Name.gob -->` | Another source file for the next example, written beside it. The example itself is `Main.gob`. |
 
-A `kotlin` fence with no directive fails the test. Grammar goes in `ebnf`
+Examples that run are run twice: once in the test process, and once through
+`python3 -m turkey run`, whose default backend is the native one, since that is
+what a reader who copies an example will execute. A `kotlin` fence with no
+directive fails the test. Grammar goes in `ebnf`
 fences and shell commands in `sh` fences; the test ignores both.
 
 **What goes in.** Only what the compiler accepts today. The reference does not

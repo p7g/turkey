@@ -17,7 +17,11 @@ checks.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -26,7 +30,8 @@ import pytest
 from turkey.driver import check, run
 from turkey.errors import TurkeyError, TurkeyPanic
 
-REF_DIR = Path(__file__).resolve().parent.parent / "docs" / "ref"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+REF_DIR = REPO_ROOT / "docs" / "ref"
 
 DIRECTIVE = re.compile(r"^<!--\s*(run|check|error|panic|module)\s*(?::\s*(.*?))?\s*-->$")
 FENCE = re.compile(r"^```(\S*)\s*$")
@@ -161,6 +166,36 @@ def test_example(example: Example, tmp_path, capsys) -> None:
         assert example.arg in exc.value.message, exc.value.message
         if example.output is not None:
             assert capsys.readouterr().out == example.output
+
+
+RUNNABLE = [e for e in EXAMPLES if e.mode in ("run", "panic")]
+
+
+@pytest.mark.parametrize("example", RUNNABLE, ids=lambda e: e.id)
+def test_example_native(example: Example, tmp_path) -> None:
+    """The same program through `turkey run`, whose default backend is the
+    native one: what a reader who copies the example will actually execute."""
+    if shutil.which("cc") is None:
+        pytest.skip("no C compiler")
+    _program(example, tmp_path)
+    main = tmp_path / "Main.gob"
+    if not main.exists():
+        main.write_text(example.src)
+    result = subprocess.run(
+        [sys.executable, "-m", "turkey", "run", "Main.gob"],
+        cwd=tmp_path,
+        env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)),
+        capture_output=True,
+        text=True,
+    )
+    if example.mode == "run":
+        assert result.returncode == 0, result.stderr
+        assert result.stdout == example.output
+    else:
+        assert result.returncode != 0
+        assert "panic: " in result.stderr and example.arg in result.stderr, result.stderr
+        if example.output is not None:
+            assert result.stdout == example.output
 
 
 def test_there_are_examples() -> None:

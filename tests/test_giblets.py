@@ -199,8 +199,9 @@ def lowered(request, tmp_path):
                      f"fun main() {{ print(Int.toString(P.f(3))) }}\n",
                      encoding="utf-8")
 
-    def lower(giblet_body: str, helper_body: str) -> tuple[int, str, str]:
-        helper.write_text(f"module Turkey.Probe_helper_{digest} (h)\n\n"
+    def lower(giblet_body: str, helper_body: str,
+              exports: str = "h") -> tuple[int, str, str]:
+        helper.write_text(f"module Turkey.Probe_helper_{digest} ({exports})\n\n"
                           + helper_body, encoding="utf-8")
         giblet.write_text(f"module Turkey.Probe_giblet_{digest} (f)\n\n"
                           f"import Turkey.Probe_helper_{digest} as H\n"
@@ -232,6 +233,46 @@ def test_a_call_that_allocates_is_refused_with_the_path_to_it(lowered):
     assert re.search(r"@f calls @h \([^)]*Probe_giblet_\w+\.gob:4:\d+\), which "
                      r"builds an array \([^)]*Probe_helper_\w+\.gob:3:\d+\)",
                      stderr), stderr
+
+
+# The allocations nobody writes (TIX-87): each helper names nothing traced, so
+# the type rule passes the call, and each lowers to an allocation its source
+# does not spell. Recursive, so each stays a call; the line is where the
+# construct the diagnostic should point at is written.
+HIDDEN = (
+    "type Hidden = Hidden[Show a](a)\n"                                   # 3
+    "fun poly(x : a, k : Int) -> Int =\n"                                 # 4
+    "    if k == 0 { 0 } else { poly((x, x), k - 1) }\n"                  # 5
+    "fun showAll[Show a](x : a, k : Int) -> Int =\n"                      # 6
+    "    if k == 0 { String.byteLength(show(x)) }\n"                      # 7
+    "    else { showAll((x, x), k - 1) }\n"                               # 8
+    "fun nests(n : Int) -> Int = if n == 0 { poly(n, 3) } else { nests(n - 1) }\n"   # 9
+    "fun packs(n : Int) -> Int = if n == 0 {\n"                           # 10
+    "    match Hidden(n) { Hidden(x) -> String.byteLength(show(x)) }\n"   # 11
+    "} else { packs(n - 1) }\n"                                           # 12
+    "fun dicts(n : Int) -> Int = if n == 0 { showAll(n, 3) } else { dicts(n - 1) }\n"  # 13
+)
+
+
+@pytest.mark.parametrize("helper, reason, line", [
+    # Polymorphic recursion is past any specialization cap: the tuple the
+    # generic body builds is reached through the call. Not a `Box`: `mono`
+    # specializes the first call at `Int`, so boxing at a polymorphic
+    # boundary has no small reproducer yet.
+    ("nests", "builds a tuple", 9),
+    # An existential packing is an object with the layout codes in front.
+    ("packs", "packs an existential, Hidden", 11),
+    # A class-polymorphic function past the cap: its dictionary's pairs.
+    ("dicts", "builds a tuple", 13),
+])
+def test_an_allocation_nobody_wrote_is_named_where_it_came_from(
+        lowered, helper, reason, line):
+    code, _, stderr = lowered(f"fun f(n : Int) -> Int = H.{helper}(n)\n",
+                              HIDDEN, exports="nests, packs, dicts")
+    assert code != 0
+    assert f"@f calls @{helper} (" in stderr, stderr
+    assert re.search(rf"which {re.escape(reason)} \([^)]*Probe_helper_\w+\.gob:"
+                     rf"{line}:\d+\)", stderr), stderr
 
 
 def test_a_giblet_calling_a_giblet_holds_no_root(lowered):

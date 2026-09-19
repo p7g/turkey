@@ -500,3 +500,19 @@ def test_boot_reports_a_field_line_break_as_python_does(tmp_path: Path) -> None:
     assert booted.returncode != 0 and python.returncode != 0
     assert "a line break separates fields here" in booted.stderr
     assert booted.stderr == python.stderr
+
+
+@pytest.mark.parametrize("name", ["err_main_returns_value",
+                                  "err_main_takes_parameter"])
+def test_boot_checks_main_as_python_does(name: str) -> None:
+    """`main` is `fun() -> Unit` (SPEC-DELTAS 21, 58; TIX-79). An error cannot
+    live in the corpus `boot` checks in one run, so each is compared here."""
+    path = f"tests/programs/{name}.gob"
+    booted = subprocess.run([str(bootc.binary()), "types", path],
+                            cwd=REPO_ROOT, capture_output=True, text=True)
+    python = subprocess.run([sys.executable, "-m", "turkey", "types", path],
+                            cwd=REPO_ROOT, capture_output=True, text=True,
+                            env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)))
+    assert booted.returncode != 0 and python.returncode != 0
+    assert "'main' is the entry point" in booted.stderr
+    assert booted.stderr == python.stderr

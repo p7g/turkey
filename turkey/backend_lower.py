@@ -649,8 +649,14 @@ class _FunctionLowerer:
                 if len(values) != len(slots):
                     raise Unsupported("LLVM jump arity mismatch", expr.span)
                 # Values were materialized in distinct slots by lower_values,
-                # so stores on the target edge are simultaneous.
-                at.terminator = bir.Jump(target.name, tuple(values))
+                # so stores on the target edge are simultaneous. Each is
+                # converted to the layout its parameter is held at, as a
+                # return's value is: `return 3` in a lambda whose result is a
+                # type variable jumps an `i64` to a boxed parameter, and
+                # `SsaLower`'s jump coerces for the same reason.
+                at.terminator = bir.Jump(target.name, tuple(
+                    self.coerce(at, value, slot.layout)
+                    for value, slot in zip(values, slots)))
             self.lower_values(expr.args, env, joins, block, jump)
             return
         if isinstance(expr, CLetRec):

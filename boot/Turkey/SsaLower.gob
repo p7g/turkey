@@ -1166,7 +1166,7 @@ fun valueHere(l : Lower, e : Core) -> Value {
             store(l, target, x)
             L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
         }
-        CTuple(elems) -> aggregate(l, elems, 0, -1)
+        CTuple(elems) -> aggregate(l, elems, 0, -1, "builds a tuple")
         CRecord(con, fields) -> {
             -- The one table, so a dictionary is *built* in the order it is
             -- later *read* in. Two sources for that order is how a field ends
@@ -1182,7 +1182,8 @@ fun valueHere(l : Lower, e : Core) -> Value {
             }
             let items = if len(sorted) == len(fields) { sorted }
                         else { Array.map(fields, fun(f) = f.1) }
-            aggregate(l, items, 1, Map.getOr(l.tags, con, -1))
+            aggregate(l, items, 1, Map.getOr(l.tags, con, -1),
+                      "builds a record, " + Ty.shortName(con))
         }
         CArray(elems) -> arrayLiteral(l, e, elems)
         CCon(name) -> match Ty.prune(e.ty) {
@@ -1262,12 +1263,14 @@ fun store(l : Lower, target : Core, x : Value) -> Unit = match target.kind {
 --
 -- `kind` is 0 for a tuple and 1 for a constructed value, which is what the
 -- runtime's own object header distinguishes.
-fun aggregate(l : Lower, items : Array Core, kind : Int, tag : Int) -> Value {
+fun aggregate(l : Lower, items : Array Core, kind : Int, tag : Int,
+             what : String) -> Value {
     let values = []
     for x in items { Array.push(values, value(l, x)) }
     let reps = Array.map(values, fun(x) = Ssa.repOf(l.func, x))
     let made = L.emit(l.b, ObjectNew(kind, tag, len(values), metadata(reps)),
                       Ssa.traced(Ptr))
+    Map.put(l.func.reasons, Ssa.valueId(made), what)
     for var i = 0; i < len(values); i = i + 1 {
         L.effect(l.b, ObjectSet(made, i, values[i]))
     }
@@ -1578,9 +1581,11 @@ fun constructor(l : Lower, e : Core, name : String, args : Array Core,
             Some(info) -> if len(info.exists) > 0 {
                 packed(l, info, name, args, tag)
             } else {
-                aggregate(l, args, 1, tag)
+                aggregate(l, args, 1, tag, "builds a value with "
+                                            + Ty.shortName(name))
             }
-            None -> aggregate(l, args, 1, tag)
+            None -> aggregate(l, args, 1, tag, "builds a value with "
+                                               + Ty.shortName(name))
         }
         None -> stop(l, "the constructor '" + name + "' has no tag")
     }
@@ -1604,6 +1609,8 @@ fun packed(l : Lower, info : ConInfo, name : String, args : Array Core,
     let reps = Array.map(values, fun(x) = Ssa.repOf(l.func, x))
     let made = L.emit(l.b, ObjectNew(1, tag, len(values), metadata(reps)),
                       Ssa.traced(Ptr))
+    Map.put(l.func.reasons, Ssa.valueId(made),
+            "packs an existential, " + Ty.shortName(name))
     for var i = 0; i < len(values); i = i + 1 {
         L.effect(l.b, ObjectSet(made, i, values[i]))
     }

@@ -104,13 +104,18 @@ def test_a_for_loop_allocates_no_cursor():
     # writes it. Once `next` is inlined the record is born and dies inside
     # one function without being handed to anything, so it is its field and
     # nothing else -- and a loop over an array allocates nothing at all.
+    # Recursive so that it survives to be looked at, as `bump` below is: a
+    # loop breaker is never inlined, and once the class dictionaries' cycles
+    # were all broken (FINDINGS 107) the straight-line version folded into
+    # `main`.
     checked = check(
-        'fun total(xs : Array Int) -> Int {\n'
+        'fun total(xs : Array Int, again : Bool) -> Int {\n'
+        '    if again { return total(xs, False) }\n'
         '    var sum = 0\n'
         '    for x in xs { sum = sum + x }\n'
         '    sum\n'
         '}\n'
-        'fun main() { print(total([1, 2, 3])) }')
+        'fun main() { print(total([1, 2, 3], True)) }')
     source = lower(checked.opt, checked.decls, checked.main)
     total = next(f for f in source.functions if "23_total" in f.name)
     built = [i.op for b in total.blocks for i in b.instructions

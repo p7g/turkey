@@ -163,11 +163,6 @@ fun withValue(b : CBind, value : Core) -> CBind = CBind {
 
 -- -- the call graph, and the cycles in it ---------------------------------------------
 
--- One binding per cycle, never to be inlined.
---
--- Deterministic on purpose: `Turkey.Deps.sccs` sorts each component, so taking
--- the first is the lexicographically first name, and a golden that depends on
--- which binding was broken does not move when an unrelated one is added.
 -- Which top-level bindings each one mentions, and nothing else.
 fun callGraph(binds : Array CBind) -> Map String (Set.Set String) {
     let known = Set.new()
@@ -183,20 +178,56 @@ fun callGraph(binds : Array CBind) -> Map String (Set.Set String) {
     graph
 }
 
+-- Enough bindings that every cycle contains one, never to be inlined.
+--
+-- One per component is not enough. Removing a component's breaker cuts the
+-- cycles through it, and a component can hold others: `head` calling itself
+-- beside `expr -> inside -> head -> expr` survives the removal of `cell`, and
+-- inlining the survivors did not terminate (FINDINGS 107). So what is left of a
+-- component once its breaker is out is split into components again, until none
+-- is cyclic.
+--
+-- Deterministic on purpose: `Turkey.Deps.sccs` sorts each component, so taking
+-- the first is the lexicographically first name, and a golden that depends on
+-- which binding was broken does not move when an unrelated one is added.
 fun loopBreakers(program : CProgram) -> Set.Set String {
-    let graph = callGraph(Array.append(program.dicts, program.binds))
     let out = Set.new()
-    for component in Deps.sccs(graph) {
-        let first = component[0]
-        let successors = match Map.get(graph, first) {
-            Some(s) -> s
-            None -> Set.new()
-        }
-        if len(component) > 1 || Set.contains(successors, first) {
-            Set.add(out, first)
+    let pending = [callGraph(Array.append(program.dicts, program.binds))]
+    var k = 0
+    while k < len(pending) {
+        let current = pending[k]
+        k = k + 1
+        for component in Deps.sccs(current) {
+            let first = component[0]
+            if len(component) == 1 {
+                if Set.contains(successorsOf(current, first), first) {
+                    Set.add(out, first)
+                }
+            } else {
+                Set.add(out, first)
+                let rest = Set.new()
+                for var m = 1; m < len(component); m = m + 1 {
+                    Set.add(rest, component[m])
+                }
+                let sub = Map.new()
+                for var m = 1; m < len(component); m = m + 1 {
+                    let kept = Set.new()
+                    for n in Set.elements(successorsOf(current, component[m])) {
+                        if Set.contains(rest, n) { Set.add(kept, n) }
+                    }
+                    Map.put(sub, component[m], kept)
+                }
+                Array.push(pending, sub)
+            }
         }
     }
     out
+}
+
+fun successorsOf(graph : Map String (Set.Set String), name : String)
+        -> Set.Set String = match Map.get(graph, name) {
+    Some(s) -> s
+    None -> Set.new()
 }
 
 -- -- the traversal --------------------------------------------------------------------

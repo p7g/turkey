@@ -34,6 +34,7 @@ import Turkey.Modules as Modules
 import Turkey.Resolve as Resolve
 import Turkey.Desugar as Desugar
 import Turkey.Types as Ty
+import Turkey.Types (TFun, TCon, TVar)
 import Turkey.Decls as Decls
 import Turkey.Deps as Deps
 import Turkey.Classes as Classes
@@ -358,12 +359,37 @@ fun dumpOpt(b : String.Builder, path : String) -> Unit {
     String.push(b, Core.showProgram(optimized, Some(entry.name)))
 }
 
--- The Low IR, and the giblets check on it. Every path that lowers comes through
--- here, so a giblet that allocates stops the compile whichever backend was
--- asked for (TIX-63).
+-- The Low IR, and the checks on it. Every path that lowers comes through here,
+-- so what they refuse stops the compile whichever backend was asked for.
+--
+-- `Ssa.verify` owns one graph's shape, `LowIr.checkReps` each instruction's
+-- representations, and `LowIr.checkCalls` the agreement between graphs -- a
+-- call's arity and representations against its callee's signature, which is
+-- the property the signature table exists for. All three were printed by the
+-- `ssa` dump and nowhere else, so a real compile trusted what only a dump
+-- checked (TIX-86). They found nothing in the corpus or in `boot` when they
+-- were made fatal; the giblets check is TIX-63's.
 fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable, path : String)
         -> (SsaLower.Module, Array SsaLower.Unsupported) {
     let (module_, skipped) = SsaLower.lowerProgram(program, decls)
+    let complaints = []
+    for f in module_.functions {
+        for message in Ssa.verify(f) { Array.push(complaints, message) }
+        for block in f.blocks {
+            for i in block.insts {
+                for message in LowIr.checkReps(f, i) {
+                    Array.push(complaints, f.name + ": " + message)
+                }
+            }
+        }
+    }
+    for message in LowIr.checkCalls(module_.functions) {
+        Array.push(complaints, message)
+    }
+    if len(complaints) > 0 {
+        Diag.fail(Diag.whole("internal error", "the low IR is malformed:\n  "
+                             + String.join(complaints, "\n  ")), path)
+    }
     Giblets.checkLowered(module_.functions, path)
     (module_, skipped)
 }
@@ -790,7 +816,51 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
         for item in items { Array.push(checked.ordered, item) }
         for w in g.warnings { Array.push(checked.warnings, w) }
     }
+    checkMain(entry, checked.env, checked.classes)
     (checked, entry)
+}
+
+-- `main`, if the entry module defines one, is `fun() -> Unit`.
+--
+-- SPEC-DELTAS 21 calls a zero-argument `main` and 58 keeps it returning `Unit`,
+-- and neither was checked: a `main` returning a value ran and dropped it, and
+-- one taking a parameter reached the backend and crashed it. Checked on the
+-- scheme, so a `main` that generalized is refused with the type it was given.
+-- `turkey/driver.py`'s `_check_main` is the other half.
+fun checkMain(entry : Modules.Module, env : Constraints.Env,
+              classes : Classes.ClassTable) -> Unit {
+    for item in entry.program.decls {
+        match item {
+            DStmt(s) -> for name in bindingNames(s) {
+                if Ty.shortName(name) == "main" {
+                    if let Some(binding) = Constraints.lookup_(env, name) {
+                        let scheme = reduced(classes, binding.scheme)
+                        if !isEntryType(scheme) {
+                            Diag.fail(Diag.at("type error", Diag.short(
+                                "'main' is the entry point and must be "
+                                + "fun() -> Unit, but this one is "
+                                + Ty.showScheme(scheme)), s.span), s.span.file)
+                        }
+                    }
+                }
+            }
+            _ -> {}
+        }
+    }
+}
+
+-- Instantiable at `fun() -> Unit` is what is asked: a `main` that only panics
+-- is `forall a. fun() -> a`, and is a `main`.
+fun isEntryType(scheme : Ty.Scheme) -> Bool {
+    if len(scheme.preds) > 0 { return False }
+    match Ty.prune(scheme.body) {
+        TFun(params, ret) -> len(params) == 0 && match Ty.prune(ret) {
+            TCon(c) -> c.name == "Unit"
+            TVar(_) -> True
+            _ -> False
+        }
+        _ -> False
+    }
 }
 
 -- The environment every module is checked in. What a module may *write* is

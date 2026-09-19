@@ -1,42 +1,26 @@
--- The bootstrap compiler (plan.txt item 9).
+-- The compiler (plan.txt item 9), built from `bootstrap/` by `tools/build.sh`
+-- (BOOTSTRAP.md).
 --
--- Run under the Python implementation for now:
---
---     python3 -m turkey run boot/Main.gob -- tokens FILE...
---     python3 -m turkey run boot/Main.gob -- ast FILE...
---     python3 -m turkey run boot/Main.gob -- desugar FILE...
---
--- and, once it emits C and compiles itself, as a native binary taking the same
--- arguments. Element zero of `args` is the first real argument under both
--- hosts, which is why the two agree about a command line at all.
---
--- One subcommand per stage, each named after the `turkey` subcommand it is
--- diffed against. `tokens` is M19, `ast` M20, `desugar` M21; the rest arrive
--- with their milestones.
+-- One subcommand per stage: `check` compiles and says nothing, `native` emits
+-- arm64 assembly, and the rest print what a stage produced, which is how a
+-- pass is read while it is being written.
 --
 -- A subcommand takes any number of files and answers for each in turn, with no
 -- separator between them: every dump ends with its own EOF, so the
--- concatenation is unambiguous. That is not a convenience for the test -- it is
--- what keeps the milestone's diff to one process, since starting this program
--- currently means compiling it.
+-- concatenation is unambiguous. That keeps a whole corpus to one process, since
+-- starting this program is not free.
 
-import Data.Set as Set
 import System.Env as Env
 import System.IO as IO
 import Turkey.Diag as Diag
 import Turkey.Source as Source
 import Turkey.Source (Source)
-import Turkey.Lexer as Lexer
-import Turkey.Token as Token
-import Turkey.Parser as Parser
-import Turkey.AstDump as AstDump
 import Turkey.Modules as Modules
 import Turkey.Resolve as Resolve
 import Turkey.Desugar as Desugar
 import Turkey.Types as Ty
 import Turkey.Types (TFun, TCon, TVar)
 import Turkey.Decls as Decls
-import Turkey.Deps as Deps
 import Turkey.Classes as Classes
 import Turkey.Solved as Solved
 import Turkey.Constraints as Constraints
@@ -79,24 +63,18 @@ fun main() {
     let args = Env.args()
     if len(args) < 2 { usage() }
     let command = args[0]
-    if !Array.contains(["tokens", "ast", "desugar", "decls", "deps",
-                    "classes", "types", "core", "mono", "opt", "ssa",
-                    "llvm", "asm", "native", "check"], command) {
+    if !Array.contains(["decls", "classes", "types", "core", "mono", "opt",
+                    "ssa", "llvm", "asm", "native", "check"], command) {
         die("unknown command '" + command + "'")
     }
-    -- One builder for every file: a `print` per token is a flush per token,
-    -- and the library is a hundred thousand of them.
+    -- One builder for every file: a `print` per line is a flush per line, and
+    -- a dump of the library is a hundred thousand of them.
     let b = String.builder()
     for var i = 1; i < len(args); i = i + 1 {
         let path = args[i]
         Diag.compiling(path)
         match command {
-            "tokens" -> dumpTokens(b, readOrDie(path))
-            "ast" -> String.push(b, AstDump.dump(
-                Parser.parse(readOrDie(path), Array.new(0))))
-            "desugar" -> dumpDesugared(b, path)
             "decls" -> dumpDecls(b, path)
-            "deps" -> dumpDeps(b, path)
             "classes" -> dumpClasses(b, path)
             "types" -> dumpTypes(b, path)
             "core" -> dumpCore(b, path)
@@ -110,24 +88,6 @@ fun main() {
         }
     }
     write(String.build(b))
-}
-
-fun dumpTokens(b : String.Builder, source : Source) -> Unit {
-    for t in Lexer.tokenize(source) {
-        String.push(b, Token.canonical(t))
-        String.push(b, "\n")
-    }
-}
-
--- Every module of the program, resolved and desugared -- not just the entry
--- one. What those two passes do to a module depends on what it imported, so a
--- dump of the entry alone would check the interesting half of the stage against
--- nothing.
-fun dumpDesugared(b : String.Builder, path : String) -> Unit {
-    for m in loadResolved(path) {
-        String.push(b, "module " + m.name + "\n")
-        String.push(b, AstDump.dump(m.program))
-    }
 }
 
 -- Every module of the program, loaded, resolved and desugared, in dependency
@@ -189,72 +149,6 @@ fun registerTables(path : String,
         }
     }
     (table, classes)
-}
-
--- Each module's top-level binding groups, in the order they are checked.
---
--- The graph is keyed by *item*, not by bound name: one binding may introduce
--- several names, and keying by name would split an item across two components
--- and infer -- and evaluate -- its right-hand side twice.
-fun dumpDeps(b : String.Builder, path : String) -> Unit {
-    for m in loadResolved(path) {
-        String.push(b, "module " + m.name + "\n")
-        let items = topLevelItems(m.program.decls)
-        let namesOf = Map.new()
-        let owner = Map.new()
-        for var i = 0; i < len(items); i = i + 1 {
-            let key = "item" + Int.toString(i)
-            let names = itemNames(items[i])
-            Map.put(namesOf, key, names)
-            for n in names {
-                if !Map.contains(owner, n) { Map.put(owner, n, key) }
-            }
-        }
-        let graph = Map.new()
-        for var i = 0; i < len(items); i = i + 1 {
-            let edges = Set.new()
-            for n in Set.elements(itemDeps(items[i])) {
-                if let Some(key) = Map.get(owner, n) {
-                    Set.add(edges, key)
-                }
-            }
-            Map.put(graph, "item" + Int.toString(i), edges)
-        }
-        for component in Deps.sccs(graph) {
-            let bound = Array.new(4)
-            for key in component {
-                for n in Map.getOr(namesOf, key, Array.new(0)) {
-                    Array.push(bound, n)
-                }
-            }
-            String.push(b, "  group " + String.join(component, " ") + " : "
-                           + String.join(Array.sort(bound), ", ") + "\n")
-        }
-    }
-}
-
-fun topLevelItems(decls : Array Decl) -> Array Stmt {
-    let out = Array.new(8)
-    for d in decls {
-        if let DStmt(s) = d {
-            Array.push(out, s)
-        }
-    }
-    out
-}
-
-fun itemNames(item : Stmt) -> Array String = match item.kind {
-    SFun(d) -> [d.name]
-    SLet(pat, _) -> Array.sort(patternVars(pat))
-    SVar(pat, _) -> Array.sort(patternVars(pat))
-    _ -> Array.new(0)
-}
-
-fun itemDeps(item : Stmt) -> Set.Set String = match item.kind {
-    SFun(d) -> Deps.freeNamesOfFun(d, Set.new())
-    SLet(_, value) -> Deps.freeNames(value, Set.new())
-    SVar(_, value) -> Deps.freeNames(value, Set.new())
-    _ -> Set.new()
 }
 
 -- The inferred type of each of the entry module's top-level bindings.
@@ -981,7 +875,7 @@ fun readOrDie(path : String) -> Source = match Source.read(path) {
 
 fun usage() -> a =
     die("usage: boot "
-        + "<tokens|ast|desugar|decls|deps|classes|types|core|mono|opt"
+        + "<decls|classes|types|core|mono|opt"
         + "|ssa|llvm|asm|native|check> FILE...")
 
 fun die(message : String) -> a {

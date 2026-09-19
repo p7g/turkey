@@ -1,5 +1,5 @@
 module Turkey.Select (
-    Unsupported(..), selectFunc, selectModule,
+    Unsupported(..), selectModule,
 )
 
 -- The low IR to arm64 (`NATIVE-BACKEND.md`, M28 phase 4).
@@ -123,40 +123,19 @@ fun selectModule(m : Module) -> (Array (Func Inst), Array Unsupported, Asm) {
     let asm = Asm.newAsm(m)
     let done = []
     let skipped = []
+    -- One selection per function, answering both the function and, if it
+    -- stopped, why. It used to run twice -- once for each answer -- which
+    -- doubled selection and the root analysis inside it on every function
+    -- (TIX-57).
     for f in m.functions {
-        match selectFunc(f, asm) {
-            Some(g) -> Array.push(done, g)
-            None -> {}
-        }
-    }
-    for f in m.functions {
-        match reasonFor(f, asm) {
-            Some(why) -> Array.push(skipped,
-                                    Unsupported { name = f.name, what = why })
-            None -> {}
+        let s = start(f, asm)
+        run(s)
+        match s.stopped {
+            Some(why) -> Array.push(skipped, Unsupported { name = f.name, what = why })
+            None -> Array.push(done, s.out)
         }
     }
     (done, skipped, asm)
-}
-
--- Why a function could not be selected, or `None` if it could.
---
--- Run separately from `selectFunc` rather than threaded through it, because a
--- driver wants the reason and the caller of `selectFunc` wants the function,
--- and returning both made every call site destructure a pair it half ignored.
-fun reasonFor(f : Func Low, asm : Asm) -> Option String {
-    let s = start(f, asm)
-    run(s)
-    s.stopped
-}
-
-fun selectFunc(f : Func Low, asm : Asm) -> Option (Func Inst) {
-    let s = start(f, asm)
-    run(s)
-    match s.stopped {
-        Some(_) -> None
-        None -> Some(s.out)
-    }
 }
 
 fun start(f : Func Low, asm : Asm) -> Sel {

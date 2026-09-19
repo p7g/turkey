@@ -12,9 +12,8 @@ exactly the path it took before, which is what the last section here pins.
 
 import pytest
 
-from turkey.driver import check, run
-from turkey.errors import TurkeyError
-from turkey.types import show_scheme
+from tests.lang import check, execute as run, types
+from tests.lang import CompileError
 
 #: The message a skolem escape raises (delta 40), quoted rather than matched
 #: on a fragment: it is the whole of what a reader gets, so a test that
@@ -52,14 +51,13 @@ def output(src: str, capsys) -> list[str]:
 
 
 def fails(src: str) -> str:
-    with pytest.raises(TurkeyError) as exc:
+    with pytest.raises(CompileError) as exc:
         check(src)
     return exc.value.message
 
 
 def scheme(src: str, name: str) -> str:
-    checked = check(src)
-    return next(show_scheme(s) for n, s in checked.signatures if n == name)
+    return types(src)[name]
 
 
 # -- a declared type is kept --------------------------------------------------
@@ -215,7 +213,6 @@ def test_an_omitted_return_type_no_longer_infers_a_written_variables_context():
     """Delta 38 said dropping the return type asked for inference back, context
     and all. Delta 67 keeps the inference and not the context: `a` was written,
     so what may be assumed of it is what was written."""
-    from turkey.errors import TypeError_
     src = """
     fun size(xs : a) {
         var n = 0
@@ -224,7 +221,7 @@ def test_an_omitted_return_type_no_longer_infers_a_written_variables_context():
     }
     fun main() { print(Int.toString(size([1]))) }
     """
-    with pytest.raises(TypeError_, match="needs 'Iterator a', which the context"):
+    with pytest.raises(CompileError, match="needs 'Iterator a', which the context"):
         scheme(src, "size")
 
 

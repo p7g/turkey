@@ -2,13 +2,12 @@
 
 import pytest
 
-from turkey.driver import check
-from turkey.errors import TurkeyError
-from turkey.types import show_scheme
+from tests.lang import check, types
+from tests.lang import CompileError
 
 
 def test_regex_result_types_are_inferred_through_associated_families():
-    checked = check('''
+    signatures = types('''
 import Regex as R
 fun either(text) = R.fullMatch(R.choice(R.literal("a"), R.satisfy(fun(c) = True)), text)
 fun repeated(text) = R.fullMatch(R.some(R.literal("a")), text)
@@ -19,7 +18,6 @@ fun pairs(text) = R.fullMatch(R.many(do {
     pure((a, b))
 }), text)
 ''')
-    signatures = {name: show_scheme(scheme) for name, scheme in checked.signatures}
     assert signatures['either'] == 'fun(String) -> Option (Either String Char)'
     assert signatures['repeated'] == 'fun(String) -> Option (Array String)'
     assert signatures['optional'] == 'fun(String) -> Option (Option String)'
@@ -43,5 +41,5 @@ fun pairs(text) = R.fullMatch(R.many(do {
     '''fun bad() = R.Consume(fun(c) = True)''',
 ])
 def test_regex_rejects_incorrect_capture_and_result_types(source):
-    with pytest.raises(TurkeyError):
+    with pytest.raises(CompileError):
         check('import Regex as R\n' + source)

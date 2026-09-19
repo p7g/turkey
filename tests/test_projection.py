@@ -4,29 +4,14 @@ from __future__ import annotations
 
 import pytest
 
-from turkey import ast
-from turkey.builtins import initial_values
-from turkey.driver import check
-from turkey.errors import TurkeyError
-from turkey.eval import Evaluator
-from turkey.parser import parse
-from turkey.pygen import execute
-from turkey.types import show_scheme
+from tests.lang import check, output, types
+from tests.lang import CompileError
 
 
 def failure(src: str) -> str:
-    with pytest.raises(TurkeyError) as exc:
+    with pytest.raises(CompileError) as exc:
         check(src)
     return exc.value.message
-
-
-def test_parser_distinguishes_numeric_projection_from_fields_and_floats():
-    program = parse("fun f(x) = x.0.name.01\nfun n() = 1.25")
-    body = program.decls[0].decl.body
-    assert isinstance(body, ast.EProject) and body.index == 1
-    assert isinstance(body.obj, ast.EField) and body.obj.name == "name"
-    assert isinstance(body.obj.obj, ast.EProject) and body.obj.obj.index == 0
-    assert isinstance(program.decls[1].decl.body, ast.ELit)
 
 
 def test_projection_is_read_only():
@@ -36,8 +21,7 @@ def test_projection_is_read_only():
 
 
 def test_generic_projection_is_retained_in_the_signature():
-    checked = check("fun first(x) = x.0")
-    assert show_scheme(checked.signatures[0][1]) == (
+    assert types("fun first(x) = x.0")["first"] == (
         "[HasProjection 0 a] fun(a) -> Elem.0 a"
     )
 
@@ -50,13 +34,12 @@ def test_projection_result_improves_for_repeated_receiver_and_index():
     type is an associated family now, so both are the type expression
     `Elem.0 a` and ordinary unification does it.
     """
-    checked = check("fun duplicate(x) = (x.0, x.0)")
-    assert show_scheme(checked.signatures[0][1]) == (
+    assert types("fun duplicate(x) = (x.0, x.0)")["duplicate"] == (
         "[HasProjection 0 a] fun(a) -> (Elem.0 a, Elem.0 a)"
     )
 
 
-def test_tuple_and_positional_wrapper_project_in_both_backends(capsys):
+def test_tuple_and_positional_wrapper_project():
     src = """
 type Payload a = Packed(a, (String, Int))
 fun first(x) = x.0
@@ -65,12 +48,7 @@ fun main() {
     print(Int.toString(first(p)) + ":" + Int.toString(p.1.1))
 }
 """
-    checked = check(src)
-    Evaluator(checked.decls, initial_values()).run(checked.opt, checked.main)
-    interpreted = capsys.readouterr().out
-    execute(checked.opt, checked.decls, checked.main)
-    compiled = capsys.readouterr().out
-    assert interpreted == compiled == "7:42\n"
+    assert output(src) == "7:42\n"
 
 
 @pytest.mark.parametrize("src, message", [
@@ -92,4 +70,4 @@ fun main() {
     }
 }
 """
-    assert check(src).warnings == []
+    assert check(src) == ""

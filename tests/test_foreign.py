@@ -21,9 +21,8 @@ from pathlib import Path
 
 import pytest
 
-from turkey.driver import check
-from turkey.errors import TurkeyError
-from turkey.types import show_scheme
+from tests.lang import check, types
+from tests.lang import CompileError
 
 _SAFE = re.compile(r"[^A-Za-z0-9_]")
 
@@ -31,10 +30,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 LIB = REPO_ROOT / "lib"
 
 
-def fails(src: str, search: list[Path] | None = None) -> str:
-    with pytest.raises(TurkeyError) as caught:
-        check(src, None, search)
-    return str(caught.value)
+def fails(src: str | Path, modules: dict[str, str] | None = None) -> str:
+    with pytest.raises(CompileError) as caught:
+        check(src, modules)
+    return caught.value.rendered
 
 
 @pytest.fixture
@@ -75,12 +74,9 @@ def test_naming_your_own_module_unsafe_does_not_let_you_in(tmp_path):
     """Checked against where the file came from, not against what it says it
     is called. A program that could opt in by writing a module header would
     have no gate at all."""
-    (tmp_path / "Unsafe").mkdir()
-    (tmp_path / "Unsafe" / "Evil.gob").write_text(
-        "module Unsafe.Evil (f)\n"
-        'foreign "system" fun f(Prim.Ptr) -> Int\n',
-        encoding="utf-8")
-    message = fails("import Unsafe.Evil as E\nfun main() { }\n", [tmp_path])
+    message = fails("import Unsafe.Evil as E\nfun main() { }\n", {
+        "Unsafe/Evil.gob": "module Unsafe.Evil (f)\n"
+                           'foreign "system" fun f(Prim.Ptr) -> Int\n'})
     assert "may only appear in a standard library module" in message
 
 
@@ -93,7 +89,9 @@ def test_a_directory_named_lib_is_not_the_library(tmp_path):
         "module Unsafe.Mine (f)\n"
         'foreign "strlen" fun f(Prim.Ptr) -> Int\n',
         encoding="utf-8")
-    message = fails("import Unsafe.Mine as P\nfun main() { }\n", [root, LIB])
+    (root / "Main.gob").write_text("import Unsafe.Mine as P\nfun main() { }\n",
+                                   encoding="utf-8")
+    message = fails(root / "Main.gob")
     assert "may only appear in a standard library module" in message
 
 
@@ -105,8 +103,7 @@ def test_a_declaration_binds_the_name_at_the_type_it_states(probe):
         "module Unsafe.Probe (call)\n"
         'foreign "strlen" fun strlen(s : Prim.Ptr) -> Int\n'
         "fun call(p : Prim.Ptr) -> Int = strlen(p)\n"))
-    checked = check(entry)
-    assert show_scheme(dict(checked.signatures)["main"]) == "fun() -> Unit"
+    assert types(entry)["main"] == "fun() -> Unit"
 
 
 @pytest.mark.parametrize(

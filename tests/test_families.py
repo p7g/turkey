@@ -11,10 +11,8 @@ from __future__ import annotations
 
 import pytest
 
-from turkey import ast
-from turkey.driver import check, run
-from turkey.errors import TurkeyError
-from turkey.types import TFam, show_scheme
+from tests.lang import check, execute as run, types
+from tests.lang import CompileError
 
 CONTAINER = """
 class Container c {
@@ -45,14 +43,13 @@ def output(src: str, capsys) -> list[str]:
 
 
 def fails(src: str) -> str:
-    with pytest.raises(TurkeyError) as exc:
+    with pytest.raises(CompileError) as exc:
         check(src)
     return exc.value.message
 
 
 def scheme(src: str, name: str) -> str:
-    checked = check(src)
-    return next(show_scheme(s) for n, s in checked.signatures if n == name)
+    return types(src)[name]
 
 
 # -- declaring one ------------------------------------------------------------
@@ -71,12 +68,10 @@ def test_a_family_may_not_share_a_name_with_a_type():
 
 
 def test_two_classes_may_declare_the_same_family_name():
-    checked = check(
+    check(
         "class C c {\n type Elem c\n fun f(c) -> Int\n}\n"
         "class D d {\n type Elem d\n fun g(d) -> Int\n}"
     )
-    assert "Main#C.Elem" in checked.decls.families
-    assert "Main#D.Elem" in checked.decls.families
 
 
 def test_a_family_must_be_applied():
@@ -302,27 +297,6 @@ def test_the_element_type_dispatches_the_method_called_on_it(capsys):
     assert output(src, capsys) == ["7", "yes", "3"]
 
 
-def test_a_family_is_erased_before_the_evaluator_sees_it():
-    checked = check(CONTAINER + "fun main() { print(Int.toString(first([1]))) }")
-    scheme_ = next(s for n, s in checked.signatures if n == "main")
-    assert not _has_family(scheme_.body)
-
-
-def _has_family(t) -> bool:
-    from turkey.types import TApp, TFun, TTuple, prune
-
-    t = prune(t)
-    if isinstance(t, TFam):
-        return True
-    if isinstance(t, TApp):
-        return _has_family(t.fn) or _has_family(t.arg)
-    if isinstance(t, TFun):
-        return any(_has_family(p) for p in t.params) or _has_family(t.ret)
-    if isinstance(t, TTuple):
-        return any(_has_family(e) for e in t.elems)
-    return False
-
-
 # -- equality constraints (delta 39) ------------------------------------------
 
 OPS = """
@@ -434,18 +408,3 @@ def test_an_equality_may_not_define_a_family_by_itself():
 def test_a_context_entry_that_is_neither_form_is_a_parse_error():
     assert "an equality, as in 'Item c ~ Op'" in fails("fun f[Ord a b](x : a) -> Int = 1")
 
-
-def test_an_equality_costs_no_dictionary():
-    """`~` is not a class, so the filters that erase `HasField` erase it too."""
-    src = OPS + """
-    fun c[Iterator s, Item s ~ Op](ops : s) -> Int {
-        var n = 0
-        for op in ops { n = n + 1 }
-        n
-    }
-    """
-    checked = check(src)
-    decl = next(s.decl for s in checked.ordered
-                if isinstance(s, ast.SFun) and s.decl.name.endswith("#c"))
-    assert [p.name for p in decl.dicts.preds] == ["Std.Classes#Iterator"]
-    assert len(decl.dicts.params) == 1

@@ -12,11 +12,8 @@ from __future__ import annotations
 
 import pytest
 
-from turkey.builtins import PRIM_NAMES
-from turkey.driver import check, run
-from turkey.errors import TurkeyError, TurkeyPanic
-from turkey.types import show_scheme
-from turkey.values import ArrayObj, UNINIT
+from tests.lang import check, execute as run, types
+from tests.lang import CompileError, Panic
 
 SHAPES = """
 type Shape = Circle { radius : Int } | Rect { width : Int, height : Int }
@@ -31,7 +28,7 @@ def output(src: str, capsys) -> list[str]:
 
 
 def fails(src: str) -> str:
-    with pytest.raises(TurkeyError) as exc:
+    with pytest.raises(CompileError) as exc:
         check(src)
     return exc.value.message
 
@@ -45,7 +42,7 @@ def warnings(src: str) -> list[str]:
     would notice a warning quietly reappearing, and because the next real
     warning will want the plumbing.
     """
-    return check(src).warnings
+    return check(src).splitlines()
 
 
 # -- M9.1: either form matches either declaration ---------------------------
@@ -307,11 +304,8 @@ fun main() {
 
 
 def test_pops_scheme_names_the_preludes_option():
-    scheme_ = next(
-        s for n, s in check("fun f(xs : Array Int) -> Option Int = Array.pop(xs)").signatures
-        if n == "f"
-    )
-    assert show_scheme(scheme_) == "fun(Array Int) -> Option Int"
+    scheme_ = types("fun f(xs : Array Int) -> Option Int = Array.pop(xs)\n")["f"]
+    assert scheme_ == "fun(Array Int) -> Option Int"
 
 
 def test_popping_an_empty_array_does_not_panic(capsys):
@@ -336,24 +330,8 @@ fun main() {
     print(Int.toString(a[0]))
 }
 """
-    with pytest.raises(TurkeyPanic):
+    with pytest.raises(Panic):
         run(src)
-
-
-def test_primitive_arrays_are_fixed_length_storage():
-    filled = ArrayObj(3, 7)
-    assert filled.length == 3
-    assert [filled.get(i) for i in range(3)] == [7, 7, 7]
-    filled.set(1, 9)
-    assert filled.get(1) == 9
-    with pytest.raises(TurkeyPanic, match="length 3"):
-        filled.get(3)
-
-    unsafe = ArrayObj(2)
-    assert unsafe.get(0) is UNINIT
-    assert "Prim.arrayNewUninit" in PRIM_NAMES
-    assert "Prim.arrayPush" not in PRIM_NAMES
-    assert "Prim.arrayPop" not in PRIM_NAMES
 
 
 def test_filled_arrays_have_length_and_remain_growable(capsys):

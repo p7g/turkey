@@ -4,38 +4,28 @@ M27 phase 0. Nothing imports the module yet -- the lowering into it is the
 next phase -- so this is what type-checks it and what exercises the analyses.
 `boot/SsaCheck.gob` is the driver; see its header for why it lives there.
 
-Run through the Python implementation, which is the host `boot` is compiled by
-today. That is the point at which this is a test of the Turkey code rather
-than of the two implementations agreeing, which is `test_boot`'s job.
+Compiled by `boot` itself and run: a test of the Turkey code, not of two
+implementations agreeing.
 """
 
-import contextlib
 import functools
-import io
 from pathlib import Path
 
-from tests import bootc
-from turkey.driver import run
+from tests import lang
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DRIVER = REPO_ROOT / "boot" / "SsaCheck.gob"
 
 
 @functools.lru_cache(maxsize=None)
+@functools.lru_cache(maxsize=1)
 def _dump() -> str:
-    """The driver's output, computed once and kept on disk.
+    """The driver's output: `boot/SsaCheck.gob` compiled by `boot` and run.
 
-    Every test here asserts on the same eight seconds of interpreted output,
-    and each used to run the driver again for it. The reference cache's key
-    covers `turkey/`, `lib/` and every `.gob` under `boot/`, which is
-    everything the run depends on.
+    It imports `boot/Turkey/`, whose sources are part of the compile's cache
+    key (`tests.lang`), so a change there recompiles it.
     """
-    def compute() -> str:
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            run(DRIVER.read_text(encoding="utf-8"), str(DRIVER))
-        return out.getvalue()
-    return bootc.reference("ssacheck", DRIVER, compute)
+    return lang.output(DRIVER)
 
 
 def _output(capfd) -> str:

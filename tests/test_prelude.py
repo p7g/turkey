@@ -11,9 +11,8 @@ from __future__ import annotations
 
 import pytest
 
-from turkey.driver import check, run
-from turkey.errors import TurkeyError
-from turkey.types import show_scheme
+from tests.lang import check, execute as run, types
+from tests.lang import CompileError
 
 # A list is the case indexing cannot serve: no kth element to hand out, so an
 # indexed `for` over it would be quadratic even if it could be written.
@@ -44,14 +43,13 @@ def output(src: str, capsys) -> list[str]:
 
 
 def fails(src: str) -> str:
-    with pytest.raises(TurkeyError) as exc:
+    with pytest.raises(CompileError) as exc:
         check(src)
     return exc.value.message
 
 
 def scheme(src: str, name: str) -> str:
-    checked = check(src)
-    return next(show_scheme(s) for n, s in checked.signatures if n == name)
+    return types(src)[name]
 
 
 # -- print is a function, not a builtin ---------------------------------------
@@ -103,11 +101,11 @@ def test_the_prelude_exports_its_bindings_and_nothing_else():
     """What a module may write is its *scope*, not the environment: after
     M11a every builtin lives in one environment and resolution is what
     decides which of them a given module can name."""
-    scope = check("fun main() {}").scope
-    assert scope["print"] == "System.IO#print"
-    assert scope["show"] == "Std.Classes#Show.show"
-    assert "Prim.intToString" not in scope
-    assert "Prim.intAdd" not in scope
+    check("fun main() { print(show(1)) }")
+    assert fails("fun f() -> String = Prim.intToString(1)") == \
+        "'Prim.intToString' is not defined"
+    assert fails("fun f() -> Int = Prim.intAdd(1, 2)") == \
+        "'Prim.intAdd' is not defined"
 
 
 def test_option_comes_from_the_prelude():

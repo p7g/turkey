@@ -11,11 +11,8 @@ from __future__ import annotations
 
 import pytest
 
-from turkey import ast
-from turkey.driver import check, run
-from turkey.errors import TurkeyError, TurkeyPanic
-from turkey.evidence import FromDict, FromInstance
-from turkey.types import show_scheme
+from tests.lang import check, execute as run, types
+from tests.lang import CompileError, Panic
 
 MONEY = """
 type Money = Money { cents : Int }
@@ -32,65 +29,16 @@ def output(src: str, capsys) -> list[str]:
 
 
 def fails(src: str) -> str:
-    with pytest.raises(TurkeyError) as exc:
+    with pytest.raises(CompileError) as exc:
         check(src)
     return exc.value.message
 
 
 def scheme(src: str, name: str) -> str:
-    checked = check(src)
-    return next(show_scheme(s) for n, s in checked.signatures if n == name)
-
-
-
-def _short(name: str) -> str:
-    """A top-level binding is `Module#name` after resolution (M11a); the tests
-    ask for it the way it was written."""
-    return name.rpartition(".")[2].rpartition("#")[2]
-
-def _uses(checked, fn: str) -> list[ast.EVar]:
-    """Every `EVar` inside one top-level function, in source order."""
-    from dataclasses import fields
-
-    found: list[ast.EVar] = []
-    seen: set[int] = set()
-
-    def walk(node) -> None:
-        if isinstance(node, (list, tuple)):
-            for item in node:
-                walk(item)
-            return
-        if not isinstance(node, ast.Node) or id(node) in seen:
-            return
-        seen.add(id(node))
-        if isinstance(node, ast.EVar):
-            found.append(node)
-        for f in fields(node):
-            walk(getattr(node, f.name))
-
-    for item in checked.program.decls:
-        if isinstance(item, ast.SFun) and _short(item.decl.name) == fn:
-            walk(item.decl.body)
-    return found
+    return types(src)[name]
 
 
 # -- what an operator is ------------------------------------------------------
-
-
-def test_an_operator_is_a_use_of_its_method():
-    """`+` carries an ordinary `Use`, resolved by the ordinary machinery."""
-    checked = check("fun f(x : Int) -> Int = x + 1")
-    (use,) = [v.use for v in _uses(checked, "f") if _short(v.name) == "add"]
-    (evidence,) = use.evidence
-    assert isinstance(evidence, FromInstance)
-    assert evidence.inst.cls == "Std.Classes#Add" and evidence.inst.con == "Int"
-
-
-def test_an_operator_on_an_open_type_takes_a_dictionary():
-    checked = check("fun twice(x) = x + x")
-    (use,) = [v.use for v in _uses(checked, "twice")
-              if _short(v.name) == "add"]
-    assert isinstance(use.evidence[0], FromDict)
 
 
 def test_addition_generalizes_over_its_class():
@@ -172,7 +120,7 @@ def test_int_division_still_truncates_toward_zero(capsys):
 
 
 def test_division_by_zero_still_panics():
-    with pytest.raises(TurkeyPanic, match="division by zero"):
+    with pytest.raises(Panic, match="division by zero"):
         run("fun main() { print(Int.toString(1 / 0)) }")
 
 
@@ -235,12 +183,6 @@ def test_the_primitives_are_not_in_the_surface_language():
         "'Prim.intAdd' is not defined"
 
 
-def test_a_program_may_declare_a_class_with_a_prelude_class_short_name():
-    checked = check("class Add a { fun add(a, a) -> a }")
-    assert "Main#Add" in checked.classes.classes
-    assert "Std.Classes#Add" in checked.classes.classes
-
-
 def test_a_program_may_define_a_name_a_class_method_already_has():
     """A method lives in the *global* namespace and a top-level binding lives
     in its module's, so the two no longer collide (M11a). This is the papercut
@@ -269,7 +211,7 @@ def test_a_second_instance_for_a_built_in_type_overlaps():
 
 
 def test_the_float_operators_are_gone():
-    with pytest.raises(TurkeyError):
+    with pytest.raises(CompileError):
         check("fun f() -> Float = 1.5 +. 2.0")
 
 

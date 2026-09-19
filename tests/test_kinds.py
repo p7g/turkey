@@ -9,15 +9,8 @@ from __future__ import annotations
 
 import pytest
 
-from turkey.decls import DeclTable
-from turkey.driver import check
-from turkey.errors import ParseError, TypeError_
-from turkey.ast import TypeDecl
-from turkey.parser import parse
-from turkey.types import (
-    ARRAY, INT, KFun, STAR, TVar, apply, array_of, kind_of, prune, show_kind,
-    show_scheme, spine, unify,
-)
+from tests import lang
+from tests.lang import CompileError, check, types
 
 
 @pytest.mark.parametrize("src, variable", [
@@ -26,28 +19,10 @@ from turkey.types import (
     ("type Alias = Array a", "a"),
 ])
 def test_a_type_declaration_rejects_an_undeclared_variable(src, variable):
-    with pytest.raises(TypeError_, match=(
+    with pytest.raises(CompileError, match=(
         rf"type variable '{variable}' is not declared by type"
     )):
         check(src)
-
-
-def test_an_existential_bracket_declares_its_variables():
-    table = DeclTable()
-    table.register_all([d for d in parse(
-        "type Some = Some[Show e](e)\n"
-        "type Counter = Counter[s] { state : s, read : fun(s) -> Int }\n"
-        "type Pair a = Pair[b](a, b)\n"
-    ).decls if isinstance(d, TypeDecl)])
-    some = table.constructors["Some"]
-    assert show_scheme(some.scheme) == "[Show a] fun(a) -> Some"
-    assert len(some.exists) == 1 and some.arity == 1
-    counter = table.constructors["Counter"]
-    assert counter.is_existential and counter.arity == 2
-    assert not table.tycons["Counter"].is_mutable_record
-    pair = table.constructors["Pair"]
-    assert show_scheme(pair.scheme) == "fun(a, b) -> Pair a"
-    assert [v.id for v in pair.exists] != []
 
 
 @pytest.mark.parametrize("src, message", [
@@ -57,20 +32,18 @@ def test_an_existential_bracket_declares_its_variables():
     ("type T = T[Nope e](e)", "unknown class 'Nope'"),
 ])
 def test_an_existential_bracket_is_checked(src, message):
-    with pytest.raises(TypeError_, match=message):
+    with pytest.raises(CompileError, match=message):
         check(src)
 
 
 def test_a_declared_phantom_parameter_is_valid():
-    checked = check("type Tagged a = Tagged(Int)\nfun tag(n) = Tagged(n)")
-    assert dict(checked.signatures)["tag"] is not None
+    assert "tag" in types("type Tagged a = Tagged(Int)\nfun tag(n) = Tagged(n)")
 
 
 def kinds(src: str) -> dict[str, str]:
-    """Every declared type constructor's kind, as it prints."""
-    table = DeclTable()
-    table.register_all([d for d in parse(src).decls if isinstance(d, TypeDecl)])
-    return {name: show_kind(info.kind) for name, info in table.tycons.items()}
+    """Every type constructor the program declares, and its kind as it prints."""
+    return {name.removeprefix("Main#"): kind
+            for name, kind in lang.kinds(src).items() if name.startswith("Main#")}
 
 
 # -- inference over declarations ------------------------------------------
@@ -112,17 +85,16 @@ def test_an_alias_body_constrains_the_alias_kind() -> None:
 
 
 def test_the_prelude_and_built_in_kinds() -> None:
-    decls = check("").decls
-    assert show_kind(decls.tycons["Data.Array#Array"].kind) == "* -> *"
-    assert show_kind(decls.tycons["Prim.Array"].kind) == "* -> *"
-    assert show_kind(decls.tycons["Int"].kind) == "*"
+    table = lang.kinds("")
+    assert table["Data.Array#Array"] == "* -> *"
+    assert table["Prim.Array"] == "* -> *"
 
 
 # -- what kinds reject -----------------------------------------------------
 
 
 def bad(src: str) -> str:
-    with pytest.raises(TypeError_) as excinfo:
+    with pytest.raises(CompileError) as excinfo:
         check(src)
     return str(excinfo.value)
 
@@ -159,38 +131,17 @@ def test_a_self_application_would_need_an_infinite_kind() -> None:
 
 
 def test_a_variable_head_must_still_be_a_variable() -> None:
-    with pytest.raises(ParseError):
-        parse("fun f(x : (Array Int) Bool) = x")
+    with pytest.raises(CompileError, match="parse error"):
+        check("fun f(x : (Array Int) Bool) = x")
 
 
 # -- kinds inside unification ---------------------------------------------
 
 
-def test_application_decomposes() -> None:
-    """`f a ~ Array Int` binds the head as well as the argument. Sound only
-    because there are no type-level lambdas, which is also why an alias has to
-    be saturated before it is expanded."""
-    f, a = TVar(1), TVar(1)
-    applied = apply(f, [a])
-    unify(applied, array_of(INT))
-    head, args = spine(applied)
-    assert head is ARRAY
-    assert prune(args[0]) is INT
-    # The head's kind was a variable until this unification decided it.
-    assert show_kind(kind_of(f)) == "* -> *"
-
-
-def test_binding_a_variable_checks_its_kind() -> None:
-    higher = TVar(1, KFun(STAR, STAR))
-    with pytest.raises(TypeError_) as excinfo:
-        unify(higher, INT)
-    assert "has kind *" in str(excinfo.value)
-
-
 def test_a_higher_kinded_variable_survives_generalization() -> None:
     """`Wrap a b` in a signature means the `a` was quantified at kind `* -> *`;
     if instantiation dropped the kind, the second use below would not unify."""
-    result = check("""
+    signatures = types("""
         type Wrap f a = Wrap(f a)
         fun unwrap(w) = match w { Wrap(inner) -> inner }
         fun main() {
@@ -198,5 +149,4 @@ def test_a_higher_kinded_variable_survives_generalization() -> None:
             let two : Array Int = unwrap(Wrap([2]))
         }
     """)
-    signatures = dict(result.signatures)
-    assert show_scheme(signatures["unwrap"]) == "fun(Wrap a b) -> a b"
+    assert signatures["unwrap"] == "fun(Wrap a b) -> a b"

@@ -13,32 +13,15 @@ cause.
 
 from __future__ import annotations
 
-import io
-from contextlib import redirect_stdout
-
-import pytest
-
-from turkey import driver, llvmgen
-from turkey.errors import TurkeyError
+from tests import lang
 
 
-def outputs(source: str, capfd) -> str:
-    checked = driver.check(source)
-    out = io.StringIO()
-    with redirect_stdout(out):
-        driver.run(source, backend="python")
-    python = out.getvalue()
-    capfd.readouterr()
-    llvmgen.execute(checked.opt, checked.decls, checked.main)
-    native = capfd.readouterr().out
-    assert python == native
-    return python
+def outputs(source: str) -> str:
+    return lang.output(source)
 
 
 def fails(source: str) -> str:
-    with pytest.raises(TurkeyError) as caught:
-        driver.check(source)
-    return caught.value.message
+    return lang.fails(source)
 
 
 PAYLOADS = """
@@ -50,7 +33,7 @@ instance Error IoError { fun message(IoError(n)) = "io " + Int.toString(n) }
 """
 
 
-def test_unrelated_payloads_travel_in_one_channel(capfd):
+def test_unrelated_payloads_travel_in_one_channel():
     """The point of the channel: two types with nothing in common, one list."""
     source = PAYLOADS + """
 fun main() {
@@ -59,10 +42,10 @@ fun main() {
     }
 }
 """
-    assert outputs(source, capfd) == "parse eof\nio 2\n"
+    assert outputs(source) == "parse eof\nio 2\n"
 
 
-def test_propagation_converts_nothing(capfd):
+def test_propagation_converts_nothing():
     """`?` moves a `SomeError` that was packed at the source. No wrapper sum,
     no conversion at the intermediate frames -- which is decision 2."""
     source = PAYLOADS + """
@@ -88,10 +71,10 @@ fun main() {
     }
 }
 """
-    assert outputs(source, capfd) == "3\nio 7\n"
+    assert outputs(source) == "3\nio 7\n"
 
 
-def test_context_keeps_the_cause_and_its_message(capfd):
+def test_context_keeps_the_cause_and_its_message():
     """GHC lost annotations exactly here, by repacking on a rethrow. `context`
     builds around the inner error instead, so every layer stays reachable."""
     source = PAYLOADS + """
@@ -106,10 +89,10 @@ fun main() {
     print(Error.describe(outer))
 }
 """
-    assert outputs(source, capfd) == "parse config\nio 5\nparse config: io 5\n"
+    assert outputs(source) == "parse config\nio 5\nparse config: io 5\n"
 
 
-def test_a_chain_is_walked_to_the_bottom(capfd):
+def test_a_chain_is_walked_to_the_bottom():
     source = PAYLOADS + """
 fun depth(e : SomeError) -> Int = match Error.causeOf(e) {
     None -> 1
@@ -125,16 +108,16 @@ fun main() {
     print(Error.describe(e))
 }
 """
-    assert outputs(source, capfd) == "4\nparse 3: parse 2: parse 1: io 0\n"
+    assert outputs(source) == "4\nparse 3: parse 2: parse 1: io 0\n"
 
 
-def test_showing_an_error_shows_the_whole_chain(capfd):
+def test_showing_an_error_shows_the_whole_chain():
     source = PAYLOADS + """
 fun main() {
     print(Error.context(fail(IoError(1)), ParseError("top")))
 }
 """
-    assert outputs(source, capfd) == "parse top: io 1\n"
+    assert outputs(source) == "parse top: io 1\n"
 
 
 def test_a_payload_must_implement_error():
@@ -158,13 +141,13 @@ fun main() { print(fail(IoError(1)).payload) }
     assert "only opening the value in a 'match' arm can name" in message
 
 
-def test_the_channel_comes_from_the_prelude(capfd):
+def test_the_channel_comes_from_the_prelude():
     """No import: `Error`, `SomeError` and `fail` are Prelude names, and the
     rest of the module is reached through the `Error` alias."""
     source = PAYLOADS + """
 fun main() { print(Error.describe(fail(IoError(3)))) }
 """
-    assert outputs(source, capfd) == "io 3\n"
+    assert outputs(source) == "io 3\n"
 
 
 CASTABLE = PAYLOADS + """
@@ -177,7 +160,7 @@ fun asCode(e : SomeError) -> Option Code = Error.cast(e)
 """
 
 
-def test_a_payload_comes_back_as_the_type_it_is(capfd):
+def test_a_payload_comes_back_as_the_type_it_is():
     source = CASTABLE + """
 fun main() {
     match asParse(fail(ParseError("eof"))) {
@@ -186,10 +169,10 @@ fun main() {
     }
 }
 """
-    assert outputs(source, capfd) == "parse eof\n"
+    assert outputs(source) == "parse eof\n"
 
 
-def test_a_payload_does_not_come_back_as_another_type(capfd):
+def test_a_payload_does_not_come_back_as_another_type():
     """The negative case is the one that matters: the packed rep and the
     wanted rep disagree, so nothing is converted."""
     source = CASTABLE + """
@@ -200,10 +183,10 @@ fun main() {
     }
 }
 """
-    assert outputs(source, capfd) == "not an io error\n"
+    assert outputs(source) == "not an io error\n"
 
 
-def test_a_scalar_payload_casts(capfd):
+def test_a_scalar_payload_casts():
     """A single-field type is held as a scalar rather than a pointer, so this
     is the case where the packed layout and a pointer-shaped result differ --
     which is exactly the combination the rep check has to rule out."""
@@ -219,10 +202,10 @@ fun main() {
     }
 }
 """
-    assert outputs(source, capfd) == "42\nnot a parse error\n"
+    assert outputs(source) == "42\nnot a parse error\n"
 
 
-def test_cast_looks_at_the_outer_payload_only(capfd):
+def test_cast_looks_at_the_outer_payload_only():
     """Not a chain search. Go's `errors.As` walks the cause chain; this does
     not, and the chain stays reachable through `causeOf` for a caller that
     wants it."""
@@ -242,7 +225,7 @@ fun main() {
     }
 }
 """
-    assert outputs(source, capfd) == "outer is not an io error\n9\n"
+    assert outputs(source) == "outer is not an io error\n9\n"
 
 
 PARAMETERIZED = PAYLOADS + """
@@ -257,7 +240,7 @@ fun asTaggedString(e : SomeError) -> Option (Tagged String) = Error.cast(e)
 """
 
 
-def test_a_parameterized_payload_casts_at_its_argument(capfd):
+def test_a_parameterized_payload_casts_at_its_argument():
     """`Tagged Int` and `Tagged String` are one constructor and one derived
     instance, whose head is general, so the argument's rep is the only thing
     telling the two apart -- and a cast that compared constructors alone would
@@ -274,10 +257,10 @@ fun main() {
     }
 }
 """
-    assert outputs(source, capfd) == "8\nnot a tagged string\n"
+    assert outputs(source) == "8\nnot a tagged string\n"
 
 
-def test_promote_packs_once_and_keeps_the_payload_reachable(capfd):
+def test_promote_packs_once_and_keeps_the_payload_reachable():
     """`promote` is `Either.mapLeft` through `fail`, so it is the same entry to
     the channel a source would write by hand: one wrapper, no cause, and the
     concrete payload still there for `cast`."""
@@ -313,7 +296,7 @@ fun main() {
     }
 }
 """
-    assert outputs(source, capfd) == "80\nio 13\n1\n13\n"
+    assert outputs(source) == "80\nio 13\n1\n13\n"
 
 
 def test_promote_demands_an_error_payload():
@@ -333,7 +316,7 @@ fun main() {
     assert "Error Plain" in message
 
 
-def test_bifunctor_reaches_the_left_that_functor_cannot(capfd):
+def test_bifunctor_reaches_the_left_that_functor_cannot():
     """`Functor (Either l)` fixes the left and varies the right. `bimap` is the
     one that reaches both, and `Data.Bifunctor.first` is the half of it this
     library had no name for.
@@ -352,10 +335,10 @@ fun main() {
     print(Either.mapLeft(bad, fun(n) = n + 1))
 }
 """
-    assert outputs(source, capfd) == "Left(4)\nRight(2)\nLeft(4)\nLeft(4)\n"
+    assert outputs(source) == "Left(4)\nRight(2)\nLeft(4)\nLeft(4)\n"
 
 
-def test_second_agrees_with_map(capfd):
+def test_second_agrees_with_map():
     """The law nothing checks. `Either` is both a `Functor` in its right half
     and a `Bifunctor`, and the two had better say the same thing."""
     source = """
@@ -367,4 +350,4 @@ fun main() {
     }
 }
 """
-    assert outputs(source, capfd) == "True\nTrue\n"
+    assert outputs(source) == "True\nTrue\n"

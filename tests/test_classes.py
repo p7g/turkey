@@ -11,11 +11,9 @@ from __future__ import annotations
 
 import pytest
 
-from turkey import ast
-from turkey.driver import check
-from turkey.errors import TurkeyError
-from turkey.parser import parse
-from turkey.types import show_kind, show_scheme
+from tests import lang
+from tests.lang import check
+from tests.lang import CompileError
 
 # `Either` was declared here until delta 45 put it in the prelude. Declaring one
 # anyway would still work -- a type is qualified by its module -- but every
@@ -24,19 +22,17 @@ PRELUDE = ""
 
 
 def sigs(src: str) -> dict[str, str]:
-    checked = check(PRELUDE + src)
-    return {name: show_scheme(scheme) for name, scheme in checked.signatures}
+    return lang.types(PRELUDE + src)
 
 
 def bad(src: str) -> str:
-    with pytest.raises(TurkeyError) as exc:
+    with pytest.raises(CompileError) as exc:
         check(PRELUDE + src)
     return exc.value.message
 
 
 def kind_of_class(src: str, name: str) -> str:
-    classes = check(PRELUDE + src).classes.classes
-    return show_kind(classes[f"Main#{name}"].kind)
+    return lang.classes(PRELUDE + src)[f"Main#{name}"].kind
 
 
 EQ = """
@@ -53,40 +49,17 @@ instance Egal Int {
 # -- parsing ------------------------------------------------------------------
 
 
-def test_signature_parameters_are_types_not_binders():
-    """`fun combine(a, a) -> a` names one type variable twice, not two binders."""
-    src = "class Semigroup a { fun combine(a, a) -> a }"
-    (decl,) = [d for d in parse(src).decls if isinstance(d, ast.ClassDecl)]
-    (method,) = decl.methods
-    assert method.body is None
-    assert [p.type_expr.name for p in method.params] == ["a", "a"]
-
-
-def test_a_method_with_a_body_binds_its_parameters():
-    src = "class C a { fun f(x : a) -> a = x }"
-    (decl,) = [d for d in parse(src).decls if isinstance(d, ast.ClassDecl)]
-    (method,) = decl.methods
-    assert method.body is not None
-    assert isinstance(method.params[0].pat, ast.PVar)
-
-
 def test_a_signature_must_state_a_return_type():
-    with pytest.raises(TurkeyError) as exc:
-        parse("class C a { fun f(a) }")
+    with pytest.raises(CompileError) as exc:
+        check("class C a { fun f(a) }")
     assert "must state a return type" in exc.value.message
 
 
 def test_a_top_level_fun_may_not_omit_its_body():
     """The signature reading is a class-body privilege, not a general one."""
-    with pytest.raises(TurkeyError) as exc:
-        parse("fun f(a, a) -> a")
+    with pytest.raises(CompileError) as exc:
+        check("fun f(a, a) -> a")
     assert "expected '=' or a block" in exc.value.message
-
-
-def test_a_higher_order_parameter_type_needs_no_new_syntax():
-    src = "class Mappable f { fun over(f a, fun(a) -> b) -> f b }"
-    (decl,) = [d for d in parse(src).decls if isinstance(d, ast.ClassDecl)]
-    assert isinstance(decl.methods[0].params[1].type_expr, ast.TEFun)
 
 
 # -- kinds --------------------------------------------------------------------
@@ -300,12 +273,6 @@ def test_an_instance_may_not_define_a_method_of_another_class():
     assert bad(src) == "'egal' is not a method of class 'Display'"
 
 
-def test_an_instance_method_states_no_signature():
-    src = "class Egal a { fun egal(a, a) -> Bool }\ninstance Egal Int { fun egal(x, y) = x == y }"
-    (inst,) = [d for d in parse(src).decls if isinstance(d, ast.InstanceDecl)]
-    assert inst.methods[0].body is not None
-
-
 def test_a_method_may_share_a_name_with_a_top_level_function():
     """It could not before M11a, because both lived in one flat namespace. A
     top-level binding and the class method now have distinct internal names."""
@@ -315,9 +282,7 @@ def test_a_method_may_share_a_name_with_a_top_level_function():
 
 def test_two_classes_may_declare_the_same_method_name():
     src = EQ + "class Same a { fun egal(a, a) -> Bool }"
-    classes = check(src).classes.classes
-    assert "Main#Egal" in classes
-    assert "Main#Same" in classes
+    classes = lang.classes(src)
     assert "Main#Egal.egal" in classes["Main#Egal"].methods
     assert "Main#Same.egal" in classes["Main#Same"].methods
 
@@ -328,9 +293,6 @@ class PairSize p { fun pairSize(p) -> Int }
 instance PairSize (a, b) { fun pairSize(pair) = 2 }
 fun size() -> Int = pairSize(("left", True))
 """
-    checked = check(src)
-    instance = checked.classes.instances["Main#PairSize"][0]
-    assert instance.con == "Tuple2"
     assert sigs(src)["size"] == "fun() -> Int"
 
 
@@ -422,9 +384,8 @@ def test_a_class_may_not_be_declared_twice():
 
 def test_a_class_may_share_a_short_name_with_a_type():
     src = "class Option a { fun f(a) -> a }"
-    checked = check(src)
-    assert "Main#Option" in checked.classes.classes
-    assert "Data.Option.Type#Option" in checked.decls.tycons
+    assert "Main#Option" in lang.classes(src)
+    assert "Data.Option.Type#Option" in lang.kinds(src)
 
 
 def test_a_method_parameter_needs_a_type():

@@ -1,14 +1,11 @@
 """Giblets: modules whose code holds no traced value (TIX-63, SPEC-DELTAS 73).
 
-Every rule is run through *both* compilers and the two verdicts compared. The
-check lives on Core, which `test_boot` already compares byte for byte, but that
-compares the input to the check, not the check: a rule fixed on one side only
-is exactly the failure FINDINGS 43 describes, and this is the test that notices
-it.
+Every rule is run through `boot`, and its verdict -- accepted, or the
+diagnostic -- is the test.
 
 A giblet module whose code is wrong on purpose cannot be in the compiler's
-list, so the tests name theirs through `TURKEY_TEST_GIBLETS`, which both
-compilers read. The module itself has to come from the shipped `lib/` -- that
+list, so the tests name theirs through `TURKEY_TEST_GIBLETS`, which the
+compiler reads. The module itself has to come from the shipped `lib/` -- that
 is one of the rules -- so, as in `test_foreign`, a probe is written there and
 removed afterwards, under a name carrying the test's own so the parallel suite
 cannot collide.
@@ -20,7 +17,6 @@ import hashlib
 import os
 import re
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
@@ -33,33 +29,26 @@ HOOK = "TURKEY_TEST_GIBLETS"
 _SAFE = re.compile(r"[^A-Za-z0-9_]")
 
 
-def _run(host: str, entry: Path, giblets: str) -> tuple[int, str]:
-    env = dict(os.environ, PYTHONPATH=str(REPO_ROOT))
-    env[HOOK] = giblets
-    command = ([sys.executable, "-m", "turkey", "core", str(entry)]
-               if host == "python" else [str(bootc.binary()), "core", str(entry)])
-    result = subprocess.run(command, cwd=REPO_ROOT, env=env,
-                            capture_output=True, text=True)
+def _run(entry: Path, giblets: str) -> tuple[int, str]:
+    env = dict(os.environ, **{HOOK: giblets})
+    result = subprocess.run([str(bootc.binary()), "core", str(entry)],
+                            cwd=REPO_ROOT, env=env, capture_output=True,
+                            text=True)
     return result.returncode, result.stderr
 
 
 def _message(stderr: str) -> str:
-    """The diagnostic without its file. The two compilers name a library file
-    differently -- `Turkey/X.gob` and `lib/Turkey/X.gob` -- which is theirs to
-    disagree on and not this check's."""
+    """The diagnostic without its file, which is a temporary path or a library
+    one and is not what these tests are about."""
     return re.sub(r"^\S*?(\d+:\d+: )", r"\1", stderr.strip())
 
 
 def verdict(entry: Path, giblets: str) -> str:
-    """What both compilers say, which must be the same thing: `""` for a
-    program they accept, the diagnostic otherwise."""
-    answers = {}
-    for host in ("python", "boot"):
-        code, stderr = _run(host, entry, giblets)
-        answers[host] = "" if code == 0 else _message(stderr)
-        assert code == 0 or stderr, f"{host} failed and said nothing"
-    assert answers["python"] == answers["boot"], answers
-    return answers["python"]
+    """What `boot` says: `""` for a program it accepts, the diagnostic
+    otherwise."""
+    code, stderr = _run(entry, giblets)
+    assert code == 0 or stderr, "boot failed and said nothing"
+    return "" if code == 0 else _message(stderr)
 
 
 @pytest.fixture
@@ -172,15 +161,6 @@ def test_a_giblet_module_must_come_from_the_library(tmp_path):
 # -- the list ----------------------------------------------------------------
 
 
-def test_both_compilers_keep_the_same_list():
-    from turkey.giblets import GIBLET_MODULES
-    source = (REPO_ROOT / "boot" / "Turkey" / "Giblets.gob").read_text(
-        encoding="utf-8")
-    found = re.search(r"^let giblets = \[(.*?)\]", source, re.M | re.S)
-    assert found is not None
-    assert set(re.findall(r'"([^"]+)"', found.group(1))) == set(GIBLET_MODULES)
-
-
 # -- after lowering (boot) ---------------------------------------------------
 #
 # The type rule cannot see what the lowering adds, so `boot` asks the question
@@ -290,7 +270,6 @@ def test_a_giblet_calling_a_giblet_holds_no_root(lowered):
 def test_the_first_giblet_module_lowers_clean():
     stdout = bootc.boot("ssa", "tests/programs/giblets_memory.gob")
     assert "fun @Turkey.Memory#fill(" in stdout
-
 
 
 def test_a_giblet_function_is_emitted_with_no_root_frame():

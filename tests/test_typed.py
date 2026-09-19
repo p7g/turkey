@@ -10,32 +10,16 @@ of a type it is not.
 
 from __future__ import annotations
 
-import io
-from contextlib import redirect_stdout
 
-import pytest
-
-from turkey import driver, llvmgen
-from turkey.errors import TurkeyError
+from tests import lang
 
 
-def outputs(source: str, capfd) -> str:
-    checked = driver.check(source)
-    out = io.StringIO()
-    with redirect_stdout(out):
-        driver.run(source, backend="python")
-    python = out.getvalue()
-    capfd.readouterr()
-    llvmgen.execute(checked.opt, checked.decls, checked.main)
-    native = capfd.readouterr().out
-    assert python == native
-    return python
+def outputs(source: str) -> str:
+    return lang.output(source)
 
 
 def fails(source: str) -> str:
-    with pytest.raises(TurkeyError) as caught:
-        driver.check(source)
-    return caught.value.message
+    return lang.fails(source)
 
 
 PROXIES = """
@@ -52,7 +36,7 @@ fun boxIntP() -> Proxy (Box Int) = Proxy
 """
 
 
-def test_a_rep_names_the_qualified_constructor(capfd):
+def test_a_rep_names_the_qualified_constructor():
     """Delta 43 made the name unique, which is the whole basis for comparing
     two reps: a bare `Box` could be two different types from two modules."""
     source = PROXIES + """
@@ -61,10 +45,10 @@ fun main() {
     print(shown(boxIntP()))
 }
 """
-    assert outputs(source, capfd) == "Int\nMain#Box Int\n"
+    assert outputs(source) == "Int\nMain#Box Int\n"
 
 
-def test_arguments_come_from_the_dictionaries_passed_in(capfd):
+def test_arguments_come_from_the_dictionaries_passed_in():
     """The instance head is general -- `Box a`, not `Box Int` -- so the rep of
     an argument cannot be known to it. It comes from the caller's dictionary,
     which is what makes one derived instance serve every use."""
@@ -72,10 +56,10 @@ def test_arguments_come_from_the_dictionaries_passed_in(capfd):
 fun deepP() -> Proxy (Box (Box (Box Int))) = Proxy
 fun main() { print(shown(deepP())) }
 """
-    assert outputs(source, capfd) == "Main#Box (Main#Box (Main#Box Int))\n"
+    assert outputs(source) == "Main#Box (Main#Box (Main#Box Int))\n"
 
 
-def test_a_tuple_carries_its_elements(capfd):
+def test_a_tuple_carries_its_elements():
     """`spine` answers no arguments for a tuple, so a rep built off the spine
     would call every pair `Tuple2` and compare them all equal."""
     source = PROXIES + """
@@ -86,10 +70,10 @@ fun main() {
     print(repOf(pairP()) == repOf(otherP()))
 }
 """
-    assert outputs(source, capfd) == "Tuple2 Int Data.String.Type#String\nFalse\n"
+    assert outputs(source) == "Tuple2 Int Data.String.Type#String\nFalse\n"
 
 
-def test_identity_is_structural(capfd):
+def test_identity_is_structural():
     source = PROXIES + """
 fun boxStrP() -> Proxy (Box String) = Proxy
 fun main() {
@@ -98,7 +82,7 @@ fun main() {
     print(repOf(boxIntP()) == repOf(boxStrP()))
 }
 """
-    assert outputs(source, capfd) == "True\nFalse\nFalse\n"
+    assert outputs(source) == "True\nFalse\nFalse\n"
 
 
 def test_a_program_may_not_write_a_typed_instance():
@@ -130,7 +114,7 @@ fun main() { print(shown(fnP())) }
     assert "no instance for" in fails(source)
 
 
-def test_a_packed_payload_can_be_asked_what_it_is(capfd):
+def test_a_packed_payload_can_be_asked_what_it_is():
     """Why `Typed` is a superclass of `Error`.
 
     The dictionary an existential packs is the `Error` one, and `Typed` rides
@@ -158,27 +142,5 @@ fun main() {
     print(payloadRep(fail(IoError(2))))
 }
 """
-    assert outputs(source, capfd) == "Main#ParseError\nMain#IoError\n"
+    assert outputs(source) == "Main#ParseError\nMain#IoError\n"
 
-
-def test_a_raw_pointer_has_no_derived_rep():
-    """`Typed Prim.Ptr` is refused, and that is what keeps a pointer out of an
-    existential.
-
-    A nullary `TCon` is otherwise derived without consulting its variants, so
-    `Prim.Ptr` would have got one for free. It must not: `Typed` is what admits
-    a value to packing and to `cast`, `addr` is not a packable layout, and a
-    pointer recovered from a dynamic value is one the checker never vouched
-    for. Excluding it is cheap now and impossible once a program depends on it.
-    """
-    from turkey import classes as classes_mod, decls as decls_mod
-    from turkey.types import Pred
-
-    table = decls_mod.DeclTable()
-    classes = classes_mod.ClassTable(table)
-    ptr = table.head("Prim.Ptr")
-    assert classes.derive_typed(Pred(classes_mod.TYPED_CLASS, [ptr])) is None
-    # And the exclusion is the pointer's, not the nullary branch's: `Int` is
-    # registered the same way and does get one.
-    integer = table.head("Int")
-    assert classes.derive_typed(Pred(classes_mod.TYPED_CLASS, [integer])) is not None

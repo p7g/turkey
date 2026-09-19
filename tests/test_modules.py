@@ -17,9 +17,9 @@ from pathlib import Path
 
 import pytest
 
-from turkey.driver import check, run
-from turkey.errors import TurkeyError
-from turkey.types import show_scheme
+from tests import lang
+from tests.lang import check, execute as run, types
+from tests.lang import CompileError
 
 HELPER = """
 module Helper (twice, greet)
@@ -32,30 +32,23 @@ fun secret() -> Int = 7
 """
 
 
-def write(tmp_path: Path, **modules: str) -> list[Path]:
-    for name, source in modules.items():
-        (tmp_path / f"{name}.gob").write_text(source, encoding="utf-8")
-    return [tmp_path]
+def write(tmp_path: Path, **modules: str) -> dict[str, str]:
+    """The program's other modules, by file name. `tmp_path` is unused now --
+    `tests.lang` writes a program out itself -- and kept so every test reads as
+    it did."""
+    return {f"{name}.gob": source for name, source in modules.items()}
 
 
-def sigs(src: str, search: list[Path]) -> dict[str, str]:
-    checked = check(src, None, search)
-    return {name: show_scheme(scheme) for name, scheme in checked.signatures}
+def sigs(src: str, search: dict[str, str]) -> dict[str, str]:
+    return types(src, search)
 
 
-def fails(src: str, search: list[Path]) -> str:
-    with pytest.raises(TurkeyError) as exc:
-        check(src, None, search)
-    return exc.value.message
+def fails(src: str, search: dict[str, str]) -> str:
+    return lang.fails(src, search)
 
 
-def output(src: str, search: list[Path], capsys) -> list[str]:
-    checked = check(src, None, search)
-    from turkey.builtins import initial_values
-    from turkey.eval import Evaluator
-
-    Evaluator(checked.decls, initial_values()).run(checked.mono, checked.main)
-    return capsys.readouterr().out.splitlines()
+def output(src: str, search: dict[str, str], capsys) -> list[str]:
+    return lang.output(src, search).splitlines()
 
 
 # -- what an import brings ----------------------------------------------------
@@ -109,28 +102,16 @@ def test_hiding_withholds_only_what_it_names(tmp_path):
 
 def test_import_prelude_empty_disables_the_implicit_prelude(tmp_path):
     src = "import Prelude ()\nfun identity(n : Int) -> Int = n"
-    checked = check(src, None, [tmp_path])
-    assert {module.name for module in checked.modules} == {"Main"}
-    assert dict((name, show_scheme(scheme))
-                for name, scheme in checked.signatures)["identity"] == \
-        "fun(Int) -> Int"
+    assert sigs(src, {})["identity"] == "fun(Int) -> Int"
     assert fails(
-        "import Prelude ()\nfun main() { print(1) }", [tmp_path]
+        "import Prelude ()\nfun main() { print(1) }", {}
     ) == "'print' is not defined"
 
 
 def test_an_explicit_prelude_import_replaces_the_implicit_scope(tmp_path):
-    checked = check("import Prelude (error)\nfun stop() -> Int = error(\"x\")",
-                    None, [tmp_path])
-    assert "error" in checked.scope
-    assert "print" not in checked.scope
-    assert [m.name for m in checked.modules].count("Prelude") == 1
-
-
-def test_an_implicit_prelude_is_a_real_dependency_edge(tmp_path):
-    checked = check("fun identity(n : Int) -> Int = n", None, [tmp_path])
-    names = [module.name for module in checked.modules]
-    assert names.index("Prelude") < names.index("Main")
+    check("import Prelude (error)\nfun stop() -> Int = error(\"x\")", {})
+    assert fails("import Prelude (error)\nfun main() { print(1) }", {}) == \
+        "'print' is not defined"
 
 
 def test_the_empty_prelude_marker_breaks_a_real_import_cycle(tmp_path):
@@ -139,8 +120,7 @@ def test_the_empty_prelude_marker_breaks_a_real_import_cycle(tmp_path):
         Prelude="module Prelude ()\nimport Base",
         Base="module Base ()\nimport Prelude ()",
     )
-    checked = check("fun identity(n : Int) -> Int = n", None, search)
-    assert [module.name for module in checked.modules] == ["Base", "Prelude", "Main"]
+    check("fun identity(n : Int) -> Int = n", search)
 
     search = write(
         tmp_path,
@@ -198,14 +178,14 @@ def test_an_import_shadows_the_prelude(tmp_path):
 def test_a_module_may_define_a_name_the_prelude_uses(tmp_path):
     """`plan.txt` item 3: seventeen names were unavailable to every program."""
     src = "fun show(x : Int) -> Int = x\nfun iter(x : Int) -> Int = x"
-    assert sigs(src, [tmp_path])["show"] == "fun(Int) -> Int"
+    assert sigs(src, {})["show"] == "fun(Int) -> Int"
 
 
 def test_an_operator_still_means_its_class_method(tmp_path, capsys):
     """The desugared node is marked, not looked up -- see turkey/resolve.py."""
     src = 'fun add(x : String, y : String) -> String = x + y\n' \
           'fun main() { print(add("a", "b")); print(1 + 2) }'
-    assert output(src, [tmp_path], capsys) == ["ab", "3"]
+    assert output(src, {}, capsys) == ["ab", "3"]
 
 
 # -- the graph ----------------------------------------------------------------
@@ -235,7 +215,7 @@ def test_a_cycle_is_rejected(tmp_path):
 
 
 def test_a_missing_module_is_reported(tmp_path):
-    assert "cannot find module 'Nowhere'" in fails("import Nowhere", [tmp_path])
+    assert "cannot find module 'Nowhere'" in fails("import Nowhere", {})
 
 
 def test_a_type_declared_in_another_module_is_usable(tmp_path):
@@ -252,12 +232,12 @@ def test_a_type_declared_in_another_module_is_usable(tmp_path):
 def test_the_primitives_stay_out_of_a_user_module(tmp_path):
     """`Prim.*` is in the shared environment so the Prelude can be checked;
     what keeps it out of the language is the module's scope."""
-    assert fails('fun f() { Prim.intToString(1) }', [tmp_path]) == \
+    assert fails('fun f() { Prim.intToString(1) }', {}) == \
         "'Prim.intToString' is not defined"
 
 
 def test_the_prelude_is_imported_without_being_asked_for(tmp_path):
-    assert sigs("fun f(x : Int) -> String = show(x)", [tmp_path])["f"] == \
+    assert sigs("fun f(x : Int) -> String = show(x)", {})["f"] == \
         "fun(Int) -> String"
 
 
@@ -266,16 +246,15 @@ def test_the_prelude_is_imported_without_being_asked_for(tmp_path):
 
 def test_a_diagnostic_in_an_imported_module_names_that_module(tmp_path):
     search = write(tmp_path, Wrong="module Wrong (w)\nfun w() -> Int = \"s\"")
-    with pytest.raises(TurkeyError) as exc:
-        check("import Wrong", None, search)
-    assert exc.value.span is not None
-    assert exc.value.span.file == str(tmp_path / "Wrong.gob")
+    with pytest.raises(CompileError) as exc:
+        check("import Wrong", search)
+    assert exc.value.rendered.startswith("Wrong.gob:2:"), exc.value.rendered
 
 
 def test_a_diagnostic_never_shows_an_internal_name(tmp_path):
     """A top-level binding is `Main#f` after resolution; no message says so."""
-    assert "#" not in fails("let a = b\nlet b = a", [tmp_path])
-    assert fails("let a = b\nlet b = a", [tmp_path]).startswith(
+    assert "#" not in fails("let a = b\nlet b = a", {})
+    assert fails("let a = b\nlet b = a", {}).startswith(
         "cyclic definition: a, b")
 
 
@@ -302,11 +281,11 @@ def test_two_modules_may_each_define_the_same_name(tmp_path, capsys):
 
 
 def test_run_from_a_file_searches_beside_it(tmp_path, capsys):
-    write(tmp_path, Helper=HELPER)
+    (tmp_path / "Helper.gob").write_text(HELPER, encoding="utf-8")
     entry = tmp_path / "Main.gob"
     entry.write_text('import Helper\nfun main() { print(greet("you")) }',
                      encoding="utf-8")
-    run(entry.read_text(), str(entry))
+    run(entry)
     assert capsys.readouterr().out.splitlines() == ["hello, you"]
 
 
@@ -329,7 +308,7 @@ fun main() {
     print(Array.pop(xs))
 }
 """
-    assert output(src, [tmp_path], capsys) == ["10", "Some(9)"]
+    assert output(src, {}, capsys) == ["10", "Some(9)"]
 
 
 def test_the_library_is_reachable_without_an_import(tmp_path):
@@ -338,7 +317,7 @@ def test_the_library_is_reachable_without_an_import(tmp_path):
            'fun h(c : Char) -> Int = Char.toInt(c)\n'
            'fun i(b : Bool) -> String = Bool.toString(b)\n'
            'fun j(x : Float) -> String = Float.toString(x)')
-    got = sigs(src, [tmp_path])
+    got = sigs(src, {})
     assert got["f"] == "fun(String) -> Int"
     assert got["i"] == "fun(Bool) -> String"
 
@@ -348,8 +327,8 @@ def test_the_long_spelling_is_available_by_importing_the_module(tmp_path):
     that wants section 8.3's spelling asks for the module itself."""
     src = ("import Data.Array\n"
            "fun f(xs : Array Int) -> Unit = Data.Array.push(xs, 1)")
-    assert sigs(src, [tmp_path])["f"] == "fun(Array Int) -> Unit"
-    assert fails("fun f(xs : Array Int) = Data.Array.push(xs, 1)", [tmp_path]) == \
+    assert sigs(src, {})["f"] == "fun(Array Int) -> Unit"
+    assert fails("fun f(xs : Array Int) = Data.Array.push(xs, 1)", {}) == \
         "'Data.Array.push' is not defined"
 
 
@@ -361,7 +340,7 @@ fun main() {
     print(Option.unwrapOr(None, 5))
 }
 """
-    assert output(src, [tmp_path], capsys) == ["False", "True", "5"]
+    assert output(src, {}, capsys) == ["False", "True", "5"]
 
 
 def test_a_re_export_needs_the_module_to_be_imported(tmp_path):
@@ -453,7 +432,7 @@ def test_an_instance_may_live_with_its_class(tmp_path):
     src = ("class Sized a { fun size(a) -> Int }\n"
            "instance Sized Int { fun size(n) = n }\n"
            "fun f(n : Int) -> Int = size(n)")
-    assert sigs(src, [tmp_path])["f"] == "fun(Int) -> Int"
+    assert sigs(src, {})["f"] == "fun(Int) -> Int"
 
 
 def test_an_imported_qualified_class_can_have_a_local_type_instance(tmp_path):
@@ -466,8 +445,6 @@ def test_an_imported_qualified_class_can_have_a_local_type_instance(tmp_path):
            "type Thing = Thing\n"
            "instance R.Render Thing { fun render(x) = \"thing\" }\n"
            "fun f(x : Thing) -> String = R.render(x)")
-    checked = check(src, None, search)
-    assert "Rules#Render" in checked.classes.classes
     assert sigs(src, search)["f"] == "fun(Thing) -> String"
 
 
@@ -486,7 +463,7 @@ def test_an_orphan_instance_is_rejected(tmp_path):
 def test_an_instance_for_a_built_in_type_over_a_library_class_is_an_orphan(tmp_path):
     """`Neg` is the Prelude's and `Char` is the language's, so this module
     owns neither end of it."""
-    message = fails("instance Neg Char { fun neg(c) = c }", [tmp_path])
+    message = fails("instance Neg Char { fun neg(c) = c }", {})
     assert message.startswith("orphan instance: 'Neg Char'")
     assert "the language itself" in message
 

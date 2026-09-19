@@ -8,33 +8,17 @@ The layout side -- every payload layout, generic code, GC -- is pinned in
 
 from __future__ import annotations
 
-import io
-from contextlib import redirect_stdout
-
 import pytest
 
-from turkey import driver, llvmgen
-from turkey.core import show_program
-from turkey.errors import TurkeyError
+from tests import lang
 
 
-def outputs(source: str, capfd) -> str:
-    checked = driver.check(source)
-    out = io.StringIO()
-    with redirect_stdout(out):
-        driver.run(source, backend="python")
-    python = out.getvalue()
-    capfd.readouterr()
-    llvmgen.execute(checked.opt, checked.decls, checked.main)
-    native = capfd.readouterr().out
-    assert python == native
-    return python
+def outputs(source: str) -> str:
+    return lang.output(source)
 
 
 def fails(source: str) -> str:
-    with pytest.raises(TurkeyError) as caught:
-        driver.check(source)
-    return caught.value.message
+    return lang.fails(source)
 
 
 SHOWN = """
@@ -51,17 +35,17 @@ fun main() {
 """
 
 
-def test_a_carried_instance_is_used_where_the_value_is_opened(capfd):
-    assert outputs(SHOWN, capfd) == "1\nx\nTrue\n"
+def test_a_carried_instance_is_used_where_the_value_is_opened():
+    assert outputs(SHOWN) == "1\nx\nTrue\n"
 
 
 def test_construction_elaborates_to_the_dictionary_and_the_field():
-    core = show_program(driver.check(SHOWN).core, "Main")
+    core = lang.dump("core", SHOWN).stdout
     assert "Main#Shown(\n  %inst.Std.Classes#Show.Int," in core
     assert "Main#Shown[a](%d1.Std.Classes#Show)(xs) ->" in core
 
 
-def test_a_record_form_opens_by_its_field_names(capfd):
+def test_a_record_form_opens_by_its_field_names():
     source = """
 type Counter = Counter[s] { state : s, step : fun(s) -> s, read : fun(s) -> Int }
 
@@ -74,10 +58,10 @@ fun main() {
     print(run(Counter { read = String.byteLength, state = "a", step = fun(s : String) -> String = s + "b" }))
 }
 """
-    assert outputs(source, capfd) == "2\n3\n"
+    assert outputs(source) == "2\n3\n"
 
 
-def test_openings_nest_and_stay_distinct(capfd):
+def test_openings_nest_and_stay_distinct():
     source = """
 type Some = Some[Show a](a)
 
@@ -89,7 +73,7 @@ fun main() {
     print(both((Some(1), Some("two"))))
 }
 """
-    assert outputs(source, capfd) == "1 two\n"
+    assert outputs(source) == "1 two\n"
 
 
 def test_two_openings_are_different_types():
@@ -105,7 +89,7 @@ fun main() {}
     assert "a" in message and ("a2" in message or "Eq" in message)
 
 
-def test_an_existential_constructor_is_a_function_value(capfd):
+def test_an_existential_constructor_is_a_function_value():
     source = """
 type Some = Some[Show a](a)
 
@@ -117,7 +101,7 @@ fun main() {
     }
 }
 """
-    assert outputs(source, capfd) == "1\n2\n"
+    assert outputs(source) == "1\n2\n"
 
 
 @pytest.mark.parametrize("source, message", [

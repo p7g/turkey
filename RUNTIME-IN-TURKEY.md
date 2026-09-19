@@ -10,7 +10,8 @@ Two things TIX-61 leaves for the tickets after it. `Prim.ptrAlloc` and
 `Prim.ptrFree` are `malloc` and `free` behind two runtime calls, standing in
 until there is an FFI: TIX-62 declares both directly and deletes them. And the
 module gate is a gesture -- `lib/Unsafe/Ptr.gob` puts the name in the import
-list of anything touching raw memory -- not the checker TIX-63 will build.
+list of anything touching raw memory -- and stays one: what TIX-63 built checks
+a narrower thing, the giblet modules below.
 
 The FFI is now argued, per the recommendation at the foot of this document, as
 `PROPOSALS.md` item 8, and built: TIX-62 landed `foreign` as SPEC-DELTAS 71,
@@ -56,6 +57,16 @@ being Turkey where they were C; the Python oracle, running every corpus
 program with `--backend python`, went from 62s to 82s of CPU over the same 91
 programs, because a string operation there is interpreted Turkey over a list of
 ints where it was a Python `str` method.
+
+**Giblets are built (TIX-63).** The non-allocating code the collector needs
+is defined by the types it names, checked twice. Both compilers check a listed
+module's Core against the type rule (SPEC-DELTAS 73). `boot` then checks its
+Low IR for what the lowering added: `LowIr.summarize` finds every function
+that may allocate, and a giblet that does, or holds a root, stops the compile
+with the path to the allocation and a source location at each step. The first
+giblet module is `Turkey.Memory`. Whether the type rule is the right line is
+still being watched (FINDINGS 109): so far every place it bent was Core
+spelling something the backend does not have.
 
 It is smaller than the thirty-five below suggest. Under "depend on libc as
 little as possible" only about ten of them are an FFI problem at all, five are
@@ -136,10 +147,10 @@ analysis**, and that is the real cost.
 **4. Callbacks.** A Turkey function usable as a C function pointer, for the
 signal handler and the thread entry. Needs the non-GC convention from (3).
 
-## Defining the subset, and what enforcing it costs
+## Defining giblets, the non-allocating code, and what enforcing it costs
 
 Two questions hide inside (3), they have different answers, and the second is
-where the cost estimate above came from. **What does the subset forbid**, and
+where the cost estimate above came from. **What does giblet code forbid**, and
 **how does the compiler know**.
 
 ### The leaf facts are already in the IR; the join is not
@@ -176,7 +187,7 @@ than Go's flood:
 What it is not free of is `Callee`, which has three shapes -- `Direct(String)`,
 `Runtime(String)` and `Indirect(Value)` -- and the third is a closure call with
 no known target. A summary must either call every indirect call allocating,
-which makes closures unusable inside the subset, or work out which closures
+which makes closures unusable in giblets, or work out which closures
 reach which call site, which is the expensive analysis Go's flood is an
 instance of.
 
@@ -236,7 +247,7 @@ object it touches is read as words and bitmaps at offsets it knows.
   (653), which takes a C string; `turkey_panic_string` (661), the one entry that
   reads a Turkey `String`, is not reachable from collector code.
 
-So the subset-by-types route is the right one. What the measurement found
+So the by-types route is the right one. What the measurement found
 instead is a list of *missing pieces*, none of which is an argument for an
 effect:
 
@@ -255,7 +266,7 @@ where giblet code meets a managed reference, and they are where the type rule
 had to be checked hardest. It holds there too, with one change to lowering;
 "What stays in C, and whose it is" below has the design.
 
-**What it costs is ergonomics inside the subset.** No `SomeError`, because
+**What it costs is ergonomics inside giblets.** No `SomeError`, because
 packing allocates; no `?`; no `Show`; sentinel returns and raw pointer
 arithmetic. Against idiomatic Turkey that is a severe dialect. Against the 310
 lines of C it replaces it is a wash -- and Modula-3's claim is that it need not
@@ -352,7 +363,7 @@ traced by the garbage collector. In most other respects, traced and untraced
 references behave identically."
 
 Traced and untraced references, which is exactly `Rep.traced`, in a language
-from 1989. The last sentence is also the ergonomic claim the subset-by-types
+from 1989. The last sentence is also the ergonomic claim the by-types
 route is betting on, from the one system that shipped it.
 
 **Zig** has no GC, so it answers (1) and (2) and says nothing about (3), which
@@ -373,7 +384,7 @@ at any point with the rest still in C.
    `String` became a library type over a byte array. The allocators and the
    float text stayed, as step 4's and TIX-75's.*
 3. **Entry and crash diagnostics, 160 lines.** Needs callbacks.
-4. **The collector, 310 lines.** Needs the low-level subset and its
+4. **The collector, 310 lines.** Needs giblets and their
    enforcement. Last, and the only one that requires (3).
 
 Stopping after 1 and 2 leaves 470 lines of C -- the collector, the entry, the
@@ -532,7 +543,7 @@ runtime rewrite becomes a *user* of it rather than the reason for it. That also
 makes it testable independently -- a program that calls `getenv` is a test, and
 does not need a collector rewritten first.
 
-**The low-level subset should wait for a reason beyond this.** It is the piece
+**Giblets should wait for a reason beyond this.** It is the piece
 that pays for the collector and nothing else, its true cost is a whole-program
 enforcement pass on Go's evidence, and the collector is the one section where
 being wrong is silent. Neither M28 nor M29 needs it: stage1, stage2 and stage3
@@ -544,7 +555,7 @@ collector is in.
 halves and are the smallest of the three pieces, and the `traced` bit that makes
 them expressible is already in the IR. If any of this is done, it is first.
 
-**The subset is defined by types, not by an effect on functions.** Decided, on
+**Giblets are defined by types, not by an effect on functions.** Decided, on
 the reasoning under "By effect, or by type": the collector manipulates the heap
 as bytes rather than as Turkey values, so "names no traced type" forbids
 everything "does not allocate" was meant to forbid, and it is checked locally

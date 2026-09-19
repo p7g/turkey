@@ -1,5 +1,9 @@
 # Language Specification
 
+> For the language as it is today, written for people using it, see the
+> [language reference](docs/ref/README.md). This document is the original
+> design and its rationale, amended by `SPEC-DELTAS.md`.
+
 ## 1. Overview
 
 A minimal procedural programming language with an ML-style type system and Hindley-Milner type inference. Strict call-by-value evaluation. Functions are uncurried. Mutable state is supported through mutable record fields and arrays. The runtime representation of values is opaque and left to the compiler.

@@ -58,7 +58,10 @@ FINDINGS 43.
 
 ## Documents
 
-* `design.md` -- the language.
+* `docs/ref/` -- the language reference: syntax and semantics for people
+  writing Turkey, every example compiled and run by `tests/test_reference.py`.
+  A change to the language updates it in the same commit.
+* `design.md` -- the original language design, with its rationale.
 * `PRIMITIVES.md` -- primitive types and their semantics.
 * `SPEC-DELTAS.md` -- numbered decisions that changed the spec.
 * `plan.txt` -- the roadmap and its milestones.

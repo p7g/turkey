@@ -514,7 +514,10 @@ every function gave that null a root slot and a store before the call. Found
 because a giblet calling another giblet came out with a root frame while
 holding nothing: the check that giblet code keeps no root is what finally
 asked the question. A traced constant is always a null, and a null names no
-object, so constants are no longer roots.
+object, so constants are no longer roots. Measured on `boot` compiling
+itself: 2,949,896 lines of assembly to 2,871,946, 2.6% of the whole output in
+root stores and frame-table entries for a null, and the compile time unchanged
+at 102s with the giblets summary added.
 
 ### 98. Two codes that meant the same thing, and a bit thrown away before it was read
 **bug, fixed.** TIX-61. The collector traced a slot whose three-bit layout code

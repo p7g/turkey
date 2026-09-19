@@ -28,10 +28,14 @@ here.
 The graph comes out of `core.names_of` and `deps.sccs`, which is Tarjan's
 algorithm and already emits components dependencies-first. In each component of
 more than one binding, and in each self-recursive singleton, one name is marked
-never-inlined. The choice within a component is **arbitrary but stable**: the
-lexicographically first, which is the first element because `deps.sccs` sorts
-each component. Arbitrary because no criterion here is better than another;
-stable because a `.opt` golden would otherwise move whenever a name changed.
+never-inlined -- and then the rest of the component is split into components
+again and the same is done to each, because one breaker cuts every cycle
+through it and not necessarily every cycle in the component (FINDINGS 107).
+That is GHC's `OccurAnal` shape. The choice within a component is **arbitrary
+but stable**: the lexicographically first, which is the first element because
+`deps.sccs` sorts each component. Arbitrary because no criterion here is better
+than another; stable because a `.opt` golden would otherwise move whenever a
+name changed.
 
 Two smaller bounds sit under that one. A binding is ordinarily inlined only if
 its body is under `INLINE_LIMIT` nodes. A body under the larger speculative
@@ -186,7 +190,14 @@ def call_graph(binds: list[CBind]) -> dict[str, set[str]]:
 
 
 def loop_breakers(program: CProgram) -> set[str]:
-    """One binding per cycle, never to be inlined.
+    """Enough bindings that every cycle contains one, never to be inlined.
+
+    One per component is not enough. Removing a component's breaker cuts the
+    cycles through it, and a component can hold others: `head` calling itself
+    beside `expr -> inside -> head -> expr` survives the removal of `cell`, and
+    inlining the survivors did not terminate (FINDINGS 107). So what is left of
+    a component once its breaker is out is split into components again, until
+    none is cyclic.
 
     Deterministic on purpose: `deps.sccs` sorts each component, so taking the
     first is the lexicographically first name, and a golden that depends on
@@ -194,9 +205,18 @@ def loop_breakers(program: CProgram) -> set[str]:
     """
     graph = call_graph(program.dicts + program.binds)
     out: set[str] = set()
-    for component in sccs(graph):
-        if len(component) > 1 or component[0] in graph[component[0]]:
-            out.add(component[0])
+    pending = [graph]
+    while pending:
+        current = pending.pop()
+        for component in sccs(current):
+            first = component[0]
+            if len(component) == 1:
+                if first in current[first]:
+                    out.add(first)
+                continue
+            out.add(first)
+            rest = set(component[1:])
+            pending.append({name: current[name] & rest for name in component[1:]})
     return out
 
 

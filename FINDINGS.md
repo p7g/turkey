@@ -450,7 +450,7 @@ different values. And the arm64 backend's float `Rem` called
 `SsaLower` never emits a float `Rem`, and caught only by grepping for the name.
 
 ### 107. One loop breaker per component is not enough to stop inlining
-**bug, open.** TIX-63. `opt.loop_breakers` and its boot twin mark one binding
+**bug, fixed.** TIX-63, fixed by TIX-85. `opt.loop_breakers` and its boot twin mark one binding
 per strongly connected component, the lexicographically first, and the header
 says why that suffices: "inlining terminates when the call graph it walks is
 acyclic". It is acyclic only if every cycle passes through the chosen name.
@@ -466,9 +466,14 @@ what kept this from biting earlier is that most components' members are too
 big to inline, and size, not the breaker, was what stopped it.
 
 GHC's answer is to choose a breaker, delete it, and take the SCCs of what is
-left again, until none remain. Worked around here by writing the walker with
-one cycle (`expr` and `inside`) and non-recursive helpers; the fix belongs to
-both optimizers and their goldens, and is its own ticket.
+left again, until none remain, and both optimizers now do that. It moved one
+golden: the component of `Ord Int`, `Eq Int` and the class defaults had cycles
+the old choice left, and now breaks at both dictionaries and two defaults, so
+`loops.gob`'s `firstEven` reduces small enough to inline into `main`. The
+cycles there never ran away only because the members were too big to inline,
+which is how the bug stayed hidden. The walker was
+written with one cycle to get past it at the time;
+`tests/programs/loop_breakers.gob` is the shape that crashed.
 
 ### 108. A probe in `lib/` changed the key of the compiler it was probing
 **test bug, fixed.** TIX-63. `bootc._fingerprint` hashes every `.gob` under

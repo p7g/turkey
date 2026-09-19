@@ -273,6 +273,40 @@ fun main() { print(even(4)) }
     assert broken == {"Main#even"}
 
 
+# The shape of FINDINGS 107: one component, three cycles. `cell` is the
+# lexicographically first name, and removing it leaves `head` calling itself
+# and `expr -> inside -> head -> expr`.
+MANY_CYCLES = """
+fun cell(n : Int) -> Int = if n <= 0 { 0 } else { expr(n - 1) }
+fun expr(n : Int) -> Int = if n <= 0 { 1 } else { inside(n - 1) }
+fun head(n : Int) -> Int = if n <= 0 { 2 } else if n == 7 { head(n - 1) } else { expr(n - 1) }
+fun inside(n : Int) -> Int = if n <= 0 { 3 } else if n == 5 { cell(n - 1) } else { head(n - 1) }
+fun main() { print(cell(20)) }
+"""
+
+
+def test_every_cycle_in_a_component_has_a_breaker():
+    """One breaker per component cuts the cycles through it, not all of them.
+    After `cell`, the rest is split again: `expr`, `head` and `inside` still
+    form a component, which breaks at `expr`, and `head` calls itself."""
+    checked = check(MANY_CYCLES)
+    broken = opt.loop_breakers(checked.mono) & {
+        "Main#cell", "Main#expr", "Main#head", "Main#inside"}
+    assert broken == {"Main#cell", "Main#expr", "Main#head"}
+
+
+def test_a_component_with_many_cycles_terminates():
+    """Before FINDINGS 107 this recursed until the interpreter's limit: every
+    function is small enough to inline, so size never stopped it."""
+    from turkey.driver import run
+    import io
+    import contextlib
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        run(MANY_CYCLES)
+    assert out.getvalue().strip() != ""
+
+
 def test_mutual_recursion_terminates_and_still_answers():
     """The property the loop breakers exist for. Without one, inlining `even`
     into `odd` into `even` does not stop."""

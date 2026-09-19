@@ -34,6 +34,7 @@ import Turkey.Modules as Modules
 import Turkey.Resolve as Resolve
 import Turkey.Desugar as Desugar
 import Turkey.Types as Ty
+import Turkey.Types (TFun, TCon)
 import Turkey.Decls as Decls
 import Turkey.Deps as Deps
 import Turkey.Classes as Classes
@@ -790,7 +791,48 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
         for item in items { Array.push(checked.ordered, item) }
         for w in g.warnings { Array.push(checked.warnings, w) }
     }
+    checkMain(entry, checked.env, checked.classes)
     (checked, entry)
+}
+
+-- `main`, if the entry module defines one, is `fun() -> Unit`.
+--
+-- SPEC-DELTAS 21 calls a zero-argument `main` and 58 keeps it returning `Unit`,
+-- and neither was checked: a `main` returning a value ran and dropped it, and
+-- one taking a parameter reached the backend and crashed it. Checked on the
+-- scheme, so a `main` that generalized is refused with the type it was given.
+-- `turkey/driver.py`'s `_check_main` is the other half.
+fun checkMain(entry : Modules.Module, env : Constraints.Env,
+              classes : Classes.ClassTable) -> Unit {
+    for item in entry.program.decls {
+        match item {
+            DStmt(s) -> for name in bindingNames(s) {
+                if Ty.shortName(name) == "main" {
+                    if let Some(binding) = Constraints.lookup_(env, name) {
+                        let scheme = reduced(classes, binding.scheme)
+                        if !isEntryType(scheme) {
+                            Diag.fail(Diag.at("type error", Diag.short(
+                                "'main' is the entry point and must be "
+                                + "fun() -> Unit, but this one is "
+                                + Ty.showScheme(scheme)), s.span), s.span.file)
+                        }
+                    }
+                }
+            }
+            _ -> {}
+        }
+    }
+}
+
+fun isEntryType(scheme : Ty.Scheme) -> Bool {
+    if len(scheme.preds) > 0 { return False }
+    match Ty.prune(scheme.body) {
+        TFun(params, ret) -> len(params) == 0 && match Ty.prune(ret) {
+            TCon(c) -> c.name == "Unit"
+            _ -> False
+        }
+        _ -> False
+    }
 }
 
 -- The environment every module is checked in. What a module may *write* is

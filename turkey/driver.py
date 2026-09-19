@@ -32,7 +32,7 @@ from .constraints import Env, Solver
 from .decls import DeclTable
 from . import giblets
 from .deps import free_names, pattern_vars, sccs
-from .errors import short
+from .errors import TypeError_, short
 from .evidence import Elaborator
 from .infer import Generator
 from .modules import ENTRY, SEP, Module, ModuleLoader
@@ -41,7 +41,8 @@ from .core import CProgram
 from .typed import TypeTable
 from .coretc import Fams
 from .typed import reduce_deep
-from .types import Pred, Scheme, show, show_kind, show_pred, show_scheme
+from .types import (Pred, Scheme, TCon, TFun, UNIT, prune, show, show_kind,
+                    show_pred, show_scheme)
 
 
 @dataclass
@@ -107,6 +108,7 @@ def check(src: str, file: str | None = None,
         warnings.extend(generator.warnings)
 
     assert generator is not None and classes is not None
+    _check_main(entry, env, classes)
     # Lowering and checking are the last stage, and the check is not optional.
     # "Evidence checkable rather than trusted" (`plan.txt` item 5) is not true
     # of a check nobody runs, so it runs the way exhaustiveness does: always.
@@ -308,6 +310,37 @@ def show_classes(decls: DeclTable, classes: ClassTable) -> str:
                 out.append(f"  type {fam} = "
                            f"{show(body, names, free_prefix='')}\n")
     return "".join(out)
+
+
+def _check_main(entry: Module, env: Env, classes: ClassTable) -> None:
+    """`main`, if the entry module defines one, is `fun() -> Unit`.
+
+    SPEC-DELTAS 21 calls a zero-argument `main` and 58 keeps it returning
+    `Unit`, and neither was checked: a `main` returning a value ran and
+    dropped it, and one taking a parameter reached the backend and crashed it.
+    Checked on the scheme, so a `main` that generalized -- `fun main(x) = x`
+    -- is refused with the type it was given rather than an instance of it.
+    """
+    for item in entry.program.decls:
+        if not isinstance(item, ast.Stmt):
+            continue
+        names = ([item.decl.name] if isinstance(item, ast.SFun)
+                 else sorted(pattern_vars(item.pat)))
+        for name in names:
+            if name.rpartition(SEP)[2] != "main":
+                continue
+            binding = env.lookup(name)
+            if binding is None:
+                continue
+            scheme = _reduced(binding.scheme, classes)
+            body = prune(scheme.body)
+            if (isinstance(body, TFun) and not body.params and not scheme.preds
+                    and isinstance(prune(body.ret), TCon)
+                    and prune(body.ret).name == UNIT.name):
+                continue
+            raise TypeError_(
+                f"'main' is the entry point and must be fun() -> Unit, but "
+                f"this one is {show_scheme(scheme)}", item.span)
 
 
 def _signatures(entry: Module, env: Env,

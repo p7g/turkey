@@ -472,8 +472,8 @@ loop.
 return-expr ::= "return" expression?
 ```
 
-`return e` leaves the innermost enclosing function, which may be a lambda,
-with the value `e`. A bare `return` returns `()`. Like `break`, it produces no
+`return e` leaves the innermost enclosing function with the value `e`. Inside
+a lambda, that is the lambda, not the function around it. A bare `return` returns `()`. Like `break`, it produces no
 value itself and can appear where any type is expected. A function whose body
 is a block does not need `return` to produce its result, because the block's
 last statement already is the result.
@@ -500,6 +500,23 @@ fun main() {
 ```text
 Some(1)
 None
+```
+
+<!-- run -->
+```kotlin
+fun main() {
+    let clamp = fun(n) {
+        if n > 10 {
+            return 10
+        }
+        n
+    }
+    print(Array.map([4, 25, 9], clamp))
+}
+```
+
+```text
+[4, 10, 9]
 ```
 
 ## Summary of types

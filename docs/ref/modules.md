@@ -154,11 +154,38 @@ A name from another module can be written with that module's name in front:
 `Temperature.toCelsius`, or with the alias from `as`: `T.toCelsius`. A module
 name with dots is written in full: `Shapes.Circle.area`.
 
-Qualified names work for functions, for types (`T.Token` in a type) and for
-constructors in expressions (`G.Point(1, 2)`). A constructor in a
-[pattern](patterns.md#constructor-patterns) is written unqualified, so matching
-on a constructor requires an import that brings it into scope bare, either a
-plain `import` or a selective list that includes it.
+Qualified names work for functions, for types (`T.Token` in a type), and for
+constructors in expressions and [patterns](patterns.md#constructor-patterns)
+alike: `G.Point(1, 2)` builds a point and `G.Point(x, y)` takes one apart.
+
+<!-- module: Geometry.gob -->
+```kotlin
+module Geometry (Point(..), origin)
+
+type Point = Point(Int, Int)
+
+fun origin() = Point(0, 0)
+```
+
+<!-- run -->
+```kotlin
+import Geometry as G
+
+fun distanceFromOrigin(p) {
+    let G.Point(x, y) = p
+    x + y
+}
+
+fun main() {
+    print(distanceFromOrigin(G.Point(3, 4)))
+    print(distanceFromOrigin(G.origin()))
+}
+```
+
+```text
+7
+0
+```
 
 ### The Prelude
 
@@ -202,7 +229,16 @@ use either.
 A program starts by initializing the entry module's top-level bindings, and
 those of every module it imports (see [Top-level bindings](declarations.md#top-level-bindings)),
 and then calls `main`, which must be a function of type `fun() -> Unit`
-declared in the entry module.
+declared in the entry module. Any other type is an error at `main`'s
+definition:
+
+<!-- error: 'main' is the entry point and must be fun() -> Unit, but this one is fun() -> String -->
+```kotlin
+fun main() = "hello"
+```
+
+A `main` whose body only panics, such as `fun main() = error("todo")`, is
+accepted, since a call to `error` fits the type `Unit`.
 
 The program's command-line arguments are available from the library as
 `System.Env.args()`, and `System.Env.exit(status)` ends the program with an

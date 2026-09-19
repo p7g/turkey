@@ -183,10 +183,10 @@ pattern-atom  ::= IDENT
                 | INT | FLOAT | STRING | CHAR
                 | "(" pattern ")"
                 | "(" pattern ("," pattern)+ ")"
-                | CONID
-                | CONID "(" (pattern ("," pattern)*)? ")"
-                | CONID "{" field-pattern (field-sep field-pattern)* (field-sep "..")? "}"
-                | CONID "{" ".." "}"
+                | qualified-CONID
+                | qualified-CONID "(" (pattern ("," pattern)*)? ")"
+                | qualified-CONID "{" field-pattern (field-sep field-pattern)* (field-sep "..")? "}"
+                | qualified-CONID "{" ".." "}"
 field-pattern ::= IDENT "=" pattern
                 | IDENT
 ```

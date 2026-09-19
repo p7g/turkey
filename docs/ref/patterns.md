@@ -17,10 +17,10 @@ pattern-atom ::= IDENT                                   -- variable
                | INT | FLOAT | STRING | CHAR             -- literal
                | "(" pattern ("," pattern)+ ")"          -- tuple
                | "(" pattern ")"                         -- grouping
-               | CONID                                   -- constructor, no payload
-               | CONID "(" (pattern ("," pattern)*)? ")"
-               | CONID "{" field-pattern (separator field-pattern)* (separator "..")? "}"
-               | CONID "{" ".." "}"
+               | qualified-CONID                         -- constructor, no payload
+               | qualified-CONID "(" (pattern ("," pattern)*)? ")"
+               | qualified-CONID "{" field-pattern (separator field-pattern)* (separator "..")? "}"
+               | qualified-CONID "{" ".." "}"
 field-pattern ::= IDENT "=" pattern
                | IDENT
 ```
@@ -87,9 +87,10 @@ positional payload takes one pattern per field, in parentheses, and the count
 must match the declaration. The parentheses are required, even for a single
 field: `Some(x)`, never `Some x`.
 
-A constructor in a pattern is written by its plain name, without a module
-qualifier, so a constructor can be matched only in a module that has it in
-scope unqualified ([Imports](modules.md#imports)).
+A constructor from another module is written the way that module's import
+brings it into scope: `Point(x, y)` after a plain `import Geometry`, or
+`G.Point(x, y)` after `import Geometry as G`
+([Qualified names](modules.md#qualified-names)).
 
 ### Record patterns
 

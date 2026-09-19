@@ -1,0 +1,223 @@
+# Modules
+
+A Turkey program is a set of modules, one per source file. A module decides
+which of its names other modules may use, and imports the names it needs from
+other modules. This chapter covers module headers and export lists, imports,
+how names are resolved, and the entry point.
+
+## Modules and files
+
+Each `.gob` file is one module. A module is found by its path: `import
+Shapes.Circle` loads the file `Shapes/Circle.gob`. The compiler looks for it
+first relative to the directory of the program's entry file, then in the
+standard library.
+
+The file given to `turkey run` or `turkey build` is the **entry module**, and
+it must define [`main`](#the-entry-point).
+
+Modules may not import each other in a cycle. If two modules need each other,
+they belong in one module.
+
+## Module headers
+
+**Syntax**
+
+```ebnf
+header      ::= "module" modname ("(" export ("," export)* ")")?
+modname     ::= CONID ("." CONID)*
+export      ::= IDENT                          -- a function or value
+              | CONID                          -- a type without its constructors, or a class
+              | CONID "(" ".." ")"             -- a type with all its constructors
+              | CONID "(" CONID ("," CONID)* ")"
+              | "module" modname               -- a re-export
+```
+
+A module may start with a header naming the module and listing what it
+**exports**. Only exported names can be used from other modules. A module
+without a header, or with a header but no list, exports everything it
+declares.
+
+<!-- module: Inventory.gob -->
+```kotlin
+module Inventory (Item, restock, describe)
+
+type Item = Item { name : String, count : Int }
+
+fun restock(name, count) = Item { name, count = clamp(count) }
+
+fun describe(item) = item.name + " x" + show(item.count)
+
+fun clamp(n) = if n < 0 { 0 } else { n }
+```
+
+<!-- run -->
+```kotlin
+import Inventory
+
+fun main() {
+    print(describe(restock("bolts", 12)))
+}
+```
+
+```text
+bolts x12
+```
+
+`clamp` is not exported, so `Main` cannot call it:
+
+<!-- module: Inventory.gob -->
+```kotlin
+module Inventory (Item, restock, describe)
+
+type Item = Item { name : String, count : Int }
+
+fun restock(name, count) = Item { name, count = clamp(count) }
+
+fun describe(item) = item.name + " x" + show(item.count)
+
+fun clamp(n) = if n < 0 { 0 } else { n }
+```
+
+<!-- error: 'clamp' is not defined -->
+```kotlin
+import Inventory
+
+fun main() {
+    print(clamp(-1))
+}
+```
+
+**Types.** Exporting `T` exports the type but not its constructors. Other
+modules can then use `T` in types and receive and pass `T` values, but cannot
+build one with a constructor or take one apart with a pattern. This is how a
+module makes a type *abstract*, so that only its own functions can create
+values of it. `T(..)` exports the type and all its constructors.
+
+**Classes.** Exporting `C(..)` exports a class and its methods. Exporting `C`
+alone exports the class without its methods, so other modules can name it in
+constraints but cannot call its methods.
+
+**Re-exports.** `module M` in an export list passes on everything the module
+has in scope under the qualifier `M`, still qualified. The Prelude uses this
+to make `Array.push`, `Int.parse` and the like available everywhere
+([The Prelude](builtins.md#the-prelude)).
+
+## Imports
+
+**Syntax**
+
+```ebnf
+import ::= "import" modname ("as" CONID)? import-list?
+import-list ::= "(" item ("," item)* ")"
+              | "hiding" "(" item ("," item)* ")"
+item   ::= IDENT | CONID | CONID "(" ".." ")"
+```
+
+| Import | Brings into scope |
+|---|---|
+| `import Geometry` | every export of `Geometry`, both bare (`area`) and qualified (`Geometry.area`) |
+| `import Geometry (area, Point(..))` | only the listed names, both bare and qualified |
+| `import Geometry hiding (area)` | every export except the listed ones |
+| `import Geometry as G` | every export, qualified only: `G.area`, not `area` |
+| `import Geometry as G (area)` | only the listed names, qualified only |
+
+<!-- module: Temperature.gob -->
+```kotlin
+module Temperature (toFahrenheit, toCelsius)
+
+fun toFahrenheit(c) = c * 9.0 / 5.0 + 32.0
+
+fun toCelsius(f) = (f - 32.0) * 5.0 / 9.0
+```
+
+<!-- run -->
+```kotlin
+import Temperature as T
+
+fun main() {
+    print(T.toFahrenheit(100.0))
+    print(T.toCelsius(212.0))
+}
+```
+
+```text
+212.0
+100.0
+```
+
+Instances are not imported or exported. Every instance in the program is
+available everywhere ([Coherence](classes.md#coherence)).
+
+### Qualified names
+
+A name from another module can be written with that module's name in front:
+`Temperature.toCelsius`, or with the alias from `as`: `T.toCelsius`. A module
+name with dots is written in full: `Shapes.Circle.area`.
+
+Qualified names work for functions, for types (`T.Token` in a type) and for
+constructors in expressions (`G.Point(1, 2)`). A constructor in a
+[pattern](patterns.md#constructor-patterns) is written unqualified, so matching
+on a constructor requires an import that brings it into scope bare, either a
+plain `import` or a selective list that includes it.
+
+### The Prelude
+
+Every module imports the Prelude implicitly. An explicit `import Prelude ...`
+replaces the implicit import. See [The Prelude](builtins.md#the-prelude) for
+what it provides.
+
+## Name resolution
+
+Within a module, a name is looked up in this order, and the first match wins:
+
+1. local variables, from the innermost scope outward;
+2. the module's own top-level declarations;
+3. names brought in by imports;
+4. names from the Prelude.
+
+So a module's own declaration **shadows** an imported name of the same
+spelling, and an import shadows the Prelude. A module can define its own
+`print` or `map`, and its own type called `Option`; the operators, `for`
+loops, indexing and `?` still use the Prelude's classes and types.
+
+<!-- run -->
+```kotlin
+fun print(message : String) -> Unit = write(">> " + message + "\n")
+
+fun main() {
+    print("shadowed")
+}
+```
+
+```text
+>> shadowed
+```
+
+When two imports provide the same bare name, the later import shadows the
+earlier one. The qualified spellings stay distinct, and are the clearer way to
+use either.
+
+## The entry point
+
+A program starts by initializing the entry module's top-level bindings, and
+those of every module it imports (see [Top-level bindings](declarations.md#top-level-bindings)),
+and then calls `main`, which must be a function of type `fun() -> Unit`
+declared in the entry module.
+
+The program's command-line arguments are available from the library as
+`System.Env.args()`, and `System.Env.exit(status)` ends the program with an
+exit status ([Exit status](runtime-errors.md#exit-status)).
+
+<!-- run -->
+```kotlin
+import System.Env
+
+fun main() {
+    let arguments = System.Env.args()
+    print(len(arguments))
+}
+```
+
+```text
+0
+```

@@ -78,9 +78,17 @@ def _fingerprint(root: Path = REPO_ROOT) -> str:
     return h.hexdigest()[:16]
 
 
+# A `boot` built elsewhere, used as it is. This is how the behavioral tests run
+# with no Python compiler to build one (TIX-94), and what a seed-built `boot`
+# (TIX-95) plugs into.
+BOOT_OVERRIDE = "TURKEY_BOOT"
+
+
 @functools.lru_cache(maxsize=1)
 def binary() -> Path:
     """The compiled `boot`, built on first use and cached across sessions.
+
+    `$TURKEY_BOOT`, if set, names a `boot` to use instead, and nothing is built.
 
     `turkey build` rather than compiling in-process and calling it, for two
     reasons that have not changed: a subprocess per invocation keeps a crash
@@ -101,6 +109,8 @@ def binary() -> Path:
     the *file* must not be observed half-written, so the build goes to a
     unique path and is moved into place with `os.replace`, which is atomic.
     """
+    if (override := os.environ.get(BOOT_OVERRIDE)):
+        return Path(override).resolve()
     cached = Path(tempfile.gettempdir()) / "turkey-bootc" / _fingerprint()
     output = cached / "boot"
     if output.exists():
@@ -171,7 +181,66 @@ def boot_with_stderr(*args: str) -> tuple[str, str]:
 
 @functools.lru_cache(maxsize=1)
 def _build_key() -> str:
-    return _fingerprint()
+    return build_key()
+
+
+def build_key() -> str:
+    """What a cached output of `boot` depends on, as a cache key.
+
+    The build's fingerprint, or -- for a `boot` named by `$TURKEY_BOOT`, whose
+    sources are nobody's business -- the binary itself plus the library and the
+    runtime it reads at run time.
+    """
+    if not os.environ.get(BOOT_OVERRIDE):
+        return _fingerprint()
+    h = hashlib.sha256(binary().read_bytes())
+    for directory, pattern in (("lib", "*.gob"), ("runtime", "*.c"),
+                               ("runtime", "*.h")):
+        for path in sorted((REPO_ROOT / directory).rglob(pattern)):
+            if path.name.startswith("Probe_"):
+                continue
+            h.update(str(path.relative_to(REPO_ROOT)).encode())
+            h.update(path.read_bytes())
+    return h.hexdigest()[:16]
+
+
+# Binaries and the runtime object, shared by every worker and every session.
+# Each file is keyed by the hash of what it was built from, so a stale one is
+# never served and a warm one is never rebuilt.
+CACHE = Path(tempfile.gettempdir()) / "turkey-native"
+RUNTIME = REPO_ROOT / "runtime" / "turkey_runtime.c"
+RUNTIME_HEADER = REPO_ROOT / "runtime" / "turkey_runtime.h"
+
+
+def digest(*parts: bytes) -> str:
+    h = hashlib.sha256()
+    for part in parts:
+        h.update(part)
+    return h.hexdigest()[:24]
+
+
+def replace_built(command: list[str], output: Path) -> None:
+    """Run a build whose `-o` is a staging path, then move it to `output`."""
+    result = subprocess.run(command, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr[:4000]
+    os.replace(command[command.index("-o") + 1], output)
+
+
+@functools.lru_cache(maxsize=None)
+def runtime_object() -> Path:
+    """`turkey_runtime.c`, compiled once rather than once per program.
+
+    Every test binary used to compile the runtime from source beside its module
+    -- the largest C file here, forty-odd times per worker.
+    """
+    key = digest(RUNTIME.read_bytes(), RUNTIME_HEADER.read_bytes())
+    output = CACHE / f"runtime-{key}.o"
+    if not output.exists():
+        CACHE.mkdir(parents=True, exist_ok=True)
+        staging = CACHE / f"runtime-{key}.{os.getpid()}.o"
+        replace_built(["cc", "-std=c11", "-O1", "-c", "-o", str(staging),
+                       str(RUNTIME)], output)
+    return output
 
 
 def boot_each(command: str, paths: list[Path],

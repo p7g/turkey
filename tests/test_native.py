@@ -22,12 +22,10 @@ module so that several can share a run even though they cannot share a file.
 
 import contextlib
 import functools
-import hashlib
 import io
 import os
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -38,8 +36,6 @@ from turkey.driver import run
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BOOT_MAIN = REPO_ROOT / "boot" / "Main.gob"
 PROGRAMS = REPO_ROOT / "tests" / "programs"
-RUNTIME = REPO_ROOT / "runtime" / "turkey_runtime.c"
-RUNTIME_HEADER = REPO_ROOT / "runtime" / "turkey_runtime.h"
 
 # Every corpus program compiles and runs. The set is kept because naming what
 # does not work is how the previous gaps got closed: a program listed here is a
@@ -51,11 +47,6 @@ CORPUS = sorted(
     if not path.name.startswith("err_")
 )
 COMPILABLE = [name for name in CORPUS if name not in UNSUPPORTED]
-
-# Binaries and the runtime object, shared by every worker and every session.
-# Each file is keyed by the hash of what it was built from, so a stale one is
-# never served and a warm one is never rebuilt.
-CACHE = Path(tempfile.gettempdir()) / "turkey-native"
 
 
 def _cc() -> str | None:
@@ -82,34 +73,11 @@ def _modules() -> dict[str, str]:
     return {path.name: texts[path] for path in paths}
 
 
-def _digest(*parts: bytes) -> str:
-    h = hashlib.sha256()
-    for part in parts:
-        h.update(part)
-    return h.hexdigest()[:24]
-
-
-def _replace_built(command: list[str], output: Path) -> None:
-    result = subprocess.run(command, capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr[:4000]
-    os.replace(command[command.index("-o") + 1], output)
-
-
-@functools.lru_cache(maxsize=None)
-def _runtime_object() -> Path:
-    """`turkey_runtime.c`, compiled once rather than once per program.
-
-    Every test binary used to compile the runtime from source beside its module
-    -- the largest C file here, forty-odd times per worker.
-    """
-    key = _digest(RUNTIME.read_bytes(), RUNTIME_HEADER.read_bytes())
-    output = CACHE / f"runtime-{key}.o"
-    if not output.exists():
-        CACHE.mkdir(parents=True, exist_ok=True)
-        staging = CACHE / f"runtime-{key}.{os.getpid()}.o"
-        _replace_built(["cc", "-std=c11", "-O1", "-c", "-o", str(staging),
-                        str(RUNTIME)], output)
-    return output
+# Shared with `test_arm64_native` and `test_bootstrap`; see `tests.bootc`.
+CACHE = bootc.CACHE
+_digest = bootc.digest
+_replace_built = bootc.replace_built
+_runtime_object = bootc.runtime_object
 
 
 @functools.lru_cache(maxsize=None)

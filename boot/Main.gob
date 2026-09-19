@@ -65,11 +65,15 @@ import Turkey.SsaLower as SsaLower
 import Turkey.Opt as Opt
 import Turkey.Ast (Decl(..), Stmt(..), StmtKind(..), patternVars)
 
--- Where the language's own library lives, relative to where this is run from.
--- The Python finds it beside its own source; a compiled binary has no such
--- thing to find, so the convention is the repository root and the tests run
--- from there.
-let libRoot = "lib"
+-- Where the language's own library lives: `TURKEY_LIB` if it is set, and
+-- otherwise `lib` relative to where this is run from. The Python finds it beside
+-- its own source; a compiled binary has no such thing to find, so the default
+-- is the repository root. The variable is what lets a program be compiled from
+-- its own directory, so that its diagnostics quote it by its bare name.
+fun libRoot() -> String = match Env.get("TURKEY_LIB") {
+    Some(root) -> root
+    None -> "lib"
+}
 
 fun main() {
     let args = Env.args()
@@ -77,7 +81,7 @@ fun main() {
     let command = args[0]
     if !Array.contains(["tokens", "ast", "desugar", "decls", "deps",
                     "classes", "types", "core", "mono", "opt", "ssa",
-                    "llvm", "asm", "native"], command) {
+                    "llvm", "asm", "native", "check"], command) {
         die("unknown command '" + command + "'")
     }
     -- One builder for every file: a `print` per token is a flush per token,
@@ -100,6 +104,7 @@ fun main() {
             "llvm" -> dumpLlvm(b, path)
             "asm" -> dumpAsm(b, path)
             "native" -> dumpNative(b, path)
+            "check" -> checkOnly(path)
             _ -> dumpOpt(b, path)
         }
     }
@@ -135,7 +140,7 @@ fun loadResolved(path : String) -> Array Modules.Module {
 -- to finish loading, since a module finishes after everything it imports, but
 -- saying so here beats relying on it at every call site.
 fun loadProgram(path : String) -> (Array Modules.Module, Modules.Module) {
-    let loader = Modules.newLoader([directoryOf(path), libRoot])
+    let loader = Modules.newLoader([directoryOf(path), libRoot()])
     let entry = Modules.loadEntry(loader, readOrDie(path), "Main")
     for m in loader.order {
         Resolve.program(m.scope, m.program)
@@ -260,7 +265,7 @@ fun itemDeps(item : Stmt) -> Set.Set String = match item.kind {
 -- eye and evidence is not.
 fun dumpTypes(b : String.Builder, path : String) -> Unit {
     let (checked, entry) = checkProgram(path)
-    for w in checked.warnings { IO.stderr(path + ":" + Diag.short(w) + "\n") }
+    reportWarnings(checked, path)
     for (name, scheme) in signatures(entry, checked.env, checked.classes) {
         String.push(b, name + " : " + Ty.showScheme(scheme) + "\n")
     }
@@ -353,6 +358,22 @@ fun optimized(checked : Checked, entry : Modules.Module) -> Core.CProgram {
     out
 }
 
+-- Everything a compile checks, and no dump: the front end, the elaboration and
+-- every check on the Core after it, which is what `turkey check` (the Python
+-- `driver.check`) does. What it prints is the warnings, on stderr; a program it
+-- rejects is reported the way every stage reports one, and exits 1.
+fun checkOnly(path : String) -> Unit {
+    let (checked, entry) = checkProgram(path)
+    reportWarnings(checked, path)
+    let _ = optimized(checked, entry)
+}
+
+-- On stderr, as `turkey run` reports them, so that the stderr of a program
+-- compiled here and then run is what the Python printed for the same program.
+fun reportWarnings(checked : Checked, path : String) -> Unit {
+    for w in checked.warnings { IO.stderr(path + ":" + Diag.short(w) + "\n") }
+}
+
 fun dumpOpt(b : String.Builder, path : String) -> Unit {
     let (checked, entry) = checkProgram(path)
     let optimized = optimized(checked, entry)
@@ -411,6 +432,7 @@ fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable, path : String)
 -- is complete only once every function *and* the entry have been emitted.
 fun dumpNative(b : String.Builder, path : String) -> Unit {
     let (checked, entry) = checkProgram(path)
+    reportWarnings(checked, path)
     let program = optimized(checked, entry)
     let (module_, skipped) = lowerModule(program, checked.decls, path)
     if len(skipped) > 0 {
@@ -959,7 +981,7 @@ fun readOrDie(path : String) -> Source = match Source.read(path) {
 fun usage() -> a =
     die("usage: boot "
         + "<tokens|ast|desugar|decls|deps|classes|types|core|mono|opt"
-        + "|ssa|llvm|asm|native> FILE...")
+        + "|ssa|llvm|asm|native|check> FILE...")
 
 fun die(message : String) -> a {
     IO.stderr("boot: " + message + "\n")

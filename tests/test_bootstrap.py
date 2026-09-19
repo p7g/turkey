@@ -34,7 +34,8 @@ from pathlib import Path
 import pytest
 
 from tests import bootc
-from tests.test_native import CACHE, _digest, _replace_built, _runtime_object
+from tests.bootc import CACHE, runtime_object as _runtime_object
+from tests.bootc import digest as _digest, replace_built as _replace_built
 
 pytestmark = pytest.mark.bootstrap
 

@@ -29,8 +29,9 @@ from pathlib import Path
 import pytest
 
 from tests import bootc
-from tests.test_native import CACHE, _digest, _reference, _replace_built
-from tests.test_native import _runtime_object
+from tests.bootc import CACHE, runtime_object
+from tests.bootc import digest as _digest, replace_built as _replace_built
+from tests.test_native import _reference
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROGRAMS = REPO_ROOT / "tests" / "programs"
@@ -70,7 +71,7 @@ def _all() -> dict[str, str]:
 def _binary(name: str) -> Path:
     """One program, assembled and linked, cached by what it was built from."""
     assembly = _all()[name].encode("utf-8")
-    runtime = _runtime_object()
+    runtime = runtime_object()
     output = CACHE / f"{Path(name).stem}-arm64-{_digest(assembly, runtime.read_bytes())}.bin"
     if not output.exists():
         CACHE.mkdir(parents=True, exist_ok=True)

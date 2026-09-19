@@ -33,7 +33,9 @@ not a value the function holds:
 * **a panic's message.** `Prim.error("...")` with a literal is a panic
   terminator in the Low IR, and the literal is interned and permanently rooted
   -- it is static data, not a heap value a collection could free. The
-  collector needs this for "out of memory" and its like.
+  collector needs this for "out of memory" and its like. `Prim.cString` and
+  `Prim.codeAddress` take a literal on the same terms: it names bytes or a
+  symbol the compiler lays out, and the result is an untraced address.
 
 Which modules are giblets is a list written here, not a naming convention or a
 declaration form: joining it is a deliberate edit to the compiler, and a module
@@ -58,6 +60,7 @@ from .types import Type, prune, show
 
 #: The giblet modules. See the module docstring for why this is a list.
 GIBLET_MODULES: frozenset[str] = frozenset({
+    "Turkey.Entry",
     "Turkey.Memory",
 })
 
@@ -243,8 +246,19 @@ def _panics(e: CApp) -> bool:
     return isinstance(fn, (CVar, CPrim)) and fn.name == "Prim.error"
 
 
+#: The primitives whose one argument is a literal the compiler lays out as
+#: static data, so that the literal is never a value the code holds: a panic's
+#: message, and the bytes and symbol behind the two static addresses
+#: (SPEC-DELTAS 74).
+_STATIC_LITERALS = frozenset({"Prim.error", "Prim.cString", "Prim.codeAddress"})
+
+
 def _panic_message(e: CApp) -> CExpr | None:
-    if _panics(e) and len(e.args) == 1 and isinstance(e.args[0], CLit):
+    fn = e.fn
+    while isinstance(fn, CTyApp):
+        fn = fn.fn
+    if (isinstance(fn, (CVar, CPrim)) and fn.name in _STATIC_LITERALS
+            and len(e.args) == 1 and isinstance(e.args[0], CLit)):
         return e.args[0]
     return None
 

@@ -88,6 +88,7 @@ def set_args(args) -> None:
     """
     _ARGS[:] = list(args)
     RAW_HEAP.reset()
+    _STATIC.clear()
     foreign.reset()
 
 
@@ -310,6 +311,40 @@ def _raw_char(code: int):
     return chr(code)
 
 
+#: What `Prim.cString` and `Prim.codeAddress` have answered this run, by
+#: argument. Natively each is one address fixed at link time, so asking twice
+#: must answer the same address twice.
+_STATIC: dict[tuple[str, str], int] = {}
+
+#: Where simulated code addresses live: far above anything `RawHeap` hands
+#: out, so a load through one is caught as a read of unallocated memory, which
+#: is the nearest this host comes to "an instruction is not data".
+_CODE_BASE = 1 << 46
+
+
+def _c_string(message) -> int:
+    """`Prim.cString`: the literal's bytes, NUL-terminated, in memory nothing
+    frees. The block is allocated on first use; natively it is in the binary."""
+    text = string_text(message)
+    key = ("c", text)
+    if key not in _STATIC:
+        payload = text.encode("utf-8") + b"\0"
+        address = RAW_HEAP.allocate(len(payload))
+        for offset, byte in enumerate(payload):
+            RAW_HEAP.store(address + offset, 1, byte)
+        _STATIC[key] = address
+    return _STATIC[key]
+
+
+def _code_address(symbol) -> int:
+    """`Prim.codeAddress`: a stand-in address, distinct per symbol. Nothing on
+    this host can call through it -- only C does that, and C is not here."""
+    key = ("code", string_text(symbol))
+    if key not in _STATIC:
+        _STATIC[key] = _CODE_BASE + 16 * sum(1 for k in _STATIC if k[0] == "code")
+    return _STATIC[key]
+
+
 def _raw_load(address, offset, width, signed=False):
     return RAW_HEAP.load(address + offset, width, signed=signed)
 
@@ -470,6 +505,25 @@ _PRIM: dict[str, tuple] = {
     "Prim.ptrDiff": _bin("Prim.ptrDiff", RAW_PTR, RAW_PTR, INT,
                          lambda a, b: _signed64(a - b)),
     "Prim.ptrNull": (mono(TFun([], RAW_PTR)), _bi("Prim.ptrNull", 0, lambda: 0)),
+
+    # Addresses fixed when the program is linked (SPEC-DELTAS 74), each for a
+    # giblet that cannot hold what the address stands in for. The argument of
+    # the first two must be a literal, which the backends check: it is data
+    # the compiler lays out, not a value computed at run time.
+    #
+    # `cString`: the literal's bytes, NUL-terminated -- the text a crash report
+    # prints, where a `String` would be a traced value.
+    "Prim.cString": (mono(TFun([STRING], RAW_PTR)),
+                     _bi("Prim.cString", 1, _c_string)),
+    # `codeAddress`: the address of a `foreign` definition's C symbol, for
+    # `signal` and `pthread_create`.
+    "Prim.codeAddress": (mono(TFun([STRING], RAW_PTR)),
+                         _bi("Prim.codeAddress", 1, _code_address)),
+    # `frameAddress`: the calling function's frame pointer, which the entry
+    # thread records as the outer bound of the collector's stack walk. There
+    # are no frames on this host to point at, so it is a constant.
+    "Prim.frameAddress": (mono(TFun([], RAW_PTR)),
+                          _bi("Prim.frameAddress", 0, lambda: _CODE_BASE - 16)),
     "Prim.ptrIsNull": _pred("Prim.ptrIsNull", RAW_PTR, lambda p: p == 0),
     "Prim.ptrEq": _cmp("Prim.ptrEq", RAW_PTR, lambda a, b: a == b),
     "Prim.ptrToInt": _un("Prim.ptrToInt", RAW_PTR, INT, _signed64),

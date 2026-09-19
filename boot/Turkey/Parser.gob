@@ -238,7 +238,7 @@ fun parseProgram(p : P) -> Program {
         } else if at(p, "instance") {
             Array.push(decls, DInstance(parseInstanceDecl(p)))
         } else if at(p, "foreign") {
-            Array.push(decls, DForeign(parseForeignDecl(p)))
+            Array.push(decls, parseForeignDecl(p))
         } else if at(p, "fun") {
             let s2 = cur(p).span
             Array.push(decls, DStmt(mkStmt(p, s2, SFun(parseFunDecl(p, False)))))
@@ -608,7 +608,7 @@ fun parseFunDecl(p : P, allowSignature : Bool) -> FunDecl {
     FunDecl {
         id = freshId(p), span = s, name = name, params = params, ret = ret,
         body = Some(parseFunBody(p)), context = context,
-        monomorphic = False,
+        monomorphic = False, symbol = None,
     }
 }
 
@@ -665,19 +665,27 @@ fun parseSignature(p : P, s : Span, name : String, context : Array Pred) -> FunD
     FunDecl {
         id = freshId(p), span = s, name = name, params = params,
         ret = Some(ret), body = None, context = context, monomorphic = False,
+        symbol = None,
     }
 }
 
--- `foreign "symbol" fun name(params) -> ret` (TIX-62).
+-- `foreign "symbol" fun name(params) -> ret` (TIX-62), with or without a body.
+--
+-- Without one it is a declaration: C defines the symbol and Turkey calls it.
+-- With one it is a *definition*: Turkey defines the symbol and C calls it
+-- (PROPOSALS.md item 9, SPEC-DELTAS 74). The definition is an ordinary `fun`
+-- that also carries the symbol, because everything from here to the backend
+-- already knows what to do with a function, and what the symbol adds -- a
+-- C-callable entry point nothing may drop -- is the backend's business alone.
 --
 -- The C symbol is always written, even when it is the Turkey name spelled the
 -- same way, so which of the two names is which is never something a reader has
 -- to work out.
 --
--- There is no body and no context, and a return type is required: a C function
--- that returns nothing writes `-> Unit`, because "the signature is stated in
+-- There is no context, and a body only for a definition. A return type is
+-- required either way: a C function that returns nothing writes `-> Unit`, because "the signature is stated in
 -- full" is the only property that makes the declaration worth trusting.
-fun parseForeignDecl(p : P) -> ForeignDecl {
+fun parseForeignDecl(p : P) -> Decl {
     let s = expect(p, "foreign").span
     let tok = cur(p)
     if Token.kindName(tok.kind) != "STRING" {
@@ -697,10 +705,33 @@ fun parseForeignDecl(p : P) -> ForeignDecl {
                 + "type; a C function that returns nothing writes '-> Unit'",
              cur(p).span)
     }
-    ForeignDecl {
-        span = s, name = name, symbol = symbol, params = params,
-        ret = parseTypeExpr(p),
+    let ret = parseTypeExpr(p)
+    if at(p, "{") || at(p, "=") {
+        -- Every parameter of a definition is a binder, and a name is what
+        -- binds one; an unnamed parameter could never be read.
+        for param in params {
+            let named = match param.kind {
+                PAnnot(inner, _) -> match inner.kind {
+                    PVar(_) -> True
+                    _ -> False
+                }
+                _ -> False
+            }
+            if !named {
+                oops(p, "foreign '" + name + "' has a body, so each parameter "
+                        + "needs a name: write 'x : T'", param.span)
+            }
+        }
+        let body = parseFunBody(p)
+        return DStmt(mkStmt(p, s, SFun(FunDecl {
+            id = freshId(p), span = s, name = name, params = params,
+            ret = Some(ret), body = Some(body), context = Array.new(0),
+            monomorphic = True, symbol = Some(symbol),
+        })))
     }
+    DForeign(ForeignDecl {
+        span = s, name = name, symbol = symbol, params = params, ret = ret,
+    })
 }
 
 -- `(fd : Int, buf : Prim.Ptr)`, or `(Int, Prim.Ptr)`, or a mix.
@@ -708,8 +739,8 @@ fun parseForeignDecl(p : P) -> ForeignDecl {
 -- Stored the way a signature's parameters are -- an annotated pattern -- so
 -- everything downstream reads a parameter's type off one shape whether it was
 -- named or not. Naming is allowed here and not there because the ambiguity
--- `looksLikeSignature` exists to settle cannot arise: a foreign declaration
--- never has a body.
+-- `looksLikeSignature` exists to settle cannot arise: every parameter of a
+-- foreign signature states its type, so `x : T` is always a name.
 fun parseForeignParams(p : P) -> Array Pat {
     skipToken(p, "(")
     let params = Array.new(2)
@@ -720,8 +751,9 @@ fun parseForeignParams(p : P) -> Array Pat {
             step(p)
             step(p)
             let ty = parseTypeExpr(p)
+            let binder = if text(tok) == "_" { PWild } else { PVar(text(tok)) }
             Array.push(params, mkPat(p, tok.span,
-                                     PAnnot(mkPat(p, tok.span, PVar(text(tok))), ty)))
+                                     PAnnot(mkPat(p, tok.span, binder), ty)))
         } else {
             let ty = parseTypeExpr(p)
             Array.push(params, mkPat(p, ty.span,

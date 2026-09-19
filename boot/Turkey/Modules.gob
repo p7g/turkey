@@ -106,8 +106,26 @@ fun newLoader(search : Array String) -> Loader = Loader {
 }
 
 -- Load the program and the effective imports it declares.
+-- The program, the effective imports it declares, and the module that starts
+-- it if it has a `main`: `Turkey.Entry` holds `turkey_main`, the entry thread
+-- and the crash handler, which C calls and nothing in the program imports
+-- (TIX-67). Loaded ahead of what the entry imports; a program with no `main`
+-- cannot be started, and needs none.
 fun loadEntry(l : Loader, source : Source, name : String) -> Module =
-    add(l, name, source, False, [name])
+    add(l, name, source, False, [name], True)
+
+let startupModule = "Turkey.Entry"
+
+fun declaresMain(program : Program) -> Bool {
+    for d in program.decls {
+        if let DStmt(s) = d {
+            if let SFun(f) = s.kind {
+                if f.name == "main" { return True }
+            }
+        }
+    }
+    False
+}
 
 fun load(l : Loader, name : String, stack : Array String) -> Module =
     match Map.get(l.modules, name) {
@@ -122,7 +140,7 @@ fun load(l : Loader, name : String, stack : Array String) -> Module =
                 Some(text) -> Source { name = path, text = text }
                 None -> oops("cannot read module '" + name + "' at " + path)
             }
-            add(l, name, source, library, Array.append(stack, [name]))
+            add(l, name, source, library, Array.append(stack, [name]), False)
         }
     }
 
@@ -157,8 +175,9 @@ fun resolvePath(l : Loader, name : String) -> (String, Bool, Array Byte) {
 }
 
 fun add(l : Loader, name : String, source : Source, library : Bool,
-        stack : Array String) -> Module {
+        stack : Array String, entry : Bool) -> Module {
     var program = Parser.parse(source, l.tycons)
+    if entry && declaresMain(program) { discard(load(l, startupModule, stack)) }
     let before = len(l.tycons)
     let explicitPrelude = hasPreludeImport(program)
     if name != Prelude.preludeName && !explicitPrelude {
@@ -511,6 +530,23 @@ let unsafePrefix = "Unsafe."
 
 fun checkForeignPlacement(name : String, program : Program,
                           library : Bool) -> Unit {
+    -- A definition's gate is narrower than a declaration's (SPEC-DELTAS 74): a
+    -- C caller sets up nothing before the call, so the body must be code the
+    -- collector need not know about, and a giblet module is where that is
+    -- checked.
+    let giblet = library && Set.contains(Giblets.gibletModules(), name)
+    for d in program.decls {
+        if let DStmt(s) = d {
+            if let SFun(f) = s.kind {
+                if Option.isSome(f.symbol) && !giblet {
+                    oopsAt("a foreign definition may only appear in a giblet "
+                        + "module, and '" + name + "' is not one: C calls it "
+                        + "with no root frame and no collector to hand, so its "
+                        + "body may hold no traced value", Some(s.span))
+                }
+            }
+        }
+    }
     if library && String.startsWith(name, unsafePrefix) { return }
     for d in program.decls {
         match d {

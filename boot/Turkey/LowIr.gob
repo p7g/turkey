@@ -1,5 +1,5 @@
 module Turkey.LowIr (
-    BinOp(..), CmpOp(..), Conv(..), Callee(..), Op(..), Low(..),
+    BinOp(..), CmpOp(..), Conv(..), Callee(..), Op(..), Low(..), AddressOf(..),
     low, effectsOf, opUses, mapUses, opResultRep, checkReps, checkCalls, showOpName,
     Allocation(..), summarize, allocatingOp,
     Builder(..), builder, into, emit, effect, terminate, block, param,
@@ -92,11 +92,22 @@ type Callee
     -- Through a closure value.
     | Indirect(Value)
 
+-- An address the linker or the machine decides, for giblet code that cannot
+-- hold what it stands for (SPEC-DELTAS 74). Each is an untraced `Ptr`.
+type AddressOf
+    -- A literal's bytes, NUL-terminated, in read-only data: `Prim.cString`.
+    = CBytes(String)
+    -- A `foreign` definition's C symbol: `Prim.codeAddress`.
+    | CodeOf(String)
+    -- This function's frame pointer: `Prim.frameAddress`.
+    | ThisFrame
+
 type Op
     = ConstInt(Int)
     | ConstFloat(Float)
     | ConstString(String)
     | ConstUnit
+    | Address(AddressOf)
     | Bin(BinOp, Value, Value)
     | Cmp(CmpOp, Value, Value)
     | Neg(Value)
@@ -263,6 +274,7 @@ fun effectsOf(op : Op) -> Effects = match op {
     -- evaluation, so it is not a safepoint.
     ConstString(_) -> empty()
     ConstUnit -> empty()
+    Address(_) -> empty()
     -- Trapping, not pure: `add`, `sub`, `mul` and `neg` panic on overflow and
     -- `div` and `rem` panic at zero (PRIMITIVES.md 1.1), so an unused one may
     -- not be deleted. The bitwise and shift operations do not trap, and
@@ -326,6 +338,7 @@ fun opUses(op : Op) -> Array Value = match op {
     ConstFloat(_) -> []
     ConstString(_) -> []
     ConstUnit -> []
+    Address(_) -> []
     Bin(_, a, b) -> [a, b]
     Cmp(_, a, b) -> [a, b]
     Neg(a) -> [a]
@@ -369,6 +382,7 @@ fun mapUses(op : Op, f : fun(Value) -> Value) -> Op = match op {
     ConstFloat(a) -> ConstFloat(a)
     ConstString(a) -> ConstString(a)
     ConstUnit -> ConstUnit
+    Address(a) -> Address(a)
     Bin(a, b, c) -> Bin(a, f(b), f(c))
     Cmp(a, b, c) -> Cmp(a, f(b), f(c))
     Neg(a) -> Neg(f(a))
@@ -419,6 +433,7 @@ fun opResultRep(op : Op) -> Option Rep = match op {
     ConstFloat(_) -> Some(Ssa.untraced(F64))
     ConstString(_) -> Some(Ssa.traced(Ptr))
     ConstUnit -> Some(Ssa.untraced(Unit))
+    Address(_) -> Some(Ssa.untraced(Ptr))
     Cmp(_, _, _) -> Some(Ssa.untraced(I1))
     Box(_) -> Some(Ssa.traced(Ptr))
     ObjectNew(_, _, _, _) -> Some(Ssa.traced(Ptr))
@@ -715,6 +730,9 @@ fun showOpName(op : Op) -> String = match op {
     ConstFloat(_) -> "const.float"
     ConstString(_) -> "const.string"
     ConstUnit -> "const.unit"
+    Address(CBytes(_)) -> "address.cstring"
+    Address(CodeOf(_)) -> "address.code"
+    Address(ThisFrame) -> "address.frame"
     Bin(o, _, _) -> show(o)
     Cmp(o, _, _) -> show(o)
     Neg(_) -> "neg"
@@ -763,6 +781,9 @@ instance Show Op {
     ConstFloat(x) -> "const " + Float.toString(x)
     ConstString(s) -> "const \"" + s + "\""
     ConstUnit -> "const ()"
+    Address(CBytes(s)) -> "address cstring \"" + s + "\""
+    Address(CodeOf(s)) -> "address code " + s
+    Address(ThisFrame) -> "address frame"
     Bin(o, a, b) -> show(o) + " " + v(a) + ", " + v(b)
     Cmp(o, a, b) -> show(o) + " " + v(a) + ", " + v(b)
     Neg(a) -> "neg " + v(a)

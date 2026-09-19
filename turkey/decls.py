@@ -141,6 +141,11 @@ class DeclTable:
         # bound under. Written by `infer.Generator.bind_foreigns` and read by
         # the backends, which is why it is here rather than on a module.
         self.foreigns: dict[str, ForeignInfo] = {}
+        # Every `foreign` definition, by the function's name: the same facts,
+        # in the other direction (SPEC-DELTAS 74). Written by
+        # `infer.Generator.check_definitions`; read by `mono`, which may not
+        # drop one, and by the backends, which export each under its symbol.
+        self.definitions: dict[str, ForeignInfo] = {}
         # `newtypes`, once the declarations are all in.
         self._newtypes: set[str] | None = None
         # Existential constructors whose contexts name classes, until

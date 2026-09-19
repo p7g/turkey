@@ -340,7 +340,9 @@ def _rules():
         w.kids(lambda: w.node(n.left), lambda: w.node(n.right))
 
     def fundecl(w: _Writer, n: ast.FunDecl) -> None:
-        w.head("fun", n, quote(n.name))
+        # A `foreign` definition's symbol, after the name; nothing otherwise.
+        w.head("fun", n, quote(n.name),
+               *([] if n.symbol is None else [quote(n.symbol)]))
         w.kids(lambda: w.items(n.params),
                lambda: w.maybe(n.ret),
                lambda: w.maybe(n.body),

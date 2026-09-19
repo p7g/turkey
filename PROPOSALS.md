@@ -898,6 +898,11 @@ rejected with 8.6's error rather than miscompiled.
 
 ## 9. `foreign` with a body: Turkey that C can call
 
+**Decided and built (TIX-67): SPEC-DELTAS 74.** Two details moved while it was
+built, and the delta has them: Turkey calls a definition directly, as it calls
+any function, rather than through the C symbol; and `Prim.codeAddress` names
+the symbol rather than the function.
+
 Item 8.3 left callbacks as "a deferral rather than a decision", owed to the
 entry and crash-diagnostics port (TIX-67) once giblets existed. Giblets exist
 now (SPEC-DELTAS 73), and three consumers are waiting:
@@ -984,6 +989,8 @@ foreign "turkey_crash_report" fun crashReport(signal : Int) -> Unit {
   declarations from `Unsafe.` modules by importing them, as it can today.
 * **Called from Turkey like a declaration.** The call is at the C ABI, to the
   symbol. That leaves one foreign call path and no second convention to lower.
+  *(As built: a direct call to the body instead, which is the path every
+  function already has; only C goes through the symbol.)*
 * **Kept alive.** A definition is a root of reachability in both compilers'
   `mono` and in the Python backend's second pass. It is never dropped.
 * **Emitted under its C symbol with external linkage.** Nothing else in the
@@ -1014,7 +1021,10 @@ each is small.
   `Prim.error`'s.
 * **`Prim.codeAddress(f) : Prim.Ptr`**: the address of a definition's C symbol,
   for `signal` and `pthread_create`. It is legal only on a definition, because
-  anything else has a leading environment and no C symbol to point at.
+  anything else has a leading environment and no C symbol to point at. *(As
+  built: `Prim.codeAddress("symbol")`, a literal like `cString`'s. Mentioning
+  `f` without calling it is making a closure, which a giblet may not do, and
+  naming the symbol says which address is meant.)*
 * **`Prim.frameAddress() : Prim.Ptr`**: the caller's frame pointer. The entry
   thread records it as the outer bound of the collector's stack walk (it is
   `__builtin_frame_address(0)` today). It is also the first row of

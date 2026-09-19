@@ -68,6 +68,33 @@ giblet module is `Turkey.Memory`. Whether the type rule is the right line is
 still being watched (FINDINGS 109): so far every place it bent was Core
 spelling something the backend does not have.
 
+**Staging step 3 is done (TIX-67), and it built the callback mechanism.** A
+Turkey function C can call is `foreign` with a body (SPEC-DELTAS 74, argued as
+`PROPOSALS.md` item 9): legal only in a giblet module, and callable from C
+under its symbol with no setup, because the body holds nothing the collector
+traces. `turkey_main`, the big-stack thread and the crash handler are four such
+definitions in `lib/Turkey/Entry.gob`, which every program with a `main` loads,
+over `pthread_*`, `signal` and `_exit` declared in `Unsafe.Libc`. Giblet code
+got three primitives to do it with -- `Prim.cString`, `Prim.codeAddress` and
+`Prim.frameAddress`, the first row of the gap table below. The program itself
+is a symbol now, `turkey_entry`, which each backend defines and the entry
+runs.
+`runtime/turkey_runtime.c` went from 1223 lines to 1104: 166 went, and what
+came back is the state the entry reads -- the collector's stack bound, the
+heads of the two shadow stacks -- and a pair of calls that bracket the
+program, because in Turkey the panic flag is unwinding and the entry's own
+code would otherwise unwind on the program's panic (FINDINGS 111). The handoff
+state (arguments, the exit flag) stayed in C and moves with the collector's
+state. What the port was checked against is today's output, byte for byte: a
+panicking program's report and a fault's crash report are identical to the C's
+under all three backends. Measured cost: none -- `boot` compiling
+itself natively took 106.9s before and 107.1s after, and the arm64 corpus
+still passes under `TURKEY_GC_STRESS=1`, which is the check that the stack
+bound the entry now reports is the right one.
+What bent in the type rule is in FINDINGS 109: two more literals, and one
+crossing into managed code the checker cannot see. The allocators' linkage,
+below, is this mechanism.
+
 It is smaller than the thirty-five below suggest. Under "depend on libc as
 little as possible" only about ten of them are an FFI problem at all, five are
 instruction selection (`frintm`/`frintp`/`frintn`/`frintz`), and the rest are
@@ -96,8 +123,8 @@ Measured, by section:
 | Values: strings, objects, arrays, boxes, closures | 546 | Nothing, once `String` is a library type -- **done**, bar the allocators and float text |
 | GC: heap list, mark, sweep, root frames | 310 | Raw memory, **and must not allocate** |
 | The outside world: args, files, print, exit | 205 | Nothing but FFI -- **done**, bar the host's handoff state |
-| Entry and the big-stack thread | 106 | FFI, and a Turkey function as a C callback |
-| Crash diagnostics | 54 | Signal handlers, so also a C callback |
+| Entry and the big-stack thread | 106 | FFI, and a Turkey function as a C callback -- **done** |
+| Crash diagnostics | 54 | Signal handlers, so also a C callback -- **done** |
 | **Total** | **1221** | |
 
 And the whole libc surface it uses is about thirty-five functions:
@@ -253,7 +280,7 @@ effect:
 
 | gap | where | what fills it |
 |---|---|---|
-| the frame address | `scan_native_frames` (480) uses `__builtin_frame_address` | a primitive |
+| the frame address | `scan_native_frames` (480) uses `__builtin_frame_address` | a primitive -- `Prim.frameAddress`, built by TIX-67 |
 | unsigned 32-bit loads, `ctz` | `HeapHeader`'s `kind`/`marked`; the free-bit search (151, 527) | primitives |
 | bulk fill and copy | `memset`/`memcpy` across the sweep and allocators | loops in a giblet module, or `foreign` |
 | region memory | `aligned_alloc` (136), `realloc` for the mark stack (341) | `foreign` declarations |
@@ -383,7 +410,8 @@ at any point with the rest still in C.
    the second easiest. *Done (TIX-66), and it needed no raw memory at all:
    `String` became a library type over a byte array. The allocators and the
    float text stayed, as step 4's and TIX-75's.*
-3. **Entry and crash diagnostics, 160 lines.** Needs callbacks.
+3. **Entry and crash diagnostics, 160 lines.** Needs callbacks. *Done
+   (TIX-67), with the callbacks: `foreign` with a body, in a giblet module.*
 4. **The collector, 310 lines.** Needs giblets and their
    enforcement. Last, and the only one that requires (3).
 
@@ -517,7 +545,10 @@ worth stating because two of them are invariants the collector must keep.
   survive `mono` and `opt`. So a Turkey allocator needs a C-callable export
   that is kept alive -- which is exactly what TIX-67 builds for the signal
   handler and the thread entry. That makes TIX-67 a prerequisite of TIX-68 for
-  a reason beyond ordering.
+  a reason beyond ordering. *Built:* a definition is kept alive, exported under
+  its symbol with external linkage, and entered through a thunk that supplies
+  the null environment (SPEC-DELTAS 74), so generated code's
+  `Call(Runtime(name))` reaches a Turkey allocator unchanged.
 
 ## The risk worth naming
 

@@ -1,0 +1,280 @@
+module Turkey.Entry (main, entryThread, crashReport, installCrashHandler)
+
+-- How a compiled program starts and how it reports a fault (TIX-67).
+--
+-- Everything here is called by C: `main` by the three-line `main` each backend
+-- emits, `entryThread` by `pthread_create`, `crashReport` by the kernel's
+-- signal delivery, and `installCrashHandler` by `main` or by the JIT. So each is
+-- a `foreign` definition (SPEC-DELTAS 74), and this is a giblet module: a C
+-- caller has no root frame to set up and no collector to hand, and the rule is
+-- what makes that true -- nothing here holds a value the collector traces.
+--
+-- It was `runtime/turkey_runtime.c`'s last two sections before the collector,
+-- and it is written the way that C was, as a sequence of calls. What changes is
+-- what a giblet cannot hold: no `String`, so text is `Prim.cString` bytes and
+-- numbers are written a digit at a time; and no top-level `let`, because the
+-- module initializer that would compute one runs *inside* `programEntry`, long
+-- after `main` has started reading.
+--
+-- Every program with a `main` loads this one, because it is what starts the
+-- program; the compilers load it beside the entry module.
+
+import Prelude ()
+import Std.Classes
+-- For the instances alone. This module is loaded ahead of every program's
+-- entry, so it cannot count on the Prelude having brought them in first, as
+-- `Turkey.Memory` does.
+import Data.Int ()
+import Data.Bool.Type (Bool(..))
+import Unsafe.Libc as Libc
+import Unsafe.Runtime as Rt
+
+-- -- starting the program ---------------------------------------------------------------
+
+-- The `main` of a compiled program, less the entry it used to be handed: the
+-- program is `Rt.programEntry`, a symbol every backend defines.
+--
+-- Hand the arguments over, run the program on a thread of its own, and turn
+-- how it ended into a status: an exit's own, `1` and a report for a panic, and
+-- `0` after a final collection otherwise.
+foreign "turkey_main" fun main(argc : Int, argv : Prim.Ptr) -> Int {
+    -- Opt-in, as `TURKEY_GC_STRESS` is: taking `SIGSEGV` over for a process
+    -- is a debugging choice rather than a default.
+    if !Prim.ptrIsNull(Libc.getenv(Prim.cString("TURKEY_SEGV_FRAMES"))) {
+        installCrashHandler()
+    }
+    if !handOver(cInt(argc), argv) { return 1 }
+    runEntry()
+    if cInt(Rt.exiting()) != 0 { return Prim.intAnd(Rt.exitStatus(), 255) }
+    if cInt(Rt.panicked()) != 0 {
+        reportPanic()
+        return 1
+    }
+    Rt.collect()
+    Rt.gcReport()
+    0
+}
+
+-- `argv + 1`: the program's own arguments, with its name dropped, which is
+-- what the JIT is handed too, so that the two hosts agree on element zero.
+-- `argv` is already an array of pointers, so only the lengths are built. False
+-- if there was no memory to build them in.
+fun handOver(argc : Int, argv : Prim.Ptr) -> Bool {
+    let count = if argc > 0 { argc - 1 } else { 0 }
+    if count == 0 {
+        Rt.argsSet(0, Prim.ptrNull(), Prim.ptrNull())
+        return True
+    }
+    let bytes = Prim.ptrAdd(argv, 8)
+    let lengths = Libc.malloc(8 * count)
+    if Prim.ptrIsNull(lengths) {
+        writeText(2, Prim.cString("turkey: out of memory reading arguments\n"))
+        return False
+    }
+    var i : Int = 0
+    while i < count {
+        Prim.storeI64(lengths, 8 * i, Libc.strlen(Prim.loadPtr(bytes, 8 * i)))
+        i = i + 1
+    }
+    Rt.argsSet(count, bytes, lengths)
+    Libc.free(lengths)
+    True
+}
+
+-- The entry runs on a thread of its own, for its stack.
+--
+-- A compiler is a tree walk, and a Turkey frame is not small: `Opt#expr` roots
+-- every live pointer it holds in one array, so its frame is kilobytes, and a
+-- deeply nested program overruns the 8MB the main thread gets on macOS. The
+-- fault is a write to the guard page, which is a `SIGSEGV` like any other and
+-- says nothing -- the handler cannot even run, because running it needs the
+-- stack that just ran out.
+--
+-- A thread takes its stack size as an attribute and the main thread's cannot
+-- be changed once the process is running, so the entry goes on a thread made
+-- for it: 512MB, the same `driver.STACK_BYTES` gives the interpreter, so that
+-- the two hosts run out of stack in the same place. `main` does nothing but
+-- wait, so this costs one thread and no concurrency: the collector still sees
+-- exactly one mutator.
+--
+-- With no thread to be had, the small stack beats not running at all, and the
+-- entry runs here -- through `entryThread` still, so the collector has its
+-- bound either way.
+fun runEntry() -> Unit {
+    -- Storage for the opaque `pthread_attr_t` and `pthread_t`: 64 and 8 bytes
+    -- on Darwin, 56 and 8 on Linux, and never read here, so generously sized.
+    let attributes = Libc.malloc(128)
+    let thread = Libc.malloc(16)
+    if Prim.ptrIsNull(attributes) || Prim.ptrIsNull(thread)
+            || cInt(Libc.pthreadAttrInit(attributes)) != 0 {
+        Libc.free(attributes)
+        Libc.free(thread)
+        let _ = entryThread(Prim.ptrNull())
+        return {}
+    }
+    let started =
+        cInt(Libc.pthreadAttrSetStackSize(attributes, 536870912)) == 0
+        && cInt(Libc.pthreadCreate(thread, attributes,
+                                   Prim.codeAddress("turkey_entry_thread"),
+                                   Prim.ptrNull())) == 0
+    let _ = Libc.pthreadAttrDestroy(attributes)
+    Libc.free(attributes)
+    if started {
+        let _ = Libc.pthreadJoin(Prim.loadPtr(thread, 0), Prim.ptrNull())
+    } else {
+        let _ = entryThread(Prim.ptrNull())
+    }
+    Libc.free(thread)
+}
+
+-- The thread's start routine, `void *(*)(void *)`.
+--
+-- Before the program runs, the collector learns where the mutator's stack
+-- ends: this frame is the outer bound of every walk of it, and a collection at
+-- any depth below needs it.
+foreign "turkey_entry_thread" fun entryThread(argument : Prim.Ptr) -> Prim.Ptr {
+    Rt.entryStackSet(Prim.frameAddress())
+    Rt.programEntry()
+    Prim.ptrNull()
+}
+
+-- `panic: <message>`, then one `  at <function> (<file>:<line>:<col>)` per
+-- frame the panic captured, innermost first -- the format the JIT's host
+-- prints too, so the two agree on every trace.
+fun reportPanic() -> Unit {
+    writeText(2, Prim.cString("panic: "))
+    writeText(2, orEmpty(Rt.panicMessage()))
+    writeText(2, Prim.cString("\n"))
+    let depth = Rt.frameCount()
+    var index : Int = 0
+    while index < depth {
+        writeText(2, Prim.cString("  at "))
+        writeText(2, orQuery(Rt.frameFunction(index)))
+        writeText(2, Prim.cString(" ("))
+        writeText(2, orQuery(Rt.frameFile(index)))
+        writeText(2, Prim.cString(":"))
+        writeDecimal(2, Rt.frameLine(index))
+        writeText(2, Prim.cString(":"))
+        writeDecimal(2, Rt.frameCol(index))
+        writeText(2, Prim.cString(")\n"))
+        index = index + 1
+    }
+}
+
+-- -- a fault ---------------------------------------------------------------------------
+
+-- A fault in generated code otherwise says nothing at all. The JIT registers
+-- no symbols, so the operating system's crash report is a list of unnamed
+-- addresses, and a debugger cannot control a hardened interpreter well enough
+-- to be attached to one. Meanwhile two shadow stacks that already exist know
+-- the answer: the panic frames carry the source position of every call that
+-- can fail, and the collector's root frames carry the function names. Walking
+-- them turns "exited -11, no output" into the Turkey call stack.
+
+-- Take `SIGSEGV` and `SIGBUS` over. Called when `TURKEY_SEGV_FRAMES` is set,
+-- by `main` in a binary and by the host under the JIT.
+foreign "turkey_install_crash_handler" fun installCrashHandler() -> Unit {
+    let handler = Prim.codeAddress("turkey_crash_report")
+    let _ = Libc.signal(sigsegv(), handler)
+    let _ = Libc.signal(sigbus(), handler)
+}
+
+-- The handler, `void (*)(int)`.
+--
+-- It runs on whatever stack faulted and may have interrupted anything,
+-- including a push onto the very chains it walks. Being a giblet is what lets
+-- it run at all -- it makes nothing the collector could be asked about -- and
+-- three more things are true of it that no rule checks (PROPOSALS.md 9.4):
+-- it calls only `write` and `_exit`, which are async-signal-safe, where the C
+-- it replaces called `snprintf`; it reads the chains as they stand, which is
+-- best-effort, since the stores that push a frame may be reordered; and it
+-- never returns into the instruction that faulted.
+foreign "turkey_crash_report" fun crashReport(signal : Int) -> Unit {
+    if cInt(signal) == sigbus() {
+        writeText(2, Prim.cString("\n*** SIGBUS in generated code\n"))
+    } else {
+        writeText(2, Prim.cString("\n*** SIGSEGV in generated code\n"))
+    }
+    writeText(2, Prim.cString("  innermost call sites:\n"))
+    -- `PanicCallFrame { previous, site }` and
+    -- `PanicSite { function, file, line, col }`: pointers and 64-bit integers,
+    -- eight bytes apart. A site on line 0 is a function's entry, not a call.
+    var frame = Rt.panicCallsHead()
+    var shown : Int = 0
+    while !Prim.ptrIsNull(frame) && shown < 20 {
+        let site = Prim.loadPtr(frame, 8)
+        if !Prim.ptrIsNull(site) && Prim.loadI64(site, 16) != 0 {
+            writeText(2, Prim.cString("    "))
+            writeText(2, orQuery(Prim.loadPtr(site, 0)))
+            writeText(2, Prim.cString(" ("))
+            writeText(2, orQuery(Prim.loadPtr(site, 8)))
+            writeText(2, Prim.cString(":"))
+            writeDecimal(2, Prim.loadI64(site, 16))
+            writeText(2, Prim.cString(":"))
+            writeDecimal(2, Prim.loadI64(site, 24))
+            writeText(2, Prim.cString(")\n"))
+            shown = shown + 1
+        }
+        frame = Prim.loadPtr(frame, 0)
+    }
+    writeText(2, Prim.cString("  enclosing functions, innermost first:\n"))
+    -- `RootFrame { previous, function_name, ... }`.
+    var roots = Rt.rootsHead()
+    shown = 0
+    while !Prim.ptrIsNull(roots) && shown < 40 {
+        writeText(2, Prim.cString("    "))
+        writeText(2, orQuery(Prim.loadPtr(roots, 8)))
+        writeText(2, Prim.cString("\n"))
+        roots = Prim.loadPtr(roots, 0)
+        shown = shown + 1
+    }
+    Libc.exitNow(139)
+}
+
+-- Darwin's numbers, which are the target's (`LINKER.md`); Linux's `SIGBUS` is 7.
+fun sigsegv() -> Int = 11
+
+fun sigbus() -> Int = 10
+
+-- -- writing without a `String` ------------------------------------------------------
+
+-- A NUL-terminated string to a descriptor. What is written is not checked:
+-- there is nowhere left to report a failure to.
+fun writeText(fd : Int, text : Prim.Ptr) -> Unit {
+    let _ = Libc.write(fd, text, Libc.strlen(text))
+}
+
+-- `n` in decimal, a digit at a time out of a table of the ten of them.
+fun writeDecimal(fd : Int, n : Int) -> Unit {
+    if n < 0 {
+        writeText(fd, Prim.cString("-"))
+        -- The magnitude's digits, least significant last, without negating:
+        -- the most negative `Int` has no positive twin.
+        writeMagnitude(fd, n)
+    } else {
+        writeMagnitude(fd, Prim.intNeg(n))
+    }
+}
+
+-- The digits of `-n`, for `n <= 0`. Division truncates toward zero, so each
+-- remainder is in `-9..0`.
+fun writeMagnitude(fd : Int, n : Int) -> Unit {
+    if n <= -10 { writeMagnitude(fd, Prim.intDiv(n, 10)) }
+    let digit = Prim.intNeg(Prim.intRem(n, 10))
+    let _ = Libc.write(fd, Prim.ptrAdd(Prim.cString("0123456789"), digit), 1)
+}
+
+fun orEmpty(text : Prim.Ptr) -> Prim.Ptr =
+    if Prim.ptrIsNull(text) { Prim.cString("") } else { text }
+
+fun orQuery(text : Prim.Ptr) -> Prim.Ptr =
+    if Prim.ptrIsNull(text) { Prim.cString("?") } else { text }
+
+-- A C `int` in an `Int`: the low half, sign-extended, because AAPCS64 leaves
+-- the high half of a 32-bit value undefined (FINDINGS 102). `System.IO.cInt`,
+-- written again here rather than imported, so that this module's imports are
+-- only what a giblet may reach.
+fun cInt(r : Int) -> Int {
+    let low = Prim.intAnd(r, 4294967295)
+    if low >= 2147483648 { low - 4294967296 } else { low }
+}

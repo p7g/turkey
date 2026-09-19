@@ -262,6 +262,7 @@ fun generate(g : Generator, program : Program) -> (Array Stmt, Constraint) {
     Classes.registerAll(g.classes, classDecls, instDecls, g.module_)
     bindMethods(g)
     bindForeigns(g, foreigns)
+    checkDefinitions(g, items)
 
     -- The graph is keyed by item, not by bound name: a single binding may
     -- introduce several names, and keying by name would split one item across
@@ -405,7 +406,10 @@ fun bindForeigns(g : Generator, decls : Array ForeignDecl) -> Unit {
             }
         }
         let ret = foreignType(g, d.ret, d.name)
-        checkForeignArity(d, params)
+        checkForeignArity(d.name, d.span, params)
+        for (_, other) in Map.entries(g.decls.definitions) {
+            if other.symbol == d.symbol { symbolClaimed(d.symbol, other, d.span) }
+        }
         Map.put(g.decls.foreigns, d.name, ForeignInfo {
             name = d.name, symbol = d.symbol, params = params, ret = ret,
             span = Some(d.span),
@@ -421,6 +425,62 @@ fun bindForeigns(g : Generator, decls : Array ForeignDecl) -> Unit {
         Map.put(g.scopes[0], d.name, False)
     }
 }
+
+-- Record each `foreign` definition's C signature (SPEC-DELTAS 74).
+--
+-- The body is typed below like any `fun`'s, against the same annotations. What
+-- is checked here is what makes it callable from C: every type is one of the
+-- seven that cross, the arguments fit the registers, and no other definition or
+-- declaration in the program claims the symbol -- which the linker would
+-- otherwise report, later and less clearly.
+fun checkDefinitions(g : Generator, items : Array Stmt) -> Unit {
+    for item in items {
+        if let SFun(d) = item.kind {
+            if let Some(symbol) = d.symbol {
+                let params = Array.new(len(d.params))
+                for param in d.params {
+                    match param.kind {
+                        PAnnot(_, te) -> Array.push(params, foreignType(g, te, Ty.shortName(d.name)))
+                        _ -> oops("a foreign parameter must state its type",
+                                  Some(param.span))
+                    }
+                }
+                let ret = match d.ret {
+                    Some(te) -> foreignType(g, te, Ty.shortName(d.name))
+                    None -> oops("a foreign definition must state its result type",
+                                 Some(d.span))
+                }
+                checkForeignArity(Ty.shortName(d.name), d.span, params)
+                var general = 0
+                for p in params {
+                    if !Ty.sameType(p, Ty.tFloat()) { general = general + 1 }
+                }
+                let limit = Ty.foreignArgLimit()
+                if general >= limit {
+                    oops("'" + Ty.shortName(d.name) + "' takes " + Int.toString(general)
+                         + " general arguments, and a foreign definition takes "
+                         + "at most " + Int.toString(limit - 1) + ": its body is "
+                         + "a Turkey function, whose environment arrives in one "
+                         + "of the eight", Some(d.span))
+                }
+                for (_, other) in Map.entries(g.decls.foreigns) {
+                    if other.symbol == symbol { symbolClaimed(symbol, other, d.span) }
+                }
+                for (_, other) in Map.entries(g.decls.definitions) {
+                    if other.symbol == symbol { symbolClaimed(symbol, other, d.span) }
+                }
+                Map.put(g.decls.definitions, d.name, ForeignInfo {
+                    name = d.name, symbol = symbol, params = params, ret = ret,
+                    span = Some(d.span),
+                })
+            }
+        }
+    }
+}
+
+fun symbolClaimed(symbol : String, other : ForeignInfo, span : Span) -> a =
+    oops("the C symbol '" + symbol + "' is already claimed by '"
+         + Ty.shortName(other.name) + "'; a program may define or declare a symbol once", Some(span))
 
 -- One argument or result type, checked against what can cross.
 --
@@ -449,7 +509,7 @@ fun foreignType(g : Generator, te : Type, who : String) -> Ty.Type {
 -- overflowed was a compiler bug and stopped the function; a *declaration* is
 -- written by someone, so it is rejected here, saying which file filled up
 -- rather than which instruction could not be selected.
-fun checkForeignArity(d : ForeignDecl, params : Array Ty.Type) -> Unit {
+fun checkForeignArity(name : String, span : Span, params : Array Ty.Type) -> Unit {
     var general = 0
     var vector = 0
     for p in params {
@@ -460,11 +520,11 @@ fun checkForeignArity(d : ForeignDecl, params : Array Ty.Type) -> Unit {
     for (count, file, regs) in [(general, "general", "x0-x7"),
                                 (vector, "floating-point", "d0-d7")] {
         if count > limit {
-            oops("'" + d.name + "' takes " + Int.toString(count) + " " + file
+            oops("'" + name + "' takes " + Int.toString(count) + " " + file
                  + " arguments, and only " + Int.toString(limit) + " fit in "
                  + regs + "; arguments past the registers go on the stack by a "
                  + "convention this compiler does not implement",
-                 Some(d.span))
+                 Some(span))
         }
     }
 }

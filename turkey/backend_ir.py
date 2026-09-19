@@ -129,6 +129,21 @@ class Foreign:
     ret: Layout
 
 
+@dataclass(frozen=True)
+class Definition:
+    """A C symbol this module *defines*: a `foreign` definition (SPEC-DELTAS 74).
+
+    `function` is the compiled body, which takes the leading environment every
+    Turkey function takes; the emitter writes a thunk under `symbol` that has
+    the C signature and supplies a null one.
+    """
+
+    symbol: str
+    function: str
+    params: tuple[Layout, ...]
+    ret: Layout
+
+
 @dataclass
 class Module:
     functions: list[Function]
@@ -136,6 +151,8 @@ class Module:
     globals: list[Value] = field(default_factory=list)
     #: Every declared C symbol the program mentions, by symbol.
     foreigns: dict[str, Foreign] = field(default_factory=dict)
+    #: Every C symbol the program defines, by symbol.
+    definitions: dict[str, Definition] = field(default_factory=dict)
 
 
 class CheckError(ValueError):

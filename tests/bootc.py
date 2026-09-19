@@ -1,8 +1,9 @@
 """`boot`, compiled once and shared by every test module that runs it.
 
-Compiling `boot` takes about three minutes. *Running* the compiled binary over
-the whole corpus takes ten seconds. Every ratio in this file follows from
-those two numbers.
+Compiling `boot` takes about two minutes, from the committed bootstrap
+by `tools/build.sh` (BOOTSTRAP.md); through the Python compiler it took three.
+*Running* the compiled binary over the whole corpus takes ten seconds. Every
+ratio in this file follows from those two numbers.
 
 `test_boot` learned that once already: it builds an executable and reuses it
 across its stages, and its docstring explains why. What it did not do was put
@@ -38,8 +39,8 @@ import fcntl
 import functools
 import hashlib
 import os
+import shutil
 import subprocess
-import sys
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -49,12 +50,13 @@ BOOT_MAIN = REPO_ROOT / "boot" / "Main.gob"
 
 
 # Everything whose contents can change what `boot` compiles to: its own
-# source, the library it links against, the Python compiler that builds it, and
-# the C runtime it is linked with. Hashing these is what lets a build be
-# reused; missing one would mean serving a stale binary, which is worse than
-# rebuilding, so this list errs wide.
+# source, the library it links against, the committed compiler that builds it
+# and the script that does, and the C runtime it is linked with. Hashing these
+# is what lets a build be reused; missing one would mean serving a stale
+# binary, which is worse than rebuilding, so this list errs wide.
 _INPUTS = (("boot", "*.gob"), ("lib", "*.gob"),
-           ("turkey", "*.py"), ("runtime", "*.c"), ("runtime", "*.h"))
+           ("bootstrap", "*"), ("tools", "build.sh"),
+           ("runtime", "*.c"), ("runtime", "*.h"))
 
 
 def _fingerprint(root: Path = REPO_ROOT) -> str:
@@ -67,6 +69,8 @@ def _fingerprint(root: Path = REPO_ROOT) -> str:
     h = hashlib.sha256()
     for directory, pattern in _INPUTS:
         for path in sorted((root / directory).rglob(pattern)):
+            if not path.is_file():
+                continue
             # A test's throwaway module in `lib/` (`test_foreign`,
             # `test_giblets`): not an input to the build, and hashing it made
             # every probe a three-minute rebuild -- and, under `-n auto`, a
@@ -78,9 +82,7 @@ def _fingerprint(root: Path = REPO_ROOT) -> str:
     return h.hexdigest()[:16]
 
 
-# A `boot` built elsewhere, used as it is. This is how the behavioral tests run
-# with no Python compiler to build one (TIX-94), and what a seed-built `boot`
-# (TIX-95) plugs into.
+# A `boot` built elsewhere, used as it is, with nothing built.
 BOOT_OVERRIDE = "TURKEY_BOOT"
 
 
@@ -90,18 +92,17 @@ def binary() -> Path:
 
     `$TURKEY_BOOT`, if set, names a `boot` to use instead, and nothing is built.
 
-    `turkey build` rather than compiling in-process and calling it, for two
-    reasons that have not changed: a subprocess per invocation keeps a crash
-    in `boot` from taking the test session with it, which matters while `boot`
-    still has one -- and it had one this week, on a nine-argument call -- and a
-    real executable is what self-hosting needs anyway.
+    `tools/build.sh`'s stage2: the committed bootstrap compiling today's
+    source. A real executable rather than anything in-process, because a
+    subprocess per invocation keeps a crash in `boot` from taking the test
+    session with it.
 
-    The build takes about three minutes and the result depends on nothing but
-    the files `_fingerprint` hashes, so it is kept in a shared directory keyed
+    The build takes about two minutes and the result depends on
+    nothing but the files `_fingerprint` hashes, so it is kept in a shared directory keyed
     by that hash rather than in a per-session temporary one. A session that
     changes nothing pays nothing. This matters more outside the test suite than
     in it: a one-off script that wants a compiled `boot` used to pay the full
-    build every time it ran, which is three minutes to ask a question that
+    build every time it ran, which is two minutes to ask a question that
     takes ten seconds to answer.
 
     Sharing the directory between concurrent builds is safe because the key is
@@ -117,7 +118,7 @@ def binary() -> Path:
         return output
     cached.mkdir(parents=True, exist_ok=True)
     # Under `pytest -n auto` every worker misses the cache at the same moment,
-    # and sixteen identical three-minute builds racing each other take far
+    # and sixteen identical builds racing each other take far
     # longer than one. The first to take the lock builds; the rest wait for it
     # and find the result. The atomic `os.replace` below is still what keeps a
     # reader from seeing a half-written file.
@@ -129,20 +130,20 @@ def binary() -> Path:
 
 
 def _build(cached: Path, output: Path) -> Path:
-    staging = cached / f"boot.{os.getpid()}"
-    result = subprocess.run(
-        [sys.executable, "-m", "turkey", "build", str(BOOT_MAIN),
-         "-o", str(staging)],
-        cwd=REPO_ROOT,
-        env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)),
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        staging.unlink(missing_ok=True)
-        raise AssertionError(
-            f"building boot failed\n{result.stdout}\n{result.stderr}")
-    os.replace(staging, output)
+    staging = cached / f"stages.{os.getpid()}"
+    try:
+        result = subprocess.run(
+            ["sh", str(REPO_ROOT / "tools" / "build.sh"), "--out", str(staging)],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise AssertionError(
+                f"building boot failed\n{result.stdout}\n{result.stderr}")
+        os.replace(staging / "stage2", output)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
     return output
 
 

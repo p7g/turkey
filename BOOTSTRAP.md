@@ -28,7 +28,8 @@ Stage N is built by stage N-1, which is Rust's convention. stage2 is today's
 source compiled by the committed compiler. It is correct if the committed
 compiler is, but its *code* is whatever that older compiler would emit. stage3
 is today's source compiled by today's source. The fixed point is that stage3,
-compiling the same source again, emits stage3's own bytes.
+compiling the same source again, emits exactly the assembly stage3 was linked
+from.
 
 What `bootstrap/` holds:
 
@@ -58,6 +59,10 @@ On the development machine (arm64, macOS 26, Apple clang 17), 2026-09-19:
 | `gzip -9` | 3.54 MB |
 | `xz -9` | 2.37 MB |
 | `zstd -19` | 2.20 MB |
+| `build.sh` (stage1 and stage2) | 128 s |
+| `build.sh --fixpoint` | 376 s |
+| of which, one self-compile | about 105 s |
+| one link | about 10 s |
 
 **Why gzip.** `/usr/bin/gzip` ships with macOS, while `xz` and `zstd` come
 from Homebrew. The better compressors would save 1.2–1.3 MB per bump, which

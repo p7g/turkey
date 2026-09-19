@@ -82,6 +82,21 @@ python3 -m turkey build rectangles.gob -o rectangles
 Use `python3 -m turkey types rectangles.gob` to inspect inferred types, or
 `python3 -m turkey --help` for the compiler's other commands.
 
+### The compiler written in Turkey
+
+On an arm64 Mac, the self-hosted compiler builds from the committed bootstrap
+with only a C compiler, no Python:
+
+```sh
+sh tools/build.sh
+build/stages/stage2 native rectangles.gob > rectangles.s
+cc -std=c11 -O1 -o rectangles rectangles.s runtime/turkey_runtime.c
+./rectangles
+```
+
+Run it from the repository root, where it finds `lib/`. See
+[BOOTSTRAP.md](BOOTSTRAP.md) for how the bootstrap works.
+
 ## Project status
 
 Turkey is an experimental language under active development. This repository,
@@ -96,6 +111,7 @@ For more depth:
 - [Language design](design.md) and [changes to the specification](SPEC-DELTAS.md)
 - [Standard library](STDLIB.md) and [library design](LIBRARY-DESIGN.md)
 - [Compiler written in Turkey](boot/) and [lessons from building it](FINDINGS.md)
+- [Building the compiler from its committed bootstrap](BOOTSTRAP.md)
 - [Roadmap](plan.txt)
 
 To run the test suite, install the development dependencies with

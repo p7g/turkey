@@ -359,12 +359,37 @@ fun dumpOpt(b : String.Builder, path : String) -> Unit {
     String.push(b, Core.showProgram(optimized, Some(entry.name)))
 }
 
--- The Low IR, and the giblets check on it. Every path that lowers comes through
--- here, so a giblet that allocates stops the compile whichever backend was
--- asked for (TIX-63).
+-- The Low IR, and the checks on it. Every path that lowers comes through here,
+-- so what they refuse stops the compile whichever backend was asked for.
+--
+-- `Ssa.verify` owns one graph's shape, `LowIr.checkReps` each instruction's
+-- representations, and `LowIr.checkCalls` the agreement between graphs -- a
+-- call's arity and representations against its callee's signature, which is
+-- the property the signature table exists for. All three were printed by the
+-- `ssa` dump and nowhere else, so a real compile trusted what only a dump
+-- checked (TIX-86). They found nothing in the corpus or in `boot` when they
+-- were made fatal; the giblets check is TIX-63's.
 fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable, path : String)
         -> (SsaLower.Module, Array SsaLower.Unsupported) {
     let (module_, skipped) = SsaLower.lowerProgram(program, decls)
+    let complaints = []
+    for f in module_.functions {
+        for message in Ssa.verify(f) { Array.push(complaints, message) }
+        for block in f.blocks {
+            for i in block.insts {
+                for message in LowIr.checkReps(f, i) {
+                    Array.push(complaints, f.name + ": " + message)
+                }
+            }
+        }
+    }
+    for message in LowIr.checkCalls(module_.functions) {
+        Array.push(complaints, message)
+    }
+    if len(complaints) > 0 {
+        Diag.fail(Diag.whole("internal error", "the low IR is malformed:\n  "
+                             + String.join(complaints, "\n  ")), path)
+    }
     Giblets.checkLowered(module_.functions, path)
     (module_, skipped)
 }

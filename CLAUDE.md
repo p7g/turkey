@@ -40,21 +40,27 @@ one. A survey that lives only in a conversation has not been done.
 already agreed, a refactor with a test suite behind it. The trigger is *novel
 design that is expensive to reverse*.
 
-## Two implementations, and what that costs
+## One implementation, and what checks it
 
-`turkey/` is Python and `boot/` is Turkey, and `tests/test_boot.py` diffs every
-stage between them byte-for-byte over the whole corpus. So a change to a shared
-algorithm is a change to *both*, or the differential goes red.
+`boot/` is the compiler and it is written in Turkey. The Python implementation
+it was diffed against is gone (TIX-96), so there is no longer a second answer
+to compare against, and a change is checked by what it *does*:
 
-That is a feature and it is the project's main correctness property, but budget
-for it: a new Core pass is two implementations plus a golden regeneration, not
-one pass. It is also why a pass belongs in Core when it can be -- Core is where
-the oracle reaches.
+* **Recorded behavior.** `tests/programs/` holds a program, its exact output
+  and its exit status. `tests/lang.py` compiles and runs through `boot`, and
+  every behavioral test goes through it. Regenerate a golden with
+  `python3 -m tests.regenerate_expected` and **read the diff**: nothing else
+  says whether a change is a fix or a regression.
+* **The reference.** `tests/test_reference.py` compiles and runs every example
+  in `docs/ref/`, so the chapters are executable.
+* **The fixed point.** `boot` compiles itself, and `pytest -m bootstrap`
+  checks that the compiler it builds emits the same bytes it was built from
+  (BOOTSTRAP.md). A miscompile has to reproduce itself exactly to survive.
 
-The failure this permits is worth knowing: `test_boot` compares *output*, so a
-stage that crashes is a stage the oracle says nothing about, and a fix to a
-shared algorithm has no test that notices it was applied to only one side. See
-FINDINGS 43.
+Budget for the goldens: a change that moves output moves the recorded files
+too, and regenerating them without reading them is how a regression gets
+committed. The old differential could not be fooled that way, which is what
+was given up, and FINDINGS 43 records what it could not catch either.
 
 ## Keep the language reference true
 

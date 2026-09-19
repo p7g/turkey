@@ -12,7 +12,7 @@ Shapes.Circle` loads the file `Shapes/Circle.gob`. The compiler looks for it
 first relative to the directory of the program's entry file, then in the
 standard library.
 
-The file given to `turkey run` or `turkey build` is the **entry module**, and
+The file the compiler is given is the **entry module**, and
 it must define [`main`](#the-entry-point).
 
 Modules may not import each other in a cycle. If two modules need each other,

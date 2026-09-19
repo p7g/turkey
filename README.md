@@ -63,47 +63,36 @@ work together without type annotations on the functions.
 
 ## Try it
 
-From this checkout, with Python 3.11+ and a C compiler installed:
-
-```sh
-python3 -m venv .venv
-source .venv/bin/activate
-python3 -m pip install -e .
-```
-
-Save the example as `rectangles.gob`, then run it or build an executable:
-
-```sh
-python3 -m turkey run rectangles.gob
-python3 -m turkey build rectangles.gob -o rectangles
-./rectangles
-```
-
-Use `python3 -m turkey types rectangles.gob` to inspect inferred types, or
-`python3 -m turkey --help` for the compiler's other commands.
-
-### The compiler written in Turkey
-
-On an arm64 Mac, the self-hosted compiler builds from the committed bootstrap
-with only a C compiler, no Python:
+The compiler is written in Turkey. On an arm64 Mac, with a C compiler
+installed, it builds from the assembly committed in `bootstrap/`:
 
 ```sh
 sh tools/build.sh
+```
+
+That leaves a compiler in `build/stages/stage2`. Save the example as
+`rectangles.gob`, then compile and run it:
+
+```sh
 build/stages/stage2 native rectangles.gob > rectangles.s
-cc -std=c11 -O1 -o rectangles rectangles.s runtime/turkey_runtime.c
+cc -o rectangles rectangles.s runtime/turkey_runtime.c
 ./rectangles
 ```
 
-Run it from the repository root, where it finds `lib/`. See
-[BOOTSTRAP.md](BOOTSTRAP.md) for how the bootstrap works.
+Run the compiler from the repository root, where it finds `lib/`. Use
+`build/stages/stage2 types rectangles.gob` to inspect inferred types; the
+other subcommands print what a stage produced, and `check` just compiles.
+[BOOTSTRAP.md](BOOTSTRAP.md) explains how the build works and when its
+committed compiler is replaced.
 
 ## Project status
 
-Turkey is an experimental language under active development. This repository,
-`turkey`, contains the Python implementation, an LLVM native backend, and
-a compiler being written in Turkey itself. The standard library is written in
-Turkey over a small set of runtime primitives. A generated-Python backend and
-differential tests help check that the implementations agree.
+Turkey is an experimental language under active development. The compiler is
+written in Turkey and compiles itself, with an arm64 backend that emits
+assembly directly and an LLVM path beside it. The standard library is written
+in Turkey over a small set of runtime primitives. A Python implementation
+served as the reference while the compiler was ported to Turkey, and was
+retired once the tests ran against the self-hosted one.
 
 For more depth:
 
@@ -114,7 +103,7 @@ For more depth:
 - [Building the compiler from its committed bootstrap](BOOTSTRAP.md)
 - [Roadmap](plan.txt)
 
-To run the test suite, install the development dependencies with
+The tests are Python. Install their dependencies with
 `python3 -m pip install -e '.[dev]'`, then run `python3 -m pytest tests -q`.
 The tests compile their programs with `boot`, which is built from the
 committed bootstrap on first use; `TURKEY_BOOT` points them at one you built

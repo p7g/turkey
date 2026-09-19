@@ -8,7 +8,7 @@ literals get their types, and the constraints that appear in inferred types.
 To see the types the compiler infers for a file, run:
 
 ```sh
-python3 -m turkey types program.gob
+boot types program.gob
 ```
 
 ## Principal types
@@ -27,7 +27,7 @@ fun pairUp(x) = (x, x)
 fun label(x) = "<" + show(x) + ">"
 ```
 
-`turkey types` reports these as:
+`boot types` reports these as:
 
 ```text
 twice : fun(fun(a) -> a, a) -> a

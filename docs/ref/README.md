@@ -92,11 +92,16 @@ hello
 Examples that the compiler rejects say so in the surrounding text, and the
 test checks that the error message says what the text claims it says.
 
-Source files use the extension `.gob`. To run one:
+Source files use the extension `.gob`. The compiler, `boot`, emits assembly,
+which a C compiler turns into an executable:
 
 ```sh
-python3 -m turkey run hello.gob
+boot native hello.gob > hello.s
+cc -o hello hello.s runtime/turkey_runtime.c
+./hello
 ```
+
+`BOOTSTRAP.md` says how to build `boot` itself.
 
 ## For maintainers
 
@@ -111,10 +116,8 @@ must be preceded by an HTML comment that says how to check it:
 | `<!-- panic: TEXT -->` | Must compile and then panic with a message containing `TEXT`. An optional `text` fence gives the output printed before the panic. |
 | `<!-- module: Name.gob -->` | Another source file for the next example, written beside it. The example itself is `Main.gob`. |
 
-Examples that run are run twice: once in the test process, and once through
-`python3 -m turkey run`, whose default backend is the native one, since that is
-what a reader who copies an example will execute. A `kotlin` fence with no
-directive fails the test. Grammar goes in `ebnf`
+Every example is compiled and run by `boot`, the way a reader who copies one
+would. A `kotlin` fence with no directive fails the test. Grammar goes in `ebnf`
 fences and shell commands in `sh` fences; the test ignores both.
 
 **What goes in.** Only what the compiler accepts today. The reference does not

@@ -109,8 +109,9 @@ type Employee = Employee { name : String, role : String, salary : Int }
 
 fun badge(Employee { name, role, salary = _ }) = name + " (" + role + ")"
 
-fun payroll(e) = match e {
-    Employee { salary, .. } -> salary
+fun payroll(employee) {
+    let Employee { salary, .. } = employee
+    salary
 }
 
 fun main() {

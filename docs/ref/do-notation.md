@@ -176,8 +176,9 @@ instance Applicative Logged {
 }
 
 instance Monad Logged {
-    fun bind(Logged(value, log), f) = match f(value) {
-        Logged(result, more) -> Logged(result, log + more)
+    fun bind(Logged(value, log), f) {
+        let Logged(result, more) = f(value)
+        Logged(result, log + more)
     }
 }
 
@@ -190,14 +191,11 @@ fun area(width, height) {
 }
 
 fun main() {
-    match area(3, 4) {
-        Logged(value, log) -> {
-            for line in log {
-                print(line)
-            }
-            print(value)
-        }
+    let Logged(value, log) = area(3, 4)
+    for line in log {
+        print(line)
     }
+    print(value)
 }
 ```
 

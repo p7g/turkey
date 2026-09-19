@@ -566,14 +566,12 @@ type Counter = Counter[s] {
     report : fun(s) -> String
 }
 
-fun runCounter(counter, times) = match counter {
-    Counter { start, step, report } -> {
-        var state = start
-        for var i = 0; i < times; i = i + 1 {
-            state = step(state)
-        }
-        report(state)
+fun runCounter(Counter { start, step, report }, times) {
+    var state = start
+    for var i = 0; i < times; i = i + 1 {
+        state = step(state)
     }
+    report(state)
 }
 
 fun main() {

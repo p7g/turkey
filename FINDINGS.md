@@ -471,7 +471,11 @@ golden: the component of `Ord Int`, `Eq Int` and the class defaults had cycles
 the old choice left, and now breaks at both dictionaries and two defaults, so
 `loops.gob`'s `firstEven` reduces small enough to inline into `main`. The
 cycles there never ran away only because the members were too big to inline,
-which is how the bug stayed hidden. The walker was
+which is how the bug stayed hidden. It costs `boot` compiling itself 2.4s of
+102, measured back to back -- the price of the bindings that are now
+breakers and were being inlined before, which in `loops.gob` were the `Ord
+Int` and `Eq Int` dictionaries; which ones they are in `boot` was not
+measured. The walker was
 written with one cycle to get past it at the time;
 `tests/programs/loop_breakers.gob` is the shape that crashed.
 

@@ -1,6 +1,7 @@
 module Turkey.LowIr (
     BinOp(..), CmpOp(..), Conv(..), Callee(..), Op(..), Low(..),
     low, effectsOf, opUses, mapUses, opResultRep, checkReps, checkCalls, showOpName,
+    Allocation(..), summarize, allocatingOp,
     Builder(..), builder, into, emit, effect, terminate, block, param,
 )
 
@@ -36,6 +37,7 @@ module Turkey.LowIr (
 -- in two places. Instruction selection expands these; that is its job.
 
 import Data.Map as Map
+import Turkey.Source (Span)
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..),
                    Effects(..), Inst(..), Term(..), Block(..), Func(..))
@@ -196,10 +198,13 @@ fun low(result : Value, op : Op) -> Low = Low { result = result, op = op }
 type Builder = Builder {
     func : Ssa.Func Low,
     at   : Ssa.BlockId,
+    -- The source construct being lowered, which the lowering keeps current;
+    -- recorded against every instruction that may allocate (`Func.origins`).
+    span : Option Span,
 }
 
 fun builder(f : Ssa.Func Low, at : Ssa.BlockId) -> Builder =
-    Builder { func = f, at = at }
+    Builder { func = f, at = at, span = None }
 
 -- Move the cursor. Blocks are built in whatever order the lowering finds
 -- them, so this is ordinary rather than exceptional.
@@ -216,6 +221,12 @@ fun into(b : Builder, at : Ssa.BlockId) -> Unit { b.at = at }
 fun emit(b : Builder, op : Op, r : Rep) -> Value {
     let v = Ssa.freshValue(b.func, r)
     Array.push(Ssa.blockAt(b.func, b.at).insts, low(v, op))
+    if effectsOf(op).allocates {
+        match b.span {
+            Some(s) -> Map.put(b.func.origins, Ssa.valueId(v), s)
+            None -> {}
+        }
+    }
     v
 }
 
@@ -292,8 +303,8 @@ fun effectsOf(op : Op) -> Effects = match op {
     ClosureNew(_, _, _) -> Ssa.allocates()
     ClosureCapture(_, _, _) -> Ssa.writes()
     -- A call may do anything the callee does, which is everything. Knowing
-    -- better than this per callee is an interprocedural summary and is not
-    -- something this phase has.
+    -- better per callee takes the whole program, which one instruction does
+    -- not have; `summarize` below is that, for allocation, over the module.
     Call(_, _) -> everything()
     GlobalLoad(_) -> Ssa.reads_()
     GlobalStore(_, _) -> Ssa.writes()
@@ -571,6 +582,110 @@ fun checkCalls(functions : Array (Ssa.Func Low)) -> Array String {
         }
     }
     out
+}
+
+-- -- which functions may allocate ---------------------------------------------
+
+-- Why a function may allocate: an instruction of its own, or a call to one
+-- that may.
+type Allocation
+    = Allocates(String, Int)
+    | CallsAllocating(String, Int)
+
+-- What an instruction allocates by itself, if anything.
+--
+-- A direct call is left to `summarize`, which knows the callee. The rest of the
+-- calls are decided here, each for its own reason:
+--
+-- * **through a closure**: the target is not known, so it may be anything --
+--   the hole `RUNTIME-IN-TURKEY.md` names as the reason not to define giblets
+--   by an effect. Giblet code has no closures, so it never meets one;
+-- * **foreign**: C, which cannot reach the managed heap. The one way it could
+--   is a declaration naming one of the runtime's own allocators, and those are
+--   not the program's to declare;
+-- * **the runtime**: allocating unless it is on the short list below.
+fun allocatingOp(op : Op) -> Option String = match op {
+    Call(Direct(_), _) -> None
+    Call(Foreign(_), _) -> None
+    Call(Indirect(_), _) -> Some("calls through a closure or a dictionary")
+    Call(Runtime(name), _) ->
+        if nonAllocatingRuntime(name) { None }
+        else { Some("calls the runtime's " + name) }
+    -- Said the way the source would say it, since the reader of this wrote
+    -- source: which construct lowered to the allocation is the question.
+    Box(_) -> Some("boxes a value to pass it where the type is not known")
+    ObjectNew(_, _, _, _) ->
+        Some("builds an object -- a constructor, tuple, record or dictionary")
+    ArrayNew(_, _, _) -> Some("builds an array")
+    CellNew(_) -> Some("makes a cell for a variable a closure captured")
+    ClosureNew(_, _, _) -> Some("makes a closure")
+    _ -> if effectsOf(op).allocates { Some("allocates (" + showOpName(op) + ")") }
+         else { None }
+}
+
+-- The runtime entry points that make nothing. Listed rather than defaulted:
+-- a new entry point is assumed to allocate until someone says otherwise.
+fun nonAllocatingRuntime(name : String) -> Bool = name == "Prim.exit"
+
+-- Every function that may allocate, and why; a function not in the answer
+-- does not.
+--
+-- A worklist over the reverse call graph rather than a fixpoint over the
+-- whole module: each function that allocates by itself is found once, and the
+-- fact runs up the callers from there, so the pass is linear in the module
+-- where a naive iteration is linear per round. A call to a function that is
+-- not in the module -- one the lowering skipped -- is taken to allocate,
+-- because nothing says it does not.
+fun summarize(functions : Array (Ssa.Func Low)) -> Map String Allocation {
+    let out = Map.new()
+    let known = Map.new()
+    for f in functions { Map.put(known, f.name, ()) }
+    let callers = Map.new()
+    let work = []
+    for f in functions {
+        for block in f.blocks {
+            for i in block.insts {
+                match i.op {
+                    Call(Direct(name), _) -> {
+                        if !Map.contains(known, name) {
+                            mark(out, work, f.name,
+                                 Allocates("calls @" + name + ", which did not lower",
+                                           Ssa.valueId(i.result)))
+                        }
+                        let site = (f.name, Ssa.valueId(i.result))
+                        match Map.get(callers, name) {
+                            Some(those) -> Array.push(those, site)
+                            None -> Map.put(callers, name, [site])
+                        }
+                    }
+                    op -> match allocatingOp(op) {
+                        Some(what) -> mark(out, work, f.name,
+                                           Allocates(what, Ssa.valueId(i.result)))
+                        None -> {}
+                    }
+                }
+            }
+        }
+    }
+    for var k = 0; k < len(work); k = k + 1 {
+        match Map.get(callers, work[k]) {
+            Some(those) -> for (caller, site) in those {
+                mark(out, work, caller, CallsAllocating(work[k], site))
+            }
+            None -> {}
+        }
+    }
+    out
+}
+
+-- The first reason found is the one kept, so the chain a diagnostic prints
+-- is a shortest one from the function to an allocation.
+fun mark(out : Map String Allocation, work : Array String, name : String,
+         why : Allocation) -> Unit {
+    if !Map.contains(out, name) {
+        Map.put(out, name, why)
+        Array.push(work, name)
+    }
 }
 
 fun sameRep(f : Ssa.Func Low, out : Array String, a : Value, b : Value,

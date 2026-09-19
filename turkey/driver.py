@@ -30,6 +30,7 @@ from .builtins import initial_type_env
 from .classes import ClassTable
 from .constraints import Env, Solver
 from .decls import DeclTable
+from . import giblets
 from .deps import free_names, pattern_vars, sccs
 from .errors import short
 from .evidence import Elaborator
@@ -111,6 +112,10 @@ def check(src: str, file: str | None = None,
     # of a check nobody runs, so it runs the way exhaustiveness does: always.
     program_core = lower.Lowerer(decls, classes, env, types).program(ordered)
     coretc.check_program(program_core, decls, classes, coretc.globals_of(env))
+    # The giblet modules hold no traced value, which is a question about the
+    # types of their code -- and Core, which both compilers produce byte for
+    # byte, is where every node has one. See turkey/giblets.py.
+    giblets.check_program(program_core, decls)
     # Specialization is checked for the same reason the lowering is, and by the
     # same checker: it rewrites every type in every body it copies, so "the
     # copy still typechecks" is the property that a substitution went wrong

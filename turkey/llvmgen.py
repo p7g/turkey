@@ -101,12 +101,7 @@ _CALLING_OPS = frozenset({
     "array_new", "closure_new", "closure_capture",
 })
 _CALLING_PRIMS = frozenset({
-    "intToString", "floatToString", "charToString", "stringConcat",
-    "stringByteLength", "stringByteAt", "stringDecodeAt",
-    "stringNextIndex", "stringSlice", "stringFind", "stringRfind",
-    "stringToByteStorage", "stringFromBytes", "stringConcatAll", "floatParse",
-    "floatFmod", "floatRemainder", "floatFloor", "floatCeil", "floatRound",
-    "floatTrunc", "stringIsValidUtf8", "floatCanParse", "stringEq", "stringLt",
+    "floatToString", "floatParse", "floatCanParse",
     "arrayNew", "arrayNewUninit", "error", "exit",
 })
 #: `Prim.load*` / `Prim.store*` to the LLVM type the access is at. One name
@@ -434,31 +429,9 @@ class _Emitter:
 
     def _declare_runtime(self) -> None:
         self._runtime("turkey_string_new", _PTR, [_PTR, _I64])
-        self._runtime("turkey_string_concat", _PTR, [_PTR, _PTR])
-        self._runtime("turkey_int_to_string", _PTR, [_I64])
         self._runtime("turkey_float_to_string", _PTR, [_F64])
         self._runtime("turkey_float_parse", _F64, [_PTR])
         self._runtime("turkey_float_can_parse", _I32, [_PTR])
-        self._runtime("turkey_float_fmod", _F64, [_F64, _F64])
-        self._runtime("turkey_float_remainder", _F64, [_F64, _F64])
-        self._runtime("turkey_float_floor", _F64, [_F64])
-        self._runtime("turkey_float_ceil", _F64, [_F64])
-        self._runtime("turkey_float_round", _F64, [_F64])
-        self._runtime("turkey_float_trunc", _F64, [_F64])
-        self._runtime("turkey_char_to_string", _PTR, [_I32])
-        self._runtime("turkey_string_byte_length", _I64, [_PTR])
-        self._runtime("turkey_string_byte_at", _I8, [_PTR, _I64])
-        self._runtime("turkey_string_decode_at", _I32, [_PTR, _I64])
-        self._runtime("turkey_string_next_index", _I64, [_PTR, _I64])
-        self._runtime("turkey_string_slice", _PTR, [_PTR, _I64, _I64])
-        self._runtime("turkey_string_find", _I64, [_PTR, _PTR, _I64])
-        self._runtime("turkey_string_rfind", _I64, [_PTR, _PTR])
-        self._runtime("turkey_string_to_byte_storage", _PTR, [_PTR])
-        self._runtime("turkey_string_from_bytes", _PTR, [_PTR])
-        self._runtime("turkey_string_is_valid_utf8", _I32, [_PTR])
-        self._runtime("turkey_string_concat_all", _PTR, [_PTR])
-        self._runtime("turkey_string_eq", _I32, [_PTR, _PTR])
-        self._runtime("turkey_string_lt", _I32, [_PTR, _PTR])
         self._runtime("turkey_exit", ir.VoidType(), [_I64])
         self._runtime("turkey_cell_new", _PTR, [_I64, _I32])
         self._runtime("turkey_object_new", _PTR, [_I32, _I32, _I64, _I64])
@@ -1155,9 +1128,6 @@ class _Emitter:
         if op in ("scalar_eq", "float_eq"):
             return (builder.fcmp_ordered("==", args[0], args[1]) if op == "float_eq"
                     else builder.icmp_unsigned("==", args[0], args[1])), builder
-        if op == "string_eq":
-            value = builder.call(self.runtime["turkey_string_eq"], args)
-            return builder.icmp_unsigned("!=", value, ir.Constant(_I32, 0)), builder
         raise Unsupported(f"no LLVM emission rule for {op}")
 
     def _static_closure(self, builder: ir.IRBuilder, symbol: str) -> ir.Value:
@@ -1344,32 +1314,11 @@ class _Emitter:
                                   "Float is not representable as an Int")
             return builder.fptosi(args[0], _I64), builder
         runtime = {
-            "intToString": "turkey_int_to_string", "floatToString": "turkey_float_to_string",
-            "charToString": "turkey_char_to_string", "stringConcat": "turkey_string_concat",
-            "stringByteLength": "turkey_string_byte_length",
-            "stringByteAt": "turkey_string_byte_at",
-            "stringDecodeAt": "turkey_string_decode_at",
-            "stringNextIndex": "turkey_string_next_index",
-            "stringSlice": "turkey_string_slice",
-            "stringFind": "turkey_string_find",
-            "stringRfind": "turkey_string_rfind",
-            "stringToByteStorage": "turkey_string_to_byte_storage",
-            "stringFromBytes": "turkey_string_from_bytes",
-            "stringConcatAll": "turkey_string_concat_all",
+            "floatToString": "turkey_float_to_string",
             "floatParse": "turkey_float_parse",
-            "floatFmod": "turkey_float_fmod",
-            "floatRemainder": "turkey_float_remainder",
-            "floatFloor": "turkey_float_floor",
-            "floatCeil": "turkey_float_ceil",
-            "floatRound": "turkey_float_round",
-            "floatTrunc": "turkey_float_trunc",
         }.get(name)
         if runtime:
             value = builder.call(self.runtime[runtime], args)
-            return value, self._propagate(function, builder)
-        if name == "stringIsValidUtf8":
-            raw = builder.call(self.runtime["turkey_string_is_valid_utf8"], args)
-            value = builder.icmp_unsigned("!=", raw, ir.Constant(_I32, 0))
             return value, self._propagate(function, builder)
         if name == "exit":
             # Never returns, so the rest of the block is unreachable and
@@ -1383,10 +1332,6 @@ class _Emitter:
             raw = builder.call(self.runtime["turkey_float_can_parse"], args)
             value = builder.icmp_unsigned("!=", raw, ir.Constant(_I32, 0))
             return value, self._propagate(function, builder)
-        if name in ("stringEq", "stringLt"):
-            raw = builder.call(self.runtime[
-                "turkey_string_eq" if name == "stringEq" else "turkey_string_lt"], args)
-            return builder.icmp_unsigned("!=", raw, ir.Constant(_I32, 0)), builder
         if name == "arrayLength":
             return self._heap_load(
                 builder,

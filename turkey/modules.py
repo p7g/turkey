@@ -27,11 +27,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import ast
+from . import ast, giblets
 from .builtins import PRIM_NAMES
 from .deps import pattern_vars
 from .errors import Span, TypeError_
 from .parser import BUILTIN_TYCONS, parse
+from .types import STRING
 
 # The library is ordinary Turkey source and sits beside the implementation
 # rather than inside it: it is what the language ships, not part of the
@@ -160,6 +161,7 @@ class ModuleLoader:
             program = parse(src, frozenset(self.tycons), file)
 
         _check_foreign_placement(name, program, library)
+        giblets.check_placement(name, library, Span(1, 1, file))
         module = Module(name, program, library)
         self.tycons |= {d.name for d in program.decls
                         if isinstance(d, ast.TypeDecl)}
@@ -190,6 +192,10 @@ class ModuleLoader:
             scope.types["Prim.Ptr"] = "Prim.Ptr"
         # So are the built-in type constructors, which no module declares.
         scope.types.update({name: name for name in BUILTIN_TYCONS})
+        # `String` is declared in a library module but spelled everywhere, the
+        # way it was when it was primitive; a module that declares its own
+        # shadows it like any other name (TIX-66).
+        scope.types["String"] = STRING.name
 
         explicit_prelude = any(
             imp.name == PRELUDE for imp in module.program.imports

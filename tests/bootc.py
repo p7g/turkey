@@ -67,6 +67,12 @@ def _fingerprint(root: Path = REPO_ROOT) -> str:
     h = hashlib.sha256()
     for directory, pattern in _INPUTS:
         for path in sorted((root / directory).rglob(pattern)):
+            # A test's throwaway module in `lib/` (`test_foreign`,
+            # `test_giblets`): not an input to the build, and hashing it made
+            # every probe a three-minute rebuild -- and, under `-n auto`, a
+            # different key for whichever worker looked while one existed.
+            if path.name.startswith("Probe_"):
+                continue
             h.update(str(path.relative_to(root)).encode())
             h.update(path.read_bytes())
     return h.hexdigest()[:16]

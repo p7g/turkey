@@ -5,37 +5,13 @@
 
 extern int32_t turkey_has_panicked;
 
-typedef struct TurkeyString {
-    int64_t length;
-    unsigned char bytes[];
-} TurkeyString;
-
-TurkeyString *turkey_string_new(const unsigned char *bytes, int64_t length);
-TurkeyString *turkey_string_concat(TurkeyString *left, TurkeyString *right);
-TurkeyString *turkey_int_to_string(int64_t value);
-TurkeyString *turkey_float_to_string(double value);
-double turkey_float_parse(TurkeyString *value);
-int32_t turkey_float_can_parse(TurkeyString *value);
-double turkey_float_fmod(double left, double right);
-double turkey_float_remainder(double left, double right);
-double turkey_float_floor(double value);
-double turkey_float_ceil(double value);
-double turkey_float_round(double value);
-double turkey_float_trunc(double value);
-TurkeyString *turkey_char_to_string(uint32_t value);
-int64_t turkey_string_byte_length(TurkeyString *value);
-uint8_t turkey_string_byte_at(TurkeyString *value, int64_t index);
-uint32_t turkey_string_decode_at(TurkeyString *value, int64_t index);
-int64_t turkey_string_next_index(TurkeyString *value, int64_t index);
-TurkeyString *turkey_string_slice(TurkeyString *value, int64_t start, int64_t stop);
-int64_t turkey_string_find(TurkeyString *haystack, TurkeyString *needle, int64_t start);
-int64_t turkey_string_rfind(TurkeyString *haystack, TurkeyString *needle);
-void *turkey_string_to_byte_storage(TurkeyString *value);
-TurkeyString *turkey_string_from_bytes(void *array);
-int32_t turkey_string_is_valid_utf8(void *array);
-TurkeyString *turkey_string_concat_all(void *array);
-int32_t turkey_string_eq(TurkeyString *left, TurkeyString *right);
-int32_t turkey_string_lt(TurkeyString *left, TurkeyString *right);
+/* A `String` is a byte array on the heap (TIX-66), so these are `void *`:
+   `turkey_string_new` is how the entry interns a literal, and the float
+   three stay C until TIX-75. */
+void *turkey_string_new(const unsigned char *bytes, int64_t length);
+void *turkey_float_to_string(double value);
+double turkey_float_parse(void *value);
+int32_t turkey_float_can_parse(void *value);
 
 void *turkey_cell_new(uint64_t value, int32_t pointer_value);
 
@@ -96,7 +72,7 @@ void turkey_install_crash_handler(void);
 int turkey_main(int argc, char **argv, void (*entry)(void));
 
 void turkey_panic(const char *message);
-void turkey_panic_string(TurkeyString *message);
+void turkey_panic_string(void *message);
 int32_t turkey_panicked(void);
 const char *turkey_panic_message(void);
 void turkey_panic_clear(void);

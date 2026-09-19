@@ -414,6 +414,111 @@ The port also showed the two hosts disagreeing about that panic's wording --
 had reason to reach until a program could hit it at startup. The C now says
 "well-formed", which is PRIMITIVES.md's word.
 
+### 105. The oracle's `round` was wrong, and only a second model of it noticed
+**bug, fixed.** TIX-66. `Float.round` was `floor(abs(x) + 0.5)` with the sign
+put back, in `builtins.py`, while the native side called C's `round`. The
+addition rounds: the largest double below one half, 0.49999999999999994, plus
+0.5 is exactly 1.0 in binary64, so the oracle said 1.0 and C said 0.0. No
+golden rounds a number that close to a half, so the differential never met it.
+
+It surfaced because moving the libm wrappers to `foreign` meant writing a
+*model* of `round` in `turkey/foreign.py`, and a model is written against C's
+definition rather than copied from the old primitive. The fraction is now taken
+exactly -- `abs(x) - floor(abs(x))`, a difference of two doubles within a
+factor of two of each other -- and both sides pin the case.
+
+### 106. The strings were two implementations the differential never compared
+**design, fixed.** TIX-66. Every string operation had a C body and a Python
+body, written separately, and `test_native` compares the two only through what
+a program prints. So the pair agreed wherever the corpus happened to look and
+nowhere else was checked -- the same shape as FINDINGS 43, one level down.
+`find` with a negative start is the example: Python's `str.find` counts a
+negative start from the *end*, the C clamped it to zero, and no caller passed
+one, so the disagreement was real and unreachable.
+
+Making `String` a library type over its bytes removed both bodies. The
+operations are Turkey in `Data.String`, which the Python oracle *runs* and
+`boot` compiles, so `test_boot` diffs the string code itself stage by stage
+instead of two unrelated programs' output. The oracle's own string
+implementation is now four seams -- a literal, a panic's message, and the two
+float conversions TIX-75 owes -- rather than a second copy of the semantics.
+
+Two smaller things fell out. The oracle had told a `Char` pattern from a
+`String` one by comparing Python types, since both were `str`; they are now
+different values. And the arm64 backend's float `Rem` called
+`turkey_float_fmod`, a wrapper the libm move deleted -- latent, because
+`SsaLower` never emits a float `Rem`, and caught only by grepping for the name.
+
+### 107. One loop breaker per component is not enough to stop inlining
+**bug, open.** TIX-63. `opt.loop_breakers` and its boot twin mark one binding
+per strongly connected component, the lexicographically first, and the header
+says why that suffices: "inlining terminates when the call graph it walks is
+acyclic". It is acyclic only if every cycle passes through the chosen name.
+A component can hold several cycles, and removing one member need not break
+them all.
+
+`Turkey.Giblets` had four: `cell`, `expr`, `head`, `inside`, with `head`
+calling itself, `expr -> inside -> head -> expr`, and `cell -> expr -> inside
+-> cell`. `cell` was chosen, two cycles survived, and the Python optimizer
+recursed past a 200,000-frame limit building `boot`. Nothing about the code was
+unusual -- a walker with a helper for the function position of a call -- so
+what kept this from biting earlier is that most components' members are too
+big to inline, and size, not the breaker, was what stopped it.
+
+GHC's answer is to choose a breaker, delete it, and take the SCCs of what is
+left again, until none remain. Worked around here by writing the walker with
+one cycle (`expr` and `inside`) and non-recursive helpers; the fix belongs to
+both optimizers and their goldens, and is its own ticket.
+
+### 108. A probe in `lib/` changed the key of the compiler it was probing
+**test bug, fixed.** TIX-63. `bootc._fingerprint` hashes every `.gob` under
+`lib/`, and `test_foreign` writes a throwaway module there. So every probe made
+a new cache key and a three-minute rebuild of `boot` -- and under `-n auto`, a
+different key for any worker that happened to look while a probe existed,
+which is a race over which binary a test ran. It went unnoticed because
+`test_foreign` only ever ran the Python compiler; `test_giblets` is the first
+test to run `boot` against a probe, and its fourteen tests took five and a half
+minutes. Probes are named `Probe_*` and are now skipped: 1.3 seconds.
+
+### 109. Giblets: where the type rule pinched
+**design, running.** TIX-63. `RUNTIME-IN-TURKEY.md` bets that "names no
+traced type" is the right line rather than Go's "does not allocate", and the
+bet is to be watched: each place the rule had to bend is written here, and if
+the list grows with the collector, the rule becomes an effect checked by the
+Low IR summary instead. So far, four, all in the first hundred lines:
+
+- **A panic.** `Prim.error("out of memory")` has a `String` argument and a
+  result at whatever type the context wanted, often a variable nothing fixed.
+  Neither is a value the code holds -- the literal is interned, the result
+  never exists -- so both pass.
+- **A `var`.** Core makes one a `%Ref` cell, which is traced. It is a slot in
+  the Low IR whenever it does not escape, and in a giblet nothing can capture
+  it, so the contents' type is what is checked.
+- **A known instance's method.** `i < n` is a field of the `Ord Int`
+  dictionary in Core, and the dictionary is a heap object. The elaboration has
+  already chosen it, and specialization makes it a direct call.
+- **A class-polymorphic function's dictionary argument**, for the same reason.
+
+None of these is the rule failing to describe the collector; each is Core
+spelling something the Low IR does not have. That is the argument for keeping
+the rule, and also the thing to watch: they are all "Core says traced, the
+backend says not", which is the check being made one level above where the
+truth is.
+
+### 110. Every direct call rooted a null
+**performance, fixed.** TIX-63. `SsaLower.directCall` passes a leading
+`ConstInt(0)` at `traced(Ptr)` as the callee's environment, and
+`Turkey.Roots.across` counts a call's own operands as live across it -- rightly,
+since the callee holds them (the "circle of c" bug). So every direct call in
+every function gave that null a root slot and a store before the call. Found
+because a giblet calling another giblet came out with a root frame while
+holding nothing: the check that giblet code keeps no root is what finally
+asked the question. A traced constant is always a null, and a null names no
+object, so constants are no longer roots. Measured on `boot` compiling
+itself: 2,949,896 lines of assembly to 2,871,946, 2.6% of the whole output in
+root stores and frame-table entries for a null, and the compile time unchanged
+at 102s with the giblets summary added.
+
 ### 98. Two codes that meant the same thing, and a bit thrown away before it was read
 **bug, fixed.** TIX-61. The collector traced a slot whose three-bit layout code
 was `>= 6`, and 6 and 7 were `PTR` and `BOXED` -- both traced. So the two codes

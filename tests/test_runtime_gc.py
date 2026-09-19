@@ -21,8 +21,8 @@ def gc_probe(tmp_path_factory):
 int main(int argc, char **argv) {
     if (argc > 1) turkey_gc_set_stress(0);
     if (argc > 2) turkey_array_new(0, 0, 8, 0);
-    TurkeyString *s = turkey_string_new((const unsigned char *)"a", 1);
-    turkey_string_concat(s, s);
+    turkey_string_new((const unsigned char *)"a", 1);
+    turkey_string_new((const unsigned char *)"aa", 2);
     turkey_collect();
     turkey_gc_report();
     return 0;
@@ -63,8 +63,8 @@ def test_allocation_kinds_and_options_survive_stress_override(gc_probe, args):
     out = probe(gc_probe, "4", *args)
     count = 3 if len(args) == 2 else 2
     assert f"allocations {count}," in out
-    assert "by kind: string 2," in out
-    assert f"array {count - 2}," in out
+    # A string is a byte array since TIX-66, so it is counted as one.
+    assert f"array {count}," in out
     assert "next threshold 4096," in out
 
 
@@ -94,10 +94,11 @@ int main(void) {
             assert(!turkey_has_panicked);
             if (i % 137 == 0) turkey_collect();
             for (int j = 0; j < 96; j++) if (held[j]) {
-                TurkeyString *s = held[j];
+                TurkeyObject *s = held[j];
                 assert(find_header(s));
                 assert(!find_header((unsigned char *)s + 1));
-                if (s->length) assert(s->bytes[s->length - 1] == 'q');
+                if (s->count)
+                    assert(((unsigned char *)s->slots)[s->count - 1] == 'q');
             }
         }
         mark_epoch = UINT32_MAX;
@@ -120,7 +121,7 @@ int main(void) {
         turkey_collect();
         assert(heap_count == 1);
         assert(region_bytes == REGION_BYTES);
-        assert(((TurkeyString *)held[0])->bytes[30] == 'q');
+        assert(((unsigned char *)((TurkeyObject *)held[0])->slots)[30] == 'q');
     }
     turkey_root_leave(&frame);
     turkey_collect();
@@ -170,7 +171,7 @@ def code_probe(tmp_path_factory):
 #include "turkey_runtime.c"
 
 /* Whether a string referenced only from `holder` survives a collection. */
-static int survives(void *holder, TurkeyString *s) {
+static int survives(void *holder, void *s) {
     RootFrame frame;
     void *roots[1];
     roots[0] = holder;
@@ -182,13 +183,13 @@ static int survives(void *holder, TurkeyString *s) {
     return alive;
 }
 
-static void *array_holding(int32_t code, TurkeyString *s) {
+static void *array_holding(int32_t code, void *s) {
     TurkeyObject *a = turkey_array_new(1, 0, 8, code);
     a->slots[0] = (uint64_t)(uintptr_t)s;
     return a;
 }
 
-static void *object_holding(int32_t code, TurkeyString *s) {
+static void *object_holding(int32_t code, void *s) {
     /* One slot, so the three-bit metadata is the code itself. */
     TurkeyObject *o = turkey_object_new(0, 0, 1, (uint64_t)code);
     o->slots[0] = (uint64_t)(uintptr_t)s;
@@ -196,16 +197,16 @@ static void *object_holding(int32_t code, TurkeyString *s) {
 }
 
 int main(void) {
-    TurkeyString *a7 = turkey_string_new((const unsigned char *)"a7", 2);
+    void *a7 = turkey_string_new((const unsigned char *)"a7", 2);
     assert(survives(array_holding(7, a7), a7));
 
-    TurkeyString *a6 = turkey_string_new((const unsigned char *)"a6", 2);
+    void *a6 = turkey_string_new((const unsigned char *)"a6", 2);
     assert(!survives(array_holding(6, a6), a6));
 
-    TurkeyString *o7 = turkey_string_new((const unsigned char *)"o7", 2);
+    void *o7 = turkey_string_new((const unsigned char *)"o7", 2);
     assert(survives(object_holding(7, o7), o7));
 
-    TurkeyString *o6 = turkey_string_new((const unsigned char *)"o6", 2);
+    void *o6 = turkey_string_new((const unsigned char *)"o6", 2);
     assert(!survives(object_holding(6, o6), o6));
 
     return turkey_has_panicked != 0;

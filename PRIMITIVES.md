@@ -272,6 +272,14 @@ preserves the invariant. It is not "a sequence of characters" and not "a
 sequence of code points" -- the code points are a *view*, and so are the
 bytes, and later so are the graphemes.
 
+**Representation (TIX-66).** `String` is declared in `lib/Data/String/Type.gob`
+as a newtype over an exact-sized `Prim.Array Byte`, which both backends erase,
+so at run time a string is a byte array. The invariants are the library's:
+the constructor takes a `Prim.Array`, which only `lib/` can name, and every
+operation in this section is Turkey over the bytes rather than a `Prim.` name
+with a C body. Nothing the section specifies changed with it; the
+`Prim.string*` floor described in 7.2 is gone.
+
 ### 4.1 No indexing, and no `length` either
 
 No `Index String` instance, no `s[i]`. Agreed and already the plan.
@@ -515,7 +523,10 @@ predicate plus a total primitive (`Prim.floatCanParse` + `Prim.floatParse`,
 `Some`/`None` are already in scope. `Prim.stringConcatAll` was added for the
 builder.
 
-Removed: `Prim.stringLength`, `Prim.stringChars`.
+Removed: `Prim.stringLength`, `Prim.stringChars`. And since TIX-66 every other
+`Prim.string*` name, with `Prim.intToString` and `Prim.charToString`: a
+`String` is a byte array declared in the library, so each became Turkey in
+`Data.String`, `Data.Int` and `Data.Char` (section 4).
 Changed: `Prim.charFromInt` (reject surrogates), `Prim.floatDiv` (no panic),
 `Prim.intAdd`/`Sub`/`Mul`/`Neg` (range check), `Prim.floatToString`
 (specified spelling, not `repr`).
@@ -594,8 +605,9 @@ What does contain it is that `Prim.` is spellable only from a library module,
 so none of this reaches ordinary Turkey except through `Unsafe.Ptr`, whose
 name is then in the import list of every module that touches raw memory --
 Oberon's `SYSTEM` rule, and the same containment delta 70 relies on for
-`Prim.castAs`. TIX-63's checker is what will make it a property rather than a
-convention.
+`Prim.castAs`. That stays a convention. What TIX-63 made a property is a
+different and narrower thing: the giblet modules the collector is written in
+hold no traced value at all (SPEC-DELTAS 73).
 
 One more thing is undefined, and it arrives with delta 71's FFI: **what a C
 function does with a pointer after the call returns.** Handing one to `write`

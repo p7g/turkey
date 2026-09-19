@@ -473,7 +473,7 @@ fun main() { print(twice("a")) }
 """)
     kept = dictionaries(checked.mono)
     before = dictionaries(checked.core)
-    assert "%inst.Main#Semigroup.String" in kept
+    assert "%inst.Main#Semigroup.Data.String.Type#String" in kept
     assert "%inst.Main#Semigroup.Int" not in kept
     assert "%inst.Main#Semigroup.Int" in before, \
         "not a claim about the lowering"

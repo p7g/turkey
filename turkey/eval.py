@@ -55,7 +55,7 @@ from .decls import DeclTable
 from .errors import TurkeyPanic
 from .values import (
     UNIT, ArrayObj, Builtin, Cell, Closure, ConstructorFn, ConValue, RecordObj,
-    get_field, set_field, truth,
+    get_field, make_string, set_field, string_bytes, truth,
 )
 
 
@@ -157,7 +157,7 @@ class Evaluator:
         return method(e, env)
 
     def _eval_CLit(self, e: CLit, env: REnv):
-        return e.value
+        return make_string(e.value) if e.kind == "String" else e.value
 
     def _eval_CUnit(self, e: CUnit, env: REnv):
         return UNIT
@@ -351,6 +351,8 @@ def match_pattern(pat: ast.Pattern, value) -> dict[str, object] | None:
     if isinstance(pat, ast.PAnnot):
         return match_pattern(pat.pat, value)
     if isinstance(pat, ast.PLit):
+        if pat.kind == "String":
+            return {} if string_bytes(value) == pat.value.encode("utf-8") else None
         return {} if value == pat.value and type(value) is type(pat.value) else None
     if isinstance(pat, ast.PTuple):
         out: dict[str, object] = {}

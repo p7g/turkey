@@ -333,6 +333,10 @@ def test_math_module_agreement_is_not_assumed():
     assert round(2.5) == 2  # what Python would have said
     assert math.floor(-1.5) == -2
     assert out("fun main() { print(Float.floor(-1.5)) }") == "-2.0\n"
+    # The largest double below one half. `floor(x + 0.5)` rounds the addition
+    # up to 1.0 and answers 1; C's `round`, which the native side calls, says 0.
+    assert out("fun main() { print(Float.round(0.49999999999999994)) }") == "0.0\n"
+    assert out("fun main() { print(Float.round(-0.49999999999999994)) }") == "-0.0\n"
 
 
 def test_raw_memory_is_poisoned_and_never_reused():

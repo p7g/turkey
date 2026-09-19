@@ -112,8 +112,8 @@ def test_a_declaration_binds_the_name_at_the_type_it_states(probe):
 @pytest.mark.parametrize(
     "written", ["String", "Array Int", "a", "fun(Int) -> Int", "Option Int"])
 def test_only_the_seven_representable_types_cross(probe, written):
-    """`String` is the one worth naming: it is a `TurkeyString`, which is a
-    length and its bytes, and every C function that wants a string wants a
+    """`String` is the one worth naming: it is a heap array of bytes with no
+    terminator (TIX-66), and every C function that wants a string wants a
     `char *`. The copy is the caller's (`Unsafe.Ptr.toCString`)."""
     entry = probe((
         "module Unsafe.Probe (f)\n"

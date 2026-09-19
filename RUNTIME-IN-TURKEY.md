@@ -10,7 +10,8 @@ Two things TIX-61 leaves for the tickets after it. `Prim.ptrAlloc` and
 `Prim.ptrFree` are `malloc` and `free` behind two runtime calls, standing in
 until there is an FFI: TIX-62 declares both directly and deletes them. And the
 module gate is a gesture -- `lib/Unsafe/Ptr.gob` puts the name in the import
-list of anything touching raw memory -- not the checker TIX-63 will build.
+list of anything touching raw memory -- and stays one: what TIX-63 built checks
+a narrower thing, the giblet modules below.
 
 The FFI is now argued, per the recommendation at the foot of this document, as
 `PROPOSALS.md` item 8, and built: TIX-62 landed `foreign` as SPEC-DELTAS 71,
@@ -37,6 +38,36 @@ out of the port: a C `int` result is only half defined in an `Int`
 (FINDINGS 102), `canRead` was a race and is gone (103), and arguments were the
 one door into `String` that skipped the UTF-8 check (104).
 
+**Staging step 2 is done (TIX-66), smaller than planned and cheaper than
+feared.** The section was mostly strings, and rather than give Turkey the
+intrinsics to reach inside a `TurkeyString`, `String` stopped being primitive:
+it is `type String = String(Prim.Array Byte)` in `lib/Data/String/Type.gob`,
+erased by both backends, and every string operation is Turkey in `Data.String`,
+`Data.Int` and `Data.Char` -- run by the Python oracle rather than written a
+second time in it (FINDINGS 106). The reasoning and the survey are "Step 2"
+below. Sixteen string primitives are gone from both compilers with their C
+bodies, six libm wrappers became `foreign` declarations, a string literal pattern
+compares inline, and `array_parts` went with its callers, so C no longer reads
+`Data.Array`'s record. Two things stayed and were reclassified: the allocators,
+which fill headers over `heap_allocate` and so are the collector's interface
+(step 4, TIX-68), and float formatting and parsing (TIX-75).
+`runtime/turkey_runtime.c` went from 1451 lines to 1223. Measured cost, not
+optimized: `boot` compiling itself went from 165s to 204s, the byte loops now
+being Turkey where they were C; the Python oracle, running every corpus
+program with `--backend python`, went from 62s to 82s of CPU over the same 91
+programs, because a string operation there is interpreted Turkey over a list of
+ints where it was a Python `str` method.
+
+**Giblets are built (TIX-63).** The non-allocating code the collector needs
+is defined by the types it names, checked twice. Both compilers check a listed
+module's Core against the type rule (SPEC-DELTAS 73). `boot` then checks its
+Low IR for what the lowering added: `LowIr.summarize` finds every function
+that may allocate, and a giblet that does, or holds a root, stops the compile
+with the path to the allocation and a source location at each step. The first
+giblet module is `Turkey.Memory`. Whether the type rule is the right line is
+still being watched (FINDINGS 109): so far every place it bent was Core
+spelling something the backend does not have.
+
 It is smaller than the thirty-five below suggest. Under "depend on libc as
 little as possible" only about ten of them are an FFI problem at all, five are
 instruction selection (`frintm`/`frintp`/`frintn`/`frintz`), and the rest are
@@ -62,7 +93,7 @@ Measured, by section:
 
 | Section | Lines | What it needs beyond ordinary Turkey |
 |---|---:|---|
-| Values: strings, objects, arrays, boxes, closures | 546 | Raw loads and stores at an address |
+| Values: strings, objects, arrays, boxes, closures | 546 | Nothing, once `String` is a library type -- **done**, bar the allocators and float text |
 | GC: heap list, mark, sweep, root frames | 310 | Raw memory, **and must not allocate** |
 | The outside world: args, files, print, exit | 205 | Nothing but FFI -- **done**, bar the host's handoff state |
 | Entry and the big-stack thread | 106 | FFI, and a Turkey function as a C callback |
@@ -116,10 +147,10 @@ analysis**, and that is the real cost.
 **4. Callbacks.** A Turkey function usable as a C function pointer, for the
 signal handler and the thread entry. Needs the non-GC convention from (3).
 
-## Defining the subset, and what enforcing it costs
+## Defining giblets, the non-allocating code, and what enforcing it costs
 
 Two questions hide inside (3), they have different answers, and the second is
-where the cost estimate above came from. **What does the subset forbid**, and
+where the cost estimate above came from. **What does giblet code forbid**, and
 **how does the compiler know**.
 
 ### The leaf facts are already in the IR; the join is not
@@ -156,7 +187,7 @@ than Go's flood:
 What it is not free of is `Callee`, which has three shapes -- `Direct(String)`,
 `Runtime(String)` and `Indirect(Value)` -- and the third is a closure call with
 no known target. A summary must either call every indirect call allocating,
-which makes closures unusable inside the subset, or work out which closures
+which makes closures unusable in giblets, or work out which closures
 reach which call site, which is the expensive analysis Go's flood is an
 instance of.
 
@@ -193,14 +224,49 @@ draw. Our collector manipulates the heap as bytes: headers, mark bits, the free
 list, the frame table, root slots. That is a property of this collector rather
 than a general truth, and it is what buys the cheaper enforcement.
 
-**What must be verified before betting on it**, because the route stands on it:
-that the collector really is all-raw. The heap walk, the headers, the mark
-bits, the free list and the frame table all look it. The suspects are the panic
-and diagnostic path, which handles strings, and the hard-coded `ArrayStorage`
-slots and closure shape -- the same two that `NATIVE-BACKEND.md`'s record-layout
-section flags.
+### Measured: the collector is all-raw
 
-**What it costs is ergonomics inside the subset.** No `SomeError`, because
+TIX-63 names the thing: code in modules the compiler holds to this rule is
+**giblets** -- the innards under the skin -- and a module of it is a *giblet
+module*.
+
+The route stood on a claim -- that the collector really is all-raw -- and
+TIX-63 took the measurement before building anything on it. **It holds.**
+Nothing in the collector handles a managed value *as a value*; every managed
+object it touches is read as words and bitmaps at offsets it knows.
+
+* **One layout decoder.** `mark_children` (`runtime/turkey_runtime.c:352`) is
+  the only code that knows what a heap object looks like: a cell's
+  `pointer_value` flag, an array's element layout code in `tag`, a
+  constructor's 3-bit-per-slot layout, 1 bit per slot for everything else.
+  Words at fixed offsets, the same thing C does with a struct.
+* **The two suspects cleared.** `ArrayStorage` went with TIX-66, and the
+  closure shape `[code, env]` is only ever *built* by the allocator and
+  *walked* as an object with a bitmap -- no reader needs to know it is a
+  closure. The panic path the collector reaches is `turkey_panic(const char*)`
+  (653), which takes a C string; `turkey_panic_string` (661), the one entry that
+  reads a Turkey `String`, is not reachable from collector code.
+
+So the by-types route is the right one. What the measurement found
+instead is a list of *missing pieces*, none of which is an argument for an
+effect:
+
+| gap | where | what fills it |
+|---|---|---|
+| the frame address | `scan_native_frames` (480) uses `__builtin_frame_address` | a primitive |
+| unsigned 32-bit loads, `ctz` | `HeapHeader`'s `kind`/`marked`; the free-bit search (151, 527) | primitives |
+| bulk fill and copy | `memset`/`memcpy` across the sweep and allocators | loops in a giblet module, or `foreign` |
+| region memory | `aligned_alloc` (136), `realloc` for the mark stack (341) | `foreign` declarations |
+| sorting the frame table | `qsort` with a C comparator (439) | a hand-written sort, not a callback |
+| formatted diagnostics | `snprintf` in `mark_grey` (325), `fprintf` stats (595-627) | `write` and hand formatting; SPEC-DELTAS 71 declines variadics |
+| the collector's state | every heap, root and mark global is a C `static` | an untraced global -- arm64 already emits one as a plain word rather than a root slot (`Turkey.Emit.emitData`) -- holding a `Prim.Ptr` to `malloc`ed state, initialized before the first allocation |
+
+The allocators, reclassified as the collector's by TIX-66, are the one place
+where giblet code meets a managed reference, and they are where the type rule
+had to be checked hardest. It holds there too, with one change to lowering;
+"What stays in C, and whose it is" below has the design.
+
+**What it costs is ergonomics inside giblets.** No `SomeError`, because
 packing allocates; no `?`; no `Show`; sentinel returns and raw pointer
 arithmetic. Against idiomatic Turkey that is a severe dialect. Against the 310
 lines of C it replaces it is a wash -- and Modula-3's claim is that it need not
@@ -297,7 +363,7 @@ traced by the garbage collector. In most other respects, traced and untraced
 references behave identically."
 
 Traced and untraced references, which is exactly `Rep.traced`, in a language
-from 1989. The last sentence is also the ergonomic claim the subset-by-types
+from 1989. The last sentence is also the ergonomic claim the by-types
 route is betting on, from the one system that shipped it.
 
 **Zig** has no GC, so it answers (1) and (2) and says nothing about (3), which
@@ -314,13 +380,144 @@ at any point with the rest still in C.
    the C. *Done (TIX-65); the argument and exit state stayed, as step 3's.*
 2. **Values, 546 lines.** Needs raw loads and stores but allocates normally, so
    it is ordinary managed Turkey with a pointer type. The largest section and
-   the second easiest.
+   the second easiest. *Done (TIX-66), and it needed no raw memory at all:
+   `String` became a library type over a byte array. The allocators and the
+   float text stayed, as step 4's and TIX-75's.*
 3. **Entry and crash diagnostics, 160 lines.** Needs callbacks.
-4. **The collector, 310 lines.** Needs the low-level subset and its
+4. **The collector, 310 lines.** Needs giblets and their
    enforcement. Last, and the only one that requires (3).
 
 Stopping after 1 and 2 leaves 470 lines of C -- the collector, the entry, the
 signal handler -- and is 60% of the way with none of the hard machinery.
+
+## Step 2: `String` stops being primitive
+
+The values section is mostly strings: twenty-odd C functions behind as many
+`Prim.string*` names, over a `TurkeyString` layout nothing else in the program
+can see. Writing those functions in Turkey over raw pointers would need a way
+from a `String` to its address, an uninitialized-string allocator and a store
+into one -- intrinsics, every one, and each a thing the Python oracle would have
+to model a second time, since its strings are host `str`s.
+
+**Decided instead: `String` is a library type over a byte array, and keeps its
+own invariants.**
+
+```
+type String = String(Prim.Array Byte)     -- lib/Data/String/Type.gob
+```
+
+Immutable and well-formed UTF-8 by construction, the way `Data.String`'s doors
+already promise, with the constructor reachable only from `lib/` because
+`Prim.Array` is. Every operation is then ordinary Turkey over an array, the C
+and the primitives go, and the oracle runs the *same* Turkey instead of its own
+`str` implementations -- so the differential covers the string code for the
+first time rather than comparing two unrelated implementations of it. `Bool` is
+the precedent for a type declared in `lib/` that both compilers still name.
+
+Performance is not an input. A byte loop is what `memcmp` is too, inlining is
+aggressive here, and vectorizing it is a later change inside one module.
+
+### The one representation question, surveyed
+
+Exact-sized array, or `(array, offset, length)` with shared backing? The second
+buys O(1) slicing. The peers split, and the split has a history:
+
+* **Rust.** `String` is "a pointer to some bytes, a length, and a capacity" --
+  a `Vec<u8>` -- and "`String`s are always valid UTF-8", an invariant the type
+  keeps and `from_utf8_unchecked` is `unsafe` for bypassing: violating it "may
+  cause memory unsafety issues with future users of the `String`, as the rest
+  of the standard library assumes that `String`s are valid UTF-8". Owned, not
+  shared; sharing is `&str`, a borrow, which Turkey does not have.
+* **Haskell `text`.** `Text` is an array, an offset and a length, so slicing is
+  O(1). 2.0 moved the array from UTF-16 to UTF-8; Channable's data set went from
+  3.08 GiB to 1.55 GiB. A library type over a byte array, exactly this shape,
+  with sharing.
+* **Java.** A library class over an array, and the counterexample: 7u6
+  *removed* `offset` and `count` and made `substring` copy, because a small
+  substring kept its whole parent alive -- sharing turned O(1) slicing into a
+  leak. JEP 254 (compact strings) then measured `char[]` at 10–45% of live data
+  across 960 heap dumps, and got 5–15% back by going to `byte[]`.
+* **Go.** A built-in `(pointer, length)` header, substrings share, and Go 1.18
+  added `strings.Clone` for the leak Java removed sharing over: "it guarantees
+  to make a copy of s into a new allocation, which can be important when
+  retaining only a small substring of a much larger string."
+* **OCaml.** A primitive block; `Bytes.create` then `Bytes.unsafe_to_string` is
+  the mutate-then-freeze route this design gets for free, because a `String`
+  is built into an array the builder owns and nothing else sees.
+
+Go and OCaml differ because their strings are primitive and their runtimes are
+C and assembly -- the arrangement this step exists to leave.
+
+**Exact-sized, in a newtype.** Both backends erase a single-field newtype
+(`DeclTable.newtypes`), so a `String` *is* a kind-2 byte array at run time with
+no wrapper object -- `(array, offset, length)` would be a three-field record, an
+extra object on every string, and Java's leak. Slicing copies, as it does today.
+The cost, recorded rather than optimized: the header goes from `TurkeyString`'s
+8 bytes to an array's 24.
+
+### Literal patterns
+
+`match s { "let" -> … }` compares against a string the compiler knows. Today it
+is a call to `turkey_string_eq`, and with the C gone there are three routes: a
+Core rewrite to an equality test, a call to the Turkey `eq` by symbol, or
+comparing inline. Core keeps patterns as nested AST (`CMatch`'s note declines
+exactly this rewrite), and a call by symbol needs a binding kept alive past
+`mono` and `opt` that no program references. **Inline:** a length test, then one
+byte compare per byte of the literal -- what a C compiler makes of `memcmp`
+against a short constant. No call, no safepoint, and the literals in patterns
+are keywords.
+
+### What stays in C, and whose it is
+
+* **The allocators** -- `object_new`, `array_new`, `cell_new`, `box`/`unbox`,
+  `closure_new` and the entry's literal interning. They fill headers over
+  `heap_allocate`, which is the collector's safepoint and its region allocator,
+  and a managed object cannot come from `malloc`: it needs a header and an
+  allocation bit in a region the collector owns. They are the collector's
+  allocation interface and move with step 4. The closure shape, `[code, env]`,
+  stays pinned there.
+* **Float formatting and parsing** -- `float_to_string`, `float_parse` and
+  `float_can_parse`, TIX-75's, because `snprintf` and `strtod` never become
+  foreign declarations. They read and build the new representation meanwhile.
+
+`array_parts` and its hard-coded `ArrayStorage` slots go with their three
+callers, so nothing in C reads `Data.Array`'s record any more.
+
+### The allocators as giblet code
+
+Decided under TIX-63 and built with step 4 (TIX-68). An allocator makes a
+managed reference, and giblet code may not name a traced type -- so this is
+where the type rule was most likely to break. It does not, and the reasons are
+worth stating because two of them are invariants the collector must keep.
+
+* **Operands arrive untraced, and that is safe.** `array_new`'s fill value and
+  `cell_new`'s value may be managed pointers; a giblet allocator receives them
+  as `Int` or `Prim.Ptr`. That is sound for two reasons, and both are
+  load-bearing: the *caller* roots every operand across the call
+  (`Turkey.Roots.across` counts the instruction's own uses), and the collector
+  **does not move objects**, so a pointer held in an untraced register still
+  names the same object afterwards. A moving collector would break this, and
+  would have to revisit the allocator interface first.
+* **Results leave untraced, and become traced at the opcode.** A giblet
+  allocator returns `Prim.Ptr`. The generated code's `ObjectNew` or `ArrayNew`
+  already has a `traced(Ptr)` result, so the conversion happens at the
+  boundary between opcode and allocator -- nowhere in source, and `checkReps`
+  still forbids making a traced pointer from an address everywhere else.
+* **`closure_new` is split in lowering.** It is the one allocator that makes
+  *two* objects, and it keeps the environment alive across the closure's
+  allocation with a C root frame (`runtime/turkey_runtime.c:837-849`). Giblet
+  code can hold that environment only as an untraced `Prim.Ptr`, which a
+  collection in between would free. So `ClosureNew` becomes two single-object
+  allocations in the *generated* code, where the environment is an ordinary
+  rooted value. Every allocator then calls `heap_allocate` exactly once and
+  holds nothing managed across it, and the type rule needs no exception.
+* **Linkage is the callback mechanism.** Generated code reaches the allocators
+  by symbol at the C ABI (`Turkey.Select.runtimeCall`). A Turkey direct call
+  passes a leading environment, and a binding nothing references does not
+  survive `mono` and `opt`. So a Turkey allocator needs a C-callable export
+  that is kept alive -- which is exactly what TIX-67 builds for the signal
+  handler and the thread entry. That makes TIX-67 a prerequisite of TIX-68 for
+  a reason beyond ordering.
 
 ## The risk worth naming
 
@@ -346,7 +543,7 @@ runtime rewrite becomes a *user* of it rather than the reason for it. That also
 makes it testable independently -- a program that calls `getenv` is a test, and
 does not need a collector rewritten first.
 
-**The low-level subset should wait for a reason beyond this.** It is the piece
+**Giblets should wait for a reason beyond this.** It is the piece
 that pays for the collector and nothing else, its true cost is a whole-program
 enforcement pass on Go's evidence, and the collector is the one section where
 being wrong is silent. Neither M28 nor M29 needs it: stage1, stage2 and stage3
@@ -358,7 +555,7 @@ collector is in.
 halves and are the smallest of the three pieces, and the `traced` bit that makes
 them expressible is already in the IR. If any of this is done, it is first.
 
-**The subset is defined by types, not by an effect on functions.** Decided, on
+**Giblets are defined by types, not by an effect on functions.** Decided, on
 the reasoning under "By effect, or by type": the collector manipulates the heap
 as bytes rather than as Turkey values, so "names no traced type" forbids
 everything "does not allocate" was meant to forbid, and it is checked locally
@@ -391,6 +588,14 @@ second one built alongside.
   <https://rpython.readthedocs.io/en/latest/rffi.html>
 - Modula-3, safe and unsafe modules, traced and untraced references:
   <https://www.opencm3.net/doc/reference/intro.html>
+- Rust's `String` and its UTF-8 invariant:
+  <https://doc.rust-lang.org/std/string/struct.String.html>
+- Haskell `text`, and its move to UTF-8: <https://hackage.haskell.org/package/text>,
+  <https://www.channable.com/tech/so-long-surrogatesa>
+- Java's `substring` stopping sharing in 7u6:
+  <https://www.infoq.com/news/2013/12/oracle-tunes-java-string>; compact strings
+  and their measurement: <https://openjdk.org/jeps/254>
+- Go's `strings.Clone`: <https://pkg.go.dev/strings#Clone>
 - Oberon, the SYSTEM pseudo-module: <http://www.ethoberon.ethz.ch/SYSTEM.html>,
   and Wirth on why it is a module:
   <https://people.inf.ethz.ch/wirth/Articles/Modula-Oberon-June.doc>

@@ -507,7 +507,7 @@ def test_class_evidence_is_called_at_the_skolems_layout(monkeypatch, capfd):
             evidence=["d"]))
         by = {make: ty for ty, make, _ in payloads(p)}
         cases = (("Main#ints", "Int"), ("Main#floats", "Float"),
-                 ("Main#strings", "String"), ("Main#bools", "Data.Bool.Type#Bool"))
+                 ("Main#strings", "Data.String.Type#String"), ("Main#bools", "Data.Bool.Type#Bool"))
         p.main(p.seq(*[
             p.call(p.ref("Main#visit"),
                    p.pack("Main#Shown", by[make],
@@ -601,7 +601,7 @@ def test_a_generic_body_packing_a_bare_variable_is_copied_per_layout(
             evidence=["d"]))
         by = {make: ty for ty, make, _ in payloads(p)}
         cases = (("Main#ints", "Int"), ("Main#floats", "Float"),
-                 ("Main#strings", "String"), ("Main#bools", "Data.Bool.Type#Bool"))
+                 ("Main#strings", "Data.String.Type#String"), ("Main#bools", "Data.Bool.Type#Bool"))
         p.main(p.seq(*[
             p.call(p.ref("Main#visit"), p.call(
                 p.ref("Main#packOne", by[make]),

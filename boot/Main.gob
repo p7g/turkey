@@ -50,6 +50,7 @@ import Turkey.Coretc as Coretc
 import Turkey.Mono as Mono
 import Turkey.Joins as Joins
 import Turkey.Layout as Layout
+import Turkey.Giblets as Giblets
 import Turkey.Arm64 as Arm64
 import Turkey.Select as Select
 import Turkey.Regalloc as Regalloc
@@ -286,6 +287,10 @@ fun lowered(checked : Checked) -> Core.CProgram {
     let program = Lower.program(lowerer, checked.ordered)
     Coretc.checkProgram(checked.decls, checked.classes, program,
                         Coretc.globalsOf(checked.env))
+    -- The giblet modules hold no traced value, which is a question about the
+    -- types of their code, and Core is where every node has one. See
+    -- `Turkey.Giblets`.
+    Giblets.checkProgram(program, checked.decls)
     program
 }
 
@@ -353,6 +358,16 @@ fun dumpOpt(b : String.Builder, path : String) -> Unit {
     String.push(b, Core.showProgram(optimized, Some(entry.name)))
 }
 
+-- The Low IR, and the giblets check on it. Every path that lowers comes through
+-- here, so a giblet that allocates stops the compile whichever backend was
+-- asked for (TIX-63).
+fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable, path : String)
+        -> (SsaLower.Module, Array SsaLower.Unsupported) {
+    let (module_, skipped) = SsaLower.lowerProgram(program, decls)
+    Giblets.checkLowered(module_.functions, path)
+    (module_, skipped)
+}
+
 -- The program as arm64 assembly (`NATIVE-BACKEND.md` M28 phase 5).
 --
 -- `asm` above prints the machine IR and its measurements -- virtual
@@ -371,7 +386,7 @@ fun dumpOpt(b : String.Builder, path : String) -> Unit {
 fun dumpNative(b : String.Builder, path : String) -> Unit {
     let (checked, entry) = checkProgram(path)
     let program = optimized(checked, entry)
-    let (module_, skipped) = SsaLower.lowerProgram(program, checked.decls)
+    let (module_, skipped) = lowerModule(program, checked.decls, path)
     if len(skipped) > 0 {
         String.push(b, "// === " + path + "\n// FAILED: "
                        + Int.toString(len(skipped)) + " bindings did not lower\n")
@@ -424,7 +439,7 @@ fun dumpNative(b : String.Builder, path : String) -> Unit {
 fun dumpAsm(b : String.Builder, path : String) -> Unit {
     let (checked, entry) = checkProgram(path)
     let program = optimized(checked, entry)
-    let (module_, skipped) = SsaLower.lowerProgram(program, checked.decls)
+    let (module_, skipped) = lowerModule(program, checked.decls, path)
     if len(skipped) > 0 {
         String.push(b, "; === " + path + "\n; FAILED: "
                        + Int.toString(len(skipped)) + " bindings did not lower\n")
@@ -649,7 +664,7 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
 fun dumpLlvm(b : String.Builder, path : String) -> Unit {
     let (checked, entry) = checkProgram(path)
     let program = optimized(checked, entry)
-    let (module_, skipped) = SsaLower.lowerProgram(program, checked.decls)
+    let (module_, skipped) = lowerModule(program, checked.decls, path)
     if len(skipped) > 0 {
         -- Emitting a module with a function missing would produce a link
         -- error a long way from its cause. Reported rather than fatal, so one
@@ -692,7 +707,7 @@ fun dumpLlvm(b : String.Builder, path : String) -> Unit {
 fun dumpSsa(b : String.Builder, path : String) -> Unit {
     let (checked, entry) = checkProgram(path)
     let program = optimized(checked, entry)
-    let (module_, skipped) = SsaLower.lowerProgram(program, checked.decls)
+    let (module_, skipped) = lowerModule(program, checked.decls, path)
     let functions = module_.functions
     -- The storage the initializer writes. Printed first because a function
     -- below refers to it, and because a global's *representation* is the fact

@@ -505,6 +505,17 @@ the rule, and also the thing to watch: they are all "Core says traced, the
 backend says not", which is the check being made one level above where the
 truth is.
 
+### 110. Every direct call rooted a null
+**performance, fixed.** TIX-63. `SsaLower.directCall` passes a leading
+`ConstInt(0)` at `traced(Ptr)` as the callee's environment, and
+`Turkey.Roots.across` counts a call's own operands as live across it -- rightly,
+since the callee holds them (the "circle of c" bug). So every direct call in
+every function gave that null a root slot and a store before the call. Found
+because a giblet calling another giblet came out with a root frame while
+holding nothing: the check that giblet code keeps no root is what finally
+asked the question. A traced constant is always a null, and a null names no
+object, so constants are no longer roots.
+
 ### 98. Two codes that meant the same thing, and a bit thrown away before it was read
 **bug, fixed.** TIX-61. The collector traced a slot whose three-bit layout code
 was `>= 6`, and 6 and 7 were `PTR` and `BOXED` -- both traced. So the two codes

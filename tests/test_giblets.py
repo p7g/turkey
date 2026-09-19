@@ -179,3 +179,71 @@ def test_both_compilers_keep_the_same_list():
     found = re.search(r"^let giblets = \[(.*?)\]", source, re.M | re.S)
     assert found is not None
     assert set(re.findall(r'"([^"]+)"', found.group(1))) == set(GIBLET_MODULES)
+
+
+# -- after lowering (boot) ---------------------------------------------------
+#
+# The type rule cannot see what the lowering adds, so `boot` asks the question
+# again of the Low IR. Python has no Low IR, so these are `boot`'s alone.
+
+
+@pytest.fixture
+def lowered(request, tmp_path):
+    """A giblet probe and an ordinary one beside it, lowered by `boot`."""
+    digest = hashlib.sha1(request.node.name.encode()).hexdigest()[:10]
+    giblet = LIB / "Turkey" / f"Probe_giblet_{digest}.gob"
+    helper = LIB / "Turkey" / f"Probe_helper_{digest}.gob"
+    entry = tmp_path / "main.gob"
+    # Called from `main`, since specialization keeps only what is reachable.
+    entry.write_text(f"import Turkey.Probe_giblet_{digest} as P\n"
+                     f"fun main() {{ print(Int.toString(P.f(3))) }}\n",
+                     encoding="utf-8")
+
+    def lower(giblet_body: str, helper_body: str) -> tuple[int, str, str]:
+        helper.write_text(f"module Turkey.Probe_helper_{digest} (h)\n\n"
+                          + helper_body, encoding="utf-8")
+        giblet.write_text(f"module Turkey.Probe_giblet_{digest} (f)\n\n"
+                          f"import Turkey.Probe_helper_{digest} as H\n"
+                          + giblet_body, encoding="utf-8")
+        env = dict(os.environ, **{HOOK: f"Turkey.Probe_giblet_{digest}"})
+        result = subprocess.run([str(bootc.binary()), "ssa", str(entry)],
+                                cwd=REPO_ROOT, env=env, capture_output=True,
+                                text=True)
+        return result.returncode, result.stdout, result.stderr
+
+    try:
+        yield lower
+    finally:
+        giblet.unlink(missing_ok=True)
+        helper.unlink(missing_ok=True)
+
+
+def test_a_call_that_allocates_is_refused_with_the_path_to_it(lowered):
+    """`h` names nothing traced, so the type rule passes the call; its body
+    builds an array, which is the allocation the type rule cannot see."""
+    code, _, stderr = lowered(
+        "fun f(n : Int) -> Int = H.h(n)\n",
+        # Recursive, so it is a loop breaker and is never inlined: the call
+        # survives to the Low IR, and the diagnostic has a path to print.
+        "fun h(n : Int) -> Int = if n == 0 { len([n, n]) } else { h(n - 1) }\n")
+    assert code != 0
+    assert "giblets: f is in a giblet module and may allocate: @f calls @h, " \
+           "which allocates (array.new)" in stderr, stderr
+
+
+def test_a_giblet_calling_a_giblet_holds_no_root(lowered):
+    """The null environment a direct call passes is traced; it is not a root
+    (`Turkey.Roots.root`), or every giblet that called anything would need a
+    frame the collector must walk."""
+    code, stdout, stderr = lowered(
+        "fun g(n : Int) -> Int = n\n"
+        "fun f(n : Int) -> Int = g(n) + H.h(n)\n",
+        "fun h(n : Int) -> Int = n\n")
+    assert code == 0, stderr
+    assert "Probe_giblet_" in stdout
+
+
+def test_the_first_giblet_module_lowers_clean():
+    stdout = bootc.boot("ssa", "tests/programs/giblets_memory.gob")
+    assert "fun @Turkey.Memory#fill(" in stdout
+

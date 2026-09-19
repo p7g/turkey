@@ -1,4 +1,4 @@
-module Turkey.Giblets (gibletModules, checkPlacement, traced, checkProgram)
+module Turkey.Giblets (gibletModules, checkPlacement, traced, checkProgram, checkLowered)
 
 -- Giblets: modules whose code holds no traced value (TIX-63, SPEC-DELTAS 73).
 -- `turkey/giblets.py` is the other implementation and says why at length; the
@@ -28,6 +28,10 @@ import Turkey.Ast (Lit(..))
 import Turkey.Decls (DeclTable(..))
 import Turkey.Diag as Diag
 import Turkey.Layout as Layout
+import Turkey.LowIr as LowIr
+import Turkey.LowIr (Low(..), Allocation(..))
+import Turkey.Roots as Roots
+import Turkey.Ssa as Ssa
 import Turkey.Source (Span)
 import Turkey.Types as Ty
 
@@ -300,3 +304,69 @@ fun describe(e : Core) -> String = match e.kind {
 }
 
 fun oops(message : String) -> a = Diag.fail(Diag.whole("internal error", message), "")
+
+-- -- after lowering --------------------------------------------------------------
+
+-- The check again, on what the lowering made of the same code.
+--
+-- The type rule says a giblet names nothing traced; it cannot say that the
+-- lowering added nothing. Boxing at a polymorphic boundary, a dictionary
+-- specialization left generic, a call to an ordinary function that allocates
+-- -- none of these is written in a giblet, and each is an allocation in one.
+-- So this asks the question the rule was a proxy for, of the Low IR: does a
+-- giblet function allocate, call anything that does, or hold a root. The
+-- Python compiler has no Low IR to ask it of; this half is `boot`'s alone.
+fun checkLowered(functions : Array (Ssa.Func Low), path : String) -> Unit {
+    let modules = gibletModules()
+    let summary = LowIr.summarize(functions)
+    for f in functions {
+        if Set.contains(modules, moduleOf(f.name)) {
+            match Map.get(summary, f.name) {
+                Some(_) -> refuse(f.name + " is in a giblet module and may "
+                                  + "allocate: " + chain(summary, f.name), path)
+                None -> {}
+            }
+            -- What nothing allocates can still hold a traced value across a
+            -- call; the collector would then have to find it, and a giblet
+            -- has no root frame for it to be found in.
+            if len(Map.keys(Roots.analyze(f).slots)) > 0 {
+                refuse(f.name + " is in a giblet module and holds a traced "
+                       + "value across a call", path)
+            }
+        }
+    }
+}
+
+-- `@f calls @g, which calls @h, which allocates: object.new` -- the path the
+-- summary recorded, which is a shortest one.
+fun chain(summary : Map String Allocation, start : String) -> String {
+    let out = String.builder()
+    var name = start
+    var going = True
+    String.push(out, "@" + start)
+    while going {
+        match Map.get(summary, name) {
+            Some(CallsAllocating(callee)) -> {
+                String.push(out, " calls @" + callee + ", which")
+                name = callee
+            }
+            Some(Allocates(what)) -> {
+                String.push(out, " " + what)
+                going = False
+            }
+            None -> { going = False }
+        }
+    }
+    String.build(out)
+}
+
+-- A symbol's module: `Turkey.Memory#fill`, `Turkey.Memory#fill@Int` and
+-- `Turkey.Memory#fill%lambda3` all belong to `Turkey.Memory`.
+fun moduleOf(symbol : String) -> String {
+    let parts = String.split(symbol, "#")
+    if len(parts) > 1 { parts[0] } else { "" }
+}
+
+fun refuse(message : String, path : String) -> a =
+    Diag.fail(Diag.whole("giblets", Diag.short(message)), path)
+

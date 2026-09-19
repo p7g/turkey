@@ -72,6 +72,7 @@ fun liveAt(frame : Frame, b : Int, n : Int) -> Array (Int, Int) {
 -- stops a cold path deciding what a hot one pays (FINDINGS 55).
 fun analyze(f : Func Low) -> Frame {
     let live = Ssa.liveness(f)
+    let constants = constantsOf(f)
     let needed = Set.new()
     let at = Map.new()
     for var b = 0; b < len(f.blocks); b = b + 1 {
@@ -79,7 +80,8 @@ fun analyze(f : Func Low) -> Frame {
         let insts = Ssa.blockAt(f, BlockId(b)).insts
         for var n = 0; n < len(insts); n = n + 1 {
             if isSafepoint(insts[n].op) {
-                let here = Array.sort(Set.elements(across(f, after[n], insts[n])))
+                let here = Array.sort(Set.elements(
+                    across(f, constants, after[n], insts[n])))
                 for id in here { Set.add(needed, id) }
                 Map.put(at, key(b, n), here)
             }
@@ -110,20 +112,40 @@ fun analyze(f : Func Low) -> Frame {
 -- Both halves are stated in `turkey/llvmgen._safepoint_live`'s comment, which
 -- is where this should have been read from rather than reasoned out
 -- (FINDINGS 69).
-fun across(f : Func Low, live : Set.Set Int, i : Low) -> Set.Set Int {
+fun across(f : Func Low, constants : Set.Set Int, live : Set.Set Int,
+           i : Low) -> Set.Set Int {
     let out = Set.new()
     for id in Set.elements(live) {
-        if id != Ssa.valueId(i.result) && traced(f, id) { Set.add(out, id) }
+        if id != Ssa.valueId(i.result) && root(f, constants, id) { Set.add(out, id) }
     }
     for v in Ssa.uses(i) {
         let id = Ssa.valueId(v)
-        if id != Ssa.valueId(i.result) && traced(f, id) { Set.add(out, id) }
+        if id != Ssa.valueId(i.result) && root(f, constants, id) { Set.add(out, id) }
     }
     out
 }
 
-fun traced(f : Func Low, id : Int) -> Bool =
-    if id < 0 || id >= len(f.reps) { False } else { f.reps[id].traced }
+-- A traced value the collector has something to find at. A constant is not
+-- one: a traced constant is always a null -- the environment every direct call
+-- passes, or the fill of a fresh pointer array -- and a null names no object. Rooting it cost a store per call site
+-- and gave a giblet function, which holds nothing, a root frame anyway
+-- (TIX-63).
+fun root(f : Func Low, constants : Set.Set Int, id : Int) -> Bool =
+    if id < 0 || id >= len(f.reps) { False }
+    else { f.reps[id].traced && !Set.contains(constants, id) }
+
+fun constantsOf(f : Func Low) -> Set.Set Int {
+    let out = Set.new()
+    for block in f.blocks {
+        for i in block.insts {
+            match i.op {
+                ConstInt(_) -> Set.add(out, Ssa.valueId(i.result))
+                _ -> {}
+            }
+        }
+    }
+    out
+}
 
 -- An operation the collector may run inside.
 --
@@ -141,6 +163,12 @@ fun isSafepoint(op : Op) -> Bool = match op {
     ArrayNew(_, _, _) -> True
     CellNew(_) -> True
     ClosureNew(_, _, _) -> True
+    -- These two are safepoints here and are not allocations in
+    -- `LowIr.effectsOf`, the one place the lists disagree, and they answer
+    -- different questions. `Unbox` is a call into the runtime and every call
+    -- is listed; `ClosureCapture` is an inline store in `Turkey.Select` and is
+    -- listed in the direction that costs a store rather than a freed object.
+    -- The giblets check asks "may this allocate" and so reads `effectsOf`.
     ClosureCapture(_, _, _) -> True
     Box(_) -> True
     Unbox(_) -> True

@@ -814,6 +814,14 @@ class Parser:
 
     def parse_con_pattern(self) -> ast.Pattern:
         tok = self.expect("CONID")
+        # Qualified as in an expression, `G.Point(x, y)`, and resolved the
+        # same way (delta 43): a constructor imported only under a qualifier
+        # could not otherwise be matched at all.
+        parts = [tok.text]
+        while self.at(".") and self.peek(1).kind == "CONID":
+            self.advance()
+            parts.append(self.advance().text)
+        con = ".".join(parts)
         if self.at("{"):
             self.advance()
             self.skip_newlines()
@@ -838,7 +846,7 @@ class Parser:
                 if not self.field_separator():
                     break
             self.expect("}")
-            return ast.PRecord(tok.span, tok.text, fields, rest)
+            return ast.PRecord(tok.span, con, fields, rest)
 
         args: list[ast.Pattern] = []
         if self.at("("):
@@ -853,11 +861,11 @@ class Parser:
             # not any more, and it fails as a pattern that simply ends early,
             # so say what happened rather than reporting the next token.
             raise ParseError(
-                f"constructor pattern '{tok.text}' must parenthesize its "
-                f"arguments: write '{tok.text}(...)'",
+                f"constructor pattern '{con}' must parenthesize its "
+                f"arguments: write '{con}(...)'",
                 self.cur.span,
             )
-        return ast.PCon(tok.span, tok.text, args)
+        return ast.PCon(tok.span, con, args)
 
     # -- expressions --------------------------------------------------------
 

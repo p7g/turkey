@@ -32,7 +32,7 @@ import Turkey.LowIr as LowIr
 import Turkey.LowIr (Low(..), Allocation(..))
 import Turkey.Roots as Roots
 import Turkey.Ssa as Ssa
-import Turkey.Source (Span)
+import Turkey.Source (Span, showSpan)
 import Turkey.Types as Ty
 
 -- The giblet modules. A list rather than a convention or a declaration form:
@@ -319,11 +319,13 @@ fun oops(message : String) -> a = Diag.fail(Diag.whole("internal error", message
 fun checkLowered(functions : Array (Ssa.Func Low), path : String) -> Unit {
     let modules = gibletModules()
     let summary = LowIr.summarize(functions)
+    let byName = Map.new()
+    for f in functions { Map.put(byName, f.name, f) }
     for f in functions {
         if Set.contains(modules, moduleOf(f.name)) {
             match Map.get(summary, f.name) {
                 Some(_) -> refuse(f.name + " is in a giblet module and may "
-                                  + "allocate: " + chain(summary, f.name), path)
+                                  + "allocate: " + chain(byName, summary, f.name), path)
                 None -> {}
             }
             -- What nothing allocates can still hold a traced value across a
@@ -337,27 +339,40 @@ fun checkLowered(functions : Array (Ssa.Func Low), path : String) -> Unit {
     }
 }
 
--- `@f calls @g, which calls @h, which allocates: object.new` -- the path the
--- summary recorded, which is a shortest one.
-fun chain(summary : Map String Allocation, start : String) -> String {
+-- The path the summary recorded, which is a shortest one, each step with the
+-- source it came from:
+--
+--     @f calls @g (Turkey/A.gob:3:5), which builds an array (Turkey/B.gob:9:12)
+fun chain(functions : Map String (Ssa.Func Low), summary : Map String Allocation,
+          start : String) -> String {
     let out = String.builder()
     var name = start
     var going = True
     String.push(out, "@" + start)
     while going {
         match Map.get(summary, name) {
-            Some(CallsAllocating(callee)) -> {
-                String.push(out, " calls @" + callee + ", which")
+            Some(CallsAllocating(callee, site)) -> {
+                String.push(out, " calls @" + callee + where(functions, name, site)
+                                 + ", which")
                 name = callee
             }
-            Some(Allocates(what)) -> {
-                String.push(out, " " + what)
+            Some(Allocates(what, site)) -> {
+                String.push(out, " " + what + where(functions, name, site))
                 going = False
             }
             None -> { going = False }
         }
     }
     String.build(out)
+}
+
+fun where(functions : Map String (Ssa.Func Low), name : String, site : Int)
+        -> String = match Map.get(functions, name) {
+    Some(f) -> match Map.get(f.origins, site) {
+        Some(s) -> " (" + s.file + ":" + showSpan(s) + ")"
+        None -> ""
+    }
+    None -> ""
 }
 
 -- A symbol's module: `Turkey.Memory#fill`, `Turkey.Memory#fill@Int` and

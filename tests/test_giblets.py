@@ -227,8 +227,11 @@ def test_a_call_that_allocates_is_refused_with_the_path_to_it(lowered):
         # survives to the Low IR, and the diagnostic has a path to print.
         "fun h(n : Int) -> Int = if n == 0 { len([n, n]) } else { h(n - 1) }\n")
     assert code != 0
-    assert "giblets: f is in a giblet module and may allocate: @f calls @h, " \
-           "which allocates (array.new)" in stderr, stderr
+    assert "giblets: f is in a giblet module and may allocate: @f calls @h " \
+           "(" in stderr, stderr
+    assert re.search(r"@f calls @h \([^)]*Probe_giblet_\w+\.gob:4:\d+\), which "
+                     r"builds an array \([^)]*Probe_helper_\w+\.gob:3:\d+\)",
+                     stderr), stderr
 
 
 def test_a_giblet_calling_a_giblet_holds_no_root(lowered):
@@ -246,4 +249,5 @@ def test_a_giblet_calling_a_giblet_holds_no_root(lowered):
 def test_the_first_giblet_module_lowers_clean():
     stdout = bootc.boot("ssa", "tests/programs/giblets_memory.gob")
     assert "fun @Turkey.Memory#fill(" in stdout
+
 

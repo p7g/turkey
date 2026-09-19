@@ -37,6 +37,7 @@ module Turkey.LowIr (
 -- in two places. Instruction selection expands these; that is its job.
 
 import Data.Map as Map
+import Turkey.Source (Span)
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..),
                    Effects(..), Inst(..), Term(..), Block(..), Func(..))
@@ -197,10 +198,13 @@ fun low(result : Value, op : Op) -> Low = Low { result = result, op = op }
 type Builder = Builder {
     func : Ssa.Func Low,
     at   : Ssa.BlockId,
+    -- The source construct being lowered, which the lowering keeps current;
+    -- recorded against every instruction that may allocate (`Func.origins`).
+    span : Option Span,
 }
 
 fun builder(f : Ssa.Func Low, at : Ssa.BlockId) -> Builder =
-    Builder { func = f, at = at }
+    Builder { func = f, at = at, span = None }
 
 -- Move the cursor. Blocks are built in whatever order the lowering finds
 -- them, so this is ordinary rather than exceptional.
@@ -217,6 +221,12 @@ fun into(b : Builder, at : Ssa.BlockId) -> Unit { b.at = at }
 fun emit(b : Builder, op : Op, r : Rep) -> Value {
     let v = Ssa.freshValue(b.func, r)
     Array.push(Ssa.blockAt(b.func, b.at).insts, low(v, op))
+    if effectsOf(op).allocates {
+        match b.span {
+            Some(s) -> Map.put(b.func.origins, Ssa.valueId(v), s)
+            None -> {}
+        }
+    }
     v
 }
 
@@ -579,8 +589,8 @@ fun checkCalls(functions : Array (Ssa.Func Low)) -> Array String {
 -- Why a function may allocate: an instruction of its own, or a call to one
 -- that may.
 type Allocation
-    = Allocates(String)
-    | CallsAllocating(String)
+    = Allocates(String, Int)
+    | CallsAllocating(String, Int)
 
 -- What an instruction allocates by itself, if anything.
 --
@@ -597,10 +607,18 @@ type Allocation
 fun allocatingOp(op : Op) -> Option String = match op {
     Call(Direct(_), _) -> None
     Call(Foreign(_), _) -> None
-    Call(Indirect(_), _) -> Some("calls through a closure")
+    Call(Indirect(_), _) -> Some("calls through a closure or a dictionary")
     Call(Runtime(name), _) ->
         if nonAllocatingRuntime(name) { None }
         else { Some("calls the runtime's " + name) }
+    -- Said the way the source would say it, since the reader of this wrote
+    -- source: which construct lowered to the allocation is the question.
+    Box(_) -> Some("boxes a value to pass it where the type is not known")
+    ObjectNew(_, _, _, _) ->
+        Some("builds an object -- a constructor, tuple, record or dictionary")
+    ArrayNew(_, _, _) -> Some("builds an array")
+    CellNew(_) -> Some("makes a cell for a variable a closure captured")
+    ClosureNew(_, _, _) -> Some("makes a closure")
     _ -> if effectsOf(op).allocates { Some("allocates (" + showOpName(op) + ")") }
          else { None }
 }
@@ -631,15 +649,18 @@ fun summarize(functions : Array (Ssa.Func Low)) -> Map String Allocation {
                     Call(Direct(name), _) -> {
                         if !Map.contains(known, name) {
                             mark(out, work, f.name,
-                                 Allocates("calls @" + name + ", which did not lower"))
+                                 Allocates("calls @" + name + ", which did not lower",
+                                           Ssa.valueId(i.result)))
                         }
+                        let site = (f.name, Ssa.valueId(i.result))
                         match Map.get(callers, name) {
-                            Some(those) -> Array.push(those, f.name)
-                            None -> Map.put(callers, name, [f.name])
+                            Some(those) -> Array.push(those, site)
+                            None -> Map.put(callers, name, [site])
                         }
                     }
                     op -> match allocatingOp(op) {
-                        Some(what) -> mark(out, work, f.name, Allocates(what))
+                        Some(what) -> mark(out, work, f.name,
+                                           Allocates(what, Ssa.valueId(i.result)))
                         None -> {}
                     }
                 }
@@ -648,8 +669,8 @@ fun summarize(functions : Array (Ssa.Func Low)) -> Map String Allocation {
     }
     for var k = 0; k < len(work); k = k + 1 {
         match Map.get(callers, work[k]) {
-            Some(those) -> for caller in those {
-                mark(out, work, caller, CallsAllocating(work[k]))
+            Some(those) -> for (caller, site) in those {
+                mark(out, work, caller, CallsAllocating(work[k], site))
             }
             None -> {}
         }

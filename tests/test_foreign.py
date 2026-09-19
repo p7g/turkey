@@ -239,7 +239,8 @@ def test_parameters_may_be_named_or_bare(probe):
     """Naming is allowed here and not in a class method's signature because
     the ambiguity that forbids it there -- a bare identifier is both a
     parameter name and a type variable -- is settled only by the presence of a
-    body, and a foreign declaration can never have one."""
+    body, and every parameter of a foreign signature states its type, so
+    `x : T` is always a name."""
     entry = probe((
         "module Unsafe.Probe (f)\n"
         'foreign "probe" fun f(fd : Int, Prim.Ptr, count : Int) -> Int\n'))

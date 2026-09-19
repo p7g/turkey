@@ -1009,7 +1009,8 @@ def _droppable(bind: CBind, is_dict: bool) -> bool:
     return is_dict or bool(bind.binders) or isinstance(bind.value, (CLam, CTyLam))
 
 
-def _reachable(program: CProgram, main: str) -> CProgram:
+def _reachable(program: CProgram, main: str,
+               definitions: frozenset[str] = frozenset()) -> CProgram:
     """Drop the bindings nothing reaches, where dropping one is unobservable.
 
     This is what makes specialization a saving rather than an addition. A
@@ -1032,6 +1033,9 @@ def _reachable(program: CProgram, main: str) -> CProgram:
     droppable |= {b.name for b in program.binds if _droppable(b, False)}
     work = [n for n in byname if n not in droppable]
     work.append(main)
+    # A `foreign` definition is reached from C, which this cannot see
+    # (SPEC-DELTAS 74).
+    work.extend(sorted(definitions))
     reach = set(work)
     while work:
         bind = byname.get(work.pop())
@@ -1208,7 +1212,7 @@ def monomorphize(program: CProgram, decls: DeclTable, classes: ClassTable,
         out = _Devirtualizer(
             Monomorphizer(out, decls, classes, state).run(), classes, state
         ).run()
-    return _reachable(out, main)
+    return _reachable(out, main, frozenset(decls.definitions))
 
 
 __all__ = ["MAX_SPECIALIZATIONS", "MAX_TYPE_NODES", "ROUNDS", "Monomorphizer",

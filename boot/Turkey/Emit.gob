@@ -1,5 +1,5 @@
 module Turkey.Emit (
-    emitFunc, emitMessages, emitData, emitEntry, emitFrameTable,
+    emitFunc, emitMessages, emitData, emitEntry, emitFrameTable, emitDefinitions,
 )
 
 -- One allocated function as arm64 assembly (`NATIVE-BACKEND.md`, M28 phase 5).
@@ -29,7 +29,8 @@ import Turkey.Asm as Asm
 import Turkey.Frame as Frame
 import Turkey.Regalloc as Regalloc
 import Turkey.Ssa as Ssa
-import Turkey.Ssa (Value(..), BlockId(..), Term(..), Func(..), Block(..), Rep(..))
+import Turkey.Ssa (Value(..), BlockId(..), Term(..), Func(..), Block(..), Rep(..),
+                   RepClass(..))
 import Turkey.SsaLower as SsaLower
 import Turkey.SsaLower (Module(..))
 
@@ -476,11 +477,14 @@ fun emitBytes(text : String, b : String.Builder) -> Unit {
 -- interned into it, then the module initializer computes every global, then
 -- `main`. The literals come first because an initializer's value may be one.
 --
--- `turkey_main` wraps the lot: argument handling, the panic report and the
--- final collection are the runtime's, written once in C rather than emitted
--- here in two backends.
+-- `Turkey.Entry` wraps the lot -- argument handling, the panic report and the
+-- final collection are written once, in Turkey, rather than emitted here in two
+-- backends -- and reaches this by its C symbol. The runtime's two calls around
+-- it park the program's ending where the entry's own code will not unwind on
+-- it.
 fun emitEntry(asm : Asm.Asm, main : String, b : String.Builder) -> Unit {
     line(b, "    .text")
+    line(b, "    .globl " + Asm.entrySymbol)
     line(b, "    .p2align 2")
     line(b, Asm.entrySymbol + ":")
     -- A frame of its own, because everything below is a call. Thirty-two
@@ -489,6 +493,7 @@ fun emitEntry(asm : Asm.Asm, main : String, b : String.Builder) -> Unit {
     instruction(b, A.Str(Physical(Gp, 29), Offset(A.sp, 16), A.W64))
     instruction(b, A.Str(Physical(Gp, 30), Offset(A.sp, 24), A.W64))
     line(b, "    add x29, sp, #16")
+    call(b, "turkey_entry_started")
 
     -- The permanent frame, before anything allocates. It is never left: every
     -- global and every literal is live for the whole run, so the mask is all
@@ -528,14 +533,16 @@ fun emitEntry(asm : Asm.Asm, main : String, b : String.Builder) -> Unit {
     -- has none.
     instruction(b, A.Mov(A.x0, A.xzr, A.W64))
     line(b, "    bl " + Asm.symbolFor(main))
+    call(b, "turkey_entry_returned")
 
     instruction(b, A.Ldr(Physical(Gp, 29), Offset(A.sp, 16), A.W64))
     instruction(b, A.Ldr(Physical(Gp, 30), Offset(A.sp, 24), A.W64))
     line(b, "    add sp, sp, #32")
     line(b, "    ret")
 
-    -- `main` itself: the runtime's, with the entry handed to it. `argc` and
-    -- `argv` are already in `x0` and `x1`.
+    -- `main` itself: `Turkey.Entry`'s, reached by its C symbol. `argv` is
+    -- already in `x1`, and `argc` in `w0`, widened to the `Int` a foreign
+    -- definition takes: AAPCS64 leaves the upper half of an `int` undefined.
     line(b, "    .globl " + Asm.runtimeFor("main"))
     line(b, "    .p2align 2")
     line(b, Asm.runtimeFor("main") + ":")
@@ -543,12 +550,46 @@ fun emitEntry(asm : Asm.Asm, main : String, b : String.Builder) -> Unit {
     instruction(b, A.Str(Physical(Gp, 29), Offset(A.sp, 0), A.W64))
     instruction(b, A.Str(Physical(Gp, 30), Offset(A.sp, 8), A.W64))
     line(b, "    mov x29, sp")
-    symbolInto(b, Physical(Gp, 2), Asm.entrySymbol)
+    line(b, "    sxtw x0, w0")
     call(b, "turkey_main")
     instruction(b, A.Ldr(Physical(Gp, 29), Offset(A.sp, 0), A.W64))
     instruction(b, A.Ldr(Physical(Gp, 30), Offset(A.sp, 8), A.W64))
     line(b, "    add sp, sp, #16")
     line(b, "    ret")
+}
+
+-- The C-callable face of each `foreign` definition (SPEC-DELTAS 74).
+--
+-- The body takes the environment every Turkey function takes, in `x0`, and C
+-- passes its first argument there. So the general arguments move up one
+-- register, `x0` becomes the null environment, and control goes to the body by
+-- a plain branch: the body returns straight to the C caller, and this has no
+-- frame of its own for the collector's walk to meet. Floating-point arguments
+-- are in `d0`-`d7` either way and do not move. Seven general arguments at most,
+-- which the front end checks, since the eighth register is the environment's.
+fun emitDefinitions(m : Module, b : String.Builder) -> Unit {
+    for (sym, name) in m.definitions {
+        for f in m.functions {
+            if f.name == name {
+                var general = 0
+                for var i = 1; i < len(f.params); i = i + 1 {
+                    match Ssa.repOf(f, f.params[i]).class_ {
+                        F64 -> {}
+                        _ -> { general = general + 1 }
+                    }
+                }
+                let label = Asm.runtimeFor(sym)
+                line(b, "    .globl " + label)
+                line(b, "    .p2align 2")
+                line(b, label + ":")
+                for var k = general; k > 0; k = k - 1 {
+                    instruction(b, A.Mov(Physical(Gp, k), Physical(Gp, k - 1), A.W64))
+                }
+                instruction(b, A.Mov(A.x0, A.xzr, A.W64))
+                line(b, "    b " + Asm.symbolFor(name))
+            }
+        }
+    }
 }
 
 -- A symbol's address, in a register: the page, then the offset within it.

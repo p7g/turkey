@@ -216,6 +216,7 @@ class Generator:
         self.classes.register_all(class_decls, inst_decls, self.module)
         self.bind_methods()
         self.bind_foreigns(foreigns)
+        self.check_definitions(items)
 
         # The graph is keyed by item, not by bound name: a single binding may
         # introduce several names (`let (a, b) = ...`), and keying by name would
@@ -295,6 +296,14 @@ class Generator:
                       for p in decl.params]
             ret = self.foreign_type(decl.ret, decl)
             self.check_foreign_arity(decl, params, ret)
+            for other in self.decls.definitions.values():
+                if other.symbol == decl.symbol:
+                    raise TypeError_(
+                        f"the C symbol '{decl.symbol}' is already claimed by "
+                        f"'{other.name}'; a program may define or declare a "
+                        f"symbol once",
+                        decl.span,
+                    )
             self.decls.foreigns[decl.name] = ForeignInfo(
                 decl.name, decl.symbol, params, ret, decl.span)
             self.env.define(decl.name, Binding(mono(TFun(params, ret)), False))
@@ -305,7 +314,46 @@ class Generator:
             # the name is not defined, while every other module sees it.
             self.scopes[0][decl.name] = False
 
-    def foreign_type(self, te: ast.TypeExpr, decl: ast.ForeignDecl) -> Type:
+    def check_definitions(self, items: list[ast.Stmt]) -> None:
+        """Record each `foreign` definition's C signature (SPEC-DELTAS 74).
+
+        The body is typed below like any `fun`'s, against the same annotations.
+        What is checked here is what makes it callable from C: every type is
+        one of the seven that cross, the arguments fit the registers, and no
+        other definition or declaration in the program claims the symbol --
+        which the linker would otherwise report, later and less clearly.
+        """
+        for item in items:
+            if not isinstance(item, ast.SFun) or item.decl.symbol is None:
+                continue
+            decl = item.decl
+            params = [self.foreign_type(p.type_expr, decl) for p in decl.params]
+            assert decl.ret is not None
+            ret = self.foreign_type(decl.ret, decl)
+            self.check_foreign_arity(decl, params, ret)
+            general = sum(1 for p in params if p.name != FLOAT.name)
+            if general >= FOREIGN_ARG_REGS:
+                raise TypeError_(
+                    f"'{decl.name}' takes {general} general arguments, and a "
+                    f"foreign definition takes at most {FOREIGN_ARG_REGS - 1}: "
+                    f"its body is a Turkey function, whose environment "
+                    f"arrives in one of the eight",
+                    decl.span,
+                )
+            for other in [*self.decls.foreigns.values(),
+                          *self.decls.definitions.values()]:
+                if other.symbol == decl.symbol:
+                    raise TypeError_(
+                        f"the C symbol '{decl.symbol}' is already claimed by "
+                        f"'{other.name}'; a program may define or declare a "
+                        f"symbol once",
+                        decl.span,
+                    )
+            self.decls.definitions[decl.name] = ForeignInfo(
+                decl.name, decl.symbol, params, ret, decl.span)
+
+    def foreign_type(self, te: ast.TypeExpr,
+                     decl: ast.ForeignDecl | ast.FunDecl) -> Type:
         """One argument or result type, checked against what can cross.
 
         The list is the seven types that each erase to exactly one machine
@@ -333,7 +381,8 @@ class Generator:
         return ty
 
     @staticmethod
-    def check_foreign_arity(decl: ast.ForeignDecl, params: list[Type],
+    def check_foreign_arity(decl: ast.ForeignDecl | ast.FunDecl,
+                            params: list[Type],
                             ret: Type) -> None:
         """At most eight arguments per register file, and none on the stack.
 

@@ -54,6 +54,11 @@ def internal(module: str, name: str) -> str:
 
 PRELUDE = "Prelude"
 ENTRY = "Main"
+#: The module a program is started by (TIX-67): `turkey_main`, the entry
+#: thread and the crash handler, which C calls and nothing in the program
+#: imports. Loaded for an entry module that declares `main`, ahead of what it
+#: imports -- a program with no `main` cannot be started, and needs none.
+STARTUP = "Turkey.Entry"
 
 
 @dataclass
@@ -112,8 +117,10 @@ class ModuleLoader:
 
     def load_entry(self, src: str, file: str | None = None,
                    name: str = ENTRY) -> Module:
-        """Load the program and the effective imports it declares."""
-        return self._add(name, src, file, library=False, stack=[name])
+        """Load the program and the effective imports it declares, and the
+        module that starts it if it has a `main`."""
+        return self._add(name, src, file, library=False, stack=[name],
+                         entry=True)
 
     def _load(self, name: str, stack: list[str]) -> Module:
         existing = self.modules.get(name)
@@ -143,8 +150,11 @@ class ModuleLoader:
         raise TypeError_(f"cannot find module '{name}' (searched {where})", None)
 
     def _add(self, name: str, src: str, file: str | None, library: bool,
-             stack: list[str]) -> Module:
+             stack: list[str], entry: bool = False) -> Module:
         program = parse(src, frozenset(self.tycons), file)
+        if entry and any(isinstance(d, ast.SFun) and d.decl.name == "main"
+                         for d in program.decls):
+            self._load(STARTUP, stack)
         before = frozenset(self.tycons)
         explicit_prelude = any(imp.name == PRELUDE for imp in program.imports)
         if name != PRELUDE and not explicit_prelude:
@@ -360,6 +370,20 @@ UNSAFE = "Unsafe."
 
 def _check_foreign_placement(name: str, program: ast.Program,
                              library: bool) -> None:
+    # A definition's gate is narrower than a declaration's (SPEC-DELTAS 74): a
+    # C caller sets up nothing before the call, so the body must be code the
+    # collector need not know about, and a giblet module is where that is
+    # checked.
+    giblet = library and name in giblets.giblet_modules()
+    for decl in program.decls:
+        if (isinstance(decl, ast.SFun) and decl.decl.symbol is not None
+                and not giblet):
+            raise TypeError_(
+                f"a foreign definition may only appear in a giblet module, and "
+                f"'{name}' is not one: C calls it with no root frame and no "
+                f"collector to hand, so its body may hold no traced value",
+                decl.span,
+            )
     if library and name.startswith(UNSAFE):
         return
     for decl in program.decls:

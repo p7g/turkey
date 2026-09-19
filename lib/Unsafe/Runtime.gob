@@ -1,19 +1,29 @@
-module Unsafe.Runtime (argCount, argBytes, argLength)
+module Unsafe.Runtime (
+    argCount, argBytes, argLength,
+    argsSet, exiting, exitStatus, panicked, panicMessage,
+    frameCount, frameFunction, frameFile, frameLine, frameCol,
+    collect, gcReport, entryStackSet, rootsHead, panicCallsHead,
+    programEntry,
+)
 
 -- The C runtime's own symbols, where Turkey has to reach them (TIX-65).
 --
 -- A seam, and a temporary one. The arguments are handed to the runtime by
--- whatever starts the program -- `turkey_main` in a binary, a `ctypes` call
+-- whatever starts the program -- `Turkey.Entry` in a binary, a `ctypes` call
 -- under the JIT -- before any Turkey runs, so they are held in C until the
--- entry section itself moves (`RUNTIME-IN-TURKEY.md`, staging step 3). This
--- module is how `System.Env.args` reads them back, and it should shrink to
--- nothing when that happens.
+-- collector's state moves too (`RUNTIME-IN-TURKEY.md`, staging step 4). This
+-- module is how `System.Env.args` reads them back, and how the entry reads the
+-- panic and exit state and the collector's stack bound, and it should shrink
+-- to nothing when that happens.
 --
 -- `Unsafe.` for the reason `Unsafe.Libc` is: each line is a signature nothing
 -- can check against the C that defines it, and `runtime/turkey_runtime.h` is
--- the header to check it against by hand.
+-- the header to check it against by hand. A C `int32_t` result is declared
+-- `Int` and read through a sign extension, as `Unsafe.Libc`'s are.
 
 import Prelude ()
+
+-- -- the arguments --------------------------------------------------------------------
 
 -- How many arguments the program was given, its own name not among them.
 foreign "turkey_arg_count" fun argCount() -> Int
@@ -24,3 +34,60 @@ foreign "turkey_arg_count" fun argCount() -> Int
 foreign "turkey_arg_bytes" fun argBytes(index : Int) -> Prim.Ptr
 
 foreign "turkey_arg_length" fun argLength(index : Int) -> Int
+
+-- Copy `count` arguments in: `bytes` is an array of `count` pointers, and
+-- `lengths` one of `count` byte counts. The runtime keeps copies, so neither
+-- needs to outlive the call.
+foreign "turkey_args_set" fun argsSet(count : Int, bytes : Prim.Ptr,
+                                      lengths : Prim.Ptr) -> Unit
+
+-- -- how the program ended ------------------------------------------------------------
+
+-- Nonzero if the program called `exit`, which unwinds on the panic flag and
+-- is told apart from a panic here. An `int32_t`.
+foreign "turkey_exiting" fun exiting() -> Int
+
+foreign "turkey_exit_status" fun exitStatus() -> Int
+
+-- Nonzero if the program panicked. An `int32_t`.
+foreign "turkey_panicked" fun panicked() -> Int
+
+-- The panic's message, NUL-terminated.
+foreign "turkey_panic_message" fun panicMessage() -> Prim.Ptr
+
+-- The trace the panic captured, innermost first: how many frames, and each
+-- one's function, file (either may be null), line and column.
+foreign "turkey_frame_count" fun frameCount() -> Int
+
+foreign "turkey_frame_function" fun frameFunction(index : Int) -> Prim.Ptr
+
+foreign "turkey_frame_file" fun frameFile(index : Int) -> Prim.Ptr
+
+foreign "turkey_frame_line" fun frameLine(index : Int) -> Int
+
+foreign "turkey_frame_col" fun frameCol(index : Int) -> Int
+
+-- -- the collector --------------------------------------------------------------------
+
+-- A final collection, and the statistics `TURKEY_GC_STATS` asks for.
+foreign "turkey_collect" fun collect() -> Unit
+
+foreign "turkey_gc_report" fun gcReport() -> Unit
+
+-- The outermost frame the collector's stack walk may reach: the entry
+-- thread's own, recorded before the program runs.
+foreign "turkey_entry_stack_set" fun entryStackSet(frame : Prim.Ptr) -> Unit
+
+-- The live shadow stacks, for the crash report: the innermost `RootFrame` and
+-- `PanicCallFrame`, each a chain by its first word.
+foreign "turkey_roots_head" fun rootsHead() -> Prim.Ptr
+
+foreign "turkey_panic_calls_head" fun panicCallsHead() -> Prim.Ptr
+
+-- -- the program ----------------------------------------------------------------------
+
+-- The program itself: its literals interned, its globals computed, and its
+-- `main` run. Defined by the code generator in every program rather than by
+-- the runtime, which is why this is the one declaration here whose symbol no
+-- C file defines.
+foreign "turkey_entry" fun programEntry() -> Unit

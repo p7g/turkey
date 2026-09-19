@@ -51,6 +51,15 @@ ALLOWED_RUNTIME_CALLS = {
     "turkey_panic", "turkey_panic_string", "turkey_panicked",
     "turkey_root_enter", "turkey_root_leave",
     "turkey_frame_enter", "turkey_frame_leave",
+    # The entry, which is Turkey since TIX-67 and is in every program: what it
+    # reads of the handoff, panic and collector state through `Unsafe.Runtime`,
+    # and the pair the generated `turkey_entry` brackets the program with.
+    "turkey_args_set", "turkey_exiting", "turkey_exit_status",
+    "turkey_panic_message", "turkey_frame_count", "turkey_frame_function",
+    "turkey_frame_file", "turkey_frame_line", "turkey_frame_col",
+    "turkey_collect", "turkey_gc_report", "turkey_entry_stack_set",
+    "turkey_roots_head", "turkey_panic_calls_head",
+    "turkey_entry_started", "turkey_entry_returned",
 }
 NATIVE_PROGRAMS = sorted(
     path.stem for path in PROGRAMS_DIR.glob("*.gob")

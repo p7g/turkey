@@ -469,6 +469,11 @@ class FunDecl(Node):
     # policy about local bindings, which is why it is a field here rather than
     # a rule in `turkey/infer.py` about what a name looks like.
     monomorphic: bool = False
+    # The C symbol a `foreign` definition is callable under (SPEC-DELTAS 74):
+    # `foreign "turkey_main" fun main(...) -> Int { ... }`. `None` for every
+    # other function. A definition is also `monomorphic`, since its signature
+    # is a monotype by construction.
+    symbol: str | None = None
 
     @property
     def is_signature(self) -> bool:
@@ -488,10 +493,11 @@ class ForeignDecl(Node):
     Parameters may be named, which a `FunDecl`'s signature form cannot allow.
     The reason that form forbids it is the ambiguity `Parser.parse_fun_decl`
     describes -- a bare identifier is both a parameter name and a type variable,
-    and only the presence of a body decides which. A `foreign` declaration can
-    never have a body, so there is nothing to decide, and a declaration whose
-    whole hazard is getting the argument order wrong should be allowed to say
-    what its arguments are.
+    and only the presence of a body decides which. A `foreign` signature states
+    every parameter's type, with a body or without (SPEC-DELTAS 74), so
+    `x : T` is always a name and a bare `T` always a type -- there is nothing
+    to decide, and a declaration whose whole hazard is getting the argument
+    order wrong should be allowed to say what its arguments are.
     """
 
     name: str

@@ -133,7 +133,9 @@ class Parser:
             elif self.at("instance"):
                 decls.append(self.parse_instance_decl())
             elif self.at("foreign"):
-                decls.append(self.parse_foreign_decl())
+                decl = self.parse_foreign_decl()
+                decls.append(ast.SFun(decl.span, decl)
+                             if isinstance(decl, ast.FunDecl) else decl)
             elif self.at("fun"):
                 decls.append(ast.SFun(self.cur.span, self.parse_fun_decl()))
             elif self.at("let", "var"):
@@ -470,8 +472,16 @@ class Parser:
         body = self.parse_fun_body()
         return ast.FunDecl(span, name, params, ret, body, context)
 
-    def parse_foreign_decl(self) -> ast.ForeignDecl:
-        """`foreign "symbol" fun name(params) -> ret`.
+    def parse_foreign_decl(self) -> ast.ForeignDecl | ast.FunDecl:
+        """`foreign "symbol" fun name(params) -> ret`, with or without a body.
+
+        Without one it is a declaration: C defines the symbol and Turkey calls
+        it. With one it is a *definition*: Turkey defines the symbol and C
+        calls it (PROPOSALS.md item 9, SPEC-DELTAS 74). The definition is an
+        ordinary `FunDecl` that also carries the symbol, because everything
+        from here to the backend already knows what to do with a function, and
+        what the symbol adds -- a C-callable entry point that nothing may drop
+        -- is the backend's business alone.
 
         The C symbol is always written, even when it is the Turkey name spelled
         the same way. Which of the two names is which is then never something a
@@ -479,7 +489,8 @@ class Parser:
         `foreign "__error" fun errnoLocation() -> Ptr` reads no differently from
         the one that says `foreign "read" fun read(...)`.
 
-        There is no body and no context. A return type is required -- a C
+        There is no context, and a body only for a definition. A return type
+        is required either way -- a C
         function that returns nothing writes `-> Unit`, because "the signature
         is stated in full" is the only property that makes the declaration
         worth trusting.
@@ -506,6 +517,20 @@ class Parser:
                 self.cur.span,
             )
         ret = self.parse_type_expr()
+        if self.at("{", "="):
+            # Every parameter of a definition is a binder, and a name is what
+            # binds one; an unnamed parameter could never be read.
+            for param in params:
+                assert isinstance(param, ast.PAnnot)
+                if not isinstance(param.pat, ast.PVar):
+                    raise ParseError(
+                        f"foreign '{name}' has a body, so each parameter needs "
+                        f"a name: write 'x : T'",
+                        param.span,
+                    )
+            body = self.parse_fun_body()
+            return ast.FunDecl(span, name, params, ret, body, symbol=symbol,
+                               monomorphic=True)
         return ast.ForeignDecl(span, name, symbol, params, ret)
 
     def parse_foreign_params(self) -> list[ast.Pattern]:
@@ -523,8 +548,9 @@ class Parser:
                 self.advance()
                 self.advance()
                 ty = self.parse_type_expr()
-                params.append(ast.PAnnot(
-                    start.span, ast.PVar(start.span, start.text), ty))
+                binder = (ast.PWild(start.span) if start.text == "_"
+                          else ast.PVar(start.span, start.text))
+                params.append(ast.PAnnot(start.span, binder, ty))
             else:
                 ty = self.parse_type_expr()
                 params.append(ast.PAnnot(ty.span, ast.PWild(ty.span), ty))

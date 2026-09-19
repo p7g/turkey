@@ -37,7 +37,7 @@ import Turkey.Decls (DeclTable(..), ConInfo(..))
 import Turkey.Diag as Diag
 import Turkey.Layout as Layout
 import Turkey.LowIr as L
-import Turkey.LowIr (Op(..), Low(..), BinOp(..), CmpOp(..), Conv(..),
+import Turkey.LowIr (Op(..), Low(..), AddressOf(..), BinOp(..), CmpOp(..), Conv(..),
                      Callee(..), Builder(..))
 import Turkey.Prelude as P
 import Turkey.Runtime as Rt
@@ -99,6 +99,10 @@ type Module = Module {
     -- The function that computes every global, in the order the program
     -- requires. Called once before `main`.
     initial   : String,
+    -- Each `foreign` definition that lowered, as (C symbol, function name),
+    -- sorted by symbol: what an emitter exports under a C-callable thunk
+    -- (SPEC-DELTAS 74).
+    definitions : Array (String, String),
 }
 
 let initializerName = "%module.initialize"
@@ -236,8 +240,17 @@ fun lowerProgram(program : CProgram, decls : DeclTable)
                                               fields, sigs, shared)
     Array.push(done, init)
     for g in lifted { Array.push(done, g) }
+    let lowered = Set.new()
+    for f in done { Set.add(lowered, f.name) }
+    let definitions : Array (String, String) = []
+    for (name, info) in Map.entries(decls.definitions) {
+        if Set.contains(lowered, name) {
+            Array.push(definitions, (info.symbol, name))
+        }
+    }
     let module_ = Module { functions = done, globals = storage,
-                           initial = initializerName }
+                           initial = initializerName,
+                           definitions = Array.sort(definitions) }
     internNullaries(module_, init)
     (module_, skipped)
 }
@@ -1675,17 +1688,13 @@ fun scalar(l : Lower, op : Op, natural : Rep, rep : Rep) -> Value =
 fun call(l : Lower, e : Core, fn : Core, args : Array Core, rep : Rep) -> Value {
     let supplied : Array Value = []
     match fn.kind {
-        CPrim(name) -> {
-            for a in args { Array.push(supplied, value(l, a)) }
-            primitive(l, e, name, supplied, rep)
-        }
+        CPrim(name) -> primCall(l, e, name, args, rep)
         -- A primitive reaches Core as a `CVar` as often as a `CPrim`: the
         -- module scope binds every `Prim.` name to itself, so an ordinary
         -- variable reference is what the resolver produces. `Prim` is the
         -- builtin module and its prefix is reserved, so the name is the test.
         CVar(name) -> if isPrim(name) {
-            for a in args { Array.push(supplied, value(l, a)) }
-            primitive(l, e, name, supplied, rep)
+            primCall(l, e, name, args, rep)
         } else if Map.contains(l.decls.foreigns, name) {
             -- A declared C symbol (TIX-62). Everything a runtime call needs
             -- and nothing more: no marshalling, because the type mapping is
@@ -1726,6 +1735,42 @@ fun call(l : Lower, e : Core, fn : Core, args : Array Core, rep : Rep) -> Value 
         -- can be.
         _ -> closureCall(l, fn, args, rep)
     }
+}
+
+-- A primitive call. Two take a literal the compiler lays out as static data
+-- rather than a value (SPEC-DELTAS 74), so their argument is read here, before
+-- it could become one; every other primitive gets its arguments lowered.
+fun primCall(l : Lower, e : Core, name : String, args : Array Core,
+             rep : Rep) -> Value {
+    if name == "Prim.cString" || name == "Prim.codeAddress" {
+        let text = if len(args) == 1 {
+            match erased(args[0]).kind {
+                CLit(LString(s)) -> Some(s)
+                _ -> None
+            }
+        } else { None }
+        return match text {
+            None -> stop(l, name + " takes a string literal")
+            Some(s) -> if name == "Prim.cString" {
+                L.emit(l.b, Address(CBytes(s)), Ssa.untraced(Ptr))
+            } else if definesSymbol(l.decls, s) {
+                L.emit(l.b, Address(CodeOf(s)), Ssa.untraced(Ptr))
+            } else {
+                stop(l, "Prim.codeAddress(\"" + s + "\") names no foreign "
+                        + "definition in this program")
+            }
+        }
+    }
+    let supplied : Array Value = []
+    for a in args { Array.push(supplied, value(l, a)) }
+    primitive(l, e, name, supplied, rep)
+}
+
+fun definesSymbol(decls : DeclTable, symbol : String) -> Bool {
+    for (_, info) in Map.entries(decls.definitions) {
+        if info.symbol == symbol { return True }
+    }
+    False
 }
 
 -- A call to a known top-level function, at *its* representations.
@@ -1825,6 +1870,9 @@ fun primitive(l : Lower, e : Core, name : String, args : Array Value,
         let a = L.emit(l.b, Convert(PtrToInt, args[0]), Ssa.untraced(I64))
         let b = L.emit(l.b, Convert(PtrToInt, args[1]), Ssa.untraced(I64))
         return L.emit(l.b, Bin(SubWrap, a, b), Ssa.untraced(I64))
+    }
+    if name == "Prim.frameAddress" && len(args) == 0 {
+        return L.emit(l.b, Address(ThisFrame), Ssa.untraced(Ptr))
     }
     if name == "Prim.ptrNull" && len(args) == 0 {
         let zero_ = L.emit(l.b, ConstInt(0), Ssa.untraced(I64))

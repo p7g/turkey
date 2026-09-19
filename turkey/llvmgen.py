@@ -118,6 +118,10 @@ _RAW_ACCESS = {
 _LAYOUT_SUFFIXES = frozenset(layout.value for layout in bir.Layout)
 
 
+#: The symbol every program defines for `Turkey.Entry` to run it by (TIX-67).
+ENTRY_SYMBOL = "turkey_entry"
+
+
 def _foreign_type(layout: bir.Layout) -> ir.Type:
     """The LLVM type a declared argument or result travels in.
 
@@ -395,6 +399,23 @@ class _Emitter:
         self._declare_runtime()
         self._declare_foreigns()
 
+    def _definition(self, info: bir.Definition, thunk: ir.Function) -> None:
+        """The C-callable face of a `foreign` definition (SPEC-DELTAS 74).
+
+        The body is an ordinary Turkey function and takes an environment
+        first; C supplies none, so this supplies a null one and is otherwise
+        a forwarding call. It is a thunk rather than a second way of compiling
+        the body because nothing else about the body differs, and LLVM inlines
+        it away.
+        """
+        builder = ir.IRBuilder(thunk.append_basic_block("entry"))
+        result = builder.call(self.functions[info.function],
+                              [ir.Constant(_PTR, None), *thunk.args])
+        if info.ret is bir.Layout.UNIT:
+            builder.ret_void()
+        else:
+            builder.ret(result)
+
     def _declare_foreigns(self) -> None:
         """One `declare` per C symbol the module actually calls (TIX-62).
 
@@ -417,6 +438,8 @@ class _Emitter:
             if instruction.op.startswith("foreign.")
         }
         for symbol in sorted(called):
+            if symbol == ENTRY_SYMBOL:
+                continue
             info = self.source.foreigns[symbol]
             self.runtime[symbol] = ir.Function(
                 self.module,
@@ -440,8 +463,9 @@ class _Emitter:
         self._runtime("turkey_array_new", _PTR, [_I64, _I64, _I32, _I32])
         self._runtime("turkey_closure_new", _PTR, [_I64, _I64, _I64])
         self._runtime("turkey_panic", ir.VoidType(), [_PTR])
+        self._runtime("turkey_entry_started", ir.VoidType(), [])
+        self._runtime("turkey_entry_returned", ir.VoidType(), [])
         self._runtime("turkey_panic_string", ir.VoidType(), [_PTR])
-        self._runtime("turkey_panicked", _I32, [])
         self._runtime("turkey_frame_enter", ir.VoidType(), [_PTR, _PTR])
         self._runtime("turkey_frame_leave", ir.VoidType(), [_PTR])
         self._runtime("turkey_root_enter", ir.VoidType(), [_PTR, _PTR, _I64, _PTR])
@@ -532,8 +556,29 @@ class _Emitter:
             ty = ir.FunctionType(_llvm_type(source.result),
                                  [_llvm_type(p.layout) for p in source.params])
             self.functions[source.name] = ir.Function(self.module, ty, name=source.name)
+        # The program as C sees it: `Turkey.Entry` declares `turkey_entry` and
+        # calls it on the thread it makes, and this module is what defines it
+        # -- the runner, with C's `void` in place of `main`'s result.
+        program = ir.Function(self.module, ir.FunctionType(ir.VoidType(), []),
+                              name=ENTRY_SYMBOL)
+        builder = ir.IRBuilder(program.append_basic_block("entry"))
+        builder.call(self.runtime["turkey_entry_started"], [])
+        builder.call(self.functions[self.source.entry], [])
+        builder.call(self.runtime["turkey_entry_returned"], [])
+        builder.ret_void()
+        self.runtime[ENTRY_SYMBOL] = program
+        # Declared before any body, because `Prim.codeAddress` names one.
+        self.definitions = {
+            symbol: ir.Function(
+                self.module,
+                ir.FunctionType(_foreign_type(info.ret),
+                                [_foreign_type(p) for p in info.params]),
+                name=symbol)
+            for symbol, info in sorted(self.source.definitions.items())}
         for source in self.source.functions:
             self._function(source, self.functions[source.name])
+        for symbol, thunk in self.definitions.items():
+            self._definition(self.source.definitions[symbol], thunk)
         text = str(self.module)
         parsed = binding.parse_assembly(text)
         parsed.verify()
@@ -1027,6 +1072,10 @@ class _Emitter:
             return value, self._propagate(function, builder)
         if op.startswith("prim."):
             return self._primitive(function, builder, op[5:], args, instruction.result.layout)
+        if op == "c_string":
+            return self._c_string(builder, instruction.args[0], ".turkey.cstring"), builder
+        if op == "code_address":
+            return builder.bitcast(self.definitions[instruction.args[0]], _PTR), builder
         if op.startswith("foreign."):
             symbol = op[len("foreign."):]
             info = self.source.foreigns[symbol]
@@ -1241,6 +1290,12 @@ class _Emitter:
                                builder.ptrtoint(args[1], _I64)), builder
         if name == "ptrNull":
             return ir.Constant(_PTR, None), builder
+        if name == "frameAddress":
+            intrinsic = self.module.globals.get("llvm.frameaddress.p0")
+            if intrinsic is None:
+                intrinsic = ir.Function(self.module, ir.FunctionType(_PTR, [_I32]),
+                                        name="llvm.frameaddress.p0")
+            return builder.call(intrinsic, [ir.Constant(_I32, 0)]), builder
         if name == "ptrIsNull":
             return builder.icmp_unsigned(
                 "==", builder.ptrtoint(args[0], _I64), ir.Constant(_I64, 0)), builder
@@ -1519,6 +1574,8 @@ class _Emitter:
 # and a wrong `restype` here is a silently truncated pointer.
 _RUNTIME_CALLS: dict[str, tuple[object, tuple]] = {
     "turkey_panic_clear": (None, ()),
+    # Defined by `Turkey.Entry` in the program's module rather than by the
+    # runtime, and reached the same way: by name, through the engine.
     "turkey_install_crash_handler": (None, ()),
     "turkey_args_set": (None, (ctypes.c_int64, ctypes.POINTER(ctypes.c_char_p),
                                ctypes.POINTER(ctypes.c_int64))),
@@ -1787,20 +1844,23 @@ def build(program: CProgram, decls: DeclTable, output: Path,
 
 
 def _entry_module(source: bir.Source, triple: str) -> str:
-    """A `main` that hands off to `turkey_main` with this program's entry.
+    """A `main` that hands off to `turkey_main`.
 
-    Three lines of IR because everything that does not depend on the program
-    is in the runtime: only the entry's *name* varies, and that is what this
-    passes. Emitted as a separate module and linked in so that the JIT path,
-    which has its own way in through `ctypes`, never acquires a `main`.
+    Everything that does not depend on the program is in `Turkey.Entry`, which
+    every program links, and it finds the program by the `turkey_entry` symbol
+    the module defines. What is left is C's `main` itself, whose `int`s are
+    widened to the `Int`s a foreign definition takes and narrowed back.
+    Emitted as a separate module and linked in so that the JIT path, which has
+    its own way in through `ctypes`, never acquires a `main`.
     """
     return f"""
 target triple = "{triple}"
-declare i32 @turkey_main(i32, ptr, ptr)
-declare void @{source.entry}()
+declare i64 @turkey_main(i64, ptr)
 define i32 @main(i32 %argc, ptr %argv) {{
-  %status = call i32 @turkey_main(i32 %argc, ptr %argv, ptr @{source.entry})
-  ret i32 %status
+  %count = sext i32 %argc to i64
+  %status = call i64 @turkey_main(i64 %count, ptr %argv)
+  %narrow = trunc i64 %status to i32
+  ret i32 %narrow
 }}
 """
 

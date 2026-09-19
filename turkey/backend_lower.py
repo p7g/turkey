@@ -948,6 +948,14 @@ class _FunctionLowerer:
             if isinstance(fn, CPrim) or (
                     isinstance(fn, CVar) and fn.name in PRIM_NAMES):
                 primitive = fn.name
+                if primitive in ("Prim.cString", "Prim.codeAddress"):
+                    # Static data named at compile time (SPEC-DELTAS 74): the
+                    # argument is the bytes, or the symbol, and never a value.
+                    done(block, self.emit(
+                        block, _static_address(primitive, expr, self.decls),
+                        (str(_erase_types(expr.args[0]).value),),
+                        bir.Layout.ADDR))
+                    return
                 if primitive == "Prim.error":
                     def panic(at: bir.Block, values: list[bir.Operand]) -> None:
                         at.terminator = bir.Panic(values[0], self.frame(expr.span))
@@ -1719,6 +1727,9 @@ def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
     # work list then pulls in every imported function/value they reference.
     pending = [main, *(bind.name for bind in program.binds
                        if bind.module == main_module and bind.name not in functions)]
+    # A `foreign` definition is reached from C, which nothing here can see
+    # (SPEC-DELTAS 74).
+    pending.extend(sorted(decls.definitions))
     while pending:
         name = pending.pop()
         if name in reachable:
@@ -1784,9 +1795,31 @@ def lower(program: CProgram, decls, main: str = "main") -> bir.Module:
             tuple(held_at(p, decls=decls) for p in info.params),
             held_at(info.ret, decls=decls))
          for info in decls.foreigns.values()},
+        {info.symbol: bir.Definition(
+            info.symbol, functions[info.name][0],
+            tuple(held_at(p, decls=decls) for p in info.params),
+            held_at(info.ret, decls=decls))
+         for info in decls.definitions.values()},
     )
     bir.check(module)
     return module
+
+
+def _static_address(primitive: str, expr: CApp, decls) -> str:
+    """The backend op for `Prim.cString` or `Prim.codeAddress`, once its
+    argument is known to be what the op needs: a string literal, and for a code
+    address, the symbol of a `foreign` definition in this program -- the one
+    kind of function that has a C-callable address to take."""
+    arg = _erase_types(expr.args[0]) if len(expr.args) == 1 else None
+    if not (isinstance(arg, CLit) and arg.kind == "String"):
+        raise Unsupported(f"{primitive} takes a string literal", expr.span)
+    if primitive == "Prim.cString":
+        return "c_string"
+    if not any(info.symbol == arg.value for info in decls.definitions.values()):
+        raise Unsupported(
+            f"Prim.codeAddress(\"{arg.value}\") names no foreign definition in "
+            f"this program", expr.span)
+    return "code_address"
 
 
 __all__ = ["layout_of", "lower", "mangle"]

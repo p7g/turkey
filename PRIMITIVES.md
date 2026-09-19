@@ -688,3 +688,31 @@ panics are **a debugging aid and not a semantics.** The native backend performs
 none of them, a program that trips one is undefined either way, and no
 conformance program may depend on one. What the simulation must never do is
 give a *defined* answer where this section says there is none.
+
+### 9.5 Addresses fixed at link time
+
+Three more, from SPEC-DELTAS 74, for giblet code that cannot hold what the
+address stands in for. Each answers a `Prim.Ptr`.
+
+```
+cString("text")        the literal's UTF-8 bytes and a NUL, in read-only data
+codeAddress("symbol")  a `foreign` definition's C entry point
+frameAddress()         the calling function's frame pointer
+```
+
+The argument of the first two must be a string literal, which lowering checks:
+it is data the compiler lays out, not a value computed at run time.
+`codeAddress` accepts only the symbol of a definition in the program, the one
+kind of function with a C-callable address. Asking twice answers the same
+address twice.
+
+Writing through `cString`'s address is undefined, as writing any string
+constant is in C. Reading through `codeAddress`'s is undefined too, and
+calling it is C's business: Turkey has no call through a raw pointer.
+`frameAddress` is defined only as a bound -- the frames of everything the
+function calls are below it -- which is what the collector's stack walk needs.
+
+On the Python host `cString` is a block in the simulated heap, allocated on
+first use and never freed. The other two answer stand-in addresses outside it,
+so a load through either is caught as a read of unallocated memory. Nothing on
+that host calls through a code address, because only C does.

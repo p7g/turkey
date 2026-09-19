@@ -605,8 +605,9 @@ What does contain it is that `Prim.` is spellable only from a library module,
 so none of this reaches ordinary Turkey except through `Unsafe.Ptr`, whose
 name is then in the import list of every module that touches raw memory --
 Oberon's `SYSTEM` rule, and the same containment delta 70 relies on for
-`Prim.castAs`. TIX-63's checker is what will make it a property rather than a
-convention.
+`Prim.castAs`. That stays a convention. What TIX-63 made a property is a
+different and narrower thing: the giblet modules the collector is written in
+hold no traced value at all (SPEC-DELTAS 73).
 
 One more thing is undefined, and it arrives with delta 71's FFI: **what a C
 function does with a pointer after the call returns.** Handing one to `write`

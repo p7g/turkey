@@ -27,7 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from . import ast
+from . import ast, giblets
 from .builtins import PRIM_NAMES
 from .deps import pattern_vars
 from .errors import Span, TypeError_
@@ -161,6 +161,7 @@ class ModuleLoader:
             program = parse(src, frozenset(self.tycons), file)
 
         _check_foreign_placement(name, program, library)
+        giblets.check_placement(name, library, Span(1, 1, file))
         module = Module(name, program, library)
         self.tycons |= {d.name for d in program.decls
                         if isinstance(d, ast.TypeDecl)}

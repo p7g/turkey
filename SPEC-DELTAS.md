@@ -3331,8 +3331,9 @@ the way `Prim.Array` is, so it is spellable only from a library module; what
 reaches the rest of the language is `lib/Unsafe/Ptr.gob`, whose name is then in
 the import list of every module that touches raw memory. That is Oberon's
 `SYSTEM` rule and Modula-3's unsafe module, obtained from the module system
-that already exists. It is a gesture and not a check: TIX-63's subset checker
-is what will make it a property.
+that already exists. It is a gesture and not a check, and remains one: TIX-63
+checks a narrower thing, that the giblet modules hold no traced value (delta
+73), and leaves who may touch raw memory to the import list.
 
 **Undefined rather than checked, and the reason is not cost.** A bounds check
 needs bounds, and an address does not carry any -- that is exactly what
@@ -3476,3 +3477,54 @@ table of built-in homes.
 **Exact-sized, not shared.** Slicing copies, as it did. A shared backing
 store with an offset buys O(1) slicing and a leak -- Java removed it in 7u6,
 and Go added `strings.Clone` to escape it.
+
+### 73. Giblets: modules that cannot allocate
+
+TIX-63. The collector runs when nothing may allocate and has no roots of its
+own, so it has to be written in code the collector need not know about. That
+code is called **giblets**, and a module of it a *giblet module*. The argument
+for the definition, and the measurement it rests on, are
+`RUNTIME-IN-TURKEY.md`'s "By effect, or by type" and "Measured: the collector
+is all-raw".
+
+**Defined by the types it names, not by an effect.** Every value in a giblet
+module's code has a type the collector does not trace: `Int`, `Byte`, `Char`,
+`Float`, `Unit`, `Bool`, `Prim.Ptr`, or a newtype over one of them. So no
+record, constructor, tuple, array, string, closure or dictionary is ever made,
+and nothing allocates because there is nothing to allocate. This is Modula-3's
+traced and untraced references, and the bit is the one the backend already
+calls `traced`.
+
+**Four things pass that the rule alone would refuse**, none of them a value the
+code holds:
+
+- the head of a call -- calling a named function is not making a closure.
+  *Mentioning* one without calling it is, and is refused;
+- a dictionary argument naming a global instance, which specialization turns
+  into a direct call;
+- a `var` -- Core spells it as a cell, but a giblet has no closure for the cell
+  to escape into, so it lives in a slot and its contents are what is checked;
+- `Prim.error` with a literal message -- the panic never returns, and the
+  literal is interned static data the collector cannot free.
+
+A giblet module may not declare an instance: a dictionary is a heap object.
+
+**Which modules, by list.** The compiler names them, and joining is a
+deliberate edit to it -- there is no declaration form and no naming
+convention. A module on the list must come from the shipped `lib/`, the gate
+`foreign` has. The first is `Turkey.Memory`. `lib/Turkey/` is where modules
+the runtime needs and nothing else does are kept.
+
+**Checked on Core, in both compilers**, where every node has a type and the two
+implementations are compared byte for byte. The error names the construct, its
+type and the module:
+
+```
+a string literal has type String, which the collector traces;
+'Turkey.Memory' is a giblet module, whose code holds untraced values only
+```
+
+**Not in the language: a `nogc` contract on function types, or an inferred
+bit on arrows.** Declined in `RUNTIME-IN-TURKEY.md` "The spectrum" until a
+third consumer that users write appears; the design to reach for then is the
+*throws* bit's, generalized.

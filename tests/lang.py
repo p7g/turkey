@@ -251,8 +251,12 @@ def check(src: Source, modules: dict[str, str] | None = None) -> str:
 
 def run(src: Source, modules: dict[str, str] | None = None,
         args: tuple[str, ...] = (), stdin: str | None = None,
-        env: dict[str, str] | None = None) -> Result:
+        env: dict[str, str] | None = None, cwd: Path | None = None) -> Result:
     """Compile and run. Raises `CompileError` if it does not compile.
+
+    The program runs in its own directory unless `cwd` says otherwise -- which
+    a program that writes files should, since the directory a source string is
+    written to is shared by every test that compiles the same string.
 
     Bytes, decoded here rather than by `text=True`, so a `\\r` the program
     prints is not rewritten as a newline on the way.
@@ -263,7 +267,7 @@ def run(src: Source, modules: dict[str, str] | None = None,
         raise CompileError(compiled.stderr, compiled.code)
     result = subprocess.run(
         [str(compiled.binary), *args],
-        cwd=entry.parent,
+        cwd=cwd or entry.parent,
         input=None if stdin is None else stdin.encode("utf-8"),
         env=None if env is None else dict(os.environ, **env),
         capture_output=True,

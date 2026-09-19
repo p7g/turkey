@@ -100,3 +100,8 @@ For more depth:
 
 To run the test suite, install the development dependencies with
 `python3 -m pip install -e '.[dev]'`, then run `python3 -m pytest tests -q`.
+The tests of what the language does compile their programs with the
+self-hosted compiler, `boot`. To run just those, without the Python
+implementation, point `TURKEY_BOOT` at a built `boot` and pass
+`--without-python-compiler`:
+`TURKEY_BOOT=path/to/boot python3 -m pytest tests -q --without-python-compiler`.

@@ -189,7 +189,7 @@ instance declared anywhere else would be an *orphan*, and two unrelated
 modules could each declare one for the same class and type. The primitive
 types and tuples belong to the language itself, so a program can give them
 instances only of its own classes. The same holds for library types such as
-`Array` and `Option`, which belong to library modules:
+`String`, `Array` and `Option`, which belong to library modules:
 
 <!-- error: orphan instance: 'Semigroup Int' is declared in 'Main' -->
 ```kotlin

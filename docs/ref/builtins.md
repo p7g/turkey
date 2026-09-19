@@ -26,6 +26,9 @@ under those names, qualified only. That is why `Array.push` and `Int.parse`
 need no import, while the bare names `push` and `parse` stay free for a
 program to use.
 
+`String` is also declared by the library, but it is in scope everywhere
+whether or not the Prelude is imported ([String](types.md#string)).
+
 ## `Bool`
 
 ```text

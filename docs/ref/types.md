@@ -55,13 +55,15 @@ These types are built into the language:
 | `Float` | 64-bit IEEE 754 floating-point numbers |
 | `Byte` | integers from 0 to 255 |
 | `Char` | Unicode scalar values |
-| `String` | immutable UTF-8 text |
 | `Unit` | the single value `()` |
 
-`Bool`, `Option`, `Either` and `Array` are not primitive. They are declared by
-the library, and the language refers to them by name: `if` needs a `Bool`, and
-a `for` loop gets an `Option` from its iterator. See [Built-in types and
-classes](builtins.md).
+`String`, `Bool`, `Option`, `Either` and `Array` are not primitive. They are
+declared by the library, and the language refers to them by name: a string
+literal is a `String`, `if` needs a `Bool`, and a `for` loop gets an `Option`
+from its iterator. `String` is described [below](#string) with the primitive
+types, because it is always in scope and its constructor is hidden, so a
+program can use it only as it would a primitive type. See [Built-in types and
+classes](builtins.md) for the others.
 
 There are no implicit conversions between primitive types. Converting an
 `Int` to a `Float` is an explicit call, `Float.fromInt(n)`. A numeric *literal*
@@ -158,7 +160,8 @@ excluding the surrogates `D800` to `DFFF`. It is written as a
 
 ### String
 
-A `String` is an immutable sequence of bytes that is always valid UTF-8. That
+`String` is in scope in every module without an import, like the primitive
+types. A `String` is an immutable sequence of bytes that is always valid UTF-8. That
 guarantee holds for every string a program can create: literals cannot contain
 invalid UTF-8, and a string built from bytes is checked when it is built.
 
@@ -446,9 +449,9 @@ Whether a value can be changed depends on its type, not on how it was bound.
 * **Mutable:** values of a type with exactly one constructor that is a record,
   such as `Item` above, and arrays. Their fields and elements can be assigned
   ([Assignment](statements.md#assignment)).
-* **Immutable:** everything else. That is every primitive type, every tuple,
-  every function, every positional constructor, and every type with more than
-  one constructor, even when the constructors are records.
+* **Immutable:** everything else. That is every primitive type, every string,
+  every tuple, every function, every positional constructor, and every type
+  with more than one constructor, even when the constructors are records.
 
 Mutable values have **reference semantics**. Creating one allocates a single
 object, and every binding, parameter, field or array element that holds it

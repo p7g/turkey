@@ -213,12 +213,47 @@ draw. Our collector manipulates the heap as bytes: headers, mark bits, the free
 list, the frame table, root slots. That is a property of this collector rather
 than a general truth, and it is what buys the cheaper enforcement.
 
-**What must be verified before betting on it**, because the route stands on it:
-that the collector really is all-raw. The heap walk, the headers, the mark
-bits, the free list and the frame table all look it. The suspects are the panic
-and diagnostic path, which handles strings, and the hard-coded `ArrayStorage`
-slots and closure shape -- the same two that `NATIVE-BACKEND.md`'s record-layout
-section flags.
+### Measured: the collector is all-raw
+
+TIX-63 names the thing: code in modules the compiler holds to this rule is
+**giblets** -- the innards under the skin -- and a module of it is a *giblet
+module*.
+
+The route stood on a claim -- that the collector really is all-raw -- and
+TIX-63 took the measurement before building anything on it. **It holds.**
+Nothing in the collector handles a managed value *as a value*; every managed
+object it touches is read as words and bitmaps at offsets it knows.
+
+* **One layout decoder.** `mark_children` (`runtime/turkey_runtime.c:352`) is
+  the only code that knows what a heap object looks like: a cell's
+  `pointer_value` flag, an array's element layout code in `tag`, a
+  constructor's 3-bit-per-slot layout, 1 bit per slot for everything else.
+  Words at fixed offsets, the same thing C does with a struct.
+* **The two suspects cleared.** `ArrayStorage` went with TIX-66, and the
+  closure shape `[code, env]` is only ever *built* by the allocator and
+  *walked* as an object with a bitmap -- no reader needs to know it is a
+  closure. The panic path the collector reaches is `turkey_panic(const char*)`
+  (653), which takes a C string; `turkey_panic_string` (661), the one entry that
+  reads a Turkey `String`, is not reachable from collector code.
+
+So the subset-by-types route is the right one. What the measurement found
+instead is a list of *missing pieces*, none of which is an argument for an
+effect:
+
+| gap | where | what fills it |
+|---|---|---|
+| the frame address | `scan_native_frames` (480) uses `__builtin_frame_address` | a primitive |
+| unsigned 32-bit loads, `ctz` | `HeapHeader`'s `kind`/`marked`; the free-bit search (151, 527) | primitives |
+| bulk fill and copy | `memset`/`memcpy` across the sweep and allocators | loops in a giblet module, or `foreign` |
+| region memory | `aligned_alloc` (136), `realloc` for the mark stack (341) | `foreign` declarations |
+| sorting the frame table | `qsort` with a C comparator (439) | a hand-written sort, not a callback |
+| formatted diagnostics | `snprintf` in `mark_grey` (325), `fprintf` stats (595-627) | `write` and hand formatting; SPEC-DELTAS 71 declines variadics |
+| the collector's state | every heap, root and mark global is a C `static` | an untraced global -- arm64 already emits one as a plain word rather than a root slot (`Turkey.Emit.emitData`) -- holding a `Prim.Ptr` to `malloc`ed state, initialized before the first allocation |
+
+The allocators, reclassified as the collector's by TIX-66, are the one place
+where giblet code meets a managed reference, and they are where the type rule
+had to be checked hardest. It holds there too, with one change to lowering;
+"What stays in C, and whose it is" below has the design.
 
 **What it costs is ergonomics inside the subset.** No `SomeError`, because
 packing allocates; no `?`; no `Show`; sentinel returns and raw pointer
@@ -436,6 +471,42 @@ are keywords.
 
 `array_parts` and its hard-coded `ArrayStorage` slots go with their three
 callers, so nothing in C reads `Data.Array`'s record any more.
+
+### The allocators as giblet code
+
+Decided under TIX-63 and built with step 4 (TIX-68). An allocator makes a
+managed reference, and giblet code may not name a traced type -- so this is
+where the type rule was most likely to break. It does not, and the reasons are
+worth stating because two of them are invariants the collector must keep.
+
+* **Operands arrive untraced, and that is safe.** `array_new`'s fill value and
+  `cell_new`'s value may be managed pointers; a giblet allocator receives them
+  as `Int` or `Prim.Ptr`. That is sound for two reasons, and both are
+  load-bearing: the *caller* roots every operand across the call
+  (`Turkey.Roots.across` counts the instruction's own uses), and the collector
+  **does not move objects**, so a pointer held in an untraced register still
+  names the same object afterwards. A moving collector would break this, and
+  would have to revisit the allocator interface first.
+* **Results leave untraced, and become traced at the opcode.** A giblet
+  allocator returns `Prim.Ptr`. The generated code's `ObjectNew` or `ArrayNew`
+  already has a `traced(Ptr)` result, so the conversion happens at the
+  boundary between opcode and allocator -- nowhere in source, and `checkReps`
+  still forbids making a traced pointer from an address everywhere else.
+* **`closure_new` is split in lowering.** It is the one allocator that makes
+  *two* objects, and it keeps the environment alive across the closure's
+  allocation with a C root frame (`runtime/turkey_runtime.c:837-849`). Giblet
+  code can hold that environment only as an untraced `Prim.Ptr`, which a
+  collection in between would free. So `ClosureNew` becomes two single-object
+  allocations in the *generated* code, where the environment is an ordinary
+  rooted value. Every allocator then calls `heap_allocate` exactly once and
+  holds nothing managed across it, and the type rule needs no exception.
+* **Linkage is the callback mechanism.** Generated code reaches the allocators
+  by symbol at the C ABI (`Turkey.Select.runtimeCall`). A Turkey direct call
+  passes a leading environment, and a binding nothing references does not
+  survive `mono` and `opt`. So a Turkey allocator needs a C-callable export
+  that is kept alive -- which is exactly what TIX-67 builds for the signal
+  handler and the thread entry. That makes TIX-67 a prerequisite of TIX-68 for
+  a reason beyond ordering.
 
 ## The risk worth naming
 

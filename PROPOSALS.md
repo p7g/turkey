@@ -1,8 +1,8 @@
 # Proposals
 
-Eight changes to the language from `notes.txt`, and one that is not -- item 8
-comes from the runtime sequence and is argued here because
-`RUNTIME-IN-TURKEY.md` asks for it to be justified as a language feature rather
+Eight changes to the language from `notes.txt`, and two that are not -- items
+8 and 9 come from the runtime sequence and are argued here because
+`RUNTIME-IN-TURKEY.md` asks for them to be justified as language features rather
 than as a means to that sequence. Each is measured against what the compiler
 does today and against how other languages answered the same question. Nothing
 here is decided; the point is to have the argument written down before any of
@@ -656,7 +656,7 @@ call.
 
 Callbacks are the one absence that is a deferral rather than a decision, and
 they belong to TIX-65 and TIX-67 because they need the non-allocating
-convention that TIX-63 has not built.
+convention that TIX-63 has not built. Item 9 argues them now that it has.
 
 ### 8.4 Strings copy, and only paths need one
 
@@ -893,6 +893,179 @@ rejected with 8.6's error rather than miscompiled.
   <https://deepwiki.com/ziglang/zig/4.5.2-platform-specific-implementations>
 - Darwin's arm64 divergence on variadic arguments:
   <https://dyncall.org/docs/manual/manualse11.html>
+
+---
+
+## 9. `foreign` with a body: Turkey that C can call
+
+Item 8.3 left callbacks as "a deferral rather than a decision", owed to the
+entry and crash-diagnostics port (TIX-67) once giblets existed. Giblets exist
+now (SPEC-DELTAS 73), and three consumers are waiting:
+
+* **the entry thread**, a `pthread_create` start routine;
+* **the crash handler**, a `signal` handler;
+* **the allocators** (TIX-68). Generated code reaches them by symbol at the C
+  ABI (`Turkey.Select.runtimeCall`), so they are the same problem without a
+  function pointer.
+
+What all three need is **a Turkey function under a C symbol, at the C calling
+convention, with no leading environment, that survives `mono` and `opt`
+although nothing in Turkey names it**. Today none of those four holds. Every
+Turkey function takes an environment first (`SsaLower.directCall`), boot's
+LLVM output is `define internal`, a function used as a value becomes a heap
+closure, and `mono._reachable` roots only `main`.
+
+### 9.1 The survey
+
+| | definition form | import form | what entering it costs |
+|---|---|---|---|
+| **Rust** | `extern "C" fn f() { … }` | `extern "C" { fn f(); }` | nothing: no runtime to enter |
+| **Zig** | `export fn f() …` | `extern fn f() …` | nothing; both imply `callconv(.c)` |
+| **Swift** (SE-0495) | `@c(name) func f() { … }` | none: C headers are imported by Clang | nothing beyond Swift's own conventions |
+| **Haskell** | `foreign export ccall "f" f :: …` | `foreign import ccall "f" f :: …` | a generated stub, an initialized RTS (`hs_init`), and a capability to run on |
+| **Go** | `//export F` on an ordinary `func` | `C.f` through the preamble | an M bound to the thread, and a scheduler lock |
+| **OCaml** | none: `Callback.register "name" f`, then `caml_named_value` and `caml_callback` from C | `external f : … = "c_symbol"` | the callback machinery, and `CAMLparam` rooting in the C that holds a value |
+
+**Rust is the form asked for here, already shipped.** The reference puts both
+directions under one keyword and tells them apart by the body. `extern`
+"allows providing function *definitions* that can be called with a particular
+ABI", and an extern block provides "function *declarations* that can be used to
+call functions without providing their *definition*". Zig reaches the same
+pair with two keywords: "Functions marked with `export` or `extern` will have
+the C calling convention by default."
+
+**Haskell is the counterexample on syntax, and its reason does not apply.**
+Import and export are separate forms because "an import declaration defines a
+new variable, whereas an export declaration uses a variable that is already
+defined". Haskell's export names an existing binding and carries only a type.
+A Turkey definition carries its own body, so there is no existing binding to
+point at, and nothing is gained by a second form.
+
+**Go and OCaml are the counterexamples on cost, and the difference is the
+point.** Their callbacks run arbitrary managed code, so entering one sets up
+the runtime:
+* OCaml makes C go through `caml_callback`, and makes the C side root every
+  value with `CAMLparam`.
+* Go binds an M to the calling thread. Measured, C-to-Go calls ran at 1–2 ms
+  per operation on AWS machines under contention, with more than 80% of the
+  time in a scheduler lock (golang/go#19574).
+* Go's own signal handlers get none of that. They run on the gsignal stack
+  under `//go:nosplit`, as "functions that may run without a valid G", where
+  "the garbage collector does not scan system stacks".
+
+That split is the one this proposal draws. **A definition may appear only in a
+giblet module.** The body then holds no traced value, has no root frame, and
+allocates nothing (SPEC-DELTAS 73, checked twice). A C caller has nothing to set
+up, and the call costs what Rust's and Zig's cost. The Go and OCaml machinery
+is what a *managed* callback would need. It stays out until a consumer wants
+one, and that consumer would be the "third consumer that users write" that
+`RUNTIME-IN-TURKEY.md` names as the condition for reopening an effect on
+arrows.
+
+### 9.2 The form
+
+```
+-- a declaration: C defines it, Turkey calls it (item 8, unchanged)
+foreign "write" fun write(fd : Int, buf : Prim.Ptr, count : Int) -> Int
+
+-- a definition: Turkey defines it, C calls it
+foreign "turkey_crash_report" fun crashReport(signal : Int) -> Unit {
+    ...
+}
+```
+
+* **Same signature rules as a declaration.** The seven types of 8.3, at most
+  eight arguments per register file (8.6), a return type always written, and
+  the symbol always written. A definition is a monotype by construction, so
+  there is nothing for `mono` to specialize and nothing for layout sharing to
+  rename.
+* **Legal only in a giblet module.** That is narrower than `Unsafe.`, and it is
+  the gate that makes 9.1's cost argument true. A giblet module may call
+  declarations from `Unsafe.` modules by importing them, as it can today.
+* **Called from Turkey like a declaration.** The call is at the C ABI, to the
+  symbol. That leaves one foreign call path and no second convention to lower.
+* **Kept alive.** A definition is a root of reachability in both compilers'
+  `mono` and in the Python backend's second pass. It is never dropped.
+* **Emitted under its C symbol with external linkage.** Nothing else in the
+  program is exported, so a definition is also the one way a symbol leaves a
+  Turkey object file.
+* **A declaration and a definition of the same symbol in one program is an
+  error.** It would be the linker's duplicate-or-undefined anyway, reported
+  earlier.
+
+**A C `int` parameter arrives half defined.** AAPCS64 leaves the upper 32 bits
+of a register undefined for an `int` argument, which is FINDINGS 102 in the
+other direction. `argc` and a signal number are both `int`, and the body
+sign-extends them from the low half, as `System.IO.cInt` does for results.
+
+**A panic inside a definition sets the flag and returns zero**, which is the
+same as any call in generated code. C has no flag test after the call, so a
+definition that can panic is the C caller's to check, and the two in this
+ticket either never return or report the flag themselves.
+
+### 9.3 What giblet code needs besides the form
+
+Three primitives. They are `Prim.`, so they are spellable only from `lib/`, and
+each is small.
+
+* **`Prim.cString("…") : Prim.Ptr`**: static, NUL-terminated bytes. A crash
+  report prints text, and a giblet cannot hold a `String` literal. The argument
+  must be a literal, and the giblet check admits it on the same terms as
+  `Prim.error`'s.
+* **`Prim.codeAddress(f) : Prim.Ptr`**: the address of a definition's C symbol,
+  for `signal` and `pthread_create`. It is legal only on a definition, because
+  anything else has a leading environment and no C symbol to point at.
+* **`Prim.frameAddress() : Prim.Ptr`**: the caller's frame pointer. The entry
+  thread records it as the outer bound of the collector's stack walk (it is
+  `__builtin_frame_address(0)` today). It is also the first row of
+  `RUNTIME-IN-TURKEY.md`'s gap table, so TIX-68 would need it regardless.
+
+### 9.4 "Does not allocate" is necessary, and a signal handler needs more
+
+A handler can interrupt anything, including the runtime halfway through
+updating the shadow stacks it is about to walk. Giblets guarantee that the
+handler makes nothing the collector must know about. They do not guarantee the
+rest:
+* it calls only async-signal-safe functions (`write` and `_exit`, which rules
+  out today's `snprintf`);
+* it reads structures that may be mid-update. Each shadow-stack push writes
+  the new frame's fields before its head in source order, but nothing stops the
+  C compiler reordering them, so the walk is best-effort, as it is today;
+* it never returns into the faulting instruction.
+
+None of that is checkable by a type rule, and Go does not check it either. Its
+handlers are a convention written down in `runtime/HACKING.md`. So these
+conditions are stated on the handler, in a comment, and are not enforced. The
+type rule still does its part: it is what makes a Turkey function *able* to be
+a handler at all.
+
+### 9.5 The one place giblet code calls managed code
+
+The entry thread calls the program's entry, and the program allocates. The
+allocation summary does not see it, because a foreign call is a leaf to
+`LowIr.summarize`, and `turkey_entry` is a generated symbol reached through a
+declaration. This is sound for a reason the rule does not know: the giblet
+holds nothing managed across the call, and the callee sets up its own roots,
+starting with the globals frame. It is still a crossing the checker cannot
+see, and it goes in FINDINGS 109 as such.
+
+### 9.6 Sources
+
+- Rust, extern function qualifiers and external blocks:
+  <https://doc.rust-lang.org/reference/items/functions.html>
+- Zig, `export` and `extern` functions and their default calling convention:
+  <https://ziglang.org/documentation/master/>
+- Swift SE-0495, `@c` functions:
+  <https://github.com/swiftlang/swift-evolution/blob/main/proposals/0495-cdecl.md>
+- Haskell 2010, foreign export against foreign import:
+  <https://www.haskell.org/onlinereport/haskell2010/haskellch8.html>, and GHC's
+  stubs and `hs_init`: <https://ghc.gitlab.haskell.org/ghc/doc/users_guide/exts/ffi.html>
+- cgo's `//export` and its rules: <https://pkg.go.dev/cmd/cgo>; the cost of
+  C-to-Go calls: <https://github.com/golang/go/issues/19574>
+- Go's signal handlers, nosplit and the system stack:
+  <https://github.com/golang/go/blob/master/src/runtime/HACKING.md>
+- OCaml's `Callback.register` and `CAMLparam`:
+  <https://ocaml.org/manual/5.3/intfc.html>
 
 ---
 

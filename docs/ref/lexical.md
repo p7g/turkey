@@ -101,11 +101,11 @@ unary minus applied to `5`.
 
 An integer literal can be used as either an `Int` or a `Float`. Which one it
 becomes is decided by type inference, as described in
-[Numeric literals](inference.md#numeric-literals). A literal that no numeric
-type can hold exactly is an error. `9223372036854775808` is one past the
-largest `Int`:
+[Numeric literals](inference.md#numeric-literals). A literal larger than the
+largest `Int` is an error, even where a `Float` is wanted.
+`9223372036854775808` is one past the largest `Int`:
 
-<!-- error: this numeric literal is not representable in any numeric type -->
+<!-- error: integer literal out of range: 9223372036854775808 -->
 ```kotlin
 fun main() {
     print(9223372036854775808)

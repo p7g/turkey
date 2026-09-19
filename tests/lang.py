@@ -25,11 +25,14 @@ the native `boot` checks a small program in a fraction of a second.
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import json
 import os
+import re
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,18 +41,47 @@ from tests import bootc
 
 REPO_ROOT = bootc.REPO_ROOT
 LIB = REPO_ROOT / "lib"
+CORPUS = REPO_ROOT / "tests" / "programs"
 WORK = Path(tempfile.gettempdir()) / "turkey-lang"
 
 Source = str | Path
 
 
 class CompileError(AssertionError):
-    """`boot` rejected the program. `message` is what it printed on stderr."""
+    """`boot` rejected the program.
 
-    def __init__(self, message: str, code: int) -> None:
-        super().__init__(message)
-        self.message = message
+    `rendered` is what it printed on stderr -- `file:line:col: stage: message`
+    -- and `message` is the message alone, which is what a test usually means.
+    """
+
+    def __init__(self, rendered: str, code: int) -> None:
+        super().__init__(rendered)
+        self.rendered = rendered
+        self.message = _message_of(rendered)
         self.code = code
+
+
+_STAGES = ("lex error", "parse error", "type error", "internal error",
+           "giblets", "error")
+
+
+def _message_of(rendered: str) -> str:
+    """The message of a rendered diagnostic, without where and which stage."""
+    text = rendered.rstrip("\n")
+    for stage in _STAGES:
+        marker = f": {stage}: "
+        if marker in text:
+            return text.split(marker, 1)[1]
+    return text
+
+
+class Panic(AssertionError):
+    """A program panicked. `message` is what followed `panic: `."""
+
+    def __init__(self, result: Result) -> None:
+        self.message = panic_message(result)
+        super().__init__(self.message)
+        self.result = result
 
 
 @dataclass(frozen=True)
@@ -112,20 +144,28 @@ def _entry(src: Source, modules: dict[str, str] | None) -> Path:
 def _key(command: str, entry: Path) -> str:
     """The cache key for `boot <command>` on `entry`.
 
-    The entry's own bytes, and -- for a `Main.gob`, the one name a program with
-    modules has -- every `.gob` beside and below it, which is what it can import.
-    A single-file corpus program imports only the library, which `build_key`
-    covers.
+    The entry's own bytes and every `.gob` beside and below it, which is what
+    it can import -- except in `tests/programs`, whose single-file programs
+    import only the library, which `build_key` covers. Hashing the whole corpus
+    into each of its programs' keys would make an edit to one a recompile of
+    all of them.
     """
     h = hashlib.sha256()
     h.update(bootc.build_key().encode())
     h.update(command.encode())
     h.update(str(entry).encode())
-    sources = (sorted(entry.parent.rglob("*.gob")) if entry.name == "Main.gob"
-               else [entry])
+    sources = ([entry] if entry.parent == CORPUS
+               else sorted(entry.parent.rglob("*.gob")))
     for path in sources:
         h.update(str(path.relative_to(entry.parent)).encode() + b"\0")
         h.update(path.read_bytes())
+    # A test's throwaway module in `lib/` (`test_foreign`, `test_giblets`),
+    # which `build_key` leaves out so that writing one is not a rebuild. It is
+    # still an input to whatever imports it.
+    for path in sorted(LIB.rglob("Probe_*.gob")):
+        h.update(str(path.relative_to(LIB)).encode() + b"\0")
+        with contextlib.suppress(FileNotFoundError):
+            h.update(path.read_bytes())
     return h.hexdigest()[:24]
 
 
@@ -243,7 +283,7 @@ def output(src: Source, modules: dict[str, str] | None = None) -> str:
 
 
 def fails(src: Source, modules: dict[str, str] | None = None) -> str:
-    """A program that is expected not to compile, and the diagnostic.
+    """A program that is expected not to compile, and its message.
 
     Checked with `boot check`, which reports what the front end and the Core
     checks refuse -- the same thing `driver.check` raised on.
@@ -263,12 +303,37 @@ def panics(src: Source, modules: dict[str, str] | None = None) -> Result:
     return result
 
 
+def execute(src: Source, modules: dict[str, str] | None = None,
+            args: tuple[str, ...] = ()) -> None:
+    """`driver.run`'s shape: print the program's stdout, raise on failure.
+
+    For tests that read what was printed with `capsys`. A compile error raises
+    `CompileError`, a panic `Panic`, after the output before it is printed.
+    """
+    result = run(src, modules, args)
+    sys.stdout.write(result.stdout)
+    if result.code != 0:
+        if "panic: " in result.stderr:
+            raise Panic(result)
+        raise AssertionError(
+            f"exited {result.code}\n{result.stdout}\n{result.stderr}")
+
+
 def panic_message(result: Result) -> str:
     """The message of the panic in `result`, without its trace."""
     for line in result.stderr.splitlines():
         if line.startswith("panic: "):
             return line[len("panic: "):]
     raise AssertionError(f"no panic in\n{result.stderr}")
+
+
+def dump(command: str, src: Source,
+         modules: dict[str, str] | None = None) -> Result:
+    """`boot <command>` on one program -- `types`, `core`, `mono`, `opt` --
+    from the program's own directory. Not cached; a dump is what is tested."""
+    result = _boot(command, _entry(src, modules))
+    return Result(result.stdout.decode("utf-8"), result.stderr.decode("utf-8"),
+                  result.returncode)
 
 
 def types(src: Source, modules: dict[str, str] | None = None) -> dict[str, str]:
@@ -282,4 +347,52 @@ def types(src: Source, modules: dict[str, str] | None = None) -> dict[str, str]:
     for line in result.stdout.decode("utf-8").splitlines():
         name, _, scheme = line.partition(" : ")
         out[name] = scheme
+    return out
+
+
+_KIND = re.compile(r"^type (\S+)(?: \S+)* :: (.+?)(?: = alias)?$")
+
+
+def kinds(src: Source, modules: dict[str, str] | None = None) -> dict[str, str]:
+    """Every type constructor in the program and the kind inferred for it, as
+    `boot decls` prints them: keyed by qualified name (`Main#Boxed`,
+    `Data.Array#Array`, `Prim.Array`)."""
+    result = dump("decls", src, modules)
+    if result.code != 0:
+        raise CompileError(result.stderr, result.code)
+    out: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if (m := _KIND.match(line)):
+            out[m.group(1)] = m.group(2)
+    return out
+
+
+@dataclass(frozen=True)
+class ClassInfo:
+    kind: str
+    methods: tuple[str, ...]
+
+
+_CLASS = re.compile(r"^class (\S+)(?: \S+)* :: (.+)$")
+_METHOD = re.compile(r"^  method (\S+) : ")
+
+
+def classes(src: Source,
+            modules: dict[str, str] | None = None) -> dict[str, ClassInfo]:
+    """Every class in the program, its parameter's kind and its methods, as
+    `boot classes` prints them, keyed by qualified name (`Main#Egal`)."""
+    result = dump("classes", src, modules)
+    if result.code != 0:
+        raise CompileError(result.stderr, result.code)
+    out: dict[str, ClassInfo] = {}
+    current: tuple[str, str, list[str]] | None = None
+    for line in result.stdout.splitlines():
+        if (m := _CLASS.match(line)):
+            if current:
+                out[current[0]] = ClassInfo(current[1], tuple(current[2]))
+            current = (m.group(1), m.group(2), [])
+        elif (m := _METHOD.match(line)) and current:
+            current[2].append(m.group(1))
+    if current:
+        out[current[0]] = ClassInfo(current[1], tuple(current[2]))
     return out

@@ -20,9 +20,7 @@ once more, FINDINGS 65. `boot llvm` prints a `; === <path>` marker before each
 module so that several can share a run even though they cannot share a file.
 """
 
-import contextlib
 import functools
-import io
 import os
 import shutil
 import subprocess
@@ -30,8 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from tests import bootc
-from turkey.driver import run
+from tests import bootc, lang
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BOOT_MAIN = REPO_ROOT / "boot" / "Main.gob"
@@ -102,16 +99,14 @@ def _binary(name: str) -> Path:
 
 @functools.lru_cache(maxsize=None)
 def _reference(name: str) -> str:
-    """What the reference implementation prints, cached like `test_boot`'s."""
-    source = PROGRAMS / name
+    """What the same program prints compiled by `boot`'s arm64 backend.
 
-    def compute() -> str:
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            with contextlib.suppress(SystemExit):
-                run(source.read_text(encoding="utf-8"), str(source), [])
-        return out.getvalue()
-    return bootc.reference("run", source, compute)
+    The two backends share everything above the low IR and nothing below it,
+    so a disagreement is a miscompile by one of them. The arm64 output is in
+    turn checked against the recorded `.expected` by `test_programs`. This used
+    to be the Python implementation running the source (TIX-94).
+    """
+    return lang.output(PROGRAMS / name)
 
 
 @pytest.mark.parametrize("name", COMPILABLE)
@@ -125,9 +120,12 @@ def test_the_corpus_compiles_and_agrees_with_the_reference(name):
     if _cc() is None:
         pytest.skip("no C compiler")
     binary = _binary(name)
-    result = subprocess.run([str(binary)], capture_output=True, text=True)
+    # From the program's own directory, as `test_programs` runs it: a program
+    # may read a file by its bare name (`system.gob`).
+    result = subprocess.run([str(binary)], cwd=PROGRAMS, capture_output=True,
+                            text=True)
     assert result.stdout == _reference(name), (
-        f"{name}: native output differs from the reference implementation")
+        f"{name}: the LLVM backend's output differs from the arm64 backend's")
 
 
 def test_nothing_is_refused():
@@ -166,7 +164,8 @@ def test_a_panic_in_a_callee_stops_the_caller():
 
 
 def _under_stress(name: str) -> subprocess.CompletedProcess:
-    return subprocess.run([str(_binary(name))], capture_output=True, text=True,
+    return subprocess.run([str(_binary(name))], cwd=PROGRAMS,
+                          capture_output=True, text=True,
                           env={"TURKEY_GC_STRESS": "1", "PATH": "/usr/bin"})
 
 
@@ -212,6 +211,7 @@ def test_symbols_are_the_compilers_own_names():
 
 def test_pointer_array_initialization_does_not_allocate_boxes():
     result = subprocess.run([str(_binary("shared_nullaries.gob"))],
+                            cwd=PROGRAMS,
                             env=dict(os.environ, TURKEY_GC_STATS="1",
                                      TURKEY_GC_STRESS="1"),
                             capture_output=True, text=True)

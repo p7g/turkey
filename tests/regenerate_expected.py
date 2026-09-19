@@ -1,31 +1,22 @@
 """Regenerate the golden `.expected` files under tests/programs.
 
-Run from anywhere: `python3 tests/regenerate_expected.py`. Each program is run
-exactly the way `tests/test_programs.py` runs it -- same working directory, same
-capture -- so the goldens and the runner can never drift apart.
+Run from the repository root: `python3 -m tests.regenerate_expected`. Each
+program is compiled and run exactly the way `tests/test_programs.py` does it --
+the same function -- so the goldens and the runner can never drift apart.
 
 Review the diff before committing: a changed golden is either a fix or a
-regression, and only you can tell which.
+regression, and only you can tell which. Nothing else checks these files now;
+there is no second compiler that has to agree with them.
 """
 
 from __future__ import annotations
 
-import os
 import pathlib
-import subprocess
-import sys
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-PROGRAMS = ROOT / "tests" / "programs"
+from tests import lang
+from tests.test_programs import NO_TRACE_YET, PROGRAMS_DIR, conformance
 
-
-def run_program(source: pathlib.Path) -> tuple[str, int]:
-    env = dict(os.environ, PYTHONPATH=str(ROOT))
-    result = subprocess.run(
-        [sys.executable, "-m", "turkey", "run", source.name],
-        cwd=source.parent, env=env, capture_output=True, text=True,
-    )
-    return result.stdout + result.stderr, result.returncode
+PROGRAMS = PROGRAMS_DIR
 
 
 def sources() -> list[pathlib.Path]:
@@ -41,8 +32,14 @@ def name_of(source: pathlib.Path) -> str:
 
 def main() -> int:
     for source in sources():
-        output, code = run_program(source)
-        source.with_suffix(".expected").write_text(output, encoding="utf-8")
+        output, code = conformance(source)
+        golden = source.with_suffix(".expected")
+        if name_of(source) in NO_TRACE_YET:
+            # `boot` prints no panic trace yet (TIX-114), and writing what it
+            # does print would delete the trace the golden records.
+            print(f"{name_of(source)}: kept, since boot prints no trace yet")
+            continue
+        golden.write_text(output, encoding="utf-8")
         expected_failure = name_of(source).startswith("err_")
         if expected_failure != (code != 0):
             word = "fail" if expected_failure else "succeed"
@@ -55,14 +52,9 @@ def main() -> int:
     for suffix, command in ((".types", "types"), (".core", "core"),
                             (".mono", "mono"), (".opt", "opt")):
         for golden in sorted(PROGRAMS.glob(f"*{suffix}")):
-            result = subprocess.run(
-                [sys.executable, "-m", "turkey", command,
-                 golden.with_suffix(".gob").name],
-                cwd=PROGRAMS, env=dict(os.environ, PYTHONPATH=str(ROOT)),
-                capture_output=True, text=True,
-            )
+            result = lang.dump(command, golden.with_suffix(".gob"))
             golden.write_text(result.stdout + result.stderr, encoding="utf-8")
-            print(f"{golden.name}: exit {result.returncode}")
+            print(f"{golden.name}: exit {result.code}")
     return 0
 
 

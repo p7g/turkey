@@ -13,22 +13,22 @@ on the line before its ```kotlin fence (see docs/ref/README.md):
 A ```kotlin fence without a directive is itself a failure: the reference
 promises that its examples are real, and an unmarked one is a promise nobody
 checks.
+
+Every example is compiled by `boot` and run as a native program, through
+`tests.lang`: what a reader who copies it will execute, and the implementation
+that stays when the Python one goes (TIX-94).
 """
 
 from __future__ import annotations
 
-import os
 import re
 import shutil
-import subprocess
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
-from turkey.driver import check, run
-from turkey.errors import TurkeyError, TurkeyPanic
+from tests import lang
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REF_DIR = REPO_ROOT / "docs" / "ref"
@@ -127,73 +127,20 @@ def _collect() -> list[Example]:
 EXAMPLES = _collect()
 
 
-def _program(example: Example, tmp_path: Path) -> tuple[str, str]:
-    """Source and file name: a single example runs as `<input>`, one with
-    modules is written out beside them so imports resolve."""
-    if not example.modules:
-        return example.src, "<input>"
-    for name, src in example.modules.items():
-        target = tmp_path / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(src)
-    main = tmp_path / "Main.gob"
-    main.write_text(example.src)
-    return example.src, str(main)
-
-
-def _check(src: str, filename: str) -> None:
-    if filename == "<input>":
-        check(src)
-    else:
-        check(src, filename, [Path(filename).parent])
-
-
+@pytest.mark.skipif(shutil.which("cc") is None, reason="no C compiler")
 @pytest.mark.parametrize("example", EXAMPLES, ids=lambda e: e.id)
-def test_example(example: Example, tmp_path, capsys) -> None:
-    src, filename = _program(example, tmp_path)
+def test_example(example: Example) -> None:
+    modules = example.modules or None
     if example.mode == "check":
-        _check(src, filename)
+        lang.check(example.src, modules)
     elif example.mode == "error":
-        with pytest.raises(TurkeyError) as exc:
-            _check(src, filename)
-        assert example.arg in exc.value.message, exc.value.message
+        message = lang.fails(example.src, modules)
+        assert example.arg in message, message
     elif example.mode == "run":
-        run(src, filename)
-        assert capsys.readouterr().out == example.output
+        assert lang.output(example.src, modules) == example.output
     elif example.mode == "panic":
-        with pytest.raises(TurkeyPanic) as exc:
-            run(src, filename)
-        assert example.arg in exc.value.message, exc.value.message
-        if example.output is not None:
-            assert capsys.readouterr().out == example.output
-
-
-RUNNABLE = [e for e in EXAMPLES if e.mode in ("run", "panic")]
-
-
-@pytest.mark.parametrize("example", RUNNABLE, ids=lambda e: e.id)
-def test_example_native(example: Example, tmp_path) -> None:
-    """The same program through `turkey run`, whose default backend is the
-    native one: what a reader who copies the example will actually execute."""
-    if shutil.which("cc") is None:
-        pytest.skip("no C compiler")
-    _program(example, tmp_path)
-    main = tmp_path / "Main.gob"
-    if not main.exists():
-        main.write_text(example.src)
-    result = subprocess.run(
-        [sys.executable, "-m", "turkey", "run", "Main.gob"],
-        cwd=tmp_path,
-        env=dict(os.environ, PYTHONPATH=str(REPO_ROOT)),
-        capture_output=True,
-        text=True,
-    )
-    if example.mode == "run":
-        assert result.returncode == 0, result.stderr
-        assert result.stdout == example.output
-    else:
-        assert result.returncode != 0
-        assert "panic: " in result.stderr and example.arg in result.stderr, result.stderr
+        result = lang.panics(example.src, modules)
+        assert example.arg in lang.panic_message(result), result.stderr
         if example.output is not None:
             assert result.stdout == example.output
 

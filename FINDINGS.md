@@ -528,6 +528,57 @@ itself: 2,949,896 lines of assembly to 2,871,946, 2.6% of the whole output in
 root stores and frame-table entries for a null, and the compile time unchanged
 at 102s with the giblets summary added.
 
+### 111. The behavioral tests had been asking the compiler that is going away
+**bug, fixed.** TIX-94. Every test that says what the language does -- the
+`docs/ref` examples, the `.expected` goldens, the diagnostic and panic tests in
+two dozen files -- ran through `turkey.driver`, the Python implementation.
+`boot` was checked against Python stage by stage (`test_boot`), and its native
+binaries against Python's evaluator (`test_native`), but never against the
+recorded behavior directly. Moving those tests onto `boot` (`tests/lang.py`)
+turned up eight differences in its first run, in code that `test_boot` compares
+byte for byte and that compiles `boot` itself:
+
+* **`Int.shr` was a logical shift** in both of `boot`'s backends: `lshr` in
+  `Turkey.Llvm`, `lsr` in `Turkey.Select`, and a comment in the first saying
+  that was what `Prim.intShr` meant. PRIMITIVES.md says arithmetic, and the
+  Python did that. `Int.shr(-8, 1)` was 9223372036854775804. It was invisible
+  to the corpus, and to `boot`, because every other `shr` in the library masks
+  its result -- except `Float.orderKey`, so `Float.totalCompare` put `-NaN`
+  above `-Infinity`.
+* **A shift amount outside 0..63 was not checked** by either backend. arm64
+  masks it to six bits, so `Int.shl(1, 64)` was 1. The check is now in
+  `Data.Int`, once, rather than in each backend.
+* **`-Int.minValue()` wrapped on arm64.** `Turkey.Llvm` traps a unary minus at
+  `Int` through `ssub.with.overflow`; `Turkey.Select` emitted a plain `sub`.
+* **Four diagnostics said `Main#Named`** to an author who wrote `Named` --
+  "is required by", "overlapping instances", "orphan instance", "is missing
+  field(s)". Python strips `Module#` from every message in `TurkeyError`'s
+  constructor; `boot` called `Diag.short` at the sites that remembered to. It is
+  in `Diag.at` and `Diag.whole` now.
+* **A diagnostic with no position had no file name**: `: type error: imports
+  form a cycle`. Twenty raising sites passed `""`, because in Python it is the
+  CLI that catches an error and knows the file. `Diag.fail` falls back to the
+  file being compiled.
+* **An imported module was quoted as `./Wrong.gob`** when the entry was named
+  without a directory. Python quotes an absolute path; `boot` now quotes
+  `Wrong.gob`, relative like the entry, which is the better of the three.
+* **An out-of-range integer literal is a lex error in `boot`** and a type error
+  in Python ("not representable in any numeric type"). Both reject the same
+  programs, and the difference was deliberate and written down in
+  `Turkey.Types`. The reference quoted Python's message; it quotes `boot`'s now,
+  and its "held exactly" wording, which 2^53 contradicted, is corrected.
+* **`boot`'s binaries print no panic trace** -- `panic: ...` and nothing after
+  it -- where three goldens expect `  at f (file:line:col)`. That is TIX-114,
+  and those goldens are checked without the trace until it lands.
+
+Every item is FINDINGS 43 again, at the scale of a test suite: the oracle
+compared `boot` with the Python, so a place where both were wrong, or where the
+comparison never ran, was a place nothing looked. The shift was the sharpest
+case. The Python *evaluator* shifted arithmetically and the Python LLVM backend
+did too, and `boot`'s two backends agreed with each other that it was logical.
+The differential that could have caught it compared `boot` with Python only
+above Core.
+
 ### 98. Two codes that meant the same thing, and a bit thrown away before it was read
 **bug, fixed.** TIX-61. The collector traced a slot whose three-bit layout code
 was `>= 6`, and 6 and 7 were `PTR` and `BOXED` -- both traced. So the two codes

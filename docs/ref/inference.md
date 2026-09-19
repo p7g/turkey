@@ -139,9 +139,11 @@ fun main() {
 3.5
 ```
 
-Whether a literal can have a type depends on its value. It must be exactly
-representable, so `9007199254740993`, which is too precise for a `Float`, can
-only be an `Int`. A literal that no type can represent is an error.
+Whether an integer literal can have a type depends on its value. It can be a
+`Float` only if its magnitude is below 2^53, the range in which a `Float` holds
+every integer exactly, so `9007199254740993` can only be an `Int`. A literal
+past the largest `Int` is rejected by the lexer
+([Integer literals](lexical.md#integer-literals)).
 
 When nothing decides a literal's type, it is **defaulted**: an integer literal
 to `Int`, and a floating-point literal to `Float`. `print(1 + 2)` prints the

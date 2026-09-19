@@ -6,18 +6,12 @@ immediate out of range and a register spelled for the wrong file -- and accepts
 a parallel copy that loses half its values (FINDINGS 95). Everything the
 allocator, the frame layout and the emitter actually decide is invisible to it.
 
-So: compile each program with `boot native`, assemble it, link it against the
-runtime, run it, and diff its output against the reference implementation --
-the same property `tests/test_native.py` asserts for the LLVM path, against the
-same oracle. Not against `tests/programs/*.expected`, which is what `turkey run`
-prints including compile-time warnings, and which is a file someone can update
-(FINDINGS 64).
-
-The runtime object and the reference outputs are `test_native`'s, imported
-rather than rebuilt: they are keyed by content hash on disk, and there is no
-second version of either to be wrong about.
+Whether each corpus program prints what it should is `test_programs`' check:
+every program there is compiled by this backend and diffed against its
+`.expected`. What is left here is what that cannot see -- the module's shape,
+the frame table, and the same programs run collecting at every allocation,
+which must print exactly what they print without it.
 """
-
 from __future__ import annotations
 
 import functools
@@ -28,10 +22,9 @@ from pathlib import Path
 
 import pytest
 
-from tests import bootc
+from tests import bootc, lang
 from tests.bootc import CACHE, runtime_object
 from tests.bootc import digest as _digest, replace_built as _replace_built
-from tests.test_native import _reference
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROGRAMS = REPO_ROOT / "tests" / "programs"
@@ -87,25 +80,6 @@ def _binary(name: str) -> Path:
     return output
 
 
-@pytest.mark.skipif(shutil.which("cc") is None, reason="no C compiler")
-@pytest.mark.parametrize("name", RUNNABLE)
-def test_the_corpus_runs_and_agrees_with_the_reference(name):
-    """The whole property, in one assertion per program.
-
-    A difference here is a miscompile by this backend: the same source, and a
-    reference implementation that has been diffed against a second one at every
-    stage above Core.
-    """
-    binary = _binary(name)
-    result = subprocess.run([str(binary)], capture_output=True, text=True)
-    # Before the output, as the stress twin below does: a panic or a fault
-    # after the last write leaves stdout correct and complete, so comparing
-    # only stdout passes a program that died on its way out.
-    assert result.returncode == 0, result.stderr[:2000]
-    assert result.stdout == _reference(name), (
-        f"{name}: arm64 output differs from the reference implementation")
-
-
 def test_nothing_was_skipped():
     """A function the backend could not emit is a function that is not there.
 
@@ -137,17 +111,19 @@ def test_the_corpus_agrees_under_gc_stress(name):
 
     Without stress a program may collect a handful of times or never, and the
     table is close to dead data: with the walker unwritten, 44 of 44 programs
-    passed the test above and **7** passed this one. It is also the only check
+    passed an unstressed run and **7** passed this one. It is also the only check
     that a root the compiler did not publish is caught -- `mark_grey` keeps the
     expensive membership test under stress, so a missed root becomes a panic on
     the first collection rather than a corruption later.
     """
     env = dict(os.environ, TURKEY_GC_STRESS="1")
-    result = subprocess.run([str(_binary(name))], capture_output=True,
-                            text=True, env=env)
+    # From the program's own directory, as `test_programs` runs it: a program
+    # may read a file by its bare name (`system.gob`).
+    result = subprocess.run([str(_binary(name))], cwd=PROGRAMS,
+                            capture_output=True, text=True, env=env)
     assert result.returncode == 0, result.stderr[:2000]
-    assert result.stdout == _reference(name), (
-        f"{name}: arm64 output under GC stress differs from the reference")
+    assert result.stdout == lang.output(PROGRAMS / name), (
+        f"{name}: arm64 output under GC stress differs from the unstressed run")
 
 
 def test_every_safepoint_label_is_in_the_frame_table():

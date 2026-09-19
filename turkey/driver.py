@@ -41,7 +41,7 @@ from .core import CProgram
 from .typed import TypeTable
 from .coretc import Fams
 from .typed import reduce_deep
-from .types import (Pred, Scheme, TCon, TFun, UNIT, prune, show, show_kind,
+from .types import (Pred, Scheme, TCon, TFun, TVar, UNIT, prune, show, show_kind,
                     show_pred, show_scheme)
 
 
@@ -334,9 +334,12 @@ def _check_main(entry: Module, env: Env, classes: ClassTable) -> None:
                 continue
             scheme = _reduced(binding.scheme, classes)
             body = prune(scheme.body)
+            # Instantiable at `fun() -> Unit` is what is asked: a `main` that
+            # only panics is `forall a. fun() -> a`, and is a `main`.
+            ret = prune(body.ret) if isinstance(body, TFun) else None
             if (isinstance(body, TFun) and not body.params and not scheme.preds
-                    and isinstance(prune(body.ret), TCon)
-                    and prune(body.ret).name == UNIT.name):
+                    and (isinstance(ret, TVar)
+                         or isinstance(ret, TCon) and ret.name == UNIT.name)):
                 continue
             raise TypeError_(
                 f"'main' is the entry point and must be fun() -> Unit, but "

@@ -30,7 +30,7 @@
 # Measured on arm64 macOS, Apple clang 17: 128 s for stage2, 376 s with
 # --fixpoint, of which each self-compile is about 105 s and each link 10 s.
 #
-# Usage: tools/build.sh [--out DIR] [--fixpoint] [--stage1 BINARY]
+# Usage: scripts/build.sh [--out DIR] [--fixpoint] [--stage1 BINARY]
 #
 #   --out DIR        where the stages go (default build/stages)
 #   --fixpoint       also build stage3 and check stage3's output equals stage2's

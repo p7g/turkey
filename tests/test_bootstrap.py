@@ -1,6 +1,6 @@
 """The bootstrap: what is committed, and the fixed point it reaches.
 
-`bootc.binary()` is stage2 of `tools/build.sh`: the committed compiler in
+`bootc.binary()` is stage2 of `scripts/build.sh`: the committed compiler in
 `bootstrap/` compiling today's source. Here stage2 compiles the
 same source again, which links into stage3, and stage3 compiling it once more
 must emit stage2's output byte for byte.
@@ -143,7 +143,7 @@ def _provenance() -> dict[str, str]:
 def test_the_bootstrap_is_what_its_provenance_says():
     """Cheap, so not opt in: the committed artifact against its record.
 
-    `tools/build.sh` checks the same hashes before it builds, so a mismatch
+    `scripts/build.sh` checks the same hashes before it builds, so a mismatch
     here is a build that will refuse to start. The commit has to exist for
     the chain to be walked back to source.
     """

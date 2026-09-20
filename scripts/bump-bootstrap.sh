@@ -14,7 +14,7 @@
 # start from a compiler built before the change. The first bump was made that
 # way, from the last compiler the Python implementation built.
 #
-# Usage: tools/bump-bootstrap.sh [--stage1 BINARY]
+# Usage: scripts/bump-bootstrap.sh [--stage1 BINARY]
 #
 #   --stage1 BINARY  start from this compiler instead of the committed one
 #                    (passed through to build.sh)
@@ -34,7 +34,7 @@ if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
     exit 1
 fi
 
-sh tools/build.sh --out "$OUT" --fixpoint "$@"
+sh scripts/build.sh --out "$OUT" --fixpoint "$@"
 
 mkdir -p "$BOOTSTRAP/runtime"
 gzip -9 -n -c "$OUT/stage3.s" > "$ARTIFACT"

@@ -28,13 +28,13 @@ def test_the_build_fingerprint_covers_boot_and_the_bootstrap(
                      "runtime/turkey_runtime.c", "runtime/turkey_runtime.h",
                      "bootstrap/PROVENANCE",
                      "bootstrap/runtime/turkey_runtime.c",
-                     "tools/build.sh"):
+                     "scripts/build.sh"):
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"-- {relative}\n")
     before = bootc._fingerprint(tmp_path)
     for relative in ("src/Turkey/Regalloc.gob", "bootstrap/PROVENANCE",
-                     "bootstrap/runtime/turkey_runtime.c", "tools/build.sh"):
+                     "bootstrap/runtime/turkey_runtime.c", "scripts/build.sh"):
         target = tmp_path / relative
         original = target.read_bytes()
         target.write_bytes(original + b"\n")

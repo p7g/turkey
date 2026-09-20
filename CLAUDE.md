@@ -92,7 +92,7 @@ too, and regenerating them without reading them is how a regression gets
 committed.
 
 `boot` itself is built from the arm64 assembly committed in `bootstrap/`, by
-`tools/build.sh`, with a C compiler and no Python. `tools/bump-bootstrap.sh`
+`scripts/build.sh`, with a C compiler and no Python. `scripts/bump-bootstrap.sh`
 replaces that committed compiler, which is a deliberate act and its own commit:
 both scripts say when and why at the top.
 

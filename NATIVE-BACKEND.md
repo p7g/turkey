@@ -1498,8 +1498,8 @@ for the LLVM path ("stage2 against stage3 has not been compared") is answered
 here for the arm64 path.
 
 **This is now how `boot` is built.** `bootstrap/` commits this backend's output
-for the compiler, and `tools/build.sh` builds from it with no Python compiler
-(`tools/build.sh`, TIX-95). The fixed point it checks is the ordinary one.
+for the compiler, and `scripts/build.sh` builds from it with no Python compiler
+(`scripts/build.sh`, TIX-95). The fixed point it checks is the ordinary one.
 
 **Speed, best of three, interleaved.** stage2-arm64 runs the corpus in
 **12.84 s** against stage1's **13.83 s**.

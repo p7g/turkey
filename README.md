@@ -67,7 +67,7 @@ The compiler is written in Turkey. On an arm64 Mac, with a C compiler
 installed, it builds from the assembly committed in `bootstrap/`:
 
 ```sh
-sh tools/build.sh
+sh scripts/build.sh
 ```
 
 That leaves a compiler in `build/stages/stage2`. Save the example as
@@ -84,9 +84,9 @@ Run the compiler from the repository root, where it finds `lib/`. Use
 other subcommands print what a stage produced, and `check` just compiles.
 
 The compiler that builds it is `bootstrap/`, which holds its own arm64
-assembly, gzip'd, with the runtime it was emitted against. `sh tools/build.sh
+assembly, gzip'd, with the runtime it was emitted against. `sh scripts/build.sh
 --fixpoint` checks the fixed point: the compiler built from today's source
-emits exactly the assembly it was built from. `tools/bump-bootstrap.sh`
+emits exactly the assembly it was built from. `scripts/bump-bootstrap.sh`
 replaces the committed compiler, which is rare and deliberate; both scripts
 explain themselves at the top.
 

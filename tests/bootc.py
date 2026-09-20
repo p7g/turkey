@@ -1,7 +1,7 @@
 """`boot`, compiled once and shared by every test module that runs it.
 
 Compiling `boot` takes about two minutes, from the committed bootstrap
-by `tools/build.sh`; through the Python compiler it took three.
+by `scripts/build.sh`; through the Python compiler it took three.
 *Running* the compiled binary over the whole corpus takes ten seconds. Every
 ratio in this file follows from those two numbers.
 
@@ -55,7 +55,7 @@ BOOT_MAIN = REPO_ROOT / "src" / "Main.gob"
 # is what lets a build be reused; missing one would mean serving a stale
 # binary, which is worse than rebuilding, so this list errs wide.
 _INPUTS = (("src", "*.gob"), ("lib", "*.gob"),
-           ("bootstrap", "*"), ("tools", "build.sh"),
+           ("bootstrap", "*"), ("scripts", "build.sh"),
            ("runtime", "*.c"), ("runtime", "*.h"))
 
 
@@ -92,7 +92,7 @@ def binary() -> Path:
 
     `$TURKEY_BOOT`, if set, names a `boot` to use instead, and nothing is built.
 
-    `tools/build.sh`'s stage2: the committed bootstrap compiling today's
+    `scripts/build.sh`'s stage2: the committed bootstrap compiling today's
     source. A real executable rather than anything in-process, because a
     subprocess per invocation keeps a crash in `boot` from taking the test
     session with it.
@@ -133,7 +133,7 @@ def _build(cached: Path, output: Path) -> Path:
     staging = cached / f"stages.{os.getpid()}"
     try:
         result = subprocess.run(
-            ["sh", str(REPO_ROOT / "tools" / "build.sh"), "--out", str(staging)],
+            ["sh", str(REPO_ROOT / "scripts" / "build.sh"), "--out", str(staging)],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,

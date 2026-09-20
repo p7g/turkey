@@ -22,7 +22,7 @@ typedef struct TurkeyObject {
     uint64_t slots[];
 } TurkeyObject;
 
-/* A `String` is its bytes (TIX-66): a kind-2 array object, `count` bytes long,
+/* A `String` is its bytes: a kind-2 array object, `count` bytes long,
    the bytes where the slots begin. `lib/Data/String/Type.gob` declares it and
    both backends erase the newtype, so what C is handed is the array itself. */
 static int64_t string_length(void *string) {
@@ -179,8 +179,8 @@ static int64_t stats_collect_clock;
 static FILE *stats_log;
 /* Scales the collection threshold: the collector runs again after this many
    times the current live set has been allocated. 2 is the default because it
-   was measured, not chosen: at 1x the bootstrapped compiler spent 79% of its
-   wall clock inside turkey_collect (FINDINGS 77), collecting a heap that was
+   was measured, not chosen: at 1x the self-compiled compiler spent 79% of its
+   wall clock inside turkey_collect, collecting a heap that was
    ~94% garbage every time; the same run at 2x halves the number of full
    mark-and-sweeps for ~1GB of peak memory. TURKEY_GC_THRESHOLD_SCALE
    overrides it for experiments. */
@@ -190,9 +190,10 @@ static int64_t stats_freed_previous;
 /* Allocations by what the object is. Indexed by `turkey_object_new`'s kind:
     0 an untagged constructor node (an ADT application -- the tree the rewrite
     passes rebuild), 1 a tagged record (a `CRecord`: buckets, storages,
-    dictionaries), 2 an array -- strings among them since TIX-66 -- 3 a
-    closure, 4 a closure environment, 5 a box, 7 a cell. Tells the 900M-object question ("what are they?")
-    apart from "who made them?". Counted only when TURKEY_GC_STATS is set, like
+    dictionaries), 2 an array, strings among them, 3 a closure, 4 a closure
+    environment, 5 a box, 7 a cell. Answers "what are they?" where the site
+    counters answer "who made them?". Counted only when TURKEY_GC_STATS is set,
+    like
     the rest of this: the constructor sites run after `heap_allocate`, which is
     where the flag is resolved. */
 static int64_t stats_by_kind[8];
@@ -360,9 +361,8 @@ static void mark_children(void *value) {
     if (header->kind != HEAP_OBJECT) return;
     TurkeyObject *object = value;
     /* Code 7 is a traced pointer and 6 is a pointer-sized word the collector
-       must not follow -- a raw address (TIX-61). The test used to be `>= 6`,
-       which was right only while every pointer was traced and so nothing was
-       ever written as 6. */
+       must not follow: a raw address. A test of `>= 6` follows both, and
+       collects through an address it has no business reading. */
     if (object->kind == 2) {
         if (object->tag == 7)
             for (int64_t index = 0; index < object->count; ++index)
@@ -392,7 +392,7 @@ static void mark(void *value) {
    The arm64 backend registers roots OCaml's way: no function pushes or pops
    anything, and each call site that may collect has a table entry naming the
    frame offsets of the roots live across it, keyed by the return address
-   (`NATIVE-BACKEND.md`, "The table's encoding, surveyed"). The collector walks
+   for it. The collector walks
    `x29` frame records -- which Apple's ABI requires to be valid at all times --
    and looks each return address up.
 
@@ -726,9 +726,8 @@ int64_t turkey_frame_col(int64_t index) {
  * What generated code calls to make a heap object, and so what the collector
  * hands out: each of these fills a header over `heap_allocate`, which is the
  * safepoint and the region allocator. They stay in C with the collector and
- * move with it (`RUNTIME-IN-TURKEY.md`, staging step 4, TIX-68) -- a managed
- * object cannot come from `malloc`, because it needs a header and an
- * allocation bit in a region this file owns.
+ * move when it does -- a managed object cannot come from `malloc`, because it
+ * needs a header and an allocation bit in a region this file owns.
  *
  * Two shapes are pinned here rather than stated anywhere a layout change could
  * see them: a closure is `[code, environment]`, and a `String` is a byte array
@@ -859,12 +858,12 @@ void *turkey_string_new(const unsigned char *bytes, int64_t length) {
     return array;
 }
 
-/* --------------------------------------------------- float text, until TIX-75
+/* ------------------------------------------------------------------ float text
  *
- * `snprintf` and `strtod` never become foreign declarations -- SPEC-DELTAS 71
- * declines variadics -- so these three stay C until TIX-75 writes shortest
- * round-trip formatting and correctly rounded parsing in Turkey. They read and
- * build strings as byte arrays like everything else now does.
+ * `snprintf` and `strtod` cannot be declared as foreign functions, since the
+ * language has no variadics, so these three stay C until shortest round-trip
+ * formatting and correctly rounded parsing are written in Turkey. They read and
+ * build strings as byte arrays like everything else here.
  */
 
 void *turkey_float_to_string(double value) {
@@ -967,15 +966,14 @@ int32_t turkey_float_can_parse(void *value) {
  *
  * The arguments going in and the exit status coming out. Everything else the
  * outside world was -- the streams and the two file doors -- is Turkey now,
- * over `open`, `read`, `write` and `close` (`lib/System/IO.gob`, TIX-65); the
+ * over `open`, `read`, `write` and `close` (`lib/System/IO.gob`); the
  * arguments are built into strings in Turkey too (`System.Env.args`).
  *
- * What is left is *state*, and it is here because both hosts reach it from
- * outside the program: `turkey_main` below and the JIT's `ctypes` call write
- * the arguments before any Turkey runs, and read the exit flag after the last
- * of it has returned. That makes it the entry section's -- staging step 3 in
- * `RUNTIME-IN-TURKEY.md` -- and it moves when the entry does. `Unsafe.Runtime`
- * is the other side of this seam and shrinks with it.
+ * What is left is *state*, and it is here because it is reached from outside
+ * the program: `turkey_main` below writes the arguments before any Turkey runs
+ * and reads the exit flag after the last of it has returned. It belongs to the
+ * entry sequence and moves when that does. `Unsafe.Runtime` is the other side
+ * of this seam and shrinks with it.
  */
 
 static unsigned char **argument_bytes;
@@ -1059,10 +1057,9 @@ void turkey_exit_clear(void) { exit_requested = 0; exit_status = 0; }
 
 /* -------------------------------------------------------- crash diagnostics
  *
- * A fault in generated code otherwise says nothing at all. The JIT registers
- * no symbols, so the operating system's crash report is a list of unnamed
- * addresses, and a debugger cannot control a hardened interpreter well enough
- * to be attached to one. Meanwhile two shadow stacks that already exist know
+ * A fault in generated code otherwise says nothing at all: the operating
+ * system's crash report is a list of addresses, and the two shadow stacks that
+ * already exist know
  * the answer: `panic_calls` carries the source position of every call that
  * can fail, and the collector's root frames carry the function names. Walking
  * them turns "exited -11, no output" into the Turkey call stack.
@@ -1113,10 +1110,8 @@ void turkey_install_crash_handler(void) {
 
 /* ------------------------------------------------------------- a real binary
  *
- * The JIT reaches the entry through `ctypes` and reads the panic and exit
- * flags back in Python. A compiled program has no Python, so the same three
- * steps -- hand over the arguments, run, report -- are here instead, and the
- * `main` the code generator emits is a call to this with the entry thunk.
+ * Three steps -- hand over the arguments, run, report -- and the `main` the
+ * code generator emits is a call to this with the entry thunk.
  *
  * In C rather than in generated IR because none of it depends on the program:
  * only the entry's *name* does, and that is the argument.
@@ -1135,8 +1130,8 @@ void turkey_install_crash_handler(void) {
  * for it. `main` does nothing but wait, so this costs one thread and no
  * concurrency: the collector still sees exactly one mutator.
  */
-/* The same 512MB `driver.STACK_BYTES` gives the interpreter, and for the
-   same reason: the two hosts should run out of stack in the same place. */
+/* 512MB. A compiler is a tree walk over a whole program, and a Turkey frame is
+   not small, so the default 8MB is reached by ordinary input. */
 #define TURKEY_STACK_BYTES ((size_t)512 * 1024 * 1024)
 
 static void *entry_thread(void *argument) {
@@ -1167,14 +1162,12 @@ static void run_entry(void (*entry)(void)) {
 }
 
 int turkey_main(int argc, char **argv, void (*entry)(void)) {
-    /* Same opt-in as the JIT's: a compiled program is the one that most needs
-       the shadow stacks read back, since there is no Python left to read the
-       flags. */
+    /* Opt-in: reading the frames back costs a signal handler, and a crash
+       report is only useful to someone debugging the runtime itself. */
     if (getenv("TURKEY_SEGV_FRAMES") != NULL) turkey_install_crash_handler();
 
-    /* `argv + 1`: the program's own arguments, with its name dropped, which is
-       what `driver.run` hands the JIT so that the two hosts agree on element
-       zero. */
+    /* `argv + 1`: the program's own arguments, with its name dropped, so
+       that element zero is the first real argument. */
     int count = argc > 0 ? argc - 1 : 0;
     if (count > 0) {
         const unsigned char **bytes =

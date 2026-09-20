@@ -8,8 +8,6 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <pthread.h>
-#include <signal.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -22,7 +20,7 @@ typedef struct TurkeyObject {
     uint64_t slots[];
 } TurkeyObject;
 
-/* A `String` is its bytes (TIX-66): a kind-2 array object, `count` bytes long,
+/* A `String` is its bytes: a kind-2 array object, `count` bytes long,
    the bytes where the slots begin. `lib/Data/String/Type.gob` declares it and
    both backends erase the newtype, so what C is handed is the array itself. */
 static int64_t string_length(void *string) {
@@ -158,6 +156,10 @@ static HeapHeader *region_allocate(size_t bytes) {
     return (HeapHeader *)(region->data + index * region->slot_size);
 }
 static RootFrame *roots;
+
+/* The innermost root frame, for the crash report in `Turkey.Entry`, which
+   walks the chain by `previous` and reads each `function_name`. */
+const void *turkey_roots_head(void) { return roots; }
 static int64_t heap_count;
 static int64_t allocations_since_collection;
 static int64_t collection_threshold = 1024;
@@ -179,8 +181,8 @@ static int64_t stats_collect_clock;
 static FILE *stats_log;
 /* Scales the collection threshold: the collector runs again after this many
    times the current live set has been allocated. 2 is the default because it
-   was measured, not chosen: at 1x the bootstrapped compiler spent 79% of its
-   wall clock inside turkey_collect (FINDINGS 77), collecting a heap that was
+   was measured, not chosen: at 1x the self-compiled compiler spent 79% of its
+   wall clock inside turkey_collect, collecting a heap that was
    ~94% garbage every time; the same run at 2x halves the number of full
    mark-and-sweeps for ~1GB of peak memory. TURKEY_GC_THRESHOLD_SCALE
    overrides it for experiments. */
@@ -190,9 +192,10 @@ static int64_t stats_freed_previous;
 /* Allocations by what the object is. Indexed by `turkey_object_new`'s kind:
     0 an untagged constructor node (an ADT application -- the tree the rewrite
     passes rebuild), 1 a tagged record (a `CRecord`: buckets, storages,
-    dictionaries), 2 an array -- strings among them since TIX-66 -- 3 a
-    closure, 4 a closure environment, 5 a box, 7 a cell. Tells the 900M-object question ("what are they?")
-    apart from "who made them?". Counted only when TURKEY_GC_STATS is set, like
+    dictionaries), 2 an array, strings among them, 3 a closure, 4 a closure
+    environment, 5 a box, 7 a cell. Answers "what are they?" where the site
+    counters answer "who made them?". Counted only when TURKEY_GC_STATS is set,
+    like
     the rest of this: the constructor sites run after `heap_allocate`, which is
     where the flag is resolved. */
 static int64_t stats_by_kind[8];
@@ -360,9 +363,8 @@ static void mark_children(void *value) {
     if (header->kind != HEAP_OBJECT) return;
     TurkeyObject *object = value;
     /* Code 7 is a traced pointer and 6 is a pointer-sized word the collector
-       must not follow -- a raw address (TIX-61). The test used to be `>= 6`,
-       which was right only while every pointer was traced and so nothing was
-       ever written as 6. */
+       must not follow: a raw address. A test of `>= 6` follows both, and
+       collects through an address it has no business reading. */
     if (object->kind == 2) {
         if (object->tag == 7)
             for (int64_t index = 0; index < object->count; ++index)
@@ -392,7 +394,7 @@ static void mark(void *value) {
    The arm64 backend registers roots OCaml's way: no function pushes or pops
    anything, and each call site that may collect has a table entry naming the
    frame offsets of the roots live across it, keyed by the return address
-   (`NATIVE-BACKEND.md`, "The table's encoding, surveyed"). The collector walks
+   for it. The collector walks
    `x29` frame records -- which Apple's ABI requires to be valid at all times --
    and looks each return address up.
 
@@ -453,8 +455,8 @@ static const FrameEntry *frame_entry_for(uintptr_t retaddr) {
     return NULL;
 }
 
-/* The frame `entry_thread` runs the program from, which is the outermost frame
-   any walk of the mutator stack can reach.
+/* The frame `Turkey.Entry`'s entry thread runs the program from, which is the
+   outermost frame any walk of the mutator stack can reach.
 
    Asking pthread for the bounds instead is what this used to do, and it is
    both unportable and less precise: `pthread_get_stackaddr_np` is Darwin's
@@ -462,9 +464,14 @@ static const FrameEntry *frame_entry_for(uintptr_t retaddr) {
    than the high one, and neither says where the program's frames actually
    begin -- only where the thread's stack was mapped. Deriving the bound from
    `TURKEY_STACK_BYTES` is no better, since `pthread_attr_setstacksize` may
-   round up or carve out a guard page. The one frame this runtime creates the
+   round up or carve out a guard page. The one frame the entry creates the
    thread for is a bound it knows exactly. */
 static char *entry_stack_high;
+
+/* Set by `Turkey.Entry`'s entry thread before the program runs, from its own
+   frame (TIX-67): the entry is Turkey now, and this bound is the collector's,
+   so the entry reports it rather than owning it. */
+void turkey_entry_stack_set(void *frame) { entry_stack_high = frame; }
 
 /* Every frame of the current stack, from this one outwards.
 
@@ -481,10 +488,11 @@ static void scan_native_frames(void) {
     if (frame_entry_count == 0) return;
     char *high = entry_stack_high;
     if (high == NULL) {
-        /* Reachable only when `pthread_create` failed and the entry ran on the
-           main thread. Scanning from an unknown outer bound is how a walk runs
-           off the end; not scanning drops live roots silently, which is worse.
-           So say so instead of doing either. */
+        /* Reachable only if something ran the program without going through
+           `Turkey.Entry`, which sets the bound even when it could not make a
+           thread. Scanning from an unknown outer bound is how a walk runs off
+           the end; not scanning drops live roots silently, which is worse. So
+           say so instead of doing either. */
         turkey_panic("no entry stack bound: the frame walker cannot run");
         return;
     }
@@ -670,10 +678,44 @@ void turkey_panic_string(void *message) {
     capture_panic_trace();
 }
 
-int32_t turkey_panicked(void) { return turkey_has_panicked; }
+/* How the program ended, once `turkey_entry_returned` has taken the flag
+   down. See there. */
+static int32_t program_panicked;
+static PanicCallFrame *entry_saved_calls;
+
+int32_t turkey_panicked(void) {
+    return turkey_has_panicked || program_panicked;
+}
 const char *turkey_panic_message(void) { return panic_buffer; }
+
+/* The two ends of the program, as the `turkey_entry` every backend emits
+   brackets it (TIX-67).
+
+   The entry is Turkey now, and in Turkey the panic flag *is* unwinding: every
+   call tests it on return and leaves if it is up. So when the program panics
+   -- or exits, which unwinds the same way -- `Turkey.Entry`'s own code would
+   unwind straight past the report it exists to print. The flag is parked in
+   `program_panicked` instead, where `turkey_panicked` still sees it and no
+   call site does.
+
+   The panic frames are bracketed for the same reason in the other direction:
+   the program's chain starts empty, so a trace names the program's frames and
+   not the entry's, and ends where the entry left it, so a frame the unwound
+   program never popped is not the entry's to trip over. */
+void turkey_entry_started(void) {
+    entry_saved_calls = panic_calls;
+    panic_calls = NULL;
+}
+
+void turkey_entry_returned(void) {
+    program_panicked = turkey_has_panicked;
+    turkey_has_panicked = 0;
+    panic_calls = entry_saved_calls;
+}
+
 void turkey_panic_clear(void) {
     turkey_has_panicked = 0;
+    program_panicked = 0;
     panic_buffer[0] = '\0';
     panic_calls = NULL;
     free(panic_trace);
@@ -695,6 +737,10 @@ void turkey_frame_leave(void *pointer) {
     if (panic_calls != frame) { turkey_panic("unbalanced panic frame"); return; }
     panic_calls = frame->previous;
 }
+
+/* The innermost live panic frame, for the crash report in `Turkey.Entry`: the
+   chain as it stands when the fault hit, not the snapshot a panic takes. */
+const void *turkey_panic_calls_head(void) { return panic_calls; }
 
 int64_t turkey_frame_count(void) {
     return panic_trace_count;
@@ -726,9 +772,8 @@ int64_t turkey_frame_col(int64_t index) {
  * What generated code calls to make a heap object, and so what the collector
  * hands out: each of these fills a header over `heap_allocate`, which is the
  * safepoint and the region allocator. They stay in C with the collector and
- * move with it (`RUNTIME-IN-TURKEY.md`, staging step 4, TIX-68) -- a managed
- * object cannot come from `malloc`, because it needs a header and an
- * allocation bit in a region this file owns.
+ * move when it does -- a managed object cannot come from `malloc`, because it
+ * needs a header and an allocation bit in a region this file owns.
  *
  * Two shapes are pinned here rather than stated anywhere a layout change could
  * see them: a closure is `[code, environment]`, and a `String` is a byte array
@@ -859,12 +904,12 @@ void *turkey_string_new(const unsigned char *bytes, int64_t length) {
     return array;
 }
 
-/* --------------------------------------------------- float text, until TIX-75
+/* ------------------------------------------------------------------ float text
  *
- * `snprintf` and `strtod` never become foreign declarations -- SPEC-DELTAS 71
- * declines variadics -- so these three stay C until TIX-75 writes shortest
- * round-trip formatting and correctly rounded parsing in Turkey. They read and
- * build strings as byte arrays like everything else now does.
+ * `snprintf` and `strtod` cannot be declared as foreign functions, since the
+ * language has no variadics, so these three stay C until shortest round-trip
+ * formatting and correctly rounded parsing are written in Turkey. They read and
+ * build strings as byte arrays like everything else here.
  */
 
 void *turkey_float_to_string(double value) {
@@ -967,15 +1012,11 @@ int32_t turkey_float_can_parse(void *value) {
  *
  * The arguments going in and the exit status coming out. Everything else the
  * outside world was -- the streams and the two file doors -- is Turkey now,
- * over `open`, `read`, `write` and `close` (`lib/System/IO.gob`, TIX-65); the
+ * over `open`, `read`, `write` and `close` (`lib/System/IO.gob`); the
  * arguments are built into strings in Turkey too (`System.Env.args`).
  *
- * What is left is *state*, and it is here because both hosts reach it from
- * outside the program: `turkey_main` below and the JIT's `ctypes` call write
- * the arguments before any Turkey runs, and read the exit flag after the last
- * of it has returned. That makes it the entry section's -- staging step 3 in
- * `RUNTIME-IN-TURKEY.md` -- and it moves when the entry does. `Unsafe.Runtime`
- * is the other side of this seam and shrinks with it.
+ * `Turkey.Entry` sets the arguments before running the program and reads the
+ * exit flag afterwards. `Unsafe.Runtime` exposes this state to Turkey code.
  */
 
 static unsigned char **argument_bytes;
@@ -1056,168 +1097,3 @@ int32_t turkey_exiting(void) { return exit_requested; }
 int64_t turkey_exit_status(void) { return exit_status; }
 
 void turkey_exit_clear(void) { exit_requested = 0; exit_status = 0; }
-
-/* -------------------------------------------------------- crash diagnostics
- *
- * A fault in generated code otherwise says nothing at all. The JIT registers
- * no symbols, so the operating system's crash report is a list of unnamed
- * addresses, and a debugger cannot control a hardened interpreter well enough
- * to be attached to one. Meanwhile two shadow stacks that already exist know
- * the answer: `panic_calls` carries the source position of every call that
- * can fail, and the collector's root frames carry the function names. Walking
- * them turns "exited -11, no output" into the Turkey call stack.
- *
- * Opt-in through `TURKEY_SEGV_FRAMES`, the way `TURKEY_GC_STRESS` is, and for
- * the same reason: taking `SIGSEGV` over for a process that is mostly not
- * this runtime is a debugging choice rather than a default.
- */
-
-static void crash_report(int signal_number) {
-    /* Async-signal-safe: `write` alone, out of a stack buffer. Nothing here
-       allocates, takes a lock, or returns -- the process is already lost, and
-       the only job left is to say where from. */
-    char line[512];
-    const char *header = signal_number == SIGBUS
-        ? "\n*** SIGBUS in generated code\n"
-        : "\n*** SIGSEGV in generated code\n";
-    write(2, header, strlen(header));
-    const char *sites = "  innermost call sites:\n";
-    write(2, sites, strlen(sites));
-    int64_t shown = 0;
-    for (PanicCallFrame *frame = panic_calls;
-         frame != NULL && shown < 20; frame = frame->previous) {
-        const PanicSite *site = frame->site;
-        if (site == NULL || site->line == 0) continue;
-        int n = snprintf(line, sizeof line, "    %s (%s:%" PRId64 ":%" PRId64 ")\n",
-                         site->function ? site->function : "?",
-                         site->file ? site->file : "?", site->line, site->col);
-        if (n > 0) write(2, line, (size_t)n);
-        shown++;
-    }
-    const char *frames = "  enclosing functions, innermost first:\n";
-    write(2, frames, strlen(frames));
-    shown = 0;
-    for (RootFrame *frame = roots; frame != NULL && shown < 40;
-         frame = frame->previous, ++shown) {
-        int n = snprintf(line, sizeof line, "    %s\n",
-                         frame->function_name ? frame->function_name : "?");
-        if (n > 0) write(2, line, (size_t)n);
-    }
-    _exit(139);
-}
-
-void turkey_install_crash_handler(void) {
-    signal(SIGSEGV, crash_report);
-    signal(SIGBUS, crash_report);
-}
-
-/* ------------------------------------------------------------- a real binary
- *
- * The JIT reaches the entry through `ctypes` and reads the panic and exit
- * flags back in Python. A compiled program has no Python, so the same three
- * steps -- hand over the arguments, run, report -- are here instead, and the
- * `main` the code generator emits is a call to this with the entry thunk.
- *
- * In C rather than in generated IR because none of it depends on the program:
- * only the entry's *name* does, and that is the argument.
- */
-/* The entry runs on a thread of its own, for its stack.
- *
- * A compiler is a tree walk, and a Turkey frame is not small: `Opt#expr` roots
- * every live pointer it holds in one array, so its frame is kilobytes, and a
- * deeply nested program overruns the 8MB the main thread gets on macOS. The
- * fault is a write to the guard page, which is a `SIGSEGV` like any other and
- * says nothing -- the handler cannot even run, because running it needs the
- * stack that just ran out.
- *
- * A thread takes its stack size as an attribute and the main thread's cannot
- * be changed once the process is running, so the entry goes on a thread made
- * for it. `main` does nothing but wait, so this costs one thread and no
- * concurrency: the collector still sees exactly one mutator.
- */
-/* The same 512MB `driver.STACK_BYTES` gives the interpreter, and for the
-   same reason: the two hosts should run out of stack in the same place. */
-#define TURKEY_STACK_BYTES ((size_t)512 * 1024 * 1024)
-
-static void *entry_thread(void *argument) {
-    /* Before the program runs, so that a collection at any depth below has it:
-       this frame is the outer bound of every mutator stack walk. */
-    entry_stack_high = (char *)__builtin_frame_address(0);
-    ((void (*)(void))argument)();
-    return NULL;
-}
-
-static void run_entry(void (*entry)(void)) {
-    pthread_attr_t attributes;
-    pthread_t thread;
-    if (pthread_attr_init(&attributes) != 0) {
-        entry();
-        return;
-    }
-    if (pthread_attr_setstacksize(&attributes, TURKEY_STACK_BYTES) != 0 ||
-            pthread_create(&thread, &attributes, entry_thread,
-                           (void *)entry) != 0) {
-        /* No thread to be had: the small stack beats not running at all. */
-        pthread_attr_destroy(&attributes);
-        entry();
-        return;
-    }
-    pthread_attr_destroy(&attributes);
-    pthread_join(thread, NULL);
-}
-
-int turkey_main(int argc, char **argv, void (*entry)(void)) {
-    /* Same opt-in as the JIT's: a compiled program is the one that most needs
-       the shadow stacks read back, since there is no Python left to read the
-       flags. */
-    if (getenv("TURKEY_SEGV_FRAMES") != NULL) turkey_install_crash_handler();
-
-    /* `argv + 1`: the program's own arguments, with its name dropped, which is
-       what `driver.run` hands the JIT so that the two hosts agree on element
-       zero. */
-    int count = argc > 0 ? argc - 1 : 0;
-    if (count > 0) {
-        const unsigned char **bytes =
-            malloc((size_t)count * sizeof(unsigned char *));
-        int64_t *lengths = malloc((size_t)count * sizeof(int64_t));
-        if (bytes == NULL || lengths == NULL) {
-            free((void *)bytes);
-            free(lengths);
-            fputs("turkey: out of memory reading arguments\n", stderr);
-            return 1;
-        }
-        for (int index = 0; index < count; ++index) {
-            bytes[index] = (const unsigned char *)argv[index + 1];
-            lengths[index] = (int64_t)strlen(argv[index + 1]);
-        }
-        turkey_args_set(count, bytes, lengths);
-        free((void *)bytes);
-        free(lengths);
-    } else {
-        turkey_args_set(0, NULL, NULL);
-    }
-
-    run_entry(entry);
-
-    if (turkey_exiting()) {
-        int64_t status = turkey_exit_status();
-        return (int)(status & 0xff);
-    }
-    if (turkey_panicked()) {
-        const char *message = turkey_panic_message();
-        fprintf(stderr, "panic: %s\n", message == NULL ? "" : message);
-        int64_t depth = turkey_frame_count();
-        for (int64_t index = 0; index < depth; ++index) {
-            const char *function = turkey_frame_function(index);
-            const char *file = turkey_frame_file(index);
-            fprintf(stderr, "  at %s (%s:%" PRId64 ":%" PRId64 ")\n",
-                    function == NULL ? "?" : function,
-                    file == NULL ? "?" : file,
-                    turkey_frame_line(index), turkey_frame_col(index));
-        }
-        return 1;
-    }
-    turkey_collect();
-    turkey_gc_report();
-    return 0;
-}

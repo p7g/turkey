@@ -5,9 +5,9 @@
 
 extern int32_t turkey_has_panicked;
 
-/* A `String` is a byte array on the heap (TIX-66), so these are `void *`:
-   `turkey_string_new` is how the entry interns a literal, and the float
-   three stay C until TIX-75. */
+/* A `String` is a byte array on the heap, so these are `void *`:
+   `turkey_string_new` is how the entry interns a literal. The float three are
+   here because formatting and parsing lean on `snprintf` and `strtod`. */
 void *turkey_string_new(const unsigned char *bytes, int64_t length);
 void *turkey_float_to_string(double value);
 double turkey_float_parse(void *value);
@@ -24,10 +24,9 @@ void *turkey_array_new(int64_t length, uint64_t initial, int32_t element_width,
 void *turkey_closure_new(uint64_t code, int64_t capture_count,
                          uint64_t pointer_bitmap);
 
-/* Raw memory: `malloc` and `free`, and deliberately nothing more (TIX-61).
-   Not heap objects -- these have no header, are never collected, and the
-   collector must not be handed one. Temporary: TIX-62's FFI declares `malloc`
-   and `free` directly and both of these go. */
+/* Raw memory: `malloc` and `free`, and deliberately nothing more. Not heap
+   objects -- these have no header, are never collected, and the collector must
+   not be handed one. */
 
 void turkey_root_enter(void *frame, void *values, int64_t count,
                        const char *function_name);
@@ -61,15 +60,17 @@ int32_t turkey_exiting(void);
 int64_t turkey_exit_status(void);
 void turkey_exit_clear(void);
 
-/* Print the Turkey call stack on a fault in generated code, then exit 139.
-   Opt-in: the host installs it when `TURKEY_SEGV_FRAMES` is set, because a
-   `SIGSEGV` handler is not this library's to take by default. */
-void turkey_install_crash_handler(void);
-
-/* The `main` of a compiled program: hands the arguments over, runs `entry`,
-   and turns the panic and exit flags into an exit status. The code generator
-   emits a `main` that is a call to this. */
-int turkey_main(int argc, char **argv, void (*entry)(void));
+/* What the entry and the crash report in `lib/Turkey/Entry.gob` read of the
+   collector's and the panic machinery's state (TIX-67). The entry itself --
+   `turkey_main`, the big-stack thread and the crash handler -- is Turkey, and
+   each program defines those symbols; these stay C because the state they
+   reach is the collector's until it moves too. */
+void turkey_entry_stack_set(void *frame);
+/* Called by the generated `turkey_entry` around the program; see the C. */
+void turkey_entry_started(void);
+void turkey_entry_returned(void);
+const void *turkey_roots_head(void);
+const void *turkey_panic_calls_head(void);
 
 void turkey_panic(const char *message);
 void turkey_panic_string(void *message);

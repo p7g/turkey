@@ -2,13 +2,12 @@ module Turkey.Select (
     Unsupported(..), selectModule,
 )
 
--- The low IR to arm64 (`NATIVE-BACKEND.md`, M28 phase 4).
+-- The low IR to arm64.
 --
--- Built in slices against the corpus, the way the Core lowering was: an
--- opcode with no rule stops one function and is *reported*, so `boot asm`
+-- Incomplete by design rather than by accident: an opcode with no rule stops
+-- one function and is *reported*, so `boot asm`
 -- prints how much of each program was selected and a histogram of what
--- stopped the rest. That report is the plan for the next slice, and it was
--- better at making one than reading the input was (FINDINGS 58).
+-- stopped the rest. That report is the plan for the next slice.
 --
 -- **The output is a different instruction type, not a rewritten one.** That is
 -- the parameterized CFG's whole purpose: after this, a virtual opcode is not
@@ -124,9 +123,9 @@ fun selectModule(m : Module) -> (Array (Func Inst), Array Unsupported, Asm) {
     let done = []
     let skipped = []
     -- One selection per function, answering both the function and, if it
-    -- stopped, why. It used to run twice -- once for each answer -- which
-    -- doubled selection and the root analysis inside it on every function
-    -- (TIX-57).
+    -- stopped, why. Both come out of one run: selection and the root
+    -- analysis inside it are the expensive part, and asking twice doubles
+    -- them.
     for f in m.functions {
         let s = start(f, asm)
         run(s)
@@ -215,8 +214,7 @@ fun incoming(f : Func Low, g : Func Inst) -> BlockId {
 -- Before a safepoint, every root live across it is stored into its slot --
 -- the same stores the LLVM path's `publish` writes, without the mask. What
 -- the mask said at run time, the frame table says as data: the call is marked
--- with the low IR position `Roots.liveAt` answers for (`NATIVE-BACKEND.md`,
--- "Frames, calls and roots, surveyed").
+-- with the low IR position `Roots.liveAt` answers for.
 fun run(s : Sel) -> Unit {
     for var b = 0; b < len(s.source.blocks); b = b + 1 {
         s.at = b
@@ -305,8 +303,8 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                 emit(s, A.CSet(d, condOf(o)))
             }
         }
-        -- `Neg` traps at `Int`, as `Turkey.Llvm` has it: `-minValue()` does
-        -- not exist. It wrapped here, silently (TIX-94).
+        -- `Neg` traps at `Int`: `-minValue()` does not exist, so negating
+        -- it must panic rather than wrap.
         Neg(a) -> if r.class_ == F64 { emit(s, A.FNeg(d, A.reg(a))) }
                   else if r.class_ == I64 {
                       overflowed(s, A.SubS(d, A.xzr, A.reg(a), w),
@@ -345,7 +343,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         ObjectGet(target, index) ->
             emit(s, A.Ldr(d, A.Offset(A.reg(target), 24 + 8 * index), A.W64))
         ObjectTag(target) -> emit(s, A.Ldr(d, A.Offset(A.reg(target), 4), A.W32))
-        -- Raw memory (TIX-61). `Indexed` is arm64's *unscaled* base+index
+        -- Raw memory. `Indexed` is arm64's *unscaled* base+index
         -- addressing, and these offsets are already bytes, so unlike
         -- `ArrayGet` there is no shift to emit and no header to skip.
         PtrLoad(base, off, c) -> {
@@ -477,7 +475,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                         stop(s, "the runtime function " + name)
                     }
                 }
-                -- A declared C symbol (TIX-62). Nothing to look up: the
+                -- A declared C symbol. Nothing to look up: the
                 -- declaration already is the symbol, and the result's file
                 -- comes from the destination's representation rather than
                 -- from a table, because a declaration states the language
@@ -769,8 +767,7 @@ fun constant(s : Sel, d : Reg, n : Int) -> Unit =
 -- what `Prim.intAddWrapping` exists to opt out of -- and division panics on a
 -- zero divisor and on the one quotient that does not fit.
 --
--- **The check stays here rather than moving into the IR**, which is the
--- decision `NATIVE-BACKEND.md` records: LLVM writes
+-- **The check stays here rather than moving into the IR.** LLVM writes
 -- `llvm.sadd.with.overflow`, arm64 reads a flag register the IR has no way to
 -- name, and a target-neutral expansion would pessimize both. Two
 -- implementations of one *rule* is the hazard; two encodings of one *check* is
@@ -886,9 +883,8 @@ fun mostNegative(s : Sel, a : Reg, b : Reg, message : String) -> Unit {
 -- fold it.
 --
 -- Nothing may come between the flag-setting instruction and this `cset`. The
--- register allocator is the thing that could insert one, and it is not written
--- yet -- recorded in `NATIVE-BACKEND.md` so that it is a constraint the
--- allocator is designed against rather than a bug it causes.
+-- register allocator is the thing that could insert one, so it must not move
+-- or spill across this pair.
 fun guardOn(s : Sel, c : A.Cond, message : String) -> Unit {
     let failed = tempValue(s, Ssa.untraced(I1))
     emit(s, A.CSet(A.reg(failed), c))
@@ -946,7 +942,7 @@ fun bits(r : Rep) -> Int = match r.class_ {
 --
 -- Answers whether it handled the name, so that the caller reports the ones
 -- that have neither an entry point nor a rule instead of emitting something
--- plausible for them (FINDINGS 63).
+-- plausible for them.
 fun inlinePrim(s : Sel, d : Reg, name : String,
                args : Array (Reg, A.Bank)) -> Bool =
     match name {
@@ -967,10 +963,7 @@ fun inlinePrim(s : Sel, d : Reg, name : String,
         -- A double's bit pattern and back: `Turkey.Llvm`'s `bitcast`, which on
         -- arm64 is an `fmov` between the two files. `fmov` copies all 64 bits
         -- and converts nothing, so the sign of a zero and a NaN's payload
-        -- survive -- which is the whole contract (PRIMITIVES.md 3.2c).
-        --
-        -- No corpus program reached these, so selection's ratchet stayed green
-        -- while three functions in the compiler's own source stopped here.
+        -- survive -- which is the whole contract of a bit-level conversion.
         -- `tests/programs/float_bits.gob` is the regression.
         "Prim.floatBits" -> {
             let (x, _) = args[0]

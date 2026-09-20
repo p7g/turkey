@@ -12,8 +12,7 @@ module Turkey.Ssa (
     liveness, livenessInOut, liveAfter, termUses, pruneUnreachable,
 )
 
--- The low IR: an SSA control-flow graph, parameterized over its instructions
--- (`NATIVE-BACKEND.md`, M27 phase 0).
+-- The low IR: an SSA control-flow graph, parameterized over its instructions.
 --
 -- The parameter is the design. Instruction selection produces a *different*
 -- instruction type rather than rewriting this one in place, so that after it a
@@ -26,9 +25,9 @@ module Turkey.Ssa (
 --
 -- Three things follow from Turkey rather than from taste:
 --
--- * **A value is a dense index**, because there is no object identity
---   (FINDINGS 10) and so nothing to point at. Everything known about a value
---   lives in an array indexed by it. That is also what Cranelift's entity
+-- * **A value is a dense index**, because there is no object identity and so
+--   nothing to point at. Everything known about a value lives in an array
+--   indexed by it. That is also what Cranelift's entity
 --   references and Go's `ssa.Value` ids are, so the constraint pushes toward
 --   what a backend wants anyway. `Value` and `BlockId` are newtypes and are
 --   therefore free -- a single-field immutable wrapper is its payload and is
@@ -43,10 +42,9 @@ module Turkey.Ssa (
 --   thing, and `Unreachable` is what an unfinished block holds while it is
 --   being built.
 --
--- SSA here is *function-wide*: a definition dominates its uses. The Python
--- backend's rule is block-local, which forces everything crossing an edge
--- through memory and makes promoting it a precondition for every optimization
--- rather than one of them.
+-- SSA here is *function-wide*: a definition dominates its uses. A block-local
+-- rule would force everything crossing an edge through memory, which makes
+-- promoting it a precondition for every optimization rather than one of them.
 
 -- No diagnostics: `verify` answers with complaints rather than failing, so
 -- this module depends on nothing but the standard library.
@@ -93,10 +91,9 @@ instance Eq RepClass {
 
 -- A representation is two facts, not one.
 --
--- The Python backend spells the second as two members of one enum -- `ptr` and
--- `boxed` -- which works until something asks a register class about a
--- `boxed`. A register class and a collector obligation are different
--- questions and both get asked.
+-- Spelling them as members of one enum -- `ptr` beside `boxed` -- works until
+-- something asks a register class about a `boxed`. A register class and a
+-- collector obligation are different questions and both get asked.
 type Rep = Rep {
     class_ : RepClass,
     -- Whether the collector must find this value at a safepoint.
@@ -123,9 +120,8 @@ instance Eq Rep {
     fun eq(a, b) = a.class_ == b.class_ && a.traced == b.traced
 }
 
--- A traced pointer prints `ptr*`: the star is the collector's obligation, and
--- the distinction is exactly what the Python backend's `ptr`/`boxed` pair
--- cannot express while also answering a register class.
+-- A traced pointer prints `ptr*`: the star is the collector's obligation, kept
+-- separate from the register class it is printed beside.
 instance Show Rep {
     fun show(r) = if r.traced { show(r.class_) + "*" } else { show(r.class_) }
 }
@@ -139,17 +135,13 @@ instance Show Rep {
 -- trigger a collection, so an allocating instruction is a **safepoint**, and a
 -- safepoint is where the register allocator has to record which registers hold
 -- traced values. Without that bit a backend has no choice but to root every
--- pointer live anywhere in the function, which is what the Python one does and
--- what FINDINGS 55 measures at 481 slots in a single frame.
+-- pointer live anywhere in the function: one measured frame needed 481 slots
+-- that way, against the handful a safepoint actually requires.
 --
--- It is here from the first commit even though nothing reads it until
--- allocation exists, because retrofitting precise stack maps into a backend
--- that did not plan for them is the rewrite this design is avoiding.
--- `traps` and `diverges` are different questions and the instruction set found
--- the difference. `diverges` is "never returns", which the Python backend
--- already tracks for a call to a bottoming function. `traps` is "may not
--- return" -- an `add` that overflows panics (PRIMITIVES.md 1.1), and a
--- dead-code pass may not delete one on the grounds that its result is unused.
+-- `traps` and `diverges` are different questions. `diverges` is "never
+-- returns", as for a call to a bottoming function. `traps` is "may not return"
+-- -- an `add` that overflows panics -- and a dead-code pass may not delete a
+-- trapping instruction on the grounds that its result is unused.
 type Effects = Effects {
     reads     : Bool,
     writes    : Bool,
@@ -321,9 +313,9 @@ fun predecessors(f : Func i) -> Array (Array BlockId) {
 fun reversePostorder(f : Func i) -> Array BlockId {
     let order : Array BlockId = []
     let seen = Set.new()
-    -- An explicit stack of (block, next successor to visit), because the
-    -- recursive form is depth-first over a graph the size of a function and
-    -- this is a compiler that has already met its own stack (FINDINGS 43).
+    -- An explicit stack of (block, next successor to visit): the recursive
+    -- form is depth-first over a graph the size of a whole function, which is
+    -- deep enough to exhaust the real one.
     let stack = [(f.entry, 0)]
     Set.add(seen, blockId(f.entry))
     while len(stack) > 0 {
@@ -379,8 +371,8 @@ fun dominators(f : Func i) -> Array (Option Int) {
                 let there = blockId(p)
                 -- Only predecessors already given an answer; an unreachable
                 -- one never gets one and is skipped for ever.
-                -- The braces are FINDINGS 22: an assignment cannot be a
-                -- match arm's body.
+                -- The braces are required: an assignment cannot be a match
+                -- arm's body.
                 match idom[there] {
                     None -> {}
                     Some(_) -> {
@@ -451,10 +443,9 @@ fun dominates(idom : Array (Option Int), a : BlockId, b : BlockId) -> Bool {
 --
 -- Run after every pass. A miscompile then becomes a rejected program at the
 -- pass that caused it rather than a wrong answer at the end, which is the
--- property that makes an optimizer safe to build incrementally -- and it
--- matters more here than in the Python backend, because the oracle below Core
--- is differential *execution* and localizes a fault to a program rather than
--- to a line.
+-- property that makes an optimizer safe to build incrementally. It matters
+-- most here because what checks this level otherwise is running the compiled
+-- program, which localizes a fault to a program rather than to a pass.
 fun verify[Inst i](f : Func i) -> Array String {
     let out = []
     let count = len(f.blocks)
@@ -695,8 +686,7 @@ fun showTerm(f : Func i, t : Term) -> String = match t {
 -- crossing an edge is an *argument on that edge*, used by the predecessor's
 -- terminator, and the parameter it becomes is defined in the successor. So
 -- there is no phi to special-case: `uses` and `defs` already say everything,
--- which is the whole argument `NATIVE-BACKEND.md` makes for block parameters
--- over phi nodes.
+-- which is what block parameters buy over phi nodes.
 fun liveness[Inst i](f : Func i) -> Array (Set.Set Int) {
     let (_, out) = livenessInOut(f)
     out
@@ -787,8 +777,8 @@ fun liveAfter[Inst i](f : Func i, at : BlockId,
 -- postorder.
 --
 -- Lowering emits a fallthrough `panic "no match arm applied"` for every
--- `match`, and since SPEC-DELTAS 61 made a non-exhaustive match an error, that
--- block is unreachable in every program that compiles. It is not the only such
+-- `match`, and a non-exhaustive match is an error, so that block is
+-- unreachable in every program that compiles. It is not the only such
 -- block, which is the reason this prunes by *reachability* rather than by
 -- knowing where that panic came from: dropping a block because nothing
 -- branches to it is correct whatever made it unreachable, where dropping it

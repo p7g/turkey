@@ -3,11 +3,10 @@ module Turkey.SsaLower (
     lowerBind, lowerProgram, tagsOf, signatures, signatureOf,
 )
 
--- Core to the low IR (`NATIVE-BACKEND.md`, M27 phase 1).
+-- Core to the low IR.
 --
--- The *logic* of `turkey/backend_lower.py` is what carries across -- what a
--- constructor costs, what a join is, where a value is held -- and its IR is
--- not. Two things follow from that IR being different, and both make this
+-- Two things follow from this IR being an SSA graph rather than a linear
+-- sequence, and both make this
 -- shorter than its ancestor.
 --
 -- **Destination passing, into a block parameter.** An expression is lowered
@@ -16,10 +15,9 @@ module Turkey.SsaLower (
 -- lowered towards the same destination and the merge block's parameter is
 -- where they meet, which is what a phi would have been.
 --
--- **No slots for what merely crosses an edge.** The Python backend's SSA is
--- block-local, so every value that outlives a branch goes through
--- `Function.slots`; here a definition dominates its uses and a slot is only
--- what a `var` genuinely needs.
+-- **No slots for what merely crosses an edge.** A definition dominates its
+-- uses, so a value outliving a branch needs no memory; a slot is only what a
+-- `var` genuinely needs.
 --
 -- Incomplete by construction, and says so: an unhandled Core form raises
 -- `Unsupported` and the caller counts it. That is what makes this buildable in
@@ -65,8 +63,7 @@ type Unsupported = Unsupported { name : String, what : String }
 -- `held_at(expected, callee, decls)` -- the *callee's* abstracted layouts and
 -- not the caller's, which is the whole point. A layout-shared copy holds its
 -- parameters at the layouts its key names, so a caller that read them off its
--- own scheme would hand a boxed value to a body expecting a bare one; see
--- FINDINGS 53 and 54, which are two instances of exactly that.
+-- own scheme would hand a boxed value to a body expecting a bare one.
 type Signature = Signature {
     params : Array Rep,
     result : Rep,
@@ -74,10 +71,9 @@ type Signature = Signature {
 
 -- The state one lowering run shares across every function it makes.
 --
--- Records have reference semantics (FINDINGS 10), so one of these passed to a
--- parent and to the nested `Lower`s its lambdas make is one object -- which is
--- what keeps the symbols unique. That is the same
--- property FINDINGS 10 records the *downside* of, used deliberately here.
+-- Records have reference semantics, so one of these passed to a parent and to
+-- the nested `Lower`s its lambdas make is one object, which is what keeps the
+-- symbols unique. Copying one would silently restart the counter.
 type Lifting = Lifting {
     -- Names one lifted lambda apart from the next. Program-wide rather than
     -- per binding, so two lambdas in two bindings cannot collide.
@@ -243,8 +239,9 @@ fun lowerProgram(program : CProgram, decls : DeclTable)
 }
 
 -- Empty objects have no fields to mutate and the language has no physical
--- equality. Share one per (kind, tag), just as the Python emitter does. Do it
--- in the shared IR so both emitters see ordinary rooted global loads.
+-- equality, so one per (kind, tag) can be shared. Done in the shared IR, so
+-- that both emitters see ordinary rooted global loads rather than each
+-- inventing its own interning.
 fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
     let objects : Map String (Int, Int) = Map.new()
     for f in m.functions {
@@ -379,8 +376,8 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
               sigs : Map String Signature, shared : Lifting)
         -> (Option (Ssa.Func Low), Array (Ssa.Func Low), Option String) {
     -- Not a function: a global whose value the module initializer computes,
-    -- which is its own phase. The two `let`s rather than one destructuring
-    -- binding are FINDINGS 41 -- a control transfer cannot cross one.
+    -- which is its own phase. Two `let`s rather than one destructuring
+    -- binding, because a control transfer cannot cross one.
     let shape = spine(bind.value)
     match shape {
         None -> return (None, [], None)
@@ -422,9 +419,9 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
         Some(why) -> (None, [], Some(why))
         -- Dead blocks dropped here rather than left for each emitter. The
         -- fallthrough panic every `match` gets is unreachable in any program
-        -- that compiles (SPEC-DELTAS 61), and LLVM's own dead-code pass has
-        -- been deleting it on that path all along -- which is exactly why it
-        -- went unnoticed until a second backend had no such pass.
+        -- that compiles, since a non-exhaustive match is rejected. A backend
+        -- with its own dead-code pass deletes it silently; one without emits
+        -- code for a block nothing can reach.
         None -> (Some(Promote.run(f)), pruneAll(l.lifted), None)
     }
 }
@@ -633,7 +630,7 @@ fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
             match otherwise {
                 Some(other) -> lower(l, other, dest)
                 -- A one-armed `if` is the statement form and answers `Unit`
-                -- whatever its branch does (design.md 6.7).
+                -- whatever its branch does.
                 None -> finish(l, L.emit(l.b, ConstUnit, Ssa.untraced(Unit)), dest)
             }
         }
@@ -658,7 +655,7 @@ fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
             -- outer copy's jump to the inner copy's block, which is not a
             -- wrong value but a wrong *edge* -- and the verifier catches it as
             -- a definition that no longer dominates its use, exactly the way
-            -- it caught the same mistake in `env` (FINDINGS 56).
+            -- it caught the same mistake before.
             let hidden = savingJoin(l, name)
             Map.put(l.joins, name, target)
             -- `rest` first: it is what jumps, and the parameters have to exist
@@ -695,10 +692,9 @@ fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
             }
         }
         -- A match is a chain of tests, and the arms all lower towards the
-        -- same destination. This is where destination passing earns the most:
-        -- the Python backend materializes the arm's value into a block
-        -- parameter and then into a slot, because its SSA is block-local;
-        -- here the arm simply jumps to where the value was wanted.
+        -- same destination. This is where destination passing earns the
+        -- most: an arm jumps to where the value was wanted, rather than
+        -- materializing it into a block parameter and then into a slot.
         CMatch(scrutinee, alts) -> {
             let v = value(l, scrutinee)
             let failed = L.block(l.b)
@@ -712,7 +708,7 @@ fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
                 L.into(l.b, test)
                 let was = saving(l, patternVars(alts[i].pat))
                 -- An existential arm's copy is lowered under the layouts its
-                -- pattern names for the constants it opens (SPEC-DELTAS 68).
+                -- pattern names for the constants it opens.
                 let outer = l.layouts
                 l.layouts = openedLayoutsFor(alts[i].pat, outer)
                 pattern(l, alts[i].pat, v, scrutinee.ty, success, failure)
@@ -837,7 +833,7 @@ fun pattern(l : Lower, p : Pat, v : Value, ty : Ty.Type,
 
 -- Opening a packed existential: the tag, then the stored layout codes against
 -- the ones this copy of the arm was lowered for, then the carried dictionaries,
--- then the fields (SPEC-DELTAS 68).
+-- then the fields.
 fun opened(l : Lower, p : Pat, o : Opening, v : Value, ty : Ty.Type,
            success : BlockId, failure : BlockId) -> Unit {
     let name = match p.kind {
@@ -990,11 +986,10 @@ fun literalTest(l : Lower, lit : Lit, v : Value) -> Value {
     L.emit(l.b, Cmp(Eq, v, want), Ssa.untraced(I1))
 }
 
--- A string literal pattern, compared inline (TIX-66). A `String` is its byte
--- array, so this is a length test and then one byte test per byte of the
--- literal -- what a C compiler makes of a `memcmp` against a short constant,
--- and the literals in patterns are keywords. No call and no safepoint.
--- `turkey/backend_lower.py`'s `lower_string_literal` builds the same chain.
+-- A string literal pattern, compared inline. A `String` is its byte array, so
+-- this is a length test and then one byte test per byte of the literal -- what
+-- a C compiler makes of a `memcmp` against a short constant, and the literals
+-- in patterns are keywords. No call, and therefore no safepoint.
 fun stringTest(l : Lower, text : String, v : Value, success : BlockId,
                failure : BlockId) -> Unit {
     let bytes = String.toBytes(text)
@@ -1114,8 +1109,7 @@ fun valueHere(l : Lower, e : Core) -> Value {
                     -- Referred to but not called. Closure conversion does not
                     -- reach this: a primitive has no `CBind`, so there is no
                     -- signature to adapt from, and the fix is a per-primitive
-                    -- adapter that `primitive` would generate. The Python
-                    -- backend refuses it too.
+                    -- adapter that `primitive` would generate.
                     stop(l, "the primitive '" + name + "' used as a value")
                 } else if Map.contains(l.decls.foreigns, name) {
                     -- The same rule, for the same reason: there is no code
@@ -1302,8 +1296,7 @@ fun metadata(reps : Array Rep) -> Int {
 -- integer, or fails to follow a pointer.
 --
 -- The test is `traced` rather than "is a pointer", which is the distinction
--- `Rep` carries and the Python backend's `PTR`/`BOXED` pair cannot make: a
--- code address is a pointer the collector must *not* follow.
+-- `Rep` carries: a code address is a pointer the collector must *not* follow.
 fun bitmap(reps : Array Rep) -> Int {
     var out = 0
     for var i = 0; i < len(reps); i = i + 1 {
@@ -1387,8 +1380,7 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     let g = Ssa.newFunc(symbol, repIn(l.decls, l.layouts, result))
     -- The *parent's* layouts. A closure inside a layout-shared copy holds the
     -- copy's variables at the copy's layouts, and a synthetic binding that
-    -- forgot them would read its captures at the boxed width -- FINDINGS 54,
-    -- and `turkey/backend_lower.py:1084` carries the same comment.
+    -- forgot them would read its captures at the boxed width.
     --
     -- An empty `joins`, because a lambda's body is not a tail position: a
     -- closure outlives the frame that binds the join, so no label is in scope
@@ -1564,8 +1556,8 @@ fun zero(l : Lower, r : Rep) -> Value = match r.class_ {
     _ -> L.emit(l.b, ConstInt(0), r)
 }
 
--- A saturated constructor. Nullary is an object with no fields rather than a
--- shared constant, which is what the Python backend builds too.
+-- A saturated constructor. A nullary one is an object with no fields, interned
+-- per (kind, tag) rather than allocated at each use.
 fun constructor(l : Lower, e : Core, name : String, args : Array Core,
                 rep : Rep) -> Value {
     if name == P.boolFalse || name == P.boolTrue {
@@ -1592,7 +1584,7 @@ fun constructor(l : Lower, e : Core, name : String, args : Array Core,
 }
 
 -- A packed existential: one layout code per hidden variable, then the carried
--- dictionaries, then the fields (SPEC-DELTAS 68). The codes are what an opening
+-- dictionaries, then the fields. The codes are what an opening
 -- compares against the layouts its arm's copy was lowered for.
 fun packed(l : Lower, info : ConInfo, name : String, args : Array Core,
            tag : Int) -> Value {
@@ -1687,7 +1679,7 @@ fun call(l : Lower, e : Core, fn : Core, args : Array Core, rep : Rep) -> Value 
             for a in args { Array.push(supplied, value(l, a)) }
             primitive(l, e, name, supplied, rep)
         } else if Map.contains(l.decls.foreigns, name) {
-            -- A declared C symbol (TIX-62). Everything a runtime call needs
+            -- A declared C symbol. Everything a runtime call needs
             -- and nothing more: no marshalling, because the type mapping is
             -- the seven types that each erase to one representation, and no
             -- coercion, because the declaration fixed every one of them.
@@ -1773,8 +1765,8 @@ fun erased(e : Core) -> Core = match e.kind {
 }
 
 -- A primitive whose machine operation this instruction set has, or a runtime
--- call. The split is the one `NATIVE-BACKEND.md` argues for: a constructor
--- where instruction selection must match, and a symbol where it need not.
+-- call. A machine operation is a constructor, so instruction selection has to
+-- match on it; a runtime call is a symbol, so it need not.
 -- A compiler bug rather than a program that is wrong: top-level names are
 -- module-qualified, so nothing a user writes can collide.
 fun oops(message : String) -> a =
@@ -1793,7 +1785,7 @@ fun primitive(l : Lower, e : Core, name : String, args : Array Value,
         L.into(l.b, L.block(l.b))
         return zero(l, rep)
     }
-    -- Raw load and store (TIX-61), one name per representation. The name
+    -- Raw load and store, one name per representation. The name
     -- carries the class because the IR attaches a `Rep` to every value when
     -- it is emitted: a load whose width were known only at run time would
     -- have no result representation for the register allocator or for
@@ -1808,7 +1800,7 @@ fun primitive(l : Lower, e : Core, name : String, args : Array Value,
         }
         None -> {}
     }
-    -- Pointer arithmetic (TIX-61). An address is an integer held at another
+    -- Pointer arithmetic. An address is an integer held at another
     -- class, so all of this is ordinary integer work with a conversion at
     -- each end -- which is also why none of it is a runtime call, and why no
     -- constant and no comparison is ever held at the `Ptr` class.
@@ -2109,8 +2101,8 @@ type Action
 -- the initializer's. `Turkey.Layout` gives a copy its layouts, and the copy of
 -- a dictionary is a record built here, so an initializer that kept one empty
 -- map would lift the copy's methods with nothing known and read an array of
--- `i1` at the boxed width. That is FINDINGS 54, and it is the reason `Lower`
--- carries `layouts` per binding rather than per program.
+-- `i1` at the boxed width, which is why `Lower` carries `layouts` per binding
+-- rather than per program.
 fun initializer(program : CProgram, decls : DeclTable,
                 globals : Set.Set String, tags : Map String Int,
                 fields : Map String (Array String),

@@ -2,20 +2,19 @@ module Turkey.Llvm (
     emitModule,
 )
 
--- The low IR as LLVM IR text (`NATIVE-BACKEND.md`, M27 phase 2).
+-- The low IR as LLVM IR text.
 --
--- Text rather than a library, which is the difference from `turkey/llvmgen.py`
--- and not a limitation: that one builds `llvmlite` objects and JITs them in
--- process, because it is the *interpreter's* backend and has a Python runtime
--- to hand the result back to. This one is a compiler -- it writes a `.ll` file
--- that `cc` turns into an object and links against `runtime/turkey_runtime.c`
--- -- so the only interface it needs is the one LLVM documents.
+-- Text rather than a library, and that is enough: what comes out is a `.ll`
+-- file that `cc` turns into an object and links against
+-- `runtime/turkey_runtime.c`, so the only interface needed is the one LLVM
+-- documents. It is also the check this path buys -- `cc` typechecks the IR,
+-- and has caught miscompiles no verifier here noticed.
 --
--- Three things make the text form less work here than it would be in Python.
+-- Three things make the text form less work than it looks.
 --
--- **Opaque pointers.** LLVM 15 onwards has one `ptr` type, so the bitcasts
--- `llvmgen.py` emits between object, array, cell and string pointers are gone
--- -- most of them existed only to satisfy a type system this level does not
+-- **Opaque pointers.** LLVM 15 onwards has one `ptr` type, so bitcasts between
+-- object, array, cell and string pointers are gone
+-- -- most of them exist only to satisfy a type system this level does not
 -- need. What remains is `getelementptr` for the offsets, and those the object
 -- layout decides.
 --
@@ -25,8 +24,7 @@ module Turkey.Llvm (
 -- is the name in Core, which is what a backtrace and a disassembly should say.
 --
 -- **Block parameters become phis, and only here.** The IR above this has
--- parameters on blocks, which is the modern choice and the one
--- `NATIVE-BACKEND.md` argues for; LLVM has phis. The conversion is mechanical
+-- parameters on blocks; LLVM has phis. The conversion is mechanical
 -- *because* of an invariant the lowering maintains -- only a `Jump` carries
 -- arguments, and a `Branch`'s targets take none -- so a block's phis are read
 -- off its predecessors' jumps and nothing has to be split. That invariant is
@@ -281,7 +279,7 @@ fun declareRuntime(e : Emit) -> Unit {
 
 -- -- string literals -----------------------------------------------------------------
 
--- One `declare` per C symbol the module actually calls (TIX-62).
+-- One `declare` per C symbol the module actually calls.
 --
 -- Beside the runtime's own, for the reason `Turkey.Runtime`'s header gives for
 -- keeping these lines here: they carry argument types the entry-point table
@@ -372,7 +370,7 @@ fun collectStatics(m : Module, out : Map String Int) -> Unit {
 -- sequence, and every evaluation after that reads the same pointer. It is also
 -- what makes two occurrences of one literal one object, which the language
 -- does not promise but nothing can observe the absence of, there being no
--- object identity (FINDINGS 10).
+-- object identity.
 fun emitLiteral(e : Emit, text : String, index : Int) -> Unit {
     let bytes = String.toBytes(text)
     let n = len(bytes)
@@ -771,7 +769,7 @@ fun emitInst(e : Emit, f : Func Low, i : Low) -> Unit {
                     + Int.toString(Rt.elementWidth(element.class_)) + ", i32 "
                     + Int.toString(Rt.layoutCode(element)) + ")")
         }
-        -- Raw memory (TIX-61). Simpler than the array cases: those widen a
+        -- Raw memory. Simpler than the array cases: those widen a
         -- narrow element to `i64` because an array slot is this compiler's
         -- own layout, and raw memory is someone else's -- a `bool` in a C
         -- struct is one byte and an `int32` is four, so the access is at the
@@ -896,10 +894,9 @@ fun emitInst(e : Emit, f : Func Low, i : Low) -> Unit {
 -- which machine instruction implements it is a fact about the operands. The
 -- same choice `Cmp` makes.
 --
--- Signed division and remainder, because Turkey's `Int` is signed. `Shr` is
--- arithmetic (`ashr`), which is what `Prim.intShr` means (PRIMITIVES.md), and
--- `ShrU` is the logical one. They were both `lshr`, and `Int.shr(-8, 1)` was
--- 9223372036854775804 (TIX-94).
+-- Signed division and remainder, because `Int` is signed. `Shr` is arithmetic
+-- (`ashr`), which is what `Prim.intShr` means, and `ShrU` is the logical one.
+-- Emitting `lshr` for both makes `Int.shr(-8, 1)` a large positive number.
 fun binOpName(o : BinOp, r : Rep) -> String {
     let float = r.class_ == F64
     match o {
@@ -1213,8 +1210,8 @@ fun emitCall(e : Emit, f : Func Low, dst : String, ty : String, r : Rep,
 
 -- A primitive with no machine operation, reached as an opaque symbol.
 --
--- `NATIVE-BACKEND.md`'s line: an opcode is a constructor where a pass must
--- match on it, and a symbol is a string where none does. Nothing above this
+-- An opcode is a constructor where a pass must match on it, and a symbol is a
+-- string where none does. Nothing above this
 -- asks *which* runtime function, so the instruction set does not grow a
 -- constructor per primitive -- and the price is paid exactly here, in one
 -- table, which is the cheapest place for it.
@@ -1284,9 +1281,8 @@ fun emitRuntimeCall(e : Emit, f : Func Low, dst : String, ty : String, r : Rep,
             "Prim.floatFromBits" ->
                 line(e, "  " + dst + " = bitcast i64 " + reg(args[0])
                         + " to double")
-            -- Unordered with itself is exactly NaN. `turkey/llvmgen.py` had
-            -- this rule and this emitter did not; no corpus program asked
-            -- until `float_bits.gob` (FINDINGS 91).
+            -- Unordered with itself is exactly NaN, and the only way to ask:
+            -- every ordered comparison against a NaN is false.
             "Prim.floatIsNaN" ->
                 line(e, "  " + dst + " = fcmp uno double " + reg(args[0])
                         + ", " + reg(args[0]))

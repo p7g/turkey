@@ -25,25 +25,22 @@ module Turkey.Ast (
 
 import Turkey.Types (ConCell)
 
--- Abstract syntax (design.md 3), as the bootstrap compiler represents it.
+-- Abstract syntax, as the compiler represents it.
 --
--- Two decisions here that `turkey/ast.py` did not have to make, both forced by
--- the language and both taken now because retrofitting either would touch every
--- node (plan.txt item 9, M20).
+-- Two decisions shape every node here, both forced by the language.
 --
--- **A mutable record wrapping an immutable variant.** Python's nodes are
--- mutable dataclasses and `turkey/desugar.py` rewrites them *in place*, so
--- everything already holding a node sees the rewrite. Turkey's multi-variant
--- ADTs are immutable by design (design.md 4.5) and its single-variant records
--- are the mutable ones -- so each syntactic category is a record carrying a
--- variant. `Desugar` will assign a new `kind` rather than build a new node, and
--- the rewrite is visible through every reference, exactly as in the Python.
+-- **A mutable record wrapping an immutable variant.** Multi-variant ADTs are
+-- immutable and single-variant records are the mutable ones, so each syntactic
+-- category is a record carrying a variant. `Desugar` rewrites a node by
+-- assigning a new `kind` rather than building a new node, and the rewrite is
+-- then visible through every reference already held -- which is what lets a
+-- rewrite happen after the tree has been shared.
 --
--- **An integer identity.** `turkey/typed.py` keys every expression's inferred
--- type by Python object identity. Turkey has no identity hash and its records
--- have reference semantics but no address a program can see, so the parser
--- stamps a monotone `id` on every node and the tables key on that. It is
--- assigned here, at the only place nodes are made, because a node without one
+-- **An integer identity.** The tables that hold an expression's inferred type,
+-- a use site's evidence and a group's dictionary abstraction all key on the
+-- node, and there is no identity hash: a record has reference semantics but no
+-- address a program can see. So the parser stamps a monotone `id` on every node
+-- as it builds it, which is the only place nodes are made. A node without one
 -- is a node inference cannot talk about.
 --
 -- Declarations are ordinary records: nothing rewrites one in place, and nothing
@@ -57,9 +54,7 @@ import Turkey.Token (quote)
 -- Program-wide rather than per-file, and that is the whole point: the tables
 -- keyed by it -- every expression's inferred type, a use site's evidence, a
 -- group's dictionary abstraction -- hold a whole program at once, so an id that
--- restarted per file would have two nodes sharing an entry. Python keys those
--- tables by object identity, which is unique by construction and so never had
--- to say this.
+-- restarted per file would have two nodes sharing an entry.
 --
 -- Never reset, and never printed. Uniqueness is all that is asked of it, and a
 -- monotone counter gives that for as many programs as one process compiles.
@@ -79,7 +74,7 @@ type Lit
     | LChar(Char)
 
 -- The name the type of a literal goes by, which is what a dump prints and what
--- `turkey/parser.py` stores in `PLit.kind`.
+-- a literal pattern carries.
 fun litKind(l : Lit) -> String = match l {
     LInt(_) -> "Int"
     LFloat(_) -> "Float"
@@ -89,11 +84,11 @@ fun litKind(l : Lit) -> String = match l {
 
 -- A literal, spelled the way the language spells it rather than the host.
 --
--- The tree dump and the Core dump both print literals, and both must print them
--- the same way -- so the rule is here, once, beside the kind it names. A float
--- gets PRIMITIVES.md 3.3's spelling and a string or char gets design.md 2.1's
--- escapes, which is what keeps a control character inside a literal from ending
--- the line it is printed on.
+-- Every dump that prints a literal prints it through here, so they cannot
+-- disagree. A float gets the shortest spelling that reads back as the same
+-- float, and a string or char gets the language's escapes -- which is what
+-- keeps a control character inside a literal from ending the line it is
+-- printed on.
 fun literalText(l : Lit) -> String = match l {
     LInt(n) -> Int.toString(n)
     LFloat(f) -> Float.toString(f)
@@ -104,7 +99,7 @@ fun literalText(l : Lit) -> String = match l {
 -- -- type syntax ------------------------------------------------------------------
 --
 -- What the author wrote. The semantic types inference manipulates are a
--- different thing entirely and arrive with M22.
+-- different thing entirely; see `Turkey.Types`.
 
 type Type = Type {
     id   : Int,
@@ -129,7 +124,7 @@ type Pat = Pat {
     span    : Span,
     kind    : PatKind,
     -- What opening an existential constructor binds, set by inference on the
-    -- `PCon` or `PRecord` that opens one (SPEC-DELTAS 68).
+    -- `PCon` or `PRecord` that opens one.
     opening : Option Opening,
 }
 
@@ -148,7 +143,8 @@ type PatKind
     -- The punning form `C { x }` is expanded to `x = x` by the parser, so a
     -- field is always a pair.
     -- The flag is a trailing `..`: the fields left unnamed are ignored on
-    -- purpose. Without it every field must be named (SPEC-DELTAS 65).
+    -- purpose. Without it every field must be named, so that adding a field to
+    -- a declaration is an error in the patterns that claim to cover all of it.
     | PRecord(String, Array (String, Pat), Bool)
     | PLit(Lit)
     | PTuple(Array Pat)
@@ -247,8 +243,8 @@ type PredKind
 type FunDecl = FunDecl {
     -- From the same supply as every other node's, so a table keyed by node id
     -- can hold declarations and expressions at once. What wants one is the
-    -- dictionary abstraction a signature-checked `fun` is given: Python hangs
-    -- it on the node, and the modules that define its type sit above this one.
+    -- dictionary abstraction a signature-checked `fun` is given, whose type is
+    -- defined in a module above this one and so cannot be a field here.
     id      : Int,
     span    : Span,
     name    : String,
@@ -258,14 +254,14 @@ type FunDecl = FunDecl {
     context : Array Pred,
     -- Set on the local `fun` a lifted loop becomes, and on nothing else. Such
     -- a function has one call site plus its own recursion, so there is nothing
-    -- for a scheme to be used at twice -- and generalizing it left a variable
-    -- in the `Brk` slot that nothing could solve, which kept every lifted loop
-    -- out of reach of the inliner. See `Turkey.Desugar.loopFun`.
+    -- for a scheme to be used at twice. Generalizing one instead leaves a
+    -- variable in the `Brk` slot that nothing can solve, which puts every
+    -- lifted loop out of reach of the inliner. See `Turkey.Desugar.loopFun`.
     monomorphic : Bool,
 }
 
 -- A function this compiler does not compile: a C symbol, and an assertion about
--- its signature that nothing can check (TIX-62, PROPOSALS.md item 8).
+-- its signature that nothing can check.
 --
 -- Its own declaration rather than a `FunDecl` with no body, because a bodiless
 -- `FunDecl` is a class method's signature and the two mean opposite things
@@ -294,8 +290,8 @@ type ConDecl = ConDecl {
     name    : String,
     args    : Array Type,
     fields  : Option (Array (String, Type)),
-    -- An existential constructor's bracket (SPEC-DELTAS 68), as written: the
-    -- bare variables it binds, and its class predicates.
+    -- An existential constructor's bracket, as written: the bare variables it
+    -- binds, and its class predicates.
     binders : Array String,
     context : Array Pred,
 }
@@ -364,8 +360,8 @@ type ImportDecl = ImportDecl {
     name      : String,
     alias     : Option String,
     items     : Option (Array ExportItem),
-    -- `hidden`, not `hiding`: `hiding` is a reserved word
-    -- (design.md 2.1) and so cannot be a field name.
+    -- `hidden`, not `hiding`: `hiding` is a reserved word and so cannot be a
+    -- field name.
     hidden    : Option (Array ExportItem),
     qualified : Bool,
 }
@@ -389,11 +385,9 @@ type Program = Program {
 -- Every variable a pattern binds.
 --
 -- A structural question about the tree and nothing more, which is why it lives
--- here rather than in the one stage that happens to ask it first: `Modules`
--- wants a `let`'s binders to know what a module declares, `Resolve` wants a
--- match arm's to know what is local, and `Infer` will want a parameter's.
--- `turkey/deps.py` holds the Python's copy for the historical reason that
--- dependency ordering asked first.
+-- here rather than in whichever stage happens to ask first: `Modules` wants a
+-- `let`'s binders to know what a module declares, `Resolve` wants a match arm's
+-- to know what is local, and `Infer` wants a parameter's.
 fun patternVars(p : Pat) -> Array String {
     let out = Array.new(4)
     collectPatternVars(p, out)

@@ -1,19 +1,15 @@
 module Turkey.Lexer (tokenize, tokenizeRaw, applyNewlineRule)
 
--- The tokenizer, in two passes (design.md 2, SPEC-DELTAS.md 11).
+-- The tokenizer, in two passes.
 --
 -- `tokenizeRaw` emits a NEWLINE for every line break; `applyNewlineRule` then
 -- decides which of them terminate a production. Keeping the two apart is what
--- makes the subtlest part of the lexical structure testable on its own, and it
--- is how `turkey/lexer.py` is arranged too -- this is a port, and a port that
--- reorganized things would be much harder to diff.
+-- makes the subtlest part of the lexical structure testable on its own.
 --
--- Two deliberate differences from the Python, both toward the spec. Python asks
--- `str.isalpha` and `str.isdigit`, which are Unicode-wide, so a Devanagari
--- digit or a Greek letter would start a numeral or an identifier there;
--- design.md 2.1 says `[a-z_]` and `[0-9]`, and that is what this asks. And an
--- integer literal outside `Int`'s range is a lex error here rather than an
--- unbounded token, which is what PRIMITIVES.md 1.3 requires.
+-- Identifiers and numerals are ASCII: `[a-z_]` starts a name and `[0-9]` a
+-- numeral, so a Greek letter or a Devanagari digit starts neither. An integer
+-- literal outside `Int`'s 64-bit range is a lex error rather than a token that
+-- wraps or widens later.
 
 import Turkey.Diag as Diag
 import Turkey.Source (Source, Span, span)
@@ -47,7 +43,7 @@ let operators = [
     "{", "}", "(", ")", "[", "]",
 ]
 
--- design.md 2.4's following condition, for the keywords among it.
+-- The keywords that can start a sibling production, for the newline rule below.
 let starters = [
     "let", "var", "fun", "type", "class", "instance", "if", "match",
     "while", "for", "loop", "return", "break", "continue", "module",
@@ -58,8 +54,8 @@ let starters = [
 
 fun peek(lx : Lexer) -> Option Char = String.decode(lx.src, lx.at)
 
--- `peek(lx, n)` in the Python. Stepping is O(n) in the offset rather than O(1),
--- which costs nothing: no caller looks further than two characters ahead.
+-- Stepping is O(n) in the offset rather than O(1), which costs nothing here: no
+-- caller looks further than two characters ahead.
 fun peekAt(lx : Lexer, ahead : Int) -> Option Char {
     var here = lx.at
     var left = ahead
@@ -75,8 +71,8 @@ fun peekAt(lx : Lexer, ahead : Int) -> Option Char {
 
 fun atEnd(lx : Lexer) -> Bool = String.atEnd(lx.src, lx.at)
 
--- One code point, keeping the line and column in step. Columns count code
--- points, which is what `turkey/errors.py` counts.
+-- One code point, keeping the line and column in step. A column counts code
+-- points, so it is what a reader would count in their editor.
 fun bump(lx : Lexer) -> Unit {
     match String.step(lx.src, lx.at) {
         None -> {}
@@ -254,8 +250,8 @@ fun lexNumber(lx : Lexer, start : Span, afterDot : Bool) -> Token {
     let text = String.slice(lx.src, from, lx.at)
     match Int.parse(text) {
         Some(n) -> plain(KInt, VInt(n), start)
-        -- PRIMITIVES.md 1.3: `Int` is 64-bit, so a literal past its range is a
-        -- compile error rather than something that wraps or widens.
+        -- `Int` is 64-bit, so a literal past its range is a compile error
+        -- rather than something that wraps or widens.
         None -> oops(lx, "integer literal out of range: " + text, start)
     }
 }
@@ -334,7 +330,7 @@ fun lexChar(lx : Lexer, start : Span) -> Token {
 -- `\u{H...H}` takes one to six hex digits: four cannot reach past the BMP, so
 -- `"\u{1F600}"` would otherwise be unwritable. There is no `\xNN`, and an
 -- escape may not name a surrogate -- together those two rules are what make "a
--- string literal is well-formed UTF-8" true by construction (PRIMITIVES.md 4.6).
+-- string literal is well-formed UTF-8" true by construction.
 fun lexEscape(lx : Lexer) -> Char {
     let start = here(lx)
     bump(lx)
@@ -427,8 +423,8 @@ fun lexWord(lx : Lexer, start : Span) -> Token {
     if Array.contains(keywords, text) {
         plain(KWord(text), VText(text), start)
     } else if startsUpper(text) {
-        -- design.md 2.3: the leading character decides. `_` and lowercase are
-        -- variables; uppercase are type and value constructors.
+        -- The leading character decides: `_` and lowercase are variables,
+        -- uppercase are type and value constructors.
         plain(KConid, VText(text), start)
     } else {
         plain(KIdent, VText(text), start)
@@ -551,11 +547,11 @@ fun isLiteral(k : Kind) -> Bool = match k {
     _ -> False
 }
 
--- design.md 2.4's preceding condition: tokens that can legally end a
--- production. `break`, `continue` and bare `return` are here even though
--- design.md omits them, because a statement ending in one still has to be
--- terminable by a newline. `?` is here because it is a *postfix* operator:
--- `let x = f()?` is a complete statement whose last token is the `?`.
+-- The preceding condition of the newline rule: tokens that can legally end a
+-- production. `break`, `continue` and bare `return` are here because a
+-- statement ending in one still has to be terminable by a newline, and `?`
+-- because it is a *postfix* operator -- `let x = f()?` is a complete statement
+-- whose last token is the `?`.
 fun canEnd(k : Kind) -> Bool {
     if isLiteral(k) { return True }
     match k {
@@ -573,8 +569,8 @@ fun canEnd(k : Kind) -> Bool {
     }
 }
 
--- design.md 2.4's following condition: tokens that can legally start a sibling
--- production. `else` and `|` are deliberately absent. That is what lets
+-- The following condition of the newline rule: tokens that can legally start a
+-- sibling production. `else` and `|` are deliberately absent. That is what lets
 -- `} else` stay one expression, and what lets a match arm's alternative
 -- patterns be split across lines -- the newline before the `|` disappears.
 fun canStart(k : Kind) -> Bool {
@@ -584,7 +580,7 @@ fun canStart(k : Kind) -> Bool {
         KConid -> True
         KWord(word) -> Array.contains(starters, word)
         KOp(op) -> match op {
-            -- `..` for a record pattern's rest on its own line (SPEC-DELTAS 65).
+            -- `..`, so a record pattern's rest can sit on its own line.
             "(" | "[" | "{" | "-" | "!" | ".." -> True
             _ -> False
         }

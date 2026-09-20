@@ -50,9 +50,9 @@ import Turkey.Opt as Opt
 import Turkey.Ast (Decl(..), Stmt(..), StmtKind(..), patternVars)
 
 -- Where the language's own library lives: `TURKEY_LIB` if it is set, and
--- otherwise `lib` relative to where this is run from. The Python finds it beside
--- its own source; a compiled binary has no such thing to find, so the default
--- is the repository root. The variable is what lets a program be compiled from
+-- otherwise `lib` relative to the working directory. A compiled binary has no
+-- source tree of its own to look beside, so the default is to be run from the
+-- repository root. Setting the variable is what lets a program be compiled from
 -- its own directory, so that its diagnostics quote it by its bare name.
 fun libRoot() -> String = match Env.get("TURKEY_LIB") {
     Some(root) -> root
@@ -179,9 +179,9 @@ fun dumpCore(b : String.Builder, path : String) -> Unit {
 
 -- The lowering, and the check that makes it evidence rather than a claim.
 --
--- The check is not optional and is not a flag. "Evidence checkable rather than
--- trusted" (plan.txt item 5) is not true of a check nobody runs, so it runs the
--- way exhaustiveness does: always, on every program.
+-- The check is not optional and is not a flag. Evidence that is checkable but
+-- unchecked is evidence nobody has checked, so it runs the way exhaustiveness
+-- does: always, on every program.
 fun lowered(checked : Checked) -> Core.CProgram {
     let lowerer = Lower.newLowerer(checked.decls, checked.classes, checked.env,
                                    checked.types)
@@ -254,17 +254,17 @@ fun optimized(checked : Checked, entry : Modules.Module) -> Core.CProgram {
 }
 
 -- Everything a compile checks, and no dump: the front end, the elaboration and
--- every check on the Core after it, which is what `turkey check` (the Python
--- `driver.check`) does. What it prints is the warnings, on stderr; a program it
--- rejects is reported the way every stage reports one, and exits 1.
+-- every check on the Core after it. What it prints is the warnings, on stderr;
+-- a program it rejects is reported the way every stage reports one, and exits
+-- 1.
 fun checkOnly(path : String) -> Unit {
     let (checked, entry) = checkProgram(path)
     reportWarnings(checked, path)
     let _ = optimized(checked, entry)
 }
 
--- On stderr, as `turkey run` reports them, so that the stderr of a program
--- compiled here and then run is what the Python printed for the same program.
+-- On stderr, and prefixed with the file, so that a warning is distinguishable
+-- from whatever the compiled program itself prints.
 fun reportWarnings(checked : Checked, path : String) -> Unit {
     for w in checked.warnings { IO.stderr(path + ":" + Diag.short(w) + "\n") }
 }
@@ -281,10 +281,9 @@ fun dumpOpt(b : String.Builder, path : String) -> Unit {
 -- `Ssa.verify` owns one graph's shape, `LowIr.checkReps` each instruction's
 -- representations, and `LowIr.checkCalls` the agreement between graphs -- a
 -- call's arity and representations against its callee's signature, which is
--- the property the signature table exists for. All three were printed by the
--- `ssa` dump and nowhere else, so a real compile trusted what only a dump
--- checked (TIX-86). They found nothing in the corpus or in `boot` when they
--- were made fatal; the giblets check is TIX-63's.
+-- the property the signature table exists for. All three run on every compile
+-- and not only under the `ssa` dump: a check that runs only when someone asks
+-- to look is a check a real compile does not have.
 fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable, path : String)
         -> (SsaLower.Module, Array SsaLower.Unsupported) {
     let (module_, skipped) = SsaLower.lowerProgram(program, decls)
@@ -310,12 +309,12 @@ fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable, path : String)
     (module_, skipped)
 }
 
--- The program as arm64 assembly (`NATIVE-BACKEND.md` M28 phase 5).
+-- The program as arm64 assembly: what the assembler reads.
 --
--- `asm` above prints the machine IR and its measurements -- virtual
--- registers, the verifiers, the histograms -- and this prints what the
--- assembler reads. Two commands rather than a flag, because they answer
--- different questions and every test of the first parses its numbers.
+-- `asm` above prints the machine IR and its measurements -- virtual registers,
+-- the verifiers, the histograms -- and this prints the text. Two commands
+-- rather than a flag, because they answer different questions and every test of
+-- the first parses its numbers.
 --
 -- **A whole module.** The functions, then the entry sequence, the panic
 -- messages, the module's data -- globals, string literals, the permanent root
@@ -372,13 +371,12 @@ fun dumpNative(b : String.Builder, path : String) -> Unit {
     Emit.emitFrameTable(layouts, b)
 }
 
--- The program as arm64 assembly (`NATIVE-BACKEND.md` M28 phase 4).
+-- The machine IR, with what selection could not translate.
 --
--- Incomplete and says so, the way the Core lowering did: an opcode with no
--- selection rule stops one function and is counted, so the histogram at the
--- end is the plan for the next slice. What it prints is what the system
--- assembler accepts, because `as` is the oracle the encoder will be checked
--- against once there is one (`LINKER.md`).
+-- Incomplete and says so: an opcode with no selection rule stops one function
+-- and is counted, so the histogram at the end names what is missing. The text
+-- is what the system assembler accepts, which is what makes `as` able to check
+-- it.
 fun dumpAsm(b : String.Builder, path : String) -> Unit {
     let (checked, entry) = checkProgram(path)
     let program = optimized(checked, entry)
@@ -597,7 +595,7 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
     }
 }
 
--- The program as LLVM IR text, ready for `cc` (`NATIVE-BACKEND.md` phase 2).
+-- The program as LLVM IR text, ready for `cc`.
 --
 -- Written to stdout like every other dump, because `boot` has no way to start
 -- a process: there is no `Prim.exec`, so it cannot invoke the C compiler
@@ -620,16 +618,16 @@ fun dumpLlvm(b : String.Builder, path : String) -> Unit {
     let (text, missing) = Llvm.emitModule(module_, main)
     -- One marker per module, so several programs can be compiled by *one*
     -- process. Two modules cannot share a `.ll` file -- the symbols collide --
-    -- but they can share a run, and starting this program means compiling it:
-    -- 2:42 of the 2:50 a program costs is `boot` itself (FINDINGS 61). A
-    -- caller splits on this line; every other dump concatenates unambiguously
-    -- for the same reason and this is the marker that makes it true here too.
+    -- but they can share a run, which matters because starting this program
+    -- costs far more than compiling a small one with it. A caller splits on
+    -- this line; every other dump concatenates unambiguously for the same
+    -- reason, and this is the marker that makes it true here too.
     String.push(b, "; === " + path + "\n")
     if len(missing) > 0 {
-        -- Refused rather than emitted. A primitive with no rule used to become
-        -- a zero of the wrong type, which `cc` rejected somewhere unrelated --
-        -- and would have become a wrong *program* wherever the types happened
-        -- to line up.
+        -- Refused rather than emitted. A primitive with no rule would
+        -- otherwise become a zero of the wrong type: rejected by `cc` somewhere
+        -- unrelated at best, and a wrong program wherever the types happened to
+        -- line up.
         String.push(b, "; FAILED: no rule for " + String.join(missing, ", ")
                        + "\n")
         return
@@ -639,11 +637,10 @@ fun dumpLlvm(b : String.Builder, path : String) -> Unit {
 
 -- The low IR, and how much of the program reached it.
 --
--- There is no byte-identical oracle below Core and there should not be: the
--- Python backend is a JIT whose IR this one deliberately does not copy
--- (`NATIVE-BACKEND.md`). What checks this instead is `Turkey.Ssa.verify`,
--- run over everything that lowered -- so a malformed graph is a complaint
--- naming the function that produced it rather than a wrong answer later.
+-- Nothing below Core is checked by comparing dumps: what a backend is checked
+-- by is what the compiled program does. `Turkey.Ssa.verify` runs over
+-- everything that lowered, so a malformed graph is a complaint naming the
+-- function that produced it rather than a wrong answer later.
 --
 -- The lowering is incomplete and reports it. The count is the progress
 -- signal: a Core form nothing handles yet stops one function, not the run.
@@ -739,11 +736,10 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
 
 -- `main`, if the entry module defines one, is `fun() -> Unit`.
 --
--- SPEC-DELTAS 21 calls a zero-argument `main` and 58 keeps it returning `Unit`,
--- and neither was checked: a `main` returning a value ran and dropped it, and
--- one taking a parameter reached the backend and crashed it. Checked on the
--- scheme, so a `main` that generalized is refused with the type it was given.
--- `turkey/driver.py`'s `_check_main` is the other half.
+-- Checked on the scheme once inference is done, so a `main` that generalized is
+-- refused with the type it was given. Without this a `main` returning a value
+-- runs and drops it, and one taking a parameter reaches the backend and crashes
+-- it -- both of which a reader is entitled to hear about as a type error.
 fun checkMain(entry : Modules.Module, env : Constraints.Env,
               classes : Classes.ClassTable) -> Unit {
     for item in entry.program.decls {

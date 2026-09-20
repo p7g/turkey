@@ -1,24 +1,22 @@
 module Turkey.Parser (parse, collectTycons, builtinTycons)
 
--- Recursive descent (design.md 3), ported from `turkey/parser.py`.
+-- Recursive descent.
 --
--- The decisions that file records hold here unchanged: types and expressions
--- have separate entry points, which is what tells `fun(Int) -> Int` from
--- `fun(x) -> Int = e`; `noRecord` is set while reading the scrutinee of
--- `if`/`while`/`match` and the iterable of `for ... in`, so `if Foo { ... }` is
--- a condition and a block rather than a record construction; and a type
--- declaration is classified per design.md 7 against the type constructor names
--- a pre-pass collected, so a type may mention one declared later in the file.
+-- Three decisions shape the whole file. Types and expressions have separate
+-- entry points, which is what tells `fun(Int) -> Int` from `fun(x) -> Int = e`.
+-- `noRecord` is set while reading the scrutinee of `if`/`while`/`match` and the
+-- iterable of `for ... in`, so `if Foo { ... }` is a condition and a block
+-- rather than a record construction. And a type declaration is classified
+-- against the type constructor names a pre-pass collected, so a type may
+-- mention one declared later in the file.
 --
--- One thing genuinely differs, and it is the language's doing. Python
--- backtracks by *catching* a `ParseError` in two places -- deciding whether a
--- method is a signature, and whether a `for` is the `in` form or the C-style
--- one. Turkey has no exceptions, so neither speculation can be a failed parse
--- that is caught and undone. Both are decided instead by a token scan that
--- looks for the one thing that distinguishes the two readings, before either is
--- attempted. `_rhsHasAlternatives` was already such a scan in the Python, so
--- this is the shape the file was reaching for rather than a workaround: a
--- speculative parse decides by failing, and a scan decides by looking.
+-- **Nothing here backtracks.** There are no exceptions to catch, so a
+-- speculative parse could not be undone even if one were attempted. Where two
+-- readings are possible -- a method signature against a method with a body, the
+-- `for ... in` form against the C-style header -- a token scan looks ahead for
+-- the one thing that tells them apart, and only then is either parsed. Keep new
+-- ambiguities to that shape: a scan decides by looking, where a speculative
+-- parse would have to decide by failing.
 
 import Turkey.Ast
 import Turkey.Diag as Diag
@@ -47,7 +45,8 @@ fun parse(source : Source, known : Array String) -> Program {
     parseProgram(p)
 }
 
--- design.md 7's pre-pass: every `type CONID` name declared in this file.
+-- The pre-pass: every `type CONID` name declared in this file, so that a
+-- declaration can mention a type constructor declared after it.
 fun collectTycons(toks : Array Token) -> Array String {
     let names = Array.slice(builtinTycons, 0, len(builtinTycons))
     for var i = 0; i + 1 < len(toks); i = i + 1 {
@@ -82,9 +81,8 @@ fun advance(p : P) -> Token {
     tok
 }
 
--- `advance` for its effect alone. A discarded value is an error (SPEC-DELTAS
--- 66), and moving past a token the caller has already looked at is most of
--- what a parser does.
+-- `advance` for its effect alone. A discarded value is an error, and moving
+-- past a token the caller has already looked at is most of what a parser does.
 fun step(p : P) -> Unit {
     let _ = advance(p)
 }
@@ -191,7 +189,7 @@ let exprStart = [
 
 let patternStart = ["INT", "FLOAT", "STRING", "CHAR", "IDENT", "CONID", "("]
 
--- Loosest first (design.md 3.5).
+-- Loosest first.
 let precedence = [
     ["||"],
     ["&&"],
@@ -360,7 +358,7 @@ fun parseTypeDecl(p : P) -> TypeDecl {
     while at(p, "IDENT") { Array.push(params, text(advance(p))) }
     skipToken(p, "=")
 
-    -- design.md 7. A `|` or a `{` payload means data type outright. A bare
+    -- A `|` or a `{` payload means data type outright. A bare
     -- `CONID args*` is a data type when the head does not name an existing type
     -- constructor -- or when it names the type being declared, which is the
     -- newtype case and not a recursive alias.
@@ -411,7 +409,7 @@ fun parseDataRhs(p : P, s : Span, name : String, params : Array String) -> TypeD
 
 -- `[s, Error e]` -- the variables an existential constructor hides. Read like a
 -- `fun`'s context, with a bare variable as one more form and an equality
--- refused (SPEC-DELTAS 68).
+-- refused.
 fun parseConContext(p : P) -> (Array String, Array Pred) {
     let binders = Array.new(1)
     let preds = Array.new(1)
@@ -472,10 +470,10 @@ fun parseConDecl(p : P) -> ConDecl {
     }
 }
 
--- What separates two fields in braces: a comma, a significant newline, or both
--- (SPEC-DELTAS 64), in a declaration, a construction and a pattern alike. A
--- newline that survived the newline rule ended the field, so what follows it
--- must be a field or the closing brace -- see `turkey/parser.py`.
+-- What separates two fields in braces: a comma, a significant newline, or both,
+-- in a declaration, a construction and a pattern alike. A newline that survived
+-- the newline rule ended the field, so what follows it must be a field or the
+-- closing brace.
 fun fieldSeparator(p : P) -> Bool {
     if eat(p, ",") {
         skipNewlines(p)
@@ -614,9 +612,8 @@ fun parseFunDecl(p : P, allowSignature : Bool) -> FunDecl {
 
 -- Is this method a signature rather than a definition?
 --
--- Python decides by *trying*: it parses the parameter list as types and undoes
--- that on failure or when a body turns up. With no exceptions the same question
--- is answered by looking, and what it looks for is the body: a definition has
+-- Answered by looking rather than by parsing and undoing, since there is
+-- nothing to undo a parse with. What it looks for is the body: a definition has
 -- an `=` or a `{` after its parameter list and a signature has neither.
 --
 -- The scan starts at the `(` and runs to the end of the declaration at bracket
@@ -668,7 +665,7 @@ fun parseSignature(p : P, s : Span, name : String, context : Array Pred) -> FunD
     }
 }
 
--- `foreign "symbol" fun name(params) -> ret` (TIX-62).
+-- `foreign "symbol" fun name(params) -> ret`.
 --
 -- The C symbol is always written, even when it is the Turkey name spelled the
 -- same way, so which of the two names is which is never something a reader has
@@ -1193,7 +1190,8 @@ fun parseAtom(p : P) -> Expr {
         "while" -> {
             step(p)
             if at(p, "let") || at(p, "var") {
-                -- `loop { match e { p -> A, _ -> break } }`, as in Python.
+                -- `while let p = e { B }` is `loop { match e { p -> B,
+                -- _ -> break } }`: the pattern failing is what ends the loop.
                 let s = tok.span
                 let (pat, value, body) = parseBindingCondition(p)
                 let m = mkExpr(p, s, EMatch(value, [
@@ -1324,9 +1322,10 @@ fun parseIf(p : P) -> Expr {
     mkExpr(p, s, EIf(cond, then, otherwise))
 }
 
--- `if let p = e { A } else { B }` is `match e { p -> A, _ -> B }`, desugared
--- here for the reason `turkey/parser.py` gives (SPEC-DELTAS 63). Without an
--- `else` the other arm is `()`.
+-- `if let p = e { A } else { B }` is `match e { p -> A, _ -> B }`, built here
+-- rather than left for a later pass: nothing downstream needs to know the form
+-- existed, and a `match` is what every stage already handles. Without an `else`
+-- the other arm is `()`.
 fun parseIfLet(p : P, s : Span) -> Expr {
     let (pat, value, then) = parseBindingCondition(p)
     var otherwise = mkExpr(p, s, EUnit)
@@ -1369,7 +1368,7 @@ fun parseBindingCondition(p : P) -> (Pat, Expr, Expr) {
 }
 
 -- The condition is a list in the grammar so that chaining can be added without
--- a retrofit; only the one-element list is implemented (SPEC-DELTAS 63).
+-- a retrofit; only the one-element list is implemented.
 fun refuseChainedCondition(p : P) -> Unit {
     if at(p, ",") {
         oops(p, "a condition cannot be chained with ',' yet; nest the 'if' instead",
@@ -1377,10 +1376,9 @@ fun refuseChainedCondition(p : P) -> Unit {
     }
 }
 
--- `for pat in expr` and the C-style header are told apart by `in`, and Python
--- finds it by parsing a pattern and seeing what follows. Here the scan looks
--- for the keyword itself, at bracket depth zero and before the loop's body or
--- the first `;`. A nested `for ... in` is inside braces, so it is never at
+-- `for pat in expr` and the C-style header are told apart by the `in`, found by
+-- scanning for the keyword itself at bracket depth zero, before the loop's body
+-- or the first `;`. A nested `for ... in` is inside braces, so it is never at
 -- depth zero here.
 fun parseFor(p : P) -> Expr {
     let s = expect(p, "for").span
@@ -1414,9 +1412,9 @@ fun forInFollows(p : P) -> Bool {
     while j < len(p.toks) {
         let kind = Token.kindName(p.toks[j].kind)
         if kind == "(" || kind == "[" || kind == "{" {
-            -- A `{` right after a constructor name is a record pattern's, not
-            -- the loop body's: `for Arm { body, .. } in arms`. Python parses a
-            -- pattern and backtracks, so it never had to ask (FINDINGS 86).
+            -- A `{` right after a constructor name opens a record pattern, not
+            -- the loop body: `for Arm { body, .. } in arms`. Treating it as the
+            -- body here would end the scan before it reached the `in`.
             let afterCon = j > p.i && Token.kindName(p.toks[j - 1].kind) == "CONID"
             if depth == 0 && kind == "{" && !afterCon { return False }
             depth = depth + 1
@@ -1442,8 +1440,8 @@ fun parseMatch(p : P) -> Expr {
     while !at(p, "}") {
         if at(p, "EOF") { oops(p, "unterminated match expression", s) }
         Array.push(arms, parseMatchArm(p))
-        -- A `|` here begins the next arm: the newline before it was dropped by
-        -- design.md 2.4, so it is the only separator left.
+        -- A `|` here begins the next arm: the newline rule dropped the newline
+        -- before it, so the `|` is the only separator left.
         if at(p, "NEWLINE") {
             skipNewlines(p)
         } else if !at(p, "}") && !at(p, "|") {

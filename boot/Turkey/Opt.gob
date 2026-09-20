@@ -3,11 +3,9 @@ module Turkey.Opt (
     loopBreakers, reduceProgram,
 )
 
--- The local reductions, from inlining through loop-result fusion
--- (`plan.txt` item 7, `turkey/opt.py`).
+-- The local reductions, from inlining through loop-result fusion.
 --
--- None of them knows what a monad is, which is the whole reason item 4's
--- `?`-aware fast lowering was deleted in favour of this: a `bind` chain is
+-- None of them knows what a monad is, and that is the point: a `bind` chain is
 -- reached the way any other saturated call to a known small function is
 -- reached.
 --
@@ -45,11 +43,10 @@ module Turkey.Opt (
 -- than by renaming, which needs no fresh-name supply and keeps the output
 -- readable against its input.
 --
--- ## What replaces Python's reflection
+-- ## One place that knows a node's shape
 --
--- Python writes six generic walks over the dataclass fields. There are none
--- here, so the shape of a node is read in one place -- `kids` -- and every walk
--- that only needs "the subterms" is written in terms of it. The walks that need
+-- The shape of a node is read in one place -- `kids` -- and every walk that
+-- only needs "the subterms" is written in terms of it. The walks that need
 -- more than that (binders, free names, tail positions) say what more they need
 -- beside their own recursion, which is where they differ from each other
 -- anyway.
@@ -183,7 +180,7 @@ fun callGraph(binds : Array CBind) -> Map String (Set.Set String) {
 -- One per component is not enough. Removing a component's breaker cuts the
 -- cycles through it, and a component can hold others: `head` calling itself
 -- beside `expr -> inside -> head -> expr` survives the removal of `cell`, and
--- inlining the survivors did not terminate (FINDINGS 107). So what is left of a
+-- inlining the survivors then does not terminate. So what is left of a
 -- component once its breaker is out is split into components again, until none
 -- is cyclic.
 --
@@ -1042,10 +1039,10 @@ type Variant = Variant {
 -- useful tag, never once per incoming edge. Copies which do not shrink after
 -- reduction, or remain over `joinSpecializeLimit`, are declined.
 --
--- Python keys its replacements by the *identity* of each jump. There is no
--- object identity here, and none is needed: which replacement a jump gets is
--- decided entirely by its signature, so the walk that rewrites recomputes the
--- signature and looks it up. A jump with no known constructor anywhere cannot
+-- Replacements are keyed by a jump's signature rather than by the jump: which
+-- replacement a jump gets is decided entirely by that signature, so the walk
+-- that rewrites recomputes it and looks it up. A jump with no known constructor
+-- anywhere cannot
 -- collide with a group, because every group was founded by a jump that has one.
 fun specializeJoin(r : Reducer, e : Core) -> Option Core = match e.kind {
     CJoin(name, params, body, rest, recursive) ->
@@ -1191,8 +1188,8 @@ fun selectArm(r : Reducer, e : Core, scrutinee : Core, alts : Array CAlt,
             PCon(name, subs) -> if name == con {
                 -- Selecting the arm would have to substitute the packed type
                 -- for the constants the pattern opened, throughout its body
-                -- (SPEC-DELTAS 68). `Turkey.Layout` narrows this case to the
-                -- one layout instead.
+                -- throughout its body. `Turkey.Layout` narrows this case to
+                -- the one layout instead.
                 match unannot(alt.pat).opening {
                     Some(_) -> return None
                     None -> {}
@@ -1460,9 +1457,8 @@ fun sizeOf_(e : Core) -> Int = match e.kind {
 fun bottoms(e : Core) -> Bool = match e.kind {
     CApp(fn, _) -> match stripTyApp(fn).kind {
         CPrim(name) -> name == "Prim.error"
-        -- Python asks for a `name` field and takes whichever node has one, so
-        -- a variable spelled this way would answer too. Nothing builds one,
-        -- and saying so costs a line.
+        -- Nothing builds a *variable* spelled `Prim.error`, but a walk that
+        -- accepted any node with that name would treat one as a panic.
         CVar(name) -> name == "Prim.error"
         _ -> False
     }
@@ -1541,13 +1537,11 @@ fun retype(e : Core, ty : Ty.Type) -> Core = match e.kind {
 -- whether *this* match survived the reduction, which is exactly the question
 -- "did pushing it into the branch buy anything".
 --
--- Python asks it with `n.alts is alts`, and the answer is always false --
--- FINDINGS.md 42, and the reason this is a constant rather than a walk.
--- `expr` rebuilds every node it touches, the alternative list included, before
--- any rule fires; the object the caller named is gone by the time the reduction
--- being asked about has happened, and no rule reuses it. Turkey has no object
--- identity to translate that with, and it needs none, because there is nothing
--- there to translate: the question is constant.
+-- **Constant, and deliberately so.** Asking it by the identity of the
+-- alternative list answers false every time: `expr` rebuilds every node it
+-- touches, the list included, before any rule fires, so the list the caller
+-- named is gone by the time the reduction being asked about has happened, and
+-- no rule reuses it.
 --
 -- Carrying the *patterns*' identity instead would make it fire -- a pattern is
 -- the one part of an alternative that survives a rebuild, here and in
@@ -1661,8 +1655,9 @@ fun collectJumps(e : Core, name : String, shadowed : Bool,
 }
 
 -- Rewrite the jumps `joinJumps` would have found, where `chosen` has something
--- to say about one. A replaced jump's arguments are not descended into, as
--- Python's identity-keyed rewrite does not descend into a node it replaced.
+-- to say about one. A replaced jump's arguments are not descended into: the
+-- replacement is the whole answer for that jump, and walking into what it
+-- replaced would rewrite the same arguments twice.
 fun replaceJumps(e : Core, name : String,
                  chosen : fun(Core) -> Option Core) -> Core =
     replaceJumpsIn(e, name, False, chosen)
@@ -1708,10 +1703,10 @@ fun jumpsTo(e : Core, name : String) -> Bool {
 -- `Turkey.Core.namesOf` is the over-approximation -- every name, bound or not
 -- -- and it is the right one for keeping a binding alive. It is the wrong one
 -- for asking whether moving a term could capture something, and using it there
--- cost most of this pass's reductions in Python: the continuation a `?` builds
--- contains `let x = ... in ...`, and `Option`'s `bind` calls its first
--- parameter `x`, so a guard reading every mentioned name refused to inline
--- `bind` at all.
+-- cost most of this pass's reductions when it was used there: the continuation
+-- a `?` builds contains `let x = ... in ...`, and `Option`'s `bind` calls its
+-- first parameter `x`, so a guard reading every mentioned name refuses to
+-- inline `bind` at all.
 fun freeNames(e : Core) -> Set.Set String = match e.kind {
     CVar(name) -> {
         let out = Set.new()
@@ -1780,10 +1775,9 @@ fun namesOfAlts(alts : Array CAlt) -> Set.Set String {
 --
 -- An over-approximation, and in the safe direction: a name that appears here
 -- but binds nothing on the path to an occurrence only costs a substitution this
--- pass declines to make. Python drives it off *field names* -- a `pat` binds
--- what its pattern binds, a `params` binds its parameters' names -- so that a
--- node added later cannot fall outside the rule by accident. The cases are
--- spelled out here instead, and `kids` is what keeps the recursion from being
+-- pass declines to make. The cases are spelled out per node kind, so a node
+-- kind that binds a name and is forgotten here is one this pass may substitute
+-- into wrongly; `kids` is what keeps the recursion from being
 -- one of them.
 fun bindersOf(e : Core) -> Set.Set String {
     let out = Set.new()

@@ -1,6 +1,6 @@
 # How the compiler is written
 
-House style for `compiler/`, the Turkey compiler written in Turkey. It exists
+House style for `boot/`, the Turkey compiler written in Turkey. It exists
 because the first drafts got several of these wrong, in ways that are cheap to
 fix once and expensive to fix in ten thousand lines.
 
@@ -99,38 +99,17 @@ the operator table is scanned in order on purpose, longest match first.
 
 ## Naming
 
-Modules are `Turkey.*` and live in `compiler/Turkey/`. The compiler is the
-Turkey compiler; `boot` was a name for the milestone, not for the program, and
-the program outlives the milestone.
+Modules are `Turkey.*` and live in `boot/Turkey/`.
 
 Reserved words cannot be field or variable names, and the list is longer than
 it looks: `type class instance fun let var match if else while for in loop
 return break continue module import export as hiding do`. `hiding` and `export`
 are the two that bite -- `ImportDecl` has a `hidden` field for that reason.
 
-## Comments
-
-Say why, not what. A comment that restates the code is noise; a comment that
-records a decision -- why the scan and not the speculation, why the field is
-`hidden`, which spec section a rule comes from -- is why the next reader does
-not have to rediscover it. Cite `design.md`, `PRIMITIVES.md` and
-`SPEC-DELTAS.md` by section where a rule comes from one.
-
-## Porting
-
-`compiler/` is a port of `turkey/*.py`, and stays recognizably so: the same
-stage boundaries, the same function names where the language allows, the same
-order of decisions. A port that reorganizes cannot be diffed against the thing
-it was ported from, and the diff is the whole test (`tests/test_boot.py`).
-
-Where the language forces a difference -- no exceptions, so speculation is a
-token scan rather than a caught failure -- the difference gets a comment saying
-which language rule forced it.
-
 ## Taking a record apart
 
-A record pattern names every field or ends in `..` (SPEC-DELTAS 65), and which
-of the two a site writes is a statement about the site.
+A record pattern names every field or ends in `..`, and which of the two a site
+writes is a statement about the site.
 
 A function whose contract is *every field of this node* -- a child enumerator,
 a map or rebuild, a substitution, a free-variable scan, a dump -- takes the node
@@ -138,15 +117,21 @@ apart with a full pattern and no `..`, writing `field = _` for a field it has
 considered and does not need. Then a field added to the declaration is a
 compile error in exactly the functions that have to decide about it. Reading
 the same node by projection (`arm.body`) compiles on regardless, which is how a
-walker comes to skip a new child silently (FINDINGS 25).
+walker comes to skip a new child silently.
 
 A function that reads a few fields on purpose -- an accessor, a diagnostic, a
 one-field test -- projects, or writes `..`.
 
+## Comments
+
+The standard is in the root `CLAUDE.md`: the code as it is now, no references
+to documents or tickets, no history, no narration. What is worth a comment here
+in particular is an ordering the passes depend on, a representation invariant
+the backend relies on, and any place where the obvious simplification is wrong.
+
 ## When something is awkward
 
-Write it down. `FINDINGS.md` at the repo root is the running list of what
-writing this compiler has turned up about the language -- bugs, design costs,
-friction, and library pieces that were missing. `plan.txt` item 9 says the
-bootstrap is the forcing function that finds papercuts at a scale `test.gob`
-cannot; a papercut nobody recorded was not found.
+The language pinching -- a missing library function, a rule that forces a
+clumsy shape, a papercut in the compiler's own source -- is worth recording
+while it is fresh, because the interesting part is what was being written when
+it bit. That goes in a tix ticket, not in a comment and not in a file.

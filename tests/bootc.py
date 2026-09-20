@@ -1,7 +1,7 @@
 """`boot`, compiled once and shared by every test module that runs it.
 
 Compiling `boot` takes about two minutes, from the committed bootstrap
-by `tools/build.sh` (BOOTSTRAP.md); through the Python compiler it took three.
+by `tools/build.sh`; through the Python compiler it took three.
 *Running* the compiled binary over the whole corpus takes ten seconds. Every
 ratio in this file follows from those two numbers.
 

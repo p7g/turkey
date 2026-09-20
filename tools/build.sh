@@ -6,7 +6,29 @@
 #   stage3  stage2 compiling the same source             (--fixpoint only)
 #   stage4  stage3's output, which must equal stage3's   (--fixpoint only)
 #
-# BOOTSTRAP.md has the stages, the bump policy and why it is shaped this way.
+# Stage N is built by stage N-1. stage2 is today's source compiled by the
+# committed compiler: correct if that one is, but its code is whatever an older
+# compiler emitted. stage3 is today's source compiled by today's source, and the
+# fixed point is that stage3 emits exactly the assembly it was built from.
+#
+# The compiler reads lib/ relative to the working directory, so every stage runs
+# from the repository root.
+#
+# bootstrap/ holds the committed compiler: the whole-program arm64 assembly for
+# boot/Main.gob under gzip -9 -n (3.5 MB; -n so the same text always compresses
+# to the same bytes), a copy of the C runtime it was emitted against, and
+# PROVENANCE, which records the commit it came from and the hashes checked here
+# before anything is built. To reproduce it from source, check out that commit
+# and build it with the bootstrap that commit itself carries.
+#
+# The runtime copy is what makes an ABI change possible: a new compiler is built
+# by the old one, which only links against the old runtime. So stage1 links
+# against bootstrap/runtime and stage2 onward against runtime/. As the runtime
+# moves into Turkey it shrinks; when nothing is left in C, delete the copy and
+# the step that builds it.
+#
+# Measured on arm64 macOS, Apple clang 17: 128 s for stage2, 376 s with
+# --fixpoint, of which each self-compile is about 105 s and each link 10 s.
 #
 # Usage: tools/build.sh [--out DIR] [--fixpoint] [--stage1 BINARY]
 #

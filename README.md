@@ -82,8 +82,13 @@ cc -o rectangles rectangles.s runtime/turkey_runtime.c
 Run the compiler from the repository root, where it finds `lib/`. Use
 `build/stages/stage2 types rectangles.gob` to inspect inferred types; the
 other subcommands print what a stage produced, and `check` just compiles.
-[BOOTSTRAP.md](BOOTSTRAP.md) explains how the build works and when its
-committed compiler is replaced.
+
+The compiler that builds it is `bootstrap/`, which holds its own arm64
+assembly, gzip'd, with the runtime it was emitted against. `sh tools/build.sh
+--fixpoint` checks the fixed point: the compiler built from today's source
+emits exactly the assembly it was built from. `tools/bump-bootstrap.sh`
+replaces the committed compiler, which is rare and deliberate; both scripts
+explain themselves at the top.
 
 ## Project status
 
@@ -100,7 +105,6 @@ For more depth:
 - [Language design](design.md) and [changes to the specification](SPEC-DELTAS.md)
 - [Standard library](STDLIB.md) and [library design](LIBRARY-DESIGN.md)
 - [Compiler written in Turkey](boot/) and [lessons from building it](FINDINGS.md)
-- [Building the compiler from its committed bootstrap](BOOTSTRAP.md)
 - [Roadmap](plan.txt)
 
 The tests are Python. Install their dependencies with

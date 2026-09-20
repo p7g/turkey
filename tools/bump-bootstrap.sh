@@ -1,10 +1,18 @@
 #!/bin/sh
 # Replace the committed bootstrap with today's compiler.
 #
-# A policy step, not a build step: bump only when the source needs something
-# the committed compiler cannot build, or the runtime's ABI changed. The bump is
-# its own commit, containing only bootstrap/, and a bad one is reverted.
-# BOOTSTRAP.md has the policy.
+# A policy step, not a build step. Bump only when the source needs something the
+# committed compiler cannot build -- a new language feature, or a changed
+# runtime ABI. Land the feature, bump, and only then use the feature in the
+# compiler; a bump for any other reason is 3.5 MB of git history for nothing.
+#
+# The bump is its own commit, containing only bootstrap/, so that a bad one is
+# fixed by reverting it. This runs the fixed point first and refuses a dirty
+# tree, because PROVENANCE has to name the commit the assembly was built from.
+#
+# --stage1 is how to bump across a change the committed compiler cannot build:
+# start from a compiler built before the change. The first bump was made that
+# way, from the last compiler the Python implementation built.
 #
 # Usage: tools/bump-bootstrap.sh [--stage1 BINARY]
 #

@@ -1,7 +1,7 @@
 """The bootstrap: what is committed, and the fixed point it reaches.
 
 `bootc.binary()` is stage2 of `tools/build.sh`: the committed compiler in
-`bootstrap/` compiling today's source (BOOTSTRAP.md). Here stage2 compiles the
+`bootstrap/` compiling today's source. Here stage2 compiles the
 same source again, which links into stage3, and stage3 compiling it once more
 must emit stage2's output byte for byte.
 

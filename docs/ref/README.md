@@ -101,7 +101,7 @@ cc -o hello hello.s runtime/turkey_runtime.c
 ./hello
 ```
 
-`BOOTSTRAP.md` says how to build `boot` itself.
+The project README says how to build `boot` itself.
 
 ## For maintainers
 

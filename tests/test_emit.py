@@ -191,7 +191,7 @@ def test_the_compilers_own_source_assembles():
     size, and `boot`'s frames are two orders of magnitude bigger than the
     corpus's.
     """
-    main = REPO_ROOT / "boot" / "Main.gob"
+    main = REPO_ROOT / "src" / "Main.gob"
     text = bootc.boot_each("native", [main], _split)[main]
     assert "// skipped " not in text
     result = _assembles(text)

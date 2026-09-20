@@ -104,7 +104,7 @@ For more depth:
 - [Language reference](docs/ref/README.md): the syntax and meaning of every construct
 - [Language design](design.md) and [changes to the specification](SPEC-DELTAS.md)
 - [Standard library](STDLIB.md) and [library design](LIBRARY-DESIGN.md)
-- [Compiler written in Turkey](boot/) and [lessons from building it](FINDINGS.md)
+- [Compiler written in Turkey](src/) and [lessons from building it](FINDINGS.md)
 - [Roadmap](plan.txt)
 
 The tests are Python. Install their dependencies with

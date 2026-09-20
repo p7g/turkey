@@ -2810,7 +2810,7 @@ highlighted as another language, counted as that language in the repository's
 language bar, and matched by that language's rules in code search.
 
 **Source files are now `.gob`.** `Data.String` is `Data/String.gob` under one
-of the search roots (`turkey/modules.py`, `boot/Turkey/Modules.gob`), and every
+of the search roots (`turkey/modules.py`, `src/Turkey/Modules.gob`), and every
 file in the corpus moved.
 
 The candidates, run against `linguist/lib/linguist/languages.yml`:
@@ -2973,7 +2973,7 @@ code that *destructures*. The Python compiler's walks are generic over dataclass
 fields and never had the hazard. The bootstrap's hand-written enumerators did,
 and they read record-shaped nodes by projection -- `ChArm(a) -> [ChExpr(a.body)]`
 -- which this rule cannot see: give `Arm` a guard and they still compile. So they
-were rewritten to destructure with full patterns, and `boot/STYLE.md` states the
+were rewritten to destructure with full patterns, and `src/STYLE.md` states the
 policy: no `..` in a function whose contract is every field of a node (children,
 maps, rebuilds, substitution, free variables, dumps), with unused fields written
 `field = _`; `..` where a site reads a few fields by intent.

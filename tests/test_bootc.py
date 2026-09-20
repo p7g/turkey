@@ -8,7 +8,7 @@ rather than reasoned about.
 
 This test compiles nothing, and it does not touch the repository: it builds a
 tree of stand-in files under `tmp_path` and fingerprints that. Perturbing the
-real `boot/` is harmless in a serial run and not under `pytest -n auto`, where
+real `src/` is harmless in a serial run and not under `pytest -n auto`, where
 another worker could cache a fingerprint of the edited tree for the rest of
 its life.
 """
@@ -23,7 +23,7 @@ from tests import bootc
 def test_the_build_fingerprint_covers_boot_and_the_bootstrap(
         tmp_path: Path) -> None:
     """`binary()` is keyed on this, and a miss here is a stale executable."""
-    for relative in ("boot/Main.gob", "boot/Turkey/Regalloc.gob",
+    for relative in ("src/Main.gob", "src/Turkey/Regalloc.gob",
                      "lib/Prelude.gob",
                      "runtime/turkey_runtime.c", "runtime/turkey_runtime.h",
                      "bootstrap/PROVENANCE",
@@ -33,7 +33,7 @@ def test_the_build_fingerprint_covers_boot_and_the_bootstrap(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"-- {relative}\n")
     before = bootc._fingerprint(tmp_path)
-    for relative in ("boot/Turkey/Regalloc.gob", "bootstrap/PROVENANCE",
+    for relative in ("src/Turkey/Regalloc.gob", "bootstrap/PROVENANCE",
                      "bootstrap/runtime/turkey_runtime.c", "tools/build.sh"):
         target = tmp_path / relative
         original = target.read_bytes()

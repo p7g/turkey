@@ -37,7 +37,7 @@ is good if the modules AoC needs land somewhere a reader would look.
 | `System.Env` | `args` `exit` `get` |
 | `Unsafe.Ptr`, `Unsafe.Libc` | raw memory, and the C symbols declared through it (SPEC-DELTAS 70, 71). Not part of the surface this document is about: they exist so that `System.*` has something to be a wrapper over, and a module that imports one says so in its import list |
 
-Prefix use across `boot/`, `lib/` and `tests/programs/`: 112 imports of
+Prefix use across `src/`, `lib/` and `tests/programs/`: 112 imports of
 `Data.*`, 17 of `Std.*`, 8 of `System.*`, 2 of `Algorithm.*`, in 49 files; 42
 mentions in `turkey/*.py`. A rename is a sed and a golden regeneration, not a
 design problem. **But** the Prelude already does `import Data.Map as Map` for
@@ -131,7 +131,7 @@ abstraction is, it cannot require materialising nodes and edges first (4.2).
 These are not in the survey; they are why a peer's answer may not transfer.
 
 * **Library code is written once.** `lib/` is Turkey source, compiled by both
-  `turkey/` and `boot/`, so a new module is one implementation, not two
+  `turkey/` and `src/`, so a new module is one implementation, not two
   (contrast a Core pass, CLAUDE.md). The expensive part of the library is
   **primitives**: `stdin`, environment variables, a clock, `sqrt`, directory
   creation each need `Prim.*` in the Python backend, the C runtime, and the
@@ -1240,9 +1240,9 @@ Every one of them gets a user-facing module, the operator classes included:
 other class. The classes are split per operator so that a type can add without
 dividing (design.md 8.2), and the modules follow that split.
 
-**The name can be `Turkey.Internal.*`, despite `boot/`.** A module name is its
+**The name can be `Turkey.Internal.*`, despite `src/`.** A module name is its
 whole dotted path, so `Turkey.Internal.Classes` (`lib/Turkey/Internal/
-Classes.tl`) and boot's `Turkey.Classes` (`boot/Turkey/Classes.gob`) are
+Classes.tl`) and boot's `Turkey.Classes` (`src/Turkey/Classes.gob`) are
 different modules. That is GHC's defence, disjoint leaves, without the package
 system behind it. The hazard is future: boot adding a `Turkey/Internal/`
 directory would shadow the library while boot compiles itself, because the

@@ -72,7 +72,7 @@ design that is expensive to reverse*.
 
 ## One implementation, and what checks it
 
-`boot/` is the compiler and it is written in Turkey. The Python implementation
+`src/` is the compiler and it is written in Turkey. The Python implementation
 it was diffed against is gone, so there is no second answer to compare against,
 and a change is checked by what it *does*:
 
@@ -164,6 +164,6 @@ needs, and what "done" means.
 * `README.md` -- what Turkey is, and how to build and run it.
 * `docs/ref/` -- the language reference: syntax and semantics for people
   writing Turkey, every example compiled and run by `tests/test_reference.py`.
-* `boot/CLAUDE.md` -- house style for the compiler's own source.
+* `src/CLAUDE.md` -- house style for the compiler's own source.
 
 Everything else at the root is on its way out; see "Where what you write goes".

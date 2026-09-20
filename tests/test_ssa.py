@@ -1,8 +1,8 @@
-"""`boot/Turkey/Ssa.gob` and `Turkey/LowIr.gob`: the low IR.
+"""`src/Turkey/Ssa.gob` and `Turkey/LowIr.gob`: the low IR.
 
 M27 phase 0. Nothing imports the module yet -- the lowering into it is the
 next phase -- so this is what type-checks it and what exercises the analyses.
-`boot/SsaCheck.gob` is the driver; see its header for why it lives there.
+`src/SsaCheck.gob` is the driver; see its header for why it lives there.
 
 Compiled by `boot` itself and run: a test of the Turkey code, not of two
 implementations agreeing.
@@ -14,15 +14,15 @@ from pathlib import Path
 from tests import lang
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DRIVER = REPO_ROOT / "boot" / "SsaCheck.gob"
+DRIVER = REPO_ROOT / "src" / "SsaCheck.gob"
 
 
 @functools.lru_cache(maxsize=None)
 @functools.lru_cache(maxsize=1)
 def _dump() -> str:
-    """The driver's output: `boot/SsaCheck.gob` compiled by `boot` and run.
+    """The driver's output: `src/SsaCheck.gob` compiled by `boot` and run.
 
-    It imports `boot/Turkey/`, whose sources are part of the compile's cache
+    It imports `src/Turkey/`, whose sources are part of the compile's cache
     key (`tests.lang`), so a change there recompiles it.
     """
     return lang.output(DRIVER)
@@ -98,7 +98,7 @@ def test_an_operand_count_cannot_be_wrong(capfd):
     is unrepresentable, which is the concrete payoff of writing the
     instruction set as an ADT rather than an opcode string and a list.
     """
-    source = (REPO_ROOT / "boot" / "Turkey" / "LowIr.gob").read_text()
+    source = (REPO_ROOT / "src" / "Turkey" / "LowIr.gob").read_text()
     assert "Bin(BinOp, Value, Value)" in source
     assert "ArraySet(Value, Value, Value)" in source
 

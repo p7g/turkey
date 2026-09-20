@@ -683,7 +683,7 @@ Two smaller ones found in the same ticket, both the same kind of hazard -- one
 side derives a list and the other writes it out:
 
 * `turkey/layout.OPENED_LAYOUTS` was `tuple(layout.value for layout in
-  bir.Layout)` while `Layout.openedLayouts` in `boot/` is a literal. A member
+  bir.Layout)` while `Layout.openedLayouts` in `src/` is a literal. A member
   added to the enum joins one and not the other, which is a different number of
   existential arm copies per side and a differential that moves for a reason in
   neither implementation. Now written out on both sides, with a comment saying
@@ -719,17 +719,17 @@ long way to travel.
 **bug, fixed.** TIX-15. Adding a module to `lib/` turned `test_boot`'s `opt`
 stage red on one line out of 37000: the Python side printed `Prim.Array (Entry
 String Binding)` where `boot` printed `Prim.Array (Data.Map.Entry String
-Binding)`. `boot` was right -- `boot/Main.gob` contains both `Data.Map.Entry`
+Binding)`. `boot` was right -- `src/Main.gob` contains both `Data.Map.Entry`
 and `Turkey.Runtime.Entry`, and delta 43 says neither keeps the short name.
 
 Neither compiler had a bug in it. `QUALIFY` is a module-level global in
 `turkey/types.py`, filled by `DeclTable.__init__` and read by `TCon.display` at
 *render* time, so it describes the program checked most recently rather than
 the one being printed. One program per process cannot tell, and every `turkey`
-command is one program per process -- a fresh `turkey opt boot/Main.gob` prints
+command is one program per process -- a fresh `turkey opt src/Main.gob` prints
 `Data.Map.Entry` correctly. `test_boot` is the only caller that checks several
 programs in one process, and it memoizes `check` across its five stages, so by
-the time `opt` rendered `boot/Main.gob` the set belonged to whichever corpus
+the time `opt` rendered `src/Main.gob` the set belonged to whichever corpus
 program was checked last. The same `CProgram` renders two different ways:
 
 ```
@@ -1073,7 +1073,7 @@ question that would have made it unnecessary:
   each other in the order `deps.sccs` already sorts them into -- the same
   arbitrary-but-stable choice the loop breaker makes.
 
-`turkey opt boot/Main.gob` finishes in 44 seconds, and no golden moves: the
+`turkey opt src/Main.gob` finishes in 44 seconds, and no golden moves: the
 whole corpus reaches neither declined case.
 
 Speculation also restores its flag to what it was rather than to `False` --
@@ -1089,8 +1089,8 @@ through a request queue, as `mono` already has, would remove the exemption
 rather than state it.
 
 **And the port needed every one of them.** None of these three reached
-`boot/Turkey/Opt.gob`, which still carried the comment stating the pre-fix
-rationale -- so `boot opt boot/Main.gob` died the same death a milestone later,
+`src/Turkey/Opt.gob`, which still carried the comment stating the pre-fix
+rationale -- so `boot opt src/Main.gob` died the same death a milestone later,
 and looked like a stack limit rather than a missing fix. What settled it was
 one measurement rather than any amount of reading: the reference recurses
 **106 levels** on that program and `boot` reached **481,650 frames**. A 1,500x
@@ -1798,7 +1798,7 @@ fixed part is `boot` itself: running it means the Python implementation
 typechecks and then *interprets* the whole bootstrap compiler before it looks
 at the target at all.
 
-`boot/Main.gob` already takes any number of files, and its header already said
+`src/Main.gob` already takes any number of files, and its header already said
 why -- "not a convenience for the test -- it is what keeps the milestone's diff
 to one process, since starting this program currently means compiling it". The
 design note was there, in the file I was invoking, and I wrote the loop anyway.
@@ -2116,7 +2116,7 @@ identifiable in one experiment rather than by bisection.
 
 **Third capture bug, and the first in a shared algorithm.** FINDINGS 56 and 59
 were both `SsaLower` failing to scope an environment, and both were mine. This
-one is older than either, lives in `turkey/opt.py` and `boot/Turkey/Opt.gob`
+one is older than either, lives in `turkey/opt.py` and `src/Turkey/Opt.gob`
 both, and had to be fixed twice -- the tax CLAUDE.md's "two implementations"
 section describes, paid in full. The corpus never produced the shape, so
 `test_boot` was never going to find it; what found it was writing a module
@@ -2165,7 +2165,7 @@ the compiled binary answers in ten seconds.
 
 The previous three findings were all "someone pays a startup cost per unit of
 work". This one is a different mistake with the same symptom: the cache had the
-**wrong key**. `boot`'s output is a pure function of `boot/`, `lib/`, `turkey/`
+**wrong key**. `boot`'s output is a pure function of `src/`, `lib/`, `turkey/`
 and `runtime/`, and a session is not any of those. Keyed on a hash of those
 files instead, the build is shared between test runs, scratch scripts,
 concurrent jobs and future sessions, and it invalidates exactly when it should.
@@ -2219,7 +2219,7 @@ the four real complaints it might one day have.
 
 
 ### 75. Three miscompiles below Core, and the C compiler found all three
-**correctness.** M28. `boot llvm boot/Main.gob` emits 66.7 MB of LLVM for the
+**correctness.** M28. `boot llvm src/Main.gob` emits 66.7 MB of LLVM for the
 compiler itself, and `cc` refused it. Three bugs, each hidden behind the
 previous, each fixed only to reveal the next:
 
@@ -2271,7 +2271,7 @@ that broke here.
 ### 76. A constructor callback was an empty object, not a closure
 
 **correctness, fixed.** Building `boot` with Python, then emitting and linking
-`boot llvm boot/Main.gob`, produced a `boot2` that crashed while desugaring its
+`boot llvm src/Main.gob`, produced a `boot2` that crashed while desugaring its
 own source. `TURKEY_SEGV_FRAMES=1` located the failure in
 `Data.Array#map@Expr,Child`, called by `Turkey.Ast#exprChildren`.
 
@@ -2303,7 +2303,7 @@ Python-built compiler and using the linked third-generation compiler.
 ### 77. The bootstrapped compiler ran at Python speed, and the collector was why
 
 **performance, diagnosed.** The linked third-generation compiler took **100.6 s**
-for `opt boot/Main.gob`, the whole pipeline over its own source, while the Python
+for `opt src/Main.gob`, the whole pipeline over its own source, while the Python
 host interpreting the same program took **293.3 s** for the same work and a
 byte-identical dump. Two-point-nine times faster, when the point of the native
 backend was an order of magnitude.
@@ -2415,7 +2415,7 @@ exception. Function values have no physical-equality operation; pointer-to-boxed
 coercions remain relabels, so sharing their capture-free shells changes no
 language-visible identity contract.
 
-All measurements below use `opt boot/Main.gob` on the same step-2 source. The
+All measurements below use `opt src/Main.gob` on the same step-2 source. The
 baseline was rebuilt with the committed Python compiler and 2x runtime rather
 than using an older saved executable. Its counts differ slightly from entry 77
 because the compiler source being optimized has changed.
@@ -2503,7 +2503,7 @@ this rule**. The slightly larger input source accounts for the count increase
 from entry 79. Collector time is 8.238 s, with 91 collections; peak RSS is
 2,073,116,672 bytes and peak reserved region storage is 1,787,232,256 bytes.
 
-Final by-kind counts for `opt boot/Main.gob`:
+Final by-kind counts for `opt src/Main.gob`:
 
 | allocation kind | Python-built compiler | self-hosted compiler |
 |---|---:|---:|
@@ -2568,7 +2568,7 @@ Float and String values, record fields, break/continue, captured shared state
 and an inlined binding that shadows a flattened record's name. SSA assertions
 check that local allocations disappear and no slot operations reach emitters.
 
-Same-source measurements of `opt boot/Main.gob` (the source now includes the
+Same-source measurements of `opt src/Main.gob` (the source now includes the
 new passes, so compare these columns rather than the earlier smaller inputs):
 
 | metric | previous self-hosted | new self-hosted | Python-built |
@@ -2627,7 +2627,7 @@ was accidentally testing the unwanted boxed initialization zero; it now checks
 real Byte/Int width conversions, while a separate test requires zero boxes for
 the pointer-array regression.
 
-Same-source `opt boot/Main.gob` measurements:
+Same-source `opt src/Main.gob` measurements:
 
 | metric | previous self-hosted | new self-hosted | Python-built |
 |---|---:|---:|---:|
@@ -2676,7 +2676,7 @@ matching totals do not imply identical allocation order or object lifetimes.
 ### 84. Profiling found the remaining gap in typed record-field stores
 
 **backend, measured.** Allocation parity did not imply generated-code parity.
-A macOS `sample` profile (1 ms interval, over `opt boot/Main.gob`) found 4,498
+A macOS `sample` profile (1 ms interval, over `opt src/Main.gob`) found 4,498
 leaf samples in `valid_heap_pointer` and 2,326 in `turkey_object_set` in the
 self-hosted build, roughly 31% of the worker thread's 22,172 samples combined.
 These helpers were not leading costs in the Python-built profile. The latter
@@ -2790,7 +2790,7 @@ comparison that could not fail.
 **design, open.** ERRORS.md step 1. The layout contract for existential
 constructors was prototyped in `turkey/` alone, under
 `tests/test_existential_layout.py`, and deliberately kept out of
-`tests/programs`: `test_boot` would diff a stage `boot/` has no rule for. This
+`tests/programs`: `test_boot` would diff a stage `src/` has no rule for. This
 is FINDINGS 43's failure mode by construction. The differential says nothing
 about any of it until step 2 ports it. Every prototype change is marked
 `PROTOTYPE` in the source so the port can find them.
@@ -2816,7 +2816,7 @@ reach the capped and mutant cases no source program produces.
 ### 91. The selection ratchet was green while `boot` stopped at `Prim.floatBits`
 **bug, fixed.** M28. `tests/test_select.py` asserts that every corpus function
 either selects to arm64 or stops for a known reason, and the only known reason
-was stack arguments. It passed. `boot asm boot/Main.gob` meanwhile reported
+was stack arguments. It passed. `boot asm src/Main.gob` meanwhile reported
 three functions stopped at "the runtime function Prim.floatBits": the primitive
 has no runtime entry point, `Select.inlinePrim` had no rule, and no corpus
 program called it anywhere `opt` did not fold it away. The rule is one `fmov`
@@ -2852,7 +2852,7 @@ parameters.
 
 The gap being closed and the code closing it are in the same program, which
 is the bootstrap's usual shape and still easy to forget: every new function in
-`boot/` is also a new input to the backend being written. A limit that applies
+`src/` is also a new input to the backend being written. A limit that applies
 to the backend's input applies to the backend.
 
 And one design error, caught before it cost anything. The plan said "spill
@@ -2866,7 +2866,7 @@ spills the failing value, a full file evicts the holder used furthest ahead.
 **bug, fixed.** `pytest -n auto --durations` on a 16-core machine: 15:09 of wall
 time at 2.3 cores. The slowest item was `test_boot`'s types milestone -- 233
 seconds of fixture setup and 203 of call -- and the fixture ran
-`python -m turkey run boot/Main.gob -- types`: the bootstrap compiler under the
+`python -m turkey run src/Main.gob -- types`: the bootstrap compiler under the
 interpreter. `tests/bootc.py` exists to stop exactly that, and says so in its
 header. The fixture went around it for a mundane reason: it needs stderr, and
 `bootc.boot` threw stderr away.
@@ -2882,17 +2882,17 @@ The rest was ordinary and multiplied by parallelism:
   xdist *worker*, so sixteen of each;
 * `test_native` compiled `turkey_runtime.c` into every test binary, per worker;
 * three `test_boot` Python sides ran `check` uncached every time, one of them
-  over `boot/Main.gob`;
+  over `src/Main.gob`;
 * two corpus loops sat inside single test items.
 
 And one that was a correctness bug, not a cost: `test_bootc` edited
-`boot/Turkey/Regalloc.gob` and `turkey/driver.py` in place to test cache keys,
+`src/Turkey/Regalloc.gob` and `turkey/driver.py` in place to test cache keys,
 which under xdist lets another worker import a truncated file.
 
 After: per-program disk caches for `boot` output, a locked `boot` build, one
 runtime object, the compiled binary for types, and cache-key tests on copies.
 **2:13 at ~7 cores** with warm references -- the baseline had to recompute some
-of `boot/Main.gob`'s, so a fully cold run lands between the two. `pytest` is now
+of `src/Main.gob`'s, so a fully cold run lands between the two. `pytest` is now
 parallel by default.
 
 ### 94. Two correct rules that together tripled the reloads

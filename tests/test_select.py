@@ -1,4 +1,4 @@
-"""`boot/Turkey/Select.gob`: the low IR to arm64 (M28 phase 4).
+"""`src/Turkey/Select.gob`: the low IR to arm64 (M28 phase 4).
 
 Until this file existed, selection was checked by a person running `boot asm`
 and reading the histogram. That is not a test, and it showed: a call with nine
@@ -113,7 +113,7 @@ def _coloured(text: str) -> tuple[int, int]:
 def _colour_reasons(text: str) -> dict[str, int]:
     """Colouring's histogram: `-- colour  <count>  <reason>`.
 
-    A different prefix from selection's on purpose (`boot/Main.gob` says why),
+    A different prefix from selection's on purpose (`src/Main.gob` says why),
     so the two cannot be summed into each other by a parser that matched both.
     """
     out: dict[str, int] = {}
@@ -296,12 +296,12 @@ def test_pressure_spills_into_both_kinds_of_slot():
 
 @functools.lru_cache(maxsize=None)
 def _boot_asm() -> str:
-    """`boot asm boot/Main.gob`: one process, about ninety seconds, so cached.
+    """`boot asm src/Main.gob`: one process, about ninety seconds, so cached.
 
-    The build fingerprint covers all of `boot/`, which is what the output
+    The build fingerprint covers all of `src/`, which is what the output
     depends on besides `Main.gob` itself.
     """
-    main = REPO_ROOT / "boot" / "Main.gob"
+    main = REPO_ROOT / "src" / "Main.gob"
     return bootc.boot_each("asm", [main], _split_asm)[main]
 
 

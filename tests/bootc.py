@@ -46,7 +46,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-BOOT_MAIN = REPO_ROOT / "boot" / "Main.gob"
+BOOT_MAIN = REPO_ROOT / "src" / "Main.gob"
 
 
 # Everything whose contents can change what `boot` compiles to: its own
@@ -54,7 +54,7 @@ BOOT_MAIN = REPO_ROOT / "boot" / "Main.gob"
 # and the script that does, and the C runtime it is linked with. Hashing these
 # is what lets a build be reused; missing one would mean serving a stale
 # binary, which is worse than rebuilding, so this list errs wide.
-_INPUTS = (("boot", "*.gob"), ("lib", "*.gob"),
+_INPUTS = (("src", "*.gob"), ("lib", "*.gob"),
            ("bootstrap", "*"), ("tools", "build.sh"),
            ("runtime", "*.c"), ("runtime", "*.h"))
 
@@ -63,7 +63,7 @@ def _fingerprint(root: Path = REPO_ROOT) -> str:
     """A digest of every input to the build, for use as a cache key.
 
     Takes the root so that `tests/test_bootc.py` can check the key against a
-    copy. It used to edit the real `boot/` and `turkey/` to do it, which under
+    copy. It used to edit the real `src/` and `turkey/` to do it, which under
     `pytest -n auto` is a truncated `driver.py` imported by some other worker.
     """
     h = hashlib.sha256()

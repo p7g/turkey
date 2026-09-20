@@ -12,7 +12,7 @@ are the committed one and the one built from today's source -- the ordinary
 fixed point, which is what OCaml's `make compare` and Rust's stage3 check.
 
 **The fixed point is opt in.** It costs a couple of minutes and re-pays on every
-change to `boot/`, which is when it is least wanted, so it is marked
+change to `src/`, which is when it is least wanted, so it is marked
 `bootstrap` and excluded by default (`pyproject.toml`). Run it with:
 
     pytest -m bootstrap
@@ -40,7 +40,7 @@ from tests.bootc import CACHE, runtime_object as _runtime_object
 from tests.bootc import digest as _digest, replace_built as _replace_built
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-BOOT_MAIN = REPO_ROOT / "boot" / "Main.gob"
+BOOT_MAIN = REPO_ROOT / "src" / "Main.gob"
 BOOTSTRAP = REPO_ROOT / "bootstrap"
 
 

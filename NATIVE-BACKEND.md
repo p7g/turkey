@@ -6,7 +6,7 @@ Status: accepted. Plan item 9, M27 and M28.
 
 `boot` owns the path from optimized Core to machine code: one low-level SSA IR,
 a small set of optimizations over it, instruction selection, register
-allocation, and object emission. Written in Turkey, in `boot/`.
+allocation, and object emission. Written in Turkey, in `src/`.
 
 The Python implementation's backend is left as it is. It is a JIT: it will
 never select instructions or allocate registers, so hardening its IR to prepare
@@ -745,7 +745,7 @@ table. That is a runtime walker of perhaps a hundred lines and a data section in
 the emitter, against deleting the entry, exit and mask code from every function.
 
 **Measured on this project, through the LLVM path** (2026-09-15). Stage2 `boot`
--- `Turkey.Llvm`'s own output for `boot/Main.gob`, 68 MB of IR -- running
+-- `Turkey.Llvm`'s own output for `src/Main.gob`, 68 MB of IR -- running
 `boot asm` over the 43-program corpus, built with `cc -O2` on an M-series Mac.
 One run makes **455 million** frame enters. The module has 2,529 enter sites,
 40,835 leave sites, 251,292 root-slot stores and 45,252 mask stores.
@@ -1299,7 +1299,7 @@ Each phase runs and is verified before the next begins.
   Spilling is spill-everywhere ("Spilling, surveyed" above): a value with no
   register is stored once after its definition and reloaded before each use,
   and every function finishes in one round of it. Before it, colouring
-  stopped in 10 corpus functions and 249 of `boot`'s. `boot asm boot/Main.gob`
+  stopped in 10 corpus functions and 249 of `boot`'s. `boot asm src/Main.gob`
   went from 65 to 88 seconds.
 
   **How a value is chosen, and the thing the plan got wrong.** The plan was
@@ -1485,12 +1485,12 @@ Three checks, in increasing strength.
 programs and the output is byte-identical: 264,606 lines, `cmp` clean. One
 program, two compilers.
 
-**stage2-arm64 exists.** `boot native boot/Main.gob` gives 2,658,647 lines in
+**stage2-arm64 exists.** `boot native src/Main.gob` gives 2,658,647 lines in
 67 s, which `cc` links against the runtime into an 11 MB executable in 8 s, and
 that binary compiles programs.
 
 **The fixed point, and it is the strong form.** stage2-arm64 compiles
-`boot/Main.gob` again in 63 s and emits output **byte-for-byte identical** to
+`src/Main.gob` again in 63 s and emits output **byte-for-byte identical** to
 stage1's. The ordinary bootstrap check is stage3 against a fourth stage; this
 is the compiler source compiled by two *different* compilers -- one built by
 LLVM, one built by this backend -- agreeing exactly. M29's outstanding question
@@ -1528,7 +1528,7 @@ and until then it says nothing either way. The probe's cost, not a result.
   value already spilled into that very slot the read was a reload of what the
   slot held. `spill` now drops those stores (FINDINGS 94). The allocator's move
   hints now cover argument and result moves as well as parameters: 153,525 of
-  184,766 taken. `boot asm boot/Main.gob` takes 126 seconds, up from 88;
+  184,766 taken. `boot asm src/Main.gob` takes 126 seconds, up from 88;
   selection runs every function twice (once for the function, once for its
   stop reason) and each run now analyzes roots, which is the first place to look.
 
@@ -1549,7 +1549,7 @@ other than the one it gives.
 
 * **Header.** 24 bytes: `kind` and `tag` (`i32` each), `count` (`i64`),
   `pointer_bitmap` (`u64`) -- `TurkeyObject` in `runtime/turkey_runtime.c`, `_OBJECT`
-  in `turkey/llvmgen.py`, and byte offsets in `boot/Turkey/Llvm.gob`.
+  in `turkey/llvmgen.py`, and byte offsets in `src/Turkey/Llvm.gob`.
 * **Slots.** One 8-byte word per field, in declaration order, at `24 + 8*i`.
   Every backend computes a constant offset: `_object_slot`, `slotAddress`, and
   `Select.gob`'s `Ldr/Str [target, #24+8*index], W64`. `field_index` and

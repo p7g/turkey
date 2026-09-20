@@ -31,7 +31,7 @@ import pytest
 from tests import bootc, lang
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-BOOT_MAIN = REPO_ROOT / "boot" / "Main.gob"
+BOOT_MAIN = REPO_ROOT / "src" / "Main.gob"
 PROGRAMS = REPO_ROOT / "tests" / "programs"
 
 # Every corpus program compiles and runs. The set is kept because naming what

@@ -143,7 +143,7 @@ inference tractable.
    defines surviving state, cleanup, nested recovery, and fatal failures.
    Structured concurrency will additionally need cancellation and parent
    propagation semantics.
-4. **Fallible-closure pain is recorded, not predicted.** Every place in `boot/`
+4. **Fallible-closure pain is recorded, not predicted.** Every place in `src/`
    where a fallible closure forces a `traverse`-shaped duplicate goes in
    FINDINGS. If that becomes a pattern, the move is **C, not B**. The backend
    half of C is small; its cost is arrow-bit inference in both implementations.
@@ -217,7 +217,7 @@ useful when recovery needs that original type, and can ship later.
 What exists already: skolems with ranks and an escape check (SPEC-DELTAS 40),
 `CAssume` with named dictionary givens, dictionaries as record values, and the
 generic fallback plus layout-keyed sharing for calls that never become ground.
-Every item below is in both `turkey/` and `boot/`.
+Every item below is in both `turkey/` and `src/`.
 
 * **Parser, AST, `astdump`:** an optional context after a constructor's name.
 * **`decls`:** `ConInfo` gains `exists` and `context`; the scheme becomes
@@ -413,7 +413,7 @@ What it found:
 
 Not established by the prototype: nested *existential* openings of two hidden
 variables at once (the product of keys is implemented but untested), recursive
-existential types, and anything in `boot/`.
+existential types, and anything in `src/`.
 
 Sources for this section:
 [Kennedy & Syme, Design and Implementation of Generics for the .NET CLR](https://www.microsoft.com/en-us/research/publication/design-and-implementation-of-generics-for-the-net-common-language-runtime/),
@@ -645,7 +645,7 @@ oracle does not reach any of them:
   as frame-free. So at an arbitrary point the ancestor chain is deliberately
   incomplete.
 * **boot's native backend emits no panic frames at all**: `turkey_frame_enter`
-  appears nowhere in `boot/`.
+  appears nowhere in `src/`.
 
 And `test_boot` diffs stages through `opt`, "the last stage before a
 backend". Everything below it is outside the oracle -- the FINDINGS 43 shape,
@@ -813,7 +813,7 @@ would reopen this is a FINDINGS entry where a type-indexed structure is wanted.
    `coretc`'s pattern rule and escape check; `mono._ground` refusing skolems;
    `layout.open_arms`, `_packs` and `_packed_layouts`; `backend_lower.packed`,
    `lower_opened` and the skolem case of `layout_of`; evidence binding in
-   `pygen` and `eval`. Every one needs its `boot/` mirror (`Core.gob`,
+   `pygen` and `eval`. Every one needs its `src/` mirror (`Core.gob`,
    `CoreTc`, `Mono.gob`, `Layout.gob`, `SsaLower.gob`, the evaluator), and
    `opt`'s pack-then-match rule is required before any real program uses
    existentials, per finding 3.

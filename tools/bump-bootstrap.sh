@@ -44,7 +44,7 @@ cat > "$BOOTSTRAP/PROVENANCE" <<EOF
 commit: $(git rev-parse HEAD)
 date: $(date -u +%Y-%m-%d)
 target: arm64-apple-darwin
-command: native boot/Main.gob
+command: native src/Main.gob
 asm-sha256: $(shasum -a 256 "$OUT/stage3.s" | cut -d' ' -f1)
 gz-sha256: $(shasum -a 256 "$ARTIFACT" | cut -d' ' -f1)
 cc: $(cc --version | head -n 1)

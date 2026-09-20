@@ -1,6 +1,6 @@
 # How the compiler is written
 
-House style for `boot/`, the Turkey compiler written in Turkey. It exists
+House style for `src/`, the Turkey compiler written in Turkey. It exists
 because the first drafts got several of these wrong, in ways that are cheap to
 fix once and expensive to fix in ten thousand lines.
 
@@ -99,7 +99,7 @@ the operator table is scanned in order on purpose, longest match first.
 
 ## Naming
 
-Modules are `Turkey.*` and live in `boot/Turkey/`.
+Modules are `Turkey.*` and live in `src/Turkey/`.
 
 Reserved words cannot be field or variable names, and the list is longer than
 it looks: `type class instance fun let var match if else while for in loop

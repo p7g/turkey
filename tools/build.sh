@@ -15,7 +15,7 @@
 # from the repository root.
 #
 # bootstrap/ holds the committed compiler: the whole-program arm64 assembly for
-# boot/Main.gob under gzip -9 -n (3.5 MB; -n so the same text always compresses
+# src/Main.gob under gzip -9 -n (3.5 MB; -n so the same text always compresses
 # to the same bytes), a copy of the C runtime it was emitted against, and
 # PROVENANCE, which records the commit it came from and the hashes checked here
 # before anything is built. To reproduce it from source, check out that commit
@@ -45,7 +45,7 @@ cd "$ROOT"
 
 # The compiler's entry module. Relative, and always spelled the same way: it is
 # printed in the first line of the assembly, so the spelling is in the bytes.
-SOURCE=boot/Main.gob
+SOURCE=src/Main.gob
 BOOTSTRAP=bootstrap
 ARTIFACT=$BOOTSTRAP/arm64-darwin.s.gz
 

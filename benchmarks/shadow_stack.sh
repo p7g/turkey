@@ -3,7 +3,7 @@
 #
 # NATIVE-BACKEND.md "Frames, calls and roots, surveyed" quotes these numbers;
 # this rebuilds and reruns them. Stage2 `boot` -- `Turkey.Llvm`'s output for
-# `boot/Main.gob` -- runs `boot asm` over the corpus in five variants:
+# `src/Main.gob` -- runs `boot asm` over the corpus in five variants:
 #
 #   calls         .ll and runtime compiled apart at -O2: enter/leave are calls
 #   inline        -flto -O2: enter/leave inline (the inline shadow stack)
@@ -21,7 +21,7 @@ WORK=${1:-${TMPDIR:-/tmp}/turkey-shadow-stack}
 mkdir -p $WORK
 cd $WORK
 BOOT=$(cd $REPO && python3 -c "from tests import bootc; print(bootc.binary())")
-[[ -s boot.ll ]] || (cd $REPO && $BOOT llvm boot/Main.gob) | sed '1{/^; === /d;}' > boot.ll
+[[ -s boot.ll ]] || (cd $REPO && $BOOT llvm src/Main.gob) | sed '1{/^; === /d;}' > boot.ll
 cp $REPO/runtime/turkey_runtime.c runtime.c
 cp $REPO/runtime/turkey_runtime.h turkey_runtime.h
 

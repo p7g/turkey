@@ -1,4 +1,4 @@
-"""`boot/Turkey/SsaLower.gob`: Core to the low IR.
+"""`src/Turkey/SsaLower.gob`: Core to the low IR.
 
 M27 phase 1, and incomplete on purpose. A Core form nothing handles yet stops
 one binding rather than the run, and `boot ssa` reports the count -- which is
@@ -20,7 +20,7 @@ import pytest
 from tests import bootc
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-BOOT_MAIN = REPO_ROOT / "boot" / "Main.gob"
+BOOT_MAIN = REPO_ROOT / "src" / "Main.gob"
 PROGRAMS = REPO_ROOT / "tests" / "programs"
 
 # Small, and between them they reach an ordinary function, a loop, a

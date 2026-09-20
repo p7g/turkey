@@ -19,7 +19,7 @@ common block elimination. Cwerg states the same rule from the other side:
 left to the frontend."
 
 And **a Core pass is checked by a second implementation.** `tests/test_boot.py`
-diffs `.opt` byte-for-byte between `turkey/` and `boot/` over the whole corpus.
+diffs `.opt` byte-for-byte between `turkey/` and `src/` over the whole corpus.
 A pass written here is verified by machinery that already exists; the same pass
 written in the backend is verified by running programs and hoping a difference
 shows. That asymmetry is worth a lot and it only points one way.
@@ -78,7 +78,7 @@ So a constant folder has a correctness obligation and a self-preservation one:
 * **And the folder itself must not overflow while folding.** This is where the
   two implementations differ and where a shared design has to be careful:
   Python's integers are arbitrary precision, so `turkey/` computing `a + b`
-  gets a value no Turkey program can hold, while `boot/` computing the same
+  gets a value no Turkey program can hold, while `src/` computing the same
   thing in a Turkey `Int` **panics the compiler**. Both must detect the
   overflow rather than perform it -- range-check the operands before the
   operation, or use the wrapping primitives and check the sign, which is what
@@ -122,12 +122,12 @@ with a reference to an earlier binding already in scope, and move nothing.
 
 The survey said both passes were sound and where they belonged. It did not say
 whether they would ever fire, and a constant folder in Core carries a cost the
-survey surfaced: `boot/Turkey/Prims.gob` holds primitive *names* and says so
+survey surfaced: `src/Turkey/Prims.gob` holds primitive *names* and says so
 deliberately -- "what one *means* is the Python's business until the C runtime
 arrives". Folding would be the first thing to need semantics there, so it is
 worth knowing what it buys before paying.
 
-Counted over `tests/programs` and `boot/Main.gob` -- the whole corpus, including
+Counted over `tests/programs` and `src/Main.gob` -- the whole corpus, including
 the compiler compiling itself -- on the program `opt` produces:
 
 | | Core | backend IR |

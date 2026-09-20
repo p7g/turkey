@@ -2,7 +2,7 @@ module Turkey.Infer (
     Generator(..), newGenerator, generate, bindMethods, checkExhaustiveness,
 )
 
--- Constraint generation (design.md 4 and 5, `turkey/infer.py`).
+-- Constraint generation.
 --
 -- This walks the tree and *builds* a constraint. It decides nothing: it never
 -- unifies, never generalizes, and never looks a name up in a type environment.
@@ -113,15 +113,16 @@ type Generator = Generator {
     -- Exhaustiveness runs after solving, when scrutinee types are known.
     matchSites  : Array (Expr, Ty.Type),
     -- And irrefutability: every pattern that binds with no second arm to fall
-    -- to (SPEC-DELTAS 63).
+    -- to.
     binderSites : Array (Pat, Ty.Type),
-    -- And every expression whose value is thrown away (SPEC-DELTAS 66),
-    -- recorded after it is generated, as `turkey/infer.py` does.
+    -- And every expression whose value is thrown away, recorded after it is
+    -- generated, since whether a value is discarded is a property of where the
+    -- expression sits rather than of the expression.
     discardSites : Array Expr,
     -- What a partially annotated `fun`'s header wrote, by declaration id: its
-    -- variables and its context (SPEC-DELTAS 67).
+    -- variables and its context.
     partialHeaders : Map Int (Array (String, Ty.Type), Array Ty.Pred),
-    -- What the patterns being matched have opened (SPEC-DELTAS 68): one list
+    -- What the patterns being matched have opened: one list
     -- per `match` arm or function whose patterns may open an existential, and
     -- `None` for a binding that may not.
     openings : Array (Option (Array (Array (String, Pred), Array ConCell))),
@@ -379,8 +380,8 @@ fun checkGroupRecursion(group : Array Stmt, boundNames : Array String,
     }
 }
 
--- Put every class method in scope, under the scheme its class gives it.
--- Put each declared C symbol in the environment, monomorphically (TIX-62).
+-- Put every class method in scope, under the scheme its class gives it, and
+-- each declared C symbol in the environment, monomorphically.
 --
 -- A foreign declaration states its type in full and has no body, so there is
 -- nothing to infer and nothing to generalize: it goes straight into the
@@ -779,9 +780,8 @@ fun checkSignature(g : Generator, decl : FunDecl, s : Scheme,
     }))
 }
 
--- design.md 5.1: a non-exhaustive match is an error (SPEC-DELTAS 61), and so is
--- a refutable binding pattern (SPEC-DELTAS 63). Runs after solving, since it
--- needs the scrutinee types resolved.
+-- A non-exhaustive match is an error, and so is a refutable binding pattern.
+-- Runs after solving, since it needs the scrutinee types resolved.
 fun checkExhaustiveness(g : Generator) -> Unit {
     for (site, scrutinee) in g.matchSites {
         let arms = match site.kind {
@@ -798,9 +798,9 @@ fun checkExhaustiveness(g : Generator) -> Unit {
                 -- useful to quote.
                 let detail = if missing == "_" { "it needs a catch-all arm" }
                              else { "'" + missing + "' is not handled" }
-                -- An error, not a warning: SPEC-DELTAS 61. See the note in
-                -- `turkey/infer.py`, which this side has to agree with
-                -- character for character.
+                -- An error rather than a warning: a match that falls off the
+                -- end has no value to produce, and there is no exception to
+                -- raise in its place.
                 oops("this match is not exhaustive; " + detail,
                      Some(site.span))
             }
@@ -819,8 +819,7 @@ fun checkExhaustiveness(g : Generator) -> Unit {
             }
         }
     }
-    -- A value computed and thrown away is an error unless there is no value
-    -- (SPEC-DELTAS 66).
+    -- A value computed and thrown away is an error unless there is no value.
     for x in g.discardSites {
         let ty = Typed.of_(g.types, x)
         let unit = match ty {
@@ -943,7 +942,7 @@ fun bindGroup(g : Generator, group : Array Stmt, rest : fun() -> a,
             }
         }
         -- The partial annotations among the group's members, for the solver
-        -- to hold to their headers when it generalizes (SPEC-DELTAS 67).
+        -- to hold to their headers when it generalizes.
         let rigid = Array.new(0)
         for item in group {
             match item.kind {
@@ -1023,12 +1022,12 @@ fun letDefinition(g : Generator, stmt : Stmt, pat : Pat, value : Expr,
     let binds = Array.new(4)
     for (n, ty) in Map.entries(bound) { Array.push(binds, (n, ty)) }
     let defn = pop(g)
-    -- design.md 4.4: only a `let` bound to a syntactic value generalizes.
+    -- Only a `let` bound to a syntactic value generalizes.
     let generalizes = !isVar && isNonexpansive(g, value)
     (binds, defn, generalizes, isVar, Array.new(0))
 }
 
--- design.md 5.2 step 3: one strongly-connected group at a time.
+-- One strongly-connected group at a time.
 --
 -- A group splits by whether a member states its own type. An inferred member's
 -- placeholder is bound *monomorphically* inside the definition, which is what
@@ -1171,7 +1170,7 @@ fun genFunction(g : Generator, params : Array Pat, retAnnot : Option Type,
     for (n, t) in Map.entries(binds) { Array.push(bindList, (n, t)) }
     -- A parameter that opened an existential scopes its rigid constants over
     -- the body and its `return`s; `ret` was made outside, so neither can hand
-    -- one back (SPEC-DELTAS 68).
+    -- one back.
     let defined = CDef(bindList, inner, False)
     if len(openings) > 0 {
         emit(g, openedConstraint(openings, defined, Some(where)))
@@ -1271,7 +1270,8 @@ fun matchPatternInner(g : Generator, pat : Pat, t : Ty.Type) -> Map String Ty.Ty
                             matchPattern(g, sub, conParams[index]), pat.span)
                     }
                 }
-                -- Every field named, or `..` (SPEC-DELTAS 65); see `turkey/infer.py`.
+                -- Every field named, or a trailing `..`: a pattern that claims
+                -- to cover the record must break when a field is added to it.
                 if !rest {
                     let named = Array.new(len(fields))
                     for (label, _) in fields { Array.push(named, label) }
@@ -1301,8 +1301,8 @@ fun mergeInto(into : Map String Ty.Type, new : Map String Ty.Type,
 
 -- -- statements --------------------------------------------------------------------
 
--- design.md 6.8: a block's value is its last statement's, and a declaration
--- contributes Unit. A binder scopes over the statements that follow it, so it is
+-- A block's value is its last statement's, and a declaration contributes Unit.
+-- A binder scopes over the statements that follow it, so it is
 -- generated as a binder *around* them rather than as one more statement.
 fun genSequence(g : Generator, stmts : Array Stmt, from : Int) -> Ty.Type {
     if from >= len(stmts) { return Ty.tUnit() }
@@ -1500,7 +1500,7 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
         eq(g, genExpr(g, cond), Ty.tBool(), Some(cond.span), "an 'if' condition")
         let thenType = genExpr(g, then)
         match otherwise {
-            -- design.md 6.7: statement-style `if` has no value.
+            -- A statement-style `if` has no value.
             None -> {
                 discardsLast(g, then)
                 Ty.tUnit()
@@ -1557,8 +1557,8 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
         discard(genExpr(g, body))
         discardsLast(g, body)
         discard(Array.pop(g.loopStack))
-        -- design.md 6.7: a `loop` never falls through, so its value comes only
-        -- from its breaks. With no break at all it never produces one.
+        -- A `loop` never falls through, so its value comes only from its
+        -- breaks. With no break at all it never produces one.
         if ctx.sawBreak { ctx.result } else { TBottom }
     }
     EMatch(scrutinee, arms) -> genMatch(g, e, scrutinee, arms)
@@ -1604,7 +1604,7 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
 
 -- A constructor's type at a use: an existential with a context is used like a
 -- constrained function, so its predicates are wanted here and the `Use` its node
--- carries is where elaboration puts the dictionaries (SPEC-DELTAS 68).
+-- carries is where elaboration puts the dictionaries.
 fun conType(g : Generator, e : Expr, name : String) -> Ty.Type {
     let info = match Decls.con(g.decls, name) {
         Some(i) -> i
@@ -1624,8 +1624,8 @@ fun conType(g : Generator, e : Expr, name : String) -> Ty.Type {
     con
 }
 
--- A constructor pattern's type, opening the constructor if it is existential
--- (SPEC-DELTAS 68). Each hidden variable becomes a rigid constant named for the
+-- A constructor pattern's type, opening the constructor if it is existential.
+-- Each hidden variable becomes a rigid constant named for the
 -- one the bracket wrote, and each predicate a given under a fresh dictionary
 -- name; both are recorded on the pattern, for Core, and on the enclosing arm or
 -- function, which is what scopes them.
@@ -1683,7 +1683,7 @@ fun openedCon(g : Generator, pat : Pat, name : String) -> Ty.Type {
 -- `inner`, under what its patterns opened: one rank for the rigid constants to
 -- live at, and the carried instances as givens -- the shape `checkSignature`
 -- builds for a declared type, with a pattern as the second source of
--- assumptions (SPEC-DELTAS 68).
+-- assumptions.
 fun openedConstraint(openings : Array (Array (String, Pred), Array ConCell),
                      inner : Constraint, where : Option Span) -> Constraint {
     let givens = Array.new(2)
@@ -1744,7 +1744,7 @@ fun genRecord(g : Generator, e : Expr, conName : String,
                 }
                 Set.add(seen, f)
             }
-            -- design.md 6.1: fields evaluate left to right, so check them so.
+            -- Fields evaluate left to right, so check them in that order.
             for (label, value) in fields {
                 match Array.indexOf(names, label) {
                     Some(index) -> eq(g, conParams[index], genExpr(g, value),
@@ -1770,9 +1770,9 @@ fun familyResult(g : Generator, fam : String) -> Ty.Kind =
 -- Nothing is decided here. If the receiver turns out to be known the solver
 -- finds the generated instance and the family reduces to the declared field
 -- type; if not, the predicate waits, and may end up travelling in a scheme.
--- That is the whole of SPEC-DELTAS.md 7: the old code pruned the receiver and
--- demanded a record on the spot, which made `a.length` mean different things
--- depending on whether the walk had reached `a[0]` yet.
+-- Pruning the receiver and demanding a record on the spot would instead make
+-- `a.length` mean different things depending on how much of the program the
+-- walk had already seen.
 --
 -- The result is a *family application* rather than a fresh variable, and that
 -- is what retires `improve`'s hand-written functional dependency: two reads of
@@ -1836,7 +1836,7 @@ fun genForIn(g : Generator, e : Expr, pat : Pat, iterable : Expr, body : Expr,
        TFun([sequence, cursor],
             Ty.applyTo(Decls.head(g.decls, P.optionType), [element], None)),
        Some(iterable.span), where)
-    -- design.md 6.5: `x` is a fresh immutable binding each iteration.
+    -- `x` is a fresh immutable binding each iteration.
     Array.push(g.openings, None)
     let binds = matchPattern(g, pat, element)
     discard(Array.pop(g.openings))
@@ -1891,7 +1891,7 @@ fun genMatch(g : Generator, e : Expr, scrutinee : Expr,
         -- The arm's value is joined with the others *inside* the rank its
         -- patterns opened, so a type it hides cannot leave through it: the
         -- variable standing for the result is made out here, older than the
-        -- rigid constants (SPEC-DELTAS 68).
+        -- rigid constants.
         let answer = if len(openings) > 0 { Some(fresh(g)) } else { None }
         push(g)
         var body = genExpr(g, arm.body)
@@ -1930,7 +1930,7 @@ fun sameKeys(a : Map String Ty.Type, b : Map String Ty.Type) -> Bool {
 
 -- -- the value restriction ---------------------------------------------------------
 
--- design.md 4.4. Only a syntactic value may be generalized.
+-- Only a syntactic value may be generalized.
 fun isNonexpansive(g : Generator, e : Expr) -> Bool = match e.kind {
     ELit(_) -> True
     EUnit -> True

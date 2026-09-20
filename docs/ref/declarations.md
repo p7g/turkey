@@ -430,3 +430,33 @@ type, and the inferred type shows them in the same bracket form.
 > **Coming from Rust.** `fun largest[Ord a](xs : Array a) -> a` is
 > `fn largest<A: Ord>(xs: &[A]) -> A`. The type variables are not declared;
 > any lowercase name in a type is one.
+
+## Foreign functions
+
+### Syntax
+
+```ebnf
+foreign-decl ::= "foreign" STRING "fun" IDENT "(" foreign-params? ")" "->" type body?
+foreign-params ::= foreign-param ("," foreign-param)*
+foreign-param ::= (IDENT ":")? type
+body ::= "=" expression | block
+```
+
+The string names the C symbol. Without a body, the declaration calls a C
+function and is allowed only in an `Unsafe.` module from the shipped library.
+With a body, it defines a C-callable Turkey function and is allowed only in a
+compiler-designated *giblet* module from that library. Giblet code cannot hold
+values that the collector traces, so a C caller needs no collector setup.
+Ordinary application modules cannot declare or define foreign functions.
+
+Every parameter and the result must state its type. A definition also needs
+a name for every parameter. The boundary types are `Int`, `Float`, `Byte`,
+`Char`, `Bool`, `Unit` and `Prim.Ptr`; traced values such as `String` cannot
+cross it. A definition accepts at most seven general-register arguments and
+eight floating-point arguments. A C symbol may be defined only once.
+
+<!-- error: may only appear in a giblet module -->
+```kotlin
+foreign "application_callback" fun callback(x : Int) -> Int = x
+fun main() { }
+```

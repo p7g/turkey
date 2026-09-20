@@ -3528,3 +3528,68 @@ a string literal has type String, which the collector traces;
 bit on arrows.** Declined in `RUNTIME-IN-TURKEY.md` "The spectrum" until a
 third consumer that users write appears; the design to reach for then is the
 *throws* bit's, generalized.
+
+### 74. `foreign` with a body: Turkey that C can call
+
+TIX-67. The runtime's entry, its big-stack thread and its crash handler are
+all called by C -- by the `main` a backend emits, by `pthread_create` and by
+signal delivery -- and the allocators (TIX-68) are called by generated code at
+the C ABI. So a Turkey function needs a C symbol, the C calling convention, no
+leading environment, and a way to survive `mono` although nothing in Turkey
+names it. The argument and the survey are `PROPOSALS.md` item 9.
+
+```
+foreign "write" fun write(fd : Int, buf : Prim.Ptr, count : Int) -> Int    -- C defines it
+foreign "turkey_crash_report" fun crashReport(signal : Int) -> Unit { ... } -- Turkey does
+```
+
+**One form, told apart by the body**, as Rust tells `extern "C" fn` from an
+`extern` block. Without one it is delta 71's declaration. With one it is a
+*definition*: an ordinary function, typed and compiled like any other, that is
+also callable from C under the symbol.
+
+**Legal only in a giblet module** (delta 73). That is what makes entering one
+free: the body holds nothing the collector traces, so it has no root frame and
+allocates nothing, and a C caller -- a signal handler included -- has nothing to
+set up first. Go and OCaml, whose callbacks run arbitrary managed code, pay for
+that with a bound thread and registered roots; this is the subset that does
+not need either.
+
+**The declaration's signature rules, and one more.** The seven types of delta
+71, a stated result, and every parameter named, since each is a binder. At
+most seven general arguments rather than eight: the body is a Turkey function,
+and its environment arrives in one of the eight registers.
+
+**Kept alive.** A definition is a root of reachability in both compilers'
+`mono` and in the Python backend's own pass, so it is never dropped.
+
+**Emitted as a thunk.** The body is compiled under its Turkey name and takes
+the environment every function takes; the backend adds the C symbol, with
+external linkage, as a thunk that supplies a null environment -- a forwarding
+call in LLVM, which inlines it, and on arm64 a register shift and a branch, so
+it has no frame for the collector's walk to meet. Turkey calls a definition as
+it calls any function, directly. A symbol a program both declares and defines,
+or defines twice, is an error.
+
+**A panic in a definition** sets the flag and returns zero, as any call does,
+and C does not test the flag. A definition that can panic is its C caller's to
+check.
+
+**Three primitives giblet code needs**, each an address fixed at link time:
+
+- `Prim.cString("...") : Prim.Ptr` -- the literal's bytes, NUL-terminated;
+- `Prim.codeAddress("symbol") : Prim.Ptr` -- a definition's C symbol, for
+  `signal` and `pthread_create`;
+- `Prim.frameAddress() : Prim.Ptr` -- the calling function's frame.
+
+The first two take a string literal, which the giblet rule admits on the same
+terms as `Prim.error`'s: it is data the compiler lays out, not a value the code
+holds. A code address names the symbol rather than the function because only a
+definition has a C-callable address, and naming its symbol says which one.
+
+**The program's own entry is a symbol too.** Every backend defines
+`turkey_entry` -- the literals interned, the globals computed, `main` run -- and
+`Turkey.Entry` declares it and runs it on the thread it makes. The runtime's
+`turkey_entry_started` and `turkey_entry_returned` bracket it, because in
+Turkey the panic flag *is* unwinding: the entry's own code, running after a
+program that panicked, would otherwise unwind straight past the report.

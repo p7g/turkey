@@ -514,6 +514,27 @@ the rule, and also the thing to watch: they are all "Core says traced, the
 backend says not", which is the check being made one level above where the
 truth is.
 
+**TIX-67, the second consumer** -- the entry, the big-stack thread and the crash
+handler, 160 lines of C as `lib/Turkey/Entry.gob`. The rule held, and what
+bent was of two kinds, neither an argument for an effect:
+
+- **Two more literals.** A crash report prints text and a giblet holds no
+  `String`, so `Prim.cString("...")` answers static bytes; `signal` and
+  `pthread_create` want a function pointer, so `Prim.codeAddress("symbol")`
+  answers one. Each literal passes on `Prim.error`'s terms -- data the compiler
+  lays out, not a value held -- and both are the first kind again: Core says
+  `String`, and the backend has no string there at all.
+- **One crossing the checker cannot see.** The entry thread calls the program,
+  which allocates, through a `foreign` declaration of `turkey_entry`, and a
+  foreign call is a leaf to `LowIr.summarize`. It is sound for a reason the
+  rule does not know -- the giblet holds nothing managed across the call, and
+  the program roots its own -- and it is the one place giblet code hands
+  control to managed code (PROPOSALS.md 9.5).
+
+And one constraint that is not the rule's but is giblets' as C reaches them:
+code C calls may run before the module initializer, so a top-level `let` in
+it reads zero. `Turkey.Entry` has none, and says why at the top.
+
 ### 110. Every direct call rooted a null
 **performance, fixed.** TIX-63. `SsaLower.directCall` passes a leading
 `ConstInt(0)` at `traced(Ptr)` as the callee's environment, and
@@ -528,7 +549,7 @@ itself: 2,949,896 lines of assembly to 2,871,946, 2.6% of the whole output in
 root stores and frame-table entries for a null, and the compile time unchanged
 at 102s with the giblets summary added.
 
-### 111. The behavioral tests had been asking the compiler that is going away
+### 115. The behavioral tests had been asking the compiler that is going away
 **bug, fixed.** TIX-94. Every test that says what the language does -- the
 `docs/ref` examples, the `.expected` goldens, the diagnostic and panic tests in
 two dozen files -- ran through `turkey.driver`, the Python implementation.
@@ -578,6 +599,59 @@ case. The Python *evaluator* shifted arithmetically and the Python LLVM backend
 did too, and `boot`'s two backends agreed with each other that it was logical.
 The differential that could have caught it compared `boot` with Python only
 above Core.
+### 111. In Turkey the panic flag is unwinding, and the entry unwound too
+**design, fixed.** TIX-67. The first binary built with the entry in Turkey
+exited 0 and printed nothing when its program panicked. A panic sets a flag,
+and every call in generated code tests it on return and leaves if it is up --
+which is the whole unwinding mechanism, and it does not know where the program
+ends. So after the program returned, `Turkey.Entry`'s own calls -- `pthread_join`,
+then `runEntry` returning to `main` -- each saw the flag and left, straight
+past the report `main` exists to print, and `main` answered its zero. The C
+never met this because C tests no flag.
+
+The flag is now parked by the runtime around the program:
+`turkey_entry_started` and `turkey_entry_returned`, called by the
+`turkey_entry` each backend emits, move it where `turkey_panicked` still sees it
+and no call site does. The same bracket empties the panic-frame chain on the
+way in and restores it on the way out, and needed to, for a second reason
+found by reading rather than running: under the Python backend the entry's
+own frames would have been at the bottom of every trace, and the frames an
+unwound program never popped would have been the entry's to trip over as an
+"unbalanced panic frame".
+
+The general point: code that runs *after* a panic, in the same program, has to
+be somewhere the flag is not. Until now there was none.
+
+### 112. A module loaded ahead of the Prelude sees no instances
+**ergonomics, open.** TIX-67. `Turkey.Entry` is loaded ahead of every program's
+entry, and its first `i < count` was "no instance for 'Ord Int'" -- in the same
+file shape as `Turkey.Memory`, which says `i < count` too and compiles.
+`Turkey.Memory` imports `Std.Classes` and nothing that declares the instance;
+it works because by the time it is loaded the Prelude has loaded `Data.Int`,
+and instances are global. Load order decided whether a module typechecked.
+`Turkey.Entry` imports `Data.Int ()` for the instances alone, and says why. The
+rule the two modules actually rely on -- an instance is visible once *any*
+module has loaded it -- is `design.md`'s, and this is its cost.
+
+### 113. A declaration and an emitter's own table named one C symbol
+**bug, fixed.** TIX-67. `Unsafe.Runtime` declares `turkey_panicked` so the entry
+can read the panic state, and both LLVM emitters already declared it in their
+runtime tables, at `i32` where the declaration says `Int` -- a duplicate name
+to `llvmlite`, and a redefinition to LLVM. Generated code never called it (it
+loads the flag), so the table entries are gone. The hazard stays: the
+emitters' runtime tables and `Unsafe.Runtime` name overlapping sets of C
+symbols, written separately, and nothing checks the two against each other or
+against `runtime/turkey_runtime.h`.
+
+### 114. A compiled program names its frames the way the compiler does
+**bug, open.** TIX-67, found writing the test the ticket asked for. A binary's
+panic trace says `at Data.Array#outOfBounds (Data/Array.gob:87:5)` where the
+JIT's says `at outOfBounds (...)`, because the JIT's host prints through
+`errors.short` and the entry prints `PanicSite.function` as it is. The C did
+the same, so the port keeps it and the comparison with `.expected` in
+`tests/test_entry.py` is made after shortening. The fix is a few lines in
+`Turkey.Entry.reportPanic`, and it is a change a program can notice: TIX-113.
+`boot`'s binaries print no frames at all, which is TIX-114.
 
 ### 98. Two codes that meant the same thing, and a bit thrown away before it was read
 **bug, fixed.** TIX-61. The collector traced a slot whose three-bit layout code

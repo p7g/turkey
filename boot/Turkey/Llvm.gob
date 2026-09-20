@@ -34,7 +34,7 @@ module Turkey.Llvm (
 import Data.Map as Map
 import Data.Set as Set
 import Turkey.LowIr as L
-import Turkey.LowIr (Op(..), Low(..), BinOp(..), CmpOp(..), Conv(..),
+import Turkey.LowIr (Op(..), Low(..), AddressOf(..), BinOp(..), CmpOp(..), Conv(..),
                      Callee(..))
 import Turkey.Roots as Roots
 import Turkey.Ssa as Ssa
@@ -191,6 +191,7 @@ fun emitModule(m : Module, entry : String) -> (String, Array String) {
     line(e, "@.turkey.global.frame = internal global [5 x i64] zeroinitializer")
     line(e, "")
     for f in m.functions { emitFunc(e, f) }
+    for (sym, name) in m.definitions { emitDefinition(e, m, sym, name) }
     emitEntry(e, m, entry)
     -- Last, because a panic message is discovered by emitting the code that
     -- mentions it -- and the entry sequence mentions one too, naming the
@@ -204,6 +205,45 @@ fun emitModule(m : Module, entry : String) -> (String, Array String) {
     }
     (String.build(e.out), Array.sort(Set.elements(e.missing)))
 }
+
+-- The C-callable face of a `foreign` definition (SPEC-DELTAS 74).
+--
+-- The body is an ordinary Turkey function, internal like every other, and
+-- takes an environment first; C supplies none, so this supplies a null one and
+-- is otherwise a forwarding call. The one symbol in the module with external
+-- linkage besides `main`, because it is the one a C caller names.
+fun emitDefinition(e : Emit, m : Module, sym : String, name : String) -> Unit {
+    for f in m.functions {
+        if f.name == name {
+            let params = []
+            let passed = ["ptr null"]
+            for var i = 1; i < len(f.params); i = i + 1 {
+                let t = typeOf(Ssa.repOf(f, f.params[i]))
+                Array.push(params, t + " %a" + Int.toString(i))
+                Array.push(passed, t + " %a" + Int.toString(i))
+            }
+            let call = symbol(name) + "(" + String.join(passed, ", ") + ")"
+            line(e, "define " + foreignResult(f.result) + " " + cSymbol(sym)
+                    + "(" + String.join(params, ", ") + ") {")
+            line(e, "b0:")
+            match f.result.class_ {
+                Unit -> {
+                    line(e, "  call " + typeOf(f.result) + " " + call)
+                    line(e, "  ret void")
+                }
+                _ -> {
+                    line(e, "  %r = call " + typeOf(f.result) + " " + call)
+                    line(e, "  ret " + typeOf(f.result) + " %r")
+                }
+            }
+            line(e, "}")
+            line(e, "")
+        }
+    }
+}
+
+-- A C symbol, spelled as LLVM names one.
+fun cSymbol(sym : String) -> String = "@\"" + escaped(sym) + "\""
 
 -- The global holding a panic message, interned per module.
 fun messageGlobal(e : Emit, text : String) -> String {
@@ -265,15 +305,16 @@ fun declareRuntime(e : Emit) -> Unit {
         "declare ptr @turkey_closure_new(i64, i64, i64)",
         "declare void @turkey_panic(ptr)",
         "declare void @turkey_panic_string(ptr)",
-        "declare i32 @turkey_panicked()",
-        "declare i32 @turkey_main(i32, ptr, ptr)",
         "declare void @turkey_root_enter(ptr, ptr, i64, ptr)",
         "declare void @turkey_root_leave(ptr)",
+        "declare void @turkey_entry_started()",
+        "declare void @turkey_entry_returned()",
         "@turkey_has_panicked = external global i32",
         "declare {i64, i1} @llvm.sadd.with.overflow.i64(i64, i64)",
         "declare {i64, i1} @llvm.ssub.with.overflow.i64(i64, i64)",
         "declare {i64, i1} @llvm.smul.with.overflow.i64(i64, i64)",
         "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)",
+        "declare ptr @llvm.frameaddress.p0(i32)",
     ] { line(e, d) }
 }
 
@@ -314,9 +355,14 @@ fun declareForeigns(e : Emit, m : Module) -> Unit {
         }
     }
     for name in Array.sort(Map.keys(seen)) {
-        line(e, Map.getOr(seen, name, ""))
+        -- `turkey_entry` is declared by `Unsafe.Runtime` and defined here, by
+        -- `emitEntry`; a declaration beside the definition is a redefinition.
+        if name != entrySymbol { line(e, Map.getOr(seen, name, "")) }
     }
 }
+
+-- The symbol every program defines for `Turkey.Entry` to run it by (TIX-67).
+let entrySymbol = "turkey_entry"
 
 -- C's `void` is not the language's unit: a void call names no value, and every
 -- instruction here has a result. A declaration that answers `Unit` is the only
@@ -707,6 +753,14 @@ fun emitInst(e : Emit, f : Func Low, i : Low) -> Unit {
         ConstString(text) -> line(e, "  " + dst + " = load ptr, ptr "
                                      + literalValue(e, literalIndex(e, text)))
         ConstUnit -> line(e, "  " + dst + " = add i8 0, 0")
+        -- Static bytes are a panic message's global by another name: both
+        -- are a C string the module interns (SPEC-DELTAS 74).
+        Address(CBytes(text)) -> line(e, "  " + dst + " = getelementptr i8, ptr "
+                                         + messageGlobal(e, text) + ", i64 0")
+        Address(CodeOf(sym)) -> line(e, "  " + dst + " = getelementptr i8, ptr "
+                                        + cSymbol(sym) + ", i64 0")
+        Address(ThisFrame) -> line(e, "  " + dst
+                                      + " = call ptr @llvm.frameaddress.p0(i32 0)")
         Bin(o, a, b) -> emitBin(e, f, dst, ty, r, o, a, b)
         Cmp(o, a, b) -> {
             let operand = Ssa.repOf(f, a)
@@ -1339,12 +1393,15 @@ fun runtimeOf(name : String) -> Option (String, String) =
 --
 -- Three things in order: the string literals are built, the module
 -- initializer computes every global, and then `main` runs. The literals come
--- first because an initializer's value may be one, and `turkey_main` wraps the
--- lot because argument handling, the panic report and the final collection are
--- the runtime's and are written once in C rather than emitted here.
+-- first because an initializer's value may be one. `Turkey.Entry` wraps the
+-- lot -- argument handling, the panic report and the final collection are
+-- written once, in Turkey, rather than emitted here -- and reaches this by its
+-- C symbol, `turkey_entry`; the runtime's two calls around it park the
+-- program's ending where the entry's own code will not unwind on it.
 fun emitEntry(e : Emit, m : Module, entry : String) -> Unit {
-    line(e, "define internal void @.turkey.entry() {")
+    line(e, "define void @" + entrySymbol + "() {")
     line(e, "b0:")
+    line(e, "  call void @turkey_entry_started()")
     -- The permanent frame, before anything allocates. It is never left: every
     -- global is live for the whole run, so the mask is all ones and the frame
     -- sits at the bottom of the chain until the process exits.
@@ -1377,13 +1434,18 @@ fun emitEntry(e : Emit, m : Module, entry : String) -> Unit {
     }
     line(e, "  call i8 " + symbol(m.initial) + "()")
     line(e, "  call i8 " + symbol(entry) + "(ptr null)")
+    line(e, "  call void @turkey_entry_returned()")
     line(e, "  ret void")
     line(e, "}")
     line(e, "")
+    -- C's `main`, whose `int`s are widened to the `Int`s a foreign definition
+    -- takes and narrowed back.
     line(e, "define i32 @main(i32 %argc, ptr %argv) {")
     line(e, "b0:")
-    line(e, "  %status = call i32 @turkey_main(i32 %argc, ptr %argv, ptr @.turkey.entry)")
-    line(e, "  ret i32 %status")
+    line(e, "  %count = sext i32 %argc to i64")
+    line(e, "  %status = call i64 @turkey_main(i64 %count, ptr %argv)")
+    line(e, "  %narrow = trunc i64 %status to i32")
+    line(e, "  ret i32 %narrow")
     line(e, "}")
 }
 

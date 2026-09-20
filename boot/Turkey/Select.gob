@@ -35,7 +35,7 @@ import Turkey.Arm64 as A
 -- gets the unqualified names.
 import Turkey.Arm64 (Reg(..), Inst(..), Bank(..))
 import Turkey.LowIr as L
-import Turkey.LowIr (Op(..), Low(..), BinOp(..), CmpOp(..), Conv(..),
+import Turkey.LowIr (Op(..), Low(..), AddressOf(..), BinOp(..), CmpOp(..), Conv(..),
                      Callee(..))
 import Turkey.Asm as Asm
 import Turkey.Asm (Asm(..))
@@ -399,6 +399,14 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         -- not a safepoint (`Turkey.Roots.isSafepoint`).
         ConstString(text) ->
             emit(s, A.Ldr(d, slotOf(s, Asm.literalSlot(s.asm, text)), A.W64))
+        -- Addresses the assembler and linker decide (SPEC-DELTAS 74). Static
+        -- bytes share the panic messages' table, since both are a C string
+        -- the module interns; a code address names the thunk `Turkey.Emit`
+        -- writes under the definition's C symbol.
+        Address(CBytes(text)) -> symbolAddress(s, d, Asm.messageSymbol(s.asm, text))
+        Address(CodeOf(sym)) -> symbolAddress(s, d, Asm.runtimeFor(sym))
+        -- Every function has a frame record, so `x29` is this frame.
+        Address(ThisFrame) -> emit(s, A.Mov(d, A.fp, A.W64))
         GlobalLoad(name) -> emit(s, A.Ldr(d, globalAt(s, name), A.W64))
         GlobalStore(name, v) -> {
             emit(s, A.Str(A.reg(v), globalAt(s, name), A.W64))
@@ -709,6 +717,13 @@ fun address(s : Sel, sym : String) -> Reg {
     -- allocator will too.
     emit(s, A.AddLo(full, page, sym))
     full
+}
+
+-- A symbol's address into `d`: `address`'s pair, ending in the destination.
+fun symbolAddress(s : Sel, d : Reg, sym : String) -> Unit {
+    let page = temp(s, Ssa.untraced(Ptr))
+    emit(s, A.Adrp(page, sym))
+    emit(s, A.AddLo(d, page, sym))
 }
 
 fun symbolFor(name : String) -> String = Asm.symbolFor(name)

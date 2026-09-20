@@ -60,15 +60,17 @@ int32_t turkey_exiting(void);
 int64_t turkey_exit_status(void);
 void turkey_exit_clear(void);
 
-/* Print the Turkey call stack on a fault in generated code, then exit 139.
-   Opt-in: the host installs it when `TURKEY_SEGV_FRAMES` is set, because a
-   `SIGSEGV` handler is not this library's to take by default. */
-void turkey_install_crash_handler(void);
-
-/* The `main` of a compiled program: hands the arguments over, runs `entry`,
-   and turns the panic and exit flags into an exit status. The code generator
-   emits a `main` that is a call to this. */
-int turkey_main(int argc, char **argv, void (*entry)(void));
+/* What the entry and the crash report in `lib/Turkey/Entry.gob` read of the
+   collector's and the panic machinery's state (TIX-67). The entry itself --
+   `turkey_main`, the big-stack thread and the crash handler -- is Turkey, and
+   each program defines those symbols; these stay C because the state they
+   reach is the collector's until it moves too. */
+void turkey_entry_stack_set(void *frame);
+/* Called by the generated `turkey_entry` around the program; see the C. */
+void turkey_entry_started(void);
+void turkey_entry_returned(void);
+const void *turkey_roots_head(void);
+const void *turkey_panic_calls_head(void);
 
 void turkey_panic(const char *message);
 void turkey_panic_string(void *message);

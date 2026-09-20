@@ -100,7 +100,8 @@ def test_every_program_has_an_entry_and_a_root_array():
     array still links, and every string literal is then null."""
     for name, text in _all().items():
         assert "_turkey_module_roots:" in text, name
-        assert "Lentry:" in text, name
+        # The program as `Turkey.Entry` runs it, by its C symbol (TIX-67).
+        assert '"_turkey_entry":' in text, name
         assert '.globl "_main"' in text, name
 
 

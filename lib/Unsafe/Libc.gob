@@ -2,6 +2,8 @@ module Unsafe.Libc (
     malloc, free, strlen, getenv, write,
     open, creat, read, close,
     floor, ceil, round, trunc, fmod, remainder,
+    pthreadAttrInit, pthreadAttrSetStackSize, pthreadAttrDestroy,
+    pthreadCreate, pthreadJoin, signal, exitNow,
 )
 
 -- The C symbols this system cannot avoid.
@@ -26,10 +28,8 @@ module Unsafe.Libc (
 -- because Apple does not commit to a syscall ABI.
 --
 -- **Only what has a caller.** The residue an FFI has to cover is about ten
--- POSIX entry points, and the rest of them -- `mmap`, `munmap`, the
--- `pthread_*` five -- arrive with the runtime sections that need them rather
--- than sitting here unused. `open`, `creat`, `read` and `close` arrived with
--- `System.IO`. A declaration nothing calls is not free
+-- POSIX entry points. `mmap` and `munmap` have no callers here.
+-- A declaration nothing calls is not free
 -- to keep: it is a signature nobody has checked against a header, which is
 -- exactly the thing this form cannot verify.
 
@@ -114,3 +114,40 @@ foreign "trunc" fun trunc(x : Float) -> Float
 foreign "fmod" fun fmod(a : Float, b : Float) -> Float
 
 foreign "remainder" fun remainder(a : Float, b : Float) -> Float
+
+-- -- the entry ------------------------------------------------------------------------
+--
+-- What `Turkey.Entry` needs to run the program on a thread with a stack of its
+-- own, and to report a fault (TIX-67). Every `int` result is read through a
+-- sign extension, as the file doors' are.
+--
+-- `pthread_attr_t` and `pthread_t` are opaque, so the caller passes storage for
+-- them: `Turkey.Entry` `malloc`s it, sized generously, since the structure's
+-- size is the platform's and is never read here. A `pthread_t` is one word on
+-- both Darwin (a pointer) and Linux (an `unsigned long`), so it is read back as
+-- a `Prim.Ptr` and handed to `pthread_join` as one.
+
+foreign "pthread_attr_init" fun pthreadAttrInit(attributes : Prim.Ptr) -> Int
+
+foreign "pthread_attr_setstacksize" fun pthreadAttrSetStackSize(attributes : Prim.Ptr,
+                                                                size : Int) -> Int
+
+foreign "pthread_attr_destroy" fun pthreadAttrDestroy(attributes : Prim.Ptr) -> Int
+
+-- `start` is a C function pointer, `void *(*)(void *)`: a `foreign`
+-- definition's address, from `Prim.codeAddress`.
+foreign "pthread_create" fun pthreadCreate(thread : Prim.Ptr,
+                                           attributes : Prim.Ptr,
+                                           start : Prim.Ptr,
+                                           argument : Prim.Ptr) -> Int
+
+foreign "pthread_join" fun pthreadJoin(thread : Prim.Ptr, result : Prim.Ptr) -> Int
+
+-- The previous handler, which nothing here restores. `handler` is a
+-- `void (*)(int)`, again a definition's address.
+foreign "signal" fun signal(number : Int, handler : Prim.Ptr) -> Prim.Ptr
+
+-- Leave now: no `atexit` handlers and no flushing, which is what a crash
+-- report wants -- the process is already lost, and `exit` would run code that
+-- may be what faulted.
+foreign "_exit" fun exitNow(status : Int) -> Unit

@@ -38,7 +38,7 @@ export      ::= IDENT
               | CONID "(" CONID ("," CONID)* ")"
               | "module" modname
 top-level   ::= import | type-decl | class-decl | instance-decl
-              | fun-decl | let-decl | var-decl
+              | fun-decl | let-decl | var-decl | foreign-decl
 import      ::= "import" modname ("as" CONID)? import-list?
 import-list ::= "(" item ("," item)* ")"
               | "hiding" "(" item ("," item)* ")"
@@ -190,3 +190,15 @@ pattern-atom  ::= IDENT
 field-pattern ::= IDENT "=" pattern
                 | IDENT
 ```
+
+## Foreign functions
+
+```ebnf
+foreign-decl ::= "foreign" STRING "fun" IDENT "(" foreign-params? ")" "->" type body?
+foreign-params ::= foreign-param ("," foreign-param)*
+foreign-param ::= (IDENT ":")? type
+body ::= "=" expression | block
+```
+
+The placement and signature restrictions are described under
+[Foreign functions](declarations.md#foreign-functions).

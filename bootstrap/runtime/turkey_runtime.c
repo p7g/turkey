@@ -864,34 +864,11 @@ void *turkey_array_new(int64_t length, uint64_t initial, int32_t element_width,
     return array;
 }
 
-void *turkey_closure_new(uint64_t code, int64_t capture_count,
-                         uint64_t pointer_bitmap) {
-    /* A capture-free closure needs no environment object: nothing can read
-       one, because a body with no captures never touches its environment
-       parameter, and the marker skips a null second slot already. This is
-       what the emitter's static closures rely on -- and what a capture-free
-       closure built any other way still benefits from, one object instead of
-       a pair. */
-    if (capture_count == 0) {
-        TurkeyObject *closure = turkey_object_new(3, -1, 2, 2);
-        if (closure == NULL) return NULL;
-        closure->slots[0] = code;
-        closure->slots[1] = 0;
-        return closure;
-    }
-    RootFrame frame;
-    void *roots[1] = {NULL};
-    turkey_root_enter(&frame, roots, 1, "turkey_closure_new");
-    TurkeyObject *environment = turkey_object_new(
-        4, -1, capture_count, pointer_bitmap);
-    if (environment == NULL) { turkey_root_leave(&frame); return NULL; }
-    roots[0] = environment;
-    frame.live = 1;
+/* The caller allocates and roots the environment separately. The shell's
+   null environment is safe to trace until the caller installs it. */
+void *turkey_closure_shell(uint64_t code) {
     TurkeyObject *closure = turkey_object_new(3, -1, 2, 2);
-    if (closure == NULL) { turkey_root_leave(&frame); return NULL; }
-    closure->slots[0] = code;
-    closure->slots[1] = (uint64_t)(uintptr_t)environment;
-    turkey_root_leave(&frame);
+    if (closure != NULL) closure->slots[0] = code;
     return closure;
 }
 

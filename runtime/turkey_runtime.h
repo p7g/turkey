@@ -21,8 +21,7 @@ void *turkey_box(uint64_t value, int32_t layout);
 uint64_t turkey_unbox(void *box, int32_t layout);
 void *turkey_array_new(int64_t length, uint64_t initial, int32_t element_width,
                        int32_t element_layout);
-void *turkey_closure_new(uint64_t code, int64_t capture_count,
-                         uint64_t pointer_bitmap);
+void *turkey_closure_shell(uint64_t code);
 
 /* Raw memory: `malloc` and `free`, and deliberately nothing more. Not heap
    objects -- these have no header, are never collected, and the collector must

@@ -1113,7 +1113,7 @@ fun valueHere(l : Lower, e : Core) -> Value {
             -- around it, using the function's own environment-first signature.
             None -> match Map.get(l.sigs, name) {
                 Some(_) -> {
-                    L.emit(l.b, ClosureNew(name, 0, 0),
+                    L.emit(l.b, ClosureNew(name, 0),
                            Ssa.traced(Ptr))
                 }
                 None -> if Set.contains(l.globals, name) {
@@ -1438,16 +1438,26 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     }
 }
 
--- The closure itself: the shell, then the captures written into it.
---
--- No slot for the shell and no reload before the captures, which is what
--- `turkey/backend_lower.py` needs because its SSA is block-local. Here the
--- shell dominates every store that follows it in the same block.
+-- Environment fields use one trace bit per capture (kind 4), unlike the
+-- three-bit field layouts of ordinary records. Zeroed captures let recursive
+-- shells survive collection before their sibling closures are installed.
+fun closureShell(l : Lower, symbol : String,
+                 captures : Array (String, Rep)) -> Value {
+    if len(captures) == 0 {
+        return L.emit(l.b, ClosureNew(symbol, 0), Ssa.traced(Ptr))
+    }
+    let reps = Array.map(captures, fun(c) = c.1)
+    let environment = L.emit(l.b, ObjectNew(4, -1, len(captures), bitmap(reps)),
+                             Ssa.traced(Ptr))
+    let closure = L.emit(l.b, ClosureNew(symbol, len(captures)), Ssa.traced(Ptr))
+    -- The later use roots the environment across the shell's safepoint.
+    L.effect(l.b, ObjectSet(closure, 1, environment))
+    closure
+}
+
 fun closureFor(l : Lower, symbol : String,
                captures : Array (String, Rep)) -> Value {
-    let reps = Array.map(captures, fun(c) = c.1)
-    let closure = L.emit(l.b, ClosureNew(symbol, len(captures), bitmap(reps)),
-                         Ssa.traced(Ptr))
+    let closure = closureShell(l, symbol, captures)
     for var i = 0; i < len(captures); i = i + 1 {
         match Map.get(l.env, captures[i].0) {
             Some(v) -> L.effect(l.b, ClosureCapture(closure, i, v))
@@ -1511,10 +1521,7 @@ fun letrec(l : Lower, binds : Array CBind, body : Core, dest : Dest) -> Unit {
     -- Every shell exists before any capture is read.
     let shells = []
     for (_, symbol, captures) in plans {
-        let reps = Array.map(captures, fun(c) = c.1)
-        Array.push(shells, L.emit(l.b, ClosureNew(symbol, len(captures),
-                                                  bitmap(reps)),
-                                  Ssa.traced(Ptr)))
+        Array.push(shells, closureShell(l, symbol, captures))
     }
     let was = saving(l, Array.map(plans, fun(p) = p.0))
     for var i = 0; i < len(plans) && i < len(shells); i = i + 1 {

@@ -767,118 +767,19 @@ int64_t turkey_frame_col(int64_t index) {
     return frame == NULL ? 0 : frame->col;
 }
 
-/* ------------------------------------------- the collector's allocation interface
- *
- * What generated code calls to make a heap object, and so what the collector
- * hands out: each of these fills a header over `heap_allocate`, which is the
- * safepoint and the region allocator. They stay in C with the collector and
- * move when it does -- a managed object cannot come from `malloc`, because it
- * needs a header and an allocation bit in a region this file owns.
- *
- * Two shapes are pinned here rather than stated anywhere a layout change could
- * see them: a closure is `[code, environment]`, and a `String` is a byte array
- * -- `lib/Data/String/Type.gob` erases to one, so `turkey_string_new` below is
- * what interns a literal.
- */
-
-void *turkey_cell_new(uint64_t value, int32_t pointer_value) {
-    TurkeyCell *cell = heap_allocate(sizeof(TurkeyCell), HEAP_CELL);
-    if (cell != NULL) { cell->value = value; cell->pointer_value = pointer_value; }
-    return cell;
+/* The allocator giblet owns payload initialization. These bridges expose only
+   collector-owned operations; the raw allocation may collect, and its caller
+   must already have rooted every managed operand. */
+void *turkey_heap_allocate(uint64_t size, int64_t kind) {
+    return heap_allocate((size_t)size, (uint32_t)kind);
 }
 
-void *turkey_object_new(int32_t kind, int32_t tag, int64_t count,
-                        uint64_t pointer_bitmap) {
-    if (count < 0 || count > 63 ||
-            ((kind == 0 || kind == 1) && count > 21) || (uint64_t)count >
-            (SIZE_MAX - sizeof(TurkeyObject)) / sizeof(uint64_t)) {
-        turkey_panic("invalid object size");
-        return NULL;
-    }
-    TurkeyObject *object = heap_allocate(
-        sizeof(TurkeyObject) + (size_t)count * sizeof(uint64_t), HEAP_OBJECT);
-    if (object == NULL) return NULL;
-    stats_count_kind(kind);
-    object->kind = kind;
-    object->tag = tag;
-    object->count = count;
-    object->pointer_bitmap = pointer_bitmap;
-    memset(object->slots, 0, (size_t)count * sizeof(uint64_t));
-    return object;
+void turkey_count_kind(int64_t kind) {
+    stats_count_kind((int)kind);
 }
 
-void *turkey_box(uint64_t value, int32_t layout) {
-    TurkeyObject *box = turkey_object_new(5, layout, 1, 0);
-    if (box != NULL) box->slots[0] = value;
-    return box;
-}
-
-uint64_t turkey_unbox(void *pointer, int32_t layout) {
-    if (!valid_object_kind(pointer, 5)) return 0;
-    TurkeyObject *box = pointer;
-    if (box->tag != layout) {
-        turkey_panic("boxed value has the wrong scalar layout");
-        return 0;
-    }
-    return box->slots[0];
-}
-
-void *turkey_array_new(int64_t length, uint64_t initial, int32_t element_width,
-                       int32_t element_layout) {
-    if (length < 0) {
-        turkey_panic("array length cannot be negative");
-        return NULL;
-    }
-    if (!(element_width == 1 || element_width == 4 || element_width == 8) ||
-            (uint64_t)length > (SIZE_MAX - sizeof(TurkeyObject)) /
-            (uint32_t)element_width) {
-        turkey_panic("invalid array size");
-        return NULL;
-    }
-    TurkeyObject *array = heap_allocate(
-        sizeof(TurkeyObject) + (size_t)length * (uint32_t)element_width,
-        HEAP_OBJECT);
-    if (array == NULL) return NULL;
-    stats_count_kind(2);
-    array->kind = 2;
-    array->tag = element_layout;
-    array->count = length;
-    array->pointer_bitmap = (uint32_t)element_width;
-    /* One `memcpy` call per element was the previous shape of this, which for
-       a million-element array is a million calls to copy up to eight bytes.
-       A zero fill is a `memset` whatever the width, and a repeating fill is a
-       typed store. */
-    unsigned char *bytes = (unsigned char *)array->slots;
-    if (initial == 0) {
-        memset(bytes, 0, (size_t)length * (uint32_t)element_width);
-    } else if (element_width == 1) {
-        memset(bytes, (int)(initial & 0xff), (size_t)length);
-    } else if (element_width == 4) {
-        uint32_t *words = (uint32_t *)bytes;
-        uint32_t value = (uint32_t)initial;
-        for (int64_t index = 0; index < length; ++index) words[index] = value;
-    } else {
-        uint64_t *words = (uint64_t *)bytes;
-        for (int64_t index = 0; index < length; ++index) words[index] = initial;
-    }
-    return array;
-}
-
-/* The caller allocates and roots the environment separately. The shell's
-   null environment is safe to trace until the caller installs it. */
-void *turkey_closure_shell(uint64_t code) {
-    TurkeyObject *closure = turkey_object_new(3, -1, 2, 2);
-    if (closure != NULL) closure->slots[0] = code;
-    return closure;
-}
-
-
-/* A literal, as the entry interns it: a byte array holding a copy. */
-void *turkey_string_new(const unsigned char *bytes, int64_t length) {
-    TurkeyObject *array = turkey_array_new(length, 0, 1, 2);
-    if (array != NULL && length > 0)
-        memcpy(array->slots, bytes, (size_t)length);
-    return array;
+int64_t turkey_valid_object_kind(void *value, int64_t kind) {
+    return valid_object_kind(value, (int32_t)kind);
 }
 
 /* ------------------------------------------------------------------ float text

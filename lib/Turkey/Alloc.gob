@@ -1,0 +1,115 @@
+module Turkey.Alloc (cellNew, objectNew, box, unbox, arrayNew, closureShell, stringNew)
+
+-- Generated callers root every managed operand across these calls. The heap
+-- does not move, so those operands may travel here as raw words. Each allocator
+-- calls the heap once, and holds no newly allocated object across another
+-- allocation. Its raw result becomes traced at the caller's allocation opcode.
+-- No initializer or managed literal may be needed: literal interning calls
+-- this module before module initialization.
+import Prelude ()
+import Std.Classes
+import Data.Int ()
+import Data.Bool.Type (Bool(..))
+import Turkey.Memory as Memory
+import Unsafe.Runtime as Rt
+
+foreign "turkey_cell_new" fun cellNew(value : Int, pointerValue : Int) -> Prim.Ptr {
+    let cell = Rt.heapAllocate(16, 3)
+    if !Prim.ptrIsNull(cell) {
+        Prim.storeI64(cell, 0, value)
+        Prim.storeI32(cell, 8, Prim.charFromInt(pointerValue))
+    }
+    cell
+}
+
+foreign "turkey_object_new" fun objectNew(kind : Int, tag : Int, count : Int,
+                                         pointerBitmap : Int) -> Prim.Ptr {
+    if count < 0 || count > 63 || ((kind == 0 || kind == 1) && count > 21) {
+        Rt.panic(Prim.cString("invalid object size"))
+        return Prim.ptrNull()
+    }
+    let object = Rt.heapAllocate(24 + 8 * count, 2)
+    if Prim.ptrIsNull(object) { return object }
+    Rt.countKind(kind)
+    header(object, kind, tag, count, pointerBitmap)
+    Memory.fill(Prim.ptrAdd(object, 24), 8 * count, 0)
+    object
+}
+
+-- The collector and generated field accesses share this layout. The two
+-- 32-bit fields must not overwrite the count or one another.
+fun header(object : Prim.Ptr, kind : Int, tag : Int, count : Int,
+           metadata : Int) -> Unit {
+    Prim.storeI32(object, 0, Prim.charFromInt(kind))
+    Prim.storeI32(object, 4, Prim.charFromInt(tag))
+    Prim.storeI64(object, 8, count)
+    Prim.storeI64(object, 16, metadata)
+}
+
+foreign "turkey_box" fun box(value : Int, layout : Int) -> Prim.Ptr {
+    let object = objectNew(5, layout, 1, 0)
+    if !Prim.ptrIsNull(object) { Prim.storeI64(object, 24, value) }
+    object
+}
+
+foreign "turkey_unbox" fun unbox(object : Prim.Ptr, layout : Int) -> Int {
+    if Rt.validObjectKind(object, 5) == 0 { return 0 }
+    if Prim.charToInt(Prim.loadI32(object, 4)) != Prim.intAnd(layout, 4294967295) {
+        Rt.panic(Prim.cString("boxed value has the wrong scalar layout"))
+        return 0
+    }
+    Prim.loadI64(object, 24)
+}
+
+foreign "turkey_array_new" fun arrayNew(length : Int, initial : Int,
+                                        elementWidth : Int, elementLayout : Int)
+        -> Prim.Ptr {
+    if length < 0 {
+        Rt.panic(Prim.cString("array length cannot be negative"))
+        return Prim.ptrNull()
+    }
+    -- floor((SIZE_MAX - 24) / width). Every nonnegative Int fits at width 1;
+    -- widths 4 and 8 have signed-representable bounds. After this check the
+    -- size is an unsigned word, passed bit-for-bit to the C heap allocator.
+    if !(elementWidth == 1 || elementWidth == 4 || elementWidth == 8)
+            || (elementWidth == 4 && length > 4611686018427387897)
+            || (elementWidth == 8 && length > 2305843009213693948) {
+        Rt.panic(Prim.cString("invalid array size"))
+        return Prim.ptrNull()
+    }
+    let size = Prim.intAddWrapping(24, Prim.intMulWrapping(length, elementWidth))
+    let array = Rt.heapAllocate(size, 2)
+    if Prim.ptrIsNull(array) { return array }
+    Rt.countKind(2)
+    header(array, 2, elementLayout, length, elementWidth)
+    let bytes = Prim.ptrAdd(array, 24)
+    if elementWidth == 1 {
+        Memory.fill(bytes, length, initial)
+    } else {
+        for var i = 0; i < length; i = i + 1 {
+            let offset = Prim.intMulWrapping(i, elementWidth)
+            if elementWidth == 4 {
+                Prim.storeI32(bytes, offset, Prim.charFromInt(initial))
+            } else {
+                Prim.storeI64(bytes, offset, initial)
+            }
+        }
+    }
+    array
+}
+
+-- The environment is independently allocated and rooted by the caller. Zero
+-- initialization makes the shell safe to trace until that pointer is installed.
+foreign "turkey_closure_shell" fun closureShell(code : Int) -> Prim.Ptr {
+    let closure = objectNew(3, -1, 2, 2)
+    if !Prim.ptrIsNull(closure) { Prim.storeI64(closure, 24, code) }
+    closure
+}
+
+foreign "turkey_string_new" fun stringNew(bytes : Prim.Ptr, length : Int) -> Prim.Ptr {
+    let array = arrayNew(length, 0, 1, 2)
+    if !Prim.ptrIsNull(array) && length > 0 {
+        Memory.copy(Prim.ptrAdd(array, 24), bytes, length)
+    }
+    array
+}

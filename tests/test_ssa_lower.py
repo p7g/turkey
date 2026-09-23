@@ -29,7 +29,7 @@ PROGRAMS = REPO_ROOT / "tests" / "programs"
 # closure conversion exists for. A sample rather than the corpus because these
 # assertions are about *shape*; `test_boot` is what runs the whole corpus.
 SAMPLE = ["adt.gob", "loops.gob", "stack.gob", "generalization.gob",
-          "constructor_values.gob", "closure_abi.gob", "local_values.gob", "shared_nullaries.gob"]
+          "constructor_values.gob", "closure_abi.gob", "closure_roots.gob", "local_values.gob", "shared_nullaries.gob"]
 
 
 @functools.lru_cache(maxsize=None)

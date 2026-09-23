@@ -151,18 +151,11 @@ type Op
     | CellNew(Value)
     | CellLoad(Value)
     | CellStore(Value, Value)
-    -- A closure over `code`, with room for `n` captures filled in afterwards,
-    -- and the bitmap the collector scans the captures by.
-    --
-    -- That bitmap is **one bit per capture**, and `ObjectNew`'s is three bits
-    -- per field. They are one field in the C struct and the object's *kind* is
-    -- what says which encoding to read -- `mark_children` in
-    -- `runtime/turkey_runtime.c` reads three bits for kinds 0 and 1 and one
-    -- bit for every other kind, and the environment this allocates is kind 4.
-    -- Hence two functions in `Turkey.SsaLower`, `metadata` and `bitmap`, which
-    -- must not be swapped. The two encodings also cap the counts differently:
-    -- 21 fields for an object, 63 captures for an environment.
-    | ClosureNew(String, Int, Int)
+    -- A single closure shell over `code`. The capture count distinguishes
+    -- capture-free closures that LLVM interns. Its environment is allocated
+    -- separately and installed with ObjectSet, so it is an ordinary SSA root
+    -- across the shell allocation. The shell traces only its second slot.
+    | ClosureNew(String, Int)
     | ClosureCapture(Value, Int, Value)
     | Call(Callee, Array Value)
     | GlobalLoad(String)
@@ -310,9 +303,9 @@ fun effectsOf(op : Op) -> Effects = match op {
     CellNew(_) -> Ssa.allocates()
     CellLoad(_) -> Ssa.reads_()
     CellStore(_, _) -> Ssa.writes()
-    -- Two allocations, the environment and the closure, and still one
-    -- safepoint: neither is observable before the other.
-    ClosureNew(_, _, _) -> Ssa.allocates()
+    -- Only the shell allocates here. Its environment is a separate value
+    -- whose later use keeps it rooted across this safepoint.
+    ClosureNew(_, _) -> Ssa.allocates()
     ClosureCapture(_, _, _) -> Ssa.writes()
     -- A call may do anything the callee does, which is everything. Knowing
     -- better per callee takes the whole program, which one instruction does
@@ -359,7 +352,7 @@ fun opUses(op : Op) -> Array Value = match op {
     CellNew(a) -> [a]
     CellLoad(a) -> [a]
     CellStore(a, b) -> [a, b]
-    ClosureNew(_, _, _) -> []
+    ClosureNew(_, _) -> []
     ClosureCapture(a, _, b) -> [a, b]
     Call(callee, args) -> {
         let out : Array Value = []
@@ -403,7 +396,7 @@ fun mapUses(op : Op, f : fun(Value) -> Value) -> Op = match op {
     CellNew(a) -> CellNew(f(a))
     CellLoad(a) -> CellLoad(f(a))
     CellStore(a, b) -> CellStore(f(a), f(b))
-    ClosureNew(a, b, c) -> ClosureNew(a, b, c)
+    ClosureNew(a, b) -> ClosureNew(a, b)
     ClosureCapture(a, b, c) -> ClosureCapture(f(a), b, f(c))
     Call(a, b) -> Call(mapCallee(a, f), Array.map(b, f))
     GlobalLoad(a) -> GlobalLoad(a)
@@ -446,7 +439,7 @@ fun opResultRep(op : Op) -> Option Rep = match op {
     PtrStore(_, _, _, _) -> Some(Ssa.untraced(Unit))
     ArrayLength(_) -> Some(Ssa.untraced(I64))
     CellNew(_) -> Some(Ssa.traced(Ptr))
-    ClosureNew(_, _, _) -> Some(Ssa.traced(Ptr))
+    ClosureNew(_, _) -> Some(Ssa.traced(Ptr))
     ObjectSet(_, _, _) -> Some(Ssa.untraced(Unit))
     ArraySet(_, _, _) -> Some(Ssa.untraced(Unit))
     CellStore(_, _) -> Some(Ssa.untraced(Unit))
@@ -580,7 +573,7 @@ fun checkCalls(functions : Array (Ssa.Func Low)) -> Array String {
                         None -> Array.push(out, f.name + ": calls @" + name
                                                 + ", which is not a function here")
                     }
-                    ClosureNew(code, n, _) -> match Map.get(known, code) {
+                    ClosureNew(code, n) -> match Map.get(known, code) {
                         -- A closure's code is called at the uniform
                         -- representation with the environment first, so its
                         -- arity is one more than the lambda's.
@@ -634,7 +627,7 @@ fun allocatingOp(op : Op) -> Option String = match op {
         Some("builds an object -- a constructor, tuple, record or dictionary")
     ArrayNew(_, _, _) -> Some("builds an array")
     CellNew(_) -> Some("makes a cell for a variable a closure captured")
-    ClosureNew(_, _, _) -> Some("makes a closure")
+    ClosureNew(_, _) -> Some("makes a closure")
     _ -> if effectsOf(op).allocates { Some("allocates (" + showOpName(op) + ")") }
          else { None }
 }
@@ -754,7 +747,7 @@ fun showOpName(op : Op) -> String = match op {
     CellNew(_) -> "cell.new"
     CellLoad(_) -> "cell.load"
     CellStore(_, _) -> "cell.store"
-    ClosureNew(_, _, _) -> "closure.new"
+    ClosureNew(_, _) -> "closure.new"
     ClosureCapture(_, _, _) -> "closure.capture"
     Call(callee, _) -> match callee {
         Direct(_) -> "call.direct"
@@ -810,9 +803,8 @@ instance Show Op {
     CellNew(a) -> "cell.new " + v(a)
     CellLoad(a) -> "cell.load " + v(a)
     CellStore(a, b) -> "cell.store " + v(a) + ", " + v(b)
-    ClosureNew(code, n, bits) ->
-        "closure.new @" + code + ", " + Int.toString(n) + ", "
-        + Int.toString(bits)
+    ClosureNew(code, n) ->
+        "closure.new @" + code + ", " + Int.toString(n)
     ClosureCapture(a, i, b) ->
         "closure.capture " + v(a) + ", " + Int.toString(i) + ", " + v(b)
     Call(callee, args) -> {

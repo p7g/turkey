@@ -152,7 +152,9 @@ def test_allocator_exports_before_initialization(allocator_probe, stress):
     result = subprocess.run([str(allocator_probe)], env=env, capture_output=True,
                             text=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stderr == ""
+    assert result.stdout == ""
+    assert result.stderr
+    assert all(line.startswith("[gc ") for line in result.stderr.splitlines())
 
 
 def test_allocator_symbols_are_defined_only_in_turkey(allocator_object):

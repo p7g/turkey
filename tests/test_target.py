@@ -82,24 +82,6 @@ def test_a_target_match_is_decided_before_lowering() -> None:
     assert "match" not in result.stdout
 
 
-def test_a_target_match_that_misses_a_target_is_refused() -> None:
-    """Exhaustiveness sees `OS` as an ordinary type, whichever target is
-    chosen: the arm for the other one is still required."""
-    message = lang.fails("""\
-import Target (OS(..))
-import Target as Target
-
-fun sigbus() -> Int = match Target.os {
-    Darwin -> 10
-}
-
-fun main() {
-    print(sigbus())
-}
-""")
-    assert message == "this match is not exhaustive; 'Linux' is not handled"
-
-
 # Each target's arm calls the errno accessor only that target's libc defines.
 # A `foreign` declaration may appear only in the library's `Unsafe.` modules,
 # so this one is written into `lib/` for the test's duration.

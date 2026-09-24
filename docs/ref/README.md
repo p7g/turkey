@@ -23,8 +23,8 @@ Some things are deliberately left out:
    keywords, literals, and how line breaks end statements.
 2. [Types](types.md): primitive types, tuples, functions, data types, records,
    aliases, mutability, and existential types.
-3. [Declarations](declarations.md): functions, lambdas, `let` and `var`,
-   annotations, and signatures.
+3. [Declarations](declarations.md): functions, lambdas, placeholder
+   functions, `let` and `var`, annotations, and signatures.
 4. [Expressions](expressions.md): operators, calls, field access, indexing,
    records, tuples, and array literals.
 5. [Patterns](patterns.md): the pattern forms, exhaustiveness, and which

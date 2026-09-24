@@ -47,6 +47,7 @@ import Turkey.LowIr as LowIr
 import Turkey.Ssa as Ssa
 import Turkey.SsaLower as SsaLower
 import Turkey.Opt as Opt
+import Turkey.Target as Target
 import Turkey.Ast (Decl(..), Stmt(..), StmtKind(..), patternVars)
 
 -- Where the language's own library lives: `TURKEY_LIB` if it is set, and
@@ -59,6 +60,9 @@ fun libRoot() -> String = match Env.get("TURKEY_LIB") {
     None -> "lib"
 }
 
+-- What `--target` chose, for every file of this run.
+var target = Target.host()
+
 fun main() {
     let args = Env.args()
     if len(args) < 2 { usage() }
@@ -67,11 +71,25 @@ fun main() {
                     "ssa", "llvm", "asm", "native", "check"], command) {
         die("unknown command '" + command + "'")
     }
+    let paths = Array.new(len(args))
+    for var i = 1; i < len(args); i = i + 1 {
+        if args[i] == "--target" {
+            if i + 1 == len(args) { usage() }
+            target = match Target.named(args[i + 1]) {
+                Some(t) -> t
+                None -> die("unknown target '" + args[i + 1] + "'; supported: "
+                            + Target.spellings())
+            }
+            i = i + 1
+        } else {
+            Array.push(paths, args[i])
+        }
+    }
+    if len(paths) == 0 { usage() }
     -- One builder for every file: a `print` per line is a flush per line, and
     -- a dump of the library is a hundred thousand of them.
     let b = String.builder()
-    for var i = 1; i < len(args); i = i + 1 {
-        let path = args[i]
+    for path in paths {
         Diag.compiling(path)
         match command {
             "decls" -> dumpDecls(b, path)
@@ -184,7 +202,7 @@ fun dumpCore(b : String.Builder, path : String) -> Unit {
 -- does: always, on every program.
 fun lowered(checked : Checked) -> Core.CProgram {
     let lowerer = Lower.newLowerer(checked.decls, checked.classes, checked.env,
-                                   checked.types)
+                                   checked.types, target)
     let program = Lower.program(lowerer, checked.ordered)
     Coretc.checkProgram(checked.decls, checked.classes, program,
                         Coretc.globalsOf(checked.env))
@@ -873,7 +891,7 @@ fun readOrDie(path : String) -> Source = match Source.read(path) {
 fun usage() -> a =
     die("usage: boot "
         + "<decls|classes|types|core|mono|opt"
-        + "|ssa|llvm|asm|native|check> FILE...")
+        + "|ssa|llvm|asm|native|check> [--target TARGET] FILE...")
 
 fun die(message : String) -> a {
     IO.stderr("boot: " + message + "\n")

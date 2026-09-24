@@ -193,6 +193,86 @@ Every module imports the Prelude implicitly. An explicit `import Prelude ...`
 replaces the implicit import. See [The Prelude](builtins.md#the-prelude) for
 what it provides.
 
+### The Target module
+
+The library module `Target` says which platform the program is being compiled
+for:
+
+```text
+module Target (OS(..), Arch(..), os, arch)
+
+type OS = Darwin
+type Arch = Arm64
+
+let os : OS      -- the target's operating system
+let arch : Arch  -- the target's processor architecture
+```
+
+Each type lists only the targets the compiler supports, which today is one:
+arm64 macOS. The compiler's `--target` option chooses among them; its value is
+spelled `arch-os`, and `arm64-darwin` is the default:
+
+```sh
+boot native --target arm64-darwin main.gob > main.s
+```
+
+Code that differs by platform is an ordinary `match`:
+
+<!-- run -->
+```kotlin
+import Target (OS(..))
+import Target as Target
+
+fun sigbus() -> Int = match Target.os {
+    Darwin -> 10
+}
+
+fun main() {
+    print(sigbus())
+}
+```
+
+```text
+10
+```
+
+Two rules make this the way to write such code:
+
+* **Every arm is checked, on every build.** The arms for other targets are
+  resolved and type-checked like any others, and when a target is added to
+  `OS`, every `match Target.os` that does not handle it becomes a
+  [non-exhaustive match](patterns.md#exhaustiveness) error. The compiler lists
+  every place a new target has to be taught about.
+* **Only the chosen target's arm is compiled.** `Target.os` and `Target.arch`
+  are known while compiling, so a `match` on either keeps only the arm that
+  matches. An arm for another target may call a
+  [`foreign`](declarations.md#foreign-functions) function that does not
+  exist on this one, and the program still links.
+
+Exhaustiveness treats `OS` and `Arch` like any other type:
+
+<!-- error: this match is not exhaustive; '(Darwin, True)' is not handled -->
+```kotlin
+import Target (OS(..))
+import Target as Target
+
+fun sigbus(fallback : Bool) -> Int = match (Target.os, fallback) {
+    (Darwin, False) -> 10
+}
+
+fun main() {
+    print(sigbus(False))
+}
+```
+
+> **Coming from Rust:** `#[cfg(target_os = "linux")]` removes the item before
+> it is checked, so code for another platform can be broken without anyone on
+> this one noticing. Nothing here is removed before checking.
+>
+> **Coming from Zig:** Zig skips analysis of the branch not taken on
+> `builtin.os.tag`. Here the branch not taken is analyzed and then not
+> compiled.
+
 ## Name resolution
 
 Within a module, a name is looked up in this order, and the first match wins:

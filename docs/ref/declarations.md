@@ -177,6 +177,182 @@ fun main() {
 3
 ```
 
+## Placeholder functions
+
+**Syntax**
+
+```ebnf
+atom ::= "_"
+       | "\" expression
+```
+
+A short function that uses its parameter once can be written without naming
+it. An `_` in an expression stands for the parameter, and the expression
+around it becomes the function:
+
+<!-- run -->
+```kotlin
+type Planet = Planet { name : String, moons : Int }
+
+fun main() {
+    let planets = [Planet { name = "Mars", moons = 2 },
+                   Planet { name = "Venus", moons = 0 }]
+    print(Array.map([1, 2, 3], _ * 2))
+    print(Array.map(planets, _.name))
+    print(Array.map(Array.filter(planets, _.moons > 0), _.name))
+}
+```
+
+```text
+[2, 4, 6]
+[Mars, Venus]
+[Mars]
+```
+
+Each is shorthand for a lambda. `_ * 2` means `fun($x) = $x * 2`, and
+`_.name` means `fun($x) = $x.name`.
+
+**How far the function reaches.** The function is the smallest *boundary*
+around the `_`. These are boundaries:
+
+* a function argument, an index, a tuple component, an array element, and a
+  record field;
+* a statement, the right-hand side of a `let` or `var`, a function body, a
+  match arm, and the value of `return` or `break`.
+
+Operators, field access, `.0` projection, `?`, `:` annotations and the
+function being called are not boundaries, and neither are grouping
+parentheses. So `_ * 2 + 1` is one function, and so is `(_ + 1) * 2`.
+
+A boundary that is *nothing but* `_` does not count, and the function reaches
+one boundary further out. That is what makes `pow(_, 2)` a function, rather
+than passing a function to `pow`:
+
+<!-- run -->
+```kotlin
+fun pow(x, n) {
+    var result = 1
+    for var i = 0; i < n; i = i + 1 { result = result * x }
+    result
+}
+
+fun main() {
+    print(Array.map([1, 2, 3], pow(_, 2)))
+    print(Array.map(["a", "b"], (_, 0)))
+}
+```
+
+```text
+[1, 4, 9]
+[(a, 0), (b, 0)]
+```
+
+In the second line the tuple's first component is a bare `_`, so the function
+is the whole tuple: `fun($x) = ($x, 0)`.
+
+Because a function argument is a boundary, a `_` inside a call inside an
+argument makes a function for the inner call, not for the outer one.
+`show(_ * 2)` means `show(fun($x) = $x * 2)`, so this is an error:
+
+<!-- error: where '_' means fun($x) = $x * 2 -->
+```kotlin
+fun main() {
+    print(Array.map([1, 2, 3], show(_ * 2)))
+}
+```
+
+When a type error is reported at a call whose argument is a placeholder
+function, the message says what the `_` was taken to mean.
+
+A function made by `_` has one parameter and uses it once: a second `_` in the
+same function is an error. `_` on its own as a whole statement, `let` or
+function body is an error too; write `fun(x) = x`.
+
+<!-- error: a function made by '_' uses its parameter once -->
+```kotlin
+fun main() {
+    print(Array.map([1, 2, 3], _ * _))
+}
+```
+
+A statement is a boundary, so a block can end in a placeholder function and
+answer it. `return _ + doubled` would answer the same function.
+
+<!-- run -->
+```kotlin
+fun scale(factor) = _ * factor
+
+fun offset(by) {
+    let doubled = by * 2
+    _ + doubled
+}
+
+fun main() {
+    print(scale(3)(5))
+    print(offset(1)(10))
+}
+```
+
+```text
+15
+12
+```
+
+**Conditions.** A `_` cannot be used in the condition of `if` or `while`, the
+sequence of `for`, the value `match` inspects, or the target of an assignment.
+The function it would make there could never be used, so the compiler says so
+rather than reporting a type error.
+
+<!-- error: '_' cannot be used in the condition of 'if' -->
+```kotlin
+fun main() {
+    let n = 3
+    if _ > n { print("big") }
+}
+```
+
+**Marking the start with `\`.** `\` in front of an expression makes it a
+function of every `_` inside it, however deeply they are nested. It reaches
+as far right as a lambda body would. Inside it, every `_` is the same
+parameter, and none of the boundaries above apply:
+
+<!-- run -->
+```kotlin
+type Planet = Planet { name : String, moons : Int }
+
+fun label(name) = "<" + name + ">"
+
+fun main() {
+    let planets = [Planet { name = "Mars", moons = 2 },
+                   Planet { name = "Venus", moons = 0 }]
+    print(Array.map(planets, \label(_.name)))
+    print(Array.map(planets, \_.name + " has " + show(_.moons)))
+    print(Array.map([1, 2, 3], \Array.map([_, _ * 10], \_ + 1)))
+}
+```
+
+```text
+[<Mars>, <Venus>]
+[Mars has 2, Venus has 0]
+[[2, 11], [3, 21], [4, 31]]
+```
+
+`\label(_.name)` means `fun($x) = label($x.name)`; without the `\`, the
+argument `_.name` would be the function. A `\` inside another `\` makes its
+own function of the `_`s inside it, as the last line shows. A `\` with no `_`
+in it is an error.
+
+The rest of the expression is evaluated each time the function is called,
+exactly as it would be in the lambda it stands for.
+
+**Coming from Scala:** this is Scala's placeholder syntax, with two
+differences. Grouping parentheses are not a boundary, so `(_ + 1) * 2` is one
+function, where in Scala the parentheses would end it. And `_ + _` is an error
+rather than a function of two parameters; use `fun(a, b) = a + b`.
+
+**Coming from Haskell:** `\` starts a function, as it does in Haskell, but it
+takes no parameter list. The parameter is `_`.
+
 ## `let` and `var`
 
 **Syntax**

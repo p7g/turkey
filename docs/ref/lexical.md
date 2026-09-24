@@ -53,9 +53,10 @@ The first letter decides what a name refers to:
 Identifiers are ASCII. After the first character they may contain letters,
 digits, `_` and `'`, so `x'` and `count_2` are both identifiers.
 
-`_` on its own is not a variable. It is the wildcard [pattern](patterns.md),
-which matches anything and binds nothing, and using it as an expression is an
-error.
+`_` on its own is not a variable. In a pattern it is the wildcard
+[pattern](patterns.md), which matches anything and binds nothing. In an
+expression it is the parameter of a
+[placeholder function](declarations.md#placeholder-functions).
 
 Because the first letter decides, a parameter list cannot mistake a type for
 a variable. In `fun(Int) -> Int = ...`, the `Int` inside the parentheses is a
@@ -79,7 +80,7 @@ ordinary library types ([Built-in types and classes](builtins.md)).
 
 ```text
 +   -   *   /   %   ==  !=  <   <=  >   >=  &&  ||  !
-=   ->  :   ,   .   ..  |   ~   ?   ;
+=   ->  :   ,   .   ..  |   ~   ?   ;   \
 (   )   [   ]   {   }
 ```
 
@@ -229,7 +230,7 @@ Precisely, a line break is a separator when all three of these hold:
 1. **The token before it can end a statement**: an identifier, a constructor
    name, a literal, `)`, `]`, `}`, `return`, `break`, `continue`, or `?`.
 2. **The token after it can start a statement**: an identifier, a constructor
-   name, a literal, `(`, `[`, `{`, `-`, `!`, `..`, or one of the keywords
+   name, a literal, `(`, `[`, `{`, `-`, `!`, `..`, `\`, or one of the keywords
    `class`, `continue`, `break`, `do`, `for`, `foreign`, `fun`, `if`,
    `import`, `instance`, `let`, `loop`, `match`, `module`, `return`, `type`,
    `var`, `while`.

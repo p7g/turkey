@@ -31,6 +31,12 @@ type P = P {
     tycons   : Array String,
     noRecord : Bool,
     file     : String,
+    -- How many `\` functions enclose the current position. Inside one, every
+    -- `_` is its parameter and no boundary closes a `_` function.
+    explicit : Int,
+    -- How many `_` placeholders have been read and not yet made into a
+    -- parameter. Zero is the common case, and it lets a boundary skip the walk.
+    pending  : Int,
 }
 
 fun parse(source : Source, known : Array String) -> Program {
@@ -41,6 +47,8 @@ fun parse(source : Source, known : Array String) -> Program {
         tycons = Array.append(collectTycons(toks), known),
         noRecord = False,
         file = source.name,
+        explicit = 0,
+        pending = 0,
     }
     parseProgram(p)
 }
@@ -184,7 +192,7 @@ let exprStart = [
     "INT", "FLOAT", "STRING", "CHAR",
     "IDENT", "CONID", "(", "[", "{", "-", "!",
     "fun", "if", "match", "while", "for", "loop", "return", "break", "continue",
-    "do",
+    "do", "\\",
 ]
 
 let patternStart = ["INT", "FLOAT", "STRING", "CHAR", "IDENT", "CONID", "("]
@@ -916,7 +924,7 @@ fun parseParamList(p : P) -> Array Pat {
 fun parseFunBody(p : P) -> Expr {
     if eat(p, "=") {
         let saved = setNoRecord(p, False)
-        let body = parseExpr(p)
+        let body = closeWhole(p, parseExpr(p))
         p.noRecord = saved
         return body
     }
@@ -932,7 +940,7 @@ fun parseBindingStmt(p : P) -> Stmt {
     let saved = setNoRecord(p, False)
     let pattern = parsePattern(p)
     skipToken(p, "=")
-    let value = parseExpr(p)
+    let value = closeWhole(p, parseExpr(p))
     p.noRecord = saved
     if Token.isWord(tok.kind, "let") {
         mkStmt(p, tok.span, SLet(pattern, value))
@@ -955,12 +963,13 @@ fun parseStmt(p : P) -> Stmt {
     if at(p, "=") {
         step(p)
         checkAssignable(p, e, s)
-        let value = parseExpr(p)
+        refusePlaceholder(p, e, "the target of an assignment")
+        let value = closeWhole(p, parseExpr(p))
         p.noRecord = saved
         return mkStmt(p, s, SAssign(e, value))
     }
     p.noRecord = saved
-    mkStmt(p, s, SExpr(e))
+    mkStmt(p, s, SExpr(closeWhole(p, e)))
 }
 
 fun checkAssignable(p : P, e : Expr, s : Span) -> Unit = match e.kind {
@@ -1139,7 +1148,7 @@ fun parsePostfix(p : P) -> Expr {
             let saved = setNoRecord(p, False)
             let args = Array.new(4)
             while !at(p, ")") {
-                Array.push(args, parseExpr(p))
+                Array.push(args, closePart(p, parseExpr(p)))
                 if !eat(p, ",") { break }
             }
             skipToken(p, ")")
@@ -1148,7 +1157,7 @@ fun parsePostfix(p : P) -> Expr {
         } else if at(p, "[") {
             step(p)
             let saved = setNoRecord(p, False)
-            let index = parseExpr(p)
+            let index = closePart(p, parseExpr(p))
             p.noRecord = saved
             skipToken(p, "]")
             e = mkExpr(p, e.span, EIndex(e, index, None, None))
@@ -1196,8 +1205,10 @@ fun parseAtom(p : P) -> Expr {
         }
         "IDENT" -> {
             step(p)
+            if text(tok) == "_" { p.pending = p.pending + 1 }
             mkExpr(p, tok.span, EVar(text(tok), False))
         }
+        "\\" -> parseExplicit(p, tok)
         "CONID" -> parseConidAtom(p)
         "(" -> parseParenAtom(p, tok)
         "[" -> parseArrayAtom(p, tok)
@@ -1228,7 +1239,7 @@ fun parseAtom(p : P) -> Expr {
                 ]))
                 return mkExpr(p, s, ELoop(mkExpr(p, s, EBlock([mkStmt(p, s, SExpr(m))]))))
             }
-            let cond = parseScrutinee(p)
+            let cond = parseScrutinee(p, "the condition of 'while'")
             refuseChainedCondition(p)
             mkExpr(p, tok.span, EWhile(cond, parseBlock(p)))
         }
@@ -1275,8 +1286,10 @@ fun parseParenAtom(p : P, tok : Token) -> Expr {
     }
     skipToken(p, ")")
     p.noRecord = saved
+    -- Grouping parentheses are not a boundary: they exist for precedence, so
+    -- `(_ + 1) * 2` is one function. A tuple's components are.
     if len(elems) == 1 { return elems[0] }
-    mkExpr(p, tok.span, ETuple(elems))
+    mkExpr(p, tok.span, ETuple(Array.map(elems, fun(x) = closePart(p, x))))
 }
 
 fun parseArrayAtom(p : P, tok : Token) -> Expr {
@@ -1284,7 +1297,7 @@ fun parseArrayAtom(p : P, tok : Token) -> Expr {
     let saved = setNoRecord(p, False)
     let elems = Array.new(4)
     while !at(p, "]") {
-        Array.push(elems, parseExpr(p))
+        Array.push(elems, closePart(p, parseExpr(p)))
         if !eat(p, ",") { break }
     }
     skipToken(p, "]")
@@ -1312,7 +1325,7 @@ fun parseConidAtom(p : P) -> Expr {
             let fname = expectWhat(p, "IDENT", "a field name")
             -- Punning: `C { x }` is `C { x = x }`, as in patterns.
             var value = mkExpr(p, fname.span, EVar(text(fname), False))
-            if eat(p, "=") { value = parseExpr(p) }
+            if eat(p, "=") { value = closePart(p, parseExpr(p)) }
             Array.push(fields, (text(fname), value))
             if !fieldSeparator(p) { break }
         }
@@ -1323,22 +1336,25 @@ fun parseConidAtom(p : P) -> Expr {
     mkExpr(p, tok.span, ECon(name))
 }
 
+-- The value of `return` or `break`, which is a whole: `return _ * n` answers
+-- the function, as `_ * n` on the last line of a block does.
 fun parseOptionalValue(p : P) -> Option Expr {
-    if atAny(p, exprStart) { return Some(parseExpr(p)) }
+    if atAny(p, exprStart) { return Some(closeWhole(p, parseExpr(p))) }
     None
 }
 
-fun parseScrutinee(p : P) -> Expr {
+fun parseScrutinee(p : P, what : String) -> Expr {
     let saved = setNoRecord(p, True)
     let e = parseExpr(p)
     p.noRecord = saved
+    refusePlaceholder(p, e, what)
     e
 }
 
 fun parseIf(p : P) -> Expr {
     let s = expect(p, "if").span
     if at(p, "let") || at(p, "var") { return parseIfLet(p, s) }
-    let cond = parseScrutinee(p)
+    let cond = parseScrutinee(p, "the condition of 'if'")
     refuseChainedCondition(p)
     let then = parseBlock(p)
     var otherwise : Option Expr = None
@@ -1376,7 +1392,7 @@ fun parseBindingCondition(p : P) -> (Pat, Expr, Expr) {
     let pat = parsePattern(p)
     skipToken(p, "=")
     p.noRecord = saved
-    let value = parseScrutinee(p)
+    let value = parseScrutinee(p, "the value a 'let' condition matches")
     refuseChainedCondition(p)
     var body = parseBlock(p)
     if mutable {
@@ -1414,7 +1430,7 @@ fun parseFor(p : P) -> Expr {
         let pattern = parsePattern(p)
         p.noRecord = saved
         skipToken(p, "in")
-        let iterable = parseScrutinee(p)
+        let iterable = parseScrutinee(p, "the sequence of 'for'")
         let body = parseBlock(p)
         return mkExpr(p, s, EForIn(
             pattern, iterable, body,
@@ -1426,6 +1442,7 @@ fun parseFor(p : P) -> Expr {
     if !at(p, "NEWLINE") { init = Some(parseStmt(p)) }
     skipWhat(p, "NEWLINE", "';' after the loop initializer")
     let cond = parseExpr(p)
+    refusePlaceholder(p, cond, "the condition of 'for'")
     skipWhat(p, "NEWLINE", "';' after the loop condition")
     var step : Option Stmt = None
     if !at(p, "{") { step = Some(parseStmt(p)) }
@@ -1459,7 +1476,7 @@ fun forInFollows(p : P) -> Bool {
 
 fun parseMatch(p : P) -> Expr {
     let s = expect(p, "match").span
-    let scrutinee = parseScrutinee(p)
+    let scrutinee = parseScrutinee(p, "the value 'match' inspects")
     skipToken(p, "{")
     let saved = setNoRecord(p, False)
     let arms = Array.new(4)
@@ -1495,5 +1512,119 @@ fun parseMatchArm(p : P) -> Arm {
         Array.push(patterns, parsePattern(p))
     }
     skipWhat(p, "->", "'->' after the arm's patterns")
-    Arm { span = s, patterns = patterns, body = parseExpr(p) }
+    Arm { span = s, patterns = patterns, body = closeWhole(p, parseExpr(p)) }
+}
+
+-- -- lambda shorthand -----------------------------------------------------------------
+--
+-- `_` in an expression is a placeholder. The parser reads it as `EVar("_")`, a
+-- name no program can bind, and rewrites it into the parameter of a function
+-- before the node leaves this module. Which function is decided by the
+-- *boundary* that closes it.
+--
+-- A *part* -- a call argument, an index, a tuple component, an array element, a
+-- record field -- closes the `_`s inside it, except that a bare `_` is left open
+-- for the boundary around it. That is what makes `pow(_, 2)` the function
+-- rather than the `_`.
+--
+-- A *whole* -- a statement, including a block's last; a `let` right-hand side;
+-- a `fun` body; a match arm; the value of `return` or `break` -- closes the
+-- same way, and a bare `_` there is an error, having nothing further out to
+-- belong to.
+--
+-- A condition, a scrutinee, an iterable and an assignment target refuse a `_`
+-- outright: the function one would make there could never be used.
+--
+-- Everything else is transparent: operators, field access, projection, `?`,
+-- `:`, a callee, and grouping parentheses, which never become a node.
+--
+-- Inside `\` none of that applies. Every `_` belongs to the nearest enclosing
+-- `\`, through any `fun` in between, and they are all the one parameter.
+--
+-- Boundaries close bottom-up, as the parser returns from them. So when one
+-- looks, every `_` beneath a nested boundary has been rewritten already, except
+-- a bare `_` that a part directly beneath left open -- and walking the whole
+-- expression finds exactly the `_`s this boundary owns.
+
+fun isPlaceholder(e : Expr) -> Bool = match e.kind {
+    EVar(name, _) -> name == "_"
+    _ -> False
+}
+
+fun placeholders(e : Expr) -> Array Expr {
+    let out = Array.new(2)
+    collectPlaceholders(ChExpr(e), out)
+    out
+}
+
+fun collectPlaceholders(c : Child, out : Array Expr) -> Unit {
+    match c {
+        ChExpr(e) -> {
+            if isPlaceholder(e) {
+                Array.push(out, e)
+                return {}
+            }
+        }
+        _ -> {}
+    }
+    for child in children(c) { collectPlaceholders(child, out) }
+}
+
+fun closePart(p : P, e : Expr) -> Expr {
+    if p.pending == 0 || p.explicit > 0 || isPlaceholder(e) { return e }
+    closeImplicit(p, e)
+}
+
+fun closeWhole(p : P, e : Expr) -> Expr {
+    if p.pending == 0 || p.explicit > 0 { return e }
+    if isPlaceholder(e) {
+        oops(p, "'_' on its own is not a function; write 'fun(x) = x'", e.span)
+    }
+    closeImplicit(p, e)
+}
+
+fun closeImplicit(p : P, e : Expr) -> Expr {
+    let found = placeholders(e)
+    if len(found) == 0 { return e }
+    if len(found) > 1 {
+        oops(p, "a function made by '_' uses its parameter once; write '\\' before "
+                + "it to use the parameter again, or 'fun' for more than one",
+             found[1].span)
+    }
+    shorthandLambda(p, e, found, e.span)
+}
+
+fun refusePlaceholder(p : P, e : Expr, what : String) -> Unit {
+    if p.pending == 0 || p.explicit > 0 { return {} }
+    let found = placeholders(e)
+    if len(found) > 0 {
+        oops(p, "'_' cannot be used in " + what
+                + ": the function it makes could never be used there",
+             found[0].span)
+    }
+}
+
+-- `\e` is `fun(x) = e` with every `_` it owns as `x`, and reaches as far right
+-- as a `fun` body does. A nested `\` has claimed its own `_`s by the time this
+-- one looks, so what is left is this one's.
+fun parseExplicit(p : P, tok : Token) -> Expr {
+    step(p)
+    let saved = setNoRecord(p, False)
+    p.explicit = p.explicit + 1
+    let body = parseExpr(p)
+    p.explicit = p.explicit - 1
+    p.noRecord = saved
+    let found = placeholders(body)
+    if len(found) == 0 {
+        oops(p, "'\\' makes a function of the '_' after it, and there is none",
+             tok.span)
+    }
+    shorthandLambda(p, body, found, tok.span)
+}
+
+fun shorthandLambda(p : P, body : Expr, found : Array Expr, s : Span) -> Expr {
+    let name = shorthandPrefix + Int.toString(freshId(p))
+    for placeholder in found { placeholder.kind = EVar(name, False) }
+    p.pending = p.pending - len(found)
+    mkExpr(p, s, ELambda([mkPat(p, found[0].span, PVar(name))], None, body))
 }

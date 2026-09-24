@@ -152,6 +152,8 @@ atom ::= INT | FLOAT | STRING | CHAR
        | block
        | "do" block
        | "fun" "(" (pattern ("," pattern)*)? ")" ("->" type)? fun-body
+       | "_"                                                     -- placeholder
+       | "\" expression                                          -- placeholder function
        | if-expr
        | "while" condition block
        | "for" pattern "in" condition block

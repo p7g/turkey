@@ -21,6 +21,7 @@ module Turkey.Ast (
     Program(..),
     patternVars, freshNodeId, armBody, declBody,
     Child(..), children, exprChildren, stmtChildren,
+    shorthandPrefix, isShorthand, sketch,
 )
 
 import Turkey.Types (ConCell)
@@ -499,4 +500,81 @@ fun optExpr(e : Option Expr) -> Array Child = match e {
 fun optStmt(s : Option Stmt) -> Array Child = match s {
     Some(x) -> [ChStmt(x)]
     None -> []
+}
+
+-- -- lambda shorthand ---------------------------------------------------------------
+
+-- What the parser names the parameter of a function made by `_` or `\`, with a
+-- counter after it. A `%` cannot be written in a program, so the name cannot
+-- capture one the body uses, and the prefix is how a later stage recognises
+-- the function as shorthand.
+let shorthandPrefix = "%it"
+
+fun isShorthand(e : Expr) -> Bool = match e.kind {
+    ELambda(params, _, _) -> len(params) == 1 && match params[0].kind {
+        PVar(name) -> String.startsWith(name, shorthandPrefix)
+        _ -> False
+    }
+    _ -> False
+}
+
+-- An expression as source, near enough for a diagnostic to show what `_` made:
+-- `fun($x) = pow($x, 2)`, with the parameter spelled the way the reference
+-- spells a hidden name. Operators are parenthesized by precedence, so the text
+-- groups the way the tree does. Anything with a block in it is `...`, since
+-- the point is the extent of a short function and not a listing.
+fun sketch(e : Expr) -> String = sketchAt(e, 0)
+
+-- The operator levels of the grammar, loosest first; a postfix form is 7 and
+-- an atom 8.
+fun opLevel(op : String) -> Int = match op {
+    "||" -> 0
+    "&&" -> 1
+    "==" | "!=" -> 2
+    "<" | "<=" | ">" | ">=" -> 3
+    "+" | "-" -> 4
+    _ -> 5
+}
+
+fun sketchAt(e : Expr, need : Int) -> String {
+    let (text, level) = sketchLevel(e)
+    if level < need { "(" + text + ")" } else { text }
+}
+
+fun sketchList(xs : Array Expr) -> String =
+    String.join(Array.map(xs, fun(x) = sketchAt(x, 0)), ", ")
+
+fun sketchName(name : String) -> String =
+    if String.startsWith(name, shorthandPrefix) { "$x" } else { name }
+
+fun sketchLevel(e : Expr) -> (String, Int) = match e.kind {
+    ELit(l) -> (literalText(l), 8)
+    EUnit -> ("()", 8)
+    EVar(name, _) -> (sketchName(name), 8)
+    ECon(name) -> (name, 8)
+    ETuple(xs) -> ("(" + sketchList(xs) + ")", 8)
+    EArray(xs) -> ("[" + sketchList(xs) + "]", 8)
+    ERecord(name, fields) -> {
+        let shown = Array.map(fields, fun((f, v)) = f + " = " + sketchAt(v, 0))
+        (name + " { " + String.join(shown, ", ") + " }", 8)
+    }
+    ELambda(params, _, body) -> {
+        let names = Array.map(params, fun(p) = match p.kind {
+            PVar(name) -> sketchName(name)
+            _ -> "..."
+        })
+        ("fun(" + String.join(names, ", ") + ") = " + sketchAt(body, 0), 0)
+    }
+    ECall(fn, args) -> (sketchAt(fn, 7) + "(" + sketchList(args) + ")", 7)
+    EIndex(arr, index, _, _) -> (sketchAt(arr, 7) + "[" + sketchAt(index, 0) + "]", 7)
+    EField(obj, name) -> (sketchAt(obj, 7) + "." + name, 7)
+    EProject(obj, n) -> (sketchAt(obj, 7) + "." + Int.toString(n), 7)
+    EQuestion(inner, _) -> (sketchAt(inner, 7) + "?", 7)
+    EUnary(op, operand, _) -> (op + sketchAt(operand, 6), 6)
+    EBinary(op, left, right, _) -> {
+        let level = opLevel(op)
+        (sketchAt(left, level) + " " + op + " " + sketchAt(right, level + 1), level)
+    }
+    EAnnot(inner, _) -> sketchLevel(inner)
+    _ -> ("...", 8)
 }

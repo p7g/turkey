@@ -101,7 +101,7 @@ int main(int argc, char **argv) {
         parent->slots[0] = 0; forget(child);
     }
     else if (!strcmp(which, "mark-header")) header_of(parent)->marked = 0;
-    else if (!strcmp(which, "mark-free")) r->marked_slots[31] |= UINT64_C(1) << 63;
+    else if (!strcmp(which, "mark-free")) r->marked_slots[0] |= UINT64_C(1) << 2;
     else if (!strcmp(which, "mark-count")) r->live++;
     else if (!strcmp(which, "size")) header_of(parent)->size = SIZE_MAX;
     else if (!strcmp(which, "short-header")) header_of(parent)->size = 8;
@@ -165,6 +165,7 @@ int main(int argc, char **argv) {
         HeapCheck check = {list, n, 0};
         if (!strcmp(which, "native-invalid")) stack[6] = 1;
         if (!strcmp(which, "native-offset")) offset = INT64_MIN;
+        if (!strcmp(which, "native-table")) frame_entries = NULL;
         if (!strcmp(which, "native-unmarked")) { check.phase = 1; mark_epoch = 1; }
         int ok = heap_check_native(&check, (uintptr_t)stack, (uintptr_t)&stack[15]);
         if (!strcmp(which, "native-valid")) { assert(ok); puts("valid"); return 0; }
@@ -224,6 +225,7 @@ CASES = {
     "allocation-stops": "invalid object header",
     "native-invalid": "invalid traced pointer",
     "native-offset": "invalid native root offset",
+    "native-table": "invalid native frame table",
     "native-unmarked": "reachable object is unmarked",
     "valid": "valid",
     "native-valid": "valid",

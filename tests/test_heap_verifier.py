@@ -19,6 +19,13 @@ def verifier_probe(tmp_path_factory, allocator_object):
 #include <assert.h>
 #include "turkey_runtime.c"
 
+static int64_t expected_count;
+static void check_stopped(void) {
+    assert(heap_count == expected_count);
+    assert(turkey_has_panicked);
+    puts("allocation stopped");
+}
+
 static void forget(void *value) {
     HeapHeader *h = header_of(value);
     HeapRegion *r = region_of(h);
@@ -140,11 +147,10 @@ int main(int argc, char **argv) {
         parent->count = -1;
         gc_verify = 1;
         turkey_gc_set_stress(1);
-        int64_t before = heap_count;
-        assert(turkey_box(3, 4) == NULL);
-        assert(heap_count == before && turkey_has_panicked);
-        puts(panic_buffer);
-        return 0;
+        expected_count = heap_count;
+        atexit(check_stopped);
+        turkey_box(3, 4);
+        abort();
     }
     else if (!strncmp(which, "native-", 7)) {
         _Alignas(16) uintptr_t stack[16] = {0};
@@ -228,8 +234,56 @@ CASES = {
 def test_verifier_detects_corruption(verifier_probe, case, diagnostic):
     result = subprocess.run([str(verifier_probe), case], capture_output=True,
                             text=True, timeout=20, env=dict(os.environ, UBSAN_OPTIONS="halt_on_error=1"))
+    if case == "allocation-stops":
+        assert result.returncode == 1, result.stderr
+        assert "allocation stopped" in result.stdout
+        assert "heap verifier: " + diagnostic in result.stderr
+        return
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
     assert diagnostic in result.stdout
     if diagnostic != "valid":
         assert result.stdout.startswith("heap verifier:")
+
+
+@pytest.mark.parametrize("backend,defect", [
+    ("native", "native-roots"), ("llvm", "shadow-roots"),
+    ("native", "children"), ("llvm", "children"),
+])
+def test_broken_collector_is_stopped_before_sweeping(tmp_path, backend, defect):
+    from tests import bootc
+
+    source = tmp_path / "main.gob"
+    source.write_text('''
+fun main() {
+    let x = [42]
+    let y = [x]
+    let z = [y]
+    print(z[0][0][0])
+}
+''')
+    result = subprocess.run([str(bootc.binary()), backend, str(source)],
+                            cwd=bootc.REPO_ROOT, capture_output=True, text=True,
+                            check=True)
+    generated = tmp_path / ("main.s" if backend == "native" else "main.ll")
+    generated.write_text(result.stdout)
+    runtime = (bootc.REPO_ROOT / "runtime/turkey_runtime.c").read_text()
+    if defect == "native-roots":
+        runtime = runtime.replace("    scan_native_frames();", "    /* injected omission */")
+    elif defect == "shadow-roots":
+        runtime = runtime.replace("for (RootFrame *frame = roots;", "for (RootFrame *frame = NULL;")
+    else:
+        runtime = runtime.replace("static void mark_children(void *value) {",
+                                  "static void mark_children(void *value) { return;")
+    mutated = tmp_path / "runtime.c"
+    mutated.write_text(runtime)
+    binary = tmp_path / "broken"
+    subprocess.run(["cc", "-std=c11", "-O1", "-Wno-override-module", "-I",
+                    str(bootc.REPO_ROOT / "runtime"), str(generated), str(mutated),
+                    "-lm", "-pthread", "-o", str(binary)],
+                   capture_output=True, text=True, check=True)
+    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=20,
+                            env=dict(os.environ, TURKEY_GC_STRESS="1", TURKEY_GC_VERIFY="1"))
+    assert result.returncode == 1, result.stderr
+    assert "heap verifier: reachable object is unmarked" in result.stderr
+    assert "42" not in result.stdout

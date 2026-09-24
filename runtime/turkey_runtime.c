@@ -790,9 +790,19 @@ static int heap_verify(int phase) {
     return result;
 }
 
+/* Heap corruption invalidates the mutator's assumptions. In particular, an
+   entry initializer may still dereference an allocation result before it can
+   propagate a panic, so verification failures must stop here. */
+static void heap_verify_or_exit(int phase) {
+    if (!heap_verify(phase)) {
+        fprintf(stderr, "%s\n", panic_buffer);
+        exit(EXIT_FAILURE);
+    }
+}
+
 void turkey_collect(void) {
     if (gc_verify < 0) gc_verify = getenv("TURKEY_GC_VERIFY") != NULL;
-    if (gc_verify && !heap_verify(0)) return;
+    if (gc_verify) heap_verify_or_exit(0);
     struct timespec stats_start, stats_end;
     int64_t stats_live_before = heap_count;
     /* Read before the sweep clears it: this is the allocation pressure the
@@ -829,7 +839,8 @@ void turkey_collect(void) {
     /* Beside the chain, not instead of it: the arm64 backend's frames are
        here and everything else's are above. */
     scan_native_frames();
-    if (turkey_has_panicked || (gc_verify && !heap_verify(1))) return;
+    if (turkey_has_panicked) return;
+    if (gc_verify) heap_verify_or_exit(1);
     /* Empty regions cost one free, regardless of their allocation count.
        Survivors rebuild availability by copying a fixed-size bitmap and
        using epoch marks. No walk over individual object headers. */
@@ -858,7 +869,7 @@ void turkey_collect(void) {
         }
         link = &region->next;
     }
-    if (gc_verify && !heap_verify(2)) return;
+    if (gc_verify) heap_verify_or_exit(2);
     allocations_since_collection = 0;
     double next_threshold = (double)(heap_count > 1024 ? heap_count : 1024)
         * threshold_scale;

@@ -47,7 +47,7 @@ target: arm64-apple-darwin
 command: native src/Main.gob
 asm-sha256: $(shasum -a 256 "$OUT/stage3.s" | cut -d' ' -f1)
 gz-sha256: $(shasum -a 256 "$ARTIFACT" | cut -d' ' -f1)
-cc: $(cc --version | head -n 1)
+cc: $(${TURKEY_CC:-cc} --version | head -n 1)
 EOF
 
 echo

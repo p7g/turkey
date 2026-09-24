@@ -33,6 +33,7 @@ import Turkey.Core (Core(..), CoreKind(..), CParam(..), CBind(..), CProgram(..),
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..))
 import Turkey.Diag as Diag
+import Turkey.Giblets as Giblets
 import Turkey.Layout as Layout
 import Turkey.LowIr as L
 import Turkey.LowIr (Op(..), Low(..), AddressOf(..), BinOp(..), CmpOp(..), Conv(..),
@@ -95,6 +96,8 @@ type Module = Module {
     -- The function that computes every global, in the order the program
     -- requires. Called once before `main`.
     initial   : String,
+    -- Runs before roots, literals, and any managed allocation.
+    early     : String,
     -- Each `foreign` definition that lowered, as (C symbol, function name),
     -- sorted by symbol: what an emitter exports under a C-callable thunk
     -- (SPEC-DELTAS 74).
@@ -113,6 +116,8 @@ type Lower = Lower {
     joins   : Map String BlockId,
     -- Top-level names, which are globals rather than locals.
     globals : Set.Set String,
+    -- Mutable giblet globals are plain storage, never reference cells.
+    globalRefs : Map String Rep,
     -- The runtime tag of each constructor. A whole-program numbering, so it is
     -- computed once and handed down rather than derived per function.
     tags    : Map String Int,
@@ -206,12 +211,20 @@ fun lowerProgram(program : CProgram, decls : DeclTable)
     for bind in Array.append(program.dicts, program.binds) {
         Set.add(globals, bind.name)
     }
+    let globalRefs = Map.new()
+    let giblets = Giblets.gibletModules()
+    for bind in program.binds {
+        if bind.mutable && Set.contains(giblets, bind.module_) {
+            Map.put(globalRefs, bind.name,
+                    repIn(decls, bind.layouts, Core.refElem(bind.ty)))
+        }
+    }
     let fields = recordLayouts(program, decls)
     let tags = tagsOf(decls, fields)
     let sigs = signatures(program, decls)
     let shared = Lifting { next = 0 }
     for bind in Array.append(program.dicts, program.binds) {
-        let (f, lifted, why) = lowerBind(bind, decls, globals, tags, fields,
+        let (f, lifted, why) = lowerBind(bind, decls, globals, globalRefs, tags, fields,
                                          sigs, shared)
         match f {
             Some(function) -> {
@@ -232,9 +245,10 @@ fun lowerProgram(program : CProgram, decls : DeclTable)
         }
     }
     -- Global initializers can also introduce lifted lambdas.
-    let (init, lifted, storage) = initializer(program, decls, globals, tags,
+    let (init, early, lifted, storage) = initializer(program, decls, globals, globalRefs, tags,
                                               fields, sigs, shared)
     Array.push(done, init)
+    Array.push(done, early)
     for g in lifted { Array.push(done, g) }
     let lowered = Set.new()
     for f in done { Set.add(lowered, f.name) }
@@ -245,7 +259,7 @@ fun lowerProgram(program : CProgram, decls : DeclTable)
         }
     }
     let module_ = Module { functions = done, globals = storage,
-                           initial = initializerName,
+                           initial = initializerName, early = Giblets.initializerName,
                            definitions = Array.sort(definitions) }
     internNullaries(module_, init)
     (module_, skipped)
@@ -299,11 +313,15 @@ fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
 -- the same reason a signature does.
 fun storageOf(program : CProgram, decls : DeclTable) -> Array (String, Rep) {
     let out = []
+    let giblets = Giblets.gibletModules()
     for bind in Array.append(program.dicts, program.binds) {
+        let ty = if bind.mutable && Set.contains(giblets, bind.module_) {
+            Core.refElem(bind.ty)
+        } else { bind.ty }
         match signatureOf(decls, bind) {
             Some(_) -> {}
             None -> Array.push(out, (bind.name,
-                                     repIn(decls, bind.layouts, bind.ty)))
+                                     repIn(decls, bind.layouts, ty)))
         }
     }
     out
@@ -385,6 +403,7 @@ fun tagsOf(decls : DeclTable,
 -- One top-level binding: the function it became, the functions lifted out of
 -- it, and the form that stopped it.
 fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
+              globalRefs : Map String Rep,
               tags : Map String Int, fields : Map String (Array String),
               sigs : Map String Signature, shared : Lifting)
         -> (Option (Ssa.Func Low), Array (Ssa.Func Low), Option String) {
@@ -415,7 +434,7 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
     }
     let f = Ssa.newFunc(bind.name, sig.result)
     Array.push(f.params, Ssa.freshValue(f, Ssa.traced(Ptr)))
-    let l = newLower(decls, f, globals, tags, fields, sigs, bind.layouts, [],
+    let l = newLower(decls, f, globals, globalRefs, tags, fields, sigs, bind.layouts, [],
                      shared)
     let entry = L.block(l.b)
     L.into(l.b, entry)
@@ -443,11 +462,13 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
 -- and a synthesized adapter. One constructor, so a field that is meant to be
 -- shared cannot be shared in two of them and copied in the third.
 fun newLower(decls : DeclTable, f : Ssa.Func Low, globals : Set.Set String,
+             globalRefs : Map String Rep,
              tags : Map String Int, fields : Map String (Array String),
              sigs : Map String Signature, layouts : Map Int String,
              lifted : Array (Ssa.Func Low), shared : Lifting) -> Lower = Lower {
     decls = decls, func = f, b = L.builder(f, BlockId(0)),
     env = Map.new(), joins = Map.new(), globals = globals, tags = tags,
+    globalRefs = globalRefs,
     fields = fields, sigs = sigs, layouts = layouts, lifted = lifted,
     shared = shared, stopped = None, flatRefs = Set.new(), flatRecords = Set.new(),
     localRefs = Map.new(), localRecords = Map.new(), nextSlot = 0,
@@ -603,6 +624,14 @@ fun localSlot(l : Lower, v : Value) -> (Int, Rep) {
     l.nextSlot = slot + 1
     L.effect(l.b, SlotStore(slot, v))
     (slot, Ssa.repOf(l.func, v))
+}
+
+fun globalRef(l : Lower, e : Core) -> Option (String, Rep) = match e.kind {
+    CVar(name) -> match Map.get(l.globalRefs, name) {
+        Some(held) -> Some((name, held))
+        None -> None
+    }
+    _ -> None
 }
 
 fun localRef(l : Lower, e : Core) -> Option (Int, Rep) = match e.kind {
@@ -1137,9 +1166,12 @@ fun valueHere(l : Lower, e : Core) -> Value {
         CTyApp(inner, _) -> value(l, inner)
         CTyLam(_, inner) -> value(l, inner)
         CRef(inner) -> L.emit(l.b, CellNew(value(l, inner)), Ssa.traced(Ptr))
-        CDeref(inner) -> match localRef(l, inner) {
+        CDeref(inner) -> match globalRef(l, inner) {
+            Some((name, held)) -> coerce(l, L.emit(l.b, GlobalLoad(name), held), rep)
+            None -> match localRef(l, inner) {
             Some((slot, held)) -> coerce(l, L.emit(l.b, SlotLoad(slot), held), rep)
             None -> L.emit(l.b, CellLoad(value(l, inner)), rep)
+            }
         }
         -- An erased wrapper has nothing to read out of: the value in hand
         -- already is the payload, the way a pattern on one binds it directly.
@@ -1260,9 +1292,12 @@ fun store(l : Lower, target : Core, x : Value) -> Unit = match target.kind {
     }
     -- Anything else is a reference cell: a `var`, whose mentions are already
     -- `CDeref` and whose assignment is a store through the cell itself.
-    _ -> match localRef(l, target) {
-        Some((slot, held)) -> L.effect(l.b, SlotStore(slot, coerce(l, x, held)))
-        None -> L.effect(l.b, CellStore(value(l, target), x))
+    _ -> match globalRef(l, target) {
+        Some((name, held)) -> L.effect(l.b, GlobalStore(name, coerce(l, x, held)))
+        None -> match localRef(l, target) {
+            Some((slot, held)) -> L.effect(l.b, SlotStore(slot, coerce(l, x, held)))
+            None -> L.effect(l.b, CellStore(value(l, target), x))
+        }
     }
 }
 
@@ -1399,7 +1434,7 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     -- closure outlives the frame that binds the join, so no label is in scope
     -- and sharing the parent's map would be a jump into a dead frame.
     -- `Turkey.Core`'s note on tail positions says exactly this.
-    let child = newLower(l.decls, g, l.globals, l.tags, l.fields, l.sigs,
+    let child = newLower(l.decls, g, l.globals, l.globalRefs, l.tags, l.fields, l.sigs,
                          l.layouts, l.lifted, l.shared)
     let entry = L.block(child.b)
     L.into(child.b, entry)
@@ -2159,10 +2194,10 @@ type Action
 -- `i1` at the boxed width, which is why `Lower` carries `layouts` per binding
 -- rather than per program.
 fun initializer(program : CProgram, decls : DeclTable,
-                globals : Set.Set String, tags : Map String Int,
-                fields : Map String (Array String),
+                globals : Set.Set String, globalRefs : Map String Rep,
+                tags : Map String Int, fields : Map String (Array String),
                 sigs : Map String Signature, shared : Lifting)
-        -> (Ssa.Func Low, Array (Ssa.Func Low), Array (String, Rep)) {
+        -> (Ssa.Func Low, Ssa.Func Low, Array (Ssa.Func Low), Array (String, Rep)) {
     let storage = storageOf(program, decls)
     let held = Map.new()
     for (name, r) in storage { Map.put(held, name, r) }
@@ -2188,14 +2223,39 @@ fun initializer(program : CProgram, decls : DeclTable,
             Array.push(actions, Field(name, i, fields[i].1))
         }
     }
+    let earlyActions : Array Action = []
+    let giblets = Giblets.gibletModules()
     for bind in program.binds {
         if Map.contains(held, bind.name) {
-            Array.push(actions, Store(bind.name, bind.value))
+            if Set.contains(giblets, bind.module_) {
+                let value = match bind.value.kind {
+                    CRef(inner) -> if bind.mutable { inner } else { bind.value }
+                    _ -> bind.value
+                }
+                Array.push(earlyActions, Store(bind.name, value))
+            } else {
+                Array.push(actions, Store(bind.name, bind.value))
+            }
         }
     }
+    let (early, earlyLifted) = lowerActions(Giblets.initializerName, earlyActions,
+        decls, globals, globalRefs, tags, fields, sigs, shared, layouts, held)
+    let (init, lifted) = lowerActions(initializerName, actions,
+        decls, globals, globalRefs, tags, fields, sigs, shared, layouts, held)
+    (init, early, Array.append(earlyLifted, lifted), storage)
+}
 
-    let f = Ssa.newFunc(initializerName, Ssa.untraced(Unit))
-    let l = newLower(decls, f, globals, tags, fields, sigs, Map.new(), [], shared)
+-- Partitioning preserves the dependency order established by module checking.
+-- Early actions contain only untraced globals; nullary objects and dictionary
+-- shells belong exclusively to the ordinary initializer.
+fun lowerActions(name : String, actions : Array Action, decls : DeclTable,
+                 globals : Set.Set String, globalRefs : Map String Rep,
+                 tags : Map String Int, fields : Map String (Array String),
+                 sigs : Map String Signature, shared : Lifting,
+                 layouts : Map String (Map Int String), held : Map String Rep)
+        -> (Ssa.Func Low, Array (Ssa.Func Low)) {
+    let f = Ssa.newFunc(name, Ssa.untraced(Unit))
+    let l = newLower(decls, f, globals, globalRefs, tags, fields, sigs, Map.new(), [], shared)
     L.into(l.b, L.block(l.b))
     for a in actions {
         let owner = ownerOf(a)
@@ -2224,7 +2284,7 @@ fun initializer(program : CProgram, decls : DeclTable,
         }
     }
     L.terminate(l.b, Ret(L.emit(l.b, ConstUnit, Ssa.untraced(Unit))))
-    (Promote.run(f), pruneAll(l.lifted), storage)
+    (Promote.run(f), pruneAll(l.lifted))
 }
 
 fun ownerOf(a : Action) -> String = match a {

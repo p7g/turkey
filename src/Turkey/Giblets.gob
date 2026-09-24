@@ -1,4 +1,4 @@
-module Turkey.Giblets (gibletModules, checkPlacement, checkLowered)
+module Turkey.Giblets (gibletModules, checkPlacement, checkLowered, initializerName)
 
 -- Giblets: modules whose code does not allocate and does not hold a traced
 -- value across a call.
@@ -21,10 +21,12 @@ import System.Env as Env
 import Data.Set as Set
 import Turkey.Diag as Diag
 import Turkey.LowIr as LowIr
-import Turkey.LowIr (Low(..), Allocation(..))
+import Turkey.LowIr (Low(..), Allocation(..), Op(..), Callee(..))
 import Turkey.Roots as Roots
 import Turkey.Ssa as Ssa
 import Turkey.Source (Span, showSpan)
+
+let initializerName = "%giblet.initialize"
 
 -- The giblet modules. A list rather than a convention or a declaration form:
 -- joining it is a deliberate edit to the compiler.
@@ -59,15 +61,17 @@ fun checkPlacement(name : String, library : Bool, where : Span) -> Unit {
 
 -- -- the check ------------------------------------------------------------------
 
--- Does a giblet function allocate, call anything that does, or hold a root.
+-- Does a giblet function allocate, call anything that does, or hold a root;
+-- and does giblet initialization stay clear of the heap and later globals.
 -- Every compile that lowers runs this, whichever backend it is for.
-fun checkLowered(functions : Array (Ssa.Func Low), path : String) -> Unit {
+fun checkLowered(functions : Array (Ssa.Func Low),
+                 definitions : Array (String, String), path : String) -> Unit {
     let modules = gibletModules()
     let summary = LowIr.summarize(functions)
     let byName = Map.new()
     for f in functions { Map.put(byName, f.name, f) }
     for f in functions {
-        if Set.contains(modules, moduleOf(f.name)) {
+        if f.name == initializerName || Set.contains(modules, moduleOf(f.name)) {
             match Map.get(summary, f.name) {
                 Some(_) -> refuse(f.name + " is in a giblet module and may "
                                   + "allocate: " + chain(byName, summary, f.name), path)
@@ -79,6 +83,58 @@ fun checkLowered(functions : Array (Ssa.Func Low), path : String) -> Unit {
             if len(Map.keys(Roots.analyze(f).slots)) > 0 {
                 refuse(f.name + " is in a giblet module and holds a traced "
                        + "value across a call", path)
+            }
+        }
+    }
+    checkEarly(byName, summary, definitions, modules, path)
+}
+
+-- Early initialization must not depend on the heap or on the later globals.
+-- Follow helpers as well as the entry itself: their scalar signatures alone
+-- cannot reveal an interned panic message or a read of an ordinary global.
+fun checkEarly(functions : Map String (Ssa.Func Low),
+               summary : Map String Allocation, definitions : Array (String, String),
+               modules : Set.Set String, path : String) -> Unit {
+    let exports = Map.new()
+    for (symbol, name) in definitions { Map.put(exports, symbol, name) }
+    let seen = Set.new()
+    let work = [initializerName]
+    for var k = 0; k < len(work); k = k + 1 {
+        let name = work[k]
+        if Set.contains(seen, name) { continue }
+        Set.add(seen, name)
+        let f = match Map.get(functions, name) {
+            Some(found) -> found
+            None -> { refuse("giblet initialization calls unknown function " + name, path) }
+        }
+        if Map.contains(summary, name) {
+            refuse("giblet initialization may allocate: "
+                   + chain(functions, summary, name), path)
+        }
+        for block in f.blocks {
+            for i in block.insts {
+                match i.op {
+                    ConstString(_) -> refuse("giblet initialization reaches " + name
+                        + ", which uses a string literal before interning", path)
+                    GlobalLoad(global) | GlobalStore(global, _) -> {
+                        if !Set.contains(modules, moduleOf(global)) {
+                            refuse("giblet initialization reaches " + name
+                                + ", which accesses the later global " + global, path)
+                        }
+                    }
+                    Call(Direct(callee), _) -> Array.push(work, callee)
+                    Call(Foreign(symbol), _) -> {
+                        if symbol == "turkey_heap_allocate" {
+                            refuse("giblet initialization may not call turkey_heap_allocate",
+                                   path)
+                        }
+                        match Map.get(exports, symbol) {
+                            Some(callee) -> Array.push(work, callee)
+                            None -> {}
+                        }
+                    }
+                    _ -> {}
+                }
             }
         }
     }

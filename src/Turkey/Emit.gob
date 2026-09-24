@@ -484,18 +484,16 @@ fun emitBytes(text : String, b : String.Builder) -> Unit {
 
 -- What has to happen before the program's own code, and `main`.
 --
--- The only hand-written assembly in the backend, and the order is
--- `Turkey.Llvm.emitEntry`'s because that is the order that has been running
--- for a milestone: the root array is registered first, then the literals are
--- interned into it, then the module initializer computes every global, then
--- `main`. The literals come first because an initializer's value may be one.
+-- Giblet globals are computed before root registration and allocation. Then
+-- the root array is registered, literals are interned into it, and the
+-- ordinary initializer runs before main. Its values may use those literals.
 --
 -- `Turkey.Entry` wraps the lot -- argument handling, the panic report and the
 -- final collection are written once, in Turkey, rather than emitted here in two
 -- backends -- and reaches this by its C symbol. The runtime's two calls around
 -- it park the program's ending where the entry's own code will not unwind on
 -- it.
-fun emitEntry(asm : Asm.Asm, main : String, b : String.Builder) -> Unit {
+fun emitEntry(asm : Asm.Asm, m : Module, main : String, b : String.Builder) -> Unit {
     let d = asm.dialect
     line(b, "    " + Asm.section(d, Asm.Text))
     function(b, d, Asm.entrySymbol(d))
@@ -506,6 +504,10 @@ fun emitEntry(asm : Asm.Asm, main : String, b : String.Builder) -> Unit {
     instruction(b, A.Str(Physical(Gp, 30), Offset(A.sp, 24), A.W64))
     line(b, "    add x29, sp, #16")
     call(b, d, "turkey_entry_started")
+    line(b, "    bl " + Asm.symbolFor(d, m.early))
+    symbolInto(b, d, A.x0, Asm.runtimeFor(d, "turkey_has_panicked"))
+    instruction(b, A.Ldr(A.x0, Offset(A.x0, 0), A.W32))
+    line(b, "    cbnz w0, " + Asm.localLabel(d, "entry_done"))
 
     -- The permanent frame, before anything allocates. It is never left: every
     -- global and every literal is live for the whole run, so the mask is all
@@ -540,11 +542,12 @@ fun emitEntry(asm : Asm.Asm, main : String, b : String.Builder) -> Unit {
         storeAt(b, A.x0, Physical(Gp, 1), 8 * Asm.literalSlot(asm, ordered[i]))
     }
 
-    line(b, "    bl " + Asm.symbolFor(d, Asm.initializerName))
+    line(b, "    bl " + Asm.symbolFor(d, m.initial))
     -- `main` takes the closure environment every Turkey function takes, and
     -- has none.
     instruction(b, A.Mov(A.x0, A.xzr, A.W64))
     line(b, "    bl " + Asm.symbolFor(d, main))
+    line(b, Asm.localLabel(d, "entry_done") + ":")
     call(b, d, "turkey_entry_returned")
 
     instruction(b, A.Ldr(Physical(Gp, 29), Offset(A.sp, 16), A.W64))

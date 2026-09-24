@@ -204,7 +204,7 @@ fun dumpCore(b : String.Builder, path : String) -> Unit {
 fun lowered(checked : Checked) -> Core.CProgram {
     let lowerer = Lower.newLowerer(checked.decls, checked.classes, checked.env,
                                    checked.types, target)
-    let program = Lower.program(lowerer, checked.ordered)
+    let program = Lower.program(lowerer, checked.ordered, checked.owners)
     Coretc.checkProgram(checked.decls, checked.classes, program,
                         Coretc.globalsOf(checked.env))
     program
@@ -320,7 +320,7 @@ fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable, path : String)
         Diag.fail(Diag.whole("internal error", "the low IR is malformed:\n  "
                              + String.join(complaints, "\n  ")), path)
     }
-    Giblets.checkLowered(module_.functions, path)
+    Giblets.checkLowered(module_.functions, module_.definitions, path)
     (module_, skipped)
 }
 
@@ -381,7 +381,7 @@ fun dumpNative(b : String.Builder, path : String) -> Unit {
     -- the table is only complete once every function has been emitted.
     -- The entry first: it interns the `<globals>` message, so the message
     -- table is not complete until it has run either.
-    Emit.emitEntry(asm, Map.getOr(entry.scope.values, "main", "main"), b)
+    Emit.emitEntry(asm, module_, Map.getOr(entry.scope.values, "main", "main"), b)
     Emit.emitDefinitions(module_, asm, b)
     Emit.emitMessages(asm, b)
     Emit.emitData(module_, asm, b)
@@ -723,6 +723,7 @@ type Checked = Checked {
     -- initialized before anything that reads it, and the lowering keeps that
     -- order because the running program depends on it.
     ordered  : Array Stmt,
+    owners   : Map Int String,
     warnings : Array String,
 }
 
@@ -733,7 +734,7 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
         decls = Decls.newDeclTable(), classes = Classes.newClassTable(
             Decls.newDeclTable()),
         env = Constraints.childEnv(initialEnv()), types = Typed.newTypeTable(),
-        ordered = Array.new(32), warnings = Array.new(4),
+        ordered = Array.new(32), owners = Map.new(), warnings = Array.new(4),
     }
     checked.classes = Classes.newClassTable(checked.decls)
     for m in modules {
@@ -745,7 +746,10 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
         Constraints.run(solver, constraint)
         Infer.checkExhaustiveness(g)
         Evidence.run(checked.classes, solver.uses)
-        for item in items { Array.push(checked.ordered, item) }
+        for item in items {
+            Array.push(checked.ordered, item)
+            Map.put(checked.owners, item.id, m.name)
+        }
         for w in g.warnings { Array.push(checked.warnings, w) }
     }
     checkMain(entry, checked.env, checked.classes)

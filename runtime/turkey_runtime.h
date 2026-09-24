@@ -13,15 +13,21 @@ void *turkey_float_to_string(double value);
 double turkey_float_parse(void *value);
 int32_t turkey_float_can_parse(void *value);
 
-void *turkey_cell_new(uint64_t value, int32_t pointer_value);
-
-void *turkey_object_new(int32_t kind, int32_t tag, int64_t count,
+/* C-callable exports supplied by Turkey.Alloc in the generated program.
+   Scalar arguments use Turkey's 64-bit Int; stored header fields stay 32-bit. */
+void *turkey_cell_new(uint64_t value, int64_t pointer_value);
+void *turkey_object_new(int64_t kind, int64_t tag, int64_t count,
                         uint64_t pointer_bitmap);
-void *turkey_box(uint64_t value, int32_t layout);
-uint64_t turkey_unbox(void *box, int32_t layout);
-void *turkey_array_new(int64_t length, uint64_t initial, int32_t element_width,
-                       int32_t element_layout);
+void *turkey_box(uint64_t value, int64_t layout);
+uint64_t turkey_unbox(void *box, int64_t layout);
+void *turkey_array_new(int64_t length, uint64_t initial, int64_t element_width,
+                       int64_t element_layout);
 void *turkey_closure_shell(uint64_t code);
+
+/* Collector-owned services used by the allocator giblet. */
+void *turkey_heap_allocate(uint64_t size, int64_t kind);
+void turkey_count_kind(int64_t kind);
+int64_t turkey_valid_object_kind(void *value, int64_t kind);
 
 /* Raw memory: `malloc` and `free`, and deliberately nothing more. Not heap
    objects -- these have no header, are never collected, and the collector must

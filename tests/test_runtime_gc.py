@@ -7,9 +7,11 @@ import subprocess
 
 import pytest
 
+from tests.allocator_probe import allocator_object
+
 
 @pytest.fixture(scope="module")
-def gc_probe(tmp_path_factory):
+def gc_probe(tmp_path_factory, allocator_object):
     cc = shutil.which("cc")
     if cc is None:
         pytest.skip("C compiler unavailable")
@@ -30,7 +32,7 @@ int main(int argc, char **argv) {
 ''')
     binary = directory / "probe"
     subprocess.run([cc, "-std=c11", "-I", str(root / "runtime"),
-                    str(source), str(root / "runtime/turkey_runtime.c"),
+                    str(source), str(root / "runtime/turkey_runtime.c"), str(allocator_object),
                     "-lm", "-pthread", "-o", str(binary)], check=True,
                    capture_output=True, text=True)
     return binary
@@ -69,7 +71,7 @@ def test_allocation_kinds_and_options_survive_stress_override(gc_probe, args):
 
 
 @pytest.fixture(scope="module")
-def region_probe(tmp_path_factory):
+def region_probe(tmp_path_factory, allocator_object):
     cc = shutil.which("cc")
     if cc is None:
         pytest.skip("C compiler unavailable")
@@ -132,7 +134,7 @@ int main(void) {
 ''')
     binary = directory / "probe"
     subprocess.run([cc, "-std=c11", "-O1", "-fsanitize=undefined",
-                    "-I", str(root / "runtime"), str(source), "-lm", "-pthread",
+                    "-I", str(root / "runtime"), str(source), str(allocator_object), "-lm", "-pthread",
                     "-o", str(binary)], check=True, capture_output=True, text=True)
     return binary
 
@@ -151,7 +153,7 @@ def test_regions_reuse_holes_and_reclaim_small_and_large_objects(region_probe, s
 
 
 @pytest.fixture(scope="module")
-def code_probe(tmp_path_factory):
+def code_probe(tmp_path_factory, allocator_object):
     """Layout code 7 is traced and 6 is not, for both of the collector's readers.
 
     `mark_children` tested `>= 6` until an untraced pointer became reachable
@@ -214,7 +216,7 @@ int main(void) {
 ''')
     binary = directory / "probe"
     subprocess.run([cc, "-std=c11", "-O1", "-fsanitize=undefined",
-                    "-I", str(root / "runtime"), str(source), "-lm", "-pthread",
+                    "-I", str(root / "runtime"), str(source), str(allocator_object), "-lm", "-pthread",
                     "-o", str(binary)], check=True, capture_output=True, text=True)
     return binary
 

@@ -196,20 +196,10 @@ what it provides.
 ### The Target module
 
 The library module `Target` says which platform the program is being compiled
-for:
-
-```text
-module Target (OS(..), Arch(..), os, arch)
-
-type OS = Darwin
-type Arch = Arm64
-
-let os : OS      -- the target's operating system
-let arch : Arch  -- the target's processor architecture
-```
-
-Each type lists only the targets the compiler supports, which today is one:
-arm64 macOS. The compiler's `--target` option chooses among them; its value is
+for. `Target.os` is the operating system, of type `OS`, and `Target.arch` the
+processor architecture, of type `Arch`. Each type lists only the targets the
+compiler supports, which today is one: arm64 macOS, so `OS` has the single
+constructor `Darwin` and `Arch` the single constructor `Arm64`. The compiler's `--target` option chooses among them; its value is
 spelled `arch-os`, and `arm64-darwin` is the default:
 
 ```sh

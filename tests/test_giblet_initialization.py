@@ -109,6 +109,11 @@ void *turkey_heap_allocate(uint64_t size, int64_t kind) {
      'fun helper(n : Int) -> Int = if n == 0 { Prim.error("early") } '
      'else { helper(n - 1) }\nfun read() -> Int = value',
      'let base : Int = 0', 'uses a string literal before interning'),
+    ('let value : Int = helper(2)\n'
+     'foreign "probe_early_helper" fun helper(n : Int) -> Int = '
+     'if n == 0 { Prim.error("early") } else { helper(n - 1) }\n'
+     'fun read() -> Int = value',
+     'let base : Int = 0', 'uses a string literal before interning'),
     ('import Unsafe.Runtime as R\n'
      'let value : Prim.Ptr = R.heapAllocate(32, 0)\nfun read() -> Int = 0',
      'let base : Int = 0', 'may not call turkey_heap_allocate'),

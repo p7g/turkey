@@ -116,10 +116,11 @@ fun widthOf(r : Rep) -> A.Width = match r.class_ {
 -- table is complete only once every function has been walked. `Turkey.Llvm`
 -- learned the same thing the hard way and says so -- its message table is
 -- emitted after the code for exactly this reason.
-fun selectModule(m : Module) -> (Array (Func Inst), Array Unsupported, Asm) {
+fun selectModule(m : Module, dialect : Asm.Dialect)
+        -> (Array (Func Inst), Array Unsupported, Asm) {
     -- One `Asm` for the module, because a literal interned by one function is
     -- the same literal in the next and the root array is one array.
-    let asm = Asm.newAsm(m)
+    let asm = Asm.newAsm(m, dialect)
     let done = []
     let skipped = []
     -- One selection per function, answering both the function and, if it
@@ -248,7 +249,7 @@ fun terminate(s : Sel, t : Term) -> Unit = match t {
     Panic(v) -> {
         s.panicking = True
         call(s, temp(s, Ssa.untraced(I64)), A.Gp, A.Gp,
-             Some(Asm.runtimeFor("turkey_panic_string")), A.xzr,
+             Some(runtimeSymbolOf(s, "turkey_panic_string")), A.xzr,
              [(A.reg(v), A.Gp)])
         s.panicking = False
         s.out.blocks[s.at].term = Ret(zeroResult(s))
@@ -404,7 +405,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         -- the module interns; a code address names the thunk `Turkey.Emit`
         -- writes under the definition's C symbol.
         Address(CBytes(text)) -> symbolAddress(s, d, Asm.messageSymbol(s.asm, text))
-        Address(CodeOf(sym)) -> symbolAddress(s, d, Asm.runtimeFor(sym))
+        Address(CodeOf(sym)) -> symbolAddress(s, d, runtimeSymbolOf(s, sym))
         -- Every function has a frame record, so `x29` is this frame.
         Address(ThisFrame) -> emit(s, A.Mov(d, A.fp, A.W64))
         GlobalLoad(name) -> emit(s, A.Ldr(d, globalAt(s, name), A.W64))
@@ -419,14 +420,14 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         -- The runtime's untyped interfaces take a raw 64-bit word, so a double
         -- crosses as its bits rather than in its own file -- the same thing
         -- `Turkey.Llvm.widened` does with a `bitcast`.
-        Box(a) -> runtimeCall(s, d, runtimeSymbolOf("turkey_box"), [raw(s, a)],
+        Box(a) -> runtimeCall(s, d, runtimeSymbolOf(s, "turkey_box"), [raw(s, a)],
                               [immediate(s, Rt.layoutCode(Ssa.repOf(s.source, a)))])
-        Unbox(a) -> runtimeCall(s, d, runtimeSymbolOf("turkey_unbox"), [A.reg(a)],
+        Unbox(a) -> runtimeCall(s, d, runtimeSymbolOf(s, "turkey_unbox"), [A.reg(a)],
                                 [immediate(s, Rt.layoutCode(r))])
-        CellNew(a) -> runtimeCall(s, d, runtimeSymbolOf("turkey_cell_new"), [raw(s, a)],
+        CellNew(a) -> runtimeCall(s, d, runtimeSymbolOf(s, "turkey_cell_new"), [raw(s, a)],
                                   [immediate(s, Rt.traceBit(Ssa.repOf(s.source, a)))])
         ObjectNew(kind, tag, count, bitmap) ->
-            runtimeCall(s, d, runtimeSymbolOf("turkey_object_new"), [],
+            runtimeCall(s, d, runtimeSymbolOf(s, "turkey_object_new"), [],
                         [immediate(s, kind), immediate(s, tag),
                          immediate(s, count), immediate(s, bitmap)])
         ObjectSet(target, index, v) -> {
@@ -436,15 +437,15 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             emit(s, A.Mov(d, A.xzr, A.W64))
         }
         ArrayNew(length, initial, element) ->
-            runtimeCall(s, d, runtimeSymbolOf("turkey_array_new"),
+            runtimeCall(s, d, runtimeSymbolOf(s, "turkey_array_new"),
                         [A.reg(length), raw(s, initial)],
                         [immediate(s, Rt.elementWidth(element.class_)),
                          immediate(s, Rt.layoutCode(element))])
         -- The code operand is the function's *address*, which is what the
         -- runtime stores and what an indirect call loads back out of slot 0.
         ClosureNew(code, _) ->
-            runtimeCall(s, d, runtimeSymbolOf("turkey_closure_shell"),
-                        [address(s, symbolFor(code))], [])
+            runtimeCall(s, d, runtimeSymbolOf(s, "turkey_closure_shell"),
+                        [address(s, symbolFor(s, code))], [])
         ClosureCapture(closure, index, v) -> {
             let env = temp(s, Ssa.traced(Ptr))
             emit(s, A.Ldr(env, A.Offset(A.reg(closure), 32), A.W64))
@@ -463,8 +464,8 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             let want = A.bankOf(r)
             match callee {
                 Direct(name) ->
-                    call(s, d, want, want, Some(symbolFor(name)), A.xzr, passed)
-                Runtime(name) -> match runtimeSymbol(name) {
+                    call(s, d, want, want, Some(symbolFor(s, name)), A.xzr, passed)
+                Runtime(name) -> match runtimeSymbol(s, name) {
                     -- The stack arguments below are this compiler's own
                     -- convention, and a C function would not read them the
                     -- same way. No runtime entry point takes more than four.
@@ -494,10 +495,10 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                 Foreign(symbol) -> if overflows(passed) {
                     stop(s, "a foreign call with stack arguments")
                 } else {
-                    -- `runtimeFor` and not the bare name: the leading
-                    -- underscore is Mach-O's, and a C symbol needs it for the
-                    -- same reason `turkey_print` does.
-                    call(s, d, want, want, Some(Asm.runtimeFor(symbol)),
+                    -- `runtimeFor` and not the bare name: the object format
+                    -- decides how a C symbol is spelled, for this one as for
+                    -- `turkey_print`.
+                    call(s, d, want, want, Some(runtimeSymbolOf(s, symbol)),
                          A.xzr, passed)
                 }
                 -- A closure: the code is slot 0 and the environment slot 1,
@@ -656,8 +657,8 @@ fun call(s : Sel, d : Reg, dBank : A.Bank, resultBank : A.Bank,
 fun propagate(s : Sel) -> Unit {
     if s.panicking { return }
     let flag = temp(s, Ssa.untraced(I32))
-    emit(s, A.Ldr(flag, A.Offset(got(s, Asm.runtimeFor("turkey_has_panicked")), 0),
-                  A.W32))
+    let panicked = got(s, runtimeSymbolOf(s, "turkey_has_panicked"))
+    emit(s, A.Ldr(flag, A.Offset(panicked, 0), A.W32))
     emit(s, A.CmpImm(flag, 0, A.W32))
     let failed = tempValue(s, Ssa.untraced(I1))
     emit(s, A.CSet(A.reg(failed), A.Ne))
@@ -672,8 +673,8 @@ fun propagate(s : Sel) -> Unit {
 fun got(s : Sel, sym : String) -> Reg {
     let page = temp(s, Ssa.untraced(Ptr))
     let full = temp(s, Ssa.untraced(Ptr))
-    emit(s, A.AdrpGot(page, sym))
-    emit(s, A.LdrGot(full, page, sym))
+    emit(s, A.AdrpGot(page, Asm.gotPage(s.asm.dialect, sym)))
+    emit(s, A.LdrGot(full, page, Asm.gotOffset(s.asm.dialect, sym)))
     full
 }
 
@@ -697,40 +698,41 @@ fun zeroResult(s : Sel) -> Value {
 fun globalAt(s : Sel, name : String) -> A.Mem =
     match Asm.globalSlot(s.asm, name) {
         Some(slot) -> slotOf(s, slot)
-        None -> A.Offset(address(s, Asm.globalSymbol(name)), 0)
+        None -> A.Offset(address(s, Asm.globalSymbol(s.asm.dialect, name)), 0)
     }
 
 -- One slot of the permanent root array.
 fun slotOf(s : Sel, slot : Int) -> A.Mem =
-    A.Offset(address(s, Asm.rootsSymbol), 8 * slot)
+    A.Offset(address(s, Asm.rootsSymbol(s.asm.dialect)), 8 * slot)
 
 -- A symbol's address, in a register. Two instructions on arm64: the page, then
 -- the offset within it.
 fun address(s : Sel, sym : String) -> Reg {
     let page = temp(s, Ssa.untraced(Ptr))
     let full = temp(s, Ssa.untraced(Ptr))
-    emit(s, A.Adrp(page, sym))
+    emit(s, A.Adrp(page, Asm.page(s.asm.dialect, sym)))
     -- Into a *second* register, not back into the first. `add` takes distinct
     -- source and destination, so there is no reason to redefine a value here
     -- and every reason not to: `Ssa.verify` counts definitions, and the
     -- allocator will too.
-    emit(s, A.AddLo(full, page, sym))
+    emit(s, A.AddLo(full, page, Asm.pageOffset(s.asm.dialect, sym)))
     full
 }
 
 -- A symbol's address into `d`: `address`'s pair, ending in the destination.
 fun symbolAddress(s : Sel, d : Reg, sym : String) -> Unit {
     let page = temp(s, Ssa.untraced(Ptr))
-    emit(s, A.Adrp(page, sym))
-    emit(s, A.AddLo(d, page, sym))
+    emit(s, A.Adrp(page, Asm.page(s.asm.dialect, sym)))
+    emit(s, A.AddLo(d, page, Asm.pageOffset(s.asm.dialect, sym)))
 }
 
-fun symbolFor(name : String) -> String = Asm.symbolFor(name)
+fun symbolFor(s : Sel, name : String) -> String = Asm.symbolFor(s.asm.dialect, name)
 
 -- A runtime entry point this pass names directly rather than through the
 -- primitive table: the heap operations have no `Prim.` spelling, because the
 -- lowering emits them and no program calls them.
-fun runtimeSymbolOf(name : String) -> String = Asm.runtimeFor(name)
+fun runtimeSymbolOf(s : Sel, name : String) -> String =
+    Asm.runtimeFor(s.asm.dialect, name)
 
 -- One element of an array, by address. The header first, then the index scaled
 -- by the element's width.
@@ -752,12 +754,13 @@ fun shiftFor(width : Int) -> Int = match width {
 -- A primitive's runtime symbol, as the assembler wants it written.
 --
 -- The table is `Turkey.Runtime`'s -- these are the symbols a C file defines,
--- not a choice this pass makes -- and what is left here is Mach-O's leading
--- underscore. C's return type is not consulted: every one of these fits in
--- `x0` and the caller already knows the representation it asked for.
-fun runtimeSymbol(name : String) -> Option String =
+-- not a choice this pass makes -- and what is left here is how the object
+-- format spells a C symbol. C's return type is not consulted: every one of
+-- these fits in `x0` and the caller already knows the representation it asked
+-- for.
+fun runtimeSymbol(s : Sel, name : String) -> Option String =
     match Rt.entryPoint(name) {
-        Some(entry) -> Some(Asm.runtimeFor(entry.symbol))
+        Some(entry) -> Some(runtimeSymbolOf(s, entry.symbol))
         None -> None
     }
 
@@ -922,7 +925,7 @@ fun guard(s : Sel, condition : Value, message : String) -> Unit {
         let text = address(s, Asm.messageSymbol(s.asm, message))
         s.panicking = True
         call(s, temp(s, Ssa.untraced(I64)), A.Gp, A.Gp,
-             Some(Asm.runtimeFor("turkey_panic")), A.xzr, [(text, A.Gp)])
+             Some(runtimeSymbolOf(s, "turkey_panic")), A.xzr, [(text, A.Gp)])
         s.panicking = False
     }
     s.out.blocks[s.at].term = Ret(zeroResult(s))
@@ -1071,7 +1074,7 @@ fun floatBin(s : Sel, d : Reg, o : BinOp, a : Reg, b : Reg) -> Unit = match o {
     -- arm64 has no remainder instruction for doubles, and LLVM's `frem` is
     -- `fmod` by definition, so this is the call the other backend also
     -- eventually becomes -- libm's own, as `Data.Float.fmod` declares it.
-    Rem -> call(s, d, A.Fp, A.Fp, Some(Asm.runtimeFor("fmod")),
+    Rem -> call(s, d, A.Fp, A.Fp, Some(runtimeSymbolOf(s, "fmod")),
                 A.xzr, [(a, A.Fp), (b, A.Fp)])
     _ -> stop(s, "the binary operation " + show(o) + " on a double")
 }

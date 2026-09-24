@@ -138,6 +138,7 @@ def test_a_value_of_traced_type_that_is_never_made_is_accepted(lowered):
         "import Target as Target\n"
         "fun f(n : Int) -> Int = match Target.os {\n"
         "    Darwin -> n\n"
+        "    Linux -> n + 1\n"
         "}\n",
         "fun h(n : Int) -> Int = n\n")
     assert code == 0, stderr

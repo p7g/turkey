@@ -16,13 +16,12 @@ from __future__ import annotations
 
 import functools
 import os
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from tests import bootc, lang
+from tests import bootc, lang, toolchain
 from tests.bootc import CACHE, runtime_object
 from tests.bootc import digest as _digest, replace_built as _replace_built
 
@@ -73,7 +72,7 @@ def _binary(name: str) -> Path:
         source.write_bytes(assembly)
         staging = stem.with_suffix(stem.suffix + ".bin")
         try:
-            _replace_built(["cc", "-o", str(staging), str(source),
+            _replace_built([*toolchain.cc(), "-o", str(staging), str(source),
                             str(runtime)], output)
         finally:
             source.unlink(missing_ok=True)
@@ -105,7 +104,7 @@ def test_every_program_has_an_entry_and_a_root_array():
         assert '.globl "_main"' in text, name
 
 
-@pytest.mark.skipif(shutil.which("cc") is None, reason="no C compiler")
+@pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
 @pytest.mark.parametrize("name", RUNNABLE)
 def test_the_corpus_agrees_under_gc_stress(name):
     """Collect at every allocation, which is what reads the frame table at all.
@@ -120,7 +119,7 @@ def test_the_corpus_agrees_under_gc_stress(name):
     env = dict(os.environ, TURKEY_GC_STRESS="1")
     # From the program's own directory, as `test_programs` runs it: a program
     # may read a file by its bare name (`system.gob`).
-    result = subprocess.run([str(_binary(name))], cwd=PROGRAMS,
+    result = subprocess.run(toolchain.command(_binary(name)), cwd=PROGRAMS,
                             capture_output=True, text=True, env=env)
     assert result.returncode == 0, result.stderr[:2000]
     assert result.stdout == lang.output(PROGRAMS / name), (

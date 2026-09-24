@@ -21,12 +21,11 @@ agree with them (`test_boot`); nothing does now. Regenerate with
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
 import pytest
 
-from tests import lang
+from tests import lang, toolchain
 
 TESTS_DIR = Path(__file__).resolve().parent
 PROGRAMS_DIR = TESTS_DIR / "programs"
@@ -44,7 +43,7 @@ BUNDLES = sorted(p / "Main.gob" for p in PROGRAMS_DIR.iterdir()
 NO_TRACE_YET = {"err_out_of_bounds", "err_string_boundary",
                 "err_uninitialized_read"}
 
-pytestmark = pytest.mark.skipif(shutil.which("cc") is None,
+pytestmark = pytest.mark.skipif(toolchain.missing(),
                                 reason="no C compiler")
 
 

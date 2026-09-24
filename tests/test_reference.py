@@ -22,13 +22,12 @@ that stays when the Python one goes (TIX-94).
 from __future__ import annotations
 
 import re
-import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
-from tests import lang
+from tests import lang, toolchain
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REF_DIR = REPO_ROOT / "docs" / "ref"
@@ -127,7 +126,7 @@ def _collect() -> list[Example]:
 EXAMPLES = _collect()
 
 
-@pytest.mark.skipif(shutil.which("cc") is None, reason="no C compiler")
+@pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
 @pytest.mark.parametrize("example", EXAMPLES, ids=lambda e: e.id)
 def test_example(example: Example) -> None:
     modules = example.modules or None

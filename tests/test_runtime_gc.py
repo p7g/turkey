@@ -2,18 +2,17 @@
 
 import os
 from pathlib import Path
-import shutil
 import subprocess
 
 import pytest
 
+from tests import toolchain
 from tests.allocator_probe import allocator_object
 
 
 @pytest.fixture(scope="module")
 def gc_probe(tmp_path_factory, allocator_object):
-    cc = shutil.which("cc")
-    if cc is None:
+    if toolchain.missing():
         pytest.skip("C compiler unavailable")
     root = Path(__file__).resolve().parents[1]
     directory = tmp_path_factory.mktemp("gc-probe")
@@ -31,7 +30,7 @@ int main(int argc, char **argv) {
 }
 ''')
     binary = directory / "probe"
-    subprocess.run([cc, "-std=c11", "-I", str(root / "runtime"),
+    subprocess.run([*toolchain.cc(), "-std=c11", "-I", str(root / "runtime"),
                     str(source), str(root / "runtime/turkey_runtime.c"), str(allocator_object),
                     "-lm", "-pthread", "-o", str(binary)], check=True,
                    capture_output=True, text=True)
@@ -41,7 +40,7 @@ int main(int argc, char **argv) {
 def probe(binary, scale="2", *args):
     env = dict(os.environ, TURKEY_GC_STATS="1", TURKEY_GC_THRESHOLD_SCALE=scale)
     env.pop("TURKEY_GC_STRESS", None)
-    result = subprocess.run([str(binary), *args], env=env,
+    result = subprocess.run(toolchain.command(binary, *args), env=env,
                             capture_output=True, text=True, check=True)
     return result.stderr
 
@@ -72,8 +71,7 @@ def test_allocation_kinds_and_options_survive_stress_override(gc_probe, args):
 
 @pytest.fixture(scope="module")
 def region_probe(tmp_path_factory, allocator_object):
-    cc = shutil.which("cc")
-    if cc is None:
+    if toolchain.missing():
         pytest.skip("C compiler unavailable")
     root = Path(__file__).resolve().parents[1]
     directory = tmp_path_factory.mktemp("region-probe")
@@ -133,7 +131,7 @@ int main(void) {
 }
 ''')
     binary = directory / "probe"
-    subprocess.run([cc, "-std=c11", "-O1", "-fsanitize=undefined",
+    subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-fsanitize=undefined",
                     "-I", str(root / "runtime"), str(source), str(allocator_object), "-lm", "-pthread",
                     "-o", str(binary)], check=True, capture_output=True, text=True)
     return binary
@@ -146,8 +144,8 @@ def test_regions_reuse_holes_and_reclaim_small_and_large_objects(region_probe, s
     env.pop("TURKEY_GC_STRESS", None)
     if stress:
         env["TURKEY_GC_STRESS"] = "1"
-    result = subprocess.run([str(region_probe)], env=env, capture_output=True,
-                            text=True, timeout=60)
+    result = subprocess.run(toolchain.command(region_probe), env=env,
+                            capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
     assert result.stderr == ""
 
@@ -162,8 +160,7 @@ def code_probe(tmp_path_factory, allocator_object):
     convention: an array's element tag and an object's three-bit slot metadata
     are read by different branches of `mark_children`, and both are pinned.
     """
-    cc = shutil.which("cc")
-    if cc is None:
+    if toolchain.missing():
         pytest.skip("C compiler unavailable")
     root = Path(__file__).resolve().parents[1]
     directory = tmp_path_factory.mktemp("code-probe")
@@ -215,12 +212,13 @@ int main(void) {
 }
 ''')
     binary = directory / "probe"
-    subprocess.run([cc, "-std=c11", "-O1", "-fsanitize=undefined",
+    subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-fsanitize=undefined",
                     "-I", str(root / "runtime"), str(source), str(allocator_object), "-lm", "-pthread",
                     "-o", str(binary)], check=True, capture_output=True, text=True)
     return binary
 
 
 def test_only_layout_code_seven_is_traced(code_probe):
-    result = subprocess.run([str(code_probe)], capture_output=True, text=True)
+    result = subprocess.run(toolchain.command(code_probe), capture_output=True,
+                            text=True)
     assert result.returncode == 0, result.stdout + result.stderr

@@ -90,6 +90,44 @@ emits exactly the assembly it was built from. `scripts/bump-bootstrap.sh`
 replaces the committed compiler, which is rare and deliberate; both scripts
 explain themselves at the top.
 
+### The C compiler, and running on another machine
+
+Two environment variables choose the toolchain, for `scripts/build.sh` and for
+the tests alike. Each is split into words the way a shell would split it.
+
+- `TURKEY_CC` is the C compiler that assembles and links a program with the
+  runtime. Unset, it is `cc`.
+- `TURKEY_RUN` is a prefix for running a program that compiler linked, or a
+  built compiler. Unset or empty, the program runs directly.
+
+On x86-64 Linux, the arm64 output runs under qemu-user. Link it statically,
+because a dynamically linked arm64 binary would need an arm64 libc to load.
+Set up the machine with:
+
+```bash
+apt-get update
+apt-get install -y \
+    qemu-user-static \
+    gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
+    python3-pytest python3-pytest-xdist
+if [ -w /proc/sys/fs/binfmt_misc/register ]; then
+    cat /usr/lib/binfmt.d/qemu-aarch64.conf > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
+fi
+```
+
+Then set `TURKEY_CC="aarch64-linux-gnu-gcc -static"` and leave `TURKEY_RUN`
+empty. The last step of the setup registers qemu with the kernel's binfmt_misc,
+so an arm64 binary runs as `./program`, with no prefix. That registration is
+lost when a machine is restored from a snapshot, so the repository's
+`.claude/settings.json` runs the same line as a SessionStart hook. On macOS the
+hook does nothing. Where binfmt_misc cannot be written, set
+`TURKEY_RUN=qemu-aarch64` instead. pytest comes from apt here, because Ubuntu
+24.04 refuses a system-wide `pip install`.
+
+This runs only what the compiler emits for Linux, and Linux is not a target
+yet. The bootstrap is macOS assembly, and `scripts/build.sh` still refuses any
+host but arm64 macOS.
+
 ## Project status
 
 Turkey is an experimental language under active development. The compiler is

@@ -9,9 +9,9 @@ working once `turkey/` is gone.
 
 A program is compiled the way a user would compile it: `boot native` from the
 program's own directory, so a diagnostic quotes the file by its bare name, then
-assembled and linked against the runtime with `cc`, then run. The library is
-found through `$TURKEY_LIB`, since the directory the program is compiled from is
-not the repository root.
+assembled and linked against the runtime with the C compiler, then run, both
+as `tests.toolchain` says. The library is found through `$TURKEY_LIB`, since
+the directory the program is compiled from is not the repository root.
 
 Both steps are cached on disk, keyed by `bootc.build_key()` and the program's
 sources, because a behavioral suite is hundreds of small programs and under
@@ -37,7 +37,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from tests import bootc
+from tests import bootc, toolchain
 
 REPO_ROOT = bootc.REPO_ROOT
 LIB = REPO_ROOT / "lib"
@@ -171,7 +171,7 @@ def _key(command: str, entry: Path) -> str:
 
 def _boot(command: str, entry: Path) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
-        [str(bootc.binary()), command, entry.name],
+        toolchain.command(bootc.binary(), command, entry.name),
         cwd=entry.parent,
         env=dict(os.environ, TURKEY_LIB=str(LIB)),
         capture_output=True,
@@ -225,7 +225,7 @@ def _native(entry: Path) -> _Compiled:
         source.write_bytes(assembly)
         try:
             bootc.replace_built(
-                ["cc", "-o", str(directory / f"bin.{os.getpid()}"),
+                [*toolchain.cc(), "-o", str(directory / f"bin.{os.getpid()}"),
                  str(source), str(bootc.runtime_object())],
                 directory / "bin")
         finally:
@@ -266,7 +266,7 @@ def run(src: Source, modules: dict[str, str] | None = None,
     if compiled.code != 0 or compiled.binary is None:
         raise CompileError(compiled.stderr, compiled.code)
     result = subprocess.run(
-        [str(compiled.binary), *args],
+        toolchain.command(compiled.binary, *args),
         cwd=cwd or entry.parent,
         input=None if stdin is None else stdin.encode("utf-8"),
         env=None if env is None else dict(os.environ, **env),

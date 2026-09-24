@@ -40,6 +40,13 @@
 
 set -eu
 
+# The C compiler and linker, and a prefix for running what it links, both split
+# into words: $TURKEY_CC is `cc` when unset, and an empty $TURKEY_RUN runs a
+# stage directly. README.md says what they are for; tests/toolchain.py reads
+# the same two.
+CC=${TURKEY_CC:-cc}
+RUN=${TURKEY_RUN:-}
+
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT"
 
@@ -88,18 +95,18 @@ sha() {
 # The compiler's own source, compiled by $1, into $2.
 emit() {
     step "$(basename "$1") $SOURCE -> $(basename "$2")"
-    "$1" native "$SOURCE" > "$2.tmp"
+    $RUN "$1" native "$SOURCE" > "$2.tmp"
     mv "$2.tmp" "$2"
 }
 
 link() {
     step "link $(basename "$2")"
-    cc -o "$2.tmp" "$1" "$3"
+    $CC -o "$2.tmp" "$1" "$3"
     mv "$2.tmp" "$2"
 }
 
 step "runtime"
-cc -std=c11 -O1 -c -o "$out/runtime.o" runtime/turkey_runtime.c
+$CC -std=c11 -O1 -c -o "$out/runtime.o" runtime/turkey_runtime.c
 
 if [ -n "$stage1" ]; then
     step "stage1 is $stage1"
@@ -111,7 +118,7 @@ else
         exit 1
     fi
     step "bootstrap runtime"
-    cc -std=c11 -O1 -c -o "$out/runtime0.o" "$BOOTSTRAP/runtime/turkey_runtime.c"
+    $CC -std=c11 -O1 -c -o "$out/runtime0.o" "$BOOTSTRAP/runtime/turkey_runtime.c"
     gunzip -c "$ARTIFACT" > "$out/stage1.s"
     if [ "$(sha "$out/stage1.s")" != "$(provenance asm-sha256)" ]; then
         echo "build.sh: $ARTIFACT decompresses to the wrong bytes" >&2

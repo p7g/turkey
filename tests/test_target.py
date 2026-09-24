@@ -1,19 +1,22 @@
 """`Target.os` and `Target.arch`, and the `--target` option that sets them.
 
 What a program can observe is in `docs/ref/modules.md`, whose examples
-`test_reference` runs. Here: the command line, and the claim the reference
-makes about compiling -- that only the chosen target's arm of a
-`match Target.os` survives to be compiled.
-
-The test that matters most cannot be written yet: a program whose other arm
-calls a `foreign` symbol that exists only on the other target, checked absent
-from the output. With one target there is no other arm. It lands with the
-second target.
+`test_reference` runs. Here: the command line, the claim the reference makes
+about compiling -- that only the chosen target's arm of a `match Target.os`
+survives to be compiled -- and that each target's output is what its
+assembler accepts.
 """
 
 from __future__ import annotations
 
+import os
+import re
+import shutil
 import subprocess
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
 
 from tests import bootc, lang
 
@@ -23,6 +26,7 @@ import Target as Target
 
 fun signalName(n : Int) -> String = match Target.os {
     Darwin -> if n == 10 { "SIGBUS" } else { "other" }
+    Linux -> if n == 7 { "SIGBUS" } else { "other" }
 }
 
 fun wordBytes() -> Int = match Target.arch {
@@ -43,7 +47,7 @@ def _boot(*args: str) -> subprocess.CompletedProcess[bytes]:
                           capture_output=True)
 
 
-def test_the_default_is_the_only_target() -> None:
+def test_the_default_is_the_host() -> None:
     chosen = _boot("native", "--target", "arm64-darwin", str(SOURCE))
     default = _boot("native", str(SOURCE))
     assert chosen.returncode == 0, chosen.stderr
@@ -54,7 +58,8 @@ def test_an_unknown_target_is_refused() -> None:
     result = _boot("check", "--target", "x86_64-linux", str(SOURCE))
     assert result.returncode == 2
     assert result.stderr.decode() == (
-        "boot: unknown target 'x86_64-linux'; supported: arm64-darwin\n")
+        "boot: unknown target 'x86_64-linux'; supported: arm64-darwin, "
+        "arm64-linux\n")
 
 
 def test_target_without_a_value_is_a_usage_error() -> None:
@@ -77,24 +82,96 @@ def test_a_target_match_is_decided_before_lowering() -> None:
     assert "match" not in result.stdout
 
 
-def test_every_arm_of_a_target_match_is_checked() -> None:
-    """Exhaustiveness sees `OS` as an ordinary type.
-
-    With one target a `match Target.os` cannot miss one, so this is the same
-    check through a pair. The direct case -- a match that names `Darwin` and
-    not a second target -- lands with the second target.
-    """
+def test_a_target_match_that_misses_a_target_is_refused() -> None:
+    """Exhaustiveness sees `OS` as an ordinary type, whichever target is
+    chosen: the arm for the other one is still required."""
     message = lang.fails("""\
 import Target (OS(..))
 import Target as Target
 
-fun sigbus(fallback : Bool) -> Int = match (Target.os, fallback) {
-    (Darwin, False) -> 10
+fun sigbus() -> Int = match Target.os {
+    Darwin -> 10
 }
 
 fun main() {
-    print(sigbus(False))
+    print(sigbus())
 }
 """)
-    assert message == (
-        "this match is not exhaustive; '(Darwin, True)' is not handled")
+    assert message == "this match is not exhaustive; 'Linux' is not handled"
+
+
+# Each target's arm calls the errno accessor only that target's libc defines.
+# A `foreign` declaration may appear only in the library's `Unsafe.` modules,
+# so this one is written into `lib/` for the test's duration.
+ERRNO = """\
+module Unsafe.Probe (found)
+
+import Target (OS(..))
+import Target as Target
+
+foreign "__error" fun darwinLocation() -> Prim.Ptr
+
+foreign "__errno_location" fun linuxLocation() -> Prim.Ptr
+
+fun location() -> Prim.Ptr = match Target.os {
+    Darwin -> darwinLocation()
+    Linux -> linuxLocation()
+}
+
+fun found() -> Bool = !Prim.ptrIsNull(location())
+"""
+
+
+@pytest.fixture
+def errno(request: pytest.FixtureRequest) -> Iterator[Path]:
+    """A program that asks for errno's address through `ERRNO`, whose module
+    is named for the test so that parallel tests do not share it."""
+    stem = "Probe_" + re.sub(r"[^A-Za-z0-9_]", "_", request.node.name)[:60]
+    path = lang.LIB / "Unsafe" / f"{stem}.gob"
+    path.write_text(ERRNO.replace("Unsafe.Probe", f"Unsafe.{stem}"),
+                    encoding="utf-8")
+    try:
+        yield lang.program(f"import Unsafe.{stem} as Errno\n\n"
+                           "fun main() {\n    print(Errno.found())\n}\n")
+    finally:
+        path.unlink(missing_ok=True)
+
+
+def _native(entry: Path, target: str) -> str:
+    result = subprocess.run(
+        [str(bootc.binary()), "native", "--target", target, entry.name],
+        cwd=entry.parent, env=dict(os.environ, TURKEY_LIB=str(lang.LIB)),
+        capture_output=True)
+    assert result.returncode == 0, result.stderr.decode()
+    return result.stdout.decode()
+
+
+@pytest.mark.parametrize(("target", "kept", "dropped"), [
+    ("arm64-darwin", '"___error"', "__errno_location"),
+    ("arm64-linux", '"__errno_location"', '"__error"'),
+])
+def test_only_the_chosen_targets_foreign_symbol_is_emitted(
+        errno: Path, target: str, kept: str, dropped: str) -> None:
+    """The other target's arm is checked and then not compiled, so its
+    `foreign` symbol never reaches the output, and a link against this
+    target's libc does not look for it."""
+    text = _native(errno, target)
+    assert kept in text
+    assert dropped not in text
+
+
+def test_the_other_targets_symbol_does_not_reach_the_link(errno: Path) -> None:
+    assert lang.output(errno) == "True\n"
+
+
+@pytest.mark.skipif(shutil.which("clang") is None, reason="needs clang")
+def test_linux_output_assembles(tmp_path: Path) -> None:
+    """ELF's assembler syntax: no underscore before a C name, `:lo12:` and
+    `:got:` relocations, ELF section names. Assembling needs no sysroot, so
+    this runs on any machine with clang."""
+    assembly = tmp_path / "program.s"
+    assembly.write_text(_native(SOURCE, "arm64-linux"))
+    result = subprocess.run(
+        ["clang", "--target=aarch64-linux-gnu", "-c", str(assembly),
+         "-o", str(tmp_path / "program.o")], capture_output=True)
+    assert result.returncode == 0, result.stderr.decode()

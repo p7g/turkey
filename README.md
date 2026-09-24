@@ -124,9 +124,9 @@ hook does nothing. Where binfmt_misc cannot be written, set
 `TURKEY_RUN=qemu-aarch64` instead. pytest comes from apt here, because Ubuntu
 24.04 refuses a system-wide `pip install`.
 
-This runs only what the compiler emits for Linux, and Linux is not a target
-yet. The bootstrap is macOS assembly, and `scripts/build.sh` still refuses any
-host but arm64 macOS.
+This runs only what the compiler emits for Linux. `--target arm64-linux`
+emits it, but the compiler itself cannot be built there yet: the bootstrap is
+macOS assembly, and `scripts/build.sh` still refuses any host but arm64 macOS.
 
 ## Project status
 

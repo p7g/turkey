@@ -1,7 +1,9 @@
 module Turkey.Asm (
-    Asm(..), newAsm, symbolFor, runtimeFor, messageSymbol, literalSlot, globalSlot,
-    globalSymbol, rootsSymbol, literalName, messageName,
-    entrySymbol, globalsFrame, frameTableSymbol, initializerName,
+    Asm(..), Dialect(..), Section(..), dialectFor, newAsm, symbolFor, runtimeFor,
+    messageSymbol, literalSlot, globalSlot, globalSymbol, rootsSymbol,
+    literalName, messageName, entrySymbol, globalsFrame, frameTableSymbol,
+    initializerName, localLabel, page, pageOffset, gotPage, gotOffset, section,
+    functionType,
 )
 
 -- What the arm64 module owns: the names, and who gets a root slot.
@@ -27,6 +29,7 @@ import Turkey.Ssa as Ssa
 import Turkey.Ssa (Rep(..), Func(..))
 import Turkey.SsaLower as SsaLower
 import Turkey.SsaLower (Module(..))
+import Turkey.Target as Target
 
 type Asm = Asm {
     -- String literal -> its index. Interned per module, so `ConstString` is a
@@ -39,6 +42,91 @@ type Asm = Asm {
     -- How many slots that array has: the traced globals, then one cache per
     -- literal.
     roots    : Int,
+    dialect  : Dialect,
+}
+
+-- -- the dialect -----------------------------------------------------------------
+
+-- The assembler syntax of the target's object format. The instructions, the
+-- register allocation and the frame layout are the same on every arm64 target;
+-- what differs is how a symbol is named, how its address is split into a page
+-- and an offset, and what the sections are called. Every one of those is
+-- answered below, by a `match` on this, and nowhere else.
+type Dialect = MachO | Elf
+
+fun dialectFor(t : Target.Target) -> Dialect = match t.os {
+    "Linux" -> Elf
+    _ -> MachO
+}
+
+-- The data a module emits, by what it holds rather than by its name in either
+-- format.
+type Section =
+    -- Code.
+    Text
+    -- NUL-terminated C strings: the panic messages.
+    | CStrings
+    -- Read-only bytes: the string literals.
+    | Constants
+    -- Writable words: the globals and the root array.
+    | Data
+    -- Words the linker relocates and nothing writes afterwards: the frame
+    -- table, which holds return addresses.
+    | Relocated
+
+fun section(d : Dialect, s : Section) -> String = match (d, s) {
+    (_, Text) -> ".text"
+    (MachO, CStrings) -> ".section __TEXT,__cstring,cstring_literals"
+    (MachO, Constants) -> ".section __TEXT,__const"
+    (MachO, Data) -> ".section __DATA,__data"
+    (MachO, Relocated) -> ".section __DATA,__const"
+    -- Not a mergeable string section: a panic message is the program's own
+    -- text and may contain a zero byte, which would split it in two.
+    (Elf, CStrings) -> ".section .rodata"
+    (Elf, Constants) -> ".section .rodata"
+    (Elf, Data) -> ".data"
+    -- Writable while the dynamic linker relocates it, read-only afterwards. In
+    -- a position-independent executable an absolute address is written at
+    -- load time, which `.rodata` does not allow.
+    (Elf, Relocated) -> ".section .data.rel.ro,\"aw\""
+}
+
+-- A symbol the assembler keeps out of the object's symbol table.
+fun localLabel(d : Dialect, name : String) -> String = match d {
+    MachO -> "L" + name
+    Elf -> ".L" + name
+}
+
+-- The two halves of a symbol's address, `adrp`'s operand and then the `add`'s:
+-- the 4KB page, and the offset within it.
+fun page(d : Dialect, sym : String) -> String = match d {
+    MachO -> sym + "@PAGE"
+    Elf -> sym
+}
+
+fun pageOffset(d : Dialect, sym : String) -> String = match d {
+    MachO -> sym + "@PAGEOFF"
+    Elf -> ":lo12:" + sym
+}
+
+-- The same pair for a symbol reached through the global offset table: the page
+-- of its entry, and the entry's offset, which the `ldr` reads the address from.
+fun gotPage(d : Dialect, sym : String) -> String = match d {
+    MachO -> sym + "@GOTPAGE"
+    Elf -> ":got:" + sym
+}
+
+fun gotOffset(d : Dialect, sym : String) -> String = match d {
+    MachO -> sym + "@GOTPAGEOFF"
+    Elf -> ":got_lo12:" + sym
+}
+
+-- What marks a symbol as a function, if the format has such a thing. ELF's
+-- tools read it -- a debugger, a profiler, `objdump` -- and Mach-O has no
+-- equivalent.
+fun functionType(d : Dialect, sym : String) -> Option String = match d {
+    MachO -> None
+    Elf -> Some(".type " + sym + ", %function")
 }
 
 -- A Turkey name as an assembler symbol.
@@ -53,36 +141,45 @@ type Asm = Asm {
 -- The alternative is mangling, and it is worse for the reason it is always
 -- worse: a crash report or an `nm` then shows a name the compiler invented
 -- rather than the one the programmer wrote.
-fun symbolFor(name : String) -> String = "\"_" + name + "\""
+--
+-- Mach-O puts an underscore before every C-level name and ELF does not, so
+-- `turkey_print` in the C source is `_turkey_print` in a Mach-O object and
+-- `turkey_print` in an ELF one.
+fun symbolFor(d : Dialect, name : String) -> String =
+    "\"" + cPrefix(d) + name + "\""
+
+fun cPrefix(d : Dialect) -> String = match d {
+    MachO -> "_"
+    Elf -> ""
+}
 
 -- A runtime entry point. A C identifier needs no quoting, but gets it anyway:
 -- one rule for how a symbol is written beats two and a test for which applies.
--- The leading underscore is Mach-O's, and is the same underscore
--- `symbolFor` adds -- `turkey_print` in the C source is `_turkey_print` in the
--- object file.
-fun runtimeFor(name : String) -> String = symbolFor(name)
+fun runtimeFor(d : Dialect, name : String) -> String = symbolFor(d, name)
 
--- Compiler-private data. Named with the `L` prefix Mach-O treats as local, so
--- these never reach the symbol table.
-fun literalName(index : Int) -> String = "Lstr" + Int.toString(index)
-fun messageName(index : Int) -> String = "Lmsg" + Int.toString(index)
+-- Compiler-private data, named as local labels so these never reach the symbol
+-- table.
+fun literalName(d : Dialect, index : Int) -> String =
+    localLabel(d, "str" + Int.toString(index))
+fun messageName(d : Dialect, index : Int) -> String =
+    localLabel(d, "msg" + Int.toString(index))
 
 -- The permanent root array, which the collector scans for the whole run.
-let rootsSymbol = "_turkey_module_roots"
+fun rootsSymbol(d : Dialect) -> String = cPrefix(d) + "turkey_module_roots"
 
 -- The sequence that runs before the program's own: it interns the literals,
 -- computes the globals and calls `main`. Global, and named, because
--- `Turkey.Entry` reaches it by its C symbol, `turkey_entry` (TIX-67).
-let entrySymbol = runtimeFor("turkey_entry")
+-- `Turkey.Entry` reaches it by its C symbol, `turkey_entry`.
+fun entrySymbol(d : Dialect) -> String = runtimeFor(d, "turkey_entry")
 
 -- The `RootFrame` covering the root array. Forty bytes -- previous,
 -- function_name, count, values, live -- and it matches `runtime/turkey_runtime.c`
 -- by layout rather than by name, which is the same agreement the mask store
 -- at offset 32 rests on.
-let globalsFrame = "Lglobals"
+fun globalsFrame(d : Dialect) -> String = localLabel(d, "globals")
 
 -- Every safepoint's roots, keyed by return address.
-let frameTableSymbol = "_turkey_frame_table"
+fun frameTableSymbol(d : Dialect) -> String = cPrefix(d) + "turkey_frame_table"
 
 -- The function that computes every global, called once before `main`.
 -- `Turkey.SsaLower` names it and `Module.initial` carries it; spelled here as
@@ -93,7 +190,8 @@ let initializerName = "%module.initialize"
 -- An untraced global is ordinary storage and gets its own symbol; a traced one
 -- lives *in* the root array instead, so that storing to it and rooting it are
 -- the same store.
-fun globalSymbol(name : String) -> String = "\"_global." + name + "\""
+fun globalSymbol(d : Dialect, name : String) -> String =
+    symbolFor(d, "global." + name)
 
 fun globalSlot(a : Asm, name : String) -> Option Int = Map.get(a.globals, name)
 
@@ -102,7 +200,7 @@ fun messageSymbol(a : Asm, text : String) -> String {
     if !Map.contains(a.messages, text) {
         Map.put(a.messages, text, len(a.messages))
     }
-    messageName(Map.getOr(a.messages, text, 0))
+    messageName(a.dialect, Map.getOr(a.messages, text, 0))
 }
 
 -- The root slot holding this literal's `TurkeyString`.
@@ -124,7 +222,7 @@ fun literalSlot(a : Asm, text : String) -> Int =
 -- A scalar global holds nothing to trace and stays ordinary storage, which
 -- also keeps the array dense: its length is the number of things the collector
 -- must scan, not the number of globals.
-fun newAsm(m : Module) -> Asm {
+fun newAsm(m : Module, dialect : Dialect) -> Asm {
     let globals = Map.new()
     var roots = 0
     for (name, r) in m.globals {
@@ -146,5 +244,5 @@ fun newAsm(m : Module) -> Asm {
         }
     }
     Asm { literals = literals, messages = Map.new(), globals = globals,
-          roots = roots + len(literals) }
+          roots = roots + len(literals), dialect = dialect }
 }

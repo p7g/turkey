@@ -175,6 +175,7 @@ static int64_t collection_threshold = 1024;
 static int64_t collection_count;
 static int gc_stress = -1;
 static int gc_initialized;
+static int gc_verify = -1;
 
 /* Opt-in accounting, printed by `turkey_gc_report` and, one line per
    collection, by `turkey_collect` itself when TURKEY_GC_STATS is set. The
@@ -295,6 +296,7 @@ static void *heap_allocate(size_t size, uint32_t kind) {
     }
     if (gc_stress || allocations_since_collection >= collection_threshold)
         turkey_collect();
+    if (turkey_has_panicked) return NULL;
     if (size > SIZE_MAX - sizeof(HeapHeader)) {
         turkey_panic("allocation is too large"); return NULL;
     }
@@ -535,7 +537,262 @@ static void scan_native_frames(void) {
     }
 }
 
+/* Independent verification uses root inclusion and closure of the marked set:
+   if roots are marked and every edge out of a marked object is marked, every
+   reachable object is marked. It never mutates marks or calls the collector's
+   traversal/lookup helpers. Compiler-emitted layouts and roots are still
+   trusted descriptions: a root omitted by the compiler cannot be reconstructed.
+   The region list and stack chain must be readable; this diagnoses runtime
+   invariant violations, not arbitrary corruption of native address space. */
+typedef struct HeapCheck {
+    HeapRegion **regions;
+    size_t count;
+    int phase; /* 0 before marking, 1 before sweeping, 2 after sweeping */
+} HeapCheck;
+
+static int heap_check_fail(const char *reason, const void *owner, int64_t index) {
+    char message[240];
+    snprintf(message, sizeof(message), "heap verifier: %s (at %p, slot %" PRId64 ")",
+             reason, owner, index);
+    turkey_panic(message);
+    return 0;
+}
+
+static int heap_check_order(const void *a, const void *b) {
+    uintptr_t x = (uintptr_t)*(HeapRegion *const *)a;
+    uintptr_t y = (uintptr_t)*(HeapRegion *const *)b;
+    return (x > y) - (x < y);
+}
+
+static HeapRegion *heap_check_region(const HeapCheck *check, uintptr_t address) {
+    size_t low = 0, high = check->count;
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        if ((uintptr_t)check->regions[mid] <= address) low = mid + 1;
+        else high = mid;
+    }
+    return low == 0 ? NULL : check->regions[low - 1];
+}
+
+static int heap_check_pointer(const HeapCheck *check, void *value, int marked,
+                              const void *owner, int64_t index) {
+    if (value == NULL) return 1;
+    uintptr_t address = (uintptr_t)value;
+    HeapRegion *r = heap_check_region(check, address);
+    if (r == NULL || address < (uintptr_t)r->data + sizeof(HeapHeader))
+        return heap_check_fail("invalid traced pointer", owner, index);
+    size_t offset = address - (uintptr_t)r->data - sizeof(HeapHeader);
+    size_t slot = offset / r->slot_size;
+    if (offset % r->slot_size || slot >= r->capacity ||
+        !(r->allocated[slot / 64] & (UINT64_C(1) << (slot % 64))))
+        return heap_check_fail("invalid traced pointer", owner, index);
+    HeapHeader *h = (HeapHeader *)(r->data + slot * r->slot_size);
+    if (marked && h->marked != mark_epoch)
+        return heap_check_fail("reachable object is unmarked", owner, index);
+    return 1;
+}
+
+static int heap_check_object(const HeapCheck *check, HeapHeader *h) {
+    void *value = h + 1;
+    int marked = check->phase != 0 && h->marked == mark_epoch;
+    if (h->kind == HEAP_CELL) {
+        if (h->size != sizeof(TurkeyCell))
+            return heap_check_fail("invalid cell size", value, -1);
+        TurkeyCell *cell = value;
+        /* Any nonzero flag denotes a pointer, as in the allocator ABI. */
+        return !cell->pointer_value || heap_check_pointer(check,
+            (void *)(uintptr_t)cell->value, marked, value, 0);
+    }
+    if (h->kind != HEAP_OBJECT || h->size < sizeof(TurkeyObject))
+        return heap_check_fail("invalid heap header", value, -1);
+    TurkeyObject *o = value;
+    if (o->kind < 0 || o->kind > 5 || o->count < 0)
+        return heap_check_fail("invalid object header", value, -1);
+    size_t width = 8;
+    if (o->kind == 2) {
+        width = o->pointer_bitmap;
+        if ((width != 1 && width != 4 && width != 8) ||
+            o->tag < 0 || o->tag > 7 || (o->tag == 7 && width != 8))
+            return heap_check_fail("invalid array layout", value, -1);
+    } else if (o->count > ((o->kind <= 1) ? 21 : 63)) {
+        return heap_check_fail("invalid object count", value, -1);
+    }
+    if ((uint64_t)o->count > (h->size - sizeof(*o)) / width ||
+        sizeof(*o) + (size_t)o->count * width != h->size)
+        return heap_check_fail("payload size disagrees with header", value, -1);
+    if (o->kind == 2 && o->tag != 7) return 1;
+    for (int64_t i = 0; i < o->count; i++) {
+        int traced = o->kind == 2 ? o->tag == 7 : o->kind <= 1
+            ? ((o->pointer_bitmap >> (i * 3)) & 7) == 7
+            : ((o->pointer_bitmap >> i) & 1) != 0;
+        if (traced && !heap_check_pointer(check, (void *)(uintptr_t)o->slots[i],
+                                          marked, value, i)) return 0;
+    }
+    return 1;
+}
+
+static int heap_check_native(const HeapCheck *check, uintptr_t current, uintptr_t high) {
+    if (frame_entry_count == 0) return 1;
+    if (frame_entry_count < 0 || frame_entries == NULL)
+        return heap_check_fail("invalid native frame table", frame_entries, -1);
+    if (high == 0) return heap_check_fail("missing native stack bound", NULL, -1);
+    for (int64_t i = 0; i < frame_entry_count; i++) {
+        if (frame_entries[i].count < 0 ||
+            (frame_entries[i].count && frame_entries[i].offsets == NULL) ||
+            (i && frame_entries[i-1].retaddr >= frame_entries[i].retaddr))
+            return heap_check_fail("invalid native frame table", frame_entries, i);
+    }
+    while (current <= high && high - current >= 16 && !(current & 15)) {
+        const uintptr_t *record = (const uintptr_t *)current;
+        uintptr_t caller = record[0];
+        if (caller <= current || caller > high || high - caller < 16 || (caller & 15)) break;
+        size_t low = 0, end = (size_t)frame_entry_count;
+        while (low < end) {
+            size_t mid = low + (end - low) / 2;
+            if (frame_entries[mid].retaddr < record[1]) low = mid + 1;
+            else end = mid;
+        }
+        if (low < (size_t)frame_entry_count && frame_entries[low].retaddr == record[1]) {
+            const FrameEntry *entry = &frame_entries[low];
+            for (int64_t i = 0; i < entry->count; i++) {
+                int64_t offset = entry->offsets[i];
+                /* Unsigned addition avoids overflow on malformed offsets;
+                   the range check rejects wraparound before dereferencing. */
+                uintptr_t slot = caller + (uint64_t)offset;
+                if ((slot & 7) || slot < current + 16 || slot > high - 8)
+                    return heap_check_fail("invalid native root offset", entry, i);
+                if (!heap_check_pointer(check, *(void **)slot, check->phase != 0,
+                                        (void *)caller, i)) return 0;
+            }
+        }
+        current = caller;
+    }
+    return 1;
+}
+
+static int heap_check_roots(const HeapCheck *check) {
+    RootFrame *slow = roots, *fast = roots;
+    while (fast != NULL && fast->previous != NULL) {
+        slow = slow->previous;
+        fast = fast->previous->previous;
+        if (slow == fast) return heap_check_fail("cyclic root chain", slow, -1);
+    }
+    for (RootFrame *f = roots; f != NULL; f = f->previous) {
+        if (f->count < 0 || f->values == NULL)
+            return heap_check_fail("invalid root frame", f, -1);
+        for (int64_t i = 0; i < f->count; i++)
+            if ((i >= 64 || (((uint64_t)f->live >> i) & 1)) &&
+                !heap_check_pointer(check, f->values[i], check->phase != 0, f, i))
+                return 0;
+    }
+    return heap_check_native(check, (uintptr_t)__builtin_frame_address(0),
+                             (uintptr_t)entry_stack_high);
+}
+
+static int heap_check_contents(HeapCheck *check) {
+    size_t bytes = 0;
+    uint64_t objects = 0;
+    /* Validate every region before using it for membership queries. */
+    for (size_t n = 0; n < check->count; n++) {
+        HeapRegion *r = check->regions[n];
+        if (((uintptr_t)r % REGION_BYTES) || r->reserved < REGION_BYTES ||
+            r->reserved % REGION_BYTES || r->slot_size < sizeof(HeapHeader) ||
+            !r->capacity || r->capacity > REGION_WORDS * 64 ||
+            r->capacity > (r->reserved - sizeof(*r)) / r->slot_size ||
+            r->used > r->capacity || r->size_class > REGION_CLASSES ||
+            r->search_word >= REGION_WORDS)
+            return heap_check_fail("invalid region geometry", r, -1);
+        size_t class_slot = r->size_class < 15 ? 32 + 16 * r->size_class
+            : (size_t)256 << (r->size_class - 14);
+        if (r->size_class < REGION_CLASSES
+                ? (r->reserved != REGION_BYTES || r->slot_size != class_slot ||
+                   r->capacity != (REGION_BYTES - sizeof(*r)) / class_slot)
+                : r->capacity != 1)
+            return heap_check_fail("invalid region size class", r, -1);
+        for (unsigned word = 0; word < r->search_word; word++)
+            if (r->allocated[word] != UINT64_MAX)
+                return heap_check_fail("allocation search skips free slots", r, word);
+        if (n && (uintptr_t)r - (uintptr_t)check->regions[n-1] < check->regions[n-1]->reserved)
+            return heap_check_fail("overlapping regions", r, -1);
+        if (bytes > SIZE_MAX - r->reserved)
+            return heap_check_fail("region byte count overflow", r, -1);
+        bytes += r->reserved;
+        uint32_t used = 0, live = 0;
+        for (unsigned i = 0; i < REGION_WORDS * 64; i++) {
+            uint64_t bit = UINT64_C(1) << (i % 64);
+            int allocated = (r->allocated[i / 64] & bit) != 0;
+            int marked = (r->marked_slots[i / 64] & bit) != 0;
+            if ((i >= r->capacity && allocated) || (marked && !allocated))
+                return heap_check_fail("marked/free slot or bitmap outside region", r, i);
+            if (check->phase != 1 && marked)
+                return heap_check_fail("uncleared region marks", r, i);
+            used += allocated;
+            live += marked;
+            if (!allocated) continue;
+            HeapHeader *h = (HeapHeader *)(r->data + i * r->slot_size);
+            if (h->size > r->slot_size - sizeof(*h))
+                return heap_check_fail("object exceeds allocation slot", h, i);
+            if (check->phase == 1 && marked != (h->marked == mark_epoch))
+                return heap_check_fail("header and region marks disagree", h, i);
+            if (check->phase == 2 && h->marked != mark_epoch)
+                return heap_check_fail("unmarked sweep survivor", h, i);
+        }
+        if (used != r->used || live != r->live)
+            return heap_check_fail("region counts disagree", r, -1);
+        objects += used;
+    }
+    if (heap_count < 0 || objects != (uint64_t)heap_count || bytes != region_bytes)
+        return heap_check_fail("heap totals disagree", NULL, -1);
+    /* Availability is a list of regions with holes, not a list of objects.
+       A full region's stale available_next is deliberately ignored. */
+    size_t expected[REGION_CLASSES] = {0}, actual[REGION_CLASSES] = {0};
+    for (size_t n = 0; n < check->count; n++) {
+        HeapRegion *r = check->regions[n];
+        if (r->size_class < REGION_CLASSES && r->used < r->capacity)
+            expected[r->size_class]++;
+        for (unsigned i = 0; i < r->capacity; i++)
+            if ((r->allocated[i / 64] >> (i % 64)) & 1)
+                if (!heap_check_object(check, (HeapHeader *)(r->data + i * r->slot_size))) return 0;
+    }
+    for (unsigned cls = 0; cls < REGION_CLASSES; cls++) {
+        for (HeapRegion *r = available[cls]; r != NULL; r = r->available_next) {
+            if (++actual[cls] > check->count ||
+                heap_check_region(check, (uintptr_t)r) != r ||
+                r->size_class != cls || r->used >= r->capacity)
+                return heap_check_fail("invalid available-region list", r, cls);
+        }
+        if (actual[cls] != expected[cls])
+            return heap_check_fail("missing available region", NULL, cls);
+    }
+    return heap_check_roots(check);
+}
+
+static int heap_verify(int phase) {
+    HeapCheck check = {NULL, 0, phase};
+    HeapRegion *slow = regions, *fast = regions;
+    while (fast != NULL && fast->next != NULL) {
+        slow = slow->next;
+        fast = fast->next->next;
+        if (slow == fast) return heap_check_fail("cyclic region chain", slow, -1);
+    }
+    for (HeapRegion *r = regions; r != NULL; r = r->next) check.count++;
+    if (check.count) {
+        if (check.count > SIZE_MAX / sizeof(*check.regions))
+            return heap_check_fail("region index too large", NULL, -1);
+        check.regions = malloc(check.count * sizeof(*check.regions));
+        if (check.regions == NULL) return heap_check_fail("out of memory", NULL, -1);
+        size_t i = 0;
+        for (HeapRegion *r = regions; r != NULL; r = r->next) check.regions[i++] = r;
+        qsort(check.regions, check.count, sizeof(*check.regions), heap_check_order);
+    }
+    int result = heap_check_contents(&check);
+    free(check.regions);
+    return result;
+}
+
 void turkey_collect(void) {
+    if (gc_verify < 0) gc_verify = getenv("TURKEY_GC_VERIFY") != NULL;
+    if (gc_verify && !heap_verify(0)) return;
     struct timespec stats_start, stats_end;
     int64_t stats_live_before = heap_count;
     /* Read before the sweep clears it: this is the allocation pressure the
@@ -572,6 +829,7 @@ void turkey_collect(void) {
     /* Beside the chain, not instead of it: the arm64 backend's frames are
        here and everything else's are above. */
     scan_native_frames();
+    if (turkey_has_panicked || (gc_verify && !heap_verify(1))) return;
     /* Empty regions cost one free, regardless of their allocation count.
        Survivors rebuild availability by copying a fixed-size bitmap and
        using epoch marks. No walk over individual object headers. */
@@ -600,6 +858,7 @@ void turkey_collect(void) {
         }
         link = &region->next;
     }
+    if (gc_verify && !heap_verify(2)) return;
     allocations_since_collection = 0;
     double next_threshold = (double)(heap_count > 1024 ? heap_count : 1024)
         * threshold_scale;

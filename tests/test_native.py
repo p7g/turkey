@@ -131,7 +131,7 @@ def test_the_corpus_agrees_under_gc_stress(name):
     if toolchain.missing():
         pytest.skip("no C compiler")
     result = subprocess.run(toolchain.command(_binary(name)), cwd=PROGRAMS,
-                            env=dict(os.environ, TURKEY_GC_STRESS="1"),
+                            env=dict(os.environ, TURKEY_GC_STRESS="1", TURKEY_GC_VERIFY="1"),
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stderr[:2000]
     assert result.stdout == _reference(name)
@@ -224,7 +224,7 @@ def test_pointer_array_initialization_does_not_allocate_boxes():
     result = subprocess.run(toolchain.command(_binary("shared_nullaries.gob")),
                             cwd=PROGRAMS,
                             env=dict(os.environ, TURKEY_GC_STATS="1",
-                                     TURKEY_GC_STRESS="1"),
+                                     TURKEY_GC_STRESS="1", TURKEY_GC_VERIFY="1"),
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert result.stdout == _reference("shared_nullaries.gob")

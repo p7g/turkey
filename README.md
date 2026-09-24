@@ -183,3 +183,14 @@ The tests are Python. Install their dependencies with
 The tests compile their programs with `boot`, which is built from the
 committed bootstrap on first use; `TURKEY_BOOT` points them at one you built
 yourself instead.
+
+To check the heap while debugging a compiled program, run it with
+`TURKEY_GC_VERIFY=1`. Each collection independently checks object bounds,
+traced references, shadow-stack and native roots, marking completeness, and
+region bookkeeping before and after sweeping. Failures report
+`heap verifier:` and stop the collection before proceeding to its next phase.
+Combine it with `TURKEY_GC_STRESS=1` to collect and verify at every allocation.
+Verification scans the allocated heap and uses temporary native memory for a
+region index; it is disabled by default. It checks the roots and layouts the
+compiler supplies, so behavioral stress tests are still needed to catch
+references omitted from those descriptions.

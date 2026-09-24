@@ -116,7 +116,7 @@ def test_the_corpus_agrees_under_gc_stress(name):
     expensive membership test under stress, so a missed root becomes a panic on
     the first collection rather than a corruption later.
     """
-    env = dict(os.environ, TURKEY_GC_STRESS="1")
+    env = dict(os.environ, TURKEY_GC_STRESS="1", TURKEY_GC_VERIFY="1")
     # From the program's own directory, as `test_programs` runs it: a program
     # may read a file by its bare name (`system.gob`).
     result = subprocess.run(toolchain.command(_binary(name)), cwd=PROGRAMS,

@@ -236,7 +236,7 @@ fun abstracted(l : Lowerer, ty : Ty.Type, dicts : Option Abstraction) -> Ty.Type
     match dicts {
         None -> ty
         Some(a) -> if len(a.params) == 0 { ty } else {
-            TFun(Array.map(a.preds, fun(p) = predType(l, p)), ty)
+            TFun(Array.map(a.preds, predType(l, _)), ty)
         }
     }
 
@@ -324,7 +324,7 @@ fun instanceBind(l : Lowerer, inst : InstInfo) -> CBind {
                 name = plan.params[i], ty = dictType(l, p.name, p.args[0]),
             })
         }
-        value = node(TFun(Array.map(params, fun(p) = p.ty), result),
+        value = node(TFun(Array.map(params, _.ty), result),
                      Some(inst.decl.span),
                      CLam(params, record, instName(inst)))
     }
@@ -424,7 +424,7 @@ fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
                 name = plan.params[i], ty = dictType(l, pr.name, pr.args[0]),
             })
         }
-        value = node(TFun(Array.map(params, fun(pm) = pm.ty), result), span,
+        value = node(TFun(Array.map(params, _.ty), result), span,
                      CLam(params, record, instName(inst)))
     }
     let b = newBind(instName(inst), value.ty, instanceBinders(inst), value, span)
@@ -487,7 +487,7 @@ fun selfDict(l : Lowerer, inst : InstInfo, params : Array String) -> Core {
     let binders = instanceBinders(inst)
     if len(binders) > 0 {
         fn = node(unknown(), Some(inst.decl.span),
-                  CTyApp(fn, Array.map(binders, fun(b) = TVar(b))))
+                  CTyApp(fn, Array.map(binders, TVar)))
     }
     if len(inst.context) == 0 {
         fn.ty = result
@@ -498,7 +498,7 @@ fun selfDict(l : Lowerer, inst : InstInfo, params : Array String) -> Core {
         Array.push(args, node(predType(l, inst.context[i]), Some(inst.decl.span),
                               CVar(params[i])))
     }
-    fn.ty = TFun(Array.map(args, fun(a) = a.ty), result)
+    fn.ty = TFun(Array.map(args, _.ty), result)
     node(result, Some(inst.decl.span), CApp(fn, args))
 }
 
@@ -624,7 +624,7 @@ fun carried(l : Lowerer, e : Expr) -> Array Core = match Map.get(l.types.uses, e
 -- The constructor as Core applies it: dictionaries, then fields.
 fun packing(dicts : Array Core, fnTy : Ty.Type, name : String,
             where : Option Span) -> Core {
-    let dictTypes = Array.map(dicts, fun(d) = d.ty)
+    let dictTypes = Array.map(dicts, _.ty)
     match Ty.prune(fnTy) {
         TFun(params, ret) ->
             node(TFun(Array.append(dictTypes, params), ret), where, CCon(name))
@@ -675,7 +675,7 @@ fun existentialRecord(l : Lowerer, e : Expr, info : ConInfo, con : String,
         }
         Array.push(ordered, node(v.ty, where, CVar(Map.getOr(held, n, n))))
     }
-    let fnTy = TFun(Array.map(ordered, fun(o) = o.ty), ty)
+    let fnTy = TFun(Array.map(ordered, _.ty), ty)
     var out = node(ty, where, CApp(packing(dicts, fnTy, con, where),
                                    Array.append(dicts, ordered)))
     for var i = len(fields) - 1; i >= 0; i = i - 1 {
@@ -825,7 +825,7 @@ fun instanceRef(l : Lowerer, inst : InstInfo, want : Ty.Type,
         Array.push(argTerms, evidence(l, args[i],
             dictType(l, p.name, resolved(l, at)), Map.new()))
     }
-    fn.ty = TFun(Array.map(argTerms, fun(a) = a.ty), result)
+    fn.ty = TFun(Array.map(argTerms, _.ty), result)
     node(result, None, CApp(fn, argTerms))
 }
 
@@ -951,7 +951,7 @@ fun wrapDicts(l : Lowerer, inner : Core, params : Option (Array String),
             name = ns[i], ty = dictType(l, ps[i].name, ps[i].args[0]),
         })
     }
-    node(TFun(Array.map(cparams, fun(p) = p.ty), inner.ty), where,
+    node(TFun(Array.map(cparams, _.ty), inner.ty), where,
          CLam(cparams, inner, "<anonymous>"))
 }
 
@@ -1119,9 +1119,9 @@ fun unskolem(t : Ty.Type, rigid : Map String VarCell) -> Ty.Type =
         }
         TApp(fn, arg, k) -> TApp(unskolem(fn, rigid), unskolem(arg, rigid), k)
         TFam(name, arg, k) -> TFam(name, unskolem(arg, rigid), k)
-        TFun(params, ret) -> TFun(Array.map(params, fun(p) = unskolem(p, rigid)),
+        TFun(params, ret) -> TFun(Array.map(params, unskolem(_, rigid)),
                                   unskolem(ret, rigid))
-        TTuple(elems) -> TTuple(Array.map(elems, fun(x) = unskolem(x, rigid)))
+        TTuple(elems) -> TTuple(Array.map(elems, unskolem(_, rigid)))
         _ -> Ty.prune(t)
     }
 
@@ -1136,7 +1136,7 @@ fun dispatch(l : Lowerer, e : Expr, scope : Scope) -> Core {
         ECon(name) -> conValue(l, e, name, ty, where)
         EVar(_, _) -> var_(l, e, scope)
         ETuple(elems) -> node(ty, where,
-            CTuple(Array.map(elems, fun(x) = expr(l, x, scope))))
+            CTuple(Array.map(elems, expr(l, _, scope))))
         EArray(elems) -> arrayLiteral(l, e, ty, elems, scope)
         ERecord(con, fields) -> {
             match Decls.con(l.decls, con) {
@@ -1158,7 +1158,7 @@ fun dispatch(l : Lowerer, e : Expr, scope : Scope) -> Core {
         ELambda(params, _, body) ->
             lambdaOf(l, params, body, ty, where, scope, "<anonymous>")
         ECall(fn, args) -> {
-            let supplied = Array.map(args, fun(a) = expr(l, a, scope))
+            let supplied = Array.map(args, expr(l, _, scope))
             var callee = fn
             loop {
                 match callee.kind {
@@ -1210,7 +1210,7 @@ fun dispatch(l : Lowerer, e : Expr, scope : Scope) -> Core {
             for arm in arms {
                 for pat in arm.patterns {
                     Array.push(alts, CAlt { pat = pat, body = celled(l, pat,
-                        arm.body, fun(s) = expr(l, arm.body, s),
+                        arm.body, expr(l, arm.body, _),
                         childScope(scope), Some(arm.span)) })
                 }
             }
@@ -1227,7 +1227,7 @@ fun arrayLiteral(l : Lowerer, e : Expr, public : Ty.Type, elems : Array Expr,
     let (_, args) = Ty.spine(public)
     let element = if len(args) == 1 { args[0] } else { TBottom }
     let raw = node(Ty.rawArrayOf(element), where,
-        CArray(Array.map(elems, fun(x) = expr(l, x, scope))))
+        CArray(Array.map(elems, expr(l, _, scope))))
     let length = node(Ty.tInt(), where, CLit(LInt(len(elems))))
     let storageTy = Ty.applyTo(Decls.head(l.decls, "Data.Array#ArrayStorage"),
                                [element], where)
@@ -1291,7 +1291,7 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
             -- application here, at the binding's own variables.
             return node(result, where, CTyApp(
                 node(unknown(), where, CVar(name)),
-                Array.map(binders, fun(b) = TVar(b))))
+                Array.map(binders, TVar)))
         }
         return node(result, where, CVar(name))
     }
@@ -1305,7 +1305,7 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
         Array.push(dicts, evidence(l, use.evidence[i],
                                    predType(l, use.preds[i]), givens))
     }
-    var typeArgs = Array.map(use.typeArgs, fun(a) = resolved(l, a))
+    var typeArgs = Array.map(use.typeArgs, resolved(l, _))
     var base = node(unknown(), where, CVar(name))
     match use.method {
         Some(mi) -> {
@@ -1328,11 +1328,11 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
             -- recorded, and the application is at the group's own variables. It
             -- does carry dictionaries -- the solver patched those in -- which is
             -- why the test cannot be "no evidence either".
-            typeArgs = Array.map(bindersOf(l, name, scope), fun(b) = TVar(b))
+            typeArgs = Array.map(bindersOf(l, name, scope), TVar)
         }
     }
     let afterTypes = if len(dicts) > 0 {
-        TFun(Array.map(dicts, fun(d) = d.ty), result)
+        TFun(Array.map(dicts, _.ty), result)
     } else { result }
     if len(typeArgs) > 0 {
         base.ty = unknown()
@@ -1476,7 +1476,7 @@ fun convMatch(l : Lowerer, e : Expr, scrutinee : Expr, arms : Array Arm,
         for arm in arms {
             for pat in arm.patterns {
                 Array.push(alts, CAlt { pat = pat, body = celled(l, pat,
-                    arm.body, fun(inner) = conv(l, arm.body, inner, k),
+                    arm.body, conv(l, arm.body, _, k),
                     childScope(scope), Some(arm.span)) })
             }
         }

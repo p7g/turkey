@@ -256,6 +256,11 @@ type Reducer = Reducer {
     -- `g` calls `h` re-reduces `h` once per path that reaches it, which is
     -- exponential in the depth of the call graph.
     reduced : Map String Core,
+    -- The immutable top-level bindings whose reduced value is `atomic`, which a
+    -- mention is replaced by. Filled as `reduceProgram` finishes each binding,
+    -- and an atom mentions no other binding, so it is finished before anything
+    -- that reads it is reduced.
+    constants : Map String CBind,
     -- For the join points case-of-case invents. Per program and in traversal
     -- order, so it is deterministic and a golden can hold it.
     counter : Int,
@@ -283,7 +288,8 @@ fun newReducer(program : CProgram) -> Reducer {
         breakers = loopBreakers(program), bindings = bindings,
         active = Array.new(8), sizes = Map.new(), moves = Map.new(),
         ends = Map.new(), wrote = Map.new(),
-        speculating = False, reduced = Map.new(), counter = 0,
+        speculating = False, reduced = Map.new(), constants = Map.new(),
+        counter = 0,
         usedNames = used,
     }
 }
@@ -319,6 +325,10 @@ fun reduceProgram(program : CProgram) -> CProgram {
                     let value = expr(r, binds[index].value)
                     Map.put(done, index, value)
                     memoize(r, name, value)
+                    if !binds[index].mutable && atomic(value) {
+                        Map.put(r.constants, name,
+                                withValue(binds[index], value))
+                    }
                 }
                 None -> {}
             }
@@ -398,6 +408,8 @@ fun children(r : Reducer, e : Core) -> Core =
 -- that came from here.
 fun step(r : Reducer, e : Core) -> Option Core {
     match e.kind {
+        CVar(_) -> return constant(r, e)
+        CTyApp(_, _) -> return constant(r, e)
         CApp(fn, _) -> return match fn.kind {
             CLam(_, _, _) -> beta(r, e)
             CField(_, _) -> knownLambda(e)
@@ -460,6 +472,35 @@ fun fresh(r : Reducer, hint : String) -> String {
 }
 
 -- -- the reductions --------------------------------------------------------------------
+
+-- A mention of an atomic top-level binding, replaced by its value.
+--
+-- A top-level binding is evaluated before `main`, but an atom does no work and
+-- has one value, so reading the binding and writing the atom in its place are
+-- indistinguishable. The replacement takes the mention's type rather than the
+-- binding's: for a generic binding that is the instantiation, including one
+-- the specialization cap left mentioning an enclosing type variable, which a
+-- polymorphically recursive function does. An atom holds no type of its own
+-- to substitute, so the node's type is the whole of the instantiation.
+--
+-- A generic binding is replaced only under its type application, since a
+-- bare mention of one is the function position of that application.
+fun constant(r : Reducer, e : Core) -> Option Core {
+    let name = match stripTyApp(e).kind {
+        CVar(n) -> n
+        _ -> return None
+    }
+    let applied = match e.kind {
+        CTyApp(_, _) -> True
+        _ -> False
+    }
+    match Map.get(r.constants, name) {
+        Some(b) -> if applied == (len(b.binders) > 0) {
+            Some(mkCore(e.ty, e.span, b.value.kind))
+        } else { None }
+        None -> None
+    }
+}
 
 -- A call under a `match`, inlined on the larger budget.
 --
@@ -1402,6 +1443,21 @@ fun isValue(e : Core) -> Bool = match e.kind {
         }
         _ -> False
     }
+    _ -> False
+}
+
+-- Whether `e` can stand for a top-level binding at every mention of it.
+--
+-- A literal, `()`, or a constructor not applied to anything. Each is a value
+-- that evaluates to the same thing everywhere and allocates nothing: a string
+-- literal is static data. Not a constructor *application*, even of atoms:
+-- `Some(1)` allocates at each mention where the binding allocated once, and
+-- without constants in static data that is a cost, not a saving. Not a record
+-- or an array, which are mutable, so that two copies are two objects.
+fun atomic(e : Core) -> Bool = match e.kind {
+    CLit(_) -> True
+    CUnit -> True
+    CCon(_) -> True
     _ -> False
 }
 

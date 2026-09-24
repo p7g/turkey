@@ -621,8 +621,10 @@ body ::= "=" expression | block
 The string names the C symbol. Without a body, the declaration calls a C
 function and is allowed only in an `Unsafe.` module from the shipped library.
 With a body, it defines a C-callable Turkey function and is allowed only in a
-compiler-designated *giblet* module from that library. Giblet code cannot hold
-values that the collector traces, so a C caller needs no collector setup.
+compiler-designated *giblet* module from that library. Giblet code does not
+allocate or hold a traced value across a call, so a C caller needs no
+collector setup. The compiler checks this on the optimized code, including
+everything a giblet calls, and refuses a giblet that could do either.
 Ordinary application modules cannot declare or define foreign functions.
 
 Every parameter and the result must state its type. A definition also needs

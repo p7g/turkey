@@ -9,13 +9,12 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from tests import bootc
+from tests import bootc, toolchain
 from tests.test_giblets import HOOK, LIB, REPO_ROOT, verdict
 
 _SAFE = re.compile(r"[^A-Za-z0-9_]")
@@ -116,13 +115,15 @@ def test_a_definition_nothing_calls_is_exported_under_its_symbol(probe):
     backend's output having the symbol is the whole claim."""
     assert probe('foreign "probe_f" fun f(x : Int) -> Int = x + 1\n') == ""
     env = dict(os.environ, **{HOOK: probe.name})
-    boot = subprocess.run([str(bootc.binary()), "llvm", str(probe.entry)],
-                          cwd=REPO_ROOT, env=env, capture_output=True,
-                          text=True, check=True).stdout
+    boot = subprocess.run(
+        toolchain.command(bootc.binary(), "llvm", str(probe.entry)),
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True,
+        check=True).stdout
     assert 'define i64 @"probe_f"(i64 %a1)' in boot
-    native = subprocess.run([str(bootc.binary()), "native", str(probe.entry)],
-                            cwd=REPO_ROOT, env=env, capture_output=True,
-                            text=True, check=True).stdout
+    native = subprocess.run(
+        toolchain.command(bootc.binary(), "native", str(probe.entry)),
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True,
+        check=True).stdout
     assert '.globl "_probe_f"' in native
 
 
@@ -145,7 +146,7 @@ __attribute__((constructor)) static void before(void) {
 """
 
 
-@pytest.mark.skipif(shutil.which("cc") is None, reason="no C compiler")
+@pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
 @pytest.mark.parametrize("backend", ["native", "llvm"])
 def test_c_calls_a_definition_through_a_pointer(probe, tmp_path, backend):
     """The calling convention, which only running it can check: general and
@@ -157,19 +158,24 @@ def test_c_calls_a_definition_through_a_pointer(probe, tmp_path, backend):
         "    Prim.floatTruncate(Prim.intToFloat(a) * x) + b\n"
         'foreign "probe_note" fun note(n : Int) -> Unit { }\n') == ""
     env = dict(os.environ, **{HOOK: probe.name})
-    text = subprocess.run([str(bootc.binary()), backend, str(probe.entry)],
-                          cwd=REPO_ROOT, env=env, capture_output=True,
-                          text=True, check=True).stdout
+    text = subprocess.run(
+        toolchain.command(bootc.binary(), backend, str(probe.entry)),
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True,
+        check=True).stdout
     source = tmp_path / ("program.s" if backend == "native" else "program.ll")
     source.write_text(text, encoding="utf-8")
     caller = tmp_path / "caller.c"
     caller.write_text(CALLER, encoding="utf-8")
     runtime = tmp_path / "runtime.o"
-    subprocess.run(["cc", "-std=c11", "-O1", "-c", "-o", str(runtime),
-                    str(REPO_ROOT / "runtime" / "turkey_runtime.c")], check=True)
+    subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-c", "-o",
+                    str(runtime),
+                    str(REPO_ROOT / "runtime" / "turkey_runtime.c")],
+                   check=True)
     binary = tmp_path / "program"
-    subprocess.run(["cc", "-O1", "-Wno-override-module", "-o", str(binary),
-                    str(source), str(runtime), str(caller)], check=True)
-    result = subprocess.run([str(binary)], capture_output=True, text=True)
+    subprocess.run([*toolchain.cc(), "-O1", "-Wno-override-module", "-o",
+                    str(binary), str(source), str(runtime), str(caller)],
+                   check=True)
+    result = subprocess.run(toolchain.command(binary), capture_output=True,
+                            text=True)
     assert result.returncode == 0, result.stderr
     assert "scale=11" in result.stderr

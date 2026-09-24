@@ -45,6 +45,8 @@ import tempfile
 from collections.abc import Callable
 from pathlib import Path
 
+from tests import toolchain
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BOOT_MAIN = REPO_ROOT / "src" / "Main.gob"
 
@@ -79,6 +81,8 @@ def _fingerprint(root: Path = REPO_ROOT) -> str:
                 continue
             h.update(str(path.relative_to(root)).encode())
             h.update(path.read_bytes())
+    # `build.sh` links `boot` with `$TURKEY_CC`.
+    h.update(toolchain.identity())
     return h.hexdigest()[:16]
 
 
@@ -169,7 +173,7 @@ def boot_with_stderr(*args: str) -> tuple[str, str]:
     for six minutes a run (FINDINGS 93).
     """
     result = subprocess.run(
-        [str(binary()), *args],
+        toolchain.command(binary(), *args),
         cwd=REPO_ROOT,
         capture_output=True,
     )
@@ -195,6 +199,8 @@ def build_key() -> str:
     if not os.environ.get(BOOT_OVERRIDE):
         return _fingerprint()
     h = hashlib.sha256(binary().read_bytes())
+    # Every output of `lang` is linked with `$TURKEY_CC`.
+    h.update(toolchain.identity())
     for directory, pattern in (("lib", "*.gob"), ("runtime", "*.c"),
                                ("runtime", "*.h")):
         for path in sorted((REPO_ROOT / directory).rglob(pattern)):
@@ -234,13 +240,14 @@ def runtime_object() -> Path:
     Every test binary used to compile the runtime from source beside its module
     -- the largest C file here, forty-odd times per worker.
     """
-    key = digest(RUNTIME.read_bytes(), RUNTIME_HEADER.read_bytes())
+    key = digest(RUNTIME.read_bytes(), RUNTIME_HEADER.read_bytes(),
+                 toolchain.identity())
     output = CACHE / f"runtime-{key}.o"
     if not output.exists():
         CACHE.mkdir(parents=True, exist_ok=True)
         staging = CACHE / f"runtime-{key}.{os.getpid()}.o"
-        replace_built(["cc", "-std=c11", "-O1", "-c", "-o", str(staging),
-                       str(RUNTIME)], output)
+        replace_built([*toolchain.cc(), "-std=c11", "-O1", "-c",
+                       "-o", str(staging), str(RUNTIME)], output)
     return output
 
 

@@ -18,14 +18,13 @@ from __future__ import annotations
 
 import functools
 import re
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 import pytest
 
-from tests import bootc
+from tests import bootc, toolchain
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROGRAMS = REPO_ROOT / "tests" / "programs"
@@ -59,7 +58,7 @@ def _assembles(text: str) -> subprocess.CompletedProcess:
         source = Path(directory) / "t.s"
         source.write_text(text, encoding="utf-8")
         return subprocess.run(
-            ["as", "-arch", "arm64", "-o", str(Path(directory) / "t.o"),
+            [*toolchain.cc(), "-c", "-o", str(Path(directory) / "t.o"),
              str(source)],
             capture_output=True, text=True)
 
@@ -87,7 +86,7 @@ def _functions(text: str) -> dict[str, list[str]]:
     return out
 
 
-@pytest.mark.skipif(shutil.which("as") is None, reason="no assembler")
+@pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
 @pytest.mark.parametrize("name", CORPUS)
 def test_the_whole_program_assembles(name):
     result = _assembles(_native(name))
@@ -183,7 +182,7 @@ def test_a_call_is_followed_by_the_panic_check():
         pytest.fail("no ordinary call in the program")
 
 
-@pytest.mark.skipif(shutil.which("as") is None, reason="no assembler")
+@pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
 def test_the_compilers_own_source_assembles():
     """The scale test: 3,073 functions, 16 KB frames, 45,097 safepoints.
 

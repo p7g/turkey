@@ -7,13 +7,12 @@ so panic reports contain the message alone; crashes also expose root frames.
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from tests import bootc
+from tests import bootc, toolchain
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PROGRAMS = REPO_ROOT / "tests" / "programs"
@@ -23,25 +22,25 @@ RUNTIME = REPO_ROOT / "runtime" / "turkey_runtime.c"
 # trace to print.
 PANICS = ["err_out_of_bounds", "err_string_boundary", "err_uninitialized_read"]
 
-pytestmark = pytest.mark.skipif(shutil.which("cc") is None,
+pytestmark = pytest.mark.skipif(toolchain.missing(),
                                 reason="no C compiler")
 
 
 def _boot_binary(backend: str, source: Path, tmp_path: Path) -> Path:
     """`boot native` or `boot llvm`, linked against the runtime."""
     # From the repository, where `boot` finds `lib/`.
-    text = subprocess.run([str(bootc.binary()), backend, str(source)],
-                          cwd=REPO_ROOT, capture_output=True, text=True,
-                          check=True).stdout
+    text = subprocess.run(
+        toolchain.command(bootc.binary(), backend, str(source)),
+        cwd=REPO_ROOT, capture_output=True, text=True, check=True).stdout
     code = tmp_path / (source.stem + (".s" if backend == "native" else ".ll"))
     code.write_text(text, encoding="utf-8")
     runtime = tmp_path / "runtime.o"
     if not runtime.exists():
-        subprocess.run(["cc", "-std=c11", "-O1", "-c", "-o", str(runtime),
-                        str(RUNTIME)], check=True)
+        subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-c", "-o",
+                        str(runtime), str(RUNTIME)], check=True)
     output = tmp_path / f"{source.stem}-{backend}"
-    subprocess.run(["cc", "-O1", "-Wno-override-module", "-o", str(output),
-                    str(code), str(runtime)], check=True)
+    subprocess.run([*toolchain.cc(), "-O1", "-Wno-override-module", "-o",
+                    str(output), str(code), str(runtime)], check=True)
     return output
 
 
@@ -49,7 +48,8 @@ def _boot_binary(backend: str, source: Path, tmp_path: Path) -> Path:
 @pytest.mark.parametrize("name", PANICS)
 def test_a_boot_binary_reports_the_panic(name, backend, tmp_path):
     binary = _boot_binary(backend, PROGRAMS / f"{name}.gob", tmp_path)
-    ran = subprocess.run([str(binary)], capture_output=True, text=True)
+    ran = subprocess.run(toolchain.command(binary), capture_output=True,
+                         text=True)
     assert ran.returncode == 1
     expected = (PROGRAMS / f"{name}.expected").read_text(encoding="utf-8")
     assert ran.stderr == expected.splitlines(keepends=True)[0]
@@ -75,8 +75,8 @@ def test_a_boot_binary_is_handed_its_arguments_and_exits_with_its_status(
     source = tmp_path / "args.gob"
     source.write_text(ARGS_AND_EXIT, encoding="utf-8")
     binary = _boot_binary(backend, source, tmp_path)
-    ran = subprocess.run([str(binary), "one", "t w o"], capture_output=True,
-                         text=True)
+    ran = subprocess.run(toolchain.command(binary, "one", "t w o"),
+                         capture_output=True, text=True)
     assert ran.stdout == "2\none\nt w o\n"
     assert ran.returncode == 3
 
@@ -102,7 +102,8 @@ HEADER = ("\n*** SIGSEGV in generated code\n  innermost call sites:\n")
 
 
 def _fault(binary: Path) -> subprocess.CompletedProcess:
-    return subprocess.run([str(binary)], capture_output=True, text=True,
+    return subprocess.run(toolchain.command(binary), capture_output=True,
+                          text=True,
                           env=dict(os.environ, TURKEY_SEGV_FRAMES="1"))
 
 
@@ -121,8 +122,8 @@ def test_without_the_request_a_fault_is_the_operating_systems(tmp_path):
     source = tmp_path / "fault.gob"
     source.write_text(FAULT, encoding="utf-8")
     binary = _boot_binary("native", source, tmp_path)
-    ran = subprocess.run([str(binary)], capture_output=True, text=True,
-                         env={k: v for k, v in os.environ.items()
-                              if k != "TURKEY_SEGV_FRAMES"})
+    ran = subprocess.run(
+        toolchain.command(binary), capture_output=True, text=True,
+        env={k: v for k, v in os.environ.items() if k != "TURKEY_SEGV_FRAMES"})
     assert ran.returncode < 0
     assert "SIGSEGV in generated code" not in ran.stderr

@@ -5,7 +5,7 @@ import subprocess
 
 import pytest
 
-from tests import bootc
+from tests import bootc, toolchain
 from tests.allocator_probe import allocator_object
 
 
@@ -136,10 +136,10 @@ int main(void) {
 }
 ''')
     binary = directory / "probe"
-    subprocess.run(["cc", "-std=c11", "-O1", "-fsanitize=undefined", "-I",
-                    str(bootc.REPO_ROOT / "runtime"), str(source),
-                    str(allocator_object), "-lm", "-pthread", "-o", str(binary)],
-                   check=True, capture_output=True, text=True)
+    subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-fsanitize=undefined",
+                    "-I", str(bootc.REPO_ROOT / "runtime"), str(source),
+                    str(allocator_object), "-lm", "-pthread", "-o",
+                    str(binary)], check=True, capture_output=True, text=True)
     return binary
 
 
@@ -149,8 +149,8 @@ def test_allocator_exports_before_initialization(allocator_probe, stress):
     env.pop("TURKEY_GC_STRESS", None)
     if stress:
         env["TURKEY_GC_STRESS"] = "1"
-    result = subprocess.run([str(allocator_probe)], env=env, capture_output=True,
-                            text=True, timeout=60)
+    result = subprocess.run(toolchain.command(allocator_probe), env=env,
+                            capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout == ""
     assert result.stderr

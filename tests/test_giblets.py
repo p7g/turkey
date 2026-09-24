@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from tests import bootc
+from tests import bootc, toolchain
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LIB = REPO_ROOT / "lib"
@@ -31,9 +31,9 @@ _SAFE = re.compile(r"[^A-Za-z0-9_]")
 
 def _run(entry: Path, giblets: str) -> tuple[int, str]:
     env = dict(os.environ, **{HOOK: giblets})
-    result = subprocess.run([str(bootc.binary()), "core", str(entry)],
-                            cwd=REPO_ROOT, env=env, capture_output=True,
-                            text=True)
+    result = subprocess.run(
+        toolchain.command(bootc.binary(), "core", str(entry)),
+        cwd=REPO_ROOT, env=env, capture_output=True, text=True)
     return result.returncode, result.stderr
 
 
@@ -187,9 +187,9 @@ def lowered(request, tmp_path):
                           f"import Turkey.Probe_helper_{digest} as H\n"
                           + giblet_body, encoding="utf-8")
         env = dict(os.environ, **{HOOK: f"Turkey.Probe_giblet_{digest}"})
-        result = subprocess.run([str(bootc.binary()), "ssa", str(entry)],
-                                cwd=REPO_ROOT, env=env, capture_output=True,
-                                text=True)
+        result = subprocess.run(
+            toolchain.command(bootc.binary(), "ssa", str(entry)),
+            cwd=REPO_ROOT, env=env, capture_output=True, text=True)
         return result.returncode, result.stdout, result.stderr
 
     try:

@@ -22,13 +22,12 @@ module so that several can share a run even though they cannot share a file.
 
 import functools
 import os
-import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from tests import bootc, lang
+from tests import bootc, lang, toolchain
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BOOT_MAIN = REPO_ROOT / "src" / "Main.gob"
@@ -44,10 +43,6 @@ CORPUS = sorted(
     if not path.name.startswith("err_")
 )
 COMPILABLE = [name for name in CORPUS if name not in UNSUPPORTED]
-
-
-def _cc() -> str | None:
-    return shutil.which("cc")
 
 
 def _split_llvm(text: str, paths: list[Path]) -> list[str]:
@@ -90,8 +85,8 @@ def _binary(name: str) -> Path:
         source.write_bytes(module)
         staging = stem.with_suffix(stem.suffix + ".bin")
         try:
-            _replace_built(["cc", "-O1", "-o", str(staging), str(source),
-                            str(runtime)], output)
+            _replace_built([*toolchain.cc(), "-O1", "-o", str(staging),
+                            str(source), str(runtime)], output)
         finally:
             source.unlink(missing_ok=True)
     return output
@@ -117,22 +112,22 @@ def test_the_corpus_compiles_and_agrees_with_the_reference(name):
     reference is the one that has been diffed against a second implementation
     at every stage above Core.
     """
-    if _cc() is None:
+    if toolchain.missing():
         pytest.skip("no C compiler")
     binary = _binary(name)
     # From the program's own directory, as `test_programs` runs it: a program
     # may read a file by its bare name (`system.gob`).
-    result = subprocess.run([str(binary)], cwd=PROGRAMS, capture_output=True,
-                            text=True)
+    result = subprocess.run(toolchain.command(binary), cwd=PROGRAMS,
+                            capture_output=True, text=True)
     assert result.stdout == _reference(name), (
         f"{name}: the LLVM backend's output differs from the arm64 backend's")
 
 
 @pytest.mark.parametrize("name", COMPILABLE)
 def test_the_corpus_agrees_under_gc_stress(name):
-    if _cc() is None:
+    if toolchain.missing():
         pytest.skip("no C compiler")
-    result = subprocess.run([str(_binary(name))], cwd=PROGRAMS,
+    result = subprocess.run(toolchain.command(_binary(name)), cwd=PROGRAMS,
                             env=dict(os.environ, TURKEY_GC_STRESS="1"),
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stderr[:2000]
@@ -175,7 +170,7 @@ def test_a_panic_in_a_callee_stops_the_caller():
 
 
 def _under_stress(name: str) -> subprocess.CompletedProcess:
-    return subprocess.run([str(_binary(name))], cwd=PROGRAMS,
+    return subprocess.run(toolchain.command(_binary(name)), cwd=PROGRAMS,
                           capture_output=True, text=True,
                           env={"TURKEY_GC_STRESS": "1", "PATH": "/usr/bin"})
 
@@ -195,7 +190,7 @@ def test_the_corpus_survives_collection(name):
     interned string literals, and the slots past 64 that the live mask has no
     bits for. 0 of 28 -> 6 -> 11 -> 22 -> 27 -> 28.
     """
-    if _cc() is None:
+    if toolchain.missing():
         pytest.skip("no C compiler")
     result = _under_stress(name)
     assert result.returncode == 0, result.stderr[-400:]
@@ -221,7 +216,7 @@ def test_symbols_are_the_compilers_own_names():
 
 
 def test_pointer_array_initialization_does_not_allocate_boxes():
-    result = subprocess.run([str(_binary("shared_nullaries.gob"))],
+    result = subprocess.run(toolchain.command(_binary("shared_nullaries.gob")),
                             cwd=PROGRAMS,
                             env=dict(os.environ, TURKEY_GC_STATS="1",
                                      TURKEY_GC_STRESS="1"),

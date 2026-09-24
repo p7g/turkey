@@ -35,7 +35,7 @@ from pathlib import Path
 
 import pytest
 
-from tests import bootc
+from tests import bootc, toolchain
 from tests.bootc import CACHE, runtime_object as _runtime_object
 from tests.bootc import digest as _digest, replace_built as _replace_built
 
@@ -73,7 +73,7 @@ def _stage3() -> Path:
         source.write_bytes(assembly)
         staging = stem.with_suffix(stem.suffix + ".bin")
         try:
-            _replace_built(["cc", "-o", str(staging), str(source),
+            _replace_built([*toolchain.cc(), "-o", str(staging), str(source),
                             str(runtime)], output)
         finally:
             source.unlink(missing_ok=True)
@@ -85,7 +85,7 @@ def _sha(text: str) -> str:
 
 
 @pytest.mark.bootstrap
-@pytest.mark.skipif(shutil.which("cc") is None, reason="no C compiler")
+@pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
 def test_stage3_compiles_the_compiler_to_stage2s_bytes():
     """The fixed point, as a byte comparison.
 
@@ -95,8 +95,9 @@ def test_stage3_compiles_the_compiler_to_stage2s_bytes():
     line is reported, which is what a failure actually needs.
     """
     stage3 = _stage3_assembly()
-    result = subprocess.run([str(_stage3()), "native", str(BOOT_MAIN)],
-                            cwd=REPO_ROOT, capture_output=True, text=True)
+    result = subprocess.run(
+        toolchain.command(_stage3(), "native", str(BOOT_MAIN)),
+        cwd=REPO_ROOT, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr[:4000]
     stage4 = bootc.split_before(result.stdout, "// === ")[BOOT_MAIN.name]
 
@@ -111,7 +112,7 @@ def test_stage3_compiles_the_compiler_to_stage2s_bytes():
 
 
 @pytest.mark.bootstrap
-@pytest.mark.skipif(shutil.which("cc") is None, reason="no C compiler")
+@pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
 def test_stage3_agrees_with_stage2_over_the_corpus():
     """One program, two compilers, for every program in the corpus.
 
@@ -122,8 +123,9 @@ def test_stage3_agrees_with_stage2_over_the_corpus():
     programs = sorted(path for path in (REPO_ROOT / "tests" / "programs").glob("*.gob")
                       if not path.name.startswith("err_"))
     stage2 = bootc.boot_each("asm", programs, _split_asm)
-    result = subprocess.run([str(_stage3()), "asm", *[str(p) for p in programs]],
-                            cwd=REPO_ROOT, capture_output=True, text=True)
+    result = subprocess.run(
+        toolchain.command(_stage3(), "asm", *[str(p) for p in programs]),
+        cwd=REPO_ROOT, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr[:4000]
     stage3 = bootc.split_before(result.stdout, "; === ")
     for path in programs:

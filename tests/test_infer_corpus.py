@@ -19,19 +19,18 @@ is held to. `expected` is `null` for a program the naive checker rejected.
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
 
 import pytest
 
-from tests import lang
+from tests import lang, toolchain
 
 CORPUS = json.loads(
     (Path(__file__).parent / "infer_corpus.json").read_text(encoding="utf-8"))
 PRELUDE: str = CORPUS["prelude"]
 CASES: list[dict] = CORPUS["cases"]
 
-pytestmark = pytest.mark.skipif(shutil.which("cc") is None,
+pytestmark = pytest.mark.skipif(toolchain.missing(),
                                 reason="no C compiler")
 
 

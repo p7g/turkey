@@ -30,14 +30,13 @@ It is skipped where there is no assembler.
 from __future__ import annotations
 
 import functools
-import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
 import pytest
 
-from tests import bootc
+from tests import bootc, toolchain
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROGRAMS = REPO_ROOT / "tests" / "programs"
@@ -392,7 +391,7 @@ def test_a_double_lives_in_the_vector_file():
     assert "fcmp " in text
 
 
-@pytest.mark.skipif(shutil.which("as") is None, reason="no assembler")
+@pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
 @pytest.mark.parametrize("name", ["adt.gob", "operators.gob",
                                   "float_bits.gob"])
 def test_the_printed_instructions_assemble(name):
@@ -424,7 +423,7 @@ def test_the_printed_instructions_assemble(name):
         path = Path(directory) / "t.s"
         path.write_text(source)
         result = subprocess.run(
-            ["as", "-arch", "arm64", "-o", str(Path(directory) / "t.o"),
+            [*toolchain.cc(), "-c", "-o", str(Path(directory) / "t.o"),
              str(path)],
             capture_output=True, text=True)
     assert result.returncode == 0, result.stderr

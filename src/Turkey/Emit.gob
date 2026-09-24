@@ -56,12 +56,10 @@ fun line(b : String.Builder, text : String) -> Unit {
 fun instruction(b : String.Builder, op : A.Arm) -> Unit =
     line(b, "    " + show(Inst { op = op }))
 
-fun emitFunc(f : Func Inst, a : Regalloc.Allocation, l : Frame.Layout,
-             tag : Int, b : String.Builder) -> Unit {
-    let symbol = Asm.symbolFor(f.name)
-    line(b, "    .globl " + symbol)
-    line(b, "    .p2align 2")
-    line(b, symbol + ":")
+fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
+             l : Frame.Layout, tag : Int, b : String.Builder) -> Unit {
+    let d = asm.dialect
+    function(b, d, Asm.symbolFor(d, f.name))
     prologue(b, l)
     -- Reverse postorder, so a block's most likely successor is the next block
     -- and its edge costs no instruction at all.
@@ -69,20 +67,31 @@ fun emitFunc(f : Func Inst, a : Regalloc.Allocation, l : Frame.Layout,
     for var k = 0; k < len(order); k = k + 1 {
         let at = Ssa.blockId(order[k])
         let next = if k + 1 < len(order) { Ssa.blockId(order[k + 1]) } else { -1 }
-        line(b, blockLabel(tag, at) + ":")
-        for i in f.blocks[at].insts { emitInst(b, f, a, l, tag, i) }
-        emitTerm(b, f, a, l, tag, f.blocks[at].term, next)
+        line(b, blockLabel(d, tag, at) + ":")
+        for i in f.blocks[at].insts { emitInst(b, d, f, a, l, tag, i) }
+        emitTerm(b, d, f, a, l, tag, f.blocks[at].term, next)
     }
+}
+
+-- A global function's label, and what the format wants said about it first.
+fun function(b : String.Builder, d : Asm.Dialect, symbol : String) -> Unit {
+    line(b, "    .globl " + symbol)
+    match Asm.functionType(d, symbol) {
+        Some(directive) -> line(b, "    " + directive)
+        None -> {}
+    }
+    line(b, "    .p2align 2")
+    line(b, symbol + ":")
 }
 
 -- The return address of the call at this safepoint: the label goes directly
 -- after the `bl`, which is where selection put the `SafepointMap` mark.
-fun safepointLabel(tag : Int, block : Int, index : Int) -> String =
-    "Lsp" + Int.toString(tag) + "b" + Int.toString(block)
-        + "i" + Int.toString(index)
+fun safepointLabel(d : Asm.Dialect, tag : Int, block : Int, index : Int) -> String =
+    Asm.localLabel(d, "sp" + Int.toString(tag) + "b" + Int.toString(block)
+                      + "i" + Int.toString(index))
 
-fun blockLabel(tag : Int, block : Int) -> String =
-    "Lf" + Int.toString(tag) + "b" + Int.toString(block)
+fun blockLabel(d : Asm.Dialect, tag : Int, block : Int) -> String =
+    Asm.localLabel(d, "f" + Int.toString(tag) + "b" + Int.toString(block))
 
 -- -- the frame ---------------------------------------------------------------
 
@@ -165,14 +174,15 @@ fun at(b : String.Builder, offset : Int) -> Mem {
 
 -- -- instructions ------------------------------------------------------------
 
-fun emitInst(b : String.Builder, f : Func Inst, a : Regalloc.Allocation,
-             l : Frame.Layout, tag : Int, i : Inst) -> Unit {
+fun emitInst(b : String.Builder, d : Asm.Dialect, f : Func Inst,
+             a : Regalloc.Allocation, l : Frame.Layout, tag : Int,
+             i : Inst) -> Unit {
     -- A safepoint is not an instruction: it is the *position* after the call,
     -- which is the return address the collector will look up. So it becomes a
     -- label, and `Turkey.Frame`'s entry for the same (block, index) names it.
     match A.safepointOf(i.op) {
         Some((sb, sn)) -> {
-            line(b, safepointLabel(tag, sb, sn) + ":")
+            line(b, safepointLabel(d, tag, sb, sn) + ":")
             return
         }
         None -> {}
@@ -219,8 +229,9 @@ fun wideSlot(l : Frame.Layout, op : A.Arm) -> Option Int = match A.memOf(op) {
 
 -- -- terminators -------------------------------------------------------------
 
-fun emitTerm(b : String.Builder, f : Func Inst, a : Regalloc.Allocation,
-             l : Frame.Layout, tag : Int, t : Term, next : Int) -> Unit =
+fun emitTerm(b : String.Builder, d : Asm.Dialect, f : Func Inst,
+             a : Regalloc.Allocation, l : Frame.Layout, tag : Int, t : Term,
+             next : Int) -> Unit =
     match t {
         -- The result into the register the convention answers in, then the
         -- frame comes down. Every return does its own epilogue: a shared exit
@@ -233,7 +244,7 @@ fun emitTerm(b : String.Builder, f : Func Inst, a : Regalloc.Allocation,
         Jump(target, args) -> {
             copies(b, f, a, Ssa.blockAt(f, target).params, args)
             if Ssa.blockId(target) != next {
-                line(b, "    b " + blockLabel(tag, Ssa.blockId(target)))
+                line(b, "    b " + blockLabel(d, tag, Ssa.blockId(target)))
             }
         }
         -- `cbnz` on the bit the comparison materialized. Whichever arm is the
@@ -241,11 +252,13 @@ fun emitTerm(b : String.Builder, f : Func Inst, a : Regalloc.Allocation,
         Branch(c, yes, no) -> {
             let bit = A.showReg(coloured(f, a, A.reg(c)), A.W32)
             if Ssa.blockId(yes) == next {
-                line(b, "    cbz " + bit + ", " + blockLabel(tag, Ssa.blockId(no)))
+                line(b, "    cbz " + bit + ", "
+                        + blockLabel(d, tag, Ssa.blockId(no)))
             } else {
-                line(b, "    cbnz " + bit + ", " + blockLabel(tag, Ssa.blockId(yes)))
+                line(b, "    cbnz " + bit + ", "
+                        + blockLabel(d, tag, Ssa.blockId(yes)))
                 if Ssa.blockId(no) != next {
-                    line(b, "    b " + blockLabel(tag, Ssa.blockId(no)))
+                    line(b, "    b " + blockLabel(d, tag, Ssa.blockId(no)))
                 }
             }
         }
@@ -358,7 +371,7 @@ fun move(b : String.Builder, d : Reg, s : Reg) -> Unit = match (d, s) {
 
 -- The panic messages, which are the only data the functions name *locally*.
 --
--- A local symbol -- `L` prefixed, so it never reaches the symbol table -- has
+-- A local symbol -- one that never reaches the symbol table -- has
 -- to be defined in the file that mentions it, which is what makes this part of
 -- the function slice rather than of the module slice to come: without it the
 -- assembler refuses the whole file. The globals and the root array are named
@@ -374,9 +387,9 @@ fun move(b : String.Builder, d : Reg, s : Reg) -> Unit = match (d, s) {
 fun emitMessages(asm : Asm.Asm, b : String.Builder) -> Unit {
     let ordered = byIndex(asm.messages)
     if len(ordered) == 0 { return }
-    line(b, "    .section __TEXT,__cstring,cstring_literals")
+    line(b, "    " + Asm.section(asm.dialect, Asm.CStrings))
     for var i = 0; i < len(ordered); i = i + 1 {
-        line(b, Asm.messageName(i) + ":")
+        line(b, Asm.messageName(asm.dialect, i) + ":")
         let out = String.builder()
         String.push(out, "    .byte ")
         for byte in String.bytes(ordered[i]) {
@@ -399,7 +412,7 @@ fun emitMessages(asm : Asm.Asm, b : String.Builder) -> Unit {
 -- before anything defined slot *n*.
 fun emitData(m : Module, asm : Asm.Asm, b : String.Builder) -> Unit {
     emitLiterals(asm, b)
-    line(b, "    .section __DATA,__data")
+    line(b, "    " + Asm.section(asm.dialect, Asm.Data))
     -- An untraced global is a word of ordinary storage. A traced one is a slot
     -- of the root array instead -- storing to it and rooting it are the same
     -- store -- so this defines nothing for it.
@@ -408,20 +421,20 @@ fun emitData(m : Module, asm : Asm.Asm, b : String.Builder) -> Unit {
             Some(_) -> {}
             None -> {
                 line(b, "    .p2align 3")
-                line(b, Asm.globalSymbol(name) + ":")
+                line(b, Asm.globalSymbol(asm.dialect, name) + ":")
                 line(b, "    .quad 0")
             }
         }
     }
     line(b, "    .p2align 3")
-    line(b, Asm.rootsSymbol + ":")
+    line(b, Asm.rootsSymbol(asm.dialect) + ":")
     -- At least one word even when the module roots nothing: the entry sequence
     -- hands this address to `turkey_root_enter`, which refuses a null one, and
     -- a symbol with no storage is a symbol that may land on top of the next.
     let bytes = if asm.roots > 0 { 8 * asm.roots } else { 8 }
     line(b, "    .space " + Int.toString(bytes))
     line(b, "    .p2align 3")
-    line(b, Asm.globalsFrame + ":")
+    line(b, Asm.globalsFrame(asm.dialect) + ":")
     -- The `RootFrame` covering it: previous, function_name, count, values,
     -- live. Five words, and the layout is `runtime/turkey_runtime.c`'s.
     line(b, "    .space 40")
@@ -431,16 +444,16 @@ fun emitData(m : Module, asm : Asm.Asm, b : String.Builder) -> Unit {
 -- the entry sequence and cached in the root array, so what the data section
 -- holds is the *input* to `turkey_string_new`.
 --
--- Not `__TEXT,__cstring`, where the panic messages go. That section is for
--- NUL-terminated C strings, and a Turkey string is bytes and a length: it may
+-- Not the section the panic messages go in, where a format has one of its own
+-- for NUL-terminated C strings: and a Turkey string is bytes and a length: it may
 -- contain a zero byte, and there is no terminator to write.
 fun emitLiterals(asm : Asm.Asm, b : String.Builder) -> Unit {
     let ordered = byIndex(asm.literals)
     if len(ordered) == 0 { return }
-    line(b, "    .section __TEXT,__const")
+    line(b, "    " + Asm.section(asm.dialect, Asm.Constants))
     for var i = 0; i < len(ordered); i = i + 1 {
         line(b, "    .p2align 3")
-        line(b, Asm.literalName(i) + ":")
+        line(b, Asm.literalName(asm.dialect, i) + ":")
         emitBytes(ordered[i], b)
     }
 }
@@ -483,28 +496,27 @@ fun emitBytes(text : String, b : String.Builder) -> Unit {
 -- it park the program's ending where the entry's own code will not unwind on
 -- it.
 fun emitEntry(asm : Asm.Asm, main : String, b : String.Builder) -> Unit {
-    line(b, "    .text")
-    line(b, "    .globl " + Asm.entrySymbol)
-    line(b, "    .p2align 2")
-    line(b, Asm.entrySymbol + ":")
+    let d = asm.dialect
+    line(b, "    " + Asm.section(d, Asm.Text))
+    function(b, d, Asm.entrySymbol(d))
     -- A frame of its own, because everything below is a call. Thirty-two
     -- bytes: the record, and the alignment Apple requires.
     line(b, "    sub sp, sp, #32")
     instruction(b, A.Str(Physical(Gp, 29), Offset(A.sp, 16), A.W64))
     instruction(b, A.Str(Physical(Gp, 30), Offset(A.sp, 24), A.W64))
     line(b, "    add x29, sp, #16")
-    call(b, "turkey_entry_started")
+    call(b, d, "turkey_entry_started")
 
     -- The permanent frame, before anything allocates. It is never left: every
     -- global and every literal is live for the whole run, so the mask is all
     -- ones and this frame sits at the bottom of the chain until the process
     -- exits.
-    symbolInto(b, A.x0, Asm.globalsFrame)
-    symbolInto(b, Physical(Gp, 1), Asm.rootsSymbol)
+    symbolInto(b, d, A.x0, Asm.globalsFrame(d))
+    symbolInto(b, d, Physical(Gp, 1), Asm.rootsSymbol(d))
     instruction(b, A.MovConst(Physical(Gp, 2), asm.roots))
-    symbolInto(b, Physical(Gp, 3), Asm.messageSymbol(asm, "<globals>"))
-    call(b, "turkey_root_enter")
-    symbolInto(b, A.x0, Asm.globalsFrame)
+    symbolInto(b, d, Physical(Gp, 3), Asm.messageSymbol(asm, "<globals>"))
+    call(b, d, "turkey_root_enter")
+    symbolInto(b, d, A.x0, Asm.globalsFrame(d))
     -- Not `mov x1, #-1`: `movn` is the instruction that spells it, and going
     -- through the assembler's alias would be one more thing to be wrong about.
     line(b, "    movn x1, #0")
@@ -513,27 +525,27 @@ fun emitEntry(asm : Asm.Asm, main : String, b : String.Builder) -> Unit {
     -- The frame table, before anything allocates: the first collection may
     -- happen inside the first `turkey_string_new` below, and a collection that
     -- cannot read the table sees no frame's roots at all.
-    symbolInto(b, A.x0, Asm.frameTableSymbol)
-    call(b, "turkey_frame_table_register")
+    symbolInto(b, d, A.x0, Asm.frameTableSymbol(d))
+    call(b, d, "turkey_frame_table_register")
 
     -- Each literal's `TurkeyString`, built once and cached in its slot. This
     -- is what makes `ConstString` a load rather than an allocation, and what
     -- makes it not a safepoint.
     let ordered = byIndex(asm.literals)
     for var i = 0; i < len(ordered); i = i + 1 {
-        symbolInto(b, A.x0, Asm.literalName(i))
+        symbolInto(b, d, A.x0, Asm.literalName(d, i))
         instruction(b, A.MovConst(Physical(Gp, 1), byteLength(ordered[i])))
-        call(b, "turkey_string_new")
-        symbolInto(b, Physical(Gp, 1), Asm.rootsSymbol)
+        call(b, d, "turkey_string_new")
+        symbolInto(b, d, Physical(Gp, 1), Asm.rootsSymbol(d))
         storeAt(b, A.x0, Physical(Gp, 1), 8 * Asm.literalSlot(asm, ordered[i]))
     }
 
-    line(b, "    bl " + Asm.symbolFor(Asm.initializerName))
+    line(b, "    bl " + Asm.symbolFor(d, Asm.initializerName))
     -- `main` takes the closure environment every Turkey function takes, and
     -- has none.
     instruction(b, A.Mov(A.x0, A.xzr, A.W64))
-    line(b, "    bl " + Asm.symbolFor(main))
-    call(b, "turkey_entry_returned")
+    line(b, "    bl " + Asm.symbolFor(d, main))
+    call(b, d, "turkey_entry_returned")
 
     instruction(b, A.Ldr(Physical(Gp, 29), Offset(A.sp, 16), A.W64))
     instruction(b, A.Ldr(Physical(Gp, 30), Offset(A.sp, 24), A.W64))
@@ -543,15 +555,13 @@ fun emitEntry(asm : Asm.Asm, main : String, b : String.Builder) -> Unit {
     -- `main` itself: `Turkey.Entry`'s, reached by its C symbol. `argv` is
     -- already in `x1`, and `argc` in `w0`, widened to the `Int` a foreign
     -- definition takes: AAPCS64 leaves the upper half of an `int` undefined.
-    line(b, "    .globl " + Asm.runtimeFor("main"))
-    line(b, "    .p2align 2")
-    line(b, Asm.runtimeFor("main") + ":")
+    function(b, d, Asm.runtimeFor(d, "main"))
     line(b, "    sub sp, sp, #16")
     instruction(b, A.Str(Physical(Gp, 29), Offset(A.sp, 0), A.W64))
     instruction(b, A.Str(Physical(Gp, 30), Offset(A.sp, 8), A.W64))
     line(b, "    mov x29, sp")
     line(b, "    sxtw x0, w0")
-    call(b, "turkey_main")
+    call(b, d, "turkey_main")
     instruction(b, A.Ldr(Physical(Gp, 29), Offset(A.sp, 0), A.W64))
     instruction(b, A.Ldr(Physical(Gp, 30), Offset(A.sp, 8), A.W64))
     line(b, "    add sp, sp, #16")
@@ -567,7 +577,7 @@ fun emitEntry(asm : Asm.Asm, main : String, b : String.Builder) -> Unit {
 -- frame of its own for the collector's walk to meet. Floating-point arguments
 -- are in `d0`-`d7` either way and do not move. Seven general arguments at most,
 -- which the front end checks, since the eighth register is the environment's.
-fun emitDefinitions(m : Module, b : String.Builder) -> Unit {
+fun emitDefinitions(m : Module, asm : Asm.Asm, b : String.Builder) -> Unit {
     for (sym, name) in m.definitions {
         for f in m.functions {
             if f.name == name {
@@ -578,15 +588,12 @@ fun emitDefinitions(m : Module, b : String.Builder) -> Unit {
                         _ -> { general = general + 1 }
                     }
                 }
-                let label = Asm.runtimeFor(sym)
-                line(b, "    .globl " + label)
-                line(b, "    .p2align 2")
-                line(b, label + ":")
+                function(b, asm.dialect, Asm.runtimeFor(asm.dialect, sym))
                 for var k = general; k > 0; k = k - 1 {
                     instruction(b, A.Mov(Physical(Gp, k), Physical(Gp, k - 1), A.W64))
                 }
                 instruction(b, A.Mov(A.x0, A.xzr, A.W64))
-                line(b, "    b " + Asm.symbolFor(name))
+                line(b, "    b " + Asm.symbolFor(asm.dialect, name))
             }
         }
     }
@@ -595,14 +602,13 @@ fun emitDefinitions(m : Module, b : String.Builder) -> Unit {
 -- A symbol's address, in a register: the page, then the offset within it.
 -- The same pair `Turkey.Select.address` emits, spelled here because the entry
 -- sequence is text rather than selected instructions.
-fun symbolInto(b : String.Builder, d : Reg, sym : String) -> Unit {
-    let r = A.showReg(d, A.W64)
-    line(b, "    adrp " + r + ", " + sym + "@PAGE")
-    line(b, "    add " + r + ", " + r + ", " + sym + "@PAGEOFF")
+fun symbolInto(b : String.Builder, d : Asm.Dialect, r : Reg, sym : String) -> Unit {
+    instruction(b, A.Adrp(r, Asm.page(d, sym)))
+    instruction(b, A.AddLo(r, r, Asm.pageOffset(d, sym)))
 }
 
-fun call(b : String.Builder, name : String) -> Unit =
-    line(b, "    bl " + Asm.runtimeFor(name))
+fun call(b : String.Builder, d : Asm.Dialect, name : String) -> Unit =
+    line(b, "    bl " + Asm.runtimeFor(d, name))
 
 -- A store through a register base, with the offset in `scratch` when the
 -- immediate does not reach. `boot` interns thousands of literals, so the root
@@ -637,18 +643,19 @@ fun byteLength(text : String) -> Int {
 --
 -- The offsets are from `x29`, signed, and `Turkey.Frame.layout` has been
 -- computing them since phase 4.
-fun emitFrameTable(layouts : Array (Int, Frame.Layout),
+fun emitFrameTable(asm : Asm.Asm, layouts : Array (Int, Frame.Layout),
                    b : String.Builder) -> Unit {
-    line(b, "    .section __DATA,__const")
+    let d = asm.dialect
+    line(b, "    " + Asm.section(d, Asm.Relocated))
     line(b, "    .p2align 3")
-    line(b, "    .globl " + Asm.frameTableSymbol)
-    line(b, Asm.frameTableSymbol + ":")
+    line(b, "    .globl " + Asm.frameTableSymbol(d))
+    line(b, Asm.frameTableSymbol(d) + ":")
     var n = 0
     for (_, l) in layouts { n = n + len(l.maps) }
     line(b, "    .quad " + Int.toString(n))
     for (tag, l) in layouts {
         for m in l.maps {
-            line(b, "    .quad " + safepointLabel(tag, m.block, m.index))
+            line(b, "    .quad " + safepointLabel(d, tag, m.block, m.index))
             line(b, "    .quad " + Int.toString(len(m.offsets)))
             for o in m.offsets { line(b, "    .quad " + Int.toString(o)) }
         }

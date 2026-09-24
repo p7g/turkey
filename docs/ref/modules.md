@@ -198,15 +198,18 @@ what it provides.
 The library module `Target` says which platform the program is being compiled
 for. `Target.os` is the operating system, of type `OS`, and `Target.arch` the
 processor architecture, of type `Arch`. Each type lists only the targets the
-compiler supports, which today is one: arm64 macOS, so `OS` has the single
-constructor `Darwin` and `Arch` the single constructor `Arm64`. The compiler's `--target` option chooses among them; its value is
-spelled `arch-os`, and `arm64-darwin` is the default:
+compiler supports, which today are arm64 macOS and arm64 Linux: `OS` has the
+constructors `Darwin` and `Linux`, and `Arch` the single constructor `Arm64`.
+The compiler's `--target` option chooses among them. Its value is spelled
+`arch-os`, `arm64-darwin` or `arm64-linux`, and the default is the platform the
+compiler itself runs on:
 
 ```sh
-boot native --target arm64-darwin main.gob > main.s
+boot native --target arm64-linux main.gob > main.s
 ```
 
-Code that differs by platform is an ordinary `match`:
+Code that differs by platform is an ordinary `match`. Compiled for macOS, this
+prints `10`, and compiled for Linux, `7`:
 
 <!-- run -->
 ```kotlin
@@ -215,6 +218,7 @@ import Target as Target
 
 fun sigbus() -> Int = match Target.os {
     Darwin -> 10
+    Linux -> 7
 }
 
 fun main() {
@@ -239,19 +243,20 @@ Two rules make this the way to write such code:
   [`foreign`](declarations.md#foreign-functions) function that does not
   exist on this one, and the program still links.
 
-Exhaustiveness treats `OS` and `Arch` like any other type:
+Exhaustiveness treats `OS` and `Arch` like any other type, so a `match` that
+forgets a target is an error whichever target is being compiled for:
 
-<!-- error: this match is not exhaustive; '(Darwin, True)' is not handled -->
+<!-- error: this match is not exhaustive; 'Linux' is not handled -->
 ```kotlin
 import Target (OS(..))
 import Target as Target
 
-fun sigbus(fallback : Bool) -> Int = match (Target.os, fallback) {
-    (Darwin, False) -> 10
+fun sigbus() -> Int = match Target.os {
+    Darwin -> 10
 }
 
 fun main() {
-    print(sigbus(False))
+    print(sigbus())
 }
 ```
 

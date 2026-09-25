@@ -113,14 +113,19 @@ apt-get install -y \
     qemu-user-static \
     gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
     python3-pytest python3-pytest-xdist
-if [ -w /proc/sys/fs/binfmt_misc/register ]; then
-    cat /usr/lib/binfmt.d/qemu-aarch64.conf > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
+B=/proc/sys/fs/binfmt_misc
+if [ -d $B ] && [ ! -e $B/register ]; then
+    mount -t binfmt_misc binfmt_misc $B 2>/dev/null
+fi
+if [ -w $B/register ]; then
+    cat /usr/lib/binfmt.d/qemu-aarch64.conf > $B/register 2>/dev/null || true
 fi
 ```
 
 Then set `TURKEY_CC="aarch64-linux-gnu-gcc -static"` and leave `TURKEY_RUN`
 empty. The last step of the setup registers qemu with the kernel's binfmt_misc,
-so an arm64 binary runs as `./program`, with no prefix. That registration is
+so an arm64 binary runs as `./program`, with no prefix, mounting binfmt_misc
+first where the container has not. That registration is
 lost when a machine is restored from a snapshot, so the repository's
 `.claude/settings.json` runs the same line as a SessionStart hook. On macOS the
 hook does nothing. Where binfmt_misc cannot be written, set

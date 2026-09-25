@@ -5,13 +5,9 @@
 
 extern int32_t turkey_has_panicked;
 
-/* A `String` is a byte array on the heap, so these are `void *`:
-   `turkey_string_new` is how the entry interns a literal. The float three are
-   here because formatting and parsing lean on `snprintf` and `strtod`. */
+/* A `String` is a byte array on the heap, so this is `void *`:
+   `turkey_string_new` is how the entry interns a literal. */
 void *turkey_string_new(const unsigned char *bytes, int64_t length);
-void *turkey_float_to_string(double value);
-double turkey_float_parse(void *value);
-int32_t turkey_float_can_parse(void *value);
 
 /* C-callable exports supplied by Turkey.Alloc in the generated program.
    Scalar arguments use Turkey's 64-bit Int; stored header fields stay 32-bit. */

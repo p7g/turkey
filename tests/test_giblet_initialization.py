@@ -103,6 +103,44 @@ void *turkey_heap_allocate(uint64_t size, int64_t kind, void *frame) {
         assert run.stdout == "initialized\n43\n"
 
 
+@pytest.mark.parametrize("backend", toolchain.BACKENDS)
+def test_c_can_run_early_initialization(modules, tmp_path, backend):
+    """`turkey_giblets_initialize` is the early initializer under a C name, so
+    that C which runs a program's Turkey code without running the program sets
+    up giblet state exactly as `turkey_entry` does."""
+    entry, env = modules(
+        'foreign "probe_step" fun step() -> Int\n'
+        'foreign "probe_again" fun again() -> Unit\n'
+        'var runs : Int = step()\n'
+        'fun read() -> Int = runs\n'
+        'fun rerun() -> Unit = again()\n',
+        'let base : Int = 0',
+        main='print(P.read()); P.rerun(); print(P.read())',
+        exports="read, rerun")
+    result = compile_source(entry, env, backend)
+    assert result.returncode == 0, result.stderr
+    generated = tmp_path / ("program.s" if backend == "native" else "program.ll")
+    generated.write_text(result.stdout)
+    probe = tmp_path / "probe.c"
+    probe.write_text('''
+#include <stdint.h>
+#include "turkey_runtime.h"
+static int64_t steps;
+int64_t probe_step(void) { return ++steps; }
+void probe_again(void) { turkey_giblets_initialize(); }
+''')
+    binary = tmp_path / "program"
+    subprocess.run([*toolchain.cc(), "-O1", "-I", str(bootc.RUNTIME.parent),
+                    *toolchain.clang_only("-Wno-override-module"), str(generated),
+                    str(bootc.RUNTIME), str(probe), *toolchain.libraries(),
+                    "-o", str(binary)],
+                   check=True, capture_output=True, text=True)
+    run = subprocess.run(toolchain.command(binary), capture_output=True, text=True,
+                         env=env)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout == "1\n2\n"
+
+
 @pytest.mark.parametrize("body, dependency, message", [
     ('let value : Int = Prim.error("early")\nfun read() -> Int = value',
      'let base : Int = 0', 'panics with a String'),

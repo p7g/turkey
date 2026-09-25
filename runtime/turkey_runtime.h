@@ -20,6 +20,11 @@ void *turkey_array_new(int64_t length, uint64_t initial, int64_t element_width,
                        int64_t element_layout);
 void *turkey_closure_shell(uint64_t code);
 
+/* The program's early initialization -- every giblet module's globals -- under
+   a C name. `turkey_entry` runs it first; C that calls a program's Turkey
+   exports without running the program calls it before anything else. */
+void turkey_giblets_initialize(void);
+
 /* Collector-owned services used by the allocator giblet. `frame` is the
    allocator's own frame pointer, where the collector's walk starts. */
 void *turkey_heap_allocate(uint64_t size, int64_t kind, void *frame);

@@ -1,9 +1,14 @@
-module Turkey.Alloc (cellNew, objectNew, box, unbox, arrayNew, closureShell, stringNew)
+module Turkey.Alloc (cellNew, objectNew, box, unbox, arrayNew, closureShell, stringNew,
+                    floatToString)
 
 -- Generated callers root every managed operand across these calls. The heap
 -- does not move, so those operands may travel here as raw words. Each allocator
 -- calls the heap once, and holds no newly allocated object across another
 -- allocation. Its raw result becomes traced at the caller's allocation opcode.
+-- Each passes its own frame to the heap, where the collector's stack walk
+-- starts, so everything between that frame and the program's entry must be
+-- Turkey. C may call these only when it is itself the outermost code on the
+-- stack, as the runtime's own C tests do.
 -- No initializer or managed literal may be needed: literal interning calls
 -- this module before module initialization.
 import Prelude ()
@@ -12,9 +17,10 @@ import Data.Int ()
 import Data.Bool.Type (Bool(..))
 import Turkey.Memory as Memory
 import Unsafe.Runtime as Rt
+import Unsafe.Libc as Libc
 
 foreign "turkey_cell_new" fun cellNew(value : Int, pointerValue : Int) -> Prim.Ptr {
-    let cell = Rt.heapAllocate(16, 3)
+    let cell = Rt.heapAllocate(16, 3, Prim.frameAddress())
     if !Prim.ptrIsNull(cell) {
         Prim.storeI64(cell, 0, value)
         Prim.storeI32(cell, 8, Prim.charFromInt(pointerValue))
@@ -28,7 +34,7 @@ foreign "turkey_object_new" fun objectNew(kind : Int, tag : Int, count : Int,
         Rt.panic(Prim.cString("invalid object size"))
         return Prim.ptrNull()
     }
-    let object = Rt.heapAllocate(24 + 8 * count, 2)
+    let object = Rt.heapAllocate(24 + 8 * count, 2, Prim.frameAddress())
     if Prim.ptrIsNull(object) { return object }
     Rt.countKind(kind)
     header(object, kind, tag, count, pointerBitmap)
@@ -78,7 +84,7 @@ foreign "turkey_array_new" fun arrayNew(length : Int, initial : Int,
         return Prim.ptrNull()
     }
     let size = Prim.intAddWrapping(24, Prim.intMulWrapping(length, elementWidth))
-    let array = Rt.heapAllocate(size, 2)
+    let array = Rt.heapAllocate(size, 2, Prim.frameAddress())
     if Prim.ptrIsNull(array) { return array }
     Rt.countKind(2)
     header(array, 2, elementLayout, length, elementWidth)
@@ -112,4 +118,11 @@ foreign "turkey_string_new" fun stringNew(bytes : Prim.Ptr, length : Int) -> Pri
         Memory.copy(Prim.ptrAdd(array, 24), bytes, length)
     }
     array
+}
+
+-- `Prim.floatToString`. The runtime formats and this allocates, so that no C
+-- frame is on the stack when the collector walks it.
+foreign "turkey_float_to_string" fun floatToString(value : Float) -> Prim.Ptr {
+    let text = Rt.floatFormat(value)
+    stringNew(text, Libc.strlen(text))
 }

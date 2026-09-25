@@ -15,8 +15,9 @@
 # from the repository root.
 #
 # bootstrap/ holds the committed compiler: the whole-program assembly for
-# src/Main.gob once per target, each under gzip -9 -n (3.5 MB each; -n so the
-# same text always compresses to the same bytes), a copy of the C runtime they
+# src/Main.gob once per target, each under gzip -9 -n (3.5 MB each; -n so one
+# gzip always compresses the same text to the same bytes, though GNU's and
+# macOS's differ from each other), a copy of the C runtime they
 # were emitted against, and PROVENANCE, which records the commit they came from
 # and the hashes checked here before anything is built. Every target's assembly
 # is the same compiler emitting for a different platform, so a build on any of

@@ -642,10 +642,12 @@ static int heap_check_native(const HeapCheck *check, uintptr_t current, uintptr_
             (i && frame_entries[i-1].retaddr >= frame_entries[i].retaddr))
             return heap_check_fail("invalid native frame table", frame_entries, i);
     }
-    while (current <= high && high - current >= 16 && !(current & 15)) {
+    /* The same bounds as scan_native_frames: records are 8-byte aligned, not
+       16, and a stricter walk would stop short of the Turkey frames. */
+    while (current <= high && high - current >= 16 && !(current & 7)) {
         const uintptr_t *record = (const uintptr_t *)current;
         uintptr_t caller = record[0];
-        if (caller <= current || caller > high || high - caller < 16 || (caller & 15)) break;
+        if (caller <= current || caller > high || high - caller < 16 || (caller & 7)) break;
         size_t low = 0, end = (size_t)frame_entry_count;
         while (low < end) {
             size_t mid = low + (end - low) / 2;

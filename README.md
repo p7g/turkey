@@ -183,3 +183,18 @@ The tests are Python. Install their dependencies with
 The tests compile their programs with `boot`, which is built from the
 committed bootstrap on first use; `TURKEY_BOOT` points them at one you built
 yourself instead.
+
+The suite runs in parallel by default, and three commands cover it:
+
+    python3 -m pytest tests -q            # everything but the fixed point
+    python3 -m pytest tests -q -m bootstrap   # the fixed point alone
+    python3 -m pytest tests -q -m ''      # both, in one run
+
+To run both, use the last one rather than the first two in turn. The fixed
+point is a chain nothing can parallelize -- `boot` compiling the compiler,
+linking the result, and that compiling it again, about two minutes a step --
+and in one run it overlaps the rest of the suite instead of starting after it.
+On a 16-core arm64 Mac, after a change to `src/` (so `boot` is rebuilt), the
+combined run takes about nine minutes. The build of `boot` and everything the tests
+compute from it are cached in `$TMPDIR` by content hash, so a second run
+with nothing changed is quicker; `-n0` runs serially, for debugging.

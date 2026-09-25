@@ -16,8 +16,8 @@ def verifier_probe(tmp_path_factory, allocator_object):
     directory = tmp_path_factory.mktemp("heap-verifier")
     source = directory / "probe.c"
     source.write_text(r'''
-#include <assert.h>
 #include "turkey_runtime.c"
+#include <assert.h>
 
 static int64_t expected_count;
 static void check_stopped(void) {

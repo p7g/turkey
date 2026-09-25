@@ -1,4 +1,4 @@
-"""The Turkey allocator exports, called from C before module initialization."""
+"""The Turkey allocator exports, called from C without running the program."""
 
 import os
 import subprocess
@@ -25,6 +25,7 @@ static void panic_is(const char *message) {
 }
 
 int main(void) {
+    turkey_giblets_initialize();
     RootFrame frame;
     void *held[32] = {0};
     turkey_root_enter(&frame, held, 32, "allocator probe");
@@ -128,11 +129,7 @@ int main(void) {
     turkey_root_leave(&frame);
     turkey_collect();
     assert(turkey_heap_objects() == 0);
-    assert(stats_allocations == 25);
-    assert(stats_by_kind[0] == 1 && stats_by_kind[1] == 1);
-    assert(stats_by_kind[2] == 12 && stats_by_kind[3] == 1);
-    assert(stats_by_kind[4] == 1 && stats_by_kind[5] == 7);
-    assert(stats_by_kind[6] == 0 && stats_by_kind[7] == 2);
+    turkey_gc_report();
     return 0;
 }
 ''')
@@ -156,12 +153,19 @@ def test_allocator_exports_before_initialization(allocator_probe, stress):
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout == ""
     assert result.stderr
-    assert all(line.startswith("[gc ") for line in result.stderr.splitlines())
+    assert all(line.startswith("[gc") for line in result.stderr.splitlines())
+    assert ", allocations 25," in result.stderr
+    assert ("[gc] by kind: constr 1, record 1, array 12, closure 1, closure-env 1, "
+            "box 7, cell 2\n") in result.stderr
 
 
 def test_allocator_symbols_are_defined_only_in_turkey(allocator_object):
     names = ["turkey_cell_new", "turkey_object_new", "turkey_array_new",
-             "turkey_box", "turkey_unbox", "turkey_closure_shell", "turkey_string_new"]
+             "turkey_box", "turkey_unbox", "turkey_closure_shell", "turkey_string_new",
+             "turkey_root_enter", "turkey_root_leave", "turkey_frame_table_register",
+             "turkey_entry_stack_set", "turkey_collect", "turkey_gc_report",
+             "turkey_gc_set_stress", "turkey_heap_objects", "turkey_roots_head",
+             "turkey_giblets_initialize"]
     def defined(path):
         result = subprocess.run(["nm", "-g", str(path)], check=True,
                                 capture_output=True, text=True)

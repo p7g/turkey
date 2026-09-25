@@ -20,6 +20,7 @@ def gc_probe(tmp_path_factory, allocator_object):
     source.write_text('''
 #include "turkey_runtime.h"
 int main(int argc, char **argv) {
+    turkey_giblets_initialize();
     if (argc > 1) turkey_gc_set_stress(0);
     if (argc > 2) turkey_array_new(0, 0, 8, 0);
     turkey_string_new((const unsigned char *)"a", 1);
@@ -82,6 +83,7 @@ def region_probe(tmp_path_factory, allocator_object):
 #include "turkey_runtime.c"
 #include <assert.h>
 int main(void) {
+    turkey_giblets_initialize();
     RootFrame frame;
     void *held[96] = {0};
     turkey_root_enter(&frame, held, 96, "region probe");
@@ -97,23 +99,23 @@ int main(void) {
             if (i % 137 == 0) turkey_collect();
             for (int j = 0; j < 96; j++) if (held[j]) {
                 TurkeyObject *s = held[j];
-                assert(find_header(s));
-                assert(!find_header((unsigned char *)s + 1));
+                assert(turkey_heap_contains(s));
+                assert(!turkey_heap_contains((unsigned char *)s + 1));
                 if (s->count)
                     assert(((unsigned char *)s->slots)[s->count - 1] == 'q');
             }
         }
-        mark_epoch = UINT32_MAX;
+        turkey_heap_set_mark_epoch(UINT32_MAX);
         turkey_collect();
-        assert(mark_epoch == 1);
-        assert(heap_count == 96);
-        assert(find_header(held[0]));
+        assert(turkey_heap_mark_epoch() == 1);
+        assert(turkey_heap_objects() == 96);
+        assert(turkey_heap_contains(held[0]));
         void *dead = held[0];
         memset(held, 0, sizeof(held));
         turkey_collect();
-        assert(!find_header(dead));
-        assert(heap_count == 0);
-        assert(region_bytes == 0);
+        assert(!turkey_heap_contains(dead));
+        assert(turkey_heap_objects() == 0);
+        assert(turkey_heap_region_bytes() == 0);
     }
     /* Keep a single object while repeatedly filling and reusing its size
        class. A leak of slots in partly live regions grows without bound. */
@@ -121,13 +123,13 @@ int main(void) {
     for (int cycle = 0; cycle < 30; cycle++) {
         for (int i = 0; i < 2000; i++) turkey_string_new(bytes, 31);
         turkey_collect();
-        assert(heap_count == 1);
-        assert(region_bytes == REGION_BYTES);
+        assert(turkey_heap_objects() == 1);
+        assert(turkey_heap_region_bytes() == REGION_BYTES);
         assert(((unsigned char *)((TurkeyObject *)held[0])->slots)[30] == 'q');
     }
     turkey_root_leave(&frame);
     turkey_collect();
-    assert(region_bytes == 0);
+    assert(turkey_heap_region_bytes() == 0);
     free(bytes);
     return turkey_has_panicked != 0;
 }
@@ -181,7 +183,7 @@ static int survives(void *holder, void *s) {
     turkey_root_enter(&frame, roots, 1, "code probe");
     frame.live = 1;
     turkey_collect();
-    int alive = find_header(s) != NULL;
+    int alive = turkey_heap_contains(s) != 0;
     turkey_root_leave(&frame);
     return alive;
 }
@@ -200,6 +202,7 @@ static void *object_holding(int32_t code, void *s) {
 }
 
 int main(void) {
+    turkey_giblets_initialize();
     void *a7 = turkey_string_new((const unsigned char *)"a7", 2);
     assert(survives(array_holding(7, a7), a7));
 

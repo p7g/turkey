@@ -70,31 +70,23 @@ def test_globals_precede_every_managed_allocation(modules, tmp_path, backend):
     assert result.returncode == 0, result.stderr
     generated = tmp_path / ("program.s" if backend == "native" else "program.ll")
     generated.write_text(result.stdout)
-    runtime = tmp_path / "runtime.o"
-    subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-c", str(bootc.RUNTIME),
-                    "-Dturkey_heap_allocate=probe_allocate", "-o", str(runtime)],
-                   check=True, capture_output=True, text=True)
     probe = tmp_path / "probe.c"
     probe.write_text('''
 #include <stdint.h>
 #include <stdlib.h>
-extern void *probe_allocate(uint64_t, int64_t, void *);
-extern int64_t probe_ready(void);
-static int steps, allocated;
+#include "turkey_runtime.h"
+static int steps;
 int64_t probe_step(int64_t n) {
-    if (allocated || n != ++steps) abort();
+    /* In order, and before the program has allocated anything. */
+    if (n != ++steps || turkey_heap_objects() != 0 || turkey_collection_count() != 0)
+        abort();
     return n == 1 ? 40 : 2;
-}
-void *turkey_heap_allocate(uint64_t size, int64_t kind, void *frame) {
-    if (!allocated && (steps != 2 || probe_ready() != 42)) abort();
-    allocated = 1;
-    return probe_allocate(size, kind, frame);
 }
 ''')
     binary = tmp_path / "program"
-    subprocess.run([*toolchain.cc(), "-O1",
+    subprocess.run([*toolchain.cc(), "-O1", "-I", str(bootc.RUNTIME.parent),
                     *toolchain.clang_only("-Wno-override-module"), str(generated),
-                    str(runtime), str(probe), *toolchain.libraries(), "-o", str(binary)],
+                    str(bootc.RUNTIME), str(probe), *toolchain.libraries(), "-o", str(binary)],
                    check=True, capture_output=True, text=True)
     for stress in ["0", "1"]:
         run = subprocess.run(toolchain.command(binary), capture_output=True, text=True,
@@ -110,24 +102,33 @@ def test_c_can_run_early_initialization(modules, tmp_path, backend):
     up giblet state exactly as `turkey_entry` does."""
     entry, env = modules(
         'foreign "probe_step" fun step() -> Int\n'
-        'foreign "probe_again" fun again() -> Unit\n'
         'var runs : Int = step()\n'
-        'fun read() -> Int = runs\n'
-        'fun rerun() -> Unit = again()\n',
-        'let base : Int = 0',
-        main='print(P.read()); P.rerun(); print(P.read())',
-        exports="read, rerun")
+        'foreign "probe_read" fun read() -> Int = runs\n',
+        'let base : Int = 0')
     result = compile_source(entry, env, backend)
     assert result.returncode == 0, result.stderr
+    # The probe supplies C's main, and never runs the program's.
+    main = toolchain.c_symbol("main")
+    text = result.stdout.replace(f'"{main}"', '"_unused_probe_main"')
+    text = text.replace("@main(", "@unused_probe_main(")
     generated = tmp_path / ("program.s" if backend == "native" else "program.ll")
-    generated.write_text(result.stdout)
+    generated.write_text(text)
     probe = tmp_path / "probe.c"
     probe.write_text('''
 #include <stdint.h>
+#include <stdio.h>
 #include "turkey_runtime.h"
 static int64_t steps;
 int64_t probe_step(void) { return ++steps; }
-void probe_again(void) { turkey_giblets_initialize(); }
+int64_t probe_read(void);
+int main(void) {
+    printf("%lld ", (long long)probe_read());
+    turkey_giblets_initialize();
+    printf("%lld ", (long long)probe_read());
+    turkey_giblets_initialize();
+    printf("%lld\\n", (long long)probe_read());
+    return 0;
+}
 ''')
     binary = tmp_path / "program"
     subprocess.run([*toolchain.cc(), "-O1", "-I", str(bootc.RUNTIME.parent),
@@ -138,7 +139,8 @@ void probe_again(void) { turkey_giblets_initialize(); }
     run = subprocess.run(toolchain.command(binary), capture_output=True, text=True,
                          env=env)
     assert run.returncode == 0, run.stderr
-    assert run.stdout == "1\n2\n"
+    # Zero before, as untraced storage starts; each call runs the initializer.
+    assert run.stdout == "0 1 2\n"
 
 
 @pytest.mark.parametrize("body, dependency, message", [
@@ -153,9 +155,9 @@ void probe_again(void) { turkey_giblets_initialize(); }
      'if n == 0 { Prim.error("early") } else { helper(n - 1) }\n'
      'fun read() -> Int = value',
      'let base : Int = 0', 'panics with a String'),
-    ('import Unsafe.Runtime as R\n'
-     'let value : Prim.Ptr = R.heapAllocate(32, 0, Prim.frameAddress())\nfun read() -> Int = 0',
-     'let base : Int = 0', 'may not call turkey_heap_allocate'),
+    ('import Turkey.Heap as H\n'
+     'let value : Prim.Ptr = H.allocate(32, 0, Prim.frameAddress())\nfun read() -> Int = 0',
+     'let base : Int = 0', 'may not call the collector'),
     ('let (a, b) : (Int, Int) = (1, 2)\nfun read() -> Int = a + b',
      'let base : Int = 0', 'builds a tuple'),
     ('var value : String = "traced"\nfun read() -> Int = 0',
@@ -199,20 +201,18 @@ def test_early_raw_panic_stops_before_allocation(modules, tmp_path, backend):
     assert result.returncode == 0, result.stderr
     generated = tmp_path / ("program.s" if backend == "native" else "program.ll")
     generated.write_text(result.stdout)
-    runtime = tmp_path / "runtime.o"
-    subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-c", str(bootc.RUNTIME),
-                    "-Dturkey_heap_allocate=unused_allocate", "-o", str(runtime)],
-                   check=True, capture_output=True, text=True)
     probe = tmp_path / "probe.c"
-    probe.write_text('#include <stdint.h>\n#include <stdlib.h>\n'
-                     'void *turkey_heap_allocate(uint64_t size, int64_t kind, void *frame) '
-                     '{ abort(); }\n')
+    probe.write_text('#include <stdint.h>\n#include <stdio.h>\n#include "turkey_runtime.h"\n'
+                     '__attribute__((destructor)) static void report(void) '
+                     '{ fprintf(stderr, "objects %lld\\n", (long long)turkey_heap_objects()); }\n')
     binary = tmp_path / "program"
-    subprocess.run([*toolchain.cc(), "-O1",
+    subprocess.run([*toolchain.cc(), "-O1", "-I", str(bootc.RUNTIME.parent),
                     *toolchain.clang_only("-Wno-override-module"), str(generated),
-                    str(runtime), str(probe), *toolchain.libraries(), "-o", str(binary)],
+                    str(bootc.RUNTIME), str(probe), *toolchain.libraries(), "-o", str(binary)],
                    check=True, capture_output=True, text=True)
     run = subprocess.run(toolchain.command(binary), capture_output=True, text=True, env=env)
     assert run.returncode == 1, run.stderr
     assert run.stdout == ""
     assert run.stderr.startswith("panic: early failure\n")
+    # Nothing was allocated: the entry stopped before interning a literal.
+    assert run.stderr.endswith("objects 0\n")

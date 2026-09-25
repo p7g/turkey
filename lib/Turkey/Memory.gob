@@ -22,6 +22,9 @@ import Data.Bool.Type (Bool(..))
 
 -- Set `count` bytes from `p` to `value`'s low byte.
 --
+-- These two run on every allocation, so their index arithmetic wraps rather
+-- than checking: a count of bytes that fits in memory is far from overflow.
+--
 -- A word at a time, then the tail a byte at a time. Every object the
 -- allocator hands out is zeroed through here, so a byte loop was a quarter of
 -- the compiler's own run time. arm64 permits an unaligned 64-bit store, so
@@ -30,14 +33,14 @@ fun fill(p : Prim.Ptr, count : Int, value : Int) -> Unit {
     let low = Prim.intAnd(value, 255)
     let word = Prim.intMulWrapping(low, 72340172838076673)
     var i = 0
-    while i + 8 <= count {
+    while Prim.intAddWrapping(i, 8) <= count {
         Prim.storeI64(p, i, word)
-        i = i + 8
+        i = Prim.intAddWrapping(i, 8)
     }
     let byte = Prim.byteFromInt(low)
     while i < count {
         Prim.storeI8(p, i, byte)
-        i = i + 1
+        i = Prim.intAddWrapping(i, 1)
     }
 }
 
@@ -47,46 +50,28 @@ fun fill(p : Prim.Ptr, count : Int, value : Int) -> Unit {
 -- only ever overwrites bytes already read.
 fun copy(target : Prim.Ptr, source : Prim.Ptr, count : Int) -> Unit {
     var i = 0
-    while i + 8 <= count {
+    while Prim.intAddWrapping(i, 8) <= count {
         Prim.storeI64(target, i, Prim.loadI64(source, i))
-        i = i + 8
+        i = Prim.intAddWrapping(i, 8)
     }
     while i < count {
         Prim.storeI8(target, i, Prim.loadI8(source, i))
-        i = i + 1
+        i = Prim.intAddWrapping(i, 1)
     }
 }
 
 -- The number of zero bits below the lowest set bit: 64 for zero, as the free
 -- bitmap's search wants -- a word with no free slot has none to find.
 --
--- Halving the window six times rather than testing a bit at a time: the
--- allocator asks this at every allocation, and a loop over the bits costs up
--- to 63 iterations there. Only low bits are ever tested, so `intShr` being
--- arithmetic does not matter.
+-- A de Bruijn multiply: isolating the lowest set bit and multiplying by the
+-- constant puts a distinct 6-bit pattern in the top bits for each of the 64
+-- positions, and the table maps the pattern back. The allocator asks this at
+-- every allocation, so it is one multiply and one load rather than a loop.
+-- The table is the position plus 48, so every entry is a printable byte.
 fun trailingZeros(x : Int) -> Int {
     if x == 0 { return 64 }
-    var n = 0
-    var rest = x
-    if Prim.intAnd(rest, 4294967295) == 0 {
-        n = n + 32
-        rest = Prim.intShr(rest, 32)
-    }
-    if Prim.intAnd(rest, 65535) == 0 {
-        n = n + 16
-        rest = Prim.intShr(rest, 16)
-    }
-    if Prim.intAnd(rest, 255) == 0 {
-        n = n + 8
-        rest = Prim.intShr(rest, 8)
-    }
-    if Prim.intAnd(rest, 15) == 0 {
-        n = n + 4
-        rest = Prim.intShr(rest, 4)
-    }
-    if Prim.intAnd(rest, 3) == 0 {
-        n = n + 2
-        rest = Prim.intShr(rest, 2)
-    }
-    if Prim.intAnd(rest, 1) == 0 { n + 1 } else { n }
+    let lowest = Prim.intAnd(x, Prim.intNegWrapping(x))
+    let pattern = Prim.intAnd(Prim.intShr(Prim.intMulWrapping(lowest, 285870213051386505), 58), 63)
+    let positions = Prim.cString("01`2iaL3mjbZVMA4ngkTec[F]WQNHB<5o_hKlYU@fSdE\\PG;^JX?RDO:I>C9=876")
+    Prim.byteToInt(Prim.loadI8(positions, pattern)) - 48
 }

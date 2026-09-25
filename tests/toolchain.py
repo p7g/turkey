@@ -9,7 +9,7 @@ Two settings, both split with shell-word rules:
 * `$TURKEY_RUN` is a prefix for executing anything the compiler linked -- a
   test program or a built `boot`. Empty means run it directly, which is right
   natively and also under qemu-user once binfmt_misc knows the format; the
-  prefix (`qemu-aarch64`) is for a machine where it cannot be registered.
+  prefix (`qemu-aarch64-static`) is for a machine where it cannot be registered.
 
 `scripts/build.sh` reads the same two variables. Every cached build output
 is keyed on `identity()` as well as its sources: the same source linked by two

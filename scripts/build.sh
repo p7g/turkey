@@ -14,12 +14,20 @@
 # The compiler reads lib/ relative to the working directory, so every stage runs
 # from the repository root.
 #
-# bootstrap/ holds the committed compiler: the whole-program arm64 assembly for
-# src/Main.gob under gzip -9 -n (3.5 MB; -n so the same text always compresses
-# to the same bytes), a copy of the C runtime it was emitted against, and
-# PROVENANCE, which records the commit it came from and the hashes checked here
-# before anything is built. To reproduce it from source, check out that commit
-# and build it with the bootstrap that commit itself carries.
+# bootstrap/ holds the committed compiler: the whole-program assembly for
+# src/Main.gob once per target, each under gzip -9 -n (3.5 MB each; -n so the
+# same text always compresses to the same bytes), a copy of the C runtime they
+# were emitted against, and PROVENANCE, which records the commit they came from
+# and the hashes checked here before anything is built. Every target's assembly
+# is the same compiler emitting for a different platform, so a build on any of
+# them starts from the same source. To reproduce it, check out that commit and
+# build it with the bootstrap that commit itself carries.
+#
+# The target is the one the C compiler links for, read from `$CC -dumpmachine`,
+# unless --target names it; every stage is emitted for it and linked by $CC, so
+# the two must agree.
+# Nothing here asks what the host is: under qemu-user an x86-64 Linux machine
+# builds and runs the arm64 Linux compiler, with $TURKEY_CC a cross compiler.
 #
 # The runtime copy is what makes an ABI change possible: a new compiler is built
 # by the old one, which only links against the old runtime. So stage1 links
@@ -30,9 +38,11 @@
 # Measured on arm64 macOS, Apple clang 17: 128 s for stage2, 376 s with
 # --fixpoint, of which each self-compile is about 105 s and each link 10 s.
 #
-# Usage: scripts/build.sh [--out DIR] [--fixpoint] [--stage1 BINARY]
+# Usage: scripts/build.sh [--out DIR] [--target TARGET] [--fixpoint]
+#                         [--stage1 BINARY]
 #
 #   --out DIR        where the stages go (default build/stages)
+#   --target TARGET  arm64-darwin or arm64-linux (default: what $CC links for)
 #   --fixpoint       also build stage3 and check stage3's output equals stage2's
 #   --stage1 BINARY  use an existing compiler as stage1 instead of the committed
 #                    assembly; how the first bump was made, and how to bump
@@ -54,26 +64,54 @@ cd "$ROOT"
 # printed in the first line of the assembly, so the spelling is in the bytes.
 SOURCE=src/Main.gob
 BOOTSTRAP=bootstrap
-ARTIFACT=$BOOTSTRAP/arm64-darwin.s.gz
 
 out=build/stages
+target=
 fixpoint=0
 stage1=
 while [ $# -gt 0 ]; do
     case $1 in
         --out) out=$2; shift 2 ;;
+        --target) target=$2; shift 2 ;;
         --fixpoint) fixpoint=1; shift ;;
         --stage1) stage1=$2; shift 2 ;;
-        *) echo "usage: $0 [--out DIR] [--fixpoint] [--stage1 BINARY]" >&2
+        *) echo "usage: $0 [--out DIR] [--target TARGET] [--fixpoint]" \
+                "[--stage1 BINARY]" >&2
            exit 2 ;;
     esac
 done
 
-if [ "$(uname -s)" != Darwin ] || [ "$(uname -m)" != arm64 ]; then
-    echo "build.sh: the bootstrap is arm64 macOS assembly;" \
-         "this host is $(uname -s) $(uname -m)" >&2
+# What $CC links for, as a target, or nothing if the triple is not one this
+# knows: arm64-apple-darwin25.6.0 from Apple clang, aarch64-linux-gnu from gcc.
+# --target is for a compiler whose triple is spelled some other way.
+machine=$($CC -dumpmachine 2>/dev/null) || {
+    echo "build.sh: cannot run the C compiler '$CC'" >&2
+    exit 1
+}
+case $machine in
+    arm64-apple-darwin*|arm64-apple-macos*|aarch64-apple-darwin*)
+        linked=arm64-darwin ;;
+    aarch64*-linux*|arm64*-linux*) linked=arm64-linux ;;
+    *) linked= ;;
+esac
+if [ -z "$target" ]; then
+    target=$linked
+fi
+case $target in
+    arm64-darwin|arm64-linux) ;;
+    '') echo "build.sh: '$CC' links for $machine, which is not a target;" \
+             "set TURKEY_CC to an arm64 macOS or Linux C compiler," \
+             "or pass --target" >&2
+        exit 1 ;;
+    *) echo "build.sh: unknown target '$target';" \
+            "supported: arm64-darwin, arm64-linux" >&2
+       exit 2 ;;
+esac
+if [ -n "$linked" ] && [ "$target" != "$linked" ]; then
+    echo "build.sh: the target is $target but '$CC' links for $machine" >&2
     exit 1
 fi
+ARTIFACT=$BOOTSTRAP/$target.s.gz
 
 mkdir -p "$out"
 case $out in /*) ;; *) out=$ROOT/$out ;; esac
@@ -88,14 +126,20 @@ provenance() {
     sed -n "s/^$1: //p" "$BOOTSTRAP/PROVENANCE"
 }
 
+# shasum comes with perl, which a minimal Linux may not have; coreutils'
+# sha256sum prints the same first field.
 sha() {
-    shasum -a 256 "$1" | cut -d' ' -f1
+    if command -v shasum > /dev/null; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    else
+        sha256sum "$1" | cut -d' ' -f1
+    fi
 }
 
 # The compiler's own source, compiled by $1, into $2.
 emit() {
     step "$(basename "$1") $SOURCE -> $(basename "$2")"
-    $RUN "$1" native "$SOURCE" > "$2.tmp"
+    $RUN "$1" native --target "$target" "$SOURCE" > "$2.tmp"
     mv "$2.tmp" "$2"
 }
 
@@ -112,15 +156,20 @@ if [ -n "$stage1" ]; then
     step "stage1 is $stage1"
     cp "$stage1" "$out/stage1"
 else
-    expected=$(provenance gz-sha256)
-    if [ "$(sha "$ARTIFACT")" != "$expected" ]; then
-        echo "build.sh: $ARTIFACT does not match PROVENANCE's gz-sha256" >&2
+    if [ ! -f "$ARTIFACT" ]; then
+        echo "build.sh: there is no committed compiler for $target" >&2
+        exit 1
+    fi
+    expected=$(provenance "$target gz-sha256")
+    if [ -z "$expected" ] || [ "$(sha "$ARTIFACT")" != "$expected" ]; then
+        echo "build.sh: $ARTIFACT does not match PROVENANCE's" \
+             "$target gz-sha256" >&2
         exit 1
     fi
     step "bootstrap runtime"
     $CC -std=c11 -O1 -c -o "$out/runtime0.o" "$BOOTSTRAP/runtime/turkey_runtime.c"
     gunzip -c "$ARTIFACT" > "$out/stage1.s"
-    if [ "$(sha "$out/stage1.s")" != "$(provenance asm-sha256)" ]; then
+    if [ "$(sha "$out/stage1.s")" != "$(provenance "$target asm-sha256")" ]; then
         echo "build.sh: $ARTIFACT decompresses to the wrong bytes" >&2
         exit 1
     fi

@@ -246,7 +246,8 @@ def runtime_object() -> Path:
     if not output.exists():
         CACHE.mkdir(parents=True, exist_ok=True)
         staging = CACHE / f"runtime-{key}.{os.getpid()}.o"
-        replace_built([*toolchain.cc(), "-std=c11", "-O1", "-c",
+        replace_built([*toolchain.cc(), "-std=c11",
+                       *toolchain.runtime_flags(), "-O1", "-c",
                        "-o", str(staging), str(RUNTIME)], output)
     return output
 

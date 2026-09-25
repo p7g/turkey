@@ -114,10 +114,12 @@ fi
 ARTIFACT=$BOOTSTRAP/$target.s.gz
 
 # glibc keeps the maths library out of libc, and the runtime calls log10;
-# Darwin's libSystem carries it, so there is nothing to add there.
+# Darwin's libSystem carries it, so there is nothing to add there. The
+# collector walks frame records, which Darwin's ABI requires and Linux's leaves
+# to the compiler: clang omits them at -O1 unless told not to.
 case $target in
-    arm64-linux) LIBS=-lm ;;
-    *) LIBS= ;;
+    arm64-linux) LIBS=-lm; RUNTIME_FLAGS=-fno-omit-frame-pointer ;;
+    *) LIBS=; RUNTIME_FLAGS= ;;
 esac
 
 mkdir -p "$out"
@@ -157,7 +159,7 @@ link() {
 }
 
 step "runtime"
-$CC -std=c11 -O1 -c -o "$out/runtime.o" runtime/turkey_runtime.c
+$CC -std=c11 -O1 $RUNTIME_FLAGS -c -o "$out/runtime.o" runtime/turkey_runtime.c
 
 if [ -n "$stage1" ]; then
     step "stage1 is $stage1"
@@ -174,7 +176,8 @@ else
         exit 1
     fi
     step "bootstrap runtime"
-    $CC -std=c11 -O1 -c -o "$out/runtime0.o" "$BOOTSTRAP/runtime/turkey_runtime.c"
+    $CC -std=c11 -O1 $RUNTIME_FLAGS -c -o "$out/runtime0.o" \
+        "$BOOTSTRAP/runtime/turkey_runtime.c"
     gunzip -c "$ARTIFACT" > "$out/stage1.s"
     if [ "$(sha "$out/stage1.s")" != "$(provenance "$target asm-sha256")" ]; then
         echo "build.sh: $ARTIFACT decompresses to the wrong bytes" >&2

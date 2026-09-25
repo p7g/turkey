@@ -137,7 +137,8 @@ int main(void) {
 }
 ''')
     binary = directory / "probe"
-    subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-fsanitize=undefined",
+    subprocess.run([*toolchain.cc(), "-std=c11",
+                    *toolchain.runtime_flags(), "-O1", "-fsanitize=undefined",
                     "-I", str(bootc.REPO_ROOT / "runtime"), str(source),
                     str(allocator_object), "-lm", "-pthread", "-o",
                     str(binary)], check=True, capture_output=True, text=True)

@@ -488,7 +488,16 @@ void turkey_entry_stack_set(void *frame) { entry_stack_high = frame; }
    of the chain marks whatever the words beyond it happen to hold, which would
    surface as a corruption a long way from here and look exactly like a
    miscompile. So the frame pointer must stay inside this thread's stack, stay
-   16-byte aligned, and strictly increase.
+   8-byte aligned, and strictly increase. Eight and not sixteen: the stack
+   pointer is 16-byte aligned, a frame record need not be, and clang for
+   arm64 Linux puts one at sp+24 when it saves d8 below it. A walk that stops
+   there never reaches the Turkey frame that called into the runtime, whose
+   roots then go unmarked and are freed while live.
+
+   The walk also needs every C function between the collector and the Turkey
+   code that called it to keep a frame record, or that caller's return address
+   is never seen. Darwin's ABI requires one; on Linux it is the compiler's
+   choice, and the runtime is compiled with -fno-omit-frame-pointer there.
 
    There is no low bound to check. The walk starts at this function's own live
    frame and `frame` only ever increases, so nothing it reaches can be below
@@ -506,7 +515,7 @@ static void scan_native_frames(void) {
         return;
     }
     void **frame = __builtin_frame_address(0);
-    while ((char *)frame + 16 <= high && ((uintptr_t)frame & 15) == 0) {
+    while ((char *)frame + 16 <= high && ((uintptr_t)frame & 7) == 0) {
         /* The return address in *this* record is an address in the *caller*,
            so the entry it finds describes the caller's frame -- whose `x29` is
            this record's saved one. Applying the offsets to this frame instead
@@ -514,7 +523,7 @@ static void scan_native_frames(void) {
            how this was wrong the first time. */
         void **next = frame[0];
         if (next <= frame || (char *)next + 16 > high
-                || ((uintptr_t)next & 15) != 0) break;
+                || ((uintptr_t)next & 7) != 0) break;
         const FrameEntry *entry = frame_entry_for((uintptr_t)frame[1]);
         if (entry != NULL)
             for (int64_t index = 0; index < entry->count; ++index) {

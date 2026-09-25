@@ -169,7 +169,8 @@ def test_c_calls_a_definition_through_a_pointer(probe, tmp_path, backend):
     caller = tmp_path / "caller.c"
     caller.write_text(CALLER, encoding="utf-8")
     runtime = tmp_path / "runtime.o"
-    subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-c", "-o",
+    subprocess.run([*toolchain.cc(), "-std=c11",
+                    *toolchain.runtime_flags(), "-O1", "-c", "-o",
                     str(runtime),
                     str(REPO_ROOT / "runtime" / "turkey_runtime.c")],
                    check=True)

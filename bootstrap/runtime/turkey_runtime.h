@@ -5,16 +5,9 @@
 
 extern int32_t turkey_has_panicked;
 
-/* A `String` is a byte array on the heap, so these are `void *`:
-   `turkey_string_new` is how the entry interns a literal. The float three are
-   here because formatting and parsing lean on `snprintf` and `strtod`; the
-   formatter answers NUL-terminated text in a runtime buffer, which
-   `turkey_float_to_string` in `Turkey.Alloc` copies into a string. */
+/* A `String` is a byte array on the heap, so this is `void *`:
+   `turkey_string_new` is how the entry interns a literal. */
 void *turkey_string_new(const unsigned char *bytes, int64_t length);
-void *turkey_float_to_string(double value);
-const char *turkey_float_format(double value);
-double turkey_float_parse(void *value);
-int32_t turkey_float_can_parse(void *value);
 
 /* C-callable exports supplied by Turkey.Alloc in the generated program.
    Scalar arguments use Turkey's 64-bit Int; stored header fields stay 32-bit. */
@@ -26,6 +19,11 @@ uint64_t turkey_unbox(void *box, int64_t layout);
 void *turkey_array_new(int64_t length, uint64_t initial, int64_t element_width,
                        int64_t element_layout);
 void *turkey_closure_shell(uint64_t code);
+
+/* The program's early initialization -- every giblet module's globals -- under
+   a C name. `turkey_entry` runs it first; C that calls a program's Turkey
+   exports without running the program calls it before anything else. */
+void turkey_giblets_initialize(void);
 
 /* Collector-owned services used by the allocator giblet. `frame` is the
    allocator's own frame pointer, where the collector's walk starts. */

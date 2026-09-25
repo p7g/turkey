@@ -14,8 +14,8 @@ def allocator_probe(allocator_object, tmp_path_factory):
     directory = tmp_path_factory.mktemp("allocator-probe")
     source = directory / "probe.c"
     source.write_text(r'''
-#include <assert.h>
 #include "turkey_runtime.c"
+#include <assert.h>
 
 static void panic_is(const char *message) {
     assert(turkey_has_panicked);

@@ -113,6 +113,13 @@ if [ -n "$linked" ] && [ "$target" != "$linked" ]; then
 fi
 ARTIFACT=$BOOTSTRAP/$target.s.gz
 
+# glibc keeps the maths library out of libc, and the runtime calls log10;
+# Darwin's libSystem carries it, so there is nothing to add there.
+case $target in
+    arm64-linux) LIBS=-lm ;;
+    *) LIBS= ;;
+esac
+
 mkdir -p "$out"
 case $out in /*) ;; *) out=$ROOT/$out ;; esac
 
@@ -145,7 +152,7 @@ emit() {
 
 link() {
     step "link $(basename "$2")"
-    $CC -o "$2.tmp" "$1" "$3"
+    $CC -o "$2.tmp" "$1" "$3" $LIBS
     mv "$2.tmp" "$2"
 }
 

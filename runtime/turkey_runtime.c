@@ -1,3 +1,12 @@
+/* clock_gettime and CLOCK_MONOTONIC are POSIX, not C11, and glibc hides them
+   under -std=c11 unless a feature-test macro asks for them. _DEFAULT_SOURCE is
+   what -std=gnu11 would define. Not _POSIX_C_SOURCE: Darwin's headers read
+   that as a request for strict POSIX and hide their extensions, while they
+   ignore _DEFAULT_SOURCE, so the macOS build is untouched by this. A
+   feature-test macro counts only before the first system header, so a probe
+   that #includes this file has to include it before anything else. */
+#define _DEFAULT_SOURCE
+
 #include "turkey_runtime.h"
 
 #include <inttypes.h>

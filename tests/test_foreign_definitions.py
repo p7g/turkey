@@ -26,11 +26,12 @@ class Probe:
     def __init__(self, name: str, path: Path, entry: Path) -> None:
         self.name, self.path, self.entry = name, path, entry
 
-    def __call__(self, body: str, giblet: bool = True) -> str:
+    def __call__(self, body: str, giblet: bool = True,
+                 command: str = "core") -> str:
         """The compiler's verdict on the module, which is listed as a giblet
         unless the test says otherwise."""
         self.path.write_text(f"module {self.name} (f)\n\n{body}", encoding="utf-8")
-        return verdict(self.entry, self.name if giblet else "")
+        return verdict(self.entry, self.name if giblet else "", command)
 
 
 @pytest.fixture
@@ -56,7 +57,7 @@ def test_a_definition_in_a_giblet_module_is_accepted(probe):
 
 def test_a_definition_outside_a_giblet_module_is_refused(probe):
     """The gate is what makes a C caller's job empty: no root frame to set up
-    and no collector to hand, because the body holds nothing traced."""
+    and no collector to hand, because the body allocates nothing."""
     message = probe('foreign "probe_f" fun f(x : Int) -> Int { x + 1 }\n',
                     giblet=False)
     assert "a foreign definition may only appear in a giblet module" in message
@@ -70,9 +71,10 @@ def test_a_program_may_not_define_a_symbol(tmp_path):
 
 
 def test_the_body_is_held_to_the_giblet_rule(probe):
-    message = probe('foreign "probe_f" fun f(x : Int) -> Int {\n'
-                    '    let s = "text"\n    x\n}\n')
-    assert "a string literal has type String" in message
+    message = probe('foreign "probe_f" fun f(x : Int) -> Int = len([x, x])\n',
+                    command="ssa")
+    assert "f is in a giblet module and may allocate: @f builds an array" \
+        in message, message
 
 
 # -- what it may say ---------------------------------------------------------

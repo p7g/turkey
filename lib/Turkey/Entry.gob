@@ -3,8 +3,8 @@ module Turkey.Entry (main, entryThread, crashReport, installCrashHandler)
 -- Start a compiled program and report its result or a fault.
 -- C calls these exported functions: the generated main, pthread_create, and
 -- signal delivery enter without collector setup. As a giblet module, this
--- code holds no traced values. Text is raw cString bytes, and numbers are
--- written a digit at a time.
+-- code does not allocate or hold a traced value across a call. Text is raw
+-- cString bytes, and numbers are written a digit at a time.
 --
 -- No top-level let may depend on module initialization: that runs inside
 -- programEntry, after this module's main has already started.
@@ -16,6 +16,8 @@ import Std.Classes
 -- `Turkey.Memory` does.
 import Data.Int ()
 import Data.Bool.Type (Bool(..))
+import Target (OS(..))
+import Target as Target
 import Unsafe.Libc as Libc
 import Unsafe.Runtime as Rt
 import Turkey.Alloc ()
@@ -165,8 +167,21 @@ fun reportPanic() -> Unit {
 -- by `main` in a binary and by the host under the JIT.
 foreign "turkey_install_crash_handler" fun installCrashHandler() -> Unit {
     let handler = Prim.codeAddress("turkey_crash_report")
-    let _ = Libc.signal(Libc.sigsegv, handler)
-    let _ = Libc.signal(Libc.sigbus, handler)
+    let _ = Libc.signal(sigsegv(), handler)
+    let _ = Libc.signal(sigbus(), handler)
+}
+
+-- Signal numbers, from each target's `<signal.h>`. Functions rather than
+-- top-level `let`s, which would be initialized only after this module has
+-- started; each call is a literal once the optimizer has decided the `match`.
+fun sigsegv() -> Int = match Target.os {
+    Darwin -> 11
+    Linux -> 11
+}
+
+fun sigbus() -> Int = match Target.os {
+    Darwin -> 10
+    Linux -> 7
 }
 
 -- The handler, `void (*)(int)`.
@@ -180,7 +195,7 @@ foreign "turkey_install_crash_handler" fun installCrashHandler() -> Unit {
 -- best-effort, since the stores that push a frame may be reordered; and it
 -- never returns into the instruction that faulted.
 foreign "turkey_crash_report" fun crashReport(signal : Int) -> Unit {
-    if cInt(signal) == Libc.sigbus {
+    if cInt(signal) == sigbus() {
         writeText(2, Prim.cString("\n*** SIGBUS in generated code\n"))
     } else {
         writeText(2, Prim.cString("\n*** SIGSEGV in generated code\n"))

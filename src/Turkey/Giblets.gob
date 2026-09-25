@@ -1,44 +1,37 @@
-module Turkey.Giblets (gibletModules, checkPlacement, traced, checkProgram, checkLowered)
+module Turkey.Giblets (gibletModules, checkPlacement, checkLowered)
 
--- Giblets: modules whose code holds no traced value.
+-- Giblets: modules whose code does not allocate and does not hold a traced
+-- value across a call.
 --
 -- The collector runs when nothing may allocate and has no roots of its own, so
--- the code it is written in must allocate nothing. That is enforced by the
--- *types* a binding names rather than by an effect it claims: code naming no
--- traced type allocates nothing, because there is nothing for it to allocate.
--- The check is a walk over one binding's Core asking of each node whether
--- `Layout.layoutOf` holds its type at a traced pointer.
+-- the code it is written in must allocate nothing and must leave nothing for
+-- it to find. Both are asked of the Low IR after optimization, which is the
+-- code that runs: an allocation the lowering adds -- boxing at a polymorphic
+-- boundary, a generic body past the specialization cap, a call through a
+-- dictionary -- is refused as surely as one the source spells, and a value of
+-- traced type that is never made is accepted. `Target.os` is one: `OS` is
+-- laid out as a traced pointer, but each read of it is a bare constructor the
+-- optimizer puts in place before it decides the `match`.
 --
--- Core is the level to ask at because it is the last one where a type is
--- attached to every node and before specialization has made copies.
---
--- Four things pass that the type rule alone would refuse, none of them a value
--- the function holds: the head of a call; a dictionary argument naming a
--- global instance, which specialization turns into a direct call; a `var`,
--- whose cell a giblet has no closure to leak into, so its contents are checked
--- instead; and a panic's literal message, which is interned static data.
+-- So whether a giblet compiles can depend on what the optimizer does -- an
+-- inlining limit can make one stop compiling -- but every build that does
+-- compile has been checked.
 
 import System.Env as Env
 import Data.Set as Set
-import Turkey.Core as Cr
-import Turkey.Core (Core(..), CoreKind(..), CAlt(..), CBind(..), CParam(..), CProgram(..))
-import Turkey.Ast (Lit(..))
-import Turkey.Decls (DeclTable(..))
 import Turkey.Diag as Diag
-import Turkey.Layout as Layout
 import Turkey.LowIr as LowIr
 import Turkey.LowIr (Low(..), Allocation(..))
 import Turkey.Roots as Roots
 import Turkey.Ssa as Ssa
 import Turkey.Source (Span, showSpan)
-import Turkey.Types as Ty
 
 -- The giblet modules. A list rather than a convention or a declaration form:
 -- joining it is a deliberate edit to the compiler.
 let giblets = ["Turkey.Entry", "Turkey.Memory", "Turkey.Alloc"]
 
 -- Extra names for the tests, which need a giblet module whose code is wrong on
--- purpose. Read by both compilers.
+-- purpose.
 let testHook = "TURKEY_TEST_GIBLETS"
 
 fun gibletModules() -> Set.Set String {
@@ -64,266 +57,10 @@ fun checkPlacement(name : String, library : Bool, where : Span) -> Unit {
     }
 }
 
--- Whether the collector must find a value of this type. An unknown layout is
--- the uniform representation, which is a traced pointer.
-fun traced(decls : DeclTable, ty : Ty.Type) -> Bool =
-    match Layout.layoutOf(decls, ty, Map.new()) {
-        None -> True
-        Some(l) -> l == "ptr" || l == "boxed"
-    }
+-- -- the check ------------------------------------------------------------------
 
-fun checkProgram(program : CProgram, decls : DeclTable) -> Unit {
-    let modules = gibletModules()
-    for b in program.dicts {
-        if Set.contains(modules, b.module_) {
-            failAt("'" + b.module_ + "' is a giblet module and may not declare an "
-                   + "instance: a dictionary is a heap object the collector traces",
-                   b.span, b.span)
-        }
-    }
-    let dicts = Set.new()
-    for b in program.dicts { Set.add(dicts, b.name) }
-    for b in program.binds {
-        if Set.contains(modules, b.module_) {
-            top(Walk { decls = decls, dicts = dicts, bind = b })
-        }
-    }
-}
-
-type Walk = Walk {
-    decls : DeclTable,
-    dicts : Set.Set String,
-    bind  : CBind,
-}
-
-fun failAt(message : String, where : Option Span, fallback : Option Span) -> a =
-    match where {
-        Some(s) -> fail(message, s)
-        None -> match fallback {
-            Some(s) -> fail(message, s)
-            None -> Diag.fail(Diag.whole("type error", message), "")
-        }
-    }
-
-fun top(w : Walk) -> Unit {
-    var value = w.bind.value
-    while isTyLam(value) { value = tyLamBody(value) }
-    match value.kind {
-        CLam(params, body, _) -> {
-            for p in params {
-                require(w, p.ty, "the parameter '" + p.name + "'", value.span)
-            }
-            require(w, body.ty, "the result", value.span)
-            expr(w, body)
-        }
-        _ -> expr(w, value)
-    }
-}
-
-fun isTyLam(e : Core) -> Bool = match e.kind {
-    CTyLam(_, _) -> True
-    _ -> False
-}
-
-fun tyLamBody(e : Core) -> Core = match e.kind {
-    CTyLam(_, body) -> body
-    _ -> e
-}
-
-fun require(w : Walk, ty : Ty.Type, what : String, where : Option Span) -> Unit {
-    if traced(w.decls, ty) {
-        failAt(what + " has type " + Ty.show(Ty.prune(ty)) + ", which the "
-               + "collector traces; '" + w.bind.module_ + "' is a giblet module, "
-               + "whose code holds untraced values only", where, w.bind.span)
-    }
-}
-
-fun expr(w : Walk, e : Core) -> Unit {
-    -- A panic's result never exists, and its type is whatever the context
-    -- wanted -- often a variable nothing fixed.
-    if !panics(e) { require(w, e.ty, describe(e), e.span) }
-    inside(w, e)
-}
-
-fun panics(e : Core) -> Bool = match e.kind {
-    CApp(fn, _) -> isPanic(fn)
-    _ -> False
-}
-
--- The function position of a call: its own type is how the call is spelled,
--- so only what is inside it is checked -- which is nothing for a name, and the
--- whole node otherwise. Answers the node still to check, if any.
-fun callee(w : Walk, fn : Core) -> Option Core {
-    var e = fn
-    while isTyApp(e) { e = tyAppFn(e) }
-    match e.kind {
-        CField(target, _) -> if chosen(w, target) { None } else { Some(e) }
-        CVar(_) -> None
-        CPrim(_) -> None
-        CCon(_) -> None
-        _ -> Some(e)
-    }
-}
-
-fun isTyApp(e : Core) -> Bool = match e.kind {
-    CTyApp(_, _) -> True
-    _ -> False
-}
-
-fun tyAppFn(e : Core) -> Core = match e.kind {
-    CTyApp(fn, _) -> fn
-    _ -> e
-}
-
--- A global dictionary, whose method the elaboration already chose.
-fun chosen(w : Walk, e : Core) -> Bool = match e.kind {
-    CVar(name) -> Set.contains(w.dicts, name)
-    _ -> False
-}
-
-fun inside(w : Walk, e : Core) -> Unit = match e.kind {
-    CLit(_) -> {}
-    CUnit -> {}
-    CVar(_) -> {}
-    CCon(_) -> {}
-    CPrim(_) -> {}
-    CApp(fn, args) -> {
-        match callee(w, fn) {
-            Some(node) -> expr(w, node)
-            None -> {}
-        }
-        let message = takesStaticLiteral(fn) && len(args) == 1 && isLit(args[0])
-        for arg in args {
-            if !message && !chosen(w, arg) { expr(w, arg) }
-        }
-    }
-    CTyApp(fn, _) -> expr(w, fn)
-    CLet(name, bound, value, body, _) -> {
-        match value.kind {
-            CRef(inner) -> if Cr.isRef(bound) {
-                require(w, Cr.refElem(bound), "the variable '" + name + "'",
-                        value.span)
-                expr(w, inner)
-            } else { expr(w, value) }
-            _ -> expr(w, value)
-        }
-        expr(w, body)
-    }
-    CDeref(target) -> if !isCell(target) { expr(w, target) }
-    CAssign(target, value) -> {
-        if !isCell(target) { expr(w, target) }
-        expr(w, value)
-    }
-    CIf(cond, then, otherwise) -> {
-        expr(w, cond)
-        expr(w, then)
-        match otherwise {
-            Some(o) -> expr(w, o)
-            None -> {}
-        }
-    }
-    -- Every pattern over an untraced scrutinee binds untraced values:
-    -- literals, names, `Bool`, and a newtype's erased payload.
-    CMatch(scrutinee, alts) -> {
-        expr(w, scrutinee)
-        for alt in alts { expr(w, alt.body) }
-    }
-    CJoin(_, params, body, rest, _) -> {
-        for p in params {
-            require(w, p.ty, "the parameter '" + p.name + "'", e.span)
-        }
-        expr(w, body)
-        expr(w, rest)
-    }
-    CJump(_, args) -> for arg in args { expr(w, arg) }
-    CLetRec(binds, body) -> {
-        for b in binds {
-            require(w, b.ty, "the local function '" + b.name + "'", b.span)
-        }
-        expr(w, body)
-    }
-    -- An untraced field of a traced aggregate: the aggregate is what the code
-    -- is holding, and it is refused there.
-    CField(target, _) -> expr(w, target)
-    CProject(target, _) -> expr(w, target)
-    CIndex(target, index) -> {
-        expr(w, target)
-        expr(w, index)
-    }
-    -- A tuple, an array, a record, a lambda or a bare cell: each has a traced
-    -- type by construction, and `expr` refused it already.
-    _ -> oops("a node passed the giblets check with a traced shape: "
-              + describe(e))
-}
-
--- The target of a read or write of a `var`: the cell itself is a slot, and
--- what is in it was checked where the variable was made.
-fun isCell(target : Core) -> Bool = match target.kind {
-    CVar(_) -> True
-    _ -> False
-}
-
--- `Prim.error` is a `CVar` in Core, bound at a scheme; a monomorphic builtin
--- would be a `CPrim`.
-fun isPanic(fn : Core) -> Bool {
-    var e = fn
-    while isTyApp(e) { e = tyAppFn(e) }
-    match e.kind {
-        CVar(name) -> name == "Prim.error"
-        CPrim(name) -> name == "Prim.error"
-        _ -> False
-    }
-}
-
--- The primitives whose one argument is a literal the compiler lays out as
--- static data, so the literal is never a value the code holds: a panic's
--- message, and the bytes and symbol behind the two static addresses
--- (SPEC-DELTAS 74).
-fun takesStaticLiteral(fn : Core) -> Bool {
-    var e = fn
-    while isTyApp(e) { e = tyAppFn(e) }
-    let named = match e.kind {
-        CVar(name) -> name
-        CPrim(name) -> name
-        _ -> ""
-    }
-    named == "Prim.error" || named == "Prim.cString" || named == "Prim.codeAddress"
-}
-
-fun isLit(e : Core) -> Bool = match e.kind {
-    CLit(_) -> True
-    _ -> False
-}
-
-fun describe(e : Core) -> String = match e.kind {
-    CLit(LString(_)) -> "a string literal"
-    CLit(_) -> "a literal"
-    CVar(name) -> "'" + name + "'"
-    CCon(name) -> "the constructor '" + name + "'"
-    CPrim(name) -> "'" + name + "'"
-    CTuple(_) -> "a tuple"
-    CArray(_) -> "an array"
-    CRecord(_, _) -> "a record"
-    CLam(_, _, _) -> "a lambda"
-    CTyLam(_, _) -> "a lambda"
-    CApp(_, _) -> "a call's result"
-    _ -> "a value"
-}
-
-fun oops(message : String) -> a = Diag.fail(Diag.whole("internal error", message), "")
-
--- -- after lowering --------------------------------------------------------------
-
--- The check again, on what the lowering made of the same code.
---
--- The type rule says a giblet names nothing traced; it cannot say that the
--- lowering added nothing. Boxing at a polymorphic boundary, a dictionary
--- specialization left generic, a call to an ordinary function that allocates
--- -- none of these is written in a giblet, and each is an allocation in one.
--- So this asks the question the type rule was a proxy for, of the Low IR
--- itself: does a giblet function allocate, call anything that does, or hold a
--- root. Both halves are needed -- the type rule catches what the source says,
--- and this catches what the lowering added.
+-- Does a giblet function allocate, call anything that does, or hold a root.
+-- Every compile that lowers runs this, whichever backend it is for.
 fun checkLowered(functions : Array (Ssa.Func Low), path : String) -> Unit {
     let modules = gibletModules()
     let summary = LowIr.summarize(functions)

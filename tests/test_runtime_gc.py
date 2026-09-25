@@ -73,6 +73,7 @@ def test_allocation_kinds_and_options_survive_stress_override(gc_probe, args):
 def region_probe(tmp_path_factory, allocator_object):
     if toolchain.missing():
         pytest.skip("C compiler unavailable")
+    toolchain.needs_sanitizer()
     root = Path(__file__).resolve().parents[1]
     directory = tmp_path_factory.mktemp("region-probe")
     source = directory / "probe.c"
@@ -162,6 +163,7 @@ def code_probe(tmp_path_factory, allocator_object):
     """
     if toolchain.missing():
         pytest.skip("C compiler unavailable")
+    toolchain.needs_sanitizer()
     root = Path(__file__).resolve().parents[1]
     directory = tmp_path_factory.mktemp("code-probe")
     source = directory / "probe.c"

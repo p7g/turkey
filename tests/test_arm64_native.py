@@ -73,7 +73,7 @@ def _binary(name: str) -> Path:
         staging = stem.with_suffix(stem.suffix + ".bin")
         try:
             _replace_built([*toolchain.cc(), "-o", str(staging), str(source),
-                            str(runtime)], output)
+                            str(runtime), *toolchain.libraries()], output)
         finally:
             source.unlink(missing_ok=True)
     return output
@@ -98,10 +98,10 @@ def test_every_program_has_an_entry_and_a_root_array():
     of functions, and each piece is silent when it is missing: an empty root
     array still links, and every string literal is then null."""
     for name, text in _all().items():
-        assert "_turkey_module_roots:" in text, name
+        assert f"{toolchain.c_symbol('turkey_module_roots')}:" in text, name
         # The program as `Turkey.Entry` runs it, by its C symbol (TIX-67).
-        assert '"_turkey_entry":' in text, name
-        assert '.globl "_main"' in text, name
+        assert f'"{toolchain.c_symbol("turkey_entry")}":' in text, name
+        assert f'.globl "{toolchain.c_symbol("main")}"' in text, name
 
 
 @pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
@@ -134,8 +134,9 @@ def test_every_safepoint_label_is_in_the_frame_table():
     """
     for name, text in _all().items():
         lines = text.splitlines()
-        at = lines.index("_turkey_frame_table:")
+        at = lines.index(f"{toolchain.c_symbol('turkey_frame_table')}:")
         declared = int(lines[at + 1].split()[1])
-        labels = sum(1 for line in lines if line.startswith("Lsp"))
+        labels = sum(1 for line in lines
+                     if line.startswith(toolchain.local_label("Lsp")))
         assert declared == labels, (name, declared, labels)
         assert declared > 0, name

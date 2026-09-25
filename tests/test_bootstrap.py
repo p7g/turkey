@@ -74,7 +74,7 @@ def _stage3() -> Path:
         staging = stem.with_suffix(stem.suffix + ".bin")
         try:
             _replace_built([*toolchain.cc(), "-o", str(staging), str(source),
-                            str(runtime)], output)
+                            str(runtime), *toolchain.libraries()], output)
         finally:
             source.unlink(missing_ok=True)
     return output

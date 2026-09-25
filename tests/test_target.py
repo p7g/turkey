@@ -18,7 +18,7 @@ from pathlib import Path
 
 import pytest
 
-from tests import bootc, lang
+from tests import bootc, lang, toolchain
 
 MATCHES = """\
 import Target (OS(..), Arch(..))
@@ -35,20 +35,26 @@ fun wordBytes() -> Int = match Target.arch {
 
 fun main() {
     print(signalName(10))
+    print(signalName(7))
     print(wordBytes())
 }
 """
+
+# What `MATCHES` prints compiled for each target: `boot`'s default is the
+# target it was built for, which is what `$TURKEY_CC` links for.
+MATCHED = {"arm64-darwin": "SIGBUS\nother\n8\n",
+           "arm64-linux": "other\nSIGBUS\n8\n"}
 
 SOURCE = bootc.REPO_ROOT / "tests" / "programs" / "constant_globals.gob"
 
 
 def _boot(*args: str) -> subprocess.CompletedProcess[bytes]:
-    return subprocess.run([str(bootc.binary()), *args], cwd=bootc.REPO_ROOT,
-                          capture_output=True)
+    return subprocess.run(toolchain.command(bootc.binary(), *args),
+                          cwd=bootc.REPO_ROOT, capture_output=True)
 
 
 def test_the_default_is_the_host() -> None:
-    chosen = _boot("native", "--target", "arm64-darwin", str(SOURCE))
+    chosen = _boot("native", "--target", toolchain.target(), str(SOURCE))
     default = _boot("native", str(SOURCE))
     assert chosen.returncode == 0, chosen.stderr
     assert chosen.stdout == default.stdout
@@ -69,7 +75,7 @@ def test_target_without_a_value_is_a_usage_error() -> None:
 
 
 def test_a_target_match_runs_the_chosen_arm() -> None:
-    assert lang.output(MATCHES) == "SIGBUS\n8\n"
+    assert lang.output(MATCHES) == MATCHED[toolchain.target()]
 
 
 def test_a_target_match_is_decided_before_lowering() -> None:
@@ -121,7 +127,8 @@ def errno(request: pytest.FixtureRequest) -> Iterator[Path]:
 
 def _native(entry: Path, target: str) -> str:
     result = subprocess.run(
-        [str(bootc.binary()), "native", "--target", target, entry.name],
+        toolchain.command(bootc.binary(), "native", "--target", target,
+                          entry.name),
         cwd=entry.parent, env=dict(os.environ, TURKEY_LIB=str(lang.LIB)),
         capture_output=True)
     assert result.returncode == 0, result.stderr.decode()

@@ -11,6 +11,7 @@ from tests.allocator_probe import allocator_object
 
 @pytest.fixture(scope="module")
 def allocator_probe(allocator_object, tmp_path_factory):
+    toolchain.needs_sanitizer()
     directory = tmp_path_factory.mktemp("allocator-probe")
     source = directory / "probe.c"
     source.write_text(r'''

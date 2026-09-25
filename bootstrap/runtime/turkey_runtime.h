@@ -7,9 +7,12 @@ extern int32_t turkey_has_panicked;
 
 /* A `String` is a byte array on the heap, so these are `void *`:
    `turkey_string_new` is how the entry interns a literal. The float three are
-   here because formatting and parsing lean on `snprintf` and `strtod`. */
+   here because formatting and parsing lean on `snprintf` and `strtod`; the
+   formatter answers NUL-terminated text in a runtime buffer, which
+   `turkey_float_to_string` in `Turkey.Alloc` copies into a string. */
 void *turkey_string_new(const unsigned char *bytes, int64_t length);
 void *turkey_float_to_string(double value);
+const char *turkey_float_format(double value);
 double turkey_float_parse(void *value);
 int32_t turkey_float_can_parse(void *value);
 
@@ -24,8 +27,9 @@ void *turkey_array_new(int64_t length, uint64_t initial, int64_t element_width,
                        int64_t element_layout);
 void *turkey_closure_shell(uint64_t code);
 
-/* Collector-owned services used by the allocator giblet. */
-void *turkey_heap_allocate(uint64_t size, int64_t kind);
+/* Collector-owned services used by the allocator giblet. `frame` is the
+   allocator's own frame pointer, where the collector's walk starts. */
+void *turkey_heap_allocate(uint64_t size, int64_t kind, void *frame);
 void turkey_count_kind(int64_t kind);
 int64_t turkey_valid_object_kind(void *value, int64_t kind);
 

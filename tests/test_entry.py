@@ -37,7 +37,7 @@ def _boot_binary(backend: str, source: Path, tmp_path: Path) -> Path:
     runtime = tmp_path / "runtime.o"
     if not runtime.exists():
         subprocess.run([*toolchain.cc(), "-std=c11",
-                        *toolchain.runtime_flags(), "-O1", "-c", "-o",
+                        "-O1", "-c", "-o",
                         str(runtime), str(RUNTIME)], check=True)
     output = tmp_path / f"{source.stem}-{backend}"
     subprocess.run([*toolchain.cc(), "-O1",

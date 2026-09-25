@@ -213,7 +213,6 @@ static void stats_count_kind(int kind) {
         stats_by_kind[kind >= 0 && kind < 8 ? kind : 0]++;
 }
 
-static void mark(void *value);
 static HeapHeader *header_of(void *value);
 
 static HeapHeader *find_header(void *value) {
@@ -276,7 +275,9 @@ static HeapHeader *header_of(void *value) {
     return value == NULL ? NULL : ((HeapHeader *)value) - 1;
 }
 
-static void *heap_allocate(size_t size, uint32_t kind) {
+static void collect(void **frame);
+
+static void *heap_allocate(size_t size, uint32_t kind, void **frame) {
     if (!gc_initialized) {
         gc_initialized = 1;
         if (gc_stress < 0) gc_stress = getenv("TURKEY_GC_STRESS") != NULL;
@@ -294,7 +295,7 @@ static void *heap_allocate(size_t size, uint32_t kind) {
         if (getenv("TURKEY_GC_STATS") != NULL) stats_log = stderr;
     }
     if (gc_stress || allocations_since_collection >= collection_threshold)
-        turkey_collect();
+        collect(frame);
     if (size > SIZE_MAX - sizeof(HeapHeader)) {
         turkey_panic("allocation is too large"); return NULL;
     }
@@ -392,25 +393,31 @@ static void mark_children(void *value) {
     }
 }
 
-static void mark(void *value) {
-    mark_grey(value, NULL, 0);
-    while (mark_count > 0) mark_children(mark_stack[--mark_count]);
-}
-
 
 /* -- frame tables ------------------------------------------------------------
 
    The arm64 backend registers roots OCaml's way: no function pushes or pops
    anything, and each call site that may collect has a table entry naming the
    frame offsets of the roots live across it, keyed by the return address
-   for it. The collector walks
-   `x29` frame records -- which Apple's ABI requires to be valid at all times --
-   and looks each return address up.
+   for it. The collector walks `x29` frame records and looks each return
+   address up.
 
-   Both root schemes run at once, and that is the point: a C frame and an
-   LLVM-path frame have return addresses in no table, so they are skipped, and
-   the shadow-stack chain above goes on covering them. A binary that registers
-   no table walks no frames at all. */
+   Only Turkey's frame records are walked, never C's. The walk starts from the
+   frame of the Turkey allocator that called into the heap, which passes its
+   own `x29` in, and ends at the entry thread's Turkey frame. Every frame in
+   between is Turkey's, because no C function on the mutator's stack calls
+   back into Turkey code that can allocate: the backend emits a frame record
+   in every function, so the chain is complete by construction. A C frame
+   keeps one only if its compiler chose to -- Darwin's ABI requires it, Linux's
+   leaves it to `-fno-omit-frame-pointer`, and clang at -O1 omits it -- and a
+   walk that crossed one would lose the Turkey caller's return address and
+   with it that caller's roots.
+
+   Both root schemes run at once, and that is the point: an LLVM-path frame
+   has a return address in no table, so it is skipped, and the shadow-stack
+   chain above goes on covering it. The shadow stack is a list the generated
+   code links through memory, and reads no frame records at all. A binary that
+   registers no table walks no frames. */
 
 typedef struct FrameEntry {
     uintptr_t retaddr;
@@ -482,28 +489,25 @@ static char *entry_stack_high;
    so the entry reports it rather than owning it. */
 void turkey_entry_stack_set(void *frame) { entry_stack_high = frame; }
 
-/* Every frame of the current stack, from this one outwards.
+/* Every Turkey frame of the mutator's stack, from `frame` outwards.
+
+   `frame` is the `x29` of the Turkey allocator that called into the heap: a
+   frame record whose return address is in the allocation site, so the first
+   entry found is the allocating function's. Null means no Turkey frame is live
+   -- the final collection runs after the program has returned -- and nothing
+   is walked.
 
    The stop conditions matter more than the loop: a walk that runs off the end
    of the chain marks whatever the words beyond it happen to hold, which would
    surface as a corruption a long way from here and look exactly like a
    miscompile. So the frame pointer must stay inside this thread's stack, stay
-   8-byte aligned, and strictly increase. Eight and not sixteen: the stack
-   pointer is 16-byte aligned, a frame record need not be, and clang for
-   arm64 Linux puts one at sp+24 when it saves d8 below it. A walk that stops
-   there never reaches the Turkey frame that called into the runtime, whose
-   roots then go unmarked and are freed while live.
+   8-byte aligned, and strictly increase.
 
-   The walk also needs every C function between the collector and the Turkey
-   code that called it to keep a frame record, or that caller's return address
-   is never seen. Darwin's ABI requires one; on Linux it is the compiler's
-   choice, and the runtime is compiled with -fno-omit-frame-pointer there.
-
-   There is no low bound to check. The walk starts at this function's own live
-   frame and `frame` only ever increases, so nothing it reaches can be below
-   the stack; the high bound and the strict increase are what confine it. */
-static void scan_native_frames(void) {
-    if (frame_entry_count == 0) return;
+   There is no low bound to check. The walk starts at a live frame below this
+   one and `frame` only ever increases, so nothing it reaches can be below the
+   stack; the high bound and the strict increase are what confine it. */
+static void scan_native_frames(void **frame) {
+    if (frame_entry_count == 0 || frame == NULL) return;
     char *high = entry_stack_high;
     if (high == NULL) {
         /* Reachable only if something ran the program without going through
@@ -514,13 +518,11 @@ static void scan_native_frames(void) {
         turkey_panic("no entry stack bound: the frame walker cannot run");
         return;
     }
-    void **frame = __builtin_frame_address(0);
     while ((char *)frame + 16 <= high && ((uintptr_t)frame & 7) == 0) {
         /* The return address in *this* record is an address in the *caller*,
            so the entry it finds describes the caller's frame -- whose `x29` is
            this record's saved one. Applying the offsets to this frame instead
-           reads whatever the callee happens to have at those offsets, which is
-           how this was wrong the first time. */
+           reads whatever the callee happens to have at those offsets. */
         void **next = frame[0];
         if (next <= frame || (char *)next + 16 > high
                 || ((uintptr_t)next & 7) != 0) break;
@@ -535,7 +537,12 @@ static void scan_native_frames(void) {
     }
 }
 
-void turkey_collect(void) {
+/* A collection with no Turkey frame live: the final one, after the program
+   has returned, and a C caller's. Anything else collects through the
+   allocator, which knows where the Turkey stack starts. */
+void turkey_collect(void) { collect(NULL); }
+
+static void collect(void **frame) {
     struct timespec stats_start, stats_end;
     int64_t stats_live_before = heap_count;
     /* Read before the sweep clears it: this is the allocation pressure the
@@ -571,7 +578,7 @@ void turkey_collect(void) {
             }
     /* Beside the chain, not instead of it: the arm64 backend's frames are
        here and everything else's are above. */
-    scan_native_frames();
+    scan_native_frames(frame);
     /* Empty regions cost one free, regardless of their allocation count.
        Survivors rebuild availability by copying a fixed-size bitmap and
        using epoch marks. No walk over individual object headers. */
@@ -787,9 +794,10 @@ int64_t turkey_frame_col(int64_t index) {
 
 /* The allocator giblet owns payload initialization. These bridges expose only
    collector-owned operations; the raw allocation may collect, and its caller
-   must already have rooted every managed operand. */
-void *turkey_heap_allocate(uint64_t size, int64_t kind) {
-    return heap_allocate((size_t)size, (uint32_t)kind);
+   must already have rooted every managed operand. `frame` is the caller's own
+   `x29`, where a collection's walk of the Turkey stack starts. */
+void *turkey_heap_allocate(uint64_t size, int64_t kind, void *frame) {
+    return heap_allocate((size_t)size, (uint32_t)kind, frame);
 }
 
 void turkey_count_kind(int64_t kind) {

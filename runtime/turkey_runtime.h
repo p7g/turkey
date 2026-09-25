@@ -20,8 +20,9 @@ void *turkey_array_new(int64_t length, uint64_t initial, int64_t element_width,
                        int64_t element_layout);
 void *turkey_closure_shell(uint64_t code);
 
-/* Collector-owned services used by the allocator giblet. */
-void *turkey_heap_allocate(uint64_t size, int64_t kind);
+/* Collector-owned services used by the allocator giblet. `frame` is the
+   allocator's own frame pointer, where the collector's walk starts. */
+void *turkey_heap_allocate(uint64_t size, int64_t kind, void *frame);
 void turkey_count_kind(int64_t kind);
 int64_t turkey_valid_object_kind(void *value, int64_t kind);
 

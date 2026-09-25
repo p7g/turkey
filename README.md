@@ -64,7 +64,8 @@ work together without type annotations on the functions.
 ## Try it
 
 The compiler is written in Turkey. On an arm64 Mac, with a C compiler
-installed, it builds from the assembly committed in `bootstrap/`:
+installed, it builds from the assembly committed in `bootstrap/` (for Linux,
+see below):
 
 ```sh
 sh scripts/build.sh
@@ -84,7 +85,9 @@ Run the compiler from the repository root, where it finds `lib/`. Use
 other subcommands print what a stage produced, and `check` just compiles.
 
 The compiler that builds it is `bootstrap/`, which holds its own arm64
-assembly, gzip'd, with the runtime it was emitted against. `sh scripts/build.sh
+assembly for macOS and for Linux, gzip'd, with the runtime it was emitted
+against. `scripts/build.sh` builds for whichever of the two the C compiler
+links for. `sh scripts/build.sh
 --fixpoint` checks the fixed point: the compiler built from today's source
 emits exactly the assembly it was built from. `scripts/bump-bootstrap.sh`
 replaces the committed compiler, which is rare and deliberate; both scripts
@@ -124,9 +127,9 @@ hook does nothing. Where binfmt_misc cannot be written, set
 `TURKEY_RUN=qemu-aarch64` instead. pytest comes from apt here, because Ubuntu
 24.04 refuses a system-wide `pip install`.
 
-This runs only what the compiler emits for Linux. `--target arm64-linux`
-emits it, but the compiler itself cannot be built there yet: the bootstrap is
-macOS assembly, and `scripts/build.sh` still refuses any host but arm64 macOS.
+With those set, `sh scripts/build.sh` builds the compiler for arm64 Linux from
+`bootstrap/arm64-linux.s.gz`, and `--target arm64-linux` makes a compiler on
+any platform emit Linux assembly.
 
 ## Project status
 

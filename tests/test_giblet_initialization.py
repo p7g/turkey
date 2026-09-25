@@ -105,23 +105,23 @@ void *turkey_heap_allocate(uint64_t size, int64_t kind, void *frame) {
 
 @pytest.mark.parametrize("body, dependency, message", [
     ('let value : Int = Prim.error("early")\nfun read() -> Int = value',
-     'let base : Int = 0', 'uses a string literal before interning'),
+     'let base : Int = 0', 'panics with a String'),
     ('let value : Int = helper(2)\n'
      'fun helper(n : Int) -> Int = if n == 0 { Prim.error("early") } '
      'else { helper(n - 1) }\nfun read() -> Int = value',
-     'let base : Int = 0', 'uses a string literal before interning'),
+     'let base : Int = 0', 'panics with a String'),
     ('let value : Int = helper(2)\n'
      'foreign "probe_early_helper" fun helper(n : Int) -> Int = '
      'if n == 0 { Prim.error("early") } else { helper(n - 1) }\n'
      'fun read() -> Int = value',
-     'let base : Int = 0', 'uses a string literal before interning'),
+     'let base : Int = 0', 'panics with a String'),
     ('import Unsafe.Runtime as R\n'
      'let value : Prim.Ptr = R.heapAllocate(32, 0, Prim.frameAddress())\nfun read() -> Int = 0',
      'let base : Int = 0', 'may not call turkey_heap_allocate'),
     ('let (a, b) : (Int, Int) = (1, 2)\nfun read() -> Int = a + b',
      'let base : Int = 0', 'builds a tuple'),
     ('var value : String = "traced"\nfun read() -> Int = 0',
-     'let base : Int = 0', 'uses a string literal before interning'),
+     'let base : Int = 0', 'uses the string literal "traced"'),
     ('var value : Option Int = None\nfun read() -> Int = 0',
      'let base : Int = 0', 'accesses the later global %nullary'),
 ])
@@ -138,6 +138,8 @@ def test_unsafe_initializers_are_refused(modules, body, dependency, message):
     ('foreign "getpid" fun pid() -> Int\nlet later : Int = pid()\n'
      'fun base(n : Int) -> Int = if n == 0 { later } '
      'else { base(n - 1) }', 'accesses the later global'),
+    ('fun base(n : Int) -> Int = if n == 0 { Prim.error("early") } '
+     'else { base(n - 1) }', 'uses a string literal before interning'),
 ])
 def test_early_helpers_cannot_reach_the_late_runtime(modules, dependency, message):
     entry, env = modules('let value : Int = D.base(2)\n'

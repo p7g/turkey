@@ -1,11 +1,13 @@
 module Turkey.Giblets (gibletModules, checkPlacement, checkLowered, initializerName)
 
--- Giblets: modules whose code does not allocate and does not hold a traced
--- value across a call.
+-- Giblets: modules whose code does not allocate, does not hold a traced value
+-- across a call, and uses no string literal.
 --
 -- The collector runs when nothing may allocate and has no roots of its own, so
 -- the code it is written in must allocate nothing and must leave nothing for
--- it to find. Both are asked of the Low IR after optimization, which is the
+-- it to find. Giblet code also runs before the program's entry sequence has
+-- made its literals, so it has none to use, and panics through a C string
+-- instead. All three are asked of the Low IR after optimization, which is the
 -- code that runs: an allocation the lowering adds -- boxing at a polymorphic
 -- boundary, a generic body past the specialization cap, a call through a
 -- dictionary -- is refused as surely as one the source spells, and a value of
@@ -21,9 +23,10 @@ import System.Env as Env
 import Data.Set as Set
 import Turkey.Diag as Diag
 import Turkey.LowIr as LowIr
-import Turkey.LowIr (Low(..), Allocation(..), Op(..), Callee(..))
+import Turkey.LowIr (Low(..), Op(..), Allocation(..), Callee(..))
 import Turkey.Roots as Roots
 import Turkey.Ssa as Ssa
+import Turkey.Ssa (Term(..))
 import Turkey.Source (Span, showSpan)
 
 let initializerName = "%giblet.initialize"
@@ -61,8 +64,9 @@ fun checkPlacement(name : String, library : Bool, where : Span) -> Unit {
 
 -- -- the check ------------------------------------------------------------------
 
--- Does a giblet function allocate, call anything that does, or hold a root;
--- and does giblet initialization stay clear of the heap and later globals.
+-- Does a giblet function allocate, call anything that does, hold a root, or use
+-- a string literal; and does giblet initialization stay clear of the heap and
+-- later globals.
 -- Every compile that lowers runs this, whichever backend it is for.
 fun checkLowered(functions : Array (Ssa.Func Low),
                  definitions : Array (String, String), path : String) -> Unit {
@@ -83,6 +87,15 @@ fun checkLowered(functions : Array (Ssa.Func Low),
             if len(Map.keys(Roots.analyze(f).slots)) > 0 {
                 refuse(f.name + " is in a giblet module and holds a traced "
                        + "value across a call", path)
+            }
+            match turkeyString(f) {
+                Some((what, site)) -> refuse(f.name + " is in a giblet module "
+                                             + "and " + what
+                                             + where(byName, f.name, site)
+                                             + "; a giblet panics with "
+                                             + "Rt.panic(Prim.cString(...))",
+                                             path)
+                None -> {}
             }
         }
     }
@@ -138,6 +151,37 @@ fun checkEarly(functions : Map String (Ssa.Func Low),
             }
         }
     }
+}
+
+-- Does a function use a Turkey `String` it did not build: a literal, or a
+-- `Prim.error` panic, whose message is one.
+--
+-- A literal's `String` is made by the program's entry sequence and read from
+-- the permanent roots, so it does not exist before that sequence runs, and a
+-- giblet runs before it -- a definition C calls, an initializer -- as well as
+-- inside it. A C string is bytes laid out at link time and exists from the
+-- start, which is why `Prim.cString` is the route and this one is closed.
+-- Judged on the optimized code, as the rest is: a match the optimizer decides
+-- leaves no unreachable arm behind to ask about.
+fun turkeyString(f : Ssa.Func Low) -> Option (String, Int) {
+    for block in f.blocks {
+        match block.term {
+            Panic(message) ->
+                return Some(("panics with a String", Ssa.valueId(message)))
+            _ -> {}
+        }
+    }
+    for block in f.blocks {
+        for i in block.insts {
+            match i.op {
+                ConstString(text) -> return Some(
+                    ("uses the string literal \"" + text + "\"",
+                     Ssa.valueId(i.result)))
+                _ -> {}
+            }
+        }
+    }
+    None
 }
 
 -- The path the summary recorded, which is a shortest one, each step with the

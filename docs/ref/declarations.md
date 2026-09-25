@@ -632,7 +632,9 @@ With a body, it defines a C-callable Turkey function and is allowed only in a
 compiler-designated *giblet* module from that library. Giblet code does not
 allocate or hold a traced value across a call, so a C caller needs no
 collector setup. The compiler checks this on the optimized code, including
-everything a giblet calls, and refuses a giblet that could do either.
+everything a giblet calls, and refuses a giblet that could do either. Giblet
+code can run before the program has started, so it also uses no string
+literal, and cannot call `error`; it panics with a C string instead.
 Ordinary application modules cannot declare or define foreign functions.
 
 Every parameter and the result must state its type. A definition also needs

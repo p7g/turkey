@@ -213,7 +213,6 @@ static void stats_count_kind(int kind) {
         stats_by_kind[kind >= 0 && kind < 8 ? kind : 0]++;
 }
 
-static void mark(void *value);
 static HeapHeader *header_of(void *value);
 
 static HeapHeader *find_header(void *value) {
@@ -392,11 +391,6 @@ static void mark_children(void *value) {
                 mark_grey((void *)(uintptr_t)object->slots[index],
                           "capture", index);
     }
-}
-
-static void mark(void *value) {
-    mark_grey(value, NULL, 0);
-    while (mark_count > 0) mark_children(mark_stack[--mark_count]);
 }
 
 
@@ -813,118 +807,6 @@ void turkey_count_kind(int64_t kind) {
 int64_t turkey_valid_object_kind(void *value, int64_t kind) {
     return valid_object_kind(value, (int32_t)kind);
 }
-
-/* ------------------------------------------------------------------ float text
- *
- * `snprintf` and `strtod` cannot be declared as foreign functions, since the
- * language has no variadics, so these three stay C until shortest round-trip
- * formatting and correctly rounded parsing are written in Turkey. The parsers
- * read strings as byte arrays like everything else here.
- *
- * The formatter does not build its string: it writes the text here, and
- * `Turkey.Alloc` allocates. A C function that called the allocator would put a
- * C frame between the collector's walk and the Turkey code that called it, and
- * the walk reads only Turkey's frame records. One buffer is enough for the one
- * mutator, whose caller copies the text out before formatting again.
- */
-
-static char float_text[64];
-
-const char *turkey_float_format(double value) {
-    char *buffer = float_text;
-    int length;
-    if (isnan(value)) length = snprintf(buffer, sizeof float_text, "NaN");
-    else if (isinf(value)) length = snprintf(buffer, sizeof float_text,
-                                             signbit(value) ? "-Infinity" : "Infinity");
-    else if (value == 0.0) {
-        length = snprintf(buffer, sizeof float_text, signbit(value) ? "-0.0" : "0.0");
-    } else {
-        union { double number; uint64_t bits; } original = { .number = value }, parsed;
-        char trial[64];
-        int precision;
-        for (precision = 1; precision < 17; ++precision) {
-            snprintf(trial, sizeof(trial), "%.*g", precision, value);
-            parsed.number = strtod(trial, NULL);
-            if (parsed.bits == original.bits) break;
-        }
-        int exponent = (int)floor(log10(fabs(value)));
-        if (exponent >= -4 && exponent < 16) {
-            int decimals = precision - exponent - 1;
-            if (decimals < 0) decimals = 0;
-            length = snprintf(buffer, sizeof float_text, "%.*f", decimals, value);
-        } else {
-            length = snprintf(buffer, sizeof float_text, "%.*e", precision - 1, value);
-            length = (int)strlen(buffer);
-        }
-        char *marker = strchr(buffer, 'e');
-        if (strchr(buffer, '.') == NULL || (marker != NULL && strchr(buffer, '.') > marker)) {
-            size_t position = marker == NULL ? (size_t)length : (size_t)(marker - buffer);
-            memmove(buffer + position + 2, buffer + position,
-                    (size_t)length - position + 1);
-            buffer[position] = '.';
-            buffer[position + 1] = '0';
-            length += 2;
-        }
-    }
-    return buffer;
-}
-
-static int parse_float(void *string, double *result) {
-    if (string == NULL) return 0;
-    struct { int64_t length; const unsigned char *bytes; } view = {
-        string_length(string), string_bytes(string) }, *value = &view;
-    if (value->length == 3 && memcmp(value->bytes, "NaN", 3) == 0) {
-        *result = NAN; return 1;
-    }
-    if (value->length == 8 && memcmp(value->bytes, "Infinity", 8) == 0) {
-        *result = INFINITY; return 1;
-    }
-    if (value->length == 9 && memcmp(value->bytes, "-Infinity", 9) == 0) {
-        *result = -INFINITY; return 1;
-    }
-    int64_t index = 0;
-    if (index < value->length &&
-            (value->bytes[index] == '+' || value->bytes[index] == '-')) index++;
-    int64_t whole = index;
-    while (index < value->length && value->bytes[index] >= '0' &&
-           value->bytes[index] <= '9') index++;
-    if (index == whole || index >= value->length || value->bytes[index++] != '.') return 0;
-    int64_t fraction = index;
-    while (index < value->length && value->bytes[index] >= '0' &&
-           value->bytes[index] <= '9') index++;
-    if (index == fraction) return 0;
-    if (index < value->length &&
-            (value->bytes[index] == 'e' || value->bytes[index] == 'E')) {
-        index++;
-        if (index < value->length &&
-                (value->bytes[index] == '+' || value->bytes[index] == '-')) index++;
-        int64_t exponent = index;
-        while (index < value->length && value->bytes[index] >= '0' &&
-               value->bytes[index] <= '9') index++;
-        if (index == exponent) return 0;
-    }
-    if (index != value->length || (uint64_t)value->length >= SIZE_MAX) return 0;
-    char *text = malloc((size_t)value->length + 1);
-    if (text == NULL) { turkey_panic("out of memory"); return 0; }
-    memcpy(text, value->bytes, (size_t)value->length);
-    text[value->length] = '\0';
-    *result = strtod(text, NULL);
-    free(text);
-    return 1;
-}
-
-double turkey_float_parse(void *value) {
-    double result = 0.0;
-    if (!parse_float(value, &result)) turkey_panic("string is not a Float");
-    return result;
-}
-
-int32_t turkey_float_can_parse(void *value) {
-    double ignored;
-    return parse_float(value, &ignored);
-}
-
-
 
 /* --------------------------------------------------- what the host hands over
  *

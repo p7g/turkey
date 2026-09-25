@@ -137,8 +137,6 @@ def test_the_corpus_agrees_under_gc_stress_without_c_frame_records(name):
     function without a frame record, and on arm64 Linux may use `x29` as an
     ordinary register; a walk that crossed a C frame would then lose the
     return address of the Turkey code that called it, and that code's roots.
-    `float_text_roots.gob` is the path that did cross one on every target:
-    `Float.toString` formatting in C and allocating the string from there.
     """
     env = dict(os.environ, TURKEY_GC_STRESS="1")
     binary = _binary(name, "-fomit-frame-pointer")

@@ -1,0 +1,619 @@
+module Data.Float.Text (toString, parse)
+
+-- `Float` to text and back: the shortest decimal that reads back as the same
+-- `Float`, and the correctly rounded `Float` nearest a decimal.
+--
+-- Both directions are exact arithmetic on a multiprecision *decimal*, shifted
+-- by powers of two. That works because 2 divides 10: a binary fraction always
+-- has a finite decimal expansion, so every value and every rounding boundary
+-- involved can be held exactly, and the one rounding decision is made on exact
+-- digits rather than on an approximation of them. There is no table of powers
+-- of ten and no 128-bit product, which the faster algorithms (Ryu, Schubfach,
+-- Eisel-Lemire) all need; the price is time, not correctness.
+--
+-- Parsing has one shortcut in front, and it is exact too: see `fastPath`.
+--
+-- Written against `Prim.` for floats because `Data.Float` imports this module,
+-- so the `Float` instances are not available here.
+
+import Prelude ()
+import Std.Classes
+import Data.Bool.Type (Bool(..))
+import Data.Int ()
+import Data.Int as Int
+import Data.Option.Type (Option(..))
+import Data.String.Type (String(..), bytesOf)
+
+-- -- the decimal ------------------------------------------------------------
+--
+-- `digits[0 .. nd]` are the significant digits, most significant first, as
+-- values 0..9, with no trailing zeros; the value is `0.d0 d1 d2 ... * 10^dp`.
+-- `nd == 0` is zero. `trunc` records that nonzero digits past `capacity` were
+-- dropped, so the true value is a little above the digits held: it is what
+-- lets an exact halfway tie be told from a value just above one.
+--
+-- 800 digits is enough to hold every value either direction produces exactly:
+-- the longest is a rounding boundary next to the smallest subnormal, 2^-1075,
+-- whose expansion has about 750 significant digits. Only parsing can exceed
+-- it -- a literal longer than that, shifted down -- and there `trunc` carries
+-- what is dropped, which is all the rounding needs to know of it.
+type Decimal = Decimal {
+    digits : Prim.Array Byte,
+    nd : Int,
+    dp : Int,
+    trunc : Bool,
+}
+
+let capacity = 800
+
+-- The widest single shift. Each pass keeps an accumulator below `10 * 2^k`,
+-- and `10 * 2^59` is below `2^63` where `10 * 2^60` is not: `Int` is signed
+-- and traps on overflow.
+let maxShift = 59
+
+-- How many digits a left shift by `maxShift` can add: `2^59` has 18.
+let slack = 18
+
+fun newDecimal() -> Decimal = Decimal {
+    -- `slack` more than `capacity`: `leftShift` writes its result up to that
+    -- far right of where it will finally sit.
+    digits = Prim.arrayNew(capacity + slack, Prim.byteFromInt(0)),
+    nd = 0,
+    dp = 0,
+    trunc = False,
+}
+
+fun digitAt(d : Decimal, i : Int) -> Int = Prim.byteToInt(Prim.arrayGet(d.digits, i))
+
+fun setDigit(d : Decimal, i : Int, v : Int) -> Unit =
+    Prim.arraySet(d.digits, i, Prim.byteFromInt(v))
+
+fun trim(d : Decimal) -> Unit {
+    while d.nd > 0 && digitAt(d, d.nd - 1) == 0 { d.nd = d.nd - 1 }
+    if d.nd == 0 { d.dp = 0 }
+}
+
+-- `v` must not be negative.
+fun assign(d : Decimal, v : Int) -> Unit {
+    var n = 0
+    var rest = v
+    while rest > 0 {
+        n = n + 1
+        rest = rest / 10
+    }
+    rest = v
+    for var i = n - 1; i >= 0; i = i - 1 {
+        setDigit(d, i, rest % 10)
+        rest = rest / 10
+    }
+    d.nd = n
+    d.dp = n
+    d.trunc = False
+    trim(d)
+}
+
+-- Divide by `2^k`, `0 < k <= maxShift`. Digits come off the front as they
+-- are completed, so the write position never passes the read position.
+fun rightShift(d : Decimal, k : Int) -> Unit {
+    var r = 0
+    var w = 0
+    var n = 0
+    -- Enough leading digits that the first quotient digit is nonzero.
+    loop {
+        if Int.shr(n, k) != 0 { break }
+        if r >= d.nd {
+            if n == 0 {
+                d.nd = 0
+                d.dp = 0
+                return
+            }
+            while Int.shr(n, k) == 0 {
+                n = n * 10
+                r = r + 1
+            }
+            break
+        }
+        n = n * 10 + digitAt(d, r)
+        r = r + 1
+    }
+    d.dp = d.dp - (r - 1)
+    let mask = Int.shl(1, k) - 1
+    while r < d.nd {
+        let c = digitAt(d, r)
+        setDigit(d, w, Int.shr(n, k))
+        w = w + 1
+        n = Int.and(n, mask) * 10 + c
+        r = r + 1
+    }
+    -- The remainder's digits, which may run past `capacity`: a division by a
+    -- power of two always terminates, but not necessarily within it.
+    while n > 0 {
+        let q = Int.shr(n, k)
+        n = Int.and(n, mask)
+        if w < capacity {
+            setDigit(d, w, q)
+            w = w + 1
+        } else if q > 0 {
+            d.trunc = True
+        }
+        n = n * 10
+    }
+    d.nd = w
+    trim(d)
+}
+
+-- Multiply by `2^k`, `0 < k <= maxShift`. The product is built from the
+-- least significant digit up, written `slack` places right of its final
+-- position so that it cannot overwrite a digit not yet read, then moved down
+-- once its length is known.
+fun leftShift(d : Decimal, k : Int) -> Unit {
+    let end = d.nd + slack
+    var w = end
+    var n = 0
+    for var r = d.nd - 1; r >= 0; r = r - 1 {
+        n = n + Int.shl(digitAt(d, r), k)
+        w = w - 1
+        setDigit(d, w, n % 10)
+        n = n / 10
+    }
+    while n > 0 {
+        w = w - 1
+        setDigit(d, w, n % 10)
+        n = n / 10
+    }
+    let count = end - w
+    var kept = count
+    if kept > capacity {
+        for var i = capacity; i < count; i = i + 1 {
+            if digitAt(d, w + i) != 0 { d.trunc = True }
+        }
+        kept = capacity
+    }
+    for var i = 0; i < kept; i = i + 1 { setDigit(d, i, digitAt(d, w + i)) }
+    d.dp = d.dp + (count - d.nd)
+    d.nd = kept
+    trim(d)
+}
+
+-- Multiply by `2^k`, or divide for a negative `k`.
+fun shift(d : Decimal, by : Int) -> Unit {
+    if d.nd == 0 { return }
+    var k = by
+    while k > maxShift {
+        leftShift(d, maxShift)
+        k = k - maxShift
+    }
+    while k < -maxShift {
+        rightShift(d, maxShift)
+        k = k + maxShift
+    }
+    if k > 0 {
+        leftShift(d, k)
+    } else if k < 0 {
+        rightShift(d, -k)
+    }
+}
+
+-- Whether keeping only the first `n` digits should round up: to nearest, and
+-- an exact tie to even. A tie with `trunc` set is not a tie -- the value is
+-- above it -- so it rounds up.
+fun shouldRoundUp(d : Decimal, n : Int) -> Bool {
+    if n < 0 || n >= d.nd { return False }
+    if digitAt(d, n) == 5 && n + 1 == d.nd {
+        if d.trunc { return True }
+        return n > 0 && digitAt(d, n - 1) % 2 != 0
+    }
+    digitAt(d, n) >= 5
+}
+
+fun roundTo(d : Decimal, n : Int) -> Unit {
+    if shouldRoundUp(d, n) { roundUp(d, n) } else { roundDown(d, n) }
+}
+
+fun roundDown(d : Decimal, n : Int) -> Unit {
+    if n < 0 || n >= d.nd { return }
+    d.nd = n
+    trim(d)
+}
+
+fun roundUp(d : Decimal, n : Int) -> Unit {
+    if n < 0 || n >= d.nd { return }
+    for var i = n - 1; i >= 0; i = i - 1 {
+        if digitAt(d, i) < 9 {
+            setDigit(d, i, digitAt(d, i) + 1)
+            d.nd = i + 1
+            return
+        }
+    }
+    -- All nines: the carry makes a single 1 one place further left.
+    setDigit(d, 0, 1)
+    d.nd = 1
+    d.dp = d.dp + 1
+}
+
+-- The integer part, rounded. Only called with `dp` small enough to fit.
+fun roundedInteger(d : Decimal) -> Int {
+    var n = 0
+    var i = 0
+    while i < d.dp && i < d.nd {
+        n = n * 10 + digitAt(d, i)
+        i = i + 1
+    }
+    while i < d.dp {
+        n = n * 10
+        i = i + 1
+    }
+    if shouldRoundUp(d, d.dp) { n + 1 } else { n }
+}
+
+-- -- binary64 ----------------------------------------------------------------
+
+let mantBits = 52
+let bias = -1023
+let hidden = 4503599627370496       -- 2^52, the implicit leading bit
+let maxBiased = 2047                -- all-ones exponent: infinities and NaN
+let signBit = -9223372036854775807 - 1
+
+-- -- formatting --------------------------------------------------------------
+
+-- The shortest decimal that reads back as `x`, as `Show Float` prints it:
+-- fixed notation when the decimal exponent is in -4..15, otherwise one digit,
+-- a point, the rest and a signed exponent of at least two digits. Either way
+-- there is a fractional part, `.0` if nothing else, so finite output lexes as
+-- a `Float` literal and not an `Int` one.
+fun toString(x : Float) -> String {
+    let bits = Prim.floatBits(x)
+    let negative = bits < 0
+    let biased = Int.and(Int.shr(bits, mantBits), maxBiased)
+    let frac = Int.and(bits, hidden - 1)
+    if biased == maxBiased {
+        if frac != 0 { return "NaN" }
+        return if negative { "-Infinity" } else { "Infinity" }
+    }
+    if biased == 0 && frac == 0 {
+        return if negative { "-0.0" } else { "0.0" }
+    }
+    -- `x = mant * 2^(exp - mantBits)`. A subnormal has no hidden bit and the
+    -- exponent of the smallest normal.
+    var mant = frac
+    var exp = biased + bias
+    if biased == 0 {
+        exp = exp + 1
+    } else {
+        mant = mant + hidden
+    }
+    let d = newDecimal()
+    assign(d, mant)
+    shift(d, exp - mantBits)
+    roundShortest(d, mant, exp)
+    render(d, negative)
+}
+
+-- Round `d`, which holds `mant * 2^(exp - mantBits)` exactly, to the fewest
+-- digits that still lie strictly inside the interval of reals that read back
+-- as it -- or on its edge, when the mantissa is even, since a tie reads back
+-- to the even neighbour. Of the candidates of that length, the nearest.
+--
+-- The interval's edges are the midpoints to the neighbouring floats, each
+-- computed exactly as its own decimal; the three are then walked digit by
+-- digit until `d` can be cut short without leaving it.
+fun roundShortest(d : Decimal, mant : Int, exp : Int) -> Unit {
+    let minExp = bias + 1
+    -- Already shortest when the gap to the nearest shorter decimal,
+    -- `10^(dp - nd)`, exceeds the half-ulp distance to either edge,
+    -- `2^(exp - mantBits)`; 3.32 is just under log2(10).
+    if exp > minExp && 332 * (d.dp - d.nd) >= 100 * (exp - mantBits) { return }
+
+    let upper = newDecimal()
+    assign(upper, mant * 2 + 1)
+    shift(upper, exp - mantBits - 1)
+
+    -- The float below is `mant - 1` at the same exponent, unless `mant` is a
+    -- power of two above the subnormals: then the float below has the next
+    -- exponent down, and the gap under `x` is half the gap over it.
+    var mantLo = mant - 1
+    var expLo = exp
+    if mant <= hidden && exp != minExp {
+        mantLo = mant * 2 - 1
+        expLo = exp - 1
+    }
+    let lower = newDecimal()
+    assign(lower, mantLo * 2 + 1)
+    shift(lower, expLo - mantBits - 1)
+
+    let inclusive = mant % 2 == 0
+
+    -- How far `upper` has pulled ahead of `d` in the digits so far: 0 while
+    -- they agree, 1 after a difference of exactly one followed only by nines
+    -- in `d` against zeros in `upper` (rounding up might land on `upper`
+    -- itself), 2 once rounding up is certainly below `upper`.
+    var upperDelta = 0
+    -- `upper` has the most digits before the point, so it is walked from its
+    -- first digit and the others are aligned to it.
+    var ui = 0
+    loop {
+        let mi = ui - upper.dp + d.dp
+        if mi >= d.nd { break }
+        let li = ui - upper.dp + lower.dp
+        let l = if li >= 0 && li < lower.nd { digitAt(lower, li) } else { 0 }
+        let m = if mi >= 0 { digitAt(d, mi) } else { 0 }
+        let u = if ui < upper.nd { digitAt(upper, ui) } else { 0 }
+
+        -- Cutting here rounds down within the interval when `lower` differs,
+        -- or when `lower` is exactly the cut and the edge is allowed.
+        let okDown = l != m || (inclusive && li + 1 == lower.nd)
+
+        if upperDelta == 0 && m + 1 < u {
+            upperDelta = 2
+        } else if upperDelta == 0 && m != u {
+            upperDelta = 1
+        } else if upperDelta == 1 && (m != 9 || u != 0) {
+            upperDelta = 2
+        }
+        let okUp = upperDelta > 0 && (inclusive || upperDelta > 1 || ui + 1 < upper.nd)
+
+        if okDown && okUp {
+            roundTo(d, mi + 1)
+            return
+        }
+        if okDown {
+            roundDown(d, mi + 1)
+            return
+        }
+        if okUp {
+            roundUp(d, mi + 1)
+            return
+        }
+        ui = ui + 1
+    }
+}
+
+-- Lay out the digits of a nonzero `d`. At most 17 digits and a three-digit
+-- exponent, so 32 bytes is room enough before trimming to size.
+fun render(d : Decimal, negative : Bool) -> String {
+    let out = Prim.arrayNewUninit(32)
+    var at = 0
+    if negative { at = put(out, at, 45) }
+    let e = d.dp - 1
+    if e >= -4 && e < 16 {
+        if d.dp <= 0 {
+            at = put(out, at, 48)
+            at = put(out, at, 46)
+            for var i = 0; i < -d.dp; i = i + 1 { at = put(out, at, 48) }
+            at = putDigits(out, at, d, 0, d.nd)
+        } else if d.dp >= d.nd {
+            at = putDigits(out, at, d, 0, d.nd)
+            for var i = d.nd; i < d.dp; i = i + 1 { at = put(out, at, 48) }
+            at = put(out, at, 46)
+            at = put(out, at, 48)
+        } else {
+            at = putDigits(out, at, d, 0, d.dp)
+            at = put(out, at, 46)
+            at = putDigits(out, at, d, d.dp, d.nd)
+        }
+    } else {
+        at = putDigits(out, at, d, 0, 1)
+        at = put(out, at, 46)
+        if d.nd > 1 {
+            at = putDigits(out, at, d, 1, d.nd)
+        } else {
+            at = put(out, at, 48)
+        }
+        at = put(out, at, 101)
+        at = put(out, at, if e < 0 { 45 } else { 43 })
+        let magnitude = if e < 0 { -e } else { e }
+        if magnitude < 10 { at = put(out, at, 48) }
+        at = putInt(out, at, magnitude)
+    }
+    let exact = Prim.arrayNewUninit(at)
+    for var i = 0; i < at; i = i + 1 { Prim.arraySet(exact, i, Prim.arrayGet(out, i)) }
+    String(exact)
+}
+
+fun put(out : Prim.Array Byte, at : Int, byte : Int) -> Int {
+    Prim.arraySet(out, at, Prim.byteFromInt(byte))
+    at + 1
+}
+
+fun putDigits(out : Prim.Array Byte, at : Int, d : Decimal, from : Int, to : Int) -> Int {
+    var w = at
+    for var i = from; i < to; i = i + 1 { w = put(out, w, 48 + digitAt(d, i)) }
+    w
+}
+
+-- `n` is positive and at most three digits.
+fun putInt(out : Prim.Array Byte, at : Int, n : Int) -> Int {
+    var w = at
+    if n >= 100 { w = put(out, w, 48 + n / 100) }
+    if n >= 10 { w = put(out, w, 48 + n / 10 % 10) }
+    put(out, w, 48 + n % 10)
+}
+
+-- -- parsing -----------------------------------------------------------------
+
+-- `[+-]? digits . digits ([eE] [+-]? digits)?`, the whole string -- the
+-- literal syntax plus a sign -- or one of `NaN`, `Infinity`, `-Infinity`,
+-- which have no literal and so can only be written down this way. `None` for
+-- anything else. The result is the `Float` nearest the exact decimal value,
+-- ties to even; out of range is an infinity or a zero of the right sign.
+fun parse(s : String) -> Option Float {
+    let b = bytesOf(s)
+    let n = Prim.arrayLength(b)
+    if bytesAre(b, "NaN") { return Some(Prim.floatDiv(0.0, 0.0)) }
+    if bytesAre(b, "Infinity") { return Some(Prim.floatDiv(1.0, 0.0)) }
+    if bytesAre(b, "-Infinity") { return Some(Prim.floatDiv(Prim.floatNeg(1.0), 0.0)) }
+
+    let scan = Scan { digits = newDecimal(), mantissa = 0, significant = 0 }
+    let d = scan.digits
+    var i = 0
+    var negative = False
+    if i < n && (byteAt(b, i) == 43 || byteAt(b, i) == 45) {
+        negative = byteAt(b, i) == 45
+        i = i + 1
+    }
+    let whole = i
+    while i < n && isDigit(byteAt(b, i)) {
+        takeDigit(scan, byteAt(b, i) - 48, False)
+        i = i + 1
+    }
+    if i == whole || i >= n || byteAt(b, i) != 46 { return None }
+    i = i + 1
+    d.dp = d.nd
+    let fraction = i
+    while i < n && isDigit(byteAt(b, i)) {
+        takeDigit(scan, byteAt(b, i) - 48, True)
+        i = i + 1
+    }
+    let fractionDigits = i - fraction
+    if fractionDigits == 0 { return None }
+
+    -- The exponent is clamped once it is past any value that could matter,
+    -- so that a thousand-digit exponent reads as an infinity or a zero rather
+    -- than overflowing `Int`.
+    var exponent = 0
+    if i < n && (byteAt(b, i) == 101 || byteAt(b, i) == 69) {
+        i = i + 1
+        var expNegative = False
+        if i < n && (byteAt(b, i) == 43 || byteAt(b, i) == 45) {
+            expNegative = byteAt(b, i) == 45
+            i = i + 1
+        }
+        let from = i
+        while i < n && isDigit(byteAt(b, i)) {
+            if exponent < 10000 { exponent = exponent * 10 + (byteAt(b, i) - 48) }
+            i = i + 1
+        }
+        if i == from { return None }
+        if expNegative { exponent = -exponent }
+    }
+    if i != n { return None }
+
+    let exp10 = exponent - fractionDigits
+    if scan.significant <= 15 && exp10 >= -22 && exp10 <= 22 {
+        let x = fastPath(scan.mantissa, exp10)
+        return Some(if negative { Prim.floatNeg(x) } else { x })
+    }
+    d.dp = d.dp + exponent
+    trim(d)
+    Some(Prim.floatFromBits(toBits(d, negative)))
+}
+
+-- The digits read so far: all of them in `digits`, and the first 15
+-- significant ones also as an integer for `fastPath`, with `significant`
+-- counting how many there were in all.
+type Scan = Scan { digits : Decimal, mantissa : Int, significant : Int }
+
+fun takeDigit(scan : Scan, v : Int, afterPoint : Bool) -> Unit {
+    let d = scan.digits
+    if v == 0 && d.nd == 0 {
+        -- A leading zero is not significant, but after the point it still
+        -- moves the point.
+        if afterPoint { d.dp = d.dp - 1 }
+        return
+    }
+    if scan.significant < 15 { scan.mantissa = scan.mantissa * 10 + v }
+    scan.significant = scan.significant + 1
+    if d.nd < capacity {
+        setDigit(d, d.nd, v)
+        d.nd = d.nd + 1
+    } else if v != 0 {
+        d.trunc = True
+    }
+}
+
+fun isDigit(c : Int) -> Bool = c >= 48 && c <= 57
+
+-- Clinger's fast path, for at most 15 significant digits and `|exp10| <=
+-- 22`. An integer below `10^15` and a power of ten up to `10^22` are both
+-- exactly representable, and a single IEEE multiply or divide of two exact
+-- operands is correctly rounded by definition -- which is the whole of what
+-- parsing has to achieve. Most literals in real programs take it.
+fun fastPath(mantissa : Int, exp10 : Int) -> Float {
+    let m = Prim.intToFloat(mantissa)
+    if exp10 >= 0 {
+        Prim.floatMul(m, powerOfTen(exp10))
+    } else {
+        Prim.floatDiv(m, powerOfTen(-exp10))
+    }
+}
+
+-- `10^k` for `0 <= k <= 22`, each step exact: `10^22 = 2^22 * 5^22` and
+-- `5^22` is below `2^53`.
+fun powerOfTen(k : Int) -> Float {
+    var p = 1.0
+    for var i = 0; i < k; i = i + 1 { p = Prim.floatMul(p, 10.0) }
+    p
+}
+
+-- The bits of the float nearest `d`, with the sign given. Scales `d` by
+-- powers of two into [1/2, 1), counting them, then takes 53 bits and rounds
+-- once. The shift sizes only decide how fast it converges -- each one is
+-- exact -- so `stepFor` need only be roughly `log2(10^dp)`.
+fun toBits(d : Decimal, negative : Bool) -> Int {
+    let sign = if negative { signBit } else { 0 }
+    if d.nd == 0 { return sign }
+    -- Past either end by a wide margin: `10^310` overflows and `10^-330` is
+    -- below half the smallest subnormal.
+    if d.dp > 310 { return Int.or(sign, Int.shl(maxBiased, mantBits)) }
+    if d.dp < -330 { return sign }
+
+    var exp = 0
+    while d.dp > 0 {
+        let k = stepFor(d.dp)
+        shift(d, -k)
+        exp = exp + k
+    }
+    while d.dp < 0 || (d.dp == 0 && digitAt(d, 0) < 5) {
+        let k = stepFor(-d.dp)
+        shift(d, k)
+        exp = exp - k
+    }
+    -- [1/2, 1) is one binary place below the [1, 2) a float's mantissa is in.
+    exp = exp - 1
+
+    -- Below the smallest normal exponent, the value is a subnormal: fewer
+    -- mantissa bits, at that exponent.
+    if exp < bias + 1 {
+        let k = bias + 1 - exp
+        shift(d, -k)
+        exp = exp + k
+    }
+    if exp - bias >= maxBiased { return Int.or(sign, Int.shl(maxBiased, mantBits)) }
+
+    shift(d, mantBits + 1)
+    var mant = roundedInteger(d)
+    -- Rounding up can carry into a 54th bit.
+    if mant == hidden * 2 {
+        mant = hidden
+        exp = exp + 1
+        if exp - bias >= maxBiased { return Int.or(sign, Int.shl(maxBiased, mantBits)) }
+    }
+    let biased = if Int.and(mant, hidden) == 0 { 0 } else { exp - bias }
+    Int.or(sign, Int.or(Int.shl(biased, mantBits), Int.and(mant, hidden - 1)))
+}
+
+-- The largest `k` with `2^k < 10^n`, for small `n`, and 27 past them.
+fun stepFor(n : Int) -> Int = match n {
+    0 -> 1
+    1 -> 3
+    2 -> 6
+    3 -> 9
+    4 -> 13
+    5 -> 16
+    6 -> 19
+    7 -> 23
+    8 -> 26
+    _ -> 27
+}
+
+fun byteAt(b : Prim.Array Byte, i : Int) -> Int = Prim.byteToInt(Prim.arrayGet(b, i))
+
+fun bytesAre(b : Prim.Array Byte, s : String) -> Bool {
+    let t = bytesOf(s)
+    let n = Prim.arrayLength(t)
+    if Prim.arrayLength(b) != n { return False }
+    for var i = 0; i < n; i = i + 1 {
+        if byteAt(b, i) != byteAt(t, i) { return False }
+    }
+    True
+}

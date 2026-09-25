@@ -100,16 +100,6 @@ def libraries() -> list[str]:
     return ["-lm"] if target() == "arm64-linux" else []
 
 
-def runtime_flags() -> list[str]:
-    """What compiling the runtime needs beyond `-std=c11 -O1`.
-
-    The collector walks frame records, which Darwin's ABI requires in every
-    function that calls another and Linux's leaves to the compiler; clang
-    omits them at -O1. The same rule as `scripts/build.sh`'s.
-    """
-    return ["-fno-omit-frame-pointer"] if target() == "arm64-linux" else []
-
-
 @functools.lru_cache(maxsize=None)
 def clang() -> bool:
     """Whether `$TURKEY_CC` is clang.

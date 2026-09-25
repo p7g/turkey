@@ -2,16 +2,19 @@
 
 import os
 from pathlib import Path
-import shutil
 import subprocess
 
 import pytest
 
+from tests import toolchain
 from tests.allocator_probe import allocator_object
 
 
 @pytest.fixture(scope="module")
 def verifier_probe(tmp_path_factory, allocator_object):
+    if toolchain.missing():
+        pytest.skip("C compiler unavailable")
+    toolchain.needs_sanitizer()
     root = Path(__file__).resolve().parents[1]
     directory = tmp_path_factory.mktemp("heap-verifier")
     source = directory / "probe.c"
@@ -51,7 +54,7 @@ int main(int argc, char **argv) {
     held[0] = parent;
     held[1] = (void *)1; /* Dead shadow slots must never be followed. */
     held[65] = child; /* Slots beyond the mask are always roots. */
-    assert(heap_verify(0));
+    assert(heap_verify(0, NULL));
     int phase = 0;
     if (!strcmp(which, "valid")) {
         /* Cycles, every field code, pointer arrays, closures/environments,
@@ -91,7 +94,8 @@ int main(int argc, char **argv) {
     }
     if (!strncmp(which, "mark-", 5) || !strcmp(which, "sweep-survivor")) {
         mark_epoch++;
-        mark(parent);
+        mark_grey(parent, NULL, 0);
+        while (mark_count > 0) mark_children(mark_stack[--mark_count]);
         phase = 1;
     }
     HeapRegion *r = region_of(header_of(parent));
@@ -131,6 +135,13 @@ int main(int argc, char **argv) {
     else if (!strcmp(which, "available")) available[r->size_class] = NULL;
     else if (!strcmp(which, "available-cycle")) r->available_next = r;
     else if (!strcmp(which, "available-foreign")) available[0] = (void *)1;
+    else if (!strcmp(which, "region-table-missing")) region_table_remove(r);
+    else if (!strcmp(which, "region-table-probe")) {
+        /* Moved one slot past its home with the home left empty. */
+        size_t mask = region_table_capacity - 1, home = region_hash(r);
+        region_table[home] = NULL;
+        region_table[(home + 1) & mask] = r;
+    }
     else if (!strcmp(which, "sweep-survivor")) {
         forget(parent);
         for (HeapRegion *s = regions; s; s = s->next) {
@@ -171,14 +182,14 @@ int main(int argc, char **argv) {
         if (!strcmp(which, "native-valid")) { assert(ok); puts("valid"); return 0; }
         assert(!ok); puts(panic_buffer); return 0;
     }
-    assert(!heap_verify(phase));
+    assert(!heap_verify(phase, NULL));
     assert(turkey_has_panicked);
     puts(panic_buffer);
     return 0;
 }
 ''')
     binary = directory / "probe"
-    subprocess.run([shutil.which("cc"), "-std=c11", "-O1", "-fsanitize=undefined",
+    subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-fsanitize=undefined",
                     "-I", str(root / "runtime"), str(source), str(allocator_object),
                     "-lm", "-pthread", "-o", str(binary)],
                    check=True, capture_output=True, text=True)
@@ -220,6 +231,8 @@ CASES = {
     "available": "missing available region",
     "available-cycle": "invalid available-region list",
     "available-foreign": "invalid available-region list",
+    "region-table-missing": "region table disagrees with region list",
+    "region-table-probe": "region table entry unreachable by probing",
     "sweep-survivor": "unmarked sweep survivor",
     "reclaimed": "invalid traced pointer",
     "allocation-stops": "invalid object header",
@@ -234,7 +247,7 @@ CASES = {
 
 @pytest.mark.parametrize("case,diagnostic", CASES.items())
 def test_verifier_detects_corruption(verifier_probe, case, diagnostic):
-    result = subprocess.run([str(verifier_probe), case], capture_output=True,
+    result = subprocess.run(toolchain.command(verifier_probe, case), capture_output=True,
                             text=True, timeout=20, env=dict(os.environ, UBSAN_OPTIONS="halt_on_error=1"))
     if case == "allocation-stops":
         assert result.returncode == 1, result.stderr
@@ -249,8 +262,10 @@ def test_verifier_detects_corruption(verifier_probe, case, diagnostic):
 
 
 @pytest.mark.parametrize("backend,defect", [
-    ("native", "native-roots"), ("llvm", "shadow-roots"),
-    ("native", "children"), ("llvm", "children"),
+    ("native", "native-roots"),
+    pytest.param("llvm", "shadow-roots", marks=toolchain.needs_clang()),
+    ("native", "children"),
+    pytest.param("llvm", "children", marks=toolchain.needs_clang()),
 ])
 def test_broken_collector_is_stopped_before_sweeping(tmp_path, backend, defect):
     from tests import bootc
@@ -264,14 +279,16 @@ fun main() {
     print(z[0][0][0])
 }
 ''')
-    result = subprocess.run([str(bootc.binary()), backend, str(source)],
+    if toolchain.missing():
+        pytest.skip("C compiler unavailable")
+    result = subprocess.run(toolchain.command(bootc.binary(), backend, str(source)),
                             cwd=bootc.REPO_ROOT, capture_output=True, text=True,
                             check=True)
     generated = tmp_path / ("main.s" if backend == "native" else "main.ll")
     generated.write_text(result.stdout)
     runtime = (bootc.REPO_ROOT / "runtime/turkey_runtime.c").read_text()
     if defect == "native-roots":
-        runtime = runtime.replace("    scan_native_frames();", "    /* injected omission */")
+        runtime = runtime.replace("    scan_native_frames(frame);", "    /* injected omission */")
     elif defect == "shadow-roots":
         runtime = runtime.replace("for (RootFrame *frame = roots;", "for (RootFrame *frame = NULL;")
     else:
@@ -280,11 +297,12 @@ fun main() {
     mutated = tmp_path / "runtime.c"
     mutated.write_text(runtime)
     binary = tmp_path / "broken"
-    subprocess.run(["cc", "-std=c11", "-O1", "-Wno-override-module", "-I",
+    subprocess.run([*toolchain.cc(), "-std=c11", "-O1",
+                    *toolchain.clang_only("-Wno-override-module"), "-I",
                     str(bootc.REPO_ROOT / "runtime"), str(generated), str(mutated),
                     "-lm", "-pthread", "-o", str(binary)],
                    capture_output=True, text=True, check=True)
-    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=20,
+    result = subprocess.run(toolchain.command(binary), capture_output=True, text=True, timeout=20,
                             env=dict(os.environ, TURKEY_GC_STRESS="1", TURKEY_GC_VERIFY="1"))
     assert result.returncode == 1, result.stderr
     assert "heap verifier: reachable object is unmarked" in result.stderr

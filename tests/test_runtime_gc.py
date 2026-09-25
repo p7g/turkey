@@ -31,7 +31,7 @@ int main(int argc, char **argv) {
 ''')
     binary = directory / "probe"
     subprocess.run([*toolchain.cc(), "-std=c11",
-                    *toolchain.runtime_flags(), "-I", str(root / "runtime"),
+                    "-I", str(root / "runtime"),
                     str(source), str(root / "runtime/turkey_runtime.c"), str(allocator_object),
                     "-lm", "-pthread", "-o", str(binary)], check=True,
                    capture_output=True, text=True)
@@ -134,7 +134,7 @@ int main(void) {
 ''')
     binary = directory / "probe"
     subprocess.run([*toolchain.cc(), "-std=c11",
-                    *toolchain.runtime_flags(), "-O1", "-fsanitize=undefined",
+                    "-O1", "-fsanitize=undefined",
                     "-I", str(root / "runtime"), str(source), str(allocator_object), "-lm", "-pthread",
                     "-o", str(binary)], check=True, capture_output=True, text=True)
     return binary
@@ -217,7 +217,7 @@ int main(void) {
 ''')
     binary = directory / "probe"
     subprocess.run([*toolchain.cc(), "-std=c11",
-                    *toolchain.runtime_flags(), "-O1", "-fsanitize=undefined",
+                    "-O1", "-fsanitize=undefined",
                     "-I", str(root / "runtime"), str(source), str(allocator_object), "-lm", "-pthread",
                     "-o", str(binary)], check=True, capture_output=True, text=True)
     return binary

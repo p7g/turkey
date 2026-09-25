@@ -148,6 +148,11 @@ than an arm64 Mac, so one self-compile takes about 26 minutes rather than
 minutes once `boot` is built and two hours from a cold cache; the few tests
 that compile the compiler's own source are most of that.
 
+On an arm64 Linux machine none of that is needed: `cc` links for it and the
+programs run directly. CI does this on GitHub's arm64 runners
+(`.github/workflows/linux.yml`), building from the bootstrap and running the
+suite and `pytest -m bootstrap` once under gcc and once under clang.
+
 Two groups of tests depend on the C compiler, and skip, saying why, where it
 cannot do what they need:
 
@@ -183,6 +188,21 @@ The tests are Python. Install their dependencies with
 The tests compile their programs with `boot`, which is built from the
 committed bootstrap on first use; `TURKEY_BOOT` points them at one you built
 yourself instead.
+
+The suite runs in parallel by default, and three commands cover it:
+
+    python3 -m pytest tests -q            # everything but the fixed point
+    python3 -m pytest tests -q -m bootstrap   # the fixed point alone
+    python3 -m pytest tests -q -m ''      # both, in one run
+
+To run both, use the last one rather than the first two in turn. The fixed
+point is a chain nothing can parallelize -- `boot` compiling the compiler,
+linking the result, and that compiling it again, about two minutes a step --
+and in one run it overlaps the rest of the suite instead of starting after it.
+On a 16-core arm64 Mac, after a change to `src/` (so `boot` is rebuilt), the
+combined run takes about nine minutes. The build of `boot` and everything the tests
+compute from it are cached in `$TMPDIR` by content hash, so a second run
+with nothing changed is quicker; `-n0` runs serially, for debugging.
 
 To check the heap while debugging a compiled program, run it with
 `TURKEY_GC_VERIFY=1`. Each collection independently checks object bounds,

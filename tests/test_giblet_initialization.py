@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from tests import bootc
+from tests import bootc, toolchain
 
 
 @pytest.fixture
@@ -38,12 +38,12 @@ def modules(request, tmp_path):
 
 
 def compile_source(entry, env, command):
-    return subprocess.run([str(bootc.binary()), command, str(entry)],
+    return subprocess.run(toolchain.command(bootc.binary(), command, str(entry)),
                           cwd=bootc.REPO_ROOT, env=env,
                           capture_output=True, text=True)
 
 
-@pytest.mark.parametrize("backend", ["native", "llvm"])
+@pytest.mark.parametrize("backend", toolchain.BACKENDS)
 def test_globals_precede_every_managed_allocation(modules, tmp_path, backend):
     entry, env = modules(
         'import Unsafe.Libc as C\n'
@@ -71,32 +71,33 @@ def test_globals_precede_every_managed_allocation(modules, tmp_path, backend):
     generated = tmp_path / ("program.s" if backend == "native" else "program.ll")
     generated.write_text(result.stdout)
     runtime = tmp_path / "runtime.o"
-    subprocess.run(["cc", "-std=c11", "-O1", "-c", str(bootc.RUNTIME),
+    subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-c", str(bootc.RUNTIME),
                     "-Dturkey_heap_allocate=probe_allocate", "-o", str(runtime)],
                    check=True, capture_output=True, text=True)
     probe = tmp_path / "probe.c"
     probe.write_text('''
 #include <stdint.h>
 #include <stdlib.h>
-extern void *probe_allocate(uint64_t, int64_t);
+extern void *probe_allocate(uint64_t, int64_t, void *);
 extern int64_t probe_ready(void);
 static int steps, allocated;
 int64_t probe_step(int64_t n) {
     if (allocated || n != ++steps) abort();
     return n == 1 ? 40 : 2;
 }
-void *turkey_heap_allocate(uint64_t size, int64_t kind) {
+void *turkey_heap_allocate(uint64_t size, int64_t kind, void *frame) {
     if (!allocated && (steps != 2 || probe_ready() != 42)) abort();
     allocated = 1;
-    return probe_allocate(size, kind);
+    return probe_allocate(size, kind, frame);
 }
 ''')
     binary = tmp_path / "program"
-    subprocess.run(["cc", "-O1", "-Wno-override-module", str(generated),
-                    str(runtime), str(probe), "-o", str(binary)],
+    subprocess.run([*toolchain.cc(), "-O1",
+                    *toolchain.clang_only("-Wno-override-module"), str(generated),
+                    str(runtime), str(probe), *toolchain.libraries(), "-o", str(binary)],
                    check=True, capture_output=True, text=True)
     for stress in ["0", "1"]:
-        run = subprocess.run([str(binary)], capture_output=True, text=True,
+        run = subprocess.run(toolchain.command(binary), capture_output=True, text=True,
                              env=dict(env, TURKEY_GC_STRESS=stress))
         assert run.returncode == 0, run.stderr
         assert run.stdout == "initialized\n43\n"
@@ -115,7 +116,7 @@ void *turkey_heap_allocate(uint64_t size, int64_t kind) {
      'fun read() -> Int = value',
      'let base : Int = 0', 'uses a string literal before interning'),
     ('import Unsafe.Runtime as R\n'
-     'let value : Prim.Ptr = R.heapAllocate(32, 0)\nfun read() -> Int = 0',
+     'let value : Prim.Ptr = R.heapAllocate(32, 0, Prim.frameAddress())\nfun read() -> Int = 0',
      'let base : Int = 0', 'may not call turkey_heap_allocate'),
     ('let (a, b) : (Int, Int) = (1, 2)\nfun read() -> Int = a + b',
      'let base : Int = 0', 'builds a tuple'),
@@ -147,7 +148,7 @@ def test_early_helpers_cannot_reach_the_late_runtime(modules, dependency, messag
     assert message in result.stderr, result.stderr
 
 
-@pytest.mark.parametrize("backend", ["native", "llvm"])
+@pytest.mark.parametrize("backend", toolchain.BACKENDS)
 def test_early_raw_panic_stops_before_allocation(modules, tmp_path, backend):
     entry, env = modules(
         'import Unsafe.Runtime as R\n'
@@ -159,18 +160,19 @@ def test_early_raw_panic_stops_before_allocation(modules, tmp_path, backend):
     generated = tmp_path / ("program.s" if backend == "native" else "program.ll")
     generated.write_text(result.stdout)
     runtime = tmp_path / "runtime.o"
-    subprocess.run(["cc", "-std=c11", "-O1", "-c", str(bootc.RUNTIME),
+    subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-c", str(bootc.RUNTIME),
                     "-Dturkey_heap_allocate=unused_allocate", "-o", str(runtime)],
                    check=True, capture_output=True, text=True)
     probe = tmp_path / "probe.c"
     probe.write_text('#include <stdint.h>\n#include <stdlib.h>\n'
-                     'void *turkey_heap_allocate(uint64_t size, int64_t kind) '
+                     'void *turkey_heap_allocate(uint64_t size, int64_t kind, void *frame) '
                      '{ abort(); }\n')
     binary = tmp_path / "program"
-    subprocess.run(["cc", "-O1", "-Wno-override-module", str(generated),
-                    str(runtime), str(probe), "-o", str(binary)],
+    subprocess.run([*toolchain.cc(), "-O1",
+                    *toolchain.clang_only("-Wno-override-module"), str(generated),
+                    str(runtime), str(probe), *toolchain.libraries(), "-o", str(binary)],
                    check=True, capture_output=True, text=True)
-    run = subprocess.run([str(binary)], capture_output=True, text=True, env=env)
+    run = subprocess.run(toolchain.command(binary), capture_output=True, text=True, env=env)
     assert run.returncode == 1, run.stderr
     assert run.stdout == ""
     assert run.stderr.startswith("panic: early failure\n")

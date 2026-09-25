@@ -125,18 +125,6 @@ def test_the_corpus_compiles_and_agrees_with_the_reference(name):
         f"{name}: the LLVM backend's output differs from the arm64 backend's")
 
 
-@toolchain.needs_clang()
-@pytest.mark.parametrize("name", COMPILABLE)
-def test_the_corpus_agrees_under_gc_stress(name):
-    if toolchain.missing():
-        pytest.skip("no C compiler")
-    result = subprocess.run(toolchain.command(_binary(name)), cwd=PROGRAMS,
-                            env=dict(os.environ, TURKEY_GC_STRESS="1", TURKEY_GC_VERIFY="1"),
-                            capture_output=True, text=True)
-    assert result.returncode == 0, result.stderr[:2000]
-    assert result.stdout == _reference(name)
-
-
 def test_nothing_is_refused():
     """No module reports a form or a primitive it could not emit.
 

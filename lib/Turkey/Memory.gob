@@ -21,18 +21,39 @@ import Std.Classes
 import Data.Bool.Type (Bool(..))
 
 -- Set `count` bytes from `p` to `value`'s low byte.
+--
+-- A word at a time, then the tail a byte at a time. Every object the
+-- allocator hands out is zeroed through here, so a byte loop was a quarter of
+-- the compiler's own run time. arm64 permits an unaligned 64-bit store, so
+-- nothing depends on `p` being aligned.
 fun fill(p : Prim.Ptr, count : Int, value : Int) -> Unit {
-    let byte = Prim.byteFromInt(Prim.intAnd(value, 255))
-    for var i = 0; i < count; i = i + 1 {
+    let low = Prim.intAnd(value, 255)
+    let word = Prim.intMulWrapping(low, 72340172838076673)
+    var i = 0
+    while i + 8 <= count {
+        Prim.storeI64(p, i, word)
+        i = i + 8
+    }
+    let byte = Prim.byteFromInt(low)
+    while i < count {
         Prim.storeI8(p, i, byte)
+        i = i + 1
     }
 }
 
 -- Copy `count` bytes from `source` to `target`, front to back: the regions must
--- not overlap unless `target` is below `source`.
+-- not overlap unless `target` is below `source`. A word at a time as `fill`
+-- is; each word is loaded before it is stored, so a `target` below `source`
+-- only ever overwrites bytes already read.
 fun copy(target : Prim.Ptr, source : Prim.Ptr, count : Int) -> Unit {
-    for var i = 0; i < count; i = i + 1 {
+    var i = 0
+    while i + 8 <= count {
+        Prim.storeI64(target, i, Prim.loadI64(source, i))
+        i = i + 8
+    }
+    while i < count {
         Prim.storeI8(target, i, Prim.loadI8(source, i))
+        i = i + 1
     }
 }
 

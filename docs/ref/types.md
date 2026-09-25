@@ -143,6 +143,62 @@ True
 True
 ```
 
+`show` of a `Float` is the shortest decimal that reads back as exactly the same
+`Float`. It is written out in full when the value's decimal exponent is from
+-4 to 15, so for magnitudes from `0.0001` up to just under `10^16`, and in
+exponent form otherwise: one digit, a point, the remaining digits, `e`, a sign,
+and an exponent of at least two digits. Either way there is a point with a
+digit after it, `.0` if nothing else, so the text of a finite `Float` is a
+valid float literal and never an integer one. Zero keeps its sign, and the
+values with no literal print as `Infinity`, `-Infinity` and `NaN`.
+
+<!-- run -->
+```kotlin
+fun main() {
+    print(100.0)
+    print(0.1 + 0.2)
+    print(0.0001)
+    print(0.00001)
+    print(1.0e16)
+    print(-2.5e-300)
+    print(-0.0)
+}
+```
+
+```text
+100.0
+0.30000000000000004
+0.0001
+1.0e-05
+1.0e+16
+-2.5e-300
+-0.0
+```
+
+`Float.parse` reads a string back. It accepts a float literal with an optional
+leading `+` or `-`, and the three special names, and nothing else: no
+surrounding space, no `1e5` without a point, no `inf`. The result is the
+`Float` nearest the decimal value, with an exact tie going to the one whose
+last bit is zero; a value too large becomes an infinity and one too small a
+zero, each keeping its sign.
+
+<!-- run -->
+```kotlin
+fun main() {
+    print(Float.parse("-1.5e3"))
+    print(Float.parse("Infinity"))
+    print(Float.parse("9007199254740993.0"))
+    print(Float.parse("1e5"))
+}
+```
+
+```text
+Some(-1500.0)
+Some(Infinity)
+Some(9007199254740992.0)
+None
+```
+
 ### Byte
 
 A `Byte` is an unsigned 8-bit integer. It exists to hold raw bytes, for

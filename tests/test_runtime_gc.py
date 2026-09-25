@@ -142,7 +142,7 @@ int main(void) {
 
 @pytest.mark.parametrize("stress", [False, True])
 def test_regions_reuse_holes_and_reclaim_small_and_large_objects(region_probe, stress):
-    env = dict(os.environ)
+    env = dict(os.environ, TURKEY_GC_VERIFY="1")
     env.pop("TURKEY_GC_STATS", None)
     env.pop("TURKEY_GC_STRESS", None)
     if stress:

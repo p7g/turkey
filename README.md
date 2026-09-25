@@ -203,3 +203,15 @@ On a 16-core arm64 Mac, after a change to `src/` (so `boot` is rebuilt), the
 combined run takes about nine minutes. The build of `boot` and everything the tests
 compute from it are cached in `$TMPDIR` by content hash, so a second run
 with nothing changed is quicker; `-n0` runs serially, for debugging.
+
+To check the heap while debugging a compiled program, run it with
+`TURKEY_GC_VERIFY=1`. Each collection independently checks object bounds,
+traced references, shadow-stack and native roots, marking completeness, and
+region bookkeeping before and after sweeping. Failures report
+`heap verifier:` and terminate the process with exit status 1 before proceeding
+to the next collection phase.
+Combine it with `TURKEY_GC_STRESS=1` to collect and verify at every allocation.
+Verification scans the allocated heap and uses temporary native memory for a
+region index; it is disabled by default. It checks the roots and layouts the
+compiler supplies, so behavioral stress tests are still needed to catch
+references omitted from those descriptions.

@@ -445,6 +445,14 @@ fun main() {
 }
 ```
 
+Compiler-designated giblet modules initialize their untraced globals before
+any managed allocation, including string-literal interning. Their initializers
+may not allocate, depend on globals outside giblet modules, or use `Prim.error`
+directly or through a helper. They can report failures through the raw
+`turkey_panic` interface with `Prim.cString`. Mutable giblet globals use direct
+storage rather than heap cells. These rules apply only to designated library
+modules.
+
 Once every top-level binding is initialized, the program calls
 [`main`](modules.md#the-entry-point).
 

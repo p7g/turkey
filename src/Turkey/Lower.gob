@@ -172,7 +172,7 @@ fun unitType() -> Ty.Type = Ty.tUnit()
 
 -- -- the program --------------------------------------------------------------------
 
-fun program(l : Lowerer, ordered : Array Stmt) -> CProgram {
+fun program(l : Lowerer, ordered : Array Stmt, owners : Map Int String) -> CProgram {
     let out = CProgram { dicts = Array.new(16), binds = Array.new(32) }
     for (name, info) in Map.entries(l.classes.classes) {
         for (method, impl) in Map.entries(info.defaults) {
@@ -184,7 +184,7 @@ fun program(l : Lowerer, ordered : Array Stmt) -> CProgram {
     }
     let scope = newScope()
     for stmt in ordered {
-        for b in top(l, stmt, scope) { Array.push(out.binds, b) }
+        for b in top(l, stmt, scope, Map.getOr(owners, stmt.id, "")) { Array.push(out.binds, b) }
     }
     out
 }
@@ -192,20 +192,21 @@ fun program(l : Lowerer, ordered : Array Stmt) -> CProgram {
 fun newBind(name : String, ty : Ty.Type, binders : Array VarCell, value : Core,
             where : Option Span) -> CBind = CBind {
     name = name, ty = ty, binders = binders, value = value, span = where,
-    mutable = False, module_ = "", equations = Array.new(0),
+    mutable = False, module_ = moduleOf(name), equations = Array.new(0),
     layouts = Map.new(),
 }
 
 -- One top-level statement. Only bindings occur here.
-fun top(l : Lowerer, stmt : Stmt, scope : Scope) -> Array CBind = match stmt.kind {
+fun top(l : Lowerer, stmt : Stmt, scope : Scope, owner : String)
+        -> Array CBind = match stmt.kind {
     SFun(decl) -> [funBind(l, decl, scope)]
-    SLet(pat, value) -> letBinds(l, stmt, pat, value, False, scope)
-    SVar(pat, value) -> letBinds(l, stmt, pat, value, True, scope)
+    SLet(pat, value) -> letBinds(l, stmt, pat, value, False, scope, owner)
+    SVar(pat, value) -> letBinds(l, stmt, pat, value, True, scope, owner)
     -- A bare expression at the top level: evaluated for effect, so it is a
     -- binding nothing reads, which is what a `let` already means.
     SExpr(e) -> {
         let value = expr(l, e, scope)
-        [newBind(freshName(l, "top"), value.ty, Array.new(0), value,
+        [newBind(owner + "#" + freshName(l, "top"), value.ty, Array.new(0), value,
                  Some(stmt.span))]
     }
     _ -> oops("unhandled top-level statement", Some(stmt.span))
@@ -249,7 +250,7 @@ fun abstracted(l : Lowerer, ty : Ty.Type, dicts : Option Abstraction) -> Ty.Type
 -- projection per name, rather than a pattern at the top level: Core has no
 -- statements, so there is nowhere for a multi-name binder to live.
 fun letBinds(l : Lowerer, stmt : Stmt, pat : Pat, value : Expr, mutable : Bool,
-             scope : Scope) -> Array CBind {
+             scope : Scope, owner : String) -> Array CBind {
     let lowered = expr(l, value, scope)
     let dicts = abstractionOf(l, stmt.id)
     let bare = unannot(pat)
@@ -271,7 +272,7 @@ fun letBinds(l : Lowerer, stmt : Stmt, pat : Pat, value : Expr, mutable : Bool,
         }
         _ -> {}
     }
-    let holder = freshName(l, "bound")
+    let holder = owner + "#" + freshName(l, "bound")
     let out = [newBind(holder, lowered.ty, Array.new(0), lowered, Some(stmt.span))]
     for name in Array.sort(patternVars(pat)) {
         let nty = nameType(l, name)

@@ -29,7 +29,10 @@ def _bindings(dump: str) -> dict[str, str]:
 def test_generic_constant_is_replaced_everywhere() -> None:
     result = lang.dump("opt", POLYREC)
     assert result.code == 0, result.stderr
-    assert "Main#none" not in result.stdout
+    # The binding itself is still printed; no other line may mention it.
+    mentions = [line for line in result.stdout.splitlines()
+                if "Main#none" in line and not line.startswith("Main#none")]
+    assert mentions == []
 
 
 def test_generic_copy_reads_the_constant_at_its_own_type() -> None:

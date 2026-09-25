@@ -212,7 +212,7 @@ def test_pointer_array_initialization_does_not_allocate_boxes():
     result = subprocess.run(toolchain.command(_binary("shared_nullaries.gob")),
                             cwd=PROGRAMS,
                             env=dict(os.environ, TURKEY_GC_STATS="1",
-                                     TURKEY_GC_STRESS="1"),
+                                     TURKEY_GC_STRESS="1", TURKEY_GC_VERIFY="1"),
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert result.stdout == _reference("shared_nullaries.gob")

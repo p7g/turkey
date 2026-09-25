@@ -170,13 +170,19 @@ def test_a_call_is_followed_by_the_panic_check():
     # Quoted, like every symbol this backend writes: `#` is the assembler's
     # immediate prefix, so one quoting rule covers Turkey names and C ones.
     text = _native("adt.gob")
-    assert '"_turkey_has_panicked"@GOTPAGE' in text
-    assert '"_turkey_has_panicked"@GOTPAGEOFF' in text
+    flag = f'"{toolchain.c_symbol("turkey_has_panicked")}"'
+    # Mach-O and ELF spell a GOT relocation differently.
+    if toolchain.target() == "arm64-linux":
+        page, offset = f":got:{flag}", f":got_lo12:{flag}"
+    else:
+        page, offset = f"{flag}@GOTPAGE", f"{flag}@GOTPAGEOFF"
+    assert page in text
+    assert offset in text
     lines = [line.strip() for line in text.splitlines()]
     for n, line in enumerate(lines):
         if line.startswith("bl ") and "turkey_panic" not in line:
             window = lines[n:n + 12]
-            assert any(w.startswith("adrp") and "GOTPAGE" in w for w in window), window
+            assert any(w.startswith("adrp") and page in w for w in window), window
             break
     else:
         pytest.fail("no ordinary call in the program")

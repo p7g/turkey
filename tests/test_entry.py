@@ -36,15 +36,18 @@ def _boot_binary(backend: str, source: Path, tmp_path: Path) -> Path:
     code.write_text(text, encoding="utf-8")
     runtime = tmp_path / "runtime.o"
     if not runtime.exists():
-        subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-c", "-o",
+        subprocess.run([*toolchain.cc(), "-std=c11",
+                        "-O1", "-c", "-o",
                         str(runtime), str(RUNTIME)], check=True)
     output = tmp_path / f"{source.stem}-{backend}"
-    subprocess.run([*toolchain.cc(), "-O1", "-Wno-override-module", "-o",
-                    str(output), str(code), str(runtime)], check=True)
+    subprocess.run([*toolchain.cc(), "-O1",
+                    *toolchain.clang_only("-Wno-override-module"), "-o",
+                    str(output), str(code), str(runtime),
+                    *toolchain.libraries()], check=True)
     return output
 
 
-@pytest.mark.parametrize("backend", ["native", "llvm"])
+@pytest.mark.parametrize("backend", toolchain.BACKENDS)
 @pytest.mark.parametrize("name", PANICS)
 def test_a_boot_binary_reports_the_panic(name, backend, tmp_path):
     binary = _boot_binary(backend, PROGRAMS / f"{name}.gob", tmp_path)
@@ -67,7 +70,7 @@ fun main() {
 """
 
 
-@pytest.mark.parametrize("backend", ["native", "llvm"])
+@pytest.mark.parametrize("backend", toolchain.BACKENDS)
 def test_a_boot_binary_is_handed_its_arguments_and_exits_with_its_status(
         backend, tmp_path):
     """What the entry does before and after the program: `argv + 1` handed
@@ -107,7 +110,7 @@ def _fault(binary: Path) -> subprocess.CompletedProcess:
                           env=dict(os.environ, TURKEY_SEGV_FRAMES="1"))
 
 
-@pytest.mark.parametrize("backend", ["native", "llvm"])
+@pytest.mark.parametrize("backend", toolchain.BACKENDS)
 def test_a_boot_binary_reports_a_fault(backend, tmp_path):
     source = tmp_path / "fault.gob"
     source.write_text(FAULT, encoding="utf-8")

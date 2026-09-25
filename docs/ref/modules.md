@@ -208,8 +208,9 @@ compiler itself runs on:
 boot native --target arm64-linux main.gob > main.s
 ```
 
-Code that differs by platform is an ordinary `match`. Compiled for macOS, this
-prints `10`, and compiled for Linux, `7`:
+Code that differs by platform is an ordinary `match`. The signal for a bus
+error is 10 on macOS and 7 on Linux, so `sigbus()` is one or the other
+depending on the target, and the program prints the same on both:
 
 <!-- run -->
 ```kotlin
@@ -221,13 +222,18 @@ fun sigbus() -> Int = match Target.os {
     Linux -> 7
 }
 
+fun describe(signal : Int) -> String =
+    if signal == sigbus() { "bus error" } else { "signal " + Int.toString(signal) }
+
 fun main() {
-    print(sigbus())
+    print(describe(sigbus()))
+    print(describe(2))
 }
 ```
 
 ```text
-10
+bus error
+signal 2
 ```
 
 Two rules make this the way to write such code:

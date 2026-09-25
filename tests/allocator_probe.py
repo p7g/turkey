@@ -7,7 +7,7 @@ import pytest
 from tests import bootc, toolchain
 
 
-@pytest.fixture(scope="module", params=["native", "llvm"])
+@pytest.fixture(scope="module", params=toolchain.BACKENDS)
 def allocator_object(request, tmp_path_factory):
     if toolchain.missing():
         pytest.skip("C compiler unavailable")
@@ -19,12 +19,14 @@ def allocator_object(request, tmp_path_factory):
         cwd=bootc.REPO_ROOT, capture_output=True, text=True, check=True)
     # The probe supplies C's main. Keep the generated entry available but never
     # call it: allocator exports must work before literals/globals initialize.
-    text = result.stdout.replace('"_main"', '"_unused_probe_main"')
+    main = toolchain.c_symbol("main")
+    text = result.stdout.replace(f'"{main}"', '"_unused_probe_main"')
     text = text.replace("@main(", "@unused_probe_main(")
     generated = directory / ("exports.s" if request.param == "native" else "exports.ll")
     generated.write_text(text)
     output = directory / "exports.o"
-    subprocess.run([*toolchain.cc(), "-O1", "-Wno-override-module", "-c",
+    subprocess.run([*toolchain.cc(), "-O1",
+                    *toolchain.clang_only("-Wno-override-module"), "-c",
                     str(generated), "-o", str(output)], check=True,
                    capture_output=True, text=True)
     return output

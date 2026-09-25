@@ -60,10 +60,11 @@ def _all() -> dict[str, str]:
 
 
 @functools.lru_cache(maxsize=None)
-def _binary(name: str) -> Path:
-    """One program, assembled and linked, cached by what it was built from."""
+def _binary(name: str, *runtime_flags: str) -> Path:
+    """One program, assembled and linked against the runtime compiled with
+    `runtime_flags`, cached by what it was built from."""
     assembly = _all()[name].encode("utf-8")
-    runtime = runtime_object()
+    runtime = runtime_object(*runtime_flags)
     output = CACHE / f"{Path(name).stem}-arm64-{_digest(assembly, runtime.read_bytes())}.bin"
     if not output.exists():
         CACHE.mkdir(parents=True, exist_ok=True)
@@ -73,7 +74,7 @@ def _binary(name: str) -> Path:
         staging = stem.with_suffix(stem.suffix + ".bin")
         try:
             _replace_built([*toolchain.cc(), "-o", str(staging), str(source),
-                            str(runtime)], output)
+                            str(runtime), *toolchain.libraries()], output)
         finally:
             source.unlink(missing_ok=True)
     return output
@@ -98,10 +99,10 @@ def test_every_program_has_an_entry_and_a_root_array():
     of functions, and each piece is silent when it is missing: an empty root
     array still links, and every string literal is then null."""
     for name, text in _all().items():
-        assert "_turkey_module_roots:" in text, name
+        assert f"{toolchain.c_symbol('turkey_module_roots')}:" in text, name
         # The program as `Turkey.Entry` runs it, by its C symbol (TIX-67).
-        assert '"_turkey_entry":' in text, name
-        assert '.globl "_main"' in text, name
+        assert f'"{toolchain.c_symbol("turkey_entry")}":' in text, name
+        assert f'.globl "{toolchain.c_symbol("main")}"' in text, name
 
 
 @pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
@@ -126,6 +127,26 @@ def test_the_corpus_agrees_under_gc_stress(name):
         f"{name}: arm64 output under GC stress differs from the unstressed run")
 
 
+@pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
+@pytest.mark.parametrize("name", RUNNABLE)
+def test_the_corpus_agrees_under_gc_stress_without_c_frame_records(name):
+    """The same, with the runtime compiled to keep no frame records.
+
+    The collector walks Turkey's frame records and never C's, so it cannot
+    depend on how the runtime was compiled. A C compiler at -O1 may leave a
+    function without a frame record, and on arm64 Linux may use `x29` as an
+    ordinary register; a walk that crossed a C frame would then lose the
+    return address of the Turkey code that called it, and that code's roots.
+    """
+    env = dict(os.environ, TURKEY_GC_STRESS="1")
+    binary = _binary(name, "-fomit-frame-pointer")
+    result = subprocess.run(toolchain.command(binary), cwd=PROGRAMS,
+                            capture_output=True, text=True, env=env)
+    assert result.returncode == 0, result.stderr[:2000]
+    assert result.stdout == lang.output(PROGRAMS / name), (
+        f"{name}: output with a frame-pointerless runtime differs")
+
+
 def test_every_safepoint_label_is_in_the_frame_table():
     """The table's count against the labels the code actually carries.
 
@@ -134,8 +155,9 @@ def test_every_safepoint_label_is_in_the_frame_table():
     """
     for name, text in _all().items():
         lines = text.splitlines()
-        at = lines.index("_turkey_frame_table:")
+        at = lines.index(f"{toolchain.c_symbol('turkey_frame_table')}:")
         declared = int(lines[at + 1].split()[1])
-        labels = sum(1 for line in lines if line.startswith("Lsp"))
+        labels = sum(1 for line in lines
+                     if line.startswith(toolchain.local_label("Lsp")))
         assert declared == labels, (name, declared, labels)
         assert declared > 0, name

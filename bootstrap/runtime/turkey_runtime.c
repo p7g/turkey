@@ -1,3 +1,12 @@
+/* clock_gettime and CLOCK_MONOTONIC are POSIX, not C11, and glibc hides them
+   under -std=c11 unless a feature-test macro asks for them. _DEFAULT_SOURCE is
+   what -std=gnu11 would define. Not _POSIX_C_SOURCE: Darwin's headers read
+   that as a request for strict POSIX and hide their extensions, while they
+   ignore _DEFAULT_SOURCE, so the macOS build is untouched by this. A
+   feature-test macro counts only before the first system header, so a probe
+   that #includes this file has to include it before anything else. */
+#define _DEFAULT_SOURCE
+
 #include "turkey_runtime.h"
 
 #include <inttypes.h>
@@ -267,7 +276,9 @@ static HeapHeader *header_of(void *value) {
     return value == NULL ? NULL : ((HeapHeader *)value) - 1;
 }
 
-static void *heap_allocate(size_t size, uint32_t kind) {
+static void collect(void **frame);
+
+static void *heap_allocate(size_t size, uint32_t kind, void **frame) {
     if (!gc_initialized) {
         gc_initialized = 1;
         if (gc_stress < 0) gc_stress = getenv("TURKEY_GC_STRESS") != NULL;
@@ -285,7 +296,7 @@ static void *heap_allocate(size_t size, uint32_t kind) {
         if (getenv("TURKEY_GC_STATS") != NULL) stats_log = stderr;
     }
     if (gc_stress || allocations_since_collection >= collection_threshold)
-        turkey_collect();
+        collect(frame);
     if (size > SIZE_MAX - sizeof(HeapHeader)) {
         turkey_panic("allocation is too large"); return NULL;
     }
@@ -394,14 +405,25 @@ static void mark(void *value) {
    The arm64 backend registers roots OCaml's way: no function pushes or pops
    anything, and each call site that may collect has a table entry naming the
    frame offsets of the roots live across it, keyed by the return address
-   for it. The collector walks
-   `x29` frame records -- which Apple's ABI requires to be valid at all times --
-   and looks each return address up.
+   for it. The collector walks `x29` frame records and looks each return
+   address up.
 
-   Both root schemes run at once, and that is the point: a C frame and an
-   LLVM-path frame have return addresses in no table, so they are skipped, and
-   the shadow-stack chain above goes on covering them. A binary that registers
-   no table walks no frames at all. */
+   Only Turkey's frame records are walked, never C's. The walk starts from the
+   frame of the Turkey allocator that called into the heap, which passes its
+   own `x29` in, and ends at the entry thread's Turkey frame. Every frame in
+   between is Turkey's, because no C function on the mutator's stack calls
+   back into Turkey code that can allocate: the backend emits a frame record
+   in every function, so the chain is complete by construction. A C frame
+   keeps one only if its compiler chose to -- Darwin's ABI requires it, Linux's
+   leaves it to `-fno-omit-frame-pointer`, and clang at -O1 omits it -- and a
+   walk that crossed one would lose the Turkey caller's return address and
+   with it that caller's roots.
+
+   Both root schemes run at once, and that is the point: an LLVM-path frame
+   has a return address in no table, so it is skipped, and the shadow-stack
+   chain above goes on covering it. The shadow stack is a list the generated
+   code links through memory, and reads no frame records at all. A binary that
+   registers no table walks no frames. */
 
 typedef struct FrameEntry {
     uintptr_t retaddr;
@@ -473,19 +495,25 @@ static char *entry_stack_high;
    so the entry reports it rather than owning it. */
 void turkey_entry_stack_set(void *frame) { entry_stack_high = frame; }
 
-/* Every frame of the current stack, from this one outwards.
+/* Every Turkey frame of the mutator's stack, from `frame` outwards.
+
+   `frame` is the `x29` of the Turkey allocator that called into the heap: a
+   frame record whose return address is in the allocation site, so the first
+   entry found is the allocating function's. Null means no Turkey frame is live
+   -- the final collection runs after the program has returned -- and nothing
+   is walked.
 
    The stop conditions matter more than the loop: a walk that runs off the end
    of the chain marks whatever the words beyond it happen to hold, which would
    surface as a corruption a long way from here and look exactly like a
    miscompile. So the frame pointer must stay inside this thread's stack, stay
-   16-byte aligned, and strictly increase.
+   8-byte aligned, and strictly increase.
 
-   There is no low bound to check. The walk starts at this function's own live
-   frame and `frame` only ever increases, so nothing it reaches can be below
-   the stack; the high bound and the strict increase are what confine it. */
-static void scan_native_frames(void) {
-    if (frame_entry_count == 0) return;
+   There is no low bound to check. The walk starts at a live frame below this
+   one and `frame` only ever increases, so nothing it reaches can be below the
+   stack; the high bound and the strict increase are what confine it. */
+static void scan_native_frames(void **frame) {
+    if (frame_entry_count == 0 || frame == NULL) return;
     char *high = entry_stack_high;
     if (high == NULL) {
         /* Reachable only if something ran the program without going through
@@ -496,16 +524,14 @@ static void scan_native_frames(void) {
         turkey_panic("no entry stack bound: the frame walker cannot run");
         return;
     }
-    void **frame = __builtin_frame_address(0);
-    while ((char *)frame + 16 <= high && ((uintptr_t)frame & 15) == 0) {
+    while ((char *)frame + 16 <= high && ((uintptr_t)frame & 7) == 0) {
         /* The return address in *this* record is an address in the *caller*,
            so the entry it finds describes the caller's frame -- whose `x29` is
            this record's saved one. Applying the offsets to this frame instead
-           reads whatever the callee happens to have at those offsets, which is
-           how this was wrong the first time. */
+           reads whatever the callee happens to have at those offsets. */
         void **next = frame[0];
         if (next <= frame || (char *)next + 16 > high
-                || ((uintptr_t)next & 15) != 0) break;
+                || ((uintptr_t)next & 7) != 0) break;
         const FrameEntry *entry = frame_entry_for((uintptr_t)frame[1]);
         if (entry != NULL)
             for (int64_t index = 0; index < entry->count; ++index) {
@@ -517,7 +543,12 @@ static void scan_native_frames(void) {
     }
 }
 
-void turkey_collect(void) {
+/* A collection with no Turkey frame live: the final one, after the program
+   has returned, and a C caller's. Anything else collects through the
+   allocator, which knows where the Turkey stack starts. */
+void turkey_collect(void) { collect(NULL); }
+
+static void collect(void **frame) {
     struct timespec stats_start, stats_end;
     int64_t stats_live_before = heap_count;
     /* Read before the sweep clears it: this is the allocation pressure the
@@ -553,7 +584,7 @@ void turkey_collect(void) {
             }
     /* Beside the chain, not instead of it: the arm64 backend's frames are
        here and everything else's are above. */
-    scan_native_frames();
+    scan_native_frames(frame);
     /* Empty regions cost one free, regardless of their allocation count.
        Survivors rebuild availability by copying a fixed-size bitmap and
        using epoch marks. No walk over individual object headers. */
@@ -769,9 +800,10 @@ int64_t turkey_frame_col(int64_t index) {
 
 /* The allocator giblet owns payload initialization. These bridges expose only
    collector-owned operations; the raw allocation may collect, and its caller
-   must already have rooted every managed operand. */
-void *turkey_heap_allocate(uint64_t size, int64_t kind) {
-    return heap_allocate((size_t)size, (uint32_t)kind);
+   must already have rooted every managed operand. `frame` is the caller's own
+   `x29`, where a collection's walk of the Turkey stack starts. */
+void *turkey_heap_allocate(uint64_t size, int64_t kind, void *frame) {
+    return heap_allocate((size_t)size, (uint32_t)kind, frame);
 }
 
 void turkey_count_kind(int64_t kind) {
@@ -786,18 +818,26 @@ int64_t turkey_valid_object_kind(void *value, int64_t kind) {
  *
  * `snprintf` and `strtod` cannot be declared as foreign functions, since the
  * language has no variadics, so these three stay C until shortest round-trip
- * formatting and correctly rounded parsing are written in Turkey. They read and
- * build strings as byte arrays like everything else here.
+ * formatting and correctly rounded parsing are written in Turkey. The parsers
+ * read strings as byte arrays like everything else here.
+ *
+ * The formatter does not build its string: it writes the text here, and
+ * `Turkey.Alloc` allocates. A C function that called the allocator would put a
+ * C frame between the collector's walk and the Turkey code that called it, and
+ * the walk reads only Turkey's frame records. One buffer is enough for the one
+ * mutator, whose caller copies the text out before formatting again.
  */
 
-void *turkey_float_to_string(double value) {
-    char buffer[64];
+static char float_text[64];
+
+const char *turkey_float_format(double value) {
+    char *buffer = float_text;
     int length;
-    if (isnan(value)) length = snprintf(buffer, sizeof(buffer), "NaN");
-    else if (isinf(value)) length = snprintf(buffer, sizeof(buffer),
+    if (isnan(value)) length = snprintf(buffer, sizeof float_text, "NaN");
+    else if (isinf(value)) length = snprintf(buffer, sizeof float_text,
                                              signbit(value) ? "-Infinity" : "Infinity");
     else if (value == 0.0) {
-        length = snprintf(buffer, sizeof(buffer), signbit(value) ? "-0.0" : "0.0");
+        length = snprintf(buffer, sizeof float_text, signbit(value) ? "-0.0" : "0.0");
     } else {
         union { double number; uint64_t bits; } original = { .number = value }, parsed;
         char trial[64];
@@ -811,9 +851,9 @@ void *turkey_float_to_string(double value) {
         if (exponent >= -4 && exponent < 16) {
             int decimals = precision - exponent - 1;
             if (decimals < 0) decimals = 0;
-            length = snprintf(buffer, sizeof(buffer), "%.*f", decimals, value);
+            length = snprintf(buffer, sizeof float_text, "%.*f", decimals, value);
         } else {
-            length = snprintf(buffer, sizeof(buffer), "%.*e", precision - 1, value);
+            length = snprintf(buffer, sizeof float_text, "%.*e", precision - 1, value);
             length = (int)strlen(buffer);
         }
         char *marker = strchr(buffer, 'e');
@@ -826,7 +866,7 @@ void *turkey_float_to_string(double value) {
             length += 2;
         }
     }
-    return turkey_string_new((const unsigned char *)buffer, length);
+    return buffer;
 }
 
 static int parse_float(void *string, double *result) {

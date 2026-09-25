@@ -35,6 +35,7 @@ driver.
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import functools
 import hashlib
@@ -234,19 +235,20 @@ def replace_built(command: list[str], output: Path) -> None:
 
 
 @functools.lru_cache(maxsize=None)
-def runtime_object() -> Path:
-    """`turkey_runtime.c`, compiled once rather than once per program.
+def runtime_object(*flags: str) -> Path:
+    """`turkey_runtime.c`, compiled once rather than once per program, with
+    `-O1` and any `flags` after it.
 
     Every test binary used to compile the runtime from source beside its module
     -- the largest C file here, forty-odd times per worker.
     """
     key = digest(RUNTIME.read_bytes(), RUNTIME_HEADER.read_bytes(),
-                 toolchain.identity())
+                 toolchain.identity(), "\0".join(flags).encode())
     output = CACHE / f"runtime-{key}.o"
     if not output.exists():
         CACHE.mkdir(parents=True, exist_ok=True)
         staging = CACHE / f"runtime-{key}.{os.getpid()}.o"
-        replace_built([*toolchain.cc(), "-std=c11", "-O1", "-c",
+        replace_built([*toolchain.cc(), "-std=c11", "-O1", *flags, "-c",
                        "-o", str(staging), str(RUNTIME)], output)
     return output
 
@@ -265,9 +267,13 @@ def boot_each(command: str, paths: list[Path],
     the library, which the fingerprint covers; a program that imported a
     sibling would need its directory hashed too, as `reference` does.
 
-    The missing programs are computed in one `boot` run under a lock, so a cold
-    cache is filled once while the other workers wait. `split` cuts that run's
-    output into one text per path, in order.
+    The missing programs are computed in one `boot` run, holding a lock per
+    program, so a cold entry is filled once while any other worker that wants
+    it waits. Per program rather than per command: `boot asm src/Main.gob`
+    takes minutes and the corpus's `boot asm` takes seconds, and one lock
+    across both made every corpus test wait for the compiler. The locks are
+    taken in path order, so two workers wanting overlapping sets cannot
+    deadlock. `split` cuts the run's output into one text per path, in order.
     """
     directory = Path(tempfile.gettempdir()) / "turkey-bootout" / _build_key() / command
     directory.mkdir(parents=True, exist_ok=True)
@@ -291,8 +297,10 @@ def boot_each(command: str, paths: list[Path],
     found, missing = load()
     if not missing:
         return found
-    with open(directory / ".lock", "w") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+    with contextlib.ExitStack() as held:
+        for cached in sorted({entry(path) for path in missing}):
+            lock = held.enter_context(open(cached.with_suffix(".lock"), "w"))
+            fcntl.flock(lock, fcntl.LOCK_EX)
         found, missing = load()
         if missing:
             text = boot(command, *(str(path) for path in missing))

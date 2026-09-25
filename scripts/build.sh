@@ -15,8 +15,9 @@
 # from the repository root.
 #
 # bootstrap/ holds the committed compiler: the whole-program assembly for
-# src/Main.gob once per target, each under gzip -9 -n (3.5 MB each; -n so the
-# same text always compresses to the same bytes), a copy of the C runtime they
+# src/Main.gob once per target, each under gzip -9 -n (3.5 MB each; -n so one
+# gzip always compresses the same text to the same bytes, though GNU's and
+# macOS's differ from each other), a copy of the C runtime they
 # were emitted against, and PROVENANCE, which records the commit they came from
 # and the hashes checked here before anything is built. Every target's assembly
 # is the same compiler emitting for a different platform, so a build on any of
@@ -113,6 +114,13 @@ if [ -n "$linked" ] && [ "$target" != "$linked" ]; then
 fi
 ARTIFACT=$BOOTSTRAP/$target.s.gz
 
+# glibc keeps the maths library out of libc, and the runtime calls log10;
+# Darwin's libSystem carries it, so there is nothing to add there.
+case $target in
+    arm64-linux) LIBS=-lm ;;
+    *) LIBS= ;;
+esac
+
 mkdir -p "$out"
 case $out in /*) ;; *) out=$ROOT/$out ;; esac
 
@@ -145,7 +153,7 @@ emit() {
 
 link() {
     step "link $(basename "$2")"
-    $CC -o "$2.tmp" "$1" "$3"
+    $CC -o "$2.tmp" "$1" "$3" $LIBS
     mv "$2.tmp" "$2"
 }
 
@@ -167,7 +175,8 @@ else
         exit 1
     fi
     step "bootstrap runtime"
-    $CC -std=c11 -O1 -c -o "$out/runtime0.o" "$BOOTSTRAP/runtime/turkey_runtime.c"
+    $CC -std=c11 -O1 -c -o "$out/runtime0.o" \
+        "$BOOTSTRAP/runtime/turkey_runtime.c"
     gunzip -c "$ARTIFACT" > "$out/stage1.s"
     if [ "$(sha "$out/stage1.s")" != "$(provenance "$target asm-sha256")" ]; then
         echo "build.sh: $ARTIFACT decompresses to the wrong bytes" >&2

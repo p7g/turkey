@@ -124,6 +124,75 @@ static HeapRegion *region_of(HeapHeader *header) {
     return (HeapRegion *)((uintptr_t)header & ~((uintptr_t)REGION_BYTES - 1));
 }
 
+/* Every live region's base, as an open-addressed set, so that `find_header`
+   can ask whether an arbitrary word is a heap pointer in constant time.
+   GC stress asks that of every pointer it traces, at every allocation, and a
+   walk of the region list there made a stressed run quadratic in the heap: a
+   corpus program took two minutes. `region_of` alone cannot answer it,
+   because the aligned base of a word that is not in the heap is not a region
+   and must not be read. Linear probing with backward-shift deletion, so no
+   tombstones build up across the regions the sweep frees. Only the base block
+   of a large region is entered: its one object's header is in that block. */
+static HeapRegion **region_table;
+static size_t region_table_capacity, region_table_count;
+
+static size_t region_hash(const HeapRegion *region) {
+    uint64_t h = ((uintptr_t)region / REGION_BYTES) * UINT64_C(0x9E3779B97F4A7C15);
+    return (size_t)(h ^ (h >> 32)) & (region_table_capacity - 1);
+}
+
+static int region_table_insert(HeapRegion *region) {
+    if ((region_table_count + 1) * 2 > region_table_capacity) {
+        size_t old_capacity = region_table_capacity;
+        HeapRegion **old = region_table;
+        size_t capacity = old_capacity == 0 ? 64 : old_capacity * 2;
+        HeapRegion **grown = calloc(capacity, sizeof(HeapRegion *));
+        if (grown == NULL) return 0;
+        region_table = grown;
+        region_table_capacity = capacity;
+        for (size_t index = 0; index < old_capacity; index++) {
+            if (old[index] == NULL) continue;
+            size_t at = region_hash(old[index]);
+            while (region_table[at] != NULL) at = (at + 1) & (capacity - 1);
+            region_table[at] = old[index];
+        }
+        free(old);
+    }
+    size_t at = region_hash(region);
+    while (region_table[at] != NULL)
+        at = (at + 1) & (region_table_capacity - 1);
+    region_table[at] = region;
+    region_table_count++;
+    return 1;
+}
+
+static int region_table_contains(const HeapRegion *region) {
+    if (region_table_capacity == 0) return 0;
+    for (size_t at = region_hash(region); region_table[at] != NULL;
+            at = (at + 1) & (region_table_capacity - 1))
+        if (region_table[at] == region) return 1;
+    return 0;
+}
+
+static void region_table_remove(const HeapRegion *region) {
+    size_t mask = region_table_capacity - 1;
+    size_t at = region_hash(region);
+    while (region_table[at] != region) at = (at + 1) & mask;
+    region_table[at] = NULL;
+    region_table_count--;
+    /* Pull back each entry after the hole that probing would no longer reach:
+       one whose home is not cyclically within (hole, here]. */
+    for (size_t here = (at + 1) & mask; region_table[here] != NULL;
+            here = (here + 1) & mask) {
+        size_t home = region_hash(region_table[here]);
+        if (((here - home) & mask) >= ((here - at) & mask)) {
+            region_table[at] = region_table[here];
+            region_table[here] = NULL;
+            at = here;
+        }
+    }
+}
+
 static HeapHeader *region_allocate(size_t bytes) {
     size_t slot = bytes <= 32 ? 32 : bytes <= 256 ? (bytes + 15) & ~(size_t)15 : 256;
     unsigned cls = slot / 16 - 2;
@@ -142,6 +211,11 @@ static HeapHeader *region_allocate(size_t bytes) {
         }
         region = aligned_alloc(REGION_BYTES, reserved);
         if (region == NULL) { turkey_panic("out of memory"); return NULL; }
+        if (!region_table_insert(region)) {
+            free(region);
+            turkey_panic("out of memory");
+            return NULL;
+        }
         memset(region, 0, sizeof(HeapRegion));
         region->slot_size = slot;
         region->reserved = reserved;
@@ -217,16 +291,17 @@ static HeapHeader *header_of(void *value);
 
 static HeapHeader *find_header(void *value) {
     uintptr_t address = (uintptr_t)value;
-    for (HeapRegion *region = regions; region != NULL; region = region->next) {
-        uintptr_t first = (uintptr_t)region->data + sizeof(HeapHeader);
-        if (address < first) continue;
-        size_t offset = address - first;
-        if (offset % region->slot_size != 0) continue;
-        size_t index = offset / region->slot_size;
-        if (index < region->capacity &&
-                (region->allocated[index / 64] & (UINT64_C(1) << (index % 64))))
-            return (HeapHeader *)(region->data + index * region->slot_size);
-    }
+    if (address < sizeof(HeapHeader)) return NULL;
+    HeapRegion *region = region_of((HeapHeader *)(address - sizeof(HeapHeader)));
+    if (!region_table_contains(region)) return NULL;
+    uintptr_t first = (uintptr_t)region->data + sizeof(HeapHeader);
+    if (address < first) return NULL;
+    size_t offset = address - first;
+    if (offset % region->slot_size != 0) return NULL;
+    size_t index = offset / region->slot_size;
+    if (index < region->capacity &&
+            (region->allocated[index / 64] & (UINT64_C(1) << (index % 64))))
+        return (HeapHeader *)(region->data + index * region->slot_size);
     return NULL;
 }
 
@@ -592,6 +667,7 @@ static void collect(void **frame) {
         if (region->live == 0) {
             *link = region->next;
             region_bytes -= region->reserved;
+            region_table_remove(region);
             free(region);
             continue;
         }

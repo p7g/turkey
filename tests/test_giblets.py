@@ -108,11 +108,13 @@ def lowered(request, tmp_path):
 
 def test_the_code_the_collector_will_be_written_in_is_accepted(lowered):
     """A `var`, a loop, a `Bool`, a newtype over `Prim.Ptr`, a method of a
-    known instance, a call to an ordinary function, and a panic's message."""
+    known instance, a call to an ordinary function, and a panic through a C
+    string."""
     code, _, stderr = lowered(
         "import Std.Classes\n"
         "import Data.Bool.Type (Bool(..))\n"
         "import Unsafe.Ptr as Ptr\n"
+        "import Unsafe.Runtime as Rt\n"
         "fun g(p : Ptr.Ptr, q : Ptr.Ptr, n : Int) -> Bool {\n"
         "    var i = 0\n"
         "    var seen = False\n"
@@ -120,7 +122,7 @@ def test_the_code_the_collector_will_be_written_in_is_accepted(lowered):
         "        if Ptr.load(p, i) == Prim.byteFromInt(0) { seen = True }\n"
         "        i = i + 1\n"
         "    }\n"
-        "    if n < 0 { Prim.error(\"negative\") }\n"
+        "    if n < 0 { Rt.panic(Prim.cString(\"negative\")) }\n"
         "    seen && p == q\n"
         "}\n"
         "fun f(n : Int) -> Int =\n"
@@ -229,12 +231,31 @@ def test_a_traced_value_held_across_a_call_is_refused(lowered):
         "    let m = H.h(n)\n"
         "    String.byteLength(s) + m\n"
         "}\n"
-        "fun f(n : Int) -> Int = g(\"text\", n)\n",
-        "fun h(n : Int) -> Int = if n <= 0 { 0 } else { h(n - 1) }\n")
+        "fun f(n : Int) -> Int = g(H.text(n), n)\n",
+        "fun h(n : Int) -> Int = if n <= 0 { 0 } else { h(n - 1) }\n"
+        # Recursive, so its literal stays out of the giblet.
+        "fun text(n : Int) -> String = if n <= 0 { \"text\" } else { text(n - 1) }\n",
+        exports="h, text")
     assert code != 0
     assert "giblets: g is in a giblet module and holds a traced value across " \
            "a call" in stderr, stderr
 
+
+# A literal's `String` is made by the entry sequence, which giblet code can
+# run before; `Prim.cString` is the route that needs nothing made.
+@pytest.mark.parametrize("body, what", [
+    ("fun f(n : Int) -> Int = if n < 0 { Prim.error(\"negative\") } else { n }\n",
+     "panics with a String"),
+    ("fun f(n : Int) -> Int = String.byteLength(\"text\") + n\n",
+     'uses the string literal "text"'),
+])
+def test_a_string_literal_is_refused(lowered, body, what):
+    code, _, stderr = lowered(body, "fun h(n : Int) -> Int = n\n")
+    assert code != 0
+    assert re.search(rf"giblets: f is in a giblet module and {re.escape(what)} "
+                     rf"\([^)]*Probe_giblet_\w+\.gob:\d+:\d+\); a giblet "
+                     rf"panics with Rt\.panic\(Prim\.cString\(\.\.\.\)\)",
+                     stderr), stderr
 
 
 def test_a_call_that_allocates_is_refused_with_the_path_to_it(lowered):

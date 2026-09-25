@@ -11,11 +11,12 @@ from tests.allocator_probe import allocator_object
 
 @pytest.fixture(scope="module")
 def allocator_probe(allocator_object, tmp_path_factory):
+    toolchain.needs_sanitizer()
     directory = tmp_path_factory.mktemp("allocator-probe")
     source = directory / "probe.c"
     source.write_text(r'''
-#include <assert.h>
 #include "turkey_runtime.c"
+#include <assert.h>
 
 static void panic_is(const char *message) {
     assert(turkey_has_panicked);
@@ -136,7 +137,8 @@ int main(void) {
 }
 ''')
     binary = directory / "probe"
-    subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-fsanitize=undefined",
+    subprocess.run([*toolchain.cc(), "-std=c11",
+                    *toolchain.runtime_flags(), "-O1", "-fsanitize=undefined",
                     "-I", str(bootc.REPO_ROOT / "runtime"), str(source),
                     str(allocator_object), "-lm", "-pthread", "-o",
                     str(binary)], check=True, capture_output=True, text=True)

@@ -126,7 +126,7 @@ def test_a_definition_nothing_calls_is_exported_under_its_symbol(probe):
         toolchain.command(bootc.binary(), "native", str(probe.entry)),
         cwd=REPO_ROOT, env=env, capture_output=True, text=True,
         check=True).stdout
-    assert '.globl "_probe_f"' in native
+    assert f'.globl "{toolchain.c_symbol("probe_f")}"' in native
 
 
 # -- called from C -------------------------------------------------------------
@@ -149,7 +149,7 @@ __attribute__((constructor)) static void before(void) {
 
 
 @pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
-@pytest.mark.parametrize("backend", ["native", "llvm"])
+@pytest.mark.parametrize("backend", toolchain.BACKENDS)
 def test_c_calls_a_definition_through_a_pointer(probe, tmp_path, backend):
     """The calling convention, which only running it can check: general and
     floating arguments interleaved, a `Unit` result that is C's `void`, and a
@@ -169,14 +169,16 @@ def test_c_calls_a_definition_through_a_pointer(probe, tmp_path, backend):
     caller = tmp_path / "caller.c"
     caller.write_text(CALLER, encoding="utf-8")
     runtime = tmp_path / "runtime.o"
-    subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-c", "-o",
+    subprocess.run([*toolchain.cc(), "-std=c11",
+                    *toolchain.runtime_flags(), "-O1", "-c", "-o",
                     str(runtime),
                     str(REPO_ROOT / "runtime" / "turkey_runtime.c")],
                    check=True)
     binary = tmp_path / "program"
-    subprocess.run([*toolchain.cc(), "-O1", "-Wno-override-module", "-o",
-                    str(binary), str(source), str(runtime), str(caller)],
-                   check=True)
+    subprocess.run([*toolchain.cc(), "-O1",
+                    *toolchain.clang_only("-Wno-override-module"), "-o",
+                    str(binary), str(source), str(runtime), str(caller),
+                    *toolchain.libraries()], check=True)
     result = subprocess.run(toolchain.command(binary), capture_output=True,
                             text=True)
     assert result.returncode == 0, result.stderr

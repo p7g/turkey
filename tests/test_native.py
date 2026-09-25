@@ -86,7 +86,8 @@ def _binary(name: str) -> Path:
         staging = stem.with_suffix(stem.suffix + ".bin")
         try:
             _replace_built([*toolchain.cc(), "-O1", "-o", str(staging),
-                            str(source), str(runtime)], output)
+                            str(source), str(runtime), *toolchain.libraries()],
+                           output)
         finally:
             source.unlink(missing_ok=True)
     return output
@@ -104,6 +105,7 @@ def _reference(name: str) -> str:
     return lang.output(PROGRAMS / name)
 
 
+@toolchain.needs_clang()
 @pytest.mark.parametrize("name", COMPILABLE)
 def test_the_corpus_compiles_and_agrees_with_the_reference(name):
     """The whole property, in one assertion per program.
@@ -123,6 +125,7 @@ def test_the_corpus_compiles_and_agrees_with_the_reference(name):
         f"{name}: the LLVM backend's output differs from the arm64 backend's")
 
 
+@toolchain.needs_clang()
 @pytest.mark.parametrize("name", COMPILABLE)
 def test_the_corpus_agrees_under_gc_stress(name):
     if toolchain.missing():
@@ -175,6 +178,7 @@ def _under_stress(name: str) -> subprocess.CompletedProcess:
                           env={"TURKEY_GC_STRESS": "1", "PATH": "/usr/bin"})
 
 
+@toolchain.needs_clang()
 @pytest.mark.parametrize("name", COMPILABLE)
 def test_the_corpus_survives_collection(name):
     """The same programs, collecting at every allocation.
@@ -215,6 +219,7 @@ def test_symbols_are_the_compilers_own_names():
     assert '@"Main#main"' in text or '@"Main#main@' in text, text[:400]
 
 
+@toolchain.needs_clang()
 def test_pointer_array_initialization_does_not_allocate_boxes():
     result = subprocess.run(toolchain.command(_binary("shared_nullaries.gob")),
                             cwd=PROGRAMS,

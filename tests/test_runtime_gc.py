@@ -30,7 +30,8 @@ int main(int argc, char **argv) {
 }
 ''')
     binary = directory / "probe"
-    subprocess.run([*toolchain.cc(), "-std=c11", "-I", str(root / "runtime"),
+    subprocess.run([*toolchain.cc(), "-std=c11",
+                    *toolchain.runtime_flags(), "-I", str(root / "runtime"),
                     str(source), str(root / "runtime/turkey_runtime.c"), str(allocator_object),
                     "-lm", "-pthread", "-o", str(binary)], check=True,
                    capture_output=True, text=True)
@@ -73,12 +74,13 @@ def test_allocation_kinds_and_options_survive_stress_override(gc_probe, args):
 def region_probe(tmp_path_factory, allocator_object):
     if toolchain.missing():
         pytest.skip("C compiler unavailable")
+    toolchain.needs_sanitizer()
     root = Path(__file__).resolve().parents[1]
     directory = tmp_path_factory.mktemp("region-probe")
     source = directory / "probe.c"
     source.write_text(r'''
-#include <assert.h>
 #include "turkey_runtime.c"
+#include <assert.h>
 int main(void) {
     RootFrame frame;
     void *held[96] = {0};
@@ -131,7 +133,8 @@ int main(void) {
 }
 ''')
     binary = directory / "probe"
-    subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-fsanitize=undefined",
+    subprocess.run([*toolchain.cc(), "-std=c11",
+                    *toolchain.runtime_flags(), "-O1", "-fsanitize=undefined",
                     "-I", str(root / "runtime"), str(source), str(allocator_object), "-lm", "-pthread",
                     "-o", str(binary)], check=True, capture_output=True, text=True)
     return binary
@@ -162,12 +165,13 @@ def code_probe(tmp_path_factory, allocator_object):
     """
     if toolchain.missing():
         pytest.skip("C compiler unavailable")
+    toolchain.needs_sanitizer()
     root = Path(__file__).resolve().parents[1]
     directory = tmp_path_factory.mktemp("code-probe")
     source = directory / "probe.c"
     source.write_text(r'''
-#include <assert.h>
 #include "turkey_runtime.c"
+#include <assert.h>
 
 /* Whether a string referenced only from `holder` survives a collection. */
 static int survives(void *holder, void *s) {
@@ -212,7 +216,8 @@ int main(void) {
 }
 ''')
     binary = directory / "probe"
-    subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-fsanitize=undefined",
+    subprocess.run([*toolchain.cc(), "-std=c11",
+                    *toolchain.runtime_flags(), "-O1", "-fsanitize=undefined",
                     "-I", str(root / "runtime"), str(source), str(allocator_object), "-lm", "-pthread",
                     "-o", str(binary)], check=True, capture_output=True, text=True)
     return binary

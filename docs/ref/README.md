@@ -101,6 +101,8 @@ cc -o hello hello.s runtime/turkey_runtime.c
 ./hello
 ```
 
+On Linux, add `-lm` to the link.
+
 The project README says how to build `boot` itself.
 
 ## For maintainers

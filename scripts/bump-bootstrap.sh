@@ -65,7 +65,13 @@ EOF
 for target in $TARGETS; do
     echo "emit $target" >&2
     $RUN "$OUT/stage3" native --target "$target" src/Main.gob > "$OUT/$target.s"
-    gzip -9 -n -c "$OUT/$target.s" > "$BOOTSTRAP/$target.s.gz"
+    # -n makes one gzip compress the same text to the same bytes, but GNU
+    # gzip and macOS's disagree. An artifact whose text is unchanged is kept,
+    # so a bump from the other platform does not rewrite 3.5 MB of it.
+    if [ ! -f "$BOOTSTRAP/$target.s.gz" ] ||
+            ! gunzip -c "$BOOTSTRAP/$target.s.gz" | cmp -s - "$OUT/$target.s"; then
+        gzip -9 -n -c "$OUT/$target.s" > "$BOOTSTRAP/$target.s.gz"
+    fi
     cat >> "$OUT/PROVENANCE" <<EOF
 $target asm-sha256: $(sha "$OUT/$target.s")
 $target gz-sha256: $(sha "$BOOTSTRAP/$target.s.gz")

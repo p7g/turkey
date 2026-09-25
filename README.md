@@ -80,6 +80,9 @@ cc -o rectangles rectangles.s runtime/turkey_runtime.c
 ./rectangles
 ```
 
+On Linux, link with `$TURKEY_CC` (below) and add `-lm`, since glibc keeps
+`log10` out of libc.
+
 Run the compiler from the repository root, where it finds `lib/`. Use
 `build/stages/stage2 types rectangles.gob` to inspect inferred types; the
 other subcommands print what a stage produced, and `check` just compiles.
@@ -113,23 +116,50 @@ apt-get install -y \
     qemu-user-static \
     gcc-aarch64-linux-gnu libc6-dev-arm64-cross \
     python3-pytest python3-pytest-xdist
-if [ -w /proc/sys/fs/binfmt_misc/register ]; then
-    cat /usr/lib/binfmt.d/qemu-aarch64.conf > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
+B=/proc/sys/fs/binfmt_misc
+if [ -d $B ] && [ ! -e $B/register ]; then
+    mount -t binfmt_misc binfmt_misc $B 2>/dev/null
+fi
+if [ -w $B/register ]; then
+    cat /usr/lib/binfmt.d/qemu-aarch64.conf > $B/register 2>/dev/null || true
 fi
 ```
 
 Then set `TURKEY_CC="aarch64-linux-gnu-gcc -static"` and leave `TURKEY_RUN`
 empty. The last step of the setup registers qemu with the kernel's binfmt_misc,
-so an arm64 binary runs as `./program`, with no prefix. That registration is
+so an arm64 binary runs as `./program`, with no prefix, mounting binfmt_misc
+first where the container has not. That registration is
 lost when a machine is restored from a snapshot, so the repository's
 `.claude/settings.json` runs the same line as a SessionStart hook. On macOS the
 hook does nothing. Where binfmt_misc cannot be written, set
-`TURKEY_RUN=qemu-aarch64` instead. pytest comes from apt here, because Ubuntu
+`TURKEY_RUN=qemu-aarch64-static` instead. pytest comes from apt here, because Ubuntu
 24.04 refuses a system-wide `pip install`.
 
 With those set, `sh scripts/build.sh` builds the compiler for arm64 Linux from
 `bootstrap/arm64-linux.s.gz`, and `--target arm64-linux` makes a compiler on
 any platform emit Linux assembly.
+
+The whole test suite runs and passes this way, `pytest -m bootstrap` and the
+fixed point included, and the goldens in `tests/programs/` are the same on
+both platforms. It is slow: qemu runs the compiler about fifteen times slower
+than an arm64 Mac, so one self-compile takes about 26 minutes rather than
+105 seconds. On a 4-core x86-64 machine `sh scripts/build.sh` takes about
+27 minutes and `--fixpoint` about 80. `python3 -m pytest` takes about 75
+minutes once `boot` is built and two hours from a cold cache; the few tests
+that compile the compiler's own source are most of that.
+
+Two groups of tests depend on the C compiler, and skip, saying why, where it
+cannot do what they need:
+
+- Under gcc, every test that compiles `boot llvm`'s output: gcc cannot
+  compile LLVM IR, and reads a `.ll` as a linker script. That is 217
+  tests with the setup above. With
+  `TURKEY_CC="clang --target=aarch64-linux-gnu -static"`, which links through
+  the same cross binutils and libc, they run and pass.
+- Under that clang, the UBSan probes in `test_allocators.py` and
+  `test_runtime_gc.py`: linking `-fsanitize=undefined` statically needs
+  compiler-rt built for aarch64, which Ubuntu's clang does not ship. gcc's
+  cross toolchain has `libubsan.a`, so under gcc they run.
 
 ## Project status
 

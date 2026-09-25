@@ -226,7 +226,8 @@ def _native(entry: Path) -> _Compiled:
         try:
             bootc.replace_built(
                 [*toolchain.cc(), "-o", str(directory / f"bin.{os.getpid()}"),
-                 str(source), str(bootc.runtime_object())],
+                 str(source), str(bootc.runtime_object()),
+                 *toolchain.libraries()],
                 directory / "bin")
         finally:
             source.unlink(missing_ok=True)

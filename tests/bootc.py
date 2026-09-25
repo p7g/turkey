@@ -235,20 +235,20 @@ def replace_built(command: list[str], output: Path) -> None:
 
 
 @functools.lru_cache(maxsize=None)
-def runtime_object() -> Path:
-    """`turkey_runtime.c`, compiled once rather than once per program.
+def runtime_object(*flags: str) -> Path:
+    """`turkey_runtime.c`, compiled once rather than once per program, with
+    `-O1` and any `flags` after it.
 
     Every test binary used to compile the runtime from source beside its module
     -- the largest C file here, forty-odd times per worker.
     """
     key = digest(RUNTIME.read_bytes(), RUNTIME_HEADER.read_bytes(),
-                 toolchain.identity())
+                 toolchain.identity(), "\0".join(flags).encode())
     output = CACHE / f"runtime-{key}.o"
     if not output.exists():
         CACHE.mkdir(parents=True, exist_ok=True)
         staging = CACHE / f"runtime-{key}.{os.getpid()}.o"
-        replace_built([*toolchain.cc(), "-std=c11",
-                       *toolchain.runtime_flags(), "-O1", "-c",
+        replace_built([*toolchain.cc(), "-std=c11", "-O1", *flags, "-c",
                        "-o", str(staging), str(RUNTIME)], output)
     return output
 

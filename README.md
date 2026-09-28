@@ -180,7 +180,6 @@ For more depth:
 - [Language design](design.md) and [changes to the specification](SPEC-DELTAS.md)
 - [Standard library](STDLIB.md) and [library design](LIBRARY-DESIGN.md)
 - [Compiler written in Turkey](src/)
-- [Roadmap](plan.txt)
 
 The tests are Python. Install their dependencies with
 `python3 -m pip install -e '.[dev]'`, then run `python3 -m pytest tests -q`.

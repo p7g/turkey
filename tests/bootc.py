@@ -51,6 +51,14 @@ from tests import toolchain
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BOOT_MAIN = REPO_ROOT / "src" / "Main.gob"
 
+# The implementation's modules the corpus imports from an ordinary program --
+# `ptr.gob` and `ptr_gc.gob` test raw memory, `foreign.gob` a C call and
+# `giblets_memory.gob` a giblet -- which the compiler refuses outside the
+# library unless named here. Set for every `boot` a test runs, since the corpus
+# is compiled from many places; a test of the refusal itself removes it.
+INTERNAL_IMPORTS = "TURKEY_TEST_INTERNAL_IMPORTS"
+os.environ[INTERNAL_IMPORTS] = "Turkey.Libc,Turkey.Memory,Turkey.Ptr"
+
 
 # Everything whose contents can change what `boot` compiles to: its own
 # source, the library it links against, the committed compiler that builds it

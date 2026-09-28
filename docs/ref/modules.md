@@ -15,6 +15,21 @@ standard library.
 The file the compiler is given is the **entry module**, and
 it must define [`main`](#the-entry-point).
 
+The standard library's `Turkey.*` modules are the implementation itself -- the
+collector, the allocator, the program's startup -- and a program may not import
+them. Only other standard library modules can. A program's own modules are
+its own, whatever they are called: `Turkey/Shapes.gob` beside the entry file is
+an ordinary module.
+
+<!-- error: 'Turkey.Heap' is part of the implementation, and only the standard library may import it -->
+```kotlin
+import Turkey.Heap as Heap
+
+fun main() {
+    print(Heap.heapObjects())
+}
+```
+
 Modules may not import each other in a cycle. If two modules need each other,
 they belong in one module.
 

@@ -37,8 +37,9 @@ def fails(src: str | Path, modules: dict[str, str] | None = None) -> str:
 
 
 @pytest.fixture
-def probe(request):
-    """Write a throwaway module into the real `lib/Unsafe/` and remove it.
+def probe(request, monkeypatch):
+    """Write a throwaway module into the real `lib/`, let it declare foreign
+    symbols through `TURKEY_TEST_FOREIGN`, and remove it.
 
     The gate is not "a directory named lib" -- it is *this* `lib`, the shipped
     one, which is where `Prim.` may be spelled too. A fixture that wrote into
@@ -47,12 +48,12 @@ def probe(request):
     cannot have two of these at once.
     """
     stem = "Probe_" + _SAFE.sub("_", request.node.name)[:60]
-    path = LIB / "Unsafe" / f"{stem}.gob"
+    path = LIB / f"{stem}.gob"
+    monkeypatch.setenv("TURKEY_TEST_FOREIGN", stem)
 
     def write(body: str) -> str:
-        path.write_text(body.replace("Unsafe.Probe", f"Unsafe.{stem}"),
-                        encoding="utf-8")
-        return f"import Unsafe.{stem} as P\nfun main() {{ }}\n"
+        path.write_text(body.replace("Unsafe.Probe", stem), encoding="utf-8")
+        return f"import {stem} as P\nfun main() {{ }}\n"
 
     try:
         yield write
@@ -67,32 +68,32 @@ def test_a_program_may_not_declare_a_foreign_symbol():
     """The containment is the whole of what the compiler offers here."""
     message = fails('foreign "getenv" fun getenv(Prim.Ptr) -> Prim.Ptr\n'
                     "fun main() { }\n")
-    assert "may only appear in a standard library module" in message
+    assert "a foreign declaration may only appear in" in message
 
 
-def test_naming_your_own_module_unsafe_does_not_let_you_in(tmp_path):
+def test_naming_your_own_module_after_a_listed_one_does_not_let_you_in(tmp_path):
     """Checked against where the file came from, not against what it says it
     is called. A program that could opt in by writing a module header would
     have no gate at all."""
-    message = fails("import Unsafe.Evil as E\nfun main() { }\n", {
-        "Unsafe/Evil.gob": "module Unsafe.Evil (f)\n"
+    message = fails("import Turkey.Libc as E\nfun main() { }\n", {
+        "Turkey/Libc.gob": "module Turkey.Libc (f)\n"
                            'foreign "system" fun f(Prim.Ptr) -> Int\n'})
-    assert "may only appear in a standard library module" in message
+    assert "a foreign declaration may only appear in" in message
 
 
 def test_a_directory_named_lib_is_not_the_library(tmp_path):
     """The first search root is the entry file's own directory, so "under some
     lib/" would be the same hole as trusting the module's name."""
     root = tmp_path / "lib"
-    (root / "Unsafe").mkdir(parents=True)
-    (root / "Unsafe" / "Mine.gob").write_text(
-        "module Unsafe.Mine (f)\n"
+    (root / "Turkey").mkdir(parents=True)
+    (root / "Turkey" / "Libc.gob").write_text(
+        "module Turkey.Libc (f)\n"
         'foreign "strlen" fun f(Prim.Ptr) -> Int\n',
         encoding="utf-8")
-    (root / "Main.gob").write_text("import Unsafe.Mine as P\nfun main() { }\n",
+    (root / "Main.gob").write_text("import Turkey.Libc as P\nfun main() { }\n",
                                    encoding="utf-8")
     message = fails(root / "Main.gob")
-    assert "may only appear in a standard library module" in message
+    assert "a foreign declaration may only appear in" in message
 
 
 # -- what it may say ---------------------------------------------------------

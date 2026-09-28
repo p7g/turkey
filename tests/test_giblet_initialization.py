@@ -13,11 +13,12 @@ from tests import bootc, toolchain
 @pytest.fixture
 def modules(request, tmp_path):
     suffix = hashlib.sha1(request.node.nodeid.encode()).hexdigest()[:10]
-    names = [f"Unsafe.Probe_early_{suffix}", f"Unsafe.Probe_zdependency_{suffix}"]
+    names = [f"Probe_early_{suffix}", f"Probe_zdependency_{suffix}"]
     paths = [bootc.REPO_ROOT / "lib" / Path(n.replace(".", "/") + ".gob")
              for n in names]
     entry = tmp_path / "main.gob"
-    env = dict(os.environ, TURKEY_TEST_GIBLETS=",".join(names))
+    env = dict(os.environ, TURKEY_TEST_GIBLETS=",".join(names),
+               TURKEY_TEST_FOREIGN=",".join(names))
 
     def write(body, dependency="", main="print(P.read())", exports="read",
               dependency_giblet=True):

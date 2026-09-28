@@ -78,22 +78,22 @@ def test_a_giblet_module_must_come_from_the_library(tmp_path):
 def lowered(request, tmp_path):
     """A giblet probe and an ordinary one beside it, lowered by `boot`."""
     digest = hashlib.sha1(request.node.name.encode()).hexdigest()[:10]
-    giblet = LIB / "Turkey" / f"Probe_giblet_{digest}.gob"
-    helper = LIB / "Turkey" / f"Probe_helper_{digest}.gob"
+    giblet = LIB / f"Probe_giblet_{digest}.gob"
+    helper = LIB / f"Probe_helper_{digest}.gob"
     entry = tmp_path / "main.gob"
     # Called from `main`, since specialization keeps only what is reachable.
-    entry.write_text(f"import Turkey.Probe_giblet_{digest} as P\n"
+    entry.write_text(f"import Probe_giblet_{digest} as P\n"
                      f"fun main() {{ print(Int.toString(P.f(3))) }}\n",
                      encoding="utf-8")
 
     def lower(giblet_body: str, helper_body: str,
               exports: str = "h") -> tuple[int, str, str]:
-        helper.write_text(f"module Turkey.Probe_helper_{digest} ({exports})\n\n"
+        helper.write_text(f"module Probe_helper_{digest} ({exports})\n\n"
                           + helper_body, encoding="utf-8")
-        giblet.write_text(f"module Turkey.Probe_giblet_{digest} (f)\n\n"
-                          f"import Turkey.Probe_helper_{digest} as H\n"
+        giblet.write_text(f"module Probe_giblet_{digest} (f)\n\n"
+                          f"import Probe_helper_{digest} as H\n"
                           + giblet_body, encoding="utf-8")
-        env = dict(os.environ, **{HOOK: f"Turkey.Probe_giblet_{digest}"})
+        env = dict(os.environ, **{HOOK: f"Probe_giblet_{digest}"})
         result = subprocess.run(
             toolchain.command(bootc.binary(), "ssa", str(entry)),
             cwd=REPO_ROOT, env=env, capture_output=True, text=True)
@@ -254,7 +254,7 @@ def test_a_string_literal_is_refused(lowered, body, what):
     assert code != 0
     assert re.search(rf"giblets: f is in a giblet module and {re.escape(what)} "
                      rf"\([^)]*Probe_giblet_\w+\.gob:\d+:\d+\); a giblet "
-                     rf"panics with Rt\.panic\(Prim\.cString\(\.\.\.\)\)",
+                     rf"panics with Process\.panic\(Prim\.cString\(\.\.\.\)\)",
                      stderr), stderr
 
 

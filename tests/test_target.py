@@ -89,8 +89,9 @@ def test_a_target_match_is_decided_before_lowering() -> None:
 
 
 # Each target's arm calls the errno accessor only that target's libc defines.
-# A `foreign` declaration may appear only in the library's `Unsafe.` modules,
-# so this one is written into `lib/` for the test's duration.
+# A `foreign` declaration may appear only in a module of the library the
+# compiler lists, so this one is written into `lib/` for the test's duration
+# and named through `TURKEY_TEST_FOREIGN`.
 ERRNO = """\
 module Unsafe.Probe (found)
 
@@ -111,15 +112,16 @@ fun found() -> Bool = !Prim.ptrIsNull(location())
 
 
 @pytest.fixture
-def errno(request: pytest.FixtureRequest) -> Iterator[Path]:
+def errno(request: pytest.FixtureRequest,
+          monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """A program that asks for errno's address through `ERRNO`, whose module
     is named for the test so that parallel tests do not share it."""
     stem = "Probe_" + re.sub(r"[^A-Za-z0-9_]", "_", request.node.name)[:60]
-    path = lang.LIB / "Unsafe" / f"{stem}.gob"
-    path.write_text(ERRNO.replace("Unsafe.Probe", f"Unsafe.{stem}"),
-                    encoding="utf-8")
+    path = lang.LIB / f"{stem}.gob"
+    path.write_text(ERRNO.replace("Unsafe.Probe", stem), encoding="utf-8")
+    monkeypatch.setenv("TURKEY_TEST_FOREIGN", stem)
     try:
-        yield lang.program(f"import Unsafe.{stem} as Errno\n\n"
+        yield lang.program(f"import {stem} as Errno\n\n"
                            "fun main() {\n    print(Errno.found())\n}\n")
     finally:
         path.unlink(missing_ok=True)

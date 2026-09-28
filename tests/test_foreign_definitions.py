@@ -39,9 +39,9 @@ def probe(request, tmp_path):
     digest = hashlib.sha1(request.node.name.encode()).hexdigest()[:10]
     stem = "Probe_" + _SAFE.sub("_", request.node.originalname)[:40] + "_" + digest
     entry = tmp_path / "main.gob"
-    entry.write_text(f"import Turkey.{stem} as P\nfun main() {{ }}\n",
+    entry.write_text(f"import {stem} as P\nfun main() {{ }}\n",
                      encoding="utf-8")
-    made = Probe(f"Turkey.{stem}", LIB / "Turkey" / f"{stem}.gob", entry)
+    made = Probe(stem, LIB / f"{stem}.gob", entry)
     try:
         yield made
     finally:

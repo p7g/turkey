@@ -627,7 +627,8 @@ body ::= "=" expression | block
 ```
 
 The string names the C symbol. Without a body, the declaration calls a C
-function and is allowed only in an `Unsafe.` module from the shipped library.
+function and is allowed only in the few standard library modules the compiler
+lists.
 With a body, it defines a C-callable Turkey function and is allowed only in a
 compiler-designated *giblet* module from that library. Giblet code does not
 allocate or hold a traced value across a call, so a C caller needs no

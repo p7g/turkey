@@ -737,7 +737,19 @@ fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
         -- most: an arm jumps to where the value was wanted, rather than
         -- materializing it into a block parameter and then into a slot.
         CMatch(scrutinee, alts) -> {
-            let v = value(l, scrutinee)
+            -- A tuple written only to be taken apart is not built: its
+            -- components are the values the arms test. `match (a, b)` is how
+            -- two values are matched at once, and building the pair would
+            -- allocate for nothing -- in a giblet, fatally.
+            let parts = components(l, scrutinee, alts)
+            let whole = match parts {
+                Some(_) -> None
+                None -> Some(value(l, scrutinee))
+            }
+            let taken = match parts {
+                Some(ps) -> ps
+                None -> []
+            }
             let failed = L.block(l.b)
             -- The first test happens where the scrutinee was computed, so
             -- every later test block is reached only through this one and the
@@ -752,7 +764,11 @@ fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
                 -- pattern names for the constants it opens.
                 let outer = l.layouts
                 l.layouts = openedLayoutsFor(alts[i].pat, outer)
-                pattern(l, alts[i].pat, v, scrutinee.ty, success, failure)
+                match whole {
+                    Some(v) -> pattern(l, alts[i].pat, v, scrutinee.ty, success, failure)
+                    None -> spread(l, alts[i].pat, taken, scrutinee.ty,
+                                   success, failure)
+                }
                 L.into(l.b, success)
                 lower(l, alts[i].body, dest)
                 l.layouts = outer
@@ -869,6 +885,84 @@ fun pattern(l : Lower, p : Pat, v : Value, ty : Ty.Type,
             }
             tested(l, v, name, ty, pieces, success, failure)
         }
+    }
+}
+
+-- The components of a tuple literal, evaluated in order, when every arm of the
+-- `match` on it takes it apart with a tuple pattern or ignores it. `None` when
+-- an arm needs the tuple itself -- a variable binds it -- or when a component's
+-- representation is not the one a field of the tuple would be read at, since
+-- the arms are lowered as if they had read it.
+fun components(l : Lower, scrutinee : Core, alts : Array Core.CAlt)
+        -> Option (Array Value) {
+    let elems = match scrutinee.kind {
+        CTuple(elems) -> elems
+        _ -> return None
+    }
+    let types = match Ty.prune(scrutinee.ty) {
+        TTuple(ts) -> ts
+        _ -> return None
+    }
+    if len(types) != len(elems) { return None }
+    for alt in alts {
+        match tuplePattern(alt.pat) {
+            Some(subs) -> if len(subs) != len(elems) { return None }
+            None -> if !ignores(alt.pat) { return None }
+        }
+    }
+    for var i = 0; i < len(elems); i = i + 1 {
+        if repOf(l, elems[i].ty) != repOf(l, types[i]) { return None }
+    }
+    let parts = []
+    for x in elems { Array.push(parts, value(l, x)) }
+    Some(parts)
+}
+
+-- The sub-patterns of a tuple pattern, through annotations.
+fun tuplePattern(p : Pat) -> Option (Array Pat) {
+    match p.opening {
+        Some(_) -> return None
+        None -> {}
+    }
+    match p.kind {
+        PAnnot(inner, _) -> tuplePattern(inner)
+        PTuple(subs) -> Some(subs)
+        _ -> None
+    }
+}
+
+fun ignores(p : Pat) -> Bool = match (p.kind, p.opening) {
+    (PAnnot(inner, _), None) -> ignores(inner)
+    (PWild, None) -> True
+    _ -> False
+}
+
+-- Test an arm of a `match` whose scrutinee `components` took apart: each
+-- sub-pattern against its component, in a chain, the way `destructure` tests
+-- each field it reads.
+fun spread(l : Lower, p : Pat, parts : Array Value, ty : Ty.Type,
+           success : BlockId, failure : BlockId) -> Unit {
+    let types = match Ty.prune(ty) {
+        TTuple(ts) -> ts
+        _ -> []
+    }
+    let subs = match tuplePattern(p) {
+        Some(subs) -> subs
+        None -> {
+            L.terminate(l.b, Jump(success, []))
+            return
+        }
+    }
+    if len(subs) == 0 {
+        L.terminate(l.b, Jump(success, []))
+        return
+    }
+    var at = l.b.at
+    for var i = 0; i < len(subs); i = i + 1 {
+        L.into(l.b, at)
+        let following = if i + 1 == len(subs) { success } else { L.block(l.b) }
+        pattern(l, subs[i], parts[i], types[i], following, failure)
+        at = following
     }
 }
 

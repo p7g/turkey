@@ -28,6 +28,7 @@ import Turkey.Arm64 (Reg(..), Bank(..), Mem(..), Inst(..))
 import Turkey.Asm as Asm
 import Turkey.Frame as Frame
 import Turkey.Regalloc as Regalloc
+import Turkey.Runtime as Rt
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), BlockId(..), Term(..), Func(..), Block(..), Rep(..),
                    RepClass(..))
@@ -436,8 +437,14 @@ fun emitData(m : Module, asm : Asm.Asm, b : String.Builder) -> Unit {
     line(b, "    .p2align 3")
     line(b, Asm.globalsFrame(asm.dialect) + ":")
     -- The `RootFrame` covering it: previous, function_name, count, values,
-    -- live. Five words, and the layout is `runtime/turkey_runtime.c`'s.
+    -- live. Five words, in the layout `lib/Turkey/Heap.gob` reads.
     line(b, "    .space 40")
+    -- Defined by every program, and visible to C: `Turkey.Runtime.processState`.
+    let processState = Asm.runtimeFor(asm.dialect, Rt.processState)
+    line(b, "    .globl " + processState)
+    line(b, "    .p2align 3")
+    line(b, processState + ":")
+    line(b, "    .space " + Int.toString(Rt.processStateBytes))
 }
 
 -- Each literal's bytes, and nothing else. The `TurkeyString` is built once by
@@ -490,9 +497,9 @@ fun emitBytes(text : String, b : String.Builder) -> Unit {
 --
 -- `Turkey.Entry` wraps the lot -- argument handling, the panic report and the
 -- final collection are written once, in Turkey, rather than emitted here in two
--- backends -- and reaches this by its C symbol. The runtime's two calls around
--- it park the program's ending where the entry's own code will not unwind on
--- it.
+-- backends -- and reaches this by its C symbol. `turkey_entry_returned`, at the
+-- end, parks the program's ending where the entry's own code will not unwind
+-- on it.
 fun emitEntry(asm : Asm.Asm, m : Module, main : String, b : String.Builder) -> Unit {
     let d = asm.dialect
     line(b, "    " + Asm.section(d, Asm.Text))
@@ -503,11 +510,10 @@ fun emitEntry(asm : Asm.Asm, m : Module, main : String, b : String.Builder) -> U
     instruction(b, A.Str(Physical(Gp, 29), Offset(A.sp, 16), A.W64))
     instruction(b, A.Str(Physical(Gp, 30), Offset(A.sp, 24), A.W64))
     line(b, "    add x29, sp, #16")
-    call(b, d, "turkey_entry_started")
     line(b, "    bl " + Asm.symbolFor(d, m.early))
-    symbolInto(b, d, A.x0, Asm.runtimeFor(d, "turkey_has_panicked"))
-    instruction(b, A.Ldr(A.x0, Offset(A.x0, 0), A.W32))
-    line(b, "    cbnz w0, " + Asm.localLabel(d, "entry_done"))
+    symbolInto(b, d, A.x0, Asm.runtimeFor(d, Rt.processState))
+    instruction(b, A.Ldr(A.x0, Offset(A.x0, 0), A.W64))
+    line(b, "    cbnz x0, " + Asm.localLabel(d, "entry_done"))
 
     -- The outer bound of every walk of the Turkey stack is this frame: every
     -- frame the program makes is below it, and its own roots are the globals

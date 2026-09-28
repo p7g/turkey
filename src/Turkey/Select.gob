@@ -408,6 +408,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         Address(CodeOf(sym)) -> symbolAddress(s, d, runtimeSymbolOf(s, sym))
         -- Every function has a frame record, so `x29` is this frame.
         Address(ThisFrame) -> emit(s, A.Mov(d, A.fp, A.W64))
+        Address(ProcessState) -> symbolAddress(s, d, runtimeSymbolOf(s, Rt.processState))
         GlobalLoad(name) -> emit(s, A.Ldr(d, globalAt(s, name), A.W64))
         GlobalStore(name, v) -> {
             emit(s, A.Str(A.reg(v), globalAt(s, name), A.W64))
@@ -652,30 +653,19 @@ fun call(s : Sel, d : Reg, dBank : A.Bank, resultBank : A.Bank,
 -- caller that did not look would carry on with a value the callee never
 -- produced. Every call, without exception, because a callee that cannot panic
 -- itself may call one that can. `Turkey.Llvm.propagate` is the same test on
--- the other path, and reads the flag as a plain load for the same reason: a
--- call to `turkey_panicked()` would be one more call to test the flag of.
+-- the other path. The flag is the first word of the process state
+-- (`Turkey.Runtime.processState`), which this program defines.
 fun propagate(s : Sel) -> Unit {
     if s.panicking { return }
-    let flag = temp(s, Ssa.untraced(I32))
-    let panicked = got(s, runtimeSymbolOf(s, "turkey_has_panicked"))
-    emit(s, A.Ldr(flag, A.Offset(panicked, 0), A.W32))
-    emit(s, A.CmpImm(flag, 0, A.W32))
+    let flag = temp(s, Ssa.untraced(I64))
+    let panicked = address(s, runtimeSymbolOf(s, Rt.processState))
+    emit(s, A.Ldr(flag, A.Offset(panicked, 0), A.W64))
+    emit(s, A.CmpImm(flag, 0, A.W64))
     let failed = tempValue(s, Ssa.untraced(I1))
     emit(s, A.CSet(A.reg(failed), A.Ne))
     -- The empty message: this path propagates a panic that already happened
     -- and raises nothing new. It returns zero, as every panic path does.
     guard(s, failed, "")
-}
-
--- The address of a symbol this module does not define, which is one
--- indirection further than one it does: the linker fills a global offset
--- table entry, and the code loads the address out of it.
-fun got(s : Sel, sym : String) -> Reg {
-    let page = temp(s, Ssa.untraced(Ptr))
-    let full = temp(s, Ssa.untraced(Ptr))
-    emit(s, A.AdrpGot(page, Asm.gotPage(s.asm.dialect, sym)))
-    emit(s, A.LdrGot(full, page, Asm.gotOffset(s.asm.dialect, sym)))
-    full
 }
 
 -- A zero of the function's result, which is what every path that leaves

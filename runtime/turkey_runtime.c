@@ -23,7 +23,10 @@ static const unsigned char *string_bytes(void *string) {
 }
 
 static char panic_buffer[256];
-int32_t turkey_has_panicked;
+/* Weak: a program the compiler emits defines the flag itself, as the first
+   word of its panic state, and that definition is the one linked. This one
+   is for a program emitted by a compiler that does not. */
+__attribute__((weak)) int64_t turkey_has_panicked;
 
 /* How many times a field or element read/written at one scalar layout found
    another one stored, and was silently boxed or unboxed to bridge the two.
@@ -100,7 +103,7 @@ static int32_t program_panicked;
 static PanicCallFrame *entry_saved_calls;
 
 int32_t turkey_panicked(void) {
-    return turkey_has_panicked || program_panicked;
+    return turkey_has_panicked != 0 || program_panicked;
 }
 const char *turkey_panic_message(void) { return panic_buffer; }
 
@@ -124,7 +127,7 @@ void turkey_entry_started(void) {
 }
 
 void turkey_entry_returned(void) {
-    program_panicked = turkey_has_panicked;
+    program_panicked = turkey_has_panicked != 0;
     turkey_has_panicked = 0;
     panic_calls = entry_saved_calls;
 }
@@ -185,7 +188,7 @@ int64_t turkey_frame_col(int64_t index) {
 
 /* The panic flag alone, which `turkey_panicked` is not: the collector stops
    before sweeping a heap it did not finish tracing. */
-int32_t turkey_panic_pending(void) { return turkey_has_panicked; }
+int32_t turkey_panic_pending(void) { return turkey_has_panicked != 0; }
 
 /* --------------------------------------------------- what the host hands over
  *

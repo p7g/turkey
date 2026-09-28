@@ -164,20 +164,22 @@ def test_pressure_saves_and_restores_callee_saved_registers():
 def test_a_call_is_followed_by_the_panic_check():
     """`turkey_panic` sets a flag and returns, so every call tests it.
 
-    The flag is the runtime's, so its address comes through the global offset
-    table rather than a page-relative `add` -- this module does not define it.
+    The program defines the flag itself, so its address is a page-relative
+    `add` rather than a load from the global offset table.
     """
     # Quoted, like every symbol this backend writes: `#` is the assembler's
     # immediate prefix, so one quoting rule covers Turkey names and C ones.
     text = _native("adt.gob")
     flag = f'"{toolchain.c_symbol("turkey_has_panicked")}"'
-    # Mach-O and ELF spell a GOT relocation differently.
+    # Mach-O and ELF spell a page relocation differently.
     if toolchain.target() == "arm64-linux":
-        page, offset = f":got:{flag}", f":got_lo12:{flag}"
+        page, offset = flag, f":lo12:{flag}"
     else:
-        page, offset = f"{flag}@GOTPAGE", f"{flag}@GOTPAGEOFF"
+        page, offset = f"{flag}@PAGE", f"{flag}@PAGEOFF"
+    assert f".globl {flag}" in text
     assert page in text
     assert offset in text
+    assert "GOT" not in text and ":got" not in text
     lines = [line.strip() for line in text.splitlines()]
     for n, line in enumerate(lines):
         if line.startswith("bl ") and "turkey_panic" not in line:

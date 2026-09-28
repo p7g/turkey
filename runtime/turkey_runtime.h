@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 
-extern int32_t turkey_has_panicked;
+extern int64_t turkey_has_panicked;
 
 /* A `String` is a byte array on the heap, so this is `void *`:
    `turkey_string_new` is how the entry interns a literal. */

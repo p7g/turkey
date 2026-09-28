@@ -92,12 +92,12 @@ hello
 Examples that the compiler rejects say so in the surrounding text, and the
 test checks that the error message says what the text claims it says.
 
-Source files use the extension `.gob`. The compiler, `boot`, emits assembly,
-which a C compiler turns into an executable:
+Source files use the extension `.gob`. The compiler, `boot`, emits assembly
+for the whole program, which a C compiler assembles and links:
 
 ```sh
 boot native hello.gob > hello.s
-cc -o hello hello.s runtime/turkey_runtime.c
+cc -o hello hello.s
 ./hello
 ```
 

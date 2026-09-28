@@ -1,13 +1,12 @@
 """Fault injection checks the verifier independently of successful collection."""
 
 import os
-from pathlib import Path
 import shutil
 import subprocess
 
 import pytest
 
-from tests import toolchain
+from tests import bootc, toolchain
 from tests.allocator_probe import allocator_object
 
 
@@ -16,11 +15,10 @@ def verifier_probe(tmp_path_factory, allocator_object):
     if toolchain.missing():
         pytest.skip("C compiler unavailable")
     toolchain.needs_sanitizer()
-    root = Path(__file__).resolve().parents[1]
     directory = tmp_path_factory.mktemp("heap-verifier")
     source = directory / "probe.c"
     source.write_text(r'''
-#include "turkey_runtime.h"
+#include "turkey_exports.h"
 #include <assert.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -267,8 +265,7 @@ int main(int argc, char **argv) {
 ''')
     binary = directory / "probe"
     subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-fsanitize=undefined",
-                    "-I", str(root / "runtime"), str(source),
-                    str(root / "runtime" / "turkey_runtime.c"), str(allocator_object),
+                    "-I", str(bootc.PROBE_INCLUDE), str(source), str(allocator_object),
                     "-lm", "-pthread", "-o", str(binary)],
                    check=True, capture_output=True, text=True)
     return binary
@@ -353,8 +350,6 @@ def test_verifier_detects_corruption(verifier_probe, case, diagnostic):
     pytest.param("llvm", "children", marks=toolchain.needs_clang()),
 ])
 def test_broken_collector_is_stopped_before_sweeping(tmp_path, backend, defect):
-    from tests import bootc
-
     source = tmp_path / "main.gob"
     source.write_text('''
 fun main() {
@@ -373,8 +368,8 @@ fun main() {
     heap = library / "Turkey" / "Heap.gob"
     text = heap.read_text()
     if defect == "native-roots":
-        before, after = ("    scanNativeFrames(frame)\n    if panicPending()",
-                         "    if panicPending()")
+        before, after = ("    scanNativeFrames(frame)\n    if Process.pending()",
+                         "    if Process.pending()")
     elif defect == "shadow-roots":
         before, after = "    var root = roots\n", "    var root = Prim.ptrNull()\n"
     else:
@@ -389,8 +384,7 @@ fun main() {
     generated.write_text(result.stdout)
     binary = tmp_path / "broken"
     subprocess.run([*toolchain.cc(), "-std=c11", "-O1",
-                    *toolchain.clang_only("-Wno-override-module"), "-I",
-                    str(bootc.REPO_ROOT / "runtime"), str(generated), str(bootc.RUNTIME),
+                    *toolchain.clang_only("-Wno-override-module"), str(generated),
                     "-lm", "-pthread", "-o", str(binary)],
                    capture_output=True, text=True, check=True)
     result = subprocess.run(toolchain.command(binary), capture_output=True, text=True, timeout=20,

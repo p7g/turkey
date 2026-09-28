@@ -53,8 +53,9 @@ fi
 
 sh scripts/build.sh --out "$OUT" --fixpoint "$@"
 
-mkdir -p "$BOOTSTRAP/runtime"
-cp runtime/turkey_runtime.c runtime/turkey_runtime.h "$BOOTSTRAP/runtime/"
+# The committed compiler's output is the whole program, so there is no C
+# runtime to keep beside it.
+rm -rf "$BOOTSTRAP/runtime"
 
 cat > "$OUT/PROVENANCE" <<EOF
 commit: $(git rev-parse HEAD)

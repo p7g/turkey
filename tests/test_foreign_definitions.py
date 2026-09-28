@@ -168,16 +168,10 @@ def test_c_calls_a_definition_through_a_pointer(probe, tmp_path, backend):
     source.write_text(text, encoding="utf-8")
     caller = tmp_path / "caller.c"
     caller.write_text(CALLER, encoding="utf-8")
-    runtime = tmp_path / "runtime.o"
-    subprocess.run([*toolchain.cc(), "-std=c11",
-                    "-O1", "-c", "-o",
-                    str(runtime),
-                    str(REPO_ROOT / "runtime" / "turkey_runtime.c")],
-                   check=True)
     binary = tmp_path / "program"
     subprocess.run([*toolchain.cc(), "-O1",
                     *toolchain.clang_only("-Wno-override-module"), "-o",
-                    str(binary), str(source), str(runtime), str(caller),
+                    str(binary), str(source), str(caller),
                     *toolchain.libraries()], check=True)
     result = subprocess.run(toolchain.command(binary), capture_output=True,
                             text=True)

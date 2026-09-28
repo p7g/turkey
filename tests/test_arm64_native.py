@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 from tests import bootc, lang, toolchain
-from tests.bootc import CACHE, runtime_object
+from tests.bootc import CACHE
 from tests.bootc import digest as _digest, replace_built as _replace_built
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -60,12 +60,10 @@ def _all() -> dict[str, str]:
 
 
 @functools.lru_cache(maxsize=None)
-def _binary(name: str, *runtime_flags: str) -> Path:
-    """One program, assembled and linked against the runtime compiled with
-    `runtime_flags`, cached by what it was built from."""
+def _binary(name: str) -> Path:
+    """One program, assembled and linked, cached by what it was built from."""
     assembly = _all()[name].encode("utf-8")
-    runtime = runtime_object(*runtime_flags)
-    output = CACHE / f"{Path(name).stem}-arm64-{_digest(assembly, runtime.read_bytes())}.bin"
+    output = CACHE / f"{Path(name).stem}-arm64-{_digest(assembly, toolchain.identity())}.bin"
     if not output.exists():
         CACHE.mkdir(parents=True, exist_ok=True)
         stem = output.with_suffix(f".{os.getpid()}")
@@ -74,7 +72,7 @@ def _binary(name: str, *runtime_flags: str) -> Path:
         staging = stem.with_suffix(stem.suffix + ".bin")
         try:
             _replace_built([*toolchain.cc(), "-o", str(staging), str(source),
-                            str(runtime), *toolchain.libraries()], output)
+                            *toolchain.libraries()], output)
         finally:
             source.unlink(missing_ok=True)
     return output
@@ -125,26 +123,6 @@ def test_the_corpus_agrees_under_gc_stress(name):
     assert result.returncode == 0, result.stderr[:2000]
     assert result.stdout == lang.output(PROGRAMS / name), (
         f"{name}: arm64 output under GC stress differs from the unstressed run")
-
-
-@pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
-@pytest.mark.parametrize("name", RUNNABLE)
-def test_the_corpus_agrees_under_gc_stress_without_c_frame_records(name):
-    """The same, with the runtime compiled to keep no frame records.
-
-    The collector walks Turkey's frame records and never C's, so it cannot
-    depend on how the runtime was compiled. A C compiler at -O1 may leave a
-    function without a frame record, and on arm64 Linux may use `x29` as an
-    ordinary register; a walk that crossed a C frame would then lose the
-    return address of the Turkey code that called it, and that code's roots.
-    """
-    env = dict(os.environ, TURKEY_GC_STRESS="1")
-    binary = _binary(name, "-fomit-frame-pointer")
-    result = subprocess.run(toolchain.command(binary), cwd=PROGRAMS,
-                            capture_output=True, text=True, env=env)
-    assert result.returncode == 0, result.stderr[:2000]
-    assert result.stdout == lang.output(PROGRAMS / name), (
-        f"{name}: output with a frame-pointerless runtime differs")
 
 
 def test_every_safepoint_label_is_in_the_frame_table():

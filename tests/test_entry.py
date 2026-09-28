@@ -1,7 +1,7 @@
 """Exercise Turkey.Entry's argument, exit, panic and crash handling.
 
-Both boot backends produce standalone binaries. Panic sites are not emitted,
-so panic reports contain the message alone; crashes also expose root frames.
+Both boot backends produce standalone binaries. Panic reports contain the
+message alone; a crash report names the functions on the root chain.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ from tests import bootc, toolchain
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PROGRAMS = REPO_ROOT / "tests" / "programs"
-RUNTIME = REPO_ROOT / "runtime" / "turkey_runtime.c"
 
 # The corpus programs that compile and then panic, which are the ones with a
 # trace to print.
@@ -27,22 +26,17 @@ pytestmark = pytest.mark.skipif(toolchain.missing(),
 
 
 def _boot_binary(backend: str, source: Path, tmp_path: Path) -> Path:
-    """`boot native` or `boot llvm`, linked against the runtime."""
+    """`boot native` or `boot llvm`, linked."""
     # From the repository, where `boot` finds `lib/`.
     text = subprocess.run(
         toolchain.command(bootc.binary(), backend, str(source)),
         cwd=REPO_ROOT, capture_output=True, text=True, check=True).stdout
     code = tmp_path / (source.stem + (".s" if backend == "native" else ".ll"))
     code.write_text(text, encoding="utf-8")
-    runtime = tmp_path / "runtime.o"
-    if not runtime.exists():
-        subprocess.run([*toolchain.cc(), "-std=c11",
-                        "-O1", "-c", "-o",
-                        str(runtime), str(RUNTIME)], check=True)
     output = tmp_path / f"{source.stem}-{backend}"
     subprocess.run([*toolchain.cc(), "-O1",
                     *toolchain.clang_only("-Wno-override-module"), "-o",
-                    str(output), str(code), str(runtime),
+                    str(output), str(code),
                     *toolchain.libraries()], check=True)
     return output
 
@@ -101,7 +95,8 @@ fun main() {
 }
 """
 
-HEADER = ("\n*** SIGSEGV in generated code\n  innermost call sites:\n")
+HEADER = ("\n*** SIGSEGV in generated code\n"
+          "  enclosing functions, innermost first:\n")
 
 
 def _fault(binary: Path) -> subprocess.CompletedProcess:

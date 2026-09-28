@@ -15,8 +15,23 @@ def allocator_probe(allocator_object, tmp_path_factory):
     directory = tmp_path_factory.mktemp("allocator-probe")
     source = directory / "probe.c"
     source.write_text(r'''
-#include "turkey_runtime.c"
+#include "turkey_exports.h"
 #include <assert.h>
+#include <string.h>
+
+/* An object's header and slots, as `Turkey.Alloc` lays them out. A `String`
+   is a byte array: its length is the count and its bytes are the slots. */
+typedef struct TurkeyObject {
+    int32_t kind;
+    int32_t tag;
+    int64_t count;
+    uint64_t pointer_bitmap;
+    uint64_t slots[];
+} TurkeyObject;
+static int64_t string_length(void *s) { return ((TurkeyObject *)s)->count; }
+static const unsigned char *string_bytes(void *s) {
+    return (const unsigned char *)((TurkeyObject *)s)->slots;
+}
 
 /* The shadow-stack frame `turkey_root_enter` fills in: the previous frame,
    the function's name, the slot count, the slots, and which of the first 64
@@ -149,7 +164,7 @@ int main(void) {
     binary = directory / "probe"
     subprocess.run([*toolchain.cc(), "-std=c11",
                     "-O1", "-fsanitize=undefined",
-                    "-I", str(bootc.REPO_ROOT / "runtime"), str(source),
+                    "-I", str(bootc.PROBE_INCLUDE), str(source),
                     str(allocator_object), "-lm", "-pthread", "-o",
                     str(binary)], check=True, capture_output=True, text=True)
     return binary
@@ -178,14 +193,13 @@ def test_allocator_symbols_are_defined_only_in_turkey(allocator_object):
              "turkey_root_enter", "turkey_root_leave", "turkey_frame_table_register",
              "turkey_entry_stack_set", "turkey_collect", "turkey_gc_report",
              "turkey_gc_set_stress", "turkey_heap_objects", "turkey_roots_head",
-             "turkey_giblets_initialize"]
+             "turkey_giblets_initialize", "turkey_panic", "turkey_panic_string",
+             "turkey_exit", "turkey_entry_returned"]
     def defined(path):
         result = subprocess.run(["nm", "-g", str(path)], check=True,
                                 capture_output=True, text=True)
         return [line.split()[-1].lstrip("_") for line in result.stdout.splitlines()
                 if len(line.split()) >= 3 and line.split()[-2].upper() == "T"]
     generated = defined(allocator_object)
-    runtime = defined(bootc.runtime_object())
     for name in names:
         assert generated.count(name) == 1
-        assert name not in runtime

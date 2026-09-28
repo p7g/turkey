@@ -74,7 +74,7 @@ def test_globals_precede_every_managed_allocation(modules, tmp_path, backend):
     probe.write_text('''
 #include <stdint.h>
 #include <stdlib.h>
-#include "turkey_runtime.h"
+#include "turkey_exports.h"
 static int steps;
 int64_t probe_step(int64_t n) {
     /* In order, and before the program has allocated anything. */
@@ -84,9 +84,9 @@ int64_t probe_step(int64_t n) {
 }
 ''')
     binary = tmp_path / "program"
-    subprocess.run([*toolchain.cc(), "-O1", "-I", str(bootc.RUNTIME.parent),
+    subprocess.run([*toolchain.cc(), "-O1", "-I", str(bootc.PROBE_INCLUDE),
                     *toolchain.clang_only("-Wno-override-module"), str(generated),
-                    str(bootc.RUNTIME), str(probe), *toolchain.libraries(), "-o", str(binary)],
+                    str(probe), *toolchain.libraries(), "-o", str(binary)],
                    check=True, capture_output=True, text=True)
     for stress in ["0", "1"]:
         run = subprocess.run(toolchain.command(binary), capture_output=True, text=True,
@@ -117,7 +117,7 @@ def test_c_can_run_early_initialization(modules, tmp_path, backend):
     probe.write_text('''
 #include <stdint.h>
 #include <stdio.h>
-#include "turkey_runtime.h"
+#include "turkey_exports.h"
 static int64_t steps;
 int64_t probe_step(void) { return ++steps; }
 int64_t probe_read(void);
@@ -131,9 +131,9 @@ int main(void) {
 }
 ''')
     binary = tmp_path / "program"
-    subprocess.run([*toolchain.cc(), "-O1", "-I", str(bootc.RUNTIME.parent),
+    subprocess.run([*toolchain.cc(), "-O1", "-I", str(bootc.PROBE_INCLUDE),
                     *toolchain.clang_only("-Wno-override-module"), str(generated),
-                    str(bootc.RUNTIME), str(probe), *toolchain.libraries(),
+                    str(probe), *toolchain.libraries(),
                     "-o", str(binary)],
                    check=True, capture_output=True, text=True)
     run = subprocess.run(toolchain.command(binary), capture_output=True, text=True,
@@ -193,7 +193,7 @@ def test_early_helpers_cannot_reach_the_late_runtime(modules, dependency, messag
 @pytest.mark.parametrize("backend", toolchain.BACKENDS)
 def test_early_raw_panic_stops_before_allocation(modules, tmp_path, backend):
     entry, env = modules(
-        'import Unsafe.Runtime as R\n'
+        'import Turkey.Process as R\n'
         'let failed : Int = fail()\n'
         'fun fail() -> Int { R.panic(Prim.cString("early failure")); 0 }\n'
         'fun read() -> Int = failed', 'let base : Int = 0')
@@ -202,13 +202,13 @@ def test_early_raw_panic_stops_before_allocation(modules, tmp_path, backend):
     generated = tmp_path / ("program.s" if backend == "native" else "program.ll")
     generated.write_text(result.stdout)
     probe = tmp_path / "probe.c"
-    probe.write_text('#include <stdint.h>\n#include <stdio.h>\n#include "turkey_runtime.h"\n'
+    probe.write_text('#include <stdint.h>\n#include <stdio.h>\n#include "turkey_exports.h"\n'
                      '__attribute__((destructor)) static void report(void) '
                      '{ fprintf(stderr, "objects %lld\\n", (long long)turkey_heap_objects()); }\n')
     binary = tmp_path / "program"
-    subprocess.run([*toolchain.cc(), "-O1", "-I", str(bootc.RUNTIME.parent),
+    subprocess.run([*toolchain.cc(), "-O1", "-I", str(bootc.PROBE_INCLUDE),
                     *toolchain.clang_only("-Wno-override-module"), str(generated),
-                    str(bootc.RUNTIME), str(probe), *toolchain.libraries(), "-o", str(binary)],
+                    str(probe), *toolchain.libraries(), "-o", str(binary)],
                    check=True, capture_output=True, text=True)
     run = subprocess.run(toolchain.command(binary), capture_output=True, text=True, env=env)
     assert run.returncode == 1, run.stderr

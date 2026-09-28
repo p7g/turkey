@@ -25,16 +25,14 @@ def test_the_build_fingerprint_covers_boot_and_the_bootstrap(
     """`binary()` is keyed on this, and a miss here is a stale executable."""
     for relative in ("src/Main.gob", "src/Turkey/Regalloc.gob",
                      "lib/Prelude.gob",
-                     "runtime/turkey_runtime.c", "runtime/turkey_runtime.h",
-                     "bootstrap/PROVENANCE",
-                     "bootstrap/runtime/turkey_runtime.c",
+                     "bootstrap/PROVENANCE", "bootstrap/arm64-darwin.s.gz",
                      "scripts/build.sh"):
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(f"-- {relative}\n")
     before = bootc._fingerprint(tmp_path)
     for relative in ("src/Turkey/Regalloc.gob", "bootstrap/PROVENANCE",
-                     "bootstrap/runtime/turkey_runtime.c", "scripts/build.sh"):
+                     "bootstrap/arm64-darwin.s.gz", "scripts/build.sh"):
         target = tmp_path / relative
         original = target.read_bytes()
         target.write_bytes(original + b"\n")

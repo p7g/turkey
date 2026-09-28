@@ -1,0 +1,752 @@
+module Turkey.HeapCheck (
+    verify, stateBytes, stateRegions, stateAvailable, stateRegionTable,
+    stateRegionTableCapacity, stateRegionTableCount, stateRegionBytes, stateObjects,
+    stateMarkEpoch, stateFrameEntries, stateFrameEntryCount, stateEntryStackHigh,
+    stateRoots,
+)
+
+-- The heap verifier: with TURKEY_GC_VERIFY set, the collector calls `verify`
+-- before marking, after marking and before sweeping, and after sweeping, and a
+-- heap that fails is reported and the process ends.
+--
+-- Its worth is that it is separate code reading the heap its own way, so that a
+-- collector bug is not checked by the same bug. That holds only while:
+--
+-- * it decodes pointer membership, object layouts and roots itself, and never
+--   calls the collector's tracing, marking or lookup helpers;
+-- * it is written against the heap's *format* -- the region, header, object and
+--   root-frame layouts, the layout codes and the frame table, copied below --
+--   and not against how the collector happens to walk them.
+--
+-- The first is structural: `Turkey.Heap` imports this module, so this one
+-- cannot import it back. What it knows of the collector is what it is handed,
+-- a snapshot of the collector's state as words at the offsets below. So a
+-- helper here that looks like one in `Turkey.Heap` is a copy on purpose, and
+-- must not move somewhere both can import: that would make a check of the
+-- collector by the collector, which passes whenever the collector is
+-- consistently wrong.
+--
+-- What it checks is closure of the marked set: if every root is marked and
+-- every edge out of a marked object is marked, every reachable object is
+-- marked. It never changes a mark. Compiler-emitted layouts and roots are still
+-- trusted descriptions -- a root the compiler omitted cannot be reconstructed --
+-- and the region list and root chains must be readable: this diagnoses the
+-- runtime's invariants, not arbitrary corruption of the address space.
+--
+-- A giblet module: it runs inside a collection, when nothing may allocate.
+-- Every value is an `Int`, a `Bool` or a `Prim.Ptr`, the scratch it needs is
+-- malloc'ed, and a failure is formatted by hand and written to fd 2.
+--
+-- The trap `Turkey.Heap` describes applies here too: a caller's `var` that
+-- shares a name with a local or parameter of something inlined into it is given
+-- a heap cell, which the giblet check refuses.
+
+import Prelude ()
+import Std.Classes
+import Data.Int ()
+import Data.Bool.Type (Bool(..))
+import Unsafe.Libc as Libc
+
+-- -- what the collector hands over --------------------------------------------------
+--
+-- One word each: the region list, the per-class available lists, the region
+-- set's table, its capacity and its count, the bytes the regions reserve, the
+-- objects allocated, the mark epoch, the frame table and its length, the outer
+-- bound of the frame walk, and the innermost shadow-stack frame.
+
+let stateBytes : Int = 96
+let stateRegions : Int = 0
+let stateAvailable : Int = 8
+let stateRegionTable : Int = 16
+let stateRegionTableCapacity : Int = 24
+let stateRegionTableCount : Int = 32
+let stateRegionBytes : Int = 40
+let stateObjects : Int = 48
+let stateMarkEpoch : Int = 56
+let stateFrameEntries : Int = 64
+let stateFrameEntryCount : Int = 72
+let stateEntryStackHigh : Int = 80
+let stateRoots : Int = 88
+
+-- -- the heap's format ----------------------------------------------------------------
+
+-- The header before every payload: an unused word, the payload size, the heap
+-- kind (u32) and the mark epoch that last reached it (u32).
+let headerBytes : Int = 24
+let headerSize : Int = 8
+let headerKind : Int = 16
+let headerMarked : Int = 20
+
+let heapObject : Int = 2
+let heapCell : Int = 3
+
+-- A cell's payload: the value, and an i32 flag, nonzero if it is a pointer.
+let cellBytes : Int = 16
+let cellFlag : Int = 8
+
+-- An object's payload: kind and tag (i32), count, the layout bitmap (an
+-- array's element width), then the slots.
+let objectKind : Int = 0
+let objectTag : Int = 4
+let objectCount : Int = 8
+let objectBitmap : Int = 16
+let objectSlots : Int = 24
+
+-- A region. Small regions are 64KB, aligned to their size, with `capacity`
+-- slots of their size class; a large region is a whole number of 64KB blocks
+-- holding one object, of class `regionClasses`.
+let regionBytes : Int = 65536
+let regionWords : Int = 32
+let regionClasses : Int = 22
+let regionNext : Int = 0
+let regionAvailableNext : Int = 8
+let regionSlotSize : Int = 16
+let regionReserved : Int = 24
+let regionCapacity : Int = 32
+let regionUsed : Int = 36
+let regionLive : Int = 40
+let regionSearchWord : Int = 44
+let regionSizeClass : Int = 48
+let regionAllocated : Int = 56
+let regionMarked : Int = 312
+let regionData : Int = 568
+
+-- A shadow-stack frame: the previous frame, the function's name, the slot
+-- count, the slots, and which of the first 64 slots are live. Slots from 64 up
+-- are always live.
+let rootPrevious : Int = 0
+let rootCount : Int = 16
+let rootValues : Int = 24
+let rootLive : Int = 32
+
+-- A frame-table entry, sorted by return address: the address, how many roots
+-- are live across the call, and their offsets from the caller's `x29`.
+let entryBytes : Int = 24
+
+-- Bigger than any region or slot can be on a 64-bit address space, and small
+-- enough that the sum of two such values stays inside an `Int`. A slot's
+-- offset, its index times the slot size, is below the region's size once the
+-- capacity has been checked against it.
+let sizeBound : Int = 4611686018427387904
+
+-- -- state ----------------------------------------------------------------------------
+
+-- The regions, sorted by address, for membership: rebuilt at each check.
+var index : Prim.Ptr = Prim.ptrNull()
+var indexCount : Int = 0
+
+-- One check's settings, and the collector's state it was handed.
+var state : Prim.Ptr = Prim.ptrNull()
+var phase : Int = 0
+var epoch : Int = 0
+var entries : Prim.Ptr = Prim.ptrNull()
+var entryCount : Int = 0
+
+-- Per size class, how many regions have room, and how many the available
+-- lists hold: set to zero by each check before it counts.
+var expected : Prim.Ptr = Libc.malloc(8 * regionClasses)
+var actual : Prim.Ptr = Libc.malloc(8 * regionClasses)
+
+-- The diagnostic, NUL-terminated. If there was no memory for it, a failure is
+-- still a failure, and ends the process unexplained.
+let textBytes : Int = 256
+var text : Prim.Ptr = Libc.malloc(textBytes)
+var textLength : Int = 0
+
+-- -- the entry points -----------------------------------------------------------------
+
+-- Check the heap at `when` -- 0 before marking, 1 before sweeping, 2 after
+-- sweeping -- for a collection whose Turkey stack starts at `frame`, and end
+-- the process with status 1 if it fails. A corrupt heap is not something to
+-- unwind through: an entry initializer may dereference an allocation result
+-- before it can see a panic.
+--
+-- With a panic pending this checks nothing, because Turkey code unwinds at
+-- every call while the flag is up. Nor does the collector mark or sweep then,
+-- for the same reason, so there is nothing for a check to catch.
+fun verify(when : Int, frame : Prim.Ptr, handed : Prim.Ptr) -> Unit {
+    if check(when, frame, handed) { return {} }
+    if !Prim.ptrIsNull(text) {
+        putByte(10)
+        let _ = Libc.write(2, text, textLength)
+    }
+    Libc.exit(1)
+}
+
+-- The same check, answering 1 if it passes and 0 with `message` set if not:
+-- for the tests that corrupt the heap on purpose, which take the state from
+-- `turkey_heap_state`.
+foreign "turkey_heap_check" fun checkForTests(when : Int, frame : Prim.Ptr,
+                                              handed : Prim.Ptr) -> Int =
+    if check(when, frame, handed) { 1 } else { 0 }
+
+foreign "turkey_heap_check_message" fun message() -> Prim.Ptr = text
+
+-- The native frame walk alone, from `current`: for a test that builds a stack
+-- and a frame table and puts them in the state it hands over.
+foreign "turkey_heap_check_frames" fun checkFramesForTests(when : Int, current : Int,
+                                                          handed : Prim.Ptr) -> Int {
+    if !begin(when, handed) { return 0 }
+    let passed = checkFrames(current, word(Prim.ptrToInt(state), stateEntryStackHigh))
+    releaseIndex()
+    if passed { 1 } else { 0 }
+}
+
+fun check(when : Int, frame : Prim.Ptr, handed : Prim.Ptr) -> Bool {
+    if !begin(when, handed) { return False }
+    let passed = checkRegions() && checkTable() && checkObjects() && checkAvailable()
+                 && checkRoots()
+                 && checkFrames(Prim.ptrToInt(frame), stateWord(stateEntryStackHigh))
+    releaseIndex()
+    passed
+}
+
+-- Take the state, and index its regions.
+fun begin(when : Int, handed : Prim.Ptr) -> Bool {
+    textLength = 0
+    if Prim.ptrIsNull(handed) || Prim.ptrIsNull(expected) || Prim.ptrIsNull(actual) {
+        return fail(Prim.cString("out of memory"), 0, -1)
+    }
+    state = handed
+    phase = when
+    epoch = Prim.intAnd(stateWord(stateMarkEpoch), 4294967295)
+    entries = Prim.loadPtr(state, stateFrameEntries)
+    entryCount = stateWord(stateFrameEntryCount)
+    buildIndex()
+}
+
+fun stateWord(offset : Int) -> Int = Prim.loadI64(state, offset)
+
+-- -- the diagnostic -------------------------------------------------------------------
+
+-- "heap verifier: <reason> (at 0x<owner>, slot <at>)", and False.
+fun fail(reason : Prim.Ptr, owner : Int, at : Int) -> Bool {
+    if Prim.ptrIsNull(text) { return False }
+    textLength = 0
+    put(Prim.cString("heap verifier: "))
+    put(reason)
+    put(Prim.cString(" (at 0x"))
+    putHex(owner)
+    put(Prim.cString(", slot "))
+    putInt(at)
+    putByte(41)
+    Prim.storeI8(text, textLength, Prim.byteFromInt(0))
+    False
+}
+
+fun failAt(reason : Prim.Ptr, owner : Prim.Ptr, at : Int) -> Bool =
+    fail(reason, Prim.ptrToInt(owner), at)
+
+-- Two bytes are kept free: one for the NUL, and one for the newline `verify`
+-- writes in its place.
+fun putByte(byte : Int) -> Unit {
+    if textLength < textBytes - 2 {
+        Prim.storeI8(text, textLength, Prim.byteFromInt(byte))
+        textLength = textLength + 1
+    }
+}
+
+fun put(s : Prim.Ptr) -> Unit {
+    var k = 0
+    while Prim.byteToInt(Prim.loadI8(s, k)) != 0 {
+        putByte(Prim.byteToInt(Prim.loadI8(s, k)))
+        k = k + 1
+    }
+}
+
+fun putInt(n : Int) -> Unit {
+    if n < 0 {
+        putByte(45)
+        putDigits(n)
+    } else {
+        putDigits(Prim.intNeg(n))
+    }
+}
+
+-- The digits of `-n`, for `n <= 0`, which the most negative `Int` has.
+fun putDigits(n : Int) -> Unit {
+    if n <= -10 { putDigits(n / 10) }
+    putByte(48 - n % 10)
+}
+
+fun putHex(n : Int) -> Unit {
+    var place = 60
+    while place > 0 && nibble(n, place) == 0 { place = place - 4 }
+    while place >= 0 {
+        let digit = nibble(n, place)
+        putByte(if digit < 10 { 48 + digit } else { 87 + digit })
+        place = place - 4
+    }
+}
+
+fun nibble(n : Int, shift : Int) -> Int = Prim.intAnd(Prim.intShr(n, shift), 15)
+
+-- -- words ----------------------------------------------------------------------------
+
+fun load32(p : Prim.Ptr, offset : Int) -> Int = Prim.charToInt(Prim.loadI32(p, offset))
+
+fun word(address : Int, offset : Int) -> Int =
+    Prim.loadI64(Prim.ptrFromInt(address), offset)
+
+-- Unsigned `a < b`: a word claimed to be a pointer need not fit in 63 bits.
+fun below(a : Int, b : Int) -> Bool =
+    if Prim.intXor(a, b) < 0 { b < 0 } else { a < b }
+
+fun hasBit(bits : Int, at : Int) -> Bool = Prim.intAnd(Prim.intShr(bits, at), 1) != 0
+
+fun bitAt(base : Int, offset : Int, at : Int) -> Bool =
+    hasBit(word(base, offset + 8 * (at / 64)), at % 64)
+
+-- -- the region index -----------------------------------------------------------------
+
+-- The region list, checked for a cycle and copied into `index` in address
+-- order. False, with the failure recorded, if it cannot be.
+fun buildIndex() -> Bool {
+    index = Prim.ptrNull()
+    indexCount = 0
+    let first = stateWord(stateRegions)
+    var tortoise = first
+    var hare = first
+    while hare != 0 && word(hare, regionNext) != 0 {
+        tortoise = word(tortoise, regionNext)
+        hare = word(word(hare, regionNext), regionNext)
+        if tortoise == hare { return fail(Prim.cString("cyclic region chain"), tortoise, -1) }
+    }
+    var found = 0
+    var walk = first
+    while walk != 0 {
+        found = found + 1
+        walk = word(walk, regionNext)
+    }
+    if found == 0 { return True }
+    let table = Libc.malloc(8 * found)
+    if Prim.ptrIsNull(table) { return fail(Prim.cString("out of memory"), 0, -1) }
+    var filled = 0
+    var copied = first
+    while copied != 0 {
+        Prim.storeI64(table, 8 * filled, copied)
+        filled = filled + 1
+        copied = word(copied, regionNext)
+    }
+    sortRegions(table, found)
+    index = table
+    indexCount = found
+    True
+}
+
+fun releaseIndex() -> Unit {
+    if !Prim.ptrIsNull(index) { Libc.free(index) }
+    index = Prim.ptrNull()
+    indexCount = 0
+}
+
+fun indexAt(at : Int) -> Int = Prim.loadI64(index, 8 * at)
+
+-- Heapsort, in place and without recursion.
+fun sortRegions(table : Prim.Ptr, n : Int) -> Unit {
+    var top = n / 2
+    while top > 0 {
+        top = top - 1
+        sink(table, top, n)
+    }
+    var last = n
+    while last > 1 {
+        last = last - 1
+        exchange(table, 0, last)
+        sink(table, 0, last)
+    }
+}
+
+fun sink(table : Prim.Ptr, from : Int, n : Int) -> Unit {
+    var parent = from
+    while 2 * parent + 1 < n {
+        var larger = 2 * parent + 1
+        if larger + 1 < n && below(Prim.loadI64(table, 8 * larger),
+                                   Prim.loadI64(table, 8 * (larger + 1))) {
+            larger = larger + 1
+        }
+        if !below(Prim.loadI64(table, 8 * parent), Prim.loadI64(table, 8 * larger)) {
+            return {}
+        }
+        exchange(table, parent, larger)
+        parent = larger
+    }
+}
+
+fun exchange(table : Prim.Ptr, a : Int, b : Int) -> Unit {
+    let saved = Prim.loadI64(table, 8 * a)
+    Prim.storeI64(table, 8 * a, Prim.loadI64(table, 8 * b))
+    Prim.storeI64(table, 8 * b, saved)
+}
+
+-- The last region at or below `address`, or 0 if there is none: the only one
+-- that could hold it.
+fun regionAt(address : Int) -> Int {
+    var low = 0
+    var high = indexCount
+    while low < high {
+        let middle = low + (high - low) / 2
+        if below(address, indexAt(middle)) { high = middle } else { low = middle + 1 }
+    }
+    if low == 0 { 0 } else { indexAt(low - 1) }
+}
+
+fun listed(region : Int) -> Bool = region != 0 && regionAt(region) == region
+
+-- -- regions --------------------------------------------------------------------------
+
+-- Each region's geometry, bitmaps and counts, and the heap's totals. Runs
+-- before anything looks a pointer up, which trusts what it establishes: that
+-- every listed region's size, slot size and capacity are consistent, and so
+-- that every slot below the capacity is inside the region.
+fun checkRegions() -> Bool {
+    var regionTotal = 0
+    var objectTotal = 0
+    for var ri = 0; ri < indexCount; ri = ri + 1 {
+        let r = indexAt(ri)
+        let reserved = word(r, regionReserved)
+        let slotSize = word(r, regionSlotSize)
+        let capacity = load32(Prim.ptrFromInt(r), regionCapacity)
+        let used = load32(Prim.ptrFromInt(r), regionUsed)
+        let cls = load32(Prim.ptrFromInt(r), regionSizeClass)
+        let search = load32(Prim.ptrFromInt(r), regionSearchWord)
+        if Prim.intAnd(r, regionBytes - 1) != 0
+                || below(reserved, regionBytes) || !below(reserved, sizeBound)
+                || Prim.intAnd(reserved, regionBytes - 1) != 0
+                || below(slotSize, headerBytes) || !below(slotSize, sizeBound)
+                || capacity == 0 || capacity > regionWords * 64
+                || capacity > (reserved - regionData) / slotSize
+                || used > capacity || cls > regionClasses || search >= regionWords {
+            return fail(Prim.cString("invalid region geometry"), r, -1)
+        }
+        let classSlot = if cls < 15 { 32 + 16 * cls } else { Prim.intShl(256, cls - 14) }
+        let classOk = if cls < regionClasses {
+            reserved == regionBytes && slotSize == classSlot
+                && capacity == (regionBytes - regionData) / classSlot
+        } else { capacity == 1 }
+        if !classOk { return fail(Prim.cString("invalid region size class"), r, -1) }
+        for var wi = 0; wi < search; wi = wi + 1 {
+            if word(r, regionAllocated + 8 * wi) != -1 {
+                return fail(Prim.cString("allocation search skips free slots"), r, wi)
+            }
+        }
+        if ri > 0 {
+            let previous = indexAt(ri - 1)
+            if below(r - previous, word(previous, regionReserved)) {
+                return fail(Prim.cString("overlapping regions"), r, -1)
+            }
+        }
+        if regionTotal > sizeBound { return fail(Prim.cString("region byte count overflow"), r, -1) }
+        regionTotal = regionTotal + reserved
+        if !checkSlots(r, capacity, slotSize) { return False }
+        objectTotal = objectTotal + used
+    }
+    let counted = stateWord(stateObjects)
+    if counted < 0 || objectTotal != counted || regionTotal != stateWord(stateRegionBytes) {
+        return fail(Prim.cString("heap totals disagree"), 0, -1)
+    }
+    True
+}
+
+-- Every bit of a region's two bitmaps against its capacity, its counts and
+-- the headers of the objectTotal it holds.
+fun checkSlots(r : Int, capacity : Int, slotSize : Int) -> Bool {
+    var usedSeen = 0
+    var liveSeen = 0
+    for var si = 0; si < regionWords * 64; si = si + 1 {
+        let allocated = bitAt(r, regionAllocated, si)
+        let marked = bitAt(r, regionMarked, si)
+        if (si >= capacity && allocated) || (marked && !allocated) {
+            return fail(Prim.cString("marked/free slot or bitmap outside region"), r, si)
+        }
+        if phase != 1 && marked {
+            return fail(Prim.cString("uncleared region marks"), r, si)
+        }
+        if allocated {
+            usedSeen = usedSeen + 1
+            if marked { liveSeen = liveSeen + 1 }
+            let h = Prim.ptrFromInt(r + regionData + si * slotSize)
+            if below(slotSize - headerBytes, Prim.loadI64(h, headerSize)) {
+                return failAt(Prim.cString("object exceeds allocation slot"), h, si)
+            }
+            let reached = load32(h, headerMarked) == epoch
+            if phase == 1 && marked != reached {
+                return failAt(Prim.cString("header and region marks disagree"), h, si)
+            }
+            if phase == 2 && !reached {
+                return failAt(Prim.cString("unmarked sweep survivor"), h, si)
+            }
+        }
+    }
+    let p = Prim.ptrFromInt(r)
+    if usedSeen != load32(p, regionUsed) || liveSeen != load32(p, regionLive) {
+        return fail(Prim.cString("region counts disagree"), r, -1)
+    }
+    True
+}
+
+-- The open-addressed set of region bases holds exactly the listed regions,
+-- each reachable by linear probing from its home slot: no empty slot between
+-- the home and the entry.
+fun checkTable() -> Bool {
+    let table = Prim.loadPtr(state, stateRegionTable)
+    let capacity = stateWord(stateRegionTableCapacity)
+    let count = stateWord(stateRegionTableCount)
+    if count != indexCount || capacity < 0 || Prim.intAnd(capacity, capacity - 1) != 0
+            || (indexCount > 0 && count * 2 > capacity) {
+        return failAt(Prim.cString("region table disagrees with region list"), table, -1)
+    }
+    var entriesSeen = 0
+    for var ti = 0; ti < capacity; ti = ti + 1 {
+        let r = Prim.loadI64(table, 8 * ti)
+        if r != 0 {
+            entriesSeen = entriesSeen + 1
+            if !listed(r) {
+                return fail(Prim.cString("region table holds an unlisted region"), r, ti)
+            }
+            var probe = home(r, capacity)
+            while probe != ti {
+                if Prim.loadI64(table, 8 * probe) == 0 {
+                    return fail(Prim.cString("region table entry unreachable by probing"), r, ti)
+                }
+                probe = Prim.intAnd(probe + 1, capacity - 1)
+            }
+        }
+    }
+    if entriesSeen != indexCount {
+        return failAt(Prim.cString("region table disagrees with region list"), table, -1)
+    }
+    True
+}
+
+-- Fibonacci hashing of the region's number, masked to the table: the same
+-- function the collector inserts with, restated.
+fun home(region : Int, capacity : Int) -> Int {
+    let h = Prim.intMulWrapping(Prim.intShr(region, 16), -7046029254386353131)
+    let folded = Prim.intXor(h, Prim.intAnd(Prim.intShr(h, 32), 4294967295))
+    Prim.intAnd(folded, capacity - 1)
+}
+
+-- Every allocated object's header and layout, and each pointer in it.
+fun checkObjects() -> Bool {
+    for var oi = 0; oi < indexCount; oi = oi + 1 {
+        let r = indexAt(oi)
+        let capacity = load32(Prim.ptrFromInt(r), regionCapacity)
+        let slotSize = word(r, regionSlotSize)
+        for var oj = 0; oj < capacity; oj = oj + 1 {
+            if bitAt(r, regionAllocated, oj) {
+                if !checkObject(r + regionData + oj * slotSize) { return False }
+            }
+        }
+    }
+    True
+}
+
+-- Each size class's available list names exactly the small regions of that
+-- class with a free slot. A full region's `availableNext` is stale and not
+-- looked at.
+fun checkAvailable() -> Bool {
+    let lists = Prim.loadPtr(state, stateAvailable)
+    for var ac = 0; ac < regionClasses; ac = ac + 1 {
+        Prim.storeI64(expected, 8 * ac, 0)
+        Prim.storeI64(actual, 8 * ac, 0)
+    }
+    for var an = 0; an < indexCount; an = an + 1 {
+        let p = Prim.ptrFromInt(indexAt(an))
+        let cls = load32(p, regionSizeClass)
+        if cls < regionClasses && load32(p, regionUsed) < load32(p, regionCapacity) {
+            Prim.storeI64(expected, 8 * cls, Prim.loadI64(expected, 8 * cls) + 1)
+        }
+    }
+    for var ac = 0; ac < regionClasses; ac = ac + 1 {
+        var ar = Prim.loadI64(lists, 8 * ac)
+        while ar != 0 {
+            let seen = Prim.loadI64(actual, 8 * ac) + 1
+            Prim.storeI64(actual, 8 * ac, seen)
+            -- Membership before anything is read from it: the list may hold a
+            -- word that is not a region at all.
+            if seen > indexCount || !listed(ar)
+                    || load32(Prim.ptrFromInt(ar), regionSizeClass) != ac
+                    || load32(Prim.ptrFromInt(ar), regionUsed)
+                       >= load32(Prim.ptrFromInt(ar), regionCapacity) {
+                return fail(Prim.cString("invalid available-region list"), ar, ac)
+            }
+            ar = word(ar, regionAvailableNext)
+        }
+        if Prim.loadI64(actual, 8 * ac) != Prim.loadI64(expected, 8 * ac) {
+            return fail(Prim.cString("missing available region"), 0, ac)
+        }
+    }
+    True
+}
+
+-- -- objects --------------------------------------------------------------------------
+
+-- The object whose header is at `h`, in a slot `checkRegions` has bounded.
+--
+-- Layout codes: an array's tag is its element's code, and its bitmap word is
+-- the element width. A constructor or record has three bits of code per slot,
+-- at most 21 slots; a closure, environment or box has one bit per slot, at most
+-- 63. Code 7 is a traced pointer, and 6 a raw address that must not be
+-- followed.
+fun checkObject(h : Int) -> Bool {
+    let value = h + headerBytes
+    let header = Prim.ptrFromInt(h)
+    let payload = Prim.ptrFromInt(value)
+    let size = Prim.loadI64(header, headerSize)
+    let heapKind = load32(header, headerKind)
+    let marked = phase != 0 && load32(header, headerMarked) == epoch
+    if heapKind == heapCell {
+        if size != cellBytes { return fail(Prim.cString("invalid cell size"), value, -1) }
+        return load32(payload, cellFlag) == 0
+            || checkPointer(Prim.loadI64(payload, 0), marked, value, 0)
+    }
+    if heapKind != heapObject || size < objectSlots {
+        return fail(Prim.cString("invalid heap header"), value, -1)
+    }
+    -- Both i32 fields are read unsigned, so a negative one is out of range too.
+    let kind = load32(payload, objectKind)
+    let tag = load32(payload, objectTag)
+    let count = Prim.loadI64(payload, objectCount)
+    let bitmap = Prim.loadI64(payload, objectBitmap)
+    if kind > 5 || count < 0 { return fail(Prim.cString("invalid object header"), value, -1) }
+    var span = 8
+    if kind == 2 {
+        span = bitmap
+        if (span != 1 && span != 4 && span != 8) || tag > 7 || (tag == 7 && span != 8) {
+            return fail(Prim.cString("invalid array layout"), value, -1)
+        }
+    } else if count > (if kind <= 1 { 21 } else { 63 }) {
+        return fail(Prim.cString("invalid object count"), value, -1)
+    }
+    -- `size` is below a slot size, so neither side of this can overflow.
+    if count > (size - objectSlots) / span || objectSlots + count * span != size {
+        return fail(Prim.cString("payload size disagrees with header"), value, -1)
+    }
+    if kind == 2 && tag != 7 { return True }
+    for var field = 0; field < count; field = field + 1 {
+        let traced = if kind == 2 { True }
+                     else if kind <= 1 { Prim.intAnd(Prim.intShr(bitmap, 3 * field), 7) == 7 }
+                     else { hasBit(bitmap, field) }
+        if traced && !checkPointer(Prim.loadI64(payload, objectSlots + 8 * field),
+                                   marked, value, field) {
+            return False
+        }
+    }
+    True
+}
+
+-- `value`, found at slot `at` of `owner`, is null or the payload of an
+-- allocated object; if `marked`, that object is marked too.
+fun checkPointer(value : Int, marked : Bool, owner : Int, at : Int) -> Bool {
+    if value == 0 { return True }
+    let r = regionAt(value)
+    if r == 0 || below(value, r + regionData + headerBytes) {
+        return fail(Prim.cString("invalid traced pointer"), owner, at)
+    }
+    let offset = Prim.intSubWrapping(value, r + regionData + headerBytes)
+    let slotSize = word(r, regionSlotSize)
+    -- Past the region's reservation is past its last slot, and keeps the
+    -- division below on a small positive `offset`.
+    if !below(offset, word(r, regionReserved)) || offset % slotSize != 0 {
+        return fail(Prim.cString("invalid traced pointer"), owner, at)
+    }
+    let slot = offset / slotSize
+    if slot >= load32(Prim.ptrFromInt(r), regionCapacity) || !bitAt(r, regionAllocated, slot) {
+        return fail(Prim.cString("invalid traced pointer"), owner, at)
+    }
+    let h = Prim.ptrFromInt(r + regionData + slot * slotSize)
+    if marked && load32(h, headerMarked) != epoch {
+        return fail(Prim.cString("reachable object is unmarked"), owner, at)
+    }
+    True
+}
+
+-- -- roots ----------------------------------------------------------------------------
+
+-- The shadow stack, checked for a cycle first, then every live slot of every
+-- frame.
+fun checkRoots() -> Bool {
+    let first = stateWord(stateRoots)
+    var behind = first
+    var ahead = first
+    while ahead != 0 && word(ahead, rootPrevious) != 0 {
+        behind = word(behind, rootPrevious)
+        ahead = word(word(ahead, rootPrevious), rootPrevious)
+        if behind == ahead { return fail(Prim.cString("cyclic root chain"), behind, -1) }
+    }
+    var rf = first
+    while rf != 0 {
+        let count = word(rf, rootCount)
+        let values = word(rf, rootValues)
+        let live = word(rf, rootLive)
+        if count < 0 || values == 0 { return fail(Prim.cString("invalid root frame"), rf, -1) }
+        for var rs = 0; rs < count; rs = rs + 1 {
+            if (rs >= 64 || hasBit(live, rs))
+                    && !checkPointer(word(values, 8 * rs), phase != 0, rf, rs) {
+                return False
+            }
+        }
+        rf = word(rf, rootPrevious)
+    }
+    True
+}
+
+-- The frame table's shape, then the arm64 frames from `current` out to `high`,
+-- `current` being the collection's Turkey frame record or 0 if none is live.
+--
+-- The walk follows the same records within the same bounds as the collector's:
+-- a record is two words, the caller's record and a return address into the
+-- caller, and the entry for that address gives the caller's roots as offsets
+-- from the caller's record. Records are 8-byte aligned and strictly increase
+-- towards `high`; the walk stops at the first that does not.
+fun checkFrames(current : Int, high : Int) -> Bool {
+    if entryCount == 0 { return True }
+    if entryCount < 0 || Prim.ptrIsNull(entries) {
+        return failAt(Prim.cString("invalid native frame table"), entries, -1)
+    }
+    for var fi = 0; fi < entryCount; fi = fi + 1 {
+        let n = entryWord(fi, 8)
+        if n < 0 || (n != 0 && entryWord(fi, 16) == 0)
+                || (fi > 0 && !below(entryWord(fi - 1, 0), entryWord(fi, 0))) {
+            return failAt(Prim.cString("invalid native frame table"), entries, fi)
+        }
+    }
+    if current == 0 { return True }
+    if high == 0 { return fail(Prim.cString("missing native stack bound"), 0, -1) }
+    var walked = current
+    while !below(high, walked) && !below(high - walked, 16) && Prim.intAnd(walked, 7) == 0 {
+        let caller = word(walked, 0)
+        if !below(walked, caller) || below(high, caller) || below(high - caller, 16)
+                || Prim.intAnd(caller, 7) != 0 {
+            return True
+        }
+        let e = entryFor(word(walked, 8))
+        if e >= 0 {
+            let offsets = entryWord(e, 16)
+            for var fi = 0; fi < entryWord(e, 8); fi = fi + 1 {
+                let slot = Prim.intAddWrapping(caller, word(offsets, 8 * fi))
+                if Prim.intAnd(slot, 7) != 0 || below(slot, walked + 16) || below(high - 8, slot) {
+                    return fail(Prim.cString("invalid native root offset"),
+                                Prim.ptrToInt(entries) + entryBytes * e, fi)
+                }
+                if !checkPointer(word(slot, 0), phase != 0, caller, fi) { return False }
+            }
+        }
+        walked = caller
+    }
+    True
+}
+
+fun entryWord(i : Int, offset : Int) -> Int = Prim.loadI64(entries, entryBytes * i + offset)
+
+-- The entry for return address `address`, or -1.
+fun entryFor(address : Int) -> Int {
+    var first = 0
+    var past = entryCount
+    while first < past {
+        let middle = first + (past - first) / 2
+        if below(entryWord(middle, 0), address) { first = middle + 1 } else { past = middle }
+    }
+    if first < entryCount && entryWord(first, 0) == address { first } else { -1 }
+}

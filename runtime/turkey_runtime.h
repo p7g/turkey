@@ -43,18 +43,32 @@ int64_t turkey_heap_objects(void);
 int64_t turkey_collection_count(void);
 void turkey_gc_set_stress(int32_t enabled);
 void turkey_gc_set_verify(int32_t enabled);
-/* Whether `value` is a live heap object, and three settings a test uses to
-   corrupt the heap on purpose. The verifier's accessors are declared beside
-   it, in the C. */
+/* Whether `value` is a live heap object; the collector's state, for the tests
+   that inspect or corrupt it; and three settings they use to corrupt it. The
+   region list, the available lists and the region set's table are the
+   collector's own memory, in the layouts `lib/Turkey/Heap.gob` describes. */
 int64_t turkey_heap_contains(void *value);
+void *turkey_heap_regions(void);
+void *turkey_heap_available(void);
+void *turkey_heap_region_table(void);
+int64_t turkey_heap_region_table_capacity(void);
+int64_t turkey_heap_region_bytes(void);
+int64_t turkey_heap_mark_epoch(void);
 void turkey_heap_set_mark_epoch(int64_t epoch);
 void turkey_heap_set_objects(int64_t count);
 void turkey_heap_set_region_bytes(int64_t bytes);
 
-/* The heap verifier, which stays C so that it is not the collector checking
-   itself: the collector calls it at each phase when TURKEY_GC_VERIFY is set,
-   and it exits the process on a failure. */
-void turkey_heap_verify(int64_t phase, void *frame);
+/* The heap verifier, Turkey.HeapCheck, for the tests that corrupt the heap on
+   purpose; the collector calls it itself when TURKEY_GC_VERIFY is set. It is
+   handed `turkey_heap_state`, the collector's state as twelve words, and
+   answers 1 if the heap passed and 0 with the diagnostic in
+   `turkey_heap_check_message`. `turkey_heap_check_frames` runs the native
+   frame walk alone, from `current`, for a test that puts a frame table and a
+   stack bound of its own into a copy of the state. */
+void *turkey_heap_state(void);
+int64_t turkey_heap_check(int64_t phase, void *frame, void *state);
+const char *turkey_heap_check_message(void);
+int64_t turkey_heap_check_frames(int64_t phase, uintptr_t current, void *state);
 int32_t turkey_panic_pending(void);
 
 /* What the host hands over: arguments in, exit status out.

@@ -18,6 +18,19 @@ def allocator_probe(allocator_object, tmp_path_factory):
 #include "turkey_runtime.c"
 #include <assert.h>
 
+/* The shadow-stack frame `turkey_root_enter` fills in: the previous frame,
+   the function's name, the slot count, the slots, and which of the first 64
+   are live. */
+typedef struct RootFrame {
+    struct RootFrame *previous;
+    const char *function_name;
+    int64_t count;
+    void **values;
+    int64_t live;
+} RootFrame;
+/* A cell: its value, and an i32 flag saying whether the value is a pointer. */
+typedef struct TurkeyCell { uint64_t value; int32_t pointer_value; } TurkeyCell;
+
 static void panic_is(const char *message) {
     assert(turkey_has_panicked);
     assert(strcmp(turkey_panic_message(), message) == 0);

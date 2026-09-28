@@ -1,9 +1,20 @@
 module Turkey.LocalEscape (analyze)
 
--- Non-escaping references and records can become local SSA values. Analyze
--- source names conservatively across shadowing; lowering checks the scoped
--- binding identity as well. Any mention inside a closure keeps heap identity.
+-- Non-escaping references and records can become local SSA values. The answer
+-- is by source name, and conservative across two bindings of one name: if
+-- either escapes, both keep heap identity. Lowering checks the scoped binding
+-- identity as well. Any mention inside a closure keeps heap identity.
+--
+-- A mention is charged to the binding it refers to, so the scan tracks scope.
+-- Inlining makes that matter: a callee's parameter becomes a `let` in the
+-- caller, and when it is spelled like one of the caller's `var`s, a scan by
+-- name alone would read every use of the parameter as the `var` escaping. A
+-- binder this does not track leaves its names resolving outward, which can
+-- only charge a mention to a reference that did not make it -- the safe
+-- direction.
+import Data.Map as Map
 import Data.Set as Set
+import Turkey.Ast (patternVars)
 import Turkey.Core as Core
 import Turkey.Core (Core(..), CoreKind(..), Mapper(..))
 
@@ -12,11 +23,17 @@ type Scan = Scan {
     records : Set.Set String,
     escapedRefs : Set.Set String,
     escapedRecords : Set.Set String,
+    -- What each name in scope is bound to, innermost binding only. A name not
+    -- here is a global, or bound by something outside the body.
+    scope : Map String Binding,
 }
+
+type Binding = Reference | Record | Plain
 
 fun analyze(body : Core) -> (Set.Set String, Set.Set String) {
     let s = Scan { refs = Set.new(), records = Set.new(),
-                   escapedRefs = Set.new(), escapedRecords = Set.new() }
+                   escapedRefs = Set.new(), escapedRecords = Set.new(),
+                   scope = Map.new() }
     walk(s, body, False)
     let refs = Set.new()
     let records = Set.new()
@@ -29,38 +46,88 @@ fun analyze(body : Core) -> (Set.Set String, Set.Set String) {
     (refs, records)
 }
 
+-- A mention of `name` that is not one of the uses a local keeps: what it
+-- refers to escapes, if it is a reference or a record at all.
+fun escapes(s : Scan, name : String, refs : Bool, records : Bool) -> Unit {
+    match Map.get(s.scope, name) {
+        Some(Plain) -> {}
+        Some(Reference) -> if refs { Set.add(s.escapedRefs, name) }
+        Some(Record) -> if records { Set.add(s.escapedRecords, name) }
+        None -> {
+            if refs { Set.add(s.escapedRefs, name) }
+            if records { Set.add(s.escapedRecords, name) }
+        }
+    }
+}
+
+-- Walk `e` with `names` bound as `what`, then put the scope back.
+fun under(s : Scan, names : Array String, what : Binding, e : Core,
+          closed : Bool) -> Unit {
+    let saved = []
+    for name in names {
+        Array.push(saved, (name, Map.get(s.scope, name)))
+        Map.put(s.scope, name, what)
+    }
+    walk(s, e, closed)
+    for var i = len(saved) - 1; i >= 0; i = i - 1 {
+        let (name, was) = saved[i]
+        match was {
+            Some(b) -> Map.put(s.scope, name, b)
+            None -> { let _ = Map.delete(s.scope, name) }
+        }
+    }
+}
+
 fun walk(s : Scan, e : Core, closed : Bool) -> Unit {
     match e.kind {
-        CLet(name, _, bound, _, binders) -> match bound.kind {
-            CRef(_) -> {
-                if closed || len(binders) > 0 { Set.add(s.escapedRefs, name) }
-                Set.add(s.refs, name)
-            }
-            CRecord(_, _) -> {
-                if closed || len(binders) > 0 || Set.contains(s.records, name) {
-                    Set.add(s.escapedRecords, name)
+        CLet(name, _, bound, body, binders) -> {
+            let what = match bound.kind {
+                CRef(_) -> {
+                    if closed || len(binders) > 0 { Set.add(s.escapedRefs, name) }
+                    Set.add(s.refs, name)
+                    Reference
                 }
-                Set.add(s.records, name)
+                CRecord(_, _) -> {
+                    if closed || len(binders) > 0 || Set.contains(s.records, name) {
+                        Set.add(s.escapedRecords, name)
+                    }
+                    Set.add(s.records, name)
+                    Record
+                }
+                _ -> Plain
             }
-            _ -> {}
+            walk(s, bound, closed)
+            under(s, [name], what, body, closed)
+            return
+        }
+        CLam(params, body, _) -> {
+            under(s, Array.map(params, _.name), Plain, body, True)
+            return
+        }
+        CJoin(_, params, body, rest, _) -> {
+            under(s, Array.map(params, _.name), Plain, body, closed)
+            walk(s, rest, closed)
+            return
+        }
+        CMatch(scrutinee, alts) -> {
+            walk(s, scrutinee, closed)
+            for alt in alts { under(s, patternVars(alt.pat), Plain, alt.body, closed) }
+            return
         }
         CVar(name) -> {
-            Set.add(s.escapedRefs, name)
-            Set.add(s.escapedRecords, name)
+            escapes(s, name, True, True)
             return
         }
         CDeref(target) -> match target.kind {
             CVar(name) -> {
-                if closed { Set.add(s.escapedRefs, name) }
-                Set.add(s.escapedRecords, name)
+                escapes(s, name, closed, True)
                 return
             }
             _ -> {}
         }
         CAssign(target, assigned) -> match target.kind {
             CVar(name) -> {
-                if closed { Set.add(s.escapedRefs, name) }
-                Set.add(s.escapedRecords, name)
+                escapes(s, name, closed, True)
                 walk(s, assigned, closed)
                 return
             }
@@ -68,18 +135,16 @@ fun walk(s : Scan, e : Core, closed : Bool) -> Unit {
         }
         CField(target, _) -> match target.kind {
             CVar(name) -> {
-                if closed { Set.add(s.escapedRecords, name) }
-                Set.add(s.escapedRefs, name)
+                escapes(s, name, True, closed)
                 return
             }
             _ -> {}
         }
         _ -> {}
     }
-    let nested = closed || match e.kind { CLam(_, _, _) -> True; _ -> False }
     let _ = Core.mapKind(e.kind, Mapper {
-        expr = fun(x) = { walk(s, x, nested); x },
+        expr = fun(x) = { walk(s, x, closed); x },
         type_ = fun(t) = t,
-        bind = fun(b) = { walk(s, Core.bindValue(b), nested); b },
+        bind = fun(b) = { walk(s, Core.bindValue(b), closed); b },
     })
 }

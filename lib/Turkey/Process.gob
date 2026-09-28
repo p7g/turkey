@@ -1,0 +1,169 @@
+module Turkey.Process (
+    argsSet, argCount, argBytes, argLength,
+    panic, panicString, pending, panicked, panicMessage, panicClear,
+    entryReturned, exit, exiting, exitStatus,
+)
+
+-- What the program was started with, and how it is ending: its arguments, and
+-- the panic or exit that unwinds it.
+--
+-- There is no unwinding in the machine's sense. A panic sets a flag and
+-- returns, and generated code tests the flag after every call and returns
+-- too, all the way out. An exit is the same flag with a status beside it, so
+-- that there is one mechanism to get right at every call site and not two.
+--
+-- A giblet module: the collector and the allocator panic through here, and
+-- they may not allocate; and `Turkey.Entry` calls it before early
+-- initialization, when no literal exists yet.
+--
+-- The flag, the message and the arguments are in the process state the
+-- compiler defines in every program, reached by `Prim.processState`, rather
+-- than in globals here. The flag has to be: generated code reads it by symbol.
+-- The arguments have to be too, because `Turkey.Entry` stores them before
+-- early initialization, which would set a global of this module back to its
+-- initial value. The message is the panic's, and goes with its flag. Only
+-- what is set once the program runs is a global.
+--
+-- The layout, in bytes: the flag at 0, the argument count at 8, the argument
+-- vector at 16, and the message from 24 to the end at 280, NUL-terminated.
+-- Offsets are functions rather than top-level `let`s because a `let` is read
+-- from its global, and `argsSet` runs before any global is initialized.
+
+import Prelude ()
+import Std.Classes
+import Data.Int ()
+import Data.Bool.Type (Bool(..))
+import Turkey.Libc as Libc
+
+fun flagAt() -> Int = 0
+fun argCountAt() -> Int = 8
+fun argVectorAt() -> Int = 16
+fun messageAt() -> Int = 24
+-- The message's capacity, its terminating zero included.
+fun messageBytes() -> Int = 256
+
+-- -- the arguments --------------------------------------------------------------------
+
+-- Record `main`'s arguments, dropping `argv[0]`, the program's own name.
+--
+-- Not copied: `argv` belongs to the process and lives as long as it does, so
+-- what is kept is the pointer, and each argument's length is counted when it
+-- is asked for.
+fun argsSet(argc : Int, argv : Prim.Ptr) -> Unit {
+    let state = Prim.processState()
+    if argc > 1 {
+        Prim.storeI64(state, argCountAt(), argc - 1)
+        Prim.storePtr(state, argVectorAt(), Prim.ptrAdd(argv, 8))
+    } else {
+        Prim.storeI64(state, argCountAt(), 0)
+        Prim.storePtr(state, argVectorAt(), Prim.ptrNull())
+    }
+}
+
+-- How many arguments the program was given, its own name not among them.
+fun argCount() -> Int = Prim.loadI64(Prim.processState(), argCountAt())
+
+-- Argument `index`'s bytes, NUL-terminated. An index outside `0..argCount()`
+-- is undefined, as any raw read is.
+fun argBytes(index : Int) -> Prim.Ptr =
+    Prim.loadPtr(Prim.loadPtr(Prim.processState(), argVectorAt()), 8 * index)
+
+fun argLength(index : Int) -> Int = Libc.strlen(argBytes(index))
+
+-- -- panicking --------------------------------------------------------------------------
+
+-- Raise a panic with a NUL-terminated message, unless one is already raised:
+-- the first is the one reported. Truncated to the buffer.
+--
+-- The C symbol is what generated code calls for a panic whose message is a
+-- constant.
+foreign "turkey_panic" fun panic(message : Prim.Ptr) -> Unit {
+    if pending() { return {} }
+    record(message, Libc.strlen(message))
+}
+
+-- The same with the message as a Turkey `String`, which is what `error` hands
+-- over: a byte array, its length in the header's count and its bytes after
+-- the header. A null one is a panic with no message of its own.
+foreign "turkey_panic_string" fun panicString(message : Prim.Ptr) -> Unit {
+    if pending() { return {} }
+    if Prim.ptrIsNull(message) {
+        record(Prim.cString("error"), 5)
+    } else {
+        record(Prim.ptrAdd(message, 24), Prim.loadI64(message, 8))
+    }
+}
+
+-- Copy the message in, then raise the flag. In that order: every call returns
+-- to a test of the flag, and the copy is calls.
+fun record(bytes : Prim.Ptr, length : Int) -> Unit {
+    let limit = messageBytes() - 1
+    let kept = if length < limit { length } else { limit }
+    let buffer = Prim.ptrAdd(Prim.processState(), messageAt())
+    copyFrom(buffer, bytes, 0, kept)
+    Prim.storeI8(buffer, kept, Prim.byteFromInt(0))
+    raise()
+}
+
+-- Bytes `i` up to `count`. By recursion rather than a `var`: a panic can be
+-- raised from a global's initializer, and a `var` there would be a cell.
+fun copyFrom(target : Prim.Ptr, source : Prim.Ptr, i : Int, count : Int) -> Unit {
+    if i < count {
+        Prim.storeI8(target, i, Prim.loadI8(source, i))
+        copyFrom(target, source, i + 1, count)
+    }
+}
+
+fun raise() -> Unit = Prim.storeI64(Prim.processState(), flagAt(), 1)
+
+-- Whether a panic or an exit is unwinding right now.
+fun pending() -> Bool = Prim.loadI64(Prim.processState(), flagAt()) != 0
+
+-- The program's ending, once `entryReturned` has taken the flag down.
+var ended : Bool = False
+
+-- Whether the program panicked or exited: unwinding now, or finished doing so.
+fun panicked() -> Bool = pending() || ended
+
+-- The panic's message, NUL-terminated; empty if there has been none.
+foreign "turkey_panic_message" fun panicMessage() -> Prim.Ptr =
+    Prim.ptrAdd(Prim.processState(), messageAt())
+
+-- Forget the panic and the exit, for C that raises them on purpose: the
+-- tests that call the allocator with bad arguments.
+foreign "turkey_panic_clear" fun panicClear() -> Unit {
+    let state = Prim.processState()
+    Prim.storeI64(state, flagAt(), 0)
+    Prim.storeI8(state, messageAt(), Prim.byteFromInt(0))
+    ended = False
+    exitRequested = False
+    status = 0
+}
+
+-- The generated `turkey_entry` calls this last, however the program ended.
+--
+-- `Turkey.Entry` runs the program and then reports how it ended, and it is
+-- Turkey: every call it makes tests the flag on return. Left up, the flag
+-- would unwind the entry straight past the report it exists to print. So it
+-- is parked in `ended`, where `panicked` still sees it and no call site does.
+foreign "turkey_entry_returned" fun entryReturned() -> Unit {
+    ended = pending()
+    Prim.storeI64(Prim.processState(), flagAt(), 0)
+}
+
+-- -- exiting ----------------------------------------------------------------------------
+
+var exitRequested : Bool = False
+var status : Int = 0
+
+-- End the program with `code`, unwinding as a panic does; `exiting` is what
+-- tells the two apart at the boundary. The C symbol is `Prim.exit`'s.
+foreign "turkey_exit" fun exit(code : Int) -> Unit {
+    exitRequested = True
+    status = code
+    raise()
+}
+
+fun exiting() -> Bool = exitRequested
+
+fun exitStatus() -> Int = status

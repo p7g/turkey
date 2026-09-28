@@ -36,7 +36,7 @@ from pathlib import Path
 import pytest
 
 from tests import bootc, toolchain
-from tests.bootc import CACHE, runtime_object as _runtime_object
+from tests.bootc import CACHE
 from tests.bootc import digest as _digest, replace_built as _replace_built
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -64,8 +64,7 @@ def _stage3() -> Path:
     """Stage2's output for itself, assembled and linked: a compiler built by
     today's source rather than by the committed one."""
     assembly = _stage3_assembly().encode("utf-8")
-    runtime = _runtime_object()
-    output = CACHE / f"stage3-arm64-{_digest(assembly, runtime.read_bytes())}.bin"
+    output = CACHE / f"stage3-arm64-{_digest(assembly, toolchain.identity())}.bin"
     if not output.exists():
         CACHE.mkdir(parents=True, exist_ok=True)
         stem = output.with_suffix(f".{os.getpid()}")
@@ -74,7 +73,7 @@ def _stage3() -> Path:
         staging = stem.with_suffix(stem.suffix + ".bin")
         try:
             _replace_built([*toolchain.cc(), "-o", str(staging), str(source),
-                            str(runtime), *toolchain.libraries()], output)
+                            *toolchain.libraries()], output)
         finally:
             source.unlink(missing_ok=True)
     return output

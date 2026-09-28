@@ -5,9 +5,8 @@ module Turkey.Llvm (
 -- The low IR as LLVM IR text.
 --
 -- Text rather than a library, and that is enough: what comes out is a `.ll`
--- file that `cc` turns into an object and links against
--- `runtime/turkey_runtime.c`, so the only interface needed is the one LLVM
--- documents. It is also the check this path buys -- `cc` typechecks the IR,
+-- file that `cc` turns into an object and links, so the only interface
+-- needed is the one LLVM documents. It is also the check this path buys -- `cc` typechecks the IR,
 -- and has caught miscompiles no verifier here noticed.
 --
 -- Three things make the text form less work than it looks.
@@ -189,6 +188,9 @@ fun emitModule(m : Module, entry : String) -> (String, Array String) {
     line(e, "@.turkey.global.roots = internal global ["
             + Int.toString(roots) + " x ptr] zeroinitializer")
     line(e, "@.turkey.global.frame = internal global [5 x i64] zeroinitializer")
+    -- Defined by every program, and visible to C: `Turkey.Runtime.processState`.
+    line(e, "@" + Rt.processState + " = global [" + Int.toString(Rt.processStateBytes)
+            + " x i8] zeroinitializer, align 8")
     line(e, "")
     for f in m.functions { emitFunc(e, f) }
     for (sym, name) in m.definitions { emitDefinition(e, m, sym, name) }
@@ -304,10 +306,8 @@ fun declareRuntime(e : Emit, m : Module) -> Set.Set String {
         "declare void @turkey_panic_string(ptr)",
         "declare void @turkey_root_enter(ptr, ptr, i64, ptr)",
         "declare void @turkey_root_leave(ptr)",
-        "declare void @turkey_entry_started()",
         "declare void @turkey_entry_returned()",
         "declare void @turkey_entry_stack_set(ptr)",
-        "@turkey_has_panicked = external global i32",
         "declare {i64, i1} @llvm.sadd.with.overflow.i64(i64, i64)",
         "declare {i64, i1} @llvm.ssub.with.overflow.i64(i64, i64)",
         "declare {i64, i1} @llvm.smul.with.overflow.i64(i64, i64)",
@@ -564,9 +564,8 @@ fun enterFrame(e : Emit, f : Func Low) -> Unit {
 --
 -- The mask is an immediate: a root set is a property of a *program point*, not
 -- of a function, so unioning the live sets over the whole function would make
--- every path pay for the ones it never takes. The runtime's `live` field is
--- exactly this, and the comment on it in `turkey_runtime.c` is the measurement
--- that put it there.
+-- every path pay for the ones it never takes. The root frame's `live` field
+-- is exactly this.
 fun publish(e : Emit, stored : Array (Int, Int)) -> Unit {
     if len(e.slots) == 0 || len(stored) == 0 { return }
     var mask = 0
@@ -625,12 +624,12 @@ fun guard(e : Emit, f : Func Low, condition : String,
 -- `turkey_panic` sets a flag and returns -- there is no unwinding -- so a
 -- caller that did not look would carry on with a value the callee never
 -- produced. Every call needs this, which is why the flag is read as a plain
--- global load rather than through `turkey_panicked()`.
+-- load of the panic state's first word rather than through a call.
 fun propagate(e : Emit, f : Func Low) -> Unit {
     let flag = fresh(e)
     let panicked = fresh(e)
-    line(e, "  " + flag + " = load i32, ptr @turkey_has_panicked")
-    line(e, "  " + panicked + " = icmp ne i32 " + flag + ", 0")
+    line(e, "  " + flag + " = load i64, ptr @" + Rt.processState)
+    line(e, "  " + panicked + " = icmp ne i64 " + flag + ", 0")
     guard(e, f, panicked, "")
 }
 
@@ -766,6 +765,8 @@ fun emitInst(e : Emit, f : Func Low, i : Low) -> Unit {
                                         + cSymbol(sym) + ", i64 0")
         Address(ThisFrame) -> line(e, "  " + dst
                                       + " = call ptr @llvm.frameaddress.p0(i32 0)")
+        Address(ProcessState) -> line(e, "  " + dst + " = getelementptr i8, ptr @"
+                                       + Rt.processState + ", i64 0")
         Bin(o, a, b) -> emitBin(e, f, dst, ty, r, o, a, b)
         Cmp(o, a, b) -> {
             let operand = Ssa.repOf(f, a)
@@ -1368,8 +1369,8 @@ fun emitRuntimeCall(e : Emit, f : Func Low, dst : String, ty : String, r : Rep,
 -- the LLVM type C returns it in.
 --
 -- The table itself is `Turkey.Runtime`'s, because the symbols and their C
--- return types are facts about `turkey_runtime.h` rather than decisions this
--- emitter makes. What stays here is the translation into LLVM's spelling --
+-- return types are facts about the library's `foreign` definitions rather
+-- than decisions this emitter makes. What stays here is the translation into LLVM's spelling --
 -- including `void`, which is C's and not the language's unit.
 fun runtimeOf(name : String) -> Option (String, String) =
     match Rt.entryPoint(name) {
@@ -1389,17 +1390,16 @@ fun runtimeOf(name : String) -> Option (String, String) =
 -- Ordinary initializers may use those literals. `Turkey.Entry` wraps the
 -- lot -- argument handling, the panic report and the final collection are
 -- written once, in Turkey, rather than emitted here -- and reaches this by its
--- C symbol, `turkey_entry`; the runtime's two calls around it park the
+-- C symbol, `turkey_entry`; `turkey_entry_returned`, at the end, parks the
 -- program's ending where the entry's own code will not unwind on it.
 fun emitEntry(e : Emit, m : Module, entry : String) -> Unit {
     line(e, "define void @" + entrySymbol + "() {")
     line(e, "b0:")
-    line(e, "  call void @turkey_entry_started()")
     line(e, "  call i8 " + symbol(m.early) + "()")
     let flag = fresh(e)
     let panicked = fresh(e)
-    line(e, "  " + flag + " = load i32, ptr @turkey_has_panicked")
-    line(e, "  " + panicked + " = icmp ne i32 " + flag + ", 0")
+    line(e, "  " + flag + " = load i64, ptr @" + Rt.processState)
+    line(e, "  " + panicked + " = icmp ne i64 " + flag + ", 0")
     line(e, "  br i1 " + panicked + ", label %entry.done, label %entry.ready")
     line(e, "entry.ready:")
     -- The outer bound of a walk of the Turkey stack, recorded once early

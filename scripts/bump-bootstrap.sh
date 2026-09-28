@@ -53,9 +53,6 @@ fi
 
 sh scripts/build.sh --out "$OUT" --fixpoint "$@"
 
-mkdir -p "$BOOTSTRAP/runtime"
-cp runtime/turkey_runtime.c runtime/turkey_runtime.h "$BOOTSTRAP/runtime/"
-
 cat > "$OUT/PROVENANCE" <<EOF
 commit: $(git rev-parse HEAD)
 date: $(date -u +%Y-%m-%d)

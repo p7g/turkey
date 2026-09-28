@@ -1,8 +1,8 @@
 #!/bin/sh
 # Build the compiler from the committed bootstrap, with no Python involved.
 #
-#   stage1  the committed assembly (bootstrap/), linked with bootstrap/runtime
-#   stage2  stage1 compiling today's source, linked with runtime/ -- the result
+#   stage1  the committed assembly (bootstrap/), linked
+#   stage2  stage1 compiling today's source, linked -- the result
 #   stage3  stage2 compiling the same source             (--fixpoint only)
 #   stage4  stage3's output, which must equal stage3's   (--fixpoint only)
 #
@@ -17,11 +17,10 @@
 # bootstrap/ holds the committed compiler: the whole-program assembly for
 # src/Main.gob once per target, each under gzip -9 -n (3.5 MB each; -n so one
 # gzip always compresses the same text to the same bytes, though GNU's and
-# macOS's differ from each other), a copy of the C runtime they
-# were emitted against, and PROVENANCE, which records the commit they came from
-# and the hashes checked here before anything is built. Every target's assembly
-# is the same compiler emitting for a different platform, so a build on any of
-# them starts from the same source. To reproduce it, check out that commit and
+# macOS's differ from each other), and PROVENANCE, which records the commit
+# they came from and the hashes checked here before anything is built. Every
+# target's assembly is the same compiler emitting for a different platform, so
+# a build on any of them starts from the same source. To reproduce it, check out that commit and
 # build it with the bootstrap that commit itself carries.
 #
 # The target is the one the C compiler links for, read from `$CC -dumpmachine`,
@@ -30,11 +29,10 @@
 # Nothing here asks what the host is: under qemu-user an x86-64 Linux machine
 # builds and runs the arm64 Linux compiler, with $TURKEY_CC a cross compiler.
 #
-# The runtime copy is what makes an ABI change possible: a new compiler is built
-# by the old one, which only links against the old runtime. So stage1 links
-# against bootstrap/runtime and stage2 onward against runtime/. As the runtime
-# moves into Turkey it shrinks; when nothing is left in C, delete the copy and
-# the step that builds it.
+# Each stage's assembly is the whole program, the runtime included -- the
+# collector, the allocator and the panic state are Turkey in lib/, compiled in
+# with everything else -- so a stage is linked from its assembly alone, against
+# nothing but the C library.
 #
 # Measured on arm64 macOS, Apple clang 17: 128 s for stage2, 376 s with
 # --fixpoint, of which each self-compile is about 105 s and each link 10 s.
@@ -114,7 +112,7 @@ if [ -n "$linked" ] && [ "$target" != "$linked" ]; then
 fi
 ARTIFACT=$BOOTSTRAP/$target.s.gz
 
-# glibc keeps the maths library out of libc, and the runtime calls log10;
+# glibc keeps the maths library out of libc, and lib/ calls fmod and floor;
 # Darwin's libSystem carries it, so there is nothing to add there.
 case $target in
     arm64-linux) LIBS=-lm ;;
@@ -153,12 +151,9 @@ emit() {
 
 link() {
     step "link $(basename "$2")"
-    $CC -o "$2.tmp" "$1" "$3" $LIBS
+    $CC -o "$2.tmp" "$1" $LIBS
     mv "$2.tmp" "$2"
 }
-
-step "runtime"
-$CC -std=c11 -O1 -c -o "$out/runtime.o" runtime/turkey_runtime.c
 
 if [ -n "$stage1" ]; then
     step "stage1 is $stage1"
@@ -174,24 +169,21 @@ else
              "$target gz-sha256" >&2
         exit 1
     fi
-    step "bootstrap runtime"
-    $CC -std=c11 -O1 -c -o "$out/runtime0.o" \
-        "$BOOTSTRAP/runtime/turkey_runtime.c"
     gunzip -c "$ARTIFACT" > "$out/stage1.s"
     if [ "$(sha "$out/stage1.s")" != "$(provenance "$target asm-sha256")" ]; then
         echo "build.sh: $ARTIFACT decompresses to the wrong bytes" >&2
         exit 1
     fi
-    link "$out/stage1.s" "$out/stage1" "$out/runtime0.o"
+    link "$out/stage1.s" "$out/stage1"
     rm "$out/stage1.s"
 fi
 
 emit "$out/stage1" "$out/stage2.s"
-link "$out/stage2.s" "$out/stage2" "$out/runtime.o"
+link "$out/stage2.s" "$out/stage2"
 
 if [ $fixpoint = 1 ]; then
     emit "$out/stage2" "$out/stage3.s"
-    link "$out/stage3.s" "$out/stage3" "$out/runtime.o"
+    link "$out/stage3.s" "$out/stage3"
     emit "$out/stage3" "$out/stage4.s"
     step "compare stage3.s stage4.s"
     if ! difference=$(cmp "$out/stage3.s" "$out/stage4.s"); then

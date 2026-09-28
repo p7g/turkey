@@ -69,15 +69,13 @@ def _modules() -> dict[str, str]:
 CACHE = bootc.CACHE
 _digest = bootc.digest
 _replace_built = bootc.replace_built
-_runtime_object = bootc.runtime_object
 
 
 @functools.lru_cache(maxsize=None)
 def _binary(name: str) -> Path:
-    """One program, linked against the runtime, cached by what it is built from."""
+    """One program, linked, cached by what it is built from."""
     module = _modules()[name].encode("utf-8")
-    runtime = _runtime_object()
-    output = CACHE / f"{Path(name).stem}-{_digest(module, runtime.read_bytes())}.bin"
+    output = CACHE / f"{Path(name).stem}-{_digest(module, toolchain.identity())}.bin"
     if not output.exists():
         CACHE.mkdir(parents=True, exist_ok=True)
         stem = output.with_suffix(f".{os.getpid()}")
@@ -86,7 +84,7 @@ def _binary(name: str) -> Path:
         staging = stem.with_suffix(stem.suffix + ".bin")
         try:
             _replace_built([*toolchain.cc(), "-O1", "-o", str(staging),
-                            str(source), str(runtime), *toolchain.libraries()],
+                            str(source), *toolchain.libraries()],
                            output)
         finally:
             source.unlink(missing_ok=True)

@@ -76,20 +76,19 @@ That leaves a compiler in `build/stages/stage2`. Save the example as
 
 ```sh
 build/stages/stage2 native rectangles.gob > rectangles.s
-cc -o rectangles rectangles.s runtime/turkey_runtime.c
+cc -o rectangles rectangles.s
 ./rectangles
 ```
 
 On Linux, link with `$TURKEY_CC` (below) and add `-lm`, since glibc keeps
-`log10` out of libc.
+the maths functions the library calls out of libc.
 
 Run the compiler from the repository root, where it finds `lib/`. Use
 `build/stages/stage2 types rectangles.gob` to inspect inferred types; the
 other subcommands print what a stage produced, and `check` just compiles.
 
 The compiler that builds it is `bootstrap/`, which holds its own arm64
-assembly for macOS and for Linux, gzip'd, with the runtime it was emitted
-against. `scripts/build.sh` builds for whichever of the two the C compiler
+assembly for macOS and for Linux, gzip'd. `scripts/build.sh` builds for whichever of the two the C compiler
 links for. `sh scripts/build.sh
 --fixpoint` checks the fixed point: the compiler built from today's source
 emits exactly the assembly it was built from. `scripts/bump-bootstrap.sh`
@@ -101,8 +100,8 @@ explain themselves at the top.
 Two environment variables choose the toolchain, for `scripts/build.sh` and for
 the tests alike. Each is split into words the way a shell would split it.
 
-- `TURKEY_CC` is the C compiler that assembles and links a program with the
-  runtime. Unset, it is `cc`.
+- `TURKEY_CC` is the C compiler that assembles and links a program. Unset, it
+  is `cc`.
 - `TURKEY_RUN` is a prefix for running a program that compiler linked, or a
   built compiler. Unset or empty, the program runs directly.
 

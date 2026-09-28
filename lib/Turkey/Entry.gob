@@ -18,15 +18,17 @@ import Data.Int ()
 import Data.Bool.Type (Bool(..))
 import Target (OS(..))
 import Target as Target
-import Unsafe.Libc as Libc
-import Unsafe.Runtime as Rt
+import Turkey.Libc as Libc
+import Turkey.Process as Process
 import Turkey.Alloc ()
 import Turkey.Heap as Heap
 
 -- -- starting the program ---------------------------------------------------------------
 
--- The program is `Rt.programEntry`, a symbol every backend defines.
---
+-- The program itself: its literals interned, its globals computed, and its
+-- `main` run, with `turkey_entry_returned` last. Every backend defines it.
+foreign "turkey_entry" fun programEntry() -> Unit
+
 -- Hand the arguments over, run the program on a thread of its own, and turn
 -- how it ended into a status: an exit's own, `1` and a report for a panic, and
 -- `0` after a final collection otherwise.
@@ -36,42 +38,16 @@ foreign "turkey_main" fun main(argc : Int, argv : Prim.Ptr) -> Int {
     if !Prim.ptrIsNull(Libc.getenv(Prim.cString("TURKEY_SEGV_FRAMES"))) {
         installCrashHandler()
     }
-    if !handOver(cInt(argc), argv) { return 1 }
+    Process.argsSet(cInt(argc), argv)
     runEntry()
-    if cInt(Rt.exiting()) != 0 { return Prim.intAnd(Rt.exitStatus(), 255) }
-    if cInt(Rt.panicked()) != 0 {
+    if Process.exiting() { return Prim.intAnd(Process.exitStatus(), 255) }
+    if Process.panicked() {
         reportPanic()
         return 1
     }
     Heap.collect()
     Heap.report()
     0
-}
-
--- `argv + 1`: the program's own arguments, with its name dropped, which is
--- what the JIT is handed too, so that the two hosts agree on element zero.
--- `argv` is already an array of pointers, so only the lengths are built. False
--- if there was no memory to build them in.
-fun handOver(argc : Int, argv : Prim.Ptr) -> Bool {
-    let count = if argc > 0 { argc - 1 } else { 0 }
-    if count == 0 {
-        Rt.argsSet(0, Prim.ptrNull(), Prim.ptrNull())
-        return True
-    }
-    let bytes = Prim.ptrAdd(argv, 8)
-    let lengths = Libc.malloc(8 * count)
-    if Prim.ptrIsNull(lengths) {
-        writeText(2, Prim.cString("turkey: out of memory reading arguments\n"))
-        return False
-    }
-    var i : Int = 0
-    while i < count {
-        Prim.storeI64(lengths, 8 * i, Libc.strlen(Prim.loadPtr(bytes, 8 * i)))
-        i = i + 1
-    }
-    Rt.argsSet(count, bytes, lengths)
-    Libc.free(lengths)
-    True
 }
 
 -- The entry runs on a thread of its own, for its stack.
@@ -121,45 +97,25 @@ fun runEntry() -> Unit {
 
 -- The thread's start routine, `void *(*)(void *)`.
 foreign "turkey_entry_thread" fun entryThread(argument : Prim.Ptr) -> Prim.Ptr {
-    Rt.programEntry()
+    programEntry()
     Prim.ptrNull()
 }
 
--- `panic: <message>`, then one `  at <function> (<file>:<line>:<col>)` per
--- frame the panic captured, innermost first -- the format the JIT's host
--- prints too, so the two agree on every trace.
+-- `panic: <message>`.
 fun reportPanic() -> Unit {
     writeText(2, Prim.cString("panic: "))
-    writeText(2, orEmpty(Rt.panicMessage()))
+    writeText(2, Process.panicMessage())
     writeText(2, Prim.cString("\n"))
-    let depth = Rt.frameCount()
-    var index : Int = 0
-    while index < depth {
-        writeText(2, Prim.cString("  at "))
-        writeText(2, orQuery(Rt.frameFunction(index)))
-        writeText(2, Prim.cString(" ("))
-        writeText(2, orQuery(Rt.frameFile(index)))
-        writeText(2, Prim.cString(":"))
-        writeDecimal(2, Rt.frameLine(index))
-        writeText(2, Prim.cString(":"))
-        writeDecimal(2, Rt.frameCol(index))
-        writeText(2, Prim.cString(")\n"))
-        index = index + 1
-    }
 }
 
 -- -- a fault ---------------------------------------------------------------------------
 
--- A fault in generated code otherwise says nothing at all. The JIT registers
--- no symbols, so the operating system's crash report is a list of unnamed
--- addresses, and a debugger cannot control a hardened interpreter well enough
--- to be attached to one. Meanwhile two shadow stacks that already exist know
--- the answer: the panic frames carry the source position of every call that
--- can fail, and the collector's root frames carry the function names. Walking
--- them turns "exited -11, no output" into the Turkey call stack.
+-- A fault in generated code otherwise says nothing at all but "exited -11".
+-- The collector's root frames carry the name of every function that roots
+-- something, so walking them turns that into the Turkey call stack.
 
--- Take `SIGSEGV` and `SIGBUS` over. Called when `TURKEY_SEGV_FRAMES` is set,
--- by `main` in a binary and by the host under the JIT.
+-- Take `SIGSEGV` and `SIGBUS` over. Called by `main` when
+-- `TURKEY_SEGV_FRAMES` is set.
 foreign "turkey_install_crash_handler" fun installCrashHandler() -> Unit {
     let handler = Prim.codeAddress("turkey_crash_report")
     let _ = Libc.signal(sigsegv(), handler)
@@ -185,42 +141,20 @@ fun sigbus() -> Int = match Target.os {
 -- including a push onto the very chains it walks. Being a giblet is what lets
 -- it run at all -- it makes nothing the collector could be asked about -- and
 -- three more things are true of it that no rule checks (PROPOSALS.md 9.4):
--- it calls only `write` and `_exit`, which are async-signal-safe, where the C
--- it replaces called `snprintf`; it reads the chains as they stand, which is
--- best-effort, since the stores that push a frame may be reordered; and it
--- never returns into the instruction that faulted.
+-- it calls only `write` and `_exit`, which are async-signal-safe; it reads the
+-- chain as it stands, which is best-effort, since the stores that push a
+-- frame may be reordered; and it never returns into the instruction that
+-- faulted.
 foreign "turkey_crash_report" fun crashReport(signal : Int) -> Unit {
     if cInt(signal) == sigbus() {
         writeText(2, Prim.cString("\n*** SIGBUS in generated code\n"))
     } else {
         writeText(2, Prim.cString("\n*** SIGSEGV in generated code\n"))
     }
-    writeText(2, Prim.cString("  innermost call sites:\n"))
-    -- `PanicCallFrame { previous, site }` and
-    -- `PanicSite { function, file, line, col }`: pointers and 64-bit integers,
-    -- eight bytes apart. A site on line 0 is a function's entry, not a call.
-    var frame = Rt.panicCallsHead()
-    var shown : Int = 0
-    while !Prim.ptrIsNull(frame) && shown < 20 {
-        let site = Prim.loadPtr(frame, 8)
-        if !Prim.ptrIsNull(site) && Prim.loadI64(site, 16) != 0 {
-            writeText(2, Prim.cString("    "))
-            writeText(2, orQuery(Prim.loadPtr(site, 0)))
-            writeText(2, Prim.cString(" ("))
-            writeText(2, orQuery(Prim.loadPtr(site, 8)))
-            writeText(2, Prim.cString(":"))
-            writeDecimal(2, Prim.loadI64(site, 16))
-            writeText(2, Prim.cString(":"))
-            writeDecimal(2, Prim.loadI64(site, 24))
-            writeText(2, Prim.cString(")\n"))
-            shown = shown + 1
-        }
-        frame = Prim.loadPtr(frame, 0)
-    }
     writeText(2, Prim.cString("  enclosing functions, innermost first:\n"))
     -- `RootFrame { previous, function_name, ... }`.
     var roots = Heap.rootsHead()
-    shown = 0
+    var shown : Int = 0
     while !Prim.ptrIsNull(roots) && shown < 40 {
         writeText(2, Prim.cString("    "))
         writeText(2, orQuery(Prim.loadPtr(roots, 8)))
@@ -238,29 +172,6 @@ foreign "turkey_crash_report" fun crashReport(signal : Int) -> Unit {
 fun writeText(fd : Int, text : Prim.Ptr) -> Unit {
     let _ = Libc.write(fd, text, Libc.strlen(text))
 }
-
--- `n` in decimal, a digit at a time out of a table of the ten of them.
-fun writeDecimal(fd : Int, n : Int) -> Unit {
-    if n < 0 {
-        writeText(fd, Prim.cString("-"))
-        -- The magnitude's digits, least significant last, without negating:
-        -- the most negative `Int` has no positive twin.
-        writeMagnitude(fd, n)
-    } else {
-        writeMagnitude(fd, Prim.intNeg(n))
-    }
-}
-
--- The digits of `-n`, for `n <= 0`. Division truncates toward zero, so each
--- remainder is in `-9..0`.
-fun writeMagnitude(fd : Int, n : Int) -> Unit {
-    if n <= -10 { writeMagnitude(fd, Prim.intDiv(n, 10)) }
-    let digit = Prim.intNeg(Prim.intRem(n, 10))
-    let _ = Libc.write(fd, Prim.ptrAdd(Prim.cString("0123456789"), digit), 1)
-}
-
-fun orEmpty(text : Prim.Ptr) -> Prim.Ptr =
-    if Prim.ptrIsNull(text) { Prim.cString("") } else { text }
 
 fun orQuery(text : Prim.Ptr) -> Prim.Ptr =
     if Prim.ptrIsNull(text) { Prim.cString("?") } else { text }

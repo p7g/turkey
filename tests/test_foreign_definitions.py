@@ -39,9 +39,9 @@ def probe(request, tmp_path):
     digest = hashlib.sha1(request.node.name.encode()).hexdigest()[:10]
     stem = "Probe_" + _SAFE.sub("_", request.node.originalname)[:40] + "_" + digest
     entry = tmp_path / "main.gob"
-    entry.write_text(f"import Turkey.{stem} as P\nfun main() {{ }}\n",
+    entry.write_text(f"import {stem} as P\nfun main() {{ }}\n",
                      encoding="utf-8")
-    made = Probe(f"Turkey.{stem}", LIB / "Turkey" / f"{stem}.gob", entry)
+    made = Probe(stem, LIB / f"{stem}.gob", entry)
     try:
         yield made
     finally:
@@ -168,16 +168,10 @@ def test_c_calls_a_definition_through_a_pointer(probe, tmp_path, backend):
     source.write_text(text, encoding="utf-8")
     caller = tmp_path / "caller.c"
     caller.write_text(CALLER, encoding="utf-8")
-    runtime = tmp_path / "runtime.o"
-    subprocess.run([*toolchain.cc(), "-std=c11",
-                    "-O1", "-c", "-o",
-                    str(runtime),
-                    str(REPO_ROOT / "runtime" / "turkey_runtime.c")],
-                   check=True)
     binary = tmp_path / "program"
     subprocess.run([*toolchain.cc(), "-O1",
                     *toolchain.clang_only("-Wno-override-module"), "-o",
-                    str(binary), str(source), str(runtime), str(caller),
+                    str(binary), str(source), str(caller),
                     *toolchain.libraries()], check=True)
     result = subprocess.run(toolchain.command(binary), capture_output=True,
                             text=True)

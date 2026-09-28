@@ -22,6 +22,7 @@ module Turkey.Modules (
 -- module here, which is also why this compiler's own layering is a DAG.
 
 import Turkey.Ast
+import System.Env as Env
 import System.IO as IO
 -- `Data.Set` is not one of the modules the Prelude re-exports.
 import Data.Set as Set
@@ -189,7 +190,8 @@ fun add(l : Loader, name : String, source : Source, library : Bool,
         -- The empty Prelude import removes the otherwise implicit edge. Empty
         -- imports of every other module remain instance-only edges.
         if !(imp.name == Prelude.preludeName && isEmptyList(imp.items)) {
-            discard(load(l, imp.name, stack))
+            let imported = load(l, imp.name, stack)
+            if !library { checkInternalImport(imported, imp) }
         }
     }
     if len(l.tycons) != before {
@@ -519,23 +521,61 @@ fun isLower(name : String) -> Bool = match String.decode(name, String.start(name
     None -> False
 }
 
--- Where a `foreign` declaration may appear: under `Unsafe.` in the shipped
--- standard library, which is exactly where `Prim.` may be spelled.
+-- -- the implementation's own modules ------------------------------------------------
+
+-- The shipped library's `Turkey.*` modules are the implementation -- the
+-- collector, the allocator, the entry, the C symbols they call -- and not a
+-- library: only another library module may import one. Their interfaces trade
+-- in raw pointers and C signatures that nothing checks, and a program that
+-- reached them would be depending on that as surely as on a public API.
 --
--- The subject of `Unsafe.` is "the collector does not know about this", and a
--- foreign symbol is the largest instance of it: the signature is an assertion
--- nothing can check, which is Modula-3's reason for allowing `EXTERNAL` only in
--- unsafe interfaces and Rust 2024's for `unsafe extern`. The name is then in
--- the import list of every module that reaches a C function, which is Oberon's
--- `SYSTEM` gesture.
+-- Decided by where the imported file came from, as `Prim.` is, so the
+-- compiler's own `Turkey.*` modules, which sit beside its entry, are the
+-- compiler's business and not this rule's.
+let internalPrefix = "Turkey."
+
+-- Modules a program may import anyway, for the tests that exercise the
+-- implementation through an ordinary program: comma-separated names.
+let internalTestHook = "TURKEY_TEST_INTERNAL_IMPORTS"
+
+fun checkInternalImport(imported : Module, imp : ImportDecl) -> Unit {
+    if !imported.library || !String.startsWith(imported.name, internalPrefix) {
+        return {}
+    }
+    match Env.get(internalTestHook) {
+        Some(allowed) -> if Array.contains(String.split(allowed, ","), imported.name) {
+            return {}
+        }
+        None -> {}
+    }
+    oopsAt("'" + imported.name + "' is part of the implementation, and only the "
+           + "standard library may import it", Some(imp.span))
+}
+
+-- The modules where a `foreign` declaration may appear, from the shipped
+-- library. A list rather than a naming convention, as the giblet modules are:
+-- joining it is a deliberate edit to the compiler.
 --
--- Two things this deliberately is not. It is not a check on the module's
--- declared *name*: only the loader knows where a file came from, and a program
--- that called its own module `Unsafe.Libc` and put it beside itself would
--- otherwise let itself in. And it is not "any directory named lib" -- the first
--- search root is the entry file's own directory, so that would be the same hole
--- wearing a different hat.
-let unsafePrefix = "Unsafe."
+-- A declaration is an assertion about a C signature that nothing can check,
+-- so the fewer places hold one the better, and every other module reaches C
+-- through what these export. It is not a check on the module's declared
+-- *name* alone: only the loader knows where a file came from, and a program
+-- that called its own module `Turkey.Libc` and put it beside itself would
+-- otherwise let itself in. Nor is it "any directory named lib" -- the first
+-- search root is the entry file's own directory, so that would be the same
+-- hole wearing a different hat.
+let foreignModules = ["Turkey.Libc", "Turkey.Entry"]
+
+-- Extra names for the tests, which declare symbols in throwaway modules.
+let foreignTestHook = "TURKEY_TEST_FOREIGN"
+
+fun declaresForeign(name : String) -> Bool {
+    if Array.contains(foreignModules, name) { return True }
+    match Env.get(foreignTestHook) {
+        Some(extra) -> Array.contains(String.split(extra, ","), name)
+        None -> False
+    }
+}
 
 fun checkForeignPlacement(name : String, program : Program,
                           library : Bool) -> Unit {
@@ -556,11 +596,11 @@ fun checkForeignPlacement(name : String, program : Program,
             }
         }
     }
-    if library && String.startsWith(name, unsafePrefix) { return }
+    if library && declaresForeign(name) { return }
     for d in program.decls {
         match d {
-            DForeign(f) -> oopsAt("a foreign declaration may only appear in a "
-                + "standard library module under '" + unsafePrefix + "', and '"
+            DForeign(f) -> oopsAt("a foreign declaration may only appear in "
+                + "Turkey.Libc or Turkey.Entry, from the standard library, and '"
                 + name + "' is not one; declare the symbol there and export a "
                 + "wrapper", Some(f.span))
             _ -> {}

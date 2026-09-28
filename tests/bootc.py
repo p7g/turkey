@@ -51,15 +51,22 @@ from tests import toolchain
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BOOT_MAIN = REPO_ROOT / "src" / "Main.gob"
 
+# The implementation's modules the corpus imports from an ordinary program --
+# `ptr.gob` and `ptr_gc.gob` test raw memory, `foreign.gob` a C call and
+# `giblets_memory.gob` a giblet -- which the compiler refuses outside the
+# library unless named here. Set for every `boot` a test runs, since the corpus
+# is compiled from many places; a test of the refusal itself removes it.
+INTERNAL_IMPORTS = "TURKEY_TEST_INTERNAL_IMPORTS"
+os.environ[INTERNAL_IMPORTS] = "Turkey.Libc,Turkey.Memory,Turkey.Ptr"
+
 
 # Everything whose contents can change what `boot` compiles to: its own
 # source, the library it links against, the committed compiler that builds it
-# and the script that does, and the C runtime it is linked with. Hashing these
-# is what lets a build be reused; missing one would mean serving a stale
-# binary, which is worse than rebuilding, so this list errs wide.
+# and the script that does. Hashing these is what lets a build be reused;
+# missing one would mean serving a stale binary, which is worse than
+# rebuilding, so this list errs wide.
 _INPUTS = (("src", "*.gob"), ("lib", "*.gob"),
-           ("bootstrap", "*"), ("scripts", "build.sh"),
-           ("runtime", "*.c"), ("runtime", "*.h"))
+           ("bootstrap", "*"), ("scripts", "build.sh"))
 
 
 def _fingerprint(root: Path = REPO_ROOT) -> str:
@@ -194,30 +201,30 @@ def build_key() -> str:
     """What a cached output of `boot` depends on, as a cache key.
 
     The build's fingerprint, or -- for a `boot` named by `$TURKEY_BOOT`, whose
-    sources are nobody's business -- the binary itself plus the library and the
-    runtime it reads at run time.
+    sources are nobody's business -- the binary itself plus the library it
+    reads at run time.
     """
     if not os.environ.get(BOOT_OVERRIDE):
         return _fingerprint()
     h = hashlib.sha256(binary().read_bytes())
     # Every output of `lang` is linked with `$TURKEY_CC`.
     h.update(toolchain.identity())
-    for directory, pattern in (("lib", "*.gob"), ("runtime", "*.c"),
-                               ("runtime", "*.h")):
-        for path in sorted((REPO_ROOT / directory).rglob(pattern)):
-            if path.name.startswith("Probe_"):
-                continue
-            h.update(str(path.relative_to(REPO_ROOT)).encode())
-            h.update(path.read_bytes())
+    for path in sorted((REPO_ROOT / "lib").rglob("*.gob")):
+        if path.name.startswith("Probe_"):
+            continue
+        h.update(str(path.relative_to(REPO_ROOT)).encode())
+        h.update(path.read_bytes())
     return h.hexdigest()[:16]
 
 
-# Binaries and the runtime object, shared by every worker and every session.
-# Each file is keyed by the hash of what it was built from, so a stale one is
-# never served and a warm one is never rebuilt.
+# Binaries, shared by every worker and every session. Each file is keyed by
+# the hash of what it was built from, so a stale one is never served and a warm
+# one is never rebuilt.
 CACHE = Path(tempfile.gettempdir()) / "turkey-native"
-RUNTIME = REPO_ROOT / "runtime" / "turkey_runtime.c"
-RUNTIME_HEADER = REPO_ROOT / "runtime" / "turkey_runtime.h"
+
+# Where `turkey_exports.h` is, for a C probe's `-I`: the declarations of what
+# a compiled program exports to C.
+PROBE_INCLUDE = REPO_ROOT / "tests"
 
 
 def digest(*parts: bytes) -> str:
@@ -232,25 +239,6 @@ def replace_built(command: list[str], output: Path) -> None:
     result = subprocess.run(command, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr[:4000]
     os.replace(command[command.index("-o") + 1], output)
-
-
-@functools.lru_cache(maxsize=None)
-def runtime_object(*flags: str) -> Path:
-    """`turkey_runtime.c`, compiled once rather than once per program, with
-    `-O1` and any `flags` after it.
-
-    Every test binary used to compile the runtime from source beside its module
-    -- the largest C file here, forty-odd times per worker.
-    """
-    key = digest(RUNTIME.read_bytes(), RUNTIME_HEADER.read_bytes(),
-                 toolchain.identity(), "\0".join(flags).encode())
-    output = CACHE / f"runtime-{key}.o"
-    if not output.exists():
-        CACHE.mkdir(parents=True, exist_ok=True)
-        staging = CACHE / f"runtime-{key}.{os.getpid()}.o"
-        replace_built([*toolchain.cc(), "-std=c11", "-O1", *flags, "-c",
-                       "-o", str(staging), str(RUNTIME)], output)
-    return output
 
 
 def boot_each(command: str, paths: list[Path],

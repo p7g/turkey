@@ -1,12 +1,11 @@
 """GC configuration and accounting, in a fresh runtime per invocation."""
 
 import os
-from pathlib import Path
 import subprocess
 
 import pytest
 
-from tests import toolchain
+from tests import bootc, toolchain
 from tests.allocator_probe import allocator_object
 
 
@@ -14,11 +13,10 @@ from tests.allocator_probe import allocator_object
 def gc_probe(tmp_path_factory, allocator_object):
     if toolchain.missing():
         pytest.skip("C compiler unavailable")
-    root = Path(__file__).resolve().parents[1]
     directory = tmp_path_factory.mktemp("gc-probe")
     source = directory / "probe.c"
     source.write_text('''
-#include "turkey_runtime.h"
+#include "turkey_exports.h"
 int main(int argc, char **argv) {
     turkey_giblets_initialize();
     if (argc > 1) turkey_gc_set_stress(0);
@@ -32,8 +30,8 @@ int main(int argc, char **argv) {
 ''')
     binary = directory / "probe"
     subprocess.run([*toolchain.cc(), "-std=c11",
-                    "-I", str(root / "runtime"),
-                    str(source), str(root / "runtime/turkey_runtime.c"), str(allocator_object),
+                    "-I", str(bootc.PROBE_INCLUDE),
+                    str(source), str(allocator_object),
                     "-lm", "-pthread", "-o", str(binary)], check=True,
                    capture_output=True, text=True)
     return binary
@@ -76,12 +74,23 @@ def region_probe(tmp_path_factory, allocator_object):
     if toolchain.missing():
         pytest.skip("C compiler unavailable")
     toolchain.needs_sanitizer()
-    root = Path(__file__).resolve().parents[1]
     directory = tmp_path_factory.mktemp("region-probe")
     source = directory / "probe.c"
     source.write_text(r'''
-#include "turkey_runtime.c"
+#include "turkey_exports.h"
 #include <assert.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* An object's header and slots, as `Turkey.Alloc` lays them out. A `String`
+   is a byte array: its length is the count and its bytes are the slots. */
+typedef struct TurkeyObject {
+    int32_t kind;
+    int32_t tag;
+    int64_t count;
+    uint64_t pointer_bitmap;
+    uint64_t slots[];
+} TurkeyObject;
 
 /* The shadow-stack frame `turkey_root_enter` fills in: the previous frame,
    the function's name, the slot count, the slots, and which of the first 64
@@ -148,7 +157,7 @@ int main(void) {
     binary = directory / "probe"
     subprocess.run([*toolchain.cc(), "-std=c11",
                     "-O1", "-fsanitize=undefined",
-                    "-I", str(root / "runtime"), str(source), str(allocator_object), "-lm", "-pthread",
+                    "-I", str(bootc.PROBE_INCLUDE), str(source), str(allocator_object), "-lm", "-pthread",
                     "-o", str(binary)], check=True, capture_output=True, text=True)
     return binary
 
@@ -179,12 +188,23 @@ def code_probe(tmp_path_factory, allocator_object):
     if toolchain.missing():
         pytest.skip("C compiler unavailable")
     toolchain.needs_sanitizer()
-    root = Path(__file__).resolve().parents[1]
     directory = tmp_path_factory.mktemp("code-probe")
     source = directory / "probe.c"
     source.write_text(r'''
-#include "turkey_runtime.c"
+#include "turkey_exports.h"
 #include <assert.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* An object's header and slots, as `Turkey.Alloc` lays them out. A `String`
+   is a byte array: its length is the count and its bytes are the slots. */
+typedef struct TurkeyObject {
+    int32_t kind;
+    int32_t tag;
+    int64_t count;
+    uint64_t pointer_bitmap;
+    uint64_t slots[];
+} TurkeyObject;
 
 /* The shadow-stack frame `turkey_root_enter` fills in: the previous frame,
    the function's name, the slot count, the slots, and which of the first 64
@@ -243,7 +263,7 @@ int main(void) {
     binary = directory / "probe"
     subprocess.run([*toolchain.cc(), "-std=c11",
                     "-O1", "-fsanitize=undefined",
-                    "-I", str(root / "runtime"), str(source), str(allocator_object), "-lm", "-pthread",
+                    "-I", str(bootc.PROBE_INCLUDE), str(source), str(allocator_object), "-lm", "-pthread",
                     "-o", str(binary)], check=True, capture_output=True, text=True)
     return binary
 

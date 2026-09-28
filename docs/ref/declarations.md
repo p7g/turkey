@@ -448,8 +448,8 @@ fun main() {
 Compiler-designated giblet modules initialize their untraced globals before
 any managed allocation, including string-literal interning. Their initializers
 may not allocate, depend on globals outside giblet modules, or use `Prim.error`
-directly or through a helper. They can report failures through the raw
-`turkey_panic` interface with `Prim.cString`. Mutable giblet globals use direct
+directly or through a helper. They can report failures through
+`Turkey.Process.panic` with `Prim.cString`. Mutable giblet globals use direct
 storage rather than heap cells. These rules apply only to designated library
 modules.
 
@@ -627,7 +627,8 @@ body ::= "=" expression | block
 ```
 
 The string names the C symbol. Without a body, the declaration calls a C
-function and is allowed only in an `Unsafe.` module from the shipped library.
+function and is allowed only in the few standard library modules the compiler
+lists.
 With a body, it defines a C-callable Turkey function and is allowed only in a
 compiler-designated *giblet* module from that library. Giblet code does not
 allocate or hold a traced value across a call, so a C caller needs no

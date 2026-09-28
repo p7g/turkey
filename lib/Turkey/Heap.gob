@@ -33,8 +33,8 @@ import Target (OS(..))
 import Target as Target
 import Turkey.HeapCheck as Check
 import Turkey.Memory as Memory
-import Unsafe.Libc as Libc
-import Unsafe.Runtime as Rt
+import Turkey.Process as Process
+import Turkey.Libc as Libc
 
 -- -- layouts ----------------------------------------------------------------------------
 --
@@ -183,7 +183,7 @@ var clock : Prim.Ptr = zeroed(16)
 fun zeroed(bytes : Int) -> Prim.Ptr {
     let p = Libc.malloc(bytes)
     if Prim.ptrIsNull(p) {
-        Rt.panic(Prim.cString("out of memory starting the collector"))
+        Process.panic(Prim.cString("out of memory starting the collector"))
         return p
     }
     Memory.fill(p, bytes, 0)
@@ -354,12 +354,12 @@ fun newRegion(bytes : Int, slotSize : Int, sizeClass : Int, large : Bool) -> Pri
     } else { regionBytes }
     let made = Libc.alignedAlloc(regionBytes, reserved)
     if Prim.ptrIsNull(made) {
-        Rt.panic(Prim.cString("out of memory"))
+        Process.panic(Prim.cString("out of memory"))
         return made
     }
     if !tableInsert(made) {
         Libc.free(made)
-        Rt.panic(Prim.cString("out of memory"))
+        Process.panic(Prim.cString("out of memory"))
         return Prim.ptrNull()
     }
     Memory.fill(made, regionData, 0)
@@ -415,10 +415,10 @@ fun allocate(size : Int, kind : Int, frame : Prim.Ptr) -> Prim.Ptr {
         -- A collection is the only thing here that can raise one, and an
         -- allocation after a failed collection would be into a heap nobody
         -- has finished tracing.
-        if panicPending() { return Prim.ptrNull() }
+        if Process.pending() { return Prim.ptrNull() }
     }
     if below(largest, size) {
-        Rt.panic(Prim.cString("allocation is too large"))
+        Process.panic(Prim.cString("allocation is too large"))
         return Prim.ptrNull()
     }
     let header = regionAllocate(plus(headerBytes, size))
@@ -452,7 +452,7 @@ fun countKind(kind : Int) -> Unit {
 fun validHeapPointer(value : Prim.Ptr) -> Bool {
     if !stress || Prim.ptrIsNull(value) { return !Prim.ptrIsNull(value) }
     if !Prim.ptrIsNull(findHeader(value)) { return True }
-    Rt.panic(Prim.cString("invalid or collected heap pointer"))
+    Process.panic(Prim.cString("invalid or collected heap pointer"))
     False
 }
 
@@ -462,7 +462,7 @@ fun validObjectKind(value : Prim.Ptr, kind : Int) -> Int {
     if !validHeapPointer(value) { return 0 }
     if load32(value, payloadKind) != heapObject
             || load32(value, objectKind) != kind {
-        Rt.panic(Prim.cString("heap object has the wrong runtime kind"))
+        Process.panic(Prim.cString("heap object has the wrong runtime kind"))
         return 0
     }
     1
@@ -479,7 +479,7 @@ fun validObjectKind(value : Prim.Ptr, kind : Int) -> Int {
 foreign "turkey_root_enter" fun rootEnter(pointer : Prim.Ptr, values : Prim.Ptr,
                                           count : Int, functionName : Prim.Ptr) -> Unit {
     if Prim.ptrIsNull(pointer) || Prim.ptrIsNull(values) || count < 0 {
-        Rt.panic(Prim.cString("invalid root frame size"))
+        Process.panic(Prim.cString("invalid root frame size"))
         return {}
     }
     Prim.storePtr(pointer, 0, roots)
@@ -492,7 +492,7 @@ foreign "turkey_root_enter" fun rootEnter(pointer : Prim.Ptr, values : Prim.Ptr,
 
 foreign "turkey_root_leave" fun rootLeave(pointer : Prim.Ptr) -> Unit {
     if Prim.ptrIsNull(pointer) || !Prim.ptrEq(roots, pointer) {
-        Rt.panic(Prim.cString("unbalanced root frame"))
+        Process.panic(Prim.cString("unbalanced root frame"))
         return {}
     }
     roots = Prim.loadPtr(pointer, 0)
@@ -533,7 +533,7 @@ foreign "turkey_frame_table_register" fun frameTableRegister(table : Prim.Ptr) -
     if count <= 0 { return {} }
     let entries = Libc.malloc(entryBytes * count)
     if Prim.ptrIsNull(entries) {
-        Rt.panic(Prim.cString("out of memory registering the frame table"))
+        Process.panic(Prim.cString("out of memory registering the frame table"))
         return {}
     }
     var p = Prim.ptrAdd(table, 8)
@@ -631,7 +631,7 @@ fun scanNativeFrames(frame : Prim.Ptr) -> Unit {
         -- generated entry. Scanning from an unknown outer bound is how a walk
         -- runs off the end; not scanning drops live roots silently, which is
         -- worse. So say so instead of doing either.
-        Rt.panic(Prim.cString("no entry stack bound: the frame walker cannot run"))
+        Process.panic(Prim.cString("no entry stack bound: the frame walker cannot run"))
         return {}
     }
     let high = Prim.ptrToInt(entryStackHigh)
@@ -689,7 +689,7 @@ fun markGrey(value : Prim.Ptr, what : Prim.Ptr, index : Int) -> Unit {
         let capacity = if markCapacity < 64 { 64 } else { markCapacity * 2 }
         let grown = Libc.realloc(markStack, 8 * capacity)
         if Prim.ptrIsNull(grown) {
-            Rt.panic(Prim.cString("out of memory while tracing the heap"))
+            Process.panic(Prim.cString("out of memory while tracing the heap"))
             return {}
         }
         markStack = grown
@@ -767,7 +767,7 @@ fun notHeapPointer(value : Prim.Ptr, what : Prim.Ptr, index : Int) -> Unit {
     putHex(Prim.ptrToInt(value))
     put(Prim.cString(")"))
     Prim.storeI8(text, textLength, Prim.byteFromInt(0))
-    Rt.panic(text)
+    Process.panic(text)
 }
 
 -- -- collecting -------------------------------------------------------------------------
@@ -803,7 +803,7 @@ fun collectFrom(frame : Prim.Ptr) -> Unit {
     -- Beside the chain, not instead of it: the arm64 backend's frames are
     -- here and everything else's are above.
     scanNativeFrames(frame)
-    if panicPending() { return {} }
+    if Process.pending() { return {} }
     if verify { verifyAt(1, frame) }
     sweep()
     if verify { verifyAt(2, frame) }
@@ -875,10 +875,6 @@ fun sweep() -> Unit {
         region = next
     }
 }
-
--- The panic flag itself, which `Rt.panicked` is not: that one also answers
--- for a program that has already ended.
-fun panicPending() -> Bool = Prim.intAnd(Rt.panicPending(), 4294967295) != 0
 
 -- -- statistics -------------------------------------------------------------------------
 

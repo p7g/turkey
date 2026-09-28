@@ -15,10 +15,11 @@ import Std.Classes
 import Data.Int ()
 import Data.Bool.Type (Bool(..))
 import Turkey.Memory as Memory
+import Turkey.Heap as Heap
 import Unsafe.Runtime as Rt
 
 foreign "turkey_cell_new" fun cellNew(value : Int, pointerValue : Int) -> Prim.Ptr {
-    let cell = Rt.heapAllocate(16, 3, Prim.frameAddress())
+    let cell = Heap.allocate(16, 3, Prim.frameAddress())
     if !Prim.ptrIsNull(cell) {
         Prim.storeI64(cell, 0, value)
         Prim.storeI32(cell, 8, Prim.charFromInt(pointerValue))
@@ -32,11 +33,13 @@ foreign "turkey_object_new" fun objectNew(kind : Int, tag : Int, count : Int,
         Rt.panic(Prim.cString("invalid object size"))
         return Prim.ptrNull()
     }
-    let object = Rt.heapAllocate(24 + 8 * count, 2, Prim.frameAddress())
+    -- `count` is at most 63 here, so the size cannot overflow.
+    let object = Heap.allocate(Prim.intAddWrapping(24, Prim.intShl(count, 3)), 2,
+                               Prim.frameAddress())
     if Prim.ptrIsNull(object) { return object }
-    Rt.countKind(kind)
+    Heap.countKind(kind)
     header(object, kind, tag, count, pointerBitmap)
-    Memory.fill(Prim.ptrAdd(object, 24), 8 * count, 0)
+    Memory.fill(Prim.ptrAdd(object, 24), Prim.intShl(count, 3), 0)
     object
 }
 
@@ -57,7 +60,7 @@ foreign "turkey_box" fun box(value : Int, layout : Int) -> Prim.Ptr {
 }
 
 foreign "turkey_unbox" fun unbox(object : Prim.Ptr, layout : Int) -> Int {
-    if Rt.validObjectKind(object, 5) == 0 { return 0 }
+    if Heap.validObjectKind(object, 5) == 0 { return 0 }
     if Prim.charToInt(Prim.loadI32(object, 4)) != Prim.intAnd(layout, 4294967295) {
         Rt.panic(Prim.cString("boxed value has the wrong scalar layout"))
         return 0
@@ -74,7 +77,7 @@ foreign "turkey_array_new" fun arrayNew(length : Int, initial : Int,
     }
     -- floor((SIZE_MAX - 24) / width). Every nonnegative Int fits at width 1;
     -- widths 4 and 8 have signed-representable bounds. After this check the
-    -- size is an unsigned word, passed bit-for-bit to the C heap allocator.
+    -- size is an unsigned word, passed bit-for-bit to the heap allocator.
     if !(elementWidth == 1 || elementWidth == 4 || elementWidth == 8)
             || (elementWidth == 4 && length > 4611686018427387897)
             || (elementWidth == 8 && length > 2305843009213693948) {
@@ -82,9 +85,9 @@ foreign "turkey_array_new" fun arrayNew(length : Int, initial : Int,
         return Prim.ptrNull()
     }
     let size = Prim.intAddWrapping(24, Prim.intMulWrapping(length, elementWidth))
-    let array = Rt.heapAllocate(size, 2, Prim.frameAddress())
+    let array = Heap.allocate(size, 2, Prim.frameAddress())
     if Prim.ptrIsNull(array) { return array }
-    Rt.countKind(2)
+    Heap.countKind(2)
     header(array, 2, elementLayout, length, elementWidth)
     let bytes = Prim.ptrAdd(array, 24)
     if elementWidth == 1 {

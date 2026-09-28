@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 
 import pytest
@@ -24,7 +25,7 @@ def verifier_probe(tmp_path_factory, allocator_object):
 
 static int64_t expected_count;
 static void check_stopped(void) {
-    assert(heap_count == expected_count);
+    assert(turkey_heap_objects() == expected_count);
     assert(turkey_has_panicked);
     puts("allocation stopped");
 }
@@ -38,11 +39,23 @@ static void forget(void *value) {
     r->live--;
 }
 
+/* What the collector's mark does to one object, done here instead so that
+   the verifier is not checked against the collector's own tracing. */
+static void remember(void *value) {
+    HeapHeader *h = header_of(value);
+    HeapRegion *r = region_of(h);
+    size_t i = ((unsigned char *)h - r->data) / r->slot_size;
+    h->marked = (uint32_t)turkey_heap_mark_epoch();
+    r->marked_slots[i / 64] |= UINT64_C(1) << (i % 64);
+    r->live++;
+}
+
 int main(int argc, char **argv) {
     assert(argc == 2);
     const char *which = argv[1];
+    turkey_giblets_initialize();
     turkey_gc_set_stress(0);
-    gc_verify = 0;
+    turkey_gc_set_verify(0);
     RootFrame frame;
     void *held[66] = {0};
     turkey_root_enter(&frame, held, 66, "verifier probe");
@@ -80,22 +93,24 @@ int main(int argc, char **argv) {
         frame.live = -1;
         /* Exactly 12 objects reachable (the closure's environment included). */
         for (int i = 0; i < 100; i++) turkey_box(i, 4);
-        gc_verify = 1;
-        mark_epoch = UINT32_MAX;
+        turkey_gc_set_verify(1);
+        turkey_heap_set_mark_epoch(UINT32_MAX);
         turkey_collect();
-        assert(!turkey_has_panicked && heap_count == 12 && mark_epoch == 1);
+        assert(!turkey_has_panicked && turkey_heap_objects() == 12);
+        assert(turkey_heap_mark_epoch() == 1);
         for (int i = 0; i < 20; i++) { turkey_box(i, 4); turkey_collect(); }
-        assert(heap_count == 12);
+        assert(turkey_heap_objects() == 12);
         memset(held, 0, sizeof held);
         turkey_collect();
-        assert(!turkey_has_panicked && heap_count == 0 && region_bytes == 0);
+        assert(!turkey_has_panicked && turkey_heap_objects() == 0);
+        assert(turkey_heap_region_bytes() == 0);
         puts("valid");
         return 0;
     }
     if (!strncmp(which, "mark-", 5) || !strcmp(which, "sweep-survivor")) {
-        mark_epoch++;
-        mark_grey(parent, NULL, 0);
-        while (mark_count > 0) mark_children(mark_stack[--mark_count]);
+        turkey_heap_set_mark_epoch(turkey_heap_mark_epoch() + 1);
+        remember(parent);
+        remember(child);
         phase = 1;
     }
     HeapRegion *r = region_of(header_of(parent));
@@ -123,28 +138,35 @@ int main(int argc, char **argv) {
     else if (!strcmp(which, "root")) held[0] = (void *)1;
     else if (!strcmp(which, "high-root")) held[65] = (void *)1;
     else if (!strcmp(which, "root-cycle")) frame.previous = &frame;
-    else if (!strcmp(which, "region-cycle")) regions->next = regions;
+    else if (!strcmp(which, "region-cycle")) turkey_heap_regions()->next = turkey_heap_regions();
     else if (!strcmp(which, "region-size")) r->slot_size = 0;
     else if (!strcmp(which, "region-capacity")) r->capacity = UINT32_MAX;
     else if (!strcmp(which, "region-count")) r->used++;
     else if (!strcmp(which, "region-class")) r->size_class = 0;
     else if (!strcmp(which, "region-search")) r->search_word = 1;
-    else if (!strcmp(which, "heap-count")) heap_count++;
-    else if (!strcmp(which, "heap-bytes")) region_bytes++;
+    else if (!strcmp(which, "heap-count")) turkey_heap_set_objects(turkey_heap_objects() + 1);
+    else if (!strcmp(which, "heap-bytes"))
+        turkey_heap_set_region_bytes(turkey_heap_region_bytes() + 1);
     else if (!strcmp(which, "bitmap")) r->allocated[31] |= UINT64_C(1) << 63;
-    else if (!strcmp(which, "available")) available[r->size_class] = NULL;
+    else if (!strcmp(which, "available")) turkey_heap_available()[r->size_class] = NULL;
     else if (!strcmp(which, "available-cycle")) r->available_next = r;
-    else if (!strcmp(which, "available-foreign")) available[0] = (void *)1;
-    else if (!strcmp(which, "region-table-missing")) region_table_remove(r);
+    else if (!strcmp(which, "available-foreign")) turkey_heap_available()[0] = (void *)1;
+    else if (!strcmp(which, "region-table-missing")) {
+        HeapRegion **table = turkey_heap_region_table();
+        for (int64_t i = 0; i < turkey_heap_region_table_capacity(); i++)
+            if (table[i] == r) table[i] = NULL;
+    }
     else if (!strcmp(which, "region-table-probe")) {
         /* Moved one slot past its home with the home left empty. */
-        size_t mask = region_table_capacity - 1, home = region_hash(r);
-        region_table[home] = NULL;
-        region_table[(home + 1) & mask] = r;
+        HeapRegion **table = turkey_heap_region_table();
+        size_t mask = (size_t)turkey_heap_region_table_capacity() - 1;
+        size_t home = region_hash(r);
+        table[home] = NULL;
+        table[(home + 1) & mask] = r;
     }
     else if (!strcmp(which, "sweep-survivor")) {
         forget(parent);
-        for (HeapRegion *s = regions; s; s = s->next) {
+        for (HeapRegion *s = turkey_heap_regions(); s; s = s->next) {
             memset(s->marked_slots, 0, sizeof s->marked_slots); s->live = 0;
         }
         phase = 2;
@@ -156,9 +178,9 @@ int main(int argc, char **argv) {
     }
     else if (!strcmp(which, "allocation-stops")) {
         parent->count = -1;
-        gc_verify = 1;
+        turkey_gc_set_verify(1);
         turkey_gc_set_stress(1);
-        expected_count = heap_count;
+        expected_count = turkey_heap_objects();
         atexit(check_stopped);
         turkey_box(3, 4);
         abort();
@@ -169,15 +191,16 @@ int main(int argc, char **argv) {
         stack[6] = (uintptr_t)child;
         int64_t offset = -16;
         FrameEntry entry = {1234, 1, &offset};
-        frame_entries = &entry; frame_entry_count = 1;
         HeapRegion *list[8]; size_t n = 0;
-        for (HeapRegion *s = regions; s; s = s->next) list[n++] = s;
+        for (HeapRegion *s = turkey_heap_regions(); s; s = s->next) list[n++] = s;
         qsort(list, n, sizeof(*list), heap_check_order);
-        HeapCheck check = {list, n, 0};
+        HeapCheck check = {.regions = list, .count = n, .phase = 0,
+                           .epoch = (uint32_t)turkey_heap_mark_epoch(),
+                           .entries = &entry, .entry_count = 1};
         if (!strcmp(which, "native-invalid")) stack[6] = 1;
         if (!strcmp(which, "native-offset")) offset = INT64_MIN;
-        if (!strcmp(which, "native-table")) frame_entries = NULL;
-        if (!strcmp(which, "native-unmarked")) { check.phase = 1; mark_epoch = 1; }
+        if (!strcmp(which, "native-table")) check.entries = NULL;
+        if (!strcmp(which, "native-unmarked")) { check.phase = 1; check.epoch = 1; }
         int ok = heap_check_native(&check, (uintptr_t)stack, (uintptr_t)&stack[15]);
         if (!strcmp(which, "native-valid")) { assert(ok); puts("valid"); return 0; }
         assert(!ok); puts(panic_buffer); return 0;
@@ -281,25 +304,31 @@ fun main() {
 ''')
     if toolchain.missing():
         pytest.skip("C compiler unavailable")
+    # The defect goes into a copy of the library, which the compiler reads
+    # through TURKEY_LIB, so that the collector itself is what is broken.
+    library = tmp_path / "lib"
+    shutil.copytree(bootc.REPO_ROOT / "lib", library)
+    heap = library / "Turkey" / "Heap.gob"
+    text = heap.read_text()
+    if defect == "native-roots":
+        before, after = ("    scanNativeFrames(frame)\n    if panicPending()",
+                         "    if panicPending()")
+    elif defect == "shadow-roots":
+        before, after = "    var root = roots\n", "    var root = Prim.ptrNull()\n"
+    else:
+        before = "fun markChildren(value : Prim.Ptr) -> Unit {\n"
+        after = before + "    if !Prim.ptrIsNull(value) { return {} }\n"
+    assert text.count(before) == 1, before
+    heap.write_text(text.replace(before, after))
     result = subprocess.run(toolchain.command(bootc.binary(), backend, str(source)),
                             cwd=bootc.REPO_ROOT, capture_output=True, text=True,
-                            check=True)
+                            check=True, env=dict(os.environ, TURKEY_LIB=str(library)))
     generated = tmp_path / ("main.s" if backend == "native" else "main.ll")
     generated.write_text(result.stdout)
-    runtime = (bootc.REPO_ROOT / "runtime/turkey_runtime.c").read_text()
-    if defect == "native-roots":
-        runtime = runtime.replace("    scan_native_frames(frame);", "    /* injected omission */")
-    elif defect == "shadow-roots":
-        runtime = runtime.replace("for (RootFrame *frame = roots;", "for (RootFrame *frame = NULL;")
-    else:
-        runtime = runtime.replace("static void mark_children(void *value) {",
-                                  "static void mark_children(void *value) { return;")
-    mutated = tmp_path / "runtime.c"
-    mutated.write_text(runtime)
     binary = tmp_path / "broken"
     subprocess.run([*toolchain.cc(), "-std=c11", "-O1",
                     *toolchain.clang_only("-Wno-override-module"), "-I",
-                    str(bootc.REPO_ROOT / "runtime"), str(generated), str(mutated),
+                    str(bootc.REPO_ROOT / "runtime"), str(generated), str(bootc.RUNTIME),
                     "-lm", "-pthread", "-o", str(binary)],
                    capture_output=True, text=True, check=True)
     result = subprocess.run(toolchain.command(binary), capture_output=True, text=True, timeout=20,

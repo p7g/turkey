@@ -2,13 +2,12 @@ module Unsafe.Runtime (
     argCount, argBytes, argLength,
     argsSet, exiting, exitStatus, panicked, panicMessage,
     frameCount, frameFunction, frameFile, frameLine, frameCol,
-    collect, gcReport, entryStackSet, rootsHead, panicCallsHead,
-    programEntry, heapAllocate, countKind, validObjectKind, panic,
+    panicCallsHead, programEntry, panic, panicPending, heapVerify,
 )
 
 -- The C runtime's own symbols, where Turkey has to reach them.
 --
--- The arguments, panic and exit state, and collector stack bounds live in C.
+-- The arguments, panic and exit state, and the heap verifier live in C.
 -- `Turkey.Entry` sets up the arguments and reads the state to report a result;
 -- `System.Env.args` reads the arguments through this interface.
 --
@@ -62,21 +61,8 @@ foreign "turkey_frame_line" fun frameLine(index : Int) -> Int
 
 foreign "turkey_frame_col" fun frameCol(index : Int) -> Int
 
--- -- the collector --------------------------------------------------------------------
-
--- A final collection, and the statistics `TURKEY_GC_STATS` asks for.
-foreign "turkey_collect" fun collect() -> Unit
-
-foreign "turkey_gc_report" fun gcReport() -> Unit
-
--- The outermost frame the collector's stack walk may reach: the entry
--- thread's own, recorded before the program runs.
-foreign "turkey_entry_stack_set" fun entryStackSet(frame : Prim.Ptr) -> Unit
-
--- The live shadow stacks, for the crash report: the innermost `RootFrame` and
--- `PanicCallFrame`, each a chain by its first word.
-foreign "turkey_roots_head" fun rootsHead() -> Prim.Ptr
-
+-- The live panic frames, for the crash report: the innermost
+-- `PanicCallFrame`, a chain by its first word.
 foreign "turkey_panic_calls_head" fun panicCallsHead() -> Prim.Ptr
 
 -- -- the program ----------------------------------------------------------------------
@@ -87,24 +73,16 @@ foreign "turkey_panic_calls_head" fun panicCallsHead() -> Prim.Ptr
 -- C file defines.
 foreign "turkey_entry" fun programEntry() -> Unit
 
--- Raw collector boundary for the allocator giblet. Size is an unsigned byte
--- count carried in an Int's bits; kind is 2 for objects and 3 for cells.
--- This may collect. Only generated allocation sites may call the allocators:
--- they root operands and turn the raw result into a traced value.
---
--- `frame` is the caller's `Prim.frameAddress()`, and a collection walks the
--- stack from there: it reads Turkey's frame records and never the runtime's,
--- which a C compiler may leave out. So the caller must be Turkey, and must be
--- the one the call is made from -- a frame passed along from further out
--- skips the frames between, and their roots with them.
-foreign "turkey_heap_allocate" fun heapAllocate(size : Int, kind : Int,
-                                                frame : Prim.Ptr) -> Prim.Ptr
-
--- Called after a successful object allocation; cell accounting is in the heap.
-foreign "turkey_count_kind" fun countKind(kind : Int) -> Unit
-
--- Checks heap membership under GC stress, then the object's runtime kind.
-foreign "turkey_valid_object_kind" fun validObjectKind(value : Prim.Ptr, kind : Int) -> Int
-
 -- Static NUL-terminated bytes, safe before any managed literal exists.
 foreign "turkey_panic" fun panic(message : Prim.Ptr) -> Unit
+
+-- Nonzero if a panic is raised and not yet unwound past the program's end,
+-- unlike `panicked`, which also answers for a program that has ended. An
+-- `int32_t`.
+foreign "turkey_panic_pending" fun panicPending() -> Int
+
+-- Check the heap against the collector's own account of it, at `phase` 0
+-- (before marking), 1 (before sweeping) or 2 (after sweeping), from the
+-- collection's Turkey `frame`. Exits the process on a failure: a corrupt heap
+-- is not something to unwind through.
+foreign "turkey_heap_verify" fun heapVerify(phase : Int, frame : Prim.Ptr) -> Unit

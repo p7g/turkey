@@ -33,7 +33,7 @@ let initializerName = "%giblet.initialize"
 
 -- The giblet modules. A list rather than a convention or a declaration form:
 -- joining it is a deliberate edit to the compiler.
-let giblets = ["Turkey.Entry", "Turkey.Memory", "Turkey.Alloc"]
+let giblets = ["Turkey.Entry", "Turkey.Memory", "Turkey.Alloc", "Turkey.Heap"]
 
 -- Extra names for the tests, which need a giblet module whose code is wrong on
 -- purpose.
@@ -102,6 +102,11 @@ fun checkLowered(functions : Array (Ssa.Func Low),
     checkEarly(byName, summary, definitions, modules, path)
 }
 
+-- Where the heap is entered. Its state is itself set up by early
+-- initialization, in an order nothing promises, and the roots it would scan are
+-- not registered until early initialization is over.
+let collectorEntries = ["Turkey.Heap#allocate", "Turkey.Heap#collectFrom"]
+
 -- Early initialization must not depend on the heap or on the later globals.
 -- Follow helpers as well as the entry itself: their scalar signatures alone
 -- cannot reveal an interned panic message or a read of an ordinary global.
@@ -135,12 +140,14 @@ fun checkEarly(functions : Map String (Ssa.Func Low),
                                 + ", which accesses the later global " + global, path)
                         }
                     }
-                    Call(Direct(callee), _) -> Array.push(work, callee)
-                    Call(Foreign(symbol), _) -> {
-                        if symbol == "turkey_heap_allocate" {
-                            refuse("giblet initialization may not call turkey_heap_allocate",
-                                   path)
+                    Call(Direct(callee), _) -> {
+                        if Array.contains(collectorEntries, callee) {
+                            refuse("giblet initialization may not call the collector: "
+                                   + name + " calls " + callee, path)
                         }
+                        Array.push(work, callee)
+                    }
+                    Call(Foreign(symbol), _) -> {
                         match Map.get(exports, symbol) {
                             Some(callee) -> Array.push(work, callee)
                             None -> {}

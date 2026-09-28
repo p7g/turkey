@@ -1,24 +1,10 @@
-/* clock_gettime and CLOCK_MONOTONIC are POSIX, not C11, and glibc hides them
-   under -std=c11 unless a feature-test macro asks for them. _DEFAULT_SOURCE is
-   what -std=gnu11 would define. Not _POSIX_C_SOURCE: Darwin's headers read
-   that as a request for strict POSIX and hide their extensions, while they
-   ignore _DEFAULT_SOURCE, so the macOS build is untouched by this. A
-   feature-test macro counts only before the first system header, so a probe
-   that #includes this file has to include it before anything else. */
-#define _DEFAULT_SOURCE
-
 #include "turkey_runtime.h"
 
 #include <inttypes.h>
 #include <stddef.h>
-#include <errno.h>
-#include <ctype.h>
-#include <time.h>
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
 
 typedef struct TurkeyCell { uint64_t value; int32_t pointer_value; } TurkeyCell;
 typedef struct TurkeyObject {
@@ -101,7 +87,14 @@ typedef struct RootFrame {
 } RootFrame;
 
 enum { HEAP_OBJECT = 2, HEAP_CELL = 3 };
-/* A header remains immediately before each payload. Small objects occupy
+
+/* The collector is `lib/Turkey/Heap.gob`. What follows is the heap verifier,
+   which checks it by decoding the collector's state with its own copy of the
+   layouts -- these structs, which must match that module's offsets -- and by
+   its own tracing, so that a collector bug is not checked by the same bug. It
+   reaches the state through the module's `turkey_heap_*` accessors.
+
+   A header remains immediately before each payload. Small objects occupy
    fixed-size slots in aligned regions; the address of any header identifies
    its region without a side table. Large objects own a dedicated region. */
 enum { REGION_BYTES = 65536, REGION_WORDS = 32, REGION_CLASSES = 22 };
@@ -113,388 +106,11 @@ typedef struct HeapRegion {
     uint32_t capacity, used, live, search_word, size_class;
     uint64_t allocated[REGION_WORDS];
     uint64_t marked_slots[REGION_WORDS];
-    _Alignas(max_align_t) unsigned char data[];
+    unsigned char data[];
 } HeapRegion;
-static HeapRegion *regions;
-static HeapRegion *available[REGION_CLASSES];
-static size_t region_bytes, region_bytes_peak;
-static uint32_t mark_epoch;
-
-static HeapRegion *region_of(HeapHeader *header) {
-    return (HeapRegion *)((uintptr_t)header & ~((uintptr_t)REGION_BYTES - 1));
-}
-
-/* Every live region's base, as an open-addressed set, so that `find_header`
-   can ask whether an arbitrary word is a heap pointer in constant time.
-   GC stress asks that of every pointer it traces, at every allocation, and a
-   walk of the region list there made a stressed run quadratic in the heap: a
-   corpus program took two minutes. `region_of` alone cannot answer it,
-   because the aligned base of a word that is not in the heap is not a region
-   and must not be read. Linear probing with backward-shift deletion, so no
-   tombstones build up across the regions the sweep frees. Only the base block
-   of a large region is entered: its one object's header is in that block. */
-static HeapRegion **region_table;
-static size_t region_table_capacity, region_table_count;
-
-static size_t region_hash(const HeapRegion *region) {
-    uint64_t h = ((uintptr_t)region / REGION_BYTES) * UINT64_C(0x9E3779B97F4A7C15);
-    return (size_t)(h ^ (h >> 32)) & (region_table_capacity - 1);
-}
-
-static int region_table_insert(HeapRegion *region) {
-    if ((region_table_count + 1) * 2 > region_table_capacity) {
-        size_t old_capacity = region_table_capacity;
-        HeapRegion **old = region_table;
-        size_t capacity = old_capacity == 0 ? 64 : old_capacity * 2;
-        HeapRegion **grown = calloc(capacity, sizeof(HeapRegion *));
-        if (grown == NULL) return 0;
-        region_table = grown;
-        region_table_capacity = capacity;
-        for (size_t index = 0; index < old_capacity; index++) {
-            if (old[index] == NULL) continue;
-            size_t at = region_hash(old[index]);
-            while (region_table[at] != NULL) at = (at + 1) & (capacity - 1);
-            region_table[at] = old[index];
-        }
-        free(old);
-    }
-    size_t at = region_hash(region);
-    while (region_table[at] != NULL)
-        at = (at + 1) & (region_table_capacity - 1);
-    region_table[at] = region;
-    region_table_count++;
-    return 1;
-}
-
-static int region_table_contains(const HeapRegion *region) {
-    if (region_table_capacity == 0) return 0;
-    for (size_t at = region_hash(region); region_table[at] != NULL;
-            at = (at + 1) & (region_table_capacity - 1))
-        if (region_table[at] == region) return 1;
-    return 0;
-}
-
-static void region_table_remove(const HeapRegion *region) {
-    size_t mask = region_table_capacity - 1;
-    size_t at = region_hash(region);
-    while (region_table[at] != region) at = (at + 1) & mask;
-    region_table[at] = NULL;
-    region_table_count--;
-    /* Pull back each entry after the hole that probing would no longer reach:
-       one whose home is not cyclically within (hole, here]. */
-    for (size_t here = (at + 1) & mask; region_table[here] != NULL;
-            here = (here + 1) & mask) {
-        size_t home = region_hash(region_table[here]);
-        if (((here - home) & mask) >= ((here - at) & mask)) {
-            region_table[at] = region_table[here];
-            region_table[here] = NULL;
-            at = here;
-        }
-    }
-}
-
-static HeapHeader *region_allocate(size_t bytes) {
-    size_t slot = bytes <= 32 ? 32 : bytes <= 256 ? (bytes + 15) & ~(size_t)15 : 256;
-    unsigned cls = slot / 16 - 2;
-    while (slot < bytes && slot < REGION_BYTES / 2) { slot *= 2; cls++; }
-    int large = bytes > REGION_BYTES / 2;
-    HeapRegion *region = large ? NULL : available[cls];
-    if (region == NULL) {
-        size_t reserved = REGION_BYTES;
-        if (large) {
-            if (bytes > SIZE_MAX - sizeof(HeapRegion) - (REGION_BYTES - 1)) {
-                turkey_panic("allocation is too large"); return NULL;
-            }
-            reserved = (sizeof(HeapRegion) + bytes + REGION_BYTES - 1)
-                & ~((size_t)REGION_BYTES - 1);
-            slot = bytes;
-        }
-        region = aligned_alloc(REGION_BYTES, reserved);
-        if (region == NULL) { turkey_panic("out of memory"); return NULL; }
-        if (!region_table_insert(region)) {
-            free(region);
-            turkey_panic("out of memory");
-            return NULL;
-        }
-        memset(region, 0, sizeof(HeapRegion));
-        region->slot_size = slot;
-        region->reserved = reserved;
-        region->capacity = large ? 1 : (REGION_BYTES - sizeof(HeapRegion)) / slot;
-        region->size_class = large ? REGION_CLASSES : cls;
-        region->next = regions;
-        regions = region;
-        if (!large) available[cls] = region;
-        region_bytes += reserved;
-        if (region_bytes > region_bytes_peak) region_bytes_peak = region_bytes;
-    }
-    unsigned word = region->search_word;
-    while (region->allocated[word] == UINT64_MAX) word++;
-    unsigned bit = (unsigned)__builtin_ctzll(~region->allocated[word]);
-    unsigned index = word * 64 + bit;
-    region->allocated[word] |= UINT64_C(1) << bit;
-    region->search_word = word;
-    region->used++;
-    if (!large && region->used == region->capacity)
-        available[cls] = region->available_next;
-    return (HeapHeader *)(region->data + index * region->slot_size);
-}
-static RootFrame *roots;
-
-/* The innermost root frame, for the crash report in `Turkey.Entry`, which
-   walks the chain by `previous` and reads each `function_name`. */
-const void *turkey_roots_head(void) { return roots; }
-static int64_t heap_count;
-static int64_t allocations_since_collection;
-static int64_t collection_threshold = 1024;
-static int64_t collection_count;
-static int gc_stress = -1;
-static int gc_initialized;
-static int gc_verify = -1;
-
-/* Opt-in accounting, printed by `turkey_gc_report` and, one line per
-   collection, by `turkey_collect` itself when TURKEY_GC_STATS is set. The
-   point is to answer "what is the collector costing and what is driving it"
-   with one run rather than with a profiler and a shrug. */
-static int64_t stats_allocations;
-static int64_t stats_bytes_allocated;
-static int64_t stats_traced;
-static int64_t stats_freed_total;
-static int64_t stats_live_total;
-static int64_t stats_live_peak;
-static int64_t stats_collect_clock;
-static FILE *stats_log;
-/* Scales the collection threshold: the collector runs again after this many
-   times the current live set has been allocated. 2 is the default because it
-   was measured, not chosen: at 1x the self-compiled compiler spent 79% of its
-   wall clock inside turkey_collect, collecting a heap that was
-   ~94% garbage every time; the same run at 2x halves the number of full
-   mark-and-sweeps for ~1GB of peak memory. TURKEY_GC_THRESHOLD_SCALE
-   overrides it for experiments. */
-static double threshold_scale = 2.0;
-/* Per-collection freed, since the running total is what the sweep knows. */
-static int64_t stats_freed_previous;
-/* Allocations by what the object is. Indexed by `turkey_object_new`'s kind:
-    0 an untagged constructor node (an ADT application -- the tree the rewrite
-    passes rebuild), 1 a tagged record (a `CRecord`: buckets, storages,
-    dictionaries), 2 an array, strings among them, 3 a closure, 4 a closure
-    environment, 5 a box, 7 a cell. Answers "what are they?" where the site
-    counters answer "who made them?". Counted only when TURKEY_GC_STATS is set,
-    like
-    the rest of this: the constructor sites run after `heap_allocate`, which is
-    where the flag is resolved. */
-static int64_t stats_by_kind[8];
-static void stats_count_kind(int kind) {
-    if (stats_log != NULL)
-        stats_by_kind[kind >= 0 && kind < 8 ? kind : 0]++;
-}
-
-static HeapHeader *header_of(void *value);
-
-static HeapHeader *find_header(void *value) {
-    uintptr_t address = (uintptr_t)value;
-    if (address < sizeof(HeapHeader)) return NULL;
-    HeapRegion *region = region_of((HeapHeader *)(address - sizeof(HeapHeader)));
-    if (!region_table_contains(region)) return NULL;
-    uintptr_t first = (uintptr_t)region->data + sizeof(HeapHeader);
-    if (address < first) return NULL;
-    size_t offset = address - first;
-    if (offset % region->slot_size != 0) return NULL;
-    size_t index = offset / region->slot_size;
-    if (index < region->capacity &&
-            (region->allocated[index / 64] & (UINT64_C(1) << (index % 64))))
-        return (HeapHeader *)(region->data + index * region->slot_size);
-    return NULL;
-}
-
-static int valid_heap_pointer(void *value) {
-    if (!gc_stress || value == NULL) return value != NULL;
-    if (find_header(value) != NULL) return 1;
-    turkey_panic("invalid or collected heap pointer");
-    return 0;
-}
-
-static int valid_object_kind(void *value, int32_t kind) {
-    if (!valid_heap_pointer(value)) return 0;
-    if (header_of(value)->kind != HEAP_OBJECT || ((TurkeyObject *)value)->kind != kind) {
-        turkey_panic("heap object has the wrong runtime kind");
-        return 0;
-    }
-    return 1;
-}
-
-void turkey_root_enter(void *pointer, void *values, int64_t count,
-                       const char *function_name) {
-    RootFrame *frame = pointer;
-    if (frame == NULL || values == NULL || count < 0) {
-        turkey_panic("invalid root frame size");
-        return;
-    }
-    frame->previous = roots;
-    frame->function_name = function_name;
-    frame->count = count;
-    frame->values = values;
-    // Nothing is live at registration: the frame is entered on the way into
-    // the region that contains the safepoints, and each safepoint names its
-    // own live set. A caller with roots that outlive the call stores the mask
-    // itself right after this returns.
-    frame->live = 0;
-    roots = frame;
-}
-
-void turkey_root_leave(void *pointer) {
-    RootFrame *frame = pointer;
-    if (frame == NULL || roots != frame) { turkey_panic("unbalanced root frame"); return; }
-    roots = frame->previous;
-}
-
-static HeapHeader *header_of(void *value) {
-    return value == NULL ? NULL : ((HeapHeader *)value) - 1;
-}
-
-static void collect(void **frame);
-
-static void *heap_allocate(size_t size, uint32_t kind, void **frame) {
-    if (!gc_initialized) {
-        gc_initialized = 1;
-        if (gc_stress < 0) gc_stress = getenv("TURKEY_GC_STRESS") != NULL;
-        const char *scale = getenv("TURKEY_GC_THRESHOLD_SCALE");
-        if (scale != NULL) {
-            char *end;
-            errno = 0;
-            double parsed = strtod(scale, &end);
-            int has_number = end != scale;
-            while (isspace((unsigned char)*end)) end++;
-            if (has_number && *end == '\0' && errno != ERANGE &&
-                    isfinite(parsed) && parsed >= 1.0)
-                threshold_scale = parsed;
-        }
-        if (getenv("TURKEY_GC_STATS") != NULL) stats_log = stderr;
-    }
-    if (gc_stress || allocations_since_collection >= collection_threshold)
-        collect(frame);
-    if (turkey_has_panicked) return NULL;
-    if (size > SIZE_MAX - sizeof(HeapHeader)) {
-        turkey_panic("allocation is too large"); return NULL;
-    }
-    HeapHeader *header = region_allocate(sizeof(HeapHeader) + size);
-    if (header == NULL) { turkey_panic("out of memory"); return NULL; }
-    header->next = NULL;
-    header->size = size;
-    header->kind = kind;
-    header->marked = 0;
-    heap_count++;
-    allocations_since_collection++;
-    if (stats_log != NULL) {
-        stats_allocations++;
-        stats_bytes_allocated += (int64_t)(size + sizeof(HeapHeader));
-        if (kind == HEAP_CELL) stats_count_kind(7);
-    }
-    return header + 1;
-}
-
-/* The grey set, as an explicit stack. Tracing used to recurse, which made the
-   C stack depth proportional to the longest chain of heap pointers: a list of
-   a hundred thousand elements is an ordinary thing for a program to build and
-   was a segfault to collect. Kept across collections so the capacity is paid
-   for once. */
-static void **mark_stack;
-static int64_t mark_count;
-static int64_t mark_capacity;
-
-static void mark_grey(void *value, const char *what, int64_t index) {
-    if (value == NULL) return;
-    /* Exact roots and layout metadata make finding the header O(1) in normal
-       execution. GC stress keeps the expensive membership check, and it earns
-       the cost: a pointer that is not in the heap means a root was missed or
-       a layout bitmap is wrong, and this turns that from a rare corruption
-       into a panic on the first collection. */
-    HeapHeader *header = gc_stress ? find_header(value) : header_of(value);
-    if (header == NULL) {
-        char message[160];
-        if (what == NULL)
-            snprintf(message, sizeof(message),
-                     "GC root or field is not a heap pointer (%p)", value);
-        else
-            snprintf(message, sizeof(message), "%s %" PRId64
-                     " is not a heap pointer (%p)", what, index, value);
-        turkey_panic(message);
-        return;
-    }
-    if (header->marked == mark_epoch) return;
-    header->marked = mark_epoch;
-    HeapRegion *region = region_of(header);
-    size_t slot = ((unsigned char *)header - region->data) / region->slot_size;
-    region->marked_slots[slot / 64] |= UINT64_C(1) << (slot % 64);
-    region->live++;
-    if (mark_count == mark_capacity) {
-        int64_t capacity = mark_capacity < 64 ? 64 : mark_capacity * 2;
-        void **grown = realloc(mark_stack, (size_t)capacity * sizeof(void *));
-        if (grown == NULL) {
-            turkey_panic("out of memory while tracing the heap");
-            return;
-        }
-        mark_stack = grown;
-        mark_capacity = capacity;
-    }
-    mark_stack[mark_count++] = value;
-}
-
-static void mark_children(void *value) {
-    HeapHeader *header = header_of(value);
-    if (header->kind == HEAP_CELL) {
-        TurkeyCell *cell = value;
-        if (cell->pointer_value)
-            mark_grey((void *)(uintptr_t)cell->value, NULL, 0);
-        return;
-    }
-    if (header->kind != HEAP_OBJECT) return;
-    TurkeyObject *object = value;
-    /* Code 7 is a traced pointer and 6 is a pointer-sized word the collector
-       must not follow: a raw address. A test of `>= 6` follows both, and
-       collects through an address it has no business reading. */
-    if (object->kind == 2) {
-        if (object->tag == 7)
-            for (int64_t index = 0; index < object->count; ++index)
-                mark_grey((void *)(uintptr_t)object->slots[index],
-                          "array pointer field", index);
-    } else if (object->kind == 0 || object->kind == 1) {
-        for (int64_t index = 0; index < object->count; ++index)
-            if (((object->pointer_bitmap >> (3 * index)) & 7) == 7)
-                mark_grey((void *)(uintptr_t)object->slots[index],
-                          "object pointer field", index);
-    } else {
-        for (int64_t index = 0; index < object->count; ++index)
-            if (object->pointer_bitmap & (UINT64_C(1) << index))
-                mark_grey((void *)(uintptr_t)object->slots[index],
-                          "capture", index);
-    }
-}
-
-
-/* -- frame tables ------------------------------------------------------------
-
-   The arm64 backend registers roots OCaml's way: no function pushes or pops
-   anything, and each call site that may collect has a table entry naming the
-   frame offsets of the roots live across it, keyed by the return address
-   for it. The collector walks `x29` frame records and looks each return
-   address up.
-
-   Only Turkey's frame records are walked, never C's. The walk starts from the
-   frame of the Turkey allocator that called into the heap, which passes its
-   own `x29` in, and ends at the entry thread's Turkey frame. Every frame in
-   between is Turkey's, because no C function on the mutator's stack calls
-   back into Turkey code that can allocate: the backend emits a frame record
-   in every function, so the chain is complete by construction. A C frame
-   keeps one only if its compiler chose to -- Darwin's ABI requires it, Linux's
-   leaves it to `-fno-omit-frame-pointer`, and clang at -O1 omits it -- and a
-   walk that crossed one would lose the Turkey caller's return address and
-   with it that caller's roots.
-
-   Both root schemes run at once, and that is the point: an LLVM-path frame
-   has a return address in no table, so it is skipped, and the shadow-stack
-   chain above goes on covering it. The shadow stack is a list the generated
-   code links through memory, and reads no frame records at all. A binary that
-   registers no table walks no frames. */
+_Static_assert(sizeof(HeapHeader) == 24, "Turkey.Heap's headerBytes");
+_Static_assert(offsetof(HeapRegion, marked_slots) == 312, "Turkey.Heap's regionMarked");
+_Static_assert(offsetof(HeapRegion, data) == 568, "Turkey.Heap's regionData");
 
 typedef struct FrameEntry {
     uintptr_t retaddr;
@@ -502,116 +118,32 @@ typedef struct FrameEntry {
     const int64_t *offsets; /* from x29, signed */
 } FrameEntry;
 
-static FrameEntry *frame_entries;
-static int64_t frame_entry_count;
+/* The collector's side of the contract, exported by `Turkey.Heap`. */
+HeapRegion *turkey_heap_regions(void);
+HeapRegion **turkey_heap_available(void);
+HeapRegion **turkey_heap_region_table(void);
+int64_t turkey_heap_region_table_capacity(void);
+int64_t turkey_heap_region_table_count(void);
+int64_t turkey_heap_region_bytes(void);
+int64_t turkey_heap_mark_epoch(void);
+FrameEntry *turkey_heap_frame_entries(void);
+int64_t turkey_heap_frame_entry_count(void);
+void *turkey_heap_entry_stack_high(void);
 
-static int compare_frame_entries(const void *a, const void *b) {
-    uintptr_t x = ((const FrameEntry *)a)->retaddr;
-    uintptr_t y = ((const FrameEntry *)b)->retaddr;
-    return x < y ? -1 : x > y ? 1 : 0;
+static HeapRegion *region_of(HeapHeader *header) {
+    return (HeapRegion *)((uintptr_t)header & ~((uintptr_t)REGION_BYTES - 1));
 }
 
-/* The emitter writes a flat array -- count, then {return address, n, n
-   offsets} -- because it cannot sort by an address the linker has not assigned
-   yet. Sorting it once here is what makes the lookup a binary search. */
-void turkey_frame_table_register(const void *table) {
-    const int64_t *words = table;
-    if (words == NULL) return;
-    int64_t count = words[0];
-    if (count <= 0) return;
-    FrameEntry *entries = malloc((size_t)count * sizeof *entries);
-    if (entries == NULL) {
-        turkey_panic("out of memory registering the frame table");
-        return;
-    }
-    const int64_t *p = words + 1;
-    for (int64_t index = 0; index < count; ++index) {
-        entries[index].retaddr = (uintptr_t)p[0];
-        entries[index].count = p[1];
-        entries[index].offsets = p + 2;
-        p += 2 + p[1];
-    }
-    qsort(entries, (size_t)count, sizeof *entries, compare_frame_entries);
-    free(frame_entries);
-    frame_entries = entries;
-    frame_entry_count = count;
+static HeapHeader *header_of(void *value) {
+    return value == NULL ? NULL : ((HeapHeader *)value) - 1;
 }
 
-static const FrameEntry *frame_entry_for(uintptr_t retaddr) {
-    int64_t low = 0, high = frame_entry_count - 1;
-    while (low <= high) {
-        int64_t middle = low + (high - low) / 2;
-        uintptr_t found = frame_entries[middle].retaddr;
-        if (found == retaddr) return &frame_entries[middle];
-        if (found < retaddr) low = middle + 1; else high = middle - 1;
-    }
-    return NULL;
-}
-
-/* The frame `Turkey.Entry`'s entry thread runs the program from, which is the
-   outermost frame any walk of the mutator stack can reach.
-
-   Asking pthread for the bounds instead is what this used to do, and it is
-   both unportable and less precise: `pthread_get_stackaddr_np` is Darwin's
-   spelling, glibc's `pthread_getattr_np` returns the *low* address rather
-   than the high one, and neither says where the program's frames actually
-   begin -- only where the thread's stack was mapped. Deriving the bound from
-   `TURKEY_STACK_BYTES` is no better, since `pthread_attr_setstacksize` may
-   round up or carve out a guard page. The one frame the entry creates the
-   thread for is a bound it knows exactly. */
-static char *entry_stack_high;
-
-/* Set by `Turkey.Entry`'s entry thread before the program runs, from its own
-   frame (TIX-67): the entry is Turkey now, and this bound is the collector's,
-   so the entry reports it rather than owning it. */
-void turkey_entry_stack_set(void *frame) { entry_stack_high = frame; }
-
-/* Every Turkey frame of the mutator's stack, from `frame` outwards.
-
-   `frame` is the `x29` of the Turkey allocator that called into the heap: a
-   frame record whose return address is in the allocation site, so the first
-   entry found is the allocating function's. Null means no Turkey frame is live
-   -- the final collection runs after the program has returned -- and nothing
-   is walked.
-
-   The stop conditions matter more than the loop: a walk that runs off the end
-   of the chain marks whatever the words beyond it happen to hold, which would
-   surface as a corruption a long way from here and look exactly like a
-   miscompile. So the frame pointer must stay inside this thread's stack, stay
-   8-byte aligned, and strictly increase.
-
-   There is no low bound to check. The walk starts at a live frame below this
-   one and `frame` only ever increases, so nothing it reaches can be below the
-   stack; the high bound and the strict increase are what confine it. */
-static void scan_native_frames(void **frame) {
-    if (frame_entry_count == 0 || frame == NULL) return;
-    char *high = entry_stack_high;
-    if (high == NULL) {
-        /* Reachable only if something ran the program without going through
-           `Turkey.Entry`, which sets the bound even when it could not make a
-           thread. Scanning from an unknown outer bound is how a walk runs off
-           the end; not scanning drops live roots silently, which is worse. So
-           say so instead of doing either. */
-        turkey_panic("no entry stack bound: the frame walker cannot run");
-        return;
-    }
-    while ((char *)frame + 16 <= high && ((uintptr_t)frame & 7) == 0) {
-        /* The return address in *this* record is an address in the *caller*,
-           so the entry it finds describes the caller's frame -- whose `x29` is
-           this record's saved one. Applying the offsets to this frame instead
-           reads whatever the callee happens to have at those offsets. */
-        void **next = frame[0];
-        if (next <= frame || (char *)next + 16 > high
-                || ((uintptr_t)next & 7) != 0) break;
-        const FrameEntry *entry = frame_entry_for((uintptr_t)frame[1]);
-        if (entry != NULL)
-            for (int64_t index = 0; index < entry->count; ++index) {
-                mark_grey(*(void **)((char *)next + entry->offsets[index]),
-                          "arm64 frame", index);
-                while (mark_count > 0) mark_children(mark_stack[--mark_count]);
-            }
-        frame = next;
-    }
+/* The region set's hash, recomputed to check that every entry is reachable
+   by probing from its home slot. `Turkey.Heap.regionHash` is the other copy. */
+static size_t region_hash(const HeapRegion *region) {
+    uint64_t h = ((uintptr_t)region / REGION_BYTES) * UINT64_C(0x9E3779B97F4A7C15);
+    return (size_t)(h ^ (h >> 32))
+        & ((size_t)turkey_heap_region_table_capacity() - 1);
 }
 
 /* Independent verification uses root inclusion and closure of the marked set:
@@ -628,6 +160,11 @@ typedef struct HeapCheck {
     /* The collection's Turkey frame record, where the native walk starts, as
        the collector's does; null when no Turkey frame is live. */
     void **frame;
+    /* The collector's state, read once through its accessors. */
+    uint32_t epoch;
+    const FrameEntry *entries;
+    int64_t entry_count;
+    uintptr_t high;
 } HeapCheck;
 
 static int heap_check_fail(const char *reason, const void *owner, int64_t index) {
@@ -667,14 +204,14 @@ static int heap_check_pointer(const HeapCheck *check, void *value, int marked,
         !(r->allocated[slot / 64] & (UINT64_C(1) << (slot % 64))))
         return heap_check_fail("invalid traced pointer", owner, index);
     HeapHeader *h = (HeapHeader *)(r->data + slot * r->slot_size);
-    if (marked && h->marked != mark_epoch)
+    if (marked && h->marked != check->epoch)
         return heap_check_fail("reachable object is unmarked", owner, index);
     return 1;
 }
 
 static int heap_check_object(const HeapCheck *check, HeapHeader *h) {
     void *value = h + 1;
-    int marked = check->phase != 0 && h->marked == mark_epoch;
+    int marked = check->phase != 0 && h->marked == check->epoch;
     if (h->kind == HEAP_CELL) {
         if (h->size != sizeof(TurkeyCell))
             return heap_check_fail("invalid cell size", value, -1);
@@ -712,6 +249,8 @@ static int heap_check_object(const HeapCheck *check, HeapHeader *h) {
 }
 
 static int heap_check_native(const HeapCheck *check, uintptr_t current, uintptr_t high) {
+    const FrameEntry *frame_entries = check->entries;
+    int64_t frame_entry_count = check->entry_count;
     if (frame_entry_count == 0) return 1;
     if (frame_entry_count < 0 || frame_entries == NULL)
         return heap_check_fail("invalid native frame table", frame_entries, -1);
@@ -721,7 +260,7 @@ static int heap_check_native(const HeapCheck *check, uintptr_t current, uintptr_
             (i && frame_entries[i-1].retaddr >= frame_entries[i].retaddr))
             return heap_check_fail("invalid native frame table", frame_entries, i);
     }
-    /* From the same record, and within the same bounds, as scan_native_frames:
+    /* From the same record, and within the same bounds, as the collector's walk:
        only Turkey's frame records are walked, and C frames between here and
        the allocator need not keep one. Records are 8-byte aligned, not 16. */
     if (current == 0) return 1;
@@ -755,6 +294,7 @@ static int heap_check_native(const HeapCheck *check, uintptr_t current, uintptr_
 }
 
 static int heap_check_roots(const HeapCheck *check) {
+    RootFrame *roots = (RootFrame *)turkey_roots_head();
     RootFrame *slow = roots, *fast = roots;
     while (fast != NULL && fast->previous != NULL) {
         slow = slow->previous;
@@ -769,11 +309,15 @@ static int heap_check_roots(const HeapCheck *check) {
                 !heap_check_pointer(check, f->values[i], check->phase != 0, f, i))
                 return 0;
     }
-    return heap_check_native(check, (uintptr_t)check->frame,
-                             (uintptr_t)entry_stack_high);
+    return heap_check_native(check, (uintptr_t)check->frame, check->high);
 }
 
 static int heap_check_contents(HeapCheck *check) {
+    HeapRegion **region_table = turkey_heap_region_table();
+    size_t region_table_capacity = (size_t)turkey_heap_region_table_capacity();
+    size_t region_table_count = (size_t)turkey_heap_region_table_count();
+    int64_t heap_count = turkey_heap_objects();
+    HeapRegion **available = turkey_heap_available();
     size_t bytes = 0;
     uint64_t objects = 0;
     /* Validate every region before using it for membership queries. */
@@ -816,16 +360,16 @@ static int heap_check_contents(HeapCheck *check) {
             HeapHeader *h = (HeapHeader *)(r->data + i * r->slot_size);
             if (h->size > r->slot_size - sizeof(*h))
                 return heap_check_fail("object exceeds allocation slot", h, i);
-            if (check->phase == 1 && marked != (h->marked == mark_epoch))
+            if (check->phase == 1 && marked != (h->marked == check->epoch))
                 return heap_check_fail("header and region marks disagree", h, i);
-            if (check->phase == 2 && h->marked != mark_epoch)
+            if (check->phase == 2 && h->marked != check->epoch)
                 return heap_check_fail("unmarked sweep survivor", h, i);
         }
         if (used != r->used || live != r->live)
             return heap_check_fail("region counts disagree", r, -1);
         objects += used;
     }
-    if (heap_count < 0 || objects != (uint64_t)heap_count || bytes != region_bytes)
+    if (heap_count < 0 || objects != (uint64_t)heap_count || bytes != (size_t)turkey_heap_region_bytes())
         return heap_check_fail("heap totals disagree", NULL, -1);
     /* The region set that the collector's pointer test consults holds exactly
        the listed regions, each reachable by probing from its home slot: every
@@ -874,7 +418,11 @@ static int heap_check_contents(HeapCheck *check) {
 }
 
 static int heap_verify(int phase, void **frame) {
-    HeapCheck check = {NULL, 0, phase, frame};
+    HeapCheck check = {NULL, 0, phase, frame,
+                       (uint32_t)turkey_heap_mark_epoch(),
+                       turkey_heap_frame_entries(), turkey_heap_frame_entry_count(),
+                       (uintptr_t)turkey_heap_entry_stack_high()};
+    HeapRegion *regions = turkey_heap_regions();
     HeapRegion *slow = regions, *fast = regions;
     while (fast != NULL && fast->next != NULL) {
         slow = slow->next;
@@ -896,148 +444,18 @@ static int heap_verify(int phase, void **frame) {
     return result;
 }
 
-/* Heap corruption invalidates the mutator's assumptions. In particular, an
+/* Called by the collector before marking (phase 0), before sweeping (1) and
+   after sweeping (2), when TURKEY_GC_VERIFY is set.
+
+   Heap corruption invalidates the mutator's assumptions. In particular, an
    entry initializer may still dereference an allocation result before it can
    propagate a panic, so verification failures must stop here. */
-static void heap_verify_or_exit(int phase, void **frame) {
-    if (!heap_verify(phase, frame)) {
+void turkey_heap_verify(int64_t phase, void *frame) {
+    if (!heap_verify((int)phase, frame)) {
         fprintf(stderr, "%s\n", panic_buffer);
         exit(EXIT_FAILURE);
     }
 }
-
-/* A collection with no Turkey frame live: the final one, after the program
-   has returned, and a C caller's. Anything else collects through the
-   allocator, which knows where the Turkey stack starts. */
-void turkey_collect(void) { collect(NULL); }
-
-static void collect(void **frame) {
-    if (gc_verify < 0) gc_verify = getenv("TURKEY_GC_VERIFY") != NULL;
-    if (gc_verify) heap_verify_or_exit(0, frame);
-    struct timespec stats_start, stats_end;
-    int64_t stats_live_before = heap_count;
-    /* Read before the sweep clears it: this is the allocation pressure the
-       collection is responding to. */
-    int64_t stats_allocs_since = allocations_since_collection;
-    int stats_wanted = stats_log != NULL;
-    if (stats_wanted) clock_gettime(CLOCK_MONOTONIC, &stats_start);
-    /* Epoch marks need no per-object clearing in an ordinary sweep. Handle
-       wrap explicitly, including stress runs that collect at every allocation. */
-    if (++mark_epoch == 0) {
-        for (HeapRegion *region = regions; region != NULL; region = region->next) {
-            for (unsigned word = 0; word < REGION_WORDS; word++) {
-                uint64_t bits = region->allocated[word];
-                while (bits) {
-                    unsigned slot = word * 64 + (unsigned)__builtin_ctzll(bits);
-                    HeapHeader *header = (HeapHeader *)(region->data + slot * region->slot_size);
-                    header->marked = 0;
-                    bits &= bits - 1;
-                }
-            }
-        }
-        mark_epoch = 1;
-    }
-    for (RootFrame *frame = roots; frame != NULL; frame = frame->previous)
-        for (int64_t index = 0; index < frame->count; ++index)
-            if (index >= 64 || (frame->live >> index) & 1) {
-                /* Named, because "a root is not a heap pointer" is true of one
-                   slot of one frame and a compiler emitting roots for the
-                   first time needs to know which. `function_name` is already
-                   carried for the crash handler; this is the same string. */
-                mark_grey(frame->values[index], frame->function_name, index);
-                while (mark_count > 0) mark_children(mark_stack[--mark_count]);
-            }
-    /* Beside the chain, not instead of it: the arm64 backend's frames are
-       here and everything else's are above. */
-    scan_native_frames(frame);
-    if (turkey_has_panicked) return;
-    if (gc_verify) heap_verify_or_exit(1, frame);
-    /* Empty regions cost one free, regardless of their allocation count.
-       Survivors rebuild availability by copying a fixed-size bitmap and
-       using epoch marks. No walk over individual object headers. */
-    memset(available, 0, sizeof(available));
-    HeapRegion **link = &regions;
-    while (*link != NULL) {
-        HeapRegion *region = *link;
-        int64_t dead = region->used - region->live;
-        heap_count -= dead;
-        stats_freed_total += dead;
-        if (region->live == 0) {
-            *link = region->next;
-            region_bytes -= region->reserved;
-            region_table_remove(region);
-            free(region);
-            continue;
-        }
-        memcpy(region->allocated, region->marked_slots, sizeof(region->allocated));
-        memset(region->marked_slots, 0, sizeof(region->marked_slots));
-        region->used = region->live;
-        region->live = 0;
-        region->search_word = 0;
-        if (region->used < region->capacity && region->size_class < REGION_CLASSES) {
-            unsigned cls = region->size_class;
-            region->available_next = available[cls];
-            available[cls] = region;
-        }
-        link = &region->next;
-    }
-    if (gc_verify) heap_verify_or_exit(2, frame);
-    allocations_since_collection = 0;
-    double next_threshold = (double)(heap_count > 1024 ? heap_count : 1024)
-        * threshold_scale;
-    /* INT64_MAX rounds up when converted to double; do not cast that bound. */
-    collection_threshold = next_threshold >= (double)INT64_MAX
-        ? INT64_MAX : (int64_t)next_threshold;
-    collection_count++;
-    if (stats_wanted) {
-        clock_gettime(CLOCK_MONOTONIC, &stats_end);
-        int64_t nanos = (stats_end.tv_sec - stats_start.tv_sec) * 1000000000ll
-            + (stats_end.tv_nsec - stats_start.tv_nsec);
-        int64_t freed_now = stats_freed_total - stats_freed_previous;
-        int64_t survived = stats_live_before - freed_now;
-        stats_freed_previous = stats_freed_total;
-        stats_collect_clock += nanos;
-        stats_traced += survived > 0 ? survived : 0;
-        stats_live_total += heap_count;
-        if (heap_count > stats_live_peak) stats_live_peak = heap_count;
-        fprintf(stats_log,
-                "[gc %" PRId64 "] allocs-since %" PRId64 ", live-before %" PRId64
-                ", survived %" PRId64 ", freed %" PRId64
-                ", next threshold %" PRId64 ", %.3f ms\n",
-                collection_count, stats_allocs_since, stats_live_before,
-                survived, freed_now,
-                collection_threshold,
-                (double)nanos / 1e6);
-        fflush(stats_log);
-    }
-}
-
-void turkey_gc_report(void) {
-    if (stats_log == NULL) return;
-    fprintf(stderr, "[gc] region bytes %zu, peak %zu\n", region_bytes, region_bytes_peak);
-    fprintf(stderr,
-            "[gc] collections %" PRId64 ", allocations %" PRId64
-            ", bytes %" PRId64 " (%.1f MB)\n",
-            collection_count, stats_allocations, stats_bytes_allocated,
-            (double)stats_bytes_allocated / (1024.0 * 1024.0));
-    fprintf(stderr,
-            "[gc] by kind: constr %" PRId64
-            ", record %" PRId64 ", array %" PRId64 ", closure %" PRId64
-            ", closure-env %" PRId64 ", box %" PRId64 ", cell %" PRId64 "\n",
-            stats_by_kind[0], stats_by_kind[1],
-            stats_by_kind[2], stats_by_kind[3], stats_by_kind[4],
-            stats_by_kind[5], stats_by_kind[7]);
-    fprintf(stderr,
-            "[gc] final live %" PRId64 ", peak live %" PRId64
-            ", objects traced %" PRId64 ", freed %" PRId64
-            ", collect time %.3f s\n",
-            heap_count, stats_live_peak, stats_traced, stats_freed_total,
-            (double)stats_collect_clock / 1e9);
-}
-
-int64_t turkey_heap_objects(void) { return heap_count; }
-int64_t turkey_collection_count(void) { return collection_count; }
-void turkey_gc_set_stress(int32_t enabled) { gc_stress = enabled != 0; }
 
 static void capture_panic_trace(void) {
     int64_t count = 0;
@@ -1167,21 +585,9 @@ int64_t turkey_frame_col(int64_t index) {
     return frame == NULL ? 0 : frame->col;
 }
 
-/* The allocator giblet owns payload initialization. These bridges expose only
-   collector-owned operations; the raw allocation may collect, and its caller
-   must already have rooted every managed operand. `frame` is the caller's own
-   `x29`, where a collection's walk of the Turkey stack starts. */
-void *turkey_heap_allocate(uint64_t size, int64_t kind, void *frame) {
-    return heap_allocate((size_t)size, (uint32_t)kind, frame);
-}
-
-void turkey_count_kind(int64_t kind) {
-    stats_count_kind((int)kind);
-}
-
-int64_t turkey_valid_object_kind(void *value, int64_t kind) {
-    return valid_object_kind(value, (int32_t)kind);
-}
+/* The panic flag alone, which `turkey_panicked` is not: the collector stops
+   before sweeping a heap it did not finish tracing. */
+int32_t turkey_panic_pending(void) { return turkey_has_panicked; }
 
 /* --------------------------------------------------- what the host hands over
  *

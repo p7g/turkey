@@ -20,31 +20,42 @@ void *turkey_array_new(int64_t length, uint64_t initial, int64_t element_width,
                        int64_t element_layout);
 void *turkey_closure_shell(uint64_t code);
 
-/* Collector-owned services used by the allocator giblet. `frame` is the
-   allocator's own frame pointer, where the collector's walk starts. */
-void *turkey_heap_allocate(uint64_t size, int64_t kind, void *frame);
-void turkey_count_kind(int64_t kind);
-int64_t turkey_valid_object_kind(void *value, int64_t kind);
+/* The program's early initialization -- every giblet module's globals -- under
+   a C name. `turkey_entry` runs it first; C that calls a program's Turkey
+   exports without running the program calls it before anything else. */
+void turkey_giblets_initialize(void);
 
-/* Raw memory: `malloc` and `free`, and deliberately nothing more. Not heap
-   objects -- these have no header, are never collected, and the collector must
-   not be handed one. */
-
+/* The collector, exported by Turkey.Heap in the generated program.
+   `turkey_root_enter`/`leave` push and pop a shadow-stack frame the caller
+   owns. The arm64 backend's roots are instead one table for the module, keyed
+   by return address, registered by its entry sequence before anything
+   allocates; the table is `const void *` because the entry is generated code
+   building the constant itself, matching the layout rather than the name. */
 void turkey_root_enter(void *frame, void *values, int64_t count,
                        const char *function_name);
 void turkey_root_leave(void *frame);
-/* The arm64 backend's roots: one table for the module, keyed by return
-   address, registered by its entry sequence before anything allocates. Spelled
-   `const void *` because the entry is generated code building the constant
-   itself, matching the layout rather than the name -- the same reason
-   `turkey_frame_enter` takes one. A program that never calls this (every
-   LLVM-path binary) is unaffected. */
 void turkey_frame_table_register(const void *table);
+void turkey_entry_stack_set(void *frame);
+const void *turkey_roots_head(void);
 void turkey_collect(void);
+void turkey_gc_report(void);
 int64_t turkey_heap_objects(void);
 int64_t turkey_collection_count(void);
-void turkey_gc_report(void);
 void turkey_gc_set_stress(int32_t enabled);
+void turkey_gc_set_verify(int32_t enabled);
+/* Whether `value` is a live heap object, and three settings a test uses to
+   corrupt the heap on purpose. The verifier's accessors are declared beside
+   it, in the C. */
+int64_t turkey_heap_contains(void *value);
+void turkey_heap_set_mark_epoch(int64_t epoch);
+void turkey_heap_set_objects(int64_t count);
+void turkey_heap_set_region_bytes(int64_t bytes);
+
+/* The heap verifier, which stays C so that it is not the collector checking
+   itself: the collector calls it at each phase when TURKEY_GC_VERIFY is set,
+   and it exits the process on a failure. */
+void turkey_heap_verify(int64_t phase, void *frame);
+int32_t turkey_panic_pending(void);
 
 /* What the host hands over: arguments in, exit status out.
    `turkey_args_set` is called by the host before the program runs and copies
@@ -63,15 +74,12 @@ int64_t turkey_exit_status(void);
 void turkey_exit_clear(void);
 
 /* What the entry and the crash report in `lib/Turkey/Entry.gob` read of the
-   collector's and the panic machinery's state (TIX-67). The entry itself --
-   `turkey_main`, the big-stack thread and the crash handler -- is Turkey, and
-   each program defines those symbols; these stay C because the state they
-   reach is the collector's until it moves too. */
-void turkey_entry_stack_set(void *frame);
-/* Called by the generated `turkey_entry` around the program; see the C. */
+   panic machinery's state. The entry itself -- `turkey_main`, the big-stack
+   thread and the crash handler -- is Turkey, and each program defines those
+   symbols. The generated `turkey_entry` calls the first two around the
+   program; see the C. */
 void turkey_entry_started(void);
 void turkey_entry_returned(void);
-const void *turkey_roots_head(void);
 const void *turkey_panic_calls_head(void);
 
 void turkey_panic(const char *message);

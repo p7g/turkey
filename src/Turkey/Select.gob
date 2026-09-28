@@ -70,6 +70,9 @@ type Sel = Sel {
     -- followed by a test of the panic flag, and a panic call must not be: it
     -- would test the flag it just set and branch to itself, forever.
     panicking : Bool,
+    -- The `i64` constants the low IR defines, by value: a divisor known here
+    -- needs fewer of the checks division otherwise pays for.
+    known   : Map Int Int,
 }
 
 fun emit(s : Sel, op : A.Arm) -> Unit {
@@ -150,7 +153,29 @@ fun start(f : Func Low, asm : Asm) -> Sel {
     }
     g.entry = incoming(f, g)
     Sel { source = f, out = g, at = 0, stopped = None, asm = asm,
-          frame = Roots.analyze(f), pending = None, panicking = False }
+          frame = Roots.analyze(f), pending = None, panicking = False,
+          known = constantsOf(f) }
+}
+
+fun constantsOf(f : Func Low) -> Map Int Int {
+    let out = Map.new()
+    for block in f.blocks {
+        for i in block.insts {
+            match i.op {
+                ConstInt(n) -> if Ssa.repOf(f, i.result).class_ == I64 {
+                    Map.put(out, Ssa.valueId(i.result), n)
+                }
+                _ -> {}
+            }
+        }
+    }
+    out
+}
+
+-- The divisor of a `div` or `rem`, where it is a constant.
+fun divisorOf(s : Sel, i : Low) -> Option Int = match i.op {
+    Bin(_, _, b) -> Map.get(s.known, Ssa.valueId(b))
+    _ -> None
 }
 
 -- A new entry block that moves each parameter out of where the caller put it,
@@ -805,53 +830,69 @@ fun trapping(s : Sel, i : Low, d : Reg, r : Rep, o : BinOp, a : Reg, b : Reg,
             emit(s, A.Cmp(high, sign, A.W64))
             guardOn(s, A.Ne, "integer overflow in *")
         }
+        -- A constant divisor other than 0 cannot raise the first panic, and
+        -- one other than -1 cannot raise the second.
         Div -> {
-            divisorGuard(s, b, "division by zero")
-            mostNegative(s, a, b, "integer overflow in /")
+            let k = divisorOf(s, i)
+            if k == None || k == Some(0) { divisorGuard(s, b, "division by zero") }
+            if k == None || k == Some(-1) {
+                mostNegative(s, a, b, "integer overflow in /")
+            }
             emit(s, A.SDiv(d, a, b, w))
         }
         -- The remainder is the division's, backwards: `msub` computes
         -- `a - (a / b) * b`, which is what arm64 has instead of an `srem`.
-        --
-        -- The most negative integer divided by -1 is taken out rather than
-        -- computed. Its mathematical remainder is zero, but the quotient it
-        -- goes through does not exist -- the same case LLVM leaves undefined
-        -- and `Turkey.Llvm` special-cases for the same reason.
-        Rem -> {
-            divisorGuard(s, b, "remainder by zero")
-            let low = temp(s, Ssa.untraced(I64))
-            constant(s, low, Int.shl(1, 63))
-            emit(s, A.Cmp(a, low, A.W64))
-            let isLow = tempValue(s, Ssa.untraced(I1))
-            emit(s, A.CSet(A.reg(isLow), A.Eq))
-            emit(s, A.CmpImm(b, -1, A.W64))
-            let isNegative = tempValue(s, Ssa.untraced(I1))
-            emit(s, A.CSet(A.reg(isNegative), A.Eq))
-            let special = tempValue(s, Ssa.untraced(I1))
-            emit(s, A.And(A.reg(special), A.reg(isLow), A.reg(isNegative),
-                          A.W32))
-            let zero = block(s)
-            let ordinary = block(s)
-            let after = block(s)
-            -- The result is the merge block's parameter, which is what a
-            -- select is in a graph with block parameters rather than phis.
-            Array.push(s.out.blocks[after].params, i.result)
-            s.out.blocks[s.at].term = Branch(special, BlockId(zero),
-                                             BlockId(ordinary))
-            s.at = zero
-            let none = tempValue(s, Ssa.untraced(I64))
-            emit(s, A.Mov(A.reg(none), A.xzr, A.W64))
-            s.out.blocks[s.at].term = Jump(BlockId(after), [none])
-            s.at = ordinary
-            let quotient = temp(s, Ssa.untraced(I64))
-            let rest = tempValue(s, Ssa.untraced(I64))
-            emit(s, A.SDiv(quotient, a, b, w))
-            emit(s, A.MSub(A.reg(rest), quotient, b, a, w))
-            s.out.blocks[s.at].term = Jump(BlockId(after), [rest])
-            s.at = after
+        -- A constant divisor other than 0 and -1 needs neither check.
+        Rem -> match divisorOf(s, i) {
+            Some(k) -> if k != 0 && k != -1 {
+                let quotient = temp(s, Ssa.untraced(I64))
+                emit(s, A.SDiv(quotient, a, b, w))
+                emit(s, A.MSub(d, quotient, b, a, w))
+            } else { remainder(s, i, d, a, b, w) }
+            None -> remainder(s, i, d, a, b, w)
         }
         _ -> stop(s, "the binary operation " + show(o))
     }
+}
+
+-- The remainder by a divisor that may be 0 or -1.
+--
+-- The most negative integer divided by -1 is taken out rather than computed.
+-- Its mathematical remainder is zero, but the quotient it goes through does
+-- not exist -- the same case LLVM leaves undefined and `Turkey.Llvm`
+-- special-cases for the same reason.
+fun remainder(s : Sel, i : Low, d : Reg, a : Reg, b : Reg, w : A.Width) -> Unit {
+    divisorGuard(s, b, "remainder by zero")
+    let low = temp(s, Ssa.untraced(I64))
+    constant(s, low, Int.shl(1, 63))
+    emit(s, A.Cmp(a, low, A.W64))
+    let isLow = tempValue(s, Ssa.untraced(I1))
+    emit(s, A.CSet(A.reg(isLow), A.Eq))
+    emit(s, A.CmpImm(b, -1, A.W64))
+    let isNegative = tempValue(s, Ssa.untraced(I1))
+    emit(s, A.CSet(A.reg(isNegative), A.Eq))
+    let special = tempValue(s, Ssa.untraced(I1))
+    emit(s, A.And(A.reg(special), A.reg(isLow), A.reg(isNegative),
+                  A.W32))
+    let zero = block(s)
+    let ordinary = block(s)
+    let after = block(s)
+    -- The result is the merge block's parameter, which is what a
+    -- select is in a graph with block parameters rather than phis.
+    Array.push(s.out.blocks[after].params, i.result)
+    s.out.blocks[s.at].term = Branch(special, BlockId(zero),
+                                     BlockId(ordinary))
+    s.at = zero
+    let none = tempValue(s, Ssa.untraced(I64))
+    emit(s, A.Mov(A.reg(none), A.xzr, A.W64))
+    s.out.blocks[s.at].term = Jump(BlockId(after), [none])
+    s.at = ordinary
+    let quotient = temp(s, Ssa.untraced(I64))
+    let rest = tempValue(s, Ssa.untraced(I64))
+    emit(s, A.SDiv(quotient, a, b, w))
+    emit(s, A.MSub(A.reg(rest), quotient, b, a, w))
+    s.out.blocks[s.at].term = Jump(BlockId(after), [rest])
+    s.at = after
 }
 
 -- A flag-setting instruction, and a panic if it overflowed.

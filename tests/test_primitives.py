@@ -1,9 +1,9 @@
-"""The primitive semantics of PRIMITIVES.md, held to directly.
+"""The semantics of the primitive types, held to directly.
 
-These are deliberately written against the *statements* in that document
-rather than against the current implementation, because the point of the
-document is that the primitives mean what it says and not whatever the host
-does. Each program is compiled by `boot` and run natively (`tests.lang`).
+These are written against what the language promises -- the "Primitive types"
+section of `docs/ref/types.md` -- rather than against whatever the current
+implementation happens to do, so that a backend that drifts from the promise
+fails here. Each program is compiled by `boot` and run natively (`tests.lang`).
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def test_int_is_64_bit_and_arithmetic_traps():
 
 def test_int_literal_out_of_range_is_a_compile_error():
     # 2^63 exactly: too big for Int, and past 2^53 so not a Float either. The
-    # lexer is what says so (PRIMITIVES.md 1.3).
+    # lexer is what says so.
     with pytest.raises(Exception, match="integer literal out of range"):
         out("fun main() { print(9223372036854775808) }")
 
@@ -125,8 +125,8 @@ def test_division_by_zero_is_ieee_not_a_panic():
 
 
 def test_every_comparison_with_nan_is_false():
-    # The bug this replaces: `gte` inherited `!lt`, so `NaN >= 1.0` was True
-    # while `NaN <= 1.0` was False (PRIMITIVES.md 3.2a).
+    # All four `Ord Float` methods are the primitive comparisons. Inheriting
+    # `gte` as `!lt` would make `NaN >= 1.0` True while `NaN <= 1.0` is False.
     src = """
     fun main() {
         let n = Float.nan()
@@ -185,7 +185,7 @@ def test_float_to_int_is_optional_rather_than_undefined():
 def test_there_is_no_hash_float():
     # `Hash a : Eq a` and `Eq Float` is not reflexive, so a NaN key could be
     # inserted and never found again. Refusing the instance makes it a type
-    # error instead (PRIMITIVES.md 3.2c).
+    # error instead.
     src = """
     fun main() {
         let m = Map.new()

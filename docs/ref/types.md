@@ -110,7 +110,9 @@ fun main() {
 
 The library module `Int` has arithmetic that wraps around or returns an
 `Option` instead of panicking, a floored modulus (`Int.mod`), and the bitwise
-operations. There are no bitwise operators.
+operations. There are no bitwise operators. The shifts, `Int.shl` and
+`Int.shr`, panic when the shift amount is outside 0 to 63 rather than masking
+it, and `Int.shr` copies the sign bit.
 
 ### Float
 
@@ -122,7 +124,61 @@ Comparisons follow IEEE 754 as well. Every comparison involving NaN is false,
 including `==`, so `NaN == NaN` is false and `NaN != NaN` is true, and
 `-0.0 == 0.0` is true. This makes `Float` the one type whose `Eq` and `Ord`
 instances do not obey the usual laws: equality is not reflexive and ordering is
-not total. There is no `%` on `Float`.
+not total. There is no `%` on `Float`: `Float.fmod` and `Float.remainder`
+are the C and IEEE 754 remainders, which round the quotient differently.
+
+Two consequences follow. There is no `Hash` instance for `Float`, because a
+key that is not equal to itself could be stored in a map and never found
+again, so a `Float` cannot be a map key. And sorting by `<` puts NaN wherever
+it happens to land. `Float.totalCompare` is the IEEE 754 total order, which
+places every value, NaN included, and distinguishes `-0.0` from `0.0`:
+
+<!-- run -->
+```kotlin
+fun main() {
+    let nan = 0.0 / 0.0
+    print(nan < 1.0)
+    print(nan > 1.0)
+    print(Float.totalCompare(nan, 1.0))
+    print(Float.totalCompare(-0.0, 0.0))
+}
+```
+
+```text
+False
+False
+GT
+LT
+```
+
+<!-- error: no instance for 'Hash Float' -->
+```kotlin
+fun main() {
+    let prices = Map.new()
+    prices[19.99] = "lunch"
+}
+```
+
+Converting a `Float` to an `Int` can fail, so `Float.truncate` returns an
+`Option Int`: `None` for NaN, the infinities, and anything outside the range of
+`Int`. `Float.floor`, `Float.ceil`, `Float.round` and `Float.trunc` round
+without leaving `Float`. `Float.fromInt` is exact up to `2^53` and rounds
+beyond it.
+
+<!-- run -->
+```kotlin
+fun main() {
+    print(Float.truncate(-3.7))
+    print(Float.truncate(1.0e300))
+    print(Float.floor(-3.7))
+}
+```
+
+```text
+Some(-3)
+None
+-4.0
+```
 
 <!-- run -->
 ```kotlin
@@ -205,7 +261,8 @@ A `Byte` is an unsigned 8-bit integer. It exists to hold raw bytes, for
 example the contents of a file, and it supports comparison but no arithmetic.
 To compute with a byte, convert it to an `Int` with `Byte.toInt`.
 `Byte.fromInt(n)` returns an `Option Byte` that is `None` when `n` is out of
-range.
+range, and `Byte.truncate(n)` keeps the low eight bits. There is no byte
+literal.
 
 ### Char
 
@@ -213,6 +270,29 @@ A `Char` is one Unicode scalar value: a code point from `0` to `10FFFF`,
 excluding the surrogates `D800` to `DFFF`. It is written as a
 [character literal](lexical.md#character-literals), such as `'a'` or
 `'\u{1F600}'`.
+
+A `Char` has no arithmetic, because adding to a scalar value means nothing
+once text is encoded in a variable number of bytes. `Char.toInt` gives the
+number, and `Char.fromInt` returns an `Option Char` that is `None` for a
+surrogate or a number out of range:
+
+<!-- run -->
+```kotlin
+fun main() {
+    print(Char.toInt('A'))
+    print(Char.fromInt(66))
+    print(Char.fromInt(55296))
+}
+```
+
+```text
+65
+Some(B)
+None
+```
+
+A `Char` is not always what a reader would call a character. `é` can be one
+scalar value, or two: `e` followed by a combining accent.
 
 ### String
 
@@ -240,6 +320,24 @@ fun main() {
 hello, world
 True
 2
+```
+
+Comparing bytes is the same as comparing scalar values, one after another, and
+nothing more. `==` does not normalize, so two strings that display the same
+can be unequal, and `<` is not alphabetical order in any language: every
+uppercase ASCII letter sorts before every lowercase one.
+
+<!-- run -->
+```kotlin
+fun main() {
+    print("\u{E9}" == "\u{65}\u{301}")
+    print("Zebra" < "apple")
+}
+```
+
+```text
+False
+True
 ```
 
 ### Unit

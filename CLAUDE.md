@@ -22,7 +22,7 @@ file are the two that belong there. If the thing you want to write is a design
 you are about to build, it is a ticket; if it is a design you have built, it is
 a comment; if it is what happened, it is the commit message.
 
-The other root documents -- `design.md`, `SPEC-DELTAS.md`, `PRIMITIVES.md`,
+The other root documents -- `design.md`, `SPEC-DELTAS.md`,
 `plan.txt`, `FINDINGS.md`, the backend and library designs -- are being retired
 into those six places (TIX-97). Until they are gone: do not add to them, and do
 not trust a claim in one without checking it against the code. Several have

@@ -124,8 +124,9 @@ fences and shell commands in `sh` fences; the test ignores both.
 
 **What goes in.** Only what the compiler accepts today. The reference does not
 mention planned features, reserved syntax, or open proposals; those belong in
-`PROPOSALS.md` and `SPEC-DELTAS.md`. When the language changes, change this
-reference in the same commit.
+tix tickets, and so does a proposal that was rejected, closed with the reason.
+When the language changes, change this reference in the same commit, and say
+why in the commit message.
 
 **Why it is shaped this way.** These are the references this one borrows
 from, and the one that chose differently.

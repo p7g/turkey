@@ -53,10 +53,6 @@ fi
 
 sh scripts/build.sh --out "$OUT" --fixpoint "$@"
 
-# The committed compiler's output is the whole program, so there is no C
-# runtime to keep beside it.
-rm -rf "$BOOTSTRAP/runtime"
-
 cat > "$OUT/PROVENANCE" <<EOF
 commit: $(git rev-parse HEAD)
 date: $(date -u +%Y-%m-%d)

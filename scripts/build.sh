@@ -34,10 +34,6 @@
 # with everything else -- so a stage is linked from its assembly alone, against
 # nothing but the C library.
 #
-# A committed compiler from before that was true comes with the C runtime it
-# was emitted against, in bootstrap/runtime, and stage1 is linked with it when
-# it is there.
-#
 # Measured on arm64 macOS, Apple clang 17: 128 s for stage2, 376 s with
 # --fixpoint, of which each self-compile is about 105 s and each link 10 s.
 #
@@ -153,14 +149,10 @@ emit() {
     mv "$2.tmp" "$2"
 }
 
-# $1's assembly into the executable $2, with any objects after it.
 link() {
-    assembly=$1
-    executable=$2
-    shift 2
-    step "link $(basename "$executable")"
-    $CC -o "$executable.tmp" "$assembly" "$@" $LIBS
-    mv "$executable.tmp" "$executable"
+    step "link $(basename "$2")"
+    $CC -o "$2.tmp" "$1" $LIBS
+    mv "$2.tmp" "$2"
 }
 
 if [ -n "$stage1" ]; then
@@ -182,14 +174,7 @@ else
         echo "build.sh: $ARTIFACT decompresses to the wrong bytes" >&2
         exit 1
     fi
-    if [ -f "$BOOTSTRAP/runtime/turkey_runtime.c" ]; then
-        step "bootstrap runtime"
-        $CC -std=c11 -O1 -c -o "$out/runtime0.o" \
-            "$BOOTSTRAP/runtime/turkey_runtime.c"
-        link "$out/stage1.s" "$out/stage1" "$out/runtime0.o"
-    else
-        link "$out/stage1.s" "$out/stage1"
-    fi
+    link "$out/stage1.s" "$out/stage1"
     rm "$out/stage1.s"
 fi
 

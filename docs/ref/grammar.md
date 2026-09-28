@@ -40,7 +40,7 @@ export      ::= IDENT
 top-level   ::= import | type-decl | class-decl | instance-decl
               | fun-decl | let-decl | var-decl | foreign-decl
 import      ::= "import" modname ("as" CONID)? import-list?
-import-list ::= "(" item ("," item)* ")"
+import-list ::= "(" (item ("," item)*)? ")"
               | "hiding" "(" item ("," item)* ")"
 item        ::= IDENT | CONID | CONID "(" ".." ")" | CONID "(" CONID ("," CONID)* ")"
 ```

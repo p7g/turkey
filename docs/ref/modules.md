@@ -123,7 +123,7 @@ to make `Array.push`, `Int.parse` and the like available everywhere
 
 ```ebnf
 import ::= "import" modname ("as" CONID)? import-list?
-import-list ::= "(" item ("," item)* ")"
+import-list ::= "(" (item ("," item)*)? ")"
               | "hiding" "(" item ("," item)* ")"
 item   ::= IDENT | CONID | CONID "(" ".." ")"
 ```
@@ -135,6 +135,7 @@ item   ::= IDENT | CONID | CONID "(" ".." ")"
 | `import Geometry hiding (area)` | every export except the listed ones |
 | `import Geometry as G` | every export, qualified only: `G.area`, not `area` |
 | `import Geometry as G (area)` | only the listed names, qualified only |
+| `import Geometry ()` | nothing; the module is still loaded, and its instances with it |
 
 <!-- module: Temperature.gob -->
 ```kotlin
@@ -205,8 +206,22 @@ fun main() {
 ### The Prelude
 
 Every module imports the Prelude implicitly. An explicit `import Prelude ...`
-replaces the implicit import. See [The Prelude](builtins.md#the-prelude) for
-what it provides.
+replaces the implicit import, and `import Prelude ()` imports nothing from it
+at all. See [The Prelude](builtins.md#the-prelude) for what it provides.
+
+<!-- run -->
+```kotlin
+import Prelude ()
+import System.IO (print)
+
+fun main() {
+    print("only print is in scope")
+}
+```
+
+```text
+only print is in scope
+```
 
 ### The Target module
 

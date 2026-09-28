@@ -277,11 +277,68 @@ type Inst = Inst { op : Arm }
 instance Ssa.Inst Inst {
     fun uses(i) = usesOf(i.op)
     fun defs(i) = defsOf(i.op)
-    -- Every machine instruction is treated as writing memory and trapping.
-    -- The optimizations run *above* this level, on the low IR, so nothing here
-    -- reads effects for anything but the register allocator's benefit -- and
-    -- a conservative answer costs it nothing.
-    fun effects(i) = Ssa.writes()
+    fun effects(i) = if computes(i.op) { Ssa.reads_() } else { Ssa.writes() }
+    fun renameUses(i, f) = Inst { op = mapUses(i.op, fun(r) = match r {
+        Virtual(n) -> reg(f(Value(n)))
+        other -> other
+    }) }
+    fun copyOf(i) = match i.op {
+        Mov(Virtual(d), Virtual(a), W64) -> Some((Value(d), Value(a)))
+        FMov(Virtual(d), Virtual(a)) -> Some((Value(d), Value(a)))
+        _ -> None
+    }
+}
+
+-- Whether an instruction does nothing but compute its destination, so that
+-- it may be deleted when that destination is unused.
+--
+-- Everything else answers `writes`, which no pass removes or reorders: a store
+-- or a call, anything that sets the flags a later branch or `cset` reads --
+-- the flags are not a `Value`, so nothing else would keep `cmp` alive -- and
+-- anything that writes a physical register, since an argument register or a
+-- result register is read by an instruction that does not name it as a use.
+-- A load may be deleted; an address this backend loads through is never one
+-- that faults on purpose.
+fun computes(op : Arm) -> Bool = match op {
+    Mov(d, _, _) -> !isPhysical(d)
+    MovZ(d, _, _) -> !isPhysical(d)
+    MovConst(d, _) -> !isPhysical(d)
+    Add(d, _, _, _) -> !isPhysical(d)
+    AddImm(d, _, _, _) -> !isPhysical(d)
+    Sub(d, _, _, _) -> !isPhysical(d)
+    SubImm(d, _, _, _) -> !isPhysical(d)
+    Mul(d, _, _, _) -> !isPhysical(d)
+    SMulH(d, _, _) -> !isPhysical(d)
+    SDiv(d, _, _, _) -> !isPhysical(d)
+    MSub(d, _, _, _, _) -> !isPhysical(d)
+    And(d, _, _, _) -> !isPhysical(d)
+    Orr(d, _, _, _) -> !isPhysical(d)
+    Eor(d, _, _, _) -> !isPhysical(d)
+    EorImm(d, _, _, _) -> !isPhysical(d)
+    Lsl(d, _, _, _) -> !isPhysical(d)
+    Lsr(d, _, _, _) -> !isPhysical(d)
+    Asr(d, _, _, _) -> !isPhysical(d)
+    CSet(d, _) -> !isPhysical(d)
+    Sxtw(d, _) -> !isPhysical(d)
+    Uxtb(d, _) -> !isPhysical(d)
+    Uxth(d, _) -> !isPhysical(d)
+    Ubfx(d, _, _, _) -> !isPhysical(d)
+    Ldr(d, _, _) -> !isPhysical(d)
+    Ldrb(d, _) -> !isPhysical(d)
+    Ldrsw(d, _) -> !isPhysical(d)
+    Adrp(d, _) -> !isPhysical(d)
+    AddLo(d, _, _) -> !isPhysical(d)
+    FMov(d, _) -> !isPhysical(d)
+    FMovIn(d, _) -> !isPhysical(d)
+    FMovOut(d, _) -> !isPhysical(d)
+    FAdd(d, _, _) -> !isPhysical(d)
+    FSub(d, _, _) -> !isPhysical(d)
+    FMul(d, _, _) -> !isPhysical(d)
+    FDiv(d, _, _) -> !isPhysical(d)
+    FNeg(d, _) -> !isPhysical(d)
+    Scvtf(d, _) -> !isPhysical(d)
+    Fcvtzs(d, _) -> !isPhysical(d)
+    _ -> False
 }
 
 -- Whether this instruction is a call, which for the allocator means two

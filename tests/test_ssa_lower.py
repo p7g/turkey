@@ -17,7 +17,7 @@ from pathlib import Path
 
 import pytest
 
-from tests import bootc
+from tests import bootc, lang
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BOOT_MAIN = REPO_ROOT / "src" / "Main.gob"
@@ -238,9 +238,20 @@ def test_a_lambda_becomes_a_lifted_function_and_a_closure():
 
 
 def test_a_function_value_uses_its_own_environment_first_signature():
-    out = _ssa("generalization.gob")
-    assert "%closure" not in out
-    assert "closure.new @Main#identity" in out
+    # Kept in an array so that the closure is used: an unused one is dead code
+    # and the low IR no longer builds it.
+    src = """
+    fun twice(x : Int) -> Int = x * 2
+
+    fun main() {
+        let fs = [twice]
+        print(fs[0](21))
+    }
+    """
+    result = lang.dump("ssa", src)
+    assert result.code == 0, result.stderr
+    assert "%closure" not in result.stdout
+    assert "closure.new @Main#twice" in result.stdout
 
 
 def test_the_calling_conventions_are_not_confused():

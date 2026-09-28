@@ -215,8 +215,9 @@ def test_parameters_are_moved_out_of_the_argument_registers():
     text = _asm("stackargs.gob")
     head, body = _function(text, "Main#mixed")
     assert head.startswith("fun @Main#mixed() ->"), head
-    # The environment, then `n`, then the first double -- in their own files.
-    assert "mov %0, x0" in body and "mov %1, x1" in body, body
+    # `n`, then the first double -- in their own files. The environment
+    # arrives in `x0` too, and nothing reads it, so its move is dead code.
+    assert "mov %0, x0" not in body and "mov %1, x1" in body, body
     assert "fmov %2, d0" in body and "mov %3, x2" in body, body
     assert any("[incoming 0]" in line for line in body), body[:20]
 

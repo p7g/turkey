@@ -47,7 +47,7 @@ def compile_source(entry, env, command):
 @pytest.mark.parametrize("backend", toolchain.BACKENDS)
 def test_globals_precede_every_managed_allocation(modules, tmp_path, backend):
     entry, env = modules(
-        'import Unsafe.Libc as C\n'
+        'import Turkey.Libc as C\n'
         'foreign "probe_step" fun step(Int) -> Int\n'
         'let answer : Int = D.base + step(2)\n'
         'var state : Prim.Ptr = C.malloc(8)\n'

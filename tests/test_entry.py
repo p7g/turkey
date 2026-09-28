@@ -79,7 +79,7 @@ def test_a_boot_binary_is_handed_its_arguments_and_exits_with_its_status(
 
 
 FAULT = """\
-import Unsafe.Ptr as Ptr
+import Turkey.Ptr as Ptr
 
 fun deeper(n : Int) -> Int {
     if n == 0 {

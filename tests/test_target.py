@@ -93,7 +93,7 @@ def test_a_target_match_is_decided_before_lowering() -> None:
 # compiler lists, so this one is written into `lib/` for the test's duration
 # and named through `TURKEY_TEST_FOREIGN`.
 ERRNO = """\
-module Unsafe.Probe (found)
+module PROBE (found)
 
 import Target (OS(..))
 import Target as Target
@@ -118,7 +118,7 @@ def errno(request: pytest.FixtureRequest,
     is named for the test so that parallel tests do not share it."""
     stem = "Probe_" + re.sub(r"[^A-Za-z0-9_]", "_", request.node.name)[:60]
     path = lang.LIB / f"{stem}.gob"
-    path.write_text(ERRNO.replace("Unsafe.Probe", stem), encoding="utf-8")
+    path.write_text(ERRNO.replace("PROBE", stem), encoding="utf-8")
     monkeypatch.setenv("TURKEY_TEST_FOREIGN", stem)
     try:
         yield lang.program(f"import {stem} as Errno\n\n"

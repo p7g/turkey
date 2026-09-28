@@ -113,7 +113,7 @@ def test_the_code_the_collector_will_be_written_in_is_accepted(lowered):
     code, _, stderr = lowered(
         "import Std.Classes\n"
         "import Data.Bool.Type (Bool(..))\n"
-        "import Unsafe.Ptr as Ptr\n"
+        "import Turkey.Ptr as Ptr\n"
         "import Turkey.Process as Rt\n"
         "fun g(p : Ptr.Ptr, q : Ptr.Ptr, n : Int) -> Bool {\n"
         "    var i = 0\n"

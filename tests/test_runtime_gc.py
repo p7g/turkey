@@ -82,6 +82,17 @@ def region_probe(tmp_path_factory, allocator_object):
     source.write_text(r'''
 #include "turkey_runtime.c"
 #include <assert.h>
+
+/* The shadow-stack frame `turkey_root_enter` fills in: the previous frame,
+   the function's name, the slot count, the slots, and which of the first 64
+   are live. */
+typedef struct RootFrame {
+    struct RootFrame *previous;
+    const char *function_name;
+    int64_t count;
+    void **values;
+    int64_t live;
+} RootFrame;
 int main(void) {
     turkey_giblets_initialize();
     RootFrame frame;
@@ -124,7 +135,7 @@ int main(void) {
         for (int i = 0; i < 2000; i++) turkey_string_new(bytes, 31);
         turkey_collect();
         assert(turkey_heap_objects() == 1);
-        assert(turkey_heap_region_bytes() == REGION_BYTES);
+        assert(turkey_heap_region_bytes() == 65536);
         assert(((unsigned char *)((TurkeyObject *)held[0])->slots)[30] == 'q');
     }
     turkey_root_leave(&frame);
@@ -174,6 +185,17 @@ def code_probe(tmp_path_factory, allocator_object):
     source.write_text(r'''
 #include "turkey_runtime.c"
 #include <assert.h>
+
+/* The shadow-stack frame `turkey_root_enter` fills in: the previous frame,
+   the function's name, the slot count, the slots, and which of the first 64
+   are live. */
+typedef struct RootFrame {
+    struct RootFrame *previous;
+    const char *function_name;
+    int64_t count;
+    void **values;
+    int64_t live;
+} RootFrame;
 
 /* Whether a string referenced only from `holder` survives a collection. */
 static int survives(void *holder, void *s) {

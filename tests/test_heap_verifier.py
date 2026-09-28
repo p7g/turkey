@@ -20,19 +20,58 @@ def verifier_probe(tmp_path_factory, allocator_object):
     directory = tmp_path_factory.mktemp("heap-verifier")
     source = directory / "probe.c"
     source.write_text(r'''
-#include "turkey_runtime.c"
+#include "turkey_runtime.h"
 #include <assert.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* The heap's format, as the probe corrupts it: a copy of its own, so that the
+   fault injected is the one named here whatever the collector or the verifier
+   believes. */
+typedef struct Header { void *next; uint64_t size; uint32_t kind, marked; } Header;
+typedef struct Region {
+    struct Region *next, *available_next;
+    uint64_t slot_size, reserved;
+    uint32_t capacity, used, live, search_word, size_class;
+    uint64_t allocated[32], marked_slots[32];
+    unsigned char data[];
+} Region;
+typedef struct Frame {
+    struct Frame *previous;
+    const char *function_name;
+    int64_t count;
+    void **values;
+    int64_t live;
+} Frame;
+typedef struct Object {
+    int32_t kind, tag;
+    int64_t count;
+    uint64_t pointer_bitmap;
+    uint64_t slots[];
+} Object;
+typedef struct Entry { uintptr_t retaddr; int64_t count; const int64_t *offsets; } Entry;
+_Static_assert(sizeof(Header) == 24, "header");
+_Static_assert(offsetof(Region, marked_slots) == 312, "marked slots");
+_Static_assert(offsetof(Region, data) == 568, "region data");
+
+static Region *regions(void) { return turkey_heap_regions(); }
+static Region **available(void) { return turkey_heap_available(); }
+static Region **region_table(void) { return turkey_heap_region_table(); }
+
+static Header *header_of(void *value) { return (Header *)value - 1; }
+static Region *region_of(Header *h) { return (Region *)((uintptr_t)h & ~(uintptr_t)65535); }
 
 static int64_t expected_count;
 static void check_stopped(void) {
     assert(turkey_heap_objects() == expected_count);
-    assert(turkey_has_panicked);
     puts("allocation stopped");
 }
 
 static void forget(void *value) {
-    HeapHeader *h = header_of(value);
-    HeapRegion *r = region_of(h);
+    Header *h = header_of(value);
+    Region *r = region_of(h);
     size_t i = ((unsigned char *)h - r->data) / r->slot_size;
     h->marked = 0;
     r->marked_slots[i / 64] &= ~(UINT64_C(1) << (i % 64));
@@ -42,12 +81,18 @@ static void forget(void *value) {
 /* What the collector's mark does to one object, done here instead so that
    the verifier is not checked against the collector's own tracing. */
 static void remember(void *value) {
-    HeapHeader *h = header_of(value);
-    HeapRegion *r = region_of(h);
+    Header *h = header_of(value);
+    Region *r = region_of(h);
     size_t i = ((unsigned char *)h - r->data) / r->slot_size;
     h->marked = (uint32_t)turkey_heap_mark_epoch();
     r->marked_slots[i / 64] |= UINT64_C(1) << (i % 64);
     r->live++;
+}
+
+/* The region set's hash, to put an entry out of its place. */
+static size_t region_hash(const Region *region) {
+    uint64_t h = ((uintptr_t)region / 65536) * UINT64_C(0x9E3779B97F4A7C15);
+    return (size_t)(h ^ (h >> 32)) & ((size_t)turkey_heap_region_table_capacity() - 1);
 }
 
 int main(int argc, char **argv) {
@@ -56,23 +101,23 @@ int main(int argc, char **argv) {
     turkey_giblets_initialize();
     turkey_gc_set_stress(0);
     turkey_gc_set_verify(0);
-    RootFrame frame;
+    Frame frame;
     void *held[66] = {0};
     turkey_root_enter(&frame, held, 66, "verifier probe");
     frame.live = 1;
-    TurkeyObject *child = turkey_string_new((const unsigned char *)"ok", 2);
-    TurkeyObject *parent = turkey_object_new(1, 0, 2, 7 | (6 << 3));
+    Object *child = turkey_string_new((const unsigned char *)"ok", 2);
+    Object *parent = turkey_object_new(1, 0, 2, 7 | (6 << 3));
     parent->slots[0] = (uintptr_t)child;
     parent->slots[1] = 1; /* A raw pointer must never be followed. */
     held[0] = parent;
     held[1] = (void *)1; /* Dead shadow slots must never be followed. */
     held[65] = child; /* Slots beyond the mask are always roots. */
-    assert(heap_verify(0, NULL));
+    assert(turkey_heap_check(0, NULL, turkey_heap_state()));
     int phase = 0;
     if (!strcmp(which, "valid")) {
         /* Cycles, every field code, pointer arrays, closures/environments,
            cells, scalar boxes and all array widths are independently decoded. */
-        TurkeyObject *cycle = turkey_object_new(0, 0, 8,
+        Object *cycle = turkey_object_new(0, 0, 8,
             0 | (1 << 3) | (2 << 6) | (3 << 9) | (4 << 12) | (5 << 15) | (6 << 18) | (7 << 21));
         for (int i = 0; i < 7; i++) cycle->slots[i] = 1;
         cycle->slots[7] = (uintptr_t)cycle;
@@ -80,10 +125,10 @@ int main(int argc, char **argv) {
         held[3] = turkey_array_new(3, (uintptr_t)child, 8, 7);
         held[4] = turkey_cell_new((uintptr_t)child, 1);
         held[5] = turkey_closure_shell(123);
-        TurkeyObject *env = turkey_object_new(4, 0, 2, 1);
+        Object *env = turkey_object_new(4, 0, 2, 1);
         env->slots[0] = (uintptr_t)child;
         env->slots[1] = 1;
-        ((TurkeyObject *)held[5])->slots[1] = (uintptr_t)env;
+        ((Object *)held[5])->slots[1] = (uintptr_t)env;
         held[6] = turkey_box(123, 4);
         held[7] = turkey_array_new(8, 1, 1, 2);
         held[8] = turkey_array_new(8, 1, 4, 3);
@@ -113,7 +158,7 @@ int main(int argc, char **argv) {
         remember(child);
         phase = 1;
     }
-    HeapRegion *r = region_of(header_of(parent));
+    Region *r = region_of(header_of(parent));
     if (!strcmp(which, "mark-child")) { forget(child); held[65] = NULL; }
     else if (!strcmp(which, "mark-root")) forget(parent);
     else if (!strcmp(which, "mark-high-root")) {
@@ -122,24 +167,31 @@ int main(int argc, char **argv) {
     else if (!strcmp(which, "mark-header")) header_of(parent)->marked = 0;
     else if (!strcmp(which, "mark-free")) r->marked_slots[0] |= UINT64_C(1) << 2;
     else if (!strcmp(which, "mark-count")) r->live++;
-    else if (!strcmp(which, "size")) header_of(parent)->size = SIZE_MAX;
+    else if (!strcmp(which, "size")) header_of(parent)->size = UINT64_MAX;
     else if (!strcmp(which, "short-header")) header_of(parent)->size = 8;
     else if (!strcmp(which, "heap-kind")) header_of(parent)->kind = 99;
     else if (!strcmp(which, "kind")) parent->kind = 99;
+    else if (!strcmp(which, "negative-kind")) parent->kind = -1;
     else if (!strcmp(which, "negative-count")) parent->count = -1;
     else if (!strcmp(which, "huge-count")) parent->count = INT64_MAX;
     else if (!strcmp(which, "payload")) parent->count = 1;
     else if (!strcmp(which, "array-width")) child->pointer_bitmap = 3;
     else if (!strcmp(which, "array-pointer-width")) child->tag = 7;
     else if (!strcmp(which, "array-tag")) child->tag = 99;
+    else if (!strcmp(which, "negative-array-tag")) child->tag = -1;
     else if (!strcmp(which, "cell-size")) { held[2] = turkey_cell_new(0, 0); header_of(held[2])->size = 1; }
     else if (!strcmp(which, "interior")) parent->slots[0]++;
     else if (!strcmp(which, "foreign")) parent->slots[0] = 1;
+    else if (!strcmp(which, "high-address")) parent->slots[0] = UINT64_C(0xfffffffffffffff8);
+    else if (!strcmp(which, "past-region")) parent->slots[0] = (uintptr_t)r + (1 << 20);
     else if (!strcmp(which, "root")) held[0] = (void *)1;
     else if (!strcmp(which, "high-root")) held[65] = (void *)1;
     else if (!strcmp(which, "root-cycle")) frame.previous = &frame;
-    else if (!strcmp(which, "region-cycle")) turkey_heap_regions()->next = turkey_heap_regions();
+    else if (!strcmp(which, "root-frame")) frame.count = -1;
+    else if (!strcmp(which, "region-cycle")) regions()->next = regions();
     else if (!strcmp(which, "region-size")) r->slot_size = 0;
+    else if (!strcmp(which, "region-huge-slot")) r->slot_size = UINT64_MAX;
+    else if (!strcmp(which, "region-reserved")) r->reserved = UINT64_MAX & ~(uint64_t)65535;
     else if (!strcmp(which, "region-capacity")) r->capacity = UINT32_MAX;
     else if (!strcmp(which, "region-count")) r->used++;
     else if (!strcmp(which, "region-class")) r->size_class = 0;
@@ -148,17 +200,17 @@ int main(int argc, char **argv) {
     else if (!strcmp(which, "heap-bytes"))
         turkey_heap_set_region_bytes(turkey_heap_region_bytes() + 1);
     else if (!strcmp(which, "bitmap")) r->allocated[31] |= UINT64_C(1) << 63;
-    else if (!strcmp(which, "available")) turkey_heap_available()[r->size_class] = NULL;
+    else if (!strcmp(which, "available")) available()[r->size_class] = NULL;
     else if (!strcmp(which, "available-cycle")) r->available_next = r;
-    else if (!strcmp(which, "available-foreign")) turkey_heap_available()[0] = (void *)1;
+    else if (!strcmp(which, "available-foreign")) available()[0] = (void *)1;
     else if (!strcmp(which, "region-table-missing")) {
-        HeapRegion **table = turkey_heap_region_table();
+        Region **table = region_table();
         for (int64_t i = 0; i < turkey_heap_region_table_capacity(); i++)
             if (table[i] == r) table[i] = NULL;
     }
     else if (!strcmp(which, "region-table-probe")) {
         /* Moved one slot past its home with the home left empty. */
-        HeapRegion **table = turkey_heap_region_table();
+        Region **table = region_table();
         size_t mask = (size_t)turkey_heap_region_table_capacity() - 1;
         size_t home = region_hash(r);
         table[home] = NULL;
@@ -166,7 +218,7 @@ int main(int argc, char **argv) {
     }
     else if (!strcmp(which, "sweep-survivor")) {
         forget(parent);
-        for (HeapRegion *s = turkey_heap_regions(); s; s = s->next) {
+        for (Region *s = regions(); s; s = s->next) {
             memset(s->marked_slots, 0, sizeof s->marked_slots); s->live = 0;
         }
         phase = 2;
@@ -190,30 +242,33 @@ int main(int argc, char **argv) {
         stack[0] = (uintptr_t)&stack[8]; stack[1] = 1234;
         stack[6] = (uintptr_t)child;
         int64_t offset = -16;
-        FrameEntry entry = {1234, 1, &offset};
-        HeapRegion *list[8]; size_t n = 0;
-        for (HeapRegion *s = turkey_heap_regions(); s; s = s->next) list[n++] = s;
-        qsort(list, n, sizeof(*list), heap_check_order);
-        HeapCheck check = {.regions = list, .count = n, .phase = 0,
-                           .epoch = (uint32_t)turkey_heap_mark_epoch(),
-                           .entries = &entry, .entry_count = 1};
+        Entry entry = {1234, 1, &offset};
+        /* The collector's state with this frame table and stack in it: the
+           frame table, its length, the mark epoch and the stack's top. */
+        int64_t state[12];
+        memcpy(state, turkey_heap_state(), sizeof state);
+        state[8] = (int64_t)(uintptr_t)&entry;
+        state[9] = 1;
+        state[10] = (int64_t)(uintptr_t)&stack[15];
+        int64_t native_phase = 0;
         if (!strcmp(which, "native-invalid")) stack[6] = 1;
         if (!strcmp(which, "native-offset")) offset = INT64_MIN;
-        if (!strcmp(which, "native-table")) check.entries = NULL;
-        if (!strcmp(which, "native-unmarked")) { check.phase = 1; check.epoch = 1; }
-        int ok = heap_check_native(&check, (uintptr_t)stack, (uintptr_t)&stack[15]);
+        if (!strcmp(which, "native-table")) state[8] = 0;
+        if (!strcmp(which, "native-unmarked")) { native_phase = 1; state[7] = 1; }
+        int64_t ok = turkey_heap_check_frames(native_phase, (uintptr_t)stack, state);
         if (!strcmp(which, "native-valid")) { assert(ok); puts("valid"); return 0; }
-        assert(!ok); puts(panic_buffer); return 0;
+        assert(!ok); puts(turkey_heap_check_message()); return 0;
     }
-    assert(!heap_verify(phase, NULL));
-    assert(turkey_has_panicked);
-    puts(panic_buffer);
+    int64_t ok = turkey_heap_check(phase, NULL, turkey_heap_state());
+    assert(!ok);
+    puts(turkey_heap_check_message());
     return 0;
 }
 ''')
     binary = directory / "probe"
     subprocess.run([*toolchain.cc(), "-std=c11", "-O1", "-fsanitize=undefined",
-                    "-I", str(root / "runtime"), str(source), str(allocator_object),
+                    "-I", str(root / "runtime"), str(source),
+                    str(root / "runtime" / "turkey_runtime.c"), str(allocator_object),
                     "-lm", "-pthread", "-o", str(binary)],
                    check=True, capture_output=True, text=True)
     return binary
@@ -230,20 +285,27 @@ CASES = {
     "short-header": "invalid heap header",
     "heap-kind": "invalid heap header",
     "kind": "invalid object header",
+    "negative-kind": "invalid object header",
     "negative-count": "invalid object header",
     "huge-count": "invalid object count",
     "payload": "payload size disagrees",
     "array-width": "invalid array layout",
     "array-pointer-width": "invalid array layout",
     "array-tag": "invalid array layout",
+    "negative-array-tag": "invalid array layout",
     "cell-size": "invalid cell size",
     "interior": "invalid traced pointer",
     "foreign": "invalid traced pointer",
+    "high-address": "invalid traced pointer",
+    "past-region": "invalid traced pointer",
     "root": "invalid traced pointer",
     "high-root": "invalid traced pointer",
     "root-cycle": "cyclic root chain",
+    "root-frame": "invalid root frame",
     "region-cycle": "cyclic region chain",
     "region-size": "invalid region geometry",
+    "region-huge-slot": "invalid region geometry",
+    "region-reserved": "invalid region geometry",
     "region-capacity": "invalid region geometry",
     "region-count": "region counts disagree",
     "region-class": "invalid region size class",

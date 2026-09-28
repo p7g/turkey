@@ -15,9 +15,10 @@ module Turkey.Heap (
 -- uses the program's Turkey code without running the program -- the runtime's
 -- own tests -- calls `turkey_giblets_initialize` first, for the same reason.
 --
--- The heap verifier in `runtime/turkey_runtime.c` reads this state through the
--- accessors at the end of this file and decodes it by its own copy of the
--- layouts below, so that a collector bug is not checked by the same bug.
+-- The heap verifier, `Turkey.HeapCheck`, is handed a snapshot of this state
+-- and decodes it by its own copy of the layouts below, so that a collector bug
+-- is not checked by the same bug. It cannot import this module, since this one
+-- imports it, and nothing here may move into it for this module to share.
 --
 -- A trap throughout: when a call is inlined, a caller's `var` that shares its
 -- name with one of the callee's parameters or locals is given a heap cell,
@@ -30,13 +31,14 @@ import Data.Int ()
 import Data.Bool.Type (Bool(..))
 import Target (OS(..))
 import Target as Target
+import Turkey.HeapCheck as Check
 import Turkey.Memory as Memory
 import Unsafe.Libc as Libc
 import Unsafe.Runtime as Rt
 
 -- -- layouts ----------------------------------------------------------------------------
 --
--- Shared with the verifier's C structs and, for the root frame, with both
+-- Copied by `Turkey.HeapCheck` and, for the root frame, shared with both
 -- backends' generated code: `Turkey.Llvm` builds one per function and
 -- `Turkey.Emit` one for the globals. A change here is a change there.
 
@@ -776,7 +778,7 @@ fun notHeapPointer(value : Prim.Ptr, what : Prim.Ptr, index : Int) -> Unit {
 foreign "turkey_collect" fun collect() -> Unit = collectFrom(Prim.ptrNull())
 
 fun collectFrom(frame : Prim.Ptr) -> Unit {
-    if verify { Rt.heapVerify(0, frame) }
+    if verify { verifyAt(0, frame) }
     let liveBefore = heapCount
     -- Read before the sweep clears it: the allocation pressure this
     -- collection is responding to.
@@ -802,9 +804,9 @@ fun collectFrom(frame : Prim.Ptr) -> Unit {
     -- here and everything else's are above.
     scanNativeFrames(frame)
     if panicPending() { return {} }
-    if verify { Rt.heapVerify(1, frame) }
+    if verify { verifyAt(1, frame) }
     sweep()
-    if verify { Rt.heapVerify(2, frame) }
+    if verify { verifyAt(2, frame) }
     allocationsSince = 0
     let floor = if heapCount > 1024 { heapCount } else { 1024 }
     let next = Prim.floatMul(Prim.intToFloat(floor), thresholdScale)
@@ -1141,13 +1143,40 @@ fun skipSpace(s : Prim.Ptr, from : Int) -> Int {
 -- C's `isspace`: space, and tab through carriage return.
 fun isSpace(c : Int) -> Bool = c == 32 || (c >= 9 && c <= 13)
 
+-- -- for the verifier -------------------------------------------------------------------
+
+-- The state `Turkey.HeapCheck` is handed, at the offsets it names. Rewritten
+-- before each check, so it is never stale. Null if there was no memory for it,
+-- which the verifier reports.
+var state : Prim.Ptr = Libc.malloc(Check.stateBytes)
+
+fun snapshot() -> Prim.Ptr {
+    if Prim.ptrIsNull(state) { return state }
+    Prim.storePtr(state, Check.stateRegions, regions)
+    Prim.storePtr(state, Check.stateAvailable, available)
+    Prim.storePtr(state, Check.stateRegionTable, regionTable)
+    Prim.storeI64(state, Check.stateRegionTableCapacity, regionTableCapacity)
+    Prim.storeI64(state, Check.stateRegionTableCount, regionTableCount)
+    Prim.storeI64(state, Check.stateRegionBytes, regionBytesInUse)
+    Prim.storeI64(state, Check.stateObjects, heapCount)
+    Prim.storeI64(state, Check.stateMarkEpoch, markEpoch)
+    Prim.storePtr(state, Check.stateFrameEntries, frameEntries)
+    Prim.storeI64(state, Check.stateFrameEntryCount, frameEntryCount)
+    Prim.storePtr(state, Check.stateEntryStackHigh, entryStackHigh)
+    Prim.storePtr(state, Check.stateRoots, roots)
+    state
+}
+
+fun verifyAt(phase : Int, frame : Prim.Ptr) -> Unit = Check.verify(phase, frame, snapshot())
+
 -- -- for C ------------------------------------------------------------------------------
 --
--- What the runtime's C reads of this state: the heap verifier, which decodes
--- it by its own copy of the layouts, and the runtime's tests. These return
--- state and change settings; none of them traces, marks or looks anything up
--- on the collector's behalf, because the verifier's worth is that it does
--- those its own way.
+-- What the runtime's C tests read of this state, and the settings they change.
+-- None of these traces, marks or looks anything up on the collector's behalf
+-- for the verifier, whose worth is that it does those its own way.
+
+-- The verifier's snapshot, for the tests that call it directly.
+foreign "turkey_heap_state" fun heapState() -> Prim.Ptr = snapshot()
 
 foreign "turkey_heap_objects" fun heapObjects() -> Int = heapCount
 
@@ -1173,16 +1202,7 @@ foreign "turkey_heap_region_table" fun heapRegionTable() -> Prim.Ptr = regionTab
 foreign "turkey_heap_region_table_capacity" fun heapRegionTableCapacity() -> Int =
     regionTableCapacity
 
-foreign "turkey_heap_region_table_count" fun heapRegionTableCount() -> Int =
-    regionTableCount
-
 foreign "turkey_heap_mark_epoch" fun heapMarkEpoch() -> Int = markEpoch
-
-foreign "turkey_heap_frame_entries" fun heapFrameEntries() -> Prim.Ptr = frameEntries
-
-foreign "turkey_heap_frame_entry_count" fun heapFrameEntryCount() -> Int = frameEntryCount
-
-foreign "turkey_heap_entry_stack_high" fun heapEntryStackHigh() -> Prim.Ptr = entryStackHigh
 
 -- Whether `value` is a live object, for the tests' questions about reuse and
 -- reclamation.

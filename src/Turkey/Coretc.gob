@@ -1,5 +1,5 @@
 module Turkey.Coretc (
-    CEnv(..), newCEnv, childCEnv, defineC, lookupC, globalsOf,
+    CEnv(..), newCEnv, defineC, lookupC, globalsOf,
     Checker(..), newChecker, checkProgram, compatible, famsOf,
 )
 
@@ -75,31 +75,48 @@ let superPrefix = "%super."
 -- One shape for all three binders -- top-level, `let`, `letrec` -- because a
 -- type application has to find its binders the same way whichever bound the
 -- name, and because the only alternative is a second agreement to keep.
+--
+-- One map for every scope, with an undo log, rather than a map per scope
+-- chained to its parent: a lookup is then one hash however deeply it is
+-- nested, and entering a scope allocates nothing. The checker's scopes nest
+-- exactly as its recursion does, so a scope is left by rolling the log back to
+-- the mark `enter` returned, and every rule that enters one leaves it before it
+-- checks anything outside it.
+--
+-- A name a scope introduced is rolled back to `None` rather than deleted, which
+-- is why an entry is optional: overwriting never leaves a tombstone, and a
+-- table that only grows by the distinct names of the program is the smaller
+-- cost.
 type CEnv = CEnv {
-    names  : Map String (Array VarCell, Ty.Type),
-    parent : Option CEnv,
+    names : Map String (Option (Array VarCell, Ty.Type)),
+    -- Each definition made inside a scope, with what the name meant before.
+    undo  : Array (String, Option (Array VarCell, Ty.Type)),
 }
 
-fun newCEnv() -> CEnv = CEnv { names = Map.new(), parent = None }
-
-fun childCEnv(e : CEnv) -> CEnv = CEnv { names = Map.new(), parent = Some(e) }
+fun newCEnv() -> CEnv = CEnv { names = Map.new(), undo = [] }
 
 fun defineC(e : CEnv, name : String, binders : Array VarCell,
-            ty : Ty.Type) -> Unit = Map.put(e.names, name, (binders, ty))
+            ty : Ty.Type) -> Unit {
+    Array.push(e.undo, (name, lookupC(e, name)))
+    Map.put(e.names, name, Some((binders, ty)))
+}
 
-fun lookupC(e : CEnv, name : String) -> Option (Array VarCell, Ty.Type) {
-    var here = e
-    var going = True
-    while going {
-        match Map.get(here.names, name) {
-            Some(found) -> return Some(found)
-            None -> match here.parent {
-                Some(up) -> { here = up }
-                None -> { going = False }
-            }
+fun lookupC(e : CEnv, name : String) -> Option (Array VarCell, Ty.Type) =
+    match Map.get(e.names, name) {
+        Some(found) -> found
+        None -> None
+    }
+
+-- The mark a scope is left by.
+fun enter(e : CEnv) -> Int = len(e.undo)
+
+fun leave(e : CEnv, mark : Int) -> Unit {
+    while len(e.undo) > mark {
+        match Array.pop(e.undo) {
+            Some((name, before)) -> Map.put(e.names, name, before)
+            None -> ()
         }
     }
-    None
 }
 
 -- The Core environment a solver environment implies.
@@ -143,6 +160,12 @@ type Checker = Checker {
     -- rule an empty one unless the rule asked otherwise -- so tail position is
     -- what a rule opts *into*, and forgetting is safe.
     joins     : Map String (Array CParam, Ty.Type),
+    -- The empty scope, shared by every node out of tail position, which is
+    -- nearly every node. Never written: a scope is extended by copying.
+    noJoins   : Map String (Array CParam, Ty.Type),
+    -- `equations` and the instance table as a reducer, built when `equations`
+    -- changes rather than on every reduction.
+    fams      : Ty.Families,
     -- The equalities the binding being checked states. Consulted before the
     -- instance table, exactly as the solver consults its assumptions first and
     -- for the same reason: a family over a rigid variable will never reduce
@@ -152,8 +175,8 @@ type Checker = Checker {
 }
 
 fun newChecker(decls : DeclTable, classes : ClassTable) -> Checker = Checker {
-    decls = decls, classes = classes, joins = Map.new(),
-    equations = Array.new(2),
+    decls = decls, classes = classes, joins = Map.new(), noJoins = Map.new(),
+    fams = famsOf(classes, []), equations = [],
 }
 
 fun checkProgram(decls : DeclTable, classes : ClassTable, prog : CProgram,
@@ -170,7 +193,9 @@ fun checkProgram(decls : DeclTable, classes : ClassTable, prog : CProgram,
 fun checkBind(ck : Checker, b : CBind, env : CEnv) -> Unit {
     let want = if b.mutable && isRef(b.ty) { refElem(b.ty) } else { b.ty }
     let saved = ck.equations
+    let savedFams = ck.fams
     ck.equations = Array.append(saved, b.equations)
+    ck.fams = famsOf(ck.classes, ck.equations)
     var got = check(ck, b.value, env, None)
     if b.mutable && isRef(b.ty) {
         got = if isRef(got) { refElem(got) } else { got }
@@ -180,8 +205,11 @@ fun checkBind(ck : Checker, b : CBind, env : CEnv) -> Unit {
     -- `Elem a ~ Int` in scope hands back `Int` -- and comparing that against an
     -- unreduced `Elem a` outside the scope asks the two sides to agree on a
     -- rewrite only one of them was allowed to make.
-    expect(ck, want, got, b.span, "the binding '" + b.name + "'")
+    if !agrees(ck, want, got) {
+        mismatch(ck, want, got, b.span, "the binding '" + b.name + "'")
+    }
     ck.equations = saved
+    ck.fams = savedFams
 }
 
 -- -- expressions --------------------------------------------------------------------
@@ -197,12 +225,12 @@ fun check(ck : Checker, e : Core, env : CEnv,
     let outer = ck.joins
     ck.joins = match joins {
         Some(j) -> j
-        None -> Map.new()
+        None -> ck.noJoins
     }
     let got = rule(ck, e, env)
     ck.joins = outer
-    expect(ck, e.ty, got, e.span, describe(e))
-    -- The *derived* type, not the claimed one. They agree or `expect` has
+    if !agrees(ck, e.ty, got) { mismatch(ck, e.ty, got, e.span, describe(e)) }
+    -- The *derived* type, not the claimed one. They agree or `mismatch` has
     -- already objected -- but "agree" is deliberately slack about variables, so
     -- a node claiming a bare variable would otherwise hand its parent a variable
     -- to reason from, and a parent that cannot tell what it is looking at checks
@@ -239,24 +267,32 @@ fun rule(ck : Checker, e : Core, env : CEnv) -> Ty.Type = match e.kind {
     CProject(target, index) -> checkProject(ck, e, target, index, env)
     CRecord(con, fields) -> checkRecord(ck, e, con, fields, env)
     CLam(params, body, _) -> {
-        let inner = childCEnv(env)
-        for p in params { defineC(inner, p.name, Array.new(0), p.ty) }
-        TFun(Array.map(params, _.ty), check(ck, body, inner, None))
+        let mark = enter(env)
+        for p in params { defineC(env, p.name, [], p.ty) }
+        let got = TFun(Array.map(params, _.ty), check(ck, body, env, None))
+        leave(env, mark)
+        got
     }
     CApp(fn, args) -> checkApp(ck, e, fn, args, env)
     CTyLam(_, body) -> check(ck, body, env, None)
     CLet(name, bound, value, body, binders) -> {
         let v = check(ck, value, env, None)
-        expect(ck, bound, v, e.span, "the binding '" + name + "'")
-        let inner = childCEnv(env)
-        defineC(inner, name, binders, bound)
-        check(ck, body, inner, tail(ck, e, "body"))
+        if !agrees(ck, bound, v) {
+            mismatch(ck, bound, v, e.span, "the binding '" + name + "'")
+        }
+        let mark = enter(env)
+        defineC(env, name, binders, bound)
+        let got = check(ck, body, env, tail(ck, e, "body"))
+        leave(env, mark)
+        got
     }
     CLetRec(binds, body) -> {
-        let inner = childCEnv(env)
-        for b in binds { defineC(inner, b.name, b.binders, b.ty) }
-        for b in binds { checkBind(ck, b, inner) }
-        check(ck, body, inner, tail(ck, e, "body"))
+        let mark = enter(env)
+        for b in binds { defineC(env, b.name, b.binders, b.ty) }
+        for b in binds { checkBind(ck, b, env) }
+        let got = check(ck, body, env, tail(ck, e, "body"))
+        leave(env, mark)
+        got
     }
     CRef(value) -> refOf(check(ck, value, env, None))
     CDeref(target) -> {
@@ -296,11 +332,12 @@ fun rule(ck : Checker, e : Core, env : CEnv) -> Ty.Type = match e.kind {
         let s = check(ck, scrutinee, env, None)
         var result : Option Ty.Type = None
         for alt in alts {
-            let inner = childCEnv(env)
+            let mark = enter(env)
             for (name, ty) in Map.entries(pattern(ck, alt.pat, s, e.span)) {
-                defineC(inner, name, Array.new(0), ty)
+                defineC(env, name, [], ty)
             }
-            let got = check(ck, alt.body, inner, joins)
+            let got = check(ck, alt.body, env, joins)
+            leave(env, mark)
             refuseEscape(alt.pat, got, e.span)
             result = match result {
                 None -> Some(got)
@@ -666,8 +703,11 @@ fun checkRecord(ck : Checker, e : Core, con : String,
             None -> fail("'" + con + "' has no field '" + name + "'", e.span)
             Some(index) -> {
                 let want = Decls.substitute(params[index], mapping)
-                expect(ck, want, check(ck, value, env, None), e.span,
-                       "field '" + name + "' of '" + con + "'")
+                let got = check(ck, value, env, None)
+                if !agrees(ck, want, got) {
+                    mismatch(ck, want, got, e.span,
+                             "field '" + name + "' of '" + con + "'")
+                }
             }
         }
     }
@@ -689,16 +729,24 @@ fun dictionary(ck : Checker, e : Core, cls : String, head : Ty.Type,
                 Some(s) -> s
                 None -> name
             }
-            expect(ck, dictType(ck, sup, head), check(ck, value, env, None),
-                   e.span, "the '" + name + "' of a '" + cls + "' dictionary")
+            let want = dictType(ck, sup, head)
+            let got = check(ck, value, env, None)
+            if !agrees(ck, want, got) {
+                mismatch(ck, want, got, e.span,
+                         "the '" + name + "' of a '" + cls + "' dictionary")
+            }
         } else {
             let m = match classMethod(info, name) {
                 Some(x) -> x
                 None -> fail("class '" + cls + "' has no method '" + name + "'",
                              e.span)
             }
-            expect(ck, methodType(ck, m, head), check(ck, value, env, None),
-                   e.span, "method '" + name + "' of '" + cls + "'")
+            let want = methodType(ck, m, head)
+            let got = check(ck, value, env, None)
+            if !agrees(ck, want, got) {
+                mismatch(ck, want, got, e.span,
+                         "method '" + name + "' of '" + cls + "'")
+            }
         }
     }
     for name in Map.keys(info.methods) {
@@ -729,8 +777,10 @@ fun checkApp(ck : Checker, e : Core, fn : Core, args : Array Core,
                      + " arguments", e.span)
             }
             for var i = 0; i < len(params); i = i + 1 {
-                expect(ck, params[i], argTys[i], e.span,
-                       "argument " + Int.toString(i + 1))
+                if !agrees(ck, params[i], argTys[i]) {
+                    mismatch(ck, params[i], argTys[i], e.span,
+                             "argument " + Int.toString(i + 1))
+                }
             }
             ret
         }
@@ -754,11 +804,14 @@ fun checkJoin(ck : Checker, e : Core, name : String, params : Array CParam,
     let innerJoins = Map.new()
     for (k, v) in Map.entries(joins) { Map.put(innerJoins, k, v) }
     Map.put(innerJoins, name, (params, e.ty))
-    let bodyEnv = childCEnv(env)
-    for p in params { defineC(bodyEnv, p.name, Array.new(0), p.ty) }
-    let bodyTy = check(ck, body, bodyEnv,
+    let mark = enter(env)
+    for p in params { defineC(env, p.name, [], p.ty) }
+    let bodyTy = check(ck, body, env,
                        if recursive { Some(innerJoins) } else { Some(joins) })
-    expect(ck, e.ty, bodyTy, e.span, "the join point '" + name + "'")
+    leave(env, mark)
+    if !agrees(ck, e.ty, bodyTy) {
+        mismatch(ck, e.ty, bodyTy, e.span, "the join point '" + name + "'")
+    }
     joinTypes(bodyTy, check(ck, rest, env, Some(innerJoins)))
 }
 
@@ -784,8 +837,10 @@ fun checkJump(ck : Checker, e : Core, name : String, args : Array Core,
              e.span)
     }
     for var i = 0; i < len(params); i = i + 1 {
-        expect(ck, params[i].ty, argTys[i], e.span,
-               "argument " + Int.toString(i + 1) + " of the jump")
+        if !agrees(ck, params[i].ty, argTys[i]) {
+            mismatch(ck, params[i].ty, argTys[i], e.span,
+                     "argument " + Int.toString(i + 1) + " of the jump")
+        }
     }
     match Ty.prune(e.ty) {
         TBottom -> {}
@@ -942,15 +997,41 @@ fun freshBinders(p : Pat) -> Map String Ty.Type {
 -- of comparing rather than something the lowering was supposed to have done.
 fun expect(ck : Checker, want : Ty.Type, got : Ty.Type, where : Option Span,
            what : String) -> Unit {
-    let w = reduce(ck, want)
-    let g = reduce(ck, got)
-    if !compatible(w, g) {
-        fail(what + " should be " + Ty.show(w) + " but is " + Ty.show(g), where)
-    }
+    if !agrees(ck, want, got) { mismatch(ck, want, got, where, what) }
 }
 
+-- `expect` in two halves, for a caller whose description has to be built: it
+-- runs once per node, and a message is only needed when one fails.
+fun agrees(ck : Checker, want : Ty.Type, got : Ty.Type) -> Bool =
+    compatible(reduce(ck, want), reduce(ck, got))
+
+fun mismatch(ck : Checker, want : Ty.Type, got : Ty.Type, where : Option Span,
+             what : String) -> a =
+    fail(what + " should be " + Ty.show(reduce(ck, want)) + " but is "
+         + Ty.show(reduce(ck, got)), where)
+
+-- A type with no family application in it is already reduced, and most are:
+-- deciding that allocates nothing, where `reduceDeep` rebuilds every node.
 fun reduce(ck : Checker, ty : Ty.Type) -> Ty.Type =
-    Typed.reduceDeep(ty, Some(famsOf(ck.classes, ck.equations)))
+    if familyFree(ty) { ty } else { Typed.reduceDeep(ty, Some(ck.fams)) }
+
+fun familyFree(ty : Ty.Type) -> Bool = match Ty.prune(ty) {
+    TFam(_, _, _) -> False
+    TApp(fn, arg, _) -> familyFree(fn) && familyFree(arg)
+    TFun(params, ret) -> {
+        for p in params {
+            if !familyFree(p) { return False }
+        }
+        familyFree(ret)
+    }
+    TTuple(elems) -> {
+        for t in elems {
+            if !familyFree(t) { return False }
+        }
+        True
+    }
+    _ -> True
+}
 
 -- The binding's equalities first, then the instances.
 --

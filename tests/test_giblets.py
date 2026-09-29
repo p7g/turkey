@@ -131,6 +131,32 @@ def test_the_code_the_collector_will_be_written_in_is_accepted(lowered):
     assert code == 0, stderr
 
 
+@pytest.mark.parametrize("helper", [
+    # The callee's parameter is spelled like the caller's `var`.
+    "fun at(p : Prim.Ptr, i : Int) -> Int = Prim.byteToInt(Prim.loadI8(p, i))\n",
+    # So is one of its locals.
+    "fun at(p : Prim.Ptr, k : Int) -> Int {\n"
+    "    let i = Prim.byteToInt(Prim.loadI8(p, k))\n"
+    "    i\n"
+    "}\n",
+])
+def test_a_var_is_not_a_cell_because_an_inlined_callee_reuses_its_name(
+        lowered, helper):
+    """Inlining binds the callee's names as `let`s in the caller. A use of
+    one is a use of that `let`, not of the caller's `var` of the same name."""
+    code, _, stderr = lowered(
+        "import Std.Classes\n"
+        + helper +
+        "fun g(s : Prim.Ptr) -> Int {\n"
+        "    var i = 0\n"
+        "    while at(s, i) == 32 { i = i + 1 }\n"
+        "    i\n"
+        "}\n"
+        "fun f(n : Int) -> Int = g(Prim.cString(\"  x\")) + n\n",
+        "fun h(n : Int) -> Int = n\n")
+    assert code == 0, stderr
+
+
 def test_a_value_of_traced_type_that_is_never_made_is_accepted(lowered):
     """What is judged is the code that runs. `OS` is laid out as a traced
     pointer, but `Target.os` is a bare constructor that the optimizer puts in

@@ -1,9 +1,9 @@
 module Turkey.Arm64 (
     Reg(..), Bank(..), reg, physical, isPhysical, bankOf, Cond(..), Width(..),
-    Mem(..), Arm(..), Inst(..), destRegs, srcRegs, mapUses, rewrite, setsFlags, isSlot, isRootSlot, slotLoad, slotStore, isCSet, redundantMove,
+    Mem(..), Arm(..), Inst(..), destRegs, srcRegs, mapUses, rewrite, setsFlags, isSlot, isRootSlot, slotLoad, slotStore, isCSet, csetOf, redundantMove,
     sameRegister, moveHint, safepointOf, memOf,
     xzr, sp, fp, lr, x0, d0, argRegs, fpArgRegs, callerSaved, calleeSaved,
-    fpCallerSaved, fpCalleeSaved, showReg, condName, isCall,
+    fpCallerSaved, fpCalleeSaved, showReg, condName, invert, isCall,
 )
 
 -- The arm64 machine instruction set.
@@ -143,7 +143,7 @@ let fpCalleeSaved = [Physical(Fp, 8), Physical(Fp, 9), Physical(Fp, 10),
 -- bits and `add x0, ...` at 64, so this is a field rather than two opcodes.
 type Width = W32 | W64
 
-type Cond = Eq | Ne | Lt | Le | Gt | Ge | Lo | Ls | Hi | Hs | Vs
+type Cond = Eq | Ne | Lt | Le | Gt | Ge | Lo | Ls | Hi | Hs | Vs | Vc
 
 -- A memory operand: a base register and an offset, scaled by the access width
 -- the way arm64's addressing modes are.
@@ -162,6 +162,12 @@ type Mem
     -- area.
     | IncomingArg(Int)
     | OutgoingArg(Int)
+    -- A symbol, as the offset within the page its base register holds: the
+    -- second half of an `adrp` pair, folded into the access so the address is
+    -- never formed on its own. The string is the dialect's spelling of the
+    -- offset (`sym@PAGEOFF`, `:lo12:sym`), and the symbol must be aligned to
+    -- the access width, as every global and the process state are.
+    | PageOffset(Reg, String)
 
 type Arm
     -- Moves and constants. `MovZ`/`MovK` build a 64-bit constant in up to four
@@ -177,6 +183,8 @@ type Arm
     | Sub(Reg, Reg, Reg, Width)
     | SubImm(Reg, Reg, Int, Width)
     | SubS(Reg, Reg, Reg, Width)
+    | AddSImm(Reg, Reg, Int, Width)
+    | SubSImm(Reg, Reg, Int, Width)
     | Mul(Reg, Reg, Reg, Width)
     -- The high half of a 64x64 multiply, which is how overflow is detected
     -- when `MulS` does not exist -- and it does not, on arm64.
@@ -187,6 +195,12 @@ type Arm
     | Orr(Reg, Reg, Reg, Width)
     | Eor(Reg, Reg, Reg, Width)
     | EorImm(Reg, Reg, Int, Width)
+    -- `and` with a logical immediate. Only a run of low ones is selected,
+    -- which every width can encode; see `Turkey.Select.lowMask`.
+    | AndImm(Reg, Reg, Int, Width)
+    | LslImm(Reg, Reg, Int, Width)
+    | LsrImm(Reg, Reg, Int, Width)
+    | AsrImm(Reg, Reg, Int, Width)
     | Lsl(Reg, Reg, Reg, Width)
     | Lsr(Reg, Reg, Reg, Width)
     | Asr(Reg, Reg, Reg, Width)
@@ -277,11 +291,72 @@ type Inst = Inst { op : Arm }
 instance Ssa.Inst Inst {
     fun uses(i) = usesOf(i.op)
     fun defs(i) = defsOf(i.op)
-    -- Every machine instruction is treated as writing memory and trapping.
-    -- The optimizations run *above* this level, on the low IR, so nothing here
-    -- reads effects for anything but the register allocator's benefit -- and
-    -- a conservative answer costs it nothing.
-    fun effects(i) = Ssa.writes()
+    fun effects(i) = if computes(i.op) { Ssa.reads_() } else { Ssa.writes() }
+    fun renameUses(i, f) = Inst { op = mapUses(i.op, fun(r) = match r {
+        Virtual(n) -> reg(f(Value(n)))
+        other -> other
+    }) }
+    fun copyOf(i) = match i.op {
+        Mov(Virtual(d), Virtual(a), W64) -> Some((Value(d), Value(a)))
+        FMov(Virtual(d), Virtual(a)) -> Some((Value(d), Value(a)))
+        _ -> None
+    }
+}
+
+-- Whether an instruction does nothing but compute its destination, so that
+-- it may be deleted when that destination is unused.
+--
+-- Everything else answers `writes`, which no pass removes or reorders: a store
+-- or a call, anything that sets the flags a later branch or `cset` reads --
+-- the flags are not a `Value`, so nothing else would keep `cmp` alive -- and
+-- anything that writes a physical register, since an argument register or a
+-- result register is read by an instruction that does not name it as a use.
+-- A load may be deleted; an address this backend loads through is never one
+-- that faults on purpose.
+fun computes(op : Arm) -> Bool = match op {
+    Mov(d, _, _) -> !isPhysical(d)
+    MovZ(d, _, _) -> !isPhysical(d)
+    MovConst(d, _) -> !isPhysical(d)
+    Add(d, _, _, _) -> !isPhysical(d)
+    AddImm(d, _, _, _) -> !isPhysical(d)
+    Sub(d, _, _, _) -> !isPhysical(d)
+    SubImm(d, _, _, _) -> !isPhysical(d)
+    Mul(d, _, _, _) -> !isPhysical(d)
+    SMulH(d, _, _) -> !isPhysical(d)
+    SDiv(d, _, _, _) -> !isPhysical(d)
+    MSub(d, _, _, _, _) -> !isPhysical(d)
+    And(d, _, _, _) -> !isPhysical(d)
+    Orr(d, _, _, _) -> !isPhysical(d)
+    Eor(d, _, _, _) -> !isPhysical(d)
+    EorImm(d, _, _, _) -> !isPhysical(d)
+    AndImm(d, _, _, _) -> !isPhysical(d)
+    LslImm(d, _, _, _) -> !isPhysical(d)
+    LsrImm(d, _, _, _) -> !isPhysical(d)
+    AsrImm(d, _, _, _) -> !isPhysical(d)
+    Lsl(d, _, _, _) -> !isPhysical(d)
+    Lsr(d, _, _, _) -> !isPhysical(d)
+    Asr(d, _, _, _) -> !isPhysical(d)
+    CSet(d, _) -> !isPhysical(d)
+    Sxtw(d, _) -> !isPhysical(d)
+    Uxtb(d, _) -> !isPhysical(d)
+    Uxth(d, _) -> !isPhysical(d)
+    Ubfx(d, _, _, _) -> !isPhysical(d)
+    Ldr(d, _, _) -> !isPhysical(d)
+    Ldrb(d, _) -> !isPhysical(d)
+    Ldrsw(d, _) -> !isPhysical(d)
+    Adrp(d, _) -> !isPhysical(d)
+    AddLo(d, _, _) -> !isPhysical(d)
+    FMov(d, _) -> !isPhysical(d)
+    FMovIn(d, _) -> !isPhysical(d)
+    FMovOut(d, _) -> !isPhysical(d)
+    FAdd(d, _, _) -> !isPhysical(d)
+    FSub(d, _, _) -> !isPhysical(d)
+    FMul(d, _, _) -> !isPhysical(d)
+    FDiv(d, _, _) -> !isPhysical(d)
+    FNeg(d, _) -> !isPhysical(d)
+    Scvtf(d, _) -> !isPhysical(d)
+    Fcvtzs(d, _) -> !isPhysical(d)
+    _ -> False
 }
 
 -- Whether this instruction is a call, which for the allocator means two
@@ -365,11 +440,19 @@ fun isCSet(op : Arm) -> Bool = match op {
     _ -> False
 }
 
+-- The value a `cset` into a virtual register defines, and its condition.
+fun csetOf(op : Arm) -> Option (Int, Cond) = match op {
+    CSet(Virtual(n), c) -> Some((n, c))
+    _ -> None
+}
+
 fun setsFlags(op : Arm) -> Bool = match op {
     Cmp(_, _, _) -> True
     CmpImm(_, _, _) -> True
     AddS(_, _, _, _) -> True
     SubS(_, _, _, _) -> True
+    AddSImm(_, _, _, _) -> True
+    SubSImm(_, _, _, _) -> True
     FCmp(_, _) -> True
     _ -> False
 }
@@ -402,6 +485,8 @@ fun srcRegs(op : Arm) -> Array Reg = match op {
     Sub(_, a, b, _)     -> [a, b]
     SubImm(_, a, _, _)  -> [a]
     SubS(_, a, b, _)    -> [a, b]
+    AddSImm(_, a, _, _) -> [a]
+    SubSImm(_, a, _, _) -> [a]
     Mul(_, a, b, _)     -> [a, b]
     SMulH(_, a, b)      -> [a, b]
     SDiv(_, a, b, _)    -> [a, b]
@@ -410,6 +495,10 @@ fun srcRegs(op : Arm) -> Array Reg = match op {
     Orr(_, a, b, _)     -> [a, b]
     Eor(_, a, b, _)     -> [a, b]
     EorImm(_, a, _, _)  -> [a]
+    AndImm(_, a, _, _)  -> [a]
+    LslImm(_, a, _, _)  -> [a]
+    LsrImm(_, a, _, _)  -> [a]
+    AsrImm(_, a, _, _)  -> [a]
     Lsl(_, a, b, _)     -> [a, b]
     Lsr(_, a, b, _)     -> [a, b]
     Asr(_, a, b, _)     -> [a, b]
@@ -471,6 +560,8 @@ fun mapUses(op : Arm, g : fun(Reg) -> Reg) -> Arm = match op {
     Sub(k0, a, b, k3)     -> Sub(k0, g(a), g(b), k3)
     SubImm(k0, a, k2, k3) -> SubImm(k0, g(a), k2, k3)
     SubS(k0, a, b, k3)    -> SubS(k0, g(a), g(b), k3)
+    AddSImm(k0, a, k2, k3) -> AddSImm(k0, g(a), k2, k3)
+    SubSImm(k0, a, k2, k3) -> SubSImm(k0, g(a), k2, k3)
     Mul(k0, a, b, k3)     -> Mul(k0, g(a), g(b), k3)
     SMulH(k0, a, b)       -> SMulH(k0, g(a), g(b))
     SDiv(k0, a, b, k3)    -> SDiv(k0, g(a), g(b), k3)
@@ -479,6 +570,10 @@ fun mapUses(op : Arm, g : fun(Reg) -> Reg) -> Arm = match op {
     Orr(k0, a, b, k3)     -> Orr(k0, g(a), g(b), k3)
     Eor(k0, a, b, k3)     -> Eor(k0, g(a), g(b), k3)
     EorImm(k0, a, k2, k3) -> EorImm(k0, g(a), k2, k3)
+    AndImm(k0, a, k2, k3) -> AndImm(k0, g(a), k2, k3)
+    LslImm(k0, a, k2, k3) -> LslImm(k0, g(a), k2, k3)
+    LsrImm(k0, a, k2, k3) -> LsrImm(k0, g(a), k2, k3)
+    AsrImm(k0, a, k2, k3) -> AsrImm(k0, g(a), k2, k3)
     Lsl(k0, a, b, k3)     -> Lsl(k0, g(a), g(b), k3)
     Lsr(k0, a, b, k3)     -> Lsr(k0, g(a), g(b), k3)
     Asr(k0, a, b, k3)     -> Asr(k0, g(a), g(b), k3)
@@ -527,6 +622,7 @@ fun mapMem(m : Mem, g : fun(Reg) -> Reg) -> Mem = match m {
     SpillSlot(n)         -> SpillSlot(n)
     IncomingArg(k)       -> IncomingArg(k)
     OutgoingArg(k)       -> OutgoingArg(k)
+    PageOffset(base, sym) -> PageOffset(g(base), sym)
 }
 
 
@@ -549,6 +645,8 @@ fun rewrite(op : Arm, g : fun(Reg) -> Reg, m : fun(Mem) -> Mem) -> Arm = match o
     Sub(f0, f1, f2, f3)      -> Sub(g(f0), g(f1), g(f2), f3)
     SubImm(f0, f1, f2, f3)   -> SubImm(g(f0), g(f1), f2, f3)
     SubS(f0, f1, f2, f3)     -> SubS(g(f0), g(f1), g(f2), f3)
+    AddSImm(f0, f1, f2, f3)  -> AddSImm(g(f0), g(f1), f2, f3)
+    SubSImm(f0, f1, f2, f3)  -> SubSImm(g(f0), g(f1), f2, f3)
     Mul(f0, f1, f2, f3)      -> Mul(g(f0), g(f1), g(f2), f3)
     SMulH(f0, f1, f2)        -> SMulH(g(f0), g(f1), g(f2))
     SDiv(f0, f1, f2, f3)     -> SDiv(g(f0), g(f1), g(f2), f3)
@@ -557,6 +655,10 @@ fun rewrite(op : Arm, g : fun(Reg) -> Reg, m : fun(Mem) -> Mem) -> Arm = match o
     Orr(f0, f1, f2, f3)      -> Orr(g(f0), g(f1), g(f2), f3)
     Eor(f0, f1, f2, f3)      -> Eor(g(f0), g(f1), g(f2), f3)
     EorImm(f0, f1, f2, f3)   -> EorImm(g(f0), g(f1), f2, f3)
+    AndImm(f0, f1, f2, f3)   -> AndImm(g(f0), g(f1), f2, f3)
+    LslImm(f0, f1, f2, f3)   -> LslImm(g(f0), g(f1), f2, f3)
+    LsrImm(f0, f1, f2, f3)   -> LsrImm(g(f0), g(f1), f2, f3)
+    AsrImm(f0, f1, f2, f3)   -> AsrImm(g(f0), g(f1), f2, f3)
     Lsl(f0, f1, f2, f3)      -> Lsl(g(f0), g(f1), g(f2), f3)
     Lsr(f0, f1, f2, f3)      -> Lsr(g(f0), g(f1), g(f2), f3)
     Asr(f0, f1, f2, f3)      -> Asr(g(f0), g(f1), g(f2), f3)
@@ -616,6 +718,8 @@ fun destRegs(op : Arm) -> Array Reg = match op {
     Sub(d, _, _, _)     -> [d]
     SubImm(d, _, _, _)  -> [d]
     SubS(d, _, _, _)    -> [d]
+    AddSImm(d, _, _, _) -> [d]
+    SubSImm(d, _, _, _) -> [d]
     Mul(d, _, _, _)     -> [d]
     SMulH(d, _, _)      -> [d]
     SDiv(d, _, _, _)    -> [d]
@@ -624,6 +728,10 @@ fun destRegs(op : Arm) -> Array Reg = match op {
     Orr(d, _, _, _)     -> [d]
     Eor(d, _, _, _)     -> [d]
     EorImm(d, _, _, _)  -> [d]
+    AndImm(d, _, _, _)  -> [d]
+    LslImm(d, _, _, _)  -> [d]
+    LsrImm(d, _, _, _)  -> [d]
+    AsrImm(d, _, _, _)  -> [d]
     Lsl(d, _, _, _)     -> [d]
     Lsr(d, _, _, _)     -> [d]
     Asr(d, _, _, _)     -> [d]
@@ -687,6 +795,7 @@ fun memRegs(m : Mem) -> Array Reg = match m {
     SpillSlot(_)         -> []
     IncomingArg(_)       -> []
     OutgoingArg(_)       -> []
+    PageOffset(base, _)  -> [base]
 }
 
 -- -- printing -----------------------------------------------------------------------
@@ -724,6 +833,25 @@ fun condName(c : Cond) -> String = match c {
     Hi -> "hi"
     Hs -> "hs"
     Vs -> "vs"
+    Vc -> "vc"
+}
+
+-- The condition that holds exactly when `c` does not. Exact on the flags, so
+-- it is exact after `fcmp` too: an unordered comparison sets the flags, and
+-- the inverse predicate reads the same flags the other way.
+fun invert(c : Cond) -> Cond = match c {
+    Eq -> Ne
+    Ne -> Eq
+    Lt -> Ge
+    Ge -> Lt
+    Le -> Gt
+    Gt -> Le
+    Lo -> Hs
+    Hs -> Lo
+    Ls -> Hi
+    Hi -> Ls
+    Vs -> Vc
+    Vc -> Vs
 }
 
 instance Show Reg {
@@ -740,6 +868,7 @@ instance Show Mem {
         SpillSlot(n) -> "[spill " + Int.toString(n) + "]"
         IncomingArg(k) -> "[incoming " + Int.toString(k) + "]"
         OutgoingArg(k) -> "[outgoing " + Int.toString(k) + "]"
+        PageOffset(base, sym) -> "[" + baseName(base) + ", " + sym + "]"
     }
 }
 
@@ -769,6 +898,8 @@ fun showArm(op : Arm) -> String = match op {
     Sub(d, a, b, w)        -> three("sub", d, a, b, w)
     SubImm(d, a, n, w)     -> imm("sub", d, a, n, w)
     SubS(d, a, b, w)       -> three("subs", d, a, b, w)
+    AddSImm(d, a, n, w)    -> imm("adds", d, a, n, w)
+    SubSImm(d, a, n, w)    -> imm("subs", d, a, n, w)
     Mul(d, a, b, w)        -> three("mul", d, a, b, w)
     SMulH(d, a, b)         -> three("smulh", d, a, b, W64)
     SDiv(d, a, b, w)       -> three("sdiv", d, a, b, w)
@@ -778,6 +909,10 @@ fun showArm(op : Arm) -> String = match op {
     Orr(d, a, b, w)        -> three("orr", d, a, b, w)
     Eor(d, a, b, w)        -> three("eor", d, a, b, w)
     EorImm(d, a, n, w)     -> imm("eor", d, a, n, w)
+    AndImm(d, a, n, w)     -> imm("and", d, a, n, w)
+    LslImm(d, a, n, w)     -> imm("lsl", d, a, n, w)
+    LsrImm(d, a, n, w)     -> imm("lsr", d, a, n, w)
+    AsrImm(d, a, n, w)     -> imm("asr", d, a, n, w)
     Lsl(d, a, b, w)        -> three("lsl", d, a, b, w)
     Lsr(d, a, b, w)        -> three("lsr", d, a, b, w)
     Asr(d, a, b, w)        -> three("asr", d, a, b, w)

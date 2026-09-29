@@ -1,0 +1,290 @@
+module Turkey.Sccp (run)
+
+-- Sparse conditional constant propagation over the low IR: Wegman and
+-- Zadeck's algorithm, in the shape QBE's `fold.c` has.
+--
+-- Two worklists: blocks newly proven reachable, and values whose lattice
+-- element fell. A block is evaluated only once some reachable edge enters it,
+-- and a block parameter meets only the arguments of jumps out of reachable
+-- blocks, which is what lets a constant branch make the code behind its other
+-- edge contribute nothing. Every value falls at most twice, from `Top` through
+-- `Known` to `Bottom`, so the pass is linear in the graph.
+--
+-- **A trap is never folded away unless it is proven not to happen.** `add`,
+-- `sub`, `mul` and `neg` panic on overflow, and `div` and `rem` at zero and
+-- `div` at the one quotient that does not fit. A fold that would overflow or
+-- divide by zero answers `Bottom` rather than a wrapped value, so the
+-- instruction stays and the program panics where it always did. A fold that
+-- succeeds replaces the instruction with its constant, dropping a check the
+-- constants have proven cannot fire.
+--
+-- **Only `i64` and `i1` values are ever `Known`.** At those two widths both
+-- backends agree on the bits: 64-bit two's complement, and 0 or 1. A narrower
+-- integer produced by wrapping arithmetic is not truncated in its arm64
+-- register, so what an `i8` sum *is* depends on the backend, and a fold would
+-- choose one of them. Floats are not folded either.
+--
+-- Nothing here adds an allocation, a call or a string literal, and a folded
+-- value is defined where it was before -- in place, or first in the block
+-- whose parameter it was -- so no live range grows. That is what makes it
+-- safe to run before the giblets check: it can only remove what the check
+-- would object to.
+
+import Turkey.LowIr as L
+import Turkey.LowIr (Op(..), Low(..), BinOp(..), CmpOp(..))
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (Value(..), BlockId(..), Term(..), RepClass(..))
+
+type Lattice = Top | Known(Int) | Bottom
+
+type Solver = Solver {
+    func      : Ssa.Func Low,
+    values    : Array Lattice,
+    reachable : Array Bool,
+    -- Where each value is read, as (block, position). The position of a
+    -- block's terminator is its instruction count.
+    users     : Array (Array (Int, Int)),
+    blocks    : Array Int,
+    fallen    : Array Int,
+}
+
+-- The function with every value SCCP proves constant replaced by that
+-- constant, every branch on one replaced by a jump, and the blocks that
+-- leaves unreachable removed.
+fun run(f : Ssa.Func Low) -> Ssa.Func Low {
+    let s = solve(f)
+    rewrite(s)
+    Ssa.pruneUnreachable(f)
+}
+
+fun solve(f : Ssa.Func Low) -> Solver {
+    let users : Array (Array (Int, Int)) = []
+    for _ in f.reps { Array.push(users, []) }
+    for var b = 0; b < len(f.blocks); b = b + 1 {
+        let block = f.blocks[b]
+        for var n = 0; n < len(block.insts); n = n + 1 {
+            for v in L.opUses(block.insts[n].op) {
+                Array.push(users[Ssa.valueId(v)], (b, n))
+            }
+        }
+        for v in Ssa.termUses(block.term) {
+            Array.push(users[Ssa.valueId(v)], (b, len(block.insts)))
+        }
+    }
+    let s = Solver {
+        func = f, values = Array.filled(len(f.reps), Top),
+        reachable = Array.filled(len(f.blocks), False), users = users,
+        blocks = [Ssa.blockId(f.entry)], fallen = [],
+    }
+    -- A function's parameters are whatever the caller passed.
+    for p in f.params { s.values[Ssa.valueId(p)] = Bottom }
+    while len(s.blocks) > 0 || len(s.fallen) > 0 {
+        while len(s.blocks) > 0 {
+            let b = s.blocks[len(s.blocks) - 1]
+            let _ = Array.pop(s.blocks)
+            if s.reachable[b] { continue }
+            s.reachable[b] = True
+            let block = f.blocks[b]
+            for i in block.insts { visit(s, i) }
+            visitTerm(s, b, block.term)
+        }
+        while len(s.fallen) > 0 {
+            let v = s.fallen[len(s.fallen) - 1]
+            let _ = Array.pop(s.fallen)
+            for (b, n) in s.users[v] {
+                if !s.reachable[b] { continue }
+                let block = f.blocks[b]
+                if n == len(block.insts) { visitTerm(s, b, block.term) }
+                else { visit(s, block.insts[n]) }
+            }
+        }
+    }
+    s
+}
+
+-- Lower a value to its meet with `next`, and queue its users if it fell.
+fun lower(s : Solver, v : Value, next : Lattice) -> Unit {
+    let id = Ssa.valueId(v)
+    let old = s.values[id]
+    let met = meet(old, next)
+    if !same(old, met) {
+        s.values[id] = met
+        Array.push(s.fallen, id)
+    }
+}
+
+fun meet(a : Lattice, b : Lattice) -> Lattice = match (a, b) {
+    (Top, x) -> x
+    (x, Top) -> x
+    (Known(x), Known(y)) -> if x == y { Known(x) } else { Bottom }
+    _ -> Bottom
+}
+
+fun same(a : Lattice, b : Lattice) -> Bool = match (a, b) {
+    (Top, Top) -> True
+    (Bottom, Bottom) -> True
+    (Known(x), Known(y)) -> x == y
+    _ -> False
+}
+
+fun visit(s : Solver, i : Low) -> Unit = lower(s, i.result, evaluate(s, i))
+
+-- A jump's arguments meet into its target's parameters every time the jump is
+-- visited, which is idempotent, so a changed argument needs nothing more than
+-- revisiting the jump. A branch carries no arguments, so its edges only make
+-- blocks reachable.
+fun visitTerm(s : Solver, b : Int, t : Term) -> Unit = match t {
+    Jump(target, args) -> {
+        let params = s.func.blocks[Ssa.blockId(target)].params
+        for var k = 0; k < len(args); k = k + 1 {
+            lower(s, params[k], s.values[Ssa.valueId(args[k])])
+        }
+        Array.push(s.blocks, Ssa.blockId(target))
+    }
+    Branch(c, yes, no) -> match s.values[Ssa.valueId(c)] {
+        Top -> {}
+        Known(k) -> Array.push(s.blocks, Ssa.blockId(if k != 0 { yes } else { no }))
+        Bottom -> {
+            Array.push(s.blocks, Ssa.blockId(yes))
+            Array.push(s.blocks, Ssa.blockId(no))
+        }
+    }
+    _ -> {}
+}
+
+-- -- evaluation ---------------------------------------------------------------------
+
+fun evaluate(s : Solver, i : Low) -> Lattice {
+    let class_ = Ssa.repOf(s.func, i.result).class_
+    if class_ != I64 && class_ != I1 { return Bottom }
+    match i.op {
+        ConstInt(n) -> Known(n)
+        Bin(o, a, b) -> both(s, a, b, if class_ == I1 { fun(x, y) = logical(o, x, y) }
+                                      else { fun(x, y) = arithmetic(o, x, y) })
+        Cmp(o, a, b) ->
+            if Ssa.repOf(s.func, a).class_ != I64 { Bottom }
+            else { both(s, a, b, fun(x, y) = Known(if compare(o, x, y) { 1 } else { 0 })) }
+        Neg(a) -> one(s, a, fun(x) = if x == Int.minValue() { Bottom } else { Known(-x) })
+        Not(a) -> one(s, a, fun(x) = Known(if x == 0 { 1 } else { 0 }))
+        _ -> Bottom
+    }
+}
+
+-- An operation of one operand: `Top` until the operand is known to be
+-- something, and `Bottom` once it is known to be anything.
+fun one(s : Solver, a : Value, fold : fun(Int) -> Lattice) -> Lattice =
+    match s.values[Ssa.valueId(a)] {
+        Known(x) -> fold(x)
+        other -> other
+    }
+
+fun both(s : Solver, a : Value, b : Value, fold : fun(Int, Int) -> Lattice)
+        -> Lattice = match (s.values[Ssa.valueId(a)], s.values[Ssa.valueId(b)]) {
+    (Known(x), Known(y)) -> fold(x, y)
+    (Bottom, _) -> Bottom
+    (_, Bottom) -> Bottom
+    _ -> Top
+}
+
+-- `i64` arithmetic, exactly as the machine does it, or `Bottom` where the
+-- machine would panic.
+fun arithmetic(o : BinOp, x : Int, y : Int) -> Lattice = match o {
+    Add -> checked(Int.addChecked(x, y))
+    Sub -> checked(Int.subChecked(x, y))
+    Mul -> checked(Int.mulChecked(x, y))
+    Div -> if y == 0 || (x == Int.minValue() && y == -1) { Bottom }
+           else { Known(x / y) }
+    -- `x % -1` is zero for every `x`, and it is what selection answers for
+    -- `minValue() % -1` rather than computing the quotient that does not fit.
+    Rem -> if y == 0 { Bottom } else if y == -1 { Known(0) } else { Known(x % y) }
+    AddWrap -> Known(Int.addWrapping(x, y))
+    SubWrap -> Known(Int.subWrapping(x, y))
+    MulWrap -> Known(Int.mulWrapping(x, y))
+    And -> Known(Int.and(x, y))
+    Or -> Known(Int.or(x, y))
+    Xor -> Known(Int.xor(x, y))
+    -- arm64 masks a shift amount to six bits and LLVM calls a larger one
+    -- poison, so only an amount both agree on is folded.
+    Shl -> if y >= 0 && y <= 63 { Known(Int.shl(x, y)) } else { Bottom }
+    Shr -> if y >= 0 && y <= 63 { Known(Int.shr(x, y)) } else { Bottom }
+    ShrU -> Bottom
+}
+
+fun checked(r : Option Int) -> Lattice = match r {
+    Some(n) -> Known(n)
+    None -> Bottom
+}
+
+-- `i1` operands are 0 or 1, so the bitwise operations are the logical ones.
+fun logical(o : BinOp, x : Int, y : Int) -> Lattice = match o {
+    And -> Known(Int.and(x, y))
+    Or -> Known(Int.or(x, y))
+    Xor -> Known(Int.xor(x, y))
+    _ -> Bottom
+}
+
+fun compare(o : CmpOp, x : Int, y : Int) -> Bool = match o {
+    Eq -> x == y
+    Ne -> x != y
+    Lt -> x < y
+    Le -> x <= y
+    Gt -> x > y
+    Ge -> x >= y
+}
+
+-- -- rewriting ----------------------------------------------------------------------
+
+fun rewrite(s : Solver) -> Unit {
+    let f = s.func
+    -- Which parameters of each block survive: a known one is removed, and
+    -- every jump into the block drops its argument.
+    let keep : Array (Array Bool) = []
+    for var b = 0; b < len(f.blocks); b = b + 1 {
+        let block = f.blocks[b]
+        let kept = []
+        let flags = []
+        let defined = []
+        for p in block.params {
+            match s.values[Ssa.valueId(p)] {
+                Known(n) -> {
+                    Array.push(flags, False)
+                    Array.push(defined, L.low(p, ConstInt(n)))
+                }
+                _ -> {
+                    Array.push(flags, True)
+                    Array.push(kept, p)
+                }
+            }
+        }
+        Array.push(keep, flags)
+        if len(defined) > 0 {
+            block.params = kept
+            for i in block.insts { Array.push(defined, i) }
+            block.insts = defined
+        }
+    }
+    for block in f.blocks {
+        for i in block.insts {
+            match (s.values[Ssa.valueId(i.result)], i.op) {
+                (_, ConstInt(_)) -> {}
+                (Known(n), _) -> { i.op = ConstInt(n) }
+                _ -> {}
+            }
+        }
+        block.term = match block.term {
+            Jump(target, args) -> {
+                let flags = keep[Ssa.blockId(target)]
+                let passed = []
+                for var k = 0; k < len(args); k = k + 1 {
+                    if flags[k] { Array.push(passed, args[k]) }
+                }
+                Jump(target, passed)
+            }
+            Branch(c, yes, no) -> match s.values[Ssa.valueId(c)] {
+                Known(k) -> Jump(if k != 0 { yes } else { no }, [])
+                _ -> Branch(c, yes, no)
+            }
+            other -> other
+        }
+    }
+}

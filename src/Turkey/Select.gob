@@ -38,6 +38,7 @@ import Turkey.LowIr as L
 import Turkey.LowIr (Op(..), Low(..), AddressOf(..), BinOp(..), CmpOp(..), Conv(..),
                      Callee(..))
 import Turkey.Asm as Asm
+import Turkey.Clean as Clean
 import Turkey.Asm (Asm(..))
 import Turkey.Roots as Roots
 import Turkey.Runtime as Rt
@@ -70,6 +71,9 @@ type Sel = Sel {
     -- followed by a test of the panic flag, and a panic call must not be: it
     -- would test the flag it just set and branch to itself, forever.
     panicking : Bool,
+    -- The integer constants the low IR defines, by value: an operand known
+    -- here can be an immediate, and a known divisor needs fewer checks.
+    known   : Map Int Int,
 }
 
 fun emit(s : Sel, op : A.Arm) -> Unit {
@@ -132,7 +136,14 @@ fun selectModule(m : Module, dialect : Asm.Dialect)
         run(s)
         match s.stopped {
             Some(why) -> Array.push(skipped, Unsupported { name = f.name, what = why })
-            None -> Array.push(done, s.out)
+            None -> {
+                -- The same two passes the low IR had, over what selection
+                -- added: the temporaries, the moves between banks, and the
+                -- values a pattern selected around.
+                Clean.eliminateCopies(s.out, False)
+                Clean.eliminateDead(s.out)
+                Array.push(done, s.out)
+            }
         }
     }
     (done, skipped, asm)
@@ -150,7 +161,31 @@ fun start(f : Func Low, asm : Asm) -> Sel {
     }
     g.entry = incoming(f, g)
     Sel { source = f, out = g, at = 0, stopped = None, asm = asm,
-          frame = Roots.analyze(f), pending = None, panicking = False }
+          frame = Roots.analyze(f), pending = None, panicking = False,
+          known = constantsOf(f) }
+}
+
+fun constantsOf(f : Func Low) -> Map Int Int {
+    let out = Map.new()
+    for block in f.blocks {
+        for i in block.insts {
+            match i.op {
+                ConstInt(n) -> if Ssa.repOf(f, i.result).class_ != F64 {
+                    Map.put(out, Ssa.valueId(i.result), n)
+                }
+                _ -> {}
+            }
+        }
+    }
+    out
+}
+
+fun known(s : Sel, v : Value) -> Option Int = Map.get(s.known, Ssa.valueId(v))
+
+-- The divisor of a `div` or `rem`, where it is a constant.
+fun divisorOf(s : Sel, i : Low) -> Option Int = match i.op {
+    Bin(_, _, b) -> Map.get(s.known, Ssa.valueId(b))
+    _ -> None
 }
 
 -- A new entry block that moves each parameter out of where the caller put it,
@@ -291,6 +326,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         ConstUnit -> emit(s, A.Mov(d, A.xzr, A.W64))
         Bin(o, a, b) ->
             if r.class_ == F64 { floatBin(s, d, o, A.reg(a), A.reg(b)) }
+            else if immediateBin(s, d, r, o, a, b, w) {}
             else { match binOp(o) {
                 Some(make) -> emit(s, make(d, A.reg(a), A.reg(b), w))
                 None -> trapping(s, i, d, r, o, A.reg(a), A.reg(b), w)
@@ -300,8 +336,21 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             if operand.class_ == F64 {
                 floatCmp(s, d, o, A.reg(a), A.reg(b))
             } else {
-                emit(s, A.Cmp(A.reg(a), A.reg(b), widthOf(operand)))
-                emit(s, A.CSet(d, condOf(o)))
+                let cw = widthOf(operand)
+                match (immediate12(known(s, b)), immediate12(known(s, a))) {
+                    (Some(n), _) -> {
+                        emit(s, A.CmpImm(A.reg(a), n, cw))
+                        emit(s, A.CSet(d, condOf(o)))
+                    }
+                    (None, Some(n)) -> {
+                        emit(s, A.CmpImm(A.reg(b), n, cw))
+                        emit(s, A.CSet(d, condOf(mirror(o))))
+                    }
+                    _ -> {
+                        emit(s, A.Cmp(A.reg(a), A.reg(b), cw))
+                        emit(s, A.CSet(d, condOf(o)))
+                    }
+                }
             }
         }
         -- `Neg` traps at `Int`: `-minValue()` does not exist, so negating
@@ -348,7 +397,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         -- addressing, and these offsets are already bytes, so unlike
         -- `ArrayGet` there is no shift to emit and no header to skip.
         PtrLoad(base, off, c) -> {
-            let at = A.Indexed(A.reg(base), A.reg(off))
+            let at = rawAddress(s, base, off, c)
             match Rt.accessWidth(c) {
                 1 -> emit(s, A.Ldrb(d, at))
                 4 -> emit(s, A.Ldr(d, at, A.W32))
@@ -356,7 +405,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             }
         }
         PtrStore(base, off, v, c) -> {
-            let at = A.Indexed(A.reg(base), A.reg(off))
+            let at = rawAddress(s, base, off, c)
             match Rt.accessWidth(c) {
                 1 -> emit(s, A.Strb(A.reg(v), at))
                 4 -> emit(s, A.Str(A.reg(v), at, A.W32))
@@ -655,14 +704,15 @@ fun call(s : Sel, d : Reg, dBank : A.Bank, resultBank : A.Bank,
 -- itself may call one that can. `Turkey.Llvm.propagate` is the same test on
 -- the other path. The flag is the first word of the process state
 -- (`Turkey.Runtime.processState`), which this program defines.
+--
+-- Three instructions: the page, a load of the flag's low word, and the branch
+-- on it. The flag is only ever 0 or 1 (`Turkey.Process.raise` stores 1), so
+-- its low word is the whole answer and can be branched on as a bit.
 fun propagate(s : Sel) -> Unit {
     if s.panicking { return }
-    let flag = temp(s, Ssa.untraced(I64))
-    let panicked = address(s, runtimeSymbolOf(s, Rt.processState))
-    emit(s, A.Ldr(flag, A.Offset(panicked, 0), A.W64))
-    emit(s, A.CmpImm(flag, 0, A.W64))
     let failed = tempValue(s, Ssa.untraced(I1))
-    emit(s, A.CSet(A.reg(failed), A.Ne))
+    emit(s, A.Ldr(A.reg(failed), symbolWord(s, runtimeSymbolOf(s, Rt.processState)),
+                  A.W32))
     -- The empty message: this path propagates a panic that already happened
     -- and raises nothing new. It returns zero, as every panic path does.
     guard(s, failed, "")
@@ -688,7 +738,7 @@ fun zeroResult(s : Sel) -> Value {
 fun globalAt(s : Sel, name : String) -> A.Mem =
     match Asm.globalSlot(s.asm, name) {
         Some(slot) -> slotOf(s, slot)
-        None -> A.Offset(address(s, Asm.globalSymbol(s.asm.dialect, name)), 0)
+        None -> symbolWord(s, Asm.globalSymbol(s.asm.dialect, name))
     }
 
 -- One slot of the permanent root array.
@@ -707,6 +757,14 @@ fun address(s : Sel, sym : String) -> Reg {
     -- allocator will too.
     emit(s, A.AddLo(full, page, Asm.pageOffset(s.asm.dialect, sym)))
     full
+}
+
+-- A symbol's word as a memory operand: the page, with the offset within it
+-- in the access itself, so the full address is never formed.
+fun symbolWord(s : Sel, sym : String) -> A.Mem {
+    let page = temp(s, Ssa.untraced(Ptr))
+    emit(s, A.Adrp(page, Asm.page(s.asm.dialect, sym)))
+    A.PageOffset(page, Asm.pageOffset(s.asm.dialect, sym))
 }
 
 -- A symbol's address into `d`: `address`'s pair, ending in the destination.
@@ -805,53 +863,69 @@ fun trapping(s : Sel, i : Low, d : Reg, r : Rep, o : BinOp, a : Reg, b : Reg,
             emit(s, A.Cmp(high, sign, A.W64))
             guardOn(s, A.Ne, "integer overflow in *")
         }
+        -- A constant divisor other than 0 cannot raise the first panic, and
+        -- one other than -1 cannot raise the second.
         Div -> {
-            divisorGuard(s, b, "division by zero")
-            mostNegative(s, a, b, "integer overflow in /")
+            let k = divisorOf(s, i)
+            if k == None || k == Some(0) { divisorGuard(s, b, "division by zero") }
+            if k == None || k == Some(-1) {
+                mostNegative(s, a, b, "integer overflow in /")
+            }
             emit(s, A.SDiv(d, a, b, w))
         }
         -- The remainder is the division's, backwards: `msub` computes
         -- `a - (a / b) * b`, which is what arm64 has instead of an `srem`.
-        --
-        -- The most negative integer divided by -1 is taken out rather than
-        -- computed. Its mathematical remainder is zero, but the quotient it
-        -- goes through does not exist -- the same case LLVM leaves undefined
-        -- and `Turkey.Llvm` special-cases for the same reason.
-        Rem -> {
-            divisorGuard(s, b, "remainder by zero")
-            let low = temp(s, Ssa.untraced(I64))
-            constant(s, low, Int.shl(1, 63))
-            emit(s, A.Cmp(a, low, A.W64))
-            let isLow = tempValue(s, Ssa.untraced(I1))
-            emit(s, A.CSet(A.reg(isLow), A.Eq))
-            emit(s, A.CmpImm(b, -1, A.W64))
-            let isNegative = tempValue(s, Ssa.untraced(I1))
-            emit(s, A.CSet(A.reg(isNegative), A.Eq))
-            let special = tempValue(s, Ssa.untraced(I1))
-            emit(s, A.And(A.reg(special), A.reg(isLow), A.reg(isNegative),
-                          A.W32))
-            let zero = block(s)
-            let ordinary = block(s)
-            let after = block(s)
-            -- The result is the merge block's parameter, which is what a
-            -- select is in a graph with block parameters rather than phis.
-            Array.push(s.out.blocks[after].params, i.result)
-            s.out.blocks[s.at].term = Branch(special, BlockId(zero),
-                                             BlockId(ordinary))
-            s.at = zero
-            let none = tempValue(s, Ssa.untraced(I64))
-            emit(s, A.Mov(A.reg(none), A.xzr, A.W64))
-            s.out.blocks[s.at].term = Jump(BlockId(after), [none])
-            s.at = ordinary
-            let quotient = temp(s, Ssa.untraced(I64))
-            let rest = tempValue(s, Ssa.untraced(I64))
-            emit(s, A.SDiv(quotient, a, b, w))
-            emit(s, A.MSub(A.reg(rest), quotient, b, a, w))
-            s.out.blocks[s.at].term = Jump(BlockId(after), [rest])
-            s.at = after
+        -- A constant divisor other than 0 and -1 needs neither check.
+        Rem -> match divisorOf(s, i) {
+            Some(k) -> if k != 0 && k != -1 {
+                let quotient = temp(s, Ssa.untraced(I64))
+                emit(s, A.SDiv(quotient, a, b, w))
+                emit(s, A.MSub(d, quotient, b, a, w))
+            } else { remainder(s, i, d, a, b, w) }
+            None -> remainder(s, i, d, a, b, w)
         }
         _ -> stop(s, "the binary operation " + show(o))
     }
+}
+
+-- The remainder by a divisor that may be 0 or -1.
+--
+-- The most negative integer divided by -1 is taken out rather than computed.
+-- Its mathematical remainder is zero, but the quotient it goes through does
+-- not exist -- the same case LLVM leaves undefined and `Turkey.Llvm`
+-- special-cases for the same reason.
+fun remainder(s : Sel, i : Low, d : Reg, a : Reg, b : Reg, w : A.Width) -> Unit {
+    divisorGuard(s, b, "remainder by zero")
+    let low = temp(s, Ssa.untraced(I64))
+    constant(s, low, Int.shl(1, 63))
+    emit(s, A.Cmp(a, low, A.W64))
+    let isLow = tempValue(s, Ssa.untraced(I1))
+    emit(s, A.CSet(A.reg(isLow), A.Eq))
+    emit(s, A.CmpImm(b, -1, A.W64))
+    let isNegative = tempValue(s, Ssa.untraced(I1))
+    emit(s, A.CSet(A.reg(isNegative), A.Eq))
+    let special = tempValue(s, Ssa.untraced(I1))
+    emit(s, A.And(A.reg(special), A.reg(isLow), A.reg(isNegative),
+                  A.W32))
+    let zero = block(s)
+    let ordinary = block(s)
+    let after = block(s)
+    -- The result is the merge block's parameter, which is what a
+    -- select is in a graph with block parameters rather than phis.
+    Array.push(s.out.blocks[after].params, i.result)
+    s.out.blocks[s.at].term = Branch(special, BlockId(zero),
+                                     BlockId(ordinary))
+    s.at = zero
+    let none = tempValue(s, Ssa.untraced(I64))
+    emit(s, A.Mov(A.reg(none), A.xzr, A.W64))
+    s.out.blocks[s.at].term = Jump(BlockId(after), [none])
+    s.at = ordinary
+    let quotient = temp(s, Ssa.untraced(I64))
+    let rest = tempValue(s, Ssa.untraced(I64))
+    emit(s, A.SDiv(quotient, a, b, w))
+    emit(s, A.MSub(A.reg(rest), quotient, b, a, w))
+    s.out.blocks[s.at].term = Jump(BlockId(after), [rest])
+    s.at = after
 }
 
 -- A flag-setting instruction, and a panic if it overflowed.
@@ -920,6 +994,115 @@ fun guard(s : Sel, condition : Value, message : String) -> Unit {
     }
     s.out.blocks[s.at].term = Ret(zeroResult(s))
     s.at = carry
+}
+
+-- A constant operand as an immediate: the forms arm64 encodes directly, so
+-- that the constant is never put in a register and the instruction that would
+-- have put it there is dead code.
+--
+-- Whether the instruction can take the immediate is the whole test; which
+-- operand it came from matters only for the operations that do not commute.
+-- A checked `add` or `sub` keeps its overflow guard: `adds` with an immediate
+-- sets V exactly as it would with the constant in a register, and one of
+-- `adds` and `subs` covers a negative constant, since `a - n` and `a + -n`
+-- overflow together.
+fun immediateBin(s : Sel, d : Reg, r : Rep, o : BinOp, a : Value, b : Value,
+                 w : A.Width) -> Bool {
+    -- The width `widthOf` chose, in bits.
+    let bits = if r.class_ == I64 || r.class_ == Ptr { 64 } else { 32 }
+    match (known(s, b), known(s, a)) {
+        (Some(n), _) -> immediateRight(s, d, r, o, A.reg(a), n, w, bits)
+        (None, Some(n)) -> if commutes(o) {
+            immediateRight(s, d, r, o, A.reg(b), n, w, bits)
+        } else { False }
+        _ -> False
+    }
+}
+
+fun immediateRight(s : Sel, d : Reg, r : Rep, o : BinOp, x : Reg, n : Int,
+                   w : A.Width, bits : Int) -> Bool = match o {
+    AddWrap -> addImmediate(s, d, x, n, w)
+    SubWrap -> n != Int.minValue() && addImmediate(s, d, x, -n, w)
+    Add -> r.class_ == I64 && checkedImmediate(s, d, x, n, w, "integer overflow in +")
+    Sub -> r.class_ == I64 && n != Int.minValue()
+           && checkedImmediate(s, d, x, -n, w, "integer overflow in -")
+    Shl -> shiftImmediate(s, A.LslImm(d, x, n, w), n, bits)
+    Shr -> shiftImmediate(s, A.AsrImm(d, x, n, w), n, bits)
+    ShrU -> shiftImmediate(s, A.LsrImm(d, x, n, w), n, bits)
+    And -> if lowMask(n, bits) { emit(s, A.AndImm(d, x, n, w)); True } else { False }
+    _ -> False
+}
+
+fun commutes(o : BinOp) -> Bool = match o {
+    AddWrap -> True
+    Add -> True
+    And -> True
+    _ -> False
+}
+
+fun addImmediate(s : Sel, d : Reg, x : Reg, n : Int, w : A.Width) -> Bool {
+    if n >= 0 && n <= 4095 { emit(s, A.AddImm(d, x, n, w)); return True }
+    if n < 0 && n >= -4095 { emit(s, A.SubImm(d, x, -n, w)); return True }
+    False
+}
+
+fun checkedImmediate(s : Sel, d : Reg, x : Reg, n : Int, w : A.Width,
+                     message : String) -> Bool {
+    if n >= 0 && n <= 4095 {
+        overflowed(s, A.AddSImm(d, x, n, w), message)
+        return True
+    }
+    if n < 0 && n >= -4095 {
+        overflowed(s, A.SubSImm(d, x, -n, w), message)
+        return True
+    }
+    False
+}
+
+-- An immediate shift amount must be in range for the width; a register
+-- amount is masked by the machine, which the language's own range check has
+-- already made moot for any amount that reaches here as a constant.
+fun shiftImmediate(s : Sel, made : A.Arm, n : Int, bits : Int) -> Bool {
+    if n < 0 || n >= bits { return False }
+    emit(s, made)
+    True
+}
+
+-- A run of ones from bit 0: every width encodes it as a logical immediate.
+-- All ones and zero are not encodable, and neither is needed.
+fun lowMask(n : Int, bits : Int) -> Bool {
+    if n <= 0 { return False }
+    let run = Int.addWrapping(n, 1)
+    Int.and(n, run) == 0 && (bits == 64 || n < Int.shl(1, bits - 1))
+}
+
+-- The twelve-bit unsigned immediate `cmp` takes.
+fun immediate12(n : Option Int) -> Option Int = match n {
+    Some(k) -> if k >= 0 && k <= 4095 { Some(k) } else { None }
+    None -> None
+}
+
+-- The comparison with its operands exchanged.
+fun mirror(o : CmpOp) -> CmpOp = match o {
+    Lt -> Gt
+    Gt -> Lt
+    Le -> Ge
+    Ge -> Le
+    other -> other
+}
+
+-- A raw access's address. A constant offset the access can encode as a
+-- scaled unsigned immediate goes in the instruction; anything else is the
+-- register form.
+fun rawAddress(s : Sel, base : Value, off : Value, c : RepClass) -> A.Mem {
+    let width = Rt.accessWidth(c)
+    match known(s, off) {
+        Some(n) -> if n >= 0 && n % width == 0 && n / width <= 4095 {
+            return A.Offset(A.reg(base), n)
+        }
+        None -> {}
+    }
+    A.Indexed(A.reg(base), A.reg(off))
 }
 
 fun binOp(o : BinOp) -> Option (fun(Reg, Reg, Reg, A.Width) -> A.Arm) = match o {

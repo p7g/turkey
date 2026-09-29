@@ -13,11 +13,12 @@ and running the compiled programs is the check below it.
 """
 
 import functools
+import re
 from pathlib import Path
 
 import pytest
 
-from tests import bootc
+from tests import bootc, lang
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BOOT_MAIN = REPO_ROOT / "src" / "Main.gob"
@@ -238,9 +239,20 @@ def test_a_lambda_becomes_a_lifted_function_and_a_closure():
 
 
 def test_a_function_value_uses_its_own_environment_first_signature():
-    out = _ssa("generalization.gob")
-    assert "%closure" not in out
-    assert "closure.new @Main#identity" in out
+    # Kept in an array so that the closure is used: an unused one is dead code
+    # and the low IR no longer builds it.
+    src = """
+    fun twice(x : Int) -> Int = x * 2
+
+    fun main() {
+        let fs = [twice]
+        print(fs[0](21))
+    }
+    """
+    result = lang.dump("ssa", src)
+    assert result.code == 0, result.stderr
+    assert "%closure" not in result.stdout
+    assert "closure.new @Main#twice" in result.stdout
 
 
 def test_the_calling_conventions_are_not_confused():
@@ -292,3 +304,46 @@ def test_nullary_objects_are_rooted_once_before_user_initializers():
     assert len(allocations) == len(set(allocations)), allocations
     assert "global.load $%nullary." in out, out
     assert "global.store $%nullary." in out, out
+
+
+TUPLE_MATCH = """
+type H = H(Int)
+
+fun same(a : H, b : H) -> Bool = match (a, b) { (H(x), H(y)) -> x == y }
+
+fun both(a : Option Int, b : Option Int) -> Int = match (a, b) {
+    (Some(x), Some(y)) -> x + y
+    (Some(x), _) -> x
+    _ -> 0
+}
+
+fun main() {
+    print(show(same(H(1), H(2))))
+    print(both(Some(1), Some(2)))
+    print(both(Some(5), None))
+    print(both(None, Some(9)))
+}
+"""
+
+
+def test_a_match_on_a_tuple_literal_does_not_build_the_tuple():
+    assert lang.output(TUPLE_MATCH) == "False\n3\n5\n0\n"
+    result = lang.dump("ssa", TUPLE_MATCH)
+    assert result.code == 0, result.stderr
+    for name in ("same", "both"):
+        body = re.search(rf"^fun @Main#{name}\(.*?^}}$", result.stdout,
+                         re.M | re.S).group(0)
+        assert "object.new" not in body, body
+
+
+def test_a_match_that_binds_the_whole_tuple_still_builds_it():
+    src = """
+    fun main() {
+        let n = [1][0]
+        match (n, n + 1) {
+            (0, _) -> print("zero")
+            pair -> print(pair.1)
+        }
+    }
+    """
+    assert lang.output(src) == "2\n"

@@ -1,0 +1,289 @@
+module Turkey.Clean (eliminateCopies, eliminateDead, mergeBlocks)
+
+-- Copy elimination and dead instruction elimination, written once against
+-- `class Inst i` and run on both sides of instruction selection.
+--
+-- Neither pass asks what an opcode computes. Copy elimination needs to know
+-- which instructions are copies and how to rename an operand; dead code
+-- elimination needs `uses`, `defs` and whether `effects` let an instruction
+-- go. Everything else they read is the graph -- terminators and block
+-- parameters -- which every instantiation shares.
+--
+-- Both keep the value numbering: a removed value simply stops being defined
+-- or used, and its `reps` entry stays, so a side table indexed by value --
+-- `origins`, the machine graph's shared numbering -- still means what it did.
+
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (Value(..), BlockId(..), Term(..), Inst(..), Func(..))
+
+-- -- copies --------------------------------------------------------------------------
+
+-- Replace every copy by its source.
+--
+-- Two kinds. An instruction the instantiation calls a copy, whose destination
+-- is renamed to its source everywhere and which is then deleted. And a block
+-- parameter every incoming jump passes the same value to -- or itself, round a
+-- loop -- which is a copy on every edge, and is removed along with the
+-- arguments that fed it. That rule is the one Braun et al. use to remove a
+-- trivial phi, and it is sound for the same reason: the one value passed
+-- reaches the block along every edge, so it dominates the block, so it
+-- dominates every use of the parameter.
+--
+-- An entry block takes no parameters, and a block no jump enters keeps its
+-- own: with nothing passed there is nothing to be a copy of.
+--
+-- An instruction copy is renamed only between two equal representations:
+-- across representations the copy is the point.
+--
+-- `traced` says whether a traced value may be renamed at all, and it is false
+-- after selection. `Turkey.Roots` analyses the low IR, and the safepoint maps
+-- and root stores it produces name the values they root by number; renaming a
+-- traced value after that would leave a map naming a value no instruction
+-- stores. Before the analysis there is nothing to disagree with.
+fun eliminateCopies[Inst i](f : Func i, traced : Bool) -> Unit {
+    let aliases = Array.filled(len(f.reps), -1)
+    var found = False
+    for block in f.blocks {
+        for inst in block.insts {
+            match copyOf(inst) {
+                Some((d, s)) -> {
+                    let r = Ssa.repOf(f, d)
+                    if r == Ssa.repOf(f, s) && (traced || !r.traced) {
+                        aliases[Ssa.valueId(d)] = Ssa.valueId(s)
+                        found = True
+                    }
+                }
+                None -> {}
+            }
+        }
+    }
+    let jumps = jumpsInto(f)
+    var changed = True
+    while changed {
+        changed = False
+        for var b = 0; b < len(f.blocks); b = b + 1 {
+            let params = f.blocks[b].params
+            for var k = 0; k < len(params); k = k + 1 {
+                let p = Ssa.valueId(params[k])
+                if aliases[p] >= 0 { continue }
+                if !traced && Ssa.repOf(f, params[k]).traced { continue }
+                var unique = -1
+                var multiple = False
+                for pred in jumps[b] {
+                    match f.blocks[pred].term {
+                        Jump(_, args) -> {
+                            let v = resolve(aliases, Ssa.valueId(args[k]))
+                            if v != p {
+                                if unique < 0 { unique = v }
+                                else if unique != v { multiple = True }
+                            }
+                        }
+                        _ -> {}
+                    }
+                }
+                if unique >= 0 && !multiple {
+                    aliases[p] = unique
+                    changed = True
+                    found = True
+                }
+            }
+        }
+    }
+    if !found { return }
+    let rename = fun(v : Value) -> Value = Value(resolve(aliases, Ssa.valueId(v)))
+    let keep = Array.map(f.blocks, fun(block) =
+        Array.map(block.params, \aliases[Ssa.valueId(_)] < 0))
+    for block in f.blocks {
+        block.params = Array.filter(block.params, \aliases[Ssa.valueId(_)] < 0)
+        let kept = []
+        for inst in block.insts {
+            let renamed = match copyOf(inst) {
+                Some((d, _)) -> aliases[Ssa.valueId(d)] >= 0
+                None -> False
+            }
+            if !renamed { Array.push(kept, renameUses(inst, rename)) }
+        }
+        block.insts = kept
+        block.term = renameTerm(block.term, rename, keep)
+    }
+}
+
+fun resolve(aliases : Array Int, id : Int) -> Int {
+    var v = id
+    while aliases[v] >= 0 { v = aliases[v] }
+    v
+}
+
+-- For each block, the blocks that jump to it. A branch carries no arguments,
+-- so it is never a source of a parameter's value.
+fun jumpsInto(f : Func i) -> Array (Array Int) {
+    let out : Array (Array Int) = []
+    for _ in f.blocks { Array.push(out, []) }
+    for var b = 0; b < len(f.blocks); b = b + 1 {
+        match f.blocks[b].term {
+            Jump(target, _) -> Array.push(out[Ssa.blockId(target)], b)
+            _ -> {}
+        }
+    }
+    out
+}
+
+-- A terminator reading renamed values, and passing only the arguments whose
+-- parameters `keep` says survive.
+fun renameTerm(t : Term, rename : fun(Value) -> Value,
+               keep : Array (Array Bool)) -> Term = match t {
+    Ret(v) -> Ret(rename(v))
+    Jump(target, args) -> {
+        let flags = keep[Ssa.blockId(target)]
+        let passed = []
+        for var k = 0; k < len(args); k = k + 1 {
+            if flags[k] { Array.push(passed, rename(args[k])) }
+        }
+        Jump(target, passed)
+    }
+    Branch(c, yes, no) -> Branch(rename(c), yes, no)
+    Panic(v) -> Panic(rename(v))
+    Unreachable -> Unreachable
+}
+
+-- -- dead code -----------------------------------------------------------------------
+
+-- Delete every instruction and block parameter whose value nothing needs.
+--
+-- Mark and sweep. The roots are what a terminator other than a jump reads, and
+-- the operands of every instruction `Ssa.deletable` refuses -- a write, a
+-- trap, a divergence. A needed instruction needs its operands; a needed block
+-- parameter needs the argument each jump into its block passes it. So a value
+-- that only ever flows round a loop into itself, and out to nothing, is dead
+-- even though it is used.
+--
+-- An allocation is deletable, which is only true because this runs before
+-- `Turkey.Roots` reads the graph: a safepoint map lists values by what the
+-- low IR said was live, and a map naming a value this deleted would describe
+-- a root that is not there. After selection a call is not deletable, so no
+-- safepoint is ever removed there.
+fun eliminateDead[Inst i](f : Func i) -> Unit {
+    let count = len(f.reps)
+    -- Where each value is defined: a block and an instruction index, or a
+    -- block and -1 - k for its parameter k. A function parameter is -1.
+    let defBlock = Array.filled(count, -1)
+    let defAt = Array.filled(count, 0)
+    for var b = 0; b < len(f.blocks); b = b + 1 {
+        let block = f.blocks[b]
+        for var k = 0; k < len(block.params); k = k + 1 {
+            defBlock[Ssa.valueId(block.params[k])] = b
+            defAt[Ssa.valueId(block.params[k])] = -1 - k
+        }
+        for var n = 0; n < len(block.insts); n = n + 1 {
+            for v in defs(block.insts[n]) {
+                defBlock[Ssa.valueId(v)] = b
+                defAt[Ssa.valueId(v)] = n
+            }
+        }
+    }
+    let live = Array.filled(count, False)
+    let work = []
+    let mark = fun(v : Value) -> Unit {
+        let id = Ssa.valueId(v)
+        if !live[id] {
+            live[id] = True
+            Array.push(work, id)
+        }
+    }
+    for block in f.blocks {
+        for inst in block.insts {
+            if !Ssa.deletable(effects(inst)) { for v in uses(inst) { mark(v) } }
+        }
+        match block.term {
+            Jump(_, _) -> {}
+            t -> for v in Ssa.termUses(t) { mark(v) }
+        }
+    }
+    let jumps = jumpsInto(f)
+    while len(work) > 0 {
+        let id = work[len(work) - 1]
+        let _ = Array.pop(work)
+        let b = defBlock[id]
+        if b < 0 { continue }
+        let at = defAt[id]
+        if at >= 0 {
+            for v in uses(f.blocks[b].insts[at]) { mark(v) }
+        } else {
+            let k = -1 - at
+            for pred in jumps[b] {
+                match f.blocks[pred].term {
+                    Jump(_, args) -> mark(args[k])
+                    _ -> {}
+                }
+            }
+        }
+    }
+    let keep = Array.map(f.blocks, fun(block) =
+        Array.map(block.params, \live[Ssa.valueId(_)]))
+    let same = fun(v : Value) -> Value = v
+    for block in f.blocks {
+        block.params = Array.filter(block.params, \live[Ssa.valueId(_)])
+        block.insts = Array.filter(block.insts, \needed(live, _))
+        block.term = renameTerm(block.term, same, keep)
+    }
+}
+
+fun needed[Inst i](live : Array Bool, inst : i) -> Bool {
+    if !Ssa.deletable(effects(inst)) { return True }
+    for v in defs(inst) {
+        if live[Ssa.valueId(v)] { return True }
+    }
+    False
+}
+
+-- -- blocks --------------------------------------------------------------------------
+
+-- Merge each block into its predecessor where that predecessor's jump is the
+-- only way in, and answer the function without the emptied blocks.
+--
+-- Lowering makes these chains -- a block per statement, a block for each
+-- value a `match` or an `if` delivers -- and a chain of fallthroughs costs no
+-- instructions, but it keeps apart what a later pass reads as one: a
+-- comparison in one block and the branch on it in the next cannot become one
+-- conditional branch. A merged block takes no parameters: copy elimination has
+-- already removed a parameter whose only jump passes it one value.
+--
+-- Blocks are renumbered, like `Ssa.pruneUnreachable`, so this runs before
+-- anything records a `BlockId`.
+fun mergeBlocks[Inst i](f : Func i) -> Func i {
+    let preds = Ssa.predecessors(f)
+    var merged = False
+    for var b = 0; b < len(f.blocks); b = b + 1 {
+        var going = True
+        while going {
+            going = False
+            match f.blocks[b].term {
+                Jump(target, args) -> {
+                    let t = Ssa.blockId(target)
+                    if t != b && t != Ssa.blockId(f.entry) && len(args) == 0
+                            && len(preds[t]) == 1
+                            && len(f.blocks[t].params) == 0 {
+                        let into = f.blocks[b]
+                        let from = f.blocks[t]
+                        for inst in from.insts { Array.push(into.insts, inst) }
+                        into.term = from.term
+                        from.insts = []
+                        from.term = Unreachable
+                        -- The merged block's successors are now reached from
+                        -- `b`, so a later merge through one of them still sees
+                        -- exactly one predecessor.
+                        for s in Ssa.successors(into.term) {
+                            let at = Ssa.blockId(s)
+                            preds[at] = Array.map(preds[at], fun(p) =
+                                if Ssa.blockId(p) == t { BlockId(b) } else { p })
+                        }
+                        merged = True
+                        going = True
+                    }
+                }
+                _ -> {}
+            }
+        }
+    }
+    if merged { Ssa.pruneUnreachable(f) } else { f }
+}

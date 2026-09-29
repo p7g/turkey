@@ -1,0 +1,109 @@
+module Turkey.Sites (instrument, counterFile)
+
+-- Counting allocations by the instruction that made them.
+--
+-- A measurement build, asked for with `TURKEY_ALLOC_SITES=1` at compile time.
+-- Every instruction left in the optimized low IR that allocates is numbered,
+-- and a counter increment is put in front of it; the entry sequence writes the
+-- counters to `counterFile` when `main` returns, and the compile prints what
+-- each number is. Joining the two says which constructs a run allocated
+-- through, and how often, which the collector's totals by kind cannot.
+--
+-- After optimization, so what is counted is what the program really does:
+-- a tuple the lowering took apart, a cell escape analysis removed, an object
+-- dead code elimination deleted, are not counted because they are not made.
+-- A giblet function is left alone: it allocates nothing by construction, and
+-- the check that says so has already run.
+
+import Data.Map as Map
+import Data.Set as Set
+import Turkey.Giblets as Giblets
+import Turkey.LowIr as L
+import Turkey.LowIr (Op(..), Low(..), AddressOf(..), BinOp(..), Callee(..))
+import Turkey.Source (Span(..), showSpan)
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (RepClass(..))
+
+-- Where the run's counts go: the site count, then one word per site, each a
+-- native-endian 64-bit integer.
+let counterFile = "turkey-alloc-sites.bin"
+
+-- Instrument every allocating instruction, and answer one line per site, in
+-- site order: `function`, the opcode, why it allocates, where it came from,
+-- and for a call through a closure, where the closure came from --
+-- tab-separated.
+fun instrument(functions : Array (Ssa.Func Low)) -> Array String {
+    let sites = []
+    let giblets = Giblets.gibletModules()
+    for f in functions {
+        if Set.contains(giblets, Giblets.moduleOf(f.name))
+                || f.name == Giblets.initializerName {
+            continue
+        }
+        let defs = Map.new()
+        for block in f.blocks {
+            for i in block.insts { Map.put(defs, Ssa.valueId(i.result), i.op) }
+        }
+        for block in f.blocks {
+            let out = []
+            for i in block.insts {
+                match L.allocatingOp(i.op) {
+                    Some(what) -> {
+                        let id = len(sites)
+                        let reason = Map.getOr(f.reasons, Ssa.valueId(i.result), what)
+                        let origin = match Map.get(f.origins, Ssa.valueId(i.result)) {
+                            Some(s) -> s.file + ":" + showSpan(s)
+                            None -> "?"
+                        }
+                        let callee = match i.op {
+                            Call(Indirect(c), _) -> describe(defs, c, 3)
+                            _ -> ""
+                        }
+                        Array.push(sites, f.name + "\t" + L.showOpName(i.op) + "\t"
+                                          + reason + "\t" + origin + "\t" + callee)
+                        count(f, out, id)
+                    }
+                    None -> {}
+                }
+                Array.push(out, i)
+            }
+            block.insts = out
+        }
+    }
+    sites
+}
+
+-- `counters[id + 1] += 1`, wrapping, as plain loads and stores: nothing here
+-- is a safepoint or a call, so the roots and frames are what they would be
+-- without it.
+fun count(f : Ssa.Func Low, out : Array Low, id : Int) -> Unit {
+    let word = Ssa.untraced(I64)
+    let base = Ssa.freshValue(f, Ssa.untraced(Ptr))
+    Array.push(out, L.low(base, Address(AllocSites)))
+    let offset = Ssa.freshValue(f, word)
+    Array.push(out, L.low(offset, ConstInt(8 * (id + 1))))
+    let old = Ssa.freshValue(f, word)
+    Array.push(out, L.low(old, PtrLoad(base, offset, I64)))
+    let one = Ssa.freshValue(f, word)
+    Array.push(out, L.low(one, ConstInt(1)))
+    let new = Ssa.freshValue(f, word)
+    Array.push(out, L.low(new, Bin(AddWrap, old, one)))
+    let done = Ssa.freshValue(f, Ssa.untraced(Unit))
+    Array.push(out, L.low(done, PtrStore(base, offset, new, I64)))
+}
+
+-- Where a value came from, a few definitions deep: enough to tell a method
+-- read out of a global dictionary from a closure passed in or built here.
+fun describe(defs : Map Int Op, v : Ssa.Value, depth : Int) -> String =
+    match Map.get(defs, Ssa.valueId(v)) {
+        None -> "a parameter"
+        Some(op) -> match op {
+            GlobalLoad(name) -> "global " + name
+            ObjectGet(inner, k) ->
+                if depth == 0 { "field " + Int.toString(k) + " of ..." }
+                else { "field " + Int.toString(k) + " of " + describe(defs, inner, depth - 1) }
+            ClosureNew(code, _) -> "closure of " + code
+            Call(_, _) -> "a call result"
+            other -> L.showOpName(other)
+        }
+    }

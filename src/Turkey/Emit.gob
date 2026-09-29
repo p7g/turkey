@@ -31,6 +31,7 @@ import Turkey.Asm as Asm
 import Turkey.Frame as Frame
 import Turkey.Regalloc as Regalloc
 import Turkey.Runtime as Rt
+import Turkey.Sites as Sites
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), BlockId(..), Term(..), Func(..), Block(..), Rep(..),
                    RepClass(..))
@@ -471,9 +472,20 @@ fun emitMessages(asm : Asm.Asm, b : String.Builder) -> Unit {
 -- Every name and every slot here was decided by `Turkey.Asm` before selection
 -- ran, which is what lets `ConstString` be a load of slot *n* emitted long
 -- before anything defined slot *n*.
-fun emitData(m : Module, asm : Asm.Asm, b : String.Builder) -> Unit {
+fun emitData(m : Module, asm : Asm.Asm, sites : Int, b : String.Builder) -> Unit {
     emitLiterals(asm, b)
     line(b, "    " + Asm.section(asm.dialect, Asm.Data))
+    -- A build that counts allocations (`Turkey.Sites`): the number of sites,
+    -- then a counter for each.
+    if sites > 0 {
+        line(b, "    .p2align 3")
+        line(b, Asm.runtimeFor(asm.dialect, "turkey_alloc_sites") + ":")
+        line(b, "    .quad " + Int.toString(sites))
+        line(b, "    .space " + Int.toString(8 * sites))
+        line(b, Asm.localLabel(asm.dialect, "alloc_sites_file") + ":")
+        emitBytes(Sites.counterFile, b)
+        line(b, "    .byte 0")
+    }
     -- An untraced global is a word of ordinary storage. A traced one is a slot
     -- of the root array instead -- storing to it and rooting it are the same
     -- store -- so this defines nothing for it.
@@ -560,7 +572,8 @@ fun emitBytes(text : String, b : String.Builder) -> Unit {
 -- backends -- and reaches this by its C symbol. `turkey_entry_returned`, at the
 -- end, parks the program's ending where the entry's own code will not unwind
 -- on it.
-fun emitEntry(asm : Asm.Asm, m : Module, main : String, b : String.Builder) -> Unit {
+fun emitEntry(asm : Asm.Asm, m : Module, main : String, sites : Int,
+              b : String.Builder) -> Unit {
     let d = asm.dialect
     line(b, "    " + Asm.section(d, Asm.Text))
     function(b, d, Asm.entrySymbol(d))
@@ -621,6 +634,7 @@ fun emitEntry(asm : Asm.Asm, m : Module, main : String, b : String.Builder) -> U
     instruction(b, A.Mov(A.x0, A.xzr, A.W64))
     line(b, "    bl " + Asm.symbolFor(d, main))
     line(b, Asm.localLabel(d, "entry_done") + ":")
+    if sites > 0 { writeSites(b, d, sites) }
     call(b, d, "turkey_entry_returned")
 
     instruction(b, A.Ldr(Physical(Gp, 29), Offset(A.sp, 16), A.W64))
@@ -648,6 +662,18 @@ fun emitEntry(asm : Asm.Asm, m : Module, main : String, b : String.Builder) -> U
     instruction(b, A.Ldr(Physical(Gp, 30), Offset(A.sp, 8), A.W64))
     line(b, "    add sp, sp, #16")
     line(b, "    ret")
+}
+
+-- The counters to `Sites.counterFile`, before the program's ending is
+-- reported: `creat`, which is not variadic as `open` is, then one `write`.
+fun writeSites(b : String.Builder, d : Asm.Dialect, sites : Int) -> Unit {
+    symbolInto(b, d, A.x0, Asm.localLabel(d, "alloc_sites_file"))
+    instruction(b, A.MovConst(Physical(Gp, 1), 420))
+    call(b, d, "creat")
+    line(b, "    sxtw x0, w0")
+    symbolInto(b, d, Physical(Gp, 1), Asm.runtimeFor(d, "turkey_alloc_sites"))
+    instruction(b, A.MovConst(Physical(Gp, 2), 8 * (sites + 1)))
+    call(b, d, "write")
 }
 
 -- The C-callable face of each `foreign` definition.

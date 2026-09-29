@@ -16,7 +16,9 @@ module Turkey.Emit (
 -- * the prologue and epilogue, from the layout;
 -- * the moves a block parameter becomes, as a parallel copy on the edge;
 -- * the branch a terminator becomes, and the fallthrough that lets one edge
---   cost nothing.
+--   cost nothing -- including the one place this reads two instructions as
+--   one: a `cset` that ends a block and feeds only its `branch` is the
+--   branch's condition, and the pair prints as a `b.cond`.
 --
 -- `as` is the oracle. Every instruction this prints is one the system
 -- assembler either accepts or refuses, which is what a text printer buys even
@@ -65,12 +67,70 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
     -- Reverse postorder, so a block's most likely successor is the next block
     -- and its edge costs no instruction at all.
     let order = Ssa.reversePostorder(f)
+    let reads = useCounts(f)
     for var k = 0; k < len(order); k = k + 1 {
         let at = Ssa.blockId(order[k])
         let next = if k + 1 < len(order) { Ssa.blockId(order[k + 1]) } else { -1 }
         line(b, blockLabel(d, tag, at) + ":")
-        for i in f.blocks[at].insts { emitInst(b, d, f, a, l, tag, i) }
-        emitTerm(b, d, f, a, l, tag, f.blocks[at].term, next)
+        let block = f.blocks[at]
+        match fused(block, reads) {
+            Some((c, yes, no)) -> {
+                for var n = 0; n < len(block.insts) - 1; n = n + 1 {
+                    emitInst(b, d, f, a, l, tag, block.insts[n])
+                }
+                conditional(b, d, tag, c, yes, no, next)
+            }
+            None -> {
+                for i in block.insts { emitInst(b, d, f, a, l, tag, i) }
+                emitTerm(b, d, f, a, l, tag, block.term, next)
+            }
+        }
+    }
+}
+
+-- How many times each value is read, terminators included.
+fun useCounts(f : Func Inst) -> Array Int {
+    let out = Array.filled(len(f.reps), 0)
+    for block in f.blocks {
+        for i in block.insts {
+            for v in Ssa.uses(i) { out[Ssa.valueId(v)] = out[Ssa.valueId(v)] + 1 }
+        }
+        for v in Ssa.termUses(block.term) {
+            out[Ssa.valueId(v)] = out[Ssa.valueId(v)] + 1
+        }
+    }
+    out
+}
+
+-- A block ending `cset %c, cond; branch %c` where nothing else reads `%c`:
+-- the branch can read the flags itself. Only when the `cset` is the last
+-- instruction, so that nothing between it and the branch -- a spill, a
+-- reload -- could have needed the bit in a register or changed the flags.
+fun fused(block : Block Inst, reads : Array Int) -> Option (A.Cond, BlockId, BlockId) {
+    match block.term {
+        Branch(c, yes, no) -> {
+            if len(block.insts) == 0 || reads[Ssa.valueId(c)] != 1 { return None }
+            match A.csetOf(block.insts[len(block.insts) - 1].op) {
+                Some((n, cond)) -> if n == Ssa.valueId(c) { Some((cond, yes, no)) }
+                                   else { None }
+                None -> None
+            }
+        }
+        _ -> None
+    }
+}
+
+-- `b.cond` to one arm, falling through to the other where it is next.
+fun conditional(b : String.Builder, d : Asm.Dialect, tag : Int, c : A.Cond,
+                yes : BlockId, no : BlockId, next : Int) -> Unit {
+    if Ssa.blockId(yes) == next {
+        line(b, "    b." + A.condName(A.invert(c)) + " "
+                + blockLabel(d, tag, Ssa.blockId(no)))
+    } else {
+        line(b, "    b." + A.condName(c) + " " + blockLabel(d, tag, Ssa.blockId(yes)))
+        if Ssa.blockId(no) != next {
+            line(b, "    b " + blockLabel(d, tag, Ssa.blockId(no)))
+        }
     }
 }
 

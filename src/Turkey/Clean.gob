@@ -1,4 +1,4 @@
-module Turkey.Clean (eliminateCopies, eliminateDead)
+module Turkey.Clean (eliminateCopies, eliminateDead, mergeBlocks)
 
 -- Copy elimination and dead instruction elimination, written once against
 -- `class Inst i` and run on both sides of instruction selection.
@@ -234,4 +234,56 @@ fun needed[Inst i](live : Array Bool, inst : i) -> Bool {
         if live[Ssa.valueId(v)] { return True }
     }
     False
+}
+
+-- -- blocks --------------------------------------------------------------------------
+
+-- Merge each block into its predecessor where that predecessor's jump is the
+-- only way in, and answer the function without the emptied blocks.
+--
+-- Lowering makes these chains -- a block per statement, a block for each
+-- value a `match` or an `if` delivers -- and a chain of fallthroughs costs no
+-- instructions, but it keeps apart what a later pass reads as one: a
+-- comparison in one block and the branch on it in the next cannot become one
+-- conditional branch. A merged block takes no parameters: copy elimination has
+-- already removed a parameter whose only jump passes it one value.
+--
+-- Blocks are renumbered, like `Ssa.pruneUnreachable`, so this runs before
+-- anything records a `BlockId`.
+fun mergeBlocks[Inst i](f : Func i) -> Func i {
+    let preds = Ssa.predecessors(f)
+    var merged = False
+    for var b = 0; b < len(f.blocks); b = b + 1 {
+        var going = True
+        while going {
+            going = False
+            match f.blocks[b].term {
+                Jump(target, args) -> {
+                    let t = Ssa.blockId(target)
+                    if t != b && t != Ssa.blockId(f.entry) && len(args) == 0
+                            && len(preds[t]) == 1
+                            && len(f.blocks[t].params) == 0 {
+                        let into = f.blocks[b]
+                        let from = f.blocks[t]
+                        for inst in from.insts { Array.push(into.insts, inst) }
+                        into.term = from.term
+                        from.insts = []
+                        from.term = Unreachable
+                        -- The merged block's successors are now reached from
+                        -- `b`, so a later merge through one of them still sees
+                        -- exactly one predecessor.
+                        for s in Ssa.successors(into.term) {
+                            let at = Ssa.blockId(s)
+                            preds[at] = Array.map(preds[at], fun(p) =
+                                if Ssa.blockId(p) == t { BlockId(b) } else { p })
+                        }
+                        merged = True
+                        going = True
+                    }
+                }
+                _ -> {}
+            }
+        }
+    }
+    if merged { Ssa.pruneUnreachable(f) } else { f }
 }

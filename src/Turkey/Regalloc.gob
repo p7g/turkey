@@ -80,7 +80,7 @@ fun pressureOf(f : Func A.Inst) -> Pressure {
     let liveOut = Ssa.liveness(f)
     for var b = 0; b < len(f.blocks); b = b + 1 {
         let at = Ssa.BlockId(b)
-        let (og, of_) = countOf(f, liveOut[b])
+        let (og, of_) = countOf(f, Set.elements(liveOut[b]))
         if og > gp { gp = og }
         if of_ > fp { fp = of_ }
         for live in Ssa.liveAfter(f, at, liveOut[b]) {
@@ -95,10 +95,10 @@ fun pressureOf(f : Func A.Inst) -> Pressure {
 -- A live set split by register file. `Ssa.liveness` answers value ids, and
 -- `f.reps` is what says which file each belongs in -- the same table the low
 -- IR used, because selection copies it rather than deriving a second one.
-fun countOf(f : Func A.Inst, live : Set.Set Int) -> (Int, Int) {
+fun countOf(f : Func A.Inst, live : Array Int) -> (Int, Int) {
     var gp = 0
     var fp = 0
-    for id in Set.elements(live) {
+    for id in live {
         match A.bankOf(f.reps[id]) {
             Gp -> { gp = gp + 1 }
             Fp -> { fp = fp + 1 }
@@ -145,7 +145,7 @@ fun acrossCalls(f : Func A.Inst) -> AcrossCalls {
                 var thisTg = 0
                 var thisUf = 0
                 var thisTf = 0
-                for id in Set.elements(after[n]) {
+                for id in after[n] {
                     let rep = f.reps[id]
                     match A.bankOf(rep) {
                         Gp -> if rep.traced { thisTg = thisTg + 1 }
@@ -198,7 +198,7 @@ fun effectivePressure(f : Func A.Inst) -> Pressure {
         let after = Ssa.liveAfter(f, Ssa.BlockId(b), liveOut[b])
         for var n = 0; n < len(block.insts); n = n + 1 {
             if A.isCall(block.insts[n]) {
-                for id in Set.elements(after[n]) {
+                for id in after[n] {
                     if f.reps[id].traced { Set.add(rooted, id) }
                 }
             }
@@ -208,7 +208,7 @@ fun effectivePressure(f : Func A.Inst) -> Pressure {
     var fp = 0
     for var b = 0; b < len(f.blocks); b = b + 1 {
         let at = Ssa.BlockId(b)
-        let (og, of_) = countExcept(f, liveOut[b], rooted)
+        let (og, of_) = countExcept(f, Set.elements(liveOut[b]), rooted)
         if og > gp { gp = og }
         if of_ > fp { fp = of_ }
         for live in Ssa.liveAfter(f, at, liveOut[b]) {
@@ -220,11 +220,11 @@ fun effectivePressure(f : Func A.Inst) -> Pressure {
     Pressure { gp = gp, fp = fp }
 }
 
-fun countExcept(f : Func A.Inst, live : Set.Set Int,
+fun countExcept(f : Func A.Inst, live : Array Int,
                 skip : Set.Set Int) -> (Int, Int) {
     var gp = 0
     var fp = 0
-    for id in Set.elements(live) {
+    for id in live {
         if !Set.contains(skip, id) {
             match A.bankOf(f.reps[id]) {
                 Gp -> { gp = gp + 1 }
@@ -344,7 +344,7 @@ fun walk(f : Func A.Inst, spills : Spills, evict : Bool) -> Walk {
             -- before it: an operand that dies here may share the destination's
             -- register, which is what makes `add x0, x0, x1` legal.
             let live = Map.new()
-            for id in Set.elements(after[n]) {
+            for id in after[n] {
                 if w.of_[id] >= 0 { Map.put(live, key(f, id, w.of_[id]), id) }
             }
             for d in Ssa.defs(block.insts[n]) {
@@ -358,13 +358,18 @@ fun walk(f : Func A.Inst, spills : Spills, evict : Bool) -> Walk {
 
 -- A taken-register key. The two files are allocated apart, so `x3` and `d3`
 -- must not collide in one set; the bank is part of the key rather than the set
--- being split in two, which would double every loop above.
-fun key(f : Func A.Inst, id : Int, n : Int) -> String = keyIn(A.bankOf(f.reps[id]), n)
+-- being split in two, which would double every loop above. Register numbers
+-- are below 32, so the vector file starts there.
+fun key(f : Func A.Inst, id : Int, n : Int) -> Int = keyIn(A.bankOf(f.reps[id]), n)
 
-fun keyIn(bank : Bank, n : Int) -> String = match bank {
-    Gp -> "x" + Int.toString(n)
-    Fp -> "d" + Int.toString(n)
+fun keyIn(bank : Bank, n : Int) -> Int = match bank {
+    Gp -> n
+    Fp -> 32 + n
 }
+
+-- A key as the register's name, for a message.
+fun keyName(k : Int) -> String =
+    if k < 32 { "x" + Int.toString(k) } else { "d" + Int.toString(k - 32) }
 
 fun poolOf(bank : Bank) -> Array Int = match bank {
     Gp -> gpPool
@@ -397,7 +402,7 @@ fun fileName(bank : Bank) -> String = match bank {
 --   definition and its store. Something *else* has to leave, and the holder
 --   whose next use is furthest away is Belady's answer and the one that frees
 --   the register for longest.
-fun place(w : Walk, taken : Map String Int, id : Int, block : Ssa.Block A.Inst,
+fun place(w : Walk, taken : Map Int Int, id : Int, block : Ssa.Block A.Inst,
           from : Int) -> Unit {
     if w.of_[id] >= 0 { return }
     let spills = w.spills
@@ -451,7 +456,7 @@ fun stopOnce(w : Walk, why : String) -> Unit = match w.stopped {
 -- *hinted* to their argument registers rather than pinned to them -- a pin
 -- can contradict (a parameter in `x0` that is live across a call has had `x0`
 -- destroyed), and a preference cannot.
-fun freeRegister(taken : Map String Int, forbidden : Set.Set Int, bank : Bank,
+fun freeRegister(taken : Map Int Int, forbidden : Set.Set Int, bank : Bank,
                  hint : Int) -> Option Int {
     -- Only a register the pool would hand out: a move from `x29`, which is
     -- how `Prim.frameAddress` reads the frame, must not colour its
@@ -469,7 +474,7 @@ fun freeRegister(taken : Map String Int, forbidden : Set.Set Int, bank : Bank,
     None
 }
 
-fun anyUnheld(taken : Map String Int, bank : Bank) -> Bool {
+fun anyUnheld(taken : Map Int Int, bank : Bank) -> Bool {
     for n in poolOf(bank) {
         if !Map.contains(taken, keyIn(bank, n)) { return True }
     }
@@ -479,7 +484,7 @@ fun anyUnheld(taken : Map String Int, bank : Bank) -> Bool {
 -- The holder to evict: in the same file, not a reload or a store (those live
 -- for one instruction and spilling them again would loop), and used furthest
 -- from `from`. Ties go to the lower value id, so that two runs agree.
-fun victim(w : Walk, taken : Map String Int, bank : Bank,
+fun victim(w : Walk, taken : Map Int Int, bank : Bank,
            block : Ssa.Block A.Inst, from : Int) -> Option Int {
     let spills = w.spills
     var best = -1
@@ -554,7 +559,7 @@ fun forbiddenSets(f : Func A.Inst,
         for var n = 0; n < len(block.insts); n = n + 1 {
             let clobbered = clobbersOf(block.insts[n])
             if len(clobbered) > 0 {
-                for id in Set.elements(after[n]) {
+                for id in after[n] {
                     let bank = A.bankOf(f.reps[id])
                     for (cb, cn) in clobbered {
                         if sameBank(bank, cb) { Set.add(out[id], cn) }
@@ -573,7 +578,7 @@ fun forbiddenSets(f : Func A.Inst,
                         Gp -> held.gp
                         Fp -> held.fp
                     }
-                    for r in Set.elements(taken) { Set.add(out[id], r) }
+                    for r in taken { Set.add(out[id], r) }
                 }
             }
         }
@@ -583,15 +588,16 @@ fun forbiddenSets(f : Func A.Inst,
 
 -- The values live after an instruction, plus the ones it defines whether or
 -- not they are used. A dead definition still writes a register.
-fun touched(i : A.Inst, after : Set.Set Int) -> Set.Set Int {
+fun touched(i : A.Inst, after : Array Int) -> Set.Set Int {
     let out = Set.new()
-    for id in Set.elements(after) { Set.add(out, id) }
+    for id in after { Set.add(out, id) }
     for d in Ssa.defs(i) { Set.add(out, Ssa.valueId(d)) }
     out
 }
 
--- Physical registers live at a program point, per file.
-type PhysicalLive = PhysicalLive { gp : Set.Set Int, fp : Set.Set Int }
+-- Physical registers live at a program point, per file. Arrays of distinct
+-- register numbers, for the reason `Ssa.liveAfter` answers arrays.
+type PhysicalLive = PhysicalLive { gp : Array Int, fp : Array Int }
 
 -- The physical registers live *after* each instruction of a block, and the
 -- ones live on entry to it.
@@ -604,18 +610,16 @@ type PhysicalLive = PhysicalLive { gp : Set.Set Int, fp : Set.Set Int }
 -- hold: it is `xzr` or `sp`. Nor is `x29`, which the prologue sets and nothing
 -- else writes, so reading it -- `Prim.frameAddress` does -- is always good.
 fun physicalLive(block : Ssa.Block A.Inst) -> (Array PhysicalLive, PhysicalLive) {
-    let sets : Array PhysicalLive = []
-    for _ in block.insts {
-        Array.push(sets, PhysicalLive { gp = Set.new(), fp = Set.new() })
-    }
+    -- Nothing is live at almost every point, so those share one value.
+    let nothing = PhysicalLive { gp = [], fp = [] }
+    let sets : Array PhysicalLive = Array.new(len(block.insts))
+    for _ in block.insts { Array.push(sets, nothing) }
     let gp = Set.new()
     let fp = Set.new()
     for var n = len(block.insts) - 1; n >= 0; n = n - 1 {
-        let hereGp = Set.new()
-        let hereFp = Set.new()
-        for r in Set.elements(gp) { Set.add(hereGp, r) }
-        for r in Set.elements(fp) { Set.add(hereFp, r) }
-        sets[n] = PhysicalLive { gp = hereGp, fp = hereFp }
+        if len(gp) > 0 || len(fp) > 0 {
+            sets[n] = PhysicalLive { gp = Set.elements(gp), fp = Set.elements(fp) }
+        }
         let op = block.insts[n].op
         for r in A.destRegs(op) {
             match r {
@@ -632,7 +636,7 @@ fun physicalLive(block : Ssa.Block A.Inst) -> (Array PhysicalLive, PhysicalLive)
             }
         }
     }
-    (sets, PhysicalLive { gp = gp, fp = fp })
+    (sets, PhysicalLive { gp = Set.elements(gp), fp = Set.elements(fp) })
 }
 
 fun sameBank(a : Bank, b : Bank) -> Bool = match (a, b) {
@@ -700,7 +704,7 @@ fun verifyColouring(f : Func A.Inst, c : Colouring) -> Array String {
             Array.push(out, "a physical register is live on entry to block b"
                             + Int.toString(b))
         }
-        let none = PhysicalLive { gp = Set.new(), fp = Set.new() }
+        let none = PhysicalLive { gp = [], fp = [] }
         for var n = 0; n < len(block.insts); n = n + 1 {
             checkPoint(out, f, c, forbidden, touched(block.insts[n], after[n]),
                        physical[n], where_(b, n))
@@ -729,13 +733,14 @@ fun checkPoint(out : Array String, f : Func A.Inst, c : Colouring,
                             + " with no register assigned")
         }
         if r >= 0 {
-            let k = key(f, id, r)
-            match Map.get(seen, k) {
+            let slot = key(f, id, r)
+            let k = keyName(slot)
+            match Map.get(seen, slot) {
                 Some(other) -> Array.push(out,
                     "values %" + Int.toString(other) + " and %"
                     + Int.toString(id) + " both hold " + k + " at "
                     + at)
-                None -> Map.put(seen, k, id)
+                None -> Map.put(seen, slot, id)
             }
             if Set.contains(forbidden[id], r) {
                 Array.push(out, "value %" + Int.toString(id) + " holds " + k
@@ -746,7 +751,7 @@ fun checkPoint(out : Array String, f : Func A.Inst, c : Colouring,
                 Gp -> physical.gp
                 Fp -> physical.fp
             }
-            if Set.contains(held, r) {
+            if Array.contains(held, r) {
                 Array.push(out, "value %" + Int.toString(id) + " holds " + k
                                 + " while the physical " + k + " is live, at "
                                 + at)
@@ -777,7 +782,7 @@ fun untracedPressure(f : Func A.Inst) -> Pressure {
     var fp = 0
     for var b = 0; b < len(f.blocks); b = b + 1 {
         let at = Ssa.BlockId(b)
-        let (og, of_) = countExcept(f, liveOut[b], traced)
+        let (og, of_) = countExcept(f, Set.elements(liveOut[b]), traced)
         if og > gp { gp = og }
         if of_ > fp { fp = of_ }
         for live in Ssa.liveAfter(f, at, liveOut[b]) {
@@ -803,7 +808,7 @@ fun worstCall(f : Func A.Inst) -> Int {
         for var n = 0; n < len(block.insts); n = n + 1 {
             if A.isCall(block.insts[n]) {
                 var here = 0
-                for id in Set.elements(after[n]) {
+                for id in after[n] {
                     match A.bankOf(f.reps[id]) {
                         Gp -> { here = here + 1 }
                         Fp -> {}

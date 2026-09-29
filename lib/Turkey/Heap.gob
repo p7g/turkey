@@ -520,7 +520,10 @@ fun newRegion(bytes : Int, slotSize : Int, sizeClass : Int, large : Bool) -> Pri
     store32(made, regionSizeClass, if large { regionClasses } else { sizeClass })
     Prim.storePtr(made, regionNext, regions)
     regions = made
-    if !large { Prim.storePtr(available, times8(sizeClass), made) }
+    if !large {
+        Prim.storePtr(available, times8(sizeClass), made)
+        Prim.storeI64(reciprocals, times8(sizeClass), (4294967296 + slotSize - 1) / slotSize)
+    }
     regionBytesInUse = regionBytesInUse + reserved
     if regionBytesInUse > regionBytesPeak { regionBytesPeak = regionBytesInUse }
     made
@@ -830,51 +833,74 @@ fun scanNativeFrames(frame : Prim.Ptr) -> Unit {
 }
 
 -- -- marking ----------------------------------------------------------------------------
+--
+-- An object is marked when it is first pushed, in its region's mark bitmap:
+-- an edge to an object already marked -- most edges, in a heap of shared
+-- names and types -- then reads the region's header, which a few thousand
+-- objects share and which stays in cache, and not the object's own. The
+-- header's epoch is written too, for the verifier, which checks the two agree.
+--
+-- `drain` is the whole of the tracing loop, decoding and pushing in line: the
+-- inliner does not copy a body this size, and a call per edge was most of what
+-- marking cost.
 
--- Mark `value` and push it for its children. `what` and `index` name where it
--- was found, for the diagnostic if it is not a heap pointer; `what` null means
--- a field or root the caller cannot name.
+-- Each size class's slot size as a multiplier: 2^32 / slot, rounded up, and
+-- 0 for a large region, whose one slot is at offset 0. A slot's offset times
+-- it, over 2^32, is the slot's index, exactly: the offset is a multiple of the
+-- slot size below 2^16, so the rounding adds less than 2^16 / 2^32 to a whole
+-- number. Set by `newRegion` for each class it makes a region of, which is
+-- before anything in the class can be marked.
+var reciprocals : Prim.Ptr = zeroed(8 * (regionClasses + 1))
+
+-- Mark and push `value`, a root found as `what` `index`, if it is not null
+-- and not yet marked. `what` null means a root the caller cannot name.
 fun markGrey(value : Prim.Ptr, what : Prim.Ptr, index : Int) -> Unit {
     if Prim.ptrIsNull(value) { return {} }
-    -- Exact roots and layout metadata make finding the header O(1) in normal
-    -- execution. GC stress keeps the membership check, and it earns the cost:
-    -- a pointer that is not in the heap means a root was missed or a layout
-    -- bitmap is wrong, and this turns that from a rare corruption into a panic
-    -- on the first collection.
-    let header = if stress { findHeader(value) } else { Prim.ptrAdd(value, payloadHeader) }
-    if Prim.ptrIsNull(header) {
+    -- Exact roots and layout metadata make the header O(1) to find in normal
+    -- execution. GC stress checks membership, and it earns the cost: a pointer
+    -- that is not in the heap means a root was missed or a layout bitmap is
+    -- wrong, and this turns that from a rare corruption into a panic on the
+    -- first collection.
+    if stress && Prim.ptrIsNull(findHeader(value)) {
         notHeapPointer(value, what, index)
         return {}
     }
-    if load32(header, headerMarked) == markEpoch { return {} }
-    store32(header, headerMarked, markEpoch)
+    let header = Prim.ptrFromInt(Prim.intSubWrapping(Prim.ptrToInt(value), headerBytes))
     let region = regionOf(header)
-    let slot = Prim.ptrDiff(header, Prim.ptrAdd(region, regionData))
-        / Prim.loadI64(region, regionSlotSize)
-    setBit(region, regionMarked, slot)
+    let slot = slotOf(region, header)
+    let at = plus(regionMarked, times8(Prim.intShr(slot, 6)))
+    let marks = Prim.loadI64(region, at)
+    if Prim.intAnd(marks, bit(slot)) != 0 { return {} }
+    Prim.storeI64(region, at, Prim.intOr(marks, bit(slot)))
     store32(region, regionLive, plus(load32(region, regionLive), 1))
-    if markCount == markCapacity {
-        let capacity = if markCapacity < 64 { 64 } else { markCapacity * 2 }
-        let grown = Libc.realloc(markStack, 8 * capacity)
-        if Prim.ptrIsNull(grown) {
-            Process.panic(Prim.cString("out of memory while tracing the heap"))
-            return {}
-        }
-        markStack = grown
-        markCapacity = capacity
-    }
+    store32(header, headerMarked, markEpoch)
+    if markCount == markCapacity && !growMarkStack() { return {} }
     Prim.storePtr(markStack, times8(markCount), value)
     markCount = plus(markCount, 1)
 }
 
-fun drain() -> Unit {
-    while markCount > 0 {
-        markCount = Prim.intSubWrapping(markCount, 1)
-        markChildren(Prim.loadPtr(markStack, times8(markCount)))
-    }
+-- The index of the slot whose header is `header`, in `region`.
+fun slotOf(region : Prim.Ptr, header : Prim.Ptr) -> Int {
+    let offset = Prim.intSubWrapping(Prim.ptrDiff(header, region), regionData)
+    let multiplier = Prim.loadI64(reciprocals, times8(load32(region, regionSizeClass)))
+    Prim.intShr(Prim.intMulWrapping(offset, multiplier), 32)
 }
 
--- The one place the collector decodes an object's layout.
+-- Double the mark stack; False, with a panic raised, if there is no memory.
+fun growMarkStack() -> Bool {
+    let capacity = if markCapacity < 64 { 64 } else { markCapacity * 2 }
+    let grown = Libc.realloc(markStack, 8 * capacity)
+    if Prim.ptrIsNull(grown) {
+        Process.panic(Prim.cString("out of memory while tracing the heap"))
+        return False
+    }
+    markStack = grown
+    markCapacity = capacity
+    True
+}
+
+-- Trace everything reachable from the stack, emptying it. This is the one
+-- place the collector decodes an object's layout.
 --
 -- An array's tag is its element's layout code, and the other objects carry a
 -- code per slot: three bits each for constructors and records, one bit each
@@ -882,41 +908,70 @@ fun drain() -> Unit {
 -- pointer-sized word the collector must not follow: a raw address. A test of
 -- `>= 6` follows both, and collects through an address it has no business
 -- reading.
-fun markChildren(value : Prim.Ptr) -> Unit {
-    let heapKind = load32(value, payloadKind)
-    if heapKind == heapCell {
-        if load32(value, 8) != 0 {
-            markGrey(Prim.loadPtr(value, 0), Prim.ptrNull(), 0)
+fun drain() -> Unit {
+    var top = markCount
+    while top > 0 {
+        top = Prim.intSubWrapping(top, 1)
+        let object = Prim.loadPtr(markStack, times8(top))
+        -- Where its pointers start, how many slots, and how each is coded:
+        -- 0 every slot is a pointer, 1 three bits per slot, 2 one bit.
+        var first = objectSlots
+        var slots = 0
+        var coding = 0
+        var codes = 0
+        let heapKind = load32(object, payloadKind)
+        if heapKind == heapCell {
+            first = 0
+            slots = if load32(object, 8) != 0 { 1 } else { 0 }
+        } else if heapKind == heapObject {
+            let kind = load32(object, objectKind)
+            codes = Prim.loadI64(object, objectBitmap)
+            if kind == 2 {
+                if load32(object, objectTag) == 7 { slots = Prim.loadI64(object, objectCount) }
+            } else {
+                slots = Prim.loadI64(object, objectCount)
+                coding = if kind == 0 || kind == 1 { 1 } else { 2 }
+            }
         }
-        return {}
+        for var field = 0; field < slots; field = plus(field, 1) {
+            let traced = if coding == 0 { True } else if coding == 1 {
+                Prim.intAnd(Prim.intShr(codes, Prim.intMulWrapping(3, field)), 7) == 7
+            } else { Prim.intAnd(codes, bit(field)) != 0 }
+            let child = if traced { Prim.loadPtr(object, plus(first, times8(field))) }
+                        else { Prim.ptrNull() }
+            if Prim.ptrIsNull(child) {
+            } else if stress && Prim.ptrIsNull(findHeader(child)) {
+                notHeapPointer(child, fieldName(heapKind, coding), field)
+            } else {
+                let childHeader = Prim.ptrFromInt(Prim.intSubWrapping(Prim.ptrToInt(child), headerBytes))
+                let childRegion = regionOf(childHeader)
+                let childSlot = slotOf(childRegion, childHeader)
+                let at = plus(regionMarked, times8(Prim.intShr(childSlot, 6)))
+                let marks = Prim.loadI64(childRegion, at)
+                let mask = bit(childSlot)
+                if Prim.intAnd(marks, mask) == 0 {
+                    Prim.storeI64(childRegion, at, Prim.intOr(marks, mask))
+                    store32(childRegion, regionLive, plus(load32(childRegion, regionLive), 1))
+                    store32(childHeader, headerMarked, markEpoch)
+                    if top == markCapacity && !growMarkStack() {
+                        markCount = 0
+                        return {}
+                    }
+                    Prim.storePtr(markStack, times8(top), child)
+                    top = plus(top, 1)
+                }
+            }
+        }
     }
-    if heapKind != heapObject { return {} }
-    let kind = load32(value, objectKind)
-    let count = Prim.loadI64(value, objectCount)
-    let bitmap = Prim.loadI64(value, objectBitmap)
-    if kind == 2 {
-        if load32(value, objectTag) == 7 {
-            for var i = 0; i < count; i = plus(i, 1) {
-                markGrey(Prim.loadPtr(value, plus(objectSlots, times8(i))),
-                         Prim.cString("array pointer field"), i)
-            }
-        }
-    } else if kind == 0 || kind == 1 {
-        for var i = 0; i < count; i = plus(i, 1) {
-            if Prim.intAnd(Prim.intShr(bitmap, Prim.intMulWrapping(3, i)), 7) == 7 {
-                markGrey(Prim.loadPtr(value, plus(objectSlots, times8(i))),
-                         Prim.cString("object pointer field"), i)
-            }
-        }
-    } else {
-        for var i = 0; i < count; i = plus(i, 1) {
-            if Prim.intAnd(bitmap, bit(i)) != 0 {
-                markGrey(Prim.loadPtr(value, plus(objectSlots, times8(i))),
-                         Prim.cString("capture"), i)
-            }
-        }
-    }
+    markCount = 0
 }
+
+-- What `notHeapPointer` calls a field, by how its object codes its slots.
+fun fieldName(cellOrObject : Int, slotCoding : Int) -> Prim.Ptr =
+    if cellOrObject == heapCell { Prim.ptrNull() }
+    else if slotCoding == 0 { Prim.cString("array pointer field") }
+    else if slotCoding == 1 { Prim.cString("object pointer field") }
+    else { Prim.cString("capture") }
 
 -- "<what> <index> is not a heap pointer (0x...)", or "GC root or field is not
 -- a heap pointer (0x...)" when the caller cannot name where it looked. Named,

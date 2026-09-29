@@ -373,8 +373,8 @@ fun main() {
     elif defect == "shadow-roots":
         before, after = "    var root = roots\n", "    var root = Prim.ptrNull()\n"
     else:
-        before = "fun markChildren(value : Prim.Ptr) -> Unit {\n"
-        after = before + "    if !Prim.ptrIsNull(value) { return {} }\n"
+        before = "        let object = Prim.loadPtr(markStack, times8(top))\n"
+        after = before + "        if !Prim.ptrIsNull(object) { continue }\n"
     assert text.count(before) == 1, before
     heap.write_text(text.replace(before, after))
     result = subprocess.run(toolchain.command(bootc.binary(), backend, str(source)),

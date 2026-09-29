@@ -2,8 +2,8 @@
 
 `families.gob` is the golden that runs. This file is the part a golden cannot
 display -- that an equation over a family *waits* rather than succeeding or
-failing, which is the third outcome M7 gives unification, and that everything
-downstream (schemes, dictionaries, the evaluator) sees a family only after it
+failing, which is unification's third outcome, and that everything
+downstream (schemes, dictionaries, the backend) sees a family only after it
 has reduced.
 """
 
@@ -174,7 +174,7 @@ def test_a_scheme_may_be_constrained_on_a_family():
 def test_an_equation_over_an_open_family_waits_rather_than_failing():
     # At `n + 1` nothing yet says what `xs` is, so `Elem c ~ Int` is neither
     # true nor false -- it waits, and the *later* line decides it. That third
-    # outcome is the milestone; order-independence is what it buys.
+    # outcome is the point; order-independence is what it buys.
     src = CONTAINER + """
     fun f(xs) {
         let n = first(xs)
@@ -187,11 +187,10 @@ def test_an_equation_over_an_open_family_waits_rather_than_failing():
 
 
 def test_an_equation_no_instance_decides_is_carried_by_the_scheme():
-    # The counterpart, and what delta 39 changed. Nothing here ever decides
-    # `c`, and `Elem c ~ Int` holds for some containers and not others -- so
-    # the condition travels to the caller, exactly as `Container c` does. This
-    # was a hard error before: the equation was stuck, and a stuck equation was
-    # rejected at the binder rather than retained by it.
+    # The counterpart. Nothing here ever decides `c`, and `Elem c ~ Int` holds
+    # for some containers and not others -- so the condition travels to the
+    # caller, exactly as `Container c` does: a stuck equation is retained by
+    # the binder's scheme, not rejected at it.
     src = CONTAINER + """
     fun f(xs) {
         let n : Int = first(xs)
@@ -227,7 +226,7 @@ def test_a_carried_equation_is_checked_at_the_use_site(capsys):
 
 def test_an_equation_that_can_never_be_decided_is_rejected():
     message = fails(CONTAINER + "fun f[Container c](xs : c) -> Int = first(xs)")
-    # `c` is the name the signature wrote, kept by the skolem (delta 38).
+    # `c` is the name the signature wrote, kept by the skolem.
     assert "cannot reduce 'Container.Elem c' to 'Int'" in message
     assert "which 'Container' instance defines it" in message
     # And the remedy, which is the equality itself: `f` is rejected for saying
@@ -297,7 +296,7 @@ def test_the_element_type_dispatches_the_method_called_on_it(capsys):
     assert output(src, capsys) == ["7", "yes", "3"]
 
 
-# -- equality constraints (delta 39) ------------------------------------------
+# -- equality constraints -----------------------------------------------------
 
 OPS = """
 type Op = Inc(Int) | Loop(Array Op)
@@ -321,8 +320,8 @@ def test_an_equality_parses_and_round_trips():
 def test_an_equality_on_the_element_is_inferred():
     """No annotation: the element is merely *used* at a concrete type.
 
-    This was a hard error before delta 39 -- `Item a ~ Op` was stuck at the
-    binder, and a stuck equation was rejected there rather than retained.
+    `Item a ~ Op` is stuck at the binder, and a stuck equation is retained in
+    the scheme rather than rejected there.
     """
     src = OPS + """
     fun countOps(ops) {
@@ -366,8 +365,8 @@ def test_matching_the_element_is_inferred_too():
     """A constructor pattern *unifies*, so it needs no given to work.
 
     `Inc` fixes the scrutinee at `Op` by the ordinary route, which defers
-    `Item a ~ Op` and now retains it. So the un-annotated form gets a type as
-    well, and a more general one than delta 38 alone could give it. The given
+    `Item a ~ Op` and retains it. So the un-annotated form gets a type as
+    well, and a more general one than a checked signature would. The given
     earns its place where a family must reduce for something other than
     unification -- see the `runOps` above, whose `Item s` is rigid.
     """

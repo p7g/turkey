@@ -34,10 +34,9 @@ fun main() {
 
 
 def test_arguments_reach_the_program(tmp_path: Path) -> None:
-    # Element zero is the program's first argument, not its own name. The C
-    # backend hands over `argv + 1` for the same reason: the two hosts have to
-    # agree on this, or a self-compiled compiler reads a different command line
-    # than the one that built it (M26).
+    # Element zero is the program's first argument, not its own name: the
+    # entry hands over `argv + 1`. Were it otherwise, a self-compiled compiler
+    # would read its command line shifted by one.
     result = _run(ARGS, tmp_path, "input.gob", "-o", "out.c")
     assert result.code == 0, result.stderr
     assert result.stdout == "3\ninput.gob\n-o\nout.c\n"

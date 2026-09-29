@@ -1,15 +1,15 @@
 """`src/Turkey/SsaLower.gob`: Core to the low IR.
 
-M27 phase 1, and incomplete on purpose. A Core form nothing handles yet stops
-one binding rather than the run, and `boot ssa` reports the count -- which is
-the progress signal for building this in slices against real programs.
+A Core form the lowering does not handle stops one binding rather than the run,
+and `boot ssa` reports the count, so a gap is a line in a dump rather than a
+crash -- and `test_nothing_is_skipped` below makes that line a failure.
 
 What is asserted is not how *much* lowers. It is that everything which does is
 well formed: `Turkey.Ssa.verify` runs over every lowered function and the dump
 carries a `!!` line per complaint. There is no byte-identical oracle below Core
 and there should not be -- diffing this against a JIT's IR would couple it to
-the artifact it deliberately does not copy -- so the verifier is what stands in
-until `boot ssa` can produce code that runs (`NATIVE-BACKEND.md`).
+the artifact it deliberately does not copy -- so the verifier stands in here,
+and running the compiled programs is the check below it.
 """
 
 import functools
@@ -145,9 +145,8 @@ def test_the_environment_is_scoped():
 def test_representations_are_converted_explicitly():
     """Byte/Int boundaries preserve explicit width conversions.
 
-    The old box assertion only exercised boxed zero used to initialize
-    pointer arrays. Those allocations are gone; typed numeric boundaries
-    still require real conversions rather than mismatched representations.
+    Typed numeric boundaries require real conversions rather than
+    mismatched representations.
     """
     out = _ssa("closure_abi.gob")
     assert "widen %" in out
@@ -158,8 +157,8 @@ def test_the_array_primitives_are_instructions():
     """Not runtime calls: the element representation decides the stride.
 
     That is a fact instruction selection must see rather than one buried in a
-    callee, which is why `NATIVE-BACKEND.md` puts the heap operations in the
-    opcode and leaves the rest as symbols.
+    callee, which is why the low IR puts the heap operations in the opcode and
+    leaves the rest as calls.
     """
     out = _ssa("stack.gob")
     assert "array.get " in out
@@ -169,13 +168,12 @@ def test_the_array_primitives_are_instructions():
 
 @pytest.mark.parametrize("name", SAMPLE)
 def test_nothing_is_skipped(name):
-    """The histogram is empty, which is what finishes M27 phase 1.
+    """The histogram is empty.
 
     Every Core form these programs contain reaches the low IR: the function
     bodies, the lambdas closure conversion lifts out of them, and the globals
-    the module initializer computes. This is the coverage ratchet -- it was
-    "every reason is `not a function`" while globals were unhandled, and a new
-    unhandled form is now a failing test rather than a line in a dump nobody
+    the module initializer computes. This is the coverage ratchet: a newly
+    unhandled form is a failing test rather than a line in a dump nobody
     reads.
     """
     out = _ssa(name)

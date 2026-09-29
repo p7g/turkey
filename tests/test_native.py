@@ -1,23 +1,16 @@
 """`boot llvm`: the corpus compiled to native code, and run.
 
-M27 phase 2, and the first point at which the bootstrap compiler produces
-something that *executes*. Everything below Core was checked by `Ssa.verify`
-until now, because there is no byte-identical oracle down there; here there is
-a better one, and it is the one `NATIVE-BACKEND.md` names for this phase --
-**differential execution**. Each program is compiled by `boot`, linked against
-the runtime, run, and its output diffed against the reference implementation
-running the same source.
+The LLVM backend, checked by **differential execution** against the arm64 one.
+Below Core there is no byte-identical oracle, so each program is compiled by
+`boot llvm`, linked, run, and its output diffed against the same program
+compiled by the arm64 backend (whose output `test_programs` checks against the
+recorded `.expected`).
 
-Not against `tests/programs/*.expected`. That file is what `turkey run` prints,
-which includes compile-time warnings on stderr, and a compiled binary has no
-compile time. It is also a file someone can update; the reference
-implementation is not (FINDINGS 64).
-
-One `boot` process for the whole corpus. Starting `boot` costs about 2:42 and
-compiling a program about half a second, so one process per program turns three
-minutes of work into an hour -- which is FINDINGS 61 and, having been ignored
-once more, FINDINGS 65. `boot llvm` prints a `; === <path>` marker before each
-module so that several can share a run even though they cannot share a file.
+One `boot` process for the whole corpus: compiling a program takes a moment,
+and one process per program would pay `boot`'s startup and the library's
+checking once per program. `boot llvm` prints a `; === <path>` marker before
+each module so that several can share a run even though they cannot share a
+file.
 """
 
 import functools
@@ -97,8 +90,7 @@ def _reference(name: str) -> str:
 
     The two backends share everything above the low IR and nothing below it,
     so a disagreement is a miscompile by one of them. The arm64 output is in
-    turn checked against the recorded `.expected` by `test_programs`. This used
-    to be the Python implementation running the source (TIX-94).
+    turn checked against the recorded `.expected` by `test_programs`.
     """
     return lang.output(PROGRAMS / name)
 
@@ -108,9 +100,8 @@ def _reference(name: str) -> str:
 def test_the_corpus_compiles_and_agrees_with_the_reference(name):
     """The whole property, in one assertion per program.
 
-    A difference here is a miscompile: the same source, two backends, and the
-    reference is the one that has been diffed against a second implementation
-    at every stage above Core.
+    A difference here is a miscompile: the same source and the same low IR,
+    through two backends.
     """
     if toolchain.missing():
         pytest.skip("no C compiler")
@@ -129,7 +120,7 @@ def test_nothing_is_refused():
     The refusal itself is still there and still matters -- a primitive with no
     rule would become a zero of the wrong type, which `cc` rejects somewhere
     unrelated and which would compile a *wrong program* wherever the types
-    happened to line up (FINDINGS 63). This asserts it never fires.
+    happened to line up. This asserts it never fires.
     """
     refused = {name: text for name, text in _modules().items()
                if "; FAILED:" in text}

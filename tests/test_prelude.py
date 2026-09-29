@@ -98,9 +98,9 @@ def test_a_primitive_is_not_in_the_surface_language():
 
 
 def test_the_prelude_exports_its_bindings_and_nothing_else():
-    """What a module may write is its *scope*, not the environment: after
-    M11a every builtin lives in one environment and resolution is what
-    decides which of them a given module can name."""
+    """What a module may write is its *scope*, not the environment: every
+    builtin lives in one environment and resolution is what decides which of
+    them a given module can name."""
     check("fun main() { print(show(1)) }")
     assert fails("fun f() -> String = Prim.intToString(1)") == \
         "'Prim.intToString' is not defined"
@@ -113,7 +113,7 @@ def test_option_comes_from_the_prelude():
 
 
 def test_a_program_may_declare_its_own_option():
-    """A type belongs to its module now (delta 43), so this shadows rather than
+    """A type belongs to its module, so this shadows rather than
     colliding -- and the two are different types, which is the point."""
     src = "type Option a = None | Some(a)\nfun f(x) = Some(x)"
     # Both print qualified, because printing `Option` twice would say less.

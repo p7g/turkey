@@ -1,13 +1,13 @@
-"""A `fun` with a complete annotation states its type (SPEC-DELTAS.md 38).
+"""A `fun` with a complete annotation states its type.
 
 Two things follow, and they are the two halves of this file. The declared type
-is *checked*, so a body can no longer narrow it to fit -- the defect delta 13
-recorded and deferred. And it is *known before the body is solved*, so a
+is *checked*, so a body cannot narrow it to fit: an annotation inference may
+rewrite documents nothing. And it is *known before the body is solved*, so a
 recursive occurrence instantiates it instead of sharing one monomorphic
 placeholder, which is polymorphic recursion.
 
-Inference is untouched. A `fun` that does not state its type completely takes
-exactly the path it took before, which is what the last section here pins.
+A `fun` that does not state its type completely is inferred, and held only to
+what its header did write, which is what the last section here pins.
 """
 
 import pytest
@@ -15,7 +15,7 @@ import pytest
 from tests.lang import check, execute as run, types
 from tests.lang import CompileError
 
-#: The message a skolem escape raises (delta 40), quoted rather than matched
+#: The message a skolem escape raises, quoted rather than matched
 #: on a fragment: it is the whole of what a reader gets, so a test that
 #: accepted half of it would not be pinning the diagnostic.
 ESCAPES = (
@@ -63,11 +63,10 @@ def scheme(src: str, name: str) -> str:
 # -- a declared type is kept --------------------------------------------------
 
 
-def test_a_recursive_call_no_longer_rewrites_the_declared_type():
-    """The delta 13 regression, in the direction delta 13 did not record.
-
-    Before delta 38 this reported `fun(Array a) -> Int`: the recursive call
-    unified the annotation's own variable with `Array _`, and no error said so.
+def test_a_recursive_call_does_not_rewrite_the_declared_type():
+    """The recursive call is at `Array Int`, and must not unify the
+    annotation's own variable with `Array _`: were the annotation a hint, this
+    would report `fun(Array a) -> Int` and no error would say so.
     """
     src = """
     fun g[Iterator a](xs : a) -> Int {
@@ -197,7 +196,7 @@ def test_a_context_reaching_the_type_through_a_family_is_accepted():
 
 def test_an_omitted_return_type_leaves_the_function_inferred():
     """One missing piece and the rest of the type is inferred -- but what the
-    header did write is held to (SPEC-DELTAS 67), context included."""
+    header did write is held to, context included."""
     src = """
     fun size[Iterator a](xs : a) {
         var n = 0
@@ -209,10 +208,10 @@ def test_an_omitted_return_type_leaves_the_function_inferred():
         "[OneOf b {Int, Float}, Iterator a, Add b] fun(a) -> b"
 
 
-def test_an_omitted_return_type_no_longer_infers_a_written_variables_context():
-    """Delta 38 said dropping the return type asked for inference back, context
-    and all. Delta 67 keeps the inference and not the context: `a` was written,
-    so what may be assumed of it is what was written."""
+def test_an_omitted_return_type_does_not_infer_a_written_variables_context():
+    """Dropping the return type asks for inference of the rest, but not of the
+    context: `a` was written, so what may be assumed of it is what was
+    written."""
     src = """
     fun size(xs : a) {
         var n = 0
@@ -265,7 +264,7 @@ def test_an_inferred_caller_instantiates_an_annotated_callee(capsys):
 
 
 def test_mutual_recursion_across_the_two_paths_reports_the_escape():
-    """Rejected, and now for the reason it is actually rejected -- delta 40.
+    """Rejected, and for the reason it is actually rejected: a skolem escape.
 
     `size` states its type, so its parameter is a skolem; `other` shares its
     SCC and is inferred, so it is checked against one monomorphic placeholder,
@@ -321,7 +320,7 @@ def test_a_call_is_not_an_escape():
 
 
 def test_a_skolem_cannot_be_stored_in_an_enclosing_binding():
-    """The escape that would make a checked signature unsound -- delta 40.
+    """The escape that would make a checked signature unsound.
 
     `f` promises to work for whatever type a caller picks, so inside its body
     `a` is a constant nobody outside has seen. Letting it fix the element type

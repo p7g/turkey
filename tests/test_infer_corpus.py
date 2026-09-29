@@ -8,12 +8,11 @@ Remy's levels instead, an optimization of exactly that scan, so the two must
 agree; a disagreement means the level bookkeeping is wrong, which shows up as a
 program wrongly accepted rather than as a crash.
 
-The cases were generated from seeded RNGs by `tests/test_infer_reference.py`,
-with the naive checker in `tests/reference.py` answering, and written to
-`tests/infer_corpus.json` once, while that checker and the Python compiler
-both agreed on every one (TIX-94). The generator and the naive checker are
-Python and go with the Python compiler; the corpus stays, and is what `boot`
-is held to. `expected` is `null` for a program the naive checker rejected.
+The cases were generated once from seeded RNGs, with a naive substitution
+checker answering, and written to `tests/infer_corpus.json`. The generator and
+the naive checker are not kept; the frozen corpus is the
+oracle, and is what `boot` is held to. `expected` is `null` for a program the
+naive checker rejected.
 """
 
 from __future__ import annotations

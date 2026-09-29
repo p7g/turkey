@@ -1,11 +1,8 @@
 """The language as `boot` compiles it: check, run, and what either reports.
 
 The behavioral tests -- a program's output, a diagnostic's text, a panic's
-message -- say what Turkey does, and none of that is a question about which
-compiler answered. They used to ask `turkey.driver`, the Python implementation,
-which is the one being retired (TIX-96). This module asks the compiled `boot`
-instead, and imports nothing from `turkey`, so a test written against it keeps
-working once `turkey/` is gone.
+message -- say what Turkey does, and every one of them asks the compiled `boot`
+through this module.
 
 A program is compiled the way a user would compile it: `boot native` from the
 program's own directory, so a diagnostic quotes the file by its bare name, then

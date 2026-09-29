@@ -29,10 +29,10 @@ def test_generic_projection_is_retained_in_the_signature():
 def test_projection_result_improves_for_repeated_receiver_and_index():
     """Two projections of one position of one receiver have one type.
 
-    That used to need a rule -- the functional dependency of
-    `HasProjection i t a`, enforced by hand in `Solver.improve`. The position's
-    type is an associated family now, so both are the type expression
-    `Elem.0 a` and ordinary unification does it.
+    No special rule does it. The position's type is an associated family, so
+    both are the type expression `Elem.0 a` and ordinary unification agrees
+    them -- where a three-argument `HasProjection i t a` would have needed a
+    hand-written functional dependency `i t -> a`.
     """
     assert types("fun duplicate(x) = (x.0, x.0)")["duplicate"] == (
         "[HasProjection 0 a] fun(a) -> (Elem.0 a, Elem.0 a)"

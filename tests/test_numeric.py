@@ -8,8 +8,7 @@ a decimal literal's set is the float types alone. That asymmetry is the
 
 The goldens cover what whole programs print. This file is the typing: which
 literals are accepted where, what a binding over a literal generalizes to, and
-where defaulting happens. The sets themselves, and a wider tower installed by
-editing the table, are the Python checker's and are in `test_numeric_py`.
+where defaulting happens.
 """
 
 from __future__ import annotations

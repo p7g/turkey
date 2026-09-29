@@ -1,9 +1,9 @@
-"""The shared recoverable-error channel (SPEC-DELTAS 69).
+"""The shared recoverable-error channel.
 
 `Error` is the class a payload satisfies, `SomeError` is the one existential
-that carries any of them, and `fail` is where a concrete error enters. This is
-the library half of ERRORS.md step 3: stack capture is not here, and none of
-these tests assume an error knows where it came from.
+that carries any of them, and `fail` is where a concrete error enters. An error
+carries no stack trace, and none of these tests assume an error knows where it
+came from.
 
 The representation underneath is `tests/test_existentials.py`'s subject; what
 this file pins is the channel -- that unrelated payload types travel together,

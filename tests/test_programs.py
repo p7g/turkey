@@ -8,14 +8,13 @@ and run there (see `tests.lang`), so error messages that quote the source file
 do so by its bare name.
 
 A program may also be a *directory*: `tests/programs/NAME/` whose entry module
-is `Main.gob` and whose golden is `Main.expected` beside it (M11a). It is
+is `Main.gob` and whose golden is `Main.expected` beside it. It is
 compiled from inside that directory, so its imports resolve against it and its
 diagnostics quote bare file names the same way.
 
-These files are the language's recorded behavior, checked against the one
-implementation that is kept. They used to be checked against the Python one,
-and could be regenerated without much thought because a second compiler had to
-agree with them (`test_boot`); nothing does now. Regenerate with
+These files are the language's recorded behavior, and nothing else checks
+them: there is no second compiler that has to agree. So a regenerated golden is
+a claim about what the language does. Regenerate with
 `tests/regenerate_expected.py`, and read every changed line of the diff.
 """
 
@@ -37,7 +36,7 @@ BUNDLES = sorted(p / "Main.gob" for p in PROGRAMS_DIR.iterdir()
 
 # Programs whose golden ends in a panic trace (`  at f (file:line:col)`), which
 # `boot`'s backend does not produce yet: its binaries print the panic and no
-# frames (TIX-114). They are checked with the trace left out, and the whole
+# frames. They are checked with the trace left out, and the whole
 # golden is kept as a strict xfail below, which starts passing -- and failing
 # the run -- when the trace arrives.
 NO_TRACE_YET = {"err_out_of_bounds", "err_string_boundary",
@@ -93,7 +92,7 @@ def test_program_conformance(program: Path) -> None:
         assert code == 0, f"{program.name} exited {code}, expected 0"
 
 
-@pytest.mark.xfail(strict=True, reason="TIX-114: no panic trace from boot yet")
+@pytest.mark.xfail(strict=True, reason="no panic trace from boot's binaries yet")
 @pytest.mark.parametrize("name", sorted(NO_TRACE_YET))
 def test_panic_trace(name: str) -> None:
     program = PROGRAMS_DIR / f"{name}.gob"
@@ -128,14 +127,13 @@ CORE = sorted(PROGRAMS_DIR.glob("*.core"))
 
 @pytest.mark.parametrize("golden", CORE, ids=[p.stem for p in CORE])
 def test_core_command(golden: Path) -> None:
-    """`NAME.core` pins what `boot core NAME.gob` prints (M13b).
+    """`NAME.core` pins what `boot core NAME.gob` prints.
 
     A `.expected` cannot see any of this. Whether a method was reached by
     selecting a superclass or by taking a second dictionary, whether an
     instance was applied at the right types, whether a `var` became a cell --
     all of it produces the same output when it is right *and* when it is
-    subtly wrong, which is why the elaboration went unchecked for as long as
-    it did. These files are the elaboration written down.
+    subtly wrong. These files are the elaboration written down.
 
     Only a few programs have one, chosen for what they show rather than for
     coverage: every program is checked by `Coretc` on every compile anyway.
@@ -148,7 +146,7 @@ OPT = sorted(PROGRAMS_DIR.glob("*.opt"))
 
 @pytest.mark.parametrize("golden", OPT, ids=[p.stem for p in OPT])
 def test_opt_command(golden: Path) -> None:
-    """`NAME.opt` pins what `boot opt NAME.gob` prints (M15b).
+    """`NAME.opt` pins what `boot opt NAME.gob` prints.
 
     The third of the trio, and the one that shows an *analysis* rather than a
     translation: which local function became a label and which stayed a
@@ -163,7 +161,7 @@ MONO = sorted(PROGRAMS_DIR.glob("*.mono"))
 
 @pytest.mark.parametrize("golden", MONO, ids=[p.stem for p in MONO])
 def test_mono_command(golden: Path) -> None:
-    """`NAME.mono` pins what `boot mono NAME.gob` prints (M14a).
+    """`NAME.mono` pins what `boot mono NAME.gob` prints.
 
     Beside the `.core` golden rather than instead of it, because the pair is
     the point: the same program before and after specialization, so a reader

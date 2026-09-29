@@ -1,8 +1,9 @@
 """`src/Turkey/Ssa.gob` and `Turkey/LowIr.gob`: the low IR.
 
-M27 phase 0. Nothing imports the module yet -- the lowering into it is the
-next phase -- so this is what type-checks it and what exercises the analyses.
-`src/SsaCheck.gob` is the driver; see its header for why it lives there.
+This exercises the IR and its analyses directly, on hand-built functions, so a
+fault in dominance, the verifiers or the effect lattice shows up here rather
+than as a miscompile. `src/SsaCheck.gob` is the driver; see its header for why
+it lives there.
 
 Compiled by `boot` itself and run: a test of the Turkey code, not of two
 implementations agreeing.
@@ -66,11 +67,11 @@ def test_a_well_formed_function_verifies(capfd):
 
 
 def test_a_use_its_definition_does_not_dominate_is_refused(capfd):
-    """The check the Python backend's block-local SSA rule cannot make.
+    """The check function-wide SSA exists for.
 
-    There, a value crossing an edge goes through a slot and the question never
-    arises; here a definition in one arm of a diamond used from the other arm
-    is exactly what function-wide SSA exists to reject.
+    Under a block-local rule a value crossing an edge goes through a slot and
+    the question never arises; here a definition in one arm of a diamond used
+    from the other arm is exactly what the verifier must reject.
     """
     out = _output(capfd)
     assert "verify after breaking it: 1" in out
@@ -106,9 +107,8 @@ def test_an_operand_count_cannot_be_wrong(capfd):
 def test_trapping_is_not_purity(capfd):
     """`add` overflows and panics, so an unused one may not be deleted.
 
-    The distinction `traps` draws is one the effects lattice did not have
-    until the instruction set was written against it: `diverges` means never
-    returns, and this means may not return.
+    The distinction `traps` draws is separate from `diverges`: `diverges`
+    means never returns, and this means may not return.
     """
     out = _output(capfd)
     assert "add deletable: no" in out
@@ -128,11 +128,11 @@ def test_an_unreachable_block_has_no_immediate_dominator(capfd):
 
 
 def test_allocation_is_what_makes_a_safepoint(capfd):
-    """Nothing reads this until the register allocator exists.
+    """What the root analysis and the stack maps are built on.
 
-    It is in the IR from the first commit because retrofitting precise stack
-    maps into a backend that did not plan for them is the rewrite this design
-    is avoiding (FINDINGS 55).
+    A collection can happen only at an allocation, so only a value live across
+    one needs a root; answering this per instruction is what lets the backend
+    root those values and no others.
     """
     out = _output(capfd)
     assert "object.new is a safepoint: yes" in out
@@ -146,7 +146,7 @@ def test_a_traced_pointer_may_not_be_stored_through_a_raw_pointer():
     written into one is a reference the collector never sees -- it frees what
     the block points at and the program reads a dangling pointer. Nothing at
     run time tells the two stores apart, because the bits are the same bits,
-    so this is the only place it can be caught (TIX-61).
+    so this is the only place it can be caught.
     """
     dump = _dump()
     assert "a raw store of an untraced pointer: 0" in dump

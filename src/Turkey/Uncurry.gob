@@ -1,0 +1,187 @@
+module Turkey.Uncurry (program)
+
+-- A function that takes dictionaries takes them with its other arguments.
+--
+-- A constrained binding the specializer left generic is a function of its
+-- dictionaries answering a function of its parameters: `f(dict)(x)`. Lowered
+-- as written, every call builds a closure over the dictionary and then calls
+-- it indirectly -- an allocation and an indirect call per call, which is what
+-- a generic `Map.put` or `Hash.hashInto` cost before this.
+--
+-- So each such binding gets a *worker* taking the dictionaries and then the
+-- parameters in one list, and every call that supplies both becomes one direct
+-- call to the worker. The binding itself stays, as a wrapper that calls the
+-- worker: a use of it as a value, or an application to its dictionaries alone,
+-- still means what it did, and reachability drops the wrapper where nothing
+-- uses it that way. GHC's worker/wrapper split, for the same reason.
+--
+-- After layout sharing, so the copies it made are included, and before the
+-- last type check, which checks what this built.
+
+import Data.Map as Map
+import Data.Set as Set
+import Turkey.Core
+import Turkey.Types as Ty
+import Turkey.Types (TFun, TVar)
+
+-- A worker, and how many dictionaries and parameters a call must supply to
+-- reach it.
+type Worker = Worker { name : String, dicts : Int, params : Int }
+
+fun program(p : CProgram) -> CProgram {
+    let workers = Map.new()
+    let used = Set.new()
+    for b in Array.append(p.dicts, p.binds) { Set.add(used, b.name) }
+    let made = Map.new()
+    for b in Array.append(p.dicts, p.binds) {
+        match split(b, used) {
+            Some((worker, wrapper, w)) -> {
+                Map.put(workers, b.name, w)
+                Map.put(made, b.name, (worker, wrapper))
+            }
+            None -> {}
+        }
+    }
+    if len(made) == 0 { return p }
+    CProgram {
+        dicts = rewriteAll(p.dicts, workers, made),
+        binds = rewriteAll(p.binds, workers, made),
+    }
+}
+
+-- The bindings in order, each split one preceded by its worker.
+fun rewriteAll(binds : Array CBind, workers : Map String Worker,
+               made : Map String (CBind, CBind)) -> Array CBind {
+    let out = []
+    for b in binds {
+        match Map.get(made, b.name) {
+            Some((worker, wrapper)) -> {
+                Array.push(out, withValue(worker, rewrite(workers, worker.value)))
+                Array.push(out, withValue(wrapper, rewrite(workers, wrapper.value)))
+            }
+            None -> Array.push(out, withValue(b, rewrite(workers, b.value)))
+        }
+    }
+    out
+}
+
+fun withValue(b : CBind, value : Core) -> CBind = CBind {
+    name = b.name, ty = b.ty, binders = b.binders, value = value,
+    span = b.span, mutable = b.mutable, module_ = b.module_,
+    equations = b.equations, layouts = b.layouts,
+}
+
+-- A binding `fun(dicts) = fun(params) = body`, as its worker and its wrapper.
+fun split(b : CBind, used : Set.Set String) -> Option (CBind, CBind, Worker) {
+    if b.mutable { return None }
+    match b.value.kind {
+        CLam(dicts, inner, outerName) -> match inner.kind {
+            CLam(params, body, innerName) ->
+                splitAt(b, used, dicts, inner, outerName, params, body, innerName)
+            _ -> None
+        }
+        _ -> None
+    }
+}
+
+fun splitAt(b : CBind, used : Set.Set String, dicts : Array CParam, inner : Core,
+            outerName : String, params : Array CParam, body : Core,
+            innerName : String) -> Option (CBind, CBind, Worker) {
+    if len(dicts) == 0 { return None }
+    for d in dicts {
+        if !isDictionary(d.ty) { return None }
+    }
+    -- One list of names, so none may be bound twice.
+    let names = Set.new()
+    for p in Array.append(dicts, params) {
+        if Set.contains(names, p.name) { return None }
+        Set.add(names, p.name)
+    }
+    let flat = flatten(b.ty)
+    let flatTy = match flat {
+        Some(t) -> t
+        None -> return None
+    }
+    var name = b.name + "%worker"
+    while Set.contains(used, name) { name = name + "~" }
+    Set.add(used, name)
+    let worker = CBind {
+        name = name, ty = flatTy, binders = b.binders,
+        value = mkCore(flatTy, b.value.span,
+                       CLam(Array.append(dicts, params), body, innerName)),
+        span = b.span, mutable = False, module_ = b.module_,
+        equations = b.equations, layouts = b.layouts,
+    }
+    let head = mkCore(flatTy, b.value.span, CVar(name))
+    let applied = if len(b.binders) == 0 { head } else {
+        mkCore(flatTy, b.value.span, CTyApp(head, Array.map(b.binders, TVar)))
+    }
+    let args = Array.map(Array.append(dicts, params),
+                         fun(p) = mkCore(p.ty, b.value.span, CVar(p.name)))
+    let call = mkCore(body.ty, b.value.span, CApp(applied, args))
+    let wrapper = withValue(b, mkCore(b.value.ty, b.value.span, CLam(dicts,
+        mkCore(inner.ty, inner.span, CLam(params, call, innerName)), outerName)))
+    Some((worker, wrapper, Worker { name = name, dicts = len(dicts),
+                                    params = len(params) }))
+}
+
+-- `fun(ds) -> fun(xs) -> r` as `fun(ds ++ xs) -> r`.
+fun flatten(t : Ty.Type) -> Option Ty.Type = match Ty.prune(t) {
+    TFun(ds, inner) -> match Ty.prune(inner) {
+        TFun(xs, r) -> Some(TFun(Array.append(ds, xs), r))
+        _ -> None
+    }
+    _ -> None
+}
+
+-- Every call that supplies a split binding's dictionaries and parameters, as
+-- one call to its worker.
+fun rewrite(workers : Map String Worker, e : Core) -> Core {
+    match e.kind {
+        CApp(fn, args) -> match fn.kind {
+            CApp(head, dargs) -> match direct(workers, head, len(dargs), len(args)) {
+                Some(worker) -> return mkCore(e.ty, e.span, CApp(worker,
+                    Array.map(Array.append(dargs, args), rewrite(workers, _))))
+                None -> {}
+            }
+            _ -> {}
+        }
+        _ -> {}
+    }
+    mkCore(e.ty, e.span, mapKind(e.kind, Mapper {
+        expr = fun(x) = rewrite(workers, x),
+        type_ = fun(t) = t,
+        bind = fun(b) = withValue(b, rewrite(workers, b.value)),
+    }))
+}
+
+-- The worker a head reaches, applied to the same types, when the call supplies
+-- exactly what the worker takes.
+fun direct(workers : Map String Worker, head : Core, dicts : Int,
+           params : Int) -> Option Core = match head.kind {
+    CVar(n) -> directTo(workers, head, n, None, dicts, params)
+    CTyApp(inner, ts) -> match inner.kind {
+        CVar(n) -> directTo(workers, head, n, Some(ts), dicts, params)
+        _ -> None
+    }
+    _ -> None
+}
+
+fun directTo(workers : Map String Worker, head : Core, name : String,
+             types : Option (Array Ty.Type), dicts : Int,
+             params : Int) -> Option Core {
+    let flatTy = match flatten(head.ty) {
+        Some(t) -> t
+        None -> return None
+    }
+    let w = match Map.get(workers, name) {
+        Some(found) -> found
+        None -> return None
+    }
+    if w.dicts != dicts || w.params != params { return None }
+    let target = mkCore(flatTy, head.span, CVar(w.name))
+    match types {
+        Some(ts) -> Some(mkCore(flatTy, head.span, CTyApp(target, ts)))
+        None -> Some(target)
+    }
+}

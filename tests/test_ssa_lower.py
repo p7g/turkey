@@ -376,3 +376,36 @@ def test_a_loop_calls_no_method_indirectly_past_the_specialization_budget():
         body = re.search(rf"^fun @Main#sum{i}\(.*?^}}$", result.stdout,
                          re.M | re.S).group(0)
         assert not re.search(r"call %\d", body), body
+
+
+def _many_map_types(count: int) -> str:
+    """A program that fills maps at `count` value types."""
+    lines = []
+    for i in range(count):
+        lines.append(f"type V{i} = V{i} {{ x : Int }}")
+        lines.append(f"fun fill{i}(m : Map Int V{i}) -> Int {{\n"
+                     f"    Map.put(m, {i}, V{i} {{ x = {i} }})\n"
+                     f"    match Map.get(m, {i}) {{\n"
+                     f"        Some(v) -> v.x\n        None -> 0\n    }}\n}}")
+    calls = " + ".join(f"fill{i}(Map.new())" for i in range(count))
+    lines.append(f"fun main() {{ print({calls}) }}")
+    return "\n".join(lines) + "\n"
+
+
+def test_a_constrained_function_past_the_budget_builds_no_closure_per_call():
+    # `Map.put` and `Map.get` take a `Hash` dictionary. Past the budget they
+    # stay generic, and a call to one supplies the dictionary and the
+    # arguments together: one call, with no closure over the dictionary.
+    count = 40
+    src = _many_map_types(count)
+    assert lang.output(src) == f"{sum(range(count))}\n"
+    result = lang.dump("ssa", src)
+    assert result.code == 0, result.stderr
+    wrapped = set(re.findall(r"^fun @(\S+)%worker\(", result.stdout, re.M))
+    assert wrapped
+    for i in range(count):
+        body = re.search(rf"^fun @Main#fill{i}\(.*?^}}$", result.stdout,
+                         re.M | re.S).group(0)
+        calls = {c[1:] for c in re.findall(r"call (@\S+)", body)}
+        assert not calls & wrapped, body
+        assert "closure.new" not in body, body

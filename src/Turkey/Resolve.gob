@@ -33,8 +33,8 @@ module Turkey.Resolve (program)
 import Data.Set as Set
 import Turkey.Ast
 import Turkey.Diag as Diag
-import Turkey.Modules (Scope(..))
-import Turkey.Source (Span)
+import Turkey.Modules (Scope(..), lookupName)
+import Turkey.Source (Span(..))
 
 -- One module's scope, plus the stack of local frames the walk maintains.
 type R = R {
@@ -65,7 +65,7 @@ fun foreignDecl(r : R, f : ForeignDecl) -> Unit {
 -- -- declarations -------------------------------------------------------------------
 
 fun typeDecl(r : R, d : TypeDecl) -> Unit {
-    d.name = tycon(r, d.name)
+    d.name = tycon(r, d.name, d.span)
     match d.alias {
         Some(a) -> typeExpr(r, a)
         None -> {}
@@ -73,7 +73,7 @@ fun typeDecl(r : R, d : TypeDecl) -> Unit {
     match d.variants {
         None -> {}
         Some(vs) -> for v in vs {
-            v.name = con(r, v.name)
+            v.name = con(r, v.name, v.span)
             context(r, v.context)
             for a in v.args { typeExpr(r, a) }
             match v.fields {
@@ -85,7 +85,7 @@ fun typeDecl(r : R, d : TypeDecl) -> Unit {
 }
 
 fun classDecl(r : R, d : ClassDecl) -> Unit {
-    d.name = cls(r, d.name)
+    d.name = cls(r, d.name, d.span)
     context(r, d.supers)
     for meth in d.methods {
         meth.name = d.name + "." + meth.name
@@ -95,11 +95,11 @@ fun classDecl(r : R, d : ClassDecl) -> Unit {
 }
 
 fun instanceDecl(r : R, d : InstanceDecl) -> Unit {
-    d.cls = cls(r, d.cls)
+    d.cls = cls(r, d.cls, d.span)
     typeExpr(r, d.head)
     context(r, d.context)
     for bind in d.families {
-        bind.name = tycon(r, bind.name)
+        bind.name = tycon(r, bind.name, bind.span)
         typeExpr(r, bind.body)
     }
     for meth in d.methods { funDecl(r, meth) }
@@ -149,7 +149,7 @@ fun typeExpr(r : R, t : Type) -> Unit = match t.kind {
     -- A type variable is scoped to its own declaration and names nothing here.
     TEVar(_) -> {}
     TECon(name, args) -> {
-        t.kind = TECon(tycon(r, name), args)
+        t.kind = TECon(tycon(r, name, t.span), args)
         for a in args { typeExpr(r, a) }
     }
     TEApp(head, args) -> {
@@ -168,7 +168,7 @@ fun context(r : R, preds : Array Pred) -> Unit {
     for pred in preds {
         match pred.kind {
             PClass(name, arg) -> {
-                pred.kind = PClass(cls(r, name), arg)
+                pred.kind = PClass(cls(r, name, pred.span), arg)
                 typeExpr(r, arg)
             }
             PEq(left, right) -> {
@@ -183,11 +183,11 @@ fun context(r : R, preds : Array Pred) -> Unit {
 -- `patternVars` collects them separately.
 fun pattern(r : R, p : Pat) -> Unit = match p.kind {
     PCon(name, args) -> {
-        p.kind = PCon(con(r, name), args)
+        p.kind = PCon(con(r, name, p.span), args)
         for a in args { pattern(r, a) }
     }
     PRecord(name, fields, rest) -> {
-        p.kind = PRecord(con(r, name), fields, rest)
+        p.kind = PRecord(con(r, name, p.span), fields, rest)
         for (_, sub) in fields { pattern(r, sub) }
     }
     PTuple(elems) -> for e in elems { pattern(r, e) }
@@ -215,12 +215,12 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
         -- A marked node is an operator or a `for` loop's `iter`/`next`, written
         -- by the parser: it means the class method by construction.
         if isMethod {
-            match Map.get(r.scope.methods, name) {
+            match lookupName(r.scope, 4, name, Some(e.span)) {
                 Some(target) -> { e.kind = EVar(target, True) }
                 None -> {}
             }
         } else if !isLocal(r, name) {
-            match Map.get(r.scope.values, name) {
+            match lookupName(r.scope, 0, name, Some(e.span)) {
                 Some(target) -> { e.kind = EVar(target, False) }
                 None -> if String.contains(name, ".") {
                     -- Qualified, and its module is not in scope. Inference
@@ -232,14 +232,14 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
             }
         }
     }
-    ECon(name) -> { e.kind = ECon(con(r, name)) }
+    ECon(name) -> { e.kind = ECon(con(r, name, e.span)) }
     ELit(_) -> {}
     EUnit -> {}
     EContinue -> {}
     ETuple(elems) -> for x in elems { expr(r, x) }
     EArray(elems) -> for x in elems { expr(r, x) }
     ERecord(name, fields) -> {
-        e.kind = ERecord(con(r, name), fields)
+        e.kind = ERecord(con(r, name, e.span), fields)
         for (_, value) in fields { expr(r, value) }
     }
     ECall(fn, args) -> {
@@ -374,9 +374,12 @@ fun localBinding(r : R, pat : Pat, value : Expr) -> Unit {
 
 -- -- namespaces ---------------------------------------------------------------------
 
-fun tycon(r : R, name : String) -> String = lookupOr(r.scope.types, name)
-fun con(r : R, name : String) -> String = lookupOr(r.scope.cons, name)
-fun cls(r : R, name : String) -> String = lookupOr(r.scope.classes, name)
+fun tycon(r : R, name : String, where : Span) -> String =
+    Option.unwrapOr(lookupName(r.scope, 1, name, Some(where)), name)
+fun con(r : R, name : String, where : Span) -> String =
+    Option.unwrapOr(lookupName(r.scope, 2, name, Some(where)), name)
+fun cls(r : R, name : String, where : Span) -> String =
+    Option.unwrapOr(lookupName(r.scope, 3, name, Some(where)), name)
 
 fun lookupOr(space : Map String String, name : String) -> String =
     Map.getOr(space, name, name)
@@ -386,7 +389,7 @@ fun lookupOr(space : Map String String, name : String) -> String =
 fun resolveMethod(r : R, ref : Option Expr) -> Unit = match ref {
     None -> {}
     Some(e) -> match e.kind {
-        EVar(name, _) -> match Map.get(r.scope.methods, name) {
+        EVar(name, _) -> match lookupName(r.scope, 4, name, Some(e.span)) {
             Some(target) -> { e.kind = EVar(target, True) }
             None -> {}
         }
@@ -398,7 +401,7 @@ fun resolveMethod(r : R, ref : Option Expr) -> Unit = match ref {
 -- `None` when the module cannot see the method at all, which leaves the
 -- bracket unlowered for inference to complain about.
 fun methodRef(r : R, name : String, where : Span) -> Option Expr =
-    match Map.get(r.scope.methods, name) {
+    match lookupName(r.scope, 4, name, Some(where)) {
         None -> None
         -- From the same supply as every parsed node's. A constant here would
         -- give every bracket in the program one id, and the tables keyed by it

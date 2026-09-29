@@ -60,7 +60,7 @@ type Item = Item { name : String, count : Int }
 
 fun restock(name, count) = Item { name, count = clamp(count) }
 
-fun describe(item) = item.name + " x" + show(item.count)
+fun describe(item : Item) = item.name + " x" + show(item.count)
 
 fun clamp(n) = if n < 0 { 0 } else { n }
 ```
@@ -88,7 +88,7 @@ type Item = Item { name : String, count : Int }
 
 fun restock(name, count) = Item { name, count = clamp(count) }
 
-fun describe(item) = item.name + " x" + show(item.count)
+fun describe(item : Item) = item.name + " x" + show(item.count)
 
 fun clamp(n) = if n < 0 { 0 } else { n }
 ```
@@ -104,9 +104,36 @@ fun main() {
 
 **Types.** Exporting `T` exports the type but not its constructors. Other
 modules can then use `T` in types and receive and pass `T` values, but cannot
-build one with a constructor or take one apart with a pattern. This is how a
+build one with a constructor, take one apart with a pattern, or read or assign
+its record fields. Field access requires the constructor to be in scope,
+including through a qualified import. This is how a
 module makes a type *abstract*, so that only its own functions can create
 values of it. `T(..)` exports the type and all its constructors.
+
+<!-- module: Sealed.gob -->
+```kotlin
+module Sealed (Token, make)
+type Token = Token { value : Int }
+fun make(n : Int) -> Token = Token { value = n }
+```
+
+<!-- error: cannot access field 'value' of abstract type 'Token' -->
+```kotlin
+import Sealed
+fun reveal() = make(3).value
+```
+
+<!-- module: Sealed.gob -->
+```kotlin
+module Sealed (Token, make)
+type Token = Token { value : Int }
+fun make(n : Int) -> Token = Token { value = n }
+```
+
+<!-- error: does not export constructor 'Token' of type 'Token' -->
+```kotlin
+import Sealed (Token(..))
+```
 
 **Classes.** Exporting `C(..)` exports a class and its methods. Exporting `C`
 alone exports the class without its methods, so other modules can name it in
@@ -126,6 +153,7 @@ import ::= "import" modname ("as" CONID)? import-list?
 import-list ::= "(" (item ("," item)*)? ")"
               | "hiding" "(" item ("," item)* ")"
 item   ::= IDENT | CONID | CONID "(" ".." ")"
+         | CONID "(" CONID ("," CONID)* ")"
 ```
 
 | Import | Brings into scope |
@@ -136,6 +164,12 @@ item   ::= IDENT | CONID | CONID "(" ".." ")"
 | `import Geometry as G` | every export, qualified only: `G.area`, not `area` |
 | `import Geometry as G (area)` | only the listed names, qualified only |
 | `import Geometry ()` | nothing; the module is still loaded, and its instances with it |
+
+In a selective import, `T` brings in the type alone, `T(..)` requests its
+constructors too, and `T(A, B)` requests the named constructors. Each requested
+constructor must be exported by the imported module and belong to `T`. A type
+and a constructor can share a spelling; importing the type alone does not
+import that constructor.
 
 <!-- module: Temperature.gob -->
 ```kotlin
@@ -331,9 +365,30 @@ fun main() {
 >> shadowed
 ```
 
-When two imports provide the same bare name, the later import shadows the
-earlier one. The qualified spellings stay distinct, and are the clearer way to
-use either.
+When two explicit imports provide different declarations with the same bare
+name, using that name is an ambiguity error naming both declarations. Import
+order does not choose one. Use distinct qualified spellings to select one; a
+local binding or a declaration in the current module can still shadow both.
+Importing the same declaration through more than one route is unambiguous.
+
+<!-- module: First.gob -->
+```kotlin
+module First (label)
+fun label() -> String = "first"
+```
+
+<!-- module: Second.gob -->
+```kotlin
+module Second (label)
+fun label() -> String = "second"
+```
+
+<!-- error: ambiguous name 'label': 'First.label', 'Second.label' -->
+```kotlin
+import First
+import Second
+fun main() { print(label()) }
+```
 
 ## The entry point
 

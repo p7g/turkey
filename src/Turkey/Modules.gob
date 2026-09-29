@@ -1,5 +1,5 @@
 module Turkey.Modules (
-    Scope(..), newScope, spaces,
+    Scope(..), newScope, spaces, lookupName,
     Module(..),
     Loader(..), newLoader, loadEntry,
     ownDeclared, ownScope,
@@ -14,9 +14,9 @@ module Turkey.Modules (
 -- importers get to share. `Turkey.Resolve` does the rewriting; nothing here
 -- touches a tree beyond parsing it.
 --
--- Three rules, in this order, later winning: what the Prelude exports, then
--- each `import`, then the module's own top-level declarations. So a local
--- definition shadows an import, and an import shadows the Prelude.
+-- Local declarations shadow explicit imports, which shadow the implicit
+-- Prelude. Distinct declarations from peer imports remain ambiguous until a
+-- use chooses a namespace; importing the same declaration twice is harmless.
 --
 -- The import graph must be acyclic. Two modules that need each other are one
 -- module here, which is also why this compiler's own layering is a DAG.
@@ -31,7 +31,7 @@ import Turkey.Parser as Parser
 import Turkey.Prelude as Prelude
 import Turkey.Prims as Prims
 import Turkey.Source as Source
-import Turkey.Source (Source, Span)
+import Turkey.Source (Source(..), Span)
 import Turkey.Giblets as Giblets
 import Turkey.Target as Target
 
@@ -54,11 +54,13 @@ type Scope = Scope {
     cons    : Map String String,
     classes : Map String String,
     methods : Map String String,
+    conflicts : Array (Map String (Array String)),
 }
 
 fun newScope() -> Scope = Scope {
     values = Map.new(), types = Map.new(), cons = Map.new(),
     classes = Map.new(), methods = Map.new(),
+    conflicts = [Map.new(), Map.new(), Map.new(), Map.new(), Map.new()],
 }
 
 -- The five, in a fixed order, so that a rule which applies to all of them is
@@ -66,6 +68,38 @@ fun newScope() -> Scope = Scope {
 -- not copies of them.
 fun spaces(s : Scope) -> Array (Map String String) =
     [s.values, s.types, s.cons, s.classes, s.methods]
+
+fun spaceAt(s : Scope, index : Int) -> Map String String = match index {
+    0 -> s.values
+    1 -> s.types
+    2 -> s.cons
+    3 -> s.classes
+    _ -> s.methods
+}
+
+-- Conflicts retain declaration identities, not import spellings: two routes
+-- to the same re-export are still one declaration.
+fun lookupName(s : Scope, space : Int, name : String,
+               where : Option Span) -> Option String {
+    match Map.get(s.conflicts[space], name) {
+        Some(targets) -> oopsAt("ambiguous name '" + name + "': "
+            + String.join(Array.map(Array.sort(targets), fun(t) =
+                quoted(String.replace(t, "#", "."))), ", "), where)
+        None -> Map.get(spaceAt(s, space), name)
+    }
+}
+
+fun mergeName(s : Scope, space : Int, name : String, target : String) -> Unit {
+    let into = spaceAt(s, space)
+    match Map.get(into, name) {
+        Some(previous) -> if previous != target {
+            let targets = Map.getOr(s.conflicts[space], name, [previous])
+            if !Array.contains(targets, target) { Array.push(targets, target) }
+            Map.put(s.conflicts[space], name, targets)
+        }
+        None -> Map.put(into, name, target)
+    }
+}
 
 type Module = Module {
     name    : String,
@@ -274,9 +308,16 @@ fun scopeOf(l : Loader, m : Module) -> Scope {
 
     let explicitPrelude = hasPreludeImport(m.program)
     if m.name != Prelude.preludeName && !explicitPrelude {
-        bring(l, scope, moduleNamed(l, Prelude.preludeName), Prelude.preludeName,
+        let implicit = newScope()
+        bring(l, implicit, moduleNamed(l, Prelude.preludeName), Prelude.preludeName,
               False, None, None, None)
+        let from = spaces(implicit)
+        let into = spaces(scope)
+        for var i = 0; i < len(into); i = i + 1 {
+            for (k, v) in Map.entries(from[i]) { Map.put(into[i], k, v) }
+        }
     }
+    let imports = newScope()
     for imp in m.program.imports {
         if !(imp.name == Prelude.preludeName && isEmptyList(imp.items)) {
             let dep = moduleNamed(l, imp.name)
@@ -284,17 +325,27 @@ fun scopeOf(l : Loader, m : Module) -> Scope {
                 Some(a) -> a
                 None -> imp.name
             }
-            bring(l, scope, dep, alias, imp.qualified, Some(imp.span),
+            bring(l, imports, dep, alias, imp.qualified, Some(imp.span),
                   imp.items, imp.hidden)
         }
     }
+
+    let imported = spaces(imports)
+    let destination = spaces(scope)
+    for var i = 0; i < len(imported); i = i + 1 {
+        for (k, v) in Map.entries(imported[i]) { Map.put(destination[i], k, v) }
+    }
+    scope.conflicts = imports.conflicts
 
     -- Last, so a module's own declarations shadow everything imported.
     let own = ownScope(m.name, m.program)
     let into = spaces(scope)
     let from = spaces(own)
     for var i = 0; i < len(into); i = i + 1 {
-        for (k, v) in Map.entries(from[i]) { Map.put(into[i], k, v) }
+        for (k, v) in Map.entries(from[i]) {
+            Map.put(into[i], k, v)
+            discard(Map.delete(scope.conflicts[i], k))
+        }
     }
     scope
 }
@@ -312,23 +363,36 @@ fun bring(l : Loader, scope : Scope, dep : Module, alias : String,
     match items {
         None -> {}
         Some(wantedItems) -> {
-            let wanted = Set.new()
+            chosen = spaces(newScope())
+            let available = spaces(dep.exports)
             for item in wantedItems {
-                Set.add(wanted, item.name)
-                -- `T(..)` asks for constructors; `C(..)` asks for methods and
-                -- associated families. The namespace decides which it is.
-                for sub in subsOf(l, dep, item) { Set.add(wanted, sub) }
+                if !namedAnywhere(dep.exports, item.name) {
+                    oopsAt("module '" + dep.name + "' does not export "
+                           + quoted(item.name), where)
+                }
+                for var i = 0; i < len(chosen); i = i + 1 {
+                    -- A type name alone does not request its same-named
+                    -- constructor. A standalone constructor name is legal.
+                    if !(i == 2 && Map.contains(dep.exports.types, item.name)) {
+                        match Map.get(available[i], item.name) {
+                            Some(target) -> Map.put(chosen[i], item.name, target)
+                            None -> {}
+                        }
+                    }
+                }
+                for sub in subsOf(l, dep, item) {
+                    checkImportedMember(l, dep, item, sub, where)
+                    let indices = if Map.contains(dep.exports.classes, item.name) {
+                        [0, 1, 4]
+                    } else { [2] }
+                    for i in indices {
+                        match Map.get(available[i], sub) {
+                            Some(target) -> Map.put(chosen[i], sub, target)
+                            None -> {}
+                        }
+                    }
+                }
             }
-            let missing = Array.new(2)
-            for name in Array.sort(Set.elements(wanted)) {
-                if !namedAnywhere(dep.exports, name) { Array.push(missing, name) }
-            }
-            if len(missing) > 0 {
-                oopsAt("module '" + dep.name + "' does not export "
-                       + String.join(Array.map(missing, quoted), ", "), where)
-            }
-            chosen = Array.map(chosen, fun(space) =
-                keepIf(space, Set.contains(wanted, _)))
         }
     }
     match hidden {
@@ -349,9 +413,42 @@ fun bring(l : Loader, scope : Scope, dep : Module, alias : String,
     let into = spaces(scope)
     for var i = 0; i < len(into); i = i + 1 {
         for (short, target) in Map.entries(chosen[i]) {
-            Map.put(into[i], alias + "." + short, target)
-            if !qualified { Map.put(into[i], short, target) }
+            mergeName(scope, i, alias + "." + short, target)
+            if !qualified { mergeName(scope, i, short, target) }
         }
+    }
+}
+
+fun checkImportedMember(l : Loader, dep : Module, item : ExportItem,
+                        sub : String, where : Option Span) -> Unit {
+    match Map.get(dep.exports.classes, item.name) {
+        Some(cls) -> {
+            if !Array.contains(membersOf(l, cls), sub)
+                || !(Map.contains(dep.exports.methods, sub)
+                     || Map.contains(dep.exports.types, sub)) {
+                oopsAt("module '" + dep.name + "' does not export member '"
+                       + sub + "' of class '" + item.name + "'", where)
+            }
+        }
+        None -> {
+            if !constructorMember(l, Map.get(dep.exports.types, item.name),
+                                  sub, Map.get(dep.exports.cons, sub)) {
+                oopsAt("module '" + dep.name + "' does not export constructor '"
+                       + sub + "' of type '" + item.name + "'", where)
+            }
+        }
+    }
+}
+
+fun constructorMember(l : Loader, parent : Option String, name : String,
+                      target : Option String) -> Bool {
+    if !Array.contains(variantsOf(l, parent), name) { return False }
+    match (parent, target) {
+        (Some(p), Some(t)) -> match String.rsplitOnce(p, "#") {
+            Some((owner, _)) -> t == Prelude.internal(owner, name)
+            None -> False
+        }
+        _ -> False
     }
 }
 
@@ -427,7 +524,7 @@ fun exportOne(l : Loader, m : Module, mine : Scope, item : ExportItem,
     }
     if isLower(item.name) {
         return Map.put(out.values, item.name,
-                       exported(m, mine.values, m.scope.values, item))
+                       exported(m, mine.values, 0, item))
     }
     -- A name the module *declares itself* is that declaration, whatever an
     -- import may have brought in under the same spelling. Without this,
@@ -446,13 +543,13 @@ fun exportOne(l : Loader, m : Module, mine : Scope, item : ExportItem,
 
 fun exportClass(l : Loader, m : Module, mine : Scope, item : ExportItem,
                 out : Scope) -> Unit {
-    let target = exported(m, mine.classes, m.scope.classes, item)
+    let target = exported(m, mine.classes, 3, item)
     Map.put(out.classes, item.name, target)
     for member in subsFrom(item, membersOf(l, target)) {
         let value = firstOf(Map.get(mine.methods, member),
-                            Map.get(m.scope.methods, member))
+                            lookupName(m.scope, 4, member, Some(item.span)))
         let family = firstOf(Map.get(mine.types, member),
-                             Map.get(m.scope.types, member))
+                             lookupName(m.scope, 1, member, Some(item.span)))
         match value {
             Some(v) -> {
                 Map.put(out.values, member, v)
@@ -469,11 +566,22 @@ fun exportClass(l : Loader, m : Module, mine : Scope, item : ExportItem,
 
 fun exportType(l : Loader, m : Module, mine : Scope, item : ExportItem,
                out : Scope) -> Unit {
-    let target = exported(m, mine.types, m.scope.types, item)
+    let target = exported(m, mine.types, 1, item)
     Map.put(out.types, item.name, target)
-    for con in subsFrom(item, variantsOf(l, Some(target))) {
-        match firstOf(Map.get(mine.cons, con), Map.get(m.scope.cons, con)) {
-            Some(t) -> Map.put(out.cons, con, t)
+    let variants = variantsOf(l, Some(target))
+    for con in subsFrom(item, variants) {
+        if !Array.contains(variants, con) {
+            oopsAt("'" + con + "' is not a constructor of '"
+                   + item.name + "'", Some(item.span))
+        }
+        match firstOf(Map.get(mine.cons, con), lookupName(m.scope, 2, con, Some(item.span))) {
+            Some(t) -> {
+                if !constructorMember(l, Some(target), con, Some(t)) {
+                    oopsAt("'" + con + "' is not a constructor of '"
+                           + item.name + "'", Some(item.span))
+                }
+                Map.put(out.cons, con, t)
+            }
             None -> oopsAt("'" + con + "' is not a constructor of '"
                            + item.name + "'", Some(item.span))
         }
@@ -491,6 +599,7 @@ fun reexport(m : Module, item : ExportItem, out : Scope) -> Unit {
     for var i = 0; i < len(into); i = i + 1 {
         for (surface, target) in Map.entries(from[i]) {
             if String.startsWith(surface, prefix) {
+                discard(lookupName(m.scope, i, surface, Some(item.span)))
                 Map.put(into[i], surface, target)
                 found = True
             }
@@ -502,9 +611,9 @@ fun reexport(m : Module, item : ExportItem, out : Scope) -> Unit {
     }
 }
 
-fun exported(m : Module, own : Map String String, wider : Map String String,
+fun exported(m : Module, own : Map String String, space : Int,
              item : ExportItem) -> String =
-    match firstOf(Map.get(own, item.name), Map.get(wider, item.name)) {
+    match firstOf(Map.get(own, item.name), lookupName(m.scope, space, item.name, Some(item.span))) {
         Some(target) -> target
         None -> oopsAt("module '" + m.name + "' exports '" + item.name
                        + "', which is not defined or imported here",

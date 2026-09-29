@@ -56,7 +56,7 @@ import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..))
 import Turkey.Diag as Diag
 import Turkey.Solved (Scope(..), Abstraction(..), Use(..), dictName, newScope)
-import Turkey.Source (Span)
+import Turkey.Source (Span(..))
 import Turkey.Typed as Typed
 import Turkey.Types as Ty
 import Turkey.Types (VarCell(..), ConCell(..), Scheme(..), Pred(..),
@@ -178,6 +178,7 @@ type Solver = Solver {
     decls      : DeclTable,
     classes    : ClassTable,
     env        : Env,
+    visibleCons : Set.Set String,
     -- Predicates a `CAssume` currently grants. A stack in effect, restored on
     -- the way out of each one.
     assumptions : Array Pred,
@@ -194,9 +195,10 @@ type Solver = Solver {
     topLevel   : Env,
 }
 
-fun newSolver(decls : DeclTable, env : Env, classes : ClassTable) -> Solver =
+fun newSolver(decls : DeclTable, env : Env, classes : ClassTable,
+              visibleCons : Set.Set String) -> Solver =
     Solver {
-        decls = decls, classes = classes, env = env,
+        decls = decls, classes = classes, env = env, visibleCons = visibleCons,
         assumptions = Array.new(4), scopes = Array.new(4), uses = Array.new(16),
         pools = [Array.new(8)], deferred = Array.new(8), topLevel = env,
     }
@@ -812,6 +814,7 @@ fun classRule(s : Solver, c : PredCell) -> Bool {
         TFam(_, _, _) -> return False
         _ -> {}
     }
+    checkFieldVisibility(s, p, t, c)
     match Classes.byInst(s.classes, p) {
         None -> {
             if Classes.isGenerated(p.name) { noField(s, p, t, c) }
@@ -823,6 +826,32 @@ fun classRule(s : Solver, c : PredCell) -> Bool {
             for q in obligations { solve(s, cpredOf(q, c.span, c.context)) }
             True
         }
+    }
+}
+
+-- Field evidence reveals representation just as a constructor pattern does.
+-- Check where the evidence is requested, including a polymorphic accessor's
+-- predicate when its caller instantiates it at an abstract record type.
+fun checkFieldVisibility(s : Solver, p : Pred, receiver : Ty.Type,
+                         c : PredCell) -> Unit {
+    let label = match Classes.generatedLabel(p.name) {
+        Some(l) -> l
+        None -> return
+    }
+    let (h, _) = Ty.spine(receiver)
+    match h {
+        TCon(con) -> match Map.get(s.decls.tycons, con.name) {
+            Some(info) -> if len(info.variants) == 1 {
+                let ctor = info.variants[0]
+                if Decls.isRecord(ctor) && !Set.contains(s.visibleCons, ctor.name) {
+                    oops("cannot access field '" + label + "' of abstract type '"
+                         + Ty.show(receiver) + "': constructor '"
+                         + Ty.shortName(ctor.name) + "' is not in scope", c.span)
+                }
+            }
+            None -> {}
+        }
+        _ -> {}
     }
 }
 

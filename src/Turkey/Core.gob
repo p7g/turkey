@@ -698,29 +698,31 @@ fun showExpr(e : Core, indent : Int, n : Namer, a : Aliases) -> String {
         CRef(value) -> call(None, "ref", [value], indent, n, a)
         CDeref(target) -> p + "!" + flat(target, n, a)
         CAssign(target, value) -> {
-            let v = flat(value, n, a)
+            -- Rendered once, at its indent as a block; see `call`.
+            let v = showExpr(value, indent + 1, n, a)
             let t = flat(target, n, a)
             -- An assigned value that is itself a block, which is what a
             -- dereference-and-add becomes once the dictionary is inlined.
             if String.contains(v, "\n") {
-                p + t + " :=\n" + showExpr(value, indent + 1, n, a)
+                p + t + " :=\n" + v
             } else {
-                p + t + " := " + v
+                p + t + " := " + String.trim(v)
             }
         }
         CIf(cond, then, otherwise) -> {
-            let c = flat(cond, n, a)
+            -- Rendered once, at its indent as a block; see `call`.
+            let c = showExpr(cond, indent + 1, n, a)
             let out = Array.new(6)
             -- A condition that is itself a block -- which is what `&&` lowers to,
             -- and what inlining leaves behind. Flat, it would put a `let` at
             -- column zero between the `if` and its brace.
             if String.contains(c, "\n") {
                 Array.push(out, p + "if")
-                Array.push(out, showExpr(cond, indent + 1, n, a))
+                Array.push(out, c)
                 Array.push(out, p + "{")
                 Array.push(out, showExpr(then, indent + 1, n, a))
             } else {
-                Array.push(out, p + "if " + c + " {")
+                Array.push(out, p + "if " + String.trim(c) + " {")
                 Array.push(out, showExpr(then, indent + 1, n, a))
             }
             match otherwise {
@@ -765,7 +767,12 @@ fun call(fn : Option Core, name : String, args : Array Core, indent : Int,
     -- Arguments before the head, which matters: type variables are numbered in
     -- the order they are met, so rendering the two the other way round renames
     -- every variable in the program and moves every golden.
-    let rendered = flatEach(args, n, a)
+    --
+    -- Each argument is rendered once, at the indent it gets if the call spans
+    -- lines; on one line it is that rendering trimmed. Rendering it again for
+    -- the other layout would do so at every level of a nested call, which is
+    -- exponential in the nesting.
+    let rendered = Array.map(args, showExpr(_, indent + 1, n, a))
     let head = match fn {
         Some(f) -> flat(f, n, a)
         None -> name
@@ -774,12 +781,14 @@ fun call(fn : Option Core, name : String, args : Array Core, indent : Int,
     for r in rendered {
         if String.contains(r, "\n") { multiline = True }
     }
-    if !multiline { return p + head + "(" + String.join(rendered, ", ") + ")" }
+    if !multiline {
+        return p + head + "(" + String.join(Array.map(rendered, String.trim), ", ") + ")"
+    }
     let out = Array.new(len(args) + 2)
     Array.push(out, p + head + "(")
     for var i = 0; i < len(args); i = i + 1 {
         let tail = if i < len(args) - 1 { "," } else { "" }
-        Array.push(out, showExpr(args[i], indent + 1, n, a) + tail)
+        Array.push(out, rendered[i] + tail)
     }
     Array.push(out, p + ")")
     String.join(out, "\n")

@@ -124,8 +124,13 @@ var regionTableCount : Int = 0
 
 var roots : Prim.Ptr = Prim.ptrNull()
 var heapCount : Int = 0
+-- Objects, and the bytes of their slots, allocated since the last
+-- collection. The bytes are what trigger the next one.
 var allocationsSince : Int = 0
-var threshold : Int = 1024
+var bytesSince : Int = 0
+-- The bytes of the slots the last sweep kept: a large object's whole region.
+var liveBytes : Int = 0
+var threshold : Int = 131072
 var collections : Int = 0
 -- A u32 in each header, so it wraps; see `startMarking`.
 var markEpoch : Int = 0
@@ -154,10 +159,20 @@ var verify : Bool = present(Prim.cString("TURKEY_GC_VERIFY"))
 -- one run rather than from a profiler.
 var statsWanted : Bool = present(Prim.cString("TURKEY_GC_STATS"))
 
--- The collector runs again after this many times the live set has been
--- allocated. 2 was measured, not chosen: at 1 the self-compiled compiler spent
--- 79% of its wall clock collecting a heap that was ~94% garbage every time,
--- and 2 halves the number of collections for ~1GB of peak memory.
+-- The collector runs again once this many times the live set's bytes have
+-- been allocated, or 64KB times it while the live set is smaller than that.
+--
+-- Bytes rather than objects, because the threshold is what bounds the heap:
+-- counted in objects, a program allocating large arrays grows its heap by the
+-- array's size for each one it counts as one. On the compiler's own run the
+-- two cost the same at equal peak memory, so that is what decided it.
+--
+-- 2 is measured. The compiler compiling itself, whose heap is a slowly growing
+-- long-lived program under a stream of short-lived trees, marks every live
+-- object again at each collection, so the objects traced fall as 1/scale and
+-- the peak heap grows by about a live set per step: 1.85G objects traced at
+-- 3.1GB of regions at 2, 1.24G at 4.1GB at 3, 0.93G at 5.2GB at 4. The test
+-- suite runs several of those compiles at once, which is what holds it at 2.
 -- TURKEY_GC_THRESHOLD_SCALE overrides it for experiments.
 var thresholdScale : Float =
     scaleFrom(Libc.getenv(Prim.cString("TURKEY_GC_THRESHOLD_SCALE")))
@@ -421,6 +436,7 @@ fun refill(cursor : Prim.Ptr, sizeClass : Int) -> Bool {
     heapCount = plus(heapCount, n)
     allocationsSince = plus(allocationsSince, n)
     let slotSize = Prim.loadI64(region, regionSlotSize)
+    bytesSince = plus(bytesSince, Prim.intMulWrapping(n, slotSize))
     Prim.storeI64(cursor, cursorFree, claim)
     Prim.storePtr(cursor, cursorBase,
                   Prim.ptrAdd(region, plus(regionData, Prim.intMulWrapping(Prim.intShl(w, 6), slotSize))))
@@ -452,6 +468,7 @@ fun retire() -> Unit {
             if lw < load32(r, regionSearchWord) { store32(r, regionSearchWord, lw) }
             heapCount = heapCount - n
             allocationsSince = allocationsSince - n
+            bytesSince = bytesSince - n * Prim.loadI64(r, regionSlotSize)
             Prim.storeI64(cursor, cursorFree, 0)
         }
     }
@@ -475,6 +492,7 @@ fun largeAllocate(bytes : Int) -> Prim.Ptr {
     store32(made, regionUsed, 1)
     heapCount = plus(heapCount, 1)
     allocationsSince = plus(allocationsSince, 1)
+    bytesSince = plus(bytesSince, Prim.loadI64(made, regionReserved))
     Prim.ptrAdd(made, regionData)
 }
 
@@ -557,7 +575,7 @@ fun allocate(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Prim.Pt
 }
 
 fun allocateSlow(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Prim.Ptr {
-    if stress || allocationsSince >= threshold {
+    if stress || bytesSince >= threshold {
         collectFrom(frame)
         -- A collection is the only thing here that can raise one, and an
         -- allocation after a failed collection would be into a heap nobody
@@ -960,7 +978,8 @@ fun collectFrom(frame : Prim.Ptr) -> Unit {
     sweep()
     if verify { verifyAt(2, frame) }
     allocationsSince = 0
-    let floor = if heapCount > 1024 { heapCount } else { 1024 }
+    bytesSince = 0
+    let floor = if liveBytes > 65536 { liveBytes } else { 65536 }
     let next = Prim.floatMul(Prim.intToFloat(floor), thresholdScale)
     -- `maxInt()` rounds up when converted, so the comparison is against 2^63,
     -- and anything that reaches it saturates instead of converting.
@@ -999,6 +1018,7 @@ fun startMarking() -> Unit {
 -- marks become its allocation bitmap, so no individual header is visited.
 fun sweep() -> Unit {
     Memory.fill(available, 8 * regionClasses, 0)
+    liveBytes = 0
     var previous = Prim.ptrNull()
     var region = regions
     while !Prim.ptrIsNull(region) {
@@ -1021,6 +1041,9 @@ fun sweep() -> Unit {
             store32(region, regionLive, 0)
             store32(region, regionSearchWord, 0)
             let cls = load32(region, regionSizeClass)
+            liveBytes = liveBytes + (if cls < regionClasses {
+                live * Prim.loadI64(region, regionSlotSize)
+            } else { Prim.loadI64(region, regionReserved) })
             if live < load32(region, regionCapacity) && cls < regionClasses {
                 Prim.storePtr(region, regionAvailableNext, Prim.loadPtr(available, 8 * cls))
                 Prim.storePtr(available, 8 * cls, region)

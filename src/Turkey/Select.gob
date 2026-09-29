@@ -704,14 +704,15 @@ fun call(s : Sel, d : Reg, dBank : A.Bank, resultBank : A.Bank,
 -- itself may call one that can. `Turkey.Llvm.propagate` is the same test on
 -- the other path. The flag is the first word of the process state
 -- (`Turkey.Runtime.processState`), which this program defines.
+--
+-- Three instructions: the page, a load of the flag's low word, and the branch
+-- on it. The flag is only ever 0 or 1 (`Turkey.Process.raise` stores 1), so
+-- its low word is the whole answer and can be branched on as a bit.
 fun propagate(s : Sel) -> Unit {
     if s.panicking { return }
-    let flag = temp(s, Ssa.untraced(I64))
-    let panicked = address(s, runtimeSymbolOf(s, Rt.processState))
-    emit(s, A.Ldr(flag, A.Offset(panicked, 0), A.W64))
-    emit(s, A.CmpImm(flag, 0, A.W64))
     let failed = tempValue(s, Ssa.untraced(I1))
-    emit(s, A.CSet(A.reg(failed), A.Ne))
+    emit(s, A.Ldr(A.reg(failed), symbolWord(s, runtimeSymbolOf(s, Rt.processState)),
+                  A.W32))
     -- The empty message: this path propagates a panic that already happened
     -- and raises nothing new. It returns zero, as every panic path does.
     guard(s, failed, "")
@@ -737,7 +738,7 @@ fun zeroResult(s : Sel) -> Value {
 fun globalAt(s : Sel, name : String) -> A.Mem =
     match Asm.globalSlot(s.asm, name) {
         Some(slot) -> slotOf(s, slot)
-        None -> A.Offset(address(s, Asm.globalSymbol(s.asm.dialect, name)), 0)
+        None -> symbolWord(s, Asm.globalSymbol(s.asm.dialect, name))
     }
 
 -- One slot of the permanent root array.
@@ -756,6 +757,14 @@ fun address(s : Sel, sym : String) -> Reg {
     -- allocator will too.
     emit(s, A.AddLo(full, page, Asm.pageOffset(s.asm.dialect, sym)))
     full
+}
+
+-- A symbol's word as a memory operand: the page, with the offset within it
+-- in the access itself, so the full address is never formed.
+fun symbolWord(s : Sel, sym : String) -> A.Mem {
+    let page = temp(s, Ssa.untraced(Ptr))
+    emit(s, A.Adrp(page, Asm.page(s.asm.dialect, sym)))
+    A.PageOffset(page, Asm.pageOffset(s.asm.dialect, sym))
 }
 
 -- A symbol's address into `d`: `address`'s pair, ending in the destination.

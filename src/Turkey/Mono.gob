@@ -1017,9 +1017,19 @@ fun discard(x : a) -> Unit = {}
 -- projection becomes one over a name; and a superclass field is already a
 -- top-level dictionary's name, so it is followed rather than hoisted.
 --
--- The record itself stays. A dictionary *parameter* is still projected from, and
--- a capped call site still passes one; what removes the records nothing reads is
--- reachability, which is a separate question.
+-- A *generic* dictionary -- an instance applied to types the budget did not
+-- give a copy for -- is just as known: its fields are the instance's methods at
+-- those types. So each of its fields is hoisted too, as a binding generic in
+-- the instance's variables (and taking its context's dictionaries first, for an
+-- instance with a context), and a projection out of the application becomes an
+-- application of that binding. Specialization then treats the method like any
+-- other generic binding: a copy if one is granted, otherwise the generic body,
+-- called directly. Whether a *body* is copied is a budget question; whether a
+-- method of a known instance is called through a record is not.
+--
+-- The record itself stays. A dictionary *parameter* is still projected from;
+-- what removes the records nothing reads is reachability, which is a separate
+-- question.
 type Devirt = Devirt {
     program : CProgram,
     classes : ClassTable,
@@ -1033,13 +1043,16 @@ type Devirt = Devirt {
     -- the binding a previous round hoisted.
     target  : Map String String,
     hoisted : Array CBind,
+    -- Generic dictionaries with fields to hoist: the instance's context
+    -- parameters, empty for an instance without one.
+    generics : Map String (Array CParam),
 }
 
 fun newDevirt(program : CProgram, classes : ClassTable, state : State) -> Devirt =
     Devirt {
         program = program, classes = classes, state = state,
         records = Map.new(), used = Set.new(), target = state.hoists,
-        hoisted = Array.new(8),
+        hoisted = Array.new(8), generics = Map.new(),
     }
 
 fun hoistKey(owner : String, field : String) -> String = owner + "#" + field
@@ -1060,6 +1073,23 @@ fun runDevirt(d : Devirt) -> CProgram {
     -- project out of a dictionary whose fields have not been looked at yet --
     -- including its own.
     for b in d.program.dicts {
+        if len(b.binders) > 0 {
+            match genericFields(b) {
+                Some((params, fields)) -> {
+                    Map.put(d.generics, b.name, params)
+                    for (name, value) in fields {
+                        if !Map.contains(d.target, hoistKey(b.name, name)) {
+                            match hoistGeneric(d, b, params, name, value) {
+                                Some(made) -> Map.put(d.target,
+                                                      hoistKey(b.name, name), made)
+                                None -> {}
+                            }
+                        }
+                    }
+                }
+                None -> {}
+            }
+        }
         match Map.get(d.records, b.name) {
             None -> {}
             Some(record) -> match record.kind {
@@ -1126,6 +1156,50 @@ fun hoist(d : Devirt, owner : CBind, name : String,
     Some(made)
 }
 
+-- A generic dictionary's context parameters and fields, if it is a record or a
+-- function of its context answering one.
+fun genericFields(b : CBind) -> Option (Array CParam, Array (String, Core)) =
+    match b.value.kind {
+        CRecord(_, fields) -> Some((Array.new(0), fields))
+        CLam(params, body, _) -> match body.kind {
+            CRecord(_, fields) -> Some((params, fields))
+            _ -> None
+        }
+        _ -> None
+    }
+
+-- A generic dictionary's field as a binding of its own: generic in the
+-- instance's variables and then the method's own, and taking the instance's
+-- context dictionaries first. Only a method -- a lambda -- is hoisted, for the
+-- reason `hoist` gives; a superclass field stays a projection.
+fun hoistGeneric(d : Devirt, owner : CBind, params : Array CParam, name : String,
+                 value : Core) -> Option String {
+    let dictTy = match Ty.prune(owner.ty) {
+        TFun(_, result) -> if len(params) > 0 { result } else { owner.ty }
+        other -> other
+    }
+    let (own, inner) = abstractionAt(d, dictTy, name, value)
+    match inner.kind {
+        CLam(_, _, _) -> {}
+        _ -> return None
+    }
+    var made = owner.name + "#" + name
+    while Set.contains(d.used, made) { made = made + "~" }
+    Set.add(d.used, made)
+    derive(d.state, made, owner.name)
+    let body = if len(params) == 0 { inner } else {
+        mkCore(TFun(Array.map(params, _.ty), inner.ty), owner.span,
+               CLam(params, inner, made))
+    }
+    Array.push(d.hoisted, CBind {
+        name = made, ty = body.ty, binders = Array.append(owner.binders, own),
+        value = body, span = owner.span, mutable = False, module_ = owner.module_,
+        equations = Array.slice(owner.equations, 0, len(owner.equations)),
+        layouts = Map.new(),
+    })
+    Some(made)
+}
+
 -- A field's own type abstraction, as binders and a body.
 --
 -- A method that quantifies over more than its class variable is not always a
@@ -1139,12 +1213,15 @@ fun hoist(d : Devirt, owner : CBind, name : String,
 -- caught it immediately: a method was hoisted with no binders and the use site
 -- still had one type argument.
 fun abstraction(d : Devirt, owner : CBind, name : String,
-                value : Core) -> (Array VarCell, Core) {
+                value : Core) -> (Array VarCell, Core) = abstractionAt(d, owner.ty, name, value)
+
+fun abstractionAt(d : Devirt, dictTy : Ty.Type, name : String,
+                  value : Core) -> (Array VarCell, Core) {
     match value.kind {
         CTyLam(binders, body) -> return (binders, body)
         _ -> {}
     }
-    let cls = match dictClass(owner.ty) {
+    let cls = match dictClass(dictTy) {
         Some(c) -> c
         None -> return (Array.new(0), value)
     }
@@ -1168,9 +1245,28 @@ fun abstraction(d : Devirt, owner : CBind, name : String,
 
 fun devirt(d : Devirt, e : Core) -> Core {
     match e.kind {
-        CField(_, _) -> match projected(d, e) {
-            Some(found) -> return mkCore(e.ty, e.span, CVar(found))
-            None -> {}
+        CField(_, _) -> {
+            match projected(d, e) {
+                Some(found) -> return mkCore(e.ty, e.span, CVar(found))
+                None -> {}
+            }
+            match genericMethod(d, e, Array.new(0), e.ty) {
+                Some(made) -> return made
+                None -> {}
+            }
+        }
+        -- A method with a quantification of its own is projected and then
+        -- applied to its own types; the hoisted binding takes the instance's
+        -- types and then those, in one application.
+        CTyApp(fn, own) -> match fn.kind {
+            CField(_, _) -> match projected(d, fn) {
+                Some(_) -> {}
+                None -> match genericMethod(d, fn, own, e.ty) {
+                    Some(made) -> return made
+                    None -> {}
+                }
+            }
+            _ -> {}
         }
         _ -> {}
     }
@@ -1179,6 +1275,52 @@ fun devirt(d : Devirt, e : Core) -> Core {
         type_ = fun(t) = t,
         bind = fun(b) = devirtBind(d, b),
     }))
+}
+
+-- A method projected out of a generic dictionary's application, as the
+-- hoisted method applied to the same types (then `own`) and, for an instance
+-- with a context, to the same context dictionaries.
+fun genericMethod(d : Devirt, e : Core, own : Array Ty.Type,
+                  ty : Ty.Type) -> Option Core = match e.kind {
+    CField(target, name) -> match target.kind {
+        CTyApp(dict, targs) -> match dict.kind {
+            CVar(g) -> match Map.get(d.generics, g) {
+                Some(params) -> if len(params) > 0 { None } else {
+                    match Map.get(d.target, hoistKey(g, name)) {
+                        Some(h) -> Some(mkCore(ty, e.span, CTyApp(
+                            mkCore(ty, e.span, CVar(h)), Array.append(targs, own))))
+                        None -> None
+                    }
+                }
+                None -> None
+            }
+            _ -> None
+        }
+        CApp(applied, dargs) -> match applied.kind {
+            CTyApp(dict, targs) -> match dict.kind {
+                CVar(g) -> match Map.get(d.generics, g) {
+                    Some(params) -> if len(params) != len(dargs) { None } else {
+                        match Map.get(d.target, hoistKey(g, name)) {
+                            Some(h) -> {
+                                let fnTy = TFun(Array.map(dargs, _.ty), ty)
+                                Some(mkCore(ty, e.span, CApp(
+                                    mkCore(fnTy, e.span, CTyApp(
+                                        mkCore(fnTy, e.span, CVar(h)),
+                                        Array.append(targs, own))),
+                                    Array.map(dargs, devirt(d, _)))))
+                            }
+                            None -> None
+                        }
+                    }
+                    None -> None
+                }
+                _ -> None
+            }
+            _ -> None
+        }
+        _ -> None
+    }
+    _ -> None
 }
 
 fun projected(d : Devirt, e : Core) -> Option String = match e.kind {

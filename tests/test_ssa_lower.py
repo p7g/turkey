@@ -347,3 +347,32 @@ def test_a_match_that_binds_the_whole_tuple_still_builds_it():
     }
     """
     assert lang.output(src) == "2\n"
+
+
+def _many_array_types(count: int) -> str:
+    """A program that iterates arrays at `count` element types."""
+    lines = []
+    for i in range(count):
+        lines.append(f"type T{i} = T{i} {{ x : Int }}")
+        lines.append(f"fun sum{i}(xs : Array T{i}) -> Int {{\n"
+                     f"    var t = 0\n    for v in xs {{ t = t + v.x }}\n"
+                     f"    t + len(xs)\n}}")
+    calls = " + ".join(f"sum{i}([T{i} {{ x = {i} }}])" for i in range(count))
+    lines.append(f"fun main() {{ print({calls}) }}")
+    return "\n".join(lines) + "\n"
+
+
+def test_a_loop_calls_no_method_indirectly_past_the_specialization_budget():
+    # More element types than one binding may be specialized at: the loops
+    # past the budget use the instance's generic methods, but call them
+    # directly -- a known dictionary is resolved whether or not a copy of
+    # its body was made.
+    count = 40
+    src = _many_array_types(count)
+    assert lang.output(src) == f"{sum(range(count)) + count}\n"
+    result = lang.dump("ssa", src)
+    assert result.code == 0, result.stderr
+    for i in range(count):
+        body = re.search(rf"^fun @Main#sum{i}\(.*?^}}$", result.stdout,
+                         re.M | re.S).group(0)
+        assert not re.search(r"call %\d", body), body

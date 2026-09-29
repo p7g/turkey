@@ -360,16 +360,28 @@ fun walk(f : Func A.Inst, spills : Spills, evict : Bool) -> Walk {
 -- must not collide in one set; the bank is part of the key rather than the set
 -- being split in two, which would double every loop above. Register numbers
 -- are below 32, so the vector file starts there.
-fun key(f : Func A.Inst, id : Int, n : Int) -> Int = keyIn(A.bankOf(f.reps[id]), n)
+--
+-- A wrapper rather than a bare `Int` because the maps it keys hold value ids,
+-- which are `Int`s too, and swapping the two must not compile. It erases to
+-- the number, so it costs nothing.
+type RegKey = RegKey(Int)
 
-fun keyIn(bank : Bank, n : Int) -> Int = match bank {
-    Gp -> n
-    Fp -> 32 + n
+instance Eq RegKey { fun eq(RegKey(a), RegKey(b)) = a == b }
+
+instance Hash RegKey { fun hashInto(RegKey(n), h) = hashInto(n, h) }
+
+fun key(f : Func A.Inst, id : Int, n : Int) -> RegKey = keyIn(A.bankOf(f.reps[id]), n)
+
+fun keyIn(bank : Bank, n : Int) -> RegKey = match bank {
+    Gp -> RegKey(n)
+    Fp -> RegKey(32 + n)
 }
 
 -- A key as the register's name, for a message.
-fun keyName(k : Int) -> String =
-    if k < 32 { "x" + Int.toString(k) } else { "d" + Int.toString(k - 32) }
+fun keyName(k : RegKey) -> String {
+    let RegKey(n) = k
+    if n < 32 { "x" + Int.toString(n) } else { "d" + Int.toString(n - 32) }
+}
 
 fun poolOf(bank : Bank) -> Array Int = match bank {
     Gp -> gpPool
@@ -402,7 +414,7 @@ fun fileName(bank : Bank) -> String = match bank {
 --   definition and its store. Something *else* has to leave, and the holder
 --   whose next use is furthest away is Belady's answer and the one that frees
 --   the register for longest.
-fun place(w : Walk, taken : Map Int Int, id : Int, block : Ssa.Block A.Inst,
+fun place(w : Walk, taken : Map RegKey Int, id : Int, block : Ssa.Block A.Inst,
           from : Int) -> Unit {
     if w.of_[id] >= 0 { return }
     let spills = w.spills
@@ -456,7 +468,7 @@ fun stopOnce(w : Walk, why : String) -> Unit = match w.stopped {
 -- *hinted* to their argument registers rather than pinned to them -- a pin
 -- can contradict (a parameter in `x0` that is live across a call has had `x0`
 -- destroyed), and a preference cannot.
-fun freeRegister(taken : Map Int Int, forbidden : Set.Set Int, bank : Bank,
+fun freeRegister(taken : Map RegKey Int, forbidden : Set.Set Int, bank : Bank,
                  hint : Int) -> Option Int {
     -- Only a register the pool would hand out: a move from `x29`, which is
     -- how `Prim.frameAddress` reads the frame, must not colour its
@@ -474,7 +486,7 @@ fun freeRegister(taken : Map Int Int, forbidden : Set.Set Int, bank : Bank,
     None
 }
 
-fun anyUnheld(taken : Map Int Int, bank : Bank) -> Bool {
+fun anyUnheld(taken : Map RegKey Int, bank : Bank) -> Bool {
     for n in poolOf(bank) {
         if !Map.contains(taken, keyIn(bank, n)) { return True }
     }
@@ -484,7 +496,7 @@ fun anyUnheld(taken : Map Int Int, bank : Bank) -> Bool {
 -- The holder to evict: in the same file, not a reload or a store (those live
 -- for one instruction and spilling them again would loop), and used furthest
 -- from `from`. Ties go to the lower value id, so that two runs agree.
-fun victim(w : Walk, taken : Map Int Int, bank : Bank,
+fun victim(w : Walk, taken : Map RegKey Int, bank : Bank,
            block : Ssa.Block A.Inst, from : Int) -> Option Int {
     let spills = w.spills
     var best = -1

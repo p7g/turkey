@@ -177,6 +177,8 @@ type Arm
     | Sub(Reg, Reg, Reg, Width)
     | SubImm(Reg, Reg, Int, Width)
     | SubS(Reg, Reg, Reg, Width)
+    | AddSImm(Reg, Reg, Int, Width)
+    | SubSImm(Reg, Reg, Int, Width)
     | Mul(Reg, Reg, Reg, Width)
     -- The high half of a 64x64 multiply, which is how overflow is detected
     -- when `MulS` does not exist -- and it does not, on arm64.
@@ -187,6 +189,12 @@ type Arm
     | Orr(Reg, Reg, Reg, Width)
     | Eor(Reg, Reg, Reg, Width)
     | EorImm(Reg, Reg, Int, Width)
+    -- `and` with a logical immediate. Only a run of low ones is selected,
+    -- which every width can encode; see `Turkey.Select.lowMask`.
+    | AndImm(Reg, Reg, Int, Width)
+    | LslImm(Reg, Reg, Int, Width)
+    | LsrImm(Reg, Reg, Int, Width)
+    | AsrImm(Reg, Reg, Int, Width)
     | Lsl(Reg, Reg, Reg, Width)
     | Lsr(Reg, Reg, Reg, Width)
     | Asr(Reg, Reg, Reg, Width)
@@ -315,6 +323,10 @@ fun computes(op : Arm) -> Bool = match op {
     Orr(d, _, _, _) -> !isPhysical(d)
     Eor(d, _, _, _) -> !isPhysical(d)
     EorImm(d, _, _, _) -> !isPhysical(d)
+    AndImm(d, _, _, _) -> !isPhysical(d)
+    LslImm(d, _, _, _) -> !isPhysical(d)
+    LsrImm(d, _, _, _) -> !isPhysical(d)
+    AsrImm(d, _, _, _) -> !isPhysical(d)
     Lsl(d, _, _, _) -> !isPhysical(d)
     Lsr(d, _, _, _) -> !isPhysical(d)
     Asr(d, _, _, _) -> !isPhysical(d)
@@ -433,6 +445,8 @@ fun setsFlags(op : Arm) -> Bool = match op {
     CmpImm(_, _, _) -> True
     AddS(_, _, _, _) -> True
     SubS(_, _, _, _) -> True
+    AddSImm(_, _, _, _) -> True
+    SubSImm(_, _, _, _) -> True
     FCmp(_, _) -> True
     _ -> False
 }
@@ -465,6 +479,8 @@ fun srcRegs(op : Arm) -> Array Reg = match op {
     Sub(_, a, b, _)     -> [a, b]
     SubImm(_, a, _, _)  -> [a]
     SubS(_, a, b, _)    -> [a, b]
+    AddSImm(_, a, _, _) -> [a]
+    SubSImm(_, a, _, _) -> [a]
     Mul(_, a, b, _)     -> [a, b]
     SMulH(_, a, b)      -> [a, b]
     SDiv(_, a, b, _)    -> [a, b]
@@ -473,6 +489,10 @@ fun srcRegs(op : Arm) -> Array Reg = match op {
     Orr(_, a, b, _)     -> [a, b]
     Eor(_, a, b, _)     -> [a, b]
     EorImm(_, a, _, _)  -> [a]
+    AndImm(_, a, _, _)  -> [a]
+    LslImm(_, a, _, _)  -> [a]
+    LsrImm(_, a, _, _)  -> [a]
+    AsrImm(_, a, _, _)  -> [a]
     Lsl(_, a, b, _)     -> [a, b]
     Lsr(_, a, b, _)     -> [a, b]
     Asr(_, a, b, _)     -> [a, b]
@@ -534,6 +554,8 @@ fun mapUses(op : Arm, g : fun(Reg) -> Reg) -> Arm = match op {
     Sub(k0, a, b, k3)     -> Sub(k0, g(a), g(b), k3)
     SubImm(k0, a, k2, k3) -> SubImm(k0, g(a), k2, k3)
     SubS(k0, a, b, k3)    -> SubS(k0, g(a), g(b), k3)
+    AddSImm(k0, a, k2, k3) -> AddSImm(k0, g(a), k2, k3)
+    SubSImm(k0, a, k2, k3) -> SubSImm(k0, g(a), k2, k3)
     Mul(k0, a, b, k3)     -> Mul(k0, g(a), g(b), k3)
     SMulH(k0, a, b)       -> SMulH(k0, g(a), g(b))
     SDiv(k0, a, b, k3)    -> SDiv(k0, g(a), g(b), k3)
@@ -542,6 +564,10 @@ fun mapUses(op : Arm, g : fun(Reg) -> Reg) -> Arm = match op {
     Orr(k0, a, b, k3)     -> Orr(k0, g(a), g(b), k3)
     Eor(k0, a, b, k3)     -> Eor(k0, g(a), g(b), k3)
     EorImm(k0, a, k2, k3) -> EorImm(k0, g(a), k2, k3)
+    AndImm(k0, a, k2, k3) -> AndImm(k0, g(a), k2, k3)
+    LslImm(k0, a, k2, k3) -> LslImm(k0, g(a), k2, k3)
+    LsrImm(k0, a, k2, k3) -> LsrImm(k0, g(a), k2, k3)
+    AsrImm(k0, a, k2, k3) -> AsrImm(k0, g(a), k2, k3)
     Lsl(k0, a, b, k3)     -> Lsl(k0, g(a), g(b), k3)
     Lsr(k0, a, b, k3)     -> Lsr(k0, g(a), g(b), k3)
     Asr(k0, a, b, k3)     -> Asr(k0, g(a), g(b), k3)
@@ -612,6 +638,8 @@ fun rewrite(op : Arm, g : fun(Reg) -> Reg, m : fun(Mem) -> Mem) -> Arm = match o
     Sub(f0, f1, f2, f3)      -> Sub(g(f0), g(f1), g(f2), f3)
     SubImm(f0, f1, f2, f3)   -> SubImm(g(f0), g(f1), f2, f3)
     SubS(f0, f1, f2, f3)     -> SubS(g(f0), g(f1), g(f2), f3)
+    AddSImm(f0, f1, f2, f3)  -> AddSImm(g(f0), g(f1), f2, f3)
+    SubSImm(f0, f1, f2, f3)  -> SubSImm(g(f0), g(f1), f2, f3)
     Mul(f0, f1, f2, f3)      -> Mul(g(f0), g(f1), g(f2), f3)
     SMulH(f0, f1, f2)        -> SMulH(g(f0), g(f1), g(f2))
     SDiv(f0, f1, f2, f3)     -> SDiv(g(f0), g(f1), g(f2), f3)
@@ -620,6 +648,10 @@ fun rewrite(op : Arm, g : fun(Reg) -> Reg, m : fun(Mem) -> Mem) -> Arm = match o
     Orr(f0, f1, f2, f3)      -> Orr(g(f0), g(f1), g(f2), f3)
     Eor(f0, f1, f2, f3)      -> Eor(g(f0), g(f1), g(f2), f3)
     EorImm(f0, f1, f2, f3)   -> EorImm(g(f0), g(f1), f2, f3)
+    AndImm(f0, f1, f2, f3)   -> AndImm(g(f0), g(f1), f2, f3)
+    LslImm(f0, f1, f2, f3)   -> LslImm(g(f0), g(f1), f2, f3)
+    LsrImm(f0, f1, f2, f3)   -> LsrImm(g(f0), g(f1), f2, f3)
+    AsrImm(f0, f1, f2, f3)   -> AsrImm(g(f0), g(f1), f2, f3)
     Lsl(f0, f1, f2, f3)      -> Lsl(g(f0), g(f1), g(f2), f3)
     Lsr(f0, f1, f2, f3)      -> Lsr(g(f0), g(f1), g(f2), f3)
     Asr(f0, f1, f2, f3)      -> Asr(g(f0), g(f1), g(f2), f3)
@@ -679,6 +711,8 @@ fun destRegs(op : Arm) -> Array Reg = match op {
     Sub(d, _, _, _)     -> [d]
     SubImm(d, _, _, _)  -> [d]
     SubS(d, _, _, _)    -> [d]
+    AddSImm(d, _, _, _) -> [d]
+    SubSImm(d, _, _, _) -> [d]
     Mul(d, _, _, _)     -> [d]
     SMulH(d, _, _)      -> [d]
     SDiv(d, _, _, _)    -> [d]
@@ -687,6 +721,10 @@ fun destRegs(op : Arm) -> Array Reg = match op {
     Orr(d, _, _, _)     -> [d]
     Eor(d, _, _, _)     -> [d]
     EorImm(d, _, _, _)  -> [d]
+    AndImm(d, _, _, _)  -> [d]
+    LslImm(d, _, _, _)  -> [d]
+    LsrImm(d, _, _, _)  -> [d]
+    AsrImm(d, _, _, _)  -> [d]
     Lsl(d, _, _, _)     -> [d]
     Lsr(d, _, _, _)     -> [d]
     Asr(d, _, _, _)     -> [d]
@@ -851,6 +889,8 @@ fun showArm(op : Arm) -> String = match op {
     Sub(d, a, b, w)        -> three("sub", d, a, b, w)
     SubImm(d, a, n, w)     -> imm("sub", d, a, n, w)
     SubS(d, a, b, w)       -> three("subs", d, a, b, w)
+    AddSImm(d, a, n, w)    -> imm("adds", d, a, n, w)
+    SubSImm(d, a, n, w)    -> imm("subs", d, a, n, w)
     Mul(d, a, b, w)        -> three("mul", d, a, b, w)
     SMulH(d, a, b)         -> three("smulh", d, a, b, W64)
     SDiv(d, a, b, w)       -> three("sdiv", d, a, b, w)
@@ -860,6 +900,10 @@ fun showArm(op : Arm) -> String = match op {
     Orr(d, a, b, w)        -> three("orr", d, a, b, w)
     Eor(d, a, b, w)        -> three("eor", d, a, b, w)
     EorImm(d, a, n, w)     -> imm("eor", d, a, n, w)
+    AndImm(d, a, n, w)     -> imm("and", d, a, n, w)
+    LslImm(d, a, n, w)     -> imm("lsl", d, a, n, w)
+    LsrImm(d, a, n, w)     -> imm("lsr", d, a, n, w)
+    AsrImm(d, a, n, w)     -> imm("asr", d, a, n, w)
     Lsl(d, a, b, w)        -> three("lsl", d, a, b, w)
     Lsr(d, a, b, w)        -> three("lsr", d, a, b, w)
     Asr(d, a, b, w)        -> three("asr", d, a, b, w)

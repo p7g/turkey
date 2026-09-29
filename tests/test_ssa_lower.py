@@ -395,7 +395,9 @@ def _many_map_types(count: int) -> str:
 def test_a_constrained_function_past_the_budget_builds_no_closure_per_call():
     # `Map.put` and `Map.get` take a `Hash` dictionary. Past the budget they
     # stay generic, and a call to one supplies the dictionary and the
-    # arguments together: one call, with no closure over the dictionary.
+    # arguments together: one call, with no closure over the dictionary. And
+    # once `Map.get` is inlined, its `hashInto` is a method of a dictionary
+    # the caller named, read as a direct call.
     count = 40
     src = _many_map_types(count)
     assert lang.output(src) == f"{sum(range(count))}\n"
@@ -408,4 +410,4 @@ def test_a_constrained_function_past_the_budget_builds_no_closure_per_call():
                          re.M | re.S).group(0)
         calls = {c[1:] for c in re.findall(r"call (@\S+)", body)}
         assert not calls & wrapped, body
-        assert "closure.new" not in body, body
+        assert "closure.new" not in body and not re.search(r"call %\d", body), body

@@ -486,6 +486,14 @@ fun step(r : Reducer, e : Core) -> Option Core {
                 Some(m) -> return Some(m)
                 None -> {}
             }
+            match nameArguments(r, e) {
+                Some(m) -> return Some(m)
+                None -> {}
+            }
+            match knownLet(r, e) {
+                Some(m) -> return Some(m)
+                None -> {}
+            }
             return floatLetThroughJoin(e)
         }
         CJoin(_, _, _, _, _) -> return specializeJoin(r, e)
@@ -1252,7 +1260,7 @@ fun specialized(groups : Map String Variant, j : Core) -> Option Core {
 -- `Some(launch())` still launches, and so does `Some((launch(), x))`.
 fun knownConstructor(r : Reducer, e : Core) -> Option Core = match e.kind {
     CMatch(scrutinee, alts) -> if isKnown(scrutinee) {
-        selectArm(r, e, scrutinee, alts)
+        selectArm(r, e, scrutinee, scrutinee, alts)
     } else {
         None
     }
@@ -1266,10 +1274,12 @@ fun isKnown(e : Core) -> Bool = match e.kind {
     _ -> isConstructor(e)
 }
 
-fun selectArm(r : Reducer, e : Core, scrutinee : Core,
+-- `root` is what a variable pattern at the root binds: the scrutinee itself,
+-- or the name a `let` gave it, which must not be rebuilt.
+fun selectArm(r : Reducer, e : Core, scrutinee : Core, root : Core,
               alts : Array CAlt) -> Option Core {
     for alt in alts {
-        let bound = Bound { names = [], values = [], later = [] }
+        let bound = Bound { root = root, names = [], values = [], later = [] }
         match decide(r, alt.pat, scrutinee, False, bound) {
             Fails -> {}
             Undecided -> return None
@@ -1288,6 +1298,159 @@ fun selectArm(r : Reducer, e : Core, scrutinee : Core,
     None
 }
 
+-- `let x = C(e1, .., en) in body` with each argument that is not atomic named
+-- first: `let t1 = e1 in .. let x = C(t1, .., tn) in body`.
+--
+-- What lets `knownLet` take `x` apart at a `match` further down: the
+-- constructor's arguments are then names it can copy, where copying `e1` would
+-- evaluate it twice. Only when `body` has a `match x` where `knownLet` looks,
+-- so a binding nobody takes apart keeps its shape. The arguments are bound in
+-- the order the constructor application evaluated them, before it, so nothing
+-- moves.
+fun nameArguments(r : Reducer, e : Core) -> Option Core = match e.kind {
+    CLet(name, ty, value, body, binders) -> {
+        if len(binders) > 0 || !unfoldable(r, value) { return None }
+        let parts = knownParts(value)
+        var plain = True
+        for part in parts { if !isAtom(part) { plain = False } }
+        if plain { return None }
+        -- Found, not decided: the fresh names cannot be captured, so only `x`
+        -- itself can hide the `match`.
+        match onSpine(body, name, Set.new(), fun(m) = Some(m)) {
+            None -> return None
+            Some(_) -> {}
+        }
+        let names = []
+        let atoms = []
+        for part in parts {
+            if isAtom(part) {
+                Array.push(atoms, part)
+            } else {
+                let t = fresh(r, "arg")
+                Array.push(names, (t, part))
+                Array.push(atoms, mkCore(part.ty, part.span, CVar(t)))
+            }
+        }
+        var out = mkCore(e.ty, e.span,
+                         CLet(name, ty, rebuildKnown(value, atoms), body, binders))
+        for var i = len(names) - 1; i >= 0; i = i - 1 {
+            let (t, part) = names[i]
+            out = mkCore(e.ty, part.span, CLet(t, part.ty, part, out, []))
+        }
+        Some(out)
+    }
+    _ -> None
+}
+
+-- `let x = C(a, b) in .. match x { .. } ..`, with the first `match x` on the
+-- body's spine replaced by the arm the constructor selects.
+--
+-- GHC's case-of-known-constructor through an unfolding. The arguments are
+-- atoms by now (`nameArguments`), so selecting an arm copies names, never
+-- work; a variable pattern at the root binds `x` itself, so the constructor
+-- is not built a second time.
+--
+-- Only on the spine -- `let` values and bodies, join bodies and continuations
+-- -- and not in every subterm. This is tried at every `let`, and a `let` chain
+-- is the whole of a function, so a walk of the body at each one is quadratic
+-- in its length. The spine is where a producer and the `match` that consumes
+-- it meet once calls are inlined.
+fun knownLet(r : Reducer, e : Core) -> Option Core = match e.kind {
+    CLet(name, ty, value, body, binders) -> {
+        if len(binders) > 0 || !unfoldable(r, value) { return None }
+        for part in knownParts(value) { if !isAtom(part) { return None } }
+        let whole = mkCore(value.ty, value.span, CVar(name))
+        let decided = onSpine(body, name, freeNames(value), fun(m) = match m.kind {
+            CMatch(_, alts) -> selectArm(r, m, value, whole, alts)
+            _ -> None
+        })
+        match decided {
+            Some(made) -> Some(mkCore(e.ty, e.span,
+                                      CLet(name, ty, value, made, binders)))
+            None -> None
+        }
+    }
+    _ -> None
+}
+
+-- `e` with the first `match name` on its spine replaced by what `decide`
+-- makes of it, or `None` if there is none or `decide` declines.
+--
+-- A binder on the way that rebinds `name`, or a name in `reads`, stops the
+-- walk: below it a `match name` would see another value, and the arguments
+-- `decide` copies in would read other bindings.
+fun onSpine(e : Core, name : String, reads : Set.Set String,
+            decide : fun(Core) -> Option Core) -> Option Core = match e.kind {
+    CMatch(scrutinee, _) -> match scrutinee.kind {
+        CVar(n) -> if n == name { decide(e) } else { None }
+        _ -> None
+    }
+    CLet(bound, ty, value, body, binders) -> {
+        match onSpine(value, name, reads, decide) {
+            Some(made) -> return Some(mkCore(e.ty, e.span,
+                                             CLet(bound, ty, made, body, binders)))
+            None -> {}
+        }
+        if bound == name || Set.contains(reads, bound) { return None }
+        match onSpine(body, name, reads, decide) {
+            Some(made) -> Some(mkCore(e.ty, e.span,
+                                      CLet(bound, ty, value, made, binders)))
+            None -> None
+        }
+    }
+    CJoin(label, params, body, rest, recursive) -> {
+        match onSpine(rest, name, reads, decide) {
+            Some(made) -> return Some(mkCore(e.ty, e.span,
+                                             CJoin(label, params, body, made,
+                                                   recursive)))
+            None -> {}
+        }
+        for p in params {
+            if p.name == name || Set.contains(reads, p.name) { return None }
+        }
+        match onSpine(body, name, reads, decide) {
+            Some(made) -> Some(mkCore(e.ty, e.span,
+                                      CJoin(label, params, made, rest, recursive)))
+            None -> None
+        }
+    }
+    _ -> None
+}
+
+-- A constructor application or tuple whose `match` can be decided wherever
+-- its name is read. Not a record: a record's fields can be assigned, and a
+-- `match` after the assignment reads what it was assigned.
+fun unfoldable(r : Reducer, e : Core) -> Bool = match e.kind {
+    CTuple(_) -> True
+    _ -> match constructorName(e) {
+        Some(con) -> match Decls.con(r.decls, con) {
+            Some(info) -> !Decls.isRecord(info)
+            None -> False
+        }
+        None -> False
+    }
+}
+
+fun knownParts(e : Core) -> Array Core = match e.kind {
+    CTuple(parts) -> parts
+    _ -> constructorArgs(e)
+}
+
+fun rebuildKnown(e : Core, parts : Array Core) -> Core = match e.kind {
+    CTuple(_) -> mkCore(e.ty, e.span, CTuple(parts))
+    _ -> rebuildConstructor(e, parts)
+}
+
+-- Whether copying `e` copies no work and no allocation.
+fun isAtom(e : Core) -> Bool = match e.kind {
+    CVar(_) -> True
+    CLit(_) -> True
+    CUnit -> True
+    CCon(_) -> True
+    _ -> False
+}
+
+
 -- What a pattern against a known part of the scrutinee comes to.
 type Decision = Matches | Fails | Undecided
 
@@ -1296,6 +1459,7 @@ type Decision = Matches | Fails | Undecided
 -- whose pattern cannot fail: it is bound whole, under a fresh name, and taken
 -- apart by a one-arm `match` around the body, which tests nothing.
 type Bound = Bound {
+    root   : Core,
     names  : Array String,
     values : Array Core,
     later  : Array (String, Pat, Ty.Type),
@@ -1318,8 +1482,8 @@ fun decide(r : Reducer, p : Pat, part : Core, nested : Bool,
     }
     match p.kind {
         PAnnot(inner, _) -> decide(r, inner, part, nested, bound)
-        PVar(name) -> bind(bound, name, part)
-        PWild -> bind(bound, fresh(r, "seq"), part)
+        PVar(name) -> bind(bound, name, if nested { part } else { bound.root })
+        PWild -> bind(bound, fresh(r, "seq"), if nested { part } else { bound.root })
         PLit(lit) -> match part.kind {
             CLit(known) -> match sameLiteral(lit, known) {
                 Some(True) -> bind(bound, fresh(r, "seq"), part)

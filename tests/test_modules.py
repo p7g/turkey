@@ -1,4 +1,4 @@
-"""M11a: a program is a graph of modules (design.md section 9).
+"""A program is a graph of modules.
 
 The golden programs under `tests/programs/modules/` cover the happy path
 end to end. What is here is the scoping rules themselves -- what an import
@@ -77,8 +77,8 @@ def test_an_alias_renames_the_module(tmp_path):
 
 
 def test_an_alias_and_a_selective_list_are_independent(tmp_path):
-    """`import M as S (f)` did not even parse before M11a: the
-    parser's `elif` chain made `as` and a list mutually exclusive."""
+    """`import M as S (f)`: an alias and a list together, which a parser
+    that treated them as alternatives would refuse."""
     search = write(tmp_path, Helper=HELPER)
     src = "import Helper as H (twice)\nfun f() -> Int = H.twice(1)"
     assert sigs(src, search)["f"] == "fun() -> Int"
@@ -162,8 +162,8 @@ def test_a_module_with_no_export_list_exports_everything(tmp_path):
 
 
 def test_a_local_definition_shadows_an_import(tmp_path):
-    """design.md section 9.3 rule 2. The two are different bindings, not a
-    conflict: `twice` here is `Main#twice`."""
+    """A module's own declarations beat its imports. The two are different
+    bindings, not a conflict: `twice` here is `Main#twice`."""
     search = write(tmp_path, Helper=HELPER)
     src = "import Helper\nfun twice(s : String) -> String = s + s"
     assert sigs(src, search)["twice"] == "fun(String) -> String"
@@ -176,13 +176,14 @@ def test_an_import_shadows_the_prelude(tmp_path):
 
 
 def test_a_module_may_define_a_name_the_prelude_uses(tmp_path):
-    """`plan.txt` item 3: seventeen names were unavailable to every program."""
+    """The Prelude's class methods (`show`, `iter`, `add`, ...) do not take
+    those names from a program that wants to define its own."""
     src = "fun show(x : Int) -> Int = x\nfun iter(x : Int) -> Int = x"
     assert sigs(src, {})["show"] == "fun(Int) -> Int"
 
 
 def test_an_operator_still_means_its_class_method(tmp_path, capsys):
-    """The desugared node is marked, not looked up -- see turkey/resolve.py."""
+    """The desugared node is marked, not looked up -- see `Turkey.Resolve`."""
     src = 'fun add(x : String, y : String) -> String = x + y\n' \
           'fun main() { print(add("a", "b")); print(1 + 2) }'
     assert output(src, {}, capsys) == ["ab", "3"]
@@ -289,12 +290,12 @@ def test_run_from_a_file_searches_beside_it(tmp_path, capsys):
     assert capsys.readouterr().out.splitlines() == ["hello, you"]
 
 
-# -- the library is written in the language (M11b) ----------------------------
+# -- the library is written in the language -----------------------------------
 
 
 def test_the_bare_names_the_library_uses_are_free(tmp_path, capsys):
-    """`plan.txt` item 3, the other half: the built-in `Array.push` used to
-    claim `push` too. A *module* re-export claims no bare name."""
+    """The other half: `Array.push` does not claim a bare `push`, because a
+    *module* re-export claims no bare name."""
     src = """
 fun push(n : Int) -> Int = n + 1
 fun new(n : Int) -> Int = n + 2
@@ -324,7 +325,7 @@ def test_the_library_is_reachable_without_an_import(tmp_path):
 
 def test_the_long_spelling_is_available_by_importing_the_module(tmp_path):
     """The Prelude re-exports `Data.Array` under the short alias. A program
-    that wants section 8.3's spelling asks for the module itself."""
+    that wants the long spelling asks for the module itself."""
     src = ("import Data.Array\n"
            "fun f(xs : Array Int) -> Unit = Data.Array.push(xs, 1)")
     assert sigs(src, {})["f"] == "fun(Array Int) -> Unit"
@@ -355,7 +356,7 @@ def test_module_is_an_export_form_not_an_import_one(tmp_path):
         fails("import Helper (module Helper)", search)
 
 
-# -- a type and an instance know which module made them (M11c) ----------------
+# -- a type and an instance know which module made them -----------------------
 
 SHAPE = """
 module Shape (Node(..), leaf)
@@ -367,8 +368,8 @@ fun leaf() -> Node = Leaf
 
 
 def test_two_modules_may_each_declare_the_same_type(tmp_path):
-    """The stated outcome of delta 43: two libraries that each have a `Node`
-    can be used together, because the two are different type constructors."""
+    """A type constructor is qualified by its module, so two libraries that
+    each have a `Node` can be used together: they are different types."""
     search = write(tmp_path, Shape=SHAPE,
                    Graph="module Graph (Node(..))\ntype Node = Node(Int)")
     src = ("import Shape as S\nimport Graph as G\n"

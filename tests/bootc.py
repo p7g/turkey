@@ -1,36 +1,16 @@
 """`boot`, compiled once and shared by every test module that runs it.
 
-Compiling `boot` takes about two minutes, from the committed bootstrap
-by `scripts/build.sh`; through the Python compiler it took three.
-*Running* the compiled binary over the whole corpus takes ten seconds. Every
-ratio in this file follows from those two numbers.
+Compiling `boot` takes about two minutes, from the committed bootstrap by
+`scripts/build.sh`. *Running* the compiled binary over the whole corpus takes
+ten seconds. Every ratio in this file follows from those two numbers.
 
-`test_boot` learned that once already: it builds an executable and reuses it
-across its stages, and its docstring explains why. What it did not do was put
-the fixture anywhere its siblings could reach, so `test_ssa_lower` and
-`test_native` each went on running `boot` through `turkey.driver.run` --
-interpreting the whole bootstrap compiler under the Python implementation,
-about three minutes before either looks at its input. `test_native` took
-forty-six minutes to do ten seconds of work.
-
-That is the third form of one mistake. FINDINGS 61 was "do not pay startup per
-file". FINDINGS 65 was the same again in a different command. This one is **the
-fix was made in one module and never reached the others** -- and the thing that
-hid it is that `test_ssa_lower`'s docstring already claimed the shape, calling
-itself the "same shape as `test_boot` building one binary and sharing it" while
-building no binary at all. A comment describing the fix reads exactly like the
-fix.
-
-So the fixture lives here, in a module that is not itself a test, and the rule
-is: **no test may run `boot` through `turkey.driver.run`.** If a module needs
-`boot`, it calls `boot(...)` below and pays the build once per session, shared
-with everyone else.
-
-Running a *corpus program* through `turkey.driver.run` is a different thing and
-stays: that is the reference implementation answering what the program should
-print, which is the oracle `test_native` compares against and takes about a
-third of a second. The rule is about the bootstrap compiler, not about the
-driver.
+So the build happens here, in a module that is not itself a test, and the rule
+is: **a test that needs `boot` calls `boot(...)` or `binary()` below**, and
+never builds or starts one of its own. The build is paid once per change to
+its inputs, shared by every worker and every session, and a test module that
+arranged its own would pay minutes per worker for seconds of work. The same
+holds one level down: a test that runs `boot` over the whole corpus goes
+through `boot_each`, so the corpus is compiled once, not once per worker.
 """
 
 from __future__ import annotations
@@ -73,8 +53,8 @@ def _fingerprint(root: Path = REPO_ROOT) -> str:
     """A digest of every input to the build, for use as a cache key.
 
     Takes the root so that `tests/test_bootc.py` can check the key against a
-    copy. It used to edit the real `src/` and `turkey/` to do it, which under
-    `pytest -n auto` is a truncated `driver.py` imported by some other worker.
+    copy, rather than editing the real `src/` while other workers under
+    `pytest -n auto` may be reading it.
     """
     h = hashlib.sha256()
     for directory, pattern in _INPUTS:
@@ -112,10 +92,9 @@ def binary() -> Path:
     The build takes about two minutes and the result depends on
     nothing but the files `_fingerprint` hashes, so it is kept in a shared directory keyed
     by that hash rather than in a per-session temporary one. A session that
-    changes nothing pays nothing. This matters more outside the test suite than
-    in it: a one-off script that wants a compiled `boot` used to pay the full
-    build every time it ran, which is two minutes to ask a question that
-    takes ten seconds to answer.
+    changes nothing pays nothing. This matters outside the test suite too: a
+    one-off script that wants a compiled `boot` does not pay two minutes of
+    build to ask a question that takes ten seconds to answer.
 
     Sharing the directory between concurrent builds is safe because the key is
     a content hash -- two builders racing are producing the same bytes -- but
@@ -175,10 +154,9 @@ def boot(*args: str) -> str:
 def boot_with_stderr(*args: str) -> tuple[str, str]:
     """`boot`, answering stdout and stderr both.
 
-    `boot types` reports exhaustiveness warnings on stderr, and `boot` above
-    threw stderr away -- which is how `test_boot`'s types milestone came to run
-    `boot` *interpreted* instead, the one thing this module's header forbids,
-    for six minutes a run (FINDINGS 93).
+    `boot` above throws stderr away, which is right for a test that wants
+    only the dump. A test that also wants the diagnostics uses this, rather
+    than running `boot` some other way.
     """
     result = subprocess.run(
         toolchain.command(binary(), *args),
@@ -245,13 +223,12 @@ def boot_each(command: str, paths: list[Path],
               split: Callable[[str, list[Path]], list[str]]) -> dict[Path, str]:
     """`boot <command>` over some programs, cached on disk per program.
 
-    The test modules that run `boot` over the corpus kept the result in an
-    `lru_cache`, which is one run per *process* -- and under `pytest -n auto`
-    every worker that drew one of their tests paid the whole corpus run again.
-    `test_select`'s cost ~22 s a worker, sixteen times.
+    On disk rather than in an `lru_cache`: a cache per *process* means that
+    under `pytest -n auto` every worker that draws one of these tests pays the
+    whole corpus run again (for `test_select`, ~22 s a worker).
 
-    Keyed on the build fingerprint -- `boot`, `lib/`, `turkey/`, the runtime --
-    plus the command and the program's own bytes. Corpus programs import only
+    Keyed on the build fingerprint -- `src/`, `lib/`, the bootstrap and the
+    build script -- plus the command and the program's own bytes. Corpus programs import only
     the library, which the fingerprint covers; a program that imported a
     sibling would need its directory hashed too, as `reference` does.
 

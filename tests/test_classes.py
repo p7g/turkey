@@ -15,9 +15,9 @@ from tests import lang
 from tests.lang import check
 from tests.lang import CompileError
 
-# `Either` was declared here until delta 45 put it in the prelude. Declaring one
-# anyway would still work -- a type is qualified by its module -- but every
-# signature below would then print it as `Main.Either` to say which one it meant.
+# `Either` comes from the Prelude. Declaring one here would work -- a type is
+# qualified by its module -- but every signature below would then print it as
+# `Main.Either` to say which one it meant.
 PRELUDE = ""
 
 
@@ -130,8 +130,8 @@ def test_a_missing_instance_names_the_type_that_lacks_one():
 def test_an_instance_context_becomes_the_use_site_obligation():
     """`Egal (Array a)` holds only where `Egal a` does, and says so.
 
-    No return type, so this is inferred rather than checked (delta 38); the
-    written `a` is held to its written context (delta 67), and the solver
+    No return type, so this is inferred rather than checked; the
+    written `a` is held to its written context, and the solver
     discovers that the instance's `Egal a` is what that context has to say.
     """
     src = EQ + """
@@ -144,7 +144,7 @@ def test_an_instance_context_becomes_the_use_site_obligation():
 
 
 def test_a_signature_must_declare_the_context_its_body_needs():
-    """The other side of delta 38: a stated type is the whole of the type."""
+    """The other side: a complete signature is the whole of the type."""
     src = EQ + """
     instance Egal (Array a) : Egal a {
         fun egal(xs, ys) = egal(xs[0], ys[0])
@@ -274,8 +274,8 @@ def test_an_instance_may_not_define_a_method_of_another_class():
 
 
 def test_a_method_may_share_a_name_with_a_top_level_function():
-    """It could not before M11a, because both lived in one flat namespace. A
-    top-level binding and the class method now have distinct internal names."""
+    """A top-level binding and a class method have distinct internal names, so
+    they do not collide in one flat namespace."""
     src = EQ + "fun egal(x, y) = x"
     assert sigs(src)["egal"] == "fun(a, b) -> a"
 

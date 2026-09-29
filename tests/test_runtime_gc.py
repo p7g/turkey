@@ -64,7 +64,7 @@ def test_allocation_kinds_and_options_survive_stress_override(gc_probe, args):
     out = probe(gc_probe, "4", *args)
     count = 3 if len(args) == 2 else 2
     assert f"allocations {count}," in out
-    # A string is a byte array since TIX-66, so it is counted as one.
+    # A string is a byte array, so it is counted as one.
     assert f"array {count}," in out
     assert "next threshold 4096," in out
 
@@ -179,10 +179,9 @@ def test_regions_reuse_holes_and_reclaim_small_and_large_objects(region_probe, s
 def code_probe(tmp_path_factory, allocator_object):
     """Layout code 7 is traced and 6 is not, for both of the collector's readers.
 
-    `mark_children` tested `>= 6` until an untraced pointer became reachable
-    (TIX-61), so the two codes were one code and nothing here could have
-    failed. This is what makes the distinction a property rather than a
-    convention: an array's element tag and an object's three-bit slot metadata
+    Reading `>= 6` as "traced" would pass every test that had no untraced
+    pointer in it, since the two codes would be one code. This is what makes
+    the distinction a property rather than a convention: an array's element tag and an object's three-bit slot metadata
     are read by different branches of `mark_children`, and both are pinned.
     """
     if toolchain.missing():

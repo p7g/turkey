@@ -1,9 +1,9 @@
-"""Existential constructors from source (SPEC-DELTAS 68).
+"""Existential constructors from source.
 
 Construction elaborates like a constrained function, a pattern opens one at a
 rigid constant scoped to its arm or function, and what it hides may not leave.
-The layout side -- every payload layout, generic code, GC -- is pinned in
-`tests/test_existential_layout.py`; this file is the language.
+The layout side -- every payload layout, generic code, GC -- is pinned by the
+`existential_*.gob` programs in `tests/programs/`; this file is the language.
 """
 
 from __future__ import annotations

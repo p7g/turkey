@@ -1,10 +1,10 @@
 """`boot native`: the corpus compiled by the independent arm64 backend, and run.
 
-M28 phase 5b, and the first oracle this backend has had that checks *meaning*.
-`tests/test_emit.py` checks that `as` accepts what is printed, which catches an
-immediate out of range and a register spelled for the wrong file -- and accepts
-a parallel copy that loses half its values (FINDINGS 95). Everything the
-allocator, the frame layout and the emitter actually decide is invisible to it.
+The check on this backend that sees *meaning*. `tests/test_emit.py` checks
+that `as` accepts what is printed, which catches an immediate out of range and
+a register spelled for the wrong file -- and accepts a parallel copy that loses
+half its values, since that is well-formed assembly. Everything the allocator,
+the frame layout and the emitter actually decide is invisible to it.
 
 Whether each corpus program prints what it should is `test_programs`' check:
 every program there is compiled by this backend and diffed against its
@@ -52,7 +52,7 @@ def _all() -> dict[str, str]:
     """Every corpus program's assembly, from one `boot` process.
 
     Starting `boot` costs minutes and compiling a program costs a moment, so
-    one process per program turns the corpus into an hour (FINDINGS 61, 65).
+    one process per program turns the corpus into an hour.
     """
     paths = [PROGRAMS / name for name in CORPUS]
     texts = bootc.boot_each("native", paths, _split)
@@ -98,7 +98,7 @@ def test_every_program_has_an_entry_and_a_root_array():
     array still links, and every string literal is then null."""
     for name, text in _all().items():
         assert f"{toolchain.c_symbol('turkey_module_roots')}:" in text, name
-        # The program as `Turkey.Entry` runs it, by its C symbol (TIX-67).
+        # The program as `Turkey.Entry` runs it, by its C symbol.
         assert f'"{toolchain.c_symbol("turkey_entry")}":' in text, name
         assert f'.globl "{toolchain.c_symbol("main")}"' in text, name
 

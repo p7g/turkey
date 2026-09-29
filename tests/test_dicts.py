@@ -89,8 +89,8 @@ fun main() {
 def test_a_method_known_only_by_its_result_type(capsys):
     """`empty()` has nothing at the call site to dispatch on but the type.
 
-    It is the exit criterion of this milestone, and the reason evidence is
-    passed rather than recovered from an argument.
+    It is the case that decides dictionary passing: evidence is passed rather
+    than recovered from an argument, because there may be no argument.
     """
     src = """
 class Default a {

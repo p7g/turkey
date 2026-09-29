@@ -1,15 +1,12 @@
-"""`src/Turkey/Select.gob`: the low IR to arm64 (M28 phase 4).
+"""`src/Turkey/Select.gob`: the low IR to arm64.
 
-Until this file existed, selection was checked by a person running `boot asm`
-and reading the histogram. That is not a test, and it showed: a call with nine
-arguments panicked *inside the compiler* -- `argRegs` indexed at 8 -- and
-nothing would have caught it, because no corpus program had a function with
-more than eight parameters until `manyargs.gob` was added below.
+Programs written to reach what the corpus does not, such as `manyargs.gob`: a
+call with more than eight arguments in one register file once panicked
+*inside the compiler*, and no corpus program had one.
 
 Three things are asserted, and they are deliberately not "the output is this
-text". There is no oracle for arm64 the way `test_boot` has one for everything
-above Core, so a golden here would only assert that selection still does what
-it did:
+text". There is no second implementation of selection to compare against, so a
+golden here would only assert that selection still does what it did:
 
 * **The machine graph verifies.** `Turkey.Ssa.verify` runs over the selected
   functions, and it is the real check -- selection creates blocks now, so a
@@ -307,10 +304,10 @@ def _boot_asm() -> str:
 def test_boot_allocates_completely():
     """The compiler's own source, which is what the spiller is for.
 
-    Before spilling, 249 of `boot`'s functions stopped: 88 values live at once
-    in `%module.initialize`, 35 of them untraced, and 84 live across one call
-    against ten callee-saved registers. The corpus alone never needed a
-    spiller, so this is the test that says it works on the program M29 needs.
+    `boot`'s peaks are far above the corpus's: 88 values live at once in
+    `%module.initialize`, 35 of them untraced, and 84 live across one call
+    against ten callee-saved registers. The corpus alone never needs a
+    spiller, so this is the test that says it works on the compiler itself.
     """
     text = _boot_asm()
     assert not _colour_reasons(text), _colour_reasons(text)
@@ -336,11 +333,9 @@ def _function(text: str, name: str) -> tuple[str, list[str]]:
 def test_the_float_primitives_select_without_a_call():
     """`Prim.floatBits`, `floatFromBits`, `floatIsNaN` and `floatFitsInt`.
 
-    None has a runtime entry point, and no corpus program reached one until
-    `float_bits.gob` -- so selection's ratchet was green while three functions
-    in `boot`'s own source stopped at "the runtime function Prim.floatBits",
-    and the same program then found `Prim.floatIsNaN` missing from *both*
-    backends (FINDINGS 91).
+    None has a runtime entry point, so each must be selected as instructions;
+    `float_bits.gob` is the program that reaches all four, since the rest of
+    the corpus could leave one unselected and the ratchet would stay green.
 
     Checked in the library wrappers, whose entry moves say which file each
     operand is in: virtual registers print as `%n`, so `fmov %2, %1` alone

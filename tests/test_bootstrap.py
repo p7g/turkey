@@ -5,11 +5,11 @@
 same source again, which links into stage3, and stage3 compiling it once more
 must emit stage2's output byte for byte.
 
-This used to be a stronger form: stage1 was built by LLVM through the Python
-compiler, so the comparison was one source compiled by two *different*
-compilers. With the Python compiler on its way out (TIX-96) the two compilers
-are the committed one and the one built from today's source -- the ordinary
-fixed point, which is what OCaml's `make compare` and Rust's stage3 check.
+The two compilers compared are the committed one and the one built from
+today's source: the ordinary fixed point, which is what OCaml's `make compare`
+and Rust's stage3 check. It is weaker than comparing two independent compilers
+of the same source, since a miscompile that reproduces itself exactly survives
+it; what it does catch is any change in what the compiler emits for itself.
 
 **The fixed point is opt in.** It costs a couple of minutes and re-pays on every
 change to `src/`, which is when it is least wanted, so it is marked

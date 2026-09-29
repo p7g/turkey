@@ -333,8 +333,8 @@ def test_a_giblet_function_is_emitted_with_no_root_frame():
     after lowering refuses any giblet `Turkey.Roots` would give a slot, and
     both native emitters read their root frames from `Turkey.Roots`, so this
     is the LLVM emitter's half of that stated where it is visible -- no
-    `turkey_root_enter` in any `Turkey.Memory` function. Dropping the frame
-    record itself is TIX-55's leaf frames."""
+    `turkey_root_enter` in any `Turkey.Memory` function. The frame record
+    itself is still emitted; this is only about roots."""
     llvm = bootc.boot("llvm", "tests/programs/giblets_memory.gob")
     bodies = re.findall(r'^define [^\n]*@"Turkey\.Memory#[^"]*"\(.*?^}',
                         llvm, re.M | re.S)

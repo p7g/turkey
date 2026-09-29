@@ -20,7 +20,7 @@ PROGRAMS = PROGRAMS_DIR
 
 
 def sources() -> list[pathlib.Path]:
-    """Every program: a single `.gob` file, or a directory's `Main.gob` (M11a)."""
+    """Every program: a single `.gob` file, or a directory's `Main.gob`."""
     bundles = [p / "Main.gob" for p in sorted(PROGRAMS.iterdir())
                if p.is_dir() and (p / "Main.gob").is_file()]
     return sorted(PROGRAMS.glob("*.gob")) + bundles
@@ -35,8 +35,8 @@ def main() -> int:
         output, code = conformance(source)
         golden = source.with_suffix(".expected")
         if name_of(source) in NO_TRACE_YET:
-            # `boot` prints no panic trace yet (TIX-114), and writing what it
-            # does print would delete the trace the golden records.
+            # `boot`'s binaries print no panic trace yet, and writing what they
+            # do print would delete the trace the golden records.
             print(f"{name_of(source)}: kept, since boot prints no trace yet")
             continue
         golden.write_text(output, encoding="utf-8")

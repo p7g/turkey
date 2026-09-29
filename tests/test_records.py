@@ -1,9 +1,9 @@
-"""M9: record symmetry, punning, mutable parameters, `Bool`, and a total `pop`.
+"""Record symmetry, punning, mutable parameters, `Bool`, and a total `pop`.
 
 `records.gob`, `err_record_arity.gob` and `mutation.gob` are the goldens. This
 file is the part a golden cannot show: that the two declaration forms and the
 two pattern forms are genuinely independent of each other, that the
-exhaustiveness checker's witness is now a pattern the checker would accept,
+exhaustiveness checker's witness is a pattern the checker would accept,
 and that a reassigned parameter rebinds a local slot rather than aliasing the
 argument.
 """
@@ -34,18 +34,15 @@ def fails(src: str) -> str:
 
 
 def warnings(src: str) -> list[str]:
-    """Kept, and now always empty.
+    """Always empty: the compiler has no warnings, only errors.
 
-    Exhaustiveness was the compiler's only warning, and SPEC-DELTAS 61 made it
-    an error -- so `check(...).warnings` is a channel nothing writes to. The
-    helper stays because a test asserting it is *still* empty is the thing that
-    would notice a warning quietly reappearing, and because the next real
-    warning will want the plumbing.
+    A test asserting this is empty is what would notice a warning quietly
+    appearing, and the next real warning will want the plumbing.
     """
     return check(src).splitlines()
 
 
-# -- M9.1: either form matches either declaration ---------------------------
+# -- either form matches either declaration --------------------------------
 
 
 def test_a_record_variant_matches_positionally(capsys):
@@ -107,7 +104,7 @@ def test_a_positional_pattern_must_supply_every_field():
 
 
 def test_a_record_pattern_names_a_subset_only_with_rest(capsys):
-    """SPEC-DELTAS 65: a subset is still allowed, but it has to say so."""
+    """A subset is allowed, but it has to say so."""
     silent = SHAPES + "fun f(s : Shape) -> Int = match s {\n    Rect { height } -> height\n    Circle(r) -> r\n}"
     assert fails(silent) == (
         "the pattern 'Rect' does not mention field 'width'; name it, or write "
@@ -124,13 +121,14 @@ fun main() {
 
 
 def test_a_record_pattern_on_a_positional_variant_is_still_refused():
-    """The asymmetry M9.1 removes ran one way only; this direction stays shut."""
+    """A positional variant has no names, so a record pattern cannot match it."""
     src = "type Pair = Pair(Int, Int)\nfun f(p : Pair) -> Int = match p { Pair { a } -> a }"
     assert fails(src) == "constructor 'Pair' has positional arguments, not fields"
 
 
 def test_the_exhaustiveness_witness_is_a_pattern_the_checker_accepts():
-    """`render` prints positionally; before M9.1 its suggestion was rejected."""
+    """`render` prints positionally, and a positional pattern is accepted for a
+    record variant, so the suggestion compiles as written."""
     src = SHAPES + "fun f(s : Shape) -> Int = match s { Circle(r) -> r }"
     assert fails(src) == "this match is not exhaustive; 'Rect(_, _)' is not handled"
     # And the witness, written out, is what closes the match.
@@ -143,7 +141,7 @@ def test_the_exhaustiveness_witness_is_a_pattern_the_checker_accepts():
     assert warnings(patched) == []
 
 
-# -- M9.2: punning in construction ------------------------------------------
+# -- punning in construction -----------------------------------------------
 
 
 def test_a_record_literal_puns(capsys):
@@ -175,7 +173,7 @@ def test_a_pun_names_a_variable_not_the_field():
     )
 
 
-# -- M9.3: parameters are mutable -------------------------------------------
+# -- parameters are mutable ------------------------------------------------
 
 
 def test_a_parameter_may_be_reassigned(capsys):
@@ -232,7 +230,7 @@ def test_a_parameter_is_still_monomorphic():
     assert fails("fun f(g) -> Int = g(1) + String.byteLength(g(\"s\"))") != ""
 
 
-# -- M9.4: `Bool` is a declared type ----------------------------------------
+# -- `Bool` is a declared type ---------------------------------------------
 
 
 def test_the_boolean_constructors_are_ordinary_constructors(capsys):
@@ -249,7 +247,7 @@ fun main() { print(flip(True)) }
 
 
 def test_a_one_armed_boolean_match_is_not_exhaustive():
-    """An error since SPEC-DELTAS 61, and `Bool` is the smallest case of it."""
+    """A non-exhaustive match is an error, and `Bool` is the smallest case."""
     src = "fun f(b : Bool) -> Int = match b { True -> 1 }"
     assert fails(src) == "this match is not exhaustive; 'False' is not handled"
 
@@ -260,8 +258,8 @@ def test_both_boolean_arms_are_a_complete_signature():
 
 
 def test_a_program_may_declare_its_own_bool():
-    """`Bool` belongs to `Data.Bool` (delta 42), and a type belongs to its
-    module (delta 43), so this shadows -- but `if` still demands the library's,
+    """`Bool` belongs to `Data.Bool`, and a type belongs to its
+    module, so this shadows -- but `if` still demands the library's,
     which is what stops the shadow from being a way to break the language."""
     check("type Bool = A | B\nfun main() { print(1) }")
     assert fails("type Bool = A | B\nfun main() { if A { print(1) } }") == (
@@ -282,7 +280,7 @@ def test_a_bool_is_not_an_array_index():
     assert fails("fun main() {\n    let a = [1]\n    print(a[True])\n}") != ""
 
 
-# -- M9.5: `Array.pop` is total ---------------------------------------------
+# -- `Array.pop` is total --------------------------------------------------
 
 
 def test_pop_answers_with_option(capsys):

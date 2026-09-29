@@ -1,9 +1,9 @@
-"""Solver-derived `Typed` instances (ERRORS.md step 5).
+"""Solver-derived `Typed` instances.
 
 A type as a value, so that a packed payload can be asked what it is. This is
 the half `cast` rests on: the rep is what a cast compares, so the two things
-that matter are that a derived rep names the type exactly -- delta 43's
-qualified constructor name, with its arguments -- and that no program can write
+that matter are that a derived rep names the type exactly -- the
+constructor's module-qualified name, with its arguments -- and that no program can write
 an instance of its own, because one that lied would make a cast return a value
 of a type it is not.
 """
@@ -37,7 +37,7 @@ fun boxIntP() -> Proxy (Box Int) = Proxy
 
 
 def test_a_rep_names_the_qualified_constructor():
-    """Delta 43 made the name unique, which is the whole basis for comparing
+    """The qualified name is unique, which is the whole basis for comparing
     two reps: a bare `Box` could be two different types from two modules."""
     source = PROXIES + """
 fun main() {

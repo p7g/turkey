@@ -1,7 +1,7 @@
-"""`foreign`: the rules a declaration has to obey (SPEC-DELTAS 71, TIX-62).
+"""`foreign`: the rules a declaration has to obey.
 
-The happy path is a conformance program -- `tests/programs/foreign.gob` runs on
-both hosts and `test_native` diffs them, which is the only thing that checks a
+The happy path is a conformance program -- `tests/programs/foreign.gob` calls
+declared symbols and its recorded output is the only thing that checks a
 calling convention. What is here is the other half: every rule the declaration
 form states, each one written against a source small enough that the answer is
 the whole test.
@@ -115,7 +115,7 @@ def test_a_declaration_binds_the_name_at_the_type_it_states(probe):
     "written", ["String", "Array Int", "a", "fun(Int) -> Int", "Option Int"])
 def test_only_the_seven_representable_types_cross(probe, written):
     """`String` is the one worth naming: it is a heap array of bytes with no
-    terminator (TIX-66), and every C function that wants a string wants a
+    terminator, and every C function that wants a string wants a
     `char *`. The copy is the caller's (`Turkey.Ptr.toCString`)."""
     entry = probe((
         "module PROBE (f)\n"

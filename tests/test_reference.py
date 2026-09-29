@@ -15,8 +15,7 @@ promises that its examples are real, and an unmarked one is a promise nobody
 checks.
 
 Every example is compiled by `boot` and run as a native program, through
-`tests.lang`: what a reader who copies it will execute, and the implementation
-that stays when the Python one goes (TIX-94).
+`tests.lang`: what a reader who copies it will execute.
 """
 
 from __future__ import annotations

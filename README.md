@@ -150,7 +150,8 @@ that compile the compiler's own source are most of that.
 On an arm64 Linux machine none of that is needed: `cc` links for it and the
 programs run directly. CI does this on GitHub's arm64 runners
 (`.github/workflows/linux.yml`), building from the bootstrap and running the
-suite and `pytest -m bootstrap` once under gcc and once under clang.
+suite and the fixed point, in one `pytest -m ''` run, once under gcc and once
+under clang.
 
 Two groups of tests depend on the C compiler, and skip, saying why, where it
 cannot do what they need:

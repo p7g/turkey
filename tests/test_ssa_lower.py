@@ -362,11 +362,9 @@ def _many_array_types(count: int) -> str:
     return "\n".join(lines) + "\n"
 
 
-def test_a_loop_calls_no_method_indirectly_past_the_specialization_budget():
-    # More element types than one binding may be specialized at: the loops
-    # past the budget use the instance's generic methods, but call them
-    # directly -- a known dictionary is resolved whether or not a copy of
-    # its body was made.
+def test_a_loop_over_many_element_types_calls_no_method_indirectly():
+    # Iterating arrays at forty element types: each loop's methods come out of
+    # a known dictionary and are called directly.
     count = 40
     src = _many_array_types(count)
     assert lang.output(src) == f"{sum(range(count)) + count}\n"
@@ -392,12 +390,12 @@ def _many_map_types(count: int) -> str:
     return "\n".join(lines) + "\n"
 
 
-def test_a_constrained_function_past_the_budget_builds_no_closure_per_call():
-    # `Map.put` and `Map.get` take a `Hash` dictionary. Past the budget they
-    # stay generic, and a call to one supplies the dictionary and the
-    # arguments together: one call, with no closure over the dictionary. And
-    # once `Map.get` is inlined, its `hashInto` is a method of a dictionary
-    # the caller named, read as a direct call.
+def test_a_constrained_function_builds_no_closure_per_call():
+    # `Map.put` and `Map.get` take a `Hash` dictionary. Where one stays
+    # generic, a call to it supplies the dictionary and the arguments
+    # together: one call, with no closure over the dictionary. And once
+    # `Map.get` is inlined, its `hashInto` is a method of a dictionary the
+    # caller named, read as a direct call.
     count = 40
     src = _many_map_types(count)
     assert lang.output(src) == f"{sum(range(count))}\n"

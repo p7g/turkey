@@ -1,5 +1,5 @@
 module Turkey.Mono (
-    maxSpecializations, maxTypeNodes, rounds,
+    maxTypeNodes, rounds, ceilingFactor, expandingBindings,
     State(..), newState,
     monomorphize, reduceTypes, checkLayouts,
 )
@@ -20,21 +20,26 @@ module Turkey.Mono (
 -- ## It is a *partial* pass, and that is a decision
 --
 -- Turkey admits polymorphic recursion, so the reachable set of specializations
--- can be infinite -- the standard reason monomorphization is undecidable. There
--- is a cap, and when it trips the call site keeps its type application and goes
--- on calling the generic binding. Every generic binding therefore survives the
--- pass unchanged, which is why the output is a mixture. The cap says nothing
--- when it trips: Turkey does not *promise* monomorphization, and a binding that
--- stays polymorphic is compiled by layout-keyed sharing instead.
+-- can be infinite -- the standard reason monomorphization is undecidable. Two
+-- things refuse a copy, and each refuses only what it has to:
 --
--- ## It goes round twice, and the budget does not restart
+-- * a binding on an *expanding cycle* (`expandingBindings`), decided from the
+--   program before specializing, is never copied -- that is exactly the
+--   polymorphic recursion that would never end, and nothing else;
+-- * a program-wide *ceiling* on the specialized code (`ceilingFactor`) bounds
+--   specialization that ends but grows exponentially without recursion.
+--
+-- A refused call site keeps its type application and goes on calling the
+-- generic binding, which survives the pass unchanged and is compiled by
+-- layout-keyed sharing; a method of a known dictionary is still called
+-- directly (see devirtualization). Turkey does not *promise* monomorphization.
+--
+-- ## It goes round twice, and the ceiling does not restart
 --
 -- Specializing and devirtualizing each *make* bindings the other would have
 -- worked on. So the pipeline runs twice and reachability runs once at the end.
--- The thing that has to be got right is not the loop but the cap: a budget spent
--- per round is no bound at all, since N rounds would grant one binding 32N
--- copies. `State` is the answer -- one budget for the whole pass, charged to the
--- original a copy descends from, plus the memo of what has already been built.
+-- `State` is shared by the rounds: one account against the ceiling, and the
+-- memo of what has already been built.
 
 import Data.Set as Set
 import Turkey.Ast
@@ -47,24 +52,41 @@ import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..))
 import Turkey.Diag as Diag
 import Turkey.Methods as Methods
+import Turkey.Opt as Opt
+import Turkey.Deps as Deps
 import Turkey.Source (Span(..))
 import Turkey.Typed as Typed
 import Turkey.Types as Ty
 import Turkey.Types (Kind(..), VarCell(..), TVar, TCon, TApp, TFam, TFun,
                      TTuple)
 
--- How many distinct specializations one binding may have, and how large a type
--- argument may be. Either limit stops the unrolling a polymorphically recursive
--- binding would otherwise ask for. The numbers are deliberately generous: no
--- program in the suite comes near them, so tripping one is a real signal.
-let maxSpecializations = 32
+-- How large a type argument may be. A cheap early refusal: a request this
+-- large is almost certainly an unrolling that the tests below would refuse
+-- anyway, and checking size is cheaper than checking anything else.
 let maxTypeNodes = 64
 
+-- How much specialized code the whole program may gain, as a multiple of its
+-- own size (both by `Opt.sizeOf_`). Specialization that terminates can still
+-- grow exponentially with no recursion in it -- a chain of functions each
+-- calling the next at two new types -- and this is what bounds that. It is a
+-- ceiling rather than a budget: set well above what any real program reaches,
+-- so a program that trips it is pathological, and what it trips on falls back
+-- to generic code with its methods still called directly.
+--
+-- Measured: the largest ratio of specialized to original code in the corpus
+-- is 0.57 (`regex_library.gob`), and the compiler's own is 0.48.
+--
+-- The charge is a copy's size before `Turkey.Opt`, which is all that exists
+-- here. Inlining then grows each copy, by at most what the inliner's own limit
+-- allows per function, so the finished program is still linear in the ceiling;
+-- only the constant is larger for a program made of tiny copies, each calling
+-- the next.
+let ceilingFactor = 2
+
 -- How many times the whole pipeline runs. A fixed number rather than a fixed
--- point, and the reason is the cap: a budget spent per round is not a bound at
--- all. So the budget is shared across rounds *and* the rounds are counted,
--- which makes the bound easy to state -- a binding descended from `f` has at
--- most `maxSpecializations` copies in the output, whatever this is set to.
+-- point: specializing and devirtualizing each make work for the other, and two
+-- rounds finish what the programs this compiles give them. The ceiling is
+-- shared across rounds, so it bounds the whole pass however many there are.
 let rounds = 2
 
 let dictPrefix = "%Dict."
@@ -161,23 +183,31 @@ fun takesDictionaries(b : CBind) -> Bool = match b.value.kind {
 -- copy under a disambiguated name -- specialization as a source of duplication,
 -- which is the opposite of the point.
 type State = State {
-    counts : Map String Int,
-    done   : Map String String,
-    origin : Map String String,
+    done      : Map String String,
+    origin    : Map String String,
+    -- Bindings on an expanding cycle (`expandingBindings`), never copied.
+    expanding : Set.Set String,
+    -- The specialized code granted so far, and how much is allowed.
+    spent     : Int,
+    ceiling   : Int,
 }
 
 fun newState() -> State = State {
-    counts = Map.new(), done = Map.new(), origin = Map.new(),
+    done = Map.new(), origin = Map.new(), expanding = Set.new(),
+    spent = 0, ceiling = 0,
 }
 
 fun root(st : State, name : String) -> String = Map.getOr(st.origin, name, name)
 
--- Charge one copy to whatever this name descends from, or refuse.
-fun spend(st : State, name : String) -> Bool {
-    let r = root(st, name)
-    let n = Map.getOr(st.counts, r, 0)
-    if n >= maxSpecializations { return False }
-    Map.put(st.counts, r, n + 1)
+-- Whether a copy of this binding may be made, charging it to the ceiling if
+-- so. A binding on an expanding cycle never is: its copies would never end.
+-- Every other binding is, until the program's specialized code reaches the
+-- ceiling.
+fun admit(st : State, b : CBind) -> Bool {
+    if Set.contains(st.expanding, root(st, b.name)) { return False }
+    let cost = Opt.sizeOf_(b.value) + 1
+    if st.spent + cost > st.ceiling { return False }
+    st.spent = st.spent + cost
     True
 }
 
@@ -712,7 +742,7 @@ fun request(m : Mono, b : CBind, targs : Array Ty.Type,
     for t in targs {
         if typeSize(t) > maxTypeNodes { return None }
     }
-    if !spend(m.state, b.name) { return None }
+    if !admit(m.state, b) { return None }
     let name = fresh(m, b.name, targs)
     derive(m.state, name, b.name)
     match dicts {
@@ -1316,15 +1346,143 @@ fun reachable(program : CProgram, main : String,
 
 -- Specialize, devirtualize, again, and then drop what nothing reaches.
 --
--- The rounds share one state, which is what keeps the cap a cap. Reachability
+-- The rounds share one state, which is what makes the ceiling one ceiling. Reachability
 -- runs once, at the end, over the finished program.
 fun monomorphize(program : CProgram, decls : DeclTable, classes : ClassTable,
                  main : String) -> CProgram {
     let state = newState()
+    state.expanding = expandingBindings(program)
+    var size = 0
+    for b in Array.append(program.dicts, program.binds) {
+        size = size + Opt.sizeOf_(b.value) + 1
+    }
+    state.ceiling = size * ceilingFactor
     var out = program
     for var i = 0; i < rounds; i = i + 1 {
         let specialized = runMono(newMono(out, decls, classes, state))
         out = runDevirt(newDevirt(specialized, classes, state))
     }
     reachable(out, main, Map.keys(decls.definitions))
+}
+
+-- -- polymorphic recursion ------------------------------------------------------------
+
+-- The bindings whose specializations would never end: those on a cycle that
+-- instantiates a binding at a type strictly containing one of its own
+-- parameters.
+--
+-- The test is the one ECMA-335 states for generic definitions (II.9.2): a
+-- graph whose nodes are type parameters, with an edge from a parameter `a` of
+-- the caller to the parameter `b` of the callee it instantiates, for every
+-- call from one member of a recursive binding group to another. The edge is
+-- *plain* when the argument is `a` itself and *expanding* when `a` occurs
+-- strictly inside it (`depth` at `a` calling `depth` at `Pair a`). The
+-- instantiations reachable from any ground call are finite exactly when no
+-- cycle contains an expanding edge: a cycle of plain edges only permutes
+-- parameters, and the memo already stops that. So this is decided before
+-- specializing, from the program alone, and nothing that is not
+-- polymorphically recursive is ever refused for being so.
+--
+-- Only a binding with a complete signature can be polymorphically recursive:
+-- without one a recursive use is at the group's own parameters, which is a
+-- plain edge. An instance's context only ever asks for dictionaries at smaller
+-- types, so dictionary construction adds no expanding edge.
+fun expandingBindings(program : CProgram) -> Set.Set String {
+    let generic = Map.new()
+    for b in Array.append(program.dicts, program.binds) {
+        if len(b.binders) > 0 { Map.put(generic, b.name, b) }
+    }
+    let calls = Map.new()
+    for (name, b) in Map.entries(generic) {
+        let deps = Set.new()
+        for n in Set.elements(namesOf(b.value)) {
+            if Map.contains(generic, n) { Set.add(deps, n) }
+        }
+        Map.put(calls, name, deps)
+    }
+    let groupOf = Map.new()
+    for group in Deps.sccs(calls) {
+        for n in group { Map.put(groupOf, n, group[0]) }
+    }
+    let params = Map.new()
+    let expanding = []
+    for (name, b) in Map.entries(generic) {
+        let group = Map.getOr(groupOf, name, name)
+        for (callee, types) in typeApplications(b.value) {
+            match Map.get(generic, callee) {
+                Some(target) -> if Map.getOr(groupOf, callee, callee) == group {
+                    for var j = 0; j < len(types) && j < len(target.binders); j = j + 1 {
+                        let t = Ty.prune(types[j])
+                        for var i = 0; i < len(b.binders); i = i + 1 {
+                            let from = parameterNode(name, i)
+                            let to = parameterNode(callee, j)
+                            let plain = match t {
+                                TVar(cell) -> cell.id == b.binders[i].id
+                                _ -> False
+                            }
+                            var occurs = False
+                            for v in Ty.varsOf([t]) {
+                                if v.id == b.binders[i].id { occurs = True }
+                            }
+                            if plain || occurs {
+                                let out = match Map.get(params, from) {
+                                    Some(found) -> found
+                                    None -> {
+                                        let made = Set.new()
+                                        Map.put(params, from, made)
+                                        made
+                                    }
+                                }
+                                Set.add(out, to)
+                                if !plain { Array.push(expanding, (from, to)) }
+                            }
+                        }
+                    }
+                }
+                None -> {}
+            }
+        }
+    }
+    let componentOf = Map.new()
+    let components = Deps.sccs(params)
+    for var k = 0; k < len(components); k = k + 1 {
+        for n in components[k] { Map.put(componentOf, n, k) }
+    }
+    let out = Set.new()
+    for (from, to) in expanding {
+        match (Map.get(componentOf, from), Map.get(componentOf, to)) {
+            (Some(a), Some(b)) -> if a == b {
+                for n in components[a] { Set.add(out, bindingOfNode(n)) }
+            }
+            _ -> {}
+        }
+    }
+    out
+}
+
+fun parameterNode(binding : String, index : Int) -> String =
+    binding + "\t" + Int.toString(index)
+
+fun bindingOfNode(node : String) -> String = String.split(node, "\t")[0]
+
+-- Every type application of a name in `e`, as (name, types).
+fun typeApplications(e : Core) -> Array (String, Array Ty.Type) {
+    let out = []
+    collectTypeApplications(e, out)
+    out
+}
+
+fun collectTypeApplications(e : Core, out : Array (String, Array Ty.Type)) -> Unit {
+    match e.kind {
+        CTyApp(fn, types) -> match fn.kind {
+            CVar(name) -> Array.push(out, (name, types))
+            _ -> {}
+        }
+        _ -> {}
+    }
+    let _ = mapKind(e.kind, Mapper {
+        expr = fun(x) = { collectTypeApplications(x, out); x },
+        type_ = fun(t) = t,
+        bind = fun(b) = { collectTypeApplications(b.value, out); b },
+    })
 }

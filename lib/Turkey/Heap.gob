@@ -388,6 +388,11 @@ fun classSlot(sizeClass : Int) -> Int =
 fun classOf(size : Int) -> Int =
     Prim.byteToInt(Prim.loadI8(classes, Prim.intShr(plus(size, 39), 4)))
 
+-- Whether `size`, unsigned, is small enough for the fast path: a class-table
+-- step below 2048. The few sizes just under `smallPayload` it turns away are
+-- still small, and `allocateSlow` gives them their class.
+fun fastSize(size : Int) -> Bool = Prim.intShr(plus(size, 39), 15) == 0
+
 fun cursorOf(sizeClass : Int) -> Prim.Ptr = Prim.ptrAdd(cursors, Prim.intShl(sizeClass, 6))
 
 -- The lowest of the cursor's free slots, `free`, which is not zero.
@@ -395,7 +400,17 @@ fun takeSlot(cursor : Prim.Ptr, free : Int) -> Prim.Ptr {
     let lowest = Prim.intAnd(free, Prim.intNegWrapping(free))
     Prim.storeI64(cursor, cursorFree, Prim.intXor(free, lowest))
     Prim.ptrAdd(Prim.loadPtr(cursor, cursorBase),
-                Prim.intMulWrapping(Memory.trailingZeros(lowest), Prim.loadI64(cursor, cursorSlot)))
+                Prim.intMulWrapping(bitIndex(lowest), Prim.loadI64(cursor, cursorSlot)))
+}
+
+-- The position of the one set bit in `lowest`: `Memory.trailingZeros`'s de
+-- Bruijn table, without its test for zero, its isolation of the lowest bit or
+-- its checked subtraction, none of which a bit already isolated needs. This
+-- runs at every allocation.
+fun bitIndex(lowest : Int) -> Int {
+    let pattern = Prim.intAnd(Prim.intShr(Prim.intMulWrapping(lowest, 285870213051386505), 58), 63)
+    let positions = Prim.cString("01`2iaL3mjbZVMA4ngkTec[F]WQNHB<5o_hKlYU@fSdE\\PG;^JX?RDO:I>C9=876")
+    Prim.intSubWrapping(Prim.byteToInt(Prim.loadI8(positions, pattern)), 48)
 }
 
 -- Fill the empty cursor of class `sizeClass` from the first word with a free
@@ -570,7 +585,7 @@ fun findHeader(value : Prim.Ptr) -> Prim.Ptr {
 -- everything else -- a collection, an empty cursor, a large object, GC stress
 -- -- is `allocateSlow`, which is also what keeps this one small.
 fun allocate(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Prim.Ptr {
-    if below(smallPayload, size) { return allocateSlow(size, kind, counted, frame) }
+    if !fastSize(size) { return allocateSlow(size, kind, counted, frame) }
     let cursor = cursorOf(classOf(size))
     let free = Prim.loadI64(cursor, cursorFree)
     if free == 0 { return allocateSlow(size, kind, counted, frame) }

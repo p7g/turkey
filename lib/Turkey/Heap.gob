@@ -151,7 +151,16 @@ var frameEntryCount : Int = 0
 -- may reach. Set by the entry once early initialization has run.
 var entryStackHigh : Prim.Ptr = Prim.ptrNull()
 
-var stress : Bool = present(Prim.cString("TURKEY_GC_STRESS"))
+-- GC stress: a collection at every allocation, or with TURKEY_GC_STRESS=N
+-- for N above 1, at random intervals averaging N allocations -- each gap
+-- uniform in 1..2N-1, so that no allocation site is always skipped. The
+-- sequence is TURKEY_GC_STRESS_SEED's, 1 by default, so that a failing run can
+-- be repeated and several seeds can cover different phases. Every allocation
+-- takes the slow path while it is on, which is where it counts down.
+var stressInterval : Int = intervalFrom(Libc.getenv(Prim.cString("TURKEY_GC_STRESS")))
+var stress : Bool = stressInterval > 0
+var stressRandom : Int = seedFrom(Libc.getenv(Prim.cString("TURKEY_GC_STRESS_SEED")))
+var stressCountdown : Int = 1
 var verify : Bool = present(Prim.cString("TURKEY_GC_VERIFY"))
 
 -- Opt-in accounting, printed one line per collection and in `report` when
@@ -593,7 +602,7 @@ fun allocate(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Prim.Pt
 }
 
 fun allocateSlow(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Prim.Ptr {
-    if stress || bytesSince >= threshold {
+    if (stress && stressDue()) || bytesSince >= threshold {
         collectFrom(frame)
         -- A collection is the only thing here that can raise one, and an
         -- allocation after a failed collection would be into a heap nobody
@@ -615,6 +624,24 @@ fun allocateSlow(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Pri
         return Prim.ptrNull()
     }
     initialize(takeSlot(cursor, Prim.loadI64(cursor, cursorFree)), size, kind, counted)
+}
+
+-- Whether GC stress collects at this allocation.
+fun stressDue() -> Bool {
+    stressCountdown = stressCountdown - 1
+    if stressCountdown > 0 { return False }
+    stressCountdown = if stressInterval == 1 { 1 } else {
+        -- xorshift64*: a full period over the nonzero words, which is all a
+        -- sampling interval needs of it.
+        var mixed = stressRandom
+        mixed = Prim.intXor(mixed, shiftRight(mixed, 12))
+        mixed = Prim.intXor(mixed, Prim.intShl(mixed, 25))
+        mixed = Prim.intXor(mixed, shiftRight(mixed, 27))
+        stressRandom = mixed
+        let drawn = shiftRight(Prim.intMulWrapping(mixed, 2685821657736338717), 1)
+        1 + drawn % (2 * stressInterval - 1)
+    }
+    True
 }
 
 -- The header of a fresh slot, and the payload after it.
@@ -1370,6 +1397,38 @@ fun scaleFrom(s : Prim.Ptr) -> Float {
     if finite(value) && Prim.floatGte(value, 1.0) { value } else { fallback }
 }
 
+-- TURKEY_GC_STRESS: 0 if it is unset, N if it is a decimal N of at least 1
+-- with optional surrounding whitespace, and 1 if it is anything else, which
+-- is how a flag set to "yes" still collects at every allocation. At most
+-- 2^60, far past any interval a run could reach.
+fun intervalFrom(s : Prim.Ptr) -> Int {
+    if Prim.ptrIsNull(s) { return 0 }
+    let n = decimalFrom(s)
+    if n < 1 { 1 } else { n }
+}
+
+-- TURKEY_GC_STRESS_SEED, or 1 if it is unset or not a decimal number; never 0,
+-- which xorshift cannot leave.
+fun seedFrom(s : Prim.Ptr) -> Int {
+    if Prim.ptrIsNull(s) { return 1 }
+    let n = decimalFrom(s)
+    if n < 1 { 1 } else { n }
+}
+
+-- The decimal number `s` holds, with optional surrounding whitespace, capped
+-- at 2^60; -1 if it holds anything else.
+fun decimalFrom(s : Prim.Ptr) -> Int {
+    var at = skipSpace(s, 0)
+    if !isDigit(byteAt(s, at)) { return -1 }
+    var total = 0
+    while isDigit(byteAt(s, at)) {
+        if total < 1152921504606846976 { total = total * 10 + byteAt(s, at) - 48 }
+        at = at + 1
+    }
+    if byteAt(s, skipSpace(s, at)) != 0 { return -1 }
+    if total > 1152921504606846976 { 1152921504606846976 } else { total }
+}
+
 -- Neither infinite nor NaN: either makes `x - x` a NaN, which equals nothing.
 fun finite(x : Float) -> Bool = Prim.floatEq(Prim.floatSub(x, x), 0.0)
 
@@ -1437,6 +1496,8 @@ foreign "turkey_collection_count" fun collectionCount() -> Int = collections
 foreign "turkey_gc_set_stress" fun setStress(enabled : Int) -> Unit {
     retire()
     stress = Prim.intAnd(enabled, 4294967295) != 0
+    stressInterval = if stress { 1 } else { 0 }
+    stressCountdown = 1
 }
 
 foreign "turkey_gc_set_verify" fun setVerify(enabled : Int) -> Unit {

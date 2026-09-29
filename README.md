@@ -1,4 +1,4 @@
-# Turkey
+# 🦃 Turkey
 
 A small procedural language with an ML-style type system.
 

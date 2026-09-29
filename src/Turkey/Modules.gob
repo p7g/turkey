@@ -1,5 +1,5 @@
 module Turkey.Modules (
-    Scope(..), newScope, spaces, lookupName,
+    Namespace(..), Scope(..), newScope, spaces, lookupName, conflictsIn,
     Module(..),
     Loader(..), newLoader, loadEntry,
     ownDeclared, ownScope,
@@ -48,6 +48,23 @@ import Turkey.Target as Target
 -- two modules may define different classes with the same short name. The fifth
 -- is protocol-method identity, for the operator and iteration nodes the parser
 -- writes itself; a method also appears in `values` for ordinary calls.
+type Namespace = ValueSpace | TypeSpace | ConstructorSpace | ClassSpace | MethodSpace
+
+let namespaces =
+    [ValueSpace, TypeSpace, ConstructorSpace, ClassSpace, MethodSpace]
+
+-- Array storage follows the same order as `spaces` and `namespaces`.
+fun namespaceIndex(space : Namespace) -> Int = match space {
+    ValueSpace -> 0
+    TypeSpace -> 1
+    ConstructorSpace -> 2
+    ClassSpace -> 3
+    MethodSpace -> 4
+}
+
+fun conflictsIn(s : Scope, space : Namespace) -> Map String (Array String) =
+    s.conflicts[namespaceIndex(space)]
+
 type Scope = Scope {
     values  : Map String String,
     types   : Map String String,
@@ -69,19 +86,19 @@ fun newScope() -> Scope = Scope {
 fun spaces(s : Scope) -> Array (Map String String) =
     [s.values, s.types, s.cons, s.classes, s.methods]
 
-fun spaceAt(s : Scope, index : Int) -> Map String String = match index {
-    0 -> s.values
-    1 -> s.types
-    2 -> s.cons
-    3 -> s.classes
-    _ -> s.methods
+fun spaceAt(s : Scope, space : Namespace) -> Map String String = match space {
+    ValueSpace -> s.values
+    TypeSpace -> s.types
+    ConstructorSpace -> s.cons
+    ClassSpace -> s.classes
+    MethodSpace -> s.methods
 }
 
 -- Conflicts retain declaration identities, not import spellings: two routes
 -- to the same re-export are still one declaration.
-fun lookupName(s : Scope, space : Int, name : String,
+fun lookupName(s : Scope, space : Namespace, name : String,
                where : Option Span) -> Option String {
-    match Map.get(s.conflicts[space], name) {
+    match Map.get(conflictsIn(s, space), name) {
         Some(targets) -> oopsAt("ambiguous name '" + name + "': "
             + String.join(Array.map(Array.sort(targets), fun(t) =
                 quoted(String.replace(t, "#", "."))), ", "), where)
@@ -89,13 +106,13 @@ fun lookupName(s : Scope, space : Int, name : String,
     }
 }
 
-fun mergeName(s : Scope, space : Int, name : String, target : String) -> Unit {
+fun mergeName(s : Scope, space : Namespace, name : String, target : String) -> Unit {
     let into = spaceAt(s, space)
     match Map.get(into, name) {
         Some(previous) -> if previous != target {
-            let targets = Map.getOr(s.conflicts[space], name, [previous])
+            let targets = Map.getOr(conflictsIn(s, space), name, [previous])
             if !Array.contains(targets, target) { Array.push(targets, target) }
-            Map.put(s.conflicts[space], name, targets)
+            Map.put(conflictsIn(s, space), name, targets)
         }
         None -> Map.put(into, name, target)
     }
@@ -370,10 +387,15 @@ fun bring(l : Loader, scope : Scope, dep : Module, alias : String,
                     oopsAt("module '" + dep.name + "' does not export "
                            + quoted(item.name), where)
                 }
-                for var i = 0; i < len(chosen); i = i + 1 {
+                for space in namespaces {
+                    let i = namespaceIndex(space)
                     -- A type name alone does not request its same-named
                     -- constructor. A standalone constructor name is legal.
-                    if !(i == 2 && Map.contains(dep.exports.types, item.name)) {
+                    let typeOnly = match space {
+                        ConstructorSpace -> Map.contains(dep.exports.types, item.name)
+                        _ -> False
+                    }
+                    if !typeOnly {
                         match Map.get(available[i], item.name) {
                             Some(target) -> Map.put(chosen[i], item.name, target)
                             None -> {}
@@ -382,10 +404,11 @@ fun bring(l : Loader, scope : Scope, dep : Module, alias : String,
                 }
                 for sub in subsOf(l, dep, item) {
                     checkImportedMember(l, dep, item, sub, where)
-                    let indices = if Map.contains(dep.exports.classes, item.name) {
-                        [0, 1, 4]
-                    } else { [2] }
-                    for i in indices {
+                    let memberSpaces = if Map.contains(dep.exports.classes, item.name) {
+                        [ValueSpace, TypeSpace, MethodSpace]
+                    } else { [ConstructorSpace] }
+                    for space in memberSpaces {
+                        let i = namespaceIndex(space)
                         match Map.get(available[i], sub) {
                             Some(target) -> Map.put(chosen[i], sub, target)
                             None -> {}
@@ -410,11 +433,11 @@ fun bring(l : Loader, scope : Scope, dep : Module, alias : String,
         }
     }
 
-    let into = spaces(scope)
-    for var i = 0; i < len(into); i = i + 1 {
+    for space in namespaces {
+        let i = namespaceIndex(space)
         for (short, target) in Map.entries(chosen[i]) {
-            mergeName(scope, i, alias + "." + short, target)
-            if !qualified { mergeName(scope, i, short, target) }
+            mergeName(scope, space, alias + "." + short, target)
+            if !qualified { mergeName(scope, space, short, target) }
         }
     }
 }
@@ -524,7 +547,7 @@ fun exportOne(l : Loader, m : Module, mine : Scope, item : ExportItem,
     }
     if isLower(item.name) {
         return Map.put(out.values, item.name,
-                       exported(m, mine.values, 0, item))
+                       exported(m, mine.values, ValueSpace, item))
     }
     -- A name the module *declares itself* is that declaration, whatever an
     -- import may have brought in under the same spelling. Without this,
@@ -543,13 +566,13 @@ fun exportOne(l : Loader, m : Module, mine : Scope, item : ExportItem,
 
 fun exportClass(l : Loader, m : Module, mine : Scope, item : ExportItem,
                 out : Scope) -> Unit {
-    let target = exported(m, mine.classes, 3, item)
+    let target = exported(m, mine.classes, ClassSpace, item)
     Map.put(out.classes, item.name, target)
     for member in subsFrom(item, membersOf(l, target)) {
         let value = firstOf(Map.get(mine.methods, member),
-                            lookupName(m.scope, 4, member, Some(item.span)))
+                            lookupName(m.scope, MethodSpace, member, Some(item.span)))
         let family = firstOf(Map.get(mine.types, member),
-                             lookupName(m.scope, 1, member, Some(item.span)))
+                             lookupName(m.scope, TypeSpace, member, Some(item.span)))
         match value {
             Some(v) -> {
                 Map.put(out.values, member, v)
@@ -566,7 +589,7 @@ fun exportClass(l : Loader, m : Module, mine : Scope, item : ExportItem,
 
 fun exportType(l : Loader, m : Module, mine : Scope, item : ExportItem,
                out : Scope) -> Unit {
-    let target = exported(m, mine.types, 1, item)
+    let target = exported(m, mine.types, TypeSpace, item)
     Map.put(out.types, item.name, target)
     let variants = variantsOf(l, Some(target))
     for con in subsFrom(item, variants) {
@@ -574,7 +597,7 @@ fun exportType(l : Loader, m : Module, mine : Scope, item : ExportItem,
             oopsAt("'" + con + "' is not a constructor of '"
                    + item.name + "'", Some(item.span))
         }
-        match firstOf(Map.get(mine.cons, con), lookupName(m.scope, 2, con, Some(item.span))) {
+        match firstOf(Map.get(mine.cons, con), lookupName(m.scope, ConstructorSpace, con, Some(item.span))) {
             Some(t) -> {
                 if !constructorMember(l, Some(target), con, Some(t)) {
                     oopsAt("'" + con + "' is not a constructor of '"
@@ -596,10 +619,11 @@ fun reexport(m : Module, item : ExportItem, out : Scope) -> Unit {
     var found = False
     let into = spaces(out)
     let from = spaces(m.scope)
-    for var i = 0; i < len(into); i = i + 1 {
+    for space in namespaces {
+        let i = namespaceIndex(space)
         for (surface, target) in Map.entries(from[i]) {
             if String.startsWith(surface, prefix) {
-                discard(lookupName(m.scope, i, surface, Some(item.span)))
+                discard(lookupName(m.scope, space, surface, Some(item.span)))
                 Map.put(into[i], surface, target)
                 found = True
             }
@@ -611,7 +635,7 @@ fun reexport(m : Module, item : ExportItem, out : Scope) -> Unit {
     }
 }
 
-fun exported(m : Module, own : Map String String, space : Int,
+fun exported(m : Module, own : Map String String, space : Namespace,
              item : ExportItem) -> String =
     match firstOf(Map.get(own, item.name), lookupName(m.scope, space, item.name, Some(item.span))) {
         Some(target) -> target

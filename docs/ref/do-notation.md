@@ -130,6 +130,61 @@ Right(10)
 Left(division by zero)
 ```
 
+### Errors from different sources: `SomeError`
+
+Because `?` never converts, every `Left` in one block needs the same type. When
+failures come from different sources, that type is the Prelude's `SomeError`,
+which holds a value of any type with an `Error` instance. `fail(e)` packs one;
+after that, `?` passes it along like any other `Left`, and no function in
+between needs to know what kind of error it holds.
+
+`Error.context(err, e)` wraps an error in a new one without discarding it, and
+`Error.describe` reads the whole chain, outermost first. `Error.cast` recovers
+the packed value when its type is known
+([`Typed` and `cast`](builtins.md#typed-and-cast)).
+
+<!-- run -->
+```kotlin
+type BadNumber = BadNumber { text : String }
+type OutOfRange = OutOfRange { value : Int }
+type Setting = Setting { name : String }
+
+instance Error BadNumber { fun message(e) = "not a number: " + e.text }
+instance Error OutOfRange { fun message(e) = "out of range: " + Int.toString(e.value) }
+instance Error Setting { fun message(e) = "in setting " + e.name }
+
+fun parse(text) = match Int.parse(text) {
+    Some(n) -> Right(n)
+    None -> Left(fail(BadNumber { text }))
+}
+
+fun percent(text) {
+    let n = parse(text)?
+    if n < 0 || n > 100 { return Left(fail(OutOfRange { value = n })) }
+    Right(n)
+}
+
+fun volume(text) = match percent(text) {
+    Left(err) -> Left(Error.context(err, Setting { name = "volume" }))
+    Right(n) -> Right(n)
+}
+
+fun main() {
+    for text in ["40", "140", "loud"] {
+        match volume(text) {
+            Right(n) -> print(n)
+            Left(err) -> print(Error.describe(err))
+        }
+    }
+}
+```
+
+```text
+40
+in setting volume: out of range: 140
+in setting volume: not a number: loud
+```
+
 ### Every combination: `Array`
 
 `Array`'s `bind` calls the function once for **each** element and

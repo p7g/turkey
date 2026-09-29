@@ -22,11 +22,6 @@ file are the two that belong there. If the thing you want to write is a design
 you are about to build, it is a ticket; if it is a design you have built, it is
 a comment; if it is what happened, it is the commit message.
 
-The other root documents -- the library designs -- are being retired
-into those six places (TIX-97). Until they are gone: do not add to them, and do
-not trust a claim in one without checking it against the code. Several have
-already been found describing a compiler that no longer exists.
-
 ## Survey the prior art before implementing anything hard
 
 Before writing a pass, an IR, an algorithm or a design that will be expensive
@@ -164,5 +159,3 @@ needs, and what "done" means.
 * `docs/ref/` -- the language reference: syntax and semantics for people
   writing Turkey, every example compiled and run by `tests/test_reference.py`.
 * `src/CLAUDE.md` -- house style for the compiler's own source.
-
-Everything else at the root is on its way out; see "Where what you write goes".

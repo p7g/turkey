@@ -218,13 +218,13 @@ MADE = (
     ("fun f(n : Int) -> Int = H.pick(n)(n)\n",
      "f", "calls through a closure or a dictionary"),
     # Polymorphic recursion through a newtype, which is erased: the types grow
-    # past the specialization cap without anything being built, and the
+    # without anything being built, so `g` is never specialized, and its
     # generic body boxes `k` to pass it as `b`.
     ("type W a = W(a)\n"
      "fun g(x : a, y : b, k : Int) -> Int =\n"
      "    if k == 0 { 0 } else { g(W(x), k, k - 1) }\n"
      "fun f(n : Int) -> Int = g(n, n, n)\n",
-     "g@Int,Int", "boxes a value to pass it where the type is not known"),
+     "g", "boxes a value to pass it where the type is not known"),
     # A method of an instance the giblet declares, called through the
     # dictionary an existential carries.
     ("import Std.Classes\n"
@@ -319,13 +319,14 @@ HIDDEN = (
 
 
 @pytest.mark.parametrize("helper, reason, line", [
-    # Polymorphic recursion is past any specialization cap: the tuple the
-    # generic body builds is reached through the call.
-    ("nests", "builds a tuple", 9),
+    # Polymorphic recursion is never specialized, so the call passes `n`
+    # where the type is not known.
+    ("nests", "boxes a value to pass it where the type is not known", 9),
     # An existential packing is an object with the layout codes in front.
     ("packs", "packs an existential, Hidden", 11),
-    # A class-polymorphic function past the cap: its dictionary's pairs.
-    ("dicts", "builds a tuple", 13),
+    # A class-polymorphic function on an expanding cycle: the tuple its
+    # generic body builds, reached through the call.
+    ("dicts", "builds a tuple", 8),
 ])
 def test_an_allocation_nobody_wrote_is_named_where_it_came_from(
         lowered, helper, reason, line):

@@ -1,6 +1,6 @@
 module Turkey.Opt (
     inlineLimit, joinSpecializeLimit, speculativeInlineLimit,
-    loopBreakers, reduceProgram,
+    loopBreakers, reduceProgram, sizeOf_,
 )
 
 -- The local reductions, from inlining through loop-result fusion.
@@ -77,6 +77,7 @@ import Turkey.Core
 import Turkey.Decls (substitute)
 import Turkey.Deps as Deps
 import Turkey.Diag as Diag
+import Turkey.Methods as Methods
 import Turkey.Source (Span)
 import Turkey.Types as Ty
 import Turkey.Types (VarCell(..), TBottom)
@@ -255,6 +256,8 @@ type Reducer = Reducer {
     -- fine: a call through `CTyApp` instantiates the lambda in place, which is
     -- type-level beta reduction rather than another top-level specialization.
     bindings : Map String CBind,
+    -- The dictionaries a projection is read out of (`Turkey.Methods`).
+    dicts : Methods.Dictionaries,
     -- What is currently being inlined. Belt and braces beside the loop
     -- breakers: this makes non-termination impossible in the code rather than
     -- merely absent from the graph.
@@ -305,6 +308,7 @@ fun newReducer(program : CProgram) -> Reducer {
     }
     Reducer {
         breakers = loopBreakers(program), bindings = bindings,
+        dicts = Methods.dictionaries(program.dicts),
         active = Array.new(8), sizes = Map.new(), moves = Map.new(),
         ends = Map.new(), wrote = Map.new(),
         speculating = False, reduced = Map.new(), constants = Map.new(),
@@ -428,7 +432,15 @@ fun children(r : Reducer, e : Core) -> Core =
 fun step(r : Reducer, e : Core) -> Option Core {
     match e.kind {
         CVar(_) -> return constant(r, e)
-        CTyApp(_, _) -> return constant(r, e)
+        -- A method read out of a known dictionary. Inlining makes these: a
+        -- generic function's dictionary parameter becomes the dictionary its
+        -- caller passed. With the method's own types when it has some, which is
+        -- why the bare projection below it is left for this.
+        CField(_, _) -> return Methods.knownField(r.dicts, e, [], e.ty)
+        CTyApp(fn, own) -> return match fn.kind {
+            CField(_, _) -> Methods.knownField(r.dicts, fn, own, e.ty)
+            _ -> constant(r, e)
+        }
         CApp(fn, _) -> return match fn.kind {
             CLam(_, _, _) -> beta(r, e)
             CField(_, _) -> knownLambda(e)

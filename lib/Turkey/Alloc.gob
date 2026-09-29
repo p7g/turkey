@@ -19,7 +19,7 @@ import Turkey.Heap as Heap
 import Turkey.Process as Process
 
 foreign "turkey_cell_new" fun cellNew(value : Int, pointerValue : Int) -> Prim.Ptr {
-    let cell = Heap.allocate(16, 3, Prim.frameAddress())
+    let cell = Heap.allocate(16, 3, 7, Prim.frameAddress())
     if !Prim.ptrIsNull(cell) {
         Prim.storeI64(cell, 0, value)
         Prim.storeI32(cell, 8, Prim.charFromInt(pointerValue))
@@ -34,12 +34,16 @@ foreign "turkey_object_new" fun objectNew(kind : Int, tag : Int, count : Int,
         return Prim.ptrNull()
     }
     -- `count` is at most 63 here, so the size cannot overflow.
-    let object = Heap.allocate(Prim.intAddWrapping(24, Prim.intShl(count, 3)), 2,
+    let object = Heap.allocate(Prim.intAddWrapping(24, Prim.intShl(count, 3)), 2, kind,
                                Prim.frameAddress())
     if Prim.ptrIsNull(object) { return object }
-    Heap.countKind(kind)
     header(object, kind, tag, count, pointerBitmap)
-    Memory.fill(Prim.ptrAdd(object, 24), Prim.intShl(count, 3), 0)
+    -- In line, a word at a time: most objects have a few slots, and are
+    -- zeroed in fewer instructions than a call takes.
+    let end = Prim.intAddWrapping(24, Prim.intShl(count, 3))
+    for var at = 24; at < end; at = Prim.intAddWrapping(at, 8) {
+        Prim.storeI64(object, at, 0)
+    }
     object
 }
 
@@ -85,9 +89,8 @@ foreign "turkey_array_new" fun arrayNew(length : Int, initial : Int,
         return Prim.ptrNull()
     }
     let size = Prim.intAddWrapping(24, Prim.intMulWrapping(length, elementWidth))
-    let array = Heap.allocate(size, 2, Prim.frameAddress())
+    let array = Heap.allocate(size, 2, 2, Prim.frameAddress())
     if Prim.ptrIsNull(array) { return array }
-    Heap.countKind(2)
     header(array, 2, elementLayout, length, elementWidth)
     let bytes = Prim.ptrAdd(array, 24)
     if elementWidth == 1 {

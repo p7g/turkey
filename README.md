@@ -207,6 +207,10 @@ region bookkeeping before and after sweeping. Failures report
 `heap verifier:` and terminate the process with exit status 1 before proceeding
 to the next collection phase.
 Combine it with `TURKEY_GC_STRESS=1` to collect and verify at every allocation.
+At the compiler's own scale that does not finish; `TURKEY_GC_STRESS=N`
+collects at random intervals averaging N allocations instead, and
+`TURKEY_GC_STRESS_SEED` picks the sequence (1 by default), so a failure can be
+repeated and several seeds put the collections at different allocations.
 Verification scans the allocated heap and uses temporary native memory for a
 region index; it is disabled by default. It checks the roots and layouts the
 compiler supplies, so behavioral stress tests are still needed to catch

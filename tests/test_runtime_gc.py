@@ -48,11 +48,11 @@ def probe(binary, scale="2", *args):
 @pytest.mark.parametrize("scale", ["", "garbage", "2junk", "nan", "inf",
                                     "1e999", "0", "-1"])
 def test_invalid_scale_uses_default(gc_probe, scale):
-    assert "next threshold 2048," in probe(gc_probe, scale)
+    assert "next threshold 131072," in probe(gc_probe, scale)
 
 
 @pytest.mark.parametrize("scale,threshold", [
-    ("1", 1024), ("4", 4096), (" 4 ", 4096),
+    ("1", 65536), ("4", 262144), (" 4 ", 262144),
     ("1e308", 9223372036854775807),
 ])
 def test_scale_is_applied_without_overflow(gc_probe, scale, threshold):
@@ -66,7 +66,7 @@ def test_allocation_kinds_and_options_survive_stress_override(gc_probe, args):
     assert f"allocations {count}," in out
     # A string is a byte array, so it is counted as one.
     assert f"array {count}," in out
-    assert "next threshold 4096," in out
+    assert "next threshold 262144," in out
 
 
 @pytest.fixture(scope="module")

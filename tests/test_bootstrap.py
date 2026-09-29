@@ -131,6 +131,44 @@ def test_stage3_agrees_with_stage2_over_the_corpus():
         assert _sha(stage2[path]) == _sha(stage3[path.name]), path.name
 
 
+STRESSED = REPO_ROOT / "tests" / "programs" / "adt.gob"
+
+
+@functools.lru_cache(maxsize=None)
+def _unstressed() -> str:
+    return bootc.boot("native", str(STRESSED))
+
+
+def _stressed(**settings: str) -> str:
+    env = dict(os.environ, **settings)
+    env.pop("TURKEY_GC_STATS", None)
+    result = subprocess.run(toolchain.command(bootc.binary(), "native", str(STRESSED)),
+                            cwd=REPO_ROOT, capture_output=True, env=env)
+    assert result.returncode == 0, result.stderr.decode("utf-8")[:4000]
+    return result.stdout.decode("utf-8")
+
+
+@pytest.mark.bootstrap
+@pytest.mark.parametrize("seed", ["1", "2", "3"])
+def test_boot_compiles_the_same_under_sampled_gc_stress(seed):
+    """`boot` itself under GC stress, the one program whose roots are densest.
+
+    Stress at every allocation does not finish at this scale: `boot` makes
+    tens of millions of objects before it reaches the program. Sampled at
+    one collection per 100,000 allocations on average it is about 800
+    collections and a dozen seconds, and each seed puts them at different
+    allocations.
+    """
+    assert _stressed(TURKEY_GC_STRESS="100000", TURKEY_GC_STRESS_SEED=seed) == _unstressed()
+
+
+@pytest.mark.bootstrap
+def test_boot_compiles_the_same_under_sampled_gc_stress_and_verification():
+    """The same, with the heap verified at every collection, sparser because
+    each verification walks the whole heap."""
+    assert _stressed(TURKEY_GC_STRESS="1000000", TURKEY_GC_VERIFY="1") == _unstressed()
+
+
 def _split_asm(text: str, paths: list[Path]) -> list[str]:
     modules = bootc.split_before(text, "; === ")
     return [modules[p.name] for p in paths]

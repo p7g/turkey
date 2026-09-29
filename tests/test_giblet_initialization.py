@@ -157,7 +157,7 @@ int main(void) {
      'fun read() -> Int = value',
      'let base : Int = 0', 'panics with a String'),
     ('import Turkey.Heap as H\n'
-     'let value : Prim.Ptr = H.allocate(32, 0, Prim.frameAddress())\nfun read() -> Int = 0',
+     'let value : Prim.Ptr = H.allocate(32, 0, 0, Prim.frameAddress())\nfun read() -> Int = 0',
      'let base : Int = 0', 'may not call the collector'),
     ('let (a, b) : (Int, Int) = (1, 2)\nfun read() -> Int = a + b',
      'let base : Int = 0', 'builds a tuple'),

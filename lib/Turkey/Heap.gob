@@ -1,5 +1,5 @@
 module Turkey.Heap (
-    allocate, countKind, validObjectKind, collect, report, rootsHead,
+    allocate, validObjectKind, collect, report, rootsHead,
 )
 
 -- The heap and its collector: regions of fixed-size slots, allocation into
@@ -130,8 +130,13 @@ var regionTableCount : Int = 0
 
 var roots : Prim.Ptr = Prim.ptrNull()
 var heapCount : Int = 0
+-- Objects, and the bytes of their slots, allocated since the last
+-- collection. The bytes are what trigger the next one.
 var allocationsSince : Int = 0
-var threshold : Int = 1024
+var bytesSince : Int = 0
+-- The bytes of the slots the last sweep kept: a large object's whole region.
+var liveBytes : Int = 0
+var threshold : Int = 131072
 var collections : Int = 0
 -- A u32 in each header, so it wraps; see `startMarking`.
 var markEpoch : Int = 0
@@ -152,7 +157,16 @@ var frameEntryCount : Int = 0
 -- may reach. Set by the entry once early initialization has run.
 var entryStackHigh : Prim.Ptr = Prim.ptrNull()
 
-var stress : Bool = present(Prim.cString("TURKEY_GC_STRESS"))
+-- GC stress: a collection at every allocation, or with TURKEY_GC_STRESS=N
+-- for N above 1, at random intervals averaging N allocations -- each gap
+-- uniform in 1..2N-1, so that no allocation site is always skipped. The
+-- sequence is TURKEY_GC_STRESS_SEED's, 1 by default, so that a failing run can
+-- be repeated and several seeds can cover different phases. Every allocation
+-- takes the slow path while it is on, which is where it counts down.
+var stressInterval : Int = intervalFrom(Libc.getenv(Prim.cString("TURKEY_GC_STRESS")))
+var stress : Bool = stressInterval > 0
+var stressRandom : Int = seedFrom(Libc.getenv(Prim.cString("TURKEY_GC_STRESS_SEED")))
+var stressCountdown : Int = 1
 var verify : Bool = present(Prim.cString("TURKEY_GC_VERIFY"))
 
 -- Opt-in accounting, printed one line per collection and in `report` when
@@ -160,10 +174,20 @@ var verify : Bool = present(Prim.cString("TURKEY_GC_VERIFY"))
 -- one run rather than from a profiler.
 var statsWanted : Bool = present(Prim.cString("TURKEY_GC_STATS"))
 
--- The collector runs again after this many times the live set has been
--- allocated. 2 was measured, not chosen: at 1 the self-compiled compiler spent
--- 79% of its wall clock collecting a heap that was ~94% garbage every time,
--- and 2 halves the number of collections for ~1GB of peak memory.
+-- The collector runs again once this many times the live set's bytes have
+-- been allocated, or 64KB times it while the live set is smaller than that.
+--
+-- Bytes rather than objects, because the threshold is what bounds the heap:
+-- counted in objects, a program allocating large arrays grows its heap by the
+-- array's size for each one it counts as one. On the compiler's own run the
+-- two cost the same at equal peak memory, so that is what decided it.
+--
+-- 2 is measured. The compiler compiling itself, whose heap is a slowly growing
+-- long-lived program under a stream of short-lived trees, marks every live
+-- object again at each collection, so the objects traced fall as 1/scale and
+-- the peak heap grows by about a live set per step: 1.85G objects traced at
+-- 3.1GB of regions at 2, 1.24G at 4.1GB at 3, 0.93G at 5.2GB at 4. The test
+-- suite runs several of those compiles at once, which is what holds it at 2.
 -- TURKEY_GC_THRESHOLD_SCALE overrides it for experiments.
 var thresholdScale : Float =
     scaleFrom(Libc.getenv(Prim.cString("TURKEY_GC_THRESHOLD_SCALE")))
@@ -176,6 +200,9 @@ var statsFreedPrevious : Int = 0
 var statsLiveTotal : Int = 0
 var statsLivePeak : Int = 0
 var statsClock : Int = 0
+-- The part of `statsClock` spent marking, roots included; the rest is the
+-- sweep and the bookkeeping around it.
+var statsMarkClock : Int = 0
 -- Allocations by what the object is, indexed by `Turkey.Alloc`'s kind:
 -- 0 constructor, 1 record, 2 array, 3 closure, 4 environment, 5 box, 7 cell.
 var statsByKind : Prim.Ptr = zeroed(64)
@@ -222,6 +249,9 @@ fun times8(multiplicand : Int) -> Int = Prim.intShl(multiplicand, 3)
 -- `n` in 1..63: a shift by 64 is not a shift in either backend.
 fun shiftRight(x : Int, n : Int) -> Int =
     Prim.intAnd(Prim.intShr(x, n), Prim.intSubWrapping(Prim.intShl(1, 64 - n), 1))
+
+-- Every bit of `x` flipped. `Prim.intNot` is a call into the runtime.
+fun complement(x : Int) -> Int = Prim.intSubWrapping(Prim.intNegWrapping(x), 1)
 
 fun bit(index : Int) -> Int = Prim.intShl(1, Prim.intAnd(index, 63))
 
@@ -311,49 +341,194 @@ fun tableRemove(region : Prim.Ptr) -> Unit {
     }
 }
 
--- A slot of at least `bytes`, as the address of its header; null, with a
--- panic raised, if there is no memory for a region.
+-- -- size classes and cursors -----------------------------------------------------------
 --
 -- Size classes are 32 to 256 bytes in steps of 16, then powers of two up to
 -- half a region. A request above that is large and gets a region of its own.
--- `bytes` is at most `largest`, which `allocate` has checked.
-fun regionAllocate(bytes : Int) -> Prim.Ptr {
-    var slot = if bytes <= 32 { 32 } else if bytes <= 256 {
-        Prim.intAnd(plus(bytes, 15), -16)
-    } else { 256 }
-    var cls = Prim.intSubWrapping(Prim.intShr(slot, 4), 2)
-    while slot < bytes && slot < regionBytes / 2 {
-        slot = slot * 2
-        cls = cls + 1
+--
+-- Allocation takes slots a bitmap word at a time. A class's cursor holds the
+-- free slots of one word of the region at the head of its available list,
+-- already set in the region's allocation bitmap and counted in its `used`, in
+-- `heapCount` and in `allocationsSince`: so a slot is handed out by clearing a
+-- bit in the cursor, and nothing else is written until the word runs out.
+--
+-- Those reserved slots hold no object, so everything that reads the bitmaps
+-- or the counts -- a collection, the verifier, the C queries -- first calls
+-- `retire`, which gives them back. After it, the heap is exactly what it
+-- would be had each slot been allocated one at a time.
+
+-- The byte offsets of a cursor's fields, and its size.
+let cursorFree : Int = 0
+-- The header of the word's first slot.
+let cursorBase : Int = 8
+let cursorSlot : Int = 16
+let cursorRegion : Int = 24
+let cursorWord : Int = 32
+let cursorBytes : Int = 64
+
+var cursors : Prim.Ptr = zeroed(cursorBytes * regionClasses)
+
+-- The largest payload a size class holds: half a region, less the header.
+let smallPayload : Int = 32744
+
+-- Each small request's class, indexed by its size with the header, rounded up
+-- to 16 and divided by 16. Every class boundary is a multiple of 16, so every
+-- size in one step has the same class.
+var classes : Prim.Ptr = classTable()
+
+fun classTable() -> Prim.Ptr {
+    let table = zeroed(2049)
+    for var step = 1; step <= 2048; step = step + 1 {
+        Prim.storeI8(table, step, Prim.byteFromInt(classFor(16 * step)))
     }
-    let large = bytes > regionBytes / 2
-    var region = if large { Prim.ptrNull() } else { Prim.loadPtr(available, times8(cls)) }
+    table
+}
+
+fun classFor(bytes : Int) -> Int {
+    if bytes <= 32 { return 0 }
+    if bytes <= 256 { return Prim.intShr(bytes + 15, 4) - 2 }
+    var classSize = 256
+    var sizeClass = 14
+    while classSize < bytes {
+        classSize = classSize * 2
+        sizeClass = sizeClass + 1
+    }
+    sizeClass
+}
+
+fun classSlot(sizeClass : Int) -> Int =
+    if sizeClass < 15 { 32 + 16 * sizeClass } else { Prim.intShl(256, sizeClass - 14) }
+
+-- The class of a payload of at most `smallPayload` bytes.
+fun classOf(size : Int) -> Int =
+    Prim.byteToInt(Prim.loadI8(classes, Prim.intShr(plus(size, 39), 4)))
+
+-- Whether `size`, unsigned, is small enough for the fast path: a class-table
+-- step below 2048. The few sizes just under `smallPayload` it turns away are
+-- still small, and `allocateSlow` gives them their class.
+fun fastSize(size : Int) -> Bool = Prim.intShr(plus(size, 39), 15) == 0
+
+fun cursorOf(sizeClass : Int) -> Prim.Ptr = Prim.ptrAdd(cursors, Prim.intShl(sizeClass, 6))
+
+-- The lowest of the cursor's free slots, `free`, which is not zero.
+fun takeSlot(cursor : Prim.Ptr, free : Int) -> Prim.Ptr {
+    let lowest = Prim.intAnd(free, Prim.intNegWrapping(free))
+    Prim.storeI64(cursor, cursorFree, Prim.intXor(free, lowest))
+    Prim.ptrAdd(Prim.loadPtr(cursor, cursorBase),
+                Prim.intMulWrapping(bitIndex(lowest), Prim.loadI64(cursor, cursorSlot)))
+}
+
+-- The position of the one set bit in `lowest`: `Memory.trailingZeros`'s de
+-- Bruijn table, without its test for zero, its isolation of the lowest bit or
+-- its checked subtraction, none of which a bit already isolated needs. This
+-- runs at every allocation.
+fun bitIndex(lowest : Int) -> Int {
+    let pattern = Prim.intAnd(Prim.intShr(Prim.intMulWrapping(lowest, 285870213051386505), 58), 63)
+    let positions = Prim.cString("01`2iaL3mjbZVMA4ngkTec[F]WQNHB<5o_hKlYU@fSdE\\PG;^JX?RDO:I>C9=876")
+    Prim.intSubWrapping(Prim.byteToInt(Prim.loadI8(positions, pattern)), 48)
+}
+
+-- Fill the empty cursor of class `sizeClass` from the first word with a free
+-- slot in the head of its available list, making a region if the list is
+-- empty; False, with a panic raised, if there is no memory for one. Under GC
+-- stress it takes one slot, so that every allocation comes back here.
+fun refill(cursor : Prim.Ptr, sizeClass : Int) -> Bool {
+    var region = Prim.loadPtr(available, times8(sizeClass))
     if Prim.ptrIsNull(region) {
-        region = newRegion(bytes, if large { bytes } else { slot }, cls, large)
-        if Prim.ptrIsNull(region) { return region }
+        let slotBytes = classSlot(sizeClass)
+        region = newRegion(slotBytes, slotBytes, sizeClass, False)
+        if Prim.ptrIsNull(region) { return False }
     }
-    -- A region on an available list has a free slot, so this finds one.
-    var free = load32(region, regionSearchWord)
-    var bits = Prim.loadI64(region, plus(regionAllocated, times8(free)))
-    while bits == -1 {
-        free = plus(free, 1)
-        bits = Prim.loadI64(region, plus(regionAllocated, times8(free)))
+    let capacity = load32(region, regionCapacity)
+    -- A region on an available list has a free slot below its capacity, so
+    -- this finds one.
+    var w = load32(region, regionSearchWord)
+    var taken = Prim.loadI64(region, plus(regionAllocated, times8(w)))
+    while plus(taken, 1) == 0 {
+        w = plus(w, 1)
+        taken = Prim.loadI64(region, plus(regionAllocated, times8(w)))
     }
-    let index = plus(Prim.intShl(free, 6), Memory.trailingZeros(Prim.intXor(bits, -1)))
-    Prim.storeI64(region, plus(regionAllocated, times8(free)), Prim.intOr(bits, bit(index)))
-    store32(region, regionSearchWord, free)
-    let used = plus(load32(region, regionUsed), 1)
+    -- The last word's bits past the capacity are clear, and are not slots.
+    var claim = complement(taken)
+    let beyond = Prim.intSubWrapping(capacity, Prim.intShl(w, 6))
+    if beyond < 64 { claim = Prim.intAnd(claim, Prim.intSubWrapping(Prim.intShl(1, beyond), 1)) }
+    if stress { claim = Prim.intAnd(claim, Prim.intNegWrapping(claim)) }
+    let now = Prim.intOr(taken, claim)
+    Prim.storeI64(region, plus(regionAllocated, times8(w)), now)
+    let n = population(claim)
+    let used = plus(load32(region, regionUsed), n)
     store32(region, regionUsed, used)
-    if !large && used == load32(region, regionCapacity) {
-        Prim.storePtr(available, times8(cls), Prim.loadPtr(region, regionAvailableNext))
+    store32(region, regionSearchWord,
+            if plus(now, 1) == 0 && w < regionWords - 1 { plus(w, 1) } else { w })
+    if used == capacity {
+        Prim.storePtr(available, times8(sizeClass), Prim.loadPtr(region, regionAvailableNext))
     }
-    Prim.ptrAdd(region, plus(regionData, Prim.intMulWrapping(index, Prim.loadI64(region, regionSlotSize))))
+    heapCount = plus(heapCount, n)
+    allocationsSince = plus(allocationsSince, n)
+    let slotSize = Prim.loadI64(region, regionSlotSize)
+    bytesSince = plus(bytesSince, Prim.intMulWrapping(n, slotSize))
+    Prim.storeI64(cursor, cursorFree, claim)
+    Prim.storePtr(cursor, cursorBase,
+                  Prim.ptrAdd(region, plus(regionData, Prim.intMulWrapping(Prim.intShl(w, 6), slotSize))))
+    Prim.storeI64(cursor, cursorSlot, slotSize)
+    Prim.storePtr(cursor, cursorRegion, region)
+    Prim.storeI64(cursor, cursorWord, w)
+    True
+}
+
+-- Give every cursor's unused slots back to its region: clear them from the
+-- allocation bitmap and the counts, move the search back to their word, and
+-- put a region they had filled back on its available list.
+fun retire() -> Unit {
+    for var rc = 0; rc < regionClasses; rc = rc + 1 {
+        let cursor = cursorOf(rc)
+        let left = Prim.loadI64(cursor, cursorFree)
+        if left != 0 {
+            let r = Prim.loadPtr(cursor, cursorRegion)
+            let lw = Prim.loadI64(cursor, cursorWord)
+            let at = plus(regionAllocated, times8(lw))
+            Prim.storeI64(r, at, Prim.intAnd(Prim.loadI64(r, at), complement(left)))
+            let n = population(left)
+            let wasUsed = load32(r, regionUsed)
+            if wasUsed == load32(r, regionCapacity) {
+                Prim.storePtr(r, regionAvailableNext, Prim.loadPtr(available, times8(rc)))
+                Prim.storePtr(available, times8(rc), r)
+            }
+            store32(r, regionUsed, wasUsed - n)
+            if lw < load32(r, regionSearchWord) { store32(r, regionSearchWord, lw) }
+            heapCount = heapCount - n
+            allocationsSince = allocationsSince - n
+            bytesSince = bytesSince - n * Prim.loadI64(r, regionSlotSize)
+            Prim.storeI64(cursor, cursorFree, 0)
+        }
+    }
+}
+
+-- The number of set bits.
+fun population(x : Int) -> Int {
+    let pairs = Prim.intSubWrapping(x, Prim.intAnd(shiftRight(x, 1), 6148914691236517205))
+    let nibbles = plus(Prim.intAnd(pairs, 3689348814741910323),
+                       Prim.intAnd(shiftRight(pairs, 2), 3689348814741910323))
+    let bytes = Prim.intAnd(plus(nibbles, shiftRight(nibbles, 4)), 1085102592571150095)
+    shiftRight(Prim.intMulWrapping(bytes, 72340172838076673), 56)
+}
+
+-- A region of its own for a request of `bytes`, header included, with its one
+-- slot allocated; null, with a panic raised, if there is no memory for it.
+fun largeAllocate(bytes : Int) -> Prim.Ptr {
+    let made = newRegion(bytes, bytes, regionClasses, True)
+    if Prim.ptrIsNull(made) { return made }
+    Prim.storeI64(made, regionAllocated, 1)
+    store32(made, regionUsed, 1)
+    heapCount = plus(heapCount, 1)
+    allocationsSince = plus(allocationsSince, 1)
+    bytesSince = plus(bytesSince, Prim.loadI64(made, regionReserved))
+    Prim.ptrAdd(made, regionData)
 }
 
 -- A fresh, empty region with slots of `slotSize`, on the region list and, if
 -- it is small, its class's available list; null, with a panic raised, if
--- there is no memory for it. Apart from `regionAllocate` so that the path
--- that finds a region with room stays small.
+-- there is no memory for it.
 fun newRegion(bytes : Int, slotSize : Int, sizeClass : Int, large : Bool) -> Prim.Ptr {
     let reserved = if large {
         Prim.intAnd(regionData + bytes + regionBytes - 1, regionMask)
@@ -375,7 +550,10 @@ fun newRegion(bytes : Int, slotSize : Int, sizeClass : Int, large : Bool) -> Pri
     store32(made, regionSizeClass, if large { regionClasses } else { sizeClass })
     Prim.storePtr(made, regionNext, regions)
     regions = made
-    if !large { Prim.storePtr(available, times8(sizeClass), made) }
+    if !large {
+        Prim.storePtr(available, times8(sizeClass), made)
+        Prim.storeI64(reciprocals, times8(sizeClass), (4294967296 + slotSize - 1) / slotSize)
+    }
     regionBytesInUse = regionBytesInUse + reserved
     if regionBytesInUse > regionBytesPeak { regionBytesPeak = regionBytesInUse }
     made
@@ -410,13 +588,27 @@ fun findHeader(value : Prim.Ptr) -> Prim.Ptr {
 
 -- `size` payload bytes of heap `kind`, uninitialized, or null with a panic
 -- raised. `size` is an unsigned byte count carried in an `Int`'s bits.
+-- `counted` is what the statistics count it as: `Turkey.Alloc`'s kind, or 7
+-- for a cell.
 --
 -- May collect, so every managed value the caller holds must be rooted. `frame`
 -- is the caller's own frame record, where the walk of the Turkey stack starts:
 -- the caller must be the Turkey function the allocation is made for, since a
 -- frame passed along from further out would skip the frames between.
-fun allocate(size : Int, kind : Int, frame : Prim.Ptr) -> Prim.Ptr {
-    if stress || allocationsSince >= threshold {
+--
+-- The path taken by nearly every allocation is a slot from the class's cursor;
+-- everything else -- a collection, an empty cursor, a large object, GC stress
+-- -- is `allocateSlow`, which is also what keeps this one small.
+fun allocate(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Prim.Ptr {
+    if !fastSize(size) { return allocateSlow(size, kind, counted, frame) }
+    let cursor = cursorOf(classOf(size))
+    let free = Prim.loadI64(cursor, cursorFree)
+    if free == 0 { return allocateSlow(size, kind, counted, frame) }
+    initialize(takeSlot(cursor, free), size, kind, counted)
+}
+
+fun allocateSlow(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Prim.Ptr {
+    if (stress && stressDue()) || bytesSince >= threshold {
         collectFrom(frame)
         -- A collection is the only thing here that can raise one, and an
         -- allocation after a failed collection would be into a heap nobody
@@ -427,29 +619,50 @@ fun allocate(size : Int, kind : Int, frame : Prim.Ptr) -> Prim.Ptr {
         Process.panic(Prim.cString("allocation is too large"))
         return Prim.ptrNull()
     }
-    let header = regionAllocate(plus(headerBytes, size))
-    if Prim.ptrIsNull(header) { return header }
+    if below(smallPayload, size) {
+        let header = largeAllocate(plus(headerBytes, size))
+        if Prim.ptrIsNull(header) { return header }
+        return initialize(header, size, kind, counted)
+    }
+    let sizeClass = classOf(size)
+    let cursor = cursorOf(sizeClass)
+    if Prim.loadI64(cursor, cursorFree) == 0 && !refill(cursor, sizeClass) {
+        return Prim.ptrNull()
+    }
+    initialize(takeSlot(cursor, Prim.loadI64(cursor, cursorFree)), size, kind, counted)
+}
+
+-- Whether GC stress collects at this allocation.
+fun stressDue() -> Bool {
+    stressCountdown = stressCountdown - 1
+    if stressCountdown > 0 { return False }
+    stressCountdown = if stressInterval == 1 { 1 } else {
+        -- xorshift64*: a full period over the nonzero words, which is all a
+        -- sampling interval needs of it.
+        var mixed = stressRandom
+        mixed = Prim.intXor(mixed, shiftRight(mixed, 12))
+        mixed = Prim.intXor(mixed, Prim.intShl(mixed, 25))
+        mixed = Prim.intXor(mixed, shiftRight(mixed, 27))
+        stressRandom = mixed
+        let drawn = shiftRight(Prim.intMulWrapping(mixed, 2685821657736338717), 1)
+        1 + drawn % (2 * stressInterval - 1)
+    }
+    True
+}
+
+-- The header of a fresh slot, and the payload after it.
+fun initialize(header : Prim.Ptr, size : Int, kind : Int, counted : Int) -> Prim.Ptr {
     Prim.storePtr(header, 0, Prim.ptrNull())
     Prim.storeI64(header, headerSize, size)
-    store32(header, headerKind, kind)
-    store32(header, headerMarked, 0)
-    heapCount = plus(heapCount, 1)
-    allocationsSince = plus(allocationsSince, 1)
+    -- The kind, and a mark epoch of 0 above it: no epoch is 0.
+    Prim.storeI64(header, headerKind, kind)
     if statsWanted {
         statsAllocations = plus(statsAllocations, 1)
         statsBytes = plus(statsBytes, plus(size, headerBytes))
-        if kind == heapCell { countKind(7) }
+        let at = if counted >= 0 && counted < 8 { times8(counted) } else { 0 }
+        Prim.storeI64(statsByKind, at, plus(Prim.loadI64(statsByKind, at), 1))
     }
     Prim.ptrAdd(header, headerBytes)
-}
-
--- Called by the allocators after a successful object allocation; a cell is
--- counted by `allocate`.
-fun countKind(kind : Int) -> Unit {
-    if statsWanted {
-        let at = if kind >= 0 && kind < 8 { 8 * kind } else { 0 }
-        Prim.storeI64(statsByKind, at, Prim.loadI64(statsByKind, at) + 1)
-    }
 }
 
 -- Under GC stress, that `value` is a live heap object: a stale or invented
@@ -668,51 +881,74 @@ fun scanNativeFrames(frame : Prim.Ptr) -> Unit {
 }
 
 -- -- marking ----------------------------------------------------------------------------
+--
+-- An object is marked when it is first pushed, in its region's mark bitmap:
+-- an edge to an object already marked -- most edges, in a heap of shared
+-- names and types -- then reads the region's header, which a few thousand
+-- objects share and which stays in cache, and not the object's own. The
+-- header's epoch is written too, for the verifier, which checks the two agree.
+--
+-- `drain` is the whole of the tracing loop, decoding and pushing in line: the
+-- inliner does not copy a body this size, and a call per edge was most of what
+-- marking cost.
 
--- Mark `value` and push it for its children. `what` and `index` name where it
--- was found, for the diagnostic if it is not a heap pointer; `what` null means
--- a field or root the caller cannot name.
+-- Each size class's slot size as a multiplier: 2^32 / slot, rounded up, and
+-- 0 for a large region, whose one slot is at offset 0. A slot's offset times
+-- it, over 2^32, is the slot's index, exactly: the offset is a multiple of the
+-- slot size below 2^16, so the rounding adds less than 2^16 / 2^32 to a whole
+-- number. Set by `newRegion` for each class it makes a region of, which is
+-- before anything in the class can be marked.
+var reciprocals : Prim.Ptr = zeroed(8 * (regionClasses + 1))
+
+-- Mark and push `value`, a root found as `what` `index`, if it is not null
+-- and not yet marked. `what` null means a root the caller cannot name.
 fun markGrey(value : Prim.Ptr, what : Prim.Ptr, index : Int) -> Unit {
     if Prim.ptrIsNull(value) { return {} }
-    -- Exact roots and layout metadata make finding the header O(1) in normal
-    -- execution. GC stress keeps the membership check, and it earns the cost:
-    -- a pointer that is not in the heap means a root was missed or a layout
-    -- bitmap is wrong, and this turns that from a rare corruption into a panic
-    -- on the first collection.
-    let header = if stress { findHeader(value) } else { Prim.ptrAdd(value, payloadHeader) }
-    if Prim.ptrIsNull(header) {
+    -- Exact roots and layout metadata make the header O(1) to find in normal
+    -- execution. GC stress checks membership, and it earns the cost: a pointer
+    -- that is not in the heap means a root was missed or a layout bitmap is
+    -- wrong, and this turns that from a rare corruption into a panic on the
+    -- first collection.
+    if stress && Prim.ptrIsNull(findHeader(value)) {
         notHeapPointer(value, what, index)
         return {}
     }
-    if load32(header, headerMarked) == markEpoch { return {} }
-    store32(header, headerMarked, markEpoch)
+    let header = Prim.ptrFromInt(Prim.intSubWrapping(Prim.ptrToInt(value), headerBytes))
     let region = regionOf(header)
-    let slot = Prim.ptrDiff(header, Prim.ptrAdd(region, regionData))
-        / Prim.loadI64(region, regionSlotSize)
-    setBit(region, regionMarked, slot)
+    let slot = slotOf(region, header)
+    let at = plus(regionMarked, times8(Prim.intShr(slot, 6)))
+    let marks = Prim.loadI64(region, at)
+    if Prim.intAnd(marks, bit(slot)) != 0 { return {} }
+    Prim.storeI64(region, at, Prim.intOr(marks, bit(slot)))
     store32(region, regionLive, plus(load32(region, regionLive), 1))
-    if markCount == markCapacity {
-        let capacity = if markCapacity < 64 { 64 } else { markCapacity * 2 }
-        let grown = Libc.realloc(markStack, 8 * capacity)
-        if Prim.ptrIsNull(grown) {
-            Process.panic(Prim.cString("out of memory while tracing the heap"))
-            return {}
-        }
-        markStack = grown
-        markCapacity = capacity
-    }
+    store32(header, headerMarked, markEpoch)
+    if markCount == markCapacity && !growMarkStack() { return {} }
     Prim.storePtr(markStack, times8(markCount), value)
     markCount = plus(markCount, 1)
 }
 
-fun drain() -> Unit {
-    while markCount > 0 {
-        markCount = Prim.intSubWrapping(markCount, 1)
-        markChildren(Prim.loadPtr(markStack, times8(markCount)))
-    }
+-- The index of the slot whose header is `header`, in `region`.
+fun slotOf(region : Prim.Ptr, header : Prim.Ptr) -> Int {
+    let offset = Prim.intSubWrapping(Prim.ptrDiff(header, region), regionData)
+    let multiplier = Prim.loadI64(reciprocals, times8(load32(region, regionSizeClass)))
+    Prim.intShr(Prim.intMulWrapping(offset, multiplier), 32)
 }
 
--- The one place the collector decodes an object's layout.
+-- Double the mark stack; False, with a panic raised, if there is no memory.
+fun growMarkStack() -> Bool {
+    let capacity = if markCapacity < 64 { 64 } else { markCapacity * 2 }
+    let grown = Libc.realloc(markStack, 8 * capacity)
+    if Prim.ptrIsNull(grown) {
+        Process.panic(Prim.cString("out of memory while tracing the heap"))
+        return False
+    }
+    markStack = grown
+    markCapacity = capacity
+    True
+}
+
+-- Trace everything reachable from the stack, emptying it. This is the one
+-- place the collector decodes an object's layout.
 --
 -- An array's tag is its element's layout code, and the other objects carry a
 -- code per slot: three bits each for constructors and records, one bit each
@@ -720,41 +956,70 @@ fun drain() -> Unit {
 -- pointer-sized word the collector must not follow: a raw address. A test of
 -- `>= 6` follows both, and collects through an address it has no business
 -- reading.
-fun markChildren(value : Prim.Ptr) -> Unit {
-    let heapKind = load32(value, payloadKind)
-    if heapKind == heapCell {
-        if load32(value, 8) != 0 {
-            markGrey(Prim.loadPtr(value, 0), Prim.ptrNull(), 0)
+fun drain() -> Unit {
+    var top = markCount
+    while top > 0 {
+        top = Prim.intSubWrapping(top, 1)
+        let object = Prim.loadPtr(markStack, times8(top))
+        -- Where its pointers start, how many slots, and how each is coded:
+        -- 0 every slot is a pointer, 1 three bits per slot, 2 one bit.
+        var first = objectSlots
+        var slots = 0
+        var coding = 0
+        var codes = 0
+        let heapKind = load32(object, payloadKind)
+        if heapKind == heapCell {
+            first = 0
+            slots = if load32(object, 8) != 0 { 1 } else { 0 }
+        } else if heapKind == heapObject {
+            let kind = load32(object, objectKind)
+            codes = Prim.loadI64(object, objectBitmap)
+            if kind == 2 {
+                if load32(object, objectTag) == 7 { slots = Prim.loadI64(object, objectCount) }
+            } else {
+                slots = Prim.loadI64(object, objectCount)
+                coding = if kind == 0 || kind == 1 { 1 } else { 2 }
+            }
         }
-        return {}
+        for var field = 0; field < slots; field = plus(field, 1) {
+            let traced = if coding == 0 { True } else if coding == 1 {
+                Prim.intAnd(Prim.intShr(codes, Prim.intMulWrapping(3, field)), 7) == 7
+            } else { Prim.intAnd(codes, bit(field)) != 0 }
+            let child = if traced { Prim.loadPtr(object, plus(first, times8(field))) }
+                        else { Prim.ptrNull() }
+            if Prim.ptrIsNull(child) {
+            } else if stress && Prim.ptrIsNull(findHeader(child)) {
+                notHeapPointer(child, fieldName(heapKind, coding), field)
+            } else {
+                let childHeader = Prim.ptrFromInt(Prim.intSubWrapping(Prim.ptrToInt(child), headerBytes))
+                let childRegion = regionOf(childHeader)
+                let childSlot = slotOf(childRegion, childHeader)
+                let at = plus(regionMarked, times8(Prim.intShr(childSlot, 6)))
+                let marks = Prim.loadI64(childRegion, at)
+                let mask = bit(childSlot)
+                if Prim.intAnd(marks, mask) == 0 {
+                    Prim.storeI64(childRegion, at, Prim.intOr(marks, mask))
+                    store32(childRegion, regionLive, plus(load32(childRegion, regionLive), 1))
+                    store32(childHeader, headerMarked, markEpoch)
+                    if top == markCapacity && !growMarkStack() {
+                        markCount = 0
+                        return {}
+                    }
+                    Prim.storePtr(markStack, times8(top), child)
+                    top = plus(top, 1)
+                }
+            }
+        }
     }
-    if heapKind != heapObject { return {} }
-    let kind = load32(value, objectKind)
-    let count = Prim.loadI64(value, objectCount)
-    let bitmap = Prim.loadI64(value, objectBitmap)
-    if kind == 2 {
-        if load32(value, objectTag) == 7 {
-            for var i = 0; i < count; i = plus(i, 1) {
-                markGrey(Prim.loadPtr(value, plus(objectSlots, times8(i))),
-                         Prim.cString("array pointer field"), i)
-            }
-        }
-    } else if kind == 0 || kind == 1 {
-        for var i = 0; i < count; i = plus(i, 1) {
-            if Prim.intAnd(Prim.intShr(bitmap, Prim.intMulWrapping(3, i)), 7) == 7 {
-                markGrey(Prim.loadPtr(value, plus(objectSlots, times8(i))),
-                         Prim.cString("object pointer field"), i)
-            }
-        }
-    } else {
-        for var i = 0; i < count; i = plus(i, 1) {
-            if Prim.intAnd(bitmap, bit(i)) != 0 {
-                markGrey(Prim.loadPtr(value, plus(objectSlots, times8(i))),
-                         Prim.cString("capture"), i)
-            }
-        }
-    }
+    markCount = 0
 }
+
+-- What `notHeapPointer` calls a field, by how its object codes its slots.
+fun fieldName(cellOrObject : Int, slotCoding : Int) -> Prim.Ptr =
+    if cellOrObject == heapCell { Prim.ptrNull() }
+    else if slotCoding == 0 { Prim.cString("array pointer field") }
+    else if slotCoding == 1 { Prim.cString("object pointer field") }
+    else { Prim.cString("capture") }
 
 -- "<what> <index> is not a heap pointer (0x...)", or "GC root or field is not
 -- a heap pointer (0x...)" when the caller cannot name where it looked. Named,
@@ -784,6 +1049,7 @@ fun notHeapPointer(value : Prim.Ptr, what : Prim.Ptr, index : Int) -> Unit {
 foreign "turkey_collect" fun collect() -> Unit = collectFrom(Prim.ptrNull())
 
 fun collectFrom(frame : Prim.Ptr) -> Unit {
+    retire()
     if verify { verifyAt(0, frame) }
     let liveBefore = heapCount
     -- Read before the sweep clears it: the allocation pressure this
@@ -810,18 +1076,23 @@ fun collectFrom(frame : Prim.Ptr) -> Unit {
     -- here and everything else's are above.
     scanNativeFrames(frame)
     if Process.pending() { return {} }
+    let marked = if wanted { nanoseconds() } else { 0 }
     if verify { verifyAt(1, frame) }
     sweep()
     if verify { verifyAt(2, frame) }
     allocationsSince = 0
-    let floor = if heapCount > 1024 { heapCount } else { 1024 }
+    bytesSince = 0
+    let floor = if liveBytes > 65536 { liveBytes } else { 65536 }
     let next = Prim.floatMul(Prim.intToFloat(floor), thresholdScale)
     -- `maxInt()` rounds up when converted, so the comparison is against 2^63,
     -- and anything that reaches it saturates instead of converting.
     threshold = if Prim.floatGte(next, Prim.intToFloat(maxInt())) { maxInt() }
                 else { Prim.floatTruncate(next) }
     collections = collections + 1
-    if wanted { logCollection(started, liveBefore, allocsSince) }
+    if wanted {
+        statsMarkClock = statsMarkClock + (marked - started)
+        logCollection(started, liveBefore, allocsSince)
+    }
 }
 
 -- A new epoch, so that no header needs clearing before a mark. The epoch is a
@@ -850,6 +1121,7 @@ fun startMarking() -> Unit {
 -- marks become its allocation bitmap, so no individual header is visited.
 fun sweep() -> Unit {
     Memory.fill(available, 8 * regionClasses, 0)
+    liveBytes = 0
     var previous = Prim.ptrNull()
     var region = regions
     while !Prim.ptrIsNull(region) {
@@ -872,6 +1144,9 @@ fun sweep() -> Unit {
             store32(region, regionLive, 0)
             store32(region, regionSearchWord, 0)
             let cls = load32(region, regionSizeClass)
+            liveBytes = liveBytes + (if cls < regionClasses {
+                live * Prim.loadI64(region, regionSlotSize)
+            } else { Prim.loadI64(region, regionReserved) })
             if live < load32(region, regionCapacity) && cls < regionClasses {
                 Prim.storePtr(region, regionAvailableNext, Prim.loadPtr(available, 8 * cls))
                 Prim.storePtr(available, 8 * cls, region)
@@ -926,6 +1201,7 @@ fun logCollection(started : Int, liveBefore : Int, allocsSince : Int) -> Unit {
 -- The run's totals, when TURKEY_GC_STATS asked for them.
 foreign "turkey_gc_report" fun report() -> Unit {
     if !statsWanted { return {} }
+    retire()
     textLength = 0
     put(Prim.cString("[gc] region bytes "))
     putInt(regionBytesInUse)
@@ -969,7 +1245,9 @@ foreign "turkey_gc_report" fun report() -> Unit {
     putInt(statsFreedTotal)
     put(Prim.cString(", collect time "))
     putFixed(statsClock, 1000000000, 3)
-    put(Prim.cString(" s\n"))
+    put(Prim.cString(" s (mark "))
+    putFixed(statsMarkClock, 1000000000, 3)
+    put(Prim.cString(" s)\n"))
     writeLine()
 }
 
@@ -1125,6 +1403,38 @@ fun scaleFrom(s : Prim.Ptr) -> Float {
     if finite(value) && Prim.floatGte(value, 1.0) { value } else { fallback }
 }
 
+-- TURKEY_GC_STRESS: 0 if it is unset, N if it is a decimal N of at least 1
+-- with optional surrounding whitespace, and 1 if it is anything else, which
+-- is how a flag set to "yes" still collects at every allocation. At most
+-- 2^60, far past any interval a run could reach.
+fun intervalFrom(s : Prim.Ptr) -> Int {
+    if Prim.ptrIsNull(s) { return 0 }
+    let n = decimalFrom(s)
+    if n < 1 { 1 } else { n }
+}
+
+-- TURKEY_GC_STRESS_SEED, or 1 if it is unset or not a decimal number; never 0,
+-- which xorshift cannot leave.
+fun seedFrom(s : Prim.Ptr) -> Int {
+    if Prim.ptrIsNull(s) { return 1 }
+    let n = decimalFrom(s)
+    if n < 1 { 1 } else { n }
+}
+
+-- The decimal number `s` holds, with optional surrounding whitespace, capped
+-- at 2^60; -1 if it holds anything else.
+fun decimalFrom(s : Prim.Ptr) -> Int {
+    var at = skipSpace(s, 0)
+    if !isDigit(byteAt(s, at)) { return -1 }
+    var total = 0
+    while isDigit(byteAt(s, at)) {
+        if total < 1152921504606846976 { total = total * 10 + byteAt(s, at) - 48 }
+        at = at + 1
+    }
+    if byteAt(s, skipSpace(s, at)) != 0 { return -1 }
+    if total > 1152921504606846976 { 1152921504606846976 } else { total }
+}
+
 -- Neither infinite nor NaN: either makes `x - x` a NaN, which equals nothing.
 fun finite(x : Float) -> Bool = Prim.floatEq(Prim.floatSub(x, x), 0.0)
 
@@ -1153,6 +1463,7 @@ fun isSpace(c : Int) -> Bool = c == 32 || (c >= 9 && c <= 13)
 var state : Prim.Ptr = Libc.malloc(Check.stateBytes)
 
 fun snapshot() -> Prim.Ptr {
+    retire()
     if Prim.ptrIsNull(state) { return state }
     Prim.storePtr(state, Check.stateRegions, regions)
     Prim.storePtr(state, Check.stateAvailable, available)
@@ -1180,13 +1491,19 @@ fun verifyAt(phase : Int, frame : Prim.Ptr) -> Unit = Check.verify(phase, frame,
 -- The verifier's snapshot, for the tests that call it directly.
 foreign "turkey_heap_state" fun heapState() -> Prim.Ptr = snapshot()
 
-foreign "turkey_heap_objects" fun heapObjects() -> Int = heapCount
+foreign "turkey_heap_objects" fun heapObjects() -> Int {
+    retire()
+    heapCount
+}
 
 foreign "turkey_collection_count" fun collectionCount() -> Int = collections
 
 -- `enabled` is a C `int`: only its low half is defined.
 foreign "turkey_gc_set_stress" fun setStress(enabled : Int) -> Unit {
+    retire()
     stress = Prim.intAnd(enabled, 4294967295) != 0
+    stressInterval = if stress { 1 } else { 0 }
+    stressCountdown = 1
 }
 
 foreign "turkey_gc_set_verify" fun setVerify(enabled : Int) -> Unit {
@@ -1208,8 +1525,10 @@ foreign "turkey_heap_mark_epoch" fun heapMarkEpoch() -> Int = markEpoch
 
 -- Whether `value` is a live object, for the tests' questions about reuse and
 -- reclamation.
-foreign "turkey_heap_contains" fun heapContains(value : Prim.Ptr) -> Int =
+foreign "turkey_heap_contains" fun heapContains(value : Prim.Ptr) -> Int {
+    retire()
     if Prim.ptrIsNull(findHeader(value)) { 0 } else { 1 }
+}
 
 -- For the tests that corrupt the heap on purpose, to see the verifier notice.
 foreign "turkey_heap_set_mark_epoch" fun setMarkEpoch(epoch : Int) -> Unit {
@@ -1217,6 +1536,7 @@ foreign "turkey_heap_set_mark_epoch" fun setMarkEpoch(epoch : Int) -> Unit {
 }
 
 foreign "turkey_heap_set_objects" fun setHeapObjects(count : Int) -> Unit {
+    retire()
     heapCount = count
 }
 

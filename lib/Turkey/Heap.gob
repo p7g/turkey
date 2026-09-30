@@ -90,6 +90,13 @@ let frameCount : Int = 16
 let frameValues : Int = 24
 let frameLive : Int = 32
 
+-- Words below this in a traced slot are not pointers: nothing is ever mapped
+-- in the first page, on any target. Generated code keeps a compact sum's
+-- nullary constructors there -- `None` is 0, a second nullary 1 -- so a traced
+-- slot, root or array element may hold one, and the collector skips it the way
+-- it skips null.
+let immediates : Int = 4096
+
 -- The objects `Turkey.Alloc` builds: `kind` and `tag` (i32), `count`, then the
 -- pointer metadata and the slots. A cell is its value and an i32 flag saying
 -- whether the value is a pointer.
@@ -896,10 +903,14 @@ fun scanNativeFrames(frame : Prim.Ptr) -> Unit {
 -- before anything in the class can be marked.
 var reciprocals : Prim.Ptr = zeroed(8 * (regionClasses + 1))
 
--- Mark and push `value`, a root found as `what` `index`, if it is not null
+-- Whether a traced word names no object: null, or one of the small integers
+-- below `immediates`.
+fun immediate(value : Prim.Ptr) -> Bool = below(Prim.ptrToInt(value), immediates)
+
+-- Mark and push `value`, a root found as `what` `index`, if it is an object
 -- and not yet marked. `what` null means a root the caller cannot name.
 fun markGrey(value : Prim.Ptr, what : Prim.Ptr, index : Int) -> Unit {
-    if Prim.ptrIsNull(value) { return {} }
+    if immediate(value) { return {} }
     -- Exact roots and layout metadata make the header O(1) to find in normal
     -- execution. GC stress checks membership, and it earns the cost: a pointer
     -- that is not in the heap means a root was missed or a layout bitmap is
@@ -983,7 +994,7 @@ fun drain() -> Unit {
             } else { Prim.intAnd(codes, bit(field)) != 0 }
             let child = if traced { Prim.loadPtr(object, plus(first, times8(field))) }
                         else { Prim.ptrNull() }
-            if Prim.ptrIsNull(child) {
+            if immediate(child) {
             } else if stress && Prim.ptrIsNull(findHeader(child)) {
                 notHeapPointer(child, fieldName(heapKind, coding), field)
             } else {

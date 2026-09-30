@@ -28,7 +28,7 @@ def verifier_probe(tmp_path_factory, allocator_object):
 /* The heap's format, as the probe corrupts it: a copy of its own, so that the
    fault injected is the one named here whatever the collector or the verifier
    believes. */
-typedef struct Header { void *next; uint64_t size; uint32_t kind, marked; } Header;
+typedef struct Header { uint64_t generation, size; uint32_t kind, marked; } Header;
 typedef struct Region {
     struct Region *next, *available_next;
     uint64_t slot_size, reserved;
@@ -72,6 +72,7 @@ static void forget(void *value) {
     Region *r = region_of(h);
     size_t i = ((unsigned char *)h - r->data) / r->slot_size;
     h->marked = 0;
+    h->generation = 0;
     r->marked_slots[i / 64] &= ~(UINT64_C(1) << (i % 64));
     r->live--;
 }
@@ -83,6 +84,7 @@ static void remember(void *value) {
     Region *r = region_of(h);
     size_t i = ((unsigned char *)h - r->data) / r->slot_size;
     h->marked = (uint32_t)turkey_heap_mark_epoch();
+    h->generation = 1;
     r->marked_slots[i / 64] |= UINT64_C(1) << (i % 64);
     r->live++;
 }
@@ -221,10 +223,54 @@ int main(int argc, char **argv) {
     }
     else if (!strcmp(which, "sweep-survivor")) {
         forget(parent);
-        for (Region *s = regions(); s; s = s->next) {
-            memset(s->marked_slots, 0, sizeof s->marked_slots); s->live = 0;
-        }
         phase = 2;
+    }
+    else if (!strcmp(which, "sticky-marks")) {
+        turkey_collect();
+        header_of(parent)->generation = 0;
+    }
+    else if (!strcmp(which, "generation")) header_of(parent)->generation = 7;
+    else if (!strcmp(which, "unremembered") || !strcmp(which, "remembered")) {
+        /* An old object given a young one: remembered only by the barrier. */
+        turkey_gc_set_generational(1);
+        turkey_collect();
+        parent->slots[0] = (uintptr_t)turkey_string_new((const unsigned char *)"young", 5);
+        if (!strcmp(which, "remembered")) {
+            turkey_write_barrier(parent);
+            assert(turkey_heap_check(0, NULL, turkey_heap_state()));
+            puts("valid");
+            return 0;
+        }
+    }
+    else if (!strcmp(which, "remembered-count")) {
+        turkey_gc_set_generational(1);
+        turkey_collect();
+        turkey_write_barrier(parent);
+        header_of(parent)->generation = 1;
+    }
+    else if (!strcmp(which, "generational")) {
+        /* A young object survives a minor collection through a remembered
+           parent, and an unreachable young one does not; an old object that
+           dies is kept by minor collections until a full one. */
+        turkey_gc_set_generational(1);
+        turkey_gc_set_verify(1);
+        turkey_collect();
+        Object *young = turkey_string_new((const unsigned char *)"young", 5);
+        parent->slots[0] = (uintptr_t)young;
+        turkey_write_barrier(parent);
+        void *dead = turkey_string_new((const unsigned char *)"dead", 4);
+        turkey_collect();
+        assert(!turkey_has_panicked);
+        assert(turkey_heap_contains(young) && !turkey_heap_contains(dead));
+        assert(header_of(young)->generation == 1 && header_of(parent)->generation == 1);
+        parent->slots[0] = 0;
+        turkey_collect();
+        assert(turkey_heap_contains(young));
+        turkey_gc_set_generational(0);
+        turkey_collect();
+        assert(!turkey_has_panicked && !turkey_heap_contains(young));
+        puts("valid");
+        return 0;
     }
     else if (!strcmp(which, "reclaimed")) {
         void *dead = turkey_box(5, 4);
@@ -248,7 +294,7 @@ int main(int argc, char **argv) {
         Entry entry = {1234, 1, &offset};
         /* The collector's state with this frame table and stack in it: the
            frame table, its length, the mark epoch and the stack's top. */
-        int64_t state[12];
+        int64_t state[16];
         memcpy(state, turkey_heap_state(), sizeof state);
         state[8] = (int64_t)(uintptr_t)&entry;
         state[9] = 1;
@@ -321,6 +367,12 @@ CASES = {
     "region-table-missing": "region table disagrees with region list",
     "region-table-probe": "region table entry unreachable by probing",
     "sweep-survivor": "unmarked sweep survivor",
+    "sticky-marks": "region marks and generation disagree",
+    "generation": "invalid generation word",
+    "unremembered": "old object holds a young one and is not remembered",
+    "remembered": "valid",
+    "remembered-count": "remembered objects miscounted",
+    "generational": "valid",
     "reclaimed": "invalid traced pointer",
     "allocation-stops": "invalid object header",
     "native-invalid": "invalid traced pointer",

@@ -189,6 +189,19 @@ var stressRandom : Int = seedFrom(Libc.getenv(Prim.cString("TURKEY_GC_STRESS_SEE
 var stressCountdown : Int = 1
 var verify : Bool = present(Prim.cString("TURKEY_GC_VERIFY"))
 
+-- Whether a collection may be minor: trace only from the roots and the
+-- remembered objects, keep every old object's mark, and free only young
+-- objects. That is sound only in a program whose every store runs the write
+-- barrier, which the committed bootstrap compiler does not emit, so it is on
+-- only with TURKEY_GC_GENERATIONAL=1 until that compiler is replaced.
+var generational : Bool = generationalFrom(Libc.getenv(Prim.cString("TURKEY_GC_GENERATIONAL")))
+-- Whether the collection in progress, or the last one, is minor.
+var minor : Bool = False
+-- The bytes the last full collection kept: a full collection is due once the
+-- live bytes have grown by the threshold scale since then, the old
+-- generation's own doubling.
+var liveBytesAfterFull : Int = 0
+
 -- Opt-in accounting, printed one line per collection and in `report` when
 -- TURKEY_GC_STATS is set: what the collector costs and what drives it, from
 -- one run rather than from a profiler.
@@ -225,6 +238,7 @@ var statsClock : Int = 0
 var statsMarkClock : Int = 0
 -- Every object the write barrier remembered.
 var statsRemembered : Int = 0
+var statsMinor : Int = 0
 -- Allocations by what the object is, indexed by `Turkey.Alloc`'s kind:
 -- 0 constructor, 1 record, 2 array, 3 closure, 4 environment, 5 box, 7 cell.
 var statsByKind : Prim.Ptr = zeroed(64)
@@ -1117,6 +1131,7 @@ foreign "turkey_collect" fun collect() -> Unit = collectFrom(Prim.ptrNull())
 
 fun collectFrom(frame : Prim.Ptr) -> Unit {
     retire()
+    minor = generational && !fullDue()
     if verify { verifyAt(0, frame) }
     let liveBefore = heapCount
     -- Read before the sweep clears it: the allocation pressure this
@@ -1124,10 +1139,13 @@ fun collectFrom(frame : Prim.Ptr) -> Unit {
     let allocsSince = allocationsSince
     let wanted = statsWanted
     let started = if wanted { nanoseconds() } else { 0 }
-    -- A full collection marks every live object again, which makes each one
-    -- old and so forgets it was remembered.
-    rememberedCount = 0
     startMarking()
+    if !minor {
+        -- Everything is traced again, and every live object marked again,
+        -- which makes it old and forgets that it was remembered.
+        clearMarks()
+        rememberedCount = 0
+    }
     var root = roots
     while !Prim.ptrIsNull(root) {
         let count = Prim.loadI64(root, frameCount)
@@ -1142,6 +1160,7 @@ fun collectFrom(frame : Prim.Ptr) -> Unit {
         }
         root = Prim.loadPtr(root, 0)
     }
+    if minor { traceRemembered() }
     -- Beside the chain, not instead of it: the arm64 backend's frames are
     -- here and everything else's are above.
     scanNativeFrames(frame)
@@ -1158,11 +1177,46 @@ fun collectFrom(frame : Prim.Ptr) -> Unit {
     -- and anything that reaches it saturates instead of converting.
     threshold = if Prim.floatGte(next, Prim.intToFloat(maxInt())) { maxInt() }
                 else { Prim.floatTruncate(next) }
+    if minor { statsMinor = statsMinor + 1 } else { liveBytesAfterFull = liveBytes }
     collections = collections + 1
     if wanted {
         statsMarkClock = statsMarkClock + (marked - started)
         logCollection(started, liveBefore, allocsSince)
     }
+}
+
+-- Whether this collection must be full: when the live bytes, old objects
+-- that died since included, have grown by the threshold scale since the last
+-- full collection kept them. Under GC stress every eighth is, so that a
+-- stressed run exercises both.
+fun fullDue() -> Bool {
+    if stress { return collections % 8 == 0 }
+    let floor = if liveBytesAfterFull > 65536 { liveBytesAfterFull } else { 65536 }
+    Prim.floatGte(Prim.intToFloat(liveBytes), Prim.floatMul(Prim.intToFloat(floor), thresholdScale))
+}
+
+-- Before a full collection's marking: no object is marked.
+fun clearMarks() -> Unit {
+    var region = regions
+    while !Prim.ptrIsNull(region) {
+        Memory.fill(Prim.ptrAdd(region, regionMarked), 8 * regionWords, 0)
+        store32(region, regionLive, 0)
+        region = Prim.loadPtr(region, regionNext)
+    }
+}
+
+-- A minor collection's other roots: the fields of every remembered object,
+-- which is marked already, being old. Each is old and not remembered after.
+fun traceRemembered() -> Unit {
+    for var i = 0; i < rememberedCount; i = plus(i, 1) {
+        let parent = Prim.loadPtr(remembered, times8(i))
+        Prim.storeI64(Prim.ptrAdd(parent, payloadHeader), headerGeneration, old)
+        if markCount == markCapacity && !growMarkStack() { return {} }
+        Prim.storePtr(markStack, times8(markCount), parent)
+        markCount = plus(markCount, 1)
+        drain()
+    }
+    rememberedCount = 0
 }
 
 -- A new epoch, so that no header needs clearing before a mark. The epoch is a
@@ -1189,6 +1243,10 @@ fun startMarking() -> Unit {
 
 -- Empty regions cost one free, however many objects they held. A survivor's
 -- marks become its allocation bitmap, so no individual header is visited.
+--
+-- The marks are kept: every survivor is old now, and an old object stays
+-- marked until a full collection clears the marks to trace everything again.
+-- A minor collection's marking starts from them, and stops at them.
 fun sweep() -> Unit {
     Memory.fill(available, 8 * regionClasses, 0)
     liveBytes = 0
@@ -1209,9 +1267,7 @@ fun sweep() -> Unit {
         } else {
             Memory.copy(Prim.ptrAdd(region, regionAllocated),
                         Prim.ptrAdd(region, regionMarked), 8 * regionWords)
-            Memory.fill(Prim.ptrAdd(region, regionMarked), 8 * regionWords, 0)
             store32(region, regionUsed, live)
-            store32(region, regionLive, 0)
             store32(region, regionSearchWord, 0)
             let cls = load32(region, regionSizeClass)
             liveBytes = liveBytes + (if cls < regionClasses {
@@ -1246,12 +1302,16 @@ fun logCollection(started : Int, liveBefore : Int, allocsSince : Int) -> Unit {
     let survived = liveBefore - freedNow
     statsFreedPrevious = statsFreedTotal
     statsClock = statsClock + nanos
-    if survived > 0 { statsTraced = statsTraced + survived }
+    -- A minor collection marks only the young survivors; the old objects were
+    -- marked already, and are not traced again.
+    let traced = if minor { survived - (liveBefore - allocsSince) } else { survived }
+    if traced > 0 { statsTraced = statsTraced + traced }
     statsLiveTotal = statsLiveTotal + heapCount
     if heapCount > statsLivePeak { statsLivePeak = heapCount }
     textLength = 0
     put(Prim.cString("[gc "))
     putInt(collections)
+    put(if minor { Prim.cString(" minor") } else { Prim.cString(" full") })
     put(Prim.cString("] allocs-since "))
     putInt(allocsSince)
     put(Prim.cString(", live-before "))
@@ -1319,7 +1379,11 @@ foreign "turkey_gc_report" fun report() -> Unit {
     putFixed(statsMarkClock, 1000000000, 3)
     put(Prim.cString(" s)\n"))
     writeLine()
-    put(Prim.cString("[gc] remembered "))
+    put(Prim.cString("[gc] minor "))
+    putInt(statsMinor)
+    put(Prim.cString(", full "))
+    putInt(collections - statsMinor)
+    put(Prim.cString(", remembered "))
     putInt(statsRemembered)
     put(Prim.cString("\n"))
     writeLine()
@@ -1477,6 +1541,10 @@ fun scaleFrom(s : Prim.Ptr) -> Float {
     if finite(value) && Prim.floatGte(value, 1.0) { value } else { fallback }
 }
 
+-- TURKEY_GC_GENERATIONAL: on if it is set to anything but 0.
+fun generationalFrom(s : Prim.Ptr) -> Bool =
+    !Prim.ptrIsNull(s) && decimalFrom(s) != 0
+
 -- TURKEY_GC_STRESS: 0 if it is unset, N if it is a decimal N of at least 1
 -- with optional surrounding whitespace, and 1 if it is anything else, which
 -- is how a flag set to "yes" still collects at every allocation. At most
@@ -1551,6 +1619,10 @@ fun snapshot() -> Prim.Ptr {
     Prim.storeI64(state, Check.stateFrameEntryCount, frameEntryCount)
     Prim.storePtr(state, Check.stateEntryStackHigh, entryStackHigh)
     Prim.storePtr(state, Check.stateRoots, roots)
+    Prim.storeI64(state, Check.stateMinor, if minor { 1 } else { 0 })
+    Prim.storeI64(state, Check.stateGenerational, if generational { 1 } else { 0 })
+    Prim.storePtr(state, Check.stateRemembered, remembered)
+    Prim.storeI64(state, Check.stateRememberedCount, rememberedCount)
     state
 }
 
@@ -1582,6 +1654,10 @@ foreign "turkey_gc_set_stress" fun setStress(enabled : Int) -> Unit {
 
 foreign "turkey_gc_set_verify" fun setVerify(enabled : Int) -> Unit {
     verify = Prim.intAnd(enabled, 4294967295) != 0
+}
+
+foreign "turkey_gc_set_generational" fun setGenerational(enabled : Int) -> Unit {
+    generational = Prim.intAnd(enabled, 4294967295) != 0
 }
 
 foreign "turkey_heap_regions" fun heapRegions() -> Prim.Ptr = regions

@@ -45,7 +45,7 @@ module Turkey.Opt (
 --
 -- ## One place that knows a node's shape
 --
--- The shape of a node is read in one place -- `kids` -- and every walk that
+-- The shape of a node is read in one place -- `anyKid` -- and every walk that
 -- only needs "the subterms" is written in terms of it. The walks that need
 -- more than that (binders, free names, tail positions) say what more they need
 -- beside their own recursion, which is where they differ from each other
@@ -123,54 +123,64 @@ let bottomInlineLimit = 1
 
 -- -- the shape of a node, once -------------------------------------------------------
 
--- Every immediate Core subterm, in field order.
-fun kids(k : CoreKind) -> Array Core = match k {
-    CLit(_) -> Array.new(0)
-    CUnit -> Array.new(0)
-    CVar(_) -> Array.new(0)
-    CCon(_) -> Array.new(0)
-    CPrim(_) -> Array.new(0)
-    CTuple(elems) -> elems
-    CArray(elems) -> elems
-    CRecord(_, fields) -> Array.map(fields, fun(f) = {
-        let (_, value) = f
-        value
-    })
-    CField(target, _) -> [target]
-    CProject(target, _) -> [target]
-    CIndex(target, index) -> [target, index]
-    CLam(_, body, _) -> [body]
-    CApp(fn, args) -> {
-        let out = [fn]
-        for a in args { Array.push(out, a) }
-        out
+-- Whether `p` holds of some immediate Core subterm, asked in field order and
+-- stopping at the first that answers true.
+--
+-- A visitor rather than a function returning the subterms as an array, which
+-- would read better and is a compromise for speed: every walk over the children
+-- is a loop, and an array returned to it escapes to the caller, so it is an
+-- allocation per node visited that no analysis removes. The closure passed here
+-- goes to a parameter that is only called, so it is built in the caller's frame.
+fun anyKid(k : CoreKind, p : fun(Core) -> Bool) -> Bool = match k {
+    CLit(_) -> False
+    CUnit -> False
+    CVar(_) -> False
+    CCon(_) -> False
+    CPrim(_) -> False
+    CTuple(elems) -> anyOf(elems, p)
+    CArray(elems) -> anyOf(elems, p)
+    CRecord(_, fields) -> {
+        for (_, value) in fields { if p(value) { return True } }
+        False
     }
-    CTyLam(_, body) -> [body]
-    CTyApp(fn, _) -> [fn]
-    CLet(_, _, value, body, _) -> [value, body]
+    CField(target, _) -> p(target)
+    CProject(target, _) -> p(target)
+    CIndex(target, index) -> p(target) || p(index)
+    CLam(_, body, _) -> p(body)
+    CApp(fn, args) -> p(fn) || anyOf(args, p)
+    CTyLam(_, body) -> p(body)
+    CTyApp(fn, _) -> p(fn)
+    CLet(_, _, value, body, _) -> p(value) || p(body)
     CLetRec(binds, body) -> {
-        let out = Array.map(binds, bindValue)
-        Array.push(out, body)
-        out
+        for b in binds { if p(bindValue(b)) { return True } }
+        p(body)
     }
-    CJoin(_, _, body, rest, _) -> [body, rest]
-    CJump(_, args) -> args
-    CRef(value) -> [value]
-    CDeref(target) -> [target]
-    CAssign(target, value) -> [target, value]
-    CIf(cond, then, otherwise) -> {
-        let out = [cond, then]
-        match otherwise {
-            Some(o) -> Array.push(out, o)
-            None -> {}
-        }
-        out
+    CJoin(_, _, body, rest, _) -> p(body) || p(rest)
+    CJump(_, args) -> anyOf(args, p)
+    CRef(value) -> p(value)
+    CDeref(target) -> p(target)
+    CAssign(target, value) -> p(target) || p(value)
+    CIf(cond, then, otherwise) -> p(cond) || p(then) || match otherwise {
+        Some(o) -> p(o)
+        None -> False
     }
     CMatch(scrutinee, alts) -> {
-        let out = [scrutinee]
-        for a in alts { Array.push(out, altBody(a)) }
-        out
+        if p(scrutinee) { return True }
+        for a in alts { if p(altBody(a)) { return True } }
+        False
     }
+}
+
+-- `f` on every immediate Core subterm, in field order.
+fun eachKid(k : CoreKind, f : fun(Core) -> Unit) -> Unit =
+    discard(anyKid(k, fun(c) {
+        f(c)
+        False
+    }))
+
+fun anyOf(xs : Array Core, p : fun(Core) -> Bool) -> Bool {
+    for x in xs { if p(x) { return True } }
+    False
 }
 
 fun withValue(b : CBind, value : Core) -> CBind = CBind {
@@ -1639,6 +1649,7 @@ fun applyNames(names : Array String, args : Array Core, body : Core,
                ty : Ty.Type) -> Option Core {
     let bound = bindersOf(body)
     let candidates = Map.new()
+    let freeOf = Map.new()
     let letters = Set.new()
     let earlier = Set.new()
     for var i = 0; i < len(names); i = i + 1 {
@@ -1647,6 +1658,7 @@ fun applyNames(names : Array String, args : Array Core, body : Core,
         if isValue(args[i]) && !Set.contains(bound, names[i])
                 && !overlaps(free, bound) {
             Map.put(candidates, names[i], args[i])
+            Map.put(freeOf, names[i], free)
         } else {
             Set.add(letters, names[i])
         }
@@ -1655,8 +1667,11 @@ fun applyNames(names : Array String, args : Array Core, body : Core,
     var settled = False
     while !settled {
         let captured = Array.new(4)
-        for (name, arg) in Map.entries(candidates) {
-            if overlaps(freeNames(arg), letters) { Array.push(captured, name) }
+        for (name, _) in Map.entries(candidates) {
+            match Map.get(freeOf, name) {
+                Some(free) -> if overlaps(free, letters) { Array.push(captured, name) }
+                None -> oops("applyNames: a candidate without its free names")
+            }
         }
         if len(captured) == 0 {
             settled = True
@@ -1849,10 +1864,10 @@ fun sizeOf_(e : Core) -> Int = match e.kind {
         total
     }
     -- A `letrec` member costs what its value costs, which is what the
-    -- recursion over `kids` already does: the wrapper itself is not code.
+    -- recursion over `eachKid` already does: the wrapper itself is not code.
     _ -> {
         var total = 1
-        for child in kids(e.kind) { total = total + sizeOf_(child) }
+        eachKid(e.kind, fun(child) { total = total + sizeOf_(child) })
         total
     }
 }
@@ -1985,10 +2000,7 @@ fun transfers(e : Core, bound : Set.Set String) -> Bool = match e.kind {
         transfers(body, if recursive { inner } else { bound })
             || transfers(rest, inner)
     }
-    _ -> {
-        for child in kids(e.kind) { if transfers(child, bound) { return True } }
-        False
-    }
+    _ -> anyKid(e.kind, transfers(_, bound))
 }
 
 -- `e` read as a saturated constructor application.
@@ -2059,7 +2071,7 @@ fun collectJumps(e : Core, name : String, shadowed : Bool,
         collectJumps(body, name, shadowed || (same && recursive), out)
         collectJumps(rest, name, shadowed || same, out)
     }
-    _ -> for child in kids(e.kind) { collectJumps(child, name, shadowed, out) }
+    _ -> eachKid(e.kind, collectJumps(_, name, shadowed, out))
 }
 
 -- Rewrite the jumps `joinJumps` would have found, where `chosen` has something
@@ -2102,8 +2114,7 @@ fun jumpsTo(e : Core, name : String) -> Bool {
         CJump(target, _) -> if target == name { return True }
         _ -> {}
     }
-    for child in kids(e.kind) { if jumpsTo(child, name) { return True } }
-    False
+    anyKid(e.kind, jumpsTo(_, name))
 }
 
 -- The term variables `e` mentions and does not itself bind.
@@ -2115,62 +2126,78 @@ fun jumpsTo(e : Core, name : String) -> Bool {
 -- a `?` builds contains `let x = ... in ...`, and `Option`'s `bind` calls its
 -- first parameter `x`, so a guard reading every mentioned name refuses to
 -- inline `bind` at all.
-fun freeNames(e : Core) -> Set.Set String = match e.kind {
-    CVar(name) -> {
-        let out = Set.new()
-        Set.add(out, name)
-        out
-    }
-    CLam(params, body, _) -> {
-        let out = freeNames(body)
-        for p in params { discard(Set.remove(out, p.name)) }
-        out
-    }
-    CLet(name, _, value, body, _) -> {
-        let out = freeNames(body)
-        discard(Set.remove(out, name))
-        for n in Set.elements(freeNames(value)) { Set.add(out, n) }
-        out
-    }
-    CLetRec(binds, body) -> {
-        let out = freeNames(body)
-        for b in binds {
-            for n in Set.elements(freeNames(bindValue(b))) { Set.add(out, n) }
-        }
-        for b in binds { discard(Set.remove(out, b.name)) }
-        out
-    }
-    CJoin(name, params, body, rest, recursive) -> {
-        let out = freeNames(body)
-        for p in params { discard(Set.remove(out, p.name)) }
-        if recursive { discard(Set.remove(out, name)) }
-        let outer = freeNames(rest)
-        discard(Set.remove(outer, name))
-        for n in Set.elements(outer) { Set.add(out, n) }
-        out
-    }
-    CMatch(scrutinee, alts) -> {
-        let out = freeNames(scrutinee)
-        for n in Set.elements(freeNamesOfAlts(alts)) { Set.add(out, n) }
-        out
-    }
-    _ -> {
-        let out = Set.new()
-        for child in kids(e.kind) {
-            for n in Set.elements(freeNames(child)) { Set.add(out, n) }
-        }
-        out
-    }
+fun freeNames(e : Core) -> Set.Set String {
+    let out = Set.new()
+    freeNamesInto(e, Map.new(), out)
+    out
 }
 
 fun freeNamesOfAlts(alts : Array CAlt) -> Set.Set String {
     let out = Set.new()
-    for CAlt { pat, body } in alts {
-        let inner = freeNames(body)
-        for name in patternVars(pat) { discard(Set.remove(inner, name)) }
-        for n in Set.elements(inner) { Set.add(out, n) }
-    }
+    freeNamesOfAltsInto(alts, Map.new(), out)
     out
+}
+
+-- Add to `out` each name `e` reads that is not bound in `scope` or inside `e`.
+--
+-- One walk and one set for the whole term: a name is hashed where it occurs,
+-- not once more for every node enclosing it. `scope` counts how many binders
+-- of each name are open around the current node, so a shadowing binder, or a
+-- pattern that yields a name twice, is closed as many times as it was opened.
+-- Every case closes what it opens, which leaves `scope` as it found it.
+fun freeNamesInto(e : Core, scope : Map String Int,
+                  out : Set.Set String) -> Unit = match e.kind {
+    CVar(name) -> if !Map.contains(scope, name) { Set.add(out, name) }
+    CLam(params, body, _) -> {
+        for p in params { enterScope(scope, p.name) }
+        freeNamesInto(body, scope, out)
+        for p in params { leaveScope(scope, p.name) }
+    }
+    CLet(name, _, value, body, _) -> {
+        freeNamesInto(value, scope, out)
+        enterScope(scope, name)
+        freeNamesInto(body, scope, out)
+        leaveScope(scope, name)
+    }
+    CLetRec(binds, body) -> {
+        for b in binds { enterScope(scope, b.name) }
+        for b in binds { freeNamesInto(bindValue(b), scope, out) }
+        freeNamesInto(body, scope, out)
+        for b in binds { leaveScope(scope, b.name) }
+    }
+    CJoin(name, params, body, rest, recursive) -> {
+        for p in params { enterScope(scope, p.name) }
+        if recursive { enterScope(scope, name) }
+        freeNamesInto(body, scope, out)
+        if recursive { leaveScope(scope, name) }
+        for p in params { leaveScope(scope, p.name) }
+        enterScope(scope, name)
+        freeNamesInto(rest, scope, out)
+        leaveScope(scope, name)
+    }
+    CMatch(scrutinee, alts) -> {
+        freeNamesInto(scrutinee, scope, out)
+        freeNamesOfAltsInto(alts, scope, out)
+    }
+    _ -> eachKid(e.kind, freeNamesInto(_, scope, out))
+}
+
+fun freeNamesOfAltsInto(alts : Array CAlt, scope : Map String Int,
+                        out : Set.Set String) -> Unit {
+    for CAlt { pat, body } in alts {
+        let vars = patternVars(pat)
+        for name in vars { enterScope(scope, name) }
+        freeNamesInto(body, scope, out)
+        for name in vars { leaveScope(scope, name) }
+    }
+}
+
+fun enterScope(scope : Map String Int, name : String) -> Unit =
+    Map.put(scope, name, Map.getOr(scope, name, 0) + 1)
+
+fun leaveScope(scope : Map String Int, name : String) -> Unit {
+    let n = Map.getOr(scope, name, 0)
+    if n <= 1 { discard(Map.delete(scope, name)) } else { Map.put(scope, name, n - 1) }
 }
 
 fun namesOfAlts(alts : Array CAlt) -> Set.Set String {
@@ -2185,7 +2212,7 @@ fun namesOfAlts(alts : Array CAlt) -> Set.Set String {
 -- but binds nothing on the path to an occurrence only costs a substitution this
 -- pass declines to make. The cases are spelled out per node kind, so a node
 -- kind that binds a name and is forgotten here is one this pass may substitute
--- into wrongly; `kids` is what keeps the recursion from being
+-- into wrongly; `eachKid` is what keeps the recursion from being
 -- one of them.
 fun bindersOf(e : Core) -> Set.Set String {
     let out = Set.new()
@@ -2207,7 +2234,7 @@ fun bindersInto(e : Core, out : Set.Set String) -> Unit {
         }
         _ -> {}
     }
-    for child in kids(e.kind) { bindersInto(child, out) }
+    eachKid(e.kind, bindersInto(_, out))
 }
 
 fun overlaps(a : Set.Set String, b : Set.Set String) -> Bool {

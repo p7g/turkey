@@ -617,6 +617,10 @@ fun localBinding(l : Lower, name : String, bound : Core) -> Value {
     value(l, bound)
 }
 
+fun isMarker(l : Lower, v : Value) -> Bool =
+    Map.contains(l.localRefs, Ssa.valueId(v))
+        || Map.contains(l.localRecords, Ssa.valueId(v))
+
 fun localSlot(l : Lower, v : Value) -> (Int, Rep) {
     let slot = l.nextSlot
     l.nextSlot = slot + 1
@@ -1497,10 +1501,19 @@ fun capturesOf(l : Lower, body : Core,
             Array.push(out, (name, Ssa.traced(Ptr)))
         } else {
             match Map.get(l.env, name) {
+                -- A flattened `var` or record is a marker, never emitted, and
+                -- capturing one is a use of an undefined value. None is free
+                -- here: `LocalEscape` keeps any binding a closure mentions free
+                -- on the heap, and reads scope to decide it. So a marker found
+                -- by name belongs to an outer binding the body rebinds: inlining
+                -- makes one whenever a callee's pattern binder is spelled like
+                -- a `var` of the caller the closure sits in.
+                --
                 -- A `unit` holds nothing and `lift` makes the child its own;
                 -- the 63-slot cap makes that worth doing rather than merely
                 -- tidy.
-                Some(v) -> if Ssa.repOf(l.func, v).class_ != Unit {
+                Some(v) -> if !isMarker(l, v)
+                        && Ssa.repOf(l.func, v).class_ != Unit {
                     Array.push(out, (name, Ssa.repOf(l.func, v)))
                 }
                 None -> {}

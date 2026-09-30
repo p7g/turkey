@@ -349,10 +349,8 @@ fun walk(f : Func A.Inst, spills : Spills, evict : Bool) -> Walk {
             for id in after[n] {
                 if w.of_[id] >= 0 { Map.put(live, key(f, id, w.of_[id]), id) }
             }
-            for d in Ssa.defs(block.insts[n]) {
-                let did = Ssa.valueId(d)
-                place(w, live, did, block, n + 1)
-            }
+            Ssa.eachDef(block.insts[n], fun(d) =
+                place(w, live, Ssa.valueId(d), block, n + 1))
         }
     }
     w
@@ -527,9 +525,7 @@ fun victim(w : Walk, taken : Map RegKey Int, bank : Bank,
 -- and two past if the block never does (it is live out, or dead).
 fun nextUse(block : Ssa.Block A.Inst, id : Int, from : Int) -> Int {
     for var n = from; n < len(block.insts); n = n + 1 {
-        for u in Ssa.uses(block.insts[n]) {
-            if Ssa.valueId(u) == id { return n }
-        }
+        if Ssa.anyUse(block.insts[n], fun(u) = Ssa.valueId(u) == id) { return n }
     }
     for u in Ssa.termUses(block.term) {
         if Ssa.valueId(u) == id { return len(block.insts) }
@@ -609,13 +605,11 @@ fun forbid(mask : Int, n : Int) -> Int = Int.or(mask, Int.shl(1, n))
 -- repeats: a definition may be live after, and an instruction defines one or
 -- two values, so a scan finds it.
 fun touched(i : A.Inst, after : Array Int) -> Array Int {
-    let defined = Ssa.defs(i)
-    if len(defined) == 0 { return after }
     let out = Array.slice(after, 0, len(after))
-    for d in defined {
+    Ssa.eachDef(i, fun(d) {
         let id = Ssa.valueId(d)
         if !Array.contains(out, id) { Array.push(out, id) }
-    }
+    })
     out
 }
 
@@ -645,20 +639,16 @@ fun physicalLive(block : Ssa.Block A.Inst) -> (Array PhysicalLive, PhysicalLive)
             sets[n] = PhysicalLive { gp = BitSet.elements(gp), fp = BitSet.elements(fp) }
         }
         let op = block.insts[n].op
-        for r in A.destRegs(op) {
-            match r {
-                Physical(Gp, k) -> { let _ = BitSet.remove(gp, k) }
-                Physical(Fp, k) -> { let _ = BitSet.remove(fp, k) }
-                Virtual(_) -> {}
-            }
-        }
-        for r in A.srcRegs(op) {
-            match r {
-                Physical(Gp, k) -> if k != 31 && k != 29 { BitSet.add(gp, k) }
-                Physical(Fp, k) -> BitSet.add(fp, k)
-                Virtual(_) -> {}
-            }
-        }
+        A.eachDest(op, fun(r) = match r {
+            Physical(Gp, k) -> { let _ = BitSet.remove(gp, k) }
+            Physical(Fp, k) -> { let _ = BitSet.remove(fp, k) }
+            Virtual(_) -> {}
+        })
+        A.eachSrc(op, fun(r) = match r {
+            Physical(Gp, k) -> if k != 31 && k != 29 { BitSet.add(gp, k) }
+            Physical(Fp, k) -> BitSet.add(fp, k)
+            Virtual(_) -> {}
+        })
     }
     (sets, PhysicalLive { gp = BitSet.elements(gp), fp = BitSet.elements(fp) })
 }
@@ -674,7 +664,7 @@ fun sameBank(a : Bank, b : Bank) -> Bool = match (a, b) {
 -- files, which the callee is free to use.
 fun clobbersOf(i : A.Inst) -> Array (Bank, Int) {
     let out : Array (Bank, Int) = []
-    for r in A.destRegs(i.op) { pushPhysical(out, r) }
+    A.eachDest(i.op, pushPhysical(out, _))
     if A.isCall(i) {
         for r in A.callerSaved { pushPhysical(out, r) }
         for r in A.fpCallerSaved { pushPhysical(out, r) }
@@ -1021,7 +1011,8 @@ fun spill(g : Func A.Inst, ids : Set.Set Int, roots : Map Int Int,
                 op = A.mapUses(op, renamed(_, id, t))
             }
             Array.push(out, A.Inst { op = op })
-            for d in Ssa.defs(i) { storeIfSpilled(out, spills, ids, Ssa.valueId(d)) }
+            Ssa.eachDef(i, fun(d) =
+                storeIfSpilled(out, spills, ids, Ssa.valueId(d)))
         }
         var term = block.term
         for id in Array.sort(Set.elements(usedSpilled(Ssa.termUses(term), ids))) {
@@ -1126,7 +1117,7 @@ fun verifyAllocation(a : Allocation) -> Array String {
         }
         for var n = 0; n < len(block.insts); n = n + 1 {
             let op = block.insts[n].op
-            for u in Ssa.uses(block.insts[n]) {
+            Ssa.eachUse(block.insts[n], fun(u) {
                 let id = Ssa.valueId(u)
                 if Map.contains(spills.slots, id) {
                     checkStore(out, spills, block, definers, b, n, id)
@@ -1135,7 +1126,7 @@ fun verifyAllocation(a : Allocation) -> Array String {
                     Some(_) -> checkReloadUse(out, block, b, n, id)
                     None -> {}
                 }
-            }
+            })
             for u in Ssa.termUses(block.term) {
                 if n == len(block.insts) - 1 {
                     match Map.get(spills.reloadOf, Ssa.valueId(u)) {
@@ -1190,8 +1181,11 @@ fun checkStore(out : Array String, spills : Spills, block : Ssa.Block A.Inst,
     }
     var m = n - 1
     while m >= 0 && isStore(block.insts[m].op) { m = m - 1 }
-    let defined = if m >= 0 { mentions(Ssa.defs(block.insts[m]), id) }
-                  else { mentions(definers, id) }
+    let defined = if m >= 0 {
+        Ssa.anyDef(block.insts[m], fun(d) = Ssa.valueId(d) == id)
+    } else {
+        mentions(definers, id)
+    }
     if !defined {
         Array.push(out, "the store of %" + Int.toString(id) + " at " + where_(b, n)
                         + " is not directly after its definition")

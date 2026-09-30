@@ -1,6 +1,6 @@
 module Turkey.Arm64 (
     Reg(..), Bank(..), reg, physical, isPhysical, bankOf, Cond(..), Width(..),
-    Mem(..), Arm(..), Inst(..), destRegs, srcRegs, mapUses, rewrite, setsFlags, isSlot, isRootSlot, isFrameAddress, slotLoad, slotStore, isCSet, csetOf, redundantMove,
+    Mem(..), Arm(..), Inst(..), anyDest, anySrc, eachDest, eachSrc, mapUses, rewrite, setsFlags, isSlot, isRootSlot, isFrameAddress, slotLoad, slotStore, isCSet, csetOf, redundantMove,
     sameRegister, moveHint, safepointOf, memOf,
     xzr, sp, fp, lr, x0, d0, argRegs, fpArgRegs, callerSaved, calleeSaved,
     fpCallerSaved, fpCalleeSaved, showReg, condName, invert, isCall,
@@ -296,8 +296,8 @@ type Arm
 type Inst = Inst { op : Arm }
 
 instance Ssa.Inst Inst {
-    fun uses(i) = usesOf(i.op)
-    fun defs(i) = defsOf(i.op)
+    fun anyUse(i, p) = anySrc(i.op, virtual(_, p))
+    fun anyDef(i, p) = anyDest(i.op, virtual(_, p))
     fun effects(i) = if computes(i.op) { Ssa.reads_() } else { Ssa.writes() }
     fun renameUses(i, f) = Inst { op = mapUses(i.op, fun(r) = match r {
         Virtual(n) -> reg(f(Value(n)))
@@ -477,82 +477,103 @@ fun isCall(i : Inst) -> Bool = match i.op {
     _ -> False
 }
 
--- The `Value` ids an instruction reads: `srcRegs` with the physical registers
--- dropped, which is what liveness and the verifier want.
-fun usesOf(op : Arm) -> Array Value = virtualOf(srcRegs(op))
-
--- The registers an instruction *reads*, physical ones included.
+-- `p` asked of a register only if it is virtual: the values an instruction
+-- reads and writes, as liveness and the verifier see them.
 --
--- The mirror of `destRegs`, and wanted for the mirror reason. The allocator
+-- The binder's name is not arbitrary. This is inlined into closures all over
+-- the backend, and the compiler in `bootstrap/`, which builds this one,
+-- captures a pattern binder spelled like a `var` of the enclosing function as
+-- that `var` -- a use of an undefined value when the `var` lives in a slot.
+-- `SsaLower.capturesOf` skips such a binder; until `bootstrap/` is rebuilt
+-- from a compiler that does, no caller may have a `var number`.
+fun virtual(r : Reg, p : fun(Value) -> Bool) -> Bool = match r {
+    Virtual(number) -> p(Value(number))
+    _ -> False
+}
+
+-- Whether `p` holds of some register an instruction *reads*, physical ones
+-- included, asked in operand order and stopping at the first that answers
+-- true.
+--
+-- This and `anyDest` are visitors rather than functions returning an array
+-- of registers, which would read better; that is a compromise for speed.
+-- Every pass from liveness to the allocator asks this of every instruction,
+-- often more than once, and a returned array escapes to its caller, so it is
+-- an allocation per question that no analysis removes. The closure passed
+-- here goes to a parameter that is only called, so it is built in the
+-- caller's frame.
+--
+-- The physical registers are the mirror of `anyDest`'s, and wanted for the
+-- mirror reason. The allocator
 -- knew what a `mov x0, %5` destroys but not that `x0` is then *live* until the
 -- `bl` reads it -- so a value defined in between could have been given `x0`
 -- and overwritten the argument. Selection never defines one there, which is
 -- why nothing broke; a spiller's reload in front of `mov x1, %6` is exactly
 -- such a value.
-fun srcRegs(op : Arm) -> Array Reg = match op {
-    Mov(_, a, _)        -> [a]
-    MovZ(_, _, _)       -> []
-    MovK(d, _, _)       -> [d]
-    Add(_, a, b, _)     -> [a, b]
-    AddImm(_, a, _, _)  -> [a]
-    AddS(_, a, b, _)    -> [a, b]
-    Sub(_, a, b, _)     -> [a, b]
-    SubImm(_, a, _, _)  -> [a]
-    SubS(_, a, b, _)    -> [a, b]
-    AddSImm(_, a, _, _) -> [a]
-    SubSImm(_, a, _, _) -> [a]
-    Mul(_, a, b, _)     -> [a, b]
-    SMulH(_, a, b)      -> [a, b]
-    SDiv(_, a, b, _)    -> [a, b]
-    MSub(_, a, b, c, _) -> [a, b, c]
-    And(_, a, b, _)     -> [a, b]
-    Orr(_, a, b, _)     -> [a, b]
-    Eor(_, a, b, _)     -> [a, b]
-    EorImm(_, a, _, _)  -> [a]
-    AndImm(_, a, _, _)  -> [a]
-    LslImm(_, a, _, _)  -> [a]
-    LsrImm(_, a, _, _)  -> [a]
-    AsrImm(_, a, _, _)  -> [a]
-    Lsl(_, a, b, _)     -> [a, b]
-    Lsr(_, a, b, _)     -> [a, b]
-    Asr(_, a, b, _)     -> [a, b]
-    Cmp(a, b, _)        -> [a, b]
-    CmpImm(a, _, _)     -> [a]
-    CSet(_, _)          -> []
-    Sxtw(_, a)          -> [a]
-    Uxtb(_, a)          -> [a]
-    Uxth(_, a)          -> [a]
-    Ubfx(_, a, _, _)    -> [a]
-    Ldr(_, m, _)        -> memRegs(m)
-    Ldrb(_, m)          -> memRegs(m)
-    Ldrsw(_, m)         -> memRegs(m)
-    Str(v, m, _)        -> Array.append([v], memRegs(m))
-    Strb(v, m)          -> Array.append([v], memRegs(m))
-    Stp(a, b, base, _)  -> [a, b, base]
-    Ldp(_, _, base, _)  -> [base]
-    Adrp(_, _)          -> []
-    AddLo(_, a, _)      -> [a]
-    FrameAddress(_, m)  -> memRegs(m)
-    MovConst(_, _)      -> []
-    FMov(_, a)          -> [a]
-    FMovIn(_, a)        -> [a]
-    FMovOut(_, a)       -> [a]
-    FAdd(_, a, b)       -> [a, b]
-    FSub(_, a, b)       -> [a, b]
-    FMul(_, a, b)       -> [a, b]
-    FDiv(_, a, b)       -> [a, b]
-    FNeg(_, a)          -> [a]
-    FCmp(a, b)          -> [a, b]
-    Scvtf(_, a)         -> [a]
-    Fcvtzs(_, a)        -> [a]
-    Bl(_)               -> []
-    Blr(a)              -> [a]
-    CallArgs(ins, _)    -> ins
-    SafepointMap(_, _)  -> []
-    Ret                 -> []
-    B(_)                -> []
-    BCond(_, _)         -> []
-    Brk(_)              -> []
+fun anySrc(op : Arm, p : fun(Reg) -> Bool) -> Bool = match op {
+    Mov(_, a, _)        -> p(a)
+    MovZ(_, _, _)       -> False
+    MovK(d, _, _)       -> p(d)
+    Add(_, a, b, _)     -> p(a) || p(b)
+    AddImm(_, a, _, _)  -> p(a)
+    AddS(_, a, b, _)    -> p(a) || p(b)
+    Sub(_, a, b, _)     -> p(a) || p(b)
+    SubImm(_, a, _, _)  -> p(a)
+    SubS(_, a, b, _)    -> p(a) || p(b)
+    AddSImm(_, a, _, _) -> p(a)
+    SubSImm(_, a, _, _) -> p(a)
+    Mul(_, a, b, _)     -> p(a) || p(b)
+    SMulH(_, a, b)      -> p(a) || p(b)
+    SDiv(_, a, b, _)    -> p(a) || p(b)
+    MSub(_, a, b, c, _) -> p(a) || p(b) || p(c)
+    And(_, a, b, _)     -> p(a) || p(b)
+    Orr(_, a, b, _)     -> p(a) || p(b)
+    Eor(_, a, b, _)     -> p(a) || p(b)
+    EorImm(_, a, _, _)  -> p(a)
+    AndImm(_, a, _, _)  -> p(a)
+    LslImm(_, a, _, _)  -> p(a)
+    LsrImm(_, a, _, _)  -> p(a)
+    AsrImm(_, a, _, _)  -> p(a)
+    Lsl(_, a, b, _)     -> p(a) || p(b)
+    Lsr(_, a, b, _)     -> p(a) || p(b)
+    Asr(_, a, b, _)     -> p(a) || p(b)
+    Cmp(a, b, _)        -> p(a) || p(b)
+    CmpImm(a, _, _)     -> p(a)
+    CSet(_, _)          -> False
+    Sxtw(_, a)          -> p(a)
+    Uxtb(_, a)          -> p(a)
+    Uxth(_, a)          -> p(a)
+    Ubfx(_, a, _, _)    -> p(a)
+    Ldr(_, m, _)        -> anyMem(m, p)
+    Ldrb(_, m)          -> anyMem(m, p)
+    Ldrsw(_, m)         -> anyMem(m, p)
+    Str(v, m, _)        -> p(v) || anyMem(m, p)
+    Strb(v, m)          -> p(v) || anyMem(m, p)
+    Stp(a, b, base, _)  -> p(a) || p(b) || p(base)
+    Ldp(_, _, base, _)  -> p(base)
+    Adrp(_, _)          -> False
+    AddLo(_, a, _)      -> p(a)
+    FrameAddress(_, m)  -> anyMem(m, p)
+    MovConst(_, _)      -> False
+    FMov(_, a)          -> p(a)
+    FMovIn(_, a)        -> p(a)
+    FMovOut(_, a)       -> p(a)
+    FAdd(_, a, b)       -> p(a) || p(b)
+    FSub(_, a, b)       -> p(a) || p(b)
+    FMul(_, a, b)       -> p(a) || p(b)
+    FDiv(_, a, b)       -> p(a) || p(b)
+    FNeg(_, a)          -> p(a)
+    FCmp(a, b)          -> p(a) || p(b)
+    Scvtf(_, a)         -> p(a)
+    Fcvtzs(_, a)        -> p(a)
+    Bl(_)               -> False
+    Blr(a)              -> p(a)
+    CallArgs(ins, _)    -> anyIn(ins, p)
+    SafepointMap(_, _)  -> False
+    Ret                 -> False
+    B(_)                -> False
+    BCond(_, _)         -> False
+    Brk(_)              -> False
 }
 
 
@@ -560,7 +581,7 @@ fun srcRegs(op : Arm) -> Array Reg = match op {
 -- the registers it writes left alone.
 --
 -- The spiller's one rewrite: a reload is a fresh value, and the instruction
--- that used the spilled one reads the reload instead. Derived from `srcRegs`
+-- that used the spilled one reads the reload instead. Derived from `anySrc`
 -- position by position so that the two cannot disagree about which operand is
 -- a read. `MovK` is the exception and is left untouched -- it reads the
 -- register it writes, so renaming the read would rename the write -- and
@@ -718,104 +739,111 @@ fun rewrite(op : Arm, g : fun(Reg) -> Reg, m : fun(Mem) -> Mem) -> Arm = match o
     Brk(f0)                  -> Brk(f0)
 }
 
--- The registers an instruction *writes*, physical ones included.
+-- Whether `p` holds of some register an instruction *writes*, physical ones
+-- included; a visitor for the reason `anySrc` gives.
 --
--- `defsOf` is this filtered to the virtual ones, which is what liveness and
+-- `anyDef` is this filtered to the virtual ones, which is what liveness and
 -- the verifier want. The allocator wants the unfiltered answer: a `mov x0, %5`
 -- before a call writes a real `x0`, and any value the allocator has put in
 -- `x0` and needs after that instruction has just been destroyed. Deriving both
 -- from one match is the point -- a second sixty-armed `match` listing the same
 -- destinations is exactly the kind of duplication that drifts.
-fun destRegs(op : Arm) -> Array Reg = match op {
-    Mov(d, _, _)        -> [d]
-    MovZ(d, _, _)       -> [d]
-    MovK(d, _, _)       -> [d]
-    Add(d, _, _, _)     -> [d]
-    AddImm(d, _, _, _)  -> [d]
-    AddS(d, _, _, _)    -> [d]
-    Sub(d, _, _, _)     -> [d]
-    SubImm(d, _, _, _)  -> [d]
-    SubS(d, _, _, _)    -> [d]
-    AddSImm(d, _, _, _) -> [d]
-    SubSImm(d, _, _, _) -> [d]
-    Mul(d, _, _, _)     -> [d]
-    SMulH(d, _, _)      -> [d]
-    SDiv(d, _, _, _)    -> [d]
-    MSub(d, _, _, _, _) -> [d]
-    And(d, _, _, _)     -> [d]
-    Orr(d, _, _, _)     -> [d]
-    Eor(d, _, _, _)     -> [d]
-    EorImm(d, _, _, _)  -> [d]
-    AndImm(d, _, _, _)  -> [d]
-    LslImm(d, _, _, _)  -> [d]
-    LsrImm(d, _, _, _)  -> [d]
-    AsrImm(d, _, _, _)  -> [d]
-    Lsl(d, _, _, _)     -> [d]
-    Lsr(d, _, _, _)     -> [d]
-    Asr(d, _, _, _)     -> [d]
-    Cmp(_, _, _)        -> []
-    CmpImm(_, _, _)     -> []
-    CSet(d, _)          -> [d]
-    Sxtw(d, _)          -> [d]
-    Uxtb(d, _)          -> [d]
-    Uxth(d, _)          -> [d]
-    Ubfx(d, _, _, _)    -> [d]
-    Ldr(d, _, _)        -> [d]
-    Ldrb(d, _)          -> [d]
-    Ldrsw(d, _)         -> [d]
-    Str(_, _, _)        -> []
-    Strb(_, _)          -> []
-    Stp(_, _, _, _)     -> []
-    Ldp(a, b, _, _)     -> [a, b]
-    Adrp(d, _)          -> [d]
-    AddLo(d, _, _)      -> [d]
-    FrameAddress(d, _)  -> [d]
-    MovConst(d, _)      -> [d]
-    FMov(d, _)          -> [d]
-    FMovIn(d, _)        -> [d]
-    FMovOut(d, _)       -> [d]
-    FAdd(d, _, _)       -> [d]
-    FSub(d, _, _)       -> [d]
-    FMul(d, _, _)       -> [d]
-    FDiv(d, _, _)       -> [d]
-    FNeg(d, _)          -> [d]
+fun anyDest(op : Arm, p : fun(Reg) -> Bool) -> Bool = match op {
+    Mov(d, _, _)        -> p(d)
+    MovZ(d, _, _)       -> p(d)
+    MovK(d, _, _)       -> p(d)
+    Add(d, _, _, _)     -> p(d)
+    AddImm(d, _, _, _)  -> p(d)
+    AddS(d, _, _, _)    -> p(d)
+    Sub(d, _, _, _)     -> p(d)
+    SubImm(d, _, _, _)  -> p(d)
+    SubS(d, _, _, _)    -> p(d)
+    AddSImm(d, _, _, _) -> p(d)
+    SubSImm(d, _, _, _) -> p(d)
+    Mul(d, _, _, _)     -> p(d)
+    SMulH(d, _, _)      -> p(d)
+    SDiv(d, _, _, _)    -> p(d)
+    MSub(d, _, _, _, _) -> p(d)
+    And(d, _, _, _)     -> p(d)
+    Orr(d, _, _, _)     -> p(d)
+    Eor(d, _, _, _)     -> p(d)
+    EorImm(d, _, _, _)  -> p(d)
+    AndImm(d, _, _, _)  -> p(d)
+    LslImm(d, _, _, _)  -> p(d)
+    LsrImm(d, _, _, _)  -> p(d)
+    AsrImm(d, _, _, _)  -> p(d)
+    Lsl(d, _, _, _)     -> p(d)
+    Lsr(d, _, _, _)     -> p(d)
+    Asr(d, _, _, _)     -> p(d)
+    Cmp(_, _, _)        -> False
+    CmpImm(_, _, _)     -> False
+    CSet(d, _)          -> p(d)
+    Sxtw(d, _)          -> p(d)
+    Uxtb(d, _)          -> p(d)
+    Uxth(d, _)          -> p(d)
+    Ubfx(d, _, _, _)    -> p(d)
+    Ldr(d, _, _)        -> p(d)
+    Ldrb(d, _)          -> p(d)
+    Ldrsw(d, _)         -> p(d)
+    Str(_, _, _)        -> False
+    Strb(_, _)          -> False
+    Stp(_, _, _, _)     -> False
+    Ldp(a, b, _, _)     -> p(a) || p(b)
+    Adrp(d, _)          -> p(d)
+    AddLo(d, _, _)      -> p(d)
+    FrameAddress(d, _)  -> p(d)
+    MovConst(d, _)      -> p(d)
+    FMov(d, _)          -> p(d)
+    FMovIn(d, _)        -> p(d)
+    FMovOut(d, _)       -> p(d)
+    FAdd(d, _, _)       -> p(d)
+    FSub(d, _, _)       -> p(d)
+    FMul(d, _, _)       -> p(d)
+    FDiv(d, _, _)       -> p(d)
+    FNeg(d, _)          -> p(d)
     -- `fcmp` writes the flags and no register, which is exactly why the guard
     -- that reads it has to stay adjacent.
-    FCmp(_, _)          -> []
-    Scvtf(d, _)         -> [d]
-    Fcvtzs(d, _)        -> [d]
-    Bl(_)               -> []
-    Blr(_)              -> []
-    CallArgs(_, outs)   -> outs
-    SafepointMap(_, _)  -> []
-    Ret                 -> []
-    B(_)                -> []
-    BCond(_, _)         -> []
-    Brk(_)              -> []
+    FCmp(_, _)          -> False
+    Scvtf(d, _)         -> p(d)
+    Fcvtzs(d, _)        -> p(d)
+    Bl(_)               -> False
+    Blr(_)              -> False
+    CallArgs(_, outs)   -> anyIn(outs, p)
+    SafepointMap(_, _)  -> False
+    Ret                 -> False
+    B(_)                -> False
+    BCond(_, _)         -> False
+    Brk(_)              -> False
 }
 
-fun defsOf(op : Arm) -> Array Value = virtualOf(destRegs(op))
-
-
-fun virtualOf(rs : Array Reg) -> Array Value {
-    let out = []
-    for r in rs {
-        if let Virtual(n) = r {
-            Array.push(out, Value(n))
-        }
-    }
-    out
+fun eachSrc(op : Arm, f : fun(Reg) -> Unit) -> Unit {
+    let _ = anySrc(op, fun(r) {
+        f(r)
+        False
+    })
 }
 
-fun memRegs(m : Mem) -> Array Reg = match m {
-    Offset(base, _)      -> [base]
-    Indexed(base, index) -> [base, index]
-    RootSlot(_)          -> []
-    SpillSlot(_)         -> []
-    ObjectSlot(_, _)     -> []
-    IncomingArg(_)       -> []
-    OutgoingArg(_)       -> []
-    PageOffset(base, _)  -> [base]
+fun eachDest(op : Arm, f : fun(Reg) -> Unit) -> Unit {
+    let _ = anyDest(op, fun(r) {
+        f(r)
+        False
+    })
+}
+
+fun anyMem(m : Mem, p : fun(Reg) -> Bool) -> Bool = match m {
+    Offset(base, _)      -> p(base)
+    Indexed(base, index) -> p(base) || p(index)
+    RootSlot(_)          -> False
+    SpillSlot(_)         -> False
+    ObjectSlot(_, _)     -> False
+    IncomingArg(_)       -> False
+    OutgoingArg(_)       -> False
+    PageOffset(base, _)  -> p(base)
+}
+
+fun anyIn(rs : Array Reg, p : fun(Reg) -> Bool) -> Bool {
+    for r in rs { if p(r) { return True } }
+    False
 }
 
 -- -- printing -----------------------------------------------------------------------

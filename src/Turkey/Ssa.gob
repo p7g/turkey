@@ -5,7 +5,7 @@ module Turkey.Ssa (
     isSafepoint, deletable,
     Term(..), successors,
     Block(..), newBlock, Func(..), newFunc,
-    Inst(..),
+    Inst(..), eachUse, eachDef,
     freshValue, repOf, blockAt,
     predecessors, reversePostorder, dominators, dominates,
     verify, showFunc,
@@ -291,8 +291,17 @@ fun blockAt(f : Func i, b : BlockId) -> Block i = f.blocks[blockId(b)]
 -- instruction is not a backend concept, and an instruction that could not be
 -- shown would be one nothing could debug.
 class Inst i : Show i {
-    fun uses(i) -> Array Value
-    fun defs(i) -> Array Value
+    -- Whether the function holds of some value the instruction reads, or
+    -- defines, asked in operand order and stopping at the first that answers
+    -- true. Visitors rather than arrays, which would read better, as a
+    -- compromise for speed: every pass asks this of every instruction, and a
+    -- returned array escapes to its caller, so it is an allocation per
+    -- question that no analysis removes. `eachUse` and `eachDef` are the loops.
+    fun anyUse(i, fun(Value) -> Bool) -> Bool
+    fun anyDef(i, fun(Value) -> Bool) -> Bool
+    -- The same values as arrays, for a caller that keeps them.
+    fun uses(inst : i) -> Array Value = collect(anyUse(inst, _))
+    fun defs(inst : i) -> Array Value = collect(anyDef(inst, _))
     fun effects(i) -> Effects
     -- The same instruction with every value it reads passed through the
     -- function. What it defines is unchanged.
@@ -301,6 +310,29 @@ class Inst i : Show i {
     -- by the source everywhere. An instantiation answers `None` for anything it
     -- does not want renamed, including a copy between representations.
     fun copyOf(i) -> Option (Value, Value)
+}
+
+fun eachUse[Inst i](i : i, f : fun(Value) -> Unit) -> Unit {
+    let _ = anyUse(i, fun(v) {
+        f(v)
+        False
+    })
+}
+
+fun eachDef[Inst i](i : i, f : fun(Value) -> Unit) -> Unit {
+    let _ = anyDef(i, fun(v) {
+        f(v)
+        False
+    })
+}
+
+fun collect(visit : fun(fun(Value) -> Bool) -> Bool) -> Array Value {
+    let out = []
+    let _ = visit(fun(v) {
+        Array.push(out, v)
+        False
+    })
+    out
 }
 
 -- -- traversal and dominance --------------------------------------------------------
@@ -491,9 +523,7 @@ fun verify[Inst i](f : Func i) -> Array String {
     for var b = 0; b < count; b = b + 1 {
         for v in f.blocks[b].params { define(out, f, defBlock, defAt, v, b, -1) }
         for var n = 0; n < len(f.blocks[b].insts); n = n + 1 {
-            for v in defs(f.blocks[b].insts[n]) {
-                define(out, f, defBlock, defAt, v, b, n)
-            }
+            eachDef(f.blocks[b].insts[n], define(out, f, defBlock, defAt, _, b, n))
         }
     }
 
@@ -511,9 +541,8 @@ fun verify[Inst i](f : Func i) -> Array String {
         if !Set.contains(live, b) { continue }
         let block = f.blocks[b]
         for var n = 0; n < len(block.insts); n = n + 1 {
-            for v in uses(block.insts[n]) {
-                checkUse(out, f, idom, defBlock, defAt, v, b, n)
-            }
+            eachUse(block.insts[n],
+                    checkUse(out, f, idom, defBlock, defAt, _, b, n))
         }
         checkTerm(out, f, idom, defBlock, defAt, b, block.term)
     }
@@ -731,12 +760,11 @@ fun livenessInOut[Inst i](f : Func i)
                 Set.add(entering, valueId(v))
             }
             for var n = len(f.blocks[b].insts) - 1; n >= 0; n = n - 1 {
-                for v in defs(f.blocks[b].insts[n]) {
+                eachDef(f.blocks[b].insts[n], fun(v) {
                     let _ = Set.remove(entering, valueId(v))
-                }
-                for v in uses(f.blocks[b].insts[n]) {
-                    Set.add(entering, valueId(v))
-                }
+                })
+                eachUse(f.blocks[b].insts[n], fun(v) =
+                    Set.add(entering, valueId(v)))
             }
             for p in f.blocks[b].params { let _ = Set.remove(entering, valueId(p)) }
             if len(entering) != len(liveIn[b]) || len(out) != len(liveOut[b]) {
@@ -779,8 +807,10 @@ fun liveAfter[Inst i](f : Func i, at : BlockId,
     for v in termUses(block.term) { Set.add(live, valueId(v)) }
     for var n = len(block.insts) - 1; n >= 0; n = n - 1 {
         sets[n] = Set.elements(live)
-        for v in defs(block.insts[n]) { let _ = Set.remove(live, valueId(v)) }
-        for v in uses(block.insts[n]) { Set.add(live, valueId(v)) }
+        eachDef(block.insts[n], fun(v) {
+            let _ = Set.remove(live, valueId(v))
+        })
+        eachUse(block.insts[n], fun(v) = Set.add(live, valueId(v)))
     }
     sets
 }

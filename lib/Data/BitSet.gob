@@ -1,0 +1,124 @@
+module Data.BitSet (BitSet, new, add, remove, contains, isEmpty, clear,
+                    unionInto, copyFrom, equal, elements)
+
+import Prelude ()
+import Std.Classes
+import Data.Array as Array
+import Data.Array (Array)
+import Data.Bool (Bool(..))
+import Data.Int as Int
+
+-- A set of the integers `0 .. capacity - 1`, one bit each, in 64-bit words.
+--
+-- The capacity is fixed when the set is made, and the set costs a bit for
+-- every integer it could hold whether or not it holds it. That is the right
+-- trade where the elements are dense small indices -- the ids of one
+-- function's values -- and the wrong one for a sparse or unbounded set, which
+-- is what `Data.Set` is for. An element outside the capacity panics, rounded
+-- up to a whole word: the words are all there is to check against.
+--
+-- Bit `n % 64` of word `n / 64` holds `n`, so bit 63 is a word's sign bit.
+-- Nothing here reads a word as a number, only as bits, and the one arithmetic
+-- shift is masked back to six bits.
+type BitSet = BitSet(Array Int)
+
+fun new(capacity : Int) -> BitSet = BitSet(Array.filled((capacity + 63) / 64, 0))
+
+fun bit(n : Int) -> Int = Int.shl(1, Int.and(n, 63))
+
+fun add(BitSet(words) : BitSet, n : Int) -> Unit {
+    let w = Int.shr(n, 6)
+    words[w] = Int.or(words[w], bit(n))
+}
+
+-- Returns True if the element was present.
+fun remove(BitSet(words) : BitSet, n : Int) -> Bool {
+    let w = Int.shr(n, 6)
+    let had = Int.and(words[w], bit(n)) != 0
+    if had { words[w] = Int.xor(words[w], bit(n)) }
+    had
+}
+
+fun contains(BitSet(words) : BitSet, n : Int) -> Bool =
+    Int.and(words[Int.shr(n, 6)], bit(n)) != 0
+
+fun isEmpty(BitSet(words) : BitSet) -> Bool {
+    for w in words {
+        if w != 0 { return False }
+    }
+    True
+}
+
+fun clear(BitSet(words) : BitSet) -> Unit {
+    for var i = 0; i < len(words); i = i + 1 { words[i] = 0 }
+}
+
+-- Adds every element of `from` to `into`, and says whether that added any.
+-- The two must have the same capacity.
+fun unionInto(BitSet(into) : BitSet, BitSet(from) : BitSet) -> Bool {
+    var changed = False
+    for var i = 0; i < len(into); i = i + 1 {
+        let merged = Int.or(into[i], from[i])
+        if merged != into[i] {
+            into[i] = merged
+            changed = True
+        }
+    }
+    changed
+}
+
+-- Makes `into` hold exactly the elements of `from`, of the same capacity.
+fun copyFrom(BitSet(into) : BitSet, BitSet(from) : BitSet) -> Unit {
+    for var i = 0; i < len(into); i = i + 1 { into[i] = from[i] }
+}
+
+-- Of two sets of the same capacity.
+fun equal(BitSet(a) : BitSet, BitSet(b) : BitSet) -> Bool {
+    for var i = 0; i < len(a); i = i + 1 {
+        if a[i] != b[i] { return False }
+    }
+    True
+}
+
+-- Ascending. Each word is walked by its lowest set bit, so the cost is per
+-- element and per word, not per bit.
+--
+-- Counted first so the answer is allocated once at its size: a caller that
+-- snapshots a set at every instruction otherwise pays for the array doubling
+-- its way up, which cost more allocations than the set itself saved.
+fun elements(BitSet(words) : BitSet) -> Array Int {
+    var count = 0
+    for w in words {
+        var rest = w
+        while rest != 0 {
+            rest = Int.and(rest, Int.subWrapping(rest, 1))
+            count = count + 1
+        }
+    }
+    let out = Array.new(count)
+    for var i = 0; i < len(words); i = i + 1 {
+        var rest = words[i]
+        while rest != 0 {
+            let low = Int.and(rest, Int.negWrapping(rest))
+            Array.push(out, i * 64 + position(low))
+            rest = Int.xor(rest, low)
+        }
+    }
+    out
+}
+
+-- The index of the one set bit in `low`, by de Bruijn multiplication: the
+-- sequence's top six bits, shifted left by the index, are distinct for every
+-- index, so they name it in the table. `shr` is arithmetic, and the mask is
+-- what makes it a logical shift when the product's sign bit is set.
+fun position(low : Int) -> Int =
+    deBruijnIndex[Int.and(Int.shr(Int.mulWrapping(low, deBruijn), 58), 63)]
+
+let deBruijn = 285870213051386505
+
+let deBruijnIndex = [
+    0, 1, 48, 2, 57, 49, 28, 3, 61, 58, 50, 42, 38, 29, 17, 4,
+    62, 55, 59, 36, 53, 51, 43, 22, 45, 39, 33, 30, 24, 18, 12, 5,
+    63, 47, 56, 27, 60, 41, 37, 16, 54, 35, 52, 21, 44, 32, 23, 11,
+    46, 26, 40, 15, 34, 20, 31, 10, 25, 14, 19, 9, 13, 8, 7, 6,
+]

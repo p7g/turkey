@@ -6,7 +6,8 @@ module Turkey.Promote (run)
 -- values are split because Branch itself has no argument arrays.
 import Turkey.Diag as Diag
 import Data.Map as Map
-import Data.Set as Set
+import Data.BitSet as BitSet
+import Data.BitSet (BitSet)
 import Turkey.LowIr as L
 import Turkey.LowIr (Op(..), Low(..))
 import Turkey.Ssa as Ssa
@@ -14,37 +15,60 @@ import Turkey.Ssa (Value(..), BlockId(..), Term(..), Rep(..))
 
 fun run(input : Ssa.Func Low) -> Ssa.Func Low {
     let f = Ssa.pruneUnreachable(input)
-    let reps = Map.new()
-    let needed : Array (Set.Set Int) = []
-    let written : Array (Set.Set Int) = []
+    -- Slots are numbered densely per function, so the sets below are bitsets
+    -- of the highest one. Most functions have none, and pay only this scan.
+    var slotCount = 0
     for block in f.blocks {
-        let use = Set.new()
-        let defs = Set.new()
+        for inst in block.insts {
+            match inst.op {
+                SlotLoad(slot) | SlotStore(slot, _) ->
+                    if slot >= slotCount { slotCount = slot + 1 }
+                _ -> {}
+            }
+        }
+    }
+    if slotCount == 0 { return f }
+    let reps = Map.new()
+    -- Each block's needed slots twice: as a list, whose order is the order of
+    -- the parameters the block gains and of the arguments every edge into it
+    -- passes, and as a bitset, to ask whether one is there already.
+    let needed : Array (Array Int) = []
+    let neededSet : Array BitSet = []
+    let written : Array BitSet = []
+    for block in f.blocks {
+        let use = []
+        let useSet = BitSet.new(slotCount)
+        let defs = BitSet.new(slotCount)
         for inst in block.insts {
             match inst.op {
                 SlotLoad(slot) -> {
-                    if !Set.contains(defs, slot) { Set.add(use, slot) }
+                    if !BitSet.contains(defs, slot) && !BitSet.contains(useSet, slot) {
+                        BitSet.add(useSet, slot)
+                        Array.push(use, slot)
+                    }
                     Map.put(reps, slot, Ssa.repOf(f, inst.result))
                 }
                 SlotStore(slot, v) -> {
-                    Set.add(defs, slot)
+                    BitSet.add(defs, slot)
                     Map.put(reps, slot, Ssa.repOf(f, v))
                 }
                 _ -> {}
             }
         }
         Array.push(needed, use)
+        Array.push(neededSet, useSet)
         Array.push(written, defs)
     }
-    if len(reps) == 0 { return f }
     var changed = True
     while changed {
         changed = False
         for var b = len(f.blocks) - 1; b >= 0; b = b - 1 {
             for target in Ssa.successors(f.blocks[b].term) {
                 for slot in needed[Ssa.blockId(target)] {
-                    if !Set.contains(written[b], slot) && !Set.contains(needed[b], slot) {
-                        Set.add(needed[b], slot)
+                    if !BitSet.contains(written[b], slot)
+                       && !BitSet.contains(neededSet[b], slot) {
+                        BitSet.add(neededSet[b], slot)
+                        Array.push(needed[b], slot)
                         changed = True
                     }
                 }
@@ -54,7 +78,7 @@ fun run(input : Ssa.Func Low) -> Ssa.Func Low {
     if len(needed[Ssa.blockId(f.entry)]) > 0 {
         panic("slot promotion: uninitialized local in " + f.name)
     }
-    let slots = Array.map(needed, Set.elements)
+    let slots = needed
     let incoming : Array (Map Int Value) = []
     let original : Array Int = []
     for var b = 0; b < len(f.blocks); b = b + 1 {

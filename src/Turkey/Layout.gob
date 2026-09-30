@@ -188,7 +188,9 @@ fun applications(e : Core, out : Array (String, Array Ty.Type)) -> Unit {
 -- `Box Int` loads the same word as an `i64`. The field that matters is one
 -- *declared* at a bare type variable and given a value of one of this body's
 -- own variables. A field declared `Prim.Array a` is a pointer whatever `a` is,
--- and a newtype is never built at all. See `turkey/layout.py`, `_constructs`.
+-- and a newtype is never built at all. A compact sum's nullary writes no field
+-- and is still one of these: whether `None : Option a` is a word or an object
+-- depends on `a` (`nullaryUnknown`). See `turkey/layout.py`, `_constructs`.
 fun constructs(decls : DeclTable, e : Core, abstracted : Set.Set Int) -> Bool {
     let found = Array.new(1)
     constructions(decls, e, abstracted, found)
@@ -199,6 +201,9 @@ fun constructions(decls : DeclTable, e : Core, abstracted : Set.Set Int,
                   found : Array Bool) -> Unit {
     if len(found) > 0 { return }
     match e.kind {
+        CCon(name) -> if nullaryUnknown(decls, name, e.ty, abstracted) {
+            Array.push(found, True)
+        }
         CApp(fn, args) -> match fn.kind {
             CCon(name) -> match Decls.con(decls, name) {
                 Some(info) -> {
@@ -248,6 +253,29 @@ fun constructions(decls : DeclTable, e : Core, abstracted : Set.Set Int,
             b
         },
     }))
+}
+
+-- Whether `name` is a nullary constructor of a compact sum (`Decls.Compact`)
+-- whose payload, at `built`, is one of this body's own variables. Such a sum is
+-- one word when the payload is a pointer and an object otherwise, so even
+-- `None` cannot be built without knowing which.
+fun nullaryUnknown(decls : DeclTable, name : String, built : Ty.Type,
+                   abstracted : Set.Set Int) -> Bool {
+    let c = match Decls.compactOf(decls, name) {
+        Some(c) -> c
+        None -> return False
+    }
+    if !Array.contains(c.nullaries, name) { return False }
+    match Decls.conFieldTypes(decls, built, c.payload) {
+        Some(ts) -> if len(ts) == 1 {
+            match Ty.prune(ts[0]) {
+                TVar(cell) -> return Set.contains(abstracted, cell.id)
+                _ -> {}
+            }
+        }
+        None -> {}
+    }
+    False
 }
 
 fun declaredFields(info : ConInfo) -> Array Ty.Type = match info.scheme.body {

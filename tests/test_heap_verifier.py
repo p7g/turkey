@@ -132,6 +132,10 @@ int main(int argc, char **argv) {
         held[8] = turkey_array_new(8, 1, 4, 3);
         held[9] = turkey_cell_new(1, 0);
         held[10] = turkey_array_new(0, 0, 8, 7);
+        /* Words below 4096 in a traced slot or a root are immediates -- a
+           compact sum's nullary constructors -- and are never followed. */
+        ((Object *)held[3])->slots[1] = 4095;
+        held[11] = (void *)1;
         held[1] = NULL;
         frame.live = -1;
         /* Exactly 12 objects reachable (the closure's environment included). */
@@ -179,11 +183,12 @@ int main(int argc, char **argv) {
     else if (!strcmp(which, "negative-array-tag")) child->tag = -1;
     else if (!strcmp(which, "cell-size")) { held[2] = turkey_cell_new(0, 0); header_of(held[2])->size = 1; }
     else if (!strcmp(which, "interior")) parent->slots[0]++;
-    else if (!strcmp(which, "foreign")) parent->slots[0] = 1;
+    /* The first word that is not an immediate, and in no region. */
+    else if (!strcmp(which, "foreign")) parent->slots[0] = 4096;
     else if (!strcmp(which, "high-address")) parent->slots[0] = UINT64_C(0xfffffffffffffff8);
     else if (!strcmp(which, "past-region")) parent->slots[0] = (uintptr_t)r + (1 << 20);
-    else if (!strcmp(which, "root")) held[0] = (void *)1;
-    else if (!strcmp(which, "high-root")) held[65] = (void *)1;
+    else if (!strcmp(which, "root")) held[0] = (void *)4096;
+    else if (!strcmp(which, "high-root")) held[65] = (void *)4096;
     else if (!strcmp(which, "root-cycle")) frame.previous = &frame;
     else if (!strcmp(which, "root-frame")) frame.count = -1;
     else if (!strcmp(which, "region-cycle")) regions()->next = regions();
@@ -249,7 +254,7 @@ int main(int argc, char **argv) {
         state[9] = 1;
         state[10] = (int64_t)(uintptr_t)&stack[15];
         int64_t native_phase = 0;
-        if (!strcmp(which, "native-invalid")) stack[6] = 1;
+        if (!strcmp(which, "native-invalid")) stack[6] = 4096;
         if (!strcmp(which, "native-offset")) offset = INT64_MIN;
         if (!strcmp(which, "native-table")) state[8] = 0;
         if (!strcmp(which, "native-unmarked")) { native_phase = 1; state[7] = 1; }

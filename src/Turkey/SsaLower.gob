@@ -31,7 +31,7 @@ import Turkey.Core as Core
 import Turkey.Core (Core(..), CoreKind(..), CParam(..), CBind(..), CProgram(..),
                     Mapper(..))
 import Turkey.Decls as Decls
-import Turkey.Decls (DeclTable(..), ConInfo(..))
+import Turkey.Decls (DeclTable(..), ConInfo(..), Compact(..))
 import Turkey.Diag as Diag
 import Turkey.Giblets as Giblets
 import Turkey.Layout as Layout
@@ -875,6 +875,13 @@ fun pattern(l : Lower, p : Pat, v : Value, ty : Ty.Type,
                 }
                 None -> {}
             }
+            match compactAt(l, name, ty) {
+                Some(c) -> {
+                    compactPattern(l, c, name, args, v, ty, success, failure)
+                    return
+                }
+                None -> {}
+            }
             let types = match Decls.conFieldTypes(l.decls, ty, name) {
                 Some(ts) -> ts
                 None -> []
@@ -1704,8 +1711,182 @@ fun zero(l : Lower, r : Rep) -> Value = match r.class_ {
     _ -> L.emit(l.b, ConstInt(0), r)
 }
 
--- A saturated constructor. A nullary one is an object with no fields, interned
--- per (kind, tag) rather than allocated at each use.
+-- -- compact sums ----------------------------------------------------------------------
+
+-- A compact sum (`Decls.Compact`) whose payload field is held at a traced
+-- pointer *at this instantiation* is one word, and nothing is allocated for it:
+--
+-- * the nullaries are the small integers 0, 1, ... in declaration order;
+-- * the payload constructor is the field itself -- `Some(p)` is `p` -- **unless**
+--   that word is below `Heap.immediates` or is itself a wrap (an object tagged
+--   `wrapTag`). Then it is a fresh one-field wrap around it. So `Some(None)` is
+--   a wrap around 0, and a word at or above `Heap.immediates` that is not a
+--   wrap is always the bare payload.
+--
+-- At any other payload representation -- `Option Int` -- the sum is an ordinary
+-- object, nullaries interned, as a sum that is not compact is. So which of the
+-- two a value is depends on the instantiation, and building or testing one needs
+-- the payload's layout: `Turkey.Layout` gives every body that does so at a type
+-- variable a layout-keyed copy, and `compactAt` refuses where there is none.
+--
+-- The word is a function of the *value*, not of the code building it, so ground
+-- code, a type-specialized copy and a layout-shared copy agree without knowing
+-- about each other. A test is: below the nullary count, the word is that
+-- nullary; otherwise it is the payload constructor, and its field is the wrap's
+-- field if it is a wrap and the word itself if not. Comparisons are signed,
+-- which is exact because a heap address is below 2^47.
+--
+-- The wrap test reads the tag of an arbitrary traced pointer, which is sound
+-- because every value a type variable can stand for has an object header: the
+-- one headerless heap value is a `var`'s cell, whose type `%Ref t` is internal
+-- and never instantiates a variable.
+
+-- The tag of a wrap object. Declared constructors are numbered from 0 by
+-- `tagsOf`, and tuples and closures carry -1.
+let wrapTag = -2
+
+-- The compact shape `name`'s type has, if it is one word at `ty`.
+--
+-- By the payload's layout, and there is no answer without one. A body can lack
+-- it: a generic dictionary's method, which is not copied per layout, or a type
+-- family applied to an abstracted variable, which a layout key does not cover.
+-- Holding the payload at the uniform representation there would pick one of
+-- the two representations for a value that may have been built with the other,
+-- so this refuses instead: the construction or test panics when reached, and
+-- the code after it is unreachable. Generic dictionaries' methods are reached
+-- from nothing but the records the initializer builds.
+fun compactAt(l : Lower, name : String, ty : Ty.Type) -> Option Compact {
+    let c = match Decls.compactOf(l.decls, name) {
+        Some(c) -> c
+        None -> return None
+    }
+    match Layout.layoutOf(l.decls, compactField(l, c, ty), l.layouts) {
+        Some(layout) -> if repOfName(layout) == Ssa.traced(Ptr) { Some(c) } else { None }
+        None -> {
+            let message = L.emit(l.b, ConstString(
+                "internal error: the representation of " + Ty.show(ty)
+                + " is not known in this body"), Ssa.traced(Ptr))
+            L.terminate(l.b, Panic(message))
+            L.into(l.b, L.block(l.b))
+            Some(c)
+        }
+    }
+}
+
+-- The payload constructor's field type, at `ty`.
+fun compactField(l : Lower, c : Compact, ty : Ty.Type) -> Ty.Type =
+    match Decls.conFieldTypes(l.decls, ty, c.payload) {
+        Some(ts) -> if len(ts) == 1 { ts[0] } else { Ty.tUnit() }
+        None -> Ty.tUnit()
+    }
+
+-- Whether values of `ty` are certainly neither below `Heap.immediates` nor
+-- wraps, so the payload constructor over one needs no test. A record, tuple,
+-- closure, array or any sum that is not compact-shaped is an ordinary object.
+-- A variable is not known to be, and a compact sum's own values may be small
+-- integers or wraps.
+fun plain(l : Lower, ty : Ty.Type) -> Bool {
+    let t = Ty.prune(ty)
+    match Decls.erasedPayload(l.decls, t) {
+        Some(payload) -> return plain(l, payload)
+        None -> {}
+    }
+    match t {
+        TTuple(_) -> return True
+        TFun(_, _) -> return True
+        _ -> {}
+    }
+    let (h, _) = Ty.spine(t)
+    match h {
+        TCon(c) -> c.uid == 0 && Option.isNone(Decls.compactShape(l.decls, c.name))
+        _ -> False
+    }
+}
+
+-- A one-word compact sum's constructor applied to `args`.
+fun compactValue(l : Lower, c : Compact, name : String, ty : Ty.Type,
+                 args : Array Core) -> Value {
+    match Array.indexOf(c.nullaries, name) {
+        Some(i) -> return L.emit(l.b, ConstInt(i), Ssa.traced(Ptr))
+        None -> {}
+    }
+    if len(args) != 1 {
+        return stop(l, "the constructor '" + name + "' must be saturated")
+    }
+    let x = coerce(l, value(l, args[0]), Ssa.traced(Ptr))
+    if plain(l, compactField(l, c, ty)) { return x }
+    let wrap = L.block(l.b)
+    let tagged = L.block(l.b)
+    let as_ = L.block(l.b)
+    let after = L.block(l.b)
+    let made = L.param(l.b, after, Ssa.traced(Ptr))
+    let limit = L.emit(l.b, ConstInt(4096), Ssa.traced(Ptr))
+    let small = L.emit(l.b, Cmp(Lt, x, limit), Ssa.untraced(I1))
+    L.terminate(l.b, Branch(small, wrap, tagged))
+    L.into(l.b, tagged)
+    let seen = L.emit(l.b, ObjectTag(x), Ssa.untraced(I32))
+    let want = L.emit(l.b, ConstInt(wrapTag), Ssa.untraced(I32))
+    let isWrap = L.emit(l.b, Cmp(Eq, seen, want), Ssa.untraced(I1))
+    L.terminate(l.b, Branch(isWrap, wrap, as_))
+    L.into(l.b, as_)
+    L.terminate(l.b, Jump(after, [x]))
+    L.into(l.b, wrap)
+    let object = L.emit(l.b, ObjectNew(1, wrapTag, 1, metadata([Ssa.traced(Ptr)])),
+                        Ssa.traced(Ptr))
+    Map.put(l.func.reasons, Ssa.valueId(object),
+            "wraps a nested value in " + Ty.shortName(name))
+    L.effect(l.b, ObjectSet(object, 0, x))
+    L.terminate(l.b, Jump(after, [object]))
+    L.into(l.b, after)
+    made
+}
+
+-- A constructor pattern on a one-word compact sum: the word test, then the
+-- payload's sub-pattern against the field.
+fun compactPattern(l : Lower, c : Compact, name : String, args : Array Pat,
+                   v : Value, ty : Ty.Type,
+                   success : BlockId, failure : BlockId) -> Unit {
+    match Array.indexOf(c.nullaries, name) {
+        Some(i) -> {
+            let want = L.emit(l.b, ConstInt(i), Ssa.traced(Ptr))
+            let test = L.emit(l.b, Cmp(Eq, v, want), Ssa.untraced(I1))
+            L.terminate(l.b, Branch(test, success, failure))
+            return
+        }
+        None -> {}
+    }
+    let count = L.emit(l.b, ConstInt(len(c.nullaries)), Ssa.traced(Ptr))
+    let nullary = L.emit(l.b, Cmp(Lt, v, count), Ssa.untraced(I1))
+    let carried = L.block(l.b)
+    L.terminate(l.b, Branch(nullary, failure, carried))
+    L.into(l.b, carried)
+    let field = compactField(l, c, ty)
+    let inner = if plain(l, field) { v } else {
+        let wrapped = L.block(l.b)
+        let as_ = L.block(l.b)
+        let after = L.block(l.b)
+        let got = L.param(l.b, after, Ssa.traced(Ptr))
+        let seen = L.emit(l.b, ObjectTag(v), Ssa.untraced(I32))
+        let want = L.emit(l.b, ConstInt(wrapTag), Ssa.untraced(I32))
+        let isWrap = L.emit(l.b, Cmp(Eq, seen, want), Ssa.untraced(I1))
+        L.terminate(l.b, Branch(isWrap, wrapped, as_))
+        L.into(l.b, wrapped)
+        L.terminate(l.b, Jump(after, [L.emit(l.b, ObjectGet(v, 0), Ssa.traced(Ptr))]))
+        L.into(l.b, as_)
+        L.terminate(l.b, Jump(after, [v]))
+        L.into(l.b, after)
+        got
+    }
+    if len(args) == 1 {
+        pattern(l, args[0], inner, field, success, failure)
+    } else {
+        L.terminate(l.b, Jump(success, []))
+    }
+}
+
+-- A saturated constructor. A nullary one that is not a one-word compact sum's
+-- is an object with no fields, interned per (kind, tag) rather than allocated
+-- at each use.
 fun constructor(l : Lower, e : Core, name : String, args : Array Core,
                 rep : Rep) -> Value {
     if name == P.boolFalse || name == P.boolTrue {
@@ -1714,6 +1895,10 @@ fun constructor(l : Lower, e : Core, name : String, args : Array Core,
     }
     match Decls.erasedPayload(l.decls, e.ty) {
         Some(_) -> if len(args) == 1 { return value(l, args[0]) }
+        None -> {}
+    }
+    match compactAt(l, name, e.ty) {
+        Some(c) -> return compactValue(l, c, name, e.ty, args)
         None -> {}
     }
     match Map.get(l.tags, name) {

@@ -19,6 +19,8 @@ module Turkey.Frame (
 --     savesAt           callee-saved registers the colouring used, in pairs
 --     rootsAt           root slots, one per rooted value (`Turkey.Roots`)
 --     spillsAt          spill slots, one per spilled untraced value
+--     objectsAt         objects built in the frame (`Turkey.Escape`), each
+--                       at the payload layout a heap object has
 --     (padding)         to the 16-byte alignment Apple requires
 --     sp + 8k           outgoing stack argument k
 --
@@ -27,7 +29,8 @@ module Turkey.Frame (
 -- an `sp` that moved around each call would move all of them.
 --
 -- **Frame tables.** For each call that may collect, the fp-relative offsets of
--- the root slots live across it. The collector walks `x29` frame records and
+-- the root slots live across it, and of the traced fields of every frame
+-- object live across it. The collector walks `x29` frame records and
 -- looks up each return address; nothing is registered at run time, which is
 -- the 13% the survey measured the shadow stack costing.
 
@@ -53,6 +56,10 @@ type Layout = Layout {
     roots    : Int,
     spillsAt : Int,
     spills   : Int,
+    objectsAt : Int,
+    -- Each frame object's first byte, from `objectsAt`, and the region's size.
+    objectStarts : Array Int,
+    objectBytes : Int,
     -- Bytes, not slots.
     outgoing : Int,
     maps     : Array SafepointMap,
@@ -77,17 +84,26 @@ fun layout(a : Regalloc.Allocation, frame : Roots.Frame) -> Layout {
     }
     let roots = Roots.slotCount(frame)
     let spills = a.spills.spillSlots
+    let objectStarts = []
+    var objectBytes = 0
+    for o in frame.objects {
+        Array.push(objectStarts, objectBytes)
+        objectBytes = objectBytes + 8 * o.words
+    }
     let saves = 8 * even(len(savedGp)) + 8 * even(len(savedFp))
-    let raw = outgoing + 8 * spills + 8 * roots + saves + 16
+    let raw = outgoing + objectBytes + 8 * spills + 8 * roots + saves + 16
     let size = (raw + 15) / 16 * 16
-    let spillsAt = outgoing + (size - raw)
+    let objectsAt = outgoing + (size - raw)
+    let spillsAt = objectsAt + objectBytes
     let rootsAt = spillsAt + 8 * spills
     let savesAt = rootsAt + 8 * roots
     let recordAt = savesAt + saves
     let l = Layout {
         size = size, recordAt = recordAt, savesAt = savesAt,
         savedGp = savedGp, savedFp = savedFp, rootsAt = rootsAt, roots = roots,
-        spillsAt = spillsAt, spills = spills, outgoing = outgoing, maps = [],
+        spillsAt = spillsAt, spills = spills, objectsAt = objectsAt,
+        objectStarts = objectStarts, objectBytes = objectBytes,
+        outgoing = outgoing, maps = [],
     }
     for block in f.blocks {
         for i in block.insts {
@@ -96,6 +112,12 @@ fun layout(a : Regalloc.Allocation, frame : Roots.Frame) -> Layout {
                     let offsets = []
                     for (slot, _) in Roots.liveAt(frame, b, n) {
                         Array.push(offsets, rootsAt + 8 * slot - recordAt)
+                    }
+                    for k in Roots.objectsAt(frame, b, n) {
+                        for field in frame.objects[k].traced {
+                            Array.push(offsets, objectsAt + objectStarts[k] + 24
+                                                + 8 * field - recordAt)
+                        }
                     }
                     Array.push(l.maps, SafepointMap { block = b, index = n,
                                                       offsets = offsets })
@@ -140,6 +162,7 @@ fun calleeSaved(a : Regalloc.Allocation) -> (Array Int, Array Int) {
 fun offsetOf(l : Layout, m : Mem) -> Option Int = match m {
     RootSlot(i) -> Some(l.rootsAt + 8 * i)
     SpillSlot(i) -> Some(l.spillsAt + 8 * i)
+    ObjectSlot(n, k) -> Some(l.objectsAt + l.objectStarts[n] + k)
     OutgoingArg(k) -> Some(8 * k)
     IncomingArg(k) -> Some(l.size + 8 * k)
     Offset(_, _) -> None
@@ -164,7 +187,8 @@ fun verifyFrame(a : Regalloc.Allocation, frame : Roots.Frame,
     if l.recordAt + 16 != l.size {
         Array.push(out, "the frame record is not at the top of the frame")
     }
-    if l.outgoing > l.spillsAt || l.spillsAt + 8 * l.spills != l.rootsAt
+    if l.outgoing > l.objectsAt || l.objectsAt + l.objectBytes != l.spillsAt
+       || l.spillsAt + 8 * l.spills != l.rootsAt
        || l.rootsAt + 8 * l.roots != l.savesAt {
         Array.push(out, "the frame's regions overlap or leave a gap")
     }
@@ -202,6 +226,10 @@ fun checkSlot(out : Array String, l : Layout, m : Mem, b : Int, n : Int) -> Unit
     let within = match m {
         RootSlot(i) -> i >= 0 && i < l.roots
         SpillSlot(i) -> i >= 0 && i < l.spills
+        ObjectSlot(n, k) -> n >= 0 && n < len(l.objectStarts) && k >= 0
+                            && l.objectStarts[n] + k
+                               < (if n + 1 < len(l.objectStarts) { l.objectStarts[n + 1] }
+                                  else { l.objectBytes })
         OutgoingArg(k) -> k >= 0 && 8 * (k + 1) <= l.outgoing
         IncomingArg(k) -> k >= 0
         -- Named rather than a wildcard, for the reason `offsetOf` gives: a

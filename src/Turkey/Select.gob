@@ -252,10 +252,23 @@ fun incoming(f : Func Low, g : Func Inst) -> BlockId {
 fun run(s : Sel) -> Unit {
     for var b = 0; b < len(s.source.blocks); b = b + 1 {
         s.at = b
+        -- The frame objects the collector may read before they are built
+        -- (`Turkey.Roots.FrameObject`), cleared before anything can collect.
+        if b == Ssa.blockId(s.source.entry) {
+            for var k = 0; k < len(s.frame.objects); k = k + 1 {
+                if s.frame.objects[k].zeroed {
+                    for field in s.frame.objects[k].traced {
+                        emit(s, A.Str(A.xzr, A.ObjectSlot(k, 24 + 8 * field), A.W64))
+                    }
+                }
+            }
+        }
         let insts = s.source.blocks[b].insts
         for var n = 0; n < len(insts); n = n + 1 {
             let live = Roots.liveAt(s.frame, b, n)
-            if len(live) > 0 {
+            -- A frame object needs no store to be published, only the map:
+            -- its fields are in the frame already.
+            if len(live) > 0 || len(Roots.objectsAt(s.frame, b, n)) > 0 {
                 for (slot, id) in live {
                     emit(s, A.Str(A.Virtual(id), A.RootSlot(slot), A.W64))
                 }
@@ -500,6 +513,35 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                 None -> {}
             }
         }
+        -- An object in the frame: the word holding its kind and tag, which is
+        -- what `ObjectTag` reads, then its fields, then its address. The count
+        -- and metadata words are left unwritten, because nothing reads them
+        -- here: the collector finds a frame object's fields from the frame
+        -- table, and never walks one.
+        StackObject(kind, tag, _, fields) -> {
+            let k = frameObject(s, i.result)
+            let t = immediate(s, Int.or(Int.and(kind, 4294967295),
+                                        Int.shl(Int.and(tag, 4294967295), 32)))
+            emit(s, A.Str(t, A.ObjectSlot(k, 0), A.W64))
+            for var n = 0; n < len(fields); n = n + 1 {
+                emit(s, A.Str(A.reg(fields[n]), A.ObjectSlot(k, 24 + 8 * n), A.W64))
+            }
+            emit(s, A.FrameAddress(d, A.ObjectSlot(k, 0)))
+        }
+        -- A closure shell, as `turkey_closure_shell` lays one out: kind 3, no
+        -- tag, then the code's address and the environment.
+        StackClosure(code, environment) -> {
+            let k = frameObject(s, i.result)
+            emit(s, A.Str(immediate(s, Int.or(3, Int.shl(4294967295, 32))),
+                          A.ObjectSlot(k, 0), A.W64))
+            emit(s, A.Str(address(s, symbolFor(s, code)), A.ObjectSlot(k, 24), A.W64))
+            let e = match environment {
+                Some(v) -> A.reg(v)
+                None -> A.xzr
+            }
+            emit(s, A.Str(e, A.ObjectSlot(k, 32), A.W64))
+            emit(s, A.FrameAddress(d, A.ObjectSlot(k, 0)))
+        }
         ClosureCapture(closure, index, v) -> {
             let env = temp(s, Ssa.traced(Ptr))
             emit(s, A.Ldr(env, A.Offset(A.reg(closure), 32), A.W64))
@@ -586,6 +628,13 @@ fun immediate(s : Sel, n : Int) -> Reg {
 -- A call to one of the runtime's untyped entry points: every argument and the
 -- result is a machine word, because `raw` has already moved any double's bits
 -- into the general file.
+-- The frame object `v` addresses. Every one has a slot: `Turkey.Roots` lists
+-- them from the same instructions.
+fun frameObject(s : Sel, v : Value) -> Int = match Roots.objectOf(s.frame, Ssa.valueId(v)) {
+    Some(k) -> k
+    None -> error("no frame slot for object %" + Int.toString(Ssa.valueId(v)))
+}
+
 -- Field `index` of an object, at the offset `ObjectGet` reads it from. A whole
 -- word whatever the field's representation, and a floating register stores its
 -- bits directly, as `CellStore` does.

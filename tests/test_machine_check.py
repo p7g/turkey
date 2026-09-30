@@ -52,10 +52,13 @@ def test_a_ground_call_left_on_the_generic_copy_is_refused():
 
 
 def test_a_scalar_constant_at_a_pointer_representation_is_refused():
-    """The collector would follow 16 as an address. Zero is null, which it
-    skips, and the well-formed case holds one."""
+    """The collector would follow 65536 as an address. Null and the words
+    below 4096 are skipped -- a compact sum's nullaries live there -- and the
+    well-formed case holds one of each. A small scalar in a traced register is
+    therefore indistinguishable from a nullary, and this check cannot refuse
+    one."""
     [message] = _case("a scalar constant at a pointer representation")
-    assert "the constant 16 is held at ptr*" in message
+    assert "the constant 65536 is held at ptr*" in message
 
 
 def test_a_void_calls_result_read_as_a_pointer_is_refused():

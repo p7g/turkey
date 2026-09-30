@@ -116,7 +116,7 @@ int main(int argc, char **argv) {
     int phase = 0;
     if (!strcmp(which, "valid")) {
         /* Cycles, every field code, pointer arrays, closures/environments,
-           cells, scalar boxes and all array widths are independently decoded. */
+           cells and all array widths are independently decoded. */
         Object *cycle = turkey_object_new(0, 0, 8,
             0 | (1 << 3) | (2 << 6) | (3 << 9) | (4 << 12) | (5 << 15) | (6 << 18) | (7 << 21));
         for (int i = 0; i < 7; i++) cycle->slots[i] = 1;
@@ -129,7 +129,7 @@ int main(int argc, char **argv) {
         env->slots[0] = (uintptr_t)child;
         env->slots[1] = 1;
         ((Object *)held[5])->slots[1] = (uintptr_t)env;
-        held[6] = turkey_box(123, 4);
+        held[6] = turkey_cell_new(123, 0);
         held[7] = turkey_array_new(8, 1, 1, 2);
         held[8] = turkey_array_new(8, 1, 4, 3);
         held[9] = turkey_cell_new(1, 0);
@@ -141,13 +141,13 @@ int main(int argc, char **argv) {
         held[1] = NULL;
         frame.live = -1;
         /* Exactly 12 objects reachable (the closure's environment included). */
-        for (int i = 0; i < 100; i++) turkey_box(i, 4);
+        for (int i = 0; i < 100; i++) turkey_cell_new(i, 0);
         turkey_gc_set_verify(1);
         turkey_heap_set_mark_epoch(UINT32_MAX);
         turkey_collect();
         assert(!turkey_has_panicked && turkey_heap_objects() == 12);
         assert(turkey_heap_mark_epoch() == 1);
-        for (int i = 0; i < 20; i++) { turkey_box(i, 4); turkey_collect(); }
+        for (int i = 0; i < 20; i++) { turkey_cell_new(i, 0); turkey_collect(); }
         assert(turkey_heap_objects() == 12);
         memset(held, 0, sizeof held);
         turkey_collect();
@@ -272,7 +272,7 @@ int main(int argc, char **argv) {
         return 0;
     }
     else if (!strcmp(which, "reclaimed")) {
-        void *dead = turkey_box(5, 4);
+        void *dead = turkey_cell_new(5, 0);
         turkey_collect();
         parent->slots[0] = (uintptr_t)dead;
     }
@@ -282,7 +282,7 @@ int main(int argc, char **argv) {
         turkey_gc_set_stress(1);
         expected_count = turkey_heap_objects();
         atexit(check_stopped);
-        turkey_box(3, 4);
+        turkey_cell_new(3, 0);
         abort();
     }
     else if (!strncmp(which, "native-", 7)) {

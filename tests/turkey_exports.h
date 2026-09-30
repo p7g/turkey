@@ -28,8 +28,6 @@ void *turkey_string_new(const unsigned char *bytes, int64_t length);
 void *turkey_cell_new(uint64_t value, int64_t pointer_value);
 void *turkey_object_new(int64_t kind, int64_t tag, int64_t count,
                         uint64_t pointer_bitmap);
-void *turkey_box(uint64_t value, int64_t layout);
-uint64_t turkey_unbox(void *box, int64_t layout);
 void *turkey_array_new(int64_t length, uint64_t initial, int64_t element_width,
                        int64_t element_layout);
 void *turkey_closure_shell(uint64_t code);

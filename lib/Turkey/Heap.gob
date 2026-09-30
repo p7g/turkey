@@ -197,9 +197,9 @@ var verify : Bool = present(Prim.cString("TURKEY_GC_VERIFY"))
 var generational : Bool = generationalFrom(Libc.getenv(Prim.cString("TURKEY_GC_GENERATIONAL")))
 -- Whether the collection in progress, or the last one, is minor.
 var minor : Bool = False
--- The bytes the last full collection kept: a full collection is due once the
--- live bytes have grown by the threshold scale since then, the old
--- generation's own doubling.
+-- The bytes the last full collection kept: the live set, as best it is known.
+-- A minor collection's `liveBytes` also counts every old object that died
+-- since, which only a full collection finds.
 var liveBytesAfterFull : Int = 0
 
 -- Opt-in accounting, printed one line per collection and in `report` when
@@ -209,6 +209,10 @@ var statsWanted : Bool = present(Prim.cString("TURKEY_GC_STATS"))
 
 -- The collector runs again once this many times the live set's bytes have
 -- been allocated, or 64KB times it while the live set is smaller than that.
+-- The live set is what the last full collection kept: sized from a minor
+-- collection's count, which includes the old objects that have died since,
+-- the young generation grew with the garbage, and the self-compile's peak
+-- memory with it, by 41% over the full collector's rather than 1%.
 --
 -- Bytes rather than objects, because the threshold is what bounds the heap:
 -- counted in objects, a program allocating large arrays grows its heap by the
@@ -1171,13 +1175,14 @@ fun collectFrom(frame : Prim.Ptr) -> Unit {
     if verify { verifyAt(2, frame) }
     allocationsSince = 0
     bytesSince = 0
-    let floor = if liveBytes > 65536 { liveBytes } else { 65536 }
+    if !minor { liveBytesAfterFull = liveBytes }
+    let floor = if liveBytesAfterFull > 65536 { liveBytesAfterFull } else { 65536 }
     let next = Prim.floatMul(Prim.intToFloat(floor), thresholdScale)
     -- `maxInt()` rounds up when converted, so the comparison is against 2^63,
     -- and anything that reaches it saturates instead of converting.
     threshold = if Prim.floatGte(next, Prim.intToFloat(maxInt())) { maxInt() }
                 else { Prim.floatTruncate(next) }
-    if minor { statsMinor = statsMinor + 1 } else { liveBytesAfterFull = liveBytes }
+    if minor { statsMinor = statsMinor + 1 }
     collections = collections + 1
     if wanted {
         statsMarkClock = statsMarkClock + (marked - started)
@@ -1186,13 +1191,18 @@ fun collectFrom(frame : Prim.Ptr) -> Unit {
 }
 
 -- Whether this collection must be full: when the live bytes, old objects
--- that died since included, have grown by the threshold scale since the last
--- full collection kept them. Under GC stress every eighth is, so that a
--- stressed run exercises both.
+-- that died since included, have grown by half since the last full collection
+-- kept them. Under GC stress every eighth is, so that a stressed run
+-- exercises both.
+--
+-- Half is measured, on the self-compile against the full collector (17.7 s,
+-- 2.60 GB max RSS): 14.3 s at 2.63 GB. Waiting for the live bytes to double
+-- instead was 14.3 s at 2.86 GB, and with the young generation also sized
+-- from them, 13.5 s at 3.67 GB.
 fun fullDue() -> Bool {
     if stress { return collections % 8 == 0 }
     let floor = if liveBytesAfterFull > 65536 { liveBytesAfterFull } else { 65536 }
-    Prim.floatGte(Prim.intToFloat(liveBytes), Prim.floatMul(Prim.intToFloat(floor), thresholdScale))
+    Prim.floatGte(Prim.intToFloat(liveBytes), Prim.floatMul(Prim.intToFloat(floor), 1.5))
 }
 
 -- Before a full collection's marking: no object is marked.

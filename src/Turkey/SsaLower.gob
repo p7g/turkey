@@ -274,7 +274,7 @@ fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
         for block in f.blocks {
             for inst in block.insts {
                 match inst.op {
-                    ObjectNew(kind, tag, count, _) -> if count == 0 {
+                    ObjectNew(kind, tag, _, fields, _) -> if len(fields) == 0 {
                         let name = "%nullary." + Int.toString(kind) + "."
                                    + Int.toString(tag)
                         Map.put(objects, name, (kind, tag))
@@ -293,7 +293,7 @@ fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
     L.into(b, start)
     for (name, shape) in objects {
         Array.push(m.globals, (name, Ssa.traced(Ptr)))
-        let made = L.emit(b, ObjectNew(shape.0, shape.1, 0, 0), Ssa.traced(Ptr))
+        let made = L.emit(b, ObjectNew(shape.0, shape.1, 0, [], 0), Ssa.traced(Ptr))
         L.effect(b, GlobalStore(name, made))
     }
     L.terminate(b, Jump(init.entry, []))
@@ -1242,7 +1242,7 @@ fun valueHere(l : Lower, e : Core) -> Value {
             -- around it, using the function's own environment-first signature.
             None -> match Map.get(l.sigs, name) {
                 Some(_) -> {
-                    L.emit(l.b, ClosureNew(name, 0),
+                    L.emit(l.b, ClosureNew(name, None),
                            Ssa.traced(Ptr))
                 }
                 None -> if Set.contains(l.globals, name) {
@@ -1305,7 +1305,7 @@ fun valueHere(l : Lower, e : Core) -> Value {
             store(l, target, x)
             L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
         }
-        CTuple(elems) -> aggregate(l, elems, 0, -1, "builds a tuple")
+        CTuple(elems) -> aggregate(l, elems, 0, -1, False, "builds a tuple")
         CRecord(con, fields) -> {
             -- The one table, so a dictionary is *built* in the order it is
             -- later *read* in. Two sources for that order is how a field ends
@@ -1321,7 +1321,7 @@ fun valueHere(l : Lower, e : Core) -> Value {
             }
             let items = if len(sorted) == len(fields) { sorted }
                         else { Array.map(fields, _.1) }
-            aggregate(l, items, 1, Map.getOr(l.tags, con, -1),
+            aggregate(l, items, 1, Map.getOr(l.tags, con, -1), mutableCon(l, con),
                       "builds a record, " + Ty.shortName(con))
         }
         CArray(elems) -> arrayLiteral(l, e, elems)
@@ -1401,23 +1401,37 @@ fun store(l : Lower, target : Core, x : Value) -> Unit = match target.kind {
     }
 }
 
--- A heap object with `count` fields, built and then filled.
+-- A heap object built with its fields.
 --
 -- `kind` is 0 for a tuple and 1 for a constructed value, which is what the
--- runtime's own object header distinguishes.
+-- runtime's own object header distinguishes. `mutable` says whether any field
+-- may be assigned later, and then every field may be.
 fun aggregate(l : Lower, items : Array Core, kind : Int, tag : Int,
-             what : String) -> Value {
+             mutable : Bool, what : String) -> Value {
     let values = []
     for x in items { Array.push(values, value(l, x)) }
     let reps = Array.map(values, Ssa.repOf(l.func, _))
-    let made = L.emit(l.b, ObjectNew(kind, tag, len(values), metadata(reps)),
+    let made = L.emit(l.b, ObjectNew(kind, tag, metadata(reps), values,
+                                     if mutable { allFields(len(values)) } else { 0 }),
                       Ssa.traced(Ptr))
     Map.put(l.func.reasons, Ssa.valueId(made), what)
-    for var i = 0; i < len(values); i = i + 1 {
-        L.effect(l.b, ObjectSet(made, i, values[i]))
-    }
     made
 }
+
+-- Whether a value built with this constructor may have a field assigned: the
+-- constructor of a mutable record. Tuples, positional constructors and
+-- existential records never change after construction, so an `ObjectGet` of
+-- one built in view is the value it was built with.
+fun mutableCon(l : Lower, con : String) -> Bool = match Decls.con(l.decls, con) {
+    Some(info) -> match Decls.recordFields(l.decls, info.tycon) {
+        Some(_) -> True
+        None -> False
+    }
+    None -> True
+}
+
+-- The mutable mask with every one of `count` fields set.
+fun allFields(count : Int) -> Int = Int.shl(1, count) - 1
 
 -- How the collector reads an object's fields: three bits of representation
 -- each, least significant field first. Not a pointer bitmap -- a width and a
@@ -1540,7 +1554,7 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     L.into(child.b, entry)
     -- The environment comes first and is not the closure: the callee is handed
     -- what the closure's second slot holds, which is why a capture is read
-    -- with an ordinary `ObjectGet` and written with `ClosureCapture`. The
+    -- with an ordinary `ObjectGet` of an object the parent built. The
     -- asymmetry is the runtime's -- the parent has the closure and the child
     -- has the environment -- and not this IR's.
     let environment = Ssa.freshValue(g, Ssa.traced(Ptr))
@@ -1573,43 +1587,46 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     }
 }
 
+-- A closure and its environment, built with every capture this body holds.
+--
 -- Environment fields use one trace bit per capture (kind 4), unlike the
--- three-bit field layouts of ordinary records. Zeroed captures let recursive
--- shells survive collection before their sibling closures are installed.
-fun closureShell(l : Lower, symbol : String,
-                 captures : Array (String, Rep)) -> Value {
+-- three-bit field layouts of ordinary records. A capture named in `later` is a
+-- sibling in a recursive group that does not exist yet: its slot starts null,
+-- which the collector skips, and is marked mutable, and `letrec` writes it
+-- with `ClosureCapture` once every shell exists.
+fun closureShell(l : Lower, symbol : String, captures : Array (String, Rep),
+                 later : Set.Set String) -> Value {
     if len(captures) == 0 {
-        return L.emit(l.b, ClosureNew(symbol, 0), Ssa.traced(Ptr))
+        return L.emit(l.b, ClosureNew(symbol, None), Ssa.traced(Ptr))
     }
-    let reps = Array.map(captures, _.1)
-    let environment = L.emit(l.b, ObjectNew(4, -1, len(captures), bitmap(reps)),
-                             Ssa.traced(Ptr))
-    let closure = L.emit(l.b, ClosureNew(symbol, len(captures)), Ssa.traced(Ptr))
-    -- The later use roots the environment across the shell's safepoint.
-    L.effect(l.b, ObjectSet(closure, 1, environment))
-    closure
-}
-
-fun closureFor(l : Lower, symbol : String,
-               captures : Array (String, Rep)) -> Value {
-    let closure = closureShell(l, symbol, captures)
+    let values = []
+    var mutable = 0
     for var i = 0; i < len(captures); i = i + 1 {
-        match Map.get(l.env, captures[i].0) {
-            Some(v) -> L.effect(l.b, ClosureCapture(closure, i, v))
-            None -> {
-                let _ = stop(l, "a capture of the unbound name '"
-                                + captures[i].0 + "'")
+        let (name, r) = captures[i]
+        if Set.contains(later, name) {
+            mutable = mutable + Int.shl(1, i)
+            Array.push(values, storageZero(l, r))
+        } else {
+            match Map.get(l.env, name) {
+                Some(v) -> Array.push(values, v)
+                None -> {
+                    Array.push(values, storageZero(l, r))
+                    let _ = stop(l, "a capture of the unbound name '" + name + "'")
+                }
             }
         }
     }
-    closure
+    let reps = Array.map(captures, _.1)
+    let environment = L.emit(l.b, ObjectNew(4, -1, bitmap(reps), values, mutable),
+                             Ssa.traced(Ptr))
+    L.emit(l.b, ClosureNew(symbol, Some(environment)), Ssa.traced(Ptr))
 }
 
 -- A lambda in value position: lift it, then build the closure.
 fun lambda(l : Lower, params : Array CParam, body : Core, result : Ty.Type) -> Value {
     let captures = capturesOf(l, body, Set.new())
     match lift(l, params, body, result, captures) {
-        Some(symbol) -> closureFor(l, symbol, captures)
+        Some(symbol) -> closureShell(l, symbol, captures, Set.new())
         None -> Ssa.freshValue(l.func, Ssa.untraced(Unit))
     }
 }
@@ -1622,8 +1639,9 @@ fun lambda(l : Lower, params : Array CParam, body : Core, result : Ty.Type) -> V
 -- the slot exists and the closure fills it later. Here no slot is needed --
 -- what has to be known before the lift is a capture's *representation*, and a
 -- closure is a traced pointer whether or not it has been allocated yet. So the
--- shells are made first, the names are bound to them, and the captures are
--- written afterwards, when every sibling is a value that dominates its store.
+-- shells are made first, the names are bound to them, and the captures of
+-- siblings are written afterwards, when every sibling is a value that dominates
+-- its store.
 fun letrec(l : Lower, binds : Array CBind, body : Core, dest : Dest) -> Unit {
     let siblings = Set.new()
     for bind in binds {
@@ -1653,10 +1671,11 @@ fun letrec(l : Lower, binds : Array CBind, body : Core, dest : Dest) -> Unit {
             None -> return
         }
     }
-    -- Every shell exists before any capture is read.
+    -- Every shell exists before a sibling is written into one. Everything
+    -- else a shell captures is in scope already, and is built into it.
     let shells = []
     for (_, symbol, captures) in plans {
-        Array.push(shells, closureShell(l, symbol, captures))
+        Array.push(shells, closureShell(l, symbol, captures, siblings))
     }
     let was = saving(l, Array.map(plans, _.0))
     for var i = 0; i < len(plans) && i < len(shells); i = i + 1 {
@@ -1665,11 +1684,10 @@ fun letrec(l : Lower, binds : Array CBind, body : Core, dest : Dest) -> Unit {
     for var i = 0; i < len(plans) && i < len(shells); i = i + 1 {
         let (_, _, captures) = plans[i]
         for var j = 0; j < len(captures); j = j + 1 {
-            match Map.get(l.env, captures[j].0) {
-                Some(v) -> L.effect(l.b, ClosureCapture(shells[i], j, v))
-                None -> {
-                    let _ = stop(l, "a capture of the unbound name '"
-                                    + captures[j].0 + "'")
+            if Set.contains(siblings, captures[j].0) {
+                match Map.get(l.env, captures[j].0) {
+                    Some(v) -> L.effect(l.b, ClosureCapture(shells[i], j, v))
+                    None -> {}
                 }
             }
         }
@@ -1688,7 +1706,7 @@ fun arrayLiteral(l : Lower, e : Core, elems : Array Core) -> Value {
     -- filled over anyway, and an empty one has no slot to read, so a zero of
     -- the element's own representation is enough in both cases.
     let initial = if len(values) > 0 { values[0] }
-                  else { arrayZero(l, element) }
+                  else { storageZero(l, element) }
     let made = L.emit(l.b, ArrayNew(length, initial, element),
                       Ssa.traced(Ptr))
     for var i = 1; i < len(values); i = i + 1 {
@@ -1698,9 +1716,11 @@ fun arrayLiteral(l : Lower, e : Core, elems : Array Core) -> Value {
     made
 }
 
--- An uninitialized pointer array needs null slots, not allocated boxes of
--- integer zero. This is storage initialization, not a generic scalar value.
-fun arrayZero(l : Lower, r : Rep) -> Value =
+-- What a slot holds before it is written: an array's fill, a placeholder
+-- global's fields, a recursive closure's sibling captures. A pointer slot is
+-- null rather than an allocated box of integer zero -- this is storage
+-- initialization, not a generic scalar value, and it must not allocate.
+fun storageZero(l : Lower, r : Rep) -> Value =
     if r.class_ == Ptr { L.emit(l.b, ConstInt(0), r) }
     else { zero(l, r) }
 
@@ -1834,11 +1854,10 @@ fun compactValue(l : Lower, c : Compact, name : String, ty : Ty.Type,
     L.into(l.b, as_)
     L.terminate(l.b, Jump(after, [x]))
     L.into(l.b, wrap)
-    let object = L.emit(l.b, ObjectNew(1, wrapTag, 1, metadata([Ssa.traced(Ptr)])),
+    let object = L.emit(l.b, ObjectNew(1, wrapTag, metadata([Ssa.traced(Ptr)]), [x], 0),
                         Ssa.traced(Ptr))
     Map.put(l.func.reasons, Ssa.valueId(object),
             "wraps a nested value in " + Ty.shortName(name))
-    L.effect(l.b, ObjectSet(object, 0, x))
     L.terminate(l.b, Jump(after, [object]))
     L.into(l.b, after)
     made
@@ -1909,11 +1928,11 @@ fun constructor(l : Lower, e : Core, name : String, args : Array Core,
             Some(info) -> if len(info.exists) > 0 {
                 packed(l, info, name, args, tag)
             } else {
-                aggregate(l, args, 1, tag, "builds a value with "
-                                            + Ty.shortName(name))
+                aggregate(l, args, 1, tag, mutableCon(l, name),
+                          "builds a value with " + Ty.shortName(name))
             }
-            None -> aggregate(l, args, 1, tag, "builds a value with "
-                                               + Ty.shortName(name))
+            None -> aggregate(l, args, 1, tag, mutableCon(l, name),
+                              "builds a value with " + Ty.shortName(name))
         }
         None -> stop(l, "the constructor '" + name + "' has no tag")
     }
@@ -1935,13 +1954,10 @@ fun packed(l : Lower, info : ConInfo, name : String, args : Array Core,
     }
     for x in args { Array.push(values, value(l, x)) }
     let reps = Array.map(values, Ssa.repOf(l.func, _))
-    let made = L.emit(l.b, ObjectNew(1, tag, len(values), metadata(reps)),
+    let made = L.emit(l.b, ObjectNew(1, tag, metadata(reps), values, 0),
                       Ssa.traced(Ptr))
     Map.put(l.func.reasons, Ssa.valueId(made),
             "packs an existential, " + Ty.shortName(name))
-    for var i = 0; i < len(values); i = i + 1 {
-        L.effect(l.b, ObjectSet(made, i, values[i]))
-    }
     made
 }
 
@@ -2229,7 +2245,7 @@ fun primitive(l : Lower, e : Core, name : String, args : Array Value,
         -- collector may walk this array before anything writes to it, so a
         -- traced slot must hold something it can follow.
         let element = elementRep(l, e.ty)
-        return L.emit(l.b, ArrayNew(args[0], arrayZero(l, element), element),
+        return L.emit(l.b, ArrayNew(args[0], storageZero(l, element), element),
                       Ssa.traced(Ptr))
     }
     if name == "Prim.castAs" && len(args) == 1 {
@@ -2592,10 +2608,13 @@ fun ownerOf(a : Action) -> String = match a {
 -- is a local and not a heap cell.
 fun act(l : Lower, a : Action, held : Map String Rep) -> Unit = match a {
     Placeholder(name, con, fields) -> {
+        -- Filled by the `Field` actions that follow, so every field is
+        -- mutable whatever the constructor, and starts as a zero.
         let reps = []
         for (_, v) in fields { Array.push(reps, repOf(l, v.ty)) }
-        let made = L.emit(l.b, ObjectNew(1, Map.getOr(l.tags, con, -1),
-                                         len(fields), metadata(reps)),
+        let made = L.emit(l.b, ObjectNew(1, Map.getOr(l.tags, con, -1), metadata(reps),
+                                         Array.map(reps, storageZero(l, _)),
+                                         allFields(len(fields))),
                           Ssa.traced(Ptr))
         L.effect(l.b, GlobalStore(name, made))
     }

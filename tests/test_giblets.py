@@ -312,7 +312,7 @@ HIDDEN = (
     "    else { showAll((x, x), k - 1) }\n"                               # 8
     "fun nests(n : Int) -> Int = if n == 0 { poly(n, 3) } else { nests(n - 1) }\n"   # 9
     "fun packs(n : Int) -> Int = if n == 0 {\n"                           # 10
-    "    match Hidden(n) { Hidden(x) -> String.byteLength(show(x)) }\n"   # 11
+    "    match [Hidden(n)][0] { Hidden(x) -> String.byteLength(show(x)) }\n"  # 11
     "} else { packs(n - 1) }\n"                                           # 12
     "fun dicts(n : Int) -> Int = if n == 0 { showAll(n, 3) } else { dicts(n - 1) }\n"  # 13
 )
@@ -322,7 +322,9 @@ HIDDEN = (
     # Polymorphic recursion is never specialized, so the call passes `n`
     # where the type is not known.
     ("nests", "boxes a value to pass it where the type is not known", 9),
-    # An existential packing is an object with the layout codes in front.
+    # An existential packing is an object with the layout codes in front. It
+    # goes into an array so that it outlives the function that opens it: a
+    # packing opened where it is built is read from its operands and deleted.
     ("packs", "packs an existential, Hidden", 11),
     # A class-polymorphic function on an expanding cycle: the tuple its
     # generic body builds, reached through the call.

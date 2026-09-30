@@ -43,6 +43,7 @@ import Turkey.Regalloc as Regalloc
 import Turkey.Roots as Roots
 import Turkey.Frame as Frame
 import Turkey.Emit as Emit
+import Turkey.Escape as Escape
 import Turkey.Asm as Asm
 import Turkey.MachineCheck as MachineCheck
 import Turkey.LowIr as LowIr
@@ -351,6 +352,13 @@ fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable, path : String)
                              + String.join(complaints, "\n  ")), path)
     }
     Giblets.checkLowered(module_.functions, module_.definitions, path)
+    -- After the giblets check, which judges the heap allocations the source
+    -- asked for: whether giblet code allocates must not come to depend on this
+    -- pass. It only swaps an allocation for its frame form, with the same
+    -- operands and result, so the checks above hold of what it leaves.
+    let giblets = Giblets.gibletModules()
+    Escape.run(module_.functions, fun(name) =
+        Set.contains(giblets, Giblets.moduleOf(name)) || name == Giblets.initializerName)
     (module_, skipped)
 }
 
@@ -416,7 +424,8 @@ fun dumpNative(b : String.Builder, path : String) -> Unit {
         let f = selected[i]
         let frame = match Map.get(lows, f.name) {
             Some(low) -> Roots.analyze(low)
-            None -> Roots.Frame { slots = Map.new(), at = Map.new() }
+            None -> Roots.Frame { slots = Map.new(), at = Map.new(), objects = [],
+                                 objectIndex = Map.new(), held = Map.new() }
         }
         let a = Regalloc.allocate(f, frame.slots)
         match a.stopped {
@@ -538,7 +547,8 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
     for f in selected {
         let frame = match Map.get(lows, f.name) {
             Some(low) -> Roots.analyze(low)
-            None -> Roots.Frame { slots = Map.new(), at = Map.new() }
+            None -> Roots.Frame { slots = Map.new(), at = Map.new(), objects = [],
+                                 objectIndex = Map.new(), held = Map.new() }
         }
         let a = Regalloc.allocate(f, frame.slots)
         if let Some(why) = a.stopped {

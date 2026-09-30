@@ -3,6 +3,12 @@
 # Under both C compilers, because a user may have either and each assembles
 # and links the compiler's output with its own toolchain. Built from the
 # committed bootstrap, as a user would build it.
+#
+# `boot` is built once per C compiler and the suite is split across jobs by
+# `scripts/ci-shard.sh`: a free runner has four cores, and the whole suite on
+# one takes over twenty minutes. Each shard runs with `-m ''`, so the
+# fixed point runs in the shard that holds it, overlapping that shard's other
+# tests.
 name: linux
 
 on:
@@ -11,15 +17,39 @@ on:
   pull_request:
 
 jobs:
-  arm64:
+  build:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 90
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         cc: [gcc, clang]
     env:
       TURKEY_CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.cc }}
+      - run: sh scripts/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: boot-${{ matrix.cc }}
+          path: build/stages/stage2
+          retention-days: 1
+
+  test:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+        shard: [self, backend, corpus, language]
+    env:
+      TURKEY_CC: ${{ matrix.cc }}
+      TURKEY_BOOT: ${{ github.workspace }}/boot/stage2
     steps:
       - uses: actions/checkout@v4
         # Whole history: the tests check that the commit
@@ -30,10 +60,12 @@ jobs:
       - run: |
           sudo apt-get update
           sudo apt-get install -y ${{ matrix.cc }} python3-pytest python3-pytest-xdist
-      - run: sh scripts/build.sh
-      - run: python3 -m pytest tests -q
-        env:
-          TURKEY_BOOT: ${{ github.workspace }}/build/stages/stage2
-      - run: python3 -m pytest tests -q -m bootstrap
-        env:
-          TURKEY_BOOT: ${{ github.workspace }}/build/stages/stage2
+      - uses: actions/download-artifact@v4
+        with:
+          name: boot-${{ matrix.cc }}
+          path: boot
+      # An artifact does not keep the executable bit.
+      - run: chmod +x boot/stage2
+      - run: |
+          args=$(sh scripts/ci-shard.sh ${{ matrix.shard }})
+          python3 -m pytest -q -m '' $args

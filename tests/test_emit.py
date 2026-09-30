@@ -9,9 +9,8 @@ offsets and the epilogue. An immediate out of range, a register spelled for the
 wrong file, an `stp` whose offset does not reach -- `as` knows every one of
 those, and a printer written against a manual does not.
 
-What it does not check is behaviour: the module's data and the entry sequence
-are the next slice, so nothing here links or runs yet. `tests/test_native.py`
-remains the executing oracle until arm64 has one.
+What it does not check is behaviour: nothing here links or runs.
+`tests/test_arm64_native.py` runs the corpus.
 """
 
 from __future__ import annotations

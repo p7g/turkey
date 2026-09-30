@@ -152,24 +152,18 @@ programs run directly. CI does this on GitHub's arm64 runners
 (`.github/workflows/linux.yml`), building from the bootstrap and running the
 suite and `pytest -m bootstrap` once under gcc and once under clang.
 
-Two groups of tests depend on the C compiler, and skip, saying why, where it
-cannot do what they need:
-
-- Under gcc, every test that compiles `boot llvm`'s output: gcc cannot
-  compile LLVM IR, and reads a `.ll` as a linker script. That is 217
-  tests with the setup above. With
-  `TURKEY_CC="clang --target=aarch64-linux-gnu -static"`, which links through
-  the same cross binutils and libc, they run and pass.
-- Under that clang, the UBSan probes in `test_allocators.py` and
-  `test_runtime_gc.py`: linking `-fsanitize=undefined` statically needs
-  compiler-rt built for aarch64, which Ubuntu's clang does not ship. gcc's
-  cross toolchain has `libubsan.a`, so under gcc they run.
+One group of tests depends on the C compiler, and skips, saying why, where it
+cannot do what it needs: under
+`TURKEY_CC="clang --target=aarch64-linux-gnu -static"`, the UBSan probes in
+`test_allocators.py` and `test_runtime_gc.py`. Linking `-fsanitize=undefined`
+statically needs compiler-rt built for aarch64, which Ubuntu's clang does not
+ship. gcc's cross toolchain has `libubsan.a`, so under gcc they run.
 
 ## Project status
 
 Turkey is an experimental language under active development. The compiler is
 written in Turkey and compiles itself, with an arm64 backend that emits
-assembly directly and an LLVM path beside it. The standard library is written
+assembly directly. The standard library is written
 in Turkey over a small set of runtime primitives. A Python implementation
 served as the reference while the compiler was ported to Turkey, and was
 retired once the tests ran against the self-hosted one.

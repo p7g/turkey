@@ -6,9 +6,8 @@ last held. `src/MachineCheckCases.gob` builds machine functions by hand, one
 well-formed and the rest each carrying one representation bug, and prints what
 the check says about each.
 
-The first three are the miscompiles a C compiler type-checking emitted LLVM
-found and nothing else did. They stay here as regression tests for the check
-that replaces it.
+The first three are representation bugs that got past every verifier above
+this one, and are kept as regression tests for it.
 """
 
 import functools

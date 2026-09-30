@@ -217,14 +217,6 @@ MADE = (
      "f", "builds an object -- a constructor, tuple, record or dictionary"),
     ("fun f(n : Int) -> Int = H.pick(n)(n)\n",
      "f", "calls through a closure or a dictionary"),
-    # Polymorphic recursion through a newtype, which is erased: the types grow
-    # without anything being built, so `g` is never specialized, and its
-    # generic body boxes `k` to pass it as `b`.
-    ("type W a = W(a)\n"
-     "fun g(x : a, y : b, k : Int) -> Int =\n"
-     "    if k == 0 { 0 } else { g(W(x), k, k - 1) }\n"
-     "fun f(n : Int) -> Int = g(n, n, n)\n",
-     "g", "boxes a value to pass it where the type is not known"),
     # A method of an instance the giblet declares, called through the
     # dictionary an existential carries.
     ("import Std.Classes\n"
@@ -319,10 +311,9 @@ HIDDEN = (
 
 
 @pytest.mark.parametrize("helper, reason, line", [
-    # Polymorphic recursion is never specialized, so the call passes `n`
-    # where the type is not known.
-    ("nests", "boxes a value to pass it where the type is not known", 9),
-    # An existential packing is an object with the layout codes in front.
+    # Polymorphic recursion is compiled per layout, so passing `n` boxes
+    # nothing; what allocates is the tuple the recursion builds.
+    ("nests", "builds a tuple", 5),    # An existential packing is an object with the layout codes in front.
     ("packs", "packs an existential, Hidden", 11),
     # A class-polymorphic function on an expanding cycle: the tuple its
     # generic body builds, reached through the call.
@@ -336,6 +327,20 @@ def test_an_allocation_nobody_wrote_is_named_where_it_came_from(
     assert f"@f calls @{helper} (" in stderr, stderr
     assert re.search(rf"which {re.escape(reason)} \([^)]*Probe_helper_\w+\.gob:"
                      rf"{line}:\d+\)", stderr), stderr
+
+
+def test_polymorphic_recursion_allocates_nothing(lowered):
+    """Through a newtype, which is erased, the types grow without anything
+    being built, so `g` is never specialized by type. It is compiled per layout
+    instead, so it holds `k` as the `Int` it is: nothing is boxed to pass it
+    where the type is not known."""
+    code, _, stderr = lowered(
+        "type W a = W(a)\n"
+        "fun g(x : a, y : b, k : Int) -> Int =\n"
+        "    if k == 0 { 0 } else { g(W(x), k, k - 1) }\n"
+        "fun f(n : Int) -> Int = g(n, n, n)\n",
+        MADE, exports="P(..), tuple, array, record, closure, pick, h")
+    assert code == 0, stderr
 
 
 def test_a_giblet_calling_a_giblet_holds_no_root(lowered):

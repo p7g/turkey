@@ -1,0 +1,125 @@
+-- Generic bodies the specializer gives up on, each exchanging a value with
+-- ground code by a route other than a direct call's arguments: a dictionary's
+-- method, a field, an array element, a closure, an associated type, a
+-- constructor variable. Every one is compiled per layout, and each result here
+-- is what a body that held the value at some other representation got wrong.
+--
+-- The `junk` parameter recurses at a growing type, which is what makes the
+-- specializer give up, without changing the type the rest of the body is
+-- about. The numbers are large so that a raw one read as a pointer, or a
+-- pointer read as a number, cannot pass by accident.
+
+type Box a = Box(a)
+
+type Id a = Id(a)
+
+class Maker a {
+    fun make(a) -> Option a
+}
+
+instance Maker Int {
+    fun make(x) = Some(x + 1)
+}
+
+-- A method of a dictionary, called with values of the body's variable.
+fun same[Eq a](x : a, y : a, n : Int, junk : b) -> Bool {
+    if n > 0 { return same(x, y, n - 1, (junk, junk)) }
+    x == y
+}
+
+-- A dictionary's method returning data the body takes apart.
+fun bump[Maker a](x : a, n : Int, junk : b) -> a {
+    if n > 0 { return bump(x, n - 1, (junk, junk)) }
+    match make(x) {
+        Some(y) -> y
+        None -> x
+    }
+}
+
+-- An associated type: `Item t` is `Int` for one `t` and `String` for another,
+-- though both `t`s are arrays.
+fun firstOr[Iterator t](c : t, d : Item t, n : Int, junk : b) -> Item t {
+    if n > 0 { return firstOr(c, d, n - 1, (junk, junk)) }
+    let cur = iter(c)
+    match next(c, cur) {
+        Some(x) -> x
+        None -> d
+    }
+}
+
+-- A value built here and taken apart by a ground reader.
+fun boxed(x : a, n : Int, junk : b) -> Box a {
+    if n > 0 { return boxed(x, n - 1, (junk, junk)) }
+    Box(x)
+}
+
+-- An array literal of the body's variable.
+fun pair(x : a, n : Int, junk : b) -> Array a {
+    if n > 0 { return pair(x, n - 1, (junk, junk)) }
+    [x, x]
+}
+
+-- A closure made here, called by ground code.
+fun adder(x : a, n : Int, junk : b) -> fun(a) -> Array a {
+    if n > 0 { return adder(x, n - 1, (junk, junk)) }
+    fun(y) = [y, x]
+}
+
+-- A local function the body uses at its own variable.
+fun twiceOver(x : a, n : Int, junk : b) -> Array a {
+    if n > 0 { return twiceOver(x, n - 1, (junk, junk)) }
+    fun twice(y) = [y, y]
+    let ns = twice(100000)
+    let xs = twice(x)
+    [xs[0], xs[1], x]
+}
+
+-- A method with a type parameter of its own, `Hash.hashInto`, called through
+-- a dictionary the body was handed: the dictionary carries it once per layout
+-- that parameter is used at.
+fun spread[Hash k](m : Map k Int, key : k, n : Int, junk : b) -> Int {
+    if n > 0 { return spread(m, key, n - 1, (junk, junk)) }
+    Map.put(m, key, n + 100000)
+    match Map.get(m, key) {
+        Some(v) -> v
+        None -> 1
+    }
+}
+
+-- The same through a constructor class: `map` is polymorphic in its element
+-- types, and here they are `Int`.
+fun bumpAll[Functor f](xs : f Int, n : Int, junk : b) -> f Int {
+    if n > 0 { return bumpAll(xs, n - 1, (junk, junk)) }
+    map(xs, fun(x) = x + 100000)
+}
+
+-- A constructor variable, instantiated at a type that is its payload.
+fun pick(xs : Array (f a), n : Int) -> f a {
+    if n > 0 { let _ = pick([xs], n - 1) }
+    xs[0]
+}
+
+fun main() {
+    print(same(100000, 100000, 3, 0))
+    print(same(1.5, 2.5, 3, 0))
+    print(bump(100000, 3, 0))
+    print(firstOr([100000, 2], 0, 3, 0))
+    print(firstOr(["a", "b"], "z", 3, 0))
+    let Box(v) = boxed(100000, 3, 0)
+    print(v + 1)
+    let xs = pair(100000, 3, 0)
+    print(xs[0] + xs[1])
+    let ys = adder(100000, 3, 0)(200000)
+    print(ys[0] + ys[1])
+    let zs = twiceOver(100000, 3, 0)
+    print(zs[0] + zs[1] + zs[2])
+    let Id(w) = pick([Id(100000), Id(7)], 3)
+    print(w)
+    print(spread(Map.new(), 5, 3, 0))
+    print(spread(Map.new(), "k", 3, 0))
+    match bumpAll(Some(1), 3, 0) {
+        Some(v) -> print(v)
+        None -> print("none")
+    }
+    print(bumpAll([1, 2], 3, 0)[1])
+}

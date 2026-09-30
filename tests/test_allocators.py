@@ -1,7 +1,10 @@
 """The Turkey allocator exports, called from C without running the program."""
 
+import gzip
 import os
+import re
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -203,3 +206,23 @@ def test_allocator_symbols_are_defined_only_in_turkey(allocator_object):
     generated = defined(allocator_object)
     for name in names:
         assert generated.count(name) == 1
+
+
+def test_box_and_unbox_are_kept_only_while_the_bootstrap_calls_them():
+    """`Turkey.Alloc` defines `turkey_box` and `turkey_unbox` although today's
+    compiler never emits a call to either: the committed bootstrap compiler,
+    which builds the first stage, does. A bump whose compiler no longer calls
+    them makes them dead, and this is what says so, in the bump's own run."""
+    root = Path(__file__).resolve().parents[1]
+    calls = re.compile(r'\bbl "_?turkey_(un)?box"')
+    called = any(calls.search(gzip.decompress(artifact.read_bytes()).decode())
+                 for artifact in sorted((root / "bootstrap").glob("*.s.gz")))
+    alloc = (root / "lib" / "Turkey" / "Alloc.gob").read_text()
+    defined = '"turkey_box"' in alloc or '"turkey_unbox"' in alloc
+    assert called or not defined, (
+        "the committed bootstrap no longer calls turkey_box or turkey_unbox, so "
+        "remove them now: Alloc.box/unbox and their exports, Heap.validObjectKind "
+        "and validHeapPointer, object kind 5 (HeapCheck's `kind > 5` and the "
+        "`, box N` field of the TURKEY_GC_STATS line), and this test; the C "
+        "probes in this file and tests/test_heap_verifier.py use turkey_box as "
+        "a small allocator and need another")

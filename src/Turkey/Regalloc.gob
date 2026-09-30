@@ -194,14 +194,14 @@ fun effectivePressure(f : Func A.Inst) -> Pressure {
     -- The traced values live across some call: exactly what `Turkey.Roots`
     -- gives a slot to, recomputed here on the machine graph because selection
     -- keeps the value numbering and this module cannot see a `Func Low`.
-    let rooted = Set.new()
+    let rooted = BitSet.new(len(f.reps))
     for var b = 0; b < len(f.blocks); b = b + 1 {
         let block = f.blocks[b]
         let after = Ssa.liveAfter(f, Ssa.BlockId(b), liveOut[b])
         for var n = 0; n < len(block.insts); n = n + 1 {
             if A.isCall(block.insts[n]) {
                 for id in after[n] {
-                    if f.reps[id].traced { Set.add(rooted, id) }
+                    if f.reps[id].traced { BitSet.add(rooted, id) }
                 }
             }
         }
@@ -223,11 +223,11 @@ fun effectivePressure(f : Func A.Inst) -> Pressure {
 }
 
 fun countExcept(f : Func A.Inst, live : Array Int,
-                skip : Set.Set Int) -> (Int, Int) {
+                skip : BitSet) -> (Int, Int) {
     var gp = 0
     var fp = 0
     for id in live {
-        if !Set.contains(skip, id) {
+        if !BitSet.contains(skip, id) {
             match A.bankOf(f.reps[id]) {
                 Gp -> { gp = gp + 1 }
                 Fp -> { fp = fp + 1 }
@@ -291,7 +291,7 @@ type Walk = Walk {
     f         : Func A.Inst,
     spills    : Spills,
     evict     : Bool,
-    forbidden : Array (Set.Set Int),
+    forbidden : Array Int,
     hints     : Array Int,
     of_       : Array Int,
     stopped   : Option String,
@@ -470,18 +470,18 @@ fun stopOnce(w : Walk, why : String) -> Unit = match w.stopped {
 -- *hinted* to their argument registers rather than pinned to them -- a pin
 -- can contradict (a parameter in `x0` that is live across a call has had `x0`
 -- destroyed), and a preference cannot.
-fun freeRegister(taken : Map RegKey Int, forbidden : Set.Set Int, bank : Bank,
+fun freeRegister(taken : Map RegKey Int, forbidden : Int, bank : Bank,
                  hint : Int) -> Option Int {
     -- Only a register the pool would hand out: a move from `x29`, which is
     -- how `Prim.frameAddress` reads the frame, must not colour its
     -- destination into the frame register itself.
     if hint >= 0 && Array.contains(poolOf(bank), hint)
        && !Map.contains(taken, keyIn(bank, hint))
-       && !Set.contains(forbidden, hint) {
+       && !forbids(forbidden, hint) {
         return Some(hint)
     }
     for n in poolOf(bank) {
-        if !Map.contains(taken, keyIn(bank, n)) && !Set.contains(forbidden, n) {
+        if !Map.contains(taken, keyIn(bank, n)) && !forbids(forbidden, n) {
             return Some(n)
         }
     }
@@ -556,16 +556,16 @@ let gpPool = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
 let fpPool = [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
               26, 27, 28, 29, 30, 31, 8, 9, 10, 11, 12, 13, 14, 15]
 
--- For each value, the register numbers it may not take.
+-- For each value, the register numbers it may not take, as a mask: bit `n`
+-- for register `n`. Every register number in either file is below 32, so one
+-- word holds the set, and the value's bank says which file it is of.
 --
 -- One sweep: at every instruction, whatever physical registers it writes are
 -- denied to every value live *across* it, and a call writes all of the
 -- caller-saved ones. A value never live across such a point collects an empty
 -- set and takes the first register in the pool.
-fun forbiddenSets(f : Func A.Inst,
-                  liveOut : Array BitSet) -> Array (Set.Set Int) {
-    let out : Array (Set.Set Int) = []
-    for _ in f.reps { Array.push(out, Set.new()) }
+fun forbiddenSets(f : Func A.Inst, liveOut : Array BitSet) -> Array Int {
+    let out = Array.filled(len(f.reps), 0)
     for var b = 0; b < len(f.blocks); b = b + 1 {
         let block = f.blocks[b]
         let after = Ssa.liveAfter(f, Ssa.BlockId(b), liveOut[b])
@@ -576,7 +576,7 @@ fun forbiddenSets(f : Func A.Inst,
                 for id in after[n] {
                     let bank = A.bankOf(f.reps[id])
                     for (cb, cn) in clobbered {
-                        if sameBank(bank, cb) { Set.add(out[id], cn) }
+                        if sameBank(bank, cb) { out[id] = forbid(out[id], cn) }
                     }
                 }
             }
@@ -587,12 +587,12 @@ fun forbiddenSets(f : Func A.Inst,
             -- register.
             let held = physical[n]
             if len(held.gp) > 0 || len(held.fp) > 0 {
-                for id in Set.elements(touched(block.insts[n], after[n])) {
+                for id in touched(block.insts[n], after[n]) {
                     let taken = match A.bankOf(f.reps[id]) {
                         Gp -> held.gp
                         Fp -> held.fp
                     }
-                    for r in taken { Set.add(out[id], r) }
+                    for r in taken { out[id] = forbid(out[id], r) }
                 }
             }
         }
@@ -600,12 +600,22 @@ fun forbiddenSets(f : Func A.Inst,
     out
 }
 
+fun forbids(mask : Int, n : Int) -> Bool = Int.and(Int.shr(mask, n), 1) != 0
+
+fun forbid(mask : Int, n : Int) -> Int = Int.or(mask, Int.shl(1, n))
+
 -- The values live after an instruction, plus the ones it defines whether or
--- not they are used. A dead definition still writes a register.
-fun touched(i : A.Inst, after : Array Int) -> Set.Set Int {
-    let out = Set.new()
-    for id in after { Set.add(out, id) }
-    for d in Ssa.defs(i) { Set.add(out, Ssa.valueId(d)) }
+-- not they are used. A dead definition still writes a register. Without
+-- repeats: a definition may be live after, and an instruction defines one or
+-- two values, so a scan finds it.
+fun touched(i : A.Inst, after : Array Int) -> Array Int {
+    let defined = Ssa.defs(i)
+    if len(defined) == 0 { return after }
+    let out = Array.slice(after, 0, len(after))
+    for d in defined {
+        let id = Ssa.valueId(d)
+        if !Array.contains(out, id) { Array.push(out, id) }
+    }
     out
 }
 
@@ -628,29 +638,29 @@ fun physicalLive(block : Ssa.Block A.Inst) -> (Array PhysicalLive, PhysicalLive)
     let nothing = PhysicalLive { gp = [], fp = [] }
     let sets : Array PhysicalLive = Array.new(len(block.insts))
     for _ in block.insts { Array.push(sets, nothing) }
-    let gp = Set.new()
-    let fp = Set.new()
+    let gp = BitSet.new(32)
+    let fp = BitSet.new(32)
     for var n = len(block.insts) - 1; n >= 0; n = n - 1 {
-        if len(gp) > 0 || len(fp) > 0 {
-            sets[n] = PhysicalLive { gp = Set.elements(gp), fp = Set.elements(fp) }
+        if !BitSet.isEmpty(gp) || !BitSet.isEmpty(fp) {
+            sets[n] = PhysicalLive { gp = BitSet.elements(gp), fp = BitSet.elements(fp) }
         }
         let op = block.insts[n].op
         for r in A.destRegs(op) {
             match r {
-                Physical(Gp, k) -> { let _ = Set.remove(gp, k) }
-                Physical(Fp, k) -> { let _ = Set.remove(fp, k) }
+                Physical(Gp, k) -> { let _ = BitSet.remove(gp, k) }
+                Physical(Fp, k) -> { let _ = BitSet.remove(fp, k) }
                 Virtual(_) -> {}
             }
         }
         for r in A.srcRegs(op) {
             match r {
-                Physical(Gp, k) -> if k != 31 && k != 29 { Set.add(gp, k) }
-                Physical(Fp, k) -> Set.add(fp, k)
+                Physical(Gp, k) -> if k != 31 && k != 29 { BitSet.add(gp, k) }
+                Physical(Fp, k) -> BitSet.add(fp, k)
                 Virtual(_) -> {}
             }
         }
     }
-    (sets, PhysicalLive { gp = Set.elements(gp), fp = Set.elements(fp) })
+    (sets, PhysicalLive { gp = BitSet.elements(gp), fp = BitSet.elements(fp) })
 }
 
 fun sameBank(a : Bank, b : Bank) -> Bool = match (a, b) {
@@ -721,7 +731,7 @@ fun verifyColouring(f : Func A.Inst, c : Colouring) -> Array String {
         let none = PhysicalLive { gp = [], fp = [] }
         for var n = 0; n < len(block.insts); n = n + 1 {
             checkPoint(out, f, c, forbidden,
-                       Set.elements(touched(block.insts[n], after[n])),
+                       touched(block.insts[n], after[n]),
                        physical[n], where_(b, n))
         }
         checkPoint(out, f, c, forbidden, BitSet.elements(liveOut[b]), none,
@@ -733,7 +743,7 @@ fun verifyColouring(f : Func A.Inst, c : Colouring) -> Array String {
 -- One program point: the values live there and the ones just defined, which
 -- is every value holding a register at that moment.
 fun checkPoint(out : Array String, f : Func A.Inst, c : Colouring,
-               forbidden : Array (Set.Set Int), live : Array Int,
+               forbidden : Array Int, live : Array Int,
                physical : PhysicalLive, at : String) -> Unit {
     let seen = Map.new()
     for id in live {
@@ -758,7 +768,7 @@ fun checkPoint(out : Array String, f : Func A.Inst, c : Colouring,
                     + at)
                 None -> Map.put(seen, slot, id)
             }
-            if Set.contains(forbidden[id], r) {
+            if forbids(forbidden[id], r) {
                 Array.push(out, "value %" + Int.toString(id) + " holds " + k
                                 + ", which is clobbered while it is live, at "
                                 + at)
@@ -790,9 +800,9 @@ fun where_(b : Int, n : Int) -> String =
 -- spiller does, and this says by how much.
 fun untracedPressure(f : Func A.Inst) -> Pressure {
     let liveOut = Ssa.liveness(f)
-    let traced = Set.new()
+    let traced = BitSet.new(len(f.reps))
     for var id = 0; id < len(f.reps); id = id + 1 {
-        if f.reps[id].traced { Set.add(traced, id) }
+        if f.reps[id].traced { BitSet.add(traced, id) }
     }
     var gp = 0
     var fp = 0

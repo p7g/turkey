@@ -26,6 +26,8 @@ module Turkey.Roots (
 -- emitter: arm64 wants `adds` and a flag register the IR cannot name, and
 -- expanding them target-neutrally in the IR would cost what the flag saves.
 
+import Data.BitSet as BitSet
+import Data.BitSet (BitSet)
 import Data.Map as Map
 import Data.Set as Set
 import Turkey.Escape as Escape
@@ -98,21 +100,20 @@ fun analyze(f : Func Low) -> Frame {
     let constants = constantsOf(f)
     let addresses = Set.new()
     for o in objects {
-        Set.add(constants, o.id)
+        BitSet.add(constants, o.id)
         Set.add(addresses, o.id)
     }
     let held = if len(objects) == 0 { Map.new() }
                else { slotsHeld(f, objects, objectIndex, Escape.reach(f, addresses)) }
-    let needed = Set.new()
+    let needed = BitSet.new(len(f.reps))
     let at = Map.new()
     for var b = 0; b < len(f.blocks); b = b + 1 {
         let after = Ssa.liveAfter(f, BlockId(b), live[b])
         let insts = Ssa.blockAt(f, BlockId(b)).insts
         for var n = 0; n < len(insts); n = n + 1 {
             if isSafepoint(insts[n].op) {
-                let here = Array.sort(Set.elements(
-                    across(f, constants, after[n], insts[n])))
-                for id in here { Set.add(needed, id) }
+                let here = across(f, constants, after[n], insts[n])
+                for id in here { BitSet.add(needed, id) }
                 Map.put(at, key(b, n), here)
             }
         }
@@ -120,7 +121,7 @@ fun analyze(f : Func Low) -> Frame {
     -- Sorted, so the slot a value gets does not depend on a set's iteration
     -- order and two runs produce the same output.
     let slots = Map.new()
-    let ids = Array.sort(Set.elements(needed))
+    let ids = BitSet.elements(needed)
     for var i = 0; i < len(ids); i = i + 1 { Map.put(slots, ids[i], i) }
     Frame { slots = slots, at = at, objects = objects, objectIndex = objectIndex,
             held = held }
@@ -204,30 +205,31 @@ fun slotsHeld(f : Func Low, objects : Array FrameObject, objectIndex : Map Int I
         out
     }
     let count = len(f.blocks)
-    let liveIn : Array (Set.Set Int) = []
-    for var b = 0; b < count; b = b + 1 { Array.push(liveIn, Set.new()) }
-    -- Backwards through one block from its live-out set, calling `at` with
-    -- each safepoint's published objects.
-    let walk = fun(b : Int, at : fun(Int, Set.Set Int) -> Unit) -> Set.Set Int {
-        let live = Set.new()
+    let size = len(objects)
+    let liveIn : Array BitSet = []
+    for var b = 0; b < count; b = b + 1 { Array.push(liveIn, BitSet.new(size)) }
+    let live = BitSet.new(size)
+    -- Backwards through one block into `live`, from its live-out set, calling
+    -- `at` with each safepoint's published objects.
+    let walk = fun(b : Int, at : fun(Int, BitSet) -> Unit) -> Unit {
+        BitSet.clear(live)
         for s in Ssa.successors(f.blocks[b].term) {
-            for k in Set.elements(liveIn[Ssa.blockId(s)]) { Set.add(live, k) }
+            let _ = BitSet.unionInto(live, liveIn[Ssa.blockId(s)])
         }
         for v in Ssa.termUses(f.blocks[b].term) {
-            for k in of_(v) { Set.add(live, k) }
+            for k in of_(v) { BitSet.add(live, k) }
         }
         let insts = f.blocks[b].insts
         for var n = len(insts) - 1; n >= 0; n = n - 1 {
             match Map.get(objectIndex, Ssa.valueId(insts[n].result)) {
-                Some(k) -> { let _ = Set.remove(live, k) }
+                Some(k) -> { let _ = BitSet.remove(live, k) }
                 None -> {}
             }
             for v in Ssa.uses(insts[n]) {
-                for k in of_(v) { Set.add(live, k) }
+                for k in of_(v) { BitSet.add(live, k) }
             }
             if isSafepoint(insts[n].op) { at(n, live) }
         }
-        live
     }
     let order = Array.reverse(Ssa.reversePostorder(f))
     var changed = True
@@ -235,18 +237,20 @@ fun slotsHeld(f : Func Low, objects : Array FrameObject, objectIndex : Map Int I
         changed = False
         for block in order {
             let b = Ssa.blockId(block)
-            let entering = walk(b, fun(_, _) = {})
-            if len(entering) != len(liveIn[b]) { changed = True }
-            liveIn[b] = entering
+            walk(b, fun(_, _) = {})
+            if !BitSet.equal(live, liveIn[b]) {
+                BitSet.copyFrom(liveIn[b], live)
+                changed = True
+            }
         }
     }
     let held = Map.new()
     for var b = 0; b < count; b = b + 1 {
-        let _ = walk(b, fun(n, live) = {
-            if len(live) > 0 { Map.put(held, key(b, n), Array.sort(Set.elements(live))) }
+        walk(b, fun(n, here) = {
+            if !BitSet.isEmpty(here) { Map.put(held, key(b, n), BitSet.elements(here)) }
         })
     }
-    for k in Set.elements(liveIn[Ssa.blockId(f.entry)]) { objects[k].zeroed = True }
+    for k in BitSet.elements(liveIn[Ssa.blockId(f.entry)]) { objects[k].zeroed = True }
     held
 }
 
@@ -271,17 +275,25 @@ fun slotsHeld(f : Func Low, objects : Array FrameObject, objectIndex : Map Int I
 --
 -- Both halves have to hold at once, and getting either backwards produces a
 -- wrong answer at run time rather than a failure here.
-fun across(f : Func Low, constants : Set.Set Int, live : Array Int,
-           i : Low) -> Set.Set Int {
-    let out = Set.new()
+--
+-- Ascending and without repeats. `live` already is, so only an operand that
+-- is not in it needs placing, and an instruction has a handful.
+fun across(f : Func Low, constants : BitSet, live : Array Int,
+           i : Low) -> Array Int {
+    let out = []
     for id in live {
-        if id != Ssa.valueId(i.result) && root(f, constants, id) { Set.add(out, id) }
+        if id != Ssa.valueId(i.result) && root(f, constants, id) { Array.push(out, id) }
     }
+    var extra = False
     for v in Ssa.uses(i) {
         let id = Ssa.valueId(v)
-        if id != Ssa.valueId(i.result) && root(f, constants, id) { Set.add(out, id) }
+        if id != Ssa.valueId(i.result) && root(f, constants, id)
+           && !Array.contains(out, id) {
+            Array.push(out, id)
+            extra = True
+        }
     }
-    out
+    if extra { Array.sort(out) } else { out }
 }
 
 -- A traced value the collector has something to find at. A constant is not
@@ -289,16 +301,16 @@ fun across(f : Func Low, constants : Set.Set Int, live : Array Int,
 -- passes, or the fill of a fresh pointer array -- and a null names no object.
 -- Rooting one costs a store per call site, and gives a function that holds
 -- nothing a root frame anyway.
-fun root(f : Func Low, constants : Set.Set Int, id : Int) -> Bool =
+fun root(f : Func Low, constants : BitSet, id : Int) -> Bool =
     if id < 0 || id >= len(f.reps) { False }
-    else { f.reps[id].traced && !Set.contains(constants, id) }
+    else { f.reps[id].traced && !BitSet.contains(constants, id) }
 
-fun constantsOf(f : Func Low) -> Set.Set Int {
-    let out = Set.new()
+fun constantsOf(f : Func Low) -> BitSet {
+    let out = BitSet.new(len(f.reps))
     for block in f.blocks {
         for i in block.insts {
             match i.op {
-                ConstInt(_) -> Set.add(out, Ssa.valueId(i.result))
+                ConstInt(_) -> BitSet.add(out, Ssa.valueId(i.result))
                 _ -> {}
             }
         }

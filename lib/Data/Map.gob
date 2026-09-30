@@ -95,8 +95,11 @@ fun findSlot[Eq k](m : Map k v, h : Int, key : k, isSearching : Bool) -> Int {
                     None    -> index
                 }
             }
+            -- An insert takes the first tombstone on the probe path, but only
+            -- once it reaches `Empty`: the key may still be further along, and
+            -- reusing the slot before looking would store it twice.
             Tombstone -> {
-                if isSearching && firstTombstone == None {
+                if !isSearching && firstTombstone == None {
                     firstTombstone = Some(index)
                 }
             }
@@ -120,7 +123,10 @@ fun put[Hash k](m : Map k v, key : k, value : v) -> Unit {
             bucket.value = value
             return
         }
-        _ -> ()
+        Tombstone -> {
+            m.tombstoneCount = m.tombstoneCount - 1
+        }
+        Empty -> ()
     }
 
     let bucket = Bucket {
@@ -193,8 +199,20 @@ fun delete[Hash k](m : Map k v, key : k) -> Bool {
     True
 }
 
+-- Called when live entries and tombstones together pass the load factor, and
+-- rehashing drops every tombstone. The table doubles only when live entries
+-- alone fill more than half the load factor; otherwise it is rebuilt at the
+-- same size. That keeps a map whose size is steady under delete/put churn at a
+-- constant capacity, and the half is the hysteresis: a same-size rehash leaves
+-- at least `cap * loadFactor / 2` puts before the next one, so rehashing stays
+-- amortized constant per operation instead of firing on every put when `size`
+-- sits just under the threshold.
 fun resize(m : Map k v) -> Unit {
-    let newCap = m.cap * 2
+    let newCap = if Prim.intToFloat(m.size) > Prim.intToFloat(m.cap) * loadFactor / 2.0 {
+        m.cap * 2
+    } else {
+        m.cap
+    }
     m.table = Prim.arrayNew(newCap, Empty)
     m.cap = newCap
     m.tombstoneCount = 0

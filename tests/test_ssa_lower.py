@@ -419,15 +419,23 @@ def test_a_loop_over_many_element_types_calls_no_method_indirectly():
 
 
 def _many_map_types(count: int) -> str:
-    """A program that fills maps at `count` value types."""
-    lines = []
+    """A program that fills maps at `count` value types, and one that `Map.put`
+    stays generic in: `spread` recurses at a growing type, so it is never
+    specialized by type, and calls `Map.put` with the `Hash` dictionary it was
+    handed."""
+    lines = [
+        "fun spread[Hash k](m : Map k Int, key : k, n : Int, junk : b) -> Int {\n"
+        "    if n > 0 { return spread(m, key, n - 1, (junk, junk)) }\n"
+        "    Map.put(m, key, n)\n"
+        "    match Map.get(m, key) {\n        Some(v) -> v\n        None -> 1\n    }\n}"]
     for i in range(count):
         lines.append(f"type V{i} = V{i} {{ x : Int }}")
         lines.append(f"fun fill{i}(m : Map Int V{i}) -> Int {{\n"
                      f"    Map.put(m, {i}, V{i} {{ x = {i} }})\n"
                      f"    match Map.get(m, {i}) {{\n"
                      f"        Some(v) -> v.x\n        None -> 0\n    }}\n}}")
-    calls = " + ".join(f"fill{i}(Map.new())" for i in range(count))
+    calls = " + ".join([f"fill{i}(Map.new())" for i in range(count)]
+                       + ["spread(Map.new(), 5, 3, 0)"])
     lines.append(f"fun main() {{ print({calls}) }}")
     return "\n".join(lines) + "\n"
 

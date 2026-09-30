@@ -8,7 +8,7 @@ module Turkey.Decls (
     star, toType, instantiateCon, con, recordFields, existentialFields,
     fieldType, projectionTypes,
     substitute, newtypes, erasedPayload, conFieldTypes, conFieldTypesOpened,
-    variantCount,
+    variantCount, Compact(..), compactShape, compactOf,
     showDeclarations,
 )
 
@@ -727,6 +727,50 @@ fun conFieldTypes(t : DeclTable, receiver : Ty.Type,
         }
     }
 }
+
+-- A sum whose constructors are nullary but for one, and that one positional
+-- with a single field: `Option a`, `Data.Map`'s `Entry`. Where that field is
+-- held at a traced pointer, a value of the sum is one word -- see
+-- `Turkey.SsaLower`'s compact sums -- and elsewhere it is an ordinary object.
+-- Which of the two a value is depends on the instantiation, so code that builds
+-- or tests one at a type variable needs that variable's layout
+-- (`Turkey.Layout.constructs`).
+--
+-- Existential and record constructors disqualify a sum: a packed value carries
+-- its layout codes, and a record has identity if a field is a `var`.
+type Compact = Compact {
+    -- In declaration order: a nullary's word is its index here.
+    nullaries : Array String,
+    payload   : String,
+}
+
+-- The compact shape of the declared type `tycon`, if it has one. Fewer than
+-- 4096 nullaries, which is the range of words a pointer never takes.
+fun compactShape(t : DeclTable, tycon : String) -> Option Compact {
+    let info = match Map.get(t.tycons, tycon) {
+        Some(i) -> i
+        None -> return None
+    }
+    let nullaries = []
+    let carrying = []
+    for v in info.variants {
+        if isRecord(v) || len(v.exists) > 0 { return None }
+        if v.arity == 0 { Array.push(nullaries, v.name) }
+        else if v.arity == 1 { Array.push(carrying, v.name) }
+        else { return None }
+    }
+    if len(nullaries) == 0 || len(nullaries) >= 4096 || len(carrying) != 1 {
+        return None
+    }
+    Some(Compact { nullaries = nullaries, payload = carrying[0] })
+}
+
+-- The compact shape of the type the constructor `name` belongs to.
+fun compactOf(t : DeclTable, name : String) -> Option Compact =
+    match Map.get(t.constructors, name) {
+        Some(info) -> compactShape(t, info.tycon)
+        None -> None
+    }
 
 -- How many variants the constructor's type has. One means there is nothing to
 -- distinguish and a pattern needs no tag test.

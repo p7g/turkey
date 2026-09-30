@@ -283,7 +283,7 @@ fun run(s : Sel) -> Unit {
 fun terminate(s : Sel, t : Term) -> Unit = match t {
     Panic(v) -> {
         s.panicking = True
-        call(s, temp(s, Ssa.untraced(I64)), A.Gp, A.Gp,
+        call(s, temp(s, Ssa.untraced(I64)), A.Gp, Some(A.Gp),
              Some(runtimeSymbolOf(s, "turkey_panic_string")), A.xzr,
              [(A.reg(v), A.Gp)])
         s.panicking = False
@@ -515,7 +515,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             let want = A.bankOf(r)
             match callee {
                 Direct(name) ->
-                    call(s, d, want, want, Some(symbolFor(s, name)), A.xzr, passed)
+                    call(s, d, want, Some(want), Some(symbolFor(s, name)), A.xzr, passed)
                 Runtime(name) -> match runtimeSymbol(s, name) {
                     -- The stack arguments below are this compiler's own
                     -- convention, and a C function would not read them the
@@ -549,7 +549,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                     -- `runtimeFor` and not the bare name: the object format
                     -- decides how a C symbol is spelled, for this one as for
                     -- `turkey_print`.
-                    call(s, d, want, want, Some(runtimeSymbolOf(s, symbol)),
+                    call(s, d, want, Some(want), Some(runtimeSymbolOf(s, symbol)),
                          A.xzr, passed)
                 }
                 -- A closure: the code is slot 0 and the environment slot 1,
@@ -563,7 +563,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                     -- Every argument and the result of a closure call is
                     -- boxed, so this one is entirely in the general file
                     -- whatever the underlying function's types are.
-                    call(s, d, want, want, None, code,
+                    call(s, d, want, Some(want), None, code,
                          Array.append([(env, A.Gp)], passed))
                 }
             }
@@ -588,7 +588,7 @@ fun runtimeCall(s : Sel, d : Reg, sym : String, first : Array Reg,
                 rest : Array Reg) -> Unit {
     let args = []
     for a in Array.append(first, rest) { Array.push(args, (a, A.Gp)) }
-    call(s, d, A.Gp, A.Gp, Some(sym), A.xzr, args)
+    call(s, d, A.Gp, Some(A.Gp), Some(sym), A.xzr, args)
 }
 
 -- A value as a general register holding its bits.
@@ -637,7 +637,7 @@ fun move(s : Sel, d : Reg, dBank : A.Bank, a : Reg, aBank : A.Bank) -> Unit =
 -- passes is a word; only Turkey functions receive more than eight, so the
 -- convention is this compiler's (`incoming` is the other half). The slots are
 -- a preallocated area at the bottom of the frame, so nothing moves `sp`.
-fun call(s : Sel, d : Reg, dBank : A.Bank, resultBank : A.Bank,
+fun call(s : Sel, d : Reg, dBank : A.Bank, answers : Option A.Bank,
          sym : Option String, indirect : Reg,
          args : Array (Reg, A.Bank)) -> Unit {
     let ins = []
@@ -675,8 +675,12 @@ fun call(s : Sel, d : Reg, dBank : A.Bank, resultBank : A.Bank,
     -- liveness today. That is correct rather than pointless: the fact is
     -- recorded where the allocator will read it, and the allocator is what
     -- teaches `uses`/`defs` about physical registers.
-    let out = match resultBank { Gp -> A.x0; Fp -> A.d0 }
-    emit(s, A.CallArgs(ins, [out]))
+    let outs = match answers {
+        Some(Gp) -> [A.x0]
+        Some(Fp) -> [A.d0]
+        None -> []
+    }
+    emit(s, A.CallArgs(ins, outs))
     match sym {
         Some(name) -> emit(s, A.Bl(name))
         None -> emit(s, A.Blr(indirect))
@@ -693,7 +697,19 @@ fun call(s : Sel, d : Reg, dBank : A.Bank, resultBank : A.Bank,
     -- The callee's result file and the destination's need not agree:
     -- `turkey_unbox` answers a double's bits in `x0`, and the value being
     -- built is a double.
-    move(s, d, dBank, out, resultBank)
+    --
+    -- A C function declared `void` writes no result register, so what `x0`
+    -- holds after one is whatever was there before -- and the destination
+    -- may be a traced pointer, since `System.Env#exit` returns any type. The
+    -- IR still gave the call a result, so it is defined, as zero: null, which
+    -- the collector skips.
+    match answers {
+        Some(bank) -> move(s, d, dBank, outs[0], bank)
+        None -> match dBank {
+            Gp -> emit(s, A.Mov(d, A.xzr, A.W64))
+            Fp -> emit(s, A.FMovIn(d, A.xzr))
+        }
+    }
     propagate(s)
 }
 
@@ -993,7 +1009,7 @@ fun guard(s : Sel, condition : Value, message : String) -> Unit {
     if message != "" {
         let text = address(s, Asm.messageSymbol(s.asm, message))
         s.panicking = True
-        call(s, temp(s, Ssa.untraced(I64)), A.Gp, A.Gp,
+        call(s, temp(s, Ssa.untraced(I64)), A.Gp, Some(A.Gp),
              Some(runtimeSymbolOf(s, "turkey_panic")), A.xzr, [(text, A.Gp)])
         s.panicking = False
     }
@@ -1230,13 +1246,15 @@ fun overflows(args : Array (Reg, A.Bank)) -> Bool {
 }
 
 -- Which file a runtime entry point answers in: `d0` for one C declares as
--- returning a `double`, `x0` for everything else.
-fun resultBank(name : String) -> A.Bank = match Rt.entryPoint(name) {
+-- returning a `double`, `x0` for everything else, and neither for one C
+-- declares `void`.
+fun resultBank(name : String) -> Option A.Bank = match Rt.entryPoint(name) {
     Some(entry) -> match entry.result {
-        Some(F64) -> A.Fp
-        _ -> A.Gp
+        Some(F64) -> Some(A.Fp)
+        Some(_) -> Some(A.Gp)
+        None -> None
     }
-    None -> A.Gp
+    None -> Some(A.Gp)
 }
 
 -- Floating point arithmetic, which does not trap.
@@ -1252,7 +1270,7 @@ fun floatBin(s : Sel, d : Reg, o : BinOp, a : Reg, b : Reg) -> Unit = match o {
     -- arm64 has no remainder instruction for doubles, and LLVM's `frem` is
     -- `fmod` by definition, so this is the call the other backend also
     -- eventually becomes -- libm's own, as `Data.Float.fmod` declares it.
-    Rem -> call(s, d, A.Fp, A.Fp, Some(runtimeSymbolOf(s, "fmod")),
+    Rem -> call(s, d, A.Fp, Some(A.Fp), Some(runtimeSymbolOf(s, "fmod")),
                 A.xzr, [(a, A.Fp), (b, A.Fp)])
     _ -> stop(s, "the binary operation " + show(o) + " on a double")
 }

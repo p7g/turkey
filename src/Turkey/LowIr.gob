@@ -177,6 +177,17 @@ type Op
     -- exist yet when the environment is built, so that slot starts null and
     -- is marked mutable.
     | ClosureCapture(Value, Int, Value)
+    -- An object in this function's frame rather than the heap, for one
+    -- `Turkey.Escape` proved never outlives the call that makes it: kind,
+    -- tag, field metadata and fields as `ObjectNew` has them, at the same
+    -- payload layout, so every access reads it as it would a heap object.
+    --
+    -- Neither an allocation nor a safepoint. The collector never marks one: it
+    -- skips any address in the stack, and this frame's table lists the
+    -- object's traced fields wherever it is live (`Turkey.Roots`).
+    | StackObject(Int, Int, Int, Array Value)
+    -- A closure shell in the frame, as `ClosureNew` builds one on the heap.
+    | StackClosure(String, Option Value)
     | Call(Callee, Array Value)
     | GlobalLoad(String)
     | GlobalStore(String, Value)
@@ -332,6 +343,10 @@ fun effectsOf(op : Op) -> Effects = match op {
     -- Allocates the shell; the environment is an operand and already built.
     ClosureNew(_, _) -> Ssa.allocates()
     ClosureCapture(_, _, _) -> Ssa.writes()
+    -- Identity, as an allocation has, and deletable when unused for the same
+    -- reason. `allocatingOp` is what says it takes nothing from the heap.
+    StackObject(_, _, _, _) -> Ssa.allocates()
+    StackClosure(_, _) -> Ssa.allocates()
     -- A call may do anything the callee does, which is everything. Knowing
     -- better per callee takes the whole program, which one instruction does
     -- not have; `summarize` below is that, for allocation, over the module.
@@ -382,6 +397,11 @@ fun opUses(op : Op) -> Array Value = match op {
         None -> []
     }
     ClosureCapture(a, _, b) -> [a, b]
+    StackObject(_, _, _, fields) -> fields
+    StackClosure(_, environment) -> match environment {
+        Some(e) -> [e]
+        None -> []
+    }
     Call(callee, args) -> {
         let out : Array Value = []
         match callee {
@@ -426,6 +446,8 @@ fun mapUses(op : Op, f : fun(Value) -> Value) -> Op = match op {
     CellStore(a, b) -> CellStore(f(a), f(b))
     ClosureNew(a, b) -> ClosureNew(a, Option.map(b, f))
     ClosureCapture(a, b, c) -> ClosureCapture(f(a), b, f(c))
+    StackObject(a, b, c, d) -> StackObject(a, b, c, Array.map(d, f))
+    StackClosure(a, b) -> StackClosure(a, Option.map(b, f))
     Call(a, b) -> Call(mapCallee(a, f), Array.map(b, f))
     GlobalLoad(a) -> GlobalLoad(a)
     GlobalStore(a, b) -> GlobalStore(a, f(b))
@@ -474,6 +496,8 @@ fun opResultRep(op : Op) -> Option Rep = match op {
     ArrayLength(_) -> Some(Ssa.untraced(I64))
     CellNew(_) -> Some(Ssa.traced(Ptr))
     ClosureNew(_, _) -> Some(Ssa.traced(Ptr))
+    StackObject(_, _, _, _) -> Some(Ssa.traced(Ptr))
+    StackClosure(_, _) -> Some(Ssa.traced(Ptr))
     ObjectSet(_, _, _) -> Some(Ssa.untraced(Unit))
     ArraySet(_, _, _) -> Some(Ssa.untraced(Unit))
     CellStore(_, _) -> Some(Ssa.untraced(Unit))
@@ -607,23 +631,24 @@ fun checkCalls(functions : Array (Ssa.Func Low)) -> Array String {
                         None -> Array.push(out, f.name + ": calls @" + name
                                                 + ", which is not a function here")
                     }
-                    ClosureNew(code, _) -> match Map.get(known, code) {
-                        -- A closure's code is called at the uniform
-                        -- representation with the environment first, so its
-                        -- arity is one more than the lambda's.
-                        Some(callee) -> if len(callee.params) < 1 {
-                            Array.push(out, f.name + ": closes over @" + code
-                                            + ", which takes no environment")
-                        }
-                        None -> Array.push(out, f.name + ": closes over @"
-                                                + code + ", which does not exist")
-                    }
+                    ClosureNew(code, _) -> closes(out, known, f.name, code)
+                    StackClosure(code, _) -> closes(out, known, f.name, code)
                     _ -> {}
                 }
             }
         }
     }
     out
+}
+
+-- A closure's code is called at the uniform representation with the
+-- environment first, so its arity is one more than the lambda's.
+fun closes(out : Array String, known : Map String (Ssa.Func Low), from : String,
+           code : String) -> Unit = match Map.get(known, code) {
+    Some(callee) -> if len(callee.params) < 1 {
+        Array.push(out, from + ": closes over @" + code + ", which takes no environment")
+    }
+    None -> Array.push(out, from + ": closes over @" + code + ", which does not exist")
 }
 
 -- -- which functions may allocate ---------------------------------------------
@@ -662,6 +687,10 @@ fun allocatingOp(op : Op) -> Option String = match op {
     ArrayNew(_, _, _) -> Some("builds an array")
     CellNew(_) -> Some("makes a cell for a variable a closure captured")
     ClosureNew(_, _) -> Some("makes a closure")
+    -- Named before the `effectsOf` fallback below, which would count them:
+    -- they have an allocation's identity and take nothing from the heap.
+    StackObject(_, _, _, _) -> None
+    StackClosure(_, _) -> None
     _ -> if effectsOf(op).allocates { Some("allocates (" + showOpName(op) + ")") }
          else { None }
 }
@@ -784,6 +813,8 @@ fun showOpName(op : Op) -> String = match op {
     CellLoad(_) -> "cell.load"
     CellStore(_, _) -> "cell.store"
     ClosureNew(_, _) -> "closure.new"
+    StackObject(_, _, _, _) -> "stack.object"
+    StackClosure(_, _) -> "stack.closure"
     ClosureCapture(_, _, _) -> "closure.capture"
     Call(callee, _) -> match callee {
         Direct(_) -> "call.direct"
@@ -848,6 +879,14 @@ instance Show Op {
     }
     ClosureCapture(a, i, b) ->
         "closure.capture " + v(a) + ", " + Int.toString(i) + ", " + v(b)
+    StackObject(kind, tag, bitmap, fields) ->
+        "stack.object kind=" + Int.toString(kind) + " tag=" + Int.toString(tag)
+        + " count=" + Int.toString(len(fields)) + " bitmap=" + Int.toString(bitmap)
+        + " [" + String.join(Array.map(fields, v), ", ") + "]"
+    StackClosure(code, environment) -> match environment {
+        Some(e) -> "stack.closure @" + code + ", " + v(e)
+        None -> "stack.closure @" + code
+    }
     Call(callee, args) -> {
         let b = String.builder()
         String.push(b, "call " + show(callee))

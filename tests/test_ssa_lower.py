@@ -373,9 +373,11 @@ def test_a_field_of_a_fresh_immutable_object_is_its_operand():
     body = re.search(r"^fun @Main#nested\(.*?^}$", result.stdout,
                      re.M | re.S).group(0)
     assert "object." not in body, body
+    # `add` only updates the counter's integer, so the counter is built in
+    # `record`'s frame (`tests/test_escape.py`); its field is still read back.
     record = re.search(r"^fun @Main#record\(.*?^}$", result.stdout,
                        re.M | re.S).group(0)
-    assert "mutable=1" in record and "object.get" in record, record
+    assert "stack.object" in record and "object.get" in record, record
 
 
 def test_a_match_that_binds_the_whole_tuple_still_builds_it():

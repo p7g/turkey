@@ -1,0 +1,581 @@
+module Turkey.Escape (run, reach)
+
+-- Objects that never outlive the call that makes them, built in its frame
+-- instead of the heap.
+--
+-- **What escapes.** A value escapes when something other than the frame that
+-- made it can still reach it after that frame returns, or when the analysis
+-- cannot tell. The rules, per function, flow-insensitively:
+--
+-- * returning it, storing it in a global, a cell, a box, raw memory, or a
+--   field or element *after* construction, passing it to a runtime or foreign
+--   function or through a closure, or converting it to an untraced word;
+-- * passing it to a parameter whose summary says it escapes;
+-- * being held -- as a field, or through a phi -- by something that escapes.
+--
+-- A store after construction is an escape even into an object that does not
+-- escape. That is what keeps "which frame object holds which" a property of
+-- construction, fixed and local to one function, and it is what lets
+-- `Turkey.Roots` keep a held object live for as long as its holder with a
+-- relation it can compute statically.
+--
+-- **Contents.** Each value also answers whether its *contents* escape --
+-- anything loaded out of it, at any depth. A cursor passed to `next` does not
+-- escape though the element `next` returns does, and the array the cursor
+-- walks is contents. The two are all a parameter's summary records: the
+-- depth is collapsed to "the object" and "everything under it", which is
+-- sound and loses only precision no allocation here needs.
+--
+-- **Calling a closure does not leak it.** Its code can only read its own
+-- environment, which it is passed as its first parameter. What the code does
+-- with the environment is that parameter's summary, applied where the closure
+-- is built -- the one place the code is known -- so the call site, which does
+-- not know it, need not.
+--
+-- **Order.** Summaries start empty and only ever grow, and a function is
+-- analyzed again when a summary it reads grows; so this is the least fixed
+-- point, and each function's last analysis is taken with the summaries its
+-- callers were decided against. A function outside the module, or a runtime
+-- or foreign one, is taken to keep everything it is given.
+--
+-- **What a frame object costs**, and why some that do not escape stay on the
+-- heap:
+--
+-- * one frame slot per allocation site, reused on each execution of it. So a
+--   site whose object -- held directly, or by another frame object -- is still
+--   reachable when the site runs again is two objects at one address, and
+--   stays on the heap;
+-- * frame bytes, which a deep recursion multiplies. `stackBudget` caps each
+--   function, taking sites in order until it is spent.
+--
+-- Functions `keep` names are left alone -- the giblet modules, whose check was
+-- decided on their heap allocations and must not come to depend on this pass.
+-- They are still analyzed, for the summaries their callers read.
+
+import Data.Map as Map
+import Data.Set as Set
+import Turkey.LowIr as L
+import Turkey.LowIr (Op(..), Low(..), Callee(..))
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (Value(..), BlockId(..), Term(..))
+
+-- The frame bytes one function may spend on objects.
+let stackBudget : Int = 1024
+
+-- Per parameter: whether the parameter itself escapes, and whether its
+-- contents do.
+type Summary = Summary { self : Array Bool, contents : Array Bool }
+
+-- One function's flow graph, which the summaries do not change.
+type Graph = Graph {
+    -- The values each value may be: a phi's arguments, a conversion's source.
+    sources : Array (Array Int),
+    -- The object a load read from, or -1.
+    loadedFrom : Array Int,
+    -- What an allocation was built holding.
+    held : Array (Array Int),
+    -- Values that escape whatever the summaries say.
+    sinks : Array Int,
+    -- Direct calls, and closures built over known code.
+    calls : Array (String, Array Int),
+    closures : Array (String, Int),
+    -- Allocation sites that could live in the frame: position, value, bytes.
+    sites : Array (Int, Int, Int, Int),
+    -- Per site, whether its block is on a cycle: only such a site can run
+    -- again while its last object is reachable.
+    cyclic : Array Bool,
+}
+
+-- One function's answer under the current summaries.
+type Flow = Flow {
+    escapes : Array Bool,
+    contents : Array Bool,
+    work : Array Int,
+}
+
+-- Rewrite every allocation that does not escape into its frame form.
+fun run(functions : Array (Ssa.Func Low), keep : fun(String) -> Bool) -> Unit {
+    let byName = Map.new()
+    for var k = 0; k < len(functions); k = k + 1 { Map.put(byName, functions[k].name, k) }
+    let graphs = Array.map(functions, graphOf)
+    let summaries = Array.map(functions, fun(f) = Summary {
+        self = Array.filled(len(f.params), False),
+        contents = Array.filled(len(f.params), False),
+    })
+    -- Who must be looked at again when a function's summary grows: its direct
+    -- callers, and whoever builds a closure over it.
+    let readers = Array.map(functions, fun(_) = Set.new())
+    for var k = 0; k < len(functions); k = k + 1 {
+        for (name, _) in graphs[k].calls {
+            match Map.get(byName, name) {
+                Some(callee) -> Set.add(readers[callee], k)
+                None -> {}
+            }
+        }
+        for (code, _) in graphs[k].closures {
+            match Map.get(byName, code) {
+                Some(callee) -> Set.add(readers[callee], k)
+                None -> {}
+            }
+        }
+    }
+    let frameable = Array.map(functions, fun(f) = !keep(f.name))
+    let lives : Array (Option Live) = Array.filled(len(functions), None)
+    let queued = Array.filled(len(functions), True)
+    let work = []
+    for var k = 0; k < len(functions); k = k + 1 { Array.push(work, k) }
+    for var w = 0; w < len(work); w = w + 1 {
+        let k = work[w]
+        queued[k] = False
+        let flow = decide(functions[k], graphs[k], summaries, byName, frameable[k], lives, k)
+        if grow(summaries[k], functions[k], flow.escapes, flow.contents) {
+            for reader in Set.elements(readers[k]) {
+                if !queued[reader] {
+                    queued[reader] = True
+                    Array.push(work, reader)
+                }
+            }
+        }
+    }
+    for var k = 0; k < len(functions); k = k + 1 {
+        if frameable[k] && len(graphs[k].sites) > 0 {
+            let flow = decide(functions[k], graphs[k], summaries, byName, True, lives, k)
+            rewrite(functions[k], graphs[k], flow.escapes)
+        }
+    }
+}
+
+-- Fold one analysis into the summary; whether anything was added.
+fun grow(s : Summary, f : Ssa.Func Low, escapes : Array Bool,
+         contents : Array Bool) -> Bool {
+    var grew = False
+    for var n = 0; n < len(f.params); n = n + 1 {
+        let id = Ssa.valueId(f.params[n])
+        if escapes[id] && !s.self[n] {
+            s.self[n] = True
+            grew = True
+        }
+        if contents[id] && !s.contents[n] {
+            s.contents[n] = True
+            grew = True
+        }
+    }
+    grew
+}
+
+-- -- the graph --------------------------------------------------------------------
+
+fun graphOf(f : Ssa.Func Low) -> Graph {
+    let n = len(f.reps)
+    let g = Graph {
+        sources = Array.map(f.reps, fun(_) = []),
+        loadedFrom = Array.filled(n, -1),
+        held = Array.map(f.reps, fun(_) = []),
+        sinks = [], calls = [], closures = [], sites = [], cyclic = [],
+    }
+    let traced = fun(v : Value) -> Bool { Ssa.repOf(f, v).traced }
+    let sink = fun(v : Value) -> Unit {
+        if traced(v) { Array.push(g.sinks, Ssa.valueId(v)) }
+    }
+    let from = fun(r : Value, v : Value) -> Unit {
+        Array.push(g.sources[Ssa.valueId(r)], Ssa.valueId(v))
+    }
+    for var b = 0; b < len(f.blocks); b = b + 1 {
+        let block = f.blocks[b]
+        for var at = 0; at < len(block.insts); at = at + 1 {
+            let i = block.insts[at]
+            let r = i.result
+            let id = Ssa.valueId(r)
+            match i.op {
+                -- A pointer computed from pointers is whichever of them it is;
+                -- one turned into a scalar is out of sight.
+                Bin(_, a, c) -> if traced(r) {
+                    from(r, a)
+                    from(r, c)
+                } else {
+                    sink(a)
+                    sink(c)
+                }
+                Neg(a) -> if traced(r) { from(r, a) } else { sink(a) }
+                Convert(_, a) -> if traced(r) { from(r, a) } else { sink(a) }
+                Box(a) -> sink(a)
+                Unbox(a) -> { g.loadedFrom[id] = Ssa.valueId(a) }
+                ObjectNew(_, _, _, fields, _) -> {
+                    g.held[id] = Array.map(fields, Ssa.valueId)
+                    Array.push(g.sites, (b, at, id, 24 + 8 * len(fields)))
+                }
+                StackObject(_, _, _, fields) -> { g.held[id] = Array.map(fields, Ssa.valueId) }
+                ObjectGet(o, _) -> { g.loadedFrom[id] = Ssa.valueId(o) }
+                ObjectSet(_, _, v) -> sink(v)
+                ArrayNew(_, initial, _) -> sink(initial)
+                ArrayGet(a, _) -> { g.loadedFrom[id] = Ssa.valueId(a) }
+                ArraySet(_, _, v) -> sink(v)
+                -- Raw memory is out of sight, in either direction.
+                PtrLoad(base, _, _) -> sink(base)
+                PtrStore(base, _, v, _) -> {
+                    sink(base)
+                    sink(v)
+                }
+                CellNew(v) -> sink(v)
+                CellLoad(c) -> { g.loadedFrom[id] = Ssa.valueId(c) }
+                CellStore(_, v) -> sink(v)
+                ClosureNew(code, environment) -> {
+                    match environment {
+                        Some(e) -> {
+                            g.held[id] = [Ssa.valueId(e)]
+                            Array.push(g.closures, (code, Ssa.valueId(e)))
+                        }
+                        None -> {}
+                    }
+                    Array.push(g.sites, (b, at, id, 40))
+                }
+                StackClosure(code, environment) -> match environment {
+                    Some(e) -> {
+                        g.held[id] = [Ssa.valueId(e)]
+                        Array.push(g.closures, (code, Ssa.valueId(e)))
+                    }
+                    None -> {}
+                }
+                ClosureCapture(_, _, v) -> sink(v)
+                Call(Direct(name), args) ->
+                    Array.push(g.calls, (name, Array.map(args, Ssa.valueId)))
+                -- The closure called is not among the arguments: see the
+                -- header.
+                Call(_, args) -> for a in args { sink(a) }
+                GlobalStore(_, v) -> sink(v)
+                SlotStore(_, v) -> sink(v)
+                _ -> {}
+            }
+        }
+        match block.term {
+            Ret(v) -> sink(v)
+            Panic(v) -> sink(v)
+            Jump(target, args) -> {
+                let params = Ssa.blockAt(f, target).params
+                for var k = 0; k < len(args) && k < len(params); k = k + 1 {
+                    from(params[k], args[k])
+                }
+            }
+            Branch(_, _, _) -> {}
+            Unreachable -> {}
+        }
+    }
+    let onCycle = Map.new()
+    for (b, _, _, _) in g.sites {
+        let cyclic = match Map.get(onCycle, b) {
+            Some(c) -> c
+            None -> {
+                let c = reachesItself(f, b)
+                Map.put(onCycle, b, c)
+                c
+            }
+        }
+        Array.push(g.cyclic, cyclic)
+    }
+    g
+}
+
+-- Whether block `b` can be reached again from its own successors.
+fun reachesItself(f : Ssa.Func Low, b : Int) -> Bool {
+    let seen = Set.new()
+    let stack = Array.map(Ssa.successors(f.blocks[b].term), Ssa.blockId)
+    while len(stack) > 0 {
+        let here = match Array.pop(stack) {
+            Some(x) -> x
+            None -> return False
+        }
+        if here == b { return True }
+        if !Set.contains(seen, here) {
+            Set.add(seen, here)
+            for next in Ssa.successors(f.blocks[here].term) {
+                Array.push(stack, Ssa.blockId(next))
+            }
+        }
+    }
+    False
+}
+
+-- -- one function -----------------------------------------------------------------
+
+-- Escape under the current summaries, then every allocation that could live in
+-- the frame and cannot -- a site reached again while its object is reachable,
+-- or past the budget -- made to escape as well, since it stays on the heap
+-- and so does anything it holds.
+fun decide(f : Ssa.Func Low, g : Graph, summaries : Array Summary,
+           byName : Map String Int, frameable : Bool,
+           lives : Array (Option Live), k : Int) -> Flow {
+    let flow = Flow {
+        escapes = Array.filled(len(f.reps), False),
+        contents = Array.filled(len(f.reps), False),
+        work = [],
+    }
+    for id in g.sinks { escape(flow, id) }
+    for (name, args) in g.calls {
+        match Map.get(byName, name) {
+            Some(callee) -> {
+                let s = summaries[callee]
+                for var n = 0; n < len(args); n = n + 1 {
+                    if n >= len(s.self) || s.self[n] { escape(flow, args[n]) }
+                    if n >= len(s.contents) || s.contents[n] { leak(flow, args[n]) }
+                }
+            }
+            None -> for a in args { escape(flow, a) }
+        }
+    }
+    for (code, environment) in g.closures {
+        match Map.get(byName, code) {
+            Some(callee) -> {
+                let s = summaries[callee]
+                if len(s.self) == 0 || s.self[0] { escape(flow, environment) }
+                if len(s.contents) == 0 || s.contents[0] { leak(flow, environment) }
+            }
+            None -> escape(flow, environment)
+        }
+    }
+    settle(flow, g)
+    if !frameable {
+        for (_, _, id, _) in g.sites { escape(flow, id) }
+        settle(flow, g)
+        return flow
+    }
+    if len(g.sites) == 0 { return flow }
+    var changed = True
+    while changed {
+        changed = False
+        let objects = Set.new()
+        var looping = False
+        for var s = 0; s < len(g.sites); s = s + 1 {
+            let (_, _, id, _) = g.sites[s]
+            if !flow.escapes[id] {
+                Set.add(objects, id)
+                if g.cyclic[s] { looping = True }
+            }
+        }
+        if len(objects) == 0 { return flow }
+        -- Liveness is the expensive half, and a site off every cycle never
+        -- runs again, so it is computed only for a function that needs it.
+        let reached = if looping { reach(f, objects) } else { Map.new() }
+        let live = if !looping { [] } else {
+            match lives[k] {
+                Some(l) -> l
+                None -> {
+                    let l = liveBefore(f, g)
+                    lives[k] = Some(l)
+                    l
+                }
+            }
+        }
+        var spent = 0
+        for var s = 0; s < len(g.sites); s = s + 1 {
+            let (_, _, id, bytes) = g.sites[s]
+            if flow.escapes[id] { continue }
+            var again = False
+            if g.cyclic[s] {
+                for v in live[s] {
+                    match Map.get(reached, v) {
+                        Some(held) -> if Set.contains(held, id) { again = True }
+                        None -> {}
+                    }
+                }
+            }
+            if again || spent + bytes > stackBudget {
+                escape(flow, id)
+                changed = True
+            } else {
+                spent = spent + bytes
+            }
+        }
+        settle(flow, g)
+    }
+    flow
+}
+
+fun escape(flow : Flow, id : Int) -> Unit {
+    if !flow.escapes[id] {
+        flow.escapes[id] = True
+        Array.push(flow.work, 2 * id)
+    }
+}
+
+fun leak(flow : Flow, id : Int) -> Unit {
+    if !flow.contents[id] {
+        flow.contents[id] = True
+        Array.push(flow.work, 2 * id + 1)
+    }
+}
+
+-- Propagate until nothing changes. An escaping value's contents escape; what
+-- a value may be escapes with it; a value loaded out of an object, escaping,
+-- is that object's contents escaping; and an object's contents escaping is
+-- everything it was built holding escaping.
+fun settle(flow : Flow, g : Graph) -> Unit {
+    while len(flow.work) > 0 {
+        let item = match Array.pop(flow.work) {
+            Some(x) -> x
+            None -> return
+        }
+        let id = item / 2
+        let from = g.loadedFrom[id]
+        if item % 2 == 0 {
+            leak(flow, id)
+            for s in g.sources[id] { escape(flow, s) }
+            if from >= 0 { leak(flow, from) }
+        } else {
+            for s in g.sources[id] { leak(flow, s) }
+            if from >= 0 { leak(flow, from) }
+            for h in g.held[id] { escape(flow, h) }
+        }
+    }
+}
+
+-- -- liveness at each site -------------------------------------------------------
+
+-- Per allocation site, the values live just before it runs: what the frame
+-- still reaches when the site's slot is written again.
+type Live = Array (Array Int)
+
+fun liveBefore(f : Ssa.Func Low, g : Graph) -> Live {
+    let (_, out) = Ssa.livenessInOut(f)
+    let afters = Map.new()
+    let result : Live = []
+    for (b, at, id, _) in g.sites {
+        let after = match Map.get(afters, b) {
+            Some(a) -> a
+            None -> {
+                let a = Ssa.liveAfter(f, BlockId(b), out[b])
+                Map.put(afters, b, a)
+                a
+            }
+        }
+        let before = Set.new()
+        for v in after[at] { if v != id { Set.add(before, v) } }
+        for v in Ssa.uses(f.blocks[b].insts[at]) { Set.add(before, Ssa.valueId(v)) }
+        Array.push(result, Set.elements(before))
+    }
+    result
+}
+
+-- -- which objects a value reaches -----------------------------------------------
+
+-- For each value, the frame objects in `objects` it may reach: the object it
+-- may be -- through phis and conversions, or loaded out of one that holds it
+-- -- and then everything those were built holding, transitively. Only values
+-- that reach one are in the answer.
+--
+-- `Turkey.Roots` reads a frame object's slot at every use of a value that
+-- reaches it, which is what keeps an object held only by another -- a closure
+-- in a record, dead as a value of its own -- traced for as long as its holder
+-- is. The same answer, just before the site, is what `decide` refuses a reused
+-- slot on.
+fun reach(f : Ssa.Func Low, objects : Set.Set Int) -> Map Int (Set.Set Int) {
+    let may : Map Int (Set.Set Int) = Map.new()
+    if len(objects) == 0 { return may }
+    let add = fun(id : Int, into : Set.Set Int) -> Bool {
+        let before = match Map.get(may, id) {
+            Some(s) -> s
+            None -> {
+                let s = Set.new()
+                Map.put(may, id, s)
+                s
+            }
+        }
+        let size = len(before)
+        for o in Set.elements(into) { Set.add(before, o) }
+        len(before) != size
+    }
+    let of_ = fun(v : Value) -> Set.Set Int = Map.getOr(may, Ssa.valueId(v), Set.new())
+    let held : Map Int (Array Value) = Map.new()
+    let edges : Array (Value, Value) = []
+    for block in f.blocks {
+        for i in block.insts {
+            let id = Ssa.valueId(i.result)
+            if Set.contains(objects, id) {
+                let one = Set.new()
+                Set.add(one, id)
+                let _ = add(id, one)
+                Map.put(held, id, Ssa.uses(i))
+            }
+        }
+        match block.term {
+            Jump(target, args) -> {
+                let params = Ssa.blockAt(f, target).params
+                for var k = 0; k < len(args) && k < len(params); k = k + 1 {
+                    Array.push(edges, (params[k], args[k]))
+                }
+            }
+            _ -> {}
+        }
+    }
+    var changed = True
+    while changed {
+        changed = False
+        for (param, arg) in edges {
+            if add(Ssa.valueId(param), of_(arg)) { changed = True }
+        }
+        for block in f.blocks {
+            for i in block.insts {
+                let id = Ssa.valueId(i.result)
+                let within = match i.op {
+                    Bin(_, a, b) -> Some([a, b])
+                    Neg(a) -> Some([a])
+                    Convert(_, a) -> Some([a])
+                    _ -> None
+                }
+                match within {
+                    Some(vs) -> if Ssa.repOf(f, i.result).traced {
+                        for v in vs { if add(id, of_(v)) { changed = True } }
+                    }
+                    None -> {}
+                }
+                let source = match i.op {
+                    ObjectGet(o, _) -> Some(o)
+                    ArrayGet(a, _) -> Some(a)
+                    CellLoad(c) -> Some(c)
+                    Unbox(b) -> Some(b)
+                    _ -> None
+                }
+                match source {
+                    Some(o) -> for object in Set.elements(of_(o)) {
+                        for v in Map.getOr(held, object, []) {
+                            if add(id, of_(v)) { changed = True }
+                        }
+                    }
+                    None -> {}
+                }
+            }
+        }
+    }
+    -- Everything reached is also everything it holds.
+    for id in Map.keys(may) {
+        let s = Map.getOr(may, id, Set.new())
+        var grew = True
+        while grew {
+            grew = False
+            for object in Set.elements(s) {
+                for v in Map.getOr(held, object, []) {
+                    for o in Set.elements(of_(v)) {
+                        if !Set.contains(s, o) {
+                            Set.add(s, o)
+                            grew = True
+                        }
+                    }
+                }
+            }
+        }
+    }
+    may
+}
+
+-- -- the rewrite ------------------------------------------------------------------
+
+fun rewrite(f : Ssa.Func Low, g : Graph, escapes : Array Bool) -> Unit {
+    for (b, at, id, _) in g.sites {
+        if escapes[id] { continue }
+        let i = f.blocks[b].insts[at]
+        i.op = match i.op {
+            ObjectNew(kind, tag, bitmap, fields, _) -> StackObject(kind, tag, bitmap, fields)
+            ClosureNew(code, environment) -> StackClosure(code, environment)
+            other -> other
+        }
+    }
+}

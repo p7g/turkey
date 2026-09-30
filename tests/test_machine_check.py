@@ -94,6 +94,18 @@ def test_an_integer_moved_into_a_traced_register_is_refused():
     assert "moves i64 into ptr*" in message
 
 
+def test_a_frame_object_address_is_the_one_traced_arithmetic():
+    """An object built in the frame is addressed as `sp` plus an offset, and
+    that address is traced wherever it flows; the collector skips it by range.
+    The check accepts exactly that, and not an untraced copy of it or the
+    address of any other slot."""
+    assert _case("a frame object's address") == []
+    [message] = _case("a frame object's address held untraced")
+    assert "a frame object's address is held at i64" in message
+    [message] = _case("a spill slot's address in a traced register")
+    assert "the address of [spill 0] is taken" in message
+
+
 def test_exit_at_a_pointer_type_compiles_and_exits():
     """The void call, from source. `exit` at `String` once read `x0` after
     `turkey_exit` into a traced register; the check refuses that, so this

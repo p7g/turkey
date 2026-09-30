@@ -1,5 +1,6 @@
 module Turkey.Roots (
-    Frame(..), analyze, slotCount, liveAt, isSafepoint,
+    Frame(..), FrameObject(..), analyze, slotCount, liveAt, objectsAt, objectOf,
+    isSafepoint,
 )
 
 -- Which values the collector must be able to find, and where each one lives
@@ -27,6 +28,7 @@ module Turkey.Roots (
 
 import Data.Map as Map
 import Data.Set as Set
+import Turkey.Escape as Escape
 import Turkey.LowIr as L
 import Turkey.LowIr (Op(..), Low(..), Callee(..))
 import Turkey.Ssa as Ssa
@@ -41,11 +43,34 @@ type Frame = Frame {
     -- a string because a pair is not hashable here; the key is private to this
     -- module and `liveAt` is the only reader.
     at    : Map String (Array Int),
+    -- The objects built in the frame (`StackObject`, `StackClosure`), in
+    -- the order the frame lays them out, and each one's index by value id.
+    objects : Array FrameObject,
+    objectIndex : Map Int Int,
+    -- (block, instruction) -> the objects whose traced fields the collector
+    -- must read there, as indices into `objects`, sorted.
+    held : Map String (Array Int),
 }
+
+-- An object in the frame: the value that is its address, its size in words
+-- (the three header words, then the fields), and which fields are traced.
+--
+-- `zeroed` says its traced fields must be cleared on entry: some path reads
+-- its slot before building it -- the head of a loop, holding the previous
+-- iteration's object in a phi that holds something else on the way in -- and
+-- on that path the collector would read whatever the stack held as pointers.
+type FrameObject = FrameObject { id : Int, words : Int, traced : Array Int, zeroed : Bool }
 
 fun key(b : Int, n : Int) -> String = Int.toString(b) + ":" + Int.toString(n)
 
 fun slotCount(frame : Frame) -> Int = len(frame.slots)
+
+-- The frame objects the collector must read at this position.
+fun objectsAt(frame : Frame, b : Int, n : Int) -> Array Int =
+    Map.getOr(frame.held, key(b, n), [])
+
+-- The index of the frame object value `id` addresses, if it is one.
+fun objectOf(frame : Frame, id : Int) -> Option Int = Map.get(frame.objectIndex, id)
 
 -- The (slot, value) pairs to publish before the instruction at this position,
 -- and nothing if it is not a safepoint.
@@ -67,7 +92,17 @@ fun liveAt(frame : Frame, b : Int, n : Int) -> Array (Int, Int) {
 -- function -- the one that stops a cold path deciding what a hot one pays.
 fun analyze(f : Func Low) -> Frame {
     let live = Ssa.liveness(f)
+    let (objects, objectIndex) = objectsOf(f)
+    -- A frame object's address is never a root: it names no heap object, and
+    -- `x29` finds it again. It is excluded the way a constant is.
     let constants = constantsOf(f)
+    let addresses = Set.new()
+    for o in objects {
+        Set.add(constants, o.id)
+        Set.add(addresses, o.id)
+    }
+    let held = if len(objects) == 0 { Map.new() }
+               else { slotsHeld(f, objects, objectIndex, Escape.reach(f, addresses)) }
     let needed = Set.new()
     let at = Map.new()
     for var b = 0; b < len(f.blocks); b = b + 1 {
@@ -87,7 +122,132 @@ fun analyze(f : Func Low) -> Frame {
     let slots = Map.new()
     let ids = Array.sort(Set.elements(needed))
     for var i = 0; i < len(ids); i = i + 1 { Map.put(slots, ids[i], i) }
-    Frame { slots = slots, at = at }
+    Frame { slots = slots, at = at, objects = objects, objectIndex = objectIndex,
+            held = held }
+}
+
+-- The frame objects, in instruction order, with their traced fields: those
+-- whose operand is traced, which is the representation the object's metadata
+-- was built from. A closure shell is two words, code then environment, and
+-- only the environment is traced.
+fun objectsOf(f : Func Low) -> (Array FrameObject, Map Int Int) {
+    let out = []
+    let index = Map.new()
+    for block in f.blocks {
+        for i in block.insts {
+            let made = match i.op {
+                StackObject(_, _, _, fields) -> {
+                    let traced = []
+                    for var k = 0; k < len(fields); k = k + 1 {
+                        if Ssa.repOf(f, fields[k]).traced { Array.push(traced, k) }
+                    }
+                    Some(FrameObject { id = Ssa.valueId(i.result),
+                                       words = 3 + len(fields), traced = traced,
+                                       zeroed = False })
+                }
+                StackClosure(_, environment) -> Some(FrameObject {
+                    id = Ssa.valueId(i.result), words = 5,
+                    traced = match environment {
+                        Some(_) -> [1]
+                        None -> []
+                    },
+                    zeroed = False,
+                })
+                _ -> None
+            }
+            match made {
+                Some(o) -> {
+                    Map.put(index, o.id, len(out))
+                    Array.push(out, o)
+                }
+                None -> {}
+            }
+        }
+    }
+    (out, index)
+}
+
+-- Where each frame object's fields must be published: the safepoints at which
+-- its slot is *live*, treating the slot as a variable that the object's
+-- construction writes and every use of a value that may reach it reads.
+-- A safepoint's own operands count as read across it, since the callee holds
+-- them.
+--
+-- **Not** "wherever a value that may reach it is live", which is the obvious
+-- rule and is wrong. What a value may reach is flow-insensitive: a phi that
+-- carries the object into a loop reaches it on every iteration, though after
+-- the first it holds something else. Between its last real use and the next
+-- iteration no live value reaches the object, so a collection there does not
+-- trace its fields and frees what they named; the next iteration publishes it
+-- again, and the collector marks freed memory. Liveness of the slot closes
+-- that gap -- from the construction to the last read, on every path -- so a
+-- field is either traced at every collection since it was written or never
+-- published again.
+--
+-- The same answer says which objects to clear on entry: those whose slot is
+-- live there, read on some path before anything built it
+-- (`FrameObject.zeroed`).
+fun slotsHeld(f : Func Low, objects : Array FrameObject, objectIndex : Map Int Int,
+              reached : Map Int (Set.Set Int)) -> Map String (Array Int) {
+    -- The objects a value may reach, as indices.
+    let of_ = fun(v : Value) -> Array Int {
+        let out = []
+        match Map.get(reached, Ssa.valueId(v)) {
+            Some(ids) -> for o in Set.elements(ids) {
+                match Map.get(objectIndex, o) {
+                    Some(k) -> Array.push(out, k)
+                    None -> {}
+                }
+            }
+            None -> {}
+        }
+        out
+    }
+    let count = len(f.blocks)
+    let liveIn : Array (Set.Set Int) = []
+    for var b = 0; b < count; b = b + 1 { Array.push(liveIn, Set.new()) }
+    -- Backwards through one block from its live-out set, calling `at` with
+    -- each safepoint's published objects.
+    let walk = fun(b : Int, at : fun(Int, Set.Set Int) -> Unit) -> Set.Set Int {
+        let live = Set.new()
+        for s in Ssa.successors(f.blocks[b].term) {
+            for k in Set.elements(liveIn[Ssa.blockId(s)]) { Set.add(live, k) }
+        }
+        for v in Ssa.termUses(f.blocks[b].term) {
+            for k in of_(v) { Set.add(live, k) }
+        }
+        let insts = f.blocks[b].insts
+        for var n = len(insts) - 1; n >= 0; n = n - 1 {
+            match Map.get(objectIndex, Ssa.valueId(insts[n].result)) {
+                Some(k) -> { let _ = Set.remove(live, k) }
+                None -> {}
+            }
+            for v in Ssa.uses(insts[n]) {
+                for k in of_(v) { Set.add(live, k) }
+            }
+            if isSafepoint(insts[n].op) { at(n, live) }
+        }
+        live
+    }
+    let order = Array.reverse(Ssa.reversePostorder(f))
+    var changed = True
+    while changed {
+        changed = False
+        for block in order {
+            let b = Ssa.blockId(block)
+            let entering = walk(b, fun(_, _) = {})
+            if len(entering) != len(liveIn[b]) { changed = True }
+            liveIn[b] = entering
+        }
+    }
+    let held = Map.new()
+    for var b = 0; b < count; b = b + 1 {
+        let _ = walk(b, fun(n, live) = {
+            if len(live) > 0 { Map.put(held, key(b, n), Array.sort(Set.elements(live))) }
+        })
+    }
+    for k in Set.elements(liveIn[Ssa.blockId(f.entry)]) { objects[k].zeroed = True }
+    held
 }
 
 -- The traced values live *across* a safepoint, which is not the same as those
@@ -162,6 +322,9 @@ fun isSafepoint(op : Op) -> Bool = match op {
     ArrayNew(_, _, _) -> True
     CellNew(_) -> True
     ClosureNew(_, _) -> True
+    -- The frame is already there: building in it takes nothing from the heap.
+    StackObject(_, _, _, _) -> False
+    StackClosure(_, _) -> False
     -- These two are safepoints here and are not allocations in
     -- `LowIr.effectsOf`, the one place the lists disagree, and they answer
     -- different questions. `Unbox` is a call into the runtime and every call

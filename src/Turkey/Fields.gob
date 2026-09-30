@@ -1,0 +1,72 @@
+module Turkey.Fields (forward)
+
+-- Load forwarding from a fresh object: an `ObjectGet` of an immutable field of
+-- an object this function built is the value it was built with.
+--
+-- Sound without looking at anything between the two. The field's value is an
+-- operand of the `ObjectNew`, which dominates the load, and a field whose bit
+-- in the mask is clear is never written after the allocation -- not by this
+-- function, not by a callee it passes the object to. So no store, call or
+-- collection in between can make the load answer anything else.
+--
+-- Only between equal representations: a load at another representation than
+-- the value was stored at is a reinterpretation, and that is the point of it.
+--
+-- The loads are left in place, reading nothing anyone needs, and dead code
+-- elimination takes them -- and then the allocation, if every read of it was
+-- forwarded, since an allocation nothing uses is deletable. Nothing here adds
+-- an instruction or makes a traced value live at a safepoint where the load it
+-- replaces was not, so it is safe before the giblets check.
+
+import Turkey.LowIr as L
+import Turkey.LowIr (Op(..), Low(..))
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (Value(..), Term(..))
+
+fun forward(f : Ssa.Func Low) -> Unit {
+    let count = len(f.reps)
+    -- The value each forwarded load stands for, or -1.
+    let alias = Array.filled(count, -1)
+    -- The fields and mutable mask of each `ObjectNew`, by its result.
+    let built : Array (Option (Array Value, Int)) = Array.filled(count, None)
+    var found = False
+    let resolve = fun(v : Value) -> Value {
+        var id = Ssa.valueId(v)
+        while alias[id] >= 0 { id = alias[id] }
+        Value(id)
+    }
+    -- Block order is reverse postorder, so an object's own value is resolved
+    -- before a load from it is looked at, and a field of a field forwards too.
+    for block in f.blocks {
+        for i in block.insts {
+            match i.op {
+                ObjectNew(_, _, _, fields, mutable) -> {
+                    built[Ssa.valueId(i.result)] = Some((fields, mutable))
+                }
+                ObjectGet(object, index) -> match built[Ssa.valueId(resolve(object))] {
+                    Some((fields, mutable)) ->
+                        if index < len(fields) && Int.and(Int.shr(mutable, index), 1) == 0 {
+                            let v = resolve(fields[index])
+                            if Ssa.repOf(f, v) == Ssa.repOf(f, i.result) {
+                                alias[Ssa.valueId(i.result)] = Ssa.valueId(v)
+                                found = True
+                            }
+                        }
+                    None -> {}
+                }
+                _ -> {}
+            }
+        }
+    }
+    if !found { return }
+    for block in f.blocks {
+        for i in block.insts { i.op = L.mapUses(i.op, resolve) }
+        block.term = match block.term {
+            Ret(v) -> Ret(resolve(v))
+            Jump(target, args) -> Jump(target, Array.map(args, resolve))
+            Branch(c, yes, no) -> Branch(resolve(c), yes, no)
+            Panic(v) -> Panic(resolve(v))
+            Unreachable -> Unreachable
+        }
+    }
+}

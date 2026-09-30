@@ -474,14 +474,18 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                                 [immediate(s, Rt.layoutCode(r))])
         CellNew(a) -> runtimeCall(s, d, runtimeSymbolOf(s, "turkey_cell_new"), [raw(s, a)],
                                   [immediate(s, Rt.traceBit(Ssa.repOf(s.source, a)))])
-        ObjectNew(kind, tag, count, bitmap) ->
+        -- The fields are written after the call returns, which is why the
+        -- operands are rooted across it (`Turkey.Roots.across`).
+        ObjectNew(kind, tag, bitmap, fields, _) -> {
             runtimeCall(s, d, runtimeSymbolOf(s, "turkey_object_new"), [],
                         [immediate(s, kind), immediate(s, tag),
-                         immediate(s, count), immediate(s, bitmap)])
+                         immediate(s, len(fields)), immediate(s, bitmap)])
+            for var i = 0; i < len(fields); i = i + 1 {
+                storeField(s, d, i, A.reg(fields[i]))
+            }
+        }
         ObjectSet(target, index, v) -> {
-            -- Typed, constant-index fields use the same layout as ObjectGet.
-            -- A floating register stores its bits directly, as CellStore does.
-            emit(s, A.Str(A.reg(v), A.Offset(A.reg(target), 24 + 8 * index), A.W64))
+            storeField(s, A.reg(target), index, A.reg(v))
             emit(s, A.Mov(d, A.xzr, A.W64))
         }
         ArrayNew(length, initial, element) ->
@@ -491,9 +495,15 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                          immediate(s, Rt.layoutCode(element))])
         -- The code operand is the function's *address*, which is what the
         -- runtime stores and what an indirect call loads back out of slot 0.
-        ClosureNew(code, _) ->
+        -- The environment is the shell's second slot.
+        ClosureNew(code, environment) -> {
             runtimeCall(s, d, runtimeSymbolOf(s, "turkey_closure_shell"),
                         [address(s, symbolFor(s, code))], [])
+            match environment {
+                Some(e) -> storeField(s, d, 1, A.reg(e))
+                None -> {}
+            }
+        }
         ClosureCapture(closure, index, v) -> {
             let env = temp(s, Ssa.traced(Ptr))
             emit(s, A.Ldr(env, A.Offset(A.reg(closure), 32), A.W64))
@@ -580,6 +590,12 @@ fun immediate(s : Sel, n : Int) -> Reg {
 -- A call to one of the runtime's untyped entry points: every argument and the
 -- result is a machine word, because `raw` has already moved any double's bits
 -- into the general file.
+-- Field `index` of an object, at the offset `ObjectGet` reads it from. A whole
+-- word whatever the field's representation, and a floating register stores its
+-- bits directly, as `CellStore` does.
+fun storeField(s : Sel, object : Reg, index : Int, v : Reg) -> Unit =
+    emit(s, A.Str(v, A.Offset(object, 24 + 8 * index), A.W64))
+
 fun runtimeCall(s : Sel, d : Reg, sym : String, first : Array Reg,
                 rest : Array Reg) -> Unit {
     let args = []

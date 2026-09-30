@@ -336,6 +336,48 @@ def test_a_match_on_a_tuple_literal_does_not_build_the_tuple():
         assert "object.new" not in body, body
 
 
+FRESH_FIELDS = """
+type Pair = Pair(Int, Int)
+type Counter = Counter { n : Int }
+
+fun nested(n : Int) -> Int {
+    let p = ((n, n + 1), n + 2)
+    let unused = (n, n * 2)
+    p.0.1 + p.1
+}
+
+fun add(c : Counter, k : Int) -> Unit =
+    if k > 0 { c.n = c.n + 1
+               add(c, k - 1) }
+
+fun record(k : Int) -> Int {
+    let c = Counter { n = k }
+    add(c, k)
+    c.n
+}
+
+fun main() {
+    print(nested(10))
+    print(record(20))
+}
+"""
+
+
+def test_a_field_of_a_fresh_immutable_object_is_its_operand():
+    # A tuple read where it is built is the values it was built with, and
+    # then nothing reads the allocation and it is deleted -- the unused one
+    # too. A record's field may be assigned, so it is read back.
+    assert lang.output(FRESH_FIELDS) == "23\n40\n"
+    result = lang.dump("ssa", FRESH_FIELDS)
+    assert result.code == 0, result.stderr
+    body = re.search(r"^fun @Main#nested\(.*?^}$", result.stdout,
+                     re.M | re.S).group(0)
+    assert "object." not in body, body
+    record = re.search(r"^fun @Main#record\(.*?^}$", result.stdout,
+                       re.M | re.S).group(0)
+    assert "mutable=1" in record and "object.get" in record, record
+
+
 def test_a_match_that_binds_the_whole_tuple_still_builds_it():
     src = """
     fun main() {

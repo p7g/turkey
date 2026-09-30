@@ -43,6 +43,8 @@ void turkey_frame_table_register(const void *table);
 void turkey_entry_stack_set(void *frame);
 const void *turkey_roots_head(void);
 void turkey_collect(void);
+/* A minor collection if they are on; `turkey_collect` is always full. */
+void turkey_collect_minor(void);
 void turkey_gc_report(void);
 int64_t turkey_heap_objects(void);
 int64_t turkey_collection_count(void);

@@ -5,6 +5,11 @@ module Turkey.Heap (
 -- The heap and its collector: regions of fixed-size slots, allocation into
 -- them, and a non-moving mark and sweep over exact roots.
 --
+-- Generational, with sticky marks: an object that survives a collection is
+-- old and stays marked, and a minor collection traces only from the roots and
+-- the old objects the write barrier remembered, and frees only young objects.
+-- A full collection clears the marks and traces everything.
+--
 -- Non-moving is load-bearing beyond this module. The allocators in
 -- `Turkey.Alloc` take managed operands as raw words, which is sound only
 -- because the object a word names is still there after a collection, and
@@ -191,9 +196,11 @@ var verify : Bool = present(Prim.cString("TURKEY_GC_VERIFY"))
 
 -- Whether a collection may be minor: trace only from the roots and the
 -- remembered objects, keep every old object's mark, and free only young
--- objects. That is sound only in a program whose every store runs the write
--- barrier, which the committed bootstrap compiler does not emit, so it is on
--- only with TURKEY_GC_GENERATIONAL=1 until that compiler is replaced.
+-- objects. Sound only in a program whose every store runs the write barrier,
+-- which every program this compiler builds does. C that stores pointers into
+-- old objects without calling `turkey_write_barrier` must turn it off with
+-- `turkey_gc_set_generational`. TURKEY_GC_GENERATIONAL=0 makes every
+-- collection full, for comparison.
 var generational : Bool = generationalFrom(Libc.getenv(Prim.cString("TURKEY_GC_GENERATIONAL")))
 -- Whether the collection in progress, or the last one, is minor.
 var minor : Bool = False
@@ -650,7 +657,7 @@ fun allocate(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Prim.Pt
 
 fun allocateSlow(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Prim.Ptr {
     if (stress && stressDue()) || bytesSince >= threshold {
-        collectFrom(frame)
+        collectFrom(frame, askedEither)
         -- A collection is the only thing here that can raise one, and an
         -- allocation after a failed collection would be into a heap nobody
         -- has finished tracing.
@@ -1130,12 +1137,19 @@ fun notHeapPointer(value : Prim.Ptr, what : Prim.Ptr, index : Int) -> Unit {
 
 -- A collection with no Turkey frame live: the final one, after the program
 -- has returned, and a C caller's. Anything else collects through `allocate`,
--- which knows where the Turkey stack starts.
-foreign "turkey_collect" fun collect() -> Unit = collectFrom(Prim.ptrNull())
+-- which knows where the Turkey stack starts. Always full: asked for by name,
+-- it frees everything unreachable.
+foreign "turkey_collect" fun collect() -> Unit = collectFrom(Prim.ptrNull(), askedFull)
 
-fun collectFrom(frame : Prim.Ptr) -> Unit {
+-- What a collection is asked to be: whatever `fullDue` says, full, or minor.
+-- Minor only if minor collections are on.
+let askedEither : Int = 0
+let askedFull : Int = 1
+let askedMinor : Int = 2
+
+fun collectFrom(frame : Prim.Ptr, asked : Int) -> Unit {
     retire()
-    minor = generational && !fullDue()
+    minor = generational && asked != askedFull && (asked == askedMinor || !fullDue())
     if verify { verifyAt(0, frame) }
     let liveBefore = heapCount
     -- Read before the sweep clears it: the allocation pressure this
@@ -1551,9 +1565,9 @@ fun scaleFrom(s : Prim.Ptr) -> Float {
     if finite(value) && Prim.floatGte(value, 1.0) { value } else { fallback }
 }
 
--- TURKEY_GC_GENERATIONAL: on if it is set to anything but 0.
+-- TURKEY_GC_GENERATIONAL: on unless it is set to 0.
 fun generationalFrom(s : Prim.Ptr) -> Bool =
-    !Prim.ptrIsNull(s) && decimalFrom(s) != 0
+    Prim.ptrIsNull(s) || decimalFrom(s) != 0
 
 -- TURKEY_GC_STRESS: 0 if it is unset, N if it is a decimal N of at least 1
 -- with optional surrounding whitespace, and 1 if it is anything else, which
@@ -1665,6 +1679,11 @@ foreign "turkey_gc_set_stress" fun setStress(enabled : Int) -> Unit {
 foreign "turkey_gc_set_verify" fun setVerify(enabled : Int) -> Unit {
     verify = Prim.intAnd(enabled, 4294967295) != 0
 }
+
+-- A minor collection, if minor collections are on, for the tests of what one
+-- keeps; `turkey_collect` is always full.
+foreign "turkey_collect_minor" fun collectMinor() -> Unit =
+    collectFrom(Prim.ptrNull(), askedMinor)
 
 foreign "turkey_gc_set_generational" fun setGenerational(enabled : Int) -> Unit {
     generational = Prim.intAnd(enabled, 4294967295) != 0

@@ -259,14 +259,13 @@ int main(int argc, char **argv) {
         parent->slots[0] = (uintptr_t)young;
         turkey_write_barrier(parent);
         void *dead = turkey_string_new((const unsigned char *)"dead", 4);
-        turkey_collect();
+        turkey_collect_minor();
         assert(!turkey_has_panicked);
         assert(turkey_heap_contains(young) && !turkey_heap_contains(dead));
         assert(header_of(young)->generation == 1 && header_of(parent)->generation == 1);
         parent->slots[0] = 0;
-        turkey_collect();
+        turkey_collect_minor();
         assert(turkey_heap_contains(young));
-        turkey_gc_set_generational(0);
         turkey_collect();
         assert(!turkey_has_panicked && !turkey_heap_contains(young));
         puts("valid");

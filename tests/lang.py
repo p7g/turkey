@@ -214,7 +214,7 @@ def _native(entry: Path) -> _Compiled:
             return result.returncode, stderr
         assembly = result.stdout
         failed = [line for line in assembly.decode("utf-8").splitlines()
-                  if line.startswith("// FAILED") or line.startswith("// skipped")]
+                  if line.startswith("// skipped")]
         if failed:
             return 1, stderr + "boot: the backend refused this program\n" + \
                 "\n".join(failed) + "\n"

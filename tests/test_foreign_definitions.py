@@ -1,7 +1,7 @@
 """Foreign definitions export Turkey functions for C callers.
 
 Check the giblet gate and signatures through boot, then call the exported
-symbols from C under both backends, including before the program starts.
+symbols from C, including before the program starts.
 """
 
 from __future__ import annotations
@@ -113,15 +113,10 @@ def test_a_symbol_is_defined_once(probe):
 
 def test_a_definition_nothing_calls_is_exported_under_its_symbol(probe):
     """Reached only from C, which `mono` cannot see: dropping it would leave
-    the symbol undefined at link time. `main` calls nothing here, so each
-    backend's output having the symbol is the whole claim."""
+    the symbol undefined at link time. `main` calls nothing here, so the
+    output having the symbol is the whole claim."""
     assert probe('foreign "probe_f" fun f(x : Int) -> Int = x + 1\n') == ""
     env = dict(os.environ, **{HOOK: probe.name})
-    boot = subprocess.run(
-        toolchain.command(bootc.binary(), "llvm", str(probe.entry)),
-        cwd=REPO_ROOT, env=env, capture_output=True, text=True,
-        check=True).stdout
-    assert 'define i64 @"probe_f"(i64 %a1)' in boot
     native = subprocess.run(
         toolchain.command(bootc.binary(), "native", str(probe.entry)),
         cwd=REPO_ROOT, env=env, capture_output=True, text=True,
@@ -149,8 +144,7 @@ __attribute__((constructor)) static void before(void) {
 
 
 @pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
-@pytest.mark.parametrize("backend", toolchain.BACKENDS)
-def test_c_calls_a_definition_through_a_pointer(probe, tmp_path, backend):
+def test_c_calls_a_definition_through_a_pointer(probe, tmp_path):
     """The calling convention, which only running it can check: general and
     floating arguments interleaved, a `Unit` result that is C's `void`, and a
     call made before the program's own entry has run."""
@@ -161,16 +155,15 @@ def test_c_calls_a_definition_through_a_pointer(probe, tmp_path, backend):
         'foreign "probe_note" fun note(n : Int) -> Unit { }\n') == ""
     env = dict(os.environ, **{HOOK: probe.name})
     text = subprocess.run(
-        toolchain.command(bootc.binary(), backend, str(probe.entry)),
+        toolchain.command(bootc.binary(), "native", str(probe.entry)),
         cwd=REPO_ROOT, env=env, capture_output=True, text=True,
         check=True).stdout
-    source = tmp_path / ("program.s" if backend == "native" else "program.ll")
+    source = tmp_path / "program.s"
     source.write_text(text, encoding="utf-8")
     caller = tmp_path / "caller.c"
     caller.write_text(CALLER, encoding="utf-8")
     binary = tmp_path / "program"
-    subprocess.run([*toolchain.cc(), "-O1",
-                    *toolchain.clang_only("-Wno-override-module"), "-o",
+    subprocess.run([*toolchain.cc(), "-O1", "-o",
                     str(binary), str(source), str(caller),
                     *toolchain.libraries()], check=True)
     result = subprocess.run(toolchain.command(binary), capture_output=True,

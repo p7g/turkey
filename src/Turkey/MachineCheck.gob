@@ -1,0 +1,565 @@
+module Turkey.MachineCheck (
+    Signature(..), signatures, check,
+)
+
+-- Representations, checked on the arm64 backend's own output.
+--
+-- `LowIr.checkReps` and `LowIr.checkCalls` judge the low IR, and everything
+-- below them -- selection, the spiller, the calling convention -- is trusted
+-- to carry each value's `Rep` into an instruction that agrees with it. Nothing
+-- at run time notices when one does not: a pointer and an integer are the same
+-- bits, a `w` register silently drops the high half of an `x`, and a register
+-- the callee never wrote reads as whatever it last held. Layout sharing makes
+-- almost every representation bug a scalar-versus-pointer confusion, and a
+-- traced register holding a scalar is a crash only once a collection happens
+-- to look at it.
+--
+-- So this reads the machine function after allocation -- spill code included
+-- -- and asks every instruction the question a typed assembler would:
+--
+-- * **the bank**: a double is only ever in a `d` register and nothing else is,
+--   and the `fmov` that crosses between them crosses in the direction it says;
+-- * **the width**: a 32-bit operation never reads or writes a 64-bit value,
+--   and a memory access touches as many bytes as the value's class occupies
+--   (`Turkey.Runtime`'s widths);
+-- * **the trace bit**: a traced register never holds a scalar -- neither a
+--   nonzero constant nor a move from an integer;
+-- * **the call**: each argument register holds a value at the callee's
+--   parameter representation and in the callee's order, and the value read out
+--   of the result register is at the callee's result representation -- which
+--   for a C function returning `void` means it is not read as anything but
+--   unit, because nothing was written there.
+--
+-- Virtual registers are judged by `Func.reps`, which selection and the spiller
+-- share with the low IR; physical registers carry their bank. The terminators
+-- are `Ssa.verify`'s, which is generic over the instruction type and already
+-- checks a return, a branch condition and a jump's arguments against their
+-- representations.
+--
+-- Answers complaints rather than failing, as the other verifiers do.
+
+import Data.Map as Map
+import Turkey.Arm64 as A
+import Turkey.Arm64 (Arm(..), Reg(..), Bank(..), Mem(..), Width(..), Inst(..))
+import Turkey.Asm as Asm
+import Turkey.LowIr (Low(..))
+import Turkey.Runtime as Rt
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (Rep(..), RepClass(..), Func(..), Block(..))
+
+-- What a call to a symbol must pass and may read back.
+--
+-- `Returns` is a Turkey function, whose every parameter and result has a
+-- representation. `Void` is a C entry point that writes no result register.
+-- A symbol in neither -- the runtime's untyped heap operations, a foreign
+-- declaration -- is checked for banks only, since a machine word is all its
+-- C signature says.
+type Signature
+    = Returns(Array Rep, Rep)
+    | Void
+
+-- Every symbol a call may name whose signature is known, spelled as a `bl`
+-- spells it.
+fun signatures(functions : Array (Func Low), dialect : Asm.Dialect)
+        -> Map String Signature {
+    let out = Map.new()
+    for f in functions {
+        let params = Array.map(f.params, fun(p) = Ssa.repOf(f, p))
+        Map.put(out, Asm.symbolFor(dialect, f.name), Returns(params, f.result))
+    }
+    for name in Rt.voidSymbols() {
+        Map.put(out, Asm.runtimeFor(dialect, name), Void)
+    }
+    out
+}
+
+fun check(f : Func Inst, sigs : Map String Signature) -> Array String {
+    let out = []
+    for var b = 0; b < len(f.blocks); b = b + 1 {
+        let c = Checker { f = f, out = out, block = b, index = 0, sigs = sigs,
+                          moved = Map.new(), stacked = Map.new(),
+                          listed = None, called = None }
+        let insts = f.blocks[b].insts
+        for var n = 0; n < len(insts); n = n + 1 {
+            c.index = n
+            instruction(c, insts[n].op)
+        }
+    }
+    out
+}
+
+type Checker = Checker {
+    f      : Func Inst,
+    out    : Array String,
+    -- Where the instruction being checked is, for the complaint.
+    block  : Int,
+    index  : Int,
+    sigs   : Map String Signature,
+    -- The value last moved into each argument register, by `regKey`, since
+    -- the last call. A call's operands are these registers, not the values,
+    -- so this is how the check sees what was passed.
+    moved  : Map Int Rep,
+    -- The same for outgoing stack arguments, by slot.
+    stacked : Map Int Rep,
+    -- The last argument list, for the call after it: `None` if there was
+    -- none, and then the result register it named, if it named one.
+    listed : Option (Option Reg),
+    -- The call just made, until its result register is read.
+    called : Option Called,
+}
+
+-- A call, as the instructions after it need to know it.
+type Called = Called { sym : String, sig : Option Signature, into : Reg }
+
+fun complain(c : Checker, what : String) -> Unit {
+    let i = c.f.blocks[c.block].insts[c.index]
+    Array.push(c.out, c.f.name + " b" + Int.toString(c.block) + "."
+                      + Int.toString(c.index) + " `" + show(i) + "`: " + what)
+}
+
+-- -- operands -------------------------------------------------------------------
+
+fun repOf(c : Checker, r : Reg) -> Option Rep = match r {
+    Virtual(n) -> Some(c.f.reps[n])
+    Physical(_, _) -> None
+}
+
+fun bankOfReg(c : Checker, r : Reg) -> Bank = match r {
+    Virtual(n) -> A.bankOf(c.f.reps[n])
+    Physical(bank, _) -> bank
+}
+
+fun wantBank(c : Checker, r : Reg, bank : Bank, what : String) -> Unit {
+    if !sameBank(bankOfReg(c, r), bank) {
+        complain(c, what + " is " + describe(c, r) + ", not in the "
+                    + showBank(bank) + " file")
+    }
+}
+
+-- A general-register operand of an integer instruction at width `w`.
+--
+-- A 32-bit instruction reads and writes the low half, so a 64-bit value
+-- through one is truncated, and a pointer through one is a different address.
+fun wantInt(c : Checker, r : Reg, w : Width, what : String) -> Unit {
+    wantBank(c, r, Gp, what)
+    match (repOf(c, r), w) {
+        (Some(rep), W32) -> if wide(rep.class_) {
+            complain(c, what + " is " + show(rep) + " at 32 bits")
+        }
+        _ -> {}
+    }
+}
+
+fun wantFloat(c : Checker, r : Reg, what : String) -> Unit =
+    wantBank(c, r, Fp, what)
+
+-- Classes a 32-bit operation cannot hold.
+fun wide(k : RepClass) -> Bool = match k {
+    I64 -> True
+    Ptr -> True
+    F64 -> True
+    _ -> False
+}
+
+fun describe(c : Checker, r : Reg) -> String = match repOf(c, r) {
+    Some(rep) -> A.showReg(r, W64) + " : " + show(rep)
+    None -> A.showReg(r, W64)
+}
+
+fun sameBank(a : Bank, b : Bank) -> Bool = match (a, b) {
+    (Gp, Gp) -> True
+    (Fp, Fp) -> True
+    _ -> False
+}
+
+fun showBank(b : Bank) -> String = match b {
+    Gp -> "general"
+    Fp -> "floating"
+}
+
+-- A register numbered in both files, as one key.
+fun regKey(r : Reg) -> Int = match r {
+    Physical(Gp, n) -> n
+    Physical(Fp, n) -> 32 + n
+    Virtual(n) -> -1 - n
+}
+
+-- -- instructions ---------------------------------------------------------------
+
+fun instruction(c : Checker, op : Arm) -> Unit {
+    readsResult(c, op)
+    match op {
+        Mov(d, a, w) -> {
+            wantInt(c, d, w, "a move's destination")
+            wantInt(c, a, w, "a move's source")
+            sameValue(c, d, a)
+            intoArgument(c, d, a)
+        }
+        MovZ(d, n, _) -> constantInto(c, d, n)
+        MovK(d, _, _) -> wantInt(c, d, W64, "a constant's destination")
+        MovConst(d, n) -> constantInto(c, d, n)
+        Add(d, a, b, w) -> arith(c, [d, a, b], w)
+        AddImm(d, a, _, w) -> arith(c, [d, a], w)
+        AddS(d, a, b, w) -> arith(c, [d, a, b], w)
+        Sub(d, a, b, w) -> arith(c, [d, a, b], w)
+        SubImm(d, a, _, w) -> arith(c, [d, a], w)
+        SubS(d, a, b, w) -> arith(c, [d, a, b], w)
+        AddSImm(d, a, _, w) -> arith(c, [d, a], w)
+        SubSImm(d, a, _, w) -> arith(c, [d, a], w)
+        Mul(d, a, b, w) -> arith(c, [d, a, b], w)
+        SMulH(d, a, b) -> arith(c, [d, a, b], W64)
+        SDiv(d, a, b, w) -> arith(c, [d, a, b], w)
+        MSub(d, a, b, e, w) -> arith(c, [d, a, b, e], w)
+        And(d, a, b, w) -> arith(c, [d, a, b], w)
+        Orr(d, a, b, w) -> arith(c, [d, a, b], w)
+        Eor(d, a, b, w) -> arith(c, [d, a, b], w)
+        EorImm(d, a, _, w) -> arith(c, [d, a], w)
+        AndImm(d, a, _, w) -> arith(c, [d, a], w)
+        LslImm(d, a, _, w) -> arith(c, [d, a], w)
+        LsrImm(d, a, _, w) -> arith(c, [d, a], w)
+        AsrImm(d, a, _, w) -> arith(c, [d, a], w)
+        Lsl(d, a, b, w) -> arith(c, [d, a, b], w)
+        Lsr(d, a, b, w) -> arith(c, [d, a, b], w)
+        Asr(d, a, b, w) -> arith(c, [d, a, b], w)
+        Cmp(a, b, w) -> arith(c, [a, b], w)
+        CmpImm(a, _, w) -> arith(c, [a], w)
+        CSet(d, _) -> wantInt(c, d, W32, "a condition's destination")
+        Sxtw(d, a) -> {
+            wantInt(c, d, W64, "a sign extension's destination")
+            wantInt(c, a, W32, "a sign extension's source")
+        }
+        Uxtb(d, a) -> arith(c, [d, a], W32)
+        Uxth(d, a) -> arith(c, [d, a], W32)
+        Ubfx(d, a, _, _) -> arith(c, [d, a], W64)
+        Ldr(d, m, w) -> access(c, d, m, widthBytes(w), "a load's destination")
+        Ldrb(d, m) -> access(c, d, m, 1, "a byte load's destination")
+        Ldrsw(d, m) -> access(c, d, m, 4, "a sign-extending load's destination")
+        Str(v, m, w) -> {
+            access(c, v, m, widthBytes(w), "a stored value")
+            match m {
+                OutgoingArg(k) -> match repOf(c, v) {
+                    Some(rep) -> Map.put(c.stacked, k, rep)
+                    None -> {}
+                }
+                _ -> {}
+            }
+        }
+        Strb(v, m) -> access(c, v, m, 1, "a stored byte")
+        Stp(a, b, base, _) -> {
+            wantBank(c, a, Gp, "a paired store's first register")
+            wantBank(c, b, Gp, "a paired store's second register")
+            address(c, base)
+        }
+        Ldp(a, b, base, _) -> {
+            wantBank(c, a, Gp, "a paired load's first register")
+            wantBank(c, b, Gp, "a paired load's second register")
+            address(c, base)
+        }
+        Adrp(d, _) -> untracedAddress(c, d, "a page address")
+        AddLo(d, a, _) -> {
+            untracedAddress(c, d, "a symbol's address")
+            address(c, a)
+        }
+        FMov(d, a) -> {
+            wantFloat(c, d, "a floating move's destination")
+            wantFloat(c, a, "a floating move's source")
+            intoArgument(c, d, a)
+        }
+        -- The bits of a general register into a floating one. `xzr` is the
+        -- zero every `fmov d, xzr` means.
+        FMovIn(d, a) -> {
+            wantFloat(c, d, "a transfer's floating destination")
+            wantInt(c, a, W64, "a transfer's general source")
+            intoArgument(c, d, a)
+        }
+        FMovOut(d, a) -> {
+            wantInt(c, d, W64, "a transfer's general destination")
+            wantFloat(c, a, "a transfer's floating source")
+            intoArgument(c, d, a)
+        }
+        FAdd(d, a, b) -> floats(c, [d, a, b])
+        FSub(d, a, b) -> floats(c, [d, a, b])
+        FMul(d, a, b) -> floats(c, [d, a, b])
+        FDiv(d, a, b) -> floats(c, [d, a, b])
+        FNeg(d, a) -> floats(c, [d, a])
+        FCmp(a, b) -> floats(c, [a, b])
+        Scvtf(d, a) -> {
+            wantFloat(c, d, "a conversion's floating destination")
+            wantInt(c, a, W64, "a conversion's integer source")
+        }
+        Fcvtzs(d, a) -> {
+            wantInt(c, d, W64, "a conversion's integer destination")
+            wantFloat(c, a, "a conversion's floating source")
+        }
+        CallArgs(ins, outs) -> {
+            for r in ins {
+                if !Map.contains(c.moved, regKey(r)) {
+                    complain(c, "a call reads " + A.showReg(r, W64)
+                                + ", which nothing wrote since the last call")
+                }
+            }
+            c.listed = Some(if len(outs) > 0 { Some(outs[0]) } else { None })
+        }
+        Bl(sym) -> call(c, sym, Map.get(c.sigs, sym))
+        Blr(target) -> {
+            wantInt(c, target, W64, "an indirect call's target")
+            call(c, "an indirect callee", None)
+        }
+        SafepointMap(_, _) -> {}
+        Ret -> {}
+        B(_) -> {}
+        BCond(_, _) -> {}
+        Brk(_) -> {}
+    }
+}
+
+-- An integer instruction: every operand in the general file at the
+-- instruction's width.
+fun arith(c : Checker, regs : Array Reg, w : Width) -> Unit {
+    for r in regs { wantInt(c, r, w, "an integer operand") }
+}
+
+fun floats(c : Checker, regs : Array Reg) -> Unit {
+    for r in regs { wantFloat(c, r, "a floating operand") }
+}
+
+-- A move between two virtual registers copies the bits and nothing else, so
+-- the two must mean the same thing by them. The one difference allowed is the
+-- one the low IR's conversions make without an instruction: `ptr` and `ptr*`,
+-- and an untraced `ptr` and `i64`. A scalar moved into a traced register is
+-- the scalar-for-pointer confusion itself.
+fun sameValue(c : Checker, d : Reg, a : Reg) -> Unit =
+    match (repOf(c, d), repOf(c, a)) {
+        (Some(to), Some(from)) -> if !compatible(to, from) {
+            complain(c, "moves " + show(from) + " into " + show(to))
+        }
+        _ -> {}
+    }
+
+fun compatible(to : Rep, from : Rep) -> Bool {
+    if to.class_ == from.class_ { return True }
+    if to.traced || from.traced { return False }
+    match (to.class_, from.class_) {
+        (Ptr, I64) -> True
+        (I64, Ptr) -> True
+        _ -> False
+    }
+}
+
+-- A constant into a register. A traced one must be null or an immediate
+-- (`Turkey.Runtime.immediates`), which the collector skips; every other
+-- number is an address it would follow.
+fun constantInto(c : Checker, d : Reg, n : Int) -> Unit {
+    wantInt(c, d, W64, "a constant's destination")
+    match repOf(c, d) {
+        Some(rep) -> if rep.traced && (n < 0 || n >= Rt.immediates) {
+            complain(c, "the constant " + Int.toString(n) + " is held at "
+                        + show(rep))
+        }
+        None -> {}
+    }
+}
+
+-- A register used to form an address.
+fun address(c : Checker, r : Reg) -> Unit = match repOf(c, r) {
+    Some(rep) -> if rep.class_ != Ptr && rep.class_ != I64 {
+        complain(c, "an address is " + show(rep))
+    }
+    None -> if !sameBank(bankOfReg(c, r), Gp) {
+        complain(c, "an address is " + A.showReg(r, W64))
+    }
+}
+
+fun untracedAddress(c : Checker, d : Reg, what : String) -> Unit {
+    address(c, d)
+    match repOf(c, d) {
+        Some(rep) -> if rep.traced {
+            complain(c, what + " is held at " + show(rep))
+        }
+        None -> {}
+    }
+}
+
+fun widthBytes(w : Width) -> Int = match w {
+    W32 -> 4
+    W64 -> 8
+}
+
+-- A load or store of `v`, touching `bytes` at `m`. Either file may be loaded
+-- or stored -- `ldr d0` is as good as `ldr x0` -- so the question is only the
+-- width, and the answer depends on what is being addressed. A frame slot, an
+-- object's field and a global are each a whole word, so a value of any class
+-- may be moved through one at eight bytes; narrower, only if its class fits.
+-- Memory reached through an *untraced* address is either an array's elements
+-- or raw memory, and those are packed: an access there is exactly as wide as
+-- the element (`Turkey.Runtime.elementWidth`) or the raw access
+-- (`Turkey.Runtime.accessWidth`) says, and a word where a byte belongs reads
+-- its neighbours.
+fun access(c : Checker, v : Reg, m : Mem, bytes : Int, what : String) -> Unit {
+    match repOf(c, v) {
+        Some(rep) -> {
+            if bytes < 8 && wide(rep.class_) {
+                complain(c, what + " is " + show(rep) + " at "
+                            + Int.toString(bytes) + " bytes")
+            } else if packed(c, m) {
+                let k = rep.class_
+                if bytes != Rt.elementWidth(k) && bytes != Rt.accessWidth(k) {
+                    complain(c, what + " is " + show(rep) + " at "
+                                + Int.toString(bytes)
+                                + " bytes through an untraced address")
+                }
+            }
+        }
+        None -> {}
+    }
+    match m {
+        Offset(base, _) -> address(c, base)
+        Indexed(base, index) -> {
+            address(c, base)
+            wantInt(c, index, W64, "an index")
+        }
+        PageOffset(base, _) -> address(c, base)
+        _ -> {}
+    }
+}
+
+-- Whether `m` reaches packed memory: through a virtual register holding an
+-- untraced address. The root array is reached that way too, and its slots are
+-- words holding traced pointers, which is the width a pointer's class says.
+fun packed(c : Checker, m : Mem) -> Bool = match m {
+    Offset(base, _) -> untracedBase(c, base)
+    Indexed(base, _) -> untracedBase(c, base)
+    _ -> False
+}
+
+fun untracedBase(c : Checker, base : Reg) -> Bool = match repOf(c, base) {
+    Some(rep) -> !rep.traced
+    None -> False
+}
+
+-- -- calls ----------------------------------------------------------------------
+
+-- A move into a physical register is an argument being passed, until the call
+-- that reads it.
+fun intoArgument(c : Checker, d : Reg, a : Reg) -> Unit = match d {
+    Physical(_, _) -> match repOf(c, a) {
+        Some(rep) -> Map.put(c.moved, regKey(d), rep)
+        -- `xzr`, as a zero argument.
+        None -> Map.put(c.moved, regKey(d), Ssa.untraced(I64))
+    }
+    Virtual(_) -> {}
+}
+
+fun call(c : Checker, sym : String, sig : Option Signature) -> Unit {
+    let named = match c.listed {
+        Some(named) -> named
+        None -> {
+            complain(c, "a call with no argument list before it")
+            None
+        }
+    }
+    match (sig, named) {
+        (Some(Returns(params, result)), Some(into)) -> {
+            arguments(c, sym, params)
+            if !sameBank(A.bankOf(result), bankOfReg(c, into)) {
+                complain(c, sym + " answers " + show(result) + ", not in "
+                            + A.showReg(into, W64))
+            }
+        }
+        (Some(Returns(params, _)), None) -> {
+            arguments(c, sym, params)
+            complain(c, "a call to " + sym + " names no result register")
+        }
+        (Some(Void), Some(into)) ->
+            complain(c, "a call to " + sym + ", which returns void, names "
+                        + A.showReg(into, W64) + " as its result")
+        _ -> {}
+    }
+    -- A read of `x0` after a call that named no result register is still a
+    -- read of what the call left there, so it is checked as one.
+    let into = match named {
+        Some(r) -> r
+        None -> A.x0
+    }
+    c.called = Some(Called { sym = sym, sig = sig, into = into })
+    c.listed = None
+    c.moved = Map.new()
+    c.stacked = Map.new()
+}
+
+-- Each parameter against the register or stack slot the convention puts it
+-- in. The files are numbered separately, and past eight in a file a parameter
+-- is on the stack, numbered in parameter order whatever its file.
+fun arguments(c : Checker, sym : String, params : Array Rep) -> Unit {
+    var general = 0
+    var vector = 0
+    var stack = 0
+    for var k = 0; k < len(params); k = k + 1 {
+        let want = params[k]
+        let got = match A.bankOf(want) {
+            Gp -> if general < len(A.argRegs) {
+                let r = A.argRegs[general]
+                general = general + 1
+                Map.get(c.moved, regKey(r))
+            } else {
+                stack = stack + 1
+                Map.get(c.stacked, stack - 1)
+            }
+            Fp -> if vector < len(A.fpArgRegs) {
+                let r = A.fpArgRegs[vector]
+                vector = vector + 1
+                Map.get(c.moved, regKey(r))
+            } else {
+                stack = stack + 1
+                Map.get(c.stacked, stack - 1)
+            }
+        }
+        match got {
+            Some(rep) -> if rep != want {
+                complain(c, "passes " + show(rep) + " to " + sym + " parameter "
+                            + Int.toString(k) + ", which is " + show(want))
+            }
+            None -> complain(c, "passes nothing to " + sym + " parameter "
+                                + Int.toString(k))
+        }
+    }
+    let passed = len(Map.keys(c.moved)) + len(Map.keys(c.stacked))
+    if passed > len(params) {
+        complain(c, "passes " + Int.toString(passed) + " arguments to " + sym
+                    + ", which takes " + Int.toString(len(params)))
+    }
+}
+
+-- The first read of the result register after a call is the call's result,
+-- and is held at what the callee answers.
+fun readsResult(c : Checker, op : Arm) -> Unit {
+    if let Some(k) = c.called {
+        if let Some((d, from)) = transfer(op) {
+            if regKey(from) == regKey(k.into) {
+                c.called = None
+                if let Some(got) = repOf(c, d) { result(c, k, got) }
+            }
+        }
+    }
+}
+
+-- A move of any kind, as (destination, source).
+fun transfer(op : Arm) -> Option (Reg, Reg) = match op {
+    Mov(d, a, _) -> Some((d, a))
+    FMov(d, a) -> Some((d, a))
+    FMovIn(d, a) -> Some((d, a))
+    FMovOut(d, a) -> Some((d, a))
+    _ -> None
+}
+
+fun result(c : Checker, k : Called, got : Rep) -> Unit = match k.sig {
+    Some(Returns(_, answers)) -> if got != answers {
+        complain(c, "reads " + show(got) + " from " + k.sym
+                    + ", which answers " + show(answers))
+    }
+    Some(Void) -> if got.class_ != Unit {
+        complain(c, "reads " + show(got) + " from " + k.sym
+                    + ", which returns void")
+    }
+    None -> {}
+}

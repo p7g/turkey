@@ -265,9 +265,9 @@ fun lowerProgram(program : CProgram, decls : DeclTable)
 }
 
 -- Empty objects have no fields to mutate and the language has no physical
--- equality, so one per (kind, tag) can be shared. Done in the shared IR, so
--- that both emitters see ordinary rooted global loads rather than each
--- inventing its own interning.
+-- equality, so one per (kind, tag) can be shared. Done in the IR, so that the
+-- emitter sees ordinary rooted global loads rather than inventing its own
+-- interning.
 fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
     let objects : Map String (Int, Int) = Map.new()
     for f in m.functions {
@@ -298,8 +298,8 @@ fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
     }
     L.terminate(b, Jump(init.entry, []))
     init.entry = start
-    -- LLVM's first printed block is its entry; keep the shared graph in
-    -- reverse postorder after inserting the initialization prefix.
+    -- Back into reverse postorder, entry first, after inserting the
+    -- initialization prefix, as every other lowered function is.
     let ordered = Ssa.pruneUnreachable(init)
     init.blocks = ordered.blocks
     init.entry = ordered.entry
@@ -1820,8 +1820,11 @@ fun compactValue(l : Lower, c : Compact, name : String, ty : Ty.Type,
     let as_ = L.block(l.b)
     let after = L.block(l.b)
     let made = L.param(l.b, after, Ssa.traced(Ptr))
-    let limit = L.emit(l.b, ConstInt(4096), Ssa.traced(Ptr))
-    let small = L.emit(l.b, Cmp(Lt, x, limit), Ssa.untraced(I1))
+    -- `<=` the largest immediate rather than `<` the bound: a traced register
+    -- may hold an immediate, and the bound itself is neither that nor a
+    -- pointer.
+    let limit = L.emit(l.b, ConstInt(Rt.immediates - 1), Ssa.traced(Ptr))
+    let small = L.emit(l.b, Cmp(Le, x, limit), Ssa.untraced(I1))
     L.terminate(l.b, Branch(small, wrap, tagged))
     L.into(l.b, tagged)
     let seen = L.emit(l.b, ObjectTag(x), Ssa.untraced(I32))
@@ -1973,9 +1976,8 @@ fun literal(l : Lower, lit : Lit, rep : Rep) -> Value = match lit {
 -- that representation is a pointer.
 --
 -- The constant used to be emitted at `rep` whatever `rep` was, which for a
--- pointer-shaped context produced a scalar sitting in a pointer -- `add ptr 0,
--- 16` in the LLVM, which is not an instruction, and worse, a global the
--- collector would then try to trace as a heap address. It reached the backend
+-- pointer-shaped context produced a scalar sitting in a pointer -- a global
+-- the collector would then try to trace as a heap address. It reached the backend
 -- because a *generic* binding is compiled at the uniform representation and
 -- `let defaultSize = 16` generalizes: a bare numeric literal is polymorphic in
 -- its numeric type, so the generic copy of it is a scalar asked for at `ptr`.

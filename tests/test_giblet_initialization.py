@@ -1,4 +1,4 @@
-"""Giblet state exists before the first managed allocation on both backends."""
+"""Giblet state exists before the first managed allocation."""
 
 import hashlib
 import os
@@ -44,8 +44,7 @@ def compile_source(entry, env, command):
                           capture_output=True, text=True)
 
 
-@pytest.mark.parametrize("backend", toolchain.BACKENDS)
-def test_globals_precede_every_managed_allocation(modules, tmp_path, backend):
+def test_globals_precede_every_managed_allocation(modules, tmp_path):
     entry, env = modules(
         'import Turkey.Libc as C\n'
         'foreign "probe_step" fun step(Int) -> Int\n'
@@ -67,9 +66,9 @@ def test_globals_precede_every_managed_allocation(modules, tmp_path, backend):
         'foreign "probe_step" fun step(Int) -> Int\n'
         'var base : Int = step(1)\n',
         main='print("initialized"); print(P.read())')
-    result = compile_source(entry, env, backend)
+    result = compile_source(entry, env, "native")
     assert result.returncode == 0, result.stderr
-    generated = tmp_path / ("program.s" if backend == "native" else "program.ll")
+    generated = tmp_path / "program.s"
     generated.write_text(result.stdout)
     probe = tmp_path / "probe.c"
     probe.write_text('''
@@ -86,7 +85,7 @@ int64_t probe_step(int64_t n) {
 ''')
     binary = tmp_path / "program"
     subprocess.run([*toolchain.cc(), "-O1", "-I", str(bootc.PROBE_INCLUDE),
-                    *toolchain.clang_only("-Wno-override-module"), str(generated),
+                    str(generated),
                     str(probe), *toolchain.libraries(), "-o", str(binary)],
                    check=True, capture_output=True, text=True)
     for stress in ["0", "1"]:
@@ -96,8 +95,7 @@ int64_t probe_step(int64_t n) {
         assert run.stdout == "initialized\n43\n"
 
 
-@pytest.mark.parametrize("backend", toolchain.BACKENDS)
-def test_c_can_run_early_initialization(modules, tmp_path, backend):
+def test_c_can_run_early_initialization(modules, tmp_path):
     """`turkey_giblets_initialize` is the early initializer under a C name, so
     that C which runs a program's Turkey code without running the program sets
     up giblet state exactly as `turkey_entry` does."""
@@ -106,13 +104,12 @@ def test_c_can_run_early_initialization(modules, tmp_path, backend):
         'var runs : Int = step()\n'
         'foreign "probe_read" fun read() -> Int = runs\n',
         'let base : Int = 0')
-    result = compile_source(entry, env, backend)
+    result = compile_source(entry, env, "native")
     assert result.returncode == 0, result.stderr
     # The probe supplies C's main, and never runs the program's.
     main = toolchain.c_symbol("main")
     text = result.stdout.replace(f'"{main}"', '"_unused_probe_main"')
-    text = text.replace("@main(", "@unused_probe_main(")
-    generated = tmp_path / ("program.s" if backend == "native" else "program.ll")
+    generated = tmp_path / "program.s"
     generated.write_text(text)
     probe = tmp_path / "probe.c"
     probe.write_text('''
@@ -133,7 +130,7 @@ int main(void) {
 ''')
     binary = tmp_path / "program"
     subprocess.run([*toolchain.cc(), "-O1", "-I", str(bootc.PROBE_INCLUDE),
-                    *toolchain.clang_only("-Wno-override-module"), str(generated),
+                    str(generated),
                     str(probe), *toolchain.libraries(),
                     "-o", str(binary)],
                    check=True, capture_output=True, text=True)
@@ -191,16 +188,15 @@ def test_early_helpers_cannot_reach_the_late_runtime(modules, dependency, messag
     assert message in result.stderr, result.stderr
 
 
-@pytest.mark.parametrize("backend", toolchain.BACKENDS)
-def test_early_raw_panic_stops_before_allocation(modules, tmp_path, backend):
+def test_early_raw_panic_stops_before_allocation(modules, tmp_path):
     entry, env = modules(
         'import Turkey.Process as R\n'
         'let failed : Int = fail()\n'
         'fun fail() -> Int { R.panic(Prim.cString("early failure")); 0 }\n'
         'fun read() -> Int = failed', 'let base : Int = 0')
-    result = compile_source(entry, env, backend)
+    result = compile_source(entry, env, "native")
     assert result.returncode == 0, result.stderr
-    generated = tmp_path / ("program.s" if backend == "native" else "program.ll")
+    generated = tmp_path / "program.s"
     generated.write_text(result.stdout)
     probe = tmp_path / "probe.c"
     probe.write_text('#include <stdint.h>\n#include <stdio.h>\n#include "turkey_exports.h"\n'
@@ -208,7 +204,7 @@ def test_early_raw_panic_stops_before_allocation(modules, tmp_path, backend):
                      '{ fprintf(stderr, "objects %lld\\n", (long long)turkey_heap_objects()); }\n')
     binary = tmp_path / "program"
     subprocess.run([*toolchain.cc(), "-O1", "-I", str(bootc.PROBE_INCLUDE),
-                    *toolchain.clang_only("-Wno-override-module"), str(generated),
+                    str(generated),
                     str(probe), *toolchain.libraries(), "-o", str(binary)],
                    check=True, capture_output=True, text=True)
     run = subprocess.run(toolchain.command(binary), capture_output=True, text=True, env=env)

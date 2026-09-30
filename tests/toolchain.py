@@ -101,20 +101,6 @@ def libraries() -> list[str]:
 
 
 @functools.lru_cache(maxsize=None)
-def clang() -> bool:
-    """Whether `$TURKEY_CC` is clang.
-
-    `boot llvm` emits LLVM IR, and only clang compiles a `.ll`: gcc takes it
-    for a linker script. `-Wno-override-module` is clang's too.
-    """
-    if missing():
-        return False
-    result = subprocess.run([*cc(), "--version"], capture_output=True,
-                            text=True)
-    return "clang" in result.stdout
-
-
-@functools.lru_cache(maxsize=None)
 def sanitizes() -> bool:
     """Whether `$TURKEY_CC` links a program built with -fsanitize=undefined.
 
@@ -139,22 +125,3 @@ def needs_sanitizer() -> None:
     if not sanitizes():
         pytest.skip("$TURKEY_CC cannot link -fsanitize=undefined: "
                     "no UBSan runtime for its target")
-
-
-# Why a test of `boot llvm`'s output does not run under a compiler that is not
-# clang, for a skip to state.
-NOT_CLANG = "$TURKEY_CC is not clang, and only clang compiles boot llvm's .ll"
-
-
-def needs_clang() -> pytest.MarkDecorator:
-    """Skips a test that compiles `boot llvm`'s output, unless under clang."""
-    return pytest.mark.skipif(not clang(), reason=NOT_CLANG)
-
-
-# Both of `boot`'s backends, for a test parametrized over them.
-BACKENDS = ["native", pytest.param("llvm", marks=needs_clang())]
-
-
-def clang_only(*flags: str) -> list[str]:
-    """`flags` if the compiler is clang, and nothing otherwise."""
-    return list(flags) if clang() else []

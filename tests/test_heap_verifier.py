@@ -348,13 +348,8 @@ def test_verifier_detects_corruption(verifier_probe, case, diagnostic):
         assert result.stdout.startswith("heap verifier:")
 
 
-@pytest.mark.parametrize("backend,defect", [
-    ("native", "native-roots"),
-    pytest.param("llvm", "shadow-roots", marks=toolchain.needs_clang()),
-    ("native", "children"),
-    pytest.param("llvm", "children", marks=toolchain.needs_clang()),
-])
-def test_broken_collector_is_stopped_before_sweeping(tmp_path, backend, defect):
+@pytest.mark.parametrize("defect", ["native-roots", "children"])
+def test_broken_collector_is_stopped_before_sweeping(tmp_path, defect):
     source = tmp_path / "main.gob"
     source.write_text('''
 fun main() {
@@ -375,22 +370,19 @@ fun main() {
     if defect == "native-roots":
         before, after = ("    scanNativeFrames(frame)\n    if Process.pending()",
                          "    if Process.pending()")
-    elif defect == "shadow-roots":
-        before, after = "    var root = roots\n", "    var root = Prim.ptrNull()\n"
     else:
         before = "        let object = Prim.loadPtr(markStack, times8(top))\n"
         after = before + "        if !Prim.ptrIsNull(object) { continue }\n"
     assert text.count(before) == 1, before
     heap.write_text(text.replace(before, after))
-    result = subprocess.run(toolchain.command(bootc.binary(), backend, str(source)),
+    result = subprocess.run(toolchain.command(bootc.binary(), "native", str(source)),
                             cwd=bootc.REPO_ROOT, capture_output=True, text=True,
                             check=True, env=dict(os.environ, TURKEY_LIB=str(library)))
-    generated = tmp_path / ("main.s" if backend == "native" else "main.ll")
+    generated = tmp_path / "main.s"
     generated.write_text(result.stdout)
     binary = tmp_path / "broken"
-    subprocess.run([*toolchain.cc(), "-std=c11", "-O1",
-                    *toolchain.clang_only("-Wno-override-module"), str(generated),
-                    "-lm", "-pthread", "-o", str(binary)],
+    subprocess.run([*toolchain.cc(), str(generated), *toolchain.libraries(),
+                    "-o", str(binary)],
                    capture_output=True, text=True, check=True)
     result = subprocess.run(toolchain.command(binary), capture_output=True, text=True, timeout=20,
                             env=dict(os.environ, TURKEY_GC_STRESS="1", TURKEY_GC_VERIFY="1"))

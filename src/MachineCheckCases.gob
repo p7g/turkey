@@ -1,0 +1,165 @@
+-- A third entry point in `src/`, beside `SsaCheck.gob`: hand-built arm64
+-- functions put to `Turkey.MachineCheck`, one well-formed and the rest each
+-- carrying one representation bug.
+--
+-- The first three are representation bugs that got past every verifier above
+-- this one, each in the shape it takes in machine code:
+--
+-- * a call to a generic copy where a ground one was meant, so the caller reads
+--   an `i64` from a function that answers a pointer;
+-- * a scalar constant emitted at a pointer representation, where the
+--   collector would follow it as an address;
+-- * the result of a C function declared `void` read as a pointer, from a
+--   register the callee never wrote.
+--
+-- `tests/test_machine_check.py` runs it.
+
+import Data.Map as Map
+import Turkey.Arm64 as A
+import Turkey.Arm64 (Arm(..), Reg(..), Mem(..), Width(..), Inst(..))
+import Turkey.Asm as Asm
+import Turkey.LowIr (Low(..))
+import Turkey.MachineCheck as MachineCheck
+import Turkey.Runtime as Rt
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (Rep(..), RepClass(..), Func(..), Block(..))
+
+let i64 = Ssa.untraced(I64)
+let pointer = Ssa.traced(Ptr)
+let f64 = Ssa.untraced(F64)
+
+-- A library constant, generalized: its generic copy answers the uniform
+-- representation.
+let generic = Asm.symbolFor(Asm.MachO, "defaultSize")
+-- A function taking a traced pointer and answering one.
+let takesPointer = Asm.symbolFor(Asm.MachO, "keep")
+let exit = Asm.runtimeFor(Asm.MachO, "turkey_exit")
+
+fun main() {
+    let size : Func Low = Ssa.newFunc("defaultSize", pointer)
+    let keep : Func Low = Ssa.newFunc("keep", pointer)
+    Array.push(keep.params, Ssa.freshValue(keep, pointer))
+    let sigs = MachineCheck.signatures([size, keep], Asm.MachO)
+    print("exit is void: " + show(Map.contains(sigs, exit)))
+
+    report("well formed", sigs, fun(f) = {
+        let n = value(f, i64)
+        emit(f, MovConst(n, 16))
+        let p = value(f, pointer)
+        emit(f, CallArgs([], [A.x0]))
+        emit(f, Bl(generic))
+        emit(f, Mov(p, A.x0, W64))
+        let q = value(f, pointer)
+        emit(f, Mov(A.x0, p, W64))
+        emit(f, CallArgs([A.x0], [A.x0]))
+        emit(f, Bl(takesPointer))
+        emit(f, Mov(q, A.x0, W64))
+        let null = value(f, pointer)
+        emit(f, MovConst(null, 0))
+        let nullary = value(f, pointer)
+        emit(f, MovConst(nullary, 1))
+        let x = value(f, f64)
+        emit(f, FMovIn(x, n))
+        emit(f, FAdd(x, x, x))
+        n
+    })
+
+    report("a ground call left on the generic copy", sigs, fun(f) = {
+        let n = value(f, i64)
+        emit(f, CallArgs([], [A.x0]))
+        emit(f, Bl(generic))
+        emit(f, Mov(n, A.x0, W64))
+        n
+    })
+
+    -- A constant below `Turkey.Runtime.immediates` is a compact sum's
+    -- nullary, which a traced register may hold, so the scalar here is one
+    -- the collector would follow.
+    report("a scalar constant at a pointer representation", sigs, fun(f) = {
+        let p = value(f, pointer)
+        emit(f, MovConst(p, 65536))
+        zero(f)
+    })
+
+    report("a void call's result read as a pointer", sigs, fun(f) = {
+        let code = value(f, i64)
+        emit(f, MovConst(code, 1))
+        emit(f, Mov(A.x0, code, W64))
+        emit(f, CallArgs([A.x0], []))
+        emit(f, Bl(exit))
+        let p = value(f, pointer)
+        emit(f, Mov(p, A.x0, W64))
+        zero(f)
+    })
+
+    report("an integer passed where a pointer is taken", sigs, fun(f) = {
+        let n = value(f, i64)
+        emit(f, MovConst(n, 7))
+        emit(f, Mov(A.x0, n, W64))
+        emit(f, CallArgs([A.x0], [A.x0]))
+        emit(f, Bl(takesPointer))
+        n
+    })
+
+    report("a double in the general file", sigs, fun(f) = {
+        let x = value(f, f64)
+        let n = value(f, i64)
+        emit(f, MovConst(n, 1))
+        emit(f, Add(x, n, n, W64))
+        zero(f)
+    })
+
+    report("a 32-bit load of a 64-bit value", sigs, fun(f) = {
+        let p = value(f, pointer)
+        emit(f, MovConst(p, 0))
+        let n = value(f, i64)
+        emit(f, Ldr(n, Offset(p, 24), W32))
+        n
+    })
+
+    report("a word read from a byte array", sigs, fun(f) = {
+        let p = value(f, pointer)
+        emit(f, MovConst(p, 0))
+        let base = value(f, Ssa.untraced(Ptr))
+        emit(f, AddImm(base, p, 24, W64))
+        let b = value(f, Ssa.untraced(I8))
+        emit(f, Ldr(b, Offset(base, 0), W64))
+        zero(f)
+    })
+
+    report("an integer moved into a traced register", sigs, fun(f) = {
+        let n = value(f, i64)
+        emit(f, MovConst(n, 8))
+        let p = value(f, pointer)
+        emit(f, Mov(p, n, W64))
+        n
+    })
+}
+
+-- One function, built by `body` into a single block that returns what `body`
+-- answers, and what the check says about it.
+fun report(what : String, sigs : Map String MachineCheck.Signature,
+           body : fun(Func Inst) -> Reg) -> Unit {
+    let f : Func Inst = Ssa.newFunc("probe", i64)
+    Array.push(f.blocks, Ssa.newBlock())
+    let answer = body(f)
+    match answer {
+        Virtual(n) -> { f.blocks[0].term = Ssa.Ret(Ssa.Value(n)) }
+        Physical(_, _) -> {}
+    }
+    let messages = MachineCheck.check(f, sigs)
+    print(what + ": " + Int.toString(len(messages)))
+    for m in messages { print("  " + m) }
+}
+
+fun value(f : Func Inst, r : Rep) -> Reg = A.reg(Ssa.freshValue(f, r))
+
+fun emit(f : Func Inst, op : Arm) -> Unit {
+    Array.push(f.blocks[0].insts, Inst { op = op })
+}
+
+fun zero(f : Func Inst) -> Reg {
+    let n = value(f, i64)
+    emit(f, MovConst(n, 0))
+    n
+}

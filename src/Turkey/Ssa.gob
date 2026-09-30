@@ -48,6 +48,8 @@ module Turkey.Ssa (
 
 -- No diagnostics: `verify` answers with complaints rather than failing, so
 -- this module depends on nothing but the standard library.
+import Data.BitSet as BitSet
+import Data.BitSet (BitSet)
 import Data.Set as Set
 import Turkey.Source (Span)
 
@@ -696,7 +698,7 @@ fun showTerm(f : Func i, t : Term) -> String = match t {
 -- terminator, and the parameter it becomes is defined in the successor. So
 -- there is no phi to special-case: `uses` and `defs` already say everything,
 -- which is what block parameters buy over phi nodes.
-fun liveness[Inst i](f : Func i) -> Array (Set.Set Int) {
+fun liveness[Inst i](f : Func i) -> Array BitSet {
     let (_, out) = livenessInOut(f)
     out
 }
@@ -705,45 +707,53 @@ fun liveness[Inst i](f : Func i) -> Array (Set.Set Int) {
 -- that is all the root analysis needed; the colourer needs live-*in* too, to
 -- know what a block's parameters interfere with, and computing the fixpoint
 -- twice to get a set it already had would be silly.
-fun livenessInOut[Inst i](f : Func i)
-        -> (Array (Set.Set Int), Array (Set.Set Int)) {
+--
+-- Every set is a bitset over the function's value ids, which are dense, and
+-- each block's pair is updated in place. Unioning a successor's live-in into
+-- live-out rather than rebuilding live-out is exact because both only grow:
+-- the iteration starts from empty sets and every step is monotone.
+fun livenessInOut[Inst i](f : Func i) -> (Array BitSet, Array BitSet) {
     let count = len(f.blocks)
-    let liveIn : Array (Set.Set Int) = []
-    let liveOut : Array (Set.Set Int) = []
+    let values = len(f.reps)
+    let liveIn : Array BitSet = []
+    let liveOut : Array BitSet = []
     for var b = 0; b < count; b = b + 1 {
-        Array.push(liveIn, Set.new())
-        Array.push(liveOut, Set.new())
+        Array.push(liveIn, BitSet.new(values))
+        Array.push(liveOut, BitSet.new(values))
     }
+    let entering = BitSet.new(values)
     let order = Array.reverse(reversePostorder(f))
     var changed = True
     while changed {
         changed = False
         for at in order {
             let b = blockId(at)
-            let out = Set.new()
+            let out = liveOut[b]
             for s in successors(f.blocks[b].term) {
-                for v in Set.elements(liveIn[blockId(s)]) { Set.add(out, v) }
+                let _ = BitSet.unionInto(out, liveIn[blockId(s)])
             }
-            let entering = Set.new()
-            for v in Set.elements(out) { Set.add(entering, v) }
+            BitSet.copyFrom(entering, out)
             -- Backward through the terminator, then the instructions.
             for v in termUses(f.blocks[b].term) {
-                Set.add(entering, valueId(v))
+                BitSet.add(entering, valueId(v))
             }
             for var n = len(f.blocks[b].insts) - 1; n >= 0; n = n - 1 {
                 for v in defs(f.blocks[b].insts[n]) {
-                    let _ = Set.remove(entering, valueId(v))
+                    let _ = BitSet.remove(entering, valueId(v))
                 }
                 for v in uses(f.blocks[b].insts[n]) {
-                    Set.add(entering, valueId(v))
+                    BitSet.add(entering, valueId(v))
                 }
             }
-            for p in f.blocks[b].params { let _ = Set.remove(entering, valueId(p)) }
-            if len(entering) != len(liveIn[b]) || len(out) != len(liveOut[b]) {
+            for p in f.blocks[b].params {
+                let _ = BitSet.remove(entering, valueId(p))
+            }
+            -- Live-out is a function of the live-ins alone, so a pass that
+            -- changes no live-in has reached the fixpoint.
+            if !BitSet.equal(entering, liveIn[b]) {
+                BitSet.copyFrom(liveIn[b], entering)
                 changed = True
             }
-            liveIn[b] = entering
-            liveOut[b] = out
         }
     }
     (liveIn, liveOut)
@@ -765,22 +775,22 @@ fun termUses(t : Term) -> Array Value = match t {
 -- `n`, which is what a safepoint needs: the callee may collect, and what must
 -- survive is whatever is still wanted when it returns.
 --
--- Each point is an array of distinct ids rather than a set: every reader only
--- walks them, and a snapshot of the one set being updated is a single array
--- where a copy would rebuild a hash table per instruction.
+-- Each point is an array of distinct ids, ascending, rather than a set: every
+-- reader only walks them, and a snapshot of the one set being updated is a
+-- single array where a copy would be a bitset the size of the function.
 fun liveAfter[Inst i](f : Func i, at : BlockId,
-                      out : Set.Set Int) -> Array (Array Int) {
+                      out : BitSet) -> Array (Array Int) {
     let block = f.blocks[blockId(at)]
     let sets : Array (Array Int) = Array.new(len(block.insts))
     let unset : Array Int = []
     for var n = 0; n < len(block.insts); n = n + 1 { Array.push(sets, unset) }
-    let live = Set.new()
-    for v in Set.elements(out) { Set.add(live, v) }
-    for v in termUses(block.term) { Set.add(live, valueId(v)) }
+    let live = BitSet.new(len(f.reps))
+    BitSet.copyFrom(live, out)
+    for v in termUses(block.term) { BitSet.add(live, valueId(v)) }
     for var n = len(block.insts) - 1; n >= 0; n = n - 1 {
-        sets[n] = Set.elements(live)
-        for v in defs(block.insts[n]) { let _ = Set.remove(live, valueId(v)) }
-        for v in uses(block.insts[n]) { Set.add(live, valueId(v)) }
+        sets[n] = BitSet.elements(live)
+        for v in defs(block.insts[n]) { let _ = BitSet.remove(live, valueId(v)) }
+        for v in uses(block.insts[n]) { BitSet.add(live, valueId(v)) }
     }
     sets
 }

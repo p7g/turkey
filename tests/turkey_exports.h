@@ -48,6 +48,10 @@ int64_t turkey_heap_objects(void);
 int64_t turkey_collection_count(void);
 void turkey_gc_set_stress(int64_t enabled);
 void turkey_gc_set_verify(int64_t enabled);
+/* The write barrier's slow path: remembers `parent` if it is old. C that
+   stores a pointer into an object allocated before the pointer's object
+   calls it after the store. */
+void turkey_write_barrier(void *parent);
 int64_t turkey_heap_contains(void *value);
 void *turkey_heap_regions(void);
 void *turkey_heap_available(void);

@@ -43,16 +43,27 @@ import Turkey.Libc as Libc
 -- generated code: `Turkey.Emit` builds the globals' one. A change here is a
 -- change there.
 
--- `HeapHeader`, immediately before every payload: a word the collector does
--- not use, the payload size, the heap kind (u32) and the mark epoch that last
--- reached it (u32).
+-- `HeapHeader`, immediately before every payload: the generation word, the
+-- payload size, the heap kind (u32) and the mark epoch that last reached it
+-- (u32).
 let headerBytes : Int = 24
+let headerGeneration : Int = 0
 let headerSize : Int = 8
 let headerKind : Int = 16
 let headerMarked : Int = 20
 -- The header and its kind, from the payload.
 let payloadHeader : Int = -24
 let payloadKind : Int = -8
+
+-- The generation word's values. An object is young from its allocation until
+-- the first collection that marks it, and old from then on: one survived
+-- collection promotes. An old object given a young one by a store is
+-- remembered, once, by the write barrier (`writeBarrier`), which `Turkey.Select`
+-- emits: the compiler reads these values too, as does every frame object's
+-- header, which is zero.
+let young : Int = 0
+let old : Int = 1
+let rememberedOld : Int = 2
 
 -- Heap kinds: an object (constructor, record, array, closure, environment,
 -- box) and a cell.
@@ -152,6 +163,12 @@ var markStack : Prim.Ptr = Prim.ptrNull()
 var markCount : Int = 0
 var markCapacity : Int = 0
 
+-- The old objects the write barrier has seen given a young one since the last
+-- collection, each once: its generation word says it is here.
+var remembered : Prim.Ptr = Prim.ptrNull()
+var rememberedCount : Int = 0
+var rememberedCapacity : Int = 0
+
 -- The arm64 backend's frame table, sorted by return address.
 var frameEntries : Prim.Ptr = Prim.ptrNull()
 var frameEntryCount : Int = 0
@@ -206,6 +223,8 @@ var statsClock : Int = 0
 -- The part of `statsClock` spent marking, roots included; the rest is the
 -- sweep and the bookkeeping around it.
 var statsMarkClock : Int = 0
+-- Every object the write barrier remembered.
+var statsRemembered : Int = 0
 -- Allocations by what the object is, indexed by `Turkey.Alloc`'s kind:
 -- 0 constructor, 1 record, 2 array, 3 closure, 4 environment, 5 box, 7 cell.
 var statsByKind : Prim.Ptr = zeroed(64)
@@ -656,7 +675,7 @@ fun stressDue() -> Bool {
 
 -- The header of a fresh slot, and the payload after it.
 fun initialize(header : Prim.Ptr, size : Int, kind : Int, counted : Int) -> Prim.Ptr {
-    Prim.storePtr(header, 0, Prim.ptrNull())
+    Prim.storeI64(header, headerGeneration, young)
     Prim.storeI64(header, headerSize, size)
     -- The kind, and a mark epoch of 0 above it: no epoch is 0.
     Prim.storeI64(header, headerKind, kind)
@@ -939,6 +958,7 @@ fun markGrey(value : Prim.Ptr, what : Prim.Ptr, index : Int) -> Unit {
     Prim.storeI64(region, at, Prim.intOr(marks, bit(slot)))
     store32(region, regionLive, plus(load32(region, regionLive), 1))
     store32(header, headerMarked, markEpoch)
+    Prim.storeI64(header, headerGeneration, old)
     if markCount == markCapacity && !growMarkStack() { return {} }
     Prim.storePtr(markStack, times8(markCount), value)
     markCount = plus(markCount, 1)
@@ -962,6 +982,35 @@ fun growMarkStack() -> Bool {
     markStack = grown
     markCapacity = capacity
     True
+}
+
+-- The write barrier's slow path: `parent` has just been given a young object,
+-- and is remembered if it is old and not remembered already. Generated code
+-- calls it only then, after testing both inline; the test here is for C.
+-- Called between a store and the next instruction, so it must not allocate,
+-- collect or panic in any way the caller could miss: it is not a safepoint,
+-- and nothing checks the panic flag after it.
+--
+-- Stores the compiler cannot see -- raw stores of a managed pointer into a
+-- managed object, from Turkey or C -- must call it too, unless the object was
+-- allocated after the value they store.
+foreign "turkey_write_barrier" fun writeBarrier(parent : Prim.Ptr) -> Unit {
+    let header = Prim.ptrAdd(parent, payloadHeader)
+    if Prim.loadI64(header, headerGeneration) != old { return {} }
+    if rememberedCount == rememberedCapacity {
+        let capacity = if rememberedCapacity < 64 { 64 } else { rememberedCapacity * 2 }
+        let grown = Libc.realloc(remembered, 8 * capacity)
+        if Prim.ptrIsNull(grown) {
+            Process.panic(Prim.cString("out of memory remembering an old object"))
+            return {}
+        }
+        remembered = grown
+        rememberedCapacity = capacity
+    }
+    Prim.storeI64(header, headerGeneration, rememberedOld)
+    Prim.storePtr(remembered, times8(rememberedCount), parent)
+    rememberedCount = plus(rememberedCount, 1)
+    statsRemembered = plus(statsRemembered, 1)
 }
 
 -- Trace everything reachable from the stack, emptying it. This is the one
@@ -1018,6 +1067,7 @@ fun drain() -> Unit {
                     Prim.storeI64(childRegion, at, Prim.intOr(marks, mask))
                     store32(childRegion, regionLive, plus(load32(childRegion, regionLive), 1))
                     store32(childHeader, headerMarked, markEpoch)
+                    Prim.storeI64(childHeader, headerGeneration, old)
                     if top == markCapacity && !growMarkStack() {
                         markCount = 0
                         return {}
@@ -1074,6 +1124,9 @@ fun collectFrom(frame : Prim.Ptr) -> Unit {
     let allocsSince = allocationsSince
     let wanted = statsWanted
     let started = if wanted { nanoseconds() } else { 0 }
+    -- A full collection marks every live object again, which makes each one
+    -- old and so forgets it was remembered.
+    rememberedCount = 0
     startMarking()
     var root = roots
     while !Prim.ptrIsNull(root) {
@@ -1265,6 +1318,10 @@ foreign "turkey_gc_report" fun report() -> Unit {
     put(Prim.cString(" s (mark "))
     putFixed(statsMarkClock, 1000000000, 3)
     put(Prim.cString(" s)\n"))
+    writeLine()
+    put(Prim.cString("[gc] remembered "))
+    putInt(statsRemembered)
+    put(Prim.cString("\n"))
     writeLine()
 }
 

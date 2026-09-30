@@ -25,6 +25,8 @@ module Turkey.Select (
 -- rather than the hazard. The GC roots are the opposite case, and their
 -- *analysis* is shared, in `Turkey.Roots`.
 
+import Data.BitSet as BitSet
+import Data.BitSet (BitSet)
 import Data.Map as Map
 import Data.Set as Set
 import Turkey.Arm64 as A
@@ -73,6 +75,12 @@ type Sel = Sel {
     -- The integer constants the low IR defines, by value: an operand known
     -- here can be an immediate, and a known divisor needs fewer checks.
     known   : Map Int Int,
+    -- For the write barrier's static exemption (`barrierNeeded`): where each
+    -- low IR value is defined, as its block and its index there or -1 for a
+    -- block parameter, and which values are fresh allocations.
+    definedIn : Array Int,
+    definedAt : Array Int,
+    allocations : BitSet,
 }
 
 fun emit(s : Sel, op : A.Arm) -> Unit {
@@ -160,7 +168,30 @@ fun start(f : Func Low, asm : Asm) -> Sel {
     g.entry = incoming(f, g)
     Sel { source = f, out = g, at = 0, stopped = None, asm = asm,
           frame = Roots.analyze(f), pending = None, panicking = False,
-          known = constantsOf(f) }
+          known = constantsOf(f), definedIn = Array.new(0), definedAt = Array.new(0),
+          allocations = BitSet.new(len(f.reps)) }
+}
+
+fun placeDefinitions(s : Sel) -> Unit {
+    let f = s.source
+    for _ in f.reps {
+        Array.push(s.definedIn, -1)
+        Array.push(s.definedAt, -1)
+    }
+    for var b = 0; b < len(f.blocks); b = b + 1 {
+        for p in f.blocks[b].params { s.definedIn[Ssa.valueId(p)] = b }
+        let insts = f.blocks[b].insts
+        for var n = 0; n < len(insts); n = n + 1 {
+            let id = Ssa.valueId(insts[n].result)
+            s.definedIn[id] = b
+            s.definedAt[id] = n
+            match insts[n].op {
+                ObjectNew(_, _, _, _, _) | ArrayNew(_, _, _) | CellNew(_)
+                    | ClosureNew(_, _) -> BitSet.add(s.allocations, id)
+                _ -> {}
+            }
+        }
+    }
 }
 
 fun constantsOf(f : Func Low) -> Map Int Int {
@@ -431,6 +462,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         CellLoad(target) -> emit(s, A.Ldr(d, A.Offset(A.reg(target), 0), A.W64))
         CellStore(target, v) -> {
             emit(s, A.Str(A.reg(v), A.Offset(A.reg(target), 0), A.W64))
+            if barrierNeeded(s, target, v) { barrier(s, A.reg(target), A.reg(v)) }
             -- A `str` of a `d` register stores the same bits a `str` of an
             -- `x` would, so no transfer is needed here and none below: only
             -- the *call* boundaries need one.
@@ -455,6 +487,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                 4 -> emit(s, A.Str(A.reg(v), at, A.W32))
                 _ -> emit(s, A.Str(A.reg(v), at, A.W64))
             }
+            if barrierNeeded(s, target, v) { barrier(s, A.reg(target), A.reg(v)) }
             emit(s, A.Mov(d, A.xzr, A.W64))
         }
         -- A literal's `TurkeyString` is built once by the module's entry
@@ -498,6 +531,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         }
         ObjectSet(target, index, v) -> {
             storeField(s, A.reg(target), index, A.reg(v))
+            if barrierNeeded(s, target, v) { barrier(s, A.reg(target), A.reg(v)) }
             emit(s, A.Mov(d, A.xzr, A.W64))
         }
         ArrayNew(length, initial, element) ->
@@ -549,6 +583,10 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             let env = temp(s, Ssa.traced(Ptr))
             emit(s, A.Ldr(env, A.Offset(A.reg(closure), 32), A.W64))
             emit(s, A.Str(A.reg(v), A.Offset(env, 24 + 8 * index), A.W64))
+            -- The parent is the environment, which the exemption cannot see:
+            -- it is loaded, not allocated here. Only recursive closures
+            -- capture after construction, so testing every one costs little.
+            if storesObject(s, v) { barrier(s, env, A.reg(v)) }
             emit(s, A.Mov(d, A.xzr, A.W64))
         }
         Call(callee, args) -> {
@@ -643,6 +681,80 @@ fun frameObject(s : Sel, v : Value) -> Int = match Roots.objectOf(s.frame, Ssa.v
 -- bits directly, as `CellStore` does.
 fun storeField(s : Sel, object : Reg, index : Int, v : Reg) -> Unit =
     emit(s, A.Str(v, A.Offset(object, 24 + 8 * index), A.W64))
+
+-- -- the write barrier ----------------------------------------------------------------
+--
+-- A minor collection traces from the roots and from the old objects remembered
+-- as holding a young one (`Turkey.Heap`), so a store that makes an old object
+-- point at a young one must remember the old one. Header word 0 is the
+-- generation word: 0 young, 1 old, 2 old and already remembered. The inline
+-- test reads the target's word first, and only a target that is old and not
+-- yet remembered goes on to the value: an object, not an immediate, and young.
+-- Only then the call, which never allocates, collects or panics, and so has
+-- no safepoint map and no test of the panic flag after it.
+--
+-- A frame object's generation word is zero (`Turkey.Frame.layout`), so a
+-- target need not be known to be in the heap.
+--
+-- The committed bootstrap compiler emits this sequence into what it builds,
+-- which runs the collector in lib/: the word's values, the slow path's name
+-- and its one argument are an interface between the two, changed only
+-- together with a bootstrap bump.
+fun barrier(s : Sel, target : Reg, value : Reg) -> Unit {
+    let done = block(s)
+    let targetAge = temp(s, Ssa.untraced(I64))
+    emit(s, A.Ldr(targetAge, A.Offset(target, -24), A.W64))
+    emit(s, A.CmpImm(targetAge, 1, A.W64))
+    skipIf(s, A.Ne, done)
+    emit(s, A.CmpImm(value, 4096, A.W64))
+    skipIf(s, A.Lo, done)
+    let valueAge = temp(s, Ssa.untraced(I64))
+    emit(s, A.Ldr(valueAge, A.Offset(value, -24), A.W64))
+    emit(s, A.CmpImm(valueAge, 0, A.W64))
+    skipIf(s, A.Ne, done)
+    move(s, A.argRegs[0], A.Gp, target, A.Gp)
+    emit(s, A.CallArgs([A.argRegs[0]], []))
+    emit(s, A.Bl(runtimeSymbolOf(s, "turkey_write_barrier")))
+    s.out.blocks[s.at].term = Jump(BlockId(done), [])
+    s.at = done
+}
+
+-- Go on to `done` if the flags just set satisfy `c`, and carry on in a fresh
+-- block if not.
+fun skipIf(s : Sel, c : A.Cond, done : Int) -> Unit {
+    let taken = tempValue(s, Ssa.untraced(I1))
+    emit(s, A.CSet(A.reg(taken), c))
+    let carry = block(s)
+    s.out.blocks[s.at].term = Branch(taken, BlockId(done), BlockId(carry))
+    s.at = carry
+}
+
+-- Whether storing `value` into `target` needs the barrier.
+--
+-- Not into one of this function's own frame objects, which the collector
+-- reads as roots every time. And not into an object allocated in the same
+-- block after `value` was defined: an object is never older than what existed
+-- before it was allocated, since the collection that promotes it traces
+-- everything reachable that was allocated earlier, so such a store can never
+-- make an old object point at a young one. That covers building an object
+-- field by field and filling an array literal.
+fun barrierNeeded(s : Sel, target : Value, value : Value) -> Bool {
+    if !storesObject(s, value) { return False }
+    match Roots.objectOf(s.frame, Ssa.valueId(target)) {
+        Some(_) -> return False
+        None -> {}
+    }
+    let t = Ssa.valueId(target)
+    let v = Ssa.valueId(value)
+    if len(s.definedIn) == 0 { placeDefinitions(s) }
+    !(BitSet.contains(s.allocations, t) && s.definedIn[v] == s.definedIn[t]
+      && s.definedAt[v] < s.definedAt[t])
+}
+
+-- Whether `value` may be a heap object: traced, and not a constant, which is
+-- null or a nullary constructor's immediate.
+fun storesObject(s : Sel, value : Value) -> Bool =
+    Ssa.repOf(s.source, value).traced && !Map.contains(s.known, Ssa.valueId(value))
 
 fun runtimeCall(s : Sel, d : Reg, sym : String, first : Array Reg,
                 rest : Array Reg) -> Unit {

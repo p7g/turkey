@@ -287,7 +287,7 @@ def split_on(text: str, marker: str) -> list[str]:
     `boot` takes any number of files in one invocation -- which is the whole
     point of this module -- so every caller needs the same unpicking
     afterwards. Two shapes exist: a dump that *starts* each program with a
-    marker line (`llvm`, `asm`), and one that *ends* each with a count line
+    marker line (`native`, `asm`), and one that *ends* each with a count line
     (`ssa`). This is the second; `split_before` is the first.
     """
     chunks, current = [], []

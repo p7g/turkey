@@ -44,11 +44,12 @@ import Turkey.Roots as Roots
 import Turkey.Frame as Frame
 import Turkey.Emit as Emit
 import Turkey.Asm as Asm
-import Turkey.Llvm as Llvm
+import Turkey.MachineCheck as MachineCheck
 import Turkey.LowIr as LowIr
 import Turkey.Ssa as Ssa
 import Turkey.SsaLower as SsaLower
 import Turkey.Sccp as Sccp
+import Turkey.Fields as Fields
 import Turkey.Clean as Clean
 import Turkey.Sites as Sites
 import Turkey.Uncurry as Uncurry
@@ -75,7 +76,7 @@ fun main() {
     if len(args) < 2 { usage() }
     let command = args[0]
     if !Array.contains(["decls", "classes", "types", "core", "mono", "opt",
-                    "ssa", "llvm", "asm", "native", "check"], command) {
+                    "ssa", "asm", "native", "check"], command) {
         die("unknown command '" + command + "'")
     }
     let paths = Array.new(len(args))
@@ -105,7 +106,6 @@ fun main() {
             "core" -> dumpCore(b, path)
             "mono" -> dumpMono(b, path)
             "ssa" -> dumpSsa(b, path)
-            "llvm" -> dumpLlvm(b, path)
             "asm" -> dumpAsm(b, path)
             "native" -> dumpNative(b, path)
             "check" -> checkOnly(path)
@@ -326,6 +326,7 @@ fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable, path : String)
         -> (SsaLower.Module, Array SsaLower.Unsupported) {
     let (module_, skipped) = SsaLower.lowerProgram(program, decls)
     module_.functions = Array.map(module_.functions, fun(lowered) = {
+        Fields.forward(lowered)
         let f = Sccp.run(lowered)
         Clean.eliminateCopies(f, True)
         Clean.eliminateDead(f)
@@ -402,6 +403,8 @@ fun dumpNative(b : String.Builder, path : String) -> Unit {
     -- Each function's frame layout is kept: the frame table is one section
     -- after the code, and its entries are those layouts' safepoint maps.
     let layouts = []
+    let sigs = MachineCheck.signatures(module_.functions, asm.dialect)
+    let complaints = []
     for var i = 0; i < len(selected); i = i + 1 {
         let f = selected[i]
         let frame = match Map.get(lows, f.name) {
@@ -412,11 +415,21 @@ fun dumpNative(b : String.Builder, path : String) -> Unit {
         match a.stopped {
             Some(why) -> String.push(b, "// skipped " + f.name + ": " + why + "\n")
             None -> {
+                for message in MachineCheck.check(a.func, sigs) {
+                    Array.push(complaints, message)
+                }
                 let l = Frame.layout(a, frame)
                 Emit.emitFunc(asm, a.func, a, l, i, b)
                 Array.push(layouts, (i, l))
             }
         }
+    }
+    -- The representations, on what was actually allocated: nothing below here
+    -- has a type system, so a scalar in a pointer's register assembles, links
+    -- and runs until a collection looks at it.
+    if len(complaints) > 0 {
+        Diag.fail(Diag.whole("internal error", "the machine code is malformed:\n  "
+                             + String.join(complaints, "\n  ")), path)
     }
     -- After the code: a message is interned by the guard that raises it, so
     -- the table is only complete once every function has been emitted.
@@ -446,7 +459,7 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
         return
     }
     String.push(b, "; === " + path + "\n")
-    let (selected, unsupported, _) =
+    let (selected, unsupported, asm) =
         Select.selectModule(module_, Asm.dialectFor(target))
     for f in selected {
         String.push(b, Ssa.showFunc(f))
@@ -498,6 +511,7 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
     -- simultaneously live values in one register assembles, links and runs --
     -- and computes a wrong answer -- so it is checked here rather than
     -- trusted, exactly as the machine graph is.
+    let sigs = MachineCheck.signatures(module_.functions, asm.dialect)
     var coloured = 0
     var hintTaken = 0
     var hintTotal = 0
@@ -553,6 +567,9 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
             let l = Frame.layout(a, frame)
             for message in Frame.verifyFrame(a, frame, l) {
                 String.push(b, "  !! " + f.name + ": " + message + "\n")
+            }
+            for message in MachineCheck.check(a.func, sigs) {
+                String.push(b, "  !! " + message + "\n")
             }
             if l.size > maxFrame { maxFrame = l.size }
             if len(l.savedGp) > maxSavedGp { maxSavedGp = len(l.savedGp) }
@@ -653,46 +670,6 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
         String.push(b, "--   " + Int.toString(Map.getOr(counts, why, 0))
                        + "  " + why + "\n")
     }
-}
-
--- The program as LLVM IR text, ready for `cc`.
---
--- Written to stdout like every other dump, because `boot` has no way to start
--- a process: there is no `Prim.exec`, so it cannot invoke the C compiler
--- itself the way a finished `boot build` would. What it can do is emit the
--- whole module, which is the compiler; linking it against the runtime is one
--- `cc` invocation that the test harness makes.
-fun dumpLlvm(b : String.Builder, path : String) -> Unit {
-    let (checked, entry) = checkProgram(path)
-    let program = optimized(checked, entry)
-    let (module_, skipped) = lowerModule(program, checked.decls, path)
-    if len(skipped) > 0 {
-        -- Emitting a module with a function missing would produce a link
-        -- error a long way from its cause. Reported rather than fatal, so one
-        -- program in a batch does not cost the rest.
-        String.push(b, "; === " + path + "\n; FAILED: "
-                       + Int.toString(len(skipped)) + " bindings did not lower\n")
-        return
-    }
-    let main = Map.getOr(entry.scope.values, "main", "main")
-    let (text, missing) = Llvm.emitModule(module_, main)
-    -- One marker per module, so several programs can be compiled by *one*
-    -- process. Two modules cannot share a `.ll` file -- the symbols collide --
-    -- but they can share a run, which matters because starting this program
-    -- costs far more than compiling a small one with it. A caller splits on
-    -- this line; every other dump concatenates unambiguously for the same
-    -- reason, and this is the marker that makes it true here too.
-    String.push(b, "; === " + path + "\n")
-    if len(missing) > 0 {
-        -- Refused rather than emitted. A primitive with no rule would
-        -- otherwise become a zero of the wrong type: rejected by `cc` somewhere
-        -- unrelated at best, and a wrong program wherever the types happened to
-        -- line up.
-        String.push(b, "; FAILED: no rule for " + String.join(missing, ", ")
-                       + "\n")
-        return
-    }
-    String.push(b, text)
 }
 
 -- The low IR, and how much of the program reached it.
@@ -941,7 +918,7 @@ fun readOrDie(path : String) -> Source = match Source.read(path) {
 fun usage() -> a =
     die("usage: boot "
         + "<decls|classes|types|core|mono|opt"
-        + "|ssa|llvm|asm|native|check> [--target TARGET] FILE...")
+        + "|ssa|asm|native|check> [--target TARGET] FILE...")
 
 fun die(message : String) -> a {
     IO.stderr("boot: " + message + "\n")

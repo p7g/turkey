@@ -86,8 +86,8 @@ type Callee
     -- point is looked up in `Turkey.Runtime`'s fixed table, and this one is
     -- already the symbol -- what the program declared is what the linker is
     -- asked for. No signature travels with it: every argument carries a `Rep`
-    -- and the result carries the destination's, so the one consumer that needs
-    -- a full signature -- LLVM's `declare` line -- reads it off a call site.
+    -- and the result carries the destination's, so a full signature can be
+    -- read off any call site.
     | Foreign(String)
     -- Through a closure value.
     | Indirect(Value)
@@ -121,11 +121,22 @@ type Op
     -- The uniform representation, for a value whose type is a variable.
     | Box(Value)
     | Unbox(Value)
-    -- A heap object: `kind` and `tag` as the runtime understands them,
-    -- `count` fields, and the field metadata -- three bits of representation
-    -- per field, which is what the collector scans by and what says how wide
-    -- each field is. See `Turkey.SsaLower.metadata`.
-    | ObjectNew(Int, Int, Int, Int)
+    -- A heap object, allocated and initialized in one instruction: `kind` and
+    -- `tag` as the runtime understands them, the field metadata (three bits of
+    -- representation per field for kinds 0 and 1, one trace bit per slot for an
+    -- environment; see `Turkey.SsaLower.metadata`), the field values, and a
+    -- mask with a bit set for each field that may be written after this.
+    --
+    -- The values are operands, so an `ObjectGet` of an immutable field of this
+    -- object is the operand, and an object nothing reads is dead code: no
+    -- `ObjectSet` follows the allocation to keep it alive. `ObjectSet` is only
+    -- for a field whose mask bit is set.
+    --
+    -- The operands are read *after* the allocation, which may collect, so they
+    -- have to be live across it. `Turkey.Roots.across` roots every traced
+    -- operand of a safepoint, which is what makes that true; the collector
+    -- also never sees the object with a field unwritten.
+    | ObjectNew(Int, Int, Int, Array Value, Int)
     | ObjectGet(Value, Int)
     | ObjectSet(Value, Int, Value)
     | ObjectTag(Value)
@@ -156,11 +167,15 @@ type Op
     | CellNew(Value)
     | CellLoad(Value)
     | CellStore(Value, Value)
-    -- A single closure shell over `code`. The capture count distinguishes
-    -- capture-free closures that LLVM interns. Its environment is allocated
-    -- separately and installed with ObjectSet, so it is an ordinary SSA root
-    -- across the shell allocation. The shell traces only its second slot.
-    | ClosureNew(String, Int)
+    -- A closure over `code`, and its environment if it captures anything --
+    -- an `ObjectNew` of kind 4 built first. Written into the shell as part of
+    -- the allocation, and rooted across it as `ObjectNew`'s operands are. The
+    -- shell traces only its second slot.
+    | ClosureNew(String, Option Value)
+    -- A write to a closure's environment after construction, and only for a
+    -- capture of a closure in the same recursive group: the sibling does not
+    -- exist yet when the environment is built, so that slot starts null and
+    -- is marked mutable.
     | ClosureCapture(Value, Int, Value)
     | Call(Callee, Array Value)
     | GlobalLoad(String)
@@ -297,7 +312,7 @@ fun effectsOf(op : Op) -> Effects = match op {
     Convert(_, _) -> empty()
     Box(_) -> Ssa.allocates()
     Unbox(_) -> Ssa.reads_()
-    ObjectNew(_, _, _, _) -> Ssa.allocates()
+    ObjectNew(_, _, _, _, _) -> Ssa.allocates()
     ObjectGet(_, _) -> Ssa.reads_()
     ObjectSet(_, _, _) -> Ssa.writes()
     ObjectTag(_) -> Ssa.reads_()
@@ -314,8 +329,7 @@ fun effectsOf(op : Op) -> Effects = match op {
     CellNew(_) -> Ssa.allocates()
     CellLoad(_) -> Ssa.reads_()
     CellStore(_, _) -> Ssa.writes()
-    -- Only the shell allocates here. Its environment is a separate value
-    -- whose later use keeps it rooted across this safepoint.
+    -- Allocates the shell; the environment is an operand and already built.
     ClosureNew(_, _) -> Ssa.allocates()
     ClosureCapture(_, _, _) -> Ssa.writes()
     -- A call may do anything the callee does, which is everything. Knowing
@@ -350,7 +364,7 @@ fun opUses(op : Op) -> Array Value = match op {
     Convert(_, a) -> [a]
     Box(a) -> [a]
     Unbox(a) -> [a]
-    ObjectNew(_, _, _, _) -> []
+    ObjectNew(_, _, _, fields, _) -> fields
     ObjectGet(a, _) -> [a]
     ObjectSet(a, _, b) -> [a, b]
     ObjectTag(a) -> [a]
@@ -363,7 +377,10 @@ fun opUses(op : Op) -> Array Value = match op {
     CellNew(a) -> [a]
     CellLoad(a) -> [a]
     CellStore(a, b) -> [a, b]
-    ClosureNew(_, _) -> []
+    ClosureNew(_, environment) -> match environment {
+        Some(e) -> [e]
+        None -> []
+    }
     ClosureCapture(a, _, b) -> [a, b]
     Call(callee, args) -> {
         let out : Array Value = []
@@ -394,7 +411,7 @@ fun mapUses(op : Op, f : fun(Value) -> Value) -> Op = match op {
     Convert(a, b) -> Convert(a, f(b))
     Box(a) -> Box(f(a))
     Unbox(a) -> Unbox(f(a))
-    ObjectNew(a, b, c, d) -> ObjectNew(a, b, c, d)
+    ObjectNew(a, b, c, d, e) -> ObjectNew(a, b, c, Array.map(d, f), e)
     ObjectGet(a, b) -> ObjectGet(f(a), b)
     ObjectSet(a, b, c) -> ObjectSet(f(a), b, f(c))
     ObjectTag(a) -> ObjectTag(f(a))
@@ -407,7 +424,7 @@ fun mapUses(op : Op, f : fun(Value) -> Value) -> Op = match op {
     CellNew(a) -> CellNew(f(a))
     CellLoad(a) -> CellLoad(f(a))
     CellStore(a, b) -> CellStore(f(a), f(b))
-    ClosureNew(a, b) -> ClosureNew(a, b)
+    ClosureNew(a, b) -> ClosureNew(a, Option.map(b, f))
     ClosureCapture(a, b, c) -> ClosureCapture(f(a), b, f(c))
     Call(a, b) -> Call(mapCallee(a, f), Array.map(b, f))
     GlobalLoad(a) -> GlobalLoad(a)
@@ -446,7 +463,7 @@ fun opResultRep(op : Op) -> Option Rep = match op {
     Address(_) -> Some(Ssa.untraced(Ptr))
     Cmp(_, _, _) -> Some(Ssa.untraced(I1))
     Box(_) -> Some(Ssa.traced(Ptr))
-    ObjectNew(_, _, _, _) -> Some(Ssa.traced(Ptr))
+    ObjectNew(_, _, _, _, _) -> Some(Ssa.traced(Ptr))
     ObjectTag(_) -> Some(Ssa.untraced(I32))
     ArrayNew(_, _, _) -> Some(Ssa.traced(Ptr))
     -- Untraced is not a default here. A pointer read out of raw memory is an
@@ -590,7 +607,7 @@ fun checkCalls(functions : Array (Ssa.Func Low)) -> Array String {
                         None -> Array.push(out, f.name + ": calls @" + name
                                                 + ", which is not a function here")
                     }
-                    ClosureNew(code, n) -> match Map.get(known, code) {
+                    ClosureNew(code, _) -> match Map.get(known, code) {
                         -- A closure's code is called at the uniform
                         -- representation with the environment first, so its
                         -- arity is one more than the lambda's.
@@ -640,7 +657,7 @@ fun allocatingOp(op : Op) -> Option String = match op {
     -- Said the way the source would say it, since the reader of this wrote
     -- source: which construct lowered to the allocation is the question.
     Box(_) -> Some("boxes a value to pass it where the type is not known")
-    ObjectNew(_, _, _, _) ->
+    ObjectNew(_, _, _, _, _) ->
         Some("builds an object -- a constructor, tuple, record or dictionary")
     ArrayNew(_, _, _) -> Some("builds an array")
     CellNew(_) -> Some("makes a cell for a variable a closure captured")
@@ -753,7 +770,7 @@ fun showOpName(op : Op) -> String = match op {
     Convert(c, _) -> show(c)
     Box(_) -> "box"
     Unbox(_) -> "unbox"
-    ObjectNew(_, _, _, _) -> "object.new"
+    ObjectNew(_, _, _, _, _) -> "object.new"
     ObjectGet(_, _) -> "object.get"
     ObjectSet(_, _, _) -> "object.set"
     ObjectTag(_) -> "object.tag"
@@ -806,9 +823,10 @@ instance Show Op {
     Convert(c, a) -> show(c) + " " + v(a)
     Box(a) -> "box " + v(a)
     Unbox(a) -> "unbox " + v(a)
-    ObjectNew(kind, tag, count, bitmap) ->
+    ObjectNew(kind, tag, bitmap, fields, mutable) ->
         "object.new kind=" + Int.toString(kind) + " tag=" + Int.toString(tag)
-        + " count=" + Int.toString(count) + " bitmap=" + Int.toString(bitmap)
+        + " count=" + Int.toString(len(fields)) + " bitmap=" + Int.toString(bitmap) + " mutable=" + Int.toString(mutable)
+        + " [" + String.join(Array.map(fields, v), ", ") + "]"
     ObjectGet(a, i) -> "object.get " + v(a) + ", " + Int.toString(i)
     ObjectSet(a, i, b) -> "object.set " + v(a) + ", " + Int.toString(i) + ", " + v(b)
     ObjectTag(a) -> "object.tag " + v(a)
@@ -824,8 +842,10 @@ instance Show Op {
     CellNew(a) -> "cell.new " + v(a)
     CellLoad(a) -> "cell.load " + v(a)
     CellStore(a, b) -> "cell.store " + v(a) + ", " + v(b)
-    ClosureNew(code, n) ->
-        "closure.new @" + code + ", " + Int.toString(n)
+    ClosureNew(code, environment) -> match environment {
+        Some(e) -> "closure.new @" + code + ", " + v(e)
+        None -> "closure.new @" + code
+    }
     ClosureCapture(a, i, b) ->
         "closure.capture " + v(a) + ", " + Int.toString(i) + ", " + v(b)
     Call(callee, args) -> {

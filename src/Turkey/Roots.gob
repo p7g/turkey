@@ -7,27 +7,23 @@ module Turkey.Roots (
 --
 -- **An analysis, not a pass, and that is the whole design decision.** The
 -- obvious alternative is an IR pass that *materializes* root frames, leaving
--- both emitters dumb. Two things argue it down.
+-- the emitter dumb. Two things argue it down.
 --
--- The materialization is not the part that can disagree. Storing a pointer
--- into an array and writing a mask is five lines in any backend, and the two
--- backends would write the same five lines whether or not they shared them.
--- What *can* disagree -- silently, rarely, and only under collection -- is
--- **which values are live across which safepoint**, and that is this module.
--- Extracting the analysis removes the hazard; extracting the emission removes
--- duplication that was never dangerous.
+-- The answer has more than one reader. Selection stores each live root into
+-- its slot before a safepoint, the frame layout gives the slots offsets, and
+-- the frame table tells the collector which of them are live at each return
+-- address. What *can* go wrong -- silently, rarely, and only under
+-- collection -- is **which values are live across which safepoint**, and all
+-- three have to agree on it, so it is computed once, here.
 --
 -- And a pass would have cost the IR. Materializing roots needs the address of
 -- a stack slot, which is an opcode the IR does not have and would gain for one
 -- caller. The analysis needs nothing: it reads a `Func Low` and answers a
 -- table.
 --
--- The same reasoning is why the overflow and division checks stay in each
--- emitter. LLVM wants `llvm.sadd.with.overflow`, arm64 wants `adds` and a
--- flag register the IR cannot name, and there is no shared *rule* between
--- them -- only a shared intention, which is not the thing that goes wrong.
--- Two implementations of one rule is the hazard; two encodings of one check
--- is the job.
+-- The overflow and division checks are the other way round, and stay in the
+-- emitter: arm64 wants `adds` and a flag register the IR cannot name, and
+-- expanding them target-neutrally in the IR would cost what the flag saves.
 
 import Data.Map as Map
 import Data.Set as Set
@@ -68,8 +64,7 @@ fun liveAt(frame : Frame, b : Int, n : Int) -> Array (Int, Int) {
 --
 -- Liveness is computed once and every safepoint's set is read out of it, which
 -- is what keeps a root set a property of a *program point* rather than of a
--- function -- the distinction `RootFrame.live` exists for, and the one that
--- stops a cold path deciding what a hot one pays.
+-- function -- the one that stops a cold path deciding what a hot one pays.
 fun analyze(f : Func Low) -> Frame {
     let live = Ssa.liveness(f)
     let constants = constantsOf(f)
@@ -103,6 +98,11 @@ fun analyze(f : Func Low) -> Frame {
 -- does. Rooting only what survives the call freed `Int.toString`'s result
 -- while `turkey_string_concat` was reading it, and "circle of 5" came out
 -- "circle of c".
+--
+-- An allocation is the same case from the other side: `ObjectNew` and
+-- `ClosureNew` write their operands into the object *after* allocating it, so
+-- an operand read only by the allocation is dead after it and still needed
+-- during it.
 --
 -- The result goes the other way and must *not* be rooted: it does not exist
 -- until the collection is over, so storing it would be a use before its
@@ -158,7 +158,7 @@ fun constantsOf(f : Func Low) -> Set.Set Int {
 -- answer is silent, and a `_ ->` arm would answer it by omission.
 fun isSafepoint(op : Op) -> Bool = match op {
     Call(_, _) -> True
-    ObjectNew(_, _, _, _) -> True
+    ObjectNew(_, _, _, _, _) -> True
     ArrayNew(_, _, _) -> True
     CellNew(_) -> True
     ClosureNew(_, _) -> True

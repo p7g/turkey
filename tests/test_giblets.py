@@ -304,7 +304,7 @@ HIDDEN = (
     "    else { showAll((x, x), k - 1) }\n"                               # 8
     "fun nests(n : Int) -> Int = if n == 0 { poly(n, 3) } else { nests(n - 1) }\n"   # 9
     "fun packs(n : Int) -> Int = if n == 0 {\n"                           # 10
-    "    match Hidden(n) { Hidden(x) -> String.byteLength(show(x)) }\n"   # 11
+    "    match [Hidden(n)][0] { Hidden(x) -> String.byteLength(show(x)) }\n"  # 11
     "} else { packs(n - 1) }\n"                                           # 12
     "fun dicts(n : Int) -> Int = if n == 0 { showAll(n, 3) } else { dicts(n - 1) }\n"  # 13
 )
@@ -313,7 +313,10 @@ HIDDEN = (
 @pytest.mark.parametrize("helper, reason, line", [
     # Polymorphic recursion is compiled per layout, so passing `n` boxes
     # nothing; what allocates is the tuple the recursion builds.
-    ("nests", "builds a tuple", 5),    # An existential packing is an object with the layout codes in front.
+    ("nests", "builds a tuple", 5),
+    # An existential packing is an object with the layout codes in front. It
+    # goes into an array so that it outlives the function that opens it: a
+    # packing opened where it is built is read from its operands and deleted.
     ("packs", "packs an existential, Hidden", 11),
     # A class-polymorphic function on an expanding cycle: the tuple its
     # generic body builds, reached through the call.
@@ -360,16 +363,3 @@ def test_the_first_giblet_module_lowers_clean():
     assert "fun @Turkey.Memory#fill(" in stdout
 
 
-def test_a_giblet_function_is_emitted_with_no_root_frame():
-    """What the collector needs of a giblet: nothing to find in it. The check
-    after lowering refuses any giblet `Turkey.Roots` would give a slot, and
-    both native emitters read their root frames from `Turkey.Roots`, so this
-    is the LLVM emitter's half of that stated where it is visible -- no
-    `turkey_root_enter` in any `Turkey.Memory` function. The frame record
-    itself is still emitted; this is only about roots."""
-    llvm = bootc.boot("llvm", "tests/programs/giblets_memory.gob")
-    bodies = re.findall(r'^define [^\n]*@"Turkey\.Memory#[^"]*"\(.*?^}',
-                        llvm, re.M | re.S)
-    assert len(bodies) >= 3
-    for body in bodies:
-        assert "turkey_root_enter" not in body, body.splitlines()[0]

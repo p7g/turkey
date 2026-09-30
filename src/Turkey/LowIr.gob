@@ -118,9 +118,6 @@ type Op
     | Neg(Value)
     | Not(Value)
     | Convert(Conv, Value)
-    -- The uniform representation, for a value whose type is a variable.
-    | Box(Value)
-    | Unbox(Value)
     -- A heap object, allocated and initialized in one instruction: `kind` and
     -- `tag` as the runtime understands them, the field metadata (three bits of
     -- representation per field for kinds 0 and 1, one trace bit per slot for an
@@ -254,7 +251,7 @@ fun into(b : Builder, at : Ssa.BlockId) -> Unit { b.at = at }
 -- Append an operation and answer the value it defines.
 --
 -- The representation is given rather than derived, because for `ObjectGet`,
--- `ArrayGet`, `Call`, `SlotLoad` and `Unbox` only the caller knows it. Where
+-- `ArrayGet`, `Call` and `SlotLoad` only the caller knows it. Where
 -- the opcode *does* determine it, `checkReps` says so afterwards -- which is
 -- the right division: the builder is for convenience and the verifier is for
 -- truth, and a builder that panicked here would be a second opinion about
@@ -321,8 +318,6 @@ fun effectsOf(op : Op) -> Effects = match op {
     Neg(_) -> Ssa.traps()
     Not(_) -> empty()
     Convert(_, _) -> empty()
-    Box(_) -> Ssa.allocates()
-    Unbox(_) -> Ssa.reads_()
     ObjectNew(_, _, _, _, _) -> Ssa.allocates()
     ObjectGet(_, _) -> Ssa.reads_()
     ObjectSet(_, _, _) -> Ssa.writes()
@@ -377,8 +372,6 @@ fun opUses(op : Op) -> Array Value = match op {
     Neg(a) -> [a]
     Not(a) -> [a]
     Convert(_, a) -> [a]
-    Box(a) -> [a]
-    Unbox(a) -> [a]
     ObjectNew(_, _, _, fields, _) -> fields
     ObjectGet(a, _) -> [a]
     ObjectSet(a, _, b) -> [a, b]
@@ -429,8 +422,6 @@ fun mapUses(op : Op, f : fun(Value) -> Value) -> Op = match op {
     Neg(a) -> Neg(f(a))
     Not(a) -> Not(f(a))
     Convert(a, b) -> Convert(a, f(b))
-    Box(a) -> Box(f(a))
-    Unbox(a) -> Unbox(f(a))
     ObjectNew(a, b, c, d, e) -> ObjectNew(a, b, c, Array.map(d, f), e)
     ObjectGet(a, b) -> ObjectGet(f(a), b)
     ObjectSet(a, b, c) -> ObjectSet(f(a), b, f(c))
@@ -484,7 +475,6 @@ fun opResultRep(op : Op) -> Option Rep = match op {
     ConstUnit -> Some(Ssa.untraced(Unit))
     Address(_) -> Some(Ssa.untraced(Ptr))
     Cmp(_, _, _) -> Some(Ssa.untraced(I1))
-    Box(_) -> Some(Ssa.traced(Ptr))
     ObjectNew(_, _, _, _, _) -> Some(Ssa.traced(Ptr))
     ObjectTag(_) -> Some(Ssa.untraced(I32))
     ArrayNew(_, _, _) -> Some(Ssa.traced(Ptr))
@@ -530,7 +520,6 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Array String {
         ArrayGet(_, index) -> wantClass(f, out, index, I64, "an array index")
         ArraySet(_, index, _) -> wantClass(f, out, index, I64, "an array index")
         ArrayNew(length, _, _) -> wantClass(f, out, length, I64, "an array length")
-        Unbox(a) -> wantClass(f, out, a, Ptr, "the operand of an unbox")
         -- A machine has no integer constant of floating type, so an integer
         -- literal at `f64` has to have become a float before it gets here.
         ConstInt(_) -> if Ssa.repOf(f, i.result).class_ == F64 {
@@ -681,7 +670,6 @@ fun allocatingOp(op : Op) -> Option String = match op {
         else { Some("calls the runtime's " + name) }
     -- Said the way the source would say it, since the reader of this wrote
     -- source: which construct lowered to the allocation is the question.
-    Box(_) -> Some("boxes a value to pass it where the type is not known")
     ObjectNew(_, _, _, _, _) ->
         Some("builds an object -- a constructor, tuple, record or dictionary")
     ArrayNew(_, _, _) -> Some("builds an array")
@@ -797,8 +785,6 @@ fun showOpName(op : Op) -> String = match op {
     Neg(_) -> "neg"
     Not(_) -> "not"
     Convert(c, _) -> show(c)
-    Box(_) -> "box"
-    Unbox(_) -> "unbox"
     ObjectNew(_, _, _, _, _) -> "object.new"
     ObjectGet(_, _) -> "object.get"
     ObjectSet(_, _, _) -> "object.set"
@@ -852,8 +838,6 @@ instance Show Op {
     Neg(a) -> "neg " + v(a)
     Not(a) -> "not " + v(a)
     Convert(c, a) -> show(c) + " " + v(a)
-    Box(a) -> "box " + v(a)
-    Unbox(a) -> "unbox " + v(a)
     ObjectNew(kind, tag, bitmap, fields, mutable) ->
         "object.new kind=" + Int.toString(kind) + " tag=" + Int.toString(tag)
         + " count=" + Int.toString(len(fields)) + " bitmap=" + Int.toString(bitmap) + " mutable=" + Int.toString(mutable)

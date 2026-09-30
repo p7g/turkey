@@ -64,7 +64,7 @@ type Unsupported = Unsupported { name : String, what : String }
 -- `held_at(expected, callee, decls)` -- the *callee's* abstracted layouts and
 -- not the caller's, which is the whole point. A layout-shared copy holds its
 -- parameters at the layouts its key names, so a caller that read them off its
--- own scheme would hand a boxed value to a body expecting a bare one.
+-- own scheme would pass a value at a layout the copy does not hold it at.
 type Signature = Signature {
     params : Array Rep,
     result : Rep,
@@ -129,7 +129,7 @@ type Lower = Lower {
     -- The layout each abstracted variable stands for, from the binding. What
     -- `Turkey.Layout` gave the copy, and what makes a representation knowable
     -- inside one.
-    layouts : Map Int String,
+    layouts : Map String String,
     -- The functions lifted out of *this* top-level binding. Shared by
     -- reference with the nested `Lower`s its lambdas make, and discarded whole
     -- if the binding stops -- a lifted body whose parent did not lower is a
@@ -164,11 +164,10 @@ type Dest
 -- read and translated here, which keeps the differential's spelling and this
 -- module's type separate on purpose.
 --
--- Every name is named, and the last arm is a refusal rather than the uniform
--- representation. It used to be `_ -> traced(Ptr)`, which answered correctly
--- for `ptr` and `boxed` and would have answered `traced` for a raw address --
--- a wrong answer with no diagnosis, because a value the collector follows
--- when it should not is not a type error and not a crash until it collects.
+-- Every name is named, and the last arm is a refusal rather than a traced
+-- pointer, which would be a wrong answer for a raw address with no diagnosis:
+-- a value the collector follows when it should not is not a type error and not
+-- a crash until it collects.
 fun repOfName(name : String) -> Rep = match name {
     "unit" -> Ssa.untraced(Unit)
     "i1" -> Ssa.untraced(I1)
@@ -178,24 +177,24 @@ fun repOfName(name : String) -> Rep = match name {
     "f64" -> Ssa.untraced(F64)
     "addr" -> Ssa.untraced(Ptr)
     "ptr" -> Ssa.traced(Ptr)
-    "boxed" -> Ssa.traced(Ptr)
     _ -> oops("no representation for the layout '" + name + "'")
 }
 
--- What a body *holds* a value of this type at, under these abstracted layouts.
+-- What a body *holds* a value of this type at, under these layouts.
 --
--- A type the layout pass cannot answer for is held at the uniform
--- representation, which is a traced pointer. That is the same answer
--- `held_at` gives and for the same reason -- parametricity leaves a generic
--- body able to hold a value and pass it on, and nothing else.
+-- There is no answer to fall back on. `Turkey.Layout` copies every generic body
+-- per layout so that every type a body mentions has one, and
+-- `Layout.unknownLayouts` checks that it did; a type without one here is a
+-- compiler bug, and holding it at a traced pointer would be a guess that the
+-- value's producer or consumer need not share.
 --
 -- Split out of `repOf` because the signature pre-pass asks this before any
 -- `Lower` exists, and asks it under a *different* binding's layouts than the
 -- one being lowered. That is the whole point of `Signature`.
-fun repIn(decls : DeclTable, layouts : Map Int String, ty : Ty.Type) -> Rep =
+fun repIn(decls : DeclTable, layouts : Map String String, ty : Ty.Type) -> Rep =
     match Layout.layoutOf(decls, ty, layouts) {
         Some(name) -> repOfName(name)
-        None -> Ssa.traced(Ptr)
+        None -> oops("no layout for the type '" + Ty.show(ty) + "'")
     }
 
 fun repOf(l : Lower, ty : Ty.Type) -> Rep = repIn(l.decls, l.layouts, ty)
@@ -463,7 +462,7 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
 fun newLower(decls : DeclTable, f : Ssa.Func Low, globals : Set.Set String,
              globalRefs : Map String Rep,
              tags : Map String Int, fields : Map String (Array String),
-             sigs : Map String Signature, layouts : Map Int String,
+             sigs : Map String Signature, layouts : Map String String,
              lifted : Array (Ssa.Func Low), shared : Lifting) -> Lower = Lower {
     decls = decls, func = f, b = L.builder(f, BlockId(0)),
     env = Map.new(), joins = Map.new(), globals = globals, tags = tags,
@@ -1054,7 +1053,7 @@ fun stop1(l : Lower, message : String) -> Unit {
 }
 
 -- The layouts an arm's openings name, over the ones already in force.
-fun openedLayoutsFor(p : Pat, outer : Map Int String) -> Map Int String {
+fun openedLayoutsFor(p : Pat, outer : Map String String) -> Map String String {
     let inner = Map.new()
     for (id_, layout) in Map.entries(outer) { Map.put(inner, id_, layout) }
     for opening in Core.openings(p) {
@@ -1062,7 +1061,7 @@ fun openedLayoutsFor(p : Pat, outer : Map Int String) -> Map Int String {
             Some(o) -> match o.layouts {
                 Some(ls) -> for var i = 0; i < len(o.skolems) && i < len(ls);
                                 i = i + 1 {
-                    Map.put(inner, 0 - o.skolems[i].uid, ls[i])
+                    Map.put(inner, Layout.skolemKey(o.skolems[i]), ls[i])
                 }
                 None -> {}
             }
@@ -1170,37 +1169,24 @@ fun wanted(l : Lower, target : BlockId, index : Int) -> Rep {
 
 -- Make `v` usable where `want` is required.
 --
--- Parametricity is what creates these. A body that is polymorphic in a type
--- holds its values at the uniform representation and can do nothing with them
--- but pass them on, so a value crossing between a generic context and a
--- concrete one changes representation without changing meaning -- and a value
--- whose type is a variable instantiated to a concrete one arrives here.
+-- Only a change of obligation on the collector is a conversion: a traced
+-- pointer and a raw address are the same word. Every other disagreement is two
+-- answers about one value's type, and converting would make it compile. A body
+-- knows the layout of every type it mentions, and the value's producer and its
+-- consumer each computed that layout from the same ground type, so a scalar
+-- reaching a pointer context -- or the reverse -- is a compiler bug. A real
+-- conversion is written in the source (`Prim.byteToInt`) and reaches `Convert`
+-- through `primitive`.
 --
--- Every conversion is explicit in the IR rather than implied by a `Rep`
--- mismatch that later passes must remember to notice, which is the same
--- argument `Rep` itself makes for carrying the collector's obligation.
+-- Unit is the exception, in both directions: a value of zero width has nothing
+-- to convert, and a unit where a word is wanted is a diverging expression's,
+-- which nothing reads.
 fun coerce(l : Lower, v : Value, want : Rep) -> Value {
     let have = Ssa.repOf(l.func, v)
     if have == want { return v }
-    -- Zero width: there is nothing to convert, and nothing reads it.
     if want.class_ == Unit { return L.emit(l.b, ConstUnit, want) }
     if have.class_ == Unit { return zero(l, want) }
-    if have.class_ != Ptr && want.class_ == Ptr {
-        return retagged(l, L.emit(l.b, Box(v), Ssa.traced(Ptr)), want)
-    }
-    if have.class_ == Ptr && want.class_ != Ptr {
-        return L.emit(l.b, Unbox(v), want)
-    }
     if have.class_ == Ptr && want.class_ == Ptr { return retagged(l, v, want) }
-    -- Two scalar classes, and this is the one case that is *refused*.
-    --
-    -- Boxing is a representation boundary and parametricity creates it, so it
-    -- happens implicitly. `i32` reaching a context that wants `i64` is not a
-    -- boundary -- it is two disagreeing answers about one value's type, and
-    -- widening it here would make the disagreement compile. A real conversion
-    -- is written in the source (`Prim.byteToInt`) and reaches `Convert`
-    -- through `primitive`. `turkey/backend_lower.py`'s `coerce` refuses this
-    -- too, and this module used to convert silently.
     stop(l, "an implicit conversion from " + show(have) + " to " + show(want))
 }
 
@@ -1263,8 +1249,12 @@ fun valueHere(l : Lower, e : Core) -> Value {
                 }
             }
         }
-        CTyApp(inner, _) -> value(l, inner)
-        CTyLam(_, inner) -> value(l, inner)
+        -- At the application's type, not the applied term's: a type
+        -- application's function is not a value, and the type on it says
+        -- nothing about the value's representation -- a reference to a generic
+        -- global may carry a bare variable there.
+        CTyApp(_, _) -> value(l, Core.mkCore(e.ty, e.span, erased(e).kind))
+        CTyLam(_, _) -> value(l, Core.mkCore(e.ty, e.span, erased(e).kind))
         CRef(inner) -> L.emit(l.b, CellNew(value(l, inner)), Ssa.traced(Ptr))
         CDeref(inner) -> match globalRef(l, inner) {
             Some((name, held)) -> coerce(l, L.emit(l.b, GlobalLoad(name), held), rep)
@@ -1727,7 +1717,8 @@ fun storageZero(l : Lower, r : Rep) -> Value =
 fun zero(l : Lower, r : Rep) -> Value = match r.class_ {
     Unit -> L.emit(l.b, ConstUnit, r)
     F64 -> L.emit(l.b, ConstFloat(0.0), r)
-    Ptr -> L.emit(l.b, Box(L.emit(l.b, ConstInt(0), Ssa.untraced(I64))), r)
+    -- A null word, which the collector skips as an immediate.
+    Ptr -> L.emit(l.b, ConstInt(0), r)
     _ -> L.emit(l.b, ConstInt(0), r)
 }
 
@@ -1765,32 +1756,14 @@ fun zero(l : Lower, r : Rep) -> Value = match r.class_ {
 -- `tagsOf`, and tuples and closures carry -1.
 let wrapTag = -2
 
--- The compact shape `name`'s type has, if it is one word at `ty`.
---
--- By the payload's layout, and there is no answer without one. A body can lack
--- it: a generic dictionary's method, which is not copied per layout, or a type
--- family applied to an abstracted variable, which a layout key does not cover.
--- Holding the payload at the uniform representation there would pick one of
--- the two representations for a value that may have been built with the other,
--- so this refuses instead: the construction or test panics when reached, and
--- the code after it is unreachable. Generic dictionaries' methods are reached
--- from nothing but the records the initializer builds.
+-- The compact shape `name`'s type has, if it is one word at `ty`: by the
+-- payload's layout, which every body knows (`repIn`).
 fun compactAt(l : Lower, name : String, ty : Ty.Type) -> Option Compact {
     let c = match Decls.compactOf(l.decls, name) {
         Some(c) -> c
         None -> return None
     }
-    match Layout.layoutOf(l.decls, compactField(l, c, ty), l.layouts) {
-        Some(layout) -> if repOfName(layout) == Ssa.traced(Ptr) { Some(c) } else { None }
-        None -> {
-            let message = L.emit(l.b, ConstString(
-                "internal error: the representation of " + Ty.show(ty)
-                + " is not known in this body"), Ssa.traced(Ptr))
-            L.terminate(l.b, Panic(message))
-            L.into(l.b, L.block(l.b))
-            Some(c)
-        }
-    }
+    if repOf(l, compactField(l, c, ty)) == Ssa.traced(Ptr) { Some(c) } else { None }
 }
 
 -- The payload constructor's field type, at `ty`.
@@ -1988,25 +1961,12 @@ fun literal(l : Lower, lit : Lit, rep : Rep) -> Value = match lit {
     LChar(c) -> scalar(l, ConstInt(Char.toInt(c)), Ssa.untraced(I64), rep)
 }
 
--- A scalar constant at whatever representation the context asked for, boxed if
--- that representation is a pointer.
+-- A scalar constant at the representation the context asked for.
 --
--- The constant used to be emitted at `rep` whatever `rep` was, which for a
--- pointer-shaped context produced a scalar sitting in a pointer -- a global
--- the collector would then try to trace as a heap address. It reached the backend
--- because a *generic* binding is compiled at the uniform representation and
--- `let defaultSize = 16` generalizes: a bare numeric literal is polymorphic in
--- its numeric type, so the generic copy of it is a scalar asked for at `ptr`.
---
--- `Turkey.Mono` no longer leaves the reference that made this reachable, so
--- this is a backstop rather than the fix. It is worth keeping as one because a
--- polymorphic scalar binding is legitimate -- one used at two different numeric
--- types cannot be specialized away -- and because the failure it prevents is
--- silent everywhere the target has no type system to object.
---
--- `coerce` does the boxing rather than this emitting a `Box` itself: crossing
--- between a scalar and the uniform representation is exactly what it is for,
--- and it is the one place that decides what such a crossing costs.
+-- A pointer-shaped context is refused by `coerce` rather than given the
+-- constant as a pointer: a literal's layout is its type's, and a context that
+-- disagrees is a compiler bug, which a scalar in a traced slot would make
+-- silent until the collector followed it.
 fun scalar(l : Lower, op : Op, natural : Rep, rep : Rep) -> Value =
     if rep.class_ == Ptr { coerce(l, L.emit(l.b, op, natural), rep) }
     else { L.emit(l.b, op, rep) }
@@ -2109,7 +2069,7 @@ fun definesSymbol(decls : DeclTable, symbol : String) -> Bool {
 -- it. `turkey/backend_lower.py` does the same with the callee's own abstracted
 -- layouts, and its comment is the reason: a layout-shared copy holds its
 -- parameters at the layouts its key names, so a caller reading them off its
--- own scheme would hand a boxed value to a body expecting a bare one.
+-- own scheme would pass a value at a layout the copy does not hold it at.
 fun directCall(l : Lower, name : String, sig : Signature, args : Array Core,
                rep : Rep) -> Value {
     let supplied = [L.emit(l.b, ConstInt(0), Ssa.traced(Ptr))]
@@ -2551,7 +2511,7 @@ fun lowerActions(name : String, actions : Array Action, decls : DeclTable,
                  globals : Set.Set String, globalRefs : Map String Rep,
                  tags : Map String Int, fields : Map String (Array String),
                  sigs : Map String Signature, shared : Lifting,
-                 layouts : Map String (Map Int String), held : Map String Rep)
+                 layouts : Map String (Map String String), held : Map String Rep)
         -> (Ssa.Func Low, Array (Ssa.Func Low)) {
     let f = Ssa.newFunc(name, Ssa.untraced(Unit))
     let l = newLower(decls, f, globals, globalRefs, tags, fields, sigs, Map.new(), [], shared)

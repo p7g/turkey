@@ -30,8 +30,8 @@ module Turkey.Mono (
 --   specialization that ends but grows exponentially without recursion.
 --
 -- A refused call site keeps its type application and goes on calling the
--- generic binding, which survives the pass unchanged and is compiled by
--- layout-keyed sharing; a method of a known dictionary is still called
+-- generic binding, which survives the pass unchanged and is copied per layout
+-- by `Turkey.Layout`; a method of a known dictionary is still called
 -- directly (see devirtualization). Turkey does not *promise* monomorphization.
 --
 -- ## It goes round twice, and the ceiling does not restart
@@ -899,56 +899,6 @@ fun reduceCore(e : Core, fams : Option Ty.Families) -> Core =
         bind = fun(b) = reduceBind(b, fams),
     }))
 
--- Where a generic body could take polymorphic data apart.
---
--- The predicate is `Core.transparentParameters`, shared with
--- `Turkey.Layout.transparent` -- see there for why one definition and not two.
--- What is decided here is *which* variables count as abstracted, and the answer
--- is the ones no layout was found for: a variable whose layout the binding was
--- compiled under is not a variable without a layout.
---
--- Reachability is from `main`, because an unreachable generic binding is never
--- compiled.
-fun leakedParameters(program : CProgram) -> Array (String, String, Ty.Type) {
-    let binds = Map.new()
-    for b in Array.append(program.dicts, program.binds) {
-        Map.put(binds, b.name, b)
-    }
-    let seen = Set.new()
-    let stack = Array.new(8)
-    for (name, _) in Map.entries(binds) {
-        if String.endsWith(name, "#main") { Array.push(stack, name) }
-    }
-    while len(stack) > 0 {
-        let name = match Array.pop(stack) {
-            Some(n) -> n
-            None -> break
-        }
-        if Set.contains(seen, name) { continue }
-        match Map.get(binds, name) {
-            None -> continue
-            Some(b) -> {
-                Set.add(seen, name)
-                for n in Set.elements(namesOf(b.value)) {
-                    if Map.contains(binds, n) { Array.push(stack, n) }
-                }
-            }
-        }
-    }
-    let found = Array.new(2)
-    for name in Array.sort(Set.elements(seen)) {
-        let b = binds[name]
-        let abstracted = Set.new()
-        for v in abstractionBinders(b) {
-            if !Map.contains(b.layouts, v.id) { Set.add(abstracted, v.id) }
-        }
-        for p in transparentParameters(b, abstracted) {
-            Array.push(found, (name, p.name, Ty.prune(p.ty)))
-        }
-    }
-    found
-}
-
 -- The bindings holding an existential arm `Turkey.Layout` did not copy.
 --
 -- The arm's field layouts depend on what was packed, so an arm with no layouts
@@ -994,25 +944,19 @@ fun unsharedInto(e : Core, found : Array Bool) -> Unit {
     }))
 }
 
--- Refuse to compile a program whose layouts cannot all be known.
+-- Refuse to compile a program with an existential arm that no layout copy
+-- was made for.
 --
 -- Refusing rather than warning because the alternative is silence: the backend
--- reads a field at the layout it computes, and if a generic body disagreed the
--- result would be a wrong value rather than an error.
+-- reads a field at the layout it computes, and if the arm disagreed with the
+-- packing the result would be a wrong value rather than an error. Every other
+-- type's layout is checked by `Turkey.Layout.unknownLayouts`.
 fun checkLayouts(program : CProgram) -> Unit {
     let unopened = unsharedOpenings(program)
     if len(unopened) > 0 {
         oops("an existential pattern reached the backend with no layout for "
              + "what it opens: " + String.join(Array.sort(unopened), ", "), None)
     }
-    let leaks = leakedParameters(program)
-    if len(leaks) == 0 { return {} }
-    let parts = Array.new(len(leaks))
-    for (name, param, ty) in leaks {
-        Array.push(parts, name + " takes " + param + " : " + Ty.show(ty))
-    }
-    oops("monomorphization left a generic body able to destructure polymorphic "
-         + "data, whose layout it cannot know: " + String.join(parts, "; "), None)
 }
 
 fun oops(message : String, where : Option Span) -> a = match where {
@@ -1045,7 +989,8 @@ fun discard(x : a) -> Unit = {}
 -- dictionaries first; its fields refer to them applied to those variables and
 -- parameters, and reading one out of an application substitutes. Specialization
 -- then treats a method like any other generic binding: a copy if one is
--- granted, otherwise the generic body, called directly. Whether a *body* is
+-- granted, otherwise the generic body, called directly and copied per layout
+-- by `Turkey.Layout`. Whether a *body* is
 -- copied is a budget question; whether a method of a known instance is called
 -- through a record is not.
 --

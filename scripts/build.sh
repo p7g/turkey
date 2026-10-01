@@ -142,10 +142,22 @@ sha() {
     fi
 }
 
+# The arguments that make compiler $1 print its assembly on stdout. stage1 is
+# whatever compiler the bootstrap or --stage1 holds, which may predate `build`
+# and spell it `native`, so it is asked rather than assumed: run with no
+# arguments, a compiler prints a usage message naming the commands it has.
+emit_command() {
+    if $RUN "$1" 2>&1 | grep -q 'boot build'; then
+        echo "build -o - -f asm"
+    else
+        echo native
+    fi
+}
+
 # The compiler's own source, compiled by $1, into $2.
 emit() {
     step "$(basename "$1") $SOURCE -> $(basename "$2")"
-    $RUN "$1" native --target "$target" "$SOURCE" > "$2.tmp"
+    $RUN "$1" $(emit_command "$1") --target "$target" "$SOURCE" > "$2.tmp"
     mv "$2.tmp" "$2"
 }
 

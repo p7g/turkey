@@ -429,7 +429,7 @@ fun main() {
         after = before + "        if !Prim.ptrIsNull(object) { continue }\n"
     assert text.count(before) == 1, before
     heap.write_text(text.replace(before, after))
-    result = subprocess.run(toolchain.command(bootc.binary(), "native", "--gc-verify",
+    result = subprocess.run(toolchain.command(bootc.binary(), *bootc.argv("asm"), "--gc-verify",
                                               str(source)),
                             cwd=bootc.REPO_ROOT, capture_output=True, text=True,
                             check=True, env=dict(os.environ, TURKEY_LIB=str(library)))

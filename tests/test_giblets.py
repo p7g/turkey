@@ -32,7 +32,7 @@ HOOK = "TURKEY_TEST_GIBLETS"
 def _run(entry: Path, giblets: str, command: str) -> tuple[int, str]:
     env = dict(os.environ, **{HOOK: giblets})
     result = subprocess.run(
-        toolchain.command(bootc.binary(), command, str(entry)),
+        toolchain.command(bootc.binary(), *bootc.argv(command), str(entry)),
         cwd=REPO_ROOT, env=env, capture_output=True, text=True)
     return result.returncode, result.stderr
 
@@ -95,7 +95,7 @@ def lowered(request, tmp_path):
                           + giblet_body, encoding="utf-8")
         env = dict(os.environ, **{HOOK: f"Probe_giblet_{digest}"})
         result = subprocess.run(
-            toolchain.command(bootc.binary(), "ssa", str(entry)),
+            toolchain.command(bootc.binary(), *bootc.argv("ssa"), str(entry)),
             cwd=REPO_ROOT, env=env, capture_output=True, text=True)
         return result.returncode, result.stdout, result.stderr
 
@@ -363,7 +363,7 @@ def test_the_first_giblet_module_lowers_clean():
     # objects. `Turkey.Memory`'s functions are small enough that the optimizer
     # inlines every call to them and reachability then drops them, so what is
     # checked here is their bodies inside `main`.
-    stdout = bootc.boot("ssa", "tests/programs/giblets_memory.gob")
+    stdout = bootc.boot(*bootc.argv("ssa"), "tests/programs/giblets_memory.gob")
     assert stdout.rstrip().endswith(" functions, 0 skipped"), stdout[-200:]
 
 

@@ -91,7 +91,7 @@ def test_a_barrier_that_remembers_nothing_is_caught(tmp_path):
     heap.write_text(text.replace(before, "    return {}\n"))
     source = tmp_path / "main.gob"
     source.write_text(CONTAINERS)
-    result = subprocess.run(toolchain.command(bootc.binary(), "native", *VERIFY,
+    result = subprocess.run(toolchain.command(bootc.binary(), *bootc.argv("asm"), *VERIFY,
                                               str(source)),
                             cwd=bootc.REPO_ROOT, capture_output=True, text=True,
                             check=True, env=dict(os.environ, TURKEY_LIB=str(library)))

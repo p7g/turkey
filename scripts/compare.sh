@@ -110,6 +110,17 @@ stats_flag() {
     fi
 }
 
+# The arguments that make compiler $1 print its assembly on stdout. A tree
+# from before `build` spelled it `native`; run with no arguments, a compiler
+# prints a usage message naming the commands it has.
+emit_command() {
+    if $RUN "$1" 2>&1 | grep -q 'boot build'; then
+        echo "build -o - -f asm"
+    else
+        echo native
+    fi
+}
+
 # Wait for background jobs $@ (pids); if any failed, show the end of its log.
 # Each job's log is at the path in the variable log_<pid>.
 await() {
@@ -156,12 +167,12 @@ pids=
 for side in base new; do
     eval "tree=\$$side"
     d=$out/$side
-    (cd "$tree" && TURKEY_ALLOC_SITES=1 $RUN "$d/stages/stage2" native \
+    (cd "$tree" && TURKEY_ALLOC_SITES=1 $RUN "$d/stages/stage2" $(emit_command "$d/stages/stage2") \
         $(stats_flag "$tree") "$SOURCE" > "$d/counted.s" 2> "$d/sites.txt" \
         && $CC -o "$d/counted" "$d/counted.s" $LIBS) > "$d/counted.log" 2>&1 &
     eval "log_$!=\"$d/counted.log\""
     pids="$pids $!"
-    (cd "$tree" && $RUN "$d/stages/stage2" native "$SOURCE" > "$d/stage3.s" \
+    (cd "$tree" && $RUN "$d/stages/stage2" $(emit_command "$d/stages/stage2") "$SOURCE" > "$d/stage3.s" \
         && $CC -o "$d/stage3" "$d/stage3.s" $LIBS) > "$d/stage3.log" 2>&1 &
     eval "log_$!=\"$d/stage3.log\""
     pids="$pids $!"
@@ -177,7 +188,7 @@ pids=
 for side in base new; do
     d=$out/$side
     cp -R "$out/input" "$d/input"
-    (cd "$d/input" && TURKEY_GC_STATS=1 $RUN "$d/counted" native "$SOURCE" \
+    (cd "$d/input" && TURKEY_GC_STATS=1 $RUN "$d/counted" $(emit_command "$d/counted") "$SOURCE" \
         > /dev/null 2> "$d/gc.txt" \
         && mv turkey-alloc-sites.bin "$d/sites.bin") > "$d/count.log" 2>&1 &
     eval "log_$!=\"$d/count.log\""
@@ -191,7 +202,7 @@ while [ $i -le "$runs" ]; do
     for side in base new; do
         step "time $side, run $i of $runs"
         (cd "$out/input" && $TIME $RUN "$out/$side/stage3" \
-            native "$SOURCE" > /dev/null 2> "$out/$side/run$i.txt") || {
+            $(emit_command "$out/$side/stage3") "$SOURCE" > /dev/null 2> "$out/$side/run$i.txt") || {
             echo "compare.sh: the $side run failed; see $out/$side/run$i.txt" >&2
             exit 1
         }

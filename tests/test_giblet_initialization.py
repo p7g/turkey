@@ -41,8 +41,9 @@ def modules(request, tmp_path):
 def compile_source(entry, env, command):
     # The probes call the runtime's exports from C, which keeps them only in a
     # build that exports every one.
-    flags = ["--export-runtime"] if command == "native" else []
-    return subprocess.run(toolchain.command(bootc.binary(), command, *flags, str(entry)),
+    flags = ["--export-runtime"] if command == "asm" else []
+    return subprocess.run(toolchain.command(bootc.binary(), *bootc.argv(command), *flags,
+                                            str(entry)),
                           cwd=bootc.REPO_ROOT, env=env,
                           capture_output=True, text=True)
 
@@ -69,7 +70,7 @@ def test_globals_precede_every_managed_allocation(modules, tmp_path):
         'foreign "probe_step" fun step(Int) -> Int\n'
         'var base : Int = step(1)\n',
         main='print("initialized"); print(P.read())')
-    result = compile_source(entry, env, "native")
+    result = compile_source(entry, env, "asm")
     assert result.returncode == 0, result.stderr
     generated = tmp_path / "program.s"
     generated.write_text(result.stdout)
@@ -107,7 +108,7 @@ def test_c_can_run_early_initialization(modules, tmp_path):
         'var runs : Int = step()\n'
         'foreign "probe_read" fun read() -> Int = runs\n',
         'let base : Int = 0')
-    result = compile_source(entry, env, "native")
+    result = compile_source(entry, env, "asm")
     assert result.returncode == 0, result.stderr
     # The probe supplies C's main, and never runs the program's.
     main = toolchain.c_symbol("main")
@@ -197,7 +198,7 @@ def test_early_raw_panic_stops_before_allocation(modules, tmp_path):
         'let failed : Int = fail()\n'
         'fun fail() -> Int { R.panic(Prim.cString("early failure")); 0 }\n'
         'fun read() -> Int = failed', 'let base : Int = 0')
-    result = compile_source(entry, env, "native")
+    result = compile_source(entry, env, "asm")
     assert result.returncode == 0, result.stderr
     generated = tmp_path / "program.s"
     generated.write_text(result.stdout)

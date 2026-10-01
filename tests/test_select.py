@@ -77,13 +77,13 @@ def _split_asm(text: str, paths: list[Path]) -> list[str]:
 
 @functools.lru_cache(maxsize=None)
 def _all() -> dict[str, str]:
-    """`boot asm` over the whole corpus, cached on disk per program.
+    """The `select` dump of the whole corpus, cached on disk per program.
 
     One `boot` run fills the cache and every worker of `pytest -n auto` reads
     it; kept only in this process, it was one corpus run per worker.
     """
     paths = [PROGRAMS / name for name in CORPUS]
-    texts = bootc.boot_each("asm", paths, _split_asm)
+    texts = bootc.boot_each("select", paths, _split_asm)
     return {path.name: texts[path] for path in paths}
 
 
@@ -294,13 +294,13 @@ def test_pressure_spills_into_both_kinds_of_slot():
 
 @functools.lru_cache(maxsize=None)
 def _boot_asm() -> str:
-    """`boot asm src/Main.gob`: one process, about ninety seconds, so cached.
+    """The `select` dump of `src/Main.gob`: one process, about ninety seconds, so cached.
 
     The build fingerprint covers all of `src/`, which is what the output
     depends on besides `Main.gob` itself.
     """
     main = REPO_ROOT / "src" / "Main.gob"
-    return bootc.boot_each("asm", [main], _split_asm)[main]
+    return bootc.boot_each("select", [main], _split_asm)[main]
 
 
 def test_boot_allocates_completely():

@@ -1,4 +1,4 @@
-"""`boot native`: the corpus compiled by the independent arm64 backend, and run.
+"""`boot build`: the corpus compiled by the independent arm64 backend, and run.
 
 The check on this backend that sees *meaning*. `tests/test_emit.py` checks
 that `as` accepts what is printed, which catches an immediate out of range and
@@ -55,7 +55,7 @@ def _all(flags: tuple[str, ...] = ()) -> dict[str, str]:
     one process per program turns the corpus into an hour.
     """
     paths = [PROGRAMS / name for name in CORPUS]
-    texts = bootc.boot_each("native", paths, _split, flags)
+    texts = bootc.boot_each("asm", paths, _split, flags)
     return {path.name: texts[path] for path in paths}
 
 

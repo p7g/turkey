@@ -1,6 +1,6 @@
 """`src/Turkey/Sites.gob`: counting allocations by the instruction that made them.
 
-`TURKEY_ALLOC_SITES=1 boot native` numbers every allocating instruction on
+`TURKEY_ALLOC_SITES=1 boot build` numbers every allocating instruction on
 stderr and makes the program write one counter per site when `main` returns.
 These pin that the numbering and the counts line up, and that a site runs as
 often as the program says it does.
@@ -32,7 +32,7 @@ def _counted(tmp_path):
     entry.write_text(PROGRAM, encoding="utf-8")
     env = dict(os.environ, TURKEY_ALLOC_SITES="1", TURKEY_LIB=str(lang.LIB))
     compiled = subprocess.run(
-        toolchain.command(bootc.binary(), "native", str(entry)),
+        toolchain.command(bootc.binary(), *bootc.argv("asm"), str(entry)),
         cwd=tmp_path, env=env, capture_output=True, check=True)
     source = tmp_path / "main.s"
     source.write_bytes(compiled.stdout)

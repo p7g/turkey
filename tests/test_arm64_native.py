@@ -104,8 +104,9 @@ def test_every_program_has_an_entry_and_a_root_array():
 
 
 @pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
+@pytest.mark.parametrize("generational", ["0", "1"])
 @pytest.mark.parametrize("name", RUNNABLE)
-def test_the_corpus_agrees_under_gc_stress(name):
+def test_the_corpus_agrees_under_gc_stress(name, generational):
     """Collect at every allocation, which is what reads the frame table at all.
 
     Without stress a program may collect a handful of times or never, and the
@@ -114,8 +115,13 @@ def test_the_corpus_agrees_under_gc_stress(name):
     that a root the compiler did not publish is caught -- `mark_grey` keeps the
     expensive membership test under stress, so a missed root becomes a panic on
     the first collection rather than a corruption later.
+
+    Once with every collection full, and once with seven in eight minor, where
+    a store the write barrier missed frees a young object that is still
+    reachable.
     """
-    env = dict(os.environ, TURKEY_GC_STRESS="1", TURKEY_GC_VERIFY="1")
+    env = dict(os.environ, TURKEY_GC_STRESS="1", TURKEY_GC_VERIFY="1",
+               TURKEY_GC_GENERATIONAL=generational)
     # From the program's own directory, as `test_programs` runs it: a program
     # may read a file by its bare name (`system.gob`).
     result = subprocess.run(toolchain.command(_binary(name)), cwd=PROGRAMS,

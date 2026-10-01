@@ -28,8 +28,6 @@ void *turkey_string_new(const unsigned char *bytes, int64_t length);
 void *turkey_cell_new(uint64_t value, int64_t pointer_value);
 void *turkey_object_new(int64_t kind, int64_t tag, int64_t count,
                         uint64_t pointer_bitmap);
-void *turkey_box(uint64_t value, int64_t layout);
-uint64_t turkey_unbox(void *box, int64_t layout);
 void *turkey_array_new(int64_t length, uint64_t initial, int64_t element_width,
                        int64_t element_layout);
 void *turkey_closure_shell(uint64_t code);
@@ -43,11 +41,18 @@ void turkey_frame_table_register(const void *table);
 void turkey_entry_stack_set(void *frame);
 const void *turkey_roots_head(void);
 void turkey_collect(void);
+/* A minor collection if they are on; `turkey_collect` is always full. */
+void turkey_collect_minor(void);
 void turkey_gc_report(void);
 int64_t turkey_heap_objects(void);
 int64_t turkey_collection_count(void);
 void turkey_gc_set_stress(int64_t enabled);
 void turkey_gc_set_verify(int64_t enabled);
+void turkey_gc_set_generational(int64_t enabled);
+/* The write barrier's slow path: remembers `parent` if it is old. C that
+   stores a pointer into an object allocated before the pointer's object
+   calls it after the store. */
+void turkey_write_barrier(void *parent);
 int64_t turkey_heap_contains(void *value);
 void *turkey_heap_regions(void);
 void *turkey_heap_available(void);

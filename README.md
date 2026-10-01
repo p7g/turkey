@@ -197,8 +197,10 @@ with nothing changed is quicker; `-n0` runs serially, for debugging.
 
 To check the heap while debugging a compiled program, run it with
 `TURKEY_GC_VERIFY=1`. Each collection independently checks object bounds,
-traced references, shadow-stack and native roots, marking completeness, and
-region bookkeeping before and after sweeping. Failures report
+traced references, shadow-stack and native roots, marking completeness,
+region bookkeeping before and after sweeping, and the generational
+invariants: an old object holding a young one must have been remembered by
+the write barrier. Failures report
 `heap verifier:` and terminate the process with exit status 1 before proceeding
 to the next collection phase.
 Combine it with `TURKEY_GC_STRESS=1` to collect and verify at every allocation.
@@ -206,6 +208,9 @@ At the compiler's own scale that does not finish; `TURKEY_GC_STRESS=N`
 collects at random intervals averaging N allocations instead, and
 `TURKEY_GC_STRESS_SEED` picks the sequence (1 by default), so a failure can be
 repeated and several seeds put the collections at different allocations.
+Under stress one collection in eight is full and the rest are minor;
+`TURKEY_GC_GENERATIONAL=0` makes every collection full, to tell a collector
+bug from a missed write barrier.
 Verification scans the allocated heap and uses temporary native memory for a
 region index; it is disabled by default. It checks the roots and layouts the
 compiler supplies, so behavioral stress tests are still needed to catch

@@ -1,10 +1,7 @@
 """The Turkey allocator exports, called from C without running the program."""
 
-import gzip
 import os
-import re
 import subprocess
-from pathlib import Path
 
 import pytest
 
@@ -102,11 +99,6 @@ int main(void) {
     held[13] = turkey_cell_new(UINT64_MAX, 0);
     assert(((TurkeyCell *)held[13])->value == UINT64_MAX);
     assert(((TurkeyCell *)held[13])->pointer_value == 0);
-    for (int layout = 0; layout <= 6; layout++) {
-        uint64_t bits = UINT64_C(0xfff812345678abcd);
-        held[14] = turkey_box(bits, layout);
-        assert(turkey_unbox(held[14], layout) == bits);
-    }
     held[15] = turkey_closure_shell(UINT64_C(0xabcdef1234567890));
     object = held[15];
     assert(object->kind == 3 && object->tag == -1 && object->count == 2);
@@ -148,15 +140,6 @@ int main(void) {
     panic_is("allocation is too large");
     assert(turkey_array_new(INT64_C(2305843009213693948), 0, 8, 0) == NULL);
     panic_is("allocation is too large");
-    assert(turkey_unbox(held[14], 5) == 0);
-    panic_is("boxed value has the wrong scalar layout");
-    assert(turkey_unbox(held[18], 4) == 0);
-    panic_is("heap object has the wrong runtime kind");
-    assert(turkey_unbox(NULL, 4) == 0);
-    assert(!turkey_has_panicked);
-    turkey_gc_set_stress(1);
-    assert(turkey_unbox((void *)8, 4) == 0);
-    panic_is("invalid or collected heap pointer");
     turkey_root_leave(&frame);
     turkey_collect();
     assert(turkey_heap_objects() == 0);
@@ -185,14 +168,14 @@ def test_allocator_exports_before_initialization(allocator_probe, stress):
     assert result.stdout == ""
     assert result.stderr
     assert all(line.startswith("[gc") for line in result.stderr.splitlines())
-    assert ", allocations 25," in result.stderr
+    assert ", allocations 18," in result.stderr
     assert ("[gc] by kind: constr 1, record 1, array 12, closure 1, closure-env 1, "
-            "box 7, cell 2\n") in result.stderr
+            "cell 2\n") in result.stderr
 
 
 def test_allocator_symbols_are_defined_only_in_turkey(allocator_object):
     names = ["turkey_cell_new", "turkey_object_new", "turkey_array_new",
-             "turkey_box", "turkey_unbox", "turkey_closure_shell", "turkey_string_new",
+             "turkey_closure_shell", "turkey_string_new",
              "turkey_root_enter", "turkey_root_leave", "turkey_frame_table_register",
              "turkey_entry_stack_set", "turkey_collect", "turkey_gc_report",
              "turkey_gc_set_stress", "turkey_heap_objects", "turkey_roots_head",
@@ -207,22 +190,3 @@ def test_allocator_symbols_are_defined_only_in_turkey(allocator_object):
     for name in names:
         assert generated.count(name) == 1
 
-
-def test_box_and_unbox_are_kept_only_while_the_bootstrap_calls_them():
-    """`Turkey.Alloc` defines `turkey_box` and `turkey_unbox` although today's
-    compiler never emits a call to either: the committed bootstrap compiler,
-    which builds the first stage, does. A bump whose compiler no longer calls
-    them makes them dead, and this is what says so, in the bump's own run."""
-    root = Path(__file__).resolve().parents[1]
-    calls = re.compile(r'\bbl "_?turkey_(un)?box"')
-    called = any(calls.search(gzip.decompress(artifact.read_bytes()).decode())
-                 for artifact in sorted((root / "bootstrap").glob("*.s.gz")))
-    alloc = (root / "lib" / "Turkey" / "Alloc.gob").read_text()
-    defined = '"turkey_box"' in alloc or '"turkey_unbox"' in alloc
-    assert called or not defined, (
-        "the committed bootstrap no longer calls turkey_box or turkey_unbox, so "
-        "remove them now: Alloc.box/unbox and their exports, Heap.validObjectKind "
-        "and validHeapPointer, object kind 5 (HeapCheck's `kind > 5` and the "
-        "`, box N` field of the TURKEY_GC_STATS line), and this test; the C "
-        "probes in this file and tests/test_heap_verifier.py use turkey_box as "
-        "a small allocator and need another")

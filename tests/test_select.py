@@ -26,6 +26,7 @@ It is skipped where there is no assembler.
 
 from __future__ import annotations
 
+import re
 import functools
 import subprocess
 import tempfile
@@ -399,9 +400,10 @@ def test_the_printed_instructions_assemble(name):
     first would not have been.
 
     Only the instruction lines, and only the ones with no virtual register
-    left in them -- there is no allocator yet, so `mov %3, x0` is not
-    something `as` can be asked about. What that leaves is the physical-register
-    traffic around calls, which is where the calling convention lives.
+    or frame slot left in them -- there is no allocator or frame layout yet,
+    so `mov %3, x0` and `str xzr, [object 0, #-24]` are not something `as`
+    can be asked about. What that leaves is the physical-register traffic
+    around calls, which is where the calling convention lives.
     """
     lines = []
     for line in _asm(name).splitlines():
@@ -410,7 +412,7 @@ def test_the_printed_instructions_assemble(name):
             continue
         if text.endswith(":") or text.startswith(("ret ", "branch ", "jump ")):
             continue
-        if "%" in text:
+        if "%" in text or re.search(r"\[(root|spill|object|incoming|outgoing) ", text):
             continue
         lines.append("\t" + text)
     assert lines, "nothing physical-only to assemble"

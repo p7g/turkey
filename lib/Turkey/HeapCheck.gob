@@ -2,7 +2,7 @@ module Turkey.HeapCheck (
     verify, stateBytes, stateRegions, stateAvailable, stateRegionTable,
     stateRegionTableCapacity, stateRegionTableCount, stateRegionBytes, stateObjects,
     stateMarkEpoch, stateFrameEntries, stateFrameEntryCount, stateEntryStackHigh,
-    stateRoots,
+    stateRoots, stateMinor, stateGenerational, stateRemembered, stateRememberedCount,
 )
 
 -- The heap verifier: with TURKEY_GC_VERIFY set, the collector calls `verify`
@@ -28,7 +28,13 @@ module Turkey.HeapCheck (
 --
 -- What it checks is closure of the marked set: if every root is marked and
 -- every edge out of a marked object is marked, every reachable object is
--- marked. It never changes a mark. Compiler-emitted layouts and roots are still
+-- marked. It never changes a mark.
+--
+-- And the generational invariants the minor collections rest on: an object is
+-- marked between collections exactly when it is old; an old object holding a
+-- young one is remembered; and after a sweep every object is old. On a minor
+-- collection "marked" is "old", since the old objects are not marked again; on
+-- a full one it is the header's epoch, as before. Compiler-emitted layouts and roots are still
 -- trusted descriptions -- a root the compiler omitted cannot be reconstructed --
 -- and the region list and root chains must be readable: this diagnoses the
 -- runtime's invariants, not arbitrary corruption of the address space.
@@ -52,9 +58,12 @@ import Turkey.Libc as Libc
 -- One word each: the region list, the per-class available lists, the region
 -- set's table, its capacity and its count, the bytes the regions reserve, the
 -- objects allocated, the mark epoch, the frame table and its length, the outer
--- bound of the frame walk, and the innermost shadow-stack frame.
+-- bound of the frame walk, the innermost shadow-stack frame, whether this
+-- collection is minor, whether the program runs the write barrier (and so
+-- whether an old object holding a young one must be remembered), and the
+-- remembered objects and their count.
 
-let stateBytes : Int = 96
+let stateBytes : Int = 128
 let stateRegions : Int = 0
 let stateAvailable : Int = 8
 let stateRegionTable : Int = 16
@@ -67,12 +76,21 @@ let stateFrameEntries : Int = 64
 let stateFrameEntryCount : Int = 72
 let stateEntryStackHigh : Int = 80
 let stateRoots : Int = 88
+let stateMinor : Int = 96
+let stateGenerational : Int = 104
+let stateRemembered : Int = 112
+let stateRememberedCount : Int = 120
 
 -- -- the heap's format ----------------------------------------------------------------
 
--- The header before every payload: an unused word, the payload size, the heap
--- kind (u32) and the mark epoch that last reached it (u32).
+-- The header before every payload: the generation word, the payload size, the
+-- heap kind (u32) and the mark epoch that last reached it (u32).
 let headerBytes : Int = 24
+let headerGeneration : Int = 0
+-- The generation word's values: young, old, and old and remembered.
+let young : Int = 0
+let old : Int = 1
+let rememberedOld : Int = 2
 -- Traced words below this are immediates, not pointers.
 let immediates : Int = 4096
 let headerSize : Int = 8
@@ -141,6 +159,10 @@ var indexCount : Int = 0
 var state : Prim.Ptr = Prim.ptrNull()
 var phase : Int = 0
 var epoch : Int = 0
+var minor : Bool = False
+var barriers : Bool = False
+-- The objects whose generation word says they are remembered, as counted.
+var rememberedSeen : Int = 0
 var entries : Prim.Ptr = Prim.ptrNull()
 var entryCount : Int = 0
 
@@ -196,8 +218,8 @@ foreign "turkey_heap_check_frames" fun checkFramesForTests(when : Int, current :
 
 fun check(when : Int, frame : Prim.Ptr, handed : Prim.Ptr) -> Bool {
     if !begin(when, handed) { return False }
-    let passed = checkRegions() && checkTable() && checkObjects() && checkAvailable()
-                 && checkRoots()
+    let passed = checkRegions() && checkTable() && checkObjects() && checkRemembered()
+                 && checkAvailable() && checkRoots()
                  && checkFrames(Prim.ptrToInt(frame), stateWord(stateEntryStackHigh))
     releaseIndex()
     passed
@@ -212,6 +234,8 @@ fun begin(when : Int, handed : Prim.Ptr) -> Bool {
     state = handed
     phase = when
     epoch = Prim.intAnd(stateWord(stateMarkEpoch), 4294967295)
+    minor = stateWord(stateMinor) != 0
+    barriers = stateWord(stateGenerational) != 0
     entries = Prim.loadPtr(state, stateFrameEntries)
     entryCount = stateWord(stateFrameEntryCount)
     buildIndex()
@@ -461,9 +485,6 @@ fun checkSlots(r : Int, capacity : Int, slotSize : Int) -> Bool {
         if (si >= capacity && allocated) || (marked && !allocated) {
             return fail(Prim.cString("marked/free slot or bitmap outside region"), r, si)
         }
-        if phase != 1 && marked {
-            return fail(Prim.cString("uncleared region marks"), r, si)
-        }
         if allocated {
             usedSeen = usedSeen + 1
             if marked { liveSeen = liveSeen + 1 }
@@ -471,12 +492,22 @@ fun checkSlots(r : Int, capacity : Int, slotSize : Int) -> Bool {
             if below(slotSize - headerBytes, Prim.loadI64(h, headerSize)) {
                 return failAt(Prim.cString("object exceeds allocation slot"), h, si)
             }
-            let reached = load32(h, headerMarked) == epoch
+            let generation = Prim.loadI64(h, headerGeneration)
+            if generation != young && generation != old && generation != rememberedOld {
+                return failAt(Prim.cString("invalid generation word"), h, si)
+            }
+            if phase != 1 && marked != (generation != young) {
+                return failAt(Prim.cString("region marks and generation disagree"), h, si)
+            }
+            let reached = reachedAt(h)
             if phase == 1 && marked != reached {
                 return failAt(Prim.cString("header and region marks disagree"), h, si)
             }
             if phase == 2 && !reached {
                 return failAt(Prim.cString("unmarked sweep survivor"), h, si)
+            }
+            if phase == 2 && generation != old {
+                return failAt(Prim.cString("young or remembered sweep survivor"), h, si)
             }
         }
     }
@@ -531,6 +562,7 @@ fun home(region : Int, capacity : Int) -> Int {
 
 -- Every allocated object's header and layout, and each pointer in it.
 fun checkObjects() -> Bool {
+    rememberedSeen = 0
     for var oi = 0; oi < indexCount; oi = oi + 1 {
         let r = indexAt(oi)
         let capacity = load32(Prim.ptrFromInt(r), regionCapacity)
@@ -588,8 +620,7 @@ fun checkAvailable() -> Bool {
 --
 -- Layout codes: an array's tag is its element's code, and its bitmap word is
 -- the element width. A constructor or record has three bits of code per slot,
--- at most 21 slots; a closure, environment or box has one bit per slot, at most
--- 63. Code 7 is a traced pointer, and 6 a raw address that must not be
+-- at most 21 slots; a closure or environment has one bit per slot, at most 63. Code 7 is a traced pointer, and 6 a raw address that must not be
 -- followed.
 fun checkObject(h : Int) -> Bool {
     let value = h + headerBytes
@@ -597,11 +628,17 @@ fun checkObject(h : Int) -> Bool {
     let payload = Prim.ptrFromInt(value)
     let size = Prim.loadI64(header, headerSize)
     let heapKind = load32(header, headerKind)
-    let marked = phase != 0 && load32(header, headerMarked) == epoch
+    let marked = phase != 0 && reachedAt(header)
+    let generation = Prim.loadI64(header, headerGeneration)
+    if generation == rememberedOld { rememberedSeen = rememberedSeen + 1 }
+    -- Between collections, with the barrier emitted: an old object that is
+    -- not remembered holds no young one.
+    let unremembered = phase == 0 && barriers && generation == old
     if heapKind == heapCell {
         if size != cellBytes { return fail(Prim.cString("invalid cell size"), value, -1) }
         return load32(payload, cellFlag) == 0
-            || checkPointer(Prim.loadI64(payload, 0), marked, value, 0)
+            || (checkPointer(Prim.loadI64(payload, 0), marked, value, 0)
+                && (!unremembered || notYoung(Prim.loadI64(payload, 0), value, 0)))
     }
     if heapKind != heapObject || size < objectSlots {
         return fail(Prim.cString("invalid heap header"), value, -1)
@@ -611,7 +648,7 @@ fun checkObject(h : Int) -> Bool {
     let tag = load32(payload, objectTag)
     let count = Prim.loadI64(payload, objectCount)
     let bitmap = Prim.loadI64(payload, objectBitmap)
-    if kind > 5 || count < 0 { return fail(Prim.cString("invalid object header"), value, -1) }
+    if kind > 4 || count < 0 { return fail(Prim.cString("invalid object header"), value, -1) }
     var span = 8
     if kind == 2 {
         span = bitmap
@@ -630,9 +667,10 @@ fun checkObject(h : Int) -> Bool {
         let traced = if kind == 2 { True }
                      else if kind <= 1 { Prim.intAnd(Prim.intShr(bitmap, 3 * field), 7) == 7 }
                      else { hasBit(bitmap, field) }
-        if traced && !checkPointer(Prim.loadI64(payload, objectSlots + 8 * field),
-                                   marked, value, field) {
-            return False
+        if traced {
+            let child = Prim.loadI64(payload, objectSlots + 8 * field)
+            if !checkPointer(child, marked, value, field) { return False }
+            if unremembered && !notYoung(child, value, field) { return False }
         }
     }
     True
@@ -662,8 +700,56 @@ fun checkPointer(value : Int, marked : Bool, owner : Int, at : Int) -> Bool {
         return fail(Prim.cString("invalid traced pointer"), owner, at)
     }
     let h = Prim.ptrFromInt(r + regionData + slot * slotSize)
-    if marked && load32(h, headerMarked) != epoch {
+    if marked && !reachedAt(h) {
         return fail(Prim.cString("reachable object is unmarked"), owner, at)
+    }
+    True
+}
+
+-- Whether this collection's marking has reached the object whose header is
+-- `h`: on a full collection, its epoch is this one; on a minor one it is old,
+-- since the old objects were marked before and marking makes the young ones
+-- it reaches old.
+fun reachedAt(h : Prim.Ptr) -> Bool =
+    if minor { Prim.loadI64(h, headerGeneration) != young }
+    else { load32(h, headerMarked) == epoch }
+
+-- `value`, a pointer `checkPointer` has accepted, found at slot `at` of an old
+-- object that is not remembered, is not a young object.
+fun notYoung(value : Int, owner : Int, at : Int) -> Bool {
+    if below(value, immediates) { return True }
+    if Prim.loadI64(Prim.ptrFromInt(value - headerBytes), headerGeneration) != young {
+        return True
+    }
+    fail(Prim.cString("old object holds a young one and is not remembered"), owner, at)
+}
+
+-- Before marking: the remembered objects are allocated, each says it is
+-- remembered, and there are as many as there are objects that say so. That is
+-- not quite that the two sets are equal -- an entry twice and another missing
+-- would pass -- but the collector adds an object only as it changes its word,
+-- so a repeat needs the word to have been reset in between, which only a
+-- collection does.
+--
+-- Not after: marking consumes the set, and on a full collection a dead object
+-- still says it is remembered until the sweep frees it. After the sweep no
+-- object is, which `checkSlots` checks.
+fun checkRemembered() -> Bool {
+    if phase != 0 { return True }
+    let count = stateWord(stateRememberedCount)
+    let entries = Prim.loadPtr(state, stateRemembered)
+    if count != rememberedSeen {
+        return fail(Prim.cString("remembered objects miscounted"), count, rememberedSeen)
+    }
+    for var ei = 0; ei < count; ei = ei + 1 {
+        let value = Prim.loadI64(entries, 8 * ei)
+        if below(value, immediates) || !checkPointer(value, False, Prim.ptrToInt(entries), ei) {
+            return fail(Prim.cString("invalid remembered object"), Prim.ptrToInt(entries), ei)
+        }
+        if Prim.loadI64(Prim.ptrFromInt(value - headerBytes), headerGeneration) != rememberedOld {
+            return fail(Prim.cString("remembered object is not marked remembered"),
+                        Prim.ptrToInt(entries), ei)
+        }
     }
     True
 }

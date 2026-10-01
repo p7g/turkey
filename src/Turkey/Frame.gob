@@ -20,7 +20,8 @@ module Turkey.Frame (
 --     rootsAt           root slots, one per rooted value (`Turkey.Roots`)
 --     spillsAt          spill slots, one per spilled untraced value
 --     objectsAt         objects built in the frame (`Turkey.Escape`), each
---                       at the payload layout a heap object has
+--                       at the payload layout a heap object has, after a
+--                       header whose first word is zero
 --     (padding)         to the 16-byte alignment Apple requires
 --     sp + 8k           outgoing stack argument k
 --
@@ -84,11 +85,18 @@ fun layout(a : Regalloc.Allocation, frame : Roots.Frame) -> Layout {
     }
     let roots = Roots.slotCount(frame)
     let spills = a.spills.spillSlots
+    -- Each object has a heap header's room in front of it, and selection
+    -- zeroes the header's first word: the generation word, which the write
+    -- barrier reads from a store's target before it knows whether the target
+    -- is in the heap or in a frame. A callee storing through a parameter is
+    -- compiled once for both. Zero reads as young, and a young target needs
+    -- nothing remembered. The collector never reads it: frame objects are
+    -- roots.
     let objectStarts = []
     var objectBytes = 0
     for o in frame.objects {
-        Array.push(objectStarts, objectBytes)
-        objectBytes = objectBytes + 8 * o.words
+        Array.push(objectStarts, objectBytes + objectHeader)
+        objectBytes = objectBytes + objectHeader + 8 * o.words
     }
     let saves = 8 * even(len(savedGp)) + 8 * even(len(savedFp))
     let raw = outgoing + objectBytes + 8 * spills + 8 * roots + saves + 16
@@ -130,6 +138,9 @@ fun layout(a : Regalloc.Allocation, frame : Roots.Frame) -> Layout {
 }
 
 fun even(n : Int) -> Int = n + n % 2
+
+-- A heap header's size, before a frame object's payload.
+let objectHeader : Int = 24
 
 -- The callee-saved registers some value was coloured into, in each file,
 -- ascending. `x19`-`x28` and `d8`-`d15`; only the low 64 bits of a `d` are
@@ -226,10 +237,13 @@ fun checkSlot(out : Array String, l : Layout, m : Mem, b : Int, n : Int) -> Unit
     let within = match m {
         RootSlot(i) -> i >= 0 && i < l.roots
         SpillSlot(i) -> i >= 0 && i < l.spills
-        ObjectSlot(n, k) -> n >= 0 && n < len(l.objectStarts) && k >= 0
+        -- The payload, or the header's generation word.
+        ObjectSlot(n, k) -> n >= 0 && n < len(l.objectStarts)
+                            && (k >= 0 || k == -objectHeader)
                             && l.objectStarts[n] + k
-                               < (if n + 1 < len(l.objectStarts) { l.objectStarts[n + 1] }
-                                  else { l.objectBytes })
+                               < (if n + 1 < len(l.objectStarts) {
+                                      l.objectStarts[n + 1] - objectHeader
+                                  } else { l.objectBytes })
         OutgoingArg(k) -> k >= 0 && 8 * (k + 1) <= l.outgoing
         IncomingArg(k) -> k >= 0
         -- Named rather than a wildcard, for the reason `offsetOf` gives: a

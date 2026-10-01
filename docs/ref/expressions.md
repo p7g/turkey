@@ -200,10 +200,12 @@ fun main() {
 **Syntax**
 
 ```ebnf
-projection ::= postfix "." INT
+projection ::= postfix "." INDEX
+INDEX      ::= "0" | [1-9] [0-9]*
 ```
 
-`e.0`, `e.1`, and so on read the elements of a tuple, counting from zero. They
+`e.0`, `e.1`, and so on read the elements of a tuple, counting from zero. The
+index is written in plain decimal: `e.01`, `e.0x1` and `e.1_0` are errors. They
 also read the payload of a value whose type has exactly one constructor with a
 positional payload, such as `type Point = Point(Int, Int)`. Projections are
 read-only, and an index past the last element is an error.

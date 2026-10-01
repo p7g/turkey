@@ -180,7 +180,7 @@ def random_decimals() -> list[str]:
 
 def literal_floats() -> list[str]:
     """Every float literal in the corpus, the reference and the compiler."""
-    pattern = re.compile(r"(?<![\w.])\d+\.\d+(?:[eE][+-]?\d+)?")
+    pattern = re.compile(r"(?<![\w.])\d+(?:\.\d+(?:[eE][+-]?\d+)?|[eE][+-]?\d+)")
     found = set()
     for root in ("tests/programs", "docs/ref", "src", "lib", "examples"):
         for path in Path(REPO_ROOT, root).rglob("*"):
@@ -195,6 +195,7 @@ def test_parsing_is_correctly_rounded() -> None:
               "2.4703282292062328e-324", "1.8e308", "1.0e-400", "1.0e400",
               "0.000000000000000000000000000001", "00012.50",
               "1.0e99999999999999999999", "1.0e-99999999999999999999",
+              "1e3", "-2E-2", "5e-324", "1e400", "12e0",
               # Longer than the 800 digits held: the digits past that point
               # still decide a tie.
               as_literal(Decimal(5e-324) / 2) + "0" * 900 + "1",
@@ -209,5 +210,6 @@ def test_parsing_accepts_the_specials_and_nothing_but_the_syntax() -> None:
 
     rejected = ["", "1", "-1", ".5", "1.", "1.e5", "1.5e", "1.5e+", "+", "-",
                 "nan", "inf", "+Infinity", "-NaN", "1.5 ", " 1.5", "1.5x",
-                "1_0.0", "0x1.0", "1.5e5.0", "1.2.3", "--1.0", "1.0ee5"]
+                "1_0.0", "0x1.0", "1.5e5.0", "1.2.3", "--1.0", "1.0ee5",
+                "e5", "1e", "1e+", "-e5", "1e5.0"]
     assert answers([f"p {s}" for s in rejected]) == ["None"] * len(rejected)

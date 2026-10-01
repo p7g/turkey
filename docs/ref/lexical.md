@@ -93,18 +93,58 @@ not `<` followed by `=`. What each operator means is covered under
 ### Integer literals
 
 ```ebnf
-INT ::= [0-9]+
+INT     ::= decimal | "0x" hex ( "_"? hex )* | "0o" [0-7] ( "_"? [0-7] )*
+          | "0b" [01] ( "_"? [01] )*
+decimal ::= "0" | [1-9] ( "_"? [0-9] )*
+hex     ::= [0-9a-fA-F]
 ```
 
-An integer literal is a sequence of decimal digits. There are no hexadecimal,
-octal or binary forms and no digit separators. A literal has no sign: `-5` is
-unary minus applied to `5`.
+An integer literal is written in decimal, or in hexadecimal, octal or binary
+after the prefix `0x`, `0o` or `0b`. The prefix is lowercase; the hexadecimal
+digits `a` to `f` may be either case. A single `_` may separate any two
+digits, to group them: `1_000_000`, `0xFFFF_FFFF`. A `_` anywhere else, after
+the prefix or at the end or next to another `_`, is an error. A literal has no
+sign: `-5` is unary minus applied to `5`.
 
-An integer literal can be used as either an `Int` or a `Float`. Which one it
-becomes is decided by type inference, as described in
-[Numeric literals](inference.md#numeric-literals). A literal larger than the
-largest `Int` is an error, even where a `Float` is wanted.
-`9223372036854775808` is one past the largest `Int`:
+<!-- run -->
+```kotlin
+fun main() {
+    let mask = 0xFFFF_FFFF
+    print(mask)
+    print(0x2A == 42)
+    print(0o755)
+    print(0b1010_0101)
+    print(1_000_000)
+}
+```
+
+```text
+4294967295
+True
+493
+165
+1000000
+```
+
+A decimal literal other than `0` does not start with a zero, so `010` is an
+error rather than ten or eight:
+
+<!-- error: leading zeros are not allowed in '010' -->
+```kotlin
+fun main() {
+    print(010)
+}
+```
+
+A number may not run straight into a letter, a digit or a `_`: `12abc` and
+`0b102` are errors, not two tokens.
+
+A literal's value is the number it spells, whatever base it is written in, so
+`0x10` and `16` are interchangeable everywhere. An integer literal can be used
+as either an `Int` or a `Float`. Which one it becomes is decided by type
+inference, as described in [Numeric literals](inference.md#numeric-literals).
+A literal larger than the largest `Int` is an error, even where a `Float` is
+wanted. `9223372036854775808` is one past the largest `Int`:
 
 <!-- error: integer literal out of range: 9223372036854775808 -->
 ```kotlin
@@ -113,22 +153,41 @@ fun main() {
 }
 ```
 
+> **Coming from C or Java.** There is no `0X` prefix, and no octal literal
+> with a leading zero. A hexadecimal literal is not a bit pattern: Java reads
+> `0xFFFFFFFFFFFFFFFFL` as `-1`, but here it is the number 2^64 - 1, which is
+> out of range. Here a literal's value decides whether it can be a `Float`,
+> and a 64-bit pattern read as `-1` could be one. The largest hexadecimal
+> literal is `0x7FFF_FFFF_FFFF_FFFF`.
+
+<!-- error: integer literal out of range: 0xFFFF_FFFF_FFFF_FFFF -->
+```kotlin
+fun main() {
+    print(0xFFFF_FFFF_FFFF_FFFF)
+}
+```
+
 ### Floating-point literals
 
 ```ebnf
-FLOAT ::= [0-9]+ "." [0-9]+ ( [eE] [+-]? [0-9]+ )?
+FLOAT    ::= decimal ( "." digits exponent? | exponent )
+exponent ::= [eE] [+-]? digits
+digits   ::= [0-9] ( "_"? [0-9] )*
 ```
 
-A floating-point literal needs digits on both sides of the `.`, so `1.` and
-`.5` are not literals. An exponent is allowed only after a fractional part:
-`1.5e3` is a `Float`, while `1e3` is the integer `1` followed by the
-identifier `e3`. A floating-point literal is always a `Float`.
+A floating-point literal is a decimal integer part followed by a fractional
+part, an exponent, or both. A fractional part needs digits on both sides of
+the `.`, so `1.` and `.5` are not literals. `_` separates digits here as it
+does in an integer literal. A floating-point literal is always a `Float`, even
+one with a whole value such as `1e3`.
 
 <!-- run -->
 ```kotlin
 fun main() {
     print(1.5e3)
     print(2.5E-2)
+    print(1e3)
+    print(6.022_140_76e23)
     print(0.1 + 0.2)
 }
 ```
@@ -136,13 +195,16 @@ fun main() {
 ```text
 1500.0
 0.025
+1000.0
+6.02214076e+23
 0.30000000000000004
 ```
 
 A `.` followed by a digit continues a number only when a digit comes before
 it as well. After a `.` that selects a field, digits are a
 [tuple projection](expressions.md#tuple-projection), so `pair.1.0` is two
-projections and not the number `1.0`.
+projections and not the number `1.0`. A projection's index is plain decimal,
+with no prefix, separator, exponent or leading zero.
 
 ### String literals
 

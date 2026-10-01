@@ -402,12 +402,15 @@ def test_verifier_detects_corruption(verifier_probe, case, diagnostic):
 @pytest.mark.parametrize("defect", ["native-roots", "children"])
 def test_broken_collector_is_stopped_before_sweeping(tmp_path, defect):
     source = tmp_path / "main.gob"
+    # Arrays in an array that grows, so that objects are reachable only
+    # through other heap objects while the program allocates.
     source.write_text('''
 fun main() {
-    let x = [42]
-    let y = [x]
-    let z = [y]
-    print(z[0][0][0])
+    var rows = []
+    for var i = 0; i < 3; i = i + 1 {
+        Array.push(rows, [i, i + 1])
+    }
+    print(rows[2][1] + 39)
 }
 ''')
     if toolchain.missing():

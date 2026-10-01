@@ -14,8 +14,9 @@ def allocator_object(tmp_path_factory):
     directory = tmp_path_factory.mktemp("allocator-exports")
     source = directory / "entry.gob"
     source.write_text("fun main() {}\n")
+    # Every `foreign` definition kept, since C is what calls them here.
     result = subprocess.run(
-        toolchain.command(bootc.binary(), "native", str(source)),
+        toolchain.command(bootc.binary(), "native", "--export-runtime", str(source)),
         cwd=bootc.REPO_ROOT, capture_output=True, text=True, check=True)
     # The probe supplies C's main. Keep the generated entry available but never
     # call it: allocator exports must work before literals/globals initialize.

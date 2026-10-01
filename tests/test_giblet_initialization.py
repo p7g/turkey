@@ -39,7 +39,10 @@ def modules(request, tmp_path):
 
 
 def compile_source(entry, env, command):
-    return subprocess.run(toolchain.command(bootc.binary(), command, str(entry)),
+    # The probes call the runtime's exports from C, which keeps them only in a
+    # build that exports every one.
+    flags = ["--export-runtime"] if command == "native" else []
+    return subprocess.run(toolchain.command(bootc.binary(), command, *flags, str(entry)),
                           cwd=bootc.REPO_ROOT, env=env,
                           capture_output=True, text=True)
 

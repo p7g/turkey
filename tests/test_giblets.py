@@ -359,7 +359,11 @@ def test_a_giblet_calling_a_giblet_holds_no_root(lowered):
 
 
 def test_the_first_giblet_module_lowers_clean():
+    # The giblet check runs on what lowers, and stops the compile if it
+    # objects. `Turkey.Memory`'s functions are small enough that the optimizer
+    # inlines every call to them and reachability then drops them, so what is
+    # checked here is their bodies inside `main`.
     stdout = bootc.boot("ssa", "tests/programs/giblets_memory.gob")
-    assert "fun @Turkey.Memory#fill(" in stdout
+    assert stdout.rstrip().endswith(" functions, 0 skipped"), stdout[-200:]
 
 

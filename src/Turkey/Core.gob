@@ -4,7 +4,7 @@ module Turkey.Core (
     openings,
     mkCore, tailParts, tailFieldNames,
     Mapper(..), mapKind, bindValue, altBody,
-    namesOf, namesInto,
+    namesOf, namesInto, codeAddressName,
     dictName, classOfDict, dictClass, isDictionary, methodField, methodBase,
     abstractionBinders,
     Aliases(..), newAliases, alias,
@@ -417,6 +417,33 @@ fun abstractionBinders(b : CBind) -> Array VarCell {
 
 fun discard(x : a) -> Unit = {}
 
+-- What `namesInto` reports a `Prim.codeAddress("symbol")` as. It uses the
+-- `foreign` definition with that C symbol as surely as a call would, but
+-- names the definition by its symbol rather than its binding, so it is
+-- reported under a name no binding has: `%` cannot start a source name.
+fun codeAddressName(symbol : String) -> String = "%codeAddress " + symbol
+
+-- The primitive is a `CPrim` or, as the resolver writes most of them, a
+-- `CVar` of its own name.
+fun codeAddressOf(fn : Core, args : Array Core) -> Option String {
+    let named = match untyped(fn).kind {
+        CPrim(name) -> name
+        CVar(name) -> name
+        _ -> ""
+    }
+    if named != "Prim.codeAddress" || len(args) != 1 { return None }
+    match untyped(args[0]).kind {
+        CLit(LString(symbol)) -> Some(symbol)
+        _ -> None
+    }
+}
+
+fun untyped(e : Core) -> Core = match e.kind {
+    CTyApp(inner, _) -> untyped(inner)
+    CTyLam(_, inner) -> untyped(inner)
+    _ -> e
+}
+
 fun namesOf(e : Core) -> Set.Set String {
     let out = Set.new()
     namesInto(e, out)
@@ -442,6 +469,10 @@ fun namesInto(e : Core, out : Set.Set String) -> Unit = match e.kind {
     CApp(fn, args) -> {
         namesInto(fn, out)
         for a in args { namesInto(a, out) }
+        match codeAddressOf(fn, args) {
+            Some(symbol) -> Set.add(out, codeAddressName(symbol))
+            None -> {}
+        }
     }
     CTyLam(_, body) -> namesInto(body, out)
     CTyApp(fn, _) -> namesInto(fn, out)

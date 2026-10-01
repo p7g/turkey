@@ -123,11 +123,13 @@ def test_a_single_variant_pattern_reads_no_tag():
 
     Reading the tag to compare it against the only value it can hold is a
     load, a compare and a branch on the hot path, and the arm it branches to
-    is unreachable.
+    is unreachable. `Data.Array`'s accessors are inlined wherever they are
+    used and then dropped, so the program is checked whole: an array is the
+    only sum it reads, and Option's two constructors are told apart without a
+    tag.
     """
     out = _ssa("stack.gob")
-    body = out.split("fun @Data.Array#state@Int")[1].split("\nfun ")[0]
-    assert "object.tag" not in body, body
+    assert "object.tag" not in out, out
 
 
 def test_the_environment_is_scoped():
@@ -227,7 +229,18 @@ def test_a_dictionary_is_allocated_before_its_fields():
 
 
 def test_a_lambda_becomes_a_lifted_function_and_a_closure():
-    out = _ssa("generalization.gob")
+    # Kept in an array, which the optimizer does not see through, so that the
+    # lambda is not inlined away; and capturing, so that it has an environment.
+    src = """
+    fun main() {
+        let n = 2
+        let fs = [fun(x : Int) = x * n]
+        print(fs[0](21))
+    }
+    """
+    result = lang.dump("ssa", src)
+    assert result.code == 0, result.stderr
+    out = result.stdout
     assert "closure.new @" in out
     assert "%lambda" in out
     # The environment remains traced; specialized scalar results stay raw.

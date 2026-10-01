@@ -55,6 +55,7 @@ import Turkey.Clean as Clean
 import Turkey.Sites as Sites
 import Turkey.Uncurry as Uncurry
 import Turkey.Opt as Opt
+import Turkey.Build as Build
 import Turkey.Target as Target
 import Turkey.Ast (Program(..), Decl(..), Stmt(..), StmtKind(..),
                    FunDecl(..), ClassDecl(..), patternVars)
@@ -71,6 +72,9 @@ fun libRoot() -> String = match Env.get("TURKEY_LIB") {
 
 -- What `--target` chose, for every file of this run.
 var target = Target.host()
+
+-- And what the other flags did (`Turkey.Build`).
+var build = Build.plain
 
 fun main() {
     let args = Env.args()
@@ -91,7 +95,10 @@ fun main() {
             }
             i = i + 1
         } else {
-            Array.push(paths, args[i])
+            match Build.flag(build, args[i]) {
+                Some(b) -> { build = b }
+                None -> Array.push(paths, args[i])
+            }
         }
     }
     if len(paths) == 0 { usage() }
@@ -210,7 +217,7 @@ fun dumpCore(b : String.Builder, path : String) -> Unit {
 -- does: always, on every program.
 fun lowered(checked : Checked) -> Core.CProgram {
     let lowerer = Lower.newLowerer(checked.decls, checked.classes, checked.env,
-                                   checked.types, target)
+                                   checked.types, target, build)
     let program = Lower.program(lowerer, checked.ordered, checked.owners)
     Coretc.checkProgram(checked.decls, checked.classes, program,
                         Coretc.globalsOf(checked.env))
@@ -227,7 +234,7 @@ fun dumpMono(b : String.Builder, path : String) -> Unit {
     let program = lowered(checked)
     let main = Map.getOr(entry.scope.values, "main", "main")
     let specialized = Mono.monomorphize(program, checked.decls, checked.classes,
-                                        main)
+                                        main, roots(checked))
     Coretc.checkProgram(checked.decls, checked.classes, specialized,
                         Coretc.globalsOf(checked.env))
     String.push(b, Core.showProgram(specialized, Some(entry.name)))
@@ -254,10 +261,13 @@ fun optimized(checked : Checked, entry : Modules.Module) -> Core.CProgram {
     let program = lowered(checked)
     let main = Map.getOr(entry.scope.values, "main", "main")
     let specialized = Mono.monomorphize(program, checked.decls, checked.classes,
-                                        main)
-    let reduced = Opt.reduceProgram(
+                                        main, roots(checked))
+    -- Reachability again, now that the reductions have inlined calls away and
+    -- folded the branches a constant decides: what only they reached is dead.
+    let reduced = Mono.reachable(Opt.reduceProgram(
         Joins.discover(Opt.reduceProgram(specialized, checked.decls)),
-        checked.decls)
+        checked.decls), main, roots(checked), checked.decls.definitions,
+        prunable(checked, Giblets.gibletModules(), _))
     Coretc.checkProgram(checked.decls, checked.classes, reduced,
                         Coretc.globalsOf(checked.env))
     -- Family applications reduced before the layouts are decided, since a stuck
@@ -284,6 +294,21 @@ fun optimized(checked : Checked, entry : Modules.Module) -> Core.CProgram {
     }
     out
 }
+
+-- Whether reachability after the optimizer may drop a binding: one from the
+-- library or the implementation (`Turkey.*`). A program's own functions stay
+-- whole, for the dumps that show them and for the giblet check, which judges
+-- each function a giblet module defines -- and so does a giblet module a test
+-- names, which comes from the library but is the test's own program.
+fun prunable(checked : Checked, giblets : Set.Set String, b : Core.CBind) -> Bool {
+    let implementation = String.startsWith(b.module_, "Turkey.")
+    if !implementation && !Set.contains(checked.library, b.module_) { return False }
+    implementation || !Set.contains(giblets, b.module_)
+}
+
+-- What reachability starts from besides `main` (`Mono.runtimeRoots`).
+fun roots(checked : Checked) -> Array String =
+    Mono.runtimeRoots(checked.decls, build.exportRuntime)
 
 -- Everything a compile checks, and no dump: the front end, the elaboration and
 -- every check on the Core after it. What it prints is the warnings, on stderr;
@@ -760,6 +785,8 @@ type Checked = Checked {
     ordered  : Array Stmt,
     owners   : Map Int String,
     warnings : Array String,
+    -- The modules that came from the shipped library.
+    library  : Set.Set String,
 }
 
 fun checkProgram(path : String) -> (Checked, Modules.Module) {
@@ -770,9 +797,11 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
             Decls.newDeclTable()),
         env = Constraints.childEnv(initialEnv()), types = Typed.newTypeTable(),
         ordered = Array.new(32), owners = Map.new(), warnings = Array.new(4),
+        library = Set.new(),
     }
     checked.classes = Classes.newClassTable(checked.decls)
     for m in modules {
+        if m.library { Set.add(checked.library, m.name) }
         let g = Infer.newGenerator(checked.decls, checked.env, checked.classes,
                                    m.name, checked.types)
         let (items, constraint) = Infer.generate(g, m.program)
@@ -934,7 +963,8 @@ fun readOrDie(path : String) -> Source = match Source.read(path) {
 fun usage() -> a =
     die("usage: boot "
         + "<decls|classes|types|core|mono|opt"
-        + "|ssa|asm|native|check> [--target TARGET] FILE...")
+        + "|ssa|asm|native|check> [--target TARGET] [--gc-verify] [--gc-stats]"
+        + " [--export-runtime] FILE...")
 
 fun die(message : String) -> a {
     IO.stderr("boot: " + message + "\n")

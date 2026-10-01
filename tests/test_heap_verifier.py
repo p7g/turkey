@@ -429,7 +429,8 @@ fun main() {
         after = before + "        if !Prim.ptrIsNull(object) { continue }\n"
     assert text.count(before) == 1, before
     heap.write_text(text.replace(before, after))
-    result = subprocess.run(toolchain.command(bootc.binary(), "native", str(source)),
+    result = subprocess.run(toolchain.command(bootc.binary(), "native", "--gc-verify",
+                                              str(source)),
                             cwd=bootc.REPO_ROOT, capture_output=True, text=True,
                             check=True, env=dict(os.environ, TURKEY_LIB=str(library)))
     generated = tmp_path / "main.s"
@@ -439,7 +440,7 @@ fun main() {
                     "-o", str(binary)],
                    capture_output=True, text=True, check=True)
     result = subprocess.run(toolchain.command(binary), capture_output=True, text=True, timeout=20,
-                            env=dict(os.environ, TURKEY_GC_STRESS="1", TURKEY_GC_VERIFY="1"))
+                            env=dict(os.environ, TURKEY_GC_STRESS="1"))
     assert result.returncode == 1, result.stderr
     assert "heap verifier: reachable object is unmarked" in result.stderr
     assert "42" not in result.stdout

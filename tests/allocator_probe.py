@@ -7,8 +7,7 @@ import pytest
 from tests import bootc, toolchain
 
 
-@pytest.fixture(scope="module")
-def allocator_object(tmp_path_factory):
+def _exports(tmp_path_factory, *flags: str):
     if toolchain.missing():
         pytest.skip("C compiler unavailable")
     directory = tmp_path_factory.mktemp("allocator-exports")
@@ -16,7 +15,8 @@ def allocator_object(tmp_path_factory):
     source.write_text("fun main() {}\n")
     # Every `foreign` definition kept, since C is what calls them here.
     result = subprocess.run(
-        toolchain.command(bootc.binary(), "native", "--export-runtime", str(source)),
+        toolchain.command(bootc.binary(), "native", "--export-runtime", *flags,
+                          str(source)),
         cwd=bootc.REPO_ROOT, capture_output=True, text=True, check=True)
     # The probe supplies C's main. Keep the generated entry available but never
     # call it: allocator exports must work before literals/globals initialize.
@@ -28,3 +28,21 @@ def allocator_object(tmp_path_factory):
     subprocess.run([*toolchain.cc(), "-c", str(generated), "-o", str(output)],
                    check=True, capture_output=True, text=True)
     return output
+
+
+@pytest.fixture(scope="module")
+def allocator_object(tmp_path_factory):
+    return _exports(tmp_path_factory)
+
+
+# With the collector's statistics compiled in, for a probe that reads them.
+@pytest.fixture(scope="module")
+def stats_object(tmp_path_factory):
+    return _exports(tmp_path_factory, "--gc-stats")
+
+
+# With the heap verifier compiled in and on, for a probe that wants every
+# collection checked.
+@pytest.fixture(scope="module")
+def verify_object(tmp_path_factory):
+    return _exports(tmp_path_factory, "--gc-verify")

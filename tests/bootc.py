@@ -220,7 +220,8 @@ def replace_built(command: list[str], output: Path) -> None:
 
 
 def boot_each(command: str, paths: list[Path],
-              split: Callable[[str, list[Path]], list[str]]) -> dict[Path, str]:
+              split: Callable[[str, list[Path]], list[str]],
+              flags: tuple[str, ...] = ()) -> dict[Path, str]:
     """`boot <command>` over some programs, cached on disk per program.
 
     On disk rather than in an `lru_cache`: a cache per *process* means that
@@ -239,8 +240,10 @@ def boot_each(command: str, paths: list[Path],
     across both made every corpus test wait for the compiler. The locks are
     taken in path order, so two workers wanting overlapping sets cannot
     deadlock. `split` cuts the run's output into one text per path, in order.
+    `flags` go to `boot` before the paths (`--gc-verify`), and into the key.
     """
-    directory = Path(tempfile.gettempdir()) / "turkey-bootout" / _build_key() / command
+    directory = (Path(tempfile.gettempdir()) / "turkey-bootout" / _build_key()
+                 / " ".join((command, *flags)))
     directory.mkdir(parents=True, exist_ok=True)
 
     def entry(path: Path) -> Path:
@@ -268,7 +271,7 @@ def boot_each(command: str, paths: list[Path],
             fcntl.flock(lock, fcntl.LOCK_EX)
         found, missing = load()
         if missing:
-            text = boot(command, *(str(path) for path in missing))
+            text = boot(command, *flags, *(str(path) for path in missing))
             chunks = split(text, missing)
             assert len(chunks) == len(missing), (
                 f"{len(chunks)} dumps for {len(missing)} programs")

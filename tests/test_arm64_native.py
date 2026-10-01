@@ -48,21 +48,21 @@ def _split(text: str, paths: list[Path]) -> list[str]:
 
 
 @functools.lru_cache(maxsize=None)
-def _all() -> dict[str, str]:
+def _all(flags: tuple[str, ...] = ()) -> dict[str, str]:
     """Every corpus program's assembly, from one `boot` process.
 
     Starting `boot` costs minutes and compiling a program costs a moment, so
     one process per program turns the corpus into an hour.
     """
     paths = [PROGRAMS / name for name in CORPUS]
-    texts = bootc.boot_each("native", paths, _split)
+    texts = bootc.boot_each("native", paths, _split, flags)
     return {path.name: texts[path] for path in paths}
 
 
 @functools.lru_cache(maxsize=None)
-def _binary(name: str) -> Path:
+def _binary(name: str, flags: tuple[str, ...] = ()) -> Path:
     """One program, assembled and linked, cached by what it was built from."""
-    assembly = _all()[name].encode("utf-8")
+    assembly = _all(flags)[name].encode("utf-8")
     output = CACHE / f"{Path(name).stem}-arm64-{_digest(assembly, toolchain.identity())}.bin"
     if not output.exists():
         CACHE.mkdir(parents=True, exist_ok=True)
@@ -118,13 +118,13 @@ def test_the_corpus_agrees_under_gc_stress(name, generational):
 
     Once with every collection full, and once with seven in eight minor, where
     a store the write barrier missed frees a young object that is still
-    reachable.
+    reachable. Compiled with the heap verifier, which checks every collection.
     """
-    env = dict(os.environ, TURKEY_GC_STRESS="1", TURKEY_GC_VERIFY="1",
-               TURKEY_GC_GENERATIONAL=generational)
+    env = dict(os.environ, TURKEY_GC_STRESS="1", TURKEY_GC_GENERATIONAL=generational)
     # From the program's own directory, as `test_programs` runs it: a program
     # may read a file by its bare name (`system.gob`).
-    result = subprocess.run(toolchain.command(_binary(name)), cwd=PROGRAMS,
+    result = subprocess.run(toolchain.command(_binary(name, ("--gc-verify",))),
+                            cwd=PROGRAMS,
                             capture_output=True, text=True, env=env)
     assert result.returncode == 0, result.stderr[:2000]
     assert result.stdout == lang.output(PROGRAMS / name), (

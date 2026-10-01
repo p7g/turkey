@@ -138,7 +138,7 @@ def _entry(src: Source, modules: dict[str, str] | None) -> Path:
     return program(src, modules)
 
 
-def _key(command: str, entry: Path) -> str:
+def _key(command: str, entry: Path, flags: tuple[str, ...] = ()) -> str:
     """The cache key for `boot <command>` on `entry`.
 
     The entry's own bytes and every `.gob` beside and below it, which is what
@@ -149,7 +149,7 @@ def _key(command: str, entry: Path) -> str:
     """
     h = hashlib.sha256()
     h.update(bootc.build_key().encode())
-    h.update(command.encode())
+    h.update(" ".join((command, *flags)).encode())
     h.update(str(entry).encode())
     sources = ([entry] if entry.parent == CORPUS
                else sorted(entry.parent.rglob("*.gob")))
@@ -166,9 +166,10 @@ def _key(command: str, entry: Path) -> str:
     return h.hexdigest()[:24]
 
 
-def _boot(command: str, entry: Path) -> subprocess.CompletedProcess[bytes]:
+def _boot(command: str, entry: Path,
+          flags: tuple[str, ...] = ()) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
-        toolchain.command(bootc.binary(), command, entry.name),
+        toolchain.command(bootc.binary(), command, *flags, entry.name),
         cwd=entry.parent,
         env=dict(os.environ, TURKEY_LIB=str(LIB)),
         capture_output=True,
@@ -176,9 +177,10 @@ def _boot(command: str, entry: Path) -> subprocess.CompletedProcess[bytes]:
     )
 
 
-def _cached(command: str, entry: Path, build) -> _Compiled:
+def _cached(command: str, entry: Path, build,
+            flags: tuple[str, ...] = ()) -> _Compiled:
     """One compile, done once per key under a lock and kept on disk."""
-    directory = WORK / "out" / _key(command, entry)
+    directory = WORK / "out" / _key(command, entry, flags)
     status = directory / "status.json"
 
     def load() -> _Compiled | None:
@@ -206,9 +208,9 @@ def _cached(command: str, entry: Path, build) -> _Compiled:
     return found
 
 
-def _native(entry: Path) -> _Compiled:
+def _native(entry: Path, flags: tuple[str, ...] = ()) -> _Compiled:
     def build(directory: Path) -> tuple[int, str]:
-        result = _boot("native", entry)
+        result = _boot("native", entry, flags)
         stderr = result.stderr.decode("utf-8")
         if result.returncode != 0:
             return result.returncode, stderr
@@ -228,7 +230,7 @@ def _native(entry: Path) -> _Compiled:
         finally:
             source.unlink(missing_ok=True)
         return 0, stderr
-    return _cached("native", entry, build)
+    return _cached("native", entry, build, flags)
 
 
 def _checked(entry: Path) -> _Compiled:
@@ -248,8 +250,11 @@ def check(src: Source, modules: dict[str, str] | None = None) -> str:
 
 def run(src: Source, modules: dict[str, str] | None = None,
         args: tuple[str, ...] = (), stdin: str | None = None,
-        env: dict[str, str] | None = None, cwd: Path | None = None) -> Result:
+        env: dict[str, str] | None = None, cwd: Path | None = None,
+        flags: tuple[str, ...] = ()) -> Result:
     """Compile and run. Raises `CompileError` if it does not compile.
+
+    `flags` are `boot`'s, for the compile: `--gc-verify`, `--gc-stats`.
 
     The program runs in its own directory unless `cwd` says otherwise -- which
     a program that writes files should, since the directory a source string is
@@ -259,7 +264,7 @@ def run(src: Source, modules: dict[str, str] | None = None,
     prints is not rewritten as a newline on the way.
     """
     entry = _entry(src, modules)
-    compiled = _native(entry)
+    compiled = _native(entry, flags)
     if compiled.code != 0 or compiled.binary is None:
         raise CompileError(compiled.stderr, compiled.code)
     result = subprocess.run(

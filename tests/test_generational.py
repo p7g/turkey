@@ -1,9 +1,10 @@
 """Minor collections: an old object given a young one keeps it alive only if
 the write barrier remembered the old one.
 
-Each program runs with `TURKEY_GC_GENERATIONAL=1 TURKEY_GC_STRESS=1
-TURKEY_GC_VERIFY=1`: a collection at every allocation, seven minor ones in
-every eight, and the heap verified around each. A store the barrier missed
+Each program is compiled with `--gc-verify` and runs with
+`TURKEY_GC_GENERATIONAL=1 TURKEY_GC_STRESS=1`: a collection at every
+allocation, seven minor ones in every eight, and the heap verified around
+each. A store the barrier missed
 shows up as the verifier's "old object holds a young one and is not
 remembered", or, if the verifier missed it too, as a young object freed while
 reachable and output that differs from the plain run.
@@ -18,13 +19,13 @@ import pytest
 from tests import bootc, lang, toolchain
 from tests.test_escape import ESCAPES, READERS
 
-GENERATIONAL = {"TURKEY_GC_GENERATIONAL": "1", "TURKEY_GC_STRESS": "1",
-                "TURKEY_GC_VERIFY": "1"}
+GENERATIONAL = {"TURKEY_GC_GENERATIONAL": "1", "TURKEY_GC_STRESS": "1"}
+VERIFY = ("--gc-verify",)
 
 
 def _agrees(src: str) -> None:
     plain = lang.output(src)
-    result = lang.run(src, env=GENERATIONAL)
+    result = lang.run(src, env=GENERATIONAL, flags=VERIFY)
     assert result.code == 0, result.stderr
     assert result.stdout == plain
 
@@ -90,7 +91,8 @@ def test_a_barrier_that_remembers_nothing_is_caught(tmp_path):
     heap.write_text(text.replace(before, "    return {}\n"))
     source = tmp_path / "main.gob"
     source.write_text(CONTAINERS)
-    result = subprocess.run(toolchain.command(bootc.binary(), "native", str(source)),
+    result = subprocess.run(toolchain.command(bootc.binary(), "native", *VERIFY,
+                                              str(source)),
                             cwd=bootc.REPO_ROOT, capture_output=True, text=True,
                             check=True, env=dict(os.environ, TURKEY_LIB=str(library)))
     generated = tmp_path / "main.s"

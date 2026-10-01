@@ -6,11 +6,11 @@ import subprocess
 import pytest
 
 from tests import bootc, toolchain
-from tests.allocator_probe import allocator_object
+from tests.allocator_probe import allocator_object, stats_object, verify_object
 
 
 @pytest.fixture(scope="module")
-def gc_probe(tmp_path_factory, allocator_object):
+def gc_probe(tmp_path_factory, stats_object):
     if toolchain.missing():
         pytest.skip("C compiler unavailable")
     directory = tmp_path_factory.mktemp("gc-probe")
@@ -31,14 +31,14 @@ int main(int argc, char **argv) {
     binary = directory / "probe"
     subprocess.run([*toolchain.cc(), "-std=c11",
                     "-I", str(bootc.PROBE_INCLUDE),
-                    str(source), str(allocator_object),
+                    str(source), str(stats_object),
                     "-lm", "-pthread", "-o", str(binary)], check=True,
                    capture_output=True, text=True)
     return binary
 
 
 def probe(binary, scale="2", *args):
-    env = dict(os.environ, TURKEY_GC_STATS="1", TURKEY_GC_THRESHOLD_SCALE=scale)
+    env = dict(os.environ, TURKEY_GC_THRESHOLD_SCALE=scale)
     env.pop("TURKEY_GC_STRESS", None)
     result = subprocess.run(toolchain.command(binary, *args), env=env,
                             capture_output=True, text=True, check=True)
@@ -70,7 +70,7 @@ def test_allocation_kinds_and_options_survive_stress_override(gc_probe, args):
 
 
 @pytest.fixture(scope="module")
-def region_probe(tmp_path_factory, allocator_object):
+def region_probe(tmp_path_factory, verify_object):
     if toolchain.missing():
         pytest.skip("C compiler unavailable")
     toolchain.needs_sanitizer()
@@ -157,15 +157,14 @@ int main(void) {
     binary = directory / "probe"
     subprocess.run([*toolchain.cc(), "-std=c11",
                     "-O1", "-fsanitize=undefined",
-                    "-I", str(bootc.PROBE_INCLUDE), str(source), str(allocator_object), "-lm", "-pthread",
+                    "-I", str(bootc.PROBE_INCLUDE), str(source), str(verify_object), "-lm", "-pthread",
                     "-o", str(binary)], check=True, capture_output=True, text=True)
     return binary
 
 
 @pytest.mark.parametrize("stress", [False, True])
 def test_regions_reuse_holes_and_reclaim_small_and_large_objects(region_probe, stress):
-    env = dict(os.environ, TURKEY_GC_VERIFY="1")
-    env.pop("TURKEY_GC_STATS", None)
+    env = dict(os.environ)
     env.pop("TURKEY_GC_STRESS", None)
     if stress:
         env["TURKEY_GC_STRESS"] = "1"

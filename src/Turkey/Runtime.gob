@@ -3,7 +3,8 @@ module Turkey.Runtime (
     processState, processStateBytes, voidSymbols, immediates,
     headerBytes, headerGeneration, headerSize, headerKind, young, heapObject, heapCell,
     cursorsGlobal, cursorBytes, cursorFree, cursorBase, cursorSlot, sizeClass, classSlot,
-    classesGlobal, classStep, fastPayload, referencedSymbols,
+    classesGlobal, classStep, fastPayload, referencedSymbols, swapStackSymbol,
+    runningGlobal, stackParked,
 )
 
 -- The interface shared by generated code and the runtime.
@@ -186,7 +187,12 @@ let referencedSymbols = [
 -- language's unit and must not be spelled as it: a `void` function writes no
 -- result register, so whatever the call's result is read as, it has to be
 -- made rather than read (`Turkey.Select.call`).
-type Entry = Entry { symbol : String, result : Option RepClass }
+--
+-- `switchesStacks` marks the one entry point that does not return to its
+-- caller's stack: it parks the caller and resumes another, so the code that
+-- runs before it returns is anyone's, and a call to it preserves no register
+-- (`Turkey.Arm64.PreservesNone`).
+type Entry = Entry { symbol : String, result : Option RepClass, switchesStacks : Bool }
 
 -- Primitive name to runtime entry point.
 --
@@ -201,7 +207,25 @@ fun entryPoint(name : String) -> Option Entry {
     None
 }
 
-let entries = [("Prim.exit", Entry { symbol = "turkey_exit", result = None })]
+let entries = [
+    ("Prim.exit", Entry { symbol = "turkey_exit", result = None, switchesStacks = False }),
+    ("Prim.swapStack",
+     Entry { symbol = swapStackSymbol, result = None, switchesStacks = True }),
+]
+
+-- -- stacks -------------------------------------------------------------------------
+
+-- `Prim.swapStack(from, to)`: park the running stack on `from` and resume
+-- `to`. The code is the compiler's own, written once per program by
+-- `Turkey.Emit.emitSwapStack`, because what it does is move `sp` and `x29`,
+-- which no Turkey function can.
+let swapStackSymbol = "turkey_swap_stack"
+
+-- `Turkey.Heap`'s record of the stack the mutator is running on, which the
+-- switch updates, and the word of a stack record that holds the frame record
+-- it was parked at: `Turkey.Heap.stackParked`.
+let runningGlobal = "Turkey.Heap#running"
+let stackParked = 8
 
 -- The entry points C declares `void`. A caller reading their result register
 -- reads whatever the callee last left there.

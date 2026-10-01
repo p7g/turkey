@@ -1,5 +1,6 @@
 module Turkey.Emit (
     emitFunc, emitMessages, emitData, emitEntry, emitFrameTable, emitDefinitions,
+    emitSwapStack,
 )
 
 -- One allocated function as arm64 code: a stream of instructions, labels and
@@ -773,6 +774,45 @@ fun byIndex(table : Map.Map String Int) -> Array String {
 }
 
 -- -- the entry sequence ------------------------------------------------------
+
+-- `turkey_swap_stack(from, to)`, the code `Prim.swapStack` calls: park the
+-- running stack on the stack record in `x0` and resume the one in `x1`.
+--
+-- Parking pushes a frame record, the caller's `x29` and the return address
+-- the `bl` left in `x30`, and stores its address in `from`'s parked word.
+-- That record has exactly the shape a call leaves, so the collector's walk
+-- of a parked stack starts there and finds the caller's roots through the
+-- frame table entry of the return address, as at any call site; and resuming
+-- is the same steps the other way round, ending in a `ret` to the return
+-- address the other stack parked with.
+--
+-- It saves no register but the record: the call preserves none
+-- (`A.PreservesNone`), so the caller has already put everything it needs
+-- after the call in its frame. `Heap.running` changes here and nowhere else,
+-- between the two stacks, so nothing that can collect ever sees it name the
+-- wrong one. `x16` and `x17` are the scratch registers, which the allocator
+-- never hands out.
+fun emitSwapStack(asm : Asm.Asm, b : Code) -> Unit {
+    let d = asm.dialect
+    let x1 = Physical(Gp, 1)
+    let x16 = Physical(Gp, 16)
+    emit(b, Section(Asm.Text))
+    function(b, Asm.runtimeFor(d, Rt.swapStackSymbol))
+    instruction(b, A.SubImm(A.sp, A.sp, 16, A.W64))
+    instruction(b, A.Str(A.fp, Offset(A.sp, 0), A.W64))
+    instruction(b, A.Str(A.lr, Offset(A.sp, 8), A.W64))
+    instruction(b, A.AddImm(x16, A.sp, 0, A.W64))
+    instruction(b, A.Str(x16, Offset(A.x0, Rt.stackParked), A.W64))
+    symbolInto(b, x16, Asm.globalSymbol(d, Rt.runningGlobal))
+    instruction(b, A.Str(x1, Offset(x16, 0), A.W64))
+    instruction(b, A.Ldr(x16, Offset(x1, Rt.stackParked), A.W64))
+    instruction(b, A.Str(A.xzr, Offset(x1, Rt.stackParked), A.W64))
+    instruction(b, A.AddImm(A.sp, x16, 0, A.W64))
+    instruction(b, A.Ldr(A.fp, Offset(A.sp, 0), A.W64))
+    instruction(b, A.Ldr(A.lr, Offset(A.sp, 8), A.W64))
+    instruction(b, A.AddImm(A.sp, A.sp, 16, A.W64))
+    instruction(b, A.Ret)
+}
 
 -- What has to happen before the program's own code, and `main`.
 --

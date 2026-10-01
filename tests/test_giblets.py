@@ -292,6 +292,35 @@ def test_a_call_that_allocates_is_refused_with_the_path_to_it(lowered):
                      stderr), stderr
 
 
+def test_a_stack_switch_is_refused(lowered):
+    """A giblet may run while the heap is half marked, and another stack's
+    code may allocate: a switch in one would let it."""
+    code, _, stderr = lowered(
+        "fun f(n : Int) -> Int {\n"
+        "    Prim.swapStack(Prim.ptrNull(), Prim.ptrNull())\n"
+        "    n\n"
+        "}\n",
+        "fun h(n : Int) -> Int = n\n")
+    assert code != 0
+    assert "giblets: f is in a giblet module and may allocate: @f " \
+           "switches stacks, and the code it switches to may allocate" \
+           in stderr, stderr
+
+
+def test_a_stack_switch_in_a_callee_is_refused_with_the_path_to_it(lowered):
+    code, _, stderr = lowered(
+        "fun f(n : Int) -> Int = H.h(n)\n",
+        # Recursive, so the call survives to the Low IR.
+        "fun h(n : Int) -> Int {\n"
+        "    if n == 0 { Prim.swapStack(Prim.ptrNull(), Prim.ptrNull()) }\n"
+        "    else { let _ = h(n - 1) }\n"
+        "    n\n"
+        "}\n")
+    assert code != 0
+    assert re.search(r"@f calls @h \([^)]*\), which switches stacks", stderr), \
+        stderr
+
+
 # The allocations nobody writes: each helper names nothing traced, and each
 # lowers to an allocation its source does not spell. Recursive, so each stays a call; the line is where the
 # construct the diagnostic should point at is written.

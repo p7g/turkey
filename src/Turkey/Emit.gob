@@ -1,6 +1,6 @@
 module Turkey.Emit (
     emitFunc, emitMessages, emitData, emitEntry, emitFrameTable, emitDefinitions,
-    emitSwapStack,
+    emitSwapStack, emitStackStart,
 )
 
 -- One allocated function as arm64 code: a stream of instructions, labels and
@@ -814,6 +814,30 @@ fun emitSwapStack(asm : Asm.Asm, b : Code) -> Unit {
     instruction(b, A.Ret)
 }
 
+-- `turkey_stack_start`, where a new coroutine stack's first switch lands:
+-- `Turkey.Heap.stackNew` parks the stack with a return into here, `x29` at
+-- the stack's outermost frame record and `sp` at a word naming the stack's
+-- own record.
+--
+-- It calls `Turkey.Coroutine#start` as a direct call is made, with no
+-- environment, and when that returns -- the body finished, or a panic
+-- unwound to the bottom of the stack -- switches to the stack that resumed
+-- this one, for the last time: nothing resumes a stack whose body has
+-- returned, and the `brk` says so if something does. `sp` is where it was on
+-- the way in, since the callee restores it, so the word is still there.
+fun emitStackStart(asm : Asm.Asm, b : Code) -> Unit {
+    let d = asm.dialect
+    let x1 = Physical(Gp, 1)
+    emit(b, Section(Asm.Text))
+    function(b, Asm.runtimeFor(d, Rt.stackStartSymbol))
+    instruction(b, A.Mov(A.x0, A.xzr, A.W64))
+    instruction(b, A.Bl(Asm.symbolFor(d, Rt.coroutineStart), A.Standard))
+    instruction(b, A.Ldr(A.x0, Offset(A.sp, 0), A.W64))
+    instruction(b, A.Ldr(x1, Offset(A.x0, Rt.stackResumedBy), A.W64))
+    call(b, d, Rt.swapStackSymbol)
+    instruction(b, A.Brk(1))
+}
+
 -- What has to happen before the program's own code, and `main`.
 --
 -- Giblet globals are computed before root registration and allocation. Then
@@ -841,10 +865,11 @@ fun emitEntry(asm : Asm.Asm, m : Module, main : String, sites : Int,
     instruction(b, A.Ldr(A.x0, Offset(A.x0, 0), A.W64))
     instruction(b, A.Cbnz(A.x0, Asm.localLabel(d, "entry_done"), A.W64))
 
-    -- The outer bound of every walk of the Turkey stack is this frame: every
-    -- frame the program makes is below it, and its own roots are the globals
-    -- frame's, not a table entry's. Recorded after early initialization, which
-    -- is what sets up the state the bound is stored in.
+    -- The outer bound of every walk of the program's own stack is this frame:
+    -- every frame the program makes on it is below it, and its own roots are
+    -- the globals frame's, not a table entry's. Recorded after early
+    -- initialization, which is what sets up the state the bound is stored in.
+    -- A coroutine's stack has a bound of its own (`Turkey.Heap.stackNew`).
     instruction(b, A.Mov(A.x0, Physical(Gp, 29), A.W64))
     call(b, d, "turkey_entry_stack_set")
 

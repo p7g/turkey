@@ -1,0 +1,88 @@
+module Turkey.Coroutine (Coroutine, new, resume, suspend, finished)
+
+-- Coroutines: a function run on a stack of its own, which can stop part way
+-- through -- at any depth of ordinary calls -- and be continued later.
+--
+-- Asymmetric: `resume` runs a coroutine until it calls `suspend` or its body
+-- returns, and either one comes back to whoever resumed it. Nothing is passed
+-- across a switch; what the two sides tell each other goes through the
+-- coroutine object or other heap objects, where its type is checked.
+--
+-- One worker. `current` is a global, which is only right while one thread
+-- runs Turkey code.
+--
+-- A stack's frames are the collector's roots for as long as it is
+-- registered, which is until its body returns. A coroutine that is never
+-- resumed to the end keeps its stack and everything its frames hold.
+
+import Prelude ()
+import Std.Classes
+import Data.Bool.Type (Bool(..))
+import Data.Option (Option(..))
+import Turkey.Heap as Heap
+
+type Coroutine = Coroutine {
+    -- `Turkey.Heap`'s record of this coroutine's stack.
+    stack    : Prim.Ptr,
+    body     : fun() -> Unit,
+    running  : Bool,
+    finished : Bool,
+}
+
+-- The coroutine whose stack is running, if any.
+var current : Option Coroutine = None
+
+-- Chosen without measurement. Reserved, not resident: only the pages a
+-- coroutine touches cost memory.
+let stackBytes = 1048576
+
+fun new(body : fun() -> Unit) -> Coroutine = Coroutine {
+    stack = Heap.stackNew(stackBytes),
+    body = body,
+    running = False,
+    finished = False,
+}
+
+fun finished(c : Coroutine) -> Bool = c.finished
+
+-- Run `c` until it suspends or finishes.
+fun resume(c : Coroutine) -> Unit {
+    if c.finished { return Prim.error("resumed a finished coroutine") }
+    -- A running coroutine is suspended inside every coroutine that resumed it
+    -- in turn, so resuming it again would run one stack twice.
+    if c.running { return Prim.error("resumed a running coroutine") }
+    let previous = current
+    let here = Heap.runningStack()
+    Heap.stackResumerSet(c.stack, here)
+    c.running = True
+    current = Some(c)
+    Prim.swapStack(here, c.stack)
+    current = previous
+    if c.finished { Heap.stackFree(c.stack) }
+}
+
+-- Give control back to whoever resumed the running coroutine; this returns
+-- when something resumes it again.
+fun suspend() -> Unit = match current {
+    None -> Prim.error("suspended outside a coroutine")
+    Some(c) -> {
+        c.running = False
+        Prim.swapStack(c.stack, Heap.stackResumer(c.stack))
+    }
+}
+
+-- What a coroutine's stack runs first, called by `turkey_stack_start`
+-- (`Turkey.Emit.emitStackStart`) the first time the stack is switched to.
+-- When this returns, that code switches back to the resumer for the last
+-- time. It does so even when the body panics: a panic returns from every
+-- call until it reaches the bottom of the stack, and the switch carries it on
+-- to the resumer, which goes on unwinding, so a panic in a coroutine ends the
+-- program as one anywhere does.
+fun start() -> Unit = match current {
+    Some(c) -> {
+        c.body()
+        c.running = False
+        c.finished = True
+    }
+    None -> Prim.error("a coroutine stack started with no coroutine")
+}

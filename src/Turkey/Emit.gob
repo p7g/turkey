@@ -2,7 +2,8 @@ module Turkey.Emit (
     emitFunc, emitMessages, emitData, emitEntry, emitFrameTable, emitDefinitions,
 )
 
--- One allocated function as arm64 assembly.
+-- One allocated function as arm64 code: a stream of instructions, labels and
+-- data (`Turkey.Stream`), which the assembly printer and the encoder both read.
 --
 -- **Nothing here rewrites anything.** Selection built the instructions, the
 -- allocator chose the registers and `Turkey.Frame` placed the slots; this
@@ -20,9 +21,9 @@ module Turkey.Emit (
 --   one: a `cset` that ends a block and feeds only its `branch` is the
 --   branch's condition, and the pair prints as a `b.cond`.
 --
--- `as` is the oracle. Every instruction this prints is one the system
--- assembler either accepts or refuses, which is what a text printer buys even
--- once an encoder emits the bytes directly.
+-- `as` is the oracle. Every instruction here is a value the printer spells and
+-- the encoder encodes, and the system assembler, given the spelling, either
+-- agrees with the encoding or refuses the text.
 
 import Data.Map as Map
 import Turkey.Arm64 as A
@@ -37,6 +38,9 @@ import Turkey.Ssa (Value(..), BlockId(..), Term(..), Func(..), Block(..), Rep(..
                    RepClass(..))
 import Turkey.SsaLower as SsaLower
 import Turkey.SsaLower (Module(..))
+import Turkey.Stream (Item(..))
+
+type Code = Array (Item Inst)
 
 -- `x16` and `x17` are the allocator's reserved scratch (`Turkey.Regalloc`'s
 -- `gpPool`), which is what makes them safe here: a large offset, a frame too
@@ -56,28 +60,24 @@ let widestAddend = 4095
 -- The largest immediate `add` and `sub` take without a shift.
 let widestImmediate = 4095
 
-fun line(b : String.Builder, text : String) -> Unit {
-    String.push(b, text)
-    String.push(b, "\n")
-}
+fun emit(b : Code, item : Item Inst) -> Unit = Array.push(b, item)
 
-fun instruction(b : String.Builder, op : A.Arm) -> Unit =
-    line(b, "    " + show(Inst { op = op }))
+fun instruction(b : Code, op : A.Arm) -> Unit = emit(b, Instruction(Inst { op = op }))
 
 fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
-             l : Frame.Layout, tag : Int, b : String.Builder) -> Unit {
+             l : Frame.Layout, tag : Int, b : Code) -> Unit {
     let d = asm.dialect
-    function(b, d, Asm.symbolFor(d, f.name))
+    function(b, Asm.symbolFor(d, f.name))
     prologue(b, l)
     -- Reverse postorder, so a block's most likely successor is the next block
     -- and its edge costs no instruction at all.
     let order = Ssa.reversePostorder(f)
     let reads = useCounts(f)
-    let cold = Cold { text = String.builder(), count = 0 }
+    let cold = Cold { text = [], count = 0 }
     for var k = 0; k < len(order); k = k + 1 {
         let at = Ssa.blockId(order[k])
         let next = if k + 1 < len(order) { Ssa.blockId(order[k + 1]) } else { -1 }
-        line(b, blockLabel(d, tag, at) + ":")
+        emit(b, Label(blockLabel(d, tag, at)))
         let block = f.blocks[at]
         match fused(block, reads) {
             Some((c, yes, no)) -> {
@@ -90,7 +90,7 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
             }
         }
     }
-    String.push(b, String.build(cold.text))
+    for item in cold.text { emit(b, item) }
 }
 
 -- The first `upTo` instructions of a block.
@@ -99,7 +99,7 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
 -- that position is its stub's call, so the label goes into the stub. One that
 -- nothing is live across has no map, and the next map belongs to something
 -- else.
-fun emitInsts(b : String.Builder, cold : Cold, d : Asm.Dialect, f : Func Inst,
+fun emitInsts(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
               a : Regalloc.Allocation, l : Frame.Layout, tag : Int,
               insts : Array Inst, upTo : Int) -> Unit {
     for var n = 0; n < upTo; n = n + 1 {
@@ -135,11 +135,11 @@ fun emitInsts(b : String.Builder, cold : Cold, d : Asm.Dialect, f : Func Inst,
 
 -- The code a function keeps after its blocks: the slow paths of its
 -- allocations, out of the way of the fast ones.
-type Cold = Cold { text : String.Builder, count : Int }
+type Cold = Cold { text : Code, count : Int }
 
 -- The labels of allocation `n` in function `tag`: its stub (`"s"`), the
 -- stub's panic exit (`"p"`) and the return to the fast path (`"r"`).
-fun allocationLabel(d : Asm.Dialect, tag : Int, n : Int, which : String) -> String =
+fun allocationLabel(d : Asm.Dialect, tag : Int, n : Int, which : String) -> Asm.Symbol =
     Asm.localLabel(d, "a" + Int.toString(tag) + which + Int.toString(n))
 
 -- How many times each value is read, terminators included.
@@ -175,37 +175,33 @@ fun fused(block : Block Inst, reads : Array Int) -> Option (A.Cond, BlockId, Blo
 }
 
 -- `b.cond` to one arm, falling through to the other where it is next.
-fun conditional(b : String.Builder, d : Asm.Dialect, tag : Int, c : A.Cond,
+fun conditional(b : Code, d : Asm.Dialect, tag : Int, c : A.Cond,
                 yes : BlockId, no : BlockId, next : Int) -> Unit {
     if Ssa.blockId(yes) == next {
-        line(b, "    b." + A.condName(A.invert(c)) + " "
-                + blockLabel(d, tag, Ssa.blockId(no)))
+        instruction(b, A.BCond(A.invert(c), blockLabel(d, tag, Ssa.blockId(no))))
     } else {
-        line(b, "    b." + A.condName(c) + " " + blockLabel(d, tag, Ssa.blockId(yes)))
+        instruction(b, A.BCond(c, blockLabel(d, tag, Ssa.blockId(yes))))
         if Ssa.blockId(no) != next {
-            line(b, "    b " + blockLabel(d, tag, Ssa.blockId(no)))
+            instruction(b, A.B(blockLabel(d, tag, Ssa.blockId(no))))
         }
     }
 }
 
 -- A global function's label, and what the format wants said about it first.
-fun function(b : String.Builder, d : Asm.Dialect, symbol : String) -> Unit {
-    line(b, "    .globl " + symbol)
-    match Asm.functionType(d, symbol) {
-        Some(directive) -> line(b, "    " + directive)
-        None -> {}
-    }
-    line(b, "    .p2align 2")
-    line(b, symbol + ":")
+fun function(b : Code, symbol : Asm.Symbol) -> Unit {
+    emit(b, Global(symbol))
+    emit(b, FunctionType(symbol))
+    emit(b, Align(2))
+    emit(b, Label(symbol))
 }
 
 -- The return address of the call at this safepoint: the label goes directly
 -- after the `bl`, which is where selection put the `SafepointMap` mark.
-fun safepointLabel(d : Asm.Dialect, tag : Int, block : Int, index : Int) -> String =
+fun safepointLabel(d : Asm.Dialect, tag : Int, block : Int, index : Int) -> Asm.Symbol =
     Asm.localLabel(d, "sp" + Int.toString(tag) + "b" + Int.toString(block)
                       + "i" + Int.toString(index))
 
-fun blockLabel(d : Asm.Dialect, tag : Int, block : Int) -> String =
+fun blockLabel(d : Asm.Dialect, tag : Int, block : Int) -> Asm.Symbol =
     Asm.localLabel(d, "f" + Int.toString(tag) + "b" + Int.toString(block))
 
 -- -- the frame ---------------------------------------------------------------
@@ -219,26 +215,26 @@ fun blockLabel(d : Asm.Dialect, tag : Int, block : Int) -> String =
 -- `boot`'s largest frame is 16,672. A store's unsigned twelve bits reach
 -- 32,760, which covers every frame the compiler has produced; past that the
 -- offset goes through `scratch` like any other.
-fun prologue(b : String.Builder, l : Frame.Layout) -> Unit {
-    adjust(b, l.size, "sub")
+fun prologue(b : Code, l : Frame.Layout) -> Unit {
+    adjust(b, l.size, False)
     store(b, Physical(Gp, 29), l.recordAt, A.W64)
     store(b, Physical(Gp, 30), l.recordAt + 8, A.W64)
     address(b, Physical(Gp, 29), l.recordAt)
     saves(b, l, True)
 }
 
-fun epilogue(b : String.Builder, l : Frame.Layout) -> Unit {
+fun epilogue(b : Code, l : Frame.Layout) -> Unit {
     saves(b, l, False)
     load(b, Physical(Gp, 29), l.recordAt, A.W64)
     load(b, Physical(Gp, 30), l.recordAt + 8, A.W64)
-    adjust(b, l.size, "add")
-    line(b, "    ret")
+    adjust(b, l.size, True)
+    instruction(b, A.Ret)
 }
 
 -- The callee-saved registers the colouring actually used, saved on the way in
 -- and restored on the way out. One store each rather than pairs: a pair's
 -- offset is the narrow immediate again, and the frames here are not small.
-fun saves(b : String.Builder, l : Frame.Layout, saving : Bool) -> Unit {
+fun saves(b : Code, l : Frame.Layout, saving : Bool) -> Unit {
     var at = l.savesAt
     for n in l.savedGp {
         if saving { store(b, Physical(Gp, n), at, A.W64) }
@@ -252,36 +248,38 @@ fun saves(b : String.Builder, l : Frame.Layout, saving : Bool) -> Unit {
     }
 }
 
-fun adjust(b : String.Builder, size : Int, what : String) -> Unit {
+-- `sp` up by `size` when `up`, down otherwise.
+fun adjust(b : Code, size : Int, up : Bool) -> Unit {
     if size == 0 { return }
     if size <= widestImmediate {
-        line(b, "    " + what + " sp, sp, #" + Int.toString(size))
+        instruction(b, if up { A.AddImm(A.sp, A.sp, size, A.W64) }
+                       else { A.SubImm(A.sp, A.sp, size, A.W64) })
     } else {
         instruction(b, A.MovConst(scratch, size))
-        line(b, "    " + what + " sp, sp, " + A.showReg(scratch, A.W64))
+        instruction(b, if up { A.AddExt(A.sp, A.sp, scratch) }
+                       else { A.SubExt(A.sp, A.sp, scratch) })
     }
 }
 
 -- `add d, sp, #offset`, for the frame pointer.
-fun address(b : String.Builder, d : Reg, offset : Int) -> Unit {
+fun address(b : Code, d : Reg, offset : Int) -> Unit {
     if offset <= widestImmediate {
-        line(b, "    add " + A.showReg(d, A.W64) + ", sp, #" + Int.toString(offset))
+        instruction(b, A.AddImm(d, A.sp, offset, A.W64))
     } else {
         instruction(b, A.MovConst(scratch, offset))
-        line(b, "    add " + A.showReg(d, A.W64) + ", sp, "
-                + A.showReg(scratch, A.W64))
+        instruction(b, A.AddExt(d, A.sp, scratch))
     }
 }
 
-fun store(b : String.Builder, r : Reg, offset : Int, w : A.Width) -> Unit =
+fun store(b : Code, r : Reg, offset : Int, w : A.Width) -> Unit =
     instruction(b, A.Str(r, at(b, offset), w))
 
-fun load(b : String.Builder, r : Reg, offset : Int, w : A.Width) -> Unit =
+fun load(b : Code, r : Reg, offset : Int, w : A.Width) -> Unit =
     instruction(b, A.Ldr(r, at(b, offset), w))
 
 -- A frame offset as a memory operand, through `scratch` when the immediate
 -- does not reach.
-fun at(b : String.Builder, offset : Int) -> Mem {
+fun at(b : Code, offset : Int) -> Mem {
     if offset <= widestOffset { return Offset(A.sp, offset) }
     instruction(b, A.MovConst(scratch, offset))
     Indexed(A.sp, scratch)
@@ -289,7 +287,7 @@ fun at(b : String.Builder, offset : Int) -> Mem {
 
 -- -- instructions ------------------------------------------------------------
 
-fun emitInst(b : String.Builder, d : Asm.Dialect, f : Func Inst,
+fun emitInst(b : Code, d : Asm.Dialect, f : Func Inst,
              a : Regalloc.Allocation, l : Frame.Layout, tag : Int,
              i : Inst) -> Unit {
     -- A safepoint is not an instruction: it is the *position* after the call,
@@ -297,7 +295,7 @@ fun emitInst(b : String.Builder, d : Asm.Dialect, f : Func Inst,
     -- label, and `Turkey.Frame`'s entry for the same (block, index) names it.
     match A.safepointOf(i.op) {
         Some((sb, sn)) -> {
-            line(b, safepointLabel(d, tag, sb, sn) + ":")
+            emit(b, Label(safepointLabel(d, tag, sb, sn)))
             return
         }
         None -> {}
@@ -327,20 +325,20 @@ fun emitInst(b : String.Builder, d : Asm.Dialect, f : Func Inst,
 -- what lets the allocator see one instruction: the destination holds each
 -- intermediate in turn, so no other value is disturbed. An empty cursor
 -- branches to its stub, after the function.
-fun allocate(b : String.Builder, cold : Cold, d : Asm.Dialect, f : Func Inst,
+fun allocate(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
              l : Frame.Layout, tag : Int, dest : Reg, al : A.Allocation,
-             safepoint : Option String) -> Unit {
+             safepoint : Option Asm.Symbol) -> Unit {
     let n = cold.count
     cold.count = n + 1
     let cursor = scratch
     let word = Physical(Gp, 17)
-    instruction(b, A.Adrp(cursor, Asm.page(d, al.cursors)))
-    instruction(b, A.Ldr(cursor, PageOffset(cursor, Asm.pageOffset(d, al.cursors)), A.W64))
+    instruction(b, A.Adrp(cursor, al.cursors))
+    instruction(b, A.Ldr(cursor, PageOffset(cursor, al.cursors), A.W64))
     if al.sizeClass > 0 {
         instruction(b, A.AddImm(cursor, cursor, Rt.cursorBytes * al.sizeClass, A.W64))
     }
     instruction(b, A.Ldr(word, Offset(cursor, Rt.cursorFree), A.W64))
-    line(b, "    cbz " + A.showReg(word, A.W64) + ", " + allocationLabel(d, tag, n, "s"))
+    instruction(b, A.Cbz(word, allocationLabel(d, tag, n, "s"), A.W64))
     -- The lowest set bit, cleared from the word that is stored back; then
     -- its position, which arm64 counts as the leading zeros of the reversal.
     instruction(b, A.Sub(dest, A.xzr, word, A.W64))
@@ -359,7 +357,7 @@ fun allocate(b : String.Builder, cold : Cold, d : Asm.Dialect, f : Func Inst,
     instruction(b, A.MovConst(cursor, al.kind))
     instruction(b, A.Str(cursor, Offset(dest, Rt.headerKind), A.W64))
     instruction(b, A.AddImm(dest, dest, Rt.headerBytes, A.W64))
-    line(b, allocationLabel(d, tag, n, "r") + ":")
+    emit(b, Label(allocationLabel(d, tag, n, "r")))
     stub(cold.text, d, f, l, tag, n, dest, al, safepoint)
 }
 
@@ -371,9 +369,9 @@ fun allocate(b : String.Builder, cold : Cold, d : Asm.Dialect, f : Func Inst,
 --
 -- `dest` is written before `length` and `fill` are last read, which the
 -- allocator knows (`A.writesBeforeReading`), so it holds neither.
-fun allocateArray(b : String.Builder, cold : Cold, d : Asm.Dialect, f : Func Inst,
+fun allocateArray(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
                   l : Frame.Layout, tag : Int, dest : Reg, length : Reg, fill : Reg,
-                  al : A.ArrayAllocation, safepoint : Option String) -> Unit {
+                  al : A.ArrayAllocation, safepoint : Option Asm.Symbol) -> Unit {
     let n = cold.count
     cold.count = n + 1
     let slow = allocationLabel(d, tag, n, "s")
@@ -388,20 +386,20 @@ fun allocateArray(b : String.Builder, cold : Cold, d : Asm.Dialect, f : Func Ins
     }
     instruction(b, A.MovConst(cursor, (Rt.fastPayload - Rt.headerBytes) / al.width + 1))
     instruction(b, A.Cmp(length, cursor, A.W64))
-    line(b, "    b.hs " + slow)
+    instruction(b, A.BCond(A.Hs, slow))
     -- The class, from the payload's size: the header and the elements.
     instruction(b, A.LslImm(word, length, shift, A.W64))
     instruction(b, A.AddImm(word, word, Rt.headerBytes + Rt.classStep, A.W64))
     instruction(b, A.LsrImm(word, word, 4, A.W64))
-    instruction(b, A.Adrp(cursor, Asm.page(d, al.classes)))
-    instruction(b, A.Ldr(cursor, PageOffset(cursor, Asm.pageOffset(d, al.classes)), A.W64))
+    instruction(b, A.Adrp(cursor, al.classes))
+    instruction(b, A.Ldr(cursor, PageOffset(cursor, al.classes), A.W64))
     instruction(b, A.Ldrb(word, Indexed(cursor, word)))
     instruction(b, A.LslImm(word, word, 6, A.W64))
-    instruction(b, A.Adrp(cursor, Asm.page(d, al.cursors)))
-    instruction(b, A.Ldr(cursor, PageOffset(cursor, Asm.pageOffset(d, al.cursors)), A.W64))
+    instruction(b, A.Adrp(cursor, al.cursors))
+    instruction(b, A.Ldr(cursor, PageOffset(cursor, al.cursors), A.W64))
     instruction(b, A.Add(cursor, cursor, word, A.W64))
     instruction(b, A.Ldr(word, Offset(cursor, Rt.cursorFree), A.W64))
-    line(b, "    cbz " + A.showReg(word, A.W64) + ", " + slow)
+    instruction(b, A.Cbz(word, slow, A.W64))
     instruction(b, A.Sub(dest, A.xzr, word, A.W64))
     instruction(b, A.And(dest, word, dest, A.W64))
     instruction(b, A.Eor(word, word, dest, A.W64))
@@ -428,10 +426,10 @@ fun allocateArray(b : String.Builder, cold : Cold, d : Asm.Dialect, f : Func Ins
     instruction(b, A.Str(cursor, Offset(dest, 16), A.W64))
     -- Every element, including an array of pointers to nothing, which the
     -- collector may walk before anything else is stored.
-    line(b, "    cbz " + A.showReg(length, A.W64) + ", " + back)
+    instruction(b, A.Cbz(length, back, A.W64))
     instruction(b, A.AddImm(cursor, dest, 24, A.W64))
     instruction(b, A.Mov(word, length, A.W64))
-    line(b, top + ":")
+    emit(b, Label(top))
     match al.width {
         1 -> instruction(b, A.Strb(fill, Offset(cursor, 0)))
         4 -> instruction(b, A.Str(fill, Offset(cursor, 0), A.W32))
@@ -439,12 +437,12 @@ fun allocateArray(b : String.Builder, cold : Cold, d : Asm.Dialect, f : Func Ins
     }
     instruction(b, A.AddImm(cursor, cursor, al.width, A.W64))
     instruction(b, A.SubSImm(word, word, 1, A.W64))
-    line(b, "    b.ne " + top)
-    line(b, back + ":")
+    instruction(b, A.BCond(A.Ne, top))
+    emit(b, Label(back))
     -- The stub: the length and the fill into the first two argument
     -- registers, without either overwriting the other.
     let text = cold.text
-    line(text, slow + ":")
+    emit(text, Label(slow))
     let x1 = A.argRegs[1]
     if A.sameRegister(fill, A.x0) && A.sameRegister(length, x1) {
         instruction(text, A.Mov(scratch, fill, A.W64))
@@ -465,17 +463,17 @@ fun allocateArray(b : String.Builder, cold : Cold, d : Asm.Dialect, f : Func Ins
 -- An allocation's slow path, after the function: the runtime's allocator with
 -- its constant arguments, the label the frame table names its return address
 -- by, the panic test every call gets, and back.
-fun stub(b : String.Builder, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
+fun stub(b : Code, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
          tag : Int, n : Int, dest : Reg, al : A.Allocation,
-         safepoint : Option String) -> Unit {
-    line(b, allocationLabel(d, tag, n, "s") + ":")
+         safepoint : Option Asm.Symbol) -> Unit {
+    emit(b, Label(allocationLabel(d, tag, n, "s")))
     var k = 0
     for arg in al.args {
         let r = A.argRegs[k]
         match arg {
             Constant(0) -> instruction(b, A.Mov(r, A.xzr, A.W64))
             Constant(value) -> instruction(b, A.MovConst(r, value))
-            AddressOf(sym) -> symbolInto(b, d, r, sym)
+            AddressOf(sym) -> symbolInto(b, r, sym)
         }
         k = k + 1
     }
@@ -484,22 +482,22 @@ fun stub(b : String.Builder, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
 
 -- The call that ends a stub, its frame-table label, the panic test every call
 -- gets, and the way back with the result in `dest`.
-fun returnFromStub(b : String.Builder, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
-                   tag : Int, n : Int, dest : Reg, slow : String,
-                   safepoint : Option String) -> Unit {
+fun returnFromStub(b : Code, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
+                   tag : Int, n : Int, dest : Reg, slow : Asm.Symbol,
+                   safepoint : Option Asm.Symbol) -> Unit {
     let failed = allocationLabel(d, tag, n, "p")
-    line(b, "    bl " + slow)
+    instruction(b, A.Bl(slow))
     match safepoint {
-        Some(label) -> line(b, label + ":")
+        Some(label) -> emit(b, Label(label))
         None -> {}
     }
     let state = Asm.runtimeFor(d, Rt.processState)
-    instruction(b, A.Adrp(scratch, Asm.page(d, state)))
-    instruction(b, A.Ldr(scratch, PageOffset(scratch, Asm.pageOffset(d, state)), A.W32))
-    line(b, "    cbnz " + A.showReg(scratch, A.W32) + ", " + failed)
+    instruction(b, A.Adrp(scratch, state))
+    instruction(b, A.Ldr(scratch, PageOffset(scratch, state), A.W32))
+    instruction(b, A.Cbnz(scratch, failed, A.W32))
     if !A.sameRegister(dest, A.x0) { instruction(b, A.Mov(dest, A.x0, A.W64)) }
-    line(b, "    b " + allocationLabel(d, tag, n, "r"))
-    line(b, failed + ":")
+    instruction(b, A.B(allocationLabel(d, tag, n, "r")))
+    emit(b, Label(failed))
     zero(b, f)
     epilogue(b, l)
 }
@@ -534,7 +532,7 @@ fun wideSlot(l : Frame.Layout, op : A.Arm) -> Option Int = match A.memOf(op) {
 
 -- -- terminators -------------------------------------------------------------
 
-fun emitTerm(b : String.Builder, d : Asm.Dialect, f : Func Inst,
+fun emitTerm(b : Code, d : Asm.Dialect, f : Func Inst,
              a : Regalloc.Allocation, l : Frame.Layout, tag : Int, t : Term,
              next : Int) -> Unit =
     match t {
@@ -549,28 +547,26 @@ fun emitTerm(b : String.Builder, d : Asm.Dialect, f : Func Inst,
         Jump(target, args) -> {
             copies(b, f, a, Ssa.blockAt(f, target).params, args)
             if Ssa.blockId(target) != next {
-                line(b, "    b " + blockLabel(d, tag, Ssa.blockId(target)))
+                instruction(b, A.B(blockLabel(d, tag, Ssa.blockId(target))))
             }
         }
         -- `cbnz` on the bit the comparison materialized. Whichever arm is the
         -- next block falls through; if neither is, both get a branch.
         Branch(c, yes, no) -> {
-            let bit = A.showReg(coloured(f, a, A.reg(c)), A.W32)
+            let bit = coloured(f, a, A.reg(c))
             if Ssa.blockId(yes) == next {
-                line(b, "    cbz " + bit + ", "
-                        + blockLabel(d, tag, Ssa.blockId(no)))
+                instruction(b, A.Cbz(bit, blockLabel(d, tag, Ssa.blockId(no)), A.W32))
             } else {
-                line(b, "    cbnz " + bit + ", "
-                        + blockLabel(d, tag, Ssa.blockId(yes)))
+                instruction(b, A.Cbnz(bit, blockLabel(d, tag, Ssa.blockId(yes)), A.W32))
                 if Ssa.blockId(no) != next {
-                    line(b, "    b " + blockLabel(d, tag, Ssa.blockId(no)))
+                    instruction(b, A.B(blockLabel(d, tag, Ssa.blockId(no))))
                 }
             }
         }
         -- Selection turns a panic into a call and a return, so one here is a
         -- selection bug rather than a shape to emit. `brk` says so at run time
         -- instead of falling into the next function.
-        Panic(_) -> line(b, "    brk #1")
+        Panic(_) -> instruction(b, A.Brk(1))
         -- Not a trap: this is reached only where the lowering proved no value
         -- arrives, and the same zero every panic path returns is the same
         -- claim made unexploitably.
@@ -580,13 +576,13 @@ fun emitTerm(b : String.Builder, d : Asm.Dialect, f : Func Inst,
         }
     }
 
-fun result(b : String.Builder, r : Reg) -> Unit = match r {
+fun result(b : Code, r : Reg) -> Unit = match r {
     Physical(Gp, n) -> if n != 0 { instruction(b, A.Mov(A.x0, r, A.W64)) }
     Physical(Fp, n) -> if n != 0 { instruction(b, A.FMov(A.d0, r)) }
-    Virtual(_) -> line(b, "    // an unallocated result reached the emitter")
+    Virtual(_) -> emit(b, Comment("an unallocated result reached the emitter"))
 }
 
-fun zero(b : String.Builder, f : Func Inst) -> Unit =
+fun zero(b : Code, f : Func Inst) -> Unit =
     match A.bankOf(f.result) {
         Gp -> instruction(b, A.Mov(A.x0, A.xzr, A.W64))
         Fp -> instruction(b, A.FMovIn(A.d0, A.xzr))
@@ -604,7 +600,7 @@ fun zero(b : String.Builder, f : Func Inst) -> Unit =
 --
 -- This is the one place the block-parameter design costs an algorithm, and it
 -- is the same one every allocator that shuffles registers at a merge writes.
-fun copies(b : String.Builder, f : Func Inst, a : Regalloc.Allocation,
+fun copies(b : Code, f : Func Inst, a : Regalloc.Allocation,
            params : Array Value, args : Array Value) -> Unit {
     let dsts : Array Reg = []
     let srcs : Array Reg = []
@@ -663,12 +659,12 @@ fun sameReg(a : Reg, b : Reg) -> Bool = A.sameRegister(a, b)
 -- A move between two registers of the same file, or through the general file
 -- when a double has to travel in the scratch register -- there is no reserved
 -- `d` scratch, and `fmov` crosses the files without converting.
-fun move(b : String.Builder, d : Reg, s : Reg) -> Unit = match (d, s) {
+fun move(b : Code, d : Reg, s : Reg) -> Unit = match (d, s) {
     (Physical(Gp, _), Physical(Gp, _)) -> instruction(b, A.Mov(d, s, A.W64))
     (Physical(Fp, _), Physical(Fp, _)) -> instruction(b, A.FMov(d, s))
     (Physical(Gp, _), Physical(Fp, _)) -> instruction(b, A.FMovOut(d, s))
     (Physical(Fp, _), Physical(Gp, _)) -> instruction(b, A.FMovIn(d, s))
-    _ -> line(b, "    // an unallocated register reached a parallel copy")
+    _ -> emit(b, Comment("an unallocated register reached a parallel copy"))
 }
 
 
@@ -682,27 +678,15 @@ fun move(b : String.Builder, d : Reg, s : Reg) -> Unit = match (d, s) {
 -- assembler refuses the whole file. The globals and the root array are named
 -- with ordinary symbols, so they can stay undefined until they are emitted.
 --
--- Emitted as bytes rather than as a quoted string: a message contains
--- whatever the program's source did, and `.asciz` would need every quote,
--- backslash and newline escaped the way the assembler reads them. The bytes
--- need nothing read back.
---
 -- `turkey_panic` takes a C string (`lib/Turkey/Process.gob`), so each one
 -- ends in a zero.
-fun emitMessages(asm : Asm.Asm, b : String.Builder) -> Unit {
+fun emitMessages(asm : Asm.Asm, b : Code) -> Unit {
     let ordered = byIndex(asm.messages)
     if len(ordered) == 0 { return }
-    line(b, "    " + Asm.section(asm.dialect, Asm.CStrings))
+    emit(b, Section(Asm.CStrings))
     for var i = 0; i < len(ordered); i = i + 1 {
-        line(b, Asm.messageName(asm.dialect, i) + ":")
-        let out = String.builder()
-        String.push(out, "    .byte ")
-        for byte in String.bytes(ordered[i]) {
-            String.push(out, Int.toString(Byte.toInt(byte)))
-            String.push(out, ", ")
-        }
-        String.push(out, "0")
-        line(b, String.build(out))
+        emit(b, Label(Asm.messageName(asm.dialect, i)))
+        emit(b, CString(ordered[i]))
     }
 }
 
@@ -715,19 +699,19 @@ fun emitMessages(asm : Asm.Asm, b : String.Builder) -> Unit {
 -- Every name and every slot here was decided by `Turkey.Asm` before selection
 -- ran, which is what lets `ConstString` be a load of slot *n* emitted long
 -- before anything defined slot *n*.
-fun emitData(m : Module, asm : Asm.Asm, sites : Int, b : String.Builder) -> Unit {
+fun emitData(m : Module, asm : Asm.Asm, sites : Int, b : Code) -> Unit {
     emitLiterals(asm, b)
-    line(b, "    " + Asm.section(asm.dialect, Asm.Data))
+    emit(b, Section(Asm.Data))
     -- A build that counts allocations (`Turkey.Sites`): the number of sites,
     -- then a counter for each.
     if sites > 0 {
-        line(b, "    .p2align 3")
-        line(b, Asm.runtimeFor(asm.dialect, "turkey_alloc_sites") + ":")
-        line(b, "    .quad " + Int.toString(sites))
-        line(b, "    .space " + Int.toString(8 * sites))
-        line(b, Asm.localLabel(asm.dialect, "alloc_sites_file") + ":")
-        emitBytes(Sites.counterFile, b)
-        line(b, "    .byte 0")
+        emit(b, Align(3))
+        emit(b, Label(Asm.runtimeFor(asm.dialect, "turkey_alloc_sites")))
+        emit(b, Word(sites))
+        emit(b, Space(8 * sites))
+        emit(b, Label(Asm.localLabel(asm.dialect, "alloc_sites_file")))
+        emit(b, Bytes(Sites.counterFile))
+        emit(b, CString(""))
     }
     -- An untraced global is a word of ordinary storage. A traced one is a slot
     -- of the root array instead -- storing to it and rooting it are the same
@@ -736,30 +720,30 @@ fun emitData(m : Module, asm : Asm.Asm, sites : Int, b : String.Builder) -> Unit
         match Asm.globalSlot(asm, name) {
             Some(_) -> {}
             None -> {
-                line(b, "    .p2align 3")
-                line(b, Asm.globalSymbol(asm.dialect, name) + ":")
-                line(b, "    .quad 0")
+                emit(b, Align(3))
+                emit(b, Label(Asm.globalSymbol(asm.dialect, name)))
+                emit(b, Word(0))
             }
         }
     }
-    line(b, "    .p2align 3")
-    line(b, Asm.rootsSymbol(asm.dialect) + ":")
+    emit(b, Align(3))
+    emit(b, Label(Asm.rootsSymbol(asm.dialect)))
     -- At least one word even when the module roots nothing: the entry sequence
     -- hands this address to `turkey_root_enter`, which refuses a null one, and
     -- a symbol with no storage is a symbol that may land on top of the next.
     let bytes = if asm.roots > 0 { 8 * asm.roots } else { 8 }
-    line(b, "    .space " + Int.toString(bytes))
-    line(b, "    .p2align 3")
-    line(b, Asm.globalsFrame(asm.dialect) + ":")
+    emit(b, Space(bytes))
+    emit(b, Align(3))
+    emit(b, Label(Asm.globalsFrame(asm.dialect)))
     -- The `RootFrame` covering it: previous, function_name, count, values,
     -- live. Five words, in the layout `lib/Turkey/Heap.gob` reads.
-    line(b, "    .space 40")
+    emit(b, Space(40))
     -- Defined by every program, and visible to C: `Turkey.Runtime.processState`.
     let processState = Asm.runtimeFor(asm.dialect, Rt.processState)
-    line(b, "    .globl " + processState)
-    line(b, "    .p2align 3")
-    line(b, processState + ":")
-    line(b, "    .space " + Int.toString(Rt.processStateBytes))
+    emit(b, Global(processState))
+    emit(b, Align(3))
+    emit(b, Label(processState))
+    emit(b, Space(Rt.processStateBytes))
 }
 
 -- Each literal's bytes, and nothing else. The `TurkeyString` is built once by
@@ -769,14 +753,14 @@ fun emitData(m : Module, asm : Asm.Asm, sites : Int, b : String.Builder) -> Unit
 -- Not the section the panic messages go in, where a format has one of its own
 -- for NUL-terminated C strings: and a Turkey string is bytes and a length: it may
 -- contain a zero byte, and there is no terminator to write.
-fun emitLiterals(asm : Asm.Asm, b : String.Builder) -> Unit {
+fun emitLiterals(asm : Asm.Asm, b : Code) -> Unit {
     let ordered = byIndex(asm.literals)
     if len(ordered) == 0 { return }
-    line(b, "    " + Asm.section(asm.dialect, Asm.Constants))
+    emit(b, Section(Asm.Constants))
     for var i = 0; i < len(ordered); i = i + 1 {
-        line(b, "    .p2align 3")
-        line(b, Asm.literalName(asm.dialect, i) + ":")
-        emitBytes(ordered[i], b)
+        emit(b, Align(3))
+        emit(b, Label(Asm.literalName(asm.dialect, i)))
+        emit(b, Bytes(ordered[i]))
     }
 }
 
@@ -786,20 +770,6 @@ fun byIndex(table : Map.Map String Int) -> Array String {
     for _ in Map.entries(table) { Array.push(out, "") }
     for (text, index) in Map.entries(table) { out[index] = text }
     out
-}
-
--- A string as a `.byte` directive, and nothing at all when it is empty: `.byte`
--- with no operands is a syntax error, and a zero-length literal is a program
--- writing `""`.
-fun emitBytes(text : String, b : String.Builder) -> Unit {
-    let out = String.builder()
-    var any = False
-    for byte in String.bytes(text) {
-        if any { String.push(out, ", ") } else { String.push(out, "    .byte ") }
-        any = True
-        String.push(out, Int.toString(Byte.toInt(byte)))
-    }
-    if any { line(b, String.build(out)) }
 }
 
 -- -- the entry sequence ------------------------------------------------------
@@ -816,20 +786,20 @@ fun emitBytes(text : String, b : String.Builder) -> Unit {
 -- end, parks the program's ending where the entry's own code will not unwind
 -- on it.
 fun emitEntry(asm : Asm.Asm, m : Module, main : String, sites : Int,
-              b : String.Builder) -> Unit {
+              b : Code) -> Unit {
     let d = asm.dialect
-    line(b, "    " + Asm.section(d, Asm.Text))
-    function(b, d, Asm.entrySymbol(d))
+    emit(b, Section(Asm.Text))
+    function(b, Asm.entrySymbol(d))
     -- A frame of its own, because everything below is a call. Thirty-two
     -- bytes: the record, and the alignment Apple requires.
-    line(b, "    sub sp, sp, #32")
+    instruction(b, A.SubImm(A.sp, A.sp, 32, A.W64))
     instruction(b, A.Str(Physical(Gp, 29), Offset(A.sp, 16), A.W64))
     instruction(b, A.Str(Physical(Gp, 30), Offset(A.sp, 24), A.W64))
-    line(b, "    add x29, sp, #16")
-    line(b, "    bl " + Asm.symbolFor(d, m.early))
-    symbolInto(b, d, A.x0, Asm.runtimeFor(d, Rt.processState))
+    instruction(b, A.AddImm(Physical(Gp, 29), A.sp, 16, A.W64))
+    instruction(b, A.Bl(Asm.symbolFor(d, m.early)))
+    symbolInto(b, A.x0, Asm.runtimeFor(d, Rt.processState))
     instruction(b, A.Ldr(A.x0, Offset(A.x0, 0), A.W64))
-    line(b, "    cbnz x0, " + Asm.localLabel(d, "entry_done"))
+    instruction(b, A.Cbnz(A.x0, Asm.localLabel(d, "entry_done"), A.W64))
 
     -- The outer bound of every walk of the Turkey stack is this frame: every
     -- frame the program makes is below it, and its own roots are the globals
@@ -842,21 +812,21 @@ fun emitEntry(asm : Asm.Asm, m : Module, main : String, sites : Int,
     -- global and every literal is live for the whole run, so the mask is all
     -- ones and this frame sits at the bottom of the chain until the process
     -- exits.
-    symbolInto(b, d, A.x0, Asm.globalsFrame(d))
-    symbolInto(b, d, Physical(Gp, 1), Asm.rootsSymbol(d))
+    symbolInto(b, A.x0, Asm.globalsFrame(d))
+    symbolInto(b, Physical(Gp, 1), Asm.rootsSymbol(d))
     instruction(b, A.MovConst(Physical(Gp, 2), asm.roots))
-    symbolInto(b, d, Physical(Gp, 3), Asm.messageSymbol(asm, "<globals>"))
+    symbolInto(b, Physical(Gp, 3), Asm.messageSymbol(asm, "<globals>"))
     call(b, d, "turkey_root_enter")
-    symbolInto(b, d, A.x0, Asm.globalsFrame(d))
+    symbolInto(b, A.x0, Asm.globalsFrame(d))
     -- Not `mov x1, #-1`: `movn` is the instruction that spells it, and going
     -- through the assembler's alias would be one more thing to be wrong about.
-    line(b, "    movn x1, #0")
+    instruction(b, A.MovN(Physical(Gp, 1), 0))
     instruction(b, A.Str(Physical(Gp, 1), Offset(A.x0, 32), A.W64))
 
     -- The frame table, before anything allocates: the first collection may
     -- happen inside the first `turkey_string_new` below, and a collection that
     -- cannot read the table sees no frame's roots at all.
-    symbolInto(b, d, A.x0, Asm.frameTableSymbol(d))
+    symbolInto(b, A.x0, Asm.frameTableSymbol(d))
     call(b, d, "turkey_frame_table_register")
 
     -- Each literal's `TurkeyString`, built once and cached in its slot. This
@@ -864,57 +834,57 @@ fun emitEntry(asm : Asm.Asm, m : Module, main : String, sites : Int,
     -- makes it not a safepoint.
     let ordered = byIndex(asm.literals)
     for var i = 0; i < len(ordered); i = i + 1 {
-        symbolInto(b, d, A.x0, Asm.literalName(d, i))
+        symbolInto(b, A.x0, Asm.literalName(d, i))
         instruction(b, A.MovConst(Physical(Gp, 1), byteLength(ordered[i])))
         call(b, d, "turkey_string_new")
-        symbolInto(b, d, Physical(Gp, 1), Asm.rootsSymbol(d))
+        symbolInto(b, Physical(Gp, 1), Asm.rootsSymbol(d))
         storeAt(b, A.x0, Physical(Gp, 1), 8 * Asm.literalSlot(asm, ordered[i]))
     }
 
-    line(b, "    bl " + Asm.symbolFor(d, m.initial))
+    instruction(b, A.Bl(Asm.symbolFor(d, m.initial)))
     -- `main` takes the closure environment every Turkey function takes, and
     -- has none.
     instruction(b, A.Mov(A.x0, A.xzr, A.W64))
-    line(b, "    bl " + Asm.symbolFor(d, main))
-    line(b, Asm.localLabel(d, "entry_done") + ":")
+    instruction(b, A.Bl(Asm.symbolFor(d, main)))
+    emit(b, Label(Asm.localLabel(d, "entry_done")))
     if sites > 0 { writeSites(b, d, sites) }
     call(b, d, "turkey_entry_returned")
 
     instruction(b, A.Ldr(Physical(Gp, 29), Offset(A.sp, 16), A.W64))
     instruction(b, A.Ldr(Physical(Gp, 30), Offset(A.sp, 24), A.W64))
-    line(b, "    add sp, sp, #32")
-    line(b, "    ret")
+    instruction(b, A.AddImm(A.sp, A.sp, 32, A.W64))
+    instruction(b, A.Ret)
 
     -- Early initialization, for a C caller that runs the program's Turkey
     -- code without running the program: the runtime's own C tests. It takes
     -- no environment and returns to the caller directly.
-    function(b, d, Asm.runtimeFor(d, "turkey_giblets_initialize"))
-    line(b, "    b " + Asm.symbolFor(d, m.early))
+    function(b, Asm.runtimeFor(d, "turkey_giblets_initialize"))
+    instruction(b, A.B(Asm.symbolFor(d, m.early)))
 
     -- `main` itself: `Turkey.Entry`'s, reached by its C symbol. `argv` is
     -- already in `x1`, and `argc` in `w0`, widened to the `Int` a foreign
     -- definition takes: AAPCS64 leaves the upper half of an `int` undefined.
-    function(b, d, Asm.runtimeFor(d, "main"))
-    line(b, "    sub sp, sp, #16")
+    function(b, Asm.runtimeFor(d, "main"))
+    instruction(b, A.SubImm(A.sp, A.sp, 16, A.W64))
     instruction(b, A.Str(Physical(Gp, 29), Offset(A.sp, 0), A.W64))
     instruction(b, A.Str(Physical(Gp, 30), Offset(A.sp, 8), A.W64))
-    line(b, "    mov x29, sp")
-    line(b, "    sxtw x0, w0")
+    instruction(b, A.AddImm(Physical(Gp, 29), A.sp, 0, A.W64))
+    instruction(b, A.Sxtw(A.x0, A.x0))
     call(b, d, "turkey_main")
     instruction(b, A.Ldr(Physical(Gp, 29), Offset(A.sp, 0), A.W64))
     instruction(b, A.Ldr(Physical(Gp, 30), Offset(A.sp, 8), A.W64))
-    line(b, "    add sp, sp, #16")
-    line(b, "    ret")
+    instruction(b, A.AddImm(A.sp, A.sp, 16, A.W64))
+    instruction(b, A.Ret)
 }
 
 -- The counters to `Sites.counterFile`, before the program's ending is
 -- reported: `creat`, which is not variadic as `open` is, then one `write`.
-fun writeSites(b : String.Builder, d : Asm.Dialect, sites : Int) -> Unit {
-    symbolInto(b, d, A.x0, Asm.localLabel(d, "alloc_sites_file"))
+fun writeSites(b : Code, d : Asm.Dialect, sites : Int) -> Unit {
+    symbolInto(b, A.x0, Asm.localLabel(d, "alloc_sites_file"))
     instruction(b, A.MovConst(Physical(Gp, 1), 420))
     call(b, d, "creat")
-    line(b, "    sxtw x0, w0")
-    symbolInto(b, d, Physical(Gp, 1), Asm.runtimeFor(d, "turkey_alloc_sites"))
+    instruction(b, A.Sxtw(A.x0, A.x0))
+    symbolInto(b, Physical(Gp, 1), Asm.runtimeFor(d, "turkey_alloc_sites"))
     instruction(b, A.MovConst(Physical(Gp, 2), 8 * (sites + 1)))
     call(b, d, "write")
 }
@@ -928,7 +898,7 @@ fun writeSites(b : String.Builder, d : Asm.Dialect, sites : Int) -> Unit {
 -- frame of its own for the collector's walk to meet. Floating-point arguments
 -- are in `d0`-`d7` either way and do not move. Seven general arguments at most,
 -- which the front end checks, since the eighth register is the environment's.
-fun emitDefinitions(m : Module, asm : Asm.Asm, b : String.Builder) -> Unit {
+fun emitDefinitions(m : Module, asm : Asm.Asm, b : Code) -> Unit {
     for (sym, name) in m.definitions {
         for f in m.functions {
             if f.name == name {
@@ -939,32 +909,32 @@ fun emitDefinitions(m : Module, asm : Asm.Asm, b : String.Builder) -> Unit {
                         _ -> { general = general + 1 }
                     }
                 }
-                function(b, asm.dialect, Asm.runtimeFor(asm.dialect, sym))
+                function(b, Asm.runtimeFor(asm.dialect, sym))
                 for var k = general; k > 0; k = k - 1 {
                     instruction(b, A.Mov(Physical(Gp, k), Physical(Gp, k - 1), A.W64))
                 }
                 instruction(b, A.Mov(A.x0, A.xzr, A.W64))
-                line(b, "    b " + Asm.symbolFor(asm.dialect, name))
+                instruction(b, A.B(Asm.symbolFor(asm.dialect, name)))
             }
         }
     }
 }
 
 -- A symbol's address, in a register: the page, then the offset within it.
--- The same pair `Turkey.Select.address` emits, spelled here because the entry
--- sequence is text rather than selected instructions.
-fun symbolInto(b : String.Builder, d : Asm.Dialect, r : Reg, sym : String) -> Unit {
-    instruction(b, A.Adrp(r, Asm.page(d, sym)))
-    instruction(b, A.AddLo(r, r, Asm.pageOffset(d, sym)))
+-- The same pair `Turkey.Select.address` emits, for code the emitter writes
+-- itself rather than code selection chose.
+fun symbolInto(b : Code, r : Reg, sym : Asm.Symbol) -> Unit {
+    instruction(b, A.Adrp(r, sym))
+    instruction(b, A.AddLo(r, r, sym))
 }
 
-fun call(b : String.Builder, d : Asm.Dialect, name : String) -> Unit =
-    line(b, "    bl " + Asm.runtimeFor(d, name))
+fun call(b : Code, d : Asm.Dialect, name : String) -> Unit =
+    instruction(b, A.Bl(Asm.runtimeFor(d, name)))
 
 -- A store through a register base, with the offset in `scratch` when the
 -- immediate does not reach. `boot` interns thousands of literals, so the root
 -- array is past 32,760 bytes long before the corpus is.
-fun storeAt(b : String.Builder, r : Reg, base : Reg, offset : Int) -> Unit {
+fun storeAt(b : Code, r : Reg, base : Reg, offset : Int) -> Unit {
     if offset <= widestOffset {
         instruction(b, A.Str(r, Offset(base, offset), A.W64))
         return
@@ -987,7 +957,7 @@ fun byteLength(text : String) -> Int {
 -- Every safepoint's live roots, keyed by return address.
 --
 -- The emitter cannot sort this: the addresses do not exist until the linker
--- has run, and all it can write is `.quad <label>` for the linker to
+-- has run, and all it can write is a word naming the label, for the linker to
 -- relocate. So the runtime owns the lookup structure, which is OCaml's
 -- division and the one LLVM states outright -- the compiler's format is for
 -- getting the facts across, not for being queried.
@@ -995,20 +965,20 @@ fun byteLength(text : String) -> Int {
 -- The offsets are from `x29`, signed, and `Turkey.Frame.layout` has been
 -- computing them since phase 4.
 fun emitFrameTable(asm : Asm.Asm, layouts : Array (Int, Frame.Layout),
-                   b : String.Builder) -> Unit {
+                   b : Code) -> Unit {
     let d = asm.dialect
-    line(b, "    " + Asm.section(d, Asm.Relocated))
-    line(b, "    .p2align 3")
-    line(b, "    .globl " + Asm.frameTableSymbol(d))
-    line(b, Asm.frameTableSymbol(d) + ":")
+    emit(b, Section(Asm.Relocated))
+    emit(b, Align(3))
+    emit(b, Global(Asm.frameTableSymbol(d)))
+    emit(b, Label(Asm.frameTableSymbol(d)))
     var n = 0
     for (_, l) in layouts { n = n + len(l.maps) }
-    line(b, "    .quad " + Int.toString(n))
+    emit(b, Word(n))
     for (tag, l) in layouts {
         for m in l.maps {
-            line(b, "    .quad " + safepointLabel(d, tag, m.block, m.index))
-            line(b, "    .quad " + Int.toString(len(m.offsets)))
-            for o in m.offsets { line(b, "    .quad " + Int.toString(o)) }
+            emit(b, WordOf(safepointLabel(d, tag, m.block, m.index)))
+            emit(b, Word(len(m.offsets)))
+            for o in m.offsets { emit(b, Word(o)) }
         }
     }
 }

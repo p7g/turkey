@@ -43,8 +43,10 @@ module Turkey.Arm64 (
 -- them. Both are places where a bigger backend would generalize and this one
 -- has no instruction that would use it.
 
+import Turkey.Asm as Asm
+import Turkey.Asm (Symbol)
 import Turkey.Ssa as Ssa
-import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..),
+import Turkey.Ssa (Value(..), Rep(..), RepClass(..),
                    Effects(..), Term(..))
 
 -- A register: virtual while selection and the allocator are running, physical
@@ -168,10 +170,9 @@ type Mem
     | OutgoingArg(Int)
     -- A symbol, as the offset within the page its base register holds: the
     -- second half of an `adrp` pair, folded into the access so the address is
-    -- never formed on its own. The string is the dialect's spelling of the
-    -- offset (`sym@PAGEOFF`, `:lo12:sym`), and the symbol must be aligned to
-    -- the access width, as every global and the process state are.
-    | PageOffset(Reg, String)
+    -- never formed on its own. The symbol must be aligned to the access width,
+    -- as every global and the process state are.
+    | PageOffset(Reg, Symbol)
 
 type Arm
     -- Moves and constants. `MovZ`/`MovK` build a 64-bit constant in up to four
@@ -234,11 +235,10 @@ type Arm
     | Stp(Reg, Reg, Reg, Int)
     | Ldp(Reg, Reg, Reg, Int)
     -- The address of a symbol, in the two-instruction form arm64 uses: a page
-    -- and an offset within it. Each string is the operand as the assembler
-    -- reads it, relocation and all, because how a relocation is spelled is the
-    -- object format's business (`Turkey.Asm.page`) and not the instruction's.
-    | Adrp(Reg, String)
-    | AddLo(Reg, Reg, String)
+    -- and an offset within it. How either half is spelled for the assembler is
+    -- the object format's business (`Turkey.Asm.page`), not the instruction's.
+    | Adrp(Reg, Symbol)
+    | AddLo(Reg, Reg, Symbol)
     -- The address of a frame slot, `add d, sp, #offset` once the frame is laid
     -- out. Only an object built in the frame is ever addressed: every other
     -- slot is read and written where it is.
@@ -275,7 +275,7 @@ type Arm
     -- and the reason a pseudo-instruction is a category the enum has at all.
     | MovConst(Reg, Int)
     -- Calls. `Bl` is direct and `Blr` is through a register.
-    | Bl(String)
+    | Bl(Symbol)
     | Blr(Reg)
     -- A pseudo-instruction: the arguments a call passes and the register it
     -- answers in are not operands of `Bl`, so without this the allocator would
@@ -305,9 +305,23 @@ type Arm
     -- register with either (`writesBeforeReading`).
     | AllocateArray(Reg, Reg, Reg, ArrayAllocation)
     | Ret
-    | B(BlockId)
-    | BCond(Cond, BlockId)
+    -- Branches to a label: a block, an allocation's stub, or another
+    -- function's symbol for a tail call. The emitter places them; selection
+    -- ends a block with a terminator instead.
+    | B(Symbol)
+    | BCond(Cond, Symbol)
+    -- Branch if the register, at this width, is zero or is not.
+    | Cbz(Reg, Symbol, Width)
+    | Cbnz(Reg, Symbol, Width)
     | Brk(Int)
+    -- The emitter's own, for the frame and the entry sequence. `MovN` writes
+    -- the complement of its immediate, which is how `-1` is one instruction.
+    -- `AddExt` and `SubExt` are the extended-register forms, the ones that
+    -- read register 31 as `sp` rather than `xzr`: how `sp` moves by an amount
+    -- too large for an immediate.
+    | MovN(Reg, Int)
+    | AddExt(Reg, Reg, Reg)
+    | SubExt(Reg, Reg, Reg)
 
 -- What `Allocate` takes: the size class, the payload's size and heap kind
 -- for the header, the runtime's slow path and its arguments, and the cursor
@@ -318,12 +332,12 @@ type Allocation = Allocation {
     slotBytes : Int,
     size      : Int,
     kind      : Int,
-    slow      : String,
+    slow      : Symbol,
     args      : Array AllocArg,
-    cursors   : String,
+    cursors   : Symbol,
 }
 
-type AllocArg = Constant(Int) | AddressOf(String)
+type AllocArg = Constant(Int) | AddressOf(Symbol)
 
 -- What `AllocateArray` takes: the element's width in bytes and layout code,
 -- the runtime's slow path, and the symbols of the cursor table and the size
@@ -331,9 +345,9 @@ type AllocArg = Constant(Int) | AddressOf(String)
 type ArrayAllocation = ArrayAllocation {
     width   : Int,
     layout  : Int,
-    slow    : String,
-    cursors : String,
-    classes : String,
+    slow    : Symbol,
+    cursors : Symbol,
+    classes : Symbol,
 }
 
 -- An instruction and the register it defines, mirroring `Turkey.LowIr.Low`.
@@ -648,9 +662,14 @@ fun anySrc(op : Arm, p : fun(Reg) -> Bool) -> Bool = match op {
     Ret                 -> False
     B(_)                -> False
     BCond(_, _)         -> False
+    Cbz(a, _, _)        -> p(a)
+    Cbnz(a, _, _)       -> p(a)
     Allocate(_, _)      -> False
     AllocateArray(_, n, v, _) -> p(n) || p(v)
     Brk(_)              -> False
+    MovN(_, _)          -> False
+    AddExt(_, a, b)     -> p(a) || p(b)
+    SubExt(_, a, b)     -> p(a) || p(b)
 }
 
 
@@ -728,9 +747,14 @@ fun mapUses(op : Arm, g : fun(Reg) -> Reg) -> Arm = match op {
     Ret                   -> Ret
     B(k0)                 -> B(k0)
     BCond(k0, k1)         -> BCond(k0, k1)
+    Cbz(a, k1, k2)        -> Cbz(g(a), k1, k2)
+    Cbnz(a, k1, k2)       -> Cbnz(g(a), k1, k2)
     Allocate(k0, k1)      -> Allocate(k0, k1)
     AllocateArray(k0, n, v, k3) -> AllocateArray(k0, g(n), g(v), k3)
     Brk(k0)               -> Brk(k0)
+    MovN(k0, k1)          -> MovN(k0, k1)
+    AddExt(k0, a, b)      -> AddExt(k0, g(a), g(b))
+    SubExt(k0, a, b)      -> SubExt(k0, g(a), g(b))
 }
 
 fun mapMem(m : Mem, g : fun(Reg) -> Reg) -> Mem = match m {
@@ -819,9 +843,14 @@ fun rewrite(op : Arm, g : fun(Reg) -> Reg, m : fun(Mem) -> Mem) -> Arm = match o
     Ret                      -> Ret
     B(f0)                    -> B(f0)
     BCond(f0, f1)            -> BCond(f0, f1)
+    Cbz(f0, f1, f2)          -> Cbz(g(f0), f1, f2)
+    Cbnz(f0, f1, f2)         -> Cbnz(g(f0), f1, f2)
     Allocate(f0, f1)         -> Allocate(g(f0), f1)
     AllocateArray(f0, f1, f2, f3) -> AllocateArray(g(f0), g(f1), g(f2), f3)
     Brk(f0)                  -> Brk(f0)
+    MovN(f0, f1)             -> MovN(g(f0), f1)
+    AddExt(f0, f1, f2)       -> AddExt(g(f0), g(f1), g(f2))
+    SubExt(f0, f1, f2)       -> SubExt(g(f0), g(f1), g(f2))
 }
 
 -- Whether `p` holds of some register an instruction *writes*, physical ones
@@ -900,9 +929,14 @@ fun anyDest(op : Arm, p : fun(Reg) -> Bool) -> Bool = match op {
     Ret                 -> False
     B(_)                -> False
     BCond(_, _)         -> False
+    Cbz(_, _, _)        -> False
+    Cbnz(_, _, _)       -> False
     Allocate(d, _)      -> p(d)
     AllocateArray(d, _, _, _) -> p(d)
     Brk(_)              -> False
+    MovN(d, _)          -> p(d)
+    AddExt(d, _, _)     -> p(d)
+    SubExt(d, _, _)     -> p(d)
 }
 
 fun eachSrc(op : Arm, f : fun(Reg) -> Unit) -> Unit {
@@ -1006,7 +1040,8 @@ instance Show Mem {
         ObjectSlot(n, k) -> "[object " + Int.toString(n) + ", #" + Int.toString(k) + "]"
         IncomingArg(k) -> "[incoming " + Int.toString(k) + "]"
         OutgoingArg(k) -> "[outgoing " + Int.toString(k) + "]"
-        PageOffset(base, sym) -> "[" + baseName(base) + ", " + sym + "]"
+        PageOffset(base, sym) ->
+            "[" + baseName(base) + ", " + Asm.pageOffset(sym) + "]"
     }
 }
 
@@ -1031,10 +1066,10 @@ fun showArm(op : Arm) -> String = match op {
                               + (if shift == 0 { "" }
                                  else { ", lsl #" + Int.toString(shift) })
     Add(d, a, b, w)        -> three("add", d, a, b, w)
-    AddImm(d, a, n, w)     -> imm("add", d, a, n, w)
+    AddImm(d, a, n, w)     -> stackImm("add", d, a, n, w)
     AddS(d, a, b, w)       -> three("adds", d, a, b, w)
     Sub(d, a, b, w)        -> three("sub", d, a, b, w)
-    SubImm(d, a, n, w)     -> imm("sub", d, a, n, w)
+    SubImm(d, a, n, w)     -> stackImm("sub", d, a, n, w)
     SubS(d, a, b, w)       -> three("subs", d, a, b, w)
     AddSImm(d, a, n, w)    -> imm("adds", d, a, n, w)
     SubSImm(d, a, n, w)    -> imm("subs", d, a, n, w)
@@ -1090,9 +1125,9 @@ fun showArm(op : Arm) -> String = match op {
     FCmp(a, b)             -> "fcmp " + fpName(a) + ", " + fpName(b)
     Scvtf(d, a)            -> "scvtf " + fpName(d) + ", " + showReg(a, W64)
     Fcvtzs(d, a)           -> "fcvtzs " + showReg(d, W64) + ", " + fpName(a)
-    Adrp(d, at)            -> "adrp " + showReg(d, W64) + ", " + at
-    AddLo(d, a, at)        -> "add " + showReg(d, W64) + ", " + showReg(a, W64)
-                              + ", " + at
+    Adrp(d, sym)           -> "adrp " + showReg(d, W64) + ", " + Asm.page(sym)
+    AddLo(d, a, sym)       -> "add " + showReg(d, W64) + ", " + showReg(a, W64)
+                              + ", " + Asm.pageOffset(sym)
     -- After layout the slot is `sp` and an offset, or `sp` and the scratch
     -- register holding one too wide for an immediate.
     FrameAddress(d, m)     -> match m {
@@ -1102,7 +1137,7 @@ fun showArm(op : Arm) -> String = match op {
                                 + ", " + showReg(index, W64)
         other -> "add " + showReg(d, W64) + ", " + show(other)
     }
-    Bl(sym)                -> "bl " + sym
+    Bl(sym)                -> "bl " + Asm.spell(sym)
     Blr(a)                 -> "blr " + showReg(a, W64)
     -- Printed as a comment: it has no encoding and exists to tell the register
     -- allocator what a call reads and writes.
@@ -1110,14 +1145,21 @@ fun showArm(op : Arm) -> String = match op {
                               + " defs " + Int.toString(len(outs))
     SafepointMap(b, n)     -> "// safepoint " + Int.toString(b) + ":" + Int.toString(n)
     Ret                    -> "ret"
-    B(target)              -> "b " + blockLabel(target)
-    BCond(c, target)       -> "b." + condName(c) + " " + blockLabel(target)
+    B(target)              -> "b " + Asm.spell(target)
+    BCond(c, target)       -> "b." + condName(c) + " " + Asm.spell(target)
+    Cbz(a, target, w)      -> "cbz " + showReg(a, w) + ", " + Asm.spell(target)
+    Cbnz(a, target, w)     -> "cbnz " + showReg(a, w) + ", " + Asm.spell(target)
     Allocate(d, a)         -> "// allocate " + showReg(d, W64) + ", class "
-                              + Int.toString(a.sizeClass) + ", " + a.slow
+                              + Int.toString(a.sizeClass) + ", " + Asm.spell(a.slow)
     AllocateArray(d, n, v, a) -> "// allocate array " + showReg(d, W64) + ", "
                                  + showReg(n, W64) + " of " + showReg(v, W64) + ", "
-                                 + a.slow
+                                 + Asm.spell(a.slow)
     Brk(n)                 -> "brk #" + Int.toString(n)
+    MovN(d, n)             -> "movn " + showReg(d, W64) + ", #" + Int.toString(n)
+    AddExt(d, a, b)        -> "add " + baseName(d) + ", " + baseName(a) + ", "
+                              + showReg(b, W64)
+    SubExt(d, a, b)        -> "sub " + baseName(d) + ", " + baseName(a) + ", "
+                              + showReg(b, W64)
 }
 
 fun three(name : String, d : Reg, a : Reg, b : Reg, w : Width) -> String =
@@ -1126,9 +1168,14 @@ fun three(name : String, d : Reg, a : Reg, b : Reg, w : Width) -> String =
 fun imm(name : String, d : Reg, a : Reg, n : Int, w : Width) -> String =
     name + " " + showReg(d, w) + ", " + showReg(a, w) + ", #" + Int.toString(n)
 
--- Local labels. `L` is the assembler's convention for a symbol that does not
--- reach the symbol table, which is what a basic block should be.
-fun blockLabel(b : BlockId) -> String = "Lb" + Int.toString(Ssa.blockId(b))
+-- `add` and `sub` with an immediate read register 31 as `sp`, which is how the
+-- frame moves.
+fun stackImm(name : String, d : Reg, a : Reg, n : Int, w : Width) -> String =
+    match w {
+        W32 -> imm(name, d, a, n, w)
+        W64 -> name + " " + baseName(d) + ", " + baseName(a) + ", #" + Int.toString(n)
+    }
+
 
 -- A register in the vector file. The width is not a parameter because there is
 -- only one: `W64` reaches `showReg`, which answers `d` for anything in `Fp`.

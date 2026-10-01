@@ -474,6 +474,20 @@ fun defines(m : SsaLower.Module, name : String) -> Bool {
     False
 }
 
+-- Whether some function calls the runtime entry point for primitive `name`.
+fun callsRuntime(m : SsaLower.Module, name : String) -> Bool {
+    for f in m.functions {
+        for block in f.blocks {
+            for i in block.insts {
+                if let LowIr.Call(LowIr.Runtime(called), _) = i.op {
+                    if called == name { return True }
+                }
+            }
+        }
+    }
+    False
+}
+
 -- Besides the `foreign` definitions: a coroutine's start, which only the code
 -- `Turkey.Emit` writes calls.
 fun roots(checked : Checked) -> Array String =
@@ -655,9 +669,14 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     -- table is not complete until it has run either.
     Emit.emitEntry(asm, module_, Map.getOr(entry.scope.values, "main", "main"),
                    sites, code)
-    Emit.emitSwapStack(asm, code)
-    -- Only in a program that has coroutines: it calls their start.
-    if defines(module_, Rt.coroutineStart) { Emit.emitStackStart(asm, code) }
+    -- Each only in a program that needs it: the switch names the runtime's
+    -- record of the running stack, and the start calls a coroutine's start
+    -- and then the switch.
+    let coroutines = defines(module_, Rt.coroutineStart)
+    if coroutines || callsRuntime(module_, "Prim.swapStack") {
+        Emit.emitSwapStack(asm, code)
+    }
+    if coroutines { Emit.emitStackStart(asm, code) }
     Emit.emitDefinitions(module_, asm, code)
     Emit.emitMessages(asm, code)
     Emit.emitData(module_, asm, sites, code)

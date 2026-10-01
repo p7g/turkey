@@ -49,17 +49,19 @@ type Pressure = Pressure { gp : Int, fp : Int }
 -- The general file has 31 numbered registers. `x31` is `sp` or `xzr`
 -- depending on the instruction and is never allocatable; `x29` is the frame
 -- pointer and `x30` the link register, both of which the prologue owns; and
--- `x18` is reserved by the platform on Darwin, and `x16`/`x17` are this
--- backend's scratch registers. That leaves x0-x15 and x19-x28.
-let availableGp = 26
+-- `x18` is reserved by the platform on Darwin, `x16`/`x17` are this
+-- backend's scratch registers, and `x28` holds the running worker
+-- (`A.worker`). That leaves x0-x15 and x19-x27.
+let availableGp = 25
 -- The vector file has 32 and this backend reserves none, because every double
 -- it makes is 64 bits and nothing vectorizes yet.
 let availableFp = 32
 
 -- What survives a call, which is a much smaller set than what exists. A value
 -- live across a `bl` and held in a caller-saved register is destroyed by the
--- callee, so it needs one of these or a spill slot -- and there are ten.
-let calleeSavedGp = 10
+-- callee, so it needs one of these or a spill slot -- and there are nine,
+-- `x28` being the worker's.
+let calleeSavedGp = 9
 let calleeSavedFp = 8
 
 -- The maximum number of values simultaneously live, per file.
@@ -632,7 +634,7 @@ fun nextUse(block : Ssa.Block A.Inst, id : Int, from : Int) -> Int {
 -- parallel copy -- QBE, Go and Cranelift all reserve one or both for the same
 -- jobs.
 let gpPool = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
-              19, 20, 21, 22, 23, 24, 25, 26, 27, 28]
+              19, 20, 21, 22, 23, 24, 25, 26, 27]
 -- The vector file's callee-saved half is `d8`-`d15`, so the caller-saved ones
 -- go first here too -- from both ends, since `v0`-`v7` and `v16`-`v31` are the
 -- caller-saved halves.
@@ -745,7 +747,8 @@ type PhysicalLive = PhysicalLive { gp : Array Int, fp : Array Int }
 -- call, the result out of `x0` after it -- so nothing should be live on entry,
 -- and `verifyColouring` says so if it is. `x31` is not a register anything can
 -- hold: it is `xzr` or `sp`. Nor is `x29`, which the prologue sets and nothing
--- else writes, so reading it -- `Prim.frameAddress` does -- is always good.
+-- else writes, so reading it -- `Prim.frameAddress` does -- is always good;
+-- nor `x28`, the worker, which nothing in a function writes at all.
 fun physicalLive(block : Ssa.Block A.Inst) -> (Array PhysicalLive, PhysicalLive) {
     -- Nothing is live at almost every point, so those share one value.
     let nothing = PhysicalLive { gp = [], fp = [] }
@@ -764,7 +767,7 @@ fun physicalLive(block : Ssa.Block A.Inst) -> (Array PhysicalLive, PhysicalLive)
             Virtual(_) -> {}
         })
         A.eachSrc(op, fun(r) = match r {
-            Physical(Gp, k) -> if k != 31 && k != 29 { BitSet.add(gp, k) }
+            Physical(Gp, k) -> if k != 31 && k != 29 && k != 28 { BitSet.add(gp, k) }
             Physical(Fp, k) -> BitSet.add(fp, k)
             Virtual(_) -> {}
         })

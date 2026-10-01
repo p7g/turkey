@@ -472,6 +472,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         -- own width apart -- not eight, which is why the width comes from
         -- `Turkey.Runtime` rather than being assumed here.
         ArrayGet(target, index) -> {
+            withinStorage(s, A.reg(target), A.reg(index))
             let at = elementAt(s, A.reg(target), A.reg(index), r.class_)
             match Rt.elementWidth(r.class_) {
                 1 -> emit(s, A.Ldrb(d, at))
@@ -480,6 +481,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             }
         }
         ArraySet(target, index, v) -> {
+            withinStorage(s, A.reg(target), A.reg(index))
             let held = Ssa.repOf(s.source, v)
             let at = elementAt(s, A.reg(target), A.reg(index), held.class_)
             match Rt.elementWidth(held.class_) {
@@ -692,6 +694,23 @@ fun immediate(s : Sel, n : Int) -> Reg {
 -- A call to one of the runtime's untyped entry points: every argument and the
 -- result is a machine word, because `raw` has already moved any double's bits
 -- into the general file.
+-- Panic unless `index` is within `array`'s own length.
+--
+-- The check a memory-safe access needs, made against the array object being
+-- accessed and nothing else. A growable `Array` checks its index against its
+-- own `length` field first, for the error a program can understand, but that
+-- field and the storage it describes are two words written separately: a
+-- task reading them while another grows the array could see the new length
+-- with the old, shorter storage. Every safety check reads only the object it
+-- protects, so that no race between tasks can turn into an access outside an
+-- object. Unsigned, so a negative index fails too.
+fun withinStorage(s : Sel, array : Reg, index : Reg) -> Unit {
+    let length = temp(s, Ssa.untraced(I64))
+    emit(s, A.Ldr(length, A.Offset(array, 8), A.W64))
+    emit(s, A.Cmp(index, length, A.W64))
+    guardOn(s, A.Hs, "array access outside the array's storage")
+}
+
 -- The frame object `v` addresses. Every one has a slot: `Turkey.Roots` lists
 -- them from the same instructions.
 fun frameObject(s : Sel, v : Value) -> Int = match Roots.objectOf(s.frame, Ssa.valueId(v)) {

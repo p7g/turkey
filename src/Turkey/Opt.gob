@@ -79,6 +79,7 @@ import Turkey.Decls (DeclTable(..), substitute)
 import Turkey.Deps as Deps
 import Turkey.Diag as Diag
 import Turkey.Methods as Methods
+import Turkey.Prelude as P
 import Turkey.Source (Span)
 import Turkey.Types as Ty
 import Turkey.Types (VarCell(..), TBottom)
@@ -297,6 +298,12 @@ type Reducer = Reducer {
     -- and an atom mentions no other binding, so it is finished before anything
     -- that reads it is reduced.
     constants : Map String CBind,
+    -- The top-level `var`s nothing ever writes, by the atom each holds from
+    -- the start: a read of one is that atom. Only a `var` every mention of
+    -- which is a read (`written`), since one passed along as a reference
+    -- could be written through.
+    unwritten : Map String Core,
+    written : Set.Set String,
     -- For the join points case-of-case invents. Per program and in traversal
     -- order, so it is deterministic and a golden can hold it.
     counter : Int,
@@ -326,7 +333,7 @@ fun newReducer(program : CProgram, decls : DeclTable) -> Reducer {
         active = Array.new(8), sizes = Map.new(), moves = Map.new(),
         ends = Map.new(), wrote = Map.new(),
         speculating = False, reduced = Map.new(), constants = Map.new(),
-        counter = 0,
+        unwritten = Map.new(), written = mentioned(all), counter = 0,
         usedNames = used,
     }
 }
@@ -365,6 +372,12 @@ fun reduceProgram(program : CProgram, decls : DeclTable) -> CProgram {
                     if !binds[index].mutable && atomic(value) {
                         Map.put(r.constants, name,
                                 withValue(binds[index], value))
+                    }
+                    match value.kind {
+                        CRef(initial) -> if atomic(initial) && !Set.contains(r.written, name) {
+                            Map.put(r.unwritten, name, initial)
+                        }
+                        _ -> {}
                     }
                 }
                 None -> {}
@@ -507,9 +520,52 @@ fun step(r : Reducer, e : Core) -> Option Core {
             return floatLetThroughJoin(e)
         }
         CJoin(_, _, _, _, _) -> return specializeJoin(r, e)
+        CIf(_, _, _) -> return knownCondition(e)
+        CDeref(target) -> return match target.kind {
+            CVar(name) -> match Map.get(r.unwritten, name) {
+                Some(initial) -> Some(mkCore(e.ty, e.span, initial.kind))
+                None -> None
+            }
+            _ -> None
+        }
         _ -> {}
     }
     None
+}
+
+-- The names mentioned anywhere other than as the reference a `!` reads: an
+-- assignment's target, a reference passed as a value. A top-level `var` not
+-- among them is never written.
+fun mentioned(binds : Array CBind) -> Set.Set String {
+    let out = Set.new()
+    for b in binds { mentionsInto(b.value, out) }
+    out
+}
+
+fun mentionsInto(e : Core, out : Set.Set String) -> Unit = match e.kind {
+    CVar(name) -> Set.add(out, name)
+    CDeref(target) -> match target.kind {
+        CVar(_) -> {}
+        _ -> mentionsInto(target, out)
+    }
+    _ -> eachKid(e.kind, mentionsInto(_, out))
+}
+
+-- An `if` whose condition is a constructor of `Bool`: the arm it chooses,
+-- with a missing `else` as the unit it answers. A top-level `let` of a
+-- constant has been substituted by now (`constant`), so this is what removes
+-- code behind a flag the program fixes at compile time.
+fun knownCondition(e : Core) -> Option Core = match e.kind {
+    CIf(cond, then, otherwise) -> match constructorName(cond) {
+        Some(name) -> if name == P.boolTrue { Some(then) }
+                      else if name == P.boolFalse { match otherwise {
+                          Some(o) -> Some(o)
+                          None -> Some(mkCore(e.ty, e.span, CUnit))
+                      } }
+                      else { None }
+        None -> None
+    }
+    _ -> None
 }
 
 fun fresh(r : Reducer, hint : String) -> String {

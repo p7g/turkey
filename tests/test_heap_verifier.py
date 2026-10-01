@@ -402,12 +402,15 @@ def test_verifier_detects_corruption(verifier_probe, case, diagnostic):
 @pytest.mark.parametrize("defect", ["native-roots", "children"])
 def test_broken_collector_is_stopped_before_sweeping(tmp_path, defect):
     source = tmp_path / "main.gob"
+    # Arrays in an array that grows, so that objects are reachable only
+    # through other heap objects while the program allocates.
     source.write_text('''
 fun main() {
-    let x = [42]
-    let y = [x]
-    let z = [y]
-    print(z[0][0][0])
+    var rows = []
+    for var i = 0; i < 3; i = i + 1 {
+        Array.push(rows, [i, i + 1])
+    }
+    print(rows[2][1] + 39)
 }
 ''')
     if toolchain.missing():
@@ -426,7 +429,8 @@ fun main() {
         after = before + "        if !Prim.ptrIsNull(object) { continue }\n"
     assert text.count(before) == 1, before
     heap.write_text(text.replace(before, after))
-    result = subprocess.run(toolchain.command(bootc.binary(), "native", str(source)),
+    result = subprocess.run(toolchain.command(bootc.binary(), "native", "--gc-verify",
+                                              str(source)),
                             cwd=bootc.REPO_ROOT, capture_output=True, text=True,
                             check=True, env=dict(os.environ, TURKEY_LIB=str(library)))
     generated = tmp_path / "main.s"
@@ -436,7 +440,7 @@ fun main() {
                     "-o", str(binary)],
                    capture_output=True, text=True, check=True)
     result = subprocess.run(toolchain.command(binary), capture_output=True, text=True, timeout=20,
-                            env=dict(os.environ, TURKEY_GC_STRESS="1", TURKEY_GC_VERIFY="1"))
+                            env=dict(os.environ, TURKEY_GC_STRESS="1"))
     assert result.returncode == 1, result.stderr
     assert "heap verifier: reachable object is unmarked" in result.stderr
     assert "42" not in result.stdout

@@ -349,6 +349,15 @@ fun walk(f : Func A.Inst, spills : Spills, evict : Bool) -> Walk {
         -- destination's register, which is what makes `add x0, x0, x1` legal.
         let ends = endings(f, block, liveOut[b], scratch)
         for var n = 0; n < len(block.insts); n = n + 1 {
+            -- An instruction that writes its destination before its last read
+            -- of an operand (an inline array allocation) places it while the
+            -- operands that die here still hold their registers.
+            let i = block.insts[n]
+            if A.writesBeforeReading(i.op) {
+                Ssa.eachDef(i, fun(d) = place(w, taken, Ssa.valueId(d), block, n + 1))
+                for id in ends[n] { releaseValue(w, taken, id) }
+                continue
+            }
             for id in ends[n] { releaseValue(w, taken, id) }
             Ssa.eachDef(block.insts[n], fun(d) =
                 place(w, taken, Ssa.valueId(d), block, n + 1))
@@ -660,6 +669,10 @@ fun forbiddenSets(f : Func A.Inst, liveOut : Array BitSet) -> Array Int {
             if len(clobbered) > 0 || holding {
                 let after = BitSet.elements(live)
                 for id in after {
+                    -- A call that defines a register itself (`Allocate`)
+                    -- destroys the caller-saved ones before it writes that
+                    -- register, so its own result may take one.
+                    if A.isCall(i) && defines(i, id) { continue }
                     let bank = A.bankOf(f.reps[id])
                     for (cb, cn) in clobbered {
                         if sameBank(bank, cb) { out[id] = forbid(out[id], cn) }
@@ -683,6 +696,7 @@ fun forbiddenSets(f : Func A.Inst, liveOut : Array BitSet) -> Array Int {
     out
 }
 
+fun defines(i : A.Inst, id : Int) -> Bool = Ssa.anyDef(i, fun(v) = Ssa.valueId(v) == id)
 fun forbidHeld(out : Array Int, f : Func A.Inst, held : PhysicalLive,
                id : Int) -> Unit {
     let taken = match A.bankOf(f.reps[id]) {
@@ -706,6 +720,14 @@ fun touched(i : A.Inst, after : Array Int) -> Array Int {
         let id = Ssa.valueId(d)
         if !Array.contains(out, id) { Array.push(out, id) }
     })
+    -- And an operand read after the destination is written, which holds its
+    -- register at the same time as the destination does.
+    if A.writesBeforeReading(i.op) {
+        Ssa.eachUse(i, fun(u) {
+            let id = Ssa.valueId(u)
+            if !Array.contains(out, id) { Array.push(out, id) }
+        })
+    }
     out
 }
 
@@ -1095,7 +1117,8 @@ fun spill(g : Func A.Inst, ids : Set.Set Int, roots : Map Int Int,
         let block = g.blocks[b]
         let out : Array A.Inst = []
         for p in block.params { storeIfSpilled(out, spills, ids, Ssa.valueId(p)) }
-        for i in block.insts {
+        for var n = 0; n < len(block.insts); n = n + 1 {
+            let i = block.insts[n]
             -- Selection stores every root into its slot before a safepoint. A
             -- value spilled into that same slot was written there at its
             -- definition, so the store is a reload and a write of what the slot
@@ -1107,6 +1130,14 @@ fun spill(g : Func A.Inst, ids : Set.Set Int, roots : Map Int Int,
                 op = A.mapUses(op, renamed(_, id, t))
             }
             Array.push(out, A.Inst { op = op })
+            -- A call that defines its own result (`Allocate`) keeps its
+            -- safepoint map directly after it, where the frame expects it, and
+            -- the result's spill store goes after the map.
+            if A.isCall(i) && n + 1 < len(block.insts)
+               && Option.isSome(A.safepointOf(block.insts[n + 1].op)) {
+                Array.push(out, block.insts[n + 1])
+                n = n + 1
+            }
             Ssa.eachDef(i, fun(d) =
                 storeIfSpilled(out, spills, ids, Ssa.valueId(d)))
         }
@@ -1277,6 +1308,11 @@ fun checkStore(out : Array String, spills : Spills, block : Ssa.Block A.Inst,
     }
     var m = n - 1
     while m >= 0 && isStore(block.insts[m].op) { m = m - 1 }
+    -- An `Allocate`'s result is stored after its safepoint map.
+    if m >= 1 && Option.isSome(A.safepointOf(block.insts[m].op))
+       && A.isCall(block.insts[m - 1]) {
+        m = m - 1
+    }
     let defined = if m >= 0 {
         Ssa.anyDef(block.insts[m], fun(d) = Ssa.valueId(d) == id)
     } else {

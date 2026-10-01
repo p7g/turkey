@@ -2,9 +2,9 @@
 its frame.
 
 Each test compiles a program, reads the low IR to see which allocations moved
-into the frame, and runs it -- plainly, and where the collector matters with
-`TURKEY_GC_STRESS=1 TURKEY_GC_VERIFY=1`, which collects at every allocation
-and checks the heap each time. A frame object the collector failed to trace
+into the frame, and runs it -- plainly, and where the collector matters
+compiled with `--gc-verify` and run with `TURKEY_GC_STRESS=1`, which collects
+at every allocation and checks the heap each time. A frame object the collector failed to trace
 through, or one freed or overwritten while reachable, shows up there as a
 verifier failure or wrong output.
 """
@@ -13,7 +13,8 @@ import re
 
 from tests import lang
 
-STRESS = {"TURKEY_GC_STRESS": "1", "TURKEY_GC_VERIFY": "1"}
+STRESS = {"TURKEY_GC_STRESS": "1"}
+VERIFY = ("--gc-verify",)
 
 
 def _function(ssa: str, name: str) -> str:
@@ -27,7 +28,7 @@ def _ssa(src: str) -> str:
 
 
 def _stressed(src: str) -> str:
-    result = lang.run(src, env=STRESS)
+    result = lang.run(src, env=STRESS, flags=VERIFY)
     assert result.code == 0, result.stderr
     return result.stdout
 

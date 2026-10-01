@@ -195,15 +195,15 @@ combined run takes about nine minutes. The build of `boot` and everything the te
 compute from it are cached in `$TMPDIR` by content hash, so a second run
 with nothing changed is quicker; `-n0` runs serially, for debugging.
 
-To check the heap while debugging a compiled program, run it with
-`TURKEY_GC_VERIFY=1`. Each collection independently checks object bounds,
+To check the heap while debugging a program, compile it with
+`boot native --gc-verify`. Each collection independently checks object bounds,
 traced references, shadow-stack and native roots, marking completeness,
 region bookkeeping before and after sweeping, and the generational
 invariants: an old object holding a young one must have been remembered by
 the write barrier. Failures report
 `heap verifier:` and terminate the process with exit status 1 before proceeding
 to the next collection phase.
-Combine it with `TURKEY_GC_STRESS=1` to collect and verify at every allocation.
+Run it with `TURKEY_GC_STRESS=1` to collect and verify at every allocation.
 At the compiler's own scale that does not finish; `TURKEY_GC_STRESS=N`
 collects at random intervals averaging N allocations instead, and
 `TURKEY_GC_STRESS_SEED` picks the sequence (1 by default), so a failure can be
@@ -212,6 +212,12 @@ Under stress one collection in eight is full and the rest are minor;
 `TURKEY_GC_GENERATIONAL=0` makes every collection full, to tell a collector
 bug from a missed write barrier.
 Verification scans the allocated heap and uses temporary native memory for a
-region index; it is disabled by default. It checks the roots and layouts the
-compiler supplies, so behavioral stress tests are still needed to catch
-references omitted from those descriptions.
+region index. A program compiled without `--gc-verify` has no verifier in it
+at all, and says so on stderr if it is run with `TURKEY_GC_VERIFY` set. It
+checks the roots and layouts the compiler supplies, so behavioral stress tests
+are still needed to catch references omitted from those descriptions.
+
+`boot native --gc-stats` compiles in the collector's accounting: a line per
+collection and a summary at exit, on stderr. Counting sends every allocation
+through the runtime rather than the code compiled in line for it, so a stats
+build's times are slower than a plain one's.

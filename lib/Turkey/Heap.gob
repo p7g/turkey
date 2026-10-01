@@ -44,9 +44,11 @@ import Turkey.Libc as Libc
 
 -- -- layouts ----------------------------------------------------------------------------
 --
--- Copied by `Turkey.HeapCheck` and, for the root frame, shared with the
--- generated code: `Turkey.Emit` builds the globals' one. A change here is a
--- change there.
+-- Copied by `Turkey.HeapCheck` and, for the root frame, the heap header, the
+-- cursors and the size classes, shared with the generated code: `Turkey.Emit`
+-- builds the globals' root frame, and takes small objects' slots from the
+-- cursors itself by `Turkey.Runtime`'s copy of those layouts. A change here is
+-- a change there.
 
 -- `HeapHeader`, immediately before every payload: the generation word, the
 -- payload size, the heap kind (u32) and the mark epoch that last reached it
@@ -192,7 +194,16 @@ var stressInterval : Int = intervalFrom(Libc.getenv(Prim.cString("TURKEY_GC_STRE
 var stress : Bool = stressInterval > 0
 var stressRandom : Int = seedFrom(Libc.getenv(Prim.cString("TURKEY_GC_STRESS_SEED")))
 var stressCountdown : Int = 1
-var verify : Bool = present(Prim.cString("TURKEY_GC_VERIFY"))
+
+-- Heap verification at every collection, by `Turkey.HeapCheck`. Fixed when the
+-- program is compiled, by `boot --gc-verify` (`Turkey.Build`), so that a
+-- program compiled without it has no verifier at all: nothing writes this
+-- `var`, so the optimizer reads it as its constant. A C caller driving the
+-- runtime turns it on and off with `turkey_gc_set_verify`, in a build that
+-- exports that, which is what keeps it a variable there.
+var verify : Bool = Prim.gcVerify
+var verifyIgnored : Bool = notCompiledIn(verify, Prim.cString("TURKEY_GC_VERIFY"),
+                                         Prim.cString("--gc-verify"))
 
 -- Whether a collection may be minor: trace only from the roots and the
 -- remembered objects, keep every old object's mark, and free only young
@@ -209,10 +220,13 @@ var minor : Bool = False
 -- since, which only a full collection finds.
 var liveBytesAfterFull : Int = 0
 
--- Opt-in accounting, printed one line per collection and in `report` when
--- TURKEY_GC_STATS is set: what the collector costs and what drives it, from
--- one run rather than from a profiler.
-var statsWanted : Bool = present(Prim.cString("TURKEY_GC_STATS"))
+-- Opt-in accounting, printed one line per collection and in `report` in a
+-- program compiled with `boot --gc-stats`: what the collector costs and what
+-- drives it, from one run rather than from a profiler. Counting sends every
+-- allocation down the slow path (`refill`), so a run's times include that.
+var statsWanted : Bool = Prim.gcStats
+var statsIgnored : Bool = notCompiledIn(statsWanted, Prim.cString("TURKEY_GC_STATS"),
+                                        Prim.cString("--gc-stats"))
 
 -- The collector runs again once this many times the live set's bytes have
 -- been allocated, or 64KB times it while the live set is smaller than that.
@@ -271,6 +285,23 @@ fun zeroed(bytes : Int) -> Prim.Ptr {
 }
 
 fun present(name : Prim.Ptr) -> Bool = !Prim.ptrIsNull(Libc.getenv(name))
+
+-- Whether the environment asks this run for a debugging aid the program was
+-- compiled without, which is said on stderr rather than ignored: the variable
+-- names the aid, and a run is where it is easiest to expect it to work.
+fun notCompiledIn(built : Bool, name : Prim.Ptr, flag : Prim.Ptr) -> Bool {
+    if built || !present(name) { return False }
+    say(Prim.cString("turkey: "))
+    say(name)
+    say(Prim.cString(" asks for what is chosen when a program is compiled: compile with "))
+    say(flag)
+    say(Prim.cString("\n"))
+    True
+}
+
+fun say(text : Prim.Ptr) -> Unit {
+    let _ = Libc.write(2, text, Libc.strlen(text))
+}
 
 -- -- raw words --------------------------------------------------------------------------
 
@@ -399,6 +430,9 @@ fun tableRemove(region : Prim.Ptr) -> Unit {
 -- already set in the region's allocation bitmap and counted in its `used`, in
 -- `heapCount` and in `allocationsSince`: so a slot is handed out by clearing a
 -- bit in the cursor, and nothing else is written until the word runs out.
+-- Generated code does exactly that for the small objects it allocates
+-- (`Turkey.Select.allocate`), and calls in only when the free word is empty,
+-- so that word is the only state an allocation may change before a refill.
 --
 -- Those reserved slots hold no object, so everything that reads the bitmaps
 -- or the counts -- a collection, the verifier, the C queries -- first calls
@@ -478,8 +512,12 @@ fun bitIndex(lowest : Int) -> Int {
 
 -- Fill the empty cursor of class `sizeClass` from the first word with a free
 -- slot in the head of its available list, making a region if the list is
--- empty; False, with a panic raised, if there is no memory for one. Under GC
--- stress it takes one slot, so that every allocation comes back here.
+-- empty; False, with a panic raised, if there is no memory for one.
+--
+-- Under GC stress, and while statistics are wanted, it takes one slot, so that
+-- every allocation comes back here: generated code takes slots from a cursor
+-- itself (`Turkey.Select.allocateInline`) and tests nothing else, so an empty
+-- cursor is the only way to make an allocation collect or be counted.
 fun refill(cursor : Prim.Ptr, sizeClass : Int) -> Bool {
     var region = Prim.loadPtr(available, times8(sizeClass))
     if Prim.ptrIsNull(region) {
@@ -500,7 +538,7 @@ fun refill(cursor : Prim.Ptr, sizeClass : Int) -> Bool {
     var claim = complement(taken)
     let beyond = Prim.intSubWrapping(capacity, Prim.intShl(w, 6))
     if beyond < 64 { claim = Prim.intAnd(claim, Prim.intSubWrapping(Prim.intShl(1, beyond), 1)) }
-    if stress { claim = Prim.intAnd(claim, Prim.intNegWrapping(claim)) }
+    if stress || statsWanted { claim = Prim.intAnd(claim, Prim.intNegWrapping(claim)) }
     let now = Prim.intOr(taken, claim)
     Prim.storeI64(region, plus(regionAllocated, times8(w)), now)
     let n = population(claim)

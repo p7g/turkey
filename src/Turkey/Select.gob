@@ -511,20 +511,31 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             emit(s, A.Str(A.reg(v), globalAt(s, name), A.W64))
             emit(s, A.Mov(d, A.xzr, A.W64))
         }
-        -- Everything that becomes a runtime call. The heap operations are at
-        -- the runtime's ABI by design (`Turkey.LowIr`'s header), so selecting
-        -- them is choosing a symbol and marshalling arguments -- there is no
-        -- instruction to pick.
-        -- The runtime's untyped interfaces take a raw 64-bit word, so a double
-        -- crosses as its bits rather than in its own file.
-        CellNew(a) -> runtimeCall(s, d, runtimeSymbolOf(s, "turkey_cell_new"), [raw(s, a)],
-                                  [immediate(s, Rt.traceBit(Ssa.repOf(s.source, a)))])
-        -- The fields are written after the call returns, which is why the
-        -- operands are rooted across it (`Turkey.Roots.across`).
+        -- The heap operations. Their runtime entries are at the runtime's ABI
+        -- by design (`Turkey.LowIr`'s header): untyped, so a double crosses as
+        -- its 64-bit word rather than in its own file.
+        --
+        -- A cell, an object and a closure shell are small and of a size known
+        -- here, so they are allocated in line (`allocate`) and the runtime is
+        -- called only when the size class's cursor is empty. Their headers
+        -- and slots are written after the allocation, on either path, which is
+        -- why the operands are rooted across it (`Turkey.Roots.across`); after
+        -- the runtime's own allocator this rewrites what it wrote.
+        CellNew(a) -> {
+            let value = raw(s, a)
+            let traced = Rt.traceBit(Ssa.repOf(s.source, a))
+            allocate(s, d, 16, Rt.heapCell, "turkey_cell_new",
+                     [A.Constant(0), A.Constant(traced)])
+            emit(s, A.Str(value, A.Offset(d, 0), A.W64))
+            let flag = temp(s, Ssa.untraced(I32))
+            constant(s, flag, traced)
+            emit(s, A.Str(flag, A.Offset(d, 8), A.W32))
+        }
         ObjectNew(kind, tag, bitmap, fields, _) -> {
-            runtimeCall(s, d, runtimeSymbolOf(s, "turkey_object_new"), [],
-                        [immediate(s, kind), immediate(s, tag),
-                         immediate(s, len(fields)), immediate(s, bitmap)])
+            allocate(s, d, 24 + 8 * len(fields), Rt.heapObject, "turkey_object_new",
+                     [A.Constant(kind), A.Constant(tag), A.Constant(len(fields)),
+                      A.Constant(bitmap)])
+            objectHeader(s, d, kind, tag, len(fields), bitmap)
             for var i = 0; i < len(fields); i = i + 1 {
                 storeField(s, d, i, A.reg(fields[i]))
             }
@@ -534,20 +545,31 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             if barrierNeeded(s, target, v) { barrier(s, A.reg(target), A.reg(v)) }
             emit(s, A.Mov(d, A.xzr, A.W64))
         }
-        ArrayNew(length, initial, element) ->
-            runtimeCall(s, d, runtimeSymbolOf(s, "turkey_array_new"),
-                        [A.reg(length), raw(s, initial)],
-                        [immediate(s, Rt.elementWidth(element.class_)),
-                         immediate(s, Rt.layoutCode(element))])
+        -- An array's size is known only at run time, so its size class is
+        -- looked up then, and an array too large for a size class is the
+        -- runtime's (`allocateArray`).
+        ArrayNew(length, initial, element) -> {
+            emit(s, A.AllocateArray(d, A.reg(length), raw(s, initial), A.ArrayAllocation {
+                width = Rt.elementWidth(element.class_), layout = Rt.layoutCode(element),
+                slow = runtimeSymbolOf(s, "turkey_array_new"),
+                cursors = untracedGlobal(s, Rt.cursorsGlobal),
+                classes = untracedGlobal(s, Rt.classesGlobal),
+            }))
+            marked(s)
+        }
         -- The code operand is the function's *address*, which is what the
         -- runtime stores and what an indirect call loads back out of slot 0.
-        -- The environment is the shell's second slot.
+        -- The environment is the shell's second slot, null when there is none.
         ClosureNew(code, environment) -> {
-            runtimeCall(s, d, runtimeSymbolOf(s, "turkey_closure_shell"),
-                        [address(s, symbolFor(s, code))], [])
+            allocate(s, d, 24 + 16, Rt.heapObject, "turkey_closure_shell",
+                     [A.AddressOf(symbolFor(s, code))])
+            -- `Turkey.Alloc.closureShell`'s header: kind 3, no tag, two
+            -- slots, and a bitmap tracing only the environment.
+            objectHeader(s, d, 3, -1, 2, 2)
+            storeField(s, d, 0, address(s, symbolFor(s, code)))
             match environment {
                 Some(e) -> storeField(s, d, 1, A.reg(e))
-                None -> {}
+                None -> storeField(s, d, 1, A.xzr)
             }
         }
         -- An object in the frame: the word holding its kind and tag, which is
@@ -674,6 +696,58 @@ fun immediate(s : Sel, n : Int) -> Reg {
 fun frameObject(s : Sel, v : Value) -> Int = match Roots.objectOf(s.frame, Ssa.valueId(v)) {
     Some(k) -> k
     None -> error("no frame slot for object %" + Int.toString(Ssa.valueId(v)))
+}
+
+-- -- allocation ---------------------------------------------------------------------
+
+-- A heap allocation of `size` payload bytes into `d`: a slot from the size
+-- class's cursor in the heap (`Turkey.Runtime`'s layouts) with its heap
+-- header written, or the runtime's `slow` entry called with `args` when the
+-- cursor is empty. One `Allocate` instruction, which the emitter expands.
+--
+-- The take is not a safepoint and calls nothing, so the collector cannot see
+-- the slot before the caller has written every word of the object, which is
+-- why nothing zeroes it. The slow path's call is the operation's safepoint.
+-- The collection, the refill and the large object are all the runtime's, and
+-- so are GC stress and allocation statistics, which empty every cursor
+-- (`Turkey.Heap.refill`) so that each allocation reaches it.
+fun allocate(s : Sel, d : Reg, size : Int, kind : Int, slow : String,
+             args : Array A.AllocArg) -> Unit {
+    let c = Rt.sizeClass(size)
+    emit(s, A.Allocate(d, A.Allocation {
+        sizeClass = c, slotBytes = Rt.classSlot(c), size = size, kind = kind,
+        slow = runtimeSymbolOf(s, slow), args = args,
+        cursors = untracedGlobal(s, Rt.cursorsGlobal),
+    }))
+    marked(s)
+}
+
+-- The safepoint map after an allocation, which is a call on its slow path.
+fun marked(s : Sel) -> Unit = match s.pending {
+    Some((b, n)) -> {
+        emit(s, A.SafepointMap(b, n))
+        s.pending = None
+    }
+    None -> {}
+}
+
+-- The symbol of a global the collector does not scan, which is where the
+-- heap keeps its tables.
+fun untracedGlobal(s : Sel, name : String) -> String =
+    match Asm.globalSlot(s.asm, name) {
+        Some(_) -> error("the heap's table " + name + " is a traced global")
+        None -> Asm.globalSymbol(s.asm.dialect, name)
+    }
+
+-- The words before an object's slots, as `Turkey.Alloc` lays them out: the
+-- kind and the tag as two 32-bit halves of one word, the slot count, and the
+-- metadata saying which slots the collector follows.
+fun objectHeader(s : Sel, object : Reg, kind : Int, tag : Int, count : Int,
+                 metadata : Int) -> Unit {
+    let word = Int.or(Int.and(kind, 0xFFFF_FFFF), Int.shl(tag, 32))
+    emit(s, A.Str(immediate(s, word), A.Offset(object, 0), A.W64))
+    emit(s, A.Str(immediate(s, count), A.Offset(object, 8), A.W64))
+    emit(s, A.Str(immediate(s, metadata), A.Offset(object, 16), A.W64))
 }
 
 -- Field `index` of an object, at the offset `ObjectGet` reads it from. A whole

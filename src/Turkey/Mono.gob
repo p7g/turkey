@@ -1,7 +1,7 @@
 module Turkey.Mono (
     maxTypeNodes, rounds, ceilingFactor, expandingBindings,
     State(..), newState,
-    monomorphize, reduceTypes, checkLayouts,
+    monomorphize, reduceTypes, checkLayouts, reachable, runtimeRoots,
 )
 
 -- Monomorphization: one copy of a polymorphic binding per type it is used at.
@@ -49,11 +49,12 @@ import Turkey.Core
 import Turkey.Core as Cr
 import Turkey.Coretc as Coretc
 import Turkey.Decls as Decls
-import Turkey.Decls (DeclTable(..))
+import Turkey.Decls (DeclTable(..), ForeignInfo(..))
 import Turkey.Diag as Diag
 import Turkey.Methods as Methods
 import Turkey.Opt as Opt
 import Turkey.Deps as Deps
+import Turkey.Runtime as Rt
 import Turkey.Source (Span(..))
 import Turkey.Typed as Typed
 import Turkey.Types as Ty
@@ -1244,24 +1245,34 @@ fun droppable(b : CBind, isDict : Bool) -> Bool {
 -- Run once, at the end, and not between rounds: an intermediate round's output is
 -- full of bindings nothing reaches *yet*, and dropping one would be answering a
 -- question the next round was going to ask.
-fun reachable(program : CProgram, main : String,
-              definitions : Array String) -> CProgram {
+--
+-- Only the bindings `prunable` accepts are dropped; the rest are kept as if
+-- `main` named them.
+fun reachable(program : CProgram, main : String, roots : Array String,
+              definitions : Map String ForeignInfo,
+              prunable : fun(CBind) -> Bool) -> CProgram {
     let byname = Map.new()
     for b in Array.append(program.dicts, program.binds) {
         Map.put(byname, b.name, b)
     }
     let drop = Set.new()
-    for b in program.dicts { Set.add(drop, b.name) }
+    for b in program.dicts {
+        if prunable(b) { Set.add(drop, b.name) }
+    }
     for b in program.binds {
-        if droppable(b, False) { Set.add(drop, b.name) }
+        if droppable(b, False) && prunable(b) { Set.add(drop, b.name) }
     }
     let work = Array.new(16)
     for (name, _) in Map.entries(byname) {
         if !Set.contains(drop, name) { Array.push(work, name) }
     }
     Array.push(work, main)
-    -- A `foreign` definition is reached from C, which this cannot see.
-    for name in definitions { Array.push(work, name) }
+    for name in roots { Array.push(work, name) }
+    -- A `Prim.codeAddress` names its definition by C symbol.
+    let bySymbol = Map.new()
+    for (name, info) in Map.entries(definitions) {
+        Map.put(bySymbol, codeAddressName(info.symbol), name)
+    }
     let reach = Set.new()
     for n in work { Set.add(reach, n) }
     while len(work) > 0 {
@@ -1271,7 +1282,8 @@ fun reachable(program : CProgram, main : String,
         }
         match Map.get(byname, name) {
             None -> {}
-            Some(b) -> for n in Set.elements(namesOf(b.value)) {
+            Some(b) -> for used in Set.elements(namesOf(b.value)) {
+                let n = Map.getOr(bySymbol, used, used)
                 if !Set.contains(reach, n) {
                     Set.add(reach, n)
                     Array.push(work, n)
@@ -1294,7 +1306,7 @@ fun reachable(program : CProgram, main : String,
 -- The rounds share one state, which is what makes the ceiling one ceiling. Reachability
 -- runs once, at the end, over the finished program.
 fun monomorphize(program : CProgram, decls : DeclTable, classes : ClassTable,
-                 main : String) -> CProgram {
+                 main : String, roots : Array String) -> CProgram {
     let state = newState()
     state.expanding = expandingBindings(program)
     var size = 0
@@ -1307,7 +1319,24 @@ fun monomorphize(program : CProgram, decls : DeclTable, classes : ClassTable,
         let specialized = runMono(newMono(out, decls, classes, state))
         out = runDevirt(newDevirt(specialized, classes, state))
     }
-    reachable(out, main, Map.keys(decls.definitions))
+    reachable(out, main, roots, decls.definitions, fun(_) = True)
+}
+
+-- The bindings reachability starts from besides `main`: the `foreign`
+-- definitions C may call. A program's own are there for C, which this cannot
+-- see, so every one is a root. The runtime's (`Turkey.*`) are there for the
+-- code the backend writes, so only those it names by symbol are -- unless a
+-- C caller drives the runtime without running the program, as the runtime's
+-- own tests do, and then only C knows which it will call.
+fun runtimeRoots(decls : DeclTable, everyDefinition : Bool) -> Array String {
+    let out = []
+    for (name, info) in Map.entries(decls.definitions) {
+        if everyDefinition || !String.startsWith(name, "Turkey.")
+                || Array.contains(Rt.referencedSymbols, info.symbol) {
+            Array.push(out, name)
+        }
+    }
+    Array.sort(out)
 }
 
 -- -- polymorphic recursion ------------------------------------------------------------

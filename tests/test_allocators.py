@@ -6,11 +6,11 @@ import subprocess
 import pytest
 
 from tests import bootc, toolchain
-from tests.allocator_probe import allocator_object
+from tests.allocator_probe import allocator_object, stats_object
 
 
 @pytest.fixture(scope="module")
-def allocator_probe(allocator_object, tmp_path_factory):
+def allocator_probe(stats_object, tmp_path_factory):
     toolchain.needs_sanitizer()
     directory = tmp_path_factory.mktemp("allocator-probe")
     source = directory / "probe.c"
@@ -151,14 +151,14 @@ int main(void) {
     subprocess.run([*toolchain.cc(), "-std=c11",
                     "-O1", "-fsanitize=undefined",
                     "-I", str(bootc.PROBE_INCLUDE), str(source),
-                    str(allocator_object), "-lm", "-pthread", "-o",
+                    str(stats_object), "-lm", "-pthread", "-o",
                     str(binary)], check=True, capture_output=True, text=True)
     return binary
 
 
 @pytest.mark.parametrize("stress", [False, True])
 def test_allocator_exports_before_initialization(allocator_probe, stress):
-    env = dict(os.environ, TURKEY_GC_STATS="1")
+    env = dict(os.environ)
     env.pop("TURKEY_GC_STRESS", None)
     if stress:
         env["TURKEY_GC_STRESS"] = "1"

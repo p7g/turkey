@@ -11,8 +11,9 @@
 #   stage2    the side's source compiled by its committed bootstrap
 #             (scripts/build.sh)
 #   counted   the side's source compiled by its stage2 with
-#             TURKEY_ALLOC_SITES=1: a compiler that counts its allocations
-#             per site
+#             TURKEY_ALLOC_SITES=1, and --gc-stats where the side has it: a
+#             compiler that counts its allocations per site and reports its
+#             collections
 #   stage3    the side's source compiled by its stage2: the compiler whose
 #             time is measured, built by a compiler with the side's own
 #             optimizations
@@ -101,6 +102,14 @@ checkout() {
     fi
 }
 
+# `--gc-stats` if the tree's compiler takes it. A tree from before it read
+# TURKEY_GC_STATS at run time instead, which the counted run also sets.
+stats_flag() {
+    if grep -q -- '--gc-stats' "$1/src/Turkey/Build.gob" 2> /dev/null; then
+        echo --gc-stats
+    fi
+}
+
 # Wait for background jobs $@ (pids); if any failed, show the end of its log.
 # Each job's log is at the path in the variable log_<pid>.
 await() {
@@ -148,7 +157,7 @@ for side in base new; do
     eval "tree=\$$side"
     d=$out/$side
     (cd "$tree" && TURKEY_ALLOC_SITES=1 $RUN "$d/stages/stage2" native \
-        "$SOURCE" > "$d/counted.s" 2> "$d/sites.txt" \
+        $(stats_flag "$tree") "$SOURCE" > "$d/counted.s" 2> "$d/sites.txt" \
         && $CC -o "$d/counted" "$d/counted.s" $LIBS) > "$d/counted.log" 2>&1 &
     eval "log_$!=\"$d/counted.log\""
     pids="$pids $!"
@@ -159,14 +168,17 @@ for side in base new; do
 done
 await $pids
 
-# 3. The counted runs. Each writes turkey-alloc-sites.bin in its working
-# directory, so each runs in its own copy of the input.
+# 3. The counted runs, which are also where the collector's statistics come
+# from: counting puts every allocation on the slow path, so the timed runs
+# leave it out. Each writes turkey-alloc-sites.bin in its working directory, so
+# each runs in its own copy of the input.
 step "count allocations (both sides)"
 pids=
 for side in base new; do
     d=$out/$side
     cp -R "$out/input" "$d/input"
-    (cd "$d/input" && $RUN "$d/counted" native "$SOURCE" > /dev/null \
+    (cd "$d/input" && TURKEY_GC_STATS=1 $RUN "$d/counted" native "$SOURCE" \
+        > /dev/null 2> "$d/gc.txt" \
         && mv turkey-alloc-sites.bin "$d/sites.bin") > "$d/count.log" 2>&1 &
     eval "log_$!=\"$d/count.log\""
     pids="$pids $!"
@@ -178,7 +190,7 @@ i=1
 while [ $i -le "$runs" ]; do
     for side in base new; do
         step "time $side, run $i of $runs"
-        (cd "$out/input" && TURKEY_GC_STATS=1 $TIME $RUN "$out/$side/stage3" \
+        (cd "$out/input" && $TIME $RUN "$out/$side/stage3" \
             native "$SOURCE" > /dev/null 2> "$out/$side/run$i.txt") || {
             echo "compare.sh: the $side run failed; see $out/$side/run$i.txt" >&2
             exit 1
@@ -227,7 +239,9 @@ def measure(text):
         'peak heap regions': number(r'\[gc\] region bytes \d+, peak (\d+)', text),
     }
 
-measured = {s: [measure(open(f'{out}/{s}/run{i}.txt').read())
+# The collector's numbers are the counted run's, the same for every timed run.
+measured = {s: [measure(open(f'{out}/{s}/run{i}.txt').read()
+                        + open(f'{out}/{s}/gc.txt').read())
                 for i in range(1, runs + 1)] for s in sides}
 
 def show(key, v):

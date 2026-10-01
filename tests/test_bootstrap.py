@@ -139,10 +139,9 @@ def _unstressed() -> str:
     return bootc.boot("native", str(STRESSED))
 
 
-def _stressed(**settings: str) -> str:
+def _stressed(boot: Path | None = None, **settings: str) -> str:
     env = dict(os.environ, **settings)
-    env.pop("TURKEY_GC_STATS", None)
-    result = subprocess.run(toolchain.command(bootc.binary(), "native", str(STRESSED)),
+    result = subprocess.run(toolchain.command(boot or bootc.binary(), "native", str(STRESSED)),
                             cwd=REPO_ROOT, capture_output=True, env=env)
     assert result.returncode == 0, result.stderr.decode("utf-8")[:4000]
     return result.stdout.decode("utf-8")
@@ -162,11 +161,27 @@ def test_boot_compiles_the_same_under_sampled_gc_stress(seed):
     assert _stressed(TURKEY_GC_STRESS="100000", TURKEY_GC_STRESS_SEED=seed) == _unstressed()
 
 
+@pytest.fixture(scope="module")
+def verifying_boot(tmp_path_factory) -> Path:
+    """`boot` compiled by `boot` with the heap verifier in, which is only ever
+    chosen when a program is compiled."""
+    directory = tmp_path_factory.mktemp("verifying-boot")
+    source = directory / "boot.s"
+    with open(source, "wb") as out:
+        subprocess.run(toolchain.command(bootc.binary(), "native", "--gc-verify",
+                                         "src/Main.gob"),
+                       cwd=REPO_ROOT, stdout=out, check=True)
+    binary = directory / "boot"
+    subprocess.run([*toolchain.cc(), "-o", str(binary), str(source),
+                    *toolchain.libraries()], check=True, capture_output=True)
+    return binary
+
+
 @pytest.mark.bootstrap
-def test_boot_compiles_the_same_under_sampled_gc_stress_and_verification():
+def test_boot_compiles_the_same_under_sampled_gc_stress_and_verification(verifying_boot):
     """The same, with the heap verified at every collection, sparser because
     each verification walks the whole heap."""
-    assert _stressed(TURKEY_GC_STRESS="1000000", TURKEY_GC_VERIFY="1") == _unstressed()
+    assert _stressed(verifying_boot, TURKEY_GC_STRESS="1000000") == _unstressed()
 
 
 def _split_asm(text: str, paths: list[Path]) -> list[str]:

@@ -1,6 +1,9 @@
 module Turkey.Runtime (
     Entry(..), layoutCode, traceBit, elementWidth, accessWidth, entryPoint,
     processState, processStateBytes, voidSymbols, immediates,
+    headerBytes, headerGeneration, headerSize, headerKind, young, heapObject, heapCell,
+    cursorsGlobal, cursorBytes, cursorFree, cursorBase, cursorSlot, sizeClass, classSlot,
+    classesGlobal, classStep, fastPayload, referencedSymbols,
 )
 
 -- The interface shared by generated code and the runtime.
@@ -86,6 +89,62 @@ fun accessWidth(c : RepClass) -> Int = match c {
 -- and `Turkey.HeapCheck` state the same bound for the collector's side.
 let immediates = 4096
 
+-- -- the heap's small-object cursors -------------------------------------------------
+
+-- Generated code allocates a small object of a known size itself, from its
+-- size class's cursor, and calls the runtime only when the cursor is empty
+-- (`Turkey.Select.allocateInline`). So it depends on `Turkey.Heap`'s layouts
+-- below, each of which that module defines under the same name.
+--
+-- The heap header, just before every payload: the generation word, the
+-- payload's size, and the heap kind with a zero mark epoch above it.
+let headerBytes = 24
+let headerGeneration = 0
+let headerSize = 8
+let headerKind = 16
+let young = 0
+let heapObject = 2
+let heapCell = 3
+
+-- `Turkey.Heap.cursors`: one cursor per size class, each `cursorBytes` long.
+-- A cursor holds a word of free-slot bits (`cursorFree`, set bits free), the
+-- header address of that word's first slot (`cursorBase`), and the class's
+-- slot size (`cursorSlot`).
+let cursorsGlobal = "Turkey.Heap#cursors"
+let cursorBytes = 64
+let cursorFree = 0
+let cursorBase = 8
+let cursorSlot = 16
+
+-- `Turkey.Heap.classes`: the size class of a payload, one byte for each step
+-- of 16, indexed by the payload's size plus `classStep`, over 16. It covers a
+-- payload of up to `fastPayload` bytes; a larger one is the runtime's to
+-- place. Generated code reads it for an array, whose size is known only at
+-- run time.
+let classesGlobal = "Turkey.Heap#classes"
+let classStep = 39
+let fastPayload = 32728
+
+-- The size class of a payload of `size` bytes: the class of its slot, header
+-- included, rounded up to 16. `Turkey.Heap.classOf` reads the same answer out
+-- of a table it builds with this rule, and the heap verifier is the test that
+-- the two agree: it reports a small object in any other class's slot.
+fun sizeClass(size : Int) -> Int {
+    let bytes = Int.and(size + headerBytes + 15, -16)
+    if bytes <= 32 { return 0 }
+    if bytes <= 256 { return Int.shr(bytes + 15, 4) - 2 }
+    var classSize = 256
+    var c = 14
+    while classSize < bytes {
+        classSize = classSize * 2
+        c = c + 1
+    }
+    c
+}
+
+-- The bytes between one slot of class `c` and the next.
+fun classSlot(c : Int) -> Int = if c < 15 { 32 + 16 * c } else { Int.shl(256, c - 14) }
+
 -- -- the process state -----------------------------------------------------------------
 
 -- Storage every program defines for itself, zeroed, under this C symbol.
@@ -99,6 +158,24 @@ let immediates = 4096
 let processState = "turkey_has_panicked"
 
 let processStateBytes = 280
+
+-- -- what the backend names -----------------------------------------------------------
+
+-- The runtime's `foreign` definitions that generated code calls or names by
+-- C symbol. Nothing in a program's Core mentions them -- the backend writes
+-- the references -- so reachability (`Turkey.Mono.reachable`) starts from
+-- them, as it starts from `main`. A symbol missing here is a definition the
+-- compile drops and the link then cannot find.
+let referencedSymbols = [
+    -- The entry sequence (`Turkey.Emit.emitEntry`).
+    "turkey_main", "turkey_entry_returned", "turkey_entry_stack_set",
+    "turkey_frame_table_register", "turkey_root_enter", "turkey_string_new",
+    -- Selection: the slow paths of allocation, the write barrier, panics,
+    -- and `Prim.exit` (`entries`).
+    "turkey_object_new", "turkey_cell_new", "turkey_closure_shell",
+    "turkey_array_new", "turkey_write_barrier", "turkey_panic",
+    "turkey_panic_string", "turkey_exit",
+]
 
 -- -- entry points ---------------------------------------------------------------------
 

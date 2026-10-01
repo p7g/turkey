@@ -1,0 +1,95 @@
+module Turkey.Stream (Item(..), print)
+
+-- What the emitter produces: a module as a sequence of values, in the order
+-- they go into the object, over the target's instruction type `i`.
+--
+-- Nothing in it is text. The assembly printer below is one consumer, and an
+-- encoder that writes the bytes directly is another; both read the same
+-- items, so the bytes the encoder writes can be checked against what the
+-- system assembler makes of the printed text. A name is a string as the
+-- object format spells it (`Turkey.Asm`), which is what both consumers need:
+-- the printer writes it, and the encoder looks it up.
+--
+-- Labels and data are items rather than fields of an instruction because the
+-- assembler treats them so: a label names the position of whatever comes
+-- next, and a data item's size is its own, not an instruction's four bytes.
+
+import Turkey.Asm as Asm
+
+type Item i
+    -- Following items go into this section.
+    = Section(Asm.Section)
+    -- The symbol is visible outside the object.
+    | Global(String)
+    -- The symbol names a function, where the format records that.
+    | FunctionType(String)
+    -- Pad to a multiple of 2^n bytes.
+    | Align(Int)
+    -- The position of the next item.
+    | Label(String)
+    | Instruction(i)
+    -- An eight-byte word: a constant, or the address of a symbol.
+    | Word(Int)
+    | WordOf(String)
+    -- `n` zero bytes.
+    | Space(Int)
+    -- A string's bytes. `CString` adds the terminating zero.
+    | Bytes(String)
+    | CString(String)
+    -- Text for the reader of the assembly, with no bytes behind it.
+    | Comment(String)
+
+-- The items as assembly text, appended to `b`, and the array emptied.
+--
+-- Emptied because the caller prints a function at a time: held until the end,
+-- `boot`'s own text is millions of items the collector keeps tracing.
+fun print[Show i](d : Asm.Dialect, items : Array (Item i), b : String.Builder) -> Unit {
+    for item in items { printItem(d, item, b) }
+    Array.clear(items)
+}
+
+fun printItem[Show i](d : Asm.Dialect, item : Item i, b : String.Builder) -> Unit =
+    match item {
+        Section(s) -> line(b, "    " + Asm.section(d, s))
+        Global(sym) -> line(b, "    .globl " + sym)
+        FunctionType(sym) -> match Asm.functionType(d, sym) {
+            Some(directive) -> line(b, "    " + directive)
+            None -> {}
+        }
+        Align(n) -> line(b, "    .p2align " + Int.toString(n))
+        Label(name) -> line(b, name + ":")
+        Instruction(i) -> line(b, "    " + show(i))
+        Word(n) -> line(b, "    .quad " + Int.toString(n))
+        WordOf(sym) -> line(b, "    .quad " + sym)
+        Space(n) -> line(b, "    .space " + Int.toString(n))
+        Bytes(text) -> byteList(b, text, False)
+        CString(text) -> byteList(b, text, True)
+        Comment(text) -> line(b, "    // " + text)
+    }
+
+fun line(b : String.Builder, text : String) -> Unit {
+    String.push(b, text)
+    String.push(b, "\n")
+}
+
+-- Bytes as a `.byte` directive, never as a quoted string: the text is whatever
+-- the program's source said, and `.ascii` would need every quote, backslash
+-- and newline escaped the way the assembler reads them back.
+--
+-- Nothing at all for an empty string with no terminator: `.byte` with no
+-- operands is a syntax error, and a zero-length literal is a program writing
+-- `""`.
+fun byteList(b : String.Builder, text : String, terminated : Bool) -> Unit {
+    var any = False
+    for byte in String.bytes(text) {
+        if any { String.push(b, ", ") } else { String.push(b, "    .byte ") }
+        any = True
+        String.push(b, Int.toString(Byte.toInt(byte)))
+    }
+    if terminated {
+        if any { String.push(b, ", ") } else { String.push(b, "    .byte ") }
+        String.push(b, "0")
+        any = True
+    }
+    if any { String.push(b, "\n") }
+}

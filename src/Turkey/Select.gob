@@ -545,11 +545,18 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             if barrierNeeded(s, target, v) { barrier(s, A.reg(target), A.reg(v)) }
             emit(s, A.Mov(d, A.xzr, A.W64))
         }
-        ArrayNew(length, initial, element) ->
-            runtimeCall(s, d, runtimeSymbolOf(s, "turkey_array_new"),
-                        [A.reg(length), raw(s, initial)],
-                        [immediate(s, Rt.elementWidth(element.class_)),
-                         immediate(s, Rt.layoutCode(element))])
+        -- An array's size is known only at run time, so its size class is
+        -- looked up then, and an array too large for a size class is the
+        -- runtime's (`allocateArray`).
+        ArrayNew(length, initial, element) -> {
+            emit(s, A.AllocateArray(d, A.reg(length), raw(s, initial), A.ArrayAllocation {
+                width = Rt.elementWidth(element.class_), layout = Rt.layoutCode(element),
+                slow = runtimeSymbolOf(s, "turkey_array_new"),
+                cursors = untracedGlobal(s, Rt.cursorsGlobal),
+                classes = untracedGlobal(s, Rt.classesGlobal),
+            }))
+            marked(s)
+        }
         -- The code operand is the function's *address*, which is what the
         -- runtime stores and what an indirect call loads back out of slot 0.
         -- The environment is the shell's second slot, null when there is none.
@@ -707,22 +714,30 @@ fun frameObject(s : Sel, v : Value) -> Int = match Roots.objectOf(s.frame, Ssa.v
 fun allocate(s : Sel, d : Reg, size : Int, kind : Int, slow : String,
              args : Array A.AllocArg) -> Unit {
     let c = Rt.sizeClass(size)
-    let cursors = match Asm.globalSlot(s.asm, Rt.cursorsGlobal) {
-        Some(_) -> error("the heap's cursor table is a traced global")
-        None -> Asm.globalSymbol(s.asm.dialect, Rt.cursorsGlobal)
-    }
     emit(s, A.Allocate(d, A.Allocation {
         sizeClass = c, slotBytes = Rt.classSlot(c), size = size, kind = kind,
-        slow = runtimeSymbolOf(s, slow), args = args, cursors = cursors,
+        slow = runtimeSymbolOf(s, slow), args = args,
+        cursors = untracedGlobal(s, Rt.cursorsGlobal),
     }))
-    match s.pending {
-        Some((b, n)) -> {
-            emit(s, A.SafepointMap(b, n))
-            s.pending = None
-        }
-        None -> {}
-    }
+    marked(s)
 }
+
+-- The safepoint map after an allocation, which is a call on its slow path.
+fun marked(s : Sel) -> Unit = match s.pending {
+    Some((b, n)) -> {
+        emit(s, A.SafepointMap(b, n))
+        s.pending = None
+    }
+    None -> {}
+}
+
+-- The symbol of a global the collector does not scan, which is where the
+-- heap keeps its tables.
+fun untracedGlobal(s : Sel, name : String) -> String =
+    match Asm.globalSlot(s.asm, name) {
+        Some(_) -> error("the heap's table " + name + " is a traced global")
+        None -> Asm.globalSymbol(s.asm.dialect, name)
+    }
 
 -- The words before an object's slots, as `Turkey.Alloc` lays them out: the
 -- kind and the tag as two 32-bit halves of one word, the slot count, and the

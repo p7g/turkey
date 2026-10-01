@@ -103,21 +103,32 @@ fun emitInsts(b : String.Builder, cold : Cold, d : Asm.Dialect, f : Func Inst,
               a : Regalloc.Allocation, l : Frame.Layout, tag : Int,
               insts : Array Inst, upTo : Int) -> Unit {
     for var n = 0; n < upTo; n = n + 1 {
-        match A.allocationOf(insts[n].op) {
-            Some((dest, allocation)) -> {
-                var label = None
-                if n + 1 < upTo {
-                    match A.safepointOf(insts[n + 1].op) {
-                        Some((sb, sn)) -> {
-                            label = Some(safepointLabel(d, tag, sb, sn))
-                            n = n + 1
-                        }
-                        None -> {}
-                    }
+        let op = insts[n].op
+        if Option.isNone(A.allocationOf(op)) && Option.isNone(A.arrayAllocationOf(op)) {
+            emitInst(b, d, f, a, l, tag, insts[n])
+            continue
+        }
+        var label = None
+        if n + 1 < upTo {
+            match A.safepointOf(insts[n + 1].op) {
+                Some((sb, sn)) -> {
+                    label = Some(safepointLabel(d, tag, sb, sn))
+                    n = n + 1
                 }
-                allocate(b, cold, d, f, l, tag, coloured(f, a, dest), allocation, label)
+                None -> {}
             }
-            None -> emitInst(b, d, f, a, l, tag, insts[n])
+        }
+        match A.allocationOf(op) {
+            Some((dest, allocation)) ->
+                allocate(b, cold, d, f, l, tag, coloured(f, a, dest), allocation, label)
+            None -> {}
+        }
+        match A.arrayAllocationOf(op) {
+            Some((dest, length, fill, allocation)) ->
+                allocateArray(b, cold, d, f, l, tag, coloured(f, a, dest),
+                              coloured(f, a, length), coloured(f, a, fill), allocation,
+                              label)
+            None -> {}
         }
     }
 }
@@ -352,25 +363,132 @@ fun allocate(b : String.Builder, cold : Cold, d : Asm.Dialect, f : Func Inst,
     stub(cold.text, d, f, l, tag, n, dest, al, safepoint)
 }
 
+-- An `AllocateArray`'s fast path: the size class from the runtime's table by
+-- the payload's size, then the same take as `allocate`, the array's header,
+-- and the elements filled. A length past what the table covers -- or
+-- negative, which compares as a huge unsigned number -- goes to the stub, and
+-- so the runtime's allocator decides what to do with it.
+--
+-- `dest` is written before `length` and `fill` are last read, which the
+-- allocator knows (`A.writesBeforeReading`), so it holds neither.
+fun allocateArray(b : String.Builder, cold : Cold, d : Asm.Dialect, f : Func Inst,
+                  l : Frame.Layout, tag : Int, dest : Reg, length : Reg, fill : Reg,
+                  al : A.ArrayAllocation, safepoint : Option String) -> Unit {
+    let n = cold.count
+    cold.count = n + 1
+    let slow = allocationLabel(d, tag, n, "s")
+    let back = allocationLabel(d, tag, n, "r")
+    let top = allocationLabel(d, tag, n, "l")
+    let cursor = scratch
+    let word = Physical(Gp, 17)
+    let shift = match al.width {
+        1 -> 0
+        4 -> 2
+        _ -> 3
+    }
+    instruction(b, A.MovConst(cursor, (Rt.fastPayload - Rt.headerBytes) / al.width + 1))
+    instruction(b, A.Cmp(length, cursor, A.W64))
+    line(b, "    b.hs " + slow)
+    -- The class, from the payload's size: the header and the elements.
+    instruction(b, A.LslImm(word, length, shift, A.W64))
+    instruction(b, A.AddImm(word, word, Rt.headerBytes + Rt.classStep, A.W64))
+    instruction(b, A.LsrImm(word, word, 4, A.W64))
+    instruction(b, A.Adrp(cursor, Asm.page(d, al.classes)))
+    instruction(b, A.Ldr(cursor, PageOffset(cursor, Asm.pageOffset(d, al.classes)), A.W64))
+    instruction(b, A.Ldrb(word, Indexed(cursor, word)))
+    instruction(b, A.LslImm(word, word, 6, A.W64))
+    instruction(b, A.Adrp(cursor, Asm.page(d, al.cursors)))
+    instruction(b, A.Ldr(cursor, PageOffset(cursor, Asm.pageOffset(d, al.cursors)), A.W64))
+    instruction(b, A.Add(cursor, cursor, word, A.W64))
+    instruction(b, A.Ldr(word, Offset(cursor, Rt.cursorFree), A.W64))
+    line(b, "    cbz " + A.showReg(word, A.W64) + ", " + slow)
+    instruction(b, A.Sub(dest, A.xzr, word, A.W64))
+    instruction(b, A.And(dest, word, dest, A.W64))
+    instruction(b, A.Eor(word, word, dest, A.W64))
+    instruction(b, A.Str(word, Offset(cursor, Rt.cursorFree), A.W64))
+    instruction(b, A.Rbit(dest, dest))
+    instruction(b, A.Clz(dest, dest))
+    instruction(b, A.Ldr(word, Offset(cursor, Rt.cursorBase), A.W64))
+    instruction(b, A.Ldr(cursor, Offset(cursor, Rt.cursorSlot), A.W64))
+    instruction(b, A.Mul(dest, dest, cursor, A.W64))
+    instruction(b, A.Add(dest, dest, word, A.W64))
+    instruction(b, A.Str(A.xzr, Offset(dest, Rt.headerGeneration), A.W64))
+    instruction(b, A.LslImm(cursor, length, shift, A.W64))
+    instruction(b, A.AddImm(cursor, cursor, Rt.headerBytes, A.W64))
+    instruction(b, A.Str(cursor, Offset(dest, Rt.headerSize), A.W64))
+    instruction(b, A.MovConst(cursor, Rt.heapObject))
+    instruction(b, A.Str(cursor, Offset(dest, Rt.headerKind), A.W64))
+    instruction(b, A.AddImm(dest, dest, Rt.headerBytes, A.W64))
+    -- The array's own header: kind 2 with the element's layout code as its
+    -- tag, the length, and the element's width.
+    instruction(b, A.MovConst(cursor, Int.or(2, Int.shl(al.layout, 32))))
+    instruction(b, A.Str(cursor, Offset(dest, 0), A.W64))
+    instruction(b, A.Str(length, Offset(dest, 8), A.W64))
+    instruction(b, A.MovConst(cursor, al.width))
+    instruction(b, A.Str(cursor, Offset(dest, 16), A.W64))
+    -- Every element, including an array of pointers to nothing, which the
+    -- collector may walk before anything else is stored.
+    line(b, "    cbz " + A.showReg(length, A.W64) + ", " + back)
+    instruction(b, A.AddImm(cursor, dest, 24, A.W64))
+    instruction(b, A.Mov(word, length, A.W64))
+    line(b, top + ":")
+    match al.width {
+        1 -> instruction(b, A.Strb(fill, Offset(cursor, 0)))
+        4 -> instruction(b, A.Str(fill, Offset(cursor, 0), A.W32))
+        _ -> instruction(b, A.Str(fill, Offset(cursor, 0), A.W64))
+    }
+    instruction(b, A.AddImm(cursor, cursor, al.width, A.W64))
+    instruction(b, A.SubSImm(word, word, 1, A.W64))
+    line(b, "    b.ne " + top)
+    line(b, back + ":")
+    -- The stub: the length and the fill into the first two argument
+    -- registers, without either overwriting the other.
+    let text = cold.text
+    line(text, slow + ":")
+    let x1 = A.argRegs[1]
+    if A.sameRegister(fill, A.x0) && A.sameRegister(length, x1) {
+        instruction(text, A.Mov(scratch, fill, A.W64))
+        instruction(text, A.Mov(A.x0, length, A.W64))
+        instruction(text, A.Mov(x1, scratch, A.W64))
+    } else if A.sameRegister(fill, A.x0) {
+        instruction(text, A.Mov(x1, fill, A.W64))
+        instruction(text, A.Mov(A.x0, length, A.W64))
+    } else {
+        instruction(text, A.Mov(A.x0, length, A.W64))
+        instruction(text, A.Mov(x1, fill, A.W64))
+    }
+    instruction(text, A.MovConst(A.argRegs[2], al.width))
+    instruction(text, A.MovConst(A.argRegs[3], al.layout))
+    returnFromStub(text, d, f, l, tag, n, dest, al.slow, safepoint)
+}
+
 -- An allocation's slow path, after the function: the runtime's allocator with
 -- its constant arguments, the label the frame table names its return address
 -- by, the panic test every call gets, and back.
 fun stub(b : String.Builder, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
          tag : Int, n : Int, dest : Reg, al : A.Allocation,
          safepoint : Option String) -> Unit {
-    let failed = allocationLabel(d, tag, n, "p")
     line(b, allocationLabel(d, tag, n, "s") + ":")
     var k = 0
     for arg in al.args {
         let r = A.argRegs[k]
         match arg {
             Constant(0) -> instruction(b, A.Mov(r, A.xzr, A.W64))
-            Constant(n) -> instruction(b, A.MovConst(r, n))
+            Constant(value) -> instruction(b, A.MovConst(r, value))
             AddressOf(sym) -> symbolInto(b, d, r, sym)
         }
         k = k + 1
     }
-    line(b, "    bl " + al.slow)
+    returnFromStub(b, d, f, l, tag, n, dest, al.slow, safepoint)
+}
+
+-- The call that ends a stub, its frame-table label, the panic test every call
+-- gets, and the way back with the result in `dest`.
+fun returnFromStub(b : String.Builder, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
+                   tag : Int, n : Int, dest : Reg, slow : String,
+                   safepoint : Option String) -> Unit {
+    let failed = allocationLabel(d, tag, n, "p")
+    line(b, "    bl " + slow)
     match safepoint {
         Some(label) -> line(b, label + ":")
         None -> {}

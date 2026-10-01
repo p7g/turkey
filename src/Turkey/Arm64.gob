@@ -1,7 +1,8 @@
 module Turkey.Arm64 (
     Reg(..), Bank(..), reg, physical, isPhysical, bankOf, Cond(..), Width(..),
-    Mem(..), Arm(..), Inst(..), Allocation(..), AllocArg(..), anyDest, anySrc, eachDest, eachSrc, mapUses, rewrite, setsFlags, isSlot, isRootSlot, isFrameAddress, slotLoad, slotStore, isCSet, csetOf, redundantMove,
-    sameRegister, moveHint, safepointOf, allocationOf, memOf,
+    Mem(..), Arm(..), Inst(..), Allocation(..), AllocArg(..), ArrayAllocation(..), anyDest, anySrc, eachDest, eachSrc, mapUses, rewrite, setsFlags, isSlot, isRootSlot, isFrameAddress, slotLoad, slotStore, isCSet, csetOf, redundantMove,
+    sameRegister, moveHint, safepointOf, allocationOf, arrayAllocationOf,
+    writesBeforeReading, memOf,
     xzr, sp, fp, lr, x0, d0, argRegs, fpArgRegs, callerSaved, calleeSaved,
     fpCallerSaved, fpCalleeSaved, showReg, condName, invert, isCall,
 )
@@ -297,6 +298,12 @@ type Arm
     -- self-compile allocates at twenty thousand sites, so a selected fast
     -- path made the compiler slower than the time it saved.
     | Allocate(Reg, Allocation)
+    -- An array of the length in the second register, every element the
+    -- third register's value: the same take from a cursor, its size class
+    -- looked up at run time, then the elements filled in. Its destination is
+    -- written before its operands are last read, so it may not share a
+    -- register with either (`writesBeforeReading`).
+    | AllocateArray(Reg, Reg, Reg, ArrayAllocation)
     | Ret
     | B(BlockId)
     | BCond(Cond, BlockId)
@@ -317,6 +324,17 @@ type Allocation = Allocation {
 }
 
 type AllocArg = Constant(Int) | AddressOf(String)
+
+-- What `AllocateArray` takes: the element's width in bytes and layout code,
+-- the runtime's slow path, and the symbols of the cursor table and the size
+-- class table.
+type ArrayAllocation = ArrayAllocation {
+    width   : Int,
+    layout  : Int,
+    slow    : String,
+    cursors : String,
+    classes : String,
+}
 
 -- An instruction and the register it defines, mirroring `Turkey.LowIr.Low`.
 --
@@ -466,6 +484,20 @@ fun allocationOf(op : Arm) -> Option (Reg, Allocation) = match op {
     _ -> None
 }
 
+-- The destination, length, fill and allocation of an `AllocateArray`.
+fun arrayAllocationOf(op : Arm) -> Option (Reg, Reg, Reg, ArrayAllocation) = match op {
+    AllocateArray(d, n, v, a) -> Some((d, n, v, a))
+    _ -> None
+}
+
+-- Whether an instruction writes its destination before it has read all of
+-- its operands, so that the destination may not share an operand's register
+-- even where the operand dies here.
+fun writesBeforeReading(op : Arm) -> Bool = match op {
+    AllocateArray(_, _, _, _) -> True
+    _ -> False
+}
+
 -- The memory operand an instruction reads or writes, if it has one.
 fun memOf(op : Arm) -> Option Mem = match op {
     FrameAddress(_, m) -> Some(m)
@@ -514,6 +546,7 @@ fun isCall(i : Inst) -> Bool = match i.op {
     Bl(_) -> True
     Blr(_) -> True
     Allocate(_, _) -> True
+    AllocateArray(_, _, _, _) -> True
     _ -> False
 }
 
@@ -616,6 +649,7 @@ fun anySrc(op : Arm, p : fun(Reg) -> Bool) -> Bool = match op {
     B(_)                -> False
     BCond(_, _)         -> False
     Allocate(_, _)      -> False
+    AllocateArray(_, n, v, _) -> p(n) || p(v)
     Brk(_)              -> False
 }
 
@@ -695,6 +729,7 @@ fun mapUses(op : Arm, g : fun(Reg) -> Reg) -> Arm = match op {
     B(k0)                 -> B(k0)
     BCond(k0, k1)         -> BCond(k0, k1)
     Allocate(k0, k1)      -> Allocate(k0, k1)
+    AllocateArray(k0, n, v, k3) -> AllocateArray(k0, g(n), g(v), k3)
     Brk(k0)               -> Brk(k0)
 }
 
@@ -785,6 +820,7 @@ fun rewrite(op : Arm, g : fun(Reg) -> Reg, m : fun(Mem) -> Mem) -> Arm = match o
     B(f0)                    -> B(f0)
     BCond(f0, f1)            -> BCond(f0, f1)
     Allocate(f0, f1)         -> Allocate(g(f0), f1)
+    AllocateArray(f0, f1, f2, f3) -> AllocateArray(g(f0), g(f1), g(f2), f3)
     Brk(f0)                  -> Brk(f0)
 }
 
@@ -865,6 +901,7 @@ fun anyDest(op : Arm, p : fun(Reg) -> Bool) -> Bool = match op {
     B(_)                -> False
     BCond(_, _)         -> False
     Allocate(d, _)      -> p(d)
+    AllocateArray(d, _, _, _) -> p(d)
     Brk(_)              -> False
 }
 
@@ -1077,6 +1114,9 @@ fun showArm(op : Arm) -> String = match op {
     BCond(c, target)       -> "b." + condName(c) + " " + blockLabel(target)
     Allocate(d, a)         -> "// allocate " + showReg(d, W64) + ", class "
                               + Int.toString(a.sizeClass) + ", " + a.slow
+    AllocateArray(d, n, v, a) -> "// allocate array " + showReg(d, W64) + ", "
+                                 + showReg(n, W64) + " of " + showReg(v, W64) + ", "
+                                 + a.slow
     Brk(n)                 -> "brk #" + Int.toString(n)
 }
 

@@ -445,10 +445,9 @@ fun checkRegions() -> Bool {
                 || used > capacity || cls > regionClasses || search >= regionWords {
             return fail(Prim.cString("invalid region geometry"), r, -1)
         }
-        let classSlot = if cls < 15 { 32 + 16 * cls } else { Prim.intShl(256, cls - 14) }
         let classOk = if cls < regionClasses {
-            reserved == regionBytes && slotSize == classSlot
-                && capacity == (regionBytes - regionData) / classSlot
+            reserved == regionBytes && slotSize == classSlot(cls)
+                && capacity == (regionBytes - regionData) / classSlot(cls)
         } else { capacity == 1 }
         if !classOk { return fail(Prim.cString("invalid region size class"), r, -1) }
         for var wi = 0; wi < search; wi = wi + 1 {
@@ -567,13 +566,34 @@ fun checkObjects() -> Bool {
         let r = indexAt(oi)
         let capacity = load32(Prim.ptrFromInt(r), regionCapacity)
         let slotSize = word(r, regionSlotSize)
+        let cls = load32(Prim.ptrFromInt(r), regionSizeClass)
         for var oj = 0; oj < capacity; oj = oj + 1 {
             if bitAt(r, regionAllocated, oj) {
-                if !checkObject(r + regionData + oj * slotSize) { return False }
+                let h = r + regionData + oj * slotSize
+                if !checkObject(h) { return False }
+                if cls < regionClasses && !ofClass(h, cls) {
+                    return fail(Prim.cString("object in another size class's slot"), h + headerBytes, -1)
+                }
             }
         }
     }
     True
+}
+
+-- The bytes between one slot of a small class and the next.
+fun classSlot(cls : Int) -> Int =
+    if cls < 15 { 32 + 16 * cls } else { Prim.intShl(256, cls - 14) }
+
+-- Whether the object whose header is at `h` has the size class `cls`: its
+-- header and payload, rounded up to 16, fit that class's slot and not the
+-- class below's. The collector and generated code each choose the class of
+-- what they allocate, by their own copies of one rule, and this is what says
+-- the two agree; a smaller slot would overlap the next object.
+fun ofClass(h : Int, cls : Int) -> Bool {
+    let size = Prim.loadI64(Prim.ptrFromInt(h), headerSize)
+    if !below(size, regionBytes) { return False }
+    let bytes = Prim.intAnd(headerBytes + size + 15, -16)
+    bytes <= classSlot(cls) && (cls == 0 || bytes > classSlot(cls - 1))
 }
 
 -- Each size class's available list names exactly the small regions of that

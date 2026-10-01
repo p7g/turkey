@@ -1,7 +1,7 @@
 module Turkey.Arm64 (
     Reg(..), Bank(..), reg, physical, isPhysical, bankOf, Cond(..), Width(..),
-    Mem(..), Arm(..), Inst(..), anyDest, anySrc, eachDest, eachSrc, mapUses, rewrite, setsFlags, isSlot, isRootSlot, isFrameAddress, slotLoad, slotStore, isCSet, csetOf, redundantMove,
-    sameRegister, moveHint, safepointOf, memOf,
+    Mem(..), Arm(..), Inst(..), Allocation(..), AllocArg(..), anyDest, anySrc, eachDest, eachSrc, mapUses, rewrite, setsFlags, isSlot, isRootSlot, isFrameAddress, slotLoad, slotStore, isCSet, csetOf, redundantMove,
+    sameRegister, moveHint, safepointOf, allocationOf, memOf,
     xzr, sp, fp, lr, x0, d0, argRegs, fpArgRegs, callerSaved, calleeSaved,
     fpCallerSaved, fpCalleeSaved, showReg, condName, invert, isCall,
 )
@@ -219,6 +219,10 @@ type Arm
     | Uxtb(Reg, Reg)
     | Uxth(Reg, Reg)
     | Ubfx(Reg, Reg, Int, Int)
+    -- Bit reversal and leading zeros, 64 bits wide: together a count of
+    -- trailing zeros, which arm64 has no single instruction for.
+    | Rbit(Reg, Reg)
+    | Clz(Reg, Reg)
     -- Memory. The width is the access size, not the register size.
     | Ldr(Reg, Mem, Width)
     | Ldrb(Reg, Mem)
@@ -282,10 +286,37 @@ type Arm
     -- frame layout can turn it into this return address's frame-table entry.
     -- It carries no encoding; the emitter gives the return address a label.
     | SafepointMap(Int, Int)
+    -- A small heap allocation, defining its register: a slot taken in line
+    -- from its size class's cursor, or a call to the runtime when the cursor
+    -- is empty. The emitter expands it (`Turkey.Emit.allocate`), putting the
+    -- call out of line after the function's blocks; until then it is one
+    -- instruction, and a call, because on one of its paths it is one.
+    --
+    -- Kept whole rather than selected as blocks and a call: the allocator's
+    -- liveness and colouring cost grow with every block and value, and the
+    -- self-compile allocates at twenty thousand sites, so a selected fast
+    -- path made the compiler slower than the time it saved.
+    | Allocate(Reg, Allocation)
     | Ret
     | B(BlockId)
     | BCond(Cond, BlockId)
     | Brk(Int)
+
+-- What `Allocate` takes: the size class, the payload's size and heap kind
+-- for the header, the runtime's slow path and its arguments, and the cursor
+-- table's symbol. Everything is a constant here, so the instruction reads no
+-- register and the slow path needs nothing kept live for it.
+type Allocation = Allocation {
+    sizeClass : Int,
+    slotBytes : Int,
+    size      : Int,
+    kind      : Int,
+    slow      : String,
+    args      : Array AllocArg,
+    cursors   : String,
+}
+
+type AllocArg = Constant(Int) | AddressOf(String)
 
 -- An instruction and the register it defines, mirroring `Turkey.LowIr.Low`.
 --
@@ -348,6 +379,8 @@ fun computes(op : Arm) -> Bool = match op {
     Uxtb(d, _) -> !isPhysical(d)
     Uxth(d, _) -> !isPhysical(d)
     Ubfx(d, _, _, _) -> !isPhysical(d)
+    Rbit(d, _) -> !isPhysical(d)
+    Clz(d, _) -> !isPhysical(d)
     Ldr(d, _, _) -> !isPhysical(d)
     Ldrb(d, _) -> !isPhysical(d)
     Ldrsw(d, _) -> !isPhysical(d)
@@ -427,6 +460,12 @@ fun safepointOf(op : Arm) -> Option (Int, Int) = match op {
     _ -> None
 }
 
+-- The destination and the allocation, if this is an `Allocate`.
+fun allocationOf(op : Arm) -> Option (Reg, Allocation) = match op {
+    Allocate(d, a) -> Some((d, a))
+    _ -> None
+}
+
 -- The memory operand an instruction reads or writes, if it has one.
 fun memOf(op : Arm) -> Option Mem = match op {
     FrameAddress(_, m) -> Some(m)
@@ -474,6 +513,7 @@ fun setsFlags(op : Arm) -> Bool = match op {
 fun isCall(i : Inst) -> Bool = match i.op {
     Bl(_) -> True
     Blr(_) -> True
+    Allocate(_, _) -> True
     _ -> False
 }
 
@@ -544,6 +584,8 @@ fun anySrc(op : Arm, p : fun(Reg) -> Bool) -> Bool = match op {
     Uxtb(_, a)          -> p(a)
     Uxth(_, a)          -> p(a)
     Ubfx(_, a, _, _)    -> p(a)
+    Rbit(_, a)          -> p(a)
+    Clz(_, a)           -> p(a)
     Ldr(_, m, _)        -> anyMem(m, p)
     Ldrb(_, m)          -> anyMem(m, p)
     Ldrsw(_, m)         -> anyMem(m, p)
@@ -573,6 +615,7 @@ fun anySrc(op : Arm, p : fun(Reg) -> Bool) -> Bool = match op {
     Ret                 -> False
     B(_)                -> False
     BCond(_, _)         -> False
+    Allocate(_, _)      -> False
     Brk(_)              -> False
 }
 
@@ -620,6 +663,8 @@ fun mapUses(op : Arm, g : fun(Reg) -> Reg) -> Arm = match op {
     Uxtb(k0, a)           -> Uxtb(k0, g(a))
     Uxth(k0, a)           -> Uxth(k0, g(a))
     Ubfx(k0, a, k2, k3)   -> Ubfx(k0, g(a), k2, k3)
+    Rbit(k0, a)           -> Rbit(k0, g(a))
+    Clz(k0, a)            -> Clz(k0, g(a))
     Ldr(k0, m, k2)        -> Ldr(k0, mapMem(m, g), k2)
     Ldrb(k0, m)           -> Ldrb(k0, mapMem(m, g))
     Ldrsw(k0, m)          -> Ldrsw(k0, mapMem(m, g))
@@ -649,6 +694,7 @@ fun mapUses(op : Arm, g : fun(Reg) -> Reg) -> Arm = match op {
     Ret                   -> Ret
     B(k0)                 -> B(k0)
     BCond(k0, k1)         -> BCond(k0, k1)
+    Allocate(k0, k1)      -> Allocate(k0, k1)
     Brk(k0)               -> Brk(k0)
 }
 
@@ -707,6 +753,8 @@ fun rewrite(op : Arm, g : fun(Reg) -> Reg, m : fun(Mem) -> Mem) -> Arm = match o
     Uxtb(f0, f1)             -> Uxtb(g(f0), g(f1))
     Uxth(f0, f1)             -> Uxth(g(f0), g(f1))
     Ubfx(f0, f1, f2, f3)     -> Ubfx(g(f0), g(f1), f2, f3)
+    Rbit(f0, f1)             -> Rbit(g(f0), g(f1))
+    Clz(f0, f1)              -> Clz(g(f0), g(f1))
     Ldr(f0, f1, f2)          -> Ldr(g(f0), mapMem(m(f1), g), f2)
     Ldrb(f0, f1)             -> Ldrb(g(f0), mapMem(m(f1), g))
     Ldrsw(f0, f1)            -> Ldrsw(g(f0), mapMem(m(f1), g))
@@ -736,6 +784,7 @@ fun rewrite(op : Arm, g : fun(Reg) -> Reg, m : fun(Mem) -> Mem) -> Arm = match o
     Ret                      -> Ret
     B(f0)                    -> B(f0)
     BCond(f0, f1)            -> BCond(f0, f1)
+    Allocate(f0, f1)         -> Allocate(g(f0), f1)
     Brk(f0)                  -> Brk(f0)
 }
 
@@ -782,6 +831,8 @@ fun anyDest(op : Arm, p : fun(Reg) -> Bool) -> Bool = match op {
     Uxtb(d, _)          -> p(d)
     Uxth(d, _)          -> p(d)
     Ubfx(d, _, _, _)    -> p(d)
+    Rbit(d, _)          -> p(d)
+    Clz(d, _)           -> p(d)
     Ldr(d, _, _)        -> p(d)
     Ldrb(d, _)          -> p(d)
     Ldrsw(d, _)         -> p(d)
@@ -813,6 +864,7 @@ fun anyDest(op : Arm, p : fun(Reg) -> Bool) -> Bool = match op {
     Ret                 -> False
     B(_)                -> False
     BCond(_, _)         -> False
+    Allocate(d, _)      -> p(d)
     Brk(_)              -> False
 }
 
@@ -971,6 +1023,8 @@ fun showArm(op : Arm) -> String = match op {
     Sxtw(d, a)             -> "sxtw " + showReg(d, W64) + ", " + showReg(a, W32)
     Uxtb(d, a)             -> "uxtb " + showReg(d, W32) + ", " + showReg(a, W32)
     Uxth(d, a)             -> "uxth " + showReg(d, W32) + ", " + showReg(a, W32)
+    Rbit(d, a)             -> "rbit " + showReg(d, W64) + ", " + showReg(a, W64)
+    Clz(d, a)              -> "clz " + showReg(d, W64) + ", " + showReg(a, W64)
     Ubfx(d, a, lsb, width) -> "ubfx " + showReg(d, W64) + ", " + showReg(a, W64)
                               + ", #" + Int.toString(lsb) + ", #"
                               + Int.toString(width)
@@ -1021,6 +1075,8 @@ fun showArm(op : Arm) -> String = match op {
     Ret                    -> "ret"
     B(target)              -> "b " + blockLabel(target)
     BCond(c, target)       -> "b." + condName(c) + " " + blockLabel(target)
+    Allocate(d, a)         -> "// allocate " + showReg(d, W64) + ", class "
+                              + Int.toString(a.sizeClass) + ", " + a.slow
     Brk(n)                 -> "brk #" + Int.toString(n)
 }
 

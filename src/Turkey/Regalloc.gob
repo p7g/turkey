@@ -320,58 +320,118 @@ fun walk(f : Func A.Inst, spills : Spills, evict : Bool) -> Walk {
     -- unassigned value simply does not appear in the checks. It was found by
     -- the hint hit rate reading exactly 0 of 3714, which is not a bad hint
     -- rate but an absent one.
-    let entryTaken = Map.new()
+    let entryTaken = newTaken()
     for p in f.params {
         let id = Ssa.valueId(p)
         place(w, entryTaken, id, entry, 0)
     }
 
+    let scratch = BitSet.new(len(f.reps))
     for at in Ssa.reversePostorder(f) {
         let b = Ssa.blockId(at)
         let block = f.blocks[b]
         -- A block's parameters are defined at its entry and are all live at
         -- once, so each avoids the values entering the block and the
         -- parameters already placed.
-        let taken = Map.new()
+        let taken = newTaken()
         for id in BitSet.elements(liveIn[b]) {
-            if w.of_[id] >= 0 { Map.put(taken, key(f, id, w.of_[id]), id) }
+            if w.of_[id] >= 0 { hold(taken, key(f, id, w.of_[id]), id) }
         }
         for p in block.params {
             let pid = Ssa.valueId(p)
             place(w, taken, pid, block, 0)
         }
-        let after = Ssa.liveAfter(f, at, liveOut[b])
+        -- From here `taken` is kept rather than rebuilt: before instruction
+        -- `n` it holds what is live after `n - 1`, so releasing what `ends[n]`
+        -- names leaves what is live after `n`, less the definitions `n` is
+        -- about to place. Interference is with what is live *after* the
+        -- instruction, not before it: an operand that dies here may share the
+        -- destination's register, which is what makes `add x0, x0, x1` legal.
+        let ends = endings(f, block, liveOut[b], scratch)
         for var n = 0; n < len(block.insts); n = n + 1 {
-            -- Interference is with what is live *after* the instruction, not
-            -- before it: an operand that dies here may share the destination's
-            -- register, which is what makes `add x0, x0, x1` legal.
-            let live = Map.new()
-            for id in after[n] {
-                if w.of_[id] >= 0 { Map.put(live, key(f, id, w.of_[id]), id) }
+            -- An instruction that writes its destination before its last read
+            -- of an operand (an inline array allocation) places it while the
+            -- operands that die here still hold their registers.
+            let i = block.insts[n]
+            if A.writesBeforeReading(i.op) {
+                Ssa.eachDef(i, fun(d) = place(w, taken, Ssa.valueId(d), block, n + 1))
+                for id in ends[n] { releaseValue(w, taken, id) }
+                continue
             }
-            -- Unless the instruction writes its destination before its last
-            -- read of an operand, as an inline array allocation does.
-            if A.writesBeforeReading(block.insts[n].op) {
-                Ssa.eachUse(block.insts[n], fun(u) {
-                    let id = Ssa.valueId(u)
-                    if w.of_[id] >= 0 { Map.put(live, key(f, id, w.of_[id]), id) }
-                })
-            }
+            for id in ends[n] { releaseValue(w, taken, id) }
             Ssa.eachDef(block.insts[n], fun(d) =
-                place(w, live, Ssa.valueId(d), block, n + 1))
+                place(w, taken, Ssa.valueId(d), block, n + 1))
         }
     }
     w
 }
 
--- A taken-register key. The two files are allocated apart, so `x3` and `d3`
--- must not collide in one set; the bank is part of the key rather than the set
--- being split in two, which would double every loop above. Register numbers
--- are below 32, so the vector file starts there.
+-- For each instruction of a block, the values that stop holding a register
+-- just before it is coloured: the operands it reads for the last time, and the
+-- definitions of the instruction before it that nothing reads. The first
+-- instruction's also has the block's parameters that nothing reads. A dead
+-- definition is released one instruction late on purpose, because it still
+-- writes its register and so must not share it with anything live there.
 --
--- A wrapper rather than a bare `Int` because the maps it keys hold value ids,
--- which are `Int`s too, and swapping the two must not compile. It erases to
--- the number, so it costs nothing.
+-- Most instructions end nothing, and those share one empty array, so a block
+-- costs a handful of small arrays rather than a live set per instruction.
+-- `live` is scratch, overwritten here.
+fun endings(f : Func A.Inst, block : Ssa.Block A.Inst, out : BitSet,
+            live : BitSet) -> Array (Array Int) {
+    let count = len(block.insts)
+    let ends : Array (Array Int) = Array.new(count)
+    let nothing : Array Int = []
+    for _ in block.insts { Array.push(ends, nothing) }
+    BitSet.copyFrom(live, out)
+    for v in Ssa.termUses(block.term) { BitSet.add(live, Ssa.valueId(v)) }
+    for var n = count - 1; n >= 0; n = n - 1 {
+        let here = n
+        Ssa.eachDef(block.insts[here], fun(d) {
+            let id = Ssa.valueId(d)
+            if !BitSet.remove(live, id) && here + 1 < count {
+                endAt(ends, here + 1, id)
+            }
+        })
+        Ssa.eachUse(block.insts[here], fun(u) {
+            let id = Ssa.valueId(u)
+            if !BitSet.contains(live, id) {
+                BitSet.add(live, id)
+                endAt(ends, here, id)
+            }
+        })
+    }
+    if count > 0 {
+        for p in block.params {
+            if !BitSet.contains(live, Ssa.valueId(p)) {
+                endAt(ends, 0, Ssa.valueId(p))
+            }
+        }
+    }
+    ends
+}
+
+-- The shared empty array is never pushed to: the first value an instruction
+-- ends gets it an array of its own.
+fun endAt(ends : Array (Array Int), n : Int, id : Int) -> Unit =
+    if len(ends[n]) == 0 { ends[n] = [id] } else { Array.push(ends[n], id) }
+
+-- A value that was evicted, or never placed, holds nothing to release.
+fun releaseValue(w : Walk, taken : Taken, id : Int) -> Unit {
+    let n = w.of_[id]
+    if n >= 0 {
+        let k = key(w.f, id, n)
+        if holderOf(taken, k) == id { release(taken, k) }
+    }
+}
+
+-- A taken-register key. The two files are allocated apart, so `x3` and `d3`
+-- must not collide; the bank is part of the key rather than every table being
+-- split in two, which would double every loop above. Register numbers are
+-- below 32, so the vector file starts there.
+--
+-- A wrapper rather than a bare `Int` because the tables it keys hold value
+-- ids, which are `Int`s too, and swapping the two must not compile. It erases
+-- to the number, so it costs nothing.
 type RegKey = RegKey(Int)
 
 instance Eq RegKey { fun eq(RegKey(a), RegKey(b)) = a == b }
@@ -391,6 +451,27 @@ fun keyName(k : RegKey) -> String {
     if n < 32 { "x" + Int.toString(n) } else { "d" + Int.toString(n - 32) }
 }
 
+-- The registers held at one program point: for each key, the value holding
+-- that register, or `-1`. `place` has to know whom it would evict, so a mask
+-- of the held registers is not enough; an array indexed by key answers both
+-- questions with no hashing, and the colourer updates one per block rather
+-- than building one per instruction.
+type Taken = Taken(Array Int)
+
+fun newTaken() -> Taken = Taken(Array.filled(64, -1))
+
+fun holderOf(Taken(held) : Taken, RegKey(k) : RegKey) -> Int = held[k]
+
+fun isHeld(taken : Taken, k : RegKey) -> Bool = holderOf(taken, k) >= 0
+
+fun hold(Taken(held) : Taken, RegKey(k) : RegKey, id : Int) -> Unit {
+    held[k] = id
+}
+
+fun release(Taken(held) : Taken, RegKey(k) : RegKey) -> Unit {
+    held[k] = -1
+}
+
 fun poolOf(bank : Bank) -> Array Int = match bank {
     Gp -> gpPool
     Fp -> fpPool
@@ -405,8 +486,8 @@ fun fileName(bank : Bank) -> String = match bank {
 -- and nothing forbids -- or, when there is none and `evict` is set, decide
 -- what goes to memory instead.
 --
--- `taken` maps each held register to the value holding it, because eviction
--- has to know whom it is evicting. `from` is the index in `block` from which
+-- `taken` says which value holds each register, because eviction has to know
+-- whom it is evicting. `from` is the index in `block` from which
 -- a holder's next use is measured.
 --
 -- Two different failures, and they need different answers. That is the one
@@ -422,7 +503,7 @@ fun fileName(bank : Bank) -> String = match bank {
 --   definition and its store. Something *else* has to leave, and the holder
 --   whose next use is furthest away is Belady's answer and the one that frees
 --   the register for longest.
-fun place(w : Walk, taken : Map RegKey Int, id : Int, block : Ssa.Block A.Inst,
+fun place(w : Walk, taken : Taken, id : Int, block : Ssa.Block A.Inst,
           from : Int) -> Unit {
     if w.of_[id] >= 0 { return }
     let spills = w.spills
@@ -433,7 +514,7 @@ fun place(w : Walk, taken : Map RegKey Int, id : Int, block : Ssa.Block A.Inst,
         match freeRegister(taken, w.forbidden[id], bank, w.hints[id]) {
             Some(n) -> {
                 w.of_[id] = n
-                Map.put(taken, keyIn(bank, n), id)
+                hold(taken, keyIn(bank, n), id)
                 placing = False
             }
             None -> if !w.evict {
@@ -451,7 +532,7 @@ fun place(w : Walk, taken : Map RegKey Int, id : Int, block : Ssa.Block A.Inst,
             } else {
                 match victim(w, taken, bank, block, from) {
                     Some(v) -> {
-                        let _ = Map.delete(taken, keyIn(bank, w.of_[v]))
+                        release(taken, keyIn(bank, w.of_[v]))
                         w.of_[v] = -1
                         Set.add(w.evicted, v)
                     }
@@ -476,27 +557,27 @@ fun stopOnce(w : Walk, why : String) -> Unit = match w.stopped {
 -- *hinted* to their argument registers rather than pinned to them -- a pin
 -- can contradict (a parameter in `x0` that is live across a call has had `x0`
 -- destroyed), and a preference cannot.
-fun freeRegister(taken : Map RegKey Int, forbidden : Int, bank : Bank,
+fun freeRegister(taken : Taken, forbidden : Int, bank : Bank,
                  hint : Int) -> Option Int {
     -- Only a register the pool would hand out: a move from `x29`, which is
     -- how `Prim.frameAddress` reads the frame, must not colour its
     -- destination into the frame register itself.
     if hint >= 0 && Array.contains(poolOf(bank), hint)
-       && !Map.contains(taken, keyIn(bank, hint))
+       && !isHeld(taken, keyIn(bank, hint))
        && !forbids(forbidden, hint) {
         return Some(hint)
     }
     for n in poolOf(bank) {
-        if !Map.contains(taken, keyIn(bank, n)) && !forbids(forbidden, n) {
+        if !isHeld(taken, keyIn(bank, n)) && !forbids(forbidden, n) {
             return Some(n)
         }
     }
     None
 }
 
-fun anyUnheld(taken : Map RegKey Int, bank : Bank) -> Bool {
+fun anyUnheld(taken : Taken, bank : Bank) -> Bool {
     for n in poolOf(bank) {
-        if !Map.contains(taken, keyIn(bank, n)) { return True }
+        if !isHeld(taken, keyIn(bank, n)) { return True }
     }
     False
 }
@@ -504,25 +585,23 @@ fun anyUnheld(taken : Map RegKey Int, bank : Bank) -> Bool {
 -- The holder to evict: in the same file, not a reload or a store (those live
 -- for one instruction and spilling them again would loop), and used furthest
 -- from `from`. Ties go to the lower value id, so that two runs agree.
-fun victim(w : Walk, taken : Map RegKey Int, bank : Bank,
+fun victim(w : Walk, taken : Taken, bank : Bank,
            block : Ssa.Block A.Inst, from : Int) -> Option Int {
     let spills = w.spills
     var best = -1
     var bestDistance = -1
     for n in poolOf(bank) {
-        match Map.get(taken, keyIn(bank, n)) {
-            Some(holder) -> {
-                let movable = !Map.contains(spills.reloadOf, holder)
-                              && !Map.contains(spills.slots, holder)
-                if movable {
-                    let d = nextUse(block, holder, from)
-                    if d > bestDistance || (d == bestDistance && holder < best) {
-                        best = holder
-                        bestDistance = d
-                    }
+        let holder = holderOf(taken, keyIn(bank, n))
+        if holder >= 0 {
+            let movable = !Map.contains(spills.reloadOf, holder)
+                          && !Map.contains(spills.slots, holder)
+            if movable {
+                let d = nextUse(block, holder, from)
+                if d > bestDistance || (d == bestDistance && holder < best) {
+                    best = holder
+                    bestDistance = d
                 }
             }
-            None -> {}
         }
     }
     if best < 0 { None } else { Some(best) }
@@ -568,47 +647,64 @@ let fpPool = [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
 -- denied to every value live *across* it, and a call writes all of the
 -- caller-saved ones. A value never live across such a point collects an empty
 -- set and takes the first register in the pool.
+--
+-- Each block is walked backwards with one running live set. Most instructions
+-- clobber nothing and sit where no physical register is live, and they cost
+-- only the update of that set: the live values are listed only where there is
+-- something to deny them.
 fun forbiddenSets(f : Func A.Inst, liveOut : Array BitSet) -> Array Int {
     let out = Array.filled(len(f.reps), 0)
+    let live = BitSet.new(len(f.reps))
     for var b = 0; b < len(f.blocks); b = b + 1 {
         let block = f.blocks[b]
-        let after = Ssa.liveAfter(f, Ssa.BlockId(b), liveOut[b])
         let (physical, _) = physicalLive(block)
-        for var n = 0; n < len(block.insts); n = n + 1 {
-            let clobbered = clobbersOf(block.insts[n])
-            if len(clobbered) > 0 {
-                for id in after[n] {
+        BitSet.copyFrom(live, liveOut[b])
+        for v in Ssa.termUses(block.term) { BitSet.add(live, Ssa.valueId(v)) }
+        for var n = len(block.insts) - 1; n >= 0; n = n - 1 {
+            -- `live` is what is live after instruction `n`.
+            let i = block.insts[n]
+            let clobbered = clobbersOf(i)
+            let held = physical[n]
+            let holding = len(held.gp) > 0 || len(held.fp) > 0
+            if len(clobbered) > 0 || holding {
+                let after = BitSet.elements(live)
+                for id in after {
                     -- A call that defines a register itself (`Allocate`)
                     -- destroys the caller-saved ones before it writes that
                     -- register, so its own result may take one.
-                    if A.isCall(block.insts[n]) && defines(block.insts[n], id) { continue }
+                    if A.isCall(i) && defines(i, id) { continue }
                     let bank = A.bankOf(f.reps[id])
                     for (cb, cn) in clobbered {
                         if sameBank(bank, cb) { out[id] = forbid(out[id], cn) }
                     }
                 }
-            }
-            -- And the other half: a physical register that is *live* here --
-            -- written by an earlier instruction, read by a later one -- is
-            -- denied to everything live across this point and to whatever
-            -- this instruction defines, since defining a value writes its
-            -- register.
-            let held = physical[n]
-            if len(held.gp) > 0 || len(held.fp) > 0 {
-                for id in touched(block.insts[n], after[n]) {
-                    let taken = match A.bankOf(f.reps[id]) {
-                        Gp -> held.gp
-                        Fp -> held.fp
-                    }
-                    for r in taken { out[id] = forbid(out[id], r) }
+                -- And the other half: a physical register that is *live*
+                -- here -- written by an earlier instruction, read by a later
+                -- one -- is denied to everything live across this point and
+                -- to whatever this instruction defines, since defining a
+                -- value writes its register.
+                if holding {
+                    for id in touched(i, after) { forbidHeld(out, f, held, id) }
                 }
             }
+            Ssa.eachDef(i, fun(d) {
+                let _ = BitSet.remove(live, Ssa.valueId(d))
+            })
+            Ssa.eachUse(i, fun(u) = BitSet.add(live, Ssa.valueId(u)))
         }
     }
     out
 }
 
 fun defines(i : A.Inst, id : Int) -> Bool = Ssa.anyDef(i, fun(v) = Ssa.valueId(v) == id)
+fun forbidHeld(out : Array Int, f : Func A.Inst, held : PhysicalLive,
+               id : Int) -> Unit {
+    let taken = match A.bankOf(f.reps[id]) {
+        Gp -> held.gp
+        Fp -> held.fp
+    }
+    for r in taken { out[id] = forbid(out[id], r) }
+}
 
 fun forbids(mask : Int, n : Int) -> Bool = Int.and(Int.shr(mask, n), 1) != 0
 

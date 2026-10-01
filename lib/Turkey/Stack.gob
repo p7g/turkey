@@ -1,0 +1,179 @@
+module Turkey.Stack (
+    running, first, next, high, parked, new, free, resumer, resumerSet,
+)
+
+-- The machine stacks Turkey code runs on: the program's own, and a
+-- coroutine's, which this module maps, lays out and unmaps. Each is a raw
+-- record on one list, which the collector walks for roots (`Turkey.Heap`)
+-- and `turkey_swap_stack` switches between (`Turkey.Emit`).
+--
+-- A giblet module: it runs before anything can allocate and holds nothing
+-- the collector traces. It never switches stacks itself, and edits only a
+-- stack nothing is running on.
+
+import Prelude ()
+import Std.Classes
+import Data.Int ()
+import Data.Bool.Type (Bool(..))
+import Target (OS(..))
+import Target as Target
+import Turkey.Process as Process
+import Turkey.Libc as Libc
+
+-- A machine stack Turkey frames run on: the outermost frame record any walk of
+-- it may reach, the frame record it was parked at (null while it runs), the
+-- next stack on the list, the start of its mapping (null for the program's
+-- own stack, which this module did not map), and the stack whose code last
+-- resumed it, which `Turkey.Coroutine` switches back to.
+--
+-- `Turkey.Runtime` holds the compiler's copy of the offsets the code it writes
+-- reads: the parked frame and the resumer. `Turkey.HeapCheck` reads the
+-- records by its own copy of the layout, so that a mistake here is not
+-- checked by the same mistake.
+let stackHigh : Int = 0
+let stackParked : Int = 8
+let stackNext : Int = 16
+let stackLow : Int = 24
+let stackResumedBy : Int = 32
+let stackBytes : Int = 40
+
+-- Every machine stack that holds Turkey frames, as a list of raw records, and
+-- the one the mutator is running on, which `turkey_swap_stack` changes. The
+-- program's own stack is the first, registered by the generated entry once
+-- early initialization has run. A collection (`Turkey.Heap`) walks the running
+-- stack from the allocator's frame and every other stack from the frame it was
+-- parked at, so a stack must be on this list before Turkey code that can
+-- allocate runs on it, and must have its parked frame recorded before it stops
+-- running.
+var stacks : Prim.Ptr = Prim.ptrNull()
+var runningStack : Prim.Ptr = Prim.ptrNull()
+var entryStack : Prim.Ptr = Libc.malloc(stackBytes)
+
+-- Recorded by the generated entry, from its own frame, after early
+-- initialization and before anything can allocate: the program's own stack,
+-- running, and the only one there is.
+foreign "turkey_entry_stack_set" fun entryStackSet(frame : Prim.Ptr) -> Unit {
+    if Prim.ptrIsNull(entryStack) {
+        Process.panic(Prim.cString("no memory for the stack record"))
+        return {}
+    }
+    Prim.storePtr(entryStack, stackHigh, frame)
+    Prim.storePtr(entryStack, stackParked, Prim.ptrNull())
+    Prim.storePtr(entryStack, stackNext, Prim.ptrNull())
+    Prim.storePtr(entryStack, stackLow, Prim.ptrNull())
+    Prim.storePtr(entryStack, stackResumedBy, Prim.ptrNull())
+    stacks = entryStack
+    runningStack = entryStack
+}
+
+-- The stack the mutator is running on: the one `Prim.swapStack` would switch
+-- away from.
+fun running() -> Prim.Ptr = runningStack
+
+-- The list, for walking it: the first stack, and the one after `stack`.
+fun first() -> Prim.Ptr = stacks
+fun next(stack : Prim.Ptr) -> Prim.Ptr = Prim.loadPtr(stack, stackNext)
+
+-- The outermost frame record any walk of `stack` may reach, and the record it
+-- was parked at, null while it runs.
+fun high(stack : Prim.Ptr) -> Prim.Ptr = Prim.loadPtr(stack, stackHigh)
+fun parked(stack : Prim.Ptr) -> Prim.Ptr = Prim.loadPtr(stack, stackParked)
+
+-- The stack whose code last resumed `stack`, which `Turkey.Coroutine` switches
+-- back to.
+fun resumer(stack : Prim.Ptr) -> Prim.Ptr = Prim.loadPtr(stack, stackResumedBy)
+
+fun resumerSet(stack : Prim.Ptr, by : Prim.Ptr) -> Unit =
+    Prim.storePtr(stack, stackResumedBy, by)
+
+-- Below every coroutine stack, a region mapped with no access, so that running
+-- off the end faults instead of writing over whatever is mapped next. A
+-- multiple of every page size arm64 systems use (4, 16 and 64KB), which
+-- `mprotect` needs; it costs address space and no memory.
+let stackGuardBytes = 65536
+
+-- A stack of `bytes` for a coroutine, registered and parked, ready for its
+-- first switch; null if there was no memory for it.
+--
+-- Mapped rather than allocated, so a page costs memory only once it is
+-- touched. Laid out from the top, all of it written here because nothing
+-- runs on the stack yet:
+--
+--     high - 16   {0, 0}                   the outermost frame record
+--     high - 32   {stack, 0}               what `turkey_stack_start` reads
+--     high - 48   {high - 16, start}       the parked record
+--
+-- The first switch to the stack resumes the parked record as it would any:
+-- `x29` from its first word and a return into its second, which is
+-- `turkey_stack_start` (`Turkey.Emit.emitStackStart`), with `sp` above the
+-- record. That code calls the coroutine's start, whose frame record then
+-- links to the outermost one -- a record whose saved `x29` is zero, where
+-- every walk of the stack stops.
+fun new(bytes : Int) -> Prim.Ptr {
+    let total = Prim.intAddWrapping(stackGuardBytes, bytes)
+    let base = Libc.mmap(Prim.ptrNull(), total, protReadWrite, mapPrivateAnonymous(),
+                         -1, 0)
+    if Prim.ptrToInt(base) == -1 { return Prim.ptrNull() }
+    if Prim.intAnd(Libc.mprotect(base, stackGuardBytes, protNone), 0xFFFF_FFFF) != 0 {
+        let _ = Libc.munmap(base, total)
+        return Prim.ptrNull()
+    }
+    let record = Libc.malloc(stackBytes)
+    if Prim.ptrIsNull(record) {
+        let _ = Libc.munmap(base, total)
+        return Prim.ptrNull()
+    }
+    let high = Prim.ptrAdd(base, total)
+    let outermost = Prim.ptrAdd(high, -16)
+    let entry = Prim.ptrAdd(high, -32)
+    let parked = Prim.ptrAdd(high, -48)
+    Prim.storePtr(outermost, 0, Prim.ptrNull())
+    Prim.storePtr(outermost, 8, Prim.ptrNull())
+    Prim.storePtr(entry, 0, record)
+    Prim.storePtr(entry, 8, Prim.ptrNull())
+    Prim.storePtr(parked, 0, outermost)
+    Prim.storePtr(parked, 8, Prim.codeAddress("turkey_stack_start"))
+    Prim.storePtr(record, stackHigh, high)
+    Prim.storePtr(record, stackParked, parked)
+    Prim.storePtr(record, stackNext, stacks)
+    Prim.storePtr(record, stackLow, base)
+    Prim.storePtr(record, stackResumedBy, Prim.ptrNull())
+    stacks = record
+    record
+}
+
+-- Unregister and unmap a stack whose last frame is gone: one that is parked
+-- for good, never to be resumed. Never the running one.
+fun free(stack : Prim.Ptr) -> Unit {
+    if Prim.ptrEq(stack, runningStack) || Prim.ptrIsNull(Prim.loadPtr(stack, stackLow)) {
+        Process.panic(Prim.cString("freed a stack that is running or not a coroutine's"))
+        return {}
+    }
+    if Prim.ptrEq(stacks, stack) {
+        stacks = Prim.loadPtr(stack, stackNext)
+    } else {
+        var before = stacks
+        while !Prim.ptrIsNull(before)
+                && !Prim.ptrEq(Prim.loadPtr(before, stackNext), stack) {
+            before = Prim.loadPtr(before, stackNext)
+        }
+        if Prim.ptrIsNull(before) {
+            Process.panic(Prim.cString("freed a stack that is not registered"))
+            return {}
+        }
+        Prim.storePtr(before, stackNext, Prim.loadPtr(stack, stackNext))
+    }
+    let low = Prim.loadPtr(stack, stackLow)
+    let _ = Libc.munmap(low, Prim.ptrDiff(Prim.loadPtr(stack, stackHigh), low))
+    Libc.free(stack)
+}
+
+-- `PROT_*` and the `MAP_*` flags of a private mapping of no file. The protections
+-- are the same everywhere; `MAP_ANON` is 0x1000 on Darwin and 0x20 on Linux.
+let protNone = 0
+let protReadWrite = 3
+
+fun mapPrivateAnonymous() -> Int = match Target.os {
+    Darwin -> 0x1002
+    Linux -> 0x22
+}

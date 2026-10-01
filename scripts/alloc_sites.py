@@ -1,6 +1,6 @@
 """Allocation counts by site, from a build that counts them.
 
-    TURKEY_ALLOC_SITES=1 boot native prog.gob > prog.s 2> sites.txt
+    TURKEY_ALLOC_SITES=1 boot build -o prog.s prog.gob 2> sites.txt
     cc -o prog prog.s && ./prog          # writes turkey-alloc-sites.bin
     python3 scripts/alloc_sites.py sites.txt turkey-alloc-sites.bin [--top N]
 

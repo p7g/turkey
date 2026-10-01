@@ -4,7 +4,7 @@ The behavioral tests -- a program's output, a diagnostic's text, a panic's
 message -- say what Turkey does, and every one of them asks the compiled `boot`
 through this module.
 
-A program is compiled the way a user would compile it: `boot native` from the
+A program is compiled the way a user would compile it: `boot build` from the
 program's own directory, so a diagnostic quotes the file by its bare name, then
 assembled and linked against the runtime with the C compiler, then run, both
 as `tests.toolchain` says. The library is found through `$TURKEY_LIB`, since
@@ -138,8 +138,8 @@ def _entry(src: Source, modules: dict[str, str] | None) -> Path:
     return program(src, modules)
 
 
-def _key(command: str, entry: Path, flags: tuple[str, ...] = ()) -> str:
-    """The cache key for `boot <command>` on `entry`.
+def _key(output: str, entry: Path, flags: tuple[str, ...] = ()) -> str:
+    """The cache key for one output of `boot` (`bootc.argv`) on `entry`.
 
     The entry's own bytes and every `.gob` beside and below it, which is what
     it can import -- except in `tests/programs`, whose single-file programs
@@ -149,7 +149,7 @@ def _key(command: str, entry: Path, flags: tuple[str, ...] = ()) -> str:
     """
     h = hashlib.sha256()
     h.update(bootc.build_key().encode())
-    h.update(" ".join((command, *flags)).encode())
+    h.update(" ".join((output, *flags)).encode())
     h.update(str(entry).encode())
     sources = ([entry] if entry.parent == CORPUS
                else sorted(entry.parent.rglob("*.gob")))
@@ -166,10 +166,10 @@ def _key(command: str, entry: Path, flags: tuple[str, ...] = ()) -> str:
     return h.hexdigest()[:24]
 
 
-def _boot(command: str, entry: Path,
+def _boot(output: str, entry: Path,
           flags: tuple[str, ...] = ()) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
-        toolchain.command(bootc.binary(), command, *flags, entry.name),
+        toolchain.command(bootc.binary(), *bootc.argv(output), *flags, entry.name),
         cwd=entry.parent,
         env=dict(os.environ, TURKEY_LIB=str(LIB)),
         capture_output=True,
@@ -177,10 +177,10 @@ def _boot(command: str, entry: Path,
     )
 
 
-def _cached(command: str, entry: Path, build,
+def _cached(output: str, entry: Path, build,
             flags: tuple[str, ...] = ()) -> _Compiled:
     """One compile, done once per key under a lock and kept on disk."""
-    directory = WORK / "out" / _key(command, entry, flags)
+    directory = WORK / "out" / _key(output, entry, flags)
     status = directory / "status.json"
 
     def load() -> _Compiled | None:
@@ -210,7 +210,7 @@ def _cached(command: str, entry: Path, build,
 
 def _native(entry: Path, flags: tuple[str, ...] = ()) -> _Compiled:
     def build(directory: Path) -> tuple[int, str]:
-        result = _boot("native", entry, flags)
+        result = _boot("asm", entry, flags)
         stderr = result.stderr.decode("utf-8")
         if result.returncode != 0:
             return result.returncode, stderr
@@ -230,7 +230,7 @@ def _native(entry: Path, flags: tuple[str, ...] = ()) -> _Compiled:
         finally:
             source.unlink(missing_ok=True)
         return 0, stderr
-    return _cached("native", entry, build, flags)
+    return _cached("asm", entry, build, flags)
 
 
 def _checked(entry: Path) -> _Compiled:
@@ -291,8 +291,8 @@ def output(src: Source, modules: dict[str, str] | None = None) -> str:
 def fails(src: Source, modules: dict[str, str] | None = None) -> str:
     """A program that is expected not to compile, and its message.
 
-    Checked with `boot check`, which reports what the front end and the Core
-    checks refuse -- the same thing `driver.check` raised on.
+    Checked with `boot check`, which reports what the front end and the
+    lowering to Core refuse -- the same thing `driver.check` raised on.
     """
     try:
         warnings = check(src, modules)
@@ -333,17 +333,18 @@ def panic_message(result: Result) -> str:
     raise AssertionError(f"no panic in\n{result.stderr}")
 
 
-def dump(command: str, src: Source,
+def dump(stage: str, src: Source,
          modules: dict[str, str] | None = None) -> Result:
-    """`boot <command>` on one program -- `types`, `core`, `mono`, `opt` --
-    from the program's own directory. Not cached; a dump is what is tested."""
-    result = _boot(command, _entry(src, modules))
+    """`boot check --dump <stage>` on one program -- `types`, `core`, `mono`,
+    `opt` -- from the program's own directory. Not cached; a dump is what is
+    tested."""
+    result = _boot(stage, _entry(src, modules))
     return Result(result.stdout.decode("utf-8"), result.stderr.decode("utf-8"),
                   result.returncode)
 
 
 def types(src: Source, modules: dict[str, str] | None = None) -> dict[str, str]:
-    """The entry module's signatures, as `boot types` prints them."""
+    """The entry module's signatures, as the `types` dump prints them."""
     entry = _entry(src, modules)
     result = _boot("types", entry)
     stderr = result.stderr.decode("utf-8")
@@ -361,7 +362,7 @@ _KIND = re.compile(r"^type (\S+)(?: \S+)* :: (.+?)(?: = alias)?$")
 
 def kinds(src: Source, modules: dict[str, str] | None = None) -> dict[str, str]:
     """Every type constructor in the program and the kind inferred for it, as
-    `boot decls` prints them: keyed by qualified name (`Main#Boxed`,
+    the `decls` dump prints them: keyed by qualified name (`Main#Boxed`,
     `Data.Array#Array`, `Prim.Array`)."""
     result = dump("decls", src, modules)
     if result.code != 0:
@@ -386,7 +387,7 @@ _METHOD = re.compile(r"^  method (\S+) : ")
 def classes(src: Source,
             modules: dict[str, str] | None = None) -> dict[str, ClassInfo]:
     """Every class in the program, its parameter's kind and its methods, as
-    `boot classes` prints them, keyed by qualified name (`Main#Egal`)."""
+    the `classes` dump prints them, keyed by qualified name (`Main#Egal`)."""
     result = dump("classes", src, modules)
     if result.code != 0:
         raise CompileError(result.stderr, result.code)

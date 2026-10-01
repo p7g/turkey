@@ -1,0 +1,114 @@
+module System.Args (Arg(..), Parser, parser, next, value, unexpected)
+
+-- A command line, read one argument at a time.
+--
+-- Nothing is declared ahead of time. `next` answers what the next argument is
+-- -- a short option, a long one, or a value -- and the caller matches on it,
+-- so that `match` is the whole specification of what a program accepts, and
+-- the only one. A table of options for a library to interpret would buy
+-- generated help at the price of a second description of the same thing, and
+-- one that nothing checks against the code that acts on it.
+--
+-- The conventions are the usual ones. `-abc` is `-a -b -c`, and a short
+-- option that takes a value takes the rest of its cluster, so `-ofile` and
+-- `-o=file` are both `-o file`. `--name=value` is `--name` with its value
+-- attached. `--` ends the options: everything after it is a value. `-` alone
+-- is a value, being the conventional name for a standard stream.
+
+type Arg = Short(Char) | Long(String) | Value(String)
+
+type Parser = Parser {
+    args     : Array String,
+    -- The next argument not yet looked at.
+    at       : Int,
+    -- What is left of a `-abc` cluster after the options already answered.
+    cluster  : String,
+    -- `--name=value`'s value, until `value` takes it.
+    attached : Option String,
+    -- The option last answered, as it was written, for a message about its
+    -- value.
+    last     : String,
+    -- Whether `--` has been passed.
+    finished : Bool,
+}
+
+fun parser(args : Array String) -> Parser =
+    Parser { args = args, at = 0, cluster = "", attached = None, last = "",
+             finished = False }
+
+-- The next argument, `Right(None)` once there are none left, or `Left` with a
+-- message when the option before it was handed a value it did not ask for.
+--
+-- An attached value nobody took is an error rather than something to drop:
+-- `--verbose=no` silently meaning `--verbose` is the opposite of what was
+-- written.
+fun next(p : Parser) -> Either String (Option Arg) {
+    if let Some(v) = p.attached {
+        p.attached = None
+        return Left(p.last + " does not take a value, but was given '" + v + "'")
+    }
+    if !String.isEmpty(p.cluster) { return Right(Some(short(p, p.cluster))) }
+    if p.at >= len(p.args) { return Right(None) }
+    let arg = p.args[p.at]
+    p.at = p.at + 1
+    if p.finished || arg == "-" { return Right(Some(Value(arg))) }
+    if arg == "--" {
+        p.finished = True
+        return next(p)
+    }
+    if let Some(rest) = String.stripPrefix(arg, "--") {
+        let name = match String.splitOnce(rest, "=") {
+            Some((name, v)) -> {
+                p.attached = Some(v)
+                name
+            }
+            None -> rest
+        }
+        p.last = "--" + name
+        return Right(Some(Long(name)))
+    }
+    match String.stripPrefix(arg, "-") {
+        Some(rest) -> Right(Some(short(p, rest)))
+        None -> Right(Some(Value(arg)))
+    }
+}
+
+-- The value of the option `next` just answered: what was attached to it, the
+-- rest of its cluster, or else the next argument whatever it looks like, so
+-- that `-o -` writes to standard output and `--dump --x` dumps a stage named
+-- `--x`. `Left` with a message if the command line has run out.
+fun value(p : Parser) -> Either String String {
+    if let Some(v) = p.attached {
+        p.attached = None
+        return Right(v)
+    }
+    if !String.isEmpty(p.cluster) {
+        let rest = p.cluster
+        p.cluster = ""
+        return Right(match String.stripPrefix(rest, "=") {
+            Some(v) -> v
+            None -> rest
+        })
+    }
+    if p.at >= len(p.args) { return Left(p.last + " needs a value") }
+    let v = p.args[p.at]
+    p.at = p.at + 1
+    Right(v)
+}
+
+-- What to say about an argument the program has no use for.
+fun unexpected(a : Arg) -> String = match a {
+    Short(c) -> "unknown option -" + Char.toString(c)
+    Long(name) -> "unknown option --" + name
+    Value(v) -> "unexpected argument '" + v + "'"
+}
+
+-- The first option of a non-empty cluster, keeping the rest for later.
+fun short(p : Parser, cluster : String) -> Arg = match String.step(cluster, String.start(cluster)) {
+    Some((c, rest)) -> {
+        p.cluster = String.slice(cluster, rest, String.end(cluster))
+        p.last = "-" + Char.toString(c)
+        Short(c)
+    }
+    None -> error("an empty cluster of short options")
+}

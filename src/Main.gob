@@ -1,18 +1,21 @@
 -- The compiler, built from the committed assembly in `bootstrap/` by
 -- `scripts/build.sh`.
 --
--- One subcommand per stage: `check` compiles and says nothing, `native` emits
--- arm64 assembly, `encode` lists the words the encoder makes of the same code
--- (the test checks them against the system assembler), and the rest print
--- what a stage produced, which is how a pass is read while it is being
--- written.
+-- Two commands. `check` compiles as far as the last stage that can reject a
+-- program, and writes nothing. `build` compiles all the way and writes the
+-- result to `-o`, in the format its extension names or `-f` overrides.
+-- Either takes `--dump STAGE,...` to print what a stage produced, which is how
+-- a pass is read while it is being written: `check` goes on as far as the
+-- latest stage asked for and no further, and `build` prints them on its way.
 --
--- A subcommand takes any number of files and answers for each in turn, with no
--- separator between them: every dump ends with its own EOF, so the
--- concatenation is unambiguous. That keeps a whole corpus to one process, since
--- starting this program is not free.
+-- Several files may be named, and each is answered in turn with no separator
+-- between them: every dump marks its own beginning or end, so the
+-- concatenation is unambiguous. That keeps a whole corpus to one process,
+-- since starting this program is not free.
 
 import Data.Set as Set
+import System.Args as Args
+import System.Args (Arg(..))
 import System.Env as Env
 import System.IO as IO
 import Turkey.Diag as Diag
@@ -80,55 +83,218 @@ var target = Target.host()
 -- And what the other flags did (`Turkey.Build`).
 var build = Build.plain
 
+-- What `--dump` can name, in the order the stages run. Its position is how far
+-- a compile has to go to print it.
+let stages = ["decls", "classes", "types", "core", "mono", "opt", "ssa",
+              "select", "listing"]
+
+-- Where `check` stops when no dump asks for more: lowering to Core, the last
+-- stage that can reject a program. Everything after it reports only internal
+-- errors, so whoever gives a later stage a diagnostic a program can earn has
+-- to move this.
+let checkedThrough = "core"
+
+-- What `build` writes. Only assembly for now: an object needs the object
+-- writer, and an executable needs either that and a linker or the writer
+-- that replaces both.
+type Format = Executable | Object | Assembly
+
+-- Where the assembly goes.
+type Sink = ToStdout | ToFile(IO.Output)
+
 fun main() {
-    let args = Env.args()
-    if len(args) < 2 { usage() }
-    let command = args[0]
-    if !Array.contains(["decls", "classes", "types", "core", "mono", "opt",
-                    "ssa", "asm", "native", "encode", "check"], command) {
-        die("unknown command '" + command + "'")
+    let p = Args.parser(Env.args())
+    let building = match Args.next(p) {
+        Right(Some(Value("check"))) -> False
+        Right(Some(Value("build"))) -> True
+        Right(Some(Value(other))) -> die("unknown command '" + other + "'")
+        _ -> usage()
     }
-    let paths = Array.new(len(args))
-    for var i = 1; i < len(args); i = i + 1 {
-        if args[i] == "--target" {
-            if i + 1 == len(args) { usage() }
-            target = match Target.named(args[i + 1]) {
-                Some(t) -> t
-                None -> die("unknown target '" + args[i + 1] + "'; supported: "
-                            + Target.spellings())
-            }
-            i = i + 1
-        } else {
-            match Build.flag(build, args[i]) {
-                Some(b) -> { build = b }
-                None -> Array.push(paths, args[i])
+    var output = None
+    var format = None
+    let dumps = Set.new()
+    let paths = []
+    loop {
+        match Args.next(p) {
+            Left(message) -> die(message)
+            Right(None) -> break
+            Right(Some(arg)) -> match arg {
+                Short('o') -> { output = Some(valueOf(p)) }
+                Short('f') -> { format = Some(formatNamed(valueOf(p))) }
+                Long("target") -> {
+                    let name = valueOf(p)
+                    target = match Target.named(name) {
+                        Some(t) -> t
+                        None -> die("unknown target '" + name + "'; supported: "
+                                    + Target.spellings())
+                    }
+                }
+                Long("dump") -> for stage in String.split(valueOf(p), ",") {
+                    if !Array.contains(stages, stage) {
+                        die("cannot dump '" + stage + "'; the stages are "
+                            + String.join(stages, ", "))
+                    }
+                    Set.add(dumps, stage)
+                }
+                Long(name) -> match Build.flag(build, "--" + name) {
+                    Some(b) -> { build = b }
+                    None -> die(Args.unexpected(arg))
+                }
+                Value(path) -> Array.push(paths, path)
+                Short(_) -> die(Args.unexpected(arg))
             }
         }
     }
     if len(paths) == 0 { usage() }
+    let sink = if building {
+        Some(openSink(output, format, paths, len(Set.elements(dumps)) > 0))
+    } else {
+        match (output, format) {
+            (None, None) -> None
+            _ -> die("check writes nothing; -o and -f are for build")
+        }
+    }
     -- One builder for every file: a `print` per line is a flush per line, and
     -- a dump of the library is a hundred thousand of them.
     let b = String.builder()
+    let listing = Encode.newListing()
     for path in paths {
         Diag.compiling(path)
-        match command {
-            "decls" -> dumpDecls(b, path)
-            "classes" -> dumpClasses(b, path)
-            "types" -> dumpTypes(b, path)
-            "core" -> dumpCore(b, path)
-            "mono" -> dumpMono(b, path)
-            "ssa" -> dumpSsa(b, path)
-            "asm" -> dumpAsm(b, path)
-            "native" -> dumpNative(b, path, fun(d, code) { Stream.print(d, code, b) })
-            "encode" -> {
-                let l = Encode.newListing()
-                dumpNative(b, path, fun(d, code) { Encode.listing(l, code, b) })
-            }
-            "check" -> checkOnly(path)
-            _ -> dumpOpt(b, path)
-        }
+        compile(b, path, dumps, listing, sink)
     }
     write(String.build(b))
+    if let Some(ToFile(out)) = sink {
+        if !IO.close(out) { die("cannot write " + Option.unwrapOr(output, "")) }
+    }
+}
+
+fun valueOf(p : Args.Parser) -> String = match Args.value(p) {
+    Left(message) -> die(message)
+    Right(v) -> v
+}
+
+fun formatNamed(name : String) -> Format = match name {
+    "exe" -> Executable
+    "obj" -> Object
+    "asm" -> Assembly
+    _ -> die("unknown format '" + name + "'; the formats are exe, obj, asm")
+}
+
+-- The format a file name asks for. An executable has no extension on the
+-- systems this targets, so a name without one is an executable, and a name
+-- with one this does not know is refused rather than taken for an executable:
+-- `-o prog.S` silently writing a binary is the mistake this rule is for.
+fun formatOf(path : String) -> Format {
+    let parts = String.split(path, "/")
+    match String.rsplitOnce(parts[len(parts) - 1], ".") {
+        None -> Executable
+        Some((_, "s")) -> Assembly
+        Some((_, "o")) -> Object
+        Some((_, ext)) -> die("cannot tell what to write from the extension '."
+                              + ext + "'; name the file .s or .o, or say which "
+                              + "with -f")
+    }
+}
+
+-- Where `build` writes, refused here if it is something this cannot write
+-- yet, before any compiling is spent on it.
+fun openSink(output : Option String, format : Option Format, paths : Array String,
+             dumping : Bool) -> Sink {
+    let chosen = match (format, output) {
+        (Some(f), _) -> f
+        (None, Some("-")) -> die("-o - needs -f, since there is no extension "
+                                 + "to tell the format from")
+        (None, Some(path)) -> formatOf(path)
+        (None, None) -> Executable
+    }
+    match chosen {
+        Executable -> die("boot cannot write an executable yet; write assembly "
+                          + "with -o NAME.s and link it with a C compiler")
+        Object -> die("boot cannot write an object file yet; write assembly "
+                      + "with -o NAME.s and assemble it")
+        Assembly -> {}
+    }
+    match output {
+        None | Some("-") -> {
+            -- Dumps go to standard output too, and two things in one stream
+            -- can be told apart only by parsing both.
+            if dumping {
+                die("--dump writes to standard output, which -o - is "
+                    + "already writing to")
+            }
+            ToStdout
+        }
+        Some(path) -> {
+            if len(paths) > 1 {
+                die("several files can be built only to standard output, "
+                    + "with -o -")
+            }
+            match IO.create(path) {
+                Some(out) -> ToFile(out)
+                None -> die("cannot write " + path)
+            }
+        }
+    }
+}
+
+-- Each stage, and the dumps of it that were asked for, as far as this
+-- compile has to go: to the code if there is a sink to write it to, and
+-- otherwise to the latest stage dumped or `checkedThrough`, whichever is
+-- later. Dumps are written out as each stage finishes, so a stage that
+-- refuses the program still leaves what came before it to look at.
+fun compile(b : String.Builder, path : String, dumps : Set.Set String,
+            listing : Encode.Listing, sink : Option Sink) -> Unit {
+    let wants = Set.contains(dumps, _)
+    var reach = position(checkedThrough)
+    for stage in Set.elements(dumps) {
+        if position(stage) > reach { reach = position(stage) }
+    }
+    if let Some(_) = sink { reach = len(stages) }
+    let through = fun(stage) = reach <= position(stage)
+    if wants("decls") { dumpDecls(b, path) }
+    if wants("classes") { dumpClasses(b, path) }
+    write(String.drain(b))
+    let (checked, entry) = checkProgram(path)
+    reportWarnings(checked, path)
+    if wants("types") { dumpTypes(b, checked, entry) }
+    let program = lowered(checked)
+    if wants("core") { String.push(b, Core.showProgram(program, Some(entry.name))) }
+    write(String.drain(b))
+    if through("core") { return }
+    let main = Map.getOr(entry.scope.values, "main", "main")
+    let specialized = Mono.monomorphize(program, checked.decls, checked.classes,
+                                        main, roots(checked))
+    if wants("mono") { dumpMono(b, checked, entry, specialized) }
+    if through("mono") { return }
+    let optimized = optimize(checked, main, specialized)
+    if wants("opt") { String.push(b, Core.showProgram(optimized, Some(entry.name))) }
+    write(String.drain(b))
+    if through("opt") { return }
+    let (module_, skipped) = lowerModule(optimized, checked.decls, path)
+    if wants("ssa") { dumpSsa(b, module_, skipped) }
+    write(String.drain(b))
+    if through("ssa") { return }
+    refuseSkipped(skipped, path)
+    if wants("select") { dumpSelect(b, path, module_) }
+    write(String.drain(b))
+    if through("select") { return }
+    -- The listing and the assembly come from one emission, each consumer
+    -- with its own text, since the program's text is too large to emit twice.
+    let outs = []
+    if wants("listing") {
+        Array.push(outs, Out { text = b, sink = ToStdout,
+                               render = fun(d, code, t) { Encode.listing(listing, code, t) } })
+    }
+    if let Some(s) = sink {
+        Array.push(outs, Out { text = String.builder(), sink = s,
+                               render = Stream.print })
+    }
+    emitModule(path, entry, module_, outs)
+}
+
+fun position(stage : String) -> Int = match Array.indexOf(stages, stage) {
+    Some(i) -> i
+    None -> error("not a stage: " + stage)
 }
 
 -- Every module of the program, loaded, resolved and desugared, in dependency
@@ -199,25 +365,19 @@ fun registerTables(path : String,
 -- exhaustiveness and elaborate the evidence. What is printed is the last step's
 -- input rather than its output, because a scheme is what a reader can check by
 -- eye and evidence is not.
-fun dumpTypes(b : String.Builder, path : String) -> Unit {
-    let (checked, entry) = checkProgram(path)
-    reportWarnings(checked, path)
+fun dumpTypes(b : String.Builder, checked : Checked, entry : Modules.Module) -> Unit {
     for (name, scheme) in signatures(entry, checked.env, checked.classes) {
         String.push(b, name + " : " + Ty.showScheme(scheme) + "\n")
     }
 }
 
--- The typed Core the elaboration produces, for the entry module.
+-- The typed Core the elaboration produces: what solving decided stops being
+-- an agreement between passes and becomes a term.
 --
--- The same front end `types` runs, and then the lowering: what solving decided
--- stops being an agreement between passes and becomes a term. Only the entry
--- module's part is printed, for the reason `types` prints one module's
--- signatures -- a whole program's Core is mostly the Prelude's.
-fun dumpCore(b : String.Builder, path : String) -> Unit {
-    let (checked, entry) = checkProgram(path)
-    String.push(b, Core.showProgram(lowered(checked), Some(entry.name)))
-}
-
+-- The `core`, `mono` and `opt` dumps print only the entry module's part, for
+-- the reason `types` prints one module's signatures -- a whole program's Core
+-- is mostly the Prelude's.
+--
 -- The lowering, and the check that makes it evidence rather than a claim.
 --
 -- The check is not optional and is not a flag. Evidence that is checkable but
@@ -237,12 +397,8 @@ fun lowered(checked : Checked) -> Core.CProgram {
 -- Checked again, and by the same checker: specialization rewrites every type in
 -- every body it copies, so "the copy still typechecks" is the property that a
 -- substitution went wrong would break first.
-fun dumpMono(b : String.Builder, path : String) -> Unit {
-    let (checked, entry) = checkProgram(path)
-    let program = lowered(checked)
-    let main = Map.getOr(entry.scope.values, "main", "main")
-    let specialized = Mono.monomorphize(program, checked.decls, checked.classes,
-                                        main, roots(checked))
+fun dumpMono(b : String.Builder, checked : Checked, entry : Modules.Module,
+             specialized : Core.CProgram) -> Unit {
     Coretc.checkProgram(checked.decls, checked.classes, specialized,
                         Coretc.globalsOf(checked.env))
     String.push(b, Core.showProgram(specialized, Some(entry.name)))
@@ -262,14 +418,11 @@ fun dumpMono(b : String.Builder, path : String) -> Unit {
 -- that is caught.
 -- Everything between the elaboration and the backend, in one place.
 --
--- `ssa` needs exactly what `opt` prints, so this is a function rather than the
--- same nine steps written twice: two copies of a pass order is how the two
--- stages come to disagree about what the backend is handed.
-fun optimized(checked : Checked, entry : Modules.Module) -> Core.CProgram {
-    let program = lowered(checked)
-    let main = Map.getOr(entry.scope.values, "main", "main")
-    let specialized = Mono.monomorphize(program, checked.decls, checked.classes,
-                                        main, roots(checked))
+-- What `opt` prints is exactly what the backend is handed: the dump and the
+-- compile both run this one function, so they cannot come to disagree about
+-- the pass order.
+fun optimize(checked : Checked, main : String, specialized : Core.CProgram)
+        -> Core.CProgram {
     -- Reachability again, now that the reductions have inlined calls away and
     -- folded the branches a constant decides: what only they reached is dead.
     let reduced = Mono.reachable(Opt.reduceProgram(
@@ -318,26 +471,10 @@ fun prunable(checked : Checked, giblets : Set.Set String, b : Core.CBind) -> Boo
 fun roots(checked : Checked) -> Array String =
     Mono.runtimeRoots(checked.decls, build.exportRuntime)
 
--- Everything a compile checks, and no dump: the front end, the elaboration and
--- every check on the Core after it. What it prints is the warnings, on stderr;
--- a program it rejects is reported the way every stage reports one, and exits
--- 1.
-fun checkOnly(path : String) -> Unit {
-    let (checked, entry) = checkProgram(path)
-    reportWarnings(checked, path)
-    let _ = optimized(checked, entry)
-}
-
 -- On stderr, and prefixed with the file, so that a warning is distinguishable
 -- from whatever the compiled program itself prints.
 fun reportWarnings(checked : Checked, path : String) -> Unit {
     for w in checked.warnings { IO.stderr(path + ":" + Diag.short(w) + "\n") }
-}
-
-fun dumpOpt(b : String.Builder, path : String) -> Unit {
-    let (checked, entry) = checkProgram(path)
-    let optimized = optimized(checked, entry)
-    String.push(b, Core.showProgram(optimized, Some(entry.name)))
 }
 
 -- The Low IR, and the checks on it. Every path that lowers comes through here,
@@ -406,12 +543,22 @@ fun refuseSkipped(skipped : Array SsaLower.Unsupported, path : String) -> Unit {
     }
 }
 
--- The program as arm64 assembly: what the assembler reads.
+-- One emission's consumer: what it makes of each piece of code, the text it
+-- makes it into, and where that text goes.
+type Out = Out {
+    render : fun(Asm.Dialect, Array (Stream.Item Arm64.Inst), String.Builder) -> Unit,
+    text   : String.Builder,
+    sink   : Sink,
+}
+
+-- The program as arm64 machine code, handed to each consumer a piece at a
+-- time: as assembly text to `build`'s output, and as the encoder's listing to
+-- the `listing` dump.
 --
--- `asm` above prints the machine IR and its measurements -- virtual registers,
--- the verifiers, the histograms -- and this prints the text. Two commands
--- rather than a flag, because they answer different questions and every test of
--- the first parses its numbers.
+-- The `select` dump prints the machine IR and its measurements -- virtual
+-- registers, the verifiers, the histograms -- and this the code. They are
+-- separate because they answer different questions and every test of the
+-- first parses its numbers.
 --
 -- **A whole module.** The functions, then the entry sequence, the panic
 -- messages, the module's data -- globals, string literals, the permanent root
@@ -421,14 +568,22 @@ fun refuseSkipped(skipped : Array SsaLower.Unsupported, path : String) -> Unit {
 -- The order below is not incidental. A message is interned by the guard that
 -- raises it, and the entry sequence interns `<globals>`, so the message table
 -- is complete only once every function *and* the entry have been emitted.
-fun dumpNative(b : String.Builder, path : String,
-               consume : fun(Asm.Dialect, Array (Stream.Item Arm64.Inst)) -> Unit) -> Unit {
-    let (checked, entry) = checkProgram(path)
-    reportWarnings(checked, path)
-    let program = optimized(checked, entry)
-    let (module_, skipped) = lowerModule(program, checked.decls, path)
-    refuseSkipped(skipped, path)
-    String.push(b, "// === " + path + "\n")
+fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
+              outs : Array Out) -> Unit {
+    let note = fun(text) { for o in outs { String.push(o.text, text) } }
+    -- Each consumer empties the array it is handed, so all but the last are
+    -- handed a copy.
+    let consume = fun(d, code) {
+        for var i = 0; i < len(outs); i = i + 1 {
+            let o = outs[i]
+            o.render(d, if i + 1 < len(outs) { Array.slice(code, 0, len(code)) }
+                        else { code }, o.text)
+        }
+    }
+    -- Written as it is emitted: held until the end, the program's text was
+    -- millions of strings the collector kept tracing.
+    let flush = fun() { for o in outs { send(o.sink, String.drain(o.text)) } }
+    note("// === " + path + "\n")
     -- A build that counts its allocations by site (`Turkey.Sites`): the table
     -- of what each site is goes to stderr.
     let sites = match Env.get("TURKEY_ALLOC_SITES") {
@@ -447,7 +602,7 @@ fun dumpNative(b : String.Builder, path : String,
     Array.push(code, Stream.Section(Asm.Text))
     consume(asm.dialect, code)
     for u in unsupported {
-        String.push(b, "// skipped " + u.name + ": " + u.what + "\n")
+        note("// skipped " + u.name + ": " + u.what + "\n")
     }
     let lows = Map.new()
     for low in module_.functions { Map.put(lows, low.name, low) }
@@ -465,17 +620,15 @@ fun dumpNative(b : String.Builder, path : String,
         }
         let a = Regalloc.allocate(f, frame.slots)
         match a.stopped {
-            Some(why) -> String.push(b, "// skipped " + f.name + ": " + why + "\n")
+            Some(why) -> note("// skipped " + f.name + ": " + why + "\n")
             None -> {
                 for message in MachineCheck.check(a.func, sigs) {
                     Array.push(complaints, message)
                 }
                 let l = Frame.layout(a, frame)
                 Emit.emitFunc(asm, a.func, a, l, i, code)
-                -- Written as it is emitted: held until the end, the program's
-                -- text was millions of strings the collector kept tracing.
                 consume(asm.dialect, code)
-                write(String.drain(b))
+                flush()
                 Array.push(layouts, (i, l))
             }
         }
@@ -498,6 +651,12 @@ fun dumpNative(b : String.Builder, path : String,
     Emit.emitData(module_, asm, sites, code)
     Emit.emitFrameTable(asm, layouts, code)
     consume(asm.dialect, code)
+    flush()
+}
+
+fun send(sink : Sink, text : String) -> Unit = match sink {
+    ToStdout -> write(text)
+    ToFile(out) -> if !IO.put(out, text) { die("cannot write the output") }
 }
 
 -- The machine IR, with what selection could not translate.
@@ -506,11 +665,7 @@ fun dumpNative(b : String.Builder, path : String,
 -- and is counted, so the histogram at the end names what is missing. The text
 -- is what the system assembler accepts, which is what makes `as` able to check
 -- it.
-fun dumpAsm(b : String.Builder, path : String) -> Unit {
-    let (checked, entry) = checkProgram(path)
-    let program = optimized(checked, entry)
-    let (module_, skipped) = lowerModule(program, checked.decls, path)
-    refuseSkipped(skipped, path)
+fun dumpSelect(b : String.Builder, path : String, module_ : SsaLower.Module) -> Unit {
     String.push(b, "; === " + path + "\n")
     let (selected, unsupported, asm) =
         Select.selectModule(module_, Asm.dialectFor(target))
@@ -735,10 +890,8 @@ fun dumpAsm(b : String.Builder, path : String) -> Unit {
 --
 -- The lowering is incomplete and reports it. The count is the progress
 -- signal: a Core form nothing handles yet stops one function, not the run.
-fun dumpSsa(b : String.Builder, path : String) -> Unit {
-    let (checked, entry) = checkProgram(path)
-    let program = optimized(checked, entry)
-    let (module_, skipped) = lowerModule(program, checked.decls, path)
+fun dumpSsa(b : String.Builder, module_ : SsaLower.Module,
+            skipped : Array SsaLower.Unsupported) -> Unit {
     let functions = module_.functions
     -- The storage the initializer writes. Printed first because a function
     -- below refers to it, and because a global's *representation* is the fact
@@ -974,10 +1127,11 @@ fun readOrDie(path : String) -> Source = match Source.read(path) {
 }
 
 fun usage() -> a =
-    die("usage: boot "
-        + "<decls|classes|types|core|mono|opt"
-        + "|ssa|asm|native|encode|check> [--target TARGET] [--gc-verify] [--gc-stats]"
-        + " [--export-runtime] FILE...")
+    die("usage: boot check [OPTIONS] FILE...\n"
+        + "       boot build [OPTIONS] [-o PATH] [-f exe|obj|asm] FILE...\n"
+        + "options: --target TARGET  --dump STAGE,...  --gc-verify  --gc-stats"
+        + "  --export-runtime\n"
+        + "stages: " + String.join(stages, ", "))
 
 fun die(message : String) -> a {
     IO.stderr("boot: " + message + "\n")

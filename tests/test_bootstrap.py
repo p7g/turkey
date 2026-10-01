@@ -56,7 +56,7 @@ def _stage3_assembly() -> str:
     The same disk-cached artifact `tests/test_emit.py` assembles, so running
     both costs one emission rather than two.
     """
-    return bootc.boot_each("native", [BOOT_MAIN], _split)[BOOT_MAIN]
+    return bootc.boot_each("asm", [BOOT_MAIN], _split)[BOOT_MAIN]
 
 
 @functools.lru_cache(maxsize=None)
@@ -95,7 +95,7 @@ def test_stage3_compiles_the_compiler_to_stage2s_bytes():
     """
     stage3 = _stage3_assembly()
     result = subprocess.run(
-        toolchain.command(_stage3(), "native", str(BOOT_MAIN)),
+        toolchain.command(_stage3(), *bootc.argv("asm"), str(BOOT_MAIN)),
         cwd=REPO_ROOT, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr[:4000]
     stage4 = bootc.split_before(result.stdout, "// === ")[BOOT_MAIN.name]
@@ -121,9 +121,9 @@ def test_stage3_agrees_with_stage2_over_the_corpus():
     """
     programs = sorted(path for path in (REPO_ROOT / "tests" / "programs").glob("*.gob")
                       if not path.name.startswith("err_"))
-    stage2 = bootc.boot_each("asm", programs, _split_asm)
+    stage2 = bootc.boot_each("select", programs, _split_asm)
     result = subprocess.run(
-        toolchain.command(_stage3(), "asm", *[str(p) for p in programs]),
+        toolchain.command(_stage3(), *bootc.argv("select"), *[str(p) for p in programs]),
         cwd=REPO_ROOT, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr[:4000]
     stage3 = bootc.split_before(result.stdout, "; === ")
@@ -136,12 +136,12 @@ STRESSED = REPO_ROOT / "tests" / "programs" / "adt.gob"
 
 @functools.lru_cache(maxsize=None)
 def _unstressed() -> str:
-    return bootc.boot("native", str(STRESSED))
+    return bootc.boot(*bootc.argv("asm"), str(STRESSED))
 
 
 def _stressed(boot: Path | None = None, **settings: str) -> str:
     env = dict(os.environ, **settings)
-    result = subprocess.run(toolchain.command(boot or bootc.binary(), "native", str(STRESSED)),
+    result = subprocess.run(toolchain.command(boot or bootc.binary(), *bootc.argv("asm"), str(STRESSED)),
                             cwd=REPO_ROOT, capture_output=True, env=env)
     assert result.returncode == 0, result.stderr.decode("utf-8")[:4000]
     return result.stdout.decode("utf-8")
@@ -168,7 +168,7 @@ def verifying_boot(tmp_path_factory) -> Path:
     directory = tmp_path_factory.mktemp("verifying-boot")
     source = directory / "boot.s"
     with open(source, "wb") as out:
-        subprocess.run(toolchain.command(bootc.binary(), "native", "--gc-verify",
+        subprocess.run(toolchain.command(bootc.binary(), *bootc.argv("asm"), "--gc-verify",
                                          "src/Main.gob"),
                        cwd=REPO_ROOT, stdout=out, check=True)
     binary = directory / "boot"
@@ -215,3 +215,22 @@ def test_the_bootstrap_is_what_its_provenance_says():
             ["git", "cat-file", "-e", f"{fields['commit']}^{{commit}}"],
             cwd=REPO_ROOT, capture_output=True)
         assert found.returncode == 0, f"no commit {fields['commit']}"
+
+
+def test_build_sh_speaks_only_the_bootstraps_command_line():
+    """A tripwire for the bump after the one that renamed `native`.
+
+    `scripts/build.sh` asks each stage whether it says `build` or the older
+    `native`, because the committed compiler may predate `build`. Once a bump
+    records a bootstrap that says `build`, every compiler `build.sh` runs
+    does, and the fallback is dead code: delete `emit_command` and call
+    `build` directly. `scripts/compare.sh` keeps its copy, since it builds
+    older trees.
+    """
+    if not _provenance()["command"].startswith("build "):
+        return
+    script = (REPO_ROOT / "scripts" / "build.sh").read_text()
+    assert "native" not in script, (
+        "bootstrap/ now speaks `boot build`, so scripts/build.sh no longer "
+        "needs to fall back to `native`: remove `emit_command` and call "
+        "`build -o - -f asm` directly")

@@ -14,7 +14,7 @@ from tests import lang
 
 
 def _main(src: str) -> str:
-    """The low IR of the program's own `main`, as `boot ssa` prints it."""
+    """The low IR of the program's own `main`, as the `ssa` dump prints it."""
     result = lang.dump("ssa", src)
     assert result.code == 0, result.stderr
     match = re.search(r"^fun @Main#main\(.*?^}$", result.stdout, re.M | re.S)

@@ -1,6 +1,6 @@
 """Exercise Turkey.Entry's argument, exit, panic and crash handling.
 
-`boot native` produces standalone binaries. Panic reports contain the
+`boot build` produces standalone binaries. Panic reports contain the
 message alone; a crash report names the functions on the root chain.
 """
 
@@ -26,10 +26,10 @@ pytestmark = pytest.mark.skipif(toolchain.missing(),
 
 
 def _boot_binary(source: Path, tmp_path: Path) -> Path:
-    """`boot native`, linked."""
+    """`boot build`, linked."""
     # From the repository, where `boot` finds `lib/`.
     text = subprocess.run(
-        toolchain.command(bootc.binary(), "native", str(source)),
+        toolchain.command(bootc.binary(), *bootc.argv("asm"), str(source)),
         cwd=REPO_ROOT, capture_output=True, text=True, check=True).stdout
     code = tmp_path / (source.stem + ".s")
     code.write_text(text, encoding="utf-8")

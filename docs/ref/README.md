@@ -96,7 +96,7 @@ Source files use the extension `.gob`. The compiler, `boot`, emits assembly
 for the whole program, which a C compiler assembles and links:
 
 ```sh
-boot native hello.gob > hello.s
+boot build -o hello.s hello.gob
 cc -o hello hello.s
 ./hello
 ```

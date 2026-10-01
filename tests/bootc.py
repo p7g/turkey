@@ -138,6 +138,19 @@ def _build(cached: Path, output: Path) -> Path:
     return output
 
 
+def argv(output: str) -> list[str]:
+    """`boot`'s arguments for one output: `asm`, the program's assembly on
+    stdout; `check`; or the name of a stage to dump (`core`, `ssa`, `select`,
+    `listing`, ...)."""
+    match output:
+        case "asm":
+            return ["build", "-o", "-", "-f", "asm"]
+        case "check":
+            return ["check"]
+        case _:
+            return ["check", "--dump", output]
+
+
 def boot(*args: str) -> str:
     """One `boot` invocation, answering its stdout.
 
@@ -219,10 +232,11 @@ def replace_built(command: list[str], output: Path) -> None:
     os.replace(command[command.index("-o") + 1], output)
 
 
-def boot_each(command: str, paths: list[Path],
+def boot_each(output: str, paths: list[Path],
               split: Callable[[str, list[Path]], list[str]],
               flags: tuple[str, ...] = ()) -> dict[Path, str]:
-    """`boot <command>` over some programs, cached on disk per program.
+    """`boot` over some programs for one output (`argv`), cached on disk per
+    program.
 
     On disk rather than in an `lru_cache`: a cache per *process* means that
     under `pytest -n auto` every worker that draws one of these tests pays the
@@ -235,15 +249,15 @@ def boot_each(command: str, paths: list[Path],
 
     The missing programs are computed in one `boot` run, holding a lock per
     program, so a cold entry is filled once while any other worker that wants
-    it waits. Per program rather than per command: `boot asm src/Main.gob`
-    takes minutes and the corpus's `boot asm` takes seconds, and one lock
+    it waits. Per program rather than per output: the `select` dump of
+    `src/Main.gob` takes minutes and the corpus's takes seconds, and one lock
     across both made every corpus test wait for the compiler. The locks are
     taken in path order, so two workers wanting overlapping sets cannot
     deadlock. `split` cuts the run's output into one text per path, in order.
     `flags` go to `boot` before the paths (`--gc-verify`), and into the key.
     """
     directory = (Path(tempfile.gettempdir()) / "turkey-bootout" / _build_key()
-                 / " ".join((command, *flags)))
+                 / " ".join((output, *flags)))
     directory.mkdir(parents=True, exist_ok=True)
 
     def entry(path: Path) -> Path:
@@ -271,7 +285,7 @@ def boot_each(command: str, paths: list[Path],
             fcntl.flock(lock, fcntl.LOCK_EX)
         found, missing = load()
         if missing:
-            text = boot(command, *flags, *(str(path) for path in missing))
+            text = boot(*argv(output), *flags, *(str(path) for path in missing))
             chunks = split(text, missing)
             assert len(chunks) == len(missing), (
                 f"{len(chunks)} dumps for {len(missing)} programs")
@@ -290,7 +304,7 @@ def split_on(text: str, marker: str) -> list[str]:
     `boot` takes any number of files in one invocation -- which is the whole
     point of this module -- so every caller needs the same unpicking
     afterwards. Two shapes exist: a dump that *starts* each program with a
-    marker line (`native`, `asm`), and one that *ends* each with a count line
+    marker line (`asm`, `select`), and one that *ends* each with a count line
     (`ssa`). This is the second; `split_before` is the first.
     """
     chunks, current = [], []

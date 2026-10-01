@@ -1,8 +1,9 @@
-"""`boot encode`: the encoder's words, checked against the system assembler.
+"""The `listing` dump: the encoder's words, checked against the system
+assembler.
 
-The oracle is exact and needs no list of instructions to test. `boot native`
-prints a program's code and `boot encode` lists the words the encoder makes of
-the same instructions; the assembler turns the printed text into an object, and
+The oracle is exact and needs no list of instructions to test. `boot build`
+writes a program's code as assembly and the `listing` dump lists the words the
+encoder makes of the same instructions; the assembler turns the printed text into an object, and
 its code section has to equal the listing word for word. So every instruction
 form the backend produces is checked, in the programs that produce it, and a
 mismatch names the instruction.
@@ -101,8 +102,8 @@ def _compare(listing: str, native: str) -> None:
 
 
 def _both(paths: list[Path]) -> tuple[dict[Path, str], dict[Path, str]]:
-    return (bootc.boot_each("encode", paths, _split),
-            bootc.boot_each("native", paths, _split))
+    return (bootc.boot_each("listing", paths, _split),
+            bootc.boot_each("asm", paths, _split))
 
 
 @pytest.mark.skipif(toolchain.missing(), reason="no C compiler")

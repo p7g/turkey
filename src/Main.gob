@@ -18,6 +18,7 @@ import System.Args as Args
 import System.Args (Arg(..))
 import System.Env as Env
 import System.IO as IO
+import System.Time as Time
 import Turkey.Diag as Diag
 import Turkey.Source as Source
 import Turkey.Source (Source)
@@ -84,6 +85,24 @@ var target = Target.host()
 -- And what the other flags did (`Turkey.Build`).
 var build = Build.plain
 
+-- `--timings`: how long each phase took, and how the backend's time is spread
+-- over functions, on stderr. What a decision about parallel or incremental
+-- compilation needs to know first: which phases are worth splitting, and
+-- whether the work in them is even enough to split.
+var timings = False
+
+-- The time now, after reporting `phase` as having started at `since`.
+fun lap(phase : String, since : Int) -> Int {
+    let now = Time.monotonic()
+    if timings { IO.stderr("time\t" + phase + "\t" + millis(now - since) + "\n") }
+    now
+}
+
+fun millis(nanos : Int) -> String {
+    let tenths = nanos / 100000
+    Int.toString(tenths / 10) + "." + Int.toString(tenths % 10) + "ms"
+}
+
 -- What `--dump` can name, in the order the stages run. Its position is how far
 -- a compile has to go to print it.
 let stages = ["decls", "classes", "types", "core", "mono", "opt", "ssa",
@@ -129,6 +148,10 @@ fun main() {
                         None -> die("unknown target '" + name + "'; supported: "
                                     + Target.spellings())
                     }
+                }
+                Long("timings") -> {
+                    timings = True
+                    Opt.measure(True)
                 }
                 Long("dump") -> for stage in String.split(valueOf(p), ",") {
                     if !Array.contains(stages, stage) {
@@ -255,23 +278,29 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
     if wants("decls") { dumpDecls(b, path) }
     if wants("classes") { dumpClasses(b, path) }
     write(String.drain(b))
+    var at = Time.monotonic()
     let (checked, entry) = checkProgram(path)
+    at = lap("check", at)
     reportWarnings(checked, path)
     if wants("types") { dumpTypes(b, checked, entry) }
     let program = lowered(checked)
+    at = lap("lower", at)
     if wants("core") { String.push(b, Core.showProgram(program, Some(entry.name))) }
     write(String.drain(b))
     if through("core") { return }
     let main = Map.getOr(entry.scope.values, "main", "main")
     let specialized = Mono.monomorphize(program, checked.decls, checked.classes,
                                         main, roots(checked))
+    at = lap("mono", at)
     if wants("mono") { dumpMono(b, checked, entry, specialized) }
     if through("mono") { return }
     let optimized = optimize(checked, main, specialized)
+    at = lap("opt", at)
     if wants("opt") { String.push(b, Core.showProgram(optimized, Some(entry.name))) }
     write(String.drain(b))
     if through("opt") { return }
     let (module_, skipped) = lowerModule(optimized, checked.decls, path)
+    at = lap("ssa", at)
     if wants("ssa") { dumpSsa(b, module_, skipped) }
     write(String.drain(b))
     if through("ssa") { return }
@@ -619,8 +648,10 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
         }
         None -> 0
     }
+    var at = Time.monotonic()
     let (selected, unsupported, asm) =
         Select.selectModule(module_, Asm.dialectFor(target))
+    at = lap("select", at)
     let code = []
     Array.push(code, Stream.Section(Asm.Text))
     consume(asm.dialect, code)
@@ -634,7 +665,10 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     let layouts = []
     let sigs = MachineCheck.signatures(module_.functions, asm.dialect)
     let complaints = []
+    -- Each function's time from its roots to its text, for `--timings`.
+    let costs : Array (String, Int) = []
     for var i = 0; i < len(selected); i = i + 1 {
+        let started = Time.monotonic()
         let f = selected[i]
         let frame = match Map.get(lows, f.name) {
             Some(low) -> Roots.analyze(low)
@@ -655,7 +689,10 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
                 Array.push(layouts, (i, l))
             }
         }
+        if timings { Array.push(costs, (f.name, Time.monotonic() - started)) }
     }
+    at = lap("backend", at)
+    if timings { reportCosts(costs) }
     -- The representations, on what was actually allocated: nothing below here
     -- has a type system, so a scalar in a pointer's register assembles, links
     -- and runs until a collection looks at it.
@@ -683,6 +720,30 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     Emit.emitFrameTable(asm, layouts, code)
     consume(asm.dialect, code)
     flush()
+    let _ = lap("tables", at)
+}
+
+-- How the backend's time is spread over functions: what parallelizing it
+-- per function could gain is bounded by the largest one, and how evenly the
+-- rest divide decides how close to that bound it gets.
+fun reportCosts(costs : Array (String, Int)) -> Unit {
+    let sorted = Array.sortBy(costs, fun((_, a), (_, b)) = Int.compare(b, a))
+    var total = 0
+    for (_, c) in sorted { total = total + c }
+    let n = len(sorted)
+    -- The cost at the given rank, in thousandths from the largest.
+    let rank = fun(thousandths) = if n == 0 { 0 } else {
+        let k = n * thousandths / 1000
+        let (_, c) = sorted[if k < n { k } else { n - 1 }]
+        c
+    }
+    IO.stderr("functions\t" + Int.toString(n) + "\ttotal " + millis(total)
+              + "\tlargest " + millis(rank(0)) + "\tp99 " + millis(rank(10))
+              + "\tp90 " + millis(rank(100)) + "\tmedian " + millis(rank(500)) + "\n")
+    for var k = 0; k < n && k < 10; k = k + 1 {
+        let (name, c) = sorted[k]
+        IO.stderr("largest\t" + millis(c) + "\t" + name + "\n")
+    }
 }
 
 fun send(sink : Sink, text : String) -> Unit = match sink {
@@ -1160,8 +1221,8 @@ fun readOrDie(path : String) -> Source = match Source.read(path) {
 fun usage() -> a =
     die("usage: boot check [OPTIONS] FILE...\n"
         + "       boot build [OPTIONS] [-o PATH] [-f exe|obj|asm] FILE...\n"
-        + "options: --target TARGET  --dump STAGE,...  --gc-verify  --gc-stats"
-        + "  --export-runtime\n"
+        + "options: --target TARGET  --dump STAGE,...  --timings  --gc-verify"
+        + "  --gc-stats  --export-runtime\n"
         + "stages: " + String.join(stages, ", "))
 
 fun die(message : String) -> a {

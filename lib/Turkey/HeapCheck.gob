@@ -1,8 +1,9 @@
 module Turkey.HeapCheck (
     verify, stateBytes, stateRegions, stateAvailable, stateRegionTable,
     stateRegionTableCapacity, stateRegionTableCount, stateRegionBytes, stateObjects,
-    stateMarkEpoch, stateFrameEntries, stateFrameEntryCount, stateEntryStackHigh,
+    stateMarkEpoch, stateFrameEntries, stateFrameEntryCount, stateStacks,
     stateRoots, stateMinor, stateGenerational, stateRemembered, stateRememberedCount,
+    stateRunning,
 )
 
 -- The heap verifier: in a program compiled with `--gc-verify`, the collector
@@ -57,13 +58,13 @@ import Turkey.Libc as Libc
 --
 -- One word each: the region list, the per-class available lists, the region
 -- set's table, its capacity and its count, the bytes the regions reserve, the
--- objects allocated, the mark epoch, the frame table and its length, the outer
--- bound of the frame walk, the innermost shadow-stack frame, whether this
--- collection is minor, whether the program runs the write barrier (and so
--- whether an old object holding a young one must be remembered), and the
--- remembered objects and their count.
+-- objects allocated, the mark epoch, the frame table and its length, the list
+-- of stacks, the innermost shadow-stack frame, whether this collection is
+-- minor, whether the program runs the write barrier (and so whether an old
+-- object holding a young one must be remembered), the remembered objects and
+-- their count, and the stack the mutator is running on.
 
-let stateBytes : Int = 128
+let stateBytes : Int = 136
 let stateRegions : Int = 0
 let stateAvailable : Int = 8
 let stateRegionTable : Int = 16
@@ -74,12 +75,13 @@ let stateObjects : Int = 48
 let stateMarkEpoch : Int = 56
 let stateFrameEntries : Int = 64
 let stateFrameEntryCount : Int = 72
-let stateEntryStackHigh : Int = 80
+let stateStacks : Int = 80
 let stateRoots : Int = 88
 let stateMinor : Int = 96
 let stateGenerational : Int = 104
 let stateRemembered : Int = 112
 let stateRememberedCount : Int = 120
+let stateRunning : Int = 128
 
 -- -- the heap's format ----------------------------------------------------------------
 
@@ -142,6 +144,12 @@ let rootLive : Int = 32
 -- A frame-table entry, sorted by return address: the address, how many roots
 -- are live across the call, and their offsets from the caller's `x29`.
 let entryBytes : Int = 24
+
+-- A stack: the outermost frame record a walk of it may reach, the record it was
+-- parked at (null while it runs or before it has run), and the next stack.
+let stackHigh : Int = 0
+let stackParked : Int = 8
+let stackNext : Int = 16
 
 -- Bigger than any region or slot can be on a 64-bit address space, and small
 -- enough that the sum of two such values stays inside an `Int`. A slot's
@@ -206,12 +214,12 @@ foreign "turkey_heap_check" fun checkForTests(when : Int, frame : Prim.Ptr,
 
 foreign "turkey_heap_check_message" fun message() -> Prim.Ptr = text
 
--- The native frame walk alone, from `current`: for a test that builds a stack
+-- The native frame walk alone, from `current`: for a test that builds stacks
 -- and a frame table and puts them in the state it hands over.
 foreign "turkey_heap_check_frames" fun checkFramesForTests(when : Int, current : Int,
                                                           handed : Prim.Ptr) -> Int {
     if !begin(when, handed) { return 0 }
-    let passed = checkFrames(current, word(Prim.ptrToInt(state), stateEntryStackHigh))
+    let passed = checkFrames(current)
     releaseIndex()
     if passed { 1 } else { 0 }
 }
@@ -220,7 +228,7 @@ fun check(when : Int, frame : Prim.Ptr, handed : Prim.Ptr) -> Bool {
     if !begin(when, handed) { return False }
     let passed = checkRegions() && checkTable() && checkObjects() && checkRemembered()
                  && checkAvailable() && checkRoots()
-                 && checkFrames(Prim.ptrToInt(frame), stateWord(stateEntryStackHigh))
+                 && checkFrames(Prim.ptrToInt(frame))
     releaseIndex()
     passed
 }
@@ -804,15 +812,10 @@ fun checkRoots() -> Bool {
     True
 }
 
--- The frame table's shape, then the arm64 frames from `current` out to `high`,
--- `current` being the collection's Turkey frame record or 0 if none is live.
---
--- The walk follows the same records within the same bounds as the collector's:
--- a record is two words, the caller's record and a return address into the
--- caller, and the entry for that address gives the caller's roots as offsets
--- from the caller's record. Records are 8-byte aligned and strictly increase
--- towards `high`; the walk stops at the first that does not.
-fun checkFrames(current : Int, high : Int) -> Bool {
+-- The frame table's shape, then every stack's arm64 frames: the running
+-- stack's from `current`, the collection's Turkey frame record or 0 if none is
+-- live, and each other stack's from the record it was parked at.
+fun checkFrames(current : Int) -> Bool {
     if entryCount == 0 { return True }
     if entryCount < 0 || Prim.ptrIsNull(entries) {
         return failAt(Prim.cString("invalid native frame table"), entries, -1)
@@ -825,6 +828,32 @@ fun checkFrames(current : Int, high : Int) -> Bool {
         }
     }
     if current == 0 { return True }
+    let running = stateWord(stateRunning)
+    if running == 0 { return fail(Prim.cString("missing native stack bound"), 0, -1) }
+    if !checkStack(current, word(running, stackHigh)) { return False }
+    var stack = stateWord(stateStacks)
+    var seen = False
+    while stack != 0 {
+        let parked = word(stack, stackParked)
+        if stack == running {
+            seen = True
+        } else if parked != 0 && !checkStack(parked, word(stack, stackHigh)) {
+            return False
+        }
+        stack = word(stack, stackNext)
+    }
+    if !seen { return fail(Prim.cString("running stack not on the stack list"), running, -1) }
+    True
+}
+
+-- One stack's frames, from the record at `current` out to `high`.
+--
+-- The walk follows the same records within the same bounds as the collector's:
+-- a record is two words, the caller's record and a return address into the
+-- caller, and the entry for that address gives the caller's roots as offsets
+-- from the caller's record. Records are 8-byte aligned and strictly increase
+-- towards `high`; the walk stops at the first that does not.
+fun checkStack(current : Int, high : Int) -> Bool {
     if high == 0 { return fail(Prim.cString("missing native stack bound"), 0, -1) }
     var walked = current
     while !below(high, walked) && !below(high - walked, 16) && Prim.intAnd(walked, 7) == 0 {
@@ -842,10 +871,10 @@ fun checkFrames(current : Int, high : Int) -> Bool {
                     return fail(Prim.cString("invalid native root offset"),
                                 Prim.ptrToInt(entries) + entryBytes * e, fi)
                 }
-                -- A frame slot may hold the address of an object in a frame,
-                -- which the collector skips by the same range. The heap may
-                -- never hold one, and `checkObject` refuses it there: it is
-                -- in no region.
+                -- A frame slot may hold the address of an object in a frame
+                -- of the same stack, which the collector skips by the same
+                -- range. The heap may never hold one, and `checkObject`
+                -- refuses it there: it is in no region.
                 let value = word(slot, 0)
                 let onStack = !below(value, current) && below(value, high)
                 if !onStack && !checkPointer(value, phase != 0, caller, fi) { return False }

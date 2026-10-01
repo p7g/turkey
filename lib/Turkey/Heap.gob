@@ -128,6 +128,14 @@ let objectSlots : Int = 24
 -- call, and where their `x29` offsets are.
 let entryBytes : Int = 24
 
+-- A machine stack Turkey frames run on: the outermost frame record any walk of
+-- it may reach, the frame record it was parked at (null while it runs, or
+-- before it has run), and the next stack on the list.
+let stackHigh : Int = 0
+let stackParked : Int = 8
+let stackNext : Int = 16
+let stackBytes : Int = 24
+
 -- -- state ------------------------------------------------------------------------------
 
 var regions : Prim.Ptr = Prim.ptrNull()
@@ -180,9 +188,18 @@ var rememberedCapacity : Int = 0
 var frameEntries : Prim.Ptr = Prim.ptrNull()
 var frameEntryCount : Int = 0
 
--- The generated entry's own frame: the outermost any walk of the Turkey stack
--- may reach. Set by the entry once early initialization has run.
-var entryStackHigh : Prim.Ptr = Prim.ptrNull()
+-- Every machine stack that holds Turkey frames, as a list of raw records, and
+-- the one the mutator is running on. The program's own stack is the first,
+-- registered by the generated entry once early initialization has run. A
+-- collection walks the running stack from the allocator's frame and every
+-- other stack from the frame it was parked at, so a stack must be on this list
+-- before Turkey code that can allocate runs on it, and must have its parked
+-- frame recorded before it stops running.
+--
+-- `Turkey.HeapCheck` reads the same records, by its own copy of the layout.
+var stacks : Prim.Ptr = Prim.ptrNull()
+var running : Prim.Ptr = Prim.ptrNull()
+var entryStack : Prim.Ptr = Libc.malloc(stackBytes)
 
 -- GC stress: a collection at every allocation, or with TURKEY_GC_STRESS=N
 -- for N above 1, at random intervals averaging N allocations -- each gap
@@ -887,28 +904,31 @@ fun frameEntryFor(retaddr : Int) -> Prim.Ptr {
 }
 
 -- Recorded by the generated entry, from its own frame, after early
--- initialization and before anything can allocate.
+-- initialization and before anything can allocate: the program's own stack,
+-- running, and the only one there is.
 foreign "turkey_entry_stack_set" fun entryStackSet(frame : Prim.Ptr) -> Unit {
-    entryStackHigh = frame
+    if Prim.ptrIsNull(entryStack) {
+        Process.panic(Prim.cString("no memory for the stack record"))
+        return {}
+    }
+    Prim.storePtr(entryStack, stackHigh, frame)
+    Prim.storePtr(entryStack, stackParked, Prim.ptrNull())
+    Prim.storePtr(entryStack, stackNext, Prim.ptrNull())
+    stacks = entryStack
+    running = entryStack
 }
 
--- Every Turkey frame of the mutator's stack, from `frame` outwards.
+-- Every Turkey frame of every stack: the running one from `frame` outwards,
+-- and each other from the frame it was parked at.
 --
 -- `frame` is the `x29` of the Turkey allocator that called into the heap: a
 -- frame record whose return address is in the allocation site, so the first
 -- entry found is the allocating function's. Null means no Turkey frame is
--- live -- the final collection runs after the program has returned -- and
--- nothing is walked.
---
--- The stop conditions matter more than the loop: a walk that runs off the end
--- of the chain marks whatever the words beyond it happen to hold, which would
--- surface as a corruption a long way from here and look exactly like a
--- miscompile. So the frame pointer must stay below the entry's frame, stay
--- 8-byte aligned, and strictly increase. There is no low bound to check: the
--- walk starts at a live frame and only ever moves outwards.
+-- live -- the final collection runs after the program has returned, when no
+-- stack's frames are -- and nothing is walked.
 fun scanNativeFrames(frame : Prim.Ptr) -> Unit {
     if frameEntryCount == 0 || Prim.ptrIsNull(frame) { return {} }
-    if Prim.ptrIsNull(entryStackHigh) {
+    if Prim.ptrIsNull(running) {
         -- Reachable only if something ran the program's code without the
         -- generated entry. Scanning from an unknown outer bound is how a walk
         -- runs off the end; not scanning drops live roots silently, which is
@@ -916,16 +936,36 @@ fun scanNativeFrames(frame : Prim.Ptr) -> Unit {
         Process.panic(Prim.cString("no entry stack bound: the frame walker cannot run"))
         return {}
     }
-    let high = Prim.ptrToInt(entryStackHigh)
+    scanStack(frame, Prim.loadPtr(running, stackHigh))
+    var stack = stacks
+    while !Prim.ptrIsNull(stack) {
+        let parked = Prim.loadPtr(stack, stackParked)
+        if !Prim.ptrEq(stack, running) && !Prim.ptrIsNull(parked) {
+            scanStack(parked, Prim.loadPtr(stack, stackHigh))
+        }
+        stack = Prim.loadPtr(stack, stackNext)
+    }
+}
+
+-- One stack's frames, from the record at `frame` out to `high`.
+--
+-- The stop conditions matter more than the loop: a walk that runs off the end
+-- of the chain marks whatever the words beyond it happen to hold, which would
+-- surface as a corruption a long way from here and look exactly like a
+-- miscompile. So the frame pointer must stay below `high`, stay 8-byte
+-- aligned, and strictly increase. There is no low bound to check: the walk
+-- starts at a live frame and only ever moves outwards.
+fun scanStack(frame : Prim.Ptr, high : Prim.Ptr) -> Unit {
+    let top = Prim.ptrToInt(high)
     var here = Prim.ptrToInt(frame)
-    while !below(high, here + 16) && Prim.intAnd(here, 7) == 0 {
+    while !below(top, here + 16) && Prim.intAnd(here, 7) == 0 {
         -- The return address in *this* record is an address in the *caller*,
         -- so the entry it finds describes the caller's frame -- whose `x29` is
         -- this record's saved one. Applying the offsets to this frame instead
         -- reads whatever the callee happens to have at those offsets.
         let record = Prim.ptrFromInt(here)
         let next = Prim.loadI64(record, 0)
-        if !below(here, next) || below(high, next + 16) || Prim.intAnd(next, 7) != 0 {
+        if !below(here, next) || below(top, next + 16) || Prim.intAnd(next, 7) != 0 {
             return {}
         }
         let entry = frameEntryFor(Prim.loadI64(record, 8))
@@ -939,11 +979,12 @@ fun scanNativeFrames(frame : Prim.Ptr) -> Unit {
                 -- a callee's rooted parameter, or one such object's field
                 -- naming another. It is not a heap object and has no mark bit;
                 -- its own frame lists its fields, which is how what it holds
-                -- is traced. Only a frame slot can hold one, since nothing in
-                -- the heap ever points into the stack, so this is the one
-                -- place the test is needed.
+                -- is traced. Such an object never leaves the function that
+                -- placed it, so it is in this stack's own range: only a frame
+                -- slot can hold one, since nothing in the heap ever points
+                -- into a stack, and a stack never points into another's.
                 let at = Prim.ptrToInt(value)
-                if below(at, Prim.ptrToInt(frame)) || !below(at, high) {
+                if below(at, Prim.ptrToInt(frame)) || !below(at, top) {
                     markGrey(value, Prim.cString("arm64 frame"), i)
                     drain()
                 }
@@ -1655,7 +1696,8 @@ fun snapshot() -> Prim.Ptr {
     Prim.storeI64(state, Check.stateMarkEpoch, markEpoch)
     Prim.storePtr(state, Check.stateFrameEntries, frameEntries)
     Prim.storeI64(state, Check.stateFrameEntryCount, frameEntryCount)
-    Prim.storePtr(state, Check.stateEntryStackHigh, entryStackHigh)
+    Prim.storePtr(state, Check.stateStacks, stacks)
+    Prim.storePtr(state, Check.stateRunning, running)
     Prim.storePtr(state, Check.stateRoots, roots)
     Prim.storeI64(state, Check.stateMinor, if minor { 1 } else { 0 })
     Prim.storeI64(state, Check.stateGenerational, if generational { 1 } else { 0 })

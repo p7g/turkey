@@ -56,6 +56,7 @@ import Turkey.MachineCheck as MachineCheck
 import Turkey.LowIr as LowIr
 import Turkey.Ssa as Ssa
 import Turkey.SsaLower as SsaLower
+import Turkey.Runtime as Rt
 import Turkey.Sccp as Sccp
 import Turkey.Fields as Fields
 import Turkey.Clean as Clean
@@ -468,8 +469,30 @@ fun prunable(checked : Checked, giblets : Set.Set String, b : Core.CBind) -> Boo
 }
 
 -- What reachability starts from besides `main` (`Mono.runtimeRoots`).
+fun defines(m : SsaLower.Module, name : String) -> Bool {
+    for f in m.functions { if f.name == name { return True } }
+    False
+}
+
+-- Whether some function calls the runtime entry point for primitive `name`.
+fun callsRuntime(m : SsaLower.Module, name : String) -> Bool {
+    for f in m.functions {
+        for block in f.blocks {
+            for i in block.insts {
+                if let LowIr.Call(LowIr.Runtime(called), _) = i.op {
+                    if called == name { return True }
+                }
+            }
+        }
+    }
+    False
+}
+
+-- Besides the `foreign` definitions: a coroutine's start, which only the code
+-- `Turkey.Emit` writes calls.
 fun roots(checked : Checked) -> Array String =
-    Mono.runtimeRoots(checked.decls, build.exportRuntime)
+    Array.append(Mono.runtimeRoots(checked.decls, build.exportRuntime),
+                 [Rt.coroutineStart])
 
 -- On stderr, and prefixed with the file, so that a warning is distinguishable
 -- from whatever the compiled program itself prints.
@@ -646,6 +669,14 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     -- table is not complete until it has run either.
     Emit.emitEntry(asm, module_, Map.getOr(entry.scope.values, "main", "main"),
                    sites, code)
+    -- Each only in a program that needs it: the switch names the runtime's
+    -- record of the running stack, and the start calls a coroutine's start
+    -- and then the switch.
+    let coroutines = defines(module_, Rt.coroutineStart)
+    if coroutines || callsRuntime(module_, "Prim.swapStack") {
+        Emit.emitSwapStack(asm, code)
+    }
+    if coroutines { Emit.emitStackStart(asm, code) }
     Emit.emitDefinitions(module_, asm, code)
     Emit.emitMessages(asm, code)
     Emit.emitData(module_, asm, sites, code)

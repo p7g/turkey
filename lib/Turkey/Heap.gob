@@ -41,6 +41,7 @@ import Turkey.HeapCheck as Check
 import Turkey.Memory as Memory
 import Turkey.Process as Process
 import Turkey.Libc as Libc
+import Turkey.Stack as Stack
 
 -- -- layouts ----------------------------------------------------------------------------
 --
@@ -128,14 +129,6 @@ let objectSlots : Int = 24
 -- call, and where their `x29` offsets are.
 let entryBytes : Int = 24
 
--- A machine stack Turkey frames run on: the outermost frame record any walk of
--- it may reach, the frame record it was parked at (null while it runs, or
--- before it has run), and the next stack on the list.
-let stackHigh : Int = 0
-let stackParked : Int = 8
-let stackNext : Int = 16
-let stackBytes : Int = 24
-
 -- -- state ------------------------------------------------------------------------------
 
 var regions : Prim.Ptr = Prim.ptrNull()
@@ -187,19 +180,6 @@ var rememberedCapacity : Int = 0
 -- The arm64 backend's frame table, sorted by return address.
 var frameEntries : Prim.Ptr = Prim.ptrNull()
 var frameEntryCount : Int = 0
-
--- Every machine stack that holds Turkey frames, as a list of raw records, and
--- the one the mutator is running on. The program's own stack is the first,
--- registered by the generated entry once early initialization has run. A
--- collection walks the running stack from the allocator's frame and every
--- other stack from the frame it was parked at, so a stack must be on this list
--- before Turkey code that can allocate runs on it, and must have its parked
--- frame recorded before it stops running.
---
--- `Turkey.HeapCheck` reads the same records, by its own copy of the layout.
-var stacks : Prim.Ptr = Prim.ptrNull()
-var running : Prim.Ptr = Prim.ptrNull()
-var entryStack : Prim.Ptr = Libc.malloc(stackBytes)
 
 -- GC stress: a collection at every allocation, or with TURKEY_GC_STRESS=N
 -- for N above 1, at random intervals averaging N allocations -- each gap
@@ -903,21 +883,6 @@ fun frameEntryFor(retaddr : Int) -> Prim.Ptr {
     Prim.ptrNull()
 }
 
--- Recorded by the generated entry, from its own frame, after early
--- initialization and before anything can allocate: the program's own stack,
--- running, and the only one there is.
-foreign "turkey_entry_stack_set" fun entryStackSet(frame : Prim.Ptr) -> Unit {
-    if Prim.ptrIsNull(entryStack) {
-        Process.panic(Prim.cString("no memory for the stack record"))
-        return {}
-    }
-    Prim.storePtr(entryStack, stackHigh, frame)
-    Prim.storePtr(entryStack, stackParked, Prim.ptrNull())
-    Prim.storePtr(entryStack, stackNext, Prim.ptrNull())
-    stacks = entryStack
-    running = entryStack
-}
-
 -- Every Turkey frame of every stack: the running one from `frame` outwards,
 -- and each other from the frame it was parked at.
 --
@@ -928,6 +893,7 @@ foreign "turkey_entry_stack_set" fun entryStackSet(frame : Prim.Ptr) -> Unit {
 -- stack's frames are -- and nothing is walked.
 fun scanNativeFrames(frame : Prim.Ptr) -> Unit {
     if frameEntryCount == 0 || Prim.ptrIsNull(frame) { return {} }
+    let running = Stack.running()
     if Prim.ptrIsNull(running) {
         -- Reachable only if something ran the program's code without the
         -- generated entry. Scanning from an unknown outer bound is how a walk
@@ -936,14 +902,14 @@ fun scanNativeFrames(frame : Prim.Ptr) -> Unit {
         Process.panic(Prim.cString("no entry stack bound: the frame walker cannot run"))
         return {}
     }
-    scanStack(frame, Prim.loadPtr(running, stackHigh))
-    var stack = stacks
+    scanStack(frame, Stack.high(running))
+    var stack = Stack.first()
     while !Prim.ptrIsNull(stack) {
-        let parked = Prim.loadPtr(stack, stackParked)
+        let parked = Stack.parked(stack)
         if !Prim.ptrEq(stack, running) && !Prim.ptrIsNull(parked) {
-            scanStack(parked, Prim.loadPtr(stack, stackHigh))
+            scanStack(parked, Stack.high(stack))
         }
-        stack = Prim.loadPtr(stack, stackNext)
+        stack = Stack.next(stack)
     }
 }
 
@@ -1696,8 +1662,8 @@ fun snapshot() -> Prim.Ptr {
     Prim.storeI64(state, Check.stateMarkEpoch, markEpoch)
     Prim.storePtr(state, Check.stateFrameEntries, frameEntries)
     Prim.storeI64(state, Check.stateFrameEntryCount, frameEntryCount)
-    Prim.storePtr(state, Check.stateStacks, stacks)
-    Prim.storePtr(state, Check.stateRunning, running)
+    Prim.storePtr(state, Check.stateStacks, Stack.first())
+    Prim.storePtr(state, Check.stateRunning, Stack.running())
     Prim.storePtr(state, Check.stateRoots, roots)
     Prim.storeI64(state, Check.stateMinor, if minor { 1 } else { 0 })
     Prim.storeI64(state, Check.stateGenerational, if generational { 1 } else { 0 })

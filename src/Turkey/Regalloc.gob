@@ -663,20 +663,21 @@ fun forbiddenSets(f : Func A.Inst, liveOut : Array BitSet) -> Array Int {
         for var n = len(block.insts) - 1; n >= 0; n = n - 1 {
             -- `live` is what is live after instruction `n`.
             let i = block.insts[n]
-            let clobbered = clobbersOf(i)
+            let clobberedGp = clobbersOf(i, Gp)
+            let clobberedFp = clobbersOf(i, Fp)
             let held = physical[n]
             let holding = len(held.gp) > 0 || len(held.fp) > 0
-            if len(clobbered) > 0 || holding {
+            if clobberedGp != 0 || clobberedFp != 0 || holding {
                 let after = BitSet.elements(live)
                 for id in after {
                     -- A call that defines a register itself (`Allocate`)
                     -- destroys the caller-saved ones before it writes that
                     -- register, so its own result may take one.
                     if A.isCall(i) && defines(i, id) { continue }
-                    let bank = A.bankOf(f.reps[id])
-                    for (cb, cn) in clobbered {
-                        if sameBank(bank, cb) { out[id] = forbid(out[id], cn) }
-                    }
+                    out[id] = Int.or(out[id], match A.bankOf(f.reps[id]) {
+                        Gp -> clobberedGp
+                        Fp -> clobberedFp
+                    })
                 }
                 -- And the other half: a physical register that is *live*
                 -- here -- written by an earlier instruction, read by a later
@@ -777,23 +778,15 @@ fun sameBank(a : Bank, b : Bank) -> Bool = match (a, b) {
     _ -> False
 }
 
--- The physical registers an instruction destroys: the ones it names as a
--- destination, plus -- if it is a call -- every caller-saved register in both
--- files, which the callee is free to use.
-fun clobbersOf(i : A.Inst) -> Array (Bank, Int) {
-    let out : Array (Bank, Int) = []
-    A.eachDest(i.op, pushPhysical(out, _))
-    if A.isCall(i) {
-        for r in A.callerSaved { pushPhysical(out, r) }
-        for r in A.fpCallerSaved { pushPhysical(out, r) }
-    }
-    out
-}
-
-fun pushPhysical(out : Array (Bank, Int), r : Reg) -> Unit = match r {
-    Physical(bank, n) -> Array.push(out, (bank, n))
-    Virtual(_) -> {}
-}
+-- The physical registers of `bank` an instruction destroys, as a mask: the
+-- ones it names as a destination, plus -- if it is a call -- the ones its
+-- convention lets the callee use. Asked of every instruction, so it builds
+-- nothing.
+fun clobbersOf(i : A.Inst, bank : Bank) -> Int =
+    A.foldDest(i.op, A.callClobbers(i.op, bank), fun(mask, r) = match r {
+        Physical(b, n) -> if sameBank(b, bank) { forbid(mask, n) } else { mask }
+        Virtual(_) -> mask
+    })
 
 
 -- Whether a colouring is actually a colouring.

@@ -1,10 +1,11 @@
 module Turkey.Arm64 (
     Reg(..), Bank(..), reg, physical, isPhysical, bankOf, Cond(..), Width(..),
-    Mem(..), Arm(..), Inst(..), Allocation(..), AllocArg(..), ArrayAllocation(..), anyDest, anySrc, eachDest, eachSrc, mapUses, rewrite, setsFlags, isSlot, isRootSlot, isFrameAddress, slotLoad, slotStore, isCSet, csetOf, redundantMove,
+    Mem(..), Arm(..), Inst(..), Convention(..), Allocation(..), AllocArg(..), ArrayAllocation(..), anyDest, foldDest, anySrc, eachDest, eachSrc, mapUses, rewrite, setsFlags, isSlot, isRootSlot, isFrameAddress, slotLoad, slotStore, isCSet, csetOf, redundantMove,
     sameRegister, moveHint, safepointOf, allocationOf, arrayAllocationOf,
     writesBeforeReading, memOf,
     xzr, sp, fp, lr, x0, d0, argRegs, fpArgRegs, callerSaved, calleeSaved,
-    fpCallerSaved, fpCalleeSaved, showReg, condName, invert, isCall,
+    fpCallerSaved, fpCalleeSaved, showReg, condName, invert, isCall, callClobbers,
+    calleeSavedMask,
 )
 
 -- The arm64 machine instruction set.
@@ -142,6 +143,63 @@ let fpCalleeSaved = [Physical(Fp, 8), Physical(Fp, 9), Physical(Fp, 10),
                      Physical(Fp, 11), Physical(Fp, 12), Physical(Fp, 13),
                      Physical(Fp, 14), Physical(Fp, 15)]
 
+-- What a call lets its callee destroy.
+--
+-- `Standard` is AAPCS64's: the caller-saved registers, in both files.
+-- `PreservesNone` is every register the allocator hands out, callee-saved
+-- included: a value live across such a call has to be in memory, and so only
+-- the values actually live are saved, by the caller, rather than a fixed set
+-- by the callee.
+--
+-- A function that makes a call clobbering a callee-saved register must still
+-- save that register itself, because its own caller expects it preserved
+-- (`Turkey.Frame.calleeSaved`).
+type Convention = Standard | PreservesNone
+
+-- The registers of `bank` a call destroys, as a mask with bit `n` for register
+-- `n`, and 0 for an instruction that is not a call. Every register number in
+-- either file is below 32. An allocation is a call on its slow path, to the
+-- runtime, under the standard convention.
+--
+-- Masks rather than lists, and computed once: the allocator asks this of
+-- every instruction it walks.
+fun callClobbers(op : Arm, bank : Bank) -> Int = match op {
+    Bl(_, c) -> clobbersUnder(c, bank)
+    Blr(_, c) -> clobbersUnder(c, bank)
+    Allocate(_, _) -> clobbersUnder(Standard, bank)
+    AllocateArray(_, _, _, _) -> clobbersUnder(Standard, bank)
+    _ -> 0
+}
+
+fun clobbersUnder(c : Convention, bank : Bank) -> Int = match (c, bank) {
+    (Standard, Gp) -> callerSavedGpMask
+    (Standard, Fp) -> callerSavedFpMask
+    (PreservesNone, Gp) -> Int.or(callerSavedGpMask, calleeSavedGpMask)
+    (PreservesNone, Fp) -> Int.or(callerSavedFpMask, calleeSavedFpMask)
+}
+
+-- The callee-saved registers of `bank`, as a mask.
+fun calleeSavedMask(bank : Bank) -> Int = match bank {
+    Gp -> calleeSavedGpMask
+    Fp -> calleeSavedFpMask
+}
+
+let callerSavedGpMask = maskOf(callerSaved)
+let callerSavedFpMask = maskOf(fpCallerSaved)
+let calleeSavedGpMask = maskOf(calleeSaved)
+let calleeSavedFpMask = maskOf(fpCalleeSaved)
+
+fun maskOf(regs : Array Reg) -> Int {
+    var mask = 0
+    for r in regs {
+        match r {
+            Physical(_, n) -> { mask = Int.or(mask, Int.shl(1, n)) }
+            Virtual(_) -> {}
+        }
+    }
+    mask
+}
+
 -- The operand width. arm64 spells the same instruction `add w0, ...` at 32
 -- bits and `add x0, ...` at 64, so this is a field rather than two opcodes.
 type Width = W32 | W64
@@ -274,9 +332,10 @@ type Arm
     -- expands it -- the same answer QBE and Cranelift give a "load immediate",
     -- and the reason a pseudo-instruction is a category the enum has at all.
     | MovConst(Reg, Int)
-    -- Calls. `Bl` is direct and `Blr` is through a register.
-    | Bl(Symbol)
-    | Blr(Reg)
+    -- Calls. `Bl` is direct and `Blr` is through a register; either names
+    -- what the callee may destroy.
+    | Bl(Symbol, Convention)
+    | Blr(Reg, Convention)
     -- A pseudo-instruction: the arguments a call passes and the register it
     -- answers in are not operands of `Bl`, so without this the allocator would
     -- see a call that uses and defines nothing. It carries no encoding.
@@ -557,8 +616,8 @@ fun setsFlags(op : Arm) -> Bool = match op {
 }
 
 fun isCall(i : Inst) -> Bool = match i.op {
-    Bl(_) -> True
-    Blr(_) -> True
+    Bl(_, _) -> True
+    Blr(_, _) -> True
     Allocate(_, _) -> True
     AllocateArray(_, _, _, _) -> True
     _ -> False
@@ -655,8 +714,8 @@ fun anySrc(op : Arm, p : fun(Reg) -> Bool) -> Bool = match op {
     FCmp(a, b)          -> p(a) || p(b)
     Scvtf(_, a)         -> p(a)
     Fcvtzs(_, a)        -> p(a)
-    Bl(_)               -> False
-    Blr(a)              -> p(a)
+    Bl(_, _)            -> False
+    Blr(a, _)           -> p(a)
     CallArgs(ins, _)    -> anyIn(ins, p)
     SafepointMap(_, _)  -> False
     Ret                 -> False
@@ -740,8 +799,8 @@ fun mapUses(op : Arm, g : fun(Reg) -> Reg) -> Arm = match op {
     FCmp(a, b)            -> FCmp(g(a), g(b))
     Scvtf(k0, a)          -> Scvtf(k0, g(a))
     Fcvtzs(k0, a)         -> Fcvtzs(k0, g(a))
-    Bl(k0)                -> Bl(k0)
-    Blr(a)                -> Blr(g(a))
+    Bl(k0, k1)            -> Bl(k0, k1)
+    Blr(a, k1)            -> Blr(g(a), k1)
     CallArgs(ins, k1)     -> CallArgs(Array.map(ins, g), k1)
     SafepointMap(k0, k1)  -> SafepointMap(k0, k1)
     Ret                   -> Ret
@@ -836,8 +895,8 @@ fun rewrite(op : Arm, g : fun(Reg) -> Reg, m : fun(Mem) -> Mem) -> Arm = match o
     Scvtf(f0, f1)            -> Scvtf(g(f0), g(f1))
     Fcvtzs(f0, f1)           -> Fcvtzs(g(f0), g(f1))
     MovConst(f0, f1)         -> MovConst(g(f0), f1)
-    Bl(f0)                   -> Bl(f0)
-    Blr(f0)                  -> Blr(g(f0))
+    Bl(f0, f1)               -> Bl(f0, f1)
+    Blr(f0, f1)              -> Blr(g(f0), f1)
     CallArgs(f0, f1)         -> CallArgs(Array.map(f0, g), Array.map(f1, g))
     SafepointMap(f0, f1)     -> SafepointMap(f0, f1)
     Ret                      -> Ret
@@ -853,91 +912,98 @@ fun rewrite(op : Arm, g : fun(Reg) -> Reg, m : fun(Mem) -> Mem) -> Arm = match o
     SubExt(f0, f1, f2)       -> SubExt(g(f0), g(f1), g(f2))
 }
 
--- Whether `p` holds of some register an instruction *writes*, physical ones
--- included; a visitor for the reason `anySrc` gives.
+-- Every register an instruction *writes*, physical ones included, folded
+-- into `acc` in order; a visitor for the reason `anySrc` gives. A fold rather
+-- than a predicate so that a caller can accumulate -- a mask of what is
+-- written, say -- without capturing a `var`, which would cost a cell for
+-- every instruction it is asked of.
 --
 -- `anyDef` is this filtered to the virtual ones, which is what liveness and
 -- the verifier want. The allocator wants the unfiltered answer: a `mov x0, %5`
 -- before a call writes a real `x0`, and any value the allocator has put in
--- `x0` and needs after that instruction has just been destroyed. Deriving both
--- from one match is the point -- a second sixty-armed `match` listing the same
--- destinations is exactly the kind of duplication that drifts.
-fun anyDest(op : Arm, p : fun(Reg) -> Bool) -> Bool = match op {
-    Mov(d, _, _)        -> p(d)
-    MovZ(d, _, _)       -> p(d)
-    MovK(d, _, _)       -> p(d)
-    Add(d, _, _, _)     -> p(d)
-    AddImm(d, _, _, _)  -> p(d)
-    AddS(d, _, _, _)    -> p(d)
-    Sub(d, _, _, _)     -> p(d)
-    SubImm(d, _, _, _)  -> p(d)
-    SubS(d, _, _, _)    -> p(d)
-    AddSImm(d, _, _, _) -> p(d)
-    SubSImm(d, _, _, _) -> p(d)
-    Mul(d, _, _, _)     -> p(d)
-    SMulH(d, _, _)      -> p(d)
-    SDiv(d, _, _, _)    -> p(d)
-    MSub(d, _, _, _, _) -> p(d)
-    And(d, _, _, _)     -> p(d)
-    Orr(d, _, _, _)     -> p(d)
-    Eor(d, _, _, _)     -> p(d)
-    EorImm(d, _, _, _)  -> p(d)
-    AndImm(d, _, _, _)  -> p(d)
-    LslImm(d, _, _, _)  -> p(d)
-    LsrImm(d, _, _, _)  -> p(d)
-    AsrImm(d, _, _, _)  -> p(d)
-    Lsl(d, _, _, _)     -> p(d)
-    Lsr(d, _, _, _)     -> p(d)
-    Asr(d, _, _, _)     -> p(d)
-    Cmp(_, _, _)        -> False
-    CmpImm(_, _, _)     -> False
-    CSet(d, _)          -> p(d)
-    Sxtw(d, _)          -> p(d)
-    Uxtb(d, _)          -> p(d)
-    Uxth(d, _)          -> p(d)
-    Ubfx(d, _, _, _)    -> p(d)
-    Rbit(d, _)          -> p(d)
-    Clz(d, _)           -> p(d)
-    Ldr(d, _, _)        -> p(d)
-    Ldrb(d, _)          -> p(d)
-    Ldrsw(d, _)         -> p(d)
-    Str(_, _, _)        -> False
-    Strb(_, _)          -> False
-    Stp(_, _, _, _)     -> False
-    Ldp(a, b, _, _)     -> p(a) || p(b)
-    Adrp(d, _)          -> p(d)
-    AddLo(d, _, _)      -> p(d)
-    FrameAddress(d, _)  -> p(d)
-    MovConst(d, _)      -> p(d)
-    FMov(d, _)          -> p(d)
-    FMovIn(d, _)        -> p(d)
-    FMovOut(d, _)       -> p(d)
-    FAdd(d, _, _)       -> p(d)
-    FSub(d, _, _)       -> p(d)
-    FMul(d, _, _)       -> p(d)
-    FDiv(d, _, _)       -> p(d)
-    FNeg(d, _)          -> p(d)
+-- `x0` and needs after that instruction has just been destroyed. Deriving all
+-- of these from one match is the point -- a second sixty-armed `match` listing
+-- the same destinations is exactly the kind of duplication that drifts.
+fun foldDest(op : Arm, acc : a, f : fun(a, Reg) -> a) -> a = match op {
+    Mov(d, _, _)        -> f(acc, d)
+    MovZ(d, _, _)       -> f(acc, d)
+    MovK(d, _, _)       -> f(acc, d)
+    Add(d, _, _, _)     -> f(acc, d)
+    AddImm(d, _, _, _)  -> f(acc, d)
+    AddS(d, _, _, _)    -> f(acc, d)
+    Sub(d, _, _, _)     -> f(acc, d)
+    SubImm(d, _, _, _)  -> f(acc, d)
+    SubS(d, _, _, _)    -> f(acc, d)
+    AddSImm(d, _, _, _) -> f(acc, d)
+    SubSImm(d, _, _, _) -> f(acc, d)
+    Mul(d, _, _, _)     -> f(acc, d)
+    SMulH(d, _, _)      -> f(acc, d)
+    SDiv(d, _, _, _)    -> f(acc, d)
+    MSub(d, _, _, _, _) -> f(acc, d)
+    And(d, _, _, _)     -> f(acc, d)
+    Orr(d, _, _, _)     -> f(acc, d)
+    Eor(d, _, _, _)     -> f(acc, d)
+    EorImm(d, _, _, _)  -> f(acc, d)
+    AndImm(d, _, _, _)  -> f(acc, d)
+    LslImm(d, _, _, _)  -> f(acc, d)
+    LsrImm(d, _, _, _)  -> f(acc, d)
+    AsrImm(d, _, _, _)  -> f(acc, d)
+    Lsl(d, _, _, _)     -> f(acc, d)
+    Lsr(d, _, _, _)     -> f(acc, d)
+    Asr(d, _, _, _)     -> f(acc, d)
+    Cmp(_, _, _)        -> acc
+    CmpImm(_, _, _)     -> acc
+    CSet(d, _)          -> f(acc, d)
+    Sxtw(d, _)          -> f(acc, d)
+    Uxtb(d, _)          -> f(acc, d)
+    Uxth(d, _)          -> f(acc, d)
+    Ubfx(d, _, _, _)    -> f(acc, d)
+    Rbit(d, _)          -> f(acc, d)
+    Clz(d, _)           -> f(acc, d)
+    Ldr(d, _, _)        -> f(acc, d)
+    Ldrb(d, _)          -> f(acc, d)
+    Ldrsw(d, _)         -> f(acc, d)
+    Str(_, _, _)        -> acc
+    Strb(_, _)          -> acc
+    Stp(_, _, _, _)     -> acc
+    Ldp(a, b, _, _)     -> f(f(acc, a), b)
+    Adrp(d, _)          -> f(acc, d)
+    AddLo(d, _, _)      -> f(acc, d)
+    FrameAddress(d, _)  -> f(acc, d)
+    MovConst(d, _)      -> f(acc, d)
+    FMov(d, _)          -> f(acc, d)
+    FMovIn(d, _)        -> f(acc, d)
+    FMovOut(d, _)       -> f(acc, d)
+    FAdd(d, _, _)       -> f(acc, d)
+    FSub(d, _, _)       -> f(acc, d)
+    FMul(d, _, _)       -> f(acc, d)
+    FDiv(d, _, _)       -> f(acc, d)
+    FNeg(d, _)          -> f(acc, d)
     -- `fcmp` writes the flags and no register, which is exactly why the guard
     -- that reads it has to stay adjacent.
-    FCmp(_, _)          -> False
-    Scvtf(d, _)         -> p(d)
-    Fcvtzs(d, _)        -> p(d)
-    Bl(_)               -> False
-    Blr(_)              -> False
-    CallArgs(_, outs)   -> anyIn(outs, p)
-    SafepointMap(_, _)  -> False
-    Ret                 -> False
-    B(_)                -> False
-    BCond(_, _)         -> False
-    Cbz(_, _, _)        -> False
-    Cbnz(_, _, _)       -> False
-    Allocate(d, _)      -> p(d)
-    AllocateArray(d, _, _, _) -> p(d)
-    Brk(_)              -> False
-    MovN(d, _)          -> p(d)
-    AddExt(d, _, _)     -> p(d)
-    SubExt(d, _, _)     -> p(d)
+    FCmp(_, _)          -> acc
+    Scvtf(d, _)         -> f(acc, d)
+    Fcvtzs(d, _)        -> f(acc, d)
+    Bl(_, _)            -> acc
+    Blr(_, _)           -> acc
+    CallArgs(_, outs)   -> foldIn(outs, acc, f)
+    SafepointMap(_, _)  -> acc
+    Ret                 -> acc
+    B(_)                -> acc
+    BCond(_, _)         -> acc
+    Cbz(_, _, _)        -> acc
+    Cbnz(_, _, _)       -> acc
+    Allocate(d, _)      -> f(acc, d)
+    AllocateArray(d, _, _, _) -> f(acc, d)
+    Brk(_)              -> acc
+    MovN(d, _)          -> f(acc, d)
+    AddExt(d, _, _)     -> f(acc, d)
+    SubExt(d, _, _)     -> f(acc, d)
 }
+
+-- Whether `p` holds of some register an instruction writes.
+fun anyDest(op : Arm, p : fun(Reg) -> Bool) -> Bool =
+    foldDest(op, False, fun(found, r) = found || p(r))
 
 fun eachSrc(op : Arm, f : fun(Reg) -> Unit) -> Unit {
     let _ = anySrc(op, fun(r) {
@@ -967,6 +1033,12 @@ fun anyMem(m : Mem, p : fun(Reg) -> Bool) -> Bool = match m {
 fun anyIn(rs : Array Reg, p : fun(Reg) -> Bool) -> Bool {
     for r in rs { if p(r) { return True } }
     False
+}
+
+fun foldIn(rs : Array Reg, acc : a, f : fun(a, Reg) -> a) -> a {
+    var out = acc
+    for r in rs { out = f(out, r) }
+    out
 }
 
 -- -- printing -----------------------------------------------------------------------
@@ -1137,8 +1209,8 @@ fun showArm(op : Arm) -> String = match op {
                                 + ", " + showReg(index, W64)
         other -> "add " + showReg(d, W64) + ", " + show(other)
     }
-    Bl(sym)                -> "bl " + Asm.spell(sym)
-    Blr(a)                 -> "blr " + showReg(a, W64)
+    Bl(sym, _)             -> "bl " + Asm.spell(sym)
+    Blr(a, _)              -> "blr " + showReg(a, W64)
     -- Printed as a comment: it has no encoding and exists to tell the register
     -- allocator what a call reads and writes.
     CallArgs(ins, outs)    -> "// call uses " + Int.toString(len(ins))

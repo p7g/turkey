@@ -2,8 +2,10 @@
 -- `scripts/build.sh`.
 --
 -- One subcommand per stage: `check` compiles and says nothing, `native` emits
--- arm64 assembly, and the rest print what a stage produced, which is how a
--- pass is read while it is being written.
+-- arm64 assembly, `encode` lists the words the encoder makes of the same code
+-- (the test checks them against the system assembler), and the rest print
+-- what a stage produced, which is how a pass is read while it is being
+-- written.
 --
 -- A subcommand takes any number of files and answers for each in turn, with no
 -- separator between them: every dump ends with its own EOF, so the
@@ -44,6 +46,7 @@ import Turkey.Roots as Roots
 import Turkey.Frame as Frame
 import Turkey.Emit as Emit
 import Turkey.Stream as Stream
+import Turkey.Arm64Encode as Encode
 import Turkey.Escape as Escape
 import Turkey.Asm as Asm
 import Turkey.MachineCheck as MachineCheck
@@ -82,7 +85,7 @@ fun main() {
     if len(args) < 2 { usage() }
     let command = args[0]
     if !Array.contains(["decls", "classes", "types", "core", "mono", "opt",
-                    "ssa", "asm", "native", "check"], command) {
+                    "ssa", "asm", "native", "encode", "check"], command) {
         die("unknown command '" + command + "'")
     }
     let paths = Array.new(len(args))
@@ -116,7 +119,11 @@ fun main() {
             "mono" -> dumpMono(b, path)
             "ssa" -> dumpSsa(b, path)
             "asm" -> dumpAsm(b, path)
-            "native" -> dumpNative(b, path)
+            "native" -> dumpNative(b, path, fun(d, code) { Stream.print(d, code, b) })
+            "encode" -> {
+                let l = Encode.newListing()
+                dumpNative(b, path, fun(d, code) { Encode.listing(l, code, b) })
+            }
             "check" -> checkOnly(path)
             _ -> dumpOpt(b, path)
         }
@@ -414,7 +421,8 @@ fun refuseSkipped(skipped : Array SsaLower.Unsupported, path : String) -> Unit {
 -- The order below is not incidental. A message is interned by the guard that
 -- raises it, and the entry sequence interns `<globals>`, so the message table
 -- is complete only once every function *and* the entry have been emitted.
-fun dumpNative(b : String.Builder, path : String) -> Unit {
+fun dumpNative(b : String.Builder, path : String,
+               consume : fun(Asm.Dialect, Array (Stream.Item Arm64.Inst)) -> Unit) -> Unit {
     let (checked, entry) = checkProgram(path)
     reportWarnings(checked, path)
     let program = optimized(checked, entry)
@@ -437,7 +445,7 @@ fun dumpNative(b : String.Builder, path : String) -> Unit {
         Select.selectModule(module_, Asm.dialectFor(target))
     let code = []
     Array.push(code, Stream.Section(Asm.Text))
-    Stream.print(asm.dialect, code, b)
+    consume(asm.dialect, code)
     for u in unsupported {
         String.push(b, "// skipped " + u.name + ": " + u.what + "\n")
     }
@@ -466,7 +474,7 @@ fun dumpNative(b : String.Builder, path : String) -> Unit {
                 Emit.emitFunc(asm, a.func, a, l, i, code)
                 -- Written as it is emitted: held until the end, the program's
                 -- text was millions of strings the collector kept tracing.
-                Stream.print(asm.dialect, code, b)
+                consume(asm.dialect, code)
                 write(String.drain(b))
                 Array.push(layouts, (i, l))
             }
@@ -489,7 +497,7 @@ fun dumpNative(b : String.Builder, path : String) -> Unit {
     Emit.emitMessages(asm, code)
     Emit.emitData(module_, asm, sites, code)
     Emit.emitFrameTable(asm, layouts, code)
-    Stream.print(asm.dialect, code, b)
+    consume(asm.dialect, code)
 }
 
 -- The machine IR, with what selection could not translate.
@@ -968,7 +976,7 @@ fun readOrDie(path : String) -> Source = match Source.read(path) {
 fun usage() -> a =
     die("usage: boot "
         + "<decls|classes|types|core|mono|opt"
-        + "|ssa|asm|native|check> [--target TARGET] [--gc-verify] [--gc-stats]"
+        + "|ssa|asm|native|encode|check> [--target TARGET] [--gc-verify] [--gc-stats]"
         + " [--export-runtime] FILE...")
 
 fun die(message : String) -> a {

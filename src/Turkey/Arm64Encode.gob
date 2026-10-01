@@ -1,0 +1,387 @@
+module Turkey.Arm64Encode (Fixup(..), Listing, encode, fixupOf, fieldMask, newListing,
+                           listing)
+
+-- The arm64 instructions as the 32-bit words the processor reads.
+--
+-- One `match` over `Arm`, so a new instruction is a compile error here until
+-- it has an encoding. It covers what selection and the emitter produce, not
+-- the instruction set: an immediate form is encoded only in the range the
+-- backend emits, and anything outside it stops with an internal error rather
+-- than producing a word nobody checked.
+--
+-- A word that refers to a label or a symbol is written with that field zero,
+-- and `fixupOf` names the field and its target. Filling it in needs addresses,
+-- which is layout's business rather than the instruction's; that is also why
+-- the comparison with the system assembler masks exactly these fields, since
+-- `as` leaves them to the linker too, or resolves them against a layout of its
+-- own.
+--
+-- The words follow the Arm Architecture Reference Manual's encodings: each
+-- constant below is an instruction's fixed bits, and the fields are or'ed in.
+
+import Turkey.Arm64 as A
+import Turkey.Arm64 (Arm(..), Reg(..), Bank(..), Mem(..), Width(..), Cond(..), Inst(..))
+import Turkey.Asm as Asm
+import Turkey.Stream (Item(..))
+
+-- A field of an instruction word that names a position the encoder does not
+-- know. The string is the operand as the instruction carries it.
+type Fixup
+    -- `b` and `bl`: a signed word offset in bits 0-25, reaching 128MB.
+    = Branch26(String)
+    -- `b.cond`, `cbz`, `cbnz`: a signed word offset in bits 5-23, reaching 1MB.
+    | Branch19(String)
+    -- `adrp`: the 4KB page, as a signed page offset split across bits 29-30
+    -- and 5-23.
+    | Page21(String)
+    -- The offset within that page, in bits 10-21, divided by the access size
+    -- `1 << scale`: an `add` has scale 0, a word load scale 3.
+    | PageOffset12(String, Int)
+
+-- The bits of a word that a fixup fills in.
+fun fieldMask(f : Fixup) -> Int = match f {
+    Branch26(_) -> 0x03FFFFFF
+    Branch19(_) -> 0x00FFFFE0
+    Page21(_) -> 0x60FFFFE0
+    PageOffset12(_, _) -> 0x003FFC00
+}
+
+-- The field an instruction leaves for layout, if it has one.
+fun fixupOf(op : Arm) -> Option Fixup = match op {
+    B(label) -> Some(Branch26(label))
+    Bl(sym) -> Some(Branch26(sym))
+    BCond(_, label) -> Some(Branch19(label))
+    Cbz(_, label, _) -> Some(Branch19(label))
+    Cbnz(_, label, _) -> Some(Branch19(label))
+    Adrp(_, at) -> Some(Page21(at))
+    AddLo(_, _, at) -> Some(PageOffset12(at, 0))
+    Ldr(d, PageOffset(_, at), w) -> Some(PageOffset12(at, scale(d, w)))
+    Ldrb(_, PageOffset(_, at)) -> Some(PageOffset12(at, 0))
+    Ldrsw(_, PageOffset(_, at)) -> Some(PageOffset12(at, 2))
+    Str(v, PageOffset(_, at), w) -> Some(PageOffset12(at, scale(v, w)))
+    Strb(_, PageOffset(_, at)) -> Some(PageOffset12(at, 0))
+    _ -> None
+}
+
+-- The words for one instruction, appended to `out`: none for a
+-- pseudo-instruction that only informs the allocator, several for a constant.
+fun encode(op : Arm, out : Array Int) -> Unit = match op {
+    Mov(d, a, w)           -> word(out, sf(w) + 0x2A0003E0 + rm(a) + rd(d))
+    MovZ(d, v, shift)      -> word(out, wide(0xD2800000, d, v, shift))
+    MovK(d, v, shift)      -> word(out, wide(0xF2800000, d, v, shift))
+    MovN(d, v)             -> word(out, wide(0x92800000, d, v, 0))
+    MovConst(d, n)         -> constant(out, d, n)
+    Add(d, a, b, w)        -> word(out, sf(w) + 0x0B000000 + three(d, a, b))
+    AddS(d, a, b, w)       -> word(out, sf(w) + 0x2B000000 + three(d, a, b))
+    Sub(d, a, b, w)        -> word(out, sf(w) + 0x4B000000 + three(d, a, b))
+    SubS(d, a, b, w)       -> word(out, sf(w) + 0x6B000000 + three(d, a, b))
+    AddImm(d, a, n, w)     -> word(out, sf(w) + addSub(0x11000000, 0x51000000, n)
+                                        + rn(a) + rd(d))
+    SubImm(d, a, n, w)     -> word(out, sf(w) + addSub(0x51000000, 0x11000000, n)
+                                        + rn(a) + rd(d))
+    AddSImm(d, a, n, w)    -> word(out, sf(w) + addSub(0x31000000, 0x71000000, n)
+                                        + rn(a) + rd(d))
+    SubSImm(d, a, n, w)    -> word(out, sf(w) + addSub(0x71000000, 0x31000000, n)
+                                        + rn(a) + rd(d))
+    -- `madd` and `msub` with the accumulator: `mul` is `madd` with `xzr`.
+    Mul(d, a, b, w)        -> word(out, sf(w) + 0x1B007C00 + three(d, a, b))
+    MSub(d, a, b, c, w)    -> word(out, sf(w) + 0x1B008000 + three(d, a, b)
+                                        + Int.shl(number(c), 10))
+    SMulH(d, a, b)         -> word(out, 0x9B407C00 + three(d, a, b))
+    SDiv(d, a, b, w)       -> word(out, sf(w) + 0x1AC00C00 + three(d, a, b))
+    And(d, a, b, w)        -> word(out, sf(w) + 0x0A000000 + three(d, a, b))
+    Orr(d, a, b, w)        -> word(out, sf(w) + 0x2A000000 + three(d, a, b))
+    Eor(d, a, b, w)        -> word(out, sf(w) + 0x4A000000 + three(d, a, b))
+    AndImm(d, a, n, w)     -> word(out, sf(w) + 0x12000000 + logical(n, w) + rn(a) + rd(d))
+    EorImm(d, a, n, w)     -> word(out, sf(w) + 0x52000000 + logical(n, w) + rn(a) + rd(d))
+    -- The immediate shifts are bitfield moves: `lsl` is `ubfm` with the field
+    -- rotated into place, `lsr` and `asr` are `ubfm` and `sbfm` from the shift
+    -- to the top bit.
+    LslImm(d, a, n, w)     -> word(out, bitfield(0x53000000, w, d, a,
+                                                 Int.and(bits(w) - n, bits(w) - 1),
+                                                 bits(w) - 1 - n))
+    LsrImm(d, a, n, w)     -> word(out, bitfield(0x53000000, w, d, a, n, bits(w) - 1))
+    AsrImm(d, a, n, w)     -> word(out, bitfield(0x13000000, w, d, a, n, bits(w) - 1))
+    Lsl(d, a, b, w)        -> word(out, sf(w) + 0x1AC02000 + three(d, a, b))
+    Lsr(d, a, b, w)        -> word(out, sf(w) + 0x1AC02400 + three(d, a, b))
+    Asr(d, a, b, w)        -> word(out, sf(w) + 0x1AC02800 + three(d, a, b))
+    -- `cmp` is `subs` into `xzr`.
+    Cmp(a, b, w)           -> word(out, sf(w) + 0x6B00001F + rm(b) + rn(a))
+    CmpImm(a, n, w)        -> word(out, sf(w) + addSub(0x7100001F, 0x3100001F, n) + rn(a))
+    -- `cset` is `csinc` from `xzr` on the opposite condition.
+    CSet(d, c)             -> word(out, 0x9A9F07E0 + Int.shl(condition(A.invert(c)), 12)
+                                        + rd(d))
+    Sxtw(d, a)             -> word(out, 0x93407C00 + rn(a) + rd(d))
+    Uxtb(d, a)             -> word(out, 0x53001C00 + rn(a) + rd(d))
+    Uxth(d, a)             -> word(out, 0x53003C00 + rn(a) + rd(d))
+    Ubfx(d, a, lsb, width) -> word(out, bitfield(0x53000000, W64, d, a, lsb,
+                                                 lsb + width - 1))
+    Rbit(d, a)             -> word(out, 0xDAC00000 + rn(a) + rd(d))
+    Clz(d, a)              -> word(out, 0xDAC01000 + rn(a) + rd(d))
+    Ldr(d, m, w)           -> word(out, access(load(d, w), d, m, scale(d, w)))
+    Ldrb(d, m)             -> word(out, access(ldrb, d, m, 0))
+    Ldrsw(d, m)            -> word(out, access(ldrsw, d, m, 2))
+    Str(v, m, w)           -> word(out, access(store(v, w), v, m, scale(v, w)))
+    Strb(v, m)             -> word(out, access(strb, v, m, 0))
+    Stp(a, b, base, n)     -> word(out, pair(0xA9000000, a, b, base, n))
+    Ldp(a, b, base, n)     -> word(out, pair(0xA9400000, a, b, base, n))
+    Adrp(d, _)             -> word(out, 0x90000000 + rd(d))
+    AddLo(d, a, _)         -> word(out, 0x91000000 + rn(a) + rd(d))
+    FrameAddress(d, m)     -> match m {
+        Offset(base, n) -> word(out, 0x91000000 + imm12(n) + rn(base) + rd(d))
+        Indexed(base, index) -> word(out, 0x8B206000 + three(d, base, index))
+        other -> unencodable("a frame address before layout: " + show(other))
+    }
+    AddExt(d, a, b)        -> word(out, 0x8B206000 + three(d, a, b))
+    SubExt(d, a, b)        -> word(out, 0xCB206000 + three(d, a, b))
+    FMov(d, a)             -> word(out, 0x1E604000 + rn(a) + rd(d))
+    FMovIn(d, a)           -> word(out, 0x9E670000 + rn(a) + rd(d))
+    FMovOut(d, a)          -> word(out, 0x9E660000 + rn(a) + rd(d))
+    FAdd(d, a, b)          -> word(out, 0x1E602800 + three(d, a, b))
+    FSub(d, a, b)          -> word(out, 0x1E603800 + three(d, a, b))
+    FMul(d, a, b)          -> word(out, 0x1E600800 + three(d, a, b))
+    FDiv(d, a, b)          -> word(out, 0x1E601800 + three(d, a, b))
+    FNeg(d, a)             -> word(out, 0x1E614000 + rn(a) + rd(d))
+    FCmp(a, b)             -> word(out, 0x1E602000 + rm(b) + rn(a))
+    Scvtf(d, a)            -> word(out, 0x9E620000 + rn(a) + rd(d))
+    Fcvtzs(d, a)           -> word(out, 0x9E780000 + rn(a) + rd(d))
+    Bl(_)                  -> word(out, 0x94000000)
+    Blr(a)                 -> word(out, 0xD63F0000 + rn(a))
+    Ret                    -> word(out, 0xD65F03C0)
+    B(_)                   -> word(out, 0x14000000)
+    BCond(c, _)            -> word(out, 0x54000000 + condition(c))
+    Cbz(a, _, w)           -> word(out, sf(w) + 0x34000000 + rd(a))
+    Cbnz(a, _, w)          -> word(out, sf(w) + 0x35000000 + rd(a))
+    Brk(n)                 -> word(out, 0xD4200000 + Int.shl(n, 5))
+    CallArgs(_, _)         -> {}
+    SafepointMap(_, _)     -> {}
+    Allocate(_, _)         -> unencodable("an allocation the emitter did not expand")
+    AllocateArray(_, _, _, _) -> unencodable("an allocation the emitter did not expand")
+}
+
+fun word(out : Array Int, w : Int) -> Unit = Array.push(out, w)
+
+fun unencodable(what : String) -> a = error("internal error: the encoder met " + what)
+
+-- -- registers ---------------------------------------------------------------
+
+fun number(r : Reg) -> Int = match r {
+    Physical(_, n) -> n
+    Virtual(n) -> unencodable("the unallocated register %" + Int.toString(n))
+}
+
+fun rd(r : Reg) -> Int = number(r)
+fun rn(r : Reg) -> Int = Int.shl(number(r), 5)
+fun rm(r : Reg) -> Int = Int.shl(number(r), 16)
+
+fun three(d : Reg, a : Reg, b : Reg) -> Int = rm(b) + rn(a) + rd(d)
+
+-- The size bit: 64-bit operation.
+fun sf(w : Width) -> Int = match w {
+    W32 -> 0
+    W64 -> 0x80000000
+}
+
+fun bits(w : Width) -> Int = match w {
+    W32 -> 32
+    W64 -> 64
+}
+
+fun condition(c : Cond) -> Int = match c {
+    Eq -> 0
+    Ne -> 1
+    Hs -> 2
+    Lo -> 3
+    Vs -> 6
+    Vc -> 7
+    Hi -> 8
+    Ls -> 9
+    Ge -> 10
+    Lt -> 11
+    Gt -> 12
+    Le -> 13
+}
+
+-- -- immediates --------------------------------------------------------------
+
+-- An `add` or `sub` immediate: a negative one is the other operation on its
+-- magnitude, so `cmp x0, #-1` is `cmn x0, #1`, as the assembler reads it.
+fun addSub(op : Int, opposite : Int, n : Int) -> Int =
+    if n < 0 { opposite + imm12(-n) } else { op + imm12(n) }
+
+-- The twelve-bit `add`/`sub` immediate, shifted by twelve when it is a
+-- multiple of 4096 too wide otherwise, which is what the assembler does with
+-- the same operand.
+fun imm12(n : Int) -> Int {
+    if n >= 0 && n <= 4095 { return Int.shl(n, 10) }
+    if n > 4095 && Int.and(n, 4095) == 0 && Int.shr(n, 12) <= 4095 {
+        return 0x400000 + Int.shl(Int.shr(n, 12), 10)
+    }
+    unencodable("the add immediate " + Int.toString(n))
+}
+
+-- A logical immediate. The general form is a rotated run of ones replicated
+-- across the register; selection emits only a run of low ones (`lowMask`) and
+-- `1`, which are the whole-register element with no rotation, so that is the
+-- case covered: `imms` is the run's length less one, `N` marks 64 bits.
+fun logical(n : Int, w : Width) -> Int {
+    var ones = 0
+    while ones < bits(w) && Int.and(Int.shr(n, ones), 1) == 1 { ones = ones + 1 }
+    if ones == 0 || ones == bits(w) || (ones < 63 && Int.shr(n, ones) != 0) {
+        unencodable("the logical immediate " + Int.toString(n))
+    }
+    let big = match w {
+        W32 -> 0
+        W64 -> 0x400000
+    }
+    big + Int.shl(ones - 1, 10)
+}
+
+-- `ubfm` and `sbfm`, whose `N` bit follows the size bit.
+fun bitfield(base : Int, w : Width, d : Reg, a : Reg, immr : Int, imms : Int) -> Int {
+    let n = match w {
+        W32 -> 0
+        W64 -> 0x80400000
+    }
+    base + n + Int.shl(immr, 16) + Int.shl(imms, 10) + rn(a) + rd(d)
+}
+
+-- `movz`, `movk` and `movn`: sixteen bits and which quarter they go to.
+fun wide(base : Int, d : Reg, v : Int, shift : Int) -> Int {
+    if v < 0 || v > 0xFFFF || Int.and(shift, 15) != 0 || shift < 0 || shift > 48 {
+        unencodable("the wide immediate " + Int.toString(v) + " at " + Int.toString(shift))
+    }
+    base + Int.shl(Int.shr(shift, 4), 21) + Int.shl(v, 5) + rd(d)
+}
+
+-- A constant as its `movz` and `movk`s, sixteen bits at a time, low half
+-- first, skipping the halves that are zero: the sequence the printer spells.
+fun constant(out : Array Int, d : Reg, n : Int) -> Unit {
+    var first = True
+    for var shift = 0; shift < 64; shift = shift + 16 {
+        let part = Int.and(Int.shr(n, shift), 0xFFFF)
+        if part != 0 {
+            word(out, wide(if first { 0xD2800000 } else { 0xF2800000 }, d, part, shift))
+            first = False
+        }
+    }
+    if first { word(out, wide(0xD2800000, d, 0, 0)) }
+}
+
+-- -- memory ------------------------------------------------------------------
+
+-- The opcodes of one access, by addressing mode: an unsigned offset scaled by
+-- the access size, an unscaled signed one, and a register index.
+type Access = Access { scaled : Int, unscaled : Int, indexed : Int }
+
+let ldrb = Access { scaled = 0x39400000, unscaled = 0x38400000, indexed = 0x38606800 }
+let strb = Access { scaled = 0x39000000, unscaled = 0x38000000, indexed = 0x38206800 }
+let ldrsw = Access { scaled = 0xB9800000, unscaled = 0xB8800000, indexed = 0xB8A06800 }
+
+fun load(r : Reg, w : Width) -> Access = match (r, w) {
+    (Physical(Fp, _), _) ->
+        Access { scaled = 0xFD400000, unscaled = 0xFC400000, indexed = 0xFC606800 }
+    (_, W64) -> Access { scaled = 0xF9400000, unscaled = 0xF8400000, indexed = 0xF8606800 }
+    (_, W32) -> Access { scaled = 0xB9400000, unscaled = 0xB8400000, indexed = 0xB8606800 }
+}
+
+fun store(r : Reg, w : Width) -> Access = match (r, w) {
+    (Physical(Fp, _), _) ->
+        Access { scaled = 0xFD000000, unscaled = 0xFC000000, indexed = 0xFC206800 }
+    (_, W64) -> Access { scaled = 0xF9000000, unscaled = 0xF8000000, indexed = 0xF8206800 }
+    (_, W32) -> Access { scaled = 0xB9000000, unscaled = 0xB8000000, indexed = 0xB8206800 }
+}
+
+-- Log2 of the access size: a double is eight bytes whatever the width says.
+fun scale(r : Reg, w : Width) -> Int = match (r, w) {
+    (Physical(Fp, _), _) -> 3
+    (_, W64) -> 3
+    (_, W32) -> 2
+}
+
+-- The scaled form where the offset is a non-negative multiple of the access
+-- size that fits, the unscaled `ldur`/`stur` form for a small offset that is
+-- not, as the assembler chooses for the same operand.
+fun access(op : Access, t : Reg, m : Mem, size : Int) -> Int = match m {
+    Offset(base, n) -> {
+        let step = Int.shl(1, size)
+        if n >= 0 && Int.and(n, step - 1) == 0 && Int.shr(n, size) <= 4095 {
+            op.scaled + Int.shl(Int.shr(n, size), 10) + rn(base) + rd(t)
+        } else if n >= -256 && n <= 255 {
+            op.unscaled + Int.shl(Int.and(n, 0x1FF), 12) + rn(base) + rd(t)
+        } else {
+            unencodable("the memory offset " + Int.toString(n))
+        }
+    }
+    Indexed(base, index) -> op.indexed + rm(index) + rn(base) + rd(t)
+    PageOffset(base, _) -> op.scaled + rn(base) + rd(t)
+    other -> unencodable("a frame slot before layout: " + show(other))
+}
+
+-- `stp` and `ldp` of two 64-bit registers at a signed offset in words.
+fun pair(base : Int, a : Reg, b : Reg, r : Reg, n : Int) -> Int {
+    if Int.and(n, 7) != 0 || n < -512 || n > 504 {
+        unencodable("the pair offset " + Int.toString(n))
+    }
+    base + Int.shl(Int.and(Int.shr(n, 3), 0x7F), 15) + Int.shl(number(b), 10) + rn(r)
+        + rd(a)
+}
+
+-- -- the listing -------------------------------------------------------------
+
+-- The code section's words, one per line as `word mask instruction`, the mask
+-- clearing whatever a fixup will fill in: what the test compares with the
+-- system assembler's object.
+--
+-- Fed a module in pieces, as the emitter produces it, so whether the items are
+-- in the code section is carried from one piece to the next.
+type Listing = Listing { inCode : Bool, words : Array Int }
+
+fun newListing() -> Listing = Listing { inCode = True, words = [] }
+
+-- One piece, appended to `b`, and the array emptied as `Stream.print` empties
+-- it.
+fun listing(l : Listing, items : Array (Item Inst), b : String.Builder) -> Unit {
+    for item in items {
+        match item {
+            Section(s) -> {
+                l.inCode = match s {
+                    Asm.Text -> True
+                    _ -> False
+                }
+            }
+            Instruction(i) -> if l.inCode { listInstruction(l, i, b) }
+            _ -> {}
+        }
+    }
+    Array.clear(items)
+}
+
+fun listInstruction(l : Listing, i : Inst, b : String.Builder) -> Unit {
+    Array.clear(l.words)
+    encode(i.op, l.words)
+    let mask = match fixupOf(i.op) {
+        Some(f) -> Int.xor(fieldMask(f), 0xFFFFFFFF)
+        None -> 0xFFFFFFFF
+    }
+    let text = String.join(String.split(show(i), "\n    "), "; ")
+    for w in l.words {
+        String.push(b, hex(w))
+        String.push(b, " ")
+        String.push(b, hex(mask))
+        String.push(b, " ")
+        String.push(b, text)
+        String.push(b, "\n")
+    }
+}
+
+let hexDigits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d",
+                 "e", "f"]
+
+fun hex(w : Int) -> String {
+    let out = String.builder()
+    for var shift = 28; shift >= 0; shift = shift - 4 {
+        String.push(out, hexDigits[Int.and(Int.shr(w, shift), 15)])
+    }
+    String.build(out)
+}

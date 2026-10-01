@@ -129,6 +129,16 @@ fun childScope(s : Scope) -> Scope {
             cont = s.cont }
 }
 
+-- A binder hides whatever was in scope under its name: the outer name's
+-- cell-ness and what it abstracted over both stop here. Every form that binds a
+-- local -- a parameter, a pattern, a `let`, a local `fun` -- calls this before
+-- saying what the new binding is, or a mention of the new name would lower as a
+-- read of the cell or an instantiation of the binding it shadows.
+fun shadow(scope : Scope, name : String) {
+    discard(Map.delete(scope.binders, name))
+    discard(Set.remove(scope.cells, name))
+}
+
 -- -- the lowerer --------------------------------------------------------------------
 
 type Lowerer = Lowerer {
@@ -1017,19 +1027,11 @@ fun lambdaOf(l : Lowerer, params : Array Pat, body : Expr, ty : Ty.Type,
             }
         }
     }
-    -- Every binder shadows whatever was in scope under its name, and binds it
-    -- monomorphically: nothing a lambda or a pattern binds generalizes. So an
-    -- outer name's cell-ness and its binders both stop here, and are reinstated
-    -- only for the binders this body actually makes cells of.
-    for p in cparams {
-        discard(Map.delete(inner.binders, p.name))
-        discard(Set.remove(inner.cells, p.name))
-    }
+    -- Nothing a lambda or a pattern binds generalizes, so after the shadowing
+    -- the only thing to reinstate is the cells this body makes.
+    for p in cparams { shadow(inner, p.name) }
     for (_, pat, _) in matches {
-        for k in Map.keys(Typed.ofPattern(l.types, pat)) {
-            discard(Map.delete(inner.binders, k))
-            discard(Set.remove(inner.cells, k))
-        }
+        for k in Map.keys(Typed.ofPattern(l.types, pat)) { shadow(inner, k) }
     }
     for (cname, _) in cells { Set.add(inner.cells, cname) }
     for (cname, _) in patternCells { Set.add(inner.cells, cname) }
@@ -1214,8 +1216,8 @@ fun dispatch(l : Lowerer, e : Expr, scope : Scope) -> Core {
             for arm in arms {
                 for pat in arm.patterns {
                     Array.push(alts, CAlt { pat = pat, body = celled(l, pat,
-                        arm.body, expr(l, arm.body, _),
-                        childScope(scope), Some(arm.span)) })
+                        arm.body, expr(l, arm.body, _), scope,
+                        Some(arm.span)) })
                 }
             }
             node(ty, where, CMatch(expr(l, scrutinee, scope), alts))
@@ -1490,8 +1492,8 @@ fun convMatch(l : Lowerer, e : Expr, scrutinee : Expr, arms : Array Arm,
         for arm in arms {
             for pat in arm.patterns {
                 Array.push(alts, CAlt { pat = pat, body = celled(l, pat,
-                    arm.body, conv(l, arm.body, _, k),
-                    childScope(scope), Some(arm.span)) })
+                    arm.body, conv(l, arm.body, _, k), scope,
+                    Some(arm.span)) })
             }
         }
         node(ty, where, CMatch(s, alts))
@@ -1761,8 +1763,9 @@ fun forIn(l : Lowerer, e : Expr, pat : Pat, iterable : Expr, body : Expr,
         [node(seqCore.ty, where, CVar(seqName)),
          node(cursorTy, where, CVar(curName))]))
     scope.cont = Some(name)
-    let b = seqThen(l, body, childScope(scope),
-                    node(TBottom, where, CJump(name, Array.new(0))))
+    let b = celled(l, pat, body,
+        seqThen(l, body, _, node(TBottom, where, CJump(name, Array.new(0)))),
+        scope, where)
     (pending, node(TBottom, where, CMatch(step, [
         CAlt { pat = mkPat(e, PCon(none, Array.new(0))), body = stop },
         CAlt { pat = mkPat(e, PCon(some, [pat])), body = b },
@@ -1848,7 +1851,10 @@ fun convBlockFrom(l : Lowerer, stmts : Array Stmt, from : Int, ty : Ty.Type,
             let group = Array.slice(stmts, from, last + 1)
             for stmt in group {
                 match stmt.kind {
-                    SFun(d) -> Map.put(scope.binders, d.name, funBinders(l, d))
+                    SFun(d) -> {
+                        shadow(scope, d.name)
+                        Map.put(scope.binders, d.name, funBinders(l, d))
+                    }
                     _ -> {}
                 }
             }
@@ -1884,6 +1890,7 @@ fun convBind(l : Lowerer, stmt : Stmt, rest : fun() -> Core, ty : Ty.Type,
     let at = Some(stmt.span)
     match stmt.kind {
         SFun(d) -> {
+            shadow(scope, d.name)
             Map.put(scope.binders, d.name, funBinders(l, d))
             return node(ty, at, CLetRec([localFun(l, d, scope)], rest()))
         }
@@ -1946,6 +1953,7 @@ fun convBindName(l : Lowerer, stmt : Stmt, pat : Pat, src : Expr, held : Ty.Type
     -- under whatever this binding did to the scope -- a `var` becomes a cell,
     -- and every mention of it after this point has to be a read of that cell.
     let value = conv(l, src, scope, Some(joined))
+    shadow(scope, name)
     Map.put(scope.binders, name, Array.new(0))
     let body = if mutable {
         Set.add(scope.cells, name)
@@ -1986,7 +1994,10 @@ fun blockFrom(l : Lowerer, stmts : Array Stmt, from : Int, ty : Ty.Type,
             -- or a sibling finds the group's binders.
             for stmt in group {
                 match stmt.kind {
-                    SFun(d) -> Map.put(scope.binders, d.name, funBinders(l, d))
+                    SFun(d) -> {
+                        shadow(scope, d.name)
+                        Map.put(scope.binders, d.name, funBinders(l, d))
+                    }
                     _ -> {}
                 }
             }
@@ -2083,6 +2094,7 @@ fun bind(l : Lowerer, stmt : Stmt, rest : fun() -> Core, ty : Ty.Type,
                                    body, Array.new(0)))
         }
         SFun(d) -> {
+            shadow(scope, d.name)
             Map.put(scope.binders, d.name, funBinders(l, d))
             node(ty, at, CLetRec([localFun(l, d, scope)], rest()))
         }
@@ -2097,6 +2109,7 @@ fun bindPattern(l : Lowerer, stmt : Stmt, pat : Pat, source : Expr,
     let binders = letBinders(l, stmt, pat)
     match bare.kind {
         PVar(name) -> {
+            shadow(scope, name)
             Map.put(scope.binders, name, binders)
             if mutable {
                 Set.add(scope.cells, name)
@@ -2114,8 +2127,21 @@ fun bindPattern(l : Lowerer, stmt : Stmt, pat : Pat, source : Expr,
                                    Array.new(0)))
         }
         -- A destructuring binding is a one-armed match, which is what it is.
+        -- Under `var` every binder is reassignable, so each is a cell over
+        -- the rest of the block, made from what the pattern bound.
         _ -> {
-            let body = rest()
+            let names = Array.sort(patternVars(bare))
+            for k in names { shadow(scope, k) }
+            let celledNames = if mutable { names } else { Array.new(0) }
+            for k in celledNames { Set.add(scope.cells, k) }
+            var body = rest()
+            let types = Typed.ofPattern(l.types, pat)
+            for k in Array.reverse(celledNames) {
+                let ty = rigidly(l, Map.getOr(types, k, TBottom))
+                body = node(body.ty, at, CLet(k, refOf(ty),
+                    node(refOf(ty), at, CRef(node(ty, at, CVar(k)))),
+                    body, Array.new(0)))
+            }
             node(body.ty, at, CMatch(value, [CAlt { pat = bare, body = body }]))
         }
     }
@@ -2125,17 +2151,20 @@ fun bindPattern(l : Lowerer, stmt : Stmt, pat : Pat, source : Expr,
 --
 -- A pattern binder is reassignable like any other: reassigning a destructured
 -- parameter rebinds the local name and nothing else, because patterns bind, they
--- do not alias. A cell is exactly that, and nothing more.
+-- do not alias. A cell is exactly that, and nothing more. Every binder shadows,
+-- assigned or not, so the body is lowered in a scope of its own even when there
+-- is no cell to make; `scope` is the one around the pattern, and is not
+-- changed.
 fun celled(l : Lowerer, pat : Pat, body : Expr, lower : fun(Scope) -> Core,
            scope : Scope, where : Option Span) -> Core {
     let types = Typed.ofPattern(l.types, pat)
     let written = assignedIn(ChExpr(body))
+    let inner = childScope(scope)
     let here = Array.new(2)
     for name in Map.keys(types) {
+        shadow(inner, name)
         if Set.contains(written, name) { Array.push(here, name) }
     }
-    if len(here) == 0 { return lower(scope) }
-    let inner = childScope(scope)
     for name in here { Set.add(inner.cells, name) }
     var out = lower(inner)
     for name in Array.reverse(Array.sort(here)) {
@@ -2186,6 +2215,7 @@ fun forInit(l : Lowerer, stmt : Stmt, pat : Pat, source : Expr, mutable : Bool,
         _ -> oops("a 'for' initializer must bind one name", at)
     }
     var value = expr(l, source, scope)
+    shadow(scope, name)
     if mutable {
         Set.add(scope.cells, name)
         value = node(refOf(value.ty), at, CRef(value))

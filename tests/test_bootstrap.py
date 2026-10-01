@@ -215,3 +215,22 @@ def test_the_bootstrap_is_what_its_provenance_says():
             ["git", "cat-file", "-e", f"{fields['commit']}^{{commit}}"],
             cwd=REPO_ROOT, capture_output=True)
         assert found.returncode == 0, f"no commit {fields['commit']}"
+
+
+def test_build_sh_speaks_only_the_bootstraps_command_line():
+    """A tripwire for the bump after the one that renamed `native`.
+
+    `scripts/build.sh` asks each stage whether it says `build` or the older
+    `native`, because the committed compiler may predate `build`. Once a bump
+    records a bootstrap that says `build`, every compiler `build.sh` runs
+    does, and the fallback is dead code: delete `emit_command` and call
+    `build` directly. `scripts/compare.sh` keeps its copy, since it builds
+    older trees.
+    """
+    if not _provenance()["command"].startswith("build "):
+        return
+    script = (REPO_ROOT / "scripts" / "build.sh").read_text()
+    assert "native" not in script, (
+        "bootstrap/ now speaks `boot build`, so scripts/build.sh no longer "
+        "needs to fall back to `native`: remove `emit_command` and call "
+        "`build -o - -f asm` directly")

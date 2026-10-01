@@ -118,7 +118,7 @@ def test_a_definition_nothing_calls_is_exported_under_its_symbol(probe):
     assert probe('foreign "probe_f" fun f(x : Int) -> Int = x + 1\n') == ""
     env = dict(os.environ, **{HOOK: probe.name})
     native = subprocess.run(
-        toolchain.command(bootc.binary(), "native", str(probe.entry)),
+        toolchain.command(bootc.binary(), *bootc.argv("asm"), str(probe.entry)),
         cwd=REPO_ROOT, env=env, capture_output=True, text=True,
         check=True).stdout
     assert f'.globl "{toolchain.c_symbol("probe_f")}"' in native
@@ -155,7 +155,7 @@ def test_c_calls_a_definition_through_a_pointer(probe, tmp_path):
         'foreign "probe_note" fun note(n : Int) -> Unit { }\n') == ""
     env = dict(os.environ, **{HOOK: probe.name})
     text = subprocess.run(
-        toolchain.command(bootc.binary(), "native", str(probe.entry)),
+        toolchain.command(bootc.binary(), *bootc.argv("asm"), str(probe.entry)),
         cwd=REPO_ROOT, env=env, capture_output=True, text=True,
         check=True).stdout
     source = tmp_path / "program.s"

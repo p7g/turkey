@@ -75,7 +75,7 @@ That leaves a compiler in `build/stages/stage2`. Save the example as
 `rectangles.gob`, then compile and run it:
 
 ```sh
-build/stages/stage2 native rectangles.gob > rectangles.s
+build/stages/stage2 build -o rectangles.s rectangles.gob
 cc -o rectangles rectangles.s
 ./rectangles
 ```
@@ -83,9 +83,14 @@ cc -o rectangles rectangles.s
 On Linux, link with `$TURKEY_CC` (below) and add `-lm`, since glibc keeps
 the maths functions the library calls out of libc.
 
-Run the compiler from the repository root, where it finds `lib/`. Use
-`build/stages/stage2 types rectangles.gob` to inspect inferred types; the
-other subcommands print what a stage produced, and `check` just compiles.
+Run the compiler from the repository root, where it finds `lib/`. It has two
+commands. `build` writes the program to `-o`, in the format the file's
+extension names (only assembly, `.s`, for now) or `-f` says; `-o - -f asm`
+writes it to standard output. `check` compiles as far as the last stage that
+can reject a program and writes nothing. Either takes `--dump STAGE,...` to
+print what a stage produced: `build/stages/stage2 check --dump types
+rectangles.gob` shows the inferred types, and running the compiler with no
+arguments lists the stages.
 
 The compiler that builds it is `bootstrap/`, which holds its own arm64
 assembly for macOS and for Linux, gzip'd. `scripts/build.sh` builds for whichever of the two the C compiler
@@ -196,7 +201,7 @@ compute from it are cached in `$TMPDIR` by content hash, so a second run
 with nothing changed is quicker; `-n0` runs serially, for debugging.
 
 To check the heap while debugging a program, compile it with
-`boot native --gc-verify`. Each collection independently checks object bounds,
+`boot build --gc-verify`. Each collection independently checks object bounds,
 traced references, shadow-stack and native roots, marking completeness,
 region bookkeeping before and after sweeping, and the generational
 invariants: an old object holding a young one must have been remembered by
@@ -217,7 +222,7 @@ at all, and says so on stderr if it is run with `TURKEY_GC_VERIFY` set. It
 checks the roots and layouts the compiler supplies, so behavioral stress tests
 are still needed to catch references omitted from those descriptions.
 
-`boot native --gc-stats` compiles in the collector's accounting: a line per
+`boot build --gc-stats` compiles in the collector's accounting: a line per
 collection and a summary at exit, on stderr. Counting sends every allocation
 through the runtime rather than the code compiled in line for it, so a stats
 build's times are slower than a plain one's.

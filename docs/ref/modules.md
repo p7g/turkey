@@ -269,7 +269,7 @@ The compiler's `--target` option chooses among them. Its value is spelled
 compiler itself runs on:
 
 ```sh
-boot native --target arm64-linux main.gob > main.s
+boot build --target arm64-linux -o main.s main.gob
 ```
 
 Code that differs by platform is an ordinary `match`. The signal for a bus

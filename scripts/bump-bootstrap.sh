@@ -56,12 +56,12 @@ sh scripts/build.sh --out "$OUT" --fixpoint "$@"
 cat > "$OUT/PROVENANCE" <<EOF
 commit: $(git rev-parse HEAD)
 date: $(date -u +%Y-%m-%d)
-command: native --target TARGET src/Main.gob
+command: build -o - -f asm --target TARGET src/Main.gob
 cc: $(${TURKEY_CC:-cc} --version | head -n 1)
 EOF
 for target in $TARGETS; do
     echo "emit $target" >&2
-    $RUN "$OUT/stage3" native --target "$target" src/Main.gob > "$OUT/$target.s"
+    $RUN "$OUT/stage3" build -o "$OUT/$target.s" --target "$target" src/Main.gob
     # -n makes one gzip compress the same text to the same bytes, but GNU
     # gzip and macOS's disagree. An artifact whose text is unchanged is kept,
     # so a bump from the other platform does not rewrite 3.5 MB of it.

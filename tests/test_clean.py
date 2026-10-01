@@ -2,7 +2,7 @@
 
 The passes run on both sides of instruction selection. What a program does is
 covered by the whole corpus, which goes through them; these pin that they do
-something, on the low IR `boot ssa` prints, and that what they must not delete
+something, on the low IR the `ssa` dump prints, and that what they must not delete
 stays.
 """
 

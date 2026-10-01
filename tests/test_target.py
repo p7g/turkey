@@ -54,8 +54,8 @@ def _boot(*args: str) -> subprocess.CompletedProcess[bytes]:
 
 
 def test_the_default_is_the_host() -> None:
-    chosen = _boot("native", "--target", toolchain.target(), str(SOURCE))
-    default = _boot("native", str(SOURCE))
+    chosen = _boot(*bootc.argv("asm"), "--target", toolchain.target(), str(SOURCE))
+    default = _boot(*bootc.argv("asm"), str(SOURCE))
     assert chosen.returncode == 0, chosen.stderr
     assert chosen.stdout == default.stdout
 
@@ -68,10 +68,10 @@ def test_an_unknown_target_is_refused() -> None:
         "arm64-linux\n")
 
 
-def test_target_without_a_value_is_a_usage_error() -> None:
+def test_target_without_a_value_is_refused() -> None:
     result = _boot("check", str(SOURCE), "--target")
     assert result.returncode == 2
-    assert result.stderr.decode().startswith("boot: usage: ")
+    assert result.stderr.decode() == "boot: --target needs a value\n"
 
 
 def test_a_target_match_runs_the_chosen_arm() -> None:
@@ -129,7 +129,7 @@ def errno(request: pytest.FixtureRequest,
 
 def _native(entry: Path, target: str) -> str:
     result = subprocess.run(
-        toolchain.command(bootc.binary(), "native", "--target", target,
+        toolchain.command(bootc.binary(), *bootc.argv("asm"), "--target", target,
                           entry.name),
         cwd=entry.parent, env=dict(os.environ, TURKEY_LIB=str(lang.LIB)),
         capture_output=True)

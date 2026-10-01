@@ -15,7 +15,7 @@ def _exports(tmp_path_factory, *flags: str):
     source.write_text("fun main() {}\n")
     # Every `foreign` definition kept, since C is what calls them here.
     result = subprocess.run(
-        toolchain.command(bootc.binary(), "native", "--export-runtime", *flags,
+        toolchain.command(bootc.binary(), *bootc.argv("asm"), "--export-runtime", *flags,
                           str(source)),
         cwd=bootc.REPO_ROOT, capture_output=True, text=True, check=True)
     # The probe supplies C's main. Keep the generated entry available but never

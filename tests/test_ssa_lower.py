@@ -1,7 +1,7 @@
 """`src/Turkey/SsaLower.gob`: Core to the low IR.
 
 A Core form the lowering does not handle stops one binding rather than the run,
-and `boot ssa` reports the count, so a gap is a line in a dump rather than a
+and the `ssa` dump reports the count, so a gap is a line in a dump rather than a
 crash -- and `test_nothing_is_skipped` below makes that line a failure.
 
 What is asserted is not how *much* lowers. It is that everything which does is
@@ -35,7 +35,7 @@ SAMPLE = ["adt.gob", "loops.gob", "stack.gob", "generalization.gob",
 
 @functools.lru_cache(maxsize=None)
 def _all() -> dict[str, str]:
-    """`boot ssa` over every sample program, in **one** invocation.
+    """The `ssa` dump of every sample program, in **one** invocation.
 
     One process for every program, and a compiled `boot` rather than an
     interpreted one -- both from `tests.bootc`, which explains why. The dump

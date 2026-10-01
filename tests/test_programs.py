@@ -113,7 +113,7 @@ SIGNATURES = sorted(PROGRAMS_DIR.glob("*.types"))
 
 @pytest.mark.parametrize("golden", SIGNATURES, ids=[p.stem for p in SIGNATURES])
 def test_types_command(golden: Path) -> None:
-    """`NAME.types` pins what `boot types NAME.gob` prints.
+    """`NAME.types` pins what the `types` dump of `NAME.gob` prints.
 
     A program only needs one when its inferred signatures are the point --
     which now includes any program whose functions carry a predicate context,
@@ -127,7 +127,7 @@ CORE = sorted(PROGRAMS_DIR.glob("*.core"))
 
 @pytest.mark.parametrize("golden", CORE, ids=[p.stem for p in CORE])
 def test_core_command(golden: Path) -> None:
-    """`NAME.core` pins what `boot core NAME.gob` prints.
+    """`NAME.core` pins what the `core` dump of `NAME.gob` prints.
 
     A `.expected` cannot see any of this. Whether a method was reached by
     selecting a superclass or by taking a second dictionary, whether an
@@ -146,7 +146,7 @@ OPT = sorted(PROGRAMS_DIR.glob("*.opt"))
 
 @pytest.mark.parametrize("golden", OPT, ids=[p.stem for p in OPT])
 def test_opt_command(golden: Path) -> None:
-    """`NAME.opt` pins what `boot opt NAME.gob` prints.
+    """`NAME.opt` pins what the `opt` dump of `NAME.gob` prints.
 
     The third of the trio, and the one that shows an *analysis* rather than a
     translation: which local function became a label and which stayed a
@@ -161,7 +161,7 @@ MONO = sorted(PROGRAMS_DIR.glob("*.mono"))
 
 @pytest.mark.parametrize("golden", MONO, ids=[p.stem for p in MONO])
 def test_mono_command(golden: Path) -> None:
-    """`NAME.mono` pins what `boot mono NAME.gob` prints.
+    """`NAME.mono` pins what the `mono` dump of `NAME.gob` prints.
 
     Beside the `.core` golden rather than instead of it, because the pair is
     the point: the same program before and after specialization, so a reader

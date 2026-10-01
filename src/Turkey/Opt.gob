@@ -1014,10 +1014,11 @@ fun fuseRecursiveJoinResult(r : Reducer, e : Core) -> Option Core = match e.kind
     CMatch(scrutinee, alts) -> match scrutinee.kind {
         CJoin(name, params, body, rest, recursive) -> if !recursive { None } else {
             let free = freeNamesOfAlts(alts)
-            let bound = bindersOf(body)
-            for n in Set.elements(bindersOf(rest)) { Set.add(bound, n) }
-            for p in params { Set.add(bound, p.name) }
-            if overlaps(free, bound) { return None }
+            let captures = Set.contains(free, _)
+            for p in params { if captures(p.name) { return None } }
+            if bindsAny(body, captures) || bindsAny(rest, captures) {
+                return None
+            }
             Some(mkCore(e.ty, scrutinee.span, CJoin(
                 name, params,
                 expr(r, consumeTail(body, alts, e.ty, e.span)),
@@ -1050,8 +1051,8 @@ fun trivialLet(e : Core) -> Option Core = match e.kind {
             CCon(_) -> {}
             _ -> return None
         }
-        let bound = bindersOf(body)
-        if Set.contains(bound, name) || overlaps(freeNames(value), bound) {
+        let free = freeNames(value)
+        if bindsAny(body, fun(n) = n == name || Set.contains(free, n)) {
             return None
         }
         let mapping = Map.new()
@@ -1078,7 +1079,7 @@ fun letToMatch(e : Core) -> Option Core = match e.kind {
                     CVar(n) -> if n != name { return None }
                     _ -> return None
                 }
-                if Set.contains(freeNamesOfAlts(alts), name) { return None }
+                if occursFreeInAlts(alts, name) { return None }
                 Some(mkCore(body.ty, body.span, CMatch(value, alts)))
             }
             _ -> None
@@ -1101,7 +1102,7 @@ fun floatLetThroughJoin(e : Core) -> Option Core = match e.kind {
     CLet(name, bound, value, body, binders) -> match body.kind {
         CJoin(joinName, params, joinBody, joinRest, recursive) -> {
             if len(binders) > 0 || recursive { return None }
-            if Set.contains(freeNames(joinBody), name) { return None }
+            if occursFree(joinBody, name) { return None }
             let rest = mkCore(body.ty, e.span,
                               CLet(name, bound, value, joinRest, binders))
             Some(mkCore(e.ty, body.span,
@@ -1146,17 +1147,24 @@ fun specializeJoin(r : Reducer, e : Core) -> Option Core = match e.kind {
 
 fun specializeOn(r : Reducer, e : Core, name : String, params : Array CParam,
                  body : Core, rest : Core) -> Option Core {
+    -- Tried at every visit of every join, and usually no jump carries a known
+    -- constructor: asking that first stops at the first one found, and the
+    -- jumps are collected only when there is something to specialize. One
+    -- walk answers both questions; a second, for whether there is any jump at
+    -- all, costs more than collecting them did.
+    var jumped = False
+    let known = someJump(rest, name, False, fun(j) {
+        jumped = True
+        hasKnownArg(j)
+    })
+    if !known { return if jumped { None } else { Some(rest) } }
     let jumps = joinJumps(rest, name)
-    if len(jumps) == 0 { return Some(rest) }
-
-    var anyKnown = False
-    for j in jumps { if hasKnownArg(j) { anyKnown = True } }
-    if !anyKnown { return None }
 
     if len(jumps) == 1 {
         -- Moving the body to the jump site must not capture one of its free
         -- variables under a same-named binder in `rest`.
-        if overlaps(freeNames(body), bindersOf(rest)) { return None }
+        let free = freeNames(body)
+        if bindsAny(rest, Set.contains(free, _)) { return None }
         let args = jumpArgs(jumps[0])
         let made = match applyParams(params, args, body, e.ty) {
             Some(m) -> expr(r, m)
@@ -1647,7 +1655,9 @@ fun applyParams(params : Array CParam, args : Array Core, body : Core,
 -- rather than deciding in one pass.
 fun applyNames(names : Array String, args : Array Core, body : Core,
                ty : Ty.Type) -> Option Core {
-    let bound = bindersOf(body)
+    -- Read only for an argument that is a value, and a walk of the whole body
+    -- per beta reduction is worth skipping when none is.
+    let bound = if anyOf(args, isValue) { bindersOf(body) } else { Set.new() }
     let candidates = Map.new()
     let freeOf = Map.new()
     let letters = Set.new()
@@ -2074,6 +2084,21 @@ fun collectJumps(e : Core, name : String, shadowed : Bool,
     _ -> eachKid(e.kind, collectJumps(_, name, shadowed, out))
 }
 
+-- Whether one of the jumps `joinJumps` would have found satisfies `p`,
+-- stopping at the first that does.
+fun someJump(e : Core, name : String, shadowed : Bool,
+             p : fun(Core) -> Bool) -> Bool = match e.kind {
+    CJump(target, args) ->
+        (!shadowed && target == name && p(e))
+            || anyOf(args, someJump(_, name, shadowed, p))
+    CJoin(bound, _, body, rest, recursive) -> {
+        let same = bound == name
+        someJump(body, name, shadowed || (same && recursive), p)
+            || someJump(rest, name, shadowed || same, p)
+    }
+    _ -> anyKid(e.kind, someJump(_, name, shadowed, p))
+}
+
 -- Rewrite the jumps `joinJumps` would have found, where `chosen` has something
 -- to say about one. A replaced jump's arguments are not descended into: the
 -- replacement is the whole answer for that jump, and walking into what it
@@ -2192,6 +2217,42 @@ fun freeNamesOfAltsInto(alts : Array CAlt, scope : Map String Int,
     }
 }
 
+-- Whether `name` is among `freeNames(e)`, asked without building the set and
+-- stopping at the first free occurrence. A binder of `name` closes the walk of
+-- whatever it scopes over, exactly where `freeNamesInto` opens a scope.
+fun occursFree(e : Core, name : String) -> Bool = match e.kind {
+    CVar(n) -> n == name
+    CLam(params, body, _) -> !paramsBind(params, name) && occursFree(body, name)
+    CLet(bound, _, value, body, _) ->
+        occursFree(value, name) || (bound != name && occursFree(body, name))
+    CLetRec(binds, body) -> {
+        for b in binds { if b.name == name { return False } }
+        for b in binds { if occursFree(bindValue(b), name) { return True } }
+        occursFree(body, name)
+    }
+    CJoin(bound, params, body, rest, recursive) ->
+        (!paramsBind(params, name) && !(recursive && bound == name)
+                && occursFree(body, name))
+            || (bound != name && occursFree(rest, name))
+    CMatch(scrutinee, alts) ->
+        occursFree(scrutinee, name) || occursFreeInAlts(alts, name)
+    _ -> anyKid(e.kind, occursFree(_, name))
+}
+
+fun occursFreeInAlts(alts : Array CAlt, name : String) -> Bool {
+    for CAlt { pat, body } in alts {
+        if !Array.contains(patternVars(pat), name) && occursFree(body, name) {
+            return True
+        }
+    }
+    False
+}
+
+fun paramsBind(params : Array CParam, name : String) -> Bool {
+    for p in params { if p.name == name { return True } }
+    False
+}
+
 fun enterScope(scope : Map String Int, name : String) -> Unit =
     Map.put(scope, name, Map.getOr(scope, name, 0) + 1)
 
@@ -2235,6 +2296,26 @@ fun bindersInto(e : Core, out : Set.Set String) -> Unit {
         _ -> {}
     }
     eachKid(e.kind, bindersInto(_, out))
+}
+
+-- Whether some name `bindersOf(e)` would hold satisfies `p`, asked without
+-- building the set and stopping at the first that does. The cases are
+-- `bindersInto`'s, and must stay so.
+fun bindsAny(e : Core, p : fun(String) -> Bool) -> Bool {
+    match e.kind {
+        CLam(params, _, _) -> for q in params { if p(q.name) { return True } }
+        CLet(name, _, _, _, _) -> if p(name) { return True }
+        CLetRec(binds, _) -> for b in binds { if p(b.name) { return True } }
+        CJoin(name, params, _, _, _) -> {
+            if p(name) { return True }
+            for q in params { if p(q.name) { return True } }
+        }
+        CMatch(_, alts) -> for a in alts {
+            for name in patternVars(a.pat) { if p(name) { return True } }
+        }
+        _ -> {}
+    }
+    anyKid(e.kind, bindsAny(_, p))
 }
 
 fun overlaps(a : Set.Set String, b : Set.Set String) -> Bool {

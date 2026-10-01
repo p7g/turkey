@@ -20,6 +20,17 @@ def test_projection_is_read_only():
     )
 
 
+@pytest.mark.parametrize("selector", ["0x1", "1_0", "01", "1e3", "0b1", "1a"])
+def test_a_selector_is_a_plain_decimal_index(selector):
+    assert failure(f"fun f() {{ let x = (1, 2); x.{selector} }}") == (
+        "a tuple selector is a plain decimal index such as .0 or .1"
+    )
+
+
+def test_a_dot_after_a_selector_is_another_projection():
+    assert output("fun main() { let x = ((1, 2), 3); print(x.0.1) }") == "2\n"
+
+
 def test_generic_projection_is_retained_in_the_signature():
     assert types("fun first(x) = x.0")["first"] == (
         "[HasProjection 0 a] fun(a) -> Elem.0 a"

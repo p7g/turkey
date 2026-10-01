@@ -14,6 +14,7 @@ import math
 
 import pytest
 
+from tests.lang import CompileError, check
 from tests.lang import execute as run
 
 
@@ -42,6 +43,75 @@ def test_int_literal_out_of_range_is_a_compile_error():
     # lexer is what says so.
     with pytest.raises(Exception, match="integer literal out of range"):
         out("fun main() { print(9223372036854775808) }")
+
+
+def lex_failure(src: str) -> str:
+    with pytest.raises(CompileError) as exc:
+        check(src)
+    return exc.value.message
+
+
+def test_int_literals_in_every_base_denote_their_value():
+    program = """fun main() {
+        print(0xFF)
+        print(0xff + 0xAb)
+        print(0o17)
+        print(0b1010)
+        print(0x0)
+        print(0x1e3)
+        print(0x7FFF_FFFF_FFFF_FFFF)
+        print(0b1111_0000)
+        print(1_000_000)
+        print(0x10 + 1.5)
+    }"""
+    assert out(program).split() == [
+        "255", "426", "15", "10", "0", "483", "9223372036854775807", "240",
+        "1000000", "17.5"]
+
+
+def test_non_decimal_literals_are_range_checked_like_decimal_ones():
+    # A literal is the number it spells, not a 64-bit pattern: read as one,
+    # this would be -1, which could then be a Float.
+    for literal in ("0xFFFF_FFFF_FFFF_FFFF", "0x8000_0000_0000_0000",
+                    "0o1_000_000_000_000_000_000_000", "0b1" + "0" * 63):
+        assert lex_failure(f"fun main() {{ print({literal}) }}") == (
+            f"integer literal out of range: {literal}")
+
+
+def test_floats_take_an_exponent_and_separators():
+    program = """fun main() {
+        print(1e3)
+        print(2E-2)
+        print(1_000.000_5)
+        print(1.5e1_0)
+        print(0.5)
+    }"""
+    assert out(program).split() == [
+        "1000.0", "0.02", "1000.0005", "15000000000.0", "0.5"]
+
+
+@pytest.mark.parametrize("literal, message", [
+    ("010", "leading zeros are not allowed in '010' (octal is written 0o)"),
+    ("00.5", "leading zeros are not allowed in '00' (octal is written 0o)"),
+    ("0_1", "leading zeros are not allowed in '0_1' (octal is written 0o)"),
+    ("0x", "hexadecimal literal needs a digit after '0x'"),
+    ("0x_FF", "hexadecimal literal needs a digit after '0x'"),
+    ("0b", "binary literal needs a digit after '0b'"),
+    ("0b102", "invalid digit '2' in binary literal"),
+    ("0o78", "invalid digit '8' in octal literal"),
+    ("0xFFg", "a number cannot be followed directly by 'g'"),
+    ("12abc", "a number cannot be followed directly by 'a'"),
+    ("1.5x", "a number cannot be followed directly by 'x'"),
+    ("1_", "a '_' in a number must sit between two digits"),
+    ("1__0", "a '_' in a number must sit between two digits"),
+    ("1_foo", "a '_' in a number must sit between two digits"),
+    ("1.0_", "a '_' in a number must sit between two digits"),
+    ("1e", "exponent needs digits in '1e'"),
+    ("1.5e+", "exponent needs digits in '1.5e+'"),
+    ("1e_3", "exponent needs digits in '1e'"),
+])
+def test_malformed_numerals_are_lex_errors(literal, message):
+    assert lex_failure(f"fun main() {{ print({literal}) }}") == message
 
 
 def test_min_int_divided_by_minus_one_traps_and_its_remainder_does_not():

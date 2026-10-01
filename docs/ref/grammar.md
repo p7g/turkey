@@ -14,8 +14,14 @@ separate two fields.
 ```ebnf
 IDENT   ::= [a-z_] [A-Za-z0-9_']*
 CONID   ::= [A-Z] [A-Za-z0-9_']*
-INT     ::= [0-9]+
-FLOAT   ::= [0-9]+ "." [0-9]+ ( [eE] [+-]? [0-9]+ )?
+INT     ::= decimal | "0x" hex ( "_"? hex )* | "0o" [0-7] ( "_"? [0-7] )*
+          | "0b" [01] ( "_"? [01] )*
+FLOAT   ::= decimal ( "." digits exponent? | exponent )
+exponent ::= [eE] [+-]? digits
+decimal ::= "0" | [1-9] ( "_"? [0-9] )*
+digits  ::= [0-9] ( "_"? [0-9] )*
+hex     ::= [0-9a-fA-F]
+INDEX   ::= "0" | [1-9] [0-9]*
 STRING  ::= '"' ( character | escape )* '"'
 CHAR    ::= "'" ( character | escape ) "'"
 escape  ::= "\n" | "\t" | "\r" | "\0" | "\\" | "\"" | "\'" | "\u{" hex hex? hex? hex? hex? hex? "}"
@@ -135,7 +141,7 @@ unary      ::= ("-" | "!") unary
 postfix    ::= atom ( "(" (expression ("," expression)*)? ")"
                     | "[" expression "]"
                     | "." IDENT
-                    | "." INT
+                    | "." INDEX
                     | "?" )*
 ```
 

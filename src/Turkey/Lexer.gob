@@ -7,9 +7,8 @@ module Turkey.Lexer (tokenize, tokenizeRaw, applyNewlineRule)
 -- makes the subtlest part of the lexical structure testable on its own.
 --
 -- Identifiers and numerals are ASCII: `[a-z_]` starts a name and `[0-9]` a
--- numeral, so a Greek letter or a Devanagari digit starts neither. An integer
--- literal outside `Int`'s 64-bit range is a lex error rather than a token that
--- wraps or widens later.
+-- numeral, so a Greek letter or a Devanagari digit starts neither. The rules
+-- for numerals are under "numbers" below.
 
 import Turkey.Diag as Diag
 import Turkey.Source (Source(..), Span, span)
@@ -119,24 +118,9 @@ fun charIs(c : Option Char, wanted : Char) -> Bool = match c {
     None -> False
 }
 
-fun charIsDigit(c : Option Char) -> Bool = match c {
-    Some(found) -> Char.isDigit(found)
-    None -> False
-}
-
 fun charIsSign(c : Option Char) -> Bool = match c {
     Some(found) -> found == '+' || found == '-'
     None -> False
-}
-
-fun isHexDigit(c : Option Char) -> Bool = match c {
-    None -> False
-    Some(found) -> match found {
-        '0' | '1' | '2' | '3' | '4' | '5' | '6' | '7' | '8' | '9' -> True
-        'a' | 'b' | 'c' | 'd' | 'e' | 'f' -> True
-        'A' | 'B' | 'C' | 'D' | 'E' | 'F' -> True
-        _ -> False
-    }
 }
 
 -- -- pass one ----------------------------------------------------------------------
@@ -171,9 +155,6 @@ fun lexOne(lx : Lexer, start : Span, c : Char, tokens : Array Token) -> Token {
         bump(lx)
         Token { kind = KNewline, value = VText(";"), span = start, forced = True }
     } else if Char.isDigit(c) {
-        -- After a dot, digits are a projection selector, so a following dot
-        -- must not fold the selector and its successor into one FLOAT: `x.0.1`
-        -- is two chained projections.
         lexNumber(lx, start, afterDot(tokens))
     } else if c == '"' {
         lexString(lx, start)
@@ -239,43 +220,189 @@ fun skipBlockComment(lx : Lexer) -> Unit {
 }
 
 -- -- numbers -----------------------------------------------------------------------
+--
+-- A numeral is `0x`, `0o` or `0b` and digits of that base, or decimal digits
+-- that may go on into a FLOAT. Every run of digits may be broken up by single
+-- `_`s, each between two digits. A literal's value is the number it spells,
+-- whatever the base: a literal's type is chosen from its value, so a hex
+-- literal past `Int`'s range cannot be read as a 64-bit pattern without also
+-- becoming a small number that can be a `Float`.
+--
+-- A numeral may not run straight into a letter, a digit or a `_`. Otherwise
+-- a token split would decide what `12abc`, `0b102` or `1_` means, and no
+-- reading of any of them is what the writer meant; each is an error instead.
+-- For the same reason a decimal numeral other than `0` does not start with a
+-- zero: `010` is neither ten nor C's eight.
 
 fun lexNumber(lx : Lexer, start : Span, afterDot : Bool) -> Token {
+    if afterDot { return lexSelector(lx, start) }
     let from = lx.at
-    while charIsDigit(peek(lx)) { bump(lx) }
-    -- FLOAT is `[0-9]+.[0-9]+`: a `.` only continues the number when a digit
-    -- follows, so `1.foo` stays an INT and a field access.
-    if !afterDot && charIs(peek(lx), '.') && charIsDigit(peekAt(lx, 1)) {
+    if charIs(peek(lx), '0') {
+        match radixOf(peekAt(lx, 1)) {
+            Some(radix) -> { return lexRadix(lx, start, from, radix) }
+            None -> {}
+        }
+    }
+    digitRun(lx, 10)
+    let text = String.slice(lx.src, from, lx.at)
+    if String.startsWith(text, "0") && text != "0" {
+        oops(lx, "leading zeros are not allowed in '" + text
+                 + "' (octal is written 0o)", start)
+    }
+    -- A `.` only continues the number when a digit follows, so `1.foo` stays
+    -- an INT and a field access, and `0..n` a range.
+    if (charIs(peek(lx), '.') && isDigitIn(peekAt(lx, 1), 10)) || isExponentMark(peek(lx)) {
         return lexFloat(lx, start, from)
     }
+    endOfNumeral(lx, start, 10)
+    intToken(lx, start, from, text, 10)
+}
+
+fun lexRadix(lx : Lexer, start : Span, from : String.Index, radix : Int) -> Token {
+    bumpBy(lx, 2)
+    let digitsFrom = lx.at
+    if !isDigitIn(peek(lx), radix) {
+        let prefix = String.slice(lx.src, from, lx.at)
+        oops(lx, radixName(radix) + " literal needs a digit after '" + prefix + "'", start)
+    }
+    digitRun(lx, radix)
+    endOfNumeral(lx, start, radix)
+    intToken(lx, start, from, String.slice(lx.src, digitsFrom, lx.at), radix)
+}
+
+-- After a projection `.`, digits are a selector: an index into a tuple, so
+-- decimal and nothing else. A following `.` must not fold the selector and
+-- its successor into one FLOAT either: `x.0.1` is two chained projections.
+fun lexSelector(lx : Lexer, start : Span) -> Token {
+    let from = lx.at
+    while isDigitIn(peek(lx), 10) { bump(lx) }
     let text = String.slice(lx.src, from, lx.at)
-    match Int.parse(text) {
-        Some(n) -> plain(KInt, VInt(n), start)
-        -- `Int` is 64-bit, so a literal past its range is a compile error
-        -- rather than something that wraps or widens.
-        None -> oops(lx, "integer literal out of range: " + text, start)
+    if (String.startsWith(text, "0") && text != "0") || gluedOn(peek(lx)) {
+        oops(lx, "a tuple selector is a plain decimal index such as .0 or .1", start)
+    }
+    intToken(lx, start, from, text, 10)
+}
+
+-- `digits` is the numeral without its prefix, `from` where the whole of it
+-- starts, which is what an error quotes.
+fun intToken(lx : Lexer, start : Span, from : String.Index, digits : String,
+             radix : Int) -> Token = match valueIn(digits, radix) {
+    Some(n) -> plain(KInt, VInt(n), start)
+    -- `Int` is 64-bit, so a literal past its range is a compile error
+    -- rather than something that wraps or widens.
+    None -> oops(lx, "integer literal out of range: "
+                     + String.slice(lx.src, from, lx.at), start)
+}
+
+-- Entered at the `.` of a fraction or at the `e` of an exponent. An exponent
+-- is what lets `show` on a large `Float` produce something that lexes back.
+fun lexFloat(lx : Lexer, start : Span, from : String.Index) -> Token {
+    if charIs(peek(lx), '.') {
+        bump(lx)
+        digitRun(lx, 10)
+    }
+    if isExponentMark(peek(lx)) {
+        bump(lx)
+        if charIsSign(peek(lx)) { bump(lx) }
+        if !isDigitIn(peek(lx), 10) {
+            oops(lx, "exponent needs digits in '"
+                     + String.slice(lx.src, from, lx.at) + "'", start)
+        }
+        digitRun(lx, 10)
+    }
+    endOfNumeral(lx, start, 10)
+    let text = String.slice(lx.src, from, lx.at)
+    match Float.parse(String.replace(text, "_", "")) {
+        Some(x) -> plain(KFloat, VFloat(x), start)
+        None -> oops(lx, "malformed floating-point literal " + text, start)
     }
 }
 
-fun lexFloat(lx : Lexer, start : Span, from : String.Index) -> Token {
-    bump(lx)
-    while charIsDigit(peek(lx)) { bump(lx) }
-    -- An exponent, and only after a fractional part, so `1e10` is still two
-    -- tokens. What it buys is round-tripping: `show` on a large `Float` prints
-    -- one, and the string it produces has to lex back.
-    if charIs(peek(lx), 'e') || charIs(peek(lx), 'E') {
-        if charIsDigit(peekAt(lx, 1)) {
+-- Digits of `radix`, each pair perhaps split by one `_`. The caller has seen
+-- the first digit. A `_` with no digit after it is left for `endOfNumeral`.
+fun digitRun(lx : Lexer, radix : Int) -> Unit {
+    loop {
+        if isDigitIn(peek(lx), radix) {
             bump(lx)
-            while charIsDigit(peek(lx)) { bump(lx) }
-        } else if charIsSign(peekAt(lx, 1)) && charIsDigit(peekAt(lx, 2)) {
+        } else if charIs(peek(lx), '_') && isDigitIn(peekAt(lx, 1), radix) {
             bumpBy(lx, 2)
-            while charIsDigit(peek(lx)) { bump(lx) }
+        } else {
+            break
         }
     }
-    let text = String.slice(lx.src, from, lx.at)
-    match Float.parse(text) {
-        Some(x) -> plain(KFloat, VFloat(x), start)
-        None -> oops(lx, "malformed floating-point literal " + text, start)
+}
+
+fun endOfNumeral(lx : Lexer, start : Span, radix : Int) -> Unit = match peek(lx) {
+    None -> {}
+    Some(c) -> {
+        if c == '_' {
+            oops(lx, "a '_' in a number must sit between two digits", start)
+        } else if Char.isDigit(c) {
+            oops(lx, "invalid digit '" + Char.toString(c) + "' in "
+                     + radixName(radix) + " literal", start)
+        } else if gluedOn(peek(lx)) {
+            oops(lx, "a number cannot be followed directly by '"
+                     + Char.toString(c) + "'", start)
+        }
+    }
+}
+
+fun gluedOn(c : Option Char) -> Bool = match c {
+    Some(found) -> Char.isAsciiAlphanumeric(found) || found == '_'
+    None -> False
+}
+
+fun radixOf(c : Option Char) -> Option Int = match c {
+    Some('x') -> Some(16)
+    Some('o') -> Some(8)
+    Some('b') -> Some(2)
+    _ -> None
+}
+
+fun radixName(radix : Int) -> String = match radix {
+    16 -> "hexadecimal"
+    8 -> "octal"
+    2 -> "binary"
+    _ -> "decimal"
+}
+
+fun isExponentMark(c : Option Char) -> Bool = charIs(c, 'e') || charIs(c, 'E')
+
+fun isDigitIn(c : Option Char, radix : Int) -> Bool = match c {
+    None -> False
+    Some(found) -> match digitValue(found) {
+        Some(d) -> d < radix
+        None -> False
+    }
+}
+
+-- The value of `digits` in `radix`, skipping `_`s, or None past `Int`'s range.
+fun valueIn(digits : String, radix : Int) -> Option Int {
+    var total = 0
+    for c in String.codePoints(digits) {
+        match digitValue(c) {
+            None -> {}
+            Some(d) -> {
+                if total > (Int.maxValue() - d) / radix { return None }
+                total = total * radix + d
+            }
+        }
+    }
+    Some(total)
+}
+
+-- A digit's value in any base up to sixteen. 48 is '0', 87 is 'a' - 10, and
+-- 55 is 'A' - 10.
+fun digitValue(c : Char) -> Option Int {
+    let code = Char.toInt(c)
+    if code >= 48 && code <= 57 {
+        Some(code - 48)
+    } else if code >= 97 && code <= 102 {
+        Some(code - 87)
+    } else if code >= 65 && code <= 70 {
+        Some(code - 55)
+    } else {
+        None
     }
 }
 
@@ -362,7 +489,7 @@ fun lexUnicodeEscape(lx : Lexer, start : Span) -> Char {
     bump(lx)
     let from = lx.at
     var count = 0
-    while isHexDigit(peek(lx)) {
+    while isDigitIn(peek(lx), 16) {
         bump(lx)
         count = count + 1
     }
@@ -371,7 +498,7 @@ fun lexUnicodeEscape(lx : Lexer, start : Span) -> Char {
     }
     let digits = String.slice(lx.src, from, lx.at)
     bump(lx)
-    let code = hexValue(digits)
+    let code = Option.expect(valueIn(digits, 16), "six hex digits fit an Int")
     match Char.fromInt(code) {
         Some(c) -> c
         None -> oops(lx, "\\u{" + digits + "} is not a Unicode scalar value: "
@@ -380,29 +507,11 @@ fun lexUnicodeEscape(lx : Lexer, start : Span) -> Char {
 }
 
 fun notScalarBecause(code : Int) -> String =
-    if code <= 57343 {
+    if code <= 0xDFFF {
         "the surrogates D800..DFFF are not characters, and a string may not contain one"
     } else {
         "values above 10FFFF are not characters, and a string may not contain one"
     }
-
-fun hexValue(digits : String) -> Int {
-    var total = 0
-    for c in String.codePoints(digits) { total = total * 16 + hexDigitValue(c) }
-    total
-}
-
--- 48 is '0', 87 is 'a' - 10, and 55 is 'A' - 10.
-fun hexDigitValue(c : Char) -> Int {
-    let code = Char.toInt(c)
-    if code >= 48 && code <= 57 {
-        code - 48
-    } else if code >= 97 && code <= 102 {
-        code - 87
-    } else {
-        code - 55
-    }
-}
 
 -- -- words and operators --------------------------------------------------------------
 

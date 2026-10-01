@@ -66,8 +66,8 @@ program can use it only as it would a primitive type. See [Built-in types and
 classes](builtins.md) for the others.
 
 There are no implicit conversions between primitive types. Converting an
-`Int` to a `Float` is an explicit call, `Float.fromInt(n)`. A numeric *literal*
-without a decimal point can still be used as a `Float`, because a literal's
+`Int` to a `Float` is an explicit call, `Float.fromInt(n)`. An *integer
+literal* can still be used as a `Float`, because a literal's
 type is chosen from context ([Numeric literals](inference.md#numeric-literals)).
 
 ### Int
@@ -231,9 +231,9 @@ fun main() {
 -0.0
 ```
 
-`Float.parse` reads a string back. It accepts a float literal with an optional
-leading `+` or `-`, and the three special names, and nothing else: no
-surrounding space, no `1e5` without a point, no `inf`. The result is the
+`Float.parse` reads a string back. It accepts a float literal without `_`
+separators, with an optional leading `+` or `-`, and the three special names,
+and nothing else: no surrounding space, no `1_000.0`, no `inf`. The result is the
 `Float` nearest the decimal value, with an exact tie going to the one whose
 last bit is zero; a value too large becomes an infinity and one too small a
 zero, each keeping its sign.
@@ -244,7 +244,7 @@ fun main() {
     print(Float.parse("-1.5e3"))
     print(Float.parse("Infinity"))
     print(Float.parse("9007199254740993.0"))
-    print(Float.parse("1e5"))
+    print(Float.parse("1_000.0"))
 }
 ```
 

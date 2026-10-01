@@ -461,6 +461,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         ArrayLength(target) -> emit(s, A.Ldr(d, A.Offset(A.reg(target), 8), A.W64))
         CellLoad(target) -> emit(s, A.Ldr(d, A.Offset(A.reg(target), 0), A.W64))
         CellStore(target, v) -> {
+            ordered(s)
             emit(s, A.Str(A.reg(v), A.Offset(A.reg(target), 0), A.W64))
             if barrierNeeded(s, target, v) { barrier(s, A.reg(target), A.reg(v)) }
             -- A `str` of a `d` register stores the same bits a `str` of an
@@ -472,6 +473,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         -- own width apart -- not eight, which is why the width comes from
         -- `Turkey.Runtime` rather than being assumed here.
         ArrayGet(target, index) -> {
+            withinStorage(s, A.reg(target), A.reg(index))
             let at = elementAt(s, A.reg(target), A.reg(index), r.class_)
             match Rt.elementWidth(r.class_) {
                 1 -> emit(s, A.Ldrb(d, at))
@@ -480,6 +482,8 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             }
         }
         ArraySet(target, index, v) -> {
+            ordered(s)
+            withinStorage(s, A.reg(target), A.reg(index))
             let held = Ssa.repOf(s.source, v)
             let at = elementAt(s, A.reg(target), A.reg(index), held.class_)
             match Rt.elementWidth(held.class_) {
@@ -508,6 +512,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         Address(AllocSites) -> symbolAddress(s, d, runtimeSymbolOf(s, sitesSymbol))
         GlobalLoad(name) -> emit(s, A.Ldr(d, globalAt(s, name), A.W64))
         GlobalStore(name, v) -> {
+            ordered(s)
             emit(s, A.Str(A.reg(v), globalAt(s, name), A.W64))
             emit(s, A.Mov(d, A.xzr, A.W64))
         }
@@ -541,6 +546,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             }
         }
         ObjectSet(target, index, v) -> {
+            ordered(s)
             storeField(s, A.reg(target), index, A.reg(v))
             if barrierNeeded(s, target, v) { barrier(s, A.reg(target), A.reg(v)) }
             emit(s, A.Mov(d, A.xzr, A.W64))
@@ -602,6 +608,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             emit(s, A.FrameAddress(d, A.ObjectSlot(k, 0)))
         }
         ClosureCapture(closure, index, v) -> {
+            ordered(s)
             let env = temp(s, Ssa.traced(Ptr))
             emit(s, A.Ldr(env, A.Offset(A.reg(closure), 32), A.W64))
             emit(s, A.Str(A.reg(v), A.Offset(env, 24 + 8 * index), A.W64))
@@ -692,6 +699,42 @@ fun immediate(s : Sel, n : Int) -> Reg {
 -- A call to one of the runtime's untyped entry points: every argument and the
 -- result is a machine word, because `raw` has already moved any double's bits
 -- into the general file.
+-- Before a store to a mutable location -- a record field, an array element,
+-- a cell, a global, a closure's late capture: no load this thread did earlier
+-- may be reordered after it.
+--
+-- This is what makes data races bounded in time as well as space: accesses
+-- to a location that no other task races on happen in program order,
+-- whatever races happen elsewhere, earlier or later. arm64 lets a store
+-- become visible before an earlier load has read its value, which would let a
+-- later race reach back into a read that had none; `dmb ishld` forbids
+-- exactly that reordering and nothing more, which is what keeps it cheap.
+-- The property is local DRF, and this the cheapest of the arm64 schemes
+-- Dolan, Sivaramakrishnan and Madhavapeddy measured for it ("Bounding Data
+-- Races in Space and Time", PLDI 2018).
+--
+-- Not before a store that initializes an object being built, which nothing
+-- else can see yet, and not before a raw store (`PtrStore`), which is the
+-- runtime's own memory and outside the language's model.
+fun ordered(s : Sel) -> Unit = emit(s, A.DmbLoad)
+
+-- Panic unless `index` is within `array`'s own length.
+--
+-- The check a memory-safe access needs, made against the array object being
+-- accessed and nothing else. A growable `Array` checks its index against its
+-- own `length` field first, for the error a program can understand, but that
+-- field and the storage it describes are two words written separately: a
+-- task reading them while another grows the array could see the new length
+-- with the old, shorter storage. Every safety check reads only the object it
+-- protects, so that no race between tasks can turn into an access outside an
+-- object. Unsigned, so a negative index fails too.
+fun withinStorage(s : Sel, array : Reg, index : Reg) -> Unit {
+    let length = temp(s, Ssa.untraced(I64))
+    emit(s, A.Ldr(length, A.Offset(array, 8), A.W64))
+    emit(s, A.Cmp(index, length, A.W64))
+    guardOn(s, A.Hs, "array access outside the array's storage")
+}
+
 -- The frame object `v` addresses. Every one has a slot: `Turkey.Roots` lists
 -- them from the same instructions.
 fun frameObject(s : Sel, v : Value) -> Int = match Roots.objectOf(s.frame, Ssa.valueId(v)) {

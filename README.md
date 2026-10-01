@@ -90,7 +90,9 @@ writes it to standard output. `check` compiles as far as the last stage that
 can reject a program and writes nothing. Either takes `--dump STAGE,...` to
 print what a stage produced: `build/stages/stage2 check --dump types
 rectangles.gob` shows the inferred types, and running the compiler with no
-arguments lists the stages.
+arguments lists the stages. `build --timings` reports on standard error how
+long each phase took, how the backend's time is spread over functions, and how
+much of the optimizer's work could run in parallel.
 
 The compiler that builds it is `bootstrap/`, which holds its own arm64
 assembly for macOS and for Linux, gzip'd. `scripts/build.sh` builds for whichever of the two the C compiler

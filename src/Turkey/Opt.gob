@@ -1,6 +1,6 @@
 module Turkey.Opt (
     inlineLimit, joinSpecializeLimit, speculativeInlineLimit,
-    loopBreakers, reduceProgram, sizeOf_, instantiateTypes,
+    loopBreakers, reduceProgram, sizeOf_, instantiateTypes, measure,
 )
 
 -- The local reductions, from inlining through loop-result fusion.
@@ -83,6 +83,8 @@ import Turkey.Prelude as P
 import Turkey.Source (Span)
 import Turkey.Types as Ty
 import Turkey.Types (VarCell(..), TBottom)
+import System.IO as IO
+import System.Time as Time
 
 -- How large a body may be and still be inlined, counted as `sizeOf_` counts.
 -- Small enough that a call site does not become unreadable, large enough for
@@ -338,6 +340,55 @@ fun newReducer(program : CProgram, decls : DeclTable) -> Reducer {
     }
 }
 
+-- `boot --timings`: how parallel `reduceProgram` could be. Off otherwise.
+var measuring = False
+
+fun measure(on : Bool) -> Unit {
+    measuring = on
+}
+
+-- The reduction's dependency structure, timed: components are reduced callees
+-- first, so a component can start once every component it calls is done, and
+-- the most expensive chain of such dependencies bounds how far running
+-- components in parallel could shorten the whole.
+fun reportSchedule(graph : Map String (Set.Set String), components : Array (Array String),
+                   costs : Array Int) -> Unit {
+    let componentOf = Map.new()
+    for var c = 0; c < len(components); c = c + 1 {
+        for name in components[c] { Map.put(componentOf, name, c) }
+    }
+    -- `components` lists callees first, so each one's dependencies are done.
+    let finish = Array.filled(len(components), 0)
+    var total = 0
+    var critical = 0
+    var largest = 0
+    var largestAt = 0
+    for var c = 0; c < len(components); c = c + 1 {
+        var ready = 0
+        for name in components[c] {
+            for callee in Set.elements(Map.getOr(graph, name, Set.new())) {
+                match Map.get(componentOf, callee) {
+                    Some(d) -> if d != c && finish[d] > ready { ready = finish[d] }
+                    None -> {}
+                }
+            }
+        }
+        finish[c] = ready + costs[c]
+        total = total + costs[c]
+        if finish[c] > critical { critical = finish[c] }
+        if costs[c] > largest {
+            largest = costs[c]
+            largestAt = c
+        }
+    }
+    let tenths = fun(n) = Int.toString(n / 100000 / 10) + "." + Int.toString(n / 100000 % 10) + "ms"
+    IO.stderr("opt-schedule\tcomponents " + Int.toString(len(components))
+              + "\ttotal " + tenths(total) + "\tcritical path " + tenths(critical)
+              + "\tlargest component " + tenths(largest) + " ("
+              + Int.toString(len(components[largestAt])) + " bindings, "
+              + (if len(components) > 0 { components[largestAt][0] } else { "" }) + ")\n")
+}
+
 -- Every binding's body, reduced -- callees before their callers.
 --
 -- The order is not cosmetic. `bodyOf` reduces a callee the first time some call
@@ -362,7 +413,11 @@ fun reduceProgram(program : CProgram, decls : DeclTable) -> CProgram {
         }
     }
     let done = Map.new()
-    for component in Deps.sccs(callGraph(binds)) {
+    let graph = callGraph(binds)
+    let components = Deps.sccs(graph)
+    let costs : Array Int = []
+    for component in components {
+        let started = if measuring { Time.monotonic() } else { 0 }
         for name in component {
             match Map.get(first, name) {
                 Some(index) -> {
@@ -383,7 +438,9 @@ fun reduceProgram(program : CProgram, decls : DeclTable) -> CProgram {
                 None -> {}
             }
         }
+        if measuring { Array.push(costs, Time.monotonic() - started) }
     }
+    if measuring { reportSchedule(graph, components, costs) }
     -- A name bound twice has one entry in the graph, so its later bindings are
     -- in no component. Nothing else can be missing.
     for var i = 0; i < len(binds); i = i + 1 {

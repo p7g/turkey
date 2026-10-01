@@ -48,7 +48,7 @@ def coroutines(request, tmp_path):
         name = "verified" if flags else "plain"
         assembly = tmp_path / f"{name}.s"
         compiled = subprocess.run(
-            toolchain.command(bootc.binary(), "native", *flags, str(entry)),
+            toolchain.command(bootc.binary(), *bootc.argv("asm"), *flags, str(entry)),
             cwd=REPO_ROOT, capture_output=True, text=True)
         assert compiled.returncode == 0, compiled.stderr
         assembly.write_text(compiled.stdout, encoding="utf-8")

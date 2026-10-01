@@ -1,9 +1,8 @@
 module Turkey.Asm (
-    Asm(..), Dialect(..), Section(..), dialectFor, newAsm, symbolFor, runtimeFor,
-    messageSymbol, literalSlot, globalSlot, globalSymbol, rootsSymbol,
-    literalName, messageName, entrySymbol, globalsFrame, frameTableSymbol,
-    localLabel, page, pageOffset, section,
-    functionType,
+    Asm(..), Dialect(..), Section(..), Symbol(..), SymbolKind(..), dialectFor, newAsm,
+    symbolFor, runtimeFor, messageSymbol, literalSlot, globalSlot, globalSymbol,
+    rootsSymbol, literalName, messageName, entrySymbol, globalsFrame,
+    frameTableSymbol, localLabel, spell, page, pageOffset, section, functionType,
 )
 
 -- What the arm64 module owns: the names, and who gets a root slot.
@@ -88,92 +87,118 @@ fun section(d : Dialect, s : Section) -> String = match (d, s) {
     (Elf, Relocated) -> ".section .data.rel.ro,\"aw\""
 }
 
--- A symbol the assembler keeps out of the object's symbol table.
-fun localLabel(d : Dialect, name : String) -> String = match d {
-    MachO -> "L" + name
-    Elf -> ".L" + name
+-- -- symbols ---------------------------------------------------------------------
+
+-- A name the code refers to: a function, a global, a block, a stub.
+--
+-- Not its spelling. The printer spells it for the assembler, and an object
+-- writer needs it unspelled: the name the symbol table holds, whether it is in
+-- the table at all, and the relocation operator kept apart from the name
+-- rather than written into it. A symbol carries the format it belongs to,
+-- because the name already depends on it -- Mach-O's underscore -- and so that
+-- an instruction can be printed without being told the format again.
+type Symbol = Symbol { name : String, kind : SymbolKind, format : Dialect }
+
+type SymbolKind
+    -- An assembler-local label, which never reaches the symbol table: a block,
+    -- a stub, a literal's bytes. `name` is without the format's prefix.
+    = Temporary
+    -- A name in the symbol table, as the table holds it.
+    | Named
+
+-- A symbol as the assembler reads it.
+--
+-- **A named symbol is quoted, and it has to be.** A Turkey name contains `#`,
+-- which is ARM assembly's immediate prefix -- `bl _Main#main` is "unexpected
+-- token in argument list" and not a call. Quoting takes the whole name through
+-- to the object file's symbol table intact. A C identifier needs no quoting
+-- and gets it anyway: one rule for how a symbol is written beats two and a
+-- test for which applies.
+--
+-- The alternative is mangling, and it is worse for the reason it is always
+-- worse: a crash report or an `nm` then shows a name the compiler invented
+-- rather than the one the programmer wrote.
+fun spell(sym : Symbol) -> String = match (sym.kind, sym.format) {
+    (Named, _) -> "\"" + sym.name + "\""
+    (Temporary, MachO) -> "L" + sym.name
+    (Temporary, Elf) -> ".L" + sym.name
 }
+
+-- A symbol the assembler keeps out of the object's symbol table.
+fun localLabel(d : Dialect, name : String) -> Symbol =
+    Symbol { name = name, kind = Temporary, format = d }
 
 -- The two halves of a symbol's address, `adrp`'s operand and then the `add`'s:
--- the 4KB page, and the offset within it.
-fun page(d : Dialect, sym : String) -> String = match d {
-    MachO -> sym + "@PAGE"
-    Elf -> sym
+-- the 4KB page, and the offset within it, as the assembler spells the
+-- relocation.
+fun page(sym : Symbol) -> String = match sym.format {
+    MachO -> spell(sym) + "@PAGE"
+    Elf -> spell(sym)
 }
 
-fun pageOffset(d : Dialect, sym : String) -> String = match d {
-    MachO -> sym + "@PAGEOFF"
-    Elf -> ":lo12:" + sym
+fun pageOffset(sym : Symbol) -> String = match sym.format {
+    MachO -> spell(sym) + "@PAGEOFF"
+    Elf -> ":lo12:" + spell(sym)
 }
 
 -- What marks a symbol as a function, if the format has such a thing. ELF's
 -- tools read it -- a debugger, a profiler, `objdump` -- and Mach-O has no
 -- equivalent.
-fun functionType(d : Dialect, sym : String) -> Option String = match d {
+fun functionType(sym : Symbol) -> Option String = match sym.format {
     MachO -> None
-    Elf -> Some(".type " + sym + ", %function")
+    Elf -> Some(".type " + spell(sym) + ", %function")
 }
 
--- A Turkey name as an assembler symbol.
---
--- **Quoted, and it has to be.** A Turkey name contains `#`, which is ARM
--- assembly's immediate prefix -- `bl _Main#main` is "unexpected token in
--- argument list" and not a call. Quoting takes the whole name through to the
--- object file's symbol table intact.
---
--- The alternative is mangling, and it is worse for the reason it is always
--- worse: a crash report or an `nm` then shows a name the compiler invented
--- rather than the one the programmer wrote.
+-- A Turkey name as a symbol.
 --
 -- Mach-O puts an underscore before every C-level name and ELF does not, so
 -- `turkey_print` in the C source is `_turkey_print` in a Mach-O object and
 -- `turkey_print` in an ELF one.
-fun symbolFor(d : Dialect, name : String) -> String =
-    "\"" + cPrefix(d) + name + "\""
+fun symbolFor(d : Dialect, name : String) -> Symbol =
+    Symbol { name = cPrefix(d) + name, kind = Named, format = d }
 
 fun cPrefix(d : Dialect) -> String = match d {
     MachO -> "_"
     Elf -> ""
 }
 
--- A runtime entry point. A C identifier needs no quoting, but gets it anyway:
--- one rule for how a symbol is written beats two and a test for which applies.
-fun runtimeFor(d : Dialect, name : String) -> String = symbolFor(d, name)
+-- A runtime entry point, which is a C name.
+fun runtimeFor(d : Dialect, name : String) -> Symbol = symbolFor(d, name)
 
 -- Compiler-private data, named as local labels so these never reach the symbol
 -- table.
-fun literalName(d : Dialect, index : Int) -> String =
+fun literalName(d : Dialect, index : Int) -> Symbol =
     localLabel(d, "str" + Int.toString(index))
-fun messageName(d : Dialect, index : Int) -> String =
+fun messageName(d : Dialect, index : Int) -> Symbol =
     localLabel(d, "msg" + Int.toString(index))
 
 -- The permanent root array, which the collector scans for the whole run.
-fun rootsSymbol(d : Dialect) -> String = cPrefix(d) + "turkey_module_roots"
+fun rootsSymbol(d : Dialect) -> Symbol = symbolFor(d, "turkey_module_roots")
 
 -- The sequence that runs before the program's own: it interns the literals,
 -- computes the globals and calls `main`. Global, and named, because
 -- `Turkey.Entry` reaches it by its C symbol, `turkey_entry`.
-fun entrySymbol(d : Dialect) -> String = runtimeFor(d, "turkey_entry")
+fun entrySymbol(d : Dialect) -> Symbol = runtimeFor(d, "turkey_entry")
 
 -- The `RootFrame` covering the root array. Forty bytes -- previous,
 -- function_name, count, values, live -- and it matches `lib/Turkey/Heap.gob`
 -- by layout rather than by name, which is the same agreement the mask store
 -- at offset 32 rests on.
-fun globalsFrame(d : Dialect) -> String = localLabel(d, "globals")
+fun globalsFrame(d : Dialect) -> Symbol = localLabel(d, "globals")
 
 -- Every safepoint's roots, keyed by return address.
-fun frameTableSymbol(d : Dialect) -> String = cPrefix(d) + "turkey_frame_table"
+fun frameTableSymbol(d : Dialect) -> Symbol = symbolFor(d, "turkey_frame_table")
 
 -- An untraced global is ordinary storage and gets its own symbol; a traced one
 -- lives *in* the root array instead, so that storing to it and rooting it are
 -- the same store.
-fun globalSymbol(d : Dialect, name : String) -> String =
+fun globalSymbol(d : Dialect, name : String) -> Symbol =
     symbolFor(d, "global." + name)
 
 fun globalSlot(a : Asm, name : String) -> Option Int = Map.get(a.globals, name)
 
 -- The message's symbol, interning it if this is the first mention.
-fun messageSymbol(a : Asm, text : String) -> String {
+fun messageSymbol(a : Asm, text : String) -> Symbol {
     if !Map.contains(a.messages, text) {
         Map.put(a.messages, text, len(a.messages))
     }

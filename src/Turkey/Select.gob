@@ -733,7 +733,7 @@ fun marked(s : Sel) -> Unit = match s.pending {
 
 -- The symbol of a global the collector does not scan, which is where the
 -- heap keeps its tables.
-fun untracedGlobal(s : Sel, name : String) -> String =
+fun untracedGlobal(s : Sel, name : String) -> Asm.Symbol =
     match Asm.globalSlot(s.asm, name) {
         Some(_) -> error("the heap's table " + name + " is a traced global")
         None -> Asm.globalSymbol(s.asm.dialect, name)
@@ -830,7 +830,7 @@ fun barrierNeeded(s : Sel, target : Value, value : Value) -> Bool {
 fun storesObject(s : Sel, value : Value) -> Bool =
     Ssa.repOf(s.source, value).traced && !Map.contains(s.known, Ssa.valueId(value))
 
-fun runtimeCall(s : Sel, d : Reg, sym : String, first : Array Reg,
+fun runtimeCall(s : Sel, d : Reg, sym : Asm.Symbol, first : Array Reg,
                 rest : Array Reg) -> Unit {
     let args = []
     for a in Array.append(first, rest) { Array.push(args, (a, A.Gp)) }
@@ -884,7 +884,7 @@ fun move(s : Sel, d : Reg, dBank : A.Bank, a : Reg, aBank : A.Bank) -> Unit =
 -- convention is this compiler's (`incoming` is the other half). The slots are
 -- a preallocated area at the bottom of the frame, so nothing moves `sp`.
 fun call(s : Sel, d : Reg, dBank : A.Bank, answers : Option A.Bank,
-         sym : Option String, indirect : Reg,
+         sym : Option Asm.Symbol, indirect : Reg,
          args : Array (Reg, A.Bank)) -> Unit {
     let ins = []
     var general = 0
@@ -1009,43 +1009,43 @@ fun slotOf(s : Sel, slot : Int) -> A.Mem =
 
 -- A symbol's address, in a register. Two instructions on arm64: the page, then
 -- the offset within it.
-fun address(s : Sel, sym : String) -> Reg {
+fun address(s : Sel, sym : Asm.Symbol) -> Reg {
     let page = temp(s, Ssa.untraced(Ptr))
     let full = temp(s, Ssa.untraced(Ptr))
-    emit(s, A.Adrp(page, Asm.page(s.asm.dialect, sym)))
+    emit(s, A.Adrp(page, sym))
     -- Into a *second* register, not back into the first. `add` takes distinct
     -- source and destination, so there is no reason to redefine a value here
     -- and every reason not to: `Ssa.verify` counts definitions, and the
     -- allocator will too.
-    emit(s, A.AddLo(full, page, Asm.pageOffset(s.asm.dialect, sym)))
+    emit(s, A.AddLo(full, page, sym))
     full
 }
 
 -- A symbol's word as a memory operand: the page, with the offset within it
 -- in the access itself, so the full address is never formed.
-fun symbolWord(s : Sel, sym : String) -> A.Mem {
+fun symbolWord(s : Sel, sym : Asm.Symbol) -> A.Mem {
     let page = temp(s, Ssa.untraced(Ptr))
-    emit(s, A.Adrp(page, Asm.page(s.asm.dialect, sym)))
-    A.PageOffset(page, Asm.pageOffset(s.asm.dialect, sym))
+    emit(s, A.Adrp(page, sym))
+    A.PageOffset(page, sym)
 }
 
 -- A symbol's address into `d`: `address`'s pair, ending in the destination.
-fun symbolAddress(s : Sel, d : Reg, sym : String) -> Unit {
+fun symbolAddress(s : Sel, d : Reg, sym : Asm.Symbol) -> Unit {
     let page = temp(s, Ssa.untraced(Ptr))
-    emit(s, A.Adrp(page, Asm.page(s.asm.dialect, sym)))
-    emit(s, A.AddLo(d, page, Asm.pageOffset(s.asm.dialect, sym)))
+    emit(s, A.Adrp(page, sym))
+    emit(s, A.AddLo(d, page, sym))
 }
 
 -- The counters of a build compiled to count allocations; `Turkey.Emit` defines
 -- them.
 let sitesSymbol = "turkey_alloc_sites"
 
-fun symbolFor(s : Sel, name : String) -> String = Asm.symbolFor(s.asm.dialect, name)
+fun symbolFor(s : Sel, name : String) -> Asm.Symbol = Asm.symbolFor(s.asm.dialect, name)
 
 -- A runtime entry point this pass names directly rather than through the
 -- primitive table: the heap operations have no `Prim.` spelling, because the
 -- lowering emits them and no program calls them.
-fun runtimeSymbolOf(s : Sel, name : String) -> String =
+fun runtimeSymbolOf(s : Sel, name : String) -> Asm.Symbol =
     Asm.runtimeFor(s.asm.dialect, name)
 
 -- One element of an array, by address. The header first, then the index scaled
@@ -1072,7 +1072,7 @@ fun shiftFor(width : Int) -> Int = match width {
 -- format spells a C symbol. C's return type is not consulted: every one of
 -- these fits in `x0` and the caller already knows the representation it asked
 -- for.
-fun runtimeSymbol(s : Sel, name : String) -> Option String =
+fun runtimeSymbol(s : Sel, name : String) -> Option Asm.Symbol =
     match Rt.entryPoint(name) {
         Some(entry) -> Some(runtimeSymbolOf(s, entry.symbol))
         None -> None

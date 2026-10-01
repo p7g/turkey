@@ -139,7 +139,7 @@ type Cold = Cold { text : Code, count : Int }
 
 -- The labels of allocation `n` in function `tag`: its stub (`"s"`), the
 -- stub's panic exit (`"p"`) and the return to the fast path (`"r"`).
-fun allocationLabel(d : Asm.Dialect, tag : Int, n : Int, which : String) -> String =
+fun allocationLabel(d : Asm.Dialect, tag : Int, n : Int, which : String) -> Asm.Symbol =
     Asm.localLabel(d, "a" + Int.toString(tag) + which + Int.toString(n))
 
 -- How many times each value is read, terminators included.
@@ -188,7 +188,7 @@ fun conditional(b : Code, d : Asm.Dialect, tag : Int, c : A.Cond,
 }
 
 -- A global function's label, and what the format wants said about it first.
-fun function(b : Code, symbol : String) -> Unit {
+fun function(b : Code, symbol : Asm.Symbol) -> Unit {
     emit(b, Global(symbol))
     emit(b, FunctionType(symbol))
     emit(b, Align(2))
@@ -197,11 +197,11 @@ fun function(b : Code, symbol : String) -> Unit {
 
 -- The return address of the call at this safepoint: the label goes directly
 -- after the `bl`, which is where selection put the `SafepointMap` mark.
-fun safepointLabel(d : Asm.Dialect, tag : Int, block : Int, index : Int) -> String =
+fun safepointLabel(d : Asm.Dialect, tag : Int, block : Int, index : Int) -> Asm.Symbol =
     Asm.localLabel(d, "sp" + Int.toString(tag) + "b" + Int.toString(block)
                       + "i" + Int.toString(index))
 
-fun blockLabel(d : Asm.Dialect, tag : Int, block : Int) -> String =
+fun blockLabel(d : Asm.Dialect, tag : Int, block : Int) -> Asm.Symbol =
     Asm.localLabel(d, "f" + Int.toString(tag) + "b" + Int.toString(block))
 
 -- -- the frame ---------------------------------------------------------------
@@ -327,13 +327,13 @@ fun emitInst(b : Code, d : Asm.Dialect, f : Func Inst,
 -- branches to its stub, after the function.
 fun allocate(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
              l : Frame.Layout, tag : Int, dest : Reg, al : A.Allocation,
-             safepoint : Option String) -> Unit {
+             safepoint : Option Asm.Symbol) -> Unit {
     let n = cold.count
     cold.count = n + 1
     let cursor = scratch
     let word = Physical(Gp, 17)
-    instruction(b, A.Adrp(cursor, Asm.page(d, al.cursors)))
-    instruction(b, A.Ldr(cursor, PageOffset(cursor, Asm.pageOffset(d, al.cursors)), A.W64))
+    instruction(b, A.Adrp(cursor, al.cursors))
+    instruction(b, A.Ldr(cursor, PageOffset(cursor, al.cursors), A.W64))
     if al.sizeClass > 0 {
         instruction(b, A.AddImm(cursor, cursor, Rt.cursorBytes * al.sizeClass, A.W64))
     }
@@ -371,7 +371,7 @@ fun allocate(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
 -- allocator knows (`A.writesBeforeReading`), so it holds neither.
 fun allocateArray(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
                   l : Frame.Layout, tag : Int, dest : Reg, length : Reg, fill : Reg,
-                  al : A.ArrayAllocation, safepoint : Option String) -> Unit {
+                  al : A.ArrayAllocation, safepoint : Option Asm.Symbol) -> Unit {
     let n = cold.count
     cold.count = n + 1
     let slow = allocationLabel(d, tag, n, "s")
@@ -391,12 +391,12 @@ fun allocateArray(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
     instruction(b, A.LslImm(word, length, shift, A.W64))
     instruction(b, A.AddImm(word, word, Rt.headerBytes + Rt.classStep, A.W64))
     instruction(b, A.LsrImm(word, word, 4, A.W64))
-    instruction(b, A.Adrp(cursor, Asm.page(d, al.classes)))
-    instruction(b, A.Ldr(cursor, PageOffset(cursor, Asm.pageOffset(d, al.classes)), A.W64))
+    instruction(b, A.Adrp(cursor, al.classes))
+    instruction(b, A.Ldr(cursor, PageOffset(cursor, al.classes), A.W64))
     instruction(b, A.Ldrb(word, Indexed(cursor, word)))
     instruction(b, A.LslImm(word, word, 6, A.W64))
-    instruction(b, A.Adrp(cursor, Asm.page(d, al.cursors)))
-    instruction(b, A.Ldr(cursor, PageOffset(cursor, Asm.pageOffset(d, al.cursors)), A.W64))
+    instruction(b, A.Adrp(cursor, al.cursors))
+    instruction(b, A.Ldr(cursor, PageOffset(cursor, al.cursors), A.W64))
     instruction(b, A.Add(cursor, cursor, word, A.W64))
     instruction(b, A.Ldr(word, Offset(cursor, Rt.cursorFree), A.W64))
     instruction(b, A.Cbz(word, slow, A.W64))
@@ -465,7 +465,7 @@ fun allocateArray(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
 -- by, the panic test every call gets, and back.
 fun stub(b : Code, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
          tag : Int, n : Int, dest : Reg, al : A.Allocation,
-         safepoint : Option String) -> Unit {
+         safepoint : Option Asm.Symbol) -> Unit {
     emit(b, Label(allocationLabel(d, tag, n, "s")))
     var k = 0
     for arg in al.args {
@@ -473,7 +473,7 @@ fun stub(b : Code, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
         match arg {
             Constant(0) -> instruction(b, A.Mov(r, A.xzr, A.W64))
             Constant(value) -> instruction(b, A.MovConst(r, value))
-            AddressOf(sym) -> symbolInto(b, d, r, sym)
+            AddressOf(sym) -> symbolInto(b, r, sym)
         }
         k = k + 1
     }
@@ -483,8 +483,8 @@ fun stub(b : Code, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
 -- The call that ends a stub, its frame-table label, the panic test every call
 -- gets, and the way back with the result in `dest`.
 fun returnFromStub(b : Code, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
-                   tag : Int, n : Int, dest : Reg, slow : String,
-                   safepoint : Option String) -> Unit {
+                   tag : Int, n : Int, dest : Reg, slow : Asm.Symbol,
+                   safepoint : Option Asm.Symbol) -> Unit {
     let failed = allocationLabel(d, tag, n, "p")
     instruction(b, A.Bl(slow))
     match safepoint {
@@ -492,8 +492,8 @@ fun returnFromStub(b : Code, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
         None -> {}
     }
     let state = Asm.runtimeFor(d, Rt.processState)
-    instruction(b, A.Adrp(scratch, Asm.page(d, state)))
-    instruction(b, A.Ldr(scratch, PageOffset(scratch, Asm.pageOffset(d, state)), A.W32))
+    instruction(b, A.Adrp(scratch, state))
+    instruction(b, A.Ldr(scratch, PageOffset(scratch, state), A.W32))
     instruction(b, A.Cbnz(scratch, failed, A.W32))
     if !A.sameRegister(dest, A.x0) { instruction(b, A.Mov(dest, A.x0, A.W64)) }
     instruction(b, A.B(allocationLabel(d, tag, n, "r")))
@@ -797,7 +797,7 @@ fun emitEntry(asm : Asm.Asm, m : Module, main : String, sites : Int,
     instruction(b, A.Str(Physical(Gp, 30), Offset(A.sp, 24), A.W64))
     instruction(b, A.AddImm(Physical(Gp, 29), A.sp, 16, A.W64))
     instruction(b, A.Bl(Asm.symbolFor(d, m.early)))
-    symbolInto(b, d, A.x0, Asm.runtimeFor(d, Rt.processState))
+    symbolInto(b, A.x0, Asm.runtimeFor(d, Rt.processState))
     instruction(b, A.Ldr(A.x0, Offset(A.x0, 0), A.W64))
     instruction(b, A.Cbnz(A.x0, Asm.localLabel(d, "entry_done"), A.W64))
 
@@ -812,12 +812,12 @@ fun emitEntry(asm : Asm.Asm, m : Module, main : String, sites : Int,
     -- global and every literal is live for the whole run, so the mask is all
     -- ones and this frame sits at the bottom of the chain until the process
     -- exits.
-    symbolInto(b, d, A.x0, Asm.globalsFrame(d))
-    symbolInto(b, d, Physical(Gp, 1), Asm.rootsSymbol(d))
+    symbolInto(b, A.x0, Asm.globalsFrame(d))
+    symbolInto(b, Physical(Gp, 1), Asm.rootsSymbol(d))
     instruction(b, A.MovConst(Physical(Gp, 2), asm.roots))
-    symbolInto(b, d, Physical(Gp, 3), Asm.messageSymbol(asm, "<globals>"))
+    symbolInto(b, Physical(Gp, 3), Asm.messageSymbol(asm, "<globals>"))
     call(b, d, "turkey_root_enter")
-    symbolInto(b, d, A.x0, Asm.globalsFrame(d))
+    symbolInto(b, A.x0, Asm.globalsFrame(d))
     -- Not `mov x1, #-1`: `movn` is the instruction that spells it, and going
     -- through the assembler's alias would be one more thing to be wrong about.
     instruction(b, A.MovN(Physical(Gp, 1), 0))
@@ -826,7 +826,7 @@ fun emitEntry(asm : Asm.Asm, m : Module, main : String, sites : Int,
     -- The frame table, before anything allocates: the first collection may
     -- happen inside the first `turkey_string_new` below, and a collection that
     -- cannot read the table sees no frame's roots at all.
-    symbolInto(b, d, A.x0, Asm.frameTableSymbol(d))
+    symbolInto(b, A.x0, Asm.frameTableSymbol(d))
     call(b, d, "turkey_frame_table_register")
 
     -- Each literal's `TurkeyString`, built once and cached in its slot. This
@@ -834,10 +834,10 @@ fun emitEntry(asm : Asm.Asm, m : Module, main : String, sites : Int,
     -- makes it not a safepoint.
     let ordered = byIndex(asm.literals)
     for var i = 0; i < len(ordered); i = i + 1 {
-        symbolInto(b, d, A.x0, Asm.literalName(d, i))
+        symbolInto(b, A.x0, Asm.literalName(d, i))
         instruction(b, A.MovConst(Physical(Gp, 1), byteLength(ordered[i])))
         call(b, d, "turkey_string_new")
-        symbolInto(b, d, Physical(Gp, 1), Asm.rootsSymbol(d))
+        symbolInto(b, Physical(Gp, 1), Asm.rootsSymbol(d))
         storeAt(b, A.x0, Physical(Gp, 1), 8 * Asm.literalSlot(asm, ordered[i]))
     }
 
@@ -880,11 +880,11 @@ fun emitEntry(asm : Asm.Asm, m : Module, main : String, sites : Int,
 -- The counters to `Sites.counterFile`, before the program's ending is
 -- reported: `creat`, which is not variadic as `open` is, then one `write`.
 fun writeSites(b : Code, d : Asm.Dialect, sites : Int) -> Unit {
-    symbolInto(b, d, A.x0, Asm.localLabel(d, "alloc_sites_file"))
+    symbolInto(b, A.x0, Asm.localLabel(d, "alloc_sites_file"))
     instruction(b, A.MovConst(Physical(Gp, 1), 420))
     call(b, d, "creat")
     instruction(b, A.Sxtw(A.x0, A.x0))
-    symbolInto(b, d, Physical(Gp, 1), Asm.runtimeFor(d, "turkey_alloc_sites"))
+    symbolInto(b, Physical(Gp, 1), Asm.runtimeFor(d, "turkey_alloc_sites"))
     instruction(b, A.MovConst(Physical(Gp, 2), 8 * (sites + 1)))
     call(b, d, "write")
 }
@@ -923,9 +923,9 @@ fun emitDefinitions(m : Module, asm : Asm.Asm, b : Code) -> Unit {
 -- A symbol's address, in a register: the page, then the offset within it.
 -- The same pair `Turkey.Select.address` emits, for code the emitter writes
 -- itself rather than code selection chose.
-fun symbolInto(b : Code, d : Asm.Dialect, r : Reg, sym : String) -> Unit {
-    instruction(b, A.Adrp(r, Asm.page(d, sym)))
-    instruction(b, A.AddLo(r, r, Asm.pageOffset(d, sym)))
+fun symbolInto(b : Code, r : Reg, sym : Asm.Symbol) -> Unit {
+    instruction(b, A.Adrp(r, sym))
+    instruction(b, A.AddLo(r, r, sym))
 }
 
 fun call(b : Code, d : Asm.Dialect, name : String) -> Unit =

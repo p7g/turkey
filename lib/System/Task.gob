@@ -1,0 +1,99 @@
+module System.Task (Task, Spawn, runScope, spawn, join, yield)
+
+-- Tasks: functions that run concurrently with the code that started them,
+-- each suspending where it waits -- in `join`, in `yield`, at any depth of
+-- ordinary calls -- so that others run meanwhile. One worker runs them all,
+-- so tasks interleave but never run in parallel, and nothing else runs between
+-- two suspension points of one task.
+--
+-- Every task belongs to a scope, and a scope ends only when every task started
+-- in it has finished:
+--
+--     let (a, b) = runScope(do {
+--         let a = spawn(fun() = fetch("a"))?
+--         let b = spawn(fun() = fetch("b"))?
+--         pure((a, b))
+--     })
+--     print(join(a) + join(b))
+--
+-- The scope is never a value a program can hold. `spawn` is a `Spawn`
+-- computation, which only `runScope` runs, giving it the scope; so a task can
+-- only be started inside a `runScope`, and no scope outlives its `runScope`.
+-- A `Spawn` value carried out of one runs in whichever `runScope` runs it
+-- next.
+--
+-- Scheduling is cooperative. A task that computes without waiting or yielding
+-- holds the worker until it finishes, and there is no cancellation: a scope
+-- whose task never finishes never ends. A panic in a task ends the program, as
+-- a panic anywhere does; a task's recoverable errors are its result.
+
+import Turkey.Coroutine as Co
+import Turkey.Scheduler as Scheduler
+
+-- A task started by `spawn`, and its result once it has one.
+type Task a = Task { result : Option a, waiters : Array Co.Coroutine }
+
+type Scope = Scope { unfinished : Int, waiters : Array Co.Coroutine }
+
+-- A computation that may start tasks: run by `runScope`, sequenced with `?`.
+type Spawn a = Spawn(fun(Scope) -> a)
+
+instance Functor Spawn {
+    fun map(Spawn(run), f) = Spawn(fun(scope) = f(run(scope)))
+}
+
+instance Applicative Spawn {
+    fun pure(value) = Spawn(fun(_) = value)
+}
+
+instance Monad Spawn {
+    fun bind(Spawn(run), f) = Spawn(fun(scope) {
+        let Spawn(rest) = f(run(scope))
+        rest(scope)
+    })
+}
+
+-- Run `body`, then wait for every task it started; the result is `body`'s.
+fun runScope(body : Spawn a) -> a {
+    let Spawn(run) = body
+    let scope = Scope { unfinished = 0, waiters = [] }
+    let result = run(scope)
+    Scheduler.waitUntil(fun() = scope.unfinished == 0,
+                        fun(c) = Array.push(scope.waiters, c))
+    result
+}
+
+-- Start `f` as a task in the enclosing scope. It runs when the code that
+-- started it next waits or yields.
+fun spawn(f : fun() -> a) -> Spawn (Task a) = Spawn(fun(scope) {
+    let task = Task { result = None, waiters = [] }
+    scope.unfinished = scope.unfinished + 1
+    Scheduler.ready(Co.new(fun() {
+        task.result = Some(f())
+        wake(task.waiters)
+        task.waiters = []
+        scope.unfinished = scope.unfinished - 1
+        if scope.unfinished == 0 {
+            wake(scope.waiters)
+            scope.waiters = []
+        }
+    }))
+    task
+})
+
+-- `task`'s result, waiting for it to finish if it has not.
+fun join(task : Task a) -> a {
+    Scheduler.waitUntil(fun() = Option.isSome(task.result),
+                        fun(c) = Array.push(task.waiters, c))
+    match task.result {
+        Some(value) -> value
+        None -> Prim.error("a joined task has no result")
+    }
+}
+
+-- Let the other tasks that can run go first.
+fun yield() -> Unit = Scheduler.yield()
+
+fun wake(waiters : Array Co.Coroutine) -> Unit {
+    for c in waiters { Scheduler.ready(c) }
+}

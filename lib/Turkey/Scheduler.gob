@@ -1,0 +1,75 @@
+module Turkey.Scheduler (ready, waitUntil, yield)
+
+-- Which task runs next, on one worker.
+--
+-- A task is a coroutine (`Turkey.Coroutine`), and every task is resumed from
+-- one place: a loop on the program's own stack, which runs whenever code on
+-- that stack has to wait. Code on a task's stack never runs the loop; when it
+-- has to wait it suspends, which returns to the loop. So the program's own
+-- stack is never a task, and keeps its full size for deep recursion.
+--
+-- Scheduling is cooperative: a task runs until it waits or yields, and one
+-- that computes without doing either holds the worker until it finishes.
+--
+-- What a task waits for keeps a list of the tasks waiting on it and makes them
+-- ready when the wait is over; nothing here knows what is being waited for.
+
+import Turkey.Coroutine as Co
+
+-- The tasks that can run, oldest first, from `head` on.
+var runnable : Array Co.Coroutine = []
+var head = 0
+
+-- Make `c` runnable: it will be resumed in its turn.
+fun ready(c : Co.Coroutine) -> Unit = Array.push(runnable, c)
+
+fun next() -> Option Co.Coroutine {
+    if head == len(runnable) {
+        if head > 0 {
+            runnable = []
+            head = 0
+        }
+        return None
+    }
+    let c = runnable[head]
+    head = head + 1
+    Some(c)
+}
+
+-- Return once `done` holds. A task gives `register` itself, so that whatever
+-- makes `done` hold can make it ready, and suspends until then; code on the
+-- program's own stack runs the other tasks meanwhile.
+fun waitUntil(done : fun() -> Bool, register : fun(Co.Coroutine) -> Unit) -> Unit {
+    match Co.running() {
+        Some(c) -> while !done() {
+            register(c)
+            Co.suspend()
+        }
+        None -> while !done() {
+            match next() {
+                Some(c) -> Co.resume(c)
+                -- Nothing can make `done` hold: every task is waiting on
+                -- another, or on the program's own code, which is waiting here.
+                None -> Prim.error("deadlock: every task is waiting")
+            }
+        }
+    }
+}
+
+-- Let the other runnable tasks run before going on. On the program's own
+-- stack, that is each task runnable now, once.
+fun yield() -> Unit = match Co.running() {
+    Some(c) -> {
+        ready(c)
+        Co.suspend()
+    }
+    None -> {
+        let count = len(runnable) - head
+        for var i = 0; i < count; i = i + 1 {
+            match next() {
+                Some(c) -> Co.resume(c)
+                None -> {}
+            }
+        }
+    }
+}

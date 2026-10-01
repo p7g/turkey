@@ -289,17 +289,29 @@ int main(int argc, char **argv) {
         _Alignas(16) uintptr_t stack[16] = {0};
         stack[0] = (uintptr_t)&stack[8]; stack[1] = 1234;
         stack[6] = (uintptr_t)child;
+        /* A second stack, parked at its innermost record, of the same shape. */
+        _Alignas(16) uintptr_t other[16] = {0};
+        other[0] = (uintptr_t)&other[8]; other[1] = 1234;
+        other[6] = (uintptr_t)child;
         int64_t offset = -16;
         Entry entry = {1234, 1, &offset};
-        /* The collector's state with this frame table and stack in it: the
-           frame table, its length, the mark epoch and the stack's top. */
-        int64_t state[16];
+        /* The stack records: the outermost record a walk may reach, the
+           record the stack is parked at, and the next on the list. */
+        uintptr_t parked[3] = {(uintptr_t)&other[15], (uintptr_t)other, 0};
+        uintptr_t running[3] = {(uintptr_t)&stack[15], 0, (uintptr_t)parked};
+        /* The collector's state with this frame table and these stacks in it:
+           the frame table, its length, the mark epoch, the stack list and the
+           running stack. */
+        int64_t state[17];
         memcpy(state, turkey_heap_state(), sizeof state);
         state[8] = (int64_t)(uintptr_t)&entry;
         state[9] = 1;
-        state[10] = (int64_t)(uintptr_t)&stack[15];
+        state[10] = (int64_t)(uintptr_t)running;
+        state[16] = (int64_t)(uintptr_t)running;
         int64_t native_phase = 0;
         if (!strcmp(which, "native-invalid")) stack[6] = 4096;
+        if (!strcmp(which, "native-parked-invalid")) other[6] = 4096;
+        if (!strcmp(which, "native-unlisted")) state[10] = (int64_t)(uintptr_t)parked;
         if (!strcmp(which, "native-offset")) offset = INT64_MIN;
         if (!strcmp(which, "native-table")) state[8] = 0;
         if (!strcmp(which, "native-unmarked")) { native_phase = 1; state[7] = 1; }
@@ -375,6 +387,8 @@ CASES = {
     "reclaimed": "invalid traced pointer",
     "allocation-stops": "invalid object header",
     "native-invalid": "invalid traced pointer",
+    "native-parked-invalid": "invalid traced pointer",
+    "native-unlisted": "running stack not on the stack list",
     "native-offset": "invalid native root offset",
     "native-table": "invalid native frame table",
     "native-unmarked": "reachable object is unmarked",

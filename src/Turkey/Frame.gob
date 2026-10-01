@@ -36,7 +36,6 @@ module Turkey.Frame (
 -- the 13% the survey measured the shadow stack costing.
 
 import Data.Map as Map
-import Data.Set as Set
 import Turkey.Arm64 as A
 import Turkey.Arm64 (Bank(..), Mem(..))
 import Turkey.Regalloc as Regalloc
@@ -142,23 +141,45 @@ fun even(n : Int) -> Int = n + n % 2
 -- A heap header's size, before a frame object's payload.
 let objectHeader : Int = 24
 
--- The callee-saved registers some value was coloured into, in each file,
--- ascending. `x19`-`x28` and `d8`-`d15`; only the low 64 bits of a `d` are
+-- The callee-saved registers this function must save, in each file,
+-- ascending: the ones some value was coloured into, and the ones a call in it
+-- clobbers. `x19`-`x28` and `d8`-`d15`; only the low 64 bits of a `d` are
 -- preserved, which is all a double has.
+--
+-- The second half is not covered by the first. A call whose convention lets
+-- the callee destroy `x19` (`A.PreservesNone`) leaves whatever the callee put
+-- there in a function that may never have coloured anything into `x19` --
+-- and that function's own caller expects its `x19` back.
 fun calleeSaved(a : Regalloc.Allocation) -> (Array Int, Array Int) {
-    let gp = Set.new()
-    let fp = Set.new()
+    var gp = 0
+    var fp = 0
     let of_ = a.colouring.of_
     for var id = 0; id < len(of_); id = id + 1 {
         let r = of_[id]
         if r >= 0 {
             match A.bankOf(a.func.reps[id]) {
-                Gp -> if r >= 19 && r <= 28 { Set.add(gp, r) }
-                Fp -> if r >= 8 && r <= 15 { Set.add(fp, r) }
+                Gp -> { gp = Int.or(gp, Int.shl(1, r)) }
+                Fp -> { fp = Int.or(fp, Int.shl(1, r)) }
             }
         }
     }
-    (Array.sort(Set.elements(gp)), Array.sort(Set.elements(fp)))
+    for block in a.func.blocks {
+        for i in block.insts {
+            gp = Int.or(gp, A.callClobbers(i.op, Gp))
+            fp = Int.or(fp, A.callClobbers(i.op, Fp))
+        }
+    }
+    (registersIn(Int.and(gp, A.calleeSavedMask(Gp))),
+     registersIn(Int.and(fp, A.calleeSavedMask(Fp))))
+}
+
+-- The register numbers in `mask`, ascending.
+fun registersIn(mask : Int) -> Array Int {
+    let out = []
+    for var r = 0; r < 32; r = r + 1 {
+        if Int.and(Int.shr(mask, r), 1) != 0 { Array.push(out, r) }
+    }
+    out
 }
 
 -- Where a frame slot is, from `sp`. `None` for memory that is not a frame slot.

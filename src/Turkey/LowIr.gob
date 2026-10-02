@@ -1,5 +1,5 @@
 module Turkey.LowIr (
-    BinOp(..), CmpOp(..), Conv(..), Callee(..), Op(..), Low(..), AddressOf(..),
+    BinOp(..), CmpOp(..), Conv(..), AtomicOp(..), Callee(..), Op(..), Low(..), AddressOf(..),
     low, effectsOf, opUses, mapUses, opResultRep, checkReps, checkCalls, showOpName,
     Allocation(..), summarize, allocatingOp,
     Builder(..), builder, into, emit, effect, terminate, block, param,
@@ -58,6 +58,14 @@ type BinOp = Add | Sub | Mul | Div | Rem | And | Or | Xor | Shl | Shr | ShrU
 -- negation because a machine has them and instruction selection would only
 -- have to put them back.
 type CmpOp = Eq | Ne | Lt | Le | Gt | Ge
+
+-- An atomic access to an `Int` in raw memory, its operands a base and a byte
+-- offset and then: `Cas` the expected value and the new one, answering the
+-- value it found, which is the expected one exactly when it stored; `Add` the
+-- addend, answering the value before; `LoadAcquire` nothing; `StoreRelease`
+-- the value. Each is ordered as the C11 sequentially consistent operations
+-- are on arm64: no access moves across it in either direction.
+type AtomicOp = Cas | FetchAdd | LoadAcquire | StoreRelease
 
 type Conv
     = IntToFloat | FloatToInt
@@ -160,6 +168,7 @@ type Op
     -- `ArrayGet` has to emit an `Lsl` first and these do not.
     | PtrLoad(Value, Value, RepClass)
     | PtrStore(Value, Value, Value, RepClass)
+    | Atomic(AtomicOp, Array Value)
     -- A `var`'s cell.
     | CellNew(Value)
     | CellLoad(Value)
@@ -332,6 +341,9 @@ fun effectsOf(op : Op) -> Effects = match op {
     -- make a dead load undeletable to buy a guarantee that is not being made.
     PtrLoad(_, _, _) -> Ssa.reads_()
     PtrStore(_, _, _, _) -> Ssa.writes()
+    -- Every one writes, the acquiring load included: it orders the accesses
+    -- after it, so it may be neither deleted nor moved.
+    Atomic(_, _) -> combine(Ssa.reads_(), Ssa.writes())
     CellNew(_) -> Ssa.allocates()
     CellLoad(_) -> Ssa.reads_()
     CellStore(_, _) -> Ssa.writes()
@@ -379,6 +391,7 @@ fun opUses(op : Op) -> Array Value = match op {
     ArrayNew(a, b, _) -> [a, b]
     PtrLoad(a, b, _) -> [a, b]
     PtrStore(a, b, c, _) -> [a, b, c]
+    Atomic(_, operands) -> operands
     ArrayGet(a, b) -> [a, b]
     ArraySet(a, b, c) -> [a, b, c]
     ArrayLength(a) -> [a]
@@ -429,6 +442,7 @@ fun mapUses(op : Op, f : fun(Value) -> Value) -> Op = match op {
     ArrayNew(a, b, c) -> ArrayNew(f(a), f(b), c)
     PtrLoad(a, b, c) -> PtrLoad(f(a), f(b), c)
     PtrStore(a, b, c, d) -> PtrStore(f(a), f(b), f(c), d)
+    Atomic(o, operands) -> Atomic(o, Array.map(operands, f))
     ArrayGet(a, b) -> ArrayGet(f(a), f(b))
     ArraySet(a, b, c) -> ArraySet(f(a), f(b), f(c))
     ArrayLength(a) -> ArrayLength(f(a))
@@ -486,6 +500,8 @@ fun opResultRep(op : Op) -> Option Rep = match op {
     -- one to follow.
     PtrLoad(_, _, c) -> Some(Ssa.untraced(c))
     PtrStore(_, _, _, _) -> Some(Ssa.untraced(Unit))
+    Atomic(StoreRelease, _) -> Some(Ssa.untraced(Unit))
+    Atomic(_, _) -> Some(Ssa.untraced(I64))
     ArrayLength(_) -> Some(Ssa.untraced(I64))
     CellNew(_) -> Some(Ssa.traced(Ptr))
     ClosureNew(_, _) -> Some(Ssa.traced(Ptr))
@@ -549,6 +565,21 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Array String {
         PtrLoad(base, off, _) -> {
             wantClass(f, out, base, Ptr, "the base of a raw load")
             wantClass(f, out, off, I64, "a raw offset")
+        }
+        Atomic(o, operands) -> {
+            let arity = match o {
+                Cas -> 4
+                FetchAdd | StoreRelease -> 3
+                LoadAcquire -> 2
+            }
+            if len(operands) != arity {
+                Array.push(out, "an atomic access with the wrong number of operands")
+            } else {
+                wantClass(f, out, operands[0], Ptr, "the base of an atomic access")
+                for var k = 1; k < arity; k = k + 1 {
+                    wantClass(f, out, operands[k], I64, "an operand of an atomic access")
+                }
+            }
         }
         Convert(PtrToInt, a) -> {
             wantClass(f, out, a, Ptr, "the operand of a pointer-to-integer")
@@ -798,6 +829,7 @@ fun showOpName(op : Op) -> String = match op {
     ArrayNew(_, _, _) -> "array.new"
     PtrLoad(_, _, _) -> "ptr.load"
     PtrStore(_, _, _, _) -> "ptr.store"
+    Atomic(o, _) -> show(o)
     ArrayGet(_, _) -> "array.get"
     ArraySet(_, _, _) -> "array.set"
     ArrayLength(_) -> "array.length"
@@ -857,6 +889,7 @@ instance Show Op {
         "ptr.load " + v(a) + ", " + v(off) + ", " + show(c)
     PtrStore(a, off, x, c) ->
         "ptr.store " + v(a) + ", " + v(off) + ", " + v(x) + ", " + show(c)
+    Atomic(o, operands) -> show(o) + " " + String.join(Array.map(operands, v), ", ")
     ArrayGet(a, i) -> "array.get " + v(a) + ", " + v(i)
     ArraySet(a, i, x) -> "array.set " + v(a) + ", " + v(i) + ", " + v(x)
     ArrayLength(a) -> "array.length " + v(a)
@@ -928,6 +961,15 @@ instance Show CmpOp {
     Le -> "le"
     Gt -> "gt"
     Ge -> "ge"
+  }
+}
+
+instance Show AtomicOp {
+  fun show(o) = match o {
+    Cas -> "atomic.cas"
+    FetchAdd -> "atomic.add"
+    LoadAcquire -> "atomic.load"
+    StoreRelease -> "atomic.store"
   }
 }
 

@@ -1,4 +1,4 @@
-module System.Parallel (workers, map, each, mapInOrder, graph, graphWith)
+module System.Parallel (workers, map, mapWith, each, mapInOrder, graph, graphWith)
 
 -- Work spread over the workers that run tasks (`System.Task`): a function of
 -- each element of an array, and a graph of steps each run once the steps it
@@ -34,16 +34,27 @@ fun chunkSize(n : Int) -> Int {
 fun lesser(a : Int, b : Int) -> Int = if a < b { a } else { b }
 
 -- `f` of each of `xs`, in order.
-fun map(xs : Array a, f : fun(a) -> b) -> Array b {
-    if workers() < 2 { return Array.map(xs, f) }
+fun map(xs : Array a, f : fun(a) -> b) -> Array b =
+    if workers() < 2 { Array.map(xs, f) } else { mapWith(xs, fun() = {}, fun(_, x) = f(x)) }
+
+-- `map`, with state of each chunk's own: `perChunk()` is made once for the
+-- elements one task runs, in turn, and each call is given it. Scratch space
+-- worth reusing across elements is the use, and so a call's result must not
+-- depend on what an earlier one left in it.
+fun mapWith(xs : Array a, perChunk : fun() -> s, f : fun(s, a) -> b) -> Array b {
+    if workers() < 2 {
+        let state = perChunk()
+        return Array.map(xs, f(state, _))
+    }
     let out : Array (Option b) = Array.filled(len(xs), None)
     let size = chunkSize(len(xs))
     Task.runScope(do {
         for var start = 0; start < len(xs); start = start + size {
             let from = start
             let _ = Task.spawn(fun() {
+                let state = perChunk()
                 let to = lesser(from + size, len(xs))
-                for var i = from; i < to; i = i + 1 { out[i] = Some(f(xs[i])) }
+                for var i = from; i < to; i = i + 1 { out[i] = Some(f(state, xs[i])) }
             })?
         }
         pure(())

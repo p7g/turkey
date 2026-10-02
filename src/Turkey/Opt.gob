@@ -84,6 +84,9 @@ import Turkey.Source (Span)
 import Turkey.Types as Ty
 import Turkey.Types (VarCell(..), TBottom)
 import System.IO as IO
+import System.Parallel as Parallel
+import Algorithm.Hash (fnv1a)
+import Std.Classes (Hasher(..))
 import System.Time as Time
 
 -- How large a body may be and still be inlined, counted as `sizeOf_` counts.
@@ -281,13 +284,13 @@ type Reducer = Reducer {
     active : Array String,
     -- The size and the transfer question of each reduced body, beside the body
     -- itself: both are questions about the callee, so both are asked once per
-    -- binding rather than once per call site.
+    -- binding rather than once per call site. These, and `reduced` below,
+    -- hold the answers about this component's own bindings, which depend on
+    -- how far it has got; `cache` holds those about finished components'.
     sizes : Map String Int,
     moves : Map String Bool,
     ends  : Map String Bool,
-    -- `size` of each body *as written*, which is what the speculative ceiling
-    -- is checked against before the body is reduced at all.
-    wrote : Map String Int,
+    cache : Cache,
     -- A speculative large inline may reduce ordinary small calls inside its
     -- residual, but does not recursively speculate about another large call.
     speculating : Bool,
@@ -306,10 +309,60 @@ type Reducer = Reducer {
     -- could be written through.
     unwritten : Map String Core,
     written : Set.Set String,
-    -- For the join points case-of-case invents. Per program and in traversal
-    -- order, so it is deterministic and a golden can hold it.
+    -- Where the names `fresh` invents come from: a count, and a suffix naming
+    -- the scope it counts in -- the component being reduced, or the
+    -- instantiation `bodyOf` is reducing. A name is so a function of what is
+    -- being reduced, not of what any other component reduced first, which is
+    -- what keeps the output the same however the components are scheduled.
+    -- `usedNames` is the input's, which a name must not repeat.
     counter : Int,
+    scope : String,
     usedNames : Set.Set String,
+    -- Which component each binding is in, the one being reduced, and the
+    -- results of finished ones (`reduceProgram`). `reduced`, `constants` and
+    -- `unwritten` above hold only this component's own; another's are its
+    -- `Done`, which every component this one depends on has finished.
+    homes : Homes,
+    component : Int,
+    finished : fun(Int) -> Done,
+}
+
+-- Answers about bindings of finished components, kept by a worker across the
+-- components it reduces (`Parallel.graphWith`): each is a function of the
+-- binding, or of the instantiation, alone, so whichever component asked
+-- first, the answer is the same. `wrote` is the size of each body *as
+-- written*, which is what the speculative ceiling is checked against before
+-- the body is reduced at all.
+type Cache = Cache {
+    reduced : Map String Core,
+    sizes   : Map String Int,
+    moves   : Map String Bool,
+    ends    : Map String Bool,
+    wrote   : Map String Int,
+}
+
+fun newCache() -> Cache = Cache {
+    reduced = Map.new(), sizes = Map.new(), moves = Map.new(), ends = Map.new(),
+    wrote = Map.new(),
+}
+
+-- The component of each binding, and of just the bindings that can be a
+-- constant (`constant`) or an unwritten `var` (`unwrittenOf`), which are few:
+-- every mention of a variable asks, and most variables are neither.
+type Homes = Homes {
+    all       : Map String Int,
+    constant  : Map String Int,
+    unwritten : Map String Int,
+}
+
+-- What reducing one component made: its bindings' reduced values by index,
+-- and the memo entries later components read.
+type Done = Done {
+    values    : Array (Int, Core),
+    reduced   : Map String Core,
+    constants : Map String CBind,
+    unwritten : Map String Core,
+    cost      : Int,
 }
 
 fun newReducer(program : CProgram, decls : DeclTable) -> Reducer {
@@ -333,11 +386,65 @@ fun newReducer(program : CProgram, decls : DeclTable) -> Reducer {
         breakers = loopBreakers(program), decls = decls, bindings = bindings,
         dicts = Methods.dictionaries(program.dicts),
         active = Array.new(8), sizes = Map.new(), moves = Map.new(),
-        ends = Map.new(), wrote = Map.new(),
+        ends = Map.new(), cache = newCache(),
         speculating = False, reduced = Map.new(), constants = Map.new(),
         unwritten = Map.new(), written = mentioned(all), counter = 0,
-        usedNames = used,
+        scope = "", usedNames = used,
+        homes = Homes { all = Map.new(), constant = Map.new(), unwritten = Map.new() },
+        component = -1,
+        finished = fun(_) = oops("no component has finished"),
     }
+}
+
+-- A reducer for component `c`: what `base` shares, which nothing writes
+-- while components are reduced, and memo tables of its own.
+fun forComponent(base : Reducer, c : Int, finished : fun(Int) -> Done, cache : Cache)
+        -> Reducer = Reducer {
+    breakers = base.breakers, decls = base.decls, bindings = base.bindings,
+    dicts = base.dicts, active = Array.new(8), sizes = Map.new(), moves = Map.new(),
+    ends = Map.new(), cache = cache, speculating = False, reduced = Map.new(),
+    constants = Map.new(), unwritten = Map.new(), written = base.written,
+    counter = 0, scope = "." + Int.toString(c), usedNames = base.usedNames,
+    homes = base.homes, component = c, finished = finished,
+}
+
+-- Whether `name` is this component's own.
+fun owned(r : Reducer, name : String) -> Bool = match Map.get(r.homes.all, name) {
+    Some(c) -> c == r.component
+    None -> False
+}
+
+-- The finished component `name` is in, if it is not this one's.
+fun doneOf(r : Reducer, name : String) -> Option Done = match Map.get(r.homes.all, name) {
+    Some(c) -> if c == r.component { None } else { Some(r.finished(c)) }
+    None -> None
+}
+
+-- `name`'s reduced body under `key`: this component's, or, for a
+-- monomorphic key, the finished component's that `name` is in.
+fun reducedOf(r : Reducer, name : String, key : String) -> Option Core =
+    if owned(r, name) { Map.get(r.reduced, key) } else {
+        match Map.get(r.cache.reduced, key) {
+            Some(found) -> Some(found)
+            -- A monomorphic key is the name and a bar, and only those are
+            -- published.
+            None -> if String.byteLength(key) != String.byteLength(name) + 1 { None } else {
+                match doneOf(r, name) {
+                    Some(done) -> Map.get(done.reduced, key)
+                    None -> None
+                }
+            }
+        }
+    }
+
+fun constantOf(r : Reducer, name : String) -> Option CBind = match Map.get(r.homes.constant, name) {
+    Some(c) -> Map.get(if c == r.component { r.constants } else { r.finished(c).constants }, name)
+    None -> None
+}
+
+fun unwrittenOf(r : Reducer, name : String) -> Option Core = match Map.get(r.homes.unwritten, name) {
+    Some(c) -> Map.get(if c == r.component { r.unwritten } else { r.finished(c).unwritten }, name)
+    None -> None
 }
 
 -- `boot --timings`: how parallel `reduceProgram` could be. Off otherwise.
@@ -403,8 +510,18 @@ fun reportSchedule(graph : Map String (Set.Set String), components : Array (Arra
 -- is one term deep. Within a cycle there is no such order and the nesting can
 -- still happen, but it is then bounded by the size of the component rather than
 -- by the height of the whole graph.
+--
+-- A component waits only for the components it mentions, so components that do
+-- not depend on each other are reduced at once, one per worker
+-- (`Parallel.graphWith`). What makes that safe and the output the same however
+-- they are scheduled: a component writes only its own `Done`, which nothing
+-- reads until it has finished; it reads only finished components' and its
+-- own; the answers a worker keeps across components are about finished
+-- components, and so the same whoever asked first; and the names it invents
+-- are scoped to it (`fresh`). One component is reduced by one worker, in
+-- order, because within a cycle what is known depends on that order.
 fun reduceProgram(program : CProgram, decls : DeclTable) -> CProgram {
-    let r = newReducer(program, decls)
+    let base = newReducer(program, decls)
     let binds = Array.append(program.dicts, program.binds)
     let first = Map.new()
     for var i = 0; i < len(binds); i = i + 1 {
@@ -412,21 +529,53 @@ fun reduceProgram(program : CProgram, decls : DeclTable) -> CProgram {
             Map.put(first, binds[i].name, i)
         }
     }
-    let done = Map.new()
     let graph = callGraph(binds)
     let components = Deps.sccs(graph)
-    let costs : Array Int = []
-    for component in components {
+    for var c = 0; c < len(components); c = c + 1 {
+        for name in components[c] { Map.put(base.homes.all, name, c) }
+    }
+    -- A lambda stays a lambda however it is reduced, so only a binding that
+    -- is not one can come out atomic, and only a reference cell can be an
+    -- unwritten `var`.
+    for b in binds {
+        match Map.get(base.homes.all, b.name) {
+            Some(c) -> match b.value.kind {
+                CLam(_, _, _) -> {}
+                CRef(_) -> {
+                    Map.put(base.homes.unwritten, b.name, c)
+                    if !b.mutable { Map.put(base.homes.constant, b.name, c) }
+                }
+                _ -> if !b.mutable { Map.put(base.homes.constant, b.name, c) }
+            }
+            None -> {}
+        }
+    }
+    -- A component waits for the components it mentions, and on as many
+    -- workers as there are, runs alongside any it does not.
+    let dependsOn = fun(c) {
+        let on = Set.new()
+        for name in components[c] {
+            for callee in Set.elements(Map.getOr(graph, name, Set.new())) {
+                match Map.get(base.homes.all, callee) {
+                    Some(d) -> if d != c { Set.add(on, d) }
+                    None -> {}
+                }
+            }
+        }
+        Array.sort(Set.elements(on))
+    }
+    let reduceComponent = fun(cache, c, finished) {
         let started = if measuring { Time.monotonic() } else { 0 }
-        for name in component {
+        let r = forComponent(base, c, finished, cache)
+        let values = []
+        for name in components[c] {
             match Map.get(first, name) {
                 Some(index) -> {
                     let value = expr(r, binds[index].value)
-                    Map.put(done, index, value)
+                    Array.push(values, (index, value))
                     memoize(r, name, value)
                     if !binds[index].mutable && atomic(value) {
-                        Map.put(r.constants, name,
-                                withValue(binds[index], value))
+                        Map.put(r.constants, name, withValue(binds[index], value))
                     }
                     match value.kind {
                         CRef(initial) -> if atomic(initial) && !Set.contains(r.written, name) {
@@ -438,13 +587,21 @@ fun reduceProgram(program : CProgram, decls : DeclTable) -> CProgram {
                 None -> {}
             }
         }
-        if measuring { Array.push(costs, Time.monotonic() - started) }
+        Done { values = values, reduced = r.reduced, constants = r.constants,
+               unwritten = r.unwritten,
+               cost = if measuring { Time.monotonic() - started } else { 0 } }
     }
-    if measuring { reportSchedule(graph, components, costs) }
+    let made = Parallel.graphWith(len(components), dependsOn, newCache, reduceComponent)
+    if measuring { reportSchedule(graph, components, Array.map(made, fun(d) = d.cost)) }
+    let done = Map.new()
+    for d in made {
+        for (index, value) in d.values { Map.put(done, index, value) }
+    }
     -- A name bound twice has one entry in the graph, so its later bindings are
-    -- in no component. Nothing else can be missing.
+    -- in no component, and are reduced last, with every component finished.
+    let rest = forComponent(base, len(components), fun(c) = made[c], newCache())
     for var i = 0; i < len(binds); i = i + 1 {
-        if !Map.contains(done, i) { Map.put(done, i, expr(r, binds[i].value)) }
+        if !Map.contains(done, i) { Map.put(done, i, expr(rest, binds[i].value)) }
     }
     let split = len(program.dicts)
     let dicts = Array.new(split)
@@ -452,12 +609,12 @@ fun reduceProgram(program : CProgram, decls : DeclTable) -> CProgram {
         Array.push(dicts, withValue(program.dicts[i], Map.getOr(done, i,
             program.dicts[i].value)))
     }
-    let rest = Array.new(len(program.binds))
+    let others = Array.new(len(program.binds))
     for var i = 0; i < len(program.binds); i = i + 1 {
-        Array.push(rest, withValue(program.binds[i], Map.getOr(done, split + i,
+        Array.push(others, withValue(program.binds[i], Map.getOr(done, split + i,
             program.binds[i].value)))
     }
-    CProgram { dicts = dicts, binds = rest }
+    CProgram { dicts = dicts, binds = others }
 }
 
 -- Record a top-level binding's reduced body for `bodyOf`.
@@ -579,7 +736,7 @@ fun step(r : Reducer, e : Core) -> Option Core {
         CJoin(_, _, _, _, _) -> return specializeJoin(r, e)
         CIf(_, _, _) -> return knownCondition(e)
         CDeref(target) -> return match target.kind {
-            CVar(name) -> match Map.get(r.unwritten, name) {
+            CVar(name) -> match unwrittenOf(r, name) {
                 Some(initial) -> Some(mkCore(e.ty, e.span, initial.kind))
                 None -> None
             }
@@ -630,10 +787,9 @@ fun fresh(r : Reducer, hint : String) -> String {
     var settled = False
     while !settled {
         r.counter = r.counter + 1
-        name = "%" + hint + Int.toString(r.counter)
+        name = "%" + hint + Int.toString(r.counter) + r.scope
         if !Set.contains(r.usedNames, name) { settled = True }
     }
-    Set.add(r.usedNames, name)
     name
 }
 
@@ -660,7 +816,7 @@ fun constant(r : Reducer, e : Core) -> Option Core {
         CTyApp(_, _) -> True
         _ -> False
     }
-    match Map.get(r.constants, name) {
+    match constantOf(r, name) {
         Some(b) -> if applied == (len(b.binders) > 0) {
             Some(mkCore(e.ty, e.span, b.value.kind))
         } else { None }
@@ -763,22 +919,26 @@ fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
     -- Type instantiation is exempt: `reduceProgram` warms no key that names
     -- type arguments, so a cold one there means "not asked for yet" rather than
     -- "not its turn", and that nesting is bounded anyway.
+    let known = reducedOf(r, name, key)
     match targs {
-        None -> if !Map.contains(r.reduced, key) { return None }
+        None -> if Option.isNone(known) { return None }
         Some(_) -> {}
     }
     -- The *reduced* body drives the ordinary limit, not the written one. A
     -- small source body that expands to five hundred nodes is five hundred
     -- nodes at every call site.
-    let body = bodyOf(r, name, key, lam)
+    let body = match known {
+        Some(found) -> found
+        None -> bodyOf(r, name, key, lam)
+    }
     -- Both questions are about the *callee's* body, which `bodyOf` has already
     -- computed once and shares with every call site. Asking them here, before
     -- anything is copied, is what keeps a body that can never be inlined from
     -- being copied and substituted at every site that mentions it -- which was,
     -- measurably, most of the work this pass did on a program the size of the
     -- bootstrap compiler.
-    if movesOf(r, key, body) { return None }
-    let size = sizeOf(r, key, body)
+    if movesOf(r, name, key, body) { return None }
+    let size = sizeOf(r, name, key, body)
     if size > speculativeInlineLimit || (r.speculating && size > limit) {
         return None
     }
@@ -796,7 +956,7 @@ fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
     -- `Prim.error(message)` and nothing else, so inlining it costs the caller
     -- nothing -- and *not* inlining it would put a frame in every panic trace
     -- pointing at the standard library rather than at the code that failed.
-    if endsOf(r, key, body) && size > bottomInlineLimit { return None }
+    if endsOf(r, name, key, body) && size > bottomInlineLimit { return None }
     -- A copied callee body becomes part of this call site. Keep spans on
     -- caller-supplied arguments, but make every node copied from the callee
     -- blame the invocation if a later Core check rejects the residual.
@@ -824,7 +984,7 @@ fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
 -- Type instantiation copies a body without changing its shape, so this is asked
 -- of the name rather than of the key: every specialization of `name` has the
 -- same written size.
-fun written(r : Reducer, name : String) -> Int = match Map.get(r.wrote, name) {
+fun written(r : Reducer, name : String) -> Int = match Map.get(r.cache.wrote, name) {
     Some(found) -> found
     None -> {
         let bind = match Map.get(r.bindings, name) {
@@ -836,38 +996,47 @@ fun written(r : Reducer, name : String) -> Int = match Map.get(r.wrote, name) {
             _ -> bind.value
         }
         let found = sizeOf_(body)
-        Map.put(r.wrote, name, found)
+        Map.put(r.cache.wrote, name, found)
         found
     }
 }
 
-fun sizeOf(r : Reducer, key : String, body : Core) -> Int = match Map.get(r.sizes, key) {
-    Some(found) -> found
-    None -> {
-        let made = sizeOf_(body)
-        Map.put(r.sizes, key, made)
-        made
+fun sizeOf(r : Reducer, name : String, key : String, body : Core) -> Int {
+    let sizes = if owned(r, name) { r.sizes } else { r.cache.sizes }
+    match Map.get(sizes, key) {
+        Some(found) -> found
+        None -> {
+            let made = sizeOf_(body)
+            Map.put(sizes, key, made)
+            made
+        }
     }
 }
 
 -- `transfers` of a reduced body, once per binding rather than per site. Both
 -- are answers about the callee, and the callee is shared.
-fun movesOf(r : Reducer, key : String, body : Core) -> Bool = match Map.get(r.moves, key) {
-    Some(found) -> found
-    None -> {
-        let made = transfers(body, Set.new())
-        Map.put(r.moves, key, made)
-        made
+fun movesOf(r : Reducer, name : String, key : String, body : Core) -> Bool {
+    let moves = if owned(r, name) { r.moves } else { r.cache.moves }
+    match Map.get(moves, key) {
+        Some(found) -> found
+        None -> {
+            let made = transfers(body, Set.new())
+            Map.put(moves, key, made)
+            made
+        }
     }
 }
 
 -- `bottoms` of a reduced body, on the same terms as the other two.
-fun endsOf(r : Reducer, key : String, body : Core) -> Bool = match Map.get(r.ends, key) {
-    Some(found) -> found
-    None -> {
-        let made = bottoms(body)
-        Map.put(r.ends, key, made)
-        made
+fun endsOf(r : Reducer, name : String, key : String, body : Core) -> Bool {
+    let ends = if owned(r, name) { r.ends } else { r.cache.ends }
+    match Map.get(ends, key) {
+        Some(found) -> found
+        None -> {
+            let made = bottoms(body)
+            Map.put(ends, key, made)
+            made
+        }
     }
 }
 
@@ -877,21 +1046,40 @@ fun endsOf(r : Reducer, key : String, body : Core) -> Bool = match Map.get(r.end
 -- contains a loop breaker and a breaker is never inlined, so a chain of
 -- expansions cannot come back to a name it is already inside. It is here so
 -- that termination is a property of this function rather than of that argument.
+--
+-- Its names are invented in a scope of the key's own, and it is reduced as
+-- if no speculation were under way, so that the body is the same whichever
+-- component asks for it first, on whichever worker: each worker reduces it
+-- once.
 fun bodyOf(r : Reducer, name : String, key : String, lam : Core) -> Core =
-    match Map.get(r.reduced, key) {
+    match reducedOf(r, name, key) {
         Some(found) -> found
         None -> {
             let inner = match lam.kind {
                 CLam(_, body, _) -> body
                 _ -> oops("a callee whose value is not a lambda")
             }
+            let (counter, scope, speculating) = (r.counter, r.scope, r.speculating)
+            r.counter = 0
+            r.scope = ".k" + Int.toString(keyHash(key))
+            r.speculating = False
             Array.push(r.active, name)
             let made = expr(r, inner)
             discard(Array.pop(r.active))
-            Map.put(r.reduced, key, made)
+            r.counter = counter
+            r.scope = scope
+            r.speculating = speculating
+            Map.put(if owned(r, name) { r.reduced } else { r.cache.reduced }, key, made)
             made
         }
     }
+
+-- A key's FNV-1a hash, which names its scope: the same in every run.
+fun keyHash(key : String) -> Int {
+    let h = fnv1a()
+    hashInto(key, h)
+    digest(h)
+}
 
 -- Expose a literal record's lambda to beta. All sibling fields must be
 -- values: record construction evaluates them before the call.

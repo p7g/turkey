@@ -1,4 +1,4 @@
-module System.Parallel (workers, map, each, mapInOrder, graph)
+module System.Parallel (workers, map, each, mapInOrder, graph, graphWith)
 
 -- Work spread over the workers that run tasks (`System.Task`): a function of
 -- each element of an array, and a graph of steps each run once the steps it
@@ -125,7 +125,15 @@ fun mapInOrder(xs : Array a, f : fun(a) -> b, use : fun(Int, b) -> Unit) -> Unit
 -- One task per worker takes ready steps from a queue, rather than a task per
 -- step waiting on its dependencies: a waiting task holds its stack.
 fun graph(count : Int, dependsOn : fun(Int) -> Array Int,
-          run : fun(Int, fun(Int) -> b) -> b) -> Array b {
+          run : fun(Int, fun(Int) -> b) -> b) -> Array b =
+    graphWith(count, dependsOn, fun() = {}, fun(_, i, finished) = run(i, finished))
+
+-- `graph`, with state of each worker's own: `perWorker()` is made once for
+-- each task taking steps, and every step that task runs is given it. A cache
+-- of answers that do not depend on which steps have run is the use: a step
+-- may run on any worker, so what it finds there must not change its result.
+fun graphWith(count : Int, dependsOn : fun(Int) -> Array Int, perWorker : fun() -> s,
+              run : fun(s, Int, fun(Int) -> b) -> b) -> Array b {
     let g = Graph {
         results = Array.filled(count, None), waitingOn = Array.filled(count, 0),
         dependents = [], ready = [], next = 0, unfinished = count, waiters = [],
@@ -154,11 +162,11 @@ fun graph(count : Int, dependsOn : fun(Int) -> Array Int,
                            + " has not finished; a step may only read those it depends on")
     }
     if workers() < 2 {
-        steps(g, run, finished)
+        steps(g, perWorker(), run, finished)
     } else {
         Task.runScope(do {
             for var w = 0; w < workers(); w = w + 1 {
-                let _ = Task.spawn(fun() = steps(g, run, finished))?
+                let _ = Task.spawn(fun() = steps(g, perWorker(), run, finished))?
             }
             pure(())
         })
@@ -201,7 +209,8 @@ fun acyclic(g : Graph b, count : Int) -> Bool {
 }
 
 -- Run ready steps until every step has finished.
-fun steps(g : Graph b, run : fun(Int, fun(Int) -> b) -> b, finished : fun(Int) -> b) -> Unit {
+fun steps(g : Graph b, state : s, run : fun(s, Int, fun(Int) -> b) -> b,
+          finished : fun(Int) -> b) -> Unit {
     while True {
         Scheduler.waitUntil(fun() = g.next < len(g.ready) || g.unfinished == 0,
                             fun(c) = Array.push(g.waiters, c))
@@ -215,7 +224,7 @@ fun steps(g : Graph b, run : fun(Int, fun(Int) -> b) -> b, finished : fun(Int) -
         let step = g.ready[g.next]
         g.next = g.next + 1
         Scheduler.unlock()
-        let value = run(step, finished)
+        let value = run(state, step, finished)
         Scheduler.lock()
         g.results[step] = Some(value)
         g.unfinished = g.unfinished - 1

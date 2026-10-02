@@ -492,7 +492,7 @@ fun poll(b : Code, cold : Cold, d : Asm.Dialect, l : Frame.Layout, tag : Int,
     for var k = 0; k < len(save.kept); k = k + 1 {
         instruction(text, A.Str(save.kept[k], Offset(A.sp, 8 * k), A.W64))
     }
-    instruction(text, A.Bl(Asm.runtimeFor(d, "turkey_poll"), A.Standard))
+    instruction(text, A.Bl(Asm.turkeyEntry(d, "turkey_poll"), A.Standard))
     emit(text, Label(safepointLabel(d, tag, pb, pn)))
     for var k = 0; k < len(save.kept); k = k + 1 {
         instruction(text, A.Ldr(save.kept[k], Offset(A.sp, 8 * k), A.W64))
@@ -1015,9 +1015,13 @@ fun writeSites(b : Code, d : Asm.Dialect, sites : Int) -> Unit {
 -- the body's caller, is in its record; the body's record, whose return
 -- address is in the face and has no frame-table entry, is passed over.
 --
--- Generated code calls these too -- the runtime's allocation slow paths are
--- `foreign` definitions -- and then `x28` is already the worker, saved and set
--- to the same value.
+-- Generated code calls the runtime's definitions too -- the allocation slow
+-- paths, the write barrier, a poll -- and there `x28` is already the running
+-- worker, which on another thread is not the one the face would set. So each
+-- definition has a second entry for Turkey callers (`Asm.turkeyEntry`), which
+-- moves the arguments the same way and branches to the body, leaving `x28`
+-- and making no frame: the body's frame record then holds its Turkey
+-- caller's return address, as at any call.
 fun emitDefinitions(m : Module, asm : Asm.Asm, b : Code) -> Unit {
     for (sym, name) in m.definitions {
         for f in m.functions {
@@ -1031,15 +1035,24 @@ fun emitDefinitions(m : Module, asm : Asm.Asm, b : Code) -> Unit {
                 }
                 function(b, Asm.runtimeFor(asm.dialect, sym))
                 enterFromC(b, asm.dialect)
-                for var k = general; k > 0; k = k - 1 {
-                    instruction(b, A.Mov(Physical(Gp, k), Physical(Gp, k - 1), A.W64))
-                }
-                instruction(b, A.Mov(A.x0, A.xzr, A.W64))
+                shiftArguments(b, general)
                 instruction(b, A.Bl(Asm.symbolFor(asm.dialect, name), A.Standard))
                 returnToC(b)
+                emit(b, Label(Asm.turkeyEntry(asm.dialect, sym)))
+                shiftArguments(b, general)
+                instruction(b, A.B(Asm.symbolFor(asm.dialect, name)))
             }
         }
     }
+}
+
+-- C's arguments, in `x0` up, moved up one register to make way for the null
+-- environment a Turkey function takes in `x0`.
+fun shiftArguments(b : Code, general : Int) -> Unit {
+    for var k = general; k > 0; k = k - 1 {
+        instruction(b, A.Mov(Physical(Gp, k), Physical(Gp, k - 1), A.W64))
+    }
+    instruction(b, A.Mov(A.x0, A.xzr, A.W64))
 }
 
 -- The way into Turkey code from C, and back: a frame record, the caller's

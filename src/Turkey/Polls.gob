@@ -1,4 +1,4 @@
-module Turkey.Polls (insert)
+module Turkey.Polls (insert, recursive)
 
 -- Polls: where a worker running a loop stops for a collection.
 --
@@ -27,18 +27,36 @@ module Turkey.Polls (insert)
 -- calling one would run past every stop. Nor does an allocation in the frame
 -- (`StackObject`), which takes nothing from the heap.
 --
+-- A function that may call itself again, directly or through others, gets a
+-- poll at its entry as well. Recursion with no loop and no allocation in it
+-- has bounded depth but not bounded time -- a naive Fibonacci makes 2^n calls
+-- -- and reaches no back edge. A function in no cycle of the call graph runs
+-- for a time bounded by its own code and its callees', which loops' polls
+-- already bound, so it needs none. Calls through a closure or a dictionary
+-- are taken to reach every function whose closure is made anywhere, which
+-- puts most of the higher-order code in one cycle: conservative, and the
+-- poll is two instructions on the path where nothing is asked of it.
+--
 -- Not in the runtime's own modules (`Turkey.Giblets`): the collector's loops
 -- run with every other worker stopped, and code that may not allocate may not
 -- call something that collects.
 
+import Data.Set as Set
+import Turkey.Deps as Deps
 import Turkey.LowIr as L
-import Turkey.LowIr (Op(..), Low(..))
+import Turkey.LowIr (Callee(..), Op(..), Low(..))
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (BlockId(..), RepClass(..), Term(..))
 
 -- Add a poll to every back edge of `f` -- an edge to a block that dominates
 -- the block it leaves -- whose loop can go around without allocating.
-fun insert(f : Ssa.Func Low) -> Unit {
+fun insert(f : Ssa.Func Low, recursive : Bool) -> Unit {
+    if recursive {
+        let entry = Ssa.blockAt(f, f.entry)
+        let insts = [L.low(Ssa.freshValue(f, Ssa.untraced(Unit)), Poll)]
+        for i in entry.insts { Array.push(insts, i) }
+        entry.insts = insts
+    }
     let idom = Ssa.dominators(f)
     let edges = []
     for var b = 0; b < len(f.blocks); b = b + 1 {
@@ -118,4 +136,41 @@ fun poll(f : Ssa.Func Low, from : Int, header : Int) -> Unit {
     }
     let done = Ssa.freshValue(f, Ssa.untraced(Unit))
     Array.push(f.blocks[edge].insts, L.low(done, Poll))
+}
+
+-- The functions of `functions` in a cycle of the call graph, leaving out
+-- those `skip` names. An indirect call is an edge to every function a closure
+-- is made of, through one node standing for all of them.
+fun recursive(functions : Array (Ssa.Func Low), skip : fun(String) -> Bool) -> Set.Set String {
+    let anywhere = "%indirect"
+    let graph = Map.new()
+    let closures = Set.new()
+    for f in functions {
+        if skip(f.name) { continue }
+        let callees = Set.new()
+        for block in f.blocks {
+            for i in block.insts {
+                match i.op {
+                    Call(Direct(name), _) -> Set.add(callees, name)
+                    Call(Indirect(_), _) -> Set.add(callees, anywhere)
+                    ClosureNew(name, _) -> Set.add(closures, name)
+                    StackClosure(name, _) -> Set.add(closures, name)
+                    _ -> {}
+                }
+            }
+        }
+        Map.put(graph, f.name, callees)
+    }
+    Map.put(graph, anywhere, closures)
+    let out = Set.new()
+    for component in Deps.sccs(graph) {
+        let looped = len(component) > 1 || match Map.get(graph, component[0]) {
+            Some(callees) -> Set.contains(callees, component[0])
+            None -> False
+        }
+        if looped {
+            for name in component { if name != anywhere { Set.add(out, name) } }
+        }
+    }
+    out
 }

@@ -1402,6 +1402,7 @@ fun store(l : Lower, target : Core, x : Value) -> Unit = match target.kind {
 -- may be assigned later, and then every field may be.
 fun aggregate(l : Lower, items : Array Core, kind : Int, tag : Int,
              mutable : Bool, what : String) -> Value {
+    if wide(l, what, len(items), Rt.fieldLimit) { return Ssa.freshValue(l.func, Ssa.traced(Ptr)) }
     let values = []
     for x in items { Array.push(values, value(l, x)) }
     let reps = Array.map(values, Ssa.repOf(l.func, _))
@@ -1432,6 +1433,11 @@ fun allFields(count : Int) -> Int = Int.shl(1, count) - 1
 -- register class are needed too, and one code answers all three. The code
 -- itself is the runtime's, so it is read from `Turkey.Runtime` rather than
 -- restated here.
+--
+-- At most `Rt.fieldLimit` fields fit, which the parser holds a declared
+-- constructor and a tuple to; `wide` stops the lowering of anything else
+-- that would be wider -- a dictionary of a class with many methods, say --
+-- rather than build an object whose last fields the collector cannot see.
 fun metadata(reps : Array Rep) -> Int {
     var out = 0
     for var i = 0; i < len(reps); i = i + 1 {
@@ -1453,6 +1459,13 @@ fun metadata(reps : Array Rep) -> Int {
 --
 -- The test is `traced` rather than "is a pointer", which is the distinction
 -- `Rep` carries: a code address is a pointer the collector must *not* follow.
+fun wide(l : Lower, kind : String, count : Int, limit : Int) -> Bool {
+    if count <= limit { return False }
+    stop1(l, kind + " of " + Int.toString(count) + " slots, more than the "
+             + Int.toString(limit) + " an object header describes")
+    True
+}
+
 fun bitmap(reps : Array Rep) -> Int {
     var out = 0
     for var i = 0; i < len(reps); i = i + 1 {
@@ -1944,6 +1957,9 @@ fun packed(l : Lower, info : ConInfo, name : String, args : Array Core,
         Some(ps) -> ps
         None -> return stop(l, "packing '" + name
                             + "' at a layout that is not knowable here")
+    }
+    if wide(l, "a packed existential", len(parts) + len(args), Rt.fieldLimit) {
+        return Ssa.freshValue(l.func, Ssa.traced(Ptr))
     }
     let values = []
     for p in parts {

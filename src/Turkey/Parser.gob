@@ -21,6 +21,7 @@ module Turkey.Parser (parse, collectTycons, builtinTycons)
 import Turkey.Ast
 import Turkey.Diag as Diag
 import Turkey.Lexer as Lexer
+import Turkey.Runtime as Rt
 import Turkey.Source (Source(..), Span)
 import Turkey.Token as Token
 import Turkey.Token (Kind(..), Token(..), Value(..))
@@ -452,10 +453,11 @@ fun parseConDecl(p : P) -> ConDecl {
     let tok = expectWhat(p, "CONID", "a constructor name")
     let (binders, context) = parseConContext(p)
     if at(p, "{") {
+        let fields = parseRecordPayload(p)
+        fieldLimit(p, tok, "constructor '" + text(tok) + "'", len(fields))
         return ConDecl {
             span = tok.span, name = text(tok), args = Array.new(0),
-            fields = Some(parseRecordPayload(p)),
-            binders = binders, context = context,
+            fields = Some(fields), binders = binders, context = context,
         }
     }
     let args = Array.new(2)
@@ -468,6 +470,7 @@ fun parseConDecl(p : P) -> ConDecl {
             if !eat(p, ",") { break }
         }
         skipToken(p, ")")
+        fieldLimit(p, tok, "constructor '" + text(tok) + "'", len(args))
     } else if at(p, "IDENT") || at(p, "CONID") || at(p, "fun") {
         oops(p, "constructor '" + text(tok) + "' must parenthesize its payload: write '"
                 + text(tok) + "(...)'", cur(p).span)
@@ -494,6 +497,15 @@ fun fieldSeparator(p : P) -> Bool {
                 + "a field; found " + describe(cur(p)), cur(p).span)
     }
     True
+}
+
+-- A value's fields are described to the collector in one word, so there is a
+-- most it can have (`Turkey.Runtime.fieldLimit`).
+fun fieldLimit(p : P, at : Token, what : String, count : Int) -> Unit {
+    if count > Rt.fieldLimit {
+        oops(p, what + " has " + Int.toString(count) + " fields, and a value can have at most "
+                + Int.toString(Rt.fieldLimit), at.span)
+    }
 }
 
 fun parseRecordPayload(p : P) -> Array (String, Type) {
@@ -596,6 +608,7 @@ fun parseParenType(p : P, tok : Token) -> Type {
     }
     skipToken(p, ")")
     if len(elems) == 1 { return elems[0] }
+    fieldLimit(p, tok, "this tuple type", len(elems))
     mkType(p, tok.span, TETuple(elems))
 }
 
@@ -1289,6 +1302,7 @@ fun parseParenAtom(p : P, tok : Token) -> Expr {
     -- Grouping parentheses are not a boundary: they exist for precedence, so
     -- `(_ + 1) * 2` is one function. A tuple's components are.
     if len(elems) == 1 { return elems[0] }
+    fieldLimit(p, tok, "this tuple", len(elems))
     mkExpr(p, tok.span, ETuple(Array.map(elems, closePart(p, _))))
 }
 

@@ -492,9 +492,7 @@ fun returnFromStub(b : Code, d : Asm.Dialect, f : Func Inst, l : Frame.Layout,
         Some(label) -> emit(b, Label(label))
         None -> {}
     }
-    let state = Asm.runtimeFor(d, Rt.processState)
-    instruction(b, A.Adrp(scratch, state))
-    instruction(b, A.Ldr(scratch, PageOffset(scratch, state), A.W32))
+    instruction(b, A.Ldr(scratch, Offset(A.worker, 0), A.W32))
     instruction(b, A.Cbnz(scratch, failed, A.W32))
     if !A.sameRegister(dest, A.x0) { instruction(b, A.Mov(dest, A.x0, A.W64)) }
     instruction(b, A.B(allocationLabel(d, tag, n, "r")))
@@ -922,9 +920,11 @@ fun emitEntry(asm : Asm.Asm, m : Module, main : String, sites : Int,
 
     -- Early initialization, for a C caller that runs the program's Turkey
     -- code without running the program: the runtime's own C tests. It takes
-    -- no environment and returns to the caller directly.
+    -- no environment, and comes in from C as a `foreign` definition does.
     function(b, Asm.runtimeFor(d, "turkey_giblets_initialize"))
-    instruction(b, A.B(Asm.symbolFor(d, m.early)))
+    enterFromC(b, d)
+    instruction(b, A.Bl(Asm.symbolFor(d, m.early), A.Standard))
+    returnToC(b)
 
     -- `main` itself: `Turkey.Entry`'s, reached by its C symbol. `argv` is
     -- already in `x1`, and `argc` in `w0`, widened to the `Int` a foreign
@@ -958,11 +958,27 @@ fun writeSites(b : Code, d : Asm.Dialect, sites : Int) -> Unit {
 --
 -- The body takes the environment every Turkey function takes, in `x0`, and C
 -- passes its first argument there. So the general arguments move up one
--- register, `x0` becomes the null environment, and control goes to the body by
--- a plain branch: the body returns straight to the C caller, and this has no
--- frame of its own for the collector's walk to meet. Floating-point arguments
--- are in `d0`-`d7` either way and do not move. Seven general arguments at most,
+-- register and `x0` becomes the null environment. Floating-point arguments are
+-- in `d0`-`d7` either way and do not move. Seven general arguments at most,
 -- which the front end checks, since the eighth register is the environment's.
+--
+-- And the body expects the running worker in `x28` (`A.worker`), which C does
+-- not keep: to C, `x28` is a callee-saved register like any other. So the face
+-- saves the caller's, sets the worker's, calls the body and puts the caller's
+-- back. With one worker, the worker is the process state every program
+-- defines; with several, it is the calling thread's.
+--
+-- That takes a frame, and it has to be a full frame record. When generated
+-- code calls a face, the return address into it is what the collector looks
+-- up to find that caller's roots, and the walk only reads return addresses
+-- out of `x29` records: one saved anywhere else would hide the caller's roots
+-- from every collection the body makes. The face's own return address, into
+-- the body's caller, is in its record; the body's record, whose return
+-- address is in the face and has no frame-table entry, is passed over.
+--
+-- Generated code calls these too -- the runtime's allocation slow paths are
+-- `foreign` definitions -- and then `x28` is already the worker, saved and set
+-- to the same value.
 fun emitDefinitions(m : Module, asm : Asm.Asm, b : Code) -> Unit {
     for (sym, name) in m.definitions {
         for f in m.functions {
@@ -975,14 +991,36 @@ fun emitDefinitions(m : Module, asm : Asm.Asm, b : Code) -> Unit {
                     }
                 }
                 function(b, Asm.runtimeFor(asm.dialect, sym))
+                enterFromC(b, asm.dialect)
                 for var k = general; k > 0; k = k - 1 {
                     instruction(b, A.Mov(Physical(Gp, k), Physical(Gp, k - 1), A.W64))
                 }
                 instruction(b, A.Mov(A.x0, A.xzr, A.W64))
-                instruction(b, A.B(Asm.symbolFor(asm.dialect, name)))
+                instruction(b, A.Bl(Asm.symbolFor(asm.dialect, name), A.Standard))
+                returnToC(b)
             }
         }
     }
+}
+
+-- The way into Turkey code from C, and back: a frame record, the caller's
+-- `x28` saved and the worker's set (`emitDefinitions` says why both). Leaves
+-- every argument register as it found it.
+fun enterFromC(b : Code, d : Asm.Dialect) -> Unit {
+    instruction(b, A.SubImm(A.sp, A.sp, 32, A.W64))
+    instruction(b, A.Str(A.fp, Offset(A.sp, 16), A.W64))
+    instruction(b, A.Str(A.lr, Offset(A.sp, 24), A.W64))
+    instruction(b, A.AddImm(A.fp, A.sp, 16, A.W64))
+    instruction(b, A.Str(A.worker, Offset(A.sp, 0), A.W64))
+    symbolInto(b, A.worker, Asm.runtimeFor(d, Rt.processState))
+}
+
+fun returnToC(b : Code) -> Unit {
+    instruction(b, A.Ldr(A.worker, Offset(A.sp, 0), A.W64))
+    instruction(b, A.Ldr(A.fp, Offset(A.sp, 16), A.W64))
+    instruction(b, A.Ldr(A.lr, Offset(A.sp, 24), A.W64))
+    instruction(b, A.AddImm(A.sp, A.sp, 32, A.W64))
+    instruction(b, A.Ret)
 }
 
 -- A symbol's address, in a register: the page, then the offset within it.

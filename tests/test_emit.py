@@ -163,8 +163,11 @@ def test_pressure_saves_and_restores_callee_saved_registers():
 def test_a_call_is_followed_by_the_panic_check():
     """`turkey_panic` sets a flag and returns, so every call tests it.
 
-    The program defines the flag itself, so its address is a page-relative
-    `add` rather than a load from the global offset table.
+    The flag is the first word of the running worker's record, which `x28`
+    holds while Turkey code runs, so the check is a load through it. The
+    program defines the record itself, so where code coming in from C sets
+    `x28` to it, its address is a page-relative `add` rather than a load from
+    the global offset table.
     """
     # Quoted, like every symbol this backend writes: `#` is the assembler's
     # immediate prefix, so one quoting rule covers Turkey names and C ones.
@@ -183,7 +186,7 @@ def test_a_call_is_followed_by_the_panic_check():
     for n, line in enumerate(lines):
         if line.startswith("bl ") and "turkey_panic" not in line:
             window = lines[n:n + 12]
-            assert any(w.startswith("adrp") and page in w for w in window), window
+            assert any(re.match(r"ldr w\d+, \[x28(, #0)?\]$", w) for w in window), window
             break
     else:
         pytest.fail("no ordinary call in the program")

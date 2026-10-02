@@ -18,6 +18,7 @@ import System.Args as Args
 import System.Args (Arg(..))
 import System.Env as Env
 import System.IO as IO
+import System.Task as Task
 import System.Time as Time
 import Turkey.Diag as Diag
 import Turkey.Source as Source
@@ -313,11 +314,11 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
     -- with its own text, since the program's text is too large to emit twice.
     let outs = []
     if wants("listing") {
-        Array.push(outs, Out { text = b, sink = ToStdout,
+        Array.push(outs, Out { text = b, sink = ToStdout, apart = False,
                                render = fun(d, code, t) { Encode.listing(listing, code, t) } })
     }
     if let Some(s) = sink {
-        Array.push(outs, Out { text = String.builder(), sink = s,
+        Array.push(outs, Out { text = String.builder(), sink = s, apart = True,
                                render = Stream.print })
     }
     emitModule(path, entry, module_, outs)
@@ -549,7 +550,8 @@ fun reportWarnings(checked : Checked, path : String) -> Unit {
 fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable, path : String)
         -> (SsaLower.Module, Array SsaLower.Unsupported) {
     let (module_, skipped) = SsaLower.lowerProgram(program, decls)
-    module_.functions = Array.map(module_.functions, fun(lowered) = {
+    -- Each function's own, so on as many workers as there are.
+    module_.functions = mapParallel(module_.functions, fun(lowered) = {
         Fields.forward(lowered)
         let f = Sccp.run(lowered)
         Clean.eliminateCopies(f, True)
@@ -557,15 +559,8 @@ fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable, path : String)
         Clean.mergeBlocks(f)
     })
     let complaints = []
-    for f in module_.functions {
-        for message in Ssa.verify(f) { Array.push(complaints, message) }
-        for block in f.blocks {
-            for i in block.insts {
-                for message in LowIr.checkReps(f, i) {
-                    Array.push(complaints, f.name + ": " + message)
-                }
-            }
-        }
+    for found in mapParallel(module_.functions, complaintsOf) {
+        for message in found { Array.push(complaints, message) }
     }
     for message in LowIr.checkCalls(module_.functions) {
         Array.push(complaints, message)
@@ -589,6 +584,17 @@ fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable, path : String)
     (module_, skipped)
 }
 
+-- What `Ssa.verify` and `LowIr.checkReps` say of one function.
+fun complaintsOf(f : Ssa.Func LowIr.Low) -> Array String {
+    let out = Ssa.verify(f)
+    for block in f.blocks {
+        for i in block.insts {
+            for message in LowIr.checkReps(f, i) { Array.push(out, f.name + ": " + message) }
+        }
+    }
+    out
+}
+
 -- A binding that did not lower stops a compile that is meant to produce code.
 -- Its callers would link against a symbol that is not there, so the one place
 -- to say so is here, naming each binding and the form that stopped it.
@@ -600,12 +606,105 @@ fun refuseSkipped(skipped : Array SsaLower.Unsupported, path : String) -> Unit {
     }
 }
 
+-- What the backend makes of one selected function: its registers, its checks,
+-- its frame and its code, or why it was skipped, and how long that took. The
+-- code is rendered already for each consumer that renders pieces apart
+-- (`Out.apart`), and left as items for the others.
+type Made = Made {
+    layout     : Option Frame.Layout,
+    skipped    : String,
+    complaints : Array String,
+    code       : Array (Stream.Item Arm64.Inst),
+    texts      : Array (Option String),
+    cost       : Int,
+}
+
+-- How many functions the backend makes at once, as tasks, before handing them
+-- on in order: enough that a window rarely waits long on its slowest function
+-- with the rest of the workers idle -- 64 measured 0.3s slower over the
+-- self-compile than this -- and few enough that their code is not all held at
+-- once.
+let backendWindow = 512
+
+-- Selected function `i`, through the backend. It reads only what selection
+-- has finished with -- `asm` is done interning, and the tables are only read
+-- -- so several can run at once.
+fun backendOf(asm : Asm.Asm, f : Ssa.Func Arm64.Inst, i : Int,
+              lows : Map.Map String (Ssa.Func LowIr.Low),
+              sigs : Map.Map String MachineCheck.Signature, outs : Array Out) -> Made {
+    let started = Time.monotonic()
+    let frame = match Map.get(lows, f.name) {
+        Some(low) -> Roots.analyze(low)
+        None -> Roots.Frame { slots = Map.new(), at = Map.new(), objects = [],
+                             objectIndex = Map.new(), held = Map.new() }
+    }
+    let a = Regalloc.allocate(f, frame.slots)
+    match a.stopped {
+        Some(why) -> Made { layout = None, skipped = why, complaints = [], code = [],
+                            texts = [], cost = Time.monotonic() - started }
+        None -> {
+            let complaints = MachineCheck.check(a.func, sigs)
+            let l = Frame.layout(a, frame)
+            let code = []
+            Emit.emitFunc(asm, a.func, a, l, i, code)
+            let texts = Array.map(outs, fun(o) = if o.apart {
+                let text = String.builder()
+                o.render(asm.dialect, Array.slice(code, 0, len(code)), text)
+                Some(String.build(text))
+            } else { None })
+            Made { layout = Some(l), skipped = "", complaints = complaints, code = code,
+                   texts = texts, cost = Time.monotonic() - started }
+        }
+    }
+}
+
+-- `f` of each of `xs`, in order: each a task when `TURKEY_WORKERS` asks for
+-- more than one worker, and a plain `map` when it does not. Each `f(x)` must
+-- touch nothing another may be writing; tasks write only their own element of
+-- the answer.
+fun mapParallel(xs : Array a, f : fun(a) -> b) -> Array b {
+    if workersWanted() < 2 { return Array.map(xs, f) }
+    let out : Array (Option b) = Array.filled(len(xs), None)
+    -- A window at a time, so that at most that many tasks' stacks exist.
+    var start = 0
+    while start < len(xs) {
+        let end = if start + backendWindow < len(xs) { start + backendWindow } else { len(xs) }
+        Task.runScope(do {
+            for var k = start; k < end; k = k + 1 {
+                let i = k
+                let _ = Task.spawn(fun() { out[i] = Some(f(xs[i])) })?
+            }
+            pure(())
+        })
+        start = end
+    }
+    Array.map(out, fun(m) = match m {
+        Some(value) -> value
+        None -> error("internal error: a parallel task made nothing")
+    })
+}
+
+-- `TURKEY_WORKERS`, as the runtime reads it (`Turkey.Scheduler`): how many
+-- workers run tasks.
+fun workersWanted() -> Int = match Env.get("TURKEY_WORKERS") {
+    Some(text) -> match Int.parse(text) {
+        Some(n) -> n
+        None -> 1
+    }
+    None -> 1
+}
+
 -- One emission's consumer: what it makes of each piece of code, the text it
 -- makes it into, and where that text goes.
 type Out = Out {
     render : fun(Asm.Dialect, Array (Stream.Item Arm64.Inst), String.Builder) -> Unit,
     text   : String.Builder,
     sink   : Sink,
+    -- Whether it renders a piece of code without anything left from the last
+    -- piece, so that pieces can be rendered at once and joined in order. The
+    -- encoder's listing carries whether it is in the code section from one
+    -- piece to the next; the assembly printer carries nothing.
+    apart  : Bool,
 }
 
 -- The program as arm64 machine code, handed to each consumer a piece at a
@@ -673,29 +772,38 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     let complaints = []
     -- Each function's time from its roots to its text, for `--timings`.
     let costs : Array (String, Int) = []
-    for var i = 0; i < len(selected); i = i + 1 {
-        let started = Time.monotonic()
-        let f = selected[i]
-        let frame = match Map.get(lows, f.name) {
-            Some(low) -> Roots.analyze(low)
-            None -> Roots.Frame { slots = Map.new(), at = Map.new(), objects = [],
-                                 objectIndex = Map.new(), held = Map.new() }
-        }
-        let a = Regalloc.allocate(f, frame.slots)
-        match a.stopped {
-            Some(why) -> note("// skipped " + f.name + ": " + why + "\n")
-            None -> {
-                for message in MachineCheck.check(a.func, sigs) {
-                    Array.push(complaints, message)
+    -- A window of functions at a time, each made by a task when there are
+    -- workers to run them in parallel, then handed on in order.
+    var start = 0
+    while start < len(selected) {
+        let end = if start + backendWindow < len(selected) { start + backendWindow }
+                  else { len(selected) }
+        let indices = []
+        for var i = start; i < end; i = i + 1 { Array.push(indices, i) }
+        let made = mapParallel(indices,
+                               fun(i) = backendOf(asm, selected[i], i, lows, sigs, outs))
+        for var k = 0; k < len(made); k = k + 1 {
+            let m = made[k]
+            let i = start + k
+            match m.layout {
+                None -> note("// skipped " + selected[i].name + ": " + m.skipped + "\n")
+                Some(l) -> {
+                    for message in m.complaints { Array.push(complaints, message) }
+                    for var o = 0; o < len(outs); o = o + 1 {
+                        match m.texts[o] {
+                            Some(text) -> String.push(outs[o].text, text)
+                            None -> outs[o].render(asm.dialect,
+                                                   Array.slice(m.code, 0, len(m.code)),
+                                                   outs[o].text)
+                        }
+                    }
+                    flush()
+                    Array.push(layouts, (i, l))
                 }
-                let l = Frame.layout(a, frame)
-                Emit.emitFunc(asm, a.func, a, l, i, code)
-                consume(asm.dialect, code)
-                flush()
-                Array.push(layouts, (i, l))
             }
+            if timings { Array.push(costs, (selected[i].name, m.cost)) }
         }
-        if timings { Array.push(costs, (f.name, Time.monotonic() - started)) }
+        start = end
     }
     at = lap("backend", at)
     if timings { reportCosts(costs) }

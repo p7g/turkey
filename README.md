@@ -94,6 +94,11 @@ arguments lists the stages. `build --timings` reports on standard error how
 long each phase took, how the backend's time is spread over functions, and how
 much of the optimizer's work could run in parallel.
 
+`TURKEY_WORKERS=N` runs a program's tasks (`System.Task`) on N threads instead
+of one, and the compiler is such a program: `TURKEY_WORKERS=8
+build/stages/stage2 build ...` compiles each function's passes and code in
+parallel, and emits the same bytes as one worker does.
+
 The compiler that builds it is `bootstrap/`, which holds its own arm64
 assembly for macOS and for Linux, gzip'd. `scripts/build.sh` builds for whichever of the two the C compiler
 links for. `sh scripts/build.sh

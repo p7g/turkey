@@ -18,7 +18,7 @@ import System.Args as Args
 import System.Args (Arg(..))
 import System.Env as Env
 import System.IO as IO
-import System.Task as Task
+import System.Parallel as Parallel
 import System.Time as Time
 import Turkey.Diag as Diag
 import Turkey.Source as Source
@@ -551,7 +551,7 @@ fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable, path : String)
         -> (SsaLower.Module, Array SsaLower.Unsupported) {
     let (module_, skipped) = SsaLower.lowerProgram(program, decls)
     -- Each function's own, so on as many workers as there are.
-    module_.functions = mapParallel(module_.functions, fun(lowered) = {
+    module_.functions = Parallel.map(module_.functions, fun(lowered) = {
         Fields.forward(lowered)
         let f = Sccp.run(lowered)
         Clean.eliminateCopies(f, True)
@@ -559,7 +559,7 @@ fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable, path : String)
         Clean.mergeBlocks(f)
     })
     let complaints = []
-    for found in mapParallel(module_.functions, complaintsOf) {
+    for found in Parallel.map(module_.functions, complaintsOf) {
         for message in found { Array.push(complaints, message) }
     }
     for message in LowIr.checkCalls(module_.functions) {
@@ -619,13 +619,6 @@ type Made = Made {
     cost       : Int,
 }
 
--- How many functions the backend makes at once, as tasks, before handing them
--- on in order: enough that a window rarely waits long on its slowest function
--- with the rest of the workers idle -- 64 measured 0.3s slower over the
--- self-compile than this -- and few enough that their code is not all held at
--- once.
-let backendWindow = 512
-
 -- Selected function `i`, through the backend. It reads only what selection
 -- has finished with -- `asm` is done interning, and the tables are only read
 -- -- so several can run at once.
@@ -656,42 +649,6 @@ fun backendOf(asm : Asm.Asm, f : Ssa.Func Arm64.Inst, i : Int,
                    texts = texts, cost = Time.monotonic() - started }
         }
     }
-}
-
--- `f` of each of `xs`, in order: each a task when `TURKEY_WORKERS` asks for
--- more than one worker, and a plain `map` when it does not. Each `f(x)` must
--- touch nothing another may be writing; tasks write only their own element of
--- the answer.
-fun mapParallel(xs : Array a, f : fun(a) -> b) -> Array b {
-    if workersWanted() < 2 { return Array.map(xs, f) }
-    let out : Array (Option b) = Array.filled(len(xs), None)
-    -- A window at a time, so that at most that many tasks' stacks exist.
-    var start = 0
-    while start < len(xs) {
-        let end = if start + backendWindow < len(xs) { start + backendWindow } else { len(xs) }
-        Task.runScope(do {
-            for var k = start; k < end; k = k + 1 {
-                let i = k
-                let _ = Task.spawn(fun() { out[i] = Some(f(xs[i])) })?
-            }
-            pure(())
-        })
-        start = end
-    }
-    Array.map(out, fun(m) = match m {
-        Some(value) -> value
-        None -> error("internal error: a parallel task made nothing")
-    })
-}
-
--- `TURKEY_WORKERS`, as the runtime reads it (`Turkey.Scheduler`): how many
--- workers run tasks.
-fun workersWanted() -> Int = match Env.get("TURKEY_WORKERS") {
-    Some(text) -> match Int.parse(text) {
-        Some(n) -> n
-        None -> 1
-    }
-    None -> 1
 }
 
 -- One emission's consumer: what it makes of each piece of code, the text it
@@ -772,39 +729,30 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     let complaints = []
     -- Each function's time from its roots to its text, for `--timings`.
     let costs : Array (String, Int) = []
-    -- A window of functions at a time, each made by a task when there are
-    -- workers to run them in parallel, then handed on in order.
-    var start = 0
-    while start < len(selected) {
-        let end = if start + backendWindow < len(selected) { start + backendWindow }
-                  else { len(selected) }
-        let indices = []
-        for var i = start; i < end; i = i + 1 { Array.push(indices, i) }
-        let made = mapParallel(indices,
-                               fun(i) = backendOf(asm, selected[i], i, lows, sigs, outs))
-        for var k = 0; k < len(made); k = k + 1 {
-            let m = made[k]
-            let i = start + k
-            match m.layout {
-                None -> note("// skipped " + selected[i].name + ": " + m.skipped + "\n")
-                Some(l) -> {
-                    for message in m.complaints { Array.push(complaints, message) }
-                    for var o = 0; o < len(outs); o = o + 1 {
-                        match m.texts[o] {
-                            Some(text) -> String.push(outs[o].text, text)
-                            None -> outs[o].render(asm.dialect,
-                                                   Array.slice(m.code, 0, len(m.code)),
-                                                   outs[o].text)
-                        }
+    -- Each function made by a task when there are workers to run them in
+    -- parallel, and handed on in order as soon as it and those before it are.
+    let indices = []
+    for var i = 0; i < len(selected); i = i + 1 { Array.push(indices, i) }
+    Parallel.mapInOrder(indices, fun(i) = backendOf(asm, selected[i], i, lows, sigs, outs),
+                        fun(i, m) {
+        match m.layout {
+            None -> note("// skipped " + selected[i].name + ": " + m.skipped + "\n")
+            Some(l) -> {
+                for message in m.complaints { Array.push(complaints, message) }
+                for var o = 0; o < len(outs); o = o + 1 {
+                    match m.texts[o] {
+                        Some(text) -> String.push(outs[o].text, text)
+                        None -> outs[o].render(asm.dialect,
+                                               Array.slice(m.code, 0, len(m.code)),
+                                               outs[o].text)
                     }
-                    flush()
-                    Array.push(layouts, (i, l))
                 }
+                flush()
+                Array.push(layouts, (i, l))
             }
-            if timings { Array.push(costs, (selected[i].name, m.cost)) }
         }
-        start = end
-    }
+        if timings { Array.push(costs, (selected[i].name, m.cost)) }
+    })
     at = lap("backend", at)
     if timings { reportCosts(costs) }
     -- The representations, on what was actually allocated: nothing below here

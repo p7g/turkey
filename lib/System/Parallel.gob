@@ -1,0 +1,230 @@
+module System.Parallel (workers, map, each, mapInOrder, graph)
+
+-- Work spread over the workers that run tasks (`System.Task`): a function of
+-- each element of an array, and a graph of steps each run once the steps it
+-- depends on have finished.
+--
+-- Each runs its function concurrently with itself when there is more than one
+-- worker, so what the calls share must be safe to share: reading data nothing
+-- writes meanwhile, and writing only what is the call's own. Every result is
+-- the function's, in the order of the input, whatever order the calls ran in.
+--
+-- With one worker each is the sequential loop it stands for, in order, with no
+-- tasks.
+--
+-- Work is split into chunks, a few per worker, each one task that runs its
+-- elements in turn. A task is a coroutine with a stack of its own, so a task
+-- per element would hold as many stacks as there are elements.
+
+import System.Task as Task
+import Turkey.Coroutine as Co
+import Turkey.Scheduler as Scheduler
+import Turkey.Workers as Workers
+
+-- How many workers run tasks, the program's own included.
+fun workers() -> Int = Workers.count()
+
+-- Elements per task, for `n` elements: about eight tasks per worker, so that a
+-- worker that draws a slow chunk is not what the rest wait for.
+fun chunkSize(n : Int) -> Int {
+    let size = n / (8 * workers())
+    if size < 1 { 1 } else { size }
+}
+
+fun lesser(a : Int, b : Int) -> Int = if a < b { a } else { b }
+
+-- `f` of each of `xs`, in order.
+fun map(xs : Array a, f : fun(a) -> b) -> Array b {
+    if workers() < 2 { return Array.map(xs, f) }
+    let out : Array (Option b) = Array.filled(len(xs), None)
+    let size = chunkSize(len(xs))
+    Task.runScope(do {
+        for var start = 0; start < len(xs); start = start + size {
+            let from = start
+            let _ = Task.spawn(fun() {
+                let to = lesser(from + size, len(xs))
+                for var i = from; i < to; i = i + 1 { out[i] = Some(f(xs[i])) }
+            })?
+        }
+        pure(())
+    })
+    Array.map(out, fun(made) = match made {
+        Some(value) -> value
+        None -> Prim.error("System.Parallel.map: an element was not computed")
+    })
+}
+
+-- `f` of each of `xs`, for what it does.
+fun each(xs : Array a, f : fun(a) -> Unit) -> Unit {
+    if workers() < 2 {
+        for x in xs { f(x) }
+        return {}
+    }
+    let size = chunkSize(len(xs))
+    Task.runScope(do {
+        for var start = 0; start < len(xs); start = start + size {
+            let from = start
+            let _ = Task.spawn(fun() {
+                let to = lesser(from + size, len(xs))
+                for var i = from; i < to; i = i + 1 { f(xs[i]) }
+            })?
+        }
+        pure(())
+    })
+}
+
+-- `f` of each of `xs`, each result handed to `use` with its index, in order,
+-- on the caller, as soon as it and every result before it are made. At most a
+-- few chunks per worker are made ahead of the one `use` is waiting for, so
+-- the results held at once stay bounded however many elements there are.
+fun mapInOrder(xs : Array a, f : fun(a) -> b, use : fun(Int, b) -> Unit) -> Unit {
+    if workers() < 2 {
+        for var i = 0; i < len(xs); i = i + 1 { use(i, f(xs[i])) }
+        return {}
+    }
+    let size = chunkSize(len(xs))
+    let ahead = 4 * workers()
+    -- Each chunk's first index and task, cleared once it has been used.
+    let chunks : Array (Option (Int, Task.Task (Array b))) = []
+    var used = 0
+    let useNext = fun() {
+        match chunks[used] {
+            Some((from, task)) -> {
+                let made = Task.join(task)
+                for var k = 0; k < len(made); k = k + 1 { use(from + k, made[k]) }
+            }
+            None -> {}
+        }
+        chunks[used] = None
+        used = used + 1
+    }
+    Task.runScope(do {
+        for var start = 0; start < len(xs); start = start + size {
+            if len(chunks) - used == ahead { useNext() }
+            let from = start
+            let task = Task.spawn(fun() {
+                let to = lesser(from + size, len(xs))
+                let made = Array.new(to - from)
+                for var i = from; i < to; i = i + 1 { Array.push(made, f(xs[i])) }
+                made
+            })?
+            Array.push(chunks, Some((from, task)))
+        }
+        while used < len(chunks) { useNext() }
+        pure(())
+    })
+}
+
+-- The steps of a dependency graph, run once each.
+--
+-- Step `i` runs, as `run(i, finished)`, once every step `dependsOn(i)` names
+-- has finished; `finished(j)` is step `j`'s result, for any step `i` depends
+-- on. The results are in step order. A cycle among the steps is an error,
+-- found before any step runs.
+--
+-- One task per worker takes ready steps from a queue, rather than a task per
+-- step waiting on its dependencies: a waiting task holds its stack.
+fun graph(count : Int, dependsOn : fun(Int) -> Array Int,
+          run : fun(Int, fun(Int) -> b) -> b) -> Array b {
+    let g = Graph {
+        results = Array.filled(count, None), waitingOn = Array.filled(count, 0),
+        dependents = [], ready = [], next = 0, unfinished = count, waiters = [],
+    }
+    for var i = 0; i < count; i = i + 1 { Array.push(g.dependents, []) }
+    for var i = 0; i < count; i = i + 1 {
+        for d in dependsOn(i) {
+            if d < 0 || d >= count {
+                return Prim.error("System.Parallel.graph: step "
+                                  + Int.toString(i) + " depends on no step "
+                                  + Int.toString(d))
+            }
+            g.waitingOn[i] = g.waitingOn[i] + 1
+            Array.push(g.dependents[d], i)
+        }
+    }
+    for var i = 0; i < count; i = i + 1 {
+        if g.waitingOn[i] == 0 { Array.push(g.ready, i) }
+    }
+    if !acyclic(g, count) {
+        return Prim.error("System.Parallel.graph: the steps' dependencies have a cycle")
+    }
+    let finished = fun(j) = match g.results[j] {
+        Some(value) -> value
+        None -> Prim.error("System.Parallel.graph: step " + Int.toString(j)
+                           + " has not finished; a step may only read those it depends on")
+    }
+    if workers() < 2 {
+        steps(g, run, finished)
+    } else {
+        Task.runScope(do {
+            for var w = 0; w < workers(); w = w + 1 {
+                let _ = Task.spawn(fun() = steps(g, run, finished))?
+            }
+            pure(())
+        })
+    }
+    Array.map(g.results, fun(made) = match made {
+        Some(value) -> value
+        None -> Prim.error("System.Parallel.graph: a step did not run")
+    })
+}
+
+-- A graph being run. Everything but `results`' reads by `finished` is read
+-- and written under the scheduler's lock: a step's result is written under it
+-- before any step depending on it is made ready, which is what makes the
+-- result visible to that step on another worker.
+type Graph b = Graph {
+    results    : Array (Option b),
+    -- Unfinished dependencies of each step, and the steps depending on each.
+    waitingOn  : Array Int,
+    dependents : Array (Array Int),
+    -- Steps ready to run, from `next` on.
+    ready      : Array Int,
+    next       : Int,
+    unfinished : Int,
+    waiters    : Array Co.Coroutine,
+}
+
+-- Whether the steps can all run: Kahn's count over a copy of `waitingOn`.
+fun acyclic(g : Graph b, count : Int) -> Bool {
+    let waiting = Array.map(g.waitingOn, fun(n) = n)
+    let queue = Array.map(g.ready, fun(n) = n)
+    var at = 0
+    while at < len(queue) {
+        for d in g.dependents[queue[at]] {
+            waiting[d] = waiting[d] - 1
+            if waiting[d] == 0 { Array.push(queue, d) }
+        }
+        at = at + 1
+    }
+    len(queue) == count
+}
+
+-- Run ready steps until every step has finished.
+fun steps(g : Graph b, run : fun(Int, fun(Int) -> b) -> b, finished : fun(Int) -> b) -> Unit {
+    while True {
+        Scheduler.waitUntil(fun() = g.next < len(g.ready) || g.unfinished == 0,
+                            fun(c) = Array.push(g.waiters, c))
+        Scheduler.lock()
+        if g.next == len(g.ready) {
+            let over = g.unfinished == 0
+            Scheduler.unlock()
+            if over { return {} }
+            continue
+        }
+        let step = g.ready[g.next]
+        g.next = g.next + 1
+        Scheduler.unlock()
+        let value = run(step, finished)
+        Scheduler.lock()
+        g.results[step] = Some(value)
+        g.unfinished = g.unfinished - 1
+        for d in g.dependents[step] {
+            g.waitingOn[d] = g.waitingOn[d] - 1
+            if g.waitingOn[d] == 0 { Array.push(g.ready, d) }
+        }
+        for c in g.waiters { Scheduler.wake(c) }
+        g.waiters = []
+        Scheduler.unlock()
+    }
+}

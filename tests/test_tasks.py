@@ -6,6 +6,8 @@ must print the same: a task's values live in frames of a parked stack, which
 the collector must find.
 """
 
+import pytest
+
 from tests import lang
 
 STRESS = {"TURKEY_GC_STRESS": "1"}
@@ -150,7 +152,8 @@ fun main() {
     assert out == "task 0 held this\ntask 19 held this\n"
 
 
-def test_waiting_on_a_task_that_waits_on_you_is_a_deadlock():
+@pytest.mark.parametrize("workers", ["1", "4"])
+def test_waiting_on_a_task_that_waits_on_you_is_a_deadlock(workers):
     result = lang.run("""
 import System.Task as Task
 
@@ -167,7 +170,7 @@ fun main() {
         pure(())
     })
 }
-""")
+""", env={"TURKEY_WORKERS": workers})
     assert result.code == 1
     assert result.stderr == "panic: deadlock: every task is waiting\n"
 

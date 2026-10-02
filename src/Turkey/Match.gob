@@ -1,0 +1,529 @@
+module Turkey.Match (Matcher(..), compile)
+
+-- Match compilation: a `match` over source patterns, which nest, becomes nested
+-- `match`es over `Turkey.Core.Alt`s, which do not.
+--
+-- `Turkey.Lower` calls this for every `match` it builds, so Core never holds a
+-- nested pattern and every pass after it sees one level of test at a time. That
+-- is the shape `Turkey.Opt`'s case-of-known-constructor decides, so a
+-- constructor built in one place and taken apart by a nested pattern in
+-- another meets a rule that can delete it, and a group of arms that test the
+-- same value tests it once.
+--
+-- The automaton is a backtracking one, in the style of Wadler's chapter of
+-- *The Implementation of Functional Programming Languages* (Peyton Jones,
+-- 1987) and of Le Fessant and Maranget, "Optimizing pattern matching" (ICFP
+-- 2001). The arms are rows of a matrix with one column per value under test.
+-- The first column splits the rows into maximal runs whose patterns there are
+-- all variables or all constructors (the *mixture rule*). A run of
+-- constructors is one `match` on the column with one arm per constructor, in
+-- the order the rows first name them, so rows that name the same constructor
+-- share a test and the rows for different constructors, which cannot both
+-- match, are not tested against each other. A run of variables binds the
+-- column and drops it. When a run fails, control goes to the code for the next
+-- run, which is a join point the run jumps to.
+--
+-- Backtracking rather than a decision tree because the size of the output is
+-- linear in the size of the input: no arm body and no pattern is copied. A
+-- decision tree tests fewer things on some paths and copies arms to do it, and
+-- `Opt` then inlines whatever this emits.
+--
+-- What this does not decide: whether the arms are exhaustive and which are
+-- unreachable. `Turkey.Exhaustive` has said so already, on the patterns as
+-- written. A value no arm matches reaches a `match` with no arm for it, and the
+-- backend panics there.
+--
+-- The order of tests is the order of the source: columns left to right, a
+-- constructor's fields before the columns after it. A run is never reordered
+-- with another, so an arm that might match is tried before every arm after it.
+
+import Turkey.Ast
+import Turkey.Core
+import Turkey.Decls as Decls
+import Turkey.Decls (DeclTable)
+import Turkey.Diag as Diag
+import Turkey.Source (Span)
+import Turkey.Types as Ty
+import Turkey.Types (TTuple, TBottom, TCon)
+
+-- What compiling needs from the pass that calls it: the declarations, how to
+-- reduce a field's type to the one its constructors are read off, and how to
+-- name a binder it invents.
+type Matcher = Matcher {
+    decls  : DeclTable,
+    reduce : fun(Ty.Type) -> Ty.Type,
+    fresh  : fun(String) -> String,
+}
+
+-- One compilation's state: how many jumps there are to each fallthrough.
+type State = State {
+    m     : Matcher,
+    jumps : Map String Int,
+}
+
+-- `match scrutinee { arms }`, of type `ty`, compiled.
+fun compile(m : Matcher, scrutinee : Core, arms : Array (Pat, Core), ty : Ty.Type,
+            span : Option Span) -> Core {
+    let st = State { m = m, jumps = Map.new() }
+    let site = Site { ty = ty, span = span }
+    -- The scrutinee is evaluated once, and a later run may test it again, so it
+    -- is held in a variable unless it is one or nothing reads it twice.
+    let root = match scrutinee.kind {
+        CVar(name) -> Column { name = name, ty = scrutinee.ty }
+        _ -> Column { name = m.fresh("scrut"), ty = scrutinee.ty }
+    }
+    let rows = Array.map(arms, fun((pat, body)) = Row { pats = [pat], binds = [], body = body })
+    let out = if len(rows) == 0 {
+        switch(root, [], site)
+    } else {
+        matrix(st, [root], rows, None, site)
+    }
+    match scrutinee.kind {
+        CVar(_) -> out
+        _ -> once(out, root.name, scrutinee)
+    }
+}
+
+-- `out` with the scrutinee in the one place that reads `name`, when that place
+-- is where `out` starts, and bound around it otherwise.
+fun once(out : Core, name : String, scrutinee : Core) -> Core {
+    let counted = Map.new()
+    countNames(out, counted)
+    if Map.getOr(counted, name, 0) == 1 {
+        match out.kind {
+            CMatch(s, alts) -> if isVar(s, name) {
+                return mkCore(out.ty, out.span, CMatch(scrutinee, alts))
+            }
+            CLet(bound, ty, value, body, binders) -> if isVar(value, name) {
+                return mkCore(out.ty, out.span, CLet(bound, ty, scrutinee, body, binders))
+            }
+            _ -> {}
+        }
+    }
+    mkCore(out.ty, out.span, CLet(name, scrutinee.ty, scrutinee, out, []))
+}
+
+fun isVar(e : Core, name : String) -> Bool = match e.kind {
+    CVar(n) -> n == name
+    _ -> False
+}
+
+fun countNames(e : Core, out : Map String Int) -> Unit {
+    match e.kind {
+        CVar(n) -> Map.put(out, n, Map.getOr(out, n, 0) + 1)
+        _ -> {}
+    }
+    discard(mapKind(e.kind, Mapper {
+        expr = fun(x) = {
+            countNames(x, out)
+            x
+        },
+        type_ = fun(t) = t,
+        bind = fun(b) = {
+            countNames(b.value, out)
+            b
+        },
+    }))
+}
+
+fun discard(x : a) -> Unit = {}
+
+-- -- the matrix ------------------------------------------------------------------------
+
+-- A value under test: the variable that holds it, and its type.
+type Column = Column { name : String, ty : Ty.Type }
+
+-- One arm, part way through: the patterns still to test, one per column, and
+-- the variables the patterns already passed bound, each to the column it named.
+type Row = Row {
+    pats  : Array Pat,
+    binds : Array (String, Ty.Type, String),
+    body  : Core,
+}
+
+-- What every `match` this emits shares: the type and span of the source one.
+type Site = Site { ty : Ty.Type, span : Option Span }
+
+-- The code for `rows` against `columns`, jumping to `fail` when none matches,
+-- or reaching a `match` with no arm for the value when there is no `fail`.
+fun matrix(st : State, columns : Array Column, rows : Array Row,
+           fail : Option String, site : Site) -> Core {
+    if len(columns) == 0 { return leafOf(rows[0]) }
+    runs(st, columns, runsOf(rows), 0, fail, site)
+}
+
+-- The first row, every test passed: its body under the variables it bound.
+--
+-- The bindings are made here and not where each variable was met, so that no
+-- jump to a fallthrough is ever under a binding a later arm's body could
+-- mention. That is what lets `runs` put a fallthrough with one jump in the
+-- jump's place.
+fun leafOf(row : Row) -> Core {
+    var out = row.body
+    for var i = len(row.binds) - 1; i >= 0; i = i - 1 {
+        let (name, ty, column) = row.binds[i]
+        out = mkCore(out.ty, out.span,
+                     CLet(name, ty, mkCore(ty, out.span, CVar(column)), out, []))
+    }
+    out
+}
+
+-- Runs `i` onwards: run `i`, falling through to the rest.
+--
+-- The rest is a join point when more than one place falls through to it, and
+-- stands in for the one jump when one does.
+fun runs(st : State, columns : Array Column, all : Array (Array Row), i : Int,
+         fail : Option String, site : Site) -> Core {
+    if i + 1 == len(all) { return run(st, columns, all[i], fail, site) }
+    let rest = runs(st, columns, all, i + 1, fail, site)
+    let next = st.m.fresh("next")
+    Map.put(st.jumps, next, 0)
+    let first = run(st, columns, all[i], Some(next), site)
+    match Map.getOr(st.jumps, next, 0) {
+        0 -> first
+        1 -> replaceJump(first, next, rest)
+        _ -> mkCore(site.ty, site.span, CJoin(next, [], rest, first, False))
+    }
+}
+
+-- What a run's patterns are in its first column.
+type Head = Variable | Literal | Tuple | Constructor
+
+fun headOf(row : Row) -> Head = match unannot(row.pats[0]).kind {
+    PVar(_) -> Variable
+    PWild -> Variable
+    PLit(_) -> Literal
+    PTuple(_) -> Tuple
+    PCon(_, _) -> Constructor
+    PRecord(_, _, _) -> Constructor
+    PAnnot(_, _) -> oops("an annotation under an annotation")
+}
+
+fun sameHead(a : Head, b : Head) -> Bool = match (a, b) {
+    (Variable, Variable) -> True
+    (Literal, Literal) -> True
+    (Tuple, Tuple) -> True
+    (Constructor, Constructor) -> True
+    _ -> False
+}
+
+fun opens(row : Row) -> Bool = Option.isSome(unannot(row.pats[0]).opening)
+
+-- The rows split where the kind of the first pattern changes. An existential
+-- pattern is a run of its own: what it opens is named by its own pattern, and
+-- two rows opening one constructor name their constants differently.
+fun runsOf(rows : Array Row) -> Array (Array Row) {
+    let out = []
+    var current = [rows[0]]
+    for var i = 1; i < len(rows); i = i + 1 {
+        let row = rows[i]
+        let prev = current[len(current) - 1]
+        if sameHead(headOf(row), headOf(prev)) && !opens(row) && !opens(prev) {
+            Array.push(current, row)
+        } else {
+            Array.push(out, current)
+            current = [row]
+        }
+    }
+    Array.push(out, current)
+    out
+}
+
+fun run(st : State, columns : Array Column, rows : Array Row,
+        fail : Option String, site : Site) -> Core {
+    let column = columns[0]
+    let after = Array.slice(columns, 1, len(columns))
+    match headOf(rows[0]) {
+        Variable -> matrix(st, after, Array.map(rows, fun(row) = {
+            let binds = match unannot(row.pats[0]).kind {
+                PVar(name) -> Array.append(row.binds, [(name, column.ty, column.name)])
+                _ -> row.binds
+            }
+            Row { pats = rest(row), binds = binds, body = row.body }
+        }), fail, site)
+        Literal -> literals(st, column, after, rows, fail, site)
+        Tuple -> {
+            let types = match st.m.reduce(column.ty) {
+                TTuple(ts) -> ts
+                _ -> []
+            }
+            let subs = Array.map(rows, fun(row) = match unannot(row.pats[0]).kind {
+                PTuple(elems) -> elems
+                _ -> oops("a tuple run with a row that is not a tuple")
+            })
+            let arity = len(subs[0])
+            let fieldTypes = Array.new(arity)
+            for var i = 0; i < arity; i = i + 1 {
+                Array.push(fieldTypes, if i < len(types) { types[i] } else { TBottom })
+            }
+            let (binders, body) = expand(st, after, rows, subs, fieldTypes, fail, site)
+            switch(column, [CAlt { alt = ATuple(binders), body = body }], site)
+        }
+        Constructor -> constructors(st, column, after, rows, fail, site)
+    }
+}
+
+-- A row's patterns after its first.
+fun rest(row : Row) -> Array Pat = Array.slice(row.pats, 1, len(row.pats))
+
+-- One arm per constructor the run names, in the order it first names them, and
+-- an arm that falls through when the run does not name them all.
+fun constructors(st : State, column : Column, after : Array Column,
+                 rows : Array Row, fail : Option String, site : Site) -> Core {
+    let names = []
+    for row in rows {
+        let name = conName(unannot(row.pats[0]))
+        if !Array.contains(names, name) { Array.push(names, name) }
+    }
+    let ty = st.m.reduce(column.ty)
+    let alts = []
+    for name in names {
+        let info = match Decls.con(st.m.decls, name) {
+            Some(i) -> i
+            None -> oops("unknown constructor '" + name + "'")
+        }
+        let these = Array.filter(rows, fun(row) = conName(unannot(row.pats[0])) == name)
+        let opening = unannot(these[0].pats[0]).opening
+        let fieldTypes = match opening {
+            Some(o) -> Decls.conFieldTypesOpened(st.m.decls, ty, name,
+                                                 Array.map(o.skolems, TCon))
+            None -> Decls.conFieldTypes(st.m.decls, ty, name)
+        }
+        let types = match fieldTypes {
+            Some(ts) -> ts
+            None -> oops("no field types for '" + name + "' at " + Ty.show(ty))
+        }
+        let subs = Array.map(these, fun(row) = positional(info, unannot(row.pats[0])))
+        let (binders, body) = expand(st, after, these, subs, types, fail, site)
+        Array.push(alts, CAlt { alt = ACon(name, binders, opening), body = body })
+    }
+    if len(names) < Decls.variantCount(st.m.decls, names[0]) {
+        orElse(st, alts, fail, site)
+    }
+    switch(column, alts, site)
+}
+
+fun conName(p : Pat) -> String = match p.kind {
+    PCon(name, _) -> name
+    PRecord(name, _, _) -> name
+    _ -> oops("a constructor run with a row that is not a constructor")
+}
+
+-- A constructor pattern's fields in declaration order, `_` for a record field
+-- it does not name.
+fun positional(info : Decls.ConInfo, p : Pat) -> Array Pat = match p.kind {
+    PCon(_, args) -> args
+    PRecord(_, labelled, _) -> match info.fields {
+        Some(labels) -> Array.map(labels, fun(label) = {
+            var sub = Pat { id = p.id, span = p.span, kind = PWild, opening = None }
+            for (given, pat) in labelled {
+                if given == label { sub = pat }
+            }
+            sub
+        })
+        None -> oops("a record pattern for '" + info.name + "', which has no fields")
+    }
+    _ -> oops("not a constructor pattern")
+}
+
+-- One arm per literal the run names, and one that falls through: no run of
+-- literals names them all.
+--
+-- Two rows share an arm when their literals are spelled alike. Not floats,
+-- whose equality is not their spelling's.
+fun literals(st : State, column : Column, after : Array Column,
+             rows : Array Row, fail : Option String, site : Site) -> Core {
+    let seen : Array Lit = []
+    let groups : Array (Array Row) = []
+    for row in rows {
+        let lit = literalOf(row)
+        var found = -1
+        for var i = 0; i < len(seen); i = i + 1 {
+            if found < 0 && sameLiteral(seen[i], lit) { found = i }
+        }
+        if found < 0 {
+            Array.push(seen, lit)
+            Array.push(groups, [row])
+        } else {
+            Array.push(groups[found], row)
+        }
+    }
+    let alts = []
+    for var i = 0; i < len(groups); i = i + 1 {
+        let inner = Array.map(groups[i], fun(row) = Row {
+            pats = rest(row), binds = row.binds, body = row.body,
+        })
+        Array.push(alts, CAlt { alt = ALit(seen[i]),
+                                body = matrix(st, after, inner, fail, site) })
+    }
+    orElse(st, alts, fail, site)
+    switch(column, alts, site)
+}
+
+fun literalOf(row : Row) -> Lit = match unannot(row.pats[0]).kind {
+    PLit(lit) -> lit
+    _ -> oops("a literal run with a row that is not a literal")
+}
+
+fun sameLiteral(a : Lit, b : Lit) -> Bool = match (a, b) {
+    (LInt(x), LInt(y)) -> x == y
+    (LString(x), LString(y)) -> x == y
+    (LChar(x), LChar(y)) -> x == y
+    _ -> False
+}
+
+-- The arm that falls through, when there is somewhere to fall.
+fun orElse(st : State, alts : Array CAlt, fail : Option String, site : Site) -> Unit =
+    match fail {
+        Some(name) -> Array.push(alts, CAlt { alt = AAny(None), body = jump(st, name, site) })
+        None -> {}
+    }
+
+-- A constructor's or tuple's fields as new columns ahead of the rest, and the
+-- rows with their sub-patterns in front: the binders of the arm, and its body.
+--
+-- A field every row ignores is not bound. A row alone in its arm with nothing
+-- left to test binds its variables in the arm itself, which is the arm as it
+-- was written: no test follows, so nothing can fall through from under them.
+-- Otherwise each field is bound to a fresh variable, a column the rows go on
+-- to test.
+fun expand(st : State, after : Array Column, rows : Array Row,
+           subs : Array (Array Pat), types : Array Ty.Type,
+           fail : Option String, site : Site) -> (Array (Option String), Core) {
+    if len(rows) == 1 && every(subs[0], leaf) && every(rest(rows[0]), leaf) {
+        let row = rows[0]
+        let binders = Array.map(subs[0], fun(p) = match unannot(p).kind {
+            PVar(name) -> Some(name)
+            _ -> None
+        })
+        let inner = Row { pats = rest(row), binds = row.binds, body = row.body }
+        return (binders, matrix(st, after, [inner], fail, site))
+    }
+    let binders = []
+    let columns = []
+    let kept = []
+    for var i = 0; i < len(types); i = i + 1 {
+        var used = False
+        for s in subs {
+            if i < len(s) && !ignored(s[i]) { used = True }
+        }
+        if used {
+            let name = st.m.fresh(hintFor(subs, i))
+            Array.push(columns, Column { name = name, ty = types[i] })
+            Array.push(kept, i)
+            Array.push(binders, Some(name))
+        } else {
+            Array.push(binders, None)
+        }
+    }
+    let inner = []
+    for var r = 0; r < len(rows); r = r + 1 {
+        let row = rows[r]
+        let front = Array.map(kept, fun(i) = subs[r][i])
+        Array.push(inner, Row {
+            pats = Array.append(front, rest(row)), binds = row.binds, body = row.body,
+        })
+    }
+    (binders, matrix(st, Array.append(columns, after), inner, fail, site))
+}
+
+-- What a field's column is called after: the variable the rows bind it to,
+-- when they agree on one, so a dump still says `k` where the source did. The
+-- column is a fresh name all the same, since a body under it may read another
+-- `k`; only the letters are kept, which is what the printer renumbers.
+fun hintFor(subs : Array (Array Pat), i : Int) -> String {
+    var named = ""
+    for s in subs {
+        if i < len(s) {
+            match unannot(s[i]).kind {
+                PWild -> {}
+                PVar(name) -> if named == "" || named == name { named = name } else {
+                    return "field"
+                }
+                _ -> return "field"
+            }
+        }
+    }
+    let letters = String.fromCodePoints(takeLetters(named))
+    if letters == "" { "field" } else { letters }
+}
+
+fun takeLetters(name : String) -> Array Char {
+    let out = []
+    for ch in String.codePoints(name) {
+        if !Char.isAsciiAlpha(ch) { return out }
+        Array.push(out, ch)
+    }
+    out
+}
+
+fun every(xs : Array a, p : fun(a) -> Bool) -> Bool {
+    for x in xs { if !p(x) { return False } }
+    True
+}
+
+-- A pattern that tests nothing.
+fun leaf(p : Pat) -> Bool = match unannot(p).kind {
+    PVar(_) -> True
+    PWild -> True
+    _ -> False
+}
+
+fun ignored(p : Pat) -> Bool = match unannot(p).kind {
+    PWild -> True
+    _ -> False
+}
+
+fun unannot(p : Pat) -> Pat = match p.kind {
+    PAnnot(inner, _) -> unannot(inner)
+    _ -> p
+}
+
+fun switch(column : Column, alts : Array CAlt, site : Site) -> Core =
+    mkCore(site.ty, site.span, CMatch(mkCore(column.ty, site.span, CVar(column.name)), alts))
+
+-- -- fallthrough -----------------------------------------------------------------------
+
+fun jump(st : State, name : String, site : Site) -> Core {
+    Map.put(st.jumps, name, Map.getOr(st.jumps, name, 0) + 1)
+    mkCore(TBottom, site.span, CJump(name, []))
+}
+
+-- `e` with its one jump to `name` replaced by `with`. Every variable `with`
+-- reads is bound outside `e` or is a column bound around the jump under a name
+-- of this pass's, so nothing on the way down can capture it; see `leafOf`.
+--
+-- An arm that only falls through, to code that binds the value its `match`
+-- tests, becomes an arm binding that value: `_ -> let y = v in b`, in a
+-- `match v`, is `y -> b`, which is the arm as it was written.
+fun replaceJump(e : Core, name : String, with : Core) -> Core = match e.kind {
+    CJump(target, _) -> if target == name { with } else { e }
+    CMatch(scrutinee, alts) -> mkCore(e.ty, e.span, CMatch(scrutinee, Array.map(alts,
+        fun(a) = match (a.alt, a.body.kind) {
+            (AAny(None), CJump(target, _)) ->
+                if target == name { bindingArm(scrutinee, with) } else { a }
+            _ -> CAlt { alt = a.alt, body = replaceJump(a.body, name, with) }
+        })))
+    _ -> mkCore(e.ty, e.span, mapKind(e.kind, Mapper {
+        expr = replaceJump(_, name, with),
+        type_ = fun(t) = t,
+        bind = fun(b) = CBind {
+            name = b.name, ty = b.ty, binders = b.binders,
+            value = replaceJump(b.value, name, with), span = b.span,
+            mutable = b.mutable, module_ = b.module_, equations = b.equations,
+            layouts = b.layouts,
+        },
+    }))
+}
+
+fun bindingArm(scrutinee : Core, with : Core) -> CAlt = match (scrutinee.kind, with.kind) {
+    (CVar(tested), CLet(bound, _, value, body, binders)) ->
+        if isVar(value, tested) && len(binders) == 0 {
+            CAlt { alt = AAny(Some(bound)), body = body }
+        } else {
+            CAlt { alt = AAny(None), body = with }
+        }
+    _ -> CAlt { alt = AAny(None), body = with }
+}
+
+fun oops(message : String) -> a = Diag.fail(Diag.whole("internal error", message), "")

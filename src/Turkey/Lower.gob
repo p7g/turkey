@@ -63,6 +63,7 @@ import Turkey.Core as Cr
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..))
 import Turkey.Diag as Diag
+import Turkey.Match as Match
 import Turkey.Prelude as P
 import Turkey.Build as Build
 import Turkey.Target as Target
@@ -169,6 +170,16 @@ fun freshName(l : Lowerer, hint : String) -> String {
 
 fun node(ty : Ty.Type, where : Option Span, k : CoreKind) -> Core =
     mkCore(ty, where, k)
+
+-- A `match`, with its patterns compiled into ones that do not nest; see
+-- `Turkey.Match`.
+fun matched(l : Lowerer, scrutinee : Core, arms : Array (Pat, Core), ty : Ty.Type,
+            where : Option Span) -> Core =
+    Match.compile(Match.Matcher {
+        decls = l.decls,
+        reduce = fun(t) = resolved(l, t),
+        fresh = freshName(l, _),
+    }, scrutinee, arms, ty, where)
 
 -- A placeholder for a type this pass fills in a moment later.
 fun unknown() -> Ty.Type = TVar(Ty.freshVar(0))
@@ -281,9 +292,8 @@ fun letBinds(l : Lowerer, stmt : Stmt, pat : Pat, value : Expr, mutable : Bool,
     let out = [newBind(holder, lowered.ty, Array.new(0), lowered, Some(stmt.span))]
     for name in Array.sort(patternVars(pat)) {
         let nty = nameType(l, name)
-        let picked = node(nty, Some(stmt.span), CMatch(
-            node(lowered.ty, Some(stmt.span), CVar(holder)),
-            [CAlt { pat = pat, body = node(nty, Some(stmt.span), CVar(name)) }]))
+        let picked = matched(l, node(lowered.ty, Some(stmt.span), CVar(holder)),
+            [(pat, node(nty, Some(stmt.span), CVar(name)))], nty, Some(stmt.span))
         Array.push(out, newBind(name, picked.ty, Array.new(0), picked,
                                 Some(stmt.span)))
     }
@@ -1064,8 +1074,7 @@ fun lambdaOf(l : Lowerer, params : Array Pat, body : Expr, ty : Ty.Type,
     }
     for var i = len(matches) - 1; i >= 0; i = i - 1 {
         let (holder, pat, pty) = matches[i]
-        out = node(out.ty, where, CMatch(node(pty, where, CVar(holder)),
-                                         [CAlt { pat = pat, body = out }]))
+        out = matched(l, node(pty, where, CVar(holder)), [(pat, out)], out.ty, where)
     }
     for var i = len(cells) - 1; i >= 0; i = i - 1 {
         -- A parameter something writes is a cell, made from the parameter
@@ -1218,12 +1227,12 @@ fun dispatch(l : Lowerer, e : Expr, scope : Scope) -> Core {
             let alts = Array.new(4)
             for arm in arms {
                 for pat in arm.patterns {
-                    Array.push(alts, CAlt { pat = pat, body = celled(l, pat,
+                    Array.push(alts, (pat, celled(l, pat,
                         arm.body, expr(l, arm.body, _),
-                        childScope(scope), Some(arm.span)) })
+                        childScope(scope), Some(arm.span))))
                 }
             }
-            node(ty, where, CMatch(expr(l, scrutinee, scope), alts))
+            matched(l, expr(l, scrutinee, scope), alts, ty, where)
         }
         EBlock(stmts) -> block(l, stmts, ty, where, childScope(scope))
         _ -> oops("cannot lower this expression", where)
@@ -1498,12 +1507,12 @@ fun convMatch(l : Lowerer, e : Expr, scrutinee : Expr, arms : Array Arm,
         let alts = Array.new(4)
         for arm in arms {
             for pat in arm.patterns {
-                Array.push(alts, CAlt { pat = pat, body = celled(l, pat,
+                Array.push(alts, (pat, celled(l, pat,
                     arm.body, conv(l, arm.body, _, k),
-                    childScope(scope), Some(arm.span)) })
+                    childScope(scope), Some(arm.span))))
             }
         }
-        node(ty, where, CMatch(s, alts))
+        matched(l, s, alts, ty, where)
     })
 }
 
@@ -1772,10 +1781,10 @@ fun forIn(l : Lowerer, e : Expr, pat : Pat, iterable : Expr, body : Expr,
     scope.cont = Some(name)
     let b = seqThen(l, body, childScope(scope),
                     node(TBottom, where, CJump(name, Array.new(0))))
-    (pending, node(TBottom, where, CMatch(step, [
-        CAlt { pat = mkPat(e, PCon(none, Array.new(0))), body = stop },
-        CAlt { pat = mkPat(e, PCon(some, [pat])), body = b },
-    ])))
+    (pending, matched(l, step, [
+        (mkPat(e, PCon(none, Array.new(0))), stop),
+        (mkPat(e, PCon(some, [pat])), b),
+    ], TBottom, where))
 }
 
 fun mkPat(e : Expr, k : PatKind) -> Pat =
@@ -2125,7 +2134,7 @@ fun bindPattern(l : Lowerer, stmt : Stmt, pat : Pat, source : Expr,
         -- A destructuring binding is a one-armed match, which is what it is.
         _ -> {
             let body = rest()
-            node(body.ty, at, CMatch(value, [CAlt { pat = bare, body = body }]))
+            matched(l, value, [(bare, body)], body.ty, at)
         }
     }
 }

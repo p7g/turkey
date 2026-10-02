@@ -132,7 +132,8 @@ let entryBytes : Int = 24
 -- -- state ------------------------------------------------------------------------------
 
 var regions : Prim.Ptr = Prim.ptrNull()
--- Per size class, the regions with a free slot, linked by `availableNext`.
+-- Per size class, the regions with a free slot that no cursor owns, linked by
+-- `availableNext`.
 var available : Prim.Ptr = zeroed(8 * regionClasses)
 var regionBytesInUse : Int = 0
 var regionBytesPeak : Int = 0
@@ -422,9 +423,10 @@ fun tableRemove(region : Prim.Ptr) -> Unit {
 -- Size classes are 32 to 256 bytes in steps of 16, then powers of two up to
 -- half a region. A request above that is large and gets a region of its own.
 --
--- Allocation takes slots a bitmap word at a time. A class's cursor holds the
--- free slots of one word of the region at the head of its available list,
--- already set in the region's allocation bitmap and counted in its `used`, in
+-- Allocation takes slots a bitmap word at a time. A class's cursor owns one
+-- region, taken off the class's available list, and holds the free slots of
+-- one word of it, already set in the region's allocation bitmap and counted
+-- in its `used`, in
 -- `heapCount` and in `allocationsSince`: so a slot is handed out by clearing a
 -- bit in the cursor, and nothing else is written until the word runs out.
 -- Generated code does exactly that for the small objects it allocates
@@ -433,8 +435,13 @@ fun tableRemove(region : Prim.Ptr) -> Unit {
 --
 -- Those reserved slots hold no object, so everything that reads the bitmaps
 -- or the counts -- a collection, the verifier, the C queries -- first calls
--- `retire`, which gives them back. After it, the heap is exactly what it
--- would be had each slot been allocated one at a time.
+-- `retire`, which gives them back, and gives up the regions, so that every
+-- region with a free slot is on its available list again. After it, the heap
+-- is exactly what it would be had each slot been allocated one at a time.
+--
+-- Owning a region is what lets several workers allocate at once: a region is
+-- written by the one worker whose cursor owns it, and the available lists,
+-- shared, are touched only to take a region or give one back.
 
 -- The byte offsets of a cursor's fields, and its size.
 let cursorFree : Int = 0
@@ -445,7 +452,10 @@ let cursorRegion : Int = 24
 let cursorWord : Int = 32
 let cursorBytes : Int = 64
 
-var cursors : Prim.Ptr = zeroed(cursorBytes * regionClasses)
+-- The cursors are the running worker's, one per class from 320 bytes into its
+-- record (`Prim.processState`), where `Turkey.Runtime` puts them and generated
+-- code finds them. The offset is a literal in `cursorOf` rather than a `let`
+-- because a `let` is a load from its global, on every slow-path allocation.
 
 -- The largest payload a size class holds: half a region, less the header.
 let smallPayload : Int = 32744
@@ -487,7 +497,8 @@ fun classOf(size : Int) -> Int =
 -- still small, and `allocateSlow` gives them their class.
 fun fastSize(size : Int) -> Bool = Prim.intShr(plus(size, 39), 15) == 0
 
-fun cursorOf(sizeClass : Int) -> Prim.Ptr = Prim.ptrAdd(cursors, Prim.intShl(sizeClass, 6))
+fun cursorOf(sizeClass : Int) -> Prim.Ptr =
+    Prim.ptrAdd(Prim.processState(), plus(320, Prim.intShl(sizeClass, 6)))
 
 -- The lowest of the cursor's free slots, `free`, which is not zero.
 fun takeSlot(cursor : Prim.Ptr, free : Int) -> Prim.Ptr {
@@ -508,23 +519,30 @@ fun bitIndex(lowest : Int) -> Int {
 }
 
 -- Fill the empty cursor of class `sizeClass` from the first word with a free
--- slot in the head of its available list, making a region if the list is
--- empty; False, with a panic raised, if there is no memory for one.
+-- slot in the region it owns, or, when that is full, in one it takes off the
+-- class's available list or makes; False, with a panic raised, if there is no
+-- memory for one. A full region it gives up is on no list, and the sweep puts
+-- it back on one if it frees a slot.
 --
 -- Under GC stress, and while statistics are wanted, it takes one slot, so that
 -- every allocation comes back here: generated code takes slots from a cursor
 -- itself (`Turkey.Select.allocateInline`) and tests nothing else, so an empty
 -- cursor is the only way to make an allocation collect or be counted.
 fun refill(cursor : Prim.Ptr, sizeClass : Int) -> Bool {
-    var region = Prim.loadPtr(available, times8(sizeClass))
-    if Prim.ptrIsNull(region) {
-        let slotBytes = classSlot(sizeClass)
-        region = newRegion(slotBytes, slotBytes, sizeClass, False)
-        if Prim.ptrIsNull(region) { return False }
+    var region = Prim.loadPtr(cursor, cursorRegion)
+    if Prim.ptrIsNull(region) || load32(region, regionUsed) == load32(region, regionCapacity) {
+        region = Prim.loadPtr(available, times8(sizeClass))
+        if Prim.ptrIsNull(region) {
+            -- A new region goes on the list, and so comes off it here too.
+            let slotBytes = classSlot(sizeClass)
+            region = newRegion(slotBytes, slotBytes, sizeClass, False)
+            if Prim.ptrIsNull(region) { return False }
+        }
+        Prim.storePtr(available, times8(sizeClass), Prim.loadPtr(region, regionAvailableNext))
+        Prim.storePtr(cursor, cursorRegion, region)
     }
     let capacity = load32(region, regionCapacity)
-    -- A region on an available list has a free slot below its capacity, so
-    -- this finds one.
+    -- The region has a free slot below its capacity, so this finds one.
     var w = load32(region, regionSearchWord)
     var taken = Prim.loadI64(region, plus(regionAllocated, times8(w)))
     while plus(taken, 1) == 0 {
@@ -543,9 +561,6 @@ fun refill(cursor : Prim.Ptr, sizeClass : Int) -> Bool {
     store32(region, regionUsed, used)
     store32(region, regionSearchWord,
             if plus(now, 1) == 0 && w < regionWords - 1 { plus(w, 1) } else { w })
-    if used == capacity {
-        Prim.storePtr(available, times8(sizeClass), Prim.loadPtr(region, regionAvailableNext))
-    }
     heapCount = plus(heapCount, n)
     allocationsSince = plus(allocationsSince, n)
     let slotSize = Prim.loadI64(region, regionSlotSize)
@@ -554,35 +569,36 @@ fun refill(cursor : Prim.Ptr, sizeClass : Int) -> Bool {
     Prim.storePtr(cursor, cursorBase,
                   Prim.ptrAdd(region, plus(regionData, Prim.intMulWrapping(Prim.intShl(w, 6), slotSize))))
     Prim.storeI64(cursor, cursorSlot, slotSize)
-    Prim.storePtr(cursor, cursorRegion, region)
     Prim.storeI64(cursor, cursorWord, w)
     True
 }
 
--- Give every cursor's unused slots back to its region: clear them from the
--- allocation bitmap and the counts, move the search back to their word, and
--- put a region they had filled back on its available list.
+-- Give every cursor's unused slots back to its region -- clear them from the
+-- allocation bitmap and the counts, and move the search back to their word --
+-- and give up the region, onto its available list if it has a free slot.
 fun retire() -> Unit {
     for var rc = 0; rc < regionClasses; rc = rc + 1 {
         let cursor = cursorOf(rc)
-        let left = Prim.loadI64(cursor, cursorFree)
-        if left != 0 {
-            let r = Prim.loadPtr(cursor, cursorRegion)
-            let lw = Prim.loadI64(cursor, cursorWord)
-            let at = plus(regionAllocated, times8(lw))
-            Prim.storeI64(r, at, Prim.intAnd(Prim.loadI64(r, at), complement(left)))
-            let n = population(left)
-            let wasUsed = load32(r, regionUsed)
-            if wasUsed == load32(r, regionCapacity) {
+        let r = Prim.loadPtr(cursor, cursorRegion)
+        if !Prim.ptrIsNull(r) {
+            let left = Prim.loadI64(cursor, cursorFree)
+            if left != 0 {
+                let lw = Prim.loadI64(cursor, cursorWord)
+                let at = plus(regionAllocated, times8(lw))
+                Prim.storeI64(r, at, Prim.intAnd(Prim.loadI64(r, at), complement(left)))
+                let n = population(left)
+                store32(r, regionUsed, load32(r, regionUsed) - n)
+                if lw < load32(r, regionSearchWord) { store32(r, regionSearchWord, lw) }
+                heapCount = heapCount - n
+                allocationsSince = allocationsSince - n
+                bytesSince = bytesSince - n * Prim.loadI64(r, regionSlotSize)
+                Prim.storeI64(cursor, cursorFree, 0)
+            }
+            if load32(r, regionUsed) < load32(r, regionCapacity) {
                 Prim.storePtr(r, regionAvailableNext, Prim.loadPtr(available, times8(rc)))
                 Prim.storePtr(available, times8(rc), r)
             }
-            store32(r, regionUsed, wasUsed - n)
-            if lw < load32(r, regionSearchWord) { store32(r, regionSearchWord, lw) }
-            heapCount = heapCount - n
-            allocationsSince = allocationsSince - n
-            bytesSince = bytesSince - n * Prim.loadI64(r, regionSlotSize)
-            Prim.storeI64(cursor, cursorFree, 0)
+            Prim.storePtr(cursor, cursorRegion, Prim.ptrNull())
         }
     }
 }

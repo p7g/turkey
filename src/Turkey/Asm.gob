@@ -1,6 +1,6 @@
 module Turkey.Asm (
     Asm(..), Dialect(..), Section(..), Symbol(..), SymbolKind(..), dialectFor, newAsm,
-    symbolFor, runtimeFor, messageSymbol, literalSlot, globalSlot, globalSymbol,
+    symbolFor, runtimeFor, messageSymbol, internMessage, literalSlot, globalSlot, globalSymbol,
     rootsSymbol, literalName, messageName, entrySymbol, globalsFrame,
     frameTableSymbol, localLabel, spell, page, pageOffset, section, functionType,
     architecture, calleeFor, turkeyEntry,
@@ -19,7 +19,9 @@ module Turkey.Asm (
 -- What must agree is *this* module and the arm64 emitter, which is why they
 -- are one file's worth of decisions rather than two.
 
+import Algorithm.Hash (fnv1a)
 import Data.Map as Map
+import Std.Classes (Hasher(..))
 import Turkey.LowIr as L
 import Turkey.LowIr (Op(..))
 import Turkey.Ssa as Ssa
@@ -182,8 +184,16 @@ fun runtimeFor(d : Dialect, name : String) -> Symbol = symbolFor(d, name)
 -- table.
 fun literalName(d : Dialect, index : Int) -> Symbol =
     localLabel(d, "str" + Int.toString(index))
-fun messageName(d : Dialect, index : Int) -> Symbol =
-    localLabel(d, "msg" + Int.toString(index))
+--
+-- A message is named by its text, not by when it was first mentioned, so that
+-- functions selected at once agree on its name without asking each other
+-- (`Turkey.Select.selectModule`). Two texts with one 63-bit hash would be one
+-- label defined twice, which the assembler refuses.
+fun messageName(d : Dialect, text : String) -> Symbol {
+    let h = fnv1a()
+    hashInto(text, h)
+    localLabel(d, "msg" + Int.toString(Int.and(digest(h), 0x7FFF_FFFF_FFFF_FFFF)))
+}
 
 -- The permanent root array, which the collector scans for the whole run.
 fun rootsSymbol(d : Dialect) -> Symbol = symbolFor(d, "turkey_module_roots")
@@ -212,10 +222,15 @@ fun globalSlot(a : Asm, name : String) -> Option Int = Map.get(a.globals, name)
 
 -- The message's symbol, interning it if this is the first mention.
 fun messageSymbol(a : Asm, text : String) -> Symbol {
+    internMessage(a, text)
+    messageName(a.dialect, text)
+}
+
+-- A message in the table, which is written in the order of first mentions.
+fun internMessage(a : Asm, text : String) -> Unit {
     if !Map.contains(a.messages, text) {
         Map.put(a.messages, text, len(a.messages))
     }
-    messageName(a.dialect, Map.getOr(a.messages, text, 0))
 }
 
 -- The root slot holding this literal's `TurkeyString`.

@@ -25,6 +25,7 @@ module Turkey.Select (
 -- rather than the hazard. The GC roots are the opposite case, and their
 -- *analysis* is shared, in `Turkey.Roots`.
 
+import System.Parallel as Parallel
 import Data.BitSet as BitSet
 import Data.BitSet (BitSet)
 import Data.Map as Map
@@ -89,6 +90,15 @@ type Sel = Sel {
     place : (Int, Int),
     publishers : Map Int (Map Int Int),
     publishedIn : Map Int BitSet,
+    -- The panic messages this function names, in the order it first names
+    -- them, for the module's table (`selectModule`). `asm` is only read.
+    messages : Array String,
+}
+
+-- `text`'s symbol, recorded as one this function names.
+fun messageOf(s : Sel, text : String) -> Asm.Symbol {
+    if !Array.contains(s.messages, text) { Array.push(s.messages, text) }
+    Asm.messageName(s.asm.dialect, text)
 }
 
 fun emit(s : Sel, op : A.Arm) -> Unit {
@@ -139,25 +149,33 @@ fun selectModule(m : Module, dialect : Asm.Dialect)
     -- One `Asm` for the module, because a literal interned by one function is
     -- the same literal in the next and the root array is one array.
     let asm = Asm.newAsm(m, dialect)
-    let done = []
-    let skipped = []
     -- One selection per function, answering both the function and, if it
     -- stopped, why. Both come out of one run: selection and the root
     -- analysis inside it are the expensive part, and asking twice doubles
-    -- them.
-    for f in m.functions {
+    -- them. Each on its own, on as many workers as there are: `asm` is only
+    -- read while they run, and the messages each names join the module's
+    -- table afterwards, in function order -- the order one selection after
+    -- another would have met them in.
+    let selected = Parallel.map(m.functions, fun(f) {
         let s = start(f, asm)
         run(s)
-        match s.stopped {
-            Some(why) -> Array.push(skipped, Unsupported { name = f.name, what = why })
-            None -> {
-                -- The same two passes the low IR had, over what selection
-                -- added: the temporaries, the moves between banks, and the
-                -- values a pattern selected around.
-                Clean.eliminateCopies(s.out, False)
-                Clean.eliminateDead(s.out)
-                Array.push(done, s.out)
-            }
+        if Option.isNone(s.stopped) {
+            -- The same two passes the low IR had, over what selection
+            -- added: the temporaries, the moves between banks, and the
+            -- values a pattern selected around.
+            Clean.eliminateCopies(s.out, False)
+            Clean.eliminateDead(s.out)
+        }
+        -- What the module needs of it, and not the selection's own state.
+        (s.out, s.stopped, s.messages)
+    })
+    let done = []
+    let skipped = []
+    for (out, stopped, messages) in selected {
+        for text in messages { Asm.internMessage(asm, text) }
+        match stopped {
+            Some(why) -> Array.push(skipped, Unsupported { name = out.name, what = why })
+            None -> Array.push(done, out)
         }
     }
     (done, skipped, asm)
@@ -178,7 +196,7 @@ fun start(f : Func Low, asm : Asm) -> Sel {
           frame = Roots.analyze(f), pending = None, panicking = False,
           known = constantsOf(f), definedIn = Array.new(0), definedAt = Array.new(0),
           allocations = BitSet.new(len(f.reps)), place = (0, 0),
-          publishers = Map.new(), publishedIn = Map.new() }
+          publishers = Map.new(), publishedIn = Map.new(), messages = [] }
 }
 
 fun placeDefinitions(s : Sel) -> Unit {
@@ -617,7 +635,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         -- bytes share the panic messages' table, since both are a C string
         -- the module interns; a code address names the thunk `Turkey.Emit`
         -- writes under the definition's C symbol.
-        Address(CBytes(text)) -> symbolAddress(s, d, Asm.messageSymbol(s.asm, text))
+        Address(CBytes(text)) -> symbolAddress(s, d, messageOf(s, text))
         Address(CodeOf(sym)) -> symbolAddress(s, d, runtimeSymbolOf(s, sym))
         -- Every function has a frame record, so `x29` is this frame.
         Address(ThisFrame) -> emit(s, A.Mov(d, A.fp, A.W64))
@@ -1426,7 +1444,7 @@ fun guard(s : Sel, condition : Value, message : String) -> Unit {
     -- An empty message means the panic is already raised and is being
     -- propagated out of a callee: this path adds a return, not a diagnosis.
     if message != "" {
-        let text = address(s, Asm.messageSymbol(s.asm, message))
+        let text = address(s, messageOf(s, message))
         s.panicking = True
         call(s, temp(s, Ssa.untraced(I64)), A.Gp, Some(A.Gp),
              Some(calleeOf(s, "turkey_panic")), A.xzr, [(text, A.Gp)],

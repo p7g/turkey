@@ -528,6 +528,20 @@ own line. The same holds wherever fields are listed: in a declaration, in a
 Field names must be distinct within one constructor. Different types may use
 the same field names.
 
+A constructor has at most 21 fields, positional or named, and a tuple at most
+21 elements. A wider value is an error where it is declared or written; group
+related fields into a record of their own instead.
+
+<!-- error: constructor 'Wide' has 22 fields, and a value can have at most 21 -->
+```kotlin
+type Wide = Wide {
+    f0 : Int, f1 : Int, f2 : Int, f3 : Int, f4 : Int, f5 : Int
+    f6 : Int, f7 : Int, f8 : Int, f9 : Int, f10 : Int, f11 : Int
+    f12 : Int, f13 : Int, f14 : Int, f15 : Int, f16 : Int, f17 : Int
+    f18 : Int, f19 : Int, f20 : Int, f21 : Int
+}
+```
+
 A record constructor is still a constructor with a payload. `Item("pen", 3, 12)`
 builds the same value as the record expression above, with the fields in
 declaration order, and `Item(n, p, q)` is a valid pattern for it.

@@ -34,6 +34,8 @@ import Turkey.Libc as Libc
 import Turkey.Lock as Lock
 import Turkey.Stack as Stack
 import Turkey.Workers as Workers
+import Target (OS(..))
+import Target as Target
 
 -- A coroutine's `waiting` state: neither queued nor parked (running, or
 -- queued to run); parked, until something wakes it; or woken while it was
@@ -47,6 +49,8 @@ var queueLock : Prim.Ptr = Lock.new()
 -- The tasks that can run, oldest first, from `head` on.
 var runnable : Array Co.Coroutine = []
 var head = 0
+-- How many tasks some worker has taken to run and not yet suspended.
+var running = 0
 
 fun lock() -> Unit = Workers.acquire(queueLock)
 fun unlock() -> Unit = Lock.release(queueLock)
@@ -64,7 +68,8 @@ fun wake(c : Co.Coroutine) -> Unit {
     }
 }
 
--- The next runnable coroutine. Under the lock.
+-- The next runnable coroutine, counted as running until `run` has seen it
+-- suspend. Under the lock.
 fun next() -> Option Co.Coroutine {
     if head == len(runnable) {
         if head > 0 {
@@ -75,6 +80,7 @@ fun next() -> Option Co.Coroutine {
     }
     let c = runnable[head]
     head = head + 1
+    running = running + 1
     Some(c)
 }
 
@@ -90,6 +96,7 @@ fun take() -> Option Co.Coroutine {
 fun run(c : Co.Coroutine) -> Unit {
     Co.resume(c)
     lock()
+    running = running - 1
     if !Co.finished(c) {
         if Co.waiting(c) == woken {
             Co.waitingSet(c, active)
@@ -124,22 +131,20 @@ fun waitUntil(done : fun() -> Bool, register : fun(Co.Coroutine) -> Unit) -> Uni
                 return {}
             }
             let c = next()
+            -- Nothing to run here or anywhere, and nothing done: only a task
+            -- could make it so, and every task is waiting.
+            let stuck = Option.isNone(c) && running == 0
             unlock()
             match c {
                 Some(c) -> run(c)
-                None -> idle()
+                None -> if stuck {
+                    return Prim.error("deadlock: every task is waiting")
+                } else {
+                    Heap.pause()
+                }
             }
         }
     }
-}
-
--- Nothing to run, and what is being waited for not done: other workers may
--- be running the task that will finish it. With one worker, nothing can make
--- it hold: every task is waiting on another, or on the program's own code,
--- which is waiting here.
-fun idle() -> Unit {
-    if Workers.count() == 1 { return Prim.error("deadlock: every task is waiting") }
-    Heap.pause()
 }
 
 -- Let the other runnable tasks run before going on. On a worker's own stack,
@@ -187,10 +192,11 @@ fun start() -> Int {
     wanted
 }
 
--- `TURKEY_WORKERS`, a decimal count, or 1.
+-- `TURKEY_WORKERS`, a decimal count, or else one per core that runs at full
+-- speed (`cores`).
 fun workersWanted() -> Int {
     let text = Libc.getenv(Prim.cString("TURKEY_WORKERS"))
-    if Prim.ptrIsNull(text) { return 1 }
+    if Prim.ptrIsNull(text) { return cores() }
     var n = 0
     var at = 0
     while True {
@@ -200,6 +206,38 @@ fun workersWanted() -> Int {
         at = at + 1
     }
     if n < 1 { 1 } else { n }
+}
+
+-- The cores worth a worker each, at most `Turkey.Workers`' limit and at least
+-- one. On Darwin the performance cores: an efficiency core is a fraction of
+-- one, and a worker there holds up whatever waits on it -- a parallel map's
+-- last chunk, a collection's mark. A Mac without performance levels says so by
+-- having no `hw.perflevel0`, and has its physical cores counted instead. On
+-- Linux every online processor, since nothing portable says which are which.
+fun cores() -> Int {
+    let n = match Target.os {
+        Darwin -> {
+            let perf = sysctlInt(Prim.cString("hw.perflevel0.physicalcpu"))
+            if perf > 0 { perf } else { sysctlInt(Prim.cString("hw.physicalcpu")) }
+        }
+        -- `_SC_NPROCESSORS_ONLN`.
+        Linux -> Libc.sysconf(84)
+    }
+    if n < 1 { 1 } else if n > 64 { 64 } else { n }
+}
+
+-- A 32-bit `sysctl` value, or 0 if there is none.
+fun sysctlInt(name : Prim.Ptr) -> Int {
+    let buffer = Libc.malloc(16)
+    if Prim.ptrIsNull(buffer) { return 0 }
+    Prim.storeI64(buffer, 0, 0)
+    Prim.storeI64(buffer, 8, 4)
+    let status = Libc.sysctlbyname(name, buffer, Prim.ptrAdd(buffer, 8), Prim.ptrNull(), 0)
+    let value = if Prim.intAnd(status, 0xFFFF_FFFF) == 0 {
+        Prim.charToInt(Prim.loadI32(buffer, 0))
+    } else { 0 }
+    Libc.free(buffer)
+    value
 }
 
 -- A worker thread's Turkey code: its stack registered, then tasks, until the

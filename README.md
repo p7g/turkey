@@ -94,10 +94,13 @@ arguments lists the stages. `build --timings` reports on standard error how
 long each phase took, how the backend's time is spread over functions, and how
 much of the optimizer's work could run in parallel.
 
-`TURKEY_WORKERS=N` runs a program's tasks (`System.Task`) on N threads instead
-of one, and the compiler is such a program: `TURKEY_WORKERS=8
-build/stages/stage2 build ...` compiles each function's passes and code in
-parallel, and emits the same bytes as one worker does.
+A program's tasks (`System.Task`, `System.Parallel`) run on one worker thread
+per performance core -- every core, on a Mac without performance levels or on
+Linux -- and the compiler is such a program: it compiles in parallel, and emits
+the same bytes however many workers it has. `TURKEY_WORKERS=N` sets the number
+of workers; `TURKEY_WORKERS=1` runs tasks interleaved on the program's own
+thread, in a fixed order. The test suite sets it to 1 for everything it runs
+unless a test asks for more, since it runs a process per core already.
 
 The compiler that builds it is `bootstrap/`, which holds its own arm64
 assembly for macOS and for Linux, gzip'd. `scripts/build.sh` builds for whichever of the two the C compiler

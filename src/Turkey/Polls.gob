@@ -3,9 +3,9 @@ module Turkey.Polls (insert)
 -- Polls: where a worker running a loop stops for a collection.
 --
 -- With several workers, a collection stops every worker at a safepoint first.
--- A worker reaches one whenever it allocates past its cursor or calls, but a
--- loop may do neither for as long as it likes, and every other worker would
--- wait for it. So every loop's back edge gets a `Poll`: a test of the worker's
+-- A worker reaches one when an allocation goes to the runtime, but a loop may
+-- not allocate for as long as it likes, and every other worker would wait for
+-- it. So a loop's back edge gets a `Poll`: a test of the worker's
 -- stop word, and a call to the runtime (`turkey_poll`) when a stop has been
 -- asked for.
 --
@@ -17,10 +17,15 @@ module Turkey.Polls (insert)
 -- (`Turkey.Emit.poll`), off the loop's path, saving exactly the registers
 -- that are live there and storing the roots that are.
 --
--- Every back edge, without trying to prove that the loop's body already
--- reaches a safepoint on every iteration: a call or an allocation that is
--- conditional does not, and an allocation reaches the runtime only once its
--- cursor's word runs out.
+-- A loop needs no poll when every path around it allocates on the heap
+-- (OCaml's rule too, where every allocation tests for a pending stop): an
+-- allocation takes a slot from its size class's cursor, whose word of
+-- free slots holds at most 64, and the runtime's slow path behind it stops
+-- the worker when asked, so the loop reaches it within 64 iterations. A call
+-- does not count, however often the loop makes it: a callee that neither
+-- loops nor allocates returns without ever testing the stop word, and a loop
+-- calling one would run past every stop. Nor does an allocation in the frame
+-- (`StackObject`), which takes nothing from the heap.
 --
 -- Not in the runtime's own modules (`Turkey.Giblets`): the collector's loops
 -- run with every other worker stopped, and code that may not allocate may not
@@ -31,8 +36,8 @@ import Turkey.LowIr (Op(..), Low(..))
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (BlockId(..), RepClass(..), Term(..))
 
--- Add a poll to every back edge of `f`: an edge to a block that dominates
--- the block it leaves.
+-- Add a poll to every back edge of `f` -- an edge to a block that dominates
+-- the block it leaves -- whose loop can go around without allocating.
 fun insert(f : Ssa.Func Low) -> Unit {
     let idom = Ssa.dominators(f)
     let edges = []
@@ -47,7 +52,49 @@ fun insert(f : Ssa.Func Low) -> Unit {
             }
         }
     }
-    for (from, header) in edges { poll(f, from, header) }
+    let allocating = []
+    for block in f.blocks { Array.push(allocating, allocates(block)) }
+    for (from, header) in edges {
+        if !always(f, allocating, header) { poll(f, from, header) }
+    }
+}
+
+fun allocates(block : Ssa.Block Low) -> Bool {
+    for i in block.insts {
+        match i.op {
+            ObjectNew(_, _, _, _, _) -> return True
+            ArrayNew(_, _, _) -> return True
+            CellNew(_) -> return True
+            ClosureNew(_, _) -> return True
+            _ -> {}
+        }
+    }
+    False
+}
+
+-- Whether every path from `header` back to it goes through a block that
+-- allocates. A block's instructions are straight-line code, so a path through
+-- a block passes every allocation in it; a path that leaves the function
+-- never comes back.
+fun always(f : Ssa.Func Low, allocating : Array Bool, header : Int) -> Bool {
+    if allocating[header] { return True }
+    let seen = Array.filled(len(f.blocks), False)
+    let work = [header]
+    while True {
+        let b = match Array.pop(work) {
+            Some(b) -> b
+            None -> break
+        }
+        for target in Ssa.successors(f.blocks[b].term) {
+            let t = Ssa.blockId(target)
+            if t == header { return False }
+            if !seen[t] && !allocating[t] {
+                seen[t] = True
+                Array.push(work, t)
+            }
+        }
+    }
+    True
 }
 
 -- Put a poll on the edge from `from` to `header`: at the end of `from` when it

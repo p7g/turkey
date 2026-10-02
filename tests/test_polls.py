@@ -10,6 +10,7 @@ roots it stores from registers and the registers it keeps across its call.
 import re
 
 from tests import bootc, lang
+from tests.test_memory_model import function
 
 STRESS = {"TURKEY_GC_STRESS": "1"}
 VERIFY = ("--gc-verify",)
@@ -49,5 +50,50 @@ def test_a_loop_tests_the_stop_word_on_its_back_edge(tmp_path):
 def test_collecting_at_polls_keeps_what_the_loops_hold():
     plain = lang.output(LOOPS)
     result = lang.run(LOOPS, env=STRESS, flags=VERIFY)
+    assert result.code == 0, result.stderr
+    assert result.stdout == plain
+
+
+# One loop allocates on every iteration, and reaches the allocator's slow
+# path, which stops the worker when asked, within a cursor's word of slots;
+# the other allocates on only some, and can go around without it.
+ALLOCATING = """
+fun every(n : Int) -> Array (Option Int) {
+    let xs = Array.filled(n, None)
+    for var i = 0; i < n; i = i + 1 { xs[i] = Some(i) }
+    xs
+}
+
+fun some(n : Int) -> Array (Option Int) {
+    let xs = Array.filled(n, None)
+    for var i = 0; i < n; i = i + 1 {
+        if i % 3 == 0 { xs[i] = Some(i) }
+    }
+    xs
+}
+
+fun main() {
+    print(len(every(3)) + len(every(4)))
+    print(len(some(3)) + len(some(4)))
+}
+"""
+
+
+def polls(asm, name):
+    return sum(1 for line in function(asm, name)
+               if line == "ldr x16, [x28, #272]")
+
+
+def test_a_loop_that_allocates_on_every_path_needs_no_poll(tmp_path):
+    source = tmp_path / "main.gob"
+    source.write_text(ALLOCATING)
+    text = bootc.boot(*bootc.argv("asm"), str(source))
+    assert polls(text, "Main#every") == 0
+    assert polls(text, "Main#some") == 1
+
+
+def test_collecting_while_allocating_loops_run():
+    plain = lang.output(ALLOCATING)
+    result = lang.run(ALLOCATING, env=STRESS, flags=VERIFY)
     assert result.code == 0, result.stderr
     assert result.stdout == plain

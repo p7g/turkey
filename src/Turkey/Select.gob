@@ -81,6 +81,14 @@ type Sel = Sel {
     definedIn : Array Int,
     definedAt : Array Int,
     allocations : BitSet,
+    -- For the fence's exemption (`unpublished`): the low IR instruction being
+    -- selected, as its block and index; per fresh allocation, the first
+    -- instruction in each block that can publish it, the terminator counting
+    -- as one past the last; and, once asked for, the blocks entered after it
+    -- may have been.
+    place : (Int, Int),
+    publishers : Map Int (Map Int Int),
+    publishedIn : Map Int BitSet,
 }
 
 fun emit(s : Sel, op : A.Arm) -> Unit {
@@ -169,7 +177,8 @@ fun start(f : Func Low, asm : Asm) -> Sel {
     Sel { source = f, out = g, at = 0, stopped = None, asm = asm,
           frame = Roots.analyze(f), pending = None, panicking = False,
           known = constantsOf(f), definedIn = Array.new(0), definedAt = Array.new(0),
-          allocations = BitSet.new(len(f.reps)) }
+          allocations = BitSet.new(len(f.reps)), place = (0, 0),
+          publishers = Map.new(), publishedIn = Map.new() }
 }
 
 fun placeDefinitions(s : Sel) -> Unit {
@@ -192,6 +201,85 @@ fun placeDefinitions(s : Sel) -> Unit {
             }
         }
     }
+    -- Every use is after the definition, so the allocations are all known.
+    for var b = 0; b < len(f.blocks); b = b + 1 {
+        let insts = f.blocks[b].insts
+        for var n = 0; n < len(insts); n = n + 1 {
+            for v in publishingUses(insts[n].op) { publisher(s, v, b, n) }
+        }
+        for v in Ssa.termUses(f.blocks[b].term) { publisher(s, v, b, len(insts)) }
+    }
+}
+
+fun publisher(s : Sel, v : Value, b : Int, n : Int) -> Unit {
+    let id = Ssa.valueId(v)
+    if !BitSet.contains(s.allocations, id) { return }
+    let firsts = match Map.get(s.publishers, id) {
+        Some(m) -> m
+        None -> {
+            let m = Map.new()
+            Map.put(s.publishers, id, m)
+            m
+        }
+    }
+    if !Map.contains(firsts, b) { Map.put(firsts, b, n) }
+}
+
+-- The operands an operation could hand to something else: all but the object
+-- a load or a store addresses, which it reads or writes and does not pass on.
+-- A conservative list -- a call, a phi, a return, a store of the object
+-- itself -- is what keeps `unpublished` sound.
+fun publishingUses(op : Op) -> Array Value = match op {
+    ObjectGet(_, _) | ObjectTag(_) | ArrayLength(_) | CellLoad(_) -> []
+    ArrayGet(_, index) -> [index]
+    ObjectSet(_, _, v) -> [v]
+    ArraySet(_, index, v) -> [index, v]
+    CellStore(_, v) -> [v]
+    _ -> L.opUses(op)
+}
+
+-- Whether `target` is an object this function allocated that nothing has been
+-- given yet, on any path to the instruction being selected: no other task can
+-- reach it, so no other task can see the order of a store to it.
+fun unpublished(s : Sel, target : Value) -> Bool {
+    if len(s.definedIn) == 0 { placeDefinitions(s) }
+    let t = Ssa.valueId(target)
+    if !BitSet.contains(s.allocations, t) { return False }
+    let firsts = match Map.get(s.publishers, t) {
+        Some(m) -> m
+        None -> return True
+    }
+    let (b, n) = s.place
+    match Map.get(firsts, b) {
+        Some(first) -> if first < n { return False }
+        None -> {}
+    }
+    !BitSet.contains(publishedBlocks(s, t, firsts), b)
+}
+
+-- The blocks reachable from a block that may publish `t`, by at least one
+-- edge: a loop can carry a publication back to its own head.
+fun publishedBlocks(s : Sel, t : Int, firsts : Map Int Int) -> BitSet {
+    match Map.get(s.publishedIn, t) {
+        Some(reached) -> return reached
+        None -> {}
+    }
+    let blocks = s.source.blocks
+    let reached = BitSet.new(len(blocks))
+    let work = []
+    for (b, _) in Map.entries(firsts) { Array.push(work, b) }
+    for var k = 0; k < len(work); k = k + 1 {
+        let b = work[k]
+        for next in Ssa.successors(blocks[b].term) {
+            let id = Ssa.blockId(next)
+            if !BitSet.contains(reached, id) {
+                BitSet.add(reached, id)
+                Array.push(work, id)
+            }
+        }
+    }
+    Map.put(s.publishedIn, t, reached)
+    reached
 }
 
 fun constantsOf(f : Func Low) -> Map Int Int {
@@ -308,6 +396,7 @@ fun run(s : Sel) -> Unit {
                 }
                 s.pending = Some((b, n))
             }
+            s.place = (b, n)
             selectInst(s, insts[n])
             -- A safepoint selected without a call -- a closure capture is a
             -- store -- has nothing to mark, and nothing can collect inside it.
@@ -461,7 +550,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         ArrayLength(target) -> emit(s, A.Ldr(d, A.Offset(A.reg(target), 8), A.W64))
         CellLoad(target) -> emit(s, A.Ldr(d, A.Offset(A.reg(target), 0), A.W64))
         CellStore(target, v) -> {
-            ordered(s)
+            ordered(s, target)
             emit(s, A.Str(A.reg(v), A.Offset(A.reg(target), 0), A.W64))
             if barrierNeeded(s, target, v) { barrier(s, A.reg(target), A.reg(v)) }
             -- A `str` of a `d` register stores the same bits a `str` of an
@@ -482,7 +571,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             }
         }
         ArraySet(target, index, v) -> {
-            ordered(s)
+            ordered(s, target)
             withinStorage(s, A.reg(target), A.reg(index))
             let held = Ssa.repOf(s.source, v)
             let at = elementAt(s, A.reg(target), A.reg(index), held.class_)
@@ -514,7 +603,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         Address(AllocSites) -> symbolAddress(s, d, runtimeSymbolOf(s, sitesSymbol))
         GlobalLoad(name) -> emit(s, A.Ldr(d, globalAt(s, name), A.W64))
         GlobalStore(name, v) -> {
-            ordered(s)
+            emit(s, A.DmbLoad)
             emit(s, A.Str(A.reg(v), globalAt(s, name), A.W64))
             emit(s, A.Mov(d, A.xzr, A.W64))
         }
@@ -548,7 +637,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             }
         }
         ObjectSet(target, index, v) -> {
-            ordered(s)
+            ordered(s, target)
             storeField(s, A.reg(target), index, A.reg(v))
             if barrierNeeded(s, target, v) { barrier(s, A.reg(target), A.reg(v)) }
             emit(s, A.Mov(d, A.xzr, A.W64))
@@ -609,7 +698,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             emit(s, A.FrameAddress(d, A.ObjectSlot(k, 0)))
         }
         ClosureCapture(closure, index, v) -> {
-            ordered(s)
+            emit(s, A.DmbLoad)
             let env = temp(s, Ssa.traced(Ptr))
             emit(s, A.Ldr(env, A.Offset(A.reg(closure), 32), A.W64))
             emit(s, A.Str(A.reg(v), A.Offset(env, 24 + 8 * index), A.W64))
@@ -709,15 +798,23 @@ fun immediate(s : Sel, n : Int) -> Reg {
 -- whatever races happen elsewhere, earlier or later. arm64 lets a store
 -- become visible before an earlier load has read its value, which would let a
 -- later race reach back into a read that had none; `dmb ishld` forbids
--- exactly that reordering and nothing more, which is what keeps it cheap.
--- The property is local DRF, and this the cheapest of the arm64 schemes
--- Dolan, Sivaramakrishnan and Madhavapeddy measured for it ("Bounding Data
--- Races in Space and Time", PLDI 2018).
+-- exactly that reordering. The property is local DRF, and the scheme is the
+-- cheaper of the two arm64 ones Dolan, Sivaramakrishnan and Madhavapeddy
+-- measured for it ("Bounding Data Races in Space and Time", PLDI 2018). The
+-- other, a dependent branch after every mutable load, costs more here too.
 --
--- Not before a store that initializes an object being built, which nothing
--- else can see yet, and not before a raw store (`PtrStore`), which is the
--- runtime's own memory and outside the language's model.
-fun ordered(s : Sel) -> Unit = emit(s, A.DmbLoad)
+-- A fence is cheap on average and dear in a loop: one per byte of a copy
+-- costs more than the copy. Nearly all of the fences that matter are in the
+-- loops filling a fresh array, which is what the exemption below is for.
+--
+-- Not before a store into an object this function allocated and has not yet
+-- handed to anything (`unpublished`) -- which covers initializing one, and
+-- filling an array before it is returned -- since no other task can see it;
+-- and not before a raw store (`PtrStore`), which is the runtime's own memory
+-- and outside the language's model.
+fun ordered(s : Sel, target : Value) -> Unit {
+    if !unpublished(s, target) { emit(s, A.DmbLoad) }
+}
 
 -- Panic unless `index` is within `array`'s own length.
 --

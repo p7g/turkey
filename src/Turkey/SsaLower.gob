@@ -28,7 +28,7 @@ module Turkey.SsaLower (
 import Data.Map as Map
 import Data.Set as Set
 import Turkey.Core as Core
-import Turkey.Core (Core(..), CoreKind(..), CParam(..), CBind(..), CProgram(..),
+import Turkey.Core (Core(..), CoreKind(..), CParam(..), CBind(..), CProgram(..), Alt(..),
                     Mapper(..))
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..), Compact(..))
@@ -48,7 +48,7 @@ import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..), Term(..),
 import Turkey.Types as Ty
 import Turkey.Types (TCon, TTuple, TFun, TBottom)
 import Turkey.Ast as Ast
-import Turkey.Ast (Lit(..), Pat(..), PatKind(..), Opening(..), patternVars)
+import Turkey.Ast (Lit(..), Opening(..))
 
 -- What is not lowered yet: the binding, and the form that stopped it.
 -- Carried rather than thrown so a driver can report coverage over a corpus --
@@ -750,12 +750,12 @@ fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
                 let success = L.block(l.b)
                 let failure = if i + 1 == len(alts) { failed } else { L.block(l.b) }
                 L.into(l.b, test)
-                let was = saving(l, patternVars(alts[i].pat))
-                -- An existential arm's copy is lowered under the layouts its
-                -- pattern names for the constants it opens.
+                let was = saving(l, Core.altVars(alts[i].alt))
+                -- An existential arm's copy is lowered under the layouts it
+                -- names for the constants it opens.
                 let outer = l.layouts
-                l.layouts = openedLayoutsFor(alts[i].pat, outer)
-                pattern(l, alts[i].pat, whole, scrutinee.ty, success, failure)
+                l.layouts = openedLayoutsFor(alts[i].alt, outer)
+                testArm(l, alts[i].alt, whole, scrutinee.ty, success, failure)
                 L.into(l.b, success)
                 lower(l, alts[i].body, dest)
                 l.layouts = outer
@@ -776,75 +776,39 @@ fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
     }
 }
 
--- -- patterns ----------------------------------------------------------------------
+-- -- arms ----------------------------------------------------------------------------
 
--- Test `p` against `v`, binding what it binds, and terminate the current block
--- into `success` or `failure`.
+-- Test `alt` against `v`, binding what it binds, and terminate the current
+-- block into `success` or `failure`.
 --
--- No slots and no re-loading. `turkey/backend_lower.py` stores the scrutinee
--- into a slot and loads it again in every test block, because a value there
--- does not survive a branch; here it does, so a sub-pattern reads the value
--- the test above it already has.
-fun pattern(l : Lower, p : Pat, v : Value, ty : Ty.Type,
+-- One level: the parts an arm binds are variables, so nothing here recurses.
+-- A value read for a part nobody binds is not read at all.
+fun testArm(l : Lower, alt : Alt, v : Value, ty : Ty.Type,
             success : BlockId, failure : BlockId) -> Unit {
     match l.stopped {
         Some(_) -> return
         None -> {}
     }
-    match p.opening {
-        Some(o) -> {
-            opened(l, p, o, v, ty, success, failure)
-            return
-        }
-        None -> {}
-    }
-    match p.kind {
-        PAnnot(inner, _) -> pattern(l, inner, v, ty, success, failure)
-        PWild -> L.terminate(l.b, Jump(success, []))
-        PVar(name) -> {
-            Map.put(l.env, name, v)
+    match alt {
+        AAny(binder) -> {
+            bindTo(l, binder, v)
             L.terminate(l.b, Jump(success, []))
         }
-        PLit(LString(text)) -> stringTest(l, text, v, success, failure)
-        PLit(lit) -> {
+        ALit(LString(text)) -> stringTest(l, text, v, success, failure)
+        ALit(lit) -> {
             let test = literalTest(l, lit, v)
             L.terminate(l.b, Branch(test, success, failure))
         }
-        PTuple(elems) -> {
-            let elemTypes = match Ty.prune(ty) {
+        ATuple(binders) -> {
+            let types = match Ty.prune(ty) {
                 TTuple(ts) -> ts
                 _ -> []
             }
-            let pieces = []
-            for var i = 0; i < len(elems) && i < len(elemTypes); i = i + 1 {
-                Array.push(pieces, (i, elems[i], elemTypes[i]))
-            }
-            destructure(l, v, pieces, success, failure)
+            destructure(l, v, positions(binders, types, 0))
+            L.terminate(l.b, Jump(success, []))
         }
-        PRecord(name, fields, _) -> {
-            let order = match Decls.con(l.decls, name) {
-                Some(info) -> match info.fields {
-                    Some(names) -> names
-                    None -> []
-                }
-                None -> []
-            }
-            let types = match Decls.conFieldTypes(l.decls, ty, name) {
-                Some(ts) -> ts
-                None -> []
-            }
-            let pieces = []
-            for (label, sub) in fields {
-                match Array.indexOf(order, label) {
-                    Some(i) -> if i < len(types) {
-                        Array.push(pieces, (i, sub, types[i]))
-                    }
-                    None -> {}
-                }
-            }
-            tested(l, v, name, ty, pieces, success, failure)
-        }
-        PCon(name, args) -> {
+        ACon(name, binders, Some(o)) -> opened(l, name, binders, o, v, ty, success, failure)
+        ACon(name, binders, None) -> {
             if name == P.boolFalse || name == P.boolTrue {
                 let want = L.emit(l.b, ConstInt(if name == P.boolTrue { 1 } else { 0 }),
                                   Ssa.untraced(I1))
@@ -855,16 +819,14 @@ fun pattern(l : Lower, p : Pat, v : Value, ty : Ty.Type,
             -- The wrapper is not there, so there is no tag to test and nothing
             -- to take out: the value in hand already *is* the payload. See
             -- `Decls.newtypes`.
-            match Decls.erasedPayload(l.decls, ty) {
-                Some(payload) -> if len(args) == 1 {
-                    pattern(l, args[0], v, payload, success, failure)
-                    return
-                }
-                None -> {}
+            if Option.isSome(Decls.erasedPayload(l.decls, ty)) && len(binders) == 1 {
+                bindTo(l, binders[0], v)
+                L.terminate(l.b, Jump(success, []))
+                return
             }
             match compactAt(l, name, ty) {
                 Some(c) -> {
-                    compactPattern(l, c, name, args, v, ty, success, failure)
+                    compactTest(l, c, name, binders, v, ty, success, failure)
                     return
                 }
                 None -> {}
@@ -873,25 +835,37 @@ fun pattern(l : Lower, p : Pat, v : Value, ty : Ty.Type,
                 Some(ts) -> ts
                 None -> []
             }
-            let pieces = []
-            for var i = 0; i < len(args) && i < len(types); i = i + 1 {
-                Array.push(pieces, (i, args[i], types[i]))
-            }
-            tested(l, v, name, ty, pieces, success, failure)
+            if !tested(l, v, name, failure) { return }
+            destructure(l, v, positions(binders, types, 0))
+            L.terminate(l.b, Jump(success, []))
         }
     }
+}
+
+fun bindTo(l : Lower, binder : Option String, v : Value) -> Unit = match binder {
+    Some(name) -> Map.put(l.env, name, v)
+    None -> {}
+}
+
+-- The fields an arm binds: each one's slot in the object, counting from
+-- `first`, its name, and its type.
+fun positions(binders : Array (Option String), types : Array Ty.Type,
+              first : Int) -> Array (Int, String, Ty.Type) {
+    let out = []
+    for var i = 0; i < len(binders) && i < len(types); i = i + 1 {
+        match binders[i] {
+            Some(name) -> Array.push(out, (first + i, name, types[i]))
+            None -> {}
+        }
+    }
+    out
 }
 
 -- Opening a packed existential: the tag, then the stored layout codes against
 -- the ones this copy of the arm was lowered for, then the carried dictionaries,
 -- then the fields.
-fun opened(l : Lower, p : Pat, o : Opening, v : Value, ty : Ty.Type,
-           success : BlockId, failure : BlockId) -> Unit {
-    let name = match p.kind {
-        PCon(n, _) -> n
-        PRecord(n, _, _) -> n
-        _ -> return stop1(l, "an opening that is not a constructor pattern")
-    }
+fun opened(l : Lower, name : String, binders : Array (Option String), o : Opening,
+           v : Value, ty : Ty.Type, success : BlockId, failure : BlockId) -> Unit {
     let layouts = match o.layouts {
         Some(ls) -> ls
         None -> return stop1(l, "an arm opening '" + name
@@ -901,19 +875,7 @@ fun opened(l : Lower, p : Pat, o : Opening, v : Value, ty : Ty.Type,
         Some(i) -> i
         None -> return stop1(l, "unknown constructor '" + name + "'")
     }
-    if Decls.variantCount(l.decls, name) > 1 {
-        match Map.get(l.tags, name) {
-            Some(tag) -> {
-                let seen = L.emit(l.b, ObjectTag(v), Ssa.untraced(I32))
-                let want = L.emit(l.b, ConstInt(tag), Ssa.untraced(I32))
-                let test = L.emit(l.b, Cmp(Eq, seen, want), Ssa.untraced(I1))
-                let next = L.block(l.b)
-                L.terminate(l.b, Branch(test, next, failure))
-                L.into(l.b, next)
-            }
-            None -> return stop1(l, "the constructor '" + name + "' has no tag")
-        }
-    }
+    if !tested(l, v, name, failure) { return }
     for var i = 0; i < len(layouts); i = i + 1 {
         let code = L.emit(l.b, ObjectGet(v, i), Ssa.untraced(I64))
         let want = L.emit(l.b, ConstInt(keyCode(layouts[i])), Ssa.untraced(I64))
@@ -933,28 +895,8 @@ fun opened(l : Lower, p : Pat, o : Opening, v : Value, ty : Ty.Type,
         Some(ts) -> ts
         None -> []
     }
-    let pieces = []
-    match p.kind {
-        PCon(_, args) -> for var i = 0; i < len(args) && i < len(types); i = i + 1 {
-            Array.push(pieces, (exists + carried + i, args[i], types[i]))
-        }
-        PRecord(_, fields, _) -> {
-            let order = match info.fields {
-                Some(names) -> names
-                None -> []
-            }
-            for (label, sub) in fields {
-                match Array.indexOf(order, label) {
-                    Some(i) -> if i < len(types) {
-                        Array.push(pieces, (exists + carried + i, sub, types[i]))
-                    }
-                    None -> {}
-                }
-            }
-        }
-        _ -> {}
-    }
-    destructure(l, v, pieces, success, failure)
+    destructure(l, v, positions(binders, types, exists + carried))
+    L.terminate(l.b, Jump(success, []))
 }
 
 fun stop1(l : Lower, message : String) -> Unit {
@@ -962,70 +904,54 @@ fun stop1(l : Lower, message : String) -> Unit {
     {}
 }
 
--- The layouts an arm's openings name, over the ones already in force.
-fun openedLayoutsFor(p : Pat, outer : Map String String) -> Map String String {
+-- The layouts an arm's opening names, over the ones already in force.
+fun openedLayoutsFor(alt : Alt, outer : Map String String) -> Map String String {
+    let o = match Core.openingOf(alt) {
+        Some(o) -> o
+        None -> return outer
+    }
     let inner = Map.new()
     for (id_, layout) in Map.entries(outer) { Map.put(inner, id_, layout) }
-    for opening in Core.openings(p) {
-        match opening.opening {
-            Some(o) -> match o.layouts {
-                Some(ls) -> for var i = 0; i < len(o.skolems) && i < len(ls);
-                                i = i + 1 {
-                    Map.put(inner, Layout.skolemKey(o.skolems[i]), ls[i])
-                }
-                None -> {}
-            }
-            None -> {}
+    match o.layouts {
+        Some(ls) -> for var i = 0; i < len(o.skolems) && i < len(ls); i = i + 1 {
+            Map.put(inner, Layout.skolemKey(o.skolems[i]), ls[i])
         }
+        None -> {}
     }
     inner
 }
 
--- The tag test a constructor pattern needs, and then its contents.
+-- The tag test a constructor needs, continuing in a block reached only when it
+-- passes; `False` if the lowering stopped.
 --
 -- A type with one constructor has nothing to distinguish, and reading the tag
 -- to compare it against the only value it can hold costs a load, a compare and
 -- a branch on the hot path -- `Array a = Array(ArrayStorage a)` would pay it
 -- on every element access. Exhaustiveness already knows the match is total;
 -- this is the lowering agreeing with it.
-fun tested(l : Lower, v : Value, name : String, ty : Ty.Type,
-           pieces : Array (Int, Pat, Ty.Type),
-           success : BlockId, failure : BlockId) -> Unit {
-    if Decls.variantCount(l.decls, name) > 1 {
-        match Map.get(l.tags, name) {
-            Some(tag) -> {
-                let seen = L.emit(l.b, ObjectTag(v), Ssa.untraced(I32))
-                let want = L.emit(l.b, ConstInt(tag), Ssa.untraced(I32))
-                let test = L.emit(l.b, Cmp(Eq, seen, want), Ssa.untraced(I1))
-                let contents = L.block(l.b)
-                L.terminate(l.b, Branch(test, contents, failure))
-                L.into(l.b, contents)
-            }
-            None -> {
-                let _ = stop(l, "the constructor '" + name + "' has no tag")
-                return
-            }
+fun tested(l : Lower, v : Value, name : String, failure : BlockId) -> Bool {
+    if Decls.variantCount(l.decls, name) <= 1 { return True }
+    match Map.get(l.tags, name) {
+        Some(tag) -> {
+            let seen = L.emit(l.b, ObjectTag(v), Ssa.untraced(I32))
+            let want = L.emit(l.b, ConstInt(tag), Ssa.untraced(I32))
+            let test = L.emit(l.b, Cmp(Eq, seen, want), Ssa.untraced(I1))
+            let contents = L.block(l.b)
+            L.terminate(l.b, Branch(test, contents, failure))
+            L.into(l.b, contents)
+            True
+        }
+        None -> {
+            let _ = stop(l, "the constructor '" + name + "' has no tag")
+            False
         }
     }
-    destructure(l, v, pieces, success, failure)
 }
 
--- Read each field and match its sub-pattern, in a chain: a sub-pattern may
--- branch, so what follows it is a block rather than the next instruction.
-fun destructure(l : Lower, object : Value, pieces : Array (Int, Pat, Ty.Type),
-                success : BlockId, failure : BlockId) -> Unit {
-    if len(pieces) == 0 {
-        L.terminate(l.b, Jump(success, []))
-        return
-    }
-    var at = l.b.at
-    for var i = 0; i < len(pieces); i = i + 1 {
-        let (index, sub, fieldTy) = pieces[i]
-        L.into(l.b, at)
-        let loaded = L.emit(l.b, ObjectGet(object, index), repOf(l, fieldTy))
-        let following = if i + 1 == len(pieces) { success } else { L.block(l.b) }
-        pattern(l, sub, loaded, fieldTy, following, failure)
-        at = following
+-- Read each field an arm binds and bind it.
+fun destructure(l : Lower, object : Value, fields : Array (Int, String, Ty.Type)) -> Unit {
+    for (index, name, fieldTy) in fields {
+        Map.put(l.env, name, L.emit(l.b, ObjectGet(object, index), repOf(l, fieldTy)))
     }
 }
 
@@ -1766,11 +1692,11 @@ fun compactValue(l : Lower, c : Compact, name : String, ty : Ty.Type,
     made
 }
 
--- A constructor pattern on a one-word compact sum: the word test, then the
--- payload's sub-pattern against the field.
-fun compactPattern(l : Lower, c : Compact, name : String, args : Array Pat,
-                   v : Value, ty : Ty.Type,
-                   success : BlockId, failure : BlockId) -> Unit {
+-- A constructor on a one-word compact sum: the word test, then the payload,
+-- read only if the arm binds it.
+fun compactTest(l : Lower, c : Compact, name : String, binders : Array (Option String),
+                v : Value, ty : Ty.Type,
+                success : BlockId, failure : BlockId) -> Unit {
     match Array.indexOf(c.nullaries, name) {
         Some(i) -> {
             let want = L.emit(l.b, ConstInt(i), Ssa.traced(Ptr))
@@ -1785,6 +1711,14 @@ fun compactPattern(l : Lower, c : Compact, name : String, args : Array Pat,
     let carried = L.block(l.b)
     L.terminate(l.b, Branch(nullary, failure, carried))
     L.into(l.b, carried)
+    let binder = if len(binders) == 1 { binders[0] } else { None }
+    let bound = match binder {
+        Some(b) -> b
+        None -> {
+            L.terminate(l.b, Jump(success, []))
+            return
+        }
+    }
     let field = compactField(l, c, ty)
     let inner = if plain(l, field) { v } else {
         let wrapped = L.block(l.b)
@@ -1802,11 +1736,8 @@ fun compactPattern(l : Lower, c : Compact, name : String, args : Array Pat,
         L.into(l.b, after)
         got
     }
-    if len(args) == 1 {
-        pattern(l, args[0], inner, field, success, failure)
-    } else {
-        L.terminate(l.b, Jump(success, []))
-    }
+    Map.put(l.env, bound, inner)
+    L.terminate(l.b, Jump(success, []))
 }
 
 -- A saturated constructor. A nullary one that is not a one-word compact sum's

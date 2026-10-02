@@ -1,7 +1,7 @@
 module Turkey.Core (
     refName, refOf, isRef, refElem,
-    Core(..), CoreKind(..), CParam(..), CAlt(..), CBind(..), CProgram(..),
-    openings,
+    Core(..), CoreKind(..), CParam(..), CAlt(..), Alt(..), CBind(..), CProgram(..),
+    altVars, openingOf, showAlt,
     mkCore, tailParts, tailFieldNames,
     Mapper(..), mapKind, bindValue, altBody,
     namesOf, namesInto, codeAddressName,
@@ -101,13 +101,28 @@ type CParam = CParam {
     ty   : Ty.Type,
 }
 
--- One arm. What its pattern *binds*, and at what types, is deliberately not
+-- One arm. What its test *binds*, and at what types, is deliberately not
 -- recorded: the checker derives it from the scrutinee's type and the
 -- constructor's declaration, which makes it a check rather than a restatement.
 type CAlt = CAlt {
-    pat  : Pat,
+    alt  : Alt,
     body : Core,
 }
+
+-- What one arm tests: a single level of a pattern, never a nested one.
+--
+-- Source patterns nest, and `Turkey.Match` compiles them into nested `match`es
+-- over these as `Turkey.Lower` builds Core, so no pass from the checker on can
+-- meet a nested pattern: there is no way to write one here. A part an arm
+-- ignores is `None`.
+type Alt
+    -- A constructor and a binder per field, in declaration order -- a record's
+    -- too -- and, for an existential, what it opens.
+    = ACon(String, Array (Option String), Option Opening)
+    | ATuple(Array (Option String))
+    | ALit(Ast.Lit)
+    -- Anything at all, binding the whole scrutinee when named.
+    | AAny(Option String)
 
 type CoreKind
     = CLit(Ast.Lit)
@@ -175,11 +190,8 @@ type CoreKind
     -- semantics, so they are one node with three shapes of target.
     | CAssign(Core, Core)
     | CIf(Core, Core, Option Core)
-    -- Pattern matching, over surface patterns. They are already a small,
-    -- total, type-directed language with no implicit anything, and
-    -- exhaustiveness has decided about them before this point. From
-    -- `Turkey.Match` onwards every arm's pattern is flat: its parts are
-    -- variables or `_`.
+    -- Pattern matching, one level at a time; see `Alt`. Exhaustiveness has
+    -- decided about the source patterns before this point.
     | CMatch(Core, Array CAlt)
 
 -- One top-level binding, with the type variables it abstracts over.
@@ -314,7 +326,7 @@ fun mapKind(k : CoreKind, m : Mapper) -> CoreKind = match k {
             None -> None
         })
     CMatch(scrutinee, alts) -> CMatch(m.expr(scrutinee),
-        Array.map(alts, fun(a) = CAlt { pat = a.pat, body = m.expr(a.body) }))
+        Array.map(alts, fun(a) = CAlt { alt = a.alt, body = m.expr(a.body) }))
 }
 
 -- The term a binding holds, and the term an arm holds, each taken apart with a
@@ -329,7 +341,7 @@ fun bindValue(b : CBind) -> Core {
 }
 
 fun altBody(a : CAlt) -> Core {
-    let CAlt { pat = _, body } = a
+    let CAlt { alt = _, body } = a
     body
 }
 
@@ -700,7 +712,7 @@ fun showExpr(e : Core, indent : Int, n : Namer, a : Aliases) -> String {
             let out = Array.new(len(alts) * 2 + 2)
             Array.push(out, p + "match " + flat(scrutinee, n, a) + " {")
             for alt in alts {
-                Array.push(out, p + "  " + showPattern(alt.pat, a) + " ->")
+                Array.push(out, p + "  " + showAlt(alt.alt, a) + " ->")
                 Array.push(out, showExpr(alt.body, indent + 2, n, a))
             }
             Array.push(out, p + "}")
@@ -755,63 +767,46 @@ fun call(fn : Option Core, name : String, args : Array Core, indent : Int,
     String.join(out, "\n")
 }
 
--- Patterns are surface patterns, so their rendering is small and local.
-fun showPattern(p : Pat, a : Aliases) -> String = match p.kind {
-    PVar(name) -> alias(a, name)
-    PWild -> "_"
-    PLit(l) -> showLit(l)
-    PCon(name, args) -> if len(args) == 0 { name + showOpening(p, a) } else {
-        name + showOpening(p, a) + "("
-            + String.join(Array.map(args, showPattern(_, a)), ", ") + ")"
+fun showAlt(alt : Alt, a : Aliases) -> String = match alt {
+    ACon(name, fields, opening) -> {
+        let head = alias(a, name) + showOpening(opening, a)
+        if len(fields) == 0 { head } else {
+            head + "(" + String.join(Array.map(fields, showBinder(_, a)), ", ") + ")"
+        }
     }
-    PRecord(name, fields, rest) -> {
-        let inner = Array.map(fields, fun(f) = {
-            let (label, sub) = f
-            label + " = " + showPattern(sub, a)
-        })
-        if rest { Array.push(inner, "..") }
-        name + showOpening(p, a) + " { " + String.join(inner, ", ") + " }"
-    }
-    PTuple(elems) ->
-        "(" + String.join(Array.map(elems, showPattern(_, a)), ", ") + ")"
-    PAnnot(inner, _) -> showPattern(inner, a)
+    ATuple(elems) -> "(" + String.join(Array.map(elems, showBinder(_, a)), ", ") + ")"
+    ALit(l) -> showLit(l)
+    AAny(binder) -> showBinder(binder, a)
 }
 
--- Every existential constructor pattern inside a pattern, outermost and
--- leftmost first -- the order an arm's copies are keyed in.
---
--- Here rather than in `Turkey.Layout`, because `Turkey.Mono.checkLayouts` asks
--- the same question to refuse what `share` did not copy.
-fun openings(p : Pat) -> Array Pat {
-    let out = Array.new(2)
-    openingsInto(p, out)
+fun showBinder(binder : Option String, a : Aliases) -> String = match binder {
+    Some(name) -> alias(a, name)
+    None -> "_"
+}
+
+-- The names an arm binds: its binders, and the dictionaries an opening
+-- brings into scope.
+fun altVars(alt : Alt) -> Array String {
+    let out = []
+    match alt {
+        ACon(_, fields, opening) -> {
+            match opening {
+                Some(o) -> for d in o.evidence { Array.push(out, d) }
+                None -> {}
+            }
+            for f in fields { if let Some(n) = f { Array.push(out, n) } }
+        }
+        ATuple(elems) -> for f in elems { if let Some(n) = f { Array.push(out, n) } }
+        ALit(_) -> {}
+        AAny(binder) -> if let Some(n) = binder { Array.push(out, n) }
+    }
     out
-}
-
-fun openingsInto(p : Pat, out : Array Pat) -> Unit = match p.kind {
-    PAnnot(inner, _) -> openingsInto(inner, out)
-    PTuple(elems) -> for e in elems { openingsInto(e, out) }
-    PCon(_, args) -> {
-        match p.opening {
-            Some(_) -> Array.push(out, p)
-            None -> {}
-        }
-        for a in args { openingsInto(a, out) }
-    }
-    PRecord(_, fields, _) -> {
-        match p.opening {
-            Some(_) -> Array.push(out, p)
-            None -> {}
-        }
-        for (_, sub) in fields { openingsInto(sub, out) }
-    }
-    _ -> {}
 }
 
 -- What opening an existential binds, as `[s@i64](%d1.Show)`: the rigid
 -- constants, the layouts this copy of the arm was made for, and the
 -- dictionaries, named as the body prints them.
-fun showOpening(p : Pat, a : Aliases) -> String = match p.opening {
+fun showOpening(opening : Option Opening, a : Aliases) -> String = match opening {
     None -> ""
     Some(o) -> {
         let layouts = match o.layouts {
@@ -822,6 +817,12 @@ fun showOpening(p : Pat, a : Aliases) -> String = match p.opening {
             + "](" + String.join(Array.map(o.evidence, alias(a, _)), ", ")
             + ")"
     }
+}
+
+-- What an arm opens, if it opens an existential.
+fun openingOf(alt : Alt) -> Option Opening = match alt {
+    ACon(_, _, opening) -> opening
+    _ -> None
 }
 
 -- One binding. The namer starts here and is shared by every type printed under

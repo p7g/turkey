@@ -1051,7 +1051,7 @@ fun caseOfCaseOn(r : Reducer, e : Core, scrutinee : Core,
         CMatch(_, inner) -> {
             let free = freeNamesOfAlts(alts)
             for a in inner {
-                for name in patternVars(a.pat) {
+                for name in altVars(a.alt) {
                     if Set.contains(free, name) { return None }
                 }
             }
@@ -1092,7 +1092,7 @@ fun caseOfCaseOn(r : Reducer, e : Core, scrutinee : Core,
         CMatch(inner, innerAlts) -> {
             let made = Array.new(len(innerAlts))
             for var i = 0; i < len(innerAlts); i = i + 1 {
-                Array.push(made, CAlt { pat = innerAlts[i].pat, body = pushed[i] })
+                Array.push(made, CAlt { alt = innerAlts[i].alt, body = pushed[i] })
             }
             mkCore(e.ty, scrutinee.span, CMatch(inner, made))
         }
@@ -1378,17 +1378,15 @@ fun specialized(groups : Map String Variant, j : Core) -> Option Core {
 -- there.
 --
 -- Scanned in source order and stopped at the first arm that is not decided, so
--- an earlier arm that might have matched keeps this from firing. An arm is
--- decided when every part of its pattern either cannot fail or faces a part of
--- the scrutinee whose shape answers it; one that tests a part nobody knows
--- needs match compilation, which this is not.
+-- an earlier arm that might have matched keeps this from firing. An arm tests
+-- one level, so it is decided by the shape of the scrutinee alone.
 --
 -- The scrutinee need not be a value, but nothing it computes may be thrown
 -- away. Selecting a branch discards the arms not taken -- which a `match` would
 -- not have run anyway -- and it discards the constructor application itself,
--- which it *would* have. So every argument is bound, in order and at every
--- depth, including the ones the pattern ignores, under a name nothing reads.
--- `Some(launch())` still launches, and so does `Some((launch(), x))`.
+-- which it *would* have. So every argument is bound, in order, including the
+-- ones the arm ignores, under a name nothing reads. `Some(launch())` still
+-- launches.
 fun knownConstructor(r : Reducer, e : Core) -> Option Core = match e.kind {
     CMatch(scrutinee, alts) -> if isKnown(scrutinee) {
         selectArm(r, e, scrutinee, scrutinee, alts)
@@ -1405,25 +1403,17 @@ fun isKnown(e : Core) -> Bool = match e.kind {
     _ -> isConstructor(e)
 }
 
--- `root` is what a variable pattern at the root binds: the scrutinee itself,
--- or the name a `let` gave it, which must not be rebuilt.
+-- `root` is what an arm that binds the whole scrutinee binds: the scrutinee
+-- itself, or the name a `let` gave it, which must not be rebuilt.
 fun selectArm(r : Reducer, e : Core, scrutinee : Core, root : Core,
               alts : Array CAlt) -> Option Core {
     for alt in alts {
-        let bound = Bound { root = root, names = [], values = [], later = [] }
-        match decide(r, alt.pat, scrutinee, False, bound) {
+        let names = []
+        let values = []
+        match decide(r, alt.alt, scrutinee, root, names, values) {
             Fails -> {}
             Undecided -> return None
-            Matches -> {
-                var body = alt.body
-                for var i = len(bound.later) - 1; i >= 0; i = i - 1 {
-                    let (name, pat, ty) = bound.later[i]
-                    let whole = mkCore(ty, scrutinee.span, CVar(name))
-                    body = mkCore(e.ty, e.span,
-                                  CMatch(whole, [CAlt { pat = pat, body = body }]))
-                }
-                return applyNames(bound.names, bound.values, body, e.ty)
-            }
+            Matches -> return applyNames(names, values, alt.body, e.ty)
         }
     }
     None
@@ -1582,152 +1572,63 @@ fun isAtom(e : Core) -> Bool = match e.kind {
 }
 
 
--- What a pattern against a known part of the scrutinee comes to.
+-- What an arm against a known scrutinee comes to.
 type Decision = Matches | Fails | Undecided
 
--- What a selected arm binds. `names[i]` is bound to `values[i]`, in the order
--- the scrutinee evaluates them. `later` is a part whose shape is not known but
--- whose pattern cannot fail: it is bound whole, under a fresh name, and taken
--- apart by a one-arm `match` around the body, which tests nothing.
-type Bound = Bound {
-    root   : Core,
-    names  : Array String,
-    values : Array Core,
-    later  : Array (String, Pat, Ty.Type),
-}
-
--- Test `p` against `part`, recording what it binds in `bound`. `nested` says
--- `part` is inside the scrutinee rather than the whole of it.
+-- Test `alt` against `known`, recording in `names` and `values` what it binds,
+-- each part of `known` to the binder the arm gives it or to a name nothing
+-- reads.
 --
--- Every sub-pattern is decided even after one is undecided, because a later
--- one may still fail outright: a pattern test reads and computes nothing, so
--- which of its parts fails first does not matter.
-fun decide(r : Reducer, p : Pat, part : Core, nested : Bool,
-           bound : Bound) -> Decision {
-    -- Selecting an opening arm would have to substitute the packed type for
-    -- the constants the pattern opened, throughout its body. `Turkey.Layout`
-    -- narrows this case to the one layout instead.
-    match p.opening {
-        Some(_) -> return Undecided
-        None -> {}
+-- Selecting an opening arm would have to substitute the packed type for the
+-- constants it opened, throughout its body. `Turkey.Layout` narrows that case
+-- to the one layout instead.
+fun decide(r : Reducer, alt : Alt, known : Core, root : Core,
+           names : Array String, values : Array Core) -> Decision = match alt {
+    AAny(binder) -> {
+        Array.push(names, nameOr(r, binder))
+        Array.push(values, root)
+        Matches
     }
-    match p.kind {
-        PAnnot(inner, _) -> decide(r, inner, part, nested, bound)
-        PVar(name) -> bind(bound, name, if nested { part } else { bound.root })
-        PWild -> bind(bound, fresh(r, "seq"), if nested { part } else { bound.root })
-        PLit(lit) -> match part.kind {
-            CLit(known) -> match sameLiteral(lit, known) {
-                Some(True) -> bind(bound, fresh(r, "seq"), part)
-                Some(False) -> Fails
-                None -> Undecided
+    ALit(lit) -> match known.kind {
+        CLit(k) -> match sameLiteral(lit, k) {
+            Some(True) -> {
+                Array.push(names, fresh(r, "seq"))
+                Array.push(values, known)
+                Matches
             }
-            _ -> Undecided
-        }
-        PTuple(subs) -> match part.kind {
-            CTuple(parts) -> decideAll(r, subs, parts, bound)
-            _ -> whole(r, p, part, nested, bound)
-        }
-        PCon(name, subs) -> fields(r, p, name, subs, part, nested, bound)
-        PRecord(name, labelled, _) -> match positional(r, p, name, labelled) {
-            Some(subs) -> fields(r, p, name, subs, part, nested, bound)
+            Some(False) -> Fails
             None -> Undecided
         }
+        _ -> Undecided
     }
-}
-
-fun decideAll(r : Reducer, subs : Array Pat, parts : Array Core,
-              bound : Bound) -> Decision {
-    if len(subs) != len(parts) { return Undecided }
-    var out = Matches
-    for var i = 0; i < len(subs); i = i + 1 {
-        match decide(r, subs[i], parts[i], True, bound) {
-            Fails -> return Fails
-            Undecided -> { out = Undecided }
-            Matches -> {}
+    ATuple(binders) -> match known.kind {
+        CTuple(parts) -> bindParts(r, binders, parts, names, values)
+        _ -> Undecided
+    }
+    ACon(_, _, Some(_)) -> Undecided
+    ACon(name, binders, None) -> match constructorName(known) {
+        Some(con) -> if con == name {
+            bindParts(r, binders, constructorArgs(known), names, values)
+        } else {
+            Fails
         }
+        None -> Undecided
     }
-    out
 }
 
--- A constructor pattern against `part`: its fields against the arguments when
--- `part` is a constructor application, and a mismatch when it is another one.
-fun fields(r : Reducer, p : Pat, name : String, subs : Array Pat, part : Core,
-           nested : Bool, bound : Bound) -> Decision = match constructorName(part) {
-    Some(known) -> if known == name {
-        decideAll(r, subs, constructorArgs(part), bound)
-    } else {
-        Fails
+fun bindParts(r : Reducer, binders : Array (Option String), parts : Array Core,
+              names : Array String, values : Array Core) -> Decision {
+    if len(binders) != len(parts) { return Undecided }
+    for var i = 0; i < len(parts); i = i + 1 {
+        Array.push(names, nameOr(r, binders[i]))
+        Array.push(values, parts[i])
     }
-    None -> whole(r, p, part, nested, bound)
-}
-
--- A pattern against a part whose shape does not answer it: decided only if
--- the pattern cannot fail, and then taken apart by a one-arm `match` around the
--- body.
---
--- Never at the root. There the one-arm `match` would be the `match` this
--- started from: a `String` literal is known, but `String(bytes)` is a
--- constructor pattern it does not answer, and the literal substituted back into
--- the residual is the original term, reduced forever.
-fun whole(r : Reducer, p : Pat, part : Core, nested : Bool,
-          bound : Bound) -> Decision {
-    if !nested || !irrefutable(r, p) { return Undecided }
-    let name = fresh(r, "part")
-    Array.push(bound.later, (name, p, part.ty))
-    bind(bound, name, part)
-}
-
-fun bind(bound : Bound, name : String, part : Core) -> Decision {
-    Array.push(bound.names, name)
-    Array.push(bound.values, part)
     Matches
 }
 
--- Whether `p` matches every value of its type: no literal, no opening, and no
--- constructor of a type that has another.
-fun irrefutable(r : Reducer, p : Pat) -> Bool {
-    match p.opening {
-        Some(_) -> return False
-        None -> {}
-    }
-    match p.kind {
-        PAnnot(inner, _) -> irrefutable(r, inner)
-        PVar(_) -> True
-        PWild -> True
-        PLit(_) -> False
-        PTuple(subs) -> allIrrefutable(r, subs)
-        PCon(name, subs) -> Decls.variantCount(r.decls, name) == 1
-            && allIrrefutable(r, subs)
-        PRecord(name, labelled, _) -> Decls.variantCount(r.decls, name) == 1
-            && allIrrefutable(r, Array.map(labelled, fun((_, sub)) = sub))
-    }
-}
-
-fun allIrrefutable(r : Reducer, subs : Array Pat) -> Bool {
-    for sub in subs { if !irrefutable(r, sub) { return False } }
-    True
-}
-
--- A record pattern's fields in declaration order, `_` for a field it leaves
--- out, which is the order the constructor application holds them in.
-fun positional(r : Reducer, p : Pat, name : String,
-               labelled : Array (String, Pat)) -> Option (Array Pat) {
-    let order = match Decls.con(r.decls, name) {
-        Some(info) -> match info.fields {
-            Some(names) -> names
-            None -> return None
-        }
-        None -> return None
-    }
-    let out = Array.new(len(order))
-    for label in order {
-        var sub = Pat { id = p.id, span = p.span, kind = PWild, opening = None }
-        for (given, pat) in labelled {
-            if given == label { sub = pat }
-        }
-        Array.push(out, sub)
-    }
-    Some(out)
+fun nameOr(r : Reducer, binder : Option String) -> String = match binder {
+    Some(name) -> name
+    None -> fresh(r, "seq")
 }
 
 -- Whether two literals are equal, when that is a question of their spelling.
@@ -1843,7 +1744,7 @@ fun consumeTail(e : Core, alts : Array CAlt, ty : Ty.Type,
         mkCore(ty, e.span, CLetRec(binds, consumeTail(body, alts, ty, span)))
     CMatch(scrutinee, inner) ->
         mkCore(ty, e.span, CMatch(scrutinee, Array.map(inner, fun(a) = CAlt {
-            pat = a.pat, body = consumeTail(a.body, alts, ty, span),
+            alt = a.alt, body = consumeTail(a.body, alts, ty, span),
         })))
     CJoin(name, params, body, rest, recursive) ->
         mkCore(ty, e.span, CJoin(name, params,
@@ -2069,7 +1970,7 @@ fun retype(e : Core, ty : Ty.Type) -> Core = match e.kind {
                                  retype(rest, ty), recursive))
     CMatch(scrutinee, alts) ->
         mkCore(ty, e.span, CMatch(scrutinee, Array.map(alts, fun(a) = CAlt {
-            pat = a.pat, body = retype(a.body, ty),
+            alt = a.alt, body = retype(a.body, ty),
         })))
     CIf(cond, then, otherwise) -> match otherwise {
         Some(o) -> mkCore(ty, e.span, CIf(cond, retype(then, ty),
@@ -2322,8 +2223,8 @@ fun freeNamesInto(e : Core, scope : Map String Int,
 
 fun freeNamesOfAltsInto(alts : Array CAlt, scope : Map String Int,
                         out : Set.Set String) -> Unit {
-    for CAlt { pat, body } in alts {
-        let vars = patternVars(pat)
+    for CAlt { alt, body } in alts {
+        let vars = altVars(alt)
         for name in vars { enterScope(scope, name) }
         freeNamesInto(body, scope, out)
         for name in vars { leaveScope(scope, name) }
@@ -2353,8 +2254,8 @@ fun occursFree(e : Core, name : String) -> Bool = match e.kind {
 }
 
 fun occursFreeInAlts(alts : Array CAlt, name : String) -> Bool {
-    for CAlt { pat, body } in alts {
-        if !Array.contains(patternVars(pat), name) && occursFree(body, name) {
+    for CAlt { alt, body } in alts {
+        if !Array.contains(altVars(alt), name) && occursFree(body, name) {
             return True
         }
     }
@@ -2404,7 +2305,7 @@ fun bindersInto(e : Core, out : Set.Set String) -> Unit {
             for p in params { Set.add(out, p.name) }
         }
         CMatch(_, alts) -> for a in alts {
-            for name in patternVars(a.pat) { Set.add(out, name) }
+            for name in altVars(a.alt) { Set.add(out, name) }
         }
         _ -> {}
     }
@@ -2424,7 +2325,7 @@ fun bindsAny(e : Core, p : fun(String) -> Bool) -> Bool {
             for q in params { if p(q.name) { return True } }
         }
         CMatch(_, alts) -> for a in alts {
-            for name in patternVars(a.pat) { if p(name) { return True } }
+            for name in altVars(a.alt) { if p(name) { return True } }
         }
         _ -> {}
     }
@@ -2434,11 +2335,6 @@ fun bindsAny(e : Core, p : fun(String) -> Bool) -> Bool {
 fun overlaps(a : Set.Set String, b : Set.Set String) -> Bool {
     for n in Set.elements(a) { if Set.contains(b, n) { return True } }
     False
-}
-
-fun unannot(p : Pat) -> Pat = match p.kind {
-    PAnnot(inner, _) -> unannot(inner)
-    _ -> p
 }
 
 fun oops(message : String) -> a =

@@ -58,9 +58,9 @@ module Turkey.Layout (
 
 import Data.Set as Set
 import Turkey.Core
-import Turkey.Ast (Pat(..), PatKind(..), Opening(..), Lit(..))
+import Turkey.Ast (Opening(..), Lit(..))
 import Turkey.Core (Core(..), CoreKind(..), CAlt(..), CBind(..), CProgram(..),
-                    CParam(..), Mapper(..), mapKind, namesOf, openings,
+                    CParam(..), Alt(..), Mapper(..), mapKind, namesOf, openingOf,
                     abstractionBinders, isDictionary, dictClass, methodField,
                     methodBase)
 import Turkey.Classes as Classes
@@ -584,7 +584,7 @@ fun opensInto(e : Core, found : Array Bool) -> Unit {
     if len(found) > 0 { return {} }
     match e.kind {
         CMatch(_, alts) -> for alt in alts {
-            if len(openings(alt.pat)) > 0 { Array.push(found, True) }
+            if Option.isSome(openingOf(alt.alt)) { Array.push(found, True) }
         }
         _ -> {}
     }
@@ -1351,17 +1351,15 @@ fun unknownInto(e : Core, layouts : Map String String,
             for alt in alts {
                 let inner = Map.new()
                 for (k, l) in Map.entries(layouts) { Map.put(inner, k, l) }
-                for p in openings(alt.pat) {
-                    match p.opening {
-                        Some(o) -> match o.layouts {
-                            Some(ls) -> for var j = 0; j < len(o.skolems) && j < len(ls);
-                                            j = j + 1 {
-                                Map.put(inner, skolemKey(o.skolems[j]), ls[j])
-                            }
-                            None -> {}
+                match openingOf(alt.alt) {
+                    Some(o) -> match o.layouts {
+                        Some(ls) -> for var j = 0; j < len(o.skolems) && j < len(ls);
+                                        j = j + 1 {
+                            Map.put(inner, skolemKey(o.skolems[j]), ls[j])
                         }
                         None -> {}
                     }
+                    None -> {}
                 }
                 unknownInto(alt.body, inner, report)
             }
@@ -1393,90 +1391,66 @@ fun openArms(s : Sharer, e : Core, scrutinee : Core, alts : Array CAlt,
     let abstracted = current(sc)
     let out = Array.new(len(alts))
     for alt in alts {
-        let opened = Array.new(2)
-        for p in openings(alt.pat) {
-            match p.opening {
-                Some(o) -> match o.layouts {
-                    None -> Array.push(opened, p)
-                    Some(_) -> {}
+        match alt.alt {
+            ACon(name, fields, Some(o)) -> if Option.isNone(o.layouts) {
+                for k in openingKeys(s, scrutinee, name, o, abstracted) {
+                    let copy = ACon(name, fields, Some(Opening {
+                        evidence = o.evidence, skolems = o.skolems,
+                        layouts = Some(String.split(k, ",")),
+                    }))
+                    Array.push(out, CAlt { alt = copy,
+                                           body = rewrite(s, alt.body, inArm(sc, copy)) })
                 }
-                None -> {}
+                continue
             }
+            _ -> {}
         }
-        if len(opened) == 0 {
-            Array.push(out, CAlt { pat = alt.pat,
-                                   body = rewrite(s, alt.body,
-                                                  inArm(sc, alt.pat)) })
-            continue
-        }
-        -- One key per opening, and one copy per combination of them -- unless
-        -- the value being opened is a packing right here, in which case it is
-        -- the one key that packing stores.
-        let choices = Array.new(len(opened))
-        for p in opened {
-            match knownKey(s, scrutinee, alt.pat, p, abstracted) {
-                Some(k) -> Array.push(choices, [k])
-                None -> {
-                    let allowed = match s.packed {
-                        None -> None
-                        Some(table) -> Some(Map.getOr(table, conName(p),
-                                                      Set.new()))
-                    }
-                    let keys = Array.new(8)
-                    for k in keyChoices(countSkolems(p)) {
-                        let take = match allowed {
-                            None -> True
-                            Some(set) -> Set.contains(set, k)
-                        }
-                        if take { Array.push(keys, k) }
-                    }
-                    Array.push(choices, keys)
-                }
-            }
-        }
-        for combination in combinations(choices) {
-            let keys = Map.new()
-            for var i = 0; i < len(opened) && i < len(combination); i = i + 1 {
-                Map.put(keys, opened[i].id, combination[i])
-            }
-            let pat = withLayouts(alt.pat, keys)
-            Array.push(out, CAlt { pat = pat,
-                                   body = rewrite(s, alt.body, inArm(sc, pat)) })
-        }
+        Array.push(out, CAlt { alt = alt.alt, body = rewrite(s, alt.body, inArm(sc, alt.alt)) })
     }
     mkCore(e.ty, e.span, CMatch(rewrite(s, scrutinee, sc), out))
 }
 
--- The scope inside an arm: the layouts around it, and the constants its pattern
--- opens at the layouts the pattern records.
-fun inArm(sc : Scope, pat : Pat) -> Scope {
+-- The keys an arm opening `name` is copied for: one per combination of
+-- layouts for its constants -- unless the value being opened is a packing
+-- right here, in which case it is the one key that packing stores.
+fun openingKeys(s : Sharer, scrutinee : Core, name : String, o : Opening,
+                abstracted : Map String String) -> Array String {
+    match knownKey(s, scrutinee, name, abstracted) {
+        Some(k) -> return [k]
+        None -> {}
+    }
+    let allowed = match s.packed {
+        None -> None
+        Some(table) -> Some(Map.getOr(table, name, Set.new()))
+    }
+    let keys = Array.new(8)
+    for k in keyChoices(len(o.skolems)) {
+        let take = match allowed {
+            None -> True
+            Some(set) -> Set.contains(set, k)
+        }
+        if take { Array.push(keys, k) }
+    }
+    keys
+}
+
+-- The scope inside an arm: the layouts around it, and the constants it opens
+-- at the layouts it records.
+fun inArm(sc : Scope, alt : Alt) -> Scope {
     let inner = Map.new()
     for (k, l) in Map.entries(current(sc)) { Map.put(inner, k, l) }
-    for p in openings(pat) {
-        match p.opening {
-            Some(o) -> match o.layouts {
-                Some(ls) -> for var j = 0; j < len(o.skolems) && j < len(ls);
-                                j = j + 1 {
-                    Map.put(inner, skolemKey(o.skolems[j]), ls[j])
-                }
-                None -> {}
+    match openingOf(alt) {
+        Some(o) -> match o.layouts {
+            Some(ls) -> for var j = 0; j < len(o.skolems) && j < len(ls);
+                            j = j + 1 {
+                Map.put(inner, skolemKey(o.skolems[j]), ls[j])
             }
             None -> {}
         }
+        None -> {}
     }
     Scope { owner = sc.owner, chain = Array.append(sc.chain, [inner]),
             locals = sc.locals }
-}
-
-fun conName(p : Pat) -> String = match p.kind {
-    PCon(name, _) -> name
-    PRecord(name, _, _) -> name
-    _ -> ""
-}
-
-fun countSkolems(p : Pat) -> Int = match p.opening {
-    Some(o) -> len(o.skolems)
-    None -> 0
 }
 
 -- Every key of `n` layouts, as the comma-joined strings the copies are named by.
@@ -1495,75 +1469,15 @@ fun keyChoices(n : Int) -> Array String {
     out
 }
 
-fun combinations(choices : Array (Array String)) -> Array (Array String) {
-    var out = [Array.new(0)]
-    for options in choices {
-        let next = Array.new(len(out))
-        for prefix in out {
-            for one in options {
-                let made = Array.new(len(prefix) + 1)
-                for x in prefix { Array.push(made, x) }
-                Array.push(made, one)
-                Array.push(next, made)
-            }
-        }
-        out = next
-    }
-    out
-}
-
--- A copy of `p` whose openings record the layouts `keys` gives them, by the id
--- of the opening in the original.
-fun withLayouts(p : Pat, keys : Map Int String) -> Pat = match p.kind {
-    PAnnot(inner, te) -> Pat {
-        id = p.id, span = p.span, kind = PAnnot(withLayouts(inner, keys), te),
-        opening = p.opening,
-    }
-    PTuple(elems) -> Pat {
-        id = p.id, span = p.span,
-        kind = PTuple(Array.map(elems, withLayouts(_, keys))),
-        opening = p.opening,
-    }
-    PCon(name, args) -> Pat {
-        id = p.id, span = p.span,
-        kind = PCon(name, Array.map(args, withLayouts(_, keys))),
-        opening = openingWith(p, keys),
-    }
-    PRecord(name, fields, rest) -> Pat {
-        id = p.id, span = p.span,
-        kind = PRecord(name, Array.map(fields, fun(f) = (f.0,
-            withLayouts(f.1, keys))), rest),
-        opening = openingWith(p, keys),
-    }
-    _ -> p
-}
-
-fun openingWith(p : Pat, keys : Map Int String) -> Option Opening = match p.opening {
-    None -> None
-    Some(o) -> match Map.get(keys, p.id) {
-        Some(k) -> Some(Opening { evidence = o.evidence, skolems = o.skolems,
-                                  layouts = Some(String.split(k, ",")) })
-        None -> Some(o)
-    }
-}
-
 -- The layouts an opening must be for, when what it opens is a packing written
 -- right here -- `match C(d, xs) { C(ys) -> ... }`, which is what an inlined
 -- opener leaves behind.
-fun knownKey(s : Sharer, scrutinee : Core, whole : Pat, p : Pat,
+fun knownKey(s : Sharer, scrutinee : Core, opened : String,
              abstracted : Map String String) -> Option String {
-    var top = whole
-    loop {
-        match top.kind {
-            PAnnot(inner, _) -> { top = inner }
-            _ -> break
-        }
-    }
-    if top.id != p.id { return None }
     match scrutinee.kind {
         CApp(fn, args) -> match fn.kind {
             CCon(name) -> {
-                if name != conName(p) { return None }
+                if name != opened { return None }
                 match Decls.con(s.decls, name) {
                     Some(info) -> if len(info.exists) > 0 {
                         return packedKey(s.decls, info, args, abstracted)
@@ -1724,21 +1638,18 @@ fun packingsInto(decls : DeclTable, e : Core, abstracted : Map String String,
                 }
                 let held = Array.new(len(conditions))
                 for c in conditions { Array.push(held, c) }
-                for p in openings(alt.pat) {
-                    match p.opening {
-                        Some(o) -> match o.layouts {
-                            Some(ls) -> {
-                                for var j = 0; j < len(o.skolems) && j < len(ls);
-                                    j = j + 1 {
-                                    Map.put(inner, skolemKey(o.skolems[j]), ls[j])
-                                }
-                                Array.push(held, (conName(p),
-                                                  String.join(ls, ",")))
+                match alt.alt {
+                    ACon(name, _, Some(o)) -> match o.layouts {
+                        Some(ls) -> {
+                            for var j = 0; j < len(o.skolems) && j < len(ls);
+                                j = j + 1 {
+                                Map.put(inner, skolemKey(o.skolems[j]), ls[j])
                             }
-                            None -> {}
+                            Array.push(held, (name, String.join(ls, ",")))
                         }
                         None -> {}
                     }
+                    _ -> {}
                 }
                 packingsInto(decls, alt.body, inner, held, out)
             }

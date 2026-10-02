@@ -333,12 +333,12 @@ fun rule(ck : Checker, e : Core, env : CEnv) -> Ty.Type = match e.kind {
         var result : Option Ty.Type = None
         for alt in alts {
             let mark = enter(env)
-            for (name, ty) in Map.entries(pattern(ck, alt.pat, s, e.span)) {
+            for (name, ty) in Map.entries(pattern(ck, alt.alt, s, e.span)) {
                 defineC(env, name, [], ty)
             }
             let got = check(ck, alt.body, env, joins)
             leave(env, mark)
-            refuseEscape(alt.pat, got, e.span)
+            refuseEscape(alt.alt, got, e.span)
             result = match result {
                 None -> Some(got)
                 Some(had) -> Some(joinTypes(had, got))
@@ -369,52 +369,23 @@ fun constructorScheme(ck : Checker, info : ConInfo) -> Scheme {
     }
 }
 
--- Every opening in a pattern, however deep, collected as `(constructor, skolems)`.
---
--- A whole tree rather than the top node: an existential is opened just as
--- readily by a record pattern or from inside a tuple, and those forms have to
--- reach the escape check too -- `lib/Data/Error.gob` opens only records.
-fun collectOpenings(p : Pat, out : Array (String, Array ConCell)) -> Unit {
-    match p.kind {
-        PVar(_) -> {}
-        PWild -> {}
-        PLit(_) -> {}
-        PAnnot(inner, _) -> collectOpenings(inner, out)
-        PTuple(elems) -> for e in elems { collectOpenings(e, out) }
-        PCon(n, args) -> {
-            match p.opening {
-                None -> {}
-                Some(o) -> Array.push(out, (n, o.skolems))
-            }
-            for a in args { collectOpenings(a, out) }
-        }
-        PRecord(n, fields, _) -> {
-            match p.opening {
-                None -> {}
-                Some(o) -> Array.push(out, (n, o.skolems))
-            }
-            for (_, sub) in fields { collectOpenings(sub, out) }
-        }
+-- An arm's type may not mention a constant its own pattern opened: the constant
+-- stands for a type chosen at each packing.
+fun refuseEscape(alt : Alt, got : Ty.Type, where : Option Span) -> Unit {
+    match alt {
+        ACon(name, _, Some(o)) -> refuseOpened(name, o, got, where)
+        _ -> {}
     }
 }
 
--- An arm's type may not mention a constant its own pattern opened: the constant
--- stands for a type chosen at each packing.
-fun refuseEscape(p : Pat, got : Ty.Type, where : Option Span) -> Unit {
-    let openings = Array.new(2)
-    collectOpenings(p, openings)
-    if len(openings) == 0 { return {} }
-    let opened = Map.new()
-    for (name, made) in openings {
-        for s in made { Map.put(opened, s.uid, name) }
-    }
+fun refuseOpened(name : String, o : Opening, got : Ty.Type, where : Option Span) -> Unit {
+    let opened = Set.new()
+    for s in o.skolems { Set.add(opened, s.uid) }
     for s in Ty.skolemsOf([got]) {
-        match Map.get(opened, s.uid) {
-            None -> {}
-            Some(name) ->
-                fail("the type of this arm, " + Ty.show(got) + ", mentions '"
-                     + s.name + "', which only exists inside the pattern '"
-                     + name + "' that opened it", where)
+        if Set.contains(opened, s.uid) {
+            fail("the type of this arm, " + Ty.show(got) + ", mentions '"
+                 + s.name + "', which only exists inside the pattern '"
+                 + name + "' that opened it", where)
         }
     }
 }
@@ -853,54 +824,56 @@ fun checkJump(ck : Checker, e : Core, name : String, args : Array Core,
 
 -- -- patterns, derived rather than read ----------------------------------------------
 
--- What a pattern binds, worked out from what it is matched against.
+-- What an arm binds, worked out from what it is matched against.
 --
 -- Reduced first, and here rather than at the call sites: a scrutinee may be
 -- `Item a`, and whether its constructors are `Op`'s is exactly what the equality
 -- in scope decides. Matching against an unreduced family would reject a program
 -- the checker had been told about.
-fun pattern(ck : Checker, p : Pat, scrutinee : Ty.Type,
+fun pattern(ck : Checker, alt : Alt, scrutinee : Ty.Type,
             where : Option Span) -> Map String Ty.Type {
     let target = Ty.prune(reduce(ck, scrutinee))
-    let bare = unannot(p)
-    match bare.kind {
-        PVar(name) -> {
+    match alt {
+        AAny(binder) -> {
             let out = Map.new()
-            Map.put(out, name, target)
+            if let Some(name) = binder { Map.put(out, name, target) }
             out
         }
-        PWild -> Map.new()
-        PLit(_) -> Map.new()
-        PTuple(elems) -> match target {
+        ALit(_) -> Map.new()
+        ATuple(elems) -> match target {
             TTuple(tys) -> {
-                let out = Map.new()
-                for var i = 0; i < len(elems) && i < len(tys); i = i + 1 {
-                    for (n, t) in Map.entries(pattern(ck, elems[i], tys[i], where)) {
-                        Map.put(out, n, t)
-                    }
+                if len(elems) != len(tys) {
+                    fail("a tuple of " + Int.toString(len(elems))
+                         + " matched against " + Ty.show(target), where)
                 }
-                out
+                bindAll(elems, tys)
             }
-            TVar(_) -> freshBinders(bare)
-            TBottom -> freshBinders(bare)
+            TVar(_) -> freshBinders(alt)
+            TBottom -> freshBinders(alt)
             _ -> fail("a tuple pattern against " + Ty.show(target), where)
         }
-        PCon(name, args) -> conPattern(ck, bare, name, Some(args), None, target, where)
-        PRecord(name, fields, _) -> conPattern(ck, bare, name, None, Some(fields), target, where)
-        _ -> fail("no rule for this pattern", where)
+        ACon(name, fields, opening) -> conPattern(ck, alt, name, fields, opening, target, where)
     }
 }
 
-fun conPattern(ck : Checker, p : Pat, name : String, args : Option (Array Pat),
-               fields : Option (Array (String, Pat)), target : Ty.Type,
+fun bindAll(binders : Array (Option String), tys : Array Ty.Type) -> Map String Ty.Type {
+    let out = Map.new()
+    for var i = 0; i < len(binders) && i < len(tys); i = i + 1 {
+        if let Some(name) = binders[i] { Map.put(out, name, tys[i]) }
+    }
+    out
+}
+
+fun conPattern(ck : Checker, alt : Alt, name : String, fields : Array (Option String),
+               opening : Option Opening, target : Ty.Type,
                where : Option Span) -> Map String Ty.Type {
     let info = match Map.get(ck.decls.constructors, name) {
         Some(i) -> i
         None -> fail("unknown constructor '" + name + "'", where)
     }
     match target {
-        TVar(_) -> return freshBinders(p)
-        TBottom -> return freshBinders(p)
+        TVar(_) -> return freshBinders(alt)
+        TBottom -> return freshBinders(alt)
         _ -> {}
     }
     let (h, _) = Ty.spine(target)
@@ -919,22 +892,22 @@ fun conPattern(ck : Checker, p : Pat, name : String, args : Option (Array Pat),
     -- them.
     let carriedTypes = Array.new(0)
     if len(info.exists) > 0 {
-        let opening = match p.opening {
+        let o = match opening {
             Some(o) -> o
             None -> fail("'" + name + "' is existential, and this pattern does "
                          + "not open it", where)
         }
-        if len(opening.skolems) != len(info.exists)
-                || len(opening.evidence) != len(info.scheme.preds) {
+        if len(o.skolems) != len(info.exists)
+                || len(o.evidence) != len(info.scheme.preds) {
             fail("'" + name + "' is existential, and this pattern does not open it",
                  where)
         }
         for var i = 0; i < len(info.exists); i = i + 1 {
-            Map.put(mapping, info.exists[i].id, TCon(opening.skolems[i]))
+            Map.put(mapping, info.exists[i].id, TCon(o.skolems[i]))
         }
         for var i = 0; i < len(info.scheme.preds); i = i + 1 {
             let pr = info.scheme.preds[i]
-            Array.push(carriedTypes, (opening.evidence[i],
+            Array.push(carriedTypes, (o.evidence[i],
                 dictType(ck, pr.name, Decls.substitute(pr.args[0], mapping))))
         }
     }
@@ -943,48 +916,18 @@ fun conPattern(ck : Checker, p : Pat, name : String, args : Option (Array Pat),
         _ -> Array.new(0)
     }
     let fieldTypes = Array.map(params, Decls.substitute(_, mapping))
-    let out = Map.new()
+    if len(fields) != len(fieldTypes) {
+        fail("'" + name + "' takes " + Int.toString(len(fieldTypes))
+             + " arguments, matched with " + Int.toString(len(fields)), where)
+    }
+    let out = bindAll(fields, fieldTypes)
     for (n, t) in carriedTypes { Map.put(out, n, t) }
-    match args {
-        Some(sub) -> {
-            if len(sub) != len(fieldTypes) {
-                fail("'" + name + "' takes " + Int.toString(len(fieldTypes))
-                     + " arguments, matched with " + Int.toString(len(sub)),
-                     where)
-            }
-            for var i = 0; i < len(sub); i = i + 1 {
-                for (n, t) in Map.entries(pattern(ck, sub[i], fieldTypes[i], where)) {
-                    Map.put(out, n, t)
-                }
-            }
-        }
-        None -> {}
-    }
-    match fields {
-        Some(fs) -> {
-            let names = match info.fields {
-                Some(ns) -> ns
-                None -> Array.new(0)
-            }
-            for (label, sub) in fs {
-                match Array.indexOf(names, label) {
-                    None -> fail("'" + name + "' has no field '" + label + "'",
-                                 where)
-                    Some(index) -> for (n, t) in Map.entries(
-                            pattern(ck, sub, fieldTypes[index], where)) {
-                        Map.put(out, n, t)
-                    }
-                }
-            }
-        }
-        None -> {}
-    }
     out
 }
 
-fun freshBinders(p : Pat) -> Map String Ty.Type {
+fun freshBinders(alt : Alt) -> Map String Ty.Type {
     let out = Map.new()
-    for n in patternVars(p) { Map.put(out, n, freshType()) }
+    for n in altVars(alt) { Map.put(out, n, freshType()) }
     out
 }
 
@@ -1151,18 +1094,6 @@ fun headMapping(s : Scheme, target : Ty.Type) -> Map Int Ty.Type {
         -- report it.
         None -> Map.new()
     }
-}
-
-fun unannot(p : Pat) -> Pat {
-    var out = p
-    var going = True
-    while going {
-        match out.kind {
-            PAnnot(inner, _) -> { out = inner }
-            _ -> { going = False }
-        }
-    }
-    out
 }
 
 -- A node, said in a way a reader can find in the term. "CVar" names the rule

@@ -55,7 +55,7 @@ fun main() {
     stores = [i for i, line in enumerate(body)
               if line.startswith("str ") and ", [sp" not in line]
     assert stores, body
-    assert all(body[i - 1] == "dmb ishld" for i in stores), body
+    assert all(body[i - 1] == "dmb ish" for i in stores), body
 
 
 def test_initializing_an_object_needs_no_fence(tmp_path):
@@ -66,7 +66,7 @@ fun make(n : Int) -> Point = Point { x = n, y = n + 1 }
 
 fun main() { print(make(3).y) }
 """)
-    assert "dmb ishld" not in function(asm, "Main#make")
+    assert "dmb ish" not in function(asm, "Main#make")
 
 
 @pytest.fixture
@@ -87,7 +87,7 @@ def library_asm(request, tmp_path):
 
 
 def fences(asm: str, name: str) -> int:
-    return function(asm, name).count("dmb ishld")
+    return function(asm, name).count("dmb ish")
 
 
 # Each function below starts by calling itself on a case that never happens:

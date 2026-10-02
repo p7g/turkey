@@ -8,9 +8,6 @@ module Turkey.Coroutine (Coroutine, new, resume, suspend, finished, running)
 -- across a switch; what the two sides tell each other goes through the
 -- coroutine object or other heap objects, where its type is checked.
 --
--- One worker. `current` is a global, which is only right while one thread
--- runs Turkey code.
---
 -- A stack's frames are the collector's roots for as long as it is
 -- registered, which is until its body returns. A coroutine that is never
 -- resumed to the end keeps its stack and everything its frames hold.
@@ -29,8 +26,17 @@ type Coroutine = Coroutine {
     finished : Bool,
 }
 
--- The coroutine whose stack is running, if any.
-var current : Option Coroutine = None
+-- Each worker's running coroutine, if any, by the worker's index in its
+-- record (`Turkey.Process`). Held here rather than in the record because it
+-- is a traced value, and the record is raw memory the collector does not
+-- read. One worker so far.
+var currents : Prim.Array (Option Coroutine) = Prim.arrayNew(1, None)
+
+fun current() -> Option Coroutine = Prim.arrayGet(currents, worker())
+
+fun currentSet(c : Option Coroutine) -> Unit = Prim.arraySet(currents, worker(), c)
+
+fun worker() -> Int = Prim.loadI64(Prim.processState(), 288)
 
 -- Chosen without measurement. Reserved, not resident: only the pages a
 -- coroutine touches cost memory.
@@ -46,7 +52,7 @@ fun new(body : fun() -> Unit) -> Coroutine = Coroutine {
 fun finished(c : Coroutine) -> Bool = c.finished
 
 -- The coroutine whose stack is running, or `None` on the program's own stack.
-fun running() -> Option Coroutine = current
+fun running() -> Option Coroutine = current()
 
 -- Run `c` until it suspends or finishes.
 fun resume(c : Coroutine) -> Unit {
@@ -54,19 +60,19 @@ fun resume(c : Coroutine) -> Unit {
     -- A running coroutine is suspended inside every coroutine that resumed it
     -- in turn, so resuming it again would run one stack twice.
     if c.running { return Prim.error("resumed a running coroutine") }
-    let previous = current
+    let previous = current()
     let here = Stack.running()
     Stack.resumerSet(c.stack, here)
     c.running = True
-    current = Some(c)
+    currentSet(Some(c))
     Prim.swapStack(here, c.stack)
-    current = previous
+    currentSet(previous)
     if c.finished { Stack.free(c.stack) }
 }
 
 -- Give control back to whoever resumed the running coroutine; this returns
 -- when something resumes it again.
-fun suspend() -> Unit = match current {
+fun suspend() -> Unit = match current() {
     None -> Prim.error("suspended outside a coroutine")
     Some(c) -> {
         c.running = False
@@ -81,7 +87,7 @@ fun suspend() -> Unit = match current {
 -- call until it reaches the bottom of the stack, and the switch carries it on
 -- to the resumer, which goes on unwinding, so a panic in a coroutine ends the
 -- program as one anywhere does.
-fun start() -> Unit = match current {
+fun start() -> Unit = match current() {
     Some(c) -> {
         c.body()
         c.running = False

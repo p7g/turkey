@@ -550,7 +550,8 @@ fun reportWarnings(checked : Checked, path : String) -> Unit {
 fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable, path : String)
         -> (SsaLower.Module, Array SsaLower.Unsupported) {
     let (module_, skipped) = SsaLower.lowerProgram(program, decls)
-    module_.functions = Array.map(module_.functions, fun(lowered) = {
+    -- Each function's own, so on as many workers as there are.
+    module_.functions = mapParallel(module_.functions, fun(lowered) = {
         Fields.forward(lowered)
         let f = Sccp.run(lowered)
         Clean.eliminateCopies(f, True)
@@ -558,15 +559,8 @@ fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable, path : String)
         Clean.mergeBlocks(f)
     })
     let complaints = []
-    for f in module_.functions {
-        for message in Ssa.verify(f) { Array.push(complaints, message) }
-        for block in f.blocks {
-            for i in block.insts {
-                for message in LowIr.checkReps(f, i) {
-                    Array.push(complaints, f.name + ": " + message)
-                }
-            }
-        }
+    for found in mapParallel(module_.functions, complaintsOf) {
+        for message in found { Array.push(complaints, message) }
     }
     for message in LowIr.checkCalls(module_.functions) {
         Array.push(complaints, message)
@@ -588,6 +582,17 @@ fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable, path : String)
     -- which giblet code may not make and gets none of.
     for f in module_.functions { if !isGiblet(f.name) { Polls.insert(f) } }
     (module_, skipped)
+}
+
+-- What `Ssa.verify` and `LowIr.checkReps` say of one function.
+fun complaintsOf(f : Ssa.Func LowIr.Low) -> Array String {
+    let out = Ssa.verify(f)
+    for block in f.blocks {
+        for i in block.insts {
+            for message in LowIr.checkReps(f, i) { Array.push(out, f.name + ": " + message) }
+        }
+    }
+    out
 }
 
 -- A binding that did not lower stops a compile that is meant to produce code.
@@ -653,26 +658,29 @@ fun backendOf(asm : Asm.Asm, f : Ssa.Func Arm64.Inst, i : Int,
     }
 }
 
--- `make(i)` for each `i` from `from` up to `to`, in order.
-fun inOrder(from : Int, to : Int, make : fun(Int) -> Made) -> Array Made {
-    let out = []
-    for var i = from; i < to; i = i + 1 { Array.push(out, make(i)) }
-    out
-}
-
--- The same, each a task.
-fun inParallel(from : Int, to : Int, make : fun(Int) -> Made) -> Array Made {
-    let out : Array (Option Made) = Array.filled(to - from, None)
-    Task.runScope(do {
-        for var k = from; k < to; k = k + 1 {
-            let i = k
-            let _ = Task.spawn(fun() { out[i - from] = Some(make(i)) })?
-        }
-        pure(())
-    })
+-- `f` of each of `xs`, in order: each a task when `TURKEY_WORKERS` asks for
+-- more than one worker, and a plain `map` when it does not. Each `f(x)` must
+-- touch nothing another may be writing; tasks write only their own element of
+-- the answer.
+fun mapParallel(xs : Array a, f : fun(a) -> b) -> Array b {
+    if workersWanted() < 2 { return Array.map(xs, f) }
+    let out : Array (Option b) = Array.filled(len(xs), None)
+    -- A window at a time, so that at most that many tasks' stacks exist.
+    var start = 0
+    while start < len(xs) {
+        let end = if start + backendWindow < len(xs) { start + backendWindow } else { len(xs) }
+        Task.runScope(do {
+            for var k = start; k < end; k = k + 1 {
+                let i = k
+                let _ = Task.spawn(fun() { out[i] = Some(f(xs[i])) })?
+            }
+            pure(())
+        })
+        start = end
+    }
     Array.map(out, fun(m) = match m {
-        Some(made) -> made
-        None -> error("internal error: a backend task made nothing")
+        Some(value) -> value
+        None -> error("internal error: a parallel task made nothing")
     })
 }
 
@@ -766,14 +774,14 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     let costs : Array (String, Int) = []
     -- A window of functions at a time, each made by a task when there are
     -- workers to run them in parallel, then handed on in order.
-    let workers = workersWanted()
     var start = 0
     while start < len(selected) {
         let end = if start + backendWindow < len(selected) { start + backendWindow }
                   else { len(selected) }
-        let make = fun(i) = backendOf(asm, selected[i], i, lows, sigs, outs)
-        let made = if workers > 1 { inParallel(start, end, make) }
-                   else { inOrder(start, end, make) }
+        let indices = []
+        for var i = start; i < end; i = i + 1 { Array.push(indices, i) }
+        let made = mapParallel(indices,
+                               fun(i) = backendOf(asm, selected[i], i, lows, sigs, outs))
         for var k = 0; k < len(made); k = k + 1 {
             let m = made[k]
             let i = start + k

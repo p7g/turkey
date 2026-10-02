@@ -28,7 +28,7 @@ module Turkey.SsaLower (
 import Data.Map as Map
 import Data.Set as Set
 import Turkey.Core as Core
-import Turkey.Core (Core(..), CoreKind(..), CParam(..), CBind(..), CProgram(..), Alt(..),
+import Turkey.Core (Core(..), CoreKind(..), CParam(..), CAlt(..), CBind(..), CProgram(..), Alt(..),
                     Mapper(..))
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..), Compact(..))
@@ -735,45 +735,245 @@ fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
                 }
             }
         }
-        -- A match is a chain of tests, and the arms all lower towards the
-        -- same destination. This is where destination passing earns the
-        -- most: an arm jumps to where the value was wanted, rather than
-        -- materializing it into a block parameter and then into a slot.
+        -- The arms all lower towards the same destination. This is where
+        -- destination passing earns the most: an arm jumps to where the value
+        -- was wanted, rather than materializing it into a block parameter and
+        -- then into a slot.
         CMatch(scrutinee, alts) -> {
             let whole = value(l, scrutinee)
-            let failed = L.block(l.b)
-            -- The first test happens where the scrutinee was computed, so
-            -- every later test block is reached only through this one and the
-            -- scrutinee dominates all of them.
-            var test = l.b.at
-            for var i = 0; i < len(alts); i = i + 1 {
-                let success = L.block(l.b)
-                let failure = if i + 1 == len(alts) { failed } else { L.block(l.b) }
-                L.into(l.b, test)
-                let was = saving(l, Core.altVars(alts[i].alt))
-                -- An existential arm's copy is lowered under the layouts it
-                -- names for the constants it opens.
-                let outer = l.layouts
-                l.layouts = openedLayoutsFor(alts[i].alt, outer)
-                testArm(l, alts[i].alt, whole, scrutinee.ty, success, failure)
-                L.into(l.b, success)
-                lower(l, alts[i].body, dest)
-                l.layouts = outer
-                restore(l, was)
-                test = failure
+            if !switched(l, whole, scrutinee.ty, alts, dest) {
+                chain(l, whole, scrutinee.ty, alts, dest)
             }
-            L.into(l.b, failed)
-            -- Exhaustiveness has already decided this is unreachable. It is
-            -- emitted anyway because the *lowering* must not be the thing that
-            -- assumes so: a bug in an earlier pass then stops here with a name
-            -- rather than falling off the end of a block.
-            let message = L.emit(l.b, ConstString("no match arm applied"),
-                                 Ssa.traced(Ptr))
-            L.terminate(l.b, Panic(message))
         }
         CLetRec(binds, body) -> letrec(l, binds, body, dest)
         _ -> finish(l, value(l, e), dest)
     }
+}
+
+-- A match as a chain of tests, one arm after another: what a match is when
+-- `switched` cannot make it one switch.
+fun chain(l : Lower, whole : Value, ty : Ty.Type, alts : Array CAlt, dest : Dest) -> Unit {
+    let failed = L.block(l.b)
+    -- The first test happens where the scrutinee was computed, so every later
+    -- test block is reached only through this one and the scrutinee dominates
+    -- all of them.
+    var test = l.b.at
+    for var i = 0; i < len(alts); i = i + 1 {
+        let success = L.block(l.b)
+        let failure = if i + 1 == len(alts) { failed } else { L.block(l.b) }
+        L.into(l.b, test)
+        let was = saving(l, Core.altVars(alts[i].alt))
+        -- An existential arm's copy is lowered under the layouts it names for
+        -- the constants it opens.
+        let outer = l.layouts
+        l.layouts = openedLayoutsFor(alts[i].alt, outer)
+        testArm(l, alts[i].alt, whole, ty, success, failure)
+        L.into(l.b, success)
+        lower(l, alts[i].body, dest)
+        l.layouts = outer
+        restore(l, was)
+        test = failure
+    }
+    L.into(l.b, failed)
+    noArm(l)
+}
+
+-- Exhaustiveness has already decided this is unreachable. It is emitted anyway
+-- because the *lowering* must not be the thing that assumes so: a bug in an
+-- earlier pass then stops here with a name rather than falling off the end of
+-- a block.
+fun noArm(l : Lower) -> Unit {
+    let message = L.emit(l.b, ConstString("no match arm applied"), Ssa.traced(Ptr))
+    L.terminate(l.b, Panic(message))
+}
+
+-- A match on the constructors of one sum, or on integer or character
+-- literals, as one `Switch`: the tag is read, or the value compared, once for
+-- the whole match rather than once per arm. `False`, having emitted nothing,
+-- for any other match.
+--
+-- An arm that matches anything ends the cases; the arms after it cannot be
+-- reached.
+fun switched(l : Lower, whole : Value, ty : Ty.Type, alts : Array CAlt,
+             dest : Dest) -> Bool {
+    let tested = []
+    var fallback : Option CAlt = None
+    for alt in alts {
+        match alt.alt {
+            AAny(_) -> {
+                fallback = Some(alt)
+                break
+            }
+            _ -> Array.push(tested, alt)
+        }
+    }
+    if len(tested) < 2 { return False }
+    let shape = match switchShape(l, whole, ty, tested) {
+        Some(sh) -> sh
+        None -> return False
+    }
+    let blocks = Array.map(tested, fun(_) = L.block(l.b))
+    let otherwise = L.block(l.b)
+    let cases = []
+    let keyed = Set.new()
+    var default : Option BlockId = Some(otherwise)
+    match shape {
+        Literals -> for var i = 0; i < len(tested); i = i + 1 {
+            match tested[i].alt {
+                ALit(lit) -> {
+                    let key = literalKey(lit)
+                    if !Set.contains(keyed, key) {
+                        Set.add(keyed, key)
+                        Array.push(cases, (key, blocks[i]))
+                    }
+                }
+                _ -> {}
+            }
+        }
+        Tags(all) -> {
+            for var i = 0; i < len(tested); i = i + 1 {
+                let key = Map.getOr(l.tags, conOf(tested[i].alt), -1)
+                if !Set.contains(keyed, key) {
+                    Set.add(keyed, key)
+                    Array.push(cases, (key, blocks[i]))
+                }
+            }
+            -- When the arms name every constructor, the tag is one of the
+            -- cases, so the switch needs no default and a search over it need
+            -- not confirm the last key it reaches.
+            if every(all, fun(name) = Set.contains(keyed, Map.getOr(l.tags, name, -1))) {
+                default = None
+            }
+        }
+        Words(c) -> {
+            var payload : Option BlockId = None
+            for var i = 0; i < len(tested); i = i + 1 {
+                let name = conOf(tested[i].alt)
+                match Array.indexOf(c.nullaries, name) {
+                    Some(key) -> if !Set.contains(keyed, key) {
+                        Set.add(keyed, key)
+                        Array.push(cases, (key, blocks[i]))
+                    }
+                    None -> if Option.isNone(payload) { payload = Some(blocks[i]) }
+                }
+            }
+            -- A nullary is the small integer it is numbered by, and the
+            -- payload a pointer above every one of them, so the payload arm is
+            -- the default once every nullary is a case.
+            if Option.isSome(payload) {
+                for var key = 0; key < len(c.nullaries); key = key + 1 {
+                    if !Set.contains(keyed, key) {
+                        Set.add(keyed, key)
+                        Array.push(cases, (key, otherwise))
+                    }
+                }
+                default = payload
+            }
+        }
+    }
+    let discriminant = match shape {
+        Tags(_) -> L.emit(l.b, ObjectTag(whole), Ssa.untraced(I32))
+        _ -> whole
+    }
+    L.terminate(l.b, Switch(discriminant, cases, default))
+    for var i = 0; i < len(tested); i = i + 1 {
+        L.into(l.b, blocks[i])
+        armOf(l, shape, tested[i], whole, ty, dest)
+    }
+    L.into(l.b, otherwise)
+    match fallback {
+        Some(alt) -> armOf(l, shape, alt, whole, ty, dest)
+        None -> noArm(l)
+    }
+    True
+}
+
+-- What a switch reads: an ordinary sum's tag, every one of which its type
+-- names; a one-word compact sum's word; or the value of an integer or
+-- character.
+type SwitchShape = Tags(Array String) | Words(Compact) | Literals
+
+fun switchShape(l : Lower, whole : Value, ty : Ty.Type,
+                tested : Array CAlt) -> Option SwitchShape {
+    match tested[0].alt {
+        ALit(_) -> {
+            let class_ = Ssa.repOf(l.func, whole).class_
+            if class_ != I64 && class_ != I32 { return None }
+            for alt in tested {
+                match alt.alt {
+                    ALit(LInt(_)) -> {}
+                    ALit(LChar(_)) -> {}
+                    _ -> return None
+                }
+            }
+            Some(Literals)
+        }
+        ACon(first, _, _) -> {
+            if first == P.boolFalse || first == P.boolTrue { return None }
+            if Option.isSome(Decls.erasedPayload(l.decls, ty)) { return None }
+            let info = match Decls.con(l.decls, first) {
+                Some(i) -> i
+                None -> return None
+            }
+            let variants = match Map.get(l.decls.tycons, info.tycon) {
+                Some(t) -> Array.map(t.variants, _.name)
+                None -> return None
+            }
+            if len(variants) < 2 { return None }
+            for alt in tested {
+                match alt.alt {
+                    ACon(name, _, None) -> if !Array.contains(variants, name) { return None }
+                    _ -> return None
+                }
+            }
+            match compactAt(l, first, ty) {
+                Some(c) -> Some(Words(c))
+                None -> Some(Tags(variants))
+            }
+        }
+        _ -> None
+    }
+}
+
+fun conOf(alt : Alt) -> String = match alt {
+    ACon(name, _, _) -> name
+    _ -> ""
+}
+
+fun literalKey(lit : Lit) -> Int = match lit {
+    LInt(n) -> n
+    LChar(c) -> Char.toInt(c)
+    _ -> 0
+}
+
+-- One arm of a switch, in the block the switch sent it to: what it binds,
+-- then its body.
+fun armOf(l : Lower, shape : SwitchShape, alt : CAlt, whole : Value, ty : Ty.Type,
+          dest : Dest) -> Unit {
+    let was = saving(l, Core.altVars(alt.alt))
+    match alt.alt {
+        AAny(binder) -> bindTo(l, binder, whole)
+        ACon(name, binders, _) -> match shape {
+            Words(c) -> if Option.isNone(Array.indexOf(c.nullaries, name)) {
+                compactPayload(l, c, binders, whole, ty)
+            }
+            _ -> {
+                let types = match Decls.conFieldTypes(l.decls, ty, name) {
+                    Some(ts) -> ts
+                    None -> []
+                }
+                destructure(l, whole, positions(binders, types, 0))
+            }
+        }
+        _ -> {}
+    }
+    lower(l, alt.body, dest)
+    restore(l, was)
+}
+
+fun every(xs : Array a, p : fun(a) -> Bool) -> Bool {
+    for x in xs { if !p(x) { return False } }
+    True
 }
 
 -- -- arms ----------------------------------------------------------------------------
@@ -1711,13 +1911,18 @@ fun compactTest(l : Lower, c : Compact, name : String, binders : Array (Option S
     let carried = L.block(l.b)
     L.terminate(l.b, Branch(nullary, failure, carried))
     L.into(l.b, carried)
+    compactPayload(l, c, binders, v, ty)
+    L.terminate(l.b, Jump(success, []))
+}
+
+-- A compact sum's payload, known to be there, bound if the arm binds it: the
+-- word itself, or the field of the wrap it is.
+fun compactPayload(l : Lower, c : Compact, binders : Array (Option String), v : Value,
+                   ty : Ty.Type) -> Unit {
     let binder = if len(binders) == 1 { binders[0] } else { None }
     let bound = match binder {
         Some(b) -> b
-        None -> {
-            L.terminate(l.b, Jump(success, []))
-            return
-        }
+        None -> return
     }
     let field = compactField(l, c, ty)
     let inner = if plain(l, field) { v } else {
@@ -1737,7 +1942,6 @@ fun compactTest(l : Lower, c : Compact, name : String, binders : Array (Option S
         got
     }
     Map.put(l.env, bound, inner)
-    L.terminate(l.b, Jump(success, []))
 }
 
 -- A saturated constructor. A nullary one that is not a one-word compact sum's

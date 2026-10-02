@@ -131,8 +131,8 @@ fun visit(s : Solver, i : Low) -> Unit = lower(s, i.result, evaluate(s, i))
 
 -- A jump's arguments meet into its target's parameters every time the jump is
 -- visited, which is idempotent, so a changed argument needs nothing more than
--- revisiting the jump. A branch carries no arguments, so its edges only make
--- blocks reachable.
+-- revisiting the jump. A branch or a switch carries no arguments, so its
+-- edges only make blocks reachable.
 fun visitTerm(s : Solver, b : Int, t : Term) -> Unit = match t {
     Jump(target, args) -> {
         let params = s.func.blocks[Ssa.blockId(target)].params
@@ -149,7 +149,29 @@ fun visitTerm(s : Solver, b : Int, t : Term) -> Unit = match t {
             Array.push(s.blocks, Ssa.blockId(no))
         }
     }
-    _ -> {}
+    Switch(v, cases, default) -> match s.values[Ssa.valueId(v)] {
+        Top -> {}
+        Known(k) -> match switchTarget(cases, default, k) {
+            Some(target) -> Array.push(s.blocks, Ssa.blockId(target))
+            None -> {}
+        }
+        Bottom -> for target in Ssa.switchTargets(cases, default) {
+            Array.push(s.blocks, Ssa.blockId(target))
+        }
+    }
+    Ret(_) -> {}
+    Panic(_) -> {}
+    Unreachable -> {}
+}
+
+-- Where a switch on a known value goes: its case, or else its default. `None`
+-- when there is neither, which the switch says cannot happen.
+fun switchTarget(cases : Array (Int, BlockId), default : Option BlockId,
+                 k : Int) -> Option BlockId {
+    for (key, target) in cases {
+        if key == k { return Some(target) }
+    }
+    default
 }
 
 -- -- evaluation ---------------------------------------------------------------------
@@ -283,6 +305,13 @@ fun rewrite(s : Solver) -> Unit {
             Branch(c, yes, no) -> match s.values[Ssa.valueId(c)] {
                 Known(k) -> Jump(if k != 0 { yes } else { no }, [])
                 _ -> Branch(c, yes, no)
+            }
+            Switch(v, cases, default) -> match s.values[Ssa.valueId(v)] {
+                Known(k) -> match switchTarget(cases, default, k) {
+                    Some(target) -> Jump(target, [])
+                    None -> Unreachable
+                }
+                _ -> Switch(v, cases, default)
             }
             other -> other
         }

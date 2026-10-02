@@ -3,7 +3,7 @@ module Turkey.Ssa (
     RepClass(..), Rep(..), traced, untraced,
     Effects(..), reads_, writes, allocates, traps, diverges,
     isSafepoint, deletable,
-    Term(..), successors,
+    Term(..), successors, switchTargets,
     Block(..), newBlock, Func(..), newFunc,
     Inst(..), eachUse, eachDef,
     freshValue, repOf, blockAt,
@@ -223,6 +223,11 @@ type Term
     -- The arguments are the target block's parameters, positionally.
     | Jump(BlockId, Array Value)
     | Branch(Value, BlockId, BlockId)
+    -- A multi-way branch on an integer: to the case equal to the value, or
+    -- else to the default. Like `Branch`, it passes its targets nothing.
+    -- No default says the cases are every value the operand can hold, which
+    -- is what lets a lowering test fewer of them than there are.
+    | Switch(Value, Array (Int, BlockId), Option BlockId)
     | Panic(Value)
     -- What an unfinished block holds while it is built, and what a block after
     -- a diverging call legitimately ends with.
@@ -232,8 +237,18 @@ fun successors(t : Term) -> Array BlockId = match t {
     Ret(_) -> []
     Jump(target, _) -> [target]
     Branch(_, yes, no) -> [yes, no]
+    Switch(_, cases, default) -> switchTargets(cases, default)
     Panic(_) -> []
     Unreachable -> []
+}
+
+fun switchTargets(cases : Array (Int, BlockId), default : Option BlockId) -> Array BlockId {
+    let out = Array.map(cases, fun((_, target)) = target)
+    match default {
+        Some(d) -> Array.push(out, d)
+        None -> {}
+    }
+    out
 }
 
 type Block i = Block {
@@ -623,6 +638,20 @@ fun checkTerm(out : Array String, f : Func i, idom : Array (Option Int),
             checkEdge(out, f, idom, defBlock, defAt, b, yes, [])
             checkEdge(out, f, idom, defBlock, defAt, b, no, [])
         }
+        Switch(v, cases, default) -> {
+            checkUse(out, f, idom, defBlock, defAt, v, b, last)
+            let keys = Set.new()
+            for (key, _) in cases {
+                if Set.contains(keys, key) {
+                    Array.push(out, f.name + ": switches to two cases for "
+                                    + Int.toString(key))
+                }
+                Set.add(keys, key)
+            }
+            for target in switchTargets(cases, default) {
+                checkEdge(out, f, idom, defBlock, defAt, b, target, [])
+            }
+        }
         Panic(v) -> checkUse(out, f, idom, defBlock, defAt, v, b, last)
         Unreachable -> {}
     }
@@ -707,6 +736,15 @@ fun showTerm(f : Func i, t : Term) -> String = match t {
     Branch(cond, yes, no) ->
         "branch " + showValue(f, cond) + ", b" + Int.toString(blockId(yes))
         + ", b" + Int.toString(blockId(no))
+    Switch(v, cases, default) -> {
+        let parts = Array.map(cases, fun((key, target)) =
+            Int.toString(key) + " -> b" + Int.toString(blockId(target)))
+        match default {
+            Some(d) -> Array.push(parts, "_ -> b" + Int.toString(blockId(d)))
+            None -> {}
+        }
+        "switch " + showValue(f, v) + " [" + String.join(parts, ", ") + "]"
+    }
     Panic(v) -> "panic " + showValue(f, v)
     Unreachable -> "unreachable"
 }
@@ -794,6 +832,7 @@ fun termUses(t : Term) -> Array Value = match t {
     Ret(v) -> [v]
     Jump(_, args) -> args
     Branch(c, _, _) -> [c]
+    Switch(v, _, _) -> [v]
     Panic(v) -> [v]
     Unreachable -> []
 }
@@ -881,6 +920,12 @@ fun remapTerm(remap : Array Int, t : Term) -> Term = match t {
     Jump(target, args) -> Jump(BlockId(remap[blockId(target)]), args)
     Branch(c, yes, no) ->
         Branch(c, BlockId(remap[blockId(yes)]), BlockId(remap[blockId(no)]))
+    Switch(v, cases, default) -> Switch(v,
+        Array.map(cases, fun((key, target)) = (key, BlockId(remap[blockId(target)]))),
+        match default {
+            Some(d) -> Some(BlockId(remap[blockId(d)]))
+            None -> None
+        })
     Panic(v) -> Panic(v)
     Unreachable -> Unreachable
 }

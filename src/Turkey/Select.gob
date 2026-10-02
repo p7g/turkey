@@ -428,7 +428,67 @@ fun terminate(s : Sel, t : Term) -> Unit = match t {
         s.panicking = False
         s.out.blocks[s.at].term = Ret(zeroResult(s))
     }
+    Switch(v, cases, default) -> {
+        let sorted = Array.sortBy(cases, fun(x, y) = Array.threeWay(x.0, y.0))
+        let width = widthOf(Ssa.repOf(s.source, v))
+        search(s, A.reg(v), width, sorted, 0, len(sorted), default)
+    }
     _ -> { s.out.blocks[s.at].term = t }
+}
+
+-- Cases `from` to `to` of a switch on `x`, in key order, from the current
+-- block: a binary search, down to a few cases tested one at a time.
+--
+-- A switch with no default holds one of its keys, so a range of one case needs
+-- no test at all, and a search over `n` cases makes about `log2 n`
+-- comparisons rather than one per arm.
+fun search(s : Sel, x : Reg, width : A.Width, cases : Array (Int, BlockId),
+           from : Int, to : Int, default : Option BlockId) -> Unit {
+    if to - from > linearCases {
+        let middle = (from + to) / 2
+        let left = block(s)
+        let right = block(s)
+        compareKey(s, x, width, cases[middle].0)
+        branchIf(s, A.Lt, left, right)
+        s.at = left
+        search(s, x, width, cases, from, middle, default)
+        s.at = right
+        search(s, x, width, cases, middle, to, default)
+        return
+    }
+    for var i = from; i < to; i = i + 1 {
+        let (key, target) = cases[i]
+        if i + 1 == to && Option.isNone(default) {
+            s.out.blocks[s.at].term = Jump(target, [])
+            return
+        }
+        compareKey(s, x, width, key)
+        let carry = block(s)
+        branchIf(s, A.Eq, Ssa.blockId(target), carry)
+        s.at = carry
+    }
+    s.out.blocks[s.at].term = match default {
+        Some(d) -> Jump(d, [])
+        None -> Unreachable
+    }
+}
+
+-- How many cases a switch tests one by one rather than by halving: below
+-- this a comparison per case costs no more than the search would.
+let linearCases = 3
+
+fun compareKey(s : Sel, x : Reg, width : A.Width, key : Int) -> Unit =
+    match immediate12(Some(key)) {
+        Some(n) -> emit(s, A.CmpImm(x, n, width))
+        None -> emit(s, A.Cmp(x, immediate(s, key), width))
+    }
+
+-- End the current block on the flags just set: to `yes` if they satisfy `c`,
+-- and to `no` if not.
+fun branchIf(s : Sel, c : A.Cond, yes : Int, no : Int) -> Unit {
+    let taken = tempValue(s, Ssa.untraced(I1))
+    emit(s, A.CSet(A.reg(taken), c))
+    s.out.blocks[s.at].term = Branch(taken, BlockId(yes), BlockId(no))
 }
 
 -- A new block at the end, and its id.

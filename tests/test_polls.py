@@ -97,3 +97,45 @@ def test_collecting_while_allocating_loops_run():
     result = lang.run(ALLOCATING, env=STRESS, flags=VERIFY)
     assert result.code == 0, result.stderr
     assert result.stdout == plain
+
+
+# Recursion with no loop and no allocation reaches no back edge, so a
+# function that can call itself again polls at its entry; one that cannot
+# does not need to. `walk` holds a heap object live across the poll.
+RECURSIVE = """
+type Pair = Pair(Int, Int)
+
+fun fib(n : Int) -> Int = if n < 2 { n } else { fib(n - 1) + fib(n - 2) }
+
+fun isEven(n : Int) -> Bool = if n == 0 { True } else { isOdd(n - 1) }
+fun isOdd(n : Int) -> Bool = if n == 0 { False } else { isEven(n - 1) }
+
+fun walk(p : Pair, n : Int) -> Int {
+    let Pair(a, b) = p
+    if n == 0 { a + b } else { walk(p, n - 1) + 1 }
+}
+
+fun leaf(n : Int) -> Int = n * 3 + 1
+
+fun main() {
+    print(fib(20) + leaf(4))
+    print(isEven(10))
+    print(walk(Pair(fib(5), leaf(2)), 50))
+}
+"""
+
+
+def test_a_recursive_function_polls_at_its_entry(tmp_path):
+    source = tmp_path / "main.gob"
+    source.write_text(RECURSIVE)
+    text = bootc.boot(*bootc.argv("asm"), str(source))
+    for name in ("Main#fib", "Main#isEven", "Main#isOdd", "Main#walk"):
+        assert polls(text, name) == 1, name
+    assert polls(text, "Main#leaf") == 0
+
+
+def test_collecting_at_entry_polls_keeps_what_recursion_holds():
+    plain = lang.output(RECURSIVE)
+    result = lang.run(RECURSIVE, env=STRESS, flags=VERIFY)
+    assert result.code == 0, result.stderr
+    assert result.stdout == plain

@@ -25,6 +25,7 @@ module Turkey.SsaLower (
 -- The `ssa` dump reports how much of each program lowered, and the verifier
 -- decides whether what did is well formed.
 
+import System.Parallel as Parallel
 import Data.Map as Map
 import Data.Set as Set
 import Turkey.Core as Core
@@ -70,14 +71,17 @@ type Signature = Signature {
     result : Rep,
 }
 
--- The state one lowering run shares across every function it makes.
+-- The state one binding's lowering shares across every function it makes.
 --
 -- Records have reference semantics, so one of these passed to a parent and to
 -- the nested `Lower`s its lambdas make is one object, which is what keeps the
 -- symbols unique. Copying one would silently restart the counter.
 type Lifting = Lifting {
-    -- Names one lifted lambda apart from the next. Program-wide rather than
-    -- per binding, so two lambdas in two bindings cannot collide.
+    -- Names one lifted lambda apart from the next. One per binding: a
+    -- lambda's symbol begins with its parent's name, which no other binding
+    -- shares, so a count of the binding's own lambdas is enough to keep them
+    -- apart -- and it does not depend on the order the bindings are lowered
+    -- in, which is any order (`lowerProgram`).
     next     : Int,
 
 }
@@ -220,10 +224,14 @@ fun lowerProgram(program : CProgram, decls : DeclTable)
     let fields = recordLayouts(program, decls)
     let tags = tagsOf(decls, fields)
     let sigs = signatures(program, decls)
-    let shared = Lifting { next = 0 }
-    for bind in Array.append(program.dicts, program.binds) {
-        let (f, lifted, why) = lowerBind(bind, decls, globals, globalRefs, tags, fields,
-                                         sigs, shared)
+    -- Each binding on its own, on as many workers as there are: lowering
+    -- reads the tables above and writes only what it makes.
+    let all = Array.append(program.dicts, program.binds)
+    let made = Parallel.map(all, fun(bind) =
+        lowerBind(bind, decls, globals, globalRefs, tags, fields, sigs, Lifting { next = 0 }))
+    for var i = 0; i < len(all); i = i + 1 {
+        let bind = all[i]
+        let (f, lifted, why) = made[i]
         match f {
             Some(function) -> {
                 -- The parent first, so a dump reads outside in.
@@ -244,7 +252,7 @@ fun lowerProgram(program : CProgram, decls : DeclTable)
     }
     -- Global initializers can also introduce lifted lambdas.
     let (init, early, lifted, storage) = initializer(program, decls, globals, globalRefs, tags,
-                                              fields, sigs, shared)
+                                              fields, sigs, Lifting { next = 0 })
     Array.push(done, init)
     Array.push(done, early)
     for g in lifted { Array.push(done, g) }

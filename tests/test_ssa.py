@@ -101,7 +101,7 @@ def test_an_operand_count_cannot_be_wrong(capfd):
     """
     source = (REPO_ROOT / "src" / "Turkey" / "LowIr.gob").read_text()
     assert "Bin(BinOp, Value, Value)" in source
-    assert "ArraySet(Value, Value, Value)" in source
+    assert "ArraySet(Value, Value, Value, IndexCheck)" in source
 
 
 def test_trapping_is_not_purity(capfd):

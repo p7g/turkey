@@ -1,5 +1,5 @@
 module Turkey.LowIr (
-    BinOp(..), CmpOp(..), Conv(..), AtomicOp(..), Callee(..), Op(..), Low(..), AddressOf(..),
+    BinOp(..), CmpOp(..), Conv(..), IndexCheck(..), AtomicOp(..), Callee(..), Op(..), Low(..), AddressOf(..),
     low, effectsOf, opUses, mapUses, opResultRep, checkReps, checkCalls, showOpName,
     Allocation(..), summarize, allocatingOp,
     Builder(..), builder, into, emit, effect, terminate, block, param,
@@ -84,6 +84,19 @@ type Conv
     -- `Bin` requires both operands at one representation.
     | PtrToInt | IntToPtr
 
+-- Whether an array access checks its index against the array's own length.
+-- `Proven` only where `Turkey.Bounds` has shown the index is in range, and
+-- then the access is valid only where it stands: an index proven by a branch
+-- that dominates the access is not proven above that branch, so a pass that
+-- moved a `Proven` access, or copied it somewhere the branch does not
+-- dominate, would make an unchecked access out of a checked one.
+--
+-- An operand of the access and not an opcode of its own, unlike `AddWrap`,
+-- because a pass that does not care about the check must still see the
+-- access: `Turkey.Escape` reads what an `ArrayGet` loads from in a match with
+-- a fallback arm, which a new opcode would fall into without a word.
+type IndexCheck = Checked | Proven
+
 type Callee
     -- A Turkey function, by its mangled symbol.
     = Direct(String)
@@ -152,8 +165,8 @@ type Op
     -- traced: it made `Array Ptr` and `Array String` the same array to the
     -- collector.
     | ArrayNew(Value, Value, Rep)
-    | ArrayGet(Value, Value)
-    | ArraySet(Value, Value, Value)
+    | ArrayGet(Value, Value, IndexCheck)
+    | ArraySet(Value, Value, Value, IndexCheck)
     | ArrayLength(Value)
     -- Raw memory: base, a *byte* offset, and the class to access at.
     --
@@ -335,9 +348,12 @@ fun effectsOf(op : Op) -> Effects = match op {
     ObjectSet(_, _, _) -> Ssa.writes()
     ObjectTag(_) -> Ssa.reads_()
     ArrayNew(_, _, _) -> Ssa.allocates()
-    -- Reads *and* traps: an index out of range panics.
-    ArrayGet(_, _) -> combine(Ssa.reads_(), Ssa.traps())
-    ArraySet(_, _, _) -> combine(Ssa.writes(), Ssa.traps())
+    -- Reads *and* traps: an index out of range panics. One proven in range
+    -- cannot, and is a plain access.
+    ArrayGet(_, _, Checked) -> combine(Ssa.reads_(), Ssa.traps())
+    ArrayGet(_, _, Proven) -> Ssa.reads_()
+    ArraySet(_, _, _, Checked) -> combine(Ssa.writes(), Ssa.traps())
+    ArraySet(_, _, _, Proven) -> Ssa.writes()
     ArrayLength(_) -> Ssa.reads_()
     -- Reads and writes, and deliberately *not* `traps`. An access off the end
     -- of a block is undefined and not checked, so claiming it can trap would
@@ -398,8 +414,8 @@ fun opUses(op : Op) -> Array Value = match op {
     PtrStore(a, b, c, _) -> [a, b, c]
     Atomic(_, operands) -> operands
     Poll -> []
-    ArrayGet(a, b) -> [a, b]
-    ArraySet(a, b, c) -> [a, b, c]
+    ArrayGet(a, b, _) -> [a, b]
+    ArraySet(a, b, c, _) -> [a, b, c]
     ArrayLength(a) -> [a]
     CellNew(a) -> [a]
     CellLoad(a) -> [a]
@@ -450,8 +466,8 @@ fun mapUses(op : Op, f : fun(Value) -> Value) -> Op = match op {
     PtrStore(a, b, c, d) -> PtrStore(f(a), f(b), f(c), d)
     Atomic(o, operands) -> Atomic(o, Array.map(operands, f))
     Poll -> Poll
-    ArrayGet(a, b) -> ArrayGet(f(a), f(b))
-    ArraySet(a, b, c) -> ArraySet(f(a), f(b), f(c))
+    ArrayGet(a, b, c) -> ArrayGet(f(a), f(b), c)
+    ArraySet(a, b, c, d) -> ArraySet(f(a), f(b), f(c), d)
     ArrayLength(a) -> ArrayLength(f(a))
     CellNew(a) -> CellNew(f(a))
     CellLoad(a) -> CellLoad(f(a))
@@ -516,7 +532,7 @@ fun opResultRep(op : Op) -> Option Rep = match op {
     StackObject(_, _, _, _) -> Some(Ssa.traced(Ptr))
     StackClosure(_, _) -> Some(Ssa.traced(Ptr))
     ObjectSet(_, _, _) -> Some(Ssa.untraced(Unit))
-    ArraySet(_, _, _) -> Some(Ssa.untraced(Unit))
+    ArraySet(_, _, _, _) -> Some(Ssa.untraced(Unit))
     CellStore(_, _) -> Some(Ssa.untraced(Unit))
     ClosureCapture(_, _, _) -> Some(Ssa.untraced(Unit))
     GlobalStore(_, _) -> Some(Ssa.untraced(Unit))
@@ -544,8 +560,8 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Array String {
         Bin(_, a, b) -> sameRep(f, out, a, b, "the operands of a binary operation")
         Cmp(_, a, b) -> sameRep(f, out, a, b, "the operands of a comparison")
         Not(a) -> wantClass(f, out, a, I1, "the operand of a logical not")
-        ArrayGet(_, index) -> wantClass(f, out, index, I64, "an array index")
-        ArraySet(_, index, _) -> wantClass(f, out, index, I64, "an array index")
+        ArrayGet(_, index, _) -> wantClass(f, out, index, I64, "an array index")
+        ArraySet(_, index, _, _) -> wantClass(f, out, index, I64, "an array index")
         ArrayNew(length, _, _) -> wantClass(f, out, length, I64, "an array length")
         -- A machine has no integer constant of floating type, so an integer
         -- literal at `f64` has to have become a float before it gets here.
@@ -839,8 +855,8 @@ fun showOpName(op : Op) -> String = match op {
     PtrStore(_, _, _, _) -> "ptr.store"
     Atomic(o, _) -> show(o)
     Poll -> "poll"
-    ArrayGet(_, _) -> "array.get"
-    ArraySet(_, _, _) -> "array.set"
+    ArrayGet(_, _, _) -> "array.get"
+    ArraySet(_, _, _, _) -> "array.set"
     ArrayLength(_) -> "array.length"
     CellNew(_) -> "cell.new"
     CellLoad(_) -> "cell.load"
@@ -868,6 +884,11 @@ instance Show Low {
 }
 
 fun v(x : Value) -> String = "%" + Int.toString(Ssa.valueId(x))
+
+fun showCheck(c : IndexCheck) -> String = match c {
+    Checked -> ""
+    Proven -> " ; in bounds"
+}
 
 instance Show Op {
   fun show(op) = match op {
@@ -900,8 +921,8 @@ instance Show Op {
         "ptr.store " + v(a) + ", " + v(off) + ", " + v(x) + ", " + show(c)
     Atomic(o, operands) -> show(o) + " " + String.join(Array.map(operands, v), ", ")
     Poll -> "poll"
-    ArrayGet(a, i) -> "array.get " + v(a) + ", " + v(i)
-    ArraySet(a, i, x) -> "array.set " + v(a) + ", " + v(i) + ", " + v(x)
+    ArrayGet(a, i, c) -> "array.get " + v(a) + ", " + v(i) + showCheck(c)
+    ArraySet(a, i, x, c) -> "array.set " + v(a) + ", " + v(i) + ", " + v(x) + showCheck(c)
     ArrayLength(a) -> "array.length " + v(a)
     CellNew(a) -> "cell.new " + v(a)
     CellLoad(a) -> "cell.load " + v(a)

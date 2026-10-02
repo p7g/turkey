@@ -1,4 +1,4 @@
-module Turkey.Scheduler (start, lock, unlock, ready, wake, waitUntil, yield)
+module Turkey.Scheduler (lock, unlock, ready, wake, waitUntil, yield)
 
 -- Which task runs next, and on which worker.
 --
@@ -9,9 +9,9 @@ module Turkey.Scheduler (start, lock, unlock, ready, wake, waitUntil, yield)
 -- suspends, which returns to the worker that resumed it. So the program's own
 -- stack is never a task, and keeps its full size for deep recursion.
 --
--- There is one worker unless `TURKEY_WORKERS` asks for more, when the first
--- task starts. With one, tasks interleave in a fixed order; with more, they
--- run in parallel, and any order is possible.
+-- There is one worker unless `TURKEY_WORKERS` asks for more (`workers`). With
+-- one, tasks interleave in a fixed order; with more, they run in parallel, and
+-- any order is possible.
 --
 -- Scheduling is cooperative: a task runs until it waits or yields, and one
 -- that computes without doing either holds its worker until it finishes.
@@ -29,6 +29,7 @@ module Turkey.Scheduler (start, lock, unlock, ready, wake, waitUntil, yield)
 -- (`run`), or queues one that is parked.
 
 import Turkey.Coroutine as Co
+import Turkey.Heap as Heap
 import Turkey.Libc as Libc
 import Turkey.Lock as Lock
 import Turkey.Stack as Stack
@@ -138,7 +139,7 @@ fun waitUntil(done : fun() -> Bool, register : fun(Co.Coroutine) -> Unit) -> Uni
 -- which is waiting here.
 fun idle() -> Unit {
     if Workers.count() == 1 { return Prim.error("deadlock: every task is waiting") }
-    Workers.pause()
+    Heap.pause()
 }
 
 -- Let the other runnable tasks run before going on. On a worker's own stack,
@@ -165,23 +166,25 @@ fun yield() -> Unit = match Co.running() {
 
 -- -- workers ----------------------------------------------------------------------------
 
-var started = False
+-- The workers `TURKEY_WORKERS` asks for, beside the main one, started as this
+-- module is initialized: after the queue's state above, which they read at
+-- once, and before most of the program's allocation, so that they help mark
+-- its collections (`Turkey.Heap.markFrom`) even before it starts a task.
+-- Each runs `workerLoop` on a thread of its own, entered through
+-- `turkey_worker_start` (`Turkey.Emit.emitWorkerStart`), which sets its
+-- record in `x28`.
+let workers : Int = start()
 
--- Start the workers `TURKEY_WORKERS` asks for, beside the main one, the first
--- time a task is started. Each runs `workerLoop` on a thread of its own, entered
--- through `turkey_worker_start` (`Turkey.Emit.emitWorkerStart`), which sets
--- its record in `x28`.
-fun start() -> Unit {
-    if started { return {} }
-    started = True
+fun start() -> Int {
     let wanted = workersWanted()
     for var i = 1; i < wanted; i = i + 1 {
         let record = Workers.new()
-        if Prim.ptrIsNull(record) { return {} }
+        if Prim.ptrIsNull(record) { return i }
         let thread = Libc.malloc(8)
         let _ = Libc.pthreadCreate(thread, Prim.ptrNull(),
                                    Prim.codeAddress("turkey_worker_start"), record)
     }
+    wanted
 }
 
 -- `TURKEY_WORKERS`, a decimal count, or 1.
@@ -214,7 +217,7 @@ fun workerLoop() -> Unit {
     while True {
         match take() {
             Some(c) -> run(c)
-            None -> Workers.pause()
+            None -> Heap.pause()
         }
     }
 }

@@ -436,10 +436,10 @@ fun main() {
     heap = library / "Turkey" / "Heap.gob"
     text = heap.read_text()
     if defect == "native-roots":
-        before, after = ("    scanNativeFrames(frame)\n    if Process.pending()",
-                         "    if Process.pending()")
+        before, after = ("    stackTasks(frame)\n", "")
     else:
-        before = "        let object = Prim.loadPtr(markStack, times8(top))\n"
+        before = ("        let object = Prim.ptrFromInt(if chunk == 0 { entry } "
+                  "else { Prim.intAnd(entry, addressBits) })\n")
         after = before + "        if !Prim.ptrIsNull(object) { continue }\n"
     assert text.count(before) == 1, before
     heap.write_text(text.replace(before, after))

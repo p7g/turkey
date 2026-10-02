@@ -1,6 +1,7 @@
 module Turkey.Workers (
-    count, index, new, recordOf, stopTheWorld, startTheWorld, stopHere, running,
-    blockEnter, blockExit, acquire, pause, ended,
+    count, index, new, recordOf, stopTheWorld, startTheWorld, stopEnter, stopLeave,
+    stopWanted, stopped, running,
+    blockEnter, blockExit, unblock, acquire, ended,
 )
 
 -- The workers: the threads that run Turkey code, each with a record of its own
@@ -17,7 +18,8 @@ module Turkey.Workers (
 --
 -- * **stopped**: it saw its stop word at a safepoint, recorded that frame as
 --   its running stack's parked frame, so that the collection walks its stack
---   like any parked one, and waits for the word to come down;
+--   like any parked one, and waits for the word to come down, marking for
+--   the collection meanwhile if it is asked to (`Turkey.Heap.stopAt`);
 -- * **blocked**: it declared, before waiting on something outside Turkey code
 --   -- a lock, or for work -- that its stack is parked at a frame and that it
 --   holds nothing else. The collector claims a blocked worker (*held*) so that
@@ -82,7 +84,7 @@ fun recordOf(i : Int) -> Prim.Ptr =
 -- waits blocked for it, so that a collection under way can finish.
 --
 -- This and the other functions that record where the worker parked
--- (`acquire`, `pause`) are `foreign` so that they are never inlined: the frame
+-- (`acquire`, `Turkey.Heap.pause`) are `foreign` so that they are never inlined: the frame
 -- they record must be their own, whose return address is a safepoint in their
 -- caller, where the caller's roots are stored and mapped.
 foreign "turkey_worker_new" fun new() -> Prim.Ptr {
@@ -158,17 +160,25 @@ fun startTheWorld() -> Unit {
 }
 
 -- At a safepoint whose caller's frame record is `frame`, with the running
--- worker's stop word raised: stop until the collection is over.
-fun stopHere(frame : Prim.Ptr) -> Unit {
-    let me = index()
+-- worker's stop word raised: stopped, until `stopLeave`. The collection may
+-- ask a stopped worker to help it mark (`Turkey.Heap.stopAt`), which is why
+-- the wait between the two is the heap's.
+fun stopEnter(frame : Prim.Ptr) -> Unit {
     parkAt(frame)
-    Prim.atomicStore(states, 8 * me, 1)
-    while Prim.intAnd(Prim.atomicLoad(Prim.processState(), 272), 1) != 0 {
-        let _ = Libc.schedYield()
-    }
-    parkAt(Prim.ptrNull())
-    Prim.atomicStore(states, 8 * me, 0)
+    Prim.atomicStore(states, 8 * index(), 1)
 }
+
+-- Whether the collection that stopped the running worker is still going.
+fun stopWanted() -> Bool = Prim.intAnd(Prim.atomicLoad(Prim.processState(), 272), 1) != 0
+
+fun stopLeave() -> Unit {
+    parkAt(Prim.ptrNull())
+    Prim.atomicStore(states, 8 * index(), 0)
+}
+
+-- Whether worker `i` is stopped at a safepoint, rather than held while
+-- blocked; only the collecting worker asks, with the world stopped.
+fun stopped(i : Int) -> Bool = Prim.atomicLoad(states, 8 * i) == 1
 
 -- About to wait outside Turkey code, with every root the caller holds in its
 -- frames and the caller's frame record at `frame`: from here a collection may
@@ -181,10 +191,15 @@ fun blockEnter(frame : Prim.Ptr) -> Unit {
 
 -- Back from waiting: running again once no collection holds this worker.
 fun blockExit() -> Unit {
-    if Prim.atomicLoad(control, 8) == 0 { return {} }
-    let me = index()
-    while Prim.atomicCas(states, 8 * me, 2, 0) != 2 { let _ = Libc.schedYield() }
+    while !unblock() { let _ = Libc.schedYield() }
+}
+
+-- Running again, True, unless a collection holds this worker.
+fun unblock() -> Bool {
+    if Prim.atomicLoad(control, 8) == 0 { return True }
+    if Prim.atomicCas(states, 8 * index(), 2, 0) != 2 { return False }
     parkAt(Prim.ptrNull())
+    True
 }
 
 -- Record `frame` as where the running worker's stack is parked, or null. A
@@ -202,15 +217,6 @@ foreign "turkey_lock_acquire" fun acquire(mutex : Prim.Ptr) -> Unit {
     if Prim.intAnd(Libc.pthreadMutexTrylock(mutex), 0xFFFF_FFFF) == 0 { return {} }
     blockEnter(Prim.frameAddress())
     let _ = Libc.pthreadMutexLock(mutex)
-    blockExit()
-}
-
--- Wait a little for work, blocked, so that a collection need not wait for this
--- worker. A sleep rather than a wake-up from whoever makes work: simple, and
--- costs an idle worker's wake-ups, not a busy one's time.
-foreign "turkey_worker_pause" fun pause() -> Unit {
-    blockEnter(Prim.frameAddress())
-    let _ = Libc.usleep(50)
     blockExit()
 }
 

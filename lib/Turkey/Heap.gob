@@ -1,5 +1,5 @@
 module Turkey.Heap (
-    allocate, collect, report, rootsHead,
+    allocate, collect, report, rootsHead, pause,
 )
 
 -- The heap and its collector: regions of fixed-size slots, allocation into
@@ -200,13 +200,14 @@ var collections : Int = 0
 -- A u32 in each header, so it wraps; see `startMarking`.
 var markEpoch : Int = 0
 
--- The grey set, as an explicit stack: tracing by recursion made the native
--- stack depth proportional to the longest chain of heap pointers, and a long
--- list is an ordinary thing to build. Kept across collections, so its growth
--- is paid for once.
-var markStack : Prim.Ptr = Prim.ptrNull()
-var markCount : Int = 0
-var markCapacity : Int = 0
+-- The grey set, as an explicit stack per worker: tracing by recursion made
+-- the native stack depth proportional to the longest chain of heap pointers,
+-- and a long list is an ordinary thing to build. Each worker's is the
+-- stack's address, how many entries it holds and how many it has room for,
+-- `markerBytes` apart by worker index; kept across collections, so its
+-- growth is paid for once.
+let markerBytes : Int = 24
+var markers : Prim.Ptr = zeroed(markerBytes * 64)
 
 -- The old objects the write barrier has seen given a young one since the last
 -- collection, each once: its generation word says it is here.
@@ -788,7 +789,7 @@ fun allocate(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Prim.Pt
 }
 
 fun allocateSlow(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Prim.Ptr {
-    if stopAsked() { Workers.stopHere(frame) }
+    if stopAsked() { stopAt(frame) }
     if stress { pollWordSet(True) }
     if (stress && stressDue()) || plus(bytesSince, localBytes()) >= threshold {
         collectFrom(frame, askedEither)
@@ -843,7 +844,7 @@ fun stopAsked() -> Bool = Prim.intAnd(Prim.atomicLoad(Prim.processState(), 272),
 -- `Turkey.Workers`' own, waiting on the protocol a stop would re-enter.
 foreign "turkey_poll" fun poll() -> Unit {
     if !Workers.running() { return {} }
-    if stopAsked() { Workers.stopHere(Prim.frameAddress()) }
+    if stopAsked() { stopAt(Prim.frameAddress()) }
     if stress {
         -- A loop can poll once per byte it copies, so only one poll in
         -- `pollStressEvery` counts as an allocation does towards stress's
@@ -1027,15 +1028,16 @@ fun frameEntryFor(retaddr : Int) -> Prim.Ptr {
     Prim.ptrNull()
 }
 
--- Every Turkey frame of every stack: the running one from `frame` outwards,
--- and each other from the frame it was parked at.
+-- Every Turkey frame of every stack, as a marking task per stack
+-- (`taskStack`): the running one from `frame` outwards, and each other from
+-- the frame it was parked at.
 --
 -- `frame` is the `x29` of the Turkey allocator that called into the heap: a
 -- frame record whose return address is in the allocation site, so the first
 -- entry found is the allocating function's. Null means no Turkey frame is
 -- live -- the final collection runs after the program has returned, when no
 -- stack's frames are -- and nothing is walked.
-fun scanNativeFrames(frame : Prim.Ptr) -> Unit {
+fun stackTasks(frame : Prim.Ptr) -> Unit {
     if frameEntryCount == 0 || Prim.ptrIsNull(frame) { return {} }
     let running = Stack.running()
     if Prim.ptrIsNull(running) {
@@ -1046,12 +1048,12 @@ fun scanNativeFrames(frame : Prim.Ptr) -> Unit {
         Process.panic(Prim.cString("no entry stack bound: the frame walker cannot run"))
         return {}
     }
-    scanStack(frame, Stack.high(running))
+    addTask(taskStack, frame, Stack.high(running))
     var stack = Stack.first()
     while !Prim.ptrIsNull(stack) {
         let parked = Stack.parked(stack)
         if !Prim.ptrEq(stack, running) && !Prim.ptrIsNull(parked) {
-            scanStack(parked, Stack.high(stack))
+            addTask(taskStack, parked, Stack.high(stack))
         }
         stack = Stack.next(stack)
     }
@@ -1096,7 +1098,6 @@ fun scanStack(frame : Prim.Ptr, high : Prim.Ptr) -> Unit {
                 let at = Prim.ptrToInt(value)
                 if below(at, Prim.ptrToInt(frame)) || !below(at, top) {
                     markGrey(value, Prim.cString("arm64 frame"), i)
-                    drain()
                 }
             }
         }
@@ -1128,8 +1129,9 @@ var reciprocals : Prim.Ptr = zeroed(8 * (regionClasses + 1))
 -- below `immediates`.
 fun immediate(value : Prim.Ptr) -> Bool = below(Prim.ptrToInt(value), immediates)
 
--- Mark and push `value`, a root found as `what` `index`, if it is an object
--- and not yet marked. `what` null means a root the caller cannot name.
+-- Mark `value`, a root found as `what` `index`, if it is an object and not
+-- yet marked, and push it on the running worker's stack. `what` null means a
+-- root the caller cannot name.
 fun markGrey(value : Prim.Ptr, what : Prim.Ptr, index : Int) -> Unit {
     if immediate(value) { return {} }
     -- Exact roots and layout metadata make the header O(1) to find in normal
@@ -1145,16 +1147,52 @@ fun markGrey(value : Prim.Ptr, what : Prim.Ptr, index : Int) -> Unit {
     let region = regionOf(header)
     let slot = slotOf(region, header)
     let at = plus(regionMarked, times8(Prim.intShr(slot, 6)))
-    let marks = Prim.loadI64(region, at)
-    if Prim.intAnd(marks, bit(slot)) != 0 { return {} }
-    Prim.storeI64(region, at, Prim.intOr(marks, bit(slot)))
-    store32(region, regionLive, plus(load32(region, regionLive), 1))
+    -- Most roots are marked already, by the time a collection's later tasks
+    -- reach them.
+    if Prim.intAnd(Prim.loadI64(region, at), bit(slot)) != 0 { return {} }
+    if !claim(region, at, bit(slot), header, sharing) { return {} }
+    push(value)
+}
+
+-- Set `mask` in the mark word at `at` of `region`, and with it the header's
+-- epoch and generation and the region's live count: False if it was set
+-- already. With other workers marking (`shared`), the bit is claimed by
+-- compare-and-swap and the count added to atomically, since the word holds
+-- 64 objects' marks and another worker may be setting one of the others; the
+-- header is the winner's alone.
+fun claim(region : Prim.Ptr, at : Int, mask : Int, header : Prim.Ptr, shared : Bool) -> Bool {
+    while True {
+        let marks = Prim.loadI64(region, at)
+        if Prim.intAnd(marks, mask) != 0 { return False }
+        if !shared {
+            Prim.storeI64(region, at, Prim.intOr(marks, mask))
+            store32(region, regionLive, plus(load32(region, regionLive), 1))
+            break
+        }
+        if Prim.atomicCas(region, at, marks, Prim.intOr(marks, mask)) == marks {
+            -- The count is the low half of the word at `regionLive`, and
+            -- never carries into the high half: a region has at most 2048
+            -- slots.
+            let _ = Prim.atomicAdd(region, regionLive, 1)
+            break
+        }
+    }
     store32(header, headerMarked, markEpoch)
     Prim.storeI64(header, headerGeneration, old)
-    if markCount == markCapacity && !growMarkStack() { return {} }
-    Prim.storePtr(markStack, times8(markCount), value)
-    markCount = plus(markCount, 1)
+    True
 }
+
+-- Push `entry` on the running worker's mark stack.
+fun push(entry : Prim.Ptr) -> Unit {
+    let m = marker()
+    let count = Prim.loadI64(m, 8)
+    if count == Prim.loadI64(m, 16) && !growMarkStack(m) { return {} }
+    Prim.storePtr(Prim.loadPtr(m, 0), times8(count), entry)
+    Prim.storeI64(m, 8, plus(count, 1))
+}
+
+-- The running worker's mark stack.
+fun marker() -> Prim.Ptr = Prim.ptrAdd(markers, markerBytes * Workers.index())
 
 -- The index of the slot whose header is `header`, in `region`.
 fun slotOf(region : Prim.Ptr, header : Prim.Ptr) -> Int {
@@ -1163,16 +1201,18 @@ fun slotOf(region : Prim.Ptr, header : Prim.Ptr) -> Int {
     Prim.intShr(Prim.intMulWrapping(offset, multiplier), 32)
 }
 
--- Double the mark stack; False, with a panic raised, if there is no memory.
-fun growMarkStack() -> Bool {
-    let capacity = if markCapacity < 64 { 64 } else { markCapacity * 2 }
-    let grown = Libc.realloc(markStack, 8 * capacity)
-    if Prim.ptrIsNull(grown) {
-        Process.panic(Prim.cString("out of memory while tracing the heap"))
+-- Double the mark stack `m`; False, with the mark failed, if there is no
+-- memory.
+fun growMarkStack(m : Prim.Ptr) -> Bool {
+    let capacity = Prim.loadI64(m, 16)
+    let grown = if capacity < 64 { 64 } else { capacity * 2 }
+    let stack = Libc.realloc(Prim.loadPtr(m, 0), 8 * grown)
+    if Prim.ptrIsNull(stack) {
+        markFailed(Prim.cString("out of memory while tracing the heap"))
         return False
     }
-    markStack = grown
-    markCapacity = capacity
+    Prim.storePtr(m, 0, stack)
+    Prim.storeI64(m, 16, grown)
     True
 }
 
@@ -1215,8 +1255,8 @@ fun remember(parent : Prim.Ptr) -> Unit {
     rememberedCountSet(plus(count, 1))
 }
 
--- Trace everything reachable from the stack, emptying it. This is the one
--- place the collector decodes an object's layout.
+-- Trace everything reachable from the running worker's mark stack, emptying
+-- it. This is the one place the collector decodes an object's layout.
 --
 -- An array's tag is its element's layout code, and the other objects carry a
 -- code per slot: three bits each for constructors and records, one bit each
@@ -1224,11 +1264,36 @@ fun remember(parent : Prim.Ptr) -> Unit {
 -- pointer-sized word the collector must not follow: a raw address. A test of
 -- `>= 6` follows both, and collects through an address it has no business
 -- reading.
+--
+-- An entry is an object, or the next chunk of one too large to scan at once:
+-- its address with the chunk's number, from 1, in the top bits, which no
+-- user-space address on arm64 has set; below `chunkLimit`, so that the entry
+-- stays positive. Scanning `chunkSlots` slots at a time
+-- lets another worker take the rest of a large array.
+--
+-- With other workers marking, every `shareEvery` entries this one gives a
+-- packet of its stack away if one of them is waiting for work.
 fun drain() -> Unit {
-    var top = markCount
+    let m = marker()
+    var stack = Prim.loadPtr(m, 0)
+    var capacity = Prim.loadI64(m, 16)
+    var top = Prim.loadI64(m, 8)
+    let shared = sharing
+    var countdown = shareEvery
     while top > 0 {
+        if shared {
+            countdown = Prim.intSubWrapping(countdown, 1)
+            if countdown == 0 {
+                countdown = shareEvery
+                if top > packetEntries && Prim.atomicLoad(marking, idleAt) > 0 {
+                    top = share(stack, top)
+                }
+            }
+        }
         top = Prim.intSubWrapping(top, 1)
-        let object = Prim.loadPtr(markStack, times8(top))
+        let entry = Prim.ptrToInt(Prim.loadPtr(stack, times8(top)))
+        let chunk = Prim.intShr(entry, 48)
+        let object = Prim.ptrFromInt(if chunk == 0 { entry } else { Prim.intAnd(entry, addressBits) })
         -- Where its pointers start, how many slots, and how each is coded:
         -- 0 every slot is a pointer, 1 three bits per slot, 2 one bit.
         var first = objectSlots
@@ -1249,7 +1314,29 @@ fun drain() -> Unit {
                 coding = if kind == 0 || kind == 1 { 1 } else { 2 }
             }
         }
-        for var field = 0; field < slots; field = plus(field, 1) {
+        var field = 0
+        var end = slots
+        if slots > chunkSlots {
+            field = Prim.intMulWrapping(chunk, chunkSlots)
+            end = if Prim.intSubWrapping(slots, field) > chunkSlots && chunk < chunkLimit {
+                plus(field, chunkSlots)
+            } else { slots }
+        }
+        if end != slots {
+            if top == capacity {
+                Prim.storeI64(m, 8, top)
+                if !growMarkStack(m) {
+                    Prim.storeI64(m, 8, 0)
+                    return {}
+                }
+                stack = Prim.loadPtr(m, 0)
+                capacity = Prim.loadI64(m, 16)
+            }
+            let next = Prim.intOr(Prim.ptrToInt(object), Prim.intShl(plus(chunk, 1), 48))
+            Prim.storePtr(stack, times8(top), Prim.ptrFromInt(next))
+            top = plus(top, 1)
+        }
+        while field < end {
             let traced = if coding == 0 { True } else if coding == 1 {
                 Prim.intAnd(Prim.intShr(codes, Prim.intMulWrapping(3, field)), 7) == 7
             } else { Prim.intAnd(codes, bit(field)) != 0 }
@@ -1265,22 +1352,347 @@ fun drain() -> Unit {
                 let at = plus(regionMarked, times8(Prim.intShr(childSlot, 6)))
                 let marks = Prim.loadI64(childRegion, at)
                 let mask = bit(childSlot)
+                -- In line when this worker marks alone: a call per object
+                -- marked is a large share of what marking costs.
                 if Prim.intAnd(marks, mask) == 0 {
-                    Prim.storeI64(childRegion, at, Prim.intOr(marks, mask))
-                    store32(childRegion, regionLive, plus(load32(childRegion, regionLive), 1))
-                    store32(childHeader, headerMarked, markEpoch)
-                    Prim.storeI64(childHeader, headerGeneration, old)
-                    if top == markCapacity && !growMarkStack() {
-                        markCount = 0
-                        return {}
+                    let won = if shared { claim(childRegion, at, mask, childHeader, True) } else {
+                        Prim.storeI64(childRegion, at, Prim.intOr(marks, mask))
+                        store32(childRegion, regionLive, plus(load32(childRegion, regionLive), 1))
+                        store32(childHeader, headerMarked, markEpoch)
+                        Prim.storeI64(childHeader, headerGeneration, old)
+                        True
                     }
-                    Prim.storePtr(markStack, times8(top), child)
-                    top = plus(top, 1)
+                    if won {
+                        if top == capacity {
+                            Prim.storeI64(m, 8, top)
+                            if !growMarkStack(m) {
+                                Prim.storeI64(m, 8, 0)
+                                return {}
+                            }
+                            stack = Prim.loadPtr(m, 0)
+                            capacity = Prim.loadI64(m, 16)
+                        }
+                        Prim.storePtr(stack, times8(top), child)
+                        top = plus(top, 1)
+                    }
                 }
             }
+            field = plus(field, 1)
         }
     }
-    markCount = 0
+    Prim.storeI64(m, 8, 0)
+}
+
+-- The bits of an entry that are an address (`drain`).
+let addressBits : Int = 0xFFFF_FFFF_FFFF
+
+-- The slots scanned at once of one object: 8 KB of pointers. An object of
+-- more than `chunkLimit` chunks has its last one scanned whole.
+let chunkSlots : Int = 1024
+let chunkLimit : Int = 0x7FFF
+
+-- -- marking in parallel ----------------------------------------------------------------
+--
+-- A collection marks with every worker stopped at a safepoint helping it: they
+-- are waiting for it anyway (`stopAt`). A worker held while blocked does not
+-- help, since it is waiting on something else.
+--
+-- The roots are tasks, which the markers claim one at a time: each stack, each
+-- frame of the root chain, and runs of the remembered set. There are many more
+-- tasks than markers, so a marker that draws a small one takes another.
+--
+-- What a root reaches is balanced as it is traced: a marker with work gives a
+-- packet of its stack to the pool whenever another is waiting for some
+-- (`drain`), and a marker with none takes one. Packets rather than stealing
+-- from each other's stacks: a lock taken once a packet costs nothing next to
+-- the packet's work, and the stacks stay plain arrays their owner pushes
+-- without synchronizing.
+--
+-- The mark is over when every marker is idle -- its own stack empty, and the
+-- pool too -- which a count of idle markers, changed under the pool's lock,
+-- says.
+
+let packetEntries : Int = 512
+let shareEvery : Int = 64
+
+-- Whether other workers are marking with this one: claims of a mark are
+-- atomic then. Set before they are asked to help and cleared after they have
+-- all finished.
+var sharing : Bool = False
+-- How many workers mark this collection.
+var participants : Int = 1
+
+-- Words of the mark's state: how many markers are idle, whether the mark is
+-- over, how many packets the pool holds, the next task to claim, and whether
+-- the mark failed.
+var marking : Prim.Ptr = zeroed(40)
+let idleAt : Int = 0
+let doneAt : Int = 8
+let packetsAt : Int = 16
+let nextTaskAt : Int = 24
+let failedAt : Int = 32
+-- What `markFailed` was told, once it has been.
+var failure : Prim.Ptr = Prim.ptrNull()
+
+-- Each worker's word saying the collection wants it to mark, by index,
+-- cleared by the worker once it has finished; and each's saying it is
+-- waiting in `pause`, where it would see that.
+var helping : Prim.Ptr = zeroed(8 * 64)
+var pausing : Prim.Ptr = zeroed(8 * 64)
+
+-- The pool: full packets, and empty ones kept for reuse, each a list through
+-- its packet's first word. A packet is that word, a count, and its entries.
+var poolLock : Prim.Ptr = Lock.new()
+var poolFull : Prim.Ptr = Prim.ptrNull()
+var poolEmpty : Prim.Ptr = Prim.ptrNull()
+
+-- The tasks: three words each, the kind and two operands.
+let taskChain : Int = 0
+let taskStack : Int = 1
+let taskRemembered : Int = 2
+var tasks : Prim.Ptr = Prim.ptrNull()
+var taskCount : Int = 0
+var taskCapacity : Int = 0
+
+-- The runs the remembered set is split into.
+let rememberedRun : Int = 1024
+
+-- Mark everything reachable, with the running worker's stack walked from
+-- `frame`: by this worker and every other stopped at a safepoint.
+fun markFrom(frame : Prim.Ptr) -> Unit {
+    Prim.atomicStore(marking, failedAt, 0)
+    taskCount = 0
+    var root = roots
+    while !Prim.ptrIsNull(root) {
+        addTask(taskChain, root, Prim.ptrNull())
+        root = Prim.loadPtr(root, 0)
+    }
+    -- By address: the set is the collecting worker's (`retire`), and the
+    -- record a marker reaches through `remembered` is its own.
+    if minor {
+        let count = rememberedCount()
+        for var i = 0; i < count; i = plus(i, rememberedRun) {
+            let end = if count - i < rememberedRun { count } else { plus(i, rememberedRun) }
+            addTask(taskRemembered, Prim.ptrAdd(remembered(), times8(i)),
+                    Prim.ptrAdd(remembered(), times8(end)))
+        }
+    }
+    stackTasks(frame)
+    Prim.atomicStore(marking, nextTaskAt, 0)
+    let me = Workers.index()
+    let n = Workers.count()
+    participants = 1
+    for var i = 0; i < n; i = plus(i, 1) {
+        if i != me && canHelp(i) { participants = plus(participants, 1) }
+    }
+    sharing = participants > 1
+    if sharing {
+        Prim.atomicStore(marking, idleAt, 0)
+        Prim.atomicStore(marking, doneAt, 0)
+        for var i = 0; i < n; i = plus(i, 1) {
+            if i != me && canHelp(i) { Prim.atomicStore(helping, times8(i), 1) }
+        }
+    }
+    mark()
+    if sharing {
+        for var i = 0; i < n; i = plus(i, 1) {
+            while Prim.atomicLoad(helping, times8(i)) != 0 { let _ = Libc.schedYield() }
+        }
+        sharing = False
+    }
+    if minor { rememberedCountSet(0) }
+    if Prim.atomicLoad(marking, failedAt) != 0 { Process.panic(failure) }
+}
+
+-- Whether worker `i`, with the world stopped, waits where it would mark if
+-- asked: stopped at a safepoint, or held in `pause`.
+fun canHelp(i : Int) -> Bool = Workers.stopped(i) || Prim.atomicLoad(pausing, times8(i)) != 0
+
+fun addTask(kind : Int, a : Prim.Ptr, b : Prim.Ptr) -> Unit {
+    if taskCount == taskCapacity {
+        let capacity = if taskCapacity < 64 { 64 } else { taskCapacity * 2 }
+        let grown = Libc.realloc(tasks, 24 * capacity)
+        if Prim.ptrIsNull(grown) {
+            markFailed(Prim.cString("out of memory while tracing the heap"))
+            return {}
+        }
+        tasks = grown
+        taskCapacity = capacity
+    }
+    let at = 24 * taskCount
+    Prim.storeI64(tasks, at, kind)
+    Prim.storePtr(tasks, plus(at, 8), a)
+    Prim.storePtr(tasks, plus(at, 16), b)
+    taskCount = plus(taskCount, 1)
+}
+
+-- A marker's part: tasks until there are none to claim, then what they reach,
+-- until the mark is over.
+fun mark() -> Unit {
+    while True {
+        let i = Prim.atomicAdd(marking, nextTaskAt, 1)
+        if i >= taskCount { break }
+        run(i)
+        drain()
+    }
+    if !sharing { return {} }
+    while take() || waitForWork() { drain() }
+}
+
+fun run(task : Int) -> Unit {
+    let at = 24 * task
+    let kind = Prim.loadI64(tasks, at)
+    let a = Prim.loadPtr(tasks, plus(at, 8))
+    let b = Prim.loadPtr(tasks, plus(at, 16))
+    if kind == taskChain {
+        let count = Prim.loadI64(a, frameCount)
+        let live = Prim.loadI64(a, frameLive)
+        let values = Prim.loadPtr(a, frameValues)
+        let name = Prim.loadPtr(a, 8)
+        for var i = 0; i < count; i = plus(i, 1) {
+            if i >= 64 || Prim.intAnd(Prim.intShr(live, i), 1) != 0 {
+                markGrey(Prim.loadPtr(values, times8(i)), name, i)
+            }
+        }
+    } else if kind == taskStack {
+        scanStack(a, b)
+    } else {
+        -- A minor collection's other roots: the fields of each remembered
+        -- object, which is marked already, being old. Each is old and not
+        -- remembered after.
+        for var at = Prim.ptrToInt(a); at < Prim.ptrToInt(b); at = plus(at, 8) {
+            let parent = Prim.loadPtr(Prim.ptrFromInt(at), 0)
+            Prim.storeI64(Prim.ptrAdd(parent, payloadHeader), headerGeneration, old)
+            push(parent)
+        }
+    }
+}
+
+-- Give the top `packetEntries` of `stack`, which holds `top`, to the pool,
+-- and answer what it holds after: `top` itself if there is no memory for a
+-- packet, which only means this worker keeps the work.
+fun share(stack : Prim.Ptr, top : Int) -> Int {
+    Lock.acquire(poolLock)
+    var packet = poolEmpty
+    if Prim.ptrIsNull(packet) {
+        packet = Libc.malloc(16 + 8 * packetEntries)
+        if Prim.ptrIsNull(packet) {
+            Lock.release(poolLock)
+            return top
+        }
+    } else {
+        poolEmpty = Prim.loadPtr(packet, 0)
+    }
+    let rest = top - packetEntries
+    Memory.copy(Prim.ptrAdd(packet, 16), Prim.ptrAdd(stack, times8(rest)), 8 * packetEntries)
+    Prim.storeI64(packet, 8, packetEntries)
+    Prim.storePtr(packet, 0, poolFull)
+    poolFull = packet
+    let _ = Prim.atomicAdd(marking, packetsAt, 1)
+    Lock.release(poolLock)
+    rest
+}
+
+-- Move a packet from the pool to the running worker's stack, if there is one.
+fun take() -> Bool {
+    if Prim.atomicLoad(marking, packetsAt) == 0 { return False }
+    Lock.acquire(poolLock)
+    let packet = poolFull
+    if Prim.ptrIsNull(packet) {
+        Lock.release(poolLock)
+        return False
+    }
+    poolFull = Prim.loadPtr(packet, 0)
+    let _ = Prim.atomicAdd(marking, packetsAt, -1)
+    let m = marker()
+    let count = Prim.loadI64(packet, 8)
+    while Prim.loadI64(m, 16) < plus(Prim.loadI64(m, 8), count) {
+        if !growMarkStack(m) {
+            Lock.release(poolLock)
+            return False
+        }
+    }
+    let top = Prim.loadI64(m, 8)
+    Memory.copy(Prim.ptrAdd(Prim.loadPtr(m, 0), times8(top)), Prim.ptrAdd(packet, 16), 8 * count)
+    Prim.storeI64(m, 8, plus(top, count))
+    Prim.storePtr(packet, 0, poolEmpty)
+    poolEmpty = packet
+    Lock.release(poolLock)
+    True
+}
+
+-- With nothing to mark: idle until a packet is put in the pool, True, or
+-- every marker is idle and the mark is over, False.
+fun waitForWork() -> Bool {
+    Lock.acquire(poolLock)
+    if !Prim.ptrIsNull(poolFull) {
+        Lock.release(poolLock)
+        return True
+    }
+    let idle = plus(Prim.atomicLoad(marking, idleAt), 1)
+    Prim.atomicStore(marking, idleAt, idle)
+    if idle == participants { Prim.atomicStore(marking, doneAt, 1) }
+    Lock.release(poolLock)
+    while Prim.atomicLoad(marking, doneAt) == 0 {
+        if Prim.atomicLoad(marking, packetsAt) > 0 {
+            Lock.acquire(poolLock)
+            let over = Prim.atomicLoad(marking, doneAt) != 0
+            if !over { Prim.atomicStore(marking, idleAt, Prim.atomicLoad(marking, idleAt) - 1) }
+            Lock.release(poolLock)
+            return !over
+        }
+        let _ = Libc.schedYield()
+    }
+    False
+}
+
+-- Record that the mark cannot finish, saying `message`: the collecting worker
+-- panics with it once every marker has stopped. The first failure is the
+-- one reported.
+fun markFailed(message : Prim.Ptr) -> Unit {
+    if Prim.atomicCas(marking, failedAt, 0, 1) == 0 { failure = message }
+}
+
+-- Wait a little for work, blocked, so that a collection need not wait for
+-- this worker. A sleep rather than a wake-up from whoever makes work: simple,
+-- and costs an idle worker's wake-ups, not a busy one's time -- as long as
+-- they are rare. Idle workers waking every 50 us slowed the busy one enough to
+-- cost the self-compile more than marking in parallel saved; a sleep of 1 ms
+-- was faster than 250 us at 2, 4 and 8 workers. It is also how long a
+-- collection may wait for a paused worker to join its mark.
+--
+-- A collection that holds this worker meanwhile may ask it to mark, as it asks
+-- the stopped ones (`pausing` says it can): it waits for the collection either
+-- way. A worker blocked on a lock is not asked, since the lock may be the
+-- collecting worker's.
+foreign "turkey_worker_pause" fun pause() -> Unit {
+    let me = times8(Workers.index())
+    Prim.atomicStore(pausing, me, 1)
+    Workers.blockEnter(Prim.frameAddress())
+    let _ = Libc.usleep(1000)
+    while !Workers.unblock() {
+        if Prim.atomicLoad(helping, me) != 0 {
+            mark()
+            Prim.atomicStore(helping, me, 0)
+        }
+        let _ = Libc.schedYield()
+    }
+    Prim.atomicStore(pausing, me, 0)
+}
+
+-- At a safepoint with the running worker's stop word raised: stopped until
+-- the collection is over, marking if it asks.
+fun stopAt(frame : Prim.Ptr) -> Unit {
+    Workers.stopEnter(frame)
+    let me = times8(Workers.index())
+    while Workers.stopWanted() {
+        if Prim.atomicLoad(helping, me) != 0 {
+            mark()
+            Prim.atomicStore(helping, me, 0)
+        }
+        let _ = Libc.schedYield()
+    }
+    Workers.stopLeave()
 }
 
 -- What `notHeapPointer` calls a field, by how its object codes its slots.
@@ -1295,6 +1707,8 @@ fun fieldName(cellOrObject : Int, slotCoding : Int) -> Prim.Ptr =
 -- because "a root is not a heap pointer" is true of one slot of one frame, and
 -- a compiler emitting roots for the first time needs to know which.
 fun notHeapPointer(value : Prim.Ptr, what : Prim.Ptr, index : Int) -> Unit {
+    -- The first marker to find one reports it, in the one text buffer.
+    if Prim.atomicCas(marking, failedAt, 0, 1) != 0 { return {} }
     textLength = 0
     if Prim.ptrIsNull(what) {
         put(Prim.cString("GC root or field"))
@@ -1307,7 +1721,7 @@ fun notHeapPointer(value : Prim.Ptr, what : Prim.Ptr, index : Int) -> Unit {
     putHex(Prim.ptrToInt(value))
     put(Prim.cString(")"))
     Prim.storeI8(text, textLength, Prim.byteFromInt(0))
-    Process.panic(text)
+    failure = text
 }
 
 -- -- collecting -------------------------------------------------------------------------
@@ -1349,24 +1763,7 @@ fun collectStopped(frame : Prim.Ptr, asked : Int) -> Unit {
         clearMarks()
         rememberedCountSet(0)
     }
-    var root = roots
-    while !Prim.ptrIsNull(root) {
-        let count = Prim.loadI64(root, frameCount)
-        let live = Prim.loadI64(root, frameLive)
-        let values = Prim.loadPtr(root, frameValues)
-        let name = Prim.loadPtr(root, 8)
-        for var i = 0; i < count; i = plus(i, 1) {
-            if i >= 64 || Prim.intAnd(Prim.intShr(live, i), 1) != 0 {
-                markGrey(Prim.loadPtr(values, times8(i)), name, i)
-                drain()
-            }
-        }
-        root = Prim.loadPtr(root, 0)
-    }
-    if minor { traceRemembered() }
-    -- Beside the chain, not instead of it: the arm64 backend's frames are
-    -- here and everything else's are above.
-    scanNativeFrames(frame)
+    markFrom(frame)
     if Process.pending() { return {} }
     let marked = if wanted { nanoseconds() } else { 0 }
     if verify { verifyAt(1, frame) }
@@ -1412,22 +1809,6 @@ fun clearMarks() -> Unit {
         store32(region, regionLive, 0)
         region = Prim.loadPtr(region, regionNext)
     }
-}
-
--- A minor collection's other roots: the fields of every remembered object,
--- which is marked already, being old. Each is old and not remembered after.
-fun traceRemembered() -> Unit {
-    let entries = remembered()
-    let count = rememberedCount()
-    for var i = 0; i < count; i = plus(i, 1) {
-        let parent = Prim.loadPtr(entries, times8(i))
-        Prim.storeI64(Prim.ptrAdd(parent, payloadHeader), headerGeneration, old)
-        if markCount == markCapacity && !growMarkStack() { return {} }
-        Prim.storePtr(markStack, times8(markCount), parent)
-        markCount = plus(markCount, 1)
-        drain()
-    }
-    rememberedCountSet(0)
 }
 
 -- A new epoch, so that no header needs clearing before a mark. The epoch is a

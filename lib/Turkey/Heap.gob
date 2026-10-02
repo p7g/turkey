@@ -760,6 +760,7 @@ fun allocate(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Prim.Pt
 }
 
 fun allocateSlow(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Prim.Ptr {
+    if stress { pollWordSet(True) }
     if (stress && stressDue()) || plus(bytesSince, localBytes()) >= threshold {
         collectFrom(frame, askedEither)
         -- A collection is the only thing here that can raise one, and an
@@ -789,6 +790,22 @@ fun allocateSlow(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Pri
 fun outOfMemory() -> Prim.Ptr {
     Process.panic(Prim.cString("out of memory"))
     Prim.ptrNull()
+}
+
+-- -- polls ------------------------------------------------------------------------------
+
+-- Raise or lower the running worker's poll word, the one every loop's back
+-- edge tests (`Turkey.Polls`): word 272 of its record.
+fun pollWordSet(up : Bool) -> Unit =
+    Prim.storeI64(Prim.processState(), 272, if up { 1 } else { 0 })
+
+-- A loop's poll, called when the worker's poll word is up, as at any call.
+--
+-- Nothing asks a worker to stop yet, so the word is up only under GC stress
+-- -- raised at the first allocation -- which collects here as it does at an
+-- allocation: that is what checks the roots each poll maps.
+foreign "turkey_poll" fun poll() -> Unit {
+    if stress && stressDue() { collectFrom(Prim.frameAddress(), askedEither) }
 }
 
 -- Whether GC stress collects at this allocation.
@@ -1779,6 +1796,7 @@ foreign "turkey_gc_set_stress" fun setStress(enabled : Int) -> Unit {
     stress = Prim.intAnd(enabled, 0xFFFF_FFFF) != 0
     stressInterval = if stress { 1 } else { 0 }
     stressCountdown = 1
+    pollWordSet(stress)
 }
 
 foreign "turkey_gc_set_verify" fun setVerify(enabled : Int) -> Unit {

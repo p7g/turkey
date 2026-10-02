@@ -105,6 +105,13 @@ fun emitInsts(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
               insts : Array Inst, upTo : Int) -> Unit {
     for var n = 0; n < upTo; n = n + 1 {
         let op = insts[n].op
+        match A.pollOf(op) {
+            Some((pb, pn)) -> {
+                poll(b, cold, d, l, tag, pb, pn)
+                continue
+            }
+            None -> {}
+        }
         if Option.isNone(A.allocationOf(op)) && Option.isNone(A.arrayAllocationOf(op)) {
             emitInst(b, d, f, a, l, tag, insts[n])
             continue
@@ -456,6 +463,42 @@ fun allocateArray(b : Code, cold : Cold, d : Asm.Dialect, f : Func Inst,
     instruction(text, A.MovConst(A.argRegs[2], al.width))
     instruction(text, A.MovConst(A.argRegs[3], al.layout))
     returnFromStub(text, d, f, l, tag, n, dest, al.slow, safepoint)
+}
+
+-- A loop's poll (`Turkey.Polls`): a test of the worker's stop word on the
+-- loop's path, and, off it, the call the stop asks for.
+--
+-- The register allocator was told nothing happens here, so the slow path
+-- keeps everything it disturbs: the live values in registers the call
+-- clobbers (`Frame.pollAt`) are pushed below the frame and popped after. `sp`
+-- moves, which the frame's own slots never see, since the roots are stored
+-- before it does and the collector finds them from `x29`. The label after the
+-- call is the poll's frame-table entry.
+fun poll(b : Code, cold : Cold, d : Asm.Dialect, l : Frame.Layout, tag : Int,
+         pb : Int, pn : Int) -> Unit {
+    let n = cold.count
+    cold.count = n + 1
+    let slow = allocationLabel(d, tag, n, "s")
+    let back = allocationLabel(d, tag, n, "r")
+    instruction(b, A.Ldr(scratch, Offset(A.worker, Rt.workerStop), A.W64))
+    instruction(b, A.Cbnz(scratch, slow, A.W64))
+    emit(b, Label(back))
+    let text = cold.text
+    emit(text, Label(slow))
+    let save = Frame.pollAt(l, pb, pn)
+    for (r, offset) in save.roots { store(text, r, offset, A.W64) }
+    let bytes = (8 * len(save.kept) + 15) / 16 * 16
+    adjust(text, bytes, False)
+    for var k = 0; k < len(save.kept); k = k + 1 {
+        instruction(text, A.Str(save.kept[k], Offset(A.sp, 8 * k), A.W64))
+    }
+    instruction(text, A.Bl(Asm.runtimeFor(d, "turkey_poll"), A.Standard))
+    emit(text, Label(safepointLabel(d, tag, pb, pn)))
+    for var k = 0; k < len(save.kept); k = k + 1 {
+        instruction(text, A.Ldr(save.kept[k], Offset(A.sp, 8 * k), A.W64))
+    }
+    adjust(text, bytes, True)
+    instruction(text, A.B(back))
 }
 
 -- An allocation's slow path, after the function: the runtime's allocator with

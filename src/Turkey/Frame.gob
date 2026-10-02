@@ -1,5 +1,5 @@
 module Turkey.Frame (
-    Layout(..), SafepointMap(..), layout, offsetOf, verifyFrame,
+    Layout(..), SafepointMap(..), PollSave(..), layout, offsetOf, verifyFrame, pollAt,
 )
 
 -- A function's frame, laid out after register allocation.
@@ -37,14 +37,22 @@ module Turkey.Frame (
 
 import Data.Map as Map
 import Turkey.Arm64 as A
-import Turkey.Arm64 (Bank(..), Mem(..))
+import Turkey.Arm64 (Bank(..), Mem(..), Reg(..))
 import Turkey.Regalloc as Regalloc
 import Turkey.Roots as Roots
 import Turkey.Ssa as Ssa
+import Turkey.Ssa (BlockId(..))
 
 -- One frame-table entry: the low IR safepoint the call came from, and the
 -- offsets from `x29` of the root slots live across it.
 type SafepointMap = SafepointMap { block : Int, index : Int, offsets : Array Int }
+
+-- What a loop's poll does on its slow path (`Turkey.Emit.poll`): the
+-- registers it keeps across its call -- the live values in registers a call
+-- clobbers -- and the live roots that are in registers, each with its root
+-- slot's offset from `sp`. A root the allocator spilled is in its root slot
+-- already, since a spilled value's slot is its root slot when it has one.
+type PollSave = PollSave { kept : Array Reg, roots : Array (Reg, Int) }
 
 type Layout = Layout {
     size     : Int,
@@ -63,6 +71,15 @@ type Layout = Layout {
     -- Bytes, not slots.
     outgoing : Int,
     maps     : Array SafepointMap,
+    -- Each poll's, by `pollKey`.
+    polls    : Map.Map Int PollSave,
+}
+
+fun pollKey(b : Int, n : Int) -> Int = Int.or(Int.shl(b, 32), n)
+
+fun pollAt(l : Layout, b : Int, n : Int) -> PollSave = match Map.get(l.polls, pollKey(b, n)) {
+    Some(p) -> p
+    None -> PollSave { kept = [], roots = [] }
 }
 
 fun layout(a : Regalloc.Allocation, frame : Roots.Frame) -> Layout {
@@ -110,11 +127,15 @@ fun layout(a : Regalloc.Allocation, frame : Roots.Frame) -> Layout {
         savedGp = savedGp, savedFp = savedFp, rootsAt = rootsAt, roots = roots,
         spillsAt = spillsAt, spills = spills, objectsAt = objectsAt,
         objectStarts = objectStarts, objectBytes = objectBytes,
-        outgoing = outgoing, maps = [],
+        outgoing = outgoing, maps = [], polls = Map.new(),
     }
     for block in f.blocks {
         for i in block.insts {
-            match A.safepointOf(i.op) {
+            let mark = match A.safepointOf(i.op) {
+                Some(at) -> Some(at)
+                None -> A.pollOf(i.op)
+            }
+            match mark {
                 Some((b, n)) -> {
                     let offsets = []
                     for (slot, _) in Roots.liveAt(frame, b, n) {
@@ -133,7 +154,71 @@ fun layout(a : Regalloc.Allocation, frame : Roots.Frame) -> Layout {
             }
         }
     }
+    placePolls(l, a, frame)
     l
+}
+
+-- What each poll keeps and stores, from the liveness of the allocated code:
+-- the values live after the poll are the ones its call must not lose.
+fun placePolls(l : Layout, a : Regalloc.Allocation, frame : Roots.Frame) -> Unit {
+    let f = a.func
+    for var bi = 0; bi < len(f.blocks); bi = bi + 1 {
+        let insts = f.blocks[bi].insts
+        var after : Array (Array Int) = []
+        for var k = 0; k < len(insts); k = k + 1 {
+            match A.pollOf(insts[k].op) {
+                Some((b, n)) -> {
+                    if len(after) == 0 {
+                        after = Ssa.liveAfter(f, BlockId(bi), a.liveOut[bi])
+                    }
+                    Map.put(l.polls, pollKey(b, n), pollSave(l, a, frame, b, n, after[k]))
+                }
+                None -> {}
+            }
+        }
+    }
+}
+
+fun pollSave(l : Layout, a : Regalloc.Allocation, frame : Roots.Frame, b : Int, n : Int,
+             live : Array Int) -> PollSave {
+    let kept = []
+    for id in live {
+        match inRegister(a, id) {
+            Some(Physical(bank, number)) ->
+                if Int.and(A.calleeSavedMask(bank), Int.shl(1, number)) == 0 {
+                    Array.push(kept, Physical(bank, number))
+                }
+            _ -> {}
+        }
+    }
+    let roots = []
+    for (slot, id) in Roots.liveAt(frame, b, n) {
+        if sortedContains(live, id) {
+            match inRegister(a, id) {
+                Some(r) -> Array.push(roots, (r, l.rootsAt + 8 * slot))
+                None -> {}
+            }
+        }
+    }
+    PollSave { kept = kept, roots = roots }
+}
+
+-- Whether `id` is in `ids`, which ascend (`Ssa.liveAfter`).
+fun sortedContains(ids : Array Int, id : Int) -> Bool {
+    var low = 0
+    var high = len(ids)
+    while low < high {
+        let middle = (low + high) / 2
+        if ids[middle] < id { low = middle + 1 } else { high = middle }
+    }
+    low < len(ids) && ids[low] == id
+}
+
+-- The register value `id` was coloured into, if it lives in one.
+fun inRegister(a : Regalloc.Allocation, id : Int) -> Option Reg {
+    let colour = a.colouring.of_[id]
+    if colour < 0 || Map.contains(a.spills.slots, id) { return None }
+    Some(Physical(A.bankOf(a.func.reps[id]), colour))
 }
 
 fun even(n : Int) -> Int = n + n % 2

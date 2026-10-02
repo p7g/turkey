@@ -1,7 +1,7 @@
 module Turkey.Arm64 (
     Reg(..), Bank(..), reg, physical, isPhysical, bankOf, Cond(..), Width(..),
     Mem(..), Arm(..), Inst(..), Convention(..), Allocation(..), AllocArg(..), ArrayAllocation(..), anyDest, foldDest, anySrc, eachDest, eachSrc, mapUses, rewrite, setsFlags, isSlot, isRootSlot, isFrameAddress, slotLoad, slotStore, isCSet, csetOf, redundantMove,
-    sameRegister, moveHint, safepointOf, allocationOf, arrayAllocationOf,
+    sameRegister, moveHint, safepointOf, pollOf, allocationOf, arrayAllocationOf,
     writesBeforeReading, memOf,
     xzr, sp, fp, lr, x0, d0, worker, argRegs, fpArgRegs, callerSaved, calleeSaved,
     fpCallerSaved, fpCalleeSaved, showReg, condName, invert, isCall, callClobbers,
@@ -355,6 +355,10 @@ type Arm
     -- frame layout can turn it into this return address's frame-table entry.
     -- It carries no encoding; the emitter gives the return address a label.
     | SafepointMap(Int, Int)
+    -- A loop's poll at the low IR safepoint `(block, index)`: nothing to the
+    -- allocator, and a test and an out-of-line call once the frame is laid
+    -- out (`Turkey.Emit.poll`).
+    | Poll(Int, Int)
     -- A small heap allocation, defining its register: a slot taken in line
     -- from its size class's cursor, or a call to the runtime when the cursor
     -- is empty. The emitter expands it (`Turkey.Emit.allocate`), putting the
@@ -572,6 +576,12 @@ fun safepointOf(op : Arm) -> Option (Int, Int) = match op {
     _ -> None
 }
 
+-- The low IR position of a loop's poll, if this is one.
+fun pollOf(op : Arm) -> Option (Int, Int) = match op {
+    Poll(b, n) -> Some((b, n))
+    _ -> None
+}
+
 -- The destination and the allocation, if this is an `Allocate`.
 fun allocationOf(op : Arm) -> Option (Reg, Allocation) = match op {
     Allocate(d, a) -> Some((d, a))
@@ -739,6 +749,7 @@ fun anySrc(op : Arm, p : fun(Reg) -> Bool) -> Bool = match op {
     Blr(a, _)           -> p(a)
     CallArgs(ins, _)    -> anyIn(ins, p)
     SafepointMap(_, _)  -> False
+    Poll(_, _)          -> False
     Ret                 -> False
     B(_)                -> False
     BCond(_, _)         -> False
@@ -829,6 +840,7 @@ fun mapUses(op : Arm, g : fun(Reg) -> Reg) -> Arm = match op {
     Blr(a, k1)            -> Blr(g(a), k1)
     CallArgs(ins, k1)     -> CallArgs(Array.map(ins, g), k1)
     SafepointMap(k0, k1)  -> SafepointMap(k0, k1)
+    Poll(k0, k1)          -> Poll(k0, k1)
     Ret                   -> Ret
     B(k0)                 -> B(k0)
     BCond(k0, k1)         -> BCond(k0, k1)
@@ -930,6 +942,7 @@ fun rewrite(op : Arm, g : fun(Reg) -> Reg, m : fun(Mem) -> Mem) -> Arm = match o
     Blr(f0, f1)              -> Blr(g(f0), f1)
     CallArgs(f0, f1)         -> CallArgs(Array.map(f0, g), Array.map(f1, g))
     SafepointMap(f0, f1)     -> SafepointMap(f0, f1)
+    Poll(f0, f1)             -> Poll(f0, f1)
     Ret                      -> Ret
     B(f0)                    -> B(f0)
     BCond(f0, f1)            -> BCond(f0, f1)
@@ -1024,6 +1037,7 @@ fun foldDest(op : Arm, acc : a, f : fun(a, Reg) -> a) -> a = match op {
     Blr(_, _)           -> acc
     CallArgs(_, outs)   -> foldIn(outs, acc, f)
     SafepointMap(_, _)  -> acc
+    Poll(_, _)          -> acc
     Ret                 -> acc
     B(_)                -> acc
     BCond(_, _)         -> acc
@@ -1257,6 +1271,7 @@ fun showArm(op : Arm) -> String = match op {
     CallArgs(ins, outs)    -> "// call uses " + Int.toString(len(ins))
                               + " defs " + Int.toString(len(outs))
     SafepointMap(b, n)     -> "// safepoint " + Int.toString(b) + ":" + Int.toString(n)
+    Poll(b, n)             -> "// poll " + Int.toString(b) + ":" + Int.toString(n)
     Ret                    -> "ret"
     B(target)              -> "b " + Asm.spell(target)
     BCond(c, target)       -> "b." + condName(c) + " " + Asm.spell(target)

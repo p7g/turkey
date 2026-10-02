@@ -603,7 +603,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         Address(AllocSites) -> symbolAddress(s, d, runtimeSymbolOf(s, sitesSymbol))
         GlobalLoad(name) -> emit(s, A.Ldr(d, globalAt(s, name), A.W64))
         GlobalStore(name, v) -> {
-            emit(s, A.DmbLoad)
+            emit(s, A.Dmb)
             emit(s, A.Str(A.reg(v), globalAt(s, name), A.W64))
             emit(s, A.Mov(d, A.xzr, A.W64))
         }
@@ -698,7 +698,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             emit(s, A.FrameAddress(d, A.ObjectSlot(k, 0)))
         }
         ClosureCapture(closure, index, v) -> {
-            emit(s, A.DmbLoad)
+            emit(s, A.Dmb)
             let env = temp(s, Ssa.traced(Ptr))
             emit(s, A.Ldr(env, A.Offset(A.reg(closure), 32), A.W64))
             emit(s, A.Str(A.reg(v), A.Offset(env, 24 + 8 * index), A.W64))
@@ -790,18 +790,26 @@ fun immediate(s : Sel, n : Int) -> Reg {
 -- result is a machine word, because `raw` has already moved any double's bits
 -- into the general file.
 -- Before a store to a mutable location -- a record field, an array element,
--- a cell, a global, a closure's late capture: no load this thread did earlier
--- may be reordered after it.
+-- a cell, a global, a closure's late capture: `dmb ish`, so that nothing this
+-- thread loaded or stored earlier is reordered after it. It does two jobs.
 --
--- This is what makes data races bounded in time as well as space: accesses
--- to a location that no other task races on happen in program order,
--- whatever races happen elsewhere, earlier or later. arm64 lets a store
--- become visible before an earlier load has read its value, which would let a
--- later race reach back into a read that had none; `dmb ishld` forbids
--- exactly that reordering. The property is local DRF, and the scheme is the
--- cheaper of the two arm64 ones Dolan, Sivaramakrishnan and Madhavapeddy
--- measured for it ("Bounding Data Races in Space and Time", PLDI 2018). The
--- other, a dependent branch after every mutable load, costs more here too.
+-- It bounds data races in time as well as space: accesses to a location that
+-- no other task races on happen in program order, whatever races happen
+-- elsewhere, earlier or later. arm64 lets a store become visible before an
+-- earlier load has read its value, which would let a later race reach back
+-- into a read that had none. Forbidding that is what the property, local DRF,
+-- needs, and a fence before such stores is the cheaper of the two arm64
+-- schemes Dolan, Sivaramakrishnan and Madhavapeddy measured for it ("Bounding
+-- Data Races in Space and Time", PLDI 2018); the other, a dependent branch
+-- after every mutable load, costs more here too.
+--
+-- And it publishes new objects: every way a new object reaches another task
+-- passes through a store this fences, so the stores that initialized it are
+-- visible first, and a task that loads the pointer sees the object whole -- on
+-- arm64 its loads through the pointer are ordered after the pointer by their
+-- address dependency. That is why the fence is the full one rather than
+-- `dmb ishld`, which orders only loads before it; on the self-compile the two
+-- cost the same, and a separate `dmb ishst` after every allocation costs more.
 --
 -- A fence is cheap on average and dear in a loop: one per byte of a copy
 -- costs more than the copy. Nearly all of the fences that matter are in the
@@ -809,11 +817,12 @@ fun immediate(s : Sel, n : Int) -> Reg {
 --
 -- Not before a store into an object this function allocated and has not yet
 -- handed to anything (`unpublished`) -- which covers initializing one, and
--- filling an array before it is returned -- since no other task can see it;
--- and not before a raw store (`PtrStore`), which is the runtime's own memory
--- and outside the language's model.
+-- filling an array before it is returned -- since no other task can see it,
+-- and the fence before the store that does hand it on covers those stores
+-- too; and not before a raw store (`PtrStore`), which is the runtime's own
+-- memory and outside the language's model.
 fun ordered(s : Sel, target : Value) -> Unit {
-    if !unpublished(s, target) { emit(s, A.DmbLoad) }
+    if !unpublished(s, target) { emit(s, A.Dmb) }
 }
 
 -- Panic unless `index` is within `array`'s own length.

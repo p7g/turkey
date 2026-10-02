@@ -38,7 +38,7 @@ let stackResumedBy : Int = 32
 let stackBytes : Int = 40
 
 -- Every machine stack that holds Turkey frames, as a list of raw records, and
--- the one the mutator is running on, which `turkey_swap_stack` changes. The
+-- the one the running worker is on, which `turkey_swap_stack` changes. The
 -- program's own stack is the first, registered by the generated entry once
 -- early initialization has run. A collection (`Turkey.Heap`) walks the running
 -- stack from the allocator's frame and every other stack from the frame it was
@@ -46,7 +46,6 @@ let stackBytes : Int = 40
 -- allocate runs on it, and must have its parked frame recorded before it stops
 -- running.
 var stacks : Prim.Ptr = Prim.ptrNull()
-var runningStack : Prim.Ptr = Prim.ptrNull()
 var entryStack : Prim.Ptr = Libc.malloc(stackBytes)
 
 -- Recorded by the generated entry, from its own frame, after early
@@ -63,12 +62,17 @@ foreign "turkey_entry_stack_set" fun entryStackSet(frame : Prim.Ptr) -> Unit {
     Prim.storePtr(entryStack, stackLow, Prim.ptrNull())
     Prim.storePtr(entryStack, stackResumedBy, Prim.ptrNull())
     stacks = entryStack
-    runningStack = entryStack
+    Prim.storePtr(Prim.processState(), runningAt(), entryStack)
 }
 
--- The stack the mutator is running on: the one `Prim.swapStack` would switch
--- away from.
-fun running() -> Prim.Ptr = runningStack
+-- The stack the running worker is on: the one `Prim.swapStack` would switch
+-- away from. A word of the worker's record (`Prim.processState`), since each
+-- worker runs a stack of its own; `Turkey.Runtime.workerRunningStack` is the
+-- compiler's copy of the offset, for the switch. A function rather than a
+-- `let` because a `let` is a load from its global.
+fun running() -> Prim.Ptr = Prim.loadPtr(Prim.processState(), runningAt())
+
+fun runningAt() -> Int = 280
 
 -- The list, for walking it: the first stack, and the one after `stack`.
 fun first() -> Prim.Ptr = stacks
@@ -145,7 +149,7 @@ fun new(bytes : Int) -> Prim.Ptr {
 -- Unregister and unmap a stack whose last frame is gone: one that is parked
 -- for good, never to be resumed. Never the running one.
 fun free(stack : Prim.Ptr) -> Unit {
-    if Prim.ptrEq(stack, runningStack) || Prim.ptrIsNull(Prim.loadPtr(stack, stackLow)) {
+    if Prim.ptrEq(stack, running()) || Prim.ptrIsNull(Prim.loadPtr(stack, stackLow)) {
         Process.panic(Prim.cString("freed a stack that is running or not a coroutine's"))
         return {}
     }

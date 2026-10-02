@@ -86,9 +86,9 @@ def test_a_barrier_that_remembers_nothing_is_caught(tmp_path):
     shutil.copytree(bootc.REPO_ROOT / "lib", library)
     heap = library / "Turkey" / "Heap.gob"
     text = heap.read_text()
-    before = "    if Prim.loadI64(header, headerGeneration) != old { return {} }\n"
+    before = "    let header = Prim.ptrAdd(parent, payloadHeader)\n"
     assert text.count(before) == 1
-    heap.write_text(text.replace(before, "    return {}\n"))
+    heap.write_text(text.replace(before, before + "    return {}\n"))
     source = tmp_path / "main.gob"
     source.write_text(CONTAINERS)
     result = subprocess.run(toolchain.command(bootc.binary(), *bootc.argv("asm"), *VERIFY,

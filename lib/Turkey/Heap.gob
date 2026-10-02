@@ -168,6 +168,31 @@ var heapCount : Int = 0
 -- collection. The bytes are what trigger the next one.
 var allocationsSince : Int = 0
 var bytesSince : Int = 0
+
+-- What a worker's cursors have taken since `retire` last folded it into the
+-- three counts above: objects, objects since the collection, and their bytes,
+-- in the last three words of its record (`Prim.processState`, from 1728).
+-- Kept per worker so that a refill from a region the cursor owns touches
+-- nothing shared and takes no lock.
+fun localAdd(objects : Int, bytes : Int) -> Unit {
+    let w = Prim.processState()
+    Prim.storeI64(w, 1728, plus(Prim.loadI64(w, 1728), objects))
+    Prim.storeI64(w, 1736, plus(Prim.loadI64(w, 1736), objects))
+    Prim.storeI64(w, 1744, plus(Prim.loadI64(w, 1744), bytes))
+}
+
+fun localBytes() -> Int = Prim.loadI64(Prim.processState(), 1744)
+
+-- Fold the running worker's counts into the heap's and zero them.
+fun localFold() -> Unit {
+    let w = Prim.processState()
+    heapCount = plus(heapCount, Prim.loadI64(w, 1728))
+    allocationsSince = plus(allocationsSince, Prim.loadI64(w, 1736))
+    bytesSince = plus(bytesSince, Prim.loadI64(w, 1744))
+    Prim.storeI64(w, 1728, 0)
+    Prim.storeI64(w, 1736, 0)
+    Prim.storeI64(w, 1744, 0)
+}
 -- The bytes of the slots the last sweep kept: a large object's whole region.
 var liveBytes : Int = 0
 var threshold : Int = 131072
@@ -267,8 +292,12 @@ var statsIgnored : Bool = notCompiledIn(statsWanted, Prim.cString("TURKEY_GC_STA
 var thresholdScale : Float =
     scaleFrom(Libc.getenv(Prim.cString("TURKEY_GC_THRESHOLD_SCALE")))
 
-var statsAllocations : Int = 0
-var statsBytes : Int = 0
+-- The counts every worker adds to as it allocates, by atomic adds: objects
+-- and bytes allocated, and objects the write barrier remembered.
+var statsCounts : Prim.Ptr = zeroed(24)
+let statsAllocationsAt : Int = 0
+let statsBytesAt : Int = 8
+let statsRememberedAt : Int = 16
 var statsTraced : Int = 0
 var statsFreedTotal : Int = 0
 var statsFreedPrevious : Int = 0
@@ -278,10 +307,9 @@ var statsClock : Int = 0
 -- The part of `statsClock` spent marking, roots included; the rest is the
 -- sweep and the bookkeeping around it.
 var statsMarkClock : Int = 0
--- Every object the write barrier remembered.
-var statsRemembered : Int = 0
 var statsMinor : Int = 0
--- Allocations by what the object is, indexed by `Turkey.Alloc`'s kind:
+-- Allocations by what the object is, indexed by `Turkey.Alloc`'s kind, also
+-- added to atomically:
 -- 0 constructor, 1 record, 2 array, 3 closure, 4 environment, 7 cell.
 var statsByKind : Prim.Ptr = zeroed(64)
 
@@ -539,9 +567,9 @@ fun bitIndex(lowest : Int) -> Int {
 
 -- Fill the empty cursor of class `sizeClass` from the first word with a free
 -- slot in the region it owns, or, when that is full, in one it takes off the
--- class's available list or makes; False if there is no memory for one.
--- Under `heapLock`: the region's bitmap is the cursor's own, but the lists and
--- the counts are shared. A full region it gives up is on no list, and the sweep puts
+-- class's available list or makes; False if there is no memory for one. The
+-- region and the worker's counts are the worker's own, so only taking a
+-- region takes `heapLock`. A full region it gives up is on no list, and the sweep puts
 -- it back on one if it frees a slot.
 --
 -- Under GC stress, and while statistics are wanted, it takes one slot, so that
@@ -551,14 +579,10 @@ fun bitIndex(lowest : Int) -> Int {
 fun refill(cursor : Prim.Ptr, sizeClass : Int) -> Bool {
     var region = Prim.loadPtr(cursor, cursorRegion)
     if Prim.ptrIsNull(region) || load32(region, regionUsed) == load32(region, regionCapacity) {
-        region = Prim.loadPtr(available, times8(sizeClass))
-        if Prim.ptrIsNull(region) {
-            -- A new region goes on the list, and so comes off it here too.
-            let slotBytes = classSlot(sizeClass)
-            region = newRegion(slotBytes, slotBytes, sizeClass, False)
-            if Prim.ptrIsNull(region) { return False }
-        }
-        Prim.storePtr(available, times8(sizeClass), Prim.loadPtr(region, regionAvailableNext))
+        Lock.acquire(heapLock)
+        region = takeRegion(sizeClass)
+        Lock.release(heapLock)
+        if Prim.ptrIsNull(region) { return False }
         Prim.storePtr(cursor, cursorRegion, region)
     }
     let capacity = load32(region, regionCapacity)
@@ -581,10 +605,8 @@ fun refill(cursor : Prim.Ptr, sizeClass : Int) -> Bool {
     store32(region, regionUsed, used)
     store32(region, regionSearchWord,
             if plus(now, 1) == 0 && w < regionWords - 1 { plus(w, 1) } else { w })
-    heapCount = plus(heapCount, n)
-    allocationsSince = plus(allocationsSince, n)
     let slotSize = Prim.loadI64(region, regionSlotSize)
-    bytesSince = plus(bytesSince, Prim.intMulWrapping(n, slotSize))
+    localAdd(n, Prim.intMulWrapping(n, slotSize))
     Prim.storeI64(cursor, cursorFree, claim)
     Prim.storePtr(cursor, cursorBase,
                   Prim.ptrAdd(region, plus(regionData, Prim.intMulWrapping(Prim.intShl(w, 6), slotSize))))
@@ -593,9 +615,25 @@ fun refill(cursor : Prim.Ptr, sizeClass : Int) -> Bool {
     True
 }
 
+-- A region of class `sizeClass` with a free slot, off the available list, or
+-- a new one; null if there is no memory for one. Under `heapLock`.
+fun takeRegion(sizeClass : Int) -> Prim.Ptr {
+    var region = Prim.loadPtr(available, times8(sizeClass))
+    if Prim.ptrIsNull(region) {
+        -- A new region goes on the list, and so comes off it here too.
+        let slotBytes = classSlot(sizeClass)
+        region = newRegion(slotBytes, slotBytes, sizeClass, False)
+        if Prim.ptrIsNull(region) { return region }
+    }
+    Prim.storePtr(available, times8(sizeClass), Prim.loadPtr(region, regionAvailableNext))
+    region
+}
+
 -- Give every cursor's unused slots back to its region -- clear them from the
 -- allocation bitmap and the counts, and move the search back to their word --
--- and give up the region, onto its available list if it has a free slot.
+-- give up the region, onto its available list if it has a free slot, and fold
+-- the worker's counts into the heap's. Edits the shared lists without the
+-- lock: it runs only where no other worker can be allocating.
 fun retire() -> Unit {
     for var rc = 0; rc < regionClasses; rc = rc + 1 {
         let cursor = cursorOf(rc)
@@ -609,9 +647,7 @@ fun retire() -> Unit {
                 let n = population(left)
                 store32(r, regionUsed, load32(r, regionUsed) - n)
                 if lw < load32(r, regionSearchWord) { store32(r, regionSearchWord, lw) }
-                heapCount = heapCount - n
-                allocationsSince = allocationsSince - n
-                bytesSince = bytesSince - n * Prim.loadI64(r, regionSlotSize)
+                localAdd(0 - n, 0 - n * Prim.loadI64(r, regionSlotSize))
                 Prim.storeI64(cursor, cursorFree, 0)
             }
             if load32(r, regionUsed) < load32(r, regionCapacity) {
@@ -621,6 +657,7 @@ fun retire() -> Unit {
             Prim.storePtr(cursor, cursorRegion, Prim.ptrNull())
         }
     }
+    localFold()
 }
 
 -- The number of set bits.
@@ -723,7 +760,7 @@ fun allocate(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Prim.Pt
 }
 
 fun allocateSlow(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Prim.Ptr {
-    if (stress && stressDue()) || bytesSince >= threshold {
+    if (stress && stressDue()) || plus(bytesSince, localBytes()) >= threshold {
         collectFrom(frame, askedEither)
         -- A collection is the only thing here that can raise one, and an
         -- allocation after a failed collection would be into a heap nobody
@@ -743,11 +780,8 @@ fun allocateSlow(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Pri
     }
     let sizeClass = classOf(size)
     let cursor = cursorOf(sizeClass)
-    if Prim.loadI64(cursor, cursorFree) == 0 {
-        Lock.acquire(heapLock)
-        let filled = refill(cursor, sizeClass)
-        Lock.release(heapLock)
-        if !filled { return outOfMemory() }
+    if Prim.loadI64(cursor, cursorFree) == 0 && !refill(cursor, sizeClass) {
+        return outOfMemory()
     }
     initialize(takeSlot(cursor, Prim.loadI64(cursor, cursorFree)), size, kind, counted)
 }
@@ -782,10 +816,10 @@ fun initialize(header : Prim.Ptr, size : Int, kind : Int, counted : Int) -> Prim
     -- The kind, and a mark epoch of 0 above it: no epoch is 0.
     Prim.storeI64(header, headerKind, kind)
     if statsWanted {
-        statsAllocations = plus(statsAllocations, 1)
-        statsBytes = plus(statsBytes, plus(size, headerBytes))
+        let _ = Prim.atomicAdd(statsCounts, statsAllocationsAt, 1)
+        let _ = Prim.atomicAdd(statsCounts, statsBytesAt, plus(size, headerBytes))
         let at = if counted >= 0 && counted < 8 { times8(counted) } else { 0 }
-        Prim.storeI64(statsByKind, at, plus(Prim.loadI64(statsByKind, at), 1))
+        let _ = Prim.atomicAdd(statsByKind, at, 1)
     }
     Prim.ptrAdd(header, headerBytes)
 }
@@ -1086,7 +1120,12 @@ fun growMarkStack() -> Bool {
 -- allocated after the value they store.
 foreign "turkey_write_barrier" fun writeBarrier(parent : Prim.Ptr) -> Unit {
     let header = Prim.ptrAdd(parent, payloadHeader)
-    if Prim.loadI64(header, headerGeneration) != old { return {} }
+    -- Claimed by changing the word, atomically: two workers storing into one
+    -- old object at once must not both remember it.
+    if Prim.loadI64(header, headerGeneration) != old
+            || Prim.atomicCas(header, headerGeneration, old, rememberedOld) != old {
+        return {}
+    }
     let count = rememberedCount()
     if count == rememberedCapacity() {
         let capacity = if count < 64 { 64 } else { count * 2 }
@@ -1098,10 +1137,9 @@ foreign "turkey_write_barrier" fun writeBarrier(parent : Prim.Ptr) -> Unit {
         rememberedSet(grown)
         rememberedCapacitySet(capacity)
     }
-    Prim.storeI64(header, headerGeneration, rememberedOld)
     Prim.storePtr(remembered(), times8(count), parent)
     rememberedCountSet(plus(count, 1))
-    statsRemembered = plus(statsRemembered, 1)
+    let _ = Prim.atomicAdd(statsCounts, statsRememberedAt, 1)
 }
 
 -- Trace everything reachable from the stack, emptying it. This is the one
@@ -1434,11 +1472,11 @@ foreign "turkey_gc_report" fun report() -> Unit {
     put(Prim.cString("[gc] collections "))
     putInt(collections)
     put(Prim.cString(", allocations "))
-    putInt(statsAllocations)
+    putInt(Prim.atomicLoad(statsCounts, statsAllocationsAt))
     put(Prim.cString(", bytes "))
-    putInt(statsBytes)
+    putInt(Prim.atomicLoad(statsCounts, statsBytesAt))
     put(Prim.cString(" ("))
-    putFixed(statsBytes, 1048576, 1)
+    putFixed(Prim.atomicLoad(statsCounts, statsBytesAt), 1048576, 1)
     put(Prim.cString(" MB)\n"))
     writeLine()
     put(Prim.cString("[gc] by kind: constr "))
@@ -1474,12 +1512,12 @@ foreign "turkey_gc_report" fun report() -> Unit {
     put(Prim.cString(", full "))
     putInt(collections - statsMinor)
     put(Prim.cString(", remembered "))
-    putInt(statsRemembered)
+    putInt(Prim.atomicLoad(statsCounts, statsRememberedAt))
     put(Prim.cString("\n"))
     writeLine()
 }
 
-fun putKind(kind : Int) -> Unit = putInt(Prim.loadI64(statsByKind, 8 * kind))
+fun putKind(kind : Int) -> Unit = putInt(Prim.atomicLoad(statsByKind, 8 * kind))
 
 -- -- text without a `String` ------------------------------------------------------------
 --

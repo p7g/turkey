@@ -1,0 +1,44 @@
+module Turkey.Lock (new, acquire, release)
+
+-- Mutual exclusion for the runtime's own shared state: the heap's region
+-- lists and counters, and the list of stacks. Each is held only across a few
+-- edits and never across a collection, a stack switch or a call that could
+-- block, so a plain operating-system mutex serves: uncontended, a lock and an
+-- unlock are a pair of atomic instructions in the C library.
+--
+-- A giblet module, because the collector and the allocator take these, and
+-- may not allocate.
+
+import Prelude ()
+import Std.Classes
+import Data.Int ()
+import Turkey.Libc as Libc
+import Turkey.Process as Process
+
+-- A lock is a `pthread_mutex_t`, in storage of its own that lives as long as
+-- the process: every lock the runtime takes is made once, by a global's
+-- initializer. A bare pointer rather than a type of its own, which would be a
+-- heap object.
+
+-- A fresh lock; a panic if there is no memory for one.
+fun new() -> Prim.Ptr {
+    -- The larger of the two platforms' `pthread_mutex_t`. A literal rather
+    -- than a `let`: other giblets' globals are made with this, and a `let` is
+    -- a global that may not be set yet.
+    let mutex = Libc.malloc(64)
+    if Prim.ptrIsNull(mutex)
+            || Prim.intAnd(Libc.pthreadMutexInit(mutex, Prim.ptrNull()), 0xFFFF_FFFF) != 0 {
+        Process.panic(Prim.cString("could not make a lock"))
+    }
+    mutex
+}
+
+-- Wait until no other thread holds `mutex`, and hold it. Not recursive: a thread
+-- that takes a lock it holds waits forever.
+fun acquire(mutex : Prim.Ptr) -> Unit {
+    let _ = Libc.pthreadMutexLock(mutex)
+}
+
+fun release(mutex : Prim.Ptr) -> Unit {
+    let _ = Libc.pthreadMutexUnlock(mutex)
+}

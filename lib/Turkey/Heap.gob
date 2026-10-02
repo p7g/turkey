@@ -41,6 +41,7 @@ import Turkey.HeapCheck as Check
 import Turkey.Memory as Memory
 import Turkey.Process as Process
 import Turkey.Libc as Libc
+import Turkey.Lock as Lock
 import Turkey.Stack as Stack
 
 -- -- layouts ----------------------------------------------------------------------------
@@ -131,6 +132,16 @@ let entryBytes : Int = 24
 
 -- -- state ------------------------------------------------------------------------------
 
+-- Held by a worker while it edits what the workers share: the region list,
+-- the available lists, the region table and the counts. A worker's own
+-- cursors and the regions they own are its alone and need no lock. A
+-- collection runs with every other worker stopped, so it takes none.
+--
+-- Never held across a panic: generated code returns from a call that raised
+-- one straight to its caller, past any release after it, so a function that
+-- runs under the lock reports failure and its caller panics once it has let go.
+var heapLock : Prim.Ptr = Lock.new()
+
 var regions : Prim.Ptr = Prim.ptrNull()
 -- Per size class, the regions with a free slot that no cursor owns, linked by
 -- `availableNext`.
@@ -174,9 +185,17 @@ var markCapacity : Int = 0
 
 -- The old objects the write barrier has seen given a young one since the last
 -- collection, each once: its generation word says it is here.
-var remembered : Prim.Ptr = Prim.ptrNull()
-var rememberedCount : Int = 0
-var rememberedCapacity : Int = 0
+-- The write barrier's remembered set is per worker, so that no two barriers
+-- write one buffer: a `malloc`ed array of objects, its count and its
+-- capacity, in words 296, 304 and 312 of the running worker's record
+-- (`Prim.processState`). Offsets are literals in the accessors, since a `let`
+-- is a load from its global. A collection consumes the running worker's.
+fun remembered() -> Prim.Ptr = Prim.loadPtr(Prim.processState(), 296)
+fun rememberedSet(buffer : Prim.Ptr) -> Unit = Prim.storePtr(Prim.processState(), 296, buffer)
+fun rememberedCount() -> Int = Prim.loadI64(Prim.processState(), 304)
+fun rememberedCountSet(n : Int) -> Unit = Prim.storeI64(Prim.processState(), 304, n)
+fun rememberedCapacity() -> Int = Prim.loadI64(Prim.processState(), 312)
+fun rememberedCapacitySet(n : Int) -> Unit = Prim.storeI64(Prim.processState(), 312, n)
 
 -- The arm64 backend's frame table, sorted by return address.
 var frameEntries : Prim.Ptr = Prim.ptrNull()
@@ -520,8 +539,9 @@ fun bitIndex(lowest : Int) -> Int {
 
 -- Fill the empty cursor of class `sizeClass` from the first word with a free
 -- slot in the region it owns, or, when that is full, in one it takes off the
--- class's available list or makes; False, with a panic raised, if there is no
--- memory for one. A full region it gives up is on no list, and the sweep puts
+-- class's available list or makes; False if there is no memory for one.
+-- Under `heapLock`: the region's bitmap is the cursor's own, but the lists and
+-- the counts are shared. A full region it gives up is on no list, and the sweep puts
 -- it back on one if it frees a slot.
 --
 -- Under GC stress, and while statistics are wanted, it takes one slot, so that
@@ -613,7 +633,7 @@ fun population(x : Int) -> Int {
 }
 
 -- A region of its own for a request of `bytes`, header included, with its one
--- slot allocated; null, with a panic raised, if there is no memory for it.
+-- slot allocated; null if there is no memory for it. Under `heapLock`.
 fun largeAllocate(bytes : Int) -> Prim.Ptr {
     let made = newRegion(bytes, bytes, regionClasses, True)
     if Prim.ptrIsNull(made) { return made }
@@ -626,20 +646,16 @@ fun largeAllocate(bytes : Int) -> Prim.Ptr {
 }
 
 -- A fresh, empty region with slots of `slotSize`, on the region list and, if
--- it is small, its class's available list; null, with a panic raised, if
--- there is no memory for it.
+-- it is small, its class's available list; null if there is no memory for it.
+-- Under `heapLock`.
 fun newRegion(bytes : Int, slotSize : Int, sizeClass : Int, large : Bool) -> Prim.Ptr {
     let reserved = if large {
         Prim.intAnd(regionData + bytes + regionBytes - 1, regionMask)
     } else { regionBytes }
     let made = Libc.alignedAlloc(regionBytes, reserved)
-    if Prim.ptrIsNull(made) {
-        Process.panic(Prim.cString("out of memory"))
-        return made
-    }
+    if Prim.ptrIsNull(made) { return made }
     if !tableInsert(made) {
         Libc.free(made)
-        Process.panic(Prim.cString("out of memory"))
         return Prim.ptrNull()
     }
     Memory.fill(made, regionData, 0)
@@ -719,16 +735,26 @@ fun allocateSlow(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Pri
         return Prim.ptrNull()
     }
     if below(smallPayload, size) {
+        Lock.acquire(heapLock)
         let header = largeAllocate(plus(headerBytes, size))
-        if Prim.ptrIsNull(header) { return header }
+        Lock.release(heapLock)
+        if Prim.ptrIsNull(header) { return outOfMemory() }
         return initialize(header, size, kind, counted)
     }
     let sizeClass = classOf(size)
     let cursor = cursorOf(sizeClass)
-    if Prim.loadI64(cursor, cursorFree) == 0 && !refill(cursor, sizeClass) {
-        return Prim.ptrNull()
+    if Prim.loadI64(cursor, cursorFree) == 0 {
+        Lock.acquire(heapLock)
+        let filled = refill(cursor, sizeClass)
+        Lock.release(heapLock)
+        if !filled { return outOfMemory() }
     }
     initialize(takeSlot(cursor, Prim.loadI64(cursor, cursorFree)), size, kind, counted)
+}
+
+fun outOfMemory() -> Prim.Ptr {
+    Process.panic(Prim.cString("out of memory"))
+    Prim.ptrNull()
 }
 
 -- Whether GC stress collects at this allocation.
@@ -1061,19 +1087,20 @@ fun growMarkStack() -> Bool {
 foreign "turkey_write_barrier" fun writeBarrier(parent : Prim.Ptr) -> Unit {
     let header = Prim.ptrAdd(parent, payloadHeader)
     if Prim.loadI64(header, headerGeneration) != old { return {} }
-    if rememberedCount == rememberedCapacity {
-        let capacity = if rememberedCapacity < 64 { 64 } else { rememberedCapacity * 2 }
-        let grown = Libc.realloc(remembered, 8 * capacity)
+    let count = rememberedCount()
+    if count == rememberedCapacity() {
+        let capacity = if count < 64 { 64 } else { count * 2 }
+        let grown = Libc.realloc(remembered(), 8 * capacity)
         if Prim.ptrIsNull(grown) {
             Process.panic(Prim.cString("out of memory remembering an old object"))
             return {}
         }
-        remembered = grown
-        rememberedCapacity = capacity
+        rememberedSet(grown)
+        rememberedCapacitySet(capacity)
     }
     Prim.storeI64(header, headerGeneration, rememberedOld)
-    Prim.storePtr(remembered, times8(rememberedCount), parent)
-    rememberedCount = plus(rememberedCount, 1)
+    Prim.storePtr(remembered(), times8(count), parent)
+    rememberedCountSet(plus(count, 1))
     statsRemembered = plus(statsRemembered, 1)
 }
 
@@ -1201,7 +1228,7 @@ fun collectFrom(frame : Prim.Ptr, asked : Int) -> Unit {
         -- Everything is traced again, and every live object marked again,
         -- which makes it old and forgets that it was remembered.
         clearMarks()
-        rememberedCount = 0
+        rememberedCountSet(0)
     }
     var root = roots
     while !Prim.ptrIsNull(root) {
@@ -1271,15 +1298,17 @@ fun clearMarks() -> Unit {
 -- A minor collection's other roots: the fields of every remembered object,
 -- which is marked already, being old. Each is old and not remembered after.
 fun traceRemembered() -> Unit {
-    for var i = 0; i < rememberedCount; i = plus(i, 1) {
-        let parent = Prim.loadPtr(remembered, times8(i))
+    let entries = remembered()
+    let count = rememberedCount()
+    for var i = 0; i < count; i = plus(i, 1) {
+        let parent = Prim.loadPtr(entries, times8(i))
         Prim.storeI64(Prim.ptrAdd(parent, payloadHeader), headerGeneration, old)
         if markCount == markCapacity && !growMarkStack() { return {} }
         Prim.storePtr(markStack, times8(markCount), parent)
         markCount = plus(markCount, 1)
         drain()
     }
-    rememberedCount = 0
+    rememberedCountSet(0)
 }
 
 -- A new epoch, so that no header needs clearing before a mark. The epoch is a
@@ -1683,8 +1712,8 @@ fun snapshot() -> Prim.Ptr {
     Prim.storePtr(state, Check.stateRoots, roots)
     Prim.storeI64(state, Check.stateMinor, if minor { 1 } else { 0 })
     Prim.storeI64(state, Check.stateGenerational, if generational { 1 } else { 0 })
-    Prim.storePtr(state, Check.stateRemembered, remembered)
-    Prim.storeI64(state, Check.stateRememberedCount, rememberedCount)
+    Prim.storePtr(state, Check.stateRemembered, remembered())
+    Prim.storeI64(state, Check.stateRememberedCount, rememberedCount())
     state
 }
 

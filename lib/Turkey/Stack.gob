@@ -19,6 +19,7 @@ import Target (OS(..))
 import Target as Target
 import Turkey.Process as Process
 import Turkey.Libc as Libc
+import Turkey.Lock as Lock
 
 -- A machine stack Turkey frames run on: the outermost frame record any walk of
 -- it may reach, the frame record it was parked at (null while it runs), the
@@ -47,6 +48,10 @@ let stackBytes : Int = 40
 -- running.
 var stacks : Prim.Ptr = Prim.ptrNull()
 var entryStack : Prim.Ptr = Libc.malloc(stackBytes)
+
+-- Held while a worker edits the list. A collection reads it with every other
+-- worker stopped, and takes no lock.
+var stacksLock : Prim.Ptr = Lock.new()
 
 -- Recorded by the generated entry, from its own frame, after early
 -- initialization and before anything can allocate: the program's own stack,
@@ -139,10 +144,12 @@ fun new(bytes : Int) -> Prim.Ptr {
     Prim.storePtr(parked, 8, Prim.codeAddress("turkey_stack_start"))
     Prim.storePtr(record, stackHigh, high)
     Prim.storePtr(record, stackParked, parked)
-    Prim.storePtr(record, stackNext, stacks)
     Prim.storePtr(record, stackLow, base)
     Prim.storePtr(record, stackResumedBy, Prim.ptrNull())
+    Lock.acquire(stacksLock)
+    Prim.storePtr(record, stackNext, stacks)
     stacks = record
+    Lock.release(stacksLock)
     record
 }
 
@@ -153,23 +160,32 @@ fun free(stack : Prim.Ptr) -> Unit {
         Process.panic(Prim.cString("freed a stack that is running or not a coroutine's"))
         return {}
     }
-    if Prim.ptrEq(stacks, stack) {
-        stacks = Prim.loadPtr(stack, stackNext)
-    } else {
-        var before = stacks
-        while !Prim.ptrIsNull(before)
-                && !Prim.ptrEq(Prim.loadPtr(before, stackNext), stack) {
-            before = Prim.loadPtr(before, stackNext)
-        }
-        if Prim.ptrIsNull(before) {
-            Process.panic(Prim.cString("freed a stack that is not registered"))
-            return {}
-        }
-        Prim.storePtr(before, stackNext, Prim.loadPtr(stack, stackNext))
+    Lock.acquire(stacksLock)
+    let found = unlink(stack)
+    Lock.release(stacksLock)
+    if !found {
+        Process.panic(Prim.cString("freed a stack that is not registered"))
+        return {}
     }
     let low = Prim.loadPtr(stack, stackLow)
     let _ = Libc.munmap(low, Prim.ptrDiff(Prim.loadPtr(stack, stackHigh), low))
     Libc.free(stack)
+}
+
+-- Take `stack` off the list; False if it is not on it. Under `stacksLock`, so
+-- it reports rather than panics: a panic would return past the release.
+fun unlink(stack : Prim.Ptr) -> Bool {
+    if Prim.ptrEq(stacks, stack) {
+        stacks = Prim.loadPtr(stack, stackNext)
+        return True
+    }
+    var before = stacks
+    while !Prim.ptrIsNull(before) && !Prim.ptrEq(Prim.loadPtr(before, stackNext), stack) {
+        before = Prim.loadPtr(before, stackNext)
+    }
+    if Prim.ptrIsNull(before) { return False }
+    Prim.storePtr(before, stackNext, Prim.loadPtr(stack, stackNext))
+    True
 }
 
 -- `PROT_*` and the `MAP_*` flags of a private mapping of no file. The protections

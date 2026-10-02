@@ -1,6 +1,6 @@
 module Turkey.Emit (
     emitFunc, emitMessages, emitData, emitEntry, emitFrameTable, emitDefinitions,
-    emitSwapStack, emitStackStart,
+    emitSwapStack, emitStackStart, emitWorkerStart,
 )
 
 -- One allocated function as arm64 code: a stream of instructions, labels and
@@ -873,6 +873,30 @@ fun emitStackStart(asm : Asm.Asm, b : Code) -> Unit {
     instruction(b, A.Ldr(x1, Offset(A.x0, Rt.stackResumedBy), A.W64))
     call(b, d, Rt.swapStackSymbol)
     instruction(b, A.Brk(1))
+}
+
+-- `turkey_worker_start(record)`, a worker thread's start routine for
+-- `pthread_create`: the worker's record in `x28`, then its Turkey code
+-- (`Turkey.Runtime.workerRun`), called as a direct call is made, with no
+-- environment. That returns only when a panic unwound it, which
+-- `turkey_worker_ended` hands to the main worker, through its Turkey entry so
+-- that `x28` is still this worker's. A full frame record, so that the worker's
+-- stack has an outermost one, and `x28` saved, since C keeps it.
+fun emitWorkerStart(asm : Asm.Asm, b : Code) -> Unit {
+    let d = asm.dialect
+    emit(b, Section(Asm.Text))
+    function(b, Asm.runtimeFor(d, Rt.workerStartSymbol))
+    instruction(b, A.SubImm(A.sp, A.sp, 32, A.W64))
+    instruction(b, A.Str(A.fp, Offset(A.sp, 16), A.W64))
+    instruction(b, A.Str(A.lr, Offset(A.sp, 24), A.W64))
+    instruction(b, A.AddImm(A.fp, A.sp, 16, A.W64))
+    instruction(b, A.Str(A.worker, Offset(A.sp, 0), A.W64))
+    instruction(b, A.Mov(A.worker, A.x0, A.W64))
+    instruction(b, A.Mov(A.x0, A.xzr, A.W64))
+    instruction(b, A.Bl(Asm.symbolFor(d, Rt.workerRun), A.Standard))
+    instruction(b, A.Bl(Asm.turkeyEntry(d, "turkey_worker_ended"), A.Standard))
+    instruction(b, A.Mov(A.x0, A.xzr, A.W64))
+    returnToC(b)
 }
 
 -- What has to happen before the program's own code, and `main`.

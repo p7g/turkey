@@ -1,28 +1,69 @@
-module Turkey.Scheduler (ready, waitUntil, yield)
+module Turkey.Scheduler (start, lock, unlock, ready, wake, waitUntil, yield)
 
--- Which task runs next, on one worker.
+-- Which task runs next, and on which worker.
 --
--- A task is a coroutine (`Turkey.Coroutine`), and every task is resumed from
--- one place: a loop on the program's own stack, which runs whenever code on
--- that stack has to wait. Code on a task's stack never runs the loop; when it
--- has to wait it suspends, which returns to the loop. So the program's own
+-- A task is a coroutine (`Turkey.Coroutine`), resumed from a worker's own
+-- stack: the main worker's, whenever code on the program's stack has to wait,
+-- and each other worker's, in `workerLoop`, for as long as the program runs.
+-- Code on a task's stack never resumes another task; when it has to wait it
+-- suspends, which returns to the worker that resumed it. So the program's own
 -- stack is never a task, and keeps its full size for deep recursion.
 --
--- Scheduling is cooperative: a task runs until it waits or yields, and one
--- that computes without doing either holds the worker until it finishes.
+-- There is one worker unless `TURKEY_WORKERS` asks for more, when the first
+-- task starts. With one, tasks interleave in a fixed order; with more, they
+-- run in parallel, and any order is possible.
 --
--- What a task waits for keeps a list of the tasks waiting on it and makes them
--- ready when the wait is over; nothing here knows what is being waited for.
+-- Scheduling is cooperative: a task runs until it waits or yields, and one
+-- that computes without doing either holds its worker until it finishes.
+--
+-- **The lock.** The queue, every coroutine's `waiting` state, and what tasks
+-- wait on (`System.Task`) are read and written only under one lock. A worker
+-- waiting for it is blocked (`Turkey.Workers.acquire`), so its holder may
+-- allocate, and collect, without waiting for the worker waiting on it.
+--
+-- **Waking before parking.** A coroutine that is about to wait registers
+-- itself under the lock and then suspends; whatever it waits for may wake it
+-- in between, on another worker, while it is still running. So a wake never
+-- resumes a coroutine itself. It marks one still running as woken, and the
+-- worker that resumed it puts it back on the queue once it has suspended
+-- (`run`), or queues one that is parked.
 
 import Turkey.Coroutine as Co
+import Turkey.Libc as Libc
+import Turkey.Lock as Lock
+import Turkey.Stack as Stack
+import Turkey.Workers as Workers
+
+-- A coroutine's `waiting` state: neither queued nor parked (running, or
+-- queued to run); parked, until something wakes it; or woken while it was
+-- still running, to be queued when it suspends.
+let active = 0
+let parked = 1
+let woken = 2
+
+var queueLock : Prim.Ptr = Lock.new()
 
 -- The tasks that can run, oldest first, from `head` on.
 var runnable : Array Co.Coroutine = []
 var head = 0
 
--- Make `c` runnable: it will be resumed in its turn.
+fun lock() -> Unit = Workers.acquire(queueLock)
+fun unlock() -> Unit = Lock.release(queueLock)
+
+-- Make `c` runnable: it will be resumed in its turn. Under the lock.
 fun ready(c : Co.Coroutine) -> Unit = Array.push(runnable, c)
 
+-- Make `c`, which is waiting, runnable once it has suspended. Under the lock.
+fun wake(c : Co.Coroutine) -> Unit {
+    if Co.waiting(c) == parked {
+        Co.waitingSet(c, active)
+        ready(c)
+    } else {
+        Co.waitingSet(c, woken)
+    }
+}
+
+-- The next runnable coroutine. Under the lock.
 fun next() -> Option Co.Coroutine {
     if head == len(runnable) {
         if head > 0 {
@@ -36,40 +77,144 @@ fun next() -> Option Co.Coroutine {
     Some(c)
 }
 
+fun take() -> Option Co.Coroutine {
+    lock()
+    let c = next()
+    unlock()
+    c
+}
+
+-- Resume `c` until it suspends, then queue it if it was woken meanwhile, or
+-- park it.
+fun run(c : Co.Coroutine) -> Unit {
+    Co.resume(c)
+    lock()
+    if !Co.finished(c) {
+        if Co.waiting(c) == woken {
+            Co.waitingSet(c, active)
+            ready(c)
+        } else {
+            Co.waitingSet(c, parked)
+        }
+    }
+    unlock()
+}
+
 -- Return once `done` holds. A task gives `register` itself, so that whatever
--- makes `done` hold can make it ready, and suspends until then; code on the
--- program's own stack runs the other tasks meanwhile.
+-- makes `done` hold can wake it, and suspends until then; code on a worker's
+-- own stack runs other tasks meanwhile. `done` and `register` run under the
+-- lock.
 fun waitUntil(done : fun() -> Bool, register : fun(Co.Coroutine) -> Unit) -> Unit {
     match Co.running() {
-        Some(c) -> while !done() {
+        Some(c) -> while True {
+            lock()
+            if done() {
+                unlock()
+                return {}
+            }
             register(c)
+            unlock()
             Co.suspend()
         }
-        None -> while !done() {
-            match next() {
-                Some(c) -> Co.resume(c)
-                -- Nothing can make `done` hold: every task is waiting on
-                -- another, or on the program's own code, which is waiting here.
-                None -> Prim.error("deadlock: every task is waiting")
+        None -> while True {
+            lock()
+            if done() {
+                unlock()
+                return {}
+            }
+            let c = next()
+            unlock()
+            match c {
+                Some(c) -> run(c)
+                None -> idle()
             }
         }
     }
 }
 
--- Let the other runnable tasks run before going on. On the program's own
--- stack, that is each task runnable now, once.
+-- Nothing to run, and what is being waited for not done: other workers may
+-- be running the task that will finish it. With one worker, nothing can make
+-- it hold: every task is waiting on another, or on the program's own code,
+-- which is waiting here.
+fun idle() -> Unit {
+    if Workers.count() == 1 { return Prim.error("deadlock: every task is waiting") }
+    Workers.pause()
+}
+
+-- Let the other runnable tasks run before going on. On a worker's own stack,
+-- that is each task runnable now, once.
 fun yield() -> Unit = match Co.running() {
     Some(c) -> {
-        ready(c)
+        lock()
+        Co.waitingSet(c, woken)
+        unlock()
         Co.suspend()
     }
     None -> {
+        lock()
         let count = len(runnable) - head
+        unlock()
         for var i = 0; i < count; i = i + 1 {
-            match next() {
-                Some(c) -> Co.resume(c)
+            match take() {
+                Some(c) -> run(c)
                 None -> {}
             }
+        }
+    }
+}
+
+-- -- workers ----------------------------------------------------------------------------
+
+var started = False
+
+-- Start the workers `TURKEY_WORKERS` asks for, beside the main one, the first
+-- time a task is started. Each runs `workerLoop` on a thread of its own, entered
+-- through `turkey_worker_start` (`Turkey.Emit.emitWorkerStart`), which sets
+-- its record in `x28`.
+fun start() -> Unit {
+    if started { return {} }
+    started = True
+    let wanted = workersWanted()
+    for var i = 1; i < wanted; i = i + 1 {
+        let record = Workers.new()
+        if Prim.ptrIsNull(record) { return {} }
+        let thread = Libc.malloc(8)
+        let _ = Libc.pthreadCreate(thread, Prim.ptrNull(),
+                                   Prim.codeAddress("turkey_worker_start"), record)
+    }
+}
+
+-- `TURKEY_WORKERS`, a decimal count, or 1.
+fun workersWanted() -> Int {
+    let text = Libc.getenv(Prim.cString("TURKEY_WORKERS"))
+    if Prim.ptrIsNull(text) { return 1 }
+    var n = 0
+    var at = 0
+    while True {
+        let digit = Prim.byteToInt(Prim.loadI8(text, at)) - 48
+        if digit < 0 || digit > 9 { break }
+        n = n * 10 + digit
+        at = at + 1
+    }
+    if n < 1 { 1 } else { n }
+}
+
+-- A worker thread's Turkey code: its stack registered, then tasks, until the
+-- program ends. It returns only when a panic unwinds it, and then
+-- `turkey_worker_start` hands the panic to the main worker
+-- (`Turkey.Workers.ended`).
+fun workerLoop() -> Unit {
+    Workers.blockExit()
+    -- The bound is the record above this function's, `turkey_worker_start`'s:
+    -- a walk scans each frame through the record below it, and stops at the
+    -- bound, so this function's own frame is scanned only if it is below it.
+    if !Stack.threadStackSet(Prim.loadPtr(Prim.frameAddress(), 0)) {
+        return Prim.error("no memory for a worker's stack record")
+    }
+    while True {
+        match take() {
+            Some(c) -> run(c)
+            None -> Workers.pause()
         }
     }
 }

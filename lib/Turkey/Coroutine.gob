@@ -1,4 +1,4 @@
-module Turkey.Coroutine (Coroutine, new, resume, suspend, finished, running)
+module Turkey.Coroutine (Coroutine, new, resume, suspend, finished, running, waiting, waitingSet)
 
 -- Coroutines: a function run on a stack of its own, which can stop part way
 -- through -- at any depth of ordinary calls -- and be continued later.
@@ -24,13 +24,16 @@ type Coroutine = Coroutine {
     body     : fun() -> Unit,
     running  : Bool,
     finished : Bool,
+    -- The scheduler's (`Turkey.Scheduler`), and only ever read or written
+    -- under its lock.
+    waiting  : Int,
 }
 
 -- Each worker's running coroutine, if any, by the worker's index in its
 -- record (`Turkey.Process`). Held here rather than in the record because it
 -- is a traced value, and the record is raw memory the collector does not
--- read. One worker so far.
-var currents : Prim.Array (Option Coroutine) = Prim.arrayNew(1, None)
+-- read. As many as there may be workers (`Turkey.Workers`).
+var currents : Prim.Array (Option Coroutine) = Prim.arrayNew(64, None)
 
 fun current() -> Option Coroutine = Prim.arrayGet(currents, worker())
 
@@ -47,9 +50,14 @@ fun new(body : fun() -> Unit) -> Coroutine = Coroutine {
     body = body,
     running = False,
     finished = False,
+    waiting = 0,
 }
 
 fun finished(c : Coroutine) -> Bool = c.finished
+
+fun waiting(c : Coroutine) -> Int = c.waiting
+
+fun waitingSet(c : Coroutine, state : Int) -> Unit { c.waiting = state }
 
 -- The coroutine whose stack is running, or `None` on the program's own stack.
 fun running() -> Option Coroutine = current()

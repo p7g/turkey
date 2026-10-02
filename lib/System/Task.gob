@@ -2,9 +2,11 @@ module System.Task (Task, Spawn, runScope, spawn, join, yield)
 
 -- Tasks: functions that run concurrently with the code that started them,
 -- each suspending where it waits -- in `join`, in `yield`, at any depth of
--- ordinary calls -- so that others run meanwhile. One worker runs them all,
--- so tasks interleave but never run in parallel, and nothing else runs between
--- two suspension points of one task.
+-- ordinary calls -- so that others run meanwhile. One worker runs them all
+-- unless the environment's `TURKEY_WORKERS` asks for more: with one, tasks
+-- interleave but never run in parallel, and nothing else runs between two
+-- suspension points of one task; with more, tasks run in parallel, and what
+-- two of them share needs synchronizing.
 --
 -- Every task belongs to a scope, and a scope ends only when every task started
 -- in it has finished:
@@ -54,6 +56,10 @@ instance Monad Spawn {
 }
 
 -- Run `body`, then wait for every task it started; the result is `body`'s.
+--
+-- A task's result, and what waits on a task or a scope, are written under
+-- the scheduler's lock (`Turkey.Scheduler`), which is what makes a result
+-- one task writes visible to the task that joins it on another worker.
 fun runScope(body : Spawn a) -> a {
     let Spawn(run) = body
     let scope = Scope { unfinished = 0, waiters = [] }
@@ -66,10 +72,12 @@ fun runScope(body : Spawn a) -> a {
 -- Start `f` as a task in the enclosing scope. It runs when the code that
 -- started it next waits or yields.
 fun spawn(f : fun() -> a) -> Spawn (Task a) = Spawn(fun(scope) {
+    Scheduler.start()
     let task = Task { result = None, waiters = [] }
-    scope.unfinished = scope.unfinished + 1
-    Scheduler.ready(Co.new(fun() {
-        task.result = Some(f())
+    let c = Co.new(fun() {
+        let value = f()
+        Scheduler.lock()
+        task.result = Some(value)
         wake(task.waiters)
         task.waiters = []
         scope.unfinished = scope.unfinished - 1
@@ -77,7 +85,12 @@ fun spawn(f : fun() -> a) -> Spawn (Task a) = Spawn(fun(scope) {
             wake(scope.waiters)
             scope.waiters = []
         }
-    }))
+        Scheduler.unlock()
+    })
+    Scheduler.lock()
+    scope.unfinished = scope.unfinished + 1
+    Scheduler.ready(c)
+    Scheduler.unlock()
     task
 })
 
@@ -85,6 +98,8 @@ fun spawn(f : fun() -> a) -> Spawn (Task a) = Spawn(fun(scope) {
 fun join(task : Task a) -> a {
     Scheduler.waitUntil(fun() = Option.isSome(task.result),
                         fun(c) = Array.push(task.waiters, c))
+    -- Read after the wait, which read it under the lock: once set, a result
+    -- is never written again.
     match task.result {
         Some(value) -> value
         None -> Prim.error("a joined task has no result")
@@ -94,6 +109,7 @@ fun join(task : Task a) -> a {
 -- Let the other tasks that can run go first.
 fun yield() -> Unit = Scheduler.yield()
 
+-- Under the scheduler's lock.
 fun wake(waiters : Array Co.Coroutine) -> Unit {
-    for c in waiters { Scheduler.ready(c) }
+    for c in waiters { Scheduler.wake(c) }
 }

@@ -1,0 +1,236 @@
+module Turkey.Workers (
+    count, index, new, recordOf, stopTheWorld, startTheWorld, stopHere, running,
+    blockEnter, blockExit, acquire, pause, ended,
+)
+
+-- The workers: the threads that run Turkey code, each with a record of its own
+-- (`Turkey.Process` lays it out) that `x28` holds while it runs, and how a
+-- collection stops all but itself.
+--
+-- A giblet module, since the collector and the allocator call it.
+--
+-- **Stopping the world.** A collection runs with every other worker stopped at
+-- a safepoint, where the frame tables describe its roots. The collecting
+-- worker raises each other worker's stop word -- the word every loop's poll
+-- tests (`Turkey.Polls`), which the allocator's slow path tests too -- and
+-- waits until each is either stopped or blocked:
+--
+-- * **stopped**: it saw its stop word at a safepoint, recorded that frame as
+--   its running stack's parked frame, so that the collection walks its stack
+--   like any parked one, and waits for the word to come down;
+-- * **blocked**: it declared, before waiting on something outside Turkey code
+--   -- a lock, or for work -- that its stack is parked at a frame and that it
+--   holds nothing else. The collector claims a blocked worker (*held*) so that
+--   it cannot run again until the collection ends.
+--
+-- A worker's state is one word, changed only atomically. The collector waits
+-- at the end until every worker it stopped is running again, so that a second
+-- collection never mistakes a worker still leaving the first for one stopped
+-- for it.
+
+import Prelude ()
+import Std.Classes
+import Data.Int ()
+import Data.Bool.Type (Bool(..))
+import Turkey.Libc as Libc
+import Turkey.Memory as Memory
+import Turkey.Stack as Stack
+
+-- At most this many workers, so that the tables below are allocated once.
+let limit : Int = 64
+
+-- Each worker's record, by index; index 0 is the main worker's, the process
+-- state every program defines.
+var records : Prim.Ptr = zeroed(8 * limit)
+-- Each worker's state, by index: `running` (0), `stopped` (1), `blocked` (2)
+-- or `held` (3).
+var states : Prim.Ptr = zeroed(8 * limit)
+-- Word 0: 1 while a collection is stopping the world, claimed by
+-- compare-and-swap. Word 8: how many workers there are.
+var control : Prim.Ptr = zeroed(16)
+
+fun zeroed(bytes : Int) -> Prim.Ptr {
+    let p = Libc.malloc(bytes)
+    if !Prim.ptrIsNull(p) { Memory.fill(p, bytes, 0) }
+    p
+}
+
+-- How many workers there are: 1 until the first is added.
+fun count() -> Int {
+    let n = Prim.atomicLoad(control, 8)
+    if n == 0 { 1 } else { n }
+}
+
+-- The running worker's index, a word of its record.
+fun index() -> Int = Prim.loadI64(Prim.processState(), 288)
+
+-- Whether the running worker is running Turkey code, rather than blocked or
+-- stopped -- which it may be in a loop of this module's, inlined into a
+-- caller and so given a poll (`Turkey.Polls`).
+fun running() -> Bool = Prim.atomicLoad(states, 8 * index()) == 0
+
+fun recordOf(i : Int) -> Prim.Ptr =
+    if i == 0 && Prim.atomicLoad(control, 8) == 0 { Prim.processState() }
+    else { Prim.loadPtr(records, 8 * i) }
+
+-- A record for a new worker, registered and blocked until its thread starts
+-- running Turkey code (`blockExit`); null if there is no room or no memory.
+-- Called on the main worker, which registers itself first.
+--
+-- Not while a collection is stopping the world, which counted the workers
+-- when it began: registration claims the same word a collection does, and
+-- waits blocked for it, so that a collection under way can finish.
+--
+-- This and the other functions that record where the worker parked
+-- (`acquire`, `pause`) are `foreign` so that they are never inlined: the frame
+-- they record must be their own, whose return address is a safepoint in their
+-- caller, where the caller's roots are stored and mapped.
+foreign "turkey_worker_new" fun new() -> Prim.Ptr {
+    -- The first: no other worker exists to be collecting.
+    if Prim.atomicLoad(control, 8) == 0 { return register() }
+    blockEnter(Prim.frameAddress())
+    while Prim.atomicCas(control, 0, 0, 1) != 0 { let _ = Libc.schedYield() }
+    let record = register()
+    Prim.atomicStore(control, 0, 0)
+    blockExit()
+    record
+}
+
+fun register() -> Prim.Ptr {
+    var n = Prim.atomicLoad(control, 8)
+    if n == 0 {
+        Prim.storePtr(records, 0, Prim.processState())
+        n = 1
+    }
+    if n == limit { return Prim.ptrNull() }
+    -- The record's size, `Turkey.Runtime.processStateBytes`.
+    let record = zeroed(1752)
+    if Prim.ptrIsNull(record) { return record }
+    Prim.storeI64(record, 288, n)
+    Prim.storePtr(records, 8 * n, record)
+    Prim.atomicStore(states, 8 * n, 2)
+    Prim.atomicStore(control, 8, plus(n, 1))
+    record
+}
+
+-- Stop every other worker, for a collection. False if another worker is
+-- stopping them already: that one collects, and this one stops at its next
+-- safepoint like the rest.
+fun stopTheWorld() -> Bool {
+    let n = count()
+    if n < 2 { return True }
+    if Prim.atomicCas(control, 0, 0, 1) != 0 { return False }
+    let me = index()
+    for var i = 0; i < n; i = plus(i, 1) {
+        if i != me { let _ = Prim.atomicAdd(recordOf(i), 272, 1) }
+    }
+    for var i = 0; i < n; i = plus(i, 1) {
+        if i != me {
+            while !stoppedOrHeld(i) { let _ = Libc.schedYield() }
+        }
+    }
+    True
+}
+
+fun stoppedOrHeld(i : Int) -> Bool {
+    let state = Prim.atomicLoad(states, 8 * i)
+    state == 1 || (state == 2 && Prim.atomicCas(states, 8 * i, 2, 3) == 2)
+}
+
+-- Let the other workers go again, and wait until every one that stopped is
+-- running before another collection may stop them.
+fun startTheWorld() -> Unit {
+    let n = count()
+    if n < 2 { return {} }
+    let me = index()
+    for var i = 0; i < n; i = plus(i, 1) {
+        if i != me {
+            if Prim.atomicLoad(states, 8 * i) == 3 { Prim.atomicStore(states, 8 * i, 2) }
+            let _ = Prim.atomicAdd(recordOf(i), 272, -1)
+        }
+    }
+    for var i = 0; i < n; i = plus(i, 1) {
+        if i != me {
+            while Prim.atomicLoad(states, 8 * i) == 1 { let _ = Libc.schedYield() }
+        }
+    }
+    Prim.atomicStore(control, 0, 0)
+}
+
+-- At a safepoint whose caller's frame record is `frame`, with the running
+-- worker's stop word raised: stop until the collection is over.
+fun stopHere(frame : Prim.Ptr) -> Unit {
+    let me = index()
+    parkAt(frame)
+    Prim.atomicStore(states, 8 * me, 1)
+    while Prim.intAnd(Prim.atomicLoad(Prim.processState(), 272), 1) != 0 {
+        let _ = Libc.schedYield()
+    }
+    parkAt(Prim.ptrNull())
+    Prim.atomicStore(states, 8 * me, 0)
+}
+
+-- About to wait outside Turkey code, with every root the caller holds in its
+-- frames and the caller's frame record at `frame`: from here a collection may
+-- run without this worker stopping.
+fun blockEnter(frame : Prim.Ptr) -> Unit {
+    if Prim.atomicLoad(control, 8) == 0 { return {} }
+    parkAt(frame)
+    Prim.atomicStore(states, 8 * index(), 2)
+}
+
+-- Back from waiting: running again once no collection holds this worker.
+fun blockExit() -> Unit {
+    if Prim.atomicLoad(control, 8) == 0 { return {} }
+    let me = index()
+    while Prim.atomicCas(states, 8 * me, 2, 0) != 2 { let _ = Libc.schedYield() }
+    parkAt(Prim.ptrNull())
+}
+
+-- Record `frame` as where the running worker's stack is parked, or null. A
+-- worker thread has no stack registered until its first Turkey code does it
+-- (`Turkey.Scheduler.workerLoop`), and nothing on it to walk before then.
+fun parkAt(frame : Prim.Ptr) -> Unit {
+    let stack = Stack.running()
+    if !Prim.ptrIsNull(stack) { Stack.parkedSet(stack, frame) }
+}
+
+-- Take `mutex` (`Turkey.Lock`), blocking the worker while it waits if another
+-- holds it, so that a holder that allocates -- and so may collect -- never
+-- waits on a worker that is waiting on it.
+foreign "turkey_lock_acquire" fun acquire(mutex : Prim.Ptr) -> Unit {
+    if Prim.intAnd(Libc.pthreadMutexTrylock(mutex), 0xFFFF_FFFF) == 0 { return {} }
+    blockEnter(Prim.frameAddress())
+    let _ = Libc.pthreadMutexLock(mutex)
+    blockExit()
+}
+
+-- Wait a little for work, blocked, so that a collection need not wait for this
+-- worker. A sleep rather than a wake-up from whoever makes work: simple, and
+-- costs an idle worker's wake-ups, not a busy one's time.
+foreign "turkey_worker_pause" fun pause() -> Unit {
+    blockEnter(Prim.frameAddress())
+    let _ = Libc.usleep(50)
+    blockExit()
+}
+
+-- A worker thread's Turkey code has returned, which it does only when a panic
+-- or an exit unwound it: hand the panic to the main worker, whose code ends
+-- the program with it, as a panic in a task on the main worker does. The
+-- flag is word 0 of a record, and the message bytes 24 to 272.
+foreign "turkey_worker_ended" fun ended() -> Unit {
+    let mine = Prim.processState()
+    if Prim.loadI64(mine, 0) == 0 { return {} }
+    -- Down first: every call below returns to a test of it.
+    Prim.storeI64(mine, 0, 0)
+    let first = recordOf(0)
+    -- The message before the flag, which the main worker may act on at once.
+    -- One that is unwinding already keeps its own.
+    if Prim.atomicLoad(first, 0) != 0 { return {} }
+    for var at = 24; at < 272; at = plus(at, 8) {
+        Prim.storeI64(first, at, Prim.loadI64(mine, at))
+    }
+    let _ = Prim.atomicCas(first, 0, 0, 1)
+}
+
+fun plus(a : Int, b : Int) -> Int = Prim.intAddWrapping(a, b)

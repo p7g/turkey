@@ -43,6 +43,7 @@ import Turkey.Process as Process
 import Turkey.Libc as Libc
 import Turkey.Lock as Lock
 import Turkey.Stack as Stack
+import Turkey.Workers as Workers
 
 -- -- layouts ----------------------------------------------------------------------------
 --
@@ -183,9 +184,8 @@ fun localAdd(objects : Int, bytes : Int) -> Unit {
 
 fun localBytes() -> Int = Prim.loadI64(Prim.processState(), 1744)
 
--- Fold the running worker's counts into the heap's and zero them.
-fun localFold() -> Unit {
-    let w = Prim.processState()
+-- Fold worker `w`'s counts into the heap's and zero them.
+fun localFold(w : Prim.Ptr) -> Unit {
     heapCount = plus(heapCount, Prim.loadI64(w, 1728))
     allocationsSince = plus(allocationsSince, Prim.loadI64(w, 1736))
     bytesSince = plus(bytesSince, Prim.loadI64(w, 1744))
@@ -544,8 +544,10 @@ fun classOf(size : Int) -> Int =
 -- still small, and `allocateSlow` gives them their class.
 fun fastSize(size : Int) -> Bool = Prim.intShr(plus(size, 39), 15) == 0
 
-fun cursorOf(sizeClass : Int) -> Prim.Ptr =
-    Prim.ptrAdd(Prim.processState(), plus(320, Prim.intShl(sizeClass, 6)))
+fun cursorOf(sizeClass : Int) -> Prim.Ptr = cursorIn(Prim.processState(), sizeClass)
+
+fun cursorIn(w : Prim.Ptr, sizeClass : Int) -> Prim.Ptr =
+    Prim.ptrAdd(w, plus(320, Prim.intShl(sizeClass, 6)))
 
 -- The lowest of the cursor's free slots, `free`, which is not zero.
 fun takeSlot(cursor : Prim.Ptr, free : Int) -> Prim.Ptr {
@@ -632,11 +634,22 @@ fun takeRegion(sizeClass : Int) -> Prim.Ptr {
 -- Give every cursor's unused slots back to its region -- clear them from the
 -- allocation bitmap and the counts, and move the search back to their word --
 -- give up the region, onto its available list if it has a free slot, and fold
--- the worker's counts into the heap's. Edits the shared lists without the
--- lock: it runs only where no other worker can be allocating.
+-- the worker's counts into the heap's -- for every worker -- and move every
+-- other worker's remembered objects to the running worker's set. Edits the
+-- shared lists without the lock: it runs only where no other worker can be
+-- allocating, in a collection or with one worker.
 fun retire() -> Unit {
+    let me = Prim.processState()
+    for var i = 0; i < Workers.count(); i = plus(i, 1) {
+        let w = Workers.recordOf(i)
+        retireWorker(w)
+        if !Prim.ptrEq(w, me) { adoptRemembered(w) }
+    }
+}
+
+fun retireWorker(w : Prim.Ptr) -> Unit {
     for var rc = 0; rc < regionClasses; rc = rc + 1 {
-        let cursor = cursorOf(rc)
+        let cursor = cursorIn(w, rc)
         let r = Prim.loadPtr(cursor, cursorRegion)
         if !Prim.ptrIsNull(r) {
             let left = Prim.loadI64(cursor, cursorFree)
@@ -647,7 +660,9 @@ fun retire() -> Unit {
                 let n = population(left)
                 store32(r, regionUsed, load32(r, regionUsed) - n)
                 if lw < load32(r, regionSearchWord) { store32(r, regionSearchWord, lw) }
-                localAdd(0 - n, 0 - n * Prim.loadI64(r, regionSlotSize))
+                heapCount = heapCount - n
+                allocationsSince = allocationsSince - n
+                bytesSince = bytesSince - n * Prim.loadI64(r, regionSlotSize)
                 Prim.storeI64(cursor, cursorFree, 0)
             }
             if load32(r, regionUsed) < load32(r, regionCapacity) {
@@ -657,7 +672,16 @@ fun retire() -> Unit {
             Prim.storePtr(cursor, cursorRegion, Prim.ptrNull())
         }
     }
-    localFold()
+    localFold(w)
+}
+
+-- Append worker `w`'s remembered objects to the running worker's set, which
+-- is the one a collection reads, and empty `w`'s.
+fun adoptRemembered(w : Prim.Ptr) -> Unit {
+    let theirs = Prim.loadPtr(w, 296)
+    let n = Prim.loadI64(w, 304)
+    for var i = 0; i < n; i = plus(i, 1) { remember(Prim.loadPtr(theirs, times8(i))) }
+    Prim.storeI64(w, 304, 0)
 }
 
 -- The number of set bits.
@@ -760,6 +784,7 @@ fun allocate(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Prim.Pt
 }
 
 fun allocateSlow(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Prim.Ptr {
+    if stopAsked() { Workers.stopHere(frame) }
     if stress { pollWordSet(True) }
     if (stress && stressDue()) || plus(bytesSince, localBytes()) >= threshold {
         collectFrom(frame, askedEither)
@@ -794,19 +819,40 @@ fun outOfMemory() -> Prim.Ptr {
 
 -- -- polls ------------------------------------------------------------------------------
 
--- Raise or lower the running worker's poll word, the one every loop's back
--- edge tests (`Turkey.Polls`): word 272 of its record.
-fun pollWordSet(up : Bool) -> Unit =
-    Prim.storeI64(Prim.processState(), 272, if up { 1 } else { 0 })
+-- The running worker's poll word, the one every loop's back edge tests
+-- (`Turkey.Polls`): word 272 of its record. Its bit 0 is a collection asking
+-- the worker to stop (`Turkey.Workers`), added and taken away by the
+-- collecting worker; its bit 1 is GC stress, which sends every poll here so
+-- that stress collects at polls as at allocations, and is the running
+-- worker's own.
+fun pollWordSet(up : Bool) -> Unit {
+    let w = Prim.processState()
+    let raised = Prim.intAnd(Prim.atomicLoad(w, 272), 2) != 0
+    if up && !raised { let _ = Prim.atomicAdd(w, 272, 2) }
+    if !up && raised { let _ = Prim.atomicAdd(w, 272, -2) }
+}
+
+fun stopAsked() -> Bool = Prim.intAnd(Prim.atomicLoad(Prim.processState(), 272), 1) != 0
 
 -- A loop's poll, called when the worker's poll word is up, as at any call.
---
--- Nothing asks a worker to stop yet, so the word is up only under GC stress
--- -- raised at the first allocation -- which collects here as it does at an
--- allocation: that is what checks the roots each poll maps.
+-- Not while the worker is blocked or stopped: the loop is then one of
+-- `Turkey.Workers`' own, waiting on the protocol a stop would re-enter.
 foreign "turkey_poll" fun poll() -> Unit {
-    if stress && stressDue() { collectFrom(Prim.frameAddress(), askedEither) }
+    if !Workers.running() { return {} }
+    if stopAsked() { Workers.stopHere(Prim.frameAddress()) }
+    if stress {
+        -- A loop can poll once per byte it copies, so stress collects at
+        -- only one poll in `pollStressEvery`, and by its own count.
+        pollCountdown = pollCountdown - 1
+        if pollCountdown <= 0 {
+            pollCountdown = pollStressEvery
+            collectFrom(Prim.frameAddress(), askedEither)
+        }
+    }
 }
+
+let pollStressEvery : Int = 257
+var pollCountdown : Int = 1
 
 -- Whether GC stress collects at this allocation.
 fun stressDue() -> Bool {
@@ -1143,6 +1189,12 @@ foreign "turkey_write_barrier" fun writeBarrier(parent : Prim.Ptr) -> Unit {
             || Prim.atomicCas(header, headerGeneration, old, rememberedOld) != old {
         return {}
     }
+    remember(parent)
+    let _ = Prim.atomicAdd(statsCounts, statsRememberedAt, 1)
+}
+
+-- Add `parent` to the running worker's remembered set.
+fun remember(parent : Prim.Ptr) -> Unit {
     let count = rememberedCount()
     if count == rememberedCapacity() {
         let capacity = if count < 64 { 64 } else { count * 2 }
@@ -1156,7 +1208,6 @@ foreign "turkey_write_barrier" fun writeBarrier(parent : Prim.Ptr) -> Unit {
     }
     Prim.storePtr(remembered(), times8(count), parent)
     rememberedCountSet(plus(count, 1))
-    let _ = Prim.atomicAdd(statsCounts, statsRememberedAt, 1)
 }
 
 -- Trace everything reachable from the stack, emptying it. This is the one
@@ -1268,7 +1319,15 @@ let askedEither : Int = 0
 let askedFull : Int = 1
 let askedMinor : Int = 2
 
+-- A collection, with every other worker stopped. If another worker is
+-- stopping them already, it collects and this one does not.
 fun collectFrom(frame : Prim.Ptr, asked : Int) -> Unit {
+    if !Workers.stopTheWorld() { return {} }
+    collectStopped(frame, asked)
+    Workers.startTheWorld()
+}
+
+fun collectStopped(frame : Prim.Ptr, asked : Int) -> Unit {
     retire()
     minor = generational && asked != askedFull && (asked == askedMinor || !fullDue())
     if verify { verifyAt(0, frame) }

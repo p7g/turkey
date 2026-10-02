@@ -192,3 +192,120 @@ fun main() {
     assert result.stdout == "before\n"
     assert result.stderr == \
         "panic: array index out of bounds: read at index 3, length 1\n"
+
+
+# -- several workers ---------------------------------------------------------------------
+#
+# With `TURKEY_WORKERS` above one, tasks run in parallel on threads of their
+# own and any interleaving is possible, so these programs print only what
+# does not depend on the order. Each runs plainly and under GC stress with the
+# heap verified, where every collection stops the other workers at a
+# safepoint first.
+
+WORKERS = {"TURKEY_WORKERS": "4"}
+
+TREE = """
+import System.Task as Task
+
+fun leaf(n : Int) -> Int {
+    let parts : Array String = []
+    for var i = 0; i < 20; i = i + 1 {
+        Array.push(parts, Int.toString(n + i))
+        if i % 5 == 0 { Task.yield() }
+    }
+    String.byteLength(String.join(parts, ""))
+}
+
+fun tree(depth : Int, n : Int) -> Int {
+    if depth == 0 { return leaf(n) }
+    let (a, b) = Task.runScope(do {
+        let a = Task.spawn(fun() = tree(depth - 1, n * 2))?
+        let b = Task.spawn(fun() = tree(depth - 1, n * 2 + 1))?
+        pure((a, b))
+    })
+    let c = Task.runScope(do {
+        let c = Task.spawn(fun() = Task.join(a) + Task.join(b))?
+        pure(c)
+    })
+    Task.join(c) + 1
+}
+
+fun main() { print(tree(5, 1)) }
+"""
+
+
+def agrees_on_workers(src: str) -> str:
+    one = lang.run(src)
+    assert one.code == 0, one.stderr
+    many = lang.run(src, env=WORKERS)
+    assert many.code == 0, many.stderr
+    assert many.stdout == one.stdout
+    stressed = lang.run(src, env=dict(WORKERS, **STRESS), flags=("--gc-verify",))
+    assert stressed.code == 0, stressed.stderr
+    assert stressed.stdout == one.stdout
+    return one.stdout
+
+
+def test_scopes_and_joins_across_workers():
+    """Scopes inside tasks and joins between them: a task waits on another
+    that another worker runs, and is woken, and requeued, by it."""
+    assert agrees_on_workers(TREE) == "1311\n"
+
+
+def test_tasks_that_allocate_in_parallel_survive_collections():
+    agrees_on_workers("""
+import System.Task as Task
+
+fun work(n : Int) -> Int {
+    var total = 0
+    for var round = 0; round < 20; round = round + 1 {
+        let parts : Array String = []
+        for var i = 0; i < 30; i = i + 1 { Array.push(parts, Int.toString(n * 100 + i)) }
+        total = total + String.byteLength(String.join(parts, ","))
+        let m = Map.new()
+        for var i = 0; i < 20; i = i + 1 { Map.put(m, i, Int.toString(i + n)) }
+        total = total + String.byteLength(Map.getOr(m, 7, ""))
+    }
+    total
+}
+
+fun main() {
+    let tasks = Task.runScope(do {
+        let made : Array (Task.Task Int) = []
+        for var n = 0; n < 32; n = n + 1 {
+            let k = n
+            Array.push(made, Task.spawn(fun() = work(k))?)
+        }
+        pure(made)
+    })
+    var sum = 0
+    for t in tasks { sum = sum + Task.join(t) }
+    print(sum)
+}
+""")
+
+
+def test_a_panic_in_a_task_on_another_worker_ends_the_program():
+    result = lang.run("""
+import System.Task as Task
+
+fun main() {
+    let _ = Task.runScope(do {
+        for var n = 0; n < 8; n = n + 1 {
+            let k = n
+            let _ = Task.spawn(fun() {
+                if k == 5 {
+                    let xs = [1]
+                    print(xs[3])
+                }
+            })?
+        }
+        pure(())
+    })
+    print("not reached")
+}
+""", env=WORKERS)
+    assert result.code == 1
+    assert result.stdout == ""
+    assert result.stderr == \
+        "panic: array index out of bounds: read at index 3, length 1\n"

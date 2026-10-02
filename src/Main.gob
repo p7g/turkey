@@ -455,25 +455,36 @@ fun dumpMono(b : String.Builder, checked : Checked, entry : Modules.Module,
 -- the pass order.
 fun optimize(checked : Checked, main : String, specialized : Core.CProgram)
         -> Core.CProgram {
+    -- Each step's time, for `--timings`, under `opt.`.
+    var at = Time.monotonic()
+    let first = Opt.reduceProgram(specialized, checked.decls)
+    at = lap("opt.reduce", at)
+    let discovered = Joins.discover(first)
+    at = lap("opt.joins", at)
+    let second = Opt.reduceProgram(discovered, checked.decls)
+    at = lap("opt.reduce", at)
     -- Reachability again, now that the reductions have inlined calls away and
     -- folded the branches a constant decides: what only they reached is dead.
-    let reduced = Mono.reachable(Opt.reduceProgram(
-        Joins.discover(Opt.reduceProgram(specialized, checked.decls)),
-        checked.decls), main, roots(checked), checked.decls.definitions,
-        prunable(checked, Giblets.gibletModules(), _))
+    let reduced = Mono.reachable(second, main, roots(checked), checked.decls.definitions,
+                                 prunable(checked, Giblets.gibletModules(), _))
+    at = lap("opt.reachable", at)
     Coretc.checkProgram(checked.decls, checked.classes, reduced,
                         Coretc.globalsOf(checked.env))
+    at = lap("opt.check", at)
     -- Family applications reduced before the layouts are decided, since a stuck
     -- one has no representation and the backend would guess. See
     -- `Mono.reduceTypes`.
     let settled = Mono.reduceTypes(reduced, checked.classes)
+    at = lap("opt.types", at)
     -- What the cap left generic, shared by layout instead of by type. This is
     -- after the optimizations rather than among them: a copy is the optimized
     -- body under another name, so there is nothing left to reduce in it.
     let out = Uncurry.program(Layout.share(settled, checked.decls,
                                            checked.classes, main))
+    at = lap("opt.share", at)
     Coretc.checkProgram(checked.decls, checked.classes, out,
                         Coretc.globalsOf(checked.env))
+    at = lap("opt.check", at)
     -- Every layout the backend asks for has to be knowable, and this is the
     -- program it would be handed.
     Mono.checkLayouts(out)
@@ -485,6 +496,7 @@ fun optimize(checked : Checked, main : String, specialized : Core.CProgram)
                           else { unknown }, "; ")),
             "")
     }
+    let _ = lap("opt.layouts", at)
     out
 }
 

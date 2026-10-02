@@ -197,17 +197,34 @@ fun withValue(b : CBind, value : Core) -> CBind = CBind {
 
 -- -- the call graph, and the cycles in it ---------------------------------------------
 
+-- What a binding's value names, binds, and reads or passes along, from one
+-- walk each. Everything `reduceProgram` needs to know about the whole program
+-- before it starts -- the call graph, the loop breakers, the names a fresh one
+-- must avoid, the `var`s something writes -- is read off these, which are
+-- walked on as many workers as there are.
+type Walked = Walked {
+    names    : Set.Set String,
+    binders  : Set.Set String,
+    mentions : Set.Set String,
+}
+
+fun walk(b : CBind) -> Walked {
+    let mentions = Set.new()
+    mentionsInto(b.value, mentions)
+    Walked { names = namesOf(b.value), binders = bindersOf(b.value), mentions = mentions }
+}
+
 -- Which top-level bindings each one mentions, and nothing else.
-fun callGraph(binds : Array CBind) -> Map String (Set.Set String) {
+fun callGraph(binds : Array CBind, walked : Array Walked) -> Map String (Set.Set String) {
     let known = Set.new()
     for b in binds { Set.add(known, b.name) }
     let graph = Map.new()
-    for b in binds {
+    for var i = 0; i < len(binds); i = i + 1 {
         let deps = Set.new()
-        for n in Set.elements(namesOf(b.value)) {
+        for n in Set.elements(walked[i].names) {
             if Set.contains(known, n) { Set.add(deps, n) }
         }
-        Map.put(graph, b.name, deps)
+        Map.put(graph, binds[i].name, deps)
     }
     graph
 }
@@ -224,9 +241,9 @@ fun callGraph(binds : Array CBind) -> Map String (Set.Set String) {
 -- Deterministic on purpose: `Turkey.Deps.sccs` sorts each component, so taking
 -- the first is the lexicographically first name, and a golden that depends on
 -- which binding was broken does not move when an unrelated one is added.
-fun loopBreakers(program : CProgram) -> Set.Set String {
+fun loopBreakers(graph : Map String (Set.Set String)) -> Set.Set String {
     let out = Set.new()
-    let pending = [callGraph(Array.append(program.dicts, program.binds))]
+    let pending = [graph]
     var k = 0
     while k < len(pending) {
         let current = pending[k]
@@ -365,7 +382,8 @@ type Done = Done {
     cost      : Int,
 }
 
-fun newReducer(program : CProgram, decls : DeclTable) -> Reducer {
+fun newReducer(program : CProgram, decls : DeclTable, graph : Map String (Set.Set String),
+               walked : Array Walked) -> Reducer {
     let all = Array.append(program.dicts, program.binds)
     let bindings = Map.new()
     for b in all {
@@ -377,18 +395,20 @@ fun newReducer(program : CProgram, decls : DeclTable) -> Reducer {
         }
     }
     let used = Set.new()
-    for b in all {
-        Set.add(used, b.name)
-        for n in Set.elements(namesOf(b.value)) { Set.add(used, n) }
-        for n in Set.elements(bindersOf(b.value)) { Set.add(used, n) }
+    let written = Set.new()
+    for var i = 0; i < len(all); i = i + 1 {
+        Set.add(used, all[i].name)
+        for n in Set.elements(walked[i].names) { Set.add(used, n) }
+        for n in Set.elements(walked[i].binders) { Set.add(used, n) }
+        for n in Set.elements(walked[i].mentions) { Set.add(written, n) }
     }
     Reducer {
-        breakers = loopBreakers(program), decls = decls, bindings = bindings,
+        breakers = loopBreakers(graph), decls = decls, bindings = bindings,
         dicts = Methods.dictionaries(program.dicts),
         active = Array.new(8), sizes = Map.new(), moves = Map.new(),
         ends = Map.new(), cache = newCache(),
         speculating = False, reduced = Map.new(), constants = Map.new(),
-        unwritten = Map.new(), written = mentioned(all), counter = 0,
+        unwritten = Map.new(), written = written, counter = 0,
         scope = "", usedNames = used,
         homes = Homes { all = Map.new(), constant = Map.new(), unwritten = Map.new() },
         component = -1,
@@ -521,15 +541,16 @@ fun reportSchedule(graph : Map String (Set.Set String), components : Array (Arra
 -- are scoped to it (`fresh`). One component is reduced by one worker, in
 -- order, because within a cycle what is known depends on that order.
 fun reduceProgram(program : CProgram, decls : DeclTable) -> CProgram {
-    let base = newReducer(program, decls)
     let binds = Array.append(program.dicts, program.binds)
+    let walked = Parallel.map(binds, walk)
+    let graph = callGraph(binds, walked)
+    let base = newReducer(program, decls, graph, walked)
     let first = Map.new()
     for var i = 0; i < len(binds); i = i + 1 {
         if !Map.contains(first, binds[i].name) {
             Map.put(first, binds[i].name, i)
         }
     }
-    let graph = callGraph(binds)
     let components = Deps.sccs(graph)
     for var c = 0; c < len(components); c = c + 1 {
         for name in components[c] { Map.put(base.homes.all, name, c) }
@@ -747,15 +768,9 @@ fun step(r : Reducer, e : Core) -> Option Core {
     None
 }
 
--- The names mentioned anywhere other than as the reference a `!` reads: an
--- assignment's target, a reference passed as a value. A top-level `var` not
--- among them is never written.
-fun mentioned(binds : Array CBind) -> Set.Set String {
-    let out = Set.new()
-    for b in binds { mentionsInto(b.value, out) }
-    out
-}
-
+-- The names `e` mentions anywhere other than as the reference a `!` reads:
+-- an assignment's target, a reference passed as a value. A top-level `var`
+-- no binding mentions so is never written.
 fun mentionsInto(e : Core, out : Set.Set String) -> Unit = match e.kind {
     CVar(name) -> Set.add(out, name)
     CDeref(target) -> match target.kind {

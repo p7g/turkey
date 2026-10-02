@@ -47,6 +47,7 @@ module Turkey.Coretc (
 -- That is a check the elaborator never had, because in the surface language the
 -- same fact was established by unification and then forgotten.
 
+import System.Parallel as Parallel
 import Data.Set as Set
 import Turkey.Ast
 import Turkey.Ast as Ast
@@ -89,11 +90,18 @@ let superPrefix = "%super."
 -- cost.
 type CEnv = CEnv {
     names : Map String (Option (Array VarCell, Ty.Type)),
+    -- What `names` does not say, read and never written: the top-level names,
+    -- which every binding's check shares (`layered`).
+    outer : Map String (Option (Array VarCell, Ty.Type)),
     -- Each definition made inside a scope, with what the name meant before.
     undo  : Array (String, Option (Array VarCell, Ty.Type)),
 }
 
-fun newCEnv() -> CEnv = CEnv { names = Map.new(), undo = [] }
+fun newCEnv() -> CEnv = CEnv { names = Map.new(), outer = Map.new(), undo = [] }
+
+-- A scope over `e`, which it reads and never writes: so checks over one `e`
+-- can run at once. `e` must be a flat environment, one with nothing outer.
+fun layered(e : CEnv) -> CEnv = CEnv { names = Map.new(), outer = e.names, undo = [] }
 
 fun defineC(e : CEnv, name : String, binders : Array VarCell,
             ty : Ty.Type) -> Unit {
@@ -104,7 +112,10 @@ fun defineC(e : CEnv, name : String, binders : Array VarCell,
 fun lookupC(e : CEnv, name : String) -> Option (Array VarCell, Ty.Type) =
     match Map.get(e.names, name) {
         Some(found) -> found
-        None -> None
+        None -> match Map.get(e.outer, name) {
+            Some(found) -> found
+            None -> None
+        }
     }
 
 -- The mark a scope is left by.
@@ -181,13 +192,15 @@ fun newChecker(decls : DeclTable, classes : ClassTable) -> Checker = Checker {
 
 fun checkProgram(decls : DeclTable, classes : ClassTable, prog : CProgram,
                  globals : CEnv) -> Unit {
-    let ck = newChecker(decls, classes)
     let all = Array.append(prog.dicts, prog.binds)
     -- Every top-level name is in scope for every other: the dictionaries refer
     -- to each other, and the bindings were ordered by dependency but may still
     -- be mutually recursive within a component.
     for b in all { defineC(globals, b.name, b.binders, b.ty) }
-    for b in all { checkBind(ck, b, globals) }
+    -- Each binding against the top-level names alone, so they are checked on
+    -- as many workers as there are, a checker to each worker's chunk.
+    let _ = Parallel.mapWith(all, fun() = newChecker(decls, classes),
+                             fun(ck, b) = checkBind(ck, b, layered(globals)))
 }
 
 fun checkBind(ck : Checker, b : CBind, env : CEnv) -> Unit {

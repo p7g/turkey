@@ -63,7 +63,8 @@ work together without type annotations on the functions.
 
 ## Try it
 
-The compiler is written in Turkey. On an arm64 Mac, with a C compiler
+The compiler is written in Turkey. On an arm64 Mac running macOS 14.4 or
+later (the runtime sleeps on `os_sync_wait_on_address`), with a C compiler
 installed, it builds from the assembly committed in `bootstrap/` (for Linux,
 see below):
 

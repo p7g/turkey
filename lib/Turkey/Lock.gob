@@ -1,44 +1,146 @@
-module Turkey.Lock (new, acquire, release)
+module Turkey.Lock (new, acquire, tryAcquire, release, wait, wake, wakeAll)
 
 -- Mutual exclusion for the runtime's own shared state: the heap's region
--- lists and counters, and the list of stacks. Each is held only across a few
--- edits and never across a collection, a stack switch or a call that could
--- block, so a plain operating-system mutex serves: uncontended, a lock and an
--- unlock are a pair of atomic instructions in the C library.
+-- lists and counters, the list of stacks, the scheduler's queue. Each is held
+-- only across a few edits and never across a collection, a stack switch or a
+-- call that could block.
 --
 -- A giblet module, because the collector and the allocator take these, and
 -- may not allocate.
+--
+-- **A lock is three words**, in storage of its own that lives as long as the
+-- process: whether it is held (0 or 1), how many threads sleep waiting for
+-- it, and whether one has been woken and not yet run. Taking a free lock is
+-- one compare-and-swap, 0 to 1; releasing it is a store of 0, and a system
+-- call to wake a sleeper only if the count says there is one and none is
+-- already awake on its way -- Go's `sync.Mutex` keeps the same flag. Without
+-- it, a lock twelve workers hammered paid a wake-up on every release while
+-- any slept, and ran 28 times slower than the C library's. A thread that finds the lock held reads it a hundred times,
+-- in case it is about to be released, then yields its core a few times, and
+-- only then counts itself and sleeps until the word is no longer 1.
+--
+-- The count is what keeps a release cheap after contention has passed: a
+-- single state word that says "perhaps someone sleeps" -- one design, three
+-- states -- cannot be cleared by the release that wakes the last sleeper, and
+-- every release after pays for a wake-up nobody needs. Measured on a lock
+-- four workers hammer, that was six times slower than the C library's.
+--
+-- A release stores, then reads the count; a sleeper counts itself, then tries
+-- the lock once more before it sleeps. Each's second access is ordered after
+-- its first (a release store and an acquire load are not reordered), so either
+-- the release sees the count or the sleeper sees the lock free: a wake-up
+-- cannot fall between them.
+--
+-- A thread may take a lock it was not first to ask for (barging): every
+-- section a lock here guards is a few hundred instructions, so handing the
+-- lock on in order would cost a sleeping thread's wake-up on every release to
+-- save nothing measurable.
+--
+-- Offsets are literals rather than `let`s: other giblets' globals are made
+-- with `new`, and a `let` is a global that may not be set yet.
 
 import Prelude ()
 import Std.Classes
 import Data.Int ()
+import Data.Bool.Type (Bool(..))
+import Target (OS(..))
+import Target as Target
 import Turkey.Libc as Libc
 import Turkey.Process as Process
 
--- A lock is a `pthread_mutex_t`, in storage of its own that lives as long as
--- the process: every lock the runtime takes is made once, by a global's
--- initializer. A bare pointer rather than a type of its own, which would be a
--- heap object.
-
--- A fresh lock; a panic if there is no memory for one.
+-- A fresh, unlocked lock; a panic if there is no memory for one.
 fun new() -> Prim.Ptr {
-    -- The larger of the two platforms' `pthread_mutex_t`. A literal rather
-    -- than a `let`: other giblets' globals are made with this, and a `let` is
-    -- a global that may not be set yet.
-    let mutex = Libc.malloc(64)
-    if Prim.ptrIsNull(mutex)
-            || Prim.intAnd(Libc.pthreadMutexInit(mutex, Prim.ptrNull()), 0xFFFF_FFFF) != 0 {
+    let lock = Libc.malloc(24)
+    if Prim.ptrIsNull(lock) {
         Process.panic(Prim.cString("could not make a lock"))
+        return lock
     }
-    mutex
+    Prim.atomicStore(lock, 16, 0)
+    Prim.atomicStore(lock, 8, 0)
+    Prim.atomicStore(lock, 0, 0)
+    lock
 }
 
--- Wait until no other thread holds `mutex`, and hold it. Not recursive: a thread
--- that takes a lock it holds waits forever.
-fun acquire(mutex : Prim.Ptr) -> Unit {
-    let _ = Libc.pthreadMutexLock(mutex)
+-- Take `lock` if no thread holds it: True if this one now does.
+fun tryAcquire(lock : Prim.Ptr) -> Bool = Prim.atomicCas(lock, 0, 0, 1) == 0
+
+-- Wait until no other thread holds `lock`, and hold it. Not recursive: a
+-- thread that takes a lock it holds waits forever.
+fun acquire(lock : Prim.Ptr) -> Unit {
+    if !tryAcquire(lock) { contended(lock) }
 }
 
-fun release(mutex : Prim.Ptr) -> Unit {
-    let _ = Libc.pthreadMutexUnlock(mutex)
+fun contended(lock : Prim.Ptr) -> Unit {
+    -- Reading rather than swapping, so that waiting threads do not take the
+    -- cache line from the one that holds it.
+    for var i = 0; i < 100; i = Prim.intAddWrapping(i, 1) {
+        if Prim.atomicLoad(lock, 0) == 0 && tryAcquire(lock) { return {} }
+    }
+    for var i = 0; i < 4; i = Prim.intAddWrapping(i, 1) {
+        let _ = Libc.schedYield()
+        if Prim.atomicLoad(lock, 0) == 0 && tryAcquire(lock) { return {} }
+    }
+    while True {
+        let _ = Prim.atomicAdd(lock, 8, 1)
+        if tryAcquire(lock) {
+            let _ = Prim.atomicAdd(lock, 8, -1)
+            return {}
+        }
+        wait(lock, 1)
+        -- Awake, so a release may wake another.
+        Prim.atomicStore(lock, 16, 0)
+        let _ = Prim.atomicAdd(lock, 8, -1)
+        if tryAcquire(lock) { return {} }
+    }
 }
+
+-- The flag is set only while a wake-up is on its way to a sleeper. A wake
+-- that found nobody asleep -- a counted thread not yet in the kernel's wait
+-- -- clears it again, and then looks once more: a release in between saw the
+-- flag set and woke nobody, and the thread it skipped may have gone to sleep
+-- since, behind a holder who has released too. So while the lock is free and
+-- someone is counted, a release keeps trying until a wake finds a sleeper or
+-- another release takes the job over.
+fun release(lock : Prim.Ptr) -> Unit {
+    Prim.atomicStore(lock, 0, 0)
+    while Prim.atomicLoad(lock, 8) != 0 && Prim.atomicLoad(lock, 0) == 0
+            && Prim.atomicCas(lock, 16, 0, 1) == 0 {
+        if wake(lock) { return {} }
+        Prim.atomicStore(lock, 16, 0)
+    }
+}
+
+-- -- sleeping on a word ----------------------------------------------------------------
+--
+-- The operating system's wait-on-address: Darwin's `os_sync_wait_on_address`,
+-- public from macOS 14.4, and Linux's `futex`. Each is named in its own arm of
+-- a match on the target, which a program built for the other drops.
+
+-- Sleep while the word at `word` holds `value`. May return early -- a
+-- signal, or a wake meant for another -- so the caller tests again.
+fun wait(word : Prim.Ptr, value : Int) -> Unit = match Target.os {
+    Darwin -> { let _ = Libc.osSyncWaitOnAddress(word, value, 8, 0) }
+    -- `FUTEX_WAIT_PRIVATE`, which compares the word's low 32 bits: every
+    -- value waited on here fits in them, and the high ones stay zero.
+    Linux -> { let _ = Libc.syscall(futex(), word, 128, value, Prim.ptrNull()) }
+}
+
+-- Wake one thread sleeping on `word`, if one is: whether one was. Darwin
+-- answers 0 having woken one and -1 (`ENOENT`) having found none; Linux, how
+-- many it woke.
+fun wake(word : Prim.Ptr) -> Bool = match Target.os {
+    Darwin -> Prim.intAnd(Libc.osSyncWakeByAddressAny(word, 8, 0), 0xFFFF_FFFF) == 0
+    Linux -> {
+        let woken = Prim.intAnd(Libc.syscall(futex(), word, 129, 1, Prim.ptrNull()), 0xFFFF_FFFF)
+        woken > 0 && woken < 0x8000_0000
+    }
+}
+
+-- Wake every thread sleeping on `word`.
+fun wakeAll(word : Prim.Ptr) -> Unit = match Target.os {
+    Darwin -> { let _ = Libc.osSyncWakeByAddressAll(word, 8, 0) }
+    Linux -> { let _ = Libc.syscall(futex(), word, 129, 0x7FFF_FFFF, Prim.ptrNull()) }
+}
+
+-- `SYS_futex` on arm64 Linux.
+fun futex() -> Int = 98

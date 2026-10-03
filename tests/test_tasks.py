@@ -161,9 +161,16 @@ var other : Option (Task.Task Int) = None
 
 fun main() {
     let _ = Task.runScope(do {
-        let a = Task.spawn(fun() = match other {
-            Some(b) -> Task.join(b)
-            None -> 0
+        -- Waits for `b` to be known: with several workers `a` may start
+        -- before the code below has made it.
+        let a = Task.spawn(fun() {
+            while True {
+                match other {
+                    Some(b) -> return Task.join(b)
+                    None -> Task.yield()
+                }
+            }
+            0
         })?
         let b = Task.spawn(fun() = Task.join(a))?
         other = Some(b)

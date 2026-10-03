@@ -1,0 +1,162 @@
+module System.Sync (
+    Mutex, mutex, withLock, update,
+    AtomicInt, atomicInt, load, store, addAndGet, compareAndSet,
+    Once, once, force,
+)
+
+-- What tasks that share data need when they run at once (`System.Task`): a
+-- mutex around a value, an integer changed atomically, and a value computed
+-- once however many tasks ask for it.
+--
+-- A task waiting for any of them waits as it does in `Task.join`: it is
+-- suspended, and its worker runs other tasks meanwhile. Nothing here blocks a
+-- worker's thread.
+--
+-- Each keeps its state word in the first field of its record and changes it
+-- only with the atomic primitives, at the field's address: the object's
+-- fields start `fieldsAt` bytes in, and the collector never moves an object.
+-- So every function here holds the record itself, not only that address,
+-- while it works on it.
+
+import Turkey.Coroutine as Co
+import Turkey.Scheduler as Scheduler
+
+let fieldsAt = 24
+
+fun word(object : a) -> Prim.Ptr = Prim.objectAddress(object)
+
+-- -- mutex -----------------------------------------------------------------------------
+
+-- A value only one task at a time may use.
+--
+-- The state is 0 free, 1 held, or 2 held and perhaps waited for. Taking a free
+-- mutex is one compare-and-swap; releasing it is a swap, and wakes the waiting
+-- tasks only if the old state was 2. A task that cannot take it marks it 2 and
+-- waits, as does one woken from among others, so that the release after it
+-- looks for waiters too.
+--
+-- Any task may take a free mutex, including one that just released it:
+-- waiters are woken, not handed the mutex, so one that is never quick enough
+-- can wait for as long as others keep taking it.
+type Mutex a = Mutex {
+    state   : Int,
+    waiters : Array Co.Coroutine,
+    value   : a,
+}
+
+fun mutex(value : a) -> Mutex a = Mutex { state = 0, waiters = [], value = value }
+
+-- `f` of the value, with the mutex held.
+fun withLock(m : Mutex a, f : fun(a) -> b) -> b {
+    lock(m)
+    let made = f(m.value)
+    unlock(m)
+    made
+}
+
+-- Replace the value with `f` of it, with the mutex held.
+fun update(m : Mutex a, f : fun(a) -> a) -> Unit {
+    lock(m)
+    m.value = f(m.value)
+    unlock(m)
+}
+
+fun lock(m : Mutex a) -> Unit {
+    if Prim.atomicCas(word(m), fieldsAt, 0, 1) == 0 { return {} }
+    Scheduler.waitUntil(fun() = claim(m), fun(c) = Array.push(m.waiters, c))
+}
+
+-- Under the scheduler's lock: take `m` if it is free, or mark it waited for.
+fun claim(m : Mutex a) -> Bool {
+    let p = word(m)
+    while True {
+        let state = Prim.atomicLoad(p, fieldsAt)
+        if state == 0 {
+            if Prim.atomicCas(p, fieldsAt, 0, 2) == 0 { return True }
+        } else if state == 1 {
+            if Prim.atomicCas(p, fieldsAt, 1, 2) == 1 { return False }
+        } else {
+            return False
+        }
+    }
+    False
+}
+
+fun unlock(m : Mutex a) -> Unit {
+    if swap(word(m), 0) != 2 { return {} }
+    Scheduler.lock()
+    for c in m.waiters { Scheduler.wake(c) }
+    m.waiters = []
+    Scheduler.changed()
+    Scheduler.unlock()
+}
+
+fun swap(p : Prim.Ptr, value : Int) -> Int {
+    while True {
+        let old = Prim.atomicLoad(p, fieldsAt)
+        if Prim.atomicCas(p, fieldsAt, old, value) == old { return old }
+    }
+    0
+}
+
+-- -- atomic integers -------------------------------------------------------------------
+
+-- An `Int` that tasks read and change without a mutex. Each operation is one
+-- atomic instruction, ordered with the reads and writes around it.
+type AtomicInt = AtomicInt { cell : Int }
+
+fun atomicInt(initial : Int) -> AtomicInt = AtomicInt { cell = initial }
+
+fun load(a : AtomicInt) -> Int = Prim.atomicLoad(word(a), fieldsAt)
+
+fun store(a : AtomicInt, value : Int) -> Unit = Prim.atomicStore(word(a), fieldsAt, value)
+
+-- Add `n`, answering the sum. It wraps on overflow, as the instruction does.
+fun addAndGet(a : AtomicInt, n : Int) -> Int =
+    Prim.intAddWrapping(Prim.atomicAdd(word(a), fieldsAt, n), n)
+
+-- Store `new` if the value is `expected`, answering whether it was.
+fun compareAndSet(a : AtomicInt, expected : Int, new : Int) -> Bool =
+    Prim.atomicCas(word(a), fieldsAt, expected, new) == expected
+
+-- -- computed once ---------------------------------------------------------------------
+
+-- A value computed the first time a task asks for it, by that task; the
+-- others that ask meanwhile wait for it. The state is 0 not started, 1 being
+-- computed, 2 made.
+--
+-- A computation that asks for its own value waits for itself, which is a
+-- deadlock.
+type Once a = Once {
+    state   : Int,
+    compute : fun() -> a,
+    made    : Option a,
+    waiters : Array Co.Coroutine,
+}
+
+fun once(compute : fun() -> a) -> Once a =
+    Once { state = 0, compute = compute, made = None, waiters = [] }
+
+fun force(o : Once a) -> a {
+    let p = word(o)
+    if Prim.atomicLoad(p, fieldsAt) != 2 {
+        if Prim.atomicCas(p, fieldsAt, 0, 1) == 0 {
+            let value = o.compute()
+            Scheduler.lock()
+            o.made = Some(value)
+            Prim.atomicStore(p, fieldsAt, 2)
+            for c in o.waiters { Scheduler.wake(c) }
+            o.waiters = []
+            Scheduler.changed()
+            Scheduler.unlock()
+        } else {
+            Scheduler.waitUntil(fun() = Prim.atomicLoad(p, fieldsAt) == 2,
+                                fun(c) = Array.push(o.waiters, c))
+        }
+    }
+    -- Written before the state became 2, which this read after.
+    match o.made {
+        Some(value) -> value
+        None -> Prim.error("System.Sync.force: a value marked made is missing")
+    }
+}

@@ -1,5 +1,6 @@
 module Turkey.Workers (
-    count, index, new, recordOf, stopTheWorld, startTheWorld, stopEnter, stopLeave,
+    count, index, new, recordOf,
+    workSeen, sleepForWork, signalWork, collectionSeen, sleepForCollection, signalCollection, stopTheWorld, startTheWorld, stopEnter, stopLeave,
     stopWanted, stopped, running,
     blockEnter, blockExit, unblock, acquire, ended,
 )
@@ -51,6 +52,50 @@ var states : Prim.Ptr = zeroed(8 * limit)
 -- Word 0: 1 while a collection is stopping the world, claimed by
 -- compare-and-swap. Word 8: how many workers there are.
 var control : Prim.Ptr = zeroed(16)
+
+-- What workers with nothing to do sleep on, so that they use no processor
+-- until there is something for them.
+--
+-- Word 0 is the work epoch: bumped when a task becomes runnable, and when one
+-- finishes while the program's own code waits for it (`signalWork`). Word 16
+-- is the collection epoch: bumped when a collection asks its stopped and held
+-- workers to mark, and when it lets them go (`signalCollection`). Words 8
+-- and 24 count the threads asleep on each, so that bumping one costs a system
+-- call only when one is.
+--
+-- A sleeper reads the epoch before it looks for what it waits for, and sleeps
+-- only while the epoch is still what it read: so a bump made after it looked
+-- either shows in the epoch, and it does not sleep, or finds it counted, and
+-- wakes it (`sleepOn`).
+var signals : Prim.Ptr = zeroed(32)
+
+fun workSeen() -> Int = Prim.atomicLoad(signals, 0)
+fun collectionSeen() -> Int = Prim.atomicLoad(signals, 16)
+
+fun sleepForWork(seen : Int) -> Unit = sleepOn(0, seen)
+fun sleepForCollection(seen : Int) -> Unit = sleepOn(16, seen)
+
+-- Sleep while the epoch at `word` is `seen`. The count goes up before the
+-- epoch is read again, and the bump goes before the count is read, so one of
+-- the two sees the other.
+fun sleepOn(word : Int, seen : Int) -> Unit {
+    let _ = Prim.atomicAdd(signals, plus(word, 8), 1)
+    if Prim.atomicLoad(signals, word) == seen { Lock.wait(Prim.ptrAdd(signals, word), seen) }
+    let _ = Prim.atomicAdd(signals, plus(word, 8), -1)
+}
+
+-- Something for an idle worker to do: wake one, or, `all`, every one.
+fun signalWork(all : Bool) -> Unit {
+    let _ = Prim.atomicAdd(signals, 0, 1)
+    if Prim.atomicLoad(signals, 8) != 0 {
+        if all { Lock.wakeAll(signals) } else { let _ = Lock.wake(signals) }
+    }
+}
+
+fun signalCollection() -> Unit {
+    let _ = Prim.atomicAdd(signals, 16, 1)
+    if Prim.atomicLoad(signals, 24) != 0 { Lock.wakeAll(Prim.ptrAdd(signals, 16)) }
+}
 
 fun zeroed(bytes : Int) -> Prim.Ptr {
     let p = Libc.malloc(bytes)
@@ -152,6 +197,8 @@ fun startTheWorld() -> Unit {
             let _ = Prim.atomicAdd(recordOf(i), 272, -1)
         }
     }
+    -- The stopped and held workers sleep until this says so (`Turkey.Heap.stopAt`).
+    signalCollection()
     for var i = 0; i < n; i = plus(i, 1) {
         if i != me {
             while Prim.atomicLoad(states, 8 * i) == 1 { let _ = Libc.schedYield() }

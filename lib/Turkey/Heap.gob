@@ -1423,14 +1423,17 @@ var sharing : Bool = False
 var participants : Int = 1
 
 -- Words of the mark's state: how many markers are idle, whether the mark is
--- over, how many packets the pool holds, the next task to claim, and whether
--- the mark failed.
-var marking : Prim.Ptr = zeroed(40)
+-- over, how many packets the pool holds, the next task to claim, whether the
+-- mark failed, and an epoch idle markers sleep on with how many do: bumped
+-- when a packet is put in the pool and when the mark is over (`markSignal`).
+var marking : Prim.Ptr = zeroed(56)
 let idleAt : Int = 0
 let doneAt : Int = 8
 let packetsAt : Int = 16
 let nextTaskAt : Int = 24
 let failedAt : Int = 32
+let epochAt : Int = 40
+let sleepersAt : Int = 48
 -- What `markFailed` was told, once it has been.
 var failure : Prim.Ptr = Prim.ptrNull()
 
@@ -1492,6 +1495,10 @@ fun markFrom(frame : Prim.Ptr) -> Unit {
         for var i = 0; i < n; i = plus(i, 1) {
             if i != me && canHelp(i) { Prim.atomicStore(helping, times8(i), 1) }
         }
+        -- The stopped ones sleep on the collection epoch, and the paused ones
+        -- may still be asleep on the work epoch.
+        Workers.signalCollection()
+        Workers.signalWork(True)
     }
     mark()
     if sharing {
@@ -1589,6 +1596,7 @@ fun share(stack : Prim.Ptr, top : Int) -> Int {
     Prim.storePtr(packet, 0, poolFull)
     poolFull = packet
     let _ = Prim.atomicAdd(marking, packetsAt, 1)
+    markSignal(False)
     Lock.release(poolLock)
     rest
 }
@@ -1631,19 +1639,40 @@ fun waitForWork() -> Bool {
     }
     let idle = plus(Prim.atomicLoad(marking, idleAt), 1)
     Prim.atomicStore(marking, idleAt, idle)
-    if idle == participants { Prim.atomicStore(marking, doneAt, 1) }
+    let over = idle == participants
+    if over { Prim.atomicStore(marking, doneAt, 1) }
     Lock.release(poolLock)
-    while Prim.atomicLoad(marking, doneAt) == 0 {
+    if over {
+        markSignal(True)
+        return False
+    }
+    while True {
+        let epoch = Prim.atomicLoad(marking, epochAt)
+        if Prim.atomicLoad(marking, doneAt) != 0 { return False }
         if Prim.atomicLoad(marking, packetsAt) > 0 {
             Lock.acquire(poolLock)
-            let over = Prim.atomicLoad(marking, doneAt) != 0
-            if !over { Prim.atomicStore(marking, idleAt, Prim.atomicLoad(marking, idleAt) - 1) }
+            let done = Prim.atomicLoad(marking, doneAt) != 0
+            if !done { Prim.atomicStore(marking, idleAt, Prim.atomicLoad(marking, idleAt) - 1) }
             Lock.release(poolLock)
-            return !over
+            return !done
         }
-        let _ = Libc.schedYield()
+        -- Asleep until a packet or the end, rather than spinning: the last
+        -- marker with work may be some while about it.
+        let _ = Prim.atomicAdd(marking, sleepersAt, 1)
+        if Prim.atomicLoad(marking, epochAt) == epoch { Lock.wait(Prim.ptrAdd(marking, epochAt), epoch) }
+        let _ = Prim.atomicAdd(marking, sleepersAt, -1)
     }
     False
+}
+
+-- A packet for an idle marker, or, `all`, the end of the mark: wake one, or
+-- every one, if any sleeps (`waitForWork`).
+fun markSignal(all : Bool) -> Unit {
+    let _ = Prim.atomicAdd(marking, epochAt, 1)
+    if Prim.atomicLoad(marking, sleepersAt) != 0 {
+        if all { Lock.wakeAll(Prim.ptrAdd(marking, epochAt)) }
+        else { let _ = Lock.wake(Prim.ptrAdd(marking, epochAt)) }
+    }
 }
 
 -- Record that the mark cannot finish, saying `message`: the collecting worker
@@ -1653,44 +1682,48 @@ fun markFailed(message : Prim.Ptr) -> Unit {
     if Prim.atomicCas(marking, failedAt, 0, 1) == 0 { failure = message }
 }
 
--- Wait a little for work, blocked, so that a collection need not wait for
--- this worker. A sleep rather than a wake-up from whoever makes work: simple,
--- and costs an idle worker's wake-ups, not a busy one's time -- as long as
--- they are rare. Idle workers waking every 50 us slowed the busy one enough to
--- cost the self-compile more than marking in parallel saved; a sleep of 1 ms
--- was faster than 250 us at 2, 4 and 8 workers. It is also how long a
--- collection may wait for a paused worker to join its mark.
+-- Sleep until there may be work, blocked, so that a collection need not wait
+-- for this worker: until the work epoch is no longer `seen`, which the caller
+-- read before it looked for work and found none (`Turkey.Workers.signalWork`).
 --
 -- A collection that holds this worker meanwhile may ask it to mark, as it asks
--- the stopped ones (`pausing` says it can): it waits for the collection either
--- way. A worker blocked on a lock is not asked, since the lock may be the
--- collecting worker's.
-foreign "turkey_worker_pause" fun pause() -> Unit {
+-- the stopped ones (`pausing` says it can), and wakes it to say so; it waits
+-- for the collection to let it go either way. A worker blocked on a lock is
+-- not asked, since the lock may be the collecting worker's.
+foreign "turkey_worker_pause" fun pause(seen : Int) -> Unit {
     let me = times8(Workers.index())
     Prim.atomicStore(pausing, me, 1)
     Workers.blockEnter(Prim.frameAddress())
-    let _ = Libc.usleep(1000)
-    while !Workers.unblock() {
+    Workers.sleepForWork(seen)
+    while True {
+        let epoch = Workers.collectionSeen()
+        if Workers.unblock() { break }
         if Prim.atomicLoad(helping, me) != 0 {
             mark()
             Prim.atomicStore(helping, me, 0)
+        } else {
+            Workers.sleepForCollection(epoch)
         }
-        let _ = Libc.schedYield()
     }
     Prim.atomicStore(pausing, me, 0)
 }
 
 -- At a safepoint with the running worker's stop word raised: stopped until
 -- the collection is over, marking if it asks.
+-- It sleeps meanwhile, woken when the collection asks it to mark and when
+-- the collection ends (`Turkey.Workers.signalCollection`).
 fun stopAt(frame : Prim.Ptr) -> Unit {
     Workers.stopEnter(frame)
     let me = times8(Workers.index())
-    while Workers.stopWanted() {
+    while True {
+        let epoch = Workers.collectionSeen()
+        if !Workers.stopWanted() { break }
         if Prim.atomicLoad(helping, me) != 0 {
             mark()
             Prim.atomicStore(helping, me, 0)
+        } else {
+            Workers.sleepForCollection(epoch)
         }
-        let _ = Libc.schedYield()
     }
     Workers.stopLeave()
 }

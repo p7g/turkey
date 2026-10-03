@@ -1,4 +1,4 @@
-module Turkey.Scheduler (lock, unlock, ready, wake, waitUntil, yield)
+module Turkey.Scheduler (lock, unlock, ready, wake, finished, waitUntil, yield)
 
 -- Which task runs next, and on which worker.
 --
@@ -55,8 +55,23 @@ var running = 0
 fun lock() -> Unit = Workers.acquire(queueLock)
 fun unlock() -> Unit = Lock.release(queueLock)
 
--- Make `c` runnable: it will be resumed in its turn. Under the lock.
-fun ready(c : Co.Coroutine) -> Unit = Array.push(runnable, c)
+-- Make `c` runnable: it will be resumed in its turn, and an idle worker is
+-- woken for it. Under the lock.
+fun ready(c : Co.Coroutine) -> Unit {
+    Array.push(runnable, c)
+    Workers.signalWork(False)
+}
+
+-- Whether the program's own code is asleep in `waitUntil`, which only a
+-- task's finishing can end. Under the lock.
+var programWaits = False
+
+-- A task has finished, which may be what the program's own code waits for:
+-- wake it, if it sleeps. Every idle worker wakes with it, since nothing says
+-- which sleeper is the program. Under the lock.
+fun finished() -> Unit {
+    if programWaits { Workers.signalWork(True) }
+}
 
 -- Make `c`, which is waiting, runnable once it has suspended. Under the lock.
 fun wake(c : Co.Coroutine) -> Unit {
@@ -130,17 +145,22 @@ fun waitUntil(done : fun() -> Bool, register : fun(Co.Coroutine) -> Unit) -> Uni
                 unlock()
                 return {}
             }
+            let seen = Workers.workSeen()
             let c = next()
             -- Nothing to run here or anywhere, and nothing done: only a task
             -- could make it so, and every task is waiting.
             let stuck = Option.isNone(c) && running == 0
+            if Option.isNone(c) && !stuck { programWaits = True }
             unlock()
             match c {
                 Some(c) -> run(c)
                 None -> if stuck {
                     return Prim.error("deadlock: every task is waiting")
                 } else {
-                    Heap.pause()
+                    Heap.pause(seen)
+                    lock()
+                    programWaits = False
+                    unlock()
                 }
             }
         }
@@ -253,9 +273,12 @@ fun workerLoop() -> Unit {
         return Prim.error("no memory for a worker's stack record")
     }
     while True {
+        -- Before looking, so that a task made runnable after the look still
+        -- wakes it (`Turkey.Workers.sleepForWork`).
+        let seen = Workers.workSeen()
         match take() {
             Some(c) -> run(c)
-            None -> Heap.pause()
+            None -> Heap.pause(seen)
         }
     }
 }

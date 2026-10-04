@@ -39,7 +39,7 @@ import Turkey.Arm64 as A
 import Turkey.Arm64 (Reg(..), Inst(..), Bank(..))
 import Turkey.LowIr as L
 import Turkey.LowIr (Op(..), Low(..), AddressOf(..), BinOp(..), CmpOp(..), Conv(..),
-                     AtomicOp(..), Callee(..))
+                     AtomicOp(..), Callee(..), IndexCheck(..))
 import Turkey.Asm as Asm
 import Turkey.Clean as Clean
 import Turkey.Asm (Asm(..))
@@ -249,9 +249,9 @@ fun publisher(s : Sel, v : Value, b : Int, n : Int) -> Unit {
 -- itself -- is what keeps `unpublished` sound.
 fun publishingUses(op : Op) -> Array Value = match op {
     ObjectGet(_, _) | ObjectTag(_) | ArrayLength(_) | CellLoad(_) -> []
-    ArrayGet(_, index) -> [index]
+    ArrayGet(_, index, _) -> [index]
     ObjectSet(_, _, v) -> [v]
-    ArraySet(_, index, v) -> [index, v]
+    ArraySet(_, index, v, _) -> [index, v]
     CellStore(_, v) -> [v]
     _ -> L.opUses(op)
 }
@@ -603,8 +603,8 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         -- An array's elements start after the header, and are the element's
         -- own width apart -- not eight, which is why the width comes from
         -- `Turkey.Runtime` rather than being assumed here.
-        ArrayGet(target, index) -> {
-            withinStorage(s, A.reg(target), A.reg(index))
+        ArrayGet(target, index, check) -> {
+            withinStorage(s, check, A.reg(target), A.reg(index))
             let at = elementAt(s, A.reg(target), A.reg(index), r.class_)
             match Rt.elementWidth(r.class_) {
                 1 -> emit(s, A.Ldrb(d, at))
@@ -612,9 +612,9 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                 _ -> emit(s, A.Ldr(d, at, A.W64))
             }
         }
-        ArraySet(target, index, v) -> {
+        ArraySet(target, index, v, check) -> {
             ordered(s, target)
-            withinStorage(s, A.reg(target), A.reg(index))
+            withinStorage(s, check, A.reg(target), A.reg(index))
             let held = Ssa.repOf(s.source, v)
             let at = elementAt(s, A.reg(target), A.reg(index), held.class_)
             match Rt.elementWidth(held.class_) {
@@ -877,11 +877,18 @@ fun ordered(s : Sel, target : Value) -> Unit {
 -- with the old, shorter storage. Every safety check reads only the object it
 -- protects, so that no race between tasks can turn into an access outside an
 -- object. Unsigned, so a negative index fails too.
-fun withinStorage(s : Sel, array : Reg, index : Reg) -> Unit {
-    let length = temp(s, Ssa.untraced(I64))
-    emit(s, A.Ldr(length, A.Offset(array, 8), A.W64))
-    emit(s, A.Cmp(index, length, A.W64))
-    guardOn(s, A.Hs, "array access outside the array's storage")
+--
+-- None for an index `Turkey.Bounds` proved in range, by the same rule.
+fun withinStorage(s : Sel, check : IndexCheck, array : Reg, index : Reg) -> Unit {
+    match check {
+        Proven -> {}
+        Checked -> {
+            let length = temp(s, Ssa.untraced(I64))
+            emit(s, A.Ldr(length, A.Offset(array, 8), A.W64))
+            emit(s, A.Cmp(index, length, A.W64))
+            guardOn(s, A.Hs, "array access outside the array's storage")
+        }
+    }
 }
 
 -- The frame object `v` addresses. Every one has a slot: `Turkey.Roots` lists

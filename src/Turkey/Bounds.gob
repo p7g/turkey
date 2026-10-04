@@ -1,0 +1,450 @@
+module Turkey.Bounds (run)
+
+-- Bounds-check elimination: mark `Proven` each array access whose index is
+-- provably within the array's own length, so that instruction selection
+-- emits no check for it.
+--
+-- **What a proof may use.** The check an access carries reads only the
+-- object it protects, so that no race between tasks can turn into an access
+-- outside an object. A proof that removes it has to keep that property, and
+-- so it uses three kinds of fact and nothing else:
+--
+--   * arithmetic on SSA values -- `i + 1` is one more than `i`, exactly,
+--     because `add` panics rather than wrap;
+--   * a comparison between two SSA values that *executed*: the branch on its
+--     result dominates the access, so the access is reached only with that
+--     outcome, and the values compared are the ones in hand;
+--   * the length of the array being accessed, read from its own header --
+--     every `ArrayLength` of one array value answers the same, because an
+--     array's length is fixed when it is allocated, and an array built here
+--     has the length it was built with.
+--
+-- What it may never use is an invariant one object keeps about another. A
+-- growable `Array` checks its index against its own `length` field, and that
+-- field is never larger than its storage -- when one task is writing both.
+-- Another task can see the storage replaced and the length not yet raised, or
+-- the reverse, so `i < length` says nothing about the storage, and the check
+-- against the storage stays. A comparison the program made between the
+-- logical length and the storage's own length would be a fact, because the
+-- values it compared are the ones the proof reasons about.
+--
+-- **The form of a fact.** Every fact is a difference constraint `x <= y + c`
+-- between two *nodes*, as in ABCD (Bodik, Gupta and Sarkar, "ABCD:
+-- Eliminating Array Bounds Checks on Demand", PLDI 2000). An `Int` value is a
+-- node plus a constant offset, so `i + 1`, `i` and `n - 1` share nodes and
+-- cost no constraint of their own; constants are offsets from a node for
+-- zero; an array's length is a node of its own, or the node of the length it
+-- was allocated with. A branch on `i < n` adds `i <= n - 1` in the blocks it
+-- alone enters, scoped by a walk of the dominator tree, and an access is
+-- proven by a short path through the facts in scope.
+--
+-- **Loops.** A loop's index is a block parameter, and the branch that tests
+-- it against the length dominates the body, which is the upper bound. The
+-- lower bound is each node's *floor*, solved optimistically over the block
+-- parameters: `i` entering at 0 and passed back as `i + 1` never goes below
+-- 0. A floor that keeps falling is widened to unbounded, so a loop counting
+-- down does not iterate the solver for ever.
+--
+-- **Where it runs.** After constant propagation and copy elimination, which
+-- make a constant index a constant and a copied length the same value. It
+-- removes traps and changes nothing else, so it adds no allocation, call or
+-- string literal and is safe before the giblets check.
+
+import Turkey.LowIr (Op(..), Low(..), BinOp(..), CmpOp(..), IndexCheck(..))
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (Value(..), BlockId(..), Term(..), RepClass(..))
+
+-- A value as `node + offset`.
+type Affine = Affine { node : Int, offset : Int }
+
+-- The least a node can be. `Unseen` is the optimistic start of the solver, and
+-- one left after it is treated as `Unbounded`.
+type Floor = Unseen | AtLeast(Int) | Unbounded
+
+type Prover = Prover {
+    func   : Ssa.Func Low,
+    defs   : Array (Option Op),
+    -- By value id. A value no fact can mention is its own node at offset 0.
+    values : Array Affine,
+    -- By node: the values' nodes, then one for each array's length, then
+    -- zero.
+    floors : Array Floor,
+    -- `x <= y + c` is `(y, c)` in `above[x]` and `(x, c)` in `below[y]`,
+    -- for the facts in scope.
+    above  : Array (Array (Int, Int)),
+    below  : Array (Array (Int, Int)),
+    zero   : Int,
+}
+
+-- Offsets are kept small enough that adding a handful of them cannot
+-- overflow; a constant outside this is a node of its own.
+let largest = 1099511627776
+
+-- How many facts a proof may chain. Every proof the library's loops need is
+-- one or two long.
+let rounds = 4
+
+fun run(f : Ssa.Func Low) -> Unit {
+    if !hasCheck(f) { return }
+    let p = prover(f)
+    solveFloors(p)
+    walk(p)
+}
+
+fun hasCheck(f : Ssa.Func Low) -> Bool {
+    for block in f.blocks {
+        for i in block.insts {
+            match i.op {
+                ArrayGet(_, _, Checked) -> return True
+                ArraySet(_, _, _, Checked) -> return True
+                _ -> {}
+            }
+        }
+    }
+    False
+}
+
+fun prover(f : Ssa.Func Low) -> Prover {
+    let n = len(f.reps)
+    let nodes = 2 * n + 1
+    let p = Prover {
+        func = f, defs = Array.filled(n, None), values = [],
+        floors = Array.filled(nodes, Unseen), above = [], below = [],
+        zero = 2 * n,
+    }
+    for var v = 0; v < n; v = v + 1 { Array.push(p.values, Affine { node = v, offset = 0 }) }
+    for _ in p.floors {
+        Array.push(p.above, [])
+        Array.push(p.below, [])
+    }
+    for var a = n; a < nodes; a = a + 1 { p.floors[a] = AtLeast(0) }
+    -- Reverse postorder, so an instruction's operands are seen before it.
+    for b in Ssa.reversePostorder(f) {
+        for i in Ssa.blockAt(f, b).insts {
+            let id = Ssa.valueId(i.result)
+            p.defs[id] = Some(i.op)
+            if Ssa.repOf(f, i.result).class_ == I64 { p.values[id] = affine(p, i) }
+        }
+    }
+    p
+}
+
+fun affine(p : Prover, i : Low) -> Affine {
+    let own = Affine { node = Ssa.valueId(i.result), offset = 0 }
+    match i.op {
+        ConstInt(k) -> if small(k) { Affine { node = p.zero, offset = k } } else { own }
+        Bin(Add, x, y) -> {
+            let (a, b) = (valueOf(p, x), valueOf(p, y))
+            if b.node == p.zero { shifted(a, b.offset, own) }
+            else if a.node == p.zero { shifted(b, a.offset, own) }
+            else { own }
+        }
+        Bin(Sub, x, y) -> {
+            let b = valueOf(p, y)
+            if b.node == p.zero { shifted(valueOf(p, x), 0 - b.offset, own) } else { own }
+        }
+        ArrayLength(a) -> lengthOf(p, a)
+        _ -> own
+    }
+}
+
+fun small(k : Int) -> Bool = k > 0 - largest && k < largest
+
+fun shifted(a : Affine, by : Int, otherwise : Affine) -> Affine =
+    if small(a.offset + by) { Affine { node = a.node, offset = a.offset + by } }
+    else { otherwise }
+
+fun valueOf(p : Prover, v : Value) -> Affine = p.values[Ssa.valueId(v)]
+
+-- The length of an array: what it was allocated with, if it was allocated
+-- here, and otherwise its own node.
+fun lengthOf(p : Prover, array : Value) -> Affine {
+    let id = Ssa.valueId(array)
+    match p.defs[id] {
+        Some(ArrayNew(length, _, _)) -> valueOf(p, length)
+        _ -> Affine { node = len(p.defs) + id, offset = 0 }
+    }
+}
+
+-- -- floors ------------------------------------------------------------------------
+
+fun solveFloors(p : Prover) -> Unit {
+    let f = p.func
+    let order = Ssa.reversePostorder(f)
+    -- The arguments each block parameter receives, from every jump to it.
+    let incoming : Array (Array (Array Value)) = Array.filled(len(f.blocks), [])
+    for var b = 0; b < len(f.blocks); b = b + 1 { incoming[b] = [] }
+    for b in order {
+        match Ssa.blockAt(f, b).term {
+            Jump(target, args) -> Array.push(incoming[Ssa.blockId(target)], args)
+            _ -> {}
+        }
+    }
+    let lowered = Array.filled(len(f.reps), 0)
+    var changed = True
+    while changed {
+        changed = False
+        for b in order {
+            let block = Ssa.blockAt(f, b)
+            for var k = 0; k < len(block.params); k = k + 1 {
+                var met = Unseen
+                for args in incoming[Ssa.blockId(b)] { met = meet(met, floorOf(p, args[k])) }
+                if settle(p, lowered, Ssa.valueId(block.params[k]), met) { changed = True }
+            }
+            for i in block.insts {
+                let id = Ssa.valueId(i.result)
+                if p.values[id].node == id && Ssa.repOf(f, i.result).class_ == I64 {
+                    if settle(p, lowered, id, floorOfOp(p, i.op)) { changed = True }
+                }
+            }
+        }
+    }
+    -- A function's parameters are whatever the caller passed: never seen
+    -- above, and unbounded here with everything else left unseen.
+    for var v = 0; v < len(f.reps); v = v + 1 {
+        if same(p.floors[v], Unseen) { p.floors[v] = Unbounded }
+    }
+}
+
+-- Lower a node's floor to `next`, if that is lower, widening it to unbounded
+-- once it has fallen often enough to be counting down.
+fun settle(p : Prover, lowered : Array Int, node : Int, next : Floor) -> Bool {
+    let old = p.floors[node]
+    let met = meet(old, next)
+    if same(old, met) { return False }
+    lowered[node] = lowered[node] + 1
+    p.floors[node] = if lowered[node] > 3 { Unbounded } else { met }
+    True
+}
+
+fun floorOfOp(p : Prover, op : Op) -> Floor = match op {
+    Bin(Add, x, y) -> plus(floorOf(p, x), floorOf(p, y))
+    Bin(Mul, x, y) -> if atLeastZero(floorOf(p, x)) && atLeastZero(floorOf(p, y)) {
+        AtLeast(0)
+    } else { Unbounded }
+    -- The sign bit of either operand clear clears it in the result.
+    Bin(And, x, y) -> if atLeastZero(floorOf(p, x)) || atLeastZero(floorOf(p, y)) {
+        AtLeast(0)
+    } else { Unbounded }
+    -- A remainder has the sign of the dividend.
+    Bin(Rem, x, _) -> if atLeastZero(floorOf(p, x)) { AtLeast(0) } else { Unbounded }
+    -- A logical shift by 1 to 63 clears the sign bit. The machine takes the
+    -- amount modulo 64, so 64 is a shift by nothing.
+    Bin(ShrU, _, y) -> {
+        let by = valueOf(p, y)
+        if by.node == p.zero && by.offset >= 1 && by.offset <= 63 { AtLeast(0) }
+        else { Unbounded }
+    }
+    _ -> Unbounded
+}
+
+fun floorOf(p : Prover, v : Value) -> Floor = floorAt(p, valueOf(p, v))
+
+fun floorAt(p : Prover, a : Affine) -> Floor =
+    if a.node == p.zero { AtLeast(a.offset) }
+    else { match p.floors[a.node] {
+        AtLeast(k) -> if small(k + a.offset) { AtLeast(k + a.offset) } else { Unbounded }
+        other -> other
+    } }
+
+fun plus(a : Floor, b : Floor) -> Floor = match (a, b) {
+    (Unbounded, _) -> Unbounded
+    (_, Unbounded) -> Unbounded
+    (AtLeast(x), AtLeast(y)) -> if small(x + y) { AtLeast(x + y) } else { Unbounded }
+    _ -> Unseen
+}
+
+fun meet(a : Floor, b : Floor) -> Floor = match (a, b) {
+    (Unseen, x) -> x
+    (x, Unseen) -> x
+    (AtLeast(x), AtLeast(y)) -> AtLeast(if x < y { x } else { y })
+    _ -> Unbounded
+}
+
+fun same(a : Floor, b : Floor) -> Bool = match (a, b) {
+    (Unseen, Unseen) -> True
+    (Unbounded, Unbounded) -> True
+    (AtLeast(x), AtLeast(y)) -> x == y
+    _ -> False
+}
+
+fun atLeastZero(a : Floor) -> Bool = match a {
+    AtLeast(k) -> k >= 0
+    _ -> False
+}
+
+-- -- facts -------------------------------------------------------------------------
+
+-- Walk the dominator tree, adding on entry to a block the facts of the one
+-- branch edge that enters it and removing them on the way back out, and
+-- proving each access against the facts in scope.
+fun walk(p : Prover) -> Unit {
+    let f = p.func
+    let idom = Ssa.dominators(f)
+    let preds = Ssa.predecessors(f)
+    let entry = Ssa.blockId(f.entry)
+    let children : Array (Array Int) = []
+    for _ in f.blocks { Array.push(children, []) }
+    for var b = 0; b < len(f.blocks); b = b + 1 {
+        match idom[b] {
+            Some(d) -> if b != entry { Array.push(children[d], b) }
+            None -> {}
+        }
+    }
+    -- The facts added, as their two nodes, and where each block's began.
+    let added : Array (Int, Int) = []
+    let marks = Array.filled(len(f.blocks), 0)
+    -- A block to enter, or `-1 - b` to leave `b`: an explicit stack, because
+    -- a dominator tree can be as deep as the function is long.
+    let stack = [entry]
+    while len(stack) > 0 {
+        let b = stack[len(stack) - 1]
+        let _ = Array.pop(stack)
+        if b < 0 {
+            let left = -1 - b
+            while len(added) > marks[left] {
+                let (x, y) = added[len(added) - 1]
+                let _ = Array.pop(added)
+                let _ = Array.pop(p.above[x])
+                let _ = Array.pop(p.below[y])
+            }
+            continue
+        }
+        marks[b] = len(added)
+        if len(preds[b]) == 1 { enterFrom(p, added, Ssa.blockId(preds[b][0]), b) }
+        for i in f.blocks[b].insts { prove(p, i) }
+        Array.push(stack, -1 - b)
+        for c in children[b] { Array.push(stack, c) }
+    }
+}
+
+-- The facts that hold in `to` because the only edge into it is one arm of
+-- the branch ending `from`.
+fun enterFrom(p : Prover, added : Array (Int, Int), from : Int, to : Int) -> Unit {
+    match p.func.blocks[from].term {
+        Branch(c, yes, no) -> {
+            if Ssa.blockId(yes) == Ssa.blockId(no) { return }
+            match p.defs[Ssa.valueId(c)] {
+                Some(Cmp(op, x, y)) -> if Ssa.repOf(p.func, x).class_ == I64 {
+                    let taken = if Ssa.blockId(yes) == to { op } else { negate(op) }
+                    let (a, b) = (valueOf(p, x), valueOf(p, y))
+                    match taken {
+                        Lt -> assume(p, added, a, b, 1)
+                        Le -> assume(p, added, a, b, 0)
+                        Gt -> assume(p, added, b, a, 1)
+                        Ge -> assume(p, added, b, a, 0)
+                        Eq -> {
+                            assume(p, added, a, b, 0)
+                            assume(p, added, b, a, 0)
+                        }
+                        Ne -> {}
+                    }
+                }
+                _ -> {}
+            }
+        }
+        _ -> {}
+    }
+}
+
+fun negate(op : CmpOp) -> CmpOp = match op {
+    Eq -> Ne
+    Ne -> Eq
+    Lt -> Ge
+    Le -> Gt
+    Gt -> Le
+    Ge -> Lt
+}
+
+-- `a <= b - gap`, as a constraint between their nodes.
+fun assume(p : Prover, added : Array (Int, Int), a : Affine, b : Affine, gap : Int) -> Unit {
+    if a.node == b.node { return }
+    let c = b.offset - a.offset - gap
+    Array.push(p.above[a.node], (b.node, c))
+    Array.push(p.below[b.node], (a.node, c))
+    Array.push(added, (a.node, b.node))
+}
+
+-- -- proofs ------------------------------------------------------------------------
+
+fun prove(p : Prover, i : Low) -> Unit = match i.op {
+    ArrayGet(array, index, Checked) ->
+        if within(p, array, index) { i.op = ArrayGet(array, index, Proven) }
+    ArraySet(array, index, x, Checked) ->
+        if within(p, array, index) { i.op = ArraySet(array, index, x, Proven) }
+    _ -> {}
+}
+
+fun within(p : Prover, array : Value, index : Value) -> Bool =
+    atLeastZero(lowest(p, valueOf(p, index))) && belowLength(p, valueOf(p, index), lengthOf(p, array))
+
+-- The least `a` can be under the facts in scope: a path backwards to a node
+-- whose floor is known.
+fun lowest(p : Prover, a : Affine) -> Floor {
+    var best = floorAt(p, a)
+    for (m, d) in reach(p.below, a.node) {
+        -- `m <= a.node + d`, so `a >= floor(m) - d + a.offset`.
+        let f = if m == p.zero { AtLeast(0) } else { p.floors[m] }
+        match f {
+            AtLeast(k) -> {
+                let at = k - d + a.offset
+                best = match best {
+                    AtLeast(sofar) -> if at > sofar { AtLeast(at) } else { best }
+                    _ -> AtLeast(at)
+                }
+            }
+            _ -> {}
+        }
+    }
+    best
+}
+
+-- Whether `a < length` under the facts in scope: a path forwards from `a`'s
+-- node to the length's, or to zero with the length's floor high enough.
+fun belowLength(p : Prover, a : Affine, length : Affine) -> Bool {
+    let want = length.offset - a.offset - 1
+    for (m, d) in reach(p.above, a.node) {
+        -- `a.node <= m + d`.
+        if m == length.node && d <= want { return True }
+        if m == p.zero {
+            match p.floors[length.node] {
+                AtLeast(k) -> if d <= k + want { return True }
+                _ -> {}
+            }
+        }
+    }
+    False
+}
+
+-- Every node within `rounds` facts of `from` along `edges`, with the
+-- tightest constant found on the way; `from` itself at 0. Bellman-Ford over
+-- the handful of facts in scope, so an array of pairs searched in place is
+-- the right size of map.
+fun reach(edges : Array (Array (Int, Int)), from : Int) -> Array (Int, Int) {
+    let found = [(from, 0)]
+    var frontier = [(from, 0)]
+    for var r = 0; r < rounds && len(frontier) > 0; r = r + 1 {
+        let next = []
+        for (n, d) in frontier {
+            for (m, c) in edges[n] {
+                let through = d + c
+                if relax(found, m, through) { Array.push(next, (m, through)) }
+            }
+        }
+        frontier = next
+    }
+    found
+}
+
+fun relax(found : Array (Int, Int), node : Int, d : Int) -> Bool {
+    for var k = 0; k < len(found); k = k + 1 {
+        let (m, sofar) = found[k]
+        if m == node {
+            if d >= sofar { return False }
+            found[k] = (node, d)
+            return True
+        }
+    }
+    Array.push(found, (node, d))
+    True
+}

@@ -728,6 +728,41 @@ fun existentialRecord(l : Lowerer, e : Expr, info : ConInfo, con : String,
     out
 }
 
+-- A record literal, with its fields evaluated in the order they were written.
+--
+-- The object is built in declaration order, which is its layout, and a field
+-- written out of that order would be evaluated out of order too. So where the
+-- two orders differ, each field is bound first, in the order it was written,
+-- and the record is built from the bindings.
+fun inWrittenOrder(l : Lowerer, con : String, fields : Array (String, Core),
+                   ty : Ty.Type, where : Option Span) -> Core {
+    let declared = match Decls.con(l.decls, con) {
+        Some(ConInfo { fields = Some(names), .. }) -> names
+        _ -> return node(ty, where, CRecord(con, fields))
+    }
+    var inOrder = True
+    for var i = 0; i < len(fields) && i < len(declared); i = i + 1 {
+        if fields[i].0 != declared[i] { inOrder = False }
+    }
+    if inOrder { return node(ty, where, CRecord(con, fields)) }
+    let held = Map.new()
+    for (n, v) in fields { Map.put(held, n, (freshName(l, "field"), v)) }
+    let built = Array.new(len(declared))
+    for n in declared {
+        let (name, v) = match Map.get(held, n) {
+            Some(found) -> found
+            None -> oops("the field '" + n + "' vanished", where)
+        }
+        Array.push(built, (n, node(v.ty, where, CVar(name))))
+    }
+    var out = node(ty, where, CRecord(con, built))
+    for var i = len(fields) - 1; i >= 0; i = i - 1 {
+        let (name, v) = held[fields[i].0]
+        out = node(ty, where, CLet(name, v.ty, v, out, Array.new(0)))
+    }
+    out
+}
+
 fun eta(l : Lowerer, called : Core, result : Ty.Type, where : Option Span) -> Core =
     match Ty.prune(result) {
         TFun(params, ret) -> {
@@ -1185,7 +1220,7 @@ fun dispatch(l : Lowerer, e : Expr, scope : Scope) -> Core {
             }
             let out = Array.new(len(fields))
             for (n, v) in fields { Array.push(out, (n, expr(l, v, scope))) }
-            node(ty, where, CRecord(con, out))
+            inWrittenOrder(l, con, out, ty, where)
         }
         EField(obj, name) -> {
             let target = expr(l, obj, scope)

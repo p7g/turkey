@@ -50,8 +50,9 @@ that each use of it may pick different types for its type variables.
 * **Top-level functions** and **local `fun` declarations** are always
   generalized.
 * **`let` bindings** are generalized only when the right-hand side is a
-  *value*: a literal, a variable, a lambda, a constructor applied to values,
-  or a tuple of values. This is the **value restriction**. A right-hand side
+  *value*: a literal, a variable, a lambda, a constructor of an
+  [immutable](types.md#mutability-and-sharing) type applied to values, or a
+  tuple of values. This is the **value restriction**. A right-hand side
   that calls a function, or creates an array, is not generalized, because
   what it creates might be mutable, and a polymorphic mutable object could be
   written at one type and read at another.
@@ -183,6 +184,17 @@ Read the constraints as: `a` has fields `width` and `height`; `Field.width a`
 is the type of the `width` field; the two fields have the same type; and that
 type can be multiplied. Tuple projection works the same way, with
 `HasProjection 1 a` and `Elem.1 a` for `t.1`.
+
+Assigning a field adds `SetField`, which holds only when the field is declared
+[`var`](types.md#mutability-and-sharing):
+
+```text
+fun deposit(account, amount) {
+    account.balance = account.balance + amount
+}
+-- deposit : [HasField "balance" a, SetField "balance" a,
+--            Add (Field.balance a)] fun(a, Field.balance a) -> Unit
+```
 
 Like `OneOf`, these constraints appear in inferred types but cannot be written
 in a program. Records are still nominal: a type has a field because its

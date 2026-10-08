@@ -27,17 +27,17 @@ import Turkey.Token as Token
 import Turkey.Token (Kind(..), Token(..), Value(..))
 
 type P = P {
-    toks     : Array Token,
-    i        : Int,
-    tycons   : Array String,
-    noRecord : Bool,
-    file     : String,
+    toks         : Array Token,
+    var i        : Int,
+    tycons       : Array String,
+    var noRecord : Bool,
+    file         : String,
     -- How many `\` functions enclose the current position. Inside one, every
     -- `_` is its parameter and no boundary closes a `_` function.
-    explicit : Int,
+    var explicit : Int,
     -- How many `_` placeholders have been read and not yet made into a
     -- parameter. Zero is the common case, and it lets a boundary skip the walk.
-    pending  : Int,
+    var pending  : Int,
 }
 
 fun parse(source : Source, known : Array String) -> Program {
@@ -453,11 +453,12 @@ fun parseConDecl(p : P) -> ConDecl {
     let tok = expectWhat(p, "CONID", "a constructor name")
     let (binders, context) = parseConContext(p)
     if at(p, "{") {
-        let fields = parseRecordPayload(p)
+        let (fields, vars, spans) = parseRecordPayload(p)
         fieldLimit(p, tok, "constructor '" + text(tok) + "'", len(fields))
         return ConDecl {
             span = tok.span, name = text(tok), args = Array.new(0),
-            fields = Some(fields), binders = binders, context = context,
+            fields = Some(fields), vars = vars, fieldSpans = spans,
+            binders = binders, context = context,
         }
     }
     let args = Array.new(2)
@@ -477,7 +478,7 @@ fun parseConDecl(p : P) -> ConDecl {
     }
     ConDecl {
         span = tok.span, name = text(tok), args = args, fields = None,
-        binders = binders, context = context,
+        vars = [], fieldSpans = [], binders = binders, context = context,
     }
 }
 
@@ -492,7 +493,7 @@ fun fieldSeparator(p : P) -> Bool {
     }
     if !at(p, "NEWLINE") { return False }
     skipNewlines(p)
-    if !at(p, "IDENT") && !at(p, "..") && !at(p, "}") {
+    if !at(p, "IDENT") && !at(p, "var") && !at(p, "..") && !at(p, "}") {
         oops(p, "a line break separates fields here, so this line must begin "
                 + "a field; found " + describe(cur(p)), cur(p).span)
     }
@@ -508,13 +509,20 @@ fun fieldLimit(p : P, at : Token, what : String, count : Int) -> Unit {
     }
 }
 
-fun parseRecordPayload(p : P) -> Array (String, Type) {
+-- A record constructor's fields, the names of those declared `var`, and where
+-- each field's name is written.
+fun parseRecordPayload(p : P) -> (Array (String, Type), Array String, Array Span) {
     skipToken(p, "{")
     skipNewlines(p)
     let fields = Array.new(4)
+    let vars = []
+    let spans = []
     let seen = Array.new(4)
     while !at(p, "}") {
+        let assignable = eat(p, "var")
         let tok = expectWhat(p, "IDENT", "a field name")
+        if assignable { Array.push(vars, text(tok)) }
+        Array.push(spans, tok.span)
         if Array.contains(seen, text(tok)) {
             oops(p, "duplicate field '" + text(tok) + "'", tok.span)
         }
@@ -524,7 +532,7 @@ fun parseRecordPayload(p : P) -> Array (String, Type) {
         if !fieldSeparator(p) { break }
     }
     skipToken(p, "}")
-    fields
+    (fields, vars, spans)
 }
 
 -- -- type expressions ----------------------------------------------------------------

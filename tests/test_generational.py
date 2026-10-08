@@ -35,7 +35,7 @@ def _agrees(src: str) -> None:
 # cell, and a map's table. Every stored string is built in the iteration that
 # stores it, so it is young whenever its container is old.
 CONTAINERS = """
-type Latest = Latest { text : String, count : Int }
+type Latest = Latest { var text : String, var count : Int }
 
 var latest = Latest { text = "", count = 0 }
 

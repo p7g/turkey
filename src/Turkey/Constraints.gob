@@ -56,7 +56,7 @@ import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..))
 import Turkey.Diag as Diag
 import Turkey.Solved (Scope(..), Abstraction(..), Use(..), dictName, newScope)
-import Turkey.Source (Span(..))
+import Turkey.Source (Span(..), showSpan)
 import Turkey.Typed as Typed
 import Turkey.Types as Ty
 import Turkey.Types (VarCell(..), ConCell(..), Scheme(..), Pred(..),
@@ -111,9 +111,9 @@ type Constraint
 -- A deferred predicate keeps its identity across rounds, and `improve` rewrites
 -- its arguments where it stands, so it is a record rather than a variant field.
 type PredCell = PredCell {
-    pred    : Pred,
-    span    : Option Span,
-    context : String,
+    var pred : Pred,
+    span     : Option Span,
+    context  : String,
 }
 
 fun cpredOf(p : Pred, where : Option Span, context : String) -> Constraint =
@@ -175,24 +175,24 @@ fun lookup_(e : Env, name : String) -> Option Binding {
 -- -- the solver --------------------------------------------------------------------
 
 type Solver = Solver {
-    decls      : DeclTable,
-    classes    : ClassTable,
-    env        : Env,
-    visibleCons : Set.Set String,
+    decls           : DeclTable,
+    classes         : ClassTable,
+    var env         : Env,
+    visibleCons     : Set.Set String,
     -- Predicates a `CAssume` currently grants. A stack in effect, restored on
     -- the way out of each one.
-    assumptions : Array Pred,
+    var assumptions : Array Pred,
     -- The dictionary scopes open at the point being solved, innermost last. A
     -- `Use` keeps the records rather than their contents, because what a binder
     -- makes available is only known once its definition is solved.
-    scopes     : Array Scope,
-    uses       : Array Use,
+    scopes          : Array Scope,
+    uses            : Array Use,
     -- `pools[r]` holds the variables born at rank r.
-    pools      : Array (Array VarCell),
+    pools           : Array (Array VarCell),
     -- Predicates that could not be settled yet.
-    deferred   : Array PredCell,
+    var deferred    : Array PredCell,
     -- Schemes of every name a top-level `CLet` bound, for the `types` command.
-    topLevel   : Env,
+    topLevel        : Env,
 }
 
 fun newSolver(decls : DeclTable, env : Env, classes : ClassTable,
@@ -834,7 +834,7 @@ fun classRule(s : Solver, c : PredCell) -> Bool {
 -- predicate when its caller instantiates it at an abstract record type.
 fun checkFieldVisibility(s : Solver, p : Pred, receiver : Ty.Type,
                          c : PredCell) -> Unit {
-    let label = match Classes.generatedLabel(p.name) {
+    let label = match fieldLabel(p.name) {
         Some(l) -> l
         None -> return
     }
@@ -864,10 +864,13 @@ fun checkFieldVisibility(s : Solver, p : Pred, receiver : Ty.Type,
 -- as field errors.
 fun noField(s : Solver, p : Pred, receiver : Ty.Type, c : PredCell) -> Unit {
     let (h, _) = Ty.spine(receiver)
-    match Classes.generatedLabel(p.name) {
+    match fieldLabel(p.name) {
         Some(label) -> {
             match h {
                 TCon(con) -> {
+                    if Option.isSome(Classes.setterLabel(p.name)) {
+                        notVar(s, con.name, label, c)
+                    }
                     match Decls.recordFields(s.decls, con.name) {
                         Some(names) -> if !Array.contains(names, label) {
                             oops("type '" + con.name + "' has no field '" + label
@@ -913,6 +916,30 @@ fun noField(s : Solver, p : Pred, receiver : Ty.Type, c : PredCell) -> Unit {
                             + " is out of bounds for '" + Ty.show(receiver)
                             + "', which has " + Int.toString(len(elems))
                             + " element(s)", c.span)
+    }
+}
+
+-- The field a generated class reads or writes.
+fun fieldLabel(cls : String) -> Option String = match Classes.generatedLabel(cls) {
+    Some(label) -> Some(label)
+    None -> Classes.setterLabel(cls)
+}
+
+-- An assignment to a field the record has but did not declare `var`. Named with
+-- its declaration, because that is where the fix goes, and the assignment may
+-- be in another function -- or, for a polymorphic receiver, the error is
+-- reported at the call that supplied the record type.
+fun notVar(s : Solver, tycon : String, label : String, c : PredCell) -> Unit {
+    match Decls.varFields(s.decls, tycon) {
+        Some(vars) -> if Array.contains(vars, label) { return {} }
+        None -> return {}
+    }
+    match Decls.fieldSpan(s.decls, tycon, label) {
+        Some(at) -> oops("cannot assign to field '" + label + "': it is not 'var' in '"
+            + Ty.shortName(tycon) + "' (declared at " + at.file + ":"
+            + showSpan(at) + "). Declare it 'var " + label
+            + "' to make it assignable.", c.span)
+        None -> {}
     }
 }
 
@@ -1081,7 +1108,7 @@ fun rejectStranded(s : Solver, stranded : Array PredCell) -> Unit {
             TFam(name, _, _) -> Classes.fieldFamilyOwner(name)
             _ -> "?"
         }
-        match Classes.generatedLabel(owner) {
+        match fieldLabel(owner) {
             Some(label) -> oops("cannot determine the type of the value whose "
                 + "field '" + label + "' is being accessed. Add a type "
                 + "annotation.", c.span)
@@ -1108,7 +1135,7 @@ fun rejectStranded(s : Solver, stranded : Array PredCell) -> Unit {
              + where + ": nothing says which '" + cls + "' instance defines it. "
              + "Add '" + equality + "' to the context.", c.span)
     }
-    match Classes.generatedLabel(c.pred.name) {
+    match fieldLabel(c.pred.name) {
         Some(label) -> oops("cannot determine the type of the value whose field '"
              + label + "' is being accessed. Add a type annotation.", c.span)
         None -> {}

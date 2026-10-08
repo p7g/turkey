@@ -39,7 +39,7 @@ def function(asm: str, name: str) -> list[str]:
 
 def test_a_store_to_a_mutable_field_is_ordered_after_earlier_loads(tmp_path):
     asm = assembly(tmp_path, """
-type Counter = Counter { count : Int }
+type Counter = Counter { var count : Int }
 
 fun bump(c : Counter) -> Unit { c.count = c.count + 1 }
 

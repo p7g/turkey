@@ -4,7 +4,7 @@ from tests import lang
 
 OPAQUE = {
     "Tok.gob": """module Tok (Token, make, read)
-type Token = Token { value : Int }
+type Token = Token { var value : Int }
 fun make(n : Int) -> Token = Token { value = n }
 fun read(t : Token) -> Int = t.value
 """

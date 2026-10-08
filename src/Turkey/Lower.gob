@@ -103,20 +103,20 @@ fun moduleOf(name : String) -> String = match String.rsplitOnce(name, "#") {
 -- `let`, and making a cell for it anyway would put an indirection on every
 -- argument of every function for no observable gain.
 type Scope = Scope {
-    cells   : Set.Set String,
+    cells    : Set.Set String,
     -- Name -> what it abstracts over, for the local bindings in scope. A
     -- *recursive* occurrence needs this and nothing else does: inference binds a
     -- name monomorphically inside its own definition, so a self-call records no
     -- type arguments -- correctly, there is nothing yet to record. System F
     -- still wants the application, at the binding's own variables.
-    binders : Map String (Array VarCell),
+    binders  : Map String (Array VarCell),
     -- Where a `return`, a `break` and a `continue` written here jump to. Each is
     -- a join name, or absent where writing that transfer would have been a
     -- compile error anyway. This is what replaces "the transfer names its target
     -- by where it sits": the scope chain already knows where it sits.
-    ret     : Option String,
-    brk     : Option String,
-    cont    : Option String,
+    var ret  : Option String,
+    var brk  : Option String,
+    var cont : Option String,
 }
 
 fun newScope() -> Scope = Scope {
@@ -142,12 +142,12 @@ type Lowerer = Lowerer {
     -- While a method body is being lowered: which rigid constant in it stands
     -- for which quantified variable. Empty everywhere else, because nothing else
     -- is checked against skolems.
-    rigid        : Map String VarCell,
+    var rigid    : Map String VarCell,
     -- Surface expressions already lowered, and what they lowered to. Only
     -- A-normalization puts anything here, and only for as long as it takes to
     -- rebuild one node around its operands.
     placeholders : Map Int Core,
-    counter      : Int,
+    var counter  : Int,
     -- Which constructors `Prim.targetOs` and `Prim.targetArch` stand for.
     target       : Target.Target,
     -- And the build primitives (`Turkey.Build`).
@@ -453,39 +453,34 @@ fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
 }
 
 fun accessors(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
-    let label = Classes.generatedLabel(inst.cls)
-    var fam = ""
-    var held = Ty.tUnit()
-    for (name, ty) in Map.entries(inst.families) {
-        fam = name
-        held = ty
-    }
-    discard(fam)
     let span = Some(inst.decl.span)
     let target = CParam { name = "%r", ty = inst.head }
     let receiver = node(inst.head, span, CVar(target.name))
-    let read = match label {
-        Some(name) -> node(held, span, CField(receiver, name))
-        None -> match Classes.generatedIndex(inst.cls) {
-            Some(index) -> node(held, span, CProject(receiver, index))
-            None -> oops("'" + inst.cls + "' is not a generated class", span)
-        }
-    }
-    let fields = [("get", node(TFun([inst.head], held), span,
-                               CLam([target], read, instName(inst) + "#get")))]
-    match label {
+    let fields = match Classes.setterLabel(inst.cls) {
         Some(name) -> {
+            let held = Decls.fieldType(l.decls, inst.head, name)
             let written = CParam { name = "%v", ty = held }
-            let slot = node(held, span,
-                            CField(node(inst.head, span, CVar(target.name)), name))
-            Array.push(fields, ("set", node(
+            let slot = node(held, span, CField(receiver, name))
+            [("set", node(
                 TFun([inst.head, held], Ty.tUnit()), span,
                 CLam([target, written],
                      node(Ty.tUnit(), span,
                           CAssign(slot, node(held, span, CVar(written.name)))),
-                     instName(inst) + "#set"))))
+                     instName(inst) + "#set")))]
         }
-        None -> {}
+        None -> {
+            var held = Ty.tUnit()
+            for (_, ty) in Map.entries(inst.families) { held = ty }
+            let read = match Classes.generatedLabel(inst.cls) {
+                Some(name) -> node(held, span, CField(receiver, name))
+                None -> match Classes.generatedIndex(inst.cls) {
+                    Some(index) -> node(held, span, CProject(receiver, index))
+                    None -> oops("'" + inst.cls + "' is not a generated class", span)
+                }
+            }
+            [("get", node(TFun([inst.head], held), span,
+                          CLam([target], read, instName(inst) + "#get")))]
+        }
     }
     let record = node(result, span, CRecord(dictConName(inst.cls), fields))
     let b = newBind(instName(inst), result, instanceBinders(inst), record, span)

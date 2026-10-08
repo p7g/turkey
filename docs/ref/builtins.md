@@ -153,7 +153,7 @@ linked list or a generated sequence:
 <!-- run -->
 ```kotlin
 type Countdown = Countdown { from : Int }
-type CountdownCursor = CountdownCursor { current : Int }
+type CountdownCursor = CountdownCursor { var current : Int }
 
 instance Iterator Countdown {
     type Item = Int

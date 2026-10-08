@@ -1,11 +1,12 @@
 module Turkey.Decls (
     ConInfo(..), isRecord,
-    TyconInfo(..), isMutableRecord,
+    TyconInfo(..), isPlainRecord, isMutable,
     FamilyInfo(..),
     ForeignInfo(..),
     DeclTable(..), newDeclTable,
     head, registerAll, settleKinds,
-    star, toType, instantiateCon, con, recordFields, existentialFields,
+    star, toType, instantiateCon, con, recordFields, varFields, fieldSpan,
+    existentialFields,
     fieldType, projectionTypes,
     substitute, newtypes, erasedPayload, conFieldTypes, conFieldTypesOpened,
     variantCount, Compact(..), compactShape, compactOf,
@@ -39,6 +40,10 @@ type ConInfo = ConInfo {
     name   : String,
     tycon  : String,
     fields : Option (Array String),
+    -- The fields declared `var`. Only a plain record has any.
+    vars   : Array String,
+    -- Where each field's name is declared, parallel to `fields`.
+    fieldSpans : Array Span,
     arity  : Int,
     -- Always `forall params. fun(args...) -> tycon params`. An existential's
     -- context is the scheme's `preds`.
@@ -63,12 +68,18 @@ type TyconInfo = TyconInfo {
     kind      : Kind,
 }
 
--- Mutable exactly when there is one variant carrying a record payload, and it
--- is not existential: an existential's fields cannot be assigned, since a write
--- would have to know the hidden type.
-fun isMutableRecord(t : TyconInfo) -> Bool =
+-- One variant carrying a record payload, and not existential: the types whose
+-- fields are read with `.`, and the only ones that may declare a field `var`.
+-- An existential's fields cannot be assigned, since a write would have to know
+-- the hidden type.
+fun isPlainRecord(t : TyconInfo) -> Bool =
     len(t.variants) == 1 && isRecord(t.variants[0])
         && len(t.variants[0].exists) == 0
+
+-- Whether a value of the type can change after it is built: some field is
+-- `var`. A type without one is immutable, records included.
+fun isMutable(t : TyconInfo) -> Bool =
+    isPlainRecord(t) && len(t.variants[0].vars) > 0
 
 -- An associated type family, as the type language sees it.
 --
@@ -131,10 +142,10 @@ type DeclTable = DeclTable {
     -- drop one, and by the backends, which export each under its symbol.
     definitions  : Map String ForeignInfo,
     -- `newtypes`, computed once the declarations are all in.
-    newtypeNames : Option (Set.Set String),
+    var newtypeNames : Option (Set.Set String),
     -- Existential constructors whose contexts name classes, until the class
     -- table has the classes to check them against.
-    uncheckedContexts : Array (ConInfo, ConDecl),
+    var uncheckedContexts : Array (ConInfo, ConDecl),
 }
 
 fun newDeclTable() -> DeclTable {
@@ -377,8 +388,10 @@ fun resolveVariants(t : DeclTable, decl : TypeDecl) -> Unit {
                 }
                 if !present { Array.push(s.quantified, cell) }
             }
+            checkVars(decl, c, variants)
             let cinfo = ConInfo {
                 name = c.name, tycon = decl.name, fields = names,
+                vars = c.vars, fieldSpans = c.fieldSpans,
                 arity = len(argTypes), scheme = s, exists = hidden,
                 existsNames = hiddenVariables(c),
             }
@@ -387,6 +400,34 @@ fun resolveVariants(t : DeclTable, decl : TypeDecl) -> Unit {
             Map.put(t.constructors, c.name, cinfo)
         }
     }
+}
+
+-- `var` only where an assignment could name the field. `x.f = v` names a
+-- field of whatever `x` is, so in a type with several constructors it would
+-- name a field the value may not have; and an existential record's field has a
+-- type that only an opening can name.
+fun checkVars(decl : TypeDecl, c : ConDecl, variants : Array ConDecl) -> Unit {
+    if len(c.vars) == 0 { return {} }
+    let at = Some(firstVarSpan(c))
+    if len(variants) > 1 {
+        oops("field '" + c.vars[0] + "' cannot be 'var': '" + decl.name
+             + "' has more than one constructor, and an assignment cannot name a "
+             + "field that only some of its values have", at)
+    }
+    if len(hiddenVariables(c)) > 0 {
+        oops("field '" + c.vars[0] + "' cannot be 'var': '" + c.name
+             + "' is existential, and an assignment cannot name the type a "
+             + "hidden field holds", at)
+    }
+}
+
+fun firstVarSpan(c : ConDecl) -> Span {
+    if let Some(fs) = c.fields {
+        for var i = 0; i < len(fs); i = i + 1 {
+            if fs[i].0 == c.vars[0] { return c.fieldSpans[i] }
+        }
+    }
+    c.span
 }
 
 fun firstOfPair(p : (String, Type)) -> String {
@@ -549,17 +590,42 @@ fun con(t : DeclTable, name : String) -> Option ConInfo = Map.get(t.constructors
 
 -- -- record field lookup ------------------------------------------------------------
 
--- The named type's field names, or `None` if it is not a mutable record.
+-- The named type's field names, or `None` if it is not a plain record.
 fun recordFields(t : DeclTable, name : String) -> Option (Array String) =
     match Map.get(t.tycons, name) {
         None -> None
-        Some(info) -> if isMutableRecord(info) { info.variants[0].fields } else { None }
+        Some(info) -> if isPlainRecord(info) { info.variants[0].fields } else { None }
+    }
+
+-- The named type's `var` fields, or `None` if it is not a plain record.
+fun varFields(t : DeclTable, name : String) -> Option (Array String) =
+    match Map.get(t.tycons, name) {
+        None -> None
+        Some(info) -> if isPlainRecord(info) { Some(info.variants[0].vars) } else { None }
+    }
+
+-- Where a plain record's field is declared.
+fun fieldSpan(t : DeclTable, name : String, label : String) -> Option Span =
+    match Map.get(t.tycons, name) {
+        Some(info) -> if isPlainRecord(info) {
+            let c = info.variants[0]
+            match c.fields {
+                Some(names) -> match Array.indexOf(names, label) {
+                    Some(i) -> if i < len(c.fieldSpans) { Some(c.fieldSpans[i]) } else { None }
+                    None -> None
+                }
+                None -> None
+            }
+        } else {
+            None
+        }
+        None -> None
     }
 
 -- The field names of a one-variant existential record, or None.
 --
 -- `recordFields` answers None for one of these, because an existential record
--- is not a mutable record: assigning a field would let a hidden variable out,
+-- is not a plain record: assigning a field would let a hidden variable out,
 -- and reading one has no type to read it at. But "not a single-variant record
 -- type" is then the wrong thing to say, since it *is* one -- which is exactly
 -- why it has a field worth asking about.
@@ -622,9 +688,9 @@ fun fieldType(t : DeclTable, receiver : Ty.Type, label : String) -> Ty.Type {
 -- its payload's type is a variable that means nothing outside an opening.
 --
 -- Records are excluded, and this is the reason there is a rule rather than a
--- check for one variant and one field: a single-variant record is mutable, and
--- assigning through two names for one box is exactly the identity that erasure
--- would take away.
+-- check for one variant and one field: a single-variant record may declare its
+-- field `var`, and assigning through two names for one box is exactly the
+-- identity that erasure would take away.
 --
 -- Recursion is excluded because it is what erasure cannot terminate on. A
 -- wrapper is erased into its payload, so `type Loop = Loop(Loop)` has no

@@ -87,7 +87,7 @@ def test_a_coroutine_suspends_deep_inside_ordinary_calls(coroutines):
     what only those frames hold survives the collections the resumer's
     allocations cause while they are parked."""
     out = agrees(coroutines, """
-type Box = Box { value : Int, items : Array String }
+type Box = Box { var value : Int, var items : Array String }
 
 fun deep(box : Box, n : Int) -> Unit {
     if n == 0 {

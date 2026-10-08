@@ -170,7 +170,7 @@ field ::= postfix "." IDENT
 
 `e.name` reads a field of a [record](types.md#records). The type of `e` must
 have exactly one constructor, and that constructor must be a record with a
-field called `name`. Fields of a mutable record can also be assigned:
+field called `name`. A field declared `var` can also be assigned:
 `e.name = value` ([Assignment](statements.md#assignment)).
 
 The type of `e` does not need to be known where the field is read. A function

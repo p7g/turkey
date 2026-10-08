@@ -81,9 +81,9 @@ fun unaryOp(op : String) -> Option (Ty.Type, Ty.Type) = match op {
 
 type LoopCtx = LoopCtx {
     -- loop | while | for
-    kind     : String,
-    result   : Ty.Type,
-    sawBreak : Bool,
+    kind         : String,
+    var result   : Ty.Type,
+    var sawBreak : Bool,
 }
 
 -- One existential under construction: the variables and constraints so far.
@@ -105,11 +105,11 @@ type Generator = Generator {
     frames      : Array Frame,
     -- Name -> mutable. Types are the solver's business; this is only what
     -- generation needs to reject an undefined name or a write to a `let`.
-    scopes      : Array (Map String Bool),
-    fnStack     : Array Ty.Type,
-    loopStack   : Array LoopCtx,
-    tyvarScopes : Array (Map String Ty.Type),
-    warnings    : Array String,
+    scopes        : Array (Map String Bool),
+    fnStack       : Array Ty.Type,
+    var loopStack : Array LoopCtx,
+    tyvarScopes   : Array (Map String Ty.Type),
+    warnings      : Array String,
     -- Exhaustiveness runs after solving, when scrutinee types are known.
     matchSites  : Array (Expr, Ty.Type),
     -- And irrefutability: every pattern that binds with no second arm to fall
@@ -1829,7 +1829,8 @@ fun familyResult(g : Generator, fam : String) -> Ty.Kind =
         None -> oops("'" + fam + "' was not declared", None)
     }
 
--- Emit `%HasField.f r` for `r.f` and hand back `%Field.f r`.
+-- Emit `%HasField.f r` for `r.f` and hand back `%Field.f r`. An assignment to
+-- `r.f` emits `%SetField.f r` beside it, which only a `var` field satisfies.
 --
 -- Nothing is decided here. If the receiver turns out to be known the solver
 -- finds the generated instance and the family reduces to the declared field
@@ -1851,6 +1852,11 @@ fun genField(g : Generator, e : Expr, assigning : Bool) -> Ty.Type =
             discard(Classes.ensureGenerated(g.classes, cls))
             emit(g, C.cpredOf(Ty.pred(cls, [receiver]), Some(e.span),
                 if assigning { "mutate" } else { "read" }))
+            if assigning {
+                let setter = Classes.setterClass(name)
+                discard(Classes.ensureGenerated(g.classes, setter))
+                emit(g, C.cpredOf(Ty.pred(setter, [receiver]), Some(e.span), "mutate"))
+            }
             let fam = Classes.fieldFamily(name)
             TFam(fam, receiver, familyResult(g, fam))
         }
@@ -2032,7 +2038,7 @@ fun isNonexpansive(g : Generator, e : Expr) -> Bool = match e.kind {
 fun immutableCon(g : Generator, name : String) -> Bool = match Decls.con(g.decls, name) {
     None -> False
     Some(info) -> match Map.get(g.decls.tycons, info.tycon) {
-        Some(t) -> !Decls.isMutableRecord(t)
+        Some(t) -> !Decls.isMutable(t)
         None -> False
     }
 }

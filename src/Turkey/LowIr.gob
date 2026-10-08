@@ -23,12 +23,12 @@ module Turkey.LowIr (
 -- **An opcode is a constructor where a pass must match on it, and a call
 -- where most passes need only know that it is one.** Arithmetic, comparison
 -- and the heap operations are constructors, because instruction selection is a
--- match over them and must be exhaustive. A primitive the runtime implements,
--- or one of the few selection writes out in place, is a `Call` whose callee
--- says which (`Runtime`, `Intrinsic`): the passes that care match on the
--- callee, and the instruction set does not grow a constructor per primitive.
--- That is the line, and it is what keeps this set at two dozen rather than the
--- hundreds Go's `Op` has.
+-- match over them and must be exhaustive. A primitive the runtime implements
+-- is a `Call` whose callee says which, and the few that are a short machine
+-- sequence with no instruction here are one `Intrinsic` op that says which:
+-- the instruction set does not grow a constructor per primitive. That is the
+-- line, and it is what keeps this set at two dozen rather than the hundreds
+-- Go's `Op` has.
 --
 -- **The level is the runtime's ABI.** `ObjectGet(p, 3)` and not an address
 -- computation, because that is one-to-one with what the allocator in
@@ -99,8 +99,10 @@ type Conv
 -- a fallback arm, which a new opcode would fall into without a word.
 type IndexCheck = Checked | Proven
 
--- The primitives that are a few instructions on arm64 and are selected as
--- such, though they reach selection as calls.
+-- The primitives that are a few instructions on arm64 and no instruction of
+-- this IR: a float's bits and back, two float predicates, and whether an
+-- integer is a scalar value. Each takes one operand, and none touches memory
+-- or traps.
 type Intrinsic = CharIsScalar | FloatBits | FloatFromBits | FloatIsNaN | FloatFitsInt
 
 fun intrinsicName(k : Intrinsic) -> String = match k {
@@ -111,15 +113,27 @@ fun intrinsicName(k : Intrinsic) -> String = match k {
     FloatFitsInt -> "Prim.floatFitsInt"
 }
 
+fun intrinsicOperand(k : Intrinsic) -> RepClass = match k {
+    CharIsScalar -> I64
+    FloatBits -> F64
+    FloatFromBits -> I64
+    FloatIsNaN -> F64
+    FloatFitsInt -> F64
+}
+
+fun intrinsicResult(k : Intrinsic) -> RepClass = match k {
+    CharIsScalar -> I1
+    FloatBits -> I64
+    FloatFromBits -> F64
+    FloatIsNaN -> I1
+    FloatFitsInt -> I1
+}
+
 type Callee
     -- A Turkey function, by its mangled symbol.
     = Direct(String)
     -- A runtime entry point.
     | Runtime(Rt.Routine)
-    -- A primitive instruction selection writes out in place, as the call
-    -- would be. A call still to everything before selection: a safepoint,
-    -- and an effect on everything.
-    | Intrinsic(Intrinsic)
     -- A C symbol a `foreign` declaration named. Separate from
     -- `Runtime` because the two are resolved differently: a runtime entry
     -- point is looked up in `Turkey.Runtime`'s fixed table, and this one is
@@ -157,6 +171,7 @@ type Op
     | Neg(Value)
     | Not(Value)
     | Convert(Conv, Value)
+    | Intrinsic(Intrinsic, Value)
     -- A heap object, allocated and initialized in one instruction: `kind` and
     -- `tag` as the runtime understands them, the field metadata (three bits of
     -- representation per field for kinds 0 and 1, one trace bit per slot for an
@@ -361,6 +376,7 @@ fun effectsOf(op : Op) -> Effects = match op {
     Neg(_) -> Ssa.traps()
     Not(_) -> empty()
     Convert(_, _) -> empty()
+    Intrinsic(_, _) -> empty()
     ObjectNew(_, _, _, _, _) -> Ssa.allocates()
     ObjectGet(_, _) -> Ssa.reads_()
     ObjectSet(_, _, _) -> Ssa.writes()
@@ -423,6 +439,7 @@ fun opUses(op : Op) -> Array Value = match op {
     Neg(a) -> [a]
     Not(a) -> [a]
     Convert(_, a) -> [a]
+    Intrinsic(_, a) -> [a]
     ObjectNew(_, _, _, fields, _) -> fields
     ObjectGet(a, _) -> [a]
     ObjectSet(a, _, b) -> [a, b]
@@ -475,6 +492,7 @@ fun mapUses(op : Op, f : fun(Value) -> Value) -> Op = match op {
     Neg(a) -> Neg(f(a))
     Not(a) -> Not(f(a))
     Convert(a, b) -> Convert(a, f(b))
+    Intrinsic(k, a) -> Intrinsic(k, f(a))
     ObjectNew(a, b, c, d, e) -> ObjectNew(a, b, c, Array.map(d, f), e)
     ObjectGet(a, b) -> ObjectGet(f(a), b)
     ObjectSet(a, b, c) -> ObjectSet(f(a), b, f(c))
@@ -545,6 +563,7 @@ fun opResultRep(op : Op) -> Option Rep = match op {
     Poll -> Some(Ssa.untraced(Unit))
     Atomic(_, _) -> Some(Ssa.untraced(I64))
     ArrayLength(_) -> Some(Ssa.untraced(I64))
+    Intrinsic(k, _) -> Some(Ssa.untraced(intrinsicResult(k)))
     CellNew(_) -> Some(Ssa.traced(Ptr))
     ClosureNew(_, _) -> Some(Ssa.traced(Ptr))
     StackObject(_, _, _, _) -> Some(Ssa.traced(Ptr))
@@ -578,6 +597,8 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Array String {
         Bin(_, a, b) -> sameRep(f, out, a, b, "the operands of a binary operation")
         Cmp(_, a, b) -> sameRep(f, out, a, b, "the operands of a comparison")
         Not(a) -> wantClass(f, out, a, I1, "the operand of a logical not")
+        Intrinsic(k, a) ->
+            wantClass(f, out, a, intrinsicOperand(k), "the operand of " + intrinsicName(k))
         ArrayGet(_, index, _) -> wantClass(f, out, index, I64, "an array index")
         ArraySet(_, index, _, _) -> wantClass(f, out, index, I64, "an array index")
         ArrayNew(length, _, _) -> wantClass(f, out, length, I64, "an array length")
@@ -745,7 +766,6 @@ fun allocatingOp(op : Op) -> Option String = match op {
         Rt.SwapStack -> Some("switches stacks, and the code it switches to may allocate")
         Rt.Exit -> None
     }
-    Call(Intrinsic(_), _) -> None
     -- Said the way the source would say it, since the reader of this wrote
     -- source: which construct lowered to the allocation is the question.
     ObjectNew(_, _, _, _, _) ->
@@ -859,6 +879,7 @@ fun showOpName(op : Op) -> String = match op {
     Neg(_) -> "neg"
     Not(_) -> "not"
     Convert(c, _) -> show(c)
+    Intrinsic(k, _) -> intrinsicName(k)
     ObjectNew(_, _, _, _, _) -> "object.new"
     ObjectGet(_, _) -> "object.get"
     ObjectSet(_, _, _) -> "object.set"
@@ -881,7 +902,6 @@ fun showOpName(op : Op) -> String = match op {
     Call(callee, _) -> match callee {
         Direct(_) -> "call.direct"
         Runtime(_) -> "call.runtime"
-        Intrinsic(_) -> "call.intrinsic"
         Foreign(_) -> "call.foreign"
         Indirect(_) -> "call.indirect"
     }
@@ -920,6 +940,7 @@ instance Show Op {
     Neg(a) -> "neg " + v(a)
     Not(a) -> "not " + v(a)
     Convert(c, a) -> show(c) + " " + v(a)
+    Intrinsic(k, a) -> intrinsicName(k) + " " + v(a)
     ObjectNew(kind, tag, bitmap, fields, mutable) ->
         "object.new kind=" + Int.toString(kind) + " tag=" + Int.toString(tag)
         + " count=" + Int.toString(len(fields)) + " bitmap=" + Int.toString(bitmap) + " mutable=" + Int.toString(mutable)
@@ -972,7 +993,6 @@ instance Show Callee {
   fun show(c) = match c {
     Direct(name) -> "@" + name
     Runtime(r) -> "%" + Rt.routineName(r)
-    Intrinsic(k) -> "%" + intrinsicName(k)
     Foreign(name) -> "&" + name
     Indirect(f) -> v(f)
   }

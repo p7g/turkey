@@ -1,5 +1,5 @@
 module Turkey.LowIr (
-    BinOp(..), CmpOp(..), Conv(..), IndexCheck(..), AtomicOp(..), Callee(..), Op(..), Low(..), AddressOf(..),
+    BinOp(..), CmpOp(..), Conv(..), IndexCheck(..), AtomicOp(..), Callee(..), Intrinsic(..), intrinsicName, Op(..), Low(..), AddressOf(..),
     low, effectsOf, opUses, mapUses, opResultRep, checkReps, checkCalls, showOpName,
     Allocation(..), summarize, allocatingOp,
     Builder(..), builder, into, emit, effect, terminate, block, param,
@@ -20,13 +20,14 @@ module Turkey.LowIr (
 -- nothing left to check, which is a whole class of malformed IR that cannot be
 -- built.
 --
--- **An opcode is a constructor where a pass must match on it, and a symbol is
--- a string where none does.** Arithmetic, comparison and the heap operations
--- are constructors, because instruction selection is a match over them and
--- must be exhaustive. A call to a runtime function is opaque -- no pass asks
--- *which* runtime function, only that it is one -- so the symbol is a string
--- and the instruction set does not grow a constructor per primitive. That is
--- the line, and it is what keeps this set at two dozen rather than the
+-- **An opcode is a constructor where a pass must match on it, and a call
+-- where most passes need only know that it is one.** Arithmetic, comparison
+-- and the heap operations are constructors, because instruction selection is a
+-- match over them and must be exhaustive. A primitive the runtime implements,
+-- or one of the few selection writes out in place, is a `Call` whose callee
+-- says which (`Runtime`, `Intrinsic`): the passes that care match on the
+-- callee, and the instruction set does not grow a constructor per primitive.
+-- That is the line, and it is what keeps this set at two dozen rather than the
 -- hundreds Go's `Op` has.
 --
 -- **The level is the runtime's ABI.** `ObjectGet(p, 3)` and not an address
@@ -37,6 +38,7 @@ module Turkey.LowIr (
 -- in two places. Instruction selection expands these; that is its job.
 
 import Data.Map as Map
+import Turkey.Runtime as Rt
 import Turkey.Source (Span)
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..),
@@ -97,11 +99,27 @@ type Conv
 -- a fallback arm, which a new opcode would fall into without a word.
 type IndexCheck = Checked | Proven
 
+-- The primitives that are a few instructions on arm64 and are selected as
+-- such, though they reach selection as calls.
+type Intrinsic = CharIsScalar | FloatBits | FloatFromBits | FloatIsNaN | FloatFitsInt
+
+fun intrinsicName(k : Intrinsic) -> String = match k {
+    CharIsScalar -> "Prim.charIsScalar"
+    FloatBits -> "Prim.floatBits"
+    FloatFromBits -> "Prim.floatFromBits"
+    FloatIsNaN -> "Prim.floatIsNaN"
+    FloatFitsInt -> "Prim.floatFitsInt"
+}
+
 type Callee
     -- A Turkey function, by its mangled symbol.
     = Direct(String)
-    -- A runtime entry point. Opaque: nothing matches on which one.
-    | Runtime(String)
+    -- A runtime entry point.
+    | Runtime(Rt.Routine)
+    -- A primitive instruction selection writes out in place, as the call
+    -- would be. A call still to everything before selection: a safepoint,
+    -- and an effect on everything.
+    | Intrinsic(Intrinsic)
     -- A C symbol a `foreign` declaration named. Separate from
     -- `Runtime` because the two are resolved differently: a runtime entry
     -- point is looked up in `Turkey.Runtime`'s fixed table, and this one is
@@ -723,12 +741,11 @@ fun allocatingOp(op : Op) -> Option String = match op {
     Call(Direct(_), _) -> None
     Call(Foreign(_), _) -> None
     Call(Indirect(_), _) -> Some("calls through a closure or a dictionary")
-    Call(Runtime(name), _) ->
-        if name == "Prim.swapStack" {
-            Some("switches stacks, and the code it switches to may allocate")
-        }
-        else if nonAllocatingRuntime(name) { None }
-        else { Some("calls the runtime's " + name) }
+    Call(Runtime(r), _) -> match r {
+        Rt.SwapStack -> Some("switches stacks, and the code it switches to may allocate")
+        Rt.Exit -> None
+    }
+    Call(Intrinsic(_), _) -> None
     -- Said the way the source would say it, since the reader of this wrote
     -- source: which construct lowered to the allocation is the question.
     ObjectNew(_, _, _, _, _) ->
@@ -743,10 +760,6 @@ fun allocatingOp(op : Op) -> Option String = match op {
     _ -> if effectsOf(op).allocates { Some("allocates (" + showOpName(op) + ")") }
          else { None }
 }
-
--- The runtime entry points that make nothing. Listed rather than defaulted:
--- a new entry point is assumed to allocate until someone says otherwise.
-fun nonAllocatingRuntime(name : String) -> Bool = name == "Prim.exit"
 
 -- Every function that may allocate, and why; a function not in the answer
 -- does not.
@@ -868,6 +881,7 @@ fun showOpName(op : Op) -> String = match op {
     Call(callee, _) -> match callee {
         Direct(_) -> "call.direct"
         Runtime(_) -> "call.runtime"
+        Intrinsic(_) -> "call.intrinsic"
         Foreign(_) -> "call.foreign"
         Indirect(_) -> "call.indirect"
     }
@@ -957,7 +971,8 @@ instance Show Op {
 instance Show Callee {
   fun show(c) = match c {
     Direct(name) -> "@" + name
-    Runtime(name) -> "%" + name
+    Runtime(r) -> "%" + Rt.routineName(r)
+    Intrinsic(k) -> "%" + intrinsicName(k)
     Foreign(name) -> "&" + name
     Indirect(f) -> v(f)
   }

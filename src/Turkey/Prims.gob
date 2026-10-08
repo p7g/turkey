@@ -1,52 +1,207 @@
-module Turkey.Prims (names)
+module Turkey.Prims (Prim(..), Choice(..), Builtin(..), all, name, choiceName,
+                     spelling, parse)
 
--- The machine operations, by name.
+-- The machine operations, and the one place a name becomes one.
 --
--- Names only, for one purpose: `Turkey.Modules` puts them in a *library*
--- module's scope and in no other module's, which is the rule that stops a user
--- program writing `Prim.intAdd`. What each one means is decided by its type in
--- `Turkey.PrimTypes` and its lowering in the backend.
+-- A library module spells a primitive `Prim.intAdd`; `parse` turns the
+-- spelling into a constructor, and from then on nothing compares a primitive's
+-- name. Every pass that acts on a primitive matches on `Prim` with no fallback
+-- arm, so a constructor added here is a compile error in each pass that has
+-- not been told what it means: its type in `Turkey.PrimTypes`, its lowering in
+-- `Turkey.SsaLower`.
 --
--- Sorted, so a missing name is easy to spot. A primitive absent here is
--- invisible to every library module, which reads as an unbound name rather than
--- as a missing primitive.
+-- `Turkey.Modules` puts every name in `all` in a *library* module's scope and
+-- in no other module's, which is the rule that stops a user program writing
+-- `Prim.intAdd`. A constructor missing from `all` is invisible to every
+-- library module, which reads as an unbound name at its first use.
 
-let names = [
-    "Prim.arrayGet", "Prim.arrayLength",
-    "Prim.arrayNew", "Prim.arrayNewUninit", "Prim.arraySet",
-    "Prim.atomicAdd", "Prim.atomicCas", "Prim.atomicLoad", "Prim.atomicStore",
-    "Prim.boolEq", "Prim.boolLt", "Prim.byteEq",
-    "Prim.byteFromInt", "Prim.byteLt", "Prim.byteToInt",
-    "Prim.charEq", "Prim.charFromInt", "Prim.charIsScalar",
-    "Prim.charLt", "Prim.charToInt", "Prim.cString", "Prim.codeAddress",
-    "Prim.error", "Prim.exit",
-    "Prim.floatAdd", "Prim.floatBits",
-    "Prim.floatDiv", "Prim.floatEq", "Prim.floatFitsInt",
-    "Prim.floatFromBits", "Prim.floatGt", "Prim.floatGte",
-    "Prim.floatIsNaN", "Prim.floatLt", "Prim.floatLte",
-    "Prim.floatMul", "Prim.floatNeg",
-    "Prim.floatSub", "Prim.floatTruncate",
-    "Prim.frameAddress",
-    "Prim.gcStats", "Prim.gcVerify",
-    "Prim.castAs",
-    "Prim.intAdd", "Prim.intAddWrapping", "Prim.intAnd",
-    "Prim.intDiv", "Prim.intEq", "Prim.intLt",
-    "Prim.intMul", "Prim.intMulWrapping", "Prim.intNeg",
-    "Prim.intNegWrapping", "Prim.intNot", "Prim.intOr",
-    "Prim.intRem", "Prim.intShl", "Prim.intShr",
-    "Prim.intSub", "Prim.intSubWrapping", "Prim.intToFloat",
-    "Prim.intXor",
-    "Prim.loadF64", "Prim.loadI1", "Prim.loadI32",
-    "Prim.loadI64", "Prim.loadI8", "Prim.loadPtr",
-    "Prim.not",
-    "Prim.objectAddress",
-    "Prim.processState",
-    "Prim.ptrAdd",
-    "Prim.ptrDiff", "Prim.ptrEq",
-    "Prim.ptrFromInt", "Prim.ptrIsNull", "Prim.ptrNull",
-    "Prim.ptrToInt",
-    "Prim.storeF64", "Prim.storeI1", "Prim.storeI32",
-    "Prim.storeI64", "Prim.storeI8", "Prim.storePtr",
-    "Prim.swapStack",
-    "Prim.targetArch", "Prim.targetOs",
+-- An operation the backend lowers.
+type Prim
+    -- Leaving: a panic with a message, and the process's exit.
+    = Error | Exit
+    -- Raw addresses and the arithmetic on them.
+    | PtrAdd | PtrDiff | PtrNull | PtrIsNull | PtrEq | PtrToInt | PtrFromInt
+    | ObjectAddress
+    -- Addresses fixed when the program is linked.
+    | CString | CodeAddress | FrameAddress | ProcessState
+    -- The stack switch coroutines are built on.
+    | SwapStack
+    -- Raw memory, one load and one store per representation.
+    | LoadI1 | LoadI8 | LoadI32 | LoadI64 | LoadF64 | LoadPtr | StoreI1 | StoreI8
+    | StoreI32 | StoreI64 | StoreF64 | StorePtr
+    -- Atomic accesses to an `Int` in raw memory.
+    | AtomicCas | AtomicAdd | AtomicLoad | AtomicStore
+    -- Raw arrays, and the conversion half of a checked cast.
+    | ArrayNew | ArrayNewUninit | ArrayGet | ArraySet | ArrayLength | CastAs
+    -- `Char` and `Byte`.
+    | CharFromInt | CharIsScalar | CharToInt | CharEq | CharLt | ByteFromInt
+    | ByteToInt | ByteEq | ByteLt
+    -- `Int`.
+    | IntAdd | IntSub | IntMul | IntDiv | IntRem | IntNeg | IntAddWrapping
+    | IntSubWrapping | IntMulWrapping | IntNegWrapping | IntAnd | IntOr | IntXor
+    | IntNot | IntShl | IntShr | IntEq | IntLt | IntToFloat
+    -- `Float`.
+    | FloatAdd | FloatSub | FloatMul | FloatDiv | FloatNeg | FloatTruncate
+    | FloatFitsInt | FloatBits | FloatFromBits | FloatIsNaN | FloatEq | FloatLt
+    | FloatLte | FloatGt | FloatGte
+    -- `Bool`.
+    | Not | BoolEq | BoolLt
+
+-- A value the compile fixes rather than computes: the target, as the
+-- constructor of `lib/Target.gob`'s own type that names it, and the runtime's
+-- debugging aids (`Turkey.Build`). Lowering writes the constructor in place of
+-- the primitive, so no `Choice` reaches Core and no backend sees one.
+type Choice = TargetOs | TargetArch | GcVerify | GcStats
+
+-- What a `Prim.` spelling stands for.
+type Builtin = Machine(Prim) | Fixed(Choice)
+
+fun name(p : Prim) -> String = match p {
+    Error -> "Prim.error"
+    Exit -> "Prim.exit"
+    PtrAdd -> "Prim.ptrAdd"
+    PtrDiff -> "Prim.ptrDiff"
+    PtrNull -> "Prim.ptrNull"
+    PtrIsNull -> "Prim.ptrIsNull"
+    PtrEq -> "Prim.ptrEq"
+    PtrToInt -> "Prim.ptrToInt"
+    PtrFromInt -> "Prim.ptrFromInt"
+    ObjectAddress -> "Prim.objectAddress"
+    CString -> "Prim.cString"
+    CodeAddress -> "Prim.codeAddress"
+    FrameAddress -> "Prim.frameAddress"
+    ProcessState -> "Prim.processState"
+    SwapStack -> "Prim.swapStack"
+    LoadI1 -> "Prim.loadI1"
+    LoadI8 -> "Prim.loadI8"
+    LoadI32 -> "Prim.loadI32"
+    LoadI64 -> "Prim.loadI64"
+    LoadF64 -> "Prim.loadF64"
+    LoadPtr -> "Prim.loadPtr"
+    StoreI1 -> "Prim.storeI1"
+    StoreI8 -> "Prim.storeI8"
+    StoreI32 -> "Prim.storeI32"
+    StoreI64 -> "Prim.storeI64"
+    StoreF64 -> "Prim.storeF64"
+    StorePtr -> "Prim.storePtr"
+    AtomicCas -> "Prim.atomicCas"
+    AtomicAdd -> "Prim.atomicAdd"
+    AtomicLoad -> "Prim.atomicLoad"
+    AtomicStore -> "Prim.atomicStore"
+    ArrayNew -> "Prim.arrayNew"
+    ArrayNewUninit -> "Prim.arrayNewUninit"
+    ArrayGet -> "Prim.arrayGet"
+    ArraySet -> "Prim.arraySet"
+    ArrayLength -> "Prim.arrayLength"
+    CastAs -> "Prim.castAs"
+    CharFromInt -> "Prim.charFromInt"
+    CharIsScalar -> "Prim.charIsScalar"
+    CharToInt -> "Prim.charToInt"
+    CharEq -> "Prim.charEq"
+    CharLt -> "Prim.charLt"
+    ByteFromInt -> "Prim.byteFromInt"
+    ByteToInt -> "Prim.byteToInt"
+    ByteEq -> "Prim.byteEq"
+    ByteLt -> "Prim.byteLt"
+    IntAdd -> "Prim.intAdd"
+    IntSub -> "Prim.intSub"
+    IntMul -> "Prim.intMul"
+    IntDiv -> "Prim.intDiv"
+    IntRem -> "Prim.intRem"
+    IntNeg -> "Prim.intNeg"
+    IntAddWrapping -> "Prim.intAddWrapping"
+    IntSubWrapping -> "Prim.intSubWrapping"
+    IntMulWrapping -> "Prim.intMulWrapping"
+    IntNegWrapping -> "Prim.intNegWrapping"
+    IntAnd -> "Prim.intAnd"
+    IntOr -> "Prim.intOr"
+    IntXor -> "Prim.intXor"
+    IntNot -> "Prim.intNot"
+    IntShl -> "Prim.intShl"
+    IntShr -> "Prim.intShr"
+    IntEq -> "Prim.intEq"
+    IntLt -> "Prim.intLt"
+    IntToFloat -> "Prim.intToFloat"
+    FloatAdd -> "Prim.floatAdd"
+    FloatSub -> "Prim.floatSub"
+    FloatMul -> "Prim.floatMul"
+    FloatDiv -> "Prim.floatDiv"
+    FloatNeg -> "Prim.floatNeg"
+    FloatTruncate -> "Prim.floatTruncate"
+    FloatFitsInt -> "Prim.floatFitsInt"
+    FloatBits -> "Prim.floatBits"
+    FloatFromBits -> "Prim.floatFromBits"
+    FloatIsNaN -> "Prim.floatIsNaN"
+    FloatEq -> "Prim.floatEq"
+    FloatLt -> "Prim.floatLt"
+    FloatLte -> "Prim.floatLte"
+    FloatGt -> "Prim.floatGt"
+    FloatGte -> "Prim.floatGte"
+    Not -> "Prim.not"
+    BoolEq -> "Prim.boolEq"
+    BoolLt -> "Prim.boolLt"
+}
+
+fun choiceName(c : Choice) -> String = match c {
+    TargetOs -> "Prim.targetOs"
+    TargetArch -> "Prim.targetArch"
+    GcVerify -> "Prim.gcVerify"
+    GcStats -> "Prim.gcStats"
+}
+
+fun spelling(b : Builtin) -> String = match b {
+    Machine(p) -> name(p)
+    Fixed(c) -> choiceName(c)
+}
+
+-- Every builtin, once.
+let all : Array Builtin = [
+    Machine(Error), Machine(Exit),
+    Machine(PtrAdd), Machine(PtrDiff), Machine(PtrNull), Machine(PtrIsNull),
+    Machine(PtrEq), Machine(PtrToInt), Machine(PtrFromInt), Machine(ObjectAddress),
+    Machine(CString), Machine(CodeAddress), Machine(FrameAddress),
+    Machine(ProcessState),
+    Machine(SwapStack),
+    Machine(LoadI1), Machine(LoadI8), Machine(LoadI32), Machine(LoadI64),
+    Machine(LoadF64), Machine(LoadPtr), Machine(StoreI1), Machine(StoreI8),
+    Machine(StoreI32), Machine(StoreI64), Machine(StoreF64), Machine(StorePtr),
+    Machine(AtomicCas), Machine(AtomicAdd), Machine(AtomicLoad),
+    Machine(AtomicStore),
+    Machine(ArrayNew), Machine(ArrayNewUninit), Machine(ArrayGet),
+    Machine(ArraySet), Machine(ArrayLength), Machine(CastAs),
+    Machine(CharFromInt), Machine(CharIsScalar), Machine(CharToInt),
+    Machine(CharEq), Machine(CharLt), Machine(ByteFromInt), Machine(ByteToInt),
+    Machine(ByteEq), Machine(ByteLt),
+    Machine(IntAdd), Machine(IntSub), Machine(IntMul), Machine(IntDiv),
+    Machine(IntRem), Machine(IntNeg), Machine(IntAddWrapping),
+    Machine(IntSubWrapping), Machine(IntMulWrapping), Machine(IntNegWrapping),
+    Machine(IntAnd), Machine(IntOr), Machine(IntXor), Machine(IntNot),
+    Machine(IntShl), Machine(IntShr), Machine(IntEq), Machine(IntLt),
+    Machine(IntToFloat),
+    Machine(FloatAdd), Machine(FloatSub), Machine(FloatMul), Machine(FloatDiv),
+    Machine(FloatNeg), Machine(FloatTruncate), Machine(FloatFitsInt),
+    Machine(FloatBits), Machine(FloatFromBits), Machine(FloatIsNaN),
+    Machine(FloatEq), Machine(FloatLt), Machine(FloatLte), Machine(FloatGt),
+    Machine(FloatGte),
+    Machine(Not), Machine(BoolEq), Machine(BoolLt),
+    Fixed(TargetOs), Fixed(TargetArch), Fixed(GcVerify), Fixed(GcStats),
 ]
+
+-- Built once, before `main`. Two entries of `all` with one spelling would make
+-- one of them unreachable by name, so that stops the compiler at start-up.
+let bySpelling : Map String Builtin = indexed()
+
+fun indexed() -> Map String Builtin {
+    let out = Map.new()
+    for b in all {
+        let s = spelling(b)
+        if Map.contains(out, s) {
+            error("the primitive '" + s + "' is listed twice")
+        }
+        Map.put(out, s, b)
+    }
+    out
+}
+
+-- The builtin a `Prim.` spelling names, or `None` for any other name.
+fun parse(s : String) -> Option Builtin = Map.get(bySpelling, s)

@@ -65,6 +65,7 @@ import Turkey.Decls (DeclTable(..), ConInfo(..))
 import Turkey.Diag as Diag
 import Turkey.Match as Match
 import Turkey.Prelude as P
+import Turkey.Prims as Prims
 import Turkey.Build as Build
 import Turkey.Target as Target
 import Turkey.Solved (Scope(..), Abstraction(..), Use(..))
@@ -1212,7 +1213,7 @@ fun dispatch(l : Lowerer, e : Expr, scope : Scope) -> Core {
                 -- `!x`, which is not a method.
                 None -> node(ty, where, CApp(
                     node(TFun([Ty.tBool()], Ty.tBool()), where,
-                         CPrim("Prim.not")), [lowered]))
+                         CPrim(Prims.Not)), [lowered]))
                 Some(f) -> node(ty, where, CApp(var_(l, f, scope), [lowered]))
             }
         }
@@ -1281,6 +1282,23 @@ fun binary(l : Lowerer, e : Expr, ty : Ty.Type, op : String, left : Expr,
     }
 }
 
+-- The constructor a builtin the compile fixes stands for in this compile.
+fun chosen(l : Lowerer, c : Prims.Choice, where : Option Span) -> String = match c {
+    Prims.TargetOs -> targetConstructor(l, l.target.os, where)
+    Prims.TargetArch -> targetConstructor(l, l.target.arch, where)
+    Prims.GcVerify -> Build.boolean(l.build.gcVerify)
+    Prims.GcStats -> Build.boolean(l.build.gcStats)
+}
+
+fun targetConstructor(l : Lowerer, short : String, where : Option Span) -> String {
+    let con = P.internal(P.targetName, short)
+    if !Map.contains(l.decls.constructors, con) {
+        oops("the target '" + l.target.spelling + "' needs '" + con
+             + "', which lib/Target.gob does not declare", where)
+    }
+    con
+}
+
 -- A name: possibly a projection, possibly applied to types and dictionaries.
 --
 -- The three steps are in the order they were abstracted in, which is the only
@@ -1311,21 +1329,11 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
                 node(unknown(), where, CVar(name)),
                 Array.map(binders, TVar)))
         }
-        match Target.chosen(l.target, name) {
-            Some(con) -> {
-                if !Map.contains(l.decls.constructors, con) {
-                    oops("the target '" + l.target.spelling + "' needs '" + con
-                         + "', which lib/Target.gob does not declare", where)
-                }
-                return node(result, where, CCon(con))
-            }
-            None -> {}
+        return match Prims.parse(name) {
+            Some(Prims.Fixed(c)) -> node(result, where, CCon(chosen(l, c, where)))
+            Some(Prims.Machine(p)) -> node(result, where, CPrim(p))
+            None -> node(result, where, CVar(name))
         }
-        match Build.chosen(l.build, name) {
-            Some(con) -> return node(result, where, CCon(con))
-            None -> {}
-        }
-        return node(result, where, CVar(name))
     }
     let use = match u {
         Some(x) -> x
@@ -1338,7 +1346,12 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
                                    predType(l, use.preds[i]), givens))
     }
     var typeArgs = Array.map(use.typeArgs, resolved(l, _))
-    var base = node(unknown(), where, CVar(name))
+    -- A polymorphic primitive, applied to its type arguments below. A `Fixed`
+    -- one is monomorphic and took the path above.
+    var base = node(unknown(), where, match Prims.parse(name) {
+        Some(Prims.Machine(p)) -> CPrim(p)
+        Some(Prims.Fixed(_)) | None -> CVar(name)
+    })
     match use.method {
         Some(mi) -> {
             -- The class's own dictionary is the first predicate, by the

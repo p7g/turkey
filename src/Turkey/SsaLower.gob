@@ -40,6 +40,7 @@ import Turkey.LowIr as L
 import Turkey.LowIr (Op(..), Low(..), AddressOf(..), BinOp(..), CmpOp(..), Conv(..),
                      AtomicOp(..), Callee(..), Builder(..), IndexCheck(..))
 import Turkey.Prelude as P
+import Turkey.Prims as Prims
 import Turkey.Runtime as Rt
 import Turkey.LocalEscape as LocalEscape
 import Turkey.Promote as Promote
@@ -1277,12 +1278,6 @@ fun valueHere(l : Lower, e : Core) -> Value {
                 }
                 None -> if Set.contains(l.globals, name) {
                     L.emit(l.b, GlobalLoad(name), rep)
-                } else if isPrim(name) {
-                    -- Referred to but not called. Closure conversion does not
-                    -- reach this: a primitive has no `CBind`, so there is no
-                    -- signature to adapt from, and the fix is a per-primitive
-                    -- adapter that `primitive` would generate.
-                    stop(l, "the primitive '" + name + "' used as a value")
                 } else if Map.contains(l.decls.foreigns, name) {
                     -- The same rule, for the same reason: there is no code
                     -- here to take the address of. A wrapper in the declaring
@@ -1384,6 +1379,11 @@ fun valueHere(l : Lower, e : Core) -> Value {
         -- value lands is the whole of it -- the same mechanism `if` already
         -- uses for its two arms, applied one level up.
         CLam(params, body, _) -> lambda(l, params, body, resultType(e.ty))
+        -- Referred to but not called. Closure conversion does not reach this:
+        -- a primitive has no `CBind`, so there is no signature to adapt from,
+        -- and the fix is a per-primitive adapter that `primitive` would
+        -- generate.
+        CPrim(p) -> stop(l, "the primitive '" + Prims.name(p) + "' used as a value")
         CIf(_, _, _) -> control(l, e, rep)
         CMatch(_, _) -> control(l, e, rep)
         CLet(_, _, _, _, _) -> control(l, e, rep)
@@ -2067,14 +2067,8 @@ fun scalar(l : Lower, op : Op, natural : Rep, rep : Rep) -> Value =
 fun call(l : Lower, e : Core, fn : Core, args : Array Core, rep : Rep) -> Value {
     let supplied : Array Value = []
     match fn.kind {
-        CPrim(name) -> primCall(l, e, name, args, rep)
-        -- A primitive reaches Core as a `CVar` as often as a `CPrim`: the
-        -- module scope binds every `Prim.` name to itself, so an ordinary
-        -- variable reference is what the resolver produces. `Prim` is the
-        -- builtin module and its prefix is reserved, so the name is the test.
-        CVar(name) -> if isPrim(name) {
-            primCall(l, e, name, args, rep)
-        } else if Map.contains(l.decls.foreigns, name) {
+        CPrim(p) -> primitive(l, e, p, args, rep)
+        CVar(name) -> if Map.contains(l.decls.foreigns, name) {
             -- A declared C symbol. Everything a runtime call needs
             -- and nothing more: no marshalling, because the type mapping is
             -- the seven types that each erase to one representation, and no
@@ -2114,35 +2108,6 @@ fun call(l : Lower, e : Core, fn : Core, args : Array Core, rep : Rep) -> Value 
         -- can be.
         _ -> closureCall(l, fn, args, rep)
     }
-}
-
--- A primitive call. Two take a literal the compiler lays out as static data
--- rather than a value, so their argument is read here, before
--- it could become one; every other primitive gets its arguments lowered.
-fun primCall(l : Lower, e : Core, name : String, args : Array Core,
-             rep : Rep) -> Value {
-    if name == "Prim.cString" || name == "Prim.codeAddress" {
-        let text = if len(args) == 1 {
-            match erased(args[0]).kind {
-                CLit(LString(s)) -> Some(s)
-                _ -> None
-            }
-        } else { None }
-        return match text {
-            None -> stop(l, name + " takes a string literal")
-            Some(s) -> if name == "Prim.cString" {
-                L.emit(l.b, Address(CBytes(s)), Ssa.untraced(Ptr))
-            } else if definesSymbol(l.decls, s) || Rt.emitsSymbol(s) {
-                L.emit(l.b, Address(CodeOf(s)), Ssa.untraced(Ptr))
-            } else {
-                stop(l, "Prim.codeAddress(\"" + s + "\") names no foreign "
-                        + "definition in this program")
-            }
-        }
-    }
-    let supplied : Array Value = []
-    for a in args { Array.push(supplied, value(l, a)) }
-    primitive(l, e, name, supplied, rep)
 }
 
 fun definesSymbol(decls : DeclTable, symbol : String) -> Bool {
@@ -2196,54 +2161,32 @@ fun erased(e : Core) -> Core = match e.kind {
     _ -> e
 }
 
--- A primitive whose machine operation this instruction set has, or a runtime
--- call. A machine operation is a constructor, so instruction selection has to
--- match on it; a runtime call is a symbol, so it need not.
 -- A compiler bug rather than a program that is wrong: top-level names are
 -- module-qualified, so nothing a user writes can collide.
 fun oops(message : String) -> a =
     Diag.fail(Diag.whole("internal error", message), "")
 
-fun isPrim(name : String) -> Bool = String.startsWith(name, "Prim.")
-
-fun primitive(l : Lower, e : Core, name : String, args : Array Value,
-              rep : Rep) -> Value {
+-- A primitive call, one arm per primitive and no fallback: a primitive added to
+-- `Turkey.Prims` does not compile until it is given a lowering here.
+--
+-- Each arm lowers its own operands, left to right and all of them before the
+-- operation, because two of them take a literal the compiler lays out as static
+-- data rather than a value, and read it before it could become one.
+fun primitive(l : Lower, e : Core, p : Prims.Prim, args : Array Core,
+              rep : Rep) -> Value = match p {
     -- `error` does not answer; it leaves. Terminating here and then moving
     -- into a fresh block keeps the walk uniform -- whatever the caller emits
     -- next is well formed and unreachable, and the verifier says nothing
     -- about unreachable code on purpose.
-    if name == "Prim.error" && len(args) == 1 {
-        L.terminate(l.b, Panic(args[0]))
+    Prims.Error -> {
+        let xs = operands(l, p, args, 1)
+        L.terminate(l.b, Panic(xs[0]))
         L.into(l.b, L.block(l.b))
-        return zero(l, rep)
+        zero(l, rep)
     }
-    -- Raw load and store, one name per representation. The name
-    -- carries the class because the IR attaches a `Rep` to every value when
-    -- it is emitted: a load whose width were known only at run time would
-    -- have no result representation for the register allocator or for
-    -- `Turkey.Roots`, which is why the floor is twelve names and the single
-    -- `load` lives in `lib/Turkey/Ptr.gob` as a class instead.
-    match rawAccess(name) {
-        Some(c) -> if len(args) == 2 {
-            return L.emit(l.b, PtrLoad(args[0], args[1], c), Ssa.untraced(c))
-        } else if len(args) == 3 {
-            L.effect(l.b, PtrStore(args[0], args[1], args[2], c))
-            return L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
-        }
-        None -> {}
-    }
-    match atomicAccess(name) {
-        Some((o, arity)) -> if len(args) == arity {
-            match o {
-                StoreRelease -> {
-                    L.effect(l.b, Atomic(o, args))
-                    return L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
-                }
-                _ -> return L.emit(l.b, Atomic(o, args), Ssa.untraced(I64))
-            }
-        }
-        None -> {}
-    }
+    Prims.Exit -> L.emit(l.b, Call(Runtime(Rt.Exit), operands(l, p, args, 1)), rep)
+    Prims.SwapStack ->
+        L.emit(l.b, Call(Runtime(Rt.SwapStack), operands(l, p, args, 2)), rep)
     -- Pointer arithmetic. An address is an integer held at another
     -- class, so all of this is ordinary integer work with a conversion at
     -- each end -- which is also why none of it is a runtime call, and why no
@@ -2252,82 +2195,129 @@ fun primitive(l : Lower, e : Core, name : String, args : Array Value,
     -- Wrapping, not checked: `AddWrap` and `SubWrap`. An address near the top
     -- of the space is not an overflow and must not panic, and the language's
     -- trapping `+` is not what is being spelled here.
-    if name == "Prim.ptrAdd" && len(args) == 2 {
-        let base = L.emit(l.b, Convert(PtrToInt, args[0]), Ssa.untraced(I64))
-        let sum = L.emit(l.b, Bin(AddWrap, base, args[1]), Ssa.untraced(I64))
-        return L.emit(l.b, Convert(IntToPtr, sum), Ssa.untraced(Ptr))
+    Prims.PtrAdd -> {
+        let xs = operands(l, p, args, 2)
+        let base = L.emit(l.b, Convert(PtrToInt, xs[0]), Ssa.untraced(I64))
+        let sum = L.emit(l.b, Bin(AddWrap, base, xs[1]), Ssa.untraced(I64))
+        L.emit(l.b, Convert(IntToPtr, sum), Ssa.untraced(Ptr))
     }
-    if name == "Prim.ptrDiff" && len(args) == 2 {
-        let a = L.emit(l.b, Convert(PtrToInt, args[0]), Ssa.untraced(I64))
-        let b = L.emit(l.b, Convert(PtrToInt, args[1]), Ssa.untraced(I64))
-        return L.emit(l.b, Bin(SubWrap, a, b), Ssa.untraced(I64))
+    Prims.PtrDiff -> {
+        let xs = operands(l, p, args, 2)
+        let a = L.emit(l.b, Convert(PtrToInt, xs[0]), Ssa.untraced(I64))
+        let b = L.emit(l.b, Convert(PtrToInt, xs[1]), Ssa.untraced(I64))
+        L.emit(l.b, Bin(SubWrap, a, b), Ssa.untraced(I64))
     }
-    if name == "Prim.frameAddress" && len(args) == 0 {
-        return L.emit(l.b, Address(ThisFrame), Ssa.untraced(Ptr))
-    }
-    if name == "Prim.processState" && len(args) == 0 {
-        return L.emit(l.b, Address(ProcessState), Ssa.untraced(Ptr))
-    }
-    if name == "Prim.ptrNull" && len(args) == 0 {
+    Prims.PtrNull -> {
+        noOperands(l, p, args)
         let zero_ = L.emit(l.b, ConstInt(0), Ssa.untraced(I64))
-        return L.emit(l.b, Convert(IntToPtr, zero_), Ssa.untraced(Ptr))
+        L.emit(l.b, Convert(IntToPtr, zero_), Ssa.untraced(Ptr))
     }
-    if name == "Prim.ptrIsNull" && len(args) == 1 {
-        let a = L.emit(l.b, Convert(PtrToInt, args[0]), Ssa.untraced(I64))
+    Prims.PtrIsNull -> {
+        let xs = operands(l, p, args, 1)
+        let a = L.emit(l.b, Convert(PtrToInt, xs[0]), Ssa.untraced(I64))
         let zero_ = L.emit(l.b, ConstInt(0), Ssa.untraced(I64))
-        return L.emit(l.b, Cmp(Eq, a, zero_), Ssa.untraced(I1))
+        L.emit(l.b, Cmp(Eq, a, zero_), Ssa.untraced(I1))
     }
-    if name == "Prim.ptrToInt" && len(args) == 1 {
-        return L.emit(l.b, Convert(PtrToInt, args[0]), Ssa.untraced(I64))
-    }
-    if name == "Prim.ptrFromInt" && len(args) == 1 {
-        return L.emit(l.b, Convert(IntToPtr, args[0]), Ssa.untraced(Ptr))
-    }
+    -- Both operands are already at one representation, so this needs no
+    -- conversion the way the rest of the pointer work does.
+    Prims.PtrEq -> primCompare(l, p, args, Eq)
+    Prims.PtrToInt -> L.emit(l.b, Convert(PtrToInt, operands(l, p, args, 1)[0]),
+                             Ssa.untraced(I64))
+    Prims.PtrFromInt -> L.emit(l.b, Convert(IntToPtr, operands(l, p, args, 1)[0]),
+                               Ssa.untraced(Ptr))
     -- The same machine value, no longer one the collector follows: a value
     -- held as a scalar has no address to give.
-    if name == "Prim.objectAddress" && len(args) == 1 {
-        if Ssa.repOf(l.func, args[0]) != Ssa.traced(Ptr) {
+    Prims.ObjectAddress -> {
+        let xs = operands(l, p, args, 1)
+        if Ssa.repOf(l.func, xs[0]) != Ssa.traced(Ptr) {
             return stop(l, "the address of a value not held as a pointer")
         }
-        return L.emit(l.b, Convert(Retag, args[0]), Ssa.untraced(Ptr))
+        L.emit(l.b, Convert(Retag, xs[0]), Ssa.untraced(Ptr))
+    }
+    Prims.CString -> match literalArgument(args) {
+        Some(text) -> L.emit(l.b, Address(CBytes(text)), Ssa.untraced(Ptr))
+        None -> stop(l, "Prim.cString takes a string literal")
+    }
+    Prims.CodeAddress -> match literalArgument(args) {
+        Some(symbol) -> if definesSymbol(l.decls, symbol) || Rt.emitsSymbol(symbol) {
+            L.emit(l.b, Address(CodeOf(symbol)), Ssa.untraced(Ptr))
+        } else {
+            stop(l, "Prim.codeAddress(\"" + symbol + "\") names no foreign "
+                    + "definition in this program")
+        }
+        None -> stop(l, "Prim.codeAddress takes a string literal")
+    }
+    Prims.FrameAddress -> {
+        noOperands(l, p, args)
+        L.emit(l.b, Address(ThisFrame), Ssa.untraced(Ptr))
+    }
+    Prims.ProcessState -> {
+        noOperands(l, p, args)
+        L.emit(l.b, Address(ProcessState), Ssa.untraced(Ptr))
+    }
+    -- Raw load and store, one primitive per representation. The primitive
+    -- carries the class because the IR attaches a `Rep` to every value when
+    -- it is emitted: a load whose width were known only at run time would
+    -- have no result representation for the register allocator or for
+    -- `Turkey.Roots`, which is why the floor is twelve primitives and the
+    -- single `load` lives in `lib/Turkey/Ptr.gob` as a class instead.
+    Prims.LoadI1 -> rawLoad(l, p, args, I1)
+    Prims.LoadI8 -> rawLoad(l, p, args, I8)
+    Prims.LoadI32 -> rawLoad(l, p, args, I32)
+    Prims.LoadI64 -> rawLoad(l, p, args, I64)
+    Prims.LoadF64 -> rawLoad(l, p, args, F64)
+    Prims.LoadPtr -> rawLoad(l, p, args, Ptr)
+    Prims.StoreI1 -> rawStore(l, p, args, I1)
+    Prims.StoreI8 -> rawStore(l, p, args, I8)
+    Prims.StoreI32 -> rawStore(l, p, args, I32)
+    Prims.StoreI64 -> rawStore(l, p, args, I64)
+    Prims.StoreF64 -> rawStore(l, p, args, F64)
+    Prims.StorePtr -> rawStore(l, p, args, Ptr)
+    Prims.AtomicCas -> L.emit(l.b, Atomic(Cas, operands(l, p, args, 4)), Ssa.untraced(I64))
+    Prims.AtomicAdd ->
+        L.emit(l.b, Atomic(FetchAdd, operands(l, p, args, 3)), Ssa.untraced(I64))
+    Prims.AtomicLoad ->
+        L.emit(l.b, Atomic(LoadAcquire, operands(l, p, args, 2)), Ssa.untraced(I64))
+    Prims.AtomicStore -> {
+        L.effect(l.b, Atomic(StoreRelease, operands(l, p, args, 3)))
+        L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
     }
     -- The array operations are instructions rather than runtime calls: the
     -- element's representation decides the stride, and that is a fact
     -- instruction selection must see rather than one buried in a callee.
-    if name == "Prim.arrayLength" && len(args) == 1 {
-        return L.emit(l.b, ArrayLength(args[0]), Ssa.untraced(I64))
+    Prims.ArrayLength ->
+        L.emit(l.b, ArrayLength(operands(l, p, args, 1)[0]), Ssa.untraced(I64))
+    Prims.ArrayGet -> {
+        let xs = operands(l, p, args, 2)
+        L.emit(l.b, ArrayGet(xs[0], xs[1], Checked), rep)
     }
-    if name == "Prim.arrayGet" && len(args) == 2 {
-        return L.emit(l.b, ArrayGet(args[0], args[1], Checked), rep)
+    Prims.ArraySet -> {
+        let xs = operands(l, p, args, 3)
+        L.effect(l.b, ArraySet(xs[0], xs[1], xs[2], Checked))
+        L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
     }
-    if name == "Prim.arraySet" && len(args) == 3 {
-        L.effect(l.b, ArraySet(args[0], args[1], args[2], Checked))
-        return L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
+    Prims.ArrayNew -> {
+        let xs = operands(l, p, args, 2)
+        L.emit(l.b, ArrayNew(xs[0], xs[1], Ssa.repOf(l.func, xs[1])), Ssa.traced(Ptr))
     }
-    if name == "Prim.arrayNew" && len(args) == 2 {
-        return L.emit(l.b, ArrayNew(args[0], args[1],
-                                    Ssa.repOf(l.func, args[1])),
-                      Ssa.traced(Ptr))
-    }
-    if name == "Prim.arrayNewUninit" && len(args) == 1 {
-        -- Uninitialized in the source language and not in the heap: the
-        -- collector may walk this array before anything writes to it, so a
-        -- traced slot must hold something it can follow.
+    -- Uninitialized in the source language and not in the heap: the
+    -- collector may walk this array before anything writes to it, so a
+    -- traced slot must hold something it can follow.
+    Prims.ArrayNewUninit -> {
+        let xs = operands(l, p, args, 1)
         let element = elementRep(l, e.ty)
-        return L.emit(l.b, ArrayNew(args[0], storageZero(l, element), element),
-                      Ssa.traced(Ptr))
+        L.emit(l.b, ArrayNew(xs[0], storageZero(l, element), element), Ssa.traced(Ptr))
     }
-    if name == "Prim.castAs" && len(args) == 1 {
-        -- The conversion half of a checked cast. `Data.Error.cast` compared the
-        -- two type reps first, so equal reps mean equal types mean equal
-        -- layouts: a legitimate cast is the identity and never converts.
-        --
-        -- Deliberately not `coerce`. That one boxes a scalar into a pointer,
-        -- and this is the one place where doing so would *compile* the
-        -- combination the rep check exists to rule out. `turkey/backend_lower.py`
-        -- keeps to the same rule, so the two agree here rather than each
-        -- inheriting whatever its own `coerce` permits.
-        if Ssa.repOf(l.func, args[0]) == rep { return args[0] }
+    -- The conversion half of a checked cast. `Data.Error.cast` compared the
+    -- two type reps first, so equal reps mean equal types mean equal
+    -- layouts: a legitimate cast is the identity and never converts.
+    --
+    -- Deliberately not `coerce`. That one boxes a scalar into a pointer,
+    -- and this is the one place where doing so would *compile* the
+    -- combination the rep check exists to rule out.
+    Prims.CastAs -> {
+        let xs = operands(l, p, args, 1)
+        if Ssa.repOf(l.func, xs[0]) == rep { return xs[0] }
         -- Dead, and provably so -- but contract 1 copies an opened arm per
         -- packed layout, so this copy can be the one whose payload is an `i64`
         -- while the result type is a pointer. Something must still be emitted.
@@ -2338,128 +2328,128 @@ fun primitive(l : Lower, e : Core, name : String, args : Array Value,
             Ssa.traced(Ptr))
         L.terminate(l.b, Panic(message))
         L.into(l.b, L.block(l.b))
-        return zero(l, rep)
+        zero(l, rep)
     }
-    match binOp(name) {
-        Some(o) -> if len(args) == 2 {
-            return L.emit(l.b, Bin(o, args[0], args[1]), rep)
-        }
-        None -> {}
-    }
-    match cmpOp(name) {
-        Some(o) -> if len(args) == 2 {
-            return L.emit(l.b, Cmp(o, args[0], args[1]), Ssa.untraced(I1))
-        }
-        None -> {}
-    }
-    if (name == "Prim.intNeg" || name == "Prim.floatNeg") && len(args) == 1 {
-        return L.emit(l.b, Neg(args[0]), rep)
-    }
+    Prims.CharFromInt -> primConvert(l, p, args, Narrow, rep)
+    Prims.CharToInt -> primConvert(l, p, args, Widen, rep)
+    Prims.CharEq -> primCompare(l, p, args, Eq)
+    Prims.CharLt -> primCompare(l, p, args, Lt)
+    Prims.ByteFromInt -> primConvert(l, p, args, Narrow, rep)
+    Prims.ByteToInt -> primConvert(l, p, args, Widen, rep)
+    Prims.ByteEq -> primCompare(l, p, args, Eq)
+    Prims.ByteLt -> primCompare(l, p, args, Lt)
+    Prims.IntAdd -> primBinary(l, p, args, Add, rep)
+    Prims.IntSub -> primBinary(l, p, args, Sub, rep)
+    Prims.IntMul -> primBinary(l, p, args, Mul, rep)
+    Prims.IntDiv -> primBinary(l, p, args, Div, rep)
+    Prims.IntRem -> primBinary(l, p, args, Rem, rep)
+    Prims.IntNeg -> L.emit(l.b, Neg(operands(l, p, args, 1)[0]), rep)
+    -- Distinct opcodes, not the same one: what differs is whether overflow
+    -- panics, and a backend that could not tell them apart would emit an
+    -- overflow check on `Data.Map`'s hashing and panic on a subtraction the
+    -- language says wraps.
+    Prims.IntAddWrapping -> primBinary(l, p, args, AddWrap, rep)
+    Prims.IntSubWrapping -> primBinary(l, p, args, SubWrap, rep)
+    Prims.IntMulWrapping -> primBinary(l, p, args, MulWrap, rep)
     -- Wrapping negation is `0 - x` without the check, which is what `SubWrap`
     -- already is; `Neg` traps.
-    if name == "Prim.intNegWrapping" && len(args) == 1 {
+    Prims.IntNegWrapping -> {
+        let xs = operands(l, p, args, 1)
         let zero = L.emit(l.b, ConstInt(0), rep)
-        return L.emit(l.b, Bin(SubWrap, zero, args[0]), rep)
+        L.emit(l.b, Bin(SubWrap, zero, xs[0]), rep)
     }
-    match conversion(name) {
-        Some(c) -> if len(args) == 1 {
-            return L.emit(l.b, Convert(c, args[0]), rep)
-        }
-        None -> {}
+    Prims.IntAnd -> primBinary(l, p, args, And, rep)
+    Prims.IntOr -> primBinary(l, p, args, Or, rep)
+    Prims.IntXor -> primBinary(l, p, args, Xor, rep)
+    -- Every bit flipped: an exclusive or with all ones.
+    Prims.IntNot -> {
+        let xs = operands(l, p, args, 1)
+        let ones = L.emit(l.b, ConstInt(-1), rep)
+        L.emit(l.b, Bin(Xor, xs[0], ones), rep)
     }
-    if name == "Prim.not" && len(args) == 1 {
-        return L.emit(l.b, Not(args[0]), rep)
-    }
-    L.emit(l.b, Call(Runtime(name), args), rep)
+    Prims.IntShl -> primBinary(l, p, args, Shl, rep)
+    Prims.IntShr -> primBinary(l, p, args, Shr, rep)
+    Prims.IntEq -> primCompare(l, p, args, Eq)
+    Prims.IntLt -> primCompare(l, p, args, Lt)
+    Prims.IntToFloat -> primConvert(l, p, args, IntToFloat, rep)
+    Prims.FloatAdd -> primBinary(l, p, args, Add, rep)
+    Prims.FloatSub -> primBinary(l, p, args, Sub, rep)
+    Prims.FloatMul -> primBinary(l, p, args, Mul, rep)
+    Prims.FloatDiv -> primBinary(l, p, args, Div, rep)
+    Prims.FloatNeg -> L.emit(l.b, Neg(operands(l, p, args, 1)[0]), rep)
+    Prims.FloatTruncate -> primConvert(l, p, args, FloatToInt, rep)
+    Prims.FloatEq -> primCompare(l, p, args, Eq)
+    Prims.FloatLt -> primCompare(l, p, args, Lt)
+    Prims.FloatLte -> primCompare(l, p, args, Le)
+    Prims.FloatGt -> primCompare(l, p, args, Gt)
+    Prims.FloatGte -> primCompare(l, p, args, Ge)
+    Prims.CharIsScalar -> primIntrinsic(l, p, args, L.CharIsScalar, rep)
+    Prims.FloatFitsInt -> primIntrinsic(l, p, args, L.FloatFitsInt, rep)
+    Prims.FloatBits -> primIntrinsic(l, p, args, L.FloatBits, rep)
+    Prims.FloatFromBits -> primIntrinsic(l, p, args, L.FloatFromBits, rep)
+    Prims.FloatIsNaN -> primIntrinsic(l, p, args, L.FloatIsNaN, rep)
+    Prims.Not -> L.emit(l.b, Not(operands(l, p, args, 1)[0]), rep)
+    Prims.BoolEq -> primCompare(l, p, args, Eq)
+    Prims.BoolLt -> primCompare(l, p, args, Lt)
 }
+
+-- A primitive's operands, lowered left to right. The type checker fixed the
+-- count, so a different one here is a compiler bug.
+fun operands(l : Lower, p : Prims.Prim, args : Array Core, arity : Int) -> Array Value {
+    if len(args) != arity {
+        oops(Prims.name(p) + " applied to " + Int.toString(len(args))
+             + " arguments, not " + Int.toString(arity))
+    }
+    let out : Array Value = []
+    for a in args { Array.push(out, value(l, a)) }
+    out
+}
+
+fun noOperands(l : Lower, p : Prims.Prim, args : Array Core) -> Unit {
+    if len(args) != 0 {
+        oops(Prims.name(p) + " applied to " + Int.toString(len(args)) + " arguments")
+    }
+}
+
+fun literalArgument(args : Array Core) -> Option String {
+    if len(args) == 1 {
+        if let CLit(LString(s)) = erased(args[0]).kind { return Some(s) }
+    }
+    None
+}
+
+fun primBinary(l : Lower, p : Prims.Prim, args : Array Core, o : BinOp, rep : Rep) -> Value {
+    let xs = operands(l, p, args, 2)
+    L.emit(l.b, Bin(o, xs[0], xs[1]), rep)
+}
+
+fun primCompare(l : Lower, p : Prims.Prim, args : Array Core, o : CmpOp) -> Value {
+    let xs = operands(l, p, args, 2)
+    L.emit(l.b, Cmp(o, xs[0], xs[1]), Ssa.untraced(I1))
+}
+
+fun primConvert(l : Lower, p : Prims.Prim, args : Array Core, c : Conv, rep : Rep) -> Value =
+    L.emit(l.b, Convert(c, operands(l, p, args, 1)[0]), rep)
+
+fun rawLoad(l : Lower, p : Prims.Prim, args : Array Core, c : RepClass) -> Value {
+    let xs = operands(l, p, args, 2)
+    L.emit(l.b, PtrLoad(xs[0], xs[1], c), Ssa.untraced(c))
+}
+
+fun rawStore(l : Lower, p : Prims.Prim, args : Array Core, c : RepClass) -> Value {
+    let xs = operands(l, p, args, 3)
+    L.effect(l.b, PtrStore(xs[0], xs[1], xs[2], c))
+    L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
+}
+
+fun primIntrinsic(l : Lower, p : Prims.Prim, args : Array Core, k : L.Intrinsic,
+              rep : Rep) -> Value =
+    L.emit(l.b, Call(Intrinsic(k), operands(l, p, args, 1)), rep)
 
 -- The element representation of an array type.
 fun elementRep(l : Lower, ty : Ty.Type) -> Rep {
     let (_, args) = Ty.spine(Ty.prune(ty))
     if len(args) > 0 { repOf(l, args[0]) } else { Ssa.traced(Ptr) }
-}
-
--- The class a raw load or store accesses at, from the primitive's name.
---
-fun atomicAccess(name : String) -> Option (AtomicOp, Int) = match name {
-    "Prim.atomicCas" -> Some((Cas, 4))
-    "Prim.atomicAdd" -> Some((FetchAdd, 3))
-    "Prim.atomicLoad" -> Some((LoadAcquire, 2))
-    "Prim.atomicStore" -> Some((StoreRelease, 3))
-    _ -> None
-}
-
--- One table for both directions: `loadI64` and `storeI64` differ in arity and
--- nothing else, so splitting them would be two tables that must agree.
-fun rawAccess(name : String) -> Option RepClass = match name {
-    "Prim.loadI1" -> Some(I1)
-    "Prim.loadI8" -> Some(I8)
-    "Prim.loadI32" -> Some(I32)
-    "Prim.loadI64" -> Some(I64)
-    "Prim.loadF64" -> Some(F64)
-    "Prim.loadPtr" -> Some(Ptr)
-    "Prim.storeI1" -> Some(I1)
-    "Prim.storeI8" -> Some(I8)
-    "Prim.storeI32" -> Some(I32)
-    "Prim.storeI64" -> Some(I64)
-    "Prim.storeF64" -> Some(F64)
-    "Prim.storePtr" -> Some(Ptr)
-    _ -> None
-}
-
-fun conversion(name : String) -> Option Conv = match name {
-    "Prim.intToFloat" -> Some(IntToFloat)
-    "Prim.floatTruncate" -> Some(FloatToInt)
-    "Prim.byteToInt" -> Some(Widen)
-    "Prim.byteFromInt" -> Some(Narrow)
-    "Prim.charToInt" -> Some(Widen)
-    "Prim.charFromInt" -> Some(Narrow)
-    _ -> None
-}
-
-fun binOp(name : String) -> Option BinOp = match name {
-    "Prim.intAdd" -> Some(Add)
-    "Prim.intSub" -> Some(Sub)
-    "Prim.intMul" -> Some(Mul)
-    "Prim.intDiv" -> Some(Div)
-    "Prim.intRem" -> Some(Rem)
-    "Prim.intAnd" -> Some(And)
-    "Prim.intOr" -> Some(Or)
-    "Prim.intXor" -> Some(Xor)
-    "Prim.intShl" -> Some(Shl)
-    "Prim.intShr" -> Some(Shr)
-    -- Distinct opcodes, not the same one: what differs is whether overflow
-    -- panics, and a backend that could not tell them apart emitted an
-    -- overflow check on `Data.Map`'s hashing and panicked on a subtraction
-    -- the language says wraps.
-    "Prim.intAddWrapping" -> Some(AddWrap)
-    "Prim.intSubWrapping" -> Some(SubWrap)
-    "Prim.intMulWrapping" -> Some(MulWrap)
-    "Prim.floatAdd" -> Some(Add)
-    "Prim.floatSub" -> Some(Sub)
-    "Prim.floatMul" -> Some(Mul)
-    "Prim.floatDiv" -> Some(Div)
-    _ -> None
-}
-
-fun cmpOp(name : String) -> Option CmpOp = match name {
-    "Prim.intEq" -> Some(Eq)
-    "Prim.intLt" -> Some(Lt)
-    "Prim.byteEq" -> Some(Eq)
-    "Prim.byteLt" -> Some(Lt)
-    "Prim.charEq" -> Some(Eq)
-    "Prim.charLt" -> Some(Lt)
-    "Prim.boolEq" -> Some(Eq)
-    "Prim.boolLt" -> Some(Lt)
-    "Prim.floatEq" -> Some(Eq)
-    "Prim.floatLt" -> Some(Lt)
-    "Prim.floatLte" -> Some(Le)
-    "Prim.floatGt" -> Some(Gt)
-    "Prim.floatGte" -> Some(Ge)
-    -- Both operands are already at one representation, so this needs no
-    -- conversion the way the rest of the pointer work does.
-    "Prim.ptrEq" -> Some(Eq)
-    _ -> None
 }
 
 -- Where a named field sits in its object.
@@ -2519,7 +2509,7 @@ fun formOf(e : Core) -> String = match e.kind {
     CUnit -> "unit"
     CVar(_) -> "a variable"
     CCon(name) -> "the constructor '" + name + "'"
-    CPrim(name) -> "the primitive '" + name + "'"
+    CPrim(p) -> "the primitive '" + Prims.name(p) + "'"
     CTuple(_) -> "a tuple"
     CArray(_) -> "an array literal"
     CRecord(_, _) -> "a record"

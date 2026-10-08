@@ -824,23 +824,23 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                 Direct(name) ->
                     call(s, d, want, Some(want), Some(symbolFor(s, name)), A.xzr, passed,
                          A.Standard)
-                Runtime(name) -> match runtimeSymbol(s, name) {
+                Runtime(routine) -> {
+                    let entry = Rt.entryPoint(routine)
                     -- The stack arguments below are this compiler's own
                     -- convention, and a C function would not read them the
                     -- same way. No runtime entry point takes more than four.
-                    Some(sym) -> if overflows(passed) {
+                    if overflows(passed) {
                         stop(s, "a runtime call with stack arguments")
                     } else {
-                        call(s, d, want, resultBank(name), Some(sym), A.xzr,
-                             passed, conventionOf(name))
-                    }
-                    -- A few primitives are a handful of compares, and a
-                    -- runtime entry point per predicate would be a call where
-                    -- a compare will do.
-                    None -> if !inlinePrim(s, d, name, passed) {
-                        stop(s, "the runtime function " + name)
+                        call(s, d, want, resultBank(entry),
+                             Some(calleeOf(s, entry.symbol)), A.xzr, passed,
+                             conventionOf(entry))
                     }
                 }
+                -- A few primitives are a handful of compares, and a runtime
+                -- entry point per predicate would be a call where a compare
+                -- will do.
+                Intrinsic(k) -> intrinsic(s, d, k, passed)
                 -- A declared C symbol. Nothing to look up: the
                 -- declaration already is the symbol, and the result's file
                 -- comes from the destination's representation rather than
@@ -1300,12 +1300,12 @@ let sitesSymbol = "turkey_alloc_sites"
 
 fun symbolFor(s : Sel, name : String) -> Asm.Symbol = Asm.symbolFor(s.asm.dialect, name)
 
--- A runtime entry point this pass names directly rather than through the
--- primitive table: the heap operations have no `Prim.` spelling, because the
--- lowering emits them and no program calls them.
 -- What a call to the C symbol `name` branches to (`Asm.calleeFor`).
 fun calleeOf(s : Sel, name : String) -> Asm.Symbol = Asm.calleeFor(s.asm, name)
 
+-- A runtime entry point this pass names directly rather than through
+-- `Turkey.Runtime.entryPoint`: the heap operations have no `Prim.` spelling,
+-- because the lowering emits them and no program calls them.
 fun runtimeSymbolOf(s : Sel, name : String) -> Asm.Symbol =
     Asm.runtimeFor(s.asm.dialect, name)
 
@@ -1325,19 +1325,6 @@ fun shiftFor(width : Int) -> Int = match width {
     4 -> 2
     _ -> 3
 }
-
--- A primitive's runtime symbol, as the assembler wants it written.
---
--- The table is `Turkey.Runtime`'s -- these are the symbols a C file defines,
--- not a choice this pass makes -- and what is left here is how the object
--- format spells a C symbol. C's return type is not consulted: every one of
--- these fits in `x0` and the caller already knows the representation it asked
--- for.
-fun runtimeSymbol(s : Sel, name : String) -> Option Asm.Symbol =
-    match Rt.entryPoint(name) {
-        Some(entry) -> Some(calleeOf(s, entry.symbol))
-        None -> None
-    }
 
 -- A 64-bit constant, in as few instructions as it takes.
 --
@@ -1655,16 +1642,11 @@ fun bits(r : Rep) -> Int = match r.class_ {
 }
 
 -- A primitive written out rather than called.
---
--- Answers whether it handled the name, so that the caller reports the ones
--- that have neither an entry point nor a rule instead of emitting something
--- plausible for them.
-fun inlinePrim(s : Sel, d : Reg, name : String,
-               args : Array (Reg, A.Bank)) -> Bool =
-    match name {
+fun intrinsic(s : Sel, d : Reg, k : L.Intrinsic, args : Array (Reg, A.Bank)) -> Unit =
+    match k {
         -- A scalar value is a code point that is not a surrogate: at most
         -- U+10FFFF, and outside U+D800..U+DFFF.
-        "Prim.charIsScalar" -> {
+        L.CharIsScalar -> {
             let (point, _) = args[0]
             let big = flag(s, point, 0x10FFFF, A.Hi)
             let atLeast = flag(s, point, 0xD800, A.Hs)
@@ -1674,36 +1656,32 @@ fun inlinePrim(s : Sel, d : Reg, name : String,
             let bad = temp(s, Ssa.untraced(I1))
             emit(s, A.Orr(bad, big, surrogate, A.W32))
             emit(s, A.EorImm(d, bad, 1, A.W32))
-            True
         }
         -- A double's bit pattern and back, which on arm64 is an `fmov` between
         -- the two files. `fmov` copies all 64 bits
         -- and converts nothing, so the sign of a zero and a NaN's payload
         -- survive -- which is the whole contract of a bit-level conversion.
         -- `tests/programs/float_bits.gob` is the regression.
-        "Prim.floatBits" -> {
+        L.FloatBits -> {
             let (x, _) = args[0]
             emit(s, A.FMovOut(d, x))
-            True
         }
-        "Prim.floatFromBits" -> {
+        L.FloatFromBits -> {
             let (n, _) = args[0]
             emit(s, A.FMovIn(d, n))
-            True
         }
         -- `fcmp` of a value with itself is unordered exactly when it is a NaN,
         -- and unordered is the one outcome that sets V.
-        "Prim.floatIsNaN" -> {
+        L.FloatIsNaN -> {
             let (x, _) = args[0]
             emit(s, A.FCmp(x, x))
             emit(s, A.CSet(d, A.Vs))
-            True
         }
         -- In `[-2^63, 2^63)`, with no separate test for a NaN because none is
         -- needed. Both conditions here are false for one:
         -- `ge` needs N == V and an unordered compare sets V alone, and `lo`
         -- needs C clear and an unordered compare sets C.
-        "Prim.floatFitsInt" -> {
+        L.FloatFitsInt -> {
             let (x, _) = args[0]
             let low = floatConstant(s, -4332462841530417152)
             let high = floatConstant(s, 4890909195324358656)
@@ -1714,9 +1692,7 @@ fun inlinePrim(s : Sel, d : Reg, name : String,
             let below = temp(s, Ssa.untraced(I1))
             emit(s, A.CSet(below, A.Lo))
             emit(s, A.And(d, atLeast, below, A.W32))
-            True
         }
-        _ -> False
     }
 
 -- A double with the given bit pattern, in a fresh `d` register. The same
@@ -1750,24 +1726,19 @@ fun overflows(args : Array (Reg, A.Bank)) -> Bool {
     general > len(A.argRegs) || vector > len(A.fpArgRegs)
 }
 
+-- What a call to a runtime entry point lets it destroy: everything, if it
+-- switches stacks, since the code that runs before it returns is another
+-- stack's.
+fun conventionOf(entry : Entry) -> A.Convention =
+    if entry.switchesStacks { A.PreservesNone } else { A.Standard }
+
 -- Which file a runtime entry point answers in: `d0` for one C declares as
 -- returning a `double`, `x0` for everything else, and neither for one C
 -- declares `void`.
--- What a call to runtime entry point `name` lets it destroy: everything, if
--- it switches stacks, since the code that runs before it returns is another
--- stack's.
-fun conventionOf(name : String) -> A.Convention = match Rt.entryPoint(name) {
-    Some(entry) -> if entry.switchesStacks { A.PreservesNone } else { A.Standard }
-    None -> A.Standard
-}
-
-fun resultBank(name : String) -> Option A.Bank = match Rt.entryPoint(name) {
-    Some(entry) -> match entry.result {
-        Some(F64) -> Some(A.Fp)
-        Some(_) -> Some(A.Gp)
-        None -> None
-    }
-    None -> Some(A.Gp)
+fun resultBank(entry : Entry) -> Option A.Bank = match entry.result {
+    Some(F64) -> Some(A.Fp)
+    Some(_) -> Some(A.Gp)
+    None -> None
 }
 
 -- Floating point arithmetic, which does not trap.

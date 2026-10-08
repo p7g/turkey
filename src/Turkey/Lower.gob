@@ -636,6 +636,29 @@ fun carried(l : Lowerer, e : Expr) -> Array Core = match Map.get(l.types.uses, e
     }
 }
 
+-- The dictionaries a field access reads or writes through, when its receiver
+-- is polymorphic: the reader's, then the setter's if it assigns. `None` where
+-- the evidence is an instance, which means the receiver's type is known here
+-- and the field is selected directly.
+--
+-- Both are given or neither is: the two predicates are about one receiver, and
+-- a receiver is either quantified over or it is not.
+fun passedAccessors(l : Lowerer, e : Expr) -> Option (Array Core) {
+    let u = Map.get(l.types.uses, e.id)?
+    if len(u.evidence) == 0 { return None }
+    match u.evidence[0] {
+        FromDict(_, _, _) -> {}
+        _ -> return None
+    }
+    let givens = givensOf(l, u)
+    let out = Array.new(len(u.evidence))
+    for var i = 0; i < len(u.evidence) && i < len(u.preds); i = i + 1 {
+        Array.push(out, evidence(l, u.evidence[i], predType(l, u.preds[i]),
+                                 givens))
+    }
+    Some(out)
+}
+
 -- The constructor as Core applies it: dictionaries, then fields.
 fun packing(dicts : Array Core, fnTy : Ty.Type, name : String,
             where : Option Span) -> Core {
@@ -1164,7 +1187,15 @@ fun dispatch(l : Lowerer, e : Expr, scope : Scope) -> Core {
             for (n, v) in fields { Array.push(out, (n, expr(l, v, scope))) }
             node(ty, where, CRecord(con, out))
         }
-        EField(obj, name) -> node(ty, where, CField(expr(l, obj, scope), name))
+        EField(obj, name) -> {
+            let target = expr(l, obj, scope)
+            match passedAccessors(l, e) {
+                Some(dicts) -> node(ty, where, CApp(
+                    node(TFun([target.ty], ty), where, CField(dicts[0], "get")),
+                    [target]))
+                None -> node(ty, where, CField(target, name))
+            }
+        }
         EProject(obj, index) -> node(ty, where,
             CProject(expr(l, obj, scope), index))
         EIndex(arr, index, _, _) -> node(ty, where,
@@ -2230,6 +2261,15 @@ fun assign(l : Lowerer, stmt : Stmt, target : Expr, source : Expr,
             node(refOf(value.ty), Some(target.span), CVar(name)), value))
         EField(obj, name) -> {
             let o = expr(l, obj, scope)
+            match passedAccessors(l, target) {
+                Some(dicts) -> if len(dicts) == 2 {
+                    return node(unit, at, CApp(
+                        node(TFun([o.ty, value.ty], unit), Some(target.span),
+                             CField(dicts[1], "set")),
+                        [o, value]))
+                }
+                None -> {}
+            }
             node(unit, at, CAssign(
                 node(value.ty, Some(target.span), CField(o, name)), value))
         }

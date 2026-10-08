@@ -381,7 +381,7 @@ for a pattern that might not match.
 
 `let` and `var` decide whether the *name* can be pointed at something else.
 They do not decide whether the value is mutable. A `let` binding of a
-[mutable record](types.md#mutability-and-sharing) can still have its fields
+record can still have its [`var` fields](types.md#mutability-and-sharing)
 assigned.
 
 A `let` or `var` in a block is visible to the statements after it. A later

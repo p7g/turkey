@@ -8,8 +8,8 @@ module Turkey.Classes (
     reduceFam, normalize, normalizeUnder, givenRule, settled, settledFam,
     uncovered,
     bySuper, byInst, entail, isClass, method, simplify,
-    fieldClass, fieldFamily, projectionClass, projectionFamily,
-    generatedLabel, generatedIndex, fieldFamilyOwner, isGenerated, accessor,
+    fieldClass, setterClass, fieldFamily, projectionClass, projectionFamily,
+    generatedLabel, setterLabel, generatedIndex, fieldFamilyOwner, isGenerated, accessor,
     ensureGenerated, synthesize,
     match_, matches,
     Skolems(..), newSkolems, skolemBind, skolemApply, skolemApplyPred,
@@ -879,13 +879,23 @@ fun checkInstance(t : ClassTable, inst : InstInfo) -> Unit {
 -- specialization reaches the dictionary is ground, the devirtualizer hoists the
 -- accessor, and the inliner takes it -- the body is a single node -- leaving
 -- exactly the `CField` that used to be emitted directly.
+--
+-- Writing is a class of its own. `r.cap = v` demands `%SetField.cap r` as well
+-- as `%HasField.cap r`, and only a field declared `var` has a `%SetField`
+-- instance, so assigning any other field is a missing instance -- reported
+-- where the receiver's type becomes known, which for a polymorphic receiver is
+-- the caller that supplies it. The setter declares no family: the type it
+-- writes is `%Field.cap r`, which the read predicate beside it determines.
 
 let fieldClassHead = "%HasField"
+let setterClassHead = "%SetField"
 let projectionClassHead = "%HasProjection"
 let fieldFamilyHead = "%Field"
 let projectionFamilyHead = "%Elem"
 
 fun fieldClass(label : String) -> String = fieldClassHead + "." + label
+
+fun setterClass(label : String) -> String = setterClassHead + "." + label
 
 fun fieldFamily(label : String) -> String = fieldFamilyHead + "." + label
 
@@ -904,9 +914,13 @@ fun generatedPart(name : String, head : String) -> Option String =
         None -> None
     }
 
--- The field name a generated class accesses, if it is one of them.
+-- The field name a generated class reads, if it is one of them.
 fun generatedLabel(cls : String) -> Option String =
     generatedPart(cls, fieldClassHead)
+
+-- The field name a generated class writes, if it is one of them.
+fun setterLabel(cls : String) -> Option String =
+    generatedPart(cls, setterClassHead)
 
 -- The position a generated projection class reads, if it is one.
 fun generatedIndex(cls : String) -> Option Int =
@@ -932,7 +946,8 @@ fun fieldFamilyOwner(fam : String) -> String {
 }
 
 fun isGenerated(cls : String) -> Bool =
-    Option.isSome(generatedLabel(cls)) || Option.isSome(generatedIndex(cls))
+    Option.isSome(generatedLabel(cls)) || Option.isSome(setterLabel(cls))
+        || Option.isSome(generatedIndex(cls))
 
 -- The internal name of a generated class's method.
 --
@@ -946,7 +961,7 @@ fun accessor(cls : String, which : String) -> String = cls + "#" + which
 -- and `InstanceDecl`, and a generated class has no source to point at.
 fun generatedSpan() -> Span = Source.span("<generated>", 0, 0)
 
--- Declare a field or projection class, once per label.
+-- Declare a field, setter or projection class, once per label.
 --
 -- Built here rather than enumerated up front for two reasons. A label's class
 -- has to exist before any signature mentioning it is read, and eager
@@ -957,7 +972,6 @@ fun ensureGenerated(t : ClassTable, cls : String) -> ClassInfo {
     if let Some(found) = Map.get(t.classes, cls) {
         return found
     }
-    let label = generatedLabel(cls)
     let cell = Ty.freshVar(1)
     let info = ClassInfo {
         name = cls
@@ -971,33 +985,40 @@ fun ensureGenerated(t : ClassTable, cls : String) -> ClassInfo {
         defaults = Map.new()
     }
     Map.put(t.classes, cls, info)
-    let fam = match label {
-        Some(name) -> fieldFamily(name)
-        None -> match generatedIndex(cls) {
-            Some(index) -> projectionFamily(index)
-            None -> oops("'" + cls + "' is not a generated class", None)
+    let receiver = TVar(cell)
+    let members = match setterLabel(cls) {
+        Some(label) -> {
+            let fam = fieldFamily(label)
+            let reader = ensureGenerated(t, fieldClass(label))
+            let res = match Map.get(t.decls.families, fam) {
+                Some(f) -> f.resKind
+                None -> oops("'" + reader.name + "' declared no family", None)
+            }
+            [("set", TFun([receiver, TFam(fam, receiver, res)], Ty.tUnit()))]
+        }
+        None -> {
+            let fam = match generatedLabel(cls) {
+                Some(name) -> fieldFamily(name)
+                None -> match generatedIndex(cls) {
+                    Some(index) -> projectionFamily(index)
+                    None -> oops("'" + cls + "' is not a generated class", None)
+                }
+            }
+            let res = Ty.kvar()
+            Map.put(t.decls.families, fam, FamilyInfo {
+                name = fam
+                cls = cls
+                argKind = cell.kind
+                resKind = res
+                span = None
+            })
+            Map.put(info.families, fam, "r")
+            [("get", TFun([receiver], TFam(fam, receiver, res)))]
         }
     }
-    let res = Ty.kvar()
-    Map.put(t.decls.families, fam, FamilyInfo {
-        name = fam
-        cls = cls
-        argKind = cell.kind
-        resKind = res
-        span = None
-    })
-    Map.put(info.families, fam, "r")
-    let receiver = TVar(cell)
-    let held = TFam(fam, receiver, res)
     let pred = Ty.pred(cls, [receiver])
     let names = Map.new()
     Map.put(names, cell.id, "r")
-    let members = [("get", TFun([receiver], held))]
-    if let Some(_) = label {
-        -- Projections are read-only: the parser rejects `x.0 = v`, so there is
-        -- nothing for a setter to be the evidence of.
-        Array.push(members, ("set", TFun([receiver, held], Ty.tUnit())))
-    }
     for (which, ty) in members {
         let name = accessor(cls, which)
         Map.put(info.methods, name, MethodInfo {
@@ -1041,16 +1062,17 @@ fun synthesize(t : ClassTable, p : Pred) -> Option InstInfo {
     let receiver = Ty.prune(p.args[0])
     let (head, _) = Ty.spine(receiver)
     let label = generatedLabel(cls)
+    let setter = setterLabel(cls)
     let index = generatedIndex(cls)
 
     -- The instance's head is the *general* one -- `Map k v`, not
     -- `Map String Int` -- so one instance covers every use. It is read off the
     -- constructor's own scheme, which is where those variables live.
     let general = match head {
-        TTuple(elems) -> match label {
+        TTuple(elems) -> match index {
             -- A tuple has positions, not field names.
-            Some(_) -> return None
-            None -> {
+            None -> return None
+            Some(_) -> {
                 -- Over fresh variables, not over the tuple that happened to be
                 -- demanded first: one instance covers every 2-tuple, and giving
                 -- it a concrete head would make it cover exactly one of them
@@ -1078,43 +1100,34 @@ fun synthesize(t : ClassTable, p : Pred) -> Option InstInfo {
         }
     }
 
-    var fam = ""
-    var held = Ty.tUnit()
-    match label {
-        Some(name) -> {
-            let owner = match head {
-                TCon(c) -> c.name
-                _ -> return None
-            }
-            match Decls.recordFields(t.decls, owner) {
-                None -> return None
-                Some(names) -> if !Array.contains(names, name) { return None }
-            }
-            fam = fieldFamily(name)
-            held = Decls.fieldType(t.decls, general, name)
+    -- What the instance says the class's family is. A setter's class has none.
+    let families = Map.new()
+    if let Some(name) = label {
+        match Decls.recordFields(t.decls, ownerOf(head)) {
+            None -> return None
+            Some(names) -> if !Array.contains(names, name) { return None }
         }
-        None -> {
-            let at = match index {
+        Map.put(families, fieldFamily(name), Decls.fieldType(t.decls, general, name))
+    } else if let Some(name) = setter {
+        match Decls.varFields(t.decls, ownerOf(head)) {
+            None -> return None
+            Some(names) -> if !Array.contains(names, name) { return None }
+        }
+    } else if let Some(at) = index {
+        let choices = match general {
+            TTuple(elems) -> elems
+            _ -> match Decls.projectionTypes(t.decls, general) {
                 Some(found) -> found
                 None -> return None
             }
-            let choices = match general {
-                TTuple(elems) -> elems
-                _ -> match Decls.projectionTypes(t.decls, general) {
-                    Some(found) -> found
-                    None -> return None
-                }
-            }
-            if at >= len(choices) {
-                return None
-            }
-            fam = projectionFamily(at)
-            held = choices[at]
         }
+        if at >= len(choices) {
+            return None
+        }
+        Map.put(families, projectionFamily(at), choices[at])
+    } else {
+        return None
     }
-
-    let families = Map.new()
-    Map.put(families, fam, held)
     let inst = InstInfo {
         cls = cls
         head = general
@@ -1141,6 +1154,13 @@ fun synthesize(t : ClassTable, p : Pred) -> Option InstInfo {
         None -> Map.put(t.instances, cls, [inst])
     }
     Some(inst)
+}
+
+-- The type constructor a field demand's receiver is headed by; a tuple's is
+-- the empty name, which no record has.
+fun ownerOf(head : Ty.Type) -> String = match head {
+    TCon(c) -> c.name
+    _ -> ""
 }
 
 fun reduceFam(t : ClassTable, name : String, arg : Ty.Type) -> Option Ty.Type {

@@ -426,7 +426,7 @@ type-decl    ::= "type" CONID IDENT* "=" constructor ("|" constructor)*
 constructor  ::= CONID existential? payload?
 payload      ::= "(" type ("," type)* ")"          -- positional
                | "{" field (separator field)* "}"   -- record
-field        ::= IDENT ":" type
+field        ::= "var"? IDENT ":" type
 separator    ::= "," | line break
 existential  ::= "[" (IDENT | CONID type) ("," (IDENT | CONID type))* "]"
 ```
@@ -526,7 +526,9 @@ own line. The same holds wherever fields are listed: in a declaration, in a
 [record expression](expressions.md#record-construction), and in a
 [record pattern](patterns.md#record-patterns). A trailing comma is allowed.
 Field names must be distinct within one constructor. Different types may use
-the same field names.
+the same field names. A field marked `var` can be assigned after the value is
+built; every other field keeps the value it was built with (see
+[Mutability and sharing](#mutability-and-sharing)).
 
 A constructor has at most 21 fields, positional or named, and a tuple at most
 21 elements. A wider value is an error where it is declared or written; group
@@ -613,13 +615,31 @@ fun first(p : Pair) = p.0
 ## Mutability and sharing
 
 Whether a value can be changed depends on its type, not on how it was bound.
+A record field can be assigned only if its declaration marks it `var`:
 
-* **Mutable:** values of a type with exactly one constructor that is a record,
-  such as `Item` above, and arrays. Their fields and elements can be assigned
-  ([Assignment](statements.md#assignment)).
+<!-- check -->
+```kotlin
+type Account = Account { owner : String, var balance : Int }
+```
+
+* **Mutable:** arrays, whose elements can be assigned, and records with at
+  least one `var` field. Only a record's `var` fields can be assigned
+  ([Assignment](statements.md#assignment)); `owner` above is fixed when the
+  `Account` is built.
 * **Immutable:** everything else. That is every primitive type, every string,
-  every tuple, every function, every positional constructor, and every type
-  with more than one constructor, even when the constructors are records.
+  every tuple, every function, every positional constructor, every record
+  with no `var` field, and every type with more than one constructor, even
+  when the constructors are records.
+
+`var` is allowed only in a type with exactly one constructor, and not in an
+existential one. An assignment `r.name = e` names a field of whatever `r`
+holds, and in a type with several constructors that would be a field only
+some of its values have:
+
+<!-- error: field 'radius' cannot be 'var': 'Shape' has more than one constructor -->
+```kotlin
+type Shape = Circle { var radius : Float } | Square { side : Float }
+```
 
 Mutable values have **reference semantics**. Creating one allocates a single
 object, and every binding, parameter, field or array element that holds it
@@ -628,7 +648,7 @@ through all of them:
 
 <!-- run -->
 ```kotlin
-type Account = Account { owner : String, balance : Int }
+type Account = Account { owner : String, var balance : Int }
 
 fun deposit(account, amount) {
     account.balance = account.balance + amount
@@ -653,16 +673,51 @@ fun main() {
 ```
 
 Immutable values can never be changed, so a program cannot tell whether they
-are copied or shared.
+are copied or shared. The same holds for a field that is not `var`: reading
+it through any reference gives the value the record was built with.
+
+Assigning a field that is not `var` is an error, and the message says where
+the field is declared, since that is where the fix goes:
+
+<!-- error: cannot assign to field 'owner': it is not 'var' in 'Account' -->
+```kotlin
+type Account = Account { owner : String, var balance : Int }
+
+fun main() {
+    let account = Account { owner = "alice", balance = 10 }
+    account.owner = "bob"
+}
+```
+
+A function that assigns a field accepts every record type whose field of that
+name is `var` ([Field constraints](inference.md#field-and-projection-constraints)),
+so when the record's type is only known at the call, the error is reported
+there:
+
+<!-- error: cannot assign to field 'owner': it is not 'var' in 'Account' -->
+```kotlin
+type Account = Account { owner : String, var balance : Int }
+
+fun rename(holder, name) {
+    holder.owner = name
+}
+
+fun main() {
+    rename(Account { owner = "alice", balance = 10 }, "bob")
+}
+```
 
 `let` and `var` control the *binding*, not the object. A `let` binding cannot
 be pointed at a different value, but if it holds a mutable object, the
 object's fields can still be assigned, as `deposit` does above
 ([`let` and `var`](declarations.md#let-and-var)).
 
-> **Coming from Rust.** There is no ownership or borrowing. A single-variant
-> record behaves like a reference-counted, interior-mutable object, and any
-> number of references to it may write to it.
+> **Coming from Rust.** There is no ownership or borrowing. A record with
+> `var` fields behaves like a reference-counted object whose `var` fields are
+> interior-mutable, and any number of references to it may write to them.
+
+> **Coming from OCaml or F#.** `var` on a field is `mutable` on a record
+> field: records are immutable unless a field says otherwise.
 
 ## Existential types
 

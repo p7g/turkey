@@ -18,7 +18,7 @@ from tests.lang import CompileError
 # indexed `for` over it would be quadratic even if it could be written.
 LIST = """
 type List a = Nil | Cons(a, List a)
-type Cur a = Cur { rest : List a }
+type Cur a = Cur { var rest : List a }
 
 instance Iterator (List a) {
     type Item = a
@@ -174,7 +174,7 @@ def test_the_cursor_is_made_once_and_advanced_per_element(capsys):
     """`iter` runs once, `next` once per element plus the one that ends it."""
     src = """
 type Two = Two { unused : Int }
-type TwoCur = TwoCur { taken : Int }
+type TwoCur = TwoCur { var taken : Int }
 
 instance Iterator Two {
     type Item = Int
@@ -212,7 +212,7 @@ def test_nothing_asks_the_container_for_a_length(capsys):
     """
     src = """
 type Naturals = Naturals { unused : Int }
-type Counter = Counter { at : Int }
+type Counter = Counter { var at : Int }
 
 instance Iterator Naturals {
     type Item = Int

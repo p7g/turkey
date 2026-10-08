@@ -92,7 +92,8 @@ There are three forms of assignment:
 
 * `x = e` gives a new value to a variable declared with `var`, or to a
   function parameter.
-* `r.field = e` changes a field of a [mutable record](types.md#mutability-and-sharing).
+* `r.field = e` changes a record field declared
+  [`var`](types.md#mutability-and-sharing).
 * `c[k] = e` replaces an element, through the [`Index`](builtins.md#index)
   class's `set` method.
 
@@ -102,7 +103,7 @@ assignment operators such as `+=`.
 
 <!-- run -->
 ```kotlin
-type Tally = Tally { count : Int }
+type Tally = Tally { var count : Int }
 
 fun main() {
     var label = "start"

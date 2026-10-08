@@ -39,7 +39,7 @@ def _stressed(src: str) -> str:
 # strings built at run time, so a capture the collector lost would print wrong.
 READERS = """
 type Mapper = Mapper { expr : fun(Int) -> String, ty : fun(String) -> String }
-type Hasher = Hasher { h : Int }
+type Hasher = Hasher { var h : Int }
 
 fun each(xs : Array Int, f : fun(Int) -> String) -> String {
     var out = ""
@@ -106,7 +106,7 @@ def test_frame_objects_survive_collection():
 
 ESCAPES = """
 type Box = Box { x : Int }
-type Holder = Holder { item : Box }
+type Holder = Holder { var item : Box }
 type Chain = Link(Int, Chain) | End
 
 var kept : Array Box = []

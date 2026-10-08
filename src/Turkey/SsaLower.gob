@@ -1334,7 +1334,7 @@ fun valueHere(l : Lower, e : Core) -> Value {
             store(l, target, x)
             L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
         }
-        CTuple(elems) -> aggregate(l, elems, 0, -1, False, "builds a tuple")
+        CTuple(elems) -> aggregate(l, elems, 0, -1, 0, "builds a tuple")
         CRecord(con, fields) -> {
             -- The one table, so a dictionary is *built* in the order it is
             -- later *read* in. Two sources for that order is how a field ends
@@ -1350,7 +1350,8 @@ fun valueHere(l : Lower, e : Core) -> Value {
             }
             let items = if len(sorted) == len(fields) { sorted }
                         else { Array.map(fields, _.1) }
-            aggregate(l, items, 1, Map.getOr(l.tags, con, -1), mutableCon(l, con),
+            aggregate(l, items, 1, Map.getOr(l.tags, con, -1),
+                      mutableMask(l, con, len(items)),
                       "builds a record, " + Ty.shortName(con))
         }
         CArray(elems) -> arrayLiteral(l, e, elems)
@@ -1438,32 +1439,41 @@ fun store(l : Lower, target : Core, x : Value) -> Unit = match target.kind {
 -- A heap object built with its fields.
 --
 -- `kind` is 0 for a tuple and 1 for a constructed value, which is what the
--- runtime's own object header distinguishes. `mutable` says whether any field
--- may be assigned later, and then every field may be.
+-- runtime's own object header distinguishes. `mutable` has a bit set for each
+-- field that may be assigned later.
 fun aggregate(l : Lower, items : Array Core, kind : Int, tag : Int,
-             mutable : Bool, what : String) -> Value {
+             mutable : Int, what : String) -> Value {
     if wide(l, what, len(items), Rt.fieldLimit) { return Ssa.freshValue(l.func, Ssa.traced(Ptr)) }
     let values = []
     for x in items { Array.push(values, value(l, x)) }
     let reps = Array.map(values, Ssa.repOf(l.func, _))
-    let made = L.emit(l.b, ObjectNew(kind, tag, metadata(reps), values,
-                                     if mutable { allFields(len(values)) } else { 0 }),
+    let made = L.emit(l.b, ObjectNew(kind, tag, metadata(reps), values, mutable),
                       Ssa.traced(Ptr))
     Map.put(l.func.reasons, Ssa.valueId(made), what)
     made
 }
 
--- Whether a value built with this constructor may have a field assigned: the
--- constructor of a mutable record. Tuples, positional constructors and
--- existential records never change after construction, so an `ObjectGet` of
--- one built in view is the value it was built with.
-fun mutableCon(l : Lower, con : String) -> Bool = match Decls.con(l.decls, con) {
-    Some(info) -> match Decls.recordFields(l.decls, info.tycon) {
-        Some(_) -> True
-        None -> False
+-- Which fields of a value built with this constructor may be assigned: its
+-- `var` fields. Any other field never changes after construction, so an
+-- `ObjectGet` of it from an object built in view is the value it was built
+-- with. A constructor the declarations do not know -- a dictionary's -- is
+-- taken to be mutable throughout.
+fun mutableMask(l : Lower, con : String, count : Int) -> Int =
+    match Decls.con(l.decls, con) {
+        Some(info) -> {
+            var mask = 0
+            match info.fields {
+                Some(names) -> for var i = 0; i < len(names); i = i + 1 {
+                    if Array.contains(info.vars, names[i]) {
+                        mask = Int.or(mask, Int.shl(1, i))
+                    }
+                }
+                None -> {}
+            }
+            mask
+        }
+        None -> allFields(count)
     }
-    None -> True
-}
 
 -- The mutable mask with every one of `count` fields set.
 fun allFields(count : Int) -> Int = Int.shl(1, count) - 1
@@ -1987,10 +1997,10 @@ fun constructor(l : Lower, e : Core, name : String, args : Array Core,
             Some(info) -> if len(info.exists) > 0 {
                 packed(l, info, name, args, tag)
             } else {
-                aggregate(l, args, 1, tag, mutableCon(l, name),
+                aggregate(l, args, 1, tag, mutableMask(l, name, len(args)),
                           "builds a value with " + Ty.shortName(name))
             }
-            None -> aggregate(l, args, 1, tag, mutableCon(l, name),
+            None -> aggregate(l, args, 1, tag, mutableMask(l, name, len(args)),
                               "builds a value with " + Ty.shortName(name))
         }
         None -> stop(l, "the constructor '" + name + "' has no tag")
@@ -2454,10 +2464,10 @@ fun elementRep(l : Lower, ty : Ty.Type) -> Rep {
 
 -- Where a named field sits in its object.
 --
--- `Decls.recordFields` answers only for a *mutable* record, which is the
+-- `Decls.recordFields` answers only for a *plain* record, which is the
 -- surface language's record and not the only thing with named fields: a
--- dictionary is a record of methods, an instance's superclasses are fields of
--- it, and neither is mutable. So the variants are searched too, which is what
+-- dictionary is a record of methods, and an instance's superclasses are fields
+-- of it. So the variants are searched too, which is what
 -- `turkey/backend_lower.py`'s `field_index` does -- and a method selection
 -- being an ordinary field read is the point of the milestone that made
 -- evidence a value.

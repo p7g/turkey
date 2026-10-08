@@ -1,4 +1,5 @@
-"""Record symmetry, punning, mutable parameters, `Bool`, and a total `pop`.
+"""Record symmetry, punning, `var` fields, mutable parameters, `Bool`, and a
+total `pop`.
 
 `records.gob`, `err_record_arity.gob` and `mutation.gob` are the goldens. This
 file is the part a golden cannot show: that the two declaration forms and the
@@ -84,7 +85,7 @@ fun main() {
     assert output(src, capsys) == ["3,4"]
 
 
-def test_a_single_variant_mutable_record_matches_positionally(capsys):
+def test_a_single_variant_record_matches_positionally(capsys):
     """A `RecordObj`, not a `ConValue` -- the other runtime shape."""
     src = POINT + """
 fun main() {
@@ -228,6 +229,57 @@ def test_a_let_inside_a_function_still_refuses_assignment():
 def test_a_parameter_is_still_monomorphic():
     """Mutability is about the binding form, not the type; `CDef` is unchanged."""
     assert fails("fun f(g) -> Int = g(1) + String.byteLength(g(\"s\"))") != ""
+
+
+# -- `var` fields -------------------------------------------------------------
+
+
+ACCOUNT = "type Account = Account { owner : String, var balance : Int }\n"
+
+
+def test_only_a_var_field_can_be_assigned(capsys):
+    src = ACCOUNT + """
+fun main() {
+    let a = Account { owner = "ann", balance = 1 }
+    a.balance = a.balance + 1
+    print(a.balance)
+}
+"""
+    assert output(src, capsys) == ["2"]
+    message = fails(ACCOUNT + """
+fun main() {
+    let a = Account { owner = "ann", balance = 1 }
+    a.owner = "bo"
+}
+""")
+    assert message == ("cannot assign to field 'owner': it is not 'var' in "
+                       "'Account' (declared at Main.gob:1:26). Declare it "
+                       "'var owner' to make it assignable.")
+
+
+def test_a_polymorphic_assignment_is_checked_where_the_type_is_supplied():
+    src = ACCOUNT + """
+fun rename(x, name) { x.owner = name }
+fun main() { rename(Account { owner = "ann", balance = 1 }, "bo") }
+"""
+    assert fails(src).startswith("cannot assign to field 'owner'")
+    assert "SetField \"balance\" a" in types(ACCOUNT + "fun bump(x) { x.balance = 1 }")["bump"]
+
+
+def test_var_is_refused_in_a_type_with_several_constructors():
+    assert fails("type T = A { var n : Int } | B").startswith(
+        "field 'n' cannot be 'var': 'T' has more than one constructor")
+
+
+def test_var_is_refused_in_an_existential_record():
+    assert fails("type Box = Box[Show a] { var item : a }").startswith(
+        "field 'item' cannot be 'var': 'Box' is existential")
+
+
+def test_a_record_with_no_var_field_is_a_value():
+    """Immutable, so the value restriction lets it generalize."""
+    src = "type Holder a = Holder { item : Option a }\nlet empty = Holder { item = None }"
+    assert types(src)["empty"] == "Holder a"
 
 
 # -- `Bool` is a declared type ---------------------------------------------

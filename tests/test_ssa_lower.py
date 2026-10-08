@@ -351,7 +351,7 @@ def test_a_match_on_a_tuple_literal_does_not_build_the_tuple():
 
 FRESH_FIELDS = """
 type Pair = Pair(Int, Int)
-type Counter = Counter { n : Int }
+type Counter = Counter { var n : Int }
 
 fun nested(n : Int) -> Int {
     let p = ((n, n + 1), n + 2)
@@ -379,7 +379,7 @@ fun main() {
 def test_a_field_of_a_fresh_immutable_object_is_its_operand():
     # A tuple read where it is built is the values it was built with, and
     # then nothing reads the allocation and it is deleted -- the unused one
-    # too. A record's field may be assigned, so it is read back.
+    # too. A `var` field may be assigned, so it is read back.
     assert lang.output(FRESH_FIELDS) == "23\n40\n"
     result = lang.dump("ssa", FRESH_FIELDS)
     assert result.code == 0, result.stderr

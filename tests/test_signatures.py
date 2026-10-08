@@ -26,7 +26,7 @@ ESCAPES = (
 
 ITER = """
 type Two a = Two { fst : a, snd : a }
-type TwoCur = TwoCur { taken : Int }
+type TwoCur = TwoCur { var taken : Int }
 
 instance Iterator (Two a) {
     type Item = a

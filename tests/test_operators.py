@@ -141,7 +141,7 @@ def test_a_user_iterator_runs(capsys):
     src = """
 type Two a = Two(a, a)
 
-type TwoCursor = TwoCursor { taken : Int }
+type TwoCursor = TwoCursor { var taken : Int }
 
 instance Iterator (Two a) {
     type Item = a

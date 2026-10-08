@@ -78,7 +78,7 @@ existential  ::= "[" binder ("," binder)* "]"
 binder       ::= IDENT | qualified-CONID atype
 payload      ::= "(" type ("," type)* ")"
                | "{" (field (field-sep field)*)? "}"
-field        ::= IDENT ":" type
+field        ::= "var"? IDENT ":" type
 ```
 
 Whether `type T = C args` is an alias or a data type is decided as described

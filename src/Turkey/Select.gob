@@ -606,6 +606,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         Convert(PtrToInt, a) -> emit(s, A.Mov(d, A.reg(a), A.W64))
         Convert(IntToPtr, a) -> emit(s, A.Mov(d, A.reg(a), A.W64))
         Not(a) -> emit(s, A.EorImm(d, A.reg(a), 1, A.W32))
+        Intrinsic(k, a) -> intrinsic(s, d, k, A.reg(a))
         -- An object slot is at a constant offset from the header.
         ObjectGet(target, index) ->
             emit(s, A.Ldr(d, A.Offset(A.reg(target), 24 + 8 * index), A.W64))
@@ -837,10 +838,6 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                              conventionOf(entry))
                     }
                 }
-                -- A few primitives are a handful of compares, and a runtime
-                -- entry point per predicate would be a call where a compare
-                -- will do.
-                Intrinsic(k) -> intrinsic(s, d, k, passed)
                 -- A declared C symbol. Nothing to look up: the
                 -- declaration already is the symbol, and the result's file
                 -- comes from the destination's representation rather than
@@ -1642,15 +1639,14 @@ fun bits(r : Rep) -> Int = match r.class_ {
 }
 
 -- A primitive written out rather than called.
-fun intrinsic(s : Sel, d : Reg, k : L.Intrinsic, args : Array (Reg, A.Bank)) -> Unit =
+fun intrinsic(s : Sel, d : Reg, k : L.Intrinsic, x : Reg) -> Unit =
     match k {
         -- A scalar value is a code point that is not a surrogate: at most
         -- U+10FFFF, and outside U+D800..U+DFFF.
         L.CharIsScalar -> {
-            let (point, _) = args[0]
-            let big = flag(s, point, 0x10FFFF, A.Hi)
-            let atLeast = flag(s, point, 0xD800, A.Hs)
-            let atMost = flag(s, point, 0xDFFF, A.Ls)
+            let big = flag(s, x, 0x10FFFF, A.Hi)
+            let atLeast = flag(s, x, 0xD800, A.Hs)
+            let atMost = flag(s, x, 0xDFFF, A.Ls)
             let surrogate = temp(s, Ssa.untraced(I1))
             emit(s, A.And(surrogate, atLeast, atMost, A.W32))
             let bad = temp(s, Ssa.untraced(I1))
@@ -1662,18 +1658,11 @@ fun intrinsic(s : Sel, d : Reg, k : L.Intrinsic, args : Array (Reg, A.Bank)) -> 
         -- and converts nothing, so the sign of a zero and a NaN's payload
         -- survive -- which is the whole contract of a bit-level conversion.
         -- `tests/programs/float_bits.gob` is the regression.
-        L.FloatBits -> {
-            let (x, _) = args[0]
-            emit(s, A.FMovOut(d, x))
-        }
-        L.FloatFromBits -> {
-            let (n, _) = args[0]
-            emit(s, A.FMovIn(d, n))
-        }
+        L.FloatBits -> emit(s, A.FMovOut(d, x))
+        L.FloatFromBits -> emit(s, A.FMovIn(d, x))
         -- `fcmp` of a value with itself is unordered exactly when it is a NaN,
         -- and unordered is the one outcome that sets V.
         L.FloatIsNaN -> {
-            let (x, _) = args[0]
             emit(s, A.FCmp(x, x))
             emit(s, A.CSet(d, A.Vs))
         }
@@ -1682,7 +1671,6 @@ fun intrinsic(s : Sel, d : Reg, k : L.Intrinsic, args : Array (Reg, A.Bank)) -> 
         -- `ge` needs N == V and an unordered compare sets V alone, and `lo`
         -- needs C clear and an unordered compare sets C.
         L.FloatFitsInt -> {
-            let (x, _) = args[0]
             let low = floatConstant(s, -4332462841530417152)
             let high = floatConstant(s, 4890909195324358656)
             emit(s, A.FCmp(x, low))

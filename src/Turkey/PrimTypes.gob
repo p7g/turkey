@@ -1,4 +1,4 @@
-module Turkey.PrimTypes (schemes)
+module Turkey.PrimTypes (scheme, choiceScheme, spellingScheme)
 
 -- The type of every machine operation.
 --
@@ -9,40 +9,56 @@ module Turkey.PrimTypes (schemes)
 -- Every primitive's type, written once. A primitive whose type is wrong here is
 -- wrong everywhere and caught nowhere above, since nothing else states it.
 
+import Turkey.Prims (Prim(..), Choice(..), Builtin(..))
 import Turkey.Types as Ty
-import Turkey.Types (Kind(..), Scheme(..), TVar, TCon, TApp, TFun, TTuple)
+import Turkey.Types (Kind(..), Scheme(..), Type, TVar, TApp, TFun)
 
-fun schemes() -> Array (String, Scheme) {
-    let out = Array.new(96)
-    {
-        let v0 = Ty.newVar(1, Ty.kvar())
-        Array.push(out, ("Prim.error", Ty.scheme([v0],
-            TFun([Ty.tString()], TVar(v0)), Array.new(0))))
-    }
-    {
-        let v0 = Ty.newVar(1, Ty.kvar())
-        Array.push(out, ("Prim.exit", Ty.scheme([v0],
-            TFun([Ty.tInt()], TVar(v0)), Array.new(0))))
-    }
-    -- The target, as the constructor of `lib/Target.gob`'s own type that names
-    -- it. Lowering writes the constructor in place of the primitive, so no
-    -- backend sees either.
-    Array.push(out, ("Prim.targetOs",
-        Ty.mono(Ty.tcon("Target#OS", KStar, Ty.noScope))))
-    Array.push(out, ("Prim.targetArch",
-        Ty.mono(Ty.tcon("Target#Arch", KStar, Ty.noScope))))
-    -- What the compile fixed of the runtime's debugging aids
-    -- (`Turkey.Build`), the same way.
-    Array.push(out, ("Prim.gcVerify", Ty.mono(Ty.tBool())))
-    Array.push(out, ("Prim.gcStats", Ty.mono(Ty.tBool())))
+fun spellingScheme(b : Builtin) -> Scheme = match b {
+    Machine(p) -> scheme(p)
+    Fixed(c) -> choiceScheme(c)
+}
+
+-- A scheme over one fresh variable, or two. Fresh on every call, so no two
+-- schemes share a variable.
+fun forall1(body : fun(Type) -> Type) -> Scheme {
+    let a = Ty.newVar(1, Ty.kvar())
+    Ty.scheme([a], body(TVar(a)), Array.new(0))
+}
+
+fun forall2(body : fun(Type, Type) -> Type) -> Scheme {
+    let a = Ty.newVar(1, Ty.kvar())
+    let b = Ty.newVar(1, Ty.kvar())
+    Ty.scheme([a, b], body(TVar(a), TVar(b)), Array.new(0))
+}
+
+fun rawArray(element : Type) -> Type = TApp(Ty.tRawArray(), element, KStar)
+
+-- The target, as the constructor of `lib/Target.gob`'s own type that names it,
+-- and what the compile fixed of the runtime's debugging aids (`Turkey.Build`).
+fun choiceScheme(c : Choice) -> Scheme = match c {
+    TargetOs -> Ty.mono(Ty.tcon("Target#OS", KStar, Ty.noScope))
+    TargetArch -> Ty.mono(Ty.tcon("Target#Arch", KStar, Ty.noScope))
+    GcVerify -> Ty.mono(Ty.tBool())
+    GcStats -> Ty.mono(Ty.tBool())
+}
+
+fun scheme(p : Prim) -> Scheme = match p {
+    Error -> forall1(fun(a) = TFun([Ty.tString()], a))
+    Exit -> forall1(fun(a) = TFun([Ty.tInt()], a))
     -- Raw memory. `malloc` and `free` are not here: they are declared as
     -- ordinary foreign functions in `lib/Turkey/Libc.gob`.
-    Array.push(out, ("Prim.ptrAdd",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt()], Ty.tRawPtr()))))
-    Array.push(out, ("Prim.ptrDiff",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tRawPtr()], Ty.tInt()))))
-    Array.push(out, ("Prim.ptrNull",
-        Ty.mono(TFun([], Ty.tRawPtr()))))
+    PtrAdd -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt()], Ty.tRawPtr()))
+    PtrDiff -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tRawPtr()], Ty.tInt()))
+    PtrNull -> Ty.mono(TFun([], Ty.tRawPtr()))
+    PtrIsNull -> Ty.mono(TFun([Ty.tRawPtr()], Ty.tBool()))
+    PtrEq -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tRawPtr()], Ty.tBool()))
+    PtrToInt -> Ty.mono(TFun([Ty.tRawPtr()], Ty.tInt()))
+    PtrFromInt -> Ty.mono(TFun([Ty.tInt()], Ty.tRawPtr()))
+    -- The address of a value held as a pointer -- a record, a constructor's
+    -- value, an array -- for the raw and atomic accesses: what `System.Sync`
+    -- keeps its state words at. Good while the value is live; the collector
+    -- does not move objects, but the address does not keep one alive.
+    ObjectAddress -> forall1(fun(a) = TFun([a], Ty.tRawPtr()))
     -- Addresses fixed when the program is linked, for giblet code that cannot
     -- hold what the address stands in for:
     --
@@ -59,206 +75,108 @@ fun schemes() -> Array (String, Scheme) {
     -- through a raw pointer. `frameAddress` is defined only as a bound -- the
     -- frames of everything the function calls are below it -- which is what
     -- the collector's stack walk needs.
-    Array.push(out, ("Prim.cString",
-        Ty.mono(TFun([Ty.tString()], Ty.tRawPtr()))))
-    Array.push(out, ("Prim.codeAddress",
-        Ty.mono(TFun([Ty.tString()], Ty.tRawPtr()))))
-    Array.push(out, ("Prim.frameAddress",
-        Ty.mono(TFun([], Ty.tRawPtr()))))
-    Array.push(out, ("Prim.processState",
-        Ty.mono(TFun([], Ty.tRawPtr()))))
+    CString -> Ty.mono(TFun([Ty.tString()], Ty.tRawPtr()))
+    CodeAddress -> Ty.mono(TFun([Ty.tString()], Ty.tRawPtr()))
+    FrameAddress -> Ty.mono(TFun([], Ty.tRawPtr()))
+    ProcessState -> Ty.mono(TFun([], Ty.tRawPtr()))
     -- Park the running stack on the stack record `from` and resume the one
     -- `to` was parked on; this call returns when something resumes `from`.
     -- Both are `Turkey.Stack`'s raw stack records. Nothing crosses the switch
     -- but control: a value passed between stacks goes through the heap, where
     -- its type is checked.
-    Array.push(out, ("Prim.swapStack",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tRawPtr()], Ty.tUnit()))))
-    Array.push(out, ("Prim.ptrIsNull",
-        Ty.mono(TFun([Ty.tRawPtr()], Ty.tBool()))))
-    Array.push(out, ("Prim.ptrEq",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tRawPtr()], Ty.tBool()))))
-    Array.push(out, ("Prim.ptrToInt",
-        Ty.mono(TFun([Ty.tRawPtr()], Ty.tInt()))))
-    Array.push(out, ("Prim.ptrFromInt",
-        Ty.mono(TFun([Ty.tInt()], Ty.tRawPtr()))))
-    -- The address of a value held as a pointer -- a record, a constructor's
-    -- value, an array -- for the raw and atomic accesses: what `System.Sync`
-    -- keeps its state words at. Good while the value is live; the collector
-    -- does not move objects, but the address does not keep one alive.
-    {
-        let v0 = Ty.newVar(1, Ty.kvar())
-        Array.push(out, ("Prim.objectAddress", Ty.scheme([v0],
-            TFun([TVar(v0)], Ty.tRawPtr()), Array.new(0))))
-    }
+    SwapStack -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tRawPtr()], Ty.tUnit()))
     -- Raw load and store, one name per representation, at a byte offset from
     -- the address. One language type per class: `i1` is `Bool`, `i8` is
     -- `Byte`, `i32` is `Char`, `i64` is `Int`, `f64` is `Float` and `ptr` is
     -- another raw address. `i1` touches one byte, and memory is
     -- little-endian because arm64 is. Loading an `i32` that is not a scalar
     -- value is undefined, and nothing checks it.
-    Array.push(out, ("Prim.loadI1",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt()], Ty.tBool()))))
-    Array.push(out, ("Prim.loadI8",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt()], Ty.tByte()))))
-    Array.push(out, ("Prim.loadI32",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt()], Ty.tChar()))))
-    Array.push(out, ("Prim.loadI64",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.loadF64",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt()], Ty.tFloat()))))
-    Array.push(out, ("Prim.loadPtr",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt()], Ty.tRawPtr()))))
-    Array.push(out, ("Prim.storeI1",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), Ty.tBool()], Ty.tUnit()))))
-    Array.push(out, ("Prim.storeI8",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), Ty.tByte()], Ty.tUnit()))))
-    Array.push(out, ("Prim.storeI32",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), Ty.tChar()], Ty.tUnit()))))
-    Array.push(out, ("Prim.storeI64",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), Ty.tInt()], Ty.tUnit()))))
+    LoadI1 -> load(Ty.tBool())
+    LoadI8 -> load(Ty.tByte())
+    LoadI32 -> load(Ty.tChar())
+    LoadI64 -> load(Ty.tInt())
+    LoadF64 -> load(Ty.tFloat())
+    LoadPtr -> load(Ty.tRawPtr())
+    StoreI1 -> store(Ty.tBool())
+    StoreI8 -> store(Ty.tByte())
+    StoreI32 -> store(Ty.tChar())
+    StoreI64 -> store(Ty.tInt())
+    StoreF64 -> store(Ty.tFloat())
+    StorePtr -> store(Ty.tRawPtr())
     -- Atomic accesses to an `Int` at a byte offset into raw memory:
     -- `atomicCas(p, off, expected, new)` answers the value it found, and
     -- stored `new` exactly when that is `expected`; `atomicAdd(p, off, n)`
     -- answers the value before. Each orders every access around it.
-    Array.push(out, ("Prim.atomicCas",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), Ty.tInt(), Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.atomicAdd",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.atomicLoad",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.atomicStore",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), Ty.tInt()], Ty.tUnit()))))
-    Array.push(out, ("Prim.storeF64",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), Ty.tFloat()], Ty.tUnit()))))
-    Array.push(out, ("Prim.storePtr",
-        Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), Ty.tRawPtr()], Ty.tUnit()))))
-    {
-        let v0 = Ty.newVar(1, Ty.kvar())
-        Array.push(out, ("Prim.arrayNew", Ty.scheme([v0],
-            TFun([Ty.tInt(), TVar(v0)], TApp(Ty.tRawArray(), TVar(v0), KStar)), Array.new(0))))
-    }
-    {
-        let v0 = Ty.newVar(1, Ty.kvar())
-        Array.push(out, ("Prim.arrayNewUninit", Ty.scheme([v0],
-            TFun([Ty.tInt()], TApp(Ty.tRawArray(), TVar(v0), KStar)), Array.new(0))))
-    }
-    {
-        -- The conversion half of a checked cast. Two
-        -- independent variables: it is handed a value of one type and answers
-        -- one of another, which is only sound because `Data.Error.cast`
-        -- compares the two type reps before calling it.
-        let c0 = Ty.newVar(1, Ty.kvar())
-        let c1 = Ty.newVar(1, Ty.kvar())
-        Array.push(out, ("Prim.castAs", Ty.scheme([c0, c1],
-            TFun([TVar(c0)], TVar(c1)), Array.new(0))))
-    }
-    {
-        let v0 = Ty.newVar(1, Ty.kvar())
-        Array.push(out, ("Prim.arrayGet", Ty.scheme([v0],
-            TFun([TApp(Ty.tRawArray(), TVar(v0), KStar), Ty.tInt()], TVar(v0)), Array.new(0))))
-    }
-    {
-        let v0 = Ty.newVar(1, Ty.kvar())
-        Array.push(out, ("Prim.arraySet", Ty.scheme([v0],
-            TFun([TApp(Ty.tRawArray(), TVar(v0), KStar), Ty.tInt(), TVar(v0)], Ty.tUnit()), Array.new(0))))
-    }
-    {
-        let v0 = Ty.newVar(1, Ty.kvar())
-        Array.push(out, ("Prim.arrayLength", Ty.scheme([v0],
-            TFun([TApp(Ty.tRawArray(), TVar(v0), KStar)], Ty.tInt()), Array.new(0))))
-    }
-    Array.push(out, ("Prim.charFromInt",
-        Ty.mono(TFun([Ty.tInt()], Ty.tChar()))))
-    Array.push(out, ("Prim.charIsScalar",
-        Ty.mono(TFun([Ty.tInt()], Ty.tBool()))))
-    Array.push(out, ("Prim.charToInt",
-        Ty.mono(TFun([Ty.tChar()], Ty.tInt()))))
-    Array.push(out, ("Prim.byteFromInt",
-        Ty.mono(TFun([Ty.tInt()], Ty.tByte()))))
-    Array.push(out, ("Prim.byteToInt",
-        Ty.mono(TFun([Ty.tByte()], Ty.tInt()))))
-    Array.push(out, ("Prim.byteEq",
-        Ty.mono(TFun([Ty.tByte(), Ty.tByte()], Ty.tBool()))))
-    Array.push(out, ("Prim.byteLt",
-        Ty.mono(TFun([Ty.tByte(), Ty.tByte()], Ty.tBool()))))
-    Array.push(out, ("Prim.intToFloat",
-        Ty.mono(TFun([Ty.tInt()], Ty.tFloat()))))
-    Array.push(out, ("Prim.floatTruncate",
-        Ty.mono(TFun([Ty.tFloat()], Ty.tInt()))))
-    Array.push(out, ("Prim.floatFitsInt",
-        Ty.mono(TFun([Ty.tFloat()], Ty.tBool()))))
-    Array.push(out, ("Prim.intAdd",
-        Ty.mono(TFun([Ty.tInt(), Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.intSub",
-        Ty.mono(TFun([Ty.tInt(), Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.intMul",
-        Ty.mono(TFun([Ty.tInt(), Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.intDiv",
-        Ty.mono(TFun([Ty.tInt(), Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.intRem",
-        Ty.mono(TFun([Ty.tInt(), Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.intNeg",
-        Ty.mono(TFun([Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.intAddWrapping",
-        Ty.mono(TFun([Ty.tInt(), Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.intSubWrapping",
-        Ty.mono(TFun([Ty.tInt(), Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.intMulWrapping",
-        Ty.mono(TFun([Ty.tInt(), Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.intNegWrapping",
-        Ty.mono(TFun([Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.intAnd",
-        Ty.mono(TFun([Ty.tInt(), Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.intOr",
-        Ty.mono(TFun([Ty.tInt(), Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.intXor",
-        Ty.mono(TFun([Ty.tInt(), Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.intNot",
-        Ty.mono(TFun([Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.intShl",
-        Ty.mono(TFun([Ty.tInt(), Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.intShr",
-        Ty.mono(TFun([Ty.tInt(), Ty.tInt()], Ty.tInt()))))
-    Array.push(out, ("Prim.not",
-        Ty.mono(TFun([Ty.tBool()], Ty.tBool()))))
-    Array.push(out, ("Prim.intEq",
-        Ty.mono(TFun([Ty.tInt(), Ty.tInt()], Ty.tBool()))))
-    Array.push(out, ("Prim.intLt",
-        Ty.mono(TFun([Ty.tInt(), Ty.tInt()], Ty.tBool()))))
-    Array.push(out, ("Prim.floatAdd",
-        Ty.mono(TFun([Ty.tFloat(), Ty.tFloat()], Ty.tFloat()))))
-    Array.push(out, ("Prim.floatSub",
-        Ty.mono(TFun([Ty.tFloat(), Ty.tFloat()], Ty.tFloat()))))
-    Array.push(out, ("Prim.floatMul",
-        Ty.mono(TFun([Ty.tFloat(), Ty.tFloat()], Ty.tFloat()))))
-    Array.push(out, ("Prim.floatDiv",
-        Ty.mono(TFun([Ty.tFloat(), Ty.tFloat()], Ty.tFloat()))))
-    Array.push(out, ("Prim.floatNeg",
-        Ty.mono(TFun([Ty.tFloat()], Ty.tFloat()))))
-    Array.push(out, ("Prim.floatBits",
-        Ty.mono(TFun([Ty.tFloat()], Ty.tInt()))))
-    Array.push(out, ("Prim.floatFromBits",
-        Ty.mono(TFun([Ty.tInt()], Ty.tFloat()))))
-    Array.push(out, ("Prim.floatIsNaN",
-        Ty.mono(TFun([Ty.tFloat()], Ty.tBool()))))
-    Array.push(out, ("Prim.floatEq",
-        Ty.mono(TFun([Ty.tFloat(), Ty.tFloat()], Ty.tBool()))))
-    Array.push(out, ("Prim.floatLt",
-        Ty.mono(TFun([Ty.tFloat(), Ty.tFloat()], Ty.tBool()))))
-    Array.push(out, ("Prim.floatLte",
-        Ty.mono(TFun([Ty.tFloat(), Ty.tFloat()], Ty.tBool()))))
-    Array.push(out, ("Prim.floatGt",
-        Ty.mono(TFun([Ty.tFloat(), Ty.tFloat()], Ty.tBool()))))
-    Array.push(out, ("Prim.floatGte",
-        Ty.mono(TFun([Ty.tFloat(), Ty.tFloat()], Ty.tBool()))))
-    Array.push(out, ("Prim.charEq",
-        Ty.mono(TFun([Ty.tChar(), Ty.tChar()], Ty.tBool()))))
-    Array.push(out, ("Prim.charLt",
-        Ty.mono(TFun([Ty.tChar(), Ty.tChar()], Ty.tBool()))))
-    Array.push(out, ("Prim.boolEq",
-        Ty.mono(TFun([Ty.tBool(), Ty.tBool()], Ty.tBool()))))
-    Array.push(out, ("Prim.boolLt",
-        Ty.mono(TFun([Ty.tBool(), Ty.tBool()], Ty.tBool()))))
-    out
+    AtomicCas ->
+        Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), Ty.tInt(), Ty.tInt()], Ty.tInt()))
+    AtomicAdd -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), Ty.tInt()], Ty.tInt()))
+    AtomicLoad -> Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt()], Ty.tInt()))
+    AtomicStore -> store(Ty.tInt())
+    ArrayNew -> forall1(fun(a) = TFun([Ty.tInt(), a], rawArray(a)))
+    ArrayNewUninit -> forall1(fun(a) = TFun([Ty.tInt()], rawArray(a)))
+    ArrayGet -> forall1(fun(a) = TFun([rawArray(a), Ty.tInt()], a))
+    ArraySet -> forall1(fun(a) = TFun([rawArray(a), Ty.tInt(), a], Ty.tUnit()))
+    ArrayLength -> forall1(fun(a) = TFun([rawArray(a)], Ty.tInt()))
+    -- The conversion half of a checked cast. Two independent variables: it is
+    -- handed a value of one type and answers one of another, which is only
+    -- sound because `Data.Error.cast` compares the two type reps before
+    -- calling it.
+    CastAs -> forall2(fun(a, b) = TFun([a], b))
+    CharFromInt -> Ty.mono(TFun([Ty.tInt()], Ty.tChar()))
+    CharIsScalar -> Ty.mono(TFun([Ty.tInt()], Ty.tBool()))
+    CharToInt -> Ty.mono(TFun([Ty.tChar()], Ty.tInt()))
+    CharEq -> relation(Ty.tChar())
+    CharLt -> relation(Ty.tChar())
+    ByteFromInt -> Ty.mono(TFun([Ty.tInt()], Ty.tByte()))
+    ByteToInt -> Ty.mono(TFun([Ty.tByte()], Ty.tInt()))
+    ByteEq -> relation(Ty.tByte())
+    ByteLt -> relation(Ty.tByte())
+    IntAdd -> binary(Ty.tInt())
+    IntSub -> binary(Ty.tInt())
+    IntMul -> binary(Ty.tInt())
+    IntDiv -> binary(Ty.tInt())
+    IntRem -> binary(Ty.tInt())
+    IntNeg -> unary(Ty.tInt())
+    IntAddWrapping -> binary(Ty.tInt())
+    IntSubWrapping -> binary(Ty.tInt())
+    IntMulWrapping -> binary(Ty.tInt())
+    IntNegWrapping -> unary(Ty.tInt())
+    IntAnd -> binary(Ty.tInt())
+    IntOr -> binary(Ty.tInt())
+    IntXor -> binary(Ty.tInt())
+    IntNot -> unary(Ty.tInt())
+    IntShl -> binary(Ty.tInt())
+    IntShr -> binary(Ty.tInt())
+    IntEq -> relation(Ty.tInt())
+    IntLt -> relation(Ty.tInt())
+    IntToFloat -> Ty.mono(TFun([Ty.tInt()], Ty.tFloat()))
+    FloatAdd -> binary(Ty.tFloat())
+    FloatSub -> binary(Ty.tFloat())
+    FloatMul -> binary(Ty.tFloat())
+    FloatDiv -> binary(Ty.tFloat())
+    FloatNeg -> unary(Ty.tFloat())
+    FloatTruncate -> Ty.mono(TFun([Ty.tFloat()], Ty.tInt()))
+    FloatFitsInt -> Ty.mono(TFun([Ty.tFloat()], Ty.tBool()))
+    FloatBits -> Ty.mono(TFun([Ty.tFloat()], Ty.tInt()))
+    FloatFromBits -> Ty.mono(TFun([Ty.tInt()], Ty.tFloat()))
+    FloatIsNaN -> Ty.mono(TFun([Ty.tFloat()], Ty.tBool()))
+    FloatEq -> relation(Ty.tFloat())
+    FloatLt -> relation(Ty.tFloat())
+    FloatLte -> relation(Ty.tFloat())
+    FloatGt -> relation(Ty.tFloat())
+    FloatGte -> relation(Ty.tFloat())
+    Not -> unary(Ty.tBool())
+    BoolEq -> relation(Ty.tBool())
+    BoolLt -> relation(Ty.tBool())
 }
+
+fun load(t : Type) -> Scheme = Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt()], t))
+
+fun store(t : Type) -> Scheme =
+    Ty.mono(TFun([Ty.tRawPtr(), Ty.tInt(), t], Ty.tUnit()))
+
+fun unary(t : Type) -> Scheme = Ty.mono(TFun([t], t))
+
+fun binary(t : Type) -> Scheme = Ty.mono(TFun([t, t], t))
+
+fun relation(t : Type) -> Scheme = Ty.mono(TFun([t, t], Ty.tBool()))

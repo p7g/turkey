@@ -1,5 +1,5 @@
 module Turkey.Runtime (
-    Entry(..), layoutCode, traceBit, elementWidth, accessWidth, entryPoint,
+    Entry(..), Routine(..), routineName, layoutCode, traceBit, elementWidth, accessWidth, entryPoint,
     processState, processStateBytes, voidSymbols, immediates, fieldLimit,
     headerBytes, headerGeneration, headerSize, headerKind, young, heapObject, heapCell,
     workerCursors, cursorBytes, cursorFree, cursorBase, cursorSlot, sizeClass, classSlot,
@@ -185,7 +185,7 @@ let referencedSymbols = [
     "turkey_main", "turkey_entry_returned", "turkey_entry_stack_set",
     "turkey_frame_table_register", "turkey_root_enter", "turkey_string_new",
     -- Selection: the slow paths of allocation, the write barrier, panics,
-    -- and `Prim.exit` (`entries`).
+    -- and `Prim.exit` (`entryPoint`).
     "turkey_object_new", "turkey_cell_new", "turkey_closure_shell",
     "turkey_array_new", "turkey_write_barrier", "turkey_panic",
     "turkey_panic_string", "turkey_exit",
@@ -210,24 +210,21 @@ let referencedSymbols = [
 -- (`Turkey.Arm64.PreservesNone`).
 type Entry = Entry { symbol : String, result : Option RepClass, switchesStacks : Bool }
 
--- Primitive name to runtime entry point.
---
--- `None` means no entry point, which is not the same as unsupported: some
--- primitives are a compare or two and each emitter inlines them rather than
--- pay a call. An emitter that cannot inline one reports it and stops the
--- function.
-fun entryPoint(name : String) -> Option Entry {
-    for (primitive, entry) in entries {
-        if primitive == name { return Some(entry) }
-    }
-    None
+-- A primitive the runtime implements, which is what a `Runtime` call calls.
+type Routine = Exit | SwapStack
+
+let routines = [Exit, SwapStack]
+
+fun entryPoint(r : Routine) -> Entry = match r {
+    Exit -> Entry { symbol = "turkey_exit", result = None, switchesStacks = False }
+    SwapStack -> Entry { symbol = swapStackSymbol, result = None, switchesStacks = True }
 }
 
-let entries = [
-    ("Prim.exit", Entry { symbol = "turkey_exit", result = None, switchesStacks = False }),
-    ("Prim.swapStack",
-     Entry { symbol = swapStackSymbol, result = None, switchesStacks = True }),
-]
+-- How the IR dump spells a routine: as the primitive it implements.
+fun routineName(r : Routine) -> String = match r {
+    Exit -> "Prim.exit"
+    SwapStack -> "Prim.swapStack"
+}
 
 -- -- stacks -------------------------------------------------------------------------
 
@@ -273,7 +270,8 @@ fun emitsSymbol(symbol : String) -> Bool =
 -- reads whatever the callee last left there.
 fun voidSymbols() -> Array String {
     let out = []
-    for (_, entry) in entries {
+    for r in routines {
+        let entry = entryPoint(r)
         if let None = entry.result { Array.push(out, entry.symbol) }
     }
     out

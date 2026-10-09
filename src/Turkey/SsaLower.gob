@@ -125,8 +125,6 @@ type Lower = Lower {
     -- The runtime tag of each constructor. A whole-program numbering, so it is
     -- computed once and handed down rather than derived per function.
     tags    : Map String Int,
-    -- Constructor name -> its fields, in the order the object holds them.
-    fields  : Map String (Array String),
     -- What a direct call must coerce to, per callee. Program-wide, and read
     -- rather than derived: the caller and the callee agree because they read
     -- one table, not because they compute the same thing twice.
@@ -147,9 +145,7 @@ type Lower = Lower {
     var flatRefs : Set.Set String,
     var flatRecords : Set.Set String,
     localRefs : Map Int (Int, Rep),
-    -- A local dictionary's slots, by field name.
-    localRecords : Map Int (Map String (Int, Rep)),
-    -- A local record's slots, by position.
+    -- A local record's or dictionary's slots, by position.
     localObjects : Map Int (Array (Int, Rep)),
     var nextSlot : Int,
 }
@@ -209,7 +205,9 @@ fun repOf(l : Lower, ty : Ty.Type) -> Rep = repIn(l.decls, l.layouts, ty)
 
 -- -- lowering -----------------------------------------------------------------------
 
-fun lowerProgram(program : CProgram, decls : DeclTable)
+-- `classes` are the program's classes, whose dictionaries are numbered beside
+-- its constructors (`tagsOf`).
+fun lowerProgram(program : CProgram, decls : DeclTable, classes : Array String)
         -> (Module, Array Unsupported) {
     let done : Array (Ssa.Func Low) = []
     let skipped : Array Unsupported = []
@@ -225,14 +223,13 @@ fun lowerProgram(program : CProgram, decls : DeclTable)
                     repIn(decls, bind.layouts, Core.refElem(bind.ty)))
         }
     }
-    let fields = recordLayouts(program, decls)
-    let tags = tagsOf(decls, fields)
+    let tags = tagsOf(decls, classes)
     let sigs = signatures(program, decls)
     -- Each binding on its own, on as many workers as there are: lowering
     -- reads the tables above and writes only what it makes.
     let all = Array.append(program.dicts, program.binds)
     let made = Parallel.map(all, fun(bind) =
-        lowerBind(bind, decls, globals, globalRefs, tags, fields, sigs, Lifting { next = 0 }))
+        lowerBind(bind, decls, globals, globalRefs, tags, sigs, Lifting { next = 0 }))
     for var i = 0; i < len(all); i = i + 1 {
         let bind = all[i]
         let (f, lifted, why) = made[i]
@@ -256,7 +253,7 @@ fun lowerProgram(program : CProgram, decls : DeclTable)
     }
     -- Global initializers can also introduce lifted lambdas.
     let (init, early, lifted, storage) = initializer(program, decls, globals, globalRefs, tags,
-                                              fields, sigs, Lifting { next = 0 })
+                                              sigs, Lifting { next = 0 })
     Array.push(done, init)
     Array.push(done, early)
     for g in lifted { Array.push(done, g) }
@@ -395,16 +392,14 @@ fun signatureOf(decls : DeclTable, bind : CBind) -> Option Signature {
 -- object that outlives the compilation that made it. Nothing reads a tag by
 -- name at run time; what matters is that one compilation agrees with itself,
 -- and that the numbering does not move when an unrelated module gains a type.
-fun tagsOf(decls : DeclTable,
-           fields : Map String (Array String)) -> Map String Int {
-    -- The dictionaries too, which are constructors nothing declared. Their
-    -- tag is never tested -- a dictionary type has one shape -- but it is
-    -- written into the object, and a numbering that omitted them would give
-    -- two different dictionaries the same `-1`.
-    let every = Set.new()
-    for name in Map.keys(decls.constructors) { Set.add(every, name) }
-    for name in Map.keys(fields) { Set.add(every, name) }
-    let names = Array.sort(Set.elements(every))
+--
+-- The dictionaries too, numbered after every constructor, one per class. Their
+-- tag is never tested -- a dictionary type has one shape -- but it is written
+-- into the object, and a numbering that omitted them would give two different
+-- dictionaries the same `-1`.
+fun tagsOf(decls : DeclTable, classes : Array String) -> Map String Int {
+    let names = Array.append(Array.sort(Map.keys(decls.constructors)),
+                             Array.map(Array.sort(classes), Core.dictName))
     let out = Map.new()
     for var i = 0; i < len(names); i = i + 1 { Map.put(out, names[i], i) }
     out
@@ -414,7 +409,7 @@ fun tagsOf(decls : DeclTable,
 -- it, and the form that stopped it.
 fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
               globalRefs : Map String Rep,
-              tags : Map String Int, fields : Map String (Array String),
+              tags : Map String Int,
               sigs : Map String Signature, shared : Lifting)
         -> (Option (Ssa.Func Low), Array (Ssa.Func Low), Option String) {
     -- Not a function: a global whose value the module initializer computes,
@@ -444,7 +439,7 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
     }
     let f = Ssa.newFunc(bind.name, sig.result)
     Array.push(f.params, Ssa.freshValue(f, Ssa.traced(Ptr)))
-    let l = newLower(decls, f, globals, globalRefs, tags, fields, sigs, bind.layouts, [],
+    let l = newLower(decls, f, globals, globalRefs, tags, sigs, bind.layouts, [],
                      shared)
     let entry = L.block(l.b)
     L.into(l.b, entry)
@@ -473,64 +468,16 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
 -- shared cannot be shared in two of them and copied in the third.
 fun newLower(decls : DeclTable, f : Ssa.Func Low, globals : Set.Set String,
              globalRefs : Map String Rep,
-             tags : Map String Int, fields : Map String (Array String),
+             tags : Map String Int,
              sigs : Map String Signature, layouts : Map String String,
              lifted : Array (Ssa.Func Low), shared : Lifting) -> Lower = Lower {
     decls = decls, func = f, b = L.builder(f, BlockId(0)),
     env = Map.new(), joins = Map.new(), globals = globals, tags = tags,
     globalRefs = globalRefs,
-    fields = fields, sigs = sigs, layouts = layouts, lifted = lifted,
+    sigs = sigs, layouts = layouts, lifted = lifted,
     shared = shared, stopped = None, flatRefs = Set.new(), flatRecords = Set.new(),
-    localRefs = Map.new(), localRecords = Map.new(), localObjects = Map.new(),
+    localRefs = Map.new(), localObjects = Map.new(),
     nextSlot = 0,
-}
-
--- Every constructor's fields, in the order its object holds them.
---
--- `Turkey.Decls` knows the ones a program *declared*, and a dictionary is not
--- one of them: its type and its constructor are synthesized when evidence
--- becomes a value, so nothing registers them. What does know is the program
--- itself -- every dictionary is a `CRecord` somewhere in it -- so the records
--- are collected by walking it, which is what `turkey/backend_lower.py`'s
--- `_record_layouts` does and for the same reason.
---
--- The traversal is `Core.mapKind` with an identity rebuild, used for its
--- totality rather than its result: a form this misses is a dictionary whose
--- fields are read at the wrong offsets, and exhaustiveness is what stops a
--- later node from being forgotten here.
-fun recordLayouts(program : CProgram,
-                  decls : DeclTable) -> Map String (Array String) {
-    let out = Map.new()
-    for (_, info) in Map.entries(decls.constructors) {
-        match info.fields {
-            Some(names) -> Map.put(out, info.name, names)
-            None -> {}
-        }
-    }
-    for bind in Array.append(program.dicts, program.binds) {
-        collectRecords(bind.value, out)
-    }
-    out
-}
-
-fun collectRecords(e : Core, out : Map String (Array String)) -> Unit {
-    match e.kind {
-        CRecord(con, fs) -> if !Map.contains(out, con) {
-            Map.put(out, con, Array.map(fs, _.0))
-        }
-        _ -> {}
-    }
-    let _ = Core.mapKind(e.kind, Mapper {
-        expr = fun(inner) = {
-            collectRecords(inner, out)
-            inner
-        },
-        type_ = fun(t) = t,
-        bind = fun(b) = {
-            collectRecords(b.value, out)
-            b
-        },
-    })
 }
 
 -- A binding's value as parameters and a body, with type abstraction erased.
@@ -616,13 +563,10 @@ fun localBinding(l : Lower, name : String, bound : Core) -> Value {
             Map.put(l.localRefs, Ssa.valueId(marker), localSlot(l, v))
             return marker
         }
-        CRecord(_, fields) -> if Set.contains(l.flatRecords, name) {
-            let slots = Map.new()
-            for (field, inner) in fields {
-                Map.put(slots, field, localSlot(l, value(l, inner)))
-            }
+        CDict(_, items) -> if Set.contains(l.flatRecords, name) {
+            let slots = Array.map(items, fun(inner) = localSlot(l, value(l, inner)))
             let marker = Ssa.freshValue(l.func, Ssa.traced(Ptr))
-            Map.put(l.localRecords, Ssa.valueId(marker), slots)
+            Map.put(l.localObjects, Ssa.valueId(marker), slots)
             return marker
         }
         CApp(fn, args) -> if Set.contains(l.flatRecords, name) && builds(l, fn) {
@@ -646,7 +590,6 @@ fun builds(l : Lower, fn : Core) -> Bool = match fn.kind {
 
 fun isMarker(l : Lower, v : Value) -> Bool =
     Map.contains(l.localRefs, Ssa.valueId(v))
-        || Map.contains(l.localRecords, Ssa.valueId(v))
         || Map.contains(l.localObjects, Ssa.valueId(v))
 
 fun localSlot(l : Lower, v : Value) -> (Int, Rep) {
@@ -671,18 +614,6 @@ fun localRef(l : Lower, e : Core) -> Option (Int, Rep) = match e.kind {
     }
     _ -> None
 }
-
-fun localField(l : Lower, e : Core, field : String) -> Option (Int, Rep) =
-    match e.kind {
-        CVar(name) -> match Map.get(l.env, name) {
-            Some(v) -> match Map.get(l.localRecords, Ssa.valueId(v)) {
-                Some(slots) -> Map.get(slots, field)
-                None -> None
-            }
-            None -> None
-        }
-        _ -> None
-    }
 
 fun localPosition(l : Lower, e : Core, index : Int) -> Option (Int, Rep) =
     match e.kind {
@@ -1342,19 +1273,9 @@ fun valueHere(l : Lower, e : Core) -> Value {
             None -> L.emit(l.b, ObjectGet(value(l, target), index), rep)
             }
         }
-        CField(target, name) -> match localField(l, target, name) {
+        CSlot(target, index) -> match localPosition(l, target, index) {
             Some((slot, held)) -> coerce(l, L.emit(l.b, SlotLoad(slot), held), rep)
-            None -> match Decls.erasedPayload(l.decls, target.ty) {
-            Some(_) -> value(l, target)
-            None -> {
-                let object = value(l, target)
-                match fieldIndex(l, target.ty, name) {
-                    Some(index) -> L.emit(l.b, ObjectGet(object, index), rep)
-                    None -> stop(l, "the field '" + name + "' of "
-                                    + Ty.typeKey(target.ty))
-                }
-            }
-        }
+            None -> L.emit(l.b, ObjectGet(value(l, target), index), rep)
         }
         CIndex(target, index) -> {
             let array = value(l, target)
@@ -1369,25 +1290,10 @@ fun valueHere(l : Lower, e : Core) -> Value {
             L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
         }
         CTuple(elems) -> aggregate(l, elems, 0, -1, 0, "builds a tuple")
-        CRecord(con, fields) -> {
-            -- The one table, so a dictionary is *built* in the order it is
-            -- later *read* in. Two sources for that order is how a field ends
-            -- up written at one offset and read at another.
-            let order = Map.getOr(l.fields, con, [])
-            -- Declaration order, not the order they were written in: the
-            -- object's shape belongs to the type.
-            let sorted = []
-            for name in order {
-                for (label, x) in fields {
-                    if label == name { Array.push(sorted, x) }
-                }
-            }
-            let items = if len(sorted) == len(fields) { sorted }
-                        else { Array.map(fields, _.1) }
-            aggregate(l, items, 1, Map.getOr(l.tags, con, -1),
-                      mutableMask(l, con, len(items)),
-                      "builds a record, " + Ty.shortName(con))
-        }
+        -- Mutable throughout, as a dictionary the initializer fills one slot
+        -- at a time must be: the masks of all dictionaries of a class agree.
+        CDict(cls, slots) -> aggregate(l, slots, 1, Map.getOr(l.tags, Core.dictName(cls), -1),
+                                       allFields(len(slots)), "builds a dictionary, " + cls)
         CArray(elems) -> arrayLiteral(l, e, elems)
         CCon(name) -> match Ty.prune(e.ty) {
             TFun(_, _) -> stop(l, "the constructor '" + name + "' must be saturated")
@@ -1446,18 +1352,6 @@ fun store(l : Lower, target : Core, x : Value) -> Unit = match target.kind {
     CIndex(array, index) -> {
         let a = value(l, array)
         L.effect(l.b, ArraySet(a, value(l, index), x, Checked))
-    }
-    CField(receiver, name) -> match localField(l, receiver, name) {
-        Some((slot, held)) -> L.effect(l.b, SlotStore(slot, coerce(l, x, held)))
-        None -> {
-        let object = value(l, receiver)
-        match fieldIndex(l, receiver.ty, name) {
-            Some(index) -> L.effect(l.b, ObjectSet(object, index, x))
-            None -> {
-                let _ = stop(l, "an assignment to a field with no known layout")
-            }
-        }
-    }
     }
     CProject(receiver, index) -> match localPosition(l, receiver, index) {
         Some((slot, held)) -> L.effect(l.b, SlotStore(slot, coerce(l, x, held)))
@@ -1653,7 +1547,7 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     -- closure outlives the frame that binds the join, so no label is in scope
     -- and sharing the parent's map would be a jump into a dead frame.
     -- `Turkey.Core`'s note on tail positions says exactly this.
-    let child = newLower(l.decls, g, l.globals, l.globalRefs, l.tags, l.fields, l.sigs,
+    let child = newLower(l.decls, g, l.globals, l.globalRefs, l.tags, l.sigs,
                          l.layouts, l.lifted, l.shared)
     let entry = L.block(child.b)
     L.into(child.b, entry)
@@ -2149,7 +2043,7 @@ fun call(l : Lower, e : Core, fn : Core, args : Array Core, rep : Rep) -> Value 
         CTyApp(_, _) -> call(l, e, Core.mkCore(fn.ty, fn.span, erased(fn).kind), args, rep)
         CTyLam(_, _) -> call(l, e, Core.mkCore(fn.ty, fn.span, erased(fn).kind), args, rep)
         -- Anything else evaluates to a function *value*, which is a closure:
-        -- a method out of a dictionary (`CField`), the result of another call,
+        -- a method out of a dictionary (`CSlot`), the result of another call,
         -- a field of a record. That is the common shape in this language --
         -- every method call is one -- and there is nothing to decide, because
         -- a value that is not a known symbol is reached the only way a value
@@ -2500,55 +2394,6 @@ fun elementRep(l : Lower, ty : Ty.Type) -> Rep {
     if len(args) > 0 { repOf(l, args[0]) } else { Ssa.traced(Ptr) }
 }
 
--- Where a named field sits in its object.
---
--- `Decls.recordFields` answers only for a *plain* record, which is the
--- surface language's record and not the only thing with named fields: a
--- dictionary is a record of methods, and an instance's superclasses are fields
--- of it. So the variants are searched too, which is what
--- `turkey/backend_lower.py`'s `field_index` does -- and a method selection
--- being an ordinary field read is the point of the milestone that made
--- evidence a value.
-fun fieldIndex(l : Lower, ty : Ty.Type, name : String) -> Option Int {
-    let (h, _) = Ty.spine(Ty.prune(ty))
-    match h {
-        TCon(c) -> {
-            -- The program's own record shapes first: a dictionary's type and
-            -- its constructor share a name, and nothing else knows its fields.
-            match Map.get(l.fields, c.name) {
-                Some(names) -> match Array.indexOf(names, name) {
-                    Some(i) -> return Some(i)
-                    None -> {}
-                }
-                None -> {}
-            }
-            match Decls.recordFields(l.decls, c.name) {
-                Some(names) -> match Array.indexOf(names, name) {
-                    Some(i) -> return Some(i)
-                    None -> {}
-                }
-                None -> {}
-            }
-            match Map.get(l.decls.tycons, c.name) {
-                Some(info) -> {
-                    for con in info.variants {
-                        match con.fields {
-                            Some(names) -> match Array.indexOf(names, name) {
-                                Some(i) -> return Some(i)
-                                None -> {}
-                            }
-                            None -> {}
-                        }
-                    }
-                    None
-                }
-                None -> None
-            }
-        }
-        _ -> None
-    }
-}
-
 -- The name of a Core form, for reporting what is not lowered yet. Not
 -- `Core.showExpr`, which wants a namer and an alias table and would print a
 -- whole subtree where a word is wanted.
@@ -2560,8 +2405,8 @@ fun formOf(e : Core) -> String = match e.kind {
     CPrim(p) -> "the primitive '" + Prims.name(p) + "'"
     CTuple(_) -> "a tuple"
     CArray(_) -> "an array literal"
-    CRecord(_, _) -> "a record"
-    CField(_, _) -> "a field"
+    CDict(_, _) -> "a dictionary"
+    CSlot(_, _) -> "a dictionary slot"
     CProject(_, _) -> "a projection"
     CIndex(_, _) -> "an index"
     CLam(_, _, _) -> "a lambda"
@@ -2583,10 +2428,9 @@ fun formOf(e : Core) -> String = match e.kind {
 
 -- One global's contribution to the initializer.
 type Action
-    -- Allocate a dictionary's record and publish it *before* its fields are
-    -- computed, so a field that mentions the dictionary reaches a real
-    -- address.
-    = Placeholder(String, String, Array (String, Core))
+    -- Allocate a dictionary and publish it *before* its slots are computed, so
+    -- a slot that mentions the dictionary reaches a real address.
+    = Placeholder(String, String, Array Core)
     -- One field of a placeheld dictionary, once its object exists.
     | Field(String, Int, Core)
     -- An ordinary global: compute the value, store it.
@@ -2594,22 +2438,22 @@ type Action
 
 -- Every global, computed in one function.
 --
--- Three phases, and the first two exist for one reason: a dictionary's fields
+-- Three phases, and the first two exist for one reason: a dictionary's slots
 -- are the instance's methods, and a method mentions the dictionary it belongs
--- to. Building the record in one step would need its own address before it had
--- one. So every record-shaped dictionary is *allocated and published* first,
--- and its fields are stored afterwards -- the same shell-first discipline
--- `letrec` uses, for the same reason, one level up.
+-- to. Building the dictionary in one step would need its own address before it
+-- had one. So every dictionary is *allocated and published* first, and its
+-- slots are stored afterwards -- the same shell-first discipline `letrec`
+-- uses, for the same reason, one level up.
 --
 -- Each action's value is lowered under the *owning binding's* layouts and not
 -- the initializer's. `Turkey.Layout` gives a copy its layouts, and the copy of
--- a dictionary is a record built here, so an initializer that kept one empty
+-- a dictionary is built here, so an initializer that kept one empty
 -- map would lift the copy's methods with nothing known and read an array of
 -- `i1` at the boxed width, which is why `Lower` carries `layouts` per binding
 -- rather than per program.
 fun initializer(program : CProgram, decls : DeclTable,
                 globals : Set.Set String, globalRefs : Map String Rep,
-                tags : Map String Int, fields : Map String (Array String),
+                tags : Map String Int,
                 sigs : Map String Signature, shared : Lifting)
         -> (Ssa.Func Low, Ssa.Func Low, Array (Ssa.Func Low), Array (String, Rep)) {
     let storage = storageOf(program, decls)
@@ -2625,16 +2469,16 @@ fun initializer(program : CProgram, decls : DeclTable,
     for bind in program.dicts {
         if !Map.contains(held, bind.name) { continue }
         match erased(bind.value).kind {
-            CRecord(con, fields) -> {
-                Array.push(actions, Placeholder(bind.name, con, fields))
-                Array.push(deferred, (bind.name, fields))
+            CDict(cls, slots) -> {
+                Array.push(actions, Placeholder(bind.name, Core.dictName(cls), slots))
+                Array.push(deferred, (bind.name, slots))
             }
             _ -> Array.push(actions, Store(bind.name, bind.value))
         }
     }
-    for (name, fields) in deferred {
-        for var i = 0; i < len(fields); i = i + 1 {
-            Array.push(actions, Field(name, i, fields[i].1))
+    for (name, slots) in deferred {
+        for var i = 0; i < len(slots); i = i + 1 {
+            Array.push(actions, Field(name, i, slots[i]))
         }
     }
     let earlyActions : Array Action = []
@@ -2653,9 +2497,9 @@ fun initializer(program : CProgram, decls : DeclTable,
         }
     }
     let (early, earlyLifted) = lowerActions(Giblets.initializerName, earlyActions,
-        decls, globals, globalRefs, tags, fields, sigs, shared, layouts, held)
+        decls, globals, globalRefs, tags, sigs, shared, layouts, held)
     let (init, lifted) = lowerActions(initializerName, actions,
-        decls, globals, globalRefs, tags, fields, sigs, shared, layouts, held)
+        decls, globals, globalRefs, tags, sigs, shared, layouts, held)
     (init, early, Array.append(earlyLifted, lifted), storage)
 }
 
@@ -2664,12 +2508,12 @@ fun initializer(program : CProgram, decls : DeclTable,
 -- shells belong exclusively to the ordinary initializer.
 fun lowerActions(name : String, actions : Array Action, decls : DeclTable,
                  globals : Set.Set String, globalRefs : Map String Rep,
-                 tags : Map String Int, fields : Map String (Array String),
+                 tags : Map String Int,
                  sigs : Map String Signature, shared : Lifting,
                  layouts : Map String (Map String String), held : Map String Rep)
         -> (Ssa.Func Low, Array (Ssa.Func Low)) {
     let f = Ssa.newFunc(name, Ssa.untraced(Unit))
-    let l = newLower(decls, f, globals, globalRefs, tags, fields, sigs, Map.new(), [], shared)
+    let l = newLower(decls, f, globals, globalRefs, tags, sigs, Map.new(), [], shared)
     L.into(l.b, L.block(l.b))
     for a in actions {
         let owner = ownerOf(a)
@@ -2714,22 +2558,20 @@ fun ownerOf(a : Action) -> String = match a {
 -- goes to a block whose parameter receives it, and the store happens there,
 -- which leaves the cursor in the right place for the action after it. This is
 -- the same destination passing the rest of the module uses, and it is why the
--- initializer needs no reverse chaining: `turkey/backend_lower.py` builds its
--- blocks backwards because it must know a successor before the block that
--- jumps to it, and here the successor is simply where the cursor ends up.
+-- initializer needs no reverse chaining: the successor is simply where the
+-- cursor ends up.
 --
 -- Each value is analysed for escaping locals on its own, as a function's body
 -- is, so a `var` in an initializer -- or in whatever was inlined into one --
 -- is a local and not a heap cell.
 fun act(l : Lower, a : Action, held : Map String Rep) -> Unit = match a {
-    Placeholder(name, con, fields) -> {
-        -- Filled by the `Field` actions that follow, so every field is
-        -- mutable whatever the constructor, and starts as a zero.
-        let reps = []
-        for (_, v) in fields { Array.push(reps, repOf(l, v.ty)) }
+    Placeholder(name, con, slots) -> {
+        -- Filled by the `Field` actions that follow, so every slot is mutable,
+        -- and starts as a zero.
+        let reps = Array.map(slots, fun(v) = repOf(l, v.ty))
         let made = L.emit(l.b, ObjectNew(1, Map.getOr(l.tags, con, -1), metadata(reps),
                                          Array.map(reps, storageZero(l, _)),
-                                         allFields(len(fields))),
+                                         allFields(len(slots))),
                           Ssa.traced(Ptr))
         L.effect(l.b, GlobalStore(name, made))
     }

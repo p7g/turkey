@@ -146,11 +146,8 @@ fun anyKid(k : CoreKind, p : fun(Core) -> Bool) -> Bool = match k {
     CPrim(_) -> False
     CTuple(elems) -> anyOf(elems, p)
     CArray(elems) -> anyOf(elems, p)
-    CRecord(_, fields) -> {
-        for (_, value) in fields { if p(value) { return True } }
-        False
-    }
-    CField(target, _) -> p(target)
+    CDict(_, slots) -> anyOf(slots, p)
+    CSlot(target, _) -> p(target)
     CProject(target, _) -> p(target)
     CIndex(target, index) -> p(target) || p(index)
     CLam(_, body, _) -> p(body)
@@ -709,14 +706,14 @@ fun step(r : Reducer, e : Core) -> Option Core {
         -- generic function's dictionary parameter becomes the dictionary its
         -- caller passed. With the method's own types when it has some, which is
         -- why the bare projection below it is left for this.
-        CField(_, _) -> return Methods.knownField(r.dicts, e, [], e.ty)
+        CSlot(_, _) -> return Methods.knownField(r.dicts, e, [], e.ty)
         CTyApp(fn, own) -> return match fn.kind {
-            CField(_, _) -> Methods.knownField(r.dicts, fn, own, e.ty)
+            CSlot(_, _) -> Methods.knownField(r.dicts, fn, own, e.ty)
             _ -> constant(r, e)
         }
         CApp(fn, _) -> return match fn.kind {
             CLam(_, _, _) -> beta(r, e)
-            CField(_, _) -> knownLambda(r.decls, e)
+            CSlot(_, _) -> knownLambda(r.decls, e)
             CProject(_, _) -> match knownLambda(r.decls, e) {
                 Some(made) -> Some(made)
                 None -> inline(r, e, inlineLimit)
@@ -1112,43 +1109,37 @@ fun keyHash(key : String) -> Int {
     digest(h)
 }
 
--- Expose a literal record's lambda to beta. All sibling fields must be
--- values: record construction evaluates them before the call.
+-- Expose a lambda read out of a dictionary or a record built right there, to
+-- beta. All sibling slots must be values: building the object evaluates them
+-- before the call.
+--
+-- A build with identity qualifies too: the object is read once, right where
+-- it is built, so nothing else can hold it.
 fun knownLambda(d : DeclTable, e : Core) -> Option Core = match e.kind {
     CApp(fn, args) -> match fn.kind {
-        CProject(target, index) -> match target.kind {
-            CApp(con, fields) -> match con.kind {
-                CCon(_) -> {
-                    if index >= len(fields) { return None }
-                    for v in fields { if !isValue(d, v) { return None } }
-                    match fields[index].kind {
-                        CLam(_, _, _) -> Some(mkCore(e.ty, e.span,
-                                                     CApp(fields[index], args)))
-                        _ -> None
-                    }
-                }
-                _ -> None
-            }
-            _ -> None
-        }
-        CField(target, name) -> match target.kind {
-            CRecord(_, fields) -> {
-                for (_, v) in fields { if !isValue(d, v) { return None } }
-                for (field, v) in fields {
-                    if field == name {
-                        return match v.kind {
-                            CLam(_, _, _) -> Some(mkCore(e.ty, e.span, CApp(v, args)))
-                            _ -> None
-                        }
-                    }
-                }
-                None
-            }
-            _ -> None
-        }
+        CProject(target, index) -> applyPart(d, e, target, index, args)
+        CSlot(target, index) -> applyPart(d, e, target, index, args)
         _ -> None
     }
     _ -> None
+}
+
+fun applyPart(d : DeclTable, e : Core, target : Core, index : Int,
+              args : Array Core) -> Option Core {
+    let parts = match target.kind {
+        CDict(_, slots) -> slots
+        CApp(con, fields) -> match con.kind {
+            CCon(_) -> fields
+            _ -> return None
+        }
+        _ -> return None
+    }
+    if index >= len(parts) { return None }
+    for v in parts { if !isValue(d, v) { return None } }
+    match parts[index].kind {
+        CLam(_, _, _) -> Some(mkCore(e.ty, e.span, CApp(parts[index], args)))
+        _ -> None
+    }
 }
 
 -- A lambda applied directly. What inlining a call site leaves behind when the

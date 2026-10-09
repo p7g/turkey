@@ -62,10 +62,9 @@ import Turkey.Core
 import Turkey.Ast (Opening(..), Lit(..))
 import Turkey.Core (Core(..), CoreKind(..), CAlt(..), CBind(..), CProgram(..),
                     CParam(..), Alt(..), Mapper(..), mapKind, namesOf, openingOf,
-                    abstractionBinders, isDictionary, dictClass, methodField,
-                    methodBase)
+                    abstractionBinders, isDictionary, dictClass)
 import Turkey.Classes as Classes
-import Turkey.Classes (ClassTable(..), ClassInfo(..), MethodInfo(..))
+import Turkey.Classes (ClassTable(..), ClassInfo(..), MethodInfo(..), Slot(..))
 import Turkey.Coretc as Coretc
 import Turkey.Decls as Decls
 import Turkey.Decls (DeclTable(..), ConInfo(..))
@@ -481,13 +480,17 @@ type Sharer = Sharer {
     made    : Map String (Array CBind),
     queue   : Array (String, String, Array String),
     used    : Set.Set String,
-    -- "class|method" -> the keys, and their layouts, of the method's own
-    -- variables that some call through an unknown dictionary uses: `keys` as
-    -- this run was started with, so every dictionary gets a field for each;
-    -- `asked` as this run's calls found them. See `methodField`.
-    keys    : Map String (Map String (Array String)),
-    asked   : Map String (Map String (Array String)),
+    -- The keys of a method's own variables that some call through an unknown
+    -- dictionary uses: `keys` as this run was started with, so every dictionary
+    -- gets a slot for each; `asked` as this run's calls found them. See
+    -- `Classes.KeyedSlot`.
+    keys    : Keys,
+    asked   : Keys,
 }
+
+-- Class -> method -> layout key -> the key's layouts, one per atom of the
+-- method's own variables.
+type Keys = Map String (Map String (Map String (Array String)))
 
 -- Where a term is being rewritten.
 --
@@ -542,6 +545,7 @@ fun share(program : CProgram, decls : DeclTable, classes : ClassTable,
           main : String) -> CProgram {
     let keys = Map.new()
     loop {
+        publish(classes, keys)
         let (first, asked1) = shareOnce(program, decls, classes, main, None, keys)
         let (out, asked) = if !opensAnywhere(program) { (first, asked1) } else {
             shareOnce(program, decls, classes, main,
@@ -552,26 +556,46 @@ fun share(program : CProgram, decls : DeclTable, classes : ClassTable,
 }
 
 -- Add `more` to `into`, answering whether anything was new.
-fun mergeKeys(into : Map String (Map String (Array String)),
-              more : Map String (Map String (Array String))) -> Bool {
+fun mergeKeys(into : Keys, more : Keys) -> Bool {
     var grew = False
-    for (method, found) in Map.entries(more) {
-        let have = match Map.get(into, method) {
-            Some(h) -> h
-            None -> {
-                let h = Map.new()
-                Map.put(into, method, h)
-                h
-            }
-        }
-        for (k, parts) in Map.entries(found) {
-            if !Map.contains(have, k) {
-                Map.put(have, k, parts)
-                grew = True
+    for (cls, methods) in Map.entries(more) {
+        let ofClass = Map.getOr(into, cls, Map.new())
+        Map.put(into, cls, ofClass)
+        for (method, found) in Map.entries(methods) {
+            let have = Map.getOr(ofClass, method, Map.new())
+            Map.put(ofClass, method, have)
+            for (k, parts) in Map.entries(found) {
+                if !Map.contains(have, k) {
+                    Map.put(have, k, parts)
+                    grew = True
+                }
             }
         }
     }
     grew
+}
+
+-- Make `keys` the keyed slots of every class's dictionaries: for each method
+-- in slot order, its keys in sorted order. Before each run, so that the run
+-- builds dictionaries with, and reads them through, the slots it was started
+-- with. The last run's are the ones that stay.
+fun publish(classes : ClassTable, keys : Keys) -> Unit {
+    for (cls, methods) in Map.entries(keys) {
+        Map.put(classes.keyed, cls, [])
+        let order = Array.new(4)
+        for slot in Classes.dictSlots(classes, cls) {
+            match slot {
+                MethodSlot(m) -> match Map.get(methods, m) {
+                    Some(found) -> for k in Array.sort(Map.keys(found)) {
+                        Array.push(order, (m, k))
+                    }
+                    None -> {}
+                }
+                _ -> {}
+            }
+        }
+        Map.put(classes.keyed, cls, order)
+    }
 }
 
 fun opensAnywhere(program : CProgram) -> Bool {
@@ -605,8 +629,7 @@ fun opensInto(e : Core, found : Array Bool) -> Unit {
 
 fun shareOnce(program : CProgram, decls : DeclTable, classes : ClassTable,
               main : String, packed : Option (Map String (Set.Set String)),
-              keys : Map String (Map String (Array String)))
-        -> (CProgram, Map String (Map String (Array String))) {
+              keys : Keys) -> (CProgram, Keys) {
     let binds = Map.new()
     let generic = Set.new()
     let fams = Map.new()
@@ -777,8 +800,8 @@ fun rewrite(s : Sharer, e : Core, sc : Scope) -> Core {
                 }
                 return rewrite(s, Opt.instantiateTypes(body, mapping), sc)
             }
-            CField(target, method) -> if len(args) > 0 && isDictionary(target.ty) {
-                return dynamicCall(s, e, fn, target, method, args, sc)
+            CSlot(target, index) -> if len(args) > 0 && isDictionary(target.ty) {
+                return dynamicCall(s, e, fn, target, index, args, sc)
             }
             CVar(n) -> match localNamed(sc, n) {
                 Some(local) -> return mkCore(e.ty, e.span, CTyApp(
@@ -795,9 +818,7 @@ fun rewrite(s : Sharer, e : Core, sc : Scope) -> Core {
         CMatch(scrutinee, alts) -> return openArms(s, e, scrutinee, alts, sc)
         -- A dictionary's field that is a method polymorphic in its own
         -- variables: see `methodStub`.
-        CRecord(con, fields) -> if isDictionary(e.ty) {
-            return dictionaryRecord(s, e, con, fields, sc)
-        }
+        CDict(cls, slots) -> return dictionarySlots(s, e, cls, slots, sc)
         -- Anywhere else, a type abstraction whose variables no key gave a
         -- layout is one nothing applies to a type -- `(/\a. f)(d)`, as
         -- instantiating a method leaves it -- so its variables are as free as
@@ -874,30 +895,37 @@ fun methodAtoms(m : MethodInfo) -> Array Ty.Type {
     out
 }
 
-fun methodOf(s : Sharer, cls : String, field : String) -> Option MethodInfo =
+-- The method slot `index` of a `cls` dictionary holds, if it holds one.
+fun methodAt(s : Sharer, cls : String, index : Int) -> Option (String, MethodInfo) {
+    let name = match Classes.slotAt(s.classes, cls, index) {
+        Some(MethodSlot(m)) -> m
+        _ -> return None
+    }
     match Map.get(s.classes.classes, cls) {
-        Some(info) -> match Classes.memberNamed(Map.keys(info.methods),
-                                                methodBase(field)) {
-            Some(resolved) -> Map.get(info.methods, resolved)
+        Some(info) -> match Map.get(info.methods, name) {
+            Some(m) -> Some((name, m))
             None -> None
         }
         None -> None
     }
+}
 
 -- A method polymorphic in its own variables, called through a dictionary this
 -- body does not know. The dictionary holds the method once per layout key of
--- those variables that any such call asks for (`dictionaryRecord`); this call
--- reads the field for its own key, computed here, where the layouts are known.
-fun dynamicCall(s : Sharer, e : Core, fn : Core, target : Core, method : String,
+-- those variables that any such call asks for (`dictionarySlots`); this call
+-- reads the slot for its own key, computed here, where the layouts are known.
+fun dynamicCall(s : Sharer, e : Core, fn : Core, target : Core, index : Int,
                 args : Array Ty.Type, sc : Scope) -> Core {
     let cls = match dictClass(target.ty) {
         Some(c) -> c
         None -> oopsAt("a method read from something that is not a dictionary", e)
     }
-    let m = match methodOf(s, cls, method) {
-        Some(found) -> found
-        None -> oopsAt("class '" + cls + "' has no method '" + method + "'", e)
+    let found = match methodAt(s, cls, index) {
+        Some(f) -> f
+        None -> oopsAt("slot " + Int.toString(index) + " of a '" + cls
+                       + "' dictionary is not a method", e)
     }
+    let (method, m) = found
     let own = ownVars(m)
     if len(own) != len(args) {
         oopsAt("the method '" + method + "' applied to " + Int.toString(len(args))
@@ -909,76 +937,79 @@ fun dynamicCall(s : Sharer, e : Core, fn : Core, target : Core, method : String,
         Left(t) -> oopsAt("no layout for '" + Ty.show(t) + "' at a call to the "
                           + "method '" + method + "' from '" + sc.owner + "'", e)
     }
-    let base = methodBase(method)
     let k = String.join(parts, ",")
-    let slot = cls + "|" + base
-    let found = match Map.get(s.asked, slot) {
-        Some(f) -> f
-        None -> {
-            let f = Map.new()
-            Map.put(s.asked, slot, f)
-            f
-        }
-    }
+    let ofClass = Map.getOr(s.asked, cls, Map.new())
+    Map.put(s.asked, cls, ofClass)
+    let found = Map.getOr(ofClass, method, Map.new())
+    Map.put(ofClass, method, found)
     Map.put(found, k, parts)
+    -- A key this run was not started with has no slot yet. The run is then not
+    -- the last, and what it makes of this call is thrown away (`share`).
+    let slot = match Classes.keyedSlot(s.classes, cls, method, k) {
+        Some(i) -> i
+        None -> index
+    }
     mkCore(e.ty, e.span, CTyApp(mkCore(fn.ty, fn.span,
-        CField(rewrite(s, target, sc), methodField(base, k))), args))
+        CSlot(rewrite(s, target, sc), slot)), args))
 }
 
--- A dictionary's record. A field holding a method polymorphic in its own
--- variables is compiled once per key some call asks for, as `methodField`s
--- beside it; the field itself becomes `methodStub`, since no call reads it.
--- Every dictionary of one class gets the same fields, in the same order, which
--- is what the backend's field offsets rely on.
-fun dictionaryRecord(s : Sharer, e : Core, con : String,
-                     fields : Array (String, Core), sc : Scope) -> Core {
-    let cls = match dictClass(e.ty) {
-        Some(c) -> c
-        None -> ""
-    }
+-- A dictionary's slots. A slot holding a method polymorphic in its own
+-- variables is compiled once per key some call asks for, in the keyed slots
+-- `publish` declared; the slot itself becomes `methodStub`, since no call
+-- reads it. Every dictionary of a class has every keyed slot of the class: one
+-- whose method is not compiled per key holds the same value in each.
+fun dictionarySlots(s : Sharer, e : Core, cls : String, slots : Array Core,
+                    sc : Scope) -> Core {
     let head = match Ty.spine(Ty.prune(e.ty)) {
         (_, args) -> if len(args) == 1 { args[0] } else { e.ty }
     }
-    let out = Array.new(len(fields))
-    for (name, value) in fields {
-        let m = match methodOf(s, cls, name) {
-            Some(found) -> found
+    let out = Array.new(len(slots))
+    -- method -> key -> the copy compiled for it.
+    let copies = Map.new()
+    -- method -> the one value every key of it shares.
+    let shared = Map.new()
+    for var i = 0; i < len(slots); i = i + 1 {
+        let value = slots[i]
+        let found = match methodAt(s, cls, i) {
+            Some(f) -> f
             None -> {
-                Array.push(out, (name, rewrite(s, value, sc)))
+                Array.push(out, rewrite(s, value, sc))
                 continue
             }
         }
+        let (name, m) = found
         let (stated, inner) = match value.kind {
             CTyLam(vs, body) -> (Some(vs), body)
             _ -> (None, value)
         }
         let vs = match fieldVars(m, head, inner) {
             Some(found) -> found
-            None -> {
-                Array.push(out, (name, rewrite(s, value, sc)))
-                continue
-            }
+            None -> Array.new(0)
         }
-        if len(unknownBinders(vs, sc)) == 0 {
-            Array.push(out, (name, rewrite(s, value, sc)))
+        if len(vs) == 0 || len(unknownBinders(vs, sc)) == 0 {
+            let made = rewrite(s, value, sc)
+            Array.push(out, made)
+            Map.put(shared, name, made)
             continue
         }
-        Array.push(out, (name, methodStub(value, stated, vs, inner, sc)))
-        let asked = Map.getOr(s.keys, cls + "|" + methodBase(name), Map.new())
+        Array.push(out, methodStub(value, stated, vs, inner, sc))
         let own = ownVars(m)
         let atoms = methodAtoms(m)
+        let made = Map.new()
+        Map.put(copies, name, made)
+        let asked = Map.getOr(Map.getOr(s.keys, cls, Map.new()), name, Map.new())
         for k in Array.sort(Map.keys(asked)) {
             let parts = asked[k]
             let fresh = Array.map(vs, fun(v) = Ty.newVar(v.level, v.kind))
             let renaming = Map.new()
             let toFresh = Map.new()
-            for var i = 0; i < len(vs) && i < len(own); i = i + 1 {
-                Map.put(renaming, vs[i].id, TVar(fresh[i]))
-                Map.put(toFresh, own[i].id, TVar(fresh[i]))
+            for var j = 0; j < len(vs) && j < len(own); j = j + 1 {
+                Map.put(renaming, vs[j].id, TVar(fresh[j]))
+                Map.put(toFresh, own[j].id, TVar(fresh[j]))
             }
-            for var i = 0; i < len(atoms) && i < len(parts); i = i + 1 {
-                let key = Ty.typeKey(Decls.substitute(atoms[i], toFresh))
-                for layouts in sc.chain { Map.put(layouts, key, parts[i]) }
+            for var j = 0; j < len(atoms) && j < len(parts); j = j + 1 {
+                let key = Ty.typeKey(Decls.substitute(atoms[j], toFresh))
+                for layouts in sc.chain { Map.put(layouts, key, parts[j]) }
             }
             let copied = Opt.instantiateTypes(inner, renaming)
             let v = match stated {
@@ -986,10 +1017,21 @@ fun dictionaryRecord(s : Sharer, e : Core, con : String,
                                   CTyLam(fresh, copied))
                 None -> copied
             }
-            Array.push(out, (methodField(methodBase(name), k), rewrite(s, v, sc)))
+            Map.put(made, k, rewrite(s, v, sc))
         }
     }
-    mkCore(e.ty, e.span, CRecord(con, out))
+    for (method, k) in Map.getOr(s.classes.keyed, cls, []) {
+        let filled = match Map.get(copies, method) {
+            Some(made) -> Map.get(made, k)
+            None -> Map.get(shared, method)
+        }
+        match filled {
+            Some(v) -> Array.push(out, v)
+            None -> oopsAt("no value for the '" + method + "' slot at key " + k
+                           + " of a '" + cls + "' dictionary", e)
+        }
+    }
+    mkCore(e.ty, e.span, CDict(cls, out))
 }
 
 -- The variables a dictionary field's value has where its method's own are, in
@@ -1053,7 +1095,7 @@ fun defaultAtoms(vs : Array VarCell, ty : Ty.Type, sc : Scope) -> Unit {
 -- while the method's own variables are instantiated afresh at each use. A use
 -- through a *known* dictionary does not read the field -- it is a direct call to
 -- the hoisted method, and keyed like any other -- and a use through an unknown
--- one reads the `methodField` for its key (`dynamicCall`), so nothing calls
+-- one reads the keyed slot for its key (`dynamicCall`), so nothing calls
 -- this. Its atoms are given `unit`, which is as good as any layout for
 -- parameters nothing reads.
 fun methodStub(e : Core, stated : Option (Array VarCell), vs : Array VarCell,

@@ -5,7 +5,7 @@ module Turkey.Core (
     mkCore, tailParts, tailFieldNames,
     Mapper(..), mapKind, bindValue, altBody,
     namesOf, namesInto, codeAddressName,
-    dictName, classOfDict, dictClass, isDictionary, methodField, methodBase,
+    dictName, classOfDict, dictClass, isDictionary,
     abstractionBinders,
     Aliases(..), newAliases, alias,
     showExpr, showBind, showProgram,
@@ -139,12 +139,15 @@ type CoreKind
     | CPrim(Prims.Prim)
     | CTuple(Array Core)
     | CArray(Array Core)
-    -- A record built by naming its fields, which is how a dictionary is built.
-    | CRecord(String, Array (String, Core))
-    -- A field projection. A method selection and a superclass selection are both
-    -- this, which is the point: they were two shapes of evidence and are one
-    -- shape of term.
-    | CField(Core, String)
+    -- A dictionary of the named class: its slots, in the order
+    -- `Classes.dictSlots` gives them. Not a constructor application, because a
+    -- slot may hold a method polymorphic in its own variables, and no
+    -- constructor's field has a type with variables of its own.
+    | CDict(String, Array Core)
+    -- One slot of a dictionary, by position. A method selection and a
+    -- superclass selection are both this, which is the point: they were two
+    -- shapes of evidence and are one shape of term.
+    | CSlot(Core, Int)
     | CProject(Core, Int)
     | CIndex(Core, Core)
     | CLam(Array CParam, Core, String)
@@ -299,11 +302,8 @@ fun mapKind(k : CoreKind, m : Mapper) -> CoreKind = match k {
     CPrim(_) -> k
     CTuple(elems) -> CTuple(Array.map(elems, m.expr))
     CArray(elems) -> CArray(Array.map(elems, m.expr))
-    CRecord(con, fields) -> CRecord(con, Array.map(fields, fun(f) = {
-        let (name, value) = f
-        (name, m.expr(value))
-    }))
-    CField(target, name) -> CField(m.expr(target), name)
+    CDict(cls, slots) -> CDict(cls, Array.map(slots, m.expr))
+    CSlot(target, index) -> CSlot(m.expr(target), index)
     CProject(target, index) -> CProject(m.expr(target), index)
     CIndex(target, index) -> CIndex(m.expr(target), m.expr(index))
     CLam(params, body, name) -> CLam(Array.map(params, fun(p) =
@@ -388,20 +388,6 @@ fun dictClass(ty : Ty.Type) -> Option String {
 
 fun isDictionary(ty : Ty.Type) -> Bool = Option.isSome(dictClass(ty))
 
--- A dictionary field holding a method polymorphic in its own variables at one
--- layout key for them: `hashInto@[ptr]` is `hashInto` compiled for an `h` held
--- as a pointer. A closure is compiled at one set of layouts, so a dictionary
--- carries one such field for every key a call through an unknown dictionary
--- asks for (`Turkey.Layout`); the method is still the one the class declares.
-fun methodField(method : String, key : String) -> String = method + "@[" + key + "]"
-
--- The method a dictionary field holds: the field's own name, or the method a
--- `methodField` names.
-fun methodBase(field : String) -> String = match String.splitOnce(field, "@[") {
-    Some((base, _)) -> base
-    None -> field
-}
-
 -- Every type variable a binding abstracts, wherever it states them.
 --
 -- A binding says `forall` in two places. `binders` is the one the checker reads
@@ -471,8 +457,8 @@ fun namesInto(e : Core, out : Set.Set String) -> Unit = match e.kind {
     CPrim(_) -> {}
     CTuple(elems) -> for x in elems { namesInto(x, out) }
     CArray(elems) -> for x in elems { namesInto(x, out) }
-    CRecord(_, fields) -> for (_, v) in fields { namesInto(v, out) }
-    CField(target, _) -> namesInto(target, out)
+    CDict(_, slots) -> for x in slots { namesInto(x, out) }
+    CSlot(target, _) -> namesInto(target, out)
     CProject(target, _) -> namesInto(target, out)
     CIndex(target, index) -> {
         namesInto(target, out)
@@ -535,9 +521,12 @@ fun namesInto(e : Core, out : Set.Set String) -> Unit = match e.kind {
 type Aliases = Aliases {
     seen   : Map String String,
     counts : Map String Int,
+    -- What slot `i` of a class's dictionary holds, for a dump to print it by.
+    slotName : fun(String, Int) -> String,
 }
 
-fun newAliases() -> Aliases = Aliases { seen = Map.new(), counts = Map.new() }
+fun newAliases(slotName : fun(String, Int) -> String) -> Aliases =
+    Aliases { seen = Map.new(), counts = Map.new(), slotName = slotName }
 
 fun alias(a : Aliases, name : String) -> String {
     match Map.get(a.seen, name) {
@@ -601,18 +590,24 @@ fun showExpr(e : Core, indent : Int, n : Namer, a : Aliases) -> String {
         CPrim(prim) -> p + Prims.name(prim)
         CTuple(elems) -> p + "(" + String.join(flatEach(elems, n, a), ", ") + ")"
         CArray(elems) -> p + "[" + String.join(flatEach(elems, n, a), ", ") + "]"
-        CRecord(con, fields) -> {
-            if len(fields) == 0 { return p + con + " {}" }
-            let out = Array.new(len(fields) * 2 + 2)
-            Array.push(out, p + con + " {")
-            for (name, value) in fields {
-                Array.push(out, p + "  " + name + " =")
-                Array.push(out, showExpr(value, indent + 2, n, a))
+        CDict(cls, slots) -> {
+            if len(slots) == 0 { return p + dictName(cls) + " {}" }
+            let out = Array.new(len(slots) * 2 + 2)
+            Array.push(out, p + dictName(cls) + " {")
+            for var i = 0; i < len(slots); i = i + 1 {
+                Array.push(out, p + "  " + a.slotName(cls, i) + " =")
+                Array.push(out, showExpr(slots[i], indent + 2, n, a))
             }
             Array.push(out, p + "}")
             String.join(out, "\n")
         }
-        CField(target, name) -> p + flat(target, n, a) + "." + alias(a, name)
+        CSlot(target, index) -> {
+            let name = match dictClass(target.ty) {
+                Some(cls) -> a.slotName(cls, index)
+                None -> "%" + Int.toString(index)
+            }
+            p + flat(target, n, a) + "." + alias(a, name)
+        }
         CProject(target, index) -> p + flat(target, n, a) + "." + Int.toString(index)
         CIndex(target, index) ->
             p + flat(target, n, a) + "[" + flat(index, n, a) + "]"
@@ -828,9 +823,9 @@ fun openingOf(alt : Alt) -> Option Opening = match alt {
 -- it, so the `a` a binder introduces is the `a` its body mentions -- which is
 -- the whole reason a reader can follow a type variable from a `forall` to the
 -- parameter that uses it.
-fun showBind(b : CBind) -> String {
+fun showBind(b : CBind, slotName : fun(String, Int) -> String) -> String {
     let n = Ty.namer("")
-    let a = newAliases()
+    let a = newAliases(slotName)
     let forall = if len(b.binders) == 0 { "" } else {
         "forall " + String.join(Array.map(b.binders,
             \Ty.showAt(TVar(_), n, 0)), " ") + ". "
@@ -841,15 +836,19 @@ fun showBind(b : CBind) -> String {
 
 -- The whole program, or just one module's part of it. A reader wants their own
 -- file's elaboration, not the Prelude's four hundred lines of it.
-fun showProgram(program : CProgram, owner : Option String) -> String {
+--
+-- `slotName` names a dictionary's slots, which the program holds by position.
+fun showProgram(program : CProgram, owner : Option String,
+                slotName : fun(String, Int) -> String) -> String {
     let out = Array.new(32)
-    showGroup(out, program.dicts, "dictionaries", owner)
-    showGroup(out, program.binds, "bindings", owner)
+    showGroup(out, program.dicts, "dictionaries", owner, slotName)
+    showGroup(out, program.binds, "bindings", owner, slotName)
     String.trimEnd(String.join(out, "\n")) + "\n"
 }
 
 fun showGroup(out : Array String, group : Array CBind, title : String,
-              owner : Option String) -> Unit {
+              owner : Option String,
+              slotName : fun(String, Int) -> String) -> Unit {
     let chosen = Array.new(len(group))
     for b in group {
         let keep = match owner {
@@ -861,7 +860,7 @@ fun showGroup(out : Array String, group : Array CBind, title : String,
     if len(chosen) == 0 { return {} }
     Array.push(out, "-- " + title)
     for b in chosen {
-        Array.push(out, showBind(b))
+        Array.push(out, showBind(b, slotName))
         Array.push(out, "")
     }
 }

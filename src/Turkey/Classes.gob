@@ -4,6 +4,7 @@ module Turkey.Classes (
     ClassInfo(..), classKind,
     InstInfo(..), instCon, instHeadKey,
     ClassTable(..), newClassTable,
+    Slot(..), dictSlots, slotAt, superSlot, methodSlot, keyedSlot, slotName,
     registerAll, resolveContext,
     reduceFam, normalize, normalizeUnder, givenRule, settled, settledFam,
     uncovered,
@@ -255,6 +256,10 @@ type ClassTable = ClassTable {
     -- state it in its context is accepted and fails in the Core checker
     -- instead.
     var rulesApply : Bool,
+    -- Class -> the keyed slots `Turkey.Layout` adds to its dictionaries, as
+    -- (method, layout key), in slot order. Empty until Layout settles, and
+    -- written once when it does. See `dictSlots`.
+    keyed     : Map String (Array (String, String)),
 }
 
 fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
@@ -264,7 +269,93 @@ fun newClassTable(decls : DeclTable) -> ClassTable = ClassTable {
     owner = Map.new()
     rules = []
     rulesApply = True
+    keyed = Map.new()
 }
+
+-- -- dictionary slots ---------------------------------------------------------------
+
+-- What one slot of a class's dictionary holds.
+type Slot
+    -- The dictionary of a superclass, by the superclass's name.
+    = SuperSlot(String)
+    -- A method, by its qualified name.
+    | MethodSlot(String)
+    -- A method polymorphic in its own variables, compiled at one layout key for
+    -- them. A closure is compiled at one set of layouts, so a dictionary that a
+    -- call reads without knowing it carries the method once per key such calls
+    -- ask for (`Turkey.Layout`).
+    | KeyedSlot(String, String)
+
+-- A class's dictionary, slot by slot: its superclasses in the order the class
+-- declares them, then its methods ordered by name, then the keyed copies
+-- `Turkey.Layout` adds. Every dictionary of the class has exactly these, so a
+-- slot's position is the same in each, and this is the one place that says
+-- what the position is.
+fun dictSlots(t : ClassTable, cls : String) -> Array Slot {
+    let info = match Map.get(t.classes, cls) {
+        Some(i) -> i
+        None -> oops("no class '" + cls + "'", None)
+    }
+    let out = Array.new(len(info.supers) + len(info.methods))
+    for sup in info.supers { Array.push(out, SuperSlot(sup.name)) }
+    for name in Array.sort(Map.keys(info.methods)) { Array.push(out, MethodSlot(name)) }
+    for (method, key) in Map.getOr(t.keyed, cls, []) {
+        Array.push(out, KeyedSlot(method, key))
+    }
+    out
+}
+
+-- What slot `index` of a `cls` dictionary holds.
+fun slotAt(t : ClassTable, cls : String, index : Int) -> Option Slot {
+    let slots = dictSlots(t, cls)
+    if index >= 0 && index < len(slots) { Some(slots[index]) } else { None }
+}
+
+-- Where a `cls` dictionary holds the dictionary of its superclass `sup`.
+fun superSlot(t : ClassTable, cls : String, sup : String) -> Option Int {
+    let slots = dictSlots(t, cls)
+    for var i = 0; i < len(slots); i = i + 1 {
+        match slots[i] {
+            SuperSlot(s) -> if s == sup { return Some(i) }
+            _ -> {}
+        }
+    }
+    None
+}
+
+-- Where a `cls` dictionary holds `method`, by its qualified name.
+fun methodSlot(t : ClassTable, cls : String, method : String) -> Option Int {
+    let slots = dictSlots(t, cls)
+    for var i = 0; i < len(slots); i = i + 1 {
+        match slots[i] {
+            MethodSlot(m) -> if m == method { return Some(i) }
+            _ -> {}
+        }
+    }
+    None
+}
+
+-- Where a `cls` dictionary holds `method` compiled at layout key `key`.
+fun keyedSlot(t : ClassTable, cls : String, method : String,
+              key : String) -> Option Int {
+    let slots = dictSlots(t, cls)
+    for var i = 0; i < len(slots); i = i + 1 {
+        match slots[i] {
+            KeyedSlot(m, k) -> if m == method && k == key { return Some(i) }
+            _ -> {}
+        }
+    }
+    None
+}
+
+-- A slot as a dump prints it: `%super.Eq`, `show`, `hashInto@[ptr]`.
+fun slotName(t : ClassTable, cls : String, index : Int) -> String =
+    match slotAt(t, cls, index) {
+        Some(SuperSlot(sup)) -> "%super." + sup
+        Some(MethodSlot(m)) -> surfaceMember(m)
+        Some(KeyedSlot(m, k)) -> surfaceMember(m) + "@[" + k + "]"
+        None -> "%" + Int.toString(index)
+    }
 
 -- `reduceFam`, refusing the wanted rules. See `settled`.
 fun settledFam(t : ClassTable, name : String, arg : Ty.Type) -> Option Ty.Type {

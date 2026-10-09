@@ -105,25 +105,27 @@ def test_frame_objects_survive_collection():
 
 
 ESCAPES = """
-type Box = Box { x : Int }
+-- Two fields, so that it is an object: a record of one immutable field is
+-- that field at run time.
+type Box = Box { x : Int, y : Int }
 type Holder = Holder { var item : Box }
 type Chain = Link(Int, Chain) | End
 
 var kept : Array Box = []
 
-fun toGlobal(n : Int) -> Unit { Array.push(kept, Box { x = n }) }
+fun toGlobal(n : Int) -> Unit { Array.push(kept, Box { x = n, y = 0 }) }
 
-fun returned(n : Int) -> Box = Box { x = n }
+fun returned(n : Int) -> Box = Box { x = n, y = 0 }
 
 fun captured(n : Int) -> fun() -> Int {
-    let b = Box { x = n }
+    let b = Box { x = n, y = 0 }
     fun() = b.x
 }
 
-fun through(f : fun(Box) -> Int, n : Int) -> Int = f(Box { x = n })
+fun through(f : fun(Box) -> Int, n : Int) -> Int = f(Box { x = n, y = 0 })
 
 fun stored(h : Holder, n : Int) -> Int {
-    h.item = Box { x = n }
+    h.item = Box { x = n, y = 0 }
     h.item.x
 }
 
@@ -146,7 +148,7 @@ fun recursive(n : Int) -> Int {
 fun main() {
     toGlobal(1)
     print(kept[0].x + returned(2).x + captured(3)() + through(fun(b) = b.x, 4))
-    let h = Holder { item = Box { x = 0 } }
+    let h = Holder { item = Box { x = 0, y = 0 } }
     print(stored(h, 5) + h.item.x)
     print(chain(100))
     print(recursive(6))
@@ -174,20 +176,22 @@ def test_objects_that_outlive_their_call_stay_on_the_heap():
 # carries it round the loop is dead once it is reassigned, and only the final
 # object is read after the loop. `chain` above is the case where it is not.
 LOOPS = """
-type Box = Box { x : Int }
+-- Two fields, so that it is an object: a record of one immutable field is
+-- that field at run time.
+type Box = Box { x : Int, y : Int }
 
 -- Recursive, so that it is called rather than inlined and the box is built.
 fun read(b : Box, k : Int) -> Int = if k == 0 { b.x } else { read(b, k - 1) }
 
 fun last(n : Int) -> Int {
-    var b = Box { x = -1 }
-    for var i = 0; i < n; i = i + 1 { b = Box { x = i } }
+    var b = Box { x = -1, y = 0 }
+    for var i = 0; i < n; i = i + 1 { b = Box { x = i, y = 0 } }
     read(b, 2)
 }
 
 fun each(n : Int) -> Int {
     var total = 0
-    for var i = 0; i < n; i = i + 1 { total = total + read(Box { x = i }, 2) }
+    for var i = 0; i < n; i = i + 1 { total = total + read(Box { x = i, y = 0 }, 2) }
     total
 }
 

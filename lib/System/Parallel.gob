@@ -33,18 +33,32 @@ fun chunkSize(n : Int) -> Int {
 
 fun lesser(a : Int, b : Int) -> Int = if a < b { a } else { b }
 
+-- `map`, `mapWith` and `each` take anything that can be both indexed by
+-- position and iterated. The tasks index, to reach their chunk; the sequential
+-- path iterates, because `for x in xs` over a growable `Array` tests each
+-- element against the bounds once where `xs[i]` tests it twice.
+
+-- The sequential `map`.
+fun mapInTurn[Iterator c, Length c, Item c ~ a](xs : c, f : fun(a) -> b) -> Array b {
+    let out = Array.new(len(xs))
+    for x in xs { Array.push(out, f(x)) }
+    out
+}
+
 -- `f` of each of `xs`, in order.
-fun map(xs : Array a, f : fun(a) -> b) -> Array b =
-    if workers() < 2 { Array.map(xs, f) } else { mapWith(xs, fun() = {}, fun(_, x) = f(x)) }
+fun map[Iterator c, Index c, Length c, Item c ~ a, Key c ~ Int, Value c ~ a](
+    xs : c, f : fun(a) -> b) -> Array b =
+    if workers() < 2 { mapInTurn(xs, f) } else { mapWith(xs, fun() = {}, fun(_, x) = f(x)) }
 
 -- `map`, with state of each chunk's own: `perChunk()` is made once for the
 -- elements one task runs, in turn, and each call is given it. Scratch space
 -- worth reusing across elements is the use, and so a call's result must not
 -- depend on what an earlier one left in it.
-fun mapWith(xs : Array a, perChunk : fun() -> s, f : fun(s, a) -> b) -> Array b {
+fun mapWith[Iterator c, Index c, Length c, Item c ~ a, Key c ~ Int, Value c ~ a](
+    xs : c, perChunk : fun() -> s, f : fun(s, a) -> b) -> Array b {
     if workers() < 2 {
         let state = perChunk()
-        return Array.map(xs, f(state, _))
+        return mapInTurn(xs, f(state, _))
     }
     let out : Array (Option b) = Array.filled(len(xs), None)
     let size = chunkSize(len(xs))
@@ -66,7 +80,8 @@ fun mapWith(xs : Array a, perChunk : fun() -> s, f : fun(s, a) -> b) -> Array b 
 }
 
 -- `f` of each of `xs`, for what it does.
-fun each(xs : Array a, f : fun(a) -> Unit) -> Unit {
+fun each[Iterator c, Index c, Length c, Item c ~ a, Key c ~ Int, Value c ~ a](
+    xs : c, f : fun(a) -> Unit) -> Unit {
     if workers() < 2 {
         for x in xs { f(x) }
         return {}
@@ -88,7 +103,8 @@ fun each(xs : Array a, f : fun(a) -> Unit) -> Unit {
 -- on the caller, as soon as it and every result before it are made. At most a
 -- few chunks per worker are made ahead of the one `use` is waiting for, so
 -- the results held at once stay bounded however many elements there are.
-fun mapInOrder(xs : Array a, f : fun(a) -> b, use : fun(Int, b) -> Unit) -> Unit {
+fun mapInOrder[Index c, Length c, Key c ~ Int, Value c ~ a](
+    xs : c, f : fun(a) -> b, use : fun(Int, b) -> Unit) -> Unit {
     if workers() < 2 {
         for var i = 0; i < len(xs); i = i + 1 { use(i, f(xs[i])) }
         return {}
@@ -135,16 +151,17 @@ fun mapInOrder(xs : Array a, f : fun(a) -> b, use : fun(Int, b) -> Unit) -> Unit
 --
 -- One task per worker takes ready steps from a queue, rather than a task per
 -- step waiting on its dependencies: a waiting task holds its stack.
-fun graph(count : Int, dependsOn : fun(Int) -> Array Int,
-          run : fun(Int, fun(Int) -> b) -> b) -> Array b =
+fun graph[Iterator d, Item d ~ Int](
+    count : Int, dependsOn : fun(Int) -> d, run : fun(Int, fun(Int) -> b) -> b) -> Array b =
     graphWith(count, dependsOn, fun() = {}, fun(_, i, finished) = run(i, finished))
 
 -- `graph`, with state of each worker's own: `perWorker()` is made once for
 -- each task taking steps, and every step that task runs is given it. A cache
 -- of answers that do not depend on which steps have run is the use: a step
 -- may run on any worker, so what it finds there must not change its result.
-fun graphWith(count : Int, dependsOn : fun(Int) -> Array Int, perWorker : fun() -> s,
-              run : fun(s, Int, fun(Int) -> b) -> b) -> Array b {
+fun graphWith[Iterator d, Item d ~ Int](
+    count : Int, dependsOn : fun(Int) -> d, perWorker : fun() -> s,
+    run : fun(s, Int, fun(Int) -> b) -> b) -> Array b {
     let g = Graph {
         results = Array.filled(count, None), waitingOn = Array.filled(count, 0),
         dependents = [], ready = [], next = 0, unfinished = count, waiters = [],

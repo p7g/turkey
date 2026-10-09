@@ -2,7 +2,15 @@ module Turkey.Bounds (run)
 
 -- Bounds-check elimination: mark `Proven` each array access whose index is
 -- provably within the array's own length, so that instruction selection
--- emits no check for it.
+-- emits no check for it; and replace by its constant each `i64` comparison
+-- whose outcome the same facts decide.
+--
+-- The second is what removes a check the library writes itself. An access
+-- tests `i < 0 || i >= length` and panics with its own message, and that test
+-- is ordinary code: once its comparisons are constants, constant propagation
+-- turns the branch on them into a jump and the call that panics is dead.
+-- Folding a comparison needs no rule beyond the ones the facts already keep:
+-- the facts are about the very values the comparison reads.
 --
 -- **What a proof may use.** The check an access carries reads only the
 -- object it protects, so that no race between tasks can turn into an access
@@ -34,9 +42,10 @@ module Turkey.Bounds (run)
 -- node plus a constant offset, so `i + 1`, `i` and `n - 1` share nodes and
 -- cost no constraint of their own; constants are offsets from a node for
 -- zero; an array's length is a node of its own, or the node of the length it
--- was allocated with. A branch on `i < n` adds `i <= n - 1` in the blocks it
--- alone enters, scoped by a walk of the dominator tree, and an access is
--- proven by a short path through the facts in scope.
+-- was allocated with. A branch on `i < n`, or on `not (i < n)`, adds
+-- `i <= n - 1` in the blocks its arm alone enters, scoped by a walk of the
+-- dominator tree, and an access or a comparison is decided by a short path
+-- through the facts in scope.
 --
 -- **Loops.** A loop's index is a block parameter, and the branch that tests
 -- it against the length dominates the body, which is the upper bound. The
@@ -46,9 +55,13 @@ module Turkey.Bounds (run)
 -- down does not iterate the solver for ever.
 --
 -- **Where it runs.** After constant propagation and copy elimination, which
--- make a constant index a constant and a copied length the same value. It
--- removes traps and changes nothing else, so it adds no allocation, call or
--- string literal and is safe before the giblets check.
+-- make a constant index a constant and a copied length the same value; and
+-- when it has folded a comparison, constant propagation and the clean-up run
+-- again, and then this pass, because removing an arm can leave a block with
+-- one way in and so with facts it did not have. It removes traps and turns
+-- comparisons into constants, so it adds no allocation, call or string
+-- literal, makes no value live for longer, and is safe before the giblets
+-- check.
 
 import Turkey.LowIr (Op(..), Low(..), BinOp(..), CmpOp(..), IndexCheck(..))
 import Turkey.Ssa as Ssa
@@ -84,19 +97,22 @@ let largest = 1099511627776
 -- one or two long.
 let rounds = 4
 
-fun run(f : Ssa.Func Low) -> Unit {
-    if !hasCheck(f) { return }
+-- Whether a comparison was folded, which leaves a branch on a constant for
+-- constant propagation to remove.
+fun run(f : Ssa.Func Low) -> Bool {
+    if !hasWork(f) { return False }
     let p = prover(f)
     solveFloors(p)
     walk(p)
 }
 
-fun hasCheck(f : Ssa.Func Low) -> Bool {
+fun hasWork(f : Ssa.Func Low) -> Bool {
     for block in f.blocks {
         for i in block.insts {
             match i.op {
                 ArrayGet(_, _, Checked) -> return True
                 ArraySet(_, _, _, Checked) -> return True
+                Cmp(_, x, _) -> if Ssa.repOf(f, x).class_ == I64 { return True }
                 _ -> {}
             }
         }
@@ -277,8 +293,9 @@ fun atLeastZero(a : Floor) -> Bool = match a {
 
 -- Walk the dominator tree, adding on entry to a block the facts of the one
 -- branch edge that enters it and removing them on the way back out, and
--- proving each access against the facts in scope.
-fun walk(p : Prover) -> Unit {
+-- proving each access and deciding each comparison against the facts in
+-- scope. Whether a comparison was folded.
+fun walk(p : Prover) -> Bool {
     let f = p.func
     let idom = Ssa.dominators(f)
     let preds = Ssa.predecessors(f)
@@ -297,6 +314,7 @@ fun walk(p : Prover) -> Unit {
     -- A block to enter, or `-1 - b` to leave `b`: an explicit stack, because
     -- a dominator tree can be as deep as the function is long.
     let stack = [entry]
+    var folded = False
     while len(stack) > 0 {
         let b = stack[len(stack) - 1]
         let _ = Array.pop(stack)
@@ -312,10 +330,13 @@ fun walk(p : Prover) -> Unit {
         }
         marks[b] = len(added)
         if len(preds[b]) == 1 { enterFrom(p, added, Ssa.blockId(preds[b][0]), b) }
-        for i in f.blocks[b].insts { prove(p, i) }
+        for i in f.blocks[b].insts {
+            if prove(p, i) { folded = True }
+        }
         Array.push(stack, -1 - b)
         for c in children[b] { Array.push(stack, c) }
     }
+    folded
 }
 
 -- The facts that hold in `to` because the only edge into it is one arm of
@@ -324,9 +345,16 @@ fun enterFrom(p : Prover, added : Array (Int, Int), from : Int, to : Int) -> Uni
     match p.func.blocks[from].term {
         Branch(c, yes, no) -> {
             if Ssa.blockId(yes) == Ssa.blockId(no) { return }
-            match p.defs[Ssa.valueId(c)] {
+            -- `x >= n` is `not (x < n)`, so a branch on a negated comparison
+            -- is the commonest way to test one: its arms are the comparison's
+            -- the other way round.
+            let (tested, held) = match p.defs[Ssa.valueId(c)] {
+                Some(Not(inner)) -> (inner, Ssa.blockId(no) == to)
+                _ -> (c, Ssa.blockId(yes) == to)
+            }
+            match p.defs[Ssa.valueId(tested)] {
                 Some(Cmp(op, x, y)) -> if Ssa.repOf(p.func, x).class_ == I64 {
-                    let taken = if Ssa.blockId(yes) == to { op } else { negate(op) }
+                    let taken = if held { op } else { negate(op) }
                     let (a, b) = (valueOf(p, x), valueOf(p, y))
                     match taken {
                         Lt -> assume(p, added, a, b, 1)
@@ -367,16 +395,44 @@ fun assume(p : Prover, added : Array (Int, Int), a : Affine, b : Affine, gap : I
 
 -- -- proofs ------------------------------------------------------------------------
 
-fun prove(p : Prover, i : Low) -> Unit = match i.op {
-    ArrayGet(array, index, Checked) ->
-        if within(p, array, index) { i.op = ArrayGet(array, index, Proven) }
-    ArraySet(array, index, x, Checked) ->
-        if within(p, array, index) { i.op = ArraySet(array, index, x, Proven) }
-    _ -> {}
+-- Mark an access proven, or replace a comparison by its outcome; whether it
+-- was a comparison.
+fun prove(p : Prover, i : Low) -> Bool {
+    match i.op {
+        ArrayGet(array, index, Checked) ->
+            if within(p, array, index) { i.op = ArrayGet(array, index, Proven) }
+        ArraySet(array, index, x, Checked) ->
+            if within(p, array, index) { i.op = ArraySet(array, index, x, Proven) }
+        Cmp(op, x, y) -> if Ssa.repOf(p.func, x).class_ == I64 {
+            match decide(p, op, valueOf(p, x), valueOf(p, y)) {
+                -- The constant an `i1` holds, as constant propagation
+                -- writes a comparison it has folded.
+                Some(outcome) -> {
+                    i.op = ConstInt(if outcome { 1 } else { 0 })
+                    return True
+                }
+                None -> {}
+            }
+        }
+        _ -> {}
+    }
+    False
 }
 
 fun within(p : Prover, array : Value, index : Value) -> Bool =
-    atLeastZero(lowest(p, valueOf(p, index))) && belowLength(p, valueOf(p, index), lengthOf(p, array))
+    atLeastZero(lowest(p, valueOf(p, index))) && atMost(p, valueOf(p, index), lengthOf(p, array), 1)
+
+-- `a op b`, if the facts in scope decide it.
+fun decide(p : Prover, op : CmpOp, a : Affine, b : Affine) -> Option Bool = match op {
+    Lt -> if atMost(p, a, b, 1) { Some(True) } else if atMost(p, b, a, 0) { Some(False) } else { None }
+    Le -> if atMost(p, a, b, 0) { Some(True) } else if atMost(p, b, a, 1) { Some(False) } else { None }
+    Gt -> decide(p, Lt, b, a)
+    Ge -> decide(p, Le, b, a)
+    Eq -> if atMost(p, a, b, 1) || atMost(p, b, a, 1) { Some(False) }
+        else if atMost(p, a, b, 0) && atMost(p, b, a, 0) { Some(True) }
+        else { None }
+    Ne -> Option.map(decide(p, Eq, a, b), fun(equal) = !equal)
+}
 
 -- The least `a` can be under the facts in scope: a path backwards to a node
 -- whose floor is known.
@@ -399,16 +455,17 @@ fun lowest(p : Prover, a : Affine) -> Floor {
     best
 }
 
--- Whether `a < length` under the facts in scope: a path forwards from `a`'s
--- node to the length's, or to zero with the length's floor high enough.
-fun belowLength(p : Prover, a : Affine, length : Affine) -> Bool {
-    let want = length.offset - a.offset - 1
+-- Whether `a <= b - gap` under the facts in scope: a path forwards from
+-- `a`'s node to `b`'s, or to zero with `b` known to be high enough. A
+-- constant `a` starts at zero, so this asks the second for it.
+fun atMost(p : Prover, a : Affine, b : Affine, gap : Int) -> Bool {
+    let want = b.offset - a.offset - gap
     for (m, d) in reach(p.above, a.node) {
         -- `a.node <= m + d`.
-        if m == length.node && d <= want { return True }
+        if m == b.node && d <= want { return True }
         if m == p.zero {
-            match p.floors[length.node] {
-                AtLeast(k) -> if d <= k + want { return True }
+            match lowest(p, b) {
+                AtLeast(k) -> if a.offset + d <= k - gap { return True }
                 _ -> {}
             }
         }

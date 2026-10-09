@@ -1,5 +1,6 @@
 """`src/Turkey/Bounds.gob`: the array accesses whose index is proven within
-the array's own length, and which carry no check.
+the array's own length, and which carry no check; and the comparisons the same
+facts decide, which are folded to constants.
 
 Each test reads the low IR, where a proven access prints `; in bounds`. The
 rule the proofs keep is the check's own: only facts about the array being
@@ -18,10 +19,18 @@ from tests import bootc, lang
 LIB = Path(__file__).resolve().parent.parent / "lib"
 
 
+def _body(ssa: str, name: str) -> str:
+    return re.search(rf"^fun @{re.escape(name)}\(.*?^}}$", ssa, re.M | re.S).group(0)
+
+
 def _accesses(ssa: str, name: str) -> list[str]:
-    body = re.search(rf"^fun @{re.escape(name)}\(.*?^}}$", ssa, re.M | re.S).group(0)
-    return [line.strip() for line in body.splitlines()
+    return [line.strip() for line in _body(ssa, name).splitlines()
             if re.search(r"= array\.(get|set) ", line)]
+
+
+def _comparisons(ssa: str, name: str) -> list[str]:
+    return [line.strip() for line in _body(ssa, name).splitlines()
+            if re.search(r"= (eq|ne|lt|le|gt|ge) ", line)]
 
 
 def _proven(line: str) -> bool:
@@ -197,3 +206,87 @@ fun main() { print(keyword("fun")) }
     assert result.code == 0, result.stderr
     reads = _accesses(result.stdout, "Main#keyword")
     assert len(reads) == 6 and all(map(_proven, reads)), reads
+
+
+# Comparisons. Each function below also compares the length with 77 to call
+# itself, a comparison nothing decides.
+
+
+def test_a_comparison_the_facts_decide_is_folded(library_ssa):
+    """An access's own test, `i < 0 || i >= length`, is implied by the loop's
+    test and the index's floor, so the branch to the error goes with it and
+    only the loop's test is left."""
+    ssa, module = library_ssa("""
+fun sum(xs : Prim.Array Int) -> Int {
+    if Prim.arrayLength(xs) == 77 { return sum(xs) }
+    var total = 0
+    for var i = 0; i < Prim.arrayLength(xs); i = i + 1 {
+        if i < 0 || i >= Prim.arrayLength(xs) { error("index out of range") }
+        total = total + Prim.arrayGet(xs, i)
+    }
+    total
+}
+
+fun run() -> Unit { print(sum(Prim.arrayNew(3, 5))) }
+""")
+    name = f"{module}#sum"
+    assert len(_comparisons(ssa, name)) == 2, _comparisons(ssa, name)
+    assert "index out of range" not in _body(ssa, name)
+
+
+@pytest.mark.parametrize("test", [
+    "i < 1", "i > 0", "i == 0", "i != 0", "i + 1 < Prim.arrayLength(xs)",
+])
+def test_a_comparison_the_facts_do_not_decide_stays(library_ssa, test):
+    """`i` is at least 0 and below the length, and each of these can go
+    either way."""
+    ssa, module = library_ssa(f"""
+fun sum(xs : Prim.Array Int) -> Int {{
+    if Prim.arrayLength(xs) == 77 {{ return sum(xs) }}
+    var total = 0
+    for var i = 0; i < Prim.arrayLength(xs); i = i + 1 {{
+        if {test} {{ total = total + 1 }}
+    }}
+    total
+}}
+
+fun run() -> Unit {{ print(sum(Prim.arrayNew(3, 5))) }}
+""")
+    compares = _comparisons(ssa, f"{module}#sum")
+    assert len(compares) == 3, compares
+
+
+def test_a_branch_on_a_negated_comparison_is_a_fact(library_ssa):
+    """`i >= n` is `not (i < n)`, so returning when it holds leaves `i < n`
+    behind."""
+    ssa, module = library_ssa("""
+fun at(xs : Prim.Array Int, i : Int) -> Int {
+    if Prim.arrayLength(xs) == 77 { return at(xs, i) }
+    if i < 0 { return 0 }
+    if i >= Prim.arrayLength(xs) { return 0 }
+    Prim.arrayGet(xs, i)
+}
+
+fun run() -> Unit { print(at(Prim.arrayNew(3, 5), 2)) }
+""")
+    accesses = _accesses(ssa, f"{module}#at")
+    assert accesses and all(map(_proven, accesses)), accesses
+
+
+def test_indexing_in_a_loop_from_zero_drops_the_test_below_zero():
+    """Indexing an `Array` tests `i < 0` and `i >= length` before reading,
+    and an index counting up from 0 is never below it. The test against the
+    length stays: it reads the length field again, a value the loop's test
+    did not compare."""
+    result = lang.dump("ssa", """
+fun sum(xs : Array Int) -> Int {
+    var total = 0
+    for var i = 0; i < len(xs); i = i + 1 { total = total + xs[i] }
+    total
+}
+
+fun main() { print(sum([1, 2, 3])) }
+""")
+    assert result.code == 0, result.stderr
+    compares = _comparisons(result.stdout, "Main#sum")
+    assert len(compares) == 2, compares

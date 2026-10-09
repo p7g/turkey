@@ -572,12 +572,13 @@ fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable,
     -- Each function's own, so on as many workers as there are.
     module_.functions = Parallel.map(module_.functions, fun(lowered) = {
         Fields.forward(lowered)
-        let f = Sccp.run(lowered)
-        Clean.eliminateCopies(f, True)
-        Clean.eliminateDead(f)
-        let merged = Clean.mergeBlocks(f)
-        Bounds.run(merged)
-        merged
+        var f = simplified(lowered)
+        -- A comparison `Bounds` folds is removed by the clean-up, which can
+        -- give a block one way in where it had two, and so facts that decide
+        -- another. Each round folds a comparison and nothing makes one, so
+        -- this ends.
+        while Bounds.run(f) { f = simplified(f) }
+        f
     })
     let complaints = []
     for found in Parallel.map(module_.functions, complaintsOf) {
@@ -606,6 +607,15 @@ fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable,
         if !isGiblet(f.name) { Polls.insert(f, Set.contains(recursive, f.name)) }
     }
     (module_, skipped)
+}
+
+-- Constant propagation, which turns a branch on a constant into a jump and
+-- drops the arm it no longer takes, and the clean-up after it.
+fun simplified(f : Ssa.Func LowIr.Low) -> Ssa.Func LowIr.Low {
+    let propagated = Sccp.run(f)
+    Clean.eliminateCopies(propagated, True)
+    Clean.eliminateDead(propagated)
+    Clean.mergeBlocks(propagated)
 }
 
 -- What `Ssa.verify` and `LowIr.checkReps` say of one function.

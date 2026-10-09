@@ -11,7 +11,9 @@ module Turkey.Types (
     tArray, tRawArray, tRawPtr, arrayOf, rawArrayOf,
     isForeignType, foreignTypes, foreignArgLimit,
     kindOf, applyTo, spine, headCon,
-    numericOrder, intLiteralSet, floatLiteralSet, numericType, sortNumeric,
+    numericOrder, intLiteralSet, floatLiteralSet, numericType,
+    arrayLiteralSet, isArrayLiteralSet, literalOrder, literalSetType,
+    showLiteralSet,
     Pred(..), pred, predKey, predLevel,
     Scheme(..), mono, scheme,
     Families(..),
@@ -582,13 +584,59 @@ fun floatLiteralSet() -> Array String {
 -- Every tower member is a nullary constructor, so its type is a `TCon`.
 fun numericType(name : String) -> Type = tcon(name, KStar, noScope)
 
-fun sortNumeric(names : Array String) -> Array String {
-    let order = numericOrder()
-    Array.sortBy(names, fun(a, b) = {
+-- Every container an array literal could be, most-preferred first.
+let arrayLiteralNames = ["Data.Array#Array", "Data.Vec#Vec"]
+
+-- The containers an array literal could be, given which of them the program
+-- declares. `declared` answers that for a qualified type name.
+--
+-- The fixed `Array` is always a member, and first: it is what a literal
+-- nothing decides defaults to, and the builtin every literal could always be.
+-- `Vec` is a member only when the program has declared `Data.Vec#Vec` by the
+-- time the module holding the literal is checked. Modules are checked after
+-- everything they import, so every module that could be handed a `Vec`, through
+-- any chain of imports, has it in the set. A program that never loads
+-- `Data.Vec` has the set `{Array}`, which `Turkey.Infer` gives a literal as
+-- plain `Array`. So a diagnostic about a literal never names a container the
+-- program does not have.
+--
+-- Each member is a constructor of kind `* -> *`, applied to the literal's
+-- element type.
+fun arrayLiteralSet(declared : fun(String) -> Bool) -> Array String {
+    let out = [arrayLiteralNames[0]]
+    for var i = 1; i < len(arrayLiteralNames); i = i + 1 {
+        if declared(arrayLiteralNames[i]) { Array.push(out, arrayLiteralNames[i]) }
+    }
+    out
+}
+
+fun isArrayLiteralSet(t : Type) -> Bool = match t {
+    TSet(names) -> len(names) > 0 && Array.contains(arrayLiteralNames, names[0])
+    _ -> False
+}
+
+-- Every member of every literal set, most-preferred first within each set:
+-- the numeric tower, then the containers.
+fun literalOrder() -> Array String = numericOrder() + arrayLiteralNames
+
+-- The type a member of a literal set names.
+fun literalSetType(name : String) -> Type =
+    if Array.contains(arrayLiteralNames, name) {
+        tcon(name, KFun(KStar, KStar), noScope)
+    } else {
+        numericType(name)
+    }
+
+-- A literal set's members as a message lists them: in `literalOrder`, each by
+-- the name a message gives its constructor.
+fun showLiteralSet(names : Array String) -> String {
+    let order = literalOrder()
+    let sorted = Array.sortBy(names, fun(a, b) = {
         let ra = rankOf(order, a)
         let rb = rankOf(order, b)
         if ra != rb { Int.compare(ra, rb) } else { Array.threeWay(a, b) }
     })
+    String.join(Array.map(sorted, display), ", ")
 }
 
 fun rankOf(order : Array String, name : String) -> Int = match Array.indexOf(order, name) {
@@ -1299,7 +1347,7 @@ fun showAt(t : Type, n : Namer, prec : Int) -> String = match prune(t) {
         }
     }
     TBottom -> "!"
-    TSet(names) -> "{" + String.join(sortNumeric(names), ", ") + "}"
+    TSet(names) -> "{" + showLiteralSet(names) + "}"
     TTuple(elems) -> "(" + String.join(showEach(elems, n, 0), ", ") + ")"
     TFun(params, ret) -> {
         let out = "fun(" + String.join(showEach(params, n, 0), ", ") + ") -> "

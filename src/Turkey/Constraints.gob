@@ -636,7 +636,16 @@ fun split(s : Solver, types : Array Ty.Type) -> Array PredCell {
     var out = Array.new(0)
     while going {
         let retainedPreds = retained(s, rank(s) - 1)
-        let stranded = unattributed(retainedPreds, types)
+        -- An array literal's container is never quantified, even when the
+        -- binding's type mentions it: lowering builds each literal as one
+        -- constructor, chosen once, where a quantified container would need a
+        -- choice per use. So such a binding takes the default -- `fun empty()
+        -- = []` is `fun() -> Array a` -- and a use wanting another container
+        -- is a plain mismatch against `Array` at that use.
+        let stranded = Array.filter(retainedPreds, isArrayLiteralDemand)
+        for p in unattributed(retainedPreds, types) {
+            if !isArrayLiteralDemand(p) { Array.push(stranded, p) }
+        }
         if len(stranded) == 0 || !applyDefaults(s, stranded) {
             rejectStranded(s, stranded)
             out = retainedPreds
@@ -956,55 +965,90 @@ fun notVar(s : Solver, tycon : String, label : String, c : PredCell) -> Unit {
 
 -- `OneOf t {...}`: `t` must be one of a closed set of built-in types.
 --
+-- A numeral's set holds types; an array literal's holds containers, and its
+-- demand carries the literal's element as a third argument, so `t` must be one
+-- of them applied to that element. See `memberType`.
+--
 -- A **singleton set is an equation** and is discharged as one, right here, at
 -- the moment the constraint is reached. That is not an optimization: deferring
 -- it would let a later unification bind `t` to something else first, and the
 -- mismatch would then be reported against the literal rather than against
 -- whatever disagreed with it.
 fun oneOfRule(s : Solver, c : PredCell) -> Bool {
-    let names = match c.pred.args[1] {
-        TSet(ns) -> ns
-        _ -> oops("a numeric demand's second argument is not a set", c.span)
-    }
+    let names = setNames(c.pred.args[1], c.span)
     if len(names) == 0 {
         oops("this numeric literal is not representable in any numeric type",
              c.span)
     }
     if len(names) == 1 {
-        -- Same argument order as the equation this stands in for, so a mismatch
-        -- reads the way it did before literals had sets.
-        Ty.unify(Ty.prune(c.pred.args[0]), Ty.numericType(names[0]), c.span,
+        -- Same argument order as the equation `t ~ T` this stands for, so a
+        -- mismatch reads as that equation's would.
+        Ty.unify(Ty.prune(c.pred.args[0]), memberType(c.pred, names[0]), c.span,
                  c.context, families(s))
         return True
     }
     let t = discharging(s, c.pred.args[0])
-    match t {
-        -- Absorbed; there is no value to represent.
-        TBottom -> return True
-        -- Still open -- improvement or defaulting will decide.
-        TVar(_) -> return False
-        TFam(_, _, _) -> return False
-        TCon(con) -> if Array.contains(names, con.name) { return True }
-        _ -> {}
+    if isArrayLiteralDemand(c) {
+        let (head, args) = Ty.spine(t)
+        match head {
+            TBottom -> return True
+            -- Still open -- a use or defaulting will decide.
+            TVar(_) -> return False
+            TFam(_, _, _) -> return False
+            TCon(con) -> if Array.contains(names, con.name) && len(args) == 1 {
+                Ty.unify(args[0], c.pred.args[2], c.span, c.context, families(s))
+                return True
+            }
+            _ -> {}
+        }
+    } else {
+        match t {
+            -- Absorbed; there is no value to represent.
+            TBottom -> return True
+            -- Still open -- improvement or defaulting will decide.
+            TVar(_) -> return False
+            TFam(_, _, _) -> return False
+            TCon(con) -> if Array.contains(names, con.name) { return True }
+            _ -> {}
+        }
     }
     -- The span is always the literal's, so name it: "expected one of ..." alone
     -- reads as though something at this position asked for a numeric type, when
-    -- in fact this position *is* the numeral.
-    oops("a numeric literal cannot have type '" + Ty.show(t) + "'; it must be "
-         + "one of " + String.join(Ty.sortNumeric(names), ", "), c.span)
+    -- in fact this position *is* the literal.
+    let what = if isArrayLiteralDemand(c) {
+        "an array literal"
+    } else {
+        "a numeric literal"
+    }
+    oops(what + " cannot have type '" + Ty.show(t) + "'; it must be "
+         + "one of " + Ty.showLiteralSet(names), c.span)
 }
 
--- Intersect `OneOf` sets that constrain the same variable.
+-- The type a `OneOf` demand's member `name` stands for: the member itself for
+-- a numeral, and the container applied to the literal's element for an array
+-- literal.
+fun memberType(p : Ty.Pred, name : String) -> Ty.Type =
+    if Ty.isArrayLiteralSet(p.args[1]) {
+        TApp(Ty.literalSetType(name), p.args[2], Ty.kstar())
+    } else {
+        Ty.literalSetType(name)
+    }
+
+-- Intersect numeric `OneOf` sets that constrain the same variable.
 --
 -- Two demands on one variable are one demand on the intersection, and an empty
 -- intersection is an error rather than a deferral -- nothing later can widen a
 -- closed set. Narrowing to a singleton is what lets the next round discharge it
 -- as an equation.
+--
+-- Array literals' demands are left alone: every one has the same set, so there
+-- is nothing to narrow, and each carries its own element, which merging would
+-- drop.
 fun improveNumeric(s : Solver) -> Unit {
     let merged = Map.new()
     let out = Array.new(len(s.deferred))
     for c in s.deferred {
-        if c.pred.name != oneOf {
+        if c.pred.name != oneOf || isArrayLiteralDemand(c) {
             Array.push(out, c)
             continue
         }
@@ -1032,7 +1076,7 @@ fun improveNumeric(s : Solver) -> Unit {
 
 fun setNames(t : Ty.Type, where : Option Span) -> Array String = match t {
     TSet(ns) -> ns
-    _ -> oops("a numeric demand's second argument is not a set", where)
+    _ -> oops("a OneOf demand's second argument is not a set", where)
 }
 
 fun intersect(a : Array String, b : Array String) -> Array String {
@@ -1043,23 +1087,27 @@ fun intersect(a : Array String, b : Array String) -> Array String {
     out
 }
 
+fun isArrayLiteralDemand(c : PredCell) -> Bool =
+    c.pred.name == oneOf && Ty.isArrayLiteralSet(c.pred.args[1])
+
 -- Resolve `OneOf`s that nothing will ever narrow, by picking a member.
 --
 -- Haskell's defaulting, for the same reason: the variable is ambiguous -- it
 -- appears in no type being generalized, so no use site can pin it and no scheme
--- can carry it. The choice is the first member of the set in tower order.
+-- can carry it. The choice is the set's first member in `Ty.literalOrder`:
+-- the head of the numeric tower for a numeral, `Array` for an array literal.
 --
 -- Only `OneOf` defaults. A stranded `HasField` is a genuine error: there is no
 -- preferred record type to guess.
 fun applyDefaults(s : Solver, stuck : Array PredCell) -> Bool {
     var progress = False
     for c in stuck {
-        if c.pred.name == oneOf {
+        if c.pred.name == oneOf && undecided(c) {
             let names = setNames(c.pred.args[1], c.span)
             var chosen = False
-            for n in Ty.numericOrder() {
+            for n in Ty.literalOrder() {
                 if Array.contains(names, n) && !chosen {
-                    Ty.unify(Ty.prune(c.pred.args[0]), Ty.numericType(n), c.span,
+                    Ty.unify(Ty.prune(c.pred.args[0]), memberType(c.pred, n), c.span,
                              c.context, families(s))
                     chosen = True
                     progress = True
@@ -1068,6 +1116,18 @@ fun applyDefaults(s : Solver, stuck : Array PredCell) -> Bool {
         }
     }
     progress
+}
+
+-- Whether a `OneOf` demand's type is still open, which is when defaulting may
+-- choose it. One an earlier default in the same round has decided is left to
+-- `oneOfRule`, which says whether the choice fits it.
+fun undecided(c : PredCell) -> Bool {
+    let t = Ty.prune(c.pred.args[0])
+    let (head, _) = Ty.spine(t)
+    match (if isArrayLiteralDemand(c) { head } else { t }) {
+        TVar(_) -> True
+        _ -> False
+    }
 }
 
 -- Deferred predicates general enough to be quantified at `level`.

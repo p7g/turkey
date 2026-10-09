@@ -101,6 +101,62 @@ def test_a_graph_runs_each_step_after_its_dependencies(workers):
     assert result.stdout == lang.output(GRAPH)
 
 
+# The functions read their input through the classes, not as an `Array`: a
+# range that is never materialized works the same, as the input of the maps
+# and as what `dependsOn` answers.
+RANGE = """
+import System.Parallel as Parallel
+
+type Upto = Upto(Int)
+type UptoCursor = UptoCursor { var at : Int }
+
+instance Length Upto { fun len(Upto(n)) = n }
+
+instance Index Upto {
+    type Key = Int
+    type Value = Int
+    fun get(Upto(_), i) = i
+    fun set(_, _, _) = error("Upto cannot be written")
+}
+
+instance Iterator Upto {
+    type Item = Int
+    type Cursor = UptoCursor
+    fun iter(_) = UptoCursor { at = 0 }
+    fun next(Upto(n), cursor) {
+        if cursor.at >= n { return None }
+        let i = cursor.at
+        cursor.at = i + 1
+        Some(i)
+    }
+}
+
+fun main() {
+    let squares = Parallel.map(Upto(1000), fun(x) = x * x)
+    print(len(squares))
+    print(squares[999])
+    print(Parallel.mapWith(Upto(4), fun() = 10, fun(base, x) = base + x))
+    var total = 0
+    Parallel.mapInOrder(Upto(100), fun(x) = x, fun(_, x) { total = total + x })
+    print(total)
+    Parallel.each(Upto(3), fun(x) { let _ = x })
+    -- Each step depends on every step before it.
+    print(Parallel.graph(6, Upto, fun(i, finished) {
+        var sum = 1
+        for d in Upto(i) { sum = sum + finished(d) }
+        sum
+    }))
+}
+"""
+
+
+@pytest.mark.parametrize("workers", ["1", "4"])
+def test_the_maps_and_graphs_read_any_indexable_container(workers):
+    result = lang.run(RANGE, env={"TURKEY_WORKERS": workers})
+    assert result.code == 0, result.stderr
+    assert result.stdout == "1000\n998001\n[10, 11, 12, 13]\n4950\n[1, 2, 4, 8, 16, 32]\n"
+
+
 def test_a_cycle_in_a_graph_is_an_error():
     result = lang.run("""
 import System.Parallel as Parallel

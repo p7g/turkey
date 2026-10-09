@@ -35,7 +35,7 @@ Some things are deliberately left out:
 8. [Type classes](classes.md): classes, instances, superclasses, associated
    types, and equality constraints.
 9. [Type inference](inference.md): what the compiler infers, when it
-   generalizes, and how numeric literals get their types.
+   generalizes, and how numeric and array literals get their types.
 10. [Runtime errors](runtime-errors.md): what makes a program panic.
 11. [Built-in types and classes](builtins.md): the library the language itself
     relies on.

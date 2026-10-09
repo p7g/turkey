@@ -4,7 +4,8 @@ Turkey checks every type when a program is compiled, and it works out almost
 all of them itself. A function with no annotations still has a precise type,
 often a more general one than its author had in mind. This chapter covers
 what inference produces and when: generalization and its limits, how numeric
-literals get their types, and the constraints that appear in inferred types.
+and array literals get their types, and the constraints that appear in inferred
+types.
 To see the types the compiler infers for a file, run:
 
 ```sh
@@ -165,6 +166,86 @@ written in a program.
 > **Coming from Haskell.** This is Haskell's `Num` and `Fractional`
 > defaulting, with a closed set of types instead of classes. A program cannot
 > add a numeric type to the set.
+
+## Array literals
+
+An [array literal](expressions.md#array-literals) does not have a single type
+either. It is an `Array` or a `Vec` of its elements, decided by how its value is
+used, and an `Array` when nothing decides:
+
+<!-- run -->
+```kotlin
+fun main() {
+    let seen = []
+    for word in ["to", "be", "or", "not", "to", "be"] {
+        if !Vec.contains(seen, word) {
+            Vec.push(seen, word)
+        }
+    }
+    print(seen)
+}
+```
+
+```text
+[to, be, or, not]
+```
+
+`seen` is a `Vec` because `Vec.contains` and `Vec.push` take one. The words are
+an `Array`: `for` accepts either, and nothing else decides. An annotation
+decides too, as in `let names : Vec String = []`, and so does a function's
+declared parameter or result type.
+
+Unlike a numeric literal, an array literal is never generic in its container.
+A binding that is generalized, such as a function, still decides which of the
+two it builds, and defaults to `Array` when its own body does not say:
+
+<!-- error: expected Vec, found Array in a function call -->
+```kotlin
+fun empty() = []
+
+fun fill(v : Vec Int) = Vec.push(v, 1)
+
+fun main() {
+    fill(empty())
+}
+```
+
+`empty` is `fun() -> Array a`: generic in the element, but not in the
+container. Declaring `fun empty() -> Vec a` makes it build a `Vec`. A signature
+cannot ask for both: `fun empty() -> c a = []` is rejected with `an array
+literal cannot have type 'c a'; it must be one of Array, Vec`.
+
+A literal in a top-level `let` is decided by that `let`'s own definition. The
+binding is not generalized ([the value restriction](#generalization)), and uses
+of it in functions, in the same module or in a module that imports it, come too
+late: a table that only a function pushes to is an `Array`, and the push is a
+type error:
+
+<!-- error: expected Vec, found Array in a function call -->
+```kotlin
+let pending = []
+
+fun remember(x : Int) = Vec.push(pending, x)
+```
+
+Annotate the binding, `let pending : Vec Int = []`, to make it a `Vec`.
+
+The constraint a literal contributes is `OneOf t {Array, Vec} e`: `t` must be
+one of the listed containers applied to the element type `e`. Like the numeric
+one, it cannot be written in a program, and a mismatch names the set:
+
+<!-- error: an array literal cannot have type 'Int'; it must be one of Array, Vec -->
+```kotlin
+let count : Int = [1, 2]
+```
+
+> **Coming from Haskell.** This is `OverloadedLists`, with a closed set of two
+> containers instead of the class `IsList`, and with a default: a literal
+> nothing decides is an `Array` rather than ambiguous.
+
+> **Coming from Rust.** `[a, b]` covers both `[a, b]` and `vec![a, b]`, and the
+> program's use of it chooses. There is no fixed-size array type whose length
+> is part of the type.
 
 ## Field and projection constraints
 

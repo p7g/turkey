@@ -241,10 +241,11 @@ index ::= postfix "[" expression "]"
 ```
 
 `c[k]` reads the element of `c` at key `k`, and `c[k] = v` replaces it. They
-mean `get(c, k)` and `set(c, k, v)`, the methods of the class
-[`Index`](builtins.md#index), so indexing works on any type with an instance.
-The library has instances for `Array`, whose keys are `Int` positions counting
-from zero, and for `Map`, whose keys are the map's key type.
+mean `get(c, k)` and `set(c, k, v)`, the methods of the classes
+[`Index` and `SetIndex`](builtins.md#index), so indexing works on any type with
+an instance. The library has instances for `Array` and `Vec`, whose keys are
+`Int` positions counting from zero, and for `Map`, whose keys are the map's key
+type.
 
 <!-- run -->
 ```kotlin
@@ -343,12 +344,19 @@ parentheses, and `()` is the unit value ([Tuples](types.md#tuples)).
 array ::= "[" (expression ("," expression)*)? "]"
 ```
 
-`[e1, e2, ..., en]` builds a new `Array` holding the values of `e1` to `en` in
-order. All elements must have the same type. `[]` is a new empty array, and
-its element type is inferred from how the array is used.
+`[e1, e2, ..., en]` builds a new [`Array`](builtins.md#array) or
+[`Vec`](builtins.md#vec) holding the values of `e1` to `en` in order. All
+elements must have the same type. `[]` is a new empty one, and its element type
+is inferred from how it is used.
 
-Each evaluation of an array literal creates a new array, which is
-[mutable](types.md#mutability-and-sharing). It is approximately equivalent to:
+Which of the two a literal builds is also inferred from how it is used, the
+way a numeric literal's type is: a literal passed to a function that takes a
+`Vec` is a `Vec`, and one that nothing decides is an `Array`
+([Array literals](inference.md#array-literals)).
+
+Each evaluation of an array literal creates a new container, which is
+[mutable](types.md#mutability-and-sharing). When it is an `Array`, it is
+approximately equivalent to:
 
 ```ebnf
 {
@@ -360,13 +368,15 @@ Each evaluation of an array literal creates a new array, which is
 }
 ```
 
+and when it is a `Vec`, to the same with `Vec.new` and `Vec.push`.
+
 <!-- run -->
 ```kotlin
 fun main() {
     let evens = []
     for n in [1, 2, 3, 4, 5, 6] {
         if n % 2 == 0 {
-            Array.push(evens, n)
+            Vec.push(evens, n)
         }
     }
     print(evens)
@@ -376,6 +386,13 @@ fun main() {
 ```text
 [2, 4, 6]
 ```
+
+Here `evens` is a `Vec`, because `Vec.push` takes one, and `[1, 2, 3, 4, 5, 6]`
+is an `Array`, because `for` accepts either and nothing else decides.
+
+> **Coming from Rust:** `[a, b]` is not a fixed-size `[T; 2]`, and it is not
+> always an array either: it is whichever of `Array` and `Vec` the program uses
+> it as, so it also stands for `vec![a, b]`.
 
 ## Blocks
 

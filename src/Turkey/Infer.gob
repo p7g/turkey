@@ -1839,6 +1839,11 @@ fun familyResult(g : Generator, fam : String) -> Ty.Kind =
 -- `a.length` mean different things depending on how much of the program the
 -- walk had already seen.
 --
+-- The site keeps a `Use` of the same predicates, in that order: the reader's,
+-- then the setter's. Where the receiver stays polymorphic, the lowering has no
+-- record type to find the field in, and reads or writes it through the
+-- accessors these predicates' dictionaries carry.
+--
 -- The result is a *family application* rather than a fresh variable, and that
 -- is what retires `improve`'s hand-written functional dependency: two reads of
 -- `r.f` used to be two unrelated variables that an improvement rule had to
@@ -1850,13 +1855,20 @@ fun genField(g : Generator, e : Expr, assigning : Bool) -> Ty.Type =
             let receiver = genExpr(g, obj)
             let cls = Classes.fieldClass(name)
             discard(Classes.ensureGenerated(g.classes, cls))
-            emit(g, C.cpredOf(Ty.pred(cls, [receiver]), Some(e.span),
+            let u = newUse(cls, Some(e.span), None)
+            let reads = Ty.pred(cls, [receiver])
+            Array.push(u.preds, reads)
+            emit(g, C.cpredOf(reads, Some(e.span),
                 if assigning { "mutate" } else { "read" }))
             if assigning {
                 let setter = Classes.setterClass(name)
                 discard(Classes.ensureGenerated(g.classes, setter))
-                emit(g, C.cpredOf(Ty.pred(setter, [receiver]), Some(e.span), "mutate"))
+                let writes = Ty.pred(setter, [receiver])
+                Array.push(u.preds, writes)
+                emit(g, C.cpredOf(writes, Some(e.span), "mutate"))
             }
+            Map.put(g.types.uses, e.id, u)
+            emit(g, CUse(u))
             let fam = Classes.fieldFamily(name)
             TFam(fam, receiver, familyResult(g, fam))
         }

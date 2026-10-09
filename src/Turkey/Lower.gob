@@ -1,7 +1,6 @@
 module Turkey.Lower (Lowerer(..), newLowerer, program)
 
--- Surface tree plus what solving decided, down to `Turkey.Core`
--- (`turkey/lower.py`).
+-- Surface tree plus what solving decided, down to `Turkey.Core`.
 --
 -- This is the pass that makes the elaboration a *tree*. Everything it needs was
 -- already computed and is currently scattered across three side tables and the
@@ -55,7 +54,7 @@ import Turkey.Ast as Ast
 import Turkey.Classes as Classes
 import Turkey.Classes (ClassTable(..), ClassInfo(..), InstInfo(..),
                        InstancePlan(..), MethodInfo(..), MethodImpl(..),
-                       Evidence(..))
+                       Evidence(..), Slot(..))
 import Turkey.Constraints as C
 import Turkey.Constraints (Env(..), Binding(..))
 import Turkey.Core
@@ -77,10 +76,6 @@ import Turkey.Types (Kind(..), VarCell(..), ConCell(..), Scheme(..), Pred(..),
                      TVar, TCon, TApp, TFam, TFun, TTuple, TBottom)
 
 -- -- naming -------------------------------------------------------------------------
-
-fun dictConName(cls : String) -> String = "%Dict." + cls
-
-fun superField(cls : String) -> String = "%super." + cls
 
 fun instName(inst : InstInfo) -> String =
     "%inst." + inst.cls + "." + Classes.instCon(inst)
@@ -305,7 +300,7 @@ fun letBinds(l : Lowerer, stmt : Stmt, pat : Pat, value : Expr, mutable : Bool,
 
 fun dictType(l : Lowerer, cls : String, arg : Ty.Type) -> Ty.Type {
     let info = classNamed(l, cls)
-    TApp(Ty.tcon(dictConName(cls), KFun(Classes.classKind(info), KStar),
+    TApp(Ty.tcon(Cr.dictName(cls), KFun(Classes.classKind(info), KStar),
                  Ty.noScope), arg, KStar)
 }
 
@@ -323,18 +318,22 @@ fun instanceBind(l : Lowerer, inst : InstInfo) -> CBind {
     let result = dictType(l, inst.cls, inst.head)
     if Classes.isGenerated(inst.cls) { return accessors(l, inst, result) }
     if inst.cls == P.typedClass { return typeRepDict(l, inst, result) }
-    let fields = Array.new(8)
     let givens = instanceGivens(l, inst, plan)
-    for (sup, ev) in Map.entries(plan.supers) {
-        Array.push(fields, (superField(sup),
-            evidence(l, ev, dictType(l, sup, inst.head), givens)))
-    }
-    for (name, impl) in Map.entries(plan.methods) {
-        Array.push(fields, (Classes.surfaceMember(name),
-            methodBody(l, inst, name, impl, plan.params)))
-    }
-    let record = node(result, Some(inst.decl.span),
-                      CRecord(dictConName(inst.cls), fields))
+    let record = dictionary(l, inst.cls, result, Some(inst.decl.span), fun(slot) =
+        match slot {
+            SuperSlot(sup) -> match Map.get(plan.supers, sup) {
+                Some(ev) -> evidence(l, ev, dictType(l, sup, inst.head), givens)
+                None -> oops("no evidence for the superclass '" + sup + "'",
+                             Some(inst.decl.span))
+            }
+            MethodSlot(name) -> match Map.get(plan.methods, name) {
+                Some(impl) -> methodBody(l, inst, name, impl, plan.params)
+                None -> oops("no body for the method '" + name + "'",
+                             Some(inst.decl.span))
+            }
+            KeyedSlot(_, _) -> oops("a keyed slot before layouts are shared",
+                                    Some(inst.decl.span))
+        })
     var value = record
     if len(plan.params) > 0 {
         let params = Array.new(len(plan.params))
@@ -378,14 +377,14 @@ fun instanceBind(l : Lowerer, inst : InstInfo) -> CBind {
 --
 -- Written here in Core rather than in the surface language, and it has to be:
 -- `fun get(r) = r.cap` is itself a field access, so it would demand the very
--- predicate it is the evidence for and regress. `CField` stays the primitive
--- and the class is its interface -- the same relation `Prim.intAdd` has to
--- `class Add`.
+-- predicate it is the evidence for and regress. `CProject` at the field's
+-- position is the primitive and the class is its interface -- the same
+-- relation `Prim.intAdd` has to `class Add`.
 --
 -- No context, so the dictionary is a bare record rather than a function of one.
 -- That is what lets the devirtualizer hoist these accessors and the inliner
 -- collapse them: wherever specialization reaches, a field access ends up the
--- same `CField` it always was.
+-- same `CProject` a field access on a known record lowers to.
 -- The dictionary of a derived `Typed` instance.
 --
 -- Written in Core for the same reason `accessors` is: the surface language
@@ -419,8 +418,8 @@ fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
                                  [argument], span)
         let dictTy = dictType(l, pred.name, argument)
         let method = node(TFun([proxyTy], repTy), span,
-                          CField(node(dictTy, span, CVar(plan.params[i])),
-                                 "typeRep"))
+                          CSlot(node(dictTy, span, CVar(plan.params[i])),
+                                slotFor(l, P.typedClass, typeRepMethod(l), span)))
         Array.push(elems, node(repTy, span,
             CApp(method, [node(proxyTy, span, CCon(P.proxyCon))])))
     }
@@ -433,8 +432,7 @@ fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
     let body = node(TFun([ownProxy], repTy), span,
                     CLam([CParam { name = "%p", ty = ownProxy }], made,
                          instName(inst) + "#typeRep"))
-    let record = node(result, span,
-                      CRecord(dictConName(inst.cls), [("typeRep", body)]))
+    let record = dictionary(l, inst.cls, result, span, fun(_) = body)
     var value = record
     if len(plan.params) > 0 {
         let params = Array.new(len(plan.params))
@@ -456,37 +454,66 @@ fun accessors(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
     let span = Some(inst.decl.span)
     let target = CParam { name = "%r", ty = inst.head }
     let receiver = node(inst.head, span, CVar(target.name))
-    let fields = match Classes.setterLabel(inst.cls) {
+    -- One method, so one slot: `get` or `set`.
+    let method = match Classes.setterLabel(inst.cls) {
         Some(name) -> {
             let held = Decls.fieldType(l.decls, inst.head, name)
             let written = CParam { name = "%v", ty = held }
-            let slot = node(held, span, CField(receiver, name))
-            [("set", node(
-                TFun([inst.head, held], Ty.tUnit()), span,
+            let slot = node(held, span, accessedField(l, receiver, name, span))
+            node(TFun([inst.head, held], Ty.tUnit()), span,
                 CLam([target, written],
                      node(Ty.tUnit(), span,
                           CAssign(slot, node(held, span, CVar(written.name)))),
-                     instName(inst) + "#set")))]
+                     instName(inst) + "#set"))
         }
         None -> {
             var held = Ty.tUnit()
             for (_, ty) in Map.entries(inst.families) { held = ty }
             let read = match Classes.generatedLabel(inst.cls) {
-                Some(name) -> node(held, span, CField(receiver, name))
+                Some(name) -> node(held, span, accessedField(l, receiver, name, span))
                 None -> match Classes.generatedIndex(inst.cls) {
                     Some(index) -> node(held, span, CProject(receiver, index))
                     None -> oops("'" + inst.cls + "' is not a generated class", span)
                 }
             }
-            [("get", node(TFun([inst.head], held), span,
-                          CLam([target], read, instName(inst) + "#get")))]
+            node(TFun([inst.head], held), span,
+                 CLam([target], read, instName(inst) + "#get"))
         }
     }
-    let record = node(result, span, CRecord(dictConName(inst.cls), fields))
+    let record = dictionary(l, inst.cls, result, span, fun(_) = method)
     let b = newBind(instName(inst), result, instanceBinders(inst), record, span)
     b.module_ = inst.module_
     b
 }
+
+-- The field an accessor reads or writes: a position, since a generated
+-- instance's head is the record type that declares the field.
+fun accessedField(l : Lowerer, receiver : Core, label : String,
+                  span : Option Span) -> CoreKind =
+    match fieldPosition(l, receiver.ty, label) {
+        Some(i) -> CProject(receiver, i)
+        None -> oops("'" + Ty.show(receiver.ty) + "' has no field '" + label + "'",
+                     span)
+    }
+
+-- A `cls` dictionary, each slot filled by `fill`.
+fun dictionary(l : Lowerer, cls : String, ty : Ty.Type, span : Option Span,
+               fill : fun(Slot) -> Core) -> Core =
+    node(ty, span, CDict(cls, Array.map(Classes.dictSlots(l.classes, cls), fill)))
+
+-- Where a `cls` dictionary holds `method`, by its qualified name.
+fun slotFor(l : Lowerer, cls : String, method : String, span : Option Span) -> Int =
+    match Classes.methodSlot(l.classes, cls, method) {
+        Some(i) -> i
+        None -> oops("class '" + cls + "' has no method '" + method + "'", span)
+    }
+
+-- The qualified name of `Typed`'s one method.
+fun typeRepMethod(l : Lowerer) -> String =
+    match Classes.memberNamed(Map.keys(classNamed(l, P.typedClass).methods), "typeRep") {
+        Some(name) -> name
+        None -> oops("'" + P.typedClass + "' has no method 'typeRep'", None)
+    }
 
 -- The instance's own variables, in the order its binding abstracts them. Read
 -- off the head, which is the only place they appear, and used by both the
@@ -636,6 +663,29 @@ fun carried(l : Lowerer, e : Expr) -> Array Core = match Map.get(l.types.uses, e
     }
 }
 
+-- The dictionaries a field access reads or writes through, when its receiver
+-- is polymorphic: the reader's, then the setter's if it assigns. `None` where
+-- the evidence is an instance, which means the receiver's type is known here
+-- and the field is selected directly.
+--
+-- Both are given or neither is: the two predicates are about one receiver, and
+-- a receiver is either quantified over or it is not.
+fun passedAccessors(l : Lowerer, e : Expr) -> Option (Array Core) {
+    let u = Map.get(l.types.uses, e.id)?
+    if len(u.evidence) == 0 { return None }
+    match u.evidence[0] {
+        FromDict(_, _, _) -> {}
+        _ -> return None
+    }
+    let givens = givensOf(l, u)
+    let out = Array.new(len(u.evidence))
+    for var i = 0; i < len(u.evidence) && i < len(u.preds); i = i + 1 {
+        Array.push(out, evidence(l, u.evidence[i], predType(l, u.preds[i]),
+                                 givens))
+    }
+    Some(out)
+}
+
 -- The constructor as Core applies it: dictionaries, then fields.
 fun packing(dicts : Array Core, fnTy : Ty.Type, name : String,
             where : Option Span) -> Core {
@@ -703,6 +753,86 @@ fun existentialRecord(l : Lowerer, e : Expr, info : ConInfo, con : String,
                                    Array.new(0)))
     }
     out
+}
+
+-- A record literal: the application of its constructor to its fields, in
+-- declaration order, which is the object's layout.
+--
+-- The fields are evaluated in the order they were written, so where that is
+-- not declaration order, each is bound first, in written order, and the
+-- constructor is applied to the bindings.
+fun recordLiteral(l : Lowerer, con : String, fields : Array (String, Core),
+                  ty : Ty.Type, where : Option Span) -> Core {
+    let declared = match Decls.con(l.decls, con) {
+        Some(ConInfo { fields = Some(names), .. }) -> names
+        _ -> oops("'" + con + "' is not a record constructor", where)
+    }
+    var inOrder = len(fields) == len(declared)
+    for var i = 0; i < len(fields) && i < len(declared); i = i + 1 {
+        if fields[i].0 != declared[i] { inOrder = False }
+    }
+    if inOrder { return applyCon(con, Array.map(fields, _.1), ty, where) }
+    let held = Map.new()
+    for (n, v) in fields { Map.put(held, n, (freshName(l, "field"), v)) }
+    let built = Array.new(len(declared))
+    for n in declared {
+        let (name, v) = match Map.get(held, n) {
+            Some(found) -> found
+            None -> oops("the field '" + n + "' vanished", where)
+        }
+        Array.push(built, node(v.ty, where, CVar(name)))
+    }
+    var out = applyCon(con, built, ty, where)
+    for var i = len(fields) - 1; i >= 0; i = i - 1 {
+        let (name, v) = held[fields[i].0]
+        out = node(ty, where, CLet(name, v.ty, v, out, Array.new(0)))
+    }
+    out
+}
+
+-- A saturated constructor application.
+fun applyCon(con : String, args : Array Core, ty : Ty.Type,
+             where : Option Span) -> Core =
+    node(ty, where, CApp(node(TFun(Array.map(args, _.ty), ty), where, CCon(con)),
+                         args))
+
+-- The position of the field `label` in `receiver`, whose type is known here:
+-- a field of a receiver whose type is not is read through its evidence
+-- (`passedAccessors`). A receiver of type `!` never yields a value, so any
+-- position reads it.
+fun knownPosition(l : Lowerer, receiver : Core, label : String,
+                  where : Option Span) -> Int {
+    match Ty.prune(receiver.ty) {
+        TBottom -> return 0
+        _ -> {}
+    }
+    match fieldPosition(l, receiver.ty, label) {
+        Some(i) -> i
+        None -> oops("'" + Ty.show(receiver.ty) + "' has no field '" + label + "'",
+                     where)
+    }
+}
+
+-- The slot of the generated accessor `which` in `dict`, a field class's
+-- dictionary.
+fun accessorSlot(l : Lowerer, dict : Core, which : String,
+                 where : Option Span) -> Int {
+    let cls = match dictClass(dict.ty) {
+        Some(c) -> c
+        None -> oops("a field accessor read from something that is not a dictionary",
+                     where)
+    }
+    slotFor(l, cls, Classes.accessor(cls, which), where)
+}
+
+-- The position of the field `label` in the record type `ty`, where `ty`'s
+-- head is known to be a record type.
+fun fieldPosition(l : Lowerer, ty : Ty.Type, label : String) -> Option Int {
+    let (h, _) = Ty.spine(Ty.prune(ty))
+    match h {
+        TCon(c) -> Array.indexOf(Decls.recordFields(l.decls, c.name)?, label)
+        _ -> None
+    }
 }
 
 fun eta(l : Lowerer, called : Core, result : Ty.Type, where : Option Span) -> Core =
@@ -788,10 +918,20 @@ fun evidence(l : Lowerer, ev : Evidence, want : Ty.Type,
             }
         }
         var out = node(start, None, CVar(name))
+        var cls = match dictClass(start) {
+            Some(c) -> c
+            None -> oops("'" + name + "' is not a dictionary", None)
+        }
         for var i = 0; i < len(path); i = i + 1 {
             let at = if i == len(path) - 1 { want }
                      else { dictType(l, path[i], head) }
-            out = node(at, None, CField(out, superField(path[i])))
+            let index = match Classes.superSlot(l.classes, cls, path[i]) {
+                Some(found) -> found
+                None -> oops("'" + path[i] + "' is not a superclass of '" + cls + "'",
+                             None)
+            }
+            out = node(at, None, CSlot(out, index))
+            cls = path[i]
         }
         out
     }
@@ -1145,8 +1285,8 @@ fun dispatch(l : Lowerer, e : Expr, scope : Scope) -> Core {
     match e.kind {
         ELit(lit) -> node(ty, where, CLit(lit))
         EUnit -> node(ty, where, CUnit)
-        -- Constructor values are ordinary functions in Core. Keep this in
-        -- elaboration, matching `lower.py`, so every backend sees the lambda.
+        -- Constructor values are ordinary functions in Core. Kept in
+        -- elaboration, so every pass after it sees the lambda.
         ECon(name) -> conValue(l, e, name, ty, where)
         EVar(_, _) -> var_(l, e, scope)
         ETuple(elems) -> node(ty, where,
@@ -1162,9 +1302,18 @@ fun dispatch(l : Lowerer, e : Expr, scope : Scope) -> Core {
             }
             let out = Array.new(len(fields))
             for (n, v) in fields { Array.push(out, (n, expr(l, v, scope))) }
-            node(ty, where, CRecord(con, out))
+            recordLiteral(l, con, out, ty, where)
         }
-        EField(obj, name) -> node(ty, where, CField(expr(l, obj, scope), name))
+        EField(obj, name) -> {
+            let target = expr(l, obj, scope)
+            match passedAccessors(l, e) {
+                Some(dicts) -> node(ty, where, CApp(
+                    node(TFun([target.ty], ty), where,
+                         CSlot(dicts[0], accessorSlot(l, dicts[0], "get", where))),
+                    [target]))
+                None -> node(ty, where, CProject(target, knownPosition(l, target, name, where)))
+            }
+        }
         EProject(obj, index) -> node(ty, where,
             CProject(expr(l, obj, scope), index))
         EIndex(arr, index, _, _) -> node(ty, where,
@@ -1245,8 +1394,8 @@ fun arrayLiteral(l : Lowerer, e : Expr, public : Ty.Type, elems : Array Expr,
     let length = node(Ty.tInt(), where, CLit(LInt(len(elems))))
     let storageTy = Ty.applyTo(Decls.head(l.decls, "Data.Array#ArrayStorage"),
                                [element], where)
-    let storage = node(storageTy, where, CRecord("Data.Array#ArrayStorage",
-        [("storage", raw), ("length", length)]))
+    let storage = recordLiteral(l, "Data.Array#ArrayStorage",
+        [("storage", raw), ("length", length)], storageTy, where)
     let constructor = node(TFun([storageTy], public), where,
                            CCon("Data.Array#Array"))
     node(public, where, CApp(constructor, [storage]))
@@ -1353,7 +1502,7 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
             -- convention the method's scheme sets up; the method is a field of
             -- it and the rest, if any, are the method's own context.
             base = node(unknown(), where,
-                        CField(dicts[0], Classes.surfaceMember(name)))
+                        CSlot(dicts[0], slotFor(l, mi.cls, mi.name, where)))
             dicts = Array.slice(dicts, 1, len(dicts))
             -- And the class variable is *already* fixed, by the dictionary the
             -- method was projected from. It is one of the method scheme's
@@ -2230,8 +2379,17 @@ fun assign(l : Lowerer, stmt : Stmt, target : Expr, source : Expr,
             node(refOf(value.ty), Some(target.span), CVar(name)), value))
         EField(obj, name) -> {
             let o = expr(l, obj, scope)
-            node(unit, at, CAssign(
-                node(value.ty, Some(target.span), CField(o, name)), value))
+            match passedAccessors(l, target) {
+                Some(dicts) -> if len(dicts) == 2 {
+                    return node(unit, at, CApp(
+                        node(TFun([o.ty, value.ty], unit), Some(target.span),
+                             CSlot(dicts[1], accessorSlot(l, dicts[1], "set", Some(target.span)))),
+                        [o, value]))
+                }
+                None -> {}
+            }
+            let slot = CProject(o, knownPosition(l, o, name, Some(target.span)))
+            node(unit, at, CAssign(node(value.ty, Some(target.span), slot), value))
         }
         EIndex(arr, index, _, _) -> {
             let a = expr(l, arr, scope)

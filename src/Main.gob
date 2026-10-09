@@ -289,7 +289,7 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
     if wants("types") { dumpTypes(b, checked, entry) }
     let program = lowered(checked)
     at = lap("lower", at)
-    if wants("core") { String.push(b, Core.showProgram(program, Some(entry.name))) }
+    if wants("core") { String.push(b, Core.showProgram(program, Some(entry.name), slotNames(checked))) }
     write(String.drain(b))
     if through("core") { return }
     let main = Map.getOr(entry.scope.values, "main", "main")
@@ -300,10 +300,10 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
     if through("mono") { return }
     let optimized = optimize(checked, main, specialized)
     at = lap("opt", at)
-    if wants("opt") { String.push(b, Core.showProgram(optimized, Some(entry.name))) }
+    if wants("opt") { String.push(b, Core.showProgram(optimized, Some(entry.name), slotNames(checked))) }
     write(String.drain(b))
     if through("opt") { return }
-    let (module_, skipped) = lowerModule(optimized, checked.decls, path)
+    let (module_, skipped) = lowerModule(optimized, checked.decls, checked.classes, path)
     at = lap("ssa", at)
     if wants("ssa") { dumpSsa(b, module_, skipped) }
     write(String.drain(b))
@@ -417,6 +417,10 @@ fun dumpTypes(b : String.Builder, checked : Checked, entry : Modules.Module) -> 
 -- The check is not optional and is not a flag. Evidence that is checkable but
 -- unchecked is evidence nobody has checked, so it runs the way exhaustiveness
 -- does: always, on every program.
+-- How a dump names a dictionary's slots, which the program holds by position.
+fun slotNames(checked : Checked) -> fun(String, Int) -> String =
+    fun(cls, index) = Classes.slotName(checked.classes, cls, index)
+
 fun lowered(checked : Checked) -> Core.CProgram {
     let lowerer = Lower.newLowerer(checked.decls, checked.classes, checked.env,
                                    checked.types, target, build)
@@ -435,7 +439,7 @@ fun dumpMono(b : String.Builder, checked : Checked, entry : Modules.Module,
              specialized : Core.CProgram) -> Unit {
     Coretc.checkProgram(checked.decls, checked.classes, specialized,
                         Coretc.globalsOf(checked.env))
-    String.push(b, Core.showProgram(specialized, Some(entry.name)))
+    String.push(b, Core.showProgram(specialized, Some(entry.name), slotNames(checked)))
 }
 
 -- And that with the optimizations applied.
@@ -561,9 +565,10 @@ fun reportWarnings(checked : Checked, path : String) -> Unit {
 -- value it stands for was not already live, so running them first can only
 -- remove what the check objects to -- a literal on a branch proven dead, an
 -- allocation nothing reads -- and cannot make acceptable code unacceptable.
-fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable, path : String)
+fun lowerModule(program : Core.CProgram, decls : Decls.DeclTable,
+                classes : Classes.ClassTable, path : String)
         -> (SsaLower.Module, Array SsaLower.Unsupported) {
-    let (module_, skipped) = SsaLower.lowerProgram(program, decls)
+    let (module_, skipped) = SsaLower.lowerProgram(program, decls, Map.keys(classes.classes))
     -- Each function's own, so on as many workers as there are.
     module_.functions = Parallel.map(module_.functions, fun(lowered) = {
         Fields.forward(lowered)

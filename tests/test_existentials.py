@@ -41,7 +41,7 @@ def test_a_carried_instance_is_used_where_the_value_is_opened():
 
 def test_construction_elaborates_to_the_dictionary_and_the_field():
     core = lang.dump("core", SHOWN).stdout
-    assert "Main#Shown(\n  %inst.Std.Classes#Show.Int," in core
+    assert "Main#Shown(%inst.Std.Classes#Show.Int, " in core
     assert "Main#Shown[a](%d1.Std.Classes#Show)(xs) ->" in core
 
 

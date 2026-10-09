@@ -52,7 +52,7 @@ import Data.Set as Set
 import Turkey.Ast
 import Turkey.Ast as Ast
 import Turkey.Classes as Classes
-import Turkey.Classes (ClassTable(..), ClassInfo(..), MethodInfo(..))
+import Turkey.Classes (ClassTable(..), ClassInfo(..), MethodInfo(..), Slot(..))
 import Turkey.Constraints as C
 import Turkey.Constraints (Env(..))
 import Turkey.Core
@@ -68,8 +68,6 @@ import Turkey.Types as Ty
 import Turkey.Types (Kind(..), VarCell(..), ConCell(..), Scheme(..), Pred(..),
                      TVar, TCon, TApp, TFam, TFun, TTuple, TBottom)
 
-let dictPrefix = "%Dict."
-let superPrefix = "%super."
 
 -- -- the environment ---------------------------------------------------------------
 
@@ -278,9 +276,9 @@ fun rule(ck : Checker, e : Core, env : CEnv) -> Ty.Type = match e.kind {
         Ty.rawArrayOf(check(ck, elems[0], env, None))
     }
     CTyApp(fn, args) -> checkTyApp(ck, e, fn, args, env)
-    CField(target, name) -> checkField(ck, e, target, name, env)
+    CSlot(target, index) -> checkSlot(ck, e, target, index, env)
     CProject(target, index) -> checkProject(ck, e, target, index, env)
-    CRecord(con, fields) -> checkRecord(ck, e, con, fields, env)
+    CDict(cls, slots) -> checkDict(ck, e, cls, slots, env)
     CLam(params, body, _) -> {
         let mark = enter(env)
         for p in params { defineC(env, p.name, [], p.ty) }
@@ -477,7 +475,7 @@ fun polymorphic(ck : Checker, fn : Core,
         Some(found) -> found
         None -> fail("'" + name + "' is not in scope", fn.span)
     }
-    CField(target, name) -> methodScheme(ck, fn, target, name, env)
+    CSlot(target, index) -> methodScheme(ck, fn, target, index, env)
     CPrim(p) -> {
         let scheme = PrimTypes.scheme(p)
         (scheme.quantified, scheme.body)
@@ -491,14 +489,16 @@ fun polymorphic(ck : Checker, fn : Core,
 -- the *dictionary's own type*, so a `Monoid` dictionary cannot answer a
 -- `Semigroup` projection, and the method's remaining binders are its own
 -- scheme's less the class variable the dictionary just fixed.
-fun methodScheme(ck : Checker, e : Core, target : Core, name : String,
+fun methodScheme(ck : Checker, e : Core, target : Core, index : Int,
                  env : CEnv) -> (Array VarCell, Ty.Type) {
     let dictTy = check(ck, target, env, None)
     let (cls, head) = dictParts(ck, dictTy, e.span)
-    let info = classNamed(ck, cls, e.span)
-    let m = match classMethod(info, name) {
-        Some(x) -> x
-        None -> fail("class '" + cls + "' has no method '" + name + "'", e.span)
+    let m = match slotOf(ck, cls, index, e.span) {
+        MethodSlot(name) -> methodNamed(ck, cls, name, e.span)
+        KeyedSlot(name, _) -> methodNamed(ck, cls, name, e.span)
+        SuperSlot(sup) -> fail("slot " + Int.toString(index) + " of a '" + cls
+                               + "' dictionary is its '" + sup
+                               + "' superclass, not a method", e.span)
     }
     let binders = Array.new(4)
     for q in m.scheme.quantified {
@@ -525,47 +525,46 @@ fun methodType(ck : Checker, m : MethodInfo, head : Ty.Type) -> Ty.Type {
 
 -- Read `%Dict.C t` back as the class `C` and the type `t`.
 fun dictParts(ck : Checker, ty : Ty.Type, where : Option Span) -> (String, Ty.Type) {
-    let (h, args) = Ty.spine(Ty.prune(ty))
-    let name = match h {
-        TCon(c) -> c.name
-        _ -> fail(Ty.show(ty) + " is not a dictionary", where)
-    }
-    if !String.startsWith(name, dictPrefix) || len(args) != 1 {
-        fail(Ty.show(ty) + " is not a dictionary", where)
-    }
-    let cls = match String.stripPrefix(name, dictPrefix) {
+    let cls = match Cr.dictClass(ty) {
         Some(c) -> c
         None -> fail(Ty.show(ty) + " is not a dictionary", where)
     }
     if !Map.contains(ck.classes.classes, cls) {
         fail("no such class '" + cls + "'", where)
     }
+    let (_, args) = Ty.spine(Ty.prune(ty))
     (cls, args[0])
 }
 
--- Three things wear this shape: a superclass, a method, a record field.
---
--- Which one it is is decided by the *target's type*, not by the name -- that is
--- what makes the check a check. A superclass selection off a record, or a field
--- access on a dictionary, is rejected here.
-fun checkField(ck : Checker, e : Core, target : Core, name : String,
-               env : CEnv) -> Ty.Type {
-    let t = check(ck, target, env, None)
-    if !isDict(t) { return recordField(ck, t, name, e.span, Some(e.ty)) }
-    let (cls, head) = dictParts(ck, t, e.span)
-    if String.startsWith(name, superPrefix) {
-        let want = match String.stripPrefix(name, superPrefix) {
-            Some(w) -> w
-            None -> name
-        }
-        if !hasSuper(ck, cls, want) {
-            fail("'" + want + "' is not a superclass of '" + cls + "'", e.span)
-        }
-        return dictType(ck, want, head)
+-- What slot `index` of a `cls` dictionary holds.
+fun slotOf(ck : Checker, cls : String, index : Int, where : Option Span) -> Slot =
+    match Classes.slotAt(ck.classes, cls, index) {
+        Some(slot) -> slot
+        None -> fail("a '" + cls + "' dictionary has no slot " + Int.toString(index),
+                     where)
     }
-    let (binders, body) = methodScheme(ck, e, target, name, env)
+
+fun methodNamed(ck : Checker, cls : String, name : String,
+                where : Option Span) -> MethodInfo =
+    match Map.get(classNamed(ck, cls, where).methods, name) {
+        Some(m) -> m
+        None -> fail("class '" + cls + "' has no method '" + name + "'", where)
+    }
+
+-- A superclass or a method, by what the class declares at that slot. Which
+-- class is decided by the *target's type*, so a `Monoid` dictionary cannot
+-- answer for a `Semigroup` slot.
+fun checkSlot(ck : Checker, e : Core, target : Core, index : Int,
+              env : CEnv) -> Ty.Type {
+    let t = check(ck, target, env, None)
+    let (cls, head) = dictParts(ck, t, e.span)
+    match slotOf(ck, cls, index, e.span) {
+        SuperSlot(sup) -> return dictType(ck, sup, head)
+        _ -> {}
+    }
+    let (binders, body) = methodScheme(ck, e, target, index, env)
     if len(binders) > 0 {
-        fail("method '" + name + "' is polymorphic in "
+        fail("method '" + Classes.slotName(ck.classes, cls, index) + "' is polymorphic in "
              + String.join(Array.map(binders, \Ty.show(TVar(_))), " ")
              + " and is used without a type application", e.span)
     }
@@ -581,178 +580,53 @@ fun checkProject(ck : Checker, e : Core, target : Core, index : Int,
         TBottom -> return e.ty
         _ -> {}
     }
-    let choices = match t {
-        TTuple(elems) -> Some(elems)
-        _ -> Decls.projectionTypes(ck.decls, t)
+    let chosen = match t {
+        TTuple(elems) -> if index < len(elems) { Some(elems[index]) } else { None }
+        _ -> Decls.payloadType(ck.decls, t, index)
     }
-    match choices {
-        Some(elems) -> if index < len(elems) { elems[index] } else {
-            fail("invalid projection ." + Int.toString(index) + " from "
-                 + Ty.show(t), e.span)
-        }
+    match chosen {
+        Some(elem) -> elem
         None -> fail("invalid projection ." + Int.toString(index) + " from "
                      + Ty.show(t), e.span)
     }
 }
 
--- A field of a single-variant record.
-fun recordField(ck : Checker, target : Ty.Type, name : String,
-                where : Option Span, erased : Option Ty.Type) -> Ty.Type {
-    let (h, _) = Ty.spine(reduce(ck, Ty.prune(target)))
-    -- The lowering kept the type inference gave it; if that is still a variable
-    -- the field was resolved by a demand the solver discharged and erased, and
-    -- there is nothing left here to check. Hand back the type inference recorded
-    -- for the selection rather than a fresh variable: a fresh variable is not
-    -- "unknown" to the callers, it is a rigid nothing.
-    match h {
-        TVar(_) -> return match erased {
-            Some(t) -> t
-            None -> freshType()
-        }
-        TFam(_, _, _) -> return match erased {
-            Some(t) -> t
-            None -> freshType()
-        }
-        TBottom -> return match erased {
-            Some(t) -> t
-            None -> freshType()
-        }
-        _ -> {}
-    }
-    let headName = match h {
-        TCon(c) -> c.name
-        _ -> fail(Ty.show(target) + " has no fields", where)
-    }
-    let info = match Map.get(ck.decls.tycons, headName) {
-        Some(info) -> info
-        None -> fail("unknown type '" + headName + "'", where)
-    }
-    for con in info.variants {
-        if Decls.isRecord(con) {
-            match con.fields {
-                Some(names) -> match Array.indexOf(names, name) {
-                    Some(index) -> match con.scheme.body {
-                        TFun(params, _) -> {
-                            let mapping = headMapping(con.scheme, target)
-                            return Decls.substitute(params[index], mapping)
-                        }
-                        _ -> {}
-                    }
-                    None -> {}
-                }
-                None -> {}
-            }
-        }
-    }
-    fail("'" + headName + "' has no field '" + name + "'", where)
-}
-
-fun isDict(ty : Ty.Type) -> Bool {
-    let (h, args) = Ty.spine(Ty.prune(ty))
-    match h {
-        TCon(c) -> String.startsWith(c.name, dictPrefix) && len(args) == 1
-        _ -> False
-    }
-}
+fun isDict(ty : Ty.Type) -> Bool = Cr.isDictionary(ty)
 
 fun dictType(ck : Checker, cls : String, arg : Ty.Type) -> Ty.Type {
     let info = classNamed(ck, cls, None)
-    TApp(Ty.tcon(dictPrefix + cls, KFun(Classes.classKind(info), KStar),
+    TApp(Ty.tcon(Cr.dictName(cls), KFun(Classes.classKind(info), KStar),
                  Ty.noScope), arg, KStar)
 }
 
-fun hasSuper(ck : Checker, cls : String, want : String) -> Bool {
-    for p in classNamed(ck, cls, None).supers {
-        if p.name == want { return True }
+-- Every slot of a dictionary, against what the class declares there. A slot
+-- missing is as much an error as a wrong one: a dictionary with a hole in it
+-- is a crash waiting at whichever call reads the hole.
+fun checkDict(ck : Checker, e : Core, cls : String, slots : Array Core,
+              env : CEnv) -> Ty.Type {
+    let (named, head) = dictParts(ck, e.ty, e.span)
+    if named != cls {
+        fail("a '" + cls + "' dictionary has the type of a '" + named + "' one", e.span)
     }
-    False
-}
-
--- A record, which is also how a dictionary is built.
-fun checkRecord(ck : Checker, e : Core, con : String,
-                fields : Array (String, Core), env : CEnv) -> Ty.Type {
-    if String.startsWith(con, dictPrefix) {
-        let (cls, head) = dictParts(ck, e.ty, e.span)
-        dictionary(ck, e, cls, head, fields, env)
-        return e.ty
+    let declared = Classes.dictSlots(ck.classes, cls)
+    if len(slots) != len(declared) {
+        fail("the '" + cls + "' dictionary for " + Ty.show(head) + " has "
+             + Int.toString(len(slots)) + " slots, where the class has "
+             + Int.toString(len(declared)), e.span)
     }
-    let info = match Map.get(ck.decls.constructors, con) {
-        Some(i) -> i
-        None -> fail("unknown constructor '" + con + "'", e.span)
-    }
-    let mapping = headMapping(info.scheme, e.ty)
-    let params = match info.scheme.body {
-        TFun(ps, _) -> ps
-        _ -> Array.new(0)
-    }
-    let names = match info.fields {
-        Some(ns) -> ns
-        None -> Array.new(0)
-    }
-    for (name, value) in fields {
-        match Array.indexOf(names, name) {
-            None -> fail("'" + con + "' has no field '" + name + "'", e.span)
-            Some(index) -> {
-                let want = Decls.substitute(params[index], mapping)
-                let got = check(ck, value, env, None)
-                if !agrees(ck, want, got) {
-                    mismatch(ck, want, got, e.span,
-                             "field '" + name + "' of '" + con + "'")
-                }
-            }
+    for var i = 0; i < len(slots); i = i + 1 {
+        let want = match declared[i] {
+            SuperSlot(sup) -> dictType(ck, sup, head)
+            MethodSlot(name) -> methodType(ck, methodNamed(ck, cls, name, e.span), head)
+            KeyedSlot(name, _) -> methodType(ck, methodNamed(ck, cls, name, e.span), head)
+        }
+        let got = check(ck, slots[i], env, None)
+        if !agrees(ck, want, got) {
+            mismatch(ck, want, got, e.span, "the '" + Classes.slotName(ck.classes, cls, i)
+                     + "' of a '" + cls + "' dictionary")
         }
     }
     e.ty
-}
-
--- Every field of a dictionary, against what the class declares.
---
--- A missing method is as much an error as a wrong one: a dictionary with a hole
--- in it is exactly what a crash from inside the evaluator used to mean.
-fun dictionary(ck : Checker, e : Core, cls : String, head : Ty.Type,
-               fields : Array (String, Core), env : CEnv) -> Unit {
-    let info = classNamed(ck, cls, e.span)
-    let seen = Set.new()
-    for (name, value) in fields {
-        Set.add(seen, name)
-        if String.startsWith(name, superPrefix) {
-            let sup = match String.stripPrefix(name, superPrefix) {
-                Some(s) -> s
-                None -> name
-            }
-            let want = dictType(ck, sup, head)
-            let got = check(ck, value, env, None)
-            if !agrees(ck, want, got) {
-                mismatch(ck, want, got, e.span,
-                         "the '" + name + "' of a '" + cls + "' dictionary")
-            }
-        } else {
-            let m = match classMethod(info, name) {
-                Some(x) -> x
-                None -> fail("class '" + cls + "' has no method '" + name + "'",
-                             e.span)
-            }
-            let want = methodType(ck, m, head)
-            let got = check(ck, value, env, None)
-            if !agrees(ck, want, got) {
-                mismatch(ck, want, got, e.span,
-                         "method '" + name + "' of '" + cls + "'")
-            }
-        }
-    }
-    for name in Map.keys(info.methods) {
-        let surface = Classes.surfaceMember(name)
-        if !Set.contains(seen, surface) {
-            fail("the '" + cls + "' dictionary for " + Ty.show(head)
-                 + " has no '" + surface + "'", e.span)
-        }
-    }
-    for sup in info.supers {
-        if !Set.contains(seen, superPrefix + sup.name) {
-            fail("the '" + cls + "' dictionary for " + Ty.show(head)
-                 + " has no '" + sup.name + "' superclass", e.span)
-        }
-    }
 }
 
 fun checkApp(ck : Checker, e : Core, fn : Core, args : Array Core,
@@ -1088,12 +962,6 @@ fun classNamed(ck : Checker, name : String, where : Option Span) -> ClassInfo =
         None -> fail("no such class '" + name + "'", where)
     }
 
-fun classMethod(info : ClassInfo, written : String) -> Option MethodInfo =
-    match Classes.memberNamed(Map.keys(info.methods), Cr.methodBase(written)) {
-        Some(resolved) -> Map.get(info.methods, resolved)
-        None -> None
-    }
-
 -- Bind a constructor's own variables to the type it was used at.
 --
 -- By matching its declared *result* against the target, not by zipping its
@@ -1120,7 +988,7 @@ fun headMapping(s : Scheme, target : Ty.Type) -> Map Int Ty.Type {
 -- someone chasing a mis-lowering needs.
 fun describe(e : Core) -> String = match e.kind {
     CVar(name) -> "the variable '" + name + "'"
-    CField(_, name) -> "the field '" + name + "'"
+    CSlot(_, index) -> "the dictionary slot " + Int.toString(index)
     CProject(_, index) -> "the projection '." + Int.toString(index) + "'"
     CCon(name) -> "the constructor '" + name + "'"
     CPrim(prim) -> "the builtin '" + Prims.name(prim) + "'"

@@ -45,7 +45,7 @@ import System.Parallel as Parallel
 import Data.Set as Set
 import Turkey.Ast
 import Turkey.Classes as Classes
-import Turkey.Classes (ClassTable(..), ClassInfo(..), MethodInfo(..))
+import Turkey.Classes (ClassTable(..), ClassInfo(..), MethodInfo(..), Slot(..))
 import Turkey.Core
 import Turkey.Core as Cr
 import Turkey.Coretc as Coretc
@@ -91,8 +91,6 @@ let ceilingFactor = 2
 -- shared across rounds, so it bounds the whole pass however many there are.
 let rounds = 2
 
-let dictPrefix = "%Dict."
-
 -- -- small questions about types ----------------------------------------------------
 
 -- No unbound variable anywhere in it, so it names one type and not a family of
@@ -136,17 +134,6 @@ fun mangle(t : Ty.Type) -> String = match Ty.prune(t) {
     TFun(_, _) -> "fun"
     TTuple(_) -> "tuple"
     _ -> "_"
-}
-
--- The class a `%Dict.C h` type names, or `None` if it is not one.
-fun dictClass(ty : Ty.Type) -> Option String {
-    let (h, args) = Ty.spine(Ty.prune(ty))
-    match h {
-        TCon(c) -> if String.startsWith(c.name, dictPrefix) && len(args) == 1 {
-            String.stripPrefix(c.name, dictPrefix)
-        } else { None }
-        _ -> None
-    }
 }
 
 -- Whether this binding is a lambda over nothing but dictionaries.
@@ -1056,15 +1043,15 @@ fun devirtBind(d : Devirt, b : CBind) -> CBind = withValue(b, devirt(d, b.value)
 fun hoistAll(d : Devirt, b : CBind) -> Option Core {
     if b.mutable { return None }
     match b.value.kind {
-        CRecord(con, fields) ->
-            match hoistFields(d, b, b.ty, [], fields) {
-                Some(made) -> Some(mkCore(b.value.ty, b.value.span, CRecord(con, made)))
+        CDict(cls, slots) ->
+            match hoistFields(d, b, b.ty, [], slots) {
+                Some(made) -> Some(mkCore(b.value.ty, b.value.span, CDict(cls, made)))
                 None -> None
             }
         CLam(params, body, name) -> match body.kind {
-            CRecord(con, fields) -> match hoistFields(d, b, body.ty, params, fields) {
+            CDict(cls, slots) -> match hoistFields(d, b, body.ty, params, slots) {
                 Some(made) -> Some(mkCore(b.value.ty, b.value.span, CLam(params,
-                    mkCore(body.ty, body.span, CRecord(con, made)), name)))
+                    mkCore(body.ty, body.span, CDict(cls, made)), name)))
                 None -> None
             }
             _ -> None
@@ -1074,17 +1061,27 @@ fun hoistAll(d : Devirt, b : CBind) -> Option Core {
 }
 
 fun hoistFields(d : Devirt, owner : CBind, dictTy : Ty.Type, params : Array CParam,
-                fields : Array (String, Core)) -> Option (Array (String, Core)) {
-    if Option.isNone(dictClass(dictTy)) { return None }
+                slots : Array Core) -> Option (Array Core) {
+    let cls = match dictClass(dictTy) {
+        Some(c) -> c
+        None -> return None
+    }
     var changed = False
-    let out = Array.new(len(fields))
-    for (name, value) in fields {
-        match hoist(d, owner, dictTy, params, name, value) {
+    let out = Array.new(len(slots))
+    for var i = 0; i < len(slots); i = i + 1 {
+        let method = match Classes.slotAt(d.classes, cls, i) {
+            Some(MethodSlot(m)) -> m
+            _ -> {
+                Array.push(out, slots[i])
+                continue
+            }
+        }
+        match hoist(d, owner, dictTy, params, method, slots[i]) {
             Some(reference) -> {
-                Array.push(out, (name, reference))
+                Array.push(out, reference)
                 changed = True
             }
-            None -> Array.push(out, (name, value))
+            None -> Array.push(out, slots[i])
         }
     }
     if changed { Some(out) } else { None }
@@ -1098,14 +1095,14 @@ fun hoistFields(d : Devirt, owner : CBind, dictTy : Ty.Type, params : Array CPar
 -- what an evaluation there can observe is exactly what the two-pass build
 -- exists to be careful about.
 fun hoist(d : Devirt, owner : CBind, dictTy : Ty.Type, params : Array CParam,
-          name : String, value : Core) -> Option Core {
+          method : String, value : Core) -> Option Core {
     if Methods.isAtom(value) { return None }
-    let (own, inner) = abstraction(d, dictTy, name, value)
+    let (own, inner) = abstraction(d, dictTy, method, value)
     match inner.kind {
         CLam(_, _, _) -> {}
         _ -> return None
     }
-    var made = owner.name + "#" + name
+    var made = owner.name + "#" + Classes.surfaceMember(method)
     while Set.contains(d.used, made) { made = made + "~" }
     Set.add(d.used, made)
     derive(d.state, made, owner.name)
@@ -1147,7 +1144,7 @@ fun hoist(d : Devirt, owner : CBind, dictTy : Ty.Type, params : Array CParam,
 -- Getting this from the term alone is what a first attempt did, and the checker
 -- caught it immediately: a method was hoisted with no binders and the use site
 -- still had one type argument.
-fun abstraction(d : Devirt, dictTy : Ty.Type, name : String,
+fun abstraction(d : Devirt, dictTy : Ty.Type, method : String,
                 value : Core) -> (Array VarCell, Core) {
     match value.kind {
         CTyLam(binders, body) -> return (binders, body)
@@ -1161,11 +1158,8 @@ fun abstraction(d : Devirt, dictTy : Ty.Type, name : String,
         Some(i) -> i
         None -> return (Array.new(0), value)
     }
-    let m = match Classes.memberNamed(Map.keys(info.methods), name) {
-        Some(resolved) -> match Map.get(info.methods, resolved) {
-            Some(x) -> x
-            None -> return (Array.new(0), value)
-        }
+    let m = match Map.get(info.methods, method) {
+        Some(x) -> x
         None -> return (Array.new(0), value)
     }
     let binders = Array.new(4)
@@ -1181,8 +1175,8 @@ fun abstraction(d : Devirt, dictTy : Ty.Type, name : String,
 -- of an application.
 fun devirt(d : Devirt, e : Core) -> Core = match e.kind {
     CTyApp(fn, own) -> match fn.kind {
-        CField(target, name) -> {
-            let field = mkCore(fn.ty, fn.span, CField(devirt(d, target), name))
+        CSlot(target, index) -> {
+            let field = mkCore(fn.ty, fn.span, CSlot(devirt(d, target), index))
             match Methods.knownField(d.dicts, field, own, e.ty) {
                 Some(found) -> found
                 None -> mkCore(e.ty, e.span, CTyApp(field, own))
@@ -1190,8 +1184,8 @@ fun devirt(d : Devirt, e : Core) -> Core = match e.kind {
         }
         _ -> recurse(d, e)
     }
-    CField(target, name) -> {
-        let field = mkCore(e.ty, e.span, CField(devirt(d, target), name))
+    CSlot(target, index) -> {
+        let field = mkCore(e.ty, e.span, CSlot(devirt(d, target), index))
         match Methods.knownField(d.dicts, field, [], e.ty) {
             Some(found) -> found
             None -> field

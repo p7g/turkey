@@ -146,11 +146,8 @@ fun anyKid(k : CoreKind, p : fun(Core) -> Bool) -> Bool = match k {
     CPrim(_) -> False
     CTuple(elems) -> anyOf(elems, p)
     CArray(elems) -> anyOf(elems, p)
-    CRecord(_, fields) -> {
-        for (_, value) in fields { if p(value) { return True } }
-        False
-    }
-    CField(target, _) -> p(target)
+    CDict(_, slots) -> anyOf(slots, p)
+    CSlot(target, _) -> p(target)
     CProject(target, _) -> p(target)
     CIndex(target, index) -> p(target) || p(index)
     CLam(_, body, _) -> p(body)
@@ -709,14 +706,18 @@ fun step(r : Reducer, e : Core) -> Option Core {
         -- generic function's dictionary parameter becomes the dictionary its
         -- caller passed. With the method's own types when it has some, which is
         -- why the bare projection below it is left for this.
-        CField(_, _) -> return Methods.knownField(r.dicts, e, [], e.ty)
+        CSlot(_, _) -> return Methods.knownField(r.dicts, e, [], e.ty)
         CTyApp(fn, own) -> return match fn.kind {
-            CField(_, _) -> Methods.knownField(r.dicts, fn, own, e.ty)
+            CSlot(_, _) -> Methods.knownField(r.dicts, fn, own, e.ty)
             _ -> constant(r, e)
         }
         CApp(fn, _) -> return match fn.kind {
             CLam(_, _, _) -> beta(r, e)
-            CField(_, _) -> knownLambda(e)
+            CSlot(_, _) -> knownLambda(r.decls, e)
+            CProject(_, _) -> match knownLambda(r.decls, e) {
+                Some(made) -> Some(made)
+                None -> inline(r, e, inlineLimit)
+            }
             _ -> inline(r, e, inlineLimit)
         }
         CMatch(_, _) -> {
@@ -743,7 +744,7 @@ fun step(r : Reducer, e : Core) -> Option Core {
             return caseOfJoin(e)
         }
         CLet(_, _, _, _, _) -> {
-            match deadLet(e) {
+            match deadLet(r.decls, e) {
                 Some(m) -> return Some(m)
                 None -> {}
             }
@@ -766,7 +767,7 @@ fun step(r : Reducer, e : Core) -> Option Core {
             return floatLetThroughJoin(e)
         }
         CJoin(_, _, _, _, _) -> return specializeJoin(r, e)
-        CIf(_, _, _) -> return knownCondition(e)
+        CIf(_, _, _) -> return knownCondition(r.decls, e)
         CDeref(target) -> return match target.kind {
             CVar(name) -> match unwrittenOf(r, name) {
                 Some(initial) -> Some(mkCore(e.ty, e.span, initial.kind))
@@ -795,8 +796,8 @@ fun mentionsInto(e : Core, out : Set.Set String) -> Unit = match e.kind {
 -- with a missing `else` as the unit it answers. A top-level `let` of a
 -- constant has been substituted by now (`constant`), so this is what removes
 -- code behind a flag the program fixes at compile time.
-fun knownCondition(e : Core) -> Option Core = match e.kind {
-    CIf(cond, then, otherwise) -> match constructorName(cond) {
+fun knownCondition(d : DeclTable, e : Core) -> Option Core = match e.kind {
+    CIf(cond, then, otherwise) -> match constructorName(d, cond) {
         Some(name) -> if name == P.boolTrue { Some(then) }
                       else if name == P.boolFalse { match otherwise {
                           Some(o) -> Some(o)
@@ -986,7 +987,7 @@ fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
     -- A copied callee body becomes part of this call site. Keep spans on
     -- caller-supplied arguments, but make every node copied from the callee
     -- blame the invocation if a later Core check rejects the residual.
-    let made = match applyParams(params, args, rebaseSpans(body, e.span), e.ty) {
+    let made = match applyParams(r.decls, params, args, rebaseSpans(body, e.span), e.ty) {
         Some(m) -> m
         None -> return None
     }
@@ -1108,28 +1109,37 @@ fun keyHash(key : String) -> Int {
     digest(h)
 }
 
--- Expose a literal record's lambda to beta. All sibling fields must be
--- values: record construction evaluates them before the call.
-fun knownLambda(e : Core) -> Option Core = match e.kind {
+-- Expose a lambda read out of a dictionary or a record built right there, to
+-- beta. All sibling slots must be values: building the object evaluates them
+-- before the call.
+--
+-- A build with identity qualifies too: the object is read once, right where
+-- it is built, so nothing else can hold it.
+fun knownLambda(d : DeclTable, e : Core) -> Option Core = match e.kind {
     CApp(fn, args) -> match fn.kind {
-        CField(target, name) -> match target.kind {
-            CRecord(_, fields) -> {
-                for (_, v) in fields { if !isValue(v) { return None } }
-                for (field, v) in fields {
-                    if field == name {
-                        return match v.kind {
-                            CLam(_, _, _) -> Some(mkCore(e.ty, e.span, CApp(v, args)))
-                            _ -> None
-                        }
-                    }
-                }
-                None
-            }
-            _ -> None
-        }
+        CProject(target, index) -> applyPart(d, e, target, index, args)
+        CSlot(target, index) -> applyPart(d, e, target, index, args)
         _ -> None
     }
     _ -> None
+}
+
+fun applyPart(d : DeclTable, e : Core, target : Core, index : Int,
+              args : Array Core) -> Option Core {
+    let parts = match target.kind {
+        CDict(_, slots) -> slots
+        CApp(con, fields) -> match con.kind {
+            CCon(_) -> fields
+            _ -> return None
+        }
+        _ -> return None
+    }
+    if index >= len(parts) { return None }
+    for v in parts { if !isValue(d, v) { return None } }
+    match parts[index].kind {
+        CLam(_, _, _) -> Some(mkCore(e.ty, e.span, CApp(parts[index], args)))
+        _ -> None
+    }
 }
 
 -- A lambda applied directly. What inlining a call site leaves behind when the
@@ -1140,7 +1150,7 @@ fun beta(r : Reducer, e : Core) -> Option Core = match e.kind {
             if len(params) != len(args) || transfers(body, Set.new()) {
                 None
             } else {
-                applyParams(params, args, body, e.ty)
+                applyParams(r.decls, params, args, body, e.ty)
             }
         _ -> None
     }
@@ -1154,9 +1164,9 @@ fun beta(r : Reducer, e : Core) -> Option Core = match e.kind {
 -- leaves the `let %d1.Mul` that fetched the dictionary standing. The value must
 -- be a value -- a `let %seq = print(x)` reads nothing either, and dropping it
 -- would drop the printing.
-fun deadLet(e : Core) -> Option Core = match e.kind {
+fun deadLet(d : DeclTable, e : Core) -> Option Core = match e.kind {
     CLet(name, _, value, body, binders) ->
-        if !isValue(value) || len(binders) > 0 {
+        if !isValue(d, value) || len(binders) > 0 {
             None
         } else if Set.contains(namesOf(body), name) {
             None
@@ -1483,7 +1493,7 @@ fun specializeOn(r : Reducer, e : Core, name : String, params : Array CParam,
     var jumped = False
     let known = someJump(rest, name, False, fun(j) {
         jumped = True
-        hasKnownArg(j)
+        hasKnownArg(r.decls, j)
     })
     if !known { return if jumped { None } else { Some(rest) } }
     let jumps = joinJumps(rest, name)
@@ -1494,7 +1504,7 @@ fun specializeOn(r : Reducer, e : Core, name : String, params : Array CParam,
         let free = freeNames(body)
         if bindsAny(rest, Set.contains(free, _)) { return None }
         let args = jumpArgs(jumps[0])
-        let made = match applyParams(params, args, body, e.ty) {
+        let made = match applyParams(r.decls, params, args, body, e.ty) {
             Some(m) -> expr(r, m)
             None -> return None
         }
@@ -1503,13 +1513,13 @@ fun specializeOn(r : Reducer, e : Core, name : String, params : Array CParam,
 
     let groups = Map.new()
     for j in jumps {
-        if hasKnownArg(j) {
-            let key = signatureKey(jumpArgs(j))
+        if hasKnownArg(r.decls, j) {
+            let key = signatureKey(r.decls, jumpArgs(j))
             match Map.get(groups, key) {
                 Some(g) -> Array.push(g.calls, j)
                 None -> Map.put(groups, key, Variant {
                     known = Array.map(jumpArgs(j),
-                                      isConstructor),
+                                      isConstructor(r.decls, _)),
                     calls = [j], made = None,
                 })
             }
@@ -1538,7 +1548,7 @@ fun specializeOn(r : Reducer, e : Core, name : String, params : Array CParam,
                 Array.push(templates, rebuildConstructor(arg, vars))
             }
         }
-        match applyParams(params, templates, body, e.ty) {
+        match applyParams(r.decls, params, templates, body, e.ty) {
             None -> {}
             Some(built) -> {
                 let made = expr(r, built)
@@ -1554,7 +1564,7 @@ fun specializeOn(r : Reducer, e : Core, name : String, params : Array CParam,
     }
     if len(variants) == 0 { return None }
 
-    var out = replaceJumps(rest, name, specialized(groups, _))
+    var out = replaceJumps(rest, name, specialized(r.decls, groups, _))
     if replaced != len(jumps) {
         out = mkCore(e.ty, e.span, CJoin(name, params, body, out, False))
     }
@@ -1567,10 +1577,10 @@ fun specializeOn(r : Reducer, e : Core, name : String, params : Array CParam,
 
 -- The jump a specialized copy wants in place of this one, if its signature
 -- founded a copy that was kept.
-fun specialized(groups : Map String Variant, j : Core) -> Option Core {
+fun specialized(d : DeclTable, groups : Map String Variant, j : Core) -> Option Core {
     let args = jumpArgs(j)
-    if !hasKnownArg(j) { return None }
-    let group = match Map.get(groups, signatureKey(args)) {
+    if !hasKnownArg(d, j) { return None }
+    let group = match Map.get(groups, signatureKey(d, args)) {
         Some(g) -> g
         None -> return None
     }
@@ -1603,7 +1613,7 @@ fun specialized(groups : Map String Variant, j : Core) -> Option Core {
 -- ones the arm ignores, under a name nothing reads. `Some(launch())` still
 -- launches.
 fun knownConstructor(r : Reducer, e : Core) -> Option Core = match e.kind {
-    CMatch(scrutinee, alts) -> if isKnown(scrutinee) {
+    CMatch(scrutinee, alts) -> if isKnown(r.decls, scrutinee) {
         selectArm(r, e, scrutinee, scrutinee, alts)
     } else {
         None
@@ -1612,10 +1622,10 @@ fun knownConstructor(r : Reducer, e : Core) -> Option Core = match e.kind {
 }
 
 -- Whether the shape of `e` can answer a pattern at its root.
-fun isKnown(e : Core) -> Bool = match e.kind {
+fun isKnown(d : DeclTable, e : Core) -> Bool = match e.kind {
     CTuple(_) -> True
     CLit(_) -> True
-    _ -> isConstructor(e)
+    _ -> isConstructor(d, e)
 }
 
 -- `root` is what an arm that binds the whole scrutinee binds: the scrutinee
@@ -1628,7 +1638,7 @@ fun selectArm(r : Reducer, e : Core, scrutinee : Core, root : Core,
         match decide(r, alt.alt, scrutinee, root, names, values) {
             Fails -> {}
             Undecided -> return None
-            Matches -> return applyNames(names, values, alt.body, e.ty)
+            Matches -> return applyNames(r.decls, names, values, alt.body, e.ty)
         }
     }
     None
@@ -1754,15 +1764,13 @@ fun onSpine(e : Core, name : String, reads : Set.Set String,
 }
 
 -- A constructor application or tuple whose `match` can be decided wherever
--- its name is read. Not a record: a record's fields can be assigned, and a
--- `match` after the assignment reads what it was assigned.
+-- its name is read. Not a build with identity (`Decls.hasIdentity`): its
+-- fields can be assigned, and a `match` after the assignment reads what it was
+-- assigned.
 fun unfoldable(r : Reducer, e : Core) -> Bool = match e.kind {
     CTuple(_) -> True
-    _ -> match constructorName(e) {
-        Some(con) -> match Decls.con(r.decls, con) {
-            Some(info) -> !Decls.isRecord(info)
-            None -> False
-        }
+    _ -> match constructorName(r.decls, e) {
+        Some(con) -> Option.isSome(Decls.con(r.decls, con))
         None -> False
     }
 }
@@ -1822,7 +1830,7 @@ fun decide(r : Reducer, alt : Alt, known : Core, root : Core,
         _ -> Undecided
     }
     ACon(_, _, Some(_)) -> Undecided
-    ACon(name, binders, None) -> match constructorName(known) {
+    ACon(name, binders, None) -> match constructorName(r.decls, known) {
         Some(con) -> if con == name {
             bindParts(r, binders, constructorArgs(known), names, values)
         } else {
@@ -1858,9 +1866,9 @@ fun sameLiteral(a : Lit, b : Lit) -> Option Bool = match (a, b) {
 
 -- -- binding a call's arguments ---------------------------------------------------------
 
-fun applyParams(params : Array CParam, args : Array Core, body : Core,
+fun applyParams(d : DeclTable, params : Array CParam, args : Array Core, body : Core,
                 ty : Ty.Type) -> Option Core =
-    applyNames(Array.map(params, _.name), args, body, ty)
+    applyNames(d, Array.map(params, _.name), args, body, ty)
 
 -- `body` with each name bound to its argument, or `None` if it cannot be.
 --
@@ -1883,11 +1891,11 @@ fun applyParams(params : Array CParam, args : Array Core, body : Core,
 -- becomes a `let` disqualifies substituting any argument that mentions it, and
 -- disqualifying one turns it into a `let` in turn, which is why this settles
 -- rather than deciding in one pass.
-fun applyNames(names : Array String, args : Array Core, body : Core,
+fun applyNames(d : DeclTable, names : Array String, args : Array Core, body : Core,
                ty : Ty.Type) -> Option Core {
     -- Read only for an argument that is a value, and a walk of the whole body
     -- per beta reduction is worth skipping when none is.
-    let bound = if anyOf(args, isValue) { bindersOf(body) } else { Set.new() }
+    let bound = if anyOf(args, isValue(d, _)) { bindersOf(body) } else { Set.new() }
     let candidates = Map.new()
     let freeOf = Map.new()
     let letters = Set.new()
@@ -1895,7 +1903,7 @@ fun applyNames(names : Array String, args : Array Core, body : Core,
     for var i = 0; i < len(names); i = i + 1 {
         let free = freeNames(args[i])
         if overlaps(free, earlier) { return None }
-        if isValue(args[i]) && !Set.contains(bound, names[i])
+        if isValue(d, args[i]) && !Set.contains(bound, names[i])
                 && !overlaps(free, bound) {
             Map.put(candidates, names[i], args[i])
             Map.put(freeOf, names[i], free)
@@ -2031,8 +2039,9 @@ fun substituteNames(e : Core, mapping : Map String Core) -> Core = match e.kind 
 -- Whether evaluating `e` does no work and can be done twice or never.
 --
 -- A `CVar` counts: variables are immutable bindings, and a `var` is a `CRef`
--- read through a `CDeref`, which is not this.
-fun isValue(e : Core) -> Bool = match e.kind {
+-- read through a `CDeref`, which is not this. A build with identity
+-- (`Decls.hasIdentity`) does not: done twice, it is two objects.
+fun isValue(d : DeclTable, e : Core) -> Bool = match e.kind {
     CLit(_) -> True
     CUnit -> True
     CVar(_) -> True
@@ -2040,12 +2049,13 @@ fun isValue(e : Core) -> Bool = match e.kind {
     CPrim(_) -> True
     CLam(_, _, _) -> True
     CTuple(elems) -> {
-        for x in elems { if !isValue(x) { return False } }
+        for x in elems { if !isValue(d, x) { return False } }
         True
     }
     CApp(fn, args) -> match fn.kind {
-        CCon(_) -> {
-            for a in args { if !isValue(a) { return False } }
+        CCon(name) -> {
+            if Decls.hasIdentity(d, name) { return False }
+            for a in args { if !isValue(d, a) { return False } }
             True
         }
         _ -> False
@@ -2241,14 +2251,21 @@ fun transfers(e : Core, bound : Set.Set String) -> Bool = match e.kind {
     _ -> anyKid(e.kind, transfers(_, bound))
 }
 
--- `e` read as a saturated constructor application.
-fun constructorName(e : Core) -> Option String = match e.kind {
-    CCon(name) -> Some(name)
-    CApp(fn, _) -> match fn.kind {
-        CCon(name) -> Some(name)
-        _ -> None
+-- `e` read as a saturated constructor application, whose value is its
+-- constructor and fields and nothing else. Not a build with identity
+-- (`Decls.hasIdentity`): rebuilding one from its fields, or reading a field
+-- off the build rather than off the object, would answer for a different
+-- object than the program holds.
+fun constructorName(d : DeclTable, e : Core) -> Option String {
+    let name = match e.kind {
+        CCon(name) -> name
+        CApp(fn, _) -> match fn.kind {
+            CCon(name) -> name
+            _ -> return None
+        }
+        _ -> return None
     }
-    _ -> None
+    if Decls.hasIdentity(d, name) { None } else { Some(name) }
 }
 
 fun constructorArgs(e : Core) -> Array Core = match e.kind {
@@ -2259,7 +2276,7 @@ fun constructorArgs(e : Core) -> Array Core = match e.kind {
     _ -> Array.new(0)
 }
 
-fun isConstructor(e : Core) -> Bool = match constructorName(e) {
+fun isConstructor(d : DeclTable, e : Core) -> Bool = match constructorName(d, e) {
     Some(_) -> True
     None -> False
 }
@@ -2271,8 +2288,8 @@ fun rebuildConstructor(e : Core, args : Array Core) -> Core = match e.kind {
     _ -> oops("not a constructor application")
 }
 
-fun hasKnownArg(j : Core) -> Bool {
-    for a in jumpArgs(j) { if isConstructor(a) { return True } }
+fun hasKnownArg(d : DeclTable, j : Core) -> Bool {
+    for a in jumpArgs(j) { if isConstructor(d, a) { return True } }
     False
 }
 
@@ -2283,8 +2300,8 @@ fun jumpArgs(j : Core) -> Array Core = match j.kind {
 
 -- What groups two jumps into one specialized copy: the constructor at each
 -- position, with its arity, or nothing where the tag is unknown.
-fun signatureKey(args : Array Core) -> String {
-    let parts = Array.map(args, fun(a) = match constructorName(a) {
+fun signatureKey(d : DeclTable, args : Array Core) -> String {
+    let parts = Array.map(args, fun(a) = match constructorName(d, a) {
         Some(con) -> con + "/" + Int.toString(len(constructorArgs(a)))
         None -> "*"
     })

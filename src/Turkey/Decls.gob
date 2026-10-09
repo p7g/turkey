@@ -7,7 +7,7 @@ module Turkey.Decls (
     head, registerAll, settleKinds,
     star, toType, instantiateCon, con, recordFields, varFields, fieldSpan,
     existentialFields,
-    fieldType, projectionTypes,
+    fieldType, projectionTypes, payloadType, hasIdentity, isRecordCon,
     substitute, newtypes, erasedPayload, conFieldTypes, conFieldTypesOpened,
     variantCount, Compact(..), compactShape, compactOf,
     showDeclarations,
@@ -35,13 +35,16 @@ import Turkey.Types (Kind(..), VarCell(..), Scheme(..),
                      TVar, TCon, ConCell(..), TApp, TFam, TFun, TTuple,
                      TSet, TBottom)
 
--- One value constructor. `fields` is `None` for the positional form.
+-- One value constructor: its fields by position, which is how its object
+-- holds them. Names are an addition some constructors make to that, and change
+-- nothing about the positions: `fields` is `None` for the positional form.
 type ConInfo = ConInfo {
     name   : String,
     tycon  : String,
     fields : Option (Array String),
-    -- The fields declared `var`. Only a plain record has any.
-    vars   : Array String,
+    -- Whether each position may be assigned, parallel to the scheme's
+    -- arguments: a field declared `var`.
+    mutable : Array Bool,
     -- Where each field's name is declared, parallel to `fields`.
     fieldSpans : Array Span,
     arity  : Int,
@@ -76,10 +79,32 @@ fun isPlainRecord(t : TyconInfo) -> Bool =
     len(t.variants) == 1 && isRecord(t.variants[0])
         && len(t.variants[0].exists) == 0
 
+-- Whether some position of the constructor may be assigned.
+fun hasMutable(c : ConInfo) -> Bool = Array.contains(c.mutable, True)
+
 -- Whether a value of the type can change after it is built: some field is
 -- `var`. A type without one is immutable, records included.
-fun isMutable(t : TyconInfo) -> Bool =
-    isPlainRecord(t) && len(t.variants[0].vars) > 0
+fun isMutable(t : TyconInfo) -> Bool {
+    for c in t.variants { if hasMutable(c) { return True } }
+    False
+}
+
+-- Whether `name` constructs a record: its fields are named.
+fun isRecordCon(t : DeclTable, name : String) -> Bool = match con(t, name) {
+    Some(info) -> isRecord(info)
+    None -> False
+}
+
+-- Whether a build with constructor `name` is an object rather than a value:
+-- some position of it can be assigned, so two builds from equal fields can be
+-- told apart by assigning through one. Such a build may not be copied, rebuilt
+-- from its fields, or matched through in place of the object it makes. However
+-- it was written -- `Counter(0)` makes an object exactly as `Counter { n = 0 }`
+-- does.
+fun hasIdentity(t : DeclTable, name : String) -> Bool = match con(t, name) {
+    Some(info) -> hasMutable(info)
+    None -> False
+}
 
 -- An associated type family, as the type language sees it.
 --
@@ -389,9 +414,13 @@ fun resolveVariants(t : DeclTable, decl : TypeDecl) -> Unit {
                 if !present { Array.push(s.quantified, cell) }
             }
             checkVars(decl, c, variants)
+            let mutable = match names {
+                Some(ns) -> Array.map(ns, Array.contains(c.vars, _))
+                None -> Array.map(argTypes, fun(_) = False)
+            }
             let cinfo = ConInfo {
                 name = c.name, tycon = decl.name, fields = names,
-                vars = c.vars, fieldSpans = c.fieldSpans,
+                mutable = mutable, fieldSpans = c.fieldSpans,
                 arity = len(argTypes), scheme = s, exists = hidden,
                 existsNames = hiddenVariables(c),
             }
@@ -601,7 +630,19 @@ fun recordFields(t : DeclTable, name : String) -> Option (Array String) =
 fun varFields(t : DeclTable, name : String) -> Option (Array String) =
     match Map.get(t.tycons, name) {
         None -> None
-        Some(info) -> if isPlainRecord(info) { Some(info.variants[0].vars) } else { None }
+        Some(info) -> if isPlainRecord(info) {
+            let c = info.variants[0]
+            let out = Array.new(len(c.mutable))
+            match c.fields {
+                Some(names) -> for var i = 0; i < len(names); i = i + 1 {
+                    if c.mutable[i] { Array.push(out, names[i]) }
+                }
+                None -> {}
+            }
+            Some(out)
+        } else {
+            None
+        }
     }
 
 -- Where a plain record's field is declared.
@@ -674,23 +715,23 @@ fun fieldType(t : DeclTable, receiver : Ty.Type, label : String) -> Ty.Type {
     }
 }
 
--- Payload types for an immutable, single positional variant.
 -- The type names whose one constructor is not there at run time.
 --
 -- `type Array a = Array(ArrayStorage a)` gives its payload a name and a `match`
 -- to get back out of, and nothing else: one variant, one field, and no way to
 -- tell the wrapper from what it wraps. There is no function identity in Turkey
 -- and no reflection, so a value of it *is* its payload, and the allocation is a
--- cost with no observable effect.
+-- cost with no observable effect. Whether the field has a name changes none of
+-- that: `type Meters = Meters { value : Float }` is erased as `Meters(Float)`
+-- is.
 --
 -- An existential constructor is excluded too: its value is a packing, holding
 -- the layouts of the types it hides and any dictionaries beside the field, and
 -- its payload's type is a variable that means nothing outside an opening.
 --
--- Records are excluded, and this is the reason there is a rule rather than a
--- check for one variant and one field: a single-variant record may declare its
--- field `var`, and assigning through two names for one box is exactly the
--- identity that erasure would take away.
+-- A field that can be assigned is excluded, and this is the reason there is a
+-- rule rather than a check for one variant and one field: assigning through
+-- two names for one box is exactly the identity that erasure would take away.
 --
 -- Recursion is excluded because it is what erasure cannot terminate on. A
 -- wrapper is erased into its payload, so `type Loop = Loop(Loop)` has no
@@ -708,7 +749,7 @@ fun newtypes(t : DeclTable) -> Set.Set String {
     }
     let candidates = Set.new()
     for (name, info) in Map.entries(t.tycons) {
-        if len(info.variants) == 1 && !isRecord(info.variants[0])
+        if len(info.variants) == 1 && !hasMutable(info.variants[0])
                 && info.variants[0].arity == 1
                 && len(info.variants[0].exists) == 0 {
             Set.add(candidates, name)
@@ -749,10 +790,7 @@ fun erasedPayload(t : DeclTable, receiver : Ty.Type) -> Option Ty.Type {
         TCon(c) -> if !Set.contains(newtypes(t), c.name) { return None }
         _ -> return None
     }
-    match projectionTypes(t, receiver) {
-        Some(payload) -> if len(payload) > 0 { Some(payload[0]) } else { None }
-        None -> None
-    }
+    payloadType(t, receiver, 0)
 }
 
 -- The field types of one *named* constructor, at a receiver already resolved.
@@ -854,15 +892,32 @@ fun variantCount(t : DeclTable, name : String) -> Int =
         }
     }
 
+-- The element types `.0`, `.1`, ... may read from a single-variant type: its
+-- payload, unless its fields are named, which a program reads by name.
 fun projectionTypes(t : DeclTable, receiver : Ty.Type) -> Option (Array Ty.Type) {
+    let (h, _) = Ty.spine(receiver)
+    match h {
+        TCon(c) -> match Map.get(t.tycons, c.name) {
+            Some(info) -> if len(info.variants) == 1 && isRecord(info.variants[0]) {
+                return None
+            }
+            None -> return None
+        }
+        _ -> return None
+    }
+    payloadTypes(t, receiver)
+}
+
+-- The field types of a single-variant type's one constructor at `receiver`,
+-- by position, whether its fields are named or not: what a position in its
+-- object holds.
+fun payloadTypes(t : DeclTable, receiver : Ty.Type) -> Option (Array Ty.Type) {
     let (h, args) = Ty.spine(receiver)
     match h {
         TCon(c) -> match Map.get(t.tycons, c.name) {
             None -> None
             Some(info) -> {
-                if len(info.variants) != 1 || isRecord(info.variants[0]) {
-                    return None
-                }
+                if len(info.variants) != 1 { return None }
                 match info.variants[0].scheme.body {
                     TFun(params, ret) -> {
                         let mapping = paramMapping(ret, args)
@@ -871,6 +926,24 @@ fun projectionTypes(t : DeclTable, receiver : Ty.Type) -> Option (Array Ty.Type)
                     _ -> None
                 }
             }
+        }
+        _ -> None
+    }
+}
+
+-- One position of `payloadTypes`, without substituting into the others.
+fun payloadType(t : DeclTable, receiver : Ty.Type, index : Int) -> Option Ty.Type {
+    let (h, args) = Ty.spine(receiver)
+    let info = match h {
+        TCon(c) -> Map.get(t.tycons, c.name)?
+        _ -> return None
+    }
+    if len(info.variants) != 1 { return None }
+    match info.variants[0].scheme.body {
+        TFun(params, ret) -> if index < len(params) {
+            Some(substitute(params[index], paramMapping(ret, args)))
+        } else {
+            None
         }
         _ -> None
     }

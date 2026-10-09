@@ -211,7 +211,7 @@ MADE = (
     ("fun f(n : Int) -> Int = H.array([n, n], n)\n",
      "f", "builds an array"),
     ("fun f(n : Int) -> Int = H.record(H.P { x = n, y = n }, n)\n",
-     "f", "builds a record, P"),
+     "f", "builds a value with P"),
     # The closure's captured environment is the object it makes.
     ("fun f(n : Int) -> Int = H.closure(fun(x : Int) = x + n, n)\n",
      "f", "builds an object -- a constructor, tuple, record or dictionary"),

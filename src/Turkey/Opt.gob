@@ -39,9 +39,11 @@ module Turkey.Opt (
 -- argument becomes a `CLet`, which is exactly a call-by-value binding. The
 -- exception is an argument that is already a **value**: duplicating one costs
 -- nothing and evaluates nothing, and substituting it is what lets the next
--- reduction see through it. Substitution is capture-avoiding by refusing rather
--- than by renaming, which needs no fresh-name supply and keeps the output
--- readable against its input.
+-- reduction see through it. Capture is avoided without renaming anything in
+-- the callee's body, which keeps the output readable against its input: a
+-- value that would be captured is bound rather than substituted, and a `let`
+-- whose name a later argument mentions binds a fresh name instead, aliased to
+-- the parameter's own inside the chain (`applyNames`).
 --
 -- ## One place that knows a node's shape
 --
@@ -987,10 +989,7 @@ fun inlineApp(r : Reducer, e : Core, fn : Core, args : Array Core,
     -- A copied callee body becomes part of this call site. Keep spans on
     -- caller-supplied arguments, but make every node copied from the callee
     -- blame the invocation if a later Core check rejects the residual.
-    let made = match applyParams(r.decls, params, args, rebaseSpans(body, e.span), e.ty) {
-        Some(m) -> m
-        None -> return None
-    }
+    let made = applyParams(r, params, args, rebaseSpans(body, e.span), e.ty)
     if size <= limit { return Some(made) }
     -- Restored to what it was, not to `False`. Speculation is meant not to
     -- nest -- the flag is the whole mechanism for that -- and clearing it on
@@ -1150,7 +1149,7 @@ fun beta(r : Reducer, e : Core) -> Option Core = match e.kind {
             if len(params) != len(args) || transfers(body, Set.new()) {
                 None
             } else {
-                applyParams(r.decls, params, args, body, e.ty)
+                Some(applyParams(r, params, args, body, e.ty))
             }
         _ -> None
     }
@@ -1504,10 +1503,7 @@ fun specializeOn(r : Reducer, e : Core, name : String, params : Array CParam,
         let free = freeNames(body)
         if bindsAny(rest, Set.contains(free, _)) { return None }
         let args = jumpArgs(jumps[0])
-        let made = match applyParams(r.decls, params, args, body, e.ty) {
-            Some(m) -> expr(r, m)
-            None -> return None
-        }
+        let made = expr(r, applyParams(r, params, args, body, e.ty))
         return Some(replaceJumps(rest, name, fun(_) = Some(made)))
     }
 
@@ -1548,18 +1544,12 @@ fun specializeOn(r : Reducer, e : Core, name : String, params : Array CParam,
                 Array.push(templates, rebuildConstructor(arg, vars))
             }
         }
-        match applyParams(r.decls, params, templates, body, e.ty) {
-            None -> {}
-            Some(built) -> {
-                let made = expr(r, built)
-                if sizeOf_(made) < sizeOf_(body)
-                        && sizeOf_(made) <= joinSpecializeLimit {
-                    let owner = fresh(r, "js")
-                    group.made = Some(owner)
-                    replaced = replaced + len(group.calls)
-                    Array.push(variants, (owner, fresh_, made))
-                }
-            }
+        let made = expr(r, applyParams(r, params, templates, body, e.ty))
+        if sizeOf_(made) < sizeOf_(body) && sizeOf_(made) <= joinSpecializeLimit {
+            let owner = fresh(r, "js")
+            group.made = Some(owner)
+            replaced = replaced + len(group.calls)
+            Array.push(variants, (owner, fresh_, made))
         }
     }
     if len(variants) == 0 { return None }
@@ -1638,7 +1628,7 @@ fun selectArm(r : Reducer, e : Core, scrutinee : Core, root : Core,
         match decide(r, alt.alt, scrutinee, root, names, values) {
             Fails -> {}
             Undecided -> return None
-            Matches -> return applyNames(r.decls, names, values, alt.body, e.ty)
+            Matches -> return Some(applyNames(r, names, values, alt.body, e.ty))
         }
     }
     None
@@ -1866,59 +1856,62 @@ fun sameLiteral(a : Lit, b : Lit) -> Option Bool = match (a, b) {
 
 -- -- binding a call's arguments ---------------------------------------------------------
 
-fun applyParams(d : DeclTable, params : Array CParam, args : Array Core, body : Core,
-                ty : Ty.Type) -> Option Core =
-    applyNames(d, Array.map(params, _.name), args, body, ty)
+fun applyParams(r : Reducer, params : Array CParam, args : Array Core, body : Core,
+                ty : Ty.Type) -> Core =
+    applyNames(r, Array.map(params, _.name), args, body, ty)
 
--- `body` with each name bound to its argument, or `None` if it cannot be.
+-- `body` with each name bound to its argument.
 --
 -- A value argument is substituted when that cannot capture anything, because
 -- seeing through it is what lets the next reduction fire. Everything else
--- becomes a `CLet`, which is call by value written down.
+-- becomes a `CLet`, which is call by value written down. Substitution is
+-- simultaneous, so a value may mention any parameter's name: `mul(x := x,
+-- y := x)` substitutes both.
 --
--- `None` when the bindings would capture each other. `let a = e1 in let b = e2`
--- puts `a` in scope for `e2`, and a call's arguments are all evaluated in the
--- caller's scope, so if `e2` mentions a name some earlier parameter also has,
--- the chain means something the call did not. The names in question are a
--- callee's parameters and a caller's locals, so it takes a coincidence -- but a
--- reduction that is wrong on a coincidence is wrong.
+-- The `let`s are sequential where a call is not. `let a = e1 in let b = e2`
+-- puts `a` in scope for `e2`, but a call evaluates every argument in the
+-- caller's scope. So a parameter whose name a later `let`'s argument mentions
+-- is bound first under a fresh name, which nothing can mention, and then to
+-- its own name inside the whole chain, where only the body sees it: `f(a :=
+-- g(b), b := h(a))` is `let %arg1 = g(b) in let b = h(a) in let a = %arg1 in
+-- body`. The body itself is never renamed, which would mean walking it with
+-- its own binders in mind; the alias is a `let` of a variable, which
+-- `trivialLet` substitutes where that is safe and leaves as a move where not.
 --
--- The `let`s this builds are themselves binders, and a substituted argument
--- lands *inside* them, so `bound` cannot be read off the callee's body alone.
--- `internal(name, b.name)` -- a caller's local spelled like a callee's second
--- parameter -- substitutes `name` for `owner` and then wraps `let name =
--- b.name` around it, and the body reads the field twice. So a parameter that
--- becomes a `let` disqualifies substituting any argument that mentions it, and
--- disqualifying one turns it into a `let` in turn, which is why this settles
--- rather than deciding in one pass.
-fun applyNames(d : DeclTable, names : Array String, args : Array Core, body : Core,
-               ty : Ty.Type) -> Option Core {
+-- A substituted argument lands inside every `let` this builds, aliases
+-- included, and those are binders too, so `bound` cannot be read off the
+-- callee's body alone. `internal(name, b.name)` -- a caller's local spelled
+-- like a callee's second parameter -- substitutes `name` for `owner` and then
+-- wraps `let name = b.name` around it, and the body reads the field twice. So
+-- a parameter that becomes a `let` disqualifies substituting any argument that
+-- mentions it, and disqualifying one turns it into a `let` in turn, which is
+-- why this settles rather than deciding in one pass. Which `let`s need a fresh
+-- name is a question about the settled set, so it is asked after.
+fun applyNames(r : Reducer, names : Array String, args : Array Core, body : Core,
+               ty : Ty.Type) -> Core {
+    let d = r.decls
     -- Read only for an argument that is a value, and a walk of the whole body
     -- per beta reduction is worth skipping when none is.
     let bound = if anyOf(args, isValue(d, _)) { bindersOf(body) } else { Set.new() }
     let candidates = Map.new()
-    let freeOf = Map.new()
+    let frees = Array.new(len(names))
     let letters = Set.new()
-    let earlier = Set.new()
     for var i = 0; i < len(names); i = i + 1 {
         let free = freeNames(args[i])
-        if overlaps(free, earlier) { return None }
+        Array.push(frees, free)
         if isValue(d, args[i]) && !Set.contains(bound, names[i])
                 && !overlaps(free, bound) {
             Map.put(candidates, names[i], args[i])
-            Map.put(freeOf, names[i], free)
         } else {
             Set.add(letters, names[i])
         }
-        Set.add(earlier, names[i])
     }
     var settled = False
     while !settled {
         let captured = Array.new(4)
-        for (name, _) in Map.entries(candidates) {
-            match Map.get(freeOf, name) {
-                Some(free) -> if overlaps(free, letters) { Array.push(captured, name) }
-                None -> oops("applyNames: a candidate without its free names")
+        for var i = 0; i < len(names); i = i + 1 {
+            if Map.contains(candidates, names[i]) && overlaps(frees[i], letters) {
+                Array.push(captured, names[i])
             }
         }
         if len(captured) == 0 {
@@ -1931,18 +1924,50 @@ fun applyNames(d : DeclTable, names : Array String, args : Array Core, body : Co
         }
     }
 
+    -- Named in parameter order, so that the fresh names are a function of the
+    -- call and not of a set's order.
+    let clashing = Set.new()
+    for var i = 0; i < len(names); i = i + 1 {
+        if !Map.contains(candidates, names[i]) {
+            for var j = 0; j < i; j = j + 1 {
+                if !Map.contains(candidates, names[j])
+                        && Set.contains(frees[i], names[j]) {
+                    Set.add(clashing, names[j])
+                }
+            }
+        }
+    }
+    let renamed = Map.new()
+    for name in names {
+        if Set.contains(clashing, name) { Map.put(renamed, name, fresh(r, "arg")) }
+    }
+
     var out = if len(Map.entries(candidates)) > 0 {
         substituteNames(body, candidates)
     } else {
         body
     }
     for var i = len(names) - 1; i >= 0; i = i - 1 {
-        if !Map.contains(candidates, names[i]) {
-            out = mkCore(ty, args[i].span,
-                         CLet(names[i], args[i].ty, args[i], out, Array.new(0)))
+        match Map.get(renamed, names[i]) {
+            Some(temp) -> {
+                let read = mkCore(args[i].ty, args[i].span, CVar(temp))
+                out = mkCore(ty, args[i].span,
+                             CLet(names[i], args[i].ty, read, out, Array.new(0)))
+            }
+            None -> {}
         }
     }
-    Some(out)
+    for var i = len(names) - 1; i >= 0; i = i - 1 {
+        if !Map.contains(candidates, names[i]) {
+            let name = match Map.get(renamed, names[i]) {
+                Some(temp) -> temp
+                None -> names[i]
+            }
+            out = mkCore(ty, args[i].span,
+                         CLet(name, args[i].ty, args[i], out, Array.new(0)))
+        }
+    }
+    out
 }
 
 -- Apply a result match at every yielding tail of `e`.

@@ -1391,14 +1391,35 @@ fun arrayLiteral(l : Lowerer, e : Expr, public : Ty.Type, elems : Array Expr,
     let element = if len(args) == 1 { args[0] } else { TBottom }
     let raw = node(Ty.rawArrayOf(element), where,
         CArray(Array.map(elems, expr(l, _, scope))))
-    let length = node(Ty.tInt(), where, CLit(LInt(len(elems))))
-    let storageTy = Ty.applyTo(Decls.head(l.decls, "Data.Array#ArrayStorage"),
-                               [element], where)
-    let storage = recordLiteral(l, "Data.Array#ArrayStorage",
-        [("storage", raw), ("length", length)], storageTy, where)
-    let constructor = node(TFun([storageTy], public), where,
-                           CCon("Data.Array#Array"))
-    node(public, where, CApp(constructor, [storage]))
+    -- Inference has chosen the container, and the library's declarations say
+    -- how it is built. A `Vec` is a storage record and a length. The library's
+    -- `Array` is one of two shapes, told apart by whether it declares
+    -- `Data.Array#ArrayStorage`: with it, `Array` is growable and built the
+    -- way a `Vec` is; without it, `Array` is the raw array under its
+    -- constructor.
+    let growable = match Ty.headCon(public) {
+        Some("Data.Vec#Vec") -> Some(("Data.Vec#Vec", "Data.Vec#VecStorage"))
+        _ -> match Decls.con(l.decls, "Data.Array#ArrayStorage") {
+            Some(_) -> Some(("Data.Array#Array", "Data.Array#ArrayStorage"))
+            None -> None
+        }
+    }
+    match growable {
+        Some((con, storageName)) -> {
+            let length = node(Ty.tInt(), where, CLit(LInt(len(elems))))
+            let storageTy = Ty.applyTo(Decls.head(l.decls, storageName), [element],
+                                       where)
+            let storage = recordLiteral(l, storageName,
+                [("storage", raw), ("length", length)], storageTy, where)
+            let constructor = node(TFun([storageTy], public), where, CCon(con))
+            node(public, where, CApp(constructor, [storage]))
+        }
+        None -> {
+            let constructor = node(TFun([raw.ty], public), where,
+                                   CCon("Data.Array#Array"))
+            node(public, where, CApp(constructor, [raw]))
+        }
+    }
 }
 
 fun binary(l : Lowerer, e : Expr, ty : Ty.Type, op : String, left : Expr,

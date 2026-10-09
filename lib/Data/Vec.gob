@@ -1,8 +1,9 @@
-module Data.Array (
-    Array,
+module Data.Vec (
+    Vec,
     new,
     filled,
-    init,
+    fromArray,
+    toArray,
     push,
     pop,
     clear,
@@ -22,6 +23,13 @@ module Data.Array (
     threeWay,
 )
 
+-- The growable array: `push` and `pop` change its length.
+--
+-- An array literal builds one directly when inference decides it is a `Vec`,
+-- out of the two records below by name: `Vec` over a `VecStorage` with the
+-- fields `storage` and `length`. Renaming any of them means changing how the
+-- compiler lowers a literal in the same commit.
+
 import Prelude ()
 import Std.Classes
 import Data.Bool.Type (Bool(..))
@@ -30,36 +38,47 @@ import Data.Int as Int
 import Data.Option.Type (Option(..))
 import Data.Ordering.Type (Ordering(..))
 import Data.String.Type as Str
+import Data.Array (Array)
+import Data.Array as Array
 import Data.Array.Storage (outOfBounds, threeWay)
 import Data.Array.Storage as Storage
 
-type ArrayStorage a = ArrayStorage {
+-- The first `length` slots of `storage` are the elements; the rest is room to
+-- grow into, and is never read.
+type VecStorage a = VecStorage {
     var storage : Prim.Array a,
     var length  : Int,
 }
 
-type Array a = Array(ArrayStorage a)
+type Vec a = Vec(VecStorage a)
 
-fun state(Array(value)) = value
+fun state(Vec(value)) = value
 
-fun new(capacity : Int) -> Array a = Array(ArrayStorage {
+-- An empty `Vec` with room for `capacity` elements before it must grow.
+fun new(capacity : Int) -> Vec a = Vec(VecStorage {
     storage = Prim.arrayNewUninit(capacity),
     length = 0,
 })
 
-fun filled(length : Int, value : a) -> Array a = Array(ArrayStorage {
+fun filled(length : Int, value : a) -> Vec a = Vec(VecStorage {
     storage = Prim.arrayNew(length, value),
     length,
 })
 
--- Element `i` is `f(i)`, computed in order from 0.
-fun init(length : Int, f : fun(Int) -> a) -> Array a {
-    let out = new(length)
-    for var i = 0; i < length; i = i + 1 { push(out, f(i)) }
+-- Both copy: a `Vec` and an `Array` never share their elements.
+fun fromArray(xs : Array a) -> Vec a {
+    let out = new(len(xs))
+    for x in xs { push(out, x) }
     out
 }
 
-fun grow(xs : Array a) {
+fun toArray(xs : Vec a) -> Array a {
+    let out = Array.new(len(xs))
+    for x in xs { Array.push(out, x) }
+    out
+}
+
+fun grow(xs : Vec a) {
     let data = state(xs)
     let capacity = Prim.arrayLength(data.storage)
     if data.length < capacity { return }
@@ -71,14 +90,14 @@ fun grow(xs : Array a) {
     data.storage = storage
 }
 
-fun push(xs : Array a, x : a) -> Unit {
+fun push(xs : Vec a, x : a) -> Unit {
     grow(xs)
     let data = state(xs)
     Prim.arraySet(data.storage, data.length, x)
     data.length = data.length + 1
 }
 
-fun pop(xs : Array a) -> Option a {
+fun pop(xs : Vec a) -> Option a {
     let data = state(xs)
     if data.length == 0 { return None }
     data.length = data.length - 1
@@ -87,23 +106,23 @@ fun pop(xs : Array a) -> Option a {
 
 -- Drop every element, keeping the capacity. The elements themselves are still
 -- reachable from the storage until they are overwritten, which costs nothing a
--- compiler notices and saves the reallocation a fresh array would need.
-fun clear(xs : Array a) -> Unit {
+-- compiler notices and saves the reallocation a fresh `Vec` would need.
+fun clear(xs : Vec a) -> Unit {
     state(xs).length = 0
 }
 
-fun bounds(xs : Array a, i : Int, operation : String) {
+fun bounds(xs : Vec a, i : Int, operation : String) {
     let length = state(xs).length
     if i < 0 || i >= length { outOfBounds(operation, i, length) }
 }
 
-fun map(xs : Array a, f : fun(a) -> b) -> Array b {
+fun map(xs : Vec a, f : fun(a) -> b) -> Vec b {
     let out = new(len(xs))
     for x in xs { push(out, f(x)) }
     out
 }
 
-fun filter(xs : Array a, keep : fun(a) -> Bool) -> Array a {
+fun filter(xs : Vec a, keep : fun(a) -> Bool) -> Vec a {
     let out = new(len(xs))
     for x in xs {
         if keep(x) { push(out, x) }
@@ -111,13 +130,13 @@ fun filter(xs : Array a, keep : fun(a) -> Bool) -> Array a {
     out
 }
 
-fun fold(xs : Array a, initial : b, step : fun(b, a) -> b) -> b {
+fun fold(xs : Vec a, initial : b, step : fun(b, a) -> b) -> b {
     var acc = initial
     for x in xs { acc = step(acc, x) }
     acc
 }
 
-fun reverse(xs : Array a) -> Array a {
+fun reverse(xs : Vec a) -> Vec a {
     let out = new(len(xs))
     var i = len(xs) - 1
     while i >= 0 {
@@ -127,7 +146,7 @@ fun reverse(xs : Array a) -> Array a {
     out
 }
 
-fun append(xs : Array a, ys : Array a) -> Array a {
+fun append(xs : Vec a, ys : Vec a) -> Vec a {
     let out = new(len(xs) + len(ys))
     for x in xs { push(out, x) }
     for y in ys { push(out, y) }
@@ -138,17 +157,13 @@ fun append(xs : Array a, ys : Array a) -> Array a {
 --
 -- `xs[i]` is the `Index` method and panics, which is right for a program that
 -- knows the index is good. `at` is for the one that is asking.
---
--- Not called `get`: that name belongs to the `Index` class, and this is not an
--- instance of it -- an `Index` method must answer `Index.Value`, which is the
--- element, not an `Option` of it.
 
-fun at(xs : Array a, i : Int) -> Option a =
+fun at(xs : Vec a, i : Int) -> Option a =
     if i < 0 || i >= len(xs) { None } else { Some(xs[i]) }
 
-fun last(xs : Array a) -> Option a = at(xs, len(xs) - 1)
+fun last(xs : Vec a) -> Option a = at(xs, len(xs) - 1)
 
-fun swap(xs : Array a, i : Int, j : Int) -> Unit {
+fun swap(xs : Vec a, i : Int, j : Int) -> Unit {
     let x = xs[i]
     xs[i] = xs[j]
     xs[j] = x
@@ -157,7 +172,7 @@ fun swap(xs : Array a, i : Int, j : Int) -> Unit {
 -- A copy, not a view. A view would alias storage that `push` is free to
 -- reallocate out from under it, and the growth policy is deliberately not part
 -- of this type's contract.
-fun slice(xs : Array a, from : Int, to : Int) -> Array a {
+fun slice(xs : Vec a, from : Int, to : Int) -> Vec a {
     if from < 0 || to > len(xs) || from > to {
         error(Str.concat(
             Str.concat("array slice out of bounds: ", Int.toString(from)),
@@ -168,29 +183,30 @@ fun slice(xs : Array a, from : Int, to : Int) -> Array a {
     out
 }
 
-fun indexOf[Eq a](xs : Array a, wanted : a) -> Option Int {
+fun indexOf[Eq a](xs : Vec a, wanted : a) -> Option Int {
     for var i = 0; i < len(xs); i = i + 1 {
         if xs[i] == wanted { return Some(i) }
     }
     None
 }
 
-fun contains[Eq a](xs : Array a, wanted : a) -> Bool = match indexOf(xs, wanted) {
+fun contains[Eq a](xs : Vec a, wanted : a) -> Bool = match indexOf(xs, wanted) {
     Some(_) -> True
     None -> False
 }
 
-fun sortBy(xs : Array a, compare : fun(a, a) -> Ordering) -> Array a {
+-- A stable sort, answering a new `Vec`; `Data.Array.Storage` says how.
+fun sortBy(xs : Vec a, compare : fun(a, a) -> Ordering) -> Vec a {
     let data = state(xs)
-    Array(ArrayStorage {
+    Vec(VecStorage {
         storage = Storage.sorted(data.storage, data.length, compare),
         length = data.length,
     })
 }
 
-fun sort[Ord a](xs : Array a) -> Array a = sortBy(xs, threeWay)
+fun sort[Ord a](xs : Vec a) -> Vec a = sortBy(xs, threeWay)
 
-instance Index (Array a) {
+instance Index (Vec a) {
     type Key = Int
     type Value = a
     fun get(xs, i) {
@@ -199,21 +215,21 @@ instance Index (Array a) {
     }
 }
 
-instance SetIndex (Array a) {
+instance SetIndex (Vec a) {
     fun set(xs, i, x) {
         bounds(xs, i, "write at")
         Prim.arraySet(state(xs).storage, i, x)
     }
 }
 
-instance Length (Array a) { fun len(xs) = state(xs).length }
+instance Length (Vec a) { fun len(xs) = state(xs).length }
 
-type ArrayCursor = ArrayCursor { var at : Int }
+type VecCursor = VecCursor { var at : Int }
 
-instance Iterator (Array a) {
+instance Iterator (Vec a) {
     type Item = a
-    type Cursor = ArrayCursor
-    fun iter(xs) = ArrayCursor { at = 0 }
+    type Cursor = VecCursor
+    fun iter(xs) = VecCursor { at = 0 }
     -- Reads the storage directly rather than through `get`: the test against
     -- `length` above is the one `get` would make, so making it twice costs a
     -- compare per element and can never fail the second time with one task.
@@ -228,11 +244,11 @@ instance Iterator (Array a) {
     }
 }
 
-instance Add (Array a) { fun add(xs, ys) = append(xs, ys) }
-instance Semigroup (Array a) { fun combine(xs, ys) = append(xs, ys) }
-instance Monoid (Array a) { fun empty() = [] }
+instance Add (Vec a) { fun add(xs, ys) = append(xs, ys) }
+instance Semigroup (Vec a) { fun combine(xs, ys) = append(xs, ys) }
+instance Monoid (Vec a) { fun empty() = [] }
 
-instance Foldable Array {
+instance Foldable Vec {
     fun foldMap[Monoid m](xs, f) {
         var acc : m = empty()
         for x in xs { acc = combine(acc, f(x)) }
@@ -240,7 +256,7 @@ instance Foldable Array {
     }
 }
 
-instance Functor Array {
+instance Functor Vec {
     fun map(xs, f) {
         let out = new(len(xs))
         for x in xs { push(out, f(x)) }
@@ -248,9 +264,9 @@ instance Functor Array {
     }
 }
 
-instance Applicative Array { fun pure(x) = [x] }
+instance Applicative Vec { fun pure(x) = [x] }
 
-instance Monad Array {
+instance Monad Vec {
     fun bind(xs, f) {
         let out = new(len(xs))
         for x in xs {
@@ -260,7 +276,7 @@ instance Monad Array {
     }
 }
 
-instance Show (Array a) : Show a {
+instance Show (Vec a) : Show a {
     fun show(xs) {
         var out = "["
         var rest = False

@@ -94,7 +94,7 @@ There are three forms of assignment:
   function parameter.
 * `r.field = e` changes a record field declared
   [`var`](types.md#mutability-and-sharing).
-* `c[k] = e` replaces an element, through the [`Index`](builtins.md#index)
+* `c[k] = e` replaces an element, through the [`SetIndex`](builtins.md#index)
   class's `set` method.
 
 The new value must have the same type as the old one. An assignment is a

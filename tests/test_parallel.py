@@ -116,7 +116,6 @@ instance Index Upto {
     type Key = Int
     type Value = Int
     fun get(Upto(_), i) = i
-    fun set(_, _, _) = error("Upto cannot be written")
 }
 
 instance Iterator Upto {

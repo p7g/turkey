@@ -76,8 +76,8 @@ the function passed to `bind`.
 > useful, in each.
 
 The following examples use four monads to show the range. The library defines
-`Monad` instances for `Option`, `Either l` and `Array`; a program can define
-its own for any suitable type.
+`Monad` instances for `Option`, `Either l`, `Array` and `Vec`; a program can
+define its own for any suitable type.
 
 ### Stopping at the first failure: `Option`
 

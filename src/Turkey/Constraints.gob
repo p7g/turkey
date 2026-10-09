@@ -371,6 +371,7 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
         discard(Array.pop(s.scopes))
     }
     CDef(binds, body, top) -> {
+        if top { decideTopLevelLiterals(s) }
         let saved = s.env
         s.env = childEnv(saved)
         for (name, ty) in binds {
@@ -737,10 +738,15 @@ fun improveFamilies(s : Solver) -> Unit {
             if isFam(Ty.prune(left)) {
                 let key = Ty.typeKey(left)
                 match Map.get(seen, key) {
-                    Some((first, at)) -> Ty.unify(first, c.pred.args[1],
-                        firstSpan(c.span, at),
-                        "the answers given for '" + Ty.show(left) + "'",
-                        families(s))
+                    -- The test is not only a shortcut. Once two answers are
+                    -- unified they stay deferred, alike, until the family
+                    -- reduces, and every later round would otherwise build the
+                    -- message again for a unification that cannot fail.
+                    Some((first, at)) -> if !Ty.sameType(first, c.pred.args[1]) {
+                        Ty.unify(first, c.pred.args[1], firstSpan(c.span, at),
+                                 "the answers given for '" + Ty.show(left) + "'",
+                                 families(s))
+                    }
                     None -> Map.put(seen, key, (c.pred.args[1], c.span))
                 }
             }
@@ -1116,6 +1122,25 @@ fun applyDefaults(s : Solver, stuck : Array PredCell) -> Bool {
         }
     }
     progress
+}
+
+-- Default the container of every array literal a top-level binding has left
+-- open, once that binding's definition is solved and before anything uses it.
+--
+-- Such a binding is one the value restriction keeps monomorphic, `let table =
+-- [...]`, so no generalization decides its literal, and only the end of the
+-- module would otherwise. Until then its demand would be carried through every
+-- later top-level binding, together with every family equation over its
+-- container that a use of the table adds -- `Index.Value t ~ a` for each
+-- `table[i]` -- and every `settle` in those bindings, one per local `let`,
+-- retries them all. That is quadratic in the module, and on the compiler's own
+-- source it does not finish. Deciding here makes a top-level binding's
+-- container a fact about its own definition: the same for a use later in the
+-- module as for one in a module that imports it, which is checked afterwards
+-- and could never decide it.
+fun decideTopLevelLiterals(s : Solver) -> Unit {
+    let open = Array.filter(s.deferred, fun(c) = isArrayLiteralDemand(c) && undecided(c))
+    if applyDefaults(s, open) { settle(s) }
 }
 
 -- Whether a `OneOf` demand's type is still open, which is when defaulting may

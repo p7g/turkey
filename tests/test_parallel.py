@@ -24,7 +24,7 @@ fun slow(n : Int) -> Int {
 
 fun main() {
     let xs = []
-    for var i = 0; i < 1000; i = i + 1 { Array.push(xs, i) }
+    for var i = 0; i < 1000; i = i + 1 { Vec.push(xs, i) }
     let ys = Parallel.map(xs, slow)
     var sum = 0
     for y in ys { sum = (sum + y) % 1000003 }
@@ -81,7 +81,7 @@ fun main() {
     -- Wide: 400 independent steps feeding one.
     let wide = Parallel.graph(401, fun(i) = if i == 400 {
         let all = []
-        for var k = 0; k < 400; k = k + 1 { Array.push(all, k) }
+        for var k = 0; k < 400; k = k + 1 { Vec.push(all, k) }
         all
     } else { [] }, fun(i, finished) {
         if i < 400 { return i * i }

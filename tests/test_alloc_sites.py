@@ -15,8 +15,8 @@ from tests import bootc, lang, toolchain
 PROGRAM = """
 type Pair = Pair(Int, Int)
 
-fun keep(xs : Array Pair, n : Int) -> Unit {
-    for var i = 0; i < n; i = i + 1 { Array.push(xs, Pair(i, n)) }
+fun keep(xs : Vec Pair, n : Int) -> Unit {
+    for var i = 0; i < n; i = i + 1 { Vec.push(xs, Pair(i, n)) }
 }
 
 fun main() {

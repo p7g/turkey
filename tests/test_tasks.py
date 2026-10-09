@@ -53,15 +53,15 @@ def test_a_scope_ends_only_when_its_tasks_have():
 import System.Task as Task
 
 fun main() {
-    let log : Array String = []
+    let log : Vec String = []
     Task.runScope(do {
         for name in ["one", "two", "three"] {
-            let _ = Task.spawn(fun() { Array.push(log, name) })?
+            let _ = Task.spawn(fun() { Vec.push(log, name) })?
         }
-        Array.push(log, "body done")
+        Vec.push(log, "body done")
         pure(())
     })
-    Array.push(log, "scope done")
+    Vec.push(log, "scope done")
     print(String.join(log, ", "))
 }
 """)
@@ -97,8 +97,8 @@ import System.Task as Task
 
 fun sumOf(xs : Array Int) -> Int {
     let tasks = Task.runScope(do {
-        let made : Array (Task.Task Int) = []
-        for x in xs { Array.push(made, Task.spawn(fun() = x * x)?) }
+        let made : Vec (Task.Task Int) = []
+        for x in xs { Vec.push(made, Task.spawn(fun() = x * x)?) }
         pure(made)
     })
     var total = 0
@@ -136,12 +136,12 @@ fun hold(n : Int) -> String {
 
 fun main() {
     let tasks = Task.runScope(do {
-        let made : Array (Task.Task String) = []
+        let made : Vec (Task.Task String) = []
         for var n = 0; n < 20; n = n + 1 {
             -- A `for var` is one variable for the whole loop, which a closure
             -- shares; the tasks run after the loop, so each needs its own.
             let k = n
-            Array.push(made, Task.spawn(fun() = hold(k))?)
+            Vec.push(made, Task.spawn(fun() = hold(k))?)
         }
         pure(made)
     })
@@ -218,9 +218,9 @@ TREE = """
 import System.Task as Task
 
 fun leaf(n : Int) -> Int {
-    let parts : Array String = []
+    let parts : Vec String = []
     for var i = 0; i < 20; i = i + 1 {
-        Array.push(parts, Int.toString(n + i))
+        Vec.push(parts, Int.toString(n + i))
         if i % 5 == 0 { Task.yield() }
     }
     String.byteLength(String.join(parts, ""))
@@ -269,8 +269,8 @@ import System.Task as Task
 fun work(n : Int) -> Int {
     var total = 0
     for var round = 0; round < 20; round = round + 1 {
-        let parts : Array String = []
-        for var i = 0; i < 30; i = i + 1 { Array.push(parts, Int.toString(n * 100 + i)) }
+        let parts : Vec String = []
+        for var i = 0; i < 30; i = i + 1 { Vec.push(parts, Int.toString(n * 100 + i)) }
         total = total + String.byteLength(String.join(parts, ","))
         let m = Map.new()
         for var i = 0; i < 20; i = i + 1 { Map.put(m, i, Int.toString(i + n)) }
@@ -281,10 +281,10 @@ fun work(n : Int) -> Int {
 
 fun main() {
     let tasks = Task.runScope(do {
-        let made : Array (Task.Task Int) = []
+        let made : Vec (Task.Task Int) = []
         for var n = 0; n < 32; n = n + 1 {
             let k = n
-            Array.push(made, Task.spawn(fun() = work(k))?)
+            Vec.push(made, Task.spawn(fun() = work(k))?)
         }
         pure(made)
     })

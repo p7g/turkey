@@ -662,7 +662,7 @@ fun main() {
 
     let xs = [1, 2]
     let ys = xs
-    Array.push(ys, 3)
+    Vec.push(ys, 3)
     print(xs)
 }
 ```

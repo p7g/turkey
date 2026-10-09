@@ -316,7 +316,7 @@ fun into(b : Builder, at : Ssa.BlockId) -> Unit { b.at = at }
 -- what an opcode means.
 fun emit(b : Builder, op : Op, r : Rep) -> Value {
     let v = Ssa.freshValue(b.func, r)
-    Array.push(Ssa.blockAt(b.func, b.at).insts, low(v, op))
+    Vec.push(Ssa.blockAt(b.func, b.at).insts, low(v, op))
     if effectsOf(op).allocates || isConstString(op) {
         match b.span {
             Some(s) -> Map.put(b.func.origins, Ssa.valueId(v), s)
@@ -339,14 +339,14 @@ fun terminate(b : Builder, t : Ssa.Term) -> Unit {
 -- A new empty block, and its id.
 fun block(b : Builder) -> Ssa.BlockId {
     let id = len(b.func.blocks)
-    Array.push(b.func.blocks, Ssa.newBlock())
+    Vec.push(b.func.blocks, Ssa.newBlock())
     Ssa.BlockId(id)
 }
 
 -- A parameter of a block, which is where a phi would be.
 fun param(b : Builder, at : Ssa.BlockId, r : Rep) -> Value {
     let v = Ssa.freshValue(b.func, r)
-    Array.push(Ssa.blockAt(b.func, at).params, v)
+    Vec.push(Ssa.blockAt(b.func, at).params, v)
     v
 }
 
@@ -465,14 +465,9 @@ fun opUses(op : Op) -> Array Value = match op {
         Some(e) -> [e]
         None -> []
     }
-    Call(callee, args) -> {
-        let out : Array Value = []
-        match callee {
-            Indirect(f) -> Array.push(out, f)
-            _ -> {}
-        }
-        for a in args { Array.push(out, a) }
-        out
+    Call(callee, args) -> match callee {
+        Indirect(f) -> Array.init(len(args) + 1, fun(i) = if i == 0 { f } else { args[i - 1] })
+        _ -> Array.init(len(args), args[_])
     }
     GlobalLoad(_) -> []
     GlobalStore(_, a) -> [a]
@@ -584,11 +579,11 @@ fun opResultRep(op : Op) -> Option Rep = match op {
 -- shape of the graph, and this owns what an operation requires of its
 -- operands. Keeping them apart is what stops the generic layer from
 -- accumulating target knowledge.
-fun checkReps(f : Ssa.Func Low, i : Low) -> Array String {
+fun checkReps(f : Ssa.Func Low, i : Low) -> Vec String {
     let out = []
     match opResultRep(i.op) {
         Some(want) -> if Ssa.repOf(f, i.result) != want {
-            Array.push(out, "result is " + show(Ssa.repOf(f, i.result))
+            Vec.push(out, "result is " + show(Ssa.repOf(f, i.result))
                             + " where " + show(want) + " was required")
         }
         None -> {}
@@ -605,7 +600,7 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Array String {
         -- A machine has no integer constant of floating type, so an integer
         -- literal at `f64` has to have become a float before it gets here.
         ConstInt(_) -> if Ssa.repOf(f, i.result).class_ == F64 {
-            Array.push(out, "an integer constant is held at f64")
+            Vec.push(out, "an integer constant is held at f64")
         }
         ClosureCapture(c, _, _) ->
             wantClass(f, out, c, Ptr, "the target of a closure capture")
@@ -622,7 +617,7 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Array String {
             wantClass(f, out, off, I64, "a raw offset")
             wantClass(f, out, stored, c, "the value of a raw store")
             if Ssa.repOf(f, stored).traced {
-                Array.push(out, "a traced pointer is stored through a raw pointer")
+                Vec.push(out, "a traced pointer is stored through a raw pointer")
             }
         }
         PtrLoad(base, off, _) -> {
@@ -636,7 +631,7 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Array String {
                 LoadAcquire -> 2
             }
             if len(operands) != arity {
-                Array.push(out, "an atomic access with the wrong number of operands")
+                Vec.push(out, "an atomic access with the wrong number of operands")
             } else {
                 wantClass(f, out, operands[0], Ptr, "the base of an atomic access")
                 for var k = 1; k < arity; k = k + 1 {
@@ -647,13 +642,13 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Array String {
         Convert(PtrToInt, a) -> {
             wantClass(f, out, a, Ptr, "the operand of a pointer-to-integer")
             if Ssa.repOf(f, a).traced {
-                Array.push(out, "a traced pointer is converted to an integer")
+                Vec.push(out, "a traced pointer is converted to an integer")
             }
         }
         Convert(IntToPtr, a) -> {
             wantClass(f, out, a, I64, "the operand of an integer-to-pointer")
             if Ssa.repOf(f, i.result).traced {
-                Array.push(out, "an integer is converted to a traced pointer")
+                Vec.push(out, "an integer is converted to a traced pointer")
             }
         }
         Call(callee, _) -> match callee {
@@ -678,7 +673,7 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Array String {
 -- Answers complaints rather than failing, the way `Ssa.verify` and
 -- `checkReps` do, and is composed with them: that layer owns the shape of one
 -- graph, this one owns agreement between graphs.
-fun checkCalls(functions : Array (Ssa.Func Low)) -> Array String {
+fun checkCalls(functions : Array (Ssa.Func Low)) -> Vec String {
     let out = []
     let known = Map.new()
     for f in functions { Map.put(known, f.name, f) }
@@ -689,7 +684,7 @@ fun checkCalls(functions : Array (Ssa.Func Low)) -> Array String {
                     Call(Direct(name), args) -> match Map.get(known, name) {
                         Some(callee) -> {
                             if len(args) != len(callee.params) {
-                                Array.push(out, f.name + ": calls @" + name
+                                Vec.push(out, f.name + ": calls @" + name
                                     + " with " + Int.toString(len(args))
                                     + " arguments where it takes "
                                     + Int.toString(len(callee.params)))
@@ -698,7 +693,7 @@ fun checkCalls(functions : Array (Ssa.Func Low)) -> Array String {
                                     if Ssa.repOf(f, args[n])
                                             != Ssa.repOf(callee,
                                                          callee.params[n]) {
-                                        Array.push(out, f.name + ": passes "
+                                        Vec.push(out, f.name + ": passes "
                                             + show(Ssa.repOf(f, args[n]))
                                             + " to @" + name + " parameter "
                                             + Int.toString(n) + ", which is "
@@ -708,13 +703,13 @@ fun checkCalls(functions : Array (Ssa.Func Low)) -> Array String {
                                 }
                             }
                             if Ssa.repOf(f, i.result) != callee.result {
-                                Array.push(out, f.name + ": reads "
+                                Vec.push(out, f.name + ": reads "
                                     + show(Ssa.repOf(f, i.result))
                                     + " from @" + name + ", which answers "
                                     + show(callee.result))
                             }
                         }
-                        None -> Array.push(out, f.name + ": calls @" + name
+                        None -> Vec.push(out, f.name + ": calls @" + name
                                                 + ", which is not a function here")
                     }
                     ClosureNew(code, _) -> closes(out, known, f.name, code)
@@ -729,12 +724,12 @@ fun checkCalls(functions : Array (Ssa.Func Low)) -> Array String {
 
 -- A closure's code is called at the uniform representation with the
 -- environment first, so its arity is one more than the lambda's.
-fun closes(out : Array String, known : Map String (Ssa.Func Low), from : String,
+fun closes(out : Vec String, known : Map String (Ssa.Func Low), from : String,
            code : String) -> Unit = match Map.get(known, code) {
     Some(callee) -> if len(callee.params) < 1 {
-        Array.push(out, from + ": closes over @" + code + ", which takes no environment")
+        Vec.push(out, from + ": closes over @" + code + ", which takes no environment")
     }
-    None -> Array.push(out, from + ": closes over @" + code + ", which does not exist")
+    None -> Vec.push(out, from + ": closes over @" + code + ", which does not exist")
 }
 
 -- -- which functions may allocate ---------------------------------------------
@@ -808,7 +803,7 @@ fun summarize(functions : Array (Ssa.Func Low)) -> Map String Allocation {
                         }
                         let site = (f.name, Ssa.valueId(i.result))
                         match Map.get(callers, name) {
-                            Some(those) -> Array.push(those, site)
+                            Some(those) -> Vec.push(those, site)
                             None -> Map.put(callers, name, [site])
                         }
                     }
@@ -837,26 +832,26 @@ fun summarize(functions : Array (Ssa.Func Low)) -> Map String Allocation {
 
 -- The first reason found is the one kept, so the chain a diagnostic prints
 -- is a shortest one from the function to an allocation.
-fun mark(out : Map String Allocation, work : Array String, name : String,
+fun mark(out : Map String Allocation, work : Vec String, name : String,
          why : Allocation) -> Unit {
     if !Map.contains(out, name) {
         Map.put(out, name, why)
-        Array.push(work, name)
+        Vec.push(work, name)
     }
 }
 
-fun sameRep(f : Ssa.Func Low, out : Array String, a : Value, b : Value,
+fun sameRep(f : Ssa.Func Low, out : Vec String, a : Value, b : Value,
             what : String) -> Unit {
     if Ssa.repOf(f, a) != Ssa.repOf(f, b) {
-        Array.push(out, what + " are " + show(Ssa.repOf(f, a)) + " and "
+        Vec.push(out, what + " are " + show(Ssa.repOf(f, a)) + " and "
                         + show(Ssa.repOf(f, b)))
     }
 }
 
-fun wantClass(f : Ssa.Func Low, out : Array String, v : Value, c : RepClass,
+fun wantClass(f : Ssa.Func Low, out : Vec String, v : Value, c : RepClass,
               what : String) -> Unit {
     if Ssa.repOf(f, v).class_ != c {
-        Array.push(out, what + " is " + show(Ssa.repOf(f, v)))
+        Vec.push(out, what + " is " + show(Ssa.repOf(f, v)))
     }
 }
 

@@ -89,12 +89,12 @@ import Turkey.Types (Kind(..), VarCell(..), ConCell(..), Scheme(..), Pred(..),
 -- table that only grows by the distinct names of the program is the smaller
 -- cost.
 type CEnv = CEnv {
-    names : Map String (Option (Array VarCell, Ty.Type)),
+    names : Map String (Option (Vec VarCell, Ty.Type)),
     -- What `names` does not say, read and never written: the top-level names,
     -- which every binding's check shares (`layered`).
-    outer : Map String (Option (Array VarCell, Ty.Type)),
+    outer : Map String (Option (Vec VarCell, Ty.Type)),
     -- Each definition made inside a scope, with what the name meant before.
-    undo  : Array (String, Option (Array VarCell, Ty.Type)),
+    undo  : Vec (String, Option (Vec VarCell, Ty.Type)),
 }
 
 fun newCEnv() -> CEnv = CEnv { names = Map.new(), outer = Map.new(), undo = [] }
@@ -103,13 +103,13 @@ fun newCEnv() -> CEnv = CEnv { names = Map.new(), outer = Map.new(), undo = [] }
 -- can run at once. `e` must be a flat environment, one with nothing outer.
 fun layered(e : CEnv) -> CEnv = CEnv { names = Map.new(), outer = e.names, undo = [] }
 
-fun defineC(e : CEnv, name : String, binders : Array VarCell,
+fun defineC(e : CEnv, name : String, binders : Vec VarCell,
             ty : Ty.Type) -> Unit {
-    Array.push(e.undo, (name, lookupC(e, name)))
+    Vec.push(e.undo, (name, lookupC(e, name)))
     Map.put(e.names, name, Some((binders, ty)))
 }
 
-fun lookupC(e : CEnv, name : String) -> Option (Array VarCell, Ty.Type) =
+fun lookupC(e : CEnv, name : String) -> Option (Vec VarCell, Ty.Type) =
     match Map.get(e.names, name) {
         Some(found) -> found
         None -> match Map.get(e.outer, name) {
@@ -123,7 +123,7 @@ fun enter(e : CEnv) -> Int = len(e.undo)
 
 fun leave(e : CEnv, mark : Int) -> Unit {
     while len(e.undo) > mark {
-        match Array.pop(e.undo) {
+        match Vec.pop(e.undo) {
             Some((name, before)) -> Map.put(e.names, name, before)
             None -> ()
         }
@@ -138,13 +138,13 @@ fun leave(e : CEnv, mark : Int) -> Unit {
 -- shadows as it should.
 fun globalsOf(env : Env) -> CEnv {
     let out = newCEnv()
-    let chain = Array.new(4)
+    let chain = Vec.new(4)
     var scope = Some(env)
     var going = True
     while going {
         match scope {
             Some(s) -> {
-                Array.push(chain, s)
+                Vec.push(chain, s)
                 scope = s.parent
             }
             None -> { going = False }
@@ -182,7 +182,7 @@ type Checker = Checker {
     -- for the same reason: a family over a rigid variable will never reduce
     -- through an instance, and the signature that promised it is the only thing
     -- that can say what it is.
-    var equations : Array (Ty.Type, Ty.Type),
+    var equations : Vec (Ty.Type, Ty.Type),
 }
 
 fun newChecker(decls : DeclTable, classes : ClassTable) -> Checker = Checker {
@@ -192,7 +192,7 @@ fun newChecker(decls : DeclTable, classes : ClassTable) -> Checker = Checker {
 
 fun checkProgram(decls : DeclTable, classes : ClassTable, prog : CProgram,
                  globals : CEnv) -> Unit {
-    let all = Array.append(prog.dicts, prog.binds)
+    let all = Vec.append(prog.dicts, prog.binds)
     -- Every top-level name is in scope for every other: the dictionaries refer
     -- to each other, and the bindings were ordered by dependency but may still
     -- be mutually recursive within a component.
@@ -207,7 +207,7 @@ fun checkBind(ck : Checker, b : CBind, env : CEnv) -> Unit {
     let want = if b.mutable && isRef(b.ty) { refElem(b.ty) } else { b.ty }
     let saved = ck.equations
     let savedFams = ck.fams
-    ck.equations = Array.append(saved, b.equations)
+    ck.equations = Vec.append(saved, b.equations)
     ck.fams = famsOf(ck.classes, ck.equations)
     var got = check(ck, b.value, env, None)
     if b.mutable && isRef(b.ty) {
@@ -376,7 +376,7 @@ fun constructorScheme(ck : Checker, info : ConInfo) -> Scheme {
             quantified = info.scheme.quantified,
             body = TFun(Array.append(Array.map(info.scheme.preds,
                 fun(pr) = dictType(ck, pr.name, pr.args[0])), params), ret),
-            preds = Array.new(0),
+            preds = [],
         }
         _ -> info.scheme
     }
@@ -470,7 +470,7 @@ fun checkTyApp(ck : Checker, e : Core, fn : Core, args : Array Ty.Type,
 
 -- The binders and body of whatever is being type-applied.
 fun polymorphic(ck : Checker, fn : Core,
-                env : CEnv) -> (Array VarCell, Ty.Type) = match fn.kind {
+                env : CEnv) -> (Vec VarCell, Ty.Type) = match fn.kind {
     CVar(name) -> match lookupC(env, name) {
         Some(found) -> found
         None -> fail("'" + name + "' is not in scope", fn.span)
@@ -490,7 +490,7 @@ fun polymorphic(ck : Checker, fn : Core,
 -- `Semigroup` projection, and the method's remaining binders are its own
 -- scheme's less the class variable the dictionary just fixed.
 fun methodScheme(ck : Checker, e : Core, target : Core, index : Int,
-                 env : CEnv) -> (Array VarCell, Ty.Type) {
+                 env : CEnv) -> (Vec VarCell, Ty.Type) {
     let dictTy = check(ck, target, env, None)
     let (cls, head) = dictParts(ck, dictTy, e.span)
     let m = match slotOf(ck, cls, index, e.span) {
@@ -500,9 +500,9 @@ fun methodScheme(ck : Checker, e : Core, target : Core, index : Int,
                                + "' dictionary is its '" + sup
                                + "' superclass, not a method", e.span)
     }
-    let binders = Array.new(4)
+    let binders = Vec.new(4)
     for q in m.scheme.quantified {
-        if q.id != m.classVar.id { Array.push(binders, q) }
+        if q.id != m.classVar.id { Vec.push(binders, q) }
     }
     (binders, methodType(ck, m, head))
 }
@@ -686,7 +686,7 @@ fun checkJoin(ck : Checker, e : Core, name : String, params : Array CParam,
 -- everywhere but in a tail position, so a jump anywhere else fails to find its
 -- name. The message says so, since the two ways to fail -- no such join, and not
 -- in tail position -- are worth telling apart.
-fun checkJump(ck : Checker, e : Core, name : String, args : Array Core,
+fun checkJump(ck : Checker, e : Core, name : String, args : Vec Core,
               env : CEnv) -> Ty.Type {
     let found = Map.get(ck.joins, name)
     let argTys = Array.map(args, check(ck, _, env, None))
@@ -783,7 +783,7 @@ fun conPattern(ck : Checker, alt : Alt, name : String, fields : Array (Option St
     -- The hidden variables are the pattern's rigid constants and nothing the
     -- scrutinee says; the dictionaries arrive under the names the pattern gives
     -- them.
-    let carriedTypes = Array.new(0)
+    let carriedTypes = []
     if len(info.exists) > 0 {
         let o = match opening {
             Some(o) -> o
@@ -800,13 +800,13 @@ fun conPattern(ck : Checker, alt : Alt, name : String, fields : Array (Option St
         }
         for var i = 0; i < len(info.scheme.preds); i = i + 1 {
             let pr = info.scheme.preds[i]
-            Array.push(carriedTypes, (o.evidence[i],
+            Vec.push(carriedTypes, (o.evidence[i],
                 dictType(ck, pr.name, Decls.substitute(pr.args[0], mapping))))
         }
     }
     let params = match info.scheme.body {
         TFun(ps, _) -> ps
-        _ -> Array.new(0)
+        _ -> []
     }
     let fieldTypes = Array.map(params, Decls.substitute(_, mapping))
     if len(fields) != len(fieldTypes) {
@@ -877,7 +877,7 @@ fun familyFree(ty : Ty.Type) -> Bool = match Ty.prune(ty) {
 -- because a family over a rigid variable never reduces through the instance
 -- table at all.
 fun famsOf(classes : ClassTable,
-           equations : Array (Ty.Type, Ty.Type)) -> Ty.Families = Ty.Families {
+           equations : Vec (Ty.Type, Ty.Type)) -> Ty.Families = Ty.Families {
     reduce = fun(t) = {
         for (left, right) in equations {
             -- A rule from a family application to itself is no rule. Skipped

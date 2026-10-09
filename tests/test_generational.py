@@ -40,14 +40,14 @@ type Latest = Latest { var text : String, var count : Int }
 var latest = Latest { text = "", count = 0 }
 
 fun main() {
-    let pushed : Array String = []
-    let replaced = Array.new(0)
-    for var i = 0; i < 50; i = i + 1 { Array.push(replaced, "") }
+    let pushed : Vec String = []
+    let replaced = Vec.new(0)
+    for var i = 0; i < 50; i = i + 1 { Vec.push(replaced, "") }
     var last = ""
     let names = Map.new()
     for var i = 0; i < 400; i = i + 1 {
         let s = Int.toString(i) + "!"
-        Array.push(pushed, s)
+        Vec.push(pushed, s)
         replaced[i % 50] = Int.toString(i * 3)
         latest.text = s
         latest.count = latest.count + 1

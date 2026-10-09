@@ -294,7 +294,7 @@ def test_run_from_a_file_searches_beside_it(tmp_path, capsys):
 
 
 def test_the_bare_names_the_library_uses_are_free(tmp_path, capsys):
-    """The other half: `Array.push` does not claim a bare `push`, because a
+    """The other half: `Vec.push` does not claim a bare `push`, because a
     *module* re-export claims no bare name."""
     src = """
 fun push(n : Int) -> Int = n + 1
@@ -304,9 +304,9 @@ fun toString(n : Int) -> Int = n + 4
 
 fun main() {
     print(push(0) + new(0) + pop(0) + toString(0))
-    let xs = Array.new(2)
-    Array.push(xs, 9)
-    print(Array.pop(xs))
+    let xs = Vec.new(2)
+    Vec.push(xs, 9)
+    print(Vec.pop(xs))
 }
 """
     assert output(src, {}, capsys) == ["10", "Some(9)"]
@@ -324,13 +324,13 @@ def test_the_library_is_reachable_without_an_import(tmp_path):
 
 
 def test_the_long_spelling_is_available_by_importing_the_module(tmp_path):
-    """The Prelude re-exports `Data.Array` under the short alias. A program
+    """The Prelude re-exports `Data.Vec` under the short alias. A program
     that wants the long spelling asks for the module itself."""
-    src = ("import Data.Array\n"
-           "fun f(xs : Array Int) -> Unit = Data.Array.push(xs, 1)")
-    assert sigs(src, {})["f"] == "fun(Array Int) -> Unit"
-    assert fails("fun f(xs : Array Int) = Data.Array.push(xs, 1)", {}) == \
-        "'Data.Array.push' is not defined"
+    src = ("import Data.Vec\n"
+           "fun f(xs : Vec Int) -> Unit = Data.Vec.push(xs, 1)")
+    assert sigs(src, {})["f"] == "fun(Vec Int) -> Unit"
+    assert fails("fun f(xs : Vec Int) = Data.Vec.push(xs, 1)", {}) == \
+        "'Data.Vec.push' is not defined"
 
 
 def test_the_library_functions_are_ordinary_turkey(tmp_path, capsys):

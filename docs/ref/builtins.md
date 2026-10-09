@@ -22,7 +22,7 @@ The Prelude provides these names unqualified:
 
 It also provides the library modules `Array`, `Bool`, `Byte`, `Char`,
 `Either`, `Error`, `Float`, `Int`, `Map`, `Option`, `Ordering`, `String` and
-`Vec` under those names, qualified only. That is why `Array.push` and
+`Vec` under those names, qualified only. That is why `Vec.push` and
 `Int.parse` need no import, while the bare names `push` and `parse` stay free
 for a program to use.
 
@@ -63,9 +63,9 @@ and continues with the value in a `Right`.
 `Array a` is a growable, mutable sequence of `a`, with
 [reference semantics](types.md#mutability-and-sharing). Its constructor is
 hidden: arrays are made with [array literals](expressions.md#array-literals)
-and with library functions such as `Array.new`, `Array.filled` and
-`Array.init`. `Array.init(n, f)` is an array of length `n` whose element `i` is
-`f(i)`, computed in order from `0`:
+and with library functions such as `Array.filled` and `Array.init`.
+`Array.init(n, f)` is an array of length `n` whose element `i` is `f(i)`,
+computed in order from `0`:
 
 <!-- run -->
 ```kotlin

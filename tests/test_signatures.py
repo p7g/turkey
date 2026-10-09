@@ -331,7 +331,7 @@ def test_a_skolem_cannot_be_stored_in_an_enclosing_binding():
     src = """
     fun main() {
         let cell = []
-        fun f(x : a) -> Int { Array.push(cell, x); 1 }
+        fun f(x : a) -> Int { Vec.push(cell, x); 1 }
         print(Int.toString(f(3)))
     }
     """

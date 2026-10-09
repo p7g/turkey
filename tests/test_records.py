@@ -332,19 +332,19 @@ def test_a_bool_is_not_an_array_index():
     assert fails("fun main() {\n    let a = [1]\n    print(a[True])\n}") != ""
 
 
-# -- `Array.pop` is total --------------------------------------------------
+# -- `Vec.pop` is total ----------------------------------------------------
 
 
 def test_pop_answers_with_option(capsys):
     src = """
 fun main() {
     let a = [1, 2]
-    print(match Array.pop(a) {
+    print(match Vec.pop(a) {
         Some(x) -> Int.toString(x)
         None -> "empty"
     })
-    let _ = Array.pop(a)
-    print(match Array.pop(a) {
+    let _ = Vec.pop(a)
+    print(match Vec.pop(a) {
         Some(x) -> Int.toString(x)
         None -> "empty"
     })
@@ -354,15 +354,15 @@ fun main() {
 
 
 def test_pops_scheme_names_the_preludes_option():
-    scheme_ = types("fun f(xs : Array Int) -> Option Int = Array.pop(xs)\n")["f"]
-    assert scheme_ == "fun(Array Int) -> Option Int"
+    scheme_ = types("fun f(xs : Vec Int) -> Option Int = Vec.pop(xs)\n")["f"]
+    assert scheme_ == "fun(Vec Int) -> Option Int"
 
 
 def test_popping_an_empty_array_does_not_panic(capsys):
     src = """
 fun main() {
-    let a = Array.new(4)
-    print(match Array.pop(a) {
+    let a = Vec.new(4)
+    print(match Vec.pop(a) {
         Some(x) -> Int.toString(x)
         None -> "empty"
     })
@@ -376,7 +376,7 @@ def test_reading_an_uninitialized_slot_is_still_a_panic():
     """`Option` launders the empty case, not a program bug."""
     src = """
 fun main() {
-    let a = Array.new(4)
+    let a = Vec.new(4)
     print(Int.toString(a[0]))
 }
 """
@@ -384,12 +384,12 @@ fun main() {
         run(src)
 
 
-def test_filled_arrays_have_length_and_remain_growable(capsys):
+def test_a_filled_vec_has_its_length_and_grows(capsys):
     src = """
 fun main() {
-    let xs = Array.filled(3, 4)
+    let xs = Vec.filled(3, 4)
     xs[1] = 9
-    Array.push(xs, 12)
+    Vec.push(xs, 12)
     print(len(xs))
     print(xs)
 }

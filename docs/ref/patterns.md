@@ -229,7 +229,7 @@ pattern would not match:
 <!-- error: this pattern is refutable; 'None' is not matched. Use 'if let' or 'match' -->
 ```kotlin
 fun main() {
-    let Some(x) = Array.pop([1, 2, 3])
+    let Some(x) = Vec.pop([1, 2, 3])
     print(x)
 }
 ```
@@ -247,7 +247,7 @@ fun main() {
     for (label, value) in [("x", x), ("y", y)] {
         print(label + " = " + show(value))
     }
-    if let Some(last) = Array.pop([1, 2, 3]) {
+    if let Some(last) = Vec.pop([1, 2, 3]) {
         print(last)
     }
 }

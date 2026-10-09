@@ -83,8 +83,8 @@ array bound with `let` has one element type, fixed by its first use:
 ```kotlin
 fun main() {
     let names = []
-    Array.push(names, 1)
-    Array.push(names, "Ada")
+    Vec.push(names, 1)
+    Vec.push(names, "Ada")
 }
 ```
 

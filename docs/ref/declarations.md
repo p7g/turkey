@@ -463,10 +463,10 @@ type:
 
 <!-- check -->
 ```kotlin
-fun scale(factor : Float, xs : Array Float) -> Array Float {
-    let result : Array Float = []
+fun scale(factor : Float, xs : Array Float) -> Vec Float {
+    let result : Vec Float = []
     for x in xs {
-        Array.push(result, x * factor)
+        Vec.push(result, x * factor)
     }
     result
 }

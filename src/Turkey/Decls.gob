@@ -46,25 +46,25 @@ type ConInfo = ConInfo {
     -- arguments: a field declared `var`.
     mutable : Array Bool,
     -- Where each field's name is declared, parallel to `fields`.
-    fieldSpans : Array Span,
+    fieldSpans : Vec Span,
     arity  : Int,
     -- Always `forall params. fun(args...) -> tycon params`. An existential's
     -- context is the scheme's `preds`.
     scheme : Scheme,
     -- An existential constructor's hidden variables: the scheme's variables
     -- that do not reach its result.
-    exists : Array VarCell,
+    exists : Vec VarCell,
     -- The names the bracket wrote for them, which an opened pattern's rigid
     -- constants are named after.
-    existsNames : Array String,
+    existsNames : Vec String,
 }
 
 fun isRecord(c : ConInfo) -> Bool = Option.isSome(c.fields)
 
 type TyconInfo = TyconInfo {
     name      : String,
-    params    : Array String,
-    variants  : Array ConInfo,
+    params    : Vec String,
+    variants  : Vec ConInfo,
     isAlias   : Bool,
     aliasBody : Option Type,
     span      : Option Span,
@@ -153,7 +153,7 @@ type DeclTable = DeclTable {
     -- Registration order, for anything that has to walk the table the way it
     -- was built. A `Map` here is insertion-ordered, but the primitives and
     -- `Prim.Array` are in it before any module is read.
-    order        : Array String,
+    order        : Vec String,
     -- Every `foreign` declaration in the program, by the name it was bound
     -- under. Written by `Turkey.Infer.bindForeigns` and read by both
     -- backends, which is why it is here: the declaration table is the one
@@ -170,7 +170,7 @@ type DeclTable = DeclTable {
     var newtypeNames : Option (Set.Set String),
     -- Existential constructors whose contexts name classes, until the class
     -- table has the classes to check them against.
-    var uncheckedContexts : Array (ConInfo, ConDecl),
+    var uncheckedContexts : Vec (ConInfo, ConDecl),
 }
 
 fun newDeclTable() -> DeclTable {
@@ -178,32 +178,32 @@ fun newDeclTable() -> DeclTable {
     Ty.clearOpened()
     let t = DeclTable {
         tycons = Map.new(), constructors = Map.new(), heads = Map.new(),
-        families = Map.new(), shorts = Map.new(), order = Array.new(16),
+        families = Map.new(), shorts = Map.new(), order = Vec.new(16),
         foreigns = Map.new(), definitions = Map.new(),
-        newtypeNames = None, uncheckedContexts = Array.new(0),
+        newtypeNames = None, uncheckedContexts = [],
     }
     for name in Ty.primitives() {
         Map.put(t.heads, name, Ty.tcon(name, KStar, Ty.noScope))
         Map.put(t.tycons, name, TyconInfo {
-            name = name, params = Array.new(0), variants = Array.new(0),
+            name = name, params = [], variants = [],
             isAlias = False, aliasBody = None, span = None, kind = KStar,
         })
         Map.put(t.shorts, name, name)
-        Array.push(t.order, name)
+        Vec.push(t.order, name)
     }
     let rawKind = KFun(KStar, KStar)
     Map.put(t.tycons, "Prim.Array", TyconInfo {
-        name = "Prim.Array", params = ["a"], variants = Array.new(0),
+        name = "Prim.Array", params = ["a"], variants = [],
         isAlias = False, aliasBody = None, span = None, kind = rawKind,
     })
     Map.put(t.heads, "Prim.Array", Ty.tcon("Prim.Array", rawKind, Ty.noScope))
-    Array.push(t.order, "Prim.Array")
+    Vec.push(t.order, "Prim.Array")
     Map.put(t.tycons, "Prim.Ptr", TyconInfo {
-        name = "Prim.Ptr", params = Array.new(0), variants = Array.new(0),
+        name = "Prim.Ptr", params = [], variants = [],
         isAlias = False, aliasBody = None, span = None, kind = KStar,
     })
     Map.put(t.heads, "Prim.Ptr", Ty.tcon("Prim.Ptr", KStar, Ty.noScope))
-    Array.push(t.order, "Prim.Ptr")
+    Vec.push(t.order, "Prim.Ptr")
     t
 }
 
@@ -216,13 +216,13 @@ fun head(t : DeclTable, name : String) -> Ty.Type = match Map.get(t.heads, name)
 
 -- Declare every type before resolving any, so they may refer to each other in
 -- any order.
-fun registerAll(t : DeclTable, decls : Array TypeDecl) -> Unit {
+fun registerAll(t : DeclTable, decls : Vec TypeDecl) -> Unit {
     for d in decls {
         let params = Set.new()
         for p in d.params { Set.add(params, p) }
-        let groups = Array.new(2)
+        let groups = Vec.new(2)
         match d.alias {
-            Some(body) -> Array.push(groups, (Set.new(), [body]))
+            Some(body) -> Vec.push(groups, (Set.new(), [body]))
             None -> {}
         }
         match d.variants {
@@ -245,7 +245,7 @@ fun registerAll(t : DeclTable, decls : Array TypeDecl) -> Unit {
                 }
                 let hiddenSet = Set.new()
                 for name in hidden { Set.add(hiddenSet, name) }
-                Array.push(groups, (hiddenSet, conTypes(c)))
+                Vec.push(groups, (hiddenSet, conTypes(c)))
             }
             None -> {}
         }
@@ -280,12 +280,12 @@ fun registerAll(t : DeclTable, decls : Array TypeDecl) -> Unit {
         -- nothing to generalize between one declaration and the next.
         let kind = Ty.kindArrow(len(d.params), KStar)
         Map.put(t.tycons, d.name, TyconInfo {
-            name = d.name, params = d.params, variants = Array.new(2),
+            name = d.name, params = d.params, variants = Vec.new(2),
             isAlias = Option.isSome(d.alias), aliasBody = d.alias,
             span = Some(d.span), kind = kind,
         })
         Map.put(t.heads, d.name, Ty.tcon(d.name, kind, Ty.noScope))
-        Array.push(t.order, d.name)
+        Vec.push(t.order, d.name)
         match Map.get(t.shorts, short) {
             Some(claimed) -> if claimed != d.name {
                 -- Two modules declare this short name. Neither may keep it.
@@ -361,8 +361,7 @@ fun resolveVariants(t : DeclTable, decl : TypeDecl) -> Unit {
     -- The type's own parameters become variables shared by every variant, so
     -- `Some a` and `None` both land in `Option a`.
     let tyvars = paramVars(info, 1)
-    let args = Array.new(len(decl.params))
-    for p in decl.params { Array.push(args, Map.getOr(tyvars, p, TBottom)) }
+    let args = Array.map(decl.params, Map.getOr(tyvars, _, TBottom))
     let result = Ty.applyTo(head(t, decl.name), args, Some(decl.span))
 
     match decl.variants {
@@ -380,27 +379,22 @@ fun resolveVariants(t : DeclTable, decl : TypeDecl) -> Unit {
             -- The bracket's variables are this variant's alone.
             let local = Map.new()
             for (k, v) in Map.entries(tyvars) { Map.put(local, k, v) }
-            let hidden = Array.new(2)
+            let hidden = Vec.new(2)
             for name in hiddenVariables(c) {
                 let cell = Ty.freshVar(1)
                 Map.put(local, name, TVar(cell))
-                Array.push(hidden, cell)
+                Vec.push(hidden, cell)
             }
-            let argTypes = Array.new(4)
-            match c.fields {
-                Some(fs) -> for (_, te) in fs {
-                    Array.push(argTypes, star(t, te, local, undeclared))
-                }
-                None -> for te in c.args {
-                    Array.push(argTypes, star(t, te, local, undeclared))
-                }
+            let argTypes = match c.fields {
+                Some(fs) -> Array.map(fs, fun((_, te)) = star(t, te, local, undeclared))
+                None -> Array.map(c.args, star(t, _, local, undeclared))
             }
             -- Class names are checked, and kinds compared, once the classes
             -- exist: `Turkey.Classes.checkConstructorContexts`.
-            let context = Array.new(len(c.context))
+            let context = Vec.new(len(c.context))
             for p in c.context {
                 match p.kind {
-                    PClass(name, argTe) -> Array.push(context,
+                    PClass(name, argTe) -> Vec.push(context,
                         Ty.pred(name, [toType(t, argTe, local, undeclared)]))
                     _ -> {}
                 }
@@ -411,11 +405,11 @@ fun resolveVariants(t : DeclTable, decl : TypeDecl) -> Unit {
                 for q in s.quantified {
                     if q.id == cell.id { present = True }
                 }
-                if !present { Array.push(s.quantified, cell) }
+                if !present { Vec.push(s.quantified, cell) }
             }
             checkVars(decl, c, variants)
             let mutable = match names {
-                Some(ns) -> Array.map(ns, Array.contains(c.vars, _))
+                Some(ns) -> Array.map(ns, Vec.contains(c.vars, _))
                 None -> Array.map(argTypes, fun(_) = False)
             }
             let cinfo = ConInfo {
@@ -424,8 +418,8 @@ fun resolveVariants(t : DeclTable, decl : TypeDecl) -> Unit {
                 arity = len(argTypes), scheme = s, exists = hidden,
                 existsNames = hiddenVariables(c),
             }
-            if len(c.context) > 0 { Array.push(t.uncheckedContexts, (cinfo, c)) }
-            Array.push(info.variants, cinfo)
+            if len(c.context) > 0 { Vec.push(t.uncheckedContexts, (cinfo, c)) }
+            Vec.push(info.variants, cinfo)
             Map.put(t.constructors, c.name, cinfo)
         }
     }
@@ -435,7 +429,7 @@ fun resolveVariants(t : DeclTable, decl : TypeDecl) -> Unit {
 -- field of whatever `x` is, so in a type with several constructors it would
 -- name a field the value may not have; and an existential record's field has a
 -- type that only an opening can name.
-fun checkVars(decl : TypeDecl, c : ConDecl, variants : Array ConDecl) -> Unit {
+fun checkVars(decl : TypeDecl, c : ConDecl, variants : Vec ConDecl) -> Unit {
     if len(c.vars) == 0 { return {} }
     let at = Some(firstVarSpan(c))
     if len(variants) > 1 {
@@ -566,7 +560,7 @@ fun toType(t : DeclTable, te : Type, tyvars : Map String Ty.Type,
 -- it is the one head that is not rigid, and `unify` decomposes an application
 -- pointwise. Any further arguments *are* an ordinary application, of whatever
 -- the family returns.
-fun family(t : DeclTable, te : Type, name : String, args : Array Type,
+fun family(t : DeclTable, te : Type, name : String, args : Vec Type,
            tyvars : Map String Ty.Type, fresh : Ty.Fresh) -> Ty.Type {
     let fam = match Map.get(t.families, name) {
         Some(f) -> f
@@ -627,15 +621,15 @@ fun recordFields(t : DeclTable, name : String) -> Option (Array String) =
     }
 
 -- The named type's `var` fields, or `None` if it is not a plain record.
-fun varFields(t : DeclTable, name : String) -> Option (Array String) =
+fun varFields(t : DeclTable, name : String) -> Option (Vec String) =
     match Map.get(t.tycons, name) {
         None -> None
         Some(info) -> if isPlainRecord(info) {
             let c = info.variants[0]
-            let out = Array.new(len(c.mutable))
+            let out = Vec.new(len(c.mutable))
             match c.fields {
                 Some(names) -> for var i = 0; i < len(names); i = i + 1 {
-                    if c.mutable[i] { Array.push(out, names[i]) }
+                    if c.mutable[i] { Vec.push(out, names[i]) }
                 }
                 None -> {}
             }
@@ -849,7 +843,7 @@ fun conFieldTypes(t : DeclTable, receiver : Ty.Type,
 -- its layout codes, and a record has identity if a field is a `var`.
 type Compact = Compact {
     -- In declaration order: a nullary's word is its index here.
-    nullaries : Array String,
+    nullaries : Vec String,
     payload   : String,
 }
 
@@ -864,8 +858,8 @@ fun compactShape(t : DeclTable, tycon : String) -> Option Compact {
     let carrying = []
     for v in info.variants {
         if isRecord(v) || len(v.exists) > 0 { return None }
-        if v.arity == 0 { Array.push(nullaries, v.name) }
-        else if v.arity == 1 { Array.push(carrying, v.name) }
+        if v.arity == 0 { Vec.push(nullaries, v.name) }
+        else if v.arity == 1 { Vec.push(carrying, v.name) }
         else { return None }
     }
     if len(nullaries) == 0 || len(nullaries) >= 4096 || len(carrying) != 1 {
@@ -977,8 +971,8 @@ fun substitute(t : Ty.Type, mapping : Map Int Ty.Type) -> Ty.Type = match Ty.pru
 
 -- -- walks over type syntax ---------------------------------------------------------
 
-fun referencedTycons(te : Option Type) -> Array String {
-    let out = Array.new(4)
+fun referencedTycons(te : Option Type) -> Vec String {
+    let out = Vec.new(4)
     match te {
         Some(t) -> referencedInto(t, out)
         None -> {}
@@ -986,9 +980,9 @@ fun referencedTycons(te : Option Type) -> Array String {
     out
 }
 
-fun referencedInto(te : Type, out : Array String) -> Unit = match te.kind {
+fun referencedInto(te : Type, out : Vec String) -> Unit = match te.kind {
     TECon(name, args) -> {
-        Array.push(out, name)
+        Vec.push(out, name)
         for a in args { referencedInto(a, out) }
     }
     TEApp(fn, args) -> {
@@ -1006,13 +1000,13 @@ fun referencedInto(te : Type, out : Array String) -> Unit = match te.kind {
 -- The variables a constructor's bracket binds, in a fixed order: its bare
 -- variables as written, then those its class predicates mention, first
 -- occurrence first.
-fun hiddenVariables(c : ConDecl) -> Array String {
-    let out = Array.new(2)
+fun hiddenVariables(c : ConDecl) -> Vec String {
+    let out = Vec.new(2)
     let seen = Set.new()
     for b in c.binders {
         if !Set.contains(seen, b) {
             Set.add(seen, b)
-            Array.push(out, b)
+            Vec.push(out, b)
         }
     }
     for p in c.context {
@@ -1021,7 +1015,7 @@ fun hiddenVariables(c : ConDecl) -> Array String {
                 match v.kind {
                     TEVar(name) -> if !Set.contains(seen, name) {
                         Set.add(seen, name)
-                        Array.push(out, name)
+                        Vec.push(out, name)
                     }
                     _ -> {}
                 }
@@ -1032,19 +1026,19 @@ fun hiddenVariables(c : ConDecl) -> Array String {
     out
 }
 
-fun conTypes(c : ConDecl) -> Array Type = match c.fields {
-    Some(fs) -> Array.map(fs, _.1)
+fun conTypes(c : ConDecl) -> Vec Type = match c.fields {
+    Some(fs) -> Vec.map(fs, _.1)
     None -> c.args
 }
 
-fun typeVariables(te : Type) -> Array Type {
-    let out = Array.new(4)
+fun typeVariables(te : Type) -> Vec Type {
+    let out = Vec.new(4)
     typeVariablesInto(te, out)
     out
 }
 
-fun typeVariablesInto(te : Type, out : Array Type) -> Unit = match te.kind {
-    TEVar(_) -> Array.push(out, te)
+fun typeVariablesInto(te : Type, out : Vec Type) -> Unit = match te.kind {
+    TEVar(_) -> Vec.push(out, te)
     TETuple(elems) -> for e in elems { typeVariablesInto(e, out) }
     TEFun(params, ret) -> {
         for p in params { typeVariablesInto(p, out) }

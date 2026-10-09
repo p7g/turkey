@@ -210,7 +210,7 @@ fun eachType(e : Core, visit : fun(Ty.Type) -> Unit) -> Unit {
 -- The walk does not look inside an atom: `Item (Pair a)` needs its own layout,
 -- and nothing about `Pair a`'s.
 fun atomsInto(ty : Ty.Type, owned : Set.Set Int, visible : Set.Set Int,
-              out : Array Ty.Type, seen : Set.Set String) -> Unit {
+              out : Vec Ty.Type, seen : Set.Set String) -> Unit {
     let t = Ty.prune(ty)
     if isAtom(t) {
         let take = match t {
@@ -229,7 +229,7 @@ fun atomsInto(ty : Ty.Type, owned : Set.Set Int, visible : Set.Set Int,
         let k = Ty.typeKey(t)
         if take && !Set.contains(seen, k) {
             Set.add(seen, k)
-            Array.push(out, t)
+            Vec.push(out, t)
         }
         return {}
     }
@@ -251,40 +251,40 @@ fun atomsInto(ty : Ty.Type, owned : Set.Set Int, visible : Set.Set Int,
 -- binds them, then its application atoms in `typeKey` order.
 --
 -- `extra` are application atoms its callees need, from `closeAtoms`.
-fun atomsOf(ty : Ty.Type, value : Core, binders : Array VarCell,
-            visible : Set.Set Int, extra : Array Ty.Type) -> Array Ty.Type {
+fun atomsOf(ty : Ty.Type, value : Core, binders : Vec VarCell,
+            visible : Set.Set Int, extra : Vec Ty.Type) -> Vec Ty.Type {
     let owned = Set.new()
     for v in binders { Set.add(owned, v.id) }
     let all = Set.new()
     for v in Set.elements(visible) { Set.add(all, v) }
     for v in binders { Set.add(all, v.id) }
-    let found = Array.new(4)
+    let found = Vec.new(4)
     let seen = Set.new()
     atomsInto(ty, owned, all, found, seen)
     eachType(value, \atomsInto(_, owned, all, found, seen))
     for t in extra { atomsInto(t, owned, all, found, seen) }
-    let out = Array.new(len(found))
+    let out = Vec.new(len(found))
     for v in binders {
-        if isStar(v.kind) { Array.push(out, TVar(v)) }
+        if isStar(v.kind) { Vec.push(out, TVar(v)) }
     }
-    let apps = Array.new(len(found))
+    let apps = Vec.new(len(found))
     for t in found {
         match t {
             TVar(_) -> {}
-            _ -> Array.push(apps, (Ty.typeKey(t), t))
+            _ -> Vec.push(apps, (Ty.typeKey(t), t))
         }
     }
-    for (_, t) in Array.sortBy(apps, fun(x, y) = Array.threeWay(x.0, y.0)) {
-        Array.push(out, t)
+    for (_, t) in Vec.sortBy(apps, fun(x, y) = Array.threeWay(x.0, y.0)) {
+        Vec.push(out, t)
     }
     out
 }
 
 -- Every `CTyApp` of a top-level name anywhere inside a term.
-fun applications(e : Core, out : Array (String, Array Ty.Type)) -> Unit {
+fun applications(e : Core, out : Vec (String, Array Ty.Type)) -> Unit {
     match e.kind {
         CTyApp(fn, args) -> match fn.kind {
-            CVar(n) -> Array.push(out, (n, args))
+            CVar(n) -> Vec.push(out, (n, args))
             _ -> {}
         }
         _ -> {}
@@ -310,11 +310,11 @@ fun applications(e : Core, out : Array (String, Array Ty.Type)) -> Unit {
 -- `t = Wrap a` it may be `Elem a`, which the caller mentions nowhere. So each
 -- one is added to the caller's atoms, until nothing changes.
 fun closeAtoms(binds : Map String CBind, generic : Set.Set String,
-               fams : Map String (Option Ty.Families)) -> Map String (Array Ty.Type) {
+               fams : Map String (Option Ty.Families)) -> Map String (Vec Ty.Type) {
     let extra = Map.new()
     let atoms = Map.new()
     for name in Set.elements(generic) {
-        Map.put(extra, name, Array.new(0))
+        Map.put(extra, name, [])
     }
     var grew = True
     while grew {
@@ -330,7 +330,7 @@ fun closeAtoms(binds : Map String CBind, generic : Set.Set String,
             for v in abstractionBinders(b) { Set.add(owned, v.id) }
             let have = Set.new()
             for t in atoms[name] { Set.add(have, Ty.typeKey(t)) }
-            let uses = Array.new(4)
+            let uses = Vec.new(4)
             applications(b.value, uses)
             for (callee, args) in uses {
                 if !Set.contains(generic, callee) { continue }
@@ -347,13 +347,13 @@ fun closeAtoms(binds : Map String CBind, generic : Set.Set String,
                     }
                     let t = Typed.reduceDeep(Decls.substitute(atom, mapping),
                                              fams[name])
-                    let found = Array.new(2)
+                    let found = Vec.new(2)
                     atomsInto(t, owned, owned, found, Set.new())
                     for a in found {
                         let k = Ty.typeKey(a)
                         if !Set.contains(have, k) {
                             Set.add(have, k)
-                            Array.push(extra[name], a)
+                            Vec.push(extra[name], a)
                             grew = True
                         }
                     }
@@ -371,18 +371,18 @@ fun closeAtoms(binds : Map String CBind, generic : Set.Set String,
 
 -- The layouts of `atoms` at one call, under the caller's `layouts`; or the
 -- first atom whose layout the caller cannot know.
-fun keyAt(s : Sharer, atoms : Array Ty.Type, binders : Array VarCell,
+fun keyAt(s : Sharer, atoms : Vec Ty.Type, binders : Vec VarCell,
           args : Array Ty.Type, fams : Option Ty.Families,
-          layouts : Map String String) -> Either Ty.Type (Array String) {
+          layouts : Map String String) -> Either Ty.Type (Vec String) {
     let mapping = Map.new()
     for var i = 0; i < len(binders) && i < len(args); i = i + 1 {
         Map.put(mapping, binders[i].id, args[i])
     }
-    let out = Array.new(len(atoms))
+    let out = Vec.new(len(atoms))
     for atom in atoms {
         let t = Typed.reduceDeep(Decls.substitute(atom, mapping), fams)
         match layoutOf(s.decls, t, layouts) {
-            Some(l) -> Array.push(out, l)
+            Some(l) -> Vec.push(out, l)
             None -> return Left(t)
         }
     }
@@ -467,7 +467,7 @@ type Sharer = Sharer {
     binds   : Map String CBind,
     -- Every top-level binding that abstracts a type: all of them are copied.
     generic : Set.Set String,
-    atoms   : Map String (Array Ty.Type),
+    atoms   : Map String (Vec Ty.Type),
     -- Each binding's families, with the equations it was checked under.
     fams    : Map String (Option Ty.Families),
     -- Which layout keys each existential constructor is packed at, when known;
@@ -477,8 +477,8 @@ type Sharer = Sharer {
     -- "original|key" -> the name built for it.
     done    : Map String String,
     -- original -> the copies, in request order.
-    made    : Map String (Array CBind),
-    queue   : Array (String, String, Array String),
+    made    : Map String (Vec CBind),
+    queue   : Vec (String, String, Vec String),
     used    : Set.Set String,
     -- The keys of a method's own variables that some call through an unknown
     -- dictionary uses: `keys` as this run was started with, so every dictionary
@@ -490,7 +490,7 @@ type Sharer = Sharer {
 
 -- Class -> method -> layout key -> the key's layouts, one per atom of the
 -- method's own variables.
-type Keys = Map String (Map String (Map String (Array String)))
+type Keys = Map String (Map String (Map String (Vec String)))
 
 -- Where a term is being rewritten.
 --
@@ -504,7 +504,7 @@ type Keys = Map String (Map String (Map String (Array String)))
 type Scope = Scope {
     owner  : String,
     chain  : Array (Map String String),
-    locals : Array (Map String Local),
+    locals : Vec (Map String Local),
 }
 
 -- A generalized binding inside a body, and its copies.
@@ -512,15 +512,15 @@ type Local = Local {
     name      : String,
     ty        : Ty.Type,
     value     : Core,
-    binders   : Array VarCell,
-    atoms     : Array Ty.Type,
+    binders   : Vec VarCell,
+    atoms     : Vec Ty.Type,
     -- A copy's original, for the fields `CLetRec` keeps on a binding.
     bind      : Option CBind,
     -- key -> the copy's name.
     done      : Map String String,
     -- The copies requested and not yet built: name, renaming, fresh binders.
-    var queue : Array (String, Map Int Ty.Type, Array VarCell),
-    built     : Array (String, Ty.Type, Core, Array VarCell, Map Int Ty.Type),
+    var queue : Vec (String, Map Int Ty.Type, Vec VarCell),
+    built     : Vec (String, Ty.Type, Core, Vec VarCell, Map Int Ty.Type),
 }
 
 fun current(sc : Scope) -> Map String String = sc.chain[len(sc.chain) - 1]
@@ -582,12 +582,12 @@ fun mergeKeys(into : Keys, more : Keys) -> Bool {
 fun publish(classes : ClassTable, keys : Keys) -> Unit {
     for (cls, methods) in Map.entries(keys) {
         Map.put(classes.keyed, cls, [])
-        let order = Array.new(4)
+        let order = Vec.new(4)
         for slot in Classes.dictSlots(classes, cls) {
             match slot {
                 MethodSlot(m) -> match Map.get(methods, m) {
                     Some(found) -> for k in Array.sort(Map.keys(found)) {
-                        Array.push(order, (m, k))
+                        Vec.push(order, (m, k))
                     }
                     None -> {}
                 }
@@ -599,18 +599,18 @@ fun publish(classes : ClassTable, keys : Keys) -> Unit {
 }
 
 fun opensAnywhere(program : CProgram) -> Bool {
-    let found = Array.new(1)
-    for b in Array.append(program.dicts, program.binds) {
+    let found = Vec.new(1)
+    for b in Vec.append(program.dicts, program.binds) {
         opensInto(b.value, found)
     }
     len(found) > 0
 }
 
-fun opensInto(e : Core, found : Array Bool) -> Unit {
+fun opensInto(e : Core, found : Vec Bool) -> Unit {
     if len(found) > 0 { return {} }
     match e.kind {
         CMatch(_, alts) -> for alt in alts {
-            if Option.isSome(openingOf(alt.alt)) { Array.push(found, True) }
+            if Option.isSome(openingOf(alt.alt)) { Vec.push(found, True) }
         }
         _ -> {}
     }
@@ -633,7 +633,7 @@ fun shareOnce(program : CProgram, decls : DeclTable, classes : ClassTable,
     let binds = Map.new()
     let generic = Set.new()
     let fams = Map.new()
-    for b in Array.append(program.dicts, program.binds) {
+    for b in Vec.append(program.dicts, program.binds) {
         Map.put(binds, b.name, b)
         -- `main` is called by the entry, at no types, and never by the
         -- program: a `main` that generalized -- one ending in `exit`, whose
@@ -648,7 +648,7 @@ fun shareOnce(program : CProgram, decls : DeclTable, classes : ClassTable,
     let s = Sharer {
         decls = decls, classes = classes, binds = binds, generic = generic,
         atoms = closeAtoms(binds, generic, fams), fams = fams, packed = packed,
-        done = Map.new(), made = Map.new(), queue = Array.new(8), used = used,
+        done = Map.new(), made = Map.new(), queue = Vec.new(8), used = used,
         keys = keys, asked = Map.new(),
     }
 
@@ -659,7 +659,7 @@ fun shareOnce(program : CProgram, decls : DeclTable, classes : ClassTable,
             for (k, l) in Map.entries(b.layouts) { Map.put(layouts, k, l) }
             defaultsInto(b, layouts, False)
             let value = rewrite(s, b.value, Scope {
-                owner = name, chain = [layouts], locals = Array.new(2),
+                owner = name, chain = [layouts], locals = Vec.new(2),
             })
             let out = withValue(b, value)
             out.layouts = layouts
@@ -675,27 +675,27 @@ fun shareOnce(program : CProgram, decls : DeclTable, classes : ClassTable,
         at = at + 1
         let copy = build(s, name, original, parts)
         match Map.get(s.made, original) {
-            Some(found) -> Array.push(found, copy)
+            Some(found) -> Vec.push(found, copy)
             None -> Map.put(s.made, original, [copy])
         }
     }
 
     let kept = reachable(s, rewritten)
-    let dicts = Array.new(len(program.dicts))
-    let rest = Array.new(len(program.binds))
+    let dicts = Vec.new(len(program.dicts))
+    let rest = Vec.new(len(program.binds))
     for b in program.dicts { emit(s, kept, rewritten, b, dicts) }
     for b in program.binds { emit(s, kept, rewritten, b, rest) }
     (CProgram { dicts = dicts, binds = rest }, s.asked)
 }
 
 fun emit(s : Sharer, kept : Set.Set String, rewritten : Map String CBind,
-         b : CBind, out : Array CBind) -> Unit {
+         b : CBind, out : Vec CBind) -> Unit {
     -- Beside the original and ahead of it, as `Turkey.Mono` places its
     -- specializations, and for the same reason: a copy depends on no more than
     -- the original does, and top-level bindings are evaluated in this order.
-    for copy in Map.getOr(s.made, b.name, Array.new(0)) { Array.push(out, copy) }
+    for copy in Map.getOr(s.made, b.name, []) { Vec.push(out, copy) }
     if Set.contains(kept, b.name) {
-        Array.push(out, Map.getOr(rewritten, b.name, b))
+        Vec.push(out, Map.getOr(rewritten, b.name, b))
     }
 }
 
@@ -743,7 +743,7 @@ fun reachable(s : Sharer, rewritten : Map String CBind) -> Set.Set String {
     live
 }
 
-fun request(s : Sharer, name : String, parts : Array String) -> String {
+fun request(s : Sharer, name : String, parts : Vec String) -> String {
     let k = String.join(parts, ",")
     let slot = name + "|" + k
     match Map.get(s.done, slot) {
@@ -757,12 +757,12 @@ fun request(s : Sharer, name : String, parts : Array String) -> String {
     -- binding terminate: the copy's own call to itself, at its own layouts,
     -- finds this entry rather than asking for another copy.
     Map.put(s.done, slot, made)
-    Array.push(s.queue, (made, name, parts))
+    Vec.push(s.queue, (made, name, parts))
     made
 }
 
 fun build(s : Sharer, made : String, original : String,
-          parts : Array String) -> CBind {
+          parts : Vec String) -> CBind {
     let b = s.binds[original]
     let layouts = Map.new()
     let atoms = s.atoms[original]
@@ -771,7 +771,7 @@ fun build(s : Sharer, made : String, original : String,
     }
     defaultsInto(b, layouts, True)
     let copy = withValue(b, rewrite(s, b.value, Scope {
-        owner = original, chain = [layouts], locals = Array.new(2),
+        owner = original, chain = [layouts], locals = Vec.new(2),
     }))
     copy.name = made
     copy.layouts = layouts
@@ -832,7 +832,7 @@ fun rewrite(s : Sharer, e : Core, sc : Scope) -> Core {
             if any { return localRec(s, e, binds, body, sc) }
         }
         CLet(name, bound, value, body, binders) -> {
-            let all = Array.append(binders, spineBinders(value))
+            let all = Vec.append(binders, spineBinders(value))
             if len(all) > 0 {
                 return localLet(s, e, name, bound, value, body, binders, all, sc)
             }
@@ -867,30 +867,30 @@ fun requestAt(s : Sharer, sc : Scope, n : String, args : Array Ty.Type,
 -- -- methods polymorphic in their own variables --------------------------------------
 
 -- A method's own variables: the ones its scheme quantifies besides the class's.
-fun ownVars(m : MethodInfo) -> Array VarCell =
-    Array.filter(m.scheme.quantified, \_.id != m.classVar.id)
+fun ownVars(m : MethodInfo) -> Vec VarCell =
+    Vec.filter(m.scheme.quantified, \_.id != m.classVar.id)
 
 -- The atoms of a method's own variables, in key order: the variables of kind
 -- `*`, then the applications over them alone in its declared type.
-fun methodAtoms(m : MethodInfo) -> Array Ty.Type {
+fun methodAtoms(m : MethodInfo) -> Vec Ty.Type {
     let own = ownVars(m)
     let owned = Set.new()
     for v in own { Set.add(owned, v.id) }
-    let found = Array.new(2)
+    let found = Vec.new(2)
     atomsInto(m.scheme.body, owned, owned, found, Set.new())
-    let out = Array.new(len(own))
+    let out = Vec.new(len(own))
     for v in own {
-        if isStar(v.kind) { Array.push(out, TVar(v)) }
+        if isStar(v.kind) { Vec.push(out, TVar(v)) }
     }
-    let apps = Array.new(len(found))
+    let apps = Vec.new(len(found))
     for t in found {
         match t {
             TVar(_) -> {}
-            _ -> Array.push(apps, (Ty.typeKey(t), t))
+            _ -> Vec.push(apps, (Ty.typeKey(t), t))
         }
     }
-    for (_, t) in Array.sortBy(apps, fun(x, y) = Array.threeWay(x.0, y.0)) {
-        Array.push(out, t)
+    for (_, t) in Vec.sortBy(apps, fun(x, y) = Array.threeWay(x.0, y.0)) {
+        Vec.push(out, t)
     }
     out
 }
@@ -963,7 +963,7 @@ fun dictionarySlots(s : Sharer, e : Core, cls : String, slots : Array Core,
     let head = match Ty.spine(Ty.prune(e.ty)) {
         (_, args) -> if len(args) == 1 { args[0] } else { e.ty }
     }
-    let out = Array.new(len(slots))
+    let out = Vec.new(len(slots))
     -- method -> key -> the copy compiled for it.
     let copies = Map.new()
     -- method -> the one value every key of it shares.
@@ -973,7 +973,7 @@ fun dictionarySlots(s : Sharer, e : Core, cls : String, slots : Array Core,
         let found = match methodAt(s, cls, i) {
             Some(f) -> f
             None -> {
-                Array.push(out, rewrite(s, value, sc))
+                Vec.push(out, rewrite(s, value, sc))
                 continue
             }
         }
@@ -984,15 +984,15 @@ fun dictionarySlots(s : Sharer, e : Core, cls : String, slots : Array Core,
         }
         let vs = match fieldVars(m, head, inner) {
             Some(found) -> found
-            None -> Array.new(0)
+            None -> []
         }
         if len(vs) == 0 || len(unknownBinders(vs, sc)) == 0 {
             let made = rewrite(s, value, sc)
-            Array.push(out, made)
+            Vec.push(out, made)
             Map.put(shared, name, made)
             continue
         }
-        Array.push(out, methodStub(value, stated, vs, inner, sc))
+        Vec.push(out, methodStub(value, stated, vs, inner, sc))
         let own = ownVars(m)
         let atoms = methodAtoms(m)
         let made = Map.new()
@@ -1000,7 +1000,7 @@ fun dictionarySlots(s : Sharer, e : Core, cls : String, slots : Array Core,
         let asked = Map.getOr(Map.getOr(s.keys, cls, Map.new()), name, Map.new())
         for k in Array.sort(Map.keys(asked)) {
             let parts = asked[k]
-            let fresh = Array.map(vs, fun(v) = Ty.newVar(v.level, v.kind))
+            let fresh = Vec.map(vs, fun(v) = Ty.newVar(v.level, v.kind))
             let renaming = Map.new()
             let toFresh = Map.new()
             for var j = 0; j < len(vs) && j < len(own); j = j + 1 {
@@ -1026,12 +1026,12 @@ fun dictionarySlots(s : Sharer, e : Core, cls : String, slots : Array Core,
             None -> Map.get(shared, method)
         }
         match filled {
-            Some(v) -> Array.push(out, v)
+            Some(v) -> Vec.push(out, v)
             None -> oopsAt("no value for the '" + method + "' slot at key " + k
                            + " of a '" + cls + "' dictionary", e)
         }
     }
-    mkCore(e.ty, e.span, CDict(cls, out))
+    mkCore(e.ty, e.span, CDict(cls, Vec.toArray(out)))
 }
 
 -- The variables a dictionary field's value has where its method's own are, in
@@ -1040,7 +1040,7 @@ fun dictionarySlots(s : Sharer, e : Core, cls : String, slots : Array Core,
 -- Read by matching the method's type at this dictionary's head against the
 -- value's: a field states its own quantification as a type abstraction or
 -- leaves it as variables its value is free in, and the matching finds either.
-fun fieldVars(m : MethodInfo, head : Ty.Type, inner : Core) -> Option (Array VarCell) {
+fun fieldVars(m : MethodInfo, head : Ty.Type, inner : Core) -> Option (Vec VarCell) {
     let mapping = Map.new()
     Map.put(mapping, m.classVar.id, head)
     let want = Decls.substitute(m.scheme.body, mapping)
@@ -1052,11 +1052,11 @@ fun fieldVars(m : MethodInfo, head : Ty.Type, inner : Core) -> Option (Array Var
     }
     let found = Map.new()
     if !matchTypes(want, got, found) { return None }
-    let out = Array.new(2)
+    let out = Vec.new(2)
     for v in ownVars(m) {
         match Map.get(found, v.id) {
             Some(t) -> match Ty.prune(t) {
-                TVar(cell) -> Array.push(out, cell)
+                TVar(cell) -> Vec.push(out, cell)
                 _ -> return None
             }
             None -> return None
@@ -1066,20 +1066,20 @@ fun fieldVars(m : MethodInfo, head : Ty.Type, inner : Core) -> Option (Array Var
 }
 
 -- The variables of kind `*` among `vs` that the scope has no layout for.
-fun unknownBinders(vs : Array VarCell, sc : Scope) -> Array VarCell =
-    Array.filter(vs, fun(v) =
+fun unknownBinders(vs : Vec VarCell, sc : Scope) -> Vec VarCell =
+    Vec.filter(vs, fun(v) =
         isStar(v.kind) && !Map.contains(current(sc), Ty.typeKey(TVar(v))))
 
 -- `unit` for every atom of `ty` over `vs`, in every map on the chain.
-fun defaultAtoms(vs : Array VarCell, ty : Ty.Type, sc : Scope) -> Unit {
+fun defaultAtoms(vs : Vec VarCell, ty : Ty.Type, sc : Scope) -> Unit {
     if len(vs) == 0 { return {} }
     let owned = Set.new()
     for v in vs { Set.add(owned, v.id) }
     let visible = Set.new()
     for v in Ty.varsOf([ty]) { Set.add(visible, v.id) }
-    let atoms = Array.new(4)
+    let atoms = Vec.new(4)
     atomsInto(ty, owned, visible, atoms, Set.new())
-    for v in vs { Array.push(atoms, TVar(v)) }
+    for v in vs { Vec.push(atoms, TVar(v)) }
     for t in atoms {
         for layouts in sc.chain {
             let k = Ty.typeKey(t)
@@ -1098,7 +1098,7 @@ fun defaultAtoms(vs : Array VarCell, ty : Ty.Type, sc : Scope) -> Unit {
 -- one reads the keyed slot for its key (`dynamicCall`), so nothing calls
 -- this. Its atoms are given `unit`, which is as good as any layout for
 -- parameters nothing reads.
-fun methodStub(e : Core, stated : Option (Array VarCell), vs : Array VarCell,
+fun methodStub(e : Core, stated : Option (Vec VarCell), vs : Vec VarCell,
                body : Core, sc : Scope) -> Core {
     defaultAtoms(vs, body.ty, sc)
     let (params, result) = match Ty.prune(body.ty) {
@@ -1106,11 +1106,10 @@ fun methodStub(e : Core, stated : Option (Array VarCell), vs : Array VarCell,
         _ -> oopsAt("a type abstraction in '" + sc.owner + "' that is not a "
                     + "method and whose layouts are not known", e)
     }
-    let names = Array.new(len(params))
-    for var i = 0; i < len(params); i = i + 1 {
-        Array.push(names, CParam { name = "%unused" + Int.toString(i),
-                                   ty = params[i] })
-    }
+    let names = Array.init(len(params), fun(i) {
+        CParam { name = "%unused" + Int.toString(i),
+                                   ty = params[i] }
+    })
     let message = mkCore(Ty.tString(), e.span, CLit(LString(
         "internal error: a dictionary method was called at layouts it was not "
         + "compiled for")))
@@ -1124,14 +1123,14 @@ fun methodStub(e : Core, stated : Option (Array VarCell), vs : Array VarCell,
 }
 
 -- The binders a value states in a `CTyLam` on its spine.
-fun spineBinders(value : Core) -> Array VarCell {
-    let out = Array.new(2)
+fun spineBinders(value : Core) -> Vec VarCell {
+    let out = Vec.new(2)
     var e = value
     loop {
         match e.kind {
             CLam(_, body, _) -> { e = body }
             CTyLam(vs, body) -> {
-                for v in vs { Array.push(out, v) }
+                for v in vs { Vec.push(out, v) }
                 e = body
             }
             _ -> break
@@ -1167,10 +1166,10 @@ fun visibleIn(s : Sharer, sc : Scope) -> Set.Set Int {
 }
 
 fun newLocal(s : Sharer, sc : Scope, name : String, ty : Ty.Type, value : Core,
-             binders : Array VarCell, bind : Option CBind) -> Local = Local {
+             binders : Vec VarCell, bind : Option CBind) -> Local = Local {
     name = name, ty = ty, value = value, binders = binders,
-    atoms = atomsOf(ty, value, binders, visibleIn(s, sc), Array.new(0)),
-    bind = bind, done = Map.new(), queue = Array.new(2), built = Array.new(2),
+    atoms = atomsOf(ty, value, binders, visibleIn(s, sc), []),
+    bind = bind, done = Map.new(), queue = Vec.new(2), built = Vec.new(2),
 }
 
 -- The copy of a local binding a use at `args` means.
@@ -1198,10 +1197,10 @@ fun requestLocal(s : Sharer, sc : Scope, local : Local, args : Array Ty.Type,
     }
     let made = local.name + "@[" + k + "]"
     let renaming = Map.new()
-    let fresh = Array.new(len(local.binders))
+    let fresh = Vec.new(len(local.binders))
     for v in local.binders {
         let w = Ty.newVar(v.level, v.kind)
-        Array.push(fresh, w)
+        Vec.push(fresh, w)
         Map.put(renaming, v.id, TVar(w))
     }
     for var i = 0; i < len(local.atoms) && i < len(parts); i = i + 1 {
@@ -1209,13 +1208,13 @@ fun requestLocal(s : Sharer, sc : Scope, local : Local, args : Array Ty.Type,
         for layouts in sc.chain { Map.put(layouts, key, parts[i]) }
     }
     Map.put(local.done, k, made)
-    Array.push(local.queue, (made, renaming, fresh))
+    Vec.push(local.queue, (made, renaming, fresh))
     made
 }
 
 -- Build every copy requested of these locals, including the ones requested
 -- while building the others.
-fun drainLocals(s : Sharer, locals : Array Local, sc : Scope) -> Unit {
+fun drainLocals(s : Sharer, locals : Vec Local, sc : Scope) -> Unit {
     var going = True
     while going {
         going = False
@@ -1223,11 +1222,11 @@ fun drainLocals(s : Sharer, locals : Array Local, sc : Scope) -> Unit {
             while len(local.queue) > 0 {
                 going = True
                 let batch = local.queue
-                local.queue = Array.new(2)
+                local.queue = Vec.new(2)
                 for (made, renaming, fresh) in batch {
                     let value = rewrite(s, renamedSpine(
                         Opt.instantiateTypes(local.value, renaming), renaming), sc)
-                    Array.push(local.built, (made, Decls.substitute(local.ty, renaming),
+                    Vec.push(local.built, (made, Decls.substitute(local.ty, renaming),
                                              value, fresh, renaming))
                 }
             }
@@ -1237,28 +1236,28 @@ fun drainLocals(s : Sharer, locals : Array Local, sc : Scope) -> Unit {
 
 -- A group of local functions some of which generalized: the ones that did are
 -- replaced by their copies, and dropped if nothing uses them.
-fun localRec(s : Sharer, e : Core, binds : Array CBind, body : Core,
+fun localRec(s : Sharer, e : Core, binds : Vec CBind, body : Core,
              sc : Scope) -> Core {
     let scope = Map.new()
-    let locals = Array.new(len(binds))
-    Array.push(sc.locals, scope)
+    let locals = Vec.new(len(binds))
+    Vec.push(sc.locals, scope)
     for b in binds {
         let binders = abstractionBinders(b)
         if len(binders) > 0 {
             let local = newLocal(s, sc, b.name, b.ty, b.value, binders, Some(b))
             Map.put(scope, b.name, local)
-            Array.push(locals, local)
+            Vec.push(locals, local)
         }
     }
     let rest = rewrite(s, body, sc)
-    let out = Array.new(len(binds))
+    let out = Vec.new(len(binds))
     for b in binds {
         if len(abstractionBinders(b)) == 0 {
-            Array.push(out, withValue(b, rewrite(s, b.value, sc)))
+            Vec.push(out, withValue(b, rewrite(s, b.value, sc)))
         }
     }
     drainLocals(s, locals, sc)
-    discard(Array.pop(sc.locals))
+    discard(Vec.pop(sc.locals))
     for local in locals {
         let original = match local.bind {
             Some(b) -> b
@@ -1267,24 +1266,24 @@ fun localRec(s : Sharer, e : Core, binds : Array CBind, body : Core,
         for (made, ty, value, fresh, renaming) in local.built {
             -- The original states its binders in `binders`, on the spine, or
             -- both; the copy states them where it did, renamed.
-            let own = Array.new(len(original.binders))
+            let own = Vec.new(len(original.binders))
             for v in original.binders {
                 match Map.get(renaming, v.id) {
-                    Some(TVar(w)) -> Array.push(own, w)
-                    _ -> Array.push(own, v)
+                    Some(TVar(w)) -> Vec.push(own, w)
+                    _ -> Vec.push(own, v)
                 }
             }
             let copy = CBind {
                 name = made, ty = ty, binders = own, value = value,
                 span = original.span, mutable = original.mutable,
                 module_ = original.module_,
-                equations = Array.map(original.equations, fun(pair) = {
+                equations = Vec.map(original.equations, fun(pair) = {
                     let (l, r) = pair
                     (Decls.substitute(l, renaming), Decls.substitute(r, renaming))
                 }),
                 layouts = original.layouts,
             }
-            Array.push(out, copy)
+            Vec.push(out, copy)
         }
     }
     if len(out) == 0 { return rest }
@@ -1294,25 +1293,25 @@ fun localRec(s : Sharer, e : Core, binds : Array CBind, body : Core,
 -- A `let` that generalized: its copies, each bound around the body, and not the
 -- original.
 fun localLet(s : Sharer, e : Core, name : String, bound : Ty.Type, value : Core,
-             body : Core, stated : Array VarCell, binders : Array VarCell,
+             body : Core, stated : Vec VarCell, binders : Vec VarCell,
              sc : Scope) -> Core {
     let local = newLocal(s, sc, name, bound, value, binders, None)
     let scope = Map.new()
     Map.put(scope, name, local)
-    Array.push(sc.locals, scope)
+    Vec.push(sc.locals, scope)
     let rest = rewrite(s, body, sc)
-    discard(Array.pop(sc.locals))
+    discard(Vec.pop(sc.locals))
     -- The value cannot name the binding it defines, so its copies are built
     -- with the binding out of scope.
     drainLocals(s, [local], sc)
     var out = rest
     for var i = len(local.built) - 1; i >= 0; i = i - 1 {
         let (made, ty, v, _, renaming) = local.built[i]
-        let own = Array.new(len(stated))
+        let own = Vec.new(len(stated))
         for b in stated {
             match Map.get(renaming, b.id) {
-                Some(TVar(w)) -> Array.push(own, w)
-                _ -> Array.push(own, b)
+                Some(TVar(w)) -> Vec.push(own, w)
+                _ -> Vec.push(own, b)
             }
         }
         out = mkCore(e.ty, e.span, CLet(made, ty, v, out, own))
@@ -1324,7 +1323,7 @@ fun localLet(s : Sharer, e : Core, name : String, bound : Ty.Type, value : Core,
 fun renamedSpine(e : Core, renaming : Map Int Ty.Type) -> Core = match e.kind {
     CLam(params, body, name) ->
         mkCore(e.ty, e.span, CLam(params, renamedSpine(body, renaming), name))
-    CTyLam(vs, body) -> mkCore(e.ty, e.span, CTyLam(Array.map(vs, fun(v) =
+    CTyLam(vs, body) -> mkCore(e.ty, e.span, CTyLam(Vec.map(vs, fun(v) =
         match Map.get(renaming, v.id) {
             Some(TVar(w)) -> w
             _ -> v
@@ -1340,15 +1339,15 @@ fun renamedSpine(e : Core, renaming : Map Int Ty.Type) -> Core = match e.kind {
 -- Only types of kind `*` classify values; a constructor like `f` in `Functor f`
 -- has no layout and needs none. The walk does not look inside an atom, for the
 -- reason `atomsInto` does not.
-fun unknownLayouts(program : CProgram, decls : DeclTable) -> Array String {
-    let each = Parallel.map(Array.append(program.dicts, program.binds), unknownOf(decls, _))
-    let out = Array.new(0)
-    for found in each { for k in found { Array.push(out, k) } }
+fun unknownLayouts(program : CProgram, decls : DeclTable) -> Vec String {
+    let each = Parallel.map(Vec.append(program.dicts, program.binds), unknownOf(decls, _))
+    let out = []
+    for found in each { for k in found { Vec.push(out, k) } }
     out
 }
 
-fun unknownOf(decls : DeclTable, b : CBind) -> Array String {
-    let out = Array.new(0)
+fun unknownOf(decls : DeclTable, b : CBind) -> Vec String {
+    let out = []
     let seen = Set.new()
     let report = fun(t : Ty.Type, layouts : Map String String) = {
         match unknownIn(decls, t, layouts) {
@@ -1356,7 +1355,7 @@ fun unknownOf(decls : DeclTable, b : CBind) -> Array String {
                 let k = Ty.show(bad)
                 if !Set.contains(seen, k) {
                     Set.add(seen, k)
-                    Array.push(out, b.name + ": " + k)
+                    Vec.push(out, b.name + ": " + k)
                 }
             }
             None -> {}
@@ -1435,10 +1434,10 @@ fun unknownInto(e : Core, layouts : Map String String,
 
 -- -- existentials -------------------------------------------------------------------
 
-fun openArms(s : Sharer, e : Core, scrutinee : Core, alts : Array CAlt,
+fun openArms(s : Sharer, e : Core, scrutinee : Core, alts : Vec CAlt,
              sc : Scope) -> Core {
     let abstracted = current(sc)
-    let out = Array.new(len(alts))
+    let out = Vec.new(len(alts))
     for alt in alts {
         match alt.alt {
             ACon(name, fields, Some(o)) -> if Option.isNone(o.layouts) {
@@ -1447,14 +1446,14 @@ fun openArms(s : Sharer, e : Core, scrutinee : Core, alts : Array CAlt,
                         evidence = o.evidence, skolems = o.skolems,
                         layouts = Some(String.split(k, ",")),
                     }))
-                    Array.push(out, CAlt { alt = copy,
+                    Vec.push(out, CAlt { alt = copy,
                                            body = rewrite(s, alt.body, inArm(sc, copy)) })
                 }
                 continue
             }
             _ -> {}
         }
-        Array.push(out, CAlt { alt = alt.alt, body = rewrite(s, alt.body, inArm(sc, alt.alt)) })
+        Vec.push(out, CAlt { alt = alt.alt, body = rewrite(s, alt.body, inArm(sc, alt.alt)) })
     }
     mkCore(e.ty, e.span, CMatch(rewrite(s, scrutinee, sc), out))
 }
@@ -1463,7 +1462,7 @@ fun openArms(s : Sharer, e : Core, scrutinee : Core, alts : Array CAlt,
 -- layouts for its constants -- unless the value being opened is a packing
 -- right here, in which case it is the one key that packing stores.
 fun openingKeys(s : Sharer, scrutinee : Core, name : String, o : Opening,
-                abstracted : Map String String) -> Array String {
+                abstracted : Map String String) -> Vec String {
     match knownKey(s, scrutinee, name, abstracted) {
         Some(k) -> return [k]
         None -> {}
@@ -1472,13 +1471,13 @@ fun openingKeys(s : Sharer, scrutinee : Core, name : String, o : Opening,
         None -> None
         Some(table) -> Some(Map.getOr(table, name, Set.new()))
     }
-    let keys = Array.new(8)
+    let keys = Vec.new(8)
     for k in keyChoices(len(o.skolems)) {
         let take = match allowed {
             None -> True
             Some(set) -> Set.contains(set, k)
         }
-        if take { Array.push(keys, k) }
+        if take { Vec.push(keys, k) }
     }
     keys
 }
@@ -1503,13 +1502,13 @@ fun inArm(sc : Scope, alt : Alt) -> Scope {
 }
 
 -- Every key of `n` layouts, as the comma-joined strings the copies are named by.
-fun keyChoices(n : Int) -> Array String {
+fun keyChoices(n : Int) -> Vec String {
     var out = [""]
     for var i = 0; i < n; i = i + 1 {
-        let next = Array.new(len(out) * len(openedLayouts))
+        let next = Vec.new(len(out) * len(openedLayouts))
         for prefix in out {
             for layout in openedLayouts {
-                Array.push(next, if prefix == "" { layout }
+                Vec.push(next, if prefix == "" { layout }
                                  else { prefix + "," + layout })
             }
         }
@@ -1556,19 +1555,19 @@ fun declaredFields(info : ConInfo) -> Array Ty.Type = match info.scheme.body {
 }
 
 fun packedKeyParts(decls : DeclTable, info : ConInfo, args : Array Core,
-                   abstracted : Map String String) -> Option (Array String) {
+                   abstracted : Map String String) -> Option (Vec String) {
     let found = Map.new()
     let declared = declaredFields(info)
     let carried = len(info.scheme.preds)
     for var i = 0; i < len(declared) && carried + i < len(args); i = i + 1 {
         discard(matchTypes(declared[i], Ty.prune(args[carried + i].ty), found))
     }
-    let out = Array.new(len(info.exists))
+    let out = Vec.new(len(info.exists))
     for v in info.exists {
         match Map.get(found, v.id) {
             None -> return None
             Some(packedTy) -> match layoutOf(decls, packedTy, abstracted) {
-                Some(l) -> Array.push(out, l)
+                Some(l) -> Vec.push(out, l)
                 None -> return None
             }
         }
@@ -1627,9 +1626,9 @@ fun matchTypes(pattern : Ty.Type, target : Ty.Type,
 -- somewhere.
 fun packedLayouts(program : CProgram,
                   decls : DeclTable) -> Map String (Set.Set String) {
-    let records = Array.new(8)
-    for b in Array.append(program.dicts, program.binds) {
-        packingsInto(decls, b.value, b.layouts, Array.new(0), records)
+    let records = Vec.new(8)
+    for b in Vec.append(program.dicts, program.binds) {
+        packingsInto(decls, b.value, b.layouts, [], records)
     }
     let live = Map.new()
     var grew = True
@@ -1667,16 +1666,16 @@ fun packedLayouts(program : CProgram,
     live
 }
 
-fun existsOf(decls : DeclTable, name : String) -> Array VarCell =
+fun existsOf(decls : DeclTable, name : String) -> Vec VarCell =
     match Decls.con(decls, name) {
         Some(info) -> info.exists
-        None -> Array.new(0)
+        None -> []
     }
 
 fun packingsInto(decls : DeclTable, e : Core, abstracted : Map String String,
-                 conditions : Array (String, String),
-                 out : Array (String, Option String,
-                              Array (String, String))) -> Unit {
+                 conditions : Vec (String, String),
+                 out : Vec (String, Option String,
+                              Vec (String, String))) -> Unit {
     match e.kind {
         CMatch(scrutinee, alts) -> {
             packingsInto(decls, scrutinee, abstracted, conditions, out)
@@ -1685,8 +1684,8 @@ fun packingsInto(decls : DeclTable, e : Core, abstracted : Map String String,
                 for (id_, layout) in Map.entries(abstracted) {
                     Map.put(inner, id_, layout)
                 }
-                let held = Array.new(len(conditions))
-                for c in conditions { Array.push(held, c) }
+                let held = Vec.new(len(conditions))
+                for c in conditions { Vec.push(held, c) }
                 match alt.alt {
                     ACon(name, _, Some(o)) -> match o.layouts {
                         Some(ls) -> {
@@ -1694,7 +1693,7 @@ fun packingsInto(decls : DeclTable, e : Core, abstracted : Map String String,
                                 j = j + 1 {
                                 Map.put(inner, skolemKey(o.skolems[j]), ls[j])
                             }
-                            Array.push(held, (name, String.join(ls, ",")))
+                            Vec.push(held, (name, String.join(ls, ",")))
                         }
                         None -> {}
                     }
@@ -1707,7 +1706,7 @@ fun packingsInto(decls : DeclTable, e : Core, abstracted : Map String String,
         CApp(fn, args) -> match fn.kind {
             CCon(name) -> match Decls.con(decls, name) {
                 Some(info) -> if len(info.exists) > 0 {
-                    Array.push(out, (name, packedKey(decls, info, args,
+                    Vec.push(out, (name, packedKey(decls, info, args,
                                                      abstracted), conditions))
                 }
                 None -> {}

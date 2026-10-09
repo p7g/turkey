@@ -27,9 +27,9 @@ import Turkey.Token as Token
 import Turkey.Token (Kind(..), Token(..), Value(..))
 
 type P = P {
-    toks         : Array Token,
+    toks         : Vec Token,
     var i        : Int,
-    tycons       : Array String,
+    tycons       : Vec String,
     var noRecord : Bool,
     file         : String,
     -- How many `\` functions enclose the current position. Inside one, every
@@ -40,12 +40,12 @@ type P = P {
     var pending  : Int,
 }
 
-fun parse(source : Source, known : Array String) -> Program {
+fun parse(source : Source, known : Vec String) -> Program {
     let toks = Lexer.tokenize(source)
     let p = P {
         toks = toks,
         i = 0,
-        tycons = Array.append(collectTycons(toks), known),
+        tycons = Vec.append(collectTycons(toks), known),
         noRecord = False,
         file = source.name,
         explicit = 0,
@@ -56,11 +56,11 @@ fun parse(source : Source, known : Array String) -> Program {
 
 -- The pre-pass: every `type CONID` name declared in this file, so that a
 -- declaration can mention a type constructor declared after it.
-fun collectTycons(toks : Array Token) -> Array String {
-    let names = Array.slice(builtinTycons, 0, len(builtinTycons))
+fun collectTycons(toks : Vec Token) -> Vec String {
+    let names = Vec.fromArray(builtinTycons)
     for var i = 0; i + 1 < len(toks); i = i + 1 {
         if Token.isWord(toks[i].kind, "type") && isConid(toks[i + 1]) {
-            Array.push(names, text(toks[i + 1]))
+            Vec.push(names, text(toks[i + 1]))
         }
     }
     names
@@ -232,25 +232,25 @@ fun parseProgram(p : P) -> Program {
     skipNewlines(p)
     var header : Option ModuleHeader = None
     if at(p, "module") { header = Some(parseModuleHeader(p)) }
-    let imports = Array.new(4)
-    let decls = Array.new(16)
+    let imports = Vec.new(4)
+    let decls = Vec.new(16)
     skipNewlines(p)
     while !at(p, "EOF") {
         if at(p, "import") {
-            Array.push(imports, parseImport(p))
+            Vec.push(imports, parseImport(p))
         } else if at(p, "type") {
-            Array.push(decls, DType(parseTypeDecl(p)))
+            Vec.push(decls, DType(parseTypeDecl(p)))
         } else if at(p, "class") {
-            Array.push(decls, DClass(parseClassDecl(p)))
+            Vec.push(decls, DClass(parseClassDecl(p)))
         } else if at(p, "instance") {
-            Array.push(decls, DInstance(parseInstanceDecl(p)))
+            Vec.push(decls, DInstance(parseInstanceDecl(p)))
         } else if at(p, "foreign") {
-            Array.push(decls, parseForeignDecl(p))
+            Vec.push(decls, parseForeignDecl(p))
         } else if at(p, "fun") {
             let s2 = cur(p).span
-            Array.push(decls, DStmt(mkStmt(p, s2, SFun(parseFunDecl(p, False)))))
+            Vec.push(decls, DStmt(mkStmt(p, s2, SFun(parseFunDecl(p, False)))))
         } else if at(p, "let") || at(p, "var") {
-            Array.push(decls, DStmt(parseBindingStmt(p)))
+            Vec.push(decls, DStmt(parseBindingStmt(p)))
         } else {
             oops(p, "expected a top-level declaration, found "
                     + describe(cur(p)), cur(p).span)
@@ -271,12 +271,12 @@ fun endOfStatement(p : P) -> Unit {
 fun parseModuleHeader(p : P) -> ModuleHeader {
     let s = expect(p, "module").span
     let name = parseModname(p)
-    var exports : Option (Array ExportItem) = None
+    var exports : Option (Vec ExportItem) = None
     if at(p, "(") {
-        let items = Array.new(8)
+        let items = Vec.new(8)
         step(p)
         while !at(p, ")") {
-            Array.push(items, parseExportItem(p))
+            Vec.push(items, parseExportItem(p))
             if !eat(p, ",") { break }
         }
         skipToken(p, ")")
@@ -296,12 +296,12 @@ fun parseExportItem(p : P) -> ExportItem {
     if !isNameToken(tok) {
         oops(p, "expected an export name, found " + describe(tok), tok.span)
     }
-    var subs : Option (Array String) = None
+    var subs : Option (Vec String) = None
     if isConid(tok) && at(p, "(") {
         step(p)
-        let names = Array.new(4)
+        let names = Vec.new(4)
         while !at(p, ")") {
-            Array.push(names, text(advance(p)))
+            Vec.push(names, text(advance(p)))
             if !eat(p, ",") { break }
         }
         skipToken(p, ")")
@@ -324,8 +324,8 @@ fun parseImport(p : P) -> ImportDecl {
     let s = expect(p, "import").span
     let name = parseModname(p)
     var alias : Option String = None
-    var items : Option (Array ExportItem) = None
-    var hidden : Option (Array ExportItem) = None
+    var items : Option (Vec ExportItem) = None
+    var hidden : Option (Vec ExportItem) = None
     if eat(p, "as") { alias = Some(text(expectWhat(p, "CONID", "a module alias"))) }
     -- An alias and a selective list are independent: `import M as S (f)` names
     -- the module and narrows what it brings. Aliased imports are
@@ -342,16 +342,16 @@ fun parseImport(p : P) -> ImportDecl {
     }
 }
 
-fun parseParenNameList(p : P) -> Array ExportItem {
+fun parseParenNameList(p : P) -> Vec ExportItem {
     skipToken(p, "(")
-    let names = Array.new(4)
+    let names = Vec.new(4)
     while !at(p, ")") {
         let item = parseExportItem(p)
         if item.kind == "module" {
             oops(p, "'module' may appear in an export list, not in an import's "
                     + "name list: a module re-exports, it does not import", item.span)
         }
-        Array.push(names, item)
+        Vec.push(names, item)
         if !eat(p, ",") { break }
     }
     skipToken(p, ")")
@@ -363,8 +363,8 @@ fun parseParenNameList(p : P) -> Array ExportItem {
 fun parseTypeDecl(p : P) -> TypeDecl {
     let s = expect(p, "type").span
     let name = text(expectWhat(p, "CONID", "a type name"))
-    let params = Array.new(2)
-    while at(p, "IDENT") { Array.push(params, text(advance(p))) }
+    let params = Vec.new(2)
+    while at(p, "IDENT") { Vec.push(params, text(advance(p))) }
     skipToken(p, "=")
 
     -- A `|` or a `{` payload means data type outright. A bare
@@ -376,7 +376,7 @@ fun parseTypeDecl(p : P) -> TypeDecl {
         if Token.kindName(peek(p, 1).kind) == "{" || rhsHasAlternatives(p) {
             return parseDataRhs(p, s, name, params)
         }
-        if !Array.contains(p.tycons, headName) || headName == name {
+        if !Vec.contains(p.tycons, headName) || headName == name {
             return parseDataRhs(p, s, name, params)
         }
     }
@@ -406,12 +406,12 @@ fun rhsHasAlternatives(p : P) -> Bool {
     False
 }
 
-fun parseDataRhs(p : P, s : Span, name : String, params : Array String) -> TypeDecl {
-    let variants = Array.new(4)
-    Array.push(variants, parseConDecl(p))
+fun parseDataRhs(p : P, s : Span, name : String, params : Vec String) -> TypeDecl {
+    let variants = Vec.new(4)
+    Vec.push(variants, parseConDecl(p))
     while eat(p, "|") {
         skipNewlines(p)
-        Array.push(variants, parseConDecl(p))
+        Vec.push(variants, parseConDecl(p))
     }
     TypeDecl { span = s, name = name, params = params, variants = Some(variants), alias = None }
 }
@@ -419,9 +419,9 @@ fun parseDataRhs(p : P, s : Span, name : String, params : Array String) -> TypeD
 -- `[s, Error e]` -- the variables an existential constructor hides. Read like a
 -- `fun`'s context, with a bare variable as one more form and an equality
 -- refused.
-fun parseConContext(p : P) -> (Array String, Array Pred) {
-    let binders = Array.new(1)
-    let preds = Array.new(1)
+fun parseConContext(p : P) -> (Vec String, Vec Pred) {
+    let binders = Vec.new(1)
+    let preds = Vec.new(1)
     if !at(p, "[") { return (binders, preds) }
     step(p)
     loop {
@@ -431,10 +431,10 @@ fun parseConContext(p : P) -> (Array String, Array Pred) {
             oops(p, "a constructor's bracket may not state an equality", s)
         }
         match written.kind {
-            TEVar(name) -> Array.push(binders, name)
+            TEVar(name) -> Vec.push(binders, name)
             TECon(name, args) -> {
                 if len(args) != 1 { oops(p, conContextShape, s) }
-                Array.push(preds, Pred { span = s, kind = PClass(name, args[0]) })
+                Vec.push(preds, Pred { span = s, kind = PClass(name, args[0]) })
             }
             _ -> oops(p, conContextShape, s)
         }
@@ -456,18 +456,18 @@ fun parseConDecl(p : P) -> ConDecl {
         let (fields, vars, spans) = parseRecordPayload(p)
         fieldLimit(p, tok, "constructor '" + text(tok) + "'", len(fields))
         return ConDecl {
-            span = tok.span, name = text(tok), args = Array.new(0),
+            span = tok.span, name = text(tok), args = [],
             fields = Some(fields), vars = vars, fieldSpans = spans,
             binders = binders, context = context,
         }
     }
-    let args = Array.new(2)
+    let args = Vec.new(2)
     if eat(p, "(") {
         -- A value constructor is an uncurried function, so it declares its
         -- payload the way a function declares parameters. Type application
         -- inside stays juxtaposed -- `Loop(Array Op)`.
         while !at(p, ")") {
-            Array.push(args, parseTypeExpr(p))
+            Vec.push(args, parseTypeExpr(p))
             if !eat(p, ",") { break }
         }
         skipToken(p, ")")
@@ -511,24 +511,24 @@ fun fieldLimit(p : P, at : Token, what : String, count : Int) -> Unit {
 
 -- A record constructor's fields, the names of those declared `var`, and where
 -- each field's name is written.
-fun parseRecordPayload(p : P) -> (Array (String, Type), Array String, Array Span) {
+fun parseRecordPayload(p : P) -> (Vec (String, Type), Vec String, Vec Span) {
     skipToken(p, "{")
     skipNewlines(p)
-    let fields = Array.new(4)
+    let fields = Vec.new(4)
     let vars = []
     let spans = []
-    let seen = Array.new(4)
+    let seen = Vec.new(4)
     while !at(p, "}") {
         let assignable = eat(p, "var")
         let tok = expectWhat(p, "IDENT", "a field name")
-        if assignable { Array.push(vars, text(tok)) }
-        Array.push(spans, tok.span)
-        if Array.contains(seen, text(tok)) {
+        if assignable { Vec.push(vars, text(tok)) }
+        Vec.push(spans, tok.span)
+        if Vec.contains(seen, text(tok)) {
             oops(p, "duplicate field '" + text(tok) + "'", tok.span)
         }
-        Array.push(seen, text(tok))
+        Vec.push(seen, text(tok))
         skipToken(p, ":")
-        Array.push(fields, (text(tok), parseTypeExpr(p)))
+        Vec.push(fields, (text(tok), parseTypeExpr(p)))
         if !fieldSeparator(p) { break }
     }
     skipToken(p, "}")
@@ -539,9 +539,9 @@ fun parseRecordPayload(p : P) -> (Array (String, Type), Array String, Array Span
 
 fun parseTypeExpr(p : P) -> Type {
     let head = parseAtype(p)
-    let args = Array.new(2)
+    let args = Vec.new(2)
     while at(p, "IDENT") || at(p, "CONID") || at(p, "(") {
-        Array.push(args, parseAtype(p))
+        Vec.push(args, parseAtype(p))
     }
     if len(args) == 0 { return head }
     match head.kind {
@@ -571,14 +571,14 @@ fun parseAtype(p : P) -> Type {
         -- resolved as one.
         "CONID" -> {
             step(p)
-            mkType(p, tok.span, TECon(dottedFrom(p, tok), Array.new(0)))
+            mkType(p, tok.span, TECon(dottedFrom(p, tok), []))
         }
         "fun" -> {
             step(p)
             skipToken(p, "(")
-            let params = Array.new(2)
+            let params = Vec.new(2)
             while !at(p, ")") {
-                Array.push(params, parseTypeExpr(p))
+                Vec.push(params, parseTypeExpr(p))
                 if !eat(p, ",") { break }
             }
             skipToken(p, ")")
@@ -592,19 +592,19 @@ fun parseAtype(p : P) -> Type {
 
 -- The rest of a dotted name whose first CONID has already been consumed.
 fun dottedFrom(p : P, first : Token) -> String {
-    let parts = Array.new(2)
-    Array.push(parts, text(first))
+    let parts = Vec.new(2)
+    Vec.push(parts, text(first))
     while at(p, ".") && Token.kindName(peek(p, 1).kind) == "CONID" {
         step(p)
-        Array.push(parts, text(advance(p)))
+        Vec.push(parts, text(advance(p)))
     }
     String.join(parts, ".")
 }
 
 fun parseParenType(p : P, tok : Token) -> Type {
     step(p)
-    let elems = Array.new(2)
-    Array.push(elems, parseTypeExpr(p))
+    let elems = Vec.new(2)
+    Vec.push(elems, parseTypeExpr(p))
     while eat(p, ",") {
         if at(p, ")") {
             if len(elems) == 1 {
@@ -612,7 +612,7 @@ fun parseParenType(p : P, tok : Token) -> Type {
             }
             break
         }
-        Array.push(elems, parseTypeExpr(p))
+        Vec.push(elems, parseTypeExpr(p))
     }
     skipToken(p, ")")
     if len(elems) == 1 { return elems[0] }
@@ -670,11 +670,11 @@ fun looksLikeSignature(p : P) -> Bool {
     True
 }
 
-fun parseSignature(p : P, s : Span, name : String, context : Array Pred) -> FunDecl {
+fun parseSignature(p : P, s : Span, name : String, context : Vec Pred) -> FunDecl {
     skipToken(p, "(")
-    let types = Array.new(2)
+    let types = Vec.new(2)
     while !at(p, ")") {
-        Array.push(types, parseTypeExpr(p))
+        Vec.push(types, parseTypeExpr(p))
         if !eat(p, ",") { break }
     }
     skipToken(p, ")")
@@ -684,9 +684,9 @@ fun parseSignature(p : P, s : Span, name : String, context : Array Pred) -> FunD
     }
     let ret = parseTypeExpr(p)
     -- A parameter of a stated type with no name is an anonymous binder.
-    let params = Array.new(len(types))
+    let params = Vec.new(len(types))
     for t in types {
-        Array.push(params, mkPat(p, t.span, PAnnot(mkPat(p, t.span, PWild), t)))
+        Vec.push(params, mkPat(p, t.span, PAnnot(mkPat(p, t.span, PWild), t)))
     }
     FunDecl {
         id = freshId(p), span = s, name = name, params = params,
@@ -746,7 +746,7 @@ fun parseForeignDecl(p : P) -> Decl {
         let body = parseFunBody(p)
         return DStmt(mkStmt(p, s, SFun(FunDecl {
             id = freshId(p), span = s, name = name, params = params,
-            ret = Some(ret), body = Some(body), context = Array.new(0),
+            ret = Some(ret), body = Some(body), context = [],
             monomorphic = True, symbol = Some(symbol),
         })))
     }
@@ -762,9 +762,9 @@ fun parseForeignDecl(p : P) -> Decl {
 -- named or not. Naming is allowed here and not there because the ambiguity
 -- `looksLikeSignature` exists to settle cannot arise: every parameter of a
 -- foreign signature states its type, so `x : T` is always a name.
-fun parseForeignParams(p : P) -> Array Pat {
+fun parseForeignParams(p : P) -> Vec Pat {
     skipToken(p, "(")
-    let params = Array.new(2)
+    let params = Vec.new(2)
     while !at(p, ")") {
         let tok = cur(p)
         if Token.kindName(tok.kind) == "IDENT"
@@ -773,11 +773,11 @@ fun parseForeignParams(p : P) -> Array Pat {
             step(p)
             let ty = parseTypeExpr(p)
             let binder = if text(tok) == "_" { PWild } else { PVar(text(tok)) }
-            Array.push(params, mkPat(p, tok.span,
+            Vec.push(params, mkPat(p, tok.span,
                                      PAnnot(mkPat(p, tok.span, binder), ty)))
         } else {
             let ty = parseTypeExpr(p)
-            Array.push(params, mkPat(p, ty.span,
+            Vec.push(params, mkPat(p, ty.span,
                                      PAnnot(mkPat(p, ty.span, PWild), ty)))
         }
         if !eat(p, ",") { break }
@@ -791,12 +791,12 @@ fun parseForeignParams(p : P) -> Array Pat {
 -- Each entry is read as a *type expression* first and classified after, because
 -- nothing shorter can tell the two forms apart: `Item c ~ Op` and
 -- `Show (Elem c)` begin identically and the `~` is two atypes away.
-fun parseContext(p : P) -> Array Pred {
-    if !at(p, "[") { return Array.new(0) }
+fun parseContext(p : P) -> Vec Pred {
+    if !at(p, "[") { return [] }
     step(p)
-    let preds = Array.new(2)
+    let preds = Vec.new(2)
     loop {
-        Array.push(preds, parsePredEntry(p))
+        Vec.push(preds, parsePredEntry(p))
         if !eat(p, ",") { break }
         if at(p, "]") { break }
     }
@@ -831,12 +831,12 @@ fun parseClassDecl(p : P) -> ClassDecl {
     let s = expect(p, "class").span
     let name = text(expectWhat(p, "CONID", "a class name"))
     let param = text(expectWhat(p, "IDENT", "the class parameter"))
-    let supers = Array.new(2)
+    let supers = Vec.new(2)
     if eat(p, ":") {
         loop {
             let tok = cur(p)
             let className = parseModname(p)
-            Array.push(supers, Pred {
+            Vec.push(supers, Pred {
                 span = tok.span, kind = PClass(className, parseAtype(p)),
             })
             if !eat(p, ",") { break }
@@ -866,11 +866,11 @@ fun parseInstanceDecl(p : P) -> InstanceDecl {
     }
 }
 
-fun parseInstanceContext(p : P) -> Array Pred {
-    if !eat(p, ":") { return Array.new(0) }
-    let preds = Array.new(2)
+fun parseInstanceContext(p : P) -> Vec Pred {
+    if !eat(p, ":") { return [] }
+    let preds = Vec.new(2)
     loop {
-        Array.push(preds, parsePredEntry(p))
+        Vec.push(preds, parsePredEntry(p))
         if !eat(p, ",") { break }
         skipNewlines(p)
         if at(p, "{") { break }
@@ -880,19 +880,19 @@ fun parseInstanceContext(p : P) -> Array Pred {
 
 -- The `{ ... }` of a class: methods, and family *declarations*.
 fun parseClassBody(p : P, isClass : Bool, param : String)
-    -> (Array FunDecl, Array FamDecl) {
+    -> (Vec FunDecl, Vec FamDecl) {
     skipToken(p, "{")
     skipNewlines(p)
-    let methods = Array.new(4)
-    let families = Array.new(2)
+    let methods = Vec.new(4)
+    let families = Vec.new(2)
     while !at(p, "}") {
         if at(p, "type") {
             let s = expect(p, "type").span
             let name = text(expectWhat(p, "CONID", "a type family name"))
             let written = text(expectWhat(p, "IDENT", "'" + param + "', the class parameter"))
-            Array.push(families, FamDecl { span = s, name = name, param = written })
+            Vec.push(families, FamDecl { span = s, name = name, param = written })
         } else if at(p, "fun") {
-            Array.push(methods, parseFunDecl(p, isClass))
+            Vec.push(methods, parseFunDecl(p, isClass))
         } else {
             oops(p, "expected a method or a 'type', found " + describe(cur(p)),
                  cur(p).span)
@@ -906,19 +906,19 @@ fun parseClassBody(p : P, isClass : Bool, param : String)
 -- The `{ ... }` of an instance: methods, and family *definitions*. The two
 -- bodies cannot share a function because what a `type` means differs, and a
 -- pair of lists is what each answers.
-fun parseInstanceBody(p : P) -> (Array FunDecl, Array FamBind) {
+fun parseInstanceBody(p : P) -> (Vec FunDecl, Vec FamBind) {
     skipToken(p, "{")
     skipNewlines(p)
-    let methods = Array.new(4)
-    let families = Array.new(2)
+    let methods = Vec.new(4)
+    let families = Vec.new(2)
     while !at(p, "}") {
         if at(p, "type") {
             let s = expect(p, "type").span
             let name = text(expectWhat(p, "CONID", "a type family name"))
             skipToken(p, "=")
-            Array.push(families, FamBind { span = s, name = name, body = parseTypeExpr(p) })
+            Vec.push(families, FamBind { span = s, name = name, body = parseTypeExpr(p) })
         } else if at(p, "fun") {
-            Array.push(methods, parseFunDecl(p, False))
+            Vec.push(methods, parseFunDecl(p, False))
         } else {
             oops(p, "expected a method or a 'type', found " + describe(cur(p)),
                  cur(p).span)
@@ -929,12 +929,12 @@ fun parseInstanceBody(p : P) -> (Array FunDecl, Array FamBind) {
     (methods, families)
 }
 
-fun parseParamList(p : P) -> Array Pat {
+fun parseParamList(p : P) -> Vec Pat {
     skipToken(p, "(")
     let saved = setNoRecord(p, False)
-    let params = Array.new(4)
+    let params = Vec.new(4)
     while !at(p, ")") {
-        Array.push(params, parsePattern(p))
+        Vec.push(params, parsePattern(p))
         if !eat(p, ",") { break }
     }
     skipToken(p, ")")
@@ -1005,11 +1005,11 @@ fun checkAssignable(p : P, e : Expr, s : Span) -> Unit = match e.kind {
 fun parseBlock(p : P) -> Expr {
     let s = expect(p, "{").span
     let saved = setNoRecord(p, False)
-    let stmts = Array.new(8)
+    let stmts = Vec.new(8)
     skipNewlines(p)
     while !at(p, "}") {
         if at(p, "EOF") { oops(p, "unterminated block", s) }
-        Array.push(stmts, parseStmt(p))
+        Vec.push(stmts, parseStmt(p))
         endOfStatement(p)
     }
     skipToken(p, "}")
@@ -1051,8 +1051,8 @@ fun parsePatternAtom(p : P) -> Pat {
 
 fun parseParenPattern(p : P, tok : Token) -> Pat {
     step(p)
-    let elems = Array.new(2)
-    Array.push(elems, parsePattern(p))
+    let elems = Vec.new(2)
+    Vec.push(elems, parsePattern(p))
     while eat(p, ",") {
         if at(p, ")") {
             if len(elems) == 1 {
@@ -1060,7 +1060,7 @@ fun parseParenPattern(p : P, tok : Token) -> Pat {
             }
             break
         }
-        Array.push(elems, parsePattern(p))
+        Vec.push(elems, parsePattern(p))
     }
     skipToken(p, ")")
     if len(elems) == 1 { return elems[0] }
@@ -1084,7 +1084,7 @@ fun parseConPattern(p : P) -> Pat {
     if at(p, "{") {
         step(p)
         skipNewlines(p)
-        let fields = Array.new(4)
+        let fields = Vec.new(4)
         var rest = False
         while !at(p, "}") {
             if eat(p, "..") {
@@ -1101,17 +1101,17 @@ fun parseConPattern(p : P) -> Pat {
             -- Punning: `C { x }` binds `x` from field `x`.
             var sub = mkPat(p, name.span, PVar(text(name)))
             if eat(p, "=") { sub = parsePattern(p) }
-            Array.push(fields, (text(name), sub))
+            Vec.push(fields, (text(name), sub))
             if !fieldSeparator(p) { break }
         }
         skipToken(p, "}")
         return mkPat(p, tok.span, PRecord(con, fields, rest))
     }
-    let args = Array.new(2)
+    let args = Vec.new(2)
     if at(p, "(") {
         step(p)
         while !at(p, ")") {
-            Array.push(args, parsePattern(p))
+            Vec.push(args, parsePattern(p))
             if !eat(p, ",") { break }
         }
         skipToken(p, ")")
@@ -1167,9 +1167,9 @@ fun parsePostfix(p : P) -> Expr {
         if at(p, "(") {
             step(p)
             let saved = setNoRecord(p, False)
-            let args = Array.new(4)
+            let args = Vec.new(4)
             while !at(p, ")") {
-                Array.push(args, closePart(p, parseExpr(p)))
+                Vec.push(args, closePart(p, parseExpr(p)))
                 if !eat(p, ",") { break }
             }
             skipToken(p, ")")
@@ -1294,8 +1294,8 @@ fun parseParenAtom(p : P, tok : Token) -> Expr {
         return mkExpr(p, tok.span, EUnit)
     }
     let saved = setNoRecord(p, False)
-    let elems = Array.new(2)
-    Array.push(elems, parseExpr(p))
+    let elems = Vec.new(2)
+    Vec.push(elems, parseExpr(p))
     while eat(p, ",") {
         if at(p, ")") {
             if len(elems) == 1 {
@@ -1303,7 +1303,7 @@ fun parseParenAtom(p : P, tok : Token) -> Expr {
             }
             break
         }
-        Array.push(elems, parseExpr(p))
+        Vec.push(elems, parseExpr(p))
     }
     skipToken(p, ")")
     p.noRecord = saved
@@ -1311,15 +1311,15 @@ fun parseParenAtom(p : P, tok : Token) -> Expr {
     -- `(_ + 1) * 2` is one function. A tuple's components are.
     if len(elems) == 1 { return elems[0] }
     fieldLimit(p, tok, "this tuple", len(elems))
-    mkExpr(p, tok.span, ETuple(Array.map(elems, closePart(p, _))))
+    mkExpr(p, tok.span, ETuple(Vec.map(elems, closePart(p, _))))
 }
 
 fun parseArrayAtom(p : P, tok : Token) -> Expr {
     step(p)
     let saved = setNoRecord(p, False)
-    let elems = Array.new(4)
+    let elems = Vec.new(4)
     while !at(p, "]") {
-        Array.push(elems, closePart(p, parseExpr(p)))
+        Vec.push(elems, closePart(p, parseExpr(p)))
         if !eat(p, ",") { break }
     }
     skipToken(p, "]")
@@ -1333,7 +1333,7 @@ fun parseConidAtom(p : P) -> Expr {
     let tok = expect(p, "CONID")
     let name = dottedFrom(p, tok)
     -- A trailing lowercase name makes the whole chain a qualified *variable*:
-    -- `Data.Array.push`, not the constructor `Data.Array` applied to anything.
+    -- `Data.Vec.push`, not the constructor `Data.Array` applied to anything.
     if at(p, ".") && Token.kindName(peek(p, 1).kind) == "IDENT" {
         step(p)
         return mkExpr(p, tok.span, EVar(name + "." + text(advance(p)), False))
@@ -1341,14 +1341,14 @@ fun parseConidAtom(p : P) -> Expr {
     if at(p, "{") && !p.noRecord {
         step(p)
         skipNewlines(p)
-        let fields = Array.new(4)
+        let fields = Vec.new(4)
         let saved = setNoRecord(p, False)
         while !at(p, "}") {
             let fname = expectWhat(p, "IDENT", "a field name")
             -- Punning: `C { x }` is `C { x = x }`, as in patterns.
             var value = mkExpr(p, fname.span, EVar(text(fname), False))
             if eat(p, "=") { value = closePart(p, parseExpr(p)) }
-            Array.push(fields, (text(fname), value))
+            Vec.push(fields, (text(fname), value))
             if !fieldSeparator(p) { break }
         }
         p.noRecord = saved
@@ -1418,13 +1418,13 @@ fun parseBindingCondition(p : P) -> (Pat, Expr, Expr) {
     refuseChainedCondition(p)
     var body = parseBlock(p)
     if mutable {
-        let stmts = Array.new(4)
+        let stmts = Vec.new(4)
         for name in patternVars(pat) {
-            Array.push(stmts, mkStmt(p, s, SVar(mkPat(p, s, PVar(name)),
+            Vec.push(stmts, mkStmt(p, s, SVar(mkPat(p, s, PVar(name)),
                                                 mkExpr(p, s, EVar(name, False)))))
         }
         match body.kind {
-            EBlock(inner) -> for st in inner { Array.push(stmts, st) }
+            EBlock(inner) -> for st in inner { Vec.push(stmts, st) }
             _ -> {}
         }
         body = mkExpr(p, body.span, EBlock(stmts))
@@ -1501,11 +1501,11 @@ fun parseMatch(p : P) -> Expr {
     let scrutinee = parseScrutinee(p, "the value 'match' inspects")
     skipToken(p, "{")
     let saved = setNoRecord(p, False)
-    let arms = Array.new(4)
+    let arms = Vec.new(4)
     skipNewlines(p)
     while !at(p, "}") {
         if at(p, "EOF") { oops(p, "unterminated match expression", s) }
-        Array.push(arms, parseMatchArm(p))
+        Vec.push(arms, parseMatchArm(p))
         -- A `|` here begins the next arm: the newline rule dropped the newline
         -- before it, so the `|` is the only separator left.
         if at(p, "NEWLINE") {
@@ -1527,11 +1527,11 @@ fun parseMatchArm(p : P) -> Arm {
     -- finished arm begins the next one, so the two readings never collide.
     let _ = eat(p, "|")
     let s = cur(p).span
-    let patterns = Array.new(2)
-    Array.push(patterns, parsePattern(p))
+    let patterns = Vec.new(2)
+    Vec.push(patterns, parsePattern(p))
     while eat(p, "|") {
         skipNewlines(p)
-        Array.push(patterns, parsePattern(p))
+        Vec.push(patterns, parsePattern(p))
     }
     skipWhat(p, "->", "'->' after the arm's patterns")
     Arm { span = s, patterns = patterns, body = closeWhole(p, parseExpr(p)) }
@@ -1573,17 +1573,17 @@ fun isPlaceholder(e : Expr) -> Bool = match e.kind {
     _ -> False
 }
 
-fun placeholders(e : Expr) -> Array Expr {
-    let out = Array.new(2)
+fun placeholders(e : Expr) -> Vec Expr {
+    let out = Vec.new(2)
     collectPlaceholders(ChExpr(e), out)
     out
 }
 
-fun collectPlaceholders(c : Child, out : Array Expr) -> Unit {
+fun collectPlaceholders(c : Child, out : Vec Expr) -> Unit {
     match c {
         ChExpr(e) -> {
             if isPlaceholder(e) {
-                Array.push(out, e)
+                Vec.push(out, e)
                 return {}
             }
         }
@@ -1644,7 +1644,7 @@ fun parseExplicit(p : P, tok : Token) -> Expr {
     shorthandLambda(p, body, found, tok.span)
 }
 
-fun shorthandLambda(p : P, body : Expr, found : Array Expr, s : Span) -> Expr {
+fun shorthandLambda(p : P, body : Expr, found : Vec Expr, s : Span) -> Expr {
     let name = shorthandPrefix + Int.toString(freshId(p))
     for placeholder in found { placeholder.kind = EVar(name, False) }
     p.pending = p.pending - len(found)

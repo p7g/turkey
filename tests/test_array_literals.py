@@ -3,174 +3,143 @@
 A literal's type is one of a closed set of containers applied to its element,
 as a numeral's is one of a closed set of numeric types: decided by how the
 literal is used, and `Array` when nothing decides. The set holds `Array`, and
-`Vec` when the program declares `Data.Vec#Vec`. A set of one is plain `Array`.
-
-The shipped library declares no `Data.Vec`, so the tests of a two-member set
-give the compiler a library that does: `lib/` linked entry by entry into a
-directory of its own, beside a `Data/Vec.gob` holding a growable array's
-declarations and one function to decide a literal with. Only `boot check` and
-its dumps run against it; nothing is linked or run.
+`Vec` when the program declares `Data.Vec#Vec`, which the Prelude does.
 """
 
 from __future__ import annotations
 
-import os
 import re
-import subprocess
-from pathlib import Path
 
 import pytest
 
-from tests import bootc, lang, toolchain
-from tests.lang import CompileError
-
-LIB = lang.LIB
-
-VEC = """\
-module Data.Vec (Vec, push)
-
-type VecStorage a = VecStorage {
-    var storage : Prim.Array a,
-    var length  : Int,
-}
-
-type Vec a = Vec(VecStorage a)
-
-fun push(xs : Vec a, x : a) -> Unit = {}
-"""
-
-
-@pytest.fixture(scope="module")
-def vec_lib(tmp_path_factory) -> Path:
-    """`lib/` with a `Data.Vec` added."""
-    lib = tmp_path_factory.mktemp("lib")
-    for entry in LIB.iterdir():
-        if entry.name != "Data":
-            (lib / entry.name).symlink_to(entry)
-    (lib / "Data").mkdir()
-    for entry in (LIB / "Data").iterdir():
-        (lib / "Data" / entry.name).symlink_to(entry)
-    (lib / "Data" / "Vec.gob").write_text(VEC, encoding="utf-8")
-    return lib
-
-
-def _boot(lib: Path, directory: Path, src: str,
-          stage: str) -> subprocess.CompletedProcess[str]:
-    (directory / "Main.gob").write_text("import Data.Vec as Vec\n" + src,
-                                        encoding="utf-8")
-    return subprocess.run(
-        toolchain.command(bootc.binary(), *bootc.argv(stage), "Main.gob"),
-        cwd=directory, env=dict(os.environ, TURKEY_LIB=str(lib)),
-        capture_output=True, text=True, timeout=600)
-
-
-@pytest.fixture
-def with_vec(vec_lib, tmp_path):
-    """`types(src)` and `fails(src)` for a program that imports `Data.Vec`
-    as `Vec`, checked against the library that has it."""
-
-    class Checker:
-        @staticmethod
-        def types(src: str) -> dict[str, str]:
-            result = _boot(vec_lib, tmp_path, src, "types")
-            if result.returncode != 0:
-                raise CompileError(result.stderr, result.returncode)
-            return dict(line.split(" : ", 1)
-                        for line in result.stdout.splitlines())
-
-        @staticmethod
-        def fails(src: str) -> str:
-            result = _boot(vec_lib, tmp_path, src, "check")
-            assert result.returncode != 0, "the program was accepted"
-            return CompileError(result.stderr, result.returncode).message
-
-        @staticmethod
-        def core(src: str) -> str:
-            result = _boot(vec_lib, tmp_path, src, "core")
-            assert result.returncode == 0, result.stderr
-            return result.stdout
-
-    return Checker
-
-
-# ----------------------------------------------------- a set of one: `Array`
-
-
-def test_without_vec_a_literal_is_an_array() -> None:
-    assert lang.types('let names = ["a", "b"]\nfun empty() = []\n') == {
-        "names": "Array String",
-        "empty": "fun() -> Array a",
-    }
-
-
-def test_without_vec_a_mismatch_is_the_equation_with_array() -> None:
-    """No set to name, and no container the program does not have."""
-    with pytest.raises(CompileError) as e:
-        lang.check('fun f(n : Int) -> Int = n\nlet y = f(["a"])\n')
-    assert e.value.message == \
-        "expected Int, found Array String in a function call"
+from tests import lang
 
 
 # ------------------------------------------------------ deciding and defaulting
 
 
-def test_a_literal_nothing_decides_is_an_array(with_vec) -> None:
-    assert with_vec.types('let names = ["a", "b"]\n')["names"] == "Array String"
+def test_a_literal_nothing_decides_is_an_array() -> None:
+    assert lang.types('let names = ["a", "b"]\n')["names"] == "Array String"
 
 
-def test_a_use_decides_the_container(with_vec) -> None:
+def test_a_use_decides_the_container() -> None:
     src = ("fun built() {\n"
            "    let out = []\n"
            "    Vec.push(out, \"a\")\n"
            "    out\n"
            "}\n")
-    assert with_vec.types(src)["built"] == "fun() -> Vec String"
+    assert lang.types(src)["built"] == "fun() -> Vec String"
 
 
-def test_an_annotation_decides_the_container(with_vec) -> None:
-    src = ("let v : Vec.Vec Int = [1]\n"
+def test_an_annotation_decides_the_container() -> None:
+    src = ("let v : Vec Int = [1]\n"
            "let a : Array Int = [2]\n")
-    assert with_vec.types(src) == {"v": "Vec Int", "a": "Array Int"}
+    assert lang.types(src) == {"v": "Vec Int", "a": "Array Int"}
 
 
-def test_two_literals_joined_are_one_container(with_vec) -> None:
+def test_two_literals_joined_are_one_container() -> None:
     src = ("fun f(b : Bool) {\n"
            "    let v = if b { [] } else { [\"a\"] }\n"
            "    Vec.push(v, \"b\")\n"
            "    v\n"
            "}\n")
-    assert with_vec.types(src)["f"] == "fun(Bool) -> Vec String"
+    assert lang.types(src)["f"] == "fun(Bool) -> Vec String"
 
 
-def test_the_literal_is_built_as_the_container_chosen(with_vec) -> None:
-    core = with_vec.core("fun main() {\n"
-                         "    let v : Vec.Vec Int = [1]\n"
-                         "    let a : Array Int = [2]\n"
-                         "}\n")
+def test_the_literal_is_built_as_the_container_chosen() -> None:
+    result = lang.dump("core", "fun main() {\n"
+                               "    let v : Vec Int = [1]\n"
+                               "    let a : Array Int = [2]\n"
+                               "}\n")
+    assert result.code == 0, result.stderr
+    core = result.stdout
     assert "Data.Vec#VecStorage" in core
     assert "Data.Array#ArrayStorage" in core
+
+
+def test_a_top_level_binding_is_decided_by_its_own_definition() -> None:
+    """A later function's use does not reach back: the binding's container is
+    defaulted once its own definition is solved."""
+    message = lang.fails("let pending = []\n"
+                         "fun remember(x : String) = Vec.push(pending, x)\n")
+    assert message == "expected Vec, found Array in a function call"
+
+
+def test_a_top_level_binding_is_decided_the_same_for_an_importer() -> None:
+    message = lang.fails("import Queue (pending)\n"
+                         "fun main() = Vec.push(pending, 1)\n",
+                         {"Queue.gob": "module Queue (pending)\n"
+                                       "let pending = []\n"})
+    assert message == "expected Vec, found Array in a function call"
+
+
+def test_an_annotated_top_level_binding_is_a_vec() -> None:
+    src = ("let pending : Vec String = []\n"
+           "fun remember(x : String) = Vec.push(pending, x)\n")
+    assert lang.types(src)["pending"] == "Vec String"
+
+
+# ------------------------------------------------------ running them
+
+
+def test_a_literal_pushed_to_is_a_vec_and_grows() -> None:
+    assert lang.output("fun main() {\n"
+                       "    let out = []\n"
+                       "    for x in [3, 1, 2] { Vec.push(out, x * 10) }\n"
+                       "    Vec.push(out, 0)\n"
+                       "    print(len(out))\n"
+                       "    print(out)\n"
+                       "}\n") == "4\n[30, 10, 20, 0]\n"
+
+
+def test_a_vec_literal_runs() -> None:
+    assert lang.output("fun main() {\n"
+                       "    let v : Vec String = [\"a\", \"b\"]\n"
+                       "    v[0] = \"z\"\n"
+                       "    Vec.push(v, \"c\")\n"
+                       "    print(len(v))\n"
+                       "    for s in v { print(s) }\n"
+                       "    print(Vec.pop(v))\n"
+                       "}\n") == "3\nz\nb\nc\nSome(c)\n"
+
+
+def test_the_generic_readers_take_a_vec() -> None:
+    """The library functions that only read take any container, so a literal
+    that has become a `Vec` needs no conversion to reach them."""
+    assert lang.output(
+        "import System.Parallel as Parallel\n"
+        "fun main() {\n"
+        "    let parts = []\n"
+        "    Vec.push(parts, \"x\")\n"
+        "    Vec.push(parts, \"y\")\n"
+        "    print(String.join(parts, \",\"))\n"
+        "    let bytes = []\n"
+        "    for b in String.toBytes(\"hi\") { Vec.push(bytes, b) }\n"
+        "    print(String.fromBytes(bytes))\n"
+        "    let xs = []\n"
+        "    for i in [1, 2, 3] { Vec.push(xs, i) }\n"
+        "    print(Parallel.map(xs, fun(x) = x * x))\n"
+        "}\n") == "x,y\nSome(hi)\n[1, 4, 9]\n"
 
 
 # ------------------------------------------------------ never quantified
 
 
-def test_a_literal_in_a_generic_function_is_defaulted_not_quantified(
-        with_vec) -> None:
+def test_a_literal_in_a_generic_function_is_defaulted_not_quantified() -> None:
     """Each literal is built as one container, so a binding whose type
     mentions the container takes `Array` rather than being generic in it."""
-    assert with_vec.types("fun empty() = []\n")["empty"] == "fun() -> Array a"
+    assert lang.types("fun empty() = []\n")["empty"] == "fun() -> Array a"
 
 
-def test_a_use_wanting_another_container_is_a_mismatch_with_array(
-        with_vec) -> None:
-    message = with_vec.fails("fun empty() = []\n"
-                             "fun takes(v : Vec.Vec Int) -> Unit = {}\n"
-                             "let u = takes(empty())\n")
+def test_a_use_wanting_another_container_is_a_mismatch_with_array() -> None:
+    message = lang.fails("fun empty() = []\n"
+                         "fun takes(v : Vec Int) -> Unit = {}\n"
+                         "let u = takes(empty())\n")
     assert message == "expected Vec, found Array in a function call"
 
 
-def test_an_annotation_cannot_make_the_container_generic(with_vec) -> None:
-    message = with_vec.fails("fun empty() -> c a = []\n")
+def test_an_annotation_cannot_make_the_container_generic() -> None:
+    message = lang.fails("fun empty() -> c a = []\n")
     assert message == ("an array literal cannot have type 'c a'; it must be "
                        "one of Array, Vec")
 
@@ -180,22 +149,19 @@ def test_an_annotation_cannot_make_the_container_generic(with_vec) -> None:
 
 @pytest.mark.parametrize("annotation", ["Int", "Option String",
                                         "Map String Int"])
-def test_a_literal_where_no_container_fits(with_vec, annotation) -> None:
-    message = with_vec.fails(f'let x : {annotation} = ["a"]\n')
+def test_a_literal_where_no_container_fits(annotation) -> None:
+    message = lang.fails(f'let x : {annotation} = ["a"]\n')
     assert message == (f"an array literal cannot have type '{annotation}'; "
                        "it must be one of Array, Vec")
 
 
-def test_a_wrong_element_is_reported_against_the_element(with_vec) -> None:
-    assert with_vec.fails('let v : Vec.Vec Int = ["a"]\n') == \
+def test_a_wrong_element_is_reported_against_the_element() -> None:
+    assert lang.fails('let v : Vec Int = ["a"]\n') == \
         "expected Int, found String in an array literal"
 
 
 @pytest.mark.parametrize("src", ["let x : String = 1\n",
                                  "let x : Option Int = 1\n"])
-def test_a_numeric_literal_reads_as_it_does_without_vec(with_vec, src) -> None:
-    with pytest.raises(CompileError) as e:
-        lang.check(src)
-    assert with_vec.fails(src) == e.value.message
+def test_a_numeric_literal_names_only_the_numbers(src) -> None:
     assert re.fullmatch(r"a numeric literal cannot have type '[^']+'; it must "
-                        r"be one of Int, Float", e.value.message)
+                        r"be one of Int, Float", lang.fails(src))

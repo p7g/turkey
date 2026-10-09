@@ -35,13 +35,16 @@ import Turkey.Types (Kind(..), VarCell(..), Scheme(..),
                      TVar, TCon, ConCell(..), TApp, TFam, TFun, TTuple,
                      TSet, TBottom)
 
--- One value constructor. `fields` is `None` for the positional form.
+-- One value constructor: its fields by position, which is how its object
+-- holds them. Names are an addition some constructors make to that, and change
+-- nothing about the positions: `fields` is `None` for the positional form.
 type ConInfo = ConInfo {
     name   : String,
     tycon  : String,
     fields : Option (Array String),
-    -- The fields declared `var`. Only a plain record has any.
-    vars   : Array String,
+    -- Whether each position may be assigned, parallel to the scheme's
+    -- arguments: a field declared `var`.
+    mutable : Array Bool,
     -- Where each field's name is declared, parallel to `fields`.
     fieldSpans : Array Span,
     arity  : Int,
@@ -76,27 +79,30 @@ fun isPlainRecord(t : TyconInfo) -> Bool =
     len(t.variants) == 1 && isRecord(t.variants[0])
         && len(t.variants[0].exists) == 0
 
+-- Whether some position of the constructor may be assigned.
+fun hasMutable(c : ConInfo) -> Bool = Array.contains(c.mutable, True)
+
 -- Whether a value of the type can change after it is built: some field is
 -- `var`. A type without one is immutable, records included.
-fun isMutable(t : TyconInfo) -> Bool =
-    isPlainRecord(t) && len(t.variants[0].vars) > 0
+fun isMutable(t : TyconInfo) -> Bool {
+    for c in t.variants { if hasMutable(c) { return True } }
+    False
+}
 
--- Whether a build with constructor `name` is an object rather than a value:
--- its type is mutable, so two builds from equal fields can be told apart by
--- assigning through one. Such a build may not be copied, rebuilt from its
--- fields, or matched through in place of the object it makes. However it was
--- written -- `Counter(0)` makes an object exactly as `Counter { n = 0 }` does.
 -- Whether `name` constructs a record: its fields are named.
 fun isRecordCon(t : DeclTable, name : String) -> Bool = match con(t, name) {
     Some(info) -> isRecord(info)
     None -> False
 }
 
+-- Whether a build with constructor `name` is an object rather than a value:
+-- some position of it can be assigned, so two builds from equal fields can be
+-- told apart by assigning through one. Such a build may not be copied, rebuilt
+-- from its fields, or matched through in place of the object it makes. However
+-- it was written -- `Counter(0)` makes an object exactly as `Counter { n = 0 }`
+-- does.
 fun hasIdentity(t : DeclTable, name : String) -> Bool = match con(t, name) {
-    Some(info) -> match Map.get(t.tycons, info.tycon) {
-        Some(tycon) -> isMutable(tycon)
-        None -> False
-    }
+    Some(info) -> hasMutable(info)
     None -> False
 }
 
@@ -408,9 +414,13 @@ fun resolveVariants(t : DeclTable, decl : TypeDecl) -> Unit {
                 if !present { Array.push(s.quantified, cell) }
             }
             checkVars(decl, c, variants)
+            let mutable = match names {
+                Some(ns) -> Array.map(ns, Array.contains(c.vars, _))
+                None -> Array.map(argTypes, fun(_) = False)
+            }
             let cinfo = ConInfo {
                 name = c.name, tycon = decl.name, fields = names,
-                vars = c.vars, fieldSpans = c.fieldSpans,
+                mutable = mutable, fieldSpans = c.fieldSpans,
                 arity = len(argTypes), scheme = s, exists = hidden,
                 existsNames = hiddenVariables(c),
             }
@@ -620,7 +630,19 @@ fun recordFields(t : DeclTable, name : String) -> Option (Array String) =
 fun varFields(t : DeclTable, name : String) -> Option (Array String) =
     match Map.get(t.tycons, name) {
         None -> None
-        Some(info) -> if isPlainRecord(info) { Some(info.variants[0].vars) } else { None }
+        Some(info) -> if isPlainRecord(info) {
+            let c = info.variants[0]
+            let out = Array.new(len(c.mutable))
+            match c.fields {
+                Some(names) -> for var i = 0; i < len(names); i = i + 1 {
+                    if c.mutable[i] { Array.push(out, names[i]) }
+                }
+                None -> {}
+            }
+            Some(out)
+        } else {
+            None
+        }
     }
 
 -- Where a plain record's field is declared.

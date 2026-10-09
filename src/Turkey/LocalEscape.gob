@@ -16,8 +16,12 @@ import Data.Map as Map
 import Data.Set as Set
 import Turkey.Core as Core
 import Turkey.Core (Core(..), CoreKind(..), Mapper(..))
+import Turkey.Decls as Decls
+import Turkey.Decls (DeclTable)
+import Turkey.Types as Ty
 
 type Scan = Scan {
+    decls : DeclTable,
     refs : Set.Set String,
     records : Set.Set String,
     escapedRefs : Set.Set String,
@@ -29,8 +33,8 @@ type Scan = Scan {
 
 type Binding = Reference | Record | Plain
 
-fun analyze(body : Core) -> (Set.Set String, Set.Set String) {
-    let s = Scan { refs = Set.new(), records = Set.new(),
+fun analyze(decls : DeclTable, body : Core) -> (Set.Set String, Set.Set String) {
+    let s = Scan { decls = decls, refs = Set.new(), records = Set.new(),
                    escapedRefs = Set.new(), escapedRecords = Set.new(),
                    scope = Map.new() }
     walk(s, body, False)
@@ -77,6 +81,26 @@ fun under(s : Scan, names : Array String, what : Binding, e : Core,
     }
 }
 
+-- A field of `target` read or written where `target` is a name: the one use
+-- a local record keeps, outside a closure. Whether that was the case.
+fun fieldOf(s : Scan, target : Core, closed : Bool) -> Bool = match target.kind {
+    CVar(name) -> {
+        escapes(s, name, True, closed)
+        True
+    }
+    _ -> False
+}
+
+-- A `let` of a record: a candidate, unless it is already seen to escape.
+fun record(s : Scan, name : String, closed : Bool,
+           binders : Array Ty.VarCell) -> Binding {
+    if closed || len(binders) > 0 || Set.contains(s.records, name) {
+        Set.add(s.escapedRecords, name)
+    }
+    Set.add(s.records, name)
+    Record
+}
+
 fun walk(s : Scan, e : Core, closed : Bool) -> Unit {
     match e.kind {
         CLet(name, _, bound, body, binders) -> {
@@ -86,12 +110,14 @@ fun walk(s : Scan, e : Core, closed : Bool) -> Unit {
                     Set.add(s.refs, name)
                     Reference
                 }
-                CRecord(_, _) -> {
-                    if closed || len(binders) > 0 || Set.contains(s.records, name) {
-                        Set.add(s.escapedRecords, name)
+                CRecord(_, _) -> record(s, name, closed, binders)
+                CApp(fn, _) -> match fn.kind {
+                    CCon(con) -> if Decls.isRecordCon(s.decls, con) {
+                        record(s, name, closed, binders)
+                    } else {
+                        Plain
                     }
-                    Set.add(s.records, name)
-                    Record
+                    _ -> Plain
                 }
                 _ -> Plain
             }
@@ -132,13 +158,8 @@ fun walk(s : Scan, e : Core, closed : Bool) -> Unit {
             }
             _ -> {}
         }
-        CField(target, _) -> match target.kind {
-            CVar(name) -> {
-                escapes(s, name, True, closed)
-                return
-            }
-            _ -> {}
-        }
+        CField(target, _) -> if fieldOf(s, target, closed) { return }
+        CProject(target, _) -> if fieldOf(s, target, closed) { return }
         _ -> {}
     }
     let _ = Core.mapKind(e.kind, Mapper {

@@ -147,7 +147,10 @@ type Lower = Lower {
     var flatRefs : Set.Set String,
     var flatRecords : Set.Set String,
     localRefs : Map Int (Int, Rep),
+    -- A local dictionary's slots, by field name.
     localRecords : Map Int (Map String (Int, Rep)),
+    -- A local record's slots, by position.
+    localObjects : Map Int (Array (Int, Rep)),
     var nextSlot : Int,
 }
 
@@ -478,7 +481,8 @@ fun newLower(decls : DeclTable, f : Ssa.Func Low, globals : Set.Set String,
     globalRefs = globalRefs,
     fields = fields, sigs = sigs, layouts = layouts, lifted = lifted,
     shared = shared, stopped = None, flatRefs = Set.new(), flatRecords = Set.new(),
-    localRefs = Map.new(), localRecords = Map.new(), nextSlot = 0,
+    localRefs = Map.new(), localRecords = Map.new(), localObjects = Map.new(),
+    nextSlot = 0,
 }
 
 -- Every constructor's fields, in the order its object holds them.
@@ -599,7 +603,7 @@ fun stop(l : Lower, what : String) -> Value {
 -- runtime value; shadowing therefore cannot mistake an ordinary pointer for a
 -- flattened binding with the same source name.
 fun prepareLocals(l : Lower, body : Core) -> Unit {
-    let (refs, records) = LocalEscape.analyze(body)
+    let (refs, records) = LocalEscape.analyze(l.decls, body)
     l.flatRefs = refs
     l.flatRecords = records
 }
@@ -621,14 +625,29 @@ fun localBinding(l : Lower, name : String, bound : Core) -> Value {
             Map.put(l.localRecords, Ssa.valueId(marker), slots)
             return marker
         }
+        CApp(fn, args) -> if Set.contains(l.flatRecords, name) && builds(l, fn) {
+            let slots = Array.map(args, fun(inner) = localSlot(l, value(l, inner)))
+            let marker = Ssa.freshValue(l.func, Ssa.traced(Ptr))
+            Map.put(l.localObjects, Ssa.valueId(marker), slots)
+            return marker
+        }
         _ -> {}
     }
     value(l, bound)
 }
 
+-- Whether `fn` is the constructor of a record, so that applying it is the
+-- build `LocalEscape` may have found does not escape. The answer there is by
+-- name, so another binding of the same name may be anything else.
+fun builds(l : Lower, fn : Core) -> Bool = match fn.kind {
+    CCon(con) -> Decls.isRecordCon(l.decls, con)
+    _ -> False
+}
+
 fun isMarker(l : Lower, v : Value) -> Bool =
     Map.contains(l.localRefs, Ssa.valueId(v))
         || Map.contains(l.localRecords, Ssa.valueId(v))
+        || Map.contains(l.localObjects, Ssa.valueId(v))
 
 fun localSlot(l : Lower, v : Value) -> (Int, Rep) {
     let slot = l.nextSlot
@@ -658,6 +677,18 @@ fun localField(l : Lower, e : Core, field : String) -> Option (Int, Rep) =
         CVar(name) -> match Map.get(l.env, name) {
             Some(v) -> match Map.get(l.localRecords, Ssa.valueId(v)) {
                 Some(slots) -> Map.get(slots, field)
+                None -> None
+            }
+            None -> None
+        }
+        _ -> None
+    }
+
+fun localPosition(l : Lower, e : Core, index : Int) -> Option (Int, Rep) =
+    match e.kind {
+        CVar(name) -> match Map.get(l.env, name) {
+            Some(v) -> match Map.get(l.localObjects, Ssa.valueId(v)) {
+                Some(slots) -> if index < len(slots) { Some(slots[index]) } else { None }
                 None -> None
             }
             None -> None
@@ -1304,9 +1335,12 @@ fun valueHere(l : Lower, e : Core) -> Value {
         }
         -- An erased wrapper has nothing to read out of: the value in hand
         -- already is the payload, the way a pattern on one binds it directly.
-        CProject(target, index) -> match Decls.erasedPayload(l.decls, target.ty) {
+        CProject(target, index) -> match localPosition(l, target, index) {
+            Some((slot, held)) -> coerce(l, L.emit(l.b, SlotLoad(slot), held), rep)
+            None -> match Decls.erasedPayload(l.decls, target.ty) {
             Some(_) -> value(l, target)
             None -> L.emit(l.b, ObjectGet(value(l, target), index), rep)
+            }
         }
         CField(target, name) -> match localField(l, target, name) {
             Some((slot, held)) -> coerce(l, L.emit(l.b, SlotLoad(slot), held), rep)
@@ -1407,7 +1441,7 @@ fun control(l : Lower, e : Core, rep : Rep) -> Value {
     arrived
 }
 
--- The three shapes of assignment target.
+-- The shapes of assignment target.
 fun store(l : Lower, target : Core, x : Value) -> Unit = match target.kind {
     CIndex(array, index) -> {
         let a = value(l, array)
@@ -1424,6 +1458,10 @@ fun store(l : Lower, target : Core, x : Value) -> Unit = match target.kind {
             }
         }
     }
+    }
+    CProject(receiver, index) -> match localPosition(l, receiver, index) {
+        Some((slot, held)) -> L.effect(l.b, SlotStore(slot, coerce(l, x, held)))
+        None -> L.effect(l.b, ObjectSet(value(l, receiver), index, x))
     }
     -- Anything else is a reference cell: a `var`, whose mentions are already
     -- `CDeref` and whose assignment is a store through the cell itself.

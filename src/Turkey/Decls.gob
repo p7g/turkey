@@ -7,7 +7,7 @@ module Turkey.Decls (
     head, registerAll, settleKinds,
     star, toType, instantiateCon, con, recordFields, varFields, fieldSpan,
     existentialFields,
-    fieldType, projectionTypes, hasIdentity,
+    fieldType, projectionTypes, payloadType, hasIdentity, isRecordCon,
     substitute, newtypes, erasedPayload, conFieldTypes, conFieldTypesOpened,
     variantCount, Compact(..), compactShape, compactOf,
     showDeclarations,
@@ -86,6 +86,12 @@ fun isMutable(t : TyconInfo) -> Bool =
 -- assigning through one. Such a build may not be copied, rebuilt from its
 -- fields, or matched through in place of the object it makes. However it was
 -- written -- `Counter(0)` makes an object exactly as `Counter { n = 0 }` does.
+-- Whether `name` constructs a record: its fields are named.
+fun isRecordCon(t : DeclTable, name : String) -> Bool = match con(t, name) {
+    Some(info) -> isRecord(info)
+    None -> False
+}
+
 fun hasIdentity(t : DeclTable, name : String) -> Bool = match con(t, name) {
     Some(info) -> match Map.get(t.tycons, info.tycon) {
         Some(tycon) -> isMutable(tycon)
@@ -867,15 +873,32 @@ fun variantCount(t : DeclTable, name : String) -> Int =
         }
     }
 
+-- The element types `.0`, `.1`, ... may read from a single-variant type: its
+-- payload, unless its fields are named, which a program reads by name.
 fun projectionTypes(t : DeclTable, receiver : Ty.Type) -> Option (Array Ty.Type) {
+    let (h, _) = Ty.spine(receiver)
+    match h {
+        TCon(c) -> match Map.get(t.tycons, c.name) {
+            Some(info) -> if len(info.variants) == 1 && isRecord(info.variants[0]) {
+                return None
+            }
+            None -> return None
+        }
+        _ -> return None
+    }
+    payloadTypes(t, receiver)
+}
+
+-- The field types of a single-variant type's one constructor at `receiver`,
+-- by position, whether its fields are named or not: what a position in its
+-- object holds.
+fun payloadTypes(t : DeclTable, receiver : Ty.Type) -> Option (Array Ty.Type) {
     let (h, args) = Ty.spine(receiver)
     match h {
         TCon(c) -> match Map.get(t.tycons, c.name) {
             None -> None
             Some(info) -> {
-                if len(info.variants) != 1 || isRecord(info.variants[0]) {
-                    return None
-                }
+                if len(info.variants) != 1 { return None }
                 match info.variants[0].scheme.body {
                     TFun(params, ret) -> {
                         let mapping = paramMapping(ret, args)
@@ -884,6 +907,24 @@ fun projectionTypes(t : DeclTable, receiver : Ty.Type) -> Option (Array Ty.Type)
                     _ -> None
                 }
             }
+        }
+        _ -> None
+    }
+}
+
+-- One position of `payloadTypes`, without substituting into the others.
+fun payloadType(t : DeclTable, receiver : Ty.Type, index : Int) -> Option Ty.Type {
+    let (h, args) = Ty.spine(receiver)
+    let info = match h {
+        TCon(c) -> Map.get(t.tycons, c.name)?
+        _ -> return None
+    }
+    if len(info.variants) != 1 { return None }
+    match info.variants[0].scheme.body {
+        TFun(params, ret) -> if index < len(params) {
+            Some(substitute(params[index], paramMapping(ret, args)))
+        } else {
+            None
         }
         _ -> None
     }

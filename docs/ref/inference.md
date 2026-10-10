@@ -95,8 +95,8 @@ cannot be inferred to call itself at a different type. With a complete
 
 > **For readers new to this.** The *value restriction* is the rule ML uses to
 > keep polymorphism and mutation apart. Without it, `let cell = []` could be
-> both an `Array Int` and an `Array String`, and a program could push an `Int`
-> and then read it back as a `String`.
+> both a `Vec Int` and a `Vec String`, and a program could push an `Int` and
+> then read it back as a `String`.
 
 ## Numeric literals
 

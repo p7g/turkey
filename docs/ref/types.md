@@ -622,10 +622,12 @@ A record field can be assigned only if its declaration marks it `var`:
 type Account = Account { owner : String, var balance : Int }
 ```
 
-* **Mutable:** arrays, whose elements can be assigned, and records with at
-  least one `var` field. Only a record's `var` fields can be assigned
-  ([Assignment](statements.md#assignment)); `owner` above is fixed when the
-  `Account` is built.
+* **Mutable:** arrays, whose elements can be assigned; `Vec`s, whose
+  elements can be assigned and which can also grow and shrink; and records
+  with at least one `var` field. An `Array` keeps the length it was made
+  with ([`Array`](builtins.md#array)). Only a record's `var` fields can be
+  assigned ([Assignment](statements.md#assignment)); `owner` above is fixed
+  when the `Account` is built.
 * **Immutable:** everything else. That is every primitive type, every string,
   every tuple, every function, every positional constructor, every record
   with no `var` field, and every type with more than one constructor, even
@@ -662,13 +664,19 @@ fun main() {
 
     let xs = [1, 2]
     let ys = xs
-    Vec.push(ys, 3)
+    ys[0] = 7
     print(xs)
+
+    let stack = [1, 2]
+    let same = stack
+    Vec.push(same, 3)
+    print(stack)
 }
 ```
 
 ```text
 15
+[7, 2]
 [1, 2, 3]
 ```
 

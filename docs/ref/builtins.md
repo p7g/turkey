@@ -60,12 +60,13 @@ and continues with the value in a `Right`.
 
 ## `Array`
 
-`Array a` is a growable, mutable sequence of `a`, with
-[reference semantics](types.md#mutability-and-sharing). Its constructor is
-hidden: arrays are made with [array literals](expressions.md#array-literals)
-and with library functions such as `Array.filled` and `Array.init`.
-`Array.init(n, f)` is an array of length `n` whose element `i` is `f(i)`,
-computed in order from `0`:
+`Array a` is a fixed-length, mutable sequence of `a`, with
+[reference semantics](types.md#mutability-and-sharing). Its length is set when
+it is made and never changes, but its elements can be assigned. Its
+constructor is hidden: arrays are made with
+[array literals](expressions.md#array-literals) and with library functions
+such as `Array.filled` and `Array.init`. `Array.init(n, f)` is an array of
+length `n` whose element `i` is `f(i)`, computed in order from `0`:
 
 <!-- run -->
 ```kotlin
@@ -84,10 +85,49 @@ their length is `len(xs)`, `for x in xs` visits their elements in order, and
 `0 .. len(xs) - 1` panics. `Array` is a `Monad`, whose `?` runs the rest of the
 block once per element.
 
+Assigning an element changes the array in place; nothing changes its length:
+
+<!-- run -->
+```kotlin
+fun main() {
+    let counts = Array.filled(3, 0)
+    for word in ["a", "bb", "a", "ccc"] {
+        let n = String.byteLength(word) - 1
+        counts[n] = counts[n] + 1
+    }
+    print(counts)
+}
+```
+
+```text
+[2, 1, 1]
+```
+
+So the module `Array` has no `push`, `pop` or `clear`. A sequence that grows
+is a [`Vec`](#vec):
+
+<!-- error: 'Array.push' is not defined -->
+```kotlin
+fun main() {
+    let xs = [1, 2]
+    Array.push(xs, 3)
+}
+```
+
+> **Coming from Rust:** `Array a` is not `[T; N]`: its length is not part of
+> its type, and two arrays of different lengths have the same type. It is
+> closest to a `Box<[T]>`, a boxed slice, shared by reference. `Vec` is
+> Rust's `Vec`.
+
+> **Coming from Haskell:** an `Array` is mutable. Assigning `xs[i] = v`
+> changes the array every other reference to it sees; it is not a new array
+> with one element replaced. It is closest to an `IOArray Int a` indexed from
+> zero.
+
 ## `Vec`
 
-`Vec a` is a growable, mutable sequence of `a`: `Vec.push` adds an element at
-the end, `Vec.pop` removes the last one, and `Vec.clear` removes them all. It
+`Vec a` is a growable, mutable sequence of `a`: its length changes as
+`Vec.push` adds an element at the end, `Vec.pop` removes the last one, and `Vec.clear` removes them all. It
 has the same instances as `Array` (indexing, `len`, `for`, `+`, `Show`,
 `Monad` and the rest), and the module `Vec` has the same functions as `Array`,
 such as `Vec.map`, `Vec.sort` and `Vec.slice`. Its constructor is hidden too: a

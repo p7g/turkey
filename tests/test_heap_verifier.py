@@ -416,12 +416,14 @@ def test_verifier_detects_corruption(verifier_probe, case, diagnostic):
 @pytest.mark.parametrize("defect", ["native-roots", "children"])
 def test_broken_collector_is_stopped_before_sweeping(tmp_path, defect):
     source = tmp_path / "main.gob"
-    # Arrays in an array that grows, so that objects are reachable only
-    # through other heap objects while the program allocates.
+    # Arrays in a `Vec` that grows, so that objects are reachable only
+    # through other heap objects while the program allocates. Ten of them:
+    # the broken marker is caught from five, once the `Vec` reallocates its
+    # storage holding four, and not with fewer.
     source.write_text('''
 fun main() {
     var rows = []
-    for var i = 0; i < 3; i = i + 1 {
+    for var i = 0; i < 10; i = i + 1 {
         Vec.push(rows, [i, i + 1])
     }
     print(rows[2][1] + 39)

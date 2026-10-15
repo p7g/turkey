@@ -1,0 +1,106 @@
+module Turkey.Errors (IOError(..), ErrorKind(..), failure, kindOf)
+
+-- `IOError`, what a failed operation on a file, a pipe or a standard stream
+-- says, and the one place a negated `errno` becomes one. `System.IO`
+-- re-exports the two types; the library's I/O modules build them here.
+
+import Turkey.Fd as Fd
+import Turkey.Sys as Sys
+
+-- What failed (`kind`), in which operation (`op`, such as "open"), and on
+-- which path, if the operation had one. The path is kept for the message: an
+-- error that says "no such file or directory" without saying which file is
+-- the shape to avoid.
+type IOError = IOError { kind : ErrorKind, op : String, path : Option String }
+
+-- A closed sum, so that a program can recover from each case it cares about
+-- and be told when it has not considered one. `NotSeekable` is a positional
+-- read or write on something that has no positions: a FIFO, a pipe, a
+-- terminal. `Closed` is an operation on a file after `close`. `Other` keeps
+-- the `errno` of anything else.
+type ErrorKind = NotFound | PermissionDenied | AlreadyExists | IsDirectory | NotDirectory
+               | BrokenPipe | NoSpace | NotSeekable | Closed | Other(Int)
+
+-- The error a failed `result` -- a negated `errno`, or `Fd.closed` -- means
+-- for `op` on `path`.
+fun failure(op : String, path : Option String, result : Int) -> IOError =
+    IOError { kind = kindOf(result), op = op, path = path }
+
+fun kindOf(result : Int) -> ErrorKind {
+    if result == Fd.closed { return Closed }
+    let errno = 0 - result
+    if errno == Sys.enoent { NotFound }
+    else if errno == Sys.eacces || errno == Sys.eperm { PermissionDenied }
+    else if errno == Sys.eexist { AlreadyExists }
+    else if errno == Sys.eisdir { IsDirectory }
+    else if errno == Sys.enotdir { NotDirectory }
+    else if errno == Sys.epipe { BrokenPipe }
+    else if errno == Sys.enospc { NoSpace }
+    else if errno == Sys.espipe { NotSeekable }
+    else { Other(errno) }
+}
+
+instance Eq ErrorKind { fun eq(a, b) = code(a) == code(b) }
+
+-- A number per case, and past them per `errno`, for `Eq`.
+fun code(k : ErrorKind) -> Int = match k {
+    NotFound -> 0
+    PermissionDenied -> 1
+    AlreadyExists -> 2
+    IsDirectory -> 3
+    NotDirectory -> 4
+    BrokenPipe -> 5
+    NoSpace -> 6
+    NotSeekable -> 7
+    Closed -> 8
+    Other(errno) -> 9 + errno
+}
+
+instance Show ErrorKind {
+    fun show(k) = match k {
+        NotFound -> "NotFound"
+        PermissionDenied -> "PermissionDenied"
+        AlreadyExists -> "AlreadyExists"
+        IsDirectory -> "IsDirectory"
+        NotDirectory -> "NotDirectory"
+        BrokenPipe -> "BrokenPipe"
+        NoSpace -> "NoSpace"
+        NotSeekable -> "NotSeekable"
+        Closed -> "Closed"
+        Other(errno) -> "Other(" + show(errno) + ")"
+    }
+}
+
+-- As `strerror` words it, for the cases it is worth naming.
+fun describe(k : ErrorKind) -> String = match k {
+    NotFound -> "no such file or directory"
+    PermissionDenied -> "permission denied"
+    AlreadyExists -> "file exists"
+    IsDirectory -> "is a directory"
+    NotDirectory -> "not a directory"
+    BrokenPipe -> "broken pipe"
+    NoSpace -> "no space left on device"
+    NotSeekable -> "illegal seek"
+    Closed -> "file already closed"
+    Other(errno) -> otherMessage(errno)
+}
+
+fun otherMessage(errno : Int) -> String {
+    if errno == Sys.eio { "input/output error" }
+    else if errno == Sys.ebadf { "bad file descriptor" }
+    else if errno == Sys.einval { "invalid argument" }
+    else if errno == Sys.emfile { "too many open files" }
+    else if errno == Sys.erofs { "read-only file system" }
+    else if errno == Sys.enomem { "cannot allocate memory" }
+    else { "error " + show(errno) }
+}
+
+-- "open foo.txt: no such file or directory".
+instance Error IOError {
+    fun message(e) = match e.path {
+        Some(p) -> e.op + " " + p + ": " + describe(e.kind)
+        None -> e.op + ": " + describe(e.kind)
+    }
+}
+
+instance Show IOError { fun show(e) = message(e) }

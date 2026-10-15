@@ -141,7 +141,7 @@ constraints but cannot call its methods.
 
 **Re-exports.** `module M` in an export list passes on everything the module
 has in scope under the qualifier `M`, still qualified. The Prelude uses this
-to make `Array.push`, `Int.parse` and the like available everywhere
+to make `Vec.push`, `Int.parse` and the like available everywhere
 ([The Prelude](builtins.md#the-prelude)).
 
 ## Imports

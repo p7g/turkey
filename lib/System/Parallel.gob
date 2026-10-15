@@ -40,9 +40,11 @@ fun lesser(a : Int, b : Int) -> Int = if a < b { a } else { b }
 
 -- The sequential `map`.
 fun mapInTurn[Iterator c, Length c, Item c ~ a](xs : c, f : fun(a) -> b) -> Array b {
-    let out = Array.new(len(xs))
-    for x in xs { Array.push(out, f(x)) }
-    out
+    let cursor = iter(xs)
+    Array.init(len(xs), fun(_) = match next(xs, cursor) {
+        Some(x) -> f(x)
+        None -> Prim.error("System.Parallel.map: fewer elements than its length")
+    })
 }
 
 -- `f` of each of `xs`, in order.
@@ -112,7 +114,7 @@ fun mapInOrder[Index c, Length c, Key c ~ Int, Value c ~ a](
     let size = chunkSize(len(xs))
     let ahead = 4 * workers()
     -- Each chunk's first index and task, cleared once it has been used.
-    let chunks : Array (Option (Int, Task.Task (Array b))) = []
+    let chunks : Vec (Option (Int, Task.Task (Array b))) = []
     var used = 0
     let useNext = fun() {
         match chunks[used] {
@@ -131,11 +133,9 @@ fun mapInOrder[Index c, Length c, Key c ~ Int, Value c ~ a](
             let from = start
             let task = Task.spawn(fun() {
                 let to = lesser(from + size, len(xs))
-                let made = Array.new(to - from)
-                for var i = from; i < to; i = i + 1 { Array.push(made, f(xs[i])) }
-                made
+                Array.init(to - from, fun(k) = f(xs[from + k]))
             })?
-            Array.push(chunks, Some((from, task)))
+            Vec.push(chunks, Some((from, task)))
         }
         while used < len(chunks) { useNext() }
         pure(())
@@ -164,9 +164,9 @@ fun graphWith[Iterator d, Item d ~ Int](
     run : fun(s, Int, fun(Int) -> b) -> b) -> Array b {
     let g = Graph {
         results = Array.filled(count, None), waitingOn = Array.filled(count, 0),
-        dependents = [], ready = [], next = 0, unfinished = count, waiters = [],
+        dependents = Array.init(count, fun(_) = []), ready = [], next = 0,
+        unfinished = count, waiters = [],
     }
-    for var i = 0; i < count; i = i + 1 { Array.push(g.dependents, []) }
     for var i = 0; i < count; i = i + 1 {
         for d in dependsOn(i) {
             if d < 0 || d >= count {
@@ -175,11 +175,11 @@ fun graphWith[Iterator d, Item d ~ Int](
                                   + Int.toString(d))
             }
             g.waitingOn[i] = g.waitingOn[i] + 1
-            Array.push(g.dependents[d], i)
+            Vec.push(g.dependents[d], i)
         }
     }
     for var i = 0; i < count; i = i + 1 {
-        if g.waitingOn[i] == 0 { Array.push(g.ready, i) }
+        if g.waitingOn[i] == 0 { Vec.push(g.ready, i) }
     }
     if !acyclic(g, count) {
         return Prim.error("System.Parallel.graph: the steps' dependencies have a cycle")
@@ -213,23 +213,23 @@ type Graph b = Graph {
     results        : Array (Option b),
     -- Unfinished dependencies of each step, and the steps depending on each.
     waitingOn      : Array Int,
-    dependents     : Array (Array Int),
+    dependents     : Array (Vec Int),
     -- Steps ready to run, from `next` on.
-    ready          : Array Int,
+    ready          : Vec Int,
     var next       : Int,
     var unfinished : Int,
-    var waiters    : Array Co.Coroutine,
+    var waiters    : Vec Co.Coroutine,
 }
 
 -- Whether the steps can all run: Kahn's count over a copy of `waitingOn`.
 fun acyclic(g : Graph b, count : Int) -> Bool {
     let waiting = Array.map(g.waitingOn, fun(n) = n)
-    let queue = Array.map(g.ready, fun(n) = n)
+    let queue = Vec.map(g.ready, fun(n) = n)
     var at = 0
     while at < len(queue) {
         for d in g.dependents[queue[at]] {
             waiting[d] = waiting[d] - 1
-            if waiting[d] == 0 { Array.push(queue, d) }
+            if waiting[d] == 0 { Vec.push(queue, d) }
         }
         at = at + 1
     }
@@ -241,7 +241,7 @@ fun steps(g : Graph b, state : s, run : fun(s, Int, fun(Int) -> b) -> b,
           finished : fun(Int) -> b) -> Unit {
     while True {
         Scheduler.waitUntil(fun() = g.next < len(g.ready) || g.unfinished == 0,
-                            fun(c) = Array.push(g.waiters, c))
+                            fun(c) = Vec.push(g.waiters, c))
         Scheduler.lock()
         if g.next == len(g.ready) {
             let over = g.unfinished == 0
@@ -258,7 +258,7 @@ fun steps(g : Graph b, state : s, run : fun(s, Int, fun(Int) -> b) -> b,
         g.unfinished = g.unfinished - 1
         for d in g.dependents[step] {
             g.waitingOn[d] = g.waitingOn[d] - 1
-            if g.waitingOn[d] == 0 { Array.push(g.ready, d) }
+            if g.waitingOn[d] == 0 { Vec.push(g.ready, d) }
         }
         for c in g.waiters { Scheduler.wake(c) }
         g.waiters = []

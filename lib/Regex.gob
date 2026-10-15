@@ -14,11 +14,11 @@ type Instruction
     | Open(Int)
     | Close(Int)
 
-type Builder a = Builder { code : Array Instruction, value : a }
+type Builder a = Builder { code : Vec Instruction, value : a }
 type Capture a = Capture(fun(Captures) -> a)
-type Captures = Captures { text : String, nodes : Array Node }
+type Captures = Captures { text : String, nodes : Vec Node }
 type Node = Node {
-    tag : Int, start : String.Index, end : String.Index, children : Array Node
+    tag : Int, start : String.Index, end : String.Index, children : Vec Node
 }
 type Supply = Supply { var next : Int }
 let supply = Supply { next = 0 }
@@ -35,10 +35,10 @@ fun shifted(inst : Instruction, offset : Int) -> Instruction = match inst {
     _ -> inst
 }
 
-fun appendCode(left : Array Instruction, right : Array Instruction) -> Array Instruction {
-    let out = Array.new(len(left) + len(right))
-    for inst in left { Array.push(out, inst) }
-    for inst in right { Array.push(out, shifted(inst, len(left))) }
+fun appendCode(left : Vec Instruction, right : Vec Instruction) -> Vec Instruction {
+    let out = Vec.new(len(left) + len(right))
+    for inst in left { Vec.push(out, inst) }
+    for inst in right { Vec.push(out, shifted(inst, len(left))) }
     out
 }
 
@@ -102,12 +102,12 @@ instance Resolve Unit {
     fun resolve(value, captures) = ()
 }
 
-fun scopedCode(code : Array Instruction, tag : Int) -> Array Instruction {
+fun scopedCode(code : Vec Instruction, tag : Int) -> Vec Instruction {
     let out = [Open(tag)]
     for inst in code {
-        Array.push(out, shifted(inst, 1))
+        Vec.push(out, shifted(inst, 1))
     }
-    Array.push(out, Close(tag))
+    Vec.push(out, Close(tag))
     out
 }
 
@@ -143,7 +143,7 @@ fun capture(body : Builder a) -> Builder (Capture String) {
 fun literal(text : String) -> Builder (Capture String) {
     let code = []
     for c in String.codePoints(text) {
-        Array.push(code, Consume(_ == c))
+        Vec.push(code, Consume(_ == c))
     }
     capture(Builder { code = code, value = () })
 }
@@ -163,11 +163,11 @@ fun satisfy(predicate : fun(Char) -> Bool) -> Builder (Capture Char) {
     }
 }
 
-fun choiceCode(left : Array Instruction, right : Array Instruction) -> Array Instruction {
+fun choiceCode(left : Vec Instruction, right : Vec Instruction) -> Vec Instruction {
     let out = [Split(1, len(left) + 2)]
-    for inst in left { Array.push(out, shifted(inst, 1)) }
-    Array.push(out, Jump(len(left) + len(right) + 2))
-    for inst in right { Array.push(out, shifted(inst, len(left) + 2)) }
+    for inst in left { Vec.push(out, shifted(inst, 1)) }
+    Vec.push(out, Jump(len(left) + len(right) + 2))
+    for inst in right { Vec.push(out, shifted(inst, len(left) + 2)) }
     out
 }
 
@@ -196,7 +196,7 @@ fun optional[Resolve a](body : Builder a) -> Builder (Capture (Option (Output a)
     let tag = fresh()
     let branch = scopedCode(body.code, tag)
     let code = [Split(1, len(branch) + 1)]
-    for inst in branch { Array.push(code, shifted(inst, 1)) }
+    for inst in branch { Vec.push(code, shifted(inst, 1)) }
     Builder {
         code = code,
         value = Capture(fun(captures) =
@@ -205,25 +205,25 @@ fun optional[Resolve a](body : Builder a) -> Builder (Capture (Option (Output a)
 }
 
 fun repeated[Resolve a](body : Builder a, atLeastOne : Bool)
-        -> Builder (Capture (Array (Output a))) {
+        -> Builder (Capture (Vec (Output a))) {
     let tag = fresh()
     let branch = scopedCode(body.code, tag)
-    let code = Array.new(len(branch) + 2)
-    if !atLeastOne { Array.push(code, Split(1, len(branch) + 2)) }
+    let code = Vec.new(len(branch) + 2)
+    if !atLeastOne { Vec.push(code, Split(1, len(branch) + 2)) }
     let offset = len(code)
-    for inst in branch { Array.push(code, shifted(inst, offset)) }
+    for inst in branch { Vec.push(code, shifted(inst, offset)) }
     if atLeastOne {
-        Array.push(code, Split(0, len(code) + 1))
+        Vec.push(code, Split(0, len(code) + 1))
     } else {
-        Array.push(code, Jump(0))
+        Vec.push(code, Jump(0))
     }
     Builder {
         code = code,
         value = Capture(fun(captures) {
-            let values = Array.new(0)
+            let values = Vec.new(0)
             for node in captures.nodes {
                 if node.tag == tag {
-                    Array.push(values, resolve(body.value, nested(captures, node)))
+                    Vec.push(values, resolve(body.value, nested(captures, node)))
                 }
             }
             values
@@ -231,23 +231,23 @@ fun repeated[Resolve a](body : Builder a, atLeastOne : Bool)
     }
 }
 
-fun many[Resolve a](body : Builder a) -> Builder (Capture (Array (Output a))) =
+fun many[Resolve a](body : Builder a) -> Builder (Capture (Vec (Output a))) =
     repeated(body, False)
 
-fun some[Resolve a](body : Builder a) -> Builder (Capture (Array (Output a))) =
+fun some[Resolve a](body : Builder a) -> Builder (Capture (Vec (Output a))) =
     repeated(body, True)
 
 -- Persistent event histories share prefixes across threads. Branches do not
 -- mutate each other's captures. Build the capture tree only for the winner.
 type History = Empty | Event(Bool, Int, String.Index, History)
 type Thread = Thread { pc : Int, history : History }
-type Frame = Frame { tag : Int, start : String.Index, children : Array Node }
+type Frame = Frame { tag : Int, start : String.Index, children : Vec Node }
 
 fun materialize(text : String, history : History) -> Captures {
-    let events = Array.new(0)
+    let events = Vec.new(0)
     var rest = history
     while let Event(opening, tag, at, previous) = rest {
-        Array.push(events, (opening, tag, at))
+        Vec.push(events, (opening, tag, at))
         rest = previous
     }
     let root = Frame { tag = -1, start = String.start(text), children = [] }
@@ -257,13 +257,13 @@ fun materialize(text : String, history : History) -> Captures {
         i = i - 1
         let (opening, tag, at) = events[i]
         if opening {
-            Array.push(stack, Frame { tag = tag, start = at, children = [] })
+            Vec.push(stack, Frame { tag = tag, start = at, children = [] })
         } else {
-            let frame = Option.expect(Array.pop(stack), "Regex: unbalanced capture history")
+            let frame = Option.expect(Vec.pop(stack), "Regex: unbalanced capture history")
             if frame.tag != tag || len(stack) == 0 {
                 error("Regex: unbalanced capture history")
             }
-            Array.push(stack[len(stack) - 1].children, Node {
+            Vec.push(stack[len(stack) - 1].children, Node {
                 tag = tag, start = frame.start, end = at, children = frame.children
             })
         }
@@ -272,35 +272,35 @@ fun materialize(text : String, history : History) -> Captures {
     Captures { text = text, nodes = root.children }
 }
 
-fun unseen(code : Array Instruction) -> Array Bool = Array.filled(len(code) + 1, False)
+fun unseen(code : Vec Instruction) -> Array Bool = Array.filled(len(code) + 1, False)
 
 -- Explicit stack avoids recursive epsilon traversal. Push right before left
 -- to process the left branch first. Each PC is visited once per input position.
-fun addThread(code : Array Instruction, threads : Array Thread, seen : Array Bool,
+fun addThread(code : Vec Instruction, threads : Vec Thread, seen : Array Bool,
         pc : Int, history : History, at : String.Index) -> Unit {
     let pending = [Thread { pc = pc, history = history }]
     while len(pending) > 0 {
-        let thread = Option.expect(Array.pop(pending), "Regex: empty thread stack")
+        let thread = Option.expect(Vec.pop(pending), "Regex: empty thread stack")
         let current = thread.pc
         if seen[current] { continue }
         seen[current] = True
         if current == len(code) {
-            Array.push(threads, thread)
+            Vec.push(threads, thread)
             continue
         }
         match code[current] {
-            Jump(target) -> Array.push(pending, Thread { pc = target, history = thread.history })
+            Jump(target) -> Vec.push(pending, Thread { pc = target, history = thread.history })
             Split(left, right) -> {
-                Array.push(pending, Thread { pc = right, history = thread.history })
-                Array.push(pending, Thread { pc = left, history = thread.history })
+                Vec.push(pending, Thread { pc = right, history = thread.history })
+                Vec.push(pending, Thread { pc = left, history = thread.history })
             }
-            Open(tag) -> Array.push(pending, Thread {
+            Open(tag) -> Vec.push(pending, Thread {
                 pc = current + 1, history = Event(True, tag, at, thread.history)
             })
-            Close(tag) -> Array.push(pending, Thread {
+            Close(tag) -> Vec.push(pending, Thread {
                 pc = current + 1, history = Event(False, tag, at, thread.history)
             })
-            Consume(_) -> Array.push(threads, thread)
+            Consume(_) -> Vec.push(threads, thread)
         }
     }
 }

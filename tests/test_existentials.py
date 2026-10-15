@@ -114,7 +114,7 @@ fun main() {
      "    Some(x) | Other(x) -> show(x)\n}\nfun main() {}\n",
      "an arm with alternatives cannot open"),
     ("type Some = Some[Show a](a)\nfun f(v : Some) -> Unit {\n"
-     "    var hold = []\n    match v {\n        Some(x) -> Array.push(hold, x)\n"
+     "    var hold = []\n    match v {\n        Some(x) -> Vec.push(hold, x)\n"
      "    }\n}\nfun main() {}\n",
      "cannot escape the pattern 'Some' that opened it"),
     ("type Some = Some[a](a)\nfun f(v : Some) -> String = match v {\n"

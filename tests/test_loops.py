@@ -112,7 +112,7 @@ def test_a_return_out_of_a_loop_leaves_the_function():
 
 
 def test_a_transfer_inside_a_call_argument_keeps_evaluation_order():
-    """`bf.gob` writes `Array.push(ops, match c { ']' -> break, _ -> ... })`.
+    """`bf.gob` writes `Vec.push(ops, match c { ']' -> break, _ -> ... })`.
 
     A transfer in an operand cannot simply be hoisted out: the arguments
     beside it would then be evaluated after it, and the evaluator is strict
@@ -129,7 +129,7 @@ fun main() {
     var i = 0
     loop {
         i = i + 1
-        Array.push(log, if i > 2 { break } else { i })
+        Vec.push(log, if i > 2 { break } else { i })
     }
     print(log)
 }

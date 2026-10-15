@@ -19,9 +19,9 @@ fun pairs(text) = R.fullMatch(R.many(do {
 }), text)
 ''')
     assert signatures['either'] == 'fun(String) -> Option (Either String Char)'
-    assert signatures['repeated'] == 'fun(String) -> Option (Array String)'
+    assert signatures['repeated'] == 'fun(String) -> Option (Vec String)'
     assert signatures['optional'] == 'fun(String) -> Option (Option String)'
-    assert signatures['pairs'] == 'fun(String) -> Option (Array (String, Option String))'
+    assert signatures['pairs'] == 'fun(String) -> Option (Vec (String, Option String))'
 
 
 @pytest.mark.parametrize('source', [

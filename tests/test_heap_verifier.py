@@ -422,7 +422,7 @@ def test_broken_collector_is_stopped_before_sweeping(tmp_path, defect):
 fun main() {
     var rows = []
     for var i = 0; i < 3; i = i + 1 {
-        Array.push(rows, [i, i + 1])
+        Vec.push(rows, [i, i + 1])
     }
     print(rows[2][1] + 39)
 }

@@ -35,7 +35,7 @@ var count = 0
 fun run(rounds : Int) -> Int {
     let lock = Lock.new()
     let workers = []
-    for var w = 0; w < Parallel.workers(); w = w + 1 { Array.push(workers, w) }
+    for var w = 0; w < Parallel.workers(); w = w + 1 { Vec.push(workers, w) }
     Parallel.each(workers, fun(_) {
         for var i = 0; i < rounds; i = i + 1 {
             Lock.acquire(lock)
@@ -91,8 +91,8 @@ import System.Task as Task
 fun work(n : Int) -> Int {
     var total = 0
     for var round = 0; round < 10; round = round + 1 {
-        let parts : Array String = []
-        for var i = 0; i < 40; i = i + 1 { Array.push(parts, Int.toString(n * 1000 + i)) }
+        let parts : Vec String = []
+        for var i = 0; i < 40; i = i + 1 { Vec.push(parts, Int.toString(n * 1000 + i)) }
         total = total + String.byteLength(String.join(parts, ","))
         let m = Map.new()
         for var i = 0; i < 30; i = i + 1 { Map.put(m, i, Int.toString(i + n)) }
@@ -103,10 +103,10 @@ fun work(n : Int) -> Int {
 
 fun main() {
     let tasks = Task.runScope(do {
-        let made : Array (Task.Task Int) = []
+        let made : Vec (Task.Task Int) = []
         for var n = 0; n < 16; n = n + 1 {
             let k = n
-            Array.push(made, Task.spawn(fun() = work(k))?)
+            Vec.push(made, Task.spawn(fun() = work(k))?)
         }
         pure(made)
     })

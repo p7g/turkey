@@ -21,7 +21,7 @@ fun make(i : Int) -> Wide = Wide {{ {values}, last = "s" + Int.toString(i) }}
 
 fun main() {{
     let kept = []
-    for var i = 0; i < 300; i = i + 1 {{ Array.push(kept, make(i)) }}
+    for var i = 0; i < 300; i = i + 1 {{ Vec.push(kept, make(i)) }}
     var total = 0
     for w in kept {{ total = total + String.byteLength(w.last) + w.f0 }}
     print(total)

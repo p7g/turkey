@@ -41,7 +41,7 @@ A `Capture a` is a recipe for obtaining an `a` after a successful match.
 | `choice(left, right)` | `Either (Output a) (Output b)` |
 | `orElse(left, right)` | `Output a`, with both builders having recipe type `a` |
 | `optional(pattern)` | `Option (Output a)` |
-| `many(pattern)` / `some(pattern)` | `Array (Output a)` |
+| `many(pattern)` / `some(pattern)` | `Vec (Output a)` |
 
 `fullMatch` wraps those results in an outer `Option`: failure is `None`, while
 successful matching of an absent optional result is `Some(None)`.
@@ -56,7 +56,7 @@ R.fullMatch(R.many(R.literal("a")), "aaa")
 
 Repetition supports structured recipes, including tuple results and the
 `Assignment` recipe above. Wrap an assignment with a delimiter in an ordinary
-`do` block, then apply `some` to obtain an `Array Assignment`. Nested repetitions
+`do` block, then apply `some` to obtain a `Vec Assignment`. Nested repetitions
 produce nested arrays. Each iteration resolves against its own capture subtree;
 optional values and branch choices cannot leak from an earlier iteration.
 

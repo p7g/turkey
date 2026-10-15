@@ -21,17 +21,17 @@ fun main() {
     let log = Sync.mutex([])
     let hits = Sync.atomicInt(0)
     let items = []
-    for var i = 0; i < 400; i = i + 1 { Array.push(items, i) }
+    for var i = 0; i < 400; i = i + 1 { Vec.push(items, i) }
     Parallel.each(items, fun(i) {
         Sync.update(total, fun(t) {
             if i % 50 == 0 { Task.yield() }
             t + i
         })
-        Sync.withLock(log, fun(entries) { Array.push(entries, i) })
+        Sync.withLock(log, fun(entries) { Vec.push(entries, i) })
         let _ = Sync.addAndGet(hits, 1)
     })
     print(Sync.withLock(total, fun(t) = t))
-    print(Sync.withLock(log, fun(entries) = len(Array.sort(entries))))
+    print(Sync.withLock(log, fun(entries) = len(Vec.sort(entries))))
     print(Sync.load(hits))
     print(Sync.compareAndSet(hits, 400, 7))
     print(Sync.compareAndSet(hits, 400, 8))
@@ -61,7 +61,7 @@ fun main() {
         "made"
     })
     let items = []
-    for var i = 0; i < 200; i = i + 1 { Array.push(items, i) }
+    for var i = 0; i < 200; i = i + 1 { Vec.push(items, i) }
     let seen = Parallel.map(items, fun(_) = Sync.force(value))
     print(len(Array.filter(seen, fun(s) = s == "made")))
     print(Sync.force(value))

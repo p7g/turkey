@@ -155,7 +155,7 @@ fun main() {
 
 A constructor with a payload is called the same way: `Some(3)`, `Card(10, Hearts)`.
 
-A module-qualified name, such as `Array.push` or `String.split`, is a function
+A module-qualified name, such as `Vec.push` or `String.split`, is a function
 from another module ([Modules](modules.md#qualified-names)). A qualified
 function is an ordinary value and can be passed like any other:
 `Array.map(words, String.byteLength)`.
@@ -360,15 +360,25 @@ approximately equivalent to:
 
 ```ebnf
 {
-    let $array = Array.new(n)
-    Array.push($array, e1)
+    let $array = Array.filled(n, e1)
+    $array[1] = e2
     ...
-    Array.push($array, en)
+    $array[n - 1] = en
     $array
 }
 ```
 
-and when it is a `Vec`, to the same with `Vec.new` and `Vec.push`.
+with `[]` an empty `Array`, and when it is a `Vec`, to:
+
+```ebnf
+{
+    let $vec = Vec.new(n)
+    Vec.push($vec, e1)
+    ...
+    Vec.push($vec, en)
+    $vec
+}
+```
 
 <!-- run -->
 ```kotlin
@@ -417,8 +427,8 @@ literal:
 <!-- run -->
 ```kotlin
 fun main() {
-    let names = [] : Array String
-    Array.push(names, "Ada")
+    let names = [] : Vec String
+    Vec.push(names, "Ada")
     print(names)
     print(3 : Float)
 }

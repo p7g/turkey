@@ -111,9 +111,9 @@ type Box = Box { x : Int, y : Int }
 type Holder = Holder { var item : Box }
 type Chain = Link(Int, Chain) | End
 
-var kept : Array Box = []
+var kept : Vec Box = []
 
-fun toGlobal(n : Int) -> Unit { Array.push(kept, Box { x = n, y = 0 }) }
+fun toGlobal(n : Int) -> Unit { Vec.push(kept, Box { x = n, y = 0 }) }
 
 fun returned(n : Int) -> Box = Box { x = n, y = 0 }
 

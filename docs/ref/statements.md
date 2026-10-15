@@ -45,7 +45,7 @@ block. A block is a scope: its declarations are not visible after it.
 ### Discarded values
 
 A statement whose value is not used must have type `Unit`. Computing a value
-and dropping it is usually a mistake, such as calling `Array.pop` for its
+and dropping it is usually a mistake, such as calling `Vec.pop` for its
 effect and forgetting that the popped element was the point. So it is an
 error:
 
@@ -53,7 +53,7 @@ error:
 ```kotlin
 fun main() {
     let stack = [1, 2, 3]
-    Array.pop(stack)
+    Vec.pop(stack)
     print(stack)
 }
 ```
@@ -64,7 +64,7 @@ To drop a value on purpose, bind it to `_`:
 ```kotlin
 fun main() {
     let stack = [1, 2, 3]
-    let _ = Array.pop(stack)
+    let _ = Vec.pop(stack)
     print(stack)
 }
 ```
@@ -191,7 +191,7 @@ inside `A`.
 ```kotlin
 fun main() {
     let queue = [3, 8]
-    if let Some(last) = Array.pop(queue) {
+    if let Some(last) = Vec.pop(queue) {
         print("took " + show(last))
     } else {
         print("empty")
@@ -231,11 +231,11 @@ which may be a block.
 type Command = Push(Int) | Pop | Clear
 
 fun apply(stack, command) = match command {
-    Push(n) -> Array.push(stack, n)
+    Push(n) -> Vec.push(stack, n)
     Pop -> {
-        let _ = Array.pop(stack)
+        let _ = Vec.pop(stack)
     }
-    Clear -> Array.clear(stack)
+    Clear -> Vec.clear(stack)
 }
 
 fun main() {
@@ -307,7 +307,7 @@ so `e` is evaluated again before every iteration, including after a
 ```kotlin
 fun main() {
     let pending = ["c", "b", "a"]
-    while let Some(task) = Array.pop(pending) {
+    while let Some(task) = Vec.pop(pending) {
         print("doing " + task)
     }
 }

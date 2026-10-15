@@ -22,8 +22,8 @@ import System.Task as Task
 fun churn(n : Int) -> Int {
     var total = 0
     for var r = 0; r < 100; r = r + 1 {
-        let parts : Array String = []
-        for var i = 0; i < 50; i = i + 1 { Array.push(parts, Int.toString(n + i)) }
+        let parts : Vec String = []
+        for var i = 0; i < 50; i = i + 1 { Vec.push(parts, Int.toString(n + i)) }
         total = total + String.byteLength(String.join(parts, ","))
     }
     total

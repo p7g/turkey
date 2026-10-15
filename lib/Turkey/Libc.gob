@@ -1,7 +1,8 @@
 module Turkey.Libc (
     malloc, free, strlen, alignedAlloc, realloc, mmap, munmap, mprotect,
     getenv, sysctlbyname, sysconf, write, clockGettime,
-    open, creat, read, close,
+    open, read, pread, pwrite, close, fcntl, fcntlWith, fstat, isatty,
+    errnoDarwin, errnoLinux,
     floor, ceil, round, trunc, fmod, remainder, sqrt,
     pthreadAttrInit, pthreadAttrSetStackSize, pthreadAttrDestroy,
     pthreadCreate, pthreadJoin, signal, exitNow, exit,
@@ -88,7 +89,7 @@ foreign "sysctlbyname" fun sysctlbyname(name : Prim.Ptr, oldp : Prim.Ptr, oldlen
 -- A system configuration value, or -1. `name` is the platform's own number.
 foreign "sysconf" fun sysconf(name : Int) -> Int
 
--- Bytes written, or a negative errno. `count` bytes at `buf`, which the caller
+-- Bytes written, or -1 with `errno` set. `count` bytes at `buf`, which the caller
 -- owns -- nothing about this pointer is known to the collector, and what `write`
 -- does with it after returning is undefined.
 foreign "write" fun write(fd : Int, buf : Prim.Ptr, count : Int) -> Int
@@ -100,35 +101,57 @@ foreign "clock_gettime" fun clockGettime(id : Int, timespec : Prim.Ptr) -> Int
 
 -- -- files ----------------------------------------------------------------------------
 --
--- Three of these answer a C `int`, and `Int` is 64 bits: the value is in the
+-- Several of these answer a C `int`, and `Int` is 64 bits: the value is in the
 -- low half of the register and the high half is whatever the callee left
 -- there, which AAPCS64 does not promise is a sign extension. So the answer is
 -- not `-1` on failure but "something whose low 32 bits are -1", and a caller
--- reads it through `System.IO`'s `cInt` rather than comparing it directly.
+-- reads it through `Turkey.Sys.cInt` rather than comparing it directly.
 -- That is the cost of a type mapping with one integer in it, and the reason it
 -- is paid at the call rather than in the mapping: an `Int32` that crossed would
 -- be a type the language does not otherwise have.
+--
+-- Each failure sets `errno`, which `Turkey.Sys.errno` reads through the
+-- location one of the last two answers; `Turkey.Io` wraps every call here in
+-- the convention `Turkey.Sys.result` states.
 
--- A descriptor, or negative. `open` is variadic in C -- the mode is a third
--- argument read only under `O_CREAT` -- and is declared here with its two
--- fixed arguments, which is ABI-correct on both targets because no variadic
--- argument is passed: Darwin's arm64 convention puts variadics on the stack,
--- and a call with none leaves nothing there for the callee to read. `flags` is
--- only ever `O_RDONLY`, which is 0 on every platform.
-foreign "open" fun open(path : Prim.Ptr, flags : Int) -> Int
+-- A descriptor, or a C `int` -1. C declares `open` variadic: the mode is read
+-- only under `O_CREAT`, and is passed every time, which is harmless when it is
+-- not read. A `mode_t` is promoted to an `int` as a variadic argument.
+foreign "open" fun open(path : Prim.Ptr, flags : Int, ... mode : Int) -> Int
 
--- `open(path, O_WRONLY | O_CREAT | O_TRUNC, mode)`, with the mode a fixed
--- argument. It exists so that nothing here needs `O_CREAT`, whose value
--- differs between Darwin and Linux and whose mode would be variadic.
-foreign "creat" fun creat(path : Prim.Ptr, mode : Int) -> Int
-
--- Bytes read, 0 at end of file, or negative. `ssize_t`, so all 64 bits mean
+-- Bytes read, 0 at end of file, or -1. `ssize_t`, so all 64 bits mean
 -- something.
 foreign "read" fun read(fd : Int, buf : Prim.Ptr, count : Int) -> Int
 
--- 0, or negative if the descriptor could not be closed -- which for a file
+-- `read` and `write` at `offset`, an `off_t`, without moving the file's
+-- position. `ssize_t` answers, like `read`'s.
+foreign "pread" fun pread(fd : Int, buf : Prim.Ptr, count : Int, offset : Int) -> Int
+
+foreign "pwrite" fun pwrite(fd : Int, buf : Prim.Ptr, count : Int, offset : Int) -> Int
+
+-- 0, or a C `int` -1 if the descriptor could not be closed -- which for a file
 -- just written can be where a deferred write error is first reported.
 foreign "close" fun close(fd : Int) -> Int
+
+-- `fcntl` with no argument, and with one `int`, which C passes as a variadic
+-- argument. A C `int` either way.
+foreign "fcntl" fun fcntl(fd : Int, command : Int) -> Int
+
+foreign "fcntl" fun fcntlWith(fd : Int, command : Int, ... argument : Int) -> Int
+
+-- Fill the `struct stat` at `buf`, whose layout `Turkey.Sys` gives: a C `int`
+-- 0 or -1.
+foreign "fstat" fun fstat(fd : Int, buf : Prim.Ptr) -> Int
+
+-- A C `int` 1 for a terminal; 0 for anything else, with `errno` set.
+foreign "isatty" fun isatty(fd : Int) -> Int
+
+-- The address of the calling thread's `errno`, as each target's libc spells
+-- it: neither defines the other's, so a caller names only one, in a `match`
+-- on `Target.os` (`Turkey.Sys.errno`).
+foreign "__error" fun errnoDarwin() -> Prim.Ptr
+
+foreign "__errno_location" fun errnoLinux() -> Prim.Ptr
 
 -- -- arithmetic -----------------------------------------------------------------------
 --

@@ -1,0 +1,224 @@
+module Turkey.Io (
+    read, write, writeText, readAt, writeAt, open, close, fcntl, fcntlWith,
+    fstat, statMode, statSize, isatty, copy,
+)
+
+-- The floor of I/O: one Turkey function per system call the I/O layer makes,
+-- each answering in `Turkey.Sys.result`'s convention -- a count or a
+-- descriptor, or the negated `errno` -- and the one checked copy between two
+-- byte arrays.
+--
+-- **Storage is passed in place.** A call that reads into or writes from bytes
+-- is given an `Array Byte` and a window of it, `from` up to but not including
+-- `to`, and hands the kernel the address of the window's first element. No
+-- scratch memory is allocated and nothing is copied a byte at a time. Three
+-- facts make the address good for the call:
+--
+-- * at run time an `Array` is the primitive array itself, and a `String` its
+--   `Prim.Array Byte`, since a single-field newtype is erased, so
+--   `Prim.objectAddress` of either is the array's header;
+-- * a `Byte` array is packed, its elements starting `elements` bytes past the
+--   header;
+-- * the collector does not move objects.
+--
+-- What the address does not do is keep the array alive: past its last use in
+-- Turkey code the array may be dead to the compiler, and a worker blocked in
+-- the call lets a collection run. So every function here ends with a
+-- `Prim.keepAlive` of the array it lent, which roots it across the call.
+--
+-- Each window is checked against its array once, before the call, and a bad
+-- one is a panic: the callers are the library's own, and a window outside the
+-- array is a bug in one of them, not a condition to report.
+--
+-- The calls that can wait on something outside the program go through
+-- `Turkey.Workers`' blocking entries, so that a collection need not wait for
+-- the worker; those read `errno` before the worker runs Turkey code again.
+-- `fcntl` and `isatty` are called directly: with the commands used here, each
+-- answers from the descriptor's own state without waiting.
+
+import Prelude ()
+import Std.Classes
+import Data.Array (Array)
+import Data.Array as Array
+import Data.Bool.Type (Bool(..))
+import Data.Byte as Byte
+import Data.Int ()
+import Data.Int as Int
+import Data.String.Type (String)
+import Data.String.Type as Str
+import Turkey.Libc as Libc
+import Turkey.Memory as Memory
+import Turkey.Sys as Sys
+import Turkey.Workers as Workers
+
+-- Where a primitive array's elements start: past the kind and tag word, the
+-- length and the element metadata (`Turkey.Alloc.header`).
+let elements : Int = 24
+
+-- -- descriptors ------------------------------------------------------------------
+
+-- Up to `to - from` bytes from `fd` into `bytes[from..to)`: how many, 0 at end
+-- of file, or the negated `errno`.
+fun read(fd : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
+    within(len(bytes), from, to)
+    let n = Workers.blockingRead(fd, addressOf(bytes, from), to - from)
+    Prim.keepAlive(bytes)
+    n
+}
+
+-- Up to `to - from` bytes from `bytes[from..to)` to `fd`: how many were
+-- taken, which may be fewer, or the negated `errno`.
+fun write(fd : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
+    within(len(bytes), from, to)
+    let n = Workers.blockingWrite(fd, addressOf(bytes, from), to - from)
+    Prim.keepAlive(bytes)
+    n
+}
+
+-- `write`, from a string's own bytes, `from` and `to` counted in bytes. A
+-- window that splits a character is the caller's business: the bytes go out
+-- as they are.
+fun writeText(fd : Int, text : String, from : Int, to : Int) -> Int {
+    let storage = Str.bytesOf(text)
+    within(Prim.arrayLength(storage), from, to)
+    let n = Workers.blockingWrite(fd, addressOf(storage, from), to - from)
+    Prim.keepAlive(storage)
+    n
+}
+
+-- `read` at `offset` in the file rather than at its position, which it
+-- neither uses nor moves: `pread`. Not possible on a pipe, a FIFO or a socket,
+-- which answer `-ESPIPE`.
+fun readAt(fd : Int, offset : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
+    within(len(bytes), from, to)
+    let n = Workers.blockingPread(fd, addressOf(bytes, from), to - from, offset)
+    Prim.keepAlive(bytes)
+    n
+}
+
+-- `write` at `offset`: `pwrite`. On a descriptor opened to append, Linux
+-- writes at the end whatever the offset, and Darwin at the offset.
+fun writeAt(fd : Int, offset : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
+    within(len(bytes), from, to)
+    let n = Workers.blockingPwrite(fd, addressOf(bytes, from), to - from, offset)
+    Prim.keepAlive(bytes)
+    n
+}
+
+-- A descriptor for `path`, or the negated `errno`. `flags` are `Turkey.Sys`'s
+-- `open` flags; `mode` is the permission bits a created file starts with,
+-- before the umask narrows them, and is ignored unless `flags` has `create`.
+--
+-- An embedded NUL is rejected rather than truncated at: a path that names one
+-- file to Turkey and another to the operating system is the shape of a
+-- directory-traversal bug.
+fun open(path : String, flags : Int, mode : Int) -> Int {
+    let name = cPath(path)
+    let fd = Workers.blockingOpen(addressOf(name, 0), flags, mode)
+    Prim.keepAlive(name)
+    fd
+}
+
+-- 0, or the negated `errno`. The descriptor is released either way: a close
+-- that fails, which for a file just written can be where a deferred write
+-- error is first reported, is not retried, since the number may already be
+-- someone else's.
+fun close(fd : Int) -> Int = Workers.blockingClose(fd)
+
+-- `fcntl` with no argument, such as `Sys.getStatusFlags`: what the command
+-- answers, or the negated `errno`.
+fun fcntl(fd : Int, command : Int) -> Int = Sys.cResult(Libc.fcntl(fd, command))
+
+-- `fcntl` with an `int` argument, such as `Sys.setStatusFlags`.
+fun fcntlWith(fd : Int, command : Int, argument : Int) -> Int =
+    Sys.cResult(Libc.fcntlWith(fd, command, argument))
+
+-- Fill `stat`, at least `Sys.statBytes()` long, with `fd`'s `struct stat`: 0,
+-- or the negated `errno`. `statMode` and `statSize` read it.
+fun fstat(fd : Int, stat : Array Byte) -> Int {
+    if len(stat) < Sys.statBytes() {
+        Prim.error("an array too short for a struct stat")
+    }
+    let r = Workers.blockingFstat(fd, addressOf(stat, 0))
+    Prim.keepAlive(stat)
+    r
+}
+
+-- `st_mode`, of a `stat` `fstat` filled.
+fun statMode(stat : Array Byte) -> Int =
+    littleEndian(stat, Sys.statModeAt(), Sys.statModeWidth())
+
+-- `st_size`, of a `stat` `fstat` filled.
+fun statSize(stat : Array Byte) -> Int = littleEndian(stat, Sys.statSizeAt(), 8)
+
+-- 1 if `fd` is a terminal, or the negated `errno`: `-ENOTTY` for anything else.
+fun isatty(fd : Int) -> Int {
+    let r = Libc.isatty(fd)
+    if Sys.cInt(r) == 1 { 1 } else { Prim.intNeg(Sys.errno()) }
+}
+
+-- -- copying ----------------------------------------------------------------------
+
+-- `source[from..to)` into `target` starting at `at`. The one bulk copy in the
+-- I/O layer: every place it moves bytes from one array to another comes
+-- through here.
+--
+-- `Array.copy` is `Prim.arrayCopy` on the two arrays' storage: both runs
+-- checked once, then 32 bytes at a time, and the two may overlap, as with
+-- `memmove`. The window is checked here only because it is given as an end
+-- rather than a count, and a window that ends before it starts is a bug in
+-- the caller, not an empty copy.
+fun copy(target : Array Byte, at : Int, source : Array Byte, from : Int, to : Int) -> Unit {
+    within(len(source), from, to)
+    Array.copy(target, at, source, from, to - from)
+}
+
+-- -- underneath -------------------------------------------------------------------
+
+-- The address of element `at` of a byte array, an `Array Byte` or a
+-- `Prim.Array Byte`: both are the primitive array at run time.
+fun addressOf(storage : a, at : Int) -> Prim.Ptr =
+    Prim.ptrAdd(Prim.objectAddress(storage), elements + at)
+
+-- Panic unless `from..to` is a window of something `length` long.
+fun within(length : Int, from : Int, to : Int) -> Unit {
+    if from < 0 || to < from || to > length {
+        outside(from, to, length)
+    }
+}
+
+-- The panic's message, built apart from the test so that the strings it
+-- allocates cost nothing on the path that passes.
+fun outside(from : Int, to : Int, length : Int) -> Unit {
+    let words = ["the window ", Int.toString(from), " to ", Int.toString(to),
+                 " is outside an array of length ", Int.toString(length)]
+    var message = ""
+    for word in words { message = Str.concat(message, word) }
+    Prim.error(message)
+}
+
+-- The `width`-byte unsigned integer at `at` in `bytes`, least significant
+-- byte first, as both targets store one.
+fun littleEndian(bytes : Array Byte, at : Int, width : Int) -> Int {
+    within(len(bytes), at, at + width)
+    var value = 0
+    for var k = width - 1; k >= 0; k = k - 1 {
+        value = Int.or(Int.shl(value, 8), Byte.toInt(bytes[at + k]))
+    }
+    value
+}
+
+-- `path`'s bytes and a NUL, in an array of their own.
+fun cPath(path : String) -> Array Byte {
+    let storage = Str.bytesOf(path)
+    let n = Prim.arrayLength(storage)
+    for var i = 0; i < n; i = i + 1 {
+        if Byte.toInt(Prim.arrayGet(storage, i)) == 0 {
+            Prim.error("a path cannot contain a NUL byte")
+        }
+    }
+    let name = Array.filled(n + 1, Byte.truncate(0))
+    Memory.copy(addressOf(name, 0), addressOf(storage, 0), n)
+    Prim.keepAlive(storage)
+    name
+}

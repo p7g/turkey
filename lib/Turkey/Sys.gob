@@ -1,0 +1,172 @@
+module Turkey.Sys (
+    readOnly, writeOnly, readWrite, append, create, truncate, exclusive,
+    nonBlocking, closeOnExec,
+    getDescriptorFlags, setDescriptorFlags, getStatusFlags, setStatusFlags,
+    descriptorCloseOnExec,
+    eperm, enoent, eintr, eio, ebadf, enomem, eacces, eexist, enotdir, eisdir,
+    einval, emfile, enotty, enospc, espipe, erofs, epipe, eagain,
+    statBytes, statModeAt, statModeWidth, statSizeAt,
+    fileType, regularFile, directory, fifo, characterDevice, socket, symbolicLink,
+    blockDevice,
+    errno, result, cResult, cInt,
+)
+
+-- What the system calls the I/O layer makes take and answer, per target: the
+-- flag bits, the error numbers, where `struct stat` keeps what is read out of
+-- it, and the one convention every wrapper answers in.
+--
+-- Each per-target value is a `match` on `Target.os`, so a target added to
+-- `lib/Target.gob` makes every one of them non-exhaustive until it is given
+-- its own. The Darwin values are `<fcntl.h>`, `<errno.h>` and `<sys/stat.h>`
+-- from the macOS SDK; the Linux values are the kernel's generic ones, which
+-- are arm64's.
+--
+-- A giblet may call anything here: `Turkey.Workers` reads `errno` through it
+-- in the moment between a blocking call and the worker running again.
+
+import Prelude ()
+import Std.Classes
+import Target (OS(..))
+import Target as Target
+import Turkey.Libc as Libc
+
+-- -- `open` and `fcntl` ---------------------------------------------------------
+
+-- The access mode, the low two bits of `open`'s flags, is the same on both.
+let readOnly : Int = 0
+let writeOnly : Int = 1
+let readWrite : Int = 2
+
+fun append() -> Int = match Target.os {
+    Darwin -> 0x8
+    Linux -> 0x400
+}
+
+fun create() -> Int = match Target.os {
+    Darwin -> 0x200
+    Linux -> 0x40
+}
+
+fun truncate() -> Int = match Target.os {
+    Darwin -> 0x400
+    Linux -> 0x200
+}
+
+fun exclusive() -> Int = match Target.os {
+    Darwin -> 0x800
+    Linux -> 0x80
+}
+
+fun nonBlocking() -> Int = match Target.os {
+    Darwin -> 0x4
+    Linux -> 0x800
+}
+
+fun closeOnExec() -> Int = match Target.os {
+    Darwin -> 0x100_0000
+    Linux -> 0x8_0000
+}
+
+-- `fcntl`'s commands, and the one descriptor flag, the same on both.
+let getDescriptorFlags : Int = 1
+let setDescriptorFlags : Int = 2
+let getStatusFlags : Int = 3
+let setStatusFlags : Int = 4
+let descriptorCloseOnExec : Int = 1
+
+-- -- error numbers ---------------------------------------------------------------
+--
+-- The same on both up to 34; `EAGAIN` is the first that differs.
+
+let eperm : Int = 1
+let enoent : Int = 2
+let eintr : Int = 4
+let eio : Int = 5
+let ebadf : Int = 9
+let enomem : Int = 12
+let eacces : Int = 13
+let eexist : Int = 17
+let enotdir : Int = 20
+let eisdir : Int = 21
+let einval : Int = 22
+let emfile : Int = 24
+let enotty : Int = 25
+let enospc : Int = 28
+let espipe : Int = 29
+let erofs : Int = 30
+let epipe : Int = 32
+
+-- `EWOULDBLOCK` is the same number on both.
+fun eagain() -> Int = match Target.os {
+    Darwin -> 35
+    Linux -> 11
+}
+
+-- -- `struct stat` ---------------------------------------------------------------
+
+-- Its size in bytes, which is what `fstat` is given room for.
+fun statBytes() -> Int = match Target.os {
+    Darwin -> 144
+    Linux -> 128
+}
+
+-- `st_mode`: a `mode_t`, two bytes on Darwin and four on Linux, after a 4-byte
+-- `st_dev` on Darwin and two 8-byte fields on Linux.
+fun statModeAt() -> Int = match Target.os {
+    Darwin -> 4
+    Linux -> 16
+}
+
+fun statModeWidth() -> Int = match Target.os {
+    Darwin -> 2
+    Linux -> 4
+}
+
+-- `st_size`, an 8-byte `off_t` on both.
+fun statSizeAt() -> Int = match Target.os {
+    Darwin -> 96
+    Linux -> 48
+}
+
+-- The file type, `S_IFMT`'s bits of `st_mode`, and its values: the same on
+-- both.
+fun fileType(mode : Int) -> Int = Prim.intAnd(mode, 0o170000)
+let regularFile : Int = 0o100000
+let directory : Int = 0o040000
+let fifo : Int = 0o010000
+let characterDevice : Int = 0o020000
+let socket : Int = 0o140000
+let symbolicLink : Int = 0o120000
+let blockDevice : Int = 0o060000
+
+-- -- the result convention -------------------------------------------------------
+
+-- The calling thread's `errno`. Read it straight after the call that set it,
+-- on the thread that made the call: anything in between that reaches C may
+-- overwrite it, and a task that suspends may resume on another worker, whose
+-- `errno` is another thread's.
+fun errno() -> Int = Prim.charToInt(Prim.loadI32(location(), 0))
+
+-- Where this thread's `errno` lives. Each arm names a symbol only its own
+-- libc defines, and only the chosen target's arm is compiled.
+fun location() -> Prim.Ptr = match Target.os {
+    Darwin -> Libc.errnoDarwin()
+    Linux -> Libc.errnoLinux()
+}
+
+-- The one convention every wrapper answers in: a count or a descriptor, never
+-- negative, or the negated `errno`. `r` is a C function's result that is
+-- negative only on failure -- `ssize_t`'s -1, or a C `int` through `cInt` --
+-- so `errno` is read only then, and must be read before anything else runs.
+fun result(r : Int) -> Int = if r < 0 { Prim.intNeg(errno()) } else { r }
+
+-- `result` for a function that answers a C `int`.
+fun cResult(r : Int) -> Int = result(cInt(r))
+
+-- A C `int` read out of a 64-bit register: the low half, sign-extended.
+-- AAPCS64 leaves the high half of a 32-bit result undefined, so it cannot be
+-- compared with -1 as it stands.
+fun cInt(r : Int) -> Int {
+    let low = Prim.intAnd(r, 0xFFFF_FFFF)
+    if low >= 0x8000_0000 { Prim.intSub(low, 0x1_0000_0000) } else { low }
+}

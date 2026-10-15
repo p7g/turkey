@@ -1,0 +1,240 @@
+module System.File (
+    File, ReadOnly, WriteOnly, ReadWrite, Appending,
+    CanRead, CanWrite, CanWriteAt, Create(..),
+    openRead, create, openAppend, openReadWrite, close, path, use,
+    readAt, writeAt,
+    readAll, readText, writeAll, writeText,
+)
+
+-- Files, open: a `Read` and a `Write` over a descriptor, with what can be
+-- done to one in its type.
+--
+-- **The mode is a type parameter.** A `File ReadOnly` has no `Write`
+-- instance, so writing through one is a type error rather than `EBADF` at run
+-- time, and an operation that does not care about the mode, such as `close`,
+-- is polymorphic in it. The modes are matched by capability classes rather
+-- than listed one by one, so an operation that needs to write constrains
+-- `CanWrite m` and holds for every mode that can. `File`'s constructor is not
+-- exported, so a program that gives a type of its own a capability gets no
+-- `File` of it.
+--
+-- **Append is a mode of its own, not an option of `create`**, because on
+-- Linux `pwrite` to a file opened to append ignores its offset and appends.
+-- `Appending` has `CanWrite` and not `CanWriteAt`, so `writeAt` on it is a
+-- type error rather than a write in the wrong place.
+--
+-- **Positional and sequential operations coexist.** `readAt` and `writeAt`
+-- neither use nor move the position that `Read` and `Write` advance, and any
+-- number of tasks may call them on one `File` at once; sequential reads and
+-- writes are each whole with respect to others of their direction.
+--
+-- **Closing is scope-based.** `use` closes a file when its body returns.
+-- A file used after `close`, by a task or a closure that kept it, answers
+-- `Closed` from every operation; the descriptor number is never reused under
+-- it (`Turkey.Fd`). `close` is idempotent.
+--
+-- Every descriptor is opened close-on-exec, so a process started later does
+-- not inherit it by accident.
+
+import System.IO (Read(..), Write(..), DecodeError(..), IOError)
+import System.IO as IO
+import Turkey.Buffer (Buffer(..))
+import Turkey.Buffer as Buf
+import Turkey.Errors as Errors
+import Turkey.Fd as Fd
+import Turkey.IO as Calls
+import Turkey.Sys as Sys
+
+-- -- modes ----------------------------------------------------------------------------
+
+type ReadOnly = ReadOnly
+type WriteOnly = WriteOnly
+type ReadWrite = ReadWrite
+type Appending = Appending
+
+class CanRead m {}
+instance CanRead ReadOnly {}
+instance CanRead ReadWrite {}
+
+class CanWrite m {}
+instance CanWrite WriteOnly {}
+instance CanWrite ReadWrite {}
+instance CanWrite Appending {}
+
+class CanWriteAt m {}
+instance CanWriteAt WriteOnly {}
+instance CanWriteAt ReadWrite {}
+
+-- An open file: its descriptor, shared safely between tasks, and the path it
+-- was opened by, for messages.
+type File m = File { fd : Fd.Fd, name : String }
+
+instance Read (File m) : CanRead m {
+    type ReadError = IOError
+    fun readInto(f, into) {
+        if into.limit == into.end { error("readInto: the buffer has no room") }
+        let n = Fd.read(fileFd(f), into.storage, into.end, into.limit)
+        if n < 0 { return Left(failed(f, "read", n)) }
+        into.end = into.end + n
+        Right(n)
+    }
+}
+
+instance Write (File m) : CanWrite m {
+    type WriteError = IOError
+    fun writeFrom(f, from) {
+        let n = Fd.write(fileFd(f), from.storage, from.start, from.end)
+        if n < 0 { Left(failed(f, "write", n)) } else { Right(()) }
+    }
+    -- Nothing is held back here: each write is a system call.
+    fun flush(f) = Right(())
+}
+
+-- -- opening and closing --------------------------------------------------------------
+
+-- What `create` does to a file that exists already: empties it, or fails with
+-- `AlreadyExists`. A sum rather than flags, since the flags it replaces have
+-- combinations that mean nothing.
+type Create = Truncate | Exclusive
+
+fun openRead(path : String) -> Either IOError (File ReadOnly) =
+    opened(path, Sys.readOnly, 0)
+
+-- A file to write, made if it does not exist, with permissions 0o666 as the
+-- umask narrows them.
+fun create(path : String, mode : Create) -> Either IOError (File WriteOnly) {
+    let existing = match mode {
+        Truncate -> Sys.truncate()
+        Exclusive -> Sys.exclusive()
+    }
+    opened(path, Int.or(Sys.writeOnly, Int.or(Sys.create(), existing)), 0o666)
+}
+
+-- A file every write goes to the end of, made if it does not exist.
+fun openAppend(path : String) -> Either IOError (File Appending) =
+    opened(path, Int.or(Sys.writeOnly, Int.or(Sys.create(), Sys.append())), 0o666)
+
+-- An existing file, to read and write.
+fun openReadWrite(path : String) -> Either IOError (File ReadWrite) =
+    opened(path, Sys.readWrite, 0)
+
+-- Close `f`. A file system may report a failed write only here, so the
+-- answer is worth reading after writing. Closing a closed file does nothing.
+-- If another task is still in an operation on `f`, the descriptor closes
+-- when it finishes, and a failure then is not reported.
+fun close(f : File m) -> Either IOError Unit {
+    let r = Fd.close(fileFd(f))
+    if r < 0 { Left(failed(f, "close", r)) } else { Right(()) }
+}
+
+fun path(f : File m) -> String = match f { File { fd = _, name } -> name }
+
+-- `body` of the file `opening` opened, which is then closed: the body's error,
+-- if it failed; otherwise the close's, if that failed; otherwise the body's
+-- result.
+--
+--     File.use(File.openRead("notes.txt"), fun(f) = IO.readAll(f))
+fun use(opening : Either IOError (File m), body : fun(File m) -> Either IOError a)
+        -> Either IOError a {
+    let f = opening?
+    let made = body(f)
+    let closing = close(f)
+    let value = made?
+    closing?
+    Right(value)
+}
+
+-- -- positional -----------------------------------------------------------------------
+
+-- Fill `into`'s room from `offset` in the file, without using or moving its
+-- position: how many bytes were read, fewer than the room only at the end of
+-- the file. Any number of tasks may do this on one `File` at once. A FIFO, a
+-- pipe or a terminal has no offsets, and answers `NotSeekable`.
+fun readAt[CanRead m](f : File m, offset : Int, into : Buffer) -> Either IOError Int {
+    let n = Fd.readAt(fileFd(f), offset, into.storage, into.end, into.limit)
+    if n < 0 { return Left(failed(f, "readAt", n)) }
+    into.end = into.end + n
+    Right(n)
+}
+
+-- Write all of `from`'s window at `offset` in the file, without using or
+-- moving its position. Not for an `Appending` file, where Linux would append
+-- it instead.
+fun writeAt[CanWriteAt m](f : File m, offset : Int, from : Buffer) -> Either IOError Unit {
+    let n = Fd.writeAt(fileFd(f), offset, from.storage, from.start, from.end)
+    if n < 0 { Left(failed(f, "writeAt", n)) } else { Right(()) }
+}
+
+-- -- whole files ----------------------------------------------------------------------
+
+-- The file's bytes, in a buffer sized by what `fstat` says the file holds,
+-- and grown if it has grown since. Read `transfer` bytes per system call.
+fun readAll(path : String) -> Either IOError Buffer = readAllBy(path, transfer)
+
+let transfer : Int = 262144
+
+fun readAllBy(path : String, step : Int) -> Either IOError Buffer {
+    let f = openRead(path)?
+    let number = Fd.number(fileFd(f))
+    let stat = Array.filled(Sys.statBytes(), Byte.truncate(0))
+    var size = 0
+    if Calls.fstat(number, stat) == 0 && Sys.fileType(Calls.statMode(stat)) == Sys.regularFile {
+        size = Calls.statSize(stat)
+    }
+    -- One byte past the size, so that reading the whole file leaves room for
+    -- the read that answers 0 rather than growing the buffer for it.
+    var out = Buf.buffer(size + 1)
+    while True {
+        if out.end == out.limit {
+            let grown = Buf.buffer(2 * out.limit)
+            Buf.append(grown, out.storage, out.start, out.end)
+            out = grown
+        }
+        let to = if out.limit - out.end > step { out.end + step } else { out.limit }
+        let n = Fd.read(fileFd(f), out.storage, out.end, to)
+        if n < 0 {
+            let _ = close(f)
+            return Left(failed(f, "read", n))
+        }
+        if n == 0 { break }
+        out.end = out.end + n
+    }
+    close(f)?
+    Right(out)
+}
+
+-- The file's text, if it is well-formed UTF-8.
+fun readText(path : String) -> Either (DecodeError IOError) String {
+    let bytes = match readAll(path) {
+        Left(e) -> return Left(Underlying(e))
+        Right(bytes) -> bytes
+    }
+    match IO.toText(bytes) {
+        Some(text) -> Right(text)
+        None -> Left(InvalidUTF8)
+    }
+}
+
+-- Replace the file's contents with `bytes`' window, making it if need be.
+fun writeAll(path : String, bytes : Buffer) -> Either IOError Unit =
+    use(create(path, Truncate), fun(f) = writeFrom(f, bytes))
+
+-- Replace the file's contents with `text`, making it if need be.
+fun writeText(path : String, text : String) -> Either IOError Unit =
+    use(create(path, Truncate), fun(f) {
+        let n = Fd.writeText(fileFd(f), text, 0, String.byteLength(text))
+        if n < 0 { Left(failed(f, "write", n)) } else { Right(()) }
+    })
+
+-- -- underneath -----------------------------------------------------------------------
+
+fun opened(path : String, flags : Int, permissions : Int) -> Either IOError (File m) {
+    let number = Calls.open(path, Int.or(flags, Sys.closeOnExec()), permissions)
+    if number < 0 { return Left(Errors.failure("open", Some(path), number)) }
+    Right(File { fd = Fd.fd(number), name = path })
+}
+
+fun fileFd(f : File m) -> Fd.Fd = match f { File { fd, name = _ } -> fd }
+
+fun failed(f : File m, op : String, result : Int) -> IOError =
+    Errors.failure(op, Some(path(f)), result)

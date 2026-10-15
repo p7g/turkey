@@ -241,6 +241,11 @@ type Op
     -- A loop's poll for a collection (`Turkey.Polls`): a safepoint that is
     -- not a call on the path where nothing is asked of it.
     | Poll
+    -- A use of the value and nothing else: `Prim.keepAlive`. It emits no
+    -- machine instruction. What it does is keep the value live up to here, so
+    -- `Turkey.Roots` roots it at every safepoint before, and an object whose
+    -- address was handed to C is not freed while C may still use it.
+    | KeepAlive(Value)
     -- A `var`'s cell.
     | CellNew(Value)
     | CellLoad(Value)
@@ -427,6 +432,9 @@ fun effectsOf(op : Op) -> Effects = match op {
     -- Neither deleted nor moved: where it is, is the point of it.
     Ordered(_) -> combine(Ssa.reads_(), Ssa.writes())
     Poll -> combine(Ssa.reads_(), Ssa.writes())
+    -- The same, for the same reason: deleted, or moved above the call it
+    -- follows, it would stop keeping anything alive across that call.
+    KeepAlive(_) -> combine(Ssa.reads_(), Ssa.writes())
     CellNew(_) -> Ssa.allocates()
     CellLoad(_) -> Ssa.reads_()
     CellStore(_, _) -> Ssa.writes()
@@ -480,6 +488,7 @@ fun opUses(op : Op) -> Array Value = match op {
     Fill(_, a, b, c) -> [a, b, c]
     Ordered(a) -> [a]
     Poll -> []
+    KeepAlive(a) -> [a]
     ArrayGet(a, b, _) -> [a, b]
     ArraySet(a, b, c, _) -> [a, b, c]
     ArrayLength(a) -> [a]
@@ -531,6 +540,7 @@ fun mapUses(op : Op, f : fun(Value) -> Value) -> Op = match op {
     Fill(w, a, b, c) -> Fill(w, f(a), f(b), f(c))
     Ordered(a) -> Ordered(f(a))
     Poll -> Poll
+    KeepAlive(a) -> KeepAlive(f(a))
     ArrayGet(a, b, c) -> ArrayGet(f(a), f(b), c)
     ArraySet(a, b, c, d) -> ArraySet(f(a), f(b), f(c), d)
     ArrayLength(a) -> ArrayLength(f(a))
@@ -593,6 +603,7 @@ fun opResultRep(op : Op) -> Option Rep = match op {
     Move(_, _, _, _, _) -> Some(Ssa.untraced(Unit))
     Fill(_, _, _, _) -> Some(Ssa.untraced(Unit))
     Ordered(_) -> Some(Ssa.untraced(Unit))
+    KeepAlive(_) -> Some(Ssa.untraced(Unit))
     Atomic(_, _) -> Some(Ssa.untraced(I64))
     ArrayLength(_) -> Some(Ssa.untraced(I64))
     Intrinsic(k, _) -> Some(Ssa.untraced(intrinsicResult(k)))
@@ -951,6 +962,7 @@ fun showOpName(op : Op) -> String = match op {
     Fill(_, _, _, _) -> "fill"
     Ordered(_) -> "ordered"
     Poll -> "poll"
+    KeepAlive(_) -> "keep.alive"
     ArrayGet(_, _, _) -> "array.get"
     ArraySet(_, _, _, _) -> "array.set"
     ArrayLength(_) -> "array.length"
@@ -1024,6 +1036,7 @@ instance Show Op {
         "fill." + Int.toString(width) + " " + v(target) + ", " + v(at) + ", " + v(value)
     Ordered(target) -> "ordered " + v(target)
     Poll -> "poll"
+    KeepAlive(a) -> "keep.alive " + v(a)
     ArrayGet(a, i, c) -> "array.get " + v(a) + ", " + v(i) + showCheck(c)
     ArraySet(a, i, x, c) -> "array.set " + v(a) + ", " + v(i) + ", " + v(x) + showCheck(c)
     ArrayLength(a) -> "array.length " + v(a)

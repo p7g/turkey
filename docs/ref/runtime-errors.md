@@ -12,7 +12,9 @@ A panic stops the whole program immediately. Nothing runs after it: there is
 no unwinding, no handler, and no way to catch a panic from Turkey code. The
 program writes `panic: ` and a message to standard error, followed by the
 function calls that were active, innermost first, and exits with status 1.
-Output written before the panic stays written.
+Output printed before the panic is written out before the panic's message,
+including output still waiting in standard output's buffer
+([When standard output is written](builtins.md#when-standard-output-is-written)).
 
 <!-- panic: array index out of bounds -->
 ```kotlin
@@ -121,4 +123,5 @@ A program that returns from `main` normally exits with status 0, and one that
 panics exits with status 1. To exit with another status, call
 `System.Env.exit(status)` from the library module `System.Env`
 ([Modules](modules.md#imports)); it stops the program at once, without a
-panic message.
+panic message, after writing out what is waiting in standard output's
+buffer.

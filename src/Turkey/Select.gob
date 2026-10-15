@@ -253,6 +253,9 @@ fun publishingUses(op : Op) -> Array Value = match op {
     ObjectSet(_, _, v) -> [v]
     ArraySet(_, index, v, _) -> [index, v]
     CellStore(_, v) -> [v]
+    Move(_, _, at, _, from) -> [at, from]
+    Fill(_, _, at, v) -> [at, v]
+    Ordered(_) -> []
     _ -> L.opUses(op)
 }
 
@@ -644,6 +647,18 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                     emit(s, A.Mov(d, A.xzr, A.W64))
                 }
             }
+        }
+        Move(width, target, at, source, from) -> {
+            moveRun(s, width, target, at, source, from)
+            emit(s, A.Mov(d, A.xzr, A.W64))
+        }
+        Fill(width, target, at, v) -> {
+            fillRun(s, width, target, at, v)
+            emit(s, A.Mov(d, A.xzr, A.W64))
+        }
+        Ordered(target) -> {
+            ordered(s, target)
+            emit(s, A.Mov(d, A.xzr, A.W64))
         }
         Poll -> {
             let (b, n) = s.place
@@ -1048,6 +1063,65 @@ fun barrier(s : Sel, target : Reg, value : Reg) -> Unit {
     s.at = done
 }
 
+-- -- runs of bytes ------------------------------------------------------------------
+--
+-- 32 bytes is two pairs of `x` registers: `ldp` and `stp` take only a base
+-- and a constant offset, so the address is formed once and both halves are
+-- reached from it. That matches the C library's `memcpy` on a large copy,
+-- with no vector register to save or restore around a call. arm64 permits an
+-- unaligned pair, so nothing depends on the run's alignment.
+--
+-- The address is an interior pointer held untraced, which is sound because
+-- nothing can collect between forming it and the last access through it.
+
+fun moveRun(s : Sel, width : Int, target : Value, at : Value, source : Value,
+         from : Value) -> Unit {
+    if width == 32 {
+        let src = runAddress(s, source, from)
+        let a = temp(s, Ssa.untraced(I64))
+        let b = temp(s, Ssa.untraced(I64))
+        let c = temp(s, Ssa.untraced(I64))
+        let e = temp(s, Ssa.untraced(I64))
+        emit(s, A.Ldp(a, b, src, 0))
+        emit(s, A.Ldp(c, e, src, 16))
+        let dst = runAddress(s, target, at)
+        emit(s, A.Stp(a, b, dst, 0))
+        emit(s, A.Stp(c, e, dst, 16))
+    } else {
+        let t = temp(s, Ssa.untraced(L.fillClass(width)))
+        loadRun(s, width, t, A.Indexed(A.reg(source), A.reg(from)))
+        storeRun(s, width, t, A.Indexed(A.reg(target), A.reg(at)))
+    }
+}
+
+fun fillRun(s : Sel, width : Int, target : Value, at : Value, v : Value) -> Unit {
+    if width == 32 {
+        let dst = runAddress(s, target, at)
+        emit(s, A.Stp(A.reg(v), A.reg(v), dst, 0))
+        emit(s, A.Stp(A.reg(v), A.reg(v), dst, 16))
+    } else {
+        storeRun(s, width, A.reg(v), A.Indexed(A.reg(target), A.reg(at)))
+    }
+}
+
+fun runAddress(s : Sel, base : Value, off : Value) -> Reg {
+    let at = temp(s, Ssa.untraced(Ptr))
+    emit(s, A.Add(at, A.reg(base), A.reg(off), A.W64))
+    at
+}
+
+fun loadRun(s : Sel, width : Int, d : Reg, at : A.Mem) -> Unit = match width {
+    1 -> emit(s, A.Ldrb(d, at))
+    4 -> emit(s, A.Ldr(d, at, A.W32))
+    _ -> emit(s, A.Ldr(d, at, A.W64))
+}
+
+fun storeRun(s : Sel, width : Int, v : Reg, at : A.Mem) -> Unit = match width {
+    1 -> emit(s, A.Strb(v, at))
+    4 -> emit(s, A.Str(v, at, A.W32))
+    _ -> emit(s, A.Str(v, at, A.W64))
+}
+
 -- Go on to `done` if the flags just set satisfy `c`, and carry on in a fresh
 -- block if not.
 fun skipIf(s : Sel, c : A.Cond, done : Int) -> Unit {
@@ -1308,7 +1382,7 @@ fun runtimeSymbolOf(s : Sel, name : String) -> Asm.Symbol =
 -- by the element's width.
 fun elementAt(s : Sel, array : Reg, index : Reg, c : RepClass) -> A.Mem {
     let base = temp(s, Ssa.untraced(Ptr))
-    emit(s, A.AddImm(base, array, 24, A.W64))
+    emit(s, A.AddImm(base, array, Rt.arrayElements, A.W64))
     let width = Rt.elementWidth(c)
     if width == 1 { return A.Indexed(base, index) }
     let scaled = temp(s, Ssa.untraced(I64))

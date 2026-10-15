@@ -51,6 +51,7 @@ import Turkey.Types as Ty
 import Turkey.Types (TCon, TTuple, TFun, TBottom)
 import Turkey.Ast as Ast
 import Turkey.Ast (Lit(..), Opening(..))
+import Turkey.Bulk as Bulk
 
 -- What is not lowered yet: the binding, and the form that stopped it.
 -- Carried rather than thrown so a driver can report coverage over a corpus --
@@ -2206,6 +2207,18 @@ fun primitive(l : Lower, e : Core, p : Prims.Prim, args : Array Core,
     Prims.StoreI64 -> rawStore(l, p, args, I64)
     Prims.StoreF64 -> rawStore(l, p, args, F64)
     Prims.StorePtr -> rawStore(l, p, args, Ptr)
+    -- Loops rather than calls, so that `Turkey.Polls` gives them their polls
+    -- (`Turkey.Bulk`).
+    Prims.CopyBytes -> {
+        let xs = operands(l, p, args, 3)
+        Bulk.copyBytes(l.b, xs[0], xs[1], xs[2])
+        L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
+    }
+    Prims.FillBytes -> {
+        let xs = operands(l, p, args, 3)
+        Bulk.fillBytes(l.b, xs[0], xs[1], xs[2])
+        L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
+    }
     Prims.AtomicCas -> L.emit(l.b, Atomic(Cas, operands(l, p, args, 4)), Ssa.untraced(I64))
     Prims.AtomicAdd ->
         L.emit(l.b, Atomic(FetchAdd, operands(l, p, args, 3)), Ssa.untraced(I64))
@@ -2232,6 +2245,27 @@ fun primitive(l : Lower, e : Core, p : Prims.Prim, args : Array Core,
     Prims.ArrayNew -> {
         let xs = operands(l, p, args, 2)
         L.emit(l.b, ArrayNew(xs[0], xs[1], Ssa.repOf(l.func, xs[1])), Ssa.traced(Ptr))
+    }
+    Prims.ArrayCopy -> {
+        let xs = operands(l, p, args, 5)
+        Bulk.copyArray(l.b, elementRep(l, args[0].ty), xs[0], xs[1], xs[2], xs[3], xs[4])
+        L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
+    }
+    -- Raw memory holds nothing the collector follows, so neither may the
+    -- array it is copied into.
+    Prims.ArrayCopyIn -> {
+        let xs = operands(l, p, args, 4)
+        let element = elementRep(l, args[0].ty)
+        if element.traced || element.class_ == Unit {
+            return stop(l, "Prim.arrayCopyIn into an array of " + show(element))
+        }
+        Bulk.copyIn(l.b, element, xs[0], xs[1], xs[2], xs[3])
+        L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
+    }
+    Prims.ArrayFill -> {
+        let xs = operands(l, p, args, 4)
+        Bulk.fillArray(l.b, Ssa.repOf(l.func, xs[3]), xs[0], xs[1], xs[2], xs[3])
+        L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
     }
     -- Uninitialized in the source language and not in the heap: the
     -- collector may walk this array before anything writes to it, so a

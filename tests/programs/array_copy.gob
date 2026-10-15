@@ -1,0 +1,108 @@
+-- `Array.copy` and `Array.fill`, and the `Vec` versions: every length from 0
+-- to 64, around the 32 bytes the compiler moves at a time, at every element
+-- width, for a run on its own and overlapping its source in either direction,
+-- and for elements the collector traces as well as ones it does not.
+--
+-- Each result is compared with the same run done one element at a time, and a
+-- line says how many of the runs agreed.
+
+fun byte(n : Int) -> Byte = Option.unwrapOr(Byte.fromInt(n % 256), Byte.minValue())
+
+-- `count` elements from `source[from]` to `target[at]`, one at a time, into a
+-- copy of `target`, through a snapshot of `source`: what any copy must answer,
+-- overlap or not.
+fun expected(target : Array a, at : Int, source : Array a, from : Int,
+             count : Int) -> Array a {
+    let before = Array.init(len(source), fun(i) = source[i])
+    let out = Array.init(len(target), fun(i) = target[i])
+    for var k = 0; k < count; k = k + 1 { out[at + k] = before[from + k] }
+    out
+}
+
+fun same[Eq a](xs : Array a, ys : Array a) -> Bool {
+    if len(xs) != len(ys) { return False }
+    for var i = 0; i < len(xs); i = i + 1 {
+        if xs[i] != ys[i] { return False }
+    }
+    True
+}
+
+-- Copies between two arrays, of every length to 64, with the runs starting
+-- at offsets that leave neither aligned.
+fun apart[Eq a](label : String, make : fun(Int) -> a) -> Unit {
+    var agreed = 0
+    for var n = 0; n <= 64; n = n + 1 {
+        let source = Array.init(70, make)
+        let target = Array.init(70, fun(i) = make(i + 100))
+        let want = expected(target, 3, source, 1, n)
+        Array.copy(target, 3, source, 1, n)
+        if same(target, want) { agreed = agreed + 1 }
+    }
+    print(label + " apart: " + Int.toString(agreed) + " of 65")
+}
+
+-- Copies within one array, by every shift that crosses a word or the 32-byte
+-- stride, toward the front and toward the back.
+fun within[Eq a](label : String, make : fun(Int) -> a) -> Unit {
+    var agreed = 0
+    var runs = 0
+    for var n = 0; n <= 64; n = n + 1 {
+        for shift in [1, 3, 8, 31, 32, 33] {
+            let xs = Array.init(140, make)
+            let up = expected(xs, shift, xs, 0, n)
+            Array.copy(xs, shift, xs, 0, n)
+            if same(xs, up) { agreed = agreed + 1 }
+            let ys = Array.init(140, make)
+            let down = expected(ys, 0, ys, shift, n)
+            Array.copy(ys, 0, ys, shift, n)
+            if same(ys, down) { agreed = agreed + 1 }
+            runs = runs + 2
+        }
+    }
+    print(label + " within: " + Int.toString(agreed) + " of " + Int.toString(runs))
+}
+
+fun filled[Eq a](label : String, make : fun(Int) -> a, value : a) -> Unit {
+    var agreed = 0
+    for var n = 0; n <= 64; n = n + 1 {
+        let xs = Array.init(70, make)
+        let want = Array.init(len(xs), fun(i) = xs[i])
+        for var k = 0; k < n; k = k + 1 { want[2 + k] = value }
+        Array.fill(xs, 2, n, value)
+        if same(xs, want) { agreed = agreed + 1 }
+    }
+    print(label + " fill: " + Int.toString(agreed) + " of 65")
+}
+
+fun main() {
+    apart("Byte", byte)
+    apart("Char", fun(i) = Option.unwrapOr(Char.fromInt(0x3B1 + i), 'x'))
+    apart("Int", fun(i) = i * 1_000_003)
+    apart("Float", fun(i) = Float.fromInt(i) / 4.0)
+    apart("Bool", fun(i) = i % 3 == 0)
+    apart("String", fun(i) = Int.toString(i))
+    apart("Option", fun(i) = if i % 2 == 0 { Some(i) } else { None })
+
+    within("Byte", byte)
+    within("Char", fun(i) = Option.unwrapOr(Char.fromInt(0x3B1 + i), 'x'))
+    within("Int", fun(i) = i)
+    within("String", fun(i) = Int.toString(i))
+
+    filled("Byte", byte, byte(0xA5))
+    filled("Char", fun(i) = 'a', 'é')
+    filled("Int", fun(i) = i, -2)
+    filled("Float", fun(i) = 0.0, -0.5)
+    filled("Bool", fun(i) = False, True)
+    filled("String", fun(i) = "", "x")
+
+    -- A `Vec` copies only among the elements it has.
+    let v = [1, 2, 3, 4, 5]
+    Vec.push(v, 6)
+    Vec.copy(v, 0, v, 2, 4)
+    Vec.fill(v, 4, 2, 0)
+    print(v)
+
+    -- Every way into a `String` and out of one copies its bytes.
+    let s = "héllo, " + "wörld"
+    print(s + " " + show(String.toBytes("日本")))
+}

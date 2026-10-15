@@ -12,6 +12,8 @@ module Data.Vec (
     fold,
     reverse,
     append,
+    copy,
+    fill,
     at,
     last,
     swap,
@@ -21,6 +23,7 @@ module Data.Vec (
     sortBy,
     sort,
     threeWay,
+    extendFromRaw,
 )
 
 -- The growable array: `push` and `pop` change its length.
@@ -40,7 +43,7 @@ import Data.Ordering.Type (Ordering(..))
 import Data.String.Type as Str
 import Data.Array (Array)
 import Data.Array as Array
-import Data.Array.Storage (outOfBounds, threeWay)
+import Data.Array.Storage (outOfBounds, checkRun, threeWay)
 import Data.Array.Storage as Storage
 
 -- The first `length` slots of `storage` are the elements; the rest is room to
@@ -74,19 +77,32 @@ fun fromArray(xs : Array a) -> Vec a {
 
 fun toArray(xs : Vec a) -> Array a {
     let data = state(xs)
-    Array.init(data.length, Prim.arrayGet(data.storage, _))
+    Array.ofStorage(Storage.copy(data.storage, data.length))
 }
 
-fun grow(xs : Vec a) {
+fun grow(xs : Vec a) { reserve(xs, 1) }
+
+-- Room for `more` elements past the length, at least doubling the capacity
+-- when there is not.
+fun reserve(xs : Vec a, more : Int) -> Unit {
     let data = state(xs)
     let capacity = Prim.arrayLength(data.storage)
-    if data.length < capacity { return }
-    let nextCapacity = if capacity == 0 { 1 } else { capacity * 2 }
+    if more <= capacity - data.length { return }
+    var nextCapacity = if capacity == 0 { 1 } else { capacity * 2 }
+    if nextCapacity - data.length < more { nextCapacity = data.length + more }
     let storage = Prim.arrayNewUninit(nextCapacity)
-    for var i = 0; i < data.length; i = i + 1 {
-        Prim.arraySet(storage, i, Prim.arrayGet(data.storage, i))
-    }
+    Prim.arrayCopy(storage, 0, data.storage, 0, data.length)
     data.storage = storage
+}
+
+-- Push `count` elements from raw memory at `source`, laid out as the storage
+-- lays them out, for the rest of the library: a program cannot hold a
+-- `Prim.Ptr`. Untraced elements only, which the compiler checks.
+fun extendFromRaw(xs : Vec a, source : Prim.Ptr, count : Int) -> Unit {
+    reserve(xs, count)
+    let data = state(xs)
+    Prim.arrayCopyIn(data.storage, data.length, source, count)
+    data.length = data.length + count
 }
 
 fun push(xs : Vec a, x : a) -> Unit {
@@ -148,10 +164,30 @@ fun reverse(xs : Vec a) -> Vec a {
 }
 
 fun append(xs : Vec a, ys : Vec a) -> Vec a {
-    let out = new(len(xs) + len(ys))
-    for x in xs { push(out, x) }
-    for y in ys { push(out, y) }
-    out
+    let n = len(xs)
+    let m = len(ys)
+    let storage = Prim.arrayNewUninit(n + m)
+    Prim.arrayCopy(storage, 0, state(xs).storage, 0, n)
+    Prim.arrayCopy(storage, n, state(ys).storage, 0, m)
+    Vec(VecStorage { storage, length = n + m })
+}
+
+-- Copy `count` elements of `source`, from index `from` on, over those of
+-- `target` from index `at` on, as `Array.copy` does. Only over elements
+-- `target` has: this never changes its length, and panics unless both runs
+-- are inside their `Vec`s.
+fun copy(target : Vec a, at : Int, source : Vec a, from : Int, count : Int)
+        -> Unit {
+    checkRun("copy into", at, count, len(target))
+    checkRun("copy from", from, count, len(source))
+    Prim.arrayCopy(state(target).storage, at, state(source).storage, from, count)
+}
+
+-- Set the `count` elements of `target` from index `at` on to `value`.
+-- Panics unless they are all elements of `target`.
+fun fill(target : Vec a, at : Int, count : Int, value : a) -> Unit {
+    checkRun("fill", at, count, len(target))
+    Prim.arrayFill(state(target).storage, at, count, value)
 }
 
 -- -- reading without panicking -------------------------------------------------
@@ -179,9 +215,9 @@ fun slice(xs : Vec a, from : Int, to : Int) -> Vec a {
             Str.concat("array slice out of bounds: ", Int.toString(from)),
             Str.concat("..", Int.toString(to))))
     }
-    let out = new(to - from)
-    for var i = from; i < to; i = i + 1 { push(out, xs[i]) }
-    out
+    let storage = Prim.arrayNewUninit(to - from)
+    Prim.arrayCopy(storage, 0, state(xs).storage, from, to - from)
+    Vec(VecStorage { storage, length = to - from })
 }
 
 fun indexOf[Eq a](xs : Vec a, wanted : a) -> Option Int {

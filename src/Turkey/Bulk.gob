@@ -1,0 +1,281 @@
+module Turkey.Bulk (copyArray, copyIn, fillArray, copyBytes, fillBytes)
+
+-- Runs of elements and of bytes, as loops of the low IR: what
+-- `Prim.arrayCopy`, `Prim.arrayCopyIn`, `Prim.arrayFill`, `Prim.copyBytes`
+-- and `Prim.fillBytes` lower to.
+--
+-- Loops here, before `Turkey.Polls`, and not in instruction selection, so that
+-- each back edge gets its poll like any other loop's: a copy of a gigabyte
+-- must not keep every other worker waiting for a collection until it is done.
+--
+-- **Untraced elements are bytes.** They move 32 at a time (`LowIr.Move`, two
+-- pairs of registers), then 8, then one element at a time for what is left,
+-- with one fence for the whole run (`Ordered`). Moving one element per load
+-- and store costs several times as much on a large copy; the 32-byte loop
+-- matches the C library's `memcpy`.
+--
+-- **Traced elements are not.** A pointer stored into an array the collector
+-- may already have scanned needs the write barrier, and the barrier is per
+-- pointer, so a traced run is an `ArrayGet` and an `ArraySet` per element,
+-- with the fence and the barrier each store is given anywhere else.
+--
+-- **Overlap.** A run copied within one array may overlap its source, and
+-- arrives as it was before the copy started, as C's `memmove` does: front to
+-- back when the target starts below the source and back to front when it
+-- starts above. Two different arrays cannot overlap, so either order is right
+-- for them and only the indices are compared.
+--
+-- **Checks.** An array run is checked against each array's own length, as
+-- every array access is (`Turkey.Select.withinStorage`), and once, before the
+-- loop. A raw run is no more checked than a raw load.
+
+import Turkey.LowIr as L
+import Turkey.LowIr (Op(..), BinOp(..), CmpOp(..), Conv(..), IndexCheck(..), Builder(..))
+import Turkey.Runtime as Rt
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (Value, BlockId, Rep(..), RepClass(..), Term(..))
+
+-- `count` elements from `source[from]` on to `target[at]` on.
+fun copyArray(b : Builder, element : Rep, target : Value, at : Value,
+              source : Value, from : Value, count : Value) -> Unit {
+    checkRuns(b, count, [(target, at), (source, from)])
+    let backward = L.emit(b, Cmp(Lt, from, at), Ssa.untraced(I1))
+    if !bytewise(element) {
+        either(b, backward, fun() {
+            let _ = downward(b, 1, count, int(b, 0), fun(k) =
+                elementCopy(b, element, target, add(b, at, k), source, add(b, from, k)))
+        }, fun() {
+            let _ = upward(b, 1, int(b, 0), count, fun(k) =
+                elementCopy(b, element, target, add(b, at, k), source, add(b, from, k)))
+        })
+        return
+    }
+    let width = Rt.elementWidth(element.class_)
+    L.effect(b, Ordered(target))
+    let into = offsetOf(b, at, width)
+    let out = offsetOf(b, from, width)
+    let n = scaled(b, count, width)
+    either(b, backward, fun() = moveDown(b, width, target, into, source, out, n),
+                        fun() = moveUp(b, width, target, into, source, out, n))
+}
+
+-- `count` elements from raw memory at `source`, laid out as the array lays
+-- them out, to `target[at]` on. Untraced elements only: raw memory holds no
+-- pointer the collector may follow.
+fun copyIn(b : Builder, element : Rep, target : Value, at : Value, source : Value,
+           count : Value) -> Unit {
+    checkRuns(b, count, [(target, at)])
+    let width = Rt.elementWidth(element.class_)
+    L.effect(b, Ordered(target))
+    moveUp(b, width, target, offsetOf(b, at, width), source, int(b, 0),
+           scaled(b, count, width))
+}
+
+-- `count` copies of `value` from `target[at]` on.
+fun fillArray(b : Builder, element : Rep, target : Value, at : Value, count : Value,
+              value : Value) -> Unit {
+    checkRuns(b, count, [(target, at)])
+    if !bytewise(element) {
+        let _ = upward(b, 1, int(b, 0), count, fun(k) =
+            L.effect(b, ArraySet(target, add(b, at, k), value, Proven)))
+        return
+    }
+    let width = Rt.elementWidth(element.class_)
+    L.effect(b, Ordered(target))
+    fillUp(b, width, target, offsetOf(b, at, width), pattern(b, value, width),
+           scaled(b, count, width))
+}
+
+-- `count` bytes from `source` to `target`, which may overlap.
+fun copyBytes(b : Builder, target : Value, source : Value, count : Value) -> Unit {
+    let t = L.emit(b, Convert(PtrToInt, target), Ssa.untraced(I64))
+    let s = L.emit(b, Convert(PtrToInt, source), Ssa.untraced(I64))
+    let backward = L.emit(b, Cmp(Lt, s, t), Ssa.untraced(I1))
+    let zero = int(b, 0)
+    either(b, backward, fun() = moveDown(b, 1, target, zero, source, zero, count),
+                        fun() = moveUp(b, 1, target, zero, source, zero, count))
+}
+
+-- `count` bytes from `target` on set to `value`'s low byte.
+fun fillBytes(b : Builder, target : Value, count : Value, value : Value) -> Unit {
+    let low = L.emit(b, Bin(And, value, int(b, 255)), Ssa.untraced(I64))
+    let word = L.emit(b, Bin(MulWrap, low, int(b, 0x0101_0101_0101_0101)),
+                      Ssa.untraced(I64))
+    fillUp(b, 1, target, int(b, 0), word, count)
+}
+
+-- -- the loops ------------------------------------------------------------------------
+
+-- Whether elements at this representation are moved as bytes. `Unit` is
+-- not, having no value to make a pattern of.
+fun bytewise(element : Rep) -> Bool = !element.traced && element.class_ != Unit
+
+fun elementCopy(b : Builder, element : Rep, target : Value, at : Value, source : Value,
+                from : Value) -> Unit {
+    let x = L.emit(b, ArrayGet(source, from, Proven), element)
+    L.effect(b, ArraySet(target, at, x, Proven))
+}
+
+-- `n` bytes, front to back: 32 at a time, then 8, then `width`, the element's
+-- own, for what is left. `width` divides `n`, so nothing is left after that.
+fun moveUp(b : Builder, width : Int, target : Value, at : Value, source : Value,
+           from : Value, n : Value) -> Unit {
+    let step = fun(w : Int) -> fun(Value) -> Unit = fun(k) =
+        L.effect(b, Move(w, target, add(b, at, k), source, add(b, from, k)))
+    var k = upward(b, 32, int(b, 0), n, step(32))
+    k = upward(b, 8, k, n, step(8))
+    if width < 8 { let _ = upward(b, width, k, n, step(width)) }
+}
+
+-- The same, back to front: the 32-byte steps from the end, and what is left
+-- over at the front.
+fun moveDown(b : Builder, width : Int, target : Value, at : Value, source : Value,
+             from : Value, n : Value) -> Unit {
+    let step = fun(w : Int) -> fun(Value) -> Unit = fun(k) =
+        L.effect(b, Move(w, target, add(b, at, k), source, add(b, from, k)))
+    let zero = int(b, 0)
+    var k = downward(b, 32, n, zero, step(32))
+    k = downward(b, 8, k, zero, step(8))
+    if width < 8 { let _ = downward(b, width, k, zero, step(width)) }
+}
+
+-- `n` bytes from `target + at` set to the pattern `word` repeats.
+fun fillUp(b : Builder, width : Int, target : Value, at : Value, word : Value,
+           n : Value) -> Unit {
+    let step = fun(w : Int, v : Value) -> fun(Value) -> Unit = fun(k) =
+        L.effect(b, Fill(w, target, add(b, at, k), v))
+    var k = upward(b, 32, int(b, 0), n, step(32, word))
+    k = upward(b, 8, k, n, step(8, word))
+    if width < 8 {
+        let narrow = L.emit(b, Convert(Narrow, word), Ssa.untraced(L.fillClass(width)))
+        let _ = upward(b, width, k, n, step(width, narrow))
+    }
+}
+
+-- A word holding `value`'s bits once per element of `width` bytes. The
+-- elements are at least as aligned within the run as the word's own copies,
+-- so every store of it, at any width, puts each element's bytes where they
+-- belong.
+fun pattern(b : Builder, value : Value, width : Int) -> Value {
+    let bits = match Ssa.repOf(b.func, value).class_ {
+        I64 -> value
+        F64 -> L.emit(b, Intrinsic(L.FloatBits, value), Ssa.untraced(I64))
+        Ptr -> L.emit(b, Convert(PtrToInt, value), Ssa.untraced(I64))
+        _ -> L.emit(b, Convert(Widen, value), Ssa.untraced(I64))
+    }
+    let copies = match width {
+        1 -> 0x0101_0101_0101_0101
+        4 -> 0x0000_0001_0000_0001
+        _ -> 1
+    }
+    if copies == 1 { return bits }
+    L.emit(b, Bin(MulWrap, bits, int(b, copies)), Ssa.untraced(I64))
+}
+
+-- `body(i)` for `i` from `from` up by `step`, while `i + step` is at most
+-- `limit`; answers the `i` it stopped at.
+fun upward(b : Builder, step : Int, from : Value, limit : Value,
+           body : fun(Value) -> Unit) -> Value {
+    let head = L.block(b)
+    let i = L.param(b, head, Ssa.untraced(I64))
+    L.terminate(b, Jump(head, [from]))
+    L.into(b, head)
+    let next = add(b, i, int(b, step))
+    let more = L.emit(b, Cmp(Le, next, limit), Ssa.untraced(I1))
+    let again = L.block(b)
+    let done = L.block(b)
+    L.terminate(b, Branch(more, again, done))
+    L.into(b, again)
+    body(i)
+    L.terminate(b, Jump(head, [next]))
+    L.into(b, done)
+    i
+}
+
+-- `body(i - step)` for `i` from `from` down by `step`, while `i - step` is at
+-- least `limit`; answers the `i` it stopped at.
+fun downward(b : Builder, step : Int, from : Value, limit : Value,
+             body : fun(Value) -> Unit) -> Value {
+    let head = L.block(b)
+    let i = L.param(b, head, Ssa.untraced(I64))
+    L.terminate(b, Jump(head, [from]))
+    L.into(b, head)
+    let next = L.emit(b, Bin(SubWrap, i, int(b, step)), Ssa.untraced(I64))
+    let more = L.emit(b, Cmp(Ge, next, limit), Ssa.untraced(I1))
+    let again = L.block(b)
+    let done = L.block(b)
+    L.terminate(b, Branch(more, again, done))
+    L.into(b, again)
+    body(next)
+    L.terminate(b, Jump(head, [next]))
+    L.into(b, done)
+    i
+}
+
+-- `yes()` if `test` holds and `no()` if not, and on from there either way.
+fun either(b : Builder, test : Value, yes : fun() -> Unit, no : fun() -> Unit) -> Unit {
+    let first = L.block(b)
+    let second = L.block(b)
+    let after = L.block(b)
+    L.terminate(b, Branch(test, first, second))
+    L.into(b, first)
+    yes()
+    L.terminate(b, Jump(after, []))
+    L.into(b, second)
+    no()
+    L.terminate(b, Jump(after, []))
+    L.into(b, after)
+}
+
+-- -- checks ---------------------------------------------------------------------------
+
+-- Panic unless `count` is not negative and every run of `count` elements,
+-- from its index on, is inside its array. The library checks first and says
+-- what was wrong in the program's terms; this is the check memory safety
+-- rests on, made against the arrays themselves.
+--
+-- `at <= length - count` cannot overflow once `count` is known not to be
+-- negative, since neither is a length.
+fun checkRuns(b : Builder, count : Value, runs : Array (Value, Value)) -> Unit {
+    let failure = L.block(b)
+    let zero = int(b, 0)
+    unless(b, L.emit(b, Cmp(Lt, count, zero), Ssa.untraced(I1)), failure)
+    for (array, at) in runs {
+        unless(b, L.emit(b, Cmp(Lt, at, zero), Ssa.untraced(I1)), failure)
+        let length = L.emit(b, ArrayLength(array), Ssa.untraced(I64))
+        let room = L.emit(b, Bin(SubWrap, length, count), Ssa.untraced(I64))
+        unless(b, L.emit(b, Cmp(Gt, at, room), Ssa.untraced(I1)), failure)
+    }
+    let carry = b.at
+    L.into(b, failure)
+    let message = L.emit(b, ConstString("a run of elements outside the array's storage"),
+                         Ssa.traced(Ptr))
+    L.terminate(b, Panic(message))
+    L.into(b, carry)
+}
+
+-- Go to `failure` if `bad`, and on in a fresh block if not.
+fun unless(b : Builder, bad : Value, failure : BlockId) -> Unit {
+    let next = L.block(b)
+    L.terminate(b, Branch(bad, failure, next))
+    L.into(b, next)
+}
+
+-- -- arithmetic -----------------------------------------------------------------------
+--
+-- Wrapping: every value here is an index, a length or a byte count within an
+-- array or a block that exists, far from overflow.
+
+fun int(b : Builder, n : Int) -> Value = L.emit(b, ConstInt(n), Ssa.untraced(I64))
+
+fun add(b : Builder, x : Value, y : Value) -> Value =
+    L.emit(b, Bin(AddWrap, x, y), Ssa.untraced(I64))
+
+-- `count` elements of `width` bytes, in bytes.
+fun scaled(b : Builder, count : Value, width : Int) -> Value =
+    if width == 1 { count }
+    else { L.emit(b, Bin(MulWrap, count, int(b, width)), Ssa.untraced(I64)) }
+
+-- Element `index`'s offset from the array's address.
+fun offsetOf(b : Builder, index : Value, width : Int) -> Value =
+    add(b, int(b, Rt.arrayElements), scaled(b, index, width))

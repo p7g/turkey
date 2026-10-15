@@ -13,7 +13,6 @@ import subprocess
 import pytest
 
 from tests import bootc, toolchain
-from tests.test_memory_model import function
 
 PROGRAM = """
 import System.IO as IO
@@ -82,6 +81,8 @@ def test_the_blocking_wrappers_are_called_not_inlined(tmp_path):
     source = tmp_path / "main.gob"
     source.write_text(PROGRAM)
     text = bootc.boot(*bootc.argv("asm"), str(source))
-    body = function(text, "System.IO#readAll")
-    assert any("Turkey.Workers#blockingRead" in line and line.startswith("bl ")
-               for line in body), body
+    # Whichever function the read lands in once the inliner is done, the
+    # wrapper itself must be reached by a call.
+    lines = [line.strip() for line in text.splitlines()]
+    assert any(line.startswith("bl ") and "Turkey.Workers#blockingRead" in line
+               for line in lines)

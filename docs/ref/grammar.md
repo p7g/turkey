@@ -203,7 +203,7 @@ field-pattern ::= IDENT "=" pattern
 
 ```ebnf
 foreign-decl ::= "foreign" STRING "fun" IDENT "(" foreign-params? ")" "->" type body?
-foreign-params ::= foreign-param ("," foreign-param)*
+foreign-params ::= foreign-param ("," foreign-param)* ("," "..." foreign-param ("," foreign-param)*)?
 foreign-param ::= (IDENT ":")? type
 body ::= "=" expression | block
 ```

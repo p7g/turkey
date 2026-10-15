@@ -138,10 +138,13 @@ type Callee
     -- `Runtime` because the two are resolved differently: a runtime entry
     -- point is looked up in `Turkey.Runtime`'s fixed table, and this one is
     -- already the symbol -- what the program declared is what the linker is
-    -- asked for. No signature travels with it: every argument carries a `Rep`
-    -- and the result carries the destination's, so a full signature can be
-    -- read off any call site.
-    | Foreign(String)
+    -- asked for. Every argument carries a `Rep` and the result carries the
+    -- destination's, so the types of a signature can be read off any call
+    -- site. What cannot is where C's named parameters end, which the `Int`
+    -- is: the arguments from that index on are a variadic function's
+    -- trailing ones, and Darwin passes those differently. For a function that
+    -- is not variadic it is the number of arguments.
+    | Foreign(String, Int)
     -- Through a closure value.
     | Indirect(Value)
 
@@ -816,7 +819,7 @@ type Allocation
 -- * **the runtime**: allocating unless it is on the short list below.
 fun allocatingOp(op : Op) -> Option String = match op {
     Call(Direct(_), _) -> None
-    Call(Foreign(_), _) -> None
+    Call(Foreign(_, _), _) -> None
     Call(Indirect(_), _) -> Some("calls through a closure or a dictionary")
     Call(Runtime(r), _) -> match r {
         Rt.SwapStack -> Some("switches stacks, and the code it switches to may allocate")
@@ -961,7 +964,7 @@ fun showOpName(op : Op) -> String = match op {
     Call(callee, _) -> match callee {
         Direct(_) -> "call.direct"
         Runtime(_) -> "call.runtime"
-        Foreign(_) -> "call.foreign"
+        Foreign(_, _) -> "call.foreign"
         Indirect(_) -> "call.indirect"
     }
     GlobalLoad(_) -> "global.load"
@@ -1044,7 +1047,14 @@ instance Show Op {
     Call(callee, args) -> {
         let b = String.builder()
         String.push(b, "call " + show(callee))
-        for a in args { String.push(b, " " + v(a)) }
+        let fixed = match callee {
+            Foreign(_, n) -> n
+            _ -> len(args)
+        }
+        for var k = 0; k < len(args); k = k + 1 {
+            if k == fixed { String.push(b, " ...") }
+            String.push(b, " " + v(args[k]))
+        }
         String.build(b)
     }
     GlobalLoad(name) -> "global.load $" + name
@@ -1058,7 +1068,7 @@ instance Show Callee {
   fun show(c) = match c {
     Direct(name) -> "@" + name
     Runtime(r) -> "%" + Rt.routineName(r)
-    Foreign(name) -> "&" + name
+    Foreign(name, _) -> "&" + name
     Indirect(f) -> v(f)
   }
 }

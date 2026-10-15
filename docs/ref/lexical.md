@@ -80,7 +80,7 @@ ordinary library types ([Built-in types and classes](builtins.md)).
 
 ```text
 +   -   *   /   %   ==  !=  <   <=  >   >=  &&  ||  !
-=   ->  :   ,   .   ..  |   ~   ?   ;   \
+=   ->  :   ,   .   ..  ...  |   ~   ?   ;   \
 (   )   [   ]   {   }
 ```
 

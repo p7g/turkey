@@ -621,7 +621,7 @@ type, and the inferred type shows them in the same bracket form.
 
 ```ebnf
 foreign-decl ::= "foreign" STRING "fun" IDENT "(" foreign-params? ")" "->" type body?
-foreign-params ::= foreign-param ("," foreign-param)*
+foreign-params ::= foreign-param ("," foreign-param)* ("," "..." foreign-param ("," foreign-param)*)?
 foreign-param ::= (IDENT ":")? type
 body ::= "=" expression | block
 ```
@@ -641,8 +641,30 @@ Ordinary application modules cannot declare or define foreign functions.
 Every parameter and the result must state its type. A definition also needs
 a name for every parameter. The boundary types are `Int`, `Float`, `Byte`,
 `Char`, `Bool`, `Unit` and `Prim.Ptr`; traced values such as `String` cannot
-cross it. A definition accepts at most seven general-register arguments and
-eight floating-point arguments. A C symbol may be defined only once.
+cross it. A declaration accepts at most eight general-register arguments
+(`Int`, `Byte`, `Char`, `Bool`, `Prim.Ptr`) and eight `Float` arguments, and a
+definition at most seven and eight. A C symbol may be defined only once, but
+several declarations may name it.
+
+A C function that takes a variable number of arguments, such as `open` or
+`fcntl`, is declared with `...` before the first argument that C does not
+name. Every argument after it still states its type, so each declaration is
+one way of calling the function, and a different set of trailing arguments is
+another declaration of the same symbol. These are as the standard library
+would write them; in an application module they are refused like any other
+declaration:
+
+<!-- error: a foreign declaration may only appear in -->
+```kotlin
+foreign "open" fun openCreate(path : Prim.Ptr, flags : Int, ... mode : Int) -> Int
+foreign "fcntl" fun fcntlGet(fd : Int, command : Int) -> Int
+foreign "fcntl" fun fcntlSet(fd : Int, command : Int, ... argument : Int) -> Int
+fun main() { }
+```
+
+The trailing arguments count against the same limits as the others. Only a
+declaration can be variadic; a definition cannot, since its body would have
+no way to read them.
 
 <!-- error: may only appear in a giblet module -->
 ```kotlin

@@ -1,0 +1,315 @@
+module Turkey.Fd (Fd, fd, number, closed, read, write, writeText, readAt, writeAt, close)
+
+-- A descriptor that tasks share: the one place the I/O layer decides when a
+-- descriptor number stops being this file's, and which of two tasks using it
+-- goes first.
+--
+-- Nothing stops two tasks holding the same handle, so `close` can run while
+-- another task is inside a `read`. Closing the number there and then would let
+-- the next `open` anywhere in the process reuse it, and the read, or one about
+-- to start, would then be reading someone else's file. So every operation
+-- holds a reference for as long as it uses the number, `close` only marks the
+-- descriptor closed, and `close(2)` runs when the last reference is dropped.
+--
+-- **The state word**, the record's first field, changed only by atomic
+-- instructions at its address, as `System.Sync` changes its own:
+--
+-- * bit 0, `closedBit`: `close` has been called. Nothing clears it, and an
+--   operation that finds it set takes no reference and answers `closed`;
+-- * bit 1, `readLock`, and bit 2, `writeLock`: held by the one sequential
+--   read and the one sequential write in progress;
+-- * bit 3, `readWaited`, and bit 4, `writeWaited`: a task may be waiting for
+--   that lock, so the release must look for waiters;
+-- * from bit 5 up, the reference count, in units of `reference`.
+--
+-- A reference is taken in the same compare-and-swap as a lock, and dropped in
+-- the same one as its release, so a sequential operation costs two atomic
+-- instructions however much it moves.
+--
+-- **The locks** make a sequential operation atomic with respect to others of
+-- its direction: a `write` of a whole buffer goes out contiguously even when
+-- the kernel takes it in pieces, and two reads never split one transfer
+-- between them. A task waiting for a lock is suspended (`Scheduler.waitUntil`)
+-- and its worker runs other tasks; nothing here blocks a worker but the system
+-- call itself. A release wakes every task waiting for that lock, and the ones
+-- that lose the race wait again, as `System.Sync`'s mutex does.
+--
+-- **Positional operations take a reference and no lock.** Each names its own
+-- offset and leaves the descriptor's position alone, so it is independent of
+-- every other operation, and any number of them run at once on one `Fd`.
+--
+-- **The retry loop.** A call interrupted by a signal is made again at once. A
+-- descriptor here is in blocking mode -- the library opens none otherwise, and
+-- an inherited one keeps the mode its parent gave it -- so a call waits in the
+-- kernel, with the worker in `Turkey.Workers`' blocking state, and the
+-- collector does not wait for it. `EAGAIN` reaches this module only from a
+-- descriptor something else made non-blocking; `again` handles it by yielding
+-- and retrying, which is correct and spins. With a poller this becomes a park
+-- on the descriptor until it reports readiness: an edge-triggered
+-- registration made once per descriptor, and a pending-readiness bit per
+-- direction, set by the poller when no task waits and consumed by the next
+-- park, so that an edge between the `EAGAIN` and the park is not lost. The
+-- read lock is held while parked, so each direction has at most one parked
+-- task.
+--
+-- Every result is a count, never negative, or the negated `errno`, as
+-- `Turkey.IO`'s are, or `closed`.
+
+import Turkey.Coroutine as Co
+import Turkey.IO as IO
+import Turkey.Scheduler as Scheduler
+import Turkey.Sys as Sys
+
+-- The state word's bits, as above.
+let closedBit : Int = 1
+let readLock : Int = 2
+let writeLock : Int = 4
+let readWaited : Int = 8
+let writeWaited : Int = 16
+let reference : Int = 32
+
+-- Where an object's fields start: the state word's offset from the record's
+-- address. The collector never moves an object, so the address is good for as
+-- long as the record is held, and every function here holds it.
+let fieldsAt : Int = 24
+
+-- What an operation on an `Fd` that has been closed answers: below every
+-- negated `errno`, so that it cannot be mistaken for one.
+let closed : Int = 0 - 0x1_0000_0000
+
+-- The `state` field is `var` though nothing assigns it: it changes after the
+-- record is built, by atomic instructions at its address, and a field that is
+-- not `var` is one the compiler may take to be what it was built with.
+type Fd = Fd {
+    var state   : Int,
+    number      : Int,
+    var readers : Vec Co.Coroutine,
+    var writers : Vec Co.Coroutine,
+}
+
+-- An `Fd` for a descriptor the caller owns from now on: its `close` closes it.
+fun fd(number : Int) -> Fd = Fd { state = 0, number = number, readers = [], writers = [] }
+
+-- The descriptor number, for a caller that only reports it. Using it for a
+-- system call races `close` in exactly the way this module exists to prevent.
+fun number(f : Fd) -> Int = f.number
+
+-- -- sequential -----------------------------------------------------------------------
+
+-- Up to `to - from` bytes into `bytes[from..to)`, from the descriptor's
+-- position: how many, at least 1, or 0 at end of file. One read at a time per
+-- `Fd`.
+fun read(f : Fd, bytes : Array Byte, from : Int, to : Int) -> Int {
+    if !lock(f, readLock, readWaited) { return closed }
+    var n = 0
+    while True {
+        n = IO.read(f.number, bytes, from, to)
+        if n == 0 - Sys.eintr { continue }
+        if n == 0 - Sys.eagain() {
+            again()
+            continue
+        }
+        break
+    }
+    unlock(f, readLock, readWaited)
+    n
+}
+
+-- All of `bytes[from..to)`, at the descriptor's position: `to - from`, or the
+-- negated `errno` of the call that failed, after whatever went before it. One
+-- write at a time per `Fd`, so the bytes go out contiguously.
+fun write(f : Fd, bytes : Array Byte, from : Int, to : Int) -> Int {
+    if !lock(f, writeLock, writeWaited) { return closed }
+    let n = writeAll(f, fun(at) = IO.write(f.number, bytes, at, to), from, to)
+    unlock(f, writeLock, writeWaited)
+    n
+}
+
+-- `write`, from a string's own bytes, counted in bytes.
+fun writeText(f : Fd, text : String, from : Int, to : Int) -> Int {
+    if !lock(f, writeLock, writeWaited) { return closed }
+    let n = writeAll(f, fun(at) = IO.writeText(f.number, text, at, to), from, to)
+    unlock(f, writeLock, writeWaited)
+    n
+}
+
+-- -- positional -----------------------------------------------------------------------
+
+-- `bytes[from..to)` filled from `offset` in the file, or as much of it as the
+-- file holds: how many, fewer than asked for only at end of file. The
+-- position is neither used nor moved, and no lock is taken.
+fun readAt(f : Fd, offset : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
+    if !acquire(f) { return closed }
+    var at = from
+    var result = 0
+    while at < to {
+        let n = IO.readAt(f.number, offset + (at - from), bytes, at, to)
+        if n == 0 - Sys.eintr { continue }
+        if n == 0 - Sys.eagain() {
+            again()
+            continue
+        }
+        if n < 0 {
+            result = n
+            break
+        }
+        if n == 0 { break }
+        at = at + n
+    }
+    let _ = release(f)
+    if result < 0 { result } else { at - from }
+}
+
+-- All of `bytes[from..to)` at `offset` in the file, the position neither used
+-- nor moved, and no lock taken: `to - from`, or the negated `errno`. Two
+-- overlapping `writeAt`s may interleave, as `pwrite`s do.
+fun writeAt(f : Fd, offset : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
+    if !acquire(f) { return closed }
+    let n = writeAll(f, fun(at) = IO.writeAt(f.number, offset + (at - from), bytes, at, to),
+                     from, to)
+    let _ = release(f)
+    n
+}
+
+-- -- closing --------------------------------------------------------------------------
+
+-- Mark `f` closed: every operation that starts afterwards answers `closed`,
+-- and a task waiting for a lock is woken to answer it too. The descriptor
+-- itself is closed when the last operation using it finishes, which is now
+-- if none is.
+--
+-- 0, or the negated `errno` of `close(2)` if it ran here; a failure in a
+-- `close(2)` that an operation finishing later runs is not reported to
+-- anyone. 0 again for an `Fd` already closed.
+fun close(f : Fd) -> Int {
+    let p = Prim.objectAddress(f)
+    while True {
+        let state = Prim.atomicLoad(p, fieldsAt)
+        if Prim.intAnd(state, closedBit) != 0 { return 0 }
+        let marked = Prim.intOr(state, closedBit) + reference
+        if Prim.atomicCas(p, fieldsAt, state, marked) == state { break }
+    }
+    -- A waiter registers under the scheduler's lock after seeing the bit
+    -- clear, so one that registered before this takes the lock is in a list,
+    -- and one after sees the bit.
+    Scheduler.lock()
+    for c in f.readers { Scheduler.wake(c) }
+    for c in f.writers { Scheduler.wake(c) }
+    f.readers = []
+    f.writers = []
+    Scheduler.changed()
+    Scheduler.unlock()
+    release(f)
+}
+
+-- -- underneath -----------------------------------------------------------------------
+
+-- Take a reference, unless `f` is closed. Whether it was taken.
+fun acquire(f : Fd) -> Bool {
+    let p = Prim.objectAddress(f)
+    while True {
+        let state = Prim.atomicLoad(p, fieldsAt)
+        if Prim.intAnd(state, closedBit) != 0 { return False }
+        if Prim.atomicCas(p, fieldsAt, state, state + reference) == state { return True }
+    }
+    False
+}
+
+-- Drop a reference, closing the descriptor if it was the last and `f` is
+-- closed: 0, or the negated `errno` of that `close(2)`. Exactly one release
+-- sees the count reach 0 with the bit set, since no reference is taken once
+-- it is set and `close` holds one of its own while it sets it.
+fun release(f : Fd) -> Int {
+    let before = Prim.atomicAdd(Prim.objectAddress(f), fieldsAt, 0 - reference)
+    if before - reference == closedBit { IO.close(f.number) } else { 0 }
+}
+
+-- Take `bit`'s lock and a reference with it, waiting for the lock if it is
+-- held, unless `f` is or becomes closed. Whether it was taken.
+fun lock(f : Fd, bit : Int, waited : Int) -> Bool {
+    let p = Prim.objectAddress(f)
+    let state = Prim.atomicLoad(p, fieldsAt)
+    if Prim.intAnd(state, closedBit + bit) == 0 {
+        if Prim.atomicCas(p, fieldsAt, state, state + bit + reference) == state { return True }
+    }
+    let claim = Claim { got = False }
+    Scheduler.waitUntil(fun() = tryLock(f, bit, waited, claim),
+                        fun(c) = if bit == readLock { Vec.push(f.readers, c) }
+                                 else { Vec.push(f.writers, c) })
+    claim.got
+}
+
+-- Whether a task that waited got the lock, or stopped waiting because `f` was
+-- closed. Made only when the lock is contended.
+type Claim = Claim { var got : Bool }
+
+-- Under the scheduler's lock: take the lock if it is free, or mark it waited
+-- for. Whether to stop waiting -- because the lock was taken, or `f` closed.
+fun tryLock(f : Fd, bit : Int, waited : Int, claim : Claim) -> Bool {
+    let p = Prim.objectAddress(f)
+    while True {
+        let state = Prim.atomicLoad(p, fieldsAt)
+        if Prim.intAnd(state, closedBit) != 0 { return True }
+        if Prim.intAnd(state, bit) == 0 {
+            if Prim.atomicCas(p, fieldsAt, state, state + bit + reference) == state {
+                claim.got = True
+                return True
+            }
+        } else if Prim.intAnd(state, waited) != 0 {
+            return False
+        } else if Prim.atomicCas(p, fieldsAt, state, state + waited) == state {
+            return False
+        }
+    }
+    False
+}
+
+-- Release `bit`'s lock and its reference, waking the tasks waiting for the
+-- lock if any may be, and closing the descriptor if this was the last
+-- reference to a closed `f`.
+fun unlock(f : Fd, bit : Int, waited : Int) -> Unit {
+    let p = Prim.objectAddress(f)
+    var before = 0
+    while True {
+        before = Prim.atomicLoad(p, fieldsAt)
+        let after = Prim.intAnd(before, Prim.intNot(bit + waited)) - reference
+        if Prim.atomicCas(p, fieldsAt, before, after) == before { break }
+    }
+    if Prim.intAnd(before, waited) != 0 {
+        Scheduler.lock()
+        if bit == readLock {
+            for c in f.readers { Scheduler.wake(c) }
+            f.readers = []
+        } else {
+            for c in f.writers { Scheduler.wake(c) }
+            f.writers = []
+        }
+        Scheduler.changed()
+        Scheduler.unlock()
+    }
+    if Prim.intAnd(before, Prim.intNot(bit + waited)) - reference == closedBit {
+        let _ = IO.close(f.number)
+    }
+}
+
+-- `write` until all of `from..to` is taken: `step(at)` writes from `at` and
+-- answers what the call did. Retried at once after a signal; 0 from a
+-- non-empty write, which would otherwise loop, is reported as `EIO`.
+fun writeAll(f : Fd, step : fun(Int) -> Int, from : Int, to : Int) -> Int {
+    var at = from
+    while at < to {
+        let n = step(at)
+        if n == 0 - Sys.eintr { continue }
+        if n == 0 - Sys.eagain() {
+            again()
+            continue
+        }
+        if n < 0 { return n }
+        if n == 0 { return 0 - Sys.eio }
+        at = at + n
+    }
+    to - from
+}
+
+-- The descriptor was not ready: let other tasks run, then try again.
+fun again() -> Unit = Scheduler.yield()

@@ -10,21 +10,11 @@ module System.IO (readFile, readBytes, writeFile, Output, create, put, close,
 -- that wants the bytes themselves is not made to go through text to get them.
 --
 -- Written in Turkey over `Turkey.IO`'s system calls, with no runtime support
--- of its own.
+-- of its own. The Prelude does not import this module, so it may use the
+-- Prelude, and only the programs that import it compile it.
 
-import Prelude ()
-import Std.Classes
-import Data.Array (Array)
-import Data.Array as Array
-import Data.Vec (Vec)
-import Data.Vec as Vec
-import Data.Bool.Type (Bool(..))
-import Data.Byte as Byte
-import Data.Int as Int
-import Data.Option.Type (Option(..))
-import Data.String as String
-import Data.String.Type as Str
 import Turkey.IO as IO
+import Turkey.Stdout (print, write, writeAll)
 import Turkey.Sys as Sys
 
 -- The file's contents, or `None` if it cannot be read or is not well-formed
@@ -47,7 +37,7 @@ fun readFile(path : String) -> Option String = match readBytes(path) {
 fun readBytes(path : String) -> Option (Vec Byte) {
     let fd = IO.open(path, Sys.readOnly, 0)
     if fd < 0 { return None }
-    readAll(fd)
+    drain(fd)
 }
 
 -- Whether every byte was written. A failed write is an ordinary thing to want
@@ -79,20 +69,8 @@ fun put(Output(fd), text : String) -> Bool = writeAll(fd, text)
 
 fun close(Output(fd)) -> Bool = IO.close(fd) == 0
 
--- The standard streams. `print` and `write` are the Prelude's, re-exported
--- from here because this is where a descriptor can be written; `Std.Classes`
--- held them while they were one primitive call, and cannot now, because the
--- raw memory underneath imports it.
---
--- A failed write to either stream is not reported, as it never was: there is
--- nowhere to report it to, and a program whose stdout is a closed pipe should
--- not have to test every line it prints.
---
--- A line is one string, newline included, so that it goes out in one `write`
--- where the kernel allows it: two processes sharing a terminal interleave by
--- line and not by fragment.
-fun print(x) { let _ = writeAll(1, Str.concat(show(x), "\n")) }
-fun write(x) { let _ = writeAll(1, show(x)) }
+-- The standard streams. `print` and `write` are the Prelude's, from
+-- `Turkey.Stdout`, and re-exported here beside the rest of them.
 fun stderr(text : String) -> Unit { let _ = writeAll(2, text) }
 
 -- -- underneath -----------------------------------------------------------------------
@@ -106,7 +84,7 @@ fun openForWriting(path : String) -> Int =
 -- failed. Read in chunks until `read` answers 0 rather than sized by `fstat`
 -- first: a pipe or a device has no length to ask for, and a regular file can
 -- change between the two calls.
-fun readAll(fd : Int) -> Option (Vec Byte) {
+fun drain(fd : Int) -> Option (Vec Byte) {
     let chunk = Array.filled(65536, Byte.truncate(0))
     let out = []
     loop {
@@ -123,20 +101,4 @@ fun readAll(fd : Int) -> Option (Vec Byte) {
     }
     let _ = IO.close(fd)
     Some(out)
-}
-
--- `write` may take fewer bytes than it was offered -- a pipe, a signal -- so
--- it is asked again from where it stopped, and again at once if a signal
--- interrupted it before it took any. Any other failure ends it; so does 0,
--- which for a non-empty request would otherwise loop.
-fun writeAll(fd : Int, text : String) -> Bool {
-    let size = String.byteLength(text)
-    var done = 0
-    while done < size {
-        let n = IO.writeText(fd, text, done, size)
-        if n == 0 - Sys.eintr { continue }
-        if n <= 0 { return False }
-        done = done + n
-    }
-    True
 }

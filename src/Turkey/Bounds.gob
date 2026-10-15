@@ -78,14 +78,14 @@ type Prover = Prover {
     func   : Ssa.Func Low,
     defs   : Array (Option Op),
     -- By value id. A value no fact can mention is its own node at offset 0.
-    values : Array Affine,
+    values : Vec Affine,
     -- By node: the values' nodes, then one for each array's length, then
     -- zero.
     floors : Array Floor,
     -- `x <= y + c` is `(y, c)` in `above[x]` and `(x, c)` in `below[y]`,
     -- for the facts in scope.
-    above  : Array (Array (Int, Int)),
-    below  : Array (Array (Int, Int)),
+    above  : Vec (Vec (Int, Int)),
+    below  : Vec (Vec (Int, Int)),
     zero   : Int,
 }
 
@@ -128,10 +128,10 @@ fun prover(f : Ssa.Func Low) -> Prover {
         floors = Array.filled(nodes, Unseen), above = [], below = [],
         zero = 2 * n,
     }
-    for var v = 0; v < n; v = v + 1 { Array.push(p.values, Affine { node = v, offset = 0 }) }
+    for var v = 0; v < n; v = v + 1 { Vec.push(p.values, Affine { node = v, offset = 0 }) }
     for _ in p.floors {
-        Array.push(p.above, [])
-        Array.push(p.below, [])
+        Vec.push(p.above, [])
+        Vec.push(p.below, [])
     }
     for var a = n; a < nodes; a = a + 1 { p.floors[a] = AtLeast(0) }
     -- Reverse postorder, so an instruction's operands are seen before it.
@@ -188,11 +188,11 @@ fun solveFloors(p : Prover) -> Unit {
     let f = p.func
     let order = Ssa.reversePostorder(f)
     -- The arguments each block parameter receives, from every jump to it.
-    let incoming : Array (Array (Array Value)) = Array.filled(len(f.blocks), [])
+    let incoming : Array (Vec (Vec Value)) = Array.filled(len(f.blocks), [])
     for var b = 0; b < len(f.blocks); b = b + 1 { incoming[b] = [] }
     for b in order {
         match Ssa.blockAt(f, b).term {
-            Jump(target, args) -> Array.push(incoming[Ssa.blockId(target)], args)
+            Jump(target, args) -> Vec.push(incoming[Ssa.blockId(target)], args)
             _ -> {}
         }
     }
@@ -300,16 +300,15 @@ fun walk(p : Prover) -> Bool {
     let idom = Ssa.dominators(f)
     let preds = Ssa.predecessors(f)
     let entry = Ssa.blockId(f.entry)
-    let children : Array (Array Int) = []
-    for _ in f.blocks { Array.push(children, []) }
+    let children : Array (Vec Int) = Array.init(len(f.blocks), fun(_) = [])
     for var b = 0; b < len(f.blocks); b = b + 1 {
         match idom[b] {
-            Some(d) -> if b != entry { Array.push(children[d], b) }
+            Some(d) -> if b != entry { Vec.push(children[d], b) }
             None -> {}
         }
     }
     -- The facts added, as their two nodes, and where each block's began.
-    let added : Array (Int, Int) = []
+    let added : Vec (Int, Int) = []
     let marks = Array.filled(len(f.blocks), 0)
     -- A block to enter, or `-1 - b` to leave `b`: an explicit stack, because
     -- a dominator tree can be as deep as the function is long.
@@ -317,14 +316,14 @@ fun walk(p : Prover) -> Bool {
     var folded = False
     while len(stack) > 0 {
         let b = stack[len(stack) - 1]
-        let _ = Array.pop(stack)
+        let _ = Vec.pop(stack)
         if b < 0 {
             let left = -1 - b
             while len(added) > marks[left] {
                 let (x, y) = added[len(added) - 1]
-                let _ = Array.pop(added)
-                let _ = Array.pop(p.above[x])
-                let _ = Array.pop(p.below[y])
+                let _ = Vec.pop(added)
+                let _ = Vec.pop(p.above[x])
+                let _ = Vec.pop(p.below[y])
             }
             continue
         }
@@ -333,15 +332,15 @@ fun walk(p : Prover) -> Bool {
         for i in f.blocks[b].insts {
             if prove(p, i) { folded = True }
         }
-        Array.push(stack, -1 - b)
-        for c in children[b] { Array.push(stack, c) }
+        Vec.push(stack, -1 - b)
+        for c in children[b] { Vec.push(stack, c) }
     }
     folded
 }
 
 -- The facts that hold in `to` because the only edge into it is one arm of
 -- the branch ending `from`.
-fun enterFrom(p : Prover, added : Array (Int, Int), from : Int, to : Int) -> Unit {
+fun enterFrom(p : Prover, added : Vec (Int, Int), from : Int, to : Int) -> Unit {
     match p.func.blocks[from].term {
         Branch(c, yes, no) -> {
             if Ssa.blockId(yes) == Ssa.blockId(no) { return }
@@ -385,12 +384,12 @@ fun negate(op : CmpOp) -> CmpOp = match op {
 }
 
 -- `a <= b - gap`, as a constraint between their nodes.
-fun assume(p : Prover, added : Array (Int, Int), a : Affine, b : Affine, gap : Int) -> Unit {
+fun assume(p : Prover, added : Vec (Int, Int), a : Affine, b : Affine, gap : Int) -> Unit {
     if a.node == b.node { return }
     let c = b.offset - a.offset - gap
-    Array.push(p.above[a.node], (b.node, c))
-    Array.push(p.below[b.node], (a.node, c))
-    Array.push(added, (a.node, b.node))
+    Vec.push(p.above[a.node], (b.node, c))
+    Vec.push(p.below[b.node], (a.node, c))
+    Vec.push(added, (a.node, b.node))
 }
 
 -- -- proofs ------------------------------------------------------------------------
@@ -477,7 +476,7 @@ fun atMost(p : Prover, a : Affine, b : Affine, gap : Int) -> Bool {
 -- tightest constant found on the way; `from` itself at 0. Bellman-Ford over
 -- the handful of facts in scope, so an array of pairs searched in place is
 -- the right size of map.
-fun reach(edges : Array (Array (Int, Int)), from : Int) -> Array (Int, Int) {
+fun reach(edges : Vec (Vec (Int, Int)), from : Int) -> Vec (Int, Int) {
     let found = [(from, 0)]
     var frontier = [(from, 0)]
     for var r = 0; r < rounds && len(frontier) > 0; r = r + 1 {
@@ -485,7 +484,7 @@ fun reach(edges : Array (Array (Int, Int)), from : Int) -> Array (Int, Int) {
         for (n, d) in frontier {
             for (m, c) in edges[n] {
                 let through = d + c
-                if relax(found, m, through) { Array.push(next, (m, through)) }
+                if relax(found, m, through) { Vec.push(next, (m, through)) }
             }
         }
         frontier = next
@@ -493,7 +492,7 @@ fun reach(edges : Array (Array (Int, Int)), from : Int) -> Array (Int, Int) {
     found
 }
 
-fun relax(found : Array (Int, Int), node : Int, d : Int) -> Bool {
+fun relax(found : Vec (Int, Int), node : Int, d : Int) -> Bool {
     for var k = 0; k < len(found); k = k + 1 {
         let (m, sofar) = found[k]
         if m == node {
@@ -502,6 +501,6 @@ fun relax(found : Array (Int, Int), node : Int, d : Int) -> Bool {
             return True
         }
     }
-    Array.push(found, (node, d))
+    Vec.push(found, (node, d))
     True
 }

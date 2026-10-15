@@ -37,18 +37,15 @@ fun normalize(p : Pat, decls : DeclTable) -> Witness = match p.kind {
         -- pattern left out, so every row for a constructor has the same width.
         let supplied = Map.new()
         for (label, sub) in fields { Map.put(supplied, label, sub) }
-        let args = Array.new(4)
-        match Decls.con(decls, name) {
+        let args = match Decls.con(decls, name) {
             Some(info) -> match info.fields {
-                Some(names) -> for n in names {
-                    match Map.get(supplied, n) {
-                        Some(sub) -> Array.push(args, normalize(sub, decls))
-                        None -> Array.push(args, WWild)
-                    }
-                }
-                None -> {}
+                Some(names) -> Array.map(names, fun(n) = match Map.get(supplied, n) {
+                    Some(sub) -> normalize(sub, decls)
+                    None -> WWild
+                })
+                None -> []
             }
-            None -> {}
+            None -> []
         }
         WCon(name, args)
     }
@@ -83,7 +80,7 @@ fun isNone(k : Key) -> Bool = match k {
     _ -> False
 }
 
-fun holdsKey(keys : Array Key, wanted : Key) -> Bool {
+fun holdsKey(keys : Vec Key, wanted : Key) -> Bool {
     for k in keys {
         if sameKey(k, wanted) { return True }
     }
@@ -127,10 +124,10 @@ fun subTypes(decls : DeclTable, key : Key, t : Ty.Type) -> Array Ty.Type =
     match key {
         KTuple(_) -> match Ty.prune(t) {
             TTuple(elems) -> elems
-            _ -> Array.new(0)
+            _ -> []
         }
-        KLit(_, _) -> Array.new(0)
-        KNone -> Array.new(0)
+        KLit(_, _) -> []
+        KNone -> []
         KCon(name) -> {
             -- Exhaustiveness runs after solving, so these variables belong to no
             -- pool: they exist only to carry the constructor's field types into
@@ -142,7 +139,7 @@ fun subTypes(decls : DeclTable, key : Key, t : Ty.Type) -> Array Ty.Type =
                     Ty.unify(ret, t, None, "", None)
                     params
                 }
-                _ -> Array.new(0)
+                _ -> []
             }
         }
     }
@@ -167,17 +164,17 @@ fun rebuild(key : Key, args : Array Witness) -> Witness = match key {
 -- -- the algorithm ------------------------------------------------------------------
 
 -- A row of patterns no row of the matrix covers, or `None` if it is exhaustive.
-fun witness(decls : DeclTable, matrix : Array (Array Witness),
+fun witness(decls : DeclTable, matrix : Vec (Array Witness),
             types : Array Ty.Type) -> Option (Array Witness) {
     if len(types) == 0 {
-        return if len(matrix) > 0 { None } else { Some(Array.new(0)) }
+        return if len(matrix) > 0 { None } else { Some([]) }
     }
     let headType = types[0]
     let restTypes = Array.slice(types, 1, len(types))
-    let used = Array.new(4)
+    let used = Vec.new(4)
     for row in matrix {
         let k = keyOf(row[0])
-        if !isNone(k) && !holdsKey(used, k) { Array.push(used, k) }
+        if !isNone(k) && !holdsKey(used, k) { Vec.push(used, k) }
     }
     let sig = signature(decls, headType)
 
@@ -212,10 +209,10 @@ fun witness(decls : DeclTable, matrix : Array (Array Witness),
 
     -- Incomplete: a value built from a constructor nobody tested reaches the
     -- default matrix, so recurse there and report one of the missing heads.
-    let default_ = Array.new(len(matrix))
+    let default_ = Vec.new(len(matrix))
     for row in matrix {
         if isNone(keyOf(row[0])) {
-            Array.push(default_, Array.slice(row, 1, len(row)))
+            Vec.push(default_, Array.slice(row, 1, len(row)))
         }
     }
     match witness(decls, default_, restTypes) {
@@ -240,30 +237,26 @@ fun witness(decls : DeclTable, matrix : Array (Array Witness),
     }
 }
 
-fun wilds(n : Int) -> Array Witness {
-    let out = Array.new(n)
-    for var i = 0; i < n; i = i + 1 { Array.push(out, WWild) }
-    out
-}
+fun wilds(n : Int) -> Array Witness = Array.filled(n, WWild)
 
-fun specialize(decls : DeclTable, matrix : Array (Array Witness), key : Key,
-               headType : Ty.Type) -> (Array (Array Witness), Array Ty.Type) {
+fun specialize(decls : DeclTable, matrix : Vec (Array Witness), key : Key,
+               headType : Ty.Type) -> (Vec (Array Witness), Array Ty.Type) {
     let argTypes = subTypes(decls, key, headType)
     let width = len(argTypes)
-    let rows = Array.new(len(matrix))
+    let rows = Vec.new(len(matrix))
     for row in matrix {
         let h = row[0]
         let rest = Array.slice(row, 1, len(row))
         let k = keyOf(h)
         if isNone(k) {
-            Array.push(rows, Array.append(wilds(width), rest))
+            Vec.push(rows, Array.append(wilds(width), rest))
         } else if sameKey(k, key) {
             let args = match h {
                 WCon(_, a) -> a
                 WTuple(elems) -> elems
-                _ -> Array.new(0)
+                _ -> []
             }
-            Array.push(rows, Array.append(args, rest))
+            Vec.push(rows, Array.append(args, rest))
         }
     }
     (rows, argTypes)
@@ -273,10 +266,10 @@ fun specialize(decls : DeclTable, matrix : Array (Array Witness), key : Key,
 
 -- The witness a match fails to handle, rendered, or `None` when it is
 -- exhaustive.
-fun check(decls : DeclTable, arms : Array Arm, scrutinee : Ty.Type) -> Option String {
-    let matrix = Array.new(8)
+fun check(decls : DeclTable, arms : Vec Arm, scrutinee : Ty.Type) -> Option String {
+    let matrix = Vec.new(8)
     for arm in arms {
-        for p in arm.patterns { Array.push(matrix, [normalize(p, decls)]) }
+        for p in arm.patterns { Vec.push(matrix, [normalize(p, decls)]) }
     }
     match witness(decls, matrix, [scrutinee]) {
         None -> None

@@ -487,19 +487,20 @@ fun applyTo(head : Type, args : Array Type, where : Option Span) -> Type {
 -- Most of the checker wants to ask "is this an `Array`?", which is a question
 -- about the head.
 fun spine(t : Type) -> (Type, Array Type) {
-    let args = Array.new(2)
+    let args = Vec.new(2)
     var head = prune(t)
     var going = True
     while going {
         match head {
             TApp(fn, arg, _) -> {
-                Array.push(args, arg)
+                Vec.push(args, arg)
                 head = prune(fn)
             }
             _ -> { going = False }
         }
     }
-    (head, Array.reverse(args))
+    let n = len(args)
+    (head, Array.init(n, fun(i) = args[n - 1 - i]))
 }
 
 -- The constructor at the head of `t`, if it is one.
@@ -536,12 +537,8 @@ let integralWidths = [("Int", 64)]
 let decimalMantissas = [("Float", 53)]
 
 -- The tower, most-preferred first.
-fun numericOrder() -> Array String {
-    let out = Array.new(4)
-    for (name, _) in integralWidths { Array.push(out, name) }
-    for (name, _) in decimalMantissas { Array.push(out, name) }
-    out
-}
+fun numericOrder() -> Array String =
+    Array.map(integralWidths, _.0) + Array.map(decimalMantissas, _.0)
 
 -- The types an integer literal could have: everything that holds `value`.
 --
@@ -560,13 +557,9 @@ fun numericOrder() -> Array String {
 -- 64-bit range is a *lex* error, so by the time a value reaches inference it
 -- fits.
 fun intLiteralSet(value : Int) -> Array String {
-    let out = Array.new(2)
-    for (name, _) in integralWidths { Array.push(out, name) }
     let magnitude = Int.abs(value)
-    for (name, mantissa) in decimalMantissas {
-        if magnitude < Int.shl(1, mantissa) { Array.push(out, name) }
-    }
-    out
+    let exact = Array.filter(decimalMantissas, fun((_, mantissa)) = magnitude < Int.shl(1, mantissa))
+    Array.map(integralWidths, _.0) + Array.map(exact, _.0)
 }
 
 -- The types a decimal literal could have: the float types, and only those.
@@ -575,11 +568,7 @@ fun intLiteralSet(value : Int) -> Array String {
 -- every binary float, so representability would reject every member and say
 -- nothing useful; what a decimal literal picks out is the *kind* of type, and
 -- precision is the programmer's business from there.
-fun floatLiteralSet() -> Array String {
-    let out = Array.new(2)
-    for (name, _) in decimalMantissas { Array.push(out, name) }
-    out
-}
+fun floatLiteralSet() -> Array String = Array.map(decimalMantissas, _.0)
 
 -- Every tower member is a nullary constructor, so its type is a `TCon`.
 fun numericType(name : String) -> Type = tcon(name, KStar, noScope)
@@ -602,13 +591,8 @@ let arrayLiteralNames = ["Data.Array#Array", "Data.Vec#Vec"]
 --
 -- Each member is a constructor of kind `* -> *`, applied to the literal's
 -- element type.
-fun arrayLiteralSet(declared : fun(String) -> Bool) -> Array String {
-    let out = [arrayLiteralNames[0]]
-    for var i = 1; i < len(arrayLiteralNames); i = i + 1 {
-        if declared(arrayLiteralNames[i]) { Array.push(out, arrayLiteralNames[i]) }
-    }
-    out
-}
+fun arrayLiteralSet(declared : fun(String) -> Bool) -> Array String =
+    Array.filter(arrayLiteralNames, fun(name) = name == arrayLiteralNames[0] || declared(name))
 
 fun isArrayLiteralSet(t : Type) -> Bool = match t {
     TSet(names) -> len(names) > 0 && Array.contains(arrayLiteralNames, names[0])
@@ -690,15 +674,15 @@ fun predLevel(p : Pred) -> Int {
 -- `forall q1 ... qn . preds => body`. An empty `quantified` means monomorphic;
 -- an empty `preds` means unqualified.
 type Scheme = Scheme {
-    quantified : Array VarCell,
+    quantified : Vec VarCell,
     body       : Type,
-    preds      : Array Pred,
+    preds      : Vec Pred,
 }
 
 fun mono(t : Type) -> Scheme =
-    Scheme { quantified = Array.new(0), body = t, preds = Array.new(0) }
+    Scheme { quantified = [], body = t, preds = [] }
 
-fun scheme(quantified : Array VarCell, body : Type, preds : Array Pred) -> Scheme =
+fun scheme(quantified : Vec VarCell, body : Type, preds : Vec Pred) -> Scheme =
     Scheme { quantified = quantified, body = body, preds = preds }
 
 -- -- operations ---------------------------------------------------------------------
@@ -815,18 +799,18 @@ fun occursAndAdjust(slot : VarCell, t : Type) -> Bool = match prune(t) {
 -- younger than the variable it would bind is out of scope. Run before
 -- `occursAndAdjust`, which lowers levels and would erase the evidence.
 -- The rigid constants reachable from `types`, first occurrence first.
-fun skolemsOf(types : Array Type) -> Array ConCell {
-    let out = Array.new(2)
+fun skolemsOf(types : Array Type) -> Vec ConCell {
+    let out = Vec.new(2)
     let seen = Set.new()
     for t in types { skolemsInto(t, out, seen) }
     out
 }
 
-fun skolemsInto(t : Type, out : Array ConCell, seen : Set.Set Int) -> Unit =
+fun skolemsInto(t : Type, out : Vec ConCell, seen : Set.Set Int) -> Unit =
     match prune(t) {
         TCon(c) -> if c.uid != 0 && !Set.contains(seen, c.uid) {
             Set.add(seen, c.uid)
-            Array.push(out, c)
+            Vec.push(out, c)
         }
         TApp(fn, arg, _) -> {
             skolemsInto(fn, out, seen)
@@ -1046,8 +1030,8 @@ fun join(a : Type, b : Type, where : Option Span, context : String,
 -- walked too, so a variable a predicate constrains is quantified along with the
 -- type's own -- a retained predicate must not mention a variable the scheme left
 -- free.
-fun generalize(t : Type, level : Int, preds : Array Pred) -> Scheme {
-    let quantified = Array.new(4)
+fun generalize(t : Type, level : Int, preds : Vec Pred) -> Scheme {
+    let quantified = Vec.new(4)
     let seen = Set.new()
     generalizeWalk(t, level, quantified, seen)
     for p in preds {
@@ -1056,11 +1040,11 @@ fun generalize(t : Type, level : Int, preds : Array Pred) -> Scheme {
     Scheme { quantified = quantified, body = t, preds = preds }
 }
 
-fun generalizeWalk(t : Type, level : Int, out : Array VarCell,
+fun generalizeWalk(t : Type, level : Int, out : Vec VarCell,
                    seen : Set.Set Int) -> Unit = match prune(t) {
     TVar(cell) -> if cell.level > level && !Set.contains(seen, cell.id) {
         Set.add(seen, cell.id)
-        Array.push(out, cell)
+        Vec.push(out, cell)
     }
     TApp(fn, arg, _) -> {
         generalizeWalk(fn, level, out, seen)
@@ -1098,19 +1082,19 @@ fun instantiate(s : Scheme, fresh : Fresh) -> Type {
 -- is the argument list of the type application that a use of a polymorphic name
 -- becomes -- and the variables are still bare here, which is right: the solver
 -- decides what they are.
-fun instantiateQual(s : Scheme, fresh : Fresh) -> (Array Pred, Type, Array Type) {
-    if len(s.quantified) == 0 { return (s.preds, s.body, Array.new(0)) }
+fun instantiateQual(s : Scheme, fresh : Fresh) -> (Vec Pred, Type, Vec Type) {
+    if len(s.quantified) == 0 { return (s.preds, s.body, []) }
     -- A fresh variable stands for a quantified one, so it inherits its kind:
     -- instantiating `Wrap f a` must not turn the `f` into something of kind `*`.
     let mapping = Map.new()
-    let args = Array.new(len(s.quantified))
+    let args = Vec.new(len(s.quantified))
     for v in s.quantified {
         let replacement = fresh()
         discard(unifyKinds(replacement.kind, v.kind))
         Map.put(mapping, v.id, TVar(replacement))
-        Array.push(args, TVar(replacement))
+        Vec.push(args, TVar(replacement))
     }
-    let preds = Array.map(s.preds, fun(p) =
+    let preds = Vec.map(s.preds, fun(p) =
         Pred { name = p.name, args = Array.map(p.args, subst(_, mapping)) })
     (preds, subst(s.body, mapping), args)
 }
@@ -1239,15 +1223,15 @@ fun typeKeyInto(b : String.Builder, t : Type) -> Unit = match prune(t) {
 -- An occurs check over whole types rather than over variables: solving an
 -- equality needs to know whether one *family application* appears inside
 -- another type, which `varsOf` cannot answer.
-fun subterms(t : Type) -> Array Type {
-    let out = Array.new(4)
+fun subterms(t : Type) -> Vec Type {
+    let out = Vec.new(4)
     subtermsInto(t, out)
     out
 }
 
-fun subtermsInto(t : Type, out : Array Type) -> Unit {
+fun subtermsInto(t : Type, out : Vec Type) -> Unit {
     let here = prune(t)
-    Array.push(out, here)
+    Vec.push(out, here)
     match here {
         TApp(fn, arg, _) -> {
             subtermsInto(fn, out)
@@ -1264,18 +1248,18 @@ fun subtermsInto(t : Type, out : Array Type) -> Unit {
 }
 
 -- The unbound variables reachable from `types`, first occurrence first.
-fun varsOf(types : Array Type) -> Array VarCell {
-    let out = Array.new(4)
+fun varsOf(types : Array Type) -> Vec VarCell {
+    let out = Vec.new(4)
     let seen = Set.new()
     for t in types { varsWalk(t, out, seen) }
     out
 }
 
-fun varsWalk(t : Type, out : Array VarCell, seen : Set.Set Int) -> Unit =
+fun varsWalk(t : Type, out : Vec VarCell, seen : Set.Set Int) -> Unit =
     match prune(t) {
         TVar(cell) -> if !Set.contains(seen, cell.id) {
             Set.add(seen, cell.id)
-            Array.push(out, cell)
+            Vec.push(out, cell)
         }
         TApp(fn, arg, _) -> {
             varsWalk(fn, out, seen)
@@ -1314,7 +1298,7 @@ fun namer(prefix : String) -> Namer =
     Namer { names = Map.new(), next = 0, prefix = prefix }
 
 -- A namer that has already named a scheme's quantified variables, positionally.
-fun namerFrom(quantified : Array VarCell, prefix : String) -> Namer {
+fun namerFrom(quantified : Vec VarCell, prefix : String) -> Namer {
     let names = Map.new()
     for var i = 0; i < len(quantified); i = i + 1 {
         Map.put(names, quantified[i].id, varName(i))
@@ -1367,9 +1351,9 @@ fun showAt(t : Type, n : Namer, prec : Int) -> String = match prune(t) {
     }
 }
 
-fun showEach(ts : Array Type, n : Namer, prec : Int) -> Array String {
-    let out = Array.new(len(ts))
-    for t in ts { Array.push(out, showAt(t, n, prec)) }
+fun showEach(ts : Array Type, n : Namer, prec : Int) -> Vec String {
+    let out = Vec.new(len(ts))
+    for t in ts { Vec.push(out, showAt(t, n, prec)) }
     out
 }
 
@@ -1386,8 +1370,8 @@ fun showScheme(s : Scheme) -> String {
     let n = namerFrom(s.quantified, "_")
     let body = showAt(s.body, n, 0)
     if len(s.preds) == 0 { return body }
-    let parts = Array.new(len(s.preds))
-    for p in s.preds { Array.push(parts, showPredWith(p, n)) }
+    let parts = Vec.new(len(s.preds))
+    for p in s.preds { Vec.push(parts, showPredWith(p, n)) }
     "[" + String.join(parts, ", ") + "] " + body
 }
 

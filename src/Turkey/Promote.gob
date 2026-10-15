@@ -32,9 +32,9 @@ fun run(input : Ssa.Func Low) -> Ssa.Func Low {
     -- Each block's needed slots twice: as a list, whose order is the order of
     -- the parameters the block gains and of the arguments every edge into it
     -- passes, and as a bitset, to ask whether one is there already.
-    let needed : Array (Array Int) = []
-    let neededSet : Array BitSet = []
-    let written : Array BitSet = []
+    let needed : Vec (Vec Int) = []
+    let neededSet : Vec BitSet = []
+    let written : Vec BitSet = []
     for block in f.blocks {
         let use = []
         let useSet = BitSet.new(slotCount)
@@ -44,7 +44,7 @@ fun run(input : Ssa.Func Low) -> Ssa.Func Low {
                 SlotLoad(slot) -> {
                     if !BitSet.contains(defs, slot) && !BitSet.contains(useSet, slot) {
                         BitSet.add(useSet, slot)
-                        Array.push(use, slot)
+                        Vec.push(use, slot)
                     }
                     Map.put(reps, slot, Ssa.repOf(f, inst.result))
                 }
@@ -55,9 +55,9 @@ fun run(input : Ssa.Func Low) -> Ssa.Func Low {
                 _ -> {}
             }
         }
-        Array.push(needed, use)
-        Array.push(neededSet, useSet)
-        Array.push(written, defs)
+        Vec.push(needed, use)
+        Vec.push(neededSet, useSet)
+        Vec.push(written, defs)
     }
     var changed = True
     while changed {
@@ -68,7 +68,7 @@ fun run(input : Ssa.Func Low) -> Ssa.Func Low {
                     if !BitSet.contains(written[b], slot)
                        && !BitSet.contains(neededSet[b], slot) {
                         BitSet.add(neededSet[b], slot)
-                        Array.push(needed[b], slot)
+                        Vec.push(needed[b], slot)
                         changed = True
                     }
                 }
@@ -79,24 +79,24 @@ fun run(input : Ssa.Func Low) -> Ssa.Func Low {
         panic("slot promotion: uninitialized local in " + f.name)
     }
     let slots = needed
-    let incoming : Array (Map Int Value) = []
-    let original : Array Int = []
+    let incoming : Vec (Map Int Value) = []
+    let original : Vec Int = []
     for var b = 0; b < len(f.blocks); b = b + 1 {
         let values = Map.new()
-        Array.push(original, len(f.blocks[b].params))
+        Vec.push(original, len(f.blocks[b].params))
         for slot in slots[b] {
             let r = match Map.get(reps, slot) {
                 Some(r) -> r
                 None -> panic("slot promotion: missing representation")
             }
             let v = Ssa.freshValue(f, r)
-            Array.push(f.blocks[b].params, v)
+            Vec.push(f.blocks[b].params, v)
             Map.put(values, slot, v)
         }
-        Array.push(incoming, values)
+        Vec.push(incoming, values)
     }
     let aliases = Map.new()
-    let outgoing : Array (Map Int Value) = []
+    let outgoing : Vec (Map Int Value) = []
     let count = len(f.blocks)
     for var b = 0; b < count; b = b + 1 {
         let values = incoming[b]
@@ -105,22 +105,22 @@ fun run(input : Ssa.Func Low) -> Ssa.Func Low {
             match inst.op {
                 SlotLoad(slot) -> Map.put(aliases, Ssa.valueId(inst.result), get(values, slot))
                 SlotStore(slot, v) -> Map.put(values, slot, v)
-                _ -> Array.push(kept, inst)
+                _ -> Vec.push(kept, inst)
             }
         }
         f.blocks[b].insts = kept
-        Array.push(outgoing, values)
+        Vec.push(outgoing, values)
     }
     for var b = 0; b < count; b = b + 1 {
         let block = f.blocks[b]
         block.term = match block.term {
-            Jump(target, args) -> Jump(target, Array.append(args,
+            Jump(target, args) -> Jump(target, Vec.append(args,
                 edgeArgs(slots, outgoing[b], target)))
             Branch(c, yes, no) -> Branch(c,
                 edge(f, yes, edgeArgs(slots, outgoing[b], yes)),
                 edge(f, no, edgeArgs(slots, outgoing[b], no)))
             Switch(v, cases, default) -> Switch(v,
-                Array.map(cases, fun((key, target)) =
+                Vec.map(cases, fun((key, target)) =
                     (key, edge(f, target, edgeArgs(slots, outgoing[b], target)))),
                 match default {
                     Some(d) -> Some(edge(f, d, edgeArgs(slots, outgoing[b], d)))
@@ -170,7 +170,7 @@ fun run(input : Ssa.Func Low) -> Ssa.Func Low {
     let keep = Array.map(f.blocks, fun(block) = Array.map(block.params,
         \!Map.contains(aliases, Ssa.valueId(_))))
     for block in f.blocks {
-        block.params = Array.filter(block.params,
+        block.params = Vec.filter(block.params,
             \!Map.contains(aliases, Ssa.valueId(_)))
         for inst in block.insts {
             inst.op = L.mapUses(inst.op, resolve(aliases, _))
@@ -184,7 +184,7 @@ fun run(input : Ssa.Func Low) -> Ssa.Func Low {
                 let kept = []
                 for var i = 0; i < len(args); i = i + 1 {
                     if keep[Ssa.blockId(target)][i] {
-                        Array.push(kept, resolve(aliases, args[i]))
+                        Vec.push(kept, resolve(aliases, args[i]))
                     }
                 }
                 Jump(target, kept)
@@ -211,16 +211,16 @@ fun resolve(aliases : Map Int Value, value : Value) -> Value {
     v
 }
 
-fun edgeArgs(slots : Array (Array Int), values : Map Int Value,
-             target : BlockId) -> Array Value =
-    Array.map(slots[Ssa.blockId(target)], get(values, _))
+fun edgeArgs(slots : Vec (Vec Int), values : Map Int Value,
+             target : BlockId) -> Vec Value =
+    Vec.map(slots[Ssa.blockId(target)], get(values, _))
 
-fun edge(f : Ssa.Func Low, target : BlockId, args : Array Value) -> BlockId {
+fun edge(f : Ssa.Func Low, target : BlockId, args : Vec Value) -> BlockId {
     if len(args) == 0 { return target }
     let b : Ssa.Block Low = Ssa.newBlock()
     b.term = Jump(target, args)
     let id = BlockId(len(f.blocks))
-    Array.push(f.blocks, b)
+    Vec.push(f.blocks, b)
     id
 }
 

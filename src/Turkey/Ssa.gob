@@ -221,13 +221,13 @@ fun deletable(e : Effects) -> Bool = !e.writes && !e.traps && !e.diverges
 type Term
     = Ret(Value)
     -- The arguments are the target block's parameters, positionally.
-    | Jump(BlockId, Array Value)
+    | Jump(BlockId, Vec Value)
     | Branch(Value, BlockId, BlockId)
     -- A multi-way branch on an integer: to the case equal to the value, or
     -- else to the default. Like `Branch`, it passes its targets nothing.
     -- No default says the cases are every value the operand can hold, which
     -- is what lets a lowering test fewer of them than there are.
-    | Switch(Value, Array (Int, BlockId), Option BlockId)
+    | Switch(Value, Vec (Int, BlockId), Option BlockId)
     | Panic(Value)
     -- What an unfinished block holds while it is built, and what a block after
     -- a diverging call legitimately ends with.
@@ -242,18 +242,15 @@ fun successors(t : Term) -> Array BlockId = match t {
     Unreachable -> []
 }
 
-fun switchTargets(cases : Array (Int, BlockId), default : Option BlockId) -> Array BlockId {
-    let out = Array.map(cases, fun((_, target)) = target)
+fun switchTargets(cases : Vec (Int, BlockId), default : Option BlockId) -> Array BlockId =
     match default {
-        Some(d) -> Array.push(out, d)
-        None -> {}
+        Some(d) -> Array.init(len(cases) + 1, fun(i) = if i < len(cases) { cases[i].1 } else { d })
+        None -> Array.map(cases, fun((_, target)) = target)
     }
-    out
-}
 
 type Block i = Block {
-    var params : Array Value,
-    var insts  : Array i,
+    var params : Vec Value,
+    var insts  : Vec i,
     var term   : Term,
 }
 
@@ -262,12 +259,12 @@ fun newBlock() -> Block i =
 
 type Func i = Func {
     name       : String,
-    params     : Array Value,
+    params     : Vec Value,
     result     : Rep,
-    var blocks : Array (Block i),
+    var blocks : Vec (Block i),
     var entry  : BlockId,
     -- Indexed by `valueId`. The side table a dense index buys.
-    reps   : Array Rep,
+    reps   : Vec Rep,
     -- Where in the source an instruction that may allocate, or a string
     -- literal, came from, by the value it defines. Read by diagnostics only -- the giblets check prints
     -- it -- so nothing is lost but a location when a pass does not carry it.
@@ -287,7 +284,7 @@ fun newFunc(name : String, result : Rep) -> Func i = Func {
 -- A value of the given representation, appended to the function's table.
 fun freshValue(f : Func i, r : Rep) -> Value {
     let id = len(f.reps)
-    Array.push(f.reps, r)
+    Vec.push(f.reps, r)
     Value(id)
 }
 
@@ -317,8 +314,8 @@ class Inst i : Show i {
     fun anyUse(i, fun(Value) -> Bool) -> Bool
     fun anyDef(i, fun(Value) -> Bool) -> Bool
     -- The same values as arrays, for a caller that keeps them.
-    fun uses(inst : i) -> Array Value = collect(anyUse(inst, _))
-    fun defs(inst : i) -> Array Value = collect(anyDef(inst, _))
+    fun uses(inst : i) -> Vec Value = collect(anyUse(inst, _))
+    fun defs(inst : i) -> Vec Value = collect(anyDef(inst, _))
     fun effects(i) -> Effects
     -- The same instruction with every value it reads passed through the
     -- function. What it defines is unchanged.
@@ -343,10 +340,10 @@ fun eachDef[Inst i](i : i, f : fun(Value) -> Unit) -> Unit {
     })
 }
 
-fun collect(visit : fun(fun(Value) -> Bool) -> Bool) -> Array Value {
+fun collect(visit : fun(fun(Value) -> Bool) -> Bool) -> Vec Value {
     let out = []
     let _ = visit(fun(v) {
-        Array.push(out, v)
+        Vec.push(out, v)
         False
     })
     out
@@ -354,12 +351,11 @@ fun collect(visit : fun(fun(Value) -> Bool) -> Bool) -> Array Value {
 
 -- -- traversal and dominance --------------------------------------------------------
 
-fun predecessors(f : Func i) -> Array (Array BlockId) {
-    let out : Array (Array BlockId) = []
-    for _ in f.blocks { Array.push(out, []) }
+fun predecessors(f : Func i) -> Array (Vec BlockId) {
+    let out : Array (Vec BlockId) = Array.init(len(f.blocks), fun(_) = [])
     for var b = 0; b < len(f.blocks); b = b + 1 {
         for s in successors(f.blocks[b].term) {
-            Array.push(out[blockId(s)], BlockId(b))
+            Vec.push(out[blockId(s)], BlockId(b))
         }
     }
     out
@@ -368,8 +364,8 @@ fun predecessors(f : Func i) -> Array (Array BlockId) {
 -- Blocks in reverse postorder, which is the order the dominance solver wants:
 -- every block but the entry appears after at least one of its predecessors, so
 -- one pass already computes most of the answer.
-fun reversePostorder(f : Func i) -> Array BlockId {
-    let order : Array BlockId = []
+fun reversePostorder(f : Func i) -> Vec BlockId {
+    let order : Vec BlockId = []
     let seen = Set.new()
     -- An explicit stack of (block, next successor to visit): the recursive
     -- form is depth-first over a graph the size of a whole function, which is
@@ -380,18 +376,18 @@ fun reversePostorder(f : Func i) -> Array BlockId {
         let (b, at) = stack[len(stack) - 1]
         let succs = successors(f.blocks[blockId(b)].term)
         if at >= len(succs) {
-            let _ = Array.pop(stack)
-            Array.push(order, b)
+            let _ = Vec.pop(stack)
+            Vec.push(order, b)
         } else {
             stack[len(stack) - 1] = (b, at + 1)
             let next = succs[at]
             if !Set.contains(seen, blockId(next)) {
                 Set.add(seen, blockId(next))
-                Array.push(stack, (next, 0))
+                Vec.push(stack, (next, 0))
             }
         }
     }
-    Array.reverse(order)
+    Vec.reverse(order)
 }
 
 -- The immediate dominator of each block, or `None` for one the entry does not
@@ -504,21 +500,21 @@ fun dominates(idom : Array (Option Int), a : BlockId, b : BlockId) -> Bool {
 -- property that makes an optimizer safe to build incrementally. It matters
 -- most here because what checks this level otherwise is running the compiled
 -- program, which localizes a fault to a program rather than to a pass.
-fun verify[Inst i](f : Func i) -> Array String {
+fun verify[Inst i](f : Func i) -> Vec String {
     let out = []
     let count = len(f.blocks)
     if count == 0 {
-        Array.push(out, f.name + ": no blocks")
+        Vec.push(out, f.name + ": no blocks")
         return out
     }
     if blockId(f.entry) < 0 || blockId(f.entry) >= count {
-        Array.push(out, f.name + ": entry is not a block")
+        Vec.push(out, f.name + ": entry is not a block")
         return out
     }
     -- The entry takes the function's parameters, so it must declare none of
     -- its own: there is no edge into it to supply them.
     if len(f.blocks[blockId(f.entry)].params) > 0 {
-        Array.push(out, f.name + ": the entry block takes parameters")
+        Vec.push(out, f.name + ": the entry block takes parameters")
     }
     -- Only a pointer may be traced. Today every `Ptr` is traced and the field
     -- looks redundant; it is not, and this is what keeps it honest -- a code
@@ -526,7 +522,7 @@ fun verify[Inst i](f : Func i) -> Array String {
     -- selection is where the first one appears.
     for var i = 0; i < len(f.reps); i = i + 1 {
         if f.reps[i].traced && f.reps[i].class_ != Ptr {
-            Array.push(out, f.name + ": value " + Int.toString(i) + " is "
+            Vec.push(out, f.name + ": value " + Int.toString(i) + " is "
                             + show(f.reps[i]) + ", which is not a pointer")
         }
     }
@@ -566,16 +562,16 @@ fun verify[Inst i](f : Func i) -> Array String {
     out
 }
 
-fun define(out : Array String, f : Func i, defBlock : Array (Option Int),
+fun define(out : Vec String, f : Func i, defBlock : Array (Option Int),
            defAt : Array Int, v : Value, b : Int, n : Int) -> Unit {
     let id = valueId(v)
     if id < 0 || id >= len(f.reps) {
-        Array.push(out, f.name + ": value " + Int.toString(id) + " has no representation")
+        Vec.push(out, f.name + ": value " + Int.toString(id) + " has no representation")
         return
     }
     match defBlock[id] {
         Some(_) -> {
-            Array.push(out, f.name + ": value " + Int.toString(id)
+            Vec.push(out, f.name + ": value " + Int.toString(id)
                             + " is defined twice")
             return
         }
@@ -587,36 +583,36 @@ fun define(out : Array String, f : Func i, defBlock : Array (Option Int),
 
 -- Every use is dominated by its definition. Within one block that is textual
 -- order; across blocks it is the dominator tree.
-fun checkUse(out : Array String, f : Func i, idom : Array (Option Int),
+fun checkUse(out : Vec String, f : Func i, idom : Array (Option Int),
              defBlock : Array (Option Int), defAt : Array Int, v : Value,
              b : Int, n : Int) -> Unit {
     let id = valueId(v)
     if id < 0 || id >= len(f.reps) {
-        Array.push(out, f.name + ": use of value " + Int.toString(id)
+        Vec.push(out, f.name + ": use of value " + Int.toString(id)
                         + " which has no representation")
         return
     }
     let where = match defBlock[id] {
         Some(n) -> n
         None -> {
-            Array.push(out, f.name + ": use of undefined value " + Int.toString(id))
+            Vec.push(out, f.name + ": use of undefined value " + Int.toString(id))
             return
         }
     }
     if where == b {
         if defAt[id] >= n {
-            Array.push(out, f.name + ": value " + Int.toString(id)
+            Vec.push(out, f.name + ": value " + Int.toString(id)
                             + " is used before it is defined")
         }
         return
     }
     if !dominates(idom, BlockId(where), BlockId(b)) {
-        Array.push(out, f.name + ": value " + Int.toString(id)
+        Vec.push(out, f.name + ": value " + Int.toString(id)
                         + " is used outside the blocks its definition dominates")
     }
 }
 
-fun checkTerm(out : Array String, f : Func i, idom : Array (Option Int),
+fun checkTerm(out : Vec String, f : Func i, idom : Array (Option Int),
               defBlock : Array (Option Int), defAt : Array Int, b : Int,
               t : Term) -> Unit {
     let last = len(f.blocks[b].insts)
@@ -624,7 +620,7 @@ fun checkTerm(out : Array String, f : Func i, idom : Array (Option Int),
         Ret(v) -> {
             checkUse(out, f, idom, defBlock, defAt, v, b, last)
             if repOf(f, v) != f.result {
-                Array.push(out, f.name + ": returns " + show(repOf(f, v))
+                Vec.push(out, f.name + ": returns " + show(repOf(f, v))
                                 + " where " + show(f.result) + " was declared")
             }
         }
@@ -632,7 +628,7 @@ fun checkTerm(out : Array String, f : Func i, idom : Array (Option Int),
         Branch(cond, yes, no) -> {
             checkUse(out, f, idom, defBlock, defAt, cond, b, last)
             if repOf(f, cond).class_ != I1 {
-                Array.push(out, f.name + ": branches on "
+                Vec.push(out, f.name + ": branches on "
                                 + show(repOf(f, cond)) + " rather than i1")
             }
             checkEdge(out, f, idom, defBlock, defAt, b, yes, [])
@@ -643,7 +639,7 @@ fun checkTerm(out : Array String, f : Func i, idom : Array (Option Int),
             let keys = Set.new()
             for (key, _) in cases {
                 if Set.contains(keys, key) {
-                    Array.push(out, f.name + ": switches to two cases for "
+                    Vec.push(out, f.name + ": switches to two cases for "
                                     + Int.toString(key))
                 }
                 Set.add(keys, key)
@@ -660,18 +656,18 @@ fun checkTerm(out : Array String, f : Func i, idom : Array (Option Int),
 -- A jump's arguments are the target's parameters, so they have to agree in
 -- number and in representation. `Branch` carries none, which is why a block
 -- reached by a branch may not take any.
-fun checkEdge(out : Array String, f : Func i, idom : Array (Option Int),
+fun checkEdge(out : Vec String, f : Func i, idom : Array (Option Int),
               defBlock : Array (Option Int), defAt : Array Int, b : Int,
-              target : BlockId, args : Array Value) -> Unit {
+              target : BlockId, args : Vec Value) -> Unit {
     let to = blockId(target)
     if to < 0 || to >= len(f.blocks) {
-        Array.push(out, f.name + ": jump to block " + Int.toString(to)
+        Vec.push(out, f.name + ": jump to block " + Int.toString(to)
                         + ", which does not exist")
         return
     }
     let params = f.blocks[to].params
     if len(params) != len(args) {
-        Array.push(out, f.name + ": jump to block " + Int.toString(to) + " passes "
+        Vec.push(out, f.name + ": jump to block " + Int.toString(to) + " passes "
                         + Int.toString(len(args)) + " arguments to "
                         + Int.toString(len(params)) + " parameters")
         return
@@ -680,7 +676,7 @@ fun checkEdge(out : Array String, f : Func i, idom : Array (Option Int),
     for var i = 0; i < len(args); i = i + 1 {
         checkUse(out, f, idom, defBlock, defAt, args[i], b, last)
         if repOf(f, args[i]) != repOf(f, params[i]) {
-            Array.push(out, f.name + ": jump to block " + Int.toString(to)
+            Vec.push(out, f.name + ": jump to block " + Int.toString(to)
                             + " passes " + show(repOf(f, args[i]))
                             + " where " + show(repOf(f, params[i]))
                             + " was declared")
@@ -737,10 +733,12 @@ fun showTerm(f : Func i, t : Term) -> String = match t {
         "branch " + showValue(f, cond) + ", b" + Int.toString(blockId(yes))
         + ", b" + Int.toString(blockId(no))
     Switch(v, cases, default) -> {
-        let parts = Array.map(cases, fun((key, target)) =
-            Int.toString(key) + " -> b" + Int.toString(blockId(target)))
+        let parts = Vec.new(len(cases) + 1)
+        for (key, target) in cases {
+            Vec.push(parts, Int.toString(key) + " -> b" + Int.toString(blockId(target)))
+        }
         match default {
-            Some(d) -> Array.push(parts, "_ -> b" + Int.toString(blockId(d)))
+            Some(d) -> Vec.push(parts, "_ -> b" + Int.toString(blockId(d)))
             None -> {}
         }
         "switch " + showValue(f, v) + " [" + String.join(parts, ", ") + "]"
@@ -782,14 +780,10 @@ fun liveness[Inst i](f : Func i) -> Array BitSet {
 fun livenessInOut[Inst i](f : Func i) -> (Array BitSet, Array BitSet) {
     let count = len(f.blocks)
     let values = len(f.reps)
-    let liveIn : Array BitSet = []
-    let liveOut : Array BitSet = []
-    for var b = 0; b < count; b = b + 1 {
-        Array.push(liveIn, BitSet.new(values))
-        Array.push(liveOut, BitSet.new(values))
-    }
+    let liveIn = Array.init(count, fun(_) = BitSet.new(values))
+    let liveOut = Array.init(count, fun(_) = BitSet.new(values))
     let entering = BitSet.new(values)
-    let order = Array.reverse(reversePostorder(f))
+    let order = Vec.reverse(reversePostorder(f))
     var changed = True
     while changed {
         changed = False
@@ -828,7 +822,7 @@ fun livenessInOut[Inst i](f : Func i) -> (Array BitSet, Array BitSet) {
 -- What a terminator reads. Not part of the `Inst` class, because a terminator
 -- is not an instruction here -- it is a field of the block, which is what
 -- keeps a block from ever being without one.
-fun termUses(t : Term) -> Array Value = match t {
+fun termUses(t : Term) -> Vec Value = match t {
     Ret(v) -> [v]
     Jump(_, args) -> args
     Branch(c, _, _) -> [c]
@@ -848,9 +842,7 @@ fun termUses(t : Term) -> Array Value = match t {
 fun liveAfter[Inst i](f : Func i, at : BlockId,
                       out : BitSet) -> Array (Array Int) {
     let block = f.blocks[blockId(at)]
-    let sets : Array (Array Int) = Array.new(len(block.insts))
-    let unset : Array Int = []
-    for var n = 0; n < len(block.insts); n = n + 1 { Array.push(sets, unset) }
+    let sets : Array (Array Int) = Array.filled(len(block.insts), [])
     let live = BitSet.new(len(f.reps))
     BitSet.copyFrom(live, out)
     for v in termUses(block.term) { BitSet.add(live, valueId(v)) }
@@ -892,24 +884,23 @@ fun pruneUnreachable[Inst i](f : Func i) -> Func i {
         }
         if same { return f }
     }
-    let remap : Array Int = []
-    for _ in f.blocks { Array.push(remap, -1) }
+    let remap = Array.filled(len(f.blocks), -1)
     for var k = 0; k < len(order); k = k + 1 {
         remap[blockId(order[k])] = k
     }
     let out = newFunc(f.name, f.result)
-    for r in f.reps { Array.push(out.reps, r) }
-    for p in f.params { Array.push(out.params, p) }
+    for r in f.reps { Vec.push(out.reps, r) }
+    for p in f.params { Vec.push(out.params, p) }
     -- The numbering is kept, so the origins are too.
     out.origins = f.origins
     out.reasons = f.reasons
     for at in order {
         let block = f.blocks[blockId(at)]
         let made = newBlock()
-        for p in block.params { Array.push(made.params, p) }
-        for inst in block.insts { Array.push(made.insts, inst) }
+        for p in block.params { Vec.push(made.params, p) }
+        for inst in block.insts { Vec.push(made.insts, inst) }
         made.term = remapTerm(remap, block.term)
-        Array.push(out.blocks, made)
+        Vec.push(out.blocks, made)
     }
     out.entry = BlockId(0)
     out
@@ -921,7 +912,7 @@ fun remapTerm(remap : Array Int, t : Term) -> Term = match t {
     Branch(c, yes, no) ->
         Branch(c, BlockId(remap[blockId(yes)]), BlockId(remap[blockId(no)]))
     Switch(v, cases, default) -> Switch(v,
-        Array.map(cases, fun((key, target)) = (key, BlockId(remap[blockId(target)]))),
+        Vec.map(cases, fun((key, target)) = (key, BlockId(remap[blockId(target)]))),
         match default {
             Some(d) -> Some(BlockId(remap[blockId(d)]))
             None -> None

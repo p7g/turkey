@@ -62,7 +62,7 @@ type State = State {
 }
 
 -- `match scrutinee { arms }`, of type `ty`, compiled.
-fun compile(m : Matcher, scrutinee : Core, arms : Array (Pat, Core), ty : Ty.Type,
+fun compile(m : Matcher, scrutinee : Core, arms : Vec (Pat, Core), ty : Ty.Type,
             span : Option Span) -> Core {
     let st = State { m = m, jumps = Map.new() }
     let site = Site { ty = ty, span = span }
@@ -146,7 +146,7 @@ type Site = Site { ty : Ty.Type, span : Option Span }
 
 -- The code for `rows` against `columns`, jumping to `fail` when none matches,
 -- or reaching a `match` with no arm for the value when there is no `fail`.
-fun matrix(st : State, columns : Array Column, rows : Array Row,
+fun matrix(st : State, columns : Vec Column, rows : Array Row,
            fail : Option String, site : Site) -> Core {
     if len(columns) == 0 { return leafOf(rows[0]) }
     runs(st, columns, runsOf(rows), 0, fail, site)
@@ -172,7 +172,7 @@ fun leafOf(row : Row) -> Core {
 --
 -- The rest is a join point when more than one place falls through to it, and
 -- stands in for the one jump when one does.
-fun runs(st : State, columns : Array Column, all : Array (Array Row), i : Int,
+fun runs(st : State, columns : Vec Column, all : Vec (Vec Row), i : Int,
          fail : Option String, site : Site) -> Core {
     if i + 1 == len(all) { return run(st, columns, all[i], fail, site) }
     let rest = runs(st, columns, all, i + 1, fail, site)
@@ -212,27 +212,27 @@ fun opens(row : Row) -> Bool = Option.isSome(unannot(row.pats[0]).opening)
 -- The rows split where the kind of the first pattern changes. An existential
 -- pattern is a run of its own: what it opens is named by its own pattern, and
 -- two rows opening one constructor name their constants differently.
-fun runsOf(rows : Array Row) -> Array (Array Row) {
+fun runsOf(rows : Array Row) -> Vec (Vec Row) {
     let out = []
     var current = [rows[0]]
     for var i = 1; i < len(rows); i = i + 1 {
         let row = rows[i]
         let prev = current[len(current) - 1]
         if sameHead(headOf(row), headOf(prev)) && !opens(row) && !opens(prev) {
-            Array.push(current, row)
+            Vec.push(current, row)
         } else {
-            Array.push(out, current)
+            Vec.push(out, current)
             current = [row]
         }
     }
-    Array.push(out, current)
+    Vec.push(out, current)
     out
 }
 
-fun run(st : State, columns : Array Column, rows : Array Row,
+fun run(st : State, columns : Vec Column, rows : Vec Row,
         fail : Option String, site : Site) -> Core {
     let column = columns[0]
-    let after = Array.slice(columns, 1, len(columns))
+    let after = Vec.slice(columns, 1, len(columns))
     match headOf(rows[0]) {
         Variable -> matrix(st, after, Array.map(rows, fun(row) = {
             let binds = match unannot(row.pats[0]).kind {
@@ -251,11 +251,8 @@ fun run(st : State, columns : Array Column, rows : Array Row,
                 PTuple(elems) -> elems
                 _ -> oops("a tuple run with a row that is not a tuple")
             })
-            let arity = len(subs[0])
-            let fieldTypes = Array.new(arity)
-            for var i = 0; i < arity; i = i + 1 {
-                Array.push(fieldTypes, if i < len(types) { types[i] } else { TBottom })
-            }
+            let fieldTypes = Array.init(len(subs[0]), fun(i) =
+                if i < len(types) { types[i] } else { TBottom })
             let (binders, body) = expand(st, after, rows, subs, fieldTypes, fail, site)
             switch(column, [CAlt { alt = ATuple(binders), body = body }], site)
         }
@@ -268,12 +265,12 @@ fun rest(row : Row) -> Array Pat = Array.slice(row.pats, 1, len(row.pats))
 
 -- One arm per constructor the run names, in the order it first names them, and
 -- an arm that falls through when the run does not name them all.
-fun constructors(st : State, column : Column, after : Array Column,
-                 rows : Array Row, fail : Option String, site : Site) -> Core {
+fun constructors(st : State, column : Column, after : Vec Column,
+                 rows : Vec Row, fail : Option String, site : Site) -> Core {
     let names = []
     for row in rows {
         let name = conName(unannot(row.pats[0]))
-        if !Array.contains(names, name) { Array.push(names, name) }
+        if !Vec.contains(names, name) { Vec.push(names, name) }
     }
     let ty = st.m.reduce(column.ty)
     let alts = []
@@ -282,7 +279,7 @@ fun constructors(st : State, column : Column, after : Array Column,
             Some(i) -> i
             None -> oops("unknown constructor '" + name + "'")
         }
-        let these = Array.filter(rows, fun(row) = conName(unannot(row.pats[0])) == name)
+        let these = Vec.filter(rows, fun(row) = conName(unannot(row.pats[0])) == name)
         let opening = unannot(these[0].pats[0]).opening
         let fieldTypes = match opening {
             Some(o) -> Decls.conFieldTypesOpened(st.m.decls, ty, name,
@@ -295,7 +292,7 @@ fun constructors(st : State, column : Column, after : Array Column,
         }
         let subs = Array.map(these, fun(row) = positional(info, unannot(row.pats[0])))
         let (binders, body) = expand(st, after, these, subs, types, fail, site)
-        Array.push(alts, CAlt { alt = ACon(name, binders, opening), body = body })
+        Vec.push(alts, CAlt { alt = ACon(name, binders, opening), body = body })
     }
     if len(names) < Decls.variantCount(st.m.decls, names[0]) {
         orElse(st, alts, fail, site)
@@ -311,16 +308,20 @@ fun conName(p : Pat) -> String = match p.kind {
 
 -- A constructor pattern's fields in declaration order, `_` for a record field
 -- it does not name.
-fun positional(info : Decls.ConInfo, p : Pat) -> Array Pat = match p.kind {
+fun positional(info : Decls.ConInfo, p : Pat) -> Vec Pat = match p.kind {
     PCon(_, args) -> args
     PRecord(_, labelled, _) -> match info.fields {
-        Some(labels) -> Array.map(labels, fun(label) = {
-            var sub = Pat { id = p.id, span = p.span, kind = PWild, opening = None }
-            for (given, pat) in labelled {
-                if given == label { sub = pat }
+        Some(labels) -> {
+            let out = Vec.new(len(labels))
+            for label in labels {
+                var sub = Pat { id = p.id, span = p.span, kind = PWild, opening = None }
+                for (given, pat) in labelled {
+                    if given == label { sub = pat }
+                }
+                Vec.push(out, sub)
             }
-            sub
-        })
+            out
+        }
         None -> oops("a record pattern for '" + info.name + "', which has no fields")
     }
     _ -> oops("not a constructor pattern")
@@ -331,10 +332,10 @@ fun positional(info : Decls.ConInfo, p : Pat) -> Array Pat = match p.kind {
 --
 -- Two rows share an arm when their literals are spelled alike. Not floats,
 -- whose equality is not their spelling's.
-fun literals(st : State, column : Column, after : Array Column,
-             rows : Array Row, fail : Option String, site : Site) -> Core {
-    let seen : Array Lit = []
-    let groups : Array (Array Row) = []
+fun literals(st : State, column : Column, after : Vec Column,
+             rows : Vec Row, fail : Option String, site : Site) -> Core {
+    let seen : Vec Lit = []
+    let groups : Vec (Vec Row) = []
     for row in rows {
         let lit = literalOf(row)
         var found = -1
@@ -342,10 +343,10 @@ fun literals(st : State, column : Column, after : Array Column,
             if found < 0 && sameLiteral(seen[i], lit) { found = i }
         }
         if found < 0 {
-            Array.push(seen, lit)
-            Array.push(groups, [row])
+            Vec.push(seen, lit)
+            Vec.push(groups, [row])
         } else {
-            Array.push(groups[found], row)
+            Vec.push(groups[found], row)
         }
     }
     let alts = []
@@ -353,7 +354,7 @@ fun literals(st : State, column : Column, after : Array Column,
         let inner = Array.map(groups[i], fun(row) = Row {
             pats = rest(row), binds = row.binds, body = row.body,
         })
-        Array.push(alts, CAlt { alt = ALit(seen[i]),
+        Vec.push(alts, CAlt { alt = ALit(seen[i]),
                                 body = matrix(st, after, inner, fail, site) })
     }
     orElse(st, alts, fail, site)
@@ -373,9 +374,9 @@ fun sameLiteral(a : Lit, b : Lit) -> Bool = match (a, b) {
 }
 
 -- The arm that falls through, when there is somewhere to fall.
-fun orElse(st : State, alts : Array CAlt, fail : Option String, site : Site) -> Unit =
+fun orElse(st : State, alts : Vec CAlt, fail : Option String, site : Site) -> Unit =
     match fail {
-        Some(name) -> Array.push(alts, CAlt { alt = AAny(None), body = jump(st, name, site) })
+        Some(name) -> Vec.push(alts, CAlt { alt = AAny(None), body = jump(st, name, site) })
         None -> {}
     }
 
@@ -387,8 +388,8 @@ fun orElse(st : State, alts : Array CAlt, fail : Option String, site : Site) -> 
 -- was written: no test follows, so nothing can fall through from under them.
 -- Otherwise each field is bound to a fresh variable, a column the rows go on
 -- to test.
-fun expand(st : State, after : Array Column, rows : Array Row,
-           subs : Array (Array Pat), types : Array Ty.Type,
+fun expand(st : State, after : Vec Column, rows : Vec Row,
+           subs : Array (Vec Pat), types : Array Ty.Type,
            fail : Option String, site : Site) -> (Array (Option String), Core) {
     if len(rows) == 1 && every(subs[0], leaf) && every(rest(rows[0]), leaf) {
         let row = rows[0]
@@ -399,39 +400,35 @@ fun expand(st : State, after : Array Column, rows : Array Row,
         let inner = Row { pats = rest(row), binds = row.binds, body = row.body }
         return (binders, matrix(st, after, [inner], fail, site))
     }
-    let binders = []
     let columns = []
     let kept = []
-    for var i = 0; i < len(types); i = i + 1 {
+    let binders = Array.init(len(types), fun(i) {
         var used = False
         for s in subs {
             if i < len(s) && !ignored(s[i]) { used = True }
         }
         if used {
             let name = st.m.fresh(hintFor(subs, i))
-            Array.push(columns, Column { name = name, ty = types[i] })
-            Array.push(kept, i)
-            Array.push(binders, Some(name))
+            Vec.push(columns, Column { name = name, ty = types[i] })
+            Vec.push(kept, i)
+            Some(name)
         } else {
-            Array.push(binders, None)
+            None
         }
-    }
-    let inner = []
-    for var r = 0; r < len(rows); r = r + 1 {
+    })
+    let inner = Array.init(len(rows), fun(r) {
         let row = rows[r]
         let front = Array.map(kept, fun(i) = subs[r][i])
-        Array.push(inner, Row {
-            pats = Array.append(front, rest(row)), binds = row.binds, body = row.body,
-        })
-    }
-    (binders, matrix(st, Array.append(columns, after), inner, fail, site))
+        Row { pats = Array.append(front, rest(row)), binds = row.binds, body = row.body }
+    })
+    (binders, matrix(st, Vec.append(columns, after), inner, fail, site))
 }
 
 -- What a field's column is called after: the variable the rows bind it to,
 -- when they agree on one, so a dump still says `k` where the source did. The
 -- column is a fresh name all the same, since a body under it may read another
 -- `k`; only the letters are kept, which is what the printer renumbers.
-fun hintFor(subs : Array (Array Pat), i : Int) -> String {
+fun hintFor(subs : Array (Vec Pat), i : Int) -> String {
     var named = ""
     for s in subs {
         if i < len(s) {
@@ -448,16 +445,16 @@ fun hintFor(subs : Array (Array Pat), i : Int) -> String {
     if letters == "" { "field" } else { letters }
 }
 
-fun takeLetters(name : String) -> Array Char {
+fun takeLetters(name : String) -> Vec Char {
     let out = []
     for ch in String.codePoints(name) {
         if !Char.isAsciiAlpha(ch) { return out }
-        Array.push(out, ch)
+        Vec.push(out, ch)
     }
     out
 }
 
-fun every(xs : Array a, p : fun(a) -> Bool) -> Bool {
+fun every[Iterator c, Item c ~ a](xs : c, p : fun(a) -> Bool) -> Bool {
     for x in xs { if !p(x) { return False } }
     True
 }
@@ -479,7 +476,7 @@ fun unannot(p : Pat) -> Pat = match p.kind {
     _ -> p
 }
 
-fun switch(column : Column, alts : Array CAlt, site : Site) -> Core =
+fun switch(column : Column, alts : Vec CAlt, site : Site) -> Core =
     mkCore(site.ty, site.span, CMatch(mkCore(column.ty, site.span, CVar(column.name)), alts))
 
 -- -- fallthrough -----------------------------------------------------------------------
@@ -498,7 +495,7 @@ fun jump(st : State, name : String, site : Site) -> Core {
 -- `match v`, is `y -> b`, which is the arm as it was written.
 fun replaceJump(e : Core, name : String, with : Core) -> Core = match e.kind {
     CJump(target, _) -> if target == name { with } else { e }
-    CMatch(scrutinee, alts) -> mkCore(e.ty, e.span, CMatch(scrutinee, Array.map(alts,
+    CMatch(scrutinee, alts) -> mkCore(e.ty, e.span, CMatch(scrutinee, Vec.map(alts,
         fun(a) = match (a.alt, a.body.kind) {
             (AAny(None), CJump(target, _)) ->
                 if target == name { bindingArm(scrutinee, with) } else { a }

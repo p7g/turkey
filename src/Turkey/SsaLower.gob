@@ -97,7 +97,7 @@ type Lifting = Lifting {
 -- program, so storing to it and rooting it are the same store.
 type Module = Module {
     var functions : Array (Ssa.Func Low),
-    globals       : Array (String, Rep),
+    globals       : Vec (String, Rep),
     -- The function that computes every global, in the order the program
     -- requires. Called once before `main`.
     initial   : String,
@@ -105,7 +105,7 @@ type Module = Module {
     early     : String,
     -- Each `foreign` definition that lowered, as (C symbol, function name),
     -- sorted by symbol: what an emitter exports under a C-callable thunk.
-    definitions : Array (String, String),
+    definitions : Vec (String, String),
 }
 
 let initializerName = "%module.initialize"
@@ -137,7 +137,7 @@ type Lower = Lower {
     -- reference with the nested `Lower`s its lambdas make, and discarded whole
     -- if the binding stops -- a lifted body whose parent did not lower is a
     -- symbol nothing calls.
-    lifted  : Array (Ssa.Func Low),
+    lifted  : Vec (Ssa.Func Low),
     -- What belongs to the program rather than to one binding.
     shared  : Lifting,
     -- The first form that could not be lowered, if any.
@@ -208,11 +208,11 @@ fun repOf(l : Lower, ty : Ty.Type) -> Rep = repIn(l.decls, l.layouts, ty)
 -- `classes` are the program's classes, whose dictionaries are numbered beside
 -- its constructors (`tagsOf`).
 fun lowerProgram(program : CProgram, decls : DeclTable, classes : Array String)
-        -> (Module, Array Unsupported) {
-    let done : Array (Ssa.Func Low) = []
-    let skipped : Array Unsupported = []
+        -> (Module, Vec Unsupported) {
+    let done : Vec (Ssa.Func Low) = []
+    let skipped : Vec Unsupported = []
     let globals = Set.new()
-    for bind in Array.append(program.dicts, program.binds) {
+    for bind in Vec.append(program.dicts, program.binds) {
         Set.add(globals, bind.name)
     }
     let globalRefs = Map.new()
@@ -227,7 +227,7 @@ fun lowerProgram(program : CProgram, decls : DeclTable, classes : Array String)
     let sigs = signatures(program, decls)
     -- Each binding on its own, on as many workers as there are: lowering
     -- reads the tables above and writes only what it makes.
-    let all = Array.append(program.dicts, program.binds)
+    let all = Vec.append(program.dicts, program.binds)
     let made = Parallel.map(all, fun(bind) =
         lowerBind(bind, decls, globals, globalRefs, tags, sigs, Lifting { next = 0 }))
     for var i = 0; i < len(all); i = i + 1 {
@@ -236,8 +236,8 @@ fun lowerProgram(program : CProgram, decls : DeclTable, classes : Array String)
         match f {
             Some(function) -> {
                 -- The parent first, so a dump reads outside in.
-                Array.push(done, function)
-                for g in lifted { Array.push(done, g) }
+                Vec.push(done, function)
+                for g in lifted { Vec.push(done, g) }
             }
             -- No reason means it is not a function at all: a global, which the
             -- initializer computes below. That is not a skip and is not
@@ -245,7 +245,7 @@ fun lowerProgram(program : CProgram, decls : DeclTable, classes : Array String)
             -- language is still unwritten, so a form that *is* handled, by
             -- another phase, does not belong in it.
             None -> match why {
-                Some(w) -> Array.push(skipped,
+                Some(w) -> Vec.push(skipped,
                                       Unsupported { name = bind.name, what = w })
                 None -> {}
             }
@@ -254,20 +254,20 @@ fun lowerProgram(program : CProgram, decls : DeclTable, classes : Array String)
     -- Global initializers can also introduce lifted lambdas.
     let (init, early, lifted, storage) = initializer(program, decls, globals, globalRefs, tags,
                                               sigs, Lifting { next = 0 })
-    Array.push(done, init)
-    Array.push(done, early)
-    for g in lifted { Array.push(done, g) }
+    Vec.push(done, init)
+    Vec.push(done, early)
+    for g in lifted { Vec.push(done, g) }
     let lowered = Set.new()
     for f in done { Set.add(lowered, f.name) }
-    let definitions : Array (String, String) = []
+    let definitions : Vec (String, String) = []
     for (name, info) in Map.entries(decls.definitions) {
         if Set.contains(lowered, name) {
-            Array.push(definitions, (info.symbol, name))
+            Vec.push(definitions, (info.symbol, name))
         }
     }
-    let module_ = Module { functions = done, globals = storage,
+    let module_ = Module { functions = Vec.toArray(done), globals = storage,
                            initial = initializerName, early = Giblets.initializerName,
-                           definitions = Array.sort(definitions) }
+                           definitions = Vec.sort(definitions) }
     internNullaries(module_, init)
     (module_, skipped)
 }
@@ -300,7 +300,7 @@ fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
     let start = L.block(b)
     L.into(b, start)
     for (name, shape) in objects {
-        Array.push(m.globals, (name, Ssa.traced(Ptr)))
+        Vec.push(m.globals, (name, Ssa.traced(Ptr)))
         let made = L.emit(b, ObjectNew(shape.0, shape.1, 0, [], 0), Ssa.traced(Ptr))
         L.effect(b, GlobalStore(name, made))
     }
@@ -318,16 +318,16 @@ fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
 -- A binding that is not a function, which is exactly the complement of
 -- `signatures`. Its representation comes from the binding's *own* layouts for
 -- the same reason a signature does.
-fun storageOf(program : CProgram, decls : DeclTable) -> Array (String, Rep) {
+fun storageOf(program : CProgram, decls : DeclTable) -> Vec (String, Rep) {
     let out = []
     let giblets = Giblets.gibletModules()
-    for bind in Array.append(program.dicts, program.binds) {
+    for bind in Vec.append(program.dicts, program.binds) {
         let ty = if bind.mutable && Set.contains(giblets, bind.module_) {
             Core.refElem(bind.ty)
         } else { bind.ty }
         match signatureOf(decls, bind) {
             Some(_) -> {}
-            None -> Array.push(out, (bind.name,
+            None -> Vec.push(out, (bind.name,
                                      repIn(decls, bind.layouts, ty)))
         }
     }
@@ -343,7 +343,7 @@ fun storageOf(program : CProgram, decls : DeclTable) -> Array (String, Rep) {
 -- reaching a global that holds a closure rather than a symbol.
 fun signatures(program : CProgram, decls : DeclTable) -> Map String Signature {
     let out = Map.new()
-    for bind in Array.append(program.dicts, program.binds) {
+    for bind in Vec.append(program.dicts, program.binds) {
         match signatureOf(decls, bind) {
             Some(sig) -> {
                 -- Top-level names are module-qualified, so a collision is a
@@ -438,7 +438,7 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
         None -> Signature { params = [], result = Ssa.traced(Ptr) }
     }
     let f = Ssa.newFunc(bind.name, sig.result)
-    Array.push(f.params, Ssa.freshValue(f, Ssa.traced(Ptr)))
+    Vec.push(f.params, Ssa.freshValue(f, Ssa.traced(Ptr)))
     let l = newLower(decls, f, globals, globalRefs, tags, sigs, bind.layouts, [],
                      shared)
     let entry = L.block(l.b)
@@ -447,7 +447,7 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
         let held = if i < len(sig.params) { sig.params[i] }
                    else { repOf(l, params[i].ty) }
         let v = Ssa.freshValue(f, held)
-        Array.push(f.params, v)
+        Vec.push(f.params, v)
         Map.put(l.env, params[i].name, v)
     }
     prepareLocals(l, body)
@@ -470,7 +470,7 @@ fun newLower(decls : DeclTable, f : Ssa.Func Low, globals : Set.Set String,
              globalRefs : Map String Rep,
              tags : Map String Int,
              sigs : Map String Signature, layouts : Map String String,
-             lifted : Array (Ssa.Func Low), shared : Lifting) -> Lower = Lower {
+             lifted : Vec (Ssa.Func Low), shared : Lifting) -> Lower = Lower {
     decls = decls, func = f, b = L.builder(f, BlockId(0)),
     env = Map.new(), joins = Map.new(), globals = globals, tags = tags,
     globalRefs = globalRefs,
@@ -499,9 +499,9 @@ fun spine(value : Core) -> Option (Array CParam, Core) = match value.kind {
 --
 -- Saving the affected names rather than copying the map: a scope binds a
 -- handful of names and the map holds every local in the function.
-fun saving(l : Lower, names : Array String) -> Array (String, Option Value) {
+fun saving[Iterator c, Item c ~ String](l : Lower, names : c) -> Vec (String, Option Value) {
     let out = []
-    for name in names { Array.push(out, (name, Map.get(l.env, name))) }
+    for name in names { Vec.push(out, (name, Map.get(l.env, name))) }
     out
 }
 
@@ -518,7 +518,7 @@ fun restore1Join(l : Lower, name : String, was : Option BlockId) -> Unit =
         }
     }
 
-fun restore(l : Lower, saved : Array (String, Option Value)) -> Unit {
+fun restore(l : Lower, saved : Vec (String, Option Value)) -> Unit {
     for (name, was) in saved {
         match was {
             Some(v) -> Map.put(l.env, name, v)
@@ -660,9 +660,9 @@ fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
         -- whole IR is shaped for.
         CJoin(name, params, body, rest, recursive) -> {
             let target = L.block(l.b)
-            let entered : Array Value = []
+            let entered : Vec Value = []
             for p in params {
-                Array.push(entered, L.param(l.b, target, repOf(l, p.ty)))
+                Vec.push(entered, L.param(l.b, target, repOf(l, p.ty)))
             }
             -- Join names are no more unique than term names are, and for the
             -- same reason: inlining copies bodies, so a function inlined into
@@ -690,13 +690,12 @@ fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
             if recursive { restore1Join(l, name, hidden) }
         }
         CJump(name, args) -> {
-            let supplied : Array Value = []
-            for a in args { Array.push(supplied, value(l, a)) }
+            let supplied = Array.map(args, fun(a) = value(l, a))
             match Map.get(l.joins, name) {
                 Some(target) -> {
-                    let passed : Array Value = []
+                    let passed : Vec Value = []
                     for var i = 0; i < len(supplied); i = i + 1 {
-                        Array.push(passed,
+                        Vec.push(passed,
                                    coerce(l, supplied[i], wanted(l, target, i)))
                     }
                     L.terminate(l.b, Jump(target, passed))
@@ -723,7 +722,7 @@ fun lower(l : Lower, e : Core, dest : Dest) -> Unit {
 
 -- A match as a chain of tests, one arm after another: what a match is when
 -- `switched` cannot make it one switch.
-fun chain(l : Lower, whole : Value, ty : Ty.Type, alts : Array CAlt, dest : Dest) -> Unit {
+fun chain(l : Lower, whole : Value, ty : Ty.Type, alts : Vec CAlt, dest : Dest) -> Unit {
     let failed = L.block(l.b)
     -- The first test happens where the scrutinee was computed, so every later
     -- test block is reached only through this one and the scrutinee dominates
@@ -765,7 +764,7 @@ fun noArm(l : Lower) -> Unit {
 --
 -- An arm that matches anything ends the cases; the arms after it cannot be
 -- reached.
-fun switched(l : Lower, whole : Value, ty : Ty.Type, alts : Array CAlt,
+fun switched(l : Lower, whole : Value, ty : Ty.Type, alts : Vec CAlt,
              dest : Dest) -> Bool {
     let tested = []
     var fallback : Option CAlt = None
@@ -775,7 +774,7 @@ fun switched(l : Lower, whole : Value, ty : Ty.Type, alts : Array CAlt,
                 fallback = Some(alt)
                 break
             }
-            _ -> Array.push(tested, alt)
+            _ -> Vec.push(tested, alt)
         }
     }
     if len(tested) < 2 { return False }
@@ -795,7 +794,7 @@ fun switched(l : Lower, whole : Value, ty : Ty.Type, alts : Array CAlt,
                     let key = literalKey(lit)
                     if !Set.contains(keyed, key) {
                         Set.add(keyed, key)
-                        Array.push(cases, (key, blocks[i]))
+                        Vec.push(cases, (key, blocks[i]))
                     }
                 }
                 _ -> {}
@@ -806,7 +805,7 @@ fun switched(l : Lower, whole : Value, ty : Ty.Type, alts : Array CAlt,
                 let key = Map.getOr(l.tags, conOf(tested[i].alt), -1)
                 if !Set.contains(keyed, key) {
                     Set.add(keyed, key)
-                    Array.push(cases, (key, blocks[i]))
+                    Vec.push(cases, (key, blocks[i]))
                 }
             }
             -- When the arms name every constructor, the tag is one of the
@@ -820,10 +819,10 @@ fun switched(l : Lower, whole : Value, ty : Ty.Type, alts : Array CAlt,
             var payload : Option BlockId = None
             for var i = 0; i < len(tested); i = i + 1 {
                 let name = conOf(tested[i].alt)
-                match Array.indexOf(c.nullaries, name) {
+                match Vec.indexOf(c.nullaries, name) {
                     Some(key) -> if !Set.contains(keyed, key) {
                         Set.add(keyed, key)
-                        Array.push(cases, (key, blocks[i]))
+                        Vec.push(cases, (key, blocks[i]))
                     }
                     None -> if Option.isNone(payload) { payload = Some(blocks[i]) }
                 }
@@ -835,7 +834,7 @@ fun switched(l : Lower, whole : Value, ty : Ty.Type, alts : Array CAlt,
                 for var key = 0; key < len(c.nullaries); key = key + 1 {
                     if !Set.contains(keyed, key) {
                         Set.add(keyed, key)
-                        Array.push(cases, (key, otherwise))
+                        Vec.push(cases, (key, otherwise))
                     }
                 }
                 default = payload
@@ -865,7 +864,7 @@ fun switched(l : Lower, whole : Value, ty : Ty.Type, alts : Array CAlt,
 type SwitchShape = Tags(Array String) | Words(Compact) | Literals
 
 fun switchShape(l : Lower, whole : Value, ty : Ty.Type,
-                tested : Array CAlt) -> Option SwitchShape {
+                tested : Vec CAlt) -> Option SwitchShape {
     match tested[0].alt {
         ALit(_) -> {
             let class_ = Ssa.repOf(l.func, whole).class_
@@ -925,7 +924,7 @@ fun armOf(l : Lower, shape : SwitchShape, alt : CAlt, whole : Value, ty : Ty.Typ
     match alt.alt {
         AAny(binder) -> bindTo(l, binder, whole)
         ACon(name, binders, _) -> match shape {
-            Words(c) -> if Option.isNone(Array.indexOf(c.nullaries, name)) {
+            Words(c) -> if Option.isNone(Vec.indexOf(c.nullaries, name)) {
                 compactPayload(l, c, binders, whole, ty)
             }
             _ -> {
@@ -1021,11 +1020,11 @@ fun bindTo(l : Lower, binder : Option String, v : Value) -> Unit = match binder 
 -- The fields an arm binds: each one's slot in the object, counting from
 -- `first`, its name, and its type.
 fun positions(binders : Array (Option String), types : Array Ty.Type,
-              first : Int) -> Array (Int, String, Ty.Type) {
+              first : Int) -> Vec (Int, String, Ty.Type) {
     let out = []
     for var i = 0; i < len(binders) && i < len(types); i = i + 1 {
         match binders[i] {
-            Some(name) -> Array.push(out, (first + i, name, types[i]))
+            Some(name) -> Vec.push(out, (first + i, name, types[i]))
             None -> {}
         }
     }
@@ -1120,7 +1119,7 @@ fun tested(l : Lower, v : Value, name : String, failure : BlockId) -> Bool {
 }
 
 -- Read each field an arm binds and bind it.
-fun destructure(l : Lower, object : Value, fields : Array (Int, String, Ty.Type)) -> Unit {
+fun destructure(l : Lower, object : Value, fields : Vec (Int, String, Ty.Type)) -> Unit {
     for (index, name, fieldTy) in fields {
         Map.put(l.env, name, L.emit(l.b, ObjectGet(object, index), repOf(l, fieldTy)))
     }
@@ -1376,8 +1375,7 @@ fun store(l : Lower, target : Core, x : Value) -> Unit = match target.kind {
 fun aggregate(l : Lower, items : Array Core, kind : Int, tag : Int,
              mutable : Int, what : String) -> Value {
     if wide(l, what, len(items), Rt.fieldLimit) { return Ssa.freshValue(l.func, Ssa.traced(Ptr)) }
-    let values = []
-    for x in items { Array.push(values, value(l, x)) }
+    let values = Array.map(items, fun(x) = value(l, x))
     let reps = Array.map(values, Ssa.repOf(l.func, _))
     let made = L.emit(l.b, ObjectNew(kind, tag, metadata(reps), values, mutable),
                       Ssa.traced(Ptr))
@@ -1481,14 +1479,14 @@ fun bitmap(reps : Array Rep) -> Int {
 -- `extra` is `CLetRec`'s siblings: names that will hold closures but do not
 -- yet, so their representation is known before their value is.
 fun capturesOf(l : Lower, body : Core,
-               extra : Set.Set String) -> Array (String, Rep) {
+               extra : Set.Set String) -> Vec (String, Rep) {
     let mentioned = Core.namesOf(body)
     let out = []
     -- Sorted, so that what a lowering produces does not depend on a map's
     -- iteration order.
     for name in Array.sort(Set.elements(mentioned)) {
         if Set.contains(extra, name) {
-            Array.push(out, (name, Ssa.traced(Ptr)))
+            Vec.push(out, (name, Ssa.traced(Ptr)))
         } else {
             match Map.get(l.env, name) {
                 -- A flattened `var` or record is a marker, never emitted, and
@@ -1504,7 +1502,7 @@ fun capturesOf(l : Lower, body : Core,
                 -- tidy.
                 Some(v) -> if !isMarker(l, v)
                         && Ssa.repOf(l.func, v).class_ != Unit {
-                    Array.push(out, (name, Ssa.repOf(l.func, v)))
+                    Vec.push(out, (name, Ssa.repOf(l.func, v)))
                 }
                 None -> {}
             }
@@ -1521,7 +1519,7 @@ fun capturesOf(l : Lower, body : Core,
 -- array and the counter, which is what makes the symbols unique and the
 -- results collectable.
 fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
-         captures : Array (String, Rep)) -> Option String {
+         captures : Vec (String, Rep)) -> Option String {
     if len(captures) > 63 {
         let _ = stop(l, "a lambda with more than 63 captures")
         return None
@@ -1552,7 +1550,7 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
     -- asymmetry is the runtime's -- the parent has the closure and the child
     -- has the environment -- and not this IR's.
     let environment = Ssa.freshValue(g, Ssa.traced(Ptr))
-    Array.push(g.params, environment)
+    Vec.push(g.params, environment)
     -- The `unit` names `capturesOf` leaves out of the environment, made here
     -- instead. Before the captures and the parameters, so either shadows one.
     for name in Array.sort(Set.elements(Core.namesOf(body))) {
@@ -1563,11 +1561,11 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
             None -> {}
         }
     }
-    let taken : Array Value = []
+    let taken : Vec Value = []
     for p in params {
         let v = Ssa.freshValue(g, repIn(l.decls, l.layouts, p.ty))
-        Array.push(g.params, v)
-        Array.push(taken, v)
+        Vec.push(g.params, v)
+        Vec.push(taken, v)
     }
     for var i = 0; i < len(captures); i = i + 1 {
         let (name, r) = captures[i]
@@ -1585,7 +1583,7 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
             None
         }
         None -> {
-            Array.push(l.lifted, g)
+            Vec.push(l.lifted, g)
             Some(symbol)
         }
     }
@@ -1598,28 +1596,28 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
 -- sibling in a recursive group that does not exist yet: its slot starts null,
 -- which the collector skips, and is marked mutable, and `letrec` writes it
 -- with `ClosureCapture` once every shell exists.
-fun closureShell(l : Lower, symbol : String, captures : Array (String, Rep),
+fun closureShell(l : Lower, symbol : String, captures : Vec (String, Rep),
                  later : Set.Set String) -> Value {
     if len(captures) == 0 {
         return L.emit(l.b, ClosureNew(symbol, None), Ssa.traced(Ptr))
     }
-    let values = []
     var mutable = 0
-    for var i = 0; i < len(captures); i = i + 1 {
+    let values = Array.init(len(captures), fun(i) {
         let (name, r) = captures[i]
         if Set.contains(later, name) {
             mutable = mutable + Int.shl(1, i)
-            Array.push(values, storageZero(l, r))
+            storageZero(l, r)
         } else {
             match Map.get(l.env, name) {
-                Some(v) -> Array.push(values, v)
+                Some(v) -> v
                 None -> {
-                    Array.push(values, storageZero(l, r))
+                    let zero = storageZero(l, r)
                     let _ = stop(l, "a capture of the unbound name '" + name + "'")
+                    zero
                 }
             }
         }
-    }
+    })
     let reps = Array.map(captures, _.1)
     let environment = L.emit(l.b, ObjectNew(4, -1, bitmap(reps), values, mutable),
                              Ssa.traced(Ptr))
@@ -1646,7 +1644,7 @@ fun lambda(l : Lower, params : Array CParam, body : Core, result : Ty.Type) -> V
 -- shells are made first, the names are bound to them, and the captures of
 -- siblings are written afterwards, when every sibling is a value that dominates
 -- its store.
-fun letrec(l : Lower, binds : Array CBind, body : Core, dest : Dest) -> Unit {
+fun letrec(l : Lower, binds : Vec CBind, body : Core, dest : Dest) -> Unit {
     let siblings = Set.new()
     for bind in binds {
         match spine(bind.value) {
@@ -1671,7 +1669,7 @@ fun letrec(l : Lower, binds : Array CBind, body : Core, dest : Dest) -> Unit {
         }
         let captures = capturesOf(l, inner, siblings)
         match lift(l, params, inner, resultType(bind.ty), captures) {
-            Some(symbol) -> Array.push(plans, (bind.name, symbol, captures))
+            Some(symbol) -> Vec.push(plans, (bind.name, symbol, captures))
             None -> return
         }
     }
@@ -1679,7 +1677,7 @@ fun letrec(l : Lower, binds : Array CBind, body : Core, dest : Dest) -> Unit {
     -- else a shell captures is in scope already, and is built into it.
     let shells = []
     for (_, symbol, captures) in plans {
-        Array.push(shells, closureShell(l, symbol, captures, siblings))
+        Vec.push(shells, closureShell(l, symbol, captures, siblings))
     }
     let was = saving(l, Array.map(plans, _.0))
     for var i = 0; i < len(plans) && i < len(shells); i = i + 1 {
@@ -1703,8 +1701,7 @@ fun letrec(l : Lower, binds : Array CBind, body : Core, dest : Dest) -> Unit {
 fun arrayLiteral(l : Lower, e : Core, elems : Array Core) -> Value {
     let (_, args) = Ty.spine(Ty.prune(e.ty))
     let element = if len(args) > 0 { repOf(l, args[0]) } else { Ssa.traced(Ptr) }
-    let values = []
-    for x in elems { Array.push(values, value(l, x)) }
+    let values = Array.map(elems, fun(x) = value(l, x))
     let length = L.emit(l.b, ConstInt(len(values)), Ssa.untraced(I64))
     -- `ArrayNew` wants something to fill with. An array with elements is
     -- filled over anyway, and an empty one has no slot to read, so a zero of
@@ -1813,7 +1810,7 @@ fun plain(l : Lower, ty : Ty.Type) -> Bool {
 -- A one-word compact sum's constructor applied to `args`.
 fun compactValue(l : Lower, c : Compact, name : String, ty : Ty.Type,
                  args : Array Core) -> Value {
-    match Array.indexOf(c.nullaries, name) {
+    match Vec.indexOf(c.nullaries, name) {
         Some(i) -> return L.emit(l.b, ConstInt(i), Ssa.traced(Ptr))
         None -> {}
     }
@@ -1855,7 +1852,7 @@ fun compactValue(l : Lower, c : Compact, name : String, ty : Ty.Type,
 fun compactTest(l : Lower, c : Compact, name : String, binders : Array (Option String),
                 v : Value, ty : Ty.Type,
                 success : BlockId, failure : BlockId) -> Unit {
-    match Array.indexOf(c.nullaries, name) {
+    match Vec.indexOf(c.nullaries, name) {
         Some(i) -> {
             let want = L.emit(l.b, ConstInt(i), Ssa.traced(Ptr))
             let test = L.emit(l.b, Cmp(Eq, v, want), Ssa.untraced(I1))
@@ -1947,11 +1944,12 @@ fun packed(l : Lower, info : ConInfo, name : String, args : Array Core,
     if wide(l, "a packed existential", len(parts) + len(args), Rt.fieldLimit) {
         return Ssa.freshValue(l.func, Ssa.traced(Ptr))
     }
-    let values = []
-    for p in parts {
-        Array.push(values, L.emit(l.b, ConstInt(keyCode(p)), Ssa.untraced(I64)))
-    }
-    for x in args { Array.push(values, value(l, x)) }
+    let values = Array.init(len(parts) + len(args), fun(i) =
+        if i < len(parts) {
+            L.emit(l.b, ConstInt(keyCode(parts[i])), Ssa.untraced(I64))
+        } else {
+            value(l, args[i - len(parts)])
+        })
     let reps = Array.map(values, Ssa.repOf(l.func, _))
     let made = L.emit(l.b, ObjectNew(1, tag, metadata(reps), values, 0),
                       Ssa.traced(Ptr))
@@ -2002,7 +2000,6 @@ fun scalar(l : Lower, op : Op, natural : Rep, rep : Rep) -> Value =
 -- evaluated in that order and this is the phase where that stops being
 -- implicit.
 fun call(l : Lower, e : Core, fn : Core, args : Array Core, rep : Rep) -> Value {
-    let supplied : Array Value = []
     match fn.kind {
         CPrim(p) -> primitive(l, e, p, args, rep)
         CVar(name) -> if Map.contains(l.decls.foreigns, name) {
@@ -2010,7 +2007,7 @@ fun call(l : Lower, e : Core, fn : Core, args : Array Core, rep : Rep) -> Value 
             -- and nothing more: no marshalling, because the type mapping is
             -- the seven types that each erase to one representation, and no
             -- coercion, because the declaration fixed every one of them.
-            for a in args { Array.push(supplied, value(l, a)) }
+            let supplied = Array.map(args, value(l, _))
             let symbol = match Map.get(l.decls.foreigns, name) {
                 Some(info) -> info.symbol
                 None -> name
@@ -2063,10 +2060,12 @@ fun definesSymbol(decls : DeclTable, symbol : String) -> Bool {
 -- own scheme would pass a value at a layout the copy does not hold it at.
 fun directCall(l : Lower, name : String, sig : Signature, args : Array Core,
                rep : Rep) -> Value {
-    let supplied = [L.emit(l.b, ConstInt(0), Ssa.traced(Ptr))]
-    for var i = 0; i < len(args); i = i + 1 {
-        Array.push(supplied, coerce(l, value(l, args[i]), sig.params[i]))
-    }
+    let supplied = Array.init(len(args) + 1, fun(i) =
+        if i == 0 {
+            L.emit(l.b, ConstInt(0), Ssa.traced(Ptr))
+        } else {
+            coerce(l, value(l, args[i - 1]), sig.params[i - 1])
+        })
     coerce(l, L.emit(l.b, Call(Direct(name), supplied), sig.result), rep)
 }
 
@@ -2077,13 +2076,10 @@ fun closureCall(l : Lower, fn : Core, args : Array Core, rep : Rep) -> Value {
     -- The callee before the arguments: Core evaluates it first, and this is
     -- the phase where that stops being implicit.
     let closure = value(l, fn)
-    let supplied : Array Value = []
     match Ty.prune(fn.ty) {
         TFun(params, result) -> {
-            for var i = 0; i < len(args); i = i + 1 {
-                Array.push(supplied, coerce(l, value(l, args[i]),
-                    repIn(l.decls, l.layouts, params[i])))
-            }
+            let supplied = Array.init(len(args), fun(i) =
+                coerce(l, value(l, args[i]), repIn(l.decls, l.layouts, params[i])))
             coerce(l, L.emit(l.b, Call(Indirect(closure), supplied),
                 repIn(l.decls, l.layouts, result)), rep)
         }
@@ -2337,9 +2333,7 @@ fun operands(l : Lower, p : Prims.Prim, args : Array Core, arity : Int) -> Array
         oops(Prims.name(p) + " applied to " + Int.toString(len(args))
              + " arguments, not " + Int.toString(arity))
     }
-    let out : Array Value = []
-    for a in args { Array.push(out, value(l, a)) }
-    out
+    Array.map(args, value(l, _))
 }
 
 fun noOperands(l : Lower, p : Prims.Prim, args : Array Core) -> Unit {
@@ -2450,33 +2444,33 @@ fun initializer(program : CProgram, decls : DeclTable,
                 globals : Set.Set String, globalRefs : Map String Rep,
                 tags : Map String Int,
                 sigs : Map String Signature, shared : Lifting)
-        -> (Ssa.Func Low, Ssa.Func Low, Array (Ssa.Func Low), Array (String, Rep)) {
+        -> (Ssa.Func Low, Ssa.Func Low, Array (Ssa.Func Low), Vec (String, Rep)) {
     let storage = storageOf(program, decls)
     let held = Map.new()
     for (name, r) in storage { Map.put(held, name, r) }
     let layouts = Map.new()
-    for bind in Array.append(program.dicts, program.binds) {
+    for bind in Vec.append(program.dicts, program.binds) {
         Map.put(layouts, bind.name, bind.layouts)
     }
 
-    let actions : Array Action = []
+    let actions : Vec Action = []
     let deferred = []
     for bind in program.dicts {
         if !Map.contains(held, bind.name) { continue }
         match erased(bind.value).kind {
             CDict(cls, slots) -> {
-                Array.push(actions, Placeholder(bind.name, Core.dictName(cls), slots))
-                Array.push(deferred, (bind.name, slots))
+                Vec.push(actions, Placeholder(bind.name, Core.dictName(cls), slots))
+                Vec.push(deferred, (bind.name, slots))
             }
-            _ -> Array.push(actions, Store(bind.name, bind.value))
+            _ -> Vec.push(actions, Store(bind.name, bind.value))
         }
     }
     for (name, slots) in deferred {
         for var i = 0; i < len(slots); i = i + 1 {
-            Array.push(actions, Field(name, i, slots[i]))
+            Vec.push(actions, Field(name, i, slots[i]))
         }
     }
-    let earlyActions : Array Action = []
+    let earlyActions : Vec Action = []
     let giblets = Giblets.gibletModules()
     for bind in program.binds {
         if Map.contains(held, bind.name) {
@@ -2485,9 +2479,9 @@ fun initializer(program : CProgram, decls : DeclTable,
                     CRef(inner) -> if bind.mutable { inner } else { bind.value }
                     _ -> bind.value
                 }
-                Array.push(earlyActions, Store(bind.name, value))
+                Vec.push(earlyActions, Store(bind.name, value))
             } else {
-                Array.push(actions, Store(bind.name, bind.value))
+                Vec.push(actions, Store(bind.name, bind.value))
             }
         }
     }
@@ -2501,7 +2495,7 @@ fun initializer(program : CProgram, decls : DeclTable,
 -- Partitioning preserves the dependency order established by module checking.
 -- Early actions contain only untraced globals; nullary objects and dictionary
 -- shells belong exclusively to the ordinary initializer.
-fun lowerActions(name : String, actions : Array Action, decls : DeclTable,
+fun lowerActions(name : String, actions : Vec Action, decls : DeclTable,
                  globals : Set.Set String, globalRefs : Map String Rep,
                  tags : Map String Int,
                  sigs : Map String Signature, shared : Lifting,
@@ -2593,8 +2587,4 @@ fun act(l : Lower, a : Action, held : Map String Rep) -> Unit = match a {
 
 -- The lifted functions get the same treatment: a lambda's body has the same
 -- `match` fallthroughs its parent's does.
-fun pruneAll(fs : Array (Ssa.Func Low)) -> Array (Ssa.Func Low) {
-    let out : Array (Ssa.Func Low) = []
-    for f in fs { Array.push(out, Promote.run(f)) }
-    out
-}
+fun pruneAll(fs : Vec (Ssa.Func Low)) -> Array (Ssa.Func Low) = Array.map(fs, Promote.run)

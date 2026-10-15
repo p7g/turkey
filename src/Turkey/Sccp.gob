@@ -43,9 +43,9 @@ type Solver = Solver {
     reachable : Array Bool,
     -- Where each value is read, as (block, position). The position of a
     -- block's terminator is its instruction count.
-    users     : Array (Array (Int, Int)),
-    blocks    : Array Int,
-    fallen    : Array Int,
+    users     : Array (Vec (Int, Int)),
+    blocks    : Vec Int,
+    fallen    : Vec Int,
 }
 
 -- The function with every value SCCP proves constant replaced by that
@@ -58,17 +58,16 @@ fun run(f : Ssa.Func Low) -> Ssa.Func Low {
 }
 
 fun solve(f : Ssa.Func Low) -> Solver {
-    let users : Array (Array (Int, Int)) = []
-    for _ in f.reps { Array.push(users, []) }
+    let users : Array (Vec (Int, Int)) = Array.init(len(f.reps), fun(_) = [])
     for var b = 0; b < len(f.blocks); b = b + 1 {
         let block = f.blocks[b]
         for var n = 0; n < len(block.insts); n = n + 1 {
             for v in L.opUses(block.insts[n].op) {
-                Array.push(users[Ssa.valueId(v)], (b, n))
+                Vec.push(users[Ssa.valueId(v)], (b, n))
             }
         }
         for v in Ssa.termUses(block.term) {
-            Array.push(users[Ssa.valueId(v)], (b, len(block.insts)))
+            Vec.push(users[Ssa.valueId(v)], (b, len(block.insts)))
         }
     }
     let s = Solver {
@@ -81,7 +80,7 @@ fun solve(f : Ssa.Func Low) -> Solver {
     while len(s.blocks) > 0 || len(s.fallen) > 0 {
         while len(s.blocks) > 0 {
             let b = s.blocks[len(s.blocks) - 1]
-            let _ = Array.pop(s.blocks)
+            let _ = Vec.pop(s.blocks)
             if s.reachable[b] { continue }
             s.reachable[b] = True
             let block = f.blocks[b]
@@ -90,7 +89,7 @@ fun solve(f : Ssa.Func Low) -> Solver {
         }
         while len(s.fallen) > 0 {
             let v = s.fallen[len(s.fallen) - 1]
-            let _ = Array.pop(s.fallen)
+            let _ = Vec.pop(s.fallen)
             for (b, n) in s.users[v] {
                 if !s.reachable[b] { continue }
                 let block = f.blocks[b]
@@ -109,7 +108,7 @@ fun lower(s : Solver, v : Value, next : Lattice) -> Unit {
     let met = meet(old, next)
     if !same(old, met) {
         s.values[id] = met
-        Array.push(s.fallen, id)
+        Vec.push(s.fallen, id)
     }
 }
 
@@ -139,24 +138,24 @@ fun visitTerm(s : Solver, b : Int, t : Term) -> Unit = match t {
         for var k = 0; k < len(args); k = k + 1 {
             lower(s, params[k], s.values[Ssa.valueId(args[k])])
         }
-        Array.push(s.blocks, Ssa.blockId(target))
+        Vec.push(s.blocks, Ssa.blockId(target))
     }
     Branch(c, yes, no) -> match s.values[Ssa.valueId(c)] {
         Top -> {}
-        Known(k) -> Array.push(s.blocks, Ssa.blockId(if k != 0 { yes } else { no }))
+        Known(k) -> Vec.push(s.blocks, Ssa.blockId(if k != 0 { yes } else { no }))
         Bottom -> {
-            Array.push(s.blocks, Ssa.blockId(yes))
-            Array.push(s.blocks, Ssa.blockId(no))
+            Vec.push(s.blocks, Ssa.blockId(yes))
+            Vec.push(s.blocks, Ssa.blockId(no))
         }
     }
     Switch(v, cases, default) -> match s.values[Ssa.valueId(v)] {
         Top -> {}
         Known(k) -> match switchTarget(cases, default, k) {
-            Some(target) -> Array.push(s.blocks, Ssa.blockId(target))
+            Some(target) -> Vec.push(s.blocks, Ssa.blockId(target))
             None -> {}
         }
         Bottom -> for target in Ssa.switchTargets(cases, default) {
-            Array.push(s.blocks, Ssa.blockId(target))
+            Vec.push(s.blocks, Ssa.blockId(target))
         }
     }
     Ret(_) -> {}
@@ -166,7 +165,7 @@ fun visitTerm(s : Solver, b : Int, t : Term) -> Unit = match t {
 
 -- Where a switch on a known value goes: its case, or else its default. `None`
 -- when there is neither, which the switch says cannot happen.
-fun switchTarget(cases : Array (Int, BlockId), default : Option BlockId,
+fun switchTarget(cases : Vec (Int, BlockId), default : Option BlockId,
                  k : Int) -> Option BlockId {
     for (key, target) in cases {
         if key == k { return Some(target) }
@@ -267,7 +266,7 @@ fun rewrite(s : Solver) -> Unit {
     let f = s.func
     -- Which parameters of each block survive: a known one is removed, and
     -- every jump into the block drops its argument.
-    let keep : Array (Array Bool) = []
+    let keep : Vec (Vec Bool) = []
     for var b = 0; b < len(f.blocks); b = b + 1 {
         let block = f.blocks[b]
         let kept = []
@@ -276,19 +275,19 @@ fun rewrite(s : Solver) -> Unit {
         for p in block.params {
             match s.values[Ssa.valueId(p)] {
                 Known(n) -> {
-                    Array.push(flags, False)
-                    Array.push(defined, L.low(p, ConstInt(n)))
+                    Vec.push(flags, False)
+                    Vec.push(defined, L.low(p, ConstInt(n)))
                 }
                 _ -> {
-                    Array.push(flags, True)
-                    Array.push(kept, p)
+                    Vec.push(flags, True)
+                    Vec.push(kept, p)
                 }
             }
         }
-        Array.push(keep, flags)
+        Vec.push(keep, flags)
         if len(defined) > 0 {
             block.params = kept
-            for i in block.insts { Array.push(defined, i) }
+            for i in block.insts { Vec.push(defined, i) }
             block.insts = defined
         }
     }
@@ -305,7 +304,7 @@ fun rewrite(s : Solver) -> Unit {
                 let flags = keep[Ssa.blockId(target)]
                 let passed = []
                 for var k = 0; k < len(args); k = k + 1 {
-                    if flags[k] { Array.push(passed, args[k]) }
+                    if flags[k] { Vec.push(passed, args[k]) }
                 }
                 Jump(target, passed)
             }

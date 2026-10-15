@@ -104,7 +104,7 @@ type Scope = Scope {
     -- name monomorphically inside its own definition, so a self-call records no
     -- type arguments -- correctly, there is nothing yet to record. System F
     -- still wants the application, at the binding's own variables.
-    binders  : Map String (Array VarCell),
+    binders  : Map String (Vec VarCell),
     -- Where a `return`, a `break` and a `continue` written here jump to. Each is
     -- a join name, or absent where writing that transfer would have been a
     -- compile error anyway. This is what replaces "the transfer names its target
@@ -169,7 +169,7 @@ fun node(ty : Ty.Type, where : Option Span, k : CoreKind) -> Core =
 
 -- A `match`, with its patterns compiled into ones that do not nest; see
 -- `Turkey.Match`.
-fun matched(l : Lowerer, scrutinee : Core, arms : Array (Pat, Core), ty : Ty.Type,
+fun matched(l : Lowerer, scrutinee : Core, arms : Vec (Pat, Core), ty : Ty.Type,
             where : Option Span) -> Core =
     Match.compile(Match.Matcher {
         decls = l.decls,
@@ -184,33 +184,33 @@ fun unitType() -> Ty.Type = Ty.tUnit()
 
 -- -- the program --------------------------------------------------------------------
 
-fun program(l : Lowerer, ordered : Array Stmt, owners : Map Int String) -> CProgram {
-    let out = CProgram { dicts = Array.new(16), binds = Array.new(32) }
+fun program(l : Lowerer, ordered : Vec Stmt, owners : Map Int String) -> CProgram {
+    let out = CProgram { dicts = Vec.new(16), binds = Vec.new(32) }
     for (name, info) in Map.entries(l.classes.classes) {
         for (method, impl) in Map.entries(info.defaults) {
-            Array.push(out.dicts, defaultMethod(l, name, method, impl))
+            Vec.push(out.dicts, defaultMethod(l, name, method, impl))
         }
     }
     for (_, insts) in Map.entries(l.classes.instances) {
-        for inst in insts { Array.push(out.dicts, instanceBind(l, inst)) }
+        for inst in insts { Vec.push(out.dicts, instanceBind(l, inst)) }
     }
     let scope = newScope()
     for stmt in ordered {
-        for b in top(l, stmt, scope, Map.getOr(owners, stmt.id, "")) { Array.push(out.binds, b) }
+        for b in top(l, stmt, scope, Map.getOr(owners, stmt.id, "")) { Vec.push(out.binds, b) }
     }
     out
 }
 
-fun newBind(name : String, ty : Ty.Type, binders : Array VarCell, value : Core,
+fun newBind(name : String, ty : Ty.Type, binders : Vec VarCell, value : Core,
             where : Option Span) -> CBind = CBind {
     name = name, ty = ty, binders = binders, value = value, span = where,
-    mutable = False, module_ = moduleOf(name), equations = Array.new(0),
+    mutable = False, module_ = moduleOf(name), equations = [],
     layouts = Map.new(),
 }
 
 -- One top-level statement. Only bindings occur here.
 fun top(l : Lowerer, stmt : Stmt, scope : Scope, owner : String)
-        -> Array CBind = match stmt.kind {
+        -> Vec CBind = match stmt.kind {
     SFun(decl) -> [funBind(l, decl, scope)]
     SLet(pat, value) -> letBinds(l, stmt, pat, value, False, scope, owner)
     SVar(pat, value) -> letBinds(l, stmt, pat, value, True, scope, owner)
@@ -218,7 +218,7 @@ fun top(l : Lowerer, stmt : Stmt, scope : Scope, owner : String)
     -- binding nothing reads, which is what a `let` already means.
     SExpr(e) -> {
         let value = expr(l, e, scope)
-        [newBind(owner + "#" + freshName(l, "top"), value.ty, Array.new(0), value,
+        [newBind(owner + "#" + freshName(l, "top"), value.ty, [], value,
                  Some(stmt.span))]
     }
     _ -> oops("unhandled top-level statement", Some(stmt.span))
@@ -228,7 +228,7 @@ fun funBind(l : Lowerer, decl : FunDecl, scope : Scope) -> CBind {
     let s = schemeOf(l, decl.name)
     let binders = match s {
         Some(sc) -> sc.quantified
-        None -> Array.new(0)
+        None -> []
     }
     let ty = match s {
         Some(sc) -> sc.body
@@ -262,7 +262,7 @@ fun abstracted(l : Lowerer, ty : Ty.Type, dicts : Option Abstraction) -> Ty.Type
 -- projection per name, rather than a pattern at the top level: Core has no
 -- statements, so there is nowhere for a multi-name binder to live.
 fun letBinds(l : Lowerer, stmt : Stmt, pat : Pat, value : Expr, mutable : Bool,
-             scope : Scope, owner : String) -> Array CBind {
+             scope : Scope, owner : String) -> Vec CBind {
     let lowered = expr(l, value, scope)
     let dicts = abstractionOf(l, stmt.id)
     let bare = unannot(pat)
@@ -271,7 +271,7 @@ fun letBinds(l : Lowerer, stmt : Stmt, pat : Pat, value : Expr, mutable : Bool,
             let s = schemeOf(l, name)
             let binders = match s {
                 Some(sc) -> sc.quantified
-                None -> Array.new(0)
+                None -> []
             }
             var body = abstract(l, lowered, dicts)
             if mutable {
@@ -285,12 +285,12 @@ fun letBinds(l : Lowerer, stmt : Stmt, pat : Pat, value : Expr, mutable : Bool,
         _ -> {}
     }
     let holder = owner + "#" + freshName(l, "bound")
-    let out = [newBind(holder, lowered.ty, Array.new(0), lowered, Some(stmt.span))]
-    for name in Array.sort(patternVars(pat)) {
+    let out = [newBind(holder, lowered.ty, [], lowered, Some(stmt.span))]
+    for name in Vec.sort(patternVars(pat)) {
         let nty = nameType(l, name)
         let picked = matched(l, node(lowered.ty, Some(stmt.span), CVar(holder)),
             [(pat, node(nty, Some(stmt.span), CVar(name)))], nty, Some(stmt.span))
-        Array.push(out, newBind(name, picked.ty, Array.new(0), picked,
+        Vec.push(out, newBind(name, picked.ty, [], picked,
                                 Some(stmt.span)))
     }
     out
@@ -336,13 +336,13 @@ fun instanceBind(l : Lowerer, inst : InstInfo) -> CBind {
         })
     var value = record
     if len(plan.params) > 0 {
-        let params = Array.new(len(plan.params))
-        for var i = 0; i < len(plan.params) && i < len(inst.context); i = i + 1 {
+        let count = fewer(len(plan.params), len(inst.context))
+        let params = Array.init(count, fun(i) {
             let p = inst.context[i]
-            Array.push(params, CParam {
+            CParam {
                 name = plan.params[i], ty = dictType(l, p.name, p.args[0]),
-            })
-        }
+            }
+        })
         value = node(TFun(Array.map(params, _.ty), result),
                      Some(inst.decl.span),
                      CLam(params, record, instName(inst)))
@@ -362,7 +362,7 @@ fun instanceBind(l : Lowerer, inst : InstInfo) -> CBind {
                     let mapping = Map.new()
                     Map.put(mapping, mi.classVar.id, inst.head)
                     for (a, rt) in equationsOf(Some(mi.scheme)) {
-                        Array.push(b.equations, (Decls.substitute(a, mapping),
+                        Vec.push(b.equations, (Decls.substitute(a, mapping),
                                                  Decls.substitute(rt, mapping)))
                     }
                 }
@@ -410,8 +410,8 @@ fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
         TTuple(elems) -> "Tuple" + Int.toString(len(elems))
         _ -> oops("a derived 'Typed' instance has no constructor", span)
     }
-    let elems = Array.new(len(plan.params))
-    for var i = 0; i < len(plan.params) && i < len(inst.context); i = i + 1 {
+    let count = fewer(len(plan.params), len(inst.context))
+    let elems = Array.init(count, fun(i) {
         let pred = inst.context[i]
         let argument = pred.args[0]
         let proxyTy = Ty.applyTo(Decls.head(l.decls, P.proxyCon),
@@ -420,9 +420,8 @@ fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
         let method = node(TFun([proxyTy], repTy), span,
                           CSlot(node(dictTy, span, CVar(plan.params[i])),
                                 slotFor(l, P.typedClass, typeRepMethod(l), span)))
-        Array.push(elems, node(repTy, span,
-            CApp(method, [node(proxyTy, span, CCon(P.proxyCon))])))
-    }
+        node(repTy, span, CApp(method, [node(proxyTy, span, CCon(P.proxyCon))]))
+    })
     let arrayTy = Ty.rawArrayOf(repTy)
     let made = node(repTy, span, CApp(
         node(TFun([Ty.tString(), arrayTy], repTy), span, CCon(P.typeRepCon)),
@@ -435,13 +434,13 @@ fun typeRepDict(l : Lowerer, inst : InstInfo, result : Ty.Type) -> CBind {
     let record = dictionary(l, inst.cls, result, span, fun(_) = body)
     var value = record
     if len(plan.params) > 0 {
-        let params = Array.new(len(plan.params))
-        for var i = 0; i < len(plan.params) && i < len(inst.context); i = i + 1 {
+        let count = fewer(len(plan.params), len(inst.context))
+        let params = Array.init(count, fun(i) {
             let pr = inst.context[i]
-            Array.push(params, CParam {
+            CParam {
                 name = plan.params[i], ty = dictType(l, pr.name, pr.args[0]),
-            })
-        }
+            }
+        })
         value = node(TFun(Array.map(params, _.ty), result), span,
                      CLam(params, record, instName(inst)))
     }
@@ -518,12 +517,12 @@ fun typeRepMethod(l : Lowerer) -> String =
 -- The instance's own variables, in the order its binding abstracts them. Read
 -- off the head, which is the only place they appear, and used by both the
 -- definition and every reference so the two cannot disagree.
-fun instanceBinders(inst : InstInfo) -> Array VarCell = Ty.varsOf([inst.head])
+fun instanceBinders(inst : InstInfo) -> Vec VarCell = Ty.varsOf([inst.head])
 
 -- The instance's own dictionary, as seen from inside one of its methods: applied
 -- to its own binders and to its own context, which is what makes the reference
 -- well-typed rather than merely well-named.
-fun selfDict(l : Lowerer, inst : InstInfo, params : Array String) -> Core {
+fun selfDict(l : Lowerer, inst : InstInfo, params : Vec String) -> Core {
     let result = dictType(l, inst.cls, inst.head)
     var fn = node(unknown(), Some(inst.decl.span), CVar(instName(inst)))
     let binders = instanceBinders(inst)
@@ -535,11 +534,10 @@ fun selfDict(l : Lowerer, inst : InstInfo, params : Array String) -> Core {
         fn.ty = result
         return fn
     }
-    let args = Array.new(len(inst.context))
-    for var i = 0; i < len(params) && i < len(inst.context); i = i + 1 {
-        Array.push(args, node(predType(l, inst.context[i]), Some(inst.decl.span),
-                              CVar(params[i])))
-    }
+    let count = fewer(len(params), len(inst.context))
+    let args = Array.init(count, fun(i) {
+        node(predType(l, inst.context[i]), Some(inst.decl.span), CVar(params[i]))
+    })
     fn.ty = TFun(Array.map(args, _.ty), result)
     node(result, Some(inst.decl.span), CApp(fn, args))
 }
@@ -601,7 +599,7 @@ fun defaultMethod(l : Lowerer, cls : String, name : String,
 -- what makes a *default* method work at all. In Core it is a `let` around the
 -- body rather than a name the evaluator arranges to have in scope.
 fun methodBody(l : Lowerer, inst : InstInfo, name : String, impl : MethodImpl,
-               params : Array String) -> Core {
+               params : Vec String) -> Core {
     let info = classNamed(l, inst.cls)
     let mi = match Map.get(info.methods, name) {
         Some(m) -> m
@@ -650,16 +648,13 @@ fun isDefaultOf(info : ClassInfo, name : String, impl : MethodImpl) -> Bool =
 -- The dictionaries a use of an existential constructor packs;
 -- empty for every other constructor.
 fun carried(l : Lowerer, e : Expr) -> Array Core = match Map.get(l.types.uses, e.id) {
-    None -> Array.new(0)
+    None -> []
     Some(u) -> {
-        let out = Array.new(len(u.evidence))
-        if len(u.evidence) == 0 { return out }
+        if len(u.evidence) == 0 { return [] }
         let givens = givensOf(l, u)
-        for var i = 0; i < len(u.evidence) && i < len(u.preds); i = i + 1 {
-            Array.push(out, evidence(l, u.evidence[i], predType(l, u.preds[i]),
-                                     givens))
-        }
-        out
+        let count = fewer(len(u.evidence), len(u.preds))
+        Array.init(count, fun(i) = evidence(l, u.evidence[i], predType(l, u.preds[i]),
+                                            givens))
     }
 }
 
@@ -678,12 +673,9 @@ fun passedAccessors(l : Lowerer, e : Expr) -> Option (Array Core) {
         _ -> return None
     }
     let givens = givensOf(l, u)
-    let out = Array.new(len(u.evidence))
-    for var i = 0; i < len(u.evidence) && i < len(u.preds); i = i + 1 {
-        Array.push(out, evidence(l, u.evidence[i], predType(l, u.preds[i]),
-                                 givens))
-    }
-    Some(out)
+    let count = fewer(len(u.evidence), len(u.preds))
+    Some(Array.init(count, fun(i) = evidence(l, u.evidence[i], predType(l, u.preds[i]),
+                                             givens)))
 }
 
 -- The constructor as Core applies it: dictionaries, then fields.
@@ -721,7 +713,7 @@ fun conValue(l : Lowerer, e : Expr, name : String, ty : Ty.Type,
 -- every backend packs. The fields are evaluated in the order they were written
 -- and bound to fresh names first, then passed in declaration order.
 fun existentialRecord(l : Lowerer, e : Expr, info : ConInfo, con : String,
-                      fields : Array (String, Expr), ty : Ty.Type,
+                      fields : Vec (String, Expr), ty : Ty.Type,
                       where : Option Span, scope : Scope) -> Core {
     let values = Map.new()
     for (n, v) in fields { Map.put(values, n, expr(l, v, scope)) }
@@ -730,16 +722,15 @@ fun existentialRecord(l : Lowerer, e : Expr, info : ConInfo, con : String,
     let dicts = carried(l, e)
     let names = match info.fields {
         Some(ns) -> ns
-        None -> Array.new(0)
+        None -> []
     }
-    let ordered = Array.new(len(names))
-    for n in names {
+    let ordered = Array.map(names, fun(n) {
         let v = match Map.get(values, n) {
             Some(x) -> x
             None -> oops("the field '" + n + "' vanished", where)
         }
-        Array.push(ordered, node(v.ty, where, CVar(Map.getOr(held, n, n))))
-    }
+        node(v.ty, where, CVar(Map.getOr(held, n, n)))
+    })
     let fnTy = TFun(Array.map(ordered, _.ty), ty)
     var out = node(ty, where, CApp(packing(dicts, fnTy, con, where),
                                    Array.append(dicts, ordered)))
@@ -750,7 +741,7 @@ fun existentialRecord(l : Lowerer, e : Expr, info : ConInfo, con : String,
             None -> oops("the field '" + n + "' vanished", where)
         }
         out = node(ty, where, CLet(Map.getOr(held, n, n), v.ty, v, out,
-                                   Array.new(0)))
+                                   []))
     }
     out
 }
@@ -774,18 +765,17 @@ fun recordLiteral(l : Lowerer, con : String, fields : Array (String, Core),
     if inOrder { return applyCon(con, Array.map(fields, _.1), ty, where) }
     let held = Map.new()
     for (n, v) in fields { Map.put(held, n, (freshName(l, "field"), v)) }
-    let built = Array.new(len(declared))
-    for n in declared {
+    let built = Array.map(declared, fun(n) {
         let (name, v) = match Map.get(held, n) {
             Some(found) -> found
             None -> oops("the field '" + n + "' vanished", where)
         }
-        Array.push(built, node(v.ty, where, CVar(name)))
-    }
+        node(v.ty, where, CVar(name))
+    })
     var out = applyCon(con, built, ty, where)
     for var i = len(fields) - 1; i >= 0; i = i - 1 {
         let (name, v) = held[fields[i].0]
-        out = node(ty, where, CLet(name, v.ty, v, out, Array.new(0)))
+        out = node(ty, where, CLet(name, v.ty, v, out, []))
     }
     out
 }
@@ -854,15 +844,15 @@ fun eta(l : Lowerer, called : Core, result : Ty.Type, where : Option Span) -> Co
 -- itself, so a binding evaluated while the dictionary is being built would build
 -- the dictionary again, for ever. Under the lambda it is evaluated when the
 -- method is *called*, by which time the dictionary exists.
-fun bindSelf(l : Lowerer, inst : InstInfo, params : Array String, name : String,
+fun bindSelf(l : Lowerer, inst : InstInfo, params : Vec String, name : String,
              body : Core, where : Option Span) -> Core {
     let own = selfDict(l, inst, params)
     match body.kind {
         CLam(ps, inner, lamName) -> node(body.ty, body.span, CLam(ps,
-            node(inner.ty, where, CLet(name, own.ty, own, inner, Array.new(0))),
+            node(inner.ty, where, CLet(name, own.ty, own, inner, [])),
             lamName))
         _ -> node(body.ty, where,
-                  CLet(name, own.ty, own, body, Array.new(0)))
+                  CLet(name, own.ty, own, body, []))
     }
 }
 
@@ -871,9 +861,9 @@ fun bindSelf(l : Lowerer, inst : InstInfo, params : Array String, name : String,
 -- (Either l)` dictionary is still `forall a b`, so the field is a type
 -- abstraction and every use of it a type application.
 fun methodAbstraction(info : MethodInfo, body : Core, where : Option Span) -> Core {
-    let binders = Array.new(4)
+    let binders = Vec.new(4)
     for q in info.scheme.quantified {
-        if q.id != info.classVar.id { Array.push(binders, q) }
+        if q.id != info.classVar.id { Vec.push(binders, q) }
     }
     if len(binders) == 0 { return body }
     node(body.ty, where, CTyLam(binders, body))
@@ -881,7 +871,7 @@ fun methodAbstraction(info : MethodInfo, body : Core, where : Option Span) -> Co
 
 -- Set the constant-to-variable map for one method body, and answer what it was.
 fun setSkolems(l : Lowerer, impl : MethodImpl, info : MethodInfo,
-               headVars : Array VarCell) -> Map String VarCell {
+               headVars : Vec VarCell) -> Map String VarCell {
     let byId = Map.new()
     for v in headVars { Map.put(byId, v.id, v) }
     for q in info.scheme.quantified { Map.put(byId, q.id, q) }
@@ -971,15 +961,14 @@ fun instanceRef(l : Lowerer, inst : InstInfo, want : Ty.Type,
         fn.ty = result
         return fn
     }
-    let argTerms = Array.new(len(args))
-    for var i = 0; i < len(args) && i < len(inst.context); i = i + 1 {
+    let count = fewer(len(args), len(inst.context))
+    let argTerms = Array.init(count, fun(i) {
         let p = inst.context[i]
         let at = Decls.substitute(p.args[0], mapping)
         -- No givens: an instance's context arrives as its own parameters, which
         -- `instanceGivens` supplies where those are in scope.
-        Array.push(argTerms, evidence(l, args[i],
-            dictType(l, p.name, resolved(l, at)), Map.new()))
-    }
+        evidence(l, args[i], dictType(l, p.name, resolved(l, at)), Map.new())
+    })
     fn.ty = TFun(Array.map(argTerms, _.ty), result)
     node(result, None, CApp(fn, argTerms))
 }
@@ -1035,8 +1024,8 @@ fun funType(l : Lowerer, decl : FunDecl) -> Ty.Type = match decl.body {
 
 -- A `fun` declaration, as a lambda -- possibly under dictionary ones.
 fun function(l : Lowerer, decl : FunDecl, ty : Ty.Type, scope : Scope,
-             dictParams : Option (Array String),
-             preds : Option (Array Pred)) -> Core {
+             dictParams : Option (Vec String),
+             preds : Option (Vec Pred)) -> Core {
     let body = match decl.body {
         Some(b) -> b
         None -> oops("a function with no body reached the lowering",
@@ -1089,8 +1078,8 @@ fun signatureSkolems(l : Lowerer, dicts : Option Abstraction,
     }
 }
 
-fun wrapDicts(l : Lowerer, inner : Core, params : Option (Array String),
-              preds : Option (Array Pred), where : Option Span) -> Core {
+fun wrapDicts(l : Lowerer, inner : Core, params : Option (Vec String),
+              preds : Option (Vec Pred), where : Option Span) -> Core {
     let ns = match params {
         Some(p) -> p
         None -> return inner
@@ -1098,14 +1087,12 @@ fun wrapDicts(l : Lowerer, inner : Core, params : Option (Array String),
     if len(ns) == 0 { return inner }
     let ps = match preds {
         Some(p) -> p
-        None -> Array.new(0)
+        None -> []
     }
-    let cparams = Array.new(len(ns))
-    for var i = 0; i < len(ns) && i < len(ps); i = i + 1 {
-        Array.push(cparams, CParam {
-            name = ns[i], ty = dictType(l, ps[i].name, ps[i].args[0]),
-        })
-    }
+    let count = fewer(len(ns), len(ps))
+    let cparams = Array.init(count, fun(i) = CParam {
+        name = ns[i], ty = dictType(l, ps[i].name, ps[i].args[0]),
+    })
     node(TFun(Array.map(cparams, _.ty), inner.ty), where,
          CLam(cparams, inner, "<anonymous>"))
 }
@@ -1124,46 +1111,45 @@ fun abstract(l : Lowerer, value : Core, dicts : Option Abstraction) -> Core =
 -- recorded. The function type has one entry per parameter and is recorded, so
 -- that is where the types come from -- and a parameter that is not a plain name
 -- becomes a fresh binder plus a `match`, which is what it always meant.
-fun lambdaOf(l : Lowerer, params : Array Pat, body : Expr, ty : Ty.Type,
+fun lambdaOf(l : Lowerer, params : Vec Pat, body : Expr, ty : Ty.Type,
              where : Option Span, scope : Scope, name : String) -> Core {
     let (fnParams, fnRet) = match Ty.prune(ty) {
         TFun(ps, r) -> (ps, r)
         _ -> oops("a function whose type is not one: " + Ty.show(ty), where)
     }
     let inner = childScope(scope)
-    let cparams = Array.new(len(params))
-    let matches = Array.new(2)
+    let matches = Vec.new(2)
     let assignedNames = assignedIn(ChExpr(body))
-    let cells = Array.new(2)
-    for var i = 0; i < len(params) && i < len(fnParams); i = i + 1 {
+    let cells = Vec.new(2)
+    let count = fewer(len(params), len(fnParams))
+    let cparams = Array.init(count, fun(i) {
         let bare = unannot(params[i])
         let pty = fnParams[i]
         match bare.kind {
             PVar(pname) -> {
-                Array.push(cparams, CParam { name = pname, ty = pty })
                 if Set.contains(assignedNames, pname) {
-                    Array.push(cells, (pname, pty))
+                    Vec.push(cells, (pname, pty))
                 }
+                CParam { name = pname, ty = pty }
             }
-            PWild -> Array.push(cparams,
-                CParam { name = freshName(l, "wild"), ty = pty })
+            PWild -> CParam { name = freshName(l, "wild"), ty = pty }
             _ -> {
                 let holder = freshName(l, "param")
-                Array.push(cparams, CParam { name = holder, ty = pty })
-                Array.push(matches, (holder, bare, pty))
+                Vec.push(matches, (holder, bare, pty))
+                CParam { name = holder, ty = pty }
             }
         }
-    }
+    })
     -- A destructured parameter's binders are reassignable too, so any the body
     -- writes become cells, exactly as a named parameter's would. Collected
     -- across every pattern first, because the body is lowered once, inside all
     -- of them.
-    let patternCells = Array.new(2)
+    let patternCells = Vec.new(2)
     for (_, pat, _) in matches {
         let bound = Typed.ofPattern(l.types, pat)
         for boundName in Array.sort(Map.keys(bound)) {
             if Set.contains(assignedNames, boundName) {
-                Array.push(patternCells,
+                Vec.push(patternCells,
                     (boundName, rigidly(l, Map.getOr(bound, boundName, TBottom))))
             }
         }
@@ -1206,7 +1192,7 @@ fun lambdaOf(l : Lowerer, params : Array Pat, body : Expr, ty : Ty.Type,
         let (cname, cty) = patternCells[i]
         out = node(out.ty, where, CLet(cname, refOf(cty),
             node(refOf(cty), where, CRef(node(cty, where, CVar(cname)))),
-            out, Array.new(0)))
+            out, []))
     }
     for var i = len(matches) - 1; i >= 0; i = i - 1 {
         let (holder, pat, pty) = matches[i]
@@ -1218,7 +1204,7 @@ fun lambdaOf(l : Lowerer, params : Array Pat, body : Expr, ty : Ty.Type,
         let (cname, cty) = cells[i]
         out = node(out.ty, where, CLet(cname, refOf(cty),
             node(refOf(cty), where, CRef(node(cty, where, CVar(cname)))),
-            out, Array.new(0)))
+            out, []))
     }
     match joined {
         Some((retName, valueName, result)) -> {
@@ -1300,8 +1286,7 @@ fun dispatch(l : Lowerer, e : Expr, scope : Scope) -> Core {
                 }
                 None -> {}
             }
-            let out = Array.new(len(fields))
-            for (n, v) in fields { Array.push(out, (n, expr(l, v, scope))) }
+            let out = Array.map(fields, fun((n, v)) = (n, expr(l, v, scope)))
             recordLiteral(l, con, out, ty, where)
         }
         EField(obj, name) -> {
@@ -1369,10 +1354,10 @@ fun dispatch(l : Lowerer, e : Expr, scope : Scope) -> Core {
                 None -> None
             }))
         EMatch(scrutinee, arms) -> {
-            let alts = Array.new(4)
+            let alts = Vec.new(4)
             for arm in arms {
                 for pat in arm.patterns {
-                    Array.push(alts, (pat, celled(l, pat,
+                    Vec.push(alts, (pat, celled(l, pat,
                         arm.body, expr(l, arm.body, _),
                         childScope(scope), Some(arm.span))))
                 }
@@ -1384,7 +1369,7 @@ fun dispatch(l : Lowerer, e : Expr, scope : Scope) -> Core {
     }
 }
 
-fun arrayLiteral(l : Lowerer, e : Expr, public : Ty.Type, elems : Array Expr,
+fun arrayLiteral(l : Lowerer, e : Expr, public : Ty.Type, elems : Vec Expr,
                  scope : Scope) -> Core {
     let where = Some(e.span)
     let (_, args) = Ty.spine(public)
@@ -1438,7 +1423,7 @@ fun binary(l : Lowerer, e : Expr, ty : Ty.Type, op : String, left : Expr,
         } else {
             node(ty, where, CIf(held, held, Some(ro)))
         }
-        return node(ty, where, CLet(name, lo.ty, lo, branch, Array.new(0)))
+        return node(ty, where, CLet(name, lo.ty, lo, branch, []))
     }
     match fn {
         Some(f) -> node(ty, where, CApp(var_(l, f, scope),
@@ -1505,11 +1490,9 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
         None -> oops("a use vanished", where)
     }
     let givens = givensOf(l, use)
-    var dicts = Array.new(len(use.evidence))
-    for var i = 0; i < len(use.evidence) && i < len(use.preds); i = i + 1 {
-        Array.push(dicts, evidence(l, use.evidence[i],
-                                   predType(l, use.preds[i]), givens))
-    }
+    let count = fewer(len(use.evidence), len(use.preds))
+    var dicts = Array.init(count, fun(i) = evidence(l, use.evidence[i],
+                                                    predType(l, use.preds[i]), givens))
     var typeArgs = Array.map(use.typeArgs, resolved(l, _))
     -- A polymorphic primitive, applied to its type arguments below. A `Fixed`
     -- one is monomorphic and took the path above.
@@ -1559,11 +1542,12 @@ fun var_(l : Lowerer, e : Expr, scope : Scope) -> Core {
 fun withoutClassVar(mi : MethodInfo, typeArgs : Array Ty.Type) -> Array Ty.Type {
     let quantified = mi.scheme.quantified
     if len(typeArgs) != len(quantified) { return typeArgs }
-    let out = Array.new(len(typeArgs))
-    for var i = 0; i < len(typeArgs); i = i + 1 {
-        if quantified[i].id != mi.classVar.id { Array.push(out, typeArgs[i]) }
+    var at = -1
+    for var i = 0; i < len(quantified); i = i + 1 {
+        if quantified[i].id == mi.classVar.id { at = i }
     }
-    out
+    if at < 0 { return typeArgs }
+    Array.init(len(typeArgs) - 1, fun(i) = if i < at { typeArgs[i] } else { typeArgs[i + 1] })
 }
 
 fun oops(message : String, where : Option Span) -> a = match where {
@@ -1572,6 +1556,9 @@ fun oops(message : String, where : Option Span) -> a = match where {
 }
 
 fun discard(x : a) -> Unit = {}
+
+-- How many of a pair of arrays walked in step there are.
+fun fewer(a : Int, b : Int) -> Int = if a < b { a } else { b }
 
 -- -- loops and transfers, as join points ---------------------------------------------
 --
@@ -1613,7 +1600,7 @@ fun conv(l : Lowerer, e : Expr, scope : Scope, k : Option String) -> Core {
                                   "a 'break' outside a loop")
         EContinue -> match scope.cont {
             None -> unsupported("a 'continue' outside a loop", where)
-            Some(target) -> node(TBottom, where, CJump(target, Array.new(0)))
+            Some(target) -> node(TBottom, where, CJump(target, []))
         }
         EBlock(stmts) -> convBlock(l, stmts, typeOfExpr(l, e), where,
                                    childScope(scope), k)
@@ -1677,15 +1664,15 @@ fun convIf(l : Lowerer, e : Expr, cond : Expr, then : Expr,
     })
 }
 
-fun convMatch(l : Lowerer, e : Expr, scrutinee : Expr, arms : Array Arm,
+fun convMatch(l : Lowerer, e : Expr, scrutinee : Expr, arms : Vec Arm,
               scope : Scope, k : Option String) -> Core {
     let ty = typeOfExpr(l, e)
     let where = Some(e.span)
     scrutinized(l, scrutinee, ty, where, scope, fun(s) = {
-        let alts = Array.new(4)
+        let alts = Vec.new(4)
         for arm in arms {
             for pat in arm.patterns {
-                Array.push(alts, (pat, celled(l, pat,
+                Vec.push(alts, (pat, celled(l, pat,
                     arm.body, conv(l, arm.body, _, k),
                     childScope(scope), Some(arm.span))))
             }
@@ -1724,7 +1711,7 @@ fun convShortCircuit(l : Lowerer, e : Expr, op : String, left : Expr,
         } else {
             node(ty, where, CIf(held, kept, Some(ro)))
         }
-        node(ty, where, CLet(name, lo.ty, lo, branch, Array.new(0)))
+        node(ty, where, CLet(name, lo.ty, lo, branch, []))
     })
 }
 
@@ -1755,7 +1742,7 @@ fun anf(l : Lowerer, e : Expr, scope : Scope, k : Option String) -> Core {
     if last < 0 {
         unsupported("a control transfer inside this expression", where)
     }
-    let bound = Array.slice(kids, 0, last + 1)
+    let bound = Vec.slice(kids, 0, last + 1)
     let joins = Array.map(bound, fun(_) =
         (freshName(l, "arg"), freshName(l, "av")))
     for var i = 0; i < len(bound); i = i + 1 {
@@ -1804,11 +1791,11 @@ fun lowerLoop(l : Lowerer, e : Expr, scope : Scope, k : Option String) -> Core {
     inner.brk = after
     let (pending, body) = iteration(l, e, inner, name, afterName)
 
-    var made = node(TBottom, where, CJoin(name, Array.new(0), body,
-        node(TBottom, where, CJump(name, Array.new(0))), True))
+    var made = node(TBottom, where, CJoin(name, [], body,
+        node(TBottom, where, CJump(name, [])), True))
     for var i = len(pending) - 1; i >= 0; i = i - 1 {
         let (bname, bty, value) = pending[i]
-        made = node(TBottom, where, CLet(bname, bty, value, made, Array.new(0)))
+        made = node(TBottom, where, CLet(bname, bty, value, made, []))
     }
     match wrapper {
         None -> made
@@ -1824,22 +1811,22 @@ fun lowerLoop(l : Lowerer, e : Expr, scope : Scope, k : Option String) -> Core {
 -- the `break` target; what each form decides is where its `continue` goes and
 -- what runs before the test.
 fun iteration(l : Lowerer, e : Expr, scope : Scope, name : String,
-              after : String) -> (Array (String, Ty.Type, Core), Core) {
+              after : String) -> (Vec (String, Ty.Type, Core), Core) {
     let where = Some(e.span)
     let stop = node(TBottom, where,
                     CJump(after, [node(unitType(), where, CUnit)]))
     match e.kind {
         ELoop(body) -> {
             scope.cont = Some(name)
-            (Array.new(0), seqThen(l, body, childScope(scope),
-                node(TBottom, where, CJump(name, Array.new(0)))))
+            ([], seqThen(l, body, childScope(scope),
+                node(TBottom, where, CJump(name, []))))
         }
         EWhile(cond, body) -> {
             scope.cont = Some(name)
             let c = expr(l, cond, scope)
             let b = seqThen(l, body, childScope(scope),
-                node(TBottom, where, CJump(name, Array.new(0))))
-            (Array.new(0), node(TBottom, where, CIf(c, b, Some(stop))))
+                node(TBottom, where, CJump(name, [])))
+            ([], node(TBottom, where, CIf(c, b, Some(stop))))
         }
         EForC(init, cond, step, body) ->
             forC(l, e, init, cond, step, body, scope, name, stop)
@@ -1860,15 +1847,15 @@ fun iteration(l : Lowerer, e : Expr, scope : Scope, name : String,
 -- it: `for var i = 0` binds `i` over the condition, the step and the body alike.
 fun forC(l : Lowerer, e : Expr, init : Option Stmt, cond : Expr,
          step : Option Stmt, body : Expr, scope : Scope, name : String,
-         stop : Core) -> (Array (String, Ty.Type, Core), Core) {
+         stop : Core) -> (Vec (String, Ty.Type, Core), Core) {
     let where = Some(e.span)
-    let pending = Array.new(2)
+    let pending = Vec.new(2)
     match init {
         Some(s) -> {
             let lowered = stmtValue(l, s, scope)
             match lowered.kind {
-                CLet(n, bound, value, _, _) -> Array.push(pending, (n, bound, value))
-                _ -> Array.push(pending, (freshName(l, "seq"), lowered.ty, lowered))
+                CLet(n, bound, value, _, _) -> Vec.push(pending, (n, bound, value))
+                _ -> Vec.push(pending, (freshName(l, "seq"), lowered.ty, lowered))
             }
         }
         None -> {}
@@ -1900,15 +1887,15 @@ fun forC(l : Lowerer, e : Expr, init : Option Stmt, cond : Expr,
     }
     var made = node(TBottom, where, CIf(c,
         seqThen(l, body, childScope(scope),
-                node(TBottom, where, CJump(contName, Array.new(0)))),
+                node(TBottom, where, CJump(contName, []))),
         Some(stop)))
     match stepJoin {
         Some((joined, value)) -> {
             let ran = node(TBottom, where, CLet(freshName(l, "seq"), value.ty,
-                value, node(TBottom, where, CJump(name, Array.new(0))),
-                Array.new(0)))
+                value, node(TBottom, where, CJump(name, [])),
+                []))
             made = node(TBottom, where,
-                        CJoin(joined, Array.new(0), ran, made, False))
+                        CJoin(joined, [], ran, made, False))
         }
         None -> {}
     }
@@ -1927,7 +1914,7 @@ fun forC(l : Lowerer, e : Expr, init : Option Stmt, cond : Expr,
 -- match are checked rather than taken on trust.
 fun forIn(l : Lowerer, e : Expr, pat : Pat, iterable : Expr, body : Expr,
           iterFn : Option Expr, nextFn : Option Expr, scope : Scope,
-          name : String, stop : Core) -> (Array (String, Ty.Type, Core), Core) {
+          name : String, stop : Core) -> (Vec (String, Ty.Type, Core), Core) {
     let where = Some(e.span)
     let seqCore = expr(l, iterable, scope)
     let iterCore = match iterFn {
@@ -1958,9 +1945,9 @@ fun forIn(l : Lowerer, e : Expr, pat : Pat, iterable : Expr, body : Expr,
          node(cursorTy, where, CVar(curName))]))
     scope.cont = Some(name)
     let b = seqThen(l, body, childScope(scope),
-                    node(TBottom, where, CJump(name, Array.new(0))))
+                    node(TBottom, where, CJump(name, [])))
     (pending, matched(l, step, [
-        (mkPat(e, PCon(none, Array.new(0))), stop),
+        (mkPat(e, PCon(none, [])), stop),
         (mkPat(e, PCon(some, [pat])), b),
     ], TBottom, where))
 }
@@ -1981,12 +1968,12 @@ fun optionParts(l : Lowerer, ty : Ty.Type, where : Option Span) -> (String, Stri
         } else { c.name }
         _ -> unsupported("a 'for' whose `next` answers no Option", where)
     }
-    let some = Array.new(2)
-    let none = Array.new(2)
+    let some = Vec.new(2)
+    let none = Vec.new(2)
     for (cname, info) in Map.entries(l.decls.constructors) {
         if info.tycon == headName {
-            if info.arity == 1 { Array.push(some, cname) }
-            if info.arity == 0 { Array.push(none, cname) }
+            if info.arity == 1 { Vec.push(some, cname) }
+            if info.arity == 0 { Vec.push(none, cname) }
         }
     }
     if len(some) != 1 || len(none) != 1 {
@@ -2005,7 +1992,7 @@ fun seqThen(l : Lowerer, e : Expr, scope : Scope, after : Core) -> Core {
     if !special(ChExpr(e)) {
         let value = expr(l, e, scope)
         return node(after.ty, where, CLet(freshName(l, "seq"), value.ty, value,
-                                          after, Array.new(0)))
+                                          after, []))
     }
     let name = freshName(l, "bind")
     let valueName = freshName(l, "bv")
@@ -2019,11 +2006,11 @@ fun seqThen(l : Lowerer, e : Expr, scope : Scope, after : Core) -> Core {
 -- A statement sequence one of whose statements holds a transfer. The same shape
 -- as an ordinary block, with the value of the last statement reaching `k` and
 -- every earlier one still a binding around what follows it.
-fun convBlock(l : Lowerer, stmts : Array Stmt, ty : Ty.Type, where : Option Span,
+fun convBlock(l : Lowerer, stmts : Vec Stmt, ty : Ty.Type, where : Option Span,
               scope : Scope, k : Option String) -> Core =
     convBlockFrom(l, stmts, 0, ty, where, scope, k)
 
-fun convBlockFrom(l : Lowerer, stmts : Array Stmt, from : Int, ty : Ty.Type,
+fun convBlockFrom(l : Lowerer, stmts : Vec Stmt, from : Int, ty : Ty.Type,
                   where : Option Span, scope : Scope, k : Option String) -> Core {
     if from >= len(stmts) { return finish(l, node(ty, where, CUnit), k) }
     let head = stmts[from]
@@ -2041,20 +2028,17 @@ fun convBlockFrom(l : Lowerer, stmts : Array Stmt, from : Int, ty : Ty.Type,
             while last + 1 < len(stmts) && isFun(stmts[last + 1]) {
                 last = last + 1
             }
-            let group = Array.slice(stmts, from, last + 1)
+            let group = Vec.slice(stmts, from, last + 1)
             for stmt in group {
                 match stmt.kind {
                     SFun(d) -> Map.put(scope.binders, d.name, funBinders(l, d))
                     _ -> {}
                 }
             }
-            let binds = Array.new(len(group))
-            for stmt in group {
-                match stmt.kind {
-                    SFun(d) -> Array.push(binds, localFun(l, d, scope))
-                    _ -> {}
-                }
-            }
+            let binds = Vec.map(group, fun(stmt) = match stmt.kind {
+                SFun(d) -> localFun(l, d, scope)
+                _ -> oops("a statement among a group of functions", where)
+            })
             node(ty, where, CLetRec(binds,
                 convBlockFrom(l, stmts, last + 1, ty, where, scope, k)))
         }
@@ -2117,7 +2101,7 @@ fun convBind(l : Lowerer, stmt : Stmt, rest : fun() -> Core, ty : Ty.Type,
             }
             discard(Map.delete(l.placeholders, src.id))
             let after = node(ty, at, CLet(freshName(l, "seq"), made.ty, made,
-                                          rest(), Array.new(0)))
+                                          rest(), []))
             node(ty, at, CJoin(name, [CParam { name = valueName, ty = held }],
                 after, conv(l, src, scope, Some(name)), False))
         }
@@ -2142,13 +2126,13 @@ fun convBindName(l : Lowerer, stmt : Stmt, pat : Pat, src : Expr, held : Ty.Type
     -- under whatever this binding did to the scope -- a `var` becomes a cell,
     -- and every mention of it after this point has to be a read of that cell.
     let value = conv(l, src, scope, Some(joined))
-    Map.put(scope.binders, name, Array.new(0))
+    Map.put(scope.binders, name, [])
     let body = if mutable {
         Set.add(scope.cells, name)
         let cell = node(refOf(held), at, CRef(heldVar))
-        node(ty, at, CLet(name, cell.ty, cell, rest(), Array.new(0)))
+        node(ty, at, CLet(name, cell.ty, cell, rest(), []))
     } else {
-        node(ty, at, CLet(name, held, heldVar, rest(), Array.new(0)))
+        node(ty, at, CLet(name, held, heldVar, rest(), []))
     }
     node(ty, at, CJoin(joined, [CParam { name = valueName, ty = held }],
                        body, value, False))
@@ -2161,10 +2145,10 @@ fun convBindName(l : Lowerer, stmt : Stmt, pat : Pat, src : Expr, held : Ty.Type
 -- The value of a block is its last statement's, and every earlier one is a
 -- binding -- of the name it introduces, or of a name nothing reads. `{ }` is
 -- `()`.
-fun block(l : Lowerer, stmts : Array Stmt, ty : Ty.Type, where : Option Span,
+fun block(l : Lowerer, stmts : Vec Stmt, ty : Ty.Type, where : Option Span,
           scope : Scope) -> Core = blockFrom(l, stmts, 0, ty, where, scope)
 
-fun blockFrom(l : Lowerer, stmts : Array Stmt, from : Int, ty : Ty.Type,
+fun blockFrom(l : Lowerer, stmts : Vec Stmt, from : Int, ty : Ty.Type,
               where : Option Span, scope : Scope) -> Core {
     if from >= len(stmts) { return node(ty, where, CUnit) }
     let head = stmts[from]
@@ -2177,7 +2161,7 @@ fun blockFrom(l : Lowerer, stmts : Array Stmt, from : Int, ty : Ty.Type,
             while last + 1 < len(stmts) && isFun(stmts[last + 1]) {
                 last = last + 1
             }
-            let group = Array.slice(stmts, from, last + 1)
+            let group = Vec.slice(stmts, from, last + 1)
             -- Registered before any body is lowered, so a member calling itself
             -- or a sibling finds the group's binders.
             for stmt in group {
@@ -2186,13 +2170,10 @@ fun blockFrom(l : Lowerer, stmts : Array Stmt, from : Int, ty : Ty.Type,
                     _ -> {}
                 }
             }
-            let binds = Array.new(len(group))
-            for stmt in group {
-                match stmt.kind {
-                    SFun(d) -> Array.push(binds, localFun(l, d, scope))
-                    _ -> {}
-                }
-            }
+            let binds = Vec.map(group, fun(stmt) = match stmt.kind {
+                SFun(d) -> localFun(l, d, scope)
+                _ -> oops("a statement among a group of functions", where)
+            })
             node(ty, where, CLetRec(binds,
                 blockFrom(l, stmts, last + 1, ty, where, scope)))
         }
@@ -2206,10 +2187,10 @@ fun blockFrom(l : Lowerer, stmts : Array Stmt, from : Int, ty : Ty.Type,
     }
 }
 
-fun funBinders(l : Lowerer, decl : FunDecl) -> Array VarCell =
+fun funBinders(l : Lowerer, decl : FunDecl) -> Vec VarCell =
     match localScheme(l, decl) {
         Some(s) -> s.quantified
-        None -> Array.new(0)
+        None -> []
     }
 
 -- A `fun` bound inside a body, with whatever it generalized over.
@@ -2225,7 +2206,7 @@ fun localFun(l : Lowerer, decl : FunDecl, scope : Scope) -> CBind {
         -- local was inferred against that signature's skolems, and a constant
         -- `k` left in its type survives specialization.
         Some(sc) -> (resolved(l, sc.body), sc.quantified)
-        None -> (rigidly(l, declType(l, decl)), Array.new(0))
+        None -> (rigidly(l, declType(l, decl)), [])
     }
     let dicts = abstractionOf(l, decl.id)
     let b = newBind(decl.name, abstracted(l, fnTy, dicts), binders,
@@ -2268,7 +2249,7 @@ fun bind(l : Lowerer, stmt : Stmt, rest : fun() -> Core, ty : Ty.Type,
             let value = expr(l, e, scope)
             let body = rest()
             node(body.ty, at, CLet(freshName(l, "seq"), value.ty, value, body,
-                                   Array.new(0)))
+                                   []))
         }
         SLet(pat, value) -> bindPattern(l, stmt, pat, value, False, rest, scope)
         SVar(pat, value) -> bindPattern(l, stmt, pat, value, True, rest, scope)
@@ -2276,7 +2257,7 @@ fun bind(l : Lowerer, stmt : Stmt, rest : fun() -> Core, ty : Ty.Type,
             let lowered = assign(l, stmt, target, value, scope)
             let body = rest()
             node(body.ty, at, CLet(freshName(l, "seq"), lowered.ty, lowered,
-                                   body, Array.new(0)))
+                                   body, []))
         }
         SFun(d) -> {
             Map.put(scope.binders, d.name, funBinders(l, d))
@@ -2307,7 +2288,7 @@ fun bindPattern(l : Lowerer, stmt : Stmt, pat : Pat, source : Expr,
         PWild -> {
             let body = rest()
             node(body.ty, at, CLet(freshName(l, "seq"), value.ty, value, body,
-                                   Array.new(0)))
+                                   []))
         }
         -- A destructuring binding is a one-armed match, which is what it is.
         _ -> {
@@ -2326,35 +2307,35 @@ fun celled(l : Lowerer, pat : Pat, body : Expr, lower : fun(Scope) -> Core,
            scope : Scope, where : Option Span) -> Core {
     let types = Typed.ofPattern(l.types, pat)
     let written = assignedIn(ChExpr(body))
-    let here = Array.new(2)
+    let here = Vec.new(2)
     for name in Map.keys(types) {
-        if Set.contains(written, name) { Array.push(here, name) }
+        if Set.contains(written, name) { Vec.push(here, name) }
     }
     if len(here) == 0 { return lower(scope) }
     let inner = childScope(scope)
     for name in here { Set.add(inner.cells, name) }
     var out = lower(inner)
-    for name in Array.reverse(Array.sort(here)) {
+    for name in Vec.reverse(Vec.sort(here)) {
         let ty = rigidly(l, Map.getOr(types, name, TBottom))
         out = node(out.ty, where, CLet(name, refOf(ty),
             node(refOf(ty), where, CRef(node(ty, where, CVar(name)))),
-            out, Array.new(0)))
+            out, []))
     }
     out
 }
 
 -- What a local `let` generalized over, if it generalized.
-fun letBinders(l : Lowerer, stmt : Stmt, pat : Pat) -> Array VarCell {
+fun letBinders(l : Lowerer, stmt : Stmt, pat : Pat) -> Vec VarCell {
     let bare = unannot(pat)
     let name = match bare.kind {
         PVar(n) -> n
-        _ -> return Array.new(0)
+        _ -> return []
     }
     match abstractionOf(l, stmt.id) {
-        None -> Array.new(0)
+        None -> []
         Some(a) -> match Map.get(a.schemes, name) {
             Some(s) -> s.quantified
-            None -> Array.new(0)
+            None -> []
         }
     }
 }
@@ -2387,7 +2368,7 @@ fun forInit(l : Lowerer, stmt : Stmt, pat : Pat, source : Expr, mutable : Bool,
         value = node(refOf(value.ty), at, CRef(value))
     }
     node(value.ty, at, CLet(name, value.ty, value,
-                            node(value.ty, at, CVar(name)), Array.new(0)))
+                            node(value.ty, at, CVar(name)), []))
 }
 
 fun assign(l : Lowerer, stmt : Stmt, target : Expr, source : Expr,
@@ -2426,13 +2407,13 @@ fun assign(l : Lowerer, stmt : Stmt, target : Expr, source : Expr,
 -- The equalities a scheme's context states, as rewrite rules. The shape is
 -- already guaranteed: a family application on the left, not mentioning itself on
 -- the right, so the pair can be used as a rule exactly as reduction uses it.
-fun equationsOf(s : Option Scheme) -> Array (Ty.Type, Ty.Type) = match s {
-    None -> Array.new(0)
+fun equationsOf(s : Option Scheme) -> Vec (Ty.Type, Ty.Type) = match s {
+    None -> []
     Some(sc) -> {
-        let out = Array.new(2)
+        let out = Vec.new(2)
         for p in sc.preds {
             if p.name == Ty.equals && len(p.args) == 2 {
-                Array.push(out, (p.args[0], p.args[1]))
+                Vec.push(out, (p.args[0], p.args[1]))
             }
         }
         out
@@ -2440,12 +2421,12 @@ fun equationsOf(s : Option Scheme) -> Array (Ty.Type, Ty.Type) = match s {
 }
 
 -- What a name abstracts over, local bindings before top-level ones.
-fun bindersOf(l : Lowerer, name : String, scope : Scope) -> Array VarCell =
+fun bindersOf(l : Lowerer, name : String, scope : Scope) -> Vec VarCell =
     match Map.get(scope.binders, name) {
         Some(local) -> local
         None -> match schemeOf(l, name) {
             Some(s) -> s.quantified
-            None -> Array.new(0)
+            None -> []
         }
     }
 
@@ -2570,11 +2551,11 @@ fun assignedInto(c : Child, out : Set.Set String) -> Unit {
 -- field order. A node absent from this table cannot be A-normalized, and a
 -- transfer inside one is declined rather than guessed at -- including `&&` and
 -- `||`, whose right operand is not unconditionally evaluated.
-fun operands(e : Expr) -> Option (Array Expr) = match e.kind {
-    ECall(fn, args) -> Some(Array.append([fn], args))
+fun operands(e : Expr) -> Option (Vec Expr) = match e.kind {
+    ECall(fn, args) -> Some(Vec.append([fn], args))
     ETuple(elems) -> Some(elems)
     EArray(elems) -> Some(elems)
-    ERecord(_, fields) -> Some(Array.map(fields, fun(f) = {
+    ERecord(_, fields) -> Some(Vec.map(fields, fun(f) = {
         let (_, v) = f
         v
     }))

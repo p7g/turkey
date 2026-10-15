@@ -156,18 +156,18 @@ type CoreKind
     -- used as binders directly -- a variable is already a distinct identity, and
     -- reusing the scheme's means the type arguments a use site recorded line up
     -- with no separate agreement to keep.
-    | CTyLam(Array VarCell, Core)
+    | CTyLam(Vec VarCell, Core)
     | CTyApp(Core, Array Ty.Type)
     -- `let name : ty = value in body`. The only sequencing form there is. The
     -- name may be one nothing reads, which is how a statement whose value is
     -- discarded is expressed. A `let` generalizes, so a local binding may be
     -- polymorphic and its uses may be type applications.
-    | CLet(String, Ty.Type, Core, Core, Array VarCell)
+    | CLet(String, Ty.Type, Core, Core, Vec VarCell)
     -- A binding group that may refer to itself and to its siblings. One form for
     -- the whole group rather than one per name, because that is what a
     -- strongly-connected component is and what the dictionary abstraction is
     -- shared over.
-    | CLetRec(Array CBind, Core)
+    | CLetRec(Vec CBind, Core)
     -- `join j(params) = body in rest` -- a label, not a function.
     --
     -- A join point is a `let`-bound continuation that is only ever *jumped* to:
@@ -185,7 +185,7 @@ type CoreKind
     -- `jump j(args)`. Typed `!`: it never yields to its context, which is why it
     -- needs no type of its own beyond bottom, and why a branch that jumps stays
     -- compatible with a branch that does not.
-    | CJump(String, Array Core)
+    | CJump(String, Vec Core)
     -- Make a reference cell. What a `var` binding is.
     | CRef(Core)
     -- Read a reference cell. What a mention of a `var` is.
@@ -197,7 +197,7 @@ type CoreKind
     | CIf(Core, Core, Option Core)
     -- Pattern matching, one level at a time; see `Alt`. Exhaustiveness has
     -- decided about the source patterns before this point.
-    | CMatch(Core, Array CAlt)
+    | CMatch(Core, Vec CAlt)
 
 -- One top-level binding, with the type variables it abstracts over.
 --
@@ -208,7 +208,7 @@ type CoreKind
 type CBind = CBind {
     var name      : String,
     var ty        : Ty.Type,
-    binders       : Array VarCell,
+    binders       : Vec VarCell,
     value         : Core,
     span          : Option Span,
     var mutable   : Bool,
@@ -219,7 +219,7 @@ type CBind = CBind {
     -- evidence -- nothing is passed for them, and they are erased at run time --
     -- but they are *facts the body was checked under*, and a family over a rigid
     -- variable does not reduce without them.
-    var equations : Array (Ty.Type, Ty.Type),
+    var equations : Vec (Ty.Type, Ty.Type),
     -- The layout of each type this binding is compiled under that its parts do
     -- not decide -- an abstracted variable, `Item t`, `f a`, a local copy's
     -- variables -- keyed by `Ty.typeKey`. `Turkey.Layout` fills it; see its
@@ -231,8 +231,8 @@ type CBind = CBind {
 
 -- A whole program: the dictionaries, then the bindings, in run order.
 type CProgram = CProgram {
-    dicts : Array CBind,
-    binds : Array CBind,
+    dicts : Vec CBind,
+    binds : Vec CBind,
 }
 
 -- Which subterms are **tail positions**: the places a jump may stand, because
@@ -256,7 +256,7 @@ fun tailFieldNames(k : CoreKind) -> Array String = match k {
     CLetRec(_, _) -> ["body"]
     CJoin(_, _, _, _, _) -> ["body", "rest"]
     CMatch(_, _) -> ["alts"]
-    _ -> Array.new(0)
+    _ -> []
 }
 
 fun tailParts(k : CoreKind) -> Array Core = match k {
@@ -268,7 +268,7 @@ fun tailParts(k : CoreKind) -> Array Core = match k {
     CLetRec(_, body) -> [body]
     CJoin(_, _, body, rest, _) -> [body, rest]
     CMatch(_, alts) -> Array.map(alts, _.body)
-    _ -> Array.new(0)
+    _ -> []
 }
 
 -- -- rebuilding ---------------------------------------------------------------------
@@ -313,12 +313,12 @@ fun mapKind(k : CoreKind, m : Mapper) -> CoreKind = match k {
     CTyApp(fn, args) -> CTyApp(m.expr(fn), Array.map(args, m.type_))
     CLet(name, bound, value, body, binders) ->
         CLet(name, m.type_(bound), m.expr(value), m.expr(body), binders)
-    CLetRec(binds, body) -> CLetRec(Array.map(binds, m.bind), m.expr(body))
+    CLetRec(binds, body) -> CLetRec(Vec.map(binds, m.bind), m.expr(body))
     CJoin(name, params, body, rest, recursive) ->
         CJoin(name, Array.map(params, fun(p) =
             CParam { name = p.name, ty = m.type_(p.ty) }),
             m.expr(body), m.expr(rest), recursive)
-    CJump(name, args) -> CJump(name, Array.map(args, m.expr))
+    CJump(name, args) -> CJump(name, Vec.map(args, m.expr))
     CRef(value) -> CRef(m.expr(value))
     CDeref(target) -> CDeref(m.expr(target))
     CAssign(target, value) -> CAssign(m.expr(target), m.expr(value))
@@ -328,7 +328,7 @@ fun mapKind(k : CoreKind, m : Mapper) -> CoreKind = match k {
             None -> None
         })
     CMatch(scrutinee, alts) -> CMatch(m.expr(scrutinee),
-        Array.map(alts, fun(a) = CAlt { alt = a.alt, body = m.expr(a.body) }))
+        Vec.map(alts, fun(a) = CAlt { alt = a.alt, body = m.expr(a.body) }))
 }
 
 -- The term a binding holds, and the term an arm holds, each taken apart with a
@@ -399,16 +399,16 @@ fun isDictionary(ty : Ty.Type) -> Bool = Option.isSome(dictClass(ty))
 --
 -- Both are `forall`, and the use site applies types to both the same way, so a
 -- pass that asks what a binding abstracts over wants them together.
-fun abstractionBinders(b : CBind) -> Array VarCell {
-    let out = Array.new(len(b.binders) + 2)
-    for v in b.binders { Array.push(out, v) }
+fun abstractionBinders(b : CBind) -> Vec VarCell {
+    let out = Vec.new(len(b.binders) + 2)
+    for v in b.binders { Vec.push(out, v) }
     var value = b.value
     var going = True
     while going {
         match value.kind {
             CLam(_, body, _) -> { value = body }
             CTyLam(vs, body) -> {
-                for v in vs { Array.push(out, v) }
+                for v in vs { Vec.push(out, v) }
                 value = body
             }
             _ -> { going = False }
@@ -554,13 +554,13 @@ fun alias(a : Aliases, name : String) -> String {
 -- and anything from the first `.` onwards is the suffix and is kept.
 fun generatedParts(name : String) -> Option (String, String) {
     let cs = String.codePoints(name)
-    let chars = Array.new(String.byteLength(name))
-    for c in cs { Array.push(chars, c) }
+    let chars = Vec.new(String.byteLength(name))
+    for c in cs { Vec.push(chars, c) }
     if len(chars) == 0 || chars[0] != '%' { return None }
     var i = 1
-    let hint = Array.new(8)
+    let hint = Vec.new(8)
     while i < len(chars) && Char.isAsciiAlpha(chars[i]) {
-        Array.push(hint, chars[i])
+        Vec.push(hint, chars[i])
         i = i + 1
     }
     if len(hint) == 0 { return None }
@@ -570,7 +570,7 @@ fun generatedParts(name : String) -> Option (String, String) {
     if i == len(chars) { return Some((String.fromCodePoints(hint), "")) }
     if chars[i] != '.' { return None }
     Some((String.fromCodePoints(hint),
-          String.fromCodePoints(Array.slice(chars, i, len(chars)))))
+          String.fromCodePoints(Vec.slice(chars, i, len(chars)))))
 }
 
 fun pad(indent : Int) -> String = String.repeat("  ", indent)
@@ -592,13 +592,13 @@ fun showExpr(e : Core, indent : Int, n : Namer, a : Aliases) -> String {
         CArray(elems) -> p + "[" + String.join(flatEach(elems, n, a), ", ") + "]"
         CDict(cls, slots) -> {
             if len(slots) == 0 { return p + dictName(cls) + " {}" }
-            let out = Array.new(len(slots) * 2 + 2)
-            Array.push(out, p + dictName(cls) + " {")
+            let out = Vec.new(len(slots) * 2 + 2)
+            Vec.push(out, p + dictName(cls) + " {")
             for var i = 0; i < len(slots); i = i + 1 {
-                Array.push(out, p + "  " + a.slotName(cls, i) + " =")
-                Array.push(out, showExpr(slots[i], indent + 2, n, a))
+                Vec.push(out, p + "  " + a.slotName(cls, i) + " =")
+                Vec.push(out, showExpr(slots[i], indent + 2, n, a))
             }
-            Array.push(out, p + "}")
+            Vec.push(out, p + "}")
             String.join(out, "\n")
         }
         CSlot(target, index) -> {
@@ -638,18 +638,18 @@ fun showExpr(e : Core, indent : Int, n : Namer, a : Aliases) -> String {
               + showExpr(body, indent, n, a)
         }
         CLetRec(binds, body) -> {
-            let out = Array.new(len(binds) * 2 + 2)
-            Array.push(out, p + "letrec")
+            let out = Vec.new(len(binds) * 2 + 2)
+            Vec.push(out, p + "letrec")
             for b in binds {
                 let forall = if len(b.binders) == 0 { "" } else {
                     " forall " + String.join(Array.map(b.binders,
                         \Ty.showAt(TVar(_), n, 0)), " ") + "."
                 }
-                Array.push(out, p + "  " + alias(a, b.name) + " :" + forall + " "
+                Vec.push(out, p + "  " + alias(a, b.name) + " :" + forall + " "
                                 + Ty.showAt(b.ty, n, 0) + " =")
-                Array.push(out, showExpr(b.value, indent + 2, n, a))
+                Vec.push(out, showExpr(b.value, indent + 2, n, a))
             }
-            Array.push(out, showExpr(body, indent, n, a))
+            Vec.push(out, showExpr(body, indent, n, a))
             String.join(out, "\n")
         }
         CJoin(name, params, body, rest, recursive) -> {
@@ -679,37 +679,37 @@ fun showExpr(e : Core, indent : Int, n : Namer, a : Aliases) -> String {
         CIf(cond, then, otherwise) -> {
             -- Rendered once, at its indent as a block; see `call`.
             let c = showExpr(cond, indent + 1, n, a)
-            let out = Array.new(6)
+            let out = Vec.new(6)
             -- A condition that is itself a block -- which is what `&&` lowers to,
             -- and what inlining leaves behind. Flat, it would put a `let` at
             -- column zero between the `if` and its brace.
             if String.contains(c, "\n") {
-                Array.push(out, p + "if")
-                Array.push(out, c)
-                Array.push(out, p + "{")
-                Array.push(out, showExpr(then, indent + 1, n, a))
+                Vec.push(out, p + "if")
+                Vec.push(out, c)
+                Vec.push(out, p + "{")
+                Vec.push(out, showExpr(then, indent + 1, n, a))
             } else {
-                Array.push(out, p + "if " + String.trim(c) + " {")
-                Array.push(out, showExpr(then, indent + 1, n, a))
+                Vec.push(out, p + "if " + String.trim(c) + " {")
+                Vec.push(out, showExpr(then, indent + 1, n, a))
             }
             match otherwise {
                 Some(o) -> {
-                    Array.push(out, p + "} else {")
-                    Array.push(out, showExpr(o, indent + 1, n, a))
+                    Vec.push(out, p + "} else {")
+                    Vec.push(out, showExpr(o, indent + 1, n, a))
                 }
                 None -> {}
             }
-            Array.push(out, p + "}")
+            Vec.push(out, p + "}")
             String.join(out, "\n")
         }
         CMatch(scrutinee, alts) -> {
-            let out = Array.new(len(alts) * 2 + 2)
-            Array.push(out, p + "match " + flat(scrutinee, n, a) + " {")
+            let out = Vec.new(len(alts) * 2 + 2)
+            Vec.push(out, p + "match " + flat(scrutinee, n, a) + " {")
             for alt in alts {
-                Array.push(out, p + "  " + showAlt(alt.alt, a) + " ->")
-                Array.push(out, showExpr(alt.body, indent + 2, n, a))
+                Vec.push(out, p + "  " + showAlt(alt.alt, a) + " ->")
+                Vec.push(out, showExpr(alt.body, indent + 2, n, a))
             }
-            Array.push(out, p + "}")
+            Vec.push(out, p + "}")
             String.join(out, "\n")
         }
     }
@@ -728,8 +728,8 @@ fun flatEach(es : Array Core, n : Namer, a : Aliases) -> Array String =
 -- An argument that spans lines -- a lambda, since that is what a `?` makes of
 -- the rest of a block, or a `let` chain, since that is what inlining makes of a
 -- call -- gets a line of its own, indented under the call.
-fun call(fn : Option Core, name : String, args : Array Core, indent : Int,
-         n : Namer, a : Aliases) -> String {
+fun call[Iterator c, Length c, Item c ~ Core](fn : Option Core, name : String, args : c,
+                                              indent : Int, n : Namer, a : Aliases) -> String {
     let p = pad(indent)
     -- Arguments before the head, which matters: type variables are numbered in
     -- the order they are met, so rendering the two the other way round renames
@@ -751,13 +751,13 @@ fun call(fn : Option Core, name : String, args : Array Core, indent : Int,
     if !multiline {
         return p + head + "(" + String.join(Array.map(rendered, String.trim), ", ") + ")"
     }
-    let out = Array.new(len(args) + 2)
-    Array.push(out, p + head + "(")
+    let out = Vec.new(len(args) + 2)
+    Vec.push(out, p + head + "(")
     for var i = 0; i < len(args); i = i + 1 {
         let tail = if i < len(args) - 1 { "," } else { "" }
-        Array.push(out, rendered[i] + tail)
+        Vec.push(out, rendered[i] + tail)
     }
-    Array.push(out, p + ")")
+    Vec.push(out, p + ")")
     String.join(out, "\n")
 }
 
@@ -780,19 +780,19 @@ fun showBinder(binder : Option String, a : Aliases) -> String = match binder {
 
 -- The names an arm binds: its binders, and the dictionaries an opening
 -- brings into scope.
-fun altVars(alt : Alt) -> Array String {
+fun altVars(alt : Alt) -> Vec String {
     let out = []
     match alt {
         ACon(_, fields, opening) -> {
             match opening {
-                Some(o) -> for d in o.evidence { Array.push(out, d) }
+                Some(o) -> for d in o.evidence { Vec.push(out, d) }
                 None -> {}
             }
-            for f in fields { if let Some(n) = f { Array.push(out, n) } }
+            for f in fields { if let Some(n) = f { Vec.push(out, n) } }
         }
-        ATuple(elems) -> for f in elems { if let Some(n) = f { Array.push(out, n) } }
+        ATuple(elems) -> for f in elems { if let Some(n) = f { Vec.push(out, n) } }
         ALit(_) -> {}
-        AAny(binder) -> if let Some(n) = binder { Array.push(out, n) }
+        AAny(binder) -> if let Some(n) = binder { Vec.push(out, n) }
     }
     out
 }
@@ -840,28 +840,28 @@ fun showBind(b : CBind, slotName : fun(String, Int) -> String) -> String {
 -- `slotName` names a dictionary's slots, which the program holds by position.
 fun showProgram(program : CProgram, owner : Option String,
                 slotName : fun(String, Int) -> String) -> String {
-    let out = Array.new(32)
+    let out = Vec.new(32)
     showGroup(out, program.dicts, "dictionaries", owner, slotName)
     showGroup(out, program.binds, "bindings", owner, slotName)
     String.trimEnd(String.join(out, "\n")) + "\n"
 }
 
-fun showGroup(out : Array String, group : Array CBind, title : String,
+fun showGroup(out : Vec String, group : Vec CBind, title : String,
               owner : Option String,
               slotName : fun(String, Int) -> String) -> Unit {
-    let chosen = Array.new(len(group))
+    let chosen = Vec.new(len(group))
     for b in group {
         let keep = match owner {
             None -> True
             Some(m) -> b.module_ == m
         }
-        if keep { Array.push(chosen, b) }
+        if keep { Vec.push(chosen, b) }
     }
     if len(chosen) == 0 { return {} }
-    Array.push(out, "-- " + title)
+    Vec.push(out, "-- " + title)
     for b in chosen {
-        Array.push(out, showBind(b, slotName))
-        Array.push(out, "")
+        Vec.push(out, showBind(b, slotName))
+        Vec.push(out, "")
     }
 }
 

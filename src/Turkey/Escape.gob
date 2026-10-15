@@ -69,29 +69,29 @@ type Summary = Summary { self : Array Bool, contents : Array Bool }
 -- One function's flow graph, which the summaries do not change.
 type Graph = Graph {
     -- The values each value may be: a phi's arguments, a conversion's source.
-    sources : Array (Array Int),
+    sources : Array (Vec Int),
     -- The object a load read from, or -1.
     loadedFrom : Array Int,
     -- What an allocation was built holding.
     held : Array (Array Int),
     -- Values that escape whatever the summaries say.
-    sinks : Array Int,
+    sinks : Vec Int,
     -- Direct calls, and closures built over known code.
-    calls : Array (String, Array Int),
-    closures : Array (String, Int),
+    calls : Vec (String, Array Int),
+    closures : Vec (String, Int),
     -- Allocation sites that could live in the frame: position, value, and the
     -- frame bytes it would take, its header included (`Turkey.Frame.layout`).
-    sites : Array (Int, Int, Int, Int),
+    sites : Vec (Int, Int, Int, Int),
     -- Per site, whether its block is on a cycle: only such a site can run
     -- again while its last object is reachable.
-    cyclic : Array Bool,
+    cyclic : Vec Bool,
 }
 
 -- One function's answer under the current summaries.
 type Flow = Flow {
     escapes : Array Bool,
     contents : Array Bool,
-    work : Array Int,
+    work : Vec Int,
 }
 
 -- Rewrite every allocation that does not escape into its frame form.
@@ -124,7 +124,7 @@ fun run(functions : Array (Ssa.Func Low), keep : fun(String) -> Bool) -> Unit {
     let lives : Array (Option Live) = Array.filled(len(functions), None)
     let queued = Array.filled(len(functions), True)
     let work = []
-    for var k = 0; k < len(functions); k = k + 1 { Array.push(work, k) }
+    for var k = 0; k < len(functions); k = k + 1 { Vec.push(work, k) }
     for var w = 0; w < len(work); w = w + 1 {
         let k = work[w]
         queued[k] = False
@@ -133,7 +133,7 @@ fun run(functions : Array (Ssa.Func Low), keep : fun(String) -> Bool) -> Unit {
             for reader in Set.elements(readers[k]) {
                 if !queued[reader] {
                     queued[reader] = True
-                    Array.push(work, reader)
+                    Vec.push(work, reader)
                 }
             }
         }
@@ -169,17 +169,17 @@ fun grow(s : Summary, f : Ssa.Func Low, escapes : Array Bool,
 fun graphOf(f : Ssa.Func Low) -> Graph {
     let n = len(f.reps)
     let g = Graph {
-        sources = Array.map(f.reps, fun(_) = []),
+        sources = Array.init(n, fun(_) = []),
         loadedFrom = Array.filled(n, -1),
-        held = Array.map(f.reps, fun(_) = []),
+        held = Array.init(n, fun(_) = []),
         sinks = [], calls = [], closures = [], sites = [], cyclic = [],
     }
     let traced = fun(v : Value) -> Bool { Ssa.repOf(f, v).traced }
     let sink = fun(v : Value) -> Unit {
-        if traced(v) { Array.push(g.sinks, Ssa.valueId(v)) }
+        if traced(v) { Vec.push(g.sinks, Ssa.valueId(v)) }
     }
     let from = fun(r : Value, v : Value) -> Unit {
-        Array.push(g.sources[Ssa.valueId(r)], Ssa.valueId(v))
+        Vec.push(g.sources[Ssa.valueId(r)], Ssa.valueId(v))
     }
     for var b = 0; b < len(f.blocks); b = b + 1 {
         let block = f.blocks[b]
@@ -201,7 +201,7 @@ fun graphOf(f : Ssa.Func Low) -> Graph {
                 Convert(_, a) -> if traced(r) { from(r, a) } else { sink(a) }
                 ObjectNew(_, _, _, fields, _) -> {
                     g.held[id] = Array.map(fields, Ssa.valueId)
-                    Array.push(g.sites, (b, at, id, 48 + 8 * len(fields)))
+                    Vec.push(g.sites, (b, at, id, 48 + 8 * len(fields)))
                 }
                 StackObject(_, _, _, fields) -> { g.held[id] = Array.map(fields, Ssa.valueId) }
                 ObjectGet(o, _) -> { g.loadedFrom[id] = Ssa.valueId(o) }
@@ -224,22 +224,22 @@ fun graphOf(f : Ssa.Func Low) -> Graph {
                     match environment {
                         Some(e) -> {
                             g.held[id] = [Ssa.valueId(e)]
-                            Array.push(g.closures, (code, Ssa.valueId(e)))
+                            Vec.push(g.closures, (code, Ssa.valueId(e)))
                         }
                         None -> {}
                     }
-                    Array.push(g.sites, (b, at, id, 64))
+                    Vec.push(g.sites, (b, at, id, 64))
                 }
                 StackClosure(code, environment) -> match environment {
                     Some(e) -> {
                         g.held[id] = [Ssa.valueId(e)]
-                        Array.push(g.closures, (code, Ssa.valueId(e)))
+                        Vec.push(g.closures, (code, Ssa.valueId(e)))
                     }
                     None -> {}
                 }
                 ClosureCapture(_, _, v) -> sink(v)
                 Call(Direct(name), args) ->
-                    Array.push(g.calls, (name, Array.map(args, Ssa.valueId)))
+                    Vec.push(g.calls, (name, Array.map(args, Ssa.valueId)))
                 -- The closure called is not among the arguments: see the
                 -- header.
                 Call(_, args) -> for a in args { sink(a) }
@@ -272,7 +272,7 @@ fun graphOf(f : Ssa.Func Low) -> Graph {
                 c
             }
         }
-        Array.push(g.cyclic, cyclic)
+        Vec.push(g.cyclic, cyclic)
     }
     g
 }
@@ -280,9 +280,10 @@ fun graphOf(f : Ssa.Func Low) -> Graph {
 -- Whether block `b` can be reached again from its own successors.
 fun reachesItself(f : Ssa.Func Low, b : Int) -> Bool {
     let seen = Set.new()
-    let stack = Array.map(Ssa.successors(f.blocks[b].term), Ssa.blockId)
+    let stack = []
+    for s in Ssa.successors(f.blocks[b].term) { Vec.push(stack, Ssa.blockId(s)) }
     while len(stack) > 0 {
-        let here = match Array.pop(stack) {
+        let here = match Vec.pop(stack) {
             Some(x) -> x
             None -> return False
         }
@@ -290,7 +291,7 @@ fun reachesItself(f : Ssa.Func Low, b : Int) -> Bool {
         if !Set.contains(seen, here) {
             Set.add(seen, here)
             for next in Ssa.successors(f.blocks[here].term) {
-                Array.push(stack, Ssa.blockId(next))
+                Vec.push(stack, Ssa.blockId(next))
             }
         }
     }
@@ -395,14 +396,14 @@ fun decide(f : Ssa.Func Low, g : Graph, summaries : Array Summary,
 fun escape(flow : Flow, id : Int) -> Unit {
     if !flow.escapes[id] {
         flow.escapes[id] = True
-        Array.push(flow.work, 2 * id)
+        Vec.push(flow.work, 2 * id)
     }
 }
 
 fun leak(flow : Flow, id : Int) -> Unit {
     if !flow.contents[id] {
         flow.contents[id] = True
-        Array.push(flow.work, 2 * id + 1)
+        Vec.push(flow.work, 2 * id + 1)
     }
 }
 
@@ -412,7 +413,7 @@ fun leak(flow : Flow, id : Int) -> Unit {
 -- everything it was built holding escaping.
 fun settle(flow : Flow, g : Graph) -> Unit {
     while len(flow.work) > 0 {
-        let item = match Array.pop(flow.work) {
+        let item = match Vec.pop(flow.work) {
             Some(x) -> x
             None -> return
         }
@@ -434,7 +435,7 @@ fun settle(flow : Flow, g : Graph) -> Unit {
 
 -- Per allocation site, the values live just before it runs: what the frame
 -- still reaches when the site's slot is written again.
-type Live = Array (Array Int)
+type Live = Vec (Array Int)
 
 fun liveBefore(f : Ssa.Func Low, g : Graph) -> Live {
     let (_, out) = Ssa.livenessInOut(f)
@@ -452,7 +453,7 @@ fun liveBefore(f : Ssa.Func Low, g : Graph) -> Live {
         let before = Set.new()
         for v in after[at] { if v != id { Set.add(before, v) } }
         Ssa.eachUse(f.blocks[b].insts[at], fun(v) = Set.add(before, Ssa.valueId(v)))
-        Array.push(result, Set.elements(before))
+        Vec.push(result, Set.elements(before))
     }
     result
 }
@@ -493,8 +494,8 @@ fun reach(f : Ssa.Func Low, objects : Set.Set Int) -> Map Int (Set.Set Int) {
         Some(s) -> s
         None -> none
     }
-    let held : Map Int (Array Value) = Map.new()
-    let edges : Array (Value, Value) = []
+    let held : Map Int (Vec Value) = Map.new()
+    let edges : Vec (Value, Value) = []
     for block in f.blocks {
         for i in block.insts {
             let id = Ssa.valueId(i.result)
@@ -509,7 +510,7 @@ fun reach(f : Ssa.Func Low, objects : Set.Set Int) -> Map Int (Set.Set Int) {
             Jump(target, args) -> {
                 let params = Ssa.blockAt(f, target).params
                 for var k = 0; k < len(args) && k < len(params); k = k + 1 {
-                    Array.push(edges, (params[k], args[k]))
+                    Vec.push(edges, (params[k], args[k]))
                 }
             }
             _ -> {}

@@ -14,11 +14,11 @@ imports it, and it already provides:
 - every class -- `Eq`, `Ord`, `Show`, `Iterator`, `Index`, `Length`, `Monad`, …
 - `Bool(..)`, `Option(..)`, `Either(..)`, `Ordering(..)`, `Array`, `Map`
 - `print`, `write`, `show`, `len`, `error`, `hash`
-- every `Data.*` module under its own qualification: `Array.push`,
+- every `Data.*` module under its own qualification: `Vec.push`,
   `String.slice`, `Int.toString`, `Char.isDigit`, `Map.get`, `Option.map`
 
 So a module that lexes text needs **no imports at all**. Write `String.push`
-and `Array.new` and be done.
+and `Vec.new` and be done.
 
 `import Prelude ()` is for the standard library, which the Prelude itself
 depends on and therefore cannot import. A compiler module that writes it, and

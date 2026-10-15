@@ -214,11 +214,11 @@ fun derive(st : State, made : String, parent : String) -> Unit =
 -- may close over the enclosing binding's parameters. So it is specialized in
 -- place: one extra binding beside the original, per type it was used at.
 type Local = Local {
-    binders : Array VarCell,
+    binders : Vec VarCell,
     insts   : Map String (String, Array Ty.Type),
 }
 
-fun newLocal(binders : Array VarCell) -> Local =
+fun newLocal(binders : Vec VarCell) -> Local =
     Local { binders = binders, insts = Map.new() }
 
 -- -- the whole program, and the specializations asked of it -------------------------
@@ -238,8 +238,8 @@ type Mono = Mono {
     -- place one level up.
     topDicts   : Set.Set String,
     dictGroup  : Set.Set String,
-    made       : Map String (Array CBind),
-    queue      : Array (String, CBind, Array Ty.Type, Option (Array String)),
+    made       : Map String (Vec CBind),
+    queue      : Vec (String, CBind, Array Ty.Type, Option (Vec String)),
     used       : Set.Set String,
 }
 
@@ -248,7 +248,7 @@ fun newMono(program : CProgram, decls : DeclTable, classes : ClassTable,
     program = program, decls = decls, classes = classes, state = state,
     byname = Map.new(), generic = Map.new(), takesDicts = Set.new(),
     topDicts = Set.new(), dictGroup = Set.new(), made = Map.new(),
-    queue = Array.new(8), used = Set.new(),
+    queue = Vec.new(8), used = Set.new(),
 }
 
 -- One binding's body, rewritten under one substitution.
@@ -259,7 +259,7 @@ fun newMono(program : CProgram, decls : DeclTable, classes : ClassTable,
 type Rewriter = Rewriter {
     owner      : Mono,
     subst      : Map Int Ty.Type,
-    equations  : Array (Ty.Type, Ty.Type),
+    equations  : Vec (Ty.Type, Ty.Type),
     fams       : Ty.Families,
     var rename : Map String String,
     -- A local name that is nothing but another name for a top-level dictionary.
@@ -268,18 +268,18 @@ type Rewriter = Rewriter {
     -- instance is what the collapse has to see through, since the binding it
     -- hoists the application into cannot see a local name.
     aliases    : Map String String,
-    scopes     : Array (Map String Local),
+    scopes     : Vec (Map String Local),
 }
 
 fun newRewriter(owner : Mono, subst : Map Int Ty.Type,
-                equations : Array (Ty.Type, Ty.Type),
-                scopes : Option (Array (Map String Local))) -> Rewriter {
+                equations : Vec (Ty.Type, Ty.Type),
+                scopes : Option (Vec (Map String Local))) -> Rewriter {
     -- Substituted before the family reducer is built from them: a given
     -- `Item s ~ Op` becomes `Item (Array Int) ~ Op` under the specialization,
     -- and it is the substituted form that is a rewrite rule for the types in the
     -- body. Plain substitution and not the reducing one, since the reducing one
     -- is what this makes.
-    let eqs = Array.map(equations, fun(pair) = {
+    let eqs = Vec.map(equations, fun(pair) = {
         let (a, b) = pair
         (Decls.substitute(a, subst), Decls.substitute(b, subst))
     })
@@ -289,7 +289,7 @@ fun newRewriter(owner : Mono, subst : Map Int Ty.Type,
         rename = Map.new(), aliases = Map.new(),
         scopes = match scopes {
             Some(s) -> s
-            None -> Array.new(4)
+            None -> Vec.new(4)
         },
     }
 }
@@ -297,7 +297,7 @@ fun newRewriter(owner : Mono, subst : Map Int Ty.Type,
 -- A rewriter for a nested binding, sharing the local scopes so a specialized
 -- local body can still reach the locals around it.
 fun childRewriter(r : Rewriter, subst : Map Int Ty.Type,
-                  equations : Array (Ty.Type, Ty.Type)) -> Rewriter {
+                  equations : Vec (Ty.Type, Ty.Type)) -> Rewriter {
     let made = newRewriter(r.owner, subst, equations, Some(r.scopes))
     for (k, v) in Map.entries(r.aliases) { Map.put(made.aliases, k, v) }
     made
@@ -403,7 +403,7 @@ fun collapse(r : Rewriter, e : Core) -> Option Core = match e.kind {
 fun collapseApp(r : Rewriter, e : Core, fn : Core,
                 args : Array Core) -> Option Core {
     var head = fn
-    var targs = Array.new(0)
+    var targs = []
     match fn.kind {
         CTyApp(inner, ta) -> {
             targs = Array.map(ta, rTy(r, _))
@@ -427,7 +427,7 @@ fun collapseApp(r : Rewriter, e : Core, fn : Core,
     }
     if len(b.binders) != len(targs) || len(params) != len(args) { return None }
     let lowered = Array.map(args, rewrite(r, _))
-    let supplied = Array.new(len(lowered))
+    let supplied = Vec.new(len(lowered))
     for a in lowered {
         match globalDict(r, a) {
             -- A context this pass could not reduce to a *top-level* name -- a
@@ -435,7 +435,7 @@ fun collapseApp(r : Rewriter, e : Core, fn : Core,
             -- collapse hoists this application to the top level, so an argument
             -- that is not visible there cannot come along.
             None -> return None
-            Some(n) -> Array.push(supplied, n)
+            Some(n) -> Vec.push(supplied, n)
         }
     }
     let made = match request(r.owner, b, targs, Some(supplied)) {
@@ -490,7 +490,7 @@ fun argsKey(args : Array Ty.Type) -> String =
     String.join(Array.map(args, Ty.typeKey), "|")
 
 fun rewriteLet(r : Rewriter, e : Core, name : String, bound : Ty.Type,
-               value : Core, body : Core, binders : Array VarCell) -> Core {
+               value : Core, body : Core, binders : Vec VarCell) -> Core {
     if len(binders) == 0 {
         -- Written out rather than left to `generic`, because the alias has to be
         -- recorded between the value and the body: the value is what decides
@@ -506,19 +506,19 @@ fun rewriteLet(r : Rewriter, e : Core, name : String, bound : Ty.Type,
         if had { Map.put(r.aliases, name, saved) }
         else { discard(Map.delete(r.aliases, name)) }
         return mkCore(rTy(r, e.ty), e.span,
-                      CLet(name, rTy(r, bound), v, b, Array.new(0)))
+                      CLet(name, rTy(r, bound), v, b, []))
     }
     let local = newLocal(binders)
     let scope = Map.new()
     Map.put(scope, name, local)
-    Array.push(r.scopes, scope)
+    Vec.push(r.scopes, scope)
     let b = rewrite(r, body)
     let made = drain(r, local, binders, value)
-    discard(Array.pop(r.scopes))
+    discard(Vec.pop(r.scopes))
     var out = b
     for var i = len(made) - 1; i >= 0; i = i - 1 {
         let (n, v) = made[i]
-        out = mkCore(rTy(r, e.ty), e.span, CLet(n, v.ty, v, out, Array.new(0)))
+        out = mkCore(rTy(r, e.ty), e.span, CLet(n, v.ty, v, out, []))
     }
     -- The generic binding stays, outermost, so that a use this pass could not
     -- specialize -- a capped one, or one under a variable that is not this
@@ -531,15 +531,15 @@ fun rewriteLet(r : Rewriter, e : Core, name : String, bound : Ty.Type,
 
 -- Build every instantiation of one local binding, including the ones discovered
 -- while building the others.
-fun drain(r : Rewriter, local : Local, binders : Array VarCell,
-          value : Core) -> Array (String, Core) {
-    let out = Array.new(4)
+fun drain(r : Rewriter, local : Local, binders : Vec VarCell,
+          value : Core) -> Vec (String, Core) {
+    let out = Vec.new(4)
     let seen = Set.new()
     var going = True
     while going {
-        let todo = Array.new(4)
+        let todo = Vec.new(4)
         for (k, v) in Map.entries(local.insts) {
-            if !Set.contains(seen, k) { Array.push(todo, (k, v)) }
+            if !Set.contains(seen, k) { Vec.push(todo, (k, v)) }
         }
         if len(todo) == 0 { return out }
         for (key, made) in todo {
@@ -548,13 +548,13 @@ fun drain(r : Rewriter, local : Local, binders : Array VarCell,
             let sub = childRewriter(r, extended(r.subst, binders, args),
                                     r.equations)
             sub.rename = r.rename
-            Array.push(out, (name, rewrite(sub, value)))
+            Vec.push(out, (name, rewrite(sub, value)))
         }
     }
     out
 }
 
-fun extended(subst : Map Int Ty.Type, binders : Array VarCell,
+fun extended(subst : Map Int Ty.Type, binders : Vec VarCell,
              args : Array Ty.Type) -> Map Int Ty.Type {
     let out = Map.new()
     for (k, v) in Map.entries(subst) { Map.put(out, k, v) }
@@ -564,20 +564,20 @@ fun extended(subst : Map Int Ty.Type, binders : Array VarCell,
     out
 }
 
-fun rewriteLetRec(r : Rewriter, e : Core, binds : Array CBind,
+fun rewriteLetRec(r : Rewriter, e : Core, binds : Vec CBind,
                   body : Core) -> Core {
     let poly = Map.new()
     for b in binds {
         if len(b.binders) > 0 { Map.put(poly, b.name, newLocal(b.binders)) }
     }
     if len(Map.keys(poly)) == 0 { return generic(r, e) }
-    Array.push(r.scopes, poly)
+    Vec.push(r.scopes, poly)
     let rest = rewrite(r, body)
     -- The generic copies first, and for the reason a `let` keeps its original: a
     -- sibling or a capped call may still name them. Their own recursive calls are
     -- at their own binders, which are not ground, so nothing inside them
     -- specializes.
-    let out = Array.map(binds, rewriteBind(r, _))
+    let out = Vec.map(binds, rewriteBind(r, _))
     let pending = Map.new()
     for b in binds {
         if len(b.binders) > 0 { Map.put(pending, b.name, b) }
@@ -585,11 +585,11 @@ fun rewriteLetRec(r : Rewriter, e : Core, binds : Array CBind,
     let seen = Set.new()
     var going = True
     while going {
-        let todo = Array.new(4)
+        let todo = Vec.new(4)
         for (ownerName, local) in Map.entries(poly) {
             for (k, v) in Map.entries(local.insts) {
                 if !Set.contains(seen, ownerName + "|" + k) {
-                    Array.push(todo, (ownerName, k, v))
+                    Vec.push(todo, (ownerName, k, v))
                 }
             }
         }
@@ -605,15 +605,15 @@ fun rewriteLetRec(r : Rewriter, e : Core, binds : Array CBind,
                                     orig.equations)
             sub.rename = r.rename
             let b = CBind {
-                name = name, ty = rTy(sub, orig.ty), binders = Array.new(0),
+                name = name, ty = rTy(sub, orig.ty), binders = [],
                 value = rewrite(sub, orig.value), span = orig.span,
                 mutable = False, module_ = orig.module_,
                 equations = sub.equations, layouts = orig.layouts,
             }
-            Array.push(out, b)
+            Vec.push(out, b)
         }
     }
-    discard(Array.pop(r.scopes))
+    discard(Vec.pop(r.scopes))
     mkCore(rTy(r, e.ty), e.span, CLetRec(out, rest))
 }
 
@@ -677,15 +677,15 @@ fun runMono(m : Mono) -> CProgram {
         let group = match Map.get(m.made, b.name) {
             Some(g) -> g
             None -> {
-                let g = Array.new(2)
+                let g = Vec.new(2)
                 Map.put(m.made, b.name, g)
                 g
             }
         }
-        Array.push(group, build(m, name, b, targs, dicts))
+        Vec.push(group, build(m, name, b, targs, dicts))
     }
 
-    let out = CProgram { dicts = Array.new(16), binds = Array.new(32) }
+    let out = CProgram { dicts = Vec.new(16), binds = Vec.new(32) }
     for (group, target) in [(m.program.dicts, out.dicts),
                             (m.program.binds, out.binds)] {
         for b in group {
@@ -693,10 +693,10 @@ fun runMono(m : Mono) -> CProgram {
             -- ahead of it, since a specialization depends on no more than the
             -- original does. Top-level bindings are evaluated in this order, so
             -- it has to be one that works.
-            for made in Map.getOr(m.made, b.name, Array.new(0)) {
-                Array.push(target, made)
+            for made in Map.getOr(m.made, b.name, []) {
+                Vec.push(target, made)
             }
-            Array.push(target, Map.getOr(rewritten, b.name, b))
+            Vec.push(target, Map.getOr(rewritten, b.name, b))
         }
     }
     out
@@ -714,7 +714,7 @@ fun rewriteTop(m : Mono, b : CBind) -> CBind {
 
 -- Ask for a binding at these arguments. `None` means the cap said no.
 fun request(m : Mono, b : CBind, targs : Array Ty.Type,
-            dicts : Option (Array String)) -> Option String {
+            dicts : Option (Vec String)) -> Option String {
     for t in targs {
         if !ground(t) { return None }
     }
@@ -742,7 +742,7 @@ fun request(m : Mono, b : CBind, targs : Array Ty.Type,
     -- binding terminate: the copy's own call to itself, at its own arguments,
     -- finds this entry rather than asking for another copy.
     Map.put(m.state.done, key, name)
-    Array.push(m.queue, (name, b, targs, dicts))
+    Vec.push(m.queue, (name, b, targs, dicts))
     Some(name)
 }
 
@@ -761,7 +761,7 @@ fun fresh(m : Mono, name : String, targs : Array Ty.Type) -> String {
 }
 
 fun build(m : Mono, name : String, b : CBind, targs : Array Ty.Type,
-          dicts : Option (Array String)) -> CBind {
+          dicts : Option (Vec String)) -> CBind {
     let subst = Map.new()
     for var i = 0; i < len(b.binders) && i < len(targs); i = i + 1 {
         Map.put(subst, b.binders[i].id, targs[i])
@@ -796,12 +796,12 @@ fun build(m : Mono, name : String, b : CBind, targs : Array Ty.Type,
     -- type arguments against and layout sharing cannot key a copy on. The call
     -- site already applies these types to the copy, so the abstraction belongs
     -- on the binding.
-    let binders = Array.new(2)
+    let binders = Vec.new(2)
     var going = True
     while going {
         match value.kind {
             CTyLam(vs, body) -> {
-                for v in vs { Array.push(binders, v) }
+                for v in vs { Vec.push(binders, v) }
                 value = body
                 ty = rTy(r, body.ty)
             }
@@ -817,8 +817,8 @@ fun build(m : Mono, name : String, b : CBind, targs : Array Ty.Type,
 
 -- The binders a specialization of `b` will state for itself: the `CTyLam` that
 -- `build` above lifts out once the dictionary lambda is consumed.
-fun promotedBinders(b : CBind, dicts : Option (Array String)) -> Array VarCell {
-    let out = Array.new(2)
+fun promotedBinders(b : CBind, dicts : Option (Vec String)) -> Vec VarCell {
+    let out = Vec.new(2)
     match dicts {
         None -> return out
         Some(_) -> {}
@@ -831,7 +831,7 @@ fun promotedBinders(b : CBind, dicts : Option (Array String)) -> Array VarCell {
     while going {
         match value.kind {
             CTyLam(vs, body) -> {
-                for v in vs { Array.push(out, v) }
+                for v in vs { Vec.push(out, v) }
                 value = body
             }
             _ -> { going = False }
@@ -862,10 +862,10 @@ fun promotedBinders(b : CBind, dicts : Option (Array String)) -> Array VarCell {
 -- reach it only if *every* such place remembered, and one pass is a thing that
 -- can be true rather than a rule five writers have to keep.
 fun reduceTypes(program : CProgram, classes : ClassTable) -> CProgram {
-    let fams = Some(Coretc.famsOf(classes, Array.new(0)))
+    let fams = Some(Coretc.famsOf(classes, []))
     CProgram {
-        dicts = Array.map(program.dicts, reduceBind(_, fams)),
-        binds = Array.map(program.binds, reduceBind(_, fams)),
+        dicts = Vec.map(program.dicts, reduceBind(_, fams)),
+        binds = Vec.map(program.binds, reduceBind(_, fams)),
     }
 }
 
@@ -894,27 +894,27 @@ fun reduceCore(e : Core, fams : Option Ty.Families) -> Core =
 -- is one the backend would read at a guess -- the same refusal
 -- `leakedParameters` makes for a generic parameter, for the binder it cannot
 -- see: a pattern's.
-fun unsharedOpenings(program : CProgram) -> Array String {
-    let all = Array.append(program.dicts, program.binds)
+fun unsharedOpenings(program : CProgram) -> Vec String {
+    let all = Vec.append(program.dicts, program.binds)
     let unshared = Parallel.map(all, fun(b) {
-        let hits = Array.new(1)
+        let hits = Vec.new(1)
         unsharedInto(b.value, hits)
         len(hits) > 0
     })
-    let found = Array.new(2)
+    let found = Vec.new(2)
     for var i = 0; i < len(all); i = i + 1 {
-        if unshared[i] { Array.push(found, all[i].name) }
+        if unshared[i] { Vec.push(found, all[i].name) }
     }
     found
 }
 
-fun unsharedInto(e : Core, found : Array Bool) -> Unit {
+fun unsharedInto(e : Core, found : Vec Bool) -> Unit {
     if len(found) > 0 { return {} }
     match e.kind {
         CMatch(_, alts) -> for alt in alts {
             match openingOf(alt.alt) {
                 Some(o) -> match o.layouts {
-                    None -> Array.push(found, True)
+                    None -> Vec.push(found, True)
                     Some(_) -> {}
                 }
                 None -> {}
@@ -946,7 +946,7 @@ fun checkLayouts(program : CProgram) -> Unit {
     let unopened = unsharedOpenings(program)
     if len(unopened) > 0 {
         oops("an existential pattern reached the backend with no layout for "
-             + "what it opens: " + String.join(Array.sort(unopened), ", "), None)
+             + "what it opens: " + String.join(Vec.sort(unopened), ", "), None)
     }
 }
 
@@ -996,36 +996,36 @@ type Devirt = Devirt {
     classes   : ClassTable,
     state     : State,
     used      : Set.Set String,
-    hoisted   : Array CBind,
+    hoisted   : Vec CBind,
     var dicts : Methods.Dictionaries,
 }
 
 fun newDevirt(program : CProgram, classes : ClassTable, state : State) -> Devirt =
     Devirt {
         program = program, classes = classes, state = state, used = Set.new(),
-        hoisted = Array.new(8), dicts = Map.new(),
+        hoisted = Vec.new(8), dicts = Map.new(),
     }
 
 fun runDevirt(d : Devirt) -> CProgram {
-    for b in Array.append(d.program.dicts, d.program.binds) {
+    for b in Vec.append(d.program.dicts, d.program.binds) {
         Set.add(d.used, b.name)
     }
     -- Every method hoisted before any rewrite, because a method's body may
     -- project out of a dictionary whose fields have not been looked at yet --
     -- including its own.
-    let dicts = Array.map(d.program.dicts, fun(b) = match hoistAll(d, b) {
+    let dicts = Vec.map(d.program.dicts, fun(b) = match hoistAll(d, b) {
         Some(value) -> withValue(b, value)
         None -> b
     })
     d.dicts = Methods.dictionaries(dicts)
-    let out = CProgram { dicts = Array.new(16), binds = Array.new(32) }
-    for b in dicts { Array.push(out.dicts, devirtBind(d, b)) }
+    let out = CProgram { dicts = Vec.new(16), binds = Vec.new(32) }
+    for b in dicts { Vec.push(out.dicts, devirtBind(d, b)) }
     -- The hoisted bindings live with the dictionaries, not after them: everything
     -- in `dicts` is defined before any record is filled, and a record's field
     -- now names a hoisted binding. A hoisted binding is always a lambda, so
     -- defining it builds a closure and cannot read a record that is still empty.
-    for b in d.hoisted { Array.push(out.dicts, devirtBind(d, b)) }
-    for b in d.program.binds { Array.push(out.binds, devirtBind(d, b)) }
+    for b in d.hoisted { Vec.push(out.dicts, devirtBind(d, b)) }
+    for b in d.program.binds { Vec.push(out.binds, devirtBind(d, b)) }
     out
 }
 
@@ -1067,23 +1067,19 @@ fun hoistFields(d : Devirt, owner : CBind, dictTy : Ty.Type, params : Array CPar
         None -> return None
     }
     var changed = False
-    let out = Array.new(len(slots))
-    for var i = 0; i < len(slots); i = i + 1 {
+    let out = Array.init(len(slots), fun(i) {
         let method = match Classes.slotAt(d.classes, cls, i) {
             Some(MethodSlot(m)) -> m
-            _ -> {
-                Array.push(out, slots[i])
-                continue
-            }
+            _ -> return slots[i]
         }
         match hoist(d, owner, dictTy, params, method, slots[i]) {
             Some(reference) -> {
-                Array.push(out, reference)
                 changed = True
+                reference
             }
-            None -> Array.push(out, slots[i])
+            None -> slots[i]
         }
-    }
+    })
     if changed { Some(out) } else { None }
 }
 
@@ -1106,15 +1102,15 @@ fun hoist(d : Devirt, owner : CBind, dictTy : Ty.Type, params : Array CParam,
     while Set.contains(d.used, made) { made = made + "~" }
     Set.add(d.used, made)
     derive(d.state, made, owner.name)
-    let binders = Array.append(owner.binders, own)
+    let binders = Vec.append(owner.binders, own)
     let body = if len(params) == 0 { inner } else {
         mkCore(TFun(Array.map(params, _.ty), inner.ty), owner.span,
                CLam(params, inner, made))
     }
-    Array.push(d.hoisted, CBind {
+    Vec.push(d.hoisted, CBind {
         name = made, ty = body.ty, binders = binders, value = body,
         span = owner.span, mutable = False, module_ = owner.module_,
-        equations = Array.slice(owner.equations, 0, len(owner.equations)),
+        equations = Vec.slice(owner.equations, 0, len(owner.equations)),
         layouts = Map.new(),
     })
     let head = mkCore(body.ty, value.span, CVar(made))
@@ -1145,26 +1141,26 @@ fun hoist(d : Devirt, owner : CBind, dictTy : Ty.Type, params : Array CParam,
 -- caught it immediately: a method was hoisted with no binders and the use site
 -- still had one type argument.
 fun abstraction(d : Devirt, dictTy : Ty.Type, method : String,
-                value : Core) -> (Array VarCell, Core) {
+                value : Core) -> (Vec VarCell, Core) {
     match value.kind {
         CTyLam(binders, body) -> return (binders, body)
         _ -> {}
     }
     let cls = match dictClass(dictTy) {
         Some(c) -> c
-        None -> return (Array.new(0), value)
+        None -> return ([], value)
     }
     let info = match Map.get(d.classes.classes, cls) {
         Some(i) -> i
-        None -> return (Array.new(0), value)
+        None -> return ([], value)
     }
     let m = match Map.get(info.methods, method) {
         Some(x) -> x
-        None -> return (Array.new(0), value)
+        None -> return ([], value)
     }
-    let binders = Array.new(4)
+    let binders = Vec.new(4)
     for q in m.scheme.quantified {
-        if q.id != m.classVar.id { Array.push(binders, q) }
+        if q.id != m.classVar.id { Vec.push(binders, q) }
     }
     (binders, value)
 }
@@ -1245,11 +1241,11 @@ fun droppable(b : CBind, isDict : Bool) -> Bool {
 --
 -- Only the bindings `prunable` accepts are dropped; the rest are kept as if
 -- `main` named them.
-fun reachable(program : CProgram, main : String, roots : Array String,
+fun reachable(program : CProgram, main : String, roots : Vec String,
               definitions : Map String ForeignInfo,
               prunable : fun(CBind) -> Bool) -> CProgram {
     let byname = Map.new()
-    for b in Array.append(program.dicts, program.binds) {
+    for b in Vec.append(program.dicts, program.binds) {
         Map.put(byname, b.name, b)
     }
     let drop = Set.new()
@@ -1259,12 +1255,12 @@ fun reachable(program : CProgram, main : String, roots : Array String,
     for b in program.binds {
         if droppable(b, False) && prunable(b) { Set.add(drop, b.name) }
     }
-    let work = Array.new(16)
+    let work = Vec.new(16)
     for (name, _) in Map.entries(byname) {
-        if !Set.contains(drop, name) { Array.push(work, name) }
+        if !Set.contains(drop, name) { Vec.push(work, name) }
     }
-    Array.push(work, main)
-    for name in roots { Array.push(work, name) }
+    Vec.push(work, main)
+    for name in roots { Vec.push(work, name) }
     -- A `Prim.codeAddress` names its definition by C symbol.
     let bySymbol = Map.new()
     for (name, info) in Map.entries(definitions) {
@@ -1273,7 +1269,7 @@ fun reachable(program : CProgram, main : String, roots : Array String,
     let reach = Set.new()
     for n in work { Set.add(reach, n) }
     while len(work) > 0 {
-        let name = match Array.pop(work) {
+        let name = match Vec.pop(work) {
             Some(n) -> n
             None -> ""
         }
@@ -1283,17 +1279,17 @@ fun reachable(program : CProgram, main : String, roots : Array String,
                 let n = Map.getOr(bySymbol, used, used)
                 if !Set.contains(reach, n) {
                     Set.add(reach, n)
-                    Array.push(work, n)
+                    Vec.push(work, n)
                 }
             }
         }
     }
-    let out = CProgram { dicts = Array.new(16), binds = Array.new(32) }
+    let out = CProgram { dicts = Vec.new(16), binds = Vec.new(32) }
     for b in program.dicts {
-        if Set.contains(reach, b.name) { Array.push(out.dicts, b) }
+        if Set.contains(reach, b.name) { Vec.push(out.dicts, b) }
     }
     for b in program.binds {
-        if Set.contains(reach, b.name) { Array.push(out.binds, b) }
+        if Set.contains(reach, b.name) { Vec.push(out.binds, b) }
     }
     out
 }
@@ -1303,11 +1299,11 @@ fun reachable(program : CProgram, main : String, roots : Array String,
 -- The rounds share one state, which is what makes the ceiling one ceiling. Reachability
 -- runs once, at the end, over the finished program.
 fun monomorphize(program : CProgram, decls : DeclTable, classes : ClassTable,
-                 main : String, roots : Array String) -> CProgram {
+                 main : String, roots : Vec String) -> CProgram {
     let state = newState()
     state.expanding = expandingBindings(program)
     var size = 0
-    for b in Array.append(program.dicts, program.binds) {
+    for b in Vec.append(program.dicts, program.binds) {
         size = size + Opt.sizeOf_(b.value) + 1
     }
     state.ceiling = size * ceilingFactor
@@ -1325,15 +1321,15 @@ fun monomorphize(program : CProgram, decls : DeclTable, classes : ClassTable,
 -- code the backend writes, so only those it names by symbol are -- unless a
 -- C caller drives the runtime without running the program, as the runtime's
 -- own tests do, and then only C knows which it will call.
-fun runtimeRoots(decls : DeclTable, everyDefinition : Bool) -> Array String {
+fun runtimeRoots(decls : DeclTable, everyDefinition : Bool) -> Vec String {
     let out = []
     for (name, info) in Map.entries(decls.definitions) {
         if everyDefinition || !String.startsWith(name, "Turkey.")
                 || Array.contains(Rt.referencedSymbols, info.symbol) {
-            Array.push(out, name)
+            Vec.push(out, name)
         }
     }
-    Array.sort(out)
+    Vec.sort(out)
 }
 
 -- -- polymorphic recursion ------------------------------------------------------------
@@ -1360,7 +1356,7 @@ fun runtimeRoots(decls : DeclTable, everyDefinition : Bool) -> Array String {
 -- types, so dictionary construction adds no expanding edge.
 fun expandingBindings(program : CProgram) -> Set.Set String {
     let generic = Map.new()
-    for b in Array.append(program.dicts, program.binds) {
+    for b in Vec.append(program.dicts, program.binds) {
         if len(b.binders) > 0 { Map.put(generic, b.name, b) }
     }
     let calls = Map.new()
@@ -1405,7 +1401,7 @@ fun expandingBindings(program : CProgram) -> Set.Set String {
                                     }
                                 }
                                 Set.add(out, to)
-                                if !plain { Array.push(expanding, (from, to)) }
+                                if !plain { Vec.push(expanding, (from, to)) }
                             }
                         }
                     }
@@ -1437,16 +1433,16 @@ fun parameterNode(binding : String, index : Int) -> String =
 fun bindingOfNode(node : String) -> String = String.split(node, "\t")[0]
 
 -- Every type application of a name in `e`, as (name, types).
-fun typeApplications(e : Core) -> Array (String, Array Ty.Type) {
+fun typeApplications(e : Core) -> Vec (String, Array Ty.Type) {
     let out = []
     collectTypeApplications(e, out)
     out
 }
 
-fun collectTypeApplications(e : Core, out : Array (String, Array Ty.Type)) -> Unit {
+fun collectTypeApplications(e : Core, out : Vec (String, Array Ty.Type)) -> Unit {
     match e.kind {
         CTyApp(fn, types) -> match fn.kind {
-            CVar(name) -> Array.push(out, (name, types))
+            CVar(name) -> Vec.push(out, (name, types))
             _ -> {}
         }
         _ -> {}

@@ -79,8 +79,8 @@ type Sel = Sel {
     -- For the write barrier's static exemption (`barrierNeeded`): where each
     -- low IR value is defined, as its block and its index there or -1 for a
     -- block parameter, and which values are fresh allocations.
-    definedIn : Array Int,
-    definedAt : Array Int,
+    definedIn : Vec Int,
+    definedAt : Vec Int,
     allocations : BitSet,
     -- For the fence's exemption (`unpublished`): the low IR instruction being
     -- selected, as its block and index; per fresh allocation, the first
@@ -92,17 +92,17 @@ type Sel = Sel {
     publishedIn : Map Int BitSet,
     -- The panic messages this function names, in the order it first names
     -- them, for the module's table (`selectModule`). `asm` is only read.
-    messages : Array String,
+    messages : Vec String,
 }
 
 -- `text`'s symbol, recorded as one this function names.
 fun messageOf(s : Sel, text : String) -> Asm.Symbol {
-    if !Array.contains(s.messages, text) { Array.push(s.messages, text) }
+    if !Vec.contains(s.messages, text) { Vec.push(s.messages, text) }
     Asm.messageName(s.asm.dialect, text)
 }
 
 fun emit(s : Sel, op : A.Arm) -> Unit {
-    Array.push(s.out.blocks[s.at].insts, Inst { op = op })
+    Vec.push(s.out.blocks[s.at].insts, Inst { op = op })
 }
 
 fun stop(s : Sel, what : String) -> Unit {
@@ -145,7 +145,7 @@ fun widthOf(r : Rep) -> A.Width = match r.class_ {
 -- table is complete only once every function has been walked, and the module
 -- emitter writes it after the code for exactly this reason.
 fun selectModule(m : Module, dialect : Asm.Dialect)
-        -> (Array (Func Inst), Array Unsupported, Asm) {
+        -> (Vec (Func Inst), Vec Unsupported, Asm) {
     -- One `Asm` for the module, because a literal interned by one function is
     -- the same literal in the next and the root array is one array.
     let asm = Asm.newAsm(m, dialect)
@@ -174,8 +174,8 @@ fun selectModule(m : Module, dialect : Asm.Dialect)
     for (out, stopped, messages) in selected {
         for text in messages { Asm.internMessage(asm, text) }
         match stopped {
-            Some(why) -> Array.push(skipped, Unsupported { name = out.name, what = why })
-            None -> Array.push(done, out)
+            Some(why) -> Vec.push(skipped, Unsupported { name = out.name, what = why })
+            None -> Vec.push(done, out)
         }
     }
     (done, skipped, asm)
@@ -185,16 +185,16 @@ fun start(f : Func Low, asm : Asm) -> Sel {
     let g = Ssa.newFunc(f.name, f.result)
     -- The same value numbering, so a `Value` means the same thing on both
     -- sides and `reps` describes both. Selection only ever adds.
-    for r in f.reps { Array.push(g.reps, r) }
+    for r in f.reps { Vec.push(g.reps, r) }
     for block in f.blocks {
         let made = Ssa.newBlock()
-        for p in block.params { Array.push(made.params, p) }
-        Array.push(g.blocks, made)
+        for p in block.params { Vec.push(made.params, p) }
+        Vec.push(g.blocks, made)
     }
     g.entry = incoming(f, g)
     Sel { source = f, out = g, at = 0, stopped = None, asm = asm,
           frame = Roots.analyze(f), pending = None, panicking = False,
-          known = constantsOf(f), definedIn = Array.new(0), definedAt = Array.new(0),
+          known = constantsOf(f), definedIn = [], definedAt = [],
           allocations = BitSet.new(len(f.reps)), place = (0, 0),
           publishers = Map.new(), publishedIn = Map.new(), messages = [] }
 }
@@ -202,8 +202,8 @@ fun start(f : Func Low, asm : Asm) -> Sel {
 fun placeDefinitions(s : Sel) -> Unit {
     let f = s.source
     for _ in f.reps {
-        Array.push(s.definedIn, -1)
-        Array.push(s.definedAt, -1)
+        Vec.push(s.definedIn, -1)
+        Vec.push(s.definedAt, -1)
     }
     for var b = 0; b < len(f.blocks); b = b + 1 {
         for p in f.blocks[b].params { s.definedIn[Ssa.valueId(p)] = b }
@@ -285,14 +285,14 @@ fun publishedBlocks(s : Sel, t : Int, firsts : Map Int Int) -> BitSet {
     let blocks = s.source.blocks
     let reached = BitSet.new(len(blocks))
     let work = []
-    for (b, _) in Map.entries(firsts) { Array.push(work, b) }
+    for (b, _) in Map.entries(firsts) { Vec.push(work, b) }
     for var k = 0; k < len(work); k = k + 1 {
         let b = work[k]
         for next in Ssa.successors(blocks[b].term) {
             let id = Ssa.blockId(next)
             if !BitSet.contains(reached, id) {
                 BitSet.add(reached, id)
-                Array.push(work, id)
+                Vec.push(work, id)
             }
         }
     }
@@ -365,10 +365,10 @@ fun incoming(f : Func Low, g : Func Inst) -> BlockId {
                 A.Ldr(into, A.IncomingArg(at), A.W64)
             }
         }
-        Array.push(entry.insts, Inst { op = op })
+        Vec.push(entry.insts, Inst { op = op })
     }
     entry.term = Jump(f.entry, [])
-    Array.push(g.blocks, entry)
+    Vec.push(g.blocks, entry)
     BlockId(len(g.blocks) - 1)
 }
 
@@ -447,7 +447,7 @@ fun terminate(s : Sel, t : Term) -> Unit = match t {
         s.out.blocks[s.at].term = Ret(zeroResult(s))
     }
     Switch(v, cases, default) -> {
-        let sorted = Array.sortBy(cases, fun(x, y) = Array.threeWay(x.0, y.0))
+        let sorted = Vec.sortBy(cases, fun(x, y) = Array.threeWay(x.0, y.0))
         let width = widthOf(Ssa.repOf(s.source, v))
         search(s, A.reg(v), width, sorted, 0, len(sorted), default)
     }
@@ -460,7 +460,7 @@ fun terminate(s : Sel, t : Term) -> Unit = match t {
 -- A switch with no default holds one of its keys, so a range of one case needs
 -- no test at all, and a search over `n` cases makes about `log2 n`
 -- comparisons rather than one per arm.
-fun search(s : Sel, x : Reg, width : A.Width, cases : Array (Int, BlockId),
+fun search(s : Sel, x : Reg, width : A.Width, cases : Vec (Int, BlockId),
            from : Int, to : Int, default : Option BlockId) -> Unit {
     if to - from > linearCases {
         let middle = (from + to) / 2
@@ -511,7 +511,7 @@ fun branchIf(s : Sel, c : A.Cond, yes : Int, no : Int) -> Unit {
 
 -- A new block at the end, and its id.
 fun block(s : Sel) -> Int {
-    Array.push(s.out.blocks, Ssa.newBlock())
+    Vec.push(s.out.blocks, Ssa.newBlock())
     len(s.out.blocks) - 1
 }
 
@@ -816,10 +816,9 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             -- one place that fact is written down. A `Float` parameter is a
             -- `double` in the C signature too, so this agrees with the runtime
             -- without either side stating it twice.
-            let passed = []
-            for a in args {
-                Array.push(passed, (A.reg(a), A.bankOf(Ssa.repOf(s.source, a))))
-            }
+            let passed = Array.map(args, fun(a) {
+                (A.reg(a), A.bankOf(Ssa.repOf(s.source, a)))
+            })
             let want = A.bankOf(r)
             match callee {
                 Direct(name) ->
@@ -1088,8 +1087,7 @@ fun storesObject(s : Sel, value : Value) -> Bool =
 
 fun runtimeCall(s : Sel, d : Reg, sym : Asm.Symbol, first : Array Reg,
                 rest : Array Reg) -> Unit {
-    let args = []
-    for a in Array.append(first, rest) { Array.push(args, (a, A.Gp)) }
+    let args = Array.map(Array.append(first, rest), fun(a) = (a, A.Gp))
     call(s, d, A.Gp, Some(A.Gp), Some(sym), A.xzr, args, A.Standard)
 }
 
@@ -1163,7 +1161,7 @@ fun call(s : Sel, d : Reg, dBank : A.Bank, answers : Option A.Bank,
                 Fp -> { let at = vector; vector = vector + 1; A.fpArgRegs[at] }
             }
             move(s, into, bank, a, bank)
-            Array.push(ins, into)
+            Vec.push(ins, into)
         }
     }
     -- The *physical* registers the call reads and writes, not the virtuals
@@ -1421,7 +1419,7 @@ fun remainder(s : Sel, i : Low, d : Reg, a : Reg, b : Reg, w : A.Width) -> Unit 
     let after = block(s)
     -- The result is the merge block's parameter, which is what a
     -- select is in a graph with block parameters rather than phis.
-    Array.push(s.out.blocks[after].params, i.result)
+    Vec.push(s.out.blocks[after].params, i.result)
     s.out.blocks[s.at].term = Branch(special, BlockId(zero),
                                      BlockId(ordinary))
     s.at = zero

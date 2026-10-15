@@ -61,7 +61,7 @@ fun namespaceIndex(space : Namespace) -> Int = match space {
     MethodSpace -> 4
 }
 
-fun conflictsIn(s : Scope, space : Namespace) -> Map String (Array String) =
+fun conflictsIn(s : Scope, space : Namespace) -> Map String (Vec String) =
     s.conflicts[namespaceIndex(space)]
 
 type Scope = Scope {
@@ -70,7 +70,7 @@ type Scope = Scope {
     cons    : Map String String,
     classes : Map String String,
     methods : Map String String,
-    var conflicts : Array (Map String (Array String)),
+    var conflicts : Array (Map String (Vec String)),
 }
 
 fun newScope() -> Scope = Scope {
@@ -99,7 +99,7 @@ fun lookupName(s : Scope, space : Namespace, name : String,
                where : Option Span) -> Option String {
     match Map.get(conflictsIn(s, space), name) {
         Some(targets) -> oopsAt("ambiguous name '" + name + "': "
-            + String.join(Array.map(Array.sort(targets), fun(t) =
+            + String.join(Vec.map(Vec.sort(targets), fun(t) =
                 quoted(String.replace(t, "#", "."))), ", "), where)
         None -> Map.get(spaceAt(s, space), name)
     }
@@ -110,7 +110,7 @@ fun mergeName(s : Scope, space : Namespace, name : String, target : String) -> U
     match Map.get(into, name) {
         Some(previous) -> if previous != target {
             let targets = Map.getOr(conflictsIn(s, space), name, [previous])
-            if !Array.contains(targets, target) { Array.push(targets, target) }
+            if !Vec.contains(targets, target) { Vec.push(targets, target) }
             Map.put(conflictsIn(s, space), name, targets)
         }
         None -> Map.put(into, name, target)
@@ -135,23 +135,23 @@ type Loader = Loader {
     modules      : Map String Module,
     -- Every module, in the order they finished loading, which is dependency
     -- order because a module finishes after everything it imports.
-    order        : Array Module,
+    order        : Vec Module,
     -- Every type name known so far, threaded into later parses: section 7's
     -- alias-versus-data pre-pass cannot see another file.
-    tycons       : Array String,
+    tycons       : Vec String,
     -- Internal type name -> its constructors' short names, so a `T(..)` in an
     -- export or import list can be answered for a type this module did not
     -- itself declare.
-    variants     : Map String (Array String),
+    variants     : Map String (Vec String),
     -- Internal class name -> its exported methods and associated families.
-    classMembers : Map String (Array String),
+    classMembers : Map String (Vec String),
 }
 
 fun newLoader(search : Array String) -> Loader = Loader {
     search = search,
     modules = Map.new(),
-    order = Array.new(8),
-    tycons = Array.new(16),
+    order = Vec.new(8),
+    tycons = Vec.new(16),
     variants = Map.new(),
     classMembers = Map.new(),
 }
@@ -253,16 +253,16 @@ fun add(l : Loader, name : String, source : Source, library : Bool,
     for d in program.decls {
         match d {
             DType(t) -> {
-                Array.push(l.tycons, t.name)
+                Vec.push(l.tycons, t.name)
                 match t.variants {
                     Some(vs) -> Map.put(l.variants, Prelude.internal(name, t.name),
-                                        Array.map(vs, conName))
+                                        Vec.map(vs, conName))
                     None -> {}
                 }
             }
             DClass(c) -> Map.put(l.classMembers, Prelude.internal(name, c.name),
-                                 Array.append(Array.map(c.methods, funName),
-                                              Array.map(c.families, famName)))
+                                 Vec.append(Vec.map(c.methods, funName),
+                                              Vec.map(c.families, famName)))
             _ -> {}
         }
     }
@@ -276,7 +276,7 @@ fun add(l : Loader, name : String, source : Source, library : Bool,
     m.scope = scopeOf(l, m)
     m.exports = exportsOf(l, m)
     Map.put(l.modules, name, m)
-    Array.push(l.order, m)
+    Vec.push(l.order, m)
     m
 }
 
@@ -291,7 +291,7 @@ fun hasPreludeImport(program : Program) -> Bool {
     False
 }
 
-fun isEmptyList(items : Option (Array ExportItem)) -> Bool = match items {
+fun isEmptyList(items : Option (Vec ExportItem)) -> Bool = match items {
     Some(xs) -> len(xs) == 0
     None -> False
 }
@@ -381,8 +381,8 @@ fun moduleNamed(l : Loader, name : String) -> Module = match Map.get(l.modules, 
 
 fun bring(l : Loader, scope : Scope, dep : Module, alias : String,
           qualified : Bool, where : Option Span,
-          items : Option (Array ExportItem),
-          hidden : Option (Array ExportItem)) -> Unit {
+          items : Option (Vec ExportItem),
+          hidden : Option (Vec ExportItem)) -> Unit {
     var chosen = Array.map(spaces(dep.exports), copyMap)
     match items {
         None -> {}
@@ -453,7 +453,7 @@ fun checkImportedMember(l : Loader, dep : Module, item : ExportItem,
                         sub : String, where : Option Span) -> Unit {
     match Map.get(dep.exports.classes, item.name) {
         Some(cls) -> {
-            if !Array.contains(membersOf(l, cls), sub)
+            if !Vec.contains(membersOf(l, cls), sub)
                 || !(Map.contains(dep.exports.methods, sub)
                      || Map.contains(dep.exports.types, sub)) {
                 oopsAt("module '" + dep.name + "' does not export member '"
@@ -472,7 +472,7 @@ fun checkImportedMember(l : Loader, dep : Module, item : ExportItem,
 
 fun constructorMember(l : Loader, parent : Option String, name : String,
                       target : Option String) -> Bool {
-    if !Array.contains(variantsOf(l, parent), name) { return False }
+    if !Vec.contains(variantsOf(l, parent), name) { return False }
     match (parent, target) {
         (Some(p), Some(t)) -> match String.rsplitOnce(p, "#") {
             Some((owner, _)) -> t == Prelude.internal(owner, name)
@@ -506,27 +506,27 @@ fun namedAnywhere(s : Scope, name : String) -> Bool {
 }
 
 -- The members `T(..)` or `C(..)` names, given what `T` or `C` is here.
-fun subsOf(l : Loader, dep : Module, item : ExportItem) -> Array String =
+fun subsOf(l : Loader, dep : Module, item : ExportItem) -> Vec String =
     match Map.get(dep.exports.classes, item.name) {
         Some(cls) -> subsFrom(item, membersOf(l, cls))
         None -> subsFrom(item, variantsOf(l, Map.get(dep.exports.types, item.name)))
     }
 
-fun membersOf(l : Loader, cls : String) -> Array String =
-    Map.getOr(l.classMembers, cls, Array.new(0))
+fun membersOf(l : Loader, cls : String) -> Vec String =
+    Map.getOr(l.classMembers, cls, [])
 
-fun variantsOf(l : Loader, target : Option String) -> Array String = match target {
-    None -> Array.new(0)
-    Some(name) -> Map.getOr(l.variants, name, Array.new(0))
+fun variantsOf(l : Loader, target : Option String) -> Vec String = match target {
+    None -> []
+    Some(name) -> Map.getOr(l.variants, name, [])
 }
 
 -- `T` names the type alone; `T(..)` every constructor; `T(A, B)` those.
-fun subsFrom(item : ExportItem, all : Array String) -> Array String = match item.subs {
-    None -> Array.new(0)
+fun subsFrom(item : ExportItem, all : Vec String) -> Vec String = match item.subs {
+    None -> []
     Some(subs) -> if isDotDot(subs) { all } else { subs }
 }
 
-fun isDotDot(subs : Array String) -> Bool =
+fun isDotDot(subs : Vec String) -> Bool =
     (len(subs) == 1 && subs[0] == "..")
     || (len(subs) == 2 && subs[0] == "." && subs[1] == ".")
 
@@ -600,7 +600,7 @@ fun exportType(l : Loader, m : Module, mine : Scope, item : ExportItem,
     Map.put(out.types, item.name, target)
     let variants = variantsOf(l, Some(target))
     for con in subsFrom(item, variants) {
-        if !Array.contains(variants, con) {
+        if !Vec.contains(variants, con) {
             oopsAt("'" + con + "' is not a constructor of '"
                    + item.name + "'", Some(item.span))
         }
@@ -620,7 +620,7 @@ fun exportType(l : Loader, m : Module, mine : Scope, item : ExportItem,
 
 -- `module M`: everything in scope here under that qualification, passed on
 -- *still qualified*. That is what lets the Prelude hand every program
--- `Array.push` without claiming the bare `push`.
+-- `Vec.push` without claiming the bare `push`.
 fun reexport(m : Module, item : ExportItem, out : Scope) -> Unit {
     let prefix = item.name + "."
     var found = False
@@ -752,41 +752,41 @@ fun checkForeignPlacement(name : String, program : Program,
 
 -- What a module declares, in each of `Scope`'s five namespaces, before class
 -- membership is taken into account.
-fun ownDeclared(program : Program) -> Array (Array String) {
-    let values = Array.new(8)
-    let types = Array.new(4)
-    let cons = Array.new(4)
-    let classes = Array.new(2)
-    let methods = Array.new(4)
+fun ownDeclared(program : Program) -> Array (Vec String) {
+    let values = Vec.new(8)
+    let types = Vec.new(4)
+    let cons = Vec.new(4)
+    let classes = Vec.new(2)
+    let methods = Vec.new(4)
     for decl in program.decls {
         match decl {
             DStmt(s) -> match s.kind {
-                SFun(d) -> Array.push(values, d.name)
-                SLet(pat, _) -> for v in Array.sort(patternVars(pat)) {
-                    Array.push(values, v)
+                SFun(d) -> Vec.push(values, d.name)
+                SLet(pat, _) -> for v in Vec.sort(patternVars(pat)) {
+                    Vec.push(values, v)
                 }
-                SVar(pat, _) -> for v in Array.sort(patternVars(pat)) {
-                    Array.push(values, v)
+                SVar(pat, _) -> for v in Vec.sort(patternVars(pat)) {
+                    Vec.push(values, v)
                 }
                 _ -> {}
             }
             DType(t) -> {
-                Array.push(types, t.name)
+                Vec.push(types, t.name)
                 match t.variants {
-                    Some(vs) -> for v in vs { Array.push(cons, v.name) }
+                    Some(vs) -> for v in vs { Vec.push(cons, v.name) }
                     None -> {}
                 }
             }
             DClass(c) -> {
-                Array.push(classes, c.name)
+                Vec.push(classes, c.name)
                 for meth in c.methods {
-                    Array.push(values, meth.name)
-                    Array.push(methods, meth.name)
+                    Vec.push(values, meth.name)
+                    Vec.push(methods, meth.name)
                 }
-                for fam in c.families { Array.push(types, fam.name) }
+                for fam in c.families { Vec.push(types, fam.name) }
             }
             DInstance(_) -> {}
-            DForeign(f) -> Array.push(values, f.name)
+            DForeign(f) -> Vec.push(values, f.name)
         }
     }
     [values, types, cons, classes, methods]

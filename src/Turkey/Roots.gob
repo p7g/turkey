@@ -44,10 +44,10 @@ type Frame = Frame {
     -- (block, instruction) -> the value ids to publish there, sorted. Keyed on
     -- a string because a pair is not hashable here; the key is private to this
     -- module and `liveAt` is the only reader.
-    at    : Map String (Array Int),
+    at    : Map String (Vec Int),
     -- The objects built in the frame (`StackObject`, `StackClosure`), in
     -- the order the frame lays them out, and each one's index by value id.
-    objects : Array FrameObject,
+    objects : Vec FrameObject,
     objectIndex : Map Int Int,
     -- (block, instruction) -> the objects whose traced fields the collector
     -- must read there, as indices into `objects`, sorted.
@@ -61,7 +61,7 @@ type Frame = Frame {
 -- its slot before building it -- the head of a loop, holding the previous
 -- iteration's object in a phi that holds something else on the way in -- and
 -- on that path the collector would read whatever the stack held as pointers.
-type FrameObject = FrameObject { id : Int, words : Int, traced : Array Int, var zeroed : Bool }
+type FrameObject = FrameObject { id : Int, words : Int, traced : Vec Int, var zeroed : Bool }
 
 fun key(b : Int, n : Int) -> String = Int.toString(b) + ":" + Int.toString(n)
 
@@ -76,11 +76,11 @@ fun objectOf(frame : Frame, id : Int) -> Option Int = Map.get(frame.objectIndex,
 
 -- The (slot, value) pairs to publish before the instruction at this position,
 -- and nothing if it is not a safepoint.
-fun liveAt(frame : Frame, b : Int, n : Int) -> Array (Int, Int) {
+fun liveAt(frame : Frame, b : Int, n : Int) -> Vec (Int, Int) {
     let out = []
     for id in Map.getOr(frame.at, key(b, n), []) {
         match Map.get(frame.slots, id) {
-            Some(slot) -> Array.push(out, (slot, id))
+            Some(slot) -> Vec.push(out, (slot, id))
             None -> {}
         }
     }
@@ -131,7 +131,7 @@ fun analyze(f : Func Low) -> Frame {
 -- whose operand is traced, which is the representation the object's metadata
 -- was built from. A closure shell is two words, code then environment, and
 -- only the environment is traced.
-fun objectsOf(f : Func Low) -> (Array FrameObject, Map Int Int) {
+fun objectsOf(f : Func Low) -> (Vec FrameObject, Map Int Int) {
     let out = []
     let index = Map.new()
     for block in f.blocks {
@@ -140,7 +140,7 @@ fun objectsOf(f : Func Low) -> (Array FrameObject, Map Int Int) {
                 StackObject(_, _, _, fields) -> {
                     let traced = []
                     for var k = 0; k < len(fields); k = k + 1 {
-                        if Ssa.repOf(f, fields[k]).traced { Array.push(traced, k) }
+                        if Ssa.repOf(f, fields[k]).traced { Vec.push(traced, k) }
                     }
                     Some(FrameObject { id = Ssa.valueId(i.result),
                                        words = 3 + len(fields), traced = traced,
@@ -159,7 +159,7 @@ fun objectsOf(f : Func Low) -> (Array FrameObject, Map Int Int) {
             match made {
                 Some(o) -> {
                     Map.put(index, o.id, len(out))
-                    Array.push(out, o)
+                    Vec.push(out, o)
                 }
                 None -> {}
             }
@@ -188,15 +188,15 @@ fun objectsOf(f : Func Low) -> (Array FrameObject, Map Int Int) {
 -- The same answer says which objects to clear on entry: those whose slot is
 -- live there, read on some path before anything built it
 -- (`FrameObject.zeroed`).
-fun slotsHeld(f : Func Low, objects : Array FrameObject, objectIndex : Map Int Int,
+fun slotsHeld(f : Func Low, objects : Vec FrameObject, objectIndex : Map Int Int,
               reached : Map Int (Set.Set Int)) -> Map String (Array Int) {
     -- The objects a value may reach, as indices.
-    let of_ = fun(v : Value) -> Array Int {
+    let of_ = fun(v : Value) -> Vec Int {
         let out = []
         match Map.get(reached, Ssa.valueId(v)) {
             Some(ids) -> for o in Set.elements(ids) {
                 match Map.get(objectIndex, o) {
-                    Some(k) -> Array.push(out, k)
+                    Some(k) -> Vec.push(out, k)
                     None -> {}
                 }
             }
@@ -206,8 +206,8 @@ fun slotsHeld(f : Func Low, objects : Array FrameObject, objectIndex : Map Int I
     }
     let count = len(f.blocks)
     let size = len(objects)
-    let liveIn : Array BitSet = []
-    for var b = 0; b < count; b = b + 1 { Array.push(liveIn, BitSet.new(size)) }
+    let liveIn : Vec BitSet = []
+    for var b = 0; b < count; b = b + 1 { Vec.push(liveIn, BitSet.new(size)) }
     let live = BitSet.new(size)
     -- Backwards through one block into `live`, from its live-out set, calling
     -- `at` with each safepoint's published objects.
@@ -231,7 +231,7 @@ fun slotsHeld(f : Func Low, objects : Array FrameObject, objectIndex : Map Int I
             if isSafepoint(insts[n].op) { at(n, live) }
         }
     }
-    let order = Array.reverse(Ssa.reversePostorder(f))
+    let order = Vec.reverse(Ssa.reversePostorder(f))
     var changed = True
     while changed {
         changed = False
@@ -279,20 +279,20 @@ fun slotsHeld(f : Func Low, objects : Array FrameObject, objectIndex : Map Int I
 -- Ascending and without repeats. `live` already is, so only an operand that
 -- is not in it needs placing, and an instruction has a handful.
 fun across(f : Func Low, constants : BitSet, live : Array Int,
-           i : Low) -> Array Int {
+           i : Low) -> Vec Int {
     let out = []
     for id in live {
-        if id != Ssa.valueId(i.result) && root(f, constants, id) { Array.push(out, id) }
+        if id != Ssa.valueId(i.result) && root(f, constants, id) { Vec.push(out, id) }
     }
     let kept = len(out)
     Ssa.eachUse(i, fun(v) {
         let id = Ssa.valueId(v)
         if id != Ssa.valueId(i.result) && root(f, constants, id)
-           && !Array.contains(out, id) {
-            Array.push(out, id)
+           && !Vec.contains(out, id) {
+            Vec.push(out, id)
         }
     })
-    if len(out) > kept { Array.sort(out) } else { out }
+    if len(out) > kept { Vec.sort(out) } else { out }
 }
 
 -- A traced value the collector has something to find at. A constant is not

@@ -75,22 +75,22 @@ type Constraint
     -- the one thing about a field access the predicate itself does not record.
     -- Mutable, because `improve` rewrites a predicate's arguments in place.
     | CPred(PredCell)
-    | CAnd(Array Constraint)
+    | CAnd(Vec Constraint)
     -- `exists vars. body` -- the variables generation invented under a binder.
     -- This is how the generator hands the solver a set of variables without
     -- knowing what rank they belong to. The solver stamps them on the way in.
-    | CExists(Array VarCell, Constraint)
+    | CExists(Vec VarCell, Constraint)
     -- Bind names to *types* -- monomorphically -- while solving the body.
     -- Function parameters, `match` arm binders, and the placeholders of a
     -- recursive group. Nothing is generalized, so nothing changes rank.
-    | CDef(Array (String, Ty.Type), Constraint, Bool)
+    | CDef(Vec (String, Ty.Type), Constraint, Bool)
     -- Bind names to *schemes* already built. The one binder whose schemes
     -- solving does not discover: a `fun` with a complete annotation states its
     -- own type, so the scheme is in scope from the group's first line, which is
     -- what lets a recursive occurrence *instantiate* it. That is polymorphic
     -- recursion, admissible here because the type was stated rather than
     -- guessed.
-    | CBind(Array (String, Scheme), Constraint, Bool)
+    | CBind(Vec (String, Scheme), Constraint, Bool)
     -- Solve the definition one rank deeper, generalize, bind the schemes, solve
     -- the body. The single place generalization happens.
     | CLet(LetCell)
@@ -100,7 +100,7 @@ type Constraint
     -- are all facts. This is the local-assumption form and deliberately the
     -- whole of it: an assumption introduced by a *pattern* is what makes GADTs
     -- destroy principal types, and none is introduced here.
-    | CAssume(Array (String, Pred), Constraint)
+    | CAssume(Vec (String, Pred), Constraint)
     -- `name <= t`: instantiate the scheme bound to `name` at `t`. The generator
     -- emits this instead of looking the name up, which is what lets it run
     -- without a type environment at all.
@@ -127,7 +127,7 @@ fun cpredOf(p : Pred, where : Option Span, context : String) -> Constraint =
     CPred(PredCell { pred = p, span = where, context = context })
 
 type LetCell = LetCell {
-    binds    : Array (String, Ty.Type),
+    binds    : Vec (String, Ty.Type),
     defn     : Constraint,
     body     : Constraint,
     span     : Option Span,
@@ -137,11 +137,11 @@ type LetCell = LetCell {
     -- constants a signature's variables became. Carried here for the same reason
     -- ranks are the solver's business at all: this is the one place that knows
     -- how deep the definition sits, so this is where they can be stamped.
-    skolems  : Array ConCell,
+    skolems  : Vec ConCell,
     -- The partial annotations in the group: each member's
     -- name, span, the variables its header wrote and the context it wrote,
     -- checked for rigidity when the group generalizes.
-    rigid    : Array (String, Span, Array (String, Ty.Type), Array Ty.Pred),
+    rigid    : Vec (String, Span, Vec (String, Ty.Type), Vec Ty.Pred),
 }
 
 -- -- the environment ---------------------------------------------------------------
@@ -188,16 +188,16 @@ type Solver = Solver {
     visibleCons     : Set.Set String,
     -- Predicates a `CAssume` currently grants. A stack in effect, restored on
     -- the way out of each one.
-    var assumptions : Array Pred,
+    var assumptions : Vec Pred,
     -- The dictionary scopes open at the point being solved, innermost last. A
     -- `Use` keeps the records rather than their contents, because what a binder
     -- makes available is only known once its definition is solved.
-    scopes          : Array Scope,
-    uses            : Array Use,
+    scopes          : Vec Scope,
+    uses            : Vec Use,
     -- `pools[r]` holds the variables born at rank r.
-    pools           : Array (Array VarCell),
+    pools           : Vec (Vec VarCell),
     -- Predicates that could not be settled yet.
-    var deferred    : Array PredCell,
+    var deferred    : Vec PredCell,
     -- Schemes of every name a top-level `CLet` bound, for the `types` command.
     topLevel        : Env,
 }
@@ -206,8 +206,8 @@ fun newSolver(decls : DeclTable, env : Env, classes : ClassTable,
               visibleCons : Set.Set String) -> Solver =
     Solver {
         decls = decls, classes = classes, env = env, visibleCons = visibleCons,
-        assumptions = Array.new(4), scopes = Array.new(4), uses = Array.new(16),
-        pools = [Array.new(8)], deferred = Array.new(8), topLevel = env,
+        assumptions = Vec.new(4), scopes = Vec.new(4), uses = Vec.new(16),
+        pools = [Vec.new(8)], deferred = Vec.new(8), topLevel = env,
     }
 
 -- The two operations unification needs from the solver, as the record
@@ -225,17 +225,17 @@ fun rank(s : Solver) -> Int = len(s.pools) - 1
 -- A variable at the current rank, recorded in the current pool.
 fun fresh(s : Solver) -> VarCell {
     let v = Ty.freshVar(rank(s))
-    Array.push(s.pools[len(s.pools) - 1], v)
+    Vec.push(s.pools[len(s.pools) - 1], v)
     v
 }
 
 -- Take responsibility for variables generation invented. They were created
 -- without a rank -- generation has no idea what rank it is under -- so they are
 -- stamped and pooled here.
-fun adopt(s : Solver, vars : Array VarCell) -> Unit {
+fun adopt(s : Solver, vars : Vec VarCell) -> Unit {
     for v in vars {
         v.level = rank(s)
-        Array.push(s.pools[len(s.pools) - 1], v)
+        Vec.push(s.pools[len(s.pools) - 1], v)
     }
 }
 
@@ -304,7 +304,7 @@ fun defer(s : Solver, a : Ty.Type, b : Ty.Type, where : Option Span,
     let flip = isFam(Ty.prune(b)) && !isFam(Ty.prune(a))
     let left = if flip { b } else { a }
     let right = if flip { a } else { b }
-    Array.push(s.deferred, PredCell {
+    Vec.push(s.deferred, PredCell {
         pred = Ty.pred(Ty.equals, [left, right]), span = where, context = context,
     })
     -- And it is a rewrite rule from here on. `x.pos` used where an `Int` is
@@ -325,7 +325,7 @@ fun defer(s : Solver, a : Ty.Type, b : Ty.Type, where : Option Span,
         TVar(_) -> { teaches = False }
         _ -> {}
     }
-    if teaches { Array.push(s.classes.rules, (l, rt)) }
+    if teaches { Vec.push(s.classes.rules, (l, rt)) }
 }
 
 fun isFam(t : Ty.Type) -> Bool = match t {
@@ -342,7 +342,7 @@ fun run(s : Solver, c : Constraint) -> Unit {
     -- anything still open that has a default takes it, and the rest is an error.
     var going = True
     while going && len(s.deferred) > 0 {
-        if applyDefaults(s, Array.slice(s.deferred, 0, len(s.deferred))) {
+        if applyDefaults(s, Vec.slice(s.deferred, 0, len(s.deferred))) {
             settle(s)
         } else {
             going = False
@@ -354,21 +354,21 @@ fun run(s : Solver, c : Constraint) -> Unit {
 fun solve(s : Solver, c : Constraint) -> Unit = match c {
     CEq(left, right, where, context) ->
         Ty.unify(left, right, where, context, families(s))
-    CPred(cell) -> if !entail(s, cell) { Array.push(s.deferred, cell) }
+    CPred(cell) -> if !entail(s, cell) { Vec.push(s.deferred, cell) }
     CAnd(parts) -> for p in parts { solve(s, p) }
     CExists(vars, body) -> {
         adopt(s, vars)
         solve(s, body)
     }
     CAssume(givens, body) -> {
-        let saved = Array.slice(s.assumptions, 0, len(s.assumptions))
-        for (_, p) in givens { Array.push(s.assumptions, p) }
+        let saved = Vec.slice(s.assumptions, 0, len(s.assumptions))
+        for (_, p) in givens { Vec.push(s.assumptions, p) }
         let assumed = newScope()
         assumed.givens = givens
-        Array.push(s.scopes, assumed)
+        Vec.push(s.scopes, assumed)
         solve(s, body)
         s.assumptions = saved
-        discard(Array.pop(s.scopes))
+        discard(Vec.pop(s.scopes))
     }
     CDef(binds, body, top) -> {
         if top { decideTopLevelLiterals(s) }
@@ -397,8 +397,8 @@ fun solve(s : Solver, c : Constraint) -> Unit = match c {
     CInstance(name, ty, where, use, given) ->
         solveInstance(s, name, ty, where, use, given)
     CUse(u) -> {
-        u.scopes = Array.slice(s.scopes, 0, len(s.scopes))
-        Array.push(s.uses, u)
+        u.scopes = Vec.slice(s.scopes, 0, len(s.scopes))
+        Vec.push(s.uses, u)
     }
 }
 
@@ -424,9 +424,9 @@ fun solveInstance(s : Solver, name : String, ty : Ty.Type, where : Option Span,
         Some(u) -> {
             -- Only the class predicates: `HasField` and `OneOf` are discharged
             -- by a lookup and a decision, and leave nothing behind to pass.
-            let kept = Array.new(len(preds))
+            let kept = Vec.new(len(preds))
             for p in preds {
-                if Classes.isClass(s.classes, p.name) { Array.push(kept, p) }
+                if Classes.isClass(s.classes, p.name) { Vec.push(kept, p) }
             }
             u.preds = kept
             -- Every type argument, though, and unfiltered: a type application
@@ -435,8 +435,8 @@ fun solveInstance(s : Solver, name : String, ty : Ty.Type, where : Option Span,
             -- completion and are variables at this point, which is correct --
             -- what they turn out to be is read back after solving.
             u.typeArgs = typeArgs
-            u.scopes = Array.slice(s.scopes, 0, len(s.scopes))
-            Array.push(s.uses, u)
+            u.scopes = Vec.slice(s.scopes, 0, len(s.scopes))
+            Vec.push(s.uses, u)
         }
         None -> {}
     }
@@ -451,7 +451,7 @@ fun solveInstance(s : Solver, name : String, ty : Ty.Type, where : Option Span,
 -- variables, and the pool is emptied either into the schemes or into the
 -- parent's pool.
 fun solveLet(s : Solver, c : LetCell) -> Unit {
-    Array.push(s.pools, Array.new(8))
+    Vec.push(s.pools, Vec.new(8))
     -- Now that the rank exists, the constants that belong to it can say so.
     -- And only while it exists: this is the whole of a skolem's life, so the
     -- stamp is lifted on the way out -- not tidiness, but correctness.
@@ -465,18 +465,17 @@ fun solveLet(s : Solver, c : LetCell) -> Unit {
 
 fun letBody(s : Solver, c : LetCell) -> Unit {
     let scope = newScope()
-    Array.push(s.scopes, scope)
+    Vec.push(s.scopes, scope)
     let firstUse = len(s.uses)
     solve(s, c.defn)
-    discard(Array.pop(s.scopes))
+    discard(Vec.pop(s.scopes))
     settle(s)
-    let types = Array.new(len(c.binds))
-    for (_, ty) in c.binds { Array.push(types, ty) }
+    let types = Array.map(c.binds, _.1)
     let retainedPreds = split(s, types)
     -- An equation tied to a variable this binder quantifies can never be decided
     -- by an enclosing one -- nothing outside mentions the variable -- so this is
     -- where it is stuck for good.
-    match Array.pop(s.pools) {
+    match Vec.pop(s.pools) {
         Some(young) -> dischargePool(s, young)
         None -> {}
     }
@@ -487,13 +486,13 @@ fun letBody(s : Solver, c : LetCell) -> Unit {
     -- context would leave that call needing a dictionary the caller's own
     -- signature never promised. Everything else stays per name: a `HasField` is
     -- erased, so nothing has to agree about it.
-    let classPreds = Array.new(4)
+    let classPreds = Vec.new(4)
     for p in retainedPreds {
-        if Classes.isClass(s.classes, p.pred.name) { Array.push(classPreds, p.pred) }
+        if Classes.isClass(s.classes, p.pred.name) { Vec.push(classPreds, p.pred) }
     }
     let shared = Classes.simplify(s.classes, classPreds)
-    let givens = Array.new(len(shared))
-    for p in shared { Array.push(givens, (dictName(p.name), p)) }
+    let givens = Vec.new(len(shared))
+    for p in shared { Vec.push(givens, (dictName(p.name), p)) }
     scope.givens = givens
     -- A call from one member of the group to another -- or to itself -- was
     -- solved against the *monomorphic* placeholder `CDef` bound, so it demanded
@@ -512,8 +511,8 @@ fun letBody(s : Solver, c : LetCell) -> Unit {
     }
     match c.dicts {
         Some(a) -> {
-            let params = Array.new(len(givens))
-            for (n, _) in givens { Array.push(params, n) }
+            let params = Vec.new(len(givens))
+            for (n, _) in givens { Vec.push(params, n) }
             a.params = params
             a.preds = shared
         }
@@ -523,11 +522,11 @@ fun letBody(s : Solver, c : LetCell) -> Unit {
     let saved = s.env
     s.env = childEnv(saved)
     for (name, ty) in c.binds {
-        let own = Array.new(4)
+        let own = Vec.new(4)
         for p in constrain(retainedPreds, ty) {
-            if !Classes.isClass(s.classes, p.name) { Array.push(own, p) }
+            if !Classes.isClass(s.classes, p.name) { Vec.push(own, p) }
         }
-        let preds = Classes.simplify(s.classes, Array.append(own, shared))
+        let preds = Classes.simplify(s.classes, Vec.append(own, shared))
         -- Reduced at every level, not just the head. A field access has the
         -- type `Field.n r`, and once `r` is a known record that family *is*
         -- the field's type -- leaving it unreduced would put machinery in a
@@ -564,14 +563,14 @@ fun letBody(s : Solver, c : LetCell) -> Unit {
 -- still be a variable, distinct from the header's others, about to be
 -- quantified by this binder, and constrained only by the context the header
 -- wrote. Otherwise the header claimed something inference did not deliver.
-fun checkRigid(s : Solver, c : LetCell, retainedPreds : Array PredCell) -> Unit {
+fun checkRigid(s : Solver, c : LetCell, retainedPreds : Vec PredCell) -> Unit {
     for (qualified, where, header, written) in c.rigid {
         -- Blamed by the name the author wrote, not the qualified one.
         let name = Ty.shortName(qualified)
-        let varNames = Array.new(len(header))
-        for (n, _) in header { Array.push(varNames, n) }
+        let varNames = Vec.new(len(header))
+        for (n, _) in header { Vec.push(varNames, n) }
         let seen = Ty.namer("")
-        for varName in Array.sort(varNames) {
+        for varName in Vec.sort(varNames) {
             var t = Ty.tUnit()
             for (n, v) in header { if n == varName { t = v } }
             match Ty.prune(t) {
@@ -618,7 +617,7 @@ fun predKey(p : Ty.Pred) -> String =
 
 -- Membership by the scope's own id: two scopes granting the same predicates are
 -- still two scopes, so structure cannot answer this.
-fun holdsScope(scopes : Array Scope, wanted : Scope) -> Bool {
+fun holdsScope(scopes : Vec Scope, wanted : Scope) -> Bool {
     for sc in scopes {
         if sc.id == wanted.id { return True }
     }
@@ -632,9 +631,9 @@ fun holdsScope(scopes : Array Scope, wanted : Scope) -> Bool {
 -- mentions a variable that appears in no type being generalized, so no use site
 -- will ever pin it. Choosing for one can unblock another, so the split is redone
 -- until it stops moving.
-fun split(s : Solver, types : Array Ty.Type) -> Array PredCell {
+fun split(s : Solver, types : Array Ty.Type) -> Vec PredCell {
     var going = True
-    var out = Array.new(0)
+    var out = []
     while going {
         let retainedPreds = retained(s, rank(s) - 1)
         -- An array literal's container is never quantified, even when the
@@ -643,9 +642,9 @@ fun split(s : Solver, types : Array Ty.Type) -> Array PredCell {
         -- choice per use. So such a binding takes the default -- `fun empty()
         -- = []` is `fun() -> Array a` -- and a use wanting another container
         -- is a plain mismatch against `Array` at that use.
-        let stranded = Array.filter(retainedPreds, isArrayLiteralDemand)
+        let stranded = Vec.filter(retainedPreds, isArrayLiteralDemand)
         for p in unattributed(retainedPreds, types) {
-            if !isArrayLiteralDemand(p) { Array.push(stranded, p) }
+            if !isArrayLiteralDemand(p) { Vec.push(stranded, p) }
         }
         if len(stranded) == 0 || !applyDefaults(s, stranded) {
             rejectStranded(s, stranded)
@@ -654,7 +653,7 @@ fun split(s : Solver, types : Array Ty.Type) -> Array PredCell {
         } else {
             -- Something was decided. Put the split back and settle again, so the
             -- choice is visible to everything that was waiting on it.
-            for p in retainedPreds { Array.push(s.deferred, p) }
+            for p in retainedPreds { Vec.push(s.deferred, p) }
             settle(s)
         }
     }
@@ -668,13 +667,13 @@ fun split(s : Solver, types : Array Ty.Type) -> Array PredCell {
 -- enclosing binding, and the parent pool adopts it so that the *next* binder
 -- sees it as its own. Doing this structurally is the point of the pools: there
 -- is no place left to forget it.
-fun dischargePool(s : Solver, young : Array VarCell) -> Unit {
+fun dischargePool(s : Solver, young : Vec VarCell) -> Unit {
     let left = rank(s) + 1
     for v in young {
         match Ty.prune(TVar(v)) {
             -- Bound during solving; unification adjusted what it points at.
             TVar(pruned) -> if pruned.level < left {
-                Array.push(s.pools[len(s.pools) - 1], pruned)
+                Vec.push(s.pools[len(s.pools) - 1], pruned)
             }
             _ -> {}
         }
@@ -696,12 +695,12 @@ fun dischargePool(s : Solver, young : Array VarCell) -> Unit {
 fun settle(s : Solver) -> Unit {
     while len(s.deferred) > 0 {
         improve(s)
-        let pending = Array.sortBy(s.deferred, fun(a, b) = {
+        let pending = Vec.sortBy(s.deferred, fun(a, b) = {
             let ka = if a.pred.name == Ty.equals { 0 } else { 1 }
             let kb = if b.pred.name == Ty.equals { 0 } else { 1 }
             Int.compare(ka, kb)
         })
-        s.deferred = Array.new(8)
+        s.deferred = Vec.new(8)
         for c in pending { solve(s, CPred(c)) }
         if len(s.deferred) >= len(pending) { return {} }
     }
@@ -957,7 +956,7 @@ fun fieldLabel(cls : String) -> Option String = match Classes.generatedLabel(cls
 -- reported at the call that supplied the record type.
 fun notVar(s : Solver, tycon : String, label : String, c : PredCell) -> Unit {
     match Decls.varFields(s.decls, tycon) {
-        Some(vars) -> if Array.contains(vars, label) { return {} }
+        Some(vars) -> if Vec.contains(vars, label) { return {} }
         None -> return {}
     }
     match Decls.fieldSpan(s.decls, tycon, label) {
@@ -1052,17 +1051,17 @@ fun memberType(p : Ty.Pred, name : String) -> Ty.Type =
 -- drop.
 fun improveNumeric(s : Solver) -> Unit {
     let merged = Map.new()
-    let out = Array.new(len(s.deferred))
+    let out = Vec.new(len(s.deferred))
     for c in s.deferred {
         if c.pred.name != oneOf || isArrayLiteralDemand(c) {
-            Array.push(out, c)
+            Vec.push(out, c)
             continue
         }
         let key = Ty.typeKey(c.pred.args[0])
         match Map.get(merged, key) {
             None -> {
                 Map.put(merged, key, c)
-                Array.push(out, c)
+                Vec.push(out, c)
             }
             Some(first) -> {
                 let names = intersect(setNames(first.pred.args[1], first.span),
@@ -1085,13 +1084,8 @@ fun setNames(t : Ty.Type, where : Option Span) -> Array String = match t {
     _ -> oops("a OneOf demand's second argument is not a set", where)
 }
 
-fun intersect(a : Array String, b : Array String) -> Array String {
-    let out = Array.new(len(a))
-    for x in a {
-        if Array.contains(b, x) { Array.push(out, x) }
-    }
-    out
-}
+fun intersect(a : Array String, b : Array String) -> Array String =
+    Array.filter(a, Array.contains(b, _))
 
 fun isArrayLiteralDemand(c : PredCell) -> Bool =
     c.pred.name == oneOf && Ty.isArrayLiteralSet(c.pred.args[1])
@@ -1105,7 +1099,7 @@ fun isArrayLiteralDemand(c : PredCell) -> Bool =
 --
 -- Only `OneOf` defaults. A stranded `HasField` is a genuine error: there is no
 -- preferred record type to guess.
-fun applyDefaults(s : Solver, stuck : Array PredCell) -> Bool {
+fun applyDefaults(s : Solver, stuck : Vec PredCell) -> Bool {
     var progress = False
     for c in stuck {
         if c.pred.name == oneOf && undecided(c) {
@@ -1139,7 +1133,7 @@ fun applyDefaults(s : Solver, stuck : Array PredCell) -> Bool {
 -- module as for one in a module that imports it, which is checked afterwards
 -- and could never decide it.
 fun decideTopLevelLiterals(s : Solver) -> Unit {
-    let open = Array.filter(s.deferred, fun(c) = isArrayLiteralDemand(c) && undecided(c))
+    let open = Vec.filter(s.deferred, fun(c) = isArrayLiteralDemand(c) && undecided(c))
     if applyDefaults(s, open) { settle(s) }
 }
 
@@ -1160,20 +1154,20 @@ fun undecided(c : PredCell) -> Bool {
 -- The test is the one generalization applies to type variables: a predicate tied
 -- to a variable created deeper than the binder travels in the scheme; one tied
 -- to an outer variable stays behind for an enclosing binding to settle.
-fun retained(s : Solver, level : Int) -> Array PredCell {
-    let keep = Array.new(len(s.deferred))
-    let out = Array.new(len(s.deferred))
+fun retained(s : Solver, level : Int) -> Vec PredCell {
+    let keep = Vec.new(len(s.deferred))
+    let out = Vec.new(len(s.deferred))
     let seen = Set.new()
     for c in s.deferred {
         if Ty.predLevel(c.pred) <= level {
-            Array.push(keep, c)
+            Vec.push(keep, c)
         } else {
             -- Two demands for the same field of the same type are one
             -- obligation; the context should not repeat itself.
             let key = Ty.predKey(c.pred)
             if !Set.contains(seen, key) {
                 Set.add(seen, key)
-                Array.push(out, c)
+                Vec.push(out, c)
             }
         }
     }
@@ -1182,7 +1176,7 @@ fun retained(s : Solver, level : Int) -> Array PredCell {
 }
 
 -- Report a predicate that can be neither discharged nor quantified.
-fun rejectStranded(s : Solver, stranded : Array PredCell) -> Unit {
+fun rejectStranded(s : Solver, stranded : Vec PredCell) -> Unit {
     if len(stranded) == 0 { return {} }
     let c = stranded[0]
     if c.pred.name == Ty.equals {
@@ -1256,7 +1250,7 @@ fun rejectStranded(s : Solver, stranded : Array PredCell) -> Unit {
 -- in the type is still determined, as long as some chain of predicates connects
 -- it to one that is. That functional reading is also why the usual ambiguity
 -- objection to a variable appearing only in the context does not apply here.
-fun reach(preds : Array PredCell, types : Array Ty.Type) -> Set.Set Int {
+fun reach[Iterator c, Item c ~ PredCell](preds : c, types : Array Ty.Type) -> Set.Set Int {
     let ids = Set.new()
     for v in Ty.varsOf(types) { Set.add(ids, v.id) }
     var changed = True
@@ -1282,21 +1276,21 @@ fun reach(preds : Array PredCell, types : Array Ty.Type) -> Set.Set Int {
 }
 
 -- The retained predicates that constrain one type.
-fun constrain(preds : Array PredCell, t : Ty.Type) -> Array Pred {
+fun constrain(preds : Vec PredCell, t : Ty.Type) -> Vec Pred {
     let ids = reach(preds, [t])
-    let out = Array.new(len(preds))
+    let out = Vec.new(len(preds))
     for c in preds {
-        if touches(c, ids) { Array.push(out, c.pred) }
+        if touches(c, ids) { Vec.push(out, c.pred) }
     }
     out
 }
 
 -- The retained predicates no scheme in the group will carry.
-fun unattributed(preds : Array PredCell, types : Array Ty.Type) -> Array PredCell {
+fun unattributed(preds : Vec PredCell, types : Array Ty.Type) -> Vec PredCell {
     let ids = reach(preds, types)
-    let out = Array.new(len(preds))
+    let out = Vec.new(len(preds))
     for c in preds {
-        if !touches(c, ids) { Array.push(out, c) }
+        if !touches(c, ids) { Vec.push(out, c) }
     }
     out
 }

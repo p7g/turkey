@@ -7,6 +7,8 @@ module Data.Array (
     fold,
     reverse,
     append,
+    copy,
+    fill,
     at,
     last,
     swap,
@@ -16,6 +18,7 @@ module Data.Array (
     sortBy,
     sort,
     threeWay,
+    ofStorage,
 )
 
 import Prelude ()
@@ -26,7 +29,7 @@ import Data.Int as Int
 import Data.Option.Type (Option(..))
 import Data.Ordering.Type (Ordering(..))
 import Data.String.Type as Str
-import Data.Array.Storage (outOfBounds, threeWay)
+import Data.Array.Storage (outOfBounds, checkRun, threeWay)
 import Data.Array.Storage as Storage
 
 -- A fixed-length array: its length is set when it is made and never changes,
@@ -43,6 +46,10 @@ import Data.Array.Storage as Storage
 type Array a = Array(Prim.Array a)
 
 fun raw(Array(storage)) = storage
+
+-- An `Array` of storage the caller made and hands over, for the rest of the
+-- library: a program cannot name a `Prim.Array`, or hold one to pass.
+fun ofStorage(storage : Prim.Array a) -> Array a = Array(storage)
 
 fun filled(length : Int, value : a) -> Array a = Array(Prim.arrayNew(length, value))
 
@@ -104,9 +111,27 @@ fun append(xs : Array a, ys : Array a) -> Array a {
     let n = len(xs)
     let m = len(ys)
     let out = Prim.arrayNewUninit(n + m)
-    for var i = 0; i < n; i = i + 1 { Prim.arraySet(out, i, xs[i]) }
-    for var j = 0; j < m; j = j + 1 { Prim.arraySet(out, n + j, ys[j]) }
+    Prim.arrayCopy(out, 0, raw(xs), 0, n)
+    Prim.arrayCopy(out, n, raw(ys), 0, m)
     Array(out)
+}
+
+-- Copy `count` elements of `source`, from index `from` on, over those of
+-- `target` from index `at` on. The two may be one array, and the runs may
+-- overlap: every element arrives as it was before the copy began. Panics
+-- unless both runs are inside their arrays.
+fun copy(target : Array a, at : Int, source : Array a, from : Int, count : Int)
+        -> Unit {
+    checkRun("copy into", at, count, len(target))
+    checkRun("copy from", from, count, len(source))
+    Prim.arrayCopy(raw(target), at, raw(source), from, count)
+}
+
+-- Set the `count` elements of `target` from index `at` on to `value`.
+-- Panics unless they are all elements of `target`.
+fun fill(target : Array a, at : Int, count : Int, value : a) -> Unit {
+    checkRun("fill", at, count, len(target))
+    Prim.arrayFill(raw(target), at, count, value)
 }
 
 -- -- reading without panicking -------------------------------------------------
@@ -136,7 +161,9 @@ fun slice(xs : Array a, from : Int, to : Int) -> Array a {
             Str.concat("array slice out of bounds: ", Int.toString(from)),
             Str.concat("..", Int.toString(to))))
     }
-    init(to - from, fun(i) = xs[from + i])
+    let out = Prim.arrayNewUninit(to - from)
+    Prim.arrayCopy(out, 0, raw(xs), from, to - from)
+    Array(out)
 }
 
 fun indexOf[Eq a](xs : Array a, wanted : a) -> Option Int {
@@ -226,10 +253,8 @@ instance Monad Array {
         let out = Prim.arrayNewUninit(total)
         var at = 0
         for part in parts {
-            for y in part {
-                Prim.arraySet(out, at, y)
-                at = at + 1
-            }
+            Prim.arrayCopy(out, at, raw(part), 0, len(part))
+            at = at + len(part)
         }
         Array(out)
     }

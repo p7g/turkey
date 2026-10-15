@@ -191,9 +191,10 @@ def probe(request, tmp_path):
     "Prim.arraySet(xs, -1, 7)",
 ])
 def test_an_access_outside_an_arrays_storage_panics(probe, access):
-    """The library checks an index against a growable array's logical length
-    first; this is the check under it, against the storage itself, which is
-    the one no race between tasks can get past."""
+    """The library checks an index first, for its own message, and a `Vec`
+    checks it against its logical length; this is the check under it, against
+    the storage itself, which is the one no race between tasks can get
+    past."""
     result = probe(f"""
 fun run() -> Unit {{
     let xs : Prim.Array Int = Prim.arrayNew(2, 0)

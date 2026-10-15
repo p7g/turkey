@@ -188,8 +188,9 @@ fun main() {
 }
 """)
     assert result.code == 0, result.stderr
-    stores = _accesses(result.stdout, "Main#main")
-    assert len(stores) == 3 and all(map(_proven, stores)), stores
+    accesses = _accesses(result.stdout, "Main#main")
+    stores = [line for line in accesses if "array.set" in line]
+    assert len(stores) == 3 and all(map(_proven, accesses)), accesses
 
 
 def test_a_string_pattern_reads_its_bytes_without_checks():
@@ -273,20 +274,47 @@ fun run() -> Unit { print(at(Prim.arrayNew(3, 5), 2)) }
     assert accesses and all(map(_proven, accesses)), accesses
 
 
-def test_indexing_in_a_loop_from_zero_drops_the_test_below_zero():
-    """Indexing an `Array` tests `i < 0` and `i >= length` before reading,
-    and an index counting up from 0 is never below it. The test against the
-    length stays: it reads the length field again, a value the loop's test
-    did not compare."""
-    result = lang.dump("ssa", """
-fun sum(xs : Array Int) -> Int {
-    var total = 0
-    for var i = 0; i < len(xs); i = i + 1 { total = total + xs[i] }
-    total
-}
+# An `Array` has one length, in its own header, and indexing one tests the
+# index against that length for its error message before the primitive access.
+# A loop bounded by `len(a)` implies that test, so it is folded away, and the
+# same facts prove the access: no message, no check against the storage.
 
-fun main() { print(sum([1, 2, 3])) }
+
+@pytest.mark.parametrize("loop", [
+    "for var i = 0; i < len(a); i = i + 1 { total = total + a[i] }",
+    "for x in a { total = total + x }",
+    "for var i = 0; i < len(a); i = i + 1 { a[i] = i }",
+], ids=["read", "iterate", "write"])
+def test_a_loop_over_an_array_carries_no_check(loop):
+    result = lang.dump("ssa", f"""
+fun walk(a : Array Int) -> Int {{
+    var total = 0
+    {loop}
+    total
+}}
+
+fun main() {{ print(walk([1, 2, 3])) }}
 """)
     assert result.code == 0, result.stderr
-    compares = _comparisons(result.stdout, "Main#sum")
-    assert len(compares) == 2, compares
+    body = _body(result.stdout, "Main#walk")
+    accesses = _accesses(result.stdout, "Main#walk")
+    assert accesses and all(map(_proven, accesses)), accesses
+    assert "outOfBounds" not in body, body
+    # Only the loop's own test against the length is left.
+    compares = _comparisons(result.stdout, "Main#walk")
+    assert len(compares) == 1, compares
+
+
+@pytest.mark.parametrize("access, message", [
+    ("print(a[5])", "array index out of bounds: read at index 5, length 3"),
+    ("a[5] = 0", "array index out of bounds: write at index 5, length 3"),
+    ("print(a[-1])", "array index out of bounds: read at index -1, length 3"),
+], ids=["read", "write", "negative"])
+def test_an_index_outside_an_array_panics_with_its_message(access, message):
+    result = lang.panics(f"""
+fun main() {{
+    let a = [1, 2, 3]
+    {access}
+}}
+""")
+    assert lang.panic_message(result) == message

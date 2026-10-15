@@ -1,11 +1,7 @@
 module Data.Array (
     Array,
-    new,
     filled,
     init,
-    push,
-    pop,
-    clear,
     map,
     filter,
     fold,
@@ -33,84 +29,64 @@ import Data.String.Type as Str
 import Data.Array.Storage (outOfBounds, threeWay)
 import Data.Array.Storage as Storage
 
-type ArrayStorage a = ArrayStorage {
-    var storage : Prim.Array a,
-    var length  : Int,
-}
+-- A fixed-length array: its length is set when it is made and never changes,
+-- and its elements can be assigned. Its one field cannot be assigned, so at run
+-- time an `Array` is the primitive array itself, with its length in the
+-- header. That header is the only length there is, so the test `get` and `set`
+-- make for the program's error message is also the one that keeps the access
+-- inside the storage, and in a loop bounded by `len(xs)` the compiler proves
+-- both away.
+--
+-- An array literal the program uses as an `Array` is built as this constructor
+-- applied to the primitive array, by name; renaming it means changing how the
+-- compiler lowers a literal in the same commit.
+type Array a = Array(Prim.Array a)
 
-type Array a = Array(ArrayStorage a)
+fun raw(Array(storage)) = storage
 
-fun state(Array(value)) = value
-
-fun new(capacity : Int) -> Array a = Array(ArrayStorage {
-    storage = Prim.arrayNewUninit(capacity),
-    length = 0,
-})
-
-fun filled(length : Int, value : a) -> Array a = Array(ArrayStorage {
-    storage = Prim.arrayNew(length, value),
-    length,
-})
+fun filled(length : Int, value : a) -> Array a = Array(Prim.arrayNew(length, value))
 
 -- Element `i` is `f(i)`, computed in order from 0.
 fun init(length : Int, f : fun(Int) -> a) -> Array a {
-    let out = new(length)
-    for var i = 0; i < length; i = i + 1 { push(out, f(i)) }
-    out
-}
-
-fun grow(xs : Array a) {
-    let data = state(xs)
-    let capacity = Prim.arrayLength(data.storage)
-    if data.length < capacity { return }
-    let nextCapacity = if capacity == 0 { 1 } else { capacity * 2 }
-    let storage = Prim.arrayNewUninit(nextCapacity)
-    for var i = 0; i < data.length; i = i + 1 {
-        Prim.arraySet(storage, i, Prim.arrayGet(data.storage, i))
-    }
-    data.storage = storage
-}
-
-fun push(xs : Array a, x : a) -> Unit {
-    grow(xs)
-    let data = state(xs)
-    Prim.arraySet(data.storage, data.length, x)
-    data.length = data.length + 1
-}
-
-fun pop(xs : Array a) -> Option a {
-    let data = state(xs)
-    if data.length == 0 { return None }
-    data.length = data.length - 1
-    Some(Prim.arrayGet(data.storage, data.length))
-}
-
--- Drop every element, keeping the capacity. The elements themselves are still
--- reachable from the storage until they are overwritten, which costs nothing a
--- compiler notices and saves the reallocation a fresh array would need.
-fun clear(xs : Array a) -> Unit {
-    state(xs).length = 0
-}
-
-fun bounds(xs : Array a, i : Int, operation : String) {
-    let length = state(xs).length
-    if i < 0 || i >= length { outOfBounds(operation, i, length) }
+    let out = Prim.arrayNewUninit(length)
+    for var i = 0; i < length; i = i + 1 { Prim.arraySet(out, i, f(i)) }
+    Array(out)
 }
 
 -- `f` of each element of `xs`, in order. `xs` is anything with a length that
 -- can be iterated, so a `Vec` maps straight to an `Array`.
+--
+-- The loop counts to the length rather than running to the end of the
+-- iteration, so every slot of the result is written: an iterator that ends
+-- early -- a `Vec` that `f` pops from -- panics instead of leaving a hole.
 fun map[Iterator c, Length c, Item c ~ a](xs : c, f : fun(a) -> b) -> Array b {
-    let out = new(len(xs))
-    for x in xs { push(out, f(x)) }
-    out
+    let n = len(xs)
+    let out = Prim.arrayNewUninit(n)
+    let cursor = iter(xs)
+    for var i = 0; i < n; i = i + 1 {
+        match next(xs, cursor) {
+            Some(x) -> Prim.arraySet(out, i, f(x))
+            None -> error("Array.map: fewer elements than the length")
+        }
+    }
+    Array(out)
 }
 
+-- How many elements are kept is known only at the end, and `keep` is called
+-- once per element, in order. So the kept ones go into scratch storage as long
+-- as `xs`, which is copied once into an array of their number unless they are
+-- all of it.
 fun filter(xs : Array a, keep : fun(a) -> Bool) -> Array a {
-    let out = new(len(xs))
+    let kept = Prim.arrayNewUninit(len(xs))
+    var count = 0
     for x in xs {
-        if keep(x) { push(out, x) }
+        if keep(x) {
+            Prim.arraySet(kept, count, x)
+            count = count + 1
+        }
     }
-    out
+    if count == Prim.arrayLength(kept) { return Array(kept) }
+    Array(Storage.copy(kept, count))
 }
 
 fun fold(xs : Array a, initial : b, step : fun(b, a) -> b) -> b {
@@ -120,20 +96,17 @@ fun fold(xs : Array a, initial : b, step : fun(b, a) -> b) -> b {
 }
 
 fun reverse(xs : Array a) -> Array a {
-    let out = new(len(xs))
-    var i = len(xs) - 1
-    while i >= 0 {
-        push(out, xs[i])
-        i = i - 1
-    }
-    out
+    let n = len(xs)
+    init(n, fun(i) = xs[n - 1 - i])
 }
 
 fun append(xs : Array a, ys : Array a) -> Array a {
-    let out = new(len(xs) + len(ys))
-    for x in xs { push(out, x) }
-    for y in ys { push(out, y) }
-    out
+    let n = len(xs)
+    let m = len(ys)
+    let out = Prim.arrayNewUninit(n + m)
+    for var i = 0; i < n; i = i + 1 { Prim.arraySet(out, i, xs[i]) }
+    for var j = 0; j < m; j = j + 1 { Prim.arraySet(out, n + j, ys[j]) }
+    Array(out)
 }
 
 -- -- reading without panicking -------------------------------------------------
@@ -156,18 +129,14 @@ fun swap(xs : Array a, i : Int, j : Int) -> Unit {
     xs[j] = x
 }
 
--- A copy, not a view. A view would alias storage that `push` is free to
--- reallocate out from under it, and the growth policy is deliberately not part
--- of this type's contract.
+-- A copy, not a view: writing to one leaves the other as it was.
 fun slice(xs : Array a, from : Int, to : Int) -> Array a {
     if from < 0 || to > len(xs) || from > to {
         error(Str.concat(
             Str.concat("array slice out of bounds: ", Int.toString(from)),
             Str.concat("..", Int.toString(to))))
     }
-    let out = new(to - from)
-    for var i = from; i < to; i = i + 1 { push(out, xs[i]) }
-    out
+    init(to - from, fun(i) = xs[from + i])
 }
 
 fun indexOf[Eq a](xs : Array a, wanted : a) -> Option Int {
@@ -182,12 +151,10 @@ fun contains[Eq a](xs : Array a, wanted : a) -> Bool = match indexOf(xs, wanted)
     None -> False
 }
 
+-- A stable sort, answering a new `Array`; `Data.Array.Storage` says how.
 fun sortBy(xs : Array a, compare : fun(a, a) -> Ordering) -> Array a {
-    let data = state(xs)
-    Array(ArrayStorage {
-        storage = Storage.sorted(data.storage, data.length, compare),
-        length = data.length,
-    })
+    let storage = raw(xs)
+    Array(Storage.sorted(storage, Prim.arrayLength(storage), compare))
 }
 
 fun sort[Ord a](xs : Array a) -> Array a = sortBy(xs, threeWay)
@@ -196,19 +163,25 @@ instance Index (Array a) {
     type Key = Int
     type Value = a
     fun get(xs, i) {
-        bounds(xs, i, "read at")
-        Prim.arrayGet(state(xs).storage, i)
+        let storage = raw(xs)
+        if i < 0 || i >= Prim.arrayLength(storage) {
+            outOfBounds("read at", i, Prim.arrayLength(storage))
+        }
+        Prim.arrayGet(storage, i)
     }
 }
 
 instance SetIndex (Array a) {
     fun set(xs, i, x) {
-        bounds(xs, i, "write at")
-        Prim.arraySet(state(xs).storage, i, x)
+        let storage = raw(xs)
+        if i < 0 || i >= Prim.arrayLength(storage) {
+            outOfBounds("write at", i, Prim.arrayLength(storage))
+        }
+        Prim.arraySet(storage, i, x)
     }
 }
 
-instance Length (Array a) { fun len(xs) = state(xs).length }
+instance Length (Array a) { fun len(xs) = Prim.arrayLength(raw(xs)) }
 
 type ArrayCursor = ArrayCursor { var at : Int }
 
@@ -216,15 +189,12 @@ instance Iterator (Array a) {
     type Item = a
     type Cursor = ArrayCursor
     fun iter(xs) = ArrayCursor { at = 0 }
-    -- Reads the storage directly rather than through `get`: the test against
-    -- `length` above is the one `get` would make, so making it twice costs a
-    -- compare per element and can never fail the second time with one task.
-    -- With several, the compiler's check against the storage's own length is
-    -- still what keeps the read inside the array.
+    -- Reads the storage directly rather than through `get`, whose test is the
+    -- one made here against the same length.
     fun next(xs, cur) {
-        let data = state(xs)
-        if cur.at >= data.length { return None }
-        let x = Prim.arrayGet(data.storage, cur.at)
+        let storage = raw(xs)
+        if cur.at >= Prim.arrayLength(storage) { return None }
+        let x = Prim.arrayGet(storage, cur.at)
         cur.at = cur.at + 1
         Some(x)
     }
@@ -242,23 +212,26 @@ instance Foldable Array {
     }
 }
 
-instance Functor Array {
-    fun map(xs, f) {
-        let out = new(len(xs))
-        for x in xs { push(out, f(x)) }
-        out
-    }
-}
+instance Functor Array { fun map(xs, f) = map(xs, f) }
 
 instance Applicative Array { fun pure(x) = [x] }
 
+-- Every `f(x)` is made first, so the result is allocated once, at their total
+-- length.
 instance Monad Array {
     fun bind(xs, f) {
-        let out = new(len(xs))
-        for x in xs {
-            for y in f(x) { push(out, y) }
+        let parts = map(xs, f)
+        var total = 0
+        for part in parts { total = total + len(part) }
+        let out = Prim.arrayNewUninit(total)
+        var at = 0
+        for part in parts {
+            for y in part {
+                Prim.arraySet(out, at, y)
+                at = at + 1
+            }
         }
-        out
+        Array(out)
     }
 }
 

@@ -119,12 +119,12 @@ def test_a_pattern_match_becomes_a_tag_test_and_a_branch():
 
 
 def test_a_single_variant_pattern_reads_no_tag():
-    """`Array a = Array(ArrayStorage a)` must not pay a tag test per access.
+    """`Vec a = Vec(VecStorage a)` must not pay a tag test per access.
 
     Reading the tag to compare it against the only value it can hold is a
     load, a compare and a branch on the hot path, and the arm it branches to
-    is unreachable. `Data.Array`'s accessors are inlined wherever they are
-    used and then dropped, so the program is checked whole: an array is the
+    is unreachable. `Data.Vec`'s accessors are inlined wherever they are
+    used and then dropped, so the program is checked whole: a `Vec` is the
     only sum it reads, and Option's two constructors are told apart without a
     tag.
     """

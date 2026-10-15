@@ -53,8 +53,9 @@ def test_the_literal_is_built_as_the_container_chosen() -> None:
                                "}\n")
     assert result.code == 0, result.stderr
     core = result.stdout
-    assert "Data.Vec#VecStorage" in core
-    assert "Data.Array#ArrayStorage" in core
+    assert "Data.Vec#Vec(Data.Vec#VecStorage([1], 1))" in core
+    # An `Array` is the primitive array under its constructor.
+    assert "Data.Array#Array([2])" in core
 
 
 def test_a_top_level_binding_is_decided_by_its_own_definition() -> None:

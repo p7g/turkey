@@ -16,12 +16,16 @@ take before the ABI this backend implements runs out.
 
 from __future__ import annotations
 
+import os
 import re
+import stat
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from tests.lang import check, types
+from tests import bootc, toolchain
+from tests.lang import check, program, run, types
 from tests.lang import CompileError
 
 _SAFE = re.compile(r"[^A-Za-z0-9_]")
@@ -247,3 +251,116 @@ def test_parameters_may_be_named_or_bare(probe):
         "module PROBE (f)\n"
         'foreign "probe" fun f(fd : Int, Prim.Ptr, count : Int) -> Int\n'))
     check(entry)
+
+
+# -- variadic functions ------------------------------------------------------
+
+# `open` with a mode and `fcntl` with an argument, which C declares variadic:
+# the mode and the argument follow the `...`. Darwin passes every variadic
+# argument on the stack and arm64 Linux in the registers, so a call that put
+# them where a named argument goes would work on one target and read garbage
+# on the other; the run is what checks that this target's call is the one its
+# libc reads.
+VARIADIC = """\
+module PROBE (create, descriptorFlags, setDescriptorFlags, close)
+
+import Target (OS(..))
+import Target as Target
+import Turkey.Ptr as Ptr
+
+foreign "open" fun openCreate(path : Prim.Ptr, flags : Int, ... mode : Int) -> Int
+foreign "fcntl" fun fcntl(fd : Int, command : Int) -> Int
+foreign "fcntl" fun fcntlWith(fd : Int, command : Int, ... argument : Int) -> Int
+foreign "close" fun close(fd : Int) -> Int
+
+-- `O_WRONLY | O_CREAT | O_EXCL`.
+fun createFlags() -> Int = match Target.os {
+    Darwin -> 0x0001 + 0x0200 + 0x0800
+    Linux -> 0x0001 + 0x0040 + 0x0080
+}
+
+fun create(path : String, mode : Int) -> Int {
+    let name = Ptr.toCString(path)
+    let fd = openCreate(Ptr.raw(name), createFlags(), mode)
+    Ptr.free(name)
+    fd
+}
+
+-- `F_GETFD` and `F_SETFD`, the same on both.
+fun descriptorFlags(fd : Int) -> Int = fcntl(fd, 1)
+fun setDescriptorFlags(fd : Int, flags : Int) -> Int = fcntlWith(fd, 2, flags)
+"""
+
+VARIADIC_MAIN = """\
+fun main() {
+    let fd = P.create("made", 0o640)
+    print(fd >= 0)
+    print(P.descriptorFlags(fd))
+    -- `FD_CLOEXEC`.
+    print(P.setDescriptorFlags(fd, 1))
+    print(P.descriptorFlags(fd))
+    print(P.close(fd))
+}
+"""
+
+
+def test_a_variadic_declaration_passes_its_trailing_arguments(probe, tmp_path):
+    """The mode reaches `open`, which the file's permissions show, and the
+    flag reaches `fcntl`, which reading it back shows."""
+    entry = probe(VARIADIC).replace("fun main() { }\n", VARIADIC_MAIN)
+    result = run(entry, cwd=tmp_path)
+    assert result.code == 0, result.stderr
+    assert result.stdout.split() == ["True", "0", "0", "1", "0"]
+    mask = os.umask(0)
+    os.umask(mask)
+    assert stat.S_IMODE((tmp_path / "made").stat().st_mode) == 0o640 & ~mask
+
+
+@pytest.mark.parametrize(("target", "on_stack"), [
+    ("arm64-darwin", True), ("arm64-linux", False)])
+def test_darwin_puts_variadic_arguments_on_the_stack(probe, target, on_stack):
+    """Darwin gives each variadic argument an 8-byte stack slot and no
+    register, whatever registers are left; Linux passes it as a named one."""
+    entry = program(probe(VARIADIC).replace("fun main() { }\n", VARIADIC_MAIN))
+    result = subprocess.run(
+        toolchain.command(bootc.binary(), *bootc.argv("select"), "--target",
+                          target, entry.name),
+        cwd=entry.parent, env=dict(os.environ, TURKEY_LIB=str(LIB)),
+        capture_output=True)
+    assert result.returncode == 0, result.stderr.decode()
+    stored = "[outgoing 0]" in result.stdout.decode()
+    assert stored == on_stack
+
+
+def test_a_variadic_marker_needs_an_argument_after_it(probe):
+    """A declaration fixes the type of every argument it passes, so a `...`
+    with nothing after it would declare no call at all."""
+    entry = probe((
+        "module PROBE (f)\n"
+        'foreign "open" fun f(path : Prim.Ptr, flags : Int, ...) -> Int\n'))
+    assert "must be followed by the variadic arguments" in fails(entry)
+
+
+def test_a_parameter_list_has_one_variadic_marker(probe):
+    entry = probe((
+        "module PROBE (f)\n"
+        'foreign "probe" fun f(a : Int, ... b : Int, ... c : Int) -> Int\n'))
+    assert "one '...'" in fails(entry)
+
+
+def test_a_foreign_definition_cannot_be_variadic():
+    """A Turkey body has no way to read C's variadic arguments."""
+    message = fails('foreign "probe" fun f(a : Int, ... b : Int) -> Int = a\n'
+                    "fun main() { }\n")
+    assert "cannot be variadic" in message
+
+
+def test_variadic_arguments_count_against_the_registers(probe):
+    """Darwin would pass the ninth on the stack, but Linux passes variadic
+    arguments as named ones, and a declaration is checked the same for
+    both."""
+    params = ", ".join(f"a{i} : Int" for i in range(7))
+    entry = probe((
+        "module PROBE (f)\n"
+        f'foreign "probe" fun f({params}, ... b : Int, c : Int) -> Int\n'))
+    assert "9 general arguments" in fails(entry)

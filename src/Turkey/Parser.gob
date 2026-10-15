@@ -720,7 +720,7 @@ fun parseForeignDecl(p : P) -> Decl {
     }
     skipToken(p, "fun")
     let name = text(expectWhat(p, "IDENT", "a function name"))
-    let params = parseForeignParams(p)
+    let (params, variadic) = parseForeignParams(p)
     if !eat(p, "->") {
         oops(p, "foreign '" + name + "' has no body, so it must state a return "
                 + "type; a C function that returns nothing writes '-> Unit'",
@@ -728,6 +728,11 @@ fun parseForeignDecl(p : P) -> Decl {
     }
     let ret = parseTypeExpr(p)
     if at(p, "{") || at(p, "=") {
+        if let Some((_, marker)) = variadic {
+            oops(p, "foreign '" + name + "' has a body, so it cannot be "
+                    + "variadic: a Turkey body has no way to read C's variadic "
+                    + "arguments", marker)
+        }
         -- Every parameter of a definition is a binder, and a name is what
         -- binds one; an unnamed parameter could never be read.
         for param in params {
@@ -750,22 +755,48 @@ fun parseForeignDecl(p : P) -> Decl {
             monomorphic = True, symbol = Some(symbol),
         })))
     }
+    let fixed = match variadic {
+        Some((at, _)) -> at
+        None -> len(params)
+    }
     DForeign(ForeignDecl {
-        span = s, name = name, symbol = symbol, params = params, ret = ret,
+        span = s, name = name, symbol = symbol, params = params, fixed = fixed,
+        ret = ret,
     })
 }
 
--- `(fd : Int, buf : Prim.Ptr)`, or `(Int, Prim.Ptr)`, or a mix.
+-- `(fd : Int, buf : Prim.Ptr)`, or `(Int, Prim.Ptr)`, or a mix, and where a
+-- `...` begins the variadic arguments, if one does: the index of the first
+-- parameter after it, and the marker's span.
 --
 -- Stored the way a signature's parameters are -- an annotated pattern -- so
 -- everything downstream reads a parameter's type off one shape whether it was
 -- named or not. Naming is allowed here and not there because the ambiguity
 -- `looksLikeSignature` exists to settle cannot arise: every parameter of a
 -- foreign signature states its type, so `x : T` is always a name.
-fun parseForeignParams(p : P) -> Vec Pat {
+--
+-- The marker stands before a parameter, not at the end of the list as C's
+-- does, because each declaration fixes the type of every argument it passes:
+-- `open` called with a mode is one declaration and `open` called without one
+-- another. So a `...` must have a parameter after it, and there is one per
+-- list.
+fun parseForeignParams(p : P) -> (Vec Pat, Option (Int, Span)) {
     skipToken(p, "(")
     let params = Vec.new(2)
+    var variadic = None
     while !at(p, ")") {
+        if at(p, "...") {
+            let marker = cur(p).span
+            if Option.isSome(variadic) {
+                oops(p, "a foreign parameter list has one '...'", marker)
+            }
+            step(p)
+            if at(p, ")") {
+                oops(p, "'...' must be followed by the variadic arguments "
+                        + "this declaration passes, each with its type", marker)
+            }
+            variadic = Some((len(params), marker))
+        }
         let tok = cur(p)
         if Token.kindName(tok.kind) == "IDENT"
                 && Token.kindName(peek(p, 1).kind) == ":" {
@@ -783,7 +814,7 @@ fun parseForeignParams(p : P) -> Vec Pat {
         if !eat(p, ",") { break }
     }
     skipToken(p, ")")
-    params
+    (params, variadic)
 }
 
 -- `[C a, Item c ~ Op]` -- a context, not a binder.

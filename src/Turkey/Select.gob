@@ -51,6 +51,7 @@ import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..), Term(..),
                    Func(..), Block(..))
 import Turkey.SsaLower as SsaLower
 import Turkey.SsaLower (Module(..))
+import Turkey.Target as Target
 
 type Unsupported = Unsupported { name : String, what : String }
 
@@ -64,6 +65,9 @@ type Sel = Sel {
     var stopped : Option String,
     -- The module's names, shared by every function in it.
     asm     : Asm,
+    -- Whether a C function's variadic arguments go on the stack whatever
+    -- registers are left, as Darwin passes them, rather than as named ones.
+    variadicsOnStack : Bool,
     -- Which values the collector must find at each safepoint, from the low IR.
     frame   : Roots.Frame,
     -- The low IR safepoint being selected, until its call is emitted and
@@ -144,11 +148,12 @@ fun widthOf(r : Rep) -> A.Width = match r.class_ {
 -- panic message is interned when the guard that raises it is emitted, so the
 -- table is complete only once every function has been walked, and the module
 -- emitter writes it after the code for exactly this reason.
-fun selectModule(m : Module, dialect : Asm.Dialect)
+fun selectModule(m : Module, target : Target.Target)
         -> (Vec (Func Inst), Vec Unsupported, Asm) {
     -- One `Asm` for the module, because a literal interned by one function is
     -- the same literal in the next and the root array is one array.
-    let asm = Asm.newAsm(m, dialect)
+    let asm = Asm.newAsm(m, Asm.dialectFor(target))
+    let variadicsOnStack = target.os == "Darwin"
     -- One selection per function, answering both the function and, if it
     -- stopped, why. Both come out of one run: selection and the root
     -- analysis inside it are the expensive part, and asking twice doubles
@@ -157,7 +162,7 @@ fun selectModule(m : Module, dialect : Asm.Dialect)
     -- table afterwards, in function order -- the order one selection after
     -- another would have met them in.
     let selected = Parallel.map(m.functions, fun(f) {
-        let s = start(f, asm)
+        let s = start(f, asm, variadicsOnStack)
         run(s)
         if Option.isNone(s.stopped) {
             -- The same two passes the low IR had, over what selection
@@ -181,7 +186,7 @@ fun selectModule(m : Module, dialect : Asm.Dialect)
     (done, skipped, asm)
 }
 
-fun start(f : Func Low, asm : Asm) -> Sel {
+fun start(f : Func Low, asm : Asm, variadicsOnStack : Bool) -> Sel {
     let g = Ssa.newFunc(f.name, f.result)
     -- The same value numbering, so a `Value` means the same thing on both
     -- sides and `reps` describes both. Selection only ever adds.
@@ -193,6 +198,7 @@ fun start(f : Func Low, asm : Asm) -> Sel {
     }
     g.entry = incoming(f, g)
     Sel { source = f, out = g, at = 0, stopped = None, asm = asm,
+          variadicsOnStack = variadicsOnStack,
           frame = Roots.analyze(f), pending = None, panicking = False,
           known = constantsOf(f), definedIn = [], definedAt = [],
           allocations = BitSet.new(len(f.reps)), place = (0, 0),
@@ -665,6 +671,14 @@ fun selectInst(s : Sel, i : Low) -> Unit {
             emit(s, A.Poll(b, n))
             emit(s, A.Mov(d, A.xzr, A.W64))
         }
+        -- Nothing at all, not even its unit result. The use was for
+        -- `Turkey.Roots`, which has already rooted the value at every
+        -- safepoint before this one. The result is left undefined because
+        -- nothing can read it: `Turkey.SsaLower` emits a keep-alive only
+        -- through `LowIr.effect`, which discards the value, and the machine
+        -- graph checks only that what is read is defined. A `mov` of `xzr`
+        -- here would survive as a dead write (`Turkey.Regalloc.touched`).
+        KeepAlive(_) -> {}
         ArrayLength(target) -> emit(s, A.Ldr(d, A.Offset(A.reg(target), 8), A.W64))
         CellLoad(target) -> emit(s, A.Ldr(d, A.Offset(A.reg(target), 0), A.W64))
         CellStore(target, v) -> {
@@ -856,19 +870,26 @@ fun selectInst(s : Sel, i : Low) -> Unit {
                 -- declaration already is the symbol, and the result's file
                 -- comes from the destination's representation rather than
                 -- from a table, because a declaration states the language
-                -- type C answers in. The stack case cannot arise -- `Infer`
+                -- type C answers in.
+                --
+                -- Named arguments past the registers cannot arise -- `Infer`
                 -- rejects a declaration with more arguments than the
                 -- registers hold, which is the same restriction this
                 -- `overflows` guards for a runtime call, made a rule instead
-                -- of a compiler stop.
-                Foreign(symbol) -> if overflows(passed) {
-                    stop(s, "a foreign call with stack arguments")
-                } else {
-                    -- `runtimeFor` and not the bare name: the object format
-                    -- decides how a C symbol is spelled, for this one as for
-                    -- `turkey_print`.
-                    call(s, d, want, Some(want), Some(calleeOf(s, symbol)),
-                         A.xzr, passed, A.Standard)
+                -- of a compiler stop. Variadic arguments count against the
+                -- registers too, except on Darwin, which passes every one of
+                -- them on the stack.
+                Foreign(symbol, fixed) -> {
+                    let inRegisters = if s.variadicsOnStack { fixed } else { len(passed) }
+                    if overflows(Array.slice(passed, 0, inRegisters)) {
+                        stop(s, "a foreign call with stack arguments")
+                    } else {
+                        -- `calleeOf` and not the bare name: the object format
+                        -- decides how a C symbol is spelled, for this one as
+                        -- for `turkey_print`.
+                        callStacking(s, d, want, Some(want), Some(calleeOf(s, symbol)),
+                                     A.xzr, passed, A.Standard, inRegisters)
+                    }
                 }
                 -- A closure: the code is slot 0 and the environment slot 1,
                 -- and the environment goes first, which is the uniform
@@ -1213,19 +1234,33 @@ fun move(s : Sel, d : Reg, dBank : A.Bank, a : Reg, aBank : A.Bank) -> Unit =
 -- a preallocated area at the bottom of the frame, so nothing moves `sp`.
 fun call(s : Sel, d : Reg, dBank : A.Bank, answers : Option A.Bank,
          sym : Option Asm.Symbol, indirect : Reg,
-         args : Array (Reg, A.Bank), convention : A.Convention) -> Unit {
+         args : Array (Reg, A.Bank), convention : A.Convention) -> Unit =
+    callStacking(s, d, dBank, answers, sym, indirect, args, convention, len(args))
+
+-- `call`, with every argument from index `stacked` on put on the stack
+-- whatever registers are left: a variadic C function's trailing arguments, on
+-- Darwin. Apple's arm64 convention gives each variadic argument its own
+-- 8-byte stack slots, in order up from the stack pointer at the call, and
+-- none of the registers, so they take the slots `call` gives an overflowing
+-- argument. An `int` among them is read from the low half of its slot.
+fun callStacking(s : Sel, d : Reg, dBank : A.Bank, answers : Option A.Bank,
+                 sym : Option Asm.Symbol, indirect : Reg,
+                 args : Array (Reg, A.Bank), convention : A.Convention,
+                 stacked : Int) -> Unit {
     let ins = []
     var general = 0
     var vector = 0
     var stack = 0
+    var k = 0
     for (a, bank) in args {
         -- Asked *before* the register is taken, not after. Asking after
         -- indexed the array with the index that overflowed it, and a
         -- nine-argument call panicked inside the compiler.
-        let full = match bank {
+        let full = k >= stacked || match bank {
             Gp -> general >= len(A.argRegs)
             Fp -> vector >= len(A.fpArgRegs)
         }
+        k = k + 1
         if full {
             emit(s, A.Str(a, A.OutgoingArg(stack), A.W64))
             stack = stack + 1

@@ -138,10 +138,13 @@ type Callee
     -- `Runtime` because the two are resolved differently: a runtime entry
     -- point is looked up in `Turkey.Runtime`'s fixed table, and this one is
     -- already the symbol -- what the program declared is what the linker is
-    -- asked for. No signature travels with it: every argument carries a `Rep`
-    -- and the result carries the destination's, so a full signature can be
-    -- read off any call site.
-    | Foreign(String)
+    -- asked for. Every argument carries a `Rep` and the result carries the
+    -- destination's, so the types of a signature can be read off any call
+    -- site. What cannot is where C's named parameters end, which the `Int`
+    -- is: the arguments from that index on are a variadic function's
+    -- trailing ones, and Darwin passes those differently. For a function that
+    -- is not variadic it is the number of arguments.
+    | Foreign(String, Int)
     -- Through a closure value.
     | Indirect(Value)
 
@@ -238,6 +241,11 @@ type Op
     -- A loop's poll for a collection (`Turkey.Polls`): a safepoint that is
     -- not a call on the path where nothing is asked of it.
     | Poll
+    -- A use of the value and nothing else: `Prim.keepAlive`. It emits no
+    -- machine instruction. What it does is keep the value live up to here, so
+    -- `Turkey.Roots` roots it at every safepoint before, and an object whose
+    -- address was handed to C is not freed while C may still use it.
+    | KeepAlive(Value)
     -- A `var`'s cell.
     | CellNew(Value)
     | CellLoad(Value)
@@ -424,6 +432,9 @@ fun effectsOf(op : Op) -> Effects = match op {
     -- Neither deleted nor moved: where it is, is the point of it.
     Ordered(_) -> combine(Ssa.reads_(), Ssa.writes())
     Poll -> combine(Ssa.reads_(), Ssa.writes())
+    -- The same, for the same reason: deleted, or moved above the call it
+    -- follows, it would stop keeping anything alive across that call.
+    KeepAlive(_) -> combine(Ssa.reads_(), Ssa.writes())
     CellNew(_) -> Ssa.allocates()
     CellLoad(_) -> Ssa.reads_()
     CellStore(_, _) -> Ssa.writes()
@@ -477,6 +488,7 @@ fun opUses(op : Op) -> Array Value = match op {
     Fill(_, a, b, c) -> [a, b, c]
     Ordered(a) -> [a]
     Poll -> []
+    KeepAlive(a) -> [a]
     ArrayGet(a, b, _) -> [a, b]
     ArraySet(a, b, c, _) -> [a, b, c]
     ArrayLength(a) -> [a]
@@ -528,6 +540,7 @@ fun mapUses(op : Op, f : fun(Value) -> Value) -> Op = match op {
     Fill(w, a, b, c) -> Fill(w, f(a), f(b), f(c))
     Ordered(a) -> Ordered(f(a))
     Poll -> Poll
+    KeepAlive(a) -> KeepAlive(f(a))
     ArrayGet(a, b, c) -> ArrayGet(f(a), f(b), c)
     ArraySet(a, b, c, d) -> ArraySet(f(a), f(b), f(c), d)
     ArrayLength(a) -> ArrayLength(f(a))
@@ -590,6 +603,7 @@ fun opResultRep(op : Op) -> Option Rep = match op {
     Move(_, _, _, _, _) -> Some(Ssa.untraced(Unit))
     Fill(_, _, _, _) -> Some(Ssa.untraced(Unit))
     Ordered(_) -> Some(Ssa.untraced(Unit))
+    KeepAlive(_) -> Some(Ssa.untraced(Unit))
     Atomic(_, _) -> Some(Ssa.untraced(I64))
     ArrayLength(_) -> Some(Ssa.untraced(I64))
     Intrinsic(k, _) -> Some(Ssa.untraced(intrinsicResult(k)))
@@ -816,7 +830,7 @@ type Allocation
 -- * **the runtime**: allocating unless it is on the short list below.
 fun allocatingOp(op : Op) -> Option String = match op {
     Call(Direct(_), _) -> None
-    Call(Foreign(_), _) -> None
+    Call(Foreign(_, _), _) -> None
     Call(Indirect(_), _) -> Some("calls through a closure or a dictionary")
     Call(Runtime(r), _) -> match r {
         Rt.SwapStack -> Some("switches stacks, and the code it switches to may allocate")
@@ -948,6 +962,7 @@ fun showOpName(op : Op) -> String = match op {
     Fill(_, _, _, _) -> "fill"
     Ordered(_) -> "ordered"
     Poll -> "poll"
+    KeepAlive(_) -> "keep.alive"
     ArrayGet(_, _, _) -> "array.get"
     ArraySet(_, _, _, _) -> "array.set"
     ArrayLength(_) -> "array.length"
@@ -961,7 +976,7 @@ fun showOpName(op : Op) -> String = match op {
     Call(callee, _) -> match callee {
         Direct(_) -> "call.direct"
         Runtime(_) -> "call.runtime"
-        Foreign(_) -> "call.foreign"
+        Foreign(_, _) -> "call.foreign"
         Indirect(_) -> "call.indirect"
     }
     GlobalLoad(_) -> "global.load"
@@ -1021,6 +1036,7 @@ instance Show Op {
         "fill." + Int.toString(width) + " " + v(target) + ", " + v(at) + ", " + v(value)
     Ordered(target) -> "ordered " + v(target)
     Poll -> "poll"
+    KeepAlive(a) -> "keep.alive " + v(a)
     ArrayGet(a, i, c) -> "array.get " + v(a) + ", " + v(i) + showCheck(c)
     ArraySet(a, i, x, c) -> "array.set " + v(a) + ", " + v(i) + ", " + v(x) + showCheck(c)
     ArrayLength(a) -> "array.length " + v(a)
@@ -1044,7 +1060,14 @@ instance Show Op {
     Call(callee, args) -> {
         let b = String.builder()
         String.push(b, "call " + show(callee))
-        for a in args { String.push(b, " " + v(a)) }
+        let fixed = match callee {
+            Foreign(_, n) -> n
+            _ -> len(args)
+        }
+        for var k = 0; k < len(args); k = k + 1 {
+            if k == fixed { String.push(b, " ...") }
+            String.push(b, " " + v(args[k]))
+        }
         String.build(b)
     }
     GlobalLoad(name) -> "global.load $" + name
@@ -1058,7 +1081,7 @@ instance Show Callee {
   fun show(c) = match c {
     Direct(name) -> "@" + name
     Runtime(r) -> "%" + Rt.routineName(r)
-    Foreign(name) -> "&" + name
+    Foreign(name, _) -> "&" + name
     Indirect(f) -> v(f)
   }
 }

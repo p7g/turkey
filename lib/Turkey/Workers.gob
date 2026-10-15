@@ -3,7 +3,8 @@ module Turkey.Workers (
     workSeen, sleepForWork, signalWork, collectionSeen, sleepForCollection, signalCollection, stopTheWorld, startTheWorld, stopEnter, stopLeave,
     stopWanted, stopped, running,
     blockEnter, blockExit, unblock, acquire, ended,
-    blockingRead, blockingWrite, blockingOpen, blockingCreat,
+    blockingRead, blockingWrite, blockingPread, blockingPwrite, blockingOpen, blockingClose,
+    blockingFstat,
 )
 
 -- The workers: the threads that run Turkey code, each with a record of its own
@@ -40,6 +41,7 @@ import Turkey.Libc as Libc
 import Turkey.Lock as Lock
 import Turkey.Memory as Memory
 import Turkey.Stack as Stack
+import Turkey.Sys as Sys
 
 -- At most this many workers, so that the tables below are allocated once.
 let limit : Int = 64
@@ -281,34 +283,61 @@ foreign "turkey_lock_acquire" fun acquire(mutex : Prim.Ptr) -> Unit {
 -- one is blocked for that time (`blockEnter`), so that a collection need not
 -- wait for it; every root its caller holds is in a frame, since the call to
 -- these is a safepoint. `foreign`, as `acquire` is, so that the frame they
--- record is their own. `System.IO` calls these rather than `Turkey.Libc`'s.
+-- record is their own. `Turkey.IO` calls these rather than `Turkey.Libc`'s.
+--
+-- Each answers in `Turkey.Sys.result`'s convention, and reads `errno` before
+-- `blockExit`: a worker held by a collection sleeps in a C call of its own,
+-- which may set `errno` over the one being reported.
 
 foreign "turkey_blocking_read" fun blockingRead(fd : Int, buf : Prim.Ptr, count : Int) -> Int {
     blockEnter(Prim.frameAddress())
-    let n = Libc.read(fd, buf, count)
+    let n = Sys.result(Libc.read(fd, buf, count))
     blockExit()
     n
 }
 
 foreign "turkey_blocking_write" fun blockingWrite(fd : Int, buf : Prim.Ptr, count : Int) -> Int {
     blockEnter(Prim.frameAddress())
-    let n = Libc.write(fd, buf, count)
+    let n = Sys.result(Libc.write(fd, buf, count))
     blockExit()
     n
 }
 
-foreign "turkey_blocking_open" fun blockingOpen(path : Prim.Ptr, flags : Int) -> Int {
+foreign "turkey_blocking_pread" fun blockingPread(fd : Int, buf : Prim.Ptr, count : Int,
+                                                  offset : Int) -> Int {
     blockEnter(Prim.frameAddress())
-    let fd = Libc.open(path, flags)
+    let n = Sys.result(Libc.pread(fd, buf, count, offset))
+    blockExit()
+    n
+}
+
+foreign "turkey_blocking_pwrite" fun blockingPwrite(fd : Int, buf : Prim.Ptr, count : Int,
+                                                    offset : Int) -> Int {
+    blockEnter(Prim.frameAddress())
+    let n = Sys.result(Libc.pwrite(fd, buf, count, offset))
+    blockExit()
+    n
+}
+
+foreign "turkey_blocking_open" fun blockingOpen(path : Prim.Ptr, flags : Int, mode : Int) -> Int {
+    blockEnter(Prim.frameAddress())
+    let fd = Sys.cResult(Libc.open(path, flags, mode))
     blockExit()
     fd
 }
 
-foreign "turkey_blocking_creat" fun blockingCreat(path : Prim.Ptr, mode : Int) -> Int {
+foreign "turkey_blocking_close" fun blockingClose(fd : Int) -> Int {
     blockEnter(Prim.frameAddress())
-    let fd = Libc.creat(path, mode)
+    let r = Sys.cResult(Libc.close(fd))
     blockExit()
-    fd
+    r
+}
+
+foreign "turkey_blocking_fstat" fun blockingFstat(fd : Int, buf : Prim.Ptr) -> Int {
+    blockEnter(Prim.frameAddress())
+    let r = Sys.cResult(Libc.fstat(fd, buf))
+    blockExit()
+    r
 }
 
 -- A worker thread's Turkey code has returned, which it does only when a panic

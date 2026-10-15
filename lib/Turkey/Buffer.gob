@@ -1,0 +1,195 @@
+module Turkey.Buffer (
+    Buffer(..), BufferCursor,
+    buffer, capacity, filled, room, clear, consume, push, append, bytes, toText, bytesOf,
+    appendText, view, limited, advance, compact, textOf,
+)
+
+-- `Buffer`, the window over a byte array that every read fills and every
+-- write empties, with its fields open to the library's I/O modules.
+-- `System.IO` re-exports the type abstractly with the public functions, so a
+-- program sees only those; `System.File` and the stream wrappers read and
+-- write the fields, and lend the storage to the kernel in place.
+--
+-- The invariant every function keeps: `0 <= start <= end <= limit <= length
+-- of storage`. The filled window is `start..end`, what a consumer has not yet
+-- taken; a read appends at `end`, and may go up to `limit`, which is the
+-- storage's length except while a caller lends the buffer with less room
+-- (`limited`).
+--
+-- The storage is made once and never replaced, so its one header is the only
+-- length there is, and an index checked against it cannot be torn by another
+-- task changing the buffer. Two tasks sharing one buffer may still see each
+-- other's half-done changes to `start` and `end`; that is a wrong answer, not
+-- an unsafe access, since every access goes through a checked window.
+--
+-- The Prelude does not import this module, but nothing here needs more than
+-- the few modules below, so they are named, and a module the Prelude does
+-- import may use it.
+
+import Prelude ()
+import Std.Classes
+import Data.Array (Array)
+import Data.Array as Array
+import Data.Bool.Type (Bool(..))
+import Data.Byte as Byte
+import Data.Int ()
+import Data.Option.Type (Option(..))
+import Data.String.Type (String(..))
+import Data.String.Type as Str
+import Turkey.IO as IO
+import Turkey.Scan as Scan
+
+type Buffer = Buffer {
+    storage   : Array Byte,
+    var start : Int,
+    var end   : Int,
+    var limit : Int,
+}
+
+-- An empty buffer that holds up to `capacity` bytes.
+fun buffer(capacity : Int) -> Buffer {
+    if capacity < 0 { Prim.error("a buffer's capacity cannot be negative") }
+    Buffer { storage = Array.filled(capacity, Byte.truncate(0)), start = 0, end = 0,
+             limit = capacity }
+}
+
+fun capacity(b : Buffer) -> Int = len(b.storage)
+
+-- How many bytes are in the window, not yet consumed.
+fun filled(b : Buffer) -> Int = b.end - b.start
+
+-- How many bytes a read may append before the buffer is full.
+fun room(b : Buffer) -> Int = b.limit - b.end
+
+-- Empty the window, making the whole capacity room again.
+fun clear(b : Buffer) -> Unit {
+    b.start = 0
+    b.end = 0
+}
+
+-- Drop `n` bytes from the front of the window. A window emptied this way
+-- starts again at the front, so that the room behind it is not lost.
+fun consume(b : Buffer, n : Int) -> Unit {
+    if n < 0 || n > b.end - b.start {
+        Prim.error("Buffer.consume: more bytes than the buffer holds")
+    }
+    b.start = b.start + n
+    if b.start == b.end { clear(b) }
+}
+
+-- Append one byte. Panics if there is no room.
+fun push(b : Buffer, x : Byte) -> Unit {
+    if b.end >= b.limit { Prim.error("Buffer.push: the buffer is full") }
+    b.storage[b.end] = x
+    b.end = b.end + 1
+}
+
+-- Append `source[from..to)`. Panics if there is not room for all of it.
+fun append(b : Buffer, source : Array Byte, from : Int, to : Int) -> Unit {
+    if to - from > b.limit - b.end { Prim.error("Buffer.append: not enough room") }
+    IO.copy(b.storage, b.end, source, from, to)
+    b.end = b.end + (to - from)
+}
+
+-- Append the bytes of `text` from byte `from` to byte `to`. Panics if there is
+-- not room for all of them.
+fun appendText(b : Buffer, text : String, from : Int, to : Int) -> Unit {
+    if to - from > b.limit - b.end { Prim.error("Buffer.append: not enough room") }
+    IO.copy(b.storage, b.end, Prim.castAs(Str.bytesOf(text)), from, to)
+    b.end = b.end + (to - from)
+}
+
+-- The window's bytes, in an array of their own.
+fun bytes(b : Buffer) -> Array Byte {
+    let out = Array.filled(b.end - b.start, Byte.truncate(0))
+    IO.copy(out, 0, b.storage, b.start, b.end)
+    out
+}
+
+-- The window as text, if it is well-formed UTF-8: a copy, checked as
+-- `String.fromBytes` checks one.
+fun toText(b : Buffer) -> Option String = textOf(b.storage, b.start, b.end)
+
+-- A buffer holding a copy of `text`'s bytes, full.
+fun bytesOf(text : String) -> Buffer {
+    let n = Prim.arrayLength(Str.bytesOf(text))
+    let b = buffer(n)
+    IO.copy(b.storage, 0, Prim.castAs(Str.bytesOf(text)), 0, n)
+    b.end = n
+    b
+}
+
+-- -- for the library ---------------------------------------------------------------
+
+-- A buffer sharing `b`'s storage whose window is `b`'s `from..to`, for
+-- handing part of a window on without copying it.
+fun view(b : Buffer, from : Int, to : Int) -> Buffer =
+    Buffer { storage = b.storage, start = from, end = to, limit = to }
+
+-- Run `f` with `b`'s room cut to at most `n` bytes, for a read that must not
+-- take more than it was asked for.
+fun limited(b : Buffer, n : Int, f : fun() -> a) -> a {
+    let saved = b.limit
+    if n < b.limit - b.end { b.limit = b.end + n }
+    let made = f()
+    b.limit = saved
+    made
+}
+
+-- Count `n` bytes just written into the room at `end` as filled.
+fun advance(b : Buffer, n : Int) -> Unit {
+    if n < 0 || n > b.limit - b.end { Prim.error("Buffer.advance: past the room") }
+    b.end = b.end + n
+}
+
+-- Move the window to the front of the storage, making all the room there is.
+-- The bytes move toward the start, which is the direction `IO.copy` allows
+-- for an overlapping copy.
+fun compact(b : Buffer) -> Unit {
+    if b.start == 0 { return () }
+    let n = b.end - b.start
+    IO.copy(b.storage, 0, b.storage, b.start, b.end)
+    b.start = 0
+    b.end = n
+}
+
+-- `source[from..to)` as a `String`, if it is well-formed UTF-8. The bytes are
+-- copied first and the copy is checked, so that a task changing `source`
+-- meanwhile cannot make the string ill-formed after its check.
+fun textOf(source : Array Byte, from : Int, to : Int) -> Option String {
+    let raw : Prim.Array Byte = Prim.arrayNewUninit(to - from)
+    -- A `Prim.Array Byte` is an `Array Byte` at run time: the one-field
+    -- newtype is erased.
+    IO.copy(Prim.castAs(raw), 0, source, from, to)
+    if Scan.wellFormed(raw, 0, to - from) { Some(String(raw)) } else { None }
+}
+
+-- -- instances ----------------------------------------------------------------------
+
+-- The `i`-th byte of the window.
+instance Index Buffer {
+    type Key = Int
+    type Value = Byte
+    fun get(b, i) {
+        if i < 0 || i >= b.end - b.start { Prim.error("Buffer: index outside the window") }
+        b.storage[b.start + i]
+    }
+}
+
+instance Length Buffer { fun len(b) = b.end - b.start }
+
+type BufferCursor = BufferCursor { var at : Int }
+
+-- The window's bytes, front to back, as the window is when each is asked
+-- for.
+instance Iterator Buffer {
+    type Item = Byte
+    type Cursor = BufferCursor
+    fun iter(b) = BufferCursor { at = 0 }
+    fun next(b, cur) {
+        if b.start + cur.at >= b.end { return None }
+        let x = b.storage[b.start + cur.at]
+        cur.at = cur.at + 1
+        Some(x)
+    }
+}

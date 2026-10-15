@@ -1,8 +1,26 @@
-module System.IO (readFile, readBytes, writeFile, Output, create, put, close,
-                  stderr, print, write)
+module System.IO (
+    -- buffers
+    Buffer, buffer, capacity, filled, room, clear, consume, push, append, bytes,
+    toText, bytesOf,
+    -- streams
+    Read(..), Write(..), Buffered, buffered, underlying, defaultCapacity,
+    Line(..), readLineInto, readLine, Lines, lines, ExactError(..), readExact,
+    readAll, CopyError(..), copy, writeText, DecodeError(..),
+    AnyRead, anyRead, AnyWrite, anyWrite,
+    IOError(..), ErrorKind(..),
+    -- files by path, and the standard streams
+    readFile, readBytes, writeFile, Output, create, put, close, stderr, print, write,
+)
 
--- Files, addressed as bytes, and the two standard streams.
+-- Streams of bytes, files addressed by path, and the standard streams.
 --
+-- **Streams.** A source of bytes is a `Read` and a sink a `Write`, each with
+-- its own error type, and bytes move between them through a `Buffer`, a
+-- window over a byte array that a read appends to and a write empties from.
+-- `Buffered` adds a buffer to any source or sink, and with it the line
+-- operations. `System.File` gives files their instances.
+--
+-- **Files by path**, the older interface below the streams:
 -- Reading answers `Option String` rather than `String` because a file is not
 -- guaranteed to be well-formed UTF-8 and a `String` is. The validation is
 -- `String.fromBytes`, the one checked way to build a `String` from bytes,
@@ -13,9 +31,431 @@ module System.IO (readFile, readBytes, writeFile, Output, create, put, close,
 -- of its own. The Prelude does not import this module, so it may use the
 -- Prelude, and only the programs that import it compile it.
 
+import Turkey.Buffer (Buffer(..), buffer, capacity, filled, room, clear, consume, push,
+                      append, bytes, toText, bytesOf)
+import Turkey.Buffer as Buf
+import Turkey.Errors (IOError(..), ErrorKind(..))
 import Turkey.IO as IO
+import Turkey.Scan as Scan
 import Turkey.Stdout (print, write, writeAll)
 import Turkey.Sys as Sys
+
+-- -- the classes --------------------------------------------------------------------
+
+-- A source of bytes. `readInto` appends to the buffer's room and answers how
+-- many bytes it appended: at least 1, or 0 only at the end of the input, and
+-- possibly fewer than there was room for. End of input is never an error.
+-- The buffer must have room; a call without any is a bug in the caller, and
+-- the library's own instances panic at it.
+--
+-- `ReadError` is the source's own error: `IOError` for a file or a pipe,
+-- `DecodeError` of the underlying source's for a layer that decodes. A
+-- function that wants one concrete error rather than lifting asks for it with
+-- an equality, `[Read r, ReadError r ~ IOError]`.
+class Read r {
+    type ReadError r
+    fun readInto(r, Buffer) -> Either (ReadError r) Int
+}
+
+-- A sink of bytes. `writeFrom` writes the buffer's whole window, or fails; it
+-- leaves the buffer as it was, so the caller decides when to clear it.
+-- `flush` pushes on whatever the sink holds back, through every layer.
+class Write w {
+    type WriteError w
+    fun writeFrom(w, Buffer) -> Either (WriteError w) Unit
+    fun flush(w) -> Either (WriteError w) Unit
+}
+
+-- What a decoding layer over a source fails with: the source's own error, or
+-- bytes that are not UTF-8.
+type DecodeError e = Underlying(e) | InvalidUTF8
+
+instance Show (DecodeError e) : Show e {
+    fun show(d) = match d {
+        Underlying(e) -> "Underlying(" + show(e) + ")"
+        InvalidUTF8 -> "InvalidUTF8"
+    }
+}
+
+instance Error (DecodeError e) : Error e {
+    fun message(d) = match d {
+        Underlying(e) -> message(e)
+        InvalidUTF8 -> "the input is not valid UTF-8"
+    }
+}
+
+-- -- buffered streams ---------------------------------------------------------------
+
+-- A source or a sink with a buffer of its own, so that many small reads or
+-- writes cost one system call per buffer. It is a `Read` when what it wraps
+-- is, and a `Write` when what it wraps is.
+--
+-- Not to be shared between tasks running at once without a lock of the
+-- program's own (`System.Sync.Mutex`). Sharing one is memory-safe, since
+-- every index into the buffer is checked, but the tasks can see each other's
+-- half-done reads.
+type Buffered r = Buffered { inner : r, held : Buffer }
+
+-- What `buffered` is given for a file or a pipe: large enough that a system
+-- call is rare, small enough that the window a line scan reads stays in the
+-- cache.
+let defaultCapacity : Int = 65536
+
+fun buffered(inner : r, capacity : Int) -> Buffered r =
+    Buffered { inner = inner, held = buffer(capacity) }
+
+-- What `b` wraps. Reading from it directly skips whatever `b` holds.
+fun underlying(b : Buffered r) -> r = b.inner
+
+-- A read at least as large as the buffer, made while the buffer is empty,
+-- goes straight into the caller's buffer: copying it through `b`'s would only
+-- add a copy.
+instance Read (Buffered r) : Read r {
+    type ReadError = ReadError r
+    fun readInto(Buffered { inner, held }, into) {
+        needsRoom(into)
+        if filled(held) == 0 {
+            if room(into) >= capacity(held) { return readInto(inner, into) }
+            clear(held)
+            let n = readInto(inner, held)?
+            if n == 0 { return Right(0) }
+        }
+        let n = smaller(filled(held), room(into))
+        Buf.append(into, held.storage, held.start, held.start + n)
+        consume(held, n)
+        Right(n)
+    }
+}
+
+-- A write at least as large as the buffer, made while the buffer is empty,
+-- goes straight to the sink.
+instance Write (Buffered w) : Write w {
+    type WriteError = WriteError w
+    fun writeFrom(b, from) {
+        let Buffered { inner, held } = b
+        var at = from.start
+        while at < from.end {
+            if filled(held) == 0 && from.end - at >= capacity(held) {
+                return writeFrom(inner, Buf.view(from, at, from.end))
+            }
+            if room(held) == 0 {
+                drainHeld(b)?
+                continue
+            }
+            let n = smaller(room(held), from.end - at)
+            Buf.append(held, from.storage, at, at + n)
+            at = at + n
+        }
+        Right(())
+    }
+    fun flush(b) {
+        drainHeld(b)?
+        let Buffered { inner, held = _ } = b
+        flush(inner)
+    }
+}
+
+-- Write out what `b` holds, and empty it.
+fun drainHeld[Write w](b : Buffered w) -> Either (WriteError w) Unit {
+    let Buffered { inner, held } = b
+    if filled(held) > 0 {
+        writeFrom(inner, held)?
+        clear(held)
+    }
+    Right(())
+}
+
+-- -- lines ----------------------------------------------------------------------------
+
+-- What `readLineInto` did. One word, with no allocation, when `e` is held at
+-- a pointer, as `IOError` and `DecodeError` are: it is answered once per
+-- line, and an `Either` with a value in each arm would be a heap object each
+-- time.
+--
+-- * `Got`: a whole line was appended, without its newline. The last line of
+--   an input that does not end in a newline is a line.
+-- * `Partial`: the output buffer filled before the line ended. What was
+--   appended is the line's start; the next call appends more of it.
+-- * `End`: the input has ended, and nothing was appended.
+-- * `Failed(e)`: the source failed.
+type Line e = Got | Partial | End | Failed(e)
+
+-- Append the next line's bytes, without the newline, to `out`, which the
+-- caller reuses from line to line: nothing is allocated, and nothing is
+-- checked, so it is the path for work on bytes -- counting lines, splitting
+-- fields, parsing numbers. A carriage return before the newline is kept.
+--
+-- A line longer than `b`'s buffer is copied across a buffer at a time; one
+-- longer than `out`'s room comes back `Partial`.
+fun readLineInto[Read r](b : Buffered r, out : Buffer) -> Line (ReadError r) {
+    let held = b.held
+    var any = False
+    while True {
+        if filled(held) == 0 {
+            clear(held)
+            match readInto(b.inner, held) {
+                Left(e) -> return Failed(e)
+                Right(n) -> if n == 0 { return if any { Got } else { End } }
+            }
+        }
+        let newline = Scan.newline(held.storage, held.start, held.end)
+        let stop = if newline < 0 { held.end } else { newline }
+        let n = stop - held.start
+        if n > room(out) {
+            let fits = room(out)
+            Buf.append(out, held.storage, held.start, held.start + fits)
+            consume(held, fits)
+            return Partial
+        }
+        Buf.append(out, held.storage, held.start, stop)
+        if newline >= 0 {
+            consume(held, n + 1)
+            return Got
+        }
+        consume(held, n)
+        any = True
+    }
+    End
+}
+
+-- The next line as a `String`, without its newline or a carriage return
+-- before it, or `None` at the end of the input. One string per line, checked
+-- as UTF-8.
+--
+-- A line that does not fit in the window is moved to the front of the buffer
+-- and the buffer refilled behind it; one longer than the whole buffer is
+-- gathered in a buffer of its own.
+fun readLine[Read r](b : Buffered r) -> Either (DecodeError (ReadError r)) (Option String) {
+    let held = b.held
+    var spill = buffer(0)
+    var scanned = held.start
+    while True {
+        let newline = Scan.newline(held.storage, scanned, held.end)
+        if newline >= 0 {
+            let line = finish(spill, held, newline)
+            consume(held, newline + 1 - held.start)
+            return line
+        }
+        if room(held) == 0 {
+            if held.start > 0 {
+                Buf.compact(held)
+            } else {
+                spill = spilled(spill, held)
+                clear(held)
+            }
+        }
+        scanned = held.end
+        match readInto(b.inner, held) {
+            Left(e) -> return Left(Underlying(e))
+            Right(n) -> if n == 0 {
+                if filled(held) == 0 && filled(spill) == 0 { return Right(None) }
+                let line = finish(spill, held, held.end)
+                clear(held)
+                return line
+            }
+        }
+    }
+    Right(None)
+}
+
+-- The line made of `spill` and `held[start..stop)`, without a final carriage
+-- return.
+fun finish(spill : Buffer, held : Buffer, stop : Int) -> Either (DecodeError e) (Option String) {
+    var source = held.storage
+    var from = held.start
+    var to = stop
+    if filled(spill) > 0 {
+        let whole = spilled(spill, Buf.view(held, held.start, stop))
+        source = whole.storage
+        from = whole.start
+        to = whole.end
+    }
+    if to > from && Byte.toInt(source[to - 1]) == 13 { to = to - 1 }
+    match Buf.textOf(source, from, to) {
+        Some(text) -> Right(Some(text))
+        None -> Left(InvalidUTF8)
+    }
+}
+
+-- `spill` with `more`'s window appended, in a larger buffer if it must be.
+fun spilled(spill : Buffer, more : Buffer) -> Buffer {
+    var into = spill
+    if room(spill) < filled(more) {
+        into = buffer(larger(2 * capacity(spill), filled(spill) + filled(more)))
+        Buf.append(into, spill.storage, spill.start, spill.end)
+    }
+    Buf.append(into, more.storage, more.start, more.end)
+    into
+}
+
+-- The lines of a source, as `readLine` reads them, until its end or its first
+-- error, which is the last item.
+type Lines r = Lines { reader : Buffered r, var finished : Bool }
+
+type LinesCursor = LinesCursor
+
+fun lines(b : Buffered r) -> Lines r = Lines { reader = b, finished = False }
+
+instance Iterator (Lines r) : Read r {
+    type Item = Either (DecodeError (ReadError r)) String
+    type Cursor = LinesCursor
+    fun iter(ls) = LinesCursor
+    fun next(ls, _) {
+        if ls.finished { return None }
+        match readLine(ls.reader) {
+            Left(e) -> {
+                ls.finished = True
+                Some(Left(e))
+            }
+            Right(None) -> {
+                ls.finished = True
+                None
+            }
+            Right(Some(line)) -> Some(Right(line))
+        }
+    }
+}
+
+-- -- whole transfers ------------------------------------------------------------------
+
+-- Why `readExact` read fewer bytes than it was asked for: the input ended
+-- first -- including before any of them, since a caller expecting a record
+-- wants one answer for "it is not there" -- or the source failed.
+type ExactError e = EndedEarly | ReadFailed(e)
+
+instance Show (ExactError e) : Show e {
+    fun show(x) = match x {
+        EndedEarly -> "EndedEarly"
+        ReadFailed(e) -> "ReadFailed(" + show(e) + ")"
+    }
+}
+
+-- Append exactly `n` bytes from `r` to `into`, for binary formats, and not one
+-- byte more: each read is given room for only what is still missing. Panics if
+-- `into` has less room than `n`.
+fun readExact[Read r](r : r, into : Buffer, n : Int) -> Either (ExactError (ReadError r)) Unit {
+    if room(into) < n { error("readExact: the buffer has less room than asked for") }
+    var missing = n
+    while missing > 0 {
+        let wanted = missing
+        match Buf.limited(into, wanted, fun() = readInto(r, into)) {
+            Left(e) -> return Left(ReadFailed(e))
+            Right(got) -> {
+                if got == 0 { return Left(EndedEarly) }
+                missing = missing - got
+            }
+        }
+    }
+    Right(())
+}
+
+-- Everything left in `r`, in a buffer as large as it needs, read 256 KiB at
+-- a time: more per call costs nothing, since the bytes are not scanned, and
+-- fewer costs system calls.
+fun readAll[Read r](r : r) -> Either (ReadError r) Buffer {
+    var out = buffer(transfer)
+    while True {
+        if room(out) == 0 {
+            let grown = buffer(2 * capacity(out))
+            Buf.append(grown, out.storage, out.start, out.end)
+            out = grown
+        }
+        let into = out
+        let n = Buf.limited(into, transfer, fun() = readInto(r, into))?
+        if n == 0 { break }
+    }
+    Right(out)
+}
+
+let transfer : Int = 262144
+
+-- Why `copy` stopped: the source failed, or the sink did.
+type CopyError a b = Reading(a) | Writing(b)
+
+-- Everything left in `r`, written to `w` through `via`, which is cleared
+-- before each read: how many bytes were copied. `w` is not flushed.
+fun copy[Read r, Write w](r : r, w : w, via : Buffer)
+        -> Either (CopyError (ReadError r) (WriteError w)) Int {
+    var total = 0
+    while True {
+        clear(via)
+        match readInto(r, via) {
+            Left(e) -> return Left(Reading(e))
+            Right(n) -> {
+                if n == 0 { break }
+                match writeFrom(w, via) {
+                    Left(e) -> return Left(Writing(e))
+                    Right(_) -> { total = total + n }
+                }
+            }
+        }
+    }
+    clear(via)
+    Right(total)
+}
+
+-- `text`'s bytes, written to `w`. They are copied, a buffer at a time, since a
+-- `Buffer` can be written into and a `String` must not be.
+fun writeText[Write w](w : w, text : String) -> Either (WriteError w) Unit {
+    let size = String.byteLength(text)
+    let chunk = buffer(smaller(size, defaultCapacity))
+    var at = 0
+    while at < size {
+        let n = smaller(size - at, capacity(chunk))
+        clear(chunk)
+        Buf.appendText(chunk, text, at, at + n)
+        writeFrom(w, chunk)?
+        at = at + n
+    }
+    Right(())
+}
+
+-- -- chosen at run time --------------------------------------------------------------
+
+-- Any source whose errors can be made `e`s: one type for "stdin or this
+-- file", decided at run time. A function that does not decide its source at
+-- run time takes `[Read r]` instead, which costs no indirect call; this one
+-- costs one per `readInto`, which is once per buffer, not per byte.
+type AnyRead e = AnyRead[s] { state : s, reading : fun(s, Buffer) -> Either e Int }
+
+instance Read (AnyRead e) {
+    type ReadError = e
+    fun readInto(AnyRead { state, reading }, into) = reading(state, into)
+}
+
+fun anyRead[Read r](r : r, lift : fun(ReadError r) -> e) -> AnyRead e =
+    AnyRead { state = r, reading = fun(s, into) = Either.mapLeft(readInto(s, into), lift) }
+
+-- `AnyRead`'s counterpart for sinks.
+type AnyWrite e = AnyWrite[s] {
+    state    : s,
+    writing  : fun(s, Buffer) -> Either e Unit,
+    flushing : fun(s) -> Either e Unit,
+}
+
+instance Write (AnyWrite e) {
+    type WriteError = e
+    fun writeFrom(AnyWrite { state, writing, flushing = _ }, from) = writing(state, from)
+    fun flush(AnyWrite { state, writing = _, flushing }) = flushing(state)
+}
+
+fun anyWrite[Write w](w : w, lift : fun(WriteError w) -> e) -> AnyWrite e =
+    AnyWrite {
+        state = w,
+        writing = fun(s, from) = Either.mapLeft(writeFrom(s, from), lift),
+        flushing = fun(s) = Either.mapLeft(flush(s), lift),
+    }
+
+-- -- underneath -----------------------------------------------------------------------
+
+fun needsRoom(into : Buffer) -> Unit {
+    if room(into) == 0 { error("readInto: the buffer has no room") }
+}
+
+fun smaller(a : Int, b : Int) -> Int = if a < b { a } else { b }
+fun larger(a : Int, b : Int) -> Int = if a > b { a } else { b }
+
+-- -- files by path --------------------------------------------------------------------
 
 -- The file's contents, or `None` if it cannot be read or is not well-formed
 -- UTF-8.

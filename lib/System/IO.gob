@@ -8,162 +8,48 @@ module System.IO (
     readAll, CopyError(..), copy, writeText, DecodeError(..),
     AnyRead, anyRead, AnyWrite, anyWrite,
     IOError(..), ErrorKind(..),
-    -- files by path, and the standard streams
-    readFile, readBytes, writeFile, Output, create, put, close, stderr, print, write,
+    -- the standard streams
+    Stdout, stdin, stdout, stderr, print, write,
 )
 
--- Streams of bytes, files addressed by path, and the standard streams.
+-- Streams of bytes, and the standard streams.
 --
 -- **Streams.** A source of bytes is a `Read` and a sink a `Write`, each with
 -- its own error type, and bytes move between them through a `Buffer`, a
 -- window over a byte array that a read appends to and a write empties from.
 -- `Buffered` adds a buffer to any source or sink, and with it the line
--- operations. `System.File` gives files their instances.
+-- operations. `System.File` gives files their instances, and opens them.
 --
--- **Files by path**, the older interface below the streams:
--- Reading answers `Option String` rather than `String` because a file is not
--- guaranteed to be well-formed UTF-8 and a `String` is. The validation is
--- `String.fromBytes`, the one checked way to build a `String` from bytes,
--- rather than something hidden inside the read, so a program
--- that wants the bytes themselves is not made to go through text to get them.
+-- **The standard streams.**
+--
+-- * `stdin()` is the one reader of the standard input the program has: every
+--   call answers the same `Buffered`, so that bytes one part of the program
+--   read ahead are not lost to another. Its buffer holds 8 KiB on a terminal
+--   and 64 KiB otherwise.
+-- * `stdout()` is the standard output that `print` and `write` write to,
+--   buffered once for the whole process (`Turkey.Stdout` says when it is
+--   written out), and safe to share between tasks. Its `flush` reports a
+--   failed write, which `print` does not.
+-- * `stderr()` is the standard error, unbuffered: every write is a system
+--   call. The standard output is written out before each, so that the two
+--   come out in the order the program wrote them.
+--
+-- Descriptors the program inherited keep their blocking mode: changing it
+-- would change it for every other process sharing them.
 --
 -- Written in Turkey over `Turkey.IO`'s system calls, with no runtime support
 -- of its own. The Prelude does not import this module, so it may use the
 -- Prelude, and only the programs that import it compile it.
 
+import System.File (stdin, stderr)
 import Turkey.Buffer (Buffer(..), buffer, capacity, filled, room, clear, consume, push,
                       append, bytes, toText, bytesOf)
 import Turkey.Buffer as Buf
 import Turkey.Errors (IOError(..), ErrorKind(..))
-import Turkey.IO as IO
 import Turkey.Scan as Scan
-import Turkey.Stdout (print, write, writeAll)
-import Turkey.Sys as Sys
-
--- -- the classes --------------------------------------------------------------------
-
--- A source of bytes. `readInto` appends to the buffer's room and answers how
--- many bytes it appended: at least 1, or 0 only at the end of the input, and
--- possibly fewer than there was room for. End of input is never an error.
--- The buffer must have room; a call without any is a bug in the caller, and
--- the library's own instances panic at it.
---
--- `ReadError` is the source's own error: `IOError` for a file or a pipe,
--- `DecodeError` of the underlying source's for a layer that decodes. A
--- function that wants one concrete error rather than lifting asks for it with
--- an equality, `[Read r, ReadError r ~ IOError]`.
-class Read r {
-    type ReadError r
-    fun readInto(r, Buffer) -> Either (ReadError r) Int
-}
-
--- A sink of bytes. `writeFrom` writes the buffer's whole window, or fails; it
--- leaves the buffer as it was, so the caller decides when to clear it.
--- `flush` pushes on whatever the sink holds back, through every layer.
-class Write w {
-    type WriteError w
-    fun writeFrom(w, Buffer) -> Either (WriteError w) Unit
-    fun flush(w) -> Either (WriteError w) Unit
-}
-
--- What a decoding layer over a source fails with: the source's own error, or
--- bytes that are not UTF-8.
-type DecodeError e = Underlying(e) | InvalidUTF8
-
-instance Show (DecodeError e) : Show e {
-    fun show(d) = match d {
-        Underlying(e) -> "Underlying(" + show(e) + ")"
-        InvalidUTF8 -> "InvalidUTF8"
-    }
-}
-
-instance Error (DecodeError e) : Error e {
-    fun message(d) = match d {
-        Underlying(e) -> message(e)
-        InvalidUTF8 -> "the input is not valid UTF-8"
-    }
-}
-
--- -- buffered streams ---------------------------------------------------------------
-
--- A source or a sink with a buffer of its own, so that many small reads or
--- writes cost one system call per buffer. It is a `Read` when what it wraps
--- is, and a `Write` when what it wraps is.
---
--- Not to be shared between tasks running at once without a lock of the
--- program's own (`System.Sync.Mutex`). Sharing one is memory-safe, since
--- every index into the buffer is checked, but the tasks can see each other's
--- half-done reads.
-type Buffered r = Buffered { inner : r, held : Buffer }
-
--- What `buffered` is given for a file or a pipe: large enough that a system
--- call is rare, small enough that the window a line scan reads stays in the
--- cache.
-let defaultCapacity : Int = 65536
-
-fun buffered(inner : r, capacity : Int) -> Buffered r =
-    Buffered { inner = inner, held = buffer(capacity) }
-
--- What `b` wraps. Reading from it directly skips whatever `b` holds.
-fun underlying(b : Buffered r) -> r = b.inner
-
--- A read at least as large as the buffer, made while the buffer is empty,
--- goes straight into the caller's buffer: copying it through `b`'s would only
--- add a copy.
-instance Read (Buffered r) : Read r {
-    type ReadError = ReadError r
-    fun readInto(Buffered { inner, held }, into) {
-        needsRoom(into)
-        if filled(held) == 0 {
-            if room(into) >= capacity(held) { return readInto(inner, into) }
-            clear(held)
-            let n = readInto(inner, held)?
-            if n == 0 { return Right(0) }
-        }
-        let n = smaller(filled(held), room(into))
-        Buf.append(into, held.storage, held.start, held.start + n)
-        consume(held, n)
-        Right(n)
-    }
-}
-
--- A write at least as large as the buffer, made while the buffer is empty,
--- goes straight to the sink.
-instance Write (Buffered w) : Write w {
-    type WriteError = WriteError w
-    fun writeFrom(b, from) {
-        let Buffered { inner, held } = b
-        var at = from.start
-        while at < from.end {
-            if filled(held) == 0 && from.end - at >= capacity(held) {
-                return writeFrom(inner, Buf.view(from, at, from.end))
-            }
-            if room(held) == 0 {
-                drainHeld(b)?
-                continue
-            }
-            let n = smaller(room(held), from.end - at)
-            Buf.append(held, from.storage, at, at + n)
-            at = at + n
-        }
-        Right(())
-    }
-    fun flush(b) {
-        drainHeld(b)?
-        let Buffered { inner, held = _ } = b
-        flush(inner)
-    }
-}
-
--- Write out what `b` holds, and empty it.
-fun drainHeld[Write w](b : Buffered w) -> Either (WriteError w) Unit {
-    let Buffered { inner, held } = b
-    if filled(held) > 0 {
-        writeFrom(inner, held)?
-        clear(held)
-    }
-    Right(())
-}
+import Turkey.Stdout (Stdout, stdout, print, write)
+import Turkey.ReadWrite (Read(..), Write(..), DecodeError(..), Buffered(..), buffered, underlying,
+                      defaultCapacity, needsRoom, smaller)
 
 -- -- lines ----------------------------------------------------------------------------
 
@@ -453,97 +339,4 @@ fun anyWrite[Write w](w : w, lift : fun(WriteError w) -> e) -> AnyWrite e =
 
 -- -- underneath -----------------------------------------------------------------------
 
-fun needsRoom(into : Buffer) -> Unit {
-    if room(into) == 0 { error("readInto: the buffer has no room") }
-}
-
-fun smaller(a : Int, b : Int) -> Int = if a < b { a } else { b }
 fun larger(a : Int, b : Int) -> Int = if a > b { a } else { b }
-
--- -- files by path --------------------------------------------------------------------
-
--- The file's contents, or `None` if it cannot be read or is not well-formed
--- UTF-8.
-fun readFile(path : String) -> Option String = match readBytes(path) {
-    Some(bs) -> String.fromBytes(bs)
-    None -> None
-}
-
--- The file's bytes, or `None` if it cannot be opened or read -- missing,
--- forbidden, a directory, a device that failed.
---
--- There is deliberately no "can this be read?" predicate beside it. There was
--- one, `canRead`, for a module search path that has to tell "no such file"
--- from "not UTF-8"; but its answer is stale by the time anything
--- acts on it, which is the check-then-use race POSIX's own `access` is
--- documented as. Reading *is* the question: a search path asks this, keeps
--- the first `Some`, and decodes it, so the two failures stay apart and there
--- is no window between asking and using.
-fun readBytes(path : String) -> Option (Vec Byte) {
-    let fd = IO.open(path, Sys.readOnly, 0)
-    if fd < 0 { return None }
-    drain(fd)
-}
-
--- Whether every byte was written. A failed write is an ordinary thing to want
--- to report -- a full disk, a read-only directory -- and unlike a failed read
--- there is no predicate that could be asked first without lying about the race.
-fun writeFile(path : String, contents : String) -> Bool {
-    let fd = openForWriting(path)
-    if fd < 0 { return False }
-    let written = writeAll(fd, contents)
-    let closed = IO.close(fd) == 0
-    written && closed
-}
-
--- A file written a piece at a time, for output too large to hold as one
--- string first. `create` empties the file if it exists, as `writeFile` does,
--- and answers `None` where `writeFile` would answer `False`.
---
--- Whether a piece was written is answered for each `put`, and `close` answers
--- whether the whole file reached the system: a write can fail late, at the
--- close, on a file system that defers it.
-type Output = Output(Int)
-
-fun create(path : String) -> Option Output {
-    let fd = openForWriting(path)
-    if fd < 0 { None } else { Some(Output(fd)) }
-}
-
-fun put(Output(fd), text : String) -> Bool = writeAll(fd, text)
-
-fun close(Output(fd)) -> Bool = IO.close(fd) == 0
-
--- The standard streams. `print` and `write` are the Prelude's, from
--- `Turkey.Stdout`, and re-exported here beside the rest of them.
-fun stderr(text : String) -> Unit { let _ = writeAll(2, text) }
-
--- -- underneath -----------------------------------------------------------------------
-
--- Write only, created if missing and emptied if not: `fopen(path, "wb")`.
--- 0o666, narrowed by the umask as `fopen` narrows it.
-fun openForWriting(path : String) -> Int =
-    IO.open(path, Int.or(Sys.writeOnly, Int.or(Sys.create(), Sys.truncate())), 0o666)
-
--- Everything left on `fd`, which is closed afterwards, or `None` if a read
--- failed. Read in chunks until `read` answers 0 rather than sized by `fstat`
--- first: a pipe or a device has no length to ask for, and a regular file can
--- change between the two calls.
-fun drain(fd : Int) -> Option (Vec Byte) {
-    let chunk = Array.filled(65536, Byte.truncate(0))
-    let out = []
-    loop {
-        let n = IO.read(fd, chunk, 0, len(chunk))
-        if n == 0 - Sys.eintr { continue }
-        if n < 0 {
-            let _ = IO.close(fd)
-            return None
-        }
-        if n == 0 { break }
-        -- The chunk's elements, 24 bytes past its header (`Turkey.IO`).
-        Vec.extendFromRaw(out, Prim.ptrAdd(Prim.objectAddress(chunk), 24), n)
-        Prim.keepAlive(chunk)
-    }
-    let _ = IO.close(fd)
-    Some(out)
-}

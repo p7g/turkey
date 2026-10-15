@@ -30,14 +30,14 @@ fun churn(n : Int) -> Int {
 
 fun main() {
     let (reader, worker) = Task.runScope(do {
-        let reader = Task.spawn(fun() = match IO.readFile("/dev/stdin") {
-            Some(text) -> String.byteLength(text)
-            None -> -1
+        let reader = Task.spawn(fun() = match IO.readAll(IO.stdin()) {
+            Right(bytes) -> IO.filled(bytes)
+            Left(_) -> -1
         })?
         let worker = Task.spawn(fun() {
             var total = 0
             for var k = 0; k < 40; k = k + 1 { total = total + churn(k) }
-            IO.stderr("churned\\n")
+            let _ = IO.writeText(IO.stderr(), "churned\\n")
             total
         })?
         pure((reader, worker))

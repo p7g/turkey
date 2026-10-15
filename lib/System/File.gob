@@ -4,6 +4,7 @@ module System.File (
     openRead, create, openAppend, openReadWrite, close, path, use,
     readAt, writeAt,
     readAll, readText, writeAll, writeText,
+    stdin, stderr,
 )
 
 -- Files, open: a `Read` and a `Write` over a descriptor, with what can be
@@ -36,13 +37,14 @@ module System.File (
 -- Every descriptor is opened close-on-exec, so a process started later does
 -- not inherit it by accident.
 
-import System.IO (Read(..), Write(..), DecodeError(..), IOError)
-import System.IO as IO
 import Turkey.Buffer (Buffer(..))
 import Turkey.Buffer as Buf
+import Turkey.Errors (IOError)
 import Turkey.Errors as Errors
 import Turkey.Fd as Fd
 import Turkey.IO as Calls
+import Turkey.Stdout as Stdout
+import Turkey.ReadWrite (Read(..), Write(..), DecodeError(..), Buffered, buffered, defaultCapacity)
 import Turkey.Sys as Sys
 
 -- -- modes ----------------------------------------------------------------------------
@@ -66,13 +68,17 @@ instance CanWriteAt WriteOnly {}
 instance CanWriteAt ReadWrite {}
 
 -- An open file: its descriptor, shared safely between tasks, and the path it
--- was opened by, for messages.
-type File m = File { fd : Fd.Fd, name : String }
+-- was opened by, for messages. `stdoutFirst` is set for the standard error,
+-- and for the standard input on a terminal: the standard output's buffer is
+-- written out before each operation, so that a prompt appears before the read
+-- waits, and the two output streams come out in the order they were written.
+type File m = File { fd : Fd.Fd, name : String, stdoutFirst : Bool }
 
 instance Read (File m) : CanRead m {
     type ReadError = IOError
     fun readInto(f, into) {
         if into.limit == into.end { error("readInto: the buffer has no room") }
+        if f.stdoutFirst { Stdout.flushPending() }
         let n = Fd.read(fileFd(f), into.storage, into.end, into.limit)
         if n < 0 { return Left(failed(f, "read", n)) }
         into.end = into.end + n
@@ -83,6 +89,7 @@ instance Read (File m) : CanRead m {
 instance Write (File m) : CanWrite m {
     type WriteError = IOError
     fun writeFrom(f, from) {
+        if f.stdoutFirst { Stdout.flushPending() }
         let n = Fd.write(fileFd(f), from.storage, from.start, from.end)
         if n < 0 { Left(failed(f, "write", n)) } else { Right(()) }
     }
@@ -127,7 +134,7 @@ fun close(f : File m) -> Either IOError Unit {
     if r < 0 { Left(failed(f, "close", r)) } else { Right(()) }
 }
 
-fun path(f : File m) -> String = match f { File { fd = _, name } -> name }
+fun path(f : File m) -> String = f.name
 
 -- `body` of the file `opening` opened, which is then closed: the body's error,
 -- if it failed; otherwise the close's, if that failed; otherwise the body's
@@ -209,7 +216,7 @@ fun readText(path : String) -> Either (DecodeError IOError) String {
         Left(e) -> return Left(Underlying(e))
         Right(bytes) -> bytes
     }
-    match IO.toText(bytes) {
+    match Buf.toText(bytes) {
         Some(text) -> Right(text)
         None -> Left(InvalidUTF8)
     }
@@ -226,15 +233,34 @@ fun writeText(path : String, text : String) -> Either IOError Unit =
         if n < 0 { Left(failed(f, "write", n)) } else { Right(()) }
     })
 
+-- -- the standard streams ----------------------------------------------------------
+
+-- `System.IO` re-exports these beside `stdout`, and says what they are. They
+-- are defined here because a `File` is made only here.
+
+-- The standard input, read through the one buffer the program has for it.
+fun stdin() -> Buffered (File ReadOnly) = standardInput
+
+-- The standard error, unbuffered.
+fun stderr() -> File WriteOnly = standardError
+
+let standardInput : Buffered (File ReadOnly) = {
+    let terminal = Calls.isatty(0) == 1
+    let f = File { fd = Fd.fd(0), name = "<stdin>", stdoutFirst = terminal }
+    buffered(f, if terminal { 8192 } else { defaultCapacity })
+}
+
+let standardError : File WriteOnly = File { fd = Fd.fd(2), name = "<stderr>", stdoutFirst = True }
+
 -- -- underneath -----------------------------------------------------------------------
 
 fun opened(path : String, flags : Int, permissions : Int) -> Either IOError (File m) {
     let number = Calls.open(path, Int.or(flags, Sys.closeOnExec()), permissions)
     if number < 0 { return Left(Errors.failure("open", Some(path), number)) }
-    Right(File { fd = Fd.fd(number), name = path })
+    Right(File { fd = Fd.fd(number), name = path, stdoutFirst = False })
 }
 
-fun fileFd(f : File m) -> Fd.Fd = match f { File { fd, name = _ } -> fd }
+fun fileFd(f : File m) -> Fd.Fd = f.fd
 
 fun failed(f : File m, op : String, result : Int) -> IOError =
     Errors.failure(op, Some(path(f)), result)

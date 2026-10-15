@@ -74,16 +74,16 @@ def test_exit_chooses_the_status_and_stops(tmp_path: Path) -> None:
 
 
 ROUND_TRIP = """
-import System.IO as IO
+import System.File as File
 import Data.String as S
 
 fun main() {
-    print(Bool.toString(IO.writeFile("out.txt", "wrote\\nthis\\n")))
-    match IO.readFile("out.txt") {
-        Some(text) -> print(Int.toString(len(S.lines(text))))
-        None -> print("could not read back")
+    print(Either.isRight(File.writeText("out.txt", "wrote\\nthis\\n")))
+    match File.readText("out.txt") {
+        Right(text) -> print(Int.toString(len(S.lines(text))))
+        Left(_) -> print("could not read back")
     }
-    print(Bool.toString(IO.writeFile("no/such/dir/out.txt", "x")))
+    print(Either.isRight(File.writeText("no/such/dir/out.txt", "x")))
 }
 """
 
@@ -92,24 +92,26 @@ def test_write_then_read(tmp_path: Path) -> None:
     result = _run(ROUND_TRIP, tmp_path)
     assert result.code == 0, result.stderr
     # Written, read back as two lines, and a write into a directory that is not
-    # there answers False rather than panicking.
+    # there fails rather than panicking.
     assert result.stdout == "True\n2\nFalse\n"
     assert (tmp_path / "out.txt").read_text() == "wrote\nthis\n"
 
 
 INVALID_UTF8 = """
+import System.File as File
 import System.IO as IO
 
 fun main() {
-    match IO.readFile("bytes.bin") {
-        Some(_) -> print("read ill-formed bytes as a String")
-        None -> print("not UTF-8")
+    match File.readText("bytes.bin") {
+        Right(_) -> print("read ill-formed bytes as a String")
+        Left(IO.InvalidUTF8) -> print("not UTF-8")
+        Left(IO.Underlying(e)) -> print(e)
     }
 }
 """
 
 
-def test_a_file_that_is_not_utf8_reads_as_none(tmp_path: Path) -> None:
+def test_a_file_that_is_not_utf8_is_not_text(tmp_path: Path) -> None:
     # The invariant is the point: a `String` is well-formed UTF-8, so the
     # validating constructor is what stands between a file and one.
     (tmp_path / "bytes.bin").write_bytes(b"\xff\xfe\x00")

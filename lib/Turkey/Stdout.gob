@@ -1,45 +1,254 @@
-module Turkey.Stdout (print, write, writeAll)
+module Turkey.Stdout (
+    Stdout, stdout, print, write, putBytes, flush, flushPending,
+)
 
--- `print` and `write`, which the Prelude exports, and so the one part of the
--- standard streams every program compiles.
+-- The standard output: one buffer for the whole process, behind a lock, which
+-- `print`, `write` and `System.IO.stdout()` all go through, so that what they
+-- write comes out in the order the program wrote it.
 --
 -- Kept apart from `System.IO` because the Prelude imports this module: what it
--- imports cannot import the Prelude, and so cannot import anything that does,
--- such as the scheduler a descriptor's lock suspends tasks through. This
--- module therefore names each library module it uses, and `System.IO`, which
--- only programs that ask for it compile, is free to use the Prelude.
+-- imports cannot import the Prelude. This module therefore names each library
+-- module it uses, and `System.IO`, which only programs that ask for it
+-- compile, is free to use the Prelude.
 --
--- A failed write to stdout is not reported: there is nowhere to report it to,
--- and a program whose stdout is a closed pipe should not have to test every
--- line it prints.
+-- **When the buffer is written out.** Whether the descriptor is a terminal is
+-- asked once, as the program starts:
 --
--- A line is one string, newline included, so that it goes out in one `write`
--- where the kernel allows it: two processes sharing a terminal interleave by
--- line and not by fragment.
+-- * on a terminal, the buffer holds 8 KiB and is written out after every
+--   line, so that a line appears as soon as it is printed;
+-- * otherwise it holds 64 KiB and is written out when it fills, up to its
+--   last newline, the partial line after it moved to the front. A single line
+--   longer than the buffer is written as it stands;
+-- * a piece of text at least as large as the whole buffer is written straight
+--   to the descriptor, after what the buffer held;
+-- * `System.IO` writes it out before every write to the standard error, and
+--   before every read of the standard input when that is a terminal
+--   (`flushPending`);
+-- * `Turkey.Entry` writes it out however the program ends: `main` returning,
+--   an exit, or a panic, before the panic's message.
+--
+-- Every write but the last of a line longer than the buffer ends at a
+-- newline, so lines from other processes writing the same pipe or terminal
+-- fall between this program's lines, not inside them, as far as the kernel
+-- keeps one `write` together.
+--
+-- **The lock** suspends a task that finds it held, and its worker runs other
+-- tasks; it is `System.Sync`'s mutex, written again here because that module
+-- uses the Prelude. `print` appends its whole line under it, so lines from
+-- tasks running at once never tear. Writing the buffer out happens under it
+-- too, so a task printing while another writes waits for the write.
+--
+-- **Failures.** A failed write through `print` or `write` is not reported to
+-- them: a program whose standard output is a closed pipe should not have to
+-- test every line it prints. The bytes are dropped and the first failure is
+-- kept until `flush` reports it.
 
 import Prelude ()
 import Std.Classes
+import Data.Array (Array)
+import Data.Array as Array
 import Data.Bool.Type (Bool(..))
+import Data.Byte as Byte
+import Data.Int ()
 import Data.String.Type as Str
+import Data.Vec (Vec)
+import Data.Vec as Vec
+import Turkey.Coroutine as Co
 import Turkey.IO as IO
+import Turkey.Process as Process
+import Turkey.Scan as Scan
+import Turkey.Scheduler as Scheduler
 import Turkey.Sys as Sys
 
-fun print(x) { let _ = writeAll(1, Str.concat(show(x), "\n")) }
-fun write(x) { let _ = writeAll(1, show(x)) }
+-- `held` and `storage` are the record's first two fields, and `state` its
+-- third, because `Turkey.Entry` reads them by offset as the program ends: it
+-- may hold no traced value across a call, so it reads the record through the
+-- address `Turkey.Process.standardOutput` keeps. The buffered bytes are
+-- `storage[0..held)`. `state` is the lock's word: 0 free, 1 held, 2 held
+-- and perhaps waited for, as `System.Sync`'s mutex keeps it. Both change
+-- after the record is built, so both are `var`.
+type Stdout = Stdout {
+    var held    : Int,
+    storage     : Array Byte,
+    var state   : Int,
+    var waiters : Vec Co.Coroutine,
+    lines       : Bool,
+    var failure : Int,
+}
 
--- Whether all of `text` reached `fd`. `write` may take fewer bytes than it
--- was offered -- a pipe, a signal -- so it is asked again from where it
--- stopped, and again at once if a signal interrupted it before it took any.
--- Any other failure ends it; so does 0, which for a non-empty request would
--- otherwise loop.
-fun writeAll(fd : Int, text : String) -> Bool {
-    let size = Prim.arrayLength(Str.bytesOf(text))
-    var done = 0
-    while done < size {
-        let n = IO.writeText(fd, text, done, size)
-        if n == 0 - Sys.eintr { continue }
-        if n <= 0 { return False }
-        done = done + n
+-- The one there is, made as the program starts.
+let out : Stdout = opened()
+
+fun stdout() -> Stdout = out
+
+fun opened() -> Stdout {
+    let terminal = IO.isatty(1) == 1
+    let capacity = if terminal { 8192 } else { 65536 }
+    let s = Stdout { held = 0, storage = Array.filled(capacity, Byte.truncate(0)),
+                     state = 0, waiters = [], lines = terminal, failure = 0 }
+    Process.standardOutputSet(Prim.objectAddress(s))
+    s
+}
+
+-- Where an object's fields start, and so the lock word's offset as the
+-- atomic primitives take it: the third field.
+let stateAt : Int = 40
+
+fun print(x) {
+    let text = Str.bytesOf(show(x))
+    lock()
+    put(Prim.castAs(text), 0, Prim.arrayLength(text))
+    if out.held == len(out.storage) { makeRoom() }
+    out.storage[out.held] = Byte.truncate(10)
+    out.held = out.held + 1
+    if out.lines { drain(out.held) }
+    unlock()
+}
+
+fun write(x) {
+    let text = Str.bytesOf(show(x))
+    putBytes(Prim.castAs(text), 0, Prim.arrayLength(text))
+}
+
+-- `bytes[from..to)`, written out at once on a terminal if they hold a
+-- newline.
+fun putBytes(bytes : Array Byte, from : Int, to : Int) -> Unit {
+    lock()
+    put(bytes, from, to)
+    if out.lines && Scan.newline(bytes, from, to) >= 0 { drain(out.held) }
+    unlock()
+}
+
+-- Write out everything held: 0, or the negated `errno` of the first write
+-- that failed since the last `flush`, which it then forgets.
+fun flush() -> Int {
+    lock()
+    drain(out.held)
+    let failure = out.failure
+    out.failure = 0
+    unlock()
+    failure
+}
+
+-- Write out anything held, before something that must come after it. The
+-- test without the lock costs nothing when the buffer is empty, which is the
+-- usual case; a print racing it from another task is ordered by the lock,
+-- before or after, as it would be without the test.
+fun flushPending() -> Unit {
+    if out.held > 0 {
+        lock()
+        drain(out.held)
+        unlock()
     }
-    True
+}
+
+-- -- underneath -----------------------------------------------------------------------
+
+-- Append `bytes[from..to)`, under the lock.
+fun put(bytes : Array Byte, from : Int, to : Int) -> Unit {
+    let capacity = len(out.storage)
+    var at = from
+    while at < to {
+        let room = capacity - out.held
+        if to - at <= room {
+            IO.copy(out.storage, out.held, bytes, at, to)
+            out.held = out.held + (to - at)
+            return {}
+        }
+        if to - at >= capacity {
+            drain(out.held)
+            let _ = writeOut(bytes, at, to)
+            return {}
+        }
+        if room == 0 {
+            makeRoom()
+        } else {
+            IO.copy(out.storage, out.held, bytes, at, at + room)
+            out.held = capacity
+            at = at + room
+        }
+    }
+}
+
+-- Make room in a full buffer: write it out up to and including its last
+-- newline, or all of it if one line fills it. The search goes back from the
+-- end, so it reads one partial line, once per buffer.
+fun makeRoom() -> Unit {
+    var at = out.held
+    while at > 0 && Byte.toInt(out.storage[at - 1]) != 10 { at = at - 1 }
+    drain(if at > 0 { at } else { out.held })
+}
+
+-- Write out `storage[0..n)`, and move what follows it to the front. A
+-- failure drops everything held, which would otherwise fail again at every
+-- line, and is kept for `flush`.
+fun drain(n : Int) -> Unit {
+    if n == 0 { return {} }
+    let r = writeOut(out.storage, 0, n)
+    if r < 0 {
+        out.held = 0
+        if out.failure == 0 { out.failure = r }
+        return {}
+    }
+    IO.copy(out.storage, 0, out.storage, n, out.held)
+    out.held = out.held - n
+}
+
+-- All of `bytes[from..to)` to descriptor 1: 0, or the negated `errno` of the
+-- write that failed. Asked again from where it stopped after a short write or
+-- a signal. A descriptor the program inherited non-blocking answers `EAGAIN`
+-- when it is full; other tasks run, and it is asked again.
+fun writeOut(bytes : Array Byte, from : Int, to : Int) -> Int {
+    var at = from
+    while at < to {
+        let n = IO.write(1, bytes, at, to)
+        if n == 0 - Sys.eintr { continue }
+        if n == 0 - Sys.eagain() {
+            Scheduler.yield()
+            continue
+        }
+        if n < 0 { return n }
+        if n == 0 { return 0 - Sys.eio }
+        at = at + n
+    }
+    0
+}
+
+-- -- the lock -------------------------------------------------------------------------
+
+fun lock() -> Unit {
+    if Prim.atomicCas(Prim.objectAddress(out), stateAt, 0, 1) == 0 { return {} }
+    Scheduler.waitUntil(fun() = claim(), fun(c) = Vec.push(out.waiters, c))
+}
+
+-- Under the scheduler's lock: take the lock if it is free, or mark it waited
+-- for.
+fun claim() -> Bool {
+    let p = Prim.objectAddress(out)
+    while True {
+        let state = Prim.atomicLoad(p, stateAt)
+        if state == 0 {
+            if Prim.atomicCas(p, stateAt, 0, 2) == 0 { return True }
+        } else if state == 1 {
+            if Prim.atomicCas(p, stateAt, 1, 2) == 1 { return False }
+        } else {
+            return False
+        }
+    }
+    False
+}
+
+fun unlock() -> Unit {
+    let p = Prim.objectAddress(out)
+    var old = 0
+    while True {
+        old = Prim.atomicLoad(p, stateAt)
+        if Prim.atomicCas(p, stateAt, old, 0) == old { break }
+    }
+    if old != 2 { return {} }
+    Scheduler.lock()
+    for c in out.waiters { Scheduler.wake(c) }
+    out.waiters = []
+    Scheduler.changed()
+    Scheduler.unlock()
 }

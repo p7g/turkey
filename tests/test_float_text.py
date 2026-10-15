@@ -30,9 +30,9 @@ PROGRAM = """\
 import System.IO as IO
 
 fun main() {
-    let text = match IO.readFile("/dev/stdin") {
-        Some(t) -> t
-        None -> ""
+    let text = match IO.readAll(IO.stdin()) {
+        Right(bytes) -> Option.unwrapOr(IO.toText(bytes), "")
+        Left(_) -> ""
     }
     for line in String.lines(text) {
         match String.splitOnce(line, " ") {

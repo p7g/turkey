@@ -1,6 +1,6 @@
 module Turkey.LowIr (
     BinOp(..), CmpOp(..), Conv(..), IndexCheck(..), AtomicOp(..), Callee(..), Intrinsic(..), intrinsicName, Op(..), Low(..), AddressOf(..),
-    low, effectsOf, opUses, mapUses, opResultRep, checkReps, checkCalls, showOpName,
+    low, effectsOf, fillClass, opUses, mapUses, opResultRep, checkReps, checkCalls, showOpName,
     Allocation(..), summarize, allocatingOp,
     Builder(..), builder, into, emit, effect, terminate, block, param,
 )
@@ -215,6 +215,26 @@ type Op
     | PtrLoad(Value, Value, RepClass)
     | PtrStore(Value, Value, Value, RepClass)
     | Atomic(AtomicOp, Array Value)
+    -- Runs of bytes, for the loops `Turkey.Bulk` builds. Each touches `width`
+    -- bytes, 32, 8, 4 or 1, at a byte offset from a base: an array, the
+    -- offset then counting from the object's start and its header included,
+    -- or a raw address.
+    --
+    -- `Move(width, target, at, source, from)` copies, loading every byte
+    -- before storing any, so a run copied onto one it overlaps arrives whole.
+    -- `Fill(width, target, at, value)` stores the value: an `i64` for 32
+    -- bytes, written four times, and otherwise a value of the width's own
+    -- class.
+    --
+    -- Neither is fenced nor barriered. What either moves is never a traced
+    -- pointer, so there is no barrier to give, and `Ordered` gives a whole
+    -- loop of them the one fence a store would have.
+    | Move(Int, Value, Value, Value, Value)
+    | Fill(Int, Value, Value, Value)
+    -- The fence a store into this object would be given
+    -- (`Turkey.Select.ordered`), once, before a loop of `Move`s or `Fill`s
+    -- into it.
+    | Ordered(Value)
     -- A loop's poll for a collection (`Turkey.Polls`): a safepoint that is
     -- not a call on the path where nothing is asked of it.
     | Poll
@@ -397,7 +417,12 @@ fun effectsOf(op : Op) -> Effects = match op {
     -- Every one writes, the acquiring load included: it orders the accesses
     -- after it, so it may be neither deleted nor moved.
     Atomic(_, _) -> combine(Ssa.reads_(), Ssa.writes())
+    -- Unchecked, as a raw access is: `Turkey.Bulk` checks a run against the
+    -- array's length before the loop.
+    Move(_, _, _, _, _) -> combine(Ssa.reads_(), Ssa.writes())
+    Fill(_, _, _, _) -> Ssa.writes()
     -- Neither deleted nor moved: where it is, is the point of it.
+    Ordered(_) -> combine(Ssa.reads_(), Ssa.writes())
     Poll -> combine(Ssa.reads_(), Ssa.writes())
     CellNew(_) -> Ssa.allocates()
     CellLoad(_) -> Ssa.reads_()
@@ -448,6 +473,9 @@ fun opUses(op : Op) -> Array Value = match op {
     PtrLoad(a, b, _) -> [a, b]
     PtrStore(a, b, c, _) -> [a, b, c]
     Atomic(_, operands) -> operands
+    Move(_, a, b, c, d) -> [a, b, c, d]
+    Fill(_, a, b, c) -> [a, b, c]
+    Ordered(a) -> [a]
     Poll -> []
     ArrayGet(a, b, _) -> [a, b]
     ArraySet(a, b, c, _) -> [a, b, c]
@@ -496,6 +524,9 @@ fun mapUses(op : Op, f : fun(Value) -> Value) -> Op = match op {
     PtrLoad(a, b, c) -> PtrLoad(f(a), f(b), c)
     PtrStore(a, b, c, d) -> PtrStore(f(a), f(b), f(c), d)
     Atomic(o, operands) -> Atomic(o, Array.map(operands, f))
+    Move(w, a, b, c, d) -> Move(w, f(a), f(b), f(c), f(d))
+    Fill(w, a, b, c) -> Fill(w, f(a), f(b), f(c))
+    Ordered(a) -> Ordered(f(a))
     Poll -> Poll
     ArrayGet(a, b, c) -> ArrayGet(f(a), f(b), c)
     ArraySet(a, b, c, d) -> ArraySet(f(a), f(b), f(c), d)
@@ -556,6 +587,9 @@ fun opResultRep(op : Op) -> Option Rep = match op {
     PtrStore(_, _, _, _) -> Some(Ssa.untraced(Unit))
     Atomic(StoreRelease, _) -> Some(Ssa.untraced(Unit))
     Poll -> Some(Ssa.untraced(Unit))
+    Move(_, _, _, _, _) -> Some(Ssa.untraced(Unit))
+    Fill(_, _, _, _) -> Some(Ssa.untraced(Unit))
+    Ordered(_) -> Some(Ssa.untraced(Unit))
     Atomic(_, _) -> Some(Ssa.untraced(I64))
     ArrayLength(_) -> Some(Ssa.untraced(I64))
     Intrinsic(k, _) -> Some(Ssa.untraced(intrinsicResult(k)))
@@ -624,6 +658,20 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Vec String {
             wantClass(f, out, base, Ptr, "the base of a raw load")
             wantClass(f, out, off, I64, "a raw offset")
         }
+        Move(width, target, at, source, from) -> {
+            runWidth(out, width)
+            wantClass(f, out, target, Ptr, "the target of a move")
+            wantClass(f, out, at, I64, "a move's offset")
+            wantClass(f, out, source, Ptr, "the source of a move")
+            wantClass(f, out, from, I64, "a move's offset")
+        }
+        Fill(width, target, at, value) -> {
+            runWidth(out, width)
+            wantClass(f, out, target, Ptr, "the target of a fill")
+            wantClass(f, out, at, I64, "a fill's offset")
+            wantClass(f, out, value, fillClass(width), "the value of a fill")
+        }
+        Ordered(target) -> wantClass(f, out, target, Ptr, "the target of a fence")
         Atomic(o, operands) -> {
             let arity = match o {
                 Cas -> 4
@@ -658,6 +706,19 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Vec String {
         _ -> {}
     }
     out
+}
+
+fun runWidth(out : Vec String, width : Int) -> Unit = match width {
+    32 | 8 | 4 | 1 -> {}
+    _ -> Vec.push(out, "a run of " + Int.toString(width) + " bytes")
+}
+
+-- The class a `Fill` of `width` bytes stores: a word, written four times for
+-- 32, and otherwise the one class as wide as the store.
+fun fillClass(width : Int) -> RepClass = match width {
+    1 -> I8
+    4 -> I32
+    _ -> I64
 }
 
 -- What one function's instructions require of *another* function.
@@ -883,6 +944,9 @@ fun showOpName(op : Op) -> String = match op {
     PtrLoad(_, _, _) -> "ptr.load"
     PtrStore(_, _, _, _) -> "ptr.store"
     Atomic(o, _) -> show(o)
+    Move(_, _, _, _, _) -> "move"
+    Fill(_, _, _, _) -> "fill"
+    Ordered(_) -> "ordered"
     Poll -> "poll"
     ArrayGet(_, _, _) -> "array.get"
     ArraySet(_, _, _, _) -> "array.set"
@@ -950,6 +1014,12 @@ instance Show Op {
     PtrStore(a, off, x, c) ->
         "ptr.store " + v(a) + ", " + v(off) + ", " + v(x) + ", " + show(c)
     Atomic(o, operands) -> show(o) + " " + String.join(Array.map(operands, v), ", ")
+    Move(width, target, at, source, from) ->
+        "move." + Int.toString(width) + " " + v(target) + ", " + v(at) + ", "
+        + v(source) + ", " + v(from)
+    Fill(width, target, at, value) ->
+        "fill." + Int.toString(width) + " " + v(target) + ", " + v(at) + ", " + v(value)
+    Ordered(target) -> "ordered " + v(target)
     Poll -> "poll"
     ArrayGet(a, i, c) -> "array.get " + v(a) + ", " + v(i) + showCheck(c)
     ArraySet(a, i, x, c) -> "array.set " + v(a) + ", " + v(i) + ", " + v(x) + showCheck(c)

@@ -1,0 +1,144 @@
+module Turkey.Scan (newline, wellFormed)
+
+-- The read-only scans of the I/O layer and of `String`: where the next
+-- newline is, how far a run of ASCII goes, and whether bytes are well-formed
+-- UTF-8. Each works on the array's storage several bytes at a time, over a
+-- window checked against the array once, because these run over every byte a
+-- program reads and a byte loop is several times slower.
+--
+-- The loads are `Prim.loadI64` at the address of an element, unaligned: arm64
+-- loads from any address, and both targets are little-endian, so the byte at
+-- the lowest address is the word's least significant. The collector does not
+-- move objects, nothing here allocates, and each function ends with a
+-- `Prim.keepAlive` of the array it reads, so the address stays good.
+--
+-- The Prelude depends on this module, through `String`, so it imports the
+-- library modules it uses by name.
+
+import Prelude ()
+import Std.Classes
+import Data.Array (Array)
+import Data.Array ()
+import Data.Bool.Type (Bool(..))
+import Data.Int ()
+import Turkey.Libc as Libc
+
+-- Where a primitive array's elements start (`Turkey.Alloc.header`).
+let elements : Int = 24
+
+-- 0x8080_8080_8080_8080, which as a signed literal is out of range.
+let highs : Int = 0 - 0x7F7F_7F7F_7F7F_7F80
+
+-- Where the first newline is in `bytes[from..to)`, or -1 if there is none.
+-- C's `memchr`, whose vector loop is several times what a word at a time in
+-- Turkey reaches (`Turkey.Libc.memchr`). It runs in a moment and cannot block,
+-- so it is called directly rather than as a blocking call.
+fun newline(bytes : Array Byte, from : Int, to : Int) -> Int {
+    within(len(bytes), from, to)
+    let base = Prim.ptrAdd(Prim.objectAddress(bytes), elements)
+    let p = Libc.memchr(Prim.ptrAdd(base, from), 10, to - from)
+    let found = if Prim.ptrIsNull(p) { -1 } else { Prim.ptrDiff(p, base) }
+    Prim.keepAlive(bytes)
+    found
+}
+
+-- Where the first byte of `base[from..to)` that is not ASCII is, or `to` if
+-- they all are: 32 bytes per step, with their high bits tested together, then
+-- a word at a time, then a byte.
+fun asciiFrom(base : Prim.Ptr, from : Int, to : Int) -> Int {
+    var i = from
+    while i + 32 <= to {
+        let any = Prim.intOr(Prim.intOr(Prim.loadI64(base, i), Prim.loadI64(base, i + 8)),
+                             Prim.intOr(Prim.loadI64(base, i + 16), Prim.loadI64(base, i + 24)))
+        if Prim.intAnd(any, highs) != 0 { break }
+        i = i + 32
+    }
+    while i + 8 <= to {
+        let high = Prim.intAnd(Prim.loadI64(base, i), highs)
+        if high != 0 { return i + firstFlagged(high) }
+        i = i + 8
+    }
+    while i < to {
+        if Prim.byteToInt(Prim.loadI8(base, i)) >= 0x80 { return i }
+        i = i + 1
+    }
+    to
+}
+
+-- Whether `bytes[from..to)` is well-formed UTF-8: the shortest encoding of a
+-- scalar value, each time, to the end. Overlong forms, surrogates, code points
+-- past 10FFFF and truncated sequences all fail.
+--
+-- A run of ASCII is passed over by `asciiFrom`, and the decoder below runs
+-- only from a byte that is not ASCII, until the next ASCII byte.
+fun wellFormed(bytes : Prim.Array Byte, from : Int, to : Int) -> Bool {
+    within(Prim.arrayLength(bytes), from, to)
+    let base = Prim.ptrAdd(Prim.objectAddress(bytes), elements)
+    var i = from
+    var good = True
+    while i < to {
+        let lead = Prim.byteToInt(Prim.loadI8(base, i))
+        if lead < 0x80 {
+            i = asciiFrom(base, i, to)
+            continue
+        }
+        let width = sequence(base, i, to, lead)
+        if width == 0 {
+            good = False
+            break
+        }
+        i = i + width
+    }
+    Prim.keepAlive(bytes)
+    good
+}
+
+-- The length of the well-formed sequence led by `lead`, a byte that is not
+-- ASCII, at `i`, or 0 if it is not one.
+fun sequence(base : Prim.Ptr, i : Int, to : Int, lead : Int) -> Int {
+    var width = 0
+    var scalar = 0
+    if lead >= 0xC2 && lead <= 0xDF {
+        width = 2
+        scalar = Prim.intAnd(lead, 0x1F)
+    } else if lead >= 0xE0 && lead <= 0xEF {
+        width = 3
+        scalar = Prim.intAnd(lead, 0x0F)
+    } else if lead >= 0xF0 && lead <= 0xF4 {
+        width = 4
+        scalar = Prim.intAnd(lead, 0x07)
+    } else {
+        return 0
+    }
+    if i > to - width { return 0 }
+    for var k = 1; k < width; k = k + 1 {
+        let b = Prim.byteToInt(Prim.loadI8(base, i + k))
+        if Prim.intAnd(b, 0xC0) != 0x80 { return 0 }
+        scalar = Prim.intOr(Prim.intShl(scalar, 6), Prim.intAnd(b, 0x3F))
+    }
+    if width == 3 && scalar < 0x800 { return 0 }
+    if width == 4 && scalar < 0x10000 { return 0 }
+    if scalar >= 0xD800 && scalar <= 0xDFFF { return 0 }
+    if scalar > 0x10FFFF { return 0 }
+    width
+}
+
+-- The index of the lowest byte whose high bit is set in `flags`, which has
+-- no other bits set and at least one of those. The lowest set bit,
+-- `flags & -flags`, is bit 8k+7; moved down to bit 8k and multiplied by a word
+-- whose byte j holds 7 - j, it brings byte 7 - k to the top byte, which holds
+-- k. The shift is arithmetic, so for k = 7 the mask clears the copies of the
+-- sign bit it brings in.
+fun firstFlagged(flags : Int) -> Int {
+    let lowest = Prim.intAnd(flags, Prim.intNegWrapping(flags))
+    let down = Prim.intAnd(Prim.intShr(lowest, 7), 0x01FF_FFFF_FFFF_FFFF)
+    let spread = Prim.intMulWrapping(down, 0x0001_0203_0405_0607)
+    Prim.intAnd(Prim.intShr(spread, 56), 0xff)
+}
+
+-- Panic unless `from..to` is a window of something `length` long.
+fun within(length : Int, from : Int, to : Int) -> Unit {
+    if from < 0 || to < from || to > length {
+        Prim.error("Turkey.Scan: a window outside its array")
+    }
+}

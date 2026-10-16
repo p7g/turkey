@@ -31,9 +31,10 @@ fun main() {
 def test_unit_values_between_statements_are_gone():
     assert lang.output(STATEMENTS) == "one\ntwo\nthree\n"
     body = _main(STATEMENTS)
-    # One `()` is the one `main` returns; every statement's unit, and the
-    # block parameters that carried them, went.
-    assert len(re.findall(r"= const \(\)", body)) == 1, body
+    # At most one `()`, the one `main` returns if it does not return the last
+    # call's; every statement's unit, and the block parameters that carried
+    # them, went.
+    assert len(re.findall(r"= const \(\)", body)) <= 1, body
     assert ":unit)" not in body, body
 
 

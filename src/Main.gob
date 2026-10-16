@@ -17,6 +17,7 @@ import Data.Set as Set
 import System.Args as Args
 import System.Args (Arg(..))
 import System.Env as Env
+import System.File as File
 import System.IO as IO
 import System.Parallel as Parallel
 import System.Time as Time
@@ -98,7 +99,7 @@ var timings = False
 -- The time now, after reporting `phase` as having started at `since`.
 fun lap(phase : String, since : Int) -> Int {
     let now = Time.monotonic()
-    if timings { IO.stderr("time\t" + phase + "\t" + millis(now - since) + "\n") }
+    if timings { toStderr("time\t" + phase + "\t" + millis(now - since) + "\n") }
     now
 }
 
@@ -124,7 +125,7 @@ let checkedThrough = "core"
 type Format = Executable | Object | Assembly
 
 -- Where the assembly goes.
-type Sink = ToStdout | ToFile(IO.Output)
+type Sink = ToStdout | ToFile(File.File File.WriteOnly)
 
 fun main() {
     let p = Args.parser(Env.args())
@@ -182,8 +183,8 @@ fun main() {
             _ -> die("check writes nothing; -o and -f are for build")
         }
     }
-    -- One builder for every file: a `print` per line is a flush per line, and
-    -- a dump of the library is a hundred thousand of them.
+    -- One builder for every file, which the dumps are pushed to line by line
+    -- and written from in one piece after each stage.
     let b = String.builder()
     let listing = Encode.newListing()
     for path in paths {
@@ -192,7 +193,7 @@ fun main() {
     }
     write(String.build(b))
     if let Some(ToFile(out)) = sink {
-        if !IO.close(out) { die("cannot write " + Option.unwrapOr(output, "")) }
+        if let Left(e) = File.close(out) { die(message(e)) }
     }
 }
 
@@ -257,9 +258,9 @@ fun openSink(output : Option String, format : Option Format, paths : Vec String,
                 die("several files can be built only to standard output, "
                     + "with -o -")
             }
-            match IO.create(path) {
-                Some(out) -> ToFile(out)
-                None -> die("cannot write " + path)
+            match File.create(path, File.Truncate) {
+                Right(out) -> ToFile(out)
+                Left(e) -> die(message(e))
             }
         }
     }
@@ -546,7 +547,7 @@ fun roots(checked : Checked) -> Vec String =
 -- On stderr, and prefixed with the file, so that a warning is distinguishable
 -- from whatever the compiled program itself prints.
 fun reportWarnings(checked : Checked, path : String) -> Unit {
-    for w in checked.warnings { IO.stderr(path + ":" + Diag.short(w) + "\n") }
+    for w in checked.warnings { toStderr(path + ":" + Diag.short(w) + "\n") }
 }
 
 -- The Low IR, and the checks on it. Every path that lowers comes through here,
@@ -737,7 +738,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
         Some(_) -> {
             let table = Sites.instrument(module_.functions)
             for var k = 0; k < len(table); k = k + 1 {
-                IO.stderr("site\t" + Int.toString(k) + "\t" + table[k] + "\n")
+                toStderr("site\t" + Int.toString(k) + "\t" + table[k] + "\n")
             }
             len(table)
         }
@@ -833,18 +834,18 @@ fun reportCosts(costs : Vec (String, Int)) -> Unit {
         let (_, c) = sorted[if k < n { k } else { n - 1 }]
         c
     }
-    IO.stderr("functions\t" + Int.toString(n) + "\ttotal " + millis(total)
+    toStderr("functions\t" + Int.toString(n) + "\ttotal " + millis(total)
               + "\tlargest " + millis(rank(0)) + "\tp99 " + millis(rank(10))
               + "\tp90 " + millis(rank(100)) + "\tmedian " + millis(rank(500)) + "\n")
     for var k = 0; k < n && k < 10; k = k + 1 {
         let (name, c) = sorted[k]
-        IO.stderr("largest\t" + millis(c) + "\t" + name + "\n")
+        toStderr("largest\t" + millis(c) + "\t" + name + "\n")
     }
 }
 
 fun send(sink : Sink, text : String) -> Unit = match sink {
     ToStdout -> write(text)
-    ToFile(out) -> if !IO.put(out, text) { die("cannot write the output") }
+    ToFile(out) -> if let Left(e) = IO.writeText(out, text) { die(message(e)) }
 }
 
 -- The machine IR, with what selection could not translate.
@@ -1323,6 +1324,8 @@ fun usage() -> a =
         + "stages: " + String.join(stages, ", "))
 
 fun die(message : String) -> a {
-    IO.stderr("boot: " + message + "\n")
+    toStderr("boot: " + message + "\n")
     Env.exit(2)
 }
+
+fun toStderr(text : String) -> Unit { let _ = IO.writeText(IO.stderr(), text) }

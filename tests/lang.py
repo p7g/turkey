@@ -280,6 +280,15 @@ def run(src: Source, modules: dict[str, str] | None = None,
                   result.returncode)
 
 
+def binary(src: Source, modules: dict[str, str] | None = None) -> Path:
+    """The compiled program, for a test that runs it with its own pipes,
+    terminal or timing. Raises `CompileError` if it does not compile."""
+    compiled = _native(_entry(src, modules))
+    if compiled.code != 0 or compiled.binary is None:
+        raise CompileError(compiled.stderr, compiled.code)
+    return compiled.binary
+
+
 def output(src: Source, modules: dict[str, str] | None = None) -> str:
     """A program that is expected to succeed, and its stdout."""
     result = run(src, modules)

@@ -1,0 +1,184 @@
+module Turkey.Output (
+    start, started, held, room, terminal, append, appendByte, lastLineEnd, drain,
+    noteFailure, takeFailure, tryLock, claim, unlock, final,
+)
+
+-- The standard output's buffer, outside the heap: one block of memory from
+-- `malloc`, made once as `Turkey.Stdout` starts, and this module's code the
+-- only code that reads or writes it.
+--
+-- Outside the heap because the buffer is written out as the program ends, by
+-- `Turkey.Entry`, which may hold no traced value across a call. Bytes in a
+-- traced array, in a traced record, could only be reached there by offsets
+-- another module's declarations decide; here the layout is this module's,
+-- and the entry calls `final` like any other caller.
+--
+-- A giblet module: `Turkey.Entry` calls it. `Turkey.Stdout` keeps what is
+-- traced -- the tasks waiting for the lock -- and calls these functions with
+-- the lock held, except `tryLock`, `claim` and `unlock`, which are the lock.
+--
+-- **The block**, in bytes: the count of bytes held at 0, the capacity at 8,
+-- the lock's word at 16, whether the descriptor is a terminal at 24 (0 or 1),
+-- the first failed write's negated `errno` at 32 (0 for none), and the bytes
+-- from 40. The bytes held are the first `held()` of them.
+--
+-- **The lock's word** is 0 free, 1 held, or 2 held and perhaps waited for, as
+-- `System.Sync`'s mutex keeps its own; `Turkey.Stdout` suspends the tasks
+-- that wait.
+
+import Prelude ()
+import Std.Classes
+import Data.Int ()
+import Data.Bool.Type (Bool(..))
+import Turkey.Libc as Libc
+import Turkey.Sys as Sys
+
+fun heldAt() -> Int = 0
+fun capacityAt() -> Int = 8
+fun lockAt() -> Int = 16
+fun terminalAt() -> Int = 24
+fun failureAt() -> Int = 32
+fun bytesAt() -> Int = 40
+
+-- The block, or null before `start`, and in a program that never prints.
+var block : Prim.Ptr = Prim.ptrNull()
+
+-- Make the block, holding `capacity` bytes: whether there was memory for it.
+fun start(capacity : Int, isTerminal : Bool) -> Bool {
+    let p = Libc.malloc(bytesAt() + capacity)
+    if Prim.ptrIsNull(p) { return False }
+    Prim.storeI64(p, heldAt(), 0)
+    Prim.storeI64(p, capacityAt(), capacity)
+    Prim.storeI64(p, lockAt(), 0)
+    Prim.storeI64(p, terminalAt(), if isTerminal { 1 } else { 0 })
+    Prim.storeI64(p, failureAt(), 0)
+    block = p
+    True
+}
+
+fun started() -> Bool = !Prim.ptrIsNull(block)
+
+fun held() -> Int = Prim.loadI64(block, heldAt())
+
+fun room() -> Int = Prim.loadI64(block, capacityAt()) - held()
+
+fun terminal() -> Bool = Prim.loadI64(block, terminalAt()) != 0
+
+-- Append `count` bytes from `source`. The caller has checked the room.
+fun append(source : Prim.Ptr, count : Int) -> Unit {
+    let n = held()
+    Prim.copyBytes(Prim.ptrAdd(block, bytesAt() + n), source, count)
+    Prim.storeI64(block, heldAt(), n + count)
+}
+
+fun appendByte(value : Int) -> Unit {
+    let n = held()
+    Prim.storeI8(block, bytesAt() + n, Prim.byteFromInt(value))
+    Prim.storeI64(block, heldAt(), n + 1)
+}
+
+-- The count of bytes up to and including the last newline held, or 0 if
+-- there is none. The search goes back from the end, so it reads one partial
+-- line.
+fun lastLineEnd() -> Int {
+    var at = held()
+    while at > 0 && Prim.byteToInt(Prim.loadI8(block, bytesAt() + at - 1)) != 10 {
+        at = at - 1
+    }
+    at
+}
+
+-- Write out the first `n` bytes held, and move what follows them to the
+-- front: how many of the `n` are still to go, which is 0 unless the
+-- descriptor answered `EAGAIN`, as one the program inherited non-blocking
+-- does when it is full. The caller decides how to wait before asking again;
+-- what was written is gone from the buffer either way.
+--
+-- Retried at once after a signal. Any other failure drops everything held,
+-- which would otherwise fail again at every line, and is kept for
+-- `takeFailure` if it is the first.
+fun drain(n : Int) -> Int {
+    var done = 0
+    var left = 0
+    while done < n {
+        let r = Sys.result(Libc.write(1, Prim.ptrAdd(block, bytesAt() + done), n - done))
+        if r == -Sys.eagain() {
+            left = n - done
+            break
+        }
+        if r != -Sys.eintr {
+            if r <= 0 {
+                noteFailure(if r == 0 { -Sys.eio } else { r })
+                Prim.storeI64(block, heldAt(), 0)
+                return 0
+            }
+            done = done + r
+        }
+    }
+    let total = held()
+    Prim.copyBytes(Prim.ptrAdd(block, bytesAt()), Prim.ptrAdd(block, bytesAt() + done),
+                   total - done)
+    Prim.storeI64(block, heldAt(), total - done)
+    left
+}
+
+-- Keep `failure`, a negated `errno`, unless an earlier one is kept.
+fun noteFailure(failure : Int) -> Unit {
+    if Prim.loadI64(block, failureAt()) == 0 { Prim.storeI64(block, failureAt(), failure) }
+}
+
+-- The first failure since the last call, as a negated `errno`, or 0; then
+-- none.
+fun takeFailure() -> Int {
+    let failure = Prim.loadI64(block, failureAt())
+    Prim.storeI64(block, failureAt(), 0)
+    failure
+}
+
+-- -- the lock -------------------------------------------------------------------------
+
+-- Take the lock if it is free.
+fun tryLock() -> Bool = Prim.atomicCas(block, lockAt(), 0, 1) == 0
+
+-- Take the lock if it is free, or mark it waited for: whether it was taken.
+-- A task that is not given it waits, and is woken by the `unlock` that sees
+-- the mark.
+fun claim() -> Bool {
+    while True {
+        let state = Prim.atomicLoad(block, lockAt())
+        if state == 0 {
+            if Prim.atomicCas(block, lockAt(), 0, 2) == 0 { return True }
+        } else if state == 1 {
+            if Prim.atomicCas(block, lockAt(), 1, 2) == 1 { return False }
+        } else {
+            return False
+        }
+    }
+    False
+}
+
+-- Release the lock: whether a task may be waiting for it.
+fun unlock() -> Bool {
+    while True {
+        let old = Prim.atomicLoad(block, lockAt())
+        if Prim.atomicCas(block, lockAt(), old, 0) == old { return old == 2 }
+    }
+    False
+}
+
+-- -- the end --------------------------------------------------------------------------
+
+-- Write out everything held, as the program ends; `Turkey.Entry` calls it
+-- however the program ended, before a panic's message.
+--
+-- The lock is taken if it is free, so that a task still running on another
+-- worker waits rather than appending under the write, and never released. If
+-- it is held, the bytes are written anyway: the holder is a task the program
+-- did not wait for, and its line may be cut. A descriptor answering `EAGAIN`
+-- is asked again at once, since there is nothing else left to run.
+fun final() -> Unit {
+    if !started() { return {} }
+    let _ = tryLock()
+    var left = held()
+    while left > 0 { left = drain(left) }
+}

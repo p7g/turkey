@@ -1,45 +1,211 @@
-module Turkey.Stdout (print, write, writeAll)
+module Turkey.Stdout (
+    Stdout, stdout, print, write, putBytes, flush, flushPending,
+)
 
--- `print` and `write`, which the Prelude exports, and so the one part of the
--- standard streams every program compiles.
+-- The standard output: one buffer for the whole process, behind a lock, which
+-- `print`, `write` and `System.IO.stdout()` all go through, so that what they
+-- write comes out in the order the program wrote it.
 --
 -- Kept apart from `System.IO` because the Prelude imports this module: what it
--- imports cannot import the Prelude, and so cannot import anything that does,
--- such as the scheduler a descriptor's lock suspends tasks through. This
--- module therefore names each library module it uses, and `System.IO`, which
--- only programs that ask for it compile, is free to use the Prelude.
+-- imports cannot import the Prelude. This module therefore names each library
+-- module it uses, and `System.IO`, which only programs that ask for it
+-- compile, is free to use the Prelude.
 --
--- A failed write to stdout is not reported: there is nowhere to report it to,
--- and a program whose stdout is a closed pipe should not have to test every
--- line it prints.
+-- **When the buffer is written out.** Whether the descriptor is a terminal is
+-- asked once, as the program starts:
 --
--- A line is one string, newline included, so that it goes out in one `write`
--- where the kernel allows it: two processes sharing a terminal interleave by
--- line and not by fragment.
+-- * on a terminal, the buffer holds 8 KiB and is written out after every
+--   line, so that a line appears as soon as it is printed;
+-- * otherwise it holds 64 KiB and is written out when it fills, up to its
+--   last newline, the partial line after it moved to the front. A single line
+--   longer than the buffer is written as it stands;
+-- * a piece of text at least as large as the whole buffer is written straight
+--   to the descriptor, after what the buffer held;
+-- * `System.IO` writes it out before every write to the standard error, and
+--   before every read of the standard input when that is a terminal
+--   (`flushPending`);
+-- * `Turkey.Entry` writes it out however the program ends: `main` returning,
+--   an exit, or a panic, before the panic's message (`Turkey.Output.final`).
+--
+-- Every write but the last of a line longer than the buffer ends at a
+-- newline, so lines from other processes writing the same pipe or terminal
+-- fall between this program's lines, not inside them, as far as the kernel
+-- keeps one `write` together.
+--
+-- **The bytes** are in `Turkey.Output`'s block, outside the heap, which only
+-- that module reads and writes; this module decides when, with the lock held.
+--
+-- **The lock** suspends a task that finds it held, and its worker runs other
+-- tasks: `System.Sync`'s mutex, written again here because that module uses
+-- the Prelude. Its word is in the block; the tasks waiting for it, which are
+-- traced, are here. `print` appends its whole line under it, so lines from
+-- tasks running at once never tear. Writing the buffer out happens under it
+-- too, so a task printing while another writes waits for the write.
+--
+-- **Failures.** A failed write through `print` or `write` is not reported to
+-- them: a program whose standard output is a closed pipe should not have to
+-- test every line it prints. The bytes are dropped and the first failure is
+-- kept until `flush` reports it.
 
 import Prelude ()
 import Std.Classes
+import Data.Array (Array)
 import Data.Bool.Type (Bool(..))
+import Data.Int ()
 import Data.String.Type as Str
+import Data.Vec (Vec)
+import Data.Vec as Vec
+import Turkey.Coroutine as Co
 import Turkey.IO as IO
+import Turkey.Output as Output
+import Turkey.Scan as Scan
+import Turkey.Scheduler as Scheduler
 import Turkey.Sys as Sys
 
-fun print(x) { let _ = writeAll(1, Str.concat(show(x), "\n")) }
-fun write(x) { let _ = writeAll(1, show(x)) }
+-- What `System.IO.stdout()` answers: the tasks waiting for the lock. The rest
+-- of the state is the block's.
+type Stdout = Stdout { var waiters : Vec Co.Coroutine }
 
--- Whether all of `text` reached `fd`. `write` may take fewer bytes than it
--- was offered -- a pipe, a signal -- so it is asked again from where it
--- stopped, and again at once if a signal interrupted it before it took any.
--- Any other failure ends it; so does 0, which for a non-empty request would
--- otherwise loop.
-fun writeAll(fd : Int, text : String) -> Bool {
-    let size = Prim.arrayLength(Str.bytesOf(text))
-    var done = 0
-    while done < size {
-        let n = IO.writeText(fd, text, done, size)
-        if n == 0 - Sys.eintr { continue }
-        if n <= 0 { return False }
-        done = done + n
+-- The one there is, made as the program starts, with the block.
+let out : Stdout = opened()
+
+fun stdout() -> Stdout = out
+
+fun opened() -> Stdout {
+    let terminal = IO.isatty(1) == 1
+    if !Output.start(if terminal { 8192 } else { 65536 }, terminal) {
+        Prim.error("no memory for the standard output's buffer")
     }
-    True
+    Stdout { waiters = [] }
+}
+
+fun print(x) {
+    let text = Str.bytesOf(show(x))
+    lock()
+    put(Prim.castAs(text), 0, Prim.arrayLength(text))
+    if Output.room() == 0 { makeRoom() }
+    Output.appendByte(10)
+    if Output.terminal() { drain(Output.held()) }
+    unlock()
+}
+
+fun write(x) {
+    let text = Str.bytesOf(show(x))
+    putBytes(Prim.castAs(text), 0, Prim.arrayLength(text))
+}
+
+-- `bytes[from..to)`, written out at once on a terminal if they hold a
+-- newline.
+fun putBytes(bytes : Array Byte, from : Int, to : Int) -> Unit {
+    lock()
+    put(bytes, from, to)
+    if Output.terminal() && Scan.newline(bytes, from, to) >= 0 { drain(Output.held()) }
+    unlock()
+}
+
+-- Write out everything held: 0, or the negated `errno` of the first write
+-- that failed since the last `flush`, which it then forgets.
+fun flush() -> Int {
+    lock()
+    drain(Output.held())
+    let failure = Output.takeFailure()
+    unlock()
+    failure
+}
+
+-- Write out anything held, before something that must come after it. The
+-- test without the lock costs nothing when the buffer is empty, which is the
+-- usual case; a print racing it from another task is ordered by the lock,
+-- before or after, as it would be without the test.
+fun flushPending() -> Unit {
+    if Output.held() > 0 {
+        lock()
+        drain(Output.held())
+        unlock()
+    }
+}
+
+-- -- underneath -----------------------------------------------------------------------
+
+-- Append `bytes[from..to)`, under the lock.
+fun put(bytes : Array Byte, from : Int, to : Int) -> Unit {
+    var at = from
+    while at < to {
+        let room = Output.room()
+        if to - at <= room {
+            appendFrom(bytes, at, to)
+            return {}
+        }
+        if to - at >= room + Output.held() {
+            drain(Output.held())
+            writeOut(bytes, at, to)
+            return {}
+        }
+        if room == 0 {
+            makeRoom()
+        } else {
+            appendFrom(bytes, at, at + room)
+            at = at + room
+        }
+    }
+}
+
+-- `bytes[from..to)` into the block, which has room for them: copied from the
+-- array's own storage, which the collector does not move.
+fun appendFrom(bytes : Array Byte, from : Int, to : Int) -> Unit {
+    Output.append(IO.addressOf(bytes, from), to - from)
+    Prim.keepAlive(bytes)
+}
+
+-- Make room in a full buffer: write it out up to and including its last
+-- newline, or all of it if one line fills it.
+fun makeRoom() -> Unit {
+    let end = Output.lastLineEnd()
+    drain(if end > 0 { end } else { Output.held() })
+}
+
+-- Write out the first `n` bytes held. A descriptor that answers `EAGAIN` lets
+-- other tasks run before it is asked again.
+fun drain(n : Int) -> Unit {
+    var left = Output.drain(n)
+    while left > 0 {
+        Scheduler.yield()
+        left = Output.drain(left)
+    }
+}
+
+-- `bytes[from..to)` straight to descriptor 1, past the buffer, for text at
+-- least as large as it. Asked again from where it stopped after a short
+-- write, a signal or `EAGAIN`; a failure is kept for `flush`, as one
+-- writing the buffer out is.
+fun writeOut(bytes : Array Byte, from : Int, to : Int) -> Unit {
+    var at = from
+    while at < to {
+        let n = IO.write(1, bytes, at, to)
+        if n == -Sys.eagain() {
+            Scheduler.yield()
+        } else if n != -Sys.eintr {
+            if n <= 0 {
+                Output.noteFailure(if n == 0 { -Sys.eio } else { n })
+                return {}
+            }
+            at = at + n
+        }
+    }
+}
+
+-- -- the lock -------------------------------------------------------------------------
+
+fun lock() -> Unit {
+    if Output.tryLock() { return {} }
+    Scheduler.waitUntil(fun() = Output.claim(), fun(c) = Vec.push(out.waiters, c))
+}
+
+fun unlock() -> Unit {
+    if !Output.unlock() { return {} }
+    Scheduler.lock()
+    for c in out.waiters { Scheduler.wake(c) }
+    out.waiters = []
+    Scheduler.changed()
+    Scheduler.unlock()
 }

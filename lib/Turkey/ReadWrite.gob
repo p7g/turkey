@@ -1,0 +1,168 @@
+module Turkey.ReadWrite (
+    Read(..), Write(..), DecodeError(..),
+    Buffered(..), buffered, underlying, defaultCapacity, needsRoom, smaller,
+)
+
+-- The stream classes, `Buffered`, and the standard output's `Write`: the part
+-- of `System.IO` that `System.File` builds on. Kept apart from `System.IO`
+-- because the standard streams there are files, and `System.File` cannot
+-- import the module that imports it. `System.IO` re-exports all of it,
+-- `Buffered` abstractly; its own functions read `Buffered`'s fields.
+
+import Turkey.Buffer (Buffer(..), buffer, capacity, filled, room, clear, consume)
+import Turkey.Buffer as Buf
+import Turkey.Errors (IOError(..))
+import Turkey.Errors as Errors
+import Turkey.Stdout (Stdout)
+import Turkey.Stdout as Stdout
+
+-- -- the classes --------------------------------------------------------------------
+
+-- A source of bytes. `readInto` appends to the buffer's room and answers how
+-- many bytes it appended: at least 1, or 0 only at the end of the input, and
+-- possibly fewer than there was room for. End of input is never an error.
+-- The buffer must have room; a call without any is a bug in the caller, and
+-- the library's own instances panic at it.
+--
+-- `ReadError` is the source's own error: `IOError` for a file or a pipe,
+-- `DecodeError` of the underlying source's for a layer that decodes. A
+-- function that wants one concrete error rather than lifting asks for it with
+-- an equality, `[Read r, ReadError r ~ IOError]`.
+class Read r {
+    type ReadError r
+    fun readInto(r, Buffer) -> Either (ReadError r) Int
+}
+
+-- A sink of bytes. `writeFrom` writes the buffer's whole window, or fails; it
+-- leaves the buffer as it was, so the caller decides when to clear it.
+-- `flush` pushes on whatever the sink holds back, through every layer.
+class Write w {
+    type WriteError w
+    fun writeFrom(w, Buffer) -> Either (WriteError w) Unit
+    fun flush(w) -> Either (WriteError w) Unit
+}
+
+-- What a decoding layer over a source fails with: the source's own error, or
+-- bytes that are not UTF-8.
+type DecodeError e = Underlying(e) | InvalidUTF8
+
+instance Show (DecodeError e) : Show e {
+    fun show(d) = match d {
+        Underlying(e) -> "Underlying(" + show(e) + ")"
+        InvalidUTF8 -> "InvalidUTF8"
+    }
+}
+
+instance Error (DecodeError e) : Error e {
+    fun message(d) = match d {
+        Underlying(e) -> message(e)
+        InvalidUTF8 -> "the input is not valid UTF-8"
+    }
+}
+
+-- -- buffered streams ---------------------------------------------------------------
+
+-- A source or a sink with a buffer of its own, so that many small reads or
+-- writes cost one system call per buffer. It is a `Read` when what it wraps
+-- is, and a `Write` when what it wraps is.
+--
+-- Not to be shared between tasks running at once without a lock of the
+-- program's own (`System.Sync.Mutex`). Sharing one is memory-safe, since
+-- every index into the buffer is checked, but the tasks can see each other's
+-- half-done reads.
+type Buffered r = Buffered { inner : r, held : Buffer }
+
+-- What `buffered` is given for a file or a pipe: large enough that a system
+-- call is rare, small enough that the window a line scan reads stays in the
+-- cache.
+let defaultCapacity : Int = 65536
+
+fun buffered(inner : r, capacity : Int) -> Buffered r =
+    Buffered { inner = inner, held = buffer(capacity) }
+
+-- What `b` wraps. Reading from it directly skips whatever `b` holds.
+fun underlying(b : Buffered r) -> r = b.inner
+
+-- A read at least as large as the buffer, made while the buffer is empty,
+-- goes straight into the caller's buffer: copying it through `b`'s would only
+-- add a copy.
+instance Read (Buffered r) : Read r {
+    type ReadError = ReadError r
+    fun readInto(Buffered { inner, held }, into) {
+        needsRoom(into)
+        if filled(held) == 0 {
+            if room(into) >= capacity(held) { return readInto(inner, into) }
+            clear(held)
+            let n = readInto(inner, held)?
+            if n == 0 { return Right(0) }
+        }
+        let n = smaller(filled(held), room(into))
+        Buf.append(into, held.storage, held.start, held.start + n)
+        consume(held, n)
+        Right(n)
+    }
+}
+
+-- A write at least as large as the buffer, made while the buffer is empty,
+-- goes straight to the sink.
+instance Write (Buffered w) : Write w {
+    type WriteError = WriteError w
+    fun writeFrom(b, from) {
+        let Buffered { inner, held } = b
+        var at = from.start
+        while at < from.end {
+            if filled(held) == 0 && from.end - at >= capacity(held) {
+                return writeFrom(inner, Buf.view(from, at, from.end))
+            }
+            if room(held) == 0 {
+                drainHeld(b)?
+                continue
+            }
+            let n = smaller(room(held), from.end - at)
+            Buf.append(held, from.storage, at, at + n)
+            at = at + n
+        }
+        Right(())
+    }
+    fun flush(b) {
+        drainHeld(b)?
+        let Buffered { inner, held = _ } = b
+        flush(inner)
+    }
+}
+
+-- Write out what `b` holds, and empty it.
+fun drainHeld[Write w](b : Buffered w) -> Either (WriteError w) Unit {
+    let Buffered { inner, held } = b
+    if filled(held) > 0 {
+        writeFrom(inner, held)?
+        clear(held)
+    }
+    Right(())
+}
+
+-- -- the standard output -------------------------------------------------------------
+
+-- A write is appended to the one standard output buffer, under its lock, so
+-- it lands between whole lines of `print`'s. A failure to write the buffer
+-- out is not answered by the write that filled it, which may be another
+-- task's: the next `flush` reports it.
+instance Write Stdout {
+    type WriteError = IOError
+    fun writeFrom(_, from) {
+        Stdout.putBytes(from.storage, from.start, from.end)
+        Right(())
+    }
+    fun flush(_) {
+        let r = Stdout.flush()
+        if r < 0 { Left(Errors.failure("write", Some("<stdout>"), r)) } else { Right(()) }
+    }
+}
+
+-- -- underneath -----------------------------------------------------------------------
+
+fun needsRoom(into : Buffer) -> Unit {
+    if room(into) == 0 { error("readInto: the buffer has no room") }
+}
+
+fun smaller(a : Int, b : Int) -> Int = if a < b { a } else { b }

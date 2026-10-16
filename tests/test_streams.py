@@ -50,7 +50,7 @@ fun sink() -> Sink = Sink { got = "", writes = 0 }
 instance IO.Write Sink {
     type WriteError = String
     fun writeFrom(s, from) {
-        s.got = s.got + Option.unwrapOr(IO.toText(from), "?")
+        s.got = s.got + Option.unwrapOr(String.fromBytes(from), "?")
         s.writes = s.writes + 1
         Right(())
     }
@@ -82,14 +82,14 @@ fun main() {
     print((IO.filled(b), IO.room(b), len(b)))
     print((Byte.toInt(b[0]), Byte.toInt(b[5])))
     IO.consume(b, 2)
-    print(IO.toText(b))
+    print(String.fromBytes(b))
     var sum = 0
     for x in b { sum = sum + Byte.toInt(x) }
     print(sum)
     -- Consuming the rest starts the window again at the front.
     IO.consume(b, 4)
     print((IO.filled(b), IO.room(b)))
-    print(IO.toText(IO.bytesOf("text")))
+    print(String.fromBytes(IO.bytesOf("text")))
     print(IO.bytes(IO.bytesOf("ab")))
 }
 """)
@@ -97,14 +97,14 @@ fun main() {
                    str(sum(b"llo!")), "(0, 8)", "Some(text)", "[97, 98]"]
 
 
-def test_toText_refuses_bytes_that_are_not_utf8():
+def test_fromBytes_refuses_bytes_that_are_not_utf8():
     out = output("""
 fun main() {
     let b = IO.buffer(4)
     IO.push(b, Byte.truncate(0xC3))
-    print(IO.toText(b))
+    print(String.fromBytes(b))
     IO.push(b, Byte.truncate(0xA9))
-    print(IO.toText(b))
+    print(String.fromBytes(b))
 }
 """)
     assert out == ["None", "Some(é)"]
@@ -163,7 +163,7 @@ fun main() {
     let out = IO.buffer(64)
     while True {
         let l = IO.readLineInto(b, out)
-        print(showLine(l) + " " + Option.unwrapOr(IO.toText(out), "?"))
+        print(showLine(l) + " " + Option.unwrapOr(String.fromBytes(out), "?"))
         IO.clear(out)
         match l {
             IO.End -> break
@@ -182,7 +182,7 @@ fun main() {
     let out = IO.buffer(4)
     for var i = 0; i < 6; i = i + 1 {
         let l = IO.readLineInto(b, out)
-        print(showLine(l) + " " + Option.unwrapOr(IO.toText(out), "?"))
+        print(showLine(l) + " " + Option.unwrapOr(String.fromBytes(out), "?"))
         IO.clear(out)
     }
     print(showLine(IO.readLineInto(IO.buffered(Broken, 4), out)))
@@ -202,11 +202,11 @@ fun main() {
     -- The buffer holds "23" now; a large read takes those two first.
     let large = IO.buffer(10)
     print(IO.readInto(b, large))
-    print(IO.toText(large))
+    print(String.fromBytes(large))
     -- Empty again, and the read is as large as the buffer: straight through.
     IO.clear(large)
     print(IO.readInto(b, large))
-    print(IO.toText(large))
+    print(String.fromBytes(large))
     print(source.at)
 }
 """)
@@ -246,10 +246,10 @@ fun main() {
     let b = IO.buffered(chunks("headbody!", 2), 64)
     let into = IO.buffer(16)
     print(IO.readExact(b, into, 4))
-    print(IO.toText(into))
+    print(String.fromBytes(into))
     IO.clear(into)
     print(IO.readExact(b, into, 4))
-    print(IO.toText(into))
+    print(String.fromBytes(into))
     IO.clear(into)
     print(IO.readExact(b, into, 4))
     print(IO.readExact(Broken, into, 1))
@@ -269,7 +269,7 @@ def test_readAll_copy_and_writeText():
 fun main() {
     let text = String.repeat("0123456789", 50000)
     match IO.readAll(chunks(text, 70000)) {
-        Right(b) -> print((IO.filled(b), IO.toText(b) == Some(text)))
+        Right(b) -> print((IO.filled(b), String.fromBytes(b) == Some(text)))
         Left(e) -> print(e)
     }
     let s = sink()

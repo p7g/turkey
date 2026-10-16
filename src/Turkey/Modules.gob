@@ -23,6 +23,7 @@ module Turkey.Modules (
 
 import Turkey.Ast
 import System.Env as Env
+import System.File as File
 import System.IO as IO
 -- `Data.Set` is not one of the modules the Prelude re-exports.
 import Data.Set as Set
@@ -185,8 +186,8 @@ fun load(l : Loader, name : String, stack : Array String) -> Module =
                 oops("imports form a cycle: " + cycleOf(stack, name)
                      + ". Two modules that need each other are one module here.")
             }
-            let (path, library, bytes) = resolvePath(l, name)
-            let source = match String.fromBytes(bytes) {
+            let (path, library, text) = resolvePath(l, name)
+            let source = match text {
                 Some(text) -> Source { name = path, text = text }
                 None -> oops("cannot read module '" + name + "' at " + path)
             }
@@ -208,19 +209,22 @@ fun cycleOf(stack : Array String, name : String) -> String {
 -- `Prim.*` is spellable.
 --
 -- Each candidate is read rather than asked about: the first one that reads is
--- the module, and its bytes come back with it so that nothing can change
--- between finding the file and compiling it. Decoding is the caller's, so
--- "not there" and "not UTF-8" stay two different failures.
-fun resolvePath(l : Loader, name : String) -> (String, Bool, Vec Byte) {
+-- the module, and its text comes back with it so that nothing can change
+-- between finding the file and compiling it. A file that reads but is not
+-- UTF-8 is still the module, with no text, so "not there" and "not UTF-8"
+-- stay two different failures.
+fun resolvePath(l : Loader, name : String) -> (String, Bool, Option String) {
     let relative = String.replace(name, ".", "/") + ".gob"
     for var i = 0; i < len(l.search); i = i + 1 {
         -- A module beside an entry named without a directory is `Wrong.gob`,
         -- as the entry itself is quoted, not `./Wrong.gob`.
         let root = l.search[i]
         let candidate = if root == "." { relative } else { root + "/" + relative }
-        match IO.readBytes(candidate) {
-            Some(bytes) -> return (candidate, i == len(l.search) - 1, bytes)
-            None -> {}
+        let library = i == len(l.search) - 1
+        match File.readText(candidate) {
+            Right(text) -> return (candidate, library, Some(text))
+            Left(IO.InvalidUTF8) -> return (candidate, library, None)
+            Left(IO.Underlying(_)) -> {}
         }
     }
     oops("cannot find module '" + name + "' (searched "

@@ -212,6 +212,63 @@ standard output; `write` does the same without the line break. `show` of a
 `String` is the string itself, without quotes. A type gets a `Show` instance
 only if someone writes one; there is no automatic derivation.
 
+### When standard output is written
+
+Standard output is buffered: `print` and `write` add their text to one buffer
+that the whole program shares, and the buffer is written to the operating
+system later. Whether standard output is a terminal is checked once, when the
+program starts. The buffer is written out:
+
+* after every line, when standard output is a terminal;
+* otherwise, when it fills (it holds 64 KiB), up to its last complete line.
+  A single line longer than the buffer is written as it stands;
+* before each write to standard error through `System.IO.stderr()`, so that
+  the two streams come out in the order the program wrote them;
+* before each read of standard input through `System.IO.stdin()`, when
+  standard input is a terminal, so that a prompt appears before the program
+  waits for an answer;
+* when the program ends: when `main` returns, when `System.Env.exit` is called,
+  and when the program panics, before the panic's message;
+* when the program calls `System.IO.flush(System.IO.stdout())`.
+
+A line printed by `print` is added whole, so lines printed by tasks running at
+the same time never mix within a line. Output still in the buffer is lost only
+if the process is killed by a signal.
+
+`print` and `write` do not report a failed write, so a program whose standard
+output is a closed pipe need not test every line it prints. `flush` reports
+the first failure since the last `flush`.
+
+<!-- run -->
+```kotlin
+import System.IO as IO
+
+fun main() {
+    write("working... ")
+    -- Without this, a program whose output goes to a pipe would show nothing
+    -- until the buffer filled or the program ended.
+    match IO.flush(IO.stdout()) {
+        Left(e) -> {
+            let _ = IO.writeText(IO.stderr(), message(e) + "\n")
+        }
+        Right(_) -> {}
+    }
+    print("done")
+}
+```
+
+```text
+working... done
+```
+
+> **Coming from Rust:** Rust's `println!` writes every line as it is printed,
+> even into a pipe. Turkey's output to a file or a pipe is written a buffer at
+> a time, as C's `printf` does, and a program that talks to another over a
+> pipe flushes before it waits for the answer.
+>
+> **Coming from C:** writing to standard error writes out standard output
+> first, which C's `stdio` does not do.
+
 ## `Iterator`
 
 ```text

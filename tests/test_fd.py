@@ -75,7 +75,7 @@ fun main() {
     print(FD.readAt(f, 0, room, 0, 4) == FD.closed)
     print(FD.writeAt(f, 0, room, 0, 4) == FD.closed)
     -- With nothing using it, closing closed the descriptor.
-    print(IO.fcntl(FD.number(f), Sys.getDescriptorFlags) == 0 - Sys.ebadf)
+    print(IO.fcntl(FD.number(f), Sys.getDescriptorFlags) == -Sys.ebadf)
 }
 """, tmp_path)
     assert out == ["0", "0", "True", "True", "True", "True", "True"]
@@ -182,7 +182,7 @@ fun main() {
         pure((Task.join(reader), Task.join(closer)))
     })
     print(results)
-    print(IO.fcntl(number, Sys.getDescriptorFlags) == 0 - Sys.ebadf)
+    print(IO.fcntl(number, Sys.getDescriptorFlags) == -Sys.ebadf)
 }
 """, tmp_path, "4")
     assert out == ["((4, True), (0, True, 4))", "True"]

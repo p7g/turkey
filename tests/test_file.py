@@ -71,7 +71,7 @@ fun main() {
     let r = must(File.openRead("made"))
     let into = IO.buffer(64)
     print(IO.readInto(r, into))
-    print(IO.toText(into))
+    print(String.fromBytes(into))
     print(IO.readInto(r, into))
     print(report(File.close(r)))
 }
@@ -88,15 +88,15 @@ fun main() {
     let f = must(File.openReadWrite("data"))
     let into = IO.buffer(4)
     print(File.readAt(f, 3, into))
-    print(IO.toText(into))
+    print(String.fromBytes(into))
     IO.clear(into)
     -- Fewer than the room only at the end of the file.
     print(File.readAt(f, 8, into))
-    print(IO.toText(into))
+    print(String.fromBytes(into))
     print(report(File.writeAt(f, 2, IO.bytesOf("ab"))))
     IO.clear(into)
     print(IO.readInto(f, into))
-    print(IO.toText(into))
+    print(String.fromBytes(into))
 }
 """, tmp_path)
     assert out == ["Right(4)", "Some(3456)", "Right(2)", "Some(89)", "ok",

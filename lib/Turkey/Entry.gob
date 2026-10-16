@@ -22,7 +22,7 @@ import Turkey.Libc as Libc
 import Turkey.Process as Process
 import Turkey.Alloc ()
 import Turkey.Heap as Heap
-import Turkey.Sys as Sys
+import Turkey.Output as Output
 
 -- -- starting the program ---------------------------------------------------------------
 
@@ -41,7 +41,16 @@ foreign "turkey_main" fun main(argc : Int, argv : Prim.Ptr) -> Int {
     }
     Process.argsSet(cInt(argc), argv)
     runEntry()
-    flushOutput()
+    -- What the standard output still holds, however the program ended, and
+    -- before a panic's message. Here, and not in the generated entry before
+    -- `turkey_entry_returned`, for two reasons. By now the panic flag is
+    -- parked, so calls return normally; in the generated entry they would run
+    -- while the program unwinds, every call testing a raised flag. And this is
+    -- library code, which every compiler compiles from today's source: a flush
+    -- the code generator emitted would be missing from any program built by a
+    -- compiler older than it, the compiler built from the committed bootstrap
+    -- among them.
+    Output.final()
     if Process.exiting() { return Prim.intAnd(Process.exitStatus(), 255) }
     if Process.panicked() {
         reportPanic()
@@ -103,43 +112,6 @@ fun runEntry() -> Unit {
 foreign "turkey_entry_thread" fun entryThread(argument : Prim.Ptr) -> Prim.Ptr {
     programEntry()
     Prim.ptrNull()
-}
-
--- What `Turkey.Stdout` still holds, written out however the program ended:
--- `main` returning, an exit, or a panic, whose message comes after it.
---
--- Here, and not in the generated entry before `turkey_entry_returned`, for two
--- reasons. By now the panic flag is parked, so the calls below return
--- normally; in the generated entry they would run while the program unwinds,
--- every call testing a raised flag. And this is library code, which every
--- compiler compiles from today's source: a flush the code generator emitted
--- would be missing from any program built by a compiler older than it, the
--- compiler built from the committed bootstrap among them.
---
--- The price is the giblet's rules: no traced value held across a call. So
--- the record is read through the address `Turkey.Process` keeps, by the
--- offsets `Turkey.Stdout` declares its fields at -- `held` at 24, `storage`
--- at 32 and the lock's word at 40 -- and the bytes through the storage's
--- address, as plain memory. The lock is taken if it is free, so that a task
--- still running on another worker waits rather than appending under the
--- write, and never released. If it is held, the bytes are written anyway:
--- the holder is a task the program did not wait for, and its line may be cut.
-fun flushOutput() -> Unit {
-    let record = Process.standardOutput()
-    if Prim.ptrIsNull(record) { return {} }
-    let _ = Prim.atomicCas(record, 40, 0, 1)
-    let held = Prim.loadI64(record, 24)
-    -- Past the storage's header, as `Turkey.IO.elements` says.
-    let bytes = Prim.ptrAdd(Prim.loadPtr(record, 32), 24)
-    var done = 0
-    while done < held {
-        let n = Sys.result(Libc.write(1, Prim.ptrAdd(bytes, done), held - done))
-        if n != 0 - Sys.eintr {
-            if n <= 0 { break }
-            done = done + n
-        }
-    }
-    Prim.storeI64(record, 24, 0)
 }
 
 -- `panic: <message>`.

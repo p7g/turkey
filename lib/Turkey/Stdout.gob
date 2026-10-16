@@ -25,16 +25,20 @@ module Turkey.Stdout (
 --   before every read of the standard input when that is a terminal
 --   (`flushPending`);
 -- * `Turkey.Entry` writes it out however the program ends: `main` returning,
---   an exit, or a panic, before the panic's message.
+--   an exit, or a panic, before the panic's message (`Turkey.Output.final`).
 --
 -- Every write but the last of a line longer than the buffer ends at a
 -- newline, so lines from other processes writing the same pipe or terminal
 -- fall between this program's lines, not inside them, as far as the kernel
 -- keeps one `write` together.
 --
+-- **The bytes** are in `Turkey.Output`'s block, outside the heap, which only
+-- that module reads and writes; this module decides when, with the lock held.
+--
 -- **The lock** suspends a task that finds it held, and its worker runs other
--- tasks; it is `System.Sync`'s mutex, written again here because that module
--- uses the Prelude. `print` appends its whole line under it, so lines from
+-- tasks: `System.Sync`'s mutex, written again here because that module uses
+-- the Prelude. Its word is in the block; the tasks waiting for it, which are
+-- traced, are here. `print` appends its whole line under it, so lines from
 -- tasks running at once never tear. Writing the buffer out happens under it
 -- too, so a task printing while another writes waits for the write.
 --
@@ -46,62 +50,42 @@ module Turkey.Stdout (
 import Prelude ()
 import Std.Classes
 import Data.Array (Array)
-import Data.Array as Array
 import Data.Bool.Type (Bool(..))
-import Data.Byte as Byte
 import Data.Int ()
 import Data.String.Type as Str
 import Data.Vec (Vec)
 import Data.Vec as Vec
 import Turkey.Coroutine as Co
 import Turkey.IO as IO
-import Turkey.Process as Process
+import Turkey.Output as Output
 import Turkey.Scan as Scan
 import Turkey.Scheduler as Scheduler
 import Turkey.Sys as Sys
 
--- `held` and `storage` are the record's first two fields, and `state` its
--- third, because `Turkey.Entry` reads them by offset as the program ends: it
--- may hold no traced value across a call, so it reads the record through the
--- address `Turkey.Process.standardOutput` keeps. The buffered bytes are
--- `storage[0..held)`. `state` is the lock's word: 0 free, 1 held, 2 held
--- and perhaps waited for, as `System.Sync`'s mutex keeps it. Both change
--- after the record is built, so both are `var`.
-type Stdout = Stdout {
-    var held    : Int,
-    storage     : Array Byte,
-    var state   : Int,
-    var waiters : Vec Co.Coroutine,
-    lines       : Bool,
-    var failure : Int,
-}
+-- What `System.IO.stdout()` answers: the tasks waiting for the lock. The rest
+-- of the state is the block's.
+type Stdout = Stdout { var waiters : Vec Co.Coroutine }
 
--- The one there is, made as the program starts.
+-- The one there is, made as the program starts, with the block.
 let out : Stdout = opened()
 
 fun stdout() -> Stdout = out
 
 fun opened() -> Stdout {
     let terminal = IO.isatty(1) == 1
-    let capacity = if terminal { 8192 } else { 65536 }
-    let s = Stdout { held = 0, storage = Array.filled(capacity, Byte.truncate(0)),
-                     state = 0, waiters = [], lines = terminal, failure = 0 }
-    Process.standardOutputSet(Prim.objectAddress(s))
-    s
+    if !Output.start(if terminal { 8192 } else { 65536 }, terminal) {
+        Prim.error("no memory for the standard output's buffer")
+    }
+    Stdout { waiters = [] }
 }
-
--- Where an object's fields start, and so the lock word's offset as the
--- atomic primitives take it: the third field.
-let stateAt : Int = 40
 
 fun print(x) {
     let text = Str.bytesOf(show(x))
     lock()
     put(Prim.castAs(text), 0, Prim.arrayLength(text))
-    if out.held == len(out.storage) { makeRoom() }
-    out.storage[out.held] = Byte.truncate(10)
-    out.held = out.held + 1
-    if out.lines { drain(out.held) }
+    if Output.room() == 0 { makeRoom() }
+    Output.appendByte(10)
+    if Output.terminal() { drain(Output.held()) }
     unlock()
 }
 
@@ -115,7 +99,7 @@ fun write(x) {
 fun putBytes(bytes : Array Byte, from : Int, to : Int) -> Unit {
     lock()
     put(bytes, from, to)
-    if out.lines && Scan.newline(bytes, from, to) >= 0 { drain(out.held) }
+    if Output.terminal() && Scan.newline(bytes, from, to) >= 0 { drain(Output.held()) }
     unlock()
 }
 
@@ -123,9 +107,8 @@ fun putBytes(bytes : Array Byte, from : Int, to : Int) -> Unit {
 -- that failed since the last `flush`, which it then forgets.
 fun flush() -> Int {
     lock()
-    drain(out.held)
-    let failure = out.failure
-    out.failure = 0
+    drain(Output.held())
+    let failure = Output.takeFailure()
     unlock()
     failure
 }
@@ -135,9 +118,9 @@ fun flush() -> Int {
 -- usual case; a print racing it from another task is ordered by the lock,
 -- before or after, as it would be without the test.
 fun flushPending() -> Unit {
-    if out.held > 0 {
+    if Output.held() > 0 {
         lock()
-        drain(out.held)
+        drain(Output.held())
         unlock()
     }
 }
@@ -146,106 +129,80 @@ fun flushPending() -> Unit {
 
 -- Append `bytes[from..to)`, under the lock.
 fun put(bytes : Array Byte, from : Int, to : Int) -> Unit {
-    let capacity = len(out.storage)
     var at = from
     while at < to {
-        let room = capacity - out.held
+        let room = Output.room()
         if to - at <= room {
-            IO.copy(out.storage, out.held, bytes, at, to)
-            out.held = out.held + (to - at)
+            appendFrom(bytes, at, to)
             return {}
         }
-        if to - at >= capacity {
-            drain(out.held)
-            let _ = writeOut(bytes, at, to)
+        if to - at >= room + Output.held() {
+            drain(Output.held())
+            writeOut(bytes, at, to)
             return {}
         }
         if room == 0 {
             makeRoom()
         } else {
-            IO.copy(out.storage, out.held, bytes, at, at + room)
-            out.held = capacity
+            appendFrom(bytes, at, at + room)
             at = at + room
         }
     }
 }
 
+-- `bytes[from..to)` into the block, which has room for them: copied from the
+-- array's own storage, which the collector does not move.
+fun appendFrom(bytes : Array Byte, from : Int, to : Int) -> Unit {
+    Output.append(IO.addressOf(bytes, from), to - from)
+    Prim.keepAlive(bytes)
+}
+
 -- Make room in a full buffer: write it out up to and including its last
--- newline, or all of it if one line fills it. The search goes back from the
--- end, so it reads one partial line, once per buffer.
+-- newline, or all of it if one line fills it.
 fun makeRoom() -> Unit {
-    var at = out.held
-    while at > 0 && Byte.toInt(out.storage[at - 1]) != 10 { at = at - 1 }
-    drain(if at > 0 { at } else { out.held })
+    let end = Output.lastLineEnd()
+    drain(if end > 0 { end } else { Output.held() })
 }
 
--- Write out `storage[0..n)`, and move what follows it to the front. A
--- failure drops everything held, which would otherwise fail again at every
--- line, and is kept for `flush`.
+-- Write out the first `n` bytes held. A descriptor that answers `EAGAIN` lets
+-- other tasks run before it is asked again.
 fun drain(n : Int) -> Unit {
-    if n == 0 { return {} }
-    let r = writeOut(out.storage, 0, n)
-    if r < 0 {
-        out.held = 0
-        if out.failure == 0 { out.failure = r }
-        return {}
+    var left = Output.drain(n)
+    while left > 0 {
+        Scheduler.yield()
+        left = Output.drain(left)
     }
-    IO.copy(out.storage, 0, out.storage, n, out.held)
-    out.held = out.held - n
 }
 
--- All of `bytes[from..to)` to descriptor 1: 0, or the negated `errno` of the
--- write that failed. Asked again from where it stopped after a short write or
--- a signal. A descriptor the program inherited non-blocking answers `EAGAIN`
--- when it is full; other tasks run, and it is asked again.
-fun writeOut(bytes : Array Byte, from : Int, to : Int) -> Int {
+-- `bytes[from..to)` straight to descriptor 1, past the buffer, for text at
+-- least as large as it. Asked again from where it stopped after a short
+-- write, a signal or `EAGAIN`; a failure is kept for `flush`, as one
+-- writing the buffer out is.
+fun writeOut(bytes : Array Byte, from : Int, to : Int) -> Unit {
     var at = from
     while at < to {
         let n = IO.write(1, bytes, at, to)
-        if n == 0 - Sys.eintr { continue }
-        if n == 0 - Sys.eagain() {
+        if n == -Sys.eagain() {
             Scheduler.yield()
-            continue
+        } else if n != -Sys.eintr {
+            if n <= 0 {
+                Output.noteFailure(if n == 0 { -Sys.eio } else { n })
+                return {}
+            }
+            at = at + n
         }
-        if n < 0 { return n }
-        if n == 0 { return 0 - Sys.eio }
-        at = at + n
     }
-    0
 }
 
 -- -- the lock -------------------------------------------------------------------------
 
 fun lock() -> Unit {
-    if Prim.atomicCas(Prim.objectAddress(out), stateAt, 0, 1) == 0 { return {} }
-    Scheduler.waitUntil(fun() = claim(), fun(c) = Vec.push(out.waiters, c))
-}
-
--- Under the scheduler's lock: take the lock if it is free, or mark it waited
--- for.
-fun claim() -> Bool {
-    let p = Prim.objectAddress(out)
-    while True {
-        let state = Prim.atomicLoad(p, stateAt)
-        if state == 0 {
-            if Prim.atomicCas(p, stateAt, 0, 2) == 0 { return True }
-        } else if state == 1 {
-            if Prim.atomicCas(p, stateAt, 1, 2) == 1 { return False }
-        } else {
-            return False
-        }
-    }
-    False
+    if Output.tryLock() { return {} }
+    Scheduler.waitUntil(fun() = Output.claim(), fun(c) = Vec.push(out.waiters, c))
 }
 
 fun unlock() -> Unit {
-    let p = Prim.objectAddress(out)
-    var old = 0
-    while True {
-        old = Prim.atomicLoad(p, stateAt)
-        if Prim.atomicCas(p, stateAt, old, 0) == old { break }
-    }
-    if old != 2 { return {} }
+    if !Output.unlock() { return {} }
     Scheduler.lock()
     for c in out.waiters { Scheduler.wake(c) }
     out.waiters = []

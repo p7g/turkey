@@ -31,7 +31,7 @@ import System.IO as IO
 
 fun main() {
     let text = match IO.readAll(IO.stdin()) {
-        Right(bytes) -> Option.unwrapOr(IO.toText(bytes), "")
+        Right(bytes) -> Option.unwrapOr(String.fromBytes(bytes), "")
         Left(_) -> ""
     }
     for line in String.lines(text) {

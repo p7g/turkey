@@ -242,8 +242,11 @@ fun freshCell(g : Generator) -> VarCell {
 --
 -- The evaluator reuses that order, so a binding is always initialized before
 -- anything that reads it. The constraint has the same shape: one binder per
--- binding group, nested so that later groups are solved in the scope of earlier
--- ones.
+-- binding group, in that order. They follow one another rather than nest,
+-- because a top-level binder's names outlive it: the solver also writes them
+-- to its top-level environment, which every later group looks names up
+-- through. So the constraint is as deep as one group, not as deep as the
+-- module is long.
 fun generate(g : Generator, program : Program) -> (Vec Stmt, Constraint) {
     let typeDecls = Vec.new(8)
     let classDecls = Vec.new(4)
@@ -329,24 +332,12 @@ fun generate(g : Generator, program : Program) -> (Vec Stmt, Constraint) {
         for item in group { Vec.push(ordered, item) }
     }
 
-    nest(g, groups, 0, classDecls, instDecls)
+    for group in groups { bindTopGroup(g, group) }
+    -- Method bodies come after every group, so that they may call any
+    -- top-level binding. Nothing calls *them* by name, so their position is
+    -- otherwise free.
+    genMethodBodies(g, classDecls, instDecls)
     (ordered, pop(g))
-}
-
-fun nest(g : Generator, groups : Vec (Vec Stmt), index : Int,
-         classDecls : Vec ClassDecl, instDecls : Vec InstanceDecl) -> Unit {
-    if index < len(groups) {
-        discard(bindGroup(g, groups[index],
-            fun() = {
-                nest(g, groups, index + 1, classDecls, instDecls)
-                Ty.tUnit()
-            }, True))
-    } else {
-        -- Method bodies are generated innermost, so that they may call any
-        -- top-level binding. Nothing calls *them* by name, so their position in
-        -- the nesting is otherwise free.
-        genMethodBodies(g, classDecls, instDecls)
-    }
 }
 
 fun itemNames(item : Stmt) -> Vec String = match item.kind {
@@ -949,14 +940,36 @@ fun diverges(g : Generator, e : Expr) -> Bool {
 
 -- -- binders -----------------------------------------------------------------------
 
--- Generate a binding group, scoping it over whatever `rest` generates.
+-- Generate a local binding group, scoping it over whatever `rest` generates.
 --
--- The only place a binder is built, so the only place that has to get the
--- nesting right. `rest` is a callback rather than a list of statements because
--- the scope of a `let` is not always "the remaining statements" -- a C-style
--- `for`'s initializer scopes over the condition and step too.
-fun bindGroup(g : Generator, group : Vec Stmt, rest : fun() -> a,
-              top : Bool) -> a {
+-- `rest` is a callback rather than a list of statements because the scope of a
+-- `let` is not always "the remaining statements" -- a C-style `for`'s
+-- initializer scopes over the condition and step too.
+fun bindGroup(g : Generator, group : Vec Stmt, rest : fun() -> a) -> a {
+    let (scope, binder) = groupBinder(g, group)
+    Vec.push(g.scopes, scope)
+    push(g)
+    let out = rest()
+    let body = pop(g)
+    discard(Vec.pop(g.scopes))
+    emit(g, binder(body, False))
+    out
+}
+
+-- Generate a top-level binding group. Its names join the module's own scope,
+-- where every group generated after it sees them, and its binder scopes over
+-- nothing: the solver keeps a top-level binder's names past its end.
+fun bindTopGroup(g : Generator, group : Vec Stmt) -> Unit {
+    let (scope, binder) = groupBinder(g, group)
+    for (name, mutable) in Map.entries(scope) { Map.put(g.scopes[0], name, mutable) }
+    emit(g, binder(CAnd([]), True))
+}
+
+-- Generate a group's definition. Answers the names it binds, each with whether
+-- it may be assigned, and the binder that scopes them over a body -- the only
+-- place a binder is built, so the only place that has to get its shape right.
+fun groupBinder(g : Generator, group : Vec Stmt)
+        -> (Map String Bool, fun(Constraint, Bool) -> Constraint) {
     let (binds, defn, generalizes, mutable, sigs) = buildDefinition(g, group)
     -- What each `fun` in the group was bound at. A generalizing group's schemes
     -- are recorded by the solver, which is the only place they exist; this covers
@@ -977,12 +990,13 @@ fun bindGroup(g : Generator, group : Vec Stmt, rest : fun() -> a,
     let scope = Map.new()
     for (n, _) in binds { Map.put(scope, n, mutable) }
     for (n, _) in sigs { Map.put(scope, n, False) }
-    Vec.push(g.scopes, scope)
-    push(g)
-    let out = rest()
-    let body = pop(g)
-    discard(Vec.pop(g.scopes))
+    (scope, fun(body, top) = binderOf(g, group, binds, defn, generalizes, sigs,
+                                      body, top))
+}
 
+fun binderOf(g : Generator, group : Vec Stmt, binds : Vec (String, Ty.Type),
+             defn : Constraint, generalizes : Bool, sigs : Vec (String, Scheme),
+             body : Constraint, top : Bool) -> Constraint {
     var node = CAnd([])
     if len(binds) == 0 {
         -- Every member states its own type, so there is nothing left to
@@ -1028,11 +1042,10 @@ fun bindGroup(g : Generator, group : Vec Stmt, rest : fun() -> a,
         -- afterwards, because nothing ever raised it.
         node = CAnd([defn, CDef(binds, body, top)])
     }
-    -- The declared schemes scope over the whole group *and* over `rest`, which is
-    -- what makes a recursive occurrence an instantiation.
+    -- The declared schemes scope over the whole group *and* over the body, which
+    -- is what makes a recursive occurrence an instantiation.
     if len(sigs) > 0 { node = CBind(sigs, node, top) }
-    emit(g, node)
-    out
+    node
 }
 
 -- The bound names, the definition's constraint, and how it binds.
@@ -1371,11 +1384,11 @@ fun genSequence(g : Generator, stmts : Vec Stmt, from : Int) -> Ty.Type {
     let stmt = stmts[from]
     match stmt.kind {
         SLet(_, _) -> return bindGroup(g, [stmt],
-            fun() = genSequence(g, stmts, from + 1), False)
+            fun() = genSequence(g, stmts, from + 1))
         SVar(_, _) -> return bindGroup(g, [stmt],
-            fun() = genSequence(g, stmts, from + 1), False)
+            fun() = genSequence(g, stmts, from + 1))
         SFun(_) -> return bindGroup(g, [stmt],
-            fun() = genSequence(g, stmts, from + 1), False)
+            fun() = genSequence(g, stmts, from + 1))
         _ -> {}
     }
     let value = genStmt(g, stmt)
@@ -1621,8 +1634,8 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
             -- list of following statements, which is why `bindGroup` takes a
             -- callback.
             Some(s) -> match s.kind {
-                SLet(_, _) -> bindGroup(g, [s], rest, False)
-                SVar(_, _) -> bindGroup(g, [s], rest, False)
+                SLet(_, _) -> bindGroup(g, [s], rest)
+                SVar(_, _) -> bindGroup(g, [s], rest)
                 _ -> {
                     discard(genStmt(g, s))
                     rest()

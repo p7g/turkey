@@ -93,7 +93,7 @@ def test_the_whole_program_assembles(name):
 
 
 # A virtual register is `%` and digits where an operand goes. Turkey *names*
-# contain `%` too -- `%module.initialize`, `%default.Std.Classes#Eq…` -- and
+# contain `%` too -- `%module.initialize`, `%default.Data.Eq#Eq…` -- and
 # they reach the symbol table intact, so the test is about operands and not
 # about the character.
 VIRTUAL = re.compile(r"(?:^|[ ,\[])%\d")

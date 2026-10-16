@@ -111,8 +111,10 @@ def test_the_code_the_collector_will_be_written_in_is_accepted(lowered):
     known instance, a call to an ordinary function, and a panic through a C
     string."""
     code, _, stderr = lowered(
-        "import Std.Classes\n"
-        "import Data.Bool.Type (Bool(..))\n"
+        "import Data.Eq (Eq(..))\n"
+        "import Data.Ord (Ord(..))\n"
+        "import Data.Num (Add(..))\n"
+        "import Data.Bool (Bool(..))\n"
         "import Turkey.Ptr as Ptr\n"
         "import Turkey.Process as Rt\n"
         "fun g(p : Ptr.Ptr, q : Ptr.Ptr, n : Int) -> Bool {\n"
@@ -145,7 +147,8 @@ def test_a_var_is_not_a_cell_because_an_inlined_callee_reuses_its_name(
     """Inlining binds the callee's names as `let`s in the caller. A use of
     one is a use of that `let`, not of the caller's `var` of the same name."""
     code, _, stderr = lowered(
-        "import Std.Classes\n"
+        "import Data.Eq (Eq(..))\n"
+        "import Data.Num (Add(..))\n"
         + helper +
         "fun g(s : Prim.Ptr) -> Int {\n"
         "    var i = 0\n"
@@ -176,8 +179,8 @@ def test_an_instance_declared_in_a_giblet_and_called_directly_is_accepted(
         lowered):
     """A method of a known instance is a direct call once specialized."""
     code, _, stderr = lowered(
-        "import Std.Classes\n"
-        "import Data.Bool.Type (Bool(..))\n"
+        "import Data.Eq (Eq(..))\n"
+        "import Data.Bool (Bool(..))\n"
         "type Handle = Handle(Int)\n"
         "instance Eq Handle {\n"
         "    fun eq(a : Handle, b : Handle) -> Bool = True\n"
@@ -219,8 +222,8 @@ MADE = (
      "f", "calls through a closure or a dictionary"),
     # A method of an instance the giblet declares, called through the
     # dictionary an existential carries.
-    ("import Std.Classes\n"
-     "import Data.Bool.Type (Bool(..))\n"
+    ("import Data.Eq (Eq(..))\n"
+     "import Data.Bool (Bool(..))\n"
      "type Handle = Handle(Int)\n"
      "instance Eq Handle {\n"
      "    fun eq(a : Handle, b : Handle) -> Bool = True\n"

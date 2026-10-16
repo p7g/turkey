@@ -118,7 +118,7 @@ def test_a_program_may_declare_its_own_option():
     src = "type Option a = None | Some(a)\nfun f(x) = Some(x)"
     # Both print qualified, because printing `Option` twice would say less.
     assert scheme(src, "f") == "fun(a) -> Main.Option a"
-    assert "Data.Option.Type.Option" in fails(
+    assert "Data.Option.Option" in fails(
         src + "\nfun g(o : Option Int) -> Bool = Option.isSome(o)")
 
 

@@ -149,7 +149,7 @@ def test_c_calls_a_definition_through_a_pointer(probe, tmp_path):
     floating arguments interleaved, a `Unit` result that is C's `void`, and a
     call made before the program's own entry has run."""
     assert probe(
-        "import Std.Classes\n"
+        "import Data.Num (Add(..), Mul(..))\n"
         'foreign "probe_scale" fun f(a : Int, x : Float, b : Int) -> Int =\n'
         "    Prim.floatTruncate(Prim.intToFloat(a) * x) + b\n"
         'foreign "probe_note" fun note(n : Int) -> Unit { }\n') == ""

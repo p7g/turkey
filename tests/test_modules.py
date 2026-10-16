@@ -449,7 +449,7 @@ def test_an_orphan_instance_is_rejected(tmp_path):
     message = fails(
         'import Shape\ninstance Show Node { fun show(n) = "node" }', search)
     assert message.startswith("orphan instance: 'Show Node' is declared in 'Main'")
-    assert "'Show' belongs to 'Std.Classes'" in message
+    assert "'Show' belongs to 'Text.Show'" in message
     assert "'Node' to 'Shape'" in message
 
 

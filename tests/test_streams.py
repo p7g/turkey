@@ -281,9 +281,13 @@ fun main() {
         Left(IO.Reading(e)) -> print(e)
         _ -> print("?")
     }
+    match IO.copy(Broken, s, IO.buffer(3)) {
+        Left(e) -> print(e)
+        Right(_) -> print("?")
+    }
 }
 """)
-    assert out == ["(500000, True)", "(6, copied, 2)", "broken"]
+    assert out == ["(500000, True)", "(6, copied, 2)", "broken", "Reading(broken)"]
 
 
 def test_any_read_and_any_write_choose_at_run_time():

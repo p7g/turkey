@@ -206,10 +206,14 @@ fun main() {
         Right(_) -> print("four bytes")
         Left(e) -> print(message(e))
     }
+    match IO.copy(must(File.openRead(".")), must(File.create("out", File.Truncate)), IO.buffer(4)) {
+        Right(_) -> print("copied")
+        Left(e) -> print(message(e))
+    }
 }
 """, tmp_path)
     assert out == ["invalid UTF-8", "open missing: no such file or directory",
-                   "the input ended early"]
+                   "the input ended early", "read .: is a directory"]
 
 
 def test_readAll_reads_a_large_file_whole(tmp_path):

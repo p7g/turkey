@@ -385,7 +385,7 @@ def test_a_class_may_not_be_declared_twice():
 def test_a_class_may_share_a_short_name_with_a_type():
     src = "class Option a { fun f(a) -> a }"
     assert "Main#Option" in lang.classes(src)
-    assert "Data.Option.Type#Option" in lang.kinds(src)
+    assert "Data.Option#Option" in lang.kinds(src)
 
 
 def test_a_method_parameter_needs_a_type():

@@ -1,4 +1,7 @@
 module Data.String (
+    String(..),
+    bytesOf,
+    concat,
     Bytes,
     CodePoints,
     Builder,
@@ -41,18 +44,29 @@ module Data.String (
 )
 
 import Prelude ()
-import Std.Classes
+import Data.Int (Int)
+import Data.Char (Char)
+import Data.Byte (Byte)
+import Data.Tuple (Unit)
+import Data.Eq (Eq(..))
+import Data.Ord (Ord(..))
+import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..))
+import Text.Show (Show(..))
+import Data.Hashable (Hash(..), Hasher(..))
+import Control.Iterator (Iterator(..))
+import Data.Index (Index(..), SetIndex(..), Length(..))
+import Data.Semigroup (Semigroup(..))
+import Data.Monoid (Monoid(..))
+import Control.Panic (error)
 import Data.Array (Array)
 import Data.Array as Array
-import Data.Bool.Type (Bool(..))
+import Data.Bool (Bool(..))
 import Data.Byte ()
 import Data.Byte as Byte
 import Data.Char as Char
 import Data.Int ()
 import Data.Int as Int
-import Data.Option.Type (Option(..))
-import Data.String.Type (String(..))
-import Data.String.Type as Type
+import Data.Option (Option(..))
 import Data.Tuple ()
 import Data.Vec (Vec)
 import Data.Vec as Vec
@@ -70,8 +84,34 @@ import Turkey.Scan as Scan
 -- the same reason; and no byte offset ever reaches the surface language, so
 -- there is no way to construct a slice that cuts a character in half.
 
+-- Its representation is its bytes: an exact-sized `Prim.Array Byte`, never written
+-- after the string is made, and always well-formed UTF-8. Both backends erase
+-- a single-field newtype, so at run time a `String` *is* the byte array -- no
+-- wrapper object, no header of its own. Slicing copies rather than sharing,
+-- because a shared backing store is how a small substring keeps a large
+-- parent alive, which is the leak Java removed sharing over in 7u6.
+--
+-- The invariants are this module's to keep, and the constructor is exported
+-- for the library: it takes a `Prim.Array`, which only a library module can
+-- name, so nothing outside `lib/` can build a `String` that skips the checks.
+-- The Prelude's `String.` names leave it out, with `bytesOf` and `concat`.
+type String = String(Prim.Array Byte)
+
+fun bytesOf(s : String) -> Prim.Array Byte = match s { String(b) -> b }
+
+fun concat(a : String, b : String) -> String {
+    let x = bytesOf(a)
+    let y = bytesOf(b)
+    let n = Prim.arrayLength(x)
+    let m = Prim.arrayLength(y)
+    let out = Prim.arrayNewUninit(Prim.intAdd(n, m))
+    Prim.arrayCopy(out, 0, x, 0, n)
+    Prim.arrayCopy(out, n, y, 0, m)
+    String(out)
+}
+
 -- O(1). The only cheap count a string has.
-fun byteLength(s : String) -> Int = Type.byteLength(s)
+fun byteLength(s : String) -> Int = Prim.arrayLength(bytesOf(s))
 
 fun isEmpty(s : String) -> Bool = byteLength(s) == 0
 
@@ -193,7 +233,7 @@ instance Ord Index { fun lt(Index(a), Index(b)) = a < b }
 fun toBytes(s : String) -> Array Byte {
     let n = byteLength(s)
     let out = Prim.arrayNewUninit(n)
-    Prim.arrayCopy(out, 0, Type.bytesOf(s), 0, n)
+    Prim.arrayCopy(out, 0, bytesOf(s), 0, n)
     Array.ofStorage(out)
 }
 
@@ -230,7 +270,7 @@ fun build(b : Builder) -> String {
     let out = Prim.arrayNewUninit(total)
     var at = 0
     for part in b.parts {
-        let from = Type.bytesOf(part)
+        let from = bytesOf(part)
         let n = Prim.arrayLength(from)
         Prim.arrayCopy(out, at, from, 0, n)
         at = at + n
@@ -472,7 +512,7 @@ instance Ord String {
     }
 }
 
-instance Add String { fun add(x, y) = Type.concat(x, y) }
+instance Add String { fun add(x, y) = concat(x, y) }
 instance Show String { fun show(x) = x }
 instance Semigroup String { fun combine(x, y) = add(x, y) }
 instance Monoid String { fun empty() = "" }
@@ -500,7 +540,7 @@ instance Hash String {
 -- invariant.
 
 -- The byte at an offset the caller has already checked.
-fun byteAt(s : String, i : Int) -> Byte = Prim.arrayGet(Type.bytesOf(s), i)
+fun byteAt(s : String, i : Int) -> Byte = Prim.arrayGet(bytesOf(s), i)
 
 fun checkIndex(s : String, i : Int) -> Unit {
     if i < 0 || i >= byteLength(s) {
@@ -560,7 +600,7 @@ fun sliceBytes(s : String, start : Int, stop : Int) -> String {
     if !isBoundary(s, start) || !isBoundary(s, stop) {
         error("string slice " + span + " does not fall on character boundaries")
     }
-    let from = Type.bytesOf(s)
+    let from = bytesOf(s)
     let out = Prim.arrayNewUninit(stop - start)
     Prim.arrayCopy(out, 0, from, start, stop - start)
     String(out)

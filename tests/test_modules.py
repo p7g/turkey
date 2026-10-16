@@ -101,15 +101,18 @@ def test_hiding_withholds_only_what_it_names(tmp_path):
 
 
 def test_import_prelude_empty_disables_the_implicit_prelude(tmp_path):
-    src = "import Prelude ()\nfun identity(n : Int) -> Int = n"
+    src = "import Prelude ()\nimport Data.Int (Int)\nfun identity(n : Int) -> Int = n"
     assert sigs(src, {})["identity"] == "fun(Int) -> Int"
+    # Not even a primitive type is in scope without an import.
+    assert "unknown type 'Int'" in fails(
+        "import Prelude ()\nfun identity(n : Int) -> Int = n", {})
     assert fails(
         "import Prelude ()\nfun main() { print(1) }", {}
     ) == "'print' is not defined"
 
 
 def test_an_explicit_prelude_import_replaces_the_implicit_scope(tmp_path):
-    check("import Prelude (error)\nfun stop() -> Int = error(\"x\")", {})
+    check("import Prelude (error, Int)\nfun stop() -> Int = error(\"x\")", {})
     assert fails("import Prelude (error)\nfun main() { print(1) }", {}) == \
         "'print' is not defined"
 
@@ -120,7 +123,7 @@ def test_a_prelude_and_a_module_it_imports_may_need_each_other(tmp_path):
     for base in ("module Base ()\nimport Prelude ()", "module Base ()"):
         search = write(tmp_path, Prelude="module Prelude ()\nimport Base",
                        Base=base)
-        check("fun identity(n : Int) -> Int = n", search)
+        check("fun identity(n) = n", search)
 
 
 # -- what an export list withholds --------------------------------------------
@@ -449,7 +452,7 @@ def test_an_orphan_instance_is_rejected(tmp_path):
     message = fails(
         'import Shape\ninstance Show Node { fun show(n) = "node" }', search)
     assert message.startswith("orphan instance: 'Show Node' is declared in 'Main'")
-    assert "'Show' belongs to 'Std.Classes'" in message
+    assert "'Show' belongs to 'Text.Show'" in message
     assert "'Node' to 'Shape'" in message
 
 

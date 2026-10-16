@@ -42,4 +42,4 @@ def test_generic_copy_reads_the_constant_at_its_own_type() -> None:
                if re.match(r"Main#deepest@\[ptr\] : forall a\.", head)]
     assert len(generic) == 1, list(bindings)
     # As a value, not only as the pattern the recursive result is matched on.
-    assert "(Data.Option.Type#None)" in generic[0]
+    assert "(Data.Option#None)" in generic[0]

@@ -70,7 +70,7 @@ fun main() {
     print(repOf(pairP()) == repOf(otherP()))
 }
 """
-    assert outputs(source) == "Tuple2 Int Data.String.Type#String\nFalse\n"
+    assert outputs(source) == "Tuple2 Int Data.String#String\nFalse\n"
 
 
 def test_identity_is_structural():

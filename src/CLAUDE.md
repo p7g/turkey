@@ -20,10 +20,10 @@ imports it, and it already provides:
 So a module that lexes text needs **no imports at all**. Write `String.push`
 and `Vec.new` and be done.
 
-`import Prelude ()` is for the standard library, which the Prelude itself
-depends on and therefore cannot import. A compiler module that writes it, and
-then re-imports `Std.Classes` and `Data.Option` and `Data.Bool` by hand, has
-reconstructed the Prelude by hand for no reason. Don't.
+`import Prelude ()` is for the standard library, which the Prelude itself is
+built from. A compiler module that writes it, and then re-imports `Data.Eq`
+and `Data.Option` and `Data.Bool` by hand, has reconstructed the Prelude by
+hand for no reason. Don't.
 
 What still needs importing:
 

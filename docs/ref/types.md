@@ -347,12 +347,34 @@ are evaluated only for their effect: an assignment, a loop, a call to `print`,
 or an `if` with no `else`. A function whose body produces nothing useful
 returns `Unit`.
 
+The type can be written `()` too, the way its value is. `Unit` is the usual
+spelling for a function's result; `()` reads better inside a larger type:
+
+<!-- run -->
+```kotlin
+type Callback = fun(String) -> ()
+
+fun twice(f : Callback, message : String) -> Unit {
+    f(message)
+    f(message)
+}
+
+fun main() {
+    twice(fun(m) = print(m), "hello")
+}
+```
+
+```text
+hello
+hello
+```
+
 ## Tuples
 
 A tuple type is written `(A, B)`, `(A, B, C)`, and so on, and a tuple value is
 written the same way with expressions: `(1, "one")`. A tuple has at least two
-elements: `(x)` is just `x` in parentheses, `(x,)` is an error, and `()` is the
-unit value rather than an empty tuple.
+elements: `(x)` is just `x` in parentheses, `(x,)` is an error, and `()` is
+[`Unit`](#unit), as a type and as a value, rather than an empty tuple.
 
 Tuples are immutable. Their elements are read with a
 [pattern](patterns.md#tuple-patterns) or with

@@ -1,4 +1,4 @@
-module Turkey.Parser (parse, collectTycons, builtinTycons)
+module Turkey.Parser (parse, collectTycons, knownTycons)
 
 -- Recursive descent.
 --
@@ -57,7 +57,7 @@ fun parse(source : Source, known : Vec String) -> Program {
 -- The pre-pass: every `type CONID` name declared in this file, so that a
 -- declaration can mention a type constructor declared after it.
 fun collectTycons(toks : Vec Token) -> Vec String {
-    let names = Vec.fromArray(builtinTycons)
+    let names = Vec.fromArray(knownTycons)
     for var i = 0; i + 1 < len(toks); i = i + 1 {
         if Token.isWord(toks[i].kind, "type") && isConid(toks[i + 1]) {
             Vec.push(names, text(toks[i + 1]))
@@ -66,7 +66,10 @@ fun collectTycons(toks : Vec Token) -> Vec String {
     names
 }
 
-let builtinTycons = ["Int", "Float", "String", "Char", "Bool", "Unit", "Array"]
+-- Type names every file may be read knowing, wherever they are declared, so
+-- that `type Count = Int` reads as an alias before the module declaring `Int`
+-- has been read. Knowing a name here puts nothing in scope.
+let knownTycons = ["Int", "Float", "String", "Char", "Byte", "Bool", "Unit", "Array"]
 
 -- -- token helpers ------------------------------------------------------------------
 
@@ -371,7 +374,9 @@ fun parseTypeDecl(p : P) -> TypeDecl {
     -- `CONID args*` is a data type when the head does not name an existing type
     -- constructor -- or when it names the type being declared, which is the
     -- newtype case and not a recursive alias.
-    if at(p, "CONID") {
+    -- A qualified head is a type: a constructor is never written qualified
+    -- where it is declared.
+    if at(p, "CONID") && Token.kindName(peek(p, 1).kind) != "." {
         let headName = text(cur(p))
         if Token.kindName(peek(p, 1).kind) == "{" || rhsHasAlternatives(p) {
             return parseDataRhs(p, s, name, params)
@@ -603,6 +608,8 @@ fun dottedFrom(p : P, first : Token) -> String {
 
 fun parseParenType(p : P, tok : Token) -> Type {
     step(p)
+    -- `()`, the unit type.
+    if eat(p, ")") { return mkType(p, tok.span, TETuple(Vec.new(0))) }
     let elems = Vec.new(2)
     Vec.push(elems, parseTypeExpr(p))
     while eat(p, ",") {

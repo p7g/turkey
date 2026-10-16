@@ -217,6 +217,24 @@ fun head(t : DeclTable, name : String) -> Ty.Type = match Map.get(t.heads, name)
 
 -- -- registration -------------------------------------------------------------------
 
+-- Whether a declaration gives a primitive its name: `type Int = Prim.Int`, or
+-- `type Unit = ()`, which is how the library puts the primitives in modules.
+-- Only the library can write the first kind, since only it can spell `Prim.`.
+-- Any other declaration of a primitive's name would make that name mean two
+-- types.
+fun namesPrimitive(d : TypeDecl) -> Bool {
+    let short = Ty.shortName(d.name)
+    if len(d.params) != 0 { return False }
+    match d.alias {
+        Some(te) -> match te.kind {
+            TECon(target, args) -> target == short && len(args) == 0
+            TETuple(elems) -> short == "Unit" && len(elems) == 0
+            _ -> False
+        }
+        None -> False
+    }
+}
+
 -- Declare every type before resolving any, so they may refer to each other in
 -- any order.
 fun registerAll(t : DeclTable, decls : Vec TypeDecl) -> Unit {
@@ -269,7 +287,7 @@ fun registerAll(t : DeclTable, decls : Vec TypeDecl) -> Unit {
     }
     for d in decls {
         let short = Ty.shortName(d.name)
-        if Ty.isPrimitive(short) {
+        if Ty.isPrimitive(short) && !namesPrimitive(d) {
             oops("cannot redefine the built-in type '" + short + "'", Some(d.span))
         }
         if Map.contains(t.tycons, d.name) {
@@ -518,7 +536,9 @@ fun toType(t : DeclTable, te : Type, tyvars : Map String Ty.Type,
             made
         }
     }
-    TETuple(elems) -> TTuple(Array.map(elems, toType(t, _, tyvars, fresh)))
+    -- `()` is the unit type, as `()` is the unit value: the tuple of nothing.
+    TETuple(elems) -> if len(elems) == 0 { Ty.tUnit() }
+                      else { TTuple(Array.map(elems, toType(t, _, tyvars, fresh))) }
     TEFun(params, ret) -> TFun(
         Array.map(params, toType(t, _, tyvars, fresh)),
         toType(t, ret, tyvars, fresh))

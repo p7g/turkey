@@ -335,21 +335,26 @@ fun position(stage : String) -> Int = match Array.indexOf(stages, stage) {
 -- Every module of the program, loaded, resolved and desugared, in dependency
 -- order. What every stage from here on starts from.
 fun loadResolved(path : String) -> Vec Modules.Module {
-    let (modules, _) = loadProgram(path)
+    let (groups, _) = loadProgram(path)
+    let modules = Vec.new(8)
+    for group in groups {
+        for m in group { Vec.push(modules, m) }
+    }
     modules
 }
 
--- Every module of the program, and the entry among them. The entry is the last
--- to finish loading, since a module finishes after everything it imports, but
+-- Every module of the program, a component of modules that import each other
+-- at a time, and the entry among them. The entry is in the last component to
+-- finish loading, since a component finishes after everything it imports, but
 -- saying so here beats relying on it at every call site.
-fun loadProgram(path : String) -> (Vec Modules.Module, Modules.Module) {
+fun loadProgram(path : String) -> (Vec (Vec Modules.Module), Modules.Module) {
     let loader = Modules.newLoader([directoryOf(path), libRoot()])
     let entry = Modules.loadEntry(loader, readOrDie(path), "Main")
     for m in loader.order {
         Resolve.program(m.scope, m.program)
         Desugar.program(m.program, m.scope.methods)
     }
-    (loader.order, entry)
+    (loader.groups, entry)
 }
 
 -- The program's declaration table, and nothing after it: every type constructor
@@ -373,22 +378,23 @@ fun registerTables(path : String,
                    withClasses : Bool) -> (Decls.DeclTable, Classes.ClassTable) {
     let table = Decls.newDeclTable()
     let classes = Classes.newClassTable(table)
-    for m in loadResolved(path) {
+    let (groups, _) = loadProgram(path)
+    for group in groups {
         let types = Vec.new(8)
         let classDecls = Vec.new(4)
         let instDecls = Vec.new(4)
-        for d in m.program.decls {
-            match d {
-                DType(td) -> Vec.push(types, td)
-                DClass(cd) -> Vec.push(classDecls, cd)
-                DInstance(idl) -> Vec.push(instDecls, idl)
-                _ -> {}
+        for m in group {
+            for d in m.program.decls {
+                match d {
+                    DType(td) -> Vec.push(types, td)
+                    DClass(cd) -> Vec.push(classDecls, (cd, m.name))
+                    DInstance(idl) -> Vec.push(instDecls, (idl, m.name))
+                    _ -> {}
+                }
             }
         }
         Decls.registerAll(table, types)
-        if withClasses {
-            Classes.registerAll(classes, classDecls, instDecls, m.name)
-        }
+        if withClasses { Classes.registerAll(classes, classDecls, instDecls) }
     }
     (table, classes)
 }
@@ -1146,7 +1152,7 @@ type Checked = Checked {
 
 fun checkProgram(path : String) -> (Checked, Modules.Module) {
     Solved.resetDictNames()
-    let (modules, entry) = loadProgram(path)
+    let (groups, entry) = loadProgram(path)
     let checked = Checked {
         decls = Decls.newDeclTable(), classes = Classes.newClassTable(
             Decls.newDeclTable()),
@@ -1155,29 +1161,52 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
         library = Set.new(),
     }
     checked.classes = Classes.newClassTable(checked.decls)
-    for m in modules {
-        if m.library { Set.add(checked.library, m.name) }
-        let g = Infer.newGenerator(checked.decls, checked.env, checked.classes,
-                                   m.name, checked.types)
-        let (items, constraint) = Infer.generate(g, m.program)
-        let visibleCons = Set.new()
-        for (_, target) in Map.entries(m.scope.cons) { Set.add(visibleCons, target) }
-        for (_, targets) in Map.entries(Modules.conflictsIn(m.scope, Modules.ConstructorSpace)) {
-            for target in targets { Set.add(visibleCons, target) }
+    -- A component of modules is checked in one run: their bindings may use
+    -- each other, so they are inferred together.
+    for group in groups {
+        let programs = Vec.new(len(group))
+        let owners = Map.new()
+        let visibleByFile = Map.new()
+        for m in group {
+            if m.library { Set.add(checked.library, m.name) }
+            Vec.push(programs, (m.name, m.program))
+            for d in m.program.decls {
+                if let DStmt(s) = d { Map.put(owners, s.id, m.name) }
+            }
+            Map.put(visibleByFile, m.file, visibleConstructors(m))
         }
+        let g = Infer.newGenerator(checked.decls, checked.env, checked.classes,
+                                   checked.types)
+        let (items, constraint) = Infer.generate(g, programs)
+        -- A constraint with no span has no module to go by, and is held to the
+        -- group's first; a group of one module has no other.
+        let fallback = visibleConstructors(group[0])
         let solver = Constraints.newSolver(checked.decls, checked.env,
-                                           checked.classes, visibleCons)
+            checked.classes, fun(where) = match where {
+                Some(sp) -> Map.getOr(visibleByFile, sp.file, fallback)
+                None -> fallback
+            })
         Constraints.run(solver, constraint)
         Infer.checkExhaustiveness(g)
         Evidence.run(checked.classes, solver.uses)
         for item in items {
             Vec.push(checked.ordered, item)
-            Map.put(checked.owners, item.id, m.name)
+            Map.put(checked.owners, item.id, Map.getOr(owners, item.id, group[0].name))
         }
         for w in g.warnings { Vec.push(checked.warnings, w) }
     }
     checkMain(entry, checked.env, checked.classes)
     (checked, entry)
+}
+
+-- The value constructors a module's scope can name, ambiguous ones included.
+fun visibleConstructors(m : Modules.Module) -> Set.Set String {
+    let out = Set.new()
+    for (_, target) in Map.entries(m.scope.cons) { Set.add(out, target) }
+    for (_, targets) in Map.entries(Modules.conflictsIn(m.scope, Modules.ConstructorSpace)) {
+        for target in targets { Set.add(out, target) }
+    }
+    out
 }
 
 -- `main`, if the entry module defines one, is `fun() -> Unit`.

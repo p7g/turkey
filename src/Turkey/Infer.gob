@@ -98,8 +98,6 @@ type Generator = Generator {
     -- the constraint is built. Shared across modules the way the declaration
     -- table is: one program, one table.
     types       : TypeTable,
-    -- Which module is being generated, for the orphan rule.
-    module_     : String,
     classes     : ClassTable,
     env         : Env,
     frames      : Vec Frame,
@@ -129,10 +127,10 @@ type Generator = Generator {
 }
 
 fun newGenerator(decls : DeclTable, builtins : Env, classes : ClassTable,
-                 owner : String, types : TypeTable) -> Generator {
+                 types : TypeTable) -> Generator {
     Typed.observe(types, classes)
     Generator {
-        decls = decls, types = types, module_ = owner, classes = classes,
+        decls = decls, types = types, classes = classes,
         env = builtins, frames = [Frame { vars = Vec.new(8), parts = Vec.new(8) }],
         scopes = [namesOf(builtins)], fnStack = Vec.new(4),
         loopStack = Vec.new(4), tyvarScopes = [Map.new()],
@@ -238,7 +236,13 @@ fun freshCell(g : Generator) -> VarCell {
 
 -- -- the program -------------------------------------------------------------------
 
--- Build the whole program's constraint, and its evaluation order.
+-- Build the constraint of a component of modules -- modules that import each
+-- other, or one module that imports none of its importers -- and their
+-- evaluation order. Each module comes with its name, which owns its classes
+-- and instances for the orphan rule. Everything else is already qualified by
+-- module, so the component's declarations are generated as one program: its
+-- types declared together, and its bindings grouped by what they use whichever
+-- module they are in.
 --
 -- The evaluator reuses that order, so a binding is always initialized before
 -- anything that reads it. The constraint has the same shape: one binder per
@@ -247,23 +251,33 @@ fun freshCell(g : Generator) -> VarCell {
 -- to its top-level environment, which every later group looks names up
 -- through. So the constraint is as deep as one group, not as deep as the
 -- module is long.
-fun generate(g : Generator, program : Program) -> (Vec Stmt, Constraint) {
+fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Constraint) {
     let typeDecls = Vec.new(8)
     let classDecls = Vec.new(4)
     let instDecls = Vec.new(4)
+    let ownedClasses = Vec.new(4)
+    let ownedInstances = Vec.new(4)
     let foreigns = Vec.new(4)
     let items = Vec.new(16)
-    for d in program.decls {
-        match d {
-            DType(t) -> Vec.push(typeDecls, t)
-            DClass(c) -> Vec.push(classDecls, c)
-            DInstance(i) -> Vec.push(instDecls, i)
-            DStmt(s) -> Vec.push(items, s)
-            DForeign(f) -> Vec.push(foreigns, f)
+    for (owner, program) in modules {
+        for d in program.decls {
+            match d {
+                DType(t) -> Vec.push(typeDecls, t)
+                DClass(c) -> {
+                    Vec.push(classDecls, c)
+                    Vec.push(ownedClasses, (c, owner))
+                }
+                DInstance(i) -> {
+                    Vec.push(instDecls, i)
+                    Vec.push(ownedInstances, (i, owner))
+                }
+                DStmt(s) -> Vec.push(items, s)
+                DForeign(f) -> Vec.push(foreigns, f)
+            }
         }
     }
     Decls.registerAll(g.decls, typeDecls)
-    Classes.registerAll(g.classes, classDecls, instDecls, g.module_)
+    Classes.registerAll(g.classes, ownedClasses, ownedInstances)
     bindMethods(g)
     bindForeigns(g, foreigns)
     checkDefinitions(g, items)

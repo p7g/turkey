@@ -18,8 +18,17 @@ module Turkey.Modules (
 -- Prelude. Distinct declarations from peer imports remain ambiguous until a
 -- use chooses a namespace; importing the same declaration twice is harmless.
 --
--- The import graph must be acyclic. Two modules that need each other are one
--- module here, which is also why this compiler's own layering is a DAG.
+-- The walk finds the graph's strongly connected components as it goes
+-- (`Deps.components`), and a module's tables are made when its component is
+-- finished: every module it imports is then either finished too or in the same
+-- component. Within a component the tables depend on each other -- a module's
+-- scope on its imports' exports, its exports on its scope -- so they are the
+-- least fixed point of those equations, as Diatchki, Jones and Hallgren
+-- specify for Haskell 98's mutually recursive modules ("A Formal Specification
+-- for the Haskell 98 Module System", 2002). A component of one module is
+-- solved in one step, by the same equations.
+--
+-- A component of more than one module is still refused, when it is finished.
 
 import Turkey.Ast
 import System.Env as Env
@@ -27,6 +36,7 @@ import System.File as File
 import System.IO as IO
 -- `Data.Set` is not one of the modules the Prelude re-exports.
 import Data.Set as Set
+import Turkey.Deps as Deps
 import Turkey.Diag as Diag
 import Turkey.Parser as Parser
 import Turkey.Prelude as Prelude
@@ -133,10 +143,17 @@ type Loader = Loader {
     -- The entry file's own directory first, then the shipped library, which is
     -- always last and is what marks a module as one the language ships.
     search       : Array String,
+    -- Every finished module.
     modules      : Map String Module,
     -- Every module, in the order they finished loading, which is dependency
-    -- order because a module finishes after everything it imports.
+    -- order: a module finishes with its component, after everything outside
+    -- the component that it imports. Members of one component are in the
+    -- order the walk reached them.
     order        : Vec Module,
+    -- The same modules, a component at a time, in the same order.
+    groups       : Vec (Vec Module),
+    -- Modules the walk has read whose component is not finished yet.
+    open         : Map String Opened,
     -- Every type name known so far, threaded into later parses: section 7's
     -- alias-versus-data pre-pass cannot see another file.
     tycons       : Vec String,
@@ -148,10 +165,22 @@ type Loader = Loader {
     classMembers : Map String (Vec String),
 }
 
+-- A module the walk has read, whose component is not finished.
+type Opened = Opened {
+    name        : String,
+    source      : Source,
+    library     : Bool,
+    var program : Program,
+    -- How many type names were known when `program` was parsed.
+    parsedWith  : Int,
+}
+
 fun newLoader(search : Array String) -> Loader = Loader {
     search = search,
     modules = Map.new(),
     order = Vec.new(8),
+    groups = Vec.new(8),
+    open = Map.new(),
     tycons = Vec.new(16),
     variants = Map.new(),
     classMembers = Map.new(),
@@ -162,8 +191,11 @@ fun newLoader(search : Array String) -> Loader = Loader {
 -- and the crash handler, which C calls and nothing in the program imports
 -- directly. Loaded ahead of what the entry imports; a program with no `main`
 -- cannot be started, and needs none.
-fun loadEntry(l : Loader, source : Source, name : String) -> Module =
-    add(l, name, source, False, [name], True)
+fun loadEntry(l : Loader, source : Source, name : String) -> Module {
+    Deps.components([name], fun(n) = read(l, n, if n == name { Some(source) } else { None }),
+                    finish(l, _))
+    moduleNamed(l, name)
+}
 
 let startupModule = "Turkey.Entry"
 
@@ -176,31 +208,6 @@ fun declaresMain(program : Program) -> Bool {
         }
     }
     False
-}
-
-fun load(l : Loader, name : String, stack : Array String) -> Module =
-    match Map.get(l.modules, name) {
-        Some(existing) -> existing
-        None -> {
-            if Array.contains(stack, name) {
-                oops("imports form a cycle: " + cycleOf(stack, name)
-                     + ". Two modules that need each other are one module here.")
-            }
-            let (path, library, text) = resolvePath(l, name)
-            let source = match text {
-                Some(text) -> Source { name = path, text = text }
-                None -> oops("cannot read module '" + name + "' at " + path)
-            }
-            add(l, name, source, library, Array.append(stack, [name]), False)
-        }
-    }
-
-fun cycleOf(stack : Array String, name : String) -> String {
-    let from = match Array.indexOf(stack, name) {
-        Some(i) -> i
-        None -> 0
-    }
-    String.join(Array.append(Array.slice(stack, from, len(stack)), [name]), " -> ")
 }
 
 -- `Data.String` is `Data/String.gob` under one of the search roots. The last
@@ -231,57 +238,166 @@ fun resolvePath(l : Loader, name : String) -> (String, Bool, Option String) {
          + String.join(l.search, ", ") + ")")
 }
 
-fun add(l : Loader, name : String, source : Source, library : Bool,
-        stack : Array String, entry : Bool) -> Module {
-    var program = Parser.parse(source, l.tycons)
-    if entry && declaresMain(program) { discard(load(l, startupModule, stack)) }
-    let before = len(l.tycons)
-    let explicitPrelude = hasPreludeImport(program)
-    if name != Prelude.preludeName && !explicitPrelude {
-        discard(load(l, Prelude.preludeName, stack))
-    }
-    for imp in program.imports {
-        -- The empty Prelude import removes the otherwise implicit edge. Empty
-        -- imports of every other module remain instance-only edges.
-        if !(imp.name == Prelude.preludeName && isEmptyList(imp.items)) {
-            let imported = load(l, imp.name, stack)
-            if !library { checkInternalImport(imported, imp) }
+-- Read a module the walk has just reached, and answer the modules it imports,
+-- in the order the walk follows them: the startup module first if this is the
+-- entry and has a `main`, then the implicit Prelude, then the module's own
+-- imports as written. `source` is the entry's; any other module is found on
+-- the search path.
+--
+-- A file is parsed here knowing the type names of every module finished so
+-- far, and again when its component is finished if more are known by then.
+fun read(l : Loader, name : String, source : Option Source) -> Array String {
+    let entry = Option.isSome(source)
+    let (found, library) = match source {
+        Some(given) -> (given, False)
+        None -> {
+            let (file, library, text) = resolvePath(l, name)
+            match text {
+                Some(text) -> (Source { name = file, text = text }, library)
+                None -> oops("cannot read module '" + name + "' at " + file)
+            }
         }
     }
-    if len(l.tycons) != before {
-        -- An imported type name changes how section 7 reads this file, and the
-        -- pre-pass that decides it already ran. Read it again, knowing.
-        program = Parser.parse(source, l.tycons)
+    let program = Parser.parse(found, l.tycons)
+    Map.put(l.open, name, Opened {
+        name = name, source = found, library = library, program = program,
+        parsedWith = len(l.tycons),
+    })
+    let edges = Vec.new(4)
+    if entry && declaresMain(program) { Vec.push(edges, startupModule) }
+    if name != Prelude.preludeName && !hasPreludeImport(program) {
+        Vec.push(edges, Prelude.preludeName)
+    }
+    for imp in program.imports {
+        if importsModule(imp) { Vec.push(edges, imp.name) }
+    }
+    Vec.toArray(edges)
+}
+
+-- The empty Prelude import removes the otherwise implicit edge. Empty imports
+-- of every other module remain instance-only edges.
+fun importsModule(imp : ImportDecl) -> Bool =
+    !(imp.name == Prelude.preludeName && isEmptyList(imp.items))
+
+-- Register a finished component's declarations and make its modules' tables.
+fun finish(l : Loader, names : Vec String) -> Unit {
+    let members = Vec.new(len(names))
+    for name in names {
+        match Map.get(l.open, name) {
+            Some(o) -> Vec.push(members, o)
+            None -> {}
+        }
+    }
+    let together = len(members) > 1
+    if together {
+        oops("imports form a cycle: "
+             + String.join(Vec.append(names, [names[0]]), " -> ")
+             + ". Two modules that need each other are one module here.")
+    }
+    for o in members {
+        if !o.library {
+            for imp in o.program.imports {
+                if importsModule(imp) { checkInternalImport(l, imp) }
+            }
+        }
     }
 
-    for d in program.decls {
+    -- A module's parse needs the type names of the modules it imports, and in a
+    -- component that includes ones not yet registered.
+    if together {
+        for o in members {
+            for d in o.program.decls {
+                if let DType(t) = d { Vec.push(l.tycons, t.name) }
+            }
+        }
+    }
+    for o in members {
+        if len(l.tycons) != o.parsedWith {
+            -- An imported type name changes how section 7 reads this file, and
+            -- the pre-pass that decides it already ran. Read it again, knowing.
+            o.program = Parser.parse(o.source, l.tycons)
+        }
+    }
+    for o in members { register(l, o, !together) }
+
+    let modules = Vec.new(len(members))
+    for o in members {
+        checkForeignPlacement(o.name, o.program, o.library)
+        Giblets.checkPlacement(o.name, o.library, Source.span(o.source.name, 1, 1))
+        let m = Module {
+            name = o.name, program = o.program, library = o.library,
+            scope = newScope(), exports = newScope(),
+        }
+        Map.put(l.modules, o.name, m)
+        Vec.push(modules, m)
+    }
+    for name in names { discard(Map.delete(l.open, name)) }
+    if together { settleTables(l, modules) }
+    -- The last round reports what is wrong, and is the only round of a
+    -- component of one module.
+    for m in modules {
+        m.scope = scopeOf(l, m, True)
+        m.exports = exportsOf(l, m, True)
+    }
+    for m in modules { Vec.push(l.order, m) }
+    Vec.push(l.groups, modules)
+}
+
+-- Bring a component's exports to their least fixed point: start from nothing,
+-- and remake every member's scope from the exports so far and its exports from
+-- that scope, until a round changes nothing. A round reports nothing, since
+-- what is missing in one may arrive in the next.
+--
+-- It ends. The names a module exports only grow from round to round, and so
+-- do the names its importers see. Which declaration a name means is decided
+-- by a fixed precedence -- the module's own, then its imports, then the
+-- Prelude -- over sources that only grow, so it changes only when a name
+-- arrives from a higher source, finitely often.
+fun settleTables(l : Loader, modules : Vec Module) -> Unit {
+    var changed = True
+    while changed {
+        changed = False
+        for m in modules { m.scope = scopeOf(l, m, False) }
+        for m in modules {
+            let next = exportsOf(l, m, False)
+            if !sameNames(next, m.exports) { changed = True }
+            m.exports = next
+        }
+    }
+}
+
+fun sameNames(a : Scope, b : Scope) -> Bool {
+    let xs = spaces(a)
+    let ys = spaces(b)
+    for var i = 0; i < len(xs); i = i + 1 {
+        if len(xs[i]) != len(ys[i]) { return False }
+        for (k, v) in Map.entries(xs[i]) {
+            if Map.get(ys[i], k) != Some(v) { return False }
+        }
+    }
+    True
+}
+
+-- Record what a module declares that other modules' tables and parses ask
+-- about: its type names, unless its component already did, its types'
+-- constructors and its classes' members.
+fun register(l : Loader, o : Opened, typeNames : Bool) -> Unit {
+    for d in o.program.decls {
         match d {
             DType(t) -> {
-                Vec.push(l.tycons, t.name)
+                if typeNames { Vec.push(l.tycons, t.name) }
                 match t.variants {
-                    Some(vs) -> Map.put(l.variants, Prelude.internal(name, t.name),
+                    Some(vs) -> Map.put(l.variants, Prelude.internal(o.name, t.name),
                                         Vec.map(vs, conName))
                     None -> {}
                 }
             }
-            DClass(c) -> Map.put(l.classMembers, Prelude.internal(name, c.name),
+            DClass(c) -> Map.put(l.classMembers, Prelude.internal(o.name, c.name),
                                  Vec.append(Vec.map(c.methods, funName),
                                               Vec.map(c.families, famName)))
             _ -> {}
         }
     }
-
-    checkForeignPlacement(name, program, library)
-    Giblets.checkPlacement(name, library, Source.span(source.name, 1, 1))
-    let m = Module {
-        name = name, program = program, library = library,
-        scope = newScope(), exports = newScope(),
-    }
-    m.scope = scopeOf(l, m)
-    m.exports = exportsOf(l, m)
-    Map.put(l.modules, name, m)
-    Vec.push(l.order, m)
-    m
 }
 
 fun conName(c : ConDecl) -> String = c.name
@@ -312,7 +428,7 @@ fun visible(b : Prims.Builtin, m : Module) -> Bool = match b {
     }
 }
 
-fun scopeOf(l : Loader, m : Module) -> Scope {
+fun scopeOf(l : Loader, m : Module, strict : Bool) -> Scope {
     let scope = newScope()
     -- `Prim.*` is spellable only from a library module, which is what keeps the
     -- machine operations out of the language: the environment holds them for
@@ -338,7 +454,7 @@ fun scopeOf(l : Loader, m : Module) -> Scope {
     if m.name != Prelude.preludeName && !explicitPrelude {
         let implicit = newScope()
         bring(l, implicit, moduleNamed(l, Prelude.preludeName), Prelude.preludeName,
-              False, None, None, None)
+              False, None, None, None, strict)
         let from = spaces(implicit)
         let into = spaces(scope)
         for var i = 0; i < len(into); i = i + 1 {
@@ -354,7 +470,7 @@ fun scopeOf(l : Loader, m : Module) -> Scope {
                 None -> imp.name
             }
             bring(l, imports, dep, alias, imp.qualified, Some(imp.span),
-                  imp.items, imp.hidden)
+                  imp.items, imp.hidden, strict)
         }
     }
 
@@ -386,7 +502,7 @@ fun moduleNamed(l : Loader, name : String) -> Module = match Map.get(l.modules, 
 fun bring(l : Loader, scope : Scope, dep : Module, alias : String,
           qualified : Bool, where : Option Span,
           items : Option (Vec ExportItem),
-          hidden : Option (Vec ExportItem)) -> Unit {
+          hidden : Option (Vec ExportItem), strict : Bool) -> Unit {
     var chosen = Array.map(spaces(dep.exports), copyMap)
     match items {
         None -> {}
@@ -394,7 +510,7 @@ fun bring(l : Loader, scope : Scope, dep : Module, alias : String,
             chosen = spaces(newScope())
             let available = spaces(dep.exports)
             for item in wantedItems {
-                if !namedAnywhere(dep.exports, item.name) {
+                if strict && !namedAnywhere(dep.exports, item.name) {
                     oopsAt("module '" + dep.name + "' does not export "
                            + quoted(item.name), where)
                 }
@@ -414,7 +530,7 @@ fun bring(l : Loader, scope : Scope, dep : Module, alias : String,
                     }
                 }
                 for sub in subsOf(l, dep, item) {
-                    checkImportedMember(l, dep, item, sub, where)
+                    if strict { checkImportedMember(l, dep, item, sub, where) }
                     let memberSpaces = if Map.contains(dep.exports.classes, item.name) {
                         [ValueSpace, TypeSpace, MethodSpace]
                     } else { [ConstructorSpace] }
@@ -536,7 +652,7 @@ fun isDotDot(subs : Vec String) -> Bool =
 
 -- -- exports ------------------------------------------------------------------------
 
-fun exportsOf(l : Loader, m : Module) -> Scope {
+fun exportsOf(l : Loader, m : Module, strict : Bool) -> Scope {
     let mine = ownScope(m.name, m.program)
     match m.program.header {
         None -> mine
@@ -544,7 +660,7 @@ fun exportsOf(l : Loader, m : Module) -> Scope {
             None -> mine
             Some(items) -> {
                 let out = newScope()
-                for item in items { exportOne(l, m, mine, item, out) }
+                for item in items { exportOne(l, m, mine, item, out, strict) }
                 out
             }
         }
@@ -552,13 +668,15 @@ fun exportsOf(l : Loader, m : Module) -> Scope {
 }
 
 fun exportOne(l : Loader, m : Module, mine : Scope, item : ExportItem,
-              out : Scope) -> Unit {
+              out : Scope, strict : Bool) -> Unit {
     if item.kind == "module" {
-        return reexport(m, item, out)
+        return reexport(m, item, out, strict)
     }
     if isLower(item.name) {
-        return Map.put(out.values, item.name,
-                       exported(m, mine.values, ValueSpace, item))
+        return match exported(m, mine.values, ValueSpace, item, strict) {
+            Some(target) -> Map.put(out.values, item.name, target)
+            None -> {}
+        }
     }
     -- A name the module *declares itself* is that declaration, whatever an
     -- import may have brought in under the same spelling. Without this,
@@ -569,21 +687,24 @@ fun exportOne(l : Loader, m : Module, mine : Scope, item : ExportItem,
     if !Map.contains(mine.types, item.name)
        && (Map.contains(mine.classes, item.name)
            || Map.contains(m.scope.classes, item.name)) {
-        exportClass(l, m, mine, item, out)
+        exportClass(l, m, mine, item, out, strict)
     } else {
-        exportType(l, m, mine, item, out)
+        exportType(l, m, mine, item, out, strict)
     }
 }
 
 fun exportClass(l : Loader, m : Module, mine : Scope, item : ExportItem,
-                out : Scope) -> Unit {
-    let target = exported(m, mine.classes, ClassSpace, item)
+                out : Scope, strict : Bool) -> Unit {
+    let target = match exported(m, mine.classes, ClassSpace, item, strict) {
+        Some(t) -> t
+        None -> return
+    }
     Map.put(out.classes, item.name, target)
     for member in subsFrom(item, membersOf(l, target)) {
         let value = firstOf(Map.get(mine.methods, member),
-                            lookupName(m.scope, MethodSpace, member, Some(item.span)))
+                            findName(m.scope, MethodSpace, member, item, strict))
         let family = firstOf(Map.get(mine.types, member),
-                             lookupName(m.scope, TypeSpace, member, Some(item.span)))
+                             findName(m.scope, TypeSpace, member, item, strict))
         match value {
             Some(v) -> {
                 Map.put(out.values, member, v)
@@ -591,41 +712,45 @@ fun exportClass(l : Loader, m : Module, mine : Scope, item : ExportItem,
             }
             None -> match family {
                 Some(f) -> Map.put(out.types, member, f)
-                None -> oopsAt("'" + member + "' is not a member of class '"
-                               + item.name + "'", Some(item.span))
+                None -> if strict {
+                    oopsAt("'" + member + "' is not a member of class '"
+                           + item.name + "'", Some(item.span))
+                }
             }
         }
     }
 }
 
 fun exportType(l : Loader, m : Module, mine : Scope, item : ExportItem,
-               out : Scope) -> Unit {
-    let target = exported(m, mine.types, TypeSpace, item)
+               out : Scope, strict : Bool) -> Unit {
+    let target = match exported(m, mine.types, TypeSpace, item, strict) {
+        Some(t) -> t
+        None -> return
+    }
     Map.put(out.types, item.name, target)
     let variants = variantsOf(l, Some(target))
     for con in subsFrom(item, variants) {
-        if !Vec.contains(variants, con) {
-            oopsAt("'" + con + "' is not a constructor of '"
-                   + item.name + "'", Some(item.span))
-        }
-        match firstOf(Map.get(mine.cons, con), lookupName(m.scope, ConstructorSpace, con, Some(item.span))) {
-            Some(t) -> {
-                if !constructorMember(l, Some(target), con, Some(t)) {
-                    oopsAt("'" + con + "' is not a constructor of '"
-                           + item.name + "'", Some(item.span))
-                }
+        if strict && !Vec.contains(variants, con) { notConstructor(con, item) }
+        match firstOf(Map.get(mine.cons, con),
+                      findName(m.scope, ConstructorSpace, con, item, strict)) {
+            Some(t) -> if constructorMember(l, Some(target), con, Some(t)) {
                 Map.put(out.cons, con, t)
+            } else if strict {
+                notConstructor(con, item)
             }
-            None -> oopsAt("'" + con + "' is not a constructor of '"
-                           + item.name + "'", Some(item.span))
+            None -> if strict { notConstructor(con, item) }
         }
     }
 }
 
+fun notConstructor(con : String, item : ExportItem) -> Unit =
+    oopsAt("'" + con + "' is not a constructor of '" + item.name + "'",
+           Some(item.span))
+
 -- `module M`: everything in scope here under that qualification, passed on
 -- *still qualified*. That is what lets the Prelude hand every program
 -- `Vec.push` without claiming the bare `push`.
-fun reexport(m : Module, item : ExportItem, out : Scope) -> Unit {
+fun reexport(m : Module, item : ExportItem, out : Scope, strict : Bool) -> Unit {
     let prefix = item.name + "."
     var found = False
     let into = spaces(out)
@@ -634,26 +759,37 @@ fun reexport(m : Module, item : ExportItem, out : Scope) -> Unit {
         let i = namespaceIndex(space)
         for (surface, target) in Map.entries(from[i]) {
             if String.startsWith(surface, prefix) {
-                discard(lookupName(m.scope, space, surface, Some(item.span)))
+                discard(findName(m.scope, space, surface, item, strict))
                 Map.put(into[i], surface, target)
                 found = True
             }
         }
     }
-    if !found {
+    if strict && !found {
         oopsAt("module '" + m.name + "' re-exports '" + item.name
                + "', which is not imported here", Some(item.span))
     }
 }
 
+-- What an export item names in `space`: the module's own declaration, or what
+-- its scope means by the name. `None` only in a round that reports nothing.
 fun exported(m : Module, own : Map String String, space : Namespace,
-             item : ExportItem) -> String =
-    match firstOf(Map.get(own, item.name), lookupName(m.scope, space, item.name, Some(item.span))) {
-        Some(target) -> target
-        None -> oopsAt("module '" + m.name + "' exports '" + item.name
-                       + "', which is not defined or imported here",
-                       Some(item.span))
+             item : ExportItem, strict : Bool) -> Option String {
+    let found = firstOf(Map.get(own, item.name),
+                        findName(m.scope, space, item.name, item, strict))
+    if strict && Option.isNone(found) {
+        oopsAt("module '" + m.name + "' exports '" + item.name
+               + "', which is not defined or imported here", Some(item.span))
     }
+    found
+}
+
+-- `lookupName`, which refuses an ambiguous name; or, in a round that reports
+-- nothing, the scope's own entry, ambiguous or not.
+fun findName(s : Scope, space : Namespace, name : String, item : ExportItem,
+             strict : Bool) -> Option String =
+    if strict { lookupName(s, space, name, Some(item.span)) }
+    else { Map.get(spaceAt(s, space), name) }
 
 fun firstOf(a : Option v, b : Option v) -> Option v = match a {
     Some(_) -> a
@@ -682,17 +818,24 @@ let internalPrefix = "Turkey."
 -- implementation through an ordinary program: comma-separated names.
 let internalTestHook = "TURKEY_TEST_INTERNAL_IMPORTS"
 
-fun checkInternalImport(imported : Module, imp : ImportDecl) -> Unit {
-    if !imported.library || !String.startsWith(imported.name, internalPrefix) {
+fun checkInternalImport(l : Loader, imp : ImportDecl) -> Unit {
+    let library = match Map.get(l.modules, imp.name) {
+        Some(m) -> m.library
+        None -> match Map.get(l.open, imp.name) {
+            Some(o) -> o.library
+            None -> False
+        }
+    }
+    if !library || !String.startsWith(imp.name, internalPrefix) {
         return {}
     }
     match Env.get(internalTestHook) {
-        Some(allowed) -> if Vec.contains(String.split(allowed, ","), imported.name) {
+        Some(allowed) -> if Vec.contains(String.split(allowed, ","), imp.name) {
             return {}
         }
         None -> {}
     }
-    oopsAt("'" + imported.name + "' is part of the implementation, and only the "
+    oopsAt("'" + imp.name + "' is part of the implementation, and only the "
            + "standard library may import it", Some(imp.span))
 }
 

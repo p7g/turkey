@@ -88,6 +88,55 @@ fun main() {
 }
 ```
 
+A top-level `let` that is not generalized has one type for the whole program.
+Its type variables are fixed by its uses, in its own module or in one that
+imports it. A numeric literal or a class constraint in it is settled sooner,
+at the end of its own module: a later use in that module decides it, and
+whatever is still open there is [defaulted](#numeric-literals) or
+[ambiguous](#ambiguity). Here `seed` becomes a `Float`, because `half` divides
+it by one:
+
+<!-- run -->
+```kotlin
+fun same(x) = x
+
+let seed = same(3)
+
+fun half() = seed / 2.0
+
+fun main() {
+    print(half())
+}
+```
+
+```text
+1.5
+```
+
+A use in a module that imports `seed` comes too late, since `seed` has
+already defaulted to `Int`:
+
+<!-- module: Seed.gob -->
+```kotlin
+module Seed (seed)
+
+fun same(x) = x
+
+let seed = same(3)
+```
+
+<!-- error: expected Int, found Float in the operands of '/' -->
+```kotlin
+import Seed
+
+fun main() {
+    print(seed / 2.0)
+}
+```
+
+An [array literal](#array-literals) in a top-level `let` is decided sooner
+still, by the binding's own definition.
+
 **Recursive groups.** Functions that call each other are inferred together,
 and inside the group each has a single, monomorphic type. So a function
 cannot be inferred to call itself at a different type. With a complete

@@ -185,7 +185,10 @@ type Solver = Solver {
     decls           : DeclTable,
     classes         : ClassTable,
     var env         : Env,
-    visibleCons     : Set.Set String,
+    -- The value constructors in scope where a span is, by the module it is
+    -- in: a component of modules is solved in one run, and each of its
+    -- modules sees its own.
+    visibleCons     : fun(Option Span) -> Set.Set String,
     -- Predicates a `CAssume` currently grants. A stack in effect, restored on
     -- the way out of each one.
     var assumptions : Vec Pred,
@@ -203,7 +206,7 @@ type Solver = Solver {
 }
 
 fun newSolver(decls : DeclTable, env : Env, classes : ClassTable,
-              visibleCons : Set.Set String) -> Solver =
+              visibleCons : fun(Option Span) -> Set.Set String) -> Solver =
     Solver {
         decls = decls, classes = classes, env = env, visibleCons = visibleCons,
         assumptions = Vec.new(4), scopes = Vec.new(4), uses = Vec.new(16),
@@ -341,10 +344,11 @@ fun run(s : Solver, c : Constraint) -> Unit {
     -- The outermost boundary: nothing further can narrow what is left, so
     -- anything still open that has a default takes it, and the rest is an error.
     --
-    -- A run is one module. So a top-level binding the value restriction keeps
+    -- A run is one component of modules that import each other -- most often
+    -- a single module. So a top-level binding the value restriction keeps
     -- monomorphic has its literals and class constraints settled by the uses
-    -- in its own module, and a module that imports it, checked in a later run,
-    -- is too late to decide them. Its plain type variables are another matter:
+    -- in its own component, and a module that imports it from outside,
+    -- checked in a later run, is too late to decide them. Its plain type variables are another matter:
     -- nothing here defaults them, so they stay open in the shared environment
     -- and an importer's uses fix them.
     var going = True
@@ -875,7 +879,7 @@ fun checkFieldVisibility(s : Solver, p : Pred, receiver : Ty.Type,
         TCon(con) -> match Map.get(s.decls.tycons, con.name) {
             Some(info) -> if len(info.variants) == 1 {
                 let ctor = info.variants[0]
-                if Decls.isRecord(ctor) && !Set.contains(s.visibleCons, ctor.name) {
+                if Decls.isRecord(ctor) && !Set.contains(s.visibleCons(c.span), ctor.name) {
                     oops("cannot access field '" + label + "' of abstract type '"
                          + Ty.show(receiver) + "': constructor '"
                          + Ty.shortName(ctor.name) + "' is not in scope", c.span)

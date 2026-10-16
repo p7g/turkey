@@ -30,8 +30,77 @@ fun main() {
 }
 ```
 
-Modules may not import each other in a cycle. If two modules need each other,
-they belong in one module.
+Modules may import each other, directly or through other modules. Modules
+that import each other in a cycle are checked together, so a function in one
+may call a function in another, and a type in one may mention a type in
+another, in either direction:
+
+<!-- module: Even.gob -->
+```kotlin
+module Even (isEven)
+import Odd (isOdd)
+
+fun isEven(n : Int) -> Bool = if n == 0 { True } else { isOdd(n - 1) }
+```
+
+<!-- module: Odd.gob -->
+```kotlin
+module Odd (isOdd)
+import Even (isEven)
+
+fun isOdd(n : Int) -> Bool = if n == 0 { False } else { isEven(n - 1) }
+```
+
+<!-- run -->
+```kotlin
+import Even (isEven)
+
+fun main() {
+    print(isEven(10))
+}
+```
+
+```text
+True
+```
+
+Each module in a cycle still sees only what it imports: a type imported without
+its constructors is [abstract](#module-headers) there, whichever module
+declares it.
+
+Top-level bindings are initialized in [dependency
+order](declarations.md#top-level-bindings) across the whole cycle, the same way as
+within one module. So values in different modules may not depend on each other
+in a cycle either:
+
+<!-- module: Width.gob -->
+```kotlin
+module Width (width)
+import Height (height)
+
+let width = height * 2
+```
+
+<!-- module: Height.gob -->
+```kotlin
+module Height (height)
+import Width (width)
+
+let height = width / 2
+```
+
+<!-- error: only functions may be mutually recursive -->
+```kotlin
+import Width (width)
+
+fun main() {
+    print(width)
+}
+```
+
+A name a module exports must be declared somewhere. Two modules that each export
+a name as the other's, without either declaring it, export nothing by that
+name.
 
 ## Module headers
 

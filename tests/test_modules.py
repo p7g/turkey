@@ -114,21 +114,13 @@ def test_an_explicit_prelude_import_replaces_the_implicit_scope(tmp_path):
         "'print' is not defined"
 
 
-def test_the_empty_prelude_marker_breaks_a_real_import_cycle(tmp_path):
-    search = write(
-        tmp_path,
-        Prelude="module Prelude ()\nimport Base",
-        Base="module Base ()\nimport Prelude ()",
-    )
-    check("fun identity(n : Int) -> Int = n", search)
-
-    search = write(
-        tmp_path,
-        Prelude="module Prelude ()\nimport Base",
-        Base="module Base ()",
-    )
-    assert "Prelude -> Base -> Prelude" in fails(
-        "fun identity(n : Int) -> Int = n", search)
+def test_a_prelude_and_a_module_it_imports_may_need_each_other(tmp_path):
+    # With the empty marker Base does not import the Prelude; without it, the
+    # implicit import closes a cycle, which loads all the same.
+    for base in ("module Base ()\nimport Prelude ()", "module Base ()"):
+        search = write(tmp_path, Prelude="module Prelude ()\nimport Base",
+                       Base=base)
+        check("fun identity(n : Int) -> Int = n", search)
 
 
 # -- what an export list withholds --------------------------------------------
@@ -206,13 +198,13 @@ def test_an_import_is_transitive_only_through_its_own_names(tmp_path):
         "'twice' is not defined"
 
 
-def test_a_cycle_is_rejected(tmp_path):
+def test_modules_may_import_each_other(tmp_path):
     search = write(
         tmp_path,
-        A="module A (a)\nimport B (b)\nfun a() -> Int = b()",
-        B="module B (b)\nimport A (a)\nfun b() -> Int = a()",
+        A="module A (a)\nimport B (b)\nfun a(n : Int) -> Int = if n == 0 { 0 } else { b(n - 1) }",
+        B="module B (b)\nimport A (a)\nfun b(n : Int) -> Int = a(n)",
     )
-    assert "imports form a cycle" in fails("import A", search)
+    assert sigs("import A\nfun f() -> Int = a(3)", search)["f"] == "fun() -> Int"
 
 
 def test_a_missing_module_is_reported(tmp_path):

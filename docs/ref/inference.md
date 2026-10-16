@@ -93,7 +93,9 @@ Its type variables are fixed by its uses, in its own module or in one that
 imports it. A numeric literal or a class constraint in it is settled sooner,
 at the end of its own module: a later use in that module decides it, and
 whatever is still open there is [defaulted](#numeric-literals) or
-[ambiguous](#ambiguity). Here `seed` becomes a `Float`, because `half` divides
+[ambiguous](#ambiguity). Modules that [import each other in a
+cycle](modules.md#modules-and-files) are checked together, so for them it is
+the end of the cycle, and a use in any of them decides it. Here `seed` becomes a `Float`, because `half` divides
 it by one:
 
 <!-- run -->

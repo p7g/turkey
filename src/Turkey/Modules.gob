@@ -194,10 +194,31 @@ fun newLoader(search : Array String) -> Loader = Loader {
 -- and the crash handler, which C calls and nothing in the program imports
 -- directly. Loaded ahead of what the entry imports; a program with no `main`
 -- cannot be started, and needs none.
+--
+-- `Turkey.WellKnown` is loaded with every program too, and what it exports is
+-- what the compiler's well-known names mean from then on (`Turkey.Prelude`).
 fun loadEntry(l : Loader, source : Source, name : String) -> Module {
     Deps.components([name], fun(n) = read(l, n, if n == name { Some(source) } else { None }),
                     finish(l, _))
+    learnWellKnown(l)
     moduleNamed(l, name)
+}
+
+fun learnWellKnown(l : Loader) -> Unit {
+    let known = moduleNamed(l, Prelude.wellKnownName)
+    Prelude.learnWellKnown(fun(space, name) {
+        let table = match space {
+            "type" -> known.exports.types
+            "constructor" -> known.exports.cons
+            "class" -> known.exports.classes
+            _ -> known.exports.values
+        }
+        match Map.get(table, name) {
+            Some(target) -> target
+            None -> oops("'" + Prelude.wellKnownName + "' does not export "
+                         + space + " '" + name + "', which the compiler needs")
+        }
+    })
 }
 
 let startupModule = "Turkey.Entry"
@@ -274,6 +295,9 @@ fun read(l : Loader, name : String, source : Option Source) -> Array String {
     for imp in program.imports {
         if importsModule(imp) { Vec.push(edges, imp.name) }
     }
+    -- Last, so that it changes nothing about the order the program's own
+    -- modules load in: what it re-exports is usually loaded by then.
+    if entry { Vec.push(edges, Prelude.wellKnownName) }
     Vec.toArray(edges)
 }
 
@@ -440,6 +464,10 @@ fun scopeOf(l : Loader, m : Module, strict : Bool) -> Scope {
         }
         Map.put(scope.types, "Prim.Array", "Prim.Array")
         Map.put(scope.types, "Prim.Ptr", "Prim.Ptr")
+        -- The primitive types, for the library to give them their names.
+        for name in ["Int", "Float", "Char", "Byte"] {
+            Map.put(scope.types, "Prim." + name, name)
+        }
     }
     -- So are the built-in type constructors, which no module declares.
     for name in Parser.builtinTycons { Map.put(scope.types, name, name) }

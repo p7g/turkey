@@ -370,10 +370,18 @@ fun parseTypeDecl(p : P) -> TypeDecl {
     while at(p, "IDENT") { Vec.push(params, text(advance(p))) }
     skipToken(p, "=")
 
-    -- A `|` or a `{` payload means data type outright. A bare
-    -- `CONID args*` is a data type when the head does not name an existing type
-    -- constructor -- or when it names the type being declared, which is the
-    -- newtype case and not a recursive alias.
+    -- A `|` or a `{` payload means data type outright. A bare `C` or `C(...)`
+    -- is a data type when `C` does not name an existing type constructor -- or
+    -- when it names the type being declared, which is the newtype case and not
+    -- a recursive alias.
+    --
+    -- Any other `C args` is an alias whether or not `C` is known yet, because
+    -- a constructor's payload is one parenthesized list with nothing after it.
+    -- This matters on the first read of a file, made before its imports are
+    -- loaded: `type D e = Either Int e` must not be taken for a malformed
+    -- constructor while `Either` is still unknown. An alias whose head stays
+    -- unknown is refused by the declaration table.
+    --
     -- A qualified head is a type: a constructor is never written qualified
     -- where it is declared.
     if at(p, "CONID") && Token.kindName(peek(p, 1).kind) != "." {
@@ -381,7 +389,8 @@ fun parseTypeDecl(p : P) -> TypeDecl {
         if Token.kindName(peek(p, 1).kind) == "{" || rhsHasAlternatives(p) {
             return parseDataRhs(p, s, name, params)
         }
-        if !Vec.contains(p.tycons, headName) || headName == name {
+        if headName == name
+                || (!Vec.contains(p.tycons, headName) && constructorShaped(p)) {
             return parseDataRhs(p, s, name, params)
         }
     }
@@ -389,6 +398,32 @@ fun parseTypeDecl(p : P) -> TypeDecl {
         span = s, name = name, params = params, variants = None,
         alias = Some(parseTypeExpr(p)),
     }
+}
+
+-- Whether the right-hand side at the cursor, a `CONID`, has a constructor's
+-- shape: nothing after it, or one parenthesized list and nothing after that,
+-- where "nothing" is anything that cannot begin a type argument.
+fun constructorShaped(p : P) -> Bool {
+    var j = p.i + 1
+    if j < len(p.toks) && Token.kindName(p.toks[j].kind) == "(" {
+        var depth = 0
+        while j < len(p.toks) {
+            let kind = Token.kindName(p.toks[j].kind)
+            if kind == "(" || kind == "[" || kind == "{" {
+                depth = depth + 1
+            } else if kind == ")" || kind == "]" || kind == "}" {
+                depth = depth - 1
+                if depth == 0 { break }
+            } else if kind == "EOF" {
+                return True
+            }
+            j = j + 1
+        }
+        j = j + 1
+    }
+    if j >= len(p.toks) { return True }
+    let kind = Token.kindName(p.toks[j].kind)
+    kind != "IDENT" && kind != "CONID" && kind != "(" && kind != "fun"
 }
 
 -- Look ahead for a top-level `|` before the declaration ends.

@@ -47,7 +47,8 @@ fun count(xs : Array) -> Int = len(xs)
 
 ## Primitive types
 
-These types are built into the language:
+These types are built into the language, and the Prelude gives them their
+names:
 
 | Type | Values |
 |---|---|
@@ -61,9 +62,9 @@ These types are built into the language:
 declared by the library, and the language refers to them by name: a string
 literal is a `String`, `if` needs a `Bool`, and a `for` loop gets an `Option`
 from its iterator. `String` is described [below](#string) with the primitive
-types, because it is always in scope and its constructor is hidden, so a
-program can use it only as it would a primitive type. See [Built-in types and
-classes](builtins.md) for the others.
+types, because its constructor is hidden, so a program can use it only as it
+would a primitive type. See [Built-in types and classes](builtins.md) for the
+others.
 
 There are no implicit conversions between primitive types. Converting an
 `Int` to a `Float` is an explicit call, `Float.fromInt(n)`. An *integer
@@ -296,8 +297,7 @@ scalar value, or two: `e` followed by a combining accent.
 
 ### String
 
-`String` is in scope in every module without an import, like the primitive
-types. A `String` is an immutable sequence of bytes that is always valid UTF-8. That
+A `String` is an immutable sequence of bytes that is always valid UTF-8. That
 guarantee holds for every string a program can create: literals cannot contain
 invalid UTF-8, and a string built from bytes is checked when it is built.
 

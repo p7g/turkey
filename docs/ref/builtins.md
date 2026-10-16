@@ -16,7 +16,7 @@ The Prelude provides these names unqualified:
 
 | Kind | Names |
 |---|---|
-| Types and their constructors | `Bool`, `Option`, `Either`, `Ordering`, `SomeError`, and the types `Array`, `Vec` and `Map` without their constructors |
+| Types and their constructors | `Int`, `Float`, `Byte`, `Char`, `Unit`, `Bool`, `Option`, `Either`, `Ordering`, `SomeError`, and the types `String`, `Array`, `Vec` and `Map` without their constructors |
 | Classes and their methods | `Eq`, `Ord`, `Add`, `Sub`, `Mul`, `Div`, `Rem`, `Neg`, `Show`, `Iterator`, `Index`, `SetIndex`, `Length`, `Functor`, `Applicative`, `Monad`, `Semigroup`, `Monoid`, `Foldable`, `Hash`, `Error`, `Typed` |
 | Functions | `print`, `write`, `error`, `fail`, `const` |
 
@@ -26,8 +26,23 @@ It also provides the library modules `Array`, `Bool`, `Byte`, `Char`,
 `Int.parse` need no import, while the bare names `push` and `parse` stay free
 for a program to use.
 
-`String` is also declared by the library, but it is in scope everywhere
-whether or not the Prelude is imported ([String](types.md#string)).
+A type is in scope only through an import, the implicit Prelude import
+included. A module that replaces the Prelude import imports the types it
+names, as it does anything else:
+
+<!-- error: unknown type 'Int' -->
+```kotlin
+import Prelude (print)
+
+fun double(n : Int) -> Int = n * 2
+
+fun main() {
+    print(double(21))
+}
+```
+
+`import Prelude (print, Int)` fixes it. The unit type can always be written
+`()`, which is syntax rather than a name ([Unit](types.md#unit)).
 
 ## `Bool`
 

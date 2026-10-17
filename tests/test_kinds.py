@@ -84,6 +84,71 @@ def test_an_alias_body_constrains_the_alias_kind() -> None:
     assert kinds("type Boxed f = f Int")["Boxed"] == "(* -> *) -> *"
 
 
+def declared(src: str) -> list[str]:
+    """The `decls` dump's lines for the entry module's own types."""
+    result = lang.dump("decls", src)
+    if result.code != 0:
+        raise CompileError(result.stderr, result.code)
+    return [line.replace("Main#", "") for line in result.stdout.splitlines()
+            if "Main#" in line]
+
+
+@pytest.mark.parametrize("rhs", [
+    "Array Int",
+    "Option (e)",
+    "Option (Option e)",
+    "Option e",
+    "Either Int Int",
+    "Either (Int) e",
+    "Either (Int) (e)",
+    "Either e Int",
+])
+def test_an_alias_may_apply_a_known_type_to_any_arguments(rhs) -> None:
+    # A file is first read before its imports are loaded, when `Option` and
+    # `Either` are not known yet; only the shapes `C` and `C(...)` may be taken
+    # for a constructor then.
+    assert declared(f"""
+        import Data.Option
+        import Data.Either
+        type D e = {rhs}
+    """) == ["type D e :: * -> * = alias"]
+
+
+def test_a_two_argument_alias_is_the_type_it_names() -> None:
+    assert lang.output("""
+        import Data.Either
+        type Result e = Either e Int
+
+        fun half(n : Int) -> Result String =
+            if n % 2 == 0 { Right(n / 2) } else { Left("odd") }
+
+        fun main() {
+            print(half(4))
+            print(half(3))
+        }
+    """) == 'Right(2)\nLeft(odd)\n'
+
+
+@pytest.mark.parametrize("src, constructor", [
+    ("type Meters = Meters(Float)", "con Meters/1 : fun(Float) -> Meters"),
+    ("type Box = Box(Int)", "con Box/1 : fun(Int) -> Box"),
+    ("type Box = Box", "con Box/0 : fun() -> Box"),
+    ("type Box a = Box(a, Int)", "con Box/2 : fun(a, Int) -> Box a"),
+])
+def test_a_single_constructor_is_still_a_data_type(src, constructor) -> None:
+    assert f"  {constructor}" in declared(src)
+
+
+def test_an_unknown_head_applied_to_arguments_says_how_to_write_a_constructor() -> None:
+    message = bad("type Shape = Circle Float")
+    assert "unknown type 'Circle'" in message
+    assert "write 'Circle(...)'" in message
+
+
+def test_a_newtype_head_applied_without_parentheses_is_refused() -> None:
+    assert "must parenthesize its payload" in bad("type Meters = Meters Float")
+
+
 def test_the_prelude_and_built_in_kinds() -> None:
     table = lang.kinds("")
     assert table["Data.Array#Array"] == "* -> *"

@@ -607,17 +607,48 @@ fun main() {
 (2, 1)
 ```
 
-The right-hand side of `type T = C args` can read either way: as an alias for
-an existing type `C`, or as a data type with one constructor named `C`. The
-compiler decides as follows:
+An alias may apply a type to any of its arguments, including two:
+
+<!-- run -->
+```kotlin
+import Data.Either
+
+type Result e = Either e Int
+
+fun half(n : Int) -> Result String =
+    if n % 2 == 0 { Right(n / 2) } else { Left("odd") }
+
+fun main() {
+    print(half(10))
+    print(half(7))
+}
+```
+
+```text
+Right(5)
+Left(odd)
+```
+
+The right-hand side of `type T = C`, or `type T = C(...)`, can read either
+way: as an alias for an existing type `C`, or as a data type with one
+constructor named `C`. The compiler decides as follows:
 
 1. If there is a `|`, or the constructor has a `{ ... }` payload, it is a data
    type.
-2. Otherwise, if `C` names a type that is already known (a primitive, a type
+2. Otherwise, if `C` is the name of the type being declared, it is a data type:
+   `type Meters = Meters(Float)` is always one.
+3. Otherwise, if `C` names a type that is already known (a primitive, a type
    declared anywhere in the same module, or an imported type), it is an alias.
-3. Otherwise it is a data type with one constructor named `C`. In particular
-   `type Meters = Meters(Float)`, whose constructor has the type's own name, is
-   always a data type.
+4. Otherwise it is a data type with one constructor named `C`.
+
+Any other right-hand side, such as `Option e` or `Either Int e`, is an alias,
+since a constructor's payload is written in one pair of parentheses. If its
+`C` is not a known type, it is an error that says so.
+
+<!-- error: write 'Circle(...)' -->
+```kotlin
+type Shape = Circle Float
+```
 
 The right-hand side of an alias must be a type with values, so `type A = Array`
 is an error. An alias must be given all of its arguments wherever it is used,

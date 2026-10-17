@@ -1,6 +1,8 @@
 module Turkey.IO (
     read, write, writeText, readAt, writeAt, open, close, fcntl, fcntlWith,
-    fstat, statMode, statSize, isatty, copy, addressOf,
+    fstat, statAt, statMode, statSize, statModified, isatty, copy, addressOf, cPath,
+    openAt, removeAt, makeDirectoryAt, renameAt, flock, makeTemporaryDirectory,
+    openStream, readEntry, entryType, entryName, closeStream,
 )
 
 -- The floor of I/O: one Turkey function per system call the I/O layer makes,
@@ -154,6 +156,20 @@ fun fstat(fd : Int, stat : Array Byte) -> Int {
     r
 }
 
+-- `fstat` for `name`, relative to the directory open on `dir`: a
+-- NUL-terminated name, as `cPath` makes one. `flags` is 0 or
+-- `Sys.atSymlinkNoFollow()`.
+fun statAt(dir : Int, name : Array Byte, stat : Array Byte, flags : Int) -> Int {
+    if len(stat) < Sys.statBytes() {
+        Prim.error("an array too short for a struct stat")
+    }
+    terminated(name)
+    let r = Workers.blockingFstatat(dir, addressOf(name, 0), addressOf(stat, 0), flags)
+    Prim.keepAlive(name)
+    Prim.keepAlive(stat)
+    r
+}
+
 -- `st_mode`, of a `stat` `fstat` filled.
 fun statMode(stat : Array Byte) -> Int =
     littleEndian(stat, Sys.statModeAt(), Sys.statModeWidth())
@@ -161,11 +177,105 @@ fun statMode(stat : Array Byte) -> Int =
 -- `st_size`, of a `stat` `fstat` filled.
 fun statSize(stat : Array Byte) -> Int = littleEndian(stat, Sys.statSizeAt(), 8)
 
+-- `st_mtime`, of a `stat` `fstat` filled, in nanoseconds since the Unix
+-- epoch.
+fun statModified(stat : Array Byte) -> Int {
+    let at = Sys.statModifiedAt()
+    littleEndian(stat, at, 8) * 1000000000 + littleEndian(stat, at + 8, 8)
+}
+
 -- 1 if `fd` is a terminal, or the negated `errno`: `-ENOTTY` for anything else.
 fun isatty(fd : Int) -> Int {
     let r = Libc.isatty(fd)
     if Sys.cInt(r) == 1 { 1 } else { -Sys.errno() }
 }
+
+-- -- directories ----------------------------------------------------------------------
+--
+-- Each takes its names NUL-terminated, as `cPath` makes them or `entryName`
+-- answers them, so that a name read out of a directory goes back to the
+-- system byte for byte, whether or not it is UTF-8. `dir` is a descriptor
+-- open on a directory, or `Sys.atWorkingDirectory()`.
+
+-- A descriptor for `name` relative to `dir`, as `open`.
+fun openAt(dir : Int, name : Array Byte, flags : Int, mode : Int) -> Int {
+    terminated(name)
+    let fd = Workers.blockingOpenat(dir, addressOf(name, 0), flags, mode)
+    Prim.keepAlive(name)
+    fd
+}
+
+-- Remove the file `name`, or, with `Sys.atRemoveDirectory()`, the empty
+-- directory: 0, or the negated `errno`.
+fun removeAt(dir : Int, name : Array Byte, flags : Int) -> Int {
+    terminated(name)
+    let r = Workers.blockingUnlinkat(dir, addressOf(name, 0), flags)
+    Prim.keepAlive(name)
+    r
+}
+
+-- Make the directory `name`, with permissions `mode` as the umask narrows
+-- them: 0, or the negated `errno`.
+fun makeDirectoryAt(dir : Int, name : Array Byte, mode : Int) -> Int {
+    terminated(name)
+    let r = Workers.blockingMkdirat(dir, addressOf(name, 0), mode)
+    Prim.keepAlive(name)
+    r
+}
+
+-- Rename `from` in `fromDir` to `to` in `toDir`, replacing what `to` named:
+-- 0, or the negated `errno`.
+fun renameAt(fromDir : Int, from : Array Byte, toDir : Int, to : Array Byte) -> Int {
+    terminated(from)
+    terminated(to)
+    let r = Workers.blockingRenameat(fromDir, addressOf(from, 0), toDir, addressOf(to, 0))
+    Prim.keepAlive(from)
+    Prim.keepAlive(to)
+    r
+}
+
+-- `flock`: 0, or the negated `errno`, `-EWOULDBLOCK` for a lock held
+-- elsewhere when `operation` has `Sys.lockNonBlocking`.
+fun flock(fd : Int, operation : Int) -> Int = Workers.blockingFlock(fd, operation)
+
+-- Make a directory named by `template`, a NUL-terminated path ending in six
+-- `X`s, which are replaced in place by the name chosen: 0, or the negated
+-- `errno`.
+fun makeTemporaryDirectory(template : Array Byte) -> Int {
+    terminated(template)
+    let made = Libc.mkdtemp(addressOf(template, 0))
+    let r = if Prim.ptrIsNull(made) { -Sys.errno() } else { 0 }
+    Prim.keepAlive(template)
+    r
+}
+
+-- A directory stream over the descriptor `fd`, which the stream owns from now
+-- on and `closeStream` closes: its address, or the negated `errno`.
+fun openStream(fd : Int) -> Int {
+    let stream = Libc.fdopendir(fd)
+    if Prim.ptrIsNull(stream) { -Sys.errno() } else { Prim.ptrToInt(stream) }
+}
+
+-- The next entry of `stream`: its address, good until the next call, or 0 at
+-- the end, or the negated `errno`. "." and ".." are entries.
+fun readEntry(stream : Int) -> Int = Workers.blockingReaddir(Prim.ptrFromInt(stream))
+
+-- An entry's `d_type`: one of `Sys.entryUnknown` and the others beside it.
+fun entryType(entry : Int) -> Int =
+    Prim.byteToInt(Prim.loadI8(Prim.ptrFromInt(entry), Sys.direntTypeAt()))
+
+-- An entry's name, NUL-terminated, in an array of its own.
+fun entryName(entry : Int) -> Array Byte {
+    let at = Prim.ptrAdd(Prim.ptrFromInt(entry), Sys.direntNameAt())
+    let n = Libc.strlen(at)
+    let name = Array.filled(n + 1, Byte.truncate(0))
+    Memory.copy(addressOf(name, 0), at, n)
+    name
+}
+
+-- Close `stream` and its descriptor: 0, or the negated `errno`. Called
+-- directly, as `close` on a directory waits for nothing.
+fun closeStream(stream : Int) -> Int = Sys.cResult(Libc.closedir(Prim.ptrFromInt(stream)))
 
 -- -- copying ----------------------------------------------------------------------
 
@@ -232,6 +342,14 @@ fun littleEndian(bytes : Array Byte, at : Int, width : Int) -> Int {
         value = Int.or(Int.shl(value, 8), Byte.toInt(bytes[at + k]))
     }
     value
+}
+
+-- Panic unless `name` ends in a NUL.
+fun terminated(name : Array Byte) -> Unit {
+    let n = len(name)
+    if n == 0 || Byte.toInt(name[n - 1]) != 0 {
+        Prim.error("a name passed to the system must end in a NUL byte")
+    }
 }
 
 -- `path`'s bytes and a NUL, in an array of their own.

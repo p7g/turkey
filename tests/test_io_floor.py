@@ -10,6 +10,7 @@ the mode and the size -- are checked on whichever target the suite runs on.
 from __future__ import annotations
 
 import errno
+import fcntl
 import os
 import stat
 
@@ -180,3 +181,144 @@ def test_a_window_outside_its_array_panics(call):
 def test_a_copy_past_the_targets_end_panics():
     result = panics(HEADER + "fun main() { IO.copy(bytes(\"abc\"), 1, bytes(\"abc\"), 0, 3) }\n")
     assert "the window 1 to 4 is outside an array of length 3" in panic_message(result)
+
+
+# -- the directory calls ---------------------------------------------------------
+#
+# `struct stat`'s modification time, `struct dirent`'s type and name, and the
+# `AT_*`, `O_DIRECTORY`/`O_NOFOLLOW` and `LOCK_*` values, each checked against
+# what Python sees of the same files on whichever target the suite runs on.
+
+
+def test_constants_python_also_has(tmp_path):
+    out = lines("""
+fun main() {
+    print(Sys.directoryOnly())
+    print(Sys.noFollow())
+    print(Sys.lockExclusive)
+    print(Sys.lockNonBlocking)
+    print(Sys.lockUnlock)
+    print(Sys.enotempty())
+    print(Sys.eloop())
+    print(Sys.exdev)
+    print(Sys.enametoolong())
+    print(Sys.eilseq())
+}
+""", tmp_path)
+    assert out == [str(v) for v in [
+        os.O_DIRECTORY, os.O_NOFOLLOW, fcntl.LOCK_EX, fcntl.LOCK_NB, fcntl.LOCK_UN,
+        errno.ENOTEMPTY, errno.ELOOP, errno.EXDEV, errno.ENAMETOOLONG, errno.EILSEQ]]
+
+
+def test_statAt_reads_the_modification_time_and_a_link_itself(tmp_path):
+    (tmp_path / "plain").write_bytes(b"abc")
+    os.utime(tmp_path / "plain", ns=(1_000_000_123, 1_700_000_000_987_654_321))
+    os.symlink("plain", tmp_path / "link")
+    out = lines("""
+fun main() {
+    let stat = Array.filled(Sys.statBytes(), Byte.truncate(0))
+    let here = Sys.atWorkingDirectory()
+    print(IO.statAt(here, IO.cPath("link"), stat, 0))
+    print(IO.statModified(stat))
+    print(IO.statSize(stat))
+    print(IO.statAt(here, IO.cPath("link"), stat, Sys.atSymlinkNoFollow()))
+    print(IO.statMode(stat))
+    print(IO.statAt(here, IO.cPath("missing"), stat, 0))
+}
+""", tmp_path)
+    assert out == ["0", "1700000000987654321", "3", "0",
+                   str(os.lstat(tmp_path / "link").st_mode), str(-errno.ENOENT)]
+
+
+def test_open_make_remove_and_rename_relative_to_a_directory(tmp_path):
+    os.mkdir(tmp_path / "base")
+    os.symlink("base", tmp_path / "link")
+    out = lines("""
+fun main() {
+    let here = Sys.atWorkingDirectory()
+    let only = Int.or(Sys.readOnly, Sys.directoryOnly())
+    let dir = IO.openAt(here, IO.cPath("base"), only, 0)
+    print(dir >= 0)
+    -- Refused: Linux says ELOOP, Darwin ENOTDIR.
+    let link = IO.openAt(here, IO.cPath("link"), Int.or(only, Sys.noFollow()), 0)
+    print(link == -Sys.eloop() || link == -Sys.enotdir)
+    print(IO.makeDirectoryAt(dir, IO.cPath("sub"), 0o750))
+    print(IO.makeDirectoryAt(dir, IO.cPath("sub"), 0o750) == -Sys.eexist)
+    let made = Int.or(Sys.writeOnly, Sys.create())
+    print(IO.close(IO.openAt(dir, IO.cPath("sub/file"), made, 0o600)))
+    print(IO.removeAt(dir, IO.cPath("sub"), Sys.atRemoveDirectory()) == -Sys.enotempty())
+    print(IO.renameAt(dir, IO.cPath("sub/file"), here, IO.cPath("moved")))
+    print(IO.removeAt(dir, IO.cPath("sub"), Sys.atRemoveDirectory()))
+    print(IO.removeAt(here, IO.cPath("moved"), 0))
+    print(IO.close(dir))
+}
+""", tmp_path)
+    assert out == ["True", "True", "0", "True", "0", "True", "0", "0", "0", "0"]
+    assert sorted(os.listdir(tmp_path / "base")) == []
+    assert sorted(os.listdir(tmp_path)) == ["base", "link"]
+
+
+def test_readdir_reads_each_name_and_type(tmp_path):
+    os.mkdir(tmp_path / "d")
+    (tmp_path / "d" / "file").write_bytes(b"")
+    os.mkdir(tmp_path / "d" / "sub")
+    os.symlink("file", tmp_path / "d" / "link")
+    os.mkfifo(tmp_path / "d" / "fifo")
+    (tmp_path / "d" / ("long" * 40)).write_bytes(b"")
+    out = lines("""
+fun main() {
+    let fd = IO.openAt(Sys.atWorkingDirectory(), IO.cPath("d"),
+                       Int.or(Sys.readOnly, Sys.directoryOnly()), 0)
+    let stream = IO.openStream(fd)
+    while True {
+        let entry = IO.readEntry(stream)
+        if entry <= 0 {
+            print(entry)
+            break
+        }
+        let name = IO.entryName(entry)
+        let text = String.fromBytes(Vec.fromArray(Array.slice(name, 0, len(name) - 1)))
+        print(show(text) + " " + show(IO.entryType(entry)))
+    }
+    print(IO.closeStream(stream))
+}
+""", tmp_path)
+    assert out[-2:] == ["0", "0"]
+    seen = {}
+    for line in out[:-2]:
+        name, kind = line.rsplit(" ", 1)
+        seen[name.removeprefix("Some(").removesuffix(")")] = int(kind)
+    # `d_type` against Python's reading of the same directory.
+    expected = {".": 4, "..": 4}
+    for entry in os.scandir(tmp_path / "d"):
+        mode = entry.stat(follow_symlinks=False).st_mode
+        expected[entry.name] = stat.S_IFMT(mode) >> 12
+    assert seen == expected
+
+
+def test_flock_keeps_a_second_open_file_out(tmp_path):
+    out = lines("""
+fun main() {
+    let flags = Int.or(Sys.readWrite, Sys.create())
+    let a = IO.open("lock", flags, 0o600)
+    let b = IO.open("lock", flags, 0o600)
+    print(IO.flock(a, Sys.lockExclusive))
+    print(IO.flock(b, Int.or(Sys.lockExclusive, Sys.lockNonBlocking)) == -Sys.eagain())
+    print(IO.flock(a, Sys.lockUnlock))
+    print(IO.flock(b, Int.or(Sys.lockExclusive, Sys.lockNonBlocking)))
+}
+""", tmp_path)
+    assert out == ["0", "True", "0", "0"]
+
+
+def test_mkdtemp_fills_in_the_template(tmp_path):
+    out = lines("""
+fun main() {
+    let template = IO.cPath("dirXXXXXX")
+    print(IO.makeTemporaryDirectory(template))
+    print(String.fromBytes(Vec.fromArray(Array.slice(template, 0, 3))))
+}
+""", tmp_path)
+    assert out == ["0", "Some(dir)"]
+    made = [p for p in os.listdir(tmp_path) if p.startswith("dir")]
+    assert len(made) == 1 and len(made[0]) == 9 and (tmp_path / made[0]).is_dir()

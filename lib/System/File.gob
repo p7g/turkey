@@ -73,14 +73,14 @@ instance CanWriteAt ReadWrite {}
 -- and for the standard input on a terminal: the standard output's buffer is
 -- written out before each operation, so that a prompt appears before the read
 -- waits, and the two output streams come out in the order they were written.
-type File m = File { fd : FD.Fd, name : String, stdoutFirst : Bool }
+type File m = File { fd : FD.FD, name : String, stdoutFirst : Bool }
 
 instance Read (File m) : CanRead m {
     type ReadError = IOError
     fun readInto(f, into) {
         if into.limit == into.end { error("readInto: the buffer has no room") }
         if f.stdoutFirst { Stdout.flushPending() }
-        let n = FD.read(fileFd(f), into.storage, into.end, into.limit)
+        let n = FD.read(fileFD(f), into.storage, into.end, into.limit)
         if n < 0 { return Left(failed(f, "read", n)) }
         into.end = into.end + n
         Right(n)
@@ -91,7 +91,7 @@ instance Write (File m) : CanWrite m {
     type WriteError = IOError
     fun writeFrom(f, from) {
         if f.stdoutFirst { Stdout.flushPending() }
-        let n = FD.write(fileFd(f), from.storage, from.start, from.end)
+        let n = FD.write(fileFD(f), from.storage, from.start, from.end)
         if n < 0 { Left(failed(f, "write", n)) } else { Right(()) }
     }
     -- Nothing is held back here: each write is a system call.
@@ -131,7 +131,7 @@ fun openReadWrite(path : String) -> Either IOError (File ReadWrite) =
 -- If another task is still in an operation on `f`, the descriptor closes
 -- when it finishes, and a failure then is not reported.
 fun close(f : File m) -> Either IOError Unit {
-    let r = FD.close(fileFd(f))
+    let r = FD.close(fileFD(f))
     if r < 0 { Left(failed(f, "close", r)) } else { Right(()) }
 }
 
@@ -159,7 +159,7 @@ fun use(opening : Either IOError (File m), body : fun(File m) -> Either IOError 
 -- the file. Any number of tasks may do this on one `File` at once. A FIFO, a
 -- pipe or a terminal has no offsets, and answers `NotSeekable`.
 fun readAt[CanRead m](f : File m, offset : Int, into : Buffer) -> Either IOError Int {
-    let n = FD.readAt(fileFd(f), offset, into.storage, into.end, into.limit)
+    let n = FD.readAt(fileFD(f), offset, into.storage, into.end, into.limit)
     if n < 0 { return Left(failed(f, "readAt", n)) }
     into.end = into.end + n
     Right(n)
@@ -169,7 +169,7 @@ fun readAt[CanRead m](f : File m, offset : Int, into : Buffer) -> Either IOError
 -- moving its position. Not for an `Appending` file, where Linux would append
 -- it instead.
 fun writeAt[CanWriteAt m](f : File m, offset : Int, from : Buffer) -> Either IOError Unit {
-    let n = FD.writeAt(fileFd(f), offset, from.storage, from.start, from.end)
+    let n = FD.writeAt(fileFD(f), offset, from.storage, from.start, from.end)
     if n < 0 { Left(failed(f, "writeAt", n)) } else { Right(()) }
 }
 
@@ -183,7 +183,7 @@ let transfer : Int = 262144
 
 fun readAllBy(path : String, step : Int) -> Either IOError Buffer {
     let f = openRead(path)?
-    let number = FD.number(fileFd(f))
+    let number = FD.number(fileFD(f))
     let stat = Array.filled(Sys.statBytes(), Byte.truncate(0))
     var size = 0
     if Calls.fstat(number, stat) == 0 && Sys.fileType(Calls.statMode(stat)) == Sys.regularFile {
@@ -199,7 +199,7 @@ fun readAllBy(path : String, step : Int) -> Either IOError Buffer {
             out = grown
         }
         let to = if out.limit - out.end > step { out.end + step } else { out.limit }
-        let n = FD.read(fileFd(f), out.storage, out.end, to)
+        let n = FD.read(fileFD(f), out.storage, out.end, to)
         if n < 0 {
             let _ = close(f)
             return Left(failed(f, "read", n))
@@ -230,7 +230,7 @@ fun writeAll(path : String, bytes : Buffer) -> Either IOError Unit =
 -- Replace the file's contents with `text`, making it if need be.
 fun writeText(path : String, text : String) -> Either IOError Unit =
     use(create(path, Truncate), fun(f) {
-        let n = FD.writeText(fileFd(f), text, 0, String.byteLength(text))
+        let n = FD.writeText(fileFD(f), text, 0, String.byteLength(text))
         if n < 0 { Left(failed(f, "write", n)) } else { Right(()) }
     })
 
@@ -261,7 +261,7 @@ fun opened(path : String, flags : Int, permissions : Int) -> Either IOError (Fil
     Right(File { fd = FD.fd(number), name = path, stdoutFirst = False })
 }
 
-fun fileFd(f : File m) -> FD.Fd = f.fd
+fun fileFD(f : File m) -> FD.FD = f.fd
 
 fun failed(f : File m, op : String, result : Int) -> IOError =
     Errors.failure(op, Some(path(f)), result)

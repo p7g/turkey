@@ -22,7 +22,7 @@ import Turkey.Sys as Sys
 
 fun bytes(text : String) -> Array Byte = String.toBytes(text)
 
-fun created(path : String) -> FD.Fd =
+fun created(path : String) -> FD.FD =
     FD.fd(IO.open(path, Int.or(Sys.readWrite, Int.or(Sys.create(), Sys.truncate())), 0o644))
 """
 
@@ -150,7 +150,7 @@ fun main() {
 
 def test_close_racing_a_blocked_read_does_not_release_the_number(tmp_path):
     """A read is blocked in the kernel on an empty FIFO when another task
-    closes its `Fd`. The number stays the FIFO's until the read finishes: a
+    closes its `FD`. The number stays the FIFO's until the read finishes: a
     new descriptor gets another number, and a write through the old one
     reaches the read. The read's next call answers `closed`, and its release
     closes the number."""

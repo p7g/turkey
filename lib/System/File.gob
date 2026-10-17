@@ -4,6 +4,13 @@ module System.File (
     openRead, create, openAppend, openReadWrite, close, path, use,
     readAt, writeAt,
     readAll, readText, writeAll, writeText,
+    lock, tryLock, unlock,
+    FileKind(..), Stat(..), stat, metadata, symlinkMetadata, metadataIn, symlinkMetadataIn,
+    Dir, workingDir, openDir, openDirIn, closeDir, dirPath, useDir, list, listPath,
+    openReadIn, createIn,
+    createDir, createDirIn, createDirAll, createDirAllIn,
+    removeFile, removeFileIn, removeDir, removeDirIn, removeTree, removeTreeIn,
+    rename, renameIn, temporaryDir,
     stdin, stderr,
 )
 
@@ -34,6 +41,15 @@ module System.File (
 -- `Closed` from every operation; the descriptor number is never reused under
 -- it (`Turkey.FD`). `close` is idempotent.
 --
+-- **Directories are handles too.** A `Dir` is an open directory, and the
+-- `...In` functions take a name relative to one, resolved by the system
+-- against the directory already open (`openat` and its kin) rather than from
+-- the root again. A directory renamed while it is open stays the same `Dir`,
+-- and a walk that opens each subdirectory from its parent, refusing to follow
+-- a symbolic link, cannot be led out of the tree it started in: that is how
+-- `removeTree` and `list` walk. Every function that takes a path is the
+-- `...In` function of `workingDir()`. A `Dir` shares `File`'s lifetime rules.
+--
 -- Every descriptor is opened close-on-exec, so a process started later does
 -- not inherit it by accident.
 
@@ -47,6 +63,7 @@ import Turkey.Stdout as Stdout
 import Turkey.ReadWrite (Read(..), Write(..), DecodeError, InvalidUTF8(..), Buffered, buffered,
                          defaultCapacity)
 import Turkey.Sys as Sys
+import System.Env as Env
 
 -- -- modes ----------------------------------------------------------------------------
 
@@ -183,11 +200,9 @@ let transfer : Int = 262144
 
 fun readAllBy(path : String, step : Int) -> Either IOError Buffer {
     let f = openRead(path)?
-    let number = FD.number(fileFD(f))
-    let stat = Array.filled(Sys.statBytes(), Byte.truncate(0))
-    var size = 0
-    if Calls.fstat(number, stat) == 0 && Sys.fileType(Calls.statMode(stat)) == Sys.regularFile {
-        size = Calls.statSize(stat)
+    let size = match stat(f) {
+        Right(Stat { size, kind = Regular, .. }) -> size
+        _ -> 0
     }
     -- One byte past the size, so that reading the whole file leaves room for
     -- the read that answers 0 rather than growing the buffer for it.
@@ -234,6 +249,397 @@ fun writeText(path : String, text : String) -> Either IOError Unit =
         if n < 0 { Left(failed(f, "write", n)) } else { Right(()) }
     })
 
+-- -- locks --------------------------------------------------------------------------
+
+-- Take the exclusive lock on `f`'s file, waiting while another holder has it.
+-- The lock is advisory, `flock`'s: it keeps out only those that ask for it,
+-- across processes and across `File`s opened separately in this one. It is
+-- released by `unlock`, or when `f` is closed.
+--
+-- The wait blocks a worker, not only the task: with one worker, a second
+-- `File` in the same program asking for a lock this program holds never gets
+-- it. `tryLock` does not wait.
+fun lock(f : File m) -> Either IOError Unit =
+    flockResult(f, "lock", FD.using(fileFD(f), fun(n) = Calls.flock(n, Sys.lockExclusive)))
+
+-- Take the exclusive lock if nobody holds it: whether it was taken.
+fun tryLock(f : File m) -> Either IOError Bool {
+    let r = FD.using(fileFD(f),
+                     fun(n) = Calls.flock(n, Int.or(Sys.lockExclusive, Sys.lockNonBlocking)))
+    if r == -Sys.eagain() { return Right(False) }
+    flockResult(f, "lock", r)?
+    Right(True)
+}
+
+fun unlock(f : File m) -> Either IOError Unit =
+    flockResult(f, "unlock", FD.using(fileFD(f), fun(n) = Calls.flock(n, Sys.lockUnlock)))
+
+fun flockResult(f : File m, op : String, r : Int) -> Either IOError Unit =
+    if r < 0 { Left(failed(f, op, r)) } else { Right(()) }
+
+-- -- what a file is -------------------------------------------------------------------
+
+type FileKind = Regular | Directory | Fifo | Symlink | Socket | CharacterDevice | BlockDevice
+
+instance Eq FileKind { fun eq(a, b) = kindCode(a) == kindCode(b) }
+
+fun kindCode(k : FileKind) -> Int = match k {
+    Regular -> 0
+    Directory -> 1
+    Fifo -> 2
+    Symlink -> 3
+    Socket -> 4
+    CharacterDevice -> 5
+    BlockDevice -> 6
+}
+
+instance Show FileKind {
+    fun show(k) = match k {
+        Regular -> "Regular"
+        Directory -> "Directory"
+        Fifo -> "Fifo"
+        Symlink -> "Symlink"
+        Socket -> "Socket"
+        CharacterDevice -> "CharacterDevice"
+        BlockDevice -> "BlockDevice"
+    }
+}
+
+-- What the system says of a file: its size in bytes, its kind, when its
+-- contents were last changed, in nanoseconds since the Unix epoch (as
+-- `System.Time.now` counts), and its permission bits, such as 0o644.
+type Stat = Stat { size : Int, kind : FileKind, modified : Int, permissions : Int }
+
+-- What `f` is now.
+fun stat(f : File m) -> Either IOError Stat {
+    let raw = Array.filled(Sys.statBytes(), Byte.truncate(0))
+    let r = FD.using(fileFD(f), fun(n) = Calls.fstat(n, raw))
+    if r < 0 { return Left(failed(f, "stat", r)) }
+    statOf(raw, Some(path(f)))
+}
+
+-- What `path` names, following symbolic links: `NotFound` if nothing does.
+fun metadata(path : String) -> Either IOError Stat = metadataIn(working, path)
+
+-- What `path` names, describing a symbolic link rather than following it.
+fun symlinkMetadata(path : String) -> Either IOError Stat = symlinkMetadataIn(working, path)
+
+fun metadataIn(d : Dir, name : String) -> Either IOError Stat =
+    statIn(d, Calls.cPath(name), 0, name)
+
+fun symlinkMetadataIn(d : Dir, name : String) -> Either IOError Stat =
+    statIn(d, Calls.cPath(name), Sys.atSymlinkNoFollow(), name)
+
+fun statIn(d : Dir, name : Array Byte, flags : Int, shown : String) -> Either IOError Stat {
+    let raw = Array.filled(Sys.statBytes(), Byte.truncate(0))
+    let r = FD.using(d.fd, fun(n) = Calls.statAt(n, name, raw, flags))
+    if r < 0 { return Left(failedIn(d, "stat", shown, r)) }
+    statOf(raw, Some(joined(d, shown)))
+}
+
+fun statOf(raw : Array Byte, path : Option String) -> Either IOError Stat {
+    let mode = Calls.statMode(raw)
+    let kind = match kindOfMode(mode) {
+        Some(k) -> k
+        -- Darwin's whiteouts, which a union mount shows, are not files.
+        None -> return Left(Errors.failure("stat", path, -Sys.einval))
+    }
+    Right(Stat { size = Calls.statSize(raw), kind = kind, modified = Calls.statModified(raw),
+                 permissions = Int.and(mode, 0o7777) })
+}
+
+fun kindOfMode(mode : Int) -> Option FileKind {
+    let t = Sys.fileType(mode)
+    if t == Sys.regularFile { Some(Regular) }
+    else if t == Sys.directory { Some(Directory) }
+    else if t == Sys.fifo { Some(Fifo) }
+    else if t == Sys.symbolicLink { Some(Symlink) }
+    else if t == Sys.socket { Some(Socket) }
+    else if t == Sys.characterDevice { Some(CharacterDevice) }
+    else if t == Sys.blockDevice { Some(BlockDevice) }
+    else { None }
+}
+
+-- -- directories ----------------------------------------------------------------------
+
+-- An open directory, and the path it was opened by, for messages. `owned` is
+-- false only for `workingDir()`, whose descriptor is not one to close.
+type Dir = Dir { fd : FD.FD, name : String, owned : Bool }
+
+-- The working directory, as a `Dir` that relative names resolve against when
+-- they are used: changing the working directory changes what it means.
+fun workingDir() -> Dir = working
+
+let working : Dir = Dir { fd = FD.fd(Sys.atWorkingDirectory()), name = ".", owned = False }
+
+fun openDir(path : String) -> Either IOError Dir = openDirIn(working, path)
+
+-- The directory `name` in `d`, following a symbolic link to one.
+fun openDirIn(d : Dir, name : String) -> Either IOError Dir =
+    dirIn(d, Calls.cPath(name), 0, name)
+
+fun dirIn(d : Dir, name : Array Byte, flags : Int, shown : String) -> Either IOError Dir {
+    let all = Int.or(Int.or(Sys.readOnly, Sys.directoryOnly()), Int.or(Sys.closeOnExec(), flags))
+    let number = FD.using(d.fd, fun(n) = Calls.openAt(n, name, all, 0))
+    if number < 0 { return Left(failedIn(d, "open", shown, number)) }
+    Right(Dir { fd = FD.fd(number), name = joined(d, shown), owned = True })
+}
+
+-- Close `d`, as `close` closes a file. Closing `workingDir()` does nothing.
+fun closeDir(d : Dir) -> Either IOError Unit {
+    if !d.owned { return Right(()) }
+    let r = FD.close(d.fd)
+    if r < 0 { Left(Errors.failure("close", Some(d.name), r)) } else { Right(()) }
+}
+
+fun dirPath(d : Dir) -> String = d.name
+
+-- `use`, for a directory.
+fun useDir(opening : Either IOError Dir, body : fun(Dir) -> Either IOError a)
+        -> Either IOError a {
+    let d = opening?
+    let made = body(d)
+    let closing = closeDir(d)
+    let value = made?
+    closing?
+    Right(value)
+}
+
+-- The names in `d`, without "." and "..", sorted by their bytes, so that two
+-- listings of the same directory come out in the same order. A name that is
+-- not UTF-8 fails the listing.
+fun list(d : Dir) -> Either IOError (Array String) {
+    let names : Vec String = []
+    for entry in entries(d)? {
+        match Buf.textOf(entry.name, 0, len(entry.name) - 1) {
+            Some(text) -> Vec.push(names, text)
+            None -> return Left(Errors.failure("list", Some(d.name), -Sys.eilseq()))
+        }
+    }
+    Right(Array.sort(Vec.toArray(names)))
+}
+
+fun listPath(path : String) -> Either IOError (Array String) = useDir(openDir(path), list)
+
+-- One entry of a directory: its name, NUL-terminated and as the system gave
+-- it, and its `d_type`.
+type Entry = Entry { name : Array Byte, kind : Int }
+
+-- The entries of `d` but "." and "..", in the order the system gives them.
+-- Read through a descriptor of their own, opened from `d`, so that the
+-- stream's position is not `d`'s and two listings of one `Dir` do not
+-- disturb each other.
+fun entries(d : Dir) -> Either IOError (Vec Entry) {
+    let flags = Int.or(Int.or(Sys.readOnly, Sys.directoryOnly()), Sys.closeOnExec())
+    let number = FD.using(d.fd, fun(n) = Calls.openAt(n, dot, flags, 0))
+    if number < 0 { return Left(Errors.failure("list", Some(d.name), number)) }
+    let stream = Calls.openStream(number)
+    if stream < 0 {
+        let _ = Calls.close(number)
+        return Left(Errors.failure("list", Some(d.name), stream))
+    }
+    let out : Vec Entry = []
+    while True {
+        let entry = Calls.readEntry(stream)
+        if entry < 0 {
+            let _ = Calls.closeStream(stream)
+            return Left(Errors.failure("list", Some(d.name), entry))
+        }
+        if entry == 0 { break }
+        let name = Calls.entryName(entry)
+        if !isDots(name) { Vec.push(out, Entry { name = name, kind = Calls.entryType(entry) }) }
+    }
+    let _ = Calls.closeStream(stream)
+    Right(out)
+}
+
+let dot : Array Byte = Calls.cPath(".")
+
+-- Whether a NUL-terminated name is "." or "..".
+fun isDots(name : Array Byte) -> Bool {
+    let n = len(name) - 1
+    if n < 1 || n > 2 { return False }
+    Byte.toInt(name[0]) == 46 && (n == 1 || Byte.toInt(name[1]) == 46)
+}
+
+-- -- files by directory ---------------------------------------------------------------
+
+fun openReadIn(d : Dir, name : String) -> Either IOError (File ReadOnly) =
+    openedIn(d, name, Sys.readOnly, 0)
+
+-- `create`, of `name` in `d`.
+fun createIn(d : Dir, name : String, mode : Create) -> Either IOError (File WriteOnly) {
+    let existing = match mode {
+        Truncate -> Sys.truncate()
+        Exclusive -> Sys.exclusive()
+    }
+    openedIn(d, name, Int.or(Sys.writeOnly, Int.or(Sys.create(), existing)), 0o666)
+}
+
+fun openedIn(d : Dir, name : String, flags : Int, permissions : Int) -> Either IOError (File m) {
+    let all = Int.or(flags, Sys.closeOnExec())
+    let c = Calls.cPath(name)
+    let number = FD.using(d.fd, fun(n) = Calls.openAt(n, c, all, permissions))
+    if number < 0 { return Left(failedIn(d, "open", name, number)) }
+    Right(File { fd = FD.fd(number), name = joined(d, name), stdoutFirst = False })
+}
+
+-- -- making and removing --------------------------------------------------------------
+
+-- Make the directory `path`, with permissions 0o777 as the umask narrows
+-- them. Its parent must exist; `AlreadyExists` if something is there.
+fun createDir(path : String) -> Either IOError Unit = createDirIn(working, path)
+
+fun createDirIn(d : Dir, name : String) -> Either IOError Unit {
+    let c = Calls.cPath(name)
+    unitIn(d, "createDir", name, FD.using(d.fd, fun(n) = Calls.makeDirectoryAt(n, c, 0o777)))
+}
+
+-- Make the directory `path` and every missing directory above it, as
+-- `mkdir -p` does. A directory that is there already, or that another process
+-- makes meanwhile, is not an error; anything else in the way is
+-- `AlreadyExists`.
+fun createDirAll(path : String) -> Either IOError Unit = createDirAllIn(working, path)
+
+fun createDirAllIn(d : Dir, path : String) -> Either IOError Unit {
+    let c = Calls.cPath(path)
+    let r = FD.using(d.fd, fun(n) = Calls.makeDirectoryAt(n, c, 0o777))
+    if r == 0 { return Right(()) }
+    if r == -Sys.enoent {
+        match parentOf(path) {
+            Some(parent) -> {
+                createDirAllIn(d, parent)?
+                let again = FD.using(d.fd, fun(n) = Calls.makeDirectoryAt(n, c, 0o777))
+                if again == 0 { return Right(()) }
+                return existingDir(d, path, again)
+            }
+            None -> return unitIn(d, "createDir", path, r)
+        }
+    }
+    existingDir(d, path, r)
+}
+
+-- `r`, `mkdir`'s failure for `path`, unless it was `EEXIST` for a directory.
+fun existingDir(d : Dir, path : String, r : Int) -> Either IOError Unit {
+    if r == -Sys.eexist {
+        match metadataIn(d, path) {
+            Right(Stat { kind = Directory, .. }) -> return Right(())
+            _ -> {}
+        }
+    }
+    unitIn(d, "createDir", path, r)
+}
+
+-- The path above `path`'s last component, if it has one.
+fun parentOf(path : String) -> Option String {
+    let trimmed = withoutTrailingSlashes(path)
+    match String.rsplitOnce(trimmed, "/") {
+        Some((parent, _)) -> if String.isEmpty(parent) { None } else { Some(parent) }
+        None -> None
+    }
+}
+
+-- `path` without the slashes that end it, unless it is all slashes.
+fun withoutTrailingSlashes(path : String) -> String {
+    var trimmed = path
+    while String.byteLength(trimmed) > 1 {
+        match String.stripSuffix(trimmed, "/") {
+            Some(shorter) -> { trimmed = shorter }
+            None -> break
+        }
+    }
+    trimmed
+}
+
+-- Remove the file `path`, or the symbolic link, not what it points to.
+fun removeFile(path : String) -> Either IOError Unit = removeFileIn(working, path)
+
+fun removeFileIn(d : Dir, name : String) -> Either IOError Unit {
+    let c = Calls.cPath(name)
+    unitIn(d, "remove", name, FD.using(d.fd, fun(n) = Calls.removeAt(n, c, 0)))
+}
+
+-- Remove the empty directory `path`: `NotEmpty` if it has entries.
+fun removeDir(path : String) -> Either IOError Unit = removeDirIn(working, path)
+
+fun removeDirIn(d : Dir, name : String) -> Either IOError Unit {
+    let c = Calls.cPath(name)
+    unitIn(d, "removeDir", name,
+           FD.using(d.fd, fun(n) = Calls.removeAt(n, c, Sys.atRemoveDirectory())))
+}
+
+-- Remove `path` and, if it is a directory, everything in it. A symbolic link
+-- is removed, never followed, wherever it is in the tree: the walk opens each
+-- directory from its parent with `O_NOFOLLOW`, so a link swapped in for a
+-- directory while the walk runs fails the walk rather than leading it
+-- outside.
+fun removeTree(path : String) -> Either IOError Unit = removeTreeIn(working, path)
+
+fun removeTreeIn(d : Dir, name : String) -> Either IOError Unit =
+    removeEntry(d, Calls.cPath(name), Sys.entryUnknown, name)
+
+-- Remove the entry `name` of `d`, whose `d_type` is `kind`; `shown` is its
+-- name for messages.
+fun removeEntry(d : Dir, name : Array Byte, kind : Int, shown : String) -> Either IOError Unit {
+    var directory = kind == Sys.entryDirectory
+    if kind == Sys.entryUnknown {
+        let found = statIn(d, name, Sys.atSymlinkNoFollow(), shown)?
+        directory = found.kind == Directory
+    }
+    if !directory {
+        return unitIn(d, "remove", shown, FD.using(d.fd, fun(n) = Calls.removeAt(n, name, 0)))
+    }
+    let inner = dirIn(d, name, Sys.noFollow(), shown)?
+    let emptied = removeEntries(inner)
+    let closing = closeDir(inner)
+    emptied?
+    closing?
+    unitIn(d, "removeDir", shown,
+           FD.using(d.fd, fun(n) = Calls.removeAt(n, name, Sys.atRemoveDirectory())))
+}
+
+fun removeEntries(d : Dir) -> Either IOError Unit {
+    for entry in entries(d)? {
+        removeEntry(d, entry.name, entry.kind, nameText(entry.name))?
+    }
+    Right(())
+}
+
+-- A NUL-terminated name as text, for a message, with a stand-in if it is not
+-- UTF-8.
+fun nameText(name : Array Byte) -> String = match Buf.textOf(name, 0, len(name) - 1) {
+    Some(text) -> text
+    None -> "<a name that is not UTF-8>"
+}
+
+-- Rename `from` to `to`, replacing whatever `to` named, in one step: anyone
+-- opening `to` meanwhile finds the old file or the new one, never neither and
+-- never half of one. Both must be on one file system, or it fails with
+-- `Other` for `EXDEV`. Writing a file under a staging name and renaming it
+-- into place is how to publish it whole.
+fun rename(from : String, to : String) -> Either IOError Unit =
+    renameIn(working, from, working, to)
+
+fun renameIn(fromDir : Dir, from : String, toDir : Dir, to : String) -> Either IOError Unit {
+    let f = Calls.cPath(from)
+    let t = Calls.cPath(to)
+    let r = FD.using(fromDir.fd, fun(fromNumber) =
+        FD.using(toDir.fd, fun(toNumber) = Calls.renameAt(fromNumber, f, toNumber, t)))
+    unitIn(fromDir, "rename", from, r)
+}
+
+-- A new, empty directory, made for this caller alone (permissions 0o700), in
+-- `$TMPDIR`, or `/tmp` if that is unset: its path, whose last component is
+-- `prefix` and six characters chosen to make it unique. Nothing removes it
+-- but `removeTree`.
+fun temporaryDir(prefix : String) -> Either IOError String {
+    let base = withoutTrailingSlashes(Option.unwrapOr(Env.get("TMPDIR"), "/tmp"))
+    let template = Calls.cPath(base + "/" + prefix + "XXXXXX")
+    let r = Calls.makeTemporaryDirectory(template)
+    if r < 0 { return Left(Errors.failure("temporaryDir", Some(base), r)) }
+    Right(nameText(template))
+}
+
 -- -- the standard streams ----------------------------------------------------------
 
 -- `System.IO` re-exports these beside `stdout`, and says what they are. They
@@ -265,3 +671,14 @@ fun fileFD(f : File m) -> FD.FD = f.fd
 
 fun failed(f : File m, op : String, result : Int) -> IOError =
     Errors.failure(op, Some(path(f)), result)
+
+-- `name` in `d`, as a path for messages: `name` itself when it is absolute or
+-- `d` is the working directory.
+fun joined(d : Dir, name : String) -> String =
+    if !d.owned || String.startsWith(name, "/") { name } else { d.name + "/" + name }
+
+fun failedIn(d : Dir, op : String, name : String, result : Int) -> IOError =
+    Errors.failure(op, Some(joined(d, name)), result)
+
+fun unitIn(d : Dir, op : String, name : String, r : Int) -> Either IOError Unit =
+    if r < 0 { Left(failedIn(d, op, name, r)) } else { Right(()) }

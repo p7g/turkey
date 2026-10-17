@@ -1402,7 +1402,9 @@ let chunkLimit : Int = 0x7FFF
 --
 -- A collection marks with every worker stopped at a safepoint helping it: they
 -- are waiting for it anyway (`stopAt`). A worker held while blocked does not
--- help, since it is waiting on something else.
+-- help, since it is waiting on something else. A worker held while it waits
+-- for work (`pause`) helps a mark big enough to repay waking it
+-- (`pausedHelpFloor`).
 --
 -- The roots are tasks, which the markers claim one at a time: each stack, each
 -- frame of the root chain, and runs of the remembered set. There are many more
@@ -1421,6 +1423,19 @@ let chunkLimit : Int = 0x7FFF
 
 let packetEntries : Int = 512
 let shareEvery : Int = 64
+
+-- The fewest bytes a mark may trace -- the young generation's for a minor
+-- collection, the heap's for a full one -- for it to ask the workers asleep
+-- in `pause` to help. Each one asked is woken from the kernel, marks, sleeps
+-- again until the collection ends, is woken again, and goes back to the
+-- scheduler's queue, whose lock every one of them then takes to find nothing
+-- to do. On an M-series Mac with eleven idle workers that is about 50 us of
+-- wall time and 200 us of system time per collection, against a few
+-- microseconds of marking for a young generation of a few hundred kilobytes:
+-- a program with one task ran six times slower than with one worker.
+-- The compiler's own collections, of tens of megabytes, are faster with
+-- them, and stay above this.
+let pausedHelpFloor : Int = 4194304
 
 -- Whether other workers are marking with this one: claims of a mark are
 -- atomic then. Set before they are asked to help and cleared after they have
@@ -1491,21 +1506,25 @@ fun markFrom(frame : Prim.Ptr) -> Unit {
     Prim.atomicStore(marking, nextTaskAt, 0)
     let me = Workers.index()
     let n = Workers.count()
+    -- Under GC stress every collection asks, so that the stressed runs, whose
+    -- heaps are small, still mark with the paused workers.
+    let traced = if minor { bytesSince } else { plus(liveBytes, bytesSince) }
+    let paused = stress || traced >= pausedHelpFloor
     participants = 1
     for var i = 0; i < n; i = plus(i, 1) {
-        if i != me && canHelp(i) { participants = plus(participants, 1) }
+        if i != me && canHelp(i, paused) { participants = plus(participants, 1) }
     }
     sharing = participants > 1
     if sharing {
         Prim.atomicStore(marking, idleAt, 0)
         Prim.atomicStore(marking, doneAt, 0)
         for var i = 0; i < n; i = plus(i, 1) {
-            if i != me && canHelp(i) { Prim.atomicStore(helping, times8(i), 1) }
+            if i != me && canHelp(i, paused) { Prim.atomicStore(helping, times8(i), 1) }
         }
         -- The stopped ones sleep on the collection epoch, and the paused ones
         -- may still be asleep on the work epoch.
         Workers.signalCollection()
-        Workers.signalWork(True)
+        if paused { Workers.signalWork(True) }
     }
     mark()
     if sharing {
@@ -1518,9 +1537,10 @@ fun markFrom(frame : Prim.Ptr) -> Unit {
     if Prim.atomicLoad(marking, failedAt) != 0 { Process.panic(failure) }
 }
 
--- Whether worker `i`, with the world stopped, waits where it would mark if
--- asked: stopped at a safepoint, or held in `pause`.
-fun canHelp(i : Int) -> Bool = Workers.stopped(i) || Prim.atomicLoad(pausing, times8(i)) != 0
+-- Whether worker `i`, with the world stopped, is to be asked to mark: it is
+-- stopped at a safepoint, or, if `paused`, held in `pause`.
+fun canHelp(i : Int, paused : Bool) -> Bool =
+    Workers.stopped(i) || (paused && Prim.atomicLoad(pausing, times8(i)) != 0)
 
 fun addTask(kind : Int, a : Prim.Ptr, b : Prim.Ptr) -> Unit {
     if taskCount == taskCapacity {

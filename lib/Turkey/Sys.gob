@@ -1,14 +1,20 @@
 module Turkey.Sys (
     readOnly, writeOnly, readWrite, append, create, truncate, exclusive,
-    nonBlocking, closeOnExec,
+    nonBlocking, closeOnExec, directoryOnly, noFollow,
+    atWorkingDirectory, atSymlinkNoFollow, atRemoveDirectory,
+    lockExclusive, lockNonBlocking, lockUnlock,
     getDescriptorFlags, setDescriptorFlags, getStatusFlags, setStatusFlags,
     descriptorCloseOnExec,
     eperm, enoent, eintr, eio, ebadf, enomem, eacces, eexist, enotdir, eisdir,
-    einval, emfile, enotty, enospc, espipe, erofs, epipe, eagain,
-    statBytes, statModeAt, statModeWidth, statSizeAt,
+    einval, emfile, enotty, enospc, espipe, erofs, epipe, exdev, eagain, enametoolong,
+    eloop, enotempty, eilseq,
+    statBytes, statModeAt, statModeWidth, statSizeAt, statModifiedAt,
+    direntTypeAt, direntNameAt,
+    entryUnknown, entryFifo, entryCharacterDevice, entryDirectory, entryBlockDevice,
+    entryRegular, entrySymbolicLink, entrySocket,
     fileType, regularFile, directory, fifo, characterDevice, socket, symbolicLink,
     blockDevice,
-    errno, result, cResult, cInt,
+    errno, clearErrno, result, cResult, cInt,
 )
 
 -- What the system calls the I/O layer makes take and answer, per target: the
@@ -17,15 +23,18 @@ module Turkey.Sys (
 --
 -- Each per-target value is a `match` on `Target.os`, so a target added to
 -- `lib/Target.gob` makes every one of them non-exhaustive until it is given
--- its own. The Darwin values are `<fcntl.h>`, `<errno.h>` and `<sys/stat.h>`
--- from the macOS SDK; the Linux values are the kernel's generic ones, which
--- are arm64's.
+-- its own. The Darwin values are `<fcntl.h>`, `<errno.h>`, `<sys/stat.h>`,
+-- `<sys/file.h>` and `<dirent.h>` from the macOS SDK. The Linux values are
+-- the kernel's generic ones, which arm64 uses, except where arm64's own
+-- `<asm/fcntl.h>` overrides them (`O_DIRECTORY`, `O_NOFOLLOW`); `struct
+-- dirent` is glibc's and musl's, which agree on arm64.
 --
 -- A giblet may call anything here: `Turkey.Workers` reads `errno` through it
 -- in the moment between a blocking call and the worker running again.
 
 import Prelude ()
 import Data.Int (Int)
+import Data.Tuple (Unit)
 import Data.Ord (Ord(..))
 import Target (OS(..))
 import Target as Target
@@ -68,6 +77,46 @@ fun closeOnExec() -> Int = match Target.os {
     Linux -> 0x8_0000
 }
 
+-- `O_DIRECTORY`: fail with `ENOTDIR` unless the path names a directory.
+-- arm64 Linux moves it, and `O_NOFOLLOW`, off the generic values.
+fun directoryOnly() -> Int = match Target.os {
+    Darwin -> 0x10_0000
+    Linux -> 0x4000
+}
+
+-- `O_NOFOLLOW`: fail with `ELOOP` if the last component is a symbolic link,
+-- rather than opening what it points to.
+fun noFollow() -> Int = match Target.os {
+    Darwin -> 0x100
+    Linux -> 0x8000
+}
+
+-- -- the `at` calls -------------------------------------------------------------------
+
+-- `AT_FDCWD`: the directory argument that means the working directory.
+fun atWorkingDirectory() -> Int = match Target.os {
+    Darwin -> Prim.intNeg(2)
+    Linux -> Prim.intNeg(100)
+}
+
+-- `AT_SYMLINK_NOFOLLOW`, for `fstatat`: describe a symbolic link, not what it
+-- points to.
+fun atSymlinkNoFollow() -> Int = match Target.os {
+    Darwin -> 0x20
+    Linux -> 0x100
+}
+
+-- `AT_REMOVEDIR`, for `unlinkat`: remove an empty directory, not a file.
+fun atRemoveDirectory() -> Int = match Target.os {
+    Darwin -> 0x80
+    Linux -> 0x200
+}
+
+-- `flock`'s operations, the same on both.
+let lockExclusive : Int = 2
+let lockNonBlocking : Int = 4
+let lockUnlock : Int = 8
+
 -- `fcntl`'s commands, and the one descriptor flag, the same on both.
 let getDescriptorFlags : Int = 1
 let setDescriptorFlags : Int = 2
@@ -96,6 +145,31 @@ let enospc : Int = 28
 let espipe : Int = 29
 let erofs : Int = 30
 let epipe : Int = 32
+
+-- `EXDEV`: a rename across file systems.
+let exdev : Int = 18
+
+fun enametoolong() -> Int = match Target.os {
+    Darwin -> 63
+    Linux -> 36
+}
+
+fun eloop() -> Int = match Target.os {
+    Darwin -> 62
+    Linux -> 40
+}
+
+-- `EILSEQ`: what a name that is not UTF-8 is reported as, by the library
+-- rather than the system.
+fun eilseq() -> Int = match Target.os {
+    Darwin -> 92
+    Linux -> 84
+}
+
+fun enotempty() -> Int = match Target.os {
+    Darwin -> 66
+    Linux -> 39
+}
 
 -- `EWOULDBLOCK` is the same number on both.
 fun eagain() -> Int = match Target.os {
@@ -129,6 +203,13 @@ fun statSizeAt() -> Int = match Target.os {
     Linux -> 48
 }
 
+-- `st_mtime`, a `struct timespec`: seconds at this offset, then nanoseconds
+-- in the next word. Darwin calls it `st_mtimespec`, Linux `st_mtim`.
+fun statModifiedAt() -> Int = match Target.os {
+    Darwin -> 48
+    Linux -> 88
+}
+
 -- The file type, `S_IFMT`'s bits of `st_mode`, and its values: the same on
 -- both.
 fun fileType(mode : Int) -> Int = Prim.intAnd(mode, 0o170000)
@@ -140,6 +221,34 @@ let socket : Int = 0o140000
 let symbolicLink : Int = 0o120000
 let blockDevice : Int = 0o060000
 
+-- -- `struct dirent` -------------------------------------------------------------------
+--
+-- What `readdir` answers. Darwin's: an 8-byte `d_ino`, an 8-byte `d_seekoff`,
+-- a 2-byte `d_reclen`, a 2-byte `d_namlen`, then `d_type`. Linux's: an 8-byte
+-- `d_ino` and `d_off`, a 2-byte `d_reclen`, then `d_type`. On both the name
+-- follows `d_type` and ends in a NUL.
+
+fun direntTypeAt() -> Int = match Target.os {
+    Darwin -> 20
+    Linux -> 18
+}
+
+fun direntNameAt() -> Int = match Target.os {
+    Darwin -> 21
+    Linux -> 19
+}
+
+-- `d_type`'s values, the same on both. A file system that does not fill it in
+-- answers `entryUnknown`, and the caller asks `fstatat`.
+let entryUnknown : Int = 0
+let entryFifo : Int = 1
+let entryCharacterDevice : Int = 2
+let entryDirectory : Int = 4
+let entryBlockDevice : Int = 6
+let entryRegular : Int = 8
+let entrySymbolicLink : Int = 10
+let entrySocket : Int = 12
+
 -- -- the result convention -------------------------------------------------------
 
 -- The calling thread's `errno`. Read it straight after the call that set it,
@@ -147,6 +256,10 @@ let blockDevice : Int = 0o060000
 -- overwrite it, and a task that suspends may resume on another worker, whose
 -- `errno` is another thread's.
 fun errno() -> Int = Prim.charToInt(Prim.loadI32(location(), 0))
+
+-- Set this thread's `errno` to 0, before a call that reports a failure only
+-- through it, such as `readdir`, whose null means either the end or an error.
+fun clearErrno() -> Unit = Prim.storeI32(location(), 0, Prim.charFromInt(0))
 
 -- Where this thread's `errno` lives. Each arm names a symbol only its own
 -- libc defines, and only the chosen target's arm is compiled.

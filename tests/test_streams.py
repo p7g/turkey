@@ -138,7 +138,7 @@ fun main() {
     print(IO.readLine(one))
 }
 """)
-    assert out == ["Right(Some(ok))", "Left(InvalidUTF8)", "Left(Underlying(broken))",
+    assert out == ["Right(Some(ok))", "Left(Left(InvalidUTF8))", "Left(Right(broken))",
                    "Right(Some(a))", "Right(None)"]
 
 
@@ -153,7 +153,7 @@ fun main() {
     print(n)
 }
 """)
-    assert out == ["Left(Underlying(broken))", "1"]
+    assert out == ["Left(Right(broken))", "1"]
 
 
 def test_readLineInto_appends_each_line_to_the_callers_buffer():
@@ -260,8 +260,8 @@ fun check(r : Either (IO.ExactError String) Unit) = match r {
     Left(e) -> print(e)
 }
 """)
-    assert out == ["Right", "Some(head)", "Right", "Some(body)", "EndedEarly",
-                   "ReadFailed(broken)"]
+    assert out == ["Right", "Some(head)", "Right", "Some(body)", "Left(EndedEarly)",
+                   "Right(broken)"]
 
 
 def test_readAll_copy_and_writeText():
@@ -281,9 +281,13 @@ fun main() {
         Left(IO.Reading(e)) -> print(e)
         _ -> print("?")
     }
+    match IO.copy(Broken, s, IO.buffer(3)) {
+        Left(e) -> print(e)
+        Right(_) -> print("?")
+    }
 }
 """)
-    assert out == ["(500000, True)", "(6, copied, 2)", "broken"]
+    assert out == ["(500000, True)", "(6, copied, 2)", "broken", "Reading(broken)"]
 
 
 def test_any_read_and_any_write_choose_at_run_time():
@@ -302,7 +306,7 @@ fun main() {
     print(s.got)
 }
 """)
-    assert out == ["Right(x)", "Right(y)", "Left(Underlying(lifted broken))", "via any"]
+    assert out == ["Right(x)", "Right(y)", "Left(Right(lifted broken))", "via any"]
 
 
 def test_reading_into_a_full_buffer_is_a_bug():

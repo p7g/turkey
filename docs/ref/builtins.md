@@ -73,6 +73,40 @@ A value that is one of two things, conventionally an error (`Left`) or a
 result (`Right`). `Either l` is a `Monad` whose `?` passes a `Left` through
 and continues with the value in a `Right`.
 
+When both sides are `Error`s, so is `Either l r`, and its `message` is the
+message of the side it holds. That is how one error type can say "this or
+that failed" without a type of its own:
+
+<!-- run -->
+```kotlin
+type Unreadable = Unreadable
+type Empty = Empty
+
+instance Error Unreadable { fun message(e) = "the file could not be read" }
+instance Error Empty { fun message(e) = "the file is empty" }
+
+fun load(text : Option String) -> Either (Either Unreadable Empty) String = match text {
+    None -> Left(Left(Unreadable))
+    Some("") -> Left(Right(Empty))
+    Some(s) -> Right(s)
+}
+
+fun main() {
+    for text in [Some("hello"), Some(""), None] {
+        match load(text) {
+            Right(s) -> print(s)
+            Left(e) -> print(message(e))
+        }
+    }
+}
+```
+
+```text
+hello
+the file is empty
+the file could not be read
+```
+
 ## `Array`
 
 `Array a` is a fixed-length, mutable sequence of `a`, with

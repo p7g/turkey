@@ -164,7 +164,7 @@ fun statSize(stat : Array Byte) -> Int = littleEndian(stat, Sys.statSizeAt(), 8)
 -- 1 if `fd` is a terminal, or the negated `errno`: `-ENOTTY` for anything else.
 fun isatty(fd : Int) -> Int {
     let r = Libc.isatty(fd)
-    if Sys.cInt(r) == 1 { 1 } else { Prim.intNeg(Sys.errno()) }
+    if Sys.cInt(r) == 1 { 1 } else { -Sys.errno() }
 }
 
 -- -- copying ----------------------------------------------------------------------
@@ -173,14 +173,30 @@ fun isatty(fd : Int) -> Int {
 -- I/O layer: every place it moves bytes from one array to another comes
 -- through here.
 --
--- `Array.copy` is `Prim.arrayCopy` on the two arrays' storage: both runs
--- checked once, then 32 bytes at a time, and the two may overlap, as with
--- `memmove`. The window is checked here only because it is given as an end
--- rather than a count, and a window that ends before it starts is a bug in
--- the caller, not an empty copy.
+-- Both windows are checked here, in one test, and a bad one panics naming
+-- it. Then `Prim.arrayCopy` moves the bytes 32 at a time, as `memmove`
+-- would: the two windows may overlap. The primitive checks both runs again
+-- against the storage, which is what keeps it safe whoever calls it, but its
+-- message cannot say which window was wrong; it is never the one a caller
+-- sees, since the test here fails first.
+--
+-- `Array.copy` would add two checks of its own, each a call, since the bulk
+-- primitive inside makes it too large to inline. This runs once per buffer
+-- refill and once per small read from a `Buffered`, so it calls the primitive
+-- on the storage directly.
 fun copy(target : Array Byte, at : Int, source : Array Byte, from : Int, to : Int) -> Unit {
-    within(len(source), from, to)
-    Array.copy(target, at, source, from, to - from)
+    let count = to - from
+    if from < 0 || count < 0 || to > len(source) || at < 0 || at > len(target) - count {
+        copyOutside(len(target), at, len(source), from, to)
+    }
+    Prim.arrayCopy(Array.storage(target), at, Array.storage(source), from, count)
+}
+
+-- Which of `copy`'s windows is wrong, said as `outside` says it: the source's
+-- if it is, else the target's.
+fun copyOutside(targetLength : Int, at : Int, sourceLength : Int, from : Int, to : Int) -> Unit {
+    if from < 0 || to < from || to > sourceLength { outside(from, to, sourceLength) }
+    outside(at, at + (to - from), targetLength)
 }
 
 -- -- underneath -------------------------------------------------------------------

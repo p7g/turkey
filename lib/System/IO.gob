@@ -4,8 +4,8 @@ module System.IO (
     bytesOf,
     -- streams
     Read(..), Write(..), Buffered, buffered, underlying, defaultCapacity,
-    Line(..), readLineInto, readLine, Lines, lines, ExactError(..), readExact,
-    readAll, CopyError(..), copy, writeText, DecodeError(..),
+    Line(..), readLineInto, readLine, Lines, lines, ExactError, EndedEarly(..), readExact,
+    readAll, CopyError(..), copy, writeText, DecodeError, InvalidUTF8(..),
     AnyRead, anyRead, AnyWrite, anyWrite,
     IOError(..), ErrorKind(..),
     -- the standard streams
@@ -48,8 +48,8 @@ import Turkey.Buffer as Buf
 import Turkey.Errors (IOError(..), ErrorKind(..))
 import Turkey.Scan as Scan
 import Turkey.Stdout (Stdout, stdout, print, write)
-import Turkey.ReadWrite (Read(..), Write(..), DecodeError(..), Buffered(..), buffered, underlying,
-                      defaultCapacity, needsRoom, smaller)
+import Turkey.ReadWrite (Read(..), Write(..), DecodeError, InvalidUTF8(..), Buffered(..),
+                         buffered, underlying, defaultCapacity, needsRoom, smaller)
 
 -- -- lines ----------------------------------------------------------------------------
 
@@ -132,7 +132,7 @@ fun readLine[Read r](b : Buffered r) -> Either (DecodeError (ReadError r)) (Opti
         }
         scanned = held.end
         match readInto(b.inner, held) {
-            Left(e) -> return Left(Underlying(e))
+            Left(e) -> return Left(Right(e))
             Right(n) -> if n == 0 {
                 if filled(held) == 0 && filled(spill) == 0 { return Right(None) }
                 let line = finish(spill, held, held.end)
@@ -164,7 +164,7 @@ fun finish(spill : Buffer, held : Buffer, stop : Int) -> Either (DecodeError e) 
     if to > from && Byte.toInt(source[to - 1]) == 13 { to = to - 1 }
     match Buf.textOf(source, from, to) {
         Some(text) -> Right(Some(text))
-        None -> Left(InvalidUTF8)
+        None -> Left(Left(InvalidUTF8))
     }
 }
 
@@ -210,16 +210,16 @@ instance Iterator (Lines r) : Read r {
 -- -- whole transfers ------------------------------------------------------------------
 
 -- Why `readExact` read fewer bytes than it was asked for: the input ended
--- first -- including before any of them, since a caller expecting a record
--- wants one answer for "it is not there" -- or the source failed.
-type ExactError e = EndedEarly | ReadFailed(e)
+-- first, on the `Left` -- including before any of them, since a caller
+-- expecting a record wants one answer for "it is not there" -- or the source
+-- failed, on the `Right`.
+type ExactError e = Either EndedEarly e
 
-instance Show (ExactError e) : Show e {
-    fun show(x) = match x {
-        EndedEarly -> "EndedEarly"
-        ReadFailed(e) -> "ReadFailed(" + show(e) + ")"
-    }
-}
+type EndedEarly = EndedEarly
+
+instance Show EndedEarly { fun show(e) = "EndedEarly" }
+
+instance Error EndedEarly { fun message(e) = "the input ended early" }
 
 -- Append exactly `n` bytes from `r` to `into`, for binary formats, and not one
 -- byte more: each read is given room for only what is still missing. Panics if
@@ -230,9 +230,9 @@ fun readExact[Read r](r : r, into : Buffer, n : Int) -> Either (ExactError (Read
     while missing > 0 {
         let wanted = missing
         match Buf.limited(into, wanted, fun() = readInto(r, into)) {
-            Left(e) -> return Left(ReadFailed(e))
+            Left(e) -> return Left(Right(e))
             Right(got) -> {
-                if got == 0 { return Left(EndedEarly) }
+                if got == 0 { return Left(Left(EndedEarly)) }
                 missing = missing - got
             }
         }
@@ -262,6 +262,20 @@ let transfer : Int = 262144
 
 -- Why `copy` stopped: the source failed, or the sink did.
 type CopyError a b = Reading(a) | Writing(b)
+
+instance Show (CopyError a b) : Show a, Show b {
+    fun show(x) = match x {
+        Reading(e) -> "Reading(" + show(e) + ")"
+        Writing(e) -> "Writing(" + show(e) + ")"
+    }
+}
+
+instance Error (CopyError a b) : Error a, Error b {
+    fun message(x) = match x {
+        Reading(e) -> message(e)
+        Writing(e) -> message(e)
+    }
+}
 
 -- Everything left in `r`, written to `w` through `via`, which is cleared
 -- before each read: how many bytes were copied. `w` is not flushed.

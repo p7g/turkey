@@ -351,3 +351,19 @@ fun main() {
 }
 """
     assert outputs(source) == "True\nTrue\n"
+
+
+def test_either_of_two_errors_is_an_error_with_the_sides_message():
+    source = PAYLOADS + """
+fun main() {
+    let parsing : Either ParseError IoError = Left(ParseError("eof"))
+    let io : Either ParseError IoError = Right(IoError(5))
+    print(message(parsing))
+    print(message(io))
+    match Error.cast(fail(io)) : Option (Either ParseError IoError) {
+        Some(Right(IoError(n))) -> print(n)
+        _ -> print("lost")
+    }
+}
+"""
+    assert outputs(source) == "parse eof\nio 5\n5\n"

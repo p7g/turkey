@@ -179,4 +179,4 @@ def test_a_window_outside_its_array_panics(call):
 
 def test_a_copy_past_the_targets_end_panics():
     result = panics(HEADER + "fun main() { IO.copy(bytes(\"abc\"), 1, bytes(\"abc\"), 0, 3) }\n")
-    assert "out of bounds" in panic_message(result)
+    assert "the window 1 to 4 is outside an array of length 3" in panic_message(result)

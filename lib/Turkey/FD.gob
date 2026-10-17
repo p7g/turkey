@@ -1,4 +1,4 @@
-module Turkey.Fd (Fd, fd, number, closed, read, write, writeText, readAt, writeAt, close)
+module Turkey.FD (FD, fd, number, closed, read, write, writeText, readAt, writeAt, close)
 
 -- A descriptor that tasks share: the one place the I/O layer decides when a
 -- descriptor number stops being this file's, and which of two tasks using it
@@ -36,7 +36,7 @@ module Turkey.Fd (Fd, fd, number, closed, read, write, writeText, readAt, writeA
 --
 -- **Positional operations take a reference and no lock.** Each names its own
 -- offset and leaves the descriptor's position alone, so it is independent of
--- every other operation, and any number of them run at once on one `Fd`.
+-- every other operation, and any number of them run at once on one `FD`.
 --
 -- **The retry loop.** A call interrupted by a signal is made again at once. A
 -- descriptor here is in blocking mode -- the library opens none otherwise, and
@@ -73,39 +73,39 @@ let reference : Int = 32
 -- long as the record is held, and every function here holds it.
 let fieldsAt : Int = 24
 
--- What an operation on an `Fd` that has been closed answers: below every
+-- What an operation on an `FD` that has been closed answers: below every
 -- negated `errno`, so that it cannot be mistaken for one.
-let closed : Int = 0 - 0x1_0000_0000
+let closed : Int = -0x1_0000_0000
 
 -- The `state` field is `var` though nothing assigns it: it changes after the
 -- record is built, by atomic instructions at its address, and a field that is
 -- not `var` is one the compiler may take to be what it was built with.
-type Fd = Fd {
+type FD = FD {
     var state   : Int,
     number      : Int,
     var readers : Vec Co.Coroutine,
     var writers : Vec Co.Coroutine,
 }
 
--- An `Fd` for a descriptor the caller owns from now on: its `close` closes it.
-fun fd(number : Int) -> Fd = Fd { state = 0, number = number, readers = [], writers = [] }
+-- An `FD` for a descriptor the caller owns from now on: its `close` closes it.
+fun fd(number : Int) -> FD = FD { state = 0, number = number, readers = [], writers = [] }
 
 -- The descriptor number, for a caller that only reports it. Using it for a
 -- system call races `close` in exactly the way this module exists to prevent.
-fun number(f : Fd) -> Int = f.number
+fun number(f : FD) -> Int = f.number
 
 -- -- sequential -----------------------------------------------------------------------
 
 -- Up to `to - from` bytes into `bytes[from..to)`, from the descriptor's
 -- position: how many, at least 1, or 0 at end of file. One read at a time per
--- `Fd`.
-fun read(f : Fd, bytes : Array Byte, from : Int, to : Int) -> Int {
+-- `FD`.
+fun read(f : FD, bytes : Array Byte, from : Int, to : Int) -> Int {
     if !lock(f, readLock, readWaited) { return closed }
     var n = 0
     while True {
         n = IO.read(f.number, bytes, from, to)
-        if n == 0 - Sys.eintr { continue }
-        if n == 0 - Sys.eagain() {
+        if n == -Sys.eintr { continue }
+        if n == -Sys.eagain() {
             again()
             continue
         }
@@ -117,8 +117,8 @@ fun read(f : Fd, bytes : Array Byte, from : Int, to : Int) -> Int {
 
 -- All of `bytes[from..to)`, at the descriptor's position: `to - from`, or the
 -- negated `errno` of the call that failed, after whatever went before it. One
--- write at a time per `Fd`, so the bytes go out contiguously.
-fun write(f : Fd, bytes : Array Byte, from : Int, to : Int) -> Int {
+-- write at a time per `FD`, so the bytes go out contiguously.
+fun write(f : FD, bytes : Array Byte, from : Int, to : Int) -> Int {
     if !lock(f, writeLock, writeWaited) { return closed }
     let n = writeAll(f, fun(at) = IO.write(f.number, bytes, at, to), from, to)
     unlock(f, writeLock, writeWaited)
@@ -126,7 +126,7 @@ fun write(f : Fd, bytes : Array Byte, from : Int, to : Int) -> Int {
 }
 
 -- `write`, from a string's own bytes, counted in bytes.
-fun writeText(f : Fd, text : String, from : Int, to : Int) -> Int {
+fun writeText(f : FD, text : String, from : Int, to : Int) -> Int {
     if !lock(f, writeLock, writeWaited) { return closed }
     let n = writeAll(f, fun(at) = IO.writeText(f.number, text, at, to), from, to)
     unlock(f, writeLock, writeWaited)
@@ -138,14 +138,14 @@ fun writeText(f : Fd, text : String, from : Int, to : Int) -> Int {
 -- `bytes[from..to)` filled from `offset` in the file, or as much of it as the
 -- file holds: how many, fewer than asked for only at end of file. The
 -- position is neither used nor moved, and no lock is taken.
-fun readAt(f : Fd, offset : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
+fun readAt(f : FD, offset : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
     if !acquire(f) { return closed }
     var at = from
     var result = 0
     while at < to {
         let n = IO.readAt(f.number, offset + (at - from), bytes, at, to)
-        if n == 0 - Sys.eintr { continue }
-        if n == 0 - Sys.eagain() {
+        if n == -Sys.eintr { continue }
+        if n == -Sys.eagain() {
             again()
             continue
         }
@@ -163,7 +163,7 @@ fun readAt(f : Fd, offset : Int, bytes : Array Byte, from : Int, to : Int) -> In
 -- All of `bytes[from..to)` at `offset` in the file, the position neither used
 -- nor moved, and no lock taken: `to - from`, or the negated `errno`. Two
 -- overlapping `writeAt`s may interleave, as `pwrite`s do.
-fun writeAt(f : Fd, offset : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
+fun writeAt(f : FD, offset : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
     if !acquire(f) { return closed }
     let n = writeAll(f, fun(at) = IO.writeAt(f.number, offset + (at - from), bytes, at, to),
                      from, to)
@@ -180,8 +180,8 @@ fun writeAt(f : Fd, offset : Int, bytes : Array Byte, from : Int, to : Int) -> I
 --
 -- 0, or the negated `errno` of `close(2)` if it ran here; a failure in a
 -- `close(2)` that an operation finishing later runs is not reported to
--- anyone. 0 again for an `Fd` already closed.
-fun close(f : Fd) -> Int {
+-- anyone. 0 again for an `FD` already closed.
+fun close(f : FD) -> Int {
     let p = Prim.objectAddress(f)
     while True {
         let state = Prim.atomicLoad(p, fieldsAt)
@@ -205,7 +205,7 @@ fun close(f : Fd) -> Int {
 -- -- underneath -----------------------------------------------------------------------
 
 -- Take a reference, unless `f` is closed. Whether it was taken.
-fun acquire(f : Fd) -> Bool {
+fun acquire(f : FD) -> Bool {
     let p = Prim.objectAddress(f)
     while True {
         let state = Prim.atomicLoad(p, fieldsAt)
@@ -219,14 +219,14 @@ fun acquire(f : Fd) -> Bool {
 -- closed: 0, or the negated `errno` of that `close(2)`. Exactly one release
 -- sees the count reach 0 with the bit set, since no reference is taken once
 -- it is set and `close` holds one of its own while it sets it.
-fun release(f : Fd) -> Int {
-    let before = Prim.atomicAdd(Prim.objectAddress(f), fieldsAt, 0 - reference)
+fun release(f : FD) -> Int {
+    let before = Prim.atomicAdd(Prim.objectAddress(f), fieldsAt, -reference)
     if before - reference == closedBit { IO.close(f.number) } else { 0 }
 }
 
 -- Take `bit`'s lock and a reference with it, waiting for the lock if it is
 -- held, unless `f` is or becomes closed. Whether it was taken.
-fun lock(f : Fd, bit : Int, waited : Int) -> Bool {
+fun lock(f : FD, bit : Int, waited : Int) -> Bool {
     let p = Prim.objectAddress(f)
     let state = Prim.atomicLoad(p, fieldsAt)
     if Prim.intAnd(state, closedBit + bit) == 0 {
@@ -245,7 +245,7 @@ type Claim = Claim { var got : Bool }
 
 -- Under the scheduler's lock: take the lock if it is free, or mark it waited
 -- for. Whether to stop waiting -- because the lock was taken, or `f` closed.
-fun tryLock(f : Fd, bit : Int, waited : Int, claim : Claim) -> Bool {
+fun tryLock(f : FD, bit : Int, waited : Int, claim : Claim) -> Bool {
     let p = Prim.objectAddress(f)
     while True {
         let state = Prim.atomicLoad(p, fieldsAt)
@@ -267,7 +267,7 @@ fun tryLock(f : Fd, bit : Int, waited : Int, claim : Claim) -> Bool {
 -- Release `bit`'s lock and its reference, waking the tasks waiting for the
 -- lock if any may be, and closing the descriptor if this was the last
 -- reference to a closed `f`.
-fun unlock(f : Fd, bit : Int, waited : Int) -> Unit {
+fun unlock(f : FD, bit : Int, waited : Int) -> Unit {
     let p = Prim.objectAddress(f)
     var before = 0
     while True {
@@ -295,17 +295,17 @@ fun unlock(f : Fd, bit : Int, waited : Int) -> Unit {
 -- `write` until all of `from..to` is taken: `step(at)` writes from `at` and
 -- answers what the call did. Retried at once after a signal; 0 from a
 -- non-empty write, which would otherwise loop, is reported as `EIO`.
-fun writeAll(f : Fd, step : fun(Int) -> Int, from : Int, to : Int) -> Int {
+fun writeAll(f : FD, step : fun(Int) -> Int, from : Int, to : Int) -> Int {
     var at = from
     while at < to {
         let n = step(at)
-        if n == 0 - Sys.eintr { continue }
-        if n == 0 - Sys.eagain() {
+        if n == -Sys.eintr { continue }
+        if n == -Sys.eagain() {
             again()
             continue
         }
         if n < 0 { return n }
-        if n == 0 { return 0 - Sys.eio }
+        if n == 0 { return -Sys.eio }
         at = at + n
     }
     to - from

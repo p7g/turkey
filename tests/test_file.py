@@ -186,9 +186,34 @@ fun main() {
     }
 }
 """, tmp_path)
-    assert out == ["ok", "Right(héllo", ")", "7", "Left(InvalidUTF8)",
-                   "Left(Underlying(open missing: no such file or directory))",
+    assert out == ["ok", "Right(héllo", ")", "7", "Left(Left(InvalidUTF8))",
+                   "Left(Right(open missing: no such file or directory))",
                    "ok", "Right(bytes)", "0"]
+
+
+def test_a_layers_error_reads_as_whichever_side_failed(tmp_path):
+    (tmp_path / "bad").write_bytes(b"ok\xff")
+    (tmp_path / "short").write_bytes(b"ab")
+    out = lines("""
+fun main() {
+    for path in ["bad", "missing"] {
+        match File.readText(path) {
+            Right(_) -> print("text")
+            Left(e) -> print(message(e))
+        }
+    }
+    match IO.readExact(must(File.openRead("short")), IO.buffer(4), 4) {
+        Right(_) -> print("four bytes")
+        Left(e) -> print(message(e))
+    }
+    match IO.copy(must(File.openRead(".")), must(File.create("out", File.Truncate)), IO.buffer(4)) {
+        Right(_) -> print("copied")
+        Left(e) -> print(message(e))
+    }
+}
+""", tmp_path)
+    assert out == ["invalid UTF-8", "open missing: no such file or directory",
+                   "the input ended early", "read .: is a directory"]
 
 
 def test_readAll_reads_a_large_file_whole(tmp_path):

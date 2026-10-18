@@ -18,7 +18,7 @@ from tests.lang import binary, run
 HEADER = """\
 import System.File as File
 import System.IO as IO
-import System.Time as Time
+import Time.Instant as Instant
 
 fun report(r : Either IO.IOError a) -> String = match r {
     Right(_) -> "ok"
@@ -52,7 +52,7 @@ def test_a_stat_is_a_value(tmp_path):
     out = lines("""
 fun describe(r : Either IO.IOError File.Stat) -> String = match r {
     Right(s) -> show(s.kind) + " " + show(s.size) + " " + show(s.permissions) + " "
-                + show(s.modified)
+                + show(Instant.unixNanos(s.modified))
     Left(e) -> show(e.kind) + ": " + message(e)
 }
 
@@ -74,7 +74,7 @@ fun main() {
     print(report(File.stat(f)))
     -- The clock `modified` is counted on.
     let s = must(File.metadata("plain"))
-    print(Time.now() >= s.modified)
+    print(Instant.now() >= s.modified)
 }
 """, tmp_path)
     plain = os.stat(tmp_path / "plain")

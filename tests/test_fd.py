@@ -15,7 +15,8 @@ from tests.lang import run
 HEADER = """\
 import System.Sync as Sync
 import System.Task as Task
-import System.Time as Time
+import Time.Duration as Duration
+import Time.Stopwatch as Stopwatch
 import Turkey.FD as FD
 import Turkey.IO as IO
 import Turkey.Sys as Sys
@@ -172,8 +173,8 @@ fun main() {
         let closer = Task.spawn(fun() {
             while Sync.load(started) == 0 { Task.yield() }
             -- Long enough for the reader to be inside read(2).
-            let until = Time.monotonic() + 200_000_000
-            while Time.monotonic() < until {}
+            let clock = Stopwatch.start()
+            while Stopwatch.elapsed(clock) < Duration.millis(200) {}
             let closing = FD.close(f)
             let other = IO.open("fifo", Sys.readWrite, 0)
             let wrote = IO.write(number, bytes("ping"), 0, 4)
@@ -206,15 +207,15 @@ fun main() {
         })?
         let waiter = Task.spawn(fun() {
             while Sync.load(started) == 0 { Task.yield() }
-            let until = Time.monotonic() + 100_000_000
-            while Time.monotonic() < until {}
+            let clock = Stopwatch.start()
+            while Stopwatch.elapsed(clock) < Duration.millis(100) {}
             let into = Array.filled(16, Byte.truncate(0))
             FD.read(f, into, 0, 16) == FD.closed
         })?
         let closer = Task.spawn(fun() {
             while Sync.load(started) == 0 { Task.yield() }
-            let until = Time.monotonic() + 300_000_000
-            while Time.monotonic() < until {}
+            let clock = Stopwatch.start()
+            while Stopwatch.elapsed(clock) < Duration.millis(300) {}
             let closing = FD.close(f)
             let _ = IO.write(number, bytes("ping"), 0, 4)
             closing

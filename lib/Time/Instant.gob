@@ -1,0 +1,82 @@
+module Time.Instant (
+    Instant, now, fromUnixNanos, unixNanos, after, elapsed, parse,
+)
+
+-- A point on the global timeline, with no calendar and no time zone: when a
+-- log line was written or a file changed. It has no year or hour of its own;
+-- those depend on a zone.
+--
+-- Stored as nanoseconds since 1970-01-01T00:00Z, the count `System.Time.now`
+-- returns and file times use, which spans 1677-09-21 to 2262-04-11. Arithmetic
+-- past that panics, as `Int` arithmetic does. The calendar types have no such
+-- limit; it is the instant's alone.
+--
+-- Leap seconds are not counted: like the system clock, an instant treats every
+-- day as 86,400 seconds.
+
+import System.Time as Clock
+import Time.Calendar as Calendar
+import Time.Date as Date
+import Time.Duration (Duration)
+import Time.Duration as Duration
+import Time.Iso as Iso
+import Time.TimeOfDay as TimeOfDay
+
+type Instant = Instant(Int)
+
+let nanosPerSecond : Int = 1000000000
+let nanosPerDay : Int = 86400 * nanosPerSecond
+
+-- The system clock's reading. The clock can be set back or forward while a
+-- program runs, so two readings can go backwards: for telling the time, not
+-- for measuring how long something took.
+fun now() -> Instant = Instant(Clock.now())
+
+fun fromUnixNanos(n : Int) -> Instant = Instant(n)
+
+fun unixNanos(Instant(n)) -> Int = n
+
+fun after(Instant(n), d : Duration) -> Instant = Instant(n + Duration.toNanos(d))
+
+-- The time from `from` to `to`: negative if `to` is earlier.
+fun elapsed(Instant(from), Instant(to)) -> Duration = Duration.nanos(to - from)
+
+instance Eq Instant { fun eq(a, b) = unixNanos(a) == unixNanos(b) }
+
+instance Ord Instant { fun lt(a, b) = unixNanos(a) < unixNanos(b) }
+
+instance Hash Instant { fun hashInto(i, h) = hashInto(unixNanos(i), h) }
+
+-- RFC 3339, in UTC: `2026-10-18T18:03:07.52Z`.
+instance Show Instant {
+    fun show(i) {
+        let n = unixNanos(i)
+        let day = Option.expect(Date.fromEpochDays(Calendar.floorDiv(n, nanosPerDay)), "in range")
+        let time = Option.expect(TimeOfDay.fromNanosOfDay(Int.mod(n, nanosPerDay)), "in range")
+        show(day) + "T" + show(time) + "Z"
+    }
+}
+
+-- RFC 3339: a date, `T`, a time, and a UTC offset, which is required. Text
+-- without one names a wall-clock reading, not an instant. `None` if the
+-- instant is outside the range above.
+fun parse(s : String) -> Option Instant {
+    let r = Iso.reader(s)
+    let day = Date.read(r)?
+    Iso.expect(r, 'T')?
+    let time = TimeOfDay.read(r)?
+    let offset = Iso.offset(r)?
+    if !Iso.finished(r) { return None }
+    let nanos = TimeOfDay.nanosOfDay(time)
+    let seconds = Date.epochDays(day) * 86400 - offset + nanos / nanosPerSecond
+    -- Before 1970 the whole seconds alone can be past the range when the
+    -- instant is not, in the earliest second there is; so a negative count is
+    -- scaled one second short and the fraction counted back from it.
+    let fraction = nanos % nanosPerSecond
+    let n = if seconds < 0 && fraction != 0 {
+        Int.addChecked(Int.mulChecked(seconds + 1, nanosPerSecond)?, fraction - nanosPerSecond)?
+    } else {
+        Int.addChecked(Int.mulChecked(seconds, nanosPerSecond)?, fraction)?
+    }
+    Some(Instant(n))
+}

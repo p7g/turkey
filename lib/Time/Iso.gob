@@ -1,5 +1,6 @@
 module Time.Iso (
-    Reader, reader, finished, accept, expect, sign, digits, someDigits, fraction,
+    Reader, reader, finished, looking, accept, expect, skip, letter, upTo, sign, digits, someDigits,
+    fraction,
     offset, padded, year, fractionText,
 )
 
@@ -17,6 +18,38 @@ fun finished(r : Reader) -> Bool = r.at == len(r.text)
 
 fun peek(r : Reader) -> Option Int =
     if finished(r) { None } else { Some(Byte.toInt(r.text[r.at])) }
+
+-- Whether `c` is next, without consuming it.
+fun looking(r : Reader, c : Char) -> Bool = peek(r) == Some(Char.toInt(c))
+
+-- Consumes whatever byte is next, if there is one.
+fun skip(r : Reader) -> Option Unit {
+    if finished(r) { return None }
+    r.at = r.at + 1
+    Some(())
+}
+
+-- Consumes an ASCII letter if one is next.
+fun letter(r : Reader) -> Bool = match peek(r) {
+    Some(b) -> {
+        if (b >= 65 && b <= 90) || (b >= 97 && b <= 122) {
+            r.at = r.at + 1
+            True
+        } else {
+            False
+        }
+    }
+    None -> False
+}
+
+-- The text up to the next `c`, which is not consumed; `None` if there is no
+-- `c`, or the text is empty.
+fun upTo(r : Reader, c : Char) -> Option String {
+    let start = r.at
+    while !looking(r, c) { skip(r)? }
+    if r.at == start { return None }
+    String.fromBytes(Array.slice(r.text, start, r.at))
+}
 
 -- Consumes `c` if it is next.
 fun accept(r : Reader, c : Char) -> Bool {
@@ -83,8 +116,9 @@ fun fraction(r : Reader) -> Option Int {
     Some(nanos)
 }
 
--- A UTC offset in seconds: `Z`, or a sign and `HH:MM` under 24 hours, as
--- RFC 3339 writes one.
+-- A UTC offset in seconds: `Z`, or a sign and `HH:MM` under 24 hours as
+-- RFC 3339 writes one, optionally with `:SS` for the offsets of old local
+-- mean times.
 fun offset(r : Reader) -> Option Int {
     if accept(r, 'Z') || accept(r, 'z') { return Some(0) }
     let negative = accept(r, '-')
@@ -92,8 +126,9 @@ fun offset(r : Reader) -> Option Int {
     let h = digits(r, 2)?
     expect(r, ':')?
     let m = digits(r, 2)?
-    if h > 23 || m > 59 { return None }
-    let seconds = (h * 60 + m) * 60
+    let s = if accept(r, ':') { digits(r, 2)? } else { 0 }
+    if h > 23 || m > 59 || s > 59 { return None }
+    let seconds = (h * 60 + m) * 60 + s
     Some(if negative { -seconds } else { seconds })
 }
 

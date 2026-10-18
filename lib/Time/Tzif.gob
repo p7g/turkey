@@ -1,0 +1,140 @@
+module Time.Tzif (Table, parse, offsetAt, transitions)
+
+-- Time zone files, as the system keeps them under `/usr/share/zoneinfo`: the
+-- TZif format, version 2 or later.
+--
+-- Only what an offset needs is kept: the transition times, the offset after
+-- each, the offset before the first, and the POSIX rule in the footer that
+-- takes over after the last. The 32-bit block of the file is skipped, and so
+-- are abbreviations, leap-second records and the standard/wall indicators,
+-- since ISO text never uses them. A version 1 file, which has no 64-bit block
+-- and no footer, is not read.
+
+import Time.Posix as Posix
+
+type Table = Table { at : Array Int, offsets : Array Int, initial : Int, after : Option Posix.Rule }
+
+fun parse(bytes : Array Byte) -> Option Table {
+    -- The first header, whose counts size the 32-bit block to skip.
+    let first = header(bytes, 0)?
+    let (_, _, leaps, times, types, chars) = first
+    let skipped = 44 + times * 5 + types * 6 + chars + leaps * 8 + skipCounts(first)
+    -- The second header, and the 64-bit block it describes.
+    let second = header(bytes, skipped)?
+    let (isUt, isStd, leaps2, times2, types2, chars2) = second
+    let base = skipped + 44
+    let indices = base + times2 * 8
+    let typeTable = indices + times2
+    let footerAt = typeTable + types2 * 6 + chars2 + leaps2 * 12 + isStd + isUt
+    if footerAt > len(bytes) || types2 == 0 { return None }
+
+    let offsets = Array.filled(types2, 0)
+    for var i = 0; i < types2; i = i + 1 {
+        let offset = signed32(bytes, typeTable + i * 6)
+        if offset <= -26 * 3600 || offset >= 26 * 3600 { return None }
+        offsets[i] = offset
+    }
+    let at = Array.init(times2, fun(i) = signed64(bytes, base + i * 8))
+    let types = Array.init(times2, fun(i) = Byte.toInt(bytes[indices + i]))
+    for var i = 0; i < times2; i = i + 1 {
+        if types[i] >= types2 || (i > 0 && at[i] <= at[i - 1]) { return None }
+    }
+    let after = Array.map(types, fun(t) = offsets[t])
+    Some(Table { at, offsets = after, initial = offsets[0], after = footer(bytes, footerAt)? })
+}
+
+-- The counts of a header at `start`: `isutcnt`, `isstdcnt`, `leapcnt`,
+-- `timecnt`, `typecnt`, `charcnt`, after the magic `TZif`, a version from `2`
+-- up, and 15 reserved bytes.
+fun header(bytes : Array Byte, start : Int) -> Option (Int, Int, Int, Int, Int, Int) {
+    if start + 44 > len(bytes) { return None }
+    let magic = [84, 90, 105, 102]
+    for var i = 0; i < 4; i = i + 1 {
+        if Byte.toInt(bytes[start + i]) != magic[i] { return None }
+    }
+    if Byte.toInt(bytes[start + 4]) < 50 { return None }
+    let count = fun(i) = signed32(bytes, start + 20 + i * 4)
+    let counts = (count(0), count(1), count(2), count(3), count(4), count(5))
+    let (a, b, c, d, e, f) = counts
+    if a < 0 || b < 0 || c < 0 || d < 0 || e < 0 || f < 0 { return None }
+    Some(counts)
+}
+
+-- The bytes of the indicator arrays, which follow the rest of a block.
+fun skipCounts(counts : (Int, Int, Int, Int, Int, Int)) -> Int {
+    let (isUt, isStd, _, _, _, _) = counts
+    isUt + isStd
+}
+
+-- The rule between the newlines that end the file: `None` inside the result
+-- for an empty one, and `None` outright if it is not a rule.
+fun footer(bytes : Array Byte, start : Int) -> Option (Option Posix.Rule) {
+    if start >= len(bytes) || Byte.toInt(bytes[start]) != 10 { return None }
+    var end = start + 1
+    while end < len(bytes) && Byte.toInt(bytes[end]) != 10 { end = end + 1 }
+    if end == start + 1 { return Some(None) }
+    let text = String.fromBytes(Array.slice(bytes, start + 1, end))?
+    Some(Some(Posix.parse(text)?))
+}
+
+fun unsigned(bytes : Array Byte, at : Int, count : Int) -> Int {
+    var n = 0
+    for var i = 0; i < count; i = i + 1 { n = Int.or(Int.shl(n, 8), Byte.toInt(bytes[at + i])) }
+    n
+}
+
+fun signed32(bytes : Array Byte, at : Int) -> Int {
+    let n = unsigned(bytes, at, 4)
+    if n >= 0x8000_0000 { n - 0x1_0000_0000 } else { n }
+}
+
+-- Eight bytes fill an `Int`, so the shifts produce the sign themselves.
+fun signed64(bytes : Array Byte, at : Int) -> Int = unsigned(bytes, at, 8)
+
+-- The offset in force at `t`, in Unix seconds. Before the first transition it
+-- is the first time type's; after the last, the footer's rule's if there is
+-- one. With no transitions at all, the footer's rule holds throughout.
+fun offsetAt(table : Table, t : Int) -> Int {
+    let n = len(table.at)
+    if n == 0 || t >= table.at[n - 1] {
+        if let Some(rule) = table.after { return Posix.offsetAt(rule, t) }
+    }
+    if n == 0 || t < table.at[0] { return table.initial }
+    -- The last transition at or before `t`.
+    var low = 0
+    var high = n - 1
+    while low < high {
+        let middle = (low + high + 1) / 2
+        if table.at[middle] <= t { low = middle } else { high = middle - 1 }
+    }
+    table.offsets[low]
+}
+
+-- The transitions from `from` up to but not including `to`, in order, each as
+-- (second, offset before, offset after), the footer's rule's included.
+fun transitions(table : Table, from : Int, to : Int) -> Array (Int, Int, Int) {
+    let out = Vec.new(4)
+    let n = len(table.at)
+    for var i = 0; i < n; i = i + 1 {
+        let t = table.at[i]
+        if t >= from && t < to {
+            let before = if i == 0 { table.initial } else { table.offsets[i - 1] }
+            Vec.push(out, (t, before, table.offsets[i]))
+        }
+    }
+    if let Some(rule) = table.after {
+        let last = if n == 0 { Int.minValue() } else { table.at[n - 1] }
+        let firstYear = yearOf(if from > last { from } else { last })
+        for var y = firstYear - 1; y <= yearOf(to) + 1; y = y + 1 {
+            for transition in Posix.transitions(rule, y) {
+                let (t, _, _) = transition
+                if t > last && t >= from && t < to { Vec.push(out, transition) }
+            }
+        }
+    }
+    Vec.toArray(out)
+}
+
+-- The year a Unix second falls in, in UTC, near enough to pick which years'
+-- rules to evaluate.
+fun yearOf(t : Int) -> Int = 1970 + t / 31556952

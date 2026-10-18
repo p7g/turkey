@@ -1,0 +1,143 @@
+-- Zoned date-times: offsets from POSIX rules and TZif files, what a wall-clock
+-- reading names when the clocks skip or repeat it, calendar shifts against
+-- elapsed time across a change to daylight saving time, and RFC 9557 text.
+--
+-- The TZif files under zoneinfo/ are tzdata 2026c's, read here directly so
+-- that the test does not depend on the system's copy. Test/Slim is written
+-- by `zic -b slim` from
+--
+--     Rule  Test  2007  max  -  Mar  Sun>=8  2:00  1:00  D
+--     Rule  Test  2007  max  -  Nov  Sun>=1  2:00  0     S
+--     Zone  Test/Slim  -5:00  Test  E%sT
+--
+-- and has a single transition: every later one comes from its footer.
+
+import System.File as File
+import System.IO as IO
+import Time
+
+fun tzif(name) = match File.readAll("zoneinfo/" + name) {
+    Right(bytes) -> Option.expect(Zone.fromTzif(name, IO.bytes(bytes)), "not a TZif file")
+    Left(e) -> error(message(e))
+}
+
+fun at(y, m, d, h, mi) = PlainDateTime.new(Option.expect(Date.new(y, m, d), "date"),
+                                          Option.expect(TimeOfDay.new(h, mi, 0), "time"))
+
+fun describe(r) = match r {
+    Unique(dt) -> "unique " + show(dt)
+    Skipped { forward, backward, at } ->
+        "skipped: forward " + show(forward) + ", backward " + show(backward) + ", at " + show(at)
+    Repeated { earlier, later } -> "repeated: " + show(earlier) + " then " + show(later)
+}
+
+fun lookup(name) = match Zone.named(name) {
+    Right(z) -> show(z)
+    Left(e) -> message(e)
+}
+
+fun later(r) = match r {
+    Repeated { later, .. } -> later
+    _ -> error("not a repeated reading")
+}
+
+fun main() {
+    let east = Option.expect(Zone.posix("EST5EDT,M3.2.0,M11.1.0"), "rule")
+
+    -- Readings around both transitions of 2026.
+    print(describe(DateTime.resolve(at(2026, Mar, 8, 1, 30), east)))
+    print(describe(DateTime.resolve(at(2026, Mar, 8, 2, 30), east)))
+    print(describe(DateTime.resolve(at(2026, Nov, 1, 1, 30), east)))
+    print(describe(DateTime.resolve(at(2026, Nov, 1, 2, 30), east)))
+    print(DateTime.of(at(2026, Mar, 8, 2, 30), east))
+    print(DateTime.of(at(2026, Nov, 1, 1, 30), east))
+
+    -- One day later on the calendar against 24 hours later.
+    let evening = DateTime.of(at(2026, Mar, 7, 21, 0), east)
+    print(shift(evening, days(1)))
+    print(after(evening, hours(24)))
+    print(elapsed(evening, shift(evening, days(1))))
+    -- A shift that lands in the gap moves forward by its length.
+    print(shift(DateTime.of(at(2026, Mar, 7, 2, 30), east), days(1)))
+    -- A shift keeps the second occurrence of a repeated reading if it can.
+    let second = later(DateTime.resolve(at(2026, Nov, 1, 1, 30), east))
+    print(shift(second, days(0)))
+    print(shift(second, weeks(1)))
+    print(after(second, minutes(-30)))
+
+    -- The calendar and clock of a zoned value, through the shared classes.
+    print(show(year(evening)) + " " + show(month(evening)) + " " + show(day(evening)) + " "
+          + show(weekday(evening)) + " " + show(hour(evening)))
+    print(DateTime.plain(evening))
+    print(DateTime.offset(evening))
+    print(DateTime.zone(evening))
+
+    -- The same instant in another zone, and equality and order.
+    let utcEvening = DateTime.inZone(evening, Zone.utc)
+    print(utcEvening)
+    print(utcEvening == evening)
+    print(DateTime.instant(utcEvening) == DateTime.instant(evening))
+    print(elapsed(evening, utcEvening))
+    print(utcEvening < evening || evening < utcEvening)
+    print(evening < after(evening, nanos(1)))
+    let kolkata = Zone.fixed(Option.expect(Offset.parse("+05:30"), "offset"))
+    print(DateTime.inZone(evening, kolkata))
+    print(elapsed(DateTime.instant(evening), DateTime.inZone(evening, kolkata)))
+
+    -- A southern rule, which starts in October and ends in April.
+    let sydney = Option.expect(Zone.posix("AEST-10AEDT,M10.1.0,M4.1.0/3"), "rule")
+    print(describe(DateTime.resolve(at(2026, Oct, 4, 2, 30), sydney)))
+    print(describe(DateTime.resolve(at(2026, Apr, 5, 2, 30), sydney)))
+    print(DateTime.of(at(2026, Jan, 15, 12, 0), sydney))
+    print(DateTime.of(at(2026, Jul, 15, 12, 0), sydney))
+
+    -- TZif files: a full one, a slim one that leaves everything to its
+    -- footer, a half-hour change, a midnight gap, and a skipped day.
+    let newYork = tzif("America/New_York")
+    print(DateTime.of(at(1918, Mar, 31, 2, 30), newYork))
+    print(DateTime.of(at(1883, Nov, 18, 12, 0), newYork))
+    print(DateTime.of(at(2026, Jul, 4, 12, 0), newYork))
+    print(DateTime.of(at(2150, Jul, 4, 12, 0), newYork))
+    let slim = tzif("Test/Slim")
+    print(DateTime.of(at(2026, Jul, 4, 12, 0), slim))
+    print(describe(DateTime.resolve(at(2040, Mar, 11, 2, 30), slim)))
+    print(describe(DateTime.resolve(at(2040, Nov, 4, 1, 30), slim)))
+    let lordHowe = tzif("Australia/Lord_Howe")
+    print(describe(DateTime.resolve(at(2026, Apr, 5, 1, 45), lordHowe)))
+    print(describe(DateTime.resolve(at(2026, Oct, 4, 2, 15), lordHowe)))
+    let saoPaulo = tzif("America/Sao_Paulo")
+    let election = DateTime.of(at(2018, Nov, 4, 15, 0), saoPaulo)
+    print(DateTime.startOfDay(election))
+    print(describe(DateTime.resolve(at(2018, Nov, 4, 0, 0), saoPaulo)))
+    print(DateTime.startOfDay(DateTime.of(at(2019, Feb, 16, 23, 0), saoPaulo)))
+    let apia = tzif("Pacific/Apia")
+    print(describe(DateTime.resolve(at(2011, Dec, 30, 12, 0), apia)))
+    print(after(DateTime.of(at(2011, Dec, 29, 23, 0), apia), hours(2)))
+
+    -- RFC 9557 text: zones as offsets or UTC, a written offset that must
+    -- agree with the zone, and Z, which states only the instant.
+    for s in ["2026-10-18T14:03:07.52+05:30[+05:30]", "2026-10-18T08:33:07Z[UTC]",
+              "2026-10-18T08:33:07Z[+05:30]", "2026-10-18T14:03+05:30[!+05:30]",
+              "2026-10-18T14:03:00-04:56:02[-04:56:02]"] {
+        print(s + " -> " + show(DateTime.parse(s)))
+    }
+    for s in ["2026-10-18T14:03:07+05:30", "2026-10-18T14:03:07[+05:30]",
+              "2026-10-18T14:03:07+01:00[+05:30]", "2026-10-18T14:03:07+05:30[]",
+              "2026-10-18T14:03:07+05:30[+05:30][u-ca=iso8601]", "2026-10-18T14:03:07+05:30[+05:30"] {
+        print("'" + s + "' -> " + show(DateTime.parse(s)))
+    }
+
+    -- Offsets, and the zone names that are refused before any file is read.
+    print(Offset.parse("-00:30"))
+    print(Offset.parse("+24:00"))
+    print(Offset.fromSeconds(-93599))
+    print(Offset.fromSeconds(93600))
+    for name in ["../etc/passwd", "/etc/localtime", "America//New_York", "America/./New_York",
+                 "", "Europe/Paris.old", "Etc/GMT+5 "] {
+        print("'" + name + "' -> " + lookup(name))
+    }
+    for rule in ["EST5EDT", "<+0330>-3:30", "UTC0", "CET-1CEST,M3.5.0,M10.5.0/3",
+                 "<-03>3<-02>,M3.5.0/-2,M10.5.0/-1", "EST", "EST5EDT,M13.1.0,M11.1.0", "5"] {
+        print(rule + " -> " + show(Option.map(Zone.posix(rule), Zone.id)))
+    }
+}

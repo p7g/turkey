@@ -10,7 +10,7 @@ module System.File (
     openReadIn, createIn,
     createDir, createDirIn, createDirAll, createDirAllIn,
     removeFile, removeFileIn, removeDir, removeDirIn, removeTree, removeTreeIn,
-    rename, renameIn, temporaryDir,
+    rename, renameIn, readLink, readLinkIn, temporaryDir,
     stdin, stderr,
 )
 
@@ -626,6 +626,31 @@ fun renameIn(fromDir : Dir, from : String, toDir : Dir, to : String) -> Either I
     let r = FD.using(fromDir.fd, fun(fromNumber) =
         FD.using(toDir.fd, fun(toNumber) = Calls.renameAt(fromNumber, f, toNumber, t)))
     unitIn(fromDir, "rename", from, r)
+}
+
+-- What the symbolic link `path` points to, as it is written in the link:
+-- possibly relative, and not checked to exist. `NotFound` if there is no such
+-- link, and `Other` with `EINVAL` if `path` is not one, or if what it points
+-- to is not UTF-8.
+fun readLink(path : String) -> Either IOError String = readLinkIn(working, path)
+
+fun readLinkIn(d : Dir, name : String) -> Either IOError String {
+    let c = Calls.cPath(name)
+    var room = 256
+    loop {
+        let into = Array.filled(room, Byte.truncate(0))
+        let r = FD.using(d.fd, fun(n) = Calls.readLinkAt(n, c, into))
+        if r < 0 { return Left(failedIn(d, "readlink", name, r)) }
+        -- A target that fills the room may have been cut short: try again
+        -- with twice the room until it does not.
+        if r < room {
+            return match String.fromBytes(Array.slice(into, 0, r)) {
+                Some(target) -> Right(target)
+                None -> Left(failedIn(d, "readlink", name, -Sys.einval))
+            }
+        }
+        room = room * 2
+    }
 }
 
 -- A new, empty directory, made for this caller alone (permissions 0o700), in

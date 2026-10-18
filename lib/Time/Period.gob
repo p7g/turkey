@@ -1,0 +1,94 @@
+module Time.Period (Period(..), years, months, weeks, days, zero, parse)
+
+-- An amount of calendar time: whole months and whole days, each counted on
+-- the calendar rather than as a fixed length. One month from January 31 is
+-- February 28 or 29; one day across a change to daylight saving time is 23 or
+-- 25 hours. It is not an amount of elapsed time, which has a fixed length.
+--
+-- Years and weeks are not stored. A year is twelve months and a week is seven
+-- days in every case the ISO calendar has, so `years(1) == months(12)` and
+-- shifting by either always gives the same date. Keeping them as fields would
+-- only add ways to write the same period.
+--
+-- The fields need not share a sign. Shifting applies the months first, then
+-- the days, so `months(1) + days(-1)` from January 31 is February 27 or 28.
+--
+-- There is deliberately no `Ord`: whether a month is longer than 30 days
+-- depends on which month, so periods have no order that holds everywhere.
+
+import Time.Iso as Iso
+
+type Period = Period { months : Int, days : Int }
+
+fun years(n : Int) -> Period = Period { months = n * 12, days = 0 }
+fun months(n : Int) -> Period = Period { months = n, days = 0 }
+fun weeks(n : Int) -> Period = Period { months = 0, days = n * 7 }
+fun days(n : Int) -> Period = Period { months = 0, days = n }
+
+let zero : Period = Period { months = 0, days = 0 }
+
+instance Eq Period { fun eq(a, b) = a.months == b.months && a.days == b.days }
+
+instance Hash Period {
+    fun hashInto(p, h) {
+        hashInto(p.months, h)
+        hashInto(p.days, h)
+    }
+}
+
+instance Add Period {
+    fun add(a, b) = Period { months = a.months + b.months, days = a.days + b.days }
+}
+
+instance Sub Period {
+    fun sub(a, b) = Period { months = a.months - b.months, days = a.days - b.days }
+}
+
+instance Neg Period { fun neg(p) = Period { months = -p.months, days = -p.days } }
+
+-- ISO 8601: `P1Y2M10D`, `P0D` for zero. A negative field carries its own sign,
+-- `P-1Y-2M`, since the fields need not agree; a period that is negative
+-- throughout still reads that way rather than as `-P1Y2M`, so that every
+-- period has one spelling.
+instance Show Period {
+    fun show(p) {
+        if p.months == 0 && p.days == 0 { return "P0D" }
+        let years = p.months / 12
+        let months = p.months % 12
+        var out = "P"
+        if years != 0 { out = out + Int.toString(years) + "Y" }
+        if months != 0 { out = out + Int.toString(months) + "M" }
+        if p.days != 0 { out = out + Int.toString(p.days) + "D" }
+        out
+    }
+}
+
+-- ISO 8601 date-based durations: `P1Y2M3W4D`, with any subset of the fields in
+-- that order, each optionally signed, and an optional sign before the `P` that
+-- negates the whole. Weeks become days. A time part (`T…`) is not a period.
+fun parse(s : String) -> Option Period {
+    let r = Iso.reader(s)
+    let sign = Iso.sign(r)
+    Iso.expect(r, 'P')?
+    var total = zero
+    var next = 0
+    if Iso.finished(r) { return None }
+    while !Iso.finished(r) {
+        -- Two statements, since the operand of `?` runs before the rest of
+        -- its statement: the sign has to be read first.
+        let fieldSign = Iso.sign(r)
+        let amount = fieldSign * Iso.someDigits(r)?
+        var field = None
+        while next < len(units) && field == None {
+            let (unit, make) = units[next]
+            if Iso.accept(r, unit) { field = Some(make(amount)) }
+            next = next + 1
+        }
+        total = total + field?
+    }
+    Some(if sign < 0 { -total } else { total })
+}
+
+-- The fields `parse` accepts, in the order they must appear.
+let units : Array (Char, fun(Int) -> Period) =
+    [('Y', years), ('M', months), ('W', weeks), ('D', days)]

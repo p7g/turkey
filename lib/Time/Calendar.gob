@@ -1,0 +1,63 @@
+module Time.Calendar (
+    minYear, maxYear, isLeapYear, daysInMonth, daysFromCivil, civilFromDays, floorDiv,
+)
+
+-- Day numbers of the proleptic Gregorian calendar: the conversion between a
+-- (year, month, day) and the count of days since 1970-01-01, which is how
+-- `Date` is stored. Everything here is total arithmetic on `Int`; validating a
+-- date is the caller's job.
+--
+-- The conversions are Howard Hinnant's `days_from_civil` and `civil_from_days`.
+-- They shift the year to start on March 1, so that the leap day is the last
+-- day of its year and the month lengths from March on follow the line
+-- `(153 * m + 2) / 5`, then count in 400-year eras of exactly 146,097 days.
+-- Each era is handled with non-negative numbers only, which is why every
+-- division of a value that can be negative goes through `floorDiv`: `/` rounds
+-- toward zero, and would put day -1 in the wrong era.
+
+import Time.Month (Month(..))
+import Time.Month as Month
+
+-- The years a `Date` may have: four digits either side of year 0, the range
+-- ISO 8601 writes without an agreed expansion.
+let minYear : Int = -9999
+let maxYear : Int = 9999
+
+fun isLeapYear(year : Int) -> Bool =
+    Int.mod(year, 4) == 0 && (Int.mod(year, 100) != 0 || Int.mod(year, 400) == 0)
+
+fun daysInMonth(year : Int, m : Month) -> Int = match m {
+    Feb -> if isLeapYear(year) { 29 } else { 28 }
+    Apr | Jun | Sep | Nov -> 30
+    _ -> 31
+}
+
+-- Rounds toward negative infinity, unlike `/`.
+fun floorDiv(a : Int, b : Int) -> Int = (a - Int.mod(a, b)) / b
+
+-- Days since 1970-01-01 of a valid date.
+fun daysFromCivil(year : Int, m : Month, day : Int) -> Int {
+    let month = Month.number(m)
+    let y = if month <= 2 { year - 1 } else { year }
+    let era = floorDiv(y, 400)
+    let yearOfEra = y - era * 400
+    let shifted = if month > 2 { month - 3 } else { month + 9 }
+    let dayOfYear = (153 * shifted + 2) / 5 + day - 1
+    let dayOfEra = yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
+    era * 146097 + dayOfEra - 719468
+}
+
+-- The date `days` after 1970-01-01, as (year, month, day).
+fun civilFromDays(days : Int) -> (Int, Month, Int) {
+    let z = days + 719468
+    let era = floorDiv(z, 146097)
+    let dayOfEra = z - era * 146097
+    let yearOfEra =
+        (dayOfEra - dayOfEra / 1460 + dayOfEra / 36524 - dayOfEra / 146096) / 365
+    let dayOfYear = dayOfEra - (365 * yearOfEra + yearOfEra / 4 - yearOfEra / 100)
+    let shifted = (5 * dayOfYear + 2) / 153
+    let day = dayOfYear - (153 * shifted + 2) / 5 + 1
+    let month = if shifted < 10 { shifted + 3 } else { shifted - 9 }
+    let year = yearOfEra + era * 400 + (if month <= 2 { 1 } else { 0 })
+    (year, Option.expect(Month.fromNumber(month), "civilFromDays: month out of range"), day)
+}

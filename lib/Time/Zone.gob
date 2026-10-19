@@ -1,6 +1,6 @@
 module Time.Zone (
     Zone, ZoneError(..), utc, fixed, posix, fromTzif, named, system, id, offsetAt,
-    offsetSecondsAt, transitions,
+    offsetAtSecond, transitions,
 )
 
 -- A time zone: the rules that say what the clocks read at each instant in a
@@ -15,8 +15,9 @@ import System.Env as Env
 import System.File as File
 import System.IO as IO
 import System.Sync as Sync
+import Time.Frame (Transition, UnixSeconds)
+import Time.Frame as Frame
 import Time.Instant (Instant)
-import Time.Instant as Instant
 import Time.Offset (Offset)
 import Time.Offset as Offset
 import Time.Posix as Posix
@@ -25,7 +26,7 @@ import Turkey.Buffer as Buf
 
 type Zone = Zone { id : String, rules : Rules }
 
-type Rules = Fixed(Int) | Posix(Posix.Rule) | Table(Tzif.Table)
+type Rules = Fixed(Offset) | Posix(Posix.Rule) | Table(Tzif.Table)
 
 -- Why a zone could not be had: an id with characters or components no zone
 -- name has; no file for it; a file that could not be read, or is not a TZif
@@ -48,13 +49,10 @@ instance Error ZoneError {
 
 instance Show ZoneError { fun show(e) = message(e) }
 
-let utc : Zone = Zone { id = "UTC", rules = Fixed(0) }
+let utc : Zone = Zone { id = "UTC", rules = Fixed(Offset.utc) }
 
 -- The zone always `offset` from UTC, named by the offset: `+05:30`.
-fun fixed(offset : Offset) -> Zone {
-    let n = Offset.toSeconds(offset)
-    Zone { id = Offset.text(n), rules = Fixed(n) }
-}
+fun fixed(offset : Offset) -> Zone = Zone { id = show(offset), rules = Fixed(offset) }
 
 -- The zone a POSIX `TZ` rule describes, `EST5EDT,M3.2.0,M11.1.0`, named by
 -- the rule's text. Such an id cannot appear in RFC 9557 text, so a `DateTime`
@@ -76,33 +74,24 @@ instance Hash Zone { fun hashInto(z, h) = hashInto(z.id, h) }
 
 instance Show Zone { fun show(z) = z.id }
 
-fun offsetAt(z : Zone, i : Instant) -> Offset =
-    Option.expect(Offset.fromSeconds(offsetSecondsAt(z, unixSeconds(i))), "offset in range")
+fun offsetAt(z : Zone, i : Instant) -> Offset = offsetAtSecond(z, Frame.fromInstant(i))
 
-fun unixSeconds(i : Instant) -> Int {
-    let n = Instant.unixNanos(i)
-    let q = n / 1000000000
-    if n % 1000000000 < 0 { q - 1 } else { q }
-}
-
--- The offset in force at the Unix second `t`, in seconds.
-fun offsetSecondsAt(z : Zone, t : Int) -> Int = match z.rules {
-    Fixed(n) -> n
+-- The offset in force at `t`, which need not be a second an `Instant` can
+-- hold.
+fun offsetAtSecond(z : Zone, t : UnixSeconds) -> Offset = match z.rules {
+    Fixed(o) -> o
     Posix(r) -> Posix.offsetAt(r, t)
     Table(table) -> Tzif.offsetAt(table, t)
 }
 
--- The transitions from the Unix second `from` up to but not including `to`,
--- in order, each as (second, offset before, offset after).
-fun transitions(z : Zone, from : Int, to : Int) -> Array (Int, Int, Int) = match z.rules {
+-- The transitions from `from` to `to`, both included, in order.
+fun transitions(z : Zone, from : UnixSeconds, to : UnixSeconds) -> Array Transition = match z.rules {
     Fixed(_) -> []
     Posix(r) -> {
         let out = Vec.new(4)
-        let first = 1970 + from / 31556952
-        for var y = first - 1; y <= 1970 + to / 31556952 + 1; y = y + 1 {
+        for var y = Frame.year(from) - 1; y <= Frame.year(to) + 1; y = y + 1 {
             for transition in Posix.transitions(r, y) {
-                let (t, _, _) = transition
-                if t >= from && t < to { Vec.push(out, transition) }
+                if transition.at >= from && transition.at <= to { Vec.push(out, transition) }
             }
         }
         Vec.toArray(out)

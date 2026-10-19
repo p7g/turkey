@@ -10,9 +10,18 @@ module Time.Tzif (Table, parse, offsetAt, transitions)
 -- since ISO text never uses them. A version 1 file, which has no 64-bit block
 -- and no footer, is not read.
 
+import Time.Frame (Transition(..), UnixSeconds)
+import Time.Frame as Frame
+import Time.Offset (Offset)
+import Time.Offset as Offset
 import Time.Posix as Posix
 
-type Table = Table { at : Array Int, offsets : Array Int, initial : Int, after : Option Posix.Rule }
+type Table = Table {
+    at : Array UnixSeconds,
+    offsets : Array Offset,
+    initial : Offset,
+    after : Option Posix.Rule,
+}
 
 fun parse(bytes : Array Byte) -> Option Table {
     -- The first header, whose counts size the 32-bit block to skip.
@@ -28,13 +37,11 @@ fun parse(bytes : Array Byte) -> Option Table {
     let footerAt = typeTable + types2 * 6 + chars2 + leaps2 * 12 + isStd + isUt
     if footerAt > len(bytes) || types2 == 0 { return None }
 
-    let offsets = Array.filled(types2, 0)
+    let offsets = Array.filled(types2, Offset.utc)
     for var i = 0; i < types2; i = i + 1 {
-        let offset = signed32(bytes, typeTable + i * 6)
-        if offset <= -26 * 3600 || offset >= 26 * 3600 { return None }
-        offsets[i] = offset
+        offsets[i] = Offset.fromSeconds(signed32(bytes, typeTable + i * 6))?
     }
-    let at = Array.init(times2, fun(i) = signed64(bytes, base + i * 8))
+    let at = Array.init(times2, fun(i) = Frame.fromUnixSeconds(signed64(bytes, base + i * 8)))
     let types = Array.init(times2, fun(i) = Byte.toInt(bytes[indices + i]))
     for var i = 0; i < times2; i = i + 1 {
         if types[i] >= types2 || (i > 0 && at[i] <= at[i - 1]) { return None }
@@ -91,10 +98,10 @@ fun signed32(bytes : Array Byte, at : Int) -> Int {
 -- Eight bytes fill an `Int`, so the shifts produce the sign themselves.
 fun signed64(bytes : Array Byte, at : Int) -> Int = unsigned(bytes, at, 8)
 
--- The offset in force at `t`, in Unix seconds. Before the first transition it
--- is the first time type's; after the last, the footer's rule's if there is
--- one. With no transitions at all, the footer's rule holds throughout.
-fun offsetAt(table : Table, t : Int) -> Int {
+-- The offset in force at `t`. Before the first transition it is the first
+-- time type's; after the last, the footer's rule's if there is one. With no
+-- transitions at all, the footer's rule holds throughout.
+fun offsetAt(table : Table, t : UnixSeconds) -> Offset {
     let n = len(table.at)
     if n == 0 || t >= table.at[n - 1] {
         if let Some(rule) = table.after { return Posix.offsetAt(rule, t) }
@@ -110,31 +117,28 @@ fun offsetAt(table : Table, t : Int) -> Int {
     table.offsets[low]
 }
 
--- The transitions from `from` up to but not including `to`, in order, each as
--- (second, offset before, offset after), the footer's rule's included.
-fun transitions(table : Table, from : Int, to : Int) -> Array (Int, Int, Int) {
+-- The transitions from `from` to `to`, both included, in order, the footer's
+-- rule's among them.
+fun transitions(table : Table, from : UnixSeconds, to : UnixSeconds) -> Array Transition {
     let out = Vec.new(4)
     let n = len(table.at)
     for var i = 0; i < n; i = i + 1 {
         let t = table.at[i]
-        if t >= from && t < to {
+        if t >= from && t <= to {
             let before = if i == 0 { table.initial } else { table.offsets[i - 1] }
-            Vec.push(out, (t, before, table.offsets[i]))
+            Vec.push(out, Transition { at = t, before, after = table.offsets[i] })
         }
     }
     if let Some(rule) = table.after {
-        let last = if n == 0 { Int.minValue() } else { table.at[n - 1] }
-        let firstYear = yearOf(if from > last { from } else { last })
-        for var y = firstYear - 1; y <= yearOf(to) + 1; y = y + 1 {
+        let start = if n == 0 || from > table.at[n - 1] { from } else { table.at[n - 1] }
+        for var y = Frame.year(start) - 1; y <= Frame.year(to) + 1; y = y + 1 {
             for transition in Posix.transitions(rule, y) {
-                let (t, _, _) = transition
-                if t > last && t >= from && t < to { Vec.push(out, transition) }
+                let t = transition.at
+                if (n == 0 || t > table.at[n - 1]) && t >= from && t <= to {
+                    Vec.push(out, transition)
+                }
             }
         }
     }
     Vec.toArray(out)
 }
-
--- The year a Unix second falls in, in UTC, near enough to pick which years'
--- rules to evaluate.
-fun yearOf(t : Int) -> Int = 1970 + t / 31556952

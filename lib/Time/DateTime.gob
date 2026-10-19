@@ -20,9 +20,11 @@ module Time.DateTime (
 -- reading lands as far after the transition as it was meant to be after the
 -- last reading before it, and a repeated one is its first occurrence.
 
-import Time.Calendar as Calendar
 import Time.Date as Date
 import Time.Duration (Duration)
+import Time.Duration as Duration
+import Time.Frame (LocalSeconds, UnixSeconds)
+import Time.Frame as Frame
 import Time.Instant (Instant)
 import Time.Instant as Instant
 import Time.Iso as Iso
@@ -35,7 +37,7 @@ import Time.TimeOfDay as TimeOfDay
 import Time.Zone (Zone)
 import Time.Zone as Zone
 
-type DateTime = DateTime { instant : Instant, offset : Int, zone : Zone }
+type DateTime = DateTime { instant : Instant, offset : Offset, zone : Zone }
 
 -- What a wall-clock reading names in a zone: one instant; none, because the
 -- clocks skipped over it -- `forward` reads it with the offset before the
@@ -46,10 +48,8 @@ type Resolution = Unique(DateTime)
                 | Skipped { forward : DateTime, backward : DateTime, at : DateTime }
                 | Repeated { earlier : DateTime, later : DateTime }
 
-let nanosPerSecond : Int = 1000000000
-
 fun fromInstant(i : Instant, z : Zone) -> DateTime =
-    DateTime { instant = i, offset = Zone.offsetSecondsAt(z, unixSeconds(i)), zone = z }
+    DateTime { instant = i, offset = Zone.offsetAt(z, i), zone = z }
 
 -- The time now in `z`. There is no form without a zone: which zone a program
 -- runs in is the system's setting, and `Zone.system()` says so where it is
@@ -58,15 +58,14 @@ fun now(z : Zone) -> DateTime = fromInstant(Instant.now(), z)
 
 fun instant(dt : DateTime) -> Instant = dt.instant
 fun zone(dt : DateTime) -> Zone = dt.zone
-fun offset(dt : DateTime) -> Offset = Option.expect(Offset.fromSeconds(dt.offset), "in range")
+fun offset(dt : DateTime) -> Offset = dt.offset
 
 -- The calendar and clock reading.
 fun plain(dt : DateTime) -> PlainDateTime {
-    let n = Instant.unixNanos(dt.instant)
-    let seconds = Calendar.floorDiv(n, nanosPerSecond) + dt.offset
-    let d = Option.expect(Date.fromEpochDays(Calendar.floorDiv(seconds, 86400)), "in range")
-    let nanos = Int.mod(seconds, 86400) * nanosPerSecond + Int.mod(n, nanosPerSecond)
-    PlainDateTime.new(d, Option.expect(TimeOfDay.fromNanosOfDay(nanos), "in range"))
+    let local = Frame.toLocal(Frame.fromInstant(dt.instant), dt.offset)
+    let d = Option.expect(Date.fromDayNumber(Frame.day(local)), "in range")
+    let since = Frame.sinceMidnight(local) + Duration.nanos(Frame.fraction(dt.instant))
+    PlainDateTime.new(d, Option.expect(TimeOfDay.afterMidnight(since), "in range"))
 }
 
 -- The same instant in another zone.
@@ -76,46 +75,57 @@ fun after(dt : DateTime, d : Duration) -> DateTime = fromInstant(Instant.after(d
 
 -- What the reading `p` names in `z`.
 fun resolve(p : PlainDateTime, z : Zone) -> Resolution {
-    let (local, nanos) = localSeconds(p)
-    let make = fun(seconds, o) = DateTime {
-        instant = Instant.fromUnixNanos(seconds * nanosPerSecond + nanos), offset = o, zone = z
+    let local = localSeconds(p)
+    let nanos = TimeOfDay.nanosecond(PlainDateTime.timeOfDay(p))
+    -- The instant `t` and its fraction of a second, shown with the offset `o`.
+    let make = fun(t : UnixSeconds, o : Offset) = DateTime {
+        instant = Option.expect(Frame.toInstant(t, nanos), "DateTime: outside the range of an Instant"),
+        offset = o,
+        zone = z,
     }
-    -- An instant reads as `local` only if it is within an offset's reach of
-    -- it, and offsets are under 26 hours: the candidates are the offset in
-    -- force at the start of that window and the one after each transition in
-    -- it, and a candidate holds if it is in force at the instant it gives.
-    let reach = 26 * 3600
-    let changes = Zone.transitions(z, local - reach, local + reach)
+    -- An instant reads as `local` only at an offset some zone can have, so it
+    -- lies between the instants the extreme offsets give: the candidates are
+    -- the offset in force at the start of that window and the one after each
+    -- transition in it, and a candidate holds if it is in force at the instant
+    -- it gives.
+    let earliest = Frame.toUnix(local, Offset.max)
+    let changes = Zone.transitions(z, earliest, Frame.toUnix(local, Offset.min))
     var valid = []
-    for o in [Zone.offsetSecondsAt(z, local - reach)] + Array.map(changes, fun(c) = c.2) {
-        if Zone.offsetSecondsAt(z, local - o) == o && !Array.contains(valid, o) {
+    for o in [Zone.offsetAtSecond(z, earliest)] + Array.map(changes, fun(c) = c.after) {
+        if Zone.offsetAtSecond(z, Frame.toUnix(local, o)) == o && !Array.contains(valid, o) {
             valid = valid + [o]
         }
     }
-    if len(valid) == 1 { return Unique(make(local - valid[0], valid[0])) }
+    if len(valid) == 1 { return Unique(make(Frame.toUnix(local, valid[0]), valid[0])) }
     if len(valid) > 1 {
         let sorted = Array.sort(valid)
         -- The larger offset reads `local` at the earlier instant.
         let largest = sorted[len(sorted) - 1]
-        return Repeated { earlier = make(local - largest, largest), later = make(local - sorted[0], sorted[0]) }
+        return Repeated {
+            earlier = make(Frame.toUnix(local, largest), largest),
+            later = make(Frame.toUnix(local, sorted[0]), sorted[0]),
+        }
     }
-    for change in changes {
-        let (t, before, after) = change
-        if t + before <= local && local < t + after {
+    for c in changes {
+        if Frame.toLocal(c.at, c.before) <= local && local < Frame.toLocal(c.at, c.after) {
             return Skipped {
-                forward = make(local - before, after),
-                backward = make(local - after, before),
-                at = DateTime { instant = Instant.fromUnixNanos(t * nanosPerSecond), offset = after, zone = z },
+                forward = make(Frame.toUnix(local, c.before), c.after),
+                backward = make(Frame.toUnix(local, c.after), c.before),
+                at = DateTime {
+                    instant = Option.expect(Frame.toInstant(c.at, 0), "DateTime: outside the range of an Instant"),
+                    offset = c.after,
+                    zone = z,
+                },
             }
         }
     }
     error("DateTime.resolve: a reading with no instant and no gap around it")
 }
 
--- `p` as Unix seconds were it UTC, and its fraction of a second.
-fun localSeconds(p : PlainDateTime) -> (Int, Int) {
-    let t = TimeOfDay.nanosOfDay(PlainDateTime.timeOfDay(p))
-    (Date.epochDays(PlainDateTime.date(p)) * 86400 + t / nanosPerSecond, t % nanosPerSecond)
+-- `p` on the clock, to the second.
+fun localSeconds(p : PlainDateTime) -> LocalSeconds {
+    let day = Date.dayNumber(PlainDateTime.date(p))
+    Frame.local(day, TimeOfDay.sinceMidnight(PlainDateTime.timeOfDay(p)))
 }
 
 -- The reading `p` in `z`, settled by the offset before a transition if the
@@ -152,8 +162,6 @@ fun startOfDay(dt : DateTime) -> DateTime {
     }
 }
 
-fun unixSeconds(i : Instant) -> Int = Calendar.floorDiv(Instant.unixNanos(i), nanosPerSecond)
-
 instance Eq DateTime {
     fun eq(a, b) = a.instant == b.instant && Zone.id(a.zone) == Zone.id(b.zone)
 }
@@ -174,7 +182,7 @@ instance Hash DateTime {
 -- RFC 9557: the reading, its offset, and the zone in brackets,
 -- `2026-10-18T14:03:07.52-04:00[America/Toronto]`.
 instance Show DateTime {
-    fun show(dt) = show(plain(dt)) + Offset.text(dt.offset) + "[" + Zone.id(dt.zone) + "]"
+    fun show(dt) = show(plain(dt)) + show(dt.offset) + "[" + Zone.id(dt.zone) + "]"
 }
 
 -- RFC 9557, as `show` writes it. The bracketed zone is required: a zone name,
@@ -193,9 +201,8 @@ fun parse(s : String) -> Option DateTime {
     Iso.expect(r, ']')?
     if !Iso.finished(r) { return None }
     let z = zoneNamed(name)?
-    let (local, nanos) = localSeconds(p)
-    let n = Int.addChecked(Int.mulChecked(local - written, nanosPerSecond)?, nanos)?
-    let dt = fromInstant(Instant.fromUnixNanos(n), z)
+    let nanos = TimeOfDay.nanosecond(PlainDateTime.timeOfDay(p))
+    let dt = fromInstant(Frame.toInstant(Frame.toUnix(localSeconds(p), written), nanos)?, z)
     if !exact && dt.offset != written { return None }
     Some(dt)
 }

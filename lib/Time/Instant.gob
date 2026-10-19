@@ -14,24 +14,22 @@ module Time.Instant (
 -- Leap seconds are not counted: like the system clock, an instant treats every
 -- day as 86,400 seconds.
 
-import Time.Calendar as Calendar
 import Time.Clock as Clock
 import Time.Date as Date
 import Time.Duration (Duration)
 import Time.Duration as Duration
+import Time.Frame as Frame
 import Time.Iso as Iso
+import Time.Offset as Offset
 import Time.TimeOfDay as TimeOfDay
 
 type Instant = Instant(Int)
-
-let nanosPerSecond : Int = 1000000000
-let nanosPerDay : Int = 86400 * nanosPerSecond
 
 -- The system clock's reading. The clock can be set back or forward while a
 -- program runs, so two readings can go backwards: for telling the time, not
 -- for measuring how long something took or setting a limit on it, which is
 -- what a `Stopwatch` and a `Deadline` are for.
-fun now() -> Instant = Instant(Clock.realtime())
+fun now() -> Instant = Clock.realtime()
 
 fun fromUnixNanos(n : Int) -> Instant = Instant(n)
 
@@ -51,10 +49,10 @@ instance Hash Instant { fun hashInto(i, h) = hashInto(unixNanos(i), h) }
 -- RFC 3339, in UTC: `2026-10-18T18:03:07.52Z`.
 instance Show Instant {
     fun show(i) {
-        let n = unixNanos(i)
-        let day = Option.expect(Date.fromEpochDays(Calendar.floorDiv(n, nanosPerDay)), "in range")
-        let time = Option.expect(TimeOfDay.fromNanosOfDay(Int.mod(n, nanosPerDay)), "in range")
-        show(day) + "T" + show(time) + "Z"
+        let utc = Frame.toLocal(Frame.fromInstant(i), Offset.utc)
+        let day = Option.expect(Date.fromDayNumber(Frame.day(utc)), "in range")
+        let since = Frame.sinceMidnight(utc) + Duration.nanos(Frame.fraction(i))
+        show(day) + "T" + show(Option.expect(TimeOfDay.afterMidnight(since), "in range")) + "Z"
     }
 }
 
@@ -68,16 +66,6 @@ fun parse(s : String) -> Option Instant {
     let time = TimeOfDay.read(r)?
     let offset = Iso.offset(r)?
     if !Iso.finished(r) { return None }
-    let nanos = TimeOfDay.nanosOfDay(time)
-    let seconds = Date.epochDays(day) * 86400 - offset + nanos / nanosPerSecond
-    -- Before 1970 the whole seconds alone can be past the range when the
-    -- instant is not, in the earliest second there is; so a negative count is
-    -- scaled one second short and the fraction counted back from it.
-    let fraction = nanos % nanosPerSecond
-    let n = if seconds < 0 && fraction != 0 {
-        Int.addChecked(Int.mulChecked(seconds + 1, nanosPerSecond)?, fraction - nanosPerSecond)?
-    } else {
-        Int.addChecked(Int.mulChecked(seconds, nanosPerSecond)?, fraction)?
-    }
-    Some(Instant(n))
+    let local = Frame.local(Date.dayNumber(day), TimeOfDay.sinceMidnight(time))
+    Frame.toInstant(Frame.toUnix(local, offset), TimeOfDay.nanosecond(time))
 }

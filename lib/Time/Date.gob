@@ -1,6 +1,7 @@
 module Time.Date (
     Date, new, today, fromEpochDays, epochDays, year, month, day, weekday, dayOfYear,
-    shift, daysBetween, periodBetween, isLeapYear, daysInMonth, parse, read,
+    shift, daysBetween, periodBetween, isLeapYear, daysInMonth, parse, read, fromDayNumber,
+    dayNumber,
 )
 
 -- A date of the ISO calendar, with no time and no time zone: a birthday, a due
@@ -11,22 +12,22 @@ module Time.Date (
 -- month and day are worked out when they are read. The constructor is not
 -- exported, so every `Date` is a day that exists.
 
+import Time.Calendar (DayNumber)
 import Time.Calendar as Calendar
+import Time.Frame as Frame
 import Time.Instant as Instant
 import Time.Iso as Iso
 import Time.Month (Month(..))
 import Time.Month as Month
 import Time.Period (Period(..))
 import Time.Weekday (Weekday)
-import Time.Weekday as Weekday
 import Time.Zone (Zone)
 import Time.Zone as Zone
-import Time.Offset as Offset
 
-type Date = Date(Int)
+type Date = Date(DayNumber)
 
-let minDays : Int = Calendar.daysFromCivil(Calendar.minYear, Jan, 1)
-let maxDays : Int = Calendar.daysFromCivil(Calendar.maxYear, Dec, 31)
+let first : DayNumber = Calendar.daysFromCivil(Calendar.minYear, Jan, 1)
+let last : DayNumber = Calendar.daysFromCivil(Calendar.maxYear, Dec, 31)
 
 -- The date with this year, month and day, if it exists.
 fun new(y : Int, m : Month, d : Int) -> Option Date =
@@ -40,16 +41,19 @@ fun new(y : Int, m : Month, d : Int) -> Option Date =
 -- `DateTime.now`: the date changes at a different instant in each.
 fun today(z : Zone) -> Date {
     let now = Instant.now()
-    let seconds = Calendar.floorDiv(Instant.unixNanos(now), 1000000000)
-        + Offset.toSeconds(Zone.offsetAt(z, now))
-    Date(Calendar.floorDiv(seconds, 86400))
+    let local = Frame.toLocal(Frame.fromInstant(now), Zone.offsetAt(z, now))
+    Option.expect(fromDayNumber(Frame.day(local)), "today is in range")
 }
 
 -- The date `n` days after 1970-01-01, if it is in range.
-fun fromEpochDays(n : Int) -> Option Date =
-    if n < minDays || n > maxDays { None } else { Some(Date(n)) }
+fun fromEpochDays(n : Int) -> Option Date = fromDayNumber(Calendar.fromEpochDays(n))
 
-fun epochDays(Date(n)) -> Int = n
+fun epochDays(Date(n)) -> Int = Calendar.epochDays(n)
+
+fun fromDayNumber(n : DayNumber) -> Option Date =
+    if n < first || n > last { None } else { Some(Date(n)) }
+
+fun dayNumber(Date(n)) -> DayNumber = n
 
 fun fields(Date(n)) -> (Int, Month, Int) = Calendar.civilFromDays(n)
 
@@ -57,14 +61,12 @@ fun year(d : Date) -> Int = fields(d).0
 fun month(d : Date) -> Month = fields(d).1
 fun day(d : Date) -> Int = fields(d).2
 
--- 1970-01-01 was a Thursday, the fourth day of an ISO week.
-fun weekday(Date(n)) -> Weekday =
-    Option.expect(Weekday.fromNumber(Int.mod(n + 3, 7) + 1), "weekday out of range")
+fun weekday(Date(n)) -> Weekday = Calendar.weekday(n)
 
 -- 1 for January 1.
 fun dayOfYear(d : Date) -> Int {
     let Date(n) = d
-    n - Calendar.daysFromCivil(year(d), Jan, 1) + 1
+    Calendar.daysBetween(Calendar.daysFromCivil(year(d), Jan, 1), n) + 1
 }
 
 fun isLeapYear(y : Int) -> Bool = Calendar.isLeapYear(y)
@@ -85,12 +87,12 @@ fun shift(d : Date, p : Period) -> Date {
     }
     let length = Calendar.daysInMonth(newYear, newMonth)
     let clamped = if dd > length { length } else { dd }
-    let moved = Calendar.daysFromCivil(newYear, newMonth, clamped) + p.days
-    Option.expect(fromEpochDays(moved), "Date.shift: the result is outside years -9999 to 9999")
+    let moved = Calendar.addDays(Calendar.daysFromCivil(newYear, newMonth, clamped), p.days)
+    Option.expect(fromDayNumber(moved), "Date.shift: the result is outside years -9999 to 9999")
 }
 
 -- The number of days from `from` to `to`: negative if `to` is earlier.
-fun daysBetween(from : Date, to : Date) -> Int = epochDays(to) - epochDays(from)
+fun daysBetween(Date(from), Date(to)) -> Int = Calendar.daysBetween(from, to)
 
 -- The period from `from` to `to`: as many whole months as fit, then the days
 -- that remain, both negative if `to` is earlier. `shift(from, periodBetween(from, to))`
@@ -110,9 +112,9 @@ fun periodBetween(from : Date, to : Date) -> Period {
     Period { months, days = daysBetween(start, to) }
 }
 
-instance Eq Date { fun eq(a, b) = epochDays(a) == epochDays(b) }
+instance Eq Date { fun eq(Date(a), Date(b)) = a == b }
 
-instance Ord Date { fun lt(a, b) = epochDays(a) < epochDays(b) }
+instance Ord Date { fun lt(Date(a), Date(b)) = a < b }
 
 instance Hash Date { fun hashInto(d, h) = hashInto(epochDays(d), h) }
 

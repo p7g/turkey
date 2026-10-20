@@ -10,7 +10,7 @@ module System.File (
     openReadIn, createIn,
     createDir, createDirIn, createDirAll, createDirAllIn,
     removeFile, removeFileIn, removeDir, removeDirIn, removeTree, removeTreeIn,
-    rename, renameIn, temporaryDir,
+    rename, renameIn, readLink, readLinkIn, temporaryDir,
     stdin, stderr,
 )
 
@@ -64,6 +64,8 @@ import Turkey.ReadWrite (Read(..), Write(..), DecodeError, InvalidUTF8(..), Buff
                          defaultCapacity)
 import Turkey.Sys as Sys
 import System.Env as Env
+import Time.Instant (Instant)
+import Time.Instant as Instant
 
 -- -- modes ----------------------------------------------------------------------------
 
@@ -306,9 +308,8 @@ instance Show FileKind {
 }
 
 -- What the system says of a file: its size in bytes, its kind, when its
--- contents were last changed, in nanoseconds since the Unix epoch (as
--- `System.Time.now` counts), and its permission bits, such as 0o644.
-type Stat = Stat { size : Int, kind : FileKind, modified : Int, permissions : Int }
+-- contents were last changed, and its permission bits, such as 0o644.
+type Stat = Stat { size : Int, kind : FileKind, modified : Instant, permissions : Int }
 
 -- What `f` is now.
 fun stat(f : File m) -> Either IOError Stat {
@@ -344,7 +345,8 @@ fun statOf(raw : Array Byte, path : Option String) -> Either IOError Stat {
         -- Darwin's whiteouts, which a union mount shows, are not files.
         None -> return Left(Errors.failure("stat", path, -Sys.einval))
     }
-    Right(Stat { size = Calls.statSize(raw), kind = kind, modified = Calls.statModified(raw),
+    Right(Stat { size = Calls.statSize(raw), kind = kind,
+                 modified = Instant.fromUnixNanos(Calls.statModified(raw)),
                  permissions = Int.and(mode, 0o7777) })
 }
 
@@ -626,6 +628,31 @@ fun renameIn(fromDir : Dir, from : String, toDir : Dir, to : String) -> Either I
     let r = FD.using(fromDir.fd, fun(fromNumber) =
         FD.using(toDir.fd, fun(toNumber) = Calls.renameAt(fromNumber, f, toNumber, t)))
     unitIn(fromDir, "rename", from, r)
+}
+
+-- What the symbolic link `path` points to, as it is written in the link:
+-- possibly relative, and not checked to exist. `NotFound` if there is no such
+-- link, and `Other` with `EINVAL` if `path` is not one, or if what it points
+-- to is not UTF-8.
+fun readLink(path : String) -> Either IOError String = readLinkIn(working, path)
+
+fun readLinkIn(d : Dir, name : String) -> Either IOError String {
+    let c = Calls.cPath(name)
+    var room = 256
+    loop {
+        let into = Array.filled(room, Byte.truncate(0))
+        let r = FD.using(d.fd, fun(n) = Calls.readLinkAt(n, c, into))
+        if r < 0 { return Left(failedIn(d, "readlink", name, r)) }
+        -- A target that fills the room may have been cut short: try again
+        -- with twice the room until it does not.
+        if r < room {
+            return match String.fromBytes(Array.slice(into, 0, r)) {
+                Some(target) -> Right(target)
+                None -> Left(failedIn(d, "readlink", name, -Sys.einval))
+            }
+        }
+        room = room * 2
+    }
 }
 
 -- A new, empty directory, made for this caller alone (permissions 0o700), in

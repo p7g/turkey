@@ -1,0 +1,164 @@
+module Time.ISO (
+    Reader, reader, finished, looking, accept, expect, skip, letter, upTo, sign, digits, someDigits,
+    fraction,
+    offset, padded, year, fractionText,
+)
+
+-- The pieces of ISO 8601 text that more than one type reads or writes.
+--
+-- Reading is strict: a reader consumes exactly the form asked for, and a type's
+-- `parse` succeeds only if the whole string is consumed. ISO text is ASCII, so
+-- the reader works on bytes; a byte outside ASCII simply fails to match.
+
+import Time.Offset (Offset)
+import Time.Offset as Offset
+
+type Reader = Reader { text : Array Byte, var at : Int }
+
+fun reader(s : String) -> Reader = Reader { text = String.toBytes(s), at = 0 }
+
+fun finished(r : Reader) -> Bool = r.at == len(r.text)
+
+fun peek(r : Reader) -> Option Int =
+    if finished(r) { None } else { Some(Byte.toInt(r.text[r.at])) }
+
+-- Whether `c` is next, without consuming it.
+fun looking(r : Reader, c : Char) -> Bool = peek(r) == Some(Char.toInt(c))
+
+-- Consumes whatever byte is next, if there is one.
+fun skip(r : Reader) -> Option Unit {
+    if finished(r) { return None }
+    r.at = r.at + 1
+    Some(())
+}
+
+-- Consumes an ASCII letter if one is next.
+fun letter(r : Reader) -> Bool = match peek(r) {
+    Some(b) -> {
+        if (b >= 65 && b <= 90) || (b >= 97 && b <= 122) {
+            r.at = r.at + 1
+            True
+        } else {
+            False
+        }
+    }
+    None -> False
+}
+
+-- The text up to the next `c`, which is not consumed; `None` if there is no
+-- `c`, or the text is empty.
+fun upTo(r : Reader, c : Char) -> Option String {
+    let start = r.at
+    while !looking(r, c) { skip(r)? }
+    if r.at == start { return None }
+    String.fromBytes(Array.slice(r.text, start, r.at))
+}
+
+-- Consumes `c` if it is next.
+fun accept(r : Reader, c : Char) -> Bool {
+    if peek(r) == Some(Char.toInt(c)) {
+        r.at = r.at + 1
+        True
+    } else {
+        False
+    }
+}
+
+fun expect(r : Reader, c : Char) -> Option Unit = if accept(r, c) { Some(()) } else { None }
+
+-- An optional `+` or `-`: -1 after a minus, otherwise 1.
+fun sign(r : Reader) -> Int {
+    if accept(r, '-') { return -1 }
+    let _ = accept(r, '+')
+    1
+}
+
+fun digitAt(r : Reader) -> Option Int = match peek(r) {
+    Some(b) -> if b >= 48 && b <= 57 { Some(b - 48) } else { None }
+    None -> None
+}
+
+-- Exactly `count` digits, as a number.
+fun digits(r : Reader, count : Int) -> Option Int {
+    var n = 0
+    for var i = 0; i < count; i = i + 1 {
+        n = n * 10 + digitAt(r)?
+        r.at = r.at + 1
+    }
+    Some(n)
+}
+
+-- One or more digits, at most 18 so the number cannot overflow.
+fun someDigits(r : Reader) -> Option Int {
+    var n = digitAt(r)?
+    r.at = r.at + 1
+    var count = 1
+    while let Some(d) = digitAt(r) {
+        count = count + 1
+        if count > 18 { return None }
+        n = n * 10 + d
+        r.at = r.at + 1
+    }
+    Some(n)
+}
+
+-- After a `.` or `,`, one to nine digits of a second, as nanoseconds. Absent,
+-- it is 0.
+fun fraction(r : Reader) -> Option Int {
+    if !accept(r, '.') && !accept(r, ',') { return Some(0) }
+    let _ = digitAt(r)?
+    var nanos = 0
+    var count = 0
+    while let Some(d) = digitAt(r) {
+        count = count + 1
+        if count > 9 { return None }
+        nanos = nanos * 10 + d
+        r.at = r.at + 1
+    }
+    for var i = count; i < 9; i = i + 1 { nanos = nanos * 10 }
+    Some(nanos)
+}
+
+-- A UTC offset: `Z`, or a sign and `HH:MM` under 24 hours as RFC 3339 writes
+-- one, optionally with `:SS` for the offsets of old local mean times.
+fun offset(r : Reader) -> Option Offset {
+    if accept(r, 'Z') || accept(r, 'z') { return Some(Offset.utc) }
+    let negative = accept(r, '-')
+    if !negative && !accept(r, '+') { return None }
+    let h = digits(r, 2)?
+    expect(r, ':')?
+    let m = digits(r, 2)?
+    let s = if accept(r, ':') { digits(r, 2)? } else { 0 }
+    if h > 23 || m > 59 || s > 59 { return None }
+    let seconds = (h * 60 + m) * 60 + s
+    Offset.fromSeconds(if negative { -seconds } else { seconds })
+}
+
+-- `n`, which is not negative, in at least `width` digits.
+fun padded(n : Int, width : Int) -> String {
+    let digits = Int.toString(n)
+    String.repeat("0", width - String.byteLength(digits)) + digits
+}
+
+-- A year as ISO 8601 writes it: four digits from 0 to 9999, otherwise a sign
+-- and six, the expanded form.
+fun year(y : Int) -> String =
+    if y >= 0 && y <= 9999 {
+        padded(y, 4)
+    } else if y < 0 {
+        "-" + padded(-y, 6)
+    } else {
+        "+" + padded(y, 6)
+    }
+
+-- `.` and the nanoseconds without trailing zeros, or nothing for 0.
+fun fractionText(nanos : Int) -> String {
+    if nanos == 0 { return "" }
+    var n = nanos
+    var width = 9
+    while n % 10 == 0 {
+        n = n / 10
+        width = width - 1
+    }
+    "." + padded(n, width)
+}

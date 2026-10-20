@@ -90,7 +90,9 @@ import System.IO as IO
 import System.Parallel as Parallel
 import Algorithm.Hash (fnv1a)
 import Data.Hashable (Hasher(..))
-import System.Time as Time
+import Time.Duration (Duration)
+import Time.Duration as Duration
+import Time.Stopwatch as Stopwatch
 
 -- How large a body may be and still be inlined, counted as `sizeOf_` counts.
 -- Small enough that a call site does not become unreadable, large enough for
@@ -379,7 +381,7 @@ type Done = Done {
     reduced   : Map String Core,
     constants : Map String CBind,
     unwritten : Map String Core,
-    cost      : Int,
+    cost      : Duration,
 }
 
 fun newReducer(program : CProgram, decls : DeclTable, graph : Map String (Set.Set String),
@@ -488,19 +490,19 @@ fun measure(on : Bool) -> Unit {
 -- the most expensive chain of such dependencies bounds how far running
 -- components in parallel could shorten the whole.
 fun reportSchedule(graph : Map String (Set.Set String), components : Vec (Vec String),
-                   costs : Array Int) -> Unit {
+                   costs : Array Duration) -> Unit {
     let componentOf = Map.new()
     for var c = 0; c < len(components); c = c + 1 {
         for name in components[c] { Map.put(componentOf, name, c) }
     }
     -- `components` lists callees first, so each one's dependencies are done.
-    let finish = Array.filled(len(components), 0)
-    var total = 0
-    var critical = 0
-    var largest = 0
+    let finish = Array.filled(len(components), Duration.zero)
+    var total = Duration.zero
+    var critical = Duration.zero
+    var largest = Duration.zero
     var largestAt = 0
     for var c = 0; c < len(components); c = c + 1 {
-        var ready = 0
+        var ready = Duration.zero
         for name in components[c] {
             for callee in Set.elements(Map.getOr(graph, name, Set.new())) {
                 match Map.get(componentOf, callee) {
@@ -517,7 +519,10 @@ fun reportSchedule(graph : Map String (Set.Set String), components : Vec (Vec St
             largestAt = c
         }
     }
-    let tenths = fun(n) = Int.toString(n / 100000 / 10) + "." + Int.toString(n / 100000 % 10) + "ms"
+    let tenths = fun(d) {
+        let n = Duration.toNanos(d) / 100000
+        Int.toString(n / 10) + "." + Int.toString(n % 10) + "ms"
+    }
     let _ = IO.writeText(IO.stderr(), "opt-schedule\tcomponents " + Int.toString(len(components))
               + "\ttotal " + tenths(total) + "\tcritical path " + tenths(critical)
               + "\tlargest component " + tenths(largest) + " ("
@@ -595,7 +600,7 @@ fun reduceProgram(program : CProgram, decls : DeclTable) -> CProgram {
         Array.sort(Set.elements(on))
     }
     let reduceComponent = fun(cache, c, finished) {
-        let started = if measuring { Time.monotonic() } else { 0 }
+        let started = if measuring { Some(Stopwatch.start()) } else { None }
         let r = forComponent(base, c, ".c" + Int.toString(keyHash(components[c][0])),
                              finished, cache)
         let values = []
@@ -620,7 +625,10 @@ fun reduceProgram(program : CProgram, decls : DeclTable) -> CProgram {
         }
         Done { values = values, reduced = r.reduced, constants = r.constants,
                unwritten = r.unwritten,
-               cost = if measuring { Time.monotonic() - started } else { 0 } }
+               cost = match started {
+                   Some(s) -> Stopwatch.elapsed(s)
+                   None -> Duration.zero
+               } }
     }
     let made = Parallel.graphWith(len(components), dependsOn, newCache, reduceComponent)
     if measuring { reportSchedule(graph, components, Array.map(made, fun(d) = d.cost)) }
@@ -1219,10 +1227,17 @@ fun floatLet(e : Core) -> Option Core = match e.kind {
 -- `R` must not fall through, or its own value would escape unmatched. That is
 -- not a restriction in practice: a join stands where a `return` or a `?` was,
 -- and control reaches its continuation by jumping.
+--
+-- And the join must not be recursive. `B` then holds jumps back to `j`, and
+-- with `B` as the scrutinee of the moved match those jumps are no longer in
+-- tail position: a self-jump would skip the match it now sits under, so the
+-- rewrite is wrong and not merely unchecked. A loop's result reaches its
+-- consumer through `fuseRecursiveJoinResult`, which moves the match to the
+-- loop's exits instead; when that rule declines, this one must too.
 fun caseOfJoin(e : Core) -> Option Core = match e.kind {
     CMatch(scrutinee, alts) -> match scrutinee.kind {
         CJoin(name, params, body, rest, recursive) -> {
-            if fallsThrough(rest) { return None }
+            if recursive || fallsThrough(rest) { return None }
             let mentioned = namesOfAlts(alts)
             for p in params {
                 if Set.contains(mentioned, p.name) { return None }

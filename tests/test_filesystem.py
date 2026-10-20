@@ -18,7 +18,7 @@ from tests.lang import binary, run
 HEADER = """\
 import System.File as File
 import System.IO as IO
-import System.Time as Time
+import Time.Instant as Instant
 
 fun report(r : Either IO.IOError a) -> String = match r {
     Right(_) -> "ok"
@@ -52,7 +52,7 @@ def test_a_stat_is_a_value(tmp_path):
     out = lines("""
 fun describe(r : Either IO.IOError File.Stat) -> String = match r {
     Right(s) -> show(s.kind) + " " + show(s.size) + " " + show(s.permissions) + " "
-                + show(s.modified)
+                + show(Instant.unixNanos(s.modified))
     Left(e) -> show(e.kind) + ": " + message(e)
 }
 
@@ -74,7 +74,7 @@ fun main() {
     print(report(File.stat(f)))
     -- The clock `modified` is counted on.
     let s = must(File.metadata("plain"))
-    print(Time.now() >= s.modified)
+    print(Instant.now() >= s.modified)
 }
 """, tmp_path)
     plain = os.stat(tmp_path / "plain")
@@ -416,3 +416,40 @@ def test_two_processes_racing_to_fill_one_cache_entry(tmp_path):
     outs = sorted(out.decode().split() for out, _ in results)
     assert outs == [["filled", "200000"], ["found", "200000"]]
     assert sorted(os.listdir(tmp_path / "cache")) == ["entry", "lock"]
+
+
+def test_readLink_answers_the_target_as_written(tmp_path):
+    os.symlink("plain", tmp_path / "relative")
+    os.symlink("/no/such/place", tmp_path / "absolute")
+    # Longer than the first buffer `readLink` tries, so it has to grow.
+    long_target = "d/" * 300 + "end"
+    os.symlink(long_target, tmp_path / "long")
+    os.mkdir(tmp_path / "dir")
+    os.symlink("../plain", tmp_path / "dir" / "up")
+    (tmp_path / "plain").write_bytes(b"x")
+    out = lines("""
+fun target(r : Either IO.IOError String) -> String = match r {
+    Right(t) -> t
+    Left(e) -> show(e.kind) + ": " + message(e)
+}
+
+fun main() {
+    print(target(File.readLink("relative")))
+    print(target(File.readLink("absolute")))
+    print(String.byteLength(target(File.readLink("long"))))
+    let d = must(File.openDir("dir"))
+    print(target(File.readLinkIn(d, "up")))
+    print(report(File.closeDir(d)))
+    print(target(File.readLink("plain")))
+    print(target(File.readLink("missing")))
+}
+""", tmp_path)
+    assert out == [
+        "plain",
+        "/no/such/place",
+        str(len(long_target)),
+        "../plain",
+        "ok",
+        f"Other({errno.EINVAL}): readlink plain: invalid argument",
+        "NotFound: readlink missing: no such file or directory",
+    ]

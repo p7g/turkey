@@ -90,6 +90,7 @@ import System.IO as IO
 import System.Parallel as Parallel
 import Algorithm.Hash (fnv1a)
 import Data.Hashable (Hasher(..))
+import Time.Duration (Duration)
 import Time.Duration as Duration
 import Time.Stopwatch as Stopwatch
 
@@ -380,7 +381,7 @@ type Done = Done {
     reduced   : Map String Core,
     constants : Map String CBind,
     unwritten : Map String Core,
-    cost      : Int,
+    cost      : Duration,
 }
 
 fun newReducer(program : CProgram, decls : DeclTable, graph : Map String (Set.Set String),
@@ -489,19 +490,19 @@ fun measure(on : Bool) -> Unit {
 -- the most expensive chain of such dependencies bounds how far running
 -- components in parallel could shorten the whole.
 fun reportSchedule(graph : Map String (Set.Set String), components : Vec (Vec String),
-                   costs : Array Int) -> Unit {
+                   costs : Array Duration) -> Unit {
     let componentOf = Map.new()
     for var c = 0; c < len(components); c = c + 1 {
         for name in components[c] { Map.put(componentOf, name, c) }
     }
     -- `components` lists callees first, so each one's dependencies are done.
-    let finish = Array.filled(len(components), 0)
-    var total = 0
-    var critical = 0
-    var largest = 0
+    let finish = Array.filled(len(components), Duration.zero)
+    var total = Duration.zero
+    var critical = Duration.zero
+    var largest = Duration.zero
     var largestAt = 0
     for var c = 0; c < len(components); c = c + 1 {
-        var ready = 0
+        var ready = Duration.zero
         for name in components[c] {
             for callee in Set.elements(Map.getOr(graph, name, Set.new())) {
                 match Map.get(componentOf, callee) {
@@ -518,7 +519,10 @@ fun reportSchedule(graph : Map String (Set.Set String), components : Vec (Vec St
             largestAt = c
         }
     }
-    let tenths = fun(n) = Int.toString(n / 100000 / 10) + "." + Int.toString(n / 100000 % 10) + "ms"
+    let tenths = fun(d) {
+        let n = Duration.toNanos(d) / 100000
+        Int.toString(n / 10) + "." + Int.toString(n % 10) + "ms"
+    }
     let _ = IO.writeText(IO.stderr(), "opt-schedule\tcomponents " + Int.toString(len(components))
               + "\ttotal " + tenths(total) + "\tcritical path " + tenths(critical)
               + "\tlargest component " + tenths(largest) + " ("
@@ -622,8 +626,8 @@ fun reduceProgram(program : CProgram, decls : DeclTable) -> CProgram {
         Done { values = values, reduced = r.reduced, constants = r.constants,
                unwritten = r.unwritten,
                cost = match started {
-                   Some(s) -> Duration.toNanos(Stopwatch.elapsed(s))
-                   None -> 0
+                   Some(s) -> Stopwatch.elapsed(s)
+                   None -> Duration.zero
                } }
     }
     let made = Parallel.graphWith(len(components), dependsOn, newCache, reduceComponent)

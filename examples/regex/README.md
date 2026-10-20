@@ -112,9 +112,9 @@ claims and engine comparisons remain separate design work.
 ## Current limits
 
 - Full matching only: no pattern-string frontend, search, or replacement API.
-- Construction uses a process-wide mutable ID supply. Matching allocates history
-  for the current run, not a global-ID-sized capture array. Concurrent construction
-  is not addressed.
+- Construction draws capture IDs from a process-wide atomic counter, so tasks
+  may build patterns at the same time. Matching allocates history for the
+  current run, not a global-ID-sized capture array.
 - Capture ownership is not statically enforced. An out-of-scope handle fails
   with a diagnostic when its recipe is evaluated.
 - Sequential reuse of the same captured fragment reuses its IDs: direct capture

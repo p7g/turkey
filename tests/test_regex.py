@@ -2,7 +2,7 @@
 
 import pytest
 
-from tests.lang import check, types
+from tests.lang import check, run, types
 from tests.lang import CompileError
 
 
@@ -43,3 +43,55 @@ fun pairs(text) = R.fullMatch(R.many(do {
 def test_regex_rejects_incorrect_capture_and_result_types(source):
     with pytest.raises(CompileError):
         check('import Regex as R\n' + source)
+
+
+# Every task builds its own pattern while the others build theirs, so that
+# capture tags are drawn from the supply at the same time; a tag handed out
+# twice would make one pattern's capture resolve to another fragment's text.
+PARALLEL_CONSTRUCTION = '''
+import Regex as R
+import System.Parallel as Parallel
+
+fun digit(c : Char) -> Bool = c >= '0' && c <= '9'
+
+fun pattern() = do {
+    let left = R.capture(R.some(R.satisfy(digit)))?
+    R.literal("-")?
+    let middle = R.optional(R.capture(R.some(R.satisfy(Char.isAsciiAlpha))))?
+    R.literal("-")?
+    let right = R.capture(R.some(R.satisfy(digit)))?
+    pure((left, middle, right))
+}
+
+fun main() {
+    let xs = []
+    for var i = 0; i < 400; i = i + 1 { Vec.push(xs, i) }
+    let results = Parallel.map(xs, fun(i) {
+        var ok = True
+        for var j = 0; j < 20; j = j + 1 {
+            let expected = Int.toString(i) + "-" + Int.toString(j)
+            match R.fullMatch(pattern(), Int.toString(i) + "-ab-" + Int.toString(j)) {
+                Some((l, Some(m), r)) -> {
+                    if l + "-" + r != expected || m != "ab" { ok = False }
+                }
+                _ -> { ok = False }
+            }
+            -- A digit in the middle group: no match.
+            if let Some(_) = R.fullMatch(pattern(), Int.toString(i) + "-a1-" + Int.toString(j)) {
+                ok = False
+            }
+        }
+        ok
+    })
+    var failures = 0
+    for ok in results { if !ok { failures = failures + 1 } }
+    print(failures)
+}
+'''
+
+
+@pytest.mark.parametrize('workers', ['1', '8'])
+def test_regex_patterns_built_by_parallel_tasks_match_independently(workers):
+    result = run(PARALLEL_CONSTRUCTION, env={'TURKEY_WORKERS': workers})
+    assert result.code == 0, result.stderr
+    assert result.stdout == '0\n'

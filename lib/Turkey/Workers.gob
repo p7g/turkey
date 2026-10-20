@@ -6,6 +6,10 @@ module Turkey.Workers (
     blockingRead, blockingWrite, blockingPread, blockingPwrite, blockingOpen, blockingClose,
     blockingFstat, blockingOpenat, blockingFstatat, blockingUnlinkat, blockingMkdirat,
     blockingRenameat, blockingFlock, blockingReaddir,
+    claim, release, wakePoller, interestAdd, interest,
+    pollRead, pollWrite, pollChild, pollForget, pollForgetChild, pollWait, pollNow,
+    resultToken, resultValue,
+    pollReadable, pollWritable, pollEof, pollError, pollTimeoutForever,
 )
 
 -- The workers: the threads that run Turkey code, each with a record of its own
@@ -42,6 +46,8 @@ import Data.Ord (Ord(..))
 import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..))
 import Data.Int ()
 import Data.Bool (Bool(..))
+import Target (OS(..))
+import Target as Target
 import Turkey.Libc as Libc
 import Turkey.Lock as Lock
 import Turkey.Memory as Memory
@@ -62,7 +68,8 @@ var states : Prim.Ptr = zeroed(8 * limit)
 var control : Prim.Ptr = zeroed(16)
 
 -- What workers with nothing to do sleep on, so that they use no processor
--- until there is something for them.
+-- until there is something for them, and the words that choose which of them
+-- waits for the operating system's readiness events instead (the poller, below).
 --
 -- Word 0 is the work epoch: bumped when a task becomes runnable, and when one
 -- finishes while the program's own code waits for it (`signalWork`). Word 16
@@ -75,7 +82,31 @@ var control : Prim.Ptr = zeroed(16)
 -- only while the epoch is still what it read: so a bump made after it looked
 -- either shows in the epoch, and it does not sleep, or finds it counted, and
 -- wakes it (`sleepOn`).
-var signals : Prim.Ptr = zeroed(32)
+--
+-- Word 32 is the poller's claim: 1 while a worker holds the right to poll,
+-- taken by compare-and-swap (`claim`), so that at most one polls at a time.
+-- Word 40 is 1 while the claimant is inside, or about to enter, a wait that
+-- only a kernel event ends (`pollWait`). Word 48 is 1 while a break is on its
+-- way to that wait, so that a burst of signals costs one system call
+-- (`wakePoller`). Word 56 counts the registrations and timers the scheduler
+-- is waiting on (`interestAdd`); workers read it without a lock to decide
+-- whether to poll at all.
+--
+-- A poller sleeps in the kernel and not on the work epoch, so `signalWork`
+-- reaches it by breaking its wait. The signaller bumps the epoch and then
+-- reads word 40; the poller sets word 40 and then reads the epoch again
+-- before it waits, and does not wait if the epoch moved (`pollWait`): the
+-- same two orderings as a futex sleeper's, so a signal either shows in the
+-- epoch or finds the poller marked and breaks its wait. On the way out the
+-- poller clears word 40 and then word 48: a signaller that finds word 48 set
+-- relies on a break already on its way, which the kernel holds for the next
+-- wait if this one has ended, so at worst the next wait ends early.
+var signals : Prim.Ptr = zeroed(64)
+
+let claimedAt : Int = 32
+let blockedAt : Int = 40
+let wakePendingAt : Int = 48
+let interestAt : Int = 56
 
 fun workSeen() -> Int = Prim.atomicLoad(signals, 0)
 fun collectionSeen() -> Int = Prim.atomicLoad(signals, 16)
@@ -92,12 +123,17 @@ fun sleepOn(word : Int, seen : Int) -> Unit {
     let _ = Prim.atomicAdd(signals, plus(word, 8), -1)
 }
 
--- Something for an idle worker to do: wake one, or, `all`, every one.
+-- Something for an idle worker to do: wake one, or, `all`, every one. A
+-- poller is one more idle worker: it is broken out of its wait when every one
+-- is to be woken, and when no sleeper on the epoch was there to take a single
+-- wake.
 fun signalWork(all : Bool) -> Unit {
     let _ = Prim.atomicAdd(signals, 0, 1)
+    var woken = False
     if Prim.atomicLoad(signals, 8) != 0 {
-        if all { Lock.wakeAll(signals) } else { let _ = Lock.wake(signals) }
+        if all { Lock.wakeAll(signals) } else { woken = Lock.wake(signals) }
     }
+    if (all || !woken) && Prim.atomicLoad(signals, blockedAt) != 0 { wakePoller() }
 }
 
 fun signalCollection() -> Unit {
@@ -279,6 +315,564 @@ foreign "turkey_lock_acquire" fun acquire(mutex : Prim.Ptr) -> Unit {
     blockEnter(Prim.frameAddress())
     Lock.acquire(mutex)
     blockExit()
+}
+
+-- -- the poller ----------------------------------------------------------------------
+--
+-- Waiting for the operating system to say that a descriptor is ready, a child
+-- has exited or a time has come: Darwin's `kqueue` and Linux's `epoll`, behind
+-- one set of calls that take and answer Ints and raw memory only. What a
+-- registration means to the program, and what to do when it fires, is the
+-- scheduler's: this layer knows a `token`, an Int chosen by the caller that
+-- comes back with the event. Token 0 is reserved for the break.
+--
+-- The poller is made by the first call that needs it, and is never closed.
+--
+-- **One poller at a time.** The functions that wait, `pollWait` and
+-- `pollNow`, share one buffer of events and one of results, so a caller holds
+-- the claim (`claim`) across them and across reading the results back
+-- (`resultToken`, `resultValue`), and gives it up with `release`. Registering
+-- and dropping interest are safe from any worker at any time.
+--
+-- **One-shot, level-triggered.** A registration delivers one event and is gone
+-- (`EV_ONESHOT`, `EPOLLONESHOT`), and one made for a descriptor that is ready
+-- already delivers at once, so readiness that arrived before the call is not
+-- lost. A descriptor closed while it is registered is dropped by Darwin
+-- without an event. On Linux, interest is dropped when every descriptor for
+-- the same open file is closed, so a descriptor that may have been duplicated
+-- is dropped with `pollForget` before it is closed. Linux keeps one
+-- registration per descriptor, not one per direction: a second one for the
+-- same descriptor, in either direction, replaces the first, and the first's
+-- token is never delivered.
+--
+-- **Results.** An event decodes to a `(token, value)` pair of Ints. For a
+-- descriptor the value is a mask of `pollReadable`, `pollWritable`, `pollEof`
+-- and `pollError`: what the kernel reported, which is more than what was asked
+-- for when a descriptor hangs up or fails. A waiter treats any result as "try
+-- the operation again". For a child the value is, on Darwin, the child's
+-- `wait` status exactly as `waitpid` stores it, which is 0 for a clean exit
+-- and so cannot be told from "nothing" by its value; on Linux it is
+-- `pollReadable`, and the status comes from `waitpid`. Either way the child
+-- is not reaped, and the caller passes the token to `pollForgetChild` once it
+-- has the result, which on Linux closes the descriptor that was watching it.
+
+let pollReadable : Int = 1
+let pollWritable : Int = 2
+let pollEof : Int = 4
+let pollError : Int = 8
+
+-- `pollWait`'s timeout for "until an event or a break".
+let pollTimeoutForever : Int = -2
+
+-- How many events a wait takes at once; the rest wait for the next call.
+let batch : Int = 64
+
+-- The poller's words. State: 0 not made, 1 being made by some worker, 2 made,
+-- 3 could not be made. The descriptor of the `kqueue` or the epoll instance.
+-- Linux's `eventfd`, registered with token 0. The negated `errno` a failed
+-- making left. The scratch block (`scratchAt`). The results block, `batch`
+-- `(token, value)` pairs of Ints. How many pairs the last wait left there.
+var poller : Prim.Ptr = zeroed(64)
+
+let stateAt : Int = 0
+let descriptorAt : Int = 8
+let wakeDescriptorAt : Int = 16
+let failureAt : Int = 24
+let scratchAt : Int = 32
+let resultsAt : Int = 40
+let countAt : Int = 48
+
+-- The scratch block, which only the claimant and the maker use: `batch` events
+-- of the target's size (`Turkey.Sys.keventBytes`, `epollEventBytes`; 32 is the
+-- larger), a `struct timespec` after them for `kevent`'s timeout, then the
+-- eight bytes holding the number 1 that Linux writes to break a wait, and
+-- eight to read it back into.
+let eventsEnd : Int = 2048
+let timespecAt : Int = 2048
+let oneAt : Int = 2064
+let drainAt : Int = 2072
+let scratchBytes : Int = 2080
+
+-- The poller, made if it was not, or the negated `errno` of why it cannot be.
+-- Workers that arrive while another is making it wait for it; the making is a
+-- few system calls, with no safepoint in it.
+fun pollerReady() -> Int {
+    while True {
+        let state = Prim.atomicLoad(poller, stateAt)
+        if state == 2 { return 0 }
+        if state == 3 { return Prim.atomicLoad(poller, failureAt) }
+        if state == 0 && Prim.atomicCas(poller, stateAt, 0, 1) == 0 {
+            let r = make()
+            if r == 0 {
+                Prim.atomicStore(poller, stateAt, 2)
+            } else {
+                Prim.atomicStore(poller, failureAt, r)
+                Prim.atomicStore(poller, stateAt, 3)
+            }
+        } else {
+            let _ = Libc.schedYield()
+        }
+    }
+    0
+}
+
+fun make() -> Int {
+    let scratch = zeroed(scratchBytes)
+    let results = Libc.malloc(Prim.intMulWrapping(batch, 16))
+    if Prim.ptrIsNull(scratch) || Prim.ptrIsNull(results) {
+        Libc.free(scratch)
+        Libc.free(results)
+        return Prim.intNeg(Sys.enomem)
+    }
+    Prim.storeI64(scratch, oneAt, 1)
+    Prim.storePtr(poller, scratchAt, scratch)
+    Prim.storePtr(poller, resultsAt, results)
+    let r = match Target.os {
+        Darwin -> makeKqueue()
+        Linux -> makeEpoll()
+    }
+    if r != 0 {
+        Prim.storePtr(poller, scratchAt, Prim.ptrNull())
+        Prim.storePtr(poller, resultsAt, Prim.ptrNull())
+        Libc.free(scratch)
+        Libc.free(results)
+    }
+    r
+}
+
+-- A `kqueue`, with the user event that breaks a wait registered under ident 0:
+-- `EV_CLEAR` makes each trigger one event that a wait takes.
+fun makeKqueue() -> Int {
+    let kq = Sys.cInt(Libc.kqueue())
+    if kq < 0 { return Prim.intNeg(Sys.errno()) }
+    let _ = Libc.fcntlWith(kq, Sys.setDescriptorFlags, Sys.descriptorCloseOnExec)
+    Prim.atomicStore(poller, descriptorAt, kq)
+    let r = change(Sys.filterUser(), 0, Prim.intOr(Sys.evAdd, Sys.evClear), 0, 0)
+    if r < 0 { let _ = Libc.close(kq) }
+    r
+}
+
+-- An epoll instance, with an `eventfd` that breaks a wait registered under
+-- token 0, level-triggered: it stays readable until a wait reads it.
+fun makeEpoll() -> Int {
+    let ep = Sys.cInt(Libc.epollCreate1(Sys.closeOnExec()))
+    if ep < 0 { return Prim.intNeg(Sys.errno()) }
+    let wake = Sys.cInt(Libc.eventfd(0, Prim.intOr(Sys.nonBlocking(), Sys.closeOnExec())))
+    if wake < 0 {
+        let failure = Prim.intNeg(Sys.errno())
+        let _ = Libc.close(ep)
+        return failure
+    }
+    let r = epollControl(ep, Sys.epollCtlAdd, wake, Sys.epollIn, 0)
+    if r < 0 {
+        let _ = Libc.close(ep)
+        let _ = Libc.close(wake)
+        return r
+    }
+    Prim.atomicStore(poller, descriptorAt, ep)
+    Prim.atomicStore(poller, wakeDescriptorAt, wake)
+    0
+}
+
+-- -- Darwin
+
+-- Fill the `struct kevent` at `at` in `buf` (`Turkey.Sys.keventBytes`). The
+-- `filter`, `flags` and `fflags` fields share one word, little-endian.
+fun setEvent(buf : Prim.Ptr, at : Int, ident : Int, filter : Int, flags : Int, fflags : Int,
+             data : Int, udata : Int) -> Unit {
+    Prim.storeI64(buf, at, ident)
+    let packed = Prim.intOr(Prim.intAnd(filter, 0xFFFF),
+                            Prim.intOr(Prim.intShl(flags, 16), Prim.intShl(fflags, 32)))
+    Prim.storeI64(buf, plus(at, 8), packed)
+    Prim.storeI64(buf, plus(at, 16), data)
+    Prim.storeI64(buf, plus(at, 24), udata)
+}
+
+-- Make one change to the queue, with `EV_RECEIPT`, so that the call answers
+-- the change and takes no pending event; 0, or the negated error number the
+-- receipt carries. Never without a receipt: a change that fails reports it
+-- only if there is room in the event list to carry it. A process or
+-- descriptor that is already gone is reported as `ESRCH` or `EBADF`.
+fun change(filter : Int, ident : Int, flags : Int, fflags : Int, udata : Int) -> Int {
+    -- The change, its receipt, and a zero timeout.
+    let buf = zeroed(80)
+    if Prim.ptrIsNull(buf) { return Prim.intNeg(Sys.enomem) }
+    setEvent(buf, 0, ident, filter, Prim.intOr(flags, Sys.evReceipt), fflags, 0, udata)
+    let kq = Prim.atomicLoad(poller, descriptorAt)
+    var answer = 0
+    while True {
+        let n = Sys.cInt(Libc.kevent(kq, buf, 1, Prim.ptrAdd(buf, 32), 1, Prim.ptrAdd(buf, 64)))
+        if n < 0 {
+            answer = Prim.intNeg(Sys.errno())
+            if answer != Prim.intNeg(Sys.eintr) { break }
+        } else {
+            let head = Prim.loadI64(buf, 40)
+            if Prim.intAnd(Prim.intShr(head, 16), Sys.evError) != 0 {
+                answer = Prim.intNeg(Prim.loadI64(buf, 48))
+            }
+            break
+        }
+    }
+    Libc.free(buf)
+    answer
+}
+
+-- -- Linux
+
+-- `epoll_ctl`, with `events` and `token` as the `struct epoll_event`; 0 or
+-- the negated `errno`.
+fun epollControl(ep : Int, operation : Int, fd : Int, events : Int, token : Int) -> Int {
+    let event = Libc.malloc(16)
+    if Prim.ptrIsNull(event) { return Prim.intNeg(Sys.enomem) }
+    Prim.storeI64(event, 0, events)
+    Prim.storeI64(event, 8, token)
+    let r = Sys.cResult(Libc.epollCtl(ep, operation, fd, event))
+    Libc.free(event)
+    r
+}
+
+-- Interest in `fd`'s `events`, once, delivering `token`: a change of the
+-- descriptor's registration, or a new one if it has none.
+fun epollArm(fd : Int, events : Int, token : Int) -> Int {
+    let ep = Prim.atomicLoad(poller, descriptorAt)
+    let armed = Prim.intOr(events, Sys.epollOneShot)
+    let r = epollControl(ep, Sys.epollCtlMod, fd, armed, token)
+    if r == Prim.intNeg(Sys.enoent) { epollControl(ep, Sys.epollCtlAdd, fd, armed, token) } else { r }
+}
+
+-- -- registering
+
+-- Tell the poller to deliver `token` once `fd` is readable, or at end of file
+-- or on an error; 0, or the negated `errno`.
+fun pollRead(fd : Int, token : Int) -> Int {
+    let ready = pollerReady()
+    if ready < 0 { return ready }
+    match Target.os {
+        Darwin -> change(Sys.filterRead(), fd, Prim.intOr(Sys.evAdd, Sys.evOneShot), 0, token)
+        Linux -> epollArm(fd, Sys.epollIn, token)
+    }
+}
+
+-- The same for `fd` writable.
+fun pollWrite(fd : Int, token : Int) -> Int {
+    let ready = pollerReady()
+    if ready < 0 { return ready }
+    match Target.os {
+        Darwin -> change(Sys.filterWrite(), fd, Prim.intOr(Sys.evAdd, Sys.evOneShot), 0, token)
+        Linux -> epollArm(fd, Sys.epollOut, token)
+    }
+}
+
+-- Tell the poller to deliver `token` once the child `pid` has exited: 0 if it
+-- will; 1 if it has exited already -- Darwin reports a child that is a zombie,
+-- or gone, as `ESRCH`, and nothing will be delivered -- in which case the
+-- caller reaps it with `waitpid`; or the negated `errno`. On Linux the child
+-- is watched through a descriptor from `pidfd_open`, which is kept in a table
+-- under `token` until `pollForgetChild`. A zombie is registered like any
+-- other and delivers at once; `pidfd_open` fails with `ESRCH` for a pid that
+-- no longer exists, which is the negated result.
+fun pollChild(pid : Int, token : Int) -> Int {
+    let ready = pollerReady()
+    if ready < 0 { return ready }
+    match Target.os {
+        Darwin -> {
+            let flags = Prim.intOr(Sys.evAdd, Sys.evOneShot)
+            let r = change(Sys.filterProc(), pid, flags, Prim.intOr(Sys.noteExit, Sys.noteExitStatus), token)
+            if r == Prim.intNeg(Sys.esrch) { 1 } else { r }
+        }
+        Linux -> watchPid(pid, token)
+    }
+}
+
+fun watchPid(pid : Int, token : Int) -> Int {
+    let fd = Sys.result(Libc.syscall(Sys.pidfdOpen, Prim.ptrFromInt(pid), 0, 0, Prim.ptrNull()))
+    if fd < 0 { return fd }
+    let r = epollArm(fd, Sys.epollIn, token)
+    if r < 0 {
+        let _ = Libc.close(fd)
+        return r
+    }
+    if !childAdd(token, fd) {
+        let _ = Libc.close(fd)
+        return Prim.intNeg(Sys.enomem)
+    }
+    0
+}
+
+-- Drop interest in `fd`, both directions, ignoring that there may be none.
+-- Before it is closed, on Linux (see above).
+fun pollForget(fd : Int) -> Unit {
+    if Prim.atomicLoad(poller, stateAt) != 2 { return {} }
+    match Target.os {
+        Darwin -> {
+            let _ = change(Sys.filterRead(), fd, Sys.evDelete, 0, 0)
+            let _ = change(Sys.filterWrite(), fd, Sys.evDelete, 0, 0)
+        }
+        Linux -> { let _ = epollControl(Prim.atomicLoad(poller, descriptorAt), Sys.epollCtlDel, fd, 0, 0) }
+    }
+}
+
+-- Drop interest in the child registered under `token`, and release what
+-- watched it, ignoring that it may have fired or never been registered:
+-- the caller does this once the child's result has been delivered, too.
+fun pollForgetChild(pid : Int, token : Int) -> Unit {
+    if Prim.atomicLoad(poller, stateAt) != 2 { return {} }
+    match Target.os {
+        Darwin -> { let _ = change(Sys.filterProc(), pid, Sys.evDelete, 0, 0) }
+        Linux -> {
+            let fd = childTake(token)
+            -- Closing the descriptor removes it from the epoll instance: no
+            -- other descriptor refers to the pidfd.
+            if fd >= 0 { let _ = Libc.close(fd) }
+        }
+    }
+}
+
+-- -- the pidfd table (Linux)
+
+-- The pidfds being watched: word 0 an array of `(token, descriptor)` pairs,
+-- 8 how many, 16 how many fit. Under `childLock`, taken with `acquire` so
+-- that a waiter does not hold up a collection. Only registration and
+-- `pollForgetChild` use it; the wait does not.
+var children : Prim.Ptr = zeroed(24)
+var childLock : Prim.Ptr = Lock.new()
+
+fun childAdd(token : Int, fd : Int) -> Bool {
+    acquire(childLock)
+    var n = Prim.loadI64(children, 8)
+    var table = Prim.loadPtr(children, 0)
+    var ok = True
+    if n == Prim.loadI64(children, 16) {
+        let room = if n == 0 { 8 } else { Prim.intMulWrapping(n, 2) }
+        let grown = Libc.realloc(table, Prim.intMulWrapping(room, 16))
+        if Prim.ptrIsNull(grown) {
+            ok = False
+        } else {
+            table = grown
+            Prim.storePtr(children, 0, grown)
+            Prim.storeI64(children, 16, room)
+        }
+    }
+    if ok {
+        Prim.storeI64(table, Prim.intMulWrapping(n, 16), token)
+        Prim.storeI64(table, plus(Prim.intMulWrapping(n, 16), 8), fd)
+        Prim.storeI64(children, 8, plus(n, 1))
+    }
+    Lock.release(childLock)
+    ok
+}
+
+-- Remove the pair for `token` and answer its descriptor, or -1.
+fun childTake(token : Int) -> Int {
+    acquire(childLock)
+    let n = Prim.loadI64(children, 8)
+    let table = Prim.loadPtr(children, 0)
+    var found = -1
+    for var i = 0; i < n; i = plus(i, 1) {
+        let at = Prim.intMulWrapping(i, 16)
+        if found < 0 && Prim.loadI64(table, at) == token {
+            found = Prim.loadI64(table, plus(at, 8))
+            let last = Prim.intMulWrapping(plus(n, -1), 16)
+            Prim.storeI64(table, at, Prim.loadI64(table, last))
+            Prim.storeI64(table, plus(at, 8), Prim.loadI64(table, plus(last, 8)))
+            Prim.storeI64(children, 8, plus(n, -1))
+        }
+    }
+    Lock.release(childLock)
+    found
+}
+
+-- -- electing and breaking
+
+-- Whether the caller is now the one worker that may poll: it stays so until
+-- `release`.
+fun claim() -> Bool = Prim.atomicCas(signals, claimedAt, 0, 1) == 0
+
+fun release() -> Unit = Prim.atomicStore(signals, claimedAt, 0)
+
+-- Registrations and timers the scheduler is waiting on, `n` more (or fewer,
+-- negative).
+fun interestAdd(n : Int) -> Unit {
+    let _ = Prim.atomicAdd(signals, interestAt, n)
+}
+
+fun interest() -> Int = Prim.atomicLoad(signals, interestAt)
+
+-- End the poller's wait, if it is in one, or keep its next from starting: a
+-- Darwin user event is triggered, a Linux `eventfd` written. A break is one
+-- event that a wait takes whenever it comes, so one sent a moment after the
+-- wait ended wakes the next wait early, which is harmless. Only the signaller
+-- that sets word 48 sends it, and a send that fails clears the word again so
+-- that the next signaller tries.
+fun wakePoller() -> Unit {
+    if Prim.atomicLoad(poller, stateAt) != 2 { return {} }
+    if Prim.atomicCas(signals, wakePendingAt, 0, 1) != 0 { return {} }
+    let failed = match Target.os {
+        Darwin -> change(Sys.filterUser(), 0, 0, Sys.noteTrigger, 0) < 0
+        -- `EAGAIN` is a counter that cannot take another 1: a break is
+        -- pending already.
+        Linux -> {
+            let wake = Prim.atomicLoad(poller, wakeDescriptorAt)
+            let one = Prim.ptrAdd(Prim.loadPtr(poller, scratchAt), oneAt)
+            let r = Sys.result(Libc.write(wake, one, 8))
+            r < 0 && r != Prim.intNeg(Sys.eagain())
+        }
+    }
+    if failed { Prim.atomicStore(signals, wakePendingAt, 0) }
+}
+
+-- -- waiting
+
+-- Wait for events, as the worker that holds the claim (`claim`) and is blocked
+-- already (`blockEnter`; `Turkey.Heap.pause` does it): until a registered
+-- event, a break, `timeout` nanoseconds (rounded up to the kernel's
+-- granularity, so that a deadline is never met early), or never if `timeout`
+-- is `pollTimeoutForever`. `seen` is the work epoch the caller read before it
+-- looked for work and found none: if the epoch has moved, the wait is skipped.
+--
+-- Answers how many results there are to read (`resultToken`, `resultValue`),
+-- which is 0 for a break, a timeout, or a signal that interrupted the wait, or
+-- the negated `errno` if the poller cannot be had or the wait failed.
+fun pollWait(seen : Int, timeout : Int) -> Int {
+    let ready = pollerReady()
+    if ready < 0 { return ready }
+    Prim.atomicStore(poller, countAt, 0)
+    Prim.atomicStore(signals, blockedAt, 1)
+    var n = 0
+    if Prim.atomicLoad(signals, 0) == seen { n = waitFor(timeout) }
+    Prim.atomicStore(signals, blockedAt, 0)
+    Prim.atomicStore(signals, wakePendingAt, 0)
+    n
+}
+
+-- Take the events that are ready now, as the worker that holds the claim,
+-- without blocking and without `blockEnter`: how many results, or the
+-- negated `errno`.
+fun pollNow() -> Int {
+    let ready = pollerReady()
+    if ready < 0 { return ready }
+    Prim.atomicStore(poller, countAt, 0)
+    waitFor(0)
+}
+
+fun resultToken(i : Int) -> Int =
+    Prim.loadI64(Prim.loadPtr(poller, resultsAt), Prim.intMulWrapping(i, 16))
+
+fun resultValue(i : Int) -> Int =
+    Prim.loadI64(Prim.loadPtr(poller, resultsAt), plus(Prim.intMulWrapping(i, 16), 8))
+
+-- The kernel's wait and the decoding of what it left. An interrupted wait
+-- answers 0, as a timeout does; the caller looks again. `errno` is read
+-- straight after the call, before anything else can set it.
+--
+-- Taking a break clears the break word: the event is gone from the kernel, so
+-- the next signaller must send another.
+fun waitFor(timeout : Int) -> Int {
+    let scratch = Prim.loadPtr(poller, scratchAt)
+    let n = match Target.os {
+        Darwin -> kqueueWait(scratch, timeout)
+        Linux -> epollWaitFor(scratch, timeout)
+    }
+    if n <= 0 { return n }
+    var count = 0
+    for var i = 0; i < n; i = plus(i, 1) {
+        count = match Target.os {
+            Darwin -> decodeKevent(scratch, i, count)
+            Linux -> decodeEpoll(scratch, i, count)
+        }
+    }
+    Prim.atomicStore(poller, countAt, count)
+    count
+}
+
+-- The number of events the kernel stored at `scratch`, or the negated `errno`
+-- of a wait that failed, with an interruption counted as no events.
+fun kqueueWait(scratch : Prim.Ptr, timeout : Int) -> Int {
+    -- Capped at about 31 years, which Darwin accepts and which is as good as
+    -- never.
+    var limit = Prim.ptrNull()
+    if timeout >= 0 {
+        limit = Prim.ptrAdd(scratch, timespecAt)
+        let capped = if timeout > 1_000_000_000_000_000 { 1_000_000_000_000_000 } else { timeout }
+        Prim.storeI64(limit, 0, capped / 1_000_000_000)
+        Prim.storeI64(limit, 8, capped % 1_000_000_000)
+    }
+    let n = Sys.cInt(Libc.kevent(Prim.atomicLoad(poller, descriptorAt), Prim.ptrNull(), 0,
+                                 scratch, batch, limit))
+    afterWait(n)
+}
+
+fun epollWaitFor(scratch : Prim.Ptr, timeout : Int) -> Int {
+    -- Milliseconds, rounded up; a C `int`, so capped.
+    let ms = if timeout < 0 {
+        -1
+    } else if timeout > 1_000_000_000_000_000 {
+        1_000_000_000
+    } else {
+        plus(timeout, 999_999) / 1_000_000
+    }
+    let n = Sys.cInt(Libc.epollWait(Prim.atomicLoad(poller, descriptorAt), scratch, batch, ms))
+    afterWait(n)
+}
+
+fun afterWait(n : Int) -> Int {
+    if n >= 0 { return n }
+    let failure = Prim.intNeg(Sys.errno())
+    if failure == Prim.intNeg(Sys.eintr) { 0 } else { failure }
+}
+
+-- Add the pair `(token, value)` to the results, answering the new count.
+fun push(count : Int, token : Int, value : Int) -> Int {
+    let results = Prim.loadPtr(poller, resultsAt)
+    Prim.storeI64(results, Prim.intMulWrapping(count, 16), token)
+    Prim.storeI64(results, plus(Prim.intMulWrapping(count, 16), 8), value)
+    plus(count, 1)
+}
+
+-- The `i`th `struct kevent` at `scratch` as a result, if it is not a break.
+-- The break is the user filter; an event whose `udata` is the token the
+-- caller chose is anything else. A read or write event carries `EV_EOF` at end
+-- of stream, and `EV_ERROR` for a failure; a process event carries the wait
+-- status in `data`.
+fun decodeKevent(scratch : Prim.Ptr, i : Int, count : Int) -> Int {
+    let event = Prim.ptrAdd(scratch, Prim.intMulWrapping(i, 32))
+    let head = Prim.loadI64(event, 8)
+    let raw = Prim.intAnd(head, 0xFFFF)
+    let filter = if raw >= 0x8000 { Prim.intSubWrapping(raw, 0x10000) } else { raw }
+    let flags = Prim.intAnd(Prim.intShr(head, 16), 0xFFFF)
+    if filter == Sys.filterUser() {
+        Prim.atomicStore(signals, wakePendingAt, 0)
+        return count
+    }
+    let token = Prim.loadI64(event, 24)
+    if filter == Sys.filterProc() {
+        return push(count, token, Prim.loadI64(event, 16))
+    }
+    var value = if filter == Sys.filterRead() { pollReadable } else { pollWritable }
+    if Prim.intAnd(flags, Sys.evEof) != 0 { value = Prim.intOr(value, pollEof) }
+    if Prim.intAnd(flags, Sys.evError) != 0 { value = Prim.intOr(value, pollError) }
+    push(count, token, value)
+}
+
+-- The `i`th `struct epoll_event` at `scratch` as a result, if it is not the
+-- break, whose `eventfd` is read to empty it, which makes it stop reporting.
+fun decodeEpoll(scratch : Prim.Ptr, i : Int, count : Int) -> Int {
+    let event = Prim.ptrAdd(scratch, Prim.intMulWrapping(i, 16))
+    let events = Prim.intAnd(Prim.loadI64(event, 0), 0xFFFF_FFFF)
+    let token = Prim.loadI64(event, 8)
+    if token == 0 {
+        let _ = Libc.read(Prim.atomicLoad(poller, wakeDescriptorAt), Prim.ptrAdd(scratch, drainAt), 8)
+        Prim.atomicStore(signals, wakePendingAt, 0)
+        return count
+    }
+    var value = 0
+    if Prim.intAnd(events, Sys.epollIn) != 0 { value = Prim.intOr(value, pollReadable) }
+    if Prim.intAnd(events, Sys.epollOut) != 0 { value = Prim.intOr(value, pollWritable) }
+    if Prim.intAnd(events, Prim.intOr(Sys.epollHup, Sys.epollRdHup)) != 0 {
+        value = Prim.intOr(value, pollEof)
+    }
+    if Prim.intAnd(events, Sys.epollErr) != 0 { value = Prim.intOr(value, pollError) }
+    push(count, token, value)
 }
 
 -- -- C calls that may block -------------------------------------------------------------

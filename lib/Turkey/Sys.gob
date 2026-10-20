@@ -7,13 +7,17 @@ module Turkey.Sys (
     descriptorCloseOnExec,
     eperm, enoent, eintr, eio, ebadf, enomem, eacces, eexist, enotdir, eisdir,
     einval, emfile, enotty, enospc, espipe, erofs, epipe, exdev, eagain, enametoolong,
-    eloop, enotempty, eilseq,
+    eloop, enotempty, eilseq, esrch, echild,
     statBytes, statModeAt, statModeWidth, statSizeAt, statModifiedAt,
     direntTypeAt, direntNameAt,
     entryUnknown, entryFifo, entryCharacterDevice, entryDirectory, entryBlockDevice,
     entryRegular, entrySymbolicLink, entrySocket,
     fileType, regularFile, directory, fifo, characterDevice, socket, symbolicLink,
     blockDevice,
+    filterRead, filterWrite, filterProc, filterUser, evAdd, evDelete, evOneShot, evClear,
+    evReceipt, evError, evEof, noteExit, noteExitStatus, noteTrigger, keventBytes,
+    epollIn, epollOut, epollErr, epollHup, epollRdHup, epollOneShot,
+    epollCtlAdd, epollCtlDel, epollCtlMod, epollEventBytes, pidfdOpen, waitNoHang,
     errno, clearErrno, result, cResult, cInt,
 )
 
@@ -24,7 +28,8 @@ module Turkey.Sys (
 -- Each per-target value is a `match` on `Target.os`, so a target added to
 -- `lib/Target.gob` makes every one of them non-exhaustive until it is given
 -- its own. The Darwin values are `<fcntl.h>`, `<errno.h>`, `<sys/stat.h>`,
--- `<sys/file.h>` and `<dirent.h>` from the macOS SDK. The Linux values are
+-- `<sys/file.h>` and `<dirent.h>` from the macOS SDK (the readiness constants
+-- are for one target each, and say so). The Linux values are
 -- the kernel's generic ones, which arm64 uses, except where arm64's own
 -- `<asm/fcntl.h>` overrides them (`O_DIRECTORY`, `O_NOFOLLOW`); `struct
 -- dirent` is glibc's and musl's, which agree on arm64.
@@ -171,6 +176,10 @@ fun enotempty() -> Int = match Target.os {
     Linux -> 39
 }
 
+-- `ESRCH`: no such process; `ECHILD`: no such child to wait for.
+let esrch : Int = 3
+let echild : Int = 10
+
 -- `EWOULDBLOCK` is the same number on both.
 fun eagain() -> Int = match Target.os {
     Darwin -> 35
@@ -248,6 +257,79 @@ let entryBlockDevice : Int = 6
 let entryRegular : Int = 8
 let entrySymbolicLink : Int = 10
 let entrySocket : Int = 12
+
+-- -- readiness -------------------------------------------------------------------
+--
+-- Darwin's `kqueue` and Linux's `epoll`, whose constants have nothing in
+-- common, so each is given for its own target only (`Turkey.Workers` names
+-- them in the arm of a match on `Target.os` that its target compiles). The
+-- Darwin values are `<sys/event.h>` from the macOS SDK and were read back
+-- from a C program built against it; the Linux ones are the kernel's
+-- `<linux/eventpoll.h>`.
+
+-- A `struct kevent` is 32 bytes: `ident` (a `uintptr_t`) at 0; `filter` (an
+-- `int16_t`) at 8; `flags` (a `uint16_t`) at 10; `fflags` (a `uint32_t`) at
+-- 12; `data` (an `intptr_t`) at 16; `udata` (a pointer) at 24.
+let keventBytes : Int = 32
+
+-- The `filter`s, which are negative numbers. A read or write filter's
+-- `ident` is a descriptor, a process filter's a pid, and a user filter's
+-- is its own name.
+fun filterRead() -> Int = Prim.intNeg(1)
+fun filterWrite() -> Int = Prim.intNeg(2)
+fun filterProc() -> Int = Prim.intNeg(5)
+fun filterUser() -> Int = Prim.intNeg(10)
+
+-- The `flags`. `EV_ADD` makes the registration, or changes it if it exists.
+-- `EV_DELETE` drops it. `EV_ONESHOT` drops it once an event is delivered.
+-- `EV_CLEAR` resets the filter's state when an event is delivered, so that
+-- an event is reported once per occurrence. `EV_RECEIPT` makes the call
+-- answer each change with an event of its own and consume no pending ones.
+-- Of what comes back, `EV_ERROR` marks a change that failed, with the error
+-- number in `data`, and `EV_EOF` an end of stream or a process that exited.
+let evAdd : Int = 0x1
+let evDelete : Int = 0x2
+let evOneShot : Int = 0x10
+let evClear : Int = 0x20
+let evReceipt : Int = 0x40
+let evError : Int = 0x4000
+let evEof : Int = 0x8000
+
+-- The `fflags` of a process filter: `NOTE_EXIT` asks for the exit, and
+-- `NOTE_EXITSTATUS` for its `wait` status as the event's `data`. Of a user
+-- filter: `NOTE_TRIGGER` fires it.
+let noteExit : Int = 0x8000_0000
+let noteExitStatus : Int = 0x400_0000
+let noteTrigger : Int = 0x100_0000
+
+-- A `struct epoll_event` is 16 bytes on arm64: the `events` mask (a
+-- `uint32_t`) at 0, then `data` (a `uint64_t`) at 8. It is packed, and 12
+-- bytes, on x86-64 only.
+let epollEventBytes : Int = 16
+
+-- The `events` bits. `EPOLLIN` and `EPOLLOUT` ask to be told of readability
+-- and writability and say so; `EPOLLERR` and `EPOLLHUP` (both ends gone) are
+-- reported whether asked for or not, and `EPOLLRDHUP` (the peer shut down
+-- writing) only when asked for. `EPOLLONESHOT` disables the descriptor's interest once an event is
+-- delivered, until `EPOLL_CTL_MOD` arms it again.
+let epollIn : Int = 0x1
+let epollOut : Int = 0x4
+let epollErr : Int = 0x8
+let epollHup : Int = 0x10
+let epollRdHup : Int = 0x2000
+let epollOneShot : Int = 0x4000_0000
+
+-- `epoll_ctl`'s operations.
+let epollCtlAdd : Int = 1
+let epollCtlDel : Int = 2
+let epollCtlMod : Int = 3
+
+-- `SYS_pidfd_open` on arm64 Linux: a descriptor that becomes readable when
+-- the process exits.
+let pidfdOpen : Int = 434
+
+-- `WNOHANG`, for `waitpid`: the same on both.
+let waitNoHang : Int = 1
 
 -- -- the result convention -------------------------------------------------------
 

@@ -1713,15 +1713,22 @@ fun markFailed(message : Prim.Ptr) -> Unit {
 -- for this worker: until the work epoch is no longer `seen`, which the caller
 -- read before it looked for work and found none (`Turkey.Workers.signalWork`).
 --
+-- A `timeout` of -1 sleeps on the epoch and answers 0. Any other waits in the
+-- operating system for readiness events instead, as the worker that holds the
+-- poller's claim (`Turkey.Workers.pollWait`), for the nanoseconds it gives or
+-- until an event or a signal: it answers how many results there are to read,
+-- or the negated `errno` if it could not wait.
+--
 -- A collection that holds this worker meanwhile may ask it to mark, as it asks
 -- the stopped ones (`pausing` says it can), and wakes it to say so; it waits
 -- for the collection to let it go either way. A worker blocked on a lock is
 -- not asked, since the lock may be the collecting worker's.
-foreign "turkey_worker_pause" fun pause(seen : Int) -> Unit {
+foreign "turkey_worker_pause" fun pause(seen : Int, timeout : Int) -> Int {
     let me = times8(Workers.index())
     Prim.atomicStore(pausing, me, 1)
     Workers.blockEnter(Prim.frameAddress())
-    Workers.sleepForWork(seen)
+    var results = 0
+    if timeout == -1 { Workers.sleepForWork(seen) } else { results = Workers.pollWait(seen, timeout) }
     while True {
         let epoch = Workers.collectionSeen()
         if Workers.unblock() { break }
@@ -1733,6 +1740,7 @@ foreign "turkey_worker_pause" fun pause(seen : Int) -> Unit {
         }
     }
     Prim.atomicStore(pausing, me, 0)
+    results
 }
 
 -- At a safepoint with the running worker's stop word raised: stopped until

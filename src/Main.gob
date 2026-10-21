@@ -20,7 +20,9 @@ import System.Env as Env
 import System.File as File
 import System.IO as IO
 import System.Parallel as Parallel
-import System.Time as Time
+import Time.Duration (Duration)
+import Time.Duration as Duration
+import Time.Stopwatch as Stopwatch
 import Turkey.Diag as Diag
 import Turkey.Source as Source
 import Turkey.Source (Source)
@@ -96,15 +98,17 @@ var build = Build.plain
 -- whether the work in them is even enough to split.
 var timings = False
 
--- The time now, after reporting `phase` as having started at `since`.
-fun lap(phase : String, since : Int) -> Int {
-    let now = Time.monotonic()
-    if timings { toStderr("time\t" + phase + "\t" + millis(now - since) + "\n") }
-    now
+-- A stopwatch started now, after reporting `phase` as having run since
+-- `since` was started.
+fun lap(phase : String, since : Stopwatch.Stopwatch) -> Stopwatch.Stopwatch {
+    if timings {
+        toStderr("time\t" + phase + "\t" + millis(Stopwatch.elapsed(since)) + "\n")
+    }
+    Stopwatch.start()
 }
 
-fun millis(nanos : Int) -> String {
-    let tenths = nanos / 100000
+fun millis(d : Duration) -> String {
+    let tenths = Duration.toNanos(d) / 100000
     Int.toString(tenths / 10) + "." + Int.toString(tenths % 10) + "ms"
 }
 
@@ -283,7 +287,7 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
     if wants("decls") { dumpDecls(b, path) }
     if wants("classes") { dumpClasses(b, path) }
     write(String.drain(b))
-    var at = Time.monotonic()
+    var at = Stopwatch.start()
     let (checked, entry) = checkProgram(path)
     at = lap("check", at)
     reportWarnings(checked, path)
@@ -469,7 +473,7 @@ fun dumpMono(b : String.Builder, checked : Checked, entry : Modules.Module,
 fun optimize(checked : Checked, main : String, specialized : Core.CProgram)
         -> Core.CProgram {
     -- Each step's time, for `--timings`, under `opt.`.
-    var at = Time.monotonic()
+    var at = Stopwatch.start()
     let first = Opt.reduceProgram(specialized, checked.decls)
     at = lap("opt.reduce", at)
     let discovered = Joins.discover(first)
@@ -657,7 +661,7 @@ type Made = Made {
     complaints : Vec String,
     code       : Vec (Stream.Item Arm64.Inst),
     texts      : Array (Option String),
-    cost       : Int,
+    cost       : Duration,
 }
 
 -- Selected function `i`, through the backend. It reads only what selection
@@ -666,7 +670,7 @@ type Made = Made {
 fun backendOf(asm : Asm.Asm, f : Ssa.Func Arm64.Inst, i : Int,
               lows : Map.Map String (Ssa.Func LowIr.Low),
               sigs : Map.Map String MachineCheck.Signature, outs : Vec Out) -> Made {
-    let started = Time.monotonic()
+    let started = Stopwatch.start()
     let frame = match Map.get(lows, f.name) {
         Some(low) -> Roots.analyze(low)
         None -> Roots.Frame { slots = Map.new(), at = Map.new(), objects = [],
@@ -675,7 +679,7 @@ fun backendOf(asm : Asm.Asm, f : Ssa.Func Arm64.Inst, i : Int,
     let a = Regalloc.allocate(f, frame.slots)
     match a.stopped {
         Some(why) -> Made { layout = None, skipped = why, complaints = [], code = [],
-                            texts = [], cost = Time.monotonic() - started }
+                            texts = [], cost = Stopwatch.elapsed(started) }
         None -> {
             let complaints = MachineCheck.check(a.func, sigs)
             let l = Frame.layout(a, frame)
@@ -687,7 +691,7 @@ fun backendOf(asm : Asm.Asm, f : Ssa.Func Arm64.Inst, i : Int,
                 Some(String.build(text))
             } else { None })
             Made { layout = Some(l), skipped = "", complaints = complaints, code = code,
-                   texts = texts, cost = Time.monotonic() - started }
+                   texts = texts, cost = Stopwatch.elapsed(started) }
         }
     }
 }
@@ -750,7 +754,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
         }
         None -> 0
     }
-    var at = Time.monotonic()
+    var at = Stopwatch.start()
     let (selected, unsupported, asm) =
         Select.selectModule(module_, target)
     at = lap("select", at)
@@ -769,7 +773,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     let sigs = MachineCheck.signatures(module_.functions, asm.dialect)
     let complaints = []
     -- Each function's time from its roots to its text, for `--timings`.
-    let costs : Vec (String, Int) = []
+    let costs : Vec (String, Duration) = []
     -- Each function made by a task when there are workers to run them in
     -- parallel, and handed on in order as soon as it and those before it are.
     let indices = Array.init(len(selected), fun(i) = i)
@@ -829,13 +833,13 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
 -- How the backend's time is spread over functions: what parallelizing it
 -- per function could gain is bounded by the largest one, and how evenly the
 -- rest divide decides how close to that bound it gets.
-fun reportCosts(costs : Vec (String, Int)) -> Unit {
-    let sorted = Vec.sortBy(costs, fun((_, a), (_, b)) = Int.compare(b, a))
-    var total = 0
+fun reportCosts(costs : Vec (String, Duration)) -> Unit {
+    let sorted = Vec.sortBy(costs, fun((_, a), (_, b)) = Array.threeWay(b, a))
+    var total = Duration.zero
     for (_, c) in sorted { total = total + c }
     let n = len(sorted)
     -- The cost at the given rank, in thousandths from the largest.
-    let rank = fun(thousandths) = if n == 0 { 0 } else {
+    let rank = fun(thousandths) = if n == 0 { Duration.zero } else {
         let k = n * thousandths / 1000
         let (_, c) = sorted[if k < n { k } else { n - 1 }]
         c

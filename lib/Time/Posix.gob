@@ -1,0 +1,171 @@
+module Time.Posix (Rule, parse, offsetAt, transitions)
+
+-- POSIX time zone rules, the `TZ` form: `EST5EDT,M3.2.0,M11.1.0` is five hours
+-- west of UTC, and an hour less from 02:00 on the second Sunday of March to
+-- 02:00 on the first Sunday of November. A TZif file ends with one of these,
+-- which gives every transition after its table runs out; files written in the
+-- default "slim" form rely on it for every year with a recurring rule.
+--
+-- The text writes an offset as hours west of UTC, the opposite of the sign an
+-- `Offset` has. The extensions TZif version 3 allows are read: a transition
+-- time from -167 to 167 hours, so that a rule can fall on the day before or
+-- after.
+
+import Time.Calendar (DayNumber)
+import Time.Calendar as Calendar
+import Time.Duration (Duration)
+import Time.Duration as Duration
+import Time.Frame (Transition(..), UnixSeconds)
+import Time.Frame as Frame
+import Time.ISO as ISO
+import Time.Month (Month(..))
+import Time.Month as Month
+import Time.Offset (Offset)
+import Time.Offset as Offset
+import Time.Weekday (Weekday(..))
+import Time.Weekday as Weekday
+
+type Rule = Rule { standard : Offset, dst : Option Dst }
+
+-- Daylight saving time: its offset, and when it starts and ends, each a day of
+-- the year and the time after its midnight on the clock in force before it --
+-- standard time for the start, daylight saving time for the end.
+type Dst = Dst { offset : Offset, start : Day, startTime : Duration, end : Day, endTime : Duration }
+
+-- `Jn`, the nth day counting March 1 as day 60 in every year; `n`, counting
+-- from 0 and counting February 29; `Mm.w.d`, the given day of the week in the
+-- wth week of the month, where week 5 is the last.
+type Day = Julian(Int) | Ordinal(Int) | WeekOf(Month, Int, Weekday)
+
+fun parse(s : String) -> Option Rule {
+    let r = ISO.reader(s)
+    name(r)?
+    let standard = west(r)?
+    if ISO.finished(r) { return Some(Rule { standard, dst = None }) }
+    name(r)?
+    -- With no offset of its own, daylight saving time is an hour ahead.
+    let offset = if ISO.finished(r) || ISO.looking(r, ',') {
+        Offset.fromSeconds(Offset.toSeconds(standard) + 3600)?
+    } else {
+        west(r)?
+    }
+    -- With no rules, the United States' since 2007. POSIX leaves this case to
+    -- the system; a TZif footer with daylight saving time always has rules, so
+    -- only a hand-written `TZ` reaches it.
+    let days = if ISO.finished(r) {
+        Some((WeekOf(Mar, 2, Sun), Duration.hours(2), WeekOf(Nov, 1, Sun), Duration.hours(2)))
+    } else {
+        rules(r)
+    }
+    let (start, startTime, end, endTime) = days?
+    if !ISO.finished(r) { return None }
+    Some(Rule { standard, dst = Some(Dst { offset, start, startTime, end, endTime }) })
+}
+
+-- The two rules after the comma, with the comma.
+fun rules(r : ISO.Reader) -> Option (Day, Duration, Day, Duration) {
+    ISO.expect(r, ',')?
+    let start = day(r)?
+    let startTime = if ISO.accept(r, '/') { Duration.seconds(clock(r, 167)?) } else { Duration.hours(2) }
+    ISO.expect(r, ',')?
+    let end = day(r)?
+    let endTime = if ISO.accept(r, '/') { Duration.seconds(clock(r, 167)?) } else { Duration.hours(2) }
+    Some((start, startTime, end, endTime))
+}
+
+-- A zone abbreviation: three or more letters, or anything but `>` inside
+-- `<...>`, which is how `<+0330>` is written.
+fun name(r : ISO.Reader) -> Option Unit {
+    if ISO.accept(r, '<') {
+        var count = 0
+        while !ISO.accept(r, '>') {
+            ISO.skip(r)?
+            count = count + 1
+        }
+        if count < 3 { None } else { Some(()) }
+    } else {
+        var count = 0
+        while ISO.letter(r) { count = count + 1 }
+        if count < 3 { None } else { Some(()) }
+    }
+}
+
+-- An offset as the text writes it, hours west of UTC.
+fun west(r : ISO.Reader) -> Option Offset = Offset.fromSeconds(-clock(r, 24)?)
+
+-- `[+-]hh[:mm[:ss]]` as seconds, with hours up to `maxHours`.
+fun clock(r : ISO.Reader, maxHours : Int) -> Option Int {
+    let sign = ISO.sign(r)
+    let h = ISO.someDigits(r)?
+    let m = if ISO.accept(r, ':') { ISO.digits(r, 2)? } else { 0 }
+    let s = if ISO.accept(r, ':') { ISO.digits(r, 2)? } else { 0 }
+    if h > maxHours || m > 59 || s > 59 { return None }
+    Some(sign * ((h * 60 + m) * 60 + s))
+}
+
+fun day(r : ISO.Reader) -> Option Day {
+    if ISO.accept(r, 'J') {
+        let n = ISO.someDigits(r)?
+        if n < 1 || n > 365 { None } else { Some(Julian(n)) }
+    } else if ISO.accept(r, 'M') {
+        let m = Month.fromNumber(ISO.someDigits(r)?)?
+        ISO.expect(r, '.')?
+        let w = ISO.someDigits(r)?
+        ISO.expect(r, '.')?
+        -- Days of the week count from Sunday as 0.
+        let d = ISO.someDigits(r)?
+        let wd = if d == 0 { Some(Sun) } else { Weekday.fromNumber(d) }
+        if w < 1 || w > 5 || d > 6 { None } else { Some(WeekOf(m, w, wd?)) }
+    } else {
+        let n = ISO.someDigits(r)?
+        if n > 365 { None } else { Some(Ordinal(n)) }
+    }
+}
+
+-- The day `d` names in `year`.
+fun dayOf(d : Day, year : Int) -> DayNumber {
+    let first = Calendar.daysFromCivil(year, Jan, 1)
+    match d {
+        Julian(n) -> Calendar.addDays(first, n - 1 + (if Calendar.isLeapYear(year) && n >= 60 { 1 } else { 0 }))
+        Ordinal(n) -> Calendar.addDays(first, n)
+        WeekOf(m, w, wd) -> {
+            let start = Calendar.daysFromCivil(year, m, 1)
+            let n = Calendar.addDays(Calendar.onOrAfter(start, wd), 7 * (w - 1))
+            -- Week 5 is the last, which may be the fourth.
+            if Calendar.daysBetween(start, n) >= Calendar.daysInMonth(year, m) {
+                Calendar.addDays(n, -7)
+            } else {
+                n
+            }
+        }
+    }
+}
+
+-- The transitions in `year`, in order.
+fun transitions(rule : Rule, year : Int) -> Array Transition = match rule.dst {
+    None -> []
+    Some(d) -> {
+        let start = Frame.toUnix(Frame.local(dayOf(d.start, year), d.startTime), rule.standard)
+        let end = Frame.toUnix(Frame.local(dayOf(d.end, year), d.endTime), d.offset)
+        let begins = Transition { at = start, before = rule.standard, after = d.offset }
+        let ends = Transition { at = end, before = d.offset, after = rule.standard }
+        if start <= end { [begins, ends] } else { [ends, begins] }
+    }
+}
+
+-- The offset in force at `t`.
+fun offsetAt(rule : Rule, t : UnixSeconds) -> Offset {
+    if let None = rule.dst { return rule.standard }
+    -- The transitions of the year before and after as well, so that a rule
+    -- whose times push a transition across New Year is still found.
+    let year = Calendar.civilFromDays(Frame.day(Frame.toLocal(t, rule.standard))).0
+    var offset = None
+    var first = None
+    for y in [year - 1, year, year + 1] {
+        for transition in transitions(rule, y) {
+            if first == None { first = Some(transition.before) }
+            if transition.at <= t { offset = Some(transition.after) }
+        }
+    }
+    Option.unwrapOr(offset, Option.unwrapOr(first, rule.standard))
+}

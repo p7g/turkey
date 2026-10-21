@@ -1,0 +1,84 @@
+module Time.Frame (
+    LocalSeconds, UnixSeconds, Transition(..), local, day, sinceMidnight, toUnix, toLocal,
+    fromInstant, fraction, toInstant, fromUnixSeconds, year,
+)
+
+-- Seconds counted in the two frames a time zone moves between. A zone's rules
+-- say when its transitions happen in UTC and what its clocks read at each, and
+-- the arithmetic that relates the two is where an hour goes missing, so the
+-- frames are separate types and an offset is the only way between them.
+--
+-- Both are whole seconds, which is all offsets and transitions are; a
+-- fraction of a second is the caller's to carry. Neither is bounded: a
+-- reading can be any date, and a zone file's transitions reach far past the
+-- years an `Instant` can hold.
+
+import Time.Calendar (DayNumber)
+import Time.Calendar as Calendar
+import Time.Duration (Duration)
+import Time.Duration as Duration
+import Time.Instant (Instant)
+import Time.Instant as Instant
+import Time.Offset (Offset)
+import Time.Offset as Offset
+
+-- Seconds since 1970-01-01T00:00 on a wall clock, in no zone.
+type LocalSeconds = LocalSeconds(Int)
+
+-- Seconds since 1970-01-01T00:00Z, leap seconds not counted.
+type UnixSeconds = UnixSeconds(Int)
+
+-- A change of a zone's offset: when it happens, and the offsets either side.
+type Transition = Transition { at : UnixSeconds, before : Offset, after : Offset }
+
+let perDay : Int = 86400
+let nanosPerSecond : Int = 1000000000
+
+-- The reading `since` after the start of `d`, its fraction of a second
+-- dropped. `since` may be negative or longer than a day, as a time zone rule's
+-- times can be.
+fun local(d : DayNumber, since : Duration) -> LocalSeconds =
+    LocalSeconds(Calendar.epochDays(d) * perDay + Duration.toSeconds(since))
+
+fun day(LocalSeconds(s)) -> DayNumber = Calendar.fromEpochDays(Calendar.floorDiv(s, perDay))
+
+-- The time since the start of the reading's day, under a day.
+fun sinceMidnight(LocalSeconds(s)) -> Duration = Duration.seconds(Int.mod(s, perDay))
+
+-- What a clock `o` from UTC reads at `t`, and back.
+fun toLocal(UnixSeconds(t), o : Offset) -> LocalSeconds = LocalSeconds(t + Offset.toSeconds(o))
+
+fun toUnix(LocalSeconds(s), o : Offset) -> UnixSeconds = UnixSeconds(s - Offset.toSeconds(o))
+
+-- The second `i` falls in, and the nanoseconds it is into it.
+fun fromInstant(i : Instant) -> UnixSeconds =
+    UnixSeconds(Calendar.floorDiv(Instant.unixNanos(i), nanosPerSecond))
+
+fun fraction(i : Instant) -> Int = Int.mod(Instant.unixNanos(i), nanosPerSecond)
+
+-- The instant `nanos` into the second `t`, if an `Instant` can hold it.
+fun toInstant(UnixSeconds(t), nanos : Int) -> Option Instant {
+    -- Before 1970 the whole seconds alone can be past the range when the
+    -- instant is not, in the earliest second there is; so a negative count is
+    -- scaled one second short and the fraction counted back from it.
+    let n = if t < 0 && nanos != 0 {
+        Int.addChecked(Int.mulChecked(t + 1, nanosPerSecond)?, nanos - nanosPerSecond)?
+    } else {
+        Int.addChecked(Int.mulChecked(t, nanosPerSecond)?, nanos)?
+    }
+    Some(Instant.fromUnixNanos(n))
+}
+
+-- A count of Unix seconds read from outside: a zone file's transition times.
+fun fromUnixSeconds(t : Int) -> UnixSeconds = UnixSeconds(t)
+
+-- The year `t` falls in, in UTC.
+fun year(t : UnixSeconds) -> Int = Calendar.civilFromDays(day(toLocal(t, Offset.utc))).0
+
+instance Eq LocalSeconds { fun eq(LocalSeconds(a), LocalSeconds(b)) = a == b }
+
+instance Ord LocalSeconds { fun lt(LocalSeconds(a), LocalSeconds(b)) = a < b }
+
+instance Eq UnixSeconds { fun eq(UnixSeconds(a), UnixSeconds(b)) = a == b }
+
+instance Ord UnixSeconds { fun lt(UnixSeconds(a), UnixSeconds(b)) = a < b }

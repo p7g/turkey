@@ -24,7 +24,8 @@ DARWIN = sys.platform == "darwin"
 PROBE = """module PROBE (ready, quiet, timeout, wakeBefore, wakeDuring, exitedChild, runningChild)
 
 import System.Task as Task
-import System.Time as Time
+import Time.Duration as Duration
+import Time.Stopwatch as Stopwatch
 import Turkey.Heap as Heap
 import Turkey.Libc as Libc
 import Turkey.Sys as Sys
@@ -84,10 +85,10 @@ fun quiet() -> Unit {
 fun timeout(ns : Int) -> Unit {
     let _ = Workers.claim()
     let seen = Workers.workSeen()
-    let start = Time.monotonic()
+    let start = Stopwatch.start()
     let n = Heap.pause(seen, ns)
     print(n)
-    print((Time.monotonic() - start) / 1000000)
+    print(Duration.toNanos(Stopwatch.elapsed(start)) / 1000000)
     Workers.release()
 }
 
@@ -98,9 +99,9 @@ fun wakeBefore() -> Unit {
     print(Workers.pollNow())
     Workers.wakePoller()
     let seen = Workers.workSeen()
-    let start = Time.monotonic()
+    let start = Stopwatch.start()
     print(Heap.pause(seen, 5000000000))
-    print((Time.monotonic() - start) / 1000000 < 1000)
+    print(Duration.toNanos(Stopwatch.elapsed(start)) / 1000000 < 1000)
     Workers.release()
 }
 
@@ -116,9 +117,9 @@ fun wakeDuring() -> Unit {
             0
         })?
         let seen = Workers.workSeen()
-        let start = Time.monotonic()
+        let start = Stopwatch.start()
         let n = Heap.pause(seen, 5000000000)
-        let ms = (Time.monotonic() - start) / 1000000
+        let ms = Duration.toNanos(Stopwatch.elapsed(start)) / 1000000
         print(n)
         print(ms >= 100 && ms < 1000)
         pure(t)

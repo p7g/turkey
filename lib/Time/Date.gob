@@ -1,0 +1,150 @@
+module Time.Date (
+    Date, new, today, fromEpochDays, epochDays, year, month, day, weekday, dayOfYear,
+    shift, daysBetween, periodBetween, isLeapYear, daysInMonth, parse, read, fromDayNumber,
+    dayNumber,
+)
+
+-- A date of the ISO calendar, with no time and no time zone: a birthday, a due
+-- date, a holiday. Years run from -9999 to 9999.
+--
+-- A date is stored as its day number, the count of days since 1970-01-01, so
+-- comparing, hashing and moving by days are integer operations. The year,
+-- month and day are worked out when they are read. The constructor is not
+-- exported, so every `Date` is a day that exists.
+
+import Time.Calendar (DayNumber)
+import Time.Calendar as Calendar
+import Time.Frame as Frame
+import Time.Instant as Instant
+import Time.ISO as ISO
+import Time.Month (Month(..))
+import Time.Month as Month
+import Time.Period (Period(..))
+import Time.Weekday (Weekday)
+import Time.Zone (Zone)
+import Time.Zone as Zone
+
+type Date = Date(DayNumber)
+
+let first : DayNumber = Calendar.daysFromCivil(Calendar.minYear, Jan, 1)
+let last : DayNumber = Calendar.daysFromCivil(Calendar.maxYear, Dec, 31)
+
+-- The date with this year, month and day, if it exists.
+fun new(y : Int, m : Month, d : Int) -> Option Date =
+    if y < Calendar.minYear || y > Calendar.maxYear || d < 1 || d > Calendar.daysInMonth(y, m) {
+        None
+    } else {
+        Some(Date(Calendar.daysFromCivil(y, m, d)))
+    }
+
+-- Today's date in `z`. Which zone is the caller's to say, as for
+-- `DateTime.now`: the date changes at a different instant in each.
+fun today(z : Zone) -> Date {
+    let now = Instant.now()
+    let local = Frame.toLocal(Frame.fromInstant(now), Zone.offsetAt(z, now))
+    Option.expect(fromDayNumber(Frame.day(local)), "today is in range")
+}
+
+-- The date `n` days after 1970-01-01, if it is in range.
+fun fromEpochDays(n : Int) -> Option Date = fromDayNumber(Calendar.fromEpochDays(n))
+
+fun epochDays(Date(n)) -> Int = Calendar.epochDays(n)
+
+fun fromDayNumber(n : DayNumber) -> Option Date =
+    if n < first || n > last { None } else { Some(Date(n)) }
+
+fun dayNumber(Date(n)) -> DayNumber = n
+
+fun fields(Date(n)) -> (Int, Month, Int) = Calendar.civilFromDays(n)
+
+fun year(d : Date) -> Int = fields(d).0
+fun month(d : Date) -> Month = fields(d).1
+fun day(d : Date) -> Int = fields(d).2
+
+fun weekday(Date(n)) -> Weekday = Calendar.weekday(n)
+
+-- 1 for January 1.
+fun dayOfYear(d : Date) -> Int {
+    let Date(n) = d
+    Calendar.daysBetween(Calendar.daysFromCivil(year(d), Jan, 1), n) + 1
+}
+
+fun isLeapYear(y : Int) -> Bool = Calendar.isLeapYear(y)
+
+fun daysInMonth(y : Int, m : Month) -> Int = Calendar.daysInMonth(y, m)
+
+-- Move by `p`: first by its months, keeping the day of the month unless the
+-- new month is too short for it, in which case the result is that month's
+-- last day; then by its days. Panics if the result is outside years -9999 to
+-- 9999, as integer arithmetic panics on overflow.
+fun shift(d : Date, p : Period) -> Date {
+    let (y, m, dd) = fields(d)
+    let total = y * 12 + (Month.number(m) - 1) + p.months
+    let newYear = Calendar.floorDiv(total, 12)
+    let newMonth = Option.expect(Month.fromNumber(Int.mod(total, 12) + 1), "month out of range")
+    if newYear < Calendar.minYear || newYear > Calendar.maxYear {
+        error("Date.shift: the result is outside years -9999 to 9999")
+    }
+    let length = Calendar.daysInMonth(newYear, newMonth)
+    let clamped = if dd > length { length } else { dd }
+    let moved = Calendar.addDays(Calendar.daysFromCivil(newYear, newMonth, clamped), p.days)
+    Option.expect(fromDayNumber(moved), "Date.shift: the result is outside years -9999 to 9999")
+}
+
+-- The number of days from `from` to `to`: negative if `to` is earlier.
+fun daysBetween(Date(from), Date(to)) -> Int = Calendar.daysBetween(from, to)
+
+-- The period from `from` to `to`: as many whole months as fit, then the days
+-- that remain, both negative if `to` is earlier. `shift(from, periodBetween(from, to))`
+-- is always `to`.
+fun periodBetween(from : Date, to : Date) -> Period {
+    let (fy, fm, _) = fields(from)
+    let (ty, tm, _) = fields(to)
+    var months = (ty - fy) * 12 + Month.number(tm) - Month.number(fm)
+    let forward = to >= from
+    let moved = shift(from, Period { months, days = 0 })
+    if forward && moved > to {
+        months = months - 1
+    } else if !forward && moved < to {
+        months = months + 1
+    }
+    let start = shift(from, Period { months, days = 0 })
+    Period { months, days = daysBetween(start, to) }
+}
+
+instance Eq Date { fun eq(Date(a), Date(b)) = a == b }
+
+instance Ord Date { fun lt(Date(a), Date(b)) = a < b }
+
+instance Hash Date { fun hashInto(d, h) = hashInto(epochDays(d), h) }
+
+-- ISO 8601: `2026-10-18`; a year outside 0 to 9999 is written with a sign and
+-- six digits, `-000044-03-15`.
+instance Show Date {
+    fun show(d) {
+        let (y, m, dd) = fields(d)
+        ISO.year(y) + "-" + ISO.padded(Month.number(m), 2) + "-" + ISO.padded(dd, 2)
+    }
+}
+
+-- The form `show` writes, and nothing else.
+fun parse(s : String) -> Option Date {
+    let r = ISO.reader(s)
+    let d = read(r)?
+    if ISO.finished(r) { Some(d) } else { None }
+}
+
+-- A date at the reader's position, for the types whose text starts with one.
+fun read(r : ISO.Reader) -> Option Date {
+    let y = if ISO.accept(r, '-') {
+        -ISO.digits(r, 6)?
+    } else if ISO.accept(r, '+') {
+        ISO.digits(r, 6)?
+    } else {
+        ISO.digits(r, 4)?
+    }
+    ISO.expect(r, '-')?
+    let m = Month.fromNumber(ISO.digits(r, 2)?)?
+    ISO.expect(r, '-')?
+    new(y, m, ISO.digits(r, 2)?)
+}

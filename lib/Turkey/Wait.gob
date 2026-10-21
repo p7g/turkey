@@ -1,4 +1,6 @@
-module Turkey.Wait (now, sleepUntil, readable, writable, childExit, timedOut, cancelled)
+module Turkey.Wait (
+    now, sleepUntil, readable, writable, readableUnless, writableUnless, childExit, cancel, forget, timedOut, cancelled,
+)
 
 -- Waiting for time, a descriptor or a child without holding a worker: the
 -- caller parks as it does for a mutex (`Turkey.Scheduler.waitUntil`), so from
@@ -9,6 +11,10 @@ module Turkey.Wait (now, sleepUntil, readable, writable, childExit, timedOut, ca
 -- program and this is only for those that wait for the outside: it needs
 -- `Turkey.Poll`, which the scheduler already has, and the scheduler's lock
 -- and `waitUntil`.
+--
+-- The Prelude imports `Turkey.Stdout`, which parks on a full pipe through this
+-- module, so this module names each library module it uses and does not import
+-- the Prelude.
 --
 -- Time is nanoseconds on a monotonic clock (`now`), and a deadline is a point
 -- on it, or -1 for none. A wait answers:
@@ -22,6 +28,16 @@ module Turkey.Wait (now, sleepUntil, readable, writable, childExit, timedOut, ca
 -- A deadline that has passed already answers `timedOut` without waiting, even
 -- if the event is ready.
 
+import Prelude ()
+import Data.Int (Int)
+import Data.Tuple (Unit)
+import Data.Eq (Eq(..))
+import Data.Ord (Ord(..))
+import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..))
+import Control.Iterator (Iterator(..))
+import Data.Index (Index(..), SetIndex(..), Length(..))
+import Data.Bool (Bool(..))
+import Data.Int ()
 import Turkey.Poll as Poll
 import Turkey.Scheduler as Scheduler
 import Turkey.Workers as Workers
@@ -45,11 +61,40 @@ fun readable(fd : Int, deadline : Int) -> Int =
 fun writable(fd : Int, deadline : Int) -> Int =
     if passed(deadline) { timedOut } else { park(fun() = Poll.writable(fd, deadline)) }
 
+-- `readable` and `writable` that answer `cancelled` without waiting if `stop()`
+-- is true once the wait may be registered, which is under the scheduler's lock,
+-- so that `stop` must only read. A closer that makes `stop` true and then calls
+-- `cancel` ends this wait either way: `cancel` finds it registered, or `stop`
+-- sees what the closer made true.
+fun readableUnless(fd : Int, deadline : Int, stop : fun() -> Bool) -> Int =
+    if passed(deadline) { timedOut } else { parkUnless(fun() = Poll.readable(fd, deadline), stop) }
+
+fun writableUnless(fd : Int, deadline : Int, stop : fun() -> Bool) -> Int =
+    if passed(deadline) { timedOut } else { parkUnless(fun() = Poll.writable(fd, deadline), stop) }
+
 -- Wait for the child `pid` to exit, and reap it. Only the one wait for a
 -- child may exist at a time, and nothing else in the program may reap it
 -- (`Turkey.Poll`).
 fun childExit(pid : Int, deadline : Int) -> Int =
     if passed(deadline) { timedOut } else { park(fun() = Poll.childExit(pid, deadline)) }
+
+-- `fd` is about to be closed: end every wait on it with `cancelled`.
+fun cancel(fd : Int) -> Unit {
+    Scheduler.lock()
+    if Poll.cancel(fd) > 0 {
+        let tasks = Poll.takeWoken()
+        for var i = 0; i < len(tasks); i = i + 1 { Scheduler.wake(tasks[i]) }
+        Scheduler.changed()
+    }
+    Scheduler.unlock()
+}
+
+-- Drop the poller's interest in `fd`, before its number is closed.
+fun forget(fd : Int) -> Unit {
+    Scheduler.lock()
+    Poll.forget(fd)
+    Scheduler.unlock()
+}
 
 fun passed(deadline : Int) -> Bool = deadline >= 0 && Poll.now() >= deadline
 
@@ -60,8 +105,14 @@ fun passed(deadline : Int) -> Bool = deadline >= 0 && Poll.now() >= deadline
 -- that polls, which is waiting for a later one: the signal moves the work
 -- epoch too, so that a worker that computed its timeout before this wait was
 -- made and has not yet begun to wait does not begin.
-fun park(start : fun() -> Poll.Waiter) -> Int {
+fun park(start : fun() -> Poll.Waiter) -> Int = parkUnless(start, fun() = False)
+
+fun parkUnless(start : fun() -> Poll.Waiter, stop : fun() -> Bool) -> Int {
     Scheduler.lock()
+    if stop() {
+        Scheduler.unlock()
+        return cancelled
+    }
     let before = Workers.interest()
     let w = start()
     let earlier = Poll.takeHeadMoved()

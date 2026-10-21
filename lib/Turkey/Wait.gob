@@ -1,0 +1,73 @@
+module Turkey.Wait (now, sleepUntil, readable, writable, childExit, timedOut, cancelled)
+
+-- Waiting for time, a descriptor or a child without holding a worker: the
+-- caller parks as it does for a mutex (`Turkey.Scheduler.waitUntil`), so from
+-- a task it suspends and its worker runs others, and from the program's own
+-- stack it runs tasks and drives the poller until the wait ends.
+--
+-- A separate module from the scheduler because the scheduler is in every
+-- program and this is only for those that wait for the outside: it needs
+-- `Turkey.Poll`, which the scheduler already has, and the scheduler's lock
+-- and `waitUntil`.
+--
+-- Time is nanoseconds on a monotonic clock (`now`), and a deadline is a point
+-- on it, or -1 for none. A wait answers:
+--
+-- * descriptors: 0 when ready, hung up or failed -- the operation says which;
+-- * children: the wait status `waitpid` stored, which is 0 or more;
+-- * for either, `timedOut` if the deadline came first, `cancelled` if the
+--   descriptor was closed under the wait (`Turkey.Poll.cancel`), or the
+--   negated error number if the wait could not be made.
+--
+-- A deadline that has passed already answers `timedOut` without waiting, even
+-- if the event is ready.
+
+import Turkey.Poll as Poll
+import Turkey.Scheduler as Scheduler
+import Turkey.Workers as Workers
+
+let timedOut : Int = Poll.timedOut
+let cancelled : Int = Poll.cancelled
+
+fun now() -> Int = Poll.now()
+
+-- Return at `deadline`.
+fun sleepUntil(deadline : Int) -> Unit {
+    if passed(deadline) { return {} }
+    let _ = park(fun() = Poll.sleeper(deadline))
+}
+
+-- Wait for `fd` to be readable.
+fun readable(fd : Int, deadline : Int) -> Int =
+    if passed(deadline) { timedOut } else { park(fun() = Poll.readable(fd, deadline)) }
+
+-- Wait for `fd` to be writable.
+fun writable(fd : Int, deadline : Int) -> Int =
+    if passed(deadline) { timedOut } else { park(fun() = Poll.writable(fd, deadline)) }
+
+-- Wait for the child `pid` to exit, and reap it. Only the one wait for a
+-- child may exist at a time, and nothing else in the program may reap it
+-- (`Turkey.Poll`).
+fun childExit(pid : Int, deadline : Int) -> Int =
+    if passed(deadline) { timedOut } else { park(fun() = Poll.childExit(pid, deadline)) }
+
+fun passed(deadline : Int) -> Bool = deadline >= 0 && Poll.now() >= deadline
+
+-- Make the wait `start` makes, and park until it ends.
+--
+-- The workers that may not be watching for it are told. A first wait wakes an
+-- idle worker to poll for it. A deadline earlier than the others wakes the one
+-- that polls, which is waiting for a later one: the signal moves the work
+-- epoch too, so that a worker that computed its timeout before this wait was
+-- made and has not yet begun to wait does not begin.
+fun park(start : fun() -> Poll.Waiter) -> Int {
+    Scheduler.lock()
+    let before = Workers.interest()
+    let w = start()
+    let earlier = Poll.takeHeadMoved()
+    if earlier || (before == 0 && Workers.interest() > 0) { Workers.signalWork(False) }
+    if earlier { Workers.wakePoller() }
+    Scheduler.unlock()
+    Scheduler.waitUntil(fun() = Poll.finished(w), fun(c) = Poll.park(w, c))
+    Poll.outcome(w)
+}

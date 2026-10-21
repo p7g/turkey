@@ -28,6 +28,17 @@ module Turkey.Scheduler (lock, unlock, ready, wake, changed, waitUntil, yield, s
 -- worker that resumed it puts it back on the queue once it has suspended
 -- (`run`), or queues one that is parked.
 --
+-- **The poller and time.** What tasks wait for outside the program -- a
+-- descriptor, a child, a time (`Turkey.Poll`, `Turkey.Wait`) -- is learned by
+-- the workers, not by a thread of its own. A worker with nothing to run polls
+-- instead of sleeping on the work epoch, if a wait is registered and no other
+-- worker polls (`idle`): it waits in the operating system for the nearest
+-- deadline, and `signalWork` breaks that wait when there is something to run.
+-- A worker that is busy looks between tasks (`poll`), without waiting, for one
+-- atomic load when nothing is registered. Whoever learns of an event or a
+-- passed deadline applies it under the lock, waking the tasks it ends. A task
+-- that is waiting for one is not stuck: the deadlock check counts it.
+--
 -- The Prelude's `print` waits through here for the standard output's lock
 -- (`Turkey.Stdout`), so this module names what it uses rather than importing
 -- the Prelude, and every program compiles it. Starting the workers is
@@ -53,6 +64,7 @@ import Turkey.Coroutine as Co
 import Turkey.Heap as Heap
 import Turkey.Libc as Libc
 import Turkey.Lock as Lock
+import Turkey.Poll as Poll
 import Turkey.Stack as Stack
 import Turkey.Workers as Workers
 import Target (OS(..))
@@ -172,16 +184,20 @@ fun waitUntil(done : fun() -> Bool, register : fun(Co.Coroutine) -> Unit) -> Uni
             let seen = Workers.workSeen()
             let c = next()
             -- Nothing to run here or anywhere, and nothing done: only a task
-            -- could make it so, and every task is waiting.
-            let stuck = Option.isNone(c) && running == 0
+            -- could make it so, and every task is waiting, for nothing the
+            -- poller could deliver either.
+            let stuck = Option.isNone(c) && running == 0 && !Poll.pending()
             if Option.isNone(c) && !stuck { programWaits = True }
             unlock()
             match c {
-                Some(c) -> run(c)
+                Some(c) -> {
+                    run(c)
+                    poll()
+                }
                 None -> if stuck {
                     return Prim.error("deadlock: every task is waiting")
                 } else {
-                    let _ = Heap.pause(seen, -1)
+                    idle(seen)
                     lock()
                     programWaits = False
                     unlock()
@@ -189,6 +205,70 @@ fun waitUntil(done : fun() -> Bool, register : fun(Co.Coroutine) -> Unit) -> Uni
             }
         }
     }
+}
+
+-- -- the poller ------------------------------------------------------------------------
+
+-- Apply what the poller found, as the worker that holds its claim: its first
+-- `n` results, and then the deadlines that have passed. Each wait that ends
+-- wakes its task, and the program's own code if it waits.
+fun settle(n : Int) -> Unit {
+    lock()
+    var ended = 0
+    for var i = 0; i < n; i = i + 1 {
+        ended = ended + Poll.deliver(Workers.resultToken(i), Workers.resultValue(i))
+    }
+    ended = ended + Poll.expire(Poll.now())
+    if ended > 0 {
+        let tasks = Poll.takeWoken()
+        for var i = 0; i < len(tasks); i = i + 1 { wake(tasks[i]) }
+        changed()
+    }
+    unlock()
+}
+
+-- Look for events and deadlines without waiting, between tasks: the worker
+-- that gets the claim does it, any other has nothing to add. With nothing
+-- registered it is one load.
+fun poll() -> Unit {
+    if Workers.interest() > 0 && Workers.claim() {
+        let n = Workers.pollNow()
+        settle(if n > 0 { n } else { 0 })
+        Workers.release()
+        -- While this worker held the claim none other could poll, and the idle
+        -- ones that found it taken are asleep on the work epoch. Wake one, so
+        -- that a deadline is not left to a poller that does not exist: it
+        -- takes the claim in `idle` and blocks in it. Once one is blocked the
+        -- claims here fail, and this signals nothing.
+        if Workers.interest() > 0 { Workers.signalWork(False) }
+    }
+}
+
+-- Wait for something to do, which `seen`, the work epoch read before looking
+-- for it, says has not come. If a wait is registered and no other worker is
+-- polling, this one waits for the poller's events instead, until the nearest
+-- deadline. When it is done, and waits remain, it wakes another idle worker to
+-- take over, since it will be busy or gone.
+--
+-- A poller that cannot be had (`pause` answers a negated error number) leaves
+-- a worker that sleeps as it would if nothing were registered.
+fun idle(seen : Int) -> Unit {
+    lock()
+    let timeout = Poll.timeout(Poll.now())
+    unlock()
+    if timeout == -1 || !Workers.claim() {
+        let _ = Heap.pause(seen, -1)
+        return {}
+    }
+    let n = Heap.pause(seen, timeout)
+    if n < 0 {
+        Workers.release()
+        let _ = Heap.pause(seen, -1)
+        return {}
+    }
+    settle(n)
+    Workers.release()
+    if Workers.interest() > 0 { Workers.signalWork(False) }
 }
 
 -- Let the other runnable tasks run before going on. On a worker's own stack,
@@ -297,8 +377,11 @@ fun workerLoop() -> Unit {
         -- wakes it (`Turkey.Workers.sleepForWork`).
         let seen = Workers.workSeen()
         match take() {
-            Some(c) -> run(c)
-            None -> { let _ = Heap.pause(seen, -1) }
+            Some(c) -> {
+                run(c)
+                poll()
+            }
+            None -> idle(seen)
         }
     }
 }

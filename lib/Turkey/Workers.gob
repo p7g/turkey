@@ -7,7 +7,7 @@ module Turkey.Workers (
     blockingFstat, blockingOpenat, blockingFstatat, blockingUnlinkat, blockingMkdirat,
     blockingRenameat, blockingFlock, blockingReaddir,
     claim, release, wakePoller, interestAdd, interest,
-    pollRead, pollWrite, pollChild, pollForget, pollForgetChild, pollWait, pollNow,
+    pollRead, pollWrite, pollReadWrite, pollChild, pollForget, pollForgetChild, pollWait, pollNow,
     resultToken, resultValue,
     pollReadable, pollWritable, pollEof, pollError, pollTimeoutForever,
 )
@@ -560,6 +560,23 @@ fun pollWrite(fd : Int, token : Int) -> Int {
     match Target.os {
         Darwin -> change(Sys.filterWrite(), fd, Prim.intOr(Sys.evAdd, Sys.evOneShot), 0, token)
         Linux -> epollArm(fd, Sys.epollOut, token)
+    }
+}
+
+-- The same for either: `token` is delivered once `fd` is readable or
+-- writable. On Linux this is the one registration the descriptor has, which
+-- replaces a read or a write registration made before it; on Darwin it is
+-- both filters, each of which delivers its own event and is gone when it has.
+fun pollReadWrite(fd : Int, token : Int) -> Int {
+    let ready = pollerReady()
+    if ready < 0 { return ready }
+    match Target.os {
+        Darwin -> {
+            let flags = Prim.intOr(Sys.evAdd, Sys.evOneShot)
+            let r = change(Sys.filterRead(), fd, flags, 0, token)
+            if r < 0 { r } else { change(Sys.filterWrite(), fd, flags, 0, token) }
+        }
+        Linux -> epollArm(fd, Prim.intOr(Sys.epollIn, Sys.epollOut), token)
     }
 }
 

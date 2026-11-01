@@ -228,3 +228,31 @@ def test_build_sh_speaks_only_the_bootstraps_command_line():
         "bootstrap/ now speaks `boot build`, so scripts/build.sh no longer "
         "needs to fall back to `native`: remove `emit_command` and call "
         "`build -o - -f asm` directly")
+
+
+def test_build_sh_links_objects_once_the_bootstrap_writes_them():
+    """A tripwire for the first bump whose compiler writes objects.
+
+    `scripts/build.sh` has the C compiler assemble every stage, because the
+    committed compiler cannot write an object. Once a bump records a commit
+    that has the object writer, every stage can: have `emit` write `-f obj`
+    and `link` link the object, so that the assembler runs only on the
+    committed assembly. Whether `--fixpoint` then compares objects or still
+    compares assembly is for that change to decide.
+
+    Read from the recorded commit's tree, since the committed assembly does
+    not say what it can do; without git there is nothing to read.
+    """
+    if not ((REPO_ROOT / ".git").exists() and shutil.which("git")):
+        return
+    writes_objects = subprocess.run(
+        ["git", "cat-file", "-e", f"{_provenance()['commit']}:src/Turkey/MachO.gob"],
+        cwd=REPO_ROOT, capture_output=True).returncode == 0
+    if not writes_objects:
+        return
+    script = (REPO_ROOT / "scripts" / "build.sh").read_text()
+    assert "-f obj" in script, (
+        "bootstrap/ was built from a compiler that writes objects, so "
+        "scripts/build.sh can link every stage from an object instead of "
+        "assembling it")
+

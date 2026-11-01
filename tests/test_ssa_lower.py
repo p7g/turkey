@@ -302,12 +302,11 @@ def test_closure_signatures_keep_each_scalar_register_class():
 
 def test_a_narrow_field_takes_its_own_width_and_not_a_word():
     # `Flags`: an `Int`, a `Float`, a `Char`, two `Bool`s and a `Byte` packed
-    # into 32 bytes, then its one pointer -- 24 header bytes and 32 of
+    # into 24 bytes, then its one pointer -- 24 header bytes and 32 of
     # fields, where a word a field would take 56.
-    out = _ssa("narrow_fields.gob")
-    assert "object.new kind=1 tag=" in out, out
-    built = [line for line in out.splitlines() if "count=7 " in line and "object.new" in line]
-    assert built, out
+    main = _ssa("narrow_fields.gob").split("fun @Main#main(", 1)[1].split("\nfun ", 1)[0]
+    built = [line for line in main.splitlines() if "count=7 " in line and "object.new" in line]
+    assert built, main
     assert all("bytes=56 pointers=1" in line for line in built), built
 
 

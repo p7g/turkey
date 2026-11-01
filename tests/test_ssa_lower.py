@@ -126,12 +126,17 @@ def test_a_single_variant_pattern_reads_no_tag():
     Reading the tag to compare it against the only value it can hold is a
     load, a compare and a branch on the hot path, and the arm it branches to
     is unreachable. `Data.Vec`'s accessors are inlined wherever they are
-    used and then dropped, so the program is checked whole: a `Vec` is the
-    only sum it reads, and Option's two constructors are told apart without a
-    tag.
+    used and then dropped, so the program's own functions are checked whole:
+    a `Vec` is the only sum they read, and Option's two constructors are told
+    apart without a tag. The runtime's functions are left out, since the
+    scheduler's waits match on sums of their own with several variants.
     """
     out = _ssa("stack.gob")
-    assert "object.tag" not in out, out
+    functions = out.split("\nfun @")[1:]
+    own = [f for f in functions if not f.startswith("Turkey.")]
+    assert any(f.startswith("Main#") for f in own), out
+    for f in own:
+        assert "object.tag" not in f, f
 
 
 def test_the_environment_is_scoped():

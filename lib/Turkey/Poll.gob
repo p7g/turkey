@@ -15,10 +15,10 @@ module Turkey.Poll (
 -- import `Turkey.Scheduler`, which imports it: what it has to wake it
 -- answers, and the scheduler wakes it (`takeWoken`).
 --
--- **One way out of waiting.** A waiter is `waiting` until the first of an
--- event, its deadline and a cancellation reaches it, and then it is `ready`,
--- `timedOut` or `cancelled`, for good: whatever comes later finds it not
--- waiting, or finds no waiter at all, and does nothing. Leaving `waiting`
+-- **One way out of waiting.** A waiter is `Waiting` until the first of an
+-- event, its deadline and a cancellation reaches it, and then it is `Ready`,
+-- `TimedOut` or `Cancelled`, for good: whatever comes later finds it not
+-- waiting, or finds no waiter at all, and does nothing. Leaving `Waiting`
 -- takes the waiter off its deadline heap and out of the descriptor or child it
 -- waited on, so the heap holds waiters that wait and nothing else.
 --
@@ -76,32 +76,23 @@ import Target as Target
 let timedOut : Int = -0x2_0000_0000
 let cancelled : Int = -0x3_0000_0000
 
--- A waiter's state.
-let stateWaiting = 0
-let stateReady = 1
-let stateTimedOut = 2
-let stateCancelled = 3
+-- How a wait stands: still waiting, or ended for good. `Ready` carries the
+-- answer: 0 for a descriptor, the wait status for a child, or a negated error
+-- number if the wait could not be made or the descriptor failed to register.
+type Outcome = Waiting | Ready(Int) | TimedOut | Cancelled
 
 -- What a waiter waits for.
-let kindSleep = 0
-let kindRead = 1
-let kindWrite = 2
-let kindChild = 3
+type WaitKind = Sleep | Read | Write | Child
 
 -- What a source stands for.
-let sourceFd = 0
-let sourceChild = 1
+type SourceKind = Descriptor | ChildProcess
 
--- One wait. `value` is set when the state becomes `ready`: 0 for a
--- descriptor, the wait status for a child, or a negated error number if the
--- wait could not be made or the descriptor failed to register. `heapAt` is
--- the waiter's place on the deadline heap, or -1; `source` is its source's
--- slot, or 0. `coroutine` is the task to wake when it ends, if one has parked
--- on it.
+-- One wait. `heapAt` is the waiter's place on the deadline heap, or -1;
+-- `source` is its source's slot, or 0. `coroutine` is the task to wake when it
+-- ends, if one has parked on it.
 type Waiter = Waiter {
-    var state     : Int,
-    kind          : Int,
-    var value     : Int,
+    var outcome   : Outcome,
+    kind          : WaitKind,
     deadline      : Int,
     var heapAt    : Int,
     var source    : Int,
@@ -117,7 +108,7 @@ type Waiter = Waiter {
 type Source = Source {
     var generation : Int,
     var live       : Bool,
-    var kind       : Int,
+    var kind       : SourceKind,
     var number     : Int,
     readers        : Vec Waiter,
     writers        : Vec Waiter,
@@ -134,7 +125,7 @@ let slotBits : Int = 1_048_576
 fun newSourceRecord() -> Source = Source {
     generation = 0,
     live = False,
-    kind = sourceFd,
+    kind = Descriptor,
     number = 0,
     readers = [],
     writers = [],
@@ -262,12 +253,11 @@ fun takeHeadMoved() -> Bool {
 
 -- -- ending waits -------------------------------------------------------------------------
 
-fun newWaiter(kind : Int, deadline : Int) -> Waiter {
+fun newWaiter(kind : WaitKind, deadline : Int) -> Waiter {
     nextId = nextId + 1
     Waiter {
-        state = stateWaiting,
+        outcome = Waiting,
         kind = kind,
-        value = 0,
         deadline = deadline,
         heapAt = -1,
         source = 0,
@@ -278,17 +268,22 @@ fun newWaiter(kind : Int, deadline : Int) -> Waiter {
 
 -- A waiter that never waited: it answers `value` at once.
 fun done(w : Waiter, value : Int) -> Waiter {
-    w.state = stateReady
-    w.value = value
+    w.outcome = Ready(value)
     w
 }
 
--- The one transition out of `waiting`: False, and nothing changed, if the
+fun waiting(w : Waiter) -> Bool = match w.outcome {
+    Waiting -> True
+    Ready(_) -> False
+    TimedOut -> False
+    Cancelled -> False
+}
+
+-- The one transition out of `Waiting`: False, and nothing changed, if the
 -- waiter is not waiting. The task parked on it is queued to be woken.
-fun finish(w : Waiter, state : Int, value : Int) -> Bool {
-    if w.state != stateWaiting { return False }
-    w.state = state
-    w.value = value
+fun finish(w : Waiter, outcome : Outcome) -> Bool {
+    if !waiting(w) { return False }
+    w.outcome = outcome
     timerRemove(w)
     match w.coroutine {
         Some(c) -> {
@@ -303,8 +298,8 @@ fun finish(w : Waiter, state : Int, value : Int) -> Bool {
 
 -- `finish`, and take the waiter out of its source, which is freed if no one
 -- else waits on it.
-fun end(w : Waiter, state : Int, value : Int) -> Unit {
-    if !finish(w, state, value) { return {} }
+fun end(w : Waiter, outcome : Outcome) -> Unit {
+    if !finish(w, outcome) { return {} }
     if w.source != 0 { leave(w) }
 }
 
@@ -312,7 +307,12 @@ fun leave(w : Waiter) -> Unit {
     let slot = w.source
     w.source = 0
     let s = sources[slot]
-    if w.kind == kindWrite { drop(s.writers, w.id) } else { drop(s.readers, w.id) }
+    match w.kind {
+        Write -> drop(s.writers, w.id)
+        Sleep -> drop(s.readers, w.id)
+        Read -> drop(s.readers, w.id)
+        Child -> drop(s.readers, w.id)
+    }
     if nobodyWaits(s) { freeSource(slot) }
 }
 
@@ -329,12 +329,12 @@ fun drop(waiters : Vec Waiter, id : Int) -> Unit {
 
 -- End every waiter in `waiters`, a source's, which are all waiting, and empty
 -- it: the source is the caller's to free.
-fun endAll(waiters : Vec Waiter, state : Int, value : Int) -> Unit {
+fun endAll(waiters : Vec Waiter, outcome : Outcome) -> Unit {
     let n = len(waiters)
     for var i = 0; i < n; i = i + 1 {
         let w = waiters[i]
         w.source = 0
-        let _ = finish(w, state, value)
+        let _ = finish(w, outcome)
     }
     Vec.clear(waiters)
 }
@@ -346,7 +346,7 @@ fun tokenOf(slot : Int, s : Source) -> Int = slot + s.generation * slotBits
 fun nobodyWaits(s : Source) -> Bool = len(s.readers) == 0 && len(s.writers) == 0
 
 -- A source's slot, counted in the interest, or the negated error number.
-fun newSource(kind : Int, number : Int) -> Int {
+fun newSource(kind : SourceKind, number : Int) -> Int {
     var slot = 0
     if len(freeSlots) > 0 {
         slot = Option.unwrapOr(Vec.pop(freeSlots), 0)
@@ -372,17 +372,20 @@ fun newSource(kind : Int, number : Int) -> Int {
 -- in the epoll set until it is removed.
 fun freeSource(slot : Int) -> Unit {
     let s = sources[slot]
-    if s.kind == sourceFd {
-        let registered = match Target.os {
-            Darwin -> s.armed != 0
-            Linux -> s.added
+    match s.kind {
+        Descriptor -> {
+            let registered = match Target.os {
+                Darwin -> s.armed != 0
+                Linux -> s.added
+            }
+            if registered { Workers.pollForget(s.number) }
+            byFd[s.number] = 0
         }
-        if registered { Workers.pollForget(s.number) }
-        byFd[s.number] = 0
-    } else {
-        Workers.pollForgetChild(s.number, tokenOf(slot, s))
-        forgetChild(slot)
-        if s.exiting { forgetExiting(slot) }
+        ChildProcess -> {
+            Workers.pollForgetChild(s.number, tokenOf(slot, s))
+            forgetChild(slot)
+            if s.exiting { forgetExiting(slot) }
+        }
     }
     s.live = False
     s.generation = s.generation + 1
@@ -434,32 +437,37 @@ fun arm(slot : Int, s : Source) -> Int {
 
 -- A wait that has only a deadline. A negative one never ends.
 fun sleeper(deadline : Int) -> Waiter {
-    let w = newWaiter(kindSleep, deadline)
+    let w = newWaiter(Sleep, deadline)
     if deadline >= 0 { timerAdd(w) }
     w
 }
 
-fun readable(fd : Int, deadline : Int) -> Waiter = waitFd(fd, kindRead, deadline)
+fun readable(fd : Int, deadline : Int) -> Waiter = waitFd(fd, Read, deadline)
 
-fun writable(fd : Int, deadline : Int) -> Waiter = waitFd(fd, kindWrite, deadline)
+fun writable(fd : Int, deadline : Int) -> Waiter = waitFd(fd, Write, deadline)
 
--- A wait for `fd` to be ready for `kind` (read or write): it ends `ready`
+-- A wait for `fd` to be ready for `kind` (`Read` or `Write`): it ends `Ready`
 -- with 0 when the descriptor is, or hangs up, or has an error -- the
--- operation then reports which -- and `ready` with the negated error number
+-- operation then reports which -- and `Ready` with the negated error number
 -- if the kernel will not watch it.
-fun waitFd(fd : Int, kind : Int, deadline : Int) -> Waiter {
+fun waitFd(fd : Int, kind : WaitKind, deadline : Int) -> Waiter {
     let w = newWaiter(kind, deadline)
     if fd < 0 { return done(w, -Sys.ebadf) }
     while len(byFd) <= fd { Vec.push(byFd, 0) }
     var slot = byFd[fd]
     if slot == 0 {
-        slot = newSource(sourceFd, fd)
+        slot = newSource(Descriptor, fd)
         if slot < 0 { return done(w, slot) }
         byFd[fd] = slot
     }
     let s = sources[slot]
     w.source = slot
-    if kind == kindWrite { Vec.push(s.writers, w) } else { Vec.push(s.readers, w) }
+    match kind {
+        Write -> Vec.push(s.writers, w)
+        Sleep -> Vec.push(s.readers, w)
+        Read -> Vec.push(s.readers, w)
+        Child -> Vec.push(s.readers, w)
+    }
     let r = arm(slot, s)
     if r < 0 {
         leave(w)
@@ -469,15 +477,15 @@ fun waitFd(fd : Int, kind : Int, deadline : Int) -> Waiter {
     w
 }
 
--- A wait for the child `pid` to exit, which ends `ready` with its wait status
+-- A wait for the child `pid` to exit, which ends `Ready` with its wait status
 -- (reaped here) or with the negated error number if it cannot be waited for.
 -- The registration comes before the first `waitpid`, so a child that exits
 -- between them is delivered and one that exited before is reaped at once.
 fun childExit(pid : Int, deadline : Int) -> Waiter {
-    let w = newWaiter(kindChild, deadline)
+    let w = newWaiter(Child, deadline)
     if pid <= 0 { return done(w, -Sys.einval) }
     if findChild(pid) != 0 { return done(w, -Sys.echild) }
-    let slot = newSource(sourceChild, pid)
+    let slot = newSource(ChildProcess, pid)
     if slot < 0 { return done(w, slot) }
     let s = sources[slot]
     Vec.push(childSlots, slot)
@@ -528,14 +536,16 @@ fun park(w : Waiter, c : Co.Coroutine) -> Unit {
     w.coroutine = Some(c)
 }
 
-fun finished(w : Waiter) -> Bool = w.state != stateWaiting
+fun finished(w : Waiter) -> Bool = !waiting(w)
 
--- How the wait ended: the value of one that is `ready`, else `timedOut` or
--- `cancelled`.
-fun outcome(w : Waiter) -> Int =
-    if w.state == stateReady { w.value }
-    else if w.state == stateTimedOut { timedOut }
-    else { cancelled }
+-- How the wait ended: the answer of one that is `Ready`, else `timedOut` or
+-- `cancelled`. Only asked once the wait has finished.
+fun outcome(w : Waiter) -> Int = match w.outcome {
+    Ready(value) -> value
+    TimedOut -> timedOut
+    Cancelled -> cancelled
+    Waiting -> Prim.error("outcome of a wait that has not ended")
+}
 
 -- -- what the scheduler asks ----------------------------------------------------------------
 
@@ -582,10 +592,9 @@ fun deliver(token : Int, value : Int) -> Int {
     if slot > 0 && slot < len(sources) {
         let s = sources[slot]
         if s.live && s.generation == token / slotBits {
-            if s.kind == sourceChild {
-                deliverChild(slot, s, value)
-            } else {
-                deliverFd(slot, s, value)
+            match s.kind {
+                ChildProcess -> deliverChild(slot, s, value)
+                Descriptor -> deliverFd(slot, s, value)
             }
         }
     }
@@ -600,16 +609,16 @@ fun deliverFd(slot : Int, s : Source, value : Int) -> Unit {
             if Prim.intAnd(value, Workers.pollWritable) != 0 { s.armed = Prim.intAnd(s.armed, 1) }
         }
     }
-    if Prim.intAnd(value, readMask) != 0 { endAll(s.readers, stateReady, 0) }
-    if Prim.intAnd(value, writeMask) != 0 { endAll(s.writers, stateReady, 0) }
+    if Prim.intAnd(value, readMask) != 0 { endAll(s.readers, Ready(0)) }
+    if Prim.intAnd(value, writeMask) != 0 { endAll(s.writers, Ready(0)) }
     if nobodyWaits(s) {
         freeSource(slot)
         return {}
     }
     let r = arm(slot, s)
     if r < 0 {
-        endAll(s.readers, stateReady, r)
-        endAll(s.writers, stateReady, r)
+        endAll(s.readers, Ready(r))
+        endAll(s.writers, Ready(r))
         freeSource(slot)
     }
 }
@@ -640,7 +649,7 @@ fun reapChild(slot : Int, s : Source) -> Unit {
             Linux -> r
         }
     }
-    endAll(s.readers, stateReady, answer)
+    endAll(s.readers, Ready(answer))
     freeSource(slot)
 }
 
@@ -676,7 +685,7 @@ fun expire(now : Int) -> Int {
         }
     }
     while len(timers) > 0 && timers[0].deadline <= now {
-        end(timers[0], stateTimedOut, 0)
+        end(timers[0], TimedOut)
     }
     ended - before
 }
@@ -688,8 +697,8 @@ fun cancel(fd : Int) -> Int {
     if fd >= 0 && fd < len(byFd) && byFd[fd] != 0 {
         let slot = byFd[fd]
         let s = sources[slot]
-        endAll(s.readers, stateCancelled, 0)
-        endAll(s.writers, stateCancelled, 0)
+        endAll(s.readers, Cancelled)
+        endAll(s.writers, Cancelled)
         freeSource(slot)
     }
     ended - before

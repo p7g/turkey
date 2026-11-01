@@ -98,24 +98,22 @@ let closed : Int = -0x1_0000_0000
 -- not `var` is one the compiler may take to be what it was built with.
 --
 -- `readMode` is changed only by whoever holds the read lock, and `polled`
--- only from 0 to 1, so neither needs an atomic instruction.
+-- only from False to True, so neither needs an atomic instruction.
 type FD = FD {
     var state    : Int,
     number       : Int,
-    var readMode : Int,
-    var polled   : Int,
+    var readMode : ReadMode,
+    var polled   : Bool,
     var readers  : Vec Co.Coroutine,
     var writers  : Vec Co.Coroutine,
 }
 
 -- An `FD` for a descriptor the caller owns from now on: its `close` closes it.
-fun fd(number : Int) -> FD = FD { state = 0, number = number, readMode = modeUnknown, polled = 0, readers = [], writers = [] }
+fun fd(number : Int) -> FD = FD { state = 0, number = number, readMode = Unknown, polled = False, readers = [], writers = [] }
 
--- What `readMode` holds: not yet looked at; call at once; or wait for readable
--- before each call.
-let modeUnknown : Int = 0
-let modeCall : Int = 1
-let modeWait : Int = 2
+-- What `readMode` holds: `Unknown`, not yet looked at; `CallAtOnce`; or
+-- `WaitFirst`, wait for readable before each call.
+type ReadMode = Unknown | CallAtOnce | WaitFirst
 
 -- The descriptor number, for a caller that only reports it. Using it for a
 -- system call races `close` in exactly the way this module exists to prevent.
@@ -129,15 +127,23 @@ fun number(f : FD) -> Int = f.number
 fun read(f : FD, bytes : Array Byte, from : Int, to : Int) -> Int {
     if !lock(f, readLock, readWaited) { return closed }
     var n = 0
-    if f.readMode == modeUnknown { f.readMode = inherited(f.number) }
+    match f.readMode {
+        Unknown -> { f.readMode = inherited(f.number) }
+        CallAtOnce -> {}
+        WaitFirst -> {}
+    }
     while True {
-        if f.readMode == modeWait {
-            let w = park(f, False)
-            if w == closed {
-                n = w
-                break
+        match f.readMode {
+            WaitFirst -> {
+                let w = park(f, False)
+                if w == closed {
+                    n = w
+                    break
+                }
+                if w != 0 { f.readMode = CallAtOnce }
             }
-            if w != 0 { f.readMode = modeCall }
+            Unknown -> {}
+            CallAtOnce -> {}
         }
         n = IO.read(f.number, bytes, from, to)
         if n == -Sys.eintr { continue }
@@ -350,7 +356,7 @@ fun unlock(f : FD, bit : Int, waited : Int) -> Unit {
 -- poller has dropped what it holds for it, since no wait can start now and
 -- none is parked, a parked task holding a reference.
 fun closeNumber(f : FD) -> Int {
-    if f.polled != 0 { Wait.forget(f.number) }
+    if f.polled { Wait.forget(f.number) }
     IO.close(f.number)
 }
 
@@ -384,25 +390,25 @@ fun writeAll(f : FD, step : fun(Int) -> Int, from : Int, to : Int, sequential : 
 -- direction's lock: wait until it is, and answer 0. `closed` if `close` ended
 -- the wait, or the negated `errno` of a wait the poller could not make.
 fun park(f : FD, writing : Bool) -> Int {
-    f.polled = 1
+    f.polled = True
     let stop = fun() = Prim.intAnd(Prim.atomicLoad(Prim.objectAddress(f), fieldsAt), closedBit) != 0
     let w = if writing { Wait.writableUnless(f.number, -1, stop) }
             else { Wait.readableUnless(f.number, -1, stop) }
     if w == Wait.cancelled { closed } else { w }
 }
 
--- How `read` treats a descriptor it has not looked at: `modeWait` for one in
--- blocking mode that is a FIFO, socket or character device, `modeCall`
+-- How `read` treats a descriptor it has not looked at: `WaitFirst` for one in
+-- blocking mode that is a FIFO, socket or character device, `CallAtOnce`
 -- otherwise, including when it cannot tell.
-fun inherited(number : Int) -> Int {
+fun inherited(number : Int) -> ReadMode {
     let flags = IO.fcntl(number, Sys.getStatusFlags)
-    if flags < 0 || Prim.intAnd(flags, Sys.nonBlocking()) != 0 { return modeCall }
+    if flags < 0 || Prim.intAnd(flags, Sys.nonBlocking()) != 0 { return CallAtOnce }
     let stat = Array.filled(Sys.statBytes(), Byte.truncate(0))
-    if IO.fstat(number, stat) < 0 { return modeCall }
+    if IO.fstat(number, stat) < 0 { return CallAtOnce }
     let kind = Sys.fileType(IO.statMode(stat))
     if kind == Sys.fifo || kind == Sys.socket || kind == Sys.characterDevice {
-        modeWait
+        WaitFirst
     } else {
-        modeCall
+        CallAtOnce
     }
 }

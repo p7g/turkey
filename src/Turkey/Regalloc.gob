@@ -281,7 +281,7 @@ type Colouring = Colouring {
 --   nothing; spilling inserts `ldr` and `str`, which leave the flags alone --
 --   and `verifyAllocation` checks that every `cset` still reaches its setter.
 fun colour(f : Func A.Inst) -> Colouring {
-    let w = walk(f, newSpills(), False)
+    let w = walk(f, newSpills(), Map.new(), False)
     Colouring { of_ = w.of_, stopped = w.stopped }
 }
 
@@ -299,9 +299,14 @@ type Walk = Walk {
     var stopped : Option String,
     evicted     : Set.Set Int,
     liveOut     : Array BitSet,
+    roots       : Map Int Int,
+    -- `spillCosts`, computed the first time `place` has to choose and empty
+    -- until then: most functions never do.
+    var cost    : Array Int,
 }
 
-fun walk(f : Func A.Inst, spills : Spills, evict : Bool) -> Walk {
+fun walk(f : Func A.Inst, spills : Spills, roots : Map Int Int,
+         evict : Bool) -> Walk {
     let (liveIn, liveOut) = Ssa.livenessInOut(f)
     let forbidden = forbiddenSets(f, liveOut)
     let of_ = Array.filled(len(f.reps), -1)
@@ -310,7 +315,8 @@ fun walk(f : Func A.Inst, spills : Spills, evict : Bool) -> Walk {
     -- yet select, and the allocator should not be where `boot` gains one.
     let w = Walk { f = f, spills = spills, evict = evict, forbidden = forbidden,
                    hints = moveHints(f), of_ = of_, stopped = None,
-                   evicted = Set.new(), liveOut = liveOut }
+                   evicted = Set.new(), liveOut = liveOut, roots = roots,
+                   cost = [] }
     let entry = f.blocks[Ssa.blockId(f.entry)]
 
     -- The function's own parameters, before anything else.
@@ -495,9 +501,10 @@ fun fileName(bank : Bank) -> String = match bank {
 --
 -- * **A register is free but forbidden.** The value is live across a clobber
 --   -- a call, or a physical register in use -- and every register nobody
---   holds is one the clobber destroys. Spilling *this* value is what helps:
+--   holds is one the clobber destroys. Either this value goes to memory --
 --   stored at its definition and reloaded at each use, it is no longer live
---   across anything.
+--   across anything -- or a holder of a register it may have does, and
+--   `cheaperHolder` picks whichever costs less.
 -- * **Every register is held.** Spilling this value would not help: it still
 --   needs a register at this very point, for the one instruction between its
 --   definition and its store. Something *else* has to leave, and the holder
@@ -525,10 +532,20 @@ fun place(w : Walk, taken : Taken, id : Int, block : Ssa.Block A.Inst,
                    || Map.contains(spills.slots, id) {
                     stopOnce(w, "a reload or store with no free register in the "
                                 + fileName(bank) + " file")
+                    placing = False
                 } else {
-                    Set.add(w.evicted, id)
+                    match cheaperHolder(w, taken, id, bank) {
+                        Some(v) -> {
+                            release(taken, keyIn(bank, w.of_[v]))
+                            w.of_[v] = -1
+                            Set.add(w.evicted, v)
+                        }
+                        None -> {
+                            Set.add(w.evicted, id)
+                            placing = False
+                        }
+                    }
                 }
-                placing = False
             } else {
                 match victim(w, taken, bank, block, from) {
                     Some(v) -> {
@@ -606,6 +623,99 @@ fun victim(w : Walk, taken : Taken, bank : Bank,
     }
     if best < 0 { None } else { Some(best) }
 }
+
+-- When `id` is live across a clobber and every register it may have is held,
+-- the holder of one of those registers that would cost less in memory than
+-- `id` does, and the cheapest of them; ties go to the lower value id.
+--
+-- Without this the value being placed is the one spilled, and the walk is in
+-- dominance order, so whatever is defined first keeps the callee-saved
+-- registers. In a loop that is the wrong way round: the invariants defined
+-- before it take them, and the loop's own variables, defined at its header,
+-- go to memory and are reloaded at every use in the body.
+fun cheaperHolder(w : Walk, taken : Taken, id : Int, bank : Bank) -> Option Int {
+    if len(w.cost) == 0 { w.cost = spillCosts(w.f, w.roots) }
+    let spills = w.spills
+    var best = -1
+    for n in poolOf(bank) {
+        let holder = holderOf(taken, keyIn(bank, n))
+        let movable = holder >= 0 && !forbids(w.forbidden[id], n)
+                      && !Map.contains(spills.reloadOf, holder)
+                      && !Map.contains(spills.slots, holder)
+        if movable && w.cost[holder] < w.cost[id]
+           && (best < 0 || w.cost[holder] < w.cost[best]
+               || (w.cost[holder] == w.cost[best] && holder < best)) {
+            best = holder
+        }
+    }
+    if best < 0 { None } else { Some(best) }
+}
+
+-- What spilling each value would cost in executed loads and stores, by
+-- `loopWeights`: a reload at every use, and a store at the definition unless
+-- the value has a root slot. The root stores selection puts before a
+-- safepoint are not counted as uses, since `spill` drops them for a value it
+-- spills into that slot -- which is what makes a traced value the cheaper one
+-- to send to memory.
+fun spillCosts(f : Func A.Inst, roots : Map Int Int) -> Array Int {
+    let weight = loopWeights(f)
+    let cost = Array.filled(len(f.reps), 0)
+    for var b = 0; b < len(f.blocks); b = b + 1 {
+        let block = f.blocks[b]
+        let w = weight[b]
+        let charge = fun(v : Value) {
+            let id = Ssa.valueId(v)
+            cost[id] = cost[id] + w
+        }
+        let stored = fun(v : Value) {
+            if !Map.contains(roots, Ssa.valueId(v)) { charge(v) }
+        }
+        for p in block.params { stored(p) }
+        for i in block.insts {
+            let rootStore = match A.slotStore(i.op) {
+                Some((_, m)) -> A.isRootSlot(m)
+                None -> False
+            }
+            if !rootStore { Ssa.eachUse(i, charge) }
+            Ssa.eachDef(i, stored)
+        }
+        for v in Ssa.termUses(block.term) { charge(v) }
+    }
+    cost
+}
+
+-- How often each block is guessed to run relative to the entry: ten times
+-- over for each natural loop it is in, the weight Chaitin's spill cost uses,
+-- up to four loops deep. A natural loop is a back edge -- an edge into a
+-- block that dominates its source -- with every block that reaches the source
+-- without passing the header. An irreducible cycle has no back edge, so its
+-- blocks are weighted as if it were not a loop.
+fun loopWeights(f : Func A.Inst) -> Array Int {
+    let count = len(f.blocks)
+    let idom = Ssa.dominators(f)
+    let preds = Ssa.predecessors(f)
+    let depth = Array.filled(count, 0)
+    for var h = 0; h < count; h = h + 1 {
+        let work : Vec Int = []
+        for p in preds[h] {
+            if Ssa.dominates(idom, Ssa.BlockId(h), p) { Vec.push(work, Ssa.blockId(p)) }
+        }
+        if len(work) > 0 {
+            let body = BitSet.new(count)
+            BitSet.add(body, h)
+            while let Some(b) = Vec.pop(work) {
+                if !BitSet.contains(body, b) {
+                    BitSet.add(body, b)
+                    for p in preds[b] { Vec.push(work, Ssa.blockId(p)) }
+                }
+            }
+            for b in BitSet.elements(body) { depth[b] = depth[b] + 1 }
+        }
+    }
+    Array.map(depth, fun(d) = loopWeight[if d < len(loopWeight) { d } else { len(loopWeight) - 1 }])
+}
+
+let loopWeight = [1, 10, 100, 1000, 10000]
 
 -- How far ahead a value is next read, counting from instruction `from`: its
 -- index if an instruction reads it, one past the last if the terminator does,
@@ -1050,7 +1160,7 @@ fun allocate(f : Func A.Inst, roots : Map Int Int) -> Allocation {
     }
     var going = True
     while going {
-        let w = walk(g, spills, True)
+        let w = walk(g, spills, roots, True)
         answer = Allocation {
             func = g, colouring = Colouring { of_ = w.of_, stopped = w.stopped },
             spills = spills, rounds = rounds, stopped = w.stopped, liveOut = w.liveOut,

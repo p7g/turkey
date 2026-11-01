@@ -13,10 +13,11 @@ import errno
 import fcntl
 import os
 import stat
+import subprocess
 
 import pytest
 
-from tests import bootc
+from tests import bootc, toolchain
 from tests.lang import panic_message, panics, run
 
 HEADER = """\
@@ -322,3 +323,65 @@ fun main() {
     assert out == ["0", "Some(dir)"]
     made = [p for p in os.listdir(tmp_path) if p.startswith("dir")]
     assert len(made) == 1 and len(made[0]) == 9 and (tmp_path / made[0]).is_dir()
+
+
+# -- child processes ------------------------------------------------------------
+#
+# `posix_spawn`'s flags, the wait status's layout and `SIGKILL`, each read back
+# from a C program built against this machine's own headers, which is the
+# target the suite runs on: Python exposes none of the spawn flags.
+
+SPAWN_CONSTANTS = r"""
+#define _GNU_SOURCE
+#include <signal.h>
+#include <spawn.h>
+#include <stdio.h>
+#include <sys/wait.h>
+
+int main(void) {
+#ifdef POSIX_SPAWN_CLOEXEC_DEFAULT
+    int cloexec_default = POSIX_SPAWN_CLOEXEC_DEFAULT;
+#else
+    int cloexec_default = 0;
+#endif
+    /* The file-action and attribute calls Turkey.Libc declares must exist. */
+    void *calls[] = {
+        (void *)posix_spawn_file_actions_addchdir_np, (void *)posix_spawn_file_actions_addopen,
+        (void *)posix_spawn_file_actions_adddup2, (void *)posix_spawnattr_setpgroup,
+        (void *)posix_spawnp,
+    };
+    printf("%d\n%d\n%d\n", SIGKILL, POSIX_SPAWN_SETPGROUP, cloexec_default);
+    printf("%d\n", sizeof(posix_spawn_file_actions_t) <= 512 && sizeof(posix_spawnattr_t) <= 512
+                   && calls[0] != 0);
+    int statuses[] = {0, 3 << 8, 255 << 8, 9, 11, 11 | 0x80, 6 | 0x80};
+    for (int i = 0; i < 7; i++) {
+        int s = statuses[i];
+        printf("%d %d\n", WIFEXITED(s) ? WEXITSTATUS(s) : -1, WIFSIGNALED(s) ? WTERMSIG(s) : 0);
+    }
+    return 0;
+}
+"""
+
+
+def test_spawn_constants_and_the_wait_status_layout(tmp_path):
+    source = tmp_path / "constants.c"
+    source.write_text(SPAWN_CONSTANTS)
+    exe = tmp_path / "constants"
+    built = subprocess.run([*toolchain.cc(), "-o", str(exe), str(source)],
+                           capture_output=True, text=True)
+    assert built.returncode == 0, built.stderr
+    expected = subprocess.run(toolchain.command(exe), capture_output=True, text=True,
+                              check=True).stdout.split("\n")[:-1]
+    out = lines("""
+fun main() {
+    print(Sys.sigKill)
+    print(Sys.spawnSetProcessGroup)
+    print(Sys.spawnCloexecDefault())
+    print(1)
+    for status in [0, 3 * 256, 255 * 256, 9, 11, 11 + 128, 6 + 128] {
+        let sig = Sys.waitSignal(status)
+        print(show(if sig == 0 { Sys.waitExitCode(status) } else { -1 }) + " " + show(sig))
+    }
+}
+""", tmp_path)
+    assert out == expected

@@ -10,6 +10,9 @@ module Turkey.Libc (
     osSyncWaitOnAddress, osSyncWakeByAddressAny, osSyncWakeByAddressAll, syscall,
     schedYield, usleep,
     kqueue, kevent, epollCreate1, epollCtl, epollWait, eventfd, waitpid,
+    pipe, pipe2, kill, posixSpawnp,
+    spawnActionsInit, spawnActionsDestroy, spawnActionsAddDup2, spawnActionsAddOpen,
+    spawnActionsAddChdir, spawnAttrInit, spawnAttrDestroy, spawnAttrSetFlags, spawnAttrSetPGroup,
 )
 
 -- The C symbols this system cannot avoid.
@@ -352,3 +355,66 @@ foreign "eventfd" fun eventfd(initial : Int, flags : Int) -> Int
 -- the pid it reaped, 0 if `WNOHANG` found it still running, or -1. `status`
 -- gets the wait status. A C `int`.
 foreign "waitpid" fun waitpid(pid : Int, status : Prim.Ptr, options : Int) -> Int
+
+-- -- child processes ------------------------------------------------------------------
+--
+-- Starting a program without `fork`: a runtime with several threads and a
+-- collector cannot copy itself into a child that then runs Turkey code, and
+-- `posix_spawn` never runs any. Every function answers a C `int`, read through
+-- `Turkey.Sys.cInt`. The `posix_spawn` family answers an error number directly
+-- (0 for success) and leaves `errno` alone; `pipe`, `pipe2` and `kill` answer
+-- -1 with `errno` set.
+--
+-- `posix_spawn_file_actions_t` and `posix_spawnattr_t` are opaque, so the
+-- caller gives them storage, as it does for `pthread_attr_t`
+-- (`Turkey.Entry`): `Turkey.Spawn` `malloc`s 512 bytes for each, and the
+-- structures are 8 bytes on Darwin (a pointer to storage the `Init` call
+-- makes, which `Destroy` frees) and 80 and 336 on glibc.
+
+-- A pipe: the read end at `fds[0]` and the write end at `fds[1]`, each a C
+-- `int`. `pipe2` is Linux only, and makes both ends with `flags`
+-- (`O_CLOEXEC`) atomically; Darwin has no such call.
+foreign "pipe" fun pipe(fds : Prim.Ptr) -> Int
+
+foreign "pipe2" fun pipe2(fds : Prim.Ptr, flags : Int) -> Int
+
+-- Send signal `signal` to process `pid`, or to the process group `-pid`.
+foreign "kill" fun kill(pid : Int, signal : Int) -> Int
+
+-- Start the program `file`, searched for on `PATH` if it has no slash, with
+-- `argv` and `envp` (each a NULL-terminated array of C strings), after
+-- `actions` and with `attributes`. The child's pid is stored at `pid`, a C
+-- `int`. An error number, including the program being missing or the
+-- directory not existing, and nothing is started then.
+foreign "posix_spawnp" fun posixSpawnp(pid : Prim.Ptr, file : Prim.Ptr, actions : Prim.Ptr,
+                                       attributes : Prim.Ptr, argv : Prim.Ptr,
+                                       envp : Prim.Ptr) -> Int
+
+foreign "posix_spawn_file_actions_init" fun spawnActionsInit(actions : Prim.Ptr) -> Int
+
+foreign "posix_spawn_file_actions_destroy" fun spawnActionsDestroy(actions : Prim.Ptr) -> Int
+
+-- In the child, `dup2(fd, target)`.
+foreign "posix_spawn_file_actions_adddup2" fun spawnActionsAddDup2(actions : Prim.Ptr, fd : Int,
+                                                                   target : Int) -> Int
+
+-- In the child, `open(path, flags, mode)` as descriptor `fd`.
+foreign "posix_spawn_file_actions_addopen" fun spawnActionsAddOpen(actions : Prim.Ptr, fd : Int,
+                                                                   path : Prim.Ptr, flags : Int,
+                                                                   mode : Int) -> Int
+
+-- In the child, `chdir(path)`: macOS 10.15 and glibc 2.29, hence the suffix.
+foreign "posix_spawn_file_actions_addchdir_np" fun spawnActionsAddChdir(actions : Prim.Ptr,
+                                                                        path : Prim.Ptr) -> Int
+
+foreign "posix_spawnattr_init" fun spawnAttrInit(attributes : Prim.Ptr) -> Int
+
+foreign "posix_spawnattr_destroy" fun spawnAttrDestroy(attributes : Prim.Ptr) -> Int
+
+-- `flags` is a C `short` of `POSIX_SPAWN_*` bits; the low half of the
+-- register is what is read.
+foreign "posix_spawnattr_setflags" fun spawnAttrSetFlags(attributes : Prim.Ptr, flags : Int) -> Int
+
+-- The process group the child joins when `POSIX_SPAWN_SETPGROUP` is set: its
+-- own, with 0.
+foreign "posix_spawnattr_setpgroup" fun spawnAttrSetPGroup(attributes : Prim.Ptr, group : Int) -> Int

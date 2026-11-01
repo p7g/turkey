@@ -18,7 +18,7 @@ from tests.lang import binary, run
 LIB = bootc.REPO_ROOT / "lib"
 
 PROBE = """module PROBE (
-    pingPong, bulk, closeParked, heartbeat, gcParked,
+    pingPong, bulk, closeParked, heartbeat, gcParked, readDeadline,
 )
 
 import System.Sync as Sync
@@ -206,6 +206,39 @@ fun gcParked() -> Unit {
         pure(0)
     })
 }
+
+-- A read on a pipe nobody writes, with a deadline 50 ms out, while another
+-- task computes: it answers `timedOut` at the deadline, and the computation
+-- is not held up. Then the pipe is written and a read with a deadline that
+-- has passed still finds the byte, as one with room does.
+fun readDeadline() -> Unit {
+    let (r, w) = makePipe()
+    print(FD.timedOut == Wait.timedOut && FD.timedOut != FD.closed && FD.timedOut < -4096)
+    let _ = Task.runScope(do {
+        let reader = Task.spawn(fun() {
+            let into = Array.filled(1, Byte.truncate(0))
+            let began = Wait.now()
+            let n = FD.readBy(r, into, 0, 1, began + 50 * millisecond)
+            (n == FD.timedOut, (Wait.now() - began) / 100000)
+        })?
+        let compute = Task.spawn(fun() {
+            var x = 0
+            for var i = 0; i < 300000; i = i + 1 {
+                x = x + i
+                if i % 1000 == 0 { Task.yield() }
+            }
+            x
+        })?
+        print(Task.join(compute))
+        print(Task.join(reader))
+        pure(0)
+    })
+    let into = Array.filled(1, Byte.truncate(0))
+    print(FD.readBy(r, into, 0, 1, Wait.now() - millisecond) == FD.timedOut)
+    let _ = send(w, 42)
+    print(FD.readBy(r, into, 0, 1, Wait.now() - millisecond))
+    print(Prim.byteToInt(into[0]))
+}
 """
 
 
@@ -298,3 +331,14 @@ def test_a_parked_reader_keeps_what_it_holds_across_collections(probe):
                  flags=("--gc-verify",))
     assert result.code == 0, result.stderr
     assert result.stdout.split("\n")[:-1] == ["[10, 20, 30, 40]", "99"]
+
+
+@pytest.mark.parametrize("workers", ["1", "4"])
+def test_a_read_with_a_deadline_gives_up_at_it_without_holding_the_worker(probe, workers):
+    out = lines(probe, "P.readDeadline()", workers)
+    assert out[:2] == ["True", str(sum(range(300000)))]
+    timed_out, tenths_of_ms = out[2].strip("()").split(", ")
+    assert timed_out == "True"
+    # 50 ms, and within a few ms of it.
+    assert 500 <= int(tenths_of_ms) < 650
+    assert out[3:] == ["True", "1", "42"]

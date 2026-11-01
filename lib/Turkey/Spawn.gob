@@ -1,0 +1,247 @@
+module Turkey.Spawn (Started(..), start, killGroup)
+
+-- Starting a program with its standard output and error on pipes the caller
+-- reads, through `posix_spawn`.
+--
+-- **Not `fork`.** A process with several threads and a collector cannot copy
+-- itself: the child would have only the calling thread, possibly copied while
+-- another held a lock it then waits for forever. `posix_spawn` runs no Turkey
+-- code in the child at all, and everything it is given is built before the
+-- call, in `malloc`ed memory the collector does not move or scan.
+--
+-- **No descriptor of ours reaches the child.** Descriptors 1 and 2 are the
+-- pipes' write ends and 0 is `/dev/null`; nothing else is open in the child.
+-- On Linux every descriptor here is made close-on-exec in the call that makes
+-- it (`pipe2`, and the rest of the library opens with `O_CLOEXEC`), and
+-- `dup2` leaves the descriptor it makes open across `exec`. Darwin has no
+-- `pipe2`, so a `pipe` followed by `fcntl` would leave a window in which a
+-- spawn on another worker inherits the new ends and keeps the pipe open for
+-- as long as it lives; `POSIX_SPAWN_CLOEXEC_DEFAULT` closes everything the
+-- file actions do not name, whatever flags the descriptor was made with.
+--
+-- **Our ends are non-blocking, the child's are not.** The two ends of a pipe
+-- are separate open files, so making the read end non-blocking, which is what
+-- lets `Turkey.FD` park a task on it instead of holding a worker, leaves the
+-- write end the child gets blocking.
+--
+-- **A process group of its own.** The child leads a new group, so that
+-- `killGroup` takes with it whatever it started in turn: a shell, a wrapper, a
+-- compiler driver.
+--
+-- The signal state needs no resetting. `exec` returns a caught signal's
+-- handler to the default, and the runtime blocks no signal and ignores none.
+
+import Turkey.IO as IO
+import Turkey.Libc as Libc
+import Turkey.Process as Process
+import Turkey.Ptr as Ptr
+import Turkey.Sys as Sys
+import Target (OS(..))
+import Target as Target
+
+-- A started child: its pid, and our ends of the pipes its standard output and
+-- standard error write to, as descriptor numbers the caller now owns.
+type Started = Started { pid : Int, stdout : Int, stderr : Int }
+
+-- The environment the program started with, taken while the program's
+-- globals are initialized, on the thread that has the process's arguments:
+-- a task may run on a worker whose record has none.
+let inherited : Prim.Ptr = Process.environment()
+
+-- Room for a `posix_spawn_file_actions_t` or a `posix_spawnattr_t`, which are
+-- opaque; the largest either is on a supported target is 336 bytes.
+let opaqueBytes : Int = 512
+
+-- Start `argv[0]`, searched for on `PATH` if it has no slash, with `argv`,
+-- in `directory` if given, and the environment the program started with
+-- after `environment`'s `(name, value)` pairs replace or add their names.
+-- Standard input is `/dev/null`.
+--
+-- The child, or the negated `errno` of whatever stopped it from starting: a
+-- missing program or directory, `EMFILE`, `EACCES`. Nothing is left open on
+-- failure.
+fun start(argv : Array String, directory : Option String, environment : Array (String, String))
+        -> Either Int Started {
+    if len(argv) == 0 { return Left(-Sys.einval) }
+    let outPipe = match pipePair() {
+        Left(e) -> return Left(e)
+        Right(p) -> p
+    }
+    let errPipe = match pipePair() {
+        Left(e) -> {
+            let (r, w) = outPipe
+            let _ = IO.close(r)
+            let _ = IO.close(w)
+            return Left(e)
+        }
+        Right(p) -> p
+    }
+    let (outRead, outWrite) = outPipe
+    let (errRead, errWrite) = errPipe
+    let blocks = []
+    let pid = Libc.malloc(8)
+    let actions = Libc.malloc(opaqueBytes)
+    let attributes = Libc.malloc(opaqueBytes)
+    Vec.push(blocks, pid)
+    Vec.push(blocks, actions)
+    Vec.push(blocks, attributes)
+    let program = cString(argv[0], blocks)
+    let argvBlock = pointers(Array.map(argv, fun(a) = cString(a, blocks)), blocks)
+    let envBlock = pointers(environmentWith(environment, blocks), blocks)
+    let dir = match directory {
+        Some(d) -> cString(d, blocks)
+        None -> Prim.ptrNull()
+    }
+    let devNull = cString("/dev/null", blocks)
+    var failure = 0
+    if Prim.ptrIsNull(pid) || Prim.ptrIsNull(actions) || Prim.ptrIsNull(attributes)
+            || Prim.ptrIsNull(program) || Prim.ptrIsNull(argvBlock) || Prim.ptrIsNull(envBlock)
+            || Prim.ptrIsNull(devNull) || (Option.isSome(directory) && Prim.ptrIsNull(dir)) {
+        failure = Sys.enomem
+    }
+    var actionsMade = False
+    var attributesMade = False
+    if failure == 0 {
+        failure = Sys.cInt(Libc.spawnActionsInit(actions))
+        actionsMade = failure == 0
+    }
+    if failure == 0 {
+        failure = Sys.cInt(Libc.spawnAttrInit(attributes))
+        attributesMade = failure == 0
+    }
+    if failure == 0 {
+        failure = Sys.cInt(Libc.spawnActionsAddOpen(actions, 0, devNull, Sys.readOnly, 0))
+    }
+    if failure == 0 {
+        failure = Sys.cInt(Libc.spawnActionsAddDup2(actions, outWrite, 1))
+    }
+    if failure == 0 {
+        failure = Sys.cInt(Libc.spawnActionsAddDup2(actions, errWrite, 2))
+    }
+    if failure == 0 && Option.isSome(directory) {
+        failure = Sys.cInt(Libc.spawnActionsAddChdir(actions, dir))
+    }
+    if failure == 0 {
+        let flags = Prim.intOr(Sys.spawnSetProcessGroup, Sys.spawnCloexecDefault())
+        failure = Sys.cInt(Libc.spawnAttrSetFlags(attributes, flags))
+    }
+    if failure == 0 {
+        failure = Sys.cInt(Libc.spawnAttrSetPGroup(attributes, 0))
+    }
+    if failure == 0 {
+        failure = Sys.cInt(Libc.posixSpawnp(pid, program, actions, attributes, argvBlock, envBlock))
+    }
+    let child = if failure == 0 { Prim.charToInt(Prim.loadI32(pid, 0)) } else { 0 }
+    if actionsMade { let _ = Libc.spawnActionsDestroy(actions) }
+    if attributesMade { let _ = Libc.spawnAttrDestroy(attributes) }
+    for block in blocks { Libc.free(block) }
+    -- The child has its own copies of its ends, or never existed.
+    let _ = IO.close(outWrite)
+    let _ = IO.close(errWrite)
+    if failure != 0 {
+        let _ = IO.close(outRead)
+        let _ = IO.close(errRead)
+        return Left(-failure)
+    }
+    Right(Started { pid = child, stdout = outRead, stderr = errRead })
+}
+
+-- Kill the process group `pid` leads, which is every process the child
+-- started that has not left it: 0, or the negated `errno`, `ESRCH` once none
+-- is left.
+--
+-- A pid names the child only until it is reaped, after which the system may
+-- give it to another process. `killGroup` is called after the child is
+-- reaped only when something may still be in its group, and a group keeps its
+-- id from being reused for as long as it has a member.
+fun killGroup(pid : Int) -> Int = Sys.cResult(Libc.kill(-pid, Sys.sigKill))
+
+-- -- underneath -----------------------------------------------------------------------
+
+-- A pipe's read end, made non-blocking, and its write end: the negated
+-- `errno` if it could not be made. Both ends are close-on-exec.
+fun pipePair() -> Either Int (Int, Int) {
+    let fds = Libc.malloc(8)
+    if Prim.ptrIsNull(fds) { return Left(-Sys.enomem) }
+    let made = match Target.os {
+        Darwin -> Sys.cResult(Libc.pipe(fds))
+        Linux -> Sys.cResult(Libc.pipe2(fds, Sys.closeOnExec()))
+    }
+    let read = Prim.charToInt(Prim.loadI32(fds, 0))
+    let write = Prim.charToInt(Prim.loadI32(fds, 4))
+    Libc.free(fds)
+    if made < 0 { return Left(made) }
+    var failure = IO.fcntl(read, Sys.getStatusFlags)
+    if failure >= 0 {
+        failure = IO.fcntlWith(read, Sys.setStatusFlags, Prim.intOr(failure, Sys.nonBlocking()))
+    }
+    if failure >= 0 && darwin() {
+        failure = IO.fcntlWith(read, Sys.setDescriptorFlags, Sys.descriptorCloseOnExec)
+    }
+    if failure >= 0 && darwin() {
+        failure = IO.fcntlWith(write, Sys.setDescriptorFlags, Sys.descriptorCloseOnExec)
+    }
+    if failure < 0 {
+        let _ = IO.close(read)
+        let _ = IO.close(write)
+        return Left(failure)
+    }
+    Right((read, write))
+}
+
+fun darwin() -> Bool = match Target.os {
+    Darwin -> True
+    Linux -> False
+}
+
+-- `s` and a NUL in a block of its own, added to `blocks` to be freed after
+-- the call; null if the allocation failed. A NUL inside `s` ends the string
+-- early, for the system.
+fun cString(s : String, blocks : Vec Prim.Ptr) -> Prim.Ptr {
+    let p = Ptr.raw(Ptr.toCString(s))
+    Vec.push(blocks, p)
+    p
+}
+
+-- A NULL-terminated array of the pointers in `items`, in a block added to
+-- `blocks`; null if the allocation failed or an item is null.
+fun pointers(items : Array Prim.Ptr, blocks : Vec Prim.Ptr) -> Prim.Ptr {
+    let p = Libc.malloc(8 * (len(items) + 1))
+    Vec.push(blocks, p)
+    if Prim.ptrIsNull(p) { return p }
+    for var i = 0; i < len(items); i = i + 1 {
+        if Prim.ptrIsNull(items[i]) { return Prim.ptrNull() }
+        Prim.storePtr(p, 8 * i, items[i])
+    }
+    Prim.storePtr(p, 8 * len(items), Prim.ptrNull())
+    p
+}
+
+-- The inherited environment's strings, less any whose name is one of
+-- `overrides`, then a `NAME=value` for each override.
+fun environmentWith(overrides : Array (String, String), blocks : Vec Prim.Ptr) -> Array Prim.Ptr {
+    let entries = []
+    let names = Array.map(overrides, fun((name, _)) = String.toBytes(name))
+    var at = 0
+    while !Prim.ptrIsNull(inherited) && !Prim.ptrIsNull(Prim.loadPtr(inherited, 8 * at)) {
+        let entry = Prim.loadPtr(inherited, 8 * at)
+        at = at + 1
+        if !named(entry, names) { Vec.push(entries, entry) }
+    }
+    for (name, value) in overrides {
+        Vec.push(entries, cString(name + "=" + value, blocks))
+    }
+    Vec.toArray(entries)
+}
+
+-- Whether the `NAME=value` string at `entry` has one of `names` as its name.
+fun named(entry : Prim.Ptr, names : Array (Array Byte)) -> Bool {
+    for name in names {
+        var same = True
+        for var i = 0; i < len(name) && same; i = i + 1 {
+            same = Prim.byteToInt(Prim.loadI8(entry, i)) == Byte.toInt(name[i])
+        }
+        if same && Prim.byteToInt(Prim.loadI8(entry, len(name))) == 61 { return True }
+    }
+    False
+}

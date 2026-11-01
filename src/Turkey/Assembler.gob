@@ -1,0 +1,233 @@
+module Turkey.Assembler (
+    Isa(..), Assembler, Use(..), Relocation(..), Definition(..), SectionData(..), Object(..),
+    new, feed, finish, sectionOrder,
+)
+
+-- The emitter's stream as bytes: sections, the labels defined in them, and
+-- the fields that refer to a label, for any instruction set and any object
+-- format.
+--
+-- The instruction set comes in as an `Isa`: how an instruction becomes bytes,
+-- which field of it refers to a symbol, and how that field is filled in once
+-- addresses are known. Every field is a fixed size, so layout is one pass
+-- that appends, and filling fields in is a second that patches in place; no
+-- instruction ever changes length.
+--
+-- A field whose value depends only on the distance from the instruction to a
+-- label in the same section -- a branch -- is filled in here, since that
+-- distance is the same wherever the section is loaded. Everything else is
+-- left as a `Relocation` for the format's writer: a page address depends on
+-- where the 4KB boundaries fall, and a symbol defined elsewhere is not here at
+-- all. Whether a field is resolved here or by the linker, it means the same.
+
+import Data.Set as Set
+import Turkey.Asm as Asm
+import Turkey.Asm (Symbol, SymbolKind(..))
+import Turkey.Stream (Item(..))
+
+-- What the assembler needs to know about an instruction set, whose
+-- instructions are `i` and whose fields that refer to a symbol are `f`.
+type Isa i f = Isa {
+    -- The instruction's bytes appended to the vector, and the field that
+    -- refers to a symbol if there is one, which starts at the instruction's
+    -- first byte.
+    encode   : fun(i, Vec Byte) -> Option f,
+    target   : fun(f) -> Symbol,
+    -- Whether the field depends only on the distance to its target.
+    relative : fun(f) -> Bool,
+    -- Fill in the field at the offset given, for an instruction at the first
+    -- address referring to the second.
+    patch    : fun(f, Vec Byte, Int, Int, Int) -> Unit,
+}
+
+-- What a relocated field holds.
+type Use f
+    -- A field of an instruction.
+    = Code(f)
+    -- An eight-byte word holding the target's address.
+    | Address64
+
+-- A field the linker fills in: at `offset` in its section, referring to
+-- `target`.
+type Relocation f = Relocation { offset : Int, use : Use f, target : Symbol }
+
+-- A symbol defined at `offset` in section `section`, an index into
+-- `Object.sections`. `exported` is the stream's `Global`; `function` its
+-- `FunctionType`.
+type Definition = Definition {
+    symbol   : Symbol,
+    section  : Int,
+    offset   : Int,
+    var exported : Bool,
+    var function : Bool,
+}
+
+type SectionData f = SectionData {
+    kind        : Asm.Section,
+    bytes       : Vec Byte,
+    -- As a power of two: the largest `Align` in the section.
+    var align   : Int,
+    relocations : Vec (Relocation f),
+}
+
+-- The assembled module. `defined` is in the order the labels were defined;
+-- `undefined` holds every named symbol referred to and not defined, in the
+-- order first referred to.
+type Object f = Object {
+    sections  : Array (SectionData f),
+    defined   : Vec Definition,
+    undefined : Vec Symbol,
+}
+
+-- A field waiting for its target to be defined.
+type Pending f = Pending { section : Int, offset : Int, use : Use f, target : Symbol }
+
+type Assembler i f = Assembler {
+    isa         : Isa i f,
+    sections    : Array (SectionData f),
+    var current : Int,
+    -- Every label, by its spelling, which tells a temporary from a named
+    -- symbol of the same name.
+    labels      : Map String Definition,
+    defined     : Vec Definition,
+    pending     : Vec (Pending f),
+    -- `Global` and `FunctionType` may come before the label they describe.
+    exported    : Set.Set String,
+    functions   : Set.Set String,
+}
+
+-- The sections in the order they are laid out in the object, which is the
+-- order the emitter fills them in.
+let sectionOrder = [Asm.Text, Asm.CStrings, Asm.Constants, Asm.Data, Asm.Relocated]
+
+fun sectionIndex(s : Asm.Section) -> Int = match s {
+    Asm.Text -> 0
+    Asm.CStrings -> 1
+    Asm.Constants -> 2
+    Asm.Data -> 3
+    Asm.Relocated -> 4
+}
+
+fun new(isa : Isa i f) -> Assembler i f =
+    Assembler {
+        isa = isa,
+        sections = Array.map(sectionOrder, fun(kind) =
+            SectionData { kind = kind, bytes = [], align = 0, relocations = [] }),
+        current = 0,
+        labels = Map.new(),
+        defined = [],
+        pending = [],
+        exported = Set.new(),
+        functions = Set.new(),
+    }
+
+-- One piece of the stream, appended, and the array emptied as
+-- `Stream.print` empties it.
+fun feed(a : Assembler i f, items : Vec (Item i)) -> Unit {
+    for item in items { feedItem(a, item) }
+    Vec.clear(items)
+}
+
+fun feedItem(a : Assembler i f, item : Item i) -> Unit {
+    let s = a.sections[a.current]
+    match item {
+        Architecture -> {}
+        Section(kind) -> { a.current = sectionIndex(kind) }
+        Global(sym) -> {
+            Set.add(a.exported, Asm.spell(sym))
+            if let Some(d) = Map.get(a.labels, Asm.spell(sym)) { d.exported = True }
+        }
+        FunctionType(sym) -> {
+            Set.add(a.functions, Asm.spell(sym))
+            if let Some(d) = Map.get(a.labels, Asm.spell(sym)) { d.function = True }
+        }
+        -- Zeros, in code as well: the emitter aligns code only to the
+        -- instruction size it already has, so nothing executes the padding.
+        Align(n) -> {
+            if n > s.align { s.align = n }
+            let size = Int.shl(1, n)
+            while len(s.bytes) % size != 0 { Vec.push(s.bytes, Byte.truncate(0)) }
+        }
+        Label(sym) -> define(a, sym)
+        Instruction(i) -> {
+            let at = len(s.bytes)
+            if let Some(f) = a.isa.encode(i, s.bytes) {
+                Vec.push(a.pending, Pending { section = a.current, offset = at, use = Code(f),
+                                              target = a.isa.target(f) })
+            }
+        }
+        Word(n) -> {
+            let at = len(s.bytes)
+            zeros(s.bytes, 8)
+            Byte.putLE(s.bytes, at, 8, n)
+        }
+        WordOf(sym) -> {
+            Vec.push(a.pending, Pending { section = a.current, offset = len(s.bytes),
+                                          use = Address64, target = sym })
+            zeros(s.bytes, 8)
+        }
+        Space(n) -> zeros(s.bytes, n)
+        Bytes(text) -> for b in String.bytes(text) { Vec.push(s.bytes, b) }
+        CString(text) -> {
+            for b in String.bytes(text) { Vec.push(s.bytes, b) }
+            Vec.push(s.bytes, Byte.truncate(0))
+        }
+        Comment(_) -> {}
+    }
+}
+
+fun zeros(bytes : Vec Byte, n : Int) -> Unit {
+    for var k = 0; k < n; k = k + 1 { Vec.push(bytes, Byte.truncate(0)) }
+}
+
+fun define(a : Assembler i f, sym : Symbol) -> Unit {
+    let key = Asm.spell(sym)
+    if Map.contains(a.labels, key) {
+        error("internal error: the label " + key + " is defined twice")
+    }
+    let d = Definition { symbol = sym, section = a.current,
+                         offset = len(a.sections[a.current].bytes),
+                         exported = Set.contains(a.exported, key),
+                         function = Set.contains(a.functions, key) }
+    Map.put(a.labels, key, d)
+    Vec.push(a.defined, d)
+}
+
+-- The module, once every item has been fed: each field whose target is in
+-- its own section and whose value is only a distance filled in, and the rest
+-- left as relocations.
+--
+-- Section addresses are not known here, so a distance is computed between
+-- offsets in one section, which is why only those fields are filled in.
+fun finish(a : Assembler i f) -> Object f {
+    let undefined = []
+    let seen = Set.new()
+    for p in a.pending {
+        let s = a.sections[p.section]
+        let key = Asm.spell(p.target)
+        match Map.get(a.labels, key) {
+            Some(d) -> match p.use {
+                Code(f) -> if d.section == p.section && a.isa.relative(f) {
+                    a.isa.patch(f, s.bytes, p.offset, p.offset, d.offset)
+                } else {
+                    Vec.push(s.relocations, relocation(p))
+                }
+                Address64 -> Vec.push(s.relocations, relocation(p))
+            }
+            None -> {
+                if let Temporary = p.target.kind {
+                    error("internal error: the label " + key + " is never defined")
+                }
+                if !Set.contains(seen, key) {
+                    Set.add(seen, key)
+                    Vec.push(undefined, p.target)
+                }
+                Vec.push(s.relocations, relocation(p))
+            }
+        }
+    }
+    Object { sections = a.sections, defined = a.defined, undefined = undefined }
+}
+
+fun relocation(p : Pending f) -> Relocation f =
+    Relocation { offset = p.offset, use = p.use, target = p.target }

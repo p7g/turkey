@@ -1,5 +1,5 @@
-module Turkey.Arm64.Encode (Fixup(..), Listing, encode, fixupOf, fieldMask, newListing,
-                            listing)
+module Turkey.Arm64.Encode (Fixup(..), Listing, encode, fixupOf, fieldMask, fixupTarget,
+                            relative, patch, isa, newListing, listing)
 
 -- The arm64 instructions as the 32-bit words the processor reads.
 --
@@ -22,40 +22,125 @@ module Turkey.Arm64.Encode (Fixup(..), Listing, encode, fixupOf, fieldMask, newL
 import Turkey.Arm64 as A
 import Turkey.Arm64 (Arm(..), Reg(..), Bank(..), Mem(..), Width(..), Cond(..), Inst(..))
 import Turkey.Asm as Asm
+import Turkey.Assembler as Assembler
 import Turkey.Asm (Symbol)
 import Turkey.Stream (Item(..))
 
 -- A field of an instruction word that holds the position of a symbol, which
 -- the encoder does not know.
 type Fixup
-    -- `b` and `bl`: a signed word offset in bits 0-25, reaching 128MB.
-    = Branch26(Symbol)
+    -- `b`: a signed word offset in bits 0-25, reaching 128MB.
+    = Jump26(Symbol)
+    -- `bl`: the same field as `b`'s. Apart from it because ELF tells a call
+    -- from a jump in the relocation.
+    | Call26(Symbol)
     -- `b.cond`, `cbz`, `cbnz`: a signed word offset in bits 5-23, reaching 1MB.
     | Branch19(Symbol)
     -- `adrp`: the 4KB page, as a signed page offset split across bits 29-30
     -- and 5-23.
     | Page21(Symbol)
     -- The offset within that page, in bits 10-21, divided by the access size
-    -- `1 << scale`: an `add` has scale 0, a word load scale 3.
+    -- `1 << scale`: a byte load has scale 0, a word load scale 3.
     | PageOffset12(Symbol, Int)
+    -- `add`'s immediate, the offset within the page undivided. The same bits
+    -- as a byte access's, and apart from it because ELF names the two
+    -- differently.
+    | AddOffset12(Symbol)
 
 -- The bits of a word that a fixup fills in.
 fun fieldMask(f : Fixup) -> Int = match f {
-    Branch26(_) -> 0x03FFFFFF
+    Jump26(_) | Call26(_) -> 0x03FFFFFF
     Branch19(_) -> 0x00FFFFE0
     Page21(_) -> 0x60FFFFE0
-    PageOffset12(_, _) -> 0x003FFC00
+    PageOffset12(_, _) | AddOffset12(_) -> 0x003FFC00
+}
+
+-- The symbol a fixup refers to.
+fun fixupTarget(f : Fixup) -> Symbol = match f {
+    Jump26(sym) | Call26(sym) | Branch19(sym) | Page21(sym) -> sym
+    PageOffset12(sym, _) | AddOffset12(sym) -> sym
+}
+
+-- Whether the field depends only on how far the target is from the
+-- instruction, so that it can be filled in without knowing where either will
+-- be loaded: true of a branch, and not of a page, whose distance depends on
+-- where the 4KB boundaries fall.
+fun relative(f : Fixup) -> Bool = match f {
+    Jump26(_) | Call26(_) | Branch19(_) -> True
+    Page21(_) | PageOffset12(_, _) | AddOffset12(_) -> False
+}
+
+-- Fill in the field of the word at `at`, for an instruction at address
+-- `place` referring to address `target`. A target out of the field's reach is
+-- an internal error rather than a wrapped offset: the backend keeps every
+-- branch within its function, and a page offset that is not a multiple of the
+-- access size means data placed at the wrong alignment.
+fun patch(f : Fixup, bytes : Vec Byte, at : Int, place : Int, target : Int) -> Unit {
+    let w = Byte.getLE(bytes, at, 4)
+    let field = match f {
+        Jump26(_) | Call26(_) -> Int.and(words(target - place, 26), 0x03FFFFFF)
+        Branch19(_) -> Int.shl(Int.and(words(target - place, 19), 0x7FFFF), 5)
+        Page21(_) -> {
+            let pages = Int.shr(target, 12) - Int.shr(place, 12)
+            within(pages, 21, "a page")
+            Int.shl(Int.and(pages, 3), 29) + Int.shl(Int.and(Int.shr(pages, 2), 0x7FFFF), 5)
+        }
+        PageOffset12(_, scale) -> {
+            let low = Int.and(target, 0xFFF)
+            if Int.and(low, Int.shl(1, scale) - 1) != 0 {
+                error("internal error: a page offset not aligned to its access")
+            }
+            Int.shl(Int.shr(low, scale), 10)
+        }
+        AddOffset12(_) -> Int.shl(Int.and(target, 0xFFF), 10)
+    }
+    Byte.putLE(bytes, at, 4, Int.or(w, field))
+}
+
+-- A byte distance as a count of instructions that fits a signed field of
+-- `width` bits.
+fun words(distance : Int, width : Int) -> Int {
+    if Int.and(distance, 3) != 0 { error("internal error: a branch to a misaligned target") }
+    let n = distance / 4
+    within(n, width, "a branch")
+    n
+}
+
+fun within(n : Int, width : Int, what : String) -> Unit {
+    let reach = Int.shl(1, width - 1)
+    if n < -reach || n >= reach { error("internal error: " + what + " out of reach") }
+}
+
+-- The instructions as the assembler takes them: each word least significant
+-- byte first, which is how both targets store an instruction.
+fun isa() -> Assembler.Isa Inst Fixup {
+    let words = []
+    Assembler.Isa {
+        encode = fun(i, out) {
+            Vec.clear(words)
+            encode(i.op, words)
+            for w in words {
+                let at = len(out)
+                for var k = 0; k < 4; k = k + 1 { Vec.push(out, Byte.truncate(0)) }
+                Byte.putLE(out, at, 4, w)
+            }
+            fixupOf(i.op)
+        },
+        target = fixupTarget,
+        relative = relative,
+        patch = patch,
+    }
 }
 
 -- The field an instruction leaves for layout, if it has one.
 fun fixupOf(op : Arm) -> Option Fixup = match op {
-    B(label) -> Some(Branch26(label))
-    Bl(sym, _) -> Some(Branch26(sym))
+    B(label) -> Some(Jump26(label))
+    Bl(sym, _) -> Some(Call26(sym))
     BCond(_, label) -> Some(Branch19(label))
     Cbz(_, label, _) -> Some(Branch19(label))
     Cbnz(_, label, _) -> Some(Branch19(label))
     Adrp(_, at) -> Some(Page21(at))
-    AddLo(_, _, at) -> Some(PageOffset12(at, 0))
+    AddLo(_, _, at) -> Some(AddOffset12(at))
     Ldr(d, PageOffset(_, at), w) -> Some(PageOffset12(at, scale(d, w)))
     Ldrb(_, PageOffset(_, at)) -> Some(PageOffset12(at, 0))
     Ldrsw(_, PageOffset(_, at)) -> Some(PageOffset12(at, 2))

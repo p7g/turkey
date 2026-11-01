@@ -175,7 +175,7 @@ field-init ::= IDENT "=" expression
 if-expr    ::= "if" condition block ("else" (block | if-expr))?
 condition  ::= expression                                        -- no bare record expression
              | ("let" | "var") pattern "=" expression            -- only after "if" and "while"
-match-arm  ::= "|"? pattern ("|" pattern)* "->" expression
+match-arm  ::= pattern ("|" pattern)* "->" expression
 ```
 
 In a `condition`, and in the collection of `for ... in`, a record expression

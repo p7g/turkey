@@ -226,18 +226,6 @@ The arms must cover every possible value of the subject
 Arms are separated by line breaks or `;`. An arm's body is one expression,
 which may be a block.
 
-An arm does not begin with `|`. The `|` separates the alternative patterns
-of one arm, and a line break before it does not end the arm, so a `|` opening
-a line continues the line before it:
-
-<!-- error: a match arm does not begin with '|'; separate arms with a line break or ';' -->
-```kotlin
-fun name(n) = match n {
-    | 0 -> "zero"
-    | _ -> "many"
-}
-```
-
 **Coming from OCaml, F# or Rust:** OCaml and F# begin each arm with `|`, and
 Rust allows a `|` before an arm's patterns. Turkey does not; write the arms on
 their own lines, or `match n { 0 -> "zero"; _ -> "many" }` on one.

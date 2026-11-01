@@ -54,13 +54,8 @@ def test_a_blocked_read_does_not_hold_up_a_collection(tmp_path, workers):
         pytest.skip("C compiler unavailable")
     source = tmp_path / "main.gob"
     source.write_text(PROGRAM)
-    compiled = subprocess.run(toolchain.command(bootc.binary(), *bootc.argv("asm"), str(source)),
-                              cwd=bootc.REPO_ROOT, capture_output=True, text=True, check=True)
-    assembly = tmp_path / "main.s"
-    assembly.write_text(compiled.stdout)
     binary = tmp_path / "blocking"
-    subprocess.run([*toolchain.cc(), str(assembly), *toolchain.libraries(), "-o", str(binary)],
-                   capture_output=True, text=True, check=True)
+    bootc.link(source, binary)
     process = subprocess.Popen(toolchain.command(binary), stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                                env=dict(os.environ, TURKEY_WORKERS=workers))

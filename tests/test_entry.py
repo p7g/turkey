@@ -28,14 +28,8 @@ pytestmark = pytest.mark.skipif(toolchain.missing(),
 def _boot_binary(source: Path, tmp_path: Path) -> Path:
     """`boot build`, linked."""
     # From the repository, where `boot` finds `lib/`.
-    text = subprocess.run(
-        toolchain.command(bootc.binary(), *bootc.argv("asm"), str(source)),
-        cwd=REPO_ROOT, capture_output=True, text=True, check=True).stdout
-    code = tmp_path / (source.stem + ".s")
-    code.write_text(text, encoding="utf-8")
     output = tmp_path / source.stem
-    subprocess.run([*toolchain.cc(), "-o", str(output), str(code),
-                    *toolchain.libraries()], check=True)
+    bootc.link(source, output)
     return output
 
 

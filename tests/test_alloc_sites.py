@@ -10,7 +10,7 @@ import os
 import struct
 import subprocess
 
-from tests import bootc, lang, toolchain
+from tests import bootc, lang
 
 PROGRAM = """
 type Pair = Pair(Int, Int)
@@ -31,17 +31,11 @@ def _counted(tmp_path):
     entry = tmp_path / "main.gob"
     entry.write_text(PROGRAM, encoding="utf-8")
     env = dict(os.environ, TURKEY_ALLOC_SITES="1", TURKEY_LIB=str(lang.LIB))
-    compiled = subprocess.run(
-        toolchain.command(bootc.binary(), *bootc.argv("asm"), str(entry)),
-        cwd=tmp_path, env=env, capture_output=True, check=True)
-    source = tmp_path / "main.s"
-    source.write_bytes(compiled.stdout)
     binary = tmp_path / "main"
-    subprocess.run([*toolchain.cc(), "-o", str(binary), str(source),
-                    *toolchain.libraries()], check=True)
+    compiled = bootc.link(entry, binary, cwd=tmp_path, env=env)
     run = subprocess.run([str(binary)], cwd=tmp_path, capture_output=True,
                          text=True, check=True)
-    table = [line.split("\t") for line in compiled.stderr.decode().splitlines()
+    table = [line.split("\t") for line in compiled.stderr.splitlines()
              if line.startswith("site\t")]
     data = (tmp_path / "turkey-alloc-sites.bin").read_bytes()
     count = struct.unpack_from("<q", data)[0]

@@ -76,8 +76,8 @@ That leaves a compiler in `build/stages/stage2`. Save the example as
 `rectangles.gob`, then compile and run it:
 
 ```sh
-build/stages/stage2 build -o rectangles.s rectangles.gob
-cc -o rectangles rectangles.s
+build/stages/stage2 build -o rectangles.o rectangles.gob
+cc -o rectangles rectangles.o
 ./rectangles
 ```
 
@@ -86,8 +86,9 @@ the maths functions the library calls out of libc.
 
 Run the compiler from the repository root, where it finds `lib/`. It has two
 commands. `build` writes the program to `-o`, in the format the file's
-extension names (only assembly, `.s`, for now) or `-f` says; `-o - -f asm`
-writes it to standard output. `check` compiles as far as the last stage that
+extension names -- a relocatable object for `.o`, assembly for `.s` -- or
+`-f obj` or `-f asm` says; `-o - -f asm` writes it to standard output. An
+object needs no assembler, only a linker. `check` compiles as far as the last stage that
 can reject a program and writes nothing. Either takes `--dump STAGE,...` to
 print what a stage produced: `build/stages/stage2 check --dump types
 rectangles.gob` shows the inferred types, and running the compiler with no
@@ -116,8 +117,8 @@ explain themselves at the top.
 Two environment variables choose the toolchain, for `scripts/build.sh` and for
 the tests alike. Each is split into words the way a shell would split it.
 
-- `TURKEY_CC` is the C compiler that assembles and links a program. Unset, it
-  is `cc`.
+- `TURKEY_CC` is the C compiler that links a program, and assembles the
+  bootstrap compiler. Unset, it is `cc`.
 - `TURKEY_RUN` is a prefix for running a program that compiler linked, or a
   built compiler. Unset or empty, the program runs directly.
 
@@ -152,7 +153,7 @@ hook does nothing. Where binfmt_misc cannot be written, set
 
 With those set, `sh scripts/build.sh` builds the compiler for arm64 Linux from
 `bootstrap/arm64-linux.s.gz`, and `--target arm64-linux` makes a compiler on
-any platform emit Linux assembly.
+any platform emit Linux objects and assembly.
 
 The whole test suite runs and passes this way, `pytest -m bootstrap` and the
 fixed point included, and the goldens in `tests/programs/` are the same on

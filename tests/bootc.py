@@ -140,11 +140,13 @@ def _build(cached: Path, output: Path) -> Path:
 
 def argv(output: str) -> list[str]:
     """`boot`'s arguments for one output: `asm`, the program's assembly on
-    stdout; `check`; or the name of a stage to dump (`core`, `ssa`, `select`,
-    `listing`, ...)."""
+    stdout; `obj`, its relocatable object on stdout; `check`; or the name of a
+    stage to dump (`core`, `ssa`, `select`, `listing`, ...)."""
     match output:
         case "asm":
             return ["build", "-o", "-", "-f", "asm"]
+        case "obj":
+            return ["build", "-o", "-", "-f", "obj"]
         case "check":
             return ["check"]
         case _:

@@ -5,9 +5,9 @@ message -- say what Turkey does, and every one of them asks the compiled `boot`
 through this module.
 
 A program is compiled the way a user would compile it: `boot build` from the
-program's own directory, so a diagnostic quotes the file by its bare name, then
-assembled and linked against the runtime with the C compiler, then run, both
-as `tests.toolchain` says. The library is found through `$TURKEY_LIB`, since
+program's own directory, so a diagnostic quotes the file by its bare name, to
+a relocatable object, then linked against the runtime with the C compiler,
+then run, both as `tests.toolchain` says. The library is found through `$TURKEY_LIB`, since
 the directory the program is compiled from is not the repository root.
 
 Both steps are cached on disk, keyed by `bootc.build_key()` and the program's
@@ -210,27 +210,21 @@ def _cached(output: str, entry: Path, build,
 
 def _native(entry: Path, flags: tuple[str, ...] = ()) -> _Compiled:
     def build(directory: Path) -> tuple[int, str]:
-        result = _boot("asm", entry, flags)
+        result = _boot("obj", entry, flags)
         stderr = result.stderr.decode("utf-8")
         if result.returncode != 0:
             return result.returncode, stderr
-        assembly = result.stdout
-        failed = [line for line in assembly.decode("utf-8").splitlines()
-                  if line.startswith("// skipped")]
-        if failed:
-            return 1, stderr + "boot: the backend refused this program\n" + \
-                "\n".join(failed) + "\n"
-        source = directory / f"main.{os.getpid()}.s"
-        source.write_bytes(assembly)
+        obj = directory / f"main.{os.getpid()}.o"
+        obj.write_bytes(result.stdout)
         try:
             bootc.replace_built(
                 [*toolchain.cc(), "-o", str(directory / f"bin.{os.getpid()}"),
-                 str(source), *toolchain.libraries()],
+                 str(obj), *toolchain.libraries()],
                 directory / "bin")
         finally:
-            source.unlink(missing_ok=True)
+            obj.unlink(missing_ok=True)
         return 0, stderr
-    return _cached("asm", entry, build, flags)
+    return _cached("obj", entry, build, flags)
 
 
 def _checked(entry: Path) -> _Compiled:

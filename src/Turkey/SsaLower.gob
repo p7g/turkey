@@ -301,7 +301,7 @@ fun internNullaries(m : Module, init : Ssa.Func Low) -> Unit {
     L.into(b, start)
     for (name, shape) in objects {
         Vec.push(m.globals, (name, Ssa.traced(Ptr)))
-        let made = L.emit(b, ObjectNew(shape.0, shape.1, 0, [], 0), Ssa.traced(Ptr))
+        let made = L.emit(b, ObjectNew(shape.0, shape.1, Rt.layout([]), [], 0), Ssa.traced(Ptr))
         L.effect(b, GlobalStore(name, made))
     }
     L.terminate(b, Jump(init.entry, []))
@@ -957,12 +957,9 @@ fun armOf(l : Lower, shape : SwitchShape, alt : CAlt, whole : Value, ty : Ty.Typ
             Words(c) -> if Option.isNone(Vec.indexOf(c.nullaries, name)) {
                 compactPayload(l, c, binders, whole, ty)
             }
-            _ -> {
-                let types = match Decls.conFieldTypes(l.decls, ty, name) {
-                    Some(ts) -> ts
-                    None -> []
-                }
-                destructure(l, whole, positions(binders, types, 0))
+            _ -> match Decls.conFieldTypes(l.decls, ty, name) {
+                Some(types) -> destructure(l, whole, layoutOf(l, types), positions(binders, types, 0))
+                None -> stop1(l, "the fields of '" + name + "' at " + Ty.show(ty))
             }
         }
         _ -> {}
@@ -1002,9 +999,9 @@ fun testArm(l : Lower, alt : Alt, v : Value, ty : Ty.Type,
         ATuple(binders) -> {
             let types = match Ty.prune(ty) {
                 TTuple(ts) -> ts
-                _ -> []
+                _ -> return stop1(l, "a tuple pattern at " + Ty.show(ty))
             }
-            destructure(l, v, positions(binders, types, 0))
+            destructure(l, v, layoutOf(l, types), positions(binders, types, 0))
             L.terminate(l.b, Jump(success, []))
         }
         ACon(name, binders, Some(o)) -> opened(l, name, binders, o, v, ty, success, failure)
@@ -1039,10 +1036,10 @@ fun testArm(l : Lower, alt : Alt, v : Value, ty : Ty.Type,
             }
             let types = match Decls.conFieldTypes(l.decls, ty, name) {
                 Some(ts) -> ts
-                None -> []
+                None -> return stop1(l, "the fields of '" + name + "' at " + Ty.show(ty))
             }
             if !tested(l, v, name, failure) { return }
-            destructure(l, v, positions(binders, types, 0))
+            destructure(l, v, layoutOf(l, types), positions(binders, types, 0))
             L.terminate(l.b, Jump(success, []))
         }
     }
@@ -1081,27 +1078,34 @@ fun opened(l : Lower, name : String, binders : Array (Option String), o : Openin
         Some(i) -> i
         None -> return stop1(l, "unknown constructor '" + name + "'")
     }
+    let skolemTypes = Array.map(o.skolems, TCon)
+    let types = match Decls.conFieldTypesOpened(l.decls, ty, name, skolemTypes) {
+        Some(ts) -> ts
+        None -> return stop1(l, "the fields of '" + name + "' opened at " + Ty.show(ty))
+    }
+    -- What `packed` built: a code per hidden variable, the dictionaries, the
+    -- fields.
+    let exists = len(info.exists)
+    let carried = len(o.evidence)
+    let reps = Array.init(exists + carried + len(types), fun(i) =
+        if i < exists { Ssa.untraced(I64) }
+        else if i < exists + carried { Ssa.traced(Ptr) }
+        else { repOf(l, types[i - exists - carried]) })
+    let layout = Rt.layout(reps)
     if !tested(l, v, name, failure) { return }
     for var i = 0; i < len(layouts); i = i + 1 {
-        let code = L.emit(l.b, ObjectGet(v, i), Ssa.untraced(I64))
+        let code = L.emit(l.b, ObjectGet(v, L.fieldRef(layout, i)), Ssa.untraced(I64))
         let want = L.emit(l.b, ConstInt(keyCode(layouts[i])), Ssa.untraced(I64))
         let test = L.emit(l.b, Cmp(Eq, code, want), Ssa.untraced(I1))
         let next = L.block(l.b)
         L.terminate(l.b, Branch(test, next, failure))
         L.into(l.b, next)
     }
-    let exists = len(info.exists)
     for var i = 0; i < len(o.evidence); i = i + 1 {
         Map.put(l.env, o.evidence[i],
-                L.emit(l.b, ObjectGet(v, exists + i), Ssa.traced(Ptr)))
+                L.emit(l.b, ObjectGet(v, L.fieldRef(layout, exists + i)), Ssa.traced(Ptr)))
     }
-    let carried = len(o.evidence)
-    let skolemTypes = Array.map(o.skolems, TCon)
-    let types = match Decls.conFieldTypesOpened(l.decls, ty, name, skolemTypes) {
-        Some(ts) -> ts
-        None -> []
-    }
-    destructure(l, v, positions(binders, types, exists + carried))
+    destructure(l, v, layout, positions(binders, types, exists + carried))
     L.terminate(l.b, Jump(success, []))
 }
 
@@ -1154,12 +1158,52 @@ fun tested(l : Lower, v : Value, name : String, failure : BlockId) -> Bool {
     }
 }
 
--- Read each field an arm binds and bind it.
-fun destructure(l : Lower, object : Value, fields : Vec (Int, String, Ty.Type)) -> Unit {
+-- Read each field an arm binds and bind it, from an object laid out as
+-- `layout`.
+fun destructure(l : Lower, object : Value, layout : Rt.Layout,
+                fields : Vec (Int, String, Ty.Type)) -> Unit {
     for (index, name, fieldTy) in fields {
-        Map.put(l.env, name, L.emit(l.b, ObjectGet(object, index), repOf(l, fieldTy)))
+        Map.put(l.env, name, L.emit(l.b, ObjectGet(object, L.fieldRef(layout, index)),
+                                    repOf(l, fieldTy)))
     }
 }
+
+-- The layout of an object whose fields have these types.
+--
+-- A reader and the object's builder each compute it, the builder from its
+-- operands' representations and the reader from the types, and agree because
+-- a value's representation is a function of its type. A field's place depends
+-- on every other field's representation, so a reader needs all of the types
+-- and not only the one it reads.
+fun layoutOf(l : Lower, types : Array Ty.Type) -> Rt.Layout =
+    Rt.layout(Array.map(types, repOf(l, _)))
+
+-- Where field `index` is in a value of type `ty`, which a projection names
+-- without a pattern: a tuple, or a type with one constructor.
+fun projected(l : Lower, ty : Ty.Type, index : Int) -> Option L.FieldRef {
+    let types = match Ty.prune(ty) {
+        TTuple(ts) -> ts
+        t -> match Decls.payloadTypes(l.decls, t) {
+            Some(ts) -> ts
+            None -> {
+                stop1(l, "a projection from " + Ty.show(ty))
+                return None
+            }
+        }
+    }
+    if index >= len(types) {
+        stop1(l, "a projection of field " + Int.toString(index) + " from " + Ty.show(ty))
+        return None
+    }
+    Some(L.fieldRef(layoutOf(l, types), index))
+}
+
+-- Slot `index` of a dictionary. Every slot holds a traced pointer -- a
+-- method's closure or a superclass's dictionary, which `dictionary` checks of
+-- each one it builds and `act` of each one it places -- so the slot is the
+-- `index`th pointer, and its place does not depend on how many slots follow.
+fun dictionarySlot(index : Int) -> L.FieldRef =
+    L.fieldRef(Rt.layout(Array.filled(index + 1, Ssa.traced(Ptr))), index)
 
 -- A literal pattern's test: a machine comparison, and a float comparison is
 -- the same constructor with `f64` operands, which is what instruction
@@ -1305,12 +1349,20 @@ fun valueHere(l : Lower, e : Core) -> Value {
             Some((slot, held)) -> coerce(l, L.emit(l.b, SlotLoad(slot), held), rep)
             None -> match Decls.erasedPayload(l.decls, target.ty) {
             Some(_) -> value(l, target)
-            None -> L.emit(l.b, ObjectGet(value(l, target), index), rep)
+            None -> match projected(l, target.ty, index) {
+                Some(field) -> L.emit(l.b, ObjectGet(value(l, target), field), rep)
+                None -> Ssa.freshValue(l.func, rep)
+            }
             }
         }
         CSlot(target, index) -> match localPosition(l, target, index) {
             Some((slot, held)) -> coerce(l, L.emit(l.b, SlotLoad(slot), held), rep)
-            None -> L.emit(l.b, ObjectGet(value(l, target), index), rep)
+            None -> {
+                if rep != Ssa.traced(Ptr) {
+                    return stop(l, "a dictionary slot held at " + show(rep))
+                }
+                L.emit(l.b, ObjectGet(value(l, target), dictionarySlot(index)), rep)
+            }
         }
         CIndex(target, index) -> {
             let array = value(l, target)
@@ -1325,10 +1377,7 @@ fun valueHere(l : Lower, e : Core) -> Value {
             L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
         }
         CTuple(elems) -> aggregate(l, elems, 0, -1, 0, "builds a tuple")
-        -- Mutable throughout, as a dictionary the initializer fills one slot
-        -- at a time must be: the masks of all dictionaries of a class agree.
-        CDict(cls, slots) -> aggregate(l, slots, 1, Map.getOr(l.tags, Core.dictName(cls), -1),
-                                       allFields(len(slots)), "builds a dictionary, " + cls)
+        CDict(cls, slots) -> dictionary(l, cls, slots)
         CArray(elems) -> arrayLiteral(l, e, elems)
         CCon(name) -> match Ty.prune(e.ty) {
             TFun(_, _) -> stop(l, "the constructor '" + name + "' must be saturated")
@@ -1390,7 +1439,10 @@ fun store(l : Lower, target : Core, x : Value) -> Unit = match target.kind {
     }
     CProject(receiver, index) -> match localPosition(l, receiver, index) {
         Some((slot, held)) -> L.effect(l.b, SlotStore(slot, coerce(l, x, held)))
-        None -> L.effect(l.b, ObjectSet(value(l, receiver), index, x))
+        None -> match projected(l, receiver.ty, index) {
+            Some(field) -> L.effect(l.b, ObjectSet(value(l, receiver), field, x))
+            None -> {}
+        }
     }
     -- Anything else is a reference cell: a `var`, whose mentions are already
     -- `CDeref` and whose assignment is a store through the cell itself.
@@ -1412,11 +1464,32 @@ fun aggregate(l : Lower, items : Array Core, kind : Int, tag : Int,
              mutable : Int, what : String) -> Value {
     if wide(l, what, len(items), Rt.fieldLimit) { return Ssa.freshValue(l.func, Ssa.traced(Ptr)) }
     let values = Array.map(items, fun(x) = value(l, x))
-    let reps = Array.map(values, Ssa.repOf(l.func, _))
-    let made = L.emit(l.b, ObjectNew(kind, tag, metadata(reps), values, mutable),
-                      Ssa.traced(Ptr))
+    built(l, kind, tag, values, mutable, what)
+}
+
+-- An object of these fields, laid out from their representations.
+fun built(l : Lower, kind : Int, tag : Int, values : Array Value, mutable : Int,
+          what : String) -> Value {
+    let layout = Rt.layout(Array.map(values, Ssa.repOf(l.func, _)))
+    let made = L.emit(l.b, ObjectNew(kind, tag, layout, values, mutable), Ssa.traced(Ptr))
     Map.put(l.func.reasons, Ssa.valueId(made), what)
     made
+}
+
+-- A dictionary: a constructed value whose slots are all traced pointers, which
+-- is what lets a slot be read knowing only its index (`dictionarySlot`).
+-- Mutable throughout, as a dictionary the initializer fills one slot at a time
+-- must be: the masks of all dictionaries of a class agree.
+fun dictionary(l : Lower, cls : String, slots : Array Core) -> Value {
+    let what = "builds a dictionary, " + cls
+    if wide(l, what, len(slots), Rt.fieldLimit) { return Ssa.freshValue(l.func, Ssa.traced(Ptr)) }
+    let values = Array.map(slots, fun(x) = value(l, x))
+    for v in values {
+        if Ssa.repOf(l.func, v) != Ssa.traced(Ptr) {
+            return stop(l, "a dictionary slot of " + cls + " held at " + show(Ssa.repOf(l.func, v)))
+        }
+    }
+    built(l, 1, Map.getOr(l.tags, Core.dictName(cls), -1), values, allFields(len(slots)), what)
 }
 
 -- Which fields of a value built with this constructor may be assigned: its
@@ -1439,51 +1512,18 @@ fun mutableMask(l : Lower, con : String, count : Int) -> Int =
 -- The mutable mask with every one of `count` fields set.
 fun allFields(count : Int) -> Int = Int.shl(1, count) - 1
 
--- How the collector reads an object's fields: three bits of representation
--- each, least significant field first. Not a pointer bitmap -- a width and a
--- register class are needed too, and one code answers all three. The code
--- itself is the runtime's, so it is read from `Turkey.Runtime` rather than
--- restated here.
---
--- At most `Rt.fieldLimit` fields fit, which the parser holds a declared
--- constructor and a tuple to; `wide` stops the lowering of anything else
--- that would be wider -- a dictionary of a class with many methods, say --
--- rather than build an object whose last fields the collector cannot see.
-fun metadata(reps : Array Rep) -> Int {
-    var out = 0
-    for var i = 0; i < len(reps); i = i + 1 {
-        out = out + Int.shl(Rt.layoutCode(reps[i]), 3 * i)
-    }
-    out
-}
-
--- -- closures ----------------------------------------------------------------------
-
--- One bit per capture, set where the collector must follow the slot.
---
--- Not `metadata`, and the difference is not cosmetic. The runtime reads a
--- kind-0 or kind-1 object's word as three bits of representation per field and
--- every other kind's -- including the environment's, which is kind 4 -- as one
--- bit per slot (`mark_children`). One C field, two encodings, and the object's
--- kind is what says which. Confusing them is silent: the collector follows an
--- integer, or fails to follow a pointer.
---
--- The test is `traced` rather than "is a pointer", which is the distinction
--- `Rep` carries: a code address is a pointer the collector must *not* follow.
+-- Whether an object of `count` fields is past `limit`, stopping the lowering
+-- if it is. The parser holds a declared constructor and a tuple to
+-- `Rt.fieldLimit`; this stops anything else that wide -- a dictionary of a
+-- class with many methods, a packed existential.
 fun wide(l : Lower, kind : String, count : Int, limit : Int) -> Bool {
     if count <= limit { return False }
     stop1(l, kind + " of " + Int.toString(count) + " slots, more than the "
-             + Int.toString(limit) + " an object header describes")
+             + Int.toString(limit) + " an object may have")
     True
 }
 
-fun bitmap(reps : Array Rep) -> Int {
-    var out = 0
-    for var i = 0; i < len(reps); i = i + 1 {
-        if reps[i].traced { out = out + Int.shl(1, i) }
-    }
-    out
-}
+-- -- closures ----------------------------------------------------------------------
 
 -- The captures a lambda needs: the names its body mentions that this body
 -- holds, and what each is held at.
@@ -1603,9 +1643,10 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
         Vec.push(g.params, v)
         Vec.push(taken, v)
     }
+    let held = environmentLayout(captures)
     for var i = 0; i < len(captures); i = i + 1 {
         let (name, r) = captures[i]
-        Map.put(child.env, name, L.emit(child.b, ObjectGet(environment, i), r))
+        Map.put(child.env, name, L.emit(child.b, ObjectGet(environment, L.fieldRef(held, i)), r))
     }
     for var i = 0; i < len(params) && i < len(taken); i = i + 1 {
         let held = repIn(l.decls, l.layouts, params[i].ty)
@@ -1627,11 +1668,11 @@ fun lift(l : Lower, params : Array CParam, body : Core, result : Ty.Type,
 
 -- A closure and its environment, built with every capture this body holds.
 --
--- Environment fields use one trace bit per capture (kind 4), unlike the
--- three-bit field layouts of ordinary records. A capture named in `later` is a
--- sibling in a recursive group that does not exist yet: its slot starts null,
--- which the collector skips, and is marked mutable, and `letrec` writes it
--- with `ClosureCapture` once every shell exists.
+-- An environment is an object of kind 4, laid out from its captures'
+-- representations as any object is (`environmentLayout`). A capture named in
+-- `later` is a sibling in a recursive group that does not exist yet: its slot
+-- starts null, which the collector skips, and is marked mutable, and `letrec`
+-- writes it with `ClosureCapture` once every shell exists.
 fun closureShell(l : Lower, symbol : String, captures : Vec (String, Rep),
                  later : Set.Set String) -> Value {
     if len(captures) == 0 {
@@ -1654,11 +1695,16 @@ fun closureShell(l : Lower, symbol : String, captures : Vec (String, Rep),
             }
         }
     })
-    let reps = Array.map(captures, _.1)
-    let environment = L.emit(l.b, ObjectNew(4, -1, bitmap(reps), values, mutable),
+    let environment = L.emit(l.b, ObjectNew(4, -1, environmentLayout(captures), values,
+                                            mutable),
                              Ssa.traced(Ptr))
     L.emit(l.b, ClosureNew(symbol, Some(environment)), Ssa.traced(Ptr))
 }
+
+-- The layout of an environment holding these captures, which the parent
+-- builds and writes and the child reads.
+fun environmentLayout(captures : Vec (String, Rep)) -> Rt.Layout =
+    Rt.layout(Array.map(captures, _.1))
 
 -- A lambda in value position: lift it, then build the closure.
 fun lambda(l : Lower, params : Array CParam, body : Core, result : Ty.Type) -> Value {
@@ -1724,7 +1770,8 @@ fun letrec(l : Lower, binds : Vec CBind, body : Core, dest : Dest) -> Unit {
         for var j = 0; j < len(captures); j = j + 1 {
             if Set.contains(siblings, captures[j].0) {
                 match Map.get(l.env, captures[j].0) {
-                    Some(v) -> L.effect(l.b, ClosureCapture(shells[i], j, v))
+                    Some(v) -> L.effect(l.b, ClosureCapture(shells[i],
+                                                            L.fieldRef(environmentLayout(captures), j), v))
                     None -> {}
                 }
             }
@@ -1803,6 +1850,9 @@ fun zero(l : Lower, r : Rep) -> Value = match r.class_ {
 -- `tagsOf`, and tuples and closures carry -1.
 let wrapTag = -2
 
+-- A wrap holds the one nested value.
+let wrapLayout = Rt.layout([Ssa.traced(Ptr)])
+
 -- The compact shape `name`'s type has, if it is one word at `ty`: by the
 -- payload's layout, which every body knows (`repIn`).
 fun compactAt(l : Lower, name : String, ty : Ty.Type) -> Option Compact {
@@ -1876,7 +1926,7 @@ fun compactValue(l : Lower, c : Compact, name : String, ty : Ty.Type,
     L.into(l.b, as_)
     L.terminate(l.b, Jump(after, [x]))
     L.into(l.b, wrap)
-    let object = L.emit(l.b, ObjectNew(1, wrapTag, metadata([Ssa.traced(Ptr)]), [x], 0),
+    let object = L.emit(l.b, ObjectNew(1, wrapTag, wrapLayout, [x], 0),
                         Ssa.traced(Ptr))
     Map.put(l.func.reasons, Ssa.valueId(object),
             "wraps a nested value in " + Ty.shortName(name))
@@ -1928,7 +1978,8 @@ fun compactPayload(l : Lower, c : Compact, binders : Array (Option String), v : 
         let isWrap = L.emit(l.b, Cmp(Eq, seen, want), Ssa.untraced(I1))
         L.terminate(l.b, Branch(isWrap, wrapped, as_))
         L.into(l.b, wrapped)
-        L.terminate(l.b, Jump(after, [L.emit(l.b, ObjectGet(v, 0), Ssa.traced(Ptr))]))
+        L.terminate(l.b, Jump(after, [L.emit(l.b, ObjectGet(v, L.fieldRef(wrapLayout, 0)),
+                                             Ssa.traced(Ptr))]))
         L.into(l.b, as_)
         L.terminate(l.b, Jump(after, [v]))
         L.into(l.b, after)
@@ -1994,12 +2045,7 @@ fun packed(l : Lower, info : ConInfo, name : String, args : Array Core,
         } else {
             value(l, args[i - len(parts)])
         })
-    let reps = Array.map(values, Ssa.repOf(l.func, _))
-    let made = L.emit(l.b, ObjectNew(1, tag, metadata(reps), values, 0),
-                      Ssa.traced(Ptr))
-    Map.put(l.func.reasons, Ssa.valueId(made),
-            "packs an existential, " + Ty.shortName(name))
-    made
+    built(l, 1, tag, values, 0, "packs an existential, " + Ty.shortName(name))
 }
 
 -- A layout's code as a packed value stores it: its position in the fixed list
@@ -2639,7 +2685,12 @@ fun act(l : Lower, a : Action, held : Map String Rep) -> Unit = match a {
         -- Filled by the `Field` actions that follow, so every slot is mutable,
         -- and starts as a zero.
         let reps = Array.map(slots, fun(v) = repOf(l, v.ty))
-        let made = L.emit(l.b, ObjectNew(1, Map.getOr(l.tags, con, -1), metadata(reps),
+        for r in reps {
+            if r != Ssa.traced(Ptr) {
+                return stop1(l, "a dictionary slot of " + con + " held at " + show(r))
+            }
+        }
+        let made = L.emit(l.b, ObjectNew(1, Map.getOr(l.tags, con, -1), Rt.layout(reps),
                                          Array.map(reps, storageZero(l, _)),
                                          allFields(len(slots))),
                           Ssa.traced(Ptr))
@@ -2652,7 +2703,7 @@ fun act(l : Lower, a : Action, held : Map String Rep) -> Unit = match a {
         lower(l, v, ToBlock(after))
         L.into(l.b, after)
         let record = L.emit(l.b, GlobalLoad(name), Ssa.traced(Ptr))
-        L.effect(l.b, ObjectSet(record, index, arrived))
+        L.effect(l.b, ObjectSet(record, dictionarySlot(index), arrived))
     }
     Store(name, v) -> {
         let want = Map.getOr(held, name, Ssa.traced(Ptr))

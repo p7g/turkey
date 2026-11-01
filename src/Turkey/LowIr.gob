@@ -1,5 +1,6 @@
 module Turkey.LowIr (
     BinOp(..), CmpOp(..), Conv(..), IndexCheck(..), AtomicOp(..), Callee(..), Intrinsic(..), intrinsicName, Op(..), Low(..), AddressOf(..),
+    FieldRef(..), fieldRef,
     low, effectsOf, fillClass, opUses, mapUses, opResultRep, checkReps, checkCalls, showOpName,
     Allocation(..), summarize, allocatingOp,
     Builder(..), builder, into, emit, effect, terminate, block, param,
@@ -30,12 +31,14 @@ module Turkey.LowIr (
 -- line, and it is what keeps this set at two dozen rather than the hundreds
 -- Go's `Op` has.
 --
--- **The level is the runtime's ABI.** `ObjectGet(p, 3)` and not an address
+-- **The level is the runtime's ABI.** `ObjectGet(p, f)` and not an address
 -- computation, because that is one-to-one with what the allocator in
--- `lib/Turkey/` provides and with what the collector understands; the offsets are described
--- by an object's metadata and are not the IR's to invent. Going lower would
--- expose arithmetic no optimization here needs and would put the heap layout
--- in two places. Instruction selection expands these; that is its job.
+-- `lib/Turkey/` provides and with what the collector understands. Where a
+-- field is comes from one function of the object's field representations,
+-- `Turkey.Runtime.layout`, applied where the object is built and where it is
+-- read; the IR carries the answer, not a rule of its own. Going lower would
+-- expose arithmetic no optimization here needs. Instruction selection expands
+-- these; that is its job.
 
 import Data.Map as Map
 import Turkey.Runtime as Rt
@@ -163,6 +166,21 @@ type AddressOf
     -- (`Turkey.Sites`). Nothing a program writes produces this.
     | AllocSites
 
+-- A field of an object: its index, and its offset in bytes from the object's
+-- address, which is `Turkey.Runtime.fieldOffset` of the object's layout. The
+-- index is what a pass reasons with -- the operand of the `ObjectNew` a get
+-- reads -- and the offset is what a machine reads.
+type FieldRef = FieldRef { index : Int, offset : Int }
+
+fun fieldRef(layout : Rt.Layout, index : Int) -> FieldRef =
+    FieldRef { index = index, offset = Rt.fieldOffset(layout, index) }
+
+fun showField(f : FieldRef) -> String =
+    Int.toString(f.index) + "@" + Int.toString(f.offset)
+
+fun showLayout(l : Rt.Layout) -> String =
+    " bytes=" + Int.toString(Rt.objectBytes(l)) + " pointers=" + Int.toString(l.pointers)
+
 type Op
     = ConstInt(Int)
     | ConstFloat(Float)
@@ -176,10 +194,10 @@ type Op
     | Convert(Conv, Value)
     | Intrinsic(Intrinsic, Value)
     -- A heap object, allocated and initialized in one instruction: `kind` and
-    -- `tag` as the runtime understands them, the field metadata (three bits of
-    -- representation per field for kinds 0 and 1, one trace bit per slot for an
-    -- environment; see `Turkey.SsaLower.metadata`), the field values, and a
-    -- mask with a bit set for each field that may be written after this.
+    -- `tag` as the runtime understands them, the layout of its fields
+    -- (`Turkey.Runtime.layout` of their representations, which `checkReps`
+    -- holds the operands to), the field values, and a mask with a bit set for
+    -- each field that may be written after this.
     --
     -- The values are operands, so an `ObjectGet` of an immutable field of this
     -- object is the operand, and an object nothing reads is dead code: no
@@ -190,9 +208,11 @@ type Op
     -- have to be live across it. `Turkey.Roots.across` roots every traced
     -- operand of a safepoint, which is what makes that true; the collector
     -- also never sees the object with a field unwritten.
-    | ObjectNew(Int, Int, Int, Array Value, Int)
-    | ObjectGet(Value, Int)
-    | ObjectSet(Value, Int, Value)
+    | ObjectNew(Int, Int, Rt.Layout, Array Value, Int)
+    -- A field, by index and by where it is (`FieldRef`), at the width of its
+    -- representation: the result's for a get and the operand's for a set.
+    | ObjectGet(Value, FieldRef)
+    | ObjectSet(Value, FieldRef, Value)
     | ObjectTag(Value)
     -- Length, initial element, and the element's representation. The class
     -- decides the stride -- `Array Byte` is packed because of this and not by
@@ -259,16 +279,16 @@ type Op
     -- capture of a closure in the same recursive group: the sibling does not
     -- exist yet when the environment is built, so that slot starts null and
     -- is marked mutable.
-    | ClosureCapture(Value, Int, Value)
+    | ClosureCapture(Value, FieldRef, Value)
     -- An object in this function's frame rather than the heap, for one
     -- `Turkey.Escape` proved never outlives the call that makes it: kind,
-    -- tag, field metadata and fields as `ObjectNew` has them, at the same
+    -- tag, layout and fields as `ObjectNew` has them, at the same
     -- payload layout, so every access reads it as it would a heap object.
     --
     -- Neither an allocation nor a safepoint. The collector never marks one: it
     -- skips any address in the stack, and this frame's table lists the
     -- object's traced fields wherever it is live (`Turkey.Roots`).
-    | StackObject(Int, Int, Int, Array Value)
+    | StackObject(Int, Int, Rt.Layout, Array Value)
     -- A closure shell in the frame, as `ClosureNew` builds one on the heap.
     | StackClosure(String, Option Value)
     | Call(Callee, Array Value)
@@ -652,6 +672,8 @@ fun checkReps(f : Ssa.Func Low, i : Low) -> Vec String {
         }
         ClosureCapture(c, _, _) ->
             wantClass(f, out, c, Ptr, "the target of a closure capture")
+        ObjectNew(_, _, layout, fields, _) -> laidOut(f, out, layout, fields)
+        StackObject(_, _, layout, fields) -> laidOut(f, out, layout, fields)
         -- An address and an integer are the same bits, so nothing at run time
         -- distinguishes a wrong pairing here. And a *traced* pointer turned
         -- into an integer is a root the collector stops seeing, so the trace
@@ -915,6 +937,25 @@ fun mark(out : Map String Allocation, work : Vec String, name : String,
     }
 }
 
+-- An object's fields are where its layout says only if they are what the
+-- layout was computed from: a field operand at another representation, put
+-- there by a pass after lowering, would be stored at its own width over its
+-- neighbours'.
+fun laidOut(f : Ssa.Func Low, out : Vec String, layout : Rt.Layout,
+            fields : Array Value) -> Unit {
+    if len(layout.reps) != len(fields) {
+        Vec.push(out, "an object of " + Int.toString(len(fields)) + " fields is laid out for "
+                        + Int.toString(len(layout.reps)))
+        return
+    }
+    for var k = 0; k < len(fields); k = k + 1 {
+        if Ssa.repOf(f, fields[k]) != layout.reps[k] {
+            Vec.push(out, "field " + Int.toString(k) + " is " + show(Ssa.repOf(f, fields[k]))
+                            + " and laid out as " + show(layout.reps[k]))
+        }
+    }
+}
+
 fun sameRep(f : Ssa.Func Low, out : Vec String, a : Value, b : Value,
             what : String) -> Unit {
     if Ssa.repOf(f, a) != Ssa.repOf(f, b) {
@@ -1015,12 +1056,12 @@ instance Show Op {
     Not(a) -> "not " + v(a)
     Convert(c, a) -> show(c) + " " + v(a)
     Intrinsic(k, a) -> intrinsicName(k) + " " + v(a)
-    ObjectNew(kind, tag, bitmap, fields, mutable) ->
+    ObjectNew(kind, tag, layout, fields, mutable) ->
         "object.new kind=" + Int.toString(kind) + " tag=" + Int.toString(tag)
-        + " count=" + Int.toString(len(fields)) + " bitmap=" + Int.toString(bitmap) + " mutable=" + Int.toString(mutable)
+        + " count=" + Int.toString(len(fields)) + showLayout(layout) + " mutable=" + Int.toString(mutable)
         + " [" + String.join(Array.map(fields, v), ", ") + "]"
-    ObjectGet(a, i) -> "object.get " + v(a) + ", " + Int.toString(i)
-    ObjectSet(a, i, b) -> "object.set " + v(a) + ", " + Int.toString(i) + ", " + v(b)
+    ObjectGet(a, f) -> "object.get " + v(a) + ", " + showField(f)
+    ObjectSet(a, f, b) -> "object.set " + v(a) + ", " + showField(f) + ", " + v(b)
     ObjectTag(a) -> "object.tag " + v(a)
     ArrayNew(n, init, c) ->
         "array.new " + v(n) + ", " + v(init) + ", " + show(c)
@@ -1047,11 +1088,11 @@ instance Show Op {
         Some(e) -> "closure.new @" + code + ", " + v(e)
         None -> "closure.new @" + code
     }
-    ClosureCapture(a, i, b) ->
-        "closure.capture " + v(a) + ", " + Int.toString(i) + ", " + v(b)
-    StackObject(kind, tag, bitmap, fields) ->
+    ClosureCapture(a, f, b) ->
+        "closure.capture " + v(a) + ", " + showField(f) + ", " + v(b)
+    StackObject(kind, tag, layout, fields) ->
         "stack.object kind=" + Int.toString(kind) + " tag=" + Int.toString(tag)
-        + " count=" + Int.toString(len(fields)) + " bitmap=" + Int.toString(bitmap)
+        + " count=" + Int.toString(len(fields)) + showLayout(layout)
         + " [" + String.join(Array.map(fields, v), ", ") + "]"
     StackClosure(code, environment) -> match environment {
         Some(e) -> "stack.closure @" + code + ", " + v(e)

@@ -125,13 +125,17 @@ let frameLive : Int = 32
 -- it skips null.
 let immediates : Int = 4096
 
--- The objects `Turkey.Alloc` builds: `kind` and `tag` (i32), `count`, then the
--- pointer metadata and the slots. A cell is its value and an i32 flag saying
+-- The objects `Turkey.Alloc` builds: `kind` and `tag` (i32), `count`, the
+-- descriptor, then the fields. An array's count is its length and its
+-- descriptor its element width. Any other object's count is the bytes of its
+-- fields, a whole number of words, and its descriptor is how many words they
+-- end with that are traced pointers: the compiler puts every traced field
+-- last (`Turkey.Runtime.layout`). A cell is its value and an i32 flag saying
 -- whether the value is a pointer.
 let objectKind : Int = 0
 let objectTag : Int = 4
 let objectCount : Int = 8
-let objectBitmap : Int = 16
+let objectDescriptor : Int = 16
 let objectSlots : Int = 24
 
 -- One frame-table entry: a return address, how many roots are live across the
@@ -1141,9 +1145,9 @@ fun immediate(value : Prim.Ptr) -> Bool = below(Prim.ptrToInt(value), immediates
 -- root the caller cannot name.
 fun markGrey(value : Prim.Ptr, what : Prim.Ptr, index : Int) -> Unit {
     if immediate(value) { return {} }
-    -- Exact roots and layout metadata make the header O(1) to find in normal
+    -- Exact roots and object descriptors make the header O(1) to find in normal
     -- execution. GC stress checks membership, and it earns the cost: a pointer
-    -- that is not in the heap means a root was missed or a layout bitmap is
+    -- that is not in the heap means a root was missed or a descriptor is
     -- wrong, and this turns that from a rare corruption into a panic on the
     -- first collection.
     if stress && Prim.ptrIsNull(findHeader(value)) {
@@ -1265,12 +1269,11 @@ fun remember(parent : Prim.Ptr) -> Unit {
 -- Trace everything reachable from the running worker's mark stack, emptying
 -- it. This is the one place the collector decodes an object's layout.
 --
--- An array's tag is its element's layout code, and the other objects carry a
--- code per slot: three bits each for constructors and records, one bit each
--- for closures and environments. Code 7 is a traced pointer and 6 is a
--- pointer-sized word the collector must not follow: a raw address. A test of
--- `>= 6` follows both, and collects through an address it has no business
--- reading.
+-- An array's tag is its element's layout code: 7 is a traced pointer and 6
+-- is a pointer-sized word the collector must not follow, a raw address. A
+-- test of `>= 6` follows both, and collects through an address it has no
+-- business reading. Any other object's descriptor counts the traced words its
+-- fields end with, and the rest of it is not looked at.
 --
 -- An entry is an object, or the next chunk of one too large to scan at once:
 -- its address with the chunk's number, from 1, in the top bits, which no
@@ -1301,24 +1304,21 @@ fun drain() -> Unit {
         let entry = Prim.ptrToInt(Prim.loadPtr(stack, times8(top)))
         let chunk = Prim.intShr(entry, 48)
         let object = Prim.ptrFromInt(if chunk == 0 { entry } else { Prim.intAnd(entry, addressBits) })
-        -- Where its pointers start, how many slots, and how each is coded.
+        -- Where its pointers start and how many there are: every word from
+        -- `first` to `slots` is one.
         var first = objectSlots
         var slots = 0
-        var coding = Pointers
-        var codes = 0
         let heapKind = load32(object, payloadKind)
         if heapKind == heapCell {
             first = 0
             slots = if load32(object, 8) != 0 { 1 } else { 0 }
-            coding = CellValue
         } else if heapKind == heapObject {
-            let kind = load32(object, objectKind)
-            codes = Prim.loadI64(object, objectBitmap)
-            if kind == 2 {
+            if load32(object, objectKind) == 2 {
                 if load32(object, objectTag) == 7 { slots = Prim.loadI64(object, objectCount) }
             } else {
-                slots = Prim.loadI64(object, objectCount)
-                coding = if kind == 0 || kind == 1 { ThreeBits } else { OneBit }
+                slots = Prim.loadI64(object, objectDescriptor)
+                first = Prim.intSubWrapping(plus(objectSlots, Prim.loadI64(object, objectCount)),
+                                            times8(slots))
             }
         }
         var field = 0
@@ -1344,17 +1344,10 @@ fun drain() -> Unit {
             top = plus(top, 1)
         }
         while field < end {
-            let traced = match coding {
-                Pointers -> True
-                ThreeBits -> Prim.intAnd(Prim.intShr(codes, Prim.intMulWrapping(3, field)), 7) == 7
-                OneBit -> Prim.intAnd(codes, bit(field)) != 0
-                CellValue -> True
-            }
-            let child = if traced { Prim.loadPtr(object, plus(first, times8(field))) }
-                        else { Prim.ptrNull() }
+            let child = Prim.loadPtr(object, plus(first, times8(field)))
             if immediate(child) {
             } else if stress && Prim.ptrIsNull(findHeader(child)) {
-                notHeapPointer(child, fieldName(coding), field)
+                notHeapPointer(child, fieldName(object, heapKind), field)
             } else {
                 let childHeader = Prim.ptrFromInt(Prim.intSubWrapping(Prim.ptrToInt(child), headerBytes))
                 let childRegion = regionOf(childHeader)
@@ -1766,19 +1759,15 @@ fun stopAt(frame : Prim.Ptr) -> Unit {
     Workers.stopLeave()
 }
 
--- How an object's slots say which of them are pointers: every one is (an
--- array of pointers), three bits per slot (a constructor or record), one bit
--- per slot (a closure or its environment), or it is a cell, whose one slot is
--- there only when it holds a pointer.
-type Coding = Pointers | ThreeBits | OneBit | CellValue
-
--- What `notHeapPointer` calls a field, by how its object codes its slots.
-fun fieldName(coding : Coding) -> Prim.Ptr = match coding {
-    Pointers -> Prim.cString("array pointer field")
-    ThreeBits -> Prim.cString("object pointer field")
-    OneBit -> Prim.cString("capture")
-    CellValue -> Prim.ptrNull()
-}
+-- What `notHeapPointer` calls a field, by the kind of object it is in.
+fun fieldName(object : Prim.Ptr, cellOrObject : Int) -> Prim.Ptr =
+    if cellOrObject == heapCell { Prim.ptrNull() }
+    else {
+        let kind = load32(object, objectKind)
+        if kind == 2 { Prim.cString("array pointer field") }
+        else if kind == 0 || kind == 1 { Prim.cString("object pointer field") }
+        else { Prim.cString("capture") }
+    }
 
 -- "<what> <index> is not a heap pointer (0x...)", or "GC root or field is not
 -- a heap pointer (0x...)" when the caller cannot name where it looked. Named,

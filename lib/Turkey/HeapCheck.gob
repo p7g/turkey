@@ -111,12 +111,14 @@ let heapCell : Int = 3
 let cellBytes : Int = 16
 let cellFlag : Int = 8
 
--- An object's payload: kind and tag (i32), count, the layout bitmap (an
--- array's element width), then the slots.
+-- An object's payload: kind and tag (i32), count, the descriptor, then the
+-- slots. For an array the count is its length and the descriptor its element
+-- width; for any other object, the bytes of its fields and how many words
+-- they end with that are traced.
 let objectKind : Int = 0
 let objectTag : Int = 4
 let objectCount : Int = 8
-let objectBitmap : Int = 16
+let objectDescriptor : Int = 16
 let objectSlots : Int = 24
 
 -- A region. Small regions are 64KB, aligned to their size, with `capacity`
@@ -675,10 +677,13 @@ fun checkAvailable() -> Bool {
 
 -- The object whose header is at `h`, in a slot `checkRegions` has bounded.
 --
--- Layout codes: an array's tag is its element's code, and its bitmap word is
--- the element width. A constructor or record has three bits of code per slot,
--- at most 21 slots; a closure or environment has one bit per slot, at most 63. Code 7 is a traced pointer, and 6 a raw address that must not be
--- followed.
+-- An array's tag is its element's code, and its descriptor the element
+-- width; code 7 is a traced pointer, and 6 a raw address that must not be
+-- followed. Any other object's fields are a whole number of words, which
+-- with the header make up the heap's payload size, and its descriptor counts
+-- the words they end with that are traced. A closure is its code's address
+-- and then its environment. Read from the header alone, by this module's own
+-- rules: nothing here knows what the compiler put in which field.
 fun checkObject(h : Int) -> Bool {
     let value = h + headerBytes
     let header = Prim.ptrFromInt(h)
@@ -704,31 +709,36 @@ fun checkObject(h : Int) -> Bool {
     let kind = load32(payload, objectKind)
     let tag = load32(payload, objectTag)
     let count = Prim.loadI64(payload, objectCount)
-    let bitmap = Prim.loadI64(payload, objectBitmap)
+    let descriptor = Prim.loadI64(payload, objectDescriptor)
     if kind > 4 || count < 0 { return fail(Prim.cString("invalid object header"), value, -1) }
-    var span = 8
+    -- The words to check: `traced` of them, from `first`.
+    var first = objectSlots
+    var traced = 0
     if kind == 2 {
-        span = bitmap
+        let span = descriptor
         if (span != 1 && span != 4 && span != 8) || tag > 7 || (tag == 7 && span != 8) {
             return fail(Prim.cString("invalid array layout"), value, -1)
         }
-    } else if count > (if kind <= 1 { 21 } else { 63 }) {
-        return fail(Prim.cString("invalid object count"), value, -1)
-    }
-    -- `size` is below a slot size, so neither side of this can overflow.
-    if count > (size - objectSlots) / span || objectSlots + count * span != size {
-        return fail(Prim.cString("payload size disagrees with header"), value, -1)
-    }
-    if kind == 2 && tag != 7 { return True }
-    for var field = 0; field < count; field = field + 1 {
-        let traced = if kind == 2 { True }
-                     else if kind <= 1 { Prim.intAnd(Prim.intShr(bitmap, 3 * field), 7) == 7 }
-                     else { hasBit(bitmap, field) }
-        if traced {
-            let child = Prim.loadI64(payload, objectSlots + 8 * field)
-            if !checkPointer(child, marked, value, field) { return False }
-            if unremembered && !notYoung(child, value, field) { return False }
+        -- `size` is below a slot size, so neither side of this can overflow.
+        if count > (size - objectSlots) / span || objectSlots + count * span != size {
+            return fail(Prim.cString("payload size disagrees with header"), value, -1)
         }
+        if tag == 7 { traced = count }
+    } else {
+        if count % 8 != 0 || objectSlots + count != size {
+            return fail(Prim.cString("payload size disagrees with header"), value, -1)
+        }
+        if descriptor < 0 || descriptor > count / 8
+                || (kind == 3 && (count != 16 || descriptor != 1)) {
+            return fail(Prim.cString("invalid object descriptor"), value, -1)
+        }
+        traced = descriptor
+        first = size - 8 * traced
+    }
+    for var field = 0; field < traced; field = field + 1 {
+        let child = Prim.loadI64(payload, first + 8 * field)
+        if !checkPointer(child, marked, value, field) { return False }
+        if unremembered && !notYoung(child, value, field) { return False }
     }
     True
 }

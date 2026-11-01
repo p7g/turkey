@@ -31,20 +31,25 @@ foreign "turkey_cell_new" fun cellNew(value : Int, pointerValue : Int) -> Prim.P
     cell
 }
 
-foreign "turkey_object_new" fun objectNew(kind : Int, tag : Int, count : Int,
-                                         pointerBitmap : Int) -> Prim.Ptr {
-    if count < 0 || count > 63 || ((kind == 0 || kind == 1) && count > 21) {
+-- An object of `bytes` bytes of fields, the last `pointers` words of them
+-- traced. Where each field is within them is the compiler's
+-- (`Turkey.Runtime.layout`); all the runtime keeps is the count, which is the
+-- collector's whole description of the object.
+foreign "turkey_object_new" fun objectNew(kind : Int, tag : Int, bytes : Int,
+                                         pointers : Int) -> Prim.Ptr {
+    -- The bound on `bytes` is far past any object a program builds, and keeps
+    -- the size from overflowing.
+    if kind < 0 || kind == 2 || kind > 4 || bytes < 0 || bytes > 0x1_0000_0000
+            || Prim.intAnd(bytes, 7) != 0 || pointers < 0 || pointers > Prim.intShr(bytes, 3) {
         Process.panic(Prim.cString("invalid object size"))
         return Prim.ptrNull()
     }
-    -- `count` is at most 63 here, so the size cannot overflow.
-    let object = Heap.allocate(Prim.intAddWrapping(24, Prim.intShl(count, 3)), 2, kind,
-                               Prim.frameAddress())
+    let object = Heap.allocate(Prim.intAddWrapping(24, bytes), 2, kind, Prim.frameAddress())
     if Prim.ptrIsNull(object) { return object }
-    header(object, kind, tag, count, pointerBitmap)
-    -- In line, a word at a time: most objects have a few slots, and are
+    header(object, kind, tag, bytes, pointers)
+    -- In line, a word at a time: most objects have a few fields, and are
     -- zeroed in fewer instructions than a call takes.
-    let end = Prim.intAddWrapping(24, Prim.intShl(count, 3))
+    let end = Prim.intAddWrapping(24, bytes)
     for var at = 24; at < end; at = Prim.intAddWrapping(at, 8) {
         Prim.storeI64(object, at, 0)
     }
@@ -54,11 +59,11 @@ foreign "turkey_object_new" fun objectNew(kind : Int, tag : Int, count : Int,
 -- The collector and generated field accesses share this layout. The two
 -- 32-bit fields must not overwrite the count or one another.
 fun header(object : Prim.Ptr, kind : Int, tag : Int, count : Int,
-           metadata : Int) -> Unit {
+           descriptor : Int) -> Unit {
     Prim.storeI32(object, 0, Prim.charFromInt(kind))
     Prim.storeI32(object, 4, Prim.charFromInt(tag))
     Prim.storeI64(object, 8, count)
-    Prim.storeI64(object, 16, metadata)
+    Prim.storeI64(object, 16, descriptor)
 }
 
 foreign "turkey_array_new" fun arrayNew(length : Int, initial : Int,
@@ -99,8 +104,10 @@ foreign "turkey_array_new" fun arrayNew(length : Int, initial : Int,
 
 -- The environment is independently allocated and rooted by the caller. Zero
 -- initialization makes the shell safe to trace until that pointer is installed.
+-- Laid out as `Turkey.Runtime.closureShell` says: the code's address, then
+-- the environment, traced.
 foreign "turkey_closure_shell" fun closureShell(code : Int) -> Prim.Ptr {
-    let closure = objectNew(3, -1, 2, 2)
+    let closure = objectNew(3, -1, 16, 1)
     if !Prim.ptrIsNull(closure) { Prim.storeI64(closure, 24, code) }
     closure
 }

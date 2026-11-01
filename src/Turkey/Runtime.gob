@@ -1,6 +1,8 @@
 module Turkey.Runtime (
     Entry(..), Routine(..), routineName, layoutCode, traceBit, elementWidth, arrayElements, accessWidth, entryPoint,
     processState, processStateBytes, voidSymbols, immediates, fieldLimit,
+    Layout(..), layout, fieldWidth, objectFields, objectBytes, fieldOffset, closureShell,
+    closureCode, closureEnvironment,
     headerBytes, headerGeneration, headerSize, headerKind, young, heapObject, heapCell,
     workerCursors, cursorBytes, cursorFree, cursorBase, cursorSlot, sizeClass, classSlot,
     classesGlobal, classStep, fastPayload, referencedSymbols, swapStackSymbol,
@@ -35,11 +37,10 @@ import Turkey.Ssa (Rep(..), RepClass(..))
 
 -- The number the runtime calls this representation.
 --
--- Written into an object's header three bits at a time by
--- `Turkey.SsaLower.metadata`, and passed to `turkey_cell_new` and
--- `turkey_array_new` by every emitter. One numbering,
--- read by `mark_children` -- so the collector follows a pointer iff the writer
--- and the caller agreed, and there is no diagnostic when they do not.
+-- An array's tag, and the argument `turkey_array_new` and `turkey_cell_new`
+-- take, by every emitter. One numbering, read by the collector -- so it
+-- follows an array's elements iff the writer and the caller agreed, and there
+-- is no diagnostic when they do not.
 --
 -- The two pointer codes are the whole reason `Rep` carries a trace bit as far
 -- as the runtime: 7 is a pointer the collector follows and 6 is a
@@ -55,11 +56,116 @@ fun layoutCode(r : Rep) -> Int = match r.class_ {
     Ptr -> if r.traced { 7 } else { 6 }
 }
 
--- The most fields a tuple or constructed value can have: what one header word
--- describes, at three bits a field (`layoutCode`). A wider one is refused at
--- compile time; the allocator refuses one too, but the code generated in line
--- does not check, and would leave fields the collector does not see.
+-- The most fields a tuple or constructed value can have; the parser refuses a
+-- wider one. Nothing in an object's layout or its descriptor is bounded by it.
 let fieldLimit = 21
+
+-- -- objects ----------------------------------------------------------------------------
+
+-- Where a sequence of fields is, in bytes from the first: each field's offset
+-- and width, the bytes the sequence spans and the alignment it needs, and how
+-- many of its words, ending at its end, are pointers the collector follows.
+--
+-- The layout of an object's fields is a function of their representations
+-- and of nothing else, so every producer and every reader of an object that
+-- computes it from the same representations finds each field in the same
+-- place. That is the whole contract: no object says where its fields are.
+--
+-- Every field that is not a traced pointer comes first, by decreasing width
+-- and in field order within a width, and then the traced pointers, in field
+-- order. So every field is at its natural alignment, the only padding is
+-- before the first pointer, and the collector's description of any object is
+-- one count (`pointers`): the words to scan, back from the end.
+-- Declaration order would leave padding after a narrow field and scatter the
+-- pointers, and a pointer after a scalar would need a bitmap. A `Unit` field
+-- is zero bytes.
+--
+-- Scalars before pointers, rather than after, and the order within a width
+-- kept: an `Int` field declared first is at the start of the fields. The
+-- records that `Turkey.FD` and `System.Sync` change with atomic instructions,
+-- at a fixed offset, rely on it.
+--
+-- Offsets are from the start of the fields, not of the object, so the same
+-- layout places a sequence wherever it is put: after an object's header
+-- (`objectFields`), or anywhere else at an alignment of `align`.
+type Layout = Layout {
+    reps     : Array Rep,
+    offsets  : Array Int,
+    widths   : Array Int,
+    size     : Int,
+    align    : Int,
+    pointers : Int,
+}
+
+-- Bytes a field of this representation occupies, and the alignment it needs.
+--
+-- Not `elementWidth`: an `Array Bool` gives an element a whole word, and a
+-- `Bool` field takes one byte. Not `accessWidth` either, though the two agree:
+-- that one is C's layout, and this one is this compiler's choice for its own
+-- objects.
+fun fieldWidth(r : Rep) -> Int = match r.class_ {
+    Unit -> 0
+    I1 -> 1
+    I8 -> 1
+    I32 -> 4
+    I64 -> 8
+    F64 -> 8
+    Ptr -> 8
+}
+
+let scalarWidths = [8, 4, 1, 0]
+
+fun layout(reps : Array Rep) -> Layout {
+    let offsets = Array.filled(len(reps), 0)
+    let widths = Array.map(reps, fieldWidth)
+    var at = 0
+    var align = 1
+    for width in scalarWidths {
+        for var i = 0; i < len(reps); i = i + 1 {
+            if widths[i] == width && !reps[i].traced {
+                offsets[i] = at
+                at = at + width
+                if width > align { align = width }
+            }
+        }
+    }
+    var pointers = 0
+    for var i = 0; i < len(reps); i = i + 1 {
+        if reps[i].traced {
+            if pointers == 0 {
+                at = Int.and(at + 7, -8)
+                align = 8
+            }
+            offsets[i] = at
+            at = at + 8
+            pointers = pointers + 1
+        }
+    }
+    Layout { reps = reps, offsets = offsets, widths = widths,
+             size = Int.and(at + align - 1, 0 - align), align = align,
+             pointers = pointers }
+}
+
+-- Where an object's fields start: after the word holding its kind and tag,
+-- the word holding its fields' size in bytes, and its descriptor, the count of
+-- traced words at the end of its fields, as `Turkey.Alloc.header` writes
+-- them. Both `Turkey.Heap` and `Turkey.HeapCheck` read this header.
+let objectFields = 24
+
+-- The bytes of an object with these fields, header included: a whole number
+-- of words, which is what the allocator clears and the verifier checks. Its
+-- traced words are its last `pointers`, since a layout with any ends on one.
+fun objectBytes(l : Layout) -> Int = objectFields + Int.and(l.size + 7, -8)
+
+-- Field `index` of an object, in bytes from the object's address.
+fun fieldOffset(l : Layout, index : Int) -> Int = objectFields + l.offsets[index]
+
+-- A closure: its code's address and its environment, null when it captures
+-- nothing. `Turkey.Alloc.closureShell` builds one, so it states the same
+-- offsets.
+let closureCode = 0
+let closureEnvironment = 1
+let closureShell = layout([Ssa.untraced(Ptr), Ssa.traced(Ptr)])
 
 -- Whether the collector must follow a slot, for the one-bit-per-slot encoding
 -- that closures and environments use. Not `layoutCode`: one C field carries

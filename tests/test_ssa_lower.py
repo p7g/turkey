@@ -30,7 +30,8 @@ PROGRAMS = REPO_ROOT / "tests" / "programs"
 # closure conversion exists for. A sample rather than the corpus because these
 # assertions are about *shape*; `test_boot` is what runs the whole corpus.
 SAMPLE = ["adt.gob", "loops.gob", "stack.gob", "generalization.gob",
-          "constructor_values.gob", "closure_abi.gob", "closure_roots.gob", "local_values.gob", "shared_nullaries.gob"]
+          "constructor_values.gob", "closure_abi.gob", "closure_roots.gob", "local_values.gob", "shared_nullaries.gob",
+          "narrow_fields.gob"]
 
 
 @functools.lru_cache(maxsize=None)
@@ -297,6 +298,16 @@ def test_closure_signatures_keep_each_scalar_register_class():
     assert signatures
     for scalar in ("i1", "i8", "i32", "i64", "f64", "unit"):
         assert any(":" + scalar in line for line in signatures), (scalar, signatures)
+
+
+def test_a_narrow_field_takes_its_own_width_and_not_a_word():
+    # `Flags`: an `Int`, a `Float`, a `Char`, two `Bool`s and a `Byte` packed
+    # into 24 bytes, then its one pointer -- 24 header bytes and 32 of
+    # fields, where a word a field would take 56.
+    main = _ssa("narrow_fields.gob").split("fun @Main#main(", 1)[1].split("\nfun ", 1)[0]
+    built = [line for line in main.splitlines() if "count=7 " in line and "object.new" in line]
+    assert built, main
+    assert all("bytes=56 pointers=1" in line for line in built), built
 
 
 def test_local_storage_is_promoted_before_both_emitters():

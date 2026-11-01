@@ -46,7 +46,7 @@ typedef struct Frame {
 typedef struct Object {
     int32_t kind, tag;
     int64_t count;
-    uint64_t pointer_bitmap;
+    uint64_t descriptor;
     uint64_t slots[];
 } Object;
 typedef struct Entry { uintptr_t retaddr; int64_t count; const int64_t *offsets; } Entry;
@@ -106,28 +106,29 @@ int main(int argc, char **argv) {
     turkey_root_enter(&frame, held, 66, "verifier probe");
     frame.live = 1;
     Object *child = turkey_string_new((const unsigned char *)"ok", 2);
-    Object *parent = turkey_object_new(1, 0, 2, 7 | (6 << 3));
-    parent->slots[0] = (uintptr_t)child;
-    parent->slots[1] = 1; /* A raw pointer must never be followed. */
+    /* Two words, the second traced. */
+    Object *parent = turkey_object_new(1, 0, 16, 1);
+    parent->slots[1] = (uintptr_t)child;
+    parent->slots[0] = 1; /* A raw pointer must never be followed. */
     held[0] = parent;
     held[1] = (void *)1; /* Dead shadow slots must never be followed. */
     held[65] = child; /* Slots beyond the mask are always roots. */
     assert(turkey_heap_check(0, NULL, turkey_heap_state()));
     int phase = 0;
     if (!strcmp(which, "valid")) {
-        /* Cycles, every field code, pointer arrays, closures/environments,
-           cells and all array widths are independently decoded. */
-        Object *cycle = turkey_object_new(0, 0, 8,
-            0 | (1 << 3) | (2 << 6) | (3 << 9) | (4 << 12) | (5 << 15) | (6 << 18) | (7 << 21));
+        /* Cycles, words that are not pointers before the traced ones,
+           pointer arrays, closures/environments, cells and all array widths
+           are independently decoded. */
+        Object *cycle = turkey_object_new(0, 0, 64, 1);
         for (int i = 0; i < 7; i++) cycle->slots[i] = 1;
         cycle->slots[7] = (uintptr_t)cycle;
         held[2] = cycle;
         held[3] = turkey_array_new(3, (uintptr_t)child, 8, 7);
         held[4] = turkey_cell_new((uintptr_t)child, 1);
         held[5] = turkey_closure_shell(123);
-        Object *env = turkey_object_new(4, 0, 2, 1);
-        env->slots[0] = (uintptr_t)child;
-        env->slots[1] = 1;
+        Object *env = turkey_object_new(4, 0, 16, 1);
+        env->slots[0] = 1;
+        env->slots[1] = (uintptr_t)child;
         ((Object *)held[5])->slots[1] = (uintptr_t)env;
         held[6] = turkey_cell_new(123, 0);
         held[7] = turkey_array_new(8, 1, 1, 2);
@@ -166,7 +167,7 @@ int main(int argc, char **argv) {
     if (!strcmp(which, "mark-child")) { forget(child); held[65] = NULL; }
     else if (!strcmp(which, "mark-root")) forget(parent);
     else if (!strcmp(which, "mark-high-root")) {
-        parent->slots[0] = 0; forget(child);
+        parent->slots[1] = 0; forget(child);
     }
     else if (!strcmp(which, "mark-header")) header_of(parent)->marked = 0;
     else if (!strcmp(which, "mark-free")) r->marked_slots[0] |= UINT64_C(1) << 2;
@@ -178,17 +179,24 @@ int main(int argc, char **argv) {
     else if (!strcmp(which, "negative-kind")) parent->kind = -1;
     else if (!strcmp(which, "negative-count")) parent->count = -1;
     else if (!strcmp(which, "huge-count")) parent->count = INT64_MAX;
-    else if (!strcmp(which, "payload")) parent->count = 1;
-    else if (!strcmp(which, "array-width")) child->pointer_bitmap = 3;
+    else if (!strcmp(which, "payload")) parent->count = 8;
+    else if (!strcmp(which, "unaligned-count")) parent->count = 15;
+    else if (!strcmp(which, "descriptor")) parent->descriptor = 3;
+    else if (!strcmp(which, "negative-descriptor")) parent->descriptor = -1;
+    else if (!strcmp(which, "closure")) {
+        held[2] = turkey_closure_shell(123);
+        ((Object *)held[2])->descriptor = 2;
+    }
+    else if (!strcmp(which, "array-width")) child->descriptor = 3;
     else if (!strcmp(which, "array-pointer-width")) child->tag = 7;
     else if (!strcmp(which, "array-tag")) child->tag = 99;
     else if (!strcmp(which, "negative-array-tag")) child->tag = -1;
     else if (!strcmp(which, "cell-size")) { held[2] = turkey_cell_new(0, 0); header_of(held[2])->size = 1; }
-    else if (!strcmp(which, "interior")) parent->slots[0]++;
+    else if (!strcmp(which, "interior")) parent->slots[1]++;
     /* The first word that is not an immediate, and in no region. */
-    else if (!strcmp(which, "foreign")) parent->slots[0] = 4096;
-    else if (!strcmp(which, "high-address")) parent->slots[0] = UINT64_C(0xfffffffffffffff8);
-    else if (!strcmp(which, "past-region")) parent->slots[0] = (uintptr_t)r + (1 << 20);
+    else if (!strcmp(which, "foreign")) parent->slots[1] = 4096;
+    else if (!strcmp(which, "high-address")) parent->slots[1] = UINT64_C(0xfffffffffffffff8);
+    else if (!strcmp(which, "past-region")) parent->slots[1] = (uintptr_t)r + (1 << 20);
     else if (!strcmp(which, "root")) held[0] = (void *)4096;
     else if (!strcmp(which, "high-root")) held[65] = (void *)4096;
     else if (!strcmp(which, "root-cycle")) frame.previous = &frame;
@@ -234,7 +242,7 @@ int main(int argc, char **argv) {
         /* An old object given a young one: remembered only by the barrier. */
         turkey_gc_set_generational(1);
         turkey_collect();
-        parent->slots[0] = (uintptr_t)turkey_string_new((const unsigned char *)"young", 5);
+        parent->slots[1] = (uintptr_t)turkey_string_new((const unsigned char *)"young", 5);
         if (!strcmp(which, "remembered")) {
             turkey_write_barrier(parent);
             assert(turkey_heap_check(0, NULL, turkey_heap_state()));
@@ -256,14 +264,14 @@ int main(int argc, char **argv) {
         turkey_gc_set_verify(1);
         turkey_collect();
         Object *young = turkey_string_new((const unsigned char *)"young", 5);
-        parent->slots[0] = (uintptr_t)young;
+        parent->slots[1] = (uintptr_t)young;
         turkey_write_barrier(parent);
         void *dead = turkey_string_new((const unsigned char *)"dead", 4);
         turkey_collect_minor();
         assert(!turkey_has_panicked);
         assert(turkey_heap_contains(young) && !turkey_heap_contains(dead));
         assert(header_of(young)->generation == 1 && header_of(parent)->generation == 1);
-        parent->slots[0] = 0;
+        parent->slots[1] = 0;
         turkey_collect_minor();
         assert(turkey_heap_contains(young));
         turkey_collect();
@@ -274,7 +282,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(which, "reclaimed")) {
         void *dead = turkey_cell_new(5, 0);
         turkey_collect();
-        parent->slots[0] = (uintptr_t)dead;
+        parent->slots[1] = (uintptr_t)dead;
     }
     else if (!strcmp(which, "allocation-stops")) {
         parent->count = -1;
@@ -346,8 +354,12 @@ CASES = {
     "kind": "invalid object header",
     "negative-kind": "invalid object header",
     "negative-count": "invalid object header",
-    "huge-count": "invalid object count",
+    "huge-count": "payload size disagrees",
     "payload": "payload size disagrees",
+    "unaligned-count": "payload size disagrees",
+    "descriptor": "invalid object descriptor",
+    "negative-descriptor": "invalid object descriptor",
+    "closure": "invalid object descriptor",
     "array-width": "invalid array layout",
     "array-pointer-width": "invalid array layout",
     "array-tag": "invalid array layout",

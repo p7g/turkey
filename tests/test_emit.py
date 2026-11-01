@@ -291,26 +291,61 @@ fun total(xs : Array Int, n : Int) -> Int {
     sum
 }
 
+fun report(xs : Array Int, n : Int) -> Unit {
+    if n == 77777 { return report(xs, n - 1) }
+    if !(total(xs, n) < 3) { print("big") } else { print("small") }
+}
+
 fun main() -> Unit {
     let xs = [1, 2, 3, 4]
     print(total(xs, 4))
-    if !(total(xs, 2) < 3) { print("big") } else { print("small") }
+    report(xs, 2)
 }
 """
 
 
 def test_a_branch_on_a_negated_comparison_reads_the_flags():
-    """`!(i < length)`, the second half of every bounds check, is one `b.ge`.
+    """`!(a < b)` is one `b.ge`.
 
     The `not` is the opposite `cset`, which the emitter folds into the branch,
-    so no comparison is materialized and negated on the way to it.
+    so no comparison is materialized and negated on the way to it. `total`'s
+    bounds check, `!(i < length)`, materializes nothing either.
+
+    A call to itself keeps `report` from being inlined into `main`.
     """
     result = lang.dump("asm", NEGATED_BRANCHES)
     assert result.code == 0, result.stderr
-    body = _functions(result.stdout)["Main#total"]
-    assert not [line for line in body if line.startswith(("cset", "eor"))], body
-    assert any(line.startswith("b.ge ") for line in body), body
+    functions = _functions(result.stdout)
+    for name in ("Main#total", "Main#report"):
+        body = functions[name]
+        assert not [line for line in body if line.startswith(("cset", "eor"))], body
+    report = functions["Main#report"]
+    assert any(line.startswith("b.ge ") for line in report), report
     assert lang.output(NEGATED_BRANCHES) == "10\nbig\n"
+
+
+BOUNDS_CHECK = """
+fun at(xs : Array Int, i : Int) -> Int {
+    if i == 77777 { return at(xs, i - 1) }
+    xs[i]
+}
+
+fun main() { print(at([1, 2, 3], 2)) }
+"""
+
+
+def test_a_bounds_check_is_a_compare_and_branch_per_half():
+    """`i < 0 || !(i < length)`, where nothing proves `i >= 0`: each half is
+    a `cmp` and a conditional branch to the panic, and no `i1` is made for the
+    join."""
+    result = lang.dump("asm", BOUNDS_CHECK)
+    assert result.code == 0, result.stderr
+    body = _functions(result.stdout)["Main#at"]
+    assert not [line for line in body if line.startswith("cset")], body
+    below = [line.split()[1] for line in body if line.startswith("b.lt ")]
+    above = [line.split()[1] for line in body if line.startswith("b.ge ")]
+    assert len(below) == 1 and below == above, body
+    assert lang.output(BOUNDS_CHECK) == "3\n"
 
 
 ELEMENT_ACCESSES = """

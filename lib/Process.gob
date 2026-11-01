@@ -1,0 +1,199 @@
+module Process (
+    Command(..), Output(..), Status(..),
+    command, inDirectory, withEnvironment, run, runUntil,
+)
+
+-- Running another program and collecting what it says: its standard output
+-- and standard error as bytes, kept apart, and how it ended.
+--
+--     let cmd = withEnvironment(command(["boot", "check", "a.gob"]), "TURKEY_LIB", lib)
+--     match run(cmd, Some(Time.seconds(60))) {
+--         Right(Output { status = Exited(0), .. }) -> ...
+--         Right(Output { status = Signaled(sig), stderr, .. }) -> ...
+--         Right(Output { status = TimedOut, stdout, .. }) -> ...
+--         Left(e) -> ...
+--     }
+--
+-- **A run is one call.** `run` returns when the program has ended and both its
+-- streams are closed, with the program's standard input empty (`/dev/null`).
+-- Both streams are read at once, so a program that fills one while the other
+-- waits is not deadlocked, and the call waits without holding a worker. To
+-- run several programs at once, call `run` from several tasks
+-- (`System.Task`, `System.Parallel`): each waits for its own program and none
+-- for another's.
+--
+-- **How it ended.** `Exited` carries the program's exit code; `Signaled` the
+-- number of the signal that killed it, as a crash or a `kill` does, which is
+-- not an exit code and is told apart from one. A program that failed to start
+-- at all -- missing, not executable, a missing working directory -- is a
+-- `Left`, never a `Status`.
+--
+-- **The timeout** is one deadline for the whole run: the program, and the
+-- reading of both streams. When it falls first, every process in the
+-- program's process group is killed (the program starts in a group of its
+-- own, so a shell, a wrapper or a compiler driver it started goes with it),
+-- the program is reaped, and the status is `TimedOut`. What was read until
+-- then is kept in `Output`. A program that leaves a process behind that keeps
+-- its output open after the program itself has exited is the same case: the
+-- streams do not end, the deadline falls, and that process is killed. With no
+-- timeout, a stream held open that way is waited for as long as it is held.
+--
+-- The environment is the one this program started with, less any name
+-- `withEnvironment` replaces, plus the replacements. Only the process's own
+-- start is read: nothing here sees a change made since.
+
+import Time.Clock as Clock
+import Time.Deadline (Deadline)
+import Time.Deadline as Deadline
+import Time.Duration (Duration)
+import System.Task as Task
+import Turkey.Errors (IOError)
+import Turkey.Errors as Errors
+import Turkey.FD as FD
+import Turkey.IO as IO
+import Turkey.Spawn as Spawn
+import Turkey.Sys as Sys
+import Turkey.Wait as Wait
+
+-- A program to run: `argv[0]` is the program, looked up on `PATH` if it has
+-- no slash, and the rest are its arguments. `directory` is where it runs,
+-- this program's own when `None`. `environment` is `(name, value)` pairs that
+-- replace or add to the inherited environment.
+type Command = Command {
+    argv        : Array String,
+    directory   : Option String,
+    environment : Array (String, String),
+}
+
+-- How the program ended: with an exit code, killed by the signal with that
+-- number, or still running when the timeout came and killed then.
+type Status = Exited(Int) | Signaled(Int) | TimedOut
+
+instance Eq Status {
+    fun eq(a, b) = match (a, b) {
+        (Exited(x), Exited(y)) -> x == y
+        (Signaled(x), Signaled(y)) -> x == y
+        (TimedOut, TimedOut) -> True
+        _ -> False
+    }
+}
+
+instance Show Status {
+    fun show(s) = match s {
+        Exited(code) -> "Exited(" + show(code) + ")"
+        Signaled(sig) -> "Signaled(" + show(sig) + ")"
+        TimedOut -> "TimedOut"
+    }
+}
+
+-- What a run produced. After a `TimedOut`, `stdout` and `stderr` are what the
+-- program had written when the deadline fell.
+type Output = Output { stdout : Array Byte, stderr : Array Byte, status : Status }
+
+-- Run `argv` here, with the inherited environment.
+fun command(argv : Array String) -> Command =
+    Command { argv, directory = None, environment = [] }
+
+-- `cmd`, run in `directory`.
+fun inDirectory(cmd : Command, directory : String) -> Command =
+    Command { argv = cmd.argv, directory = Some(directory), environment = cmd.environment }
+
+-- `cmd`, with `name` set to `value` for the program. Later calls for the same
+-- name win.
+fun withEnvironment(cmd : Command, name : String, value : String) -> Command =
+    Command { argv = cmd.argv, directory = cmd.directory,
+              environment = Array.append(cmd.environment, [(name, value)]) }
+
+-- Run `cmd` and wait for it to end, or for `timeout` to pass if there is one.
+fun run(cmd : Command, timeout : Option Duration) -> Either IOError Output =
+    runUntil(cmd, Option.map(timeout, Deadline.after))
+
+-- `run` with a deadline made earlier, so that one limit can cover this and
+-- other steps.
+fun runUntil(cmd : Command, deadline : Option Deadline) -> Either IOError Output {
+    let limit = match deadline {
+        Some(d) -> Clock.nanos(Deadline.reading(d))
+        None -> -1
+    }
+    let name = if len(cmd.argv) == 0 { "" } else { cmd.argv[0] }
+    let started = match Spawn.start(cmd.argv, cmd.directory, laterWins(cmd.environment)) {
+        Left(e) -> return Left(Errors.failure("spawn", Some(name), e))
+        Right(s) -> s
+    }
+    let out = FD.fd(started.stdout)
+    let err = FD.fd(started.stderr)
+    let finished = Task.runScope(do {
+        let reading = Task.spawn(fun() = drain(out, limit))?
+        let readingErr = Task.spawn(fun() = drain(err, limit))?
+        let waited = Wait.childExit(started.pid, limit)
+        var timedOut = waited == Wait.timedOut
+        var failed = if waited < 0 && !timedOut { waited } else { 0 }
+        if timedOut || failed != 0 {
+            -- The group first, so the program cannot start more, then the
+            -- program itself is reaped if it has not been.
+            let _ = Spawn.killGroup(started.pid)
+            if timedOut { let _ = Wait.childExit(started.pid, -1) }
+        }
+        let (stdout, outCode) = Task.join(reading)
+        let (stderr, errCode) = Task.join(readingErr)
+        -- The program ended before the deadline but something it started
+        -- still holds a stream open: the same timeout.
+        if !timedOut && failed == 0 && (outCode == FD.timedOut || errCode == FD.timedOut) {
+            timedOut = True
+            let _ = Spawn.killGroup(started.pid)
+        }
+        if failed == 0 && !timedOut {
+            if outCode < 0 { failed = outCode } else if errCode < 0 { failed = errCode }
+        }
+        let status = if timedOut { TimedOut }
+                     else if Sys.waitSignal(waited) != 0 { Signaled(Sys.waitSignal(waited)) }
+                     else { Exited(Sys.waitExitCode(waited)) }
+        pure((failed, Output { stdout, stderr, status }))
+    })
+    let _ = FD.close(out)
+    let _ = FD.close(err)
+    let (failed, output) = finished
+    if failed != 0 { Left(Errors.failure("wait", Some(name), failed)) } else { Right(output) }
+}
+
+-- -- underneath -----------------------------------------------------------------------
+
+-- Every byte of `f` up to its end, or until `deadline` (a monotonic time in
+-- nanoseconds, or -1): the bytes, and how it stopped: 0 at the end,
+-- `FD.timedOut`, or the negated `errno` of a read that failed.
+fun drain(f : FD.FD, deadline : Int) -> (Array Byte, Int) {
+    var storage = Array.filled(4096, Byte.truncate(0))
+    var end = 0
+    var code = 0
+    while True {
+        if end == len(storage) {
+            let bigger = Array.filled(2 * len(storage), Byte.truncate(0))
+            IO.copy(bigger, 0, storage, 0, end)
+            storage = bigger
+        }
+        let n = FD.readBy(f, storage, end, len(storage), deadline)
+        if n == 0 { break }
+        if n < 0 {
+            code = n
+            break
+        }
+        end = end + n
+    }
+    (Array.slice(storage, 0, end), code)
+}
+
+-- `environment` with the pairs a later one for the same name overrides
+-- dropped, in order.
+fun laterWins(environment : Array (String, String)) -> Array (String, String) {
+    let kept = []
+    for var i = 0; i < len(environment); i = i + 1 {
+        let (name, _) = environment[i]
+        var shadowed = False
+        for var j = i + 1; j < len(environment); j = j + 1 {
+            let (later, _) = environment[j]
+            if later == name { shadowed = True }
+        }
+        if !shadowed { Vec.push(kept, environment[i]) }
+    }
+    Vec.toArray(kept)
+}

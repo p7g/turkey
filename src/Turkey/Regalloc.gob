@@ -53,9 +53,12 @@ type Pressure = Pressure { gp : Int, fp : Int }
 -- backend's scratch registers, and `x28` holds the running worker
 -- (`A.worker`). That leaves x0-x15 and x19-x27.
 let availableGp = 25
--- The vector file has 32 and this backend reserves none, because every double
--- it makes is 64 bits and nothing vectorizes yet.
-let availableFp = 32
+-- The vector file has 32, and `d31` is the scratch register that breaks a
+-- cycle of doubles in a parallel copy, as `x16` does for the general file.
+-- Breaking one through `x16` instead puts two cross-file `fmov`s on what is
+-- usually a loop's critical path, and a 32nd live double is rarer than a
+-- cycle.
+let availableFp = 31
 
 -- What survives a call, which is a much smaller set than what exists. A value
 -- live across a `bl` and held in a caller-saved register is destroyed by the
@@ -295,6 +298,10 @@ type Walk = Walk {
     evict       : Bool,
     forbidden   : Array Int,
     hints       : Array Int,
+    -- `affinities`: the block parameters each value is passed to, and the
+    -- values each block parameter is passed.
+    sinks       : Array (Vec Int),
+    sources     : Array (Vec Int),
     of_         : Array Int,
     var stopped : Option String,
     evicted     : Set.Set Int,
@@ -315,11 +322,13 @@ fun walk(f : Func A.Inst, spills : Spills, roots : Map Int Int,
     let (liveIn, liveOut) = Ssa.livenessInOut(f)
     let forbidden = forbiddenSets(f, liveOut)
     let of_ = Array.filled(len(f.reps), -1)
+    let (sinks, sources) = affinities(f)
     -- Everything `place` needs in one record, so that it takes five arguments
     -- and not ten: a call passing more than eight is one this backend cannot
     -- yet select, and the allocator should not be where `boot` gains one.
     let w = Walk { f = f, spills = spills, evict = evict, forbidden = forbidden,
-                   hints = moveHints(f), of_ = of_, stopped = None,
+                   hints = moveHints(f), sinks = sinks, sources = sources,
+                   of_ = of_, stopped = None,
                    evicted = Set.new(), crowded = Set.new(), liveOut = liveOut,
                    roots = roots,
                    cost = [] }
@@ -401,31 +410,32 @@ fun endings(f : Func A.Inst, block : Ssa.Block A.Inst, out : BitSet,
         Ssa.eachDef(block.insts[here], fun(d) {
             let id = Ssa.valueId(d)
             if !BitSet.remove(live, id) && here + 1 < count {
-                endAt(ends, here + 1, id)
+                appendTo(ends, here + 1, id)
             }
         })
         Ssa.eachUse(block.insts[here], fun(u) {
             let id = Ssa.valueId(u)
             if !BitSet.contains(live, id) {
                 BitSet.add(live, id)
-                endAt(ends, here, id)
+                appendTo(ends, here, id)
             }
         })
     }
     if count > 0 {
         for p in block.params {
             if !BitSet.contains(live, Ssa.valueId(p)) {
-                endAt(ends, 0, Ssa.valueId(p))
+                appendTo(ends, 0, Ssa.valueId(p))
             }
         }
     }
     ends
 }
 
--- The shared empty array is never pushed to: the first value an instruction
--- ends gets it an array of its own.
-fun endAt(ends : Array (Vec Int), n : Int, id : Int) -> Unit =
-    if len(ends[n]) == 0 { ends[n] = [id] } else { Vec.push(ends[n], id) }
+-- For a table whose entries start as one shared empty array: that array is
+-- never pushed to, and the first value added to an entry gets it an array of
+-- its own.
+fun appendTo(table : Array (Vec Int), n : Int, id : Int) -> Unit =
+    if len(table[n]) == 0 { table[n] = [id] } else { Vec.push(table[n], id) }
 
 -- A value that was evicted, or never placed, holds nothing to release.
 fun releaseValue(w : Walk, taken : Taken, id : Int) -> Unit {
@@ -526,7 +536,8 @@ fun place(w : Walk, taken : Taken, id : Int, block : Ssa.Block A.Inst,
     let why = "a value with no free register in the " + fileName(bank) + " file"
     var placing = True
     while placing {
-        match freeRegister(taken, w.forbidden[id], bank, w.hints[id]) {
+        match freeRegister(taken, w.forbidden[id], bank,
+                           preference(w, taken, id, bank)) {
             Some(n) -> {
                 w.of_[id] = n
                 hold(taken, keyIn(bank, n), id)
@@ -588,20 +599,96 @@ fun stopOnce(w : Walk, why : String) -> Unit = match w.stopped {
 -- destroyed), and a preference cannot.
 fun freeRegister(taken : Taken, forbidden : Int, bank : Bank,
                  hint : Int) -> Option Int {
-    -- Only a register the pool would hand out: a move from `x29`, which is
-    -- how `Prim.frameAddress` reads the frame, must not colour its
-    -- destination into the frame register itself.
-    if hint >= 0 && Array.contains(poolOf(bank), hint)
-       && !isHeld(taken, keyIn(bank, hint))
-       && !forbids(forbidden, hint) {
-        return Some(hint)
-    }
+    if usable(taken, forbidden, bank, hint) { return Some(hint) }
     for n in poolOf(bank) {
         if !isHeld(taken, keyIn(bank, n)) && !forbids(forbidden, n) {
             return Some(n)
         }
     }
     None
+}
+
+-- Whether register `n` can be handed out here. Only a register the pool would
+-- hand out: a move from `x29`, which is how `Prim.frameAddress` reads the
+-- frame, must not colour its destination into the frame register itself.
+fun usable(taken : Taken, forbidden : Int, bank : Bank, n : Int) -> Bool =
+    n >= 0 && Array.contains(poolOf(bank), n)
+    && !isHeld(taken, keyIn(bank, n)) && !forbids(forbidden, n)
+
+-- The register `id` would best take, or `-1` for none in particular: the first
+-- of these it may have here, each of which makes one copy redundant.
+--
+-- 1. Its move hint, to or from a fixed register.
+-- 2. The register of a block parameter it is passed to. A loop header's
+--    parameters are coloured before anything in the loop, so a value a latch
+--    passes back finds the header's register already chosen, and taking it
+--    empties that slot of the back edge's parallel copy. A parameter not yet
+--    coloured is searched through, to the parameters it is passed to in turn:
+--    a block that several latches jump to, like the one holding a loop's
+--    poll, passes its parameters straight on to the header's, and without the
+--    search each latch would copy into that block's registers and the block
+--    copy them again into the header's.
+-- 3. For a block parameter, the register of a value passed to it. That serves
+--    a forward merge, whose arguments are all coloured before it.
+--
+-- Sinks come before sources because a sink already coloured is almost always
+-- a loop header, and a copy on a back edge runs every iteration.
+--
+-- This is a preference and never a constraint, and the walk colours in
+-- dominance order, where any free register keeps the rest colourable, so no
+-- choice made here can make the colouring fail.
+fun preference(w : Walk, taken : Taken, id : Int, bank : Bank) -> Int {
+    let forbidden = w.forbidden[id]
+    let hint = w.hints[id]
+    if usable(taken, forbidden, bank, hint) { return hint }
+    let seen = [id]
+    for var n = 0; n < len(seen) && n < sinkSearch; n = n + 1 {
+        for s in w.sinks[seen[n]] {
+            let r = w.of_[s]
+            if r >= 0 {
+                if usable(taken, forbidden, bank, r) { return r }
+            } else if !Vec.contains(seen, s) {
+                Vec.push(seen, s)
+            }
+        }
+    }
+    for s in w.sources[id] {
+        let r = w.of_[s]
+        if usable(taken, forbidden, bank, r) { return r }
+    }
+    -1
+}
+
+-- How many values `preference` searches through for a coloured sink. A chain
+-- of parameters that only pass a value along is short -- a latch's value,
+-- the poll block's parameter, the header's -- and the bound keeps a value
+-- passed to many jumps from costing a walk of the whole loop.
+let sinkSearch = 8
+
+-- For each value, the block parameters a `Jump` passes it to (its sinks), and
+-- for each block parameter the values passed to it (its sources). A value
+-- passed to its own parameter, as a loop passes an unchanged variable back,
+-- is neither: that slot of the copy is empty whatever is chosen.
+fun affinities(f : Func A.Inst) -> (Array (Vec Int), Array (Vec Int)) {
+    let sinks : Array (Vec Int) = Array.filled(len(f.reps), [])
+    let sources : Array (Vec Int) = Array.filled(len(f.reps), [])
+    for block in f.blocks {
+        match block.term {
+            Jump(target, args) -> {
+                let params = f.blocks[Ssa.blockId(target)].params
+                for var i = 0; i < len(params) && i < len(args); i = i + 1 {
+                    let a = Ssa.valueId(args[i])
+                    let p = Ssa.valueId(params[i])
+                    if a != p {
+                        appendTo(sinks, a, p)
+                        appendTo(sources, p, a)
+                    }
+                }
+            }
+            _ -> {}
+        }
+    }
+    (sinks, sources)
 }
 
 fun anyUnheld(taken : Taken, bank : Bank) -> Bool {
@@ -769,7 +856,7 @@ let gpPool = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
 -- go first here too -- from both ends, since `v0`-`v7` and `v16`-`v31` are the
 -- caller-saved halves.
 let fpPool = [0, 1, 2, 3, 4, 5, 6, 7, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-              26, 27, 28, 29, 30, 31, 8, 9, 10, 11, 12, 13, 14, 15]
+              26, 27, 28, 29, 30, 8, 9, 10, 11, 12, 13, 14, 15]
 
 -- For each value, the register numbers it may not take, as a mask: bit `n`
 -- for register `n`. Every register number in either file is below 32, so one

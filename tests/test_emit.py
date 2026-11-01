@@ -356,3 +356,63 @@ def test_an_element_access_scales_its_index_itself(function, load, store):
 
 def test_element_accesses_read_and_write_the_element():
     assert lang.output(ELEMENT_ACCESSES) == "3 2.5 b 9\n"
+
+
+MOVE = re.compile(r"f?mov [xd]\d+, [xd]\d+$")
+GP_FROM_FP = re.compile(r"fmov x\d+, d\d+$")
+
+
+def _moves_before(body: list[str], n: int) -> int:
+    count = 0
+    while n > 0 and MOVE.match(body[n - 1]):
+        count += 1
+        n -= 1
+    return count
+
+
+def _loop_edge_moves(body: list[str]) -> dict[str, int]:
+    """The moves on each edge between blocks of a loop, keyed by where they are.
+
+    A loop runs from a header -- the target of a `b` to a label laid out
+    earlier -- to that `b`. The copies into a block's parameters are the moves
+    just before a jump to it, or before its label when the block before it
+    falls through. Counting every edge inside the loop takes in the latches
+    that jump to the block holding the poll, which passes their values on to
+    the header: a copy into that block's parameters runs every iteration just
+    as a copy into the header's does.
+    """
+    labels = {line[:-1]: n for n, line in enumerate(body) if line.endswith(":")}
+    out: dict[str, int] = {}
+    for end, line in enumerate(body):
+        if not line.startswith("b L"):
+            continue
+        start = labels.get(line.split()[1], end)
+        if start >= end:
+            continue
+        for n in range(start, end + 1):
+            if body[n].startswith("b L") or (n > start and body[n].endswith(":")):
+                out[f"{n}: {body[n]}"] = _moves_before(body, n)
+    return out
+
+
+def test_a_loop_carried_value_keeps_its_register_round_the_loop():
+    """A loop that updates its variables needs no copies at its back edge:
+    each new value is computed into the register the header keeps it in.
+
+    `Main#escape` carries four doubles round the Mandelbrot iteration, with a
+    poll on the back edge, and no double goes through a general register.
+    `Main#interpret` carries six integers, some across a call, and its arms
+    each jump to the block holding the poll, which passes them on to the
+    header; neither the arms nor that block copy them. `Main#rotate` passes
+    three doubles round in a cycle, which needs a spare register to break, and
+    that register is a vector one.
+    """
+    functions = _functions(_native("loop_carried.gob"))
+    escape = functions["Main#escape"]
+    for name in ("Main#escape", "Main#rotate"):
+        body = functions[name]
+        assert not [line for line in body if GP_FROM_FP.match(line)], (name, body)
+    for body in (escape, functions["Main#interpret"]):
+        edges = _loop_edge_moves(body)
+        assert edges, "no loop found"
+        assert all(count <= 1 for count in edges.values()), edges

@@ -12,21 +12,11 @@ module System.Sync (
 -- suspended, and its worker runs other tasks meanwhile. Nothing here blocks a
 -- worker's thread.
 --
--- Each keeps its state word in the first field of its record and changes it
--- only with the atomic primitives, at the field's address: the object's
--- fields start `fieldsAt` bytes in, an `Int` declared first is the first of
--- them (`Turkey.Runtime.layout`), and the collector never moves an object.
--- So every function here holds the record itself, not only that address,
--- while it works on it. The field is declared `var` though nothing assigns it:
--- it does change after the record is built, and a field that is not `var` is
--- one the compiler may take to be what it was built with.
+-- Each keeps its state word in a `Prim.Atomic`, a cell of its own whose every
+-- access is atomic.
 
 import Turkey.Coroutine as Co
 import Turkey.Scheduler as Scheduler
-
-let fieldsAt = 24
-
-fun word(object : a) -> Prim.Ptr = Prim.objectAddress(object)
 
 -- -- mutex -----------------------------------------------------------------------------
 
@@ -42,12 +32,12 @@ fun word(object : a) -> Prim.Ptr = Prim.objectAddress(object)
 -- waiters are woken, not handed the mutex, so one that is never quick enough
 -- can wait for as long as others keep taking it.
 type Mutex a = Mutex {
-    var state   : Int,
+    state       : Prim.Atomic,
     var waiters : Vec Co.Coroutine,
     var value   : a,
 }
 
-fun mutex(value : a) -> Mutex a = Mutex { state = 0, waiters = [], value = value }
+fun mutex(value : a) -> Mutex a = Mutex { state = Prim.atomicNew(0), waiters = [], value = value }
 
 -- `f` of the value, with the mutex held.
 fun withLock(m : Mutex a, f : fun(a) -> b) -> b {
@@ -65,19 +55,19 @@ fun update(m : Mutex a, f : fun(a) -> a) -> Unit {
 }
 
 fun lock(m : Mutex a) -> Unit {
-    if Prim.atomicCas(word(m), fieldsAt, 0, 1) == 0 { return {} }
+    if Prim.atomicSwapIf(m.state, 0, 1) == 0 { return {} }
     Scheduler.waitUntil(fun() = claim(m), fun(c) = Vec.push(m.waiters, c))
 }
 
 -- Under the scheduler's lock: take `m` if it is free, or mark it waited for.
 fun claim(m : Mutex a) -> Bool {
-    let p = word(m)
+    let p = m.state
     while True {
-        let state = Prim.atomicLoad(p, fieldsAt)
+        let state = Prim.atomicGet(p)
         if state == 0 {
-            if Prim.atomicCas(p, fieldsAt, 0, 2) == 0 { return True }
+            if Prim.atomicSwapIf(p, 0, 2) == 0 { return True }
         } else if state == 1 {
-            if Prim.atomicCas(p, fieldsAt, 1, 2) == 1 { return False }
+            if Prim.atomicSwapIf(p, 1, 2) == 1 { return False }
         } else {
             return False
         }
@@ -86,7 +76,7 @@ fun claim(m : Mutex a) -> Bool {
 }
 
 fun unlock(m : Mutex a) -> Unit {
-    if swap(word(m), 0) != 2 { return {} }
+    if swap(m.state, 0) != 2 { return {} }
     Scheduler.lock()
     for c in m.waiters { Scheduler.wake(c) }
     m.waiters = []
@@ -94,10 +84,10 @@ fun unlock(m : Mutex a) -> Unit {
     Scheduler.unlock()
 }
 
-fun swap(p : Prim.Ptr, value : Int) -> Int {
+fun swap(p : Prim.Atomic, value : Int) -> Int {
     while True {
-        let old = Prim.atomicLoad(p, fieldsAt)
-        if Prim.atomicCas(p, fieldsAt, old, value) == old { return old }
+        let old = Prim.atomicGet(p)
+        if Prim.atomicSwapIf(p, old, value) == old { return old }
     }
     0
 }
@@ -107,23 +97,21 @@ fun swap(p : Prim.Ptr, value : Int) -> Int {
 -- An `Int` that tasks read and change without a mutex. Each operation is one
 -- atomic instruction, ordered with the reads and writes around it.
 --
--- Its one field being `var` is also what gives it an address at all: a record
--- of one immutable field is that field at run time.
-type AtomicInt = AtomicInt { var cell : Int }
+type AtomicInt = AtomicInt(Prim.Atomic)
 
-fun atomicInt(initial : Int) -> AtomicInt = AtomicInt { cell = initial }
+fun atomicInt(initial : Int) -> AtomicInt = AtomicInt(Prim.atomicNew(initial))
 
-fun load(a : AtomicInt) -> Int = Prim.atomicLoad(word(a), fieldsAt)
+fun load(AtomicInt(cell)) -> Int = Prim.atomicGet(cell)
 
-fun store(a : AtomicInt, value : Int) -> Unit = Prim.atomicStore(word(a), fieldsAt, value)
+fun store(AtomicInt(cell), value : Int) -> Unit = Prim.atomicSet(cell, value)
 
 -- Add `n`, answering the sum. It wraps on overflow, as the instruction does.
-fun addAndGet(a : AtomicInt, n : Int) -> Int =
-    Prim.intAddWrapping(Prim.atomicAdd(word(a), fieldsAt, n), n)
+fun addAndGet(AtomicInt(cell), n : Int) -> Int =
+    Prim.intAddWrapping(Prim.atomicAddTo(cell, n), n)
 
 -- Store `new` if the value is `expected`, answering whether it was.
-fun compareAndSet(a : AtomicInt, expected : Int, new : Int) -> Bool =
-    Prim.atomicCas(word(a), fieldsAt, expected, new) == expected
+fun compareAndSet(AtomicInt(cell), expected : Int, new : Int) -> Bool =
+    Prim.atomicSwapIf(cell, expected, new) == expected
 
 -- -- computed once ---------------------------------------------------------------------
 
@@ -134,29 +122,29 @@ fun compareAndSet(a : AtomicInt, expected : Int, new : Int) -> Bool =
 -- A computation that asks for its own value waits for itself, which is a
 -- deadlock.
 type Once a = Once {
-    var state   : Int,
+    state       : Prim.Atomic,
     compute     : fun() -> a,
     var made    : Option a,
     var waiters : Vec Co.Coroutine,
 }
 
 fun once(compute : fun() -> a) -> Once a =
-    Once { state = 0, compute = compute, made = None, waiters = [] }
+    Once { state = Prim.atomicNew(0), compute = compute, made = None, waiters = [] }
 
 fun force(o : Once a) -> a {
-    let p = word(o)
-    if Prim.atomicLoad(p, fieldsAt) != 2 {
-        if Prim.atomicCas(p, fieldsAt, 0, 1) == 0 {
+    let p = o.state
+    if Prim.atomicGet(p) != 2 {
+        if Prim.atomicSwapIf(p, 0, 1) == 0 {
             let value = o.compute()
             Scheduler.lock()
             o.made = Some(value)
-            Prim.atomicStore(p, fieldsAt, 2)
+            Prim.atomicSet(p, 2)
             for c in o.waiters { Scheduler.wake(c) }
             o.waiters = []
             Scheduler.changed()
             Scheduler.unlock()
         } else {
-            Scheduler.waitUntil(fun() = Prim.atomicLoad(p, fieldsAt) == 2,
+            Scheduler.waitUntil(fun() = Prim.atomicGet(p) == 2,
                                 fun(c) = Vec.push(o.waiters, c))
         }
     }

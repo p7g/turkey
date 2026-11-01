@@ -18,9 +18,8 @@ import pytest
 from tests import bootc
 from tests.lang import LIB, output, program
 
-# The bytes are a library array whose storage `strlen` reads by address.
-# `Prim.objectAddress` gives the header's address; the elements start 24 bytes
-# in.
+# The bytes are a library array whose storage `strlen` reads by address,
+# `Prim.elementAddress` of its first element.
 PROBE = """\
 module {name} (lengthOf)
 
@@ -30,7 +29,7 @@ fun lengthOf(n : Int) -> Int {{
     let bytes : Prim.Array Byte = Prim.arrayNew(n + 1, Prim.byteFromInt(65))
     Prim.arraySet(bytes, n, Prim.byteFromInt(0))
     {early}
-    let k = Libc.strlen(Prim.ptrAdd(Prim.objectAddress(bytes), 24))
+    let k = Libc.strlen(Prim.elementAddress(bytes, 0))
     {keep}
     k
 }}

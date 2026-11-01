@@ -12,6 +12,10 @@ is `Main.gob` and whose golden is `Main.expected` beside it. It is
 compiled from inside that directory, so its imports resolve against it and its
 diagnostics quote bare file names the same way.
 
+How a program must end is recorded in it, by an outcome directive: a line
+`--@ exit: N`, `--@ panic` or `--@ error` (it must not compile). Without one
+it must run and exit 0. `tests/harness/` reads the same lines.
+
 These files are the language's recorded behavior, and nothing else checks
 them: there is no second compiler that has to agree. So a regenerated golden is
 a claim about what the language does. Regenerate with
@@ -62,6 +66,21 @@ def conformance(program: Path) -> tuple[str, int]:
     return result.stdout + result.stderr, result.code
 
 
+def outcome(program: Path) -> tuple[str, int]:
+    """What the program's outcome directive says: ("exit", N), ("panic", 0)
+    or ("error", 0)."""
+    for line in program.read_text().splitlines():
+        if not line.startswith("--@"):
+            continue
+        name, _, value = line[3:].partition(":")
+        name = name.strip()
+        if name == "exit":
+            return "exit", int(value)
+        if name in ("panic", "error"):
+            return name, 0
+    return "exit", 0
+
+
 def _without_trace(text: str) -> str:
     return "".join(line for line in text.splitlines(keepends=True)
                    if not line.startswith("  at "))
@@ -86,10 +105,14 @@ def test_program_conformance(program: Path) -> None:
 
     assert actual == expected, _diff_message(expected, actual, code)
 
-    if _id(program).startswith("err_"):
-        assert code != 0, f"{program.name} is an err_ program but exited 0"
+    kind, status = outcome(program)
+    if kind == "exit":
+        assert code == status, f"{program.name} exited {code}, expected {status}"
+    elif kind == "panic":
+        assert code != 0 and "panic: " in actual, (
+            f"{program.name} exited {code} without the panic --@ panic expects")
     else:
-        assert code == 0, f"{program.name} exited {code}, expected 0"
+        assert code != 0, f"{program.name} compiled, but --@ error expects it not to"
 
 
 @pytest.mark.xfail(strict=True, reason="no panic trace from boot's binaries yet")

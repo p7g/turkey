@@ -14,7 +14,7 @@ from __future__ import annotations
 import pathlib
 
 from tests import lang
-from tests.test_programs import NO_TRACE_YET, PROGRAMS_DIR, conformance
+from tests.test_programs import NO_TRACE_YET, PROGRAMS_DIR, conformance, outcome
 
 PROGRAMS = PROGRAMS_DIR
 
@@ -40,10 +40,11 @@ def main() -> int:
             print(f"{name_of(source)}: kept, since boot prints no trace yet")
             continue
         golden.write_text(output, encoding="utf-8")
-        expected_failure = name_of(source).startswith("err_")
-        if expected_failure != (code != 0):
-            word = "fail" if expected_failure else "succeed"
-            print(f"warning: {name_of(source)} was expected to {word}, exit {code}")
+        kind, status = outcome(source)
+        ended_as_said = code == status if kind == "exit" else code != 0
+        if not ended_as_said:
+            said = f"exit {status}" if kind == "exit" else kind
+            print(f"warning: {name_of(source)} says --@ {said}, but exited {code}")
         print(f"{name_of(source)}: exit {code}, {len(output.splitlines())} line(s)")
 
     # Only programs that already have a `.types`, `.core`, `.mono` or `.opt`

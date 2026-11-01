@@ -192,9 +192,9 @@ def test_a_program_may_define_a_name_a_class_method_already_has():
 
 
 def test_an_operator_still_means_its_method_next_to_a_local_of_that_name(capsys):
-    """`+` desugars to `add` at parse time, so a module that defines its own
-    `add` would capture every `+` if that node were resolved by name. It is
-    marked as a method instead -- see `Turkey.Resolve`."""
+    """`+` means `add`, so a module that defines its own `add` would capture
+    every `+` if that reference were resolved by name. It is marked as a method
+    instead -- see `Turkey.Resolve`."""
     src = '''
 fun add(x, y) = x + y
 fun main() {
@@ -218,3 +218,95 @@ def test_the_float_operators_are_gone():
 def test_the_named_comparisons_are_gone():
     for name in ("String.eq", "String.lt", "Bool.eq", "Float.lt", "Char.eq"):
         assert f"'{name}' is not defined" in fails(f"fun f() = {name}")
+
+
+# -- declared operators -------------------------------------------------------
+
+
+def test_a_declared_operator_is_a_call_of_its_target():
+    src = "infix Combine (<+>) = pair\nfun pair(a, b) = (a, b)\nfun f(x : Int) = x <+> 'c'"
+    assert scheme(src, "f") == "fun(Int) -> (Int, Char)"
+
+
+def test_a_declared_operator_may_be_used_before_its_declaration(capsys):
+    src = """
+fun main() { print(1 <+> 2) }
+infix Combine (<+>) = plus
+fun plus(a : Int, b : Int) = a + b
+"""
+    assert output(src, capsys) == ["3"]
+
+
+def test_a_class_method_target_keeps_its_class():
+    src = "infix Combine (<>) = combine\nfun twice(x) = x <> x"
+    assert scheme(src, "twice") == "[Semigroup a] fun(a) -> a"
+
+
+def test_an_operator_type_error_points_at_the_operator():
+    src = "infix Combine (<+>) = plus\nfun plus(a : Int, b : Int) = a + b\nfun f() = 1 <+> \"x\""
+    with pytest.raises(CompileError) as exc:
+        check(src)
+    assert ":3:13:" in exc.value.rendered
+
+
+def test_an_unknown_group_is_refused():
+    assert fails("infix Concatenation (<+>) = combine").startswith(
+        "unknown precedence group 'Concatenation'; the groups are Multiplication,")
+
+
+def test_a_built_in_operator_cannot_be_redeclared():
+    assert fails("infix Addition (+) = combine") == \
+        "'+' is a built-in operator and cannot be redeclared"
+    assert fails("infix Conjunction (&&) = combine") == \
+        "'&&' is a built-in operator and cannot be redeclared"
+
+
+@pytest.mark.parametrize("op", ["=", "->", "~"])
+def test_punctuation_cannot_be_declared(op):
+    assert fails(f"infix Sequence ({op}) = combine") == \
+        f"'{op}' is punctuation and cannot be declared as an operator"
+
+
+def test_the_target_must_take_two_parameters():
+    assert fails("infix Sequence (|>) = f\nfun f(x) = x") == \
+        "the operator '|>' needs a function of two parameters, and 'f' takes 1"
+
+
+def test_the_target_must_be_a_function():
+    assert fails("infix Sequence (|>) = f\nlet f = fun(a, b) = a") == \
+        "the operator '|>' needs a top-level function or class method, and 'f' is neither"
+
+
+def test_the_target_must_exist():
+    assert fails("infix Sequence (|>) = nowhere") == "'nowhere' is not defined"
+
+
+def test_an_operator_is_declared_once():
+    src = "infix Sequence (|>) = combine\ninfix Choice (|>) = combine"
+    assert fails(src) == "the operator '|>' is declared twice"
+
+
+def test_unrelated_groups_need_parentheses():
+    src = "infix BitOr (|) = combine\ninfix BitXor (^) = combine\nfun f(a, b, c) = a | b ^ c"
+    assert fails(src) == ("'|' (BitOr) and '^' (BitXor) have no precedence between "
+                          "them; add parentheses to say which applies first")
+
+
+def test_a_run_of_operator_characters_is_one_token():
+    assert fails("fun f(x : Int) = x*-1") == (
+        "the operator '*-' is not declared; if '*-' is more than one operator, "
+        "separate them: '* -'")
+
+
+def test_a_run_where_a_token_was_expected_suggests_the_split():
+    assert fails("fun f() { let x =-1\n x }").endswith(
+        "; if '=-' is more than one operator, separate them: '= -'")
+
+
+def test_a_run_may_split_into_declared_operators():
+    src = "infix Combine (<>) = combine\nfun f(a : String) = a<>-1"
+    assert fails(src).endswith("separate them: '<> -'")
+
+
+def test_infix_is_still_an_ordinary_name(capsys):
+    assert output("fun main() {\n let infix = 3\n print(infix)\n}", capsys) == ["3"]

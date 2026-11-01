@@ -14,6 +14,7 @@ module Turkey.Ast (
     FamBind(..),
     ClassDecl(..),
     InstanceDecl(..),
+    InfixDecl(..),
     ExportItem(..),
     ModuleHeader(..),
     ImportDecl(..),
@@ -47,6 +48,7 @@ import Turkey.Types (ConCell)
 -- Declarations are ordinary records: nothing rewrites one in place, and nothing
 -- keys a table by one.
 
+import Turkey.Fixity (Group)
 import Turkey.Source (Span)
 import Turkey.Token (quote)
 
@@ -155,17 +157,21 @@ type PatKind
 
 type Expr = Expr {
     id       : Int,
-    span     : Span,
+    -- Assigned only where an operator chain is resolved: a chain is spanned by
+    -- its first operand until then, and a declared operator's node by the
+    -- operator itself.
+    var span : Span,
     var kind : ExprKind,
 }
 
 type ExprKind
     = ELit(Lit)
     | EUnit
-    -- The `Bool` is set when the parser wrote this node itself to mean a
-    -- *class method* -- the `add` a `+` desugars to. Resolution leaves such a
-    -- node alone, so a module defining its own `add` shadows the Prelude's for
-    -- ordinary calls without quietly capturing every `+` in the file.
+    -- The `Bool` is set when the compiler wrote this node itself to mean a
+    -- *class method* -- the `add` a `+` means. Resolution looks such a node up
+    -- among class methods only, so a module defining its own `add` shadows the
+    -- Prelude's for ordinary calls without quietly capturing every `+` in the
+    -- file.
     | EVar(String, Bool)
     | ECon(String)
     | ETuple(Vec Expr)
@@ -183,6 +189,12 @@ type ExprKind
     -- as a marked reference. `!` is not a method and leaves it `None`.
     | EUnary(String, Expr, Option Expr)
     | EBinary(String, Expr, Expr, Option Expr)
+    -- Operands and the binary operators between them, as the parser reads
+    -- them: one more operand than operator. Grouping needs every operator's
+    -- precedence group, which an `infix` declaration anywhere in the module
+    -- may supply, so `Turkey.Resolve` rewrites the chain into `EBinary` nodes
+    -- and no stage after it sees one.
+    | EChain(Vec Expr, Vec (String, Span))
     | EAnnot(Expr, Type)
     | EIf(Expr, Expr, Option Expr)
     | EWhile(Expr, Expr)
@@ -355,6 +367,17 @@ type InstanceDecl = InstanceDecl {
     families : Vec FamBind,
 }
 
+-- `infix Combine (<>) = combine`: the operator `<>` is in the group
+-- `Combine`, and `a <> b` is the call `combine(a, b)`. `target` is resolved
+-- in place like any reference.
+type InfixDecl = InfixDecl {
+    span       : Span,
+    group      : Group,
+    op         : String,
+    var target : String,
+    targetSpan : Span,
+}
+
 -- One entry of an export list, or of an import's `(...)` / `hiding (...)`.
 -- `kind` is "name" for `f`, `T(A, B)` and `T(..)`, and "module" for the
 -- re-export form, which names no entity of its own.
@@ -390,6 +413,7 @@ type Decl
     | DClass(ClassDecl)
     | DInstance(InstanceDecl)
     | DForeign(ForeignDecl)
+    | DInfix(InfixDecl)
 
 type Program = Program {
     span    : Span,
@@ -424,7 +448,7 @@ fun collectPatternVars(p : Pat, out : Vec String) -> Unit = match p.kind {
 
 -- Every `Expr`, `Stmt`, `Arm` or `FunDecl` directly under a node.
 --
--- The method references the parser writes -- `EBinary`'s `add`, `EForIn`'s
+-- The method references the compiler writes -- `EBinary`'s `add`, `EForIn`'s
 -- `iter`, `EQuestion`'s `bind` -- are deliberately not children. Each is a bare
 -- `EVar`, so no scanner's answer can depend on whether it is walked, and
 -- leaving them out keeps this list to the syntax.
@@ -460,6 +484,7 @@ fun exprChildren(e : Expr) -> Vec Child = match e.kind {
     EProject(obj, _) -> [ChExpr(obj)]
     EUnary(_, operand, _) -> [ChExpr(operand)]
     EBinary(_, left, right, _) -> [ChExpr(left), ChExpr(right)]
+    EChain(operands, _) -> Vec.map(operands, ChExpr)
     EAnnot(inner, _) -> [ChExpr(inner)]
     EIf(cond, then, otherwise) ->
         Vec.append([ChExpr(cond), ChExpr(then)], optExpr(otherwise))
@@ -583,6 +608,15 @@ fun sketchLevel(e : Expr) -> (String, Int) = match e.kind {
     EBinary(op, left, right, _) -> {
         let level = opLevel(op)
         (sketchAt(left, level) + " " + op + " " + sketchAt(right, level + 1), level)
+    }
+    EChain(operands, ops) -> {
+        let b = String.builder()
+        String.push(b, sketchAt(operands[0], 6))
+        for var i = 0; i < len(ops); i = i + 1 {
+            let (op, _) = ops[i]
+            String.push(b, " " + op + " " + sketchAt(operands[i + 1], 6))
+        }
+        (String.build(b), 0)
     }
     EAnnot(inner, _) -> sketchLevel(inner)
     _ -> ("...", 8)

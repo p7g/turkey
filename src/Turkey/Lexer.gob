@@ -1,4 +1,4 @@
-module Turkey.Lexer (tokenize, tokenizeRaw, applyNewlineRule)
+module Turkey.Lexer (tokenize, tokenizeRaw, applyNewlineRule, isOperatorChar)
 
 -- The tokenizer, in two passes.
 --
@@ -33,15 +33,13 @@ let keywords = [
     "import", "export", "as", "hiding", "do", "foreign",
 ]
 
--- Longest match first: `<=` must beat `<`, `->` must beat `-`, and `...`, a
--- foreign declaration's variadic marker, must beat `..`. `?` is a postfix
--- operator and no longer operator begins with one, so it sits with the
--- singles.
-let operators = [
-    "...",
-    "==", "!=", "<=", ">=", "->", "&&", "||", "..",
-    "=", "<", ">", "+", "-", "*", "/", "%", "!", ":", ",", ".", "|", "~", "?",
-    "\\",
+-- The punctuation that is not an operator run (see `lexOperator`). Longest
+-- match first: `...`, a foreign declaration's variadic marker, must beat `..`.
+-- `?` is a postfix operator and no longer token begins with one, so it sits
+-- with the singles.
+let punctuation = [
+    "...", "..",
+    ":", ",", ".", "?", "\\",
     "{", "}", "(", ")", "[", "]",
 ]
 
@@ -543,14 +541,44 @@ fun lexWord(lx : Lexer, start : Span) -> Token {
     }
 }
 
+-- The characters an operator is spelled with. `?`, `.`, `:` and `\` are
+-- absent because each already means something on its own -- the postfix `?`,
+-- projection and ranges, annotation, and `\` functions -- that a longer run
+-- would swallow.
+fun isOperatorChar(c : Char) -> Bool = match c {
+    '!' | '#' | '$' | '%' | '&' | '*' | '+' | '-' | '/' | '<' | '=' | '>'
+        | '@' | '^' | '|' | '~' -> True
+    _ -> False
+}
+
 fun startsUpper(text : String) -> Bool =
     match String.decode(text, String.start(text)) {
         None -> False
         Some(c) -> Char.isAsciiUpper(c)
     }
 
+-- An operator is a maximal run of operator characters, so `<=`, `>>=` and
+-- `==-` are one token each, whether or not the run is an operator anything
+-- declares: whether it is, and what it means, is settled after imports are
+-- known, and `==-` is reported there with the split it probably meant. A run
+-- stops before `--`, which begins a comment, so `x +-- note` is `x +`.
 fun lexOperator(lx : Lexer, start : Span, c : Char) -> Token {
-    for op in operators {
+    if isOperatorChar(c) {
+        let from = lx.at
+        loop {
+            match peek(lx) {
+                None -> { break }
+                Some(next) -> {
+                    if !isOperatorChar(next) { break }
+                    if next == '-' && charIs(peekAt(lx, 1), '-') { break }
+                    bump(lx)
+                }
+            }
+        }
+        let op = String.slice(lx.src, from, lx.at)
+        return plain(KOp(op), VText(op), start)
+    }
+    for op in punctuation {
         if matchesAt(lx.src, lx.at, op) {
             bumpBy(lx, String.codePointCount(op))
             return plain(KOp(op), VText(op), start)

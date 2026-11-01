@@ -20,6 +20,7 @@ module Turkey.Parser (parse, collectTycons)
 
 import Turkey.Ast
 import Turkey.Diag as Diag
+import Turkey.Fixity as Fixity
 import Turkey.Lexer as Lexer
 import Turkey.Runtime as Rt
 import Turkey.Source (Source(..), Span)
@@ -126,9 +127,27 @@ fun skipWhat(p : P, name : String, what : String) -> Unit {
 
 fun expectWhat(p : P, name : String, what : String) -> Token {
     if !at(p, name) {
-        oops(p, "expected " + what + ", found " + describe(cur(p)), cur(p).span)
+        oops(p, "expected " + what + ", found " + describe(cur(p))
+                + splitHint(cur(p)), cur(p).span)
     }
     advance(p)
+}
+
+-- What to say about an operator run that is probably two operators written
+-- without a space between them, `=-` in `x =-1` say. Nothing when it is not.
+fun splitHint(tok : Token) -> String {
+    if !isOperatorRun(tok) || Fixity.isBuiltin(text(tok)) { return "" }
+    Fixity.splitAdvice(text(tok), Fixity.isBuiltin)
+}
+
+-- A token spelled with operator characters. The lexer makes every such run
+-- one token, so its first character decides.
+fun isOperatorRun(tok : Token) -> Bool = match tok.kind {
+    KOp(op) -> match String.decode(op, String.start(op)) {
+        Some(c) -> Lexer.isOperatorChar(c)
+        None -> False
+    }
+    _ -> False
 }
 
 fun oops(p : P, message : String, where : Span) -> a =
@@ -183,8 +202,8 @@ fun mkExpr(p : P, s : Span, k : ExprKind) -> Expr =
 fun mkStmt(p : P, s : Span, k : StmtKind) -> Stmt =
     Stmt { id = freshId(p), span = s, kind = k }
 
--- A marked method reference: the `add` a `+` means. Marked, so that a module
--- defining its own `add` does not quietly capture every `+` in the file.
+-- A marked method reference: the `neg` a `-` means. Marked, so that a module
+-- defining its own `neg` does not quietly capture every `-` in the file.
 fun method(p : P, s : Span, name : String) -> Expr =
     mkExpr(p, s, EVar(name, True))
 
@@ -200,33 +219,6 @@ let exprStart = [
 ]
 
 let patternStart = ["INT", "FLOAT", "STRING", "CHAR", "IDENT", "CONID", "("]
-
--- Loosest first.
-let precedence = [
-    ["||"],
-    ["&&"],
-    ["==", "!="],
-    ["<", "<=", ">", ">="],
-    ["+", "-"],
-    ["*", "/", "%"],
-]
-
--- `&&`, `||` and `!` are absent deliberately: the first two short-circuit,
--- which no function call does, and `!` is defined in terms of them.
-fun binaryMethod(op : String) -> Option String = match op {
-    "+" -> Some("add")
-    "-" -> Some("sub")
-    "*" -> Some("mul")
-    "/" -> Some("div")
-    "%" -> Some("rem")
-    "==" -> Some("eq")
-    "!=" -> Some("ne")
-    "<" -> Some("lt")
-    "<=" -> Some("lte")
-    ">" -> Some("gt")
-    ">=" -> Some("gte")
-    _ -> None
-}
 
 -- -- program ------------------------------------------------------------------------
 
@@ -254,6 +246,8 @@ fun parseProgram(p : P) -> Program {
             Vec.push(decls, DStmt(mkStmt(p, s2, SFun(parseFunDecl(p, False)))))
         } else if at(p, "let") || at(p, "var") {
             Vec.push(decls, DStmt(parseBindingStmt(p)))
+        } else if atInfix(p) {
+            Vec.push(decls, DInfix(parseInfixDecl(p)))
         } else {
             oops(p, "expected a top-level declaration, found "
                     + describe(cur(p)), cur(p).span)
@@ -359,6 +353,51 @@ fun parseParenNameList(p : P) -> Vec ExportItem {
     }
     skipToken(p, ")")
     names
+}
+
+-- -- operator declarations -----------------------------------------------------------
+
+-- `infix` is a keyword only here, at the start of a top-level declaration and
+-- before a group name, so it stays free for a program's own names.
+fun atInfix(p : P) -> Bool =
+    at(p, "IDENT") && text(cur(p)) == "infix" && Token.kindName(peek(p, 1).kind) == "CONID"
+
+fun parseInfixDecl(p : P) -> InfixDecl {
+    step(p)
+    let groupTok = expectWhat(p, "CONID", "a precedence group")
+    let group = match Fixity.groupNamed(text(groupTok)) {
+        Some(g) -> g
+        None -> oops(p, "unknown precedence group '" + text(groupTok)
+                        + "'; the groups are " + Fixity.groupList, groupTok.span)
+    }
+    skipWhat(p, "(", "'(' before the operator")
+    let opTok = cur(p)
+    if !isOperatorRun(opTok) {
+        oops(p, "expected an operator, found " + describe(opTok), opTok.span)
+    }
+    step(p)
+    match Fixity.declarable(text(opTok)) {
+        Some(why) -> oops(p, why, opTok.span)
+        None -> {}
+    }
+    skipWhat(p, ")", "')' after the operator")
+    skipToken(p, "=")
+    let targetTok = cur(p)
+    var target = ""
+    if at(p, "IDENT") {
+        target = text(advance(p))
+    } else if at(p, "CONID") {
+        let qualifier = dottedFrom(p, advance(p))
+        skipWhat(p, ".", "a function name")
+        target = qualifier + "." + text(expectWhat(p, "IDENT", "a function name"))
+    } else {
+        oops(p, "expected the function the operator means, found "
+                + describe(targetTok), targetTok.span)
+    }
+    InfixDecl {
+        span = opTok.span, group = group, op = text(opTok), target = target,
+        targetSpan = targetTok.span,
+    }
 }
 
 -- -- type declarations ---------------------------------------------------------------
@@ -1198,7 +1237,7 @@ fun parseConPattern(p : P) -> Pat {
 -- -- expressions ---------------------------------------------------------------------
 
 fun parseExpr(p : P) -> Expr {
-    let e = parseBinary(p, 0)
+    let e = parseChain(p)
     if at(p, ":") {
         step(p)
         return mkExpr(p, e.span, EAnnot(e, parseTypeExpr(p)))
@@ -1206,24 +1245,38 @@ fun parseExpr(p : P) -> Expr {
     e
 }
 
-fun parseBinary(p : P, level : Int) -> Expr {
-    let levels = precedence
-    if level >= len(levels) { return parseUnary(p) }
-    var left = parseBinary(p, level + 1)
-    while Array.contains(levels[level], kindOf(p)) {
-        let op = Token.kindName(advance(p).kind)
-        let right = parseBinary(p, level + 1)
-        var fn : Option Expr = None
-        match binaryMethod(op) {
-            Some(name) -> { fn = Some(method(p, left.span, name)) }
-            None -> {}
-        }
-        left = mkExpr(p, left.span, EBinary(op, left, right, fn))
+-- Binary operators, read flat: how `a + b * c` groups is decided by
+-- `Turkey.Resolve`, once every operator's precedence group is known. Nothing
+-- here knows a precedence, so nothing here needs an import.
+fun parseChain(p : P) -> Expr {
+    let first = parseUnary(p)
+    if !atBinaryOperator(p) { return first }
+    let operands = Vec.new(4)
+    let ops = Vec.new(4)
+    Vec.push(operands, first)
+    while atBinaryOperator(p) {
+        let tok = advance(p)
+        Vec.push(ops, (text(tok), tok.span))
+        Vec.push(operands, parseUnary(p))
     }
-    left
+    mkExpr(p, first.span, EChain(operands, ops))
 }
 
+-- Every operator run is a binary operator except the ones that are
+-- punctuation -- `=`, `->`, `~` -- and the prefix `!`.
+fun atBinaryOperator(p : P) -> Bool =
+    isOperatorRun(cur(p)) && !atAny(p, notBinary)
+
+let notBinary = ["=", "->", "~", "!"]
+
 fun parseUnary(p : P) -> Expr {
+    if isOperatorRun(cur(p)) && !at(p, "!") && !at(p, "-") {
+        let hint = splitHint(cur(p))
+        if hint != "" {
+            oops(p, "expected an expression, found " + describe(cur(p)) + hint,
+                 cur(p).span)
+        }
+    }
     if at(p, "!") || at(p, "-") {
         let tok = advance(p)
         let op = Token.kindName(tok.kind)

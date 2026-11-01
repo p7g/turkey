@@ -1,0 +1,278 @@
+module Turkey.Fixity (
+    Group(..), groupNamed, groupName, groupList, builtinGroup, binaryMethod,
+    isBuiltin, declarable, associate, splitAdvice,
+)
+
+-- How a chain of binary operators groups.
+--
+-- The parser reads `a + b * c` as a flat chain -- operands, and the operators
+-- between them -- because it cannot know a declared operator's group when it
+-- meets a use: the `infix` declaration may come later in the file. Name
+-- resolution settles each operator's group and then calls `associate` to build
+-- the tree. Built-in and declared operators go through the one table below.
+--
+-- **The groups are a partial order, not a ladder.** Two operators whose groups
+-- are not related, directly or through others, cannot sit next to each other
+-- without parentheses: `a + b << 2` is an error rather than a guess, because
+-- languages disagree about such pairs and a reader has to guess too.
+-- Associativity belongs to the group, so two operators of one group always
+-- associate the same way and need no rule of their own.
+--
+-- Programs choose among these groups and cannot make new ones.
+
+import Turkey.Diag as Diag
+import Turkey.Source (Span(..))
+
+type Group
+    = Multiplication
+    | Addition
+    | BitShift
+    | BitAnd
+    | BitOr
+    | BitXor
+    | Combine
+    | Comparison
+    | Equality
+    | Conjunction
+    | Disjunction
+    | Choice
+    | Sequence
+
+let groups = [
+    Multiplication, Addition, BitShift, BitAnd, BitOr, BitXor, Combine,
+    Comparison, Equality, Conjunction, Disjunction, Choice, Sequence,
+]
+
+fun groupName(g : Group) -> String = match g {
+    Multiplication -> "Multiplication"
+    Addition -> "Addition"
+    BitShift -> "BitShift"
+    BitAnd -> "BitAnd"
+    BitOr -> "BitOr"
+    BitXor -> "BitXor"
+    Combine -> "Combine"
+    Comparison -> "Comparison"
+    Equality -> "Equality"
+    Conjunction -> "Conjunction"
+    Disjunction -> "Disjunction"
+    Choice -> "Choice"
+    Sequence -> "Sequence"
+}
+
+-- For a diagnostic that has to say what the choices are.
+let groupList = String.join(Array.map(groups, groupName), ", ")
+
+fun groupNamed(name : String) -> Option Group {
+    for g in groups {
+        if groupName(g) == name { return Some(g) }
+    }
+    None
+}
+
+-- The groups each group binds directly tighter than. Everything else follows
+-- by transitivity, and a pair with no path either way is unrelated.
+fun directlyAbove(g : Group) -> Array Group = match g {
+    Multiplication -> [Addition]
+    Addition -> [Comparison]
+    BitShift -> [BitAnd, Comparison]
+    BitAnd -> [BitOr, BitXor, Comparison]
+    BitOr -> [Comparison]
+    BitXor -> [Comparison]
+    Combine -> [Comparison]
+    Comparison -> [Equality]
+    Equality -> [Conjunction]
+    Conjunction -> [Disjunction]
+    Disjunction -> [Choice]
+    Choice -> [Sequence]
+    Sequence -> []
+}
+
+-- Right-associative so that a chain of appends is linear: `a <> (b <> c)`
+-- copies `a` once, where `(a <> b) <> c` copies it twice.
+fun rightAssociative(g : Group) -> Bool = match g {
+    Combine -> True
+    _ -> False
+}
+
+-- Whether `a` binds tighter than `b`. The graph is a dozen nodes, so a search
+-- per question is cheaper than keeping a closure up to date.
+fun tighter(a : Group, b : Group) -> Bool {
+    for next in directlyAbove(a) {
+        if same(next, b) || tighter(next, b) { return True }
+    }
+    False
+}
+
+fun same(a : Group, b : Group) -> Bool = groupName(a) == groupName(b)
+
+-- The built-in binary operators. `&&` and `||` are here too: they have groups
+-- like any operator, and only what they mean, not how they group, is special.
+fun builtinGroup(op : String) -> Option Group = match op {
+    "*" | "/" | "%" -> Some(Multiplication)
+    "+" | "-" -> Some(Addition)
+    "<" | "<=" | ">" | ">=" -> Some(Comparison)
+    "==" | "!=" -> Some(Equality)
+    "&&" -> Some(Conjunction)
+    "||" -> Some(Disjunction)
+    _ -> None
+}
+
+-- The class method a built-in operator means. `&&` and `||` have none: they
+-- short-circuit, which no function call does.
+fun binaryMethod(op : String) -> Option String = match op {
+    "+" -> Some("add")
+    "-" -> Some("sub")
+    "*" -> Some("mul")
+    "/" -> Some("div")
+    "%" -> Some("rem")
+    "==" -> Some("eq")
+    "!=" -> Some("ne")
+    "<" -> Some("lt")
+    "<=" -> Some("lte")
+    ">" -> Some("gt")
+    ">=" -> Some("gte")
+    _ -> None
+}
+
+-- Every operator-character token the language gives a meaning of its own: the
+-- binary operators, the prefix `!`, and the punctuation spelled with operator
+-- characters.
+fun isBuiltin(op : String) -> Bool = match builtinGroup(op) {
+    Some(_) -> True
+    None -> match op {
+        "!" | "=" | "->" | "~" | "|" -> True
+        _ -> False
+    }
+}
+
+-- Why an `infix` declaration may not claim `op`, if it may not. `|` is
+-- declarable even though patterns and type declarations use it: those are
+-- parsed apart from expressions, so the two meanings never meet.
+fun declarable(op : String) -> Option String = match op {
+    "=" | "->" | "~" -> Some("'" + op + "' is punctuation and cannot be declared as an operator")
+    "|" -> None
+    _ -> if isBuiltin(op) {
+        Some("'" + op + "' is a built-in operator and cannot be redeclared")
+    } else {
+        None
+    }
+}
+
+-- -- re-association -------------------------------------------------------------------
+--
+-- Operator precedence parsing over the flat chain: an operator waits on a
+-- stack until one that binds no tighter arrives. Every pair of operators that
+-- the stack compares is a pair whose order decides the tree, so comparing
+-- through the partial order is exactly the check that unrelated operators are
+-- not left for the reader to group.
+
+-- `operands` has one more element than `ops`, and `opGroups` is `ops`' groups.
+-- `build(i, left, right)` makes the node for operator `i`; `start(x)` is where
+-- an operand begins, which is what a built-in operator's node is spanned by.
+fun associate(operands : Vec e, ops : Vec (String, Span), opGroups : Vec Group,
+              build : fun(Int, e, e, Span) -> e, start : fun(e) -> Span) -> e {
+    let values = Vec.new(len(operands))
+    let starts = Vec.new(len(operands))
+    let pending = Vec.new(len(ops))
+    Vec.push(values, operands[0])
+    Vec.push(starts, start(operands[0]))
+    for var i = 0; i < len(ops); i = i + 1 {
+        loop {
+            match Vec.last(pending) {
+                None -> { break }
+                Some(top) -> {
+                    if !first(ops, opGroups, top, i) { break }
+                    reduce(values, starts, pending, build)
+                }
+            }
+        }
+        Vec.push(pending, i)
+        Vec.push(values, operands[i + 1])
+        Vec.push(starts, start(operands[i + 1]))
+    }
+    while len(pending) > 0 { reduce(values, starts, pending, build) }
+    values[0]
+}
+
+-- Whether the operator `top`, to the left, takes its right operand before the
+-- operator `next` takes its left one.
+fun first(ops : Vec (String, Span), opGroups : Vec Group, top : Int,
+          next : Int) -> Bool {
+    let a = opGroups[top]
+    let b = opGroups[next]
+    if same(a, b) {
+        !rightAssociative(a)
+    } else if tighter(a, b) {
+        True
+    } else if tighter(b, a) {
+        False
+    } else {
+        let (left, _) = ops[top]
+        let (right, where) = ops[next]
+        Diag.fail(Diag.at("parse error", "'" + left + "' (" + groupName(a)
+            + ") and '" + right + "' (" + groupName(b) + ") have no precedence "
+            + "between them; add parentheses to say which applies first", where),
+            where.file)
+    }
+}
+
+fun reduce(values : Vec e, starts : Vec Span, pending : Vec Int,
+           build : fun(Int, e, e, Span) -> e) -> Unit {
+    let op = pop(pending)
+    let right = pop(values)
+    let _ = pop(starts)
+    let left = pop(values)
+    let from = pop(starts)
+    Vec.push(values, build(op, left, right, from))
+    Vec.push(starts, from)
+}
+
+fun pop(xs : Vec a) -> a = Option.expect(Vec.pop(xs), "the operator stack is balanced")
+
+-- -- splitting a run ------------------------------------------------------------------
+
+-- The end of a diagnostic about the run `op`, suggesting the operators
+-- `known` accepts that it splits into, or nothing when it splits into none.
+-- The lexer reads the longest run of operator characters, so a run nothing
+-- declares is most often two operators written without a space: `x==-1`.
+fun splitAdvice(op : String, known : fun(String) -> Bool) -> String = match split(op, known) {
+    Some(parts) -> "; if '" + op + "' is more than one operator, separate them: '"
+                   + String.join(parts, " ") + "'"
+    None -> ""
+}
+
+-- `op` as a sequence of operators `known` accepts, if it is one: `==-` is
+-- `["==", "-"]`. Longer pieces are tried first.
+fun split(op : String, known : fun(String) -> Bool) -> Option (Vec String) {
+    let chars = Vec.new(4)
+    for c in String.codePoints(op) { Vec.push(chars, c) }
+    splitFrom(chars, 0, known)
+}
+
+fun splitFrom(chars : Vec Char, at : Int, known : fun(String) -> Bool)
+        -> Option (Vec String) {
+    if at == len(chars) { return Some(Vec.new(2)) }
+    var end = len(chars)
+    while end > at {
+        let piece = spell(chars, at, end)
+        if known(piece) {
+            match splitFrom(chars, end, known) {
+                Some(rest) -> {
+                    let out = Vec.new(len(rest) + 1)
+                    Vec.push(out, piece)
+                    for r in rest { Vec.push(out, r) }
+                    return Some(out)
+                }
+                None -> {}
+            }
+        }
+        end = end - 1
+    }
+    None
+}
+
+fun spell(chars : Vec Char, from : Int, to : Int) -> String {
+    let b = String.builder()
+    for var i = from; i < to; i = i + 1 { String.push(b, Char.toString(chars[i])) }
+    String.build(b)
+}

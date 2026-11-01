@@ -40,17 +40,50 @@ False
 
 ## Operators
 
-| Precedence | Operators | Associativity | Meaning |
+**Syntax**
+
+```ebnf
+chain ::= unary (OPERATOR unary)*
+```
+
+A sequence of binary operators is grouped by **precedence groups**. Every
+binary operator belongs to one group, and a group's associativity applies to
+all of its operators. The built-in operators are in the groups below; the
+groups with no built-in operator are for [declared
+operators](#declared-operators).
+
+| Group | Operators | Associativity | Binds tighter than |
 |---|---|---|---|
-| highest | `f(...)` `a[i]` `a.f` `a.0` `e?` | left | call, index, field, projection, [`?`](do-notation.md) |
-| | `-e` `!e` | prefix | negation, logical not |
-| | `*` `/` `%` | left | `mul`, `div`, `rem` |
-| | `+` `-` | left | `add`, `sub` |
-| | `<` `<=` `>` `>=` | left | `lt`, `lte`, `gt`, `gte` |
-| | `==` `!=` | left | `eq`, `ne` |
-| | `&&` | left | logical and |
-| | `\|\|` | left | logical or |
-| lowest | `e : T` | | [type annotation](#type-annotations) |
+| | `f(...)` `a[i]` `a.f` `a.0` `e?` | left | everything below: call, index, field, projection, [`?`](do-notation.md) |
+| | `-e` `!e` | prefix | every group: negation, logical not |
+| `Multiplication` | `*` `/` `%` | left | `Addition` |
+| `Addition` | `+` `-` | left | `Comparison` |
+| `BitShift` | | left | `BitAnd`, `Comparison` |
+| `BitAnd` | | left | `BitOr`, `BitXor`, `Comparison` |
+| `BitOr` | | left | `Comparison` |
+| `BitXor` | | left | `Comparison` |
+| `Combine` | | right | `Comparison` |
+| `Comparison` | `<` `<=` `>` `>=` | left | `Equality` |
+| `Equality` | `==` `!=` | left | `Conjunction` |
+| `Conjunction` | `&&` | left | `Disjunction` |
+| `Disjunction` | `\|\|` | left | `Choice` |
+| `Choice` | | left | `Sequence` |
+| `Sequence` | | left | |
+| | `e : T` | | binds loosest of all: [type annotation](#type-annotations) |
+
+"Binds tighter than" is transitive: `Multiplication` binds tighter than
+`Addition`, which binds tighter than `Comparison`, so `Multiplication` binds
+tighter than `Comparison` too. Two groups with no path between them in that
+column are **unrelated**, and an expression that mixes operators from
+unrelated groups must use parentheses to say which applies first. So
+`Addition` and `BitShift` are unrelated, and `a + b << c` is an error where
+`(a + b) << c` is not.
+
+For readers new to this: this is a *partial order*. Most languages rank every
+operator against every other, so any two operators can be mixed and a reader
+has to remember which binds tighter. Here a pair that is seldom written
+together, and that languages disagree about, has no order at all, and the
+compiler asks for the parentheses a reader would want anyway.
 
 <!-- run -->
 ```kotlin
@@ -69,7 +102,7 @@ True
 True
 ```
 
-Comparisons are left-associative like everything else, so `a < b < c` means
+`Comparison` is left-associative, so `a < b < c` means
 `(a < b) < c`, which compares a `Bool` with `c` and is usually a type error.
 Write `a < b && b < c`.
 
@@ -131,6 +164,114 @@ concatenates strings, there is no `%` on `Float`, and `Byte` has no arithmetic.
 short-circuit: the right operand is evaluated only if the left one does not
 already decide the answer, so `a && b` is the same as
 `if a { b } else { False }`.
+
+### Declared operators
+
+**Syntax**
+
+```ebnf
+infix-decl ::= "infix" CONID "(" OPERATOR ")" "=" target
+target     ::= IDENT | CONID ("." CONID)* "." IDENT
+```
+
+An `infix` declaration, at the top level of a module, makes an operator an
+alias for a function: `infix Combine (<>) = combine` puts `<>` in the group
+`Combine`, and makes `a <> b` mean `combine(a, b)`.
+
+* The group is one of the groups in the [table above](#operators). A program
+  chooses among them and cannot add its own.
+* The operator is any [operator token](lexical.md#operators-and-punctuation)
+  other than a built-in operator (`+`, `==`, `&&`, `!` and the rest) and the
+  punctuation `=`, `->` and `~`. `|` may be declared: patterns and type
+  declarations, which use it, are read separately from expressions.
+* The target is a top-level function or a class method that takes two
+  parameters, from this module or one it imports. It may be qualified.
+* A use is an ordinary call of the target. Its types are the target's, a class
+  method's class is demanded as by any call, and both operands are evaluated,
+  left to right, before the call: unlike `&&` and `||`, a declared operator
+  never skips its right operand.
+* The operator may be used anywhere in the module that declares it, before the
+  declaration too. It is not visible in other modules.
+* An operator is declared once per module, in one group.
+
+`infix` is a keyword only at the start of a top-level declaration, so it is
+still an ordinary name everywhere else.
+
+<!-- run -->
+```kotlin
+infix Combine (<>) = combine
+infix Sequence (|>) = pipe
+
+fun pipe(x, f) = f(x)
+
+fun shout(s : String) -> String = s <> "!"
+
+fun main() {
+    print("Hello" <> ", " <> "world" |> shout)
+    print("ab" <> "c" == "abc")
+}
+```
+
+```text
+Hello, world!
+True
+```
+
+`combine` is the method of the Prelude's `Semigroup` class, so `<>` works on
+every type with a `Semigroup` instance. `Combine` binds tighter than
+`Equality`, so the comparison is `("ab" <> "c") == "abc"`, and `Sequence` is
+the loosest group, so `|>` applies to the whole concatenation. As a
+desugaring, the first `print` is roughly:
+
+```text
+print(pipe(combine("Hello", combine(", ", "world")), shout))
+```
+
+`Combine` is right-associative, which the nesting shows: `a <> b <> c` is
+`a <> (b <> c)`. On strings and vectors that copies each part once, where the
+other grouping would copy the left part again at every step.
+
+Mixing unrelated groups is an error that names both operators:
+
+<!-- error: '+' (Addition) and '<>' (Combine) have no precedence between them -->
+```kotlin
+infix Combine (<>) = combine
+
+fun main() {
+    print("a" + "b" <> "c")
+}
+```
+
+A declared operator, like a built-in binary one, may begin a line that
+continues the line before it ([Line breaks](lexical.md#line-breaks-and-semicolons)):
+
+<!-- run -->
+```kotlin
+infix Sequence (|>) = pipe
+
+fun pipe(x, f) = f(x)
+
+fun main() {
+    let shown = [3, 1, 2]
+        |> Vec.fromArray
+        |> Vec.sort
+        |> show
+    print(shown)
+}
+```
+
+```text
+[1, 2, 3]
+```
+
+> **Coming from Haskell:** there are no numeric levels and no `infixl` or
+> `infixr`: an operator takes its precedence and associativity from its group.
+> An operator is not a value, so there are no sections and no `(<>)` to pass
+> to a function; pass the named function instead.
+
+> **Coming from Rust:** a declared operator is not a trait of its own. It is
+> another spelling of a function, so it is overloaded exactly when that
+> function is a class method.
 
 ## Function calls
 

@@ -25,6 +25,7 @@ INDEX   ::= "0" | [1-9] [0-9]*
 STRING  ::= '"' ( character | escape )* '"'
 CHAR    ::= "'" ( character | escape ) "'"
 escape  ::= "\n" | "\t" | "\r" | "\0" | "\\" | "\"" | "\'" | "\u{" hex hex? hex? hex? hex? hex? "}"
+OPERATOR ::= [!#$%&*+\-/<=>@^|~]+                            -- the longest run, never containing "--"
 ```
 
 Keywords: `as break class continue do else export for foreign fun hiding if
@@ -44,7 +45,7 @@ export      ::= IDENT
               | CONID "(" CONID ("," CONID)* ")"
               | "module" modname
 top-level   ::= import | type-decl | class-decl | instance-decl
-              | fun-decl | let-decl | var-decl | foreign-decl
+              | fun-decl | let-decl | var-decl | foreign-decl | infix-decl
 import      ::= "import" modname ("as" CONID)? import-list?
 import-list ::= "(" (item ("," item)*)? ")"
               | "hiding" "(" item ("," item)* ")"
@@ -126,16 +127,13 @@ assignment ::= IDENT "=" expression
 
 ## Expressions
 
-Binary operators, from loosest to tightest. All are left-associative.
+A chain of binary operators is read flat and grouped by the operators'
+precedence groups ([Operators](expressions.md#operators)). The `OPERATOR` of
+a chain is any operator but `=`, `->`, `~` and `!`.
 
 ```ebnf
-expression ::= or-expr (":" type)?
-or-expr    ::= and-expr ("||" and-expr)*
-and-expr   ::= eq-expr ("&&" eq-expr)*
-eq-expr    ::= rel-expr (("==" | "!=") rel-expr)*
-rel-expr   ::= add-expr (("<" | "<=" | ">" | ">=") add-expr)*
-add-expr   ::= mul-expr (("+" | "-") mul-expr)*
-mul-expr   ::= unary (("*" | "/" | "%") unary)*
+expression ::= chain (":" type)?
+chain      ::= unary (OPERATOR unary)*
 unary      ::= ("-" | "!") unary
              | postfix
 postfix    ::= atom ( "(" (expression ("," expression)*)? ")"
@@ -181,6 +179,18 @@ match-arm  ::= "|"? pattern ("|" pattern)* "->" expression
 In a `condition`, and in the collection of `for ... in`, a record expression
 must be parenthesized. `let` and `var` conditions are accepted only after
 `if` and `while`.
+
+## Operator declarations
+
+```ebnf
+infix-decl ::= "infix" CONID "(" OPERATOR ")" "=" target
+target     ::= IDENT | CONID ("." CONID)* "." IDENT
+```
+
+`infix` is not a reserved word; it begins an `infix-decl` only at the start of
+a top-level item. The `CONID` is a precedence group, and the `OPERATOR` is
+neither built in nor `=`, `->` or `~` ([Declared
+operators](expressions.md#declared-operators)).
 
 ## Patterns
 

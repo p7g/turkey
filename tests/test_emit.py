@@ -234,3 +234,48 @@ def test_a_branch_on_a_negated_comparison_reads_the_flags():
     assert not [line for line in body if line.startswith(("cset", "eor"))], body
     assert any(line.startswith("b.ge ") for line in body), body
     assert lang.output(NEGATED_BRANCHES) == "10\nbig\n"
+
+
+ELEMENT_ACCESSES = """
+fun moveInt(xs : Array Int, from : Int, to : Int) -> Unit { xs[to] = xs[from] }
+fun moveFloat(xs : Array Float, from : Int, to : Int) -> Unit { xs[to] = xs[from] }
+fun moveChar(xs : Array Char, from : Int, to : Int) -> Unit { xs[to] = xs[from] }
+fun moveByte(xs : Array Byte, from : Int, to : Int) -> Unit { xs[to] = xs[from] }
+
+fun main() -> Unit {
+    let ints = [1, 2, 3]
+    moveInt(ints, 2, 0)
+    let floats = [1.5, 2.5]
+    moveFloat(floats, 1, 0)
+    let chars = ['a', 'b']
+    moveChar(chars, 1, 0)
+    let bytes = [Byte.truncate(7), Byte.truncate(9)]
+    moveByte(bytes, 1, 0)
+    print(show(ints[0]) + " " + show(floats[0]) + " " + show(chars[0]) + " "
+          + show(Byte.toInt(bytes[0])))
+}
+"""
+
+
+@pytest.mark.parametrize("function, load, store", [
+    ("Main#moveInt", r"ldr x\d+", r"str x\d+"),
+    ("Main#moveFloat", r"ldr d\d+", r"str d\d+"),
+    ("Main#moveChar", r"ldr w\d+", r"str w\d+"),
+    ("Main#moveByte", r"ldrb w\d+", r"strb w\d+"),
+])
+def test_an_element_access_scales_its_index_itself(function, load, store):
+    """`[base, index, lsl #k]`, the shift the access's own size: the index is
+    not shifted into a register first, and a byte's is not shifted at all."""
+    result = lang.dump("asm", ELEMENT_ACCESSES)
+    assert result.code == 0, result.stderr
+    body = _functions(result.stdout)[function]
+    assert not [line for line in body if line.startswith(("lsl ", "movz "))], body
+    shift = {"Main#moveInt": ", lsl #3", "Main#moveFloat": ", lsl #3",
+             "Main#moveChar": ", lsl #2", "Main#moveByte": ""}[function]
+    element = r", \[x\d+, x\d+" + re.escape(shift) + r"\]$"
+    assert any(re.match(load + element, line) for line in body), body
+    assert any(re.match(store + element, line) for line in body), body
+
+
+def test_element_accesses_read_and_write_the_element():
+    assert lang.output(ELEMENT_ACCESSES) == "3 2.5 b 9\n"

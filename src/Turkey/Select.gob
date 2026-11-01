@@ -391,10 +391,19 @@ fun incoming(f : Func Low, g : Func Inst) -> BlockId {
 -- inserted, so every `BlockId` a terminator already names still means the
 -- block it meant.
 --
--- Before a safepoint, every root live across it is stored into its slot. Which
--- slots are live there is not written at run time: the frame table says it as
--- data, and the call is marked with the low IR position `Roots.liveAt`
--- answers for.
+-- A root is stored into its slot once, directly after its definition, and
+-- never before a safepoint. Which slots are live at a safepoint is not written
+-- at run time: the frame table says it as data, and the call is marked with
+-- the low IR position `Roots.liveAt` answers for.
+--
+-- The invariant the frame table relies on: wherever a safepoint's map says a
+-- slot is live, the slot holds that value. It holds because the definition
+-- dominates every safepoint the value is live across, no other value is ever
+-- given the slot (`Roots.Frame.slots`), and the collector does not move
+-- objects, so nothing rewrites the slot after the store. A loop-invariant
+-- pointer is then stored once before the loop, and not at every call in it.
+-- The price is a store on a path that reaches no safepoint, after a
+-- definition that is live across one only on some other path.
 fun run(s : Sel) -> Unit {
     for var b = 0; b < len(s.source.blocks); b = b + 1 {
         s.at = b
@@ -412,20 +421,19 @@ fun run(s : Sel) -> Unit {
                 }
             }
         }
+        if b == Ssa.blockId(s.source.entry) {
+            for p in s.source.params { storeRoot(s, p) }
+        }
+        for p in s.source.blocks[b].params { storeRoot(s, p) }
         let insts = s.source.blocks[b].insts
         for var n = 0; n < len(insts); n = n + 1 {
-            let live = Roots.liveAt(s.frame, b, n)
-            -- A frame object needs no store to be published, only the map:
-            -- its fields are in the frame already.
-            -- A poll stores its roots on its own slow path (`Turkey.Emit.poll`).
+            -- A poll's map is written by its own slow path (`Turkey.Emit.poll`).
             let polls = match insts[n].op {
                 Poll -> True
                 _ -> False
             }
-            if !polls && (len(live) > 0 || len(Roots.objectsAt(s.frame, b, n)) > 0) {
-                for (slot, id) in live {
-                    emit(s, A.Str(A.Virtual(id), A.RootSlot(slot), A.W64))
-                }
+            if !polls && (len(Roots.liveAt(s.frame, b, n)) > 0
+                          || len(Roots.objectsAt(s.frame, b, n)) > 0) {
                 s.pending = Some((b, n))
             }
             s.place = (b, n)
@@ -433,9 +441,16 @@ fun run(s : Sel) -> Unit {
             -- A safepoint selected without a call -- a closure capture is a
             -- store -- has nothing to mark, and nothing can collect inside it.
             s.pending = None
+            -- After the call's map, where the result first exists.
+            storeRoot(s, insts[n].result)
         }
         terminate(s, s.source.blocks[b].term)
     }
+}
+
+fun storeRoot(s : Sel, v : Value) -> Unit = match Roots.slotOf(s.frame, Ssa.valueId(v)) {
+    Some(slot) -> emit(s, A.Str(A.Virtual(Ssa.valueId(v)), A.RootSlot(slot), A.W64))
+    None -> {}
 }
 
 -- A block's terminator, as the machine graph ends a block.

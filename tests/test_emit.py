@@ -190,6 +190,53 @@ def test_a_value_in_a_slot_is_loaded_once_between_calls():
             seen.add(match.group(1))
 
 
+ROOT_STORE = re.compile(r"str (%\d+), \[root (\d+)\]$")
+PARAMETER = re.compile(r"mov (%\d+), x\d+$")
+
+
+def test_a_root_is_stored_once_at_its_definition():
+    """A root slot is written once, where its value is defined, and never again
+    before a safepoint: the slot belongs to that value alone and the collector
+    does not move what it points to.
+
+    `Main#scan` keeps an array, a string, a vector and a closure live across the
+    calls in its loop. All four are parameters, so all four stores are in the
+    first block of the function's body, ahead of the loop. And in every
+    function of the program, the Prelude's included, no root slot is stored
+    twice.
+    """
+    result = lang.dump("select", PROGRAMS / "root_once.gob")
+    assert result.code == 0, result.stderr
+    assert "!!" not in result.stdout, result.stdout
+    # Function -> its root stores as (block, value, slot), and its parameters:
+    # the values the entry block moves out of the argument registers.
+    stores: dict[str, list[tuple[str, str, str]]] = {}
+    parameters: dict[str, set[str]] = {}
+    name = block = ""
+    entry = False
+    for line in result.stdout.splitlines():
+        stripped = line.strip()
+        if line.startswith("fun @"):
+            name = line[len("fun @"):].split("(")[0]
+            stores[name], parameters[name] = [], set()
+        elif line.startswith("  b") and stripped.endswith(":"):
+            block = stripped.split()[0].split("(")[0].rstrip(":")
+            entry = stripped.endswith("entry:")
+        elif (match := ROOT_STORE.match(stripped)):
+            stores[name].append((block, match.group(1), match.group(2)))
+        elif entry and (match := PARAMETER.match(stripped)):
+            parameters[name].add(match.group(1))
+    scan = stores["Main#scan"]
+    assert len(parameters["Main#scan"]) == 4, parameters["Main#scan"]
+    assert parameters["Main#scan"] <= {value for _, value, _ in scan}, scan
+    for block, value, _ in scan:
+        if value in parameters["Main#scan"]:
+            assert block == "b0", f"{value} is stored in {block}, not before the loop"
+    for name, made in stores.items():
+        slots = [slot for _, _, slot in made]
+        assert len(slots) == len(set(slots)), f"{name} stores a root slot twice: {made}"
+
+
 def test_a_call_is_followed_by_the_panic_check():
     """`turkey_panic` sets a flag and returns, so every call tests it.
 

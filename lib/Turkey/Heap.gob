@@ -18,8 +18,9 @@ module Turkey.Heap (
 --
 -- A giblet module, and the one that most needs to be: this is the code that
 -- runs when nothing may allocate, and it has no roots of its own because it is
--- what reads everyone else's. Every value here is an `Int`, a `Bool`, a
--- `Float` or a `Prim.Ptr`, and every structure is raw memory at fixed offsets.
+-- what reads everyone else's. Every value here is an `Int`, a `Float`, a
+-- `Prim.Ptr` or an enumeration such as `Bool`, none of them traced, and every
+-- structure is raw memory at fixed offsets.
 --
 -- The collector's state is this module's globals, set up by early
 -- initialization, which runs before anything can allocate. A C caller that
@@ -42,14 +43,13 @@ import Data.Error (Error(..))
 import Control.Iterator (Iterator(..))
 import Data.Int ()
 import Data.Bool (Bool(..))
-import Target (OS(..))
-import Target as Target
 import Turkey.HeapCheck as Check
 import Turkey.Memory as Memory
 import Turkey.Process as Process
 import Turkey.Libc as Libc
 import Turkey.Lock as Lock
 import Turkey.Stack as Stack
+import Turkey.Sys as Sys
 import Turkey.Workers as Workers
 
 -- -- layouts ----------------------------------------------------------------------------
@@ -803,7 +803,7 @@ fun allocateSlow(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Pri
     if stopAsked() { stopAt(frame) }
     if stress { pollWordSet(True) }
     if (stress && stressDue()) || plus(bytesSince, localBytes()) >= threshold {
-        collectFrom(frame, askedEither)
+        collectFrom(frame, Due)
         -- A collection is the only thing here that can raise one, and an
         -- allocation after a failed collection would be into a heap nobody
         -- has finished tracing.
@@ -863,7 +863,7 @@ foreign "turkey_poll" fun poll() -> Unit {
         pollCountdown = pollCountdown - 1
         if pollCountdown <= 0 {
             pollCountdown = pollStressEvery
-            if stressDue() { collectFrom(Prim.frameAddress(), askedEither) }
+            if stressDue() { collectFrom(Prim.frameAddress(), Due) }
         }
     }
 }
@@ -1709,15 +1709,22 @@ fun markFailed(message : Prim.Ptr) -> Unit {
 -- for this worker: until the work epoch is no longer `seen`, which the caller
 -- read before it looked for work and found none (`Turkey.Workers.signalWork`).
 --
+-- A `timeout` of -1 sleeps on the epoch and answers 0. Any other waits in the
+-- operating system for readiness events instead, as the worker that holds the
+-- poller's claim (`Turkey.Workers.pollWait`), for the nanoseconds it gives or
+-- until an event or a signal: it answers how many results there are to read,
+-- or the negated `errno` if it could not wait.
+--
 -- A collection that holds this worker meanwhile may ask it to mark, as it asks
 -- the stopped ones (`pausing` says it can), and wakes it to say so; it waits
 -- for the collection to let it go either way. A worker blocked on a lock is
 -- not asked, since the lock may be the collecting worker's.
-foreign "turkey_worker_pause" fun pause(seen : Int) -> Unit {
+foreign "turkey_worker_pause" fun pause(seen : Int, timeout : Int) -> Int {
     let me = times8(Workers.index())
     Prim.atomicStore(pausing, me, 1)
     Workers.blockEnter(Prim.frameAddress())
-    Workers.sleepForWork(seen)
+    var results = 0
+    if timeout == -1 { Workers.sleepForWork(seen) } else { results = Workers.pollWait(seen, timeout) }
     while True {
         let epoch = Workers.collectionSeen()
         if Workers.unblock() { break }
@@ -1729,6 +1736,7 @@ foreign "turkey_worker_pause" fun pause(seen : Int) -> Unit {
         }
     }
     Prim.atomicStore(pausing, me, 0)
+    results
 }
 
 -- At a safepoint with the running worker's stop word raised: stopped until
@@ -1751,7 +1759,7 @@ fun stopAt(frame : Prim.Ptr) -> Unit {
     Workers.stopLeave()
 }
 
--- What `notHeapPointer` calls a field, by how its object codes its slots.
+-- What `notHeapPointer` calls a field, by the kind of object it is in.
 fun fieldName(object : Prim.Ptr, cellOrObject : Int) -> Prim.Ptr =
     if cellOrObject == heapCell { Prim.ptrNull() }
     else {
@@ -1789,26 +1797,28 @@ fun notHeapPointer(value : Prim.Ptr, what : Prim.Ptr, index : Int) -> Unit {
 -- has returned, and a C caller's. Anything else collects through `allocate`,
 -- which knows where the Turkey stack starts. Always full: asked for by name,
 -- it frees everything unreachable.
-foreign "turkey_collect" fun collect() -> Unit = collectFrom(Prim.ptrNull(), askedFull)
+foreign "turkey_collect" fun collect() -> Unit = collectFrom(Prim.ptrNull(), Full)
 
 -- What a collection is asked to be: whatever `fullDue` says, full, or minor.
 -- Minor only if minor collections are on.
-let askedEither : Int = 0
-let askedFull : Int = 1
-let askedMinor : Int = 2
+type Asked = Due | Full | Minor
 
 -- A collection, with every other worker stopped. If another worker is
 -- stopping them already, it collects and this one does not.
-fun collectFrom(frame : Prim.Ptr, asked : Int) -> Unit {
+fun collectFrom(frame : Prim.Ptr, asked : Asked) -> Unit {
     if !Workers.stopTheWorld() { return {} }
     collectStopped(frame, asked)
     Workers.startTheWorld()
 }
 
-fun collectStopped(frame : Prim.Ptr, asked : Int) -> Unit {
+fun collectStopped(frame : Prim.Ptr, asked : Asked) -> Unit {
     retire()
-    minor = generational && asked != askedFull && (asked == askedMinor || !fullDue())
-    if verify { verifyAt(0, frame) }
+    minor = generational && match asked {
+        Due -> !fullDue()
+        Full -> False
+        Minor -> True
+    }
+    if verify { verifyAt(Check.BeforeMarking, frame) }
     let liveBefore = heapCount
     -- Read before the sweep clears it: the allocation pressure this
     -- collection is responding to.
@@ -1825,9 +1835,9 @@ fun collectStopped(frame : Prim.Ptr, asked : Int) -> Unit {
     markFrom(frame)
     if Process.pending() { return {} }
     let marked = if wanted { nanoseconds() } else { 0 }
-    if verify { verifyAt(1, frame) }
+    if verify { verifyAt(Check.BeforeSweeping, frame) }
     sweep()
-    if verify { verifyAt(2, frame) }
+    if verify { verifyAt(Check.AfterSweeping, frame) }
     allocationsSince = 0
     bytesSince = 0
     if !minor { liveBytesAfterFull = liveBytes }
@@ -1937,14 +1947,8 @@ fun sweep() -> Unit {
 -- -- statistics -------------------------------------------------------------------------
 
 fun nanoseconds() -> Int {
-    let _ = Libc.clockGettime(monotonic(), clock)
+    let _ = Libc.clockGettime(Sys.clockMonotonic(), clock)
     Prim.loadI64(clock, 0) * 1000000000 + Prim.loadI64(clock, 8)
-}
-
--- `CLOCK_MONOTONIC`, from each target's `<time.h>`.
-fun monotonic() -> Int = match Target.os {
-    Darwin -> 6
-    Linux -> 1
 }
 
 fun logCollection(started : Int, liveBefore : Int, allocsSince : Int) -> Unit {
@@ -2276,7 +2280,7 @@ fun snapshot() -> Prim.Ptr {
     state
 }
 
-fun verifyAt(phase : Int, frame : Prim.Ptr) -> Unit = Check.verify(phase, frame, snapshot())
+fun verifyAt(phase : Check.Phase, frame : Prim.Ptr) -> Unit = Check.verify(phase, frame, snapshot())
 
 -- -- for C ------------------------------------------------------------------------------
 --
@@ -2310,7 +2314,7 @@ foreign "turkey_gc_set_verify" fun setVerify(enabled : Int) -> Unit {
 -- A minor collection, if minor collections are on, for the tests of what one
 -- keeps; `turkey_collect` is always full.
 foreign "turkey_collect_minor" fun collectMinor() -> Unit =
-    collectFrom(Prim.ptrNull(), askedMinor)
+    collectFrom(Prim.ptrNull(), Minor)
 
 foreign "turkey_gc_set_generational" fun setGenerational(enabled : Int) -> Unit {
     generational = Prim.intAnd(enabled, 0xFFFF_FFFF) != 0

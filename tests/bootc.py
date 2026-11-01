@@ -140,11 +140,13 @@ def _build(cached: Path, output: Path) -> Path:
 
 def argv(output: str) -> list[str]:
     """`boot`'s arguments for one output: `asm`, the program's assembly on
-    stdout; `check`; or the name of a stage to dump (`core`, `ssa`, `select`,
-    `listing`, ...)."""
+    stdout; `obj`, its relocatable object on stdout; `check`; or the name of a
+    stage to dump (`core`, `ssa`, `select`, `listing`, ...)."""
     match output:
         case "asm":
             return ["build", "-o", "-", "-f", "asm"]
+        case "obj":
+            return ["build", "-o", "-", "-f", "obj"]
         case "check":
             return ["check"]
         case _:
@@ -223,6 +225,23 @@ def digest(*parts: bytes) -> str:
     for part in parts:
         h.update(part)
     return h.hexdigest()[:24]
+
+
+def link(entry: Path, output: Path, *flags: str, cwd: Path = REPO_ROOT,
+         env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    """`boot build` of `entry` to an object beside `output`, linked into
+    `output` with the C compiler and the runtime's libraries. Answers `boot`'s
+    run, whose stderr a caller may read. `flags` go to `boot` before the
+    entry."""
+    obj = output.with_name(output.name + ".o")
+    compiled = subprocess.run(
+        toolchain.command(binary(), "build", "-o", str(obj), *flags, str(entry)),
+        cwd=cwd, env=env, capture_output=True, text=True)
+    assert compiled.returncode == 0, compiled.stderr[-4000:]
+    linked = subprocess.run([*toolchain.cc(), "-o", str(output), str(obj),
+                             *toolchain.libraries()], capture_output=True, text=True)
+    assert linked.returncode == 0, linked.stderr[-4000:]
+    return compiled
 
 
 def replace_built(command: list[str], output: Path) -> None:

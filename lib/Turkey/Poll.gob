@@ -1,0 +1,711 @@
+module Turkey.Poll (
+    Waiter, timedOut, cancelled,
+    now, sleeper, readable, writable, childExit,
+    park, finished, outcome,
+    timeout, pending, deliver, expire, cancel, forget, takeWoken, takeHeadMoved,
+)
+
+-- What tasks wait for besides each other: a time to come, a descriptor to be
+-- ready, a child to exit. A wait is a `Waiter`; the scheduler's workers
+-- deliver what the operating system reports (`Turkey.Workers`' poller) and
+-- the time that passes to the waiters, which answer the coroutines to wake.
+--
+-- Every function here is called under the scheduler's lock, which is what
+-- protects every table below, and none of them waits. This module cannot
+-- import `Turkey.Scheduler`, which imports it: what it has to wake it
+-- answers, and the scheduler wakes it (`takeWoken`).
+--
+-- **One way out of waiting.** A waiter is `Waiting` until the first of an
+-- event, its deadline and a cancellation reaches it, and then it is `Ready`,
+-- `TimedOut` or `Cancelled`, for good: whatever comes later finds it not
+-- waiting, or finds no waiter at all, and does nothing. Leaving `Waiting`
+-- takes the waiter off its deadline heap and out of the descriptor or child it
+-- waited on, so the heap holds waiters that wait and nothing else.
+--
+-- **Descriptors.** The poller knows a descriptor's number and a token, and on
+-- Linux keeps one registration per descriptor, not one per direction. So a
+-- `Source` is one descriptor number, or one child, with the waiters on its
+-- read side and on its write side, and one token for the kernel. It exists
+-- while a waiter waits on it. A token is the source's slot and, above 20 bits,
+-- its generation, which is raised each time the slot is freed: an event that
+-- arrives for a slot that has been freed and used again carries the old
+-- generation and is ignored. The kernel is told the directions that wait
+-- (`arm`) and each registration delivers once, so a direction that still
+-- waits after an event is told again. A direction whose waiter left first
+-- may stay registered; its event wakes nobody.
+--
+-- **Interest.** `Turkey.Workers.interest` is the number of sources plus the
+-- number of waiters on the deadline heap, kept exact at the places that make
+-- or free one, so that a count of 0 means nothing can wake a waiter and a
+-- worker that sees it need not poll.
+--
+-- **Children.** A child is reaped by the one wait that watches it, with
+-- `waitpid(pid, WNOHANG)`, never `wait` or `waitpid(-1, ...)`, and no one
+-- anywhere else in the program may call either, or set `SIGCHLD` to
+-- `SIG_IGN`: any of them takes the status of a child someone is waiting for.
+-- A wait for a child that is not this process's answers `-ECHILD`, as does a
+-- second wait for one that is waited for already.
+--
+-- Everything here is reachable from the module's own tables, which are roots:
+-- a waiter is held by its source or by the heap until it leaves them, and a
+-- coroutine by the waiter. The raw memory below holds no heap value.
+
+import Prelude ()
+import Data.Int (Int)
+import Data.Tuple (Unit)
+import Data.Eq (Eq(..))
+import Data.Ord (Ord(..))
+import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..))
+import Control.Iterator (Iterator(..))
+import Data.Index (Index(..), SetIndex(..), Length(..))
+import Data.Bool (Bool(..))
+import Data.Int ()
+import Data.Option (Option(..))
+import Data.Option as Option
+import Data.Vec (Vec)
+import Data.Vec as Vec
+import Turkey.Coroutine as Co
+import Turkey.Libc as Libc
+import Turkey.Sys as Sys
+import Turkey.Workers as Workers
+import Target (OS(..))
+import Target as Target
+
+-- What a wait answers when it ended without its event, below every negated
+-- error number (and `Turkey.FD.closed`, the next below them).
+let timedOut : Int = -0x2_0000_0000
+let cancelled : Int = -0x3_0000_0000
+
+-- How a wait stands: still waiting, or ended for good. `Ready` carries the
+-- answer: 0 for a descriptor, the wait status for a child, or a negated error
+-- number if the wait could not be made or the descriptor failed to register.
+type Outcome = Waiting | Ready(Int) | TimedOut | Cancelled
+
+-- What a waiter waits for.
+type WaitKind = Sleep | Read | Write | Child
+
+-- What a source stands for.
+type SourceKind = Descriptor | ChildProcess
+
+-- One wait. `heapAt` is the waiter's place on the deadline heap, or -1;
+-- `source` is its source's slot, or 0. `coroutine` is the task to wake when it
+-- ends, if one has parked on it.
+type Waiter = Waiter {
+    var outcome   : Outcome,
+    kind          : WaitKind,
+    deadline      : Int,
+    var heapAt    : Int,
+    var source    : Int,
+    id            : Int,
+    var coroutine : Option Co.Coroutine,
+}
+
+-- A descriptor number or a child with waiters, and what the kernel has been
+-- told about it. `armed` is the directions registered: 1 for read, 2 for
+-- write, and on Linux what its one registration was made for. `added` is
+-- whether Linux's epoll set holds the descriptor at all, which a one-shot that
+-- has fired leaves it doing. A source's record is reused when its slot is.
+type Source = Source {
+    var generation : Int,
+    var live       : Bool,
+    var kind       : SourceKind,
+    var number     : Int,
+    readers        : Vec Waiter,
+    writers        : Vec Waiter,
+    var armed      : Int,
+    var added      : Bool,
+    -- A child's: it has exited, but `waitpid` cannot reap it yet (`exiting`).
+    -- `event` is what the poller reported for it, which on Darwin is its status.
+    var exiting    : Bool,
+    var event      : Int,
+}
+
+let slotBits : Int = 1_048_576
+
+fun newSourceRecord() -> Source = Source {
+    generation = 0,
+    live = False,
+    kind = Descriptor,
+    number = 0,
+    readers = [],
+    writers = [],
+    armed = 0,
+    added = False,
+    exiting = False,
+    event = 0,
+}
+
+-- The sources by slot; slot 0 is not one, since token 0 is the poller's own
+-- break. The free slots, the live sources' count, the slot of the source for
+-- each descriptor number (0 for none) and the slots of those for children.
+var sources : Vec Source = [newSourceRecord()]
+var freeSlots : Vec Int = []
+var liveSources = 0
+var byFd : Vec Int = []
+var childSlots : Vec Int = []
+-- The slots of the children that have exited and are not yet waitable, which
+-- `expire` asks again, and which keep the poller from waiting for long.
+var exiting : Vec Int = []
+let exitingRetry : Int = 1_000_000
+
+-- The waiters with a deadline, as a binary min-heap on the deadline.
+var timers : Vec Waiter = []
+-- Whether a waiter has become the earliest deadline since `takeHeadMoved`.
+var headMoved = False
+
+-- The tasks to wake, and how many waiters have ended: kept so that each
+-- function can answer how many it ended (a program's own stack waits too, and
+-- has no coroutine to wake).
+var woken : Vec Co.Coroutine = []
+var ended = 0
+var nextId = 0
+
+-- Where `waitpid` stores a status; only used under the lock.
+var statusBuffer : Prim.Ptr = Libc.malloc(8)
+
+-- -- time ---------------------------------------------------------------------------------
+
+-- Nanoseconds on a clock that only moves forward, which every deadline is
+-- on. Each call has its own `struct timespec`, since workers read it at once.
+fun now() -> Int {
+    let timespec = Libc.malloc(16)
+    let _ = Libc.clockGettime(Sys.clockMonotonic(), timespec)
+    let nanoseconds = Prim.loadI64(timespec, 0) * 1000000000 + Prim.loadI64(timespec, 8)
+    Libc.free(timespec)
+    nanoseconds
+}
+
+-- -- the deadline heap --------------------------------------------------------------------
+
+fun place(i : Int, w : Waiter) -> Unit {
+    timers[i] = w
+    w.heapAt = i
+}
+
+-- Move the waiter at `start` up to where it belongs, answering where that is.
+fun siftUp(start : Int) -> Int {
+    var i = start
+    let w = timers[i]
+    while i > 0 {
+        let parent = (i - 1) / 2
+        let p = timers[parent]
+        if !(w.deadline < p.deadline) { break }
+        place(i, p)
+        i = parent
+    }
+    place(i, w)
+    i
+}
+
+fun siftDown(start : Int) -> Unit {
+    var i = start
+    let w = timers[i]
+    let n = len(timers)
+    while True {
+        var child = 2 * i + 1
+        if child >= n { break }
+        if child + 1 < n && timers[child + 1].deadline < timers[child].deadline {
+            child = child + 1
+        }
+        let c = timers[child]
+        if !(c.deadline < w.deadline) { break }
+        place(i, c)
+        i = child
+    }
+    place(i, w)
+}
+
+fun timerAdd(w : Waiter) -> Unit {
+    Vec.push(timers, w)
+    let at = siftUp(len(timers) - 1)
+    Workers.interestAdd(1)
+    if at == 0 { headMoved = True }
+}
+
+fun timerRemove(w : Waiter) -> Unit {
+    let i = w.heapAt
+    if i < 0 { return {} }
+    w.heapAt = -1
+    Workers.interestAdd(-1)
+    let last = len(timers) - 1
+    let moved = timers[last]
+    let _ = Vec.pop(timers)
+    if i < last {
+        place(i, moved)
+        siftDown(siftUp(i))
+    }
+}
+
+-- Whether the earliest deadline is a different waiter's than when this was
+-- last asked, which a worker that is waiting for the operating system with
+-- the old one has to be told.
+fun takeHeadMoved() -> Bool {
+    let moved = headMoved
+    headMoved = False
+    moved
+}
+
+-- -- ending waits -------------------------------------------------------------------------
+
+fun newWaiter(kind : WaitKind, deadline : Int) -> Waiter {
+    nextId = nextId + 1
+    Waiter {
+        outcome = Waiting,
+        kind = kind,
+        deadline = deadline,
+        heapAt = -1,
+        source = 0,
+        id = nextId,
+        coroutine = None,
+    }
+}
+
+-- A waiter that never waited: it answers `value` at once.
+fun done(w : Waiter, value : Int) -> Waiter {
+    w.outcome = Ready(value)
+    w
+}
+
+fun waiting(w : Waiter) -> Bool = match w.outcome {
+    Waiting -> True
+    Ready(_) -> False
+    TimedOut -> False
+    Cancelled -> False
+}
+
+-- The one transition out of `Waiting`: False, and nothing changed, if the
+-- waiter is not waiting. The task parked on it is queued to be woken.
+fun finish(w : Waiter, outcome : Outcome) -> Bool {
+    if !waiting(w) { return False }
+    w.outcome = outcome
+    timerRemove(w)
+    match w.coroutine {
+        Some(c) -> {
+            Vec.push(woken, c)
+            w.coroutine = None
+        }
+        None -> {}
+    }
+    ended = ended + 1
+    True
+}
+
+-- `finish`, and take the waiter out of its source, which is freed if no one
+-- else waits on it.
+fun end(w : Waiter, outcome : Outcome) -> Unit {
+    if !finish(w, outcome) { return {} }
+    if w.source != 0 { leave(w) }
+}
+
+fun leave(w : Waiter) -> Unit {
+    let slot = w.source
+    w.source = 0
+    let s = sources[slot]
+    match w.kind {
+        Write -> drop(s.writers, w.id)
+        Sleep -> drop(s.readers, w.id)
+        Read -> drop(s.readers, w.id)
+        Child -> drop(s.readers, w.id)
+    }
+    if nobodyWaits(s) { freeSource(slot) }
+}
+
+fun drop(waiters : Vec Waiter, id : Int) -> Unit {
+    let n = len(waiters)
+    for var i = 0; i < n; i = i + 1 {
+        if waiters[i].id == id {
+            Vec.swap(waiters, i, n - 1)
+            let _ = Vec.pop(waiters)
+            return {}
+        }
+    }
+}
+
+-- End every waiter in `waiters`, a source's, which are all waiting, and empty
+-- it: the source is the caller's to free.
+fun endAll(waiters : Vec Waiter, outcome : Outcome) -> Unit {
+    let n = len(waiters)
+    for var i = 0; i < n; i = i + 1 {
+        let w = waiters[i]
+        w.source = 0
+        let _ = finish(w, outcome)
+    }
+    Vec.clear(waiters)
+}
+
+-- -- sources ------------------------------------------------------------------------------
+
+fun tokenOf(slot : Int, s : Source) -> Int = slot + s.generation * slotBits
+
+fun nobodyWaits(s : Source) -> Bool = len(s.readers) == 0 && len(s.writers) == 0
+
+-- A source's slot, counted in the interest, or the negated error number.
+fun newSource(kind : SourceKind, number : Int) -> Int {
+    var slot = 0
+    if len(freeSlots) > 0 {
+        slot = Option.unwrapOr(Vec.pop(freeSlots), 0)
+    } else {
+        if len(sources) >= slotBits { return -Sys.enomem }
+        slot = len(sources)
+        Vec.push(sources, newSourceRecord())
+    }
+    let s = sources[slot]
+    s.live = True
+    s.kind = kind
+    s.number = number
+    s.armed = 0
+    s.added = False
+    s.exiting = False
+    liveSources = liveSources + 1
+    Workers.interestAdd(1)
+    slot
+}
+
+-- Release a source nobody waits on, and drop what the kernel holds for it: a
+-- Darwin one-shot that has fired is gone already, and a Linux descriptor stays
+-- in the epoll set until it is removed.
+fun freeSource(slot : Int) -> Unit {
+    let s = sources[slot]
+    match s.kind {
+        Descriptor -> {
+            let registered = match Target.os {
+                Darwin -> s.armed != 0
+                Linux -> s.added
+            }
+            if registered { Workers.pollForget(s.number) }
+            byFd[s.number] = 0
+        }
+        ChildProcess -> {
+            Workers.pollForgetChild(s.number, tokenOf(slot, s))
+            forgetChild(slot)
+            if s.exiting { forgetExiting(slot) }
+        }
+    }
+    s.live = False
+    s.generation = s.generation + 1
+    s.armed = 0
+    s.added = False
+    Vec.push(freeSlots, slot)
+    liveSources = liveSources - 1
+    Workers.interestAdd(-1)
+}
+
+-- Tell the kernel about the directions that wait and are not registered; 0,
+-- or the negated error number. On Linux the one registration is replaced by
+-- one for exactly the directions that wait, when it does not cover them.
+fun arm(slot : Int, s : Source) -> Int {
+    var want = 0
+    if len(s.readers) > 0 { want = 1 }
+    if len(s.writers) > 0 { want = Prim.intOr(want, 2) }
+    let token = tokenOf(slot, s)
+    match Target.os {
+        Darwin -> {
+            var r = 0
+            if Prim.intAnd(want, 1) != 0 && Prim.intAnd(s.armed, 1) == 0 {
+                r = Workers.pollRead(s.number, token)
+                if r >= 0 { s.armed = Prim.intOr(s.armed, 1) }
+            }
+            if r >= 0 && Prim.intAnd(want, 2) != 0 && Prim.intAnd(s.armed, 2) == 0 {
+                r = Workers.pollWrite(s.number, token)
+                if r >= 0 { s.armed = Prim.intOr(s.armed, 2) }
+            }
+            r
+        }
+        Linux -> {
+            if Prim.intAnd(want, s.armed) == want { return 0 }
+            let r = match want {
+                1 -> Workers.pollRead(s.number, token)
+                2 -> Workers.pollWrite(s.number, token)
+                _ -> Workers.pollReadWrite(s.number, token)
+            }
+            if r >= 0 {
+                s.armed = want
+                s.added = True
+            }
+            r
+        }
+    }
+}
+
+-- -- starting waits -----------------------------------------------------------------------
+
+-- A wait that has only a deadline. A negative one never ends.
+fun sleeper(deadline : Int) -> Waiter {
+    let w = newWaiter(Sleep, deadline)
+    if deadline >= 0 { timerAdd(w) }
+    w
+}
+
+fun readable(fd : Int, deadline : Int) -> Waiter = waitFd(fd, Read, deadline)
+
+fun writable(fd : Int, deadline : Int) -> Waiter = waitFd(fd, Write, deadline)
+
+-- A wait for `fd` to be ready for `kind` (`Read` or `Write`): it ends `Ready`
+-- with 0 when the descriptor is, or hangs up, or has an error -- the
+-- operation then reports which -- and `Ready` with the negated error number
+-- if the kernel will not watch it.
+fun waitFd(fd : Int, kind : WaitKind, deadline : Int) -> Waiter {
+    let w = newWaiter(kind, deadline)
+    if fd < 0 { return done(w, -Sys.ebadf) }
+    while len(byFd) <= fd { Vec.push(byFd, 0) }
+    var slot = byFd[fd]
+    if slot == 0 {
+        slot = newSource(Descriptor, fd)
+        if slot < 0 { return done(w, slot) }
+        byFd[fd] = slot
+    }
+    let s = sources[slot]
+    w.source = slot
+    match kind {
+        Write -> Vec.push(s.writers, w)
+        Sleep -> Vec.push(s.readers, w)
+        Read -> Vec.push(s.readers, w)
+        Child -> Vec.push(s.readers, w)
+    }
+    let r = arm(slot, s)
+    if r < 0 {
+        leave(w)
+        return done(w, r)
+    }
+    if deadline >= 0 { timerAdd(w) }
+    w
+}
+
+-- A wait for the child `pid` to exit, which ends `Ready` with its wait status
+-- (reaped here) or with the negated error number if it cannot be waited for.
+-- The registration comes before the first `waitpid`, so a child that exits
+-- between them is delivered and one that exited before is reaped at once.
+fun childExit(pid : Int, deadline : Int) -> Waiter {
+    let w = newWaiter(Child, deadline)
+    if pid <= 0 { return done(w, -Sys.einval) }
+    if findChild(pid) != 0 { return done(w, -Sys.echild) }
+    let slot = newSource(ChildProcess, pid)
+    if slot < 0 { return done(w, slot) }
+    let s = sources[slot]
+    Vec.push(childSlots, slot)
+    let r = Workers.pollChild(pid, tokenOf(slot, s))
+    if r < 0 {
+        freeSource(slot)
+        return done(w, r)
+    }
+    let reaped = Sys.cResult(Libc.waitpid(pid, statusBuffer, Sys.waitNoHang))
+    if reaped != 0 {
+        freeSource(slot)
+        return done(w, if reaped > 0 { status() } else { reaped })
+    }
+    -- Exited by the kernel's account but not waitable yet: the wait goes on,
+    -- and `expire` asks again.
+    if r == 1 { markExiting(slot, s, 0) }
+    w.source = slot
+    Vec.push(s.readers, w)
+    if deadline >= 0 { timerAdd(w) }
+    w
+}
+
+fun status() -> Int = Prim.charToInt(Prim.loadI32(statusBuffer, 0))
+
+fun findChild(pid : Int) -> Int {
+    let n = len(childSlots)
+    for var i = 0; i < n; i = i + 1 {
+        if sources[childSlots[i]].number == pid { return childSlots[i] }
+    }
+    0
+}
+
+fun forgetChild(slot : Int) -> Unit {
+    let n = len(childSlots)
+    for var i = 0; i < n; i = i + 1 {
+        if childSlots[i] == slot {
+            Vec.swap(childSlots, i, n - 1)
+            let _ = Vec.pop(childSlots)
+            return {}
+        }
+    }
+}
+
+-- -- parking and reading the answer ---------------------------------------------------------
+
+-- Let `c`, the task about to suspend, be woken when `w` ends.
+fun park(w : Waiter, c : Co.Coroutine) -> Unit {
+    w.coroutine = Some(c)
+}
+
+fun finished(w : Waiter) -> Bool = !waiting(w)
+
+-- How the wait ended: the answer of one that is `Ready`, else `timedOut` or
+-- `cancelled`. Only asked once the wait has finished.
+fun outcome(w : Waiter) -> Int = match w.outcome {
+    Ready(value) -> value
+    TimedOut -> timedOut
+    Cancelled -> cancelled
+    Waiting -> Prim.error("outcome of a wait that has not ended")
+}
+
+-- -- what the scheduler asks ----------------------------------------------------------------
+
+-- Whether any wait can still end: a source with waiters, or a deadline.
+fun pending() -> Bool = liveSources > 0 || len(timers) > 0
+
+-- What the poller should wait for, at time `now`: -1 if nothing can end a
+-- wait; -2 (`Turkey.Workers.pollTimeoutForever`) if only an event can; else
+-- the nanoseconds to the earliest deadline, 0 if it has passed, and at most a
+-- millisecond while a child that has exited waits to be reaped.
+fun timeout(now : Int) -> Int {
+    if len(exiting) > 0 {
+        let left = if len(timers) > 0 { timers[0].deadline - now } else { exitingRetry }
+        if left < 0 { 0 } else if left > exitingRetry { exitingRetry } else { left }
+    } else if len(timers) > 0 {
+        let left = timers[0].deadline - now
+        if left < 0 { 0 } else { left }
+    } else if liveSources > 0 {
+        Workers.pollTimeoutForever
+    } else {
+        -1
+    }
+}
+
+-- The coroutines of the waiters that have ended since the last call, for the
+-- scheduler to wake.
+fun takeWoken() -> Vec Co.Coroutine {
+    let tasks = woken
+    if len(tasks) > 0 { woken = [] }
+    tasks
+}
+
+let readMask : Int = Prim.intOr(Workers.pollReadable, Prim.intOr(Workers.pollEof, Workers.pollError))
+let writeMask : Int = Prim.intOr(Workers.pollWritable, Prim.intOr(Workers.pollEof, Workers.pollError))
+
+-- The poller reported `value` for `token`; answers how many waiters ended.
+-- A descriptor that is readable, hung up or failed ends the waiters that
+-- read, and one writable, hung up or failed those that write. Linux's one-shot
+-- registration is gone whatever it reported, and Darwin's filter that
+-- reported is.
+fun deliver(token : Int, value : Int) -> Int {
+    let before = ended
+    let slot = token % slotBits
+    if slot > 0 && slot < len(sources) {
+        let s = sources[slot]
+        if s.live && s.generation == token / slotBits {
+            match s.kind {
+                ChildProcess -> deliverChild(slot, s, value)
+                Descriptor -> deliverFd(slot, s, value)
+            }
+        }
+    }
+    ended - before
+}
+
+fun deliverFd(slot : Int, s : Source, value : Int) -> Unit {
+    match Target.os {
+        Linux -> { s.armed = 0 }
+        Darwin -> {
+            if Prim.intAnd(value, Workers.pollReadable) != 0 { s.armed = Prim.intAnd(s.armed, 2) }
+            if Prim.intAnd(value, Workers.pollWritable) != 0 { s.armed = Prim.intAnd(s.armed, 1) }
+        }
+    }
+    if Prim.intAnd(value, readMask) != 0 { endAll(s.readers, Ready(0)) }
+    if Prim.intAnd(value, writeMask) != 0 { endAll(s.writers, Ready(0)) }
+    if nobodyWaits(s) {
+        freeSource(slot)
+        return {}
+    }
+    let r = arm(slot, s)
+    if r < 0 {
+        endAll(s.readers, Ready(r))
+        endAll(s.writers, Ready(r))
+        freeSource(slot)
+    }
+}
+
+-- The child exited: reap it and answer its status. On Darwin the event has
+-- the status too, and answers it if `waitpid` has none to give, as when
+-- something else reaped the child first.
+fun deliverChild(slot : Int, s : Source, value : Int) -> Unit {
+    s.event = value
+    reapChild(slot, s)
+}
+
+-- Ask `waitpid` for the child of `s`, once: if it is reaped the waiters end
+-- with its status, if it is gone some other way they end with the negated
+-- error number -- on Darwin the status the poller reported, since someone
+-- else reaped it -- and if it is not waitable yet it is `exiting`.
+fun reapChild(slot : Int, s : Source) -> Unit {
+    let r = Sys.cResult(Libc.waitpid(s.number, statusBuffer, Sys.waitNoHang))
+    if r == 0 {
+        markExiting(slot, s, s.event)
+        return {}
+    }
+    let answer = if r > 0 {
+        status()
+    } else {
+        match Target.os {
+            Darwin -> s.event
+            Linux -> r
+        }
+    }
+    endAll(s.readers, Ready(answer))
+    freeSource(slot)
+}
+
+fun markExiting(slot : Int, s : Source, event : Int) -> Unit {
+    s.event = event
+    if !s.exiting {
+        s.exiting = True
+        Vec.push(exiting, slot)
+    }
+}
+
+fun forgetExiting(slot : Int) -> Unit {
+    let n = len(exiting)
+    for var i = 0; i < n; i = i + 1 {
+        if exiting[i] == slot {
+            Vec.swap(exiting, i, n - 1)
+            let _ = Vec.pop(exiting)
+            return {}
+        }
+    }
+}
+
+-- Ask again for the children that were not waitable, and end every waiter
+-- whose deadline is at or before `now` with `timedOut`; answers how many.
+fun expire(now : Int) -> Int {
+    let before = ended
+    -- Backwards: a child that is reaped leaves the list by swapping with the
+    -- last, which has been asked already.
+    for var i = len(exiting) - 1; i >= 0; i = i - 1 {
+        if i < len(exiting) {
+            let slot = exiting[i]
+            reapChild(slot, sources[slot])
+        }
+    }
+    while len(timers) > 0 && timers[0].deadline <= now {
+        end(timers[0], TimedOut)
+    }
+    ended - before
+}
+
+-- `fd` is about to be closed: end every wait on it with `cancelled`, and drop
+-- the kernel's interest. Answers how many ended.
+fun cancel(fd : Int) -> Int {
+    let before = ended
+    if fd >= 0 && fd < len(byFd) && byFd[fd] != 0 {
+        let slot = byFd[fd]
+        let s = sources[slot]
+        endAll(s.readers, Cancelled)
+        endAll(s.writers, Cancelled)
+        freeSource(slot)
+    }
+    ended - before
+}
+
+-- Drop the kernel's interest in `fd` before its number is closed, which on
+-- Linux a registration does not survive while another descriptor for the same
+-- open file exists. `cancel` first: a wait still on `fd` is not woken by this.
+fun forget(fd : Int) -> Unit {
+    Workers.pollForget(fd)
+    if fd >= 0 && fd < len(byFd) && byFd[fd] != 0 {
+        let s = sources[byFd[fd]]
+        s.armed = 0
+        s.added = False
+    }
+}

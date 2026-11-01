@@ -457,16 +457,8 @@ fun main() {
         after = before + "        if !Prim.ptrIsNull(object) { continue }\n"
     assert text.count(before) == 1, before
     heap.write_text(text.replace(before, after))
-    result = subprocess.run(toolchain.command(bootc.binary(), *bootc.argv("asm"), "--gc-verify",
-                                              str(source)),
-                            cwd=bootc.REPO_ROOT, capture_output=True, text=True,
-                            check=True, env=dict(os.environ, TURKEY_LIB=str(library)))
-    generated = tmp_path / "main.s"
-    generated.write_text(result.stdout)
     binary = tmp_path / "broken"
-    subprocess.run([*toolchain.cc(), str(generated), *toolchain.libraries(),
-                    "-o", str(binary)],
-                   capture_output=True, text=True, check=True)
+    bootc.link(source, binary, "--gc-verify", env=dict(os.environ, TURKEY_LIB=str(library)))
     result = subprocess.run(toolchain.command(binary), capture_output=True, text=True, timeout=20,
                             env=dict(os.environ, TURKEY_GC_STRESS="1"))
     assert result.returncode == 1, result.stderr

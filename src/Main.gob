@@ -56,6 +56,9 @@ import Turkey.Frame as Frame
 import Turkey.Emit as Emit
 import Turkey.Stream as Stream
 import Turkey.Arm64.Encode as Encode
+import Turkey.Assembler as Assembler
+import Turkey.MachO as MachO
+import Turkey.Elf as Elf
 import Turkey.Escape as Escape
 import Turkey.Asm as Asm
 import Turkey.MachineCheck as MachineCheck
@@ -123,13 +126,15 @@ let stages = ["decls", "classes", "types", "core", "mono", "opt", "ssa",
 -- to move this.
 let checkedThrough = "core"
 
--- What `build` writes. Only assembly for now: an object needs the object
--- writer, and an executable needs either that and a linker or the writer
--- that replaces both.
+-- What `build` writes: assembly, or a relocatable object for the system
+-- linker. An executable needs the linker's work done here as well.
 type Format = Executable | Object | Assembly
 
--- Where the assembly goes.
-type Sink = ToStdout | ToFile(File.File File.WriteOnly)
+-- Where the output goes.
+type Destination = ToStdout | ToFile(File.File File.WriteOnly)
+
+-- What `build` writes, and where.
+type Sink = Sink { to : Destination, format : Format }
 
 fun main() {
     let p = Args.parser(Env.args())
@@ -196,7 +201,7 @@ fun main() {
         compile(b, path, dumps, listing, sink)
     }
     write(String.build(b))
-    if let Some(ToFile(out)) = sink {
+    if let Some(Sink { to = ToFile(out), .. }) = sink {
         if let Left(e) = File.close(out) { die(message(e)) }
     }
 }
@@ -243,11 +248,9 @@ fun openSink(output : Option String, format : Option Format, paths : Vec String,
     match chosen {
         Executable -> die("boot cannot write an executable yet; write assembly "
                           + "with -o NAME.s and link it with a C compiler")
-        Object -> die("boot cannot write an object file yet; write assembly "
-                      + "with -o NAME.s and assemble it")
-        Assembly -> {}
+        Object | Assembly -> {}
     }
-    match output {
+    let to = match output {
         None | Some("-") -> {
             -- Dumps go to standard output too, and two things in one stream
             -- can be told apart only by parsing both.
@@ -268,6 +271,10 @@ fun openSink(output : Option String, format : Option Format, paths : Vec String,
             }
         }
     }
+    if let Object = chosen {
+        if len(paths) > 1 { die("several files cannot be written as one object") }
+    }
+    Sink { to = to, format = chosen }
 }
 
 -- Each stage, and the dumps of it that were asked for, as far as this
@@ -321,14 +328,36 @@ fun compile(b : String.Builder, path : String, dumps : Set.Set String,
     -- with its own text, since the program's text is too large to emit twice.
     let outs = []
     if wants("listing") {
-        Vec.push(outs, Out { text = b, sink = ToStdout, apart = False,
+        Vec.push(outs, Out { text = b, sink = Some(ToStdout), apart = False,
                                render = fun(d, code, t) { Encode.listing(listing, code, t) } })
     }
-    if let Some(s) = sink {
-        Vec.push(outs, Out { text = String.builder(), sink = s, apart = True,
-                               render = Stream.print })
+    match sink {
+        Some(Sink { to, format = Object }) -> {
+            let assembler = Assembler.new(Encode.isa())
+            Vec.push(outs, Out { text = String.builder(), sink = None, apart = False,
+                                   render = fun(d, code, t) { Assembler.feed(assembler, code) } })
+            let refused = emitModule(path, entry, module_, outs)
+            -- A function that is not there is a link error at best, and no
+            -- error at all if its callers were refused too.
+            if len(refused) > 0 {
+                Diag.fail(Diag.whole("internal error", "the backend refused:\n  "
+                                     + String.join(refused, "\n  ")), path)
+            }
+            let started = Stopwatch.start()
+            let obj = Assembler.finish(assembler)
+            sendBytes(to, match Asm.dialectFor(target) {
+                Asm.MachO -> MachO.objectFile(obj)
+                Asm.Elf -> Elf.objectFile(obj)
+            })
+            let _ = lap("object", started)
+        }
+        Some(Sink { to, .. }) -> {
+            Vec.push(outs, Out { text = String.builder(), sink = Some(to), apart = True,
+                                   render = Stream.print })
+            let _ = emitModule(path, entry, module_, outs)
+        }
+        None -> { let _ = emitModule(path, entry, module_, outs) }
     }
-    emitModule(path, entry, module_, outs)
 }
 
 fun position(stage : String) -> Int = match Array.indexOf(stages, stage) {
@@ -701,7 +730,8 @@ fun backendOf(asm : Asm.Asm, f : Ssa.Func Arm64.Inst, i : Int,
 type Out = Out {
     render : fun(Asm.Dialect, Vec (Stream.Item Arm64.Inst), String.Builder) -> Unit,
     text   : String.Builder,
-    sink   : Sink,
+    -- None for a consumer whose output is not text and is written afterwards.
+    sink   : Option Destination,
     -- Whether it renders a piece of code without anything left from the last
     -- piece, so that pieces can be rendered at once and joined in order. The
     -- encoder's listing carries whether it is in the code section from one
@@ -726,8 +756,11 @@ type Out = Out {
 -- The order below is not incidental. A message is interned by the guard that
 -- raises it, and the entry sequence interns `<globals>`, so the message table
 -- is complete only once every function *and* the entry have been emitted.
+--
+-- Answers what the backend refused, which in assembly is only a comment.
 fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
-              outs : Vec Out) -> Unit {
+              outs : Vec Out) -> Vec String {
+    let refused = []
     let note = fun(text) { for o in outs { String.push(o.text, text) } }
     -- Each consumer empties the array it is handed, so all but the last are
     -- handed a copy.
@@ -740,7 +773,12 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     }
     -- Written as it is emitted: held until the end, the program's text was
     -- millions of strings the collector kept tracing.
-    let flush = fun() { for o in outs { send(o.sink, String.drain(o.text)) } }
+    let flush = fun() {
+        for o in outs {
+            let text = String.drain(o.text)
+            if let Some(to) = o.sink { send(to, text) }
+        }
+    }
     note("// === " + path + "\n")
     -- A build that counts its allocations by site (`Turkey.Sites`): the table
     -- of what each site is goes to stderr.
@@ -763,6 +801,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     Vec.push(code, Stream.Section(Asm.Text))
     consume(asm.dialect, code)
     for u in unsupported {
+        Vec.push(refused, u.name + ": " + u.what)
         note("// skipped " + u.name + ": " + u.what + "\n")
     }
     let lows = Map.new()
@@ -780,7 +819,10 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     Parallel.mapInOrder(indices, fun(i) = backendOf(asm, selected[i], i, lows, sigs, outs),
                         fun(i, m) {
         match m.layout {
-            None -> note("// skipped " + selected[i].name + ": " + m.skipped + "\n")
+            None -> {
+                Vec.push(refused, selected[i].name + ": " + m.skipped)
+                note("// skipped " + selected[i].name + ": " + m.skipped + "\n")
+            }
             Some(l) -> {
                 for message in m.complaints { Vec.push(complaints, message) }
                 for var o = 0; o < len(outs); o = o + 1 {
@@ -828,6 +870,7 @@ fun emitModule(path : String, entry : Modules.Module, module_ : SsaLower.Module,
     consume(asm.dialect, code)
     flush()
     let _ = lap("tables", at)
+    refused
 }
 
 -- How the backend's time is spread over functions: what parallelizing it
@@ -853,9 +896,26 @@ fun reportCosts(costs : Vec (String, Duration)) -> Unit {
     }
 }
 
-fun send(sink : Sink, text : String) -> Unit = match sink {
+fun send(to : Destination, text : String) -> Unit = match to {
     ToStdout -> write(text)
     ToFile(out) -> if let Left(e) = IO.writeText(out, text) { die(message(e)) }
+}
+
+fun sendBytes(to : Destination, bytes : Vec Byte) -> Unit {
+    let array = Vec.toArray(bytes)
+    let buffer = IO.buffer(len(array))
+    IO.append(buffer, array, 0, len(array))
+    match to {
+        ToStdout -> {
+            if let Left(_) = IO.writeFrom(IO.stdout(), buffer) {
+                die("cannot write the object to standard output")
+            }
+            if let Left(_) = IO.flush(IO.stdout()) {
+                die("cannot write the object to standard output")
+            }
+        }
+        ToFile(out) -> if let Left(e) = IO.writeFrom(out, buffer) { die(message(e)) }
+    }
 }
 
 -- The machine IR, with what selection could not translate.

@@ -1,0 +1,210 @@
+module Hash.SHA256 (SHA256, new, update, updateText, finish, hex, ofBytes, ofText)
+
+-- SHA-256, as FIPS 180-4 specifies it: a Merkle-Damgard construction over
+-- 512-bit blocks, with a 256-bit state of eight 32-bit words.
+--
+-- `Int` is 64 bits wide, so every 32-bit word lives in an `Int` with its high
+-- half zero. An addition can produce 33 bits and a rotation can shift a word
+-- past bit 31, so each result is masked back to 32 bits before it is stored
+-- or used again. Words are never negative, which is why `Int.shr` (arithmetic)
+-- is the logical shift here.
+
+import Prelude ()
+import Data.Int (Int)
+import Data.Byte (Byte)
+import Data.Array (Array)
+import Data.String (String)
+import Data.Tuple (Unit)
+import Data.Bool (Bool(..))
+import Data.Eq (Eq(..))
+import Data.Ord (Ord(..))
+import Data.Num (Add(..), Sub(..), Mul(..))
+import Data.Index (Index(..), SetIndex(..), Length(..))
+import Data.Byte as Byte
+import Data.Int as Int
+import Data.Array as Array
+import Data.String as String
+
+let mask : Int = 0xFFFF_FFFF
+
+-- The first 32 bits of the fractional parts of the cube roots of the first 64
+-- primes (FIPS 180-4, 4.2.2).
+let roundConstants : Array Int = [
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+]
+
+-- The first 32 bits of the fractional parts of the square roots of the first
+-- eight primes (FIPS 180-4, 5.3.3), as a fresh array each call.
+fun initialState() -> Array Int = [
+    0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+]
+
+-- The state of a hash in progress. `block` holds the bytes of the current
+-- partial block, `filled` how many of them there are, and `length` the total
+-- fed so far in bytes. `schedule` is the 64-word message schedule, kept here
+-- so that compressing a block allocates nothing.
+type SHA256 = SHA256 {
+    var state : Array Int,
+    var block : Array Byte,
+    var filled : Int,
+    var length : Int,
+    var schedule : Array Int,
+}
+
+fun new() -> SHA256 = SHA256 {
+    state = initialState(),
+    block = Array.filled(64, Byte.truncate(0)),
+    filled = 0,
+    length = 0,
+    schedule = Array.filled(64, 0),
+}
+
+-- Feed `bytes` from index `from` up to, not including, `to`.
+fun update(h : SHA256, bytes : Array Byte, from : Int, to : Int) -> Unit {
+    let block = h.block
+    var at = from
+    if h.filled > 0 {
+        while at < to && h.filled < 64 {
+            block[h.filled] = bytes[at]
+            h.filled = h.filled + 1
+            at = at + 1
+        }
+        if h.filled == 64 {
+            compress(h, block, 0)
+            h.filled = 0
+        }
+    }
+    -- Whole blocks are compressed straight from the caller's bytes.
+    while to - at >= 64 {
+        compress(h, bytes, at)
+        at = at + 64
+    }
+    while at < to {
+        block[h.filled] = bytes[at]
+        h.filled = h.filled + 1
+        at = at + 1
+    }
+    h.length = h.length + (to - from)
+}
+
+-- Feed the UTF-8 bytes of `s`.
+fun updateText(h : SHA256, s : String) -> Unit {
+    let bytes = String.toBytes(s)
+    update(h, bytes, 0, len(bytes))
+}
+
+-- The 32-byte digest of everything fed so far. `h` is left as it was, so more
+-- input may follow and `finish` may be asked again.
+fun finish(h : SHA256) -> Array Byte {
+    let work = SHA256 {
+        state = Array.slice(h.state, 0, 8),
+        block = Array.slice(h.block, 0, 64),
+        filled = h.filled,
+        length = h.length,
+        schedule = h.schedule,
+    }
+    let block = work.block
+    -- The padding is a single 1 bit, zeros up to 56 mod 64, then the message
+    -- length in bits as a 64-bit big-endian integer. When the bytes already
+    -- in the block leave fewer than 9 free, the length needs a second block.
+    block[work.filled] = Byte.truncate(0x80)
+    work.filled = work.filled + 1
+    if work.filled > 56 {
+        for var i = work.filled; i < 64; i = i + 1 { block[i] = Byte.truncate(0) }
+        compress(work, block, 0)
+        work.filled = 0
+    }
+    for var i = work.filled; i < 56; i = i + 1 { block[i] = Byte.truncate(0) }
+    Byte.putBE(block, 56, 8, work.length * 8)
+    compress(work, block, 0)
+
+    let out = Array.filled(32, Byte.truncate(0))
+    for var i = 0; i < 8; i = i + 1 {
+        Byte.putBE(out, 4 * i, 4, work.state[i])
+    }
+    out
+}
+
+fun rotr(x : Int, n : Int) -> Int =
+    Int.and(Int.or(Int.shr(x, n), Int.shl(x, 32 - n)), mask)
+
+-- Fold the 64 bytes at `src[at..]` into the state (FIPS 180-4, 6.2.2).
+fun compress(h : SHA256, src : Array Byte, at : Int) -> Unit {
+    let w = h.schedule
+    for var t = 0; t < 16; t = t + 1 {
+        w[t] = Byte.getBE(src, at + 4 * t, 4)
+    }
+    for var t = 16; t < 64; t = t + 1 {
+        let x = w[t - 15]
+        let y = w[t - 2]
+        let s0 = Int.xor(Int.xor(rotr(x, 7), rotr(x, 18)), Int.shr(x, 3))
+        let s1 = Int.xor(Int.xor(rotr(y, 17), rotr(y, 19)), Int.shr(y, 10))
+        w[t] = Int.and(w[t - 16] + s0 + w[t - 7] + s1, mask)
+    }
+
+    let st = h.state
+    var a = st[0]
+    var b = st[1]
+    var c = st[2]
+    var d = st[3]
+    var e = st[4]
+    var f = st[5]
+    var g = st[6]
+    var hh = st[7]
+    for var t = 0; t < 64; t = t + 1 {
+        let s1 = Int.xor(Int.xor(rotr(e, 6), rotr(e, 11)), rotr(e, 25))
+        let ch = Int.xor(Int.and(e, f), Int.and(Int.xor(e, mask), g))
+        let t1 = Int.and(hh + s1 + ch + roundConstants[t] + w[t], mask)
+        let s0 = Int.xor(Int.xor(rotr(a, 2), rotr(a, 13)), rotr(a, 22))
+        let maj = Int.xor(Int.xor(Int.and(a, b), Int.and(a, c)), Int.and(b, c))
+        let t2 = s0 + maj
+        hh = g
+        g = f
+        f = e
+        e = Int.and(d + t1, mask)
+        d = c
+        c = b
+        b = a
+        a = Int.and(t1 + t2, mask)
+    }
+
+    st[0] = Int.and(st[0] + a, mask)
+    st[1] = Int.and(st[1] + b, mask)
+    st[2] = Int.and(st[2] + c, mask)
+    st[3] = Int.and(st[3] + d, mask)
+    st[4] = Int.and(st[4] + e, mask)
+    st[5] = Int.and(st[5] + f, mask)
+    st[6] = Int.and(st[6] + g, mask)
+    st[7] = Int.and(st[7] + hh, mask)
+}
+
+-- Lowercase hexadecimal, two digits a byte.
+fun hex(digest : Array Byte) -> String {
+    let digits = ["0", "1", "2", "3", "4", "5", "6", "7",
+                  "8", "9", "a", "b", "c", "d", "e", "f"]
+    var out = ""
+    for var i = 0; i < len(digest); i = i + 1 {
+        let n = Byte.toInt(digest[i])
+        out = out + digits[Int.shr(n, 4)] + digits[Int.and(n, 15)]
+    }
+    out
+}
+
+fun ofBytes(bytes : Array Byte) -> String {
+    let h = new()
+    update(h, bytes, 0, len(bytes))
+    hex(finish(h))
+}
+
+fun ofText(s : String) -> String {
+    let h = new()
+    updateText(h, s)
+    hex(finish(h))
+}

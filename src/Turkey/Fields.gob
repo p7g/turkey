@@ -9,8 +9,10 @@ module Turkey.Fields (forward)
 -- function, not by a callee it passes the object to. So no store, call or
 -- collection in between can make the load answer anything else.
 --
--- Only between equal representations: a load at another representation than
--- the value was stored at is a reinterpretation, and that is the point of it.
+-- Only between equal representations, from where the field is: a load at
+-- another representation than the value was stored at is a reinterpretation,
+-- and that is the point of it, and a load at another offset than the
+-- object's layout gives the field reads some other field.
 --
 -- The loads are left in place, reading nothing anyone needs, and dead code
 -- elimination takes them -- and then the allocation, if every read of it was
@@ -19,6 +21,7 @@ module Turkey.Fields (forward)
 -- replaces was not, so it is safe before the giblets check.
 
 import Turkey.LowIr as L
+import Turkey.Runtime as Rt
 import Turkey.LowIr (Op(..), Low(..))
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), Term(..))
@@ -27,8 +30,8 @@ fun forward(f : Ssa.Func Low) -> Unit {
     let count = len(f.reps)
     -- The value each forwarded load stands for, or -1.
     let alias = Array.filled(count, -1)
-    -- The fields and mutable mask of each `ObjectNew`, by its result.
-    let built : Array (Option (Array Value, Int)) = Array.filled(count, None)
+    -- The layout, fields and mutable mask of each `ObjectNew`, by its result.
+    let built : Array (Option (Rt.Layout, Array Value, Int)) = Array.filled(count, None)
     var found = False
     let resolve = fun(v : Value) -> Value {
         var id = Ssa.valueId(v)
@@ -40,18 +43,21 @@ fun forward(f : Ssa.Func Low) -> Unit {
     for block in f.blocks {
         for i in block.insts {
             match i.op {
-                ObjectNew(_, _, _, fields, mutable) -> {
-                    built[Ssa.valueId(i.result)] = Some((fields, mutable))
+                ObjectNew(_, _, layout, fields, mutable) -> {
+                    built[Ssa.valueId(i.result)] = Some((layout, fields, mutable))
                 }
-                ObjectGet(object, index) -> match built[Ssa.valueId(resolve(object))] {
-                    Some((fields, mutable)) ->
-                        if index < len(fields) && Int.and(Int.shr(mutable, index), 1) == 0 {
+                ObjectGet(object, field) -> match built[Ssa.valueId(resolve(object))] {
+                    Some((layout, fields, mutable)) -> {
+                        let index = field.index
+                        if index < len(fields) && Int.and(Int.shr(mutable, index), 1) == 0
+                                && Rt.fieldOffset(layout, index) == field.offset {
                             let v = resolve(fields[index])
                             if Ssa.repOf(f, v) == Ssa.repOf(f, i.result) {
                                 alias[Ssa.valueId(i.result)] = Ssa.valueId(v)
                                 found = True
                             }
                         }
+                    }
                     None -> {}
                 }
                 _ -> {}

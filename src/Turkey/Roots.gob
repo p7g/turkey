@@ -33,6 +33,7 @@ import Data.Set as Set
 import Turkey.Escape as Escape
 import Turkey.LowIr as L
 import Turkey.LowIr (Op(..), Low(..), Callee(..))
+import Turkey.Runtime as Rt
 import Turkey.Ssa as Ssa
 import Turkey.Ssa (Value(..), BlockId(..), Rep(..), RepClass(..), Func(..))
 
@@ -54,14 +55,15 @@ type Frame = Frame {
     held : Map String (Array Int),
 }
 
--- An object in the frame: the value that is its address, its size in words
--- (the three header words, then the fields), and which fields are traced.
+-- An object in the frame: the value that is its address, its size in bytes
+-- (`Turkey.Runtime.objectBytes`: its header and its fields), and where its
+-- traced fields are, in bytes from its address.
 --
 -- `zeroed` says its traced fields must be cleared on entry: some path reads
 -- its slot before building it -- the head of a loop, holding the previous
 -- iteration's object in a phi that holds something else on the way in -- and
 -- on that path the collector would read whatever the stack held as pointers.
-type FrameObject = FrameObject { id : Int, words : Int, traced : Vec Int, var zeroed : Bool }
+type FrameObject = FrameObject { id : Int, bytes : Int, traced : Vec Int, var zeroed : Bool }
 
 fun key(b : Int, n : Int) -> String = Int.toString(b) + ":" + Int.toString(n)
 
@@ -127,29 +129,26 @@ fun analyze(f : Func Low) -> Frame {
             held = held }
 }
 
--- The frame objects, in instruction order, with their traced fields: those
--- whose operand is traced, which is the representation the object's metadata
--- was built from. A closure shell is two words, code then environment, and
--- only the environment is traced.
+-- The frame objects, in instruction order, with their traced fields: the
+-- last `pointers` words of the object, which its layout puts there.
+-- A closure shell is laid out as `Turkey.Runtime.closureShell`, and only the
+-- environment is traced.
 fun objectsOf(f : Func Low) -> (Vec FrameObject, Map Int Int) {
     let out = []
     let index = Map.new()
     for block in f.blocks {
         for i in block.insts {
             let made = match i.op {
-                StackObject(_, _, _, fields) -> {
-                    let traced = []
-                    for var k = 0; k < len(fields); k = k + 1 {
-                        if Ssa.repOf(f, fields[k]).traced { Vec.push(traced, k) }
-                    }
-                    Some(FrameObject { id = Ssa.valueId(i.result),
-                                       words = 3 + len(fields), traced = traced,
-                                       zeroed = False })
-                }
+                StackObject(_, _, layout, _) -> Some(FrameObject {
+                    id = Ssa.valueId(i.result), bytes = Rt.objectBytes(layout),
+                    traced = Vec.fromArray(Array.init(layout.pointers, fun(k) =
+                        Rt.objectBytes(layout) - 8 * (layout.pointers - k))),
+                    zeroed = False,
+                })
                 StackClosure(_, environment) -> Some(FrameObject {
-                    id = Ssa.valueId(i.result), words = 5,
+                    id = Ssa.valueId(i.result), bytes = Rt.objectBytes(Rt.closureShell),
                     traced = match environment {
-                        Some(_) -> [1]
+                        Some(_) -> [Rt.fieldOffset(Rt.closureShell, Rt.closureEnvironment)]
                         None -> []
                     },
                     zeroed = False,

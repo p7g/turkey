@@ -2,14 +2,14 @@
 # Build the compiler from the committed bootstrap, with no Python involved.
 #
 #   stage1  the committed assembly (bootstrap/), linked
-#   stage2  stage1 compiling today's source, linked -- the result
+#   stage2  stage1 compiling today's source to an object, linked -- the result
 #   stage3  stage2 compiling the same source             (--fixpoint only)
-#   stage4  stage3's output, which must equal stage3's   (--fixpoint only)
+#   stage4  stage3's object, which must equal stage3's   (--fixpoint only)
 #
 # Stage N is built by stage N-1. stage2 is today's source compiled by the
 # committed compiler: correct if that one is, but its code is whatever an older
 # compiler emitted. stage3 is today's source compiled by today's source, and the
-# fixed point is that stage3 emits exactly the assembly it was built from.
+# fixed point is that stage3 emits exactly the object it was built from.
 #
 # The compiler reads lib/ relative to the working directory, so every stage runs
 # from the repository root.
@@ -29,9 +29,9 @@
 # Nothing here asks what the host is: under qemu-user an x86-64 Linux machine
 # builds and runs the arm64 Linux compiler, with $TURKEY_CC a cross compiler.
 #
-# Each stage's assembly is the whole program, the runtime included -- the
+# Each stage's object is the whole program, the runtime included -- the
 # collector, the allocator and the panic state are Turkey in lib/, compiled in
-# with everything else -- so a stage is linked from its assembly alone, against
+# with everything else -- so a stage is linked from its object alone, against
 # nothing but the C library.
 #
 # Measured on arm64 macOS, Apple clang 17: 128 s for stage2, 376 s with
@@ -142,11 +142,19 @@ sha() {
     fi
 }
 
-# The compiler's own source, compiled by $1, into $2.
+# The compiler's own source, compiled by $1, into $2: an object file, which
+# every stage after the first is linked from, so that the C compiler's
+# assembler runs only on the committed assembly.
 emit() {
     step "$(basename "$1") $SOURCE -> $(basename "$2")"
-    $RUN "$1" build -o - -f asm --target "$target" "$SOURCE" > "$2.tmp"
+    $RUN "$1" build -o "$2.tmp" -f obj --target "$target" "$SOURCE"
     mv "$2.tmp" "$2"
+}
+
+# The same, as assembly on standard output: for saying where two stages
+# differ, since an object's first differing byte names no line.
+assembly() {
+    $RUN "$1" build -o - -f asm --target "$target" "$SOURCE"
 }
 
 link() {
@@ -178,16 +186,19 @@ else
     rm "$out/stage1.s"
 fi
 
-emit "$out/stage1" "$out/stage2.s"
-link "$out/stage2.s" "$out/stage2"
+emit "$out/stage1" "$out/stage2.o"
+link "$out/stage2.o" "$out/stage2"
 
 if [ $fixpoint = 1 ]; then
-    emit "$out/stage2" "$out/stage3.s"
-    link "$out/stage3.s" "$out/stage3"
-    emit "$out/stage3" "$out/stage4.s"
-    step "compare stage3.s stage4.s"
-    if ! difference=$(cmp "$out/stage3.s" "$out/stage4.s"); then
-        echo "build.sh: no fixpoint: $difference" >&2
+    emit "$out/stage2" "$out/stage3.o"
+    link "$out/stage3.o" "$out/stage3"
+    emit "$out/stage3" "$out/stage4.o"
+    step "compare stage3.o stage4.o"
+    if ! cmp -s "$out/stage3.o" "$out/stage4.o"; then
+        assembly "$out/stage2" > "$out/stage3.s"
+        assembly "$out/stage3" > "$out/stage4.s"
+        difference=$(cmp "$out/stage3.s" "$out/stage4.s")
+        echo "build.sh: no fixpoint: ${difference:-the objects differ, the assembly does not}" >&2
         line=${difference##* line }
         case $line in *[!0-9]*|'') ;; *)
             echo "  stage3: $(sed -n "${line}p" "$out/stage3.s")" >&2

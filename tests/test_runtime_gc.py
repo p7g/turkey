@@ -88,7 +88,7 @@ typedef struct TurkeyObject {
     int32_t kind;
     int32_t tag;
     int64_t count;
-    uint64_t pointer_bitmap;
+    uint64_t descriptor;
     uint64_t slots[];
 } TurkeyObject;
 
@@ -200,7 +200,7 @@ typedef struct TurkeyObject {
     int32_t kind;
     int32_t tag;
     int64_t count;
-    uint64_t pointer_bitmap;
+    uint64_t descriptor;
     uint64_t slots[];
 } TurkeyObject;
 
@@ -235,8 +235,8 @@ static void *array_holding(int32_t code, void *s) {
 }
 
 static void *object_holding(int32_t code, void *s) {
-    /* One slot, so the three-bit metadata is the code itself. */
-    TurkeyObject *o = turkey_object_new(0, 0, 1, (uint64_t)code);
+    /* One word of fields, traced if the descriptor counts it. */
+    TurkeyObject *o = turkey_object_new(0, 0, 8, code == 7 ? 1 : 0);
     o->slots[0] = (uint64_t)(uintptr_t)s;
     return o;
 }

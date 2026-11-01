@@ -26,8 +26,8 @@ void turkey_panic_clear(void);
 /* Turkey.Alloc. A `String` is a byte array, so it is `void *`. */
 void *turkey_string_new(const unsigned char *bytes, int64_t length);
 void *turkey_cell_new(uint64_t value, int64_t pointer_value);
-void *turkey_object_new(int64_t kind, int64_t tag, int64_t count,
-                        uint64_t pointer_bitmap);
+void *turkey_object_new(int64_t kind, int64_t tag, int64_t bytes,
+                        int64_t pointers);
 void *turkey_array_new(int64_t length, uint64_t initial, int64_t element_width,
                        int64_t element_layout);
 void *turkey_closure_shell(uint64_t code);

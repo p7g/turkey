@@ -25,7 +25,7 @@ typedef struct TurkeyObject {
     int32_t kind;
     int32_t tag;
     int64_t count;
-    uint64_t pointer_bitmap;
+    uint64_t descriptor;
     uint64_t slots[];
 } TurkeyObject;
 static int64_t string_length(void *s) { return ((TurkeyObject *)s)->count; }
@@ -61,14 +61,14 @@ int main(void) {
     assert(sizeof(TurkeyCell) == 16);
     assert(sizeof(TurkeyObject) == 24);
 
-    held[0] = turkey_object_new(0, -1, 21, 0);
+    held[0] = turkey_object_new(0, -1, 168, 0);
     TurkeyObject *object = held[0];
-    assert(object->kind == 0 && object->tag == -1 && object->count == 21);
-    assert(object->pointer_bitmap == 0);
+    assert(object->kind == 0 && object->tag == -1 && object->count == 168);
+    assert(object->descriptor == 0);
     for (int i = 0; i < 21; i++) assert(object->slots[i] == 0);
-    held[1] = turkey_object_new(4, -1, 63, UINT64_MAX);
+    held[1] = turkey_object_new(4, -1, 504, 63);
     object = held[1];
-    assert(object->pointer_bitmap == UINT64_MAX);
+    assert(object->descriptor == 63);
     for (int i = 0; i < 63; i++) assert(object->slots[i] == 0);
     held[2] = turkey_object_new(1, 123, 0, 0);
     assert(((TurkeyObject *)held[2])->count == 0);
@@ -81,7 +81,7 @@ int main(void) {
             held[slot] = turkey_array_new(3, bits, width, 6);
             TurkeyObject *array = held[slot++];
             assert(array->kind == 2 && array->tag == 6 && array->count == 3);
-            assert(array->pointer_bitmap == (uint64_t)width);
+            assert(array->descriptor == (uint64_t)width);
             for (int i = 0; i < 3; i++) {
                 uint64_t actual = 0;
                 memcpy(&actual, (unsigned char *)array->slots + i * width, width);
@@ -101,8 +101,8 @@ int main(void) {
     assert(((TurkeyCell *)held[13])->pointer_value == 0);
     held[15] = turkey_closure_shell(UINT64_C(0xabcdef1234567890));
     object = held[15];
-    assert(object->kind == 3 && object->tag == -1 && object->count == 2);
-    assert(object->pointer_bitmap == 2);
+    assert(object->kind == 3 && object->tag == -1 && object->count == 16);
+    assert(object->descriptor == 1);
     assert(object->slots[0] == UINT64_C(0xabcdef1234567890));
     assert(object->slots[1] == 0);
     unsigned char bytes[] = {'a', 0, 'b'};
@@ -119,9 +119,11 @@ int main(void) {
     assert(memcmp(string_bytes((void *)(uintptr_t)object->slots[2]), "a\0b", 3) == 0);
     assert(!turkey_has_panicked);
 
-    assert(turkey_object_new(0, 0, 22, 0) == NULL);
+    assert(turkey_object_new(0, 0, 12, 0) == NULL);
     panic_is("invalid object size");
-    assert(turkey_object_new(4, 0, 64, 0) == NULL);
+    assert(turkey_object_new(4, 0, 8, 2) == NULL);
+    panic_is("invalid object size");
+    assert(turkey_object_new(2, 0, 8, 0) == NULL);
     panic_is("invalid object size");
     assert(turkey_object_new(4, 0, -1, 0) == NULL);
     panic_is("invalid object size");

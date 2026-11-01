@@ -70,6 +70,7 @@ import Turkey.Output as Output
 import Turkey.Scan as Scan
 import Turkey.Scheduler as Scheduler
 import Turkey.Sys as Sys
+import Turkey.Wait as Wait
 
 -- What `System.IO.stdout()` answers: the tasks waiting for the lock. The rest
 -- of the state is the block's.
@@ -173,14 +174,21 @@ fun makeRoom() -> Unit {
     drain(if end > 0 { end } else { Output.held() })
 }
 
--- Write out the first `n` bytes held. A descriptor that answers `EAGAIN` lets
--- other tasks run before it is asked again.
+-- Write out the first `n` bytes held. A descriptor that answers `EAGAIN` is
+-- waited for without holding a worker (`Turkey.Wait`) before it is asked
+-- again.
 fun drain(n : Int) -> Unit {
     var left = Output.drain(n)
     while left > 0 {
-        Scheduler.yield()
+        waitWritable()
         left = Output.drain(left)
     }
+}
+
+-- Descriptor 1 answered `EAGAIN`: park until it is writable. If the poller
+-- cannot watch it, let other tasks run and try again.
+fun waitWritable() -> Unit {
+    if Wait.writable(1, -1) != 0 { Scheduler.yield() }
 }
 
 -- `bytes[from..to)` straight to descriptor 1, past the buffer, for text at
@@ -192,7 +200,7 @@ fun writeOut(bytes : Array Byte, from : Int, to : Int) -> Unit {
     while at < to {
         let n = IO.write(1, bytes, at, to)
         if n == -Sys.eagain() {
-            Scheduler.yield()
+            waitWritable()
         } else if n != -Sys.eintr {
             if n <= 0 {
                 Output.noteFailure(if n == 0 { -Sys.eio } else { n })

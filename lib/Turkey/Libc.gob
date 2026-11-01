@@ -9,6 +9,7 @@ module Turkey.Libc (
     pthreadCreate, pthreadJoin, signal, exitNow, exit,
     osSyncWaitOnAddress, osSyncWakeByAddressAny, osSyncWakeByAddressAll, syscall,
     schedYield, usleep,
+    kqueue, kevent, epollCreate1, epollCtl, epollWait, eventfd, waitpid,
 )
 
 -- The C symbols this system cannot avoid.
@@ -307,3 +308,47 @@ foreign "_exit" fun exitNow(status : Int) -> Unit
 foreign "exit" fun exit(status : Int) -> Unit
 
 foreign "sqrt" fun sqrt(x : Float) -> Float
+
+-- -- readiness ------------------------------------------------------------------------
+--
+-- Darwin's `kqueue` and Linux's `epoll` (with `eventfd`, which wakes it), each
+-- named in its own arm of a match on `Target.os` (`Turkey.Workers`); a
+-- program built for the other target never looks the symbols up. Each
+-- answers a C `int`, read through `Turkey.Sys.cInt`, with `errno` set on -1.
+
+-- A new kernel event queue: a descriptor, or -1. Darwin only.
+foreign "kqueue" fun kqueue() -> Int
+
+-- Apply the `nchanges` `struct kevent`s at `changes` to the queue `kq`, then
+-- wait for events, storing up to `nevents` at `events`: how many were stored,
+-- 0 when `timeout` -- a `struct timespec`, or null to wait without limit --
+-- ran out, or -1. A change that is rejected is stored as an event with
+-- `EV_ERROR` set when there is room for it, and fails the call when there is
+-- not. Darwin only.
+foreign "kevent" fun kevent(kq : Int, changes : Prim.Ptr, nchanges : Int, events : Prim.Ptr,
+                            nevents : Int, timeout : Prim.Ptr) -> Int
+
+-- A new epoll instance, with `flags` `EPOLL_CLOEXEC` or 0. Linux only.
+foreign "epoll_create1" fun epollCreate1(flags : Int) -> Int
+
+-- Add, change or remove descriptor `fd`'s interest in the epoll instance
+-- `epfd`, as `operation` says (`EPOLL_CTL_*`); `event` is a `struct
+-- epoll_event`, read for an add or a change and not for a removal, which
+-- older kernels still want non-null. 0 or -1. Linux only.
+foreign "epoll_ctl" fun epollCtl(epfd : Int, operation : Int, fd : Int, event : Prim.Ptr) -> Int
+
+-- Wait at most `timeout` milliseconds, or without limit when it is -1, for up
+-- to `maxEvents` events, stored as `struct epoll_event`s at `events`: how many
+-- were stored, 0 when the time ran out, or -1. Linux only.
+foreign "epoll_wait" fun epollWait(epfd : Int, events : Prim.Ptr, maxEvents : Int,
+                                   timeout : Int) -> Int
+
+-- A counter that is a descriptor, starting at `initial`; readable while it is
+-- not zero, and a read of eight bytes resets it. `flags` are `EFD_*`. Linux
+-- only.
+foreign "eventfd" fun eventfd(initial : Int, flags : Int) -> Int
+
+-- Wait for a child to change state, or with `WNOHANG` in `options` only ask:
+-- the pid it reaped, 0 if `WNOHANG` found it still running, or -1. `status`
+-- gets the wait status. A C `int`.
+foreign "waitpid" fun waitpid(pid : Int, status : Prim.Ptr, options : Int) -> Int

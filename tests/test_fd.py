@@ -149,12 +149,10 @@ fun main() {
     assert out == [str(256 * 4096), str(sum(range(256)) * 4096)]
 
 
-def test_close_racing_a_blocked_read_does_not_release_the_number(tmp_path):
-    """A read is blocked in the kernel on an empty FIFO when another task
-    closes its `FD`. The number stays the FIFO's until the read finishes: a
-    new descriptor gets another number, and a write through the old one
-    reaches the read. The read's next call answers `closed`, and its release
-    closes the number."""
+def test_close_ends_a_read_parked_on_an_empty_fifo_and_the_number_is_released_after(tmp_path):
+    """A read is parked on an empty FIFO (the descriptor is waited for, not
+    read blocking) when another task closes its `FD`. The read answers
+    `closed` and its release closes the number."""
     os.mkfifo(tmp_path / "fifo")
     out = lines("""
 fun main() {
@@ -168,17 +166,13 @@ fun main() {
             let into = Array.filled(16, Byte.truncate(0))
             let first = FD.read(f, into, 0, 16)
             let second = FD.read(f, into, 0, 16)
-            (first, second == FD.closed)
+            (first == FD.closed, second == FD.closed)
         })?
         let closer = Task.spawn(fun() {
             while Sync.load(started) == 0 { Task.yield() }
-            -- Long enough for the reader to be inside read(2).
             let clock = Stopwatch.start()
             while Stopwatch.elapsed(clock) < Duration.millis(200) {}
-            let closing = FD.close(f)
-            let other = IO.open("fifo", Sys.readWrite, 0)
-            let wrote = IO.write(number, bytes("ping"), 0, 4)
-            (closing, other != number, wrote)
+            FD.close(f)
         })?
         pure((Task.join(reader), Task.join(closer)))
     })
@@ -186,11 +180,11 @@ fun main() {
     print(IO.fcntl(number, Sys.getDescriptorFlags) == -Sys.ebadf)
 }
 """, tmp_path, "4")
-    assert out == ["((4, True), (0, True, 4))", "True"]
+    assert out == ["((True, True), 0)", "True"]
 
 
 def test_a_task_waiting_for_a_lock_is_woken_by_close(tmp_path):
-    """One task holds the read lock, blocked on an empty FIFO; a second waits
+    """One task holds the read lock, parked on an empty FIFO; a second waits
     for the lock, suspended. Closing wakes the second, which answers
     `closed` without reading."""
     os.mkfifo(tmp_path / "fifo")
@@ -216,13 +210,11 @@ fun main() {
             while Sync.load(started) == 0 { Task.yield() }
             let clock = Stopwatch.start()
             while Stopwatch.elapsed(clock) < Duration.millis(300) {}
-            let closing = FD.close(f)
-            let _ = IO.write(number, bytes("ping"), 0, 4)
-            closing
+            FD.close(f)
         })?
-        pure((Task.join(holder), Task.join(waiter), Task.join(closer)))
+        pure((Task.join(holder) == FD.closed, Task.join(waiter), Task.join(closer)))
     })
     print(results)
 }
 """, tmp_path, "4")
-    assert out == ["(4, True, 0)"]
+    assert out == ["(True, True, 0)"]

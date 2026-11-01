@@ -265,6 +265,29 @@ To compute with a byte, convert it to an `Int` with `Byte.toInt`.
 range, and `Byte.truncate(n)` keeps the low eight bits. There is no byte
 literal.
 
+An integer stored in several bytes, as in a file format, is read with
+`Byte.getLE(bytes, at, width)` or `Byte.getBE` and written with
+`Byte.putLE(bytes, at, width, n)` or `Byte.putBE`: least significant byte
+first, or most significant first, for a `width` from 1 to 8. They work on an
+`Array Byte` or a `Vec Byte`.
+
+<!-- run -->
+```kotlin
+fun main() {
+    let header = Array.filled(4, Byte.truncate(0))
+    Byte.putLE(header, 0, 4, 0xFEEDFACF)
+    print(Byte.toInt(header[0]))
+    print(Byte.getBE(header, 0, 2))
+    print(Byte.getLE(header, 0, 4) == 0xFEEDFACF)
+}
+```
+
+```text
+207
+53242
+True
+```
+
 ### Char
 
 A `Char` is one Unicode scalar value: a code point from `0` to `10FFFF`,

@@ -1,13 +1,15 @@
 export (
-    Builder, Capture, Captures, Resolve(..), Combining(..),
-    literal, satisfy, capture, choice, orElse, optional, many, some, fullMatch,
+    Builder, Pattern, Capture, Captures, Resolve(..), Combining(..),
+    literal, satisfy, capture, choice, orElse, optional, many, some, compile, fullMatch,
+    fullMatchWithin, defaultBudget,
 )
 
--- Construction is eager: bind joins materialized Thompson NFA fragments.
--- Capture values are recipes evaluated only after a successful full match.
+-- A `Builder` describes a pattern, `compile` assembles one into a `Pattern`,
+-- and `fullMatch` runs a `Pattern` against a whole string. Capture values are
+-- recipes, evaluated only after a successful match.
 -- See examples/regex/README.md for semantics, examples, and current limits.
 
-import System.Sync as Sync
+import Data.BitSet as BitSet
 
 type Instruction
     = Consume(fun(Char) -> Bool)
@@ -16,47 +18,58 @@ type Instruction
     | Open(Int)
     | Close(Int)
 
-type Builder a = Builder { code : Vec Instruction, value : a }
+-- What a builder writes into: the instructions so far, at their final
+-- positions, and the next unused tag.
+--
+-- `quiet` counts the `capture`s around the builder running now. A capture
+-- keeps the text it spans and throws away the recipe of what is inside it,
+-- so the scopes inside one would never be read, and are not written.
+type Assembly = Assembly { code : Vec Instruction, var tags : Int, var quiet : Int }
+
+-- A builder runs once for every place it is used in a pattern, so each use
+-- gets its own tags and its own recipes. That is what lets one fragment
+-- appear twice in a pattern and resolve each time to its own match.
+type Builder a = Builder(fun(Assembly) -> a)
+
+type Pattern a = Pattern { code : Array Instruction, value : a }
+
 type Capture a = Capture(fun(Captures) -> a)
 type Captures = Captures { text : String, nodes : Vec Node }
 type Node = Node {
     tag : Int, start : String.Index, end : String.Index, children : Vec Node
 }
 
--- Capture tags are unique across the process, not only within one pattern:
--- a recipe holds the tags of the fragments it reads, and a fragment can be
--- composed into any number of patterns after it is built. The counter is
--- atomic so that tasks can build patterns at the same time.
-let supply : Sync.AtomicInt = Sync.atomicInt(0)
+fun run(Builder(build) : Builder a, asm : Assembly) -> a = build(asm)
 
-fun fresh() -> Int = Sync.addAndGet(supply, 1)
+fun here(asm : Assembly) -> Int = len(asm.code)
 
-fun shifted(inst : Instruction, offset : Int) -> Instruction = match inst {
-    Jump(pc) -> Jump(pc + offset)
-    Split(a, b) -> Split(a + offset, b + offset)
-    _ -> inst
+fun emit(asm : Assembly, inst : Instruction) -> Unit = Vec.push(asm.code, inst)
+
+fun fresh(asm : Assembly) -> Int {
+    let tag = asm.tags
+    asm.tags = tag + 1
+    tag
 }
 
-fun appendCode(left : Vec Instruction, right : Vec Instruction) -> Vec Instruction {
-    let out = Vec.new(len(left) + len(right))
-    for inst in left { Vec.push(out, inst) }
-    for inst in right { Vec.push(out, shifted(inst, len(left))) }
-    out
+-- `body` inside the scope `tag`, unless a capture around it makes the scope
+-- unreadable.
+fun scoped(asm : Assembly, tag : Int, body : Builder a) -> a {
+    if asm.quiet == 0 { emit(asm, Open(tag)) }
+    let value = run(body, asm)
+    if asm.quiet == 0 { emit(asm, Close(tag)) }
+    value
 }
 
 instance Functor Builder {
-    fun map(b, f) = Builder { code = b.code, value = f(b.value) }
+    fun map(b, f) = Builder(fun(asm) = f(run(b, asm)))
 }
 
 instance Applicative Builder {
-    fun pure(x) = Builder { code = [], value = x }
+    fun pure(x) = Builder(fun(asm) = x)
 }
 
 instance Monad Builder {
-    fun bind(b, f) {
-        let next = f(b.value)
-        Builder { code = appendCode(b.code, next.code), value = next.value }
-    }
+    fun bind(b, f) = Builder(fun(asm) = run(f(run(b, asm)), asm))
 }
 
 instance Functor Capture {
@@ -104,21 +117,8 @@ instance Resolve Unit {
     fun resolve(value, captures) = ()
 }
 
-fun scopedCode(code : Vec Instruction, tag : Int) -> Vec Instruction {
-    let out = [Open(tag)]
-    for inst in code {
-        Vec.push(out, shifted(inst, 1))
-    }
-    Vec.push(out, Close(tag))
-    out
-}
-
 fun findNode(captures : Captures, tag : Int) -> Option Node {
-    -- Sequential reuse of the same handle means the last occurrence wins.
-    var i = len(captures.nodes)
-    while i > 0 {
-        i = i - 1
-        let node = captures.nodes[i]
+    for node in captures.nodes {
         if node.tag == tag { return Some(node) }
     }
     None
@@ -131,60 +131,59 @@ fun nested(captures : Captures, node : Node) -> Captures =
     Captures { text = captures.text, nodes = node.children }
 
 -- Capture the complete text of a fragment, ignoring its extraction recipe.
-fun capture(body : Builder a) -> Builder (Capture String) {
-    let tag = fresh()
-    Builder {
-        code = scopedCode(body.code, tag)
-        value = Capture(fun(captures) {
-            let node = requiredNode(captures, tag)
-            String.slice(captures.text, node.start, node.end)
-        })
-    }
-}
+fun capture(body : Builder a) -> Builder (Capture String) = Builder(fun(asm) {
+    let tag = fresh(asm)
+    if asm.quiet == 0 { emit(asm, Open(tag)) }
+    asm.quiet = asm.quiet + 1
+    let _ = run(body, asm)
+    asm.quiet = asm.quiet - 1
+    if asm.quiet == 0 { emit(asm, Close(tag)) }
+    Capture(fun(captures) {
+        let node = requiredNode(captures, tag)
+        String.slice(captures.text, node.start, node.end)
+    })
+})
 
-fun literal(text : String) -> Builder (Capture String) {
-    let code = []
+-- A literal's text is known without a scope: when the match succeeds, it is
+-- the text that matched.
+fun literal(text : String) -> Builder (Capture String) = Builder(fun(asm) {
     for c in String.codePoints(text) {
-        Vec.push(code, Consume(_ == c))
+        emit(asm, Consume(_ == c))
     }
-    capture(Builder { code = code, value = () })
-}
+    pure(text)
+})
 
-fun satisfy(predicate : fun(Char) -> Bool) -> Builder (Capture Char) {
-    let tag = fresh()
-    Builder {
-        code = scopedCode([Consume(predicate)], tag),
-        value = Capture(fun(captures) {
-            let node = requiredNode(captures, tag)
-            if let Some(c) = String.decode(captures.text, node.start) {
-                c
-            } else {
-                error("Regex: missing character in successful capture")
-            }
-        })
-    }
-}
-
-fun choiceCode(left : Vec Instruction, right : Vec Instruction) -> Vec Instruction {
-    let out = [Split(1, len(left) + 2)]
-    for inst in left { Vec.push(out, shifted(inst, 1)) }
-    Vec.push(out, Jump(len(left) + len(right) + 2))
-    for inst in right { Vec.push(out, shifted(inst, len(left) + 2)) }
-    out
-}
+fun satisfy(predicate : fun(Char) -> Bool) -> Builder (Capture Char) = Builder(fun(asm) {
+    let tag = fresh(asm)
+    scoped(asm, tag, Builder(fun(asm) = emit(asm, Consume(predicate))))
+    Capture(fun(captures) {
+        let node = requiredNode(captures, tag)
+        if let Some(c) = String.decode(captures.text, node.start) {
+            c
+        } else {
+            error("Regex: missing character in successful capture")
+        }
+    })
+})
 
 fun choice[Resolve a, Resolve b](left : Builder a, right : Builder b)
-        -> Builder (Capture (Either (Output a) (Output b))) {
-    let leftTag = fresh()
-    let rightTag = fresh()
-    Builder {
-        code = choiceCode(scopedCode(left.code, leftTag), scopedCode(right.code, rightTag)),
-        value = Capture(fun(captures) = match findNode(captures, leftTag) {
-            Some(node) -> Left(resolve(left.value, nested(captures, node)))
-            None -> Right(resolve(right.value, nested(captures, requiredNode(captures, rightTag))))
-        })
-    }
-}
+        -> Builder (Capture (Either (Output a) (Output b))) = Builder(fun(asm) {
+    let leftTag = fresh(asm)
+    let rightTag = fresh(asm)
+    let split = here(asm)
+    emit(asm, Split(0, 0))
+    let l = scoped(asm, leftTag, left)
+    let jump = here(asm)
+    emit(asm, Jump(0))
+    let rightStart = here(asm)
+    let r = scoped(asm, rightTag, right)
+    asm.code[split] = Split(split + 1, rightStart)
+    asm.code[jump] = Jump(here(asm))
+    Capture(fun(captures) = match findNode(captures, leftTag) {
+        Some(node) -> Left(resolve(l, nested(captures, node)))
+        None -> Right(resolve(r, nested(captures, requiredNode(captures, rightTag))))
+    })
+})
 
 fun orElse[Resolve a](left : Builder a, right : Builder a) -> Builder (Capture (Output a)) {
     let result = choice(left, right)
@@ -194,44 +193,39 @@ fun orElse[Resolve a](left : Builder a, right : Builder a) -> Builder (Capture (
     }))
 }
 
-fun optional[Resolve a](body : Builder a) -> Builder (Capture (Option (Output a))) {
-    let tag = fresh()
-    let branch = scopedCode(body.code, tag)
-    let code = [Split(1, len(branch) + 1)]
-    for inst in branch { Vec.push(code, shifted(inst, 1)) }
-    Builder {
-        code = code,
-        value = Capture(fun(captures) =
-            map(findNode(captures, tag), \resolve(body.value, nested(captures, _))))
-    }
-}
+fun optional[Resolve a](body : Builder a) -> Builder (Capture (Option (Output a))) =
+    Builder(fun(asm) {
+        let tag = fresh(asm)
+        let split = here(asm)
+        emit(asm, Split(0, 0))
+        let value = scoped(asm, tag, body)
+        asm.code[split] = Split(split + 1, here(asm))
+        Capture(fun(captures) =
+            map(findNode(captures, tag), \resolve(value, nested(captures, _))))
+    })
 
 fun repeated[Resolve a](body : Builder a, atLeastOne : Bool)
-        -> Builder (Capture (Vec (Output a))) {
-    let tag = fresh()
-    let branch = scopedCode(body.code, tag)
-    let code = Vec.new(len(branch) + 2)
-    if !atLeastOne { Vec.push(code, Split(1, len(branch) + 2)) }
-    let offset = len(code)
-    for inst in branch { Vec.push(code, shifted(inst, offset)) }
+        -> Builder (Capture (Vec (Output a))) = Builder(fun(asm) {
+    let tag = fresh(asm)
+    let start = here(asm)
+    if !atLeastOne { emit(asm, Split(0, 0)) }
+    let value = scoped(asm, tag, body)
     if atLeastOne {
-        Vec.push(code, Split(0, len(code) + 1))
+        emit(asm, Split(start, here(asm) + 1))
     } else {
-        Vec.push(code, Jump(0))
+        emit(asm, Jump(start))
+        asm.code[start] = Split(start + 1, here(asm))
     }
-    Builder {
-        code = code,
-        value = Capture(fun(captures) {
-            let values = Vec.new(0)
-            for node in captures.nodes {
-                if node.tag == tag {
-                    Vec.push(values, resolve(body.value, nested(captures, node)))
-                }
+    Capture(fun(captures) {
+        let values = []
+        for node in captures.nodes {
+            if node.tag == tag {
+                Vec.push(values, resolve(value, nested(captures, node)))
             }
-            values
-        })
-    }
-}
+        }
+        values
+    })
+})
 
 fun many[Resolve a](body : Builder a) -> Builder (Capture (Vec (Output a))) =
     repeated(body, False)
@@ -239,34 +233,49 @@ fun many[Resolve a](body : Builder a) -> Builder (Capture (Vec (Output a))) =
 fun some[Resolve a](body : Builder a) -> Builder (Capture (Vec (Output a))) =
     repeated(body, True)
 
--- Persistent event histories share prefixes across threads. Branches do not
--- mutate each other's captures. Build the capture tree only for the winner.
-type History = Empty | Event(Bool, Int, String.Index, History)
-type Thread = Thread { pc : Int, history : History }
+-- Assemble `b` once. Jumps and splits are pointed past any chain of jumps
+-- they lead to, so that matching never follows one jump to reach another.
+fun compile[Resolve r](b : Builder r) -> Pattern r {
+    let asm = Assembly { code = [], tags = 0, quiet = 0 }
+    let value = run(b, asm)
+    let code = asm.code
+    let past = fun(target : Int) {
+        var t = target
+        var steps = 0
+        while steps < len(code) && t < len(code) {
+            match code[t] {
+                Jump(next) -> { t = next }
+                _ -> break
+            }
+            steps = steps + 1
+        }
+        t
+    }
+    let out = Array.init(len(code), fun(pc) = match code[pc] {
+        Jump(t) -> Jump(past(t))
+        Split(a, b) -> Split(past(a), past(b))
+        inst -> inst
+    })
+    Pattern { code = out, value = value }
+}
+
+-- A capture boundary, in the order the winning path crossed it.
+type Event = Event { opening : Bool, tag : Int, at : String.Index }
 type Frame = Frame { tag : Int, start : String.Index, children : Vec Node }
 
-fun materialize(text : String, history : History) -> Captures {
-    let events = Vec.new(0)
-    var rest = history
-    while let Event(opening, tag, at, previous) = rest {
-        Vec.push(events, (opening, tag, at))
-        rest = previous
-    }
+fun tree(text : String, events : Vec Event) -> Captures {
     let root = Frame { tag = -1, start = String.start(text), children = [] }
     let stack = [root]
-    var i = len(events)
-    while i > 0 {
-        i = i - 1
-        let (opening, tag, at) = events[i]
-        if opening {
-            Vec.push(stack, Frame { tag = tag, start = at, children = [] })
+    for event in events {
+        if event.opening {
+            Vec.push(stack, Frame { tag = event.tag, start = event.at, children = [] })
         } else {
             let frame = Option.expect(Vec.pop(stack), "Regex: unbalanced capture history")
-            if frame.tag != tag || len(stack) == 0 {
+            if frame.tag != event.tag || len(stack) == 0 {
                 error("Regex: unbalanced capture history")
             }
             Vec.push(stack[len(stack) - 1].children, Node {
-                tag = tag, start = frame.start, end = at, children = frame.children
+                tag = event.tag, start = frame.start, end = event.at, children = frame.children
             })
         }
     }
@@ -274,51 +283,161 @@ fun materialize(text : String, history : History) -> Captures {
     Captures { text = text, nodes = root.children }
 }
 
-fun unseen(code : Vec Instruction) -> Array Bool = Array.filled(len(code) + 1, False)
+-- How many (instruction, position) pairs the backtracker may keep a bit for
+-- by default: 32 KiB of visited set.
+let defaultBudget : Int = 256 * 1024
 
--- Explicit stack avoids recursive epsilon traversal. Push right before left
--- to process the left branch first. Each PC is visited once per input position.
-fun addThread(code : Vec Instruction, threads : Vec Thread, seen : Array Bool,
-        pc : Int, history : History, at : String.Index) -> Unit {
-    let pending = [Thread { pc = pc, history = history }]
-    while len(pending) > 0 {
-        let thread = Option.expect(Vec.pop(pending), "Regex: empty thread stack")
-        let current = thread.pc
-        if seen[current] { continue }
-        seen[current] = True
-        if current == len(code) {
-            Vec.push(threads, thread)
-            continue
-        }
-        match code[current] {
-            Jump(target) -> Vec.push(pending, Thread { pc = target, history = thread.history })
-            Split(left, right) -> {
-                Vec.push(pending, Thread { pc = right, history = thread.history })
-                Vec.push(pending, Thread { pc = left, history = thread.history })
+fun fullMatch[Resolve r](pattern : Pattern r, text : String) -> Option (Output r) =
+    fullMatchWithin(pattern, text, defaultBudget)
+
+-- `fullMatch`, backtracking only if the visited set fits in `budget` pairs
+-- of instruction and position, and otherwise running the Pike VM, whose
+-- space is linear in the pattern alone. The two give the same results; the
+-- budget trades memory for speed and nothing else.
+fun fullMatchWithin[Resolve r](pattern : Pattern r, text : String, budget : Int)
+        -> Option (Output r) {
+    let pairs = (len(pattern.code) + 1) * (String.byteLength(text) + 1)
+    let events = if pairs <= budget { backtrack(pattern.code, text) } else { pike(pattern.code, text) }
+    Some(resolve(pattern.value, tree(text, events?)))
+}
+
+-- -- backtracking ---------------------------------------------------------------------
+
+-- Where the second branch of a split resumes: its instruction, its place in
+-- the text (and how many characters precede it), and how much of the event
+-- log is still true there.
+type Resume = Resume { pc : Int, at : String.Index, count : Int, logged : Int }
+
+-- Depth first, the first branch of every split before the second, so the
+-- first path to reach the end of the pattern at the end of the text is the
+-- one the Pike VM would choose. A pair of instruction and position is
+-- explored at most once: whether the rest of the pattern can match from it
+-- does not depend on how it was reached, so a second arrival can only fail
+-- again, and the work is bounded by the pairs, as the Pike VM's is.
+--
+-- Positions are counted in characters for the visited set; there are at
+-- most as many as bytes, which is what `fullMatch` budgets for.
+fun backtrack(code : Array Instruction, text : String) -> Option (Vec Event) {
+    let width = len(code) + 1
+    let visited = BitSet.new(width * (String.byteLength(text) + 1))
+    let events = []
+    let pending = [Resume { pc = 0, at = String.start(text), count = 0, logged = 0 }]
+    while let Some(resume) = Vec.pop(pending) {
+        while len(events) > resume.logged { let _ = Vec.pop(events) }
+        var pc = resume.pc
+        var at = resume.at
+        var count = resume.count
+        loop {
+            let key = count * width + pc
+            if BitSet.contains(visited, key) { break }
+            BitSet.add(visited, key)
+            if pc == len(code) {
+                if String.atEnd(text, at) { return Some(events) }
+                break
             }
-            Open(tag) -> Vec.push(pending, Thread {
-                pc = current + 1, history = Event(True, tag, at, thread.history)
-            })
-            Close(tag) -> Vec.push(pending, Thread {
-                pc = current + 1, history = Event(False, tag, at, thread.history)
-            })
-            Consume(_) -> Vec.push(threads, thread)
+            match code[pc] {
+                Consume(predicate) -> match String.step(text, at) {
+                    Some((c, next)) -> {
+                        if !predicate(c) { break }
+                        at = next
+                        count = count + 1
+                        pc = pc + 1
+                    }
+                    None -> break
+                }
+                Jump(target) -> { pc = target }
+                Split(first, second) -> {
+                    Vec.push(pending, Resume { pc = second, at, count, logged = len(events) })
+                    pc = first
+                }
+                Open(tag) -> {
+                    Vec.push(events, Event { opening = True, tag, at })
+                    pc = pc + 1
+                }
+                Close(tag) -> {
+                    Vec.push(events, Event { opening = False, tag, at })
+                    pc = pc + 1
+                }
+            }
+        }
+    }
+    None
+}
+
+-- -- Pike VM ---------------------------------------------------------------------------
+
+-- Persistent event histories share prefixes across threads. Branches do not
+-- mutate each other's captures. Only the winner's is turned into a log.
+type History = Empty | Crossed(Event, History)
+type Thread = Thread { pc : Int, history : History }
+
+fun logOf(history : History) -> Vec Event {
+    let events = []
+    var rest = history
+    while let Crossed(event, previous) = rest {
+        Vec.push(events, event)
+        rest = previous
+    }
+    Vec.reverse(events)
+}
+
+-- Follow every jump, split and capture boundary from `pc` at position `at`,
+-- adding a thread for each `Consume` reached and for the end of the pattern.
+-- Splits go on `pending` second branch first, so the first branch is
+-- followed first and its threads come first. `seen[pc] == stamp` marks an
+-- instruction already reached at this position: the first arrival has the
+-- higher priority, and a later one would only repeat it.
+fun addThread(code : Array Instruction, threads : Vec Thread, pending : Vec Thread,
+        seen : Array Int, stamp : Int, pc : Int, history : History, at : String.Index) -> Unit {
+    Vec.push(pending, Thread { pc, history })
+    while let Some(thread) = Vec.pop(pending) {
+        var current = thread.pc
+        var h = thread.history
+        loop {
+            if seen[current] == stamp { break }
+            seen[current] = stamp
+            if current == len(code) {
+                Vec.push(threads, Thread { pc = current, history = h })
+                break
+            }
+            match code[current] {
+                Jump(target) -> { current = target }
+                Split(first, second) -> {
+                    Vec.push(pending, Thread { pc = second, history = h })
+                    current = first
+                }
+                Open(tag) -> {
+                    h = Crossed(Event { opening = True, tag, at }, h)
+                    current = current + 1
+                }
+                Close(tag) -> {
+                    h = Crossed(Event { opening = False, tag, at }, h)
+                    current = current + 1
+                }
+                Consume(_) -> {
+                    Vec.push(threads, Thread { pc = current, history = h })
+                    break
+                }
+            }
         }
     }
 }
 
-fun fullMatch[Resolve r](pattern : Builder r, text : String) -> Option (Output r) {
+fun pike(code : Array Instruction, text : String) -> Option (Vec Event) {
+    let seen = Array.filled(len(code) + 1, -1)
+    let pending = []
+    var stamp = 0
     var current = []
     var at = String.start(text)
-    addThread(pattern.code, current, unseen(pattern.code), 0, Empty, at)
+    addThread(code, current, pending, seen, stamp, 0, Empty, at)
     while let Some((c, next)) = String.step(text, at) {
         let following = []
-        let seen = unseen(pattern.code)
+        stamp = stamp + 1
         for thread in current {
-            if thread.pc < len(pattern.code) {
-                if let Consume(predicate) = pattern.code[thread.pc] {
+            if thread.pc < len(code) {
+                if let Consume(predicate) = code[thread.pc] {
                     if predicate(c) {
-                        addThread(pattern.code, following, seen,
+                        addThread(code, following, pending, seen, stamp,
                             thread.pc + 1, thread.history, next)
                     }
                 }
@@ -328,9 +447,7 @@ fun fullMatch[Resolve r](pattern : Builder r, text : String) -> Option (Output r
         at = next
     }
     for thread in current {
-        if thread.pc == len(pattern.code) {
-            return Some(resolve(pattern.value, materialize(text, thread.history)))
-        }
+        if thread.pc == len(code) { return Some(logOf(thread.history)) }
     }
     None
 }

@@ -1,4 +1,4 @@
-module Turkey.Resolve (program)
+module Turkey.Resolve (program, arities)
 
 -- Name resolution across modules.
 --
@@ -19,11 +19,18 @@ module Turkey.Resolve (program)
 --   the scope that binds them, so they need no qualification, and the frames
 --   below track scopes precisely enough to tell one from a top-level
 --   reference.
--- * **Operators.** `a + b` became a plain `add` reference at parse time, and
---   once shadowing an import is legal that node would resolve to whatever `add`
---   the module happens to define. The parser marks the node, and the marked
---   ones are looked up in the separate protocol-method scope -- so `+` still
---   means the imported `Add.add` in a module whose own `add` is unrelated.
+-- * **Operators.** `a + b` means the class method `add`, and once shadowing
+--   an import is legal a plain `add` reference would resolve to whatever `add`
+--   the module happens to define. So the reference an operator means is
+--   marked, and the marked ones are looked up in the separate protocol-method
+--   scope -- so `+` still means the imported `Add.add` in a module whose own
+--   `add` is unrelated.
+--
+-- Operator chains are grouped here too, because a declared operator's group
+-- is known only once its `infix` declaration has been read, and the parser
+-- reads chains flat so that it never has to know. A declared operator becomes an `EBinary`
+-- whose method is its target, already resolved: a two-argument call of a named
+-- function, which no later stage tells from any other.
 --
 -- A qualified name whose module part is not in scope is reported here, because
 -- this is the only stage that knows what "in scope" means. An *unqualified*
@@ -33,19 +40,34 @@ module Turkey.Resolve (program)
 import Data.Set as Set
 import Turkey.Ast
 import Turkey.Diag as Diag
-import Turkey.Modules (Namespace(..), Scope(..), lookupName)
+import Turkey.Fixity as Fixity
+import Turkey.Fixity (Group)
+import Turkey.Modules (Module(..), Namespace(..), Scope(..), lookupName)
+import Turkey.Prelude as Prelude
 import Turkey.Source (Span(..))
 import Turkey.Types as Ty
 
 -- One module's scope, plus the stack of local frames the walk maintains.
 type R = R {
-    scope  : Scope,
+    scope     : Scope,
     -- Innermost last. A name in any frame is local and is left alone.
-    locals : Vec (Set.Set String),
+    locals    : Vec (Set.Set String),
+    -- Each operator the module declares: its group, and the resolved name of
+    -- the function it means.
+    operators : Map String (Group, String),
 }
 
-fun program(scope : Scope, p : Program) -> Unit {
-    let r = R { scope = scope, locals = Vec.new(4) }
+-- `arities` is every top-level function and class method of the program, by
+-- internal name, with how many parameters it takes.
+fun program(scope : Scope, p : Program, arities : Map String Int) -> Unit {
+    let r = R { scope = scope, locals = Vec.new(4), operators = Map.new() }
+    -- Before any expression, since a use may precede its declaration.
+    for decl in p.decls {
+        match decl {
+            DInfix(d) -> infixDecl(r, d, arities)
+            _ -> {}
+        }
+    }
     for decl in p.decls {
         match decl {
             DStmt(s) -> topLevel(r, s)
@@ -53,8 +75,56 @@ fun program(scope : Scope, p : Program) -> Unit {
             DClass(c) -> classDecl(r, c)
             DInstance(i) -> instanceDecl(r, i)
             DForeign(f) -> foreignDecl(r, f)
+            DInfix(_) -> {}
         }
     }
+}
+
+-- Every module's top-level functions and class methods, by the internal names
+-- resolution gives them, with their arities. Taken before any module is
+-- resolved, while every declaration still has the name it was written with,
+-- so that an operator may mean a function from any module it can see.
+fun arities(modules : Vec Module) -> Map String Int {
+    let out = Map.new()
+    for m in modules {
+        for decl in m.program.decls {
+            match decl {
+                DStmt(s) -> match s.kind {
+                    SFun(d) -> Map.put(out, Prelude.internal(m.name, d.name), len(d.params))
+                    _ -> {}
+                }
+                DClass(c) -> {
+                    let cls = Prelude.internal(m.name, c.name)
+                    for meth in c.methods {
+                        Map.put(out, cls + "." + meth.name, len(meth.params))
+                    }
+                }
+                _ -> {}
+            }
+        }
+    }
+    out
+}
+
+fun infixDecl(r : R, d : InfixDecl, arities : Map String Int) -> Unit {
+    if Map.contains(r.operators, d.op) {
+        oops("the operator '" + d.op + "' is declared twice", d.span)
+    }
+    let target = match lookupName(r.scope, ValueSpace, d.target, Some(d.targetSpan)) {
+        Some(t) -> t
+        None -> oops("'" + d.target + "' is not defined", d.targetSpan)
+    }
+    match Map.get(arities, target) {
+        Some(2) -> {}
+        Some(n) -> oops("the operator '" + d.op + "' needs a function of two "
+                        + "parameters, and '" + d.target + "' takes "
+                        + Int.toString(n), d.targetSpan)
+        None -> oops("the operator '" + d.op + "' needs a top-level function "
+                     + "or class method, and '" + d.target + "' is neither",
+                     d.targetSpan)
+    }
+    d.target = target
+    Map.put(r.operators, d.op, (d.group, target))
 }
 
 fun foreignDecl(r : R, f : ForeignDecl) -> Unit {
@@ -267,6 +337,15 @@ fun expr(r : R, e : Expr) -> Unit = match e.kind {
         expr(r, left)
         expr(r, right)
     }
+    EChain(operands, ops) -> {
+        for x in operands { expr(r, x) }
+        let groups = Vec.map(ops, fun((op, where)) = groupOf(r, op, where))
+        let tree = Fixity.associate(operands, ops, groups,
+                                    fun(i, left, right, from) = binary(r, ops[i], left, right, from),
+                                    fun(x) = x.span)
+        e.span = tree.span
+        e.kind = tree.kind
+    }
     EAnnot(inner, t) -> {
         expr(r, inner)
         typeExpr(r, t)
@@ -392,7 +471,7 @@ fun cls(r : R, name : String, where : Span) -> String =
 fun lookupOr(space : Map String String, name : String) -> String =
     Map.getOr(space, name, name)
 
--- A method reference the parser wrote: `EBinary`'s `fn`, `EForIn`'s `iter`.
+-- A method reference the compiler wrote: `EBinary`'s `fn`, `EForIn`'s `iter`.
 -- Absent when the operator has no class, which `!` and `&&` do not.
 fun resolveMethod(r : R, ref : Option Expr) -> Unit = match ref {
     None -> {}
@@ -418,6 +497,46 @@ fun methodRef(r : R, name : String, where : Span) -> Option Expr =
             id = freshNodeId(), span = where, kind = EVar(target, True),
         })
     }
+
+-- -- operators --------------------------------------------------------------------
+
+fun groupOf(r : R, op : String, where : Span) -> Group = match Fixity.builtinGroup(op) {
+    Some(g) -> g
+    None -> match Map.get(r.operators, op) {
+        Some((g, _)) -> g
+        None -> Diag.fail(Diag.at("parse error", "the operator '" + op
+            + "' is not declared" + splitHint(r, op), where), where.file)
+    }
+}
+
+fun splitHint(r : R, op : String) -> String =
+    Fixity.splitAdvice(op, fun(piece) = Fixity.isBuiltin(piece)
+                                        || Map.contains(r.operators, piece))
+
+-- One operator of a chain, applied. A built-in operator's node is spanned by
+-- where its left operand begins, and means its class method; a declared one's
+-- is spanned by the operator, which is what a diagnostic about the call
+-- should point at.
+fun binary(r : R, op : (String, Span), left : Expr, right : Expr, from : Span) -> Expr {
+    let (name, where) = op
+    match Map.get(r.operators, name) {
+        Some((_, target)) -> node(where, EBinary(name, left, right,
+                                                 Some(node(where, EVar(target, False)))))
+        None -> match Fixity.binaryMethod(name) {
+            Some(method) -> {
+                let fn = Some(node(from, EVar(method, True)))
+                resolveMethod(r, fn)
+                node(from, EBinary(name, left, right, fn))
+            }
+            None -> node(from, EBinary(name, left, right, None))
+        }
+    }
+}
+
+-- From the same supply as every parsed node's, for the reason `methodRef`
+-- gives.
+fun node(where : Span, kind : ExprKind) -> Expr =
+    Expr { id = freshNodeId(), span = where, kind = kind }
 
 -- -- local frames -------------------------------------------------------------------
 

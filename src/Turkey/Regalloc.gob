@@ -298,6 +298,11 @@ type Walk = Walk {
     of_         : Array Int,
     var stopped : Option String,
     evicted     : Set.Set Int,
+    -- The evicted values that left because every register was held, rather
+    -- than because they were live across a clobber. One reload shared by
+    -- several reads would hold a register over the same crowded stretch, so
+    -- these are reloaded at each read.
+    crowded     : Set.Set Int,
     liveOut     : Array BitSet,
     roots       : Map Int Int,
     -- `spillCosts`, computed the first time `place` has to choose and empty
@@ -315,7 +320,8 @@ fun walk(f : Func A.Inst, spills : Spills, roots : Map Int Int,
     -- yet select, and the allocator should not be where `boot` gains one.
     let w = Walk { f = f, spills = spills, evict = evict, forbidden = forbidden,
                    hints = moveHints(f), of_ = of_, stopped = None,
-                   evicted = Set.new(), liveOut = liveOut, roots = roots,
+                   evicted = Set.new(), crowded = Set.new(), liveOut = liveOut,
+                   roots = roots,
                    cost = [] }
     let entry = f.blocks[Ssa.blockId(f.entry)]
 
@@ -502,9 +508,11 @@ fun fileName(bank : Bank) -> String = match bank {
 -- * **A register is free but forbidden.** The value is live across a clobber
 --   -- a call, or a physical register in use -- and every register nobody
 --   holds is one the clobber destroys. Either this value goes to memory --
---   stored at its definition and reloaded at each use, it is no longer live
---   across anything -- or a holder of a register it may have does, and
---   `cheaperHolder` picks whichever costs less.
+--   stored at its definition and reloaded after the calls, it is no longer
+--   live across one -- or a holder of a register it may have does, and
+--   `cheaperHolder` picks whichever costs less. A reload shared by several
+--   reads can meet this too, across a physical register's live range, and is
+--   split into one reload per read.
 -- * **Every register is held.** Spilling this value would not help: it still
 --   needs a register at this very point, for the one instruction between its
 --   definition and its store. Something *else* has to leave, and the holder
@@ -528,7 +536,10 @@ fun place(w : Walk, taken : Taken, id : Int, block : Ssa.Block A.Inst,
                 stopOnce(w, why)
                 placing = False
             } else if anyUnheld(taken, bank) {
-                if Map.contains(spills.reloadOf, id)
+                if Set.contains(spills.shared, id) {
+                    Set.add(w.evicted, id)
+                    placing = False
+                } else if Map.contains(spills.reloadOf, id)
                    || Map.contains(spills.slots, id) {
                     stopOnce(w, "a reload or store with no free register in the "
                                 + fileName(bank) + " file")
@@ -552,6 +563,7 @@ fun place(w : Walk, taken : Taken, id : Int, block : Ssa.Block A.Inst,
                         release(taken, keyIn(bank, w.of_[v]))
                         w.of_[v] = -1
                         Set.add(w.evicted, v)
+                        Set.add(w.crowded, v)
                     }
                     None -> {
                         stopOnce(w, why)
@@ -599,9 +611,10 @@ fun anyUnheld(taken : Taken, bank : Bank) -> Bool {
     False
 }
 
--- The holder to evict: in the same file, not a reload or a store (those live
--- for one instruction and spilling them again would loop), and used furthest
--- from `from`. Ties go to the lower value id, so that two runs agree.
+-- The holder to evict: in the same file, not a store or a reload read only
+-- once (those live for one instruction and spilling them again would loop),
+-- and used furthest from `from`. Ties go to the lower value id, so that two
+-- runs agree.
 fun victim(w : Walk, taken : Taken, bank : Bank,
            block : Ssa.Block A.Inst, from : Int) -> Option Int {
     let spills = w.spills
@@ -610,7 +623,8 @@ fun victim(w : Walk, taken : Taken, bank : Bank,
     for n in poolOf(bank) {
         let holder = holderOf(taken, keyIn(bank, n))
         if holder >= 0 {
-            let movable = !Map.contains(spills.reloadOf, holder)
+            let movable = (!Map.contains(spills.reloadOf, holder)
+                           || Set.contains(spills.shared, holder))
                           && !Map.contains(spills.slots, holder)
             if movable {
                 let d = nextUse(block, holder, from)
@@ -652,11 +666,19 @@ fun cheaperHolder(w : Walk, taken : Taken, id : Int, bank : Bank) -> Option Int 
 }
 
 -- What spilling each value would cost in executed loads and stores, by
--- `loopWeights`: a reload at every use, and a store at the definition unless
+-- `loopWeights`: a load at every read, and a store at the definition unless
 -- the value has a root slot. The root stores selection puts before a
--- safepoint are not counted as uses, since `spill` drops them for a value it
+-- safepoint are not counted as reads, since `spill` drops them for a value it
 -- spills into that slot -- which is what makes a traced value the cheaper one
 -- to send to memory.
+--
+-- Every read is charged although `spill` loads once for all the reads between
+-- two calls. Charging only those loads is the plausible refinement and it
+-- picks worse victims: a traced pointer read several times in a loop then
+-- ties with an accumulator that pays a store and a load, and spilling the
+-- pointer puts a load in front of every dereference. On a loop over two
+-- arrays with nine accumulators, and on library loops a bytecode interpreter
+-- spends its time in, it measured 1.5 to 3% slower.
 fun spillCosts(f : Func A.Inst, roots : Map Int Int) -> Array Int {
     let weight = loopWeights(f)
     let cost = Array.filled(len(f.reps), 0)
@@ -1112,12 +1134,16 @@ type Spills = Spills {
     slots          : Map Int A.Mem,
     -- Reload value id -> the spilled value it reloads.
     reloadOf       : Map Int Int,
+    -- The reloads read more than once. Only these may be evicted: a later
+    -- round splits one back into a reload per read.
+    shared         : Set.Set Int,
     var spillSlots : Int,
     var stores     : Int,
 }
 
 fun newSpills() -> Spills =
-    Spills { slots = Map.new(), reloadOf = Map.new(), spillSlots = 0, stores = 0 }
+    Spills { slots = Map.new(), reloadOf = Map.new(), shared = Set.new(),
+             spillSlots = 0, stores = 0 }
 
 type Allocation = Allocation {
     -- The function as allocated: unreachable blocks gone, spill code in.
@@ -1136,16 +1162,18 @@ let maxRounds = 16
 
 -- Spill, then colour, until the colouring finishes.
 --
--- **Spill-everywhere**: a spilled value is stored once, directly after its
--- definition, and reloaded into a fresh value directly before each use. Every
--- reload dominates its only use, so the function stays in SSA form with no
--- reconstruction -- which here would also mean splitting edges, since a
--- `Branch` cannot carry the block argument a merge would need -- and the
--- chordal theorem still holds for the next walk.
+-- A spilled value is stored once, directly after its definition, and reloaded
+-- into a fresh value before a read -- once for every read up to the next call,
+-- in its block and in the blocks below it that have no other predecessor
+-- (`spill`). Every reload dominates its reads, so the function stays in SSA
+-- form with no reconstruction -- which here would also mean splitting edges,
+-- since a `Branch` cannot carry the block argument a merge would need -- and
+-- the chordal theorem still holds for the next walk.
 --
 -- The walk decides what to spill as it fails (`place`), so the loop is spill
 -- what the last walk named, then walk again. It converges because a value is
--- spilled at most once and a reload or a store is never spilled; the cap is a
+-- spilled at most once, a store is never spilled, and a reload is spilled only
+-- if it has more than one read, into reloads that have one; the cap is a
 -- report, not a policy.
 --
 -- The input is not changed. Selection's output is still printed and measured
@@ -1174,7 +1202,7 @@ fun allocate(f : Func A.Inst, roots : Map Int Int) -> Allocation {
                                       + Int.toString(maxRounds) + " rounds")
                 going = False
             } else {
-                spill(g, w.evicted, roots, spills)
+                spill(g, w.evicted, w.crowded, roots, spills)
                 rounds = rounds + 1
             }
         }
@@ -1197,17 +1225,34 @@ fun copyFunc(f : Func A.Inst) -> Func A.Inst {
     g
 }
 
--- Store each value in `ids` after its definition and reload it before each use.
+-- Store each value in `ids` after its definition, and reload it before the
+-- first read after each call; a reload in `ids` is instead replaced by a
+-- reload in front of each of its reads.
+--
+-- A reload stands in for its value until the next call or poll, through the
+-- rest of its block and on into any block whose only predecessor is the one
+-- it reaches the end of. Within that region it is one value in one register
+-- and never live across a call, which is what the value itself could not be;
+-- and since the region is a tree, it dominates every read it serves, so no
+-- merge needs a parameter. A value in `crowded` was evicted for want of any
+-- register, not of one that survives a call, and a reload held from read to
+-- read would want one over the same stretch, so it gets a reload per read.
 --
 -- A rooted value's slot is its root slot. The collector scans that slot
 -- whenever the safepoint's mask says the value is live, so writing it once at
 -- the definition is the store rooting needs as well -- the safepoint is left
 -- only the mask to write. That is the saving the root array was always going
 -- to give this backend, and it is why the root array is consulted here and not
--- only by the emitter.
-fun spill(g : Func A.Inst, ids : Set.Set Int, roots : Map Int Int,
-          spills : Spills) -> Unit {
+-- only by the emitter. It is also why splitting at the calls costs only the
+-- loads: the store was owed anyway.
+fun spill(g : Func A.Inst, ids : Set.Set Int, crowded : Set.Set Int,
+          roots : Map Int Int, spills : Spills) -> Unit {
+    let splitting = Set.new()
     for id in Array.sort(Set.elements(ids)) {
+        if Map.contains(spills.reloadOf, id) {
+            Set.add(splitting, id)
+            continue
+        }
         let slot = match Map.get(roots, id) {
             Some(n) -> A.RootSlot(n)
             None -> {
@@ -1218,8 +1263,13 @@ fun spill(g : Func A.Inst, ids : Set.Set Int, roots : Map Int Int,
         }
         Map.put(spills.slots, id, slot)
     }
-    for var b = 0; b < len(g.blocks); b = b + 1 {
+    let preds = Ssa.predecessors(g)
+    let leaving : Array (Option (Map Int Int)) = Array.filled(len(g.blocks), None)
+    for at in Ssa.reversePostorder(g) {
+        let b = Ssa.blockId(at)
         let block = g.blocks[b]
+        -- Spilled value -> the reload standing in for it here.
+        let ready = inherited(preds, leaving, b)
         let out : Vec A.Inst = []
         for p in block.params { storeIfSpilled(out, spills, ids, Ssa.valueId(p)) }
         for var n = 0; n < len(block.insts); n = n + 1 {
@@ -1229,9 +1279,10 @@ fun spill(g : Func A.Inst, ids : Set.Set Int, roots : Map Int Int,
             -- definition, so the store is a reload and a write of what the slot
             -- already holds -- and on `boot` it nearly tripled the reloads.
             if isRootStoreOfSpilled(i.op, ids, spills) { continue }
+            if isLoadOf(i.op, splitting) { continue }
             var op = i.op
             for id in Array.sort(Set.elements(usedSpilled(Ssa.uses(i), ids))) {
-                let t = reload(g, out, spills, id)
+                let t = standIn(g, out, spills, ready, crowded, id)
                 op = A.mapUses(op, renamed(_, id, t))
             }
             Vec.push(out, A.Inst { op = op })
@@ -1245,15 +1296,89 @@ fun spill(g : Func A.Inst, ids : Set.Set Int, roots : Map Int Int,
             }
             Ssa.eachDef(i, fun(d) =
                 storeIfSpilled(out, spills, ids, Ssa.valueId(d)))
+            if endsReloads(i) { clear(ready) }
         }
         var term = block.term
         for id in Array.sort(Set.elements(usedSpilled(Ssa.termUses(term), ids))) {
-            let t = reload(g, out, spills, id)
+            let t = standIn(g, out, spills, ready, crowded, id)
             term = renamedTerm(term, id, t)
         }
         block.insts = out
         block.term = term
+        leaving[b] = Some(ready)
     }
+    for id in Set.elements(splitting) {
+        let _ = Map.delete(spills.reloadOf, id)
+        let _ = Set.remove(spills.shared, id)
+    }
+}
+
+-- The value to read in place of the spilled or split `id`, loading it at the
+-- end of `out` if nothing loaded already stands in for it.
+fun standIn(g : Func A.Inst, out : Vec A.Inst, spills : Spills,
+            ready : Map Int Int, crowded : Set.Set Int, id : Int) -> Int {
+    match Map.get(spills.reloadOf, id) {
+        Some(from) -> return reload(g, out, spills, from)
+        None -> {}
+    }
+    match Map.get(ready, id) {
+        Some(t) -> {
+            Set.add(spills.shared, t)
+            t
+        }
+        None -> {
+            let t = reload(g, out, spills, id)
+            if !Set.contains(crowded, id) { Map.put(ready, id, t) }
+            t
+        }
+    }
+}
+
+-- Whether an instruction ends every reload's stretch: a call, which destroys
+-- the registers a reload could otherwise keep, or a poll, at which the
+-- collector may run.
+fun endsReloads(i : A.Inst) -> Bool =
+    A.isCall(i) || Option.isSome(A.pollOf(i.op))
+
+-- What a block starts out knowing from above, as `leaving` records each
+-- block's end: its predecessor's, if it has exactly one and that one is
+-- done, and nothing otherwise. Reverse postorder visits a block's only
+-- predecessor first, since that predecessor dominates it.
+fun inherited(preds : Array (Vec BlockId), leaving : Array (Option (Map Int v)),
+              b : Int) -> Map Int v {
+    let out = Map.new()
+    let p = onlyPredecessor(preds, b)
+    if p >= 0 {
+        match leaving[p] {
+            Some(m) -> for (k, v) in Map.entries(m) { Map.put(out, k, v) }
+            None -> {}
+        }
+    }
+    out
+}
+
+-- The one block with an edge into `b`, counting a block with several edges
+-- into it once, or `-1`. A block that is its own predecessor has none for
+-- this purpose: what it knows at its end is not known at its start.
+fun onlyPredecessor(preds : Array (Vec BlockId), b : Int) -> Int {
+    var only = -1
+    for p in preds[b] {
+        let n = Ssa.blockId(p)
+        if n == b || (only >= 0 && n != only) { return -1 }
+        only = n
+    }
+    only
+}
+
+fun clear(m : Map Int v) -> Unit {
+    for k in Map.keys(m) {
+        let _ = Map.delete(m, k)
+    }
+}
+
+fun isLoadOf(op : A.Arm, ids : Set.Set Int) -> Bool = match A.slotLoad(op) {
+    Some((t, _)) -> Set.contains(ids, t)
+    None -> False
 }
 
 fun isRootStoreOfSpilled(op : A.Arm, ids : Set.Set Int, spills : Spills) -> Bool =
@@ -1336,18 +1461,17 @@ fun verifyAllocation(a : Allocation) -> Vec String {
         }
     }
     let entry = Ssa.blockId(g.entry)
-    for var b = 0; b < len(g.blocks); b = b + 1 {
+    let preds = Ssa.predecessors(g)
+    let leaving : Array (Option (Map Int Unit)) = Array.filled(len(g.blocks), None)
+    for at in Ssa.reversePostorder(g) {
+        let b = Ssa.blockId(at)
         let block = g.blocks[b]
         -- The values defined on entry to this block, which a store at its
         -- head may be writing.
         let definers = if b == entry { Vec.append(g.params, block.params) }
                        else { block.params }
-        for u in Ssa.termUses(block.term) {
-            if Map.contains(spills.slots, Ssa.valueId(u)) {
-                Vec.push(out, "spilled value %" + Int.toString(Ssa.valueId(u))
-                                + " is read by the terminator of b" + Int.toString(b))
-            }
-        }
+        -- The reloads that may be read here: `spill`'s rule, kept apart.
+        let ready = inherited(preds, leaving, b)
         for var n = 0; n < len(block.insts); n = n + 1 {
             let op = block.insts[n].op
             Ssa.eachUse(block.insts[n], fun(u) {
@@ -1355,35 +1479,36 @@ fun verifyAllocation(a : Allocation) -> Vec String {
                 if Map.contains(spills.slots, id) {
                     checkStore(out, spills, block, definers, b, n, id)
                 }
-                match Map.get(spills.reloadOf, id) {
-                    Some(_) -> checkReloadUse(out, block, b, n, id)
-                    None -> {}
-                }
+                checkReloadRead(out, spills, ready, id, where_(b, n))
             })
-            for u in Ssa.termUses(block.term) {
-                if n == len(block.insts) - 1 {
-                    match Map.get(spills.reloadOf, Ssa.valueId(u)) {
-                        Some(_) -> checkReloadUse(out, block, b, len(block.insts),
-                                                  Ssa.valueId(u))
-                        None -> {}
-                    }
-                }
-            }
             match A.slotLoad(op) {
                 Some((t, mem)) -> match Map.get(spills.reloadOf, t) {
-                    Some(from) -> if show(mem) != show(Map.getOr(spills.slots, from,
-                                                                 A.SpillSlot(-1))) {
-                        Vec.push(out, "reload %" + Int.toString(t)
-                                        + " loads the wrong slot for %"
-                                        + Int.toString(from))
+                    Some(from) -> {
+                        if show(mem) != show(Map.getOr(spills.slots, from,
+                                                       A.SpillSlot(-1))) {
+                            Vec.push(out, "reload %" + Int.toString(t)
+                                            + " loads the wrong slot for %"
+                                            + Int.toString(from))
+                        }
+                        Map.put(ready, t, ())
                     }
                     None -> Vec.push(out, "a slot load at " + where_(b, n)
                                             + " is not a recorded reload")
                 }
                 None -> {}
             }
+            if endsReloads(block.insts[n]) { clear(ready) }
             if A.isCSet(op) { checkFlags(out, block, b, n) }
         }
+        for u in Ssa.termUses(block.term) {
+            let id = Ssa.valueId(u)
+            if Map.contains(spills.slots, id) {
+                Vec.push(out, "spilled value %" + Int.toString(id)
+                                + " is read by the terminator of b" + Int.toString(b))
+            }
+            checkReloadRead(out, spills, ready, id, "the terminator of b" + Int.toString(b))
+        }
+        leaving[b] = Some(ready)
     }
     out
 }
@@ -1442,20 +1567,21 @@ fun isStore(op : A.Arm) -> Bool = match A.slotStore(op) {
     None -> False
 }
 
--- A reload is read only by the instruction its run of reloads stands in front
--- of, or by the terminator if the run ends the block.
-fun checkReloadUse(out : Vec String, block : Ssa.Block A.Inst, b : Int, n : Int,
-                   id : Int) -> Unit {
-    var m = n - 1
-    while m >= 0 && isReload(block.insts[m].op) {
-        match A.slotLoad(block.insts[m].op) {
-            Some((t, _)) -> if t == id { return }
-            None -> {}
-        }
-        m = m - 1
+-- A reload is read only where no call or poll lies between its load and the
+-- read: later in its own block, or in a block reached from the end of that one
+-- through edges into blocks with no other predecessor. That is the whole of
+-- the region it may stand in for, and it is what makes a reload safe to keep
+-- in any register -- it is never live across a call, so it needs no register
+-- a callee preserves, and never across a point where the collector runs, so a
+-- traced one needs no root. A read anywhere else means `spill` reused a load
+-- across a merge, where it may not dominate the read, or across a call, where
+-- the register holding it is gone.
+fun checkReloadRead(out : Vec String, spills : Spills, ready : Map Int Unit,
+                    id : Int, at : String) -> Unit {
+    if Map.contains(spills.reloadOf, id) && !Map.contains(ready, id) {
+        Vec.push(out, "reload %" + Int.toString(id) + " is read at " + at
+                        + ", past a call or a merge since it was loaded")
     }
-    Vec.push(out, "reload %" + Int.toString(id) + " is read at " + where_(b, n)
-                    + ", which is not the instruction it was loaded for")
 }
 
 fun isReload(op : A.Arm) -> Bool = match A.slotLoad(op) {

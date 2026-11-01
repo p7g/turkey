@@ -160,6 +160,36 @@ def test_pressure_saves_and_restores_callee_saved_registers():
                 "x27", "x28")), sorted(saved)
 
 
+SLOT_LOAD = re.compile(r"ldr [xwd]\d+, (\[sp(?:, #\d+)?\])$")
+
+
+def test_a_value_in_a_slot_is_loaded_once_between_calls():
+    """A spilled value is reloaded after a call, and that one reload serves
+    every read up to the next call.
+
+    `Main#mixed` keeps more integers live across its loop's call than the
+    callee-saved registers hold, and reads each several times in the
+    straight-line code after the call. Within a run of instructions with no
+    label and no call, no slot is loaded twice.
+    """
+    body = _functions(_native("reload_once.gob"))["Main#mixed"]
+    # The prologue's saves come before the first label; a store after it is
+    # spill code, and without any this test would check nothing.
+    first_label = next(n for n, line in enumerate(body) if line.endswith(":"))
+    assert any(line.startswith("str ") and ", [sp" in line
+               for line in body[first_label:]), "nothing was spilled"
+    seen: set[str] = set()
+    for line in body:
+        if line.endswith(":") or line.startswith(("bl ", "blr ")):
+            seen = set()
+            continue
+        match = SLOT_LOAD.match(line)
+        if match:
+            assert match.group(1) not in seen, (
+                f"{match.group(1)} loaded twice between calls")
+            seen.add(match.group(1))
+
+
 def test_a_call_is_followed_by_the_panic_check():
     """`turkey_panic` sets a flag and returns, so every call tests it.
 

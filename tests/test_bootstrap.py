@@ -166,14 +166,8 @@ def verifying_boot(tmp_path_factory) -> Path:
     """`boot` compiled by `boot` with the heap verifier in, which is only ever
     chosen when a program is compiled."""
     directory = tmp_path_factory.mktemp("verifying-boot")
-    source = directory / "boot.s"
-    with open(source, "wb") as out:
-        subprocess.run(toolchain.command(bootc.binary(), *bootc.argv("asm"), "--gc-verify",
-                                         "src/Main.gob"),
-                       cwd=REPO_ROOT, stdout=out, check=True)
     binary = directory / "boot"
-    subprocess.run([*toolchain.cc(), "-o", str(binary), str(source),
-                    *toolchain.libraries()], check=True, capture_output=True)
+    bootc.link(bootc.BOOT_MAIN, binary, "--gc-verify")
     return binary
 
 

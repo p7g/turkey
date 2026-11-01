@@ -54,14 +54,8 @@ def module(request, tmp_path):
 
 @pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
 def test_each_answers_and_stores_what_it_should(module, tmp_path):
-    asm = tmp_path / "main.s"
-    built = subprocess.run(
-        toolchain.command(bootc.binary(), "build", "-o", str(asm), str(module)),
-        cwd=REPO_ROOT, capture_output=True, text=True)
-    assert built.returncode == 0, built.stderr
     binary = tmp_path / "main"
-    subprocess.run([*toolchain.cc(), "-o", str(binary), str(asm),
-                    *toolchain.libraries()], check=True, capture_output=True)
+    bootc.link(module, binary)
     ran = subprocess.run(toolchain.command(binary), capture_output=True, text=True,
                          timeout=60)
     assert ran.returncode == 0, ran.stderr

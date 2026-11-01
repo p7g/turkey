@@ -169,14 +169,8 @@ def probe(request, tmp_path):
         entry = tmp_path / "main.gob"
         entry.write_text(f"import {module} as P\nfun main() {{ P.run() }}\n",
                          encoding="utf-8")
-        asm = tmp_path / "main.s"
-        built = subprocess.run(
-            toolchain.command(bootc.binary(), "build", "-o", str(asm), str(entry)),
-            cwd=REPO_ROOT, capture_output=True, text=True)
-        assert built.returncode == 0, built.stderr
         binary = tmp_path / "main"
-        subprocess.run([*toolchain.cc(), "-o", str(binary), str(asm),
-                        *toolchain.libraries()], check=True, capture_output=True)
+        bootc.link(entry, binary)
         return subprocess.run(toolchain.command(binary), capture_output=True,
                               text=True, timeout=60)
 

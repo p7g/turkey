@@ -64,14 +64,8 @@ def probe(tmp_path_factory):
     (library / "System" / "LockProbe.gob").write_text(PROBE)
     source = root / "main.gob"
     source.write_text(MAIN)
-    compiled = subprocess.run(toolchain.command(bootc.binary(), *bootc.argv("asm"), str(source)),
-                              cwd=bootc.REPO_ROOT, capture_output=True, text=True, check=True,
-                              env=dict(os.environ, TURKEY_LIB=str(library)))
-    assembly = root / "main.s"
-    assembly.write_text(compiled.stdout)
     binary = root / "probe"
-    subprocess.run([*toolchain.cc(), str(assembly), *toolchain.libraries(), "-o", str(binary)],
-                   capture_output=True, text=True, check=True)
+    bootc.link(source, binary, env=dict(os.environ, TURKEY_LIB=str(library)))
     return binary
 
 
@@ -122,13 +116,8 @@ def test_workers_contending_for_the_heap_lock_under_stress_all_finish(tmp_path):
         pytest.skip("C compiler unavailable")
     source = tmp_path / "main.gob"
     source.write_text(STRESSED)
-    compiled = subprocess.run(toolchain.command(bootc.binary(), *bootc.argv("asm"), str(source)),
-                              cwd=bootc.REPO_ROOT, capture_output=True, text=True, check=True)
-    assembly = tmp_path / "main.s"
-    assembly.write_text(compiled.stdout)
     binary = tmp_path / "stressed"
-    subprocess.run([*toolchain.cc(), str(assembly), *toolchain.libraries(), "-o", str(binary)],
-                   capture_output=True, text=True, check=True)
+    bootc.link(source, binary)
     env = dict(os.environ, TURKEY_WORKERS="4", TURKEY_GC_STRESS="1", TURKEY_GC_GENERATIONAL="0")
     for _ in range(5):
         result = subprocess.run(toolchain.command(binary), capture_output=True, text=True,

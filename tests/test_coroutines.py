@@ -46,16 +46,8 @@ def coroutines(request, tmp_path):
         entry.write_text(f"import {module} as P\nfun main() {{ P.run() }}\n",
                          encoding="utf-8")
         name = "verified" if flags else "plain"
-        assembly = tmp_path / f"{name}.s"
-        compiled = subprocess.run(
-            toolchain.command(bootc.binary(), *bootc.argv("asm"), *flags, str(entry)),
-            cwd=REPO_ROOT, capture_output=True, text=True)
-        assert compiled.returncode == 0, compiled.stderr
-        assembly.write_text(compiled.stdout, encoding="utf-8")
         binary = tmp_path / name
-        subprocess.run([*toolchain.cc(), "-o", str(binary), str(assembly),
-                        *toolchain.libraries()],
-                       check=True, capture_output=True, text=True)
+        bootc.link(entry, binary, *flags)
         return binary
 
     def run(body: str, verified: bool = False,

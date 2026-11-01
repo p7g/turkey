@@ -91,15 +91,8 @@ def test_a_barrier_that_remembers_nothing_is_caught(tmp_path):
     heap.write_text(text.replace(before, before + "    return {}\n"))
     source = tmp_path / "main.gob"
     source.write_text(CONTAINERS)
-    result = subprocess.run(toolchain.command(bootc.binary(), *bootc.argv("asm"), *VERIFY,
-                                              str(source)),
-                            cwd=bootc.REPO_ROOT, capture_output=True, text=True,
-                            check=True, env=dict(os.environ, TURKEY_LIB=str(library)))
-    generated = tmp_path / "main.s"
-    generated.write_text(result.stdout)
     binary = tmp_path / "broken"
-    subprocess.run([*toolchain.cc(), str(generated), *toolchain.libraries(),
-                    "-o", str(binary)], capture_output=True, text=True, check=True)
+    bootc.link(source, binary, *VERIFY, env=dict(os.environ, TURKEY_LIB=str(library)))
     result = subprocess.run(toolchain.command(binary), capture_output=True, text=True,
                             timeout=60, env=dict(os.environ, **GENERATIONAL))
     assert result.returncode == 1, result.stderr

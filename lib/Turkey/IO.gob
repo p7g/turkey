@@ -12,16 +12,10 @@ module Turkey.IO (
 --
 -- **Storage is passed in place.** A call that reads into or writes from bytes
 -- is given an `Array Byte` and a window of it, `from` up to but not including
--- `to`, and hands the kernel the address of the window's first element. No
--- scratch memory is allocated and nothing is copied a byte at a time. Three
--- facts make the address good for the call:
---
--- * at run time an `Array` is the primitive array itself, and a `String` its
---   `Prim.Array Byte`, since a single-field newtype is erased, so
---   `Prim.objectAddress` of either is the array's header;
--- * a `Byte` array is packed, its elements starting `elements` bytes past the
---   header;
--- * the collector does not move objects.
+-- `to`, and hands the kernel the address of the window's first element
+-- (`Prim.elementAddress`). No scratch memory is allocated and nothing is
+-- copied a byte at a time. The address is good for the call because the
+-- collector does not move objects.
 --
 -- What the address does not do is keep the array alive: past its last use in
 -- Turkey code the array may be dead to the compiler, and a worker blocked in
@@ -63,10 +57,6 @@ import Turkey.Memory as Memory
 import Turkey.Sys as Sys
 import Turkey.Workers as Workers
 
--- Where a primitive array's elements start: past the kind and tag word, the
--- length and the element metadata (`Turkey.Alloc.header`).
-let elements : Int = 24
-
 -- -- descriptors ------------------------------------------------------------------
 
 -- Up to `to - from` bytes from `fd` into `bytes[from..to)`: how many, 0 at end
@@ -93,7 +83,7 @@ fun write(fd : Int, bytes : Array Byte, from : Int, to : Int) -> Int {
 fun writeText(fd : Int, text : String, from : Int, to : Int) -> Int {
     let storage = Str.bytesOf(text)
     within(Prim.arrayLength(storage), from, to)
-    let n = Workers.blockingWrite(fd, addressOf(storage, from), to - from)
+    let n = Workers.blockingWrite(fd, Prim.elementAddress(storage, from), to - from)
     Prim.keepAlive(storage)
     n
 }
@@ -323,10 +313,9 @@ fun copyOutside(targetLength : Int, at : Int, sourceLength : Int, from : Int, to
 
 -- -- underneath -------------------------------------------------------------------
 
--- The address of element `at` of a byte array, an `Array Byte` or a
--- `Prim.Array Byte`: both are the primitive array at run time.
-fun addressOf(storage : a, at : Int) -> Prim.Ptr =
-    Prim.ptrAdd(Prim.objectAddress(storage), elements + at)
+-- The address of element `at` of a byte array.
+fun addressOf(bytes : Array Byte, at : Int) -> Prim.Ptr =
+    Prim.elementAddress(Array.storage(bytes), at)
 
 -- Panic unless `from..to` is a window of something `length` long.
 fun within(length : Int, from : Int, to : Int) -> Unit {
@@ -363,7 +352,7 @@ fun cPath(path : String) -> Array Byte {
         }
     }
     let name = Array.filled(n + 1, Byte.truncate(0))
-    Memory.copy(addressOf(name, 0), addressOf(storage, 0), n)
+    Memory.copy(addressOf(name, 0), Prim.elementAddress(storage, 0), n)
     Prim.keepAlive(storage)
     name
 }

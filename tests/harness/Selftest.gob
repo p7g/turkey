@@ -1,0 +1,81 @@
+module Selftest (cases, check)
+
+-- The harness checked against cases whose outcome is known: one per outcome,
+-- in `selftest/`, each named for the outcome it must be given (`fail_*.gob`
+-- must be reported as a fail). A harness that called a crash a wrong answer,
+-- or let an unknown directive pass, would otherwise go unnoticed, since its
+-- reports on the real corpus are all anyone reads.
+
+import Case (Case(..), Outcome(..), Result(..))
+import Case as Case
+import Files as Files
+import Programs as Programs
+
+-- The file-name prefix each outcome's case has.
+let prefixes = [
+    ("compiler_crash", CompilerCrash), ("program_crash", ProgramCrash),
+    ("harness_error", HarnessError), ("timeout", Timeout), ("xfail", XFail),
+    ("xpass", XPass), ("skip", Skip), ("fail", Fail), ("pass", Pass),
+]
+
+-- The cases in `ROOT/tests/harness/selftest`, and the one that crashes
+-- `boot`, which is written under the cache each run rather than committed:
+-- it is a program nested deeper than the compiler's stack, 400 KB of
+-- parentheses. If `boot` stops crashing on it, the selftest says so and a new
+-- way to crash it is wanted.
+fun cases(root : String, cache : String) -> Array Case {
+    let found = Programs.discover(root + "/tests/harness/selftest", "tests/harness/selftest")
+    let depth = 200000
+    let source = "fun main() { print(Int.toString(" + String.repeat("(", depth) + "1"
+                 + String.repeat(")", depth) + ")) }\n"
+    let directory = cache + "/selftest"
+    let _ = Files.writeText(directory + "/compiler_crash.gob", source)
+    let _ = Files.writeText(directory + "/compiler_crash.expected", "")
+    Array.append(found, Programs.discover(directory, "(generated)"))
+}
+
+-- Whether every case was given the outcome its name says, and every outcome
+-- was given to some case, printing what was not.
+fun check(cases : Array Case, results : Array Result) -> Bool {
+    var ok = True
+    for var i = 0; i < len(cases); i = i + 1 {
+        let name = cases[i].name
+        let base = match String.rsplitOnce(name, "/") {
+            Some((_, b)) -> b
+            None -> name
+        }
+        let got = results[i].outcome
+        match wanted(base) {
+            None -> {
+                print("selftest: " + name + " is not named for an outcome")
+                ok = False
+            }
+            Some(o) -> if o != got {
+                print("selftest: " + name + " should be " + Case.outcomeName(o) + ", was "
+                      + Case.outcomeName(got) + " (" + results[i].why + ")")
+                ok = False
+            }
+        }
+    }
+    for entry in prefixes {
+        let (_, o) = entry
+        var seen = False
+        for r in results {
+            if r.outcome == o { seen = True }
+        }
+        if !seen {
+            print("selftest: no case was given " + Case.outcomeName(o))
+            ok = False
+        }
+    }
+    print(if ok { "selftest: every outcome classified correctly" } else { "selftest: FAILED" })
+    ok
+}
+
+fun wanted(base : String) -> Option Outcome {
+    for entry in prefixes {
+        let (prefix, o) = entry
+        if String.startsWith(base, prefix) { return Some(o) }
+    }
+    None
+}

@@ -1,0 +1,242 @@
+module Cache (Cache(..), Compiled(..), open, compile, evict, panicked)
+
+-- Compiled programs, kept on disk under `ROOT/compile/KEY/` and shared by
+-- every run, worktree and concurrent session on the machine.
+--
+-- **The key** is SHA-256 over what a compile depends on: the `boot` binary's
+-- bytes; the library, by name and contents, since a library module the
+-- compiler itself never uses is in no byte of `boot`, but a program that
+-- imports it compiles differently when it changes; the toolchain's identity
+-- (`Toolchain.identity`); the arguments `boot` is given; and each of the
+-- case's sources by name and contents. Running is not cached: it is what is
+-- being tested.
+--
+-- **An entry is published whole.** It is filled in a fresh directory of its
+-- own and renamed into place, under an advisory lock on `KEY.lock`, so a
+-- concurrent compile of the same key waits and then finds the entry, and no
+-- reader ever sees half of one. What is kept is a compile that answered: a
+-- linked binary and `boot`'s warnings, or a refusal and its diagnostic. A
+-- crash or a timeout is not kept, so it is tried again next run.
+--
+-- **Eviction runs when the harness starts.** A hit rewrites the entry's
+-- `used` file, and an entry whose `used` is 7 days old is removed. Of the
+-- builds `scripts/test.sh` keeps (`boot/`, `stage1/`, `harness/`), all but the
+-- 8 most recently used are removed. Nothing used in the last hour is ever
+-- removed, so a concurrent session never loses what it is using.
+
+import Hash.SHA256 as SHA256
+import Process (Output(..), Status(..))
+import Process as Process
+import System.File as File
+import Time.Duration (Duration)
+import Time.Duration as Duration
+import Time.Instant as Instant
+import Time.Sleep as Sleep
+import Case (Case(..))
+import Files as Files
+import Toolchain (Toolchain(..))
+import Toolchain as Toolchain
+
+type Cache = Cache { root : String, base : String }
+
+-- What a compile came to: a binary and the warnings `boot` printed; a
+-- refusal, with `boot`'s exit status and diagnostic; `boot` crashing, or the
+-- link failing, with why and what it printed; or running out of time.
+type Compiled = Built(String, String) | Refused(Int, String) | Crashed(String, String)
+              | Overran(String)
+
+-- The cache under `root`, with the part of every key that does not depend
+-- on the case worked out once.
+fun open(root : String, t : Toolchain) -> Either String Cache {
+    let h = SHA256.new()
+    let boot = Files.readBytes(t.boot)?
+    SHA256.update(h, boot, 0, len(boot))
+    let library = Files.filesUnder(t.lib)?
+    feed(h, t.lib, Array.filter(library, fun(name) =
+        String.endsWith(name, ".gob") && !String.contains(name, "Probe_")))?
+    SHA256.updateText(h, t.identity)
+    Right(Cache { root = root, base = SHA256.hex(SHA256.finish(h)) })
+}
+
+-- Each of `names`, a path relative to `directory`, by name and contents.
+fun feed(h : SHA256.SHA256, directory : String, names : Array String) -> Either String Unit {
+    for name in names {
+        let bytes = match Files.readBytes(directory + "/" + name) {
+            Right(b) -> b
+            Left(why) -> return Left(why)
+        }
+        SHA256.updateText(h, name + "\u{0}" + Int.toString(len(bytes)) + "\u{0}")
+        SHA256.update(h, bytes, 0, len(bytes))
+    }
+    Right(())
+}
+
+fun keyOf(cache : Cache, c : Case, argv : Array String) -> Either String String {
+    let h = SHA256.new()
+    SHA256.updateText(h, cache.base + "\u{0}" + String.join(argv, " ") + "\u{0}")
+    feed(h, c.directory, c.sources)?
+    Right(SHA256.hex(SHA256.finish(h)))
+}
+
+-- Whether `stderr` holds a panic: a line starting `panic: `.
+fun panicked(stderr : String) -> Bool {
+    for line in String.lines(stderr) {
+        if String.startsWith(line, "panic: ") { return True }
+    }
+    False
+}
+
+-- `c` compiled and linked, from the cache or now. `Left` is a harness error:
+-- a source that cannot be read, or a cache that cannot be written.
+fun compile(cache : Cache, t : Toolchain, c : Case) -> Either String Compiled {
+    let flags = ["build", "-f", "obj"]
+    let key = keyOf(cache, c, flags)?
+    let entry = cache.root + "/compile/" + key
+    if let Some(found) = load(entry) { return Right(found) }
+    Files.writeText(entry + ".lock", "")?
+    let lockFile = match File.openReadWrite(entry + ".lock") {
+        Right(f) -> f
+        Left(e) -> return Left(show(e))
+    }
+    -- `tryLock` and a sleep rather than `lock`, whose wait blocks the worker
+    -- and with it every other case it is running.
+    while True {
+        match File.tryLock(lockFile) {
+            Right(True) -> break
+            Right(False) -> Sleep.sleep(Duration.millis(50))
+            Left(e) -> {
+                let _ = File.close(lockFile)
+                return Left(show(e))
+            }
+        }
+    }
+    let result = match load(entry) {
+        Some(found) -> Right(found)
+        None -> build(t, c, flags, entry)
+    }
+    let _ = File.close(lockFile)
+    result
+}
+
+-- The entry at `entry`, marked used, if there is one.
+fun load(entry : String) -> Option Compiled {
+    let status = match Files.readText(entry + "/status") {
+        Right(s) -> s
+        Left(_) -> return None
+    }
+    let stderr = Either.unwrapOr(Files.readText(entry + "/stderr"), "")
+    let _ = Files.writeText(entry + "/used", Int.toString(Instant.unixNanos(Instant.now())))
+    match Int.parse(status) {
+        Some(0) -> Some(Built(entry + "/bin", stderr))
+        Some(code) -> Some(Refused(code, stderr))
+        None -> None
+    }
+}
+
+fun build(t : Toolchain, c : Case, flags : Array String, entry : String)
+    -> Either String Compiled {
+    let staging = match File.temporaryDir("turkey-test-") {
+        Right(d) -> d
+        Left(e) -> return Left(show(e))
+    }
+    let compiled = runBoot(t, c, flags, staging)
+    let published = match compiled {
+        Built(_, stderr) -> publish(staging, entry, 0, stderr)
+        Refused(code, stderr) -> publish(staging, entry, code, stderr)
+        _ -> Right(())
+    }
+    let _ = File.removeTree(staging)
+    if let Left(why) = published { return Left(why) }
+    Right(match compiled {
+        Built(_, stderr) -> Built(entry + "/bin", stderr)
+        other -> other
+    })
+}
+
+-- `boot` on the case, writing its object and then the linked binary into
+-- `staging`.
+fun runBoot(t : Toolchain, c : Case, flags : Array String, staging : String) -> Compiled {
+    let object = staging + "/main.o"
+    let argv = Array.append(Array.append(t.run, [t.boot]),
+                            Array.append(flags, ["-o", object, c.entry]))
+    let limit = Toolchain.limit(t, 300)
+    let compiled = match Process.run(Toolchain.command(t, argv, c.directory), Some(limit)) {
+        Left(e) -> return Crashed("boot did not start: " + show(e), "")
+        Right(out) -> out
+    }
+    let stderr = Toolchain.text(compiled.stderr)
+    match compiled.status {
+        TimedOut -> return Overran(stderr)
+        Signaled(n) -> return Crashed("boot died by signal " + Int.toString(n), stderr)
+        Exited(code) -> {
+            if panicked(stderr) { return Crashed("boot panicked", stderr) }
+            if code != 0 { return Refused(code, stderr) }
+        }
+    }
+    let link = Toolchain.linkCommand(t, object, staging + "/bin", c.directory)
+    match Process.run(link, Some(limit)) {
+        Right(Output { status = Exited(0), .. }) -> Built(staging + "/bin", stderr)
+        Right(Output { status = TimedOut, stderr = linkErr, .. }) -> Overran(Toolchain.text(linkErr))
+        Right(Output { stderr = linkErr, .. }) -> Crashed("the link failed", Toolchain.text(linkErr))
+        Left(e) -> Crashed("the C compiler did not start: " + show(e), "")
+    }
+}
+
+-- Write the entry's status and diagnostic beside what is in `staging`, and
+-- rename it into place. A rename that finds the entry there already lost a
+-- race nobody should be able to run, since the lock is held; the entry that
+-- won is as good, and the staging directory is removed by the caller.
+fun publish(staging : String, entry : String, code : Int, stderr : String) -> Either String Unit {
+    Files.writeText(staging + "/stderr", stderr)?
+    Files.writeText(staging + "/used", "")?
+    -- `status` last: an entry is whole once it has one.
+    Files.writeText(staging + "/status", Int.toString(code))?
+    match File.rename(staging, entry) {
+        Right(_) -> Right(())
+        Left(e) -> if Files.exists(entry + "/status") { Right(()) } else { Left(show(e)) }
+    }
+}
+
+-- -- eviction -------------------------------------------------------------------------
+
+let week : Duration = Duration.hours(24 * 7)
+
+let hour : Duration = Duration.hours(1)
+
+let buildsKept : Int = 8
+
+fun evict(root : String) -> Unit {
+    let compiled = root + "/compile"
+    for name in Files.listed(compiled) {
+        let path = compiled + "/" + name
+        if String.endsWith(name, ".lock") {
+            -- A lock outlives its entry by a week, so whoever holds one is
+            -- long gone.
+            let entry = Option.unwrapOr(String.stripSuffix(path, ".lock"), path)
+            if !Files.exists(entry) && olderThan(path, week) { let _ = File.removeFile(path) }
+        } else if olderThan(path + "/used", week) {
+            let _ = File.removeTree(path)
+        }
+    }
+    for kind in ["boot", "stage1", "harness"] {
+        let directory = root + "/" + kind
+        let names = Files.listed(directory)
+        let newestFirst = Array.sortBy(names, fun(a, b) =
+            Int.compare(ageOf(directory + "/" + a), ageOf(directory + "/" + b)))
+        for var i = buildsKept; i < len(newestFirst); i = i + 1 {
+            let path = directory + "/" + newestFirst[i]
+            if olderThan(path, hour) { let _ = File.removeTree(path) }
+        }
+    }
+}
+
+-- In nanoseconds, with what is gone counted as oldest.
+fun ageOf(path : String) -> Int = match Files.age(path) {
+    Some(d) -> Duration.toNanos(d)
+    None -> Int.maxValue()
+}
+
+fun olderThan(path : String, d : Duration) -> Bool = match Files.age(path) {
+    Some(a) -> a > d
+    None -> False
+}

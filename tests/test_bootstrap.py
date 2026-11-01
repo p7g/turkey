@@ -198,8 +198,10 @@ def test_the_bootstrap_is_what_its_provenance_says():
     """Cheap, so not opt in: the committed artifact against its record.
 
     `scripts/build.sh` checks the same hashes before it builds, so a mismatch
-    here is a build that will refuse to start. The commit has to exist for
-    the chain to be walked back to source.
+    here is a build that will refuse to start. The commit has to be in
+    HEAD's history for the chain to be walked back to source: a squash or
+    rebase merge of the bump leaves it reachable only from the pull request's
+    branch, if at all.
     """
     fields = _provenance()
     artifacts = sorted(BOOTSTRAP.glob("*.s.gz"))
@@ -212,9 +214,10 @@ def test_the_bootstrap_is_what_its_provenance_says():
                 == fields[f"{target} asm-sha256"])
     if (REPO_ROOT / ".git").exists() and shutil.which("git"):
         found = subprocess.run(
-            ["git", "cat-file", "-e", f"{fields['commit']}^{{commit}}"],
+            ["git", "merge-base", "--is-ancestor", fields["commit"], "HEAD"],
             cwd=REPO_ROOT, capture_output=True)
-        assert found.returncode == 0, f"no commit {fields['commit']}"
+        assert found.returncode == 0, \
+            f"commit {fields['commit']} is not in HEAD's history"
 
 
 def test_build_sh_speaks_only_the_bootstraps_command_line():

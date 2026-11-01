@@ -9,6 +9,8 @@
 # The bump is its own commit, containing only bootstrap/, so that a bad one is
 # fixed by reverting it. This runs the fixed point first and refuses a dirty
 # tree, because PROVENANCE has to name the commit the assembly was built from.
+# For the same reason the pull request is merged with a merge commit: a squash
+# or rebase drops that commit from main's history.
 #
 # There is one artifact per target, arm64-darwin.s.gz and arm64-linux.s.gz, and
 # a bump writes both from the fixed-point compiler, whichever target that was

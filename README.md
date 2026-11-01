@@ -191,7 +191,22 @@ For more depth:
 - [Language reference](docs/ref/README.md): the syntax and meaning of every construct
 - [Compiler written in Turkey](src/)
 
-The tests are Python. Install their dependencies with
+The recorded programs in `tests/programs/` are run by a harness written in
+Turkey, `tests/harness/`:
+
+    sh scripts/test.sh                    # every program, one per core at once
+    sh scripts/test.sh tests/programs/bf  # the programs whose path starts so
+    sh scripts/test.sh -v --shard 2/4     # a quarter of them, passes listed
+    sh scripts/test.sh --selftest         # the harness checked on its own cases
+
+It builds `boot` (or uses `TURKEY_BOOT`) and compiles itself with the committed
+bootstrap compiler, both cached in `$TMPDIR/turkey-test/`, as are compiled
+programs. A program's expected outcome is a directive in it: `--@ error` (it
+must not compile), `--@ panic`, `--@ exit: N`, and otherwise exit 0. A case
+that fails is shown with a diff, and every actual output is kept under
+`$TMPDIR/turkey-test/actual/`.
+
+The rest of the tests are Python. Install their dependencies with
 `python3 -m pip install -e '.[dev]'`, then run `python3 -m pytest tests -q`.
 The tests compile their programs with `boot`, which is built from the
 committed bootstrap on first use; `TURKEY_BOOT` points them at one you built

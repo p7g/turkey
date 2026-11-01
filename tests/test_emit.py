@@ -336,15 +336,17 @@ fun main() { print(at([1, 2, 3], 2)) }
 
 def test_a_bounds_check_is_a_compare_and_branch_per_half():
     """`i < 0 || !(i < length)`, where nothing proves `i >= 0`: each half is
-    a `cmp` and a conditional branch to the panic, and no `i1` is made for the
-    join."""
+    a `cmp` and a conditional branch to the panic, no `i1` is made for the
+    join, and the load carries no second check."""
     result = lang.dump("asm", BOUNDS_CHECK)
     assert result.code == 0, result.stderr
     body = _functions(result.stdout)["Main#at"]
     assert not [line for line in body if line.startswith("cset")], body
+    assert len([line for line in body if line.startswith("cmp ")]) == 3, body
     below = [line.split()[1] for line in body if line.startswith("b.lt ")]
     above = [line.split()[1] for line in body if line.startswith("b.ge ")]
     assert len(below) == 1 and below == above, body
+    assert not [line for line in body if line.startswith("b.hs ")], body
     assert lang.output(BOUNDS_CHECK) == "3\n"
 
 

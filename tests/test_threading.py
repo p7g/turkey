@@ -37,9 +37,10 @@ fun main() { print(at([1, 2, 3], 2)) }
 """
 
 
-def test_a_bounds_check_is_two_branches():
+def test_a_bounds_check_is_two_branches_and_the_access_is_proven():
     """The library's `i < 0 || !(i < length)`: each comparison is branched
-    on where it is made, and nothing is joined or negated.
+    on where it is made, and the block holding the access is entered only from
+    `i < length`, so the access carries no check of its own.
 
     A call to itself keeps `at` from being inlined into `main`.
     """
@@ -47,6 +48,8 @@ def test_a_bounds_check_is_two_branches():
     assert not _bool_joins(body), body
     assert not re.search(r"= not ", body), body
     assert re.search(r"%(\d+) = lt %2, %\d+\n\s*branch %\1:i1", body), body
+    gets = [line.strip() for line in body.splitlines() if "= array.get " in line]
+    assert gets and all(line.endswith("; in bounds") for line in gets), gets
     assert lang.output(AT) == "3\n"
 
 

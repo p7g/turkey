@@ -518,6 +518,28 @@ fun branchIf(s : Sel, c : A.Cond, yes : Int, no : Int) -> Unit {
     s.out.blocks[s.at].term = Branch(taken, BlockId(yes), BlockId(no))
 }
 
+-- A `not` of a comparison selected just before it is the opposite `cset`
+-- on the same flags, which are still set. The emitter folds a `cset` that
+-- ends a block into its branch, so a branch on `!(a < b)` is `b.ge` and not
+-- `cset; eor; cbnz`; and the first `cset`, if nothing else reads it, is dead.
+--
+-- Not by swapping the branch's arms instead: the emitter lays a block's `no`
+-- arm out next, and the arms are the way round the source wrote them, with
+-- the failure path of a check taken and the code after it falling through.
+fun negate(s : Sel, d : Reg, a : Value) -> Unit {
+    let insts = s.out.blocks[s.at].insts
+    if len(insts) > 0 {
+        match A.csetOf(insts[len(insts) - 1].op) {
+            Some((n, c)) -> if n == Ssa.valueId(a) {
+                emit(s, A.CSet(d, A.invert(c)))
+                return
+            }
+            None -> {}
+        }
+    }
+    emit(s, A.EorImm(d, A.reg(a), 1, A.W32))
+}
+
 -- A new block at the end, and its id.
 fun block(s : Sel) -> Int {
     Vec.push(s.out.blocks, Ssa.newBlock())
@@ -614,7 +636,7 @@ fun selectInst(s : Sel, i : Low) -> Unit {
         -- distinguish the two.
         Convert(PtrToInt, a) -> emit(s, A.Mov(d, A.reg(a), A.W64))
         Convert(IntToPtr, a) -> emit(s, A.Mov(d, A.reg(a), A.W64))
-        Not(a) -> emit(s, A.EorImm(d, A.reg(a), 1, A.W32))
+        Not(a) -> negate(s, d, a)
         Intrinsic(k, a) -> intrinsic(s, d, k, A.reg(a))
         -- A field is at a constant offset from the header.
         ObjectGet(target, field) -> loadField(s, d, A.Offset(A.reg(target), field.offset), r)

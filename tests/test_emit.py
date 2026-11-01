@@ -23,7 +23,7 @@ from pathlib import Path
 
 import pytest
 
-from tests import bootc, toolchain
+from tests import bootc, lang, toolchain
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PROGRAMS = REPO_ROOT / "tests" / "programs"
@@ -205,3 +205,32 @@ def test_the_compilers_own_source_assembles():
     assert "// skipped " not in text
     result = _assembles(text)
     assert result.returncode == 0, result.stderr[:4000]
+
+
+NEGATED_BRANCHES = """
+fun total(xs : Array Int, n : Int) -> Int {
+    var sum = 0
+    for var i = 0; i < n; i = i + 1 { sum = sum + xs[i] }
+    sum
+}
+
+fun main() -> Unit {
+    let xs = [1, 2, 3, 4]
+    print(total(xs, 4))
+    if !(total(xs, 2) < 3) { print("big") } else { print("small") }
+}
+"""
+
+
+def test_a_branch_on_a_negated_comparison_reads_the_flags():
+    """`!(i < length)`, the second half of every bounds check, is one `b.ge`.
+
+    The `not` is the opposite `cset`, which the emitter folds into the branch,
+    so no comparison is materialized and negated on the way to it.
+    """
+    result = lang.dump("asm", NEGATED_BRANCHES)
+    assert result.code == 0, result.stderr
+    body = _functions(result.stdout)["Main#total"]
+    assert not [line for line in body if line.startswith(("cset", "eor"))], body
+    assert any(line.startswith("b.ge ") for line in body), body
+    assert lang.output(NEGATED_BRANCHES) == "10\nbig\n"

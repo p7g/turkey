@@ -1,4 +1,4 @@
-module Turkey.FD (FD, fd, number, closed, read, write, writeText, readAt, writeAt, using, close)
+module Turkey.FD (FD, fd, number, closed, timedOut, read, readBy, write, writeText, readAt, writeAt, using, close)
 
 -- A descriptor that tasks share: the one place the I/O layer decides when a
 -- descriptor number stops being this file's, and which of two tasks using it
@@ -67,8 +67,12 @@ module Turkey.FD (FD, fd, number, closed, read, write, writeText, readAt, writeA
 -- so that only then is its poller registration dropped before the number is
 -- closed.
 --
+-- **A deadline.** `readBy` takes one, a point on `Turkey.Wait.now`'s clock or
+-- -1 for none, and gives up at it from either wait: the one before the call
+-- and the one after `EAGAIN`.
+--
 -- Every result is a count, never negative, or the negated `errno`, as
--- `Turkey.IO`'s are, or `closed`.
+-- `Turkey.IO`'s are, or `closed`, or, for `readBy`, `timedOut`.
 
 import Turkey.Coroutine as Co
 import Turkey.IO as IO
@@ -92,6 +96,10 @@ let fieldsAt : Int = 24
 -- What an operation on an `FD` that has been closed answers: below every
 -- negated `errno`, so that it cannot be mistaken for one.
 let closed : Int = -0x1_0000_0000
+
+-- What `readBy` answers when its deadline came first: `Turkey.Wait.timedOut`,
+-- below every negated `errno` and distinct from `closed`.
+let timedOut : Int = Wait.timedOut
 
 -- The `state` field is `var` though nothing assigns it: it changes after the
 -- record is built, by atomic instructions at its address, and a field that is
@@ -124,7 +132,14 @@ fun number(f : FD) -> Int = f.number
 -- Up to `to - from` bytes into `bytes[from..to)`, from the descriptor's
 -- position: how many, at least 1, or 0 at end of file. One read at a time per
 -- `FD`.
-fun read(f : FD, bytes : Array Byte, from : Int, to : Int) -> Int {
+fun read(f : FD, bytes : Array Byte, from : Int, to : Int) -> Int =
+    readBy(f, bytes, from, to, -1)
+
+-- `read`, giving up at `deadline`, a monotonic time in nanoseconds
+-- (`Turkey.Wait.now`) or -1 for none: `timedOut` if it came first. A read that
+-- timed out has transferred nothing, and leaves the descriptor as it was, so
+-- the caller may make it again as it would after `EAGAIN`.
+fun readBy(f : FD, bytes : Array Byte, from : Int, to : Int, deadline : Int) -> Int {
     if !lock(f, readLock, readWaited) { return closed }
     var n = 0
     match f.readMode {
@@ -135,8 +150,8 @@ fun read(f : FD, bytes : Array Byte, from : Int, to : Int) -> Int {
     while True {
         match f.readMode {
             WaitFirst -> {
-                let w = park(f, False)
-                if w == closed {
+                let w = park(f, False, deadline)
+                if w == closed || w == timedOut {
                     n = w
                     break
                 }
@@ -148,7 +163,7 @@ fun read(f : FD, bytes : Array Byte, from : Int, to : Int) -> Int {
         n = IO.read(f.number, bytes, from, to)
         if n == -Sys.eintr { continue }
         if n == -Sys.eagain() {
-            let w = park(f, False)
+            let w = park(f, False, deadline)
             if w == 0 { continue }
             n = w
         }
@@ -375,7 +390,7 @@ fun writeAll(f : FD, step : fun(Int) -> Int, from : Int, to : Int, sequential : 
                 Scheduler.yield()
                 continue
             }
-            let w = park(f, True)
+            let w = park(f, True, -1)
             if w == 0 { continue }
             return w
         }
@@ -388,12 +403,13 @@ fun writeAll(f : FD, step : fun(Int) -> Int, from : Int, to : Int, sequential : 
 
 -- The descriptor was not ready, and the caller holds a reference and the
 -- direction's lock: wait until it is, and answer 0. `closed` if `close` ended
--- the wait, or the negated `errno` of a wait the poller could not make.
-fun park(f : FD, writing : Bool) -> Int {
+-- the wait, `timedOut` if `deadline` came first, or the negated `errno` of a
+-- wait the poller could not make.
+fun park(f : FD, writing : Bool, deadline : Int) -> Int {
     f.polled = True
     let stop = fun() = Prim.intAnd(Prim.atomicLoad(Prim.objectAddress(f), fieldsAt), closedBit) != 0
-    let w = if writing { Wait.writableUnless(f.number, -1, stop) }
-            else { Wait.readableUnless(f.number, -1, stop) }
+    let w = if writing { Wait.writableUnless(f.number, deadline, stop) }
+            else { Wait.readableUnless(f.number, deadline, stop) }
     if w == Wait.cancelled { closed } else { w }
 }
 

@@ -38,7 +38,7 @@
 # --fixpoint, of which each self-compile is about 105 s and each link 10 s.
 #
 # Usage: scripts/build.sh [--out DIR] [--target TARGET] [--fixpoint]
-#                         [--stage1 BINARY]
+#                         [--stage1 BINARY] [--stage1-only]
 #
 #   --out DIR        where the stages go (default build/stages)
 #   --target TARGET  arm64-darwin or arm64-linux (default: what $CC links for)
@@ -46,6 +46,8 @@
 #   --stage1 BINARY  use an existing compiler as stage1 instead of the committed
 #                    assembly; how the first bump was made, and how to bump
 #                    across a change the committed compiler cannot build
+#   --stage1-only    stop after stage1: what scripts/test.sh compiles the test
+#                    harness with
 
 set -eu
 
@@ -68,14 +70,16 @@ out=build/stages
 target=
 fixpoint=0
 stage1=
+only1=0
 while [ $# -gt 0 ]; do
     case $1 in
         --out) out=$2; shift 2 ;;
         --target) target=$2; shift 2 ;;
         --fixpoint) fixpoint=1; shift ;;
         --stage1) stage1=$2; shift 2 ;;
+        --stage1-only) only1=1; shift ;;
         *) echo "usage: $0 [--out DIR] [--target TARGET] [--fixpoint]" \
-                "[--stage1 BINARY]" >&2
+                "[--stage1 BINARY] [--stage1-only]" >&2
            exit 2 ;;
     esac
 done
@@ -184,6 +188,11 @@ else
     fi
     link "$out/stage1.s" "$out/stage1"
     rm "$out/stage1.s"
+fi
+
+if [ $only1 = 1 ]; then
+    step "done: $out/stage1"
+    exit 0
 fi
 
 emit "$out/stage1" "$out/stage2.o"

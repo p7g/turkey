@@ -1,8 +1,11 @@
 """Regenerate the golden `.expected` files under tests/programs.
 
 Run from the repository root: `python3 -m tests.regenerate_expected`. Each
-program is compiled and run exactly the way `tests/test_programs.py` does it --
-the same function -- so the goldens and the runner can never drift apart.
+program is compiled and run as `tests/harness/` runs it: by `boot` from its
+own directory, then linked and run there, its output being stdout then
+stderr. A program that says `--@ xfail` is left alone, since its golden
+records what it is expected *not* to print yet; writing what it does print
+would delete that.
 
 Review the diff before committing: a changed golden is either a fix or a
 regression, and only you can tell which. Nothing else checks these files now;
@@ -14,9 +17,8 @@ from __future__ import annotations
 import pathlib
 
 from tests import lang
-from tests.test_programs import NO_TRACE_YET, PROGRAMS_DIR, conformance, outcome
 
-PROGRAMS = PROGRAMS_DIR
+PROGRAMS = lang.CORPUS
 
 
 def sources() -> list[pathlib.Path]:
@@ -30,21 +32,39 @@ def name_of(source: pathlib.Path) -> str:
     return source.parent.name if source.name == "Main.gob" else source.stem
 
 
+def directives(program: pathlib.Path) -> dict[str, str]:
+    """The program's `--@ name: value` lines, as the harness reads them."""
+    found = {}
+    for line in program.read_text().splitlines():
+        if line.startswith("--@"):
+            name, _, value = line[3:].partition(":")
+            found[name.strip()] = value.strip()
+    return found
+
+
+def conformance(program: pathlib.Path) -> tuple[str, int]:
+    """What the program printed, stdout then stderr, and its status."""
+    try:
+        result = lang.run(program)
+    except lang.CompileError as error:
+        return error.rendered, error.code
+    return result.stdout + result.stderr, result.code
+
+
 def main() -> int:
     for source in sources():
-        output, code = conformance(source)
-        golden = source.with_suffix(".expected")
-        if name_of(source) in NO_TRACE_YET:
-            # `boot`'s binaries print no panic trace yet, and writing what they
-            # do print would delete the trace the golden records.
-            print(f"{name_of(source)}: kept, since boot prints no trace yet")
+        said = directives(source)
+        if "xfail" in said:
+            print(f"{name_of(source)}: kept, since it says --@ xfail: {said['xfail']}")
             continue
-        golden.write_text(output, encoding="utf-8")
-        kind, status = outcome(source)
-        ended_as_said = code == status if kind == "exit" else code != 0
+        output, code = conformance(source)
+        source.with_suffix(".expected").write_text(output, encoding="utf-8")
+        if "error" in said or "panic" in said:
+            ended_as_said = code != 0
+        else:
+            ended_as_said = code == int(said.get("exit", "0"))
         if not ended_as_said:
-            said = f"exit {status}" if kind == "exit" else kind
-            print(f"warning: {name_of(source)} says --@ {said}, but exited {code}")
+            print(f"warning: {name_of(source)} exited {code}, which its directives do not say")
         print(f"{name_of(source)}: exit {code}, {len(output.splitlines())} line(s)")
 
     # Only programs that already have a `.types`, `.core`, `.mono` or `.opt`

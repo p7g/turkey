@@ -39,7 +39,6 @@ import Turkey.Layout as Layout
 import Turkey.LowIr as L
 import Turkey.LowIr (Op(..), Low(..), AddressOf(..), BinOp(..), CmpOp(..), Conv(..),
                      AtomicOp(..), Callee(..), Builder(..), IndexCheck(..))
-import Turkey.Prelude as P
 import Turkey.Prims as Prims
 import Turkey.Runtime as Rt
 import Turkey.LocalEscape as LocalEscape
@@ -816,6 +815,16 @@ fun switched(l : Lower, whole : Value, ty : Ty.Type, alts : Vec CAlt,
                 default = None
             }
         }
+        Indices(all) -> {
+            for var i = 0; i < len(tested); i = i + 1 {
+                let key = Option.unwrapOr(Array.indexOf(all, conOf(tested[i].alt)), -1)
+                if !Set.contains(keyed, key) {
+                    Set.add(keyed, key)
+                    Vec.push(cases, (key, blocks[i]))
+                }
+            }
+            if len(keyed) == len(all) { default = None }
+        }
         Words(c) -> {
             var payload : Option BlockId = None
             for var i = 0; i < len(tested); i = i + 1 {
@@ -846,7 +855,7 @@ fun switched(l : Lower, whole : Value, ty : Ty.Type, alts : Vec CAlt,
         Tags(_) -> L.emit(l.b, ObjectTag(whole), Ssa.untraced(I32))
         _ -> whole
     }
-    L.terminate(l.b, Switch(discriminant, cases, default))
+    L.terminate(l.b, decide(l, discriminant, cases, default))
     for var i = 0; i < len(tested); i = i + 1 {
         L.into(l.b, blocks[i])
         armOf(l, shape, tested[i], whole, ty, dest)
@@ -859,10 +868,28 @@ fun switched(l : Lower, whole : Value, ty : Ty.Type, alts : Vec CAlt,
     True
 }
 
+-- A switch, or a branch where the value is one bit: an enumeration of two
+-- constructors is held at `i1`, and a branch tests the bit itself where a
+-- switch would compare it against a key.
+fun decide(l : Lower, v : Value, cases : Vec (Int, BlockId),
+           default : Option BlockId) -> Term {
+    if Ssa.repOf(l.func, v).class_ != I1 { return Switch(v, cases, default) }
+    match (caseFor(cases, default, 1), caseFor(cases, default, 0)) {
+        (Some(yes), Some(no)) -> Branch(v, yes, no)
+        _ -> Switch(v, cases, default)
+    }
+}
+
+fun caseFor(cases : Vec (Int, BlockId), default : Option BlockId,
+            key : Int) -> Option BlockId {
+    for (k, block) in cases { if k == key { return Some(block) } }
+    default
+}
+
 -- What a switch reads: an ordinary sum's tag, every one of which its type
--- names; a one-word compact sum's word; or the value of an integer or
--- character.
-type SwitchShape = Tags(Array String) | Words(Compact) | Literals
+-- names; an enumeration's value, which is its index among those names; a
+-- one-word compact sum's word; or the value of an integer or character.
+type SwitchShape = Tags(Array String) | Indices(Array String) | Words(Compact) | Literals
 
 fun switchShape(l : Lower, whole : Value, ty : Ty.Type,
                 tested : Vec CAlt) -> Option SwitchShape {
@@ -880,7 +907,6 @@ fun switchShape(l : Lower, whole : Value, ty : Ty.Type,
             Some(Literals)
         }
         ACon(first, _, _) -> {
-            if first == P.boolFalse || first == P.boolTrue { return None }
             if Option.isSome(Decls.erasedPayload(l.decls, ty)) { return None }
             let info = match Decls.con(l.decls, first) {
                 Some(i) -> i
@@ -896,6 +922,9 @@ fun switchShape(l : Lower, whole : Value, ty : Ty.Type,
                     ACon(name, _, None) -> if !Array.contains(variants, name) { return None }
                     _ -> return None
                 }
+            }
+            if Option.isSome(Decls.enumIndex(l.decls, first)) {
+                return Some(Indices(variants))
             }
             match compactAt(l, first, ty) {
                 Some(c) -> Some(Words(c))
@@ -980,12 +1009,18 @@ fun testArm(l : Lower, alt : Alt, v : Value, ty : Ty.Type,
         }
         ACon(name, binders, Some(o)) -> opened(l, name, binders, o, v, ty, success, failure)
         ACon(name, binders, None) -> {
-            if name == P.boolFalse || name == P.boolTrue {
-                let want = L.emit(l.b, ConstInt(if name == P.boolTrue { 1 } else { 0 }),
-                                  Ssa.untraced(I1))
-                let test = L.emit(l.b, Cmp(Eq, v, want), Ssa.untraced(I1))
-                L.terminate(l.b, Branch(test, success, failure))
-                return
+            match Decls.enumIndex(l.decls, name) {
+                Some(i) -> {
+                    if Decls.variantCount(l.decls, name) <= 1 {
+                        L.terminate(l.b, Jump(success, []))
+                        return
+                    }
+                    let want = enumValue(l, i, Ssa.repOf(l.func, v))
+                    let test = L.emit(l.b, Cmp(Eq, v, want), Ssa.untraced(I1))
+                    L.terminate(l.b, Branch(test, success, failure))
+                    return
+                }
+                None -> {}
             }
             -- The wrapper is not there, so there is no tag to test and nothing
             -- to take out: the value in hand already *is* the payload. See
@@ -1787,7 +1822,8 @@ fun compactField(l : Lower, c : Compact, ty : Ty.Type) -> Ty.Type =
 
 -- Whether values of `ty` are certainly neither below `Heap.immediates` nor
 -- wraps, so the payload constructor over one needs no test. A record, tuple,
--- closure, array or any sum that is not compact-shaped is an ordinary object.
+-- closure, array or any sum that is neither compact-shaped nor an enumeration
+-- is an ordinary object.
 -- A variable is not known to be, and a compact sum's own values may be small
 -- integers or wraps.
 fun plain(l : Lower, ty : Ty.Type) -> Bool {
@@ -1804,6 +1840,7 @@ fun plain(l : Lower, ty : Ty.Type) -> Bool {
     let (h, _) = Ty.spine(t)
     match h {
         TCon(c) -> c.uid == 0 && Option.isNone(Decls.compactShape(l.decls, c.name))
+                   && Option.isNone(Decls.enumSize(l.decls, c.name))
         _ -> False
     }
 }
@@ -1900,14 +1937,20 @@ fun compactPayload(l : Lower, c : Compact, binders : Array (Option String), v : 
     Map.put(l.env, bound, inner)
 }
 
--- A saturated constructor. A nullary one that is not a one-word compact sum's
--- is an object with no fields, interned per (kind, tag) rather than allocated
--- at each use.
+-- An enumeration's constructor: its index, at the width its type is held at
+-- (`Decls.enumSize`). An enumeration of one constructor is held at no width.
+fun enumValue(l : Lower, index : Int, rep : Rep) -> Value =
+    if rep.class_ == Unit { L.emit(l.b, ConstUnit, rep) }
+    else { L.emit(l.b, ConstInt(index), rep) }
+
+-- A saturated constructor. A nullary one that is neither an enumeration's nor a
+-- one-word compact sum's is an object with no fields, interned per (kind, tag)
+-- rather than allocated at each use.
 fun constructor(l : Lower, e : Core, name : String, args : Array Core,
                 rep : Rep) -> Value {
-    if name == P.boolFalse || name == P.boolTrue {
-        return L.emit(l.b, ConstInt(if name == P.boolTrue { 1 } else { 0 }),
-                      Ssa.untraced(I1))
+    match Decls.enumIndex(l.decls, name) {
+        Some(i) -> return enumValue(l, i, repOf(l, e.ty))
+        None -> {}
     }
     match Decls.erasedPayload(l.decls, e.ty) {
         Some(_) -> if len(args) == 1 { return value(l, args[0]) }

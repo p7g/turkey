@@ -113,9 +113,11 @@ def test_a_pattern_match_becomes_a_tag_test_and_a_branch():
     out = _ssa("adt.gob")
     assert "object.tag " in out
     # Exhaustiveness has already decided this arm is unreachable. It is
-    # emitted anyway so that a bug in an earlier pass stops with a name.
-    assert 'panic' in out
-    assert 'no match arm applied' in out
+    # emitted anyway so that a bug in an earlier pass stops with a name. A
+    # switch naming every constructor has no such arm, and an opening is
+    # tested arm by arm, so an existential match is where one survives.
+    opened = lang.dump("ssa", (PROGRAMS / "existential_forms.gob").read_text())
+    assert 'no match arm applied' in opened.stdout
 
 
 def test_a_single_variant_pattern_reads_no_tag():

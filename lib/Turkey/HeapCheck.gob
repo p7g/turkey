@@ -1,5 +1,5 @@
 module Turkey.HeapCheck (
-    verify, stateBytes, stateRegions, stateAvailable, stateRegionTable,
+    Phase(..), verify, stateBytes, stateRegions, stateAvailable, stateRegionTable,
     stateRegionTableCapacity, stateRegionTableCount, stateRegionBytes, stateObjects,
     stateMarkEpoch, stateFrameEntries, stateFrameEntryCount, stateStacks,
     stateRoots, stateMinor, stateGenerational, stateRemembered, stateRememberedCount,
@@ -170,7 +170,7 @@ var indexCount : Int = 0
 
 -- One check's settings, and the collector's state it was handed.
 var state : Prim.Ptr = Prim.ptrNull()
-var phase : Int = 0
+var phase : Phase = BeforeMarking
 var epoch : Int = 0
 var minor : Bool = False
 var barriers : Bool = False
@@ -192,8 +192,32 @@ var textLength : Int = 0
 
 -- -- the entry points -----------------------------------------------------------------
 
--- Check the heap at `when` -- 0 before marking, 1 before sweeping, 2 after
--- sweeping -- for a collection whose Turkey stack starts at `frame`, and end
+-- Where in a collection a check is made.
+type Phase = BeforeMarking | BeforeSweeping | AfterSweeping
+
+-- Whether marking has run, so a reached object is marked by now.
+fun afterMarking() -> Bool = match phase {
+    BeforeMarking -> False
+    BeforeSweeping -> True
+    AfterSweeping -> True
+}
+
+fun beforeSweeping() -> Bool = match phase {
+    BeforeSweeping -> True
+    _ -> False
+}
+
+fun afterSweeping() -> Bool = match phase {
+    AfterSweeping -> True
+    _ -> False
+}
+
+-- A phase as C numbers it: 0 before marking, 1 before sweeping, 2 after.
+fun phaseOf(when : Int) -> Phase =
+    if when == 0 { BeforeMarking } else if when == 1 { BeforeSweeping } else { AfterSweeping }
+
+-- Check the heap at `when` for a collection whose Turkey stack starts at
+-- `frame`, and end
 -- the process with status 1 if it fails. A corrupt heap is not something to
 -- unwind through: an entry initializer may dereference an allocation result
 -- before it can see a panic.
@@ -201,7 +225,7 @@ var textLength : Int = 0
 -- With a panic pending this checks nothing, because Turkey code unwinds at
 -- every call while the flag is up. Nor does the collector mark or sweep then,
 -- for the same reason, so there is nothing for a check to catch.
-fun verify(when : Int, frame : Prim.Ptr, handed : Prim.Ptr) -> Unit {
+fun verify(when : Phase, frame : Prim.Ptr, handed : Prim.Ptr) -> Unit {
     if check(when, frame, handed) { return {} }
     if !Prim.ptrIsNull(text) {
         putByte(10)
@@ -215,7 +239,7 @@ fun verify(when : Int, frame : Prim.Ptr, handed : Prim.Ptr) -> Unit {
 -- `turkey_heap_state`.
 foreign "turkey_heap_check" fun checkForTests(when : Int, frame : Prim.Ptr,
                                               handed : Prim.Ptr) -> Int =
-    if check(when, frame, handed) { 1 } else { 0 }
+    if check(phaseOf(when), frame, handed) { 1 } else { 0 }
 
 foreign "turkey_heap_check_message" fun message() -> Prim.Ptr = text
 
@@ -223,13 +247,13 @@ foreign "turkey_heap_check_message" fun message() -> Prim.Ptr = text
 -- and a frame table and puts them in the state it hands over.
 foreign "turkey_heap_check_frames" fun checkFramesForTests(when : Int, current : Int,
                                                           handed : Prim.Ptr) -> Int {
-    if !begin(when, handed) { return 0 }
+    if !begin(phaseOf(when), handed) { return 0 }
     let passed = checkFrames(current)
     releaseIndex()
     if passed { 1 } else { 0 }
 }
 
-fun check(when : Int, frame : Prim.Ptr, handed : Prim.Ptr) -> Bool {
+fun check(when : Phase, frame : Prim.Ptr, handed : Prim.Ptr) -> Bool {
     if !begin(when, handed) { return False }
     let passed = checkRegions() && checkTable() && checkObjects() && checkRemembered()
                  && checkAvailable() && checkRoots()
@@ -239,7 +263,7 @@ fun check(when : Int, frame : Prim.Ptr, handed : Prim.Ptr) -> Bool {
 }
 
 -- Take the state, and index its regions.
-fun begin(when : Int, handed : Prim.Ptr) -> Bool {
+fun begin(when : Phase, handed : Prim.Ptr) -> Bool {
     textLength = 0
     if Prim.ptrIsNull(handed) || Prim.ptrIsNull(expected) || Prim.ptrIsNull(actual) {
         return fail(Prim.cString("out of memory"), 0, -1)
@@ -508,17 +532,17 @@ fun checkSlots(r : Int, capacity : Int, slotSize : Int) -> Bool {
             if generation != young && generation != old && generation != rememberedOld {
                 return failAt(Prim.cString("invalid generation word"), h, si)
             }
-            if phase != 1 && marked != (generation != young) {
+            if !beforeSweeping() && marked != (generation != young) {
                 return failAt(Prim.cString("region marks and generation disagree"), h, si)
             }
             let reached = reachedAt(h)
-            if phase == 1 && marked != reached {
+            if beforeSweeping() && marked != reached {
                 return failAt(Prim.cString("header and region marks disagree"), h, si)
             }
-            if phase == 2 && !reached {
+            if afterSweeping() && !reached {
                 return failAt(Prim.cString("unmarked sweep survivor"), h, si)
             }
-            if phase == 2 && generation != old {
+            if afterSweeping() && generation != old {
                 return failAt(Prim.cString("young or remembered sweep survivor"), h, si)
             }
         }
@@ -661,12 +685,12 @@ fun checkObject(h : Int) -> Bool {
     let payload = Prim.ptrFromInt(value)
     let size = Prim.loadI64(header, headerSize)
     let heapKind = load32(header, headerKind)
-    let marked = phase != 0 && reachedAt(header)
+    let marked = afterMarking() && reachedAt(header)
     let generation = Prim.loadI64(header, headerGeneration)
     if generation == rememberedOld { rememberedSeen = rememberedSeen + 1 }
     -- Between collections, with the barrier emitted: an old object that is
     -- not remembered holds no young one.
-    let unremembered = phase == 0 && barriers && generation == old
+    let unremembered = !afterMarking() && barriers && generation == old
     if heapKind == heapCell {
         if size != cellBytes { return fail(Prim.cString("invalid cell size"), value, -1) }
         return load32(payload, cellFlag) == 0
@@ -768,7 +792,7 @@ fun notYoung(value : Int, owner : Int, at : Int) -> Bool {
 -- still says it is remembered until the sweep frees it. After the sweep no
 -- object is, which `checkSlots` checks.
 fun checkRemembered() -> Bool {
-    if phase != 0 { return True }
+    if afterMarking() { return True }
     let count = stateWord(stateRememberedCount)
     let entries = Prim.loadPtr(state, stateRemembered)
     if count != rememberedSeen {
@@ -808,7 +832,7 @@ fun checkRoots() -> Bool {
         if count < 0 || values == 0 { return fail(Prim.cString("invalid root frame"), rf, -1) }
         for var rs = 0; rs < count; rs = rs + 1 {
             if (rs >= 64 || hasBit(live, rs))
-                    && !checkPointer(word(values, 8 * rs), phase != 0, rf, rs) {
+                    && !checkPointer(word(values, 8 * rs), afterMarking(), rf, rs) {
                 return False
             }
         }
@@ -882,7 +906,7 @@ fun checkStack(current : Int, high : Int) -> Bool {
                 -- refuses it there: it is in no region.
                 let value = word(slot, 0)
                 let onStack = !below(value, current) && below(value, high)
-                if !onStack && !checkPointer(value, phase != 0, caller, fi) { return False }
+                if !onStack && !checkPointer(value, afterMarking(), caller, fi) { return False }
             }
         }
         walked = caller

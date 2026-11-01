@@ -13,6 +13,7 @@ import Data.BitSet as BitSet
 
 type Instruction
     = Consume(fun(Char) -> Bool)
+    | Exactly(Char)
     | Jump(Int)
     | Split(Int, Int)
     | Open(Int)
@@ -31,13 +32,22 @@ type Assembly = Assembly { code : Vec Instruction, var tags : Int, var quiet : I
 -- appear twice in a pattern and resolve each time to its own match.
 type Builder a = Builder(fun(Assembly) -> a)
 
-type Pattern a = Pattern { code : Array Instruction, value : a }
+-- `joins` marks the instructions reached by a jump or a split, or first:
+-- every other one is reached only by falling through from the one before.
+type Pattern a = Pattern { code : Array Instruction, joins : Array Bool, value : a }
 
 type Capture a = Capture(fun(Captures) -> a)
-type Captures = Captures { text : String, nodes : Vec Node }
-type Node = Node {
-    tag : Int, start : String.Index, end : String.Index, children : Vec Node
-}
+
+-- The capture boundaries the winning path crossed, in order. `marks[i]` is
+-- twice the scope's tag at its open and one more at its close, and
+-- `places[i]` is where it was crossed. For an open, `partner[i]` is the
+-- index of its close. Opens and closes nest, so the scopes directly inside
+-- the entries `from` to `to` are found by starting at `from` and jumping
+-- from each open to just past its close.
+type Log = Log { marks : Vec Int, places : Vec String.Index, partner : Array Int }
+
+-- One scope of a match: the entries of the log strictly inside it.
+type Captures = Captures { text : String, log : Log, from : Int, to : Int }
 
 fun run(Builder(build) : Builder a, asm : Assembly) -> a = build(asm)
 
@@ -117,18 +127,23 @@ instance Resolve Unit {
     fun resolve(value, captures) = ()
 }
 
-fun findNode(captures : Captures, tag : Int) -> Option Node {
-    for node in captures.nodes {
-        if node.tag == tag { return Some(node) }
+-- The open of the scope `tag` directly inside `captures`, if the match
+-- went through it.
+fun child(captures : Captures, tag : Int) -> Option Int {
+    let log = captures.log
+    var i = captures.from
+    while i < captures.to {
+        if log.marks[i] == 2 * tag { return Some(i) }
+        i = log.partner[i] + 1
     }
     None
 }
 
-fun requiredNode(captures : Captures, tag : Int) -> Node =
-    Option.expect(findNode(captures, tag), "Regex: capture did not participate in this match")
+fun requiredChild(captures : Captures, tag : Int) -> Int =
+    Option.expect(child(captures, tag), "Regex: capture did not participate in this match")
 
-fun nested(captures : Captures, node : Node) -> Captures =
-    Captures { text = captures.text, nodes = node.children }
+fun nested(captures : Captures, open : Int) -> Captures =
+    Captures { text = captures.text, log = captures.log, from = open + 1, to = captures.log.partner[open] }
 
 -- Capture the complete text of a fragment, ignoring its extraction recipe.
 fun capture(body : Builder a) -> Builder (Capture String) = Builder(fun(asm) {
@@ -139,8 +154,9 @@ fun capture(body : Builder a) -> Builder (Capture String) = Builder(fun(asm) {
     asm.quiet = asm.quiet - 1
     if asm.quiet == 0 { emit(asm, Close(tag)) }
     Capture(fun(captures) {
-        let node = requiredNode(captures, tag)
-        String.slice(captures.text, node.start, node.end)
+        let open = requiredChild(captures, tag)
+        let log = captures.log
+        String.slice(captures.text, log.places[open], log.places[log.partner[open]])
     })
 })
 
@@ -148,7 +164,7 @@ fun capture(body : Builder a) -> Builder (Capture String) = Builder(fun(asm) {
 -- the text that matched.
 fun literal(text : String) -> Builder (Capture String) = Builder(fun(asm) {
     for c in String.codePoints(text) {
-        emit(asm, Consume(_ == c))
+        emit(asm, Exactly(c))
     }
     pure(text)
 })
@@ -157,8 +173,8 @@ fun satisfy(predicate : fun(Char) -> Bool) -> Builder (Capture Char) = Builder(f
     let tag = fresh(asm)
     scoped(asm, tag, Builder(fun(asm) = emit(asm, Consume(predicate))))
     Capture(fun(captures) {
-        let node = requiredNode(captures, tag)
-        if let Some(c) = String.decode(captures.text, node.start) {
+        let open = requiredChild(captures, tag)
+        if let Some(c) = String.decode(captures.text, captures.log.places[open]) {
             c
         } else {
             error("Regex: missing character in successful capture")
@@ -179,9 +195,9 @@ fun choice[Resolve a, Resolve b](left : Builder a, right : Builder b)
     let r = scoped(asm, rightTag, right)
     asm.code[split] = Split(split + 1, rightStart)
     asm.code[jump] = Jump(here(asm))
-    Capture(fun(captures) = match findNode(captures, leftTag) {
-        Some(node) -> Left(resolve(l, nested(captures, node)))
-        None -> Right(resolve(r, nested(captures, requiredNode(captures, rightTag))))
+    Capture(fun(captures) = match child(captures, leftTag) {
+        Some(open) -> Left(resolve(l, nested(captures, open)))
+        None -> Right(resolve(r, nested(captures, requiredChild(captures, rightTag))))
     })
 })
 
@@ -201,7 +217,7 @@ fun optional[Resolve a](body : Builder a) -> Builder (Capture (Option (Output a)
         let value = scoped(asm, tag, body)
         asm.code[split] = Split(split + 1, here(asm))
         Capture(fun(captures) =
-            map(findNode(captures, tag), \resolve(value, nested(captures, _))))
+            map(child(captures, tag), \resolve(value, nested(captures, _))))
     })
 
 fun repeated[Resolve a](body : Builder a, atLeastOne : Bool)
@@ -218,10 +234,13 @@ fun repeated[Resolve a](body : Builder a, atLeastOne : Bool)
     }
     Capture(fun(captures) {
         let values = []
-        for node in captures.nodes {
-            if node.tag == tag {
-                Vec.push(values, resolve(value, nested(captures, node)))
+        let log = captures.log
+        var i = captures.from
+        while i < captures.to {
+            if log.marks[i] == 2 * tag {
+                Vec.push(values, resolve(value, nested(captures, i)))
             }
+            i = log.partner[i] + 1
         }
         values
     })
@@ -256,31 +275,37 @@ fun compile[Resolve r](b : Builder r) -> Pattern r {
         Split(a, b) -> Split(past(a), past(b))
         inst -> inst
     })
-    Pattern { code = out, value = value }
-}
-
--- A capture boundary, in the order the winning path crossed it.
-type Event = Event { opening : Bool, tag : Int, at : String.Index }
-type Frame = Frame { tag : Int, start : String.Index, children : Vec Node }
-
-fun tree(text : String, events : Vec Event) -> Captures {
-    let root = Frame { tag = -1, start = String.start(text), children = [] }
-    let stack = [root]
-    for event in events {
-        if event.opening {
-            Vec.push(stack, Frame { tag = event.tag, start = event.at, children = [] })
-        } else {
-            let frame = Option.expect(Vec.pop(stack), "Regex: unbalanced capture history")
-            if frame.tag != event.tag || len(stack) == 0 {
-                error("Regex: unbalanced capture history")
+    let joins = Array.filled(len(out) + 1, False)
+    joins[0] = True
+    for inst in out {
+        match inst {
+            Jump(t) -> { joins[t] = True }
+            Split(a, b) -> {
+                joins[a] = True
+                joins[b] = True
             }
-            Vec.push(stack[len(stack) - 1].children, Node {
-                tag = event.tag, start = frame.start, end = event.at, children = frame.children
-            })
+            _ -> {}
         }
     }
-    if len(stack) != 1 { error("Regex: unclosed capture history") }
-    Captures { text = text, nodes = root.children }
+    Pattern { code = out, joins, value = value }
+}
+
+-- The boundaries a path crossed, as `Log` holds them, before `partner` is
+-- worked out.
+type Trail = Trail { marks : Vec Int, places : Vec String.Index }
+
+fun logOf(trail : Trail) -> Log {
+    let partner = Array.filled(len(trail.marks), -1)
+    let opens = []
+    for var i = 0; i < len(trail.marks); i = i + 1 {
+        if trail.marks[i] % 2 == 0 {
+            Vec.push(opens, i)
+        } else {
+            partner[Option.expect(Vec.pop(opens), "Regex: unbalanced capture log")] = i
+        }
+    }
+    if len(opens) != 0 { error("Regex: unclosed capture log") }
+    Log { marks = trail.marks, places = trail.places, partner }
 }
 
 -- How many (instruction, position) pairs the backtracker may keep a bit for
@@ -297,8 +322,13 @@ fun fullMatch[Resolve r](pattern : Pattern r, text : String) -> Option (Output r
 fun fullMatchWithin[Resolve r](pattern : Pattern r, text : String, budget : Int)
         -> Option (Output r) {
     let pairs = (len(pattern.code) + 1) * (String.byteLength(text) + 1)
-    let events = if pairs <= budget { backtrack(pattern.code, text) } else { pike(pattern.code, text) }
-    Some(resolve(pattern.value, tree(text, events?)))
+    let events = if pairs <= budget {
+        backtrack(pattern.code, pattern.joins, text)
+    } else {
+        pike(pattern.code, text)
+    }
+    let log = logOf(events?)
+    Some(resolve(pattern.value, Captures { text, log, from = 0, to = len(log.marks) }))
 }
 
 -- -- backtracking ---------------------------------------------------------------------
@@ -315,24 +345,35 @@ type Resume = Resume { pc : Int, at : String.Index, count : Int, logged : Int }
 -- does not depend on how it was reached, so a second arrival can only fail
 -- again, and the work is bounded by the pairs, as the Pike VM's is.
 --
+-- Only joins need a visited bit. Any other instruction has one predecessor,
+-- the instruction before it, at one position, the same one or the one before;
+-- arriving twice there means arriving twice at the nearest join behind it,
+-- which the bit there has already stopped.
+--
 -- Positions are counted in characters for the visited set; there are at
 -- most as many as bytes, which is what `fullMatch` budgets for.
-fun backtrack(code : Array Instruction, text : String) -> Option (Vec Event) {
+fun backtrack(code : Array Instruction, joins : Array Bool, text : String) -> Option Trail {
     let width = len(code) + 1
     let visited = BitSet.new(width * (String.byteLength(text) + 1))
-    let events = []
+    let marks = []
+    let places = []
     let pending = [Resume { pc = 0, at = String.start(text), count = 0, logged = 0 }]
     while let Some(resume) = Vec.pop(pending) {
-        while len(events) > resume.logged { let _ = Vec.pop(events) }
+        while len(marks) > resume.logged {
+            let _ = Vec.pop(marks)
+            let _ = Vec.pop(places)
+        }
         var pc = resume.pc
         var at = resume.at
         var count = resume.count
         loop {
-            let key = count * width + pc
-            if BitSet.contains(visited, key) { break }
-            BitSet.add(visited, key)
+            if joins[pc] {
+                let key = count * width + pc
+                if BitSet.contains(visited, key) { break }
+                BitSet.add(visited, key)
+            }
             if pc == len(code) {
-                if String.atEnd(text, at) { return Some(events) }
+                if String.atEnd(text, at) { return Some(Trail { marks, places }) }
                 break
             }
             match code[pc] {
@@ -345,17 +386,28 @@ fun backtrack(code : Array Instruction, text : String) -> Option (Vec Event) {
                     }
                     None -> break
                 }
+                Exactly(wanted) -> match String.step(text, at) {
+                    Some((c, next)) -> {
+                        if c != wanted { break }
+                        at = next
+                        count = count + 1
+                        pc = pc + 1
+                    }
+                    None -> break
+                }
                 Jump(target) -> { pc = target }
                 Split(first, second) -> {
-                    Vec.push(pending, Resume { pc = second, at, count, logged = len(events) })
+                    Vec.push(pending, Resume { pc = second, at, count, logged = len(marks) })
                     pc = first
                 }
                 Open(tag) -> {
-                    Vec.push(events, Event { opening = True, tag, at })
+                    Vec.push(marks, 2 * tag)
+                    Vec.push(places, at)
                     pc = pc + 1
                 }
                 Close(tag) -> {
-                    Vec.push(events, Event { opening = False, tag, at })
+                    Vec.push(marks, 2 * tag + 1)
+                    Vec.push(places, at)
                     pc = pc + 1
                 }
             }
@@ -368,17 +420,19 @@ fun backtrack(code : Array Instruction, text : String) -> Option (Vec Event) {
 
 -- Persistent event histories share prefixes across threads. Branches do not
 -- mutate each other's captures. Only the winner's is turned into a log.
-type History = Empty | Crossed(Event, History)
+type History = Empty | Crossed(Int, String.Index, History)
 type Thread = Thread { pc : Int, history : History }
 
-fun logOf(history : History) -> Vec Event {
-    let events = []
+fun trailOf(history : History) -> Trail {
+    let marks = []
+    let places = []
     var rest = history
-    while let Crossed(event, previous) = rest {
-        Vec.push(events, event)
+    while let Crossed(mark, at, previous) = rest {
+        Vec.push(marks, mark)
+        Vec.push(places, at)
         rest = previous
     }
-    Vec.reverse(events)
+    Trail { marks = Vec.reverse(marks), places = Vec.reverse(places) }
 }
 
 -- Follow every jump, split and capture boundary from `pc` at position `at`,
@@ -407,14 +461,14 @@ fun addThread(code : Array Instruction, threads : Vec Thread, pending : Vec Thre
                     current = first
                 }
                 Open(tag) -> {
-                    h = Crossed(Event { opening = True, tag, at }, h)
+                    h = Crossed(2 * tag, at, h)
                     current = current + 1
                 }
                 Close(tag) -> {
-                    h = Crossed(Event { opening = False, tag, at }, h)
+                    h = Crossed(2 * tag + 1, at, h)
                     current = current + 1
                 }
-                Consume(_) -> {
+                Consume(_) | Exactly(_) -> {
                     Vec.push(threads, Thread { pc = current, history = h })
                     break
                 }
@@ -423,7 +477,7 @@ fun addThread(code : Array Instruction, threads : Vec Thread, pending : Vec Thre
     }
 }
 
-fun pike(code : Array Instruction, text : String) -> Option (Vec Event) {
+fun pike(code : Array Instruction, text : String) -> Option Trail {
     let seen = Array.filled(len(code) + 1, -1)
     let pending = []
     var stamp = 0
@@ -435,11 +489,14 @@ fun pike(code : Array Instruction, text : String) -> Option (Vec Event) {
         stamp = stamp + 1
         for thread in current {
             if thread.pc < len(code) {
-                if let Consume(predicate) = code[thread.pc] {
-                    if predicate(c) {
-                        addThread(code, following, pending, seen, stamp,
-                            thread.pc + 1, thread.history, next)
-                    }
+                let accepts = match code[thread.pc] {
+                    Consume(predicate) -> predicate(c)
+                    Exactly(wanted) -> c == wanted
+                    _ -> False
+                }
+                if accepts {
+                    addThread(code, following, pending, seen, stamp,
+                        thread.pc + 1, thread.history, next)
                 }
             }
         }
@@ -447,7 +504,7 @@ fun pike(code : Array Instruction, text : String) -> Option (Vec Event) {
         at = next
     }
     for thread in current {
-        if thread.pc == len(code) { return Some(logOf(thread.history)) }
+        if thread.pc == len(code) { return Some(trailOf(thread.history)) }
     }
     None
 }

@@ -103,8 +103,8 @@ int main(void) {
     object = held[15];
     assert(object->kind == 3 && object->tag == -1 && object->count == 16);
     assert(object->descriptor == 1);
-    assert(object->slots[0] == UINT64_C(0xabcdef1234567890));
-    assert(object->slots[1] == 0);
+    assert(object->slots[0] == 0);
+    assert(object->slots[1] == UINT64_C(0xabcdef1234567890));
     unsigned char bytes[] = {'a', 0, 'b'};
     held[16] = turkey_string_new(bytes, 3);
     bytes[0] = 'z';

@@ -64,21 +64,21 @@ let fieldLimit = 21
 
 -- Where a sequence of fields is, in bytes from the first: each field's offset
 -- and width, the bytes the sequence spans and the alignment it needs, and how
--- many of its words, ending at its end, are pointers the collector follows.
+-- many of its words, from the first, are pointers the collector follows.
 --
 -- The layout of an object's fields is a function of their representations
 -- and of nothing else, so every producer and every reader of an object that
 -- computes it from the same representations finds each field in the same
 -- place. That is the whole contract: no object says where its fields are.
 --
--- Every field that is not a traced pointer comes first, by decreasing width
--- and in field order within a width, and then the traced pointers, in field
--- order. So every field is at its natural alignment, the only padding is
--- before the first pointer, and the collector's description of any object is
--- one count (`pointers`): the words to scan, back from the end.
--- Declaration order would leave padding after a narrow field and scatter the
--- pointers, and a pointer after a scalar would need a bitmap. A `Unit` field
--- is zero bytes.
+-- The traced pointers come first, in field order, and then every other
+-- field by decreasing width, in field order within a width. So every field is
+-- at its natural alignment with no padding between fields, and the
+-- collector's description of any object is one count (`pointers`): the words
+-- to scan, starting where the fields do, right after the header it has just
+-- read. Declaration order would leave padding after a narrow field and
+-- scatter the pointers, and a pointer after a scalar would need a bitmap. A
+-- `Unit` field is zero bytes, at the end.
 --
 -- Offsets are from the start of the fields, not of the object, so the same
 -- layout places a sequence wherever it is put: after an object's header
@@ -114,7 +114,15 @@ fun layout(reps : Array Rep) -> Layout {
     let offsets = Array.filled(len(reps), 0)
     let widths = Array.map(reps, fieldWidth)
     var at = 0
-    var align = 1
+    var pointers = 0
+    for var i = 0; i < len(reps); i = i + 1 {
+        if reps[i].traced {
+            offsets[i] = at
+            at = at + 8
+            pointers = pointers + 1
+        }
+    }
+    var align = if pointers > 0 { 8 } else { 1 }
     for width in scalarWidths {
         for var i = 0; i < len(reps); i = i + 1 {
             if widths[i] == width && !reps[i].traced {
@@ -124,18 +132,6 @@ fun layout(reps : Array Rep) -> Layout {
             }
         }
     }
-    var pointers = 0
-    for var i = 0; i < len(reps); i = i + 1 {
-        if reps[i].traced {
-            if pointers == 0 {
-                at = Int.and(at + 7, -8)
-                align = 8
-            }
-            offsets[i] = at
-            at = at + 8
-            pointers = pointers + 1
-        }
-    }
     Layout { reps = reps, offsets = offsets, widths = widths,
              size = Int.and(at + align - 1, 0 - align), align = align,
              pointers = pointers }
@@ -143,13 +139,12 @@ fun layout(reps : Array Rep) -> Layout {
 
 -- Where an object's fields start: after the word holding its kind and tag,
 -- the word holding its fields' size in bytes, and its descriptor, the count of
--- traced words at the end of its fields, as `Turkey.Alloc.header` writes
+-- traced words at the start of its fields, as `Turkey.Alloc.header` writes
 -- them. Both `Turkey.Heap` and `Turkey.HeapCheck` read this header.
 let objectFields = 24
 
 -- The bytes of an object with these fields, header included: a whole number
--- of words, which is what the allocator clears and the verifier checks. Its
--- traced words are its last `pointers`, since a layout with any ends on one.
+-- of words, which is what the allocator clears and the verifier checks.
 fun objectBytes(l : Layout) -> Int = objectFields + Int.and(l.size + 7, -8)
 
 -- Field `index` of an object, in bytes from the object's address.

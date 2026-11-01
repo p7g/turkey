@@ -776,7 +776,13 @@ fun step(r : Reducer, e : Core) -> Option Core {
             }
             return floatLetThroughJoin(e)
         }
-        CJoin(_, _, _, _, _) -> return specializeJoin(r, e)
+        CJoin(_, _, _, _, _) -> {
+            match specializeJoin(r, e) {
+                Some(m) -> return Some(m)
+                None -> {}
+            }
+            return flattenJoin(r, e)
+        }
         CIf(_, _, _) -> return knownCondition(r.decls, e)
         CDeref(target) -> return match target.kind {
             CVar(name) -> match unwrittenOf(r, name) {
@@ -1602,6 +1608,101 @@ fun specialized(d : DeclTable, groups : Map String Variant, j : Core) -> Option 
         }
     }
     Some(mkCore(TBottom, j.span, CJump(target, out)))
+}
+
+-- A join parameter passed as its fields, where every jump builds it on the
+-- spot.
+--
+-- `join j(t : (Char, Index)) = match t {..}`, reached only by `jump j((c, i))`,
+-- builds the tuple at every jump and takes it apart again in the body, and
+-- the backend keeps a tuple in memory even when it never escapes. When every
+-- jump to `j` -- from `rest`, and from the body of a loop -- passes the same
+-- constructor at a position, the jumps pass its fields there instead, and the
+-- body rebinds the parameter to the constructor rebuilt from them, which
+-- `letToMatch` and `knownLet` then take apart. MLton's `Flatten` does this for
+-- a block whose tuple argument is available at every jump.
+--
+-- Nothing is copied, so unlike `specializeJoin` this needs no size bound. A
+-- body that uses the parameter whole costs no more than before: it builds the
+-- value once per entry, where every jump built one, and it is bound rather
+-- than substituted, so two mentions still build it once. The fields are
+-- evaluated where the constructor's arguments were, left to right among the
+-- jump's other arguments, so nothing moves.
+--
+-- Only constructors `unfoldable` admits: one with a `var` field has identity,
+-- and no `match` on it can be decided from its arguments, so splitting it
+-- would gain nothing.
+fun flattenJoin(r : Reducer, e : Core) -> Option Core = match e.kind {
+    CJoin(name, params, body, rest, recursive) -> {
+        let jumps = joinJumps(rest, name)
+        if recursive { collectJumps(body, name, False, jumps) }
+        if len(jumps) == 0 { return None }
+        let first = jumpArgs(jumps[0])
+        let flat = Vec.new(len(params))
+        var found = False
+        for var i = 0; i < len(params); i = i + 1 {
+            let shape = shapeOf(r, first[i])
+            var same = Option.isSome(shape)
+            for j in jumps {
+                if shapeOf(r, jumpArgs(j)[i]) != shape { same = False }
+            }
+            Vec.push(flat, same)
+            found = found || same
+        }
+        if !found { return None }
+
+        let ps = Vec.new(len(params))
+        let lets = Vec.new(4)
+        for var i = 0; i < len(params); i = i + 1 {
+            if !flat[i] {
+                Vec.push(ps, params[i])
+            } else {
+                let vars = Array.map(knownParts(first[i]), fun(field) {
+                    let v = fresh(r, "jf")
+                    Vec.push(ps, CParam { name = v, ty = field.ty })
+                    mkCore(field.ty, field.span, CVar(v))
+                })
+                Vec.push(lets, (params[i], rebuildKnown(first[i], vars)))
+            }
+        }
+        let split = fun(j) = Some(mkCore(j.ty, j.span, CJump(name,
+                                                            flatArgs(flat, j))))
+        var made = if recursive { replaceJumps(body, name, split) } else { body }
+        for var i = len(lets) - 1; i >= 0; i = i - 1 {
+            let (p, value) = lets[i]
+            made = mkCore(body.ty, value.span, CLet(p.name, p.ty, value, made, []))
+        }
+        Some(mkCore(e.ty, e.span, CJoin(name, Vec.toArray(ps), made,
+                                        replaceJumps(rest, name, split),
+                                        recursive)))
+    }
+    _ -> None
+}
+
+-- The constructor and arity `flattenJoin` needs every jump to agree on, or
+-- `None` for an argument it cannot split.
+fun shapeOf(r : Reducer, e : Core) -> Option String {
+    if !unfoldable(r, e) { return None }
+    let arity = Int.toString(len(knownParts(e)))
+    match e.kind {
+        CTuple(_) -> Some("()/" + arity)
+        _ -> Option.map(constructorName(r.decls, e), _ + "/" + arity)
+    }
+}
+
+-- A jump's arguments with the fields of each position `flat` marks in place
+-- of the constructor.
+fun flatArgs(flat : Vec Bool, j : Core) -> Vec Core {
+    let args = jumpArgs(j)
+    let out = Vec.new(len(args))
+    for var i = 0; i < len(args); i = i + 1 {
+        if flat[i] {
+            for part in knownParts(args[i]) { Vec.push(out, part) }
+        } else {
+            Vec.push(out, args[i])
+        }
+    }
+    out
 }
 
 -- A `match` on a constructor application, a tuple or a literal that is right

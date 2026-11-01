@@ -1109,6 +1109,9 @@ fun opened(l : Lower, name : String, binders : Array (Option String), o : Openin
     L.terminate(l.b, Jump(success, []))
 }
 
+-- Where a cell keeps its value, as an operand.
+fun cellValue(l : Lower) -> Value = L.emit(l.b, ConstInt(Rt.cellValue), Ssa.untraced(I64))
+
 fun stop1(l : Lower, message : String) -> Unit {
     let _ = stop(l, message)
     {}
@@ -2257,6 +2260,24 @@ fun primitive(l : Lower, e : Core, p : Prims.Prim, args : Array Core,
         }
         L.emit(l.b, Convert(Retag, xs[0]), Ssa.untraced(Ptr))
     }
+    -- The array's address, no longer one the collector follows, past its
+    -- header and `i` elements at the stride its element is stored at.
+    Prims.ElementAddress -> {
+        let xs = operands(l, p, args, 2)
+        let (_, held) = Ty.spine(Ty.prune(args[0].ty))
+        if len(held) != 1 { return stop(l, "the element address of a non-array") }
+        let element = repOf(l, held[0])
+        let base = L.emit(l.b, Convert(PtrToInt, L.emit(l.b, Convert(Retag, xs[0]),
+                                                        Ssa.untraced(Ptr))),
+                          Ssa.untraced(I64))
+        let width = L.emit(l.b, ConstInt(Rt.elementWidth(element.class_)), Ssa.untraced(I64))
+        let skipped = L.emit(l.b, Bin(MulWrap, xs[1], width), Ssa.untraced(I64))
+        let header = L.emit(l.b, ConstInt(Rt.arrayElements), Ssa.untraced(I64))
+        let at = L.emit(l.b, Bin(AddWrap, L.emit(l.b, Bin(AddWrap, base, header),
+                                                 Ssa.untraced(I64)), skipped),
+                        Ssa.untraced(I64))
+        L.emit(l.b, Convert(IntToPtr, at), Ssa.untraced(Ptr))
+    }
     Prims.KeepAlive -> {
         L.effect(l.b, KeepAlive(operands(l, p, args, 1)[0]))
         L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
@@ -2320,6 +2341,28 @@ fun primitive(l : Lower, e : Core, p : Prims.Prim, args : Array Core,
     Prims.AtomicStore -> {
         L.effect(l.b, Atomic(StoreRelease, operands(l, p, args, 3)))
         L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
+    }
+    -- A `Prim.Atomic` is a cell (`CellNew`) holding an `Int`, which the
+    -- collector does not follow, and every access is an atomic one at the
+    -- cell's value (`Rt.cellValue`). The cell itself is the base, a traced
+    -- operand, so it is live and rooted across the access like any other.
+    Prims.AtomicNew -> L.emit(l.b, CellNew(operands(l, p, args, 1)[0]), Ssa.traced(Ptr))
+    Prims.AtomicGet -> {
+        let xs = operands(l, p, args, 1)
+        L.emit(l.b, Atomic(LoadAcquire, [xs[0], cellValue(l)]), Ssa.untraced(I64))
+    }
+    Prims.AtomicSet -> {
+        let xs = operands(l, p, args, 2)
+        L.effect(l.b, Atomic(StoreRelease, [xs[0], cellValue(l), xs[1]]))
+        L.emit(l.b, ConstUnit, Ssa.untraced(Unit))
+    }
+    Prims.AtomicAddTo -> {
+        let xs = operands(l, p, args, 2)
+        L.emit(l.b, Atomic(FetchAdd, [xs[0], cellValue(l), xs[1]]), Ssa.untraced(I64))
+    }
+    Prims.AtomicSwapIf -> {
+        let xs = operands(l, p, args, 3)
+        L.emit(l.b, Atomic(Cas, [xs[0], cellValue(l), xs[1], xs[2]]), Ssa.untraced(I64))
     }
     -- The array operations are instructions rather than runtime calls: the
     -- element's representation decides the stride, and that is a fact

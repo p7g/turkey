@@ -32,9 +32,14 @@ type Assembly = Assembly { code : Vec Instruction, var tags : Int, var quiet : I
 -- appear twice in a pattern and resolve each time to its own match.
 type Builder a = Builder(fun(Assembly) -> a)
 
--- `joins` marks the instructions reached by a jump or a split, or first:
--- every other one is reached only by falling through from the one before.
-type Pattern a = Pattern { code : Array Instruction, joins : Array Bool, value : a }
+-- The instructions of a compiled pattern. `joins` marks the ones reached by
+-- a jump or a split, or first: every other one is reached only by falling
+-- through from the one before. `boundaries` and `splits` count the Open and
+-- Close instructions and the Split instructions, which a match uses to size
+-- its log and its stack of choices; a path through a loop can need more.
+type Program = Program { code : Array Instruction, joins : Array Bool, boundaries : Int, splits : Int }
+
+type Pattern a = Pattern { program : Program, value : a }
 
 type Capture a = Capture(fun(Captures) -> a)
 
@@ -277,17 +282,21 @@ fun compile[Resolve r](b : Builder r) -> Pattern r {
     })
     let joins = Array.filled(len(out) + 1, False)
     joins[0] = True
+    var boundaries = 0
+    var splits = 0
     for inst in out {
         match inst {
             Jump(t) -> { joins[t] = True }
             Split(a, b) -> {
                 joins[a] = True
                 joins[b] = True
+                splits = splits + 1
             }
+            Open(_) | Close(_) -> { boundaries = boundaries + 1 }
             _ -> {}
         }
     }
-    Pattern { code = out, joins, value = value }
+    Pattern { program = Program { code = out, joins, boundaries, splits }, value = value }
 }
 
 -- The boundaries a path crossed, as `Log` holds them, before `partner` is
@@ -296,7 +305,7 @@ type Trail = Trail { marks : Vec Int, places : Vec String.Index }
 
 fun logOf(trail : Trail) -> Log {
     let partner = Array.filled(len(trail.marks), -1)
-    let opens = []
+    let opens = Vec.new(len(trail.marks) / 2)
     for var i = 0; i < len(trail.marks); i = i + 1 {
         if trail.marks[i] % 2 == 0 {
             Vec.push(opens, i)
@@ -321,12 +330,9 @@ fun fullMatch[Resolve r](pattern : Pattern r, text : String) -> Option (Output r
 -- budget trades memory for speed and nothing else.
 fun fullMatchWithin[Resolve r](pattern : Pattern r, text : String, budget : Int)
         -> Option (Output r) {
-    let pairs = (len(pattern.code) + 1) * (String.byteLength(text) + 1)
-    let events = if pairs <= budget {
-        backtrack(pattern.code, pattern.joins, text)
-    } else {
-        pike(pattern.code, text)
-    }
+    let program = pattern.program
+    let pairs = (len(program.code) + 1) * (String.byteLength(text) + 1)
+    let events = if pairs <= budget { backtrack(program, text) } else { pike(program, text) }
     let log = logOf(events?)
     Some(resolve(pattern.value, Captures { text, log, from = 0, to = len(log.marks) }))
 }
@@ -352,12 +358,15 @@ type Resume = Resume { pc : Int, at : String.Index, count : Int, logged : Int }
 --
 -- Positions are counted in characters for the visited set; there are at
 -- most as many as bytes, which is what `fullMatch` budgets for.
-fun backtrack(code : Array Instruction, joins : Array Bool, text : String) -> Option Trail {
+fun backtrack(program : Program, text : String) -> Option Trail {
+    let code = program.code
+    let joins = program.joins
     let width = len(code) + 1
     let visited = BitSet.new(width * (String.byteLength(text) + 1))
-    let marks = []
-    let places = []
-    let pending = [Resume { pc = 0, at = String.start(text), count = 0, logged = 0 }]
+    let marks = Vec.new(program.boundaries)
+    let places = Vec.new(program.boundaries)
+    let pending = Vec.new(program.splits + 1)
+    Vec.push(pending, Resume { pc = 0, at = String.start(text), count = 0, logged = 0 })
     while let Some(resume) = Vec.pop(pending) {
         while len(marks) > resume.logged {
             let _ = Vec.pop(marks)
@@ -477,7 +486,8 @@ fun addThread(code : Array Instruction, threads : Vec Thread, pending : Vec Thre
     }
 }
 
-fun pike(code : Array Instruction, text : String) -> Option Trail {
+fun pike(program : Program, text : String) -> Option Trail {
+    let code = program.code
     let seen = Array.filled(len(code) + 1, -1)
     let pending = []
     var stamp = 0

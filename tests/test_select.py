@@ -404,7 +404,8 @@ def test_the_printed_instructions_assemble(name):
         text = line.strip()
         if not text or text.startswith((";", "fun ", "}", "--", "global ")):
             continue
-        if text.endswith(":") or text.startswith(("ret ", "branch ", "jump ")):
+        if (text.endswith(":") or text.startswith(("ret ", "branch ", "jump "))
+                or text == "unreachable"):
             continue
         if "%" in text or re.search(r"\[(root|spill|object|incoming|outgoing) ", text):
             continue

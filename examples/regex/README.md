@@ -114,13 +114,14 @@ the capture discards the inner recipe.
 
 `fullMatch` runs one of two engines, and they give the same results:
 
-- When `(instructions + 1) * (bytes of text + 1)` is within a budget, 256Ki
-  pairs by default, a depth-first backtracker with a visited bit for each pair
+- When `(instructions + 1) * (bytes of text + 1)` is within a budget, 2Mi
+  pairs (a 256 KiB visited set) by default, a depth-first backtracker with a visited bit for each pair
   of instruction and position. It tries the first branch of every split
   before the second, so the first path it finds is the one the Pike VM would
   choose, and since a pair is explored at most once, the work is bounded by
   the number of pairs. Capture boundaries go to one event log, cut back on
-  backtracking. This follows RE2's BitState and Go's backtracker.
+  backtracking. This follows RE2's BitState, Go's backtracker and Rust's bounded
+  backtracker, whose default budget this is.
 - Otherwise the [Pike VM](https://swtch.com/~rsc/regexp/regexp2.html): ordered
   epsilon closure, parallel threads, and first-arrival deduplication at each
   instruction and input position. Threads carry persistent event histories

@@ -318,8 +318,10 @@ fun logOf(trail : Trail) -> Log {
 }
 
 -- How many (instruction, position) pairs the backtracker may keep a bit for
--- by default: 32 KiB of visited set.
-let defaultBudget : Int = 256 * 1024
+-- by default: 256 KiB of visited set. The set grows with the text, so its
+-- cost per character does not; past the budget the Pike VM is about half as
+-- fast but needs memory for the pattern alone.
+let defaultBudget : Int = 2 * 1024 * 1024
 
 fun fullMatch[Resolve r](pattern : Pattern r, text : String) -> Option (Output r) =
     fullMatchWithin(pattern, text, defaultBudget)
@@ -430,7 +432,22 @@ fun backtrack(program : Program, text : String) -> Option Trail {
 -- Persistent event histories share prefixes across threads. Branches do not
 -- mutate each other's captures. Only the winner's is turned into a log.
 type History = Empty | Crossed(Int, String.Index, History)
-type Thread = Thread { pc : Int, history : History }
+
+-- A list of threads, in priority order, as parallel vectors: a thread is an
+-- instruction and its history.
+type Threads = Threads { pcs : Vec Int, histories : Vec History }
+
+fun threads() -> Threads = Threads { pcs = [], histories = [] }
+
+fun add(ts : Threads, pc : Int, history : History) -> Unit {
+    Vec.push(ts.pcs, pc)
+    Vec.push(ts.histories, history)
+}
+
+fun clear(ts : Threads) -> Unit {
+    Vec.clear(ts.pcs)
+    Vec.clear(ts.histories)
+}
 
 fun trailOf(history : History) -> Trail {
     let marks = []
@@ -450,23 +467,23 @@ fun trailOf(history : History) -> Trail {
 -- followed first and its threads come first. `seen[pc] == stamp` marks an
 -- instruction already reached at this position: the first arrival has the
 -- higher priority, and a later one would only repeat it.
-fun addThread(code : Array Instruction, threads : Vec Thread, pending : Vec Thread,
+fun addThread(code : Array Instruction, out : Threads, pending : Threads,
         seen : Array Int, stamp : Int, pc : Int, history : History, at : String.Index) -> Unit {
-    Vec.push(pending, Thread { pc, history })
-    while let Some(thread) = Vec.pop(pending) {
-        var current = thread.pc
-        var h = thread.history
+    add(pending, pc, history)
+    while let Some(start) = Vec.pop(pending.pcs) {
+        var current = start
+        var h = Option.expect(Vec.pop(pending.histories), "Regex: thread stacks out of step")
         loop {
             if seen[current] == stamp { break }
             seen[current] = stamp
             if current == len(code) {
-                Vec.push(threads, Thread { pc = current, history = h })
+                add(out, current, h)
                 break
             }
             match code[current] {
                 Jump(target) -> { current = target }
                 Split(first, second) -> {
-                    Vec.push(pending, Thread { pc = second, history = h })
+                    add(pending, second, h)
                     current = first
                 }
                 Open(tag) -> {
@@ -478,7 +495,7 @@ fun addThread(code : Array Instruction, threads : Vec Thread, pending : Vec Thre
                     current = current + 1
                 }
                 Consume(_) | Exactly(_) -> {
-                    Vec.push(threads, Thread { pc = current, history = h })
+                    add(out, current, h)
                     break
                 }
             }
@@ -486,35 +503,42 @@ fun addThread(code : Array Instruction, threads : Vec Thread, pending : Vec Thre
     }
 }
 
+-- The thread lists for this position and the next are two that swap, so
+-- stepping allocates no list. A position with no threads left ends the
+-- match there.
 fun pike(program : Program, text : String) -> Option Trail {
     let code = program.code
     let seen = Array.filled(len(code) + 1, -1)
-    let pending = []
+    let pending = threads()
     var stamp = 0
-    var current = []
+    var current = threads()
+    var following = threads()
     var at = String.start(text)
     addThread(code, current, pending, seen, stamp, 0, Empty, at)
     while let Some((c, next)) = String.step(text, at) {
-        let following = []
+        if len(current.pcs) == 0 { return None }
         stamp = stamp + 1
-        for thread in current {
-            if thread.pc < len(code) {
-                let accepts = match code[thread.pc] {
+        for var i = 0; i < len(current.pcs); i = i + 1 {
+            let pc = current.pcs[i]
+            if pc < len(code) {
+                let accepts = match code[pc] {
                     Consume(predicate) -> predicate(c)
                     Exactly(wanted) -> c == wanted
                     _ -> False
                 }
                 if accepts {
-                    addThread(code, following, pending, seen, stamp,
-                        thread.pc + 1, thread.history, next)
+                    addThread(code, following, pending, seen, stamp, pc + 1, current.histories[i], next)
                 }
             }
         }
+        let done = current
+        clear(done)
         current = following
+        following = done
         at = next
     }
-    for thread in current {
-        if thread.pc == len(code) { return Some(trailOf(thread.history)) }
+    for var i = 0; i < len(current.pcs); i = i + 1 {
+        if current.pcs[i] == len(code) { return Some(trailOf(current.histories[i])) }
     }
     None
 }

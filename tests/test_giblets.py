@@ -160,10 +160,9 @@ def test_a_var_is_not_a_cell_because_an_inlined_callee_reuses_its_name(
     assert code == 0, stderr
 
 
-def test_a_value_of_traced_type_that_is_never_made_is_accepted(lowered):
-    """What is judged is the code that runs. `OS` is laid out as a traced
-    pointer, but `Target.os` is a bare constructor that the optimizer puts in
-    place and then decides the `match` on."""
+def test_a_match_on_a_target_constant_is_accepted(lowered):
+    """`Target.os` is an enumeration, so it is an untraced word whether or not
+    the optimizer decides the `match` on it first."""
     code, _, stderr = lowered(
         "import Target (OS(..))\n"
         "import Target as Target\n"
@@ -172,6 +171,34 @@ def test_a_value_of_traced_type_that_is_never_made_is_accepted(lowered):
         "    Linux -> n + 1\n"
         "}\n",
         "fun h(n : Int) -> Int = n\n")
+    assert code == 0, stderr
+
+
+def test_an_enumeration_is_held_as_an_int_is(lowered):
+    """A sum of nullary constructors is untraced: a giblet keeps one in a `var`
+    global, holds one across a call and matches on it, and the global's
+    initializer makes nothing for the ordinary initializer to have made
+    first."""
+    code, _, stderr = lowered(
+        "type Phase = Idle | Marking | Sweeping\n"
+        "var phase : Phase = Idle\n"
+        "fun next(p : Phase) -> Phase = match p {\n"
+        "    Idle -> Marking\n"
+        "    Marking -> Sweeping\n"
+        "    Sweeping -> Idle\n"
+        "}\n"
+        "fun weight(p : Phase) -> Int = match p {\n"
+        "    Idle -> 0\n"
+        "    Marking -> 1\n"
+        "    Sweeping -> 2\n"
+        "}\n"
+        "fun f(n : Int) -> Int {\n"
+        "    let was = phase\n"
+        "    let m = H.h(n)\n"
+        "    phase = next(was)\n"
+        "    weight(was) + weight(phase) + m\n"
+        "}\n",
+        "fun h(n : Int) -> Int = if n <= 0 { 0 } else { h(n - 1) }\n")
     assert code == 0, stderr
 
 

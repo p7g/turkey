@@ -146,7 +146,7 @@ name.
 **Syntax**
 
 ```ebnf
-header      ::= "module" modname? ("(" export ("," export)* ")")?
+header      ::= "module" "(" (export ("," export)*)? ")"
 modname     ::= CONID ("." CONID)*
 export      ::= IDENT                          -- a function or value
               | CONID                          -- a type without its constructors, or a class
@@ -156,21 +156,21 @@ export      ::= IDENT                          -- a function or value
 ```
 
 A module may start with a header listing what it **exports**. Only exported
-names can be used from other modules. A module without a header, or with a
-header but no list, exports everything it declares.
+names can be used from other modules. A module without a header exports
+everything it declares, and one whose list is empty, `module ()`, exports
+nothing.
 
-The header may also name the module, as `module Inventory (Item)`. The name
-says nothing the path does not, and it must agree with it: in the entry
-module it must be `Main`.
+The header does not name the module: its [path](#modules-and-files) does, and
+a name written after `module` is an error.
 
 <!-- module: Inventory.gob -->
 ```kotlin
-module Stock (count)
+module Inventory (count)
 
 fun count() -> Int = 12
 ```
 
-<!-- error: this module's header names it 'Stock', but its path makes it 'Inventory' -->
+<!-- error: a module's name comes from its file's path and is not written in its header -->
 ```kotlin
 import Inventory
 

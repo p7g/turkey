@@ -41,7 +41,7 @@ collide with the `Index` *class* the way a bare `Index` does.
 opaquely. So write one or the other:
 
 ```
-module Turkey.Ast (Expr(..), ExprKind(..), Lit(..), litKind)
+module (Expr(..), ExprKind(..), Lit(..), litKind)
 ```
 
 not `Expr, Expr(..)`, which asks for the same thing twice.

@@ -37,7 +37,7 @@ Comments: `--` to the end of the line, and `{- ... -}`, which nests.
 
 ```ebnf
 module      ::= header? top-level*
-header      ::= "module" modname? ("(" export ("," export)* ")")?
+header      ::= "module" "(" (export ("," export)*)? ")"
 modname     ::= CONID ("." CONID)*
 export      ::= IDENT
               | CONID

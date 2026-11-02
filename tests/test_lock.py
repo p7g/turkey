@@ -21,7 +21,7 @@ import pytest
 
 from tests import bootc, toolchain
 
-PROBE = """module System.LockProbe (run)
+PROBE = """module (run)
 
 import System.Parallel as Parallel
 import Turkey.Libc as Libc

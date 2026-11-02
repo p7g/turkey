@@ -69,7 +69,7 @@ def test_a_top_level_binding_is_decided_by_its_own_definition() -> None:
 def test_a_top_level_binding_is_decided_the_same_for_an_importer() -> None:
     message = lang.fails("import Queue (pending)\n"
                          "fun main() = Vec.push(pending, 1)\n",
-                         {"Queue.gob": "module Queue (pending)\n"
+                         {"Queue.gob": "module (pending)\n"
                                        "let pending = []\n"})
     assert message == "expected Vec, found Array in a function call"
 

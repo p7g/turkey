@@ -21,7 +21,7 @@ from tests.lang import run
 LIB = bootc.REPO_ROOT / "lib"
 DARWIN = sys.platform == "darwin"
 
-PROBE = """module PROBE (ready, quiet, timeout, wakeBefore, wakeDuring, exitedChild, runningChild)
+PROBE = """module (ready, quiet, timeout, wakeBefore, wakeDuring, exitedChild, runningChild)
 
 import System.Task as Task
 import Time.Duration as Duration

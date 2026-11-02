@@ -39,7 +39,7 @@ def coroutines(request, tmp_path):
     probe = LIB / f"{module}.gob"
 
     def build(body: str, *flags: str) -> Path:
-        probe.write_text(f"module {module} (run)\n\n"
+        probe.write_text(f"module (run)\n\n"
                          "import Turkey.Coroutine as Co\n\n" + body,
                          encoding="utf-8")
         entry = tmp_path / "main.gob"

@@ -160,24 +160,7 @@ names can be used from other modules. A module without a header exports
 everything it declares, and one whose list is empty, `module ()`, exports
 nothing.
 
-The header does not name the module: its [path](#modules-and-files) does, and
-a name written after `module` is an error.
-
-<!-- module: Inventory.gob -->
-```kotlin
-module Inventory (count)
-
-fun count() -> Int = 12
-```
-
-<!-- error: a module's name comes from its file's path and is not written in its header -->
-```kotlin
-import Inventory
-
-fun main() {
-    print(count())
-}
-```
+The header does not name the module: its [path](#modules-and-files) does.
 
 <!-- module: Inventory.gob -->
 ```kotlin

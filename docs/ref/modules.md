@@ -2,7 +2,7 @@
 
 A Turkey program is a set of modules, one per source file. A module decides
 which of its names other modules may use, and imports the names it needs from
-other modules. This chapter covers module headers and export lists, imports,
+other modules. This chapter covers export declarations, imports,
 how names are resolved, and the entry point.
 
 ## Modules and files
@@ -20,7 +20,7 @@ every system:
 
 <!-- module: Shapes/circle.gob -->
 ```kotlin
-module (area)
+export (area)
 
 fun area(r : Int) -> Int = 3 * r * r
 ```
@@ -76,7 +76,7 @@ another, in either direction:
 
 <!-- module: Even.gob -->
 ```kotlin
-module (isEven)
+export (isEven)
 import Odd (isOdd)
 
 fun isEven(n : Int) -> Bool = if n == 0 { True } else { isOdd(n - 1) }
@@ -84,7 +84,7 @@ fun isEven(n : Int) -> Bool = if n == 0 { True } else { isOdd(n - 1) }
 
 <!-- module: Odd.gob -->
 ```kotlin
-module (isOdd)
+export (isOdd)
 import Even (isEven)
 
 fun isOdd(n : Int) -> Bool = if n == 0 { False } else { isEven(n - 1) }
@@ -104,7 +104,7 @@ True
 ```
 
 Each module in a cycle still sees only what it imports: a type imported without
-its constructors is [abstract](#module-headers) there, whichever module
+its constructors is [abstract](#export-declarations) there, whichever module
 declares it.
 
 Top-level bindings are initialized in [dependency
@@ -114,7 +114,7 @@ in a cycle either:
 
 <!-- module: Width.gob -->
 ```kotlin
-module (width)
+export (width)
 import Height (height)
 
 let width = height * 2
@@ -122,7 +122,7 @@ let width = height * 2
 
 <!-- module: Height.gob -->
 ```kotlin
-module (height)
+export (height)
 import Width (width)
 
 let height = width / 2
@@ -141,12 +141,13 @@ A name a module exports must be declared somewhere. Two modules that each export
 a name as the other's, without either declaring it, export nothing by that
 name.
 
-## Module headers
+## Export declarations
 
 **Syntax**
 
 ```ebnf
-header      ::= "module" "(" (export ("," export)*)? ")"
+export-decl ::= "export" "(" ".." ")"
+              | "export" "(" (export ("," export)*)? ")"
 modname     ::= CONID ("." CONID)*
 export      ::= IDENT                          -- a function or value
               | CONID                          -- a type without its constructors, or a class
@@ -155,16 +156,18 @@ export      ::= IDENT                          -- a function or value
               | "module" modname               -- a re-export
 ```
 
-A module may start with a header listing what it **exports**. Only exported
-names can be used from other modules. A module without a header exports
-everything it declares, and one whose list is empty, `module ()`, exports
+A module that other modules import starts with an export declaration, which
+lists what it **exports**. Only exported names can be used from other modules,
+whether bare or [qualified](#qualified-names). `export (..)` exports everything
+the module itself declares, though not what it imports, and `export ()` exports
 nothing.
 
-The header does not name the module: its [path](#modules-and-files) does.
+The declaration comes first in the file, before any import, and it does not
+name the module: its [path](#modules-and-files) does.
 
 <!-- module: Inventory.gob -->
 ```kotlin
-module (Item, restock, describe)
+export (Item, restock, describe)
 
 type Item = Item { name : String, count : Int }
 
@@ -188,11 +191,12 @@ fun main() {
 bolts x12
 ```
 
-`clamp` is not exported, so `Main` cannot call it:
+`clamp` is not exported, so `Main` cannot call it, neither as `clamp` nor as
+`Inventory.clamp`:
 
 <!-- module: Inventory.gob -->
 ```kotlin
-module (Item, restock, describe)
+export (Item, restock, describe)
 
 type Item = Item { name : String, count : Int }
 
@@ -212,6 +216,53 @@ fun main() {
 }
 ```
 
+Only the [entry module](#modules-and-files) may leave the declaration out,
+since nothing can import it. Importing a module that has none is an error:
+
+<!-- module: Scratch.gob -->
+```kotlin
+fun helper() -> Int = 1
+```
+
+<!-- error: module 'Scratch' is imported but has no export declaration -->
+```kotlin
+import Scratch
+
+fun main() {
+    print(helper())
+}
+```
+
+`export (..)` is the shortest declaration that makes it importable:
+
+<!-- module: Scratch.gob -->
+```kotlin
+export (..)
+
+fun helper() -> Int = 1
+```
+
+<!-- run -->
+```kotlin
+import Scratch
+
+fun main() {
+    print(helper())
+}
+```
+
+```text
+1
+```
+
+> **Coming from Haskell:** a module with no export list exports everything
+> in Haskell. Here every module that is imported says what it exports, and
+> `export (..)` is how it says "everything".
+>
+> **Coming from Rust:** a declaration is private unless the export list names
+> it, much as an item is private without `pub`; the list is in one place at
+> the top of the file rather than on each item.
+
 **Types.** Exporting `T` exports the type but not its constructors. Other
 modules can then use `T` in types and receive and pass `T` values, but cannot
 build one with a constructor, take one apart with a pattern, or read or assign
@@ -222,7 +273,7 @@ values of it. `T(..)` exports the type and all its constructors.
 
 <!-- module: Sealed.gob -->
 ```kotlin
-module (Token, make)
+export (Token, make)
 type Token = Token { value : Int }
 fun make(n : Int) -> Token = Token { value = n }
 ```
@@ -235,7 +286,7 @@ fun reveal() = make(3).value
 
 <!-- module: Sealed.gob -->
 ```kotlin
-module (Token, make)
+export (Token, make)
 type Token = Token { value : Int }
 fun make(n : Int) -> Token = Token { value = n }
 ```
@@ -283,7 +334,7 @@ import that constructor.
 
 <!-- module: Temperature.gob -->
 ```kotlin
-module (toFahrenheit, toCelsius)
+export (toFahrenheit, toCelsius)
 
 fun toFahrenheit(c) = c * 9.0 / 5.0 + 32.0
 
@@ -320,7 +371,7 @@ alike: `G.Point(1, 2)` builds a point and `G.Point(x, y)` takes one apart.
 
 <!-- module: Geometry.gob -->
 ```kotlin
-module (Point(..), origin)
+export (Point(..), origin)
 
 type Point = Point(Int, Int)
 
@@ -483,13 +534,13 @@ Importing the same declaration through more than one route is unambiguous.
 
 <!-- module: First.gob -->
 ```kotlin
-module (label)
+export (label)
 fun label() -> String = "first"
 ```
 
 <!-- module: Second.gob -->
 ```kotlin
-module (label)
+export (label)
 fun label() -> String = "second"
 ```
 

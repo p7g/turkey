@@ -17,7 +17,7 @@ from tests.lang import binary, run
 
 LIB = bootc.REPO_ROOT / "lib"
 
-PROBE = """module (
+PROBE = """export (
     pingPong, bulk, closeParked, heartbeat, gcParked, readDeadline,
 )
 

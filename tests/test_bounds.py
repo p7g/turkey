@@ -45,7 +45,7 @@ def library_ssa(request, tmp_path):
     path = LIB / f"{module}.gob"
 
     def build(body: str) -> tuple[str, str]:
-        path.write_text(f"module (run)\n\n" + body, encoding="utf-8")
+        path.write_text(f"export (run)\n\n" + body, encoding="utf-8")
         entry = tmp_path / "main.gob"
         entry.write_text(f"import {module} as P\nfun main() {{ P.run() }}\n",
                          encoding="utf-8")

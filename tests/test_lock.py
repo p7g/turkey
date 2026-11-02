@@ -21,7 +21,7 @@ import pytest
 
 from tests import bootc, toolchain
 
-PROBE = """module (run)
+PROBE = """export (run)
 
 import System.Parallel as Parallel
 import Turkey.Libc as Libc

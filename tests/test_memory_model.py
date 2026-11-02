@@ -77,7 +77,7 @@ def library_asm(request, tmp_path):
     path = LIB / f"{module}.gob"
 
     def build(body: str) -> tuple[str, str]:
-        path.write_text(f"module (run)\n\n" + body, encoding="utf-8")
+        path.write_text(f"export (run)\n\n" + body, encoding="utf-8")
         return assembly(tmp_path, f"import {module} as P\nfun main() {{ P.run() }}\n"), module
 
     try:
@@ -165,7 +165,7 @@ def probe(request, tmp_path):
     path = LIB / f"{module}.gob"
 
     def run(body: str) -> subprocess.CompletedProcess:
-        path.write_text(f"module (run)\n\n" + body, encoding="utf-8")
+        path.write_text(f"export (run)\n\n" + body, encoding="utf-8")
         entry = tmp_path / "main.gob"
         entry.write_text(f"import {module} as P\nfun main() {{ P.run() }}\n",
                          encoding="utf-8")

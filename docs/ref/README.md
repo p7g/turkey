@@ -39,7 +39,7 @@ Some things are deliberately left out:
 10. [Runtime errors](runtime-errors.md): what makes a program panic.
 11. [Built-in types and classes](builtins.md): the library the language itself
     relies on.
-12. [Modules](modules.md): module headers, exports, imports, and the entry
+12. [Modules](modules.md): export declarations, imports, and the entry
     point.
 13. [Grammar](grammar.md): the whole grammar in one place.
 

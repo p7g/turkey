@@ -22,8 +22,8 @@ def modules(request, tmp_path):
 
     def write(body, dependency="", main="print(P.read())", exports="read",
               dependency_giblet=True):
-        paths[1].write_text(f"module (base)\n{dependency}\n")
-        paths[0].write_text(f"module ({exports})\n"
+        paths[1].write_text(f"export (base)\n{dependency}\n")
+        paths[0].write_text(f"export ({exports})\n"
                             f"import {names[1]} as D\n{body}\n")
         entry.write_text(f"import {names[0]} as P\nfun main() {{ {main} }}\n")
         actual_env = dict(env)

@@ -36,8 +36,9 @@ Comments: `--` to the end of the line, and `{- ... -}`, which nests.
 ## Modules
 
 ```ebnf
-module      ::= header? top-level*
-header      ::= "module" "(" (export ("," export)*)? ")"
+module      ::= export-decl? top-level*
+export-decl ::= "export" "(" ".." ")"
+              | "export" "(" (export ("," export)*)? ")"
 modname     ::= CONID ("." CONID)*
 export      ::= IDENT
               | CONID

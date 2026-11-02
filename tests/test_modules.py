@@ -22,7 +22,7 @@ from tests.lang import check, execute as run, types
 from tests.lang import CompileError
 
 HELPER = """
-module (twice, greet)
+export (twice, greet)
 
 fun twice(n : Int) -> Int = n + n
 
@@ -120,8 +120,8 @@ def test_an_explicit_prelude_import_replaces_the_implicit_scope(tmp_path):
 def test_a_prelude_and_a_module_it_imports_may_need_each_other(tmp_path):
     # With the empty marker Base does not import the Prelude; without it, the
     # implicit import closes a cycle, which loads all the same.
-    for base in ("module ()\nimport Prelude ()", "module ()"):
-        search = write(tmp_path, Prelude="module ()\nimport Base",
+    for base in ("export ()\nimport Prelude ()", "export ()"):
+        search = write(tmp_path, Prelude="export ()\nimport Base",
                        Base=base)
         check("fun identity(n) = n", search)
 
@@ -142,15 +142,35 @@ def test_importing_a_name_that_is_not_exported_says_so(tmp_path):
 
 
 def test_a_module_may_not_export_what_it_does_not_have(tmp_path):
-    search = write(tmp_path, Broken="module (nope)\nfun yes() = 1")
+    search = write(tmp_path, Broken="export (nope)\nfun yes() = 1")
     assert fails("import Broken", search) == \
         "module 'Broken' exports 'nope', which is not defined or imported here"
 
 
-def test_a_module_with_no_export_list_exports_everything(tmp_path):
-    search = write(tmp_path, Open="fun one() -> Int = 1\nfun two() -> Int = 2")
-    src = "import Open\nfun f() -> Int = one() + two()"
+def test_export_everything_exports_what_the_module_declares(tmp_path):
+    search = write(tmp_path, Open="export (..)\nfun one() -> Int = 1\nfun two() -> Int = 2")
+    src = "import Open\nfun f() -> Int = one() + Open.two()"
     assert sigs(src, search)["f"] == "fun() -> Int"
+
+
+def test_export_everything_does_not_pass_on_imports(tmp_path):
+    search = write(tmp_path, Helper=HELPER,
+                   Open="export (..)\nimport Helper\nfun one() -> Int = twice(1)")
+    assert fails("import Open\nfun f() -> Int = twice(1)", search) == \
+        "'twice' is not defined"
+
+
+def test_an_imported_module_needs_an_export_declaration(tmp_path):
+    """Even an instance-only import: only the entry, which nothing imports,
+    may leave the declaration out."""
+    search = write(tmp_path, Open="fun one() -> Int = 1")
+    for src in ("import Open", "import Open ()", "import Open as O"):
+        assert fails(src, search).startswith(
+            "module 'Open' is imported but has no export declaration")
+
+
+def test_an_entry_may_have_an_export_declaration(tmp_path):
+    check("export (main)\nfun main() { print(1) }", {})
 
 
 # -- which name wins ----------------------------------------------------------
@@ -165,7 +185,7 @@ def test_a_local_definition_shadows_an_import(tmp_path):
 
 
 def test_an_import_shadows_the_prelude(tmp_path):
-    search = write(tmp_path, Shadow="fun print(x : Int) -> Int = x + 1")
+    search = write(tmp_path, Shadow="export (print)\nfun print(x : Int) -> Int = x + 1")
     src = "import Shadow\nfun f() -> Int = print(1)"
     assert sigs(src, search)["f"] == "fun() -> Int"
 
@@ -192,7 +212,7 @@ def test_an_import_is_transitive_only_through_its_own_names(tmp_path):
     search = write(
         tmp_path,
         Helper=HELPER,
-        Middle="module (thrice)\nimport Helper (twice)\n"
+        Middle="export (thrice)\nimport Helper (twice)\n"
                "fun thrice(n : Int) -> Int = twice(n) + n",
     )
     assert sigs("import Middle\nfun f() -> Int = thrice(1)", search)["f"] == \
@@ -204,8 +224,8 @@ def test_an_import_is_transitive_only_through_its_own_names(tmp_path):
 def test_modules_may_import_each_other(tmp_path):
     search = write(
         tmp_path,
-        A="module (a)\nimport B (b)\nfun a(n : Int) -> Int = if n == 0 { 0 } else { b(n - 1) }",
-        B="module (b)\nimport A (a)\nfun b(n : Int) -> Int = a(n)",
+        A="export (a)\nimport B (b)\nfun a(n : Int) -> Int = if n == 0 { 0 } else { b(n - 1) }",
+        B="export (b)\nimport A (a)\nfun b(n : Int) -> Int = a(n)",
     )
     assert sigs("import A\nfun f() -> Int = a(3)", search)["f"] == "fun() -> Int"
 
@@ -219,7 +239,7 @@ def test_a_type_declared_in_another_module_is_usable(tmp_path):
     hand the parser the type names an import already put in scope."""
     search = write(
         tmp_path,
-        Shape="module (Circle(..))\ntype Circle = Circle(Int)",
+        Shape="export (Circle(..))\ntype Circle = Circle(Int)",
     )
     src = "import Shape\ntype Round = Circle\nfun f(c : Round) -> Round = c"
     assert sigs(src, search)["f"] == "fun(Circle) -> Circle"
@@ -241,7 +261,7 @@ def test_the_prelude_is_imported_without_being_asked_for(tmp_path):
 
 
 def test_a_diagnostic_in_an_imported_module_names_that_module(tmp_path):
-    search = write(tmp_path, Wrong="module (w)\nfun w() -> Int = \"s\"")
+    search = write(tmp_path, Wrong="export (w)\nfun w() -> Int = \"s\"")
     with pytest.raises(CompileError) as exc:
         check("import Wrong", search)
     assert exc.value.rendered.startswith("Wrong.gob:2:"), exc.value.rendered
@@ -258,7 +278,7 @@ def test_run_evaluates_every_module_in_dependency_order(tmp_path, capsys):
     search = write(
         tmp_path,
         Helper=HELPER,
-        Middle="module (loud)\nimport Helper (greet)\n"
+        Middle="export (loud)\nimport Helper (greet)\n"
                "fun loud(who : String) -> String = greet(who) + \"!\"",
     )
     src = 'import Middle\nfun main() { print(loud("world")) }'
@@ -268,8 +288,8 @@ def test_run_evaluates_every_module_in_dependency_order(tmp_path, capsys):
 def test_two_modules_may_each_define_the_same_name(tmp_path, capsys):
     search = write(
         tmp_path,
-        One="module (name)\nfun name() -> String = \"one\"",
-        Two="module (name)\nfun name() -> String = \"two\"",
+        One="export (name)\nfun name() -> String = \"one\"",
+        Two="export (name)\nfun name() -> String = \"two\"",
     )
     src = ('import One as One\nimport Two as Two\n'
            'fun main() { print(One.name()); print(Two.name()) }')
@@ -340,7 +360,7 @@ fun main() {
 
 
 def test_a_re_export_needs_the_module_to_be_imported(tmp_path):
-    search = write(tmp_path, Nope="module (module Missing)\nfun f() = 1")
+    search = write(tmp_path, Nope="export (module Missing)\nfun f() = 1")
     assert fails("import Nope", search) == \
         "module 'Nope' re-exports 'Missing', which is not imported here"
 
@@ -354,7 +374,7 @@ def test_module_is_an_export_form_not_an_import_one(tmp_path):
 # -- a type and an instance know which module made them -----------------------
 
 SHAPE = """
-module (Node(..), leaf)
+export (Node(..), leaf)
 
 type Node = Leaf | Fork(Node, Node)
 
@@ -366,7 +386,7 @@ def test_two_modules_may_each_declare_the_same_type(tmp_path):
     """A type constructor is qualified by its module, so two libraries that
     each have a `Node` can be used together: they are different types."""
     search = write(tmp_path, Shape=SHAPE,
-                   Graph="module (Node(..))\ntype Node = Node(Int)")
+                   Graph="export (Node(..))\ntype Node = Node(Int)")
     src = ("import Shape as S\nimport Graph as G\n"
            "fun a() -> S.Node = S.Leaf\nfun b() -> G.Node = G.Node(1)")
     got = sigs(src, search)
@@ -394,7 +414,7 @@ def test_an_export_list_may_withhold_the_constructors(tmp_path):
     difference between an abstract type and a transparent one."""
     search = write(
         tmp_path,
-        Opaque="module (Token, make)\n"
+        Opaque="export (Token, make)\n"
                "type Token = Token(Int)\n"
                "fun make(n : Int) -> Token = Token(n)",
     )
@@ -434,7 +454,7 @@ def test_an_instance_may_live_with_its_class(tmp_path):
 def test_an_imported_qualified_class_can_have_a_local_type_instance(tmp_path):
     search = write(
         tmp_path,
-        Rules=("module (Render(..))\n"
+        Rules=("export (Render(..))\n"
                "class Render a { fun render(a) -> String }"),
     )
     src = ("import Rules as R\n"
@@ -468,7 +488,7 @@ def test_two_instances_for_one_head_still_overlap(tmp_path):
     search = write(
         tmp_path,
         Shape=SHAPE,
-        Extra="module ()\nimport Shape (Node(..))\n"
+        Extra="export ()\nimport Shape (Node(..))\n"
               'instance Show Node { fun show(n) = "a" }',
     )
     assert "orphan instance" in fails("import Extra", search)

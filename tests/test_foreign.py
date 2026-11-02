@@ -77,12 +77,12 @@ def test_a_program_may_not_declare_a_foreign_symbol():
 
 def test_naming_your_own_module_after_a_listed_one_does_not_let_you_in(tmp_path):
     """Checked against where the file came from, not against what it says it
-    is called. A program that could opt in by writing a module header would
+    is called. A program that could opt in by what its own source says would
     have no gate at all. `import Prelude ()`, because a module beside the
     entry shadows the library's own `Turkey.Libc`, which the Prelude
     reaches."""
     message = fails("import Turkey.Libc as E\nfun main() { }\n", {
-        "Turkey/Libc.gob": "module (f)\n"
+        "Turkey/Libc.gob": "export (f)\n"
                            "import Prelude ()\n"
                            'foreign "system" fun f(Prim.Ptr) -> Int\n'})
     assert "a foreign declaration may only appear in" in message
@@ -94,7 +94,7 @@ def test_a_directory_named_lib_is_not_the_library(tmp_path):
     root = tmp_path / "lib"
     (root / "Turkey").mkdir(parents=True)
     (root / "Turkey" / "Libc.gob").write_text(
-        "module (f)\n"
+        "export (f)\n"
         "import Prelude ()\n"
         'foreign "strlen" fun f(Prim.Ptr) -> Int\n',
         encoding="utf-8")
@@ -109,7 +109,7 @@ def test_a_directory_named_lib_is_not_the_library(tmp_path):
 
 def test_a_declaration_binds_the_name_at_the_type_it_states(probe):
     entry = probe((
-        "module (call)\n"
+        "export (call)\n"
         'foreign "strlen" fun strlen(s : Prim.Ptr) -> Int\n'
         "fun call(p : Prim.Ptr) -> Int = strlen(p)\n"))
     assert types(entry)["main"] == "fun() -> Unit"
@@ -122,7 +122,7 @@ def test_only_the_seven_representable_types_cross(probe, written):
     terminator, and every C function that wants a string wants a
     `char *`. The copy is the caller's (`Turkey.Ptr.toCString`)."""
     entry = probe((
-        "module (f)\n"
+        "export (f)\n"
         f'foreign "probe" fun f(x : {written}) -> Int\n'))
     message = fails(entry)
     assert "cannot cross a foreign boundary" in message
@@ -130,14 +130,14 @@ def test_only_the_seven_representable_types_cross(probe, written):
 
 def test_a_result_type_is_checked_too(probe):
     entry = probe((
-        "module (f)\n"
+        "export (f)\n"
         'foreign "probe" fun f(x : Int) -> String\n'))
     assert "cannot cross a foreign boundary" in fails(entry)
 
 
 def test_unit_is_how_a_void_function_is_written(probe):
     entry = probe((
-        "module (f)\n"
+        "export (f)\n"
         'foreign "free" fun f(p : Prim.Ptr) -> Unit\n'))
     check(entry)
 
@@ -150,7 +150,7 @@ def test_eight_general_arguments_fit(probe):
     six, so the limit costs nothing today."""
     params = ", ".join(f"a{i} : Int" for i in range(8))
     entry = probe((
-        "module (f)\n"
+        "export (f)\n"
         f'foreign "probe" fun f({params}) -> Int\n'))
     check(entry)
 
@@ -163,7 +163,7 @@ def test_a_ninth_general_argument_is_rejected_at_the_declaration(probe):
     register file filled up."""
     params = ", ".join(f"a{i} : Int" for i in range(9))
     entry = probe((
-        "module (f)\n"
+        "export (f)\n"
         f'foreign "probe" fun f({params}) -> Int\n'))
     message = fails(entry)
     assert "9 general arguments" in message
@@ -176,7 +176,7 @@ def test_the_two_register_files_are_counted_apart(probe):
     params = ", ".join(
         [f"a{i} : Int" for i in range(8)] + [f"b{i} : Float" for i in range(8)])
     entry = probe((
-        "module (f)\n"
+        "export (f)\n"
         f'foreign "probe" fun f({params}) -> Int\n'))
     check(entry)
 
@@ -184,7 +184,7 @@ def test_the_two_register_files_are_counted_apart(probe):
 def test_a_ninth_float_is_rejected_and_says_so(probe):
     params = ", ".join(f"a{i} : Float" for i in range(9))
     entry = probe((
-        "module (f)\n"
+        "export (f)\n"
         f'foreign "probe" fun f({params}) -> Int\n'))
     message = fails(entry)
     assert "9 floating-point arguments" in message
@@ -196,7 +196,7 @@ def test_a_ninth_float_is_rejected_and_says_so(probe):
 
 def test_a_foreign_name_collides_with_a_function_of_the_same_name(probe):
     entry = probe((
-        "module (f)\n"
+        "export (f)\n"
         'foreign "probe" fun f(x : Int) -> Int\n'
         "fun f(x : Int) -> Int = x\n"))
     assert "already defined" in fails(entry)
@@ -204,7 +204,7 @@ def test_a_foreign_name_collides_with_a_function_of_the_same_name(probe):
 
 def test_declaring_the_same_name_twice_is_an_error(probe):
     entry = probe((
-        "module (f)\n"
+        "export (f)\n"
         'foreign "probe" fun f(x : Int) -> Int\n'
         'foreign "other" fun f(x : Int) -> Int\n'))
     assert "declared more than once" in fails(entry)
@@ -214,7 +214,7 @@ def test_two_names_may_share_one_symbol(probe):
     """Nothing about a C symbol is owned by the declaration, so two of them
     may name it. The Turkey names are what collide, not the symbols."""
     entry = probe((
-        "module (f, g)\n"
+        "export (f, g)\n"
         'foreign "strlen" fun f(p : Prim.Ptr) -> Int\n'
         'foreign "strlen" fun g(p : Prim.Ptr) -> Int\n'))
     check(entry)
@@ -227,7 +227,7 @@ def test_a_return_type_is_required(probe):
     """"The signature is stated in full" is the only property that makes an
     unverifiable declaration worth trusting, so there is no defaulting."""
     entry = probe((
-        "module (f)\n"
+        "export (f)\n"
         'foreign "probe" fun f(x : Int)\n'))
     message = fails(entry)
     assert "must state a return type" in message
@@ -236,7 +236,7 @@ def test_a_return_type_is_required(probe):
 
 def test_the_c_symbol_is_required(probe):
     entry = probe((
-        "module (f)\n"
+        "export (f)\n"
         "foreign fun f(x : Int) -> Int\n"))
     assert "expected the C symbol as a string" in fails(entry)
 
@@ -248,7 +248,7 @@ def test_parameters_may_be_named_or_bare(probe):
     body, and every parameter of a foreign signature states its type, so
     `x : T` is always a name."""
     entry = probe((
-        "module (f)\n"
+        "export (f)\n"
         'foreign "probe" fun f(fd : Int, Prim.Ptr, count : Int) -> Int\n'))
     check(entry)
 
@@ -262,7 +262,7 @@ def test_parameters_may_be_named_or_bare(probe):
 # on the other; the run is what checks that this target's call is the one its
 # libc reads.
 VARIADIC = """\
-module (create, descriptorFlags, setDescriptorFlags, close)
+export (create, descriptorFlags, setDescriptorFlags, close)
 
 import Target (OS(..))
 import Target as Target
@@ -336,14 +336,14 @@ def test_a_variadic_marker_needs_an_argument_after_it(probe):
     """A declaration fixes the type of every argument it passes, so a `...`
     with nothing after it would declare no call at all."""
     entry = probe((
-        "module (f)\n"
+        "export (f)\n"
         'foreign "open" fun f(path : Prim.Ptr, flags : Int, ...) -> Int\n'))
     assert "must be followed by the variadic arguments" in fails(entry)
 
 
 def test_a_parameter_list_has_one_variadic_marker(probe):
     entry = probe((
-        "module (f)\n"
+        "export (f)\n"
         'foreign "probe" fun f(a : Int, ... b : Int, ... c : Int) -> Int\n'))
     assert "one '...'" in fails(entry)
 
@@ -361,6 +361,6 @@ def test_variadic_arguments_count_against_the_registers(probe):
     both."""
     params = ", ".join(f"a{i} : Int" for i in range(7))
     entry = probe((
-        "module (f)\n"
+        "export (f)\n"
         f'foreign "probe" fun f({params}, ... b : Int, c : Int) -> Int\n'))
     assert "9 general arguments" in fails(entry)

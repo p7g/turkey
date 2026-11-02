@@ -16,7 +16,7 @@ from tests.lang import run
 
 LIB = bootc.REPO_ROOT / "lib"
 
-PROBE = """module (
+PROBE = """export (
     sleepOrder, sleepFreesWorker, sleepOwn, readWake, readTimeout, childStatus,
     childAlready, childTimeout, joinSleeper, sleepBesideCompute,
 )

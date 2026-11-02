@@ -120,7 +120,7 @@ already defaulted to `Int`:
 
 <!-- module: Seed.gob -->
 ```kotlin
-module (seed)
+export (seed)
 
 fun same(x) = x
 

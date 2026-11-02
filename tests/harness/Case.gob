@@ -1,6 +1,6 @@
 module Case (
-    Case(..), Expected(..), Outcome(..), Result(..),
-    directives, outcomeName, failsRun, passed,
+    Case(..), Expected(..), Requirement(..), Outcome(..), Result(..),
+    directives, requirementName, outcomeName, failsRun, passed,
 )
 
 -- What a test is, whatever source it came from, and what can become of it.
@@ -14,6 +14,25 @@ module Case (
 -- How a case must end. Without a directive saying otherwise, a program
 -- compiles, runs and exits 0.
 type Expected = Exits(Int) | Panics | Rejected
+
+-- What a case may need of the machine: a C compiler, an assembler, or one
+-- system.
+type Requirement = Cc | As | Darwin | Linux
+
+fun requirementName(r : Requirement) -> String = match r {
+    Cc -> "cc"
+    As -> "as"
+    Darwin -> "darwin"
+    Linux -> "linux"
+}
+
+fun requirement(name : String) -> Option Requirement = match name {
+    "cc" -> Some(Cc)
+    "as" -> Some(As)
+    "darwin" -> Some(Darwin)
+    "linux" -> Some(Linux)
+    _ -> None
+}
 
 type Case = Case {
     -- What the report and a selection call it: the path from the repository
@@ -35,8 +54,8 @@ type Case = Case {
     expected : Expected,
     -- How long the compiled program may run, in seconds, before `--timeout-scale`.
     timeout : Option Int,
-    -- `cc`, `as`, `darwin` or `linux`: the case is skipped unless each holds.
-    requires : Array String,
+    -- The case is skipped unless each holds.
+    requires : Array Requirement,
     -- The reason the case is expected to fail its comparison.
     xfail : Option String,
     problem : Option String,
@@ -120,48 +139,17 @@ fun directives(base : Case, text : String) -> Case {
             Some((n, v)) -> (String.trim(n), Some(String.trim(v)))
             None -> (rest, None)
         }
-        let said = match (name, value) {
-            ("exit", Some(v)) -> match Int.parse(v) {
-                Some(n) -> Right(Some(Exits(n)))
-                None -> Left("'exit' takes a number, not '" + v + "'")
-            }
-            ("panic", None) -> Right(Some(Panics))
-            ("error", None) -> Right(Some(Rejected))
-            ("timeout", Some(v)) -> {
-                let n = Option.unwrapOr(Int.parse(v), 0)
-                if n > 0 {
-                    timeout = Some(n)
-                    Right(None)
-                } else {
-                    Left("'timeout' takes a whole number of seconds, not '" + v + "'")
-                }
-            }
-            ("requires", Some(v)) -> match v {
-                "cc" | "as" | "darwin" | "linux" -> {
-                    Vec.push(requires, v)
-                    Right(None)
-                }
-                _ -> Left("'requires' takes cc, as, darwin or linux, not '" + v + "'")
-            }
-            ("xfail", Some("")) -> Left("'xfail' needs a reason")
-            ("xfail", Some(v)) -> {
-                xfail = Some(v)
-                Right(None)
-            }
-            ("exit", None) | ("timeout", None) | ("requires", None) | ("xfail", None) ->
-                Left("'" + name + "' needs a value")
-            ("panic", Some(_)) | ("error", Some(_)) -> Left("'" + name + "' takes no value")
-            _ -> Left("unknown directive '" + name + "'")
-        }
-        match said {
+        match directive(name, value) {
             Left(why) -> { if Option.isNone(problem) { problem = Some(why) } }
-            Right(Some(e)) -> {
+            Right(Ends(e)) -> {
                 if Option.isSome(expected) && Option.isNone(problem) {
                     problem = Some("more than one of 'exit', 'panic' and 'error'")
                 }
                 expected = Some(e)
             }
-            Right(None) -> {}
+            Right(TimesOut(n)) -> { timeout = Some(n) }
+            Right(Requires(r)) -> Vec.push(requires, r)
+            Right(Fails(reason)) -> { xfail = Some(reason) }
         }
     }
     Case {
@@ -175,9 +163,33 @@ fun directives(base : Case, text : String) -> Case {
         timeout = timeout,
         requires = Vec.toArray(requires),
         xfail = xfail,
-        problem = match problem {
-            Some(p) -> Some(p)
-            None -> base.problem
-        },
+        problem = if Option.isSome(problem) { problem } else { base.problem },
     }
+}
+
+-- One `--@` line.
+type Directive = Ends(Expected) | TimesOut(Int) | Requires(Requirement) | Fails(String)
+
+fun directive(name : String, value : Option String) -> Either String Directive = match (name, value) {
+    ("exit", Some(v)) -> match Int.parse(v) {
+        Some(n) -> Right(Ends(Exits(n)))
+        None -> Left("'exit' takes a number, not '" + v + "'")
+    }
+    ("panic", None) -> Right(Ends(Panics))
+    ("error", None) -> Right(Ends(Rejected))
+    ("timeout", Some(v)) -> {
+        let n = Option.unwrapOr(Int.parse(v), 0)
+        if n > 0 { Right(TimesOut(n)) }
+        else { Left("'timeout' takes a whole number of seconds, not '" + v + "'") }
+    }
+    ("requires", Some(v)) -> match requirement(v) {
+        Some(r) -> Right(Requires(r))
+        None -> Left("'requires' takes cc, as, darwin or linux, not '" + v + "'")
+    }
+    ("xfail", Some("")) -> Left("'xfail' needs a reason")
+    ("xfail", Some(v)) -> Right(Fails(v))
+    ("exit", None) | ("timeout", None) | ("requires", None) | ("xfail", None) ->
+        Left("'" + name + "' needs a value")
+    ("panic", Some(_)) | ("error", Some(_)) -> Left("'" + name + "' takes no value")
+    _ -> Left("unknown directive '" + name + "'")
 }

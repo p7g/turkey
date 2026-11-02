@@ -31,30 +31,27 @@ fun readTimings(path : String) -> Map String Timing {
     let timings = Map.new()
     let text = Either.unwrapOr(Files.readText(path), "")
     for line in String.lines(text) {
-        let fields = String.splitOnce(line, " ")
-        if let Some((millis, rest)) = fields {
-            if let Some((failed, name)) = String.splitOnce(rest, " ") {
-                if let Some(ms) = Int.parse(millis) {
-                    Map.put(timings, name, Timing { millis = ms, failed = failed == "1" })
-                }
-            }
-        }
+        if let Some((name, timing)) = timingOf(line) { Map.put(timings, name, timing) }
     }
     timings
+}
+
+fun timingOf(line : String) -> Option (String, Timing) {
+    let (millis, rest) = String.splitOnce(line, " ")?
+    let (failed, name) = String.splitOnce(rest, " ")?
+    let ms = Int.parse(millis)?
+    Some((name, Timing { millis = ms, failed = failed == "1" }))
 }
 
 -- The timings of this run written over the old ones, which are kept for the
 -- cases this run did not select. Written beside the file and renamed over it,
 -- so a concurrent session reads the old file or the new one.
-fun writeTimings(path : String, old : Map String Timing, cases : Array Case,
-                 results : Array Result) -> Unit {
-    for var i = 0; i < len(cases); i = i + 1 {
-        let r = results[i]
-        Map.put(old, cases[i].name, Timing { millis = r.millis, failed = Case.failsRun(r.outcome) })
+fun writeTimings(path : String, old : Map String Timing, ran : Array (Case, Result)) -> Unit {
+    for (c, r) in ran {
+        Map.put(old, c.name, Timing { millis = r.millis, failed = Case.failsRun(r.outcome) })
     }
     let b = String.builder()
-    for entry in Map.entries(old) {
-        let (name, timing) = entry
+    for (name, timing) in old {
         String.push(b, Int.toString(timing.millis) + " " + (if timing.failed { "1" } else { "0" })
                        + " " + name + "\n")
     }
@@ -69,17 +66,13 @@ fun writeTimings(path : String, old : Map String Timing, cases : Array Case,
 -- `cases` in the order to run them. The sort is stable and `cases` arrive
 -- sorted by name, so cases that tie keep that order.
 fun ordered(cases : Array Case, timings : Map String Timing) -> Array Case =
-    Array.sortBy(cases, fun(a, b) {
-        let (ra, ma) = rank(timings, a)
-        let (rb, mb) = rank(timings, b)
-        if ra != rb { Int.compare(ra, rb) } else { Int.compare(mb, ma) }
-    })
+    Array.sortBy(cases, fun(a, b) = Array.threeWay(rank(timings, a), rank(timings, b)))
 
--- The group a case runs in, failed last time first and untimed last, and its
--- last duration.
+-- What a case is sorted by: the group it runs in, failed last time first and
+-- untimed last, then its last duration, longest first.
 fun rank(timings : Map String Timing, c : Case) -> (Int, Int) = match Map.get(timings, c.name) {
-    Some(Timing { failed = True, millis }) -> (0, millis)
-    Some(Timing { millis, .. }) -> (1, millis)
+    Some(Timing { failed = True, millis }) -> (0, -millis)
+    Some(Timing { millis, .. }) -> (1, -millis)
     None -> (2, 0)
 }
 
@@ -88,28 +81,27 @@ fun inShard(name : String, index : Int, count : Int) -> Bool {
     let h = SHA256.new()
     SHA256.updateText(h, name)
     let digest = SHA256.finish(h)
-    var n = 0
-    for var i = 0; i < 4; i = i + 1 { n = n * 256 + Byte.toInt(digest[i]) }
+    let n = Array.fold(Array.slice(digest, 0, 4), 0, fun(n, b) = n * 256 + Byte.toInt(b))
     n % count == index - 1
 }
 
 -- `run` of each case, `jobs` at a time, each result in its case's place.
 fun runAll(cases : Array Case, jobs : Int, run : fun(Case) -> Result) -> Array Result {
-    let results : Array (Option Result) = Array.filled(len(cases), None)
+    let results = Array.filled(len(cases), None)
     -- The next case to take. Atomic, since with more than one worker two
     -- tasks may take one at once.
     let next = Sync.atomicInt(0)
     Task.runScope(do {
         for var j = 0; j < jobs; j = j + 1 {
             let _ = Task.spawn(fun() {
-                var i = Sync.addAndGet(next, 1) - 1
-                while i < len(cases) {
+                loop {
+                    let i = Sync.addAndGet(next, 1) - 1
+                    if i >= len(cases) { break }
                     results[i] = Some(run(cases[i]))
-                    i = Sync.addAndGet(next, 1) - 1
                 }
             })?
         }
         pure(())
     })
-    Array.map(results, fun(r) = Option.expect(r, "a case was not run"))
+    Array.map(results, Option.expect(_, "a case was not run"))
 }

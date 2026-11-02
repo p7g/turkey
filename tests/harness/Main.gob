@@ -54,26 +54,21 @@ fun main() {
     }
     let found = if o.selftest { Selftest.cases(o.root, o.cache) }
                 else { Programs.discover(o.root + "/tests/programs", "tests/programs") }
-    let selected = Array.filter(found, fun(c) = chosen(o, c.name))
+    let selected = Array.filter(found, \chosen(o, _.name))
     let timingsFile = o.cache + "/timings"
     let timings = Schedule.readTimings(timingsFile)
     let cases = Schedule.ordered(selected, timings)
     let actual = o.cache + "/actual"
     let results = Schedule.runAll(cases, o.jobs, Execute.execute(t, cache, actual, _))
-    Schedule.writeTimings(timingsFile, timings, cases, results)
+    let ran = Array.init(len(cases), \(cases[_], results[_]))
+    Schedule.writeTimings(timingsFile, timings, ran)
     -- Reported in name order, whatever order they ran in.
-    let byName = Array.sortBy(Array.init(len(cases), fun(i) = i),
-                              fun(a, b) = order(cases[a].name, cases[b].name))
-    let shownCases = Array.map(byName, fun(i) = cases[i])
-    let shownResults = Array.map(byName, fun(i) = results[i])
+    let byName = Array.sortBy(ran, fun((a, _), (b, _)) = Array.threeWay(a.name, b.name))
     let millis = Duration.toNanos(Stopwatch.elapsed(watch)) / 1000000
-    var ok = Report.report(shownCases, shownResults, o.verbose, actual, millis)
-    if o.selftest { ok = Selftest.check(shownCases, shownResults) }
+    let reported = Report.report(byName, o.verbose, actual, millis)
+    let ok = if o.selftest { Selftest.check(byName) } else { reported }
     Env.exit(if ok { 0 } else { 1 })
 }
-
-fun order(a : String, b : String) -> Ordering =
-    if a < b { LT } else if b < a { GT } else { EQ }
 
 -- Whether the case `name` is in the shard and the selection.
 fun chosen(o : Options, name : String) -> Bool {
@@ -81,20 +76,17 @@ fun chosen(o : Options, name : String) -> Bool {
         if !Schedule.inShard(name, index, count) { return False }
     }
     if len(o.selections) == 0 { return True }
-    let (path, part) = match String.splitOnce(name, "::") {
-        Some(split) -> split
-        None -> (name, "")
-    }
+    let (path, part) = selector(name)
     for s in o.selections {
-        let (wantPath, wantPart) = match String.splitOnce(s, "::") {
-            Some(split) -> split
-            None -> (s, "")
-        }
+        let (wantPath, wantPart) = selector(s)
         let wantPath = Option.unwrapOr(String.stripPrefix(wantPath, "./"), wantPath)
         if String.startsWith(path, wantPath) && String.contains(part, wantPart) { return True }
     }
     False
 }
+
+-- `PATH::CASE` as its two parts, and a bare `PATH` as one with no `CASE`.
+fun selector(s : String) -> (String, String) = Option.unwrapOr(String.splitOnce(s, "::"), (s, ""))
 
 fun options(args : Array String) -> Options {
     let o = Options {

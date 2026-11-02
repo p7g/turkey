@@ -15,6 +15,7 @@ module Execute (execute, diffLimit)
 
 import Process (Output(..), Status(..))
 import Process as Process
+import System.IO (IOError)
 import Time.Duration as Duration
 import Time.Stopwatch as Stopwatch
 import Case (Case(..), Expected(..), Outcome(..), Result(..))
@@ -58,11 +59,11 @@ fun judge(t : Toolchain, cache : Cache, actual : String, c : Case) -> (Outcome, 
     }
     let golden = match Files.readText(c.golden) {
         Right(text) -> text
-        Left(why) -> return (HarnessError, why, "")
+        Left(e) -> return (HarnessError, Error.describe(e), "")
     }
     let compiled = match Cache.compile(cache, t, c) {
         Right(compiled) -> compiled
-        Left(why) -> return (HarnessError, why, "")
+        Left(e) -> return (HarnessError, Error.describe(e), "")
     }
     let run = match compiled {
         Crashed(why, stderr) -> {
@@ -88,7 +89,7 @@ fun judge(t : Toolchain, cache : Cache, actual : String, c : Case) -> (Outcome, 
     record(actual, "output", output)
     let diff = Diff.unified(golden, output, diffLimit)
     match status {
-        Left(why) -> (HarnessError, why, "")
+        Left(e) -> (HarnessError, "the program did not start: " + Error.message(e), "")
         Right(TimedOut) -> (Timeout, "the program ran out of time", diff)
         Right(Signaled(n)) -> (ProgramCrash, "the program died by signal " + Int.toString(n), diff)
         Right(Exited(code)) -> {
@@ -112,11 +113,11 @@ fun judge(t : Toolchain, cache : Cache, actual : String, c : Case) -> (Outcome, 
 -- The compiled program run in the case's directory: how it ended, what the
 -- golden is compared with, and its own stderr, where a panic is looked for.
 fun runProgram(t : Toolchain, c : Case, binary : String, warnings : String)
-    -> (Either String Status, String, String) {
+    -> (Either IOError Status, String, String) {
     let argv = Array.append(t.run, [binary])
     let limit = Toolchain.limit(t, Option.unwrapOr(c.timeout, defaultTimeout))
     match Process.run(Toolchain.command(t, argv, c.directory), Some(limit)) {
-        Left(e) -> (Left("the program did not start: " + show(e)), "", "")
+        Left(e) -> (Left(e), "", "")
         Right(Output { stdout, stderr, status }) -> {
             let err = Toolchain.text(stderr)
             (Right(status), Toolchain.text(stdout) + warnings + err, err)
@@ -131,13 +132,13 @@ fun dumps(t : Toolchain, actual : String, c : Case) -> (Outcome, String, String)
         let (stage, golden) = dump
         let expected = match Files.readText(golden) {
             Right(text) -> text
-            Left(why) -> return (HarnessError, why, "")
+            Left(e) -> return (HarnessError, Error.describe(e), "")
         }
         let argv = Array.append(t.run, [t.boot, "check", "--dump", stage, c.entry])
         let limit = Toolchain.limit(t, defaultTimeout)
         let out = match Process.run(Toolchain.command(t, argv, c.directory), Some(limit)) {
             Right(out) -> out
-            Left(e) -> return (HarnessError, "boot did not start: " + show(e), "")
+            Left(e) -> return (HarnessError, "boot did not start: " + Error.message(e), "")
         }
         let stderr = Toolchain.text(out.stderr)
         let printed = Toolchain.text(out.stdout) + stderr

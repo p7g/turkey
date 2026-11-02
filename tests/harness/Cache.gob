@@ -47,7 +47,7 @@ type Compiled = Built(String, String) | Refused(Int, String) | Crashed(String, S
 
 -- The cache under `root`, with the part of every key that does not depend
 -- on the case worked out once.
-fun open(root : String, t : Toolchain) -> Either String Cache {
+fun open(root : String, t : Toolchain) -> Either SomeError Cache {
     let h = SHA256.new()
     let boot = Files.readBytes(t.boot)?
     SHA256.update(h, boot, 0, len(boot))
@@ -59,7 +59,7 @@ fun open(root : String, t : Toolchain) -> Either String Cache {
 }
 
 -- Each of `names`, a path relative to `directory`, by name and contents.
-fun feed(h : SHA256.SHA256, directory : String, names : Array String) -> Either String Unit {
+fun feed(h : SHA256.SHA256, directory : String, names : Array String) -> Either SomeError Unit {
     for name in names {
         let bytes = Files.readBytes(directory + "/" + name)?
         SHA256.updateText(h, name + "\u{0}" + Int.toString(len(bytes)) + "\u{0}")
@@ -68,7 +68,7 @@ fun feed(h : SHA256.SHA256, directory : String, names : Array String) -> Either 
     Right(())
 }
 
-fun keyOf(cache : Cache, c : Case, argv : Array String) -> Either String String {
+fun keyOf(cache : Cache, c : Case, argv : Array String) -> Either SomeError String {
     let h = SHA256.new()
     SHA256.updateText(h, cache.base + "\u{0}" + String.join(argv, " ") + "\u{0}")
     feed(h, c.directory, c.sources)?
@@ -85,16 +85,13 @@ fun panicked(stderr : String) -> Bool {
 
 -- `c` compiled and linked, from the cache or now. `Left` is a harness error:
 -- a source that cannot be read, or a cache that cannot be written.
-fun compile(cache : Cache, t : Toolchain, c : Case) -> Either String Compiled {
+fun compile(cache : Cache, t : Toolchain, c : Case) -> Either SomeError Compiled {
     let flags = ["build", "-f", "obj"]
     let key = keyOf(cache, c, flags)?
     let entry = cache.root + "/compile/" + key
     if let Some(found) = load(entry) { return Right(found) }
     Files.writeText(entry + ".lock", "")?
-    let lockFile = match File.openReadWrite(entry + ".lock") {
-        Right(f) -> f
-        Left(e) -> return Left(show(e))
-    }
+    let lockFile = Error.promote(File.openReadWrite(entry + ".lock"))?
     -- `tryLock` and a sleep rather than `lock`, whose wait blocks the worker
     -- and with it every other case it is running.
     while True {
@@ -103,7 +100,7 @@ fun compile(cache : Cache, t : Toolchain, c : Case) -> Either String Compiled {
             Right(False) -> Sleep.sleep(Duration.millis(50))
             Left(e) -> {
                 let _ = File.close(lockFile)
-                return Left(show(e))
+                return Left(fail(e))
             }
         }
     }
@@ -131,11 +128,8 @@ fun load(entry : String) -> Option Compiled {
 }
 
 fun build(t : Toolchain, c : Case, flags : Array String, entry : String)
-    -> Either String Compiled {
-    let staging = match File.temporaryDir("turkey-test-") {
-        Right(d) -> d
-        Left(e) -> return Left(show(e))
-    }
+    -> Either SomeError Compiled {
+    let staging = Error.promote(File.temporaryDir("turkey-test-"))?
     let compiled = runBoot(t, c, flags, staging)
     let published = match compiled {
         Built(_, stderr) -> publish(staging, entry, 0, stderr)
@@ -143,7 +137,7 @@ fun build(t : Toolchain, c : Case, flags : Array String, entry : String)
         _ -> Right(())
     }
     let _ = File.removeTree(staging)
-    if let Left(why) = published { return Left(why) }
+    published?
     Right(match compiled {
         Built(_, stderr) -> Built(entry + "/bin", stderr)
         other -> other
@@ -158,7 +152,7 @@ fun runBoot(t : Toolchain, c : Case, flags : Array String, staging : String) -> 
                             Array.append(flags, ["-o", object, c.entry]))
     let limit = Toolchain.limit(t, 300)
     let compiled = match Process.run(Toolchain.command(t, argv, c.directory), Some(limit)) {
-        Left(e) -> return Crashed("boot did not start: " + show(e), "")
+        Left(e) -> return Crashed("boot did not start: " + Error.message(e), "")
         Right(out) -> out
     }
     let stderr = Toolchain.text(compiled.stderr)
@@ -175,7 +169,7 @@ fun runBoot(t : Toolchain, c : Case, flags : Array String, staging : String) -> 
         Right(Output { status = Exited(0), .. }) -> Built(staging + "/bin", stderr)
         Right(Output { status = TimedOut, stderr = linkErr, .. }) -> Overran(Toolchain.text(linkErr))
         Right(Output { stderr = linkErr, .. }) -> Crashed("the link failed", Toolchain.text(linkErr))
-        Left(e) -> Crashed("the C compiler did not start: " + show(e), "")
+        Left(e) -> Crashed("the C compiler did not start: " + Error.message(e), "")
     }
 }
 
@@ -183,14 +177,14 @@ fun runBoot(t : Toolchain, c : Case, flags : Array String, staging : String) -> 
 -- rename it into place. A rename that finds the entry there already lost a
 -- race nobody should be able to run, since the lock is held; the entry that
 -- won is as good, and the staging directory is removed by the caller.
-fun publish(staging : String, entry : String, code : Int, stderr : String) -> Either String Unit {
+fun publish(staging : String, entry : String, code : Int, stderr : String) -> Either SomeError Unit {
     Files.writeText(staging + "/stderr", stderr)?
     Files.writeText(staging + "/used", "")?
     -- `status` last: an entry is whole once it has one.
     Files.writeText(staging + "/status", Int.toString(code))?
     match File.rename(staging, entry) {
         Right(_) -> Right(())
-        Left(e) -> if Files.exists(entry + "/status") { Right(()) } else { Left(show(e)) }
+        Left(e) -> if Files.exists(entry + "/status") { Right(()) } else { Left(fail(e)) }
     }
 }
 

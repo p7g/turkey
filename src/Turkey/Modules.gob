@@ -166,6 +166,11 @@ type Loader = Loader {
     variants     : Map String (Vec String),
     -- Internal class name -> its exported methods and associated families.
     classMembers : Map String (Vec String),
+    -- The entry's file, as the program was given it.
+    var entry    : String,
+    -- Directory -> the names in it, for spelling a module's path exactly.
+    -- A directory that cannot be listed has no names.
+    listings     : Map String (Array String),
 }
 
 -- A module the walk has read, whose component is not finished.
@@ -187,6 +192,8 @@ fun newLoader(search : Array String) -> Loader = Loader {
     tycons = Vec.new(16),
     variants = Map.new(),
     classMembers = Map.new(),
+    entry = "",
+    listings = Map.new(),
 }
 
 -- The program, the effective imports it declares, and the module that starts
@@ -198,6 +205,7 @@ fun newLoader(search : Array String) -> Loader = Loader {
 -- `Turkey.WellKnown` is loaded with every program too, and what it exports is
 -- what the compiler's well-known names mean from then on (`Turkey.Prelude`).
 fun loadEntry(l : Loader, source : Source, name : String) -> Module {
+    l.entry = source.name
     Deps.components([name], fun(n) = read(l, n, if n == name { Some(source) } else { None }),
                     finish(l, _))
     learnWellKnown(l)
@@ -234,10 +242,18 @@ fun declaresMain(program : Program) -> Bool {
     False
 }
 
--- `Data.String` is `Data/String.gob` under one of the search roots. The last
--- root is the library, and a module found there is a library module -- which is
--- the whole of what `library` means and the only thing that decides whether
--- `Prim.*` is spellable.
+-- A module's name is its path: `Data.String` is `Data/String.gob` under one of
+-- the search roots. The last root is the library, and a module found there is
+-- a library module -- which is the whole of what `library` means and the only
+-- thing that decides whether `Prim.*` is spellable.
+--
+-- The path is spelled exactly as the name is. Each component is looked up in
+-- its directory's listing rather than trusted to `open`, because on a
+-- filesystem that ignores case, as macOS's does by default, `open` would find
+-- `Data/String.gob` for `import Data.string`, and the same program would then
+-- mean something else on Linux, or two spellings would load one file as two
+-- modules. A file whose name differs only in case is not the module, and the
+-- search goes on to the next root, as it would where case matters.
 --
 -- Each candidate is read rather than asked about: the first one that reads is
 -- the module, and its text comes back with it so that nothing can change
@@ -245,28 +261,119 @@ fun declaresMain(program : Program) -> Bool {
 -- UTF-8 is still the module, with no text, so "not there" and "not UTF-8"
 -- stay two different failures.
 fun resolvePath(l : Loader, name : String) -> (String, Bool, Option String) {
-    let relative = String.replace(name, ".", "/") + ".gob"
+    let parts = Vec.toArray(String.split(name, "."))
+    let relative = String.join(parts, "/") + ".gob"
     for var i = 0; i < len(l.search); i = i + 1 {
-        -- A module beside an entry named without a directory is `Wrong.gob`,
-        -- as the entry itself is quoted, not `./Wrong.gob`.
         let root = l.search[i]
-        let candidate = if root == "." { relative } else { root + "/" + relative }
+        let candidate = within(root, relative)
         let library = i == len(l.search) - 1
-        match File.readText(candidate) {
-            Right(text) -> return (candidate, library, Some(text))
-            Left(Left(IO.InvalidUTF8)) -> return (candidate, library, None)
-            Left(Right(_)) -> {}
+        if spelledExactly(l, root, parts) {
+            match File.readText(candidate) {
+                Right(text) -> return (candidate, library, Some(text))
+                Left(Left(IO.InvalidUTF8)) -> return (candidate, library, None)
+                Left(Right(_)) -> {}
+            }
+        }
+    }
+    for root in l.search {
+        match spelledLoosely(l, root, parts) {
+            Some(actual) -> oops("cannot find module '" + name + "': "
+                                 + quoted(within(root, actual)) + " differs from "
+                                 + "its name only in case, and a module's path "
+                                 + "must be spelled exactly as its name is")
+            None -> {}
         }
     }
     oops("cannot find module '" + name + "' (searched "
          + String.join(l.search, ", ") + ")")
 }
 
+-- A module beside an entry named without a directory is `Wrong.gob`, as the
+-- entry itself is quoted, not `./Wrong.gob`.
+fun within(root : String, relative : String) -> String =
+    if root == "." { relative } else { root + "/" + relative }
+
+-- Whether every component of the module's path is a name in its directory,
+-- with exactly that spelling.
+fun spelledExactly(l : Loader, root : String, parts : Array String) -> Bool {
+    var dir = root
+    for var k = 0; k < len(parts); k = k + 1 {
+        let entry = componentName(parts, k)
+        if !Array.contains(listing(l, dir), entry) { return False }
+        dir = within(dir, entry)
+    }
+    True
+}
+
+-- The path under `root` that differs from the module's only in the case of
+-- ASCII letters, if there is one: what a misspelled import most likely meant.
+fun spelledLoosely(l : Loader, root : String, parts : Array String) -> Option String {
+    let found : Vec String = []
+    var dir = root
+    for var k = 0; k < len(parts); k = k + 1 {
+        match looseMatch(listing(l, dir), componentName(parts, k)) {
+            Some(entry) -> {
+                Vec.push(found, entry)
+                dir = within(dir, entry)
+            }
+            None -> return None
+        }
+    }
+    Some(String.join(found, "/"))
+}
+
+fun looseMatch(names : Array String, wanted : String) -> Option String {
+    let folded = foldCase(wanted)
+    for name in names {
+        if foldCase(name) == folded { return Some(name) }
+    }
+    None
+}
+
+fun componentName(parts : Array String, k : Int) -> String =
+    if k == len(parts) - 1 { parts[k] + ".gob" } else { parts[k] }
+
+fun listing(l : Loader, dir : String) -> Array String = match Map.get(l.listings, dir) {
+    Some(names) -> names
+    None -> {
+        let names = match File.listPath(dir) {
+            Right(names) -> names
+            Left(_) -> []
+        }
+        Map.put(l.listings, dir, names)
+        names
+    }
+}
+
+fun foldCase(s : String) -> String {
+    let out : Vec Char = []
+    for c in String.codePoints(s) {
+        let code = Char.toInt(c)
+        let folded = if code >= 65 && code <= 90 { Char.fromInt(code + 32) } else { None }
+        Vec.push(out, Option.unwrapOr(folded, c))
+    }
+    String.fromCodePoints(out)
+}
+
+-- The entry is quoted as the program was given it, and a module beside it
+-- without the `./` that may have come with it.
+fun isEntryFile(l : Loader, file : String) -> Bool =
+    withoutDot(file) == withoutDot(l.entry)
+
+fun withoutDot(path : String) -> String = Option.unwrapOr(String.stripPrefix(path, "./"), path)
+
 -- Read a module the walk has just reached, and answer the modules it imports,
 -- in the order the walk follows them: the startup module first if this is the
 -- entry and has a `main`, then the implicit Prelude, then the module's own
 -- imports as written. `source` is the entry's; any other module is found on
 -- the search path.
+--
+-- The entry is the module `Main`, whatever its file is called, and no module
+-- may import it: not as `Main`, and not by the name its file would have as an
+-- ordinary module. Either would give the program a second view of one module:
+-- `import Main` would make the entry a dependency of its own imports, and an
+-- import of `Tool` beside an entry `Tool.gob` would load that file again as a
+-- different module, with its own copy of every top-level binding.
 --
 -- A file is parsed here knowing the type names of every module finished so
 -- far, and again when its component is finished if more are known by then.
@@ -277,12 +384,28 @@ fun read(l : Loader, name : String, source : Option Source) -> Array String {
         None -> {
             let (file, library, text) = resolvePath(l, name)
             match text {
-                Some(text) -> (Source { name = file, text = text }, library)
+                Some(text) -> {
+                    if isEntryFile(l, file) {
+                        oops("cannot import '" + name + "': " + quoted(file)
+                             + " is the entry module, '" + Prelude.entryName
+                             + "', and the entry cannot be imported")
+                    }
+                    (Source { name = file, text = text }, library)
+                }
                 None -> oops("cannot read module '" + name + "' at " + file)
             }
         }
     }
     let program = Parser.parse(found, l.tycons)
+    if let Some(header) = program.header {
+        if let Some(written) = header.name {
+            if written != name {
+                let because = if entry { "it is the entry module" } else { "its path makes it" }
+                oopsAt("this module's header names it '" + written + "', but "
+                       + because + " '" + name + "'", Some(header.span))
+            }
+        }
+    }
     Map.put(l.open, name, Opened {
         name = name, source = found, library = library, program = program,
         parsedWith = len(l.tycons),
@@ -293,6 +416,10 @@ fun read(l : Loader, name : String, source : Option Source) -> Array String {
         Vec.push(edges, Prelude.preludeName)
     }
     for imp in program.imports {
+        if imp.name == Prelude.entryName {
+            oopsAt("'" + Prelude.entryName + "' is the entry module, and the "
+                   + "entry cannot be imported", Some(imp.span))
+        }
         if importsModule(imp) { Vec.push(edges, imp.name) }
     }
     -- Last, so that it changes nothing about the order the program's own

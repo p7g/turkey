@@ -7,13 +7,52 @@ how names are resolved, and the entry point.
 
 ## Modules and files
 
-Each `.gob` file is one module. A module is found by its path: `import
-Shapes.Circle` loads the file `Shapes/Circle.gob`. The compiler looks for it
-first relative to the directory of the program's entry file, then in the
-standard library.
+Each `.gob` file is one module, and a module's name is its path: the file
+`Shapes/Circle.gob` is the module `Shapes.Circle`, and `import Shapes.Circle`
+loads it. The compiler looks for the file first relative to the directory of
+the program's entry file, then in the standard library. Moving a file renames
+the module, and every import of it has to change with it.
+
+The path is spelled exactly as the name is, letter case included, even where
+the filesystem ignores case, as macOS's usually does. A file whose name
+differs only in case is not the module, so a program finds the same modules on
+every system:
+
+<!-- module: Shapes/circle.gob -->
+```kotlin
+module (area)
+
+fun area(r : Int) -> Int = 3 * r * r
+```
+
+<!-- error: cannot find module 'Shapes.Circle': 'Shapes/circle.gob' differs from its name only in case -->
+```kotlin
+import Shapes.Circle (area)
+
+fun main() {
+    print(area(2))
+}
+```
 
 The file the compiler is given is the **entry module**, and
-it must define [`main`](#the-entry-point).
+it must define [`main`](#the-entry-point). The entry module is called `Main`,
+whatever its file is called, and no module may import it: neither as `Main`
+nor by the name its file would have as an ordinary module: beside an entry
+`Tool.gob`, `import Tool` is an error. So each file of a program is exactly
+one module, with one name.
+
+<!-- error: 'Main' is the entry module, and the entry cannot be imported -->
+```kotlin
+import Main
+
+fun main() {
+    print("hello")
+}
+```
+
+> **Coming from Haskell:** a file's path is its module's whole name, so there
+> is no `module Shapes.Circle where` to keep in step with it, and the entry
+> module is `Main` without saying so.
 
 The standard library's `Turkey.*` modules are the implementation itself -- the
 collector, the allocator, the program's startup -- and a program may not import
@@ -37,7 +76,7 @@ another, in either direction:
 
 <!-- module: Even.gob -->
 ```kotlin
-module Even (isEven)
+module (isEven)
 import Odd (isOdd)
 
 fun isEven(n : Int) -> Bool = if n == 0 { True } else { isOdd(n - 1) }
@@ -45,7 +84,7 @@ fun isEven(n : Int) -> Bool = if n == 0 { True } else { isOdd(n - 1) }
 
 <!-- module: Odd.gob -->
 ```kotlin
-module Odd (isOdd)
+module (isOdd)
 import Even (isEven)
 
 fun isOdd(n : Int) -> Bool = if n == 0 { False } else { isEven(n - 1) }
@@ -75,7 +114,7 @@ in a cycle either:
 
 <!-- module: Width.gob -->
 ```kotlin
-module Width (width)
+module (width)
 import Height (height)
 
 let width = height * 2
@@ -83,7 +122,7 @@ let width = height * 2
 
 <!-- module: Height.gob -->
 ```kotlin
-module Height (height)
+module (height)
 import Width (width)
 
 let height = width / 2
@@ -107,7 +146,7 @@ name.
 **Syntax**
 
 ```ebnf
-header      ::= "module" modname ("(" export ("," export)* ")")?
+header      ::= "module" modname? ("(" export ("," export)* ")")?
 modname     ::= CONID ("." CONID)*
 export      ::= IDENT                          -- a function or value
               | CONID                          -- a type without its constructors, or a class
@@ -116,14 +155,33 @@ export      ::= IDENT                          -- a function or value
               | "module" modname               -- a re-export
 ```
 
-A module may start with a header naming the module and listing what it
-**exports**. Only exported names can be used from other modules. A module
-without a header, or with a header but no list, exports everything it
-declares.
+A module may start with a header listing what it **exports**. Only exported
+names can be used from other modules. A module without a header, or with a
+header but no list, exports everything it declares.
+
+The header may also name the module, as `module Inventory (Item)`. The name
+says nothing the path does not, and it must agree with it: in the entry
+module it must be `Main`.
 
 <!-- module: Inventory.gob -->
 ```kotlin
-module Inventory (Item, restock, describe)
+module Stock (count)
+
+fun count() -> Int = 12
+```
+
+<!-- error: this module's header names it 'Stock', but its path makes it 'Inventory' -->
+```kotlin
+import Inventory
+
+fun main() {
+    print(count())
+}
+```
+
+<!-- module: Inventory.gob -->
+```kotlin
+module (Item, restock, describe)
 
 type Item = Item { name : String, count : Int }
 
@@ -151,7 +209,7 @@ bolts x12
 
 <!-- module: Inventory.gob -->
 ```kotlin
-module Inventory (Item, restock, describe)
+module (Item, restock, describe)
 
 type Item = Item { name : String, count : Int }
 
@@ -181,7 +239,7 @@ values of it. `T(..)` exports the type and all its constructors.
 
 <!-- module: Sealed.gob -->
 ```kotlin
-module Sealed (Token, make)
+module (Token, make)
 type Token = Token { value : Int }
 fun make(n : Int) -> Token = Token { value = n }
 ```
@@ -194,7 +252,7 @@ fun reveal() = make(3).value
 
 <!-- module: Sealed.gob -->
 ```kotlin
-module Sealed (Token, make)
+module (Token, make)
 type Token = Token { value : Int }
 fun make(n : Int) -> Token = Token { value = n }
 ```
@@ -242,7 +300,7 @@ import that constructor.
 
 <!-- module: Temperature.gob -->
 ```kotlin
-module Temperature (toFahrenheit, toCelsius)
+module (toFahrenheit, toCelsius)
 
 fun toFahrenheit(c) = c * 9.0 / 5.0 + 32.0
 
@@ -279,7 +337,7 @@ alike: `G.Point(1, 2)` builds a point and `G.Point(x, y)` takes one apart.
 
 <!-- module: Geometry.gob -->
 ```kotlin
-module Geometry (Point(..), origin)
+module (Point(..), origin)
 
 type Point = Point(Int, Int)
 
@@ -442,13 +500,13 @@ Importing the same declaration through more than one route is unambiguous.
 
 <!-- module: First.gob -->
 ```kotlin
-module First (label)
+module (label)
 fun label() -> String = "first"
 ```
 
 <!-- module: Second.gob -->
 ```kotlin
-module Second (label)
+module (label)
 fun label() -> String = "second"
 ```
 

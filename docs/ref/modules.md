@@ -311,8 +311,9 @@ to make `Vec.push`, `Int.parse` and the like available everywhere
 
 ```ebnf
 import ::= "import" modname ("as" CONID)? import-list?
-import-list ::= "(" (item ("," item)*)? ")"
+import-list ::= "(" (entry ("," entry)*)? ")"
               | "hiding" "(" item ("," item)* ")"
+entry  ::= item ("as" (IDENT | CONID | "_"))? | ".."
 item   ::= IDENT | CONID | CONID "(" ".." ")"
          | CONID "(" CONID ("," CONID)* ")"
 ```
@@ -320,11 +321,74 @@ item   ::= IDENT | CONID | CONID "(" ".." ")"
 | Import | Brings into scope |
 |---|---|
 | `import Geometry` | every export of `Geometry`, both bare (`area`) and qualified (`Geometry.area`) |
-| `import Geometry (area, Point(..))` | only the listed names, both bare and qualified |
+| `import Geometry (area, Point(..))` | the listed names bare, and every export qualified |
+| `import Geometry (..)` | every export, both bare and qualified |
+| `import Geometry (area as size)` | `area` under the bare name `size`, and every export qualified |
+| `import Geometry (area as _, ..)` | every export bare except `area`, and every export qualified |
 | `import Geometry hiding (area)` | every export except the listed ones |
 | `import Geometry as G` | every export, qualified only: `G.area`, not `area` |
-| `import Geometry as G (area)` | only the listed names, qualified only |
-| `import Geometry ()` | nothing; the module is still loaded, and its instances with it |
+| `import Geometry as G (area)` | `area` bare, and every export qualified as `G.area` |
+| `import Geometry ()` | no bare names; every export qualified, and the module's instances |
+
+An import's list chooses bare names only. The qualified names, `Geometry.area`
+or `G.area`, are every export the module has, whatever the list says.
+
+`..` in a list stands for every export the other entries do not name, and may
+appear once. Beside it an entry only renames (`x as y`) or withholds
+(`x as _`): `import Geometry (area, ..)` is an error, since `..` already
+brings `area`. A rename keeps a name's case, so a value is renamed to a
+lowercase name and a type, class or constructor to a capitalized one.
+`Point(..) as _` withholds the type and its constructors together, and
+`C(..) as _` a class and its methods; `Point as _` withholds the type alone.
+
+Renaming and withholding are for bare names that collide. Here two modules
+both export `parse`, and the second import withholds its `parse`, which is
+then written `Csv.parse`:
+
+<!-- module: Json.gob -->
+```kotlin
+export (Value(..), parse)
+
+type Value = Number(Int) | Text(String)
+
+fun parse(s : String) -> Value = match Int.parse(s) {
+    Some(n) -> Number(n)
+    None -> Text(s)
+}
+```
+
+<!-- module: Csv.gob -->
+```kotlin
+export (parse, width)
+
+fun parse(line : String) -> Vec String = String.split(line, ",")
+
+fun width(row : Vec String) -> Int = len(row)
+```
+
+<!-- run -->
+```kotlin
+import Json (..)
+import Csv (parse as _, ..)
+
+fun describe(v : Value) -> String = match v {
+    Number(n) -> "number " + show(n)
+    Text(s) -> "text " + s
+}
+
+fun main() {
+    print(describe(parse("42")))
+    print(width(Csv.parse("a,b,c")))
+}
+```
+
+```text
+number 42
+3
+```
+
+`import Csv (parse as parseRow, ..)` would bring it bare as `parseRow`
+instead.
 
 In a selective import, `T` brings in the type alone, `T(..)` requests its
 constructors too, and `T(A, B)` requests the named constructors. Each requested

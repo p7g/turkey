@@ -333,22 +333,82 @@ fun parseImport(p : P) -> ImportDecl {
     let s = expect(p, "import").span
     let name = parseModname(p)
     var alias : Option String = None
-    var items : Option (Vec ExportItem) = None
+    var items : Option (Vec ImportItem) = None
+    var rest = False
     var hidden : Option (Vec ExportItem) = None
     if eat(p, "as") { alias = Some(text(expectWhat(p, "CONID", "a module alias"))) }
-    -- An alias and a selective list are independent: `import M as S (f)` names
-    -- the module and narrows what it brings. Aliased imports are
-    -- qualified-only; unaliased ones bring both spellings.
+    -- An alias and a list are independent: `import M as S (f)` names the
+    -- qualifier and chooses the bare names.
     if at(p, "hiding") {
         step(p)
         hidden = Some(parseParenNameList(p))
     } else if at(p, "(") {
-        items = Some(parseParenNameList(p))
+        let (list, dots) = parseImportList(p)
+        items = Some(list)
+        rest = dots
     }
     ImportDecl {
-        span = s, name = name, alias = alias, items = items, hidden = hidden,
-        qualified = Option.isSome(alias),
+        span = s, name = name, alias = alias, items = items, rest = rest,
+        hidden = hidden, qualified = Option.isSome(alias),
     }
+}
+
+-- `(a, T(..), x as y, C as _, ..)`. Beside a `..`, which already brings every
+-- name the list does not mention, an item can only rename or withhold.
+fun parseImportList(p : P) -> (Vec ImportItem, Bool) {
+    skipToken(p, "(")
+    let items = Vec.new(4)
+    var dots : Option Span = None
+    while !at(p, ")") {
+        if at(p, "..") {
+            let tok = advance(p)
+            if Option.isSome(dots) {
+                oops(p, "'..' appears twice in one import list", tok.span)
+            }
+            dots = Some(tok.span)
+        } else {
+            Vec.push(items, parseImportItem(p))
+        }
+        if !eat(p, ",") { break }
+    }
+    skipToken(p, ")")
+    if Option.isSome(dots) {
+        for entry in items {
+            if Option.isNone(entry.rename) {
+                oops(p, "'" + entry.item.name + "' is already brought in by '..'; "
+                        + "beside '..' an item can only rename a name, as in "
+                        + "'x as y', or withhold it, as in 'x as _'",
+                     entry.item.span)
+            }
+        }
+    }
+    (items, Option.isSome(dots))
+}
+
+fun parseImportItem(p : P) -> ImportItem {
+    let item = parseExportItem(p)
+    if item.kind == "module" {
+        oops(p, "'module' may appear in an export list, not in an import's "
+                + "name list: a module re-exports, it does not import", item.span)
+    }
+    if !eat(p, "as") { return ImportItem { item = item, rename = None } }
+    let tok = advance(p)
+    if !isNameToken(tok) {
+        oops(p, "expected a name, or '_' for none, after 'as', found "
+                + describe(tok), tok.span)
+    }
+    let to = text(tok)
+    if to != "_" && isConid(tok) != startsUpper(item.name) {
+        oops(p, "'" + item.name + "' cannot be renamed to '" + to + "': a value's "
+                + "name begins with a lowercase letter, and a type's, a class's or "
+                + "a constructor's with a capital", tok.span)
+    }
+    ImportItem { item = item, rename = Some(to) }
+}
+
+fun startsUpper(name : String) -> Bool = match String.decode(name, String.start(name)) {
+    Some(c) -> Char.isAsciiUpper(c)
+    None -> False
 }
 
 fun parseParenNameList(p : P) -> Vec ExportItem {

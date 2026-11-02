@@ -77,13 +77,81 @@ def test_an_alias_renames_the_module(tmp_path):
 
 
 def test_an_alias_and_a_selective_list_are_independent(tmp_path):
-    """`import M as S (f)`: an alias and a list together, which a parser
-    that treated them as alternatives would refuse."""
+    """`import M as S (f)`: the list chooses the bare names, and the alias
+    qualifies every export, listed or not."""
     search = write(tmp_path, Helper=HELPER)
-    src = "import Helper as H (twice)\nfun f() -> Int = H.twice(1)"
+    src = "import Helper as H (twice)\nfun f() -> Int = twice(1) + H.twice(1)\nfun g() = H.greet(\"x\")"
     assert sigs(src, search)["f"] == "fun() -> Int"
-    assert fails("import Helper as H (twice)\nfun f() = H.greet(\"x\")",
-                 search) == "'H.greet' is not defined"
+    assert fails("import Helper as H (twice)\nfun f() = greet(\"x\")",
+                 search) == "'greet' is not defined"
+
+
+def test_a_selective_list_leaves_the_qualifier_whole(tmp_path):
+    search = write(tmp_path, Helper=HELPER)
+    src = "import Helper (twice)\nfun g() -> String = Helper.greet(\"x\")"
+    assert sigs(src, search)["g"] == "fun() -> String"
+
+
+def test_an_empty_list_brings_the_qualifier_alone(tmp_path):
+    search = write(tmp_path, Helper=HELPER)
+    src = "import Helper ()\nfun f() -> Int = Helper.twice(1)"
+    assert sigs(src, search)["f"] == "fun() -> Int"
+    assert fails("import Helper ()\nfun f() = twice(1)", search) == \
+        "'twice' is not defined"
+
+
+def test_dot_dot_in_a_list_brings_every_bare_name(tmp_path):
+    search = write(tmp_path, Helper=HELPER)
+    src = "import Helper as H (..)\nfun f() -> Int = twice(1) + H.twice(1)"
+    assert sigs(src, search)["f"] == "fun() -> Int"
+
+
+def test_a_rename_brings_the_bare_name_under_another_spelling(tmp_path):
+    search = write(tmp_path, Helper=HELPER)
+    src = "import Helper (twice as double)\nfun f() -> Int = double(1) + Helper.twice(1)"
+    assert sigs(src, search)["f"] == "fun() -> Int"
+    assert fails("import Helper (twice as double)\nfun f() = twice(1)", search) == \
+        "'twice' is not defined"
+
+
+def test_as_underscore_withholds_one_bare_name_from_dot_dot(tmp_path):
+    search = write(tmp_path, Helper=HELPER)
+    src = "import Helper (greet as _, ..)\nfun f() -> Int = twice(1)\nfun g() = Helper.greet(\"x\")"
+    assert sigs(src, search)["f"] == "fun() -> Int"
+    assert fails("import Helper (greet as _, ..)\nfun f() = greet(\"x\")", search) == \
+        "'greet' is not defined"
+
+
+def test_a_type_withheld_with_its_constructors(tmp_path):
+    search = write(tmp_path, Shape="export (Shape(..), unit)\n"
+                   "type Shape = Circle(Int) | Square(Int)\nfun unit() = Circle(1)")
+    assert "unknown constructor 'Circle'" in fails(
+        "import Shape (Shape(..) as _, ..)\nfun f() = Circle(1)", search)
+    assert "unknown type 'Shape'" in fails(
+        "import Shape (Shape(..) as _, ..)\nfun f(s : Shape) = s", search)
+    check("import Shape (Shape(..) as _, ..)\nfun f() = Shape.Circle(1)\nfun g() = unit()",
+          search)
+
+
+def test_a_class_withheld_with_its_methods(tmp_path):
+    search = write(tmp_path, Same="export (Same(..))\nclass Same a { fun same(a, a) -> Bool }")
+    assert fails("import Same (Same(..) as _, ..)\nfun f(x) = same(x, x)", search) == \
+        "'same' is not defined"
+    check("import Same (Same(..) as _, ..)\nfun f(x) = Same.same(x, x)", search)
+
+
+@pytest.mark.parametrize("src, message", [
+    ("import Helper (twice, ..)",
+     "'twice' is already brought in by '..'; beside '..' an item can only rename "
+     "a name, as in 'x as y', or withhold it, as in 'x as _'"),
+    ("import Helper (.., ..)", "'..' appears twice in one import list"),
+    ("import Helper (twice as Twice)",
+     "'twice' cannot be renamed to 'Twice': a value's name begins with a lowercase "
+     "letter, and a type's, a class's or a constructor's with a capital"),
+])
+def test_malformed_lists_are_refused(tmp_path, src, message):
+    search = write(tmp_path, Helper=HELPER)
+    assert fails(src, search) == message
 
 
 def test_a_selective_list_withholds_the_rest(tmp_path):

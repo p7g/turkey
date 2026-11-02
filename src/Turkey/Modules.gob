@@ -413,6 +413,11 @@ fun read(l : Loader, name : String, source : Option Source) -> Array String {
         }
         if importsModule(imp) { Vec.push(edges, imp.name) }
     }
+    -- After the Prelude, which imports each of these itself, so that they
+    -- change nothing about the order modules load in.
+    if getsPrelude(name, program) {
+        for q in Prelude.preludeQualifiers { Vec.push(edges, q) }
+    }
     -- Last, so that it changes nothing about the order the program's own
     -- modules load in: what it re-exports is usually loaded by then.
     if entry { Vec.push(edges, Prelude.wellKnownName) }
@@ -420,9 +425,29 @@ fun read(l : Loader, name : String, source : Option Source) -> Array String {
 }
 
 -- The empty Prelude import removes the otherwise implicit edge. Empty imports
--- of every other module remain instance-only edges.
-fun importsModule(imp : ImportDecl) -> Bool =
-    !(imp.name == Prelude.preludeName && isEmptyList(imp.items))
+-- of every other module remain edges, for the qualifier and the instances.
+fun importsModule(imp : ImportDecl) -> Bool = !optsOut(imp)
+
+-- `import Prelude ()`, the one import that brings nothing.
+fun optsOut(imp : ImportDecl) -> Bool =
+    imp.name == Prelude.preludeName && !imp.rest && isEmptyList(imp.items)
+
+-- Whether a module has the Prelude, implicitly or by an import that names
+-- something from it.
+fun getsPrelude(name : String, program : Program) -> Bool {
+    if name == Prelude.preludeName { return False }
+    for imp in program.imports {
+        if optsOut(imp) { return False }
+    }
+    True
+}
+
+-- The qualifier the Prelude gives the module `m`: the last component of its
+-- name.
+fun preludeQualifier(m : String) -> String = match String.rsplitOnce(m, ".") {
+    Some((_, last)) -> last
+    None -> m
+}
 
 -- Register a finished component's declarations and make its modules' tables.
 fun finish(l : Loader, names : Vec String) -> Unit {
@@ -551,7 +576,7 @@ fun hasPreludeImport(program : Program) -> Bool {
     False
 }
 
-fun isEmptyList(items : Option (Vec ExportItem)) -> Bool = match items {
+fun isEmptyList(items : Option (Vec ImportItem)) -> Bool = match items {
     Some(xs) -> len(xs) == 0
     None -> False
 }
@@ -589,11 +614,15 @@ fun scopeOf(l : Loader, m : Module, strict : Bool) -> Scope {
         }
     }
 
-    let explicitPrelude = hasPreludeImport(m.program)
-    if m.name != Prelude.preludeName && !explicitPrelude {
+    if getsPrelude(m.name, m.program) {
         let implicit = newScope()
-        bring(l, implicit, moduleNamed(l, Prelude.preludeName), Prelude.preludeName,
-              False, None, None, None, strict)
+        if !hasPreludeImport(m.program) {
+            bring(l, implicit, moduleNamed(l, Prelude.preludeName), Prelude.preludeName,
+                  None, AllBare, strict)
+        }
+        for q in Prelude.preludeQualifiers {
+            bring(l, implicit, moduleNamed(l, q), preludeQualifier(q), None, NoBare, strict)
+        }
         let from = spaces(implicit)
         let into = spaces(scope)
         for var i = 0; i < len(into); i = i + 1 {
@@ -602,14 +631,13 @@ fun scopeOf(l : Loader, m : Module, strict : Bool) -> Scope {
     }
     let imports = newScope()
     for imp in m.program.imports {
-        if !(imp.name == Prelude.preludeName && isEmptyList(imp.items)) {
+        if !optsOut(imp) {
             let dep = moduleNamed(l, imp.name)
             let alias = match imp.alias {
                 Some(a) -> a
                 None -> imp.name
             }
-            bring(l, imports, dep, alias, imp.qualified, Some(imp.span),
-                  imp.items, imp.hidden, strict)
+            bring(l, imports, dep, alias, Some(imp.span), bareOf(imp), strict)
         }
     }
 
@@ -638,10 +666,24 @@ fun moduleNamed(l : Loader, name : String) -> Module = match Map.get(l.modules, 
     None -> oops("module '" + name + "' was not loaded")
 }
 
+-- Which bare names an import brings. Its qualified names are every export,
+-- under its alias, whatever this says -- except that `hiding` withholds both.
+type Bare
+    = AllBare
+    | NoBare
+    -- An import's list, and whether it has a `..`.
+    | Listed(Vec ImportItem, Bool)
+    -- `hiding (...)`, and whether the bare names come too.
+    | Hiding(Vec ExportItem, Bool)
+
+fun bareOf(imp : ImportDecl) -> Bare = match (imp.items, imp.hidden) {
+    (Some(items), _) -> Listed(items, imp.rest)
+    (None, Some(hidden)) -> Hiding(hidden, !imp.qualified)
+    (None, None) -> if imp.qualified { NoBare } else { AllBare }
+}
+
 fun bring(l : Loader, scope : Scope, dep : Module, alias : String,
-          qualified : Bool, where : Option Span,
-          items : Option (Vec ExportItem),
-          hidden : Option (Vec ExportItem), strict : Bool) -> Unit {
+          where : Option Span, bare : Bare, strict : Bool) -> Unit {
     -- Checked here rather than when `dep` is loaded, so that the error points
     -- at an import. Only the entry may omit the declaration, and the entry
     -- cannot be imported.
@@ -650,70 +692,107 @@ fun bring(l : Loader, scope : Scope, dep : Module, alias : String,
                + "declaration; begin it with 'export (...)' listing its "
                + "exports, or 'export (..)' for everything it declares", where)
     }
-    var chosen = Array.map(spaces(dep.exports), copyMap)
-    match items {
-        None -> {}
-        Some(wantedItems) -> {
-            chosen = spaces(newScope())
-            let available = spaces(dep.exports)
-            for item in wantedItems {
-                if strict && !namedAnywhere(dep.exports, item.name) {
-                    oopsAt("module '" + dep.name + "' does not export "
-                           + quoted(item.name), where)
-                }
-                for space in namespaces {
-                    let i = namespaceIndex(space)
-                    -- A type name alone does not request its same-named
-                    -- constructor. A standalone constructor name is legal.
-                    let typeOnly = match space {
-                        ConstructorSpace -> Map.contains(dep.exports.types, item.name)
-                        _ -> False
-                    }
-                    if !typeOnly {
-                        match Map.get(available[i], item.name) {
-                            Some(target) -> Map.put(chosen[i], item.name, target)
-                            None -> {}
-                        }
-                    }
-                }
-                for sub in subsOf(l, dep, item) {
-                    if strict { checkImportedMember(l, dep, item, sub, where) }
-                    let memberSpaces = if Map.contains(dep.exports.classes, item.name) {
-                        [ValueSpace, TypeSpace, MethodSpace]
-                    } else { [ConstructorSpace] }
-                    for space in memberSpaces {
-                        let i = namespaceIndex(space)
-                        match Map.get(available[i], sub) {
-                            Some(target) -> Map.put(chosen[i], sub, target)
-                            None -> {}
-                        }
-                    }
-                }
-            }
-        }
+    let available = spaces(dep.exports)
+    let qualified = match bare {
+        Hiding(hidden, _) -> withheld(l, dep, available, hidden)
+        _ -> available
     }
-    match hidden {
-        None -> {}
-        Some(hiddenItems) -> {
-            let out = Set.new()
-            for item in hiddenItems {
-                Set.add(out, item.name)
-                if Option.isSome(Map.get(dep.exports.classes, item.name)) {
-                    for sub in subsOf(l, dep, item) { Set.add(out, sub) }
-                }
-            }
-            chosen = Array.map(chosen, fun(space) =
-                keepIf(space, !Set.contains(out, _)))
-        }
+    let chosen = match bare {
+        AllBare -> available
+        NoBare -> spaces(newScope())
+        Listed(items, rest) -> listed(l, dep, items, rest, where, strict)
+        Hiding(_, also) -> if also { qualified } else { spaces(newScope()) }
     }
-
     for space in namespaces {
         let i = namespaceIndex(space)
-        for (short, target) in Map.entries(chosen[i]) {
+        for (short, target) in Map.entries(qualified[i]) {
             mergeName(scope, space, alias + "." + short, target)
-            if !qualified { mergeName(scope, space, short, target) }
+        }
+        for (short, target) in Map.entries(chosen[i]) {
+            mergeName(scope, space, short, target)
         }
     }
+}
+
+fun withheld(l : Loader, dep : Module, available : Array (Map String String),
+             hidden : Vec ExportItem) -> Array (Map String String) {
+    let out = Set.new()
+    for item in hidden {
+        Set.add(out, item.name)
+        if Option.isSome(Map.get(dep.exports.classes, item.name)) {
+            for sub in subsOf(l, dep, item) { Set.add(out, sub) }
+        }
+    }
+    Array.map(available, fun(space) = keepIf(space, !Set.contains(out, _)))
+}
+
+-- The bare names an import's list brings. With a `..`, every export comes
+-- except what an item names, and each item says what to bring instead: its
+-- names again under a new name, or nothing.
+fun listed(l : Loader, dep : Module, items : Vec ImportItem, rest : Bool,
+           where : Option Span, strict : Bool) -> Array (Map String String) {
+    let chosen = if rest { Array.map(spaces(dep.exports), copyMap) }
+                 else { spaces(newScope()) }
+    for entry in items {
+        let named = itemNames(l, dep, entry.item, where, strict)
+        if rest {
+            for (i, short, _, _) in named { discard(Map.delete(chosen[i], short)) }
+        }
+        let under = match entry.rename {
+            Some(to) -> to
+            None -> entry.item.name
+        }
+        if under != "_" {
+            -- A rename is of the item's own name; the members it lists keep
+            -- theirs.
+            for (i, short, target, member) in named {
+                Map.put(chosen[i], if member { short } else { under }, target)
+            }
+        }
+    }
+    chosen
+}
+
+-- Everything one list item names in `dep`'s exports: the namespace, the name,
+-- what it means, and whether it is a member the item lists -- `T(A)`'s `A`,
+-- `C(..)`'s methods -- rather than the item itself.
+fun itemNames(l : Loader, dep : Module, item : ExportItem, where : Option Span,
+              strict : Bool) -> Vec (Int, String, String, Bool) {
+    if strict && !namedAnywhere(dep.exports, item.name) {
+        oopsAt("module '" + dep.name + "' does not export "
+               + quoted(item.name), where)
+    }
+    let available = spaces(dep.exports)
+    let out = Vec.new(4)
+    for space in namespaces {
+        let i = namespaceIndex(space)
+        -- A type name alone does not request its same-named constructor. A
+        -- standalone constructor name is legal.
+        let typeOnly = match space {
+            ConstructorSpace -> Map.contains(dep.exports.types, item.name)
+            _ -> False
+        }
+        if !typeOnly {
+            match Map.get(available[i], item.name) {
+                Some(target) -> Vec.push(out, (i, item.name, target, False))
+                None -> {}
+            }
+        }
+    }
+    for sub in subsOf(l, dep, item) {
+        if strict { checkImportedMember(l, dep, item, sub, where) }
+        let memberSpaces = if Map.contains(dep.exports.classes, item.name) {
+            [ValueSpace, TypeSpace, MethodSpace]
+        } else { [ConstructorSpace] }
+        for space in memberSpaces {
+            let i = namespaceIndex(space)
+            match Map.get(available[i], sub) {
+                Some(target) -> Vec.push(out, (i, sub, target, True))
+                None -> {}
+            }
+        }
+    }
+    out
 }
 
 fun checkImportedMember(l : Loader, dep : Module, item : ExportItem,

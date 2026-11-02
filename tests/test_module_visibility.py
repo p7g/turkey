@@ -128,10 +128,13 @@ def test_exported_constructor_can_be_imported_selectively(selection):
         "M.gob": "export (T(C))\ntype T = C | D"}) == "7\n"
 
 
-def test_selecting_only_record_type_withholds_field_access():
+def test_the_qualified_constructor_gives_field_access_without_the_bare_one():
+    """An import's list chooses bare names only, and `Tok.Token` -- in scope
+    through the qualifier whatever the list says -- is the constructor field
+    access asks for."""
     modules = {"Tok.gob": OPAQUE["Tok.gob"].replace("(Token, make, read)", "(Token(..), make, read)")}
-    assert "constructor 'Token' is not in scope" in lang.fails(
-        "import Tok (Token, make)\nfun f() = make(1).value", modules)
+    assert lang.output("import Tok (Token, make)\nfun main() { print(make(1).value) }",
+                       modules) == "1\n"
 
 
 @pytest.mark.parametrize("imports", ["import A as Q\nimport B as Q", "import B as Q\nimport A as Q"])

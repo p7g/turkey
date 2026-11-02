@@ -214,7 +214,7 @@ took 8
 
 ```ebnf
 match-expr ::= "match" expression "{" match-arm (separator match-arm)* "}"
-match-arm  ::= "|"? pattern ("|" pattern)* "->" expression
+match-arm  ::= pattern ("|" pattern)* "->" expression
 ```
 
 `match` evaluates its subject, then tries each arm's [patterns](patterns.md)
@@ -225,6 +225,10 @@ The arms must cover every possible value of the subject
 
 Arms are separated by line breaks or `;`. An arm's body is one expression,
 which may be a block.
+
+**Coming from OCaml, F# or Rust:** OCaml and F# begin each arm with `|`, and
+Rust allows a `|` before an arm's patterns. Turkey does not; write the arms on
+their own lines, or `match n { 0 -> "zero"; _ -> "many" }` on one.
 
 <!-- run -->
 ```kotlin

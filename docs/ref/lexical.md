@@ -74,18 +74,48 @@ var       while
 ```
 
 `True`, `False`, `None` and `Some` are not keywords. They are constructors of
-ordinary library types ([Built-in types and classes](builtins.md)).
+ordinary library types ([Built-in types and classes](builtins.md)). Nor is
+`infix`, which begins an [operator
+declaration](expressions.md#declared-operators) only at the start of a
+top-level declaration and is an ordinary name everywhere else.
 
 ## Operators and punctuation
 
+An operator is a run of these characters:
+
 ```text
-+   -   *   /   %   ==  !=  <   <=  >   >=  &&  ||  !
-=   ->  :   ,   .   ..  ...  |   ~   ?   ;   \
-(   )   [   ]   {   }
+!   #   $   %   &   *   +   -   /   <   =   >   @   ^   |   ~
 ```
 
-The lexer takes the longest operator that matches, so `<=` is one token and
-not `<` followed by `=`. What each operator means is covered under
+The lexer takes the longest run it can, so `<=` is one token and not `<`
+followed by `=`, and `x==-1` is `x`, the operator `==-`, and `1`. A run stops
+before `--`, which begins a comment. Some runs are built in:
+
+```text
++   -   *   /   %   ==  !=  <   <=  >   >=  &&  ||  !   =   ->  |   ~
+```
+
+`|` separates patterns and constructors, and is the one of these a module
+may also [declare](expressions.md#declared-operators) as a binary operator.
+Any other run is an operator only where a module declares it. Using one that nothing
+declares is an error, and when the run splits into operators that do exist,
+the message suggests the split:
+
+<!-- error: if '==-' is more than one operator, separate them: '== -' -->
+```kotlin
+fun main() {
+    let x = 1
+    print(x==-1)
+}
+```
+
+The other punctuation is
+
+```text
+:   ,   .   ..  ...  ?   ;   \   (   )   [   ]   {   }
+```
+
+What each operator means is covered under
 [Expressions](expressions.md#operators).
 
 ## Literals
@@ -339,7 +369,8 @@ break changes the meaning of a program:
 
 * A line that starts with `-` or `!` begins a new statement, because both can
   start an expression. To continue an expression with a subtraction, end the
-  previous line with the `-` instead.
+  previous line with the `-` instead. Every other operator, declared ones
+  included, continues the line before it.
 * A line that starts with `(` or `[` begins a new statement. It is not a call
   or an index applied to the line before.
 

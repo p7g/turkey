@@ -158,7 +158,7 @@ alternatives and in function and lambda parameters, and nowhere else.
 **Syntax**
 
 ```ebnf
-match-arm ::= "|"? pattern ("|" pattern)* "->" expression
+match-arm ::= pattern ("|" pattern)* "->" expression
 ```
 
 A `match` arm may list several patterns separated by `|`. The arm is taken if
@@ -183,8 +183,30 @@ fun main() {
 7
 ```
 
-A line break before `|` does not end the arm, so alternatives can be listed
-one per line, and an arm may begin with a `|`.
+A line break before `|` does not end the arm, so a long list of alternatives
+can be continued on the next line:
+
+<!-- run -->
+```kotlin
+type Shape = Circle(Int) | Square(Int) | Triangle(Int) | Hexagon(Int) | Dot
+
+fun size(shape) = match shape {
+    Circle(n) | Square(n)
+        | Triangle(n) | Hexagon(n) -> n
+    Dot -> 0
+}
+
+fun main() {
+    print(size(Triangle(3)))
+}
+```
+
+```text
+3
+```
+
+The `|` belongs to the pattern list of one arm, so an arm cannot begin with
+one ([`match`](statements.md#match)).
 
 ## Exhaustiveness
 

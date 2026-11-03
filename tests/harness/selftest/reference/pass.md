@@ -29,7 +29,7 @@ fun double(n : Int) -> Int = n * 2
 
 A rejection, quoting part of its message:
 
-<!-- error: expected String, found Int -->
+<!-- error: expected 'String', found 'Int' -->
 ```kotlin
 fun main() {
     let n : Int = "one"

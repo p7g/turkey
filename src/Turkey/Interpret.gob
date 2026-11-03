@@ -84,6 +84,8 @@ type Program = Program {
     inits    : Vec (String, Core),
     -- Each `Prim.cString` literal's bytes and NUL, kept for the whole run.
     cstrings : Map String Value,
+    -- The modules that run compiled.
+    host     : Set.Set String,
 }
 
 -- The state of one interpretation: the program, and how deep it may go.
@@ -97,7 +99,7 @@ fun prepare(core : CProgram, decls : DeclTable, classes : ClassTable,
             skipped : Int) -> Program {
     let p = Program {
         decls = decls, fams = Some(Coretc.famsOf(classes, [])), cons = Map.new(),
-        globals = Map.new(), inits = [], cstrings = Map.new(),
+        globals = Map.new(), inits = [], cstrings = Map.new(), host = Hosted.hostModules(),
     }
     -- Read now, so that the lazily built set is not built while the program
     -- runs.
@@ -111,12 +113,11 @@ fun prepare(core : CProgram, decls : DeclTable, classes : ClassTable,
         define(p, name, VNative(name, fun(args) = entry(reenter, args)))
     }
     for (name, read) in Boundary.values { define(p, name, read()) }
-    let host = Hosted.hostModules()
     let shared = Set.new()
     for name in Boundary.compiledShared { Set.add(shared, name) }
     for group in [core.dicts, core.binds] {
         for b in group {
-            if Set.contains(host, b.module_) || Set.contains(shared, b.name) { continue }
+            if Set.contains(p.host, b.module_) || Set.contains(shared, b.name) { continue }
             if Map.contains(p.globals, b.name) { continue }
             let literals = []
             cStringsInto(b.value, literals)
@@ -196,15 +197,20 @@ fun stripTypes(e : Core) -> Core = match e.kind {
 -- Run the program: compute its globals in order, then call `main`.
 fun run(p : Program, main : String) -> Unit {
     let c = Ctx { program = p, limit = V.stackLimit(V.entryBudget) }
+    -- Every dictionary is published before any slot is computed, as the
+    -- compiled initializer does, so that a slot may mention any of them.
+    for (name, value) in p.inits {
+        if let CDict(_, slots) = value.kind {
+            let g = p.globals[name]
+            g.value = VTuple(Array.filled(len(slots), VUnit))
+            g.ready = True
+        }
+    }
     for (name, value) in p.inits {
         let g = p.globals[name]
-        -- A dictionary is published before its slots are computed, as the
-        -- compiled initializer does, so that a slot may mention it.
         match value.kind {
             CDict(_, slots) -> {
-                let held = Array.filled(len(slots), VUnit)
-                g.value = VTuple(held)
-                g.ready = True
+                let held = V.fields(g.value)
                 for var i = 0; i < len(slots); i = i + 1 {
                     held[i] = eval(c, slots[i], None, None)
                 }
@@ -224,6 +230,10 @@ fun global(c : Ctx, name : String) -> Value = match Map.get(c.program.globals, n
     }
     None -> if Map.contains(c.program.decls.foreigns, name) {
         cannot("call the foreign function '" + String.replace(name, "#", ".") + "'")
+    } else if Set.contains(c.program.host, Option.unwrapOr(Option.map(
+            String.splitOnce(name, "#"), fun((m, _)) = m), "")) {
+        cannot("call '" + String.replace(name, "#", ".") + "', which only compiled code "
+               + "calls")
     } else {
         oops("no binding '" + name + "'")
     }

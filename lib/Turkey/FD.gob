@@ -1,4 +1,5 @@
-export (FD, fd, number, closed, timedOut, read, readBy, write, writeText, readAt, writeAt, using, close)
+export (FD, fd, number, closed, timedOut, read, readBy, write, writeText, readAt, writeAt, using, flock,
+        close)
 
 -- A descriptor that tasks share: the one place the I/O layer decides when a
 -- descriptor number stops being this file's, and which of two tasks using it
@@ -79,6 +80,8 @@ import Turkey.IO as IO
 import Turkey.Scheduler as Scheduler
 import Turkey.Sys as Sys
 import Turkey.Wait as Wait
+import Target (OS(..))
+import Target as Target
 
 -- The state word's bits, as above.
 let closedBit : Int = 1
@@ -231,6 +234,35 @@ fun using(f : FD, call : fun(Int) -> Int) -> Int {
     let r = call(f.number)
     let _ = release(f)
     r
+}
+
+-- Take `flock`'s `operation` lock (`Sys.lockExclusive`, without `LOCK_NB`)
+-- on `f`'s file, waiting while another holder has it: 0, `closed` if `f` is or
+-- is closed during the wait, `timedOut` if `deadline` came first, or the
+-- negated `errno`. Only an answer of 0 leaves the lock taken.
+--
+-- On Darwin the wait parks the task (`Turkey.Wait.lockedUnless`) and the
+-- deadline is a point on `Turkey.Wait.now`'s clock, or -1 for none. Linux
+-- reports no release of a lock, so there the call waits in the kernel and
+-- holds its worker, and a deadline other than -1 answers `-EINVAL`.
+fun flock(f : FD, operation : Int, deadline : Int) -> Int {
+    if !acquire(f) { return closed }
+    let r = match Target.os {
+        Darwin -> flockParked(f, operation, deadline)
+        Linux -> if deadline < 0 { IO.flock(f.number, operation) } else { -Sys.einval }
+    }
+    let _ = release(f)
+    r
+}
+
+-- Try the lock first, so that one nobody holds costs a single call and no
+-- trip through the scheduler's lock.
+fun flockParked(f : FD, operation : Int, deadline : Int) -> Int {
+    let r = IO.flock(f.number, Prim.intOr(operation, Sys.lockNonBlocking))
+    if r != -Sys.eagain() { return r }
+    let stop = fun() = Prim.intAnd(Prim.atomicGet(f.state), closedBit) != 0
+    let w = Wait.lockedUnless(f.number, operation, deadline, stop)
+    if w == Wait.cancelled { closed } else { w }
 }
 
 -- -- closing --------------------------------------------------------------------------

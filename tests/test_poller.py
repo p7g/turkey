@@ -8,6 +8,7 @@ allocation and the heap verified around each.
 """
 
 import hashlib
+import sys
 
 import pytest
 
@@ -18,14 +19,16 @@ LIB = bootc.REPO_ROOT / "lib"
 
 PROBE = """export (
     sleepOrder, sleepFreesWorker, sleepOwn, readWake, readTimeout, childStatus,
-    childAlready, childTimeout, joinSleeper, sleepBesideCompute,
+    childAlready, childTimeout, joinSleeper, sleepBesideCompute, lockTimeout,
 )
 
 import System.Task as Task
+import Turkey.FD as FD
 import Turkey.IO as IO
 import Turkey.Libc as Libc
 import Turkey.Sys as Sys
 import Turkey.Wait as Wait
+import Turkey.Workers as Workers
 
 foreign "pipe" fun pipe(fds : Prim.Ptr) -> Int
 foreign "fork" fun fork() -> Int
@@ -205,6 +208,22 @@ fun sleepBesideCompute() -> Unit {
     })
 }
 
+-- A wait for a file lock that gives up at its deadline leaves no source and
+-- no deadline behind, and takes the lock once its holder lets go.
+fun lockTimeout(path : String) -> Unit {
+    let flags = Int.or(Sys.readWrite, Sys.create())
+    let a = FD.fd(IO.open(path, flags, 0o600))
+    let b = FD.fd(IO.open(path, flags, 0o600))
+    print(FD.flock(a, Sys.lockExclusive, -1))
+    let began = Wait.now()
+    print(FD.flock(b, Sys.lockExclusive, after(50)) == FD.timedOut)
+    print((Wait.now() - began) / millisecond >= 50)
+    print(Workers.interest())
+    print(IO.flock(FD.number(a), Sys.lockUnlock))
+    print(FD.flock(b, Sys.lockExclusive, after(1000)))
+    print(Workers.interest())
+}
+
 -- The program's own stack waits for a task that sleeps, which is not a
 -- deadlock.
 fun joinSleeper() -> Unit {
@@ -307,3 +326,11 @@ def test_waits_survive_a_collection_at_every_allocation(probe, workers):
 
 def test_a_sleeper_is_woken_while_the_other_worker_computes(probe):
     assert probe("P.sleepBesideCompute()", "2") == ["slept", "True", "computed"]
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="Linux reports no release of a lock")
+@pytest.mark.parametrize("workers", WORKERS)
+@pytest.mark.parametrize("stress", [False, True])
+def test_a_lock_wait_times_out_and_leaves_nothing_registered(probe, workers, stress, tmp_path):
+    out = probe(f'P.lockTimeout("{tmp_path}/lock")', workers, stress=stress)
+    assert out == ["0", "True", "True", "0", "0", "0", "0"]

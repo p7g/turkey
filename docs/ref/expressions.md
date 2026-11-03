@@ -48,9 +48,10 @@ chain ::= unary (OPERATOR unary)*
 
 A sequence of binary operators is grouped by **precedence groups**. Every
 binary operator belongs to one group, and a group's associativity applies to
-all of its operators. The built-in operators are in the groups below; the
-groups with no built-in operator are for [declared
-operators](#declared-operators).
+all of its operators. The groups are fixed, and so is the group of each
+operator in the table below: `&&` and `||` are built in, and the others are
+[declared by the Prelude](#operators-are-class-methods). The groups with no
+operator here are for [declared operators](#declared-operators).
 
 | Group | Operators | Associativity | Binds tighter than |
 |---|---|---|---|
@@ -108,8 +109,9 @@ Write `a < b && b < c`.
 
 ### Operators are class methods
 
-The arithmetic and comparison operators are not built into any type. Each is
-a call to a method of a [class](classes.md) from the Prelude:
+The arithmetic and comparison operators are not built into any type. The
+Prelude [declares](#declared-operators) each one as a call to a method of a
+[class](classes.md):
 
 | Expression | Means | Class |
 |---|---|---|
@@ -152,7 +154,31 @@ because each class has a single type parameter. `Money * Int` cannot be given
 a meaning with `*`; write a function instead.
 
 The operator always means the class method, even in a module that declares its
-own function called `add` or `eq`.
+own function called `add` or `eq`. Being Prelude declarations, these operators
+are imported like the Prelude's other names: a module that writes
+`import Prelude ()` has none of them until it imports them from the modules
+that declare them, `Data.Num`, `Data.Eq` and `Data.Ord`
+([Operators in imports](modules.md#operators-in-imports)):
+
+<!-- run -->
+```kotlin
+import Prelude ()
+import Data.Num ((+), (*))
+import System.IO (print)
+import Text.Show (show)
+
+fun main() {
+    print(show(1 + 2 * 3))
+}
+```
+
+```text
+7
+```
+
+Their groups are fixed. A module may declare one of these operators itself,
+shadowing the Prelude's, but only in the group the table at the top of this
+section gives it, so `a + b * c` groups the same way in every module.
 
 Which instances the library provides for the built-in types is listed in
 [Built-in types and classes](builtins.md#operator-classes). In particular `+`
@@ -181,11 +207,13 @@ alias for a function: `infix Combine (<>) = combine` puts `<>` in the group
 * The group is one of the groups in the [table above](#operators). A program
   chooses among them and cannot add its own.
 * The operator is any [operator token](lexical.md#operators-and-punctuation)
-  other than a built-in operator (`+`, `==`, `&&`, `!` and the rest), the
-  punctuation `=`, `->` and `~`, and an operator that ends in `=` without
-  beginning with one: `+=` and `>>=` cannot be declared, and `===` can. `|`
-  may be declared: patterns and type declarations, which use it, are read
-  separately from expressions.
+  other than the built-in `&&`, `||` and `!`, the punctuation `=`, `->` and
+  `~`, and an operator that ends in `=` without beginning with one: `+=` and
+  `>>=` cannot be declared, and `===` can. An arithmetic or comparison
+  operator may be declared only in its own group
+  ([Operators are class methods](#operators-are-class-methods)). `|` may be
+  declared: patterns and type declarations, which use it, are read separately
+  from expressions.
 * The target is a top-level function or a class method that takes two
   parameters, from this module or one it imports. It may be qualified.
 * A use is an ordinary call of the target. Its types are the target's, a class

@@ -3,7 +3,8 @@ assembler's means for the same program.
 
 Not the same bytes. The two may spell a reference differently -- the assembler
 reaches a label in another section through a section-start symbol and an
-addend, `boot` through a symbol of the label's own; the assembler leaves a call
+addend, `boot` through a symbol of the label's own for a page relocation and
+through the label's section for an address word; the assembler leaves a call
 to a global function in the same section to the linker, `boot` fills it in --
 and either is correct. What has to agree is what the linker makes of them.
 
@@ -338,3 +339,16 @@ def test_the_object_means_what_the_assemblers_does(name):
 @pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
 def test_the_object_means_what_the_assemblers_does_on_the_compiler():
     _compare(bootc.BOOT_MAIN)
+
+
+# The linker records every symbol in the code as a function start, and a
+# profiler or symbolicator ends a function at the next start. So a label
+# inside a function -- a safepoint's return address, which the frame table
+# holds -- must reach the linker without a symbol of its own.
+@pytest.mark.skipif(toolchain.missing(), reason="no C compiler")
+def test_no_label_in_the_code_has_a_symbol():
+    obj = _parse(_objects(PROGRAMS / "adt.gob")[0])
+    labels = [s.name for s in obj.symbols
+              if not s.named and s.section is not None
+              and obj.sections[s.section].name in ("__TEXT,__text", ".text")]
+    assert not labels, labels[:10]

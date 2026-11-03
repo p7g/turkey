@@ -322,6 +322,11 @@ type Arm
     -- A pair, which is how a frame is set up and torn down in one instruction.
     | Stp(Reg, Reg, Reg, Int)
     | Ldp(Reg, Reg, Reg, Int)
+    -- A pair that moves its base by the offset: before the store, after the
+    -- load. The emitter pushes the frame record with one and pops it with the
+    -- other; selection never emits either.
+    | StpPre(Reg, Reg, Reg, Int)
+    | LdpPost(Reg, Reg, Reg, Int)
     -- The address of a symbol, in the two-instruction form arm64 uses: a page
     -- and an offset within it. How either half is spelled for the assembler is
     -- the object format's business (`Turkey.Asm.page`), not the instruction's.
@@ -769,6 +774,8 @@ fun anySrc(op : Arm, p : fun(Reg) -> Bool) -> Bool = match op {
     Strb(v, m)          -> p(v) || anyMem(m, p)
     Stp(a, b, base, _)  -> p(a) || p(b) || p(base)
     Ldp(_, _, base, _)  -> p(base)
+    StpPre(a, b, base, _) -> p(a) || p(b) || p(base)
+    LdpPost(_, _, base, _) -> p(base)
     Adrp(_, _)          -> False
     AddLo(_, a, _)      -> p(a)
     FrameAddress(_, m)  -> anyMem(m, p)
@@ -860,6 +867,8 @@ fun mapUses(op : Arm, g : fun(Reg) -> Reg) -> Arm = match op {
     Strb(v, m)            -> Strb(g(v), mapMem(m, g))
     Stp(a, b, base, k3)   -> Stp(g(a), g(b), g(base), k3)
     Ldp(k0, k1, base, k3) -> Ldp(k0, k1, g(base), k3)
+    StpPre(a, b, base, k3) -> StpPre(g(a), g(b), g(base), k3)
+    LdpPost(k0, k1, base, k3) -> LdpPost(k0, k1, g(base), k3)
     Adrp(k0, k1)          -> Adrp(k0, k1)
     AddLo(k0, a, k2)      -> AddLo(k0, g(a), k2)
     FrameAddress(k0, m)   -> FrameAddress(k0, mapMem(m, g))
@@ -963,6 +972,8 @@ fun rewrite(op : Arm, g : fun(Reg) -> Reg, m : fun(Mem) -> Mem) -> Arm = match o
     Strb(f0, f1)             -> Strb(g(f0), mapMem(m(f1), g))
     Stp(f0, f1, f2, f3)      -> Stp(g(f0), g(f1), g(f2), f3)
     Ldp(f0, f1, f2, f3)      -> Ldp(g(f0), g(f1), g(f2), f3)
+    StpPre(f0, f1, f2, f3)   -> StpPre(g(f0), g(f1), g(f2), f3)
+    LdpPost(f0, f1, f2, f3)  -> LdpPost(g(f0), g(f1), g(f2), f3)
     Adrp(f0, f1)             -> Adrp(g(f0), f1)
     AddLo(f0, f1, f2)        -> AddLo(g(f0), g(f1), f2)
     FrameAddress(f0, f1)     -> FrameAddress(g(f0), mapMem(m(f1), g))
@@ -1056,6 +1067,8 @@ fun foldDest(op : Arm, acc : a, f : fun(a, Reg) -> a) -> a = match op {
     Strb(_, _)          -> acc
     Stp(_, _, _, _)     -> acc
     Ldp(a, b, _, _)     -> f(f(acc, a), b)
+    StpPre(_, _, base, _) -> f(acc, base)
+    LdpPost(a, b, base, _) -> f(f(f(acc, a), b), base)
     Adrp(d, _)          -> f(acc, d)
     AddLo(d, _, _)      -> f(acc, d)
     FrameAddress(d, _)  -> f(acc, d)
@@ -1281,6 +1294,11 @@ fun showArm(op : Arm) -> String = match op {
     Ldp(a, b, base, n)     -> "ldp " + showReg(a, W64) + ", " + showReg(b, W64)
                               + ", [" + baseName(base) + ", #" + Int.toString(n)
                               + "]"
+    StpPre(a, b, base, n)  -> "stp " + showReg(a, W64) + ", " + showReg(b, W64)
+                              + ", [" + baseName(base) + ", #" + Int.toString(n)
+                              + "]!"
+    LdpPost(a, b, base, n) -> "ldp " + showReg(a, W64) + ", " + showReg(b, W64)
+                              + ", [" + baseName(base) + "], #" + Int.toString(n)
     MovConst(d, n)         -> showConst(d, n)
     -- A virtual register prints as `%n` whichever bank it is in, so these read
     -- the same as their integer counterparts until the allocator has run.

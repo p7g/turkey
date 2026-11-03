@@ -50,10 +50,11 @@ fun main() {
 }
 """)
     body = function(asm, "Main#bump")
-    # Stores through a register other than `sp`: the frame's own saves are
-    # not to a location anyone else can see.
+    # Stores through a register other than `sp` and `x29`: the frame's own
+    # saves are not to a location anyone else can see.
     stores = [i for i, line in enumerate(body)
-              if line.startswith("str ") and ", [sp" not in line]
+              if line.startswith("str ") and ", [sp" not in line
+              and ", [x29" not in line]
     assert stores, body
     assert all(body[i - 1] == "dmb ish" for i in stores), body
 

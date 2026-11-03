@@ -123,22 +123,35 @@ def test_nothing_was_skipped(name):
 @pytest.mark.parametrize("name", CORPUS)
 def test_every_return_comes_after_an_epilogue(name):
     """A `ret` that did not restore `x30` and `sp` returns into the caller's
-    frame with the callee's stack still claimed."""
+    frame with the callee's stack still claimed.
+
+    A compiled function pops its frame record last, and brings `sp` back to
+    it from `x29` first unless the record is the whole frame. The runtime's
+    hand-written entries restore both from `sp`.
+    """
     for function, body in _functions(_native(name)).items():
+        compiled = bool(body) and body[0] == "stp x29, x30, [sp, #-16]!"
+        claims = compiled and body[2].startswith(("sub sp, sp,", "movz x16,"))
         for n, line in enumerate(body):
             if line == "ret":
                 window = body[max(0, n - 8):n]
-                assert any(w.startswith("ldr x30,") for w in window), (
-                    function, window)
-                assert any(w.startswith("add sp, sp,") for w in window), (
-                    function, window)
+                if compiled:
+                    assert body[n - 1] == "ldp x29, x30, [sp], #16", (
+                        function, window)
+                    if claims:
+                        assert "add sp, x29, #0" in window, (function, window)
+                else:
+                    assert any(w.startswith("ldr x30,") for w in window), (
+                        function, window)
+                    assert any(w.startswith("add sp, sp,") for w in window), (
+                        function, window)
 
 
 def test_a_function_opens_by_claiming_its_frame():
     body = _functions(_native("adt.gob"))["Main#main"]
-    assert body[0].startswith("sub sp, sp, #") or body[0].startswith("movz"), body[:3]
-    assert any(line.startswith("str x29,") for line in body), body[:6]
-    assert any(line.startswith("add x29, sp,") for line in body), body[:6]
+    assert body[0] == "stp x29, x30, [sp, #-16]!", body[:3]
+    assert body[1] == "add x29, sp, #0", body[:3]
+    assert body[2].startswith(("sub sp, sp, #", "movz")), body[:3]
 
 
 def test_stack_arguments_are_addressed_from_the_stack_pointer():
@@ -155,8 +168,9 @@ def test_stack_arguments_are_addressed_from_the_stack_pointer():
 
 def test_pressure_saves_and_restores_callee_saved_registers():
     body = _functions(_native("pressure.gob"))["Main#wide"]
-    saved = {line.split()[1].rstrip(",") for line in body
-             if line.startswith("str x") and ", [sp, #" in line}
+    saved = {r.rstrip(",") for line in body
+             if line.startswith(("str x", "stp x")) and ", [x29, #-" in line
+             for r in line.split()[1:3]}
     assert any(r in saved for r in
                ("x19", "x20", "x21", "x22", "x23", "x24", "x25", "x26",
                 "x27", "x28")), sorted(saved)

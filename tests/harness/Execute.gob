@@ -11,6 +11,9 @@ export (execute, diffLimit)
 -- directive says. Then each dump golden is checked against `boot check
 -- --dump STAGE`, which is not cached, since the dump is what is tested.
 --
+-- A reference example is judged on what its chapter quotes instead
+-- (`Reference`): its stdout exactly, and a part of its message.
+--
 -- Running a case and judging it are separate: `observe` runs the processes
 -- and gathers what they produced, and `verdict` and `Bless.decide` are pure
 -- functions of that, the case and its goldens. Every dump is run whenever the
@@ -27,12 +30,14 @@ import Time.Duration as Duration
 import Time.Stopwatch as Stopwatch
 import Bless (Blessing(..), Guard(..))
 import Bless as Bless
-import Case (Case(..), Outcome(..), Result(..), Finish(..), Ending(..), Observed(..), Recorded(..))
+import Case (Case(..), Golden(..), Quote(..), Outcome(..), Result(..), Finish(..), Ending(..), Observed(..),
+             Recorded(..))
 import Case as Case
 import Cache (Cache, Compiled(..))
 import Cache as Cache
 import Diff as Diff
 import Files as Files
+import Reference as Reference
 import Toolchain (Toolchain(..))
 import Toolchain as Toolchain
 
@@ -88,9 +93,13 @@ fun assess(t : Toolchain, cache : Cache, actual : String, c : Case) -> (Verdict,
 fun unrunnable(why : String) -> (Verdict, Blessing) = (Verdict(HarnessError, why, ""), Refuse(Unrunnable, why))
 
 -- The case's goldens as they are on disk. A missing `.expected` is not an
--- error here: the verdict reports it, and bless creates it.
+-- error here: the verdict reports it, and bless creates it. A quoted golden
+-- is not on disk, and is recorded as no `.expected`.
 fun goldens(c : Case) -> Either SomeError Recorded {
-    let expected = if Files.exists(c.golden) { Some(Files.readText(c.golden)?) } else { None }
+    let expected = match c.golden {
+        OnDisk(path) -> if Files.exists(path) { Some(Files.readText(path)?) } else { None }
+        Quoted(_) -> None
+    }
     let dumps = []
     for (_, path) in c.dumps { Vec.push(dumps, Files.readText(path)?) }
     Right(Recorded { expected, dumps = Vec.toArray(dumps) })
@@ -106,9 +115,10 @@ fun observe(t : Toolchain, cache : Cache, actual : String, c : Case) -> Either S
         Left(e) -> return Left(Error.describe(e))
     }
     let ran = match compiled {
-        Crashed(why, stderr) -> (CompileCrash(why), stderr)
-        Overran(stderr) -> (CompileExpired, stderr)
-        Refused(code, stderr) -> (Diagnosed(code), stderr)
+        Crashed(why, stderr) -> (CompileCrash(why), "", stderr)
+        Overran(stderr) -> (CompileExpired, "", stderr)
+        Refused(code, stderr) -> (Diagnosed(code), "", stderr)
+        Accepted(warnings) -> (Checked, "", warnings)
         Built(binary, warnings) -> match runProgram(t, c, binary, warnings) {
             Right(r) -> r
             Left(e) -> {
@@ -117,24 +127,24 @@ fun observe(t : Toolchain, cache : Cache, actual : String, c : Case) -> Either S
             }
         }
     }
-    let (ending, output) = ran
-    record(actual, "output", output)
+    let (ending, stdout, stderr) = ran
+    record(actual, "output", stdout + stderr)
     let dumps = match ending {
         CompileCrash(_) | CompileExpired -> []
-        Diagnosed(_) | Ran(_) -> runDumps(t, actual, c)?
+        Diagnosed(_) | Checked | Ran(_) -> runDumps(t, actual, c)?
     }
-    Right(Observed { ending, output, dumps })
+    Right(Observed { ending, stdout, stderr, dumps })
 }
 
--- The compiled program run in the case's directory: how it ended, and what
--- the golden is compared with.
+-- The compiled program run in the case's directory: how it ended, its
+-- stdout, and the compile's warnings then its stderr.
 fun runProgram(t : Toolchain, c : Case, binary : String, warnings : String)
-    -> Either IOError (Ending, String) {
+    -> Either IOError (Ending, String, String) {
     let argv = t.run + [binary]
     let limit = Toolchain.limit(t, Option.unwrapOr(c.timeout, defaultTimeout))
     let Output { stdout, stderr, status } = Process.run(Toolchain.command(t, argv, c.directory), Some(limit))?
     let err = Toolchain.text(stderr)
-    Right((Ran(finish(status, err)), Toolchain.text(stdout) + warnings + err))
+    Right((Ran(finish(status, err)), Toolchain.text(stdout), warnings + err))
 }
 
 -- Each of the case's dump stages, as `boot check --dump STAGE` ended and what
@@ -174,23 +184,21 @@ fun record(directory : String, name : String, text : String) -> Unit {
 -- The outcome of a case whose goldens are `recorded` and whose run produced
 -- `observed`. The output is judged first, then each dump in turn; the first
 -- that is wrong decides.
-fun verdict(c : Case, recorded : Recorded, observed : Observed) -> Verdict {
+fun verdict(c : Case, recorded : Recorded, observed : Observed) -> Verdict = match c.golden {
+    OnDisk(path) -> goldenVerdict(c, path, recorded, observed)
+    Quoted(q) -> quotedVerdict(c, q, observed)
+}
+
+fun goldenVerdict(c : Case, path : String, recorded : Recorded, observed : Observed) -> Verdict {
     let golden = match recorded.expected {
         Some(text) -> text
         None -> {
-            let file = Option.fold(String.rsplitOnce(c.golden, "/"), c.golden, _.1)
+            let file = Option.fold(String.rsplitOnce(path, "/"), path, _.1)
             return Verdict(HarnessError, "no " + file + " beside " + c.entry, "")
         }
     }
-    let output = observed.output
-    let diff = Diff.unified(golden, output, diffLimit)
-    match observed.ending {
-        CompileCrash(why) -> return Verdict(CompilerCrash, why, tail(output))
-        CompileExpired -> return Verdict(Timeout, "boot or the link took too long", tail(output))
-        Ran(Expired) -> return Verdict(Timeout, "the program ran out of time", diff)
-        Ran(Killed(n)) -> return Verdict(ProgramCrash, "the program died by signal " + Int.toString(n), diff)
-        Diagnosed(_) | Ran(Returned(_)) | Ran(Panicked(_)) -> {}
-    }
+    let diff = Diff.unified(golden, Case.printed(observed), diffLimit)
+    if let Some(v) = ended(observed, diff) { return v }
     if let Some(why) = Case.disagreement(c.expected, observed.ending) { return Verdict(Fail, why, diff) }
     if diff != "" {
         let why = match observed.ending {
@@ -203,6 +211,42 @@ fun verdict(c : Case, recorded : Recorded, observed : Observed) -> Verdict {
         if let Some(v) = dumpVerdict(c.dumps[i].0, recorded.dumps[i], observed.dumps[i]) { return v }
     }
     Verdict(Pass, "", "")
+}
+
+-- The outcome of a reference example whose chapter quotes `q`. A quoted
+-- message only has to be contained in the message, since it is the part of
+-- it the chapter is about.
+fun quotedVerdict(c : Case, q : Quote, observed : Observed) -> Verdict {
+    let diff = match q.stdout {
+        Some(text) -> Diff.unified(text, observed.stdout, diffLimit)
+        None -> ""
+    }
+    if let Some(v) = ended(observed, diff) { return v }
+    if let Some(why) = Case.disagreement(c.expected, observed.ending) { return Verdict(Fail, why, diff) }
+    if let Some(quoted) = q.message {
+        let message = Reference.message(observed)
+        if !String.contains(message, quoted) {
+            let shown = "quoted:\n" + indented(quoted) + "message:\n" + indented(message)
+            return Verdict(Fail, "the message does not contain the quoted text", shown)
+        }
+    }
+    if diff != "" { return Verdict(Fail, "the output differs", diff) }
+    Verdict(Pass, "", "")
+}
+
+fun indented(text : String) -> String = String.unlines(Vec.map(String.lines(text), \"    " + _))
+
+-- The outcome of a compile or a program that crashed or ran out of time, if
+-- one did, showing `diff` for a program.
+fun ended(observed : Observed, diff : String) -> Option Verdict {
+    let output = Case.printed(observed)
+    match observed.ending {
+        CompileCrash(why) -> Some(Verdict(CompilerCrash, why, tail(output)))
+        CompileExpired -> Some(Verdict(Timeout, "boot or the link took too long", tail(output)))
+        Ran(Expired) -> Some(Verdict(Timeout, "the program ran out of time", diff))
+        Ran(Killed(n)) -> Some(Verdict(ProgramCrash, "the program died by signal " + Int.toString(n), diff))
+        Diagnosed(_) | Checked | Ran(Returned(_)) | Ran(Panicked(_)) -> None
+    }
 }
 
 -- What is wrong with the dump of `stage`, whose golden is `golden`, if

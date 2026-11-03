@@ -15,11 +15,13 @@ export (Cache(..), Compiled(..), open, compile, evict, panicked)
 -- own and renamed into place, under an advisory lock on `KEY.lock`, so a
 -- concurrent compile of the same key waits and then finds the entry, and no
 -- reader ever sees half of one. What is kept is a compile that answered: a
--- linked binary and `boot`'s warnings, or a refusal and its diagnostic. A
--- crash or a timeout is not kept, so it is tried again next run.
+-- linked binary and `boot`'s warnings, an acceptance by `boot check` and its
+-- warnings, or a refusal and its diagnostic. A crash or a timeout is not
+-- kept, so it is tried again next run.
 --
 -- **Eviction runs when the harness starts.** A hit rewrites the entry's
--- `used` file, and an entry whose `used` is 7 days old is removed. Of the
+-- `used` file, and an entry whose `used` is 7 days old is removed, as is a
+-- reference example's directory under `ROOT/reference/` (`Reference`). Of the
 -- builds `scripts/test.sh` keeps (`boot/`, `stage1/`, `harness/`), all but the
 -- 8 most recently used are removed. Nothing used in the last hour is ever
 -- removed, so a concurrent session never loses what it is using.
@@ -39,11 +41,12 @@ import Toolchain as Toolchain
 
 type Cache = Cache { root : String, base : String }
 
--- What a compile came to: a binary and the warnings `boot` printed; a
+-- What a compile came to: a binary and the warnings `boot` printed; for a
+-- case that is only checked, `boot check` accepting it, with its warnings; a
 -- refusal, with `boot`'s exit status and diagnostic; `boot` crashing, or the
 -- link failing, with why and what it printed; or running out of time.
-type Compiled = Built(String, String) | Refused(Int, String) | Crashed(String, String)
-              | Overran(String)
+type Compiled = Built(String, String) | Accepted(String) | Refused(Int, String)
+              | Crashed(String, String) | Overran(String)
 
 -- The cache under `root`, with the part of every key that does not depend
 -- on the case worked out once.
@@ -81,10 +84,10 @@ fun panicked(stderr : String) -> Bool =
 -- `c` compiled and linked, from the cache or now. `Left` is a harness error:
 -- a source that cannot be read, or a cache that cannot be written.
 fun compile(cache : Cache, t : Toolchain, c : Case) -> Either SomeError Compiled {
-    let flags = ["build", "-f", "obj"]
+    let flags = if c.checkOnly { ["check"] } else { ["build", "-f", "obj"] }
     let key = keyOf(cache, c, flags)?
     let entry = cache.root + "/compile/" + key
-    if let Some(found) = load(entry) { return Right(found) }
+    if let Some(found) = load(entry, c.checkOnly) { return Right(found) }
     Files.writeText(entry + ".lock", "")?
     let lockFile = Error.promote(File.openReadWrite(entry + ".lock"))?
     -- `tryLock` and a sleep rather than `lock`. `lock` waits in `flock`, which
@@ -102,7 +105,7 @@ fun compile(cache : Cache, t : Toolchain, c : Case) -> Either SomeError Compiled
             }
         }
     }
-    let result = match load(entry) {
+    let result = match load(entry, c.checkOnly) {
         Some(found) -> Right(found)
         None -> build(t, c, flags, entry)
     }
@@ -110,13 +113,14 @@ fun compile(cache : Cache, t : Toolchain, c : Case) -> Either SomeError Compiled
     result
 }
 
--- The entry at `entry`, marked used, if there is one.
-fun load(entry : String) -> Option Compiled {
+-- The entry at `entry`, marked used, if there is one. `checked` is whether
+-- it is a `boot check`, which keeps no binary.
+fun load(entry : String, checked : Bool) -> Option Compiled {
     let status = Either.right(Files.readText(entry + "/status"))?
     let stderr = Either.unwrapOr(Files.readText(entry + "/stderr"), "")
     let _ = Files.writeText(entry + "/used", Int.toString(Instant.unixNanos(Instant.now())))
     match Int.parse(status) {
-        Some(0) -> Some(Built(entry + "/bin", stderr))
+        Some(0) -> Some(if checked { Accepted(stderr) } else { Built(entry + "/bin", stderr) })
         Some(code) -> Some(Refused(code, stderr))
         None -> None
     }
@@ -128,6 +132,7 @@ fun build(t : Toolchain, c : Case, flags : Array String, entry : String)
     let compiled = runBoot(t, c, flags, staging)
     let published = match compiled {
         Built(_, stderr) -> publish(staging, entry, 0, stderr)
+        Accepted(stderr) -> publish(staging, entry, 0, stderr)
         Refused(code, stderr) -> publish(staging, entry, code, stderr)
         _ -> Right(())
     }
@@ -140,10 +145,11 @@ fun build(t : Toolchain, c : Case, flags : Array String, entry : String)
 }
 
 -- `boot` on the case, writing its object and then the linked binary into
--- `staging`.
+-- `staging`; or, for a case that is only checked, `boot check` alone.
 fun runBoot(t : Toolchain, c : Case, flags : Array String, staging : String) -> Compiled {
     let object = staging + "/main.o"
-    let argv = t.run + [t.boot] + flags + ["-o", object, c.entry]
+    let output = if c.checkOnly { [] } else { ["-o", object] }
+    let argv = t.run + [t.boot] + flags + output + [c.entry]
     let limit = Toolchain.limit(t, 300)
     let compiled = match Process.run(Toolchain.command(t, argv, c.directory), Some(limit)) {
         Left(e) -> return Crashed("boot did not start: " + Error.message(e), "")
@@ -158,6 +164,7 @@ fun runBoot(t : Toolchain, c : Case, flags : Array String, staging : String) -> 
             if code != 0 { return Refused(code, stderr) }
         }
     }
+    if c.checkOnly { return Accepted(stderr) }
     let link = Toolchain.linkCommand(t, object, staging + "/bin", c.directory)
     match Process.run(link, Some(limit)) {
         Right(Output { status = Exited(0), .. }) -> Built(staging + "/bin", stderr)
@@ -202,6 +209,11 @@ fun evict(root : String) -> Unit {
         } else if olderThan(path + "/used", week) {
             let _ = File.removeTree(path)
         }
+    }
+    let examples = root + "/reference"
+    for name in Files.listed(examples) {
+        let path = examples + "/" + name
+        if olderThan(path + "/used", week) { let _ = File.removeTree(path) }
     }
     for kind in ["boot", "stage1", "harness"] {
         let directory = root + "/" + kind

@@ -1,0 +1,292 @@
+export (cases, message)
+
+-- Cases from the language reference, `docs/ref/`: every Turkey example in
+-- every chapter, checked against what the chapter says of it.
+--
+-- An example is a `kotlin` fence, and an HTML comment on the line before it
+-- says how to check it:
+--
+--   <!-- run -->             a whole program; the next `text` fence is its
+--                            exact stdout, and it exits 0
+--   <!-- check -->           `boot check` accepts it
+--   <!-- error: TEXT -->     `boot check` rejects it, and TEXT is in the
+--                            message
+--   <!-- panic: TEXT -->     it compiles, then panics, and TEXT is in the
+--                            panic's message; an optional `text` fence is its
+--                            exact stdout
+--   <!-- module: F.gob -->   another file of the next example's program
+--
+-- Every example requires a C compiler, since even one that is only checked
+-- is a promise about a program a reader can build.
+--
+-- A case is named `PREFIX/CHAPTER.md:LINE`, LINE being the line of the
+-- example's opening fence, which is where an editor should jump.
+--
+-- A chapter that cannot be read this way -- a `kotlin` fence with no
+-- directive, an unknown directive, a `run` with no `text` fence, `module`
+-- blocks with no example after them -- ends in a harness-error case named by
+-- the chapter and the line, and its later examples are not read. An
+-- unmarked fence is an error rather than a skip because the reference
+-- promises that its examples are real, and an unmarked one is a promise
+-- nobody checks. For the same reason, a directory with no examples at all is
+-- a harness error.
+--
+-- Each example is written out as `Main.gob` beside its modules, in a
+-- directory of its own under `WORK` named by a hash of those files. The
+-- directory is filled in a fresh one and renamed into place, so concurrent
+-- runs that share the cache share it too, and none of them sees it
+-- half-written. A run rewrites the `used` file of every directory it finds,
+-- and `Cache.evict` removes those unused for a week.
+
+import Hash.SHA256 as SHA256
+import System.File as File
+import Case (Case(..), Expected(..), Golden(..), Quote(..), Requirement(..), Ending(..), Observed(..))
+import Files as Files
+
+let modes = ["run", "check", "error", "panic", "module"]
+
+-- The stages `boot` names in a diagnostic, `FILE:LINE:COL: STAGE: MESSAGE`.
+let stages = ["lex error", "parse error", "type error", "internal error", "giblets", "error"]
+
+-- One example as its chapter gives it: the line of its opening fence, its
+-- directive and that directive's argument, its source, the `text` fence
+-- after it, and the modules before it, as (file name, source).
+type Example = Example {
+    line : Int,
+    mode : String,
+    arg : String,
+    source : String,
+    stdout : Option String,
+    modules : Array (String, String),
+}
+
+-- What is wrong with a chapter, and on which line.
+type Malformed = Malformed { line : Int, why : String }
+
+-- A fence: its language, its body, the line it opens on, and the index of
+-- the line after the one that closes it.
+type Fence = Fence { language : String, body : String, line : Int, next : Int }
+
+-- Returns a case for every example in each `.md` file in `directory` (an
+-- absolute path), named by `prefix`, the path to it from the repository
+-- root, in chapter order. Writes each example's files under `work`.
+fun cases(directory : String, prefix : String, work : String) -> Array Case {
+    let out = []
+    for name in Files.listed(directory) {
+        if !String.endsWith(name, ".md") { continue }
+        let chapter = prefix + "/" + name
+        match Files.readText(directory + "/" + name) {
+            Left(e) -> Vec.push(out, broken(chapter, directory, name, Error.describe(e)))
+            Right(text) -> {
+                let found = []
+                let read = extract(String.lines(text), found)
+                for e in found { Vec.push(out, example(work, caseName(chapter, e.line), e)) }
+                if let Left(m) = read { Vec.push(out, broken(caseName(chapter, m.line), directory, name, m.why)) }
+            }
+        }
+    }
+    if !Iterator.any(out, \Option.isNone(_.problem)) {
+        Vec.push(out, broken(prefix, directory, ".", "no examples in " + prefix))
+    }
+    Vec.toArray(out)
+}
+
+fun caseName(chapter : String, line : Int) -> String = chapter + ":" + Int.toString(line)
+
+-- A case that is a harness error for `why`, and is never compiled.
+fun broken(name : String, directory : String, entry : String, why : String) -> Case = Case {
+    name = name,
+    directory = directory,
+    entry = entry,
+    sources = [],
+    golden = Quoted(Quote { stdout = None, message = None }),
+    dumps = [],
+    expected = Exits(0),
+    timeout = None,
+    requires = [],
+    xfail = None,
+    problem = Some(why),
+    checkOnly = False,
+}
+
+fun example(work : String, name : String, e : Example) -> Case {
+    let files = [("Main.gob", e.source)] + e.modules
+    let written = writeOut(work, files)
+    let quoted = match e.mode {
+        "error" | "panic" -> Some(e.arg)
+        _ -> None
+    }
+    Case {
+        name = name,
+        directory = Either.unwrapOr(written, work),
+        entry = "Main.gob",
+        sources = Array.map(files, _.0),
+        golden = Quoted(Quote { stdout = e.stdout, message = quoted }),
+        dumps = [],
+        expected = match e.mode {
+            "error" -> Rejected
+            "panic" -> Panics
+            _ -> Exits(0)
+        },
+        timeout = None,
+        requires = [Cc],
+        xfail = None,
+        problem = Option.map(Either.left(written), Error.describe),
+        checkOnly = e.mode == "check" || e.mode == "error",
+    }
+}
+
+-- Returns the directory under `work` that holds `files`, each (name, text),
+-- writing it first if it is not there yet, and marks it used.
+fun writeOut(work : String, files : Array (String, String)) -> Either SomeError String {
+    -- Each length comes before its text, so that no two sets of files hash
+    -- the same by moving text from one file to the next.
+    let parts = Array.map(files, \_.0 + "\u{0}" + Int.toString(String.byteLength(_.1)) + "\u{0}" + _.1)
+    let directory = work + "/" + SHA256.ofText(String.join(parts, ""))
+    if Files.exists(directory) {
+        Files.writeText(directory + "/used", "")?
+        return Right(directory)
+    }
+    Error.promote(File.createDirAll(work))?
+    let staging = Error.promote(File.temporaryDir("turkey-reference-"))?
+    for (name, text) in files { Files.writeText(staging + "/" + name, text)? }
+    Files.writeText(staging + "/used", "")?
+    -- A rename that finds the directory there lost a race to a run writing
+    -- the same files, and the directory that won is as good.
+    let renamed = File.rename(staging, directory)
+    let _ = File.removeTree(staging)
+    if let Left(e) = renamed {
+        if !Files.exists(directory) { return Left(fail(e)) }
+    }
+    Right(directory)
+}
+
+-- -- reading a chapter -----------------------------------------------------------------
+
+-- Pushes each example in `lines` onto `found`, up to the first thing wrong
+-- with the chapter, if there is one.
+fun extract(lines : Vec String, found : Vec Example) -> Either Malformed Unit {
+    var modules = []
+    var lastModule = 0
+    var i = 0
+    while i < len(lines) {
+        let line = String.trim(lines[i])
+        if let Some((mode, arg)) = directive(line) {
+            -- Any other comment is prose, unless it stands where a directive
+            -- would, before a `kotlin` fence.
+            if !Iterator.any(modes, _ == mode) {
+                if nextIsFence(lines, i + 1, "kotlin") {
+                    return Left(Malformed(i + 1, "unknown directive '" + mode + "'"))
+                }
+                i = i + 1
+                continue
+            }
+            let f = fence(lines, i + 1)?
+            if f.language != "kotlin" { return Left(Malformed(i + 1, "a directive must precede a kotlin fence")) }
+            i = f.next
+            if mode == "module" {
+                if arg == "" { return Left(Malformed(f.line, "'module' needs a file name")) }
+                Vec.push(modules, (arg, f.body))
+                lastModule = f.line
+                continue
+            }
+            if (mode == "error" || mode == "panic") && arg == "" {
+                return Left(Malformed(f.line, "'" + mode + "' needs the text its message contains"))
+            }
+            var stdout = None
+            if mode == "run" || (mode == "panic" && nextIsFence(lines, i, "text")) {
+                if !nextIsFence(lines, i, "text") { return Left(Malformed(f.line, "'run' needs a text fence after it")) }
+                let t = fence(lines, i)?
+                stdout = Some(t.body)
+                i = t.next
+            }
+            Vec.push(found, Example { line = f.line, mode, arg, source = f.body, stdout, modules = Vec.toArray(modules) })
+            modules = []
+        } else if let Some(language) = opening(line) {
+            if language == "kotlin" { return Left(Malformed(i + 1, "a kotlin fence with no directive")) }
+            let f = fence(lines, i)?
+            i = f.next
+        } else {
+            i = i + 1
+        }
+    }
+    if len(modules) > 0 { return Left(Malformed(lastModule, "'module' blocks with no example after them")) }
+    Right(())
+}
+
+-- The name and argument of the HTML comment that `line`, trimmed, is, if it
+-- is one: `<!-- NAME -->` or `<!-- NAME: ARGUMENT -->`.
+fun directive(line : String) -> Option (String, String) {
+    let opened = String.stripPrefix(line, "<!--")?
+    let inner = String.trim(String.stripSuffix(opened, "-->")?)
+    Some(match String.splitOnce(inner, ":") {
+        Some((name, arg)) -> (String.trim(name), String.trim(arg))
+        None -> (inner, "")
+    })
+}
+
+-- The language of the fence that `line`, trimmed, opens, if it opens one.
+fun opening(line : String) -> Option String {
+    let language = String.stripPrefix(line, "```")?
+    if len(String.words(language)) > 1 { None } else { Some(language) }
+}
+
+-- The fence that opens at index `from`, or after the blank lines there.
+fun fence(lines : Vec String, from : Int) -> Either Malformed Fence {
+    let i = nonBlank(lines, from)
+    let language = if i < len(lines) { opening(String.trim(lines[i])) } else { None }
+    let language = match language {
+        Some(l) -> l
+        None -> return Left(Malformed(i + 1, "expected a code fence"))
+    }
+    var j = i + 1
+    while j < len(lines) && String.trimEnd(lines[j]) != "```" { j = j + 1 }
+    if j >= len(lines) { return Left(Malformed(i + 1, "the fence is never closed")) }
+    Right(Fence { language, body = String.unlines(Vec.slice(lines, i + 1, j)), line = i + 1, next = j + 1 })
+}
+
+-- Whether the first line that is not blank, at index `from` or after, opens
+-- a fence of `language`.
+fun nextIsFence(lines : Vec String, from : Int, language : String) -> Bool {
+    let i = nonBlank(lines, from)
+    i < len(lines) && String.trimEnd(lines[i]) == "```" + language
+}
+
+fun nonBlank(lines : Vec String, from : Int) -> Int {
+    var i = from
+    while i < len(lines) && String.isEmpty(String.trim(lines[i])) { i = i + 1 }
+    i
+}
+
+-- -- judging -------------------------------------------------------------------------
+
+-- Returns the message a quote is looked for in: a diagnostic's, without the
+-- place and the stage before it, or else a panic's, without its trace.
+fun message(observed : Observed) -> String = match observed.ending {
+    Diagnosed(_) -> diagnostic(observed.stderr)
+    _ -> panicMessage(observed.stderr)
+}
+
+-- Everything after the first `: STAGE: ` in `rendered`, trying the stages
+-- in order, or all of it if none is there.
+fun diagnostic(rendered : String) -> String {
+    var text = rendered
+    loop {
+        match String.stripSuffix(text, "\n") {
+            Some(shorter) -> { text = shorter }
+            None -> break
+        }
+    }
+    for stage in stages {
+        if let Some((_, rest)) = String.splitOnce(text, ": " + stage + ": ") { return rest }
+    }
+    text
+}
+
+-- What follows `panic: ` on the first line of `stderr` that starts with it.
+fun panicMessage(stderr : String) -> String {
+    for line in String.lines(stderr) {
+        if let Some(rest) = String.stripPrefix(line, "panic: ") { return rest }
+    }
+    ""
+}

@@ -1,7 +1,7 @@
 export (
-    Case(..), Expected(..), Requirement(..), Outcome(..), Result(..),
+    Case(..), Expected(..), Golden(..), Quote(..), Requirement(..), Outcome(..), Result(..),
     Finish(..), Ending(..), Observed(..), Recorded(..),
-    directives, requirementName, outcomeName, failsRun, passed, disagreement,
+    directives, requirementName, outcomeName, failsRun, passed, disagreement, printed,
 )
 
 -- What a test is, whatever source it came from, and what can become of it.
@@ -15,6 +15,17 @@ export (
 -- How a case must end. Without a directive saying otherwise, a program
 -- compiles, runs and exits 0.
 type Expected = Exits(Int) | Panics | Rejected
+
+-- What a case's output is compared with. `OnDisk` is the path of an
+-- `.expected` golden, stdout then stderr, compared exactly; bless writes it.
+-- `Quoted` is what a reference example's chapter says of it, which a person
+-- writes and bless never does.
+type Golden = OnDisk(String) | Quoted(Quote)
+
+-- What a reference example's chapter quotes: the program's stdout, compared
+-- exactly, and a part of its diagnostic or panic message, which the message
+-- must contain.
+type Quote = Quote { stdout : Option String, message : Option String }
 
 -- What a case may need of the machine: a C compiler, an assembler, or one
 -- system.
@@ -47,8 +58,7 @@ type Case = Case {
     -- Every file the compile reads besides the library, relative to
     -- `directory`: the cache key is made of these.
     sources : Array String,
-    -- The `.expected` golden: stdout, then stderr.
-    golden : String,
+    golden : Golden,
     -- Dump goldens, as (stage, path): `boot check --dump STAGE` must print
     -- exactly that file and exit 0.
     dumps : Array (String, String),
@@ -60,6 +70,9 @@ type Case = Case {
     -- The reason the case is expected to fail its comparison.
     xfail : Option String,
     problem : Option String,
+    -- Whether `boot check` is run on the case in place of a build, so that
+    -- nothing is linked or run.
+    checkOnly : Bool,
 }
 
 -- Every outcome is reported distinctly. `CompilerCrash` is `boot` dying by a
@@ -123,16 +136,19 @@ type Finish = Returned(Int) | Panicked(Int) | Killed(Int) | Expired
 -- How a case's compile and run ended. `CompileCrash` is `boot` dying by a
 -- signal or panicking, or the link failing, with why; `CompileExpired` is
 -- either of them running out of time; `Diagnosed` is `boot` refusing the
--- program, with its exit status; `Ran` is how the compiled program ended.
-type Ending = CompileCrash(String) | CompileExpired | Diagnosed(Int) | Ran(Finish)
+-- program, with its exit status; `Checked` is `boot check` accepting a case
+-- that is only checked; `Ran` is how the compiled program ended.
+type Ending = CompileCrash(String) | CompileExpired | Diagnosed(Int) | Checked | Ran(Finish)
 
--- What a run of a case produced. `output` is what the `.expected` golden is
--- compared with: stdout, then the compile's warnings and the program's
--- stderr; or a failed compile's diagnostic. `dumps` holds how each dump
--- stage ended and what it printed, stdout then stderr, in the order of
--- `Case.dumps`. It is empty when the compile crashed or ran out of time,
--- since no dump is run then.
-type Observed = Observed { ending : Ending, output : String, dumps : Array (Finish, String) }
+-- What a run of a case produced. `stdout` is the program's; `stderr` is the
+-- compile's warnings and then the program's stderr, or a failed compile's
+-- diagnostic. `dumps` holds how each dump stage ended and what it printed,
+-- stdout then stderr, in the order of `Case.dumps`. It is empty when the
+-- compile crashed or ran out of time, since no dump is run then.
+type Observed = Observed { ending : Ending, stdout : String, stderr : String, dumps : Array (Finish, String) }
+
+-- Returns what an `.expected` golden is compared with: stdout, then stderr.
+fun printed(o : Observed) -> String = o.stdout + o.stderr
 
 -- A case's goldens as they are on disk: the `.expected` file, if there is
 -- one, and each dump golden, in the order of `Case.dumps`.
@@ -145,8 +161,11 @@ type Recorded = Recorded { expected : Option String, dumps : Array String }
 fun disagreement(expected : Expected, ending : Ending) -> Option String = match (expected, ending) {
     (_, CompileCrash(_)) | (_, CompileExpired) | (_, Ran(Killed(_))) | (_, Ran(Expired)) -> None
     (Rejected, Diagnosed(_)) -> None
-    (Rejected, _) -> Some("compiled, but --@ error expects a compile error")
+    (Rejected, _) -> Some("compiled, but the case expects a compile error")
     (_, Diagnosed(_)) -> Some("did not compile")
+    -- A case that is only checked is never run, so whether it compiled is
+    -- all there is to compare.
+    (_, Checked) -> None
     (Exits(n), Ran(Returned(code))) ->
         if code == n { None } else { Some("exited " + Int.toString(code) + ", not " + Int.toString(n)) }
     (Exits(_), Ran(Panicked(_))) -> Some("panicked")
@@ -155,7 +174,7 @@ fun disagreement(expected : Expected, ending : Ending) -> Option String = match 
 }
 
 fun withoutPanic(code : Int) -> Option String =
-    Some("exited " + Int.toString(code) + " without the panic --@ panic expects")
+    Some("exited " + Int.toString(code) + " without the panic the case expects")
 
 -- -- directives -----------------------------------------------------------------------
 
@@ -208,6 +227,7 @@ fun directives(base : Case, text : String) -> Case {
         requires = Vec.toArray(requires),
         xfail = xfail,
         problem = Option.or(problem, base.problem),
+        checkOnly = base.checkOnly,
     }
 }
 

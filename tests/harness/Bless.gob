@@ -12,7 +12,7 @@ export (Guard(..), Blessing(..), decide, permitted, overLimit, refused, refusalL
 -- Both decisions are pure functions of the case, its goldens and what its
 -- run produced, so the selftest checks them without writing a file.
 
-import Case (Case(..), Expected(..), Finish(..), Ending(..), Observed(..), Recorded(..))
+import Case (Case(..), Expected(..), Golden(..), Finish(..), Ending(..), Observed(..), Recorded(..))
 import Case as Case
 
 -- The most refused cases a run may have and still write the rest.
@@ -36,7 +36,7 @@ fun guardName(g : Guard) -> String = match g {
 
 -- What bless does with a case: nothing, because every golden already holds
 -- what the run produced; write each (path, text); nothing, deliberately, for
--- the reason given; or nothing, refused, by the guard and for the reason
+-- the reason given, as for every reference example; or nothing, refused, by the guard and for the reason
 -- given. Only a refusal fails the run.
 type Blessing = Unchanged | Write(Array (String, String)) | Keep(String) | Refuse(Guard, String)
 
@@ -47,6 +47,12 @@ type Blessing = Unchanged | Write(Array (String, String)) | Keep(String) | Refus
 -- goldens is written. A missing `.expected` is written, and a dump golden is
 -- written only if it is in `c.dumps`, which holds the ones that exist.
 fun decide(c : Case, recorded : Recorded, observed : Observed) -> Blessing {
+    -- A quote is prose a person wrote about the example, and a failure there
+    -- is a fix to the chapter or to the compiler that a person makes.
+    let golden = match c.golden {
+        OnDisk(path) -> path
+        Quoted(_) -> return Keep("the reference is written by hand")
+    }
     -- An `xfail` golden records what the case is expected not to print yet;
     -- writing what it does print would delete that.
     if let Some(reason) = c.xfail { return Keep("xfail: " + reason) }
@@ -54,12 +60,13 @@ fun decide(c : Case, recorded : Recorded, observed : Observed) -> Blessing {
     -- A new program needs an `.expected`, so a missing one is created. Adding
     -- a dump golden is a deliberate act, so only existing ones are compared.
     let writes = []
+    let output = Case.printed(observed)
     match recorded.expected {
         Some(old) -> {
-            if newlyEmpty(old, observed.output) { return Refuse(NewlyEmpty, "the output is newly empty") }
-            if old != observed.output { Vec.push(writes, (c.golden, observed.output)) }
+            if newlyEmpty(old, output) { return Refuse(NewlyEmpty, "the output is newly empty") }
+            if old != output { Vec.push(writes, (golden, output)) }
         }
-        None -> Vec.push(writes, (c.golden, observed.output))
+        None -> Vec.push(writes, (golden, output))
     }
     for i in Int.range(0, len(c.dumps)) {
         let stage = c.dumps[i].0
@@ -92,14 +99,15 @@ fun suspect(expected : Expected, observed : Observed) -> Option (Guard, String) 
             -- usage error or a file it cannot read, and never to a
             -- diagnostic about the program. Such an error on a case marked
             -- `--@ error` would otherwise pass every other guard.
-            for line in String.lines(observed.output) {
+            for line in String.lines(observed.stderr) {
                 if let Some(error) = String.stripPrefix(line, "boot: ") {
                     return Some((Diagnostic, "an error from boot itself: " + error))
                 }
             }
             Option.map(Case.disagreement(expected, ending), \(Diagnostic, _))
         }
-        Ran(Returned(_)) | Ran(Panicked(_)) -> Option.map(Case.disagreement(expected, ending), \(WrongEnd, _))
+        Checked | Ran(Returned(_)) | Ran(Panicked(_)) ->
+            Option.map(Case.disagreement(expected, ending), \(WrongEnd, _))
     }
 }
 

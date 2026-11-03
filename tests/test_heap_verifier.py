@@ -480,7 +480,7 @@ fun main() {
         before, after = ("    stackTasks(frame)\n", "")
     else:
         before = ("        let object = Prim.ptrFromInt(if chunk == 0 { entry } "
-                  "else { Prim.intAnd(entry, addressBits) })\n")
+                  "else { entry & addressBits })\n")
         after = before + "        if !Prim.ptrIsNull(object) { continue }\n"
     assert text.count(before) == 1, before
     heap.write_text(text.replace(before, after))

@@ -78,36 +78,36 @@ fun relative(f : Fixup) -> Bool = match f {
 fun patch(f : Fixup, bytes : Vec Byte, at : Int, place : Int, target : Int) -> Unit {
     let w = Byte.getLE(bytes, at, 4)
     let field = match f {
-        Jump26(_) | Call26(_) -> Int.and(words(target - place, 26), 0x03FFFFFF)
-        Branch19(_) -> Int.shl(Int.and(words(target - place, 19), 0x7FFFF), 5)
+        Jump26(_) | Call26(_) -> words(target - place, 26) & 0x03FFFFFF
+        Branch19(_) -> (words(target - place, 19) & 0x7FFFF) << 5
         Page21(_) -> {
-            let pages = Int.shr(target, 12) - Int.shr(place, 12)
+            let pages = (target >> 12) - (place >> 12)
             within(pages, 21, "a page")
-            Int.shl(Int.and(pages, 3), 29) + Int.shl(Int.and(Int.shr(pages, 2), 0x7FFFF), 5)
+            (pages & 3) << 29 | (pages >> 2 & 0x7FFFF) << 5
         }
         PageOffset12(_, scale) -> {
-            let low = Int.and(target, 0xFFF)
-            if Int.and(low, Int.shl(1, scale) - 1) != 0 {
+            let low = target & 0xFFF
+            if low & ((1 << scale) - 1) != 0 {
                 error("internal error: a page offset not aligned to its access")
             }
-            Int.shl(Int.shr(low, scale), 10)
+            (low >> scale) << 10
         }
-        AddOffset12(_) -> Int.shl(Int.and(target, 0xFFF), 10)
+        AddOffset12(_) -> (target & 0xFFF) << 10
     }
-    Byte.putLE(bytes, at, 4, Int.or(w, field))
+    Byte.putLE(bytes, at, 4, w | field)
 }
 
 -- A byte distance as a count of instructions that fits a signed field of
 -- `width` bits.
 fun words(distance : Int, width : Int) -> Int {
-    if Int.and(distance, 3) != 0 { error("internal error: a branch to a misaligned target") }
+    if distance & 3 != 0 { error("internal error: a branch to a misaligned target") }
     let n = distance / 4
     within(n, width, "a branch")
     n
 }
 
 fun within(n : Int, width : Int, what : String) -> Unit {
-    let reach = Int.shl(1, width - 1)
+    let reach = 1 << (width - 1)
     if n < -reach || n >= reach { error("internal error: " + what + " out of reach") }
 }
 
@@ -171,8 +171,8 @@ fun encode(op : Arm, out : Vec Int) -> Unit = match op {
                                         + rn(a) + rd(d))
     -- `madd` and `msub` with the accumulator: `mul` is `madd` with `xzr`.
     Mul(d, a, b, w)        -> word(out, sf(w) + 0x1B007C00 + three(d, a, b))
-    MSub(d, a, b, c, w)    -> word(out, sf(w) + 0x1B008000 + three(d, a, b)
-                                        + Int.shl(number(c), 10))
+    MSub(d, a, b, c, w)    -> word(out, sf(w) | 0x1B008000 | three(d, a, b)
+                                        | number(c) << 10)
     SMulH(d, a, b)         -> word(out, 0x9B407C00 + three(d, a, b))
     SDiv(d, a, b, w)       -> word(out, sf(w) + 0x1AC00C00 + three(d, a, b))
     And(d, a, b, w)        -> word(out, sf(w) + 0x0A000000 + three(d, a, b))
@@ -184,7 +184,7 @@ fun encode(op : Arm, out : Vec Int) -> Unit = match op {
     -- rotated into place, `lsr` and `asr` are `ubfm` and `sbfm` from the shift
     -- to the top bit.
     LslImm(d, a, n, w)     -> word(out, bitfield(0x53000000, w, d, a,
-                                                 Int.and(bits(w) - n, bits(w) - 1),
+                                                 (bits(w) - n) & (bits(w) - 1),
                                                  bits(w) - 1 - n))
     LsrImm(d, a, n, w)     -> word(out, bitfield(0x53000000, w, d, a, n, bits(w) - 1))
     AsrImm(d, a, n, w)     -> word(out, bitfield(0x13000000, w, d, a, n, bits(w) - 1))
@@ -195,8 +195,8 @@ fun encode(op : Arm, out : Vec Int) -> Unit = match op {
     Cmp(a, b, w)           -> word(out, sf(w) + 0x6B00001F + rm(b) + rn(a))
     CmpImm(a, n, w)        -> word(out, sf(w) + addSub(0x7100001F, 0x3100001F, n) + rn(a))
     -- `cset` is `csinc` from `xzr` on the opposite condition.
-    CSet(d, c)             -> word(out, 0x9A9F07E0 + Int.shl(condition(A.invert(c)), 12)
-                                        + rd(d))
+    CSet(d, c)             -> word(out, 0x9A9F07E0 | condition(A.invert(c)) << 12
+                                        | rd(d))
     Sxtw(d, a)             -> word(out, 0x93407C00 + rn(a) + rd(d))
     Uxtb(d, a)             -> word(out, 0x53001C00 + rn(a) + rd(d))
     Uxth(d, a)             -> word(out, 0x53003C00 + rn(a) + rd(d))
@@ -240,7 +240,7 @@ fun encode(op : Arm, out : Vec Int) -> Unit = match op {
     BCond(c, _)            -> word(out, 0x54000000 + condition(c))
     Cbz(a, _, w)           -> word(out, sf(w) + 0x34000000 + rd(a))
     Cbnz(a, _, w)          -> word(out, sf(w) + 0x35000000 + rd(a))
-    Brk(n)                 -> word(out, 0xD4200000 + Int.shl(n, 5))
+    Brk(n)                 -> word(out, 0xD4200000 | n << 5)
     Dmb                    -> word(out, 0xD5033BBF)
     AtomicCas(d, a, e, n)  -> {
         word(out, 0xAA0003F0 + rm(e))
@@ -270,8 +270,8 @@ fun number(r : Reg) -> Int = match r {
 }
 
 fun rd(r : Reg) -> Int = number(r)
-fun rn(r : Reg) -> Int = Int.shl(number(r), 5)
-fun rm(r : Reg) -> Int = Int.shl(number(r), 16)
+fun rn(r : Reg) -> Int = number(r) << 5
+fun rm(r : Reg) -> Int = number(r) << 16
 
 fun three(d : Reg, a : Reg, b : Reg) -> Int = rm(b) + rn(a) + rd(d)
 
@@ -312,9 +312,9 @@ fun addSub(op : Int, opposite : Int, n : Int) -> Int =
 -- multiple of 4096 too wide otherwise, which is what the assembler does with
 -- the same operand.
 fun imm12(n : Int) -> Int {
-    if n >= 0 && n <= 4095 { return Int.shl(n, 10) }
-    if n > 4095 && Int.and(n, 4095) == 0 && Int.shr(n, 12) <= 4095 {
-        return 0x400000 + Int.shl(Int.shr(n, 12), 10)
+    if n >= 0 && n <= 4095 { return n << 10 }
+    if n > 4095 && n & 4095 == 0 && n >> 12 <= 4095 {
+        return 0x400000 | (n >> 12) << 10
     }
     unencodable("the add immediate " + Int.toString(n))
 }
@@ -325,15 +325,15 @@ fun imm12(n : Int) -> Int {
 -- case covered: `imms` is the run's length less one, `N` marks 64 bits.
 fun logical(n : Int, w : Width) -> Int {
     var ones = 0
-    while ones < bits(w) && Int.and(Int.shr(n, ones), 1) == 1 { ones = ones + 1 }
-    if ones == 0 || ones == bits(w) || (ones < 63 && Int.shr(n, ones) != 0) {
+    while ones < bits(w) && n >> ones & 1 == 1 { ones = ones + 1 }
+    if ones == 0 || ones == bits(w) || (ones < 63 && n >> ones != 0) {
         unencodable("the logical immediate " + Int.toString(n))
     }
     let big = match w {
         W32 -> 0
         W64 -> 0x400000
     }
-    big + Int.shl(ones - 1, 10)
+    big | (ones - 1) << 10
 }
 
 -- `ubfm` and `sbfm`, whose `N` bit follows the size bit.
@@ -342,15 +342,15 @@ fun bitfield(base : Int, w : Width, d : Reg, a : Reg, immr : Int, imms : Int) ->
         W32 -> 0
         W64 -> 0x80400000
     }
-    base + n + Int.shl(immr, 16) + Int.shl(imms, 10) + rn(a) + rd(d)
+    base | n | immr << 16 | imms << 10 | rn(a) | rd(d)
 }
 
 -- `movz`, `movk` and `movn`: sixteen bits and which quarter they go to.
 fun wide(base : Int, d : Reg, v : Int, shift : Int) -> Int {
-    if v < 0 || v > 0xFFFF || Int.and(shift, 15) != 0 || shift < 0 || shift > 48 {
+    if v < 0 || v > 0xFFFF || shift & 15 != 0 || shift < 0 || shift > 48 {
         unencodable("the wide immediate " + Int.toString(v) + " at " + Int.toString(shift))
     }
-    base + Int.shl(Int.shr(shift, 4), 21) + Int.shl(v, 5) + rd(d)
+    base | (shift >> 4) << 21 | v << 5 | rd(d)
 }
 
 -- A constant as its `movz` and `movk`s, sixteen bits at a time, low half
@@ -358,7 +358,7 @@ fun wide(base : Int, d : Reg, v : Int, shift : Int) -> Int {
 fun constant(out : Vec Int, d : Reg, n : Int) -> Unit {
     var first = True
     for var shift = 0; shift < 64; shift = shift + 16 {
-        let part = Int.and(Int.shr(n, shift), 0xFFFF)
+        let part = n >> shift & 0xFFFF
         if part != 0 {
             word(out, wide(if first { 0xD2800000 } else { 0xF2800000 }, d, part, shift))
             first = False
@@ -404,11 +404,11 @@ fun scale(r : Reg, w : Width) -> Int = match (r, w) {
 -- not, as the assembler chooses for the same operand.
 fun access(op : Access, t : Reg, m : Mem, size : Int) -> Int = match m {
     Offset(base, n) -> {
-        let step = Int.shl(1, size)
-        if n >= 0 && Int.and(n, step - 1) == 0 && Int.shr(n, size) <= 4095 {
-            op.scaled + Int.shl(Int.shr(n, size), 10) + rn(base) + rd(t)
+        let step = 1 << size
+        if n >= 0 && n & (step - 1) == 0 && n >> size <= 4095 {
+            op.scaled | (n >> size) << 10 | rn(base) | rd(t)
         } else if n >= -256 && n <= 255 {
-            op.unscaled + Int.shl(Int.and(n, 0x1FF), 12) + rn(base) + rd(t)
+            op.unscaled | (n & 0x1FF) << 12 | rn(base) | rd(t)
         } else {
             unencodable("the memory offset " + Int.toString(n))
         }
@@ -418,18 +418,17 @@ fun access(op : Access, t : Reg, m : Mem, size : Int) -> Int = match m {
     Scaled(base, index, n) ->
         if n == size { op.indexed + 0x1000 + rm(index) + rn(base) + rd(t) }
         else { unencodable("an index shifted by " + Int.toString(n) + " for a "
-                           + Int.toString(Int.shl(1, size)) + "-byte access") }
+                           + Int.toString(1 << size) + "-byte access") }
     PageOffset(base, _) -> op.scaled + rn(base) + rd(t)
     other -> unencodable("a frame slot before layout: " + show(other))
 }
 
 -- `stp` and `ldp` of two 64-bit registers at a signed offset in words.
 fun pair(base : Int, a : Reg, b : Reg, r : Reg, n : Int) -> Int {
-    if Int.and(n, 7) != 0 || n < -512 || n > 504 {
+    if n & 7 != 0 || n < -512 || n > 504 {
         unencodable("the pair offset " + Int.toString(n))
     }
-    base + Int.shl(Int.and(Int.shr(n, 3), 0x7F), 15) + Int.shl(number(b), 10) + rn(r)
-        + rd(a)
+    base | (n >> 3 & 0x7F) << 15 | number(b) << 10 | rn(r) | rd(a)
 }
 
 -- -- the listing -------------------------------------------------------------
@@ -466,7 +465,7 @@ fun listInstruction(l : Listing, i : Inst, b : String.Builder) -> Unit {
     Vec.clear(l.words)
     encode(i.op, l.words)
     let mask = match fixupOf(i.op) {
-        Some(f) -> Int.xor(fieldMask(f), 0xFFFFFFFF)
+        Some(f) -> fieldMask(f) ^ 0xFFFFFFFF
         None -> 0xFFFFFFFF
     }
     let text = String.join(String.split(show(i), "\n    "), "; ")
@@ -486,7 +485,7 @@ let hexDigits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c"
 fun hex(w : Int) -> String {
     let out = String.builder()
     for var shift = 28; shift >= 0; shift = shift - 4 {
-        String.push(out, hexDigits[Int.and(Int.shr(w, shift), 15)])
+        String.push(out, hexDigits[w >> shift & 15])
     }
     String.build(out)
 }

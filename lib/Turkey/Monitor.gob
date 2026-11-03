@@ -1,0 +1,127 @@
+export (run)
+
+-- The monitor: a thread of its own that takes the permit of a thread blocked
+-- in a C call and hands it to a spare thread (`Turkey.Workers`), so that a
+-- call waiting on something outside the program does not cost the program a
+-- thread that could be running tasks.
+--
+-- A giblet module. The monitor holds no permit, never allocates and never
+-- takes the scheduler's lock, so it can act while every holder is blocked,
+-- in any of those. Its record is registered nowhere, and no collection waits
+-- for it.
+--
+-- **Ticks.** It looks every 20 us. Once it has found nothing to do for 50
+-- ticks, it doubles the wait at each tick, up to 10 ms. These are Go's
+-- `sysmon`'s numbers. While every holder is idle it sleeps until one is not
+-- (`Turkey.Workers.monitorSleep`), so an idle program has no ticks.
+--
+-- **Taking a permit.** A thread seen in the same call on two ticks loses its
+-- permit if there is more to run than the threads free to run it
+-- (`Turkey.Workers.monitorWork`), or once it has been seen in the call for
+-- 10 ms whatever there is to run, so that a holder is there to poll and run
+-- what the poller wakes. "The same call" is the whole state word, whose call
+-- count moves at every call: two short calls on two ticks are two words. So a
+-- call that returns within a tick costs nothing here, and Go's numbers keep
+-- its point: a file read from the page cache is over long before a tick.
+--
+-- The take is the compare-and-swap a collection uses to hold a blocked
+-- thread, so the thread cannot be allocating meanwhile. Holding it, the
+-- monitor gives the thread's cursors back to the heap
+-- (`Turkey.Heap.retireHeld`): each owns a region, and a thread blocked for
+-- long would otherwise keep up to 22 regions from every other. The thread
+-- refills them when it next allocates.
+
+import Prelude ()
+import Data.Int (Int)
+import Data.Tuple (Unit)
+import Data.Eq (Eq(..), (==), (!=))
+import Data.Ord (Ord(..), (<), (<=), (>), (>=))
+import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
+import Data.Int ()
+import Data.Bool (Bool(..))
+import Turkey.Heap as Heap
+import Turkey.Libc as Libc
+import Turkey.Memory as Memory
+import Turkey.Sys as Sys
+import Turkey.Workers as Workers
+
+-- Microseconds.
+let firstDelay : Int = 20
+let longestDelay : Int = 10000
+let idleTicks : Int = 50
+
+-- Nanoseconds a call may go on before its permit is taken with nothing
+-- waiting to run.
+let longCall : Int = 10000000
+
+-- Per thread, by index: the state word the monitor last saw it calling with,
+-- or 0, and when it first saw that word, in nanoseconds. Made when the
+-- monitor starts, since most programs never start it.
+var seen : Prim.Ptr = Prim.ptrNull()
+var since : Prim.Ptr = Prim.ptrNull()
+var clock : Prim.Ptr = Prim.ptrNull()
+
+-- The monitor's thread's Turkey code (`Turkey.Scheduler.workerLoop`), which
+-- returns only if there is no memory for its tables, leaving the program
+-- without a monitor.
+fun run() -> Unit {
+    seen = zeroed(8 * Workers.threadLimit())
+    since = zeroed(8 * Workers.threadLimit())
+    clock = zeroed(16)
+    if Prim.ptrIsNull(seen) || Prim.ptrIsNull(since) || Prim.ptrIsNull(clock) { return {} }
+    var delay = firstDelay
+    var idle = 0
+    while True {
+        if idle == 0 {
+            delay = firstDelay
+        } else if idle > idleTicks && delay < longestDelay {
+            delay = Prim.intMulWrapping(delay, 2)
+            if delay > longestDelay { delay = longestDelay }
+        }
+        let _ = Libc.usleep(delay)
+        var acted = retake(nanoseconds())
+        if Workers.monitorHandOut() { acted = True }
+        if Workers.monitorSleep() { acted = True }
+        idle = if acted { 0 } else { Prim.intAddWrapping(idle, 1) }
+    }
+}
+
+-- Take the permit of each thread that is due to lose it: whether any was.
+fun retake(now : Int) -> Bool {
+    var took = False
+    let n = Workers.count()
+    for var i = 0; i < n; i = Prim.intAddWrapping(i, 1) {
+        let at = Prim.intShl(i, 3)
+        let state = Workers.monitorState(i)
+        if !Workers.monitorCalling(state) {
+            Prim.storeI64(seen, at, 0)
+        } else if Prim.loadI64(seen, at) != state {
+            Prim.storeI64(seen, at, state)
+            Prim.storeI64(since, at, now)
+        } else if Workers.monitorWork() || Prim.intSubWrapping(now, Prim.loadI64(since, at)) >= longCall {
+            if take(i, state) {
+                Prim.storeI64(seen, at, 0)
+                took = True
+            }
+        }
+    }
+    took
+}
+
+fun take(i : Int, state : Int) -> Bool {
+    if !Workers.monitorHold(i, state) { return False }
+    Heap.retireHeld(Workers.recordOf(i))
+    Workers.monitorTake(i, state)
+    True
+}
+
+fun nanoseconds() -> Int {
+    let _ = Libc.clockGettime(Sys.clockMonotonic(), clock)
+    Prim.intAddWrapping(Prim.intMulWrapping(Prim.loadI64(clock, 0), 1000000000), Prim.loadI64(clock, 8))
+}
+
+fun zeroed(bytes : Int) -> Prim.Ptr {
+    let p = Libc.malloc(bytes)
+    if !Prim.ptrIsNull(p) { Memory.fill(p, bytes, 0) }
+    p
+}

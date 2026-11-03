@@ -1,17 +1,19 @@
-export (lock, unlock, ready, wake, changed, waitUntil, yield, start)
+export (lock, unlock, ready, wake, changed, waitUntil, yield, afterCall, start)
 
 -- Which task runs next, and on which worker.
 --
--- A task is a coroutine (`Turkey.Coroutine`), resumed from a worker's own
--- stack: the main worker's, whenever code on the program's stack has to wait,
--- and each other worker's, in `workerLoop`, for as long as the program runs.
+-- A task is a coroutine (`Turkey.Coroutine`), resumed from a thread's own
+-- stack: the program's, whenever code on the program's stack has to wait,
+-- and each other thread's, in `workerLoop`, for as long as the program runs.
 -- Code on a task's stack never resumes another task; when it has to wait it
--- suspends, which returns to the worker that resumed it. So the program's own
+-- suspends, which returns to the thread that resumed it. So the program's own
 -- stack is never a task, and keeps its full size for deep recursion.
 --
--- There is one worker unless `TURKEY_WORKERS` asks for more (`start`). With
--- one, tasks interleave in a fixed order; with more, they run in parallel, and
--- any order is possible.
+-- A thread takes tasks only while it holds a run permit (`Turkey.Workers`).
+-- There is one permit unless `TURKEY_WORKERS` asks for more (`start`). With
+-- one, tasks interleave in a fixed order, unless one blocks in a call long
+-- enough for the monitor to hand the permit to another thread; with more,
+-- they run in parallel, and any order is possible.
 --
 -- Scheduling is cooperative: a task runs until it waits or yields, and one
 -- that computes without doing either holds its worker until it finishes.
@@ -65,6 +67,7 @@ import Turkey.Coroutine as Co
 import Turkey.Heap as Heap
 import Turkey.Libc as Libc
 import Turkey.Lock as Lock
+import Turkey.Monitor as Monitor
 import Turkey.Poll as Poll
 import Turkey.Stack as Stack
 import Turkey.Workers as Workers
@@ -93,6 +96,7 @@ fun unlock() -> Unit = Lock.release(queueLock)
 -- woken for it. Under the lock.
 fun ready(c : Co.Coroutine) -> Unit {
     Vec.push(runnable, c)
+    Workers.queuedSet(len(runnable) - head)
     Workers.signalWork(False)
 }
 
@@ -131,6 +135,7 @@ fun next() -> Option Co.Coroutine {
     let c = runnable[head]
     head = head + 1
     running = running + 1
+    Workers.queuedSet(len(runnable) - head)
     Some(c)
 }
 
@@ -177,6 +182,8 @@ fun waitUntil(done : fun() -> Bool, register : fun(Co.Coroutine) -> Unit) -> Uni
             Co.suspend()
         }
         None -> while True {
+            -- The task this stack ran last may have lost its permit (`afterCall`).
+            if !Workers.permitHeld() { Workers.permitAwait(True) }
             lock()
             if done() {
                 unlock()
@@ -254,6 +261,12 @@ fun poll() -> Unit {
 -- A poller that cannot be had (`pause` answers a negated error number) leaves
 -- a worker that sleeps as it would if nothing were registered.
 fun idle(seen : Int) -> Unit {
+    Workers.idleEnter()
+    wait(seen)
+    Workers.idleLeave()
+}
+
+fun wait(seen : Int) -> Unit {
     lock()
     let timeout = Poll.timeout(Poll.now())
     unlock()
@@ -270,6 +283,17 @@ fun idle(seen : Int) -> Unit {
     settle(n)
     Workers.release()
     if Workers.interest() > 0 { Workers.signalWork(False) }
+}
+
+-- Back from a blocking call (`Turkey.Workers.blockingRead` and the rest),
+-- in which the monitor may have given the thread's permit to another
+-- (`Turkey.Monitor`): if the thread came back without one, give the running
+-- task back to be queued, as `yield` does, and go on in it on whichever
+-- thread takes it. The thread, back in its own loop, parks as a spare
+-- (`workerLoop`). One load when the permit is still there. The program's own
+-- stack waits for a permit in the call instead (`Turkey.Workers.callExit`).
+fun afterCall() -> Unit {
+    if !Workers.permitHeld() { yield() }
 }
 
 -- Let the other runnable tasks run before going on. On a worker's own stack,
@@ -296,21 +320,26 @@ fun yield() -> Unit = match Co.running() {
 
 -- -- workers ----------------------------------------------------------------------------
 
--- Start the workers `TURKEY_WORKERS` asks for, beside the main one, and
--- answer how many there are, the main one included. Each runs `workerLoop` on
--- a thread of its own, entered through `turkey_worker_start`
--- (`Turkey.Emit.emitWorkerStart`), which sets its record in `x28`. Called
--- once, as `System.Task` is initialized.
+-- Start a thread holding a permit for each permit `TURKEY_WORKERS` asks for
+-- beyond the program's own, and the monitor, and answer how many permits
+-- there are. Each thread runs `workerLoop`, entered through
+-- `turkey_worker_start` (`Turkey.Emit.emitWorkerStart`), which sets its
+-- record in `x28`. Called once, as `System.Task` is initialized.
 fun start() -> Int {
     let wanted = workersWanted()
-    for var i = 1; i < wanted; i = i + 1 {
+    Workers.mainRegister()
+    var started = 1
+    while started < wanted {
         let record = Workers.new()
-        if Prim.ptrIsNull(record) { return i }
+        if Prim.ptrIsNull(record) { break }
         let thread = Libc.malloc(8)
         let _ = Libc.pthreadCreate(thread, Prim.ptrNull(),
                                    Prim.codeAddress("turkey_worker_start"), record)
+        started = started + 1
     }
-    wanted
+    Workers.permitsSet(started)
+    let _ = Workers.monitorStart()
+    started
 }
 
 -- `TURKEY_WORKERS`, a decimal count, or else one per core that runs at full
@@ -329,8 +358,7 @@ fun workersWanted() -> Int {
     if n < 1 { 1 } else { n }
 }
 
--- The cores worth a worker each, at most `Turkey.Workers`' limit and at least
--- one. On Darwin the performance cores: an efficiency core is a fraction of
+-- The cores worth a worker each, and at least one. On Darwin the performance cores: an efficiency core is a fraction of
 -- one, and a worker there holds up whatever waits on it -- a parallel map's
 -- last chunk, a collection's mark. A Mac without performance levels says so by
 -- having no `hw.perflevel0`, and has its physical cores counted instead. On
@@ -344,7 +372,7 @@ fun cores() -> Int {
         -- `_SC_NPROCESSORS_ONLN`.
         Linux -> Libc.sysconf(84)
     }
-    if n < 1 { 1 } else if n > 64 { 64 } else { n }
+    if n < 1 { 1 } else { n }
 }
 
 -- A 32-bit `sysctl` value, or 0 if there is none.
@@ -361,11 +389,14 @@ fun sysctlInt(name : Prim.Ptr) -> Int {
     value
 }
 
--- A worker thread's Turkey code: its stack registered, then tasks, until the
--- program ends. It returns only when a panic unwinds it, and then
--- `turkey_worker_start` hands the panic to the main worker
+-- A thread's Turkey code, other than the program's own: the monitor's
+-- (`Turkey.Monitor`), or else the thread's stack registered, then, until the
+-- program ends, a permit and the tasks it lets the thread run, until the
+-- permit is gone. It returns only when a panic unwinds it, and then
+-- `turkey_worker_start` hands the panic to the program's own thread
 -- (`Turkey.Workers.ended`).
 fun workerLoop() -> Unit {
+    if Workers.monitoring() { return Monitor.run() }
     Workers.blockExit()
     -- The bound is the record above this function's, `turkey_worker_start`'s:
     -- a walk scans each frame through the record below it, and stops at the
@@ -374,6 +405,17 @@ fun workerLoop() -> Unit {
         return Prim.error("no memory for a worker's stack record")
     }
     while True {
+        Workers.permitAwait(False)
+        serve()
+    }
+}
+
+-- Run tasks while the running thread holds its permit: until the task it ran
+-- last lost it in a call, or the thread gives it to the program's own stack,
+-- which waits for one.
+fun serve() -> Unit {
+    while Workers.permitHeld() {
+        if Workers.permitWanted() && Workers.permitGive() { return {} }
         -- Before looking, so that a task made runnable after the look still
         -- wakes it (`Turkey.Workers.sleepForWork`).
         let seen = Workers.workSeen()

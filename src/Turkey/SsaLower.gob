@@ -146,7 +146,7 @@ type Lower = Lower {
     -- The layout each abstracted variable stands for, from the binding. What
     -- `Turkey.Layout` gave the copy, and what makes a representation knowable
     -- inside one.
-    var layouts : Map String String,
+    var layouts : Map String Ssa.Layout,
     -- The functions lifted out of *this* top-level binding. Shared by
     -- reference with the nested `Lower`s its lambdas make, and discarded whole
     -- if the binding stops -- a lifted body whose parent did not lower is a
@@ -176,28 +176,15 @@ type Dest
 
 -- -- representations ----------------------------------------------------------------
 
--- The representation a value of this type is held at.
---
--- `Turkey.Layout` already answers this, as the *name* of a layout, because
--- that name goes into a shared copy's name and therefore into the `opt`
--- golden that `test_boot` diffs. So it is not changed to answer a `Rep`; it is
--- read and translated here, which keeps the differential's spelling and this
--- module's type separate on purpose.
---
--- Every name is named, and the last arm is a refusal rather than a traced
--- pointer, which would be a wrong answer for a raw address with no diagnosis:
--- a value the collector follows when it should not is not a type error and not
--- a crash until it collects.
-fun repOfName(name : String) -> Rep = match name {
-    "unit" -> Ssa.untraced(Unit)
-    "i1" -> Ssa.untraced(I1)
-    "i8" -> Ssa.untraced(I8)
-    "i32" -> Ssa.untraced(I32)
-    "i64" -> Ssa.untraced(I64)
-    "f64" -> Ssa.untraced(F64)
-    "addr" -> Ssa.untraced(Ptr)
-    "ptr" -> Ssa.traced(Ptr)
-    _ -> oops("no representation for the layout '" + name + "'")
+-- Returns the one register a value of this layout is held in: its slot, or
+-- `Unit` for a layout with none. Fails on a layout of several slots, which
+-- one `Rep` cannot hold.
+fun repOfLayout(layout : Ssa.Layout) -> Rep = match len(layout.slots) {
+    0 -> Ssa.untraced(Unit)
+    1 -> layout.slots[0]
+    _ -> oops("the layout '" + Ssa.layoutName(layout) + "' has "
+              + Int.toString(len(layout.slots)) + " slots, and a value is held "
+              + "in one register")
 }
 
 -- What a body *holds* a value of this type at, under these layouts.
@@ -211,9 +198,9 @@ fun repOfName(name : String) -> Rep = match name {
 -- Split out of `repOf` because the signature pre-pass asks this before any
 -- `Lower` exists, and asks it under a *different* binding's layouts than the
 -- one being lowered. That is the whole point of `Signature`.
-fun repIn(decls : DeclTable, layouts : Map String String, ty : Ty.Type) -> Rep =
+fun repIn(decls : DeclTable, layouts : Map String Ssa.Layout, ty : Ty.Type) -> Rep =
     match Layout.layoutOf(decls, ty, layouts) {
-        Some(name) -> repOfName(name)
+        Some(layout) -> repOfLayout(layout)
         None -> oops("no layout for the type '" + Ty.show(ty) + "'")
     }
 
@@ -551,7 +538,7 @@ fun lowerBind(bind : CBind, decls : DeclTable, globals : Set.Set String,
 fun newLower(decls : DeclTable, f : Ssa.Func Low, globals : Set.Set String,
              globalRefs : Map String Rep,
              tags : Map String Int,
-             sigs : Map String Signature, layouts : Map String String,
+             sigs : Map String Signature, layouts : Map String Ssa.Layout,
              lifted : Vec (Ssa.Func Low), shared : Lifting) -> Lower = Lower {
     decls = decls, func = f, b = L.builder(f, BlockId(0)),
     env = Map.new(), joins = Map.new(), globals = globals, tags = tags,
@@ -1212,7 +1199,7 @@ fun stop1(l : Lower, message : String) -> Unit {
 }
 
 -- The layouts an arm's opening names, over the ones already in force.
-fun openedLayoutsFor(alt : Alt, outer : Map String String) -> Map String String {
+fun openedLayoutsFor(alt : Alt, outer : Map String Ssa.Layout) -> Map String Ssa.Layout {
     let o = match Core.openingOf(alt) {
         Some(o) -> o
         None -> return outer
@@ -2174,10 +2161,10 @@ fun packed(l : Lower, info : ConInfo, name : String, args : Array Core,
 
 -- A layout's code as a packed value stores it: its position in the fixed list
 -- the arms are copied for, so a code names one layout and nothing else.
-fun keyCode(name : String) -> Int {
+fun keyCode(layout : Ssa.Layout) -> Int {
     var i = 0
-    for layout in Layout.openedLayouts {
-        if layout == name { return i }
+    for opened in Layout.openedLayouts {
+        if opened == layout { return i }
         i = i + 1
     }
     0
@@ -2781,7 +2768,7 @@ fun lowerActions(name : String, actions : Vec Action, decls : DeclTable,
                  globals : Set.Set String, globalRefs : Map String Rep,
                  tags : Map String Int,
                  sigs : Map String Signature, shared : Lifting,
-                 layouts : Map String (Map String String), held : Map String Rep)
+                 layouts : Map String (Map String Ssa.Layout), held : Map String Rep)
         -> (Ssa.Func Low, Array (Ssa.Func Low)) {
     let f = Ssa.newFunc(name, Ssa.untraced(Unit))
     let l = newLower(decls, f, globals, globalRefs, tags, sigs, Map.new(), [], shared)

@@ -100,8 +100,11 @@ A program's tasks (`System.Task`, `System.Parallel`) run on one worker thread
 per performance core -- every core, on a Mac without performance levels or on
 Linux -- and the compiler is such a program: it compiles in parallel, and emits
 the same bytes however many workers it has. `TURKEY_WORKERS=N` sets the number
-of workers; `TURKEY_WORKERS=1` runs tasks interleaved on the program's own
-thread, in a fixed order. The test suite sets it to 1 for everything it runs
+of workers: how many tasks run at once. `TURKEY_WORKERS=1` runs tasks
+interleaved on the program's own thread, in a fixed order, unless a task waits
+long enough in a call that cannot be polled, such as a file read or `flock`:
+then another thread runs the rest meanwhile, as one does beside each worker
+blocked in such a call. The test suite sets it to 1 for everything it runs
 unless a test asks for more, since it runs a process per core already.
 
 The compiler that builds it is `bootstrap/`, which holds its own arm64
@@ -166,8 +169,8 @@ that compile the compiler's own source are most of that.
 
 On an arm64 Linux machine none of that is needed: `cc` links for it and the
 programs run directly. CI does this on GitHub's arm64 runners
-(`.github/workflows/linux.yml`), building from the bootstrap once under gcc and once
-under clang, and running the suite and the fixed point split across jobs by
+(`.github/workflows/linux.yml`), building from the bootstrap under gcc and
+running the suite and the fixed point split across jobs by
 `scripts/ci-shard.sh`.
 
 One group of tests depends on the C compiler, and skips, saying why, where it

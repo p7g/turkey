@@ -82,15 +82,13 @@ def region_probe(tmp_path_factory, verify_object):
 #include <stdlib.h>
 #include <string.h>
 
-/* An object's header and slots, as `Turkey.Alloc` lays them out. A `String`
-   is a byte array: its length is the count and its bytes are the slots. */
-typedef struct TurkeyObject {
-    int32_t kind;
-    int32_t tag;
-    int64_t count;
-    uint64_t descriptor;
-    uint64_t slots[];
-} TurkeyObject;
+/* An array as `Turkey.Alloc` lays it out, which a `String` is: its header,
+   its length and its elements. */
+typedef struct TurkeyArray {
+    uint64_t header;
+    int64_t length;
+    unsigned char elements[];
+} TurkeyArray;
 
 /* The shadow-stack frame `turkey_root_enter` fills in: the previous frame,
    the function's name, the slot count, the slots, and which of the first 64
@@ -110,7 +108,9 @@ int main(void) {
     frame.live = -1;
     unsigned char *bytes = malloc(200000);
     memset(bytes, 'q', 200000);
-    size_t sizes[] = {0, 1, 7, 24, 31, 232, 1024, 32720, 65536, 200000};
+    /* 32752 bytes and a header and a length are the largest object a size
+       class holds, and 32753 the smallest given a region of its own. */
+    size_t sizes[] = {0, 1, 7, 24, 31, 232, 1024, 32752, 32753, 200000};
     for (int cycle = 0; cycle < 4; cycle++) {
         for (int i = 0; i < 1000; i++) {
             int slot = i % 96;
@@ -118,16 +118,13 @@ int main(void) {
             assert(!turkey_has_panicked);
             if (i % 137 == 0) turkey_collect();
             for (int j = 0; j < 96; j++) if (held[j]) {
-                TurkeyObject *s = held[j];
+                TurkeyArray *s = held[j];
                 assert(turkey_heap_contains(s));
                 assert(!turkey_heap_contains((unsigned char *)s + 1));
-                if (s->count)
-                    assert(((unsigned char *)s->slots)[s->count - 1] == 'q');
+                if (s->length) assert(s->elements[s->length - 1] == 'q');
             }
         }
-        turkey_heap_set_mark_epoch(UINT32_MAX);
         turkey_collect();
-        assert(turkey_heap_mark_epoch() == 1);
         assert(turkey_heap_objects() == 96);
         assert(turkey_heap_contains(held[0]));
         void *dead = held[0];
@@ -145,7 +142,7 @@ int main(void) {
         turkey_collect();
         assert(turkey_heap_objects() == 1);
         assert(turkey_heap_region_bytes() == 65536);
-        assert(((unsigned char *)((TurkeyObject *)held[0])->slots)[30] == 'q');
+        assert(((TurkeyArray *)held[0])->elements[30] == 'q');
     }
     turkey_root_leave(&frame);
     turkey_collect();
@@ -194,15 +191,17 @@ def code_probe(tmp_path_factory, allocator_object):
 #include <stdlib.h>
 #include <string.h>
 
-/* An object's header and slots, as `Turkey.Alloc` lays them out. A `String`
-   is a byte array: its length is the count and its bytes are the slots. */
+/* An object as `Turkey.Alloc` lays it out: its header and its fields; and an
+   array: its header, its length and its elements. */
 typedef struct TurkeyObject {
-    int32_t kind;
-    int32_t tag;
-    int64_t count;
-    uint64_t descriptor;
+    uint64_t header;
     uint64_t slots[];
 } TurkeyObject;
+typedef struct TurkeyArray {
+    uint64_t header;
+    int64_t length;
+    uint64_t elements[];
+} TurkeyArray;
 
 /* The shadow-stack frame `turkey_root_enter` fills in: the previous frame,
    the function's name, the slot count, the slots, and which of the first 64
@@ -229,13 +228,13 @@ static int survives(void *holder, void *s) {
 }
 
 static void *array_holding(int32_t code, void *s) {
-    TurkeyObject *a = turkey_array_new(1, 0, 8, code);
-    a->slots[0] = (uint64_t)(uintptr_t)s;
+    TurkeyArray *a = turkey_array_new(1, 0, 8, code);
+    a->elements[0] = (uint64_t)(uintptr_t)s;
     return a;
 }
 
 static void *object_holding(int32_t code, void *s) {
-    /* One word of fields, traced if the descriptor counts it. */
+    /* One word of fields, traced if the header counts it. */
     TurkeyObject *o = turkey_object_new(0, 0, 8, code == 7 ? 1 : 0);
     o->slots[0] = (uint64_t)(uintptr_t)s;
     return o;

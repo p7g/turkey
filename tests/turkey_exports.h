@@ -59,8 +59,6 @@ void *turkey_heap_available(void);
 void *turkey_heap_region_table(void);
 int64_t turkey_heap_region_table_capacity(void);
 int64_t turkey_heap_region_bytes(void);
-int64_t turkey_heap_mark_epoch(void);
-void turkey_heap_set_mark_epoch(int64_t epoch);
 void turkey_heap_set_objects(int64_t count);
 void turkey_heap_set_region_bytes(int64_t bytes);
 void *turkey_heap_state(void);

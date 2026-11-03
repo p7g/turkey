@@ -395,7 +395,7 @@ def test_the_printed_instructions_assemble(name):
 
     Only the instruction lines, and only the ones with no virtual register
     or frame slot left in them -- there is no allocator or frame layout yet,
-    so `mov %3, x0` and `str xzr, [object 0, #-24]` are not something `as`
+    so `mov %3, x0` and `str %4, [object 0, #8]` are not something `as`
     can be asked about. What that leaves is the physical-register traffic
     around calls, which is where the calling convention lives.
     """

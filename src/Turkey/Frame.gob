@@ -100,18 +100,17 @@ fun layout(a : Regalloc.Allocation, frame : Roots.Frame) -> Layout {
     }
     let roots = Roots.slotCount(frame)
     let spills = a.spills.spillSlots
-    -- Each object has a heap header's room in front of it, and selection
-    -- zeroes the header's first word: the generation word, which the write
-    -- barrier reads from a store's target before it knows whether the target
-    -- is in the heap or in a frame. A callee storing through a parameter is
-    -- compiled once for both. Zero reads as young, and a young target needs
-    -- nothing remembered. The collector never reads it: frame objects are
-    -- roots.
+    -- Each object is laid out as it would be in the heap, header included.
+    -- Selection writes the header young: the write barrier reads the
+    -- generation of a store's target before it knows whether the target is
+    -- in the heap or in a frame, since a callee storing through a parameter
+    -- is compiled once for both, and a young target needs nothing
+    -- remembered. The collector never reads it: frame objects are roots.
     let objectStarts = []
     var objectBytes = 0
     for o in frame.objects {
-        Vec.push(objectStarts, objectBytes + objectHeader)
-        objectBytes = objectBytes + objectHeader + o.bytes
+        Vec.push(objectStarts, objectBytes)
+        objectBytes = objectBytes + o.bytes
     }
     let saves = 8 * even(len(savedGp)) + 8 * even(len(savedFp))
     let raw = outgoing + objectBytes + 8 * spills + 8 * roots + saves + 16
@@ -199,9 +198,6 @@ fun inRegister(a : Regalloc.Allocation, id : Int) -> Option Reg {
 }
 
 fun even(n : Int) -> Int = n + n % 2
-
--- A heap header's size, before a frame object's payload.
-let objectHeader : Int = 24
 
 -- The callee-saved registers this function must save, in each file,
 -- ascending: the ones some value was coloured into, and the ones a call in it
@@ -322,12 +318,10 @@ fun checkSlot(out : Vec String, l : Layout, m : Mem, b : Int, n : Int) -> Unit {
     let within = match m {
         RootSlot(i) -> i >= 0 && i < l.roots
         SpillSlot(i) -> i >= 0 && i < l.spills
-        -- The payload, or the header's generation word.
-        ObjectSlot(n, k) -> n >= 0 && n < len(l.objectStarts)
-                            && (k >= 0 || k == -objectHeader)
+        ObjectSlot(n, k) -> n >= 0 && n < len(l.objectStarts) && k >= 0
                             && l.objectStarts[n] + k
                                < (if n + 1 < len(l.objectStarts) {
-                                      l.objectStarts[n + 1] - objectHeader
+                                      l.objectStarts[n + 1]
                                   } else { l.objectBytes })
         OutgoingArg(k) -> k >= 0 && 8 * (k + 1) <= l.outgoing
         IncomingArg(k) -> k >= 0

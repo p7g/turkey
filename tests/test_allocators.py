@@ -19,19 +19,16 @@ def allocator_probe(stats_object, tmp_path_factory):
 #include <assert.h>
 #include <string.h>
 
-/* An object's header and slots, as `Turkey.Alloc` lays them out. A `String`
-   is a byte array: its length is the count and its bytes are the slots. */
-typedef struct TurkeyObject {
-    int32_t kind;
-    int32_t tag;
-    int64_t count;
-    uint64_t descriptor;
-    uint64_t slots[];
-} TurkeyObject;
-static int64_t string_length(void *s) { return ((TurkeyObject *)s)->count; }
-static const unsigned char *string_bytes(void *s) {
-    return (const unsigned char *)((TurkeyObject *)s)->slots;
-}
+/* An object's header, as `Turkey.Alloc` writes it: the generation, the
+   kind, the count -- the traced words the fields start with, an array's
+   element layout code, or a cell's flag -- and the tag. Then the fields; an
+   array's length and elements; or a cell's value. A `String` is a byte
+   array. */
+typedef struct Header { uint8_t generation, kind; uint16_t count; int32_t tag; } Header;
+typedef struct TurkeyObject { Header header; uint64_t slots[]; } TurkeyObject;
+typedef struct TurkeyArray { Header header; int64_t length; unsigned char elements[]; } TurkeyArray;
+static int64_t string_length(void *s) { return ((TurkeyArray *)s)->length; }
+static const unsigned char *string_bytes(void *s) { return ((TurkeyArray *)s)->elements; }
 
 /* The shadow-stack frame `turkey_root_enter` fills in: the previous frame,
    the function's name, the slot count, the slots, and which of the first 64
@@ -43,8 +40,9 @@ typedef struct RootFrame {
     void **values;
     int64_t live;
 } RootFrame;
-/* A cell: its value, and an i32 flag saying whether the value is a pointer. */
-typedef struct TurkeyCell { uint64_t value; int32_t pointer_value; } TurkeyCell;
+/* A cell: its header, whose count is 1 if the value is a pointer, and the
+   value. */
+typedef struct TurkeyCell { Header header; uint64_t value; } TurkeyCell;
 
 static void panic_is(const char *message) {
     assert(turkey_has_panicked);
@@ -58,51 +56,57 @@ int main(void) {
     void *held[32] = {0};
     turkey_root_enter(&frame, held, 32, "allocator probe");
     frame.live = -1;
+    assert(sizeof(Header) == 8);
     assert(sizeof(TurkeyCell) == 16);
-    assert(sizeof(TurkeyObject) == 24);
+    assert(sizeof(TurkeyObject) == 8);
 
     held[0] = turkey_object_new(0, -1, 168, 0);
     TurkeyObject *object = held[0];
-    assert(object->kind == 0 && object->tag == -1 && object->count == 168);
-    assert(object->descriptor == 0);
+    assert(object->header.generation == 0 && object->header.kind == 0);
+    assert(object->header.tag == -1 && object->header.count == 0);
     for (int i = 0; i < 21; i++) assert(object->slots[i] == 0);
     held[1] = turkey_object_new(4, -1, 504, 63);
     object = held[1];
-    assert(object->descriptor == 63);
+    assert(object->header.kind == 4 && object->header.count == 63);
     for (int i = 0; i < 63; i++) assert(object->slots[i] == 0);
     held[2] = turkey_object_new(1, 123, 0, 0);
-    assert(((TurkeyObject *)held[2])->count == 0);
+    object = held[2];
+    assert(object->header.kind == 1 && object->header.tag == 123 && object->header.count == 0);
 
     int slot = 3;
     for (int width = 1; width <= 8; width *= 2) {
         if (width == 2) continue;
+        /* The layout code that gives this width. */
+        int code = width == 1 ? 2 : width == 4 ? 3 : 6;
         for (int filled = 0; filled < 2; filled++) {
             uint64_t bits = filled ? UINT64_C(0xfedcba98deadbeef) : 0;
-            held[slot] = turkey_array_new(3, bits, width, 6);
-            TurkeyObject *array = held[slot++];
-            assert(array->kind == 2 && array->tag == 6 && array->count == 3);
-            assert(array->descriptor == (uint64_t)width);
+            held[slot] = turkey_array_new(3, bits, width, code);
+            TurkeyArray *array = held[slot++];
+            assert(array->header.generation == 0 && array->header.kind == 2);
+            assert(array->header.count == code && array->length == 3);
             for (int i = 0; i < 3; i++) {
                 uint64_t actual = 0;
-                memcpy(&actual, (unsigned char *)array->slots + i * width, width);
+                memcpy(&actual, array->elements + i * width, width);
                 uint64_t mask = width == 8 ? UINT64_MAX : (UINT64_C(1) << (8 * width)) - 1;
                 assert(actual == (bits & mask));
             }
         }
-        held[slot] = turkey_array_new(0, 42, width, 6);
-        assert(((TurkeyObject *)held[slot++])->count == 0);
+        held[slot] = turkey_array_new(0, 42, width, code);
+        assert(((TurkeyArray *)held[slot++])->length == 0);
     }
 
     held[12] = turkey_cell_new((uintptr_t)held[0], 1);
-    assert(((TurkeyCell *)held[12])->value == (uintptr_t)held[0]);
-    assert(((TurkeyCell *)held[12])->pointer_value == 1);
+    TurkeyCell *cell = held[12];
+    assert(cell->header.kind == 5 && cell->header.count == 1);
+    assert(cell->value == (uintptr_t)held[0]);
     held[13] = turkey_cell_new(UINT64_MAX, 0);
-    assert(((TurkeyCell *)held[13])->value == UINT64_MAX);
-    assert(((TurkeyCell *)held[13])->pointer_value == 0);
+    cell = held[13];
+    assert(cell->header.kind == 5 && cell->header.count == 0);
+    assert(cell->value == UINT64_MAX);
     held[15] = turkey_closure_shell(UINT64_C(0xabcdef1234567890));
     object = held[15];
-    assert(object->kind == 3 && object->tag == -1 && object->count == 16);
-    assert(object->descriptor == 1);
+    assert(object->header.kind == 3 && object->header.tag == -1);
+    assert(object->header.count == 1);
     assert(object->slots[0] == 0);
     assert(object->slots[1] == UINT64_C(0xabcdef1234567890));
     unsigned char bytes[] = {'a', 0, 'b'};
@@ -115,8 +119,9 @@ int main(void) {
     held[18] = turkey_array_new(3, (uintptr_t)held[16], 8, 7);
     held[16] = NULL;
     turkey_collect();
-    object = held[18];
-    assert(memcmp(string_bytes((void *)(uintptr_t)object->slots[2]), "a\0b", 3) == 0);
+    uint64_t element = 0;
+    memcpy(&element, ((TurkeyArray *)held[18])->elements + 16, 8);
+    assert(memcmp(string_bytes((void *)(uintptr_t)element), "a\0b", 3) == 0);
     assert(!turkey_has_panicked);
 
     assert(turkey_object_new(0, 0, 12, 0) == NULL);
@@ -127,20 +132,28 @@ int main(void) {
     panic_is("invalid object size");
     assert(turkey_object_new(4, 0, -1, 0) == NULL);
     panic_is("invalid object size");
+    /* The header counts the traced words in 16 bits. */
+    assert(turkey_object_new(1, 0, 8 * 65536, 65536) == NULL);
+    panic_is("invalid object size");
     assert(turkey_array_new(-1, 0, 8, 0) == NULL);
     panic_is("array length cannot be negative");
     assert(turkey_string_new(NULL, -1) == NULL);
     panic_is("array length cannot be negative");
     assert(turkey_array_new(0, 0, 2, 0) == NULL);
     panic_is("invalid array size");
-    assert(turkey_array_new(INT64_C(4611686018427387898), 0, 4, 0) == NULL);
+    /* The layout code is all the header keeps, so it has to give the width. */
+    assert(turkey_array_new(1, 0, 1, 6) == NULL);
     panic_is("invalid array size");
-    assert(turkey_array_new(INT64_C(2305843009213693949), 0, 8, 0) == NULL);
+    assert(turkey_array_new(1, 0, 8, 8) == NULL);
     panic_is("invalid array size");
-    /* Accepted payload sizes still have to leave room for the heap header. */
-    assert(turkey_array_new(INT64_C(4611686018427387897), 0, 4, 0) == NULL);
+    assert(turkey_array_new(INT64_C(4611686018427387900), 0, 4, 3) == NULL);
+    panic_is("invalid array size");
+    assert(turkey_array_new(INT64_C(2305843009213693950), 0, 8, 4) == NULL);
+    panic_is("invalid array size");
+    /* Accepted sizes still have to leave room for a region's own fields. */
+    assert(turkey_array_new(INT64_C(4611686018427387899), 0, 4, 3) == NULL);
     panic_is("allocation is too large");
-    assert(turkey_array_new(INT64_C(2305843009213693948), 0, 8, 0) == NULL);
+    assert(turkey_array_new(INT64_C(2305843009213693949), 0, 8, 4) == NULL);
     panic_is("allocation is too large");
     turkey_root_leave(&frame);
     turkey_collect();

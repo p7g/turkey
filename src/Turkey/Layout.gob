@@ -71,26 +71,29 @@ import Turkey.Decls (DeclTable(..), ConInfo(..))
 import Turkey.Diag as Diag
 import Turkey.Prims as Prims
 import Turkey.Source (Span(..))
+import Turkey.Ssa as Ssa
+import Turkey.Ssa (Layout(..), Rep(..), RepClass(..))
 import Turkey.Opt as Opt
 import Turkey.Typed as Typed
 import Turkey.Types as Ty
 import Turkey.Types (Kind(..), VarCell(..), ConCell(..), TVar, TCon, TApp, TFam,
                      TFun, TTuple, TSet, TBottom)
 
--- The representations, as the strings `CBind.layouts` holds. A name rather
--- than a constructor because that is what a copy's name is built from; there
--- is nothing to compute from one.
-let unit_ = "unit"
-let i1 = "i1"
-let i8 = "i8"
-let i32 = "i32"
-let i64 = "i64"
-let f64 = "f64"
-let ptr = "ptr"
+-- The layouts a type can have. Each is one slot, except `unit_`, which has
+-- none.
+let unit_ = Layout { slots = [] }
+let i1 = one(Ssa.untraced(I1))
+let i8 = one(Ssa.untraced(I8))
+let i32 = one(Ssa.untraced(I32))
+let i64 = one(Ssa.untraced(I64))
+let f64 = one(Ssa.untraced(F64))
+let ptr = one(Ssa.traced(Ptr))
 -- A raw machine address: pointer-shaped, and not traced. It is the one layout
--- a traced pointer cannot stand for, which is why it is spelled rather than
--- folded into `ptr`.
-let addr = "addr"
+-- a traced pointer cannot stand for, which is why it is its own layout rather
+-- than folded into `ptr`.
+let addr = one(Ssa.untraced(Ptr))
+
+fun one(slot : Rep) -> Layout = Layout { slots = [slot] }
 
 -- Every layout a packed variable can have been stored at, in the order an
 -- opened arm is copied for them.
@@ -137,7 +140,7 @@ fun isStar(k : Kind) -> Bool = match Ty.kprune(k) {
 -- no uniform representation to fall back on: a guess would be a value that one
 -- side holds boxed and the other reads raw.
 fun layoutOf(decls : DeclTable, ty : Ty.Type,
-             layouts : Map String String) -> Option String {
+             layouts : Map String Layout) -> Option Layout {
     let t = Ty.prune(ty)
     match t {
         TBottom -> return Some(unit_)
@@ -181,7 +184,7 @@ fun layoutOf(decls : DeclTable, ty : Ty.Type,
 -- A declared type's layout: an enumeration's index at the narrowest width that
 -- holds its largest (`Decls.enumSize`), and anything else a pointer to its
 -- object. One constructor has nothing to hold.
-fun declaredLayout(decls : DeclTable, tycon : String) -> String =
+fun declaredLayout(decls : DeclTable, tycon : String) -> Layout =
     match Decls.enumSize(decls, tycon) {
         Some(n) -> if n == 1 { unit_ } else if n == 2 { i1 }
                    else if n <= 256 { i8 } else { i32 }
@@ -385,7 +388,7 @@ fun closeAtoms(binds : Map String CBind, generic : Set.Set String,
 -- first atom whose layout the caller cannot know.
 fun keyAt(s : Sharer, atoms : Vec Ty.Type, binders : Vec VarCell,
           args : Array Ty.Type, fams : Option Ty.Families,
-          layouts : Map String String) -> Either Ty.Type (Vec String) {
+          layouts : Map String Layout) -> Either Ty.Type (Vec Layout) {
     let mapping = Map.new()
     for var i = 0; i < len(binders) && i < len(args); i = i + 1 {
         Map.put(mapping, binders[i].id, args[i])
@@ -410,7 +413,7 @@ fun keyAt(s : Sharer, atoms : Vec Ty.Type, binders : Vec VarCell,
 -- any fixed layout is correct as long as it is the same everywhere, and `unit`
 -- is the one that neither reads nor traces a word. `own` says whether the
 -- binding's own variables are keyed, as a copy's are, or free, as `main`'s are.
-fun defaultsInto(b : CBind, layouts : Map String String,
+fun defaultsInto(b : CBind, layouts : Map String Layout,
                  own : Bool) -> Unit {
     let bound = Set.new()
     if own { for v in abstractionBinders(b) { Set.add(bound, v.id) } }
@@ -442,7 +445,7 @@ fun bindersInto(e : Core, out : Set.Set Int) -> Unit {
 }
 
 fun freeAtomsInto(ty : Ty.Type, bound : Set.Set Int,
-                  layouts : Map String String) -> Unit {
+                  layouts : Map String Layout) -> Unit {
     let t = Ty.prune(ty)
     if isAtom(t) {
         match t {
@@ -490,7 +493,7 @@ type Sharer = Sharer {
     done    : Map String String,
     -- original -> the copies, in request order.
     made    : Map String (Vec CBind),
-    queue   : Vec (String, String, Vec String),
+    queue   : Vec (String, String, Vec Layout),
     used    : Set.Set String,
     -- The keys of a method's own variables that some call through an unknown
     -- dictionary uses: `keys` as this run was started with, so every dictionary
@@ -502,7 +505,7 @@ type Sharer = Sharer {
 
 -- Class -> method -> layout key -> the key's layouts, one per atom of the
 -- method's own variables.
-type Keys = Map String (Map String (Map String (Vec String)))
+type Keys = Map String (Map String (Map String (Vec Layout)))
 
 -- Where a term is being rewritten.
 --
@@ -515,7 +518,7 @@ type Keys = Map String (Map String (Map String (Vec String)))
 -- `locals` are the generalized bindings in scope, innermost last.
 type Scope = Scope {
     owner  : String,
-    chain  : Array (Map String String),
+    chain  : Array (Map String Layout),
     locals : Vec (Map String Local),
 }
 
@@ -535,7 +538,7 @@ type Local = Local {
     built     : Vec (String, Ty.Type, Core, Vec VarCell, Map Int Ty.Type),
 }
 
-fun current(sc : Scope) -> Map String String = sc.chain[len(sc.chain) - 1]
+fun current(sc : Scope) -> Map String Layout = sc.chain[len(sc.chain) - 1]
 
 fun famsFor(s : Sharer, sc : Scope) -> Option Ty.Families =
     Map.getOr(s.fams, sc.owner, None)
@@ -755,8 +758,8 @@ fun reachable(s : Sharer, rewritten : Map String CBind) -> Set.Set String {
     live
 }
 
-fun request(s : Sharer, name : String, parts : Vec String) -> String {
-    let k = String.join(parts, ",")
+fun request(s : Sharer, name : String, parts : Vec Layout) -> String {
+    let k = Ssa.keyName(parts)
     let slot = name + "|" + k
     match Map.get(s.done, slot) {
         Some(found) -> return found
@@ -774,7 +777,7 @@ fun request(s : Sharer, name : String, parts : Vec String) -> String {
 }
 
 fun build(s : Sharer, made : String, original : String,
-          parts : Vec String) -> CBind {
+          parts : Vec Layout) -> CBind {
     let b = s.binds[original]
     let layouts = Map.new()
     let atoms = s.atoms[original]
@@ -949,7 +952,7 @@ fun dynamicCall(s : Sharer, e : Core, fn : Core, target : Core, index : Int,
         Left(t) -> oopsAt("no layout for '" + Ty.show(t) + "' at a call to the "
                           + "method '" + method + "' from '" + sc.owner + "'", e)
     }
-    let k = String.join(parts, ",")
+    let k = Ssa.keyName(parts)
     let ofClass = Map.getOr(s.asked, cls, Map.new())
     Map.put(s.asked, cls, ofClass)
     let found = Map.getOr(ofClass, method, Map.new())
@@ -1202,7 +1205,7 @@ fun requestLocal(s : Sharer, sc : Scope, local : Local, args : Array Ty.Type,
         Left(t) -> oopsAt("no layout for '" + Ty.show(t) + "' at a use of the "
                           + "local '" + local.name + "' in '" + sc.owner + "'", at)
     }
-    let k = String.join(parts, ",")
+    let k = Ssa.keyName(parts)
     match Map.get(local.done, k) {
         Some(found) -> return found
         None -> {}
@@ -1361,7 +1364,7 @@ fun unknownLayouts(program : CProgram, decls : DeclTable) -> Vec String {
 fun unknownOf(decls : DeclTable, b : CBind) -> Vec String {
     let out = []
     let seen = Set.new()
-    let report = fun(t : Ty.Type, layouts : Map String String) = {
+    let report = fun(t : Ty.Type, layouts : Map String Layout) = {
         match unknownIn(decls, t, layouts) {
             Some(bad) -> {
                 let k = Ty.show(bad)
@@ -1379,7 +1382,7 @@ fun unknownOf(decls : DeclTable, b : CBind) -> Vec String {
 }
 
 fun unknownIn(decls : DeclTable, ty : Ty.Type,
-              layouts : Map String String) -> Option Ty.Type {
+              layouts : Map String Layout) -> Option Ty.Type {
     let t = Ty.prune(ty)
     if !isStar(Ty.kindOf(t)) { return None }
     match layoutOf(decls, t, layouts) {
@@ -1402,8 +1405,8 @@ fun unknownIn(decls : DeclTable, ty : Ty.Type,
     None
 }
 
-fun unknownInto(e : Core, layouts : Map String String,
-                report : fun(Ty.Type, Map String String) -> Unit) -> Unit {
+fun unknownInto(e : Core, layouts : Map String Layout,
+                report : fun(Ty.Type, Map String Layout) -> Unit) -> Unit {
     report(e.ty, layouts)
     match e.kind {
         CMatch(scrutinee, alts) -> {
@@ -1453,10 +1456,10 @@ fun openArms(s : Sharer, e : Core, scrutinee : Core, alts : Vec CAlt,
     for alt in alts {
         match alt.alt {
             ACon(name, fields, Some(o)) -> if Option.isNone(o.layouts) {
-                for k in openingKeys(s, scrutinee, name, o, abstracted) {
+                for parts in openingKeys(s, scrutinee, name, o, abstracted) {
                     let copy = ACon(name, fields, Some(Opening {
                         evidence = o.evidence, skolems = o.skolems,
-                        layouts = Some(String.split(k, ",")),
+                        layouts = Some(parts),
                     }))
                     Vec.push(out, CAlt { alt = copy,
                                            body = rewrite(s, alt.body, inArm(sc, copy)) })
@@ -1474,9 +1477,9 @@ fun openArms(s : Sharer, e : Core, scrutinee : Core, alts : Vec CAlt,
 -- layouts for its constants -- unless the value being opened is a packing
 -- right here, in which case it is the one key that packing stores.
 fun openingKeys(s : Sharer, scrutinee : Core, name : String, o : Opening,
-                abstracted : Map String String) -> Vec String {
+                abstracted : Map String Layout) -> Vec (Vec Layout) {
     match knownKey(s, scrutinee, name, abstracted) {
-        Some(k) -> return [k]
+        Some(parts) -> return [parts]
         None -> {}
     }
     let allowed = match s.packed {
@@ -1484,12 +1487,12 @@ fun openingKeys(s : Sharer, scrutinee : Core, name : String, o : Opening,
         Some(table) -> Some(Map.getOr(table, name, Set.new()))
     }
     let keys = Vec.new(8)
-    for k in keyChoices(len(o.skolems)) {
+    for parts in keyChoices(len(o.skolems)) {
         let take = match allowed {
             None -> True
-            Some(set) -> Set.contains(set, k)
+            Some(set) -> Set.contains(set, Ssa.keyName(parts))
         }
-        if take { Vec.push(keys, k) }
+        if take { Vec.push(keys, parts) }
     }
     keys
 }
@@ -1513,15 +1516,15 @@ fun inArm(sc : Scope, alt : Alt) -> Scope {
             locals = sc.locals }
 }
 
--- Every key of `n` layouts, as the comma-joined strings the copies are named by.
-fun keyChoices(n : Int) -> Vec String {
-    var out = [""]
+-- Every key of `n` layouts drawn from `openedLayouts`, the last layout
+-- varying fastest.
+fun keyChoices(n : Int) -> Vec (Vec Layout) {
+    var out = [Vec.new(0)]
     for var i = 0; i < n; i = i + 1 {
         let next = Vec.new(len(out) * len(openedLayouts))
         for prefix in out {
             for layout in openedLayouts {
-                Vec.push(next, if prefix == "" { layout }
-                                 else { prefix + "," + layout })
+                Vec.push(next, Vec.append(prefix, [layout]))
             }
         }
         out = next
@@ -1533,14 +1536,14 @@ fun keyChoices(n : Int) -> Vec String {
 -- right here -- `match C(d, xs) { C(ys) -> ... }`, which is what an inlined
 -- opener leaves behind.
 fun knownKey(s : Sharer, scrutinee : Core, opened : String,
-             abstracted : Map String String) -> Option String {
+             abstracted : Map String Layout) -> Option (Vec Layout) {
     match scrutinee.kind {
         CApp(fn, args) -> match fn.kind {
             CCon(name) -> {
                 if name != opened { return None }
                 match Decls.con(s.decls, name) {
                     Some(info) -> if len(info.exists) > 0 {
-                        return packedKey(s.decls, info, args, abstracted)
+                        return packedKeyParts(s.decls, info, args, abstracted)
                     }
                     None -> {}
                 }
@@ -1552,22 +1555,20 @@ fun knownKey(s : Sharer, scrutinee : Core, opened : String,
     }
 }
 
--- The layouts one packing stores for its hidden variables, or `None` if they
--- are not knowable here. Matched one way, so no type is changed.
+-- The name of the key `packedKeyParts` finds, or `None` where it finds none.
 fun packedKey(decls : DeclTable, info : ConInfo, args : Array Core,
-              abstracted : Map String String) -> Option String =
-    match packedKeyParts(decls, info, args, abstracted) {
-        Some(parts) -> Some(String.join(parts, ","))
-        None -> None
-    }
+              abstracted : Map String Layout) -> Option String =
+    Option.map(packedKeyParts(decls, info, args, abstracted), Ssa.keyName)
 
 fun declaredFields(info : ConInfo) -> Array Ty.Type = match info.scheme.body {
     TFun(params, _) -> params
     _ -> []
 }
 
+-- The layouts one packing stores for its hidden variables, or `None` if they
+-- are not knowable here. Matched one way, so no type is changed.
 fun packedKeyParts(decls : DeclTable, info : ConInfo, args : Array Core,
-                   abstracted : Map String String) -> Option (Vec String) {
+                   abstracted : Map String Layout) -> Option (Vec Layout) {
     let found = Map.new()
     let declared = declaredFields(info)
     let carried = len(info.scheme.preds)
@@ -1665,7 +1666,7 @@ fun packedLayouts(program : CProgram,
             }
             let keys = match key {
                 Some(one) -> [one]
-                None -> keyChoices(len(existsOf(decls, name)))
+                None -> Vec.map(keyChoices(len(existsOf(decls, name))), Ssa.keyName)
             }
             for one in keys {
                 if !Set.contains(have, one) {
@@ -1684,7 +1685,7 @@ fun existsOf(decls : DeclTable, name : String) -> Vec VarCell =
         None -> []
     }
 
-fun packingsInto(decls : DeclTable, e : Core, abstracted : Map String String,
+fun packingsInto(decls : DeclTable, e : Core, abstracted : Map String Layout,
                  conditions : Vec (String, String),
                  out : Vec (String, Option String,
                               Vec (String, String))) -> Unit {
@@ -1705,7 +1706,7 @@ fun packingsInto(decls : DeclTable, e : Core, abstracted : Map String String,
                                 j = j + 1 {
                                 Map.put(inner, skolemKey(o.skolems[j]), ls[j])
                             }
-                            Vec.push(held, (name, String.join(ls, ",")))
+                            Vec.push(held, (name, Ssa.keyName(ls)))
                         }
                         None -> {}
                     }

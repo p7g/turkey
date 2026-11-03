@@ -67,7 +67,9 @@ def _functions(text: str) -> dict[str, list[str]]:
 
     The assembler directives around a function -- `.globl`, `.p2align`, the
     symbol itself -- are not part of what it does, so they are dropped here and
-    the first line of a body is its first instruction.
+    the first line of a body is its first instruction. A local label is kept:
+    it is `L1:` on Mach-O and `.L1:` on ELF, so a line starting with `.` is a
+    directive only when it does not end in a colon.
     """
     out: dict[str, list[str]] = {}
     current: str | None = None
@@ -76,7 +78,7 @@ def _functions(text: str) -> dict[str, list[str]]:
         if stripped.startswith(".globl "):
             current = stripped[len(".globl "):].strip('"').lstrip("_")
             out[current] = []
-        elif stripped.startswith("."):
+        elif stripped.startswith(".") and not stripped.endswith(":"):
             continue
         elif stripped.startswith('"') and stripped.endswith('":'):
             continue
@@ -407,6 +409,10 @@ def _moves_before(body: list[str], n: int) -> int:
     return count
 
 
+# An unconditional branch to a local label, on Mach-O or on ELF.
+LOCAL_BRANCH = ("b L", "b .L")
+
+
 def _loop_edge_moves(body: list[str]) -> dict[str, int]:
     """The moves on each edge between blocks of a loop, keyed by where they are.
 
@@ -421,13 +427,13 @@ def _loop_edge_moves(body: list[str]) -> dict[str, int]:
     labels = {line[:-1]: n for n, line in enumerate(body) if line.endswith(":")}
     out: dict[str, int] = {}
     for end, line in enumerate(body):
-        if not line.startswith("b L"):
+        if not line.startswith(LOCAL_BRANCH):
             continue
         start = labels.get(line.split()[1], end)
         if start >= end:
             continue
         for n in range(start, end + 1):
-            if body[n].startswith("b L") or (n > start and body[n].endswith(":")):
+            if body[n].startswith(LOCAL_BRANCH) or (n > start and body[n].endswith(":")):
                 out[f"{n}: {body[n]}"] = _moves_before(body, n)
     return out
 

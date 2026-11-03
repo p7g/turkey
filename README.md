@@ -106,6 +106,17 @@ The C functions and runtime it reaches run compiled, through
 `lib/Interpreter/Boundary.gob`, which `scripts/build.sh` checks against what
 `stage2 boundary src/Main.gob` generates from the library.
 
+`build/stages/stage2 repl` is an interactive top level on the same
+interpreter. It reads declarations, `import`s and expressions from standard
+input, one per line, or more while a bracket is open or a line ends in `=`.
+An expression is bound to `it` and printed with `show`, or its type is printed
+where it has no `Show`. A later declaration of a name shadows the earlier one,
+and what was written against the earlier one keeps it. A type error is
+reported and the session goes on; a panic ends it. Each input takes about
+0.6 s, since it checks the library and every earlier input again, twice: once
+in a child `check`, so that a rejected input does not end the session, and
+once to run it.
+
 A program's tasks (`System.Task`, `System.Parallel`) run on one worker thread
 per performance core -- every core, on a Mac without performance levels or on
 Linux -- and the compiler is such a program: it compiles in parallel, and emits

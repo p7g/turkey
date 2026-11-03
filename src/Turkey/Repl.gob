@@ -1,0 +1,423 @@
+export (Loaded(..), run)
+
+-- The interactive top level, `boot repl`, on the Core interpreter
+-- (`Turkey.Interpret`).
+--
+-- **Each input is a module of its own**, written to a directory of the
+-- session's and named so that no program names one: `ReplInput1`,
+-- `ReplInput2`, and so on. An input imports every earlier one with a list
+-- that leaves out each name a later input declared again, so that a name
+-- means its latest declaration: two earlier modules that both declare it
+-- would make it ambiguous, and a module's own declaration shadows what it
+-- imports. An earlier declaration that used a name declared again keeps
+-- the one it was checked against.
+--
+-- **Each input checks the whole program again**: the library and every
+-- input, from the start. Evaluation is not repeated: a global an earlier
+-- program computed keeps its value in the next (`Interpret.prepareAfter`),
+-- which is sound because an earlier input's module never changes.
+--
+-- **A program the front end rejects ends the process**, so an input is
+-- checked first by `boot check` in a child process, whose diagnostics are the
+-- session's, and loaded here only once that passes.
+--
+-- **Kinds of input.** One that starts with a declaration's keyword is
+-- declarations, and one that starts with `import` is imports, which every
+-- later input repeats. Anything else is an expression, bound to `it`: its
+-- value is printed with `show` where its type has `Show` and is not `Unit`,
+-- and its type is printed otherwise. A line that leaves a bracket open, or
+-- ends in `=`, continues on the next.
+--
+-- **Standard input** is read through the interpreted `System.IO.stdin()`, by
+-- a module of the session's (`promptSource`): it is the buffer every input
+-- that reads standard input reads too, so neither takes a line meant for the
+-- other.
+
+import Data.Set as Set
+import System.Env as Env
+import System.File as File
+import System.IO as IO
+import Process
+import Interpreter.Host as Host
+import Interpreter.Value (Value(..))
+import Interpreter.Value as V
+import Turkey.Classes (ClassTable)
+import Turkey.Core (CProgram)
+import Turkey.Decls (DeclTable)
+import Turkey.Interpret as Interpret
+import Turkey.Modules as Modules
+
+-- A program as the front end leaves it, checked and lowered.
+type Loaded = Loaded {
+    core    : CProgram,
+    decls   : DeclTable,
+    classes : ClassTable,
+    modules : Vec Modules.Module,
+    -- The type of a top-level binding, by its qualified name, as its author
+    -- would write it.
+    typeOf  : fun(String) -> Option String,
+}
+
+-- An input the session kept: its module, every name it declares, and those
+-- of them that name both a type and a constructor.
+type Kept = Kept { module_ : String, names : Set.Set String, both : Set.Set String }
+
+type Session = Session {
+    -- What started this process, to run `check` with.
+    self        : String,
+    dir         : String,
+    -- Checks and lowers the program whose entry is at a path. Ends the
+    -- process if the program is rejected.
+    load        : fun(String) -> Loaded,
+    -- How many of the process's arguments are the REPL's own.
+    skipped     : Int,
+    kept        : Vec Kept,
+    -- The text of each `import` input, which every later input repeats.
+    imports     : Vec String,
+    var program : Interpret.Program,
+}
+
+-- What an input is.
+type Kind = Declarations | Imports | Expression
+
+instance Eq Kind {
+    fun eq(a, b) = match (a, b) {
+        (Declarations, Declarations) | (Imports, Imports) | (Expression, Expression) -> True
+        _ -> False
+    }
+}
+
+let promptModule = "ReplPrompt"
+let inputPrefix = "ReplInput"
+let showPrefix = "ReplShow"
+let entryName = "ReplMain.gob"
+
+-- What a diagnostic calls the input it is about.
+let inputFile = "<input>"
+
+let declarationWords = ["fun", "let", "var", "type", "class", "instance", "export"]
+
+let promptSource = "export (next)\n"
+    + "\n"
+    + "import System.IO as IO\n"
+    + "\n"
+    + "fun next() -> Option String = match IO.readLine(IO.stdin()) {\n"
+    + "    Right(line) -> line\n"
+    + "    Left(_) -> None\n"
+    + "}\n"
+
+-- Read inputs from the standard input until it ends, and run each.
+-- `skipped` is how many of the process's arguments are the REPL's own.
+fun run(load : fun(String) -> Loaded, skipped : Int) -> Unit {
+    let dir = match File.temporaryDir("turkey-repl.") {
+        Right(d) -> d
+        Left(e) -> fatal("cannot make a directory for the session: " + show(e))
+    }
+    put(dir, promptModule + ".gob", promptSource)
+    put(dir, entryName, entrySource(0, None))
+    let first = load(dir + "/" + entryName)
+    let s = Session {
+        self = Host.ownPath(), dir = dir, load = load, skipped = skipped, kept = [],
+        imports = [],
+        program = Interpret.prepare(first.core, first.decls, first.classes, skipped),
+    }
+    Interpret.start(s.program)
+    let terminal = Host.standardInputIsTerminal()
+    loop {
+        match readInput(s, terminal) {
+            Some(text) -> if String.trim(text) != "" { step(s, String.trim(text)) }
+            None -> break
+        }
+    }
+    if terminal { print("") }
+    let _ = File.removeTree(dir)
+}
+
+-- The next input, which may run over several lines, or `None` at the end of
+-- the standard input.
+fun readInput(s : Session, terminal : Bool) -> Option String {
+    var text = ""
+    loop {
+        if terminal { write(if text == "" { "> " } else { "| " }) }
+        match readLine(s) {
+            Some(line) -> {
+                text = if text == "" { line } else { text + "\n" + line }
+                if !continues(text) { return Some(text) }
+            }
+            None -> return if text == "" { None } else { Some(text) }
+        }
+    }
+}
+
+fun readLine(s : Session) -> Option String =
+    match Interpret.callGlobal(s.program, promptModule + "#next", []) {
+        VCon(_, fields) -> if len(fields) == 1 { Some(V.text(fields[0])) } else { None }
+        _ -> None
+    }
+
+-- Whether `text` leaves a bracket open or ends in `=`, so that the input
+-- goes on. Brackets in literals and comments do not count.
+fun continues(text : String) -> Bool {
+    var depth = 0
+    var last = ' '
+    var quote = ' '
+    var escaped = False
+    var comment = False
+    var previous = ' '
+    for c in String.codePoints(text) {
+        if comment {
+            if c == '\n' { comment = False }
+        } else if quote != ' ' {
+            if escaped { escaped = False }
+            else if c == '\\' { escaped = True }
+            else if c == quote { quote = ' ' }
+        } else if c == '-' && previous == '-' {
+            comment = True
+            last = ' '
+        } else {
+            match c {
+                '"' -> { quote = c }
+                '(' | '[' | '{' -> { depth = depth + 1 }
+                ')' | ']' | '}' -> { depth = depth - 1 }
+                _ -> {}
+            }
+            if !Char.isSpace(c) { last = c }
+        }
+        previous = c
+    }
+    depth > 0 || last == '='
+}
+
+-- What `text` is, by its first word. `fun` followed by a parenthesis is a
+-- function expression, not a declaration.
+fun kindOf(text : String) -> Kind {
+    var word = ""
+    var next = ' '
+    var ended = False
+    for c in String.codePoints(text) {
+        if !ended && Char.isAsciiAlpha(c) {
+            word = word + Char.toString(c)
+        } else if Char.isSpace(c) {
+            ended = True
+        } else {
+            next = c
+            break
+        }
+    }
+    if word == "import" { Imports }
+    else if word == "fun" && next == '(' { Expression }
+    else if Array.contains(declarationWords, word) { Declarations }
+    else { Expression }
+}
+
+-- -- one input ---------------------------------------------------------------------
+
+fun step(s : Session, text : String) -> Unit {
+    let index = len(s.kept) + 1
+    let name = inputPrefix + Int.toString(index)
+    let kind = kindOf(text)
+    let header = headerOf(s)
+    let headerLines = len(String.split(header, "\n")) - 1
+    let source = match kind {
+        Expression -> header + "let it =\n" + text + "\n"
+        _ -> header + text + "\n"
+    }
+    let offset = match kind {
+        Expression -> headerLines + 1
+        _ -> headerLines
+    }
+    put(s.dir, name + ".gob", source)
+    -- An expression is checked with its value shown first, which fails where
+    -- its type has no `Show`, and then without.
+    var shown = False
+    if kind == Expression {
+        let showName = showPrefix + Int.toString(index)
+        put(s.dir, showName + ".gob", "export (shown)\n\nimport " + name + " (it)\n\n"
+            + "fun shown() -> String = show(it)\n")
+        put(s.dir, entryName, entrySource(index, Some(showName)))
+        shown = checks(s, name, offset, False)
+    }
+    if !shown {
+        put(s.dir, entryName, entrySource(index, None))
+        if !checks(s, name, offset, True) { return }
+    }
+    let loaded = s.load(s.dir + "/" + entryName)
+    s.program = Interpret.prepareAfter(Some(s.program), loaded.core, loaded.decls,
+                                       loaded.classes, s.skipped)
+    Interpret.start(s.program)
+    match kind {
+        Imports -> Vec.push(s.imports, text)
+        _ -> Vec.push(s.kept, keptOf(loaded.modules, name))
+    }
+    if kind == Expression {
+        let ty = Option.unwrapOr(loaded.typeOf(name + "#it"), "?")
+        if ty == "Unit" {
+        } else if !shown {
+            print("it : " + unqualified(s, ty))
+        } else {
+            let showName = showPrefix + Int.toString(index)
+            print(V.text(Interpret.callGlobal(s.program, showName + "#shown", [])))
+        }
+    }
+}
+
+-- What every input begins with: its export list, the earlier inputs, and
+-- the imports the session has been given.
+fun headerOf(s : Session) -> String {
+    let b = String.builder()
+    String.push(b, "export (..)\n")
+    for var k = 0; k < len(s.kept); k = k + 1 {
+        let hidden = []
+        for n in Array.sort(Set.elements(s.kept[k].names)) {
+            var later = False
+            for var j = k + 1; j < len(s.kept); j = j + 1 {
+                if Set.contains(s.kept[j].names, n) { later = True }
+            }
+            if later {
+                Vec.push(hidden, if Set.contains(s.kept[k].both, n) { n + "(" + n + ") as _" }
+                                 else { n + " as _" })
+            }
+        }
+        Vec.push(hidden, "..")
+        String.push(b, "import " + s.kept[k].module_ + " (" + String.join(hidden, ", ") + ")\n")
+    }
+    for text in s.imports { String.push(b, text + "\n") }
+    String.build(b)
+}
+
+-- The entry: every module of the session, and `shown`'s module if there is
+-- one.
+fun entrySource(inputs : Int, shown : Option String) -> String {
+    let b = String.builder()
+    String.push(b, "import " + promptModule + " ()\n")
+    for var i = 1; i <= inputs; i = i + 1 {
+        String.push(b, "import " + inputPrefix + Int.toString(i) + " ()\n")
+    }
+    if let Some(m) = shown { String.push(b, "import " + m + " ()\n") }
+    String.push(b, "fun main() {}\n")
+    String.build(b)
+}
+
+fun keptOf(modules : Vec Modules.Module, name : String) -> Kept {
+    let names = Set.new()
+    let both = Set.new()
+    for m in modules {
+        if m.name == name {
+            for space in Modules.spaces(m.exports) {
+                for n in Map.keys(space) { Set.add(names, n) }
+            }
+            for n in Map.keys(m.exports.types) {
+                if Map.contains(m.exports.cons, n) { Set.add(both, n) }
+            }
+        }
+    }
+    Kept { module_ = name, names = names, both = both }
+}
+
+-- Whether `boot check` accepts the session's entry. Writes its diagnostics
+-- about the input `name` to the standard error, with their lines counted
+-- from the input's first, and every other diagnostic only if `reporting`
+-- and the check failed.
+fun checks(s : Session, name : String, offset : Int, reporting : Bool) -> Bool {
+    let out = match Process.run(Process.command([s.self, "check", s.dir + "/" + entryName]),
+                                None) {
+        Right(o) -> o
+        Left(e) -> fatal("cannot run '" + s.self + " check': " + show(e))
+    }
+    let passed = out.status == Process.Exited(0)
+    if !passed && !reporting { return False }
+    let path = s.dir + "/" + name + ".gob:"
+    let b = String.builder()
+    for line in String.lines(String.fromBytesLossy(out.stderr)) {
+        match String.stripPrefix(line, path) {
+            Some(rest) -> String.push(b, inputFile + ":"
+                                      + unqualified(s, renumbered(rest, offset)) + "\n")
+            None -> if !passed {
+                String.push(b, unqualified(s, String.replace(line, s.dir + "/", "")) + "\n")
+            }
+        }
+    }
+    match out.status {
+        Process.Signaled(n) -> String.push(b, "boot: repl: the check was killed by signal "
+                                           + Int.toString(n) + "\n")
+        _ -> {}
+    }
+    let _ = IO.writeText(IO.stderr(), String.build(b))
+    passed
+}
+
+-- `rest`, the part of a diagnostic after its file, with the line it starts
+-- with moved up by `offset`.
+fun renumbered(rest : String, offset : Int) -> String = match String.splitOnce(rest, ":") {
+    Some((line, after)) -> match Int.parse(line) {
+        Some(n) -> Int.toString(n - offset) + ":" + after
+        None -> rest
+    }
+    None -> rest
+}
+
+-- `text` with each name an input declared, which the front end writes
+-- qualified by the input's module, written as the session knows it: `Box`
+-- for the latest declaration of `Box`, and `Box@1` for the first of several,
+-- once a later input has declared it again.
+fun unqualified(s : Session, text : String) -> String {
+    let cs = []
+    for c in String.codePoints(text) { Vec.push(cs, c) }
+    let prefix = []
+    for c in String.codePoints(inputPrefix) { Vec.push(prefix, c) }
+    let b = String.builder()
+    var i = 0
+    while i < len(cs) {
+        var at = i
+        var matches = True
+        for p in prefix {
+            if at >= len(cs) || cs[at] != p { matches = False }
+            at = at + 1
+        }
+        var index = 0
+        let digitsFrom = at
+        while matches && at < len(cs) && Char.isDigit(cs[at]) {
+            index = index * 10 + (Char.toInt(cs[at]) - Char.toInt('0'))
+            at = at + 1
+        }
+        if !matches || at == digitsFrom || at >= len(cs) || cs[at] != '.' {
+            String.push(b, Char.toString(cs[i]))
+            i = i + 1
+            continue
+        }
+        at = at + 1
+        var name = ""
+        while at < len(cs) && (Char.isAsciiAlphanumeric(cs[at]) || cs[at] == '_') {
+            name = name + Char.toString(cs[at])
+            at = at + 1
+        }
+        String.push(b, name + ordinal(s, index, name))
+        i = at
+    }
+    String.build(b)
+}
+
+-- `@N` when input `index`'s `name` is the `N`th declaration of several, and
+-- a later input declared it again; nothing when it is the latest.
+fun ordinal(s : Session, index : Int, name : String) -> String {
+    var before = 0
+    var later = False
+    for var k = 0; k < len(s.kept); k = k + 1 {
+        if Set.contains(s.kept[k].names, name) {
+            if k + 1 < index { before = before + 1 }
+            if k + 1 > index { later = True }
+        }
+    }
+    if later { "@" + Int.toString(before + 1) } else { "" }
+}
+
+fun put(dir : String, file : String, text : String) -> Unit =
+    match File.writeText(dir + "/" + file, text) {
+        Right(_) -> {}
+        Left(e) -> fatal("cannot write the session's '" + file + "': " + show(e))
+    }
+
+fun fatal(message : String) -> a {
+    let _ = IO.writeText(IO.stderr(), "boot: repl: " + message + "\n")
+    Env.exit(2)
+}

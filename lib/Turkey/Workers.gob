@@ -9,7 +9,8 @@ export (
     monitorHandOut, monitorSleep,
     blockingRead, blockingWrite, blockingPread, blockingPwrite, blockingOpen, blockingClose,
     blockingFstat, blockingOpenat, blockingFstatat, blockingUnlinkat, blockingMkdirat,
-    blockingRenameat, blockingReadlinkat, blockingFlock, blockingReaddir,
+    blockingRenameat, blockingReadlinkat, blockingFlock, blockingReaddir, blockingGetaddrinfo,
+    blockingSleepOn,
     claim, release, wakePoller, interestAdd, interest,
     pollRead, pollWrite, pollReadWrite, pollChild, pollUnlock, pollForget, pollForgetChild,
     pollForgetUnlock, pollWait, pollNow,
@@ -1470,6 +1471,31 @@ foreign "turkey_blocking_readdir" fun blockingReaddir(stream : Prim.Ptr) -> Int 
     let r = if Prim.ptrIsNull(entry) { Prim.intNeg(Sys.errno()) } else { Prim.ptrToInt(entry) }
     callExit()
     r
+}
+
+-- `getaddrinfo` for `node`, with no service, which waits as long as the
+-- slowest name server it asks: the list is stored at word 0 of `out`, and,
+-- when the answer is `EAI_SYSTEM`, `errno` at word 8. The answer is the C
+-- `int` code, sign-extended: 0, or an `EAI_*` code (`Turkey.Sys`).
+foreign "turkey_blocking_getaddrinfo" fun blockingGetaddrinfo(node : Prim.Ptr, hints : Prim.Ptr,
+                                                              out : Prim.Ptr) -> Int {
+    callEnter(Prim.frameAddress())
+    let code = Sys.cInt(Libc.getaddrinfo(node, Prim.ptrNull(), hints, out))
+    if code == Sys.eaiSystem() { Prim.storeI64(out, 8, Sys.errno()) }
+    callExit()
+    code
+}
+
+-- Sleep while the word at `word` holds `value`, for at most `nanoseconds`,
+-- or without limit when it is negative, as a blocking call: so the program's
+-- own stack can wait for a task without running it, while the monitor hands
+-- its permit to a thread that does (`Turkey.Detach`). Returns early as
+-- `Turkey.Lock.wait` does.
+foreign "turkey_blocking_sleep_on" fun blockingSleepOn(word : Prim.Ptr, value : Int,
+                                                       nanoseconds : Int) -> Unit {
+    callEnter(Prim.frameAddress())
+    if nanoseconds < 0 { Lock.wait(word, value) } else { Lock.waitFor(word, value, nanoseconds) }
+    callExit()
 }
 
 -- A worker thread's Turkey code has returned, which it does only when a panic

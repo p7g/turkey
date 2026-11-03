@@ -1,0 +1,385 @@
+export (IP(..), parse, Query(..), system, lookup, lookupsAtOnce)
+
+-- Names to addresses, for `Net`: the address type, its text form, and
+-- lookups through the system's resolver, `getaddrinfo`.
+--
+-- **Only the system's resolver.** It is what reads the system's
+-- configuration: on Darwin the resolvers set per domain (a VPN's, say), and
+-- on Linux the sources nsswitch names besides the hosts file and DNS (`mdns`,
+-- `myhostname`). A resolver of our own would answer differently from every
+-- other program on the machine. An address written as text is the one
+-- exception: `parse` reads it, and it never reaches `getaddrinfo`.
+--
+-- **Bounded, and detachable.** `getaddrinfo` holds its thread until the
+-- slowest name server it asks answers, and cannot be stopped. So lookups in
+-- `getaddrinfo` at once are bounded (`lookups`), and one with a deadline
+-- runs on a helper task (`Turkey.Detach`): at the deadline the caller
+-- returns, and the helper frees the list when it comes. One without a
+-- deadline makes the call itself.
+
+import Turkey.Detach as Detach
+import Turkey.Errors (IOError(..), ErrorKind(..))
+import Turkey.Errors as Errors
+import Turkey.IO as IO
+import Turkey.Libc as Libc
+import Turkey.Memory as Memory
+import Turkey.Scheduler as Scheduler
+import Turkey.Sys as Sys
+import Turkey.Wait as Wait
+import Turkey.Workers as Workers
+
+-- -- addresses -----------------------------------------------------------------------
+
+-- An IPv4 address, as the 32-bit number whose bytes are its four parts, the
+-- first the most significant; or an IPv6 address, as its first and last 64
+-- bits and its scope: the number of the interface a link-local address is
+-- on, or 0.
+type IP = V4(Int) | V6(Int, Int, Int)
+
+instance Eq IP {
+    fun eq(a, b) = match (a, b) {
+        (V4(x), V4(y)) -> x == y
+        (V6(h, l, s), V6(h2, l2, s2)) -> h == h2 && l == l2 && s == s2
+        _ -> False
+    }
+}
+
+-- The address's usual text: dotted decimal for IPv4. For IPv6, RFC 5952's:
+-- lowercase hexadecimal groups without leading zeros, the longest run of two
+-- or more zero groups (the first, of equal runs) written `::`, an
+-- IPv4-mapped address's last 32 bits in dotted decimal, and a scope as `%`
+-- and its number.
+instance Show IP {
+    fun show(ip) = match ip {
+        V4(n) -> dotted(n)
+        V6(high, low, scope) -> {
+            let text = if high == 0 && Prim.intShr(low, 32) == 0xffff {
+                "::ffff:" + dotted(Prim.intAnd(low, 0xFFFF_FFFF))
+            } else {
+                groups(high, low)
+            }
+            if scope == 0 { text } else { text + "%" + Int.toString(scope) }
+        }
+    }
+}
+
+fun dotted(n : Int) -> String {
+    let parts : Vec String = []
+    for var shift = 24; shift >= 0; shift = shift - 8 {
+        Vec.push(parts, Int.toString(Prim.intAnd(Prim.intShr(n, shift), 0xff)))
+    }
+    String.join(parts, ".")
+}
+
+fun groups(high : Int, low : Int) -> String {
+    let g = Array.init(8, fun(i) {
+        let half = if i < 4 { high } else { low }
+        Prim.intAnd(Prim.intShr(half, 48 - 16 * (i % 4)), 0xffff)
+    })
+    -- The longest run of zero groups, if it is two or more.
+    var runAt = -1
+    var runLength = 1
+    var i = 0
+    while i < 8 {
+        var j = i
+        while j < 8 && g[j] == 0 { j = j + 1 }
+        if j - i > runLength {
+            runAt = i
+            runLength = j - i
+        }
+        i = if j > i { j } else { i + 1 }
+    }
+    let text = String.builder()
+    for var k = 0; k < 8; k = k + 1 {
+        if k == runAt {
+            String.push(text, "::")
+            k = k + runLength - 1
+        } else {
+            if k > 0 && k != runAt + runLength { String.push(text, ":") }
+            String.push(text, hex(g[k]))
+        }
+    }
+    String.build(text)
+}
+
+let hexDigits : Array String = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "a", "b", "c", "d", "e", "f"]
+
+fun hex(n : Int) -> String {
+    let text = String.builder()
+    var started = False
+    for var shift = 12; shift >= 0; shift = shift - 4 {
+        let d = Prim.intAnd(Prim.intShr(n, shift), 0xf)
+        if d != 0 || started || shift == 0 {
+            started = True
+            String.push(text, hexDigits[d])
+        }
+    }
+    String.build(text)
+}
+
+-- -- reading an address -------------------------------------------------------------
+
+-- The address `text` writes: four decimal parts from 0 to 255, with no
+-- leading zeros, for IPv4 -- since `010` is 8 to some readers and 10 to
+-- others, it is neither here; or, for IPv6, RFC 4291's eight hexadecimal
+-- groups, with one run of zero groups written `::`, an embedded IPv4 address
+-- as the last two, and a scope as `%` and a decimal number. `None` for
+-- anything else, a scope by interface name included.
+fun parse(text : String) -> Option IP {
+    let b = String.bytesOf(text)
+    match v4(b, 0, len(b)) {
+        Some(n) -> Some(V4(n))
+        None -> v6(b)
+    }
+}
+
+fun byte(b : Prim.Array Byte, i : Int) -> Int = Byte.toInt(b[i])
+
+fun isDigit(c : Int) -> Bool = c >= 48 && c <= 57
+
+-- An IPv4 address in `b[from..to)`, as its number.
+fun v4(b : Prim.Array Byte, from : Int, to : Int) -> Option Int {
+    var n = 0
+    var parts = 0
+    var i = from
+    while i < to && parts < 4 {
+        if parts > 0 {
+            if byte(b, i) != 46 { return None }
+            i = i + 1
+        }
+        let start = i
+        var part = 0
+        while i < to && i - start < 3 && isDigit(byte(b, i)) {
+            part = part * 10 + byte(b, i) - 48
+            i = i + 1
+        }
+        let digits = i - start
+        if digits == 0 || part > 255 || (digits > 1 && byte(b, start) == 48) { return None }
+        n = n * 256 + part
+        parts = parts + 1
+    }
+    if parts == 4 && i == to { Some(n) } else { None }
+}
+
+fun v6(b : Prim.Array Byte) -> Option IP {
+    let n = len(b)
+    var end = 0
+    while end < n && byte(b, end) != 37 { end = end + 1 }
+    var scope = 0
+    if end < n {
+        if end + 1 == n || n - end > 11 { return None }
+        for var i = end + 1; i < n; i = i + 1 {
+            if !isDigit(byte(b, i)) { return None }
+            scope = scope * 10 + byte(b, i) - 48
+        }
+        if scope > 0xFFFF_FFFF { return None }
+    }
+    match v6Groups(b, end) {
+        Some(g) -> Some(V6(pack(g, 0), pack(g, 4), scope))
+        None -> None
+    }
+}
+
+-- The eight groups `b[0..end)` writes.
+fun v6Groups(b : Prim.Array Byte, end : Int) -> Option (Array Int) {
+    let g : Vec Int = []
+    -- Where `::` stands among the groups, or -1.
+    var ellipsis = -1
+    var i = 0
+    if end >= 2 && byte(b, 0) == 58 && byte(b, 1) == 58 {
+        ellipsis = 0
+        i = 2
+    }
+    while i < end {
+        let start = i
+        var group = 0
+        while i < end && i - start < 4 && hexDigit(byte(b, i)) >= 0 {
+            group = group * 16 + hexDigit(byte(b, i))
+            i = i + 1
+        }
+        if i < end && byte(b, i) == 46 {
+            -- An IPv4 address, which ends the text and fills two groups.
+            if len(g) > 6 { return None }
+            match v4(b, start, end) {
+                Some(a) -> {
+                    Vec.push(g, Prim.intShr(a, 16))
+                    Vec.push(g, Prim.intAnd(a, 0xffff))
+                }
+                None -> return None
+            }
+            i = end
+            break
+        }
+        if i == start || len(g) == 8 { return None }
+        Vec.push(g, group)
+        if i == end { break }
+        if byte(b, i) != 58 { return None }
+        i = i + 1
+        if i < end && byte(b, i) == 58 {
+            if ellipsis >= 0 { return None }
+            ellipsis = len(g)
+            i = i + 1
+        } else if i == end {
+            return None
+        }
+    }
+    let count = len(g)
+    if ellipsis < 0 {
+        if count != 8 { return None }
+        return Some(Vec.toArray(g))
+    }
+    -- `::` stands for one zero group at least.
+    if count > 7 { return None }
+    let zeros = 8 - count
+    Some(Array.init(8, fun(k) =
+        if k < ellipsis { g[k] } else if k < ellipsis + zeros { 0 } else { g[k - zeros] }))
+}
+
+fun hexDigit(c : Int) -> Int =
+    if isDigit(c) { c - 48 }
+    else if c >= 97 && c <= 102 { c - 87 }
+    else if c >= 65 && c <= 70 { c - 55 }
+    else { -1 }
+
+-- Four groups from `at`, as 64 bits.
+fun pack(g : Array Int, at : Int) -> Int {
+    var n = 0
+    for var k = at; k < at + 4; k = k + 1 { n = Prim.intOr(Prim.intShl(n, 16), g[k]) }
+    n
+}
+
+-- -- lookups ------------------------------------------------------------------------
+
+-- How a lookup asks: `ask(node, hints, out)` as
+-- `Turkey.Workers.blockingGetaddrinfo`, and `free(list)` as `freeaddrinfo`.
+-- Every lookup is given `system`; a test gives one that blocks for as long as
+-- it likes, or counts what it frees.
+type Query = Query { ask : fun(Prim.Ptr, Prim.Ptr, Prim.Ptr) -> Int, free : fun(Prim.Ptr) -> Unit }
+
+let system : Query = Query {
+    ask = fun(node, hints, out) = Workers.blockingGetaddrinfo(node, hints, out),
+    free = fun(list) = Libc.freeaddrinfo(list),
+}
+
+-- At most this many lookups are in `getaddrinfo` at once; more wait for one
+-- to return. Each holds a thread for as long as it is there, once the
+-- monitor has handed its permit on, and may hold a socket. 128 is an eighth
+-- of the threads a program may have (`Turkey.Workers.threadLimit`), which
+-- leaves the rest to blocked file calls, and half of the 256 descriptors a
+-- process gets by default on macOS, which leaves the rest to the program. A
+-- lookup that the caller left counts until its call returns.
+let lookupsAtOnce : Int = 128
+
+let lookups : Detach.Semaphore = Detach.semaphore(lookupsAtOnce)
+
+-- What `getaddrinfo` answered: its code, the list when the code is 0, and
+-- `errno` when it is `EAI_SYSTEM`.
+type Answer = Answer { code : Int, list : Prim.Ptr, errno : Int }
+
+-- The addresses `host` names, in the order the resolver gives them, each
+-- once; waiting at most until `deadline`, on `Turkey.Wait.now`'s clock, or
+-- without limit when it is -1.
+fun lookup(query : Query, host : String, deadline : Int) -> Either IOError (Array IP) {
+    match parse(host) {
+        Some(ip) -> return Right([ip])
+        None -> {}
+    }
+    let bytes = String.bytesOf(host)
+    for var i = 0; i < len(bytes); i = i + 1 {
+        if byte(bytes, i) == 0 { return Left(failure(host, Other(Sys.einval))) }
+    }
+    let name = IO.cPath(host)
+    if Detach.acquire(lookups, deadline) != 0 { return Left(failure(host, TimedOut)) }
+    let call = fun() {
+        let answer = ask(query, name)
+        Detach.release(lookups)
+        answer
+    }
+    let answered = if deadline < 0 { Right(call()) }
+                   else { Detach.run(call, fun(answer) = discard(query, answer), deadline) }
+    match answered {
+        Left(_) -> Left(failure(host, TimedOut))
+        Right(answer) -> if answer.code != 0 {
+            Left(failure(host, kindOf(answer)))
+        } else {
+            let found = addresses(answer.list)
+            discard(query, answer)
+            Right(found)
+        }
+    }
+}
+
+-- `getaddrinfo` for the NUL-terminated `name`, which this frame keeps alive
+-- until the call has returned.
+fun ask(query : Query, name : Array Byte) -> Answer {
+    let hints = Libc.malloc(Sys.addrinfoBytes)
+    let out = Libc.malloc(16)
+    if Prim.ptrIsNull(hints) || Prim.ptrIsNull(out) {
+        Libc.free(hints)
+        Libc.free(out)
+        return Answer { code = Sys.eaiMemory(), list = Prim.ptrNull(), errno = 0 }
+    }
+    -- Either family, and no flags, so that the answer depends on the name
+    -- and not on which interfaces are up. One socket type, since each
+    -- address comes once per type otherwise.
+    Memory.fill(hints, Sys.addrinfoBytes, 0)
+    Memory.fill(out, 16, 0)
+    Prim.storeI32(hints, Sys.addrinfoSocktypeAt, Prim.charFromInt(Sys.sockStream))
+    let asking = query.ask
+    let code = asking(IO.addressOf(name, 0), hints, out)
+    Scheduler.afterCall()
+    Prim.keepAlive(name)
+    let list = if code == 0 { Prim.loadPtr(out, 0) } else { Prim.ptrNull() }
+    let answer = Answer { code = code, list = list, errno = Prim.loadI64(out, 8) }
+    Libc.free(hints)
+    Libc.free(out)
+    answer
+}
+
+fun discard(query : Query, answer : Answer) -> Unit {
+    if answer.code == 0 {
+        let freeing = query.free
+        freeing(answer.list)
+    }
+}
+
+-- The addresses on `list`, each once, in its order.
+fun addresses(list : Prim.Ptr) -> Array IP {
+    let found : Vec IP = []
+    var at = list
+    while !Prim.ptrIsNull(at) {
+        let family = Prim.charToInt(Prim.loadI32(at, Sys.addrinfoFamilyAt))
+        let sockaddr = Prim.loadPtr(at, Sys.addrinfoAddressAt())
+        let ip = if Prim.ptrIsNull(sockaddr) { None }
+                 else if family == Sys.afInet { Some(V4(bigEndian(sockaddr, 4, 4))) }
+                 else if family == Sys.afInet6() {
+                     let scope = Prim.intAnd(Prim.charToInt(Prim.loadI32(sockaddr, 24)), 0xFFFF_FFFF)
+                     Some(V6(bigEndian(sockaddr, 8, 8), bigEndian(sockaddr, 16, 8), scope))
+                 } else { None }
+        match ip {
+            Some(ip) -> if !Vec.contains(found, ip) { Vec.push(found, ip) }
+            None -> {}
+        }
+        at = Prim.loadPtr(at, Sys.addrinfoNextAt)
+    }
+    Vec.toArray(found)
+}
+
+fun bigEndian(p : Prim.Ptr, at : Int, bytes : Int) -> Int {
+    var n = 0
+    for var k = 0; k < bytes; k = k + 1 {
+        n = Prim.intOr(Prim.intShl(n, 8), Prim.byteToInt(Prim.loadI8(p, at + k)))
+    }
+    n
+}
+
+fun kindOf(answer : Answer) -> ErrorKind {
+    let code = answer.code
+    if code == Sys.eaiNoName() || code == Sys.eaiNoData() { HostNotFound }
+    else if code == Sys.eaiMemory() { Other(Sys.enomem) }
+    else if code == Sys.eaiSystem() && answer.errno != 0 { Errors.kindOf(-answer.errno) }
+    else { Resolver(code) }
+}
+
+fun failure(host : String, kind : ErrorKind) -> IOError =
+    IOError { kind = kind, op = "lookup", path = Some(host) }

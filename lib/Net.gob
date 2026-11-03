@@ -1,0 +1,64 @@
+export (IP(..), lookup, lookupUntil, parse)
+
+-- Names to addresses: what a host name stands for, as the system's resolver
+-- says.
+--
+--     match Net.lookup("example.com", Some(Duration.seconds(5))) {
+--         Right(addresses) -> for a in addresses { print(a) }
+--         Left(e) -> print(e)
+--     }
+--
+-- **The system's resolver.** A lookup asks `getaddrinfo`, as other programs
+-- on the machine do, so it gets their answers: the hosts file, DNS as the
+-- system configures it, and on Linux whatever else nsswitch names. An
+-- address written as text -- `127.0.0.1`, `::1`, `fe80::1%2` -- is read by
+-- `parse` instead, and is its own answer, so it resolves without a network.
+-- So does `localhost`, from the hosts file.
+--
+-- **The answer** is every address the name has, IPv4 and IPv6, each once, in
+-- the order the resolver prefers them, which is the order to try them in.
+-- A name with no address is `Left` with the kind `HostNotFound`; a resolver
+-- that could not answer, `Resolver` with its code, which differs by system;
+-- a name with a NUL byte in it, `Other` with `EINVAL`. The error's `op` is
+-- "lookup" and its path the name.
+--
+-- **The timeout** bounds the whole lookup, waiting for a turn included. When
+-- it passes first the answer is `TimedOut`, at once. The resolver cannot be
+-- stopped, so it goes on to its end, and what it finds is thrown away.
+-- Without a timeout, a lookup waits as long as the slowest name server the
+-- resolver asks.
+--
+-- **Many at once.** A lookup waits without holding a worker, so other tasks
+-- run meanwhile, and lookups from several tasks run at once, up to 128 in
+-- the resolver together; more wait their turn.
+
+import Time.Clock as Clock
+import Time.Deadline (Deadline)
+import Time.Deadline as Deadline
+import Time.Duration (Duration)
+-- For the workers, and the monitor that starts with them, which a lookup
+-- waiting with a deadline needs (`Turkey.Detach`); importing it starts them.
+import System.Task as Task
+import Turkey.Errors (IOError)
+import Turkey.Resolve (IP(..))
+import Turkey.Resolve as Resolve
+
+-- The addresses `host` names, waiting at most `timeout` for them.
+fun lookup(host : String, timeout : Option Duration) -> Either IOError (Array IP) =
+    lookupUntil(host, Option.map(timeout, Deadline.after))
+
+-- `lookup` with a deadline made earlier, so that one limit can cover this and
+-- other steps.
+fun lookupUntil(host : String, deadline : Option Deadline) -> Either IOError (Array IP) {
+    let limit = match deadline {
+        Some(d) -> Clock.nanos(Deadline.reading(d))
+        None -> -1
+    }
+    Resolve.lookup(Resolve.system, host, limit)
+}
+
+-- The address `text` writes, if it writes one: four decimal parts from 0 to
+-- 255 without leading zeros; or eight hexadecimal groups, one run of zero
+-- groups written `::`, perhaps an IPv4 address as the last two, and perhaps
+-- a scope as `%` and a number.
+fun parse(text : String) -> Option IP = Resolve.parse(text)

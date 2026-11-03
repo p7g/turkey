@@ -1,0 +1,209 @@
+export (run, Semaphore, semaphore, acquire, release)
+
+-- Waiting for a C call that cannot be polled, timed or stopped --
+-- `getaddrinfo`, say -- with a deadline: the call runs on a helper task, and
+-- the caller waits for the helper until the deadline. When the deadline comes
+-- first, the caller returns, and the call goes on to its end on the helper,
+-- whose frame keeps every buffer the call was given alive until then.
+--
+-- Nothing stops a call once it has started. A signal would, in some cases,
+-- and is not used: it ends only a call that sleeps interruptibly, which a
+-- local-disk read and `getaddrinfo` do not; one sent just before the call
+-- begins is lost; and a handler without `SA_RESTART` lets every slow system
+-- call in the process fail with `EINTR`, foreign code's included.
+--
+-- **A result nobody takes.** Each call is given the cleanup that undoes its
+-- result -- `freeaddrinfo` for a lookup's list, say, or `close` for a
+-- descriptor. Exactly one of the caller and the helper ends up with the
+-- result (`help` says how), so a result is neither used after its cleanup
+-- nor leaked.
+--
+-- **Who runs the helper.** A task that waits parks, so any thread holding a
+-- permit runs the helper, and at the deadline any one runs the task again.
+-- The program's own stack cannot park: it runs tasks while it waits
+-- (`Turkey.Scheduler.waitUntil`), and if one of them were the helper, it
+-- would be inside the call until the call returned, deadline or not. So it
+-- sleeps instead, as a thread in a blocking call does
+-- (`Turkey.Workers.blockingSleepOn`), and the monitor hands its permit to a
+-- thread that runs the helper. That needs the monitor, which starts with the
+-- workers (`System.Task`): a module that waits here imports that first.
+--
+-- A deadline is a time on `Turkey.Wait.now`'s clock, or -1 for none; one that
+-- has passed already answers `Turkey.Wait.timedOut` without starting
+-- anything.
+
+import Turkey.Coroutine as Co
+import Turkey.Libc as Libc
+import Turkey.Lock as Lock
+import Turkey.Poll as Poll
+import Turkey.Scheduler as Scheduler
+import Turkey.Wait as Wait
+import Turkey.Workers as Workers
+
+-- A helper's call and what becomes of its result: the waiter the caller
+-- waits on, once the helper is queued, and the result, once the caller may
+-- take it.
+type Pending a = Pending { var waiter : Option Poll.Waiter, var value : Option a }
+
+-- The word the program's own stack sleeps on while it waits here; whoever
+-- ends its wait moves it and wakes it. There is one program stack, so one
+-- word.
+var programWord : Prim.Ptr = zeroed()
+
+fun zeroed() -> Prim.Ptr {
+    let word = Libc.malloc(8)
+    Prim.atomicStore(word, 0, 0)
+    word
+}
+
+-- Run `call` on a helper task and wait until `deadline` for its result:
+-- `Right` with it, or `Left(Wait.timedOut)` if the deadline came first, and
+-- then `cleanup` gets the result when the call returns.
+--
+-- `call` makes its C call through one of `Turkey.Workers`' blocking
+-- wrappers, followed by `Turkey.Scheduler.afterCall`, as `Turkey.IO` does,
+-- so that the helper's thread may lose its permit while it waits. `cleanup`
+-- runs on the helper, and may make such calls too.
+fun run(call : fun() -> a, cleanup : fun(a) -> Unit, deadline : Int) -> Either Int a {
+    if passed(deadline) { return Left(Wait.timedOut) }
+    let pending = Pending { waiter = None, value = None }
+    let program = Option.isNone(Co.running())
+    -- Made here rather than under the lock, since a stack is mapped for it.
+    let helper = Co.new(fun() = help(pending, call, cleanup, program))
+    let outcome = await(fun(timer) {
+        let w = Poll.sleeper(timer)
+        pending.waiter = Some(w)
+        Scheduler.ready(helper)
+        w
+    }, deadline)
+    if outcome != 0 { return Left(outcome) }
+    match pending.value {
+        Some(value) -> Right(value)
+        None -> Prim.error("a detached call ended its wait without a result")
+    }
+}
+
+fun help(pending : Pending a, call : fun() -> a, cleanup : fun(a) -> Unit, program : Bool) -> Unit {
+    let value = call()
+    Scheduler.lock()
+    let w = match pending.waiter {
+        Some(w) -> w
+        None -> Prim.error("a helper ran before it was queued")
+    }
+    -- The race between the call's return and the caller's leaving is
+    -- decided here. The waiter leaves `Waiting` once, under the scheduler's
+    -- lock: by this `complete`, or at the deadline (`Turkey.Poll.expire` for
+    -- a task, `timeOut` in `programWait`). If this moved it, the value is
+    -- stored before the lock is let go, and the caller, which reads it only
+    -- once it sees `Ready` under the lock, takes it. If the deadline moved
+    -- it, the caller has left or is leaving without reading `value`, which
+    -- nobody else can reach, so the cleanup here is the only one.
+    let taken = Poll.complete(w, 0)
+    if taken {
+        pending.value = Some(value)
+        ended(program)
+    }
+    Scheduler.unlock()
+    if !taken { cleanup(value) }
+}
+
+-- -- semaphores ---------------------------------------------------------------------
+
+-- A count of units, taken by `acquire` and given back by `release`, which a
+-- task waits for by parking and the program's own stack by sleeping, either
+-- with a deadline. Under the scheduler's lock. Waiters are served in the
+-- order they came; one whose deadline passed is skipped.
+type Semaphore = Semaphore { var free : Int, queue : Vec Queued, var head : Int }
+
+type Queued = Queued { waiter : Poll.Waiter, program : Bool }
+
+fun semaphore(units : Int) -> Semaphore = Semaphore { free = units, queue = [], head = 0 }
+
+-- Take a unit of `s`, waiting until `deadline` for one if none is free: 0,
+-- or `Wait.timedOut`.
+fun acquire(s : Semaphore, deadline : Int) -> Int {
+    if passed(deadline) { return Wait.timedOut }
+    Scheduler.lock()
+    let free = s.free > 0
+    if free { s.free = s.free - 1 }
+    Scheduler.unlock()
+    if free { return 0 }
+    let program = Option.isNone(Co.running())
+    await(fun(timer) {
+        let w = Poll.sleeper(timer)
+        if s.free > 0 {
+            s.free = s.free - 1
+            let _ = Poll.complete(w, 0)
+        } else {
+            Vec.push(s.queue, Queued { waiter = w, program = program })
+        }
+        w
+    }, deadline)
+}
+
+-- Give a unit back to `s`: to the first waiter still waiting, or to the
+-- count.
+fun release(s : Semaphore) -> Unit {
+    Scheduler.lock()
+    var handed = False
+    while !handed && s.head < len(s.queue) {
+        let q = s.queue[s.head]
+        s.head = s.head + 1
+        if Poll.complete(q.waiter, 0) {
+            handed = True
+            ended(q.program)
+        }
+    }
+    if s.head == len(s.queue) && s.head > 0 {
+        Vec.clear(s.queue)
+        s.head = 0
+    }
+    if !handed { s.free = s.free + 1 }
+    Scheduler.unlock()
+}
+
+-- -- waiting ------------------------------------------------------------------------
+
+fun passed(deadline : Int) -> Bool = deadline >= 0 && Wait.now() >= deadline
+
+-- Wait for the waiter `start` makes, under the scheduler's lock, from a
+-- deadline it puts on the poller's heap (-1 for none): its outcome.
+fun await(start : fun(Int) -> Poll.Waiter, deadline : Int) -> Int = match Co.running() {
+    Some(_) -> Wait.park(fun() = start(deadline))
+    None -> programWait(start, deadline)
+}
+
+-- The program's own stack's wait: the waiter has no deadline on the heap,
+-- since no worker could wake this stack for it, and this stack ends it
+-- itself, when its own sleep runs out. A sleep that a wake or the clock cut
+-- short only loops. Back from the sleep, the stack holds a permit again
+-- (`Turkey.Workers.callExit`).
+fun programWait(start : fun(Int) -> Poll.Waiter, deadline : Int) -> Int {
+    Scheduler.lock()
+    let w = start(-1)
+    Scheduler.unlock()
+    while True {
+        -- Read before the look, and moved after the waiter ends, so that an
+        -- end after the look stops the sleep from starting.
+        let seen = Prim.atomicLoad(programWord, 0)
+        Scheduler.lock()
+        let left = if deadline < 0 { -1 } else { deadline - Wait.now() }
+        if !Poll.finished(w) && deadline >= 0 && left <= 0 { let _ = Poll.timeOut(w) }
+        let over = Poll.finished(w)
+        Scheduler.unlock()
+        if over { break }
+        Workers.blockingSleepOn(programWord, seen, left)
+    }
+    Poll.outcome(w)
+}
+
+-- A waiter just ended: wake its task, or the program's own stack. Under the
+-- scheduler's lock.
+fun ended(program : Bool) -> Unit {
+    let tasks = Poll.takeWoken()
+    for c in tasks { Scheduler.wake(c) }
+    if program {
+        let _ = Prim.atomicAdd(programWord, 0, 1)
+        let _ = Lock.wake(programWord)
+    }
+}

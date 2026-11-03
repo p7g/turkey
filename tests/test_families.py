@@ -405,5 +405,5 @@ def test_an_equality_may_not_define_a_family_by_itself():
 
 
 def test_a_context_entry_that_is_neither_form_is_a_parse_error():
-    assert "an equality, as in 'Item c ~ Op'" in fails("fun f[Ord a b](x : a) -> Int = 1")
+    assert "neither a constraint nor an equality" in fails("fun f[Ord a b](x : a) -> Int = 1")
 

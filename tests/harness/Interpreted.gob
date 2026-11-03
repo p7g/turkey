@@ -1,0 +1,175 @@
+export (Skips(..), file, readSkips, judge, entry, rewritten)
+
+-- Every program a case compiles and runs is also run by `boot interpret`,
+-- from the Core it is lowered to, and the two runs must agree: the same exit
+-- status, panic or not, and the same output, stdout then stderr. A panic's
+-- trace lines (`  at ...`) are not compared, since the interpreter prints
+-- none.
+--
+-- The native run is what the interpreted one is compared with, and the
+-- native run is compared with the golden. So where the case passes, the
+-- interpreted run agrees with the golden too; and under `--bless`, where the
+-- golden is what is being rewritten, the comparison still has an answer.
+--
+-- A program the interpreter cannot run is listed in the skip list, `file`,
+-- one per line, `NAME REASON`, where `NAME` is the case's name:
+--
+-- * `ffi`: it calls C or the runtime directly, which only compiled code can;
+--   the interpreter exits 98;
+-- * `stack`: interpreting it needs more stack than the interpreter allows
+--   itself; it exits 99;
+-- * `timing`: the interpreter's slowdown changes what it prints.
+--
+-- A listed case whose interpreted run agrees fails, so that the list is no
+-- longer than it is true. `--bless` rewrites the line of every case it ran:
+-- it lists `ffi` and `stack` from the interpreter's exit status, unlists a
+-- case that agrees, and keeps a `timing` line while the runs disagree. It
+-- never adds a `timing` line, since a disagreement it cannot explain is as
+-- likely a miscompile as a slow interpreter; it refuses the case instead.
+
+import Case (Outcome(..), Finish(..), Ending(..), Observed(..), Interpretation)
+import Case as Case
+import Diff as Diff
+
+-- The skip list's path from the repository root.
+let file = "tests/interpret_skips.txt"
+
+let reasons = ["ffi", "stack", "timing"]
+
+-- The skip list as read: the comment lines it starts with, kept as they are,
+-- and each listed case's reason.
+type Skips = Skips { header : String, listed : Map String String }
+
+-- Returns the skip list in `text`, or why it cannot be read. A line is
+-- `NAME REASON`; a blank line, and anything after a `#`, is ignored.
+fun readSkips(text : String) -> Either String Skips {
+    let header = String.builder()
+    let listed = Map.new()
+    var inHeader = True
+    for line in String.lines(text) {
+        let content = String.trim(Option.fold(String.splitOnce(line, "#"), line, _.0))
+        if String.isEmpty(content) {
+            if inHeader { String.push(header, line + "\n") }
+            continue
+        }
+        inHeader = False
+        let words = String.words(content)
+        if len(words) != 2 { return Left(file + ": '" + line + "' is not 'NAME REASON'") }
+        if !Array.contains(reasons, words[1]) {
+            return Left(file + ": '" + words[1] + "' is not a reason; the reasons are "
+                        + String.join(reasons, ", "))
+        }
+        if Map.contains(listed, words[0]) { return Left(file + ": " + words[0] + " is listed twice") }
+        Map.put(listed, words[0], words[1])
+    }
+    Right(Skips { header = String.build(header), listed })
+}
+
+-- What the interpreter's exit status says it could not do, as a reason.
+fun cannot(i : Interpretation) -> Option String = match i.finish {
+    Returned(98) -> Some("ffi")
+    Returned(99) -> Some("stack")
+    _ -> None
+}
+
+-- Whether the interpreted run `i` agrees with the native run in `observed`.
+fun agrees(observed : Observed, i : Interpretation) -> Bool {
+    let ended = match (observed.ending, i.finish) {
+        (Ran(Returned(a)), Returned(b)) -> a == b
+        (Ran(Panicked(a)), Panicked(b)) -> a == b
+        _ -> False
+    }
+    ended && untraced(Case.printed(observed)) == untraced(i.printed)
+}
+
+fun untraced(text : String) -> String =
+    String.join(Vec.filter(String.split(text, "\n"), \!String.startsWith(_, "  at ")), "\n")
+
+fun ending(f : Finish) -> String = match f {
+    Returned(code) -> "exited " + Int.toString(code)
+    Panicked(code) -> "panicked, exiting " + Int.toString(code)
+    Killed(n) -> "died by signal " + Int.toString(n)
+    Expired -> "ran out of time"
+}
+
+-- Returns what is wrong with the interpreted run `i` of a case whose native
+-- run in `observed` passed, as (outcome, why, diff), or `None` if nothing
+-- is. `listed` is the case's reason in the skip list, if it has one, and
+-- `limit` the longest diff shown, in lines.
+fun judge(listed : Option String, observed : Observed, i : Interpretation, limit : Int)
+    -> Option (Outcome, String, String) {
+    match i.finish {
+        Expired -> return Some((Timeout, "the interpreter ran out of time", ""))
+        Killed(n) -> return Some((CompilerCrash, "the interpreter died by signal " + Int.toString(n), ""))
+        Returned(_) | Panicked(_) -> {}
+    }
+    let diff = Diff.unified(untraced(Case.printed(observed)), untraced(i.printed), limit)
+    let shown = if String.isEmpty(diff) { "native: " + nativeEnding(observed) + "\ninterpreted: "
+                                         + ending(i.finish) + "\n" } else { diff }
+    if agrees(observed, i) {
+        return match listed {
+            None -> None
+            Some(reason) -> Some((Fail, "listed in " + file + " as '" + reason
+                                  + "', but the interpreted run agrees; unlist it", ""))
+        }
+    }
+    match (listed, cannot(i)) {
+        (Some("timing"), _) -> None
+        (Some(reason), Some(found)) ->
+            if reason == found { None }
+            else { Some((Fail, "listed in " + file + " as '" + reason + "', but the interpreter "
+                         + ending(i.finish) + ", which is '" + found + "'", "")) }
+        (Some(reason), None) -> Some((Fail, "listed in " + file + " as '" + reason
+                                      + "', but the interpreted run differs from the native one", shown))
+        (None, Some(found)) -> Some((Fail, "the interpreter cannot run it ('" + found + "'); list it in "
+                                     + file + ", or run --bless", i.printed))
+        (None, None) -> Some((Fail, "the interpreted run differs from the native one", shown))
+    }
+}
+
+fun nativeEnding(observed : Observed) -> String = match observed.ending {
+    Ran(f) -> ending(f)
+    _ -> "did not run"
+}
+
+-- Returns what `--bless` makes the case's line in the skip list, given its
+-- reason there now, if any: `Right(None)` for no line, `Right(Some(reason))`
+-- for that reason, or `Left(why)` if bless must refuse the case.
+fun entry(listed : Option String, observed : Observed, i : Interpretation) -> Either String (Option String) {
+    if agrees(observed, i) { return Right(None) }
+    if let Some(found) = cannot(i) { return Right(Some(found)) }
+    match (i.finish, listed) {
+        (Expired, _) -> Left("the interpreter ran out of time")
+        (Killed(n), _) -> Left("the interpreter died by signal " + Int.toString(n))
+        (_, Some("timing")) -> Right(Some("timing"))
+        _ -> Left("the interpreted run differs from the native one; a miscompile, or, if the "
+                  + "interpreter's slowdown is why, list it in " + file + " as 'timing' by hand")
+    }
+}
+
+-- Returns the skip list `skips` with each case's line as `entries` says,
+-- as (name, what `entry` returned for it), or `None` where nothing changes.
+-- A case not in `entries`, and one whose entry is `Left`, keeps its line.
+fun rewritten(skips : Skips, entries : Array (String, Either String (Option String))) -> Option String {
+    let listed = Map.new()
+    for (name, reason) in Map.entries(skips.listed) { Map.put(listed, name, reason) }
+    var changed = False
+    for (name, e) in entries {
+        match e {
+            Right(Some(reason)) -> if Map.get(listed, name) != Some(reason) {
+                Map.put(listed, name, reason)
+                changed = True
+            }
+            Right(None) -> if Map.contains(listed, name) {
+                let _ = Map.delete(listed, name)
+                changed = True
+            }
+            Left(_) -> {}
+        }
+    }
+    if !changed { return None }
+    let b = String.builder()
+    String.push(b, skips.header)
+    for name in Array.sort(Map.keys(listed)) { String.push(b, name + " " + listed[name] + "\n") }
+    Some(String.build(b))
+}

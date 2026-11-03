@@ -198,6 +198,22 @@ fi
 emit "$out/stage1" "$out/stage2.o"
 link "$out/stage2.o" "$out/stage2"
 
+# The interpreter's table of compiled bindings, lib/Interpreter/Boundary.gob,
+# is generated from the library by `boot boundary` and committed. Regenerated
+# here by the compiler just built, so that a library change which makes it
+# stale, or which interpreted code could not cross (src/Turkey/Hosted.gob
+# says what that is), fails the build rather than an interpreted program.
+step "check lib/Interpreter/Boundary.gob"
+if ! $RUN "$out/stage2" boundary "$SOURCE" > "$out/Boundary.gob"; then
+    echo "build.sh: the library has no interpreter boundary; see above" >&2
+    exit 1
+fi
+if ! cmp -s "$out/Boundary.gob" lib/Interpreter/Boundary.gob; then
+    echo "build.sh: lib/Interpreter/Boundary.gob is stale; regenerate it with" \
+         "'$out/stage2 boundary $SOURCE > $out/Boundary.gob' and copy it over" >&2
+    exit 1
+fi
+
 if [ $fixpoint = 1 ]; then
     emit "$out/stage2" "$out/stage3.o"
     link "$out/stage3.o" "$out/stage3"

@@ -155,6 +155,57 @@ def test_a_blocked_flock_costs_no_running_worker(tmp_path, workers):
     assert out == "locked\n"
 
 
+PRINT = HEADER + SPINNERS + """
+import System.File as File
+
+fun main() {
+    let line = String.repeat("x", 1000)
+    let n = permits()
+    let arrived = Sync.atomicInt(0)
+    let printer = Task.runScope(do {
+        -- First, so that it is the first task a thread takes. The pipe fills
+        -- long before it is done, and its write then waits for the test.
+        let printer = Task.spawn(fun() {
+            for var i = 0; i < 2000; i = i + 1 { print(line) }
+            0
+        })?
+        -- Spinners as `spinners` starts them, which say so in a file: a
+        -- write to the standard error first writes out the standard output.
+        for var i = 0; i < n; i = i + 1 {
+            let _ = Task.spawn(fun() {
+                if Sync.addAndGet(arrived, 1) == n {
+                    let _ = File.writeText(Option.unwrapOr(Env.get("SPUN"), ""), "spun")
+                }
+                var x = 0
+                while Sync.load(arrived) < n { x = (x + 1) % 1000 }
+                x
+            })?
+        }
+        pure(printer)
+    })
+    let _ = Task.join(printer)
+}
+"""
+
+
+@pytest.mark.parametrize("workers", ["1", "2"])
+def test_a_print_blocked_on_a_full_pipe_costs_no_running_worker(tmp_path, workers):
+    # The standard output is written out through a blocking call, so the
+    # spinners finish while the test has read none of it.
+    spun = tmp_path / "spun"
+    process = _start(tmp_path, PRINT, workers, SPUN=str(spun))
+    try:
+        deadline = time.monotonic() + 60
+        while not spun.exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert spun.exists(), "the spinners did not run while the print waited"
+        out, err = process.communicate(timeout=60)
+    finally:
+        process.kill()
+    assert process.returncode == 0, err
+    assert out == ("x" * 1000 + "\n") * 2000
+
+
 MANY = HEADER + SPINNERS + """
 fun churn(n : Int) -> Int {
     let parts : Vec String = []

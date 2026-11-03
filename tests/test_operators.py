@@ -265,6 +265,8 @@ def test_a_built_in_operator_cannot_be_redeclared():
 def test_an_arithmetic_operator_keeps_its_group():
     assert fails("infix Combine (+) = combine") == \
         "'+' is always in the group Addition and cannot be declared in Combine"
+    assert fails("infix Choice (|) = combine") == \
+        "'|' is always in the group BitOr and cannot be declared in Choice"
 
 
 def test_an_arithmetic_operator_may_be_shadowed_in_its_group(capsys):

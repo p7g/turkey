@@ -97,8 +97,9 @@ long each phase took, how the backend's time is spread over functions, and how
 much of the optimizer's work could run in parallel.
 
 A program's tasks (`System.Task`, `System.Parallel`) run on one worker thread
-per performance core -- every core, on a Mac without performance levels or on
-Linux -- and the compiler is such a program: it compiles in parallel, and emits
+per performance core -- every core on a Mac without performance levels; on
+Linux, every CPU the program may run on, or its cgroup's CPU limit where that
+is lower -- and the compiler is such a program: it compiles in parallel, and emits
 the same bytes however many workers it has. `TURKEY_WORKERS=N` sets the number
 of workers: how many tasks run at once. `TURKEY_WORKERS=1` runs tasks
 interleaved on the program's own thread, in a fixed order, unless a task waits

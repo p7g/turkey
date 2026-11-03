@@ -1,0 +1,326 @@
+export (count)
+
+-- How many cores a program has to run tasks on, for the run permits it gets
+-- when `TURKEY_WORKERS` does not say (`Turkey.Scheduler.start`).
+--
+-- Read once, before the workers start, and never again: a limit that changes
+-- while the program runs is not followed.
+--
+-- `Turkey.Scheduler` calls this, so it imports no Prelude, for the reason
+-- that module gives.
+
+import Prelude ()
+import Data.Int (Int)
+import Data.Tuple (Unit)
+import Data.Eq (Eq(..), (==), (!=))
+import Data.Ord (Ord(..), (<), (<=), (>), (>=))
+import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
+import Bits (BitAnd(..), BitOr(..), (&), (|))
+import Data.Bool (Bool(..))
+import Turkey.Libc as Libc
+import Turkey.Memory as Memory
+import Turkey.Sys as Sys
+import Target (OS(..))
+import Target as Target
+
+-- The cores worth a worker each, and at least one.
+fun count() -> Int {
+    let n = match Target.os {
+        Darwin -> darwinCores()
+        Linux -> linuxCores()
+    }
+    if n < 1 { 1 } else { n }
+}
+
+-- -- Darwin -------------------------------------------------------------------------------
+
+-- The performance cores: an efficiency core is a fraction of one, and a worker
+-- there holds up whatever waits on it -- a parallel map's last chunk, a
+-- collection's mark. A Mac without performance levels says so by having no
+-- `hw.perflevel0`, and has its physical cores counted instead.
+fun darwinCores() -> Int {
+    let perf = sysctlInt(Prim.cString("hw.perflevel0.physicalcpu"))
+    if perf > 0 { perf } else { sysctlInt(Prim.cString("hw.physicalcpu")) }
+}
+
+-- A 32-bit `sysctl` value, or 0 if there is none.
+fun sysctlInt(name : Prim.Ptr) -> Int {
+    let buffer = Libc.malloc(16)
+    if Prim.ptrIsNull(buffer) { return 0 }
+    Prim.storeI64(buffer, 0, 0)
+    Prim.storeI64(buffer, 8, 4)
+    let status = Libc.sysctlbyname(name, buffer, Prim.ptrAdd(buffer, 8), Prim.ptrNull(), 0)
+    let value = if status & 0xFFFF_FFFF == 0 {
+        Prim.charToInt(Prim.loadI32(buffer, 0))
+    } else { 0 }
+    Libc.free(buffer)
+    value
+}
+
+-- -- Linux --------------------------------------------------------------------------------
+
+-- The CPUs the program may run on, or its cgroup's CPU limit where that is
+-- lower. Nothing portable says which CPUs are fast, so each counts as one.
+--
+-- The limit is the cgroup v2 `cpu.max` quota over its period, a number of
+-- CPUs that may be fractional. Round it up, and raise it to 2, but never above
+-- the CPUs there are:
+--
+-- * rounding down would leave part of the quota unused in every period;
+--   rounding up lets the program use all of it, at the risk of being
+--   throttled near the end of a busy period;
+-- * one permit allows no parallelism at all, and a limit below 2 is often a
+--   small average for a workload that bursts, which a second permit lets
+--   burst. A single CPU still gets one permit, since a second could only take
+--   turns with the first.
+--
+-- Only the process's own cgroup is read, not its ancestors', so a tighter
+-- limit on a parent is not seen; a container usually cannot see its parents.
+-- Cgroup v1's `cpu.cfs_quota_us` is not read either.
+fun linuxCores() -> Int {
+    let cpus = affinityCount()
+    let limit = cgroupLimit()
+    if limit == 0 { return cpus }
+    let floored = if limit < 2 { 2 } else { limit }
+    if floored < cpus { floored } else { cpus }
+}
+
+-- Bytes in the affinity mask asked for: room for 8192 CPUs. The kernel
+-- rejects a mask smaller than its own CPU count, so a larger machine reads
+-- as having its online CPUs.
+let maskBytes : Int = 1024
+
+-- The CPUs in the running thread's affinity mask, which `taskset` and a
+-- container's cpuset narrow, or the online CPUs if the mask cannot be read.
+-- The workers inherit the mask from the program's thread, so its count is
+-- theirs.
+fun affinityCount() -> Int {
+    let mask = Libc.malloc(maskBytes)
+    if Prim.ptrIsNull(mask) { return onlineCpus() }
+    Memory.fill(mask, maskBytes, 0)
+    var n = 0
+    if Libc.schedGetaffinity(0, maskBytes, mask) & 0xFFFF_FFFF == 0 {
+        var at = 0
+        while at < maskBytes {
+            var bits = Prim.byteToInt(Prim.loadI8(mask, at))
+            while bits != 0 {
+                bits = bits & (bits - 1)
+                n = n + 1
+            }
+            at = at + 1
+        }
+    }
+    Libc.free(mask)
+    if n > 0 { n } else { onlineCpus() }
+}
+
+-- `_SC_NPROCESSORS_ONLN`.
+fun onlineCpus() -> Int = Libc.sysconf(84)
+
+-- The process's cgroup v2 CPU limit, in whole CPUs rounded up, or 0 if it has
+-- none or it cannot be read.
+--
+-- `TURKEY_TEST_CGROUP_ROOT` names a directory to read in place of `/` for
+-- every file this reads, so that a test can give a program any `cpu.max`
+-- without a cgroup of its own.
+--
+-- The cgroup's directory is the cgroup2 mount point (`/proc/self/mountinfo`)
+-- joined to the process's cgroup path (`/proc/self/cgroup`), less the part of
+-- that path above the mount's root. In a container with its own cgroup
+-- namespace the path is `/` and so is the root; without one, the container's
+-- cgroup is mounted as the root, and the path names it too.
+fun cgroupLimit() -> Int {
+    let given = Libc.getenv(Prim.cString("TURKEY_TEST_CGROUP_ROOT"))
+    let root = if Prim.ptrIsNull(given) { Prim.cString("") } else { given }
+    let membership = slurpUnder(root, Prim.cString("/proc/self/cgroup"))
+    if Prim.ptrIsNull(membership) { return 0 }
+    let mounts = slurpUnder(root, Prim.cString("/proc/self/mountinfo"))
+    if Prim.ptrIsNull(mounts) {
+        Libc.free(membership)
+        return 0
+    }
+    -- A v2 membership is the line with hierarchy 0 and no controllers.
+    let path = lineAfter(membership, Prim.cString("0::"))
+    let mountRoot = cgroup2Mount(mounts)
+    var limit = 0
+    if !Prim.ptrIsNull(path) && !Prim.ptrIsNull(mountRoot) {
+        let mount = Prim.ptrAdd(mountRoot, Libc.strlen(mountRoot) + 1)
+        let file = join4(root, mount, below(path, mountRoot), Prim.cString("/cpu.max"))
+        if !Prim.ptrIsNull(file) {
+            let text = slurp(file)
+            if !Prim.ptrIsNull(text) {
+                limit = cpuMaxCpus(text)
+                Libc.free(text)
+            }
+            Libc.free(file)
+        }
+    }
+    Libc.free(mounts)
+    Libc.free(membership)
+    limit
+}
+
+-- `cpu.max`'s quota over its period, rounded up, or 0 for no limit. The file
+-- is the quota and the period in microseconds, or `max` for the quota when
+-- there is no limit: `max 100000`, `150000 100000`.
+fun cpuMaxCpus(text : Prim.Ptr) -> Int {
+    let quota = decimal(text)
+    if quota <= 0 { return 0 }
+    let space = Libc.memchr(text, 32, Libc.strlen(text))
+    if Prim.ptrIsNull(space) { return 0 }
+    let period = decimal(Prim.ptrAdd(space, 1))
+    if period <= 0 { return 0 }
+    (quota + period - 1) / period
+}
+
+-- The decimal number `text` begins with, or -1 if it begins with no digit or
+-- with more than 18, which would not be a limit the kernel sets.
+fun decimal(text : Prim.Ptr) -> Int {
+    var n = 0
+    var at = 0
+    while True {
+        let digit = byteAt(text, at) - 48
+        if digit < 0 || digit > 9 { break }
+        if at == 18 { return -1 }
+        n = n * 10 + digit
+        at = at + 1
+    }
+    if at == 0 { -1 } else { n }
+}
+
+-- The root of the first cgroup2 mount in `mounts`, the text of
+-- `/proc/self/mountinfo`, followed after its NUL by the mount point; or null.
+-- Cuts `mounts` into strings to make them.
+--
+-- A line is space-separated fields: an ID, the parent's ID, the device, the
+-- root, the mount point, the options, any optional fields, `-`, and then the
+-- file system's type. Paths have their spaces escaped, so ` - ` is the
+-- separator wherever it appears.
+fun cgroup2Mount(mounts : Prim.Ptr) -> Prim.Ptr {
+    var line = mounts
+    while byteAt(line, 0) != 0 {
+        let next = cutLine(line)
+        let separator = find(line, Prim.cString(" - "))
+        if !Prim.ptrIsNull(separator) && startsWith(Prim.ptrAdd(separator, 3),
+                                                    Prim.cString("cgroup2 ")) {
+            let mountRoot = cutField(cutField(cutField(line)))
+            let _ = cutField(cutField(mountRoot))
+            return mountRoot
+        }
+        line = next
+    }
+    Prim.ptrNull()
+}
+
+-- `path` with `mountRoot` taken off its front, if it is there as a whole
+-- number of components; else `path`.
+fun below(path : Prim.Ptr, mountRoot : Prim.Ptr) -> Prim.Ptr {
+    let n = Libc.strlen(mountRoot)
+    if n <= 1 || !startsWith(path, mountRoot) { return path }
+    let after = byteAt(path, n)
+    if after == 0 || after == 47 { Prim.ptrAdd(path, n) } else { path }
+}
+
+-- The rest of the first line of `text` that begins with `prefix`, cut off at
+-- its end; or null. Cuts `text` into lines to look.
+fun lineAfter(text : Prim.Ptr, prefix : Prim.Ptr) -> Prim.Ptr {
+    var line = text
+    while byteAt(line, 0) != 0 {
+        let next = cutLine(line)
+        if startsWith(line, prefix) { return Prim.ptrAdd(line, Libc.strlen(prefix)) }
+        line = next
+    }
+    Prim.ptrNull()
+}
+
+-- End the line `line` begins with a NUL in place of its newline, and return
+-- where the next one begins: past the newline, or at the end of the text.
+fun cutLine(line : Prim.Ptr) -> Prim.Ptr = cutAt(line, 10)
+
+-- End the field `field` begins with a NUL in place of the space after it, and
+-- return where the next one begins.
+fun cutField(field : Prim.Ptr) -> Prim.Ptr = cutAt(field, 32)
+
+fun cutAt(text : Prim.Ptr, byte : Int) -> Prim.Ptr {
+    let length = Libc.strlen(text)
+    let at = Libc.memchr(text, byte, length)
+    if Prim.ptrIsNull(at) { return Prim.ptrAdd(text, length) }
+    Prim.storeI8(at, 0, Prim.byteFromInt(0))
+    Prim.ptrAdd(at, 1)
+}
+
+-- Where `needle` first appears in `text`, or null.
+fun find(text : Prim.Ptr, needle : Prim.Ptr) -> Prim.Ptr {
+    var at = text
+    while byteAt(at, 0) != 0 {
+        if startsWith(at, needle) { return at }
+        at = Prim.ptrAdd(at, 1)
+    }
+    Prim.ptrNull()
+}
+
+fun startsWith(text : Prim.Ptr, prefix : Prim.Ptr) -> Bool {
+    var at = 0
+    while byteAt(prefix, at) != 0 {
+        if byteAt(text, at) != byteAt(prefix, at) { return False }
+        at = at + 1
+    }
+    True
+}
+
+fun byteAt(text : Prim.Ptr, at : Int) -> Int = Prim.byteToInt(Prim.loadI8(text, at))
+
+-- `a`, `b`, `c` and `d` one after another, as a string from `malloc`; or null.
+fun join4(a : Prim.Ptr, b : Prim.Ptr, c : Prim.Ptr, d : Prim.Ptr) -> Prim.Ptr {
+    let la = Libc.strlen(a)
+    let lb = Libc.strlen(b)
+    let lc = Libc.strlen(c)
+    let ld = Libc.strlen(d)
+    let joined = Libc.malloc(la + lb + lc + ld + 1)
+    if Prim.ptrIsNull(joined) { return joined }
+    Memory.copy(joined, a, la)
+    Memory.copy(Prim.ptrAdd(joined, la), b, lb)
+    Memory.copy(Prim.ptrAdd(joined, la + lb), c, lc)
+    Memory.copy(Prim.ptrAdd(joined, la + lb + lc), d, ld + 1)
+    joined
+}
+
+-- `slurp` of `root` and `path` joined.
+fun slurpUnder(root : Prim.Ptr, path : Prim.Ptr) -> Prim.Ptr {
+    let file = join4(root, path, Prim.cString(""), Prim.cString(""))
+    if Prim.ptrIsNull(file) { return file }
+    let text = slurp(file)
+    Libc.free(file)
+    text
+}
+
+-- The whole of the file at `path`, as a string from `malloc`; or null if it
+-- cannot be read. The files read here are generated by the kernel, and have no
+-- NUL in them.
+fun slurp(path : Prim.Ptr) -> Prim.Ptr {
+    let fd = Sys.cInt(Libc.open(path, Sys.readOnly | Sys.closeOnExec(), 0))
+    if fd < 0 { return Prim.ptrNull() }
+    var size = 4096
+    var text = Libc.malloc(size)
+    var length = 0
+    while !Prim.ptrIsNull(text) {
+        if length + 1 == size {
+            size = 2 * size
+            let grown = Libc.realloc(text, size)
+            if Prim.ptrIsNull(grown) { Libc.free(text) }
+            text = grown
+        } else {
+            let n = Libc.read(fd, Prim.ptrAdd(text, length), size - 1 - length)
+            if n == 0 { break }
+            if n < 0 {
+                Libc.free(text)
+                text = Prim.ptrNull()
+            } else {
+                length = length + n
+            }
+        }
+    }
+    let _ = Libc.close(fd)
+    if !Prim.ptrIsNull(text) { Prim.storeI8(text, length, Prim.byteFromInt(0)) }
+    text
+}

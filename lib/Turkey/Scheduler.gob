@@ -10,10 +10,10 @@ export (lock, unlock, ready, wake, changed, waitUntil, yield, afterCall, start)
 -- stack is never a task, and keeps its full size for deep recursion.
 --
 -- A thread takes tasks only while it holds a run permit (`Turkey.Workers`).
--- There is one permit unless `TURKEY_WORKERS` asks for more (`start`). With
--- one, tasks interleave in a fixed order, unless one blocks in a call long
--- enough for the monitor to hand the permit to another thread; with more,
--- they run in parallel, and any order is possible.
+-- There is a permit per core (`Turkey.Cores`), unless `TURKEY_WORKERS` says
+-- how many (`start`). With one, tasks interleave in a fixed order, unless one
+-- blocks in a call long enough for the monitor to hand the permit to another
+-- thread; with more, they run in parallel, and any order is possible.
 --
 -- Scheduling is cooperative: a task runs until it waits or yields, and one
 -- that computes without doing either holds its worker until it finishes.
@@ -63,6 +63,7 @@ import Data.Option (Option(..))
 import Data.Option as Option
 import Data.Vec (Vec)
 import Data.Vec as Vec
+import Turkey.Cores as Cores
 import Turkey.Coroutine as Co
 import Turkey.Heap as Heap
 import Turkey.Libc as Libc
@@ -71,8 +72,6 @@ import Turkey.Monitor as Monitor
 import Turkey.Poll as Poll
 import Turkey.Stack as Stack
 import Turkey.Workers as Workers
-import Target (OS(..))
-import Target as Target
 
 -- A coroutine's `waiting` state: neither queued nor parked (running, or
 -- queued to run); parked, until something wakes it; or woken while it was
@@ -347,10 +346,10 @@ fun start() -> Int {
 }
 
 -- `TURKEY_WORKERS`, a decimal count, or else one per core that runs at full
--- speed (`cores`).
+-- speed (`Turkey.Cores`).
 fun workersWanted() -> Int {
     let text = Libc.getenv(Prim.cString("TURKEY_WORKERS"))
-    if Prim.ptrIsNull(text) { return cores() }
+    if Prim.ptrIsNull(text) { return Cores.count() }
     var n = 0
     var at = 0
     while True {
@@ -360,37 +359,6 @@ fun workersWanted() -> Int {
         at = at + 1
     }
     if n < 1 { 1 } else { n }
-}
-
--- The cores worth a worker each, and at least one. On Darwin the performance cores: an efficiency core is a fraction of
--- one, and a worker there holds up whatever waits on it -- a parallel map's
--- last chunk, a collection's mark. A Mac without performance levels says so by
--- having no `hw.perflevel0`, and has its physical cores counted instead. On
--- Linux every online processor, since nothing portable says which are which.
-fun cores() -> Int {
-    let n = match Target.os {
-        Darwin -> {
-            let perf = sysctlInt(Prim.cString("hw.perflevel0.physicalcpu"))
-            if perf > 0 { perf } else { sysctlInt(Prim.cString("hw.physicalcpu")) }
-        }
-        -- `_SC_NPROCESSORS_ONLN`.
-        Linux -> Libc.sysconf(84)
-    }
-    if n < 1 { 1 } else { n }
-}
-
--- A 32-bit `sysctl` value, or 0 if there is none.
-fun sysctlInt(name : Prim.Ptr) -> Int {
-    let buffer = Libc.malloc(16)
-    if Prim.ptrIsNull(buffer) { return 0 }
-    Prim.storeI64(buffer, 0, 0)
-    Prim.storeI64(buffer, 8, 4)
-    let status = Libc.sysctlbyname(name, buffer, Prim.ptrAdd(buffer, 8), Prim.ptrNull(), 0)
-    let value = if status & 0xFFFF_FFFF == 0 {
-        Prim.charToInt(Prim.loadI32(buffer, 0))
-    } else { 0 }
-    Libc.free(buffer)
-    value
 }
 
 -- A thread's Turkey code, other than the program's own: the monitor's

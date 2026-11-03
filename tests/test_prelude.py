@@ -204,6 +204,45 @@ fun main() {
     ]
 
 
+# Counts aloud: `next` prints each element it hands out, so what a consumer
+# pulled is in the output.
+NOISY = """
+type Noisy = Noisy { stop : Int }
+type NoisyCur = NoisyCur { var at : Int }
+
+instance Iterator Noisy {
+    type Item = Int
+    type Cursor = NoisyCur
+
+    fun iter(n) = NoisyCur { at = 0 }
+
+    fun next(n, cur) {
+        if cur.at >= n.stop { return None }
+        let k = cur.at
+        print("next " + show(k))
+        cur.at = k + 1
+        Some(k)
+    }
+}
+"""
+
+
+def test_any_and_find_pull_nothing_past_the_deciding_element(capsys):
+    src = NOISY + """
+fun main() {
+    let xs = Noisy { stop = 10 }
+    print(Iterator.any(xs, _ == 2))
+    print(Iterator.find(xs, _ == 1))
+    print(Iterator.all(xs, _ < 1))
+}
+"""
+    assert output(src, capsys) == [
+        "next 0", "next 1", "next 2", "True",
+        "next 0", "next 1", "Some(1)",
+        "next 0", "next 1", "False",
+    ]
+
+
 def test_nothing_asks_the_container_for_a_length(capsys):
     """An iterator with no end at all is fine, because the loop never counts.
 

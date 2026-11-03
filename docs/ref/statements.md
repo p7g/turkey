@@ -334,7 +334,8 @@ for-in ::= "for" pattern "in" expression block
 `for x in e { B }` runs `B` once for each element of `e`, with `x` bound to
 the element. Any type with an instance of the [`Iterator`](builtins.md#iterator)
 class can be iterated. The library provides instances for arrays, maps, sets,
-and a string's bytes and code points. The loop's type is `Unit`.
+a string's bytes and code points, and ranges of integers. The loop's type is
+`Unit`.
 
 The loop pattern must be [irrefutable](patterns.md#irrefutable-patterns), so it
 can take elements apart but cannot filter them:
@@ -385,6 +386,31 @@ until there is none. It is approximately equivalent to:
 element is a mutable record, `x` refers to the same record the collection
 holds. See [`Iterator`](builtins.md#iterator) for how to make a type iterable.
 
+`Int.range(from, to)` is the integers from `from` up to but not including
+`to`, and is empty when `from` is not less than `to`:
+
+<!-- run -->
+```kotlin
+fun main() {
+    let squares = []
+    for n in Int.range(1, 5) {
+        Vec.push(squares, n * n)
+    }
+    print(squares)
+    for n in Int.range(3, 3) {
+        print(n)
+    }
+}
+```
+
+```text
+[1, 4, 9, 16]
+```
+
+**Coming from Rust:** `Int.range(a, b)` is `a..b`. There is no inclusive
+form, no step and no descending range; count down with
+[`for` with a counter](#for-with-a-counter).
+
 ## `for` with a counter
 
 **Syntax**
@@ -419,6 +445,9 @@ fun main() {
 A variable declared in `init` is visible in the test, the step and the body,
 and not after the loop. Either `init` or `step` may be left out, but both `;`
 are required.
+
+To count up by one, `for i in Int.range(from, to)` says the same with less
+([`for` over a collection](#for-over-a-collection)).
 
 ## `loop`
 

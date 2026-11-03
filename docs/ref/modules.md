@@ -472,7 +472,7 @@ infix Sequence (|>) = pipe
 fun pipe(x, f) = f(x)
 ```
 
-<!-- error: the operator '|>' is not declared; 'Pipe' exports it -->
+<!-- error: the operator '|>' is not imported; 'Pipe' exports it -->
 ```kotlin
 import Pipe
 
@@ -676,7 +676,7 @@ export (label)
 fun label() -> String = "second"
 ```
 
-<!-- error: ambiguous name 'label': 'First.label', 'Second.label' -->
+<!-- error: 'label' is ambiguous: it is imported as 'First.label' and 'Second.label' -->
 ```kotlin
 import First (label)
 import Second (label)
@@ -691,7 +691,7 @@ and then calls `main`, which must be a function of type `fun() -> Unit`
 declared in the entry module. Any other type is an error at `main`'s
 definition:
 
-<!-- error: 'main' is the entry point and must be fun() -> Unit, but this one is fun() -> String -->
+<!-- error: 'main' has type 'fun() -> String', and the entry point must have type 'fun() -> Unit' -->
 ```kotlin
 fun main() = "hello"
 ```

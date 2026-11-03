@@ -25,7 +25,7 @@ import Time.Duration as Duration
 import Time.Stopwatch as Stopwatch
 import Turkey.Diag as Diag
 import Turkey.Source as Source
-import Turkey.Source (Source)
+import Turkey.Source (Source(..))
 import Turkey.Modules as Modules
 import Turkey.Resolve as Resolve
 import Turkey.Desugar as Desugar
@@ -142,7 +142,9 @@ fun main() {
     let building = match Args.next(p) {
         Right(Some(Value("check"))) -> False
         Right(Some(Value("build"))) -> True
-        Right(Some(Value(other))) -> die("unknown command '" + other + "'")
+        Right(Some(Value(other))) -> die("unknown command '" + other
+                                         + "'; the commands are 'check' and "
+                                         + "'build'")
         _ -> usage()
     }
     var output = None
@@ -190,7 +192,8 @@ fun main() {
     } else {
         match (output, format) {
             (None, None) -> None
-            _ -> die("check writes nothing; -o and -f are for build")
+            _ -> die("'boot check' writes no output, so it takes no -o or "
+                     + "-f; use 'boot build' to write one")
         }
     }
     -- One builder for every file, which the dumps are pushed to line by line
@@ -241,8 +244,8 @@ fun openSink(output : Option String, format : Option Format, paths : Vec String,
              dumping : Bool) -> Sink {
     let chosen = match (format, output) {
         (Some(f), _) -> f
-        (None, Some("-")) -> die("-o - needs -f, since there is no extension "
-                                 + "to tell the format from")
+        (None, Some("-")) -> die("-o - has no extension to tell the format "
+                                 + "from; add -f asm or -f obj")
         (None, Some(path)) -> formatOf(path)
         (None, None) -> Executable
     }
@@ -256,15 +259,16 @@ fun openSink(output : Option String, format : Option Format, paths : Vec String,
             -- Dumps go to standard output too, and two things in one stream
             -- can be told apart only by parsing both.
             if dumping {
-                die("--dump writes to standard output, which -o - is "
-                    + "already writing to")
+                die("--dump and the build would both write to standard "
+                    + "output; write the build to a file with -o PATH")
             }
             ToStdout
         }
         Some(path) -> {
             if len(paths) > 1 {
-                die("several files can be built only to standard output, "
-                    + "with -o -")
+                die("-o '" + path + "' can take only one input file, and "
+                    + Int.toString(len(paths)) + " were given; build each "
+                    + "file separately, or write to standard output with -o -")
             }
             match File.create(path, File.Truncate) {
                 Right(out) -> ToFile(out)
@@ -273,7 +277,10 @@ fun openSink(output : Option String, format : Option Format, paths : Vec String,
         }
     }
     if let Object = chosen {
-        if len(paths) > 1 { die("several files cannot be written as one object") }
+        if len(paths) > 1 {
+            die(Int.toString(len(paths)) + " input files cannot be written as "
+                + "one object; build each file separately")
+        }
     }
     Sink { to = to, format = chosen }
 }
@@ -1294,9 +1301,9 @@ fun checkMain(entry : Modules.Module, env : Constraints.Env,
                         let scheme = reduced(classes, binding.scheme)
                         if !isEntryType(scheme) {
                             Diag.fail(Diag.at("type error",
-                                "'main' is the entry point and must be "
-                                + "fun() -> Unit, but this one is "
-                                + Ty.showScheme(scheme), s.span), s.span.file)
+                                "'main' has type '" + Ty.showScheme(scheme)
+                                + "', and the entry point must have type "
+                                + "'fun() -> Unit'", s.span), s.span.file)
                         }
                     }
                 }
@@ -1409,9 +1416,10 @@ fun directoryOf(path : String) -> String {
     String.join(Vec.slice(parts, 0, len(parts) - 1), "/")
 }
 
-fun readOrDie(path : String) -> Source = match Source.read(path) {
-    Some(source) -> source
-    None -> die("cannot read " + path)
+fun readOrDie(path : String) -> Source = match File.readText(path) {
+    Right(text) -> Source { name = path, text = text }
+    Left(Left(_)) -> die("'" + path + "' is not valid UTF-8")
+    Left(Right(e)) -> die(message(e))
 }
 
 fun usage() -> a =

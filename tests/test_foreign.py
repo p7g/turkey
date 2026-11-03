@@ -72,7 +72,7 @@ def test_a_program_may_not_declare_a_foreign_symbol():
     """The containment is the whole of what the compiler offers here."""
     message = fails('foreign "getenv" fun getenv(Prim.Ptr) -> Prim.Ptr\n'
                     "fun main() { }\n")
-    assert "a foreign declaration may only appear in" in message
+    assert "a 'foreign' function without a body can appear only in" in message
 
 
 def test_naming_your_own_module_after_a_listed_one_does_not_let_you_in(tmp_path):
@@ -85,7 +85,7 @@ def test_naming_your_own_module_after_a_listed_one_does_not_let_you_in(tmp_path)
         "Turkey/Libc.gob": "export (f)\n"
                            "import Prelude ()\n"
                            'foreign "system" fun f(Prim.Ptr) -> Int\n'})
-    assert "a foreign declaration may only appear in" in message
+    assert "a 'foreign' function without a body can appear only in" in message
 
 
 def test_a_directory_named_lib_is_not_the_library(tmp_path):
@@ -101,7 +101,7 @@ def test_a_directory_named_lib_is_not_the_library(tmp_path):
     (root / "Main.gob").write_text("import Turkey.Libc as P\nfun main() { }\n",
                                    encoding="utf-8")
     message = fails(root / "Main.gob")
-    assert "a foreign declaration may only appear in" in message
+    assert "a 'foreign' function without a body can appear only in" in message
 
 
 # -- what it may say ---------------------------------------------------------

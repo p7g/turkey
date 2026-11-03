@@ -269,12 +269,13 @@ def test_punctuation_cannot_be_declared(op):
 
 def test_the_target_must_take_two_parameters():
     assert fails("infix Sequence (|>) = f\nfun f(x) = x") == \
-        "the operator '|>' needs a function of two parameters, and 'f' takes 1"
+        "'f' takes 1 parameter, and the operator '|>' must name a function of two"
 
 
 def test_the_target_must_be_a_function():
     assert fails("infix Sequence (|>) = f\nlet f = fun(a, b) = a") == \
-        "the operator '|>' needs a top-level function or class method, and 'f' is neither"
+        ("'f' is neither a top-level function nor a class method, and the "
+         "operator '|>' must name one")
 
 
 def test_the_target_must_exist():

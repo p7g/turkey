@@ -147,25 +147,25 @@ int main(void) {
 
 @pytest.mark.parametrize("body, dependency, message", [
     ('let value : Int = Prim.error("early")\nfun read() -> Int = value',
-     'let base : Int = 0', 'panics with a String'),
+     'let base : Int = 0', "panics with a 'String'"),
     ('let value : Int = helper(2)\n'
      'fun helper(n : Int) -> Int = if n == 0 { Prim.error("early") } '
      'else { helper(n - 1) }\nfun read() -> Int = value',
-     'let base : Int = 0', 'panics with a String'),
+     'let base : Int = 0', "panics with a 'String'"),
     ('let value : Int = helper(2)\n'
      'foreign "probe_early_helper" fun helper(n : Int) -> Int = '
      'if n == 0 { Prim.error("early") } else { helper(n - 1) }\n'
      'fun read() -> Int = value',
-     'let base : Int = 0', 'panics with a String'),
+     'let base : Int = 0', "panics with a 'String'"),
     ('import Turkey.Heap as H\n'
      'let value : Prim.Ptr = H.allocate(32, 0, 0, Prim.frameAddress())\nfun read() -> Int = 0',
-     'let base : Int = 0', 'may not call the collector'),
+     'let base : Int = 0', 'giblet initialization cannot call the collector'),
     ('let (a, b) : (Int, Int) = (1, 2)\nfun read() -> Int = a + b',
      'let base : Int = 0', 'builds a tuple'),
     ('var value : String = "traced"\nfun read() -> Int = 0',
      'let base : Int = 0', 'uses the string literal "traced"'),
     ('var value : Option Int = None\nfun read() -> Int = 0',
-     'let base : Int = 0', 'accesses the later global %nullary'),
+     'let base : Int = 0', "uses a constructor with no fields, such as 'None'"),
 ])
 def test_unsafe_initializers_are_refused(modules, body, dependency, message):
     entry, env = modules(body, dependency)
@@ -176,12 +176,15 @@ def test_unsafe_initializers_are_refused(modules, body, dependency, message):
 
 @pytest.mark.parametrize("dependency, message", [
     ('fun base(n : Int) -> Int = if n == 0 { len([n, n]) } '
-     'else { base(n - 1) }', 'may allocate'),
+     'else { base(n - 1) }',
+     "giblet initialization calls 'base'"),
     ('foreign "getpid" fun pid() -> Int\nlet later : Int = pid()\n'
      'fun base(n : Int) -> Int = if n == 0 { later } '
-     'else { base(n - 1) }', 'accesses the later global'),
+     'else { base(n - 1) }',
+     'and giblet initialization can use only the globals of giblet modules'),
     ('fun base(n : Int) -> Int = if n == 0 { Prim.error("early") } '
-     'else { base(n - 1) }', 'uses a string literal before interning'),
+     'else { base(n - 1) }',
+     'uses a string literal, and giblet initialization cannot'),
 ])
 def test_early_helpers_cannot_reach_the_late_runtime(modules, dependency, message):
     entry, env = modules('let value : Int = D.base(2)\n'

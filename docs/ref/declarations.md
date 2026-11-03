@@ -654,7 +654,7 @@ another declaration of the same symbol. These are as the standard library
 would write them; in an application module they are refused like any other
 declaration:
 
-<!-- error: a foreign declaration may only appear in -->
+<!-- error: a 'foreign' function without a body can appear only in -->
 ```kotlin
 foreign "open" fun openCreate(path : Prim.Ptr, flags : Int, ... mode : Int) -> Int
 foreign "fcntl" fun fcntlGet(fd : Int, command : Int) -> Int
@@ -666,7 +666,7 @@ The trailing arguments count against the same limits as the others. Only a
 declaration can be variadic; a definition cannot, since its body would have
 no way to read them.
 
-<!-- error: may only appear in a giblet module -->
+<!-- error: can appear only in a giblet module -->
 ```kotlin
 foreign "application_callback" fun callback(x : Int) -> Int = x
 fun main() { }

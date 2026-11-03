@@ -197,22 +197,22 @@ CALLEE_SAVED = {f"x{n}" for n in range(19, 28)}
 
 
 def test_a_zero_read_after_a_call_is_computed_again():
-    """A zero defined before a call and read after it is not kept across it.
+    """A zero evicted across a call is computed again, not kept in a slot.
 
     `Main#label` passes `String.concat` a null closure environment, which
-    selection materializes before the calls in its argument list. Kept, it
-    would hold a callee-saved register or a stack slot; computed again, it is
-    a `mov` of `xzr` between the last of those calls and the one that reads
-    it.
+    selection materializes before the calls in its argument list, while nine
+    other values live across those calls hold every callee-saved register.
+    The zero is the cheapest of them to evict, and evicted it is a `mov` of
+    `xzr` between the last of those calls and the one that reads it.
     """
     body = _functions(_native("rematerialize.gob"))["Main#label"]
     calls = [n for n, line in enumerate(body) if line.startswith("bl ")]
     concat = next(n for n in calls if "String#concat" in body[n])
     before = max(n for n in calls if n < concat)
     assert "mov x0, xzr" in body[before + 1:concat], body[before:concat]
-    first_label = next(n for n, line in enumerate(body) if line.endswith(":"))
-    loads = [line for line in body[first_label:concat] if SLOT_LOAD.match(line)]
-    assert not loads, loads
+    stored = [(line, after) for line, after in zip(body, body[1:])
+              if (m := ZERO.match(line)) and after.startswith(f"str {m.group(1)}, ")]
+    assert not stored, stored
     held = [line for line in body
             if (m := ZERO.match(line)) and m.group(1) in CALLEE_SAVED]
     assert not held, held

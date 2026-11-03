@@ -86,7 +86,7 @@ def test_a_barrier_that_remembers_nothing_is_caught(tmp_path):
     shutil.copytree(bootc.REPO_ROOT / "lib", library)
     heap = library / "Turkey" / "Heap.gob"
     text = heap.read_text()
-    before = "    let header = Prim.ptrAdd(parent, payloadHeader)\n"
+    before = "    let header = Prim.loadI64(parent, 0)\n"
     assert text.count(before) == 1
     heap.write_text(text.replace(before, before + "    return {}\n"))
     source = tmp_path / "main.gob"

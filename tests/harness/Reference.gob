@@ -43,18 +43,24 @@ import System.File as File
 import Case (Case(..), Expected(..), Golden(..), Quote(..), Requirement(..), Ending(..), Observed(..))
 import Files as Files
 
-let modes = ["run", "check", "error", "panic", "module"]
-
 -- The stages `boot` names in a diagnostic, `FILE:LINE:COL: STAGE: MESSAGE`.
 let stages = ["lex error", "parse error", "type error", "internal error", "giblets", "error"]
 
--- One example as its chapter gives it: the line of its opening fence, its
--- directive and that directive's argument, its source, the `text` fence
--- after it, and the modules before it, as (file name, source).
+-- How an example is checked: it runs and exits 0; `boot check` accepts it;
+-- `boot check` rejects it with the text in its message; or it panics with
+-- the text in the panic's message.
+type Mode = Run | Check | Fails(String) | Panic(String)
+
+-- What a directive marks the fence after it as: another file, by name, of
+-- the next example's program, or an example checked as `Mode` says.
+type Marker = ModuleFile(String) | Marked(Mode)
+
+-- One example as its chapter gives it: the line of its opening fence, how
+-- it is checked, its source, the `text` fence after it, and the modules
+-- before it, as (file name, source).
 type Example = Example {
     line : Int,
-    mode : String,
-    arg : String,
+    mode : Mode,
     source : String,
     stdout : Option String,
     modules : Array (String, String),
@@ -113,8 +119,8 @@ fun example(work : String, name : String, e : Example) -> Case {
     let files = [("Main.gob", e.source)] + e.modules
     let written = writeOut(work, files)
     let quoted = match e.mode {
-        "error" | "panic" -> Some(e.arg)
-        _ -> None
+        Fails(text) | Panic(text) -> Some(text)
+        Run | Check -> None
     }
     Case {
         name = name,
@@ -124,15 +130,18 @@ fun example(work : String, name : String, e : Example) -> Case {
         golden = Quoted(Quote { stdout = e.stdout, message = quoted }),
         dumps = [],
         expected = match e.mode {
-            "error" -> Rejected
-            "panic" -> Panics
-            _ -> Exits(0)
+            Fails(_) -> Rejected
+            Panic(_) -> Panics
+            Run | Check -> Exits(0)
         },
         timeout = None,
         requires = [Cc],
         xfail = None,
         problem = Option.map(Either.left(written), Error.describe),
-        checkOnly = e.mode == "check" || e.mode == "error",
+        checkOnly = match e.mode {
+            Check | Fails(_) -> True
+            Run | Panic(_) -> False
+        },
     }
 }
 
@@ -171,37 +180,44 @@ fun extract(lines : Vec String, found : Vec Example) -> Either Malformed Unit {
     var i = 0
     while i < len(lines) {
         let line = String.trim(lines[i])
-        if let Some((mode, arg)) = directive(line) {
-            -- Any other comment is prose, unless it stands where a directive
-            -- would, before a `kotlin` fence.
-            if !Iterator.any(modes, _ == mode) {
-                if nextIsFence(lines, i + 1, "kotlin") {
-                    return Left(Malformed(i + 1, "unknown directive '" + mode + "'"))
+        if let Some((name, arg)) = directive(line) {
+            match marker(name, arg) {
+                -- Any other comment is prose, unless it stands where a
+                -- directive would, before a `kotlin` fence.
+                None -> {
+                    if nextIsFence(lines, i + 1, "kotlin") {
+                        return Left(Malformed(i + 1, "unknown directive '" + name + "'"))
+                    }
+                    i = i + 1
                 }
-                i = i + 1
-                continue
+                Some(marked) -> {
+                    let f = fence(lines, i + 1)?
+                    if f.language != "kotlin" { return Left(Malformed(i + 1, "a directive must precede a kotlin fence")) }
+                    i = f.next
+                    match Either.mapLeft(marked, \Malformed(f.line, _))? {
+                        ModuleFile(file) -> {
+                            Vec.push(modules, (file, f.body))
+                            lastModule = f.line
+                        }
+                        Marked(mode) -> {
+                            let quotesOutput = match mode {
+                                Run -> True
+                                Panic(_) -> nextIsFence(lines, i, "text")
+                                Check | Fails(_) -> False
+                            }
+                            var stdout = None
+                            if quotesOutput {
+                                if !nextIsFence(lines, i, "text") { return Left(Malformed(f.line, "'run' needs a text fence after it")) }
+                                let t = fence(lines, i)?
+                                stdout = Some(t.body)
+                                i = t.next
+                            }
+                            Vec.push(found, Example { line = f.line, mode, source = f.body, stdout, modules = Vec.toArray(modules) })
+                            modules = []
+                        }
+                    }
+                }
             }
-            let f = fence(lines, i + 1)?
-            if f.language != "kotlin" { return Left(Malformed(i + 1, "a directive must precede a kotlin fence")) }
-            i = f.next
-            if mode == "module" {
-                if arg == "" { return Left(Malformed(f.line, "'module' needs a file name")) }
-                Vec.push(modules, (arg, f.body))
-                lastModule = f.line
-                continue
-            }
-            if (mode == "error" || mode == "panic") && arg == "" {
-                return Left(Malformed(f.line, "'" + mode + "' needs the text its message contains"))
-            }
-            var stdout = None
-            if mode == "run" || (mode == "panic" && nextIsFence(lines, i, "text")) {
-                if !nextIsFence(lines, i, "text") { return Left(Malformed(f.line, "'run' needs a text fence after it")) }
-                let t = fence(lines, i)?
-                stdout = Some(t.body)
-                i = t.next
-            }
-            Vec.push(found, Example { line = f.line, mode, arg, source = f.body, stdout, modules = Vec.toArray(modules) })
-            modules = []
         } else if let Some(language) = opening(line) {
             if language == "kotlin" { return Left(Malformed(i + 1, "a kotlin fence with no directive")) }
             let f = fence(lines, i)?
@@ -213,6 +229,21 @@ fun extract(lines : Vec String, found : Vec Example) -> Either Malformed Unit {
     if len(modules) > 0 { return Left(Malformed(lastModule, "'module' blocks with no example after them")) }
     Right(())
 }
+
+-- Returns what the directive `name` marks the next fence as, given its
+-- argument `arg`, or why `arg` does not suit it. Returns `None` if `name`
+-- is not a directive.
+fun marker(name : String, arg : String) -> Option (Either String Marker) = match name {
+    "module" -> Some(if arg == "" { Left("'module' needs a file name") } else { Right(ModuleFile(arg)) })
+    "run" -> Some(Right(Marked(Run)))
+    "check" -> Some(Right(Marked(Check)))
+    "error" -> Some(quoting(name, arg, \Fails(_)))
+    "panic" -> Some(quoting(name, arg, \Panic(_)))
+    _ -> None
+}
+
+fun quoting(name : String, arg : String, mode : fun(String) -> Mode) -> Either String Marker =
+    if arg == "" { Left("'" + name + "' needs the text its message contains") } else { Right(Marked(mode(arg))) }
 
 -- The name and argument of the HTML comment that `line`, trimmed, is, if it
 -- is one: `<!-- NAME -->` or `<!-- NAME: ARGUMENT -->`.

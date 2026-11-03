@@ -53,7 +53,8 @@ PEERS = {name + ".gob": f'export (f)\nfun f() -> String = "{name}"' for name in 
 @pytest.mark.parametrize("imports", ["import A (..)\nimport B (..)", "import B (..)\nimport A (..)"])
 def test_ambiguous_import_is_reported_at_use(imports):
     assert lang.fails(imports + "\nfun main() { print(f()) }", PEERS) == (
-        "ambiguous name 'f': 'A.f', 'B.f'")
+        "'f' is ambiguous: it is imported as 'A.f' and 'B.f'; write the "
+        "qualified name of the one you mean")
 
 
 def test_unused_ambiguity_and_qualified_access_are_legal():
@@ -74,14 +75,14 @@ def test_repeated_import_of_same_declaration_is_unambiguous():
 
 
 def test_ambiguous_name_cannot_be_reexported():
-    assert "ambiguous name 'f'" in lang.fails("import Relay", {
+    assert "'f' is ambiguous" in lang.fails("import Relay", {
         **PEERS, "Relay.gob": "export (f)\nimport A (..)\nimport B (..)"})
 
 
 @pytest.mark.parametrize("body", ["fun f(x : T) = x", "fun f() = C", "fun f(x) = match x { C -> 1 }"])
 def test_type_and_constructor_names_have_ambiguity_checks(body):
     modules = {n + ".gob": f"export (T(..))\ntype T = C" for n in ("A", "B")}
-    assert "ambiguous name" in lang.fails("import A (..)\nimport B (..)\n" + body, modules)
+    assert "is ambiguous: it is imported as" in lang.fails("import A (..)\nimport B (..)\n" + body, modules)
 
 
 def test_qualified_record_constructor_allows_field_access():
@@ -97,7 +98,7 @@ def test_field_evidence_cannot_cross_module_boundary_to_reveal_abstract_record()
 
 def test_class_names_are_ambiguous_independently_of_types():
     modules = {n + ".gob": f"export (C(..))\nclass C a {{ fun get(a) -> Int }}" for n in ("A", "B")}
-    assert "ambiguous name 'C'" in lang.fails(
+    assert "'C' is ambiguous" in lang.fails(
         "import A (..)\nimport B (..)\nfun f[C a](x : a) = get(x)", modules)
 
 

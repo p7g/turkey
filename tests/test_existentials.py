@@ -106,22 +106,22 @@ fun main() {
 
 @pytest.mark.parametrize("source, message", [
     ("type Some = Some[Show a](a)\nfun leak(Some(x)) = x\nfun main() {}\n",
-     "cannot escape the pattern 'Some' that opened it"),
+     "the type 'a' hidden by 'Some' cannot leave"),
     ("type Some = Some[Show a](a)\nfun main() {\n    let Some(x) = Some(1)\n}\n",
-     "only a 'match' arm or a function parameter may do"),
+     "cannot be matched by a 'let', 'var' or 'for' pattern"),
     ("type Some = Some[Show a](a) | Other[Show a](a)\n"
      "fun f(v : Some) -> String = match v {\n"
      "    Some(x) | Other(x) -> show(x)\n}\nfun main() {}\n",
-     "an arm with alternatives cannot open"),
+     "an arm with alternatives cannot match an existential constructor"),
     ("type Some = Some[Show a](a)\nfun f(v : Some) -> Unit {\n"
      "    var hold = []\n    match v {\n        Some(x) -> Vec.push(hold, x)\n"
      "    }\n}\nfun main() {}\n",
-     "cannot escape the pattern 'Some' that opened it"),
+     "the type 'a' hidden by 'Some' cannot leave"),
     ("type Some = Some[a](a)\nfun f(v : Some) -> String = match v {\n"
      "    Some(x) -> show(x)\n}\nfun main() {}\n",
      "no instance for 'Show a'"),
     ("type Some = Some[Show a](a)\nfun main() {\n    for Some(x) in [Some(1)] {\n    }\n}\n",
-     "only a 'match' arm or a function parameter may do"),
+     "cannot be matched by a 'let', 'var' or 'for' pattern"),
 ])
 def test_what_an_opening_may_not_do(source, message):
     assert message in fails(source)
@@ -136,13 +136,13 @@ def test_what_an_opening_may_not_do(source, message):
      "fun both(v : (Some, Some)) -> String = match v {\n"
      "    (Some(x), Some(y)) -> show(if False { x } else { y })\n"
      "}\nfun main() {}\n",
-     "expected a, found a2"),
+     "expected 'a', found 'a2'"),
     # The same, opened by a parameter list rather than an arm: one opening scope
     # either way, so one pool of names either way.
     ("type Some = Some[Show a](a)\n"
      "fun both(Some(x), Some(y)) -> String = show(if False { x } else { y })\n"
      "fun main() {}\n",
-     "expected a, found a2"),
+     "expected 'a', found 'a2'"),
 ])
 def test_two_openings_in_one_scope_hide_different_types(source, message):
     assert message in fails(source)
@@ -159,4 +159,4 @@ def test_two_openings_in_one_scope_hide_different_types(source, message):
     "    (Box { item = p }, _) -> p\n}\nfun main() {}\n",
 ])
 def test_a_record_opening_may_not_leak_either(source):
-    assert "cannot escape the pattern 'Box' that opened it" in fails(source)
+    assert "the type 's' hidden by 'Box' cannot leave" in fails(source)

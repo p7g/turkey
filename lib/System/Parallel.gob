@@ -40,10 +40,13 @@ fun lesser(a : Int, b : Int) -> Int = if a < b { a } else { b }
 
 -- The sequential `map`.
 fun mapInTurn[Iterator c, Length c, Item c ~ a](xs : c, f : fun(a) -> b) -> Array b {
+    let n = len(xs)
     let cursor = iter(xs)
-    Array.init(len(xs), fun(_) = match next(xs, cursor) {
+    Array.init(n, fun(i) = match next(xs, cursor) {
         Some(x) -> f(x)
-        None -> Prim.error("System.Parallel.map: fewer elements than its length")
+        None -> Prim.error("System.Parallel.map: the collection ended after "
+                           + Int.toString(i) + " of its " + Int.toString(n)
+                           + " elements; do not change a collection while mapping over it")
     })
 }
 
@@ -170,9 +173,10 @@ fun graphWith[Iterator d, Item d ~ Int](
     for var i = 0; i < count; i = i + 1 {
         for d in dependsOn(i) {
             if d < 0 || d >= count {
-                return Prim.error("System.Parallel.graph: step "
-                                  + Int.toString(i) + " depends on no step "
-                                  + Int.toString(d))
+                return Prim.error("System.Parallel.graph: step " + Int.toString(i)
+                                  + " depends on step " + Int.toString(d)
+                                  + ", but the steps are numbered 0 to "
+                                  + Int.toString(count - 1))
             }
             g.waitingOn[i] = g.waitingOn[i] + 1
             Vec.push(g.dependents[d], i)
@@ -181,13 +185,15 @@ fun graphWith[Iterator d, Item d ~ Int](
     for var i = 0; i < count; i = i + 1 {
         if g.waitingOn[i] == 0 { Vec.push(g.ready, i) }
     }
-    if !acyclic(g, count) {
-        return Prim.error("System.Parallel.graph: the steps' dependencies have a cycle")
+    if let Some(i) = blocked(g, count) {
+        return Prim.error("System.Parallel.graph: step " + Int.toString(i)
+                          + " can never run: its dependencies lead into a cycle")
     }
     let finished = fun(j) = match g.results[j] {
         Some(value) -> value
-        None -> Prim.error("System.Parallel.graph: step " + Int.toString(j)
-                           + " has not finished; a step may only read those it depends on")
+        None -> Prim.error("System.Parallel.graph: a step read the result of step "
+                           + Int.toString(j) + ", which it does not depend on; add "
+                           + Int.toString(j) + " to its dependencies")
     }
     if workers() < 2 {
         steps(g, perWorker(), run, finished)
@@ -221,8 +227,10 @@ type Graph b = Graph {
     var waiters    : Vec Co.Coroutine,
 }
 
--- Whether the steps can all run: Kahn's count over a copy of `waitingOn`.
-fun acyclic(g : Graph b, count : Int) -> Bool {
+-- The first step that can never run, if there is one: Kahn's algorithm over
+-- a copy of `waitingOn`. Such a step is on a cycle of dependencies or depends
+-- on a step that is.
+fun blocked(g : Graph b, count : Int) -> Option Int {
     let waiting = Array.map(g.waitingOn, fun(n) = n)
     let queue = Vec.map(g.ready, fun(n) = n)
     var at = 0
@@ -233,7 +241,10 @@ fun acyclic(g : Graph b, count : Int) -> Bool {
         }
         at = at + 1
     }
-    len(queue) == count
+    for var i = 0; i < count; i = i + 1 {
+        if waiting[i] > 0 { return Some(i) }
+    }
+    None
 }
 
 -- Run ready steps until every step has finished.

@@ -49,7 +49,9 @@ fun each(xs : Array Int, f : fun(Int) -> String) -> String {
 
 fun mapKind(xs : Array Int, m : Mapper) -> String {
     let rest = Array.map(xs, fun(x) = Int.toString(x * 10))
-    each(xs, fun(x) = m.ty(m.expr(x))) + String.join(rest, ",")
+    let widths = Array.map(rest, fun(s) = Int.toString(String.byteLength(s)))
+    each(xs, fun(x) = m.ty(m.expr(x))) + String.join(rest, ",") + "|"
+        + String.join(widths, ",")
 }
 
 fun children(xs : Array Int, tag : Int) -> String {
@@ -79,7 +81,7 @@ fun main() {
 }
 """
 
-READERS_OUTPUT = "<717>;<727>;10,20\n<838>;30\n"
+READERS_OUTPUT = "<717>;<727>;10,20|2,2\n<838>;30|2\n"
 
 
 def test_objects_a_callee_only_reads_are_built_in_the_frame():

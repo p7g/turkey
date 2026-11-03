@@ -162,7 +162,7 @@ program. Because an instance head is a constructor applied to variables, two
 instances for the same constructor would always apply to the same types, so a
 second one is an error:
 
-<!-- error: overlapping instances: 'Describe Dog' and 'Describe Dog' both apply -->
+<!-- error: overlapping instances: 'Describe Dog' is already declared at 7:1 -->
 ```kotlin
 class Describe a {
     fun describe(a) -> String
@@ -240,7 +240,7 @@ A method whose class parameter appears only in its result, such as a
 `default() -> a`, can be called only where the result's type is fixed by the
 context around the call. Otherwise the call is ambiguous:
 
-<!-- error: cannot determine a type satisfying 'Show a'. Add a type annotation. -->
+<!-- error: cannot determine what type 'a' is in 'Show a'; add a type annotation -->
 ```kotlin
 class Default a {
     fun default() -> a

@@ -41,7 +41,7 @@ def test_int_is_64_bit_and_arithmetic_traps():
 def test_int_literal_out_of_range_is_a_compile_error():
     # 2^63 exactly: too big for Int, and past 2^53 so not a Float either. The
     # lexer is what says so.
-    with pytest.raises(Exception, match="integer literal out of range"):
+    with pytest.raises(Exception, match="is too large for 'Int'"):
         out("fun main() { print(9223372036854775808) }")
 
 
@@ -75,7 +75,7 @@ def test_non_decimal_literals_are_range_checked_like_decimal_ones():
     for literal in ("0xFFFF_FFFF_FFFF_FFFF", "0x8000_0000_0000_0000",
                     "0o1_000_000_000_000_000_000_000", "0b1" + "0" * 63):
         assert lex_failure(f"fun main() {{ print({literal}) }}") == (
-            f"integer literal out of range: {literal}")
+            f"integer literal '{literal}' is too large for 'Int'")
 
 
 def test_floats_take_an_exponent_and_separators():
@@ -91,9 +91,9 @@ def test_floats_take_an_exponent_and_separators():
 
 
 @pytest.mark.parametrize("literal, message", [
-    ("010", "leading zeros are not allowed in '010' (octal is written 0o)"),
-    ("00.5", "leading zeros are not allowed in '00' (octal is written 0o)"),
-    ("0_1", "leading zeros are not allowed in '0_1' (octal is written 0o)"),
+    ("010", "'010' has a leading zero; remove it, or write '0o10' for an octal number"),
+    ("00.5", "'00' has a leading zero; remove it"),
+    ("0_1", "'0_1' has a leading zero; remove it, or write '0o1' for an octal number"),
     ("0x", "hexadecimal literal needs a digit after '0x'"),
     ("0x_FF", "hexadecimal literal needs a digit after '0x'"),
     ("0b", "binary literal needs a digit after '0b'"),
@@ -102,13 +102,13 @@ def test_floats_take_an_exponent_and_separators():
     ("0xFFg", "a number cannot be followed directly by 'g'"),
     ("12abc", "a number cannot be followed directly by 'a'"),
     ("1.5x", "a number cannot be followed directly by 'x'"),
-    ("1_", "a '_' in a number must sit between two digits"),
-    ("1__0", "a '_' in a number must sit between two digits"),
-    ("1_foo", "a '_' in a number must sit between two digits"),
-    ("1.0_", "a '_' in a number must sit between two digits"),
-    ("1e", "exponent needs digits in '1e'"),
-    ("1.5e+", "exponent needs digits in '1.5e+'"),
-    ("1e_3", "exponent needs digits in '1e'"),
+    ("1_", "'_' in this number is not between two digits; remove it"),
+    ("1__0", "'_' in this number is not between two digits; remove it"),
+    ("1_foo", "'_' in this number is not between two digits; remove it"),
+    ("1.0_", "'_' in this number is not between two digits; remove it"),
+    ("1e", "the exponent in '1e' has no digits"),
+    ("1.5e+", "the exponent in '1.5e+' has no digits"),
+    ("1e_3", "the exponent in '1e' has no digits"),
 ])
 def test_malformed_numerals_are_lex_errors(literal, message):
     assert lex_failure(f"fun main() {{ print({literal}) }}") == message
@@ -366,15 +366,17 @@ def test_char_is_a_scalar_value_so_surrogates_are_rejected():
 
 
 def test_lexer_rejects_surrogate_and_oversized_escapes():
-    for escape in ("\\u{D800}", "\\u{DFFF}", "\\u{110000}"):
-        with pytest.raises(Exception, match="not a Unicode scalar value"):
+    for escape, problem in (("\\u{D800}", "is a surrogate"),
+                            ("\\u{DFFF}", "is a surrogate"),
+                            ("\\u{110000}", "is above")):
+        with pytest.raises(Exception, match=problem):
             out(f'fun main() {{ print("{escape}") }}')
 
 
 def test_unicode_escape_reaches_beyond_the_bmp():
     assert out('fun main() { print("\\u{1F600}") }') == "\U0001f600\n"
     assert out('fun main() { print("\\u{41}") }') == "A\n"
-    with pytest.raises(Exception, match=r"\\u escape"):
+    with pytest.raises(Exception, match=r"malformed '\\u' escape"):
         out('fun main() { print("\\u0041") }')
 
 

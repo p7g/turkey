@@ -316,4 +316,4 @@ fun main() {
 }
 """)
     assert result.code != 0
-    assert "readInto: the buffer has no room" in result.stderr
+    assert "readInto: the buffer has no room; consume or clear some of it first" in result.stderr

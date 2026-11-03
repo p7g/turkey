@@ -19,9 +19,8 @@ from tests.lang import CompileError
 #: on a fragment: it is the whole of what a reader gets, so a test that
 #: accepted half of it would not be pinning the diagnostic.
 ESCAPES = (
-    "the type 'a' cannot escape the signature that declares it: it stands "
-    "for whatever a caller of that function chooses, so nothing outside can "
-    "be equal to it"
+    "the type variable 'a' from a signature cannot be equal to a type from "
+    "outside its function"
 )
 
 ITER = """
@@ -93,7 +92,7 @@ def test_a_body_less_general_than_its_signature_is_rejected():
 
 
 def test_a_signature_may_not_narrow_its_return_type():
-    assert fails("fun f(x : Int) -> a = x") == "expected a, found Int in the function body"
+    assert fails("fun f(x : Int) -> a = x") == "expected 'a', found 'Int' in the function body"
 
 
 # -- polymorphic recursion ----------------------------------------------------
@@ -173,8 +172,8 @@ def test_a_context_the_signature_omits_is_not_granted():
 def test_a_context_over_a_variable_the_type_omits_is_rejected_where_written():
     src = "fun f[Iterator b](x : Int) -> Int = x"
     assert fails(src) == (
-        "'Iterator b' constrains a type that the declared type of 'f' does "
-        "not mention, so no use of 'f' could decide it"
+        "'Iterator b' constrains a type variable that the declared type of 'f' "
+        "does not mention; remove it from the context"
     )
 
 
@@ -220,7 +219,7 @@ def test_an_omitted_return_type_does_not_infer_a_written_variables_context():
     }
     fun main() { print(Int.toString(size([1]))) }
     """
-    with pytest.raises(CompileError, match="needs 'Iterator a', which the context"):
+    with pytest.raises(CompileError, match="needs 'Iterator a', which its annotation's context"):
         scheme(src, "size")
 
 

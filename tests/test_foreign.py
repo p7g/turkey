@@ -72,7 +72,7 @@ def test_a_program_may_not_declare_a_foreign_symbol():
     """The containment is the whole of what the compiler offers here."""
     message = fails('foreign "getenv" fun getenv(Prim.Ptr) -> Prim.Ptr\n'
                     "fun main() { }\n")
-    assert "a foreign declaration may only appear in" in message
+    assert "a 'foreign' function without a body can appear only in" in message
 
 
 def test_naming_your_own_module_after_a_listed_one_does_not_let_you_in(tmp_path):
@@ -85,7 +85,7 @@ def test_naming_your_own_module_after_a_listed_one_does_not_let_you_in(tmp_path)
         "Turkey/Libc.gob": "export (f)\n"
                            "import Prelude ()\n"
                            'foreign "system" fun f(Prim.Ptr) -> Int\n'})
-    assert "a foreign declaration may only appear in" in message
+    assert "a 'foreign' function without a body can appear only in" in message
 
 
 def test_a_directory_named_lib_is_not_the_library(tmp_path):
@@ -101,7 +101,7 @@ def test_a_directory_named_lib_is_not_the_library(tmp_path):
     (root / "Main.gob").write_text("import Turkey.Libc as P\nfun main() { }\n",
                                    encoding="utf-8")
     message = fails(root / "Main.gob")
-    assert "a foreign declaration may only appear in" in message
+    assert "a 'foreign' function without a body can appear only in" in message
 
 
 # -- what it may say ---------------------------------------------------------
@@ -125,14 +125,14 @@ def test_only_the_seven_representable_types_cross(probe, written):
         "export (f)\n"
         f'foreign "probe" fun f(x : {written}) -> Int\n'))
     message = fails(entry)
-    assert "cannot cross a foreign boundary" in message
+    assert "cannot appear in the foreign signature of" in message
 
 
 def test_a_result_type_is_checked_too(probe):
     entry = probe((
         "export (f)\n"
         'foreign "probe" fun f(x : Int) -> String\n'))
-    assert "cannot cross a foreign boundary" in fails(entry)
+    assert "cannot appear in the foreign signature of" in fails(entry)
 
 
 def test_unit_is_how_a_void_function_is_written(probe):
@@ -160,14 +160,14 @@ def test_a_ninth_general_argument_is_rejected_at_the_declaration(probe):
     its outgoing stack slots are its own convention and not one a C function
     would read; a runtime entry point that overflowed was a compiler bug, and a
     declaration is written by someone, so it gets an error that says which
-    register file filled up."""
+    kind of parameter there are too many of."""
     params = ", ".join(f"a{i} : Int" for i in range(9))
     entry = probe((
         "export (f)\n"
         f'foreign "probe" fun f({params}) -> Int\n'))
     message = fails(entry)
-    assert "9 general arguments" in message
-    assert "x0-x7" in message
+    assert "9 non-'Float' parameters" in message
+    assert "at most 8" in message
 
 
 def test_the_two_register_files_are_counted_apart(probe):
@@ -187,8 +187,8 @@ def test_a_ninth_float_is_rejected_and_says_so(probe):
         "export (f)\n"
         f'foreign "probe" fun f({params}) -> Int\n'))
     message = fails(entry)
-    assert "9 floating-point arguments" in message
-    assert "d0-d7" in message
+    assert "9 'Float' parameters" in message
+    assert "at most 8" in message
 
 
 # -- the namespace -----------------------------------------------------------
@@ -230,7 +230,7 @@ def test_a_return_type_is_required(probe):
         "export (f)\n"
         'foreign "probe" fun f(x : Int)\n'))
     message = fails(entry)
-    assert "must state a return type" in message
+    assert "has no return type" in message
     assert "-> Unit" in message
 
 
@@ -338,14 +338,14 @@ def test_a_variadic_marker_needs_an_argument_after_it(probe):
     entry = probe((
         "export (f)\n"
         'foreign "open" fun f(path : Prim.Ptr, flags : Int, ...) -> Int\n'))
-    assert "must be followed by the variadic arguments" in fails(entry)
+    assert "'...' has no parameters after it" in fails(entry)
 
 
 def test_a_parameter_list_has_one_variadic_marker(probe):
     entry = probe((
         "export (f)\n"
         'foreign "probe" fun f(a : Int, ... b : Int, ... c : Int) -> Int\n'))
-    assert "one '...'" in fails(entry)
+    assert "'...' appears twice in this parameter list" in fails(entry)
 
 
 def test_a_foreign_definition_cannot_be_variadic():
@@ -363,4 +363,4 @@ def test_variadic_arguments_count_against_the_registers(probe):
     entry = probe((
         "export (f)\n"
         f'foreign "probe" fun f({params}, ... b : Int, c : Int) -> Int\n'))
-    assert "9 general arguments" in fails(entry)
+    assert "9 non-'Float' parameters" in fails(entry)

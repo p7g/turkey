@@ -264,7 +264,7 @@ So a call with a bare `_` is a function even where an operator or a field
 access follows it. `label(_) + "!"` adds a function to a string, which is an
 error; write `\label(_) + "!"`, explained below.
 
-<!-- error: where '_' means fun($x) = label($x) -->
+<!-- error: where '_' means 'fun($x) = label($x)' -->
 ```kotlin
 fun label(name) = "<" + name + ">"
 
@@ -277,7 +277,7 @@ Because a function argument is a boundary, a `_` inside a call inside an
 argument makes a function for the inner call, not for the outer one.
 `show(_ * 2)` means `show(fun($x) = $x * 2)`, so this is an error:
 
-<!-- error: where '_' means fun($x) = $x * 2 -->
+<!-- error: where '_' means 'fun($x) = $x * 2' -->
 ```kotlin
 fun main() {
     print(Array.map([1, 2, 3], show(_ * 2)))
@@ -291,7 +291,7 @@ A function made by `_` has one parameter and uses it once: a second `_` in the
 same function is an error. `_` on its own as a whole statement, `let` or
 function body is an error too; write `fun(x) = x`.
 
-<!-- error: a function made by '_' uses its parameter once -->
+<!-- error: '_' appears more than once in this function -->
 ```kotlin
 fun main() {
     print(Array.map([1, 2, 3], _ * _))
@@ -460,7 +460,7 @@ calls refer to. So a top-level `let` can call a function declared further
 down. Only functions can depend on each other in a cycle; a cycle that
 includes a `let` or `var` is an error:
 
-<!-- error: only functions may be mutually recursive -->
+<!-- error: only functions can be mutually recursive -->
 ```kotlin
 let a = b + 1
 let b = a + 1
@@ -578,7 +578,7 @@ fun count(label : a, n) -> Int = if n > 3 { n } else { count("more", n + 1) }
 fun pick(x : a, y : b) = if True { x } else { y }
 ```
 
-<!-- error: the body of 'describe' needs 'Show a', which the context its annotation writes does not state -->
+<!-- error: the body of 'describe' needs 'Show a', which its annotation's context does not list -->
 ```kotlin
 fun describe(x : a, label) = label + show(x)
 ```
@@ -679,7 +679,7 @@ another declaration of the same symbol. These are as the standard library
 would write them; in an application module they are refused like any other
 declaration:
 
-<!-- error: a foreign declaration may only appear in -->
+<!-- error: a 'foreign' function without a body can appear only in -->
 ```kotlin
 foreign "open" fun openCreate(path : Prim.Ptr, flags : Int, ... mode : Int) -> Int
 foreign "fcntl" fun fcntlGet(fd : Int, command : Int) -> Int
@@ -691,7 +691,7 @@ The trailing arguments count against the same limits as the others. Only a
 declaration can be variadic; a definition cannot, since its body would have
 no way to read them.
 
-<!-- error: may only appear in a giblet module -->
+<!-- error: can appear only in a giblet module -->
 ```kotlin
 foreign "application_callback" fun callback(x : Int) -> Int = x
 fun main() { }

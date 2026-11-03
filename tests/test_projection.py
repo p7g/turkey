@@ -16,15 +16,20 @@ def failure(src: str) -> str:
 
 def test_projection_is_read_only():
     assert failure("fun f() { let x = (1, 2); x.0 = 3 }") == (
-        "numeric projections are read-only"
+        "cannot assign to the tuple component '.0'; build a new tuple instead"
     )
 
 
-@pytest.mark.parametrize("selector", ["0x1", "1_0", "01", "1e3", "0b1", "1a"])
-def test_a_selector_is_a_plain_decimal_index(selector):
-    assert failure(f"fun f() {{ let x = (1, 2); x.{selector} }}") == (
-        "a tuple selector is a plain decimal index such as .0 or .1"
-    )
+@pytest.mark.parametrize("selector, message", [
+    ("0x1", "tuple index '.0' cannot be followed directly by 'x'"),
+    ("1_0", "tuple index '.1' cannot be followed directly by '_'"),
+    ("01", "tuple index '.01' has a leading zero; write '.1'"),
+    ("1e3", "tuple index '.1' cannot be followed directly by 'e'"),
+    ("0b1", "tuple index '.0' cannot be followed directly by 'b'"),
+    ("1a", "tuple index '.1' cannot be followed directly by 'a'"),
+])
+def test_a_selector_is_a_plain_decimal_index(selector, message):
+    assert failure(f"fun f() {{ let x = (1, 2); x.{selector} }}") == message
 
 
 def test_a_dot_after_a_selector_is_another_projection():
@@ -64,8 +69,8 @@ fun main() {
 
 @pytest.mark.parametrize("src, message", [
     ("fun f(x : (Int, String)) = x.2", "projection index 2 is out of bounds"),
-    ("type R = R { x : Int }\nfun f(x : R) = x.0", "cannot project position 0"),
-    ("type S = A(Int) | B(Int)\nfun f(x : S) = x.0", "cannot project position 0"),
+    ("type R = R { x : Int }\nfun f(x : R) = x.0", "cannot take '.0' of"),
+    ("type S = A(Int) | B(Int)\nfun f(x : S) = x.0", "cannot take '.0' of"),
 ])
 def test_invalid_projection_receivers_are_rejected(src, message):
     assert message in failure(src)

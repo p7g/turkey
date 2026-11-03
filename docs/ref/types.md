@@ -115,7 +115,7 @@ operations, which the [bitwise operators](expressions.md#bitwise-operators)
 `&`, `|`, `^`, `<<` and `>>` also spell. The shifts panic when the shift amount
 is outside 0 to 63 rather than masking it, and `>>` copies the sign bit.
 
-<!-- panic: shift amount is not in 0..63 -->
+<!-- panic: Int.shl: shift amount 64 is outside 0..63 -->
 ```kotlin
 fun main() {
     print(1 << 64)
@@ -605,7 +605,7 @@ constructor, and that constructor is a record. A type with several
 constructors is taken apart with `match`, even if all of its constructors are
 records:
 
-<!-- error: cannot read field 'radius': 'Shape' is not a single-variant record type -->
+<!-- error: cannot read field 'radius': 'Shape' is not a record type with one constructor; take it apart with 'match' -->
 ```kotlin
 type Shape = Circle { radius : Float } | Square { side : Float }
 
@@ -856,7 +856,7 @@ knows only what the bracket said: in the example above, only that `value` has
 a `Show` instance. The hidden type cannot leave the place where it was opened,
 so a function cannot return the unwrapped value:
 
-<!-- error: cannot escape the pattern 'Shown' that opened it -->
+<!-- error: the type 'a' hidden by 'Shown' cannot leave the 'match' arm or function that opened it -->
 ```kotlin
 type Shown = Shown[Show a](a)
 

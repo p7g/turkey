@@ -65,7 +65,7 @@ def test_the_operators_are_homogeneous():
     This is the visible cost of declining MPTCs, and it is stated here rather
     than left to be discovered.
     """
-    assert "expected Int, found Float" in fails("fun f(a : Int, b : Float) = a + b")
+    assert "expected 'Int', found 'Float'" in fails("fun f(a : Int, b : Float) = a + b")
 
 
 def test_an_operator_needs_only_an_instance(capsys):
@@ -207,8 +207,8 @@ fun main() {
 
 
 def test_a_second_instance_for_a_built_in_type_overlaps():
-    assert fails("instance Add Int { fun add(x, y) = x }") == \
-        "overlapping instances: 'Add Int' and 'Add Int' both apply"
+    assert fails("instance Add Int { fun add(x, y) = x }").startswith(
+        "overlapping instances: 'Add Int' is already declared in 'Data.Int' at ")
 
 
 def test_the_float_operators_are_gone():
@@ -286,12 +286,13 @@ def test_punctuation_cannot_be_declared(op):
 
 def test_the_target_must_take_two_parameters():
     assert fails("infix Sequence (|>) = f\nfun f(x) = x") == \
-        "the operator '|>' needs a function of two parameters, and 'f' takes 1"
+        "'f' takes 1 parameter, and the operator '|>' must name a function of two"
 
 
 def test_the_target_must_be_a_function():
     assert fails("infix Sequence (|>) = f\nlet f = fun(a, b) = a") == \
-        "the operator '|>' needs a top-level function or class method, and 'f' is neither"
+        ("'f' is neither a top-level function nor a class method, and the "
+         "operator '|>' must name one")
 
 
 def test_the_target_must_exist():

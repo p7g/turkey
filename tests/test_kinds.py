@@ -28,7 +28,7 @@ def test_a_type_declaration_rejects_an_undeclared_variable(src, variable):
 @pytest.mark.parametrize("src, message", [
     ("type T a = T[a](a)", "'a' is a parameter of type 'T'"),
     ("type T = T[s](b)", "type variable 'b' is not declared by type"),
-    ("type T = T[s, s](s)", "binds a variable twice"),
+    ("type T = T[s, s](s)", "'s' appears twice in the bracket of 'T'"),
     ("type T = T[Nope e](e)", "unknown class 'Nope'"),
 ])
 def test_an_existential_bracket_is_checked(src, message):
@@ -146,7 +146,7 @@ def test_an_unknown_head_applied_to_arguments_says_how_to_write_a_constructor() 
 
 
 def test_a_newtype_head_applied_without_parentheses_is_refused() -> None:
-    assert "must parenthesize its payload" in bad("type Meters = Meters Float")
+    assert "is not in parentheses; write 'Meters(...)'" in bad("type Meters = Meters Float")
 
 
 def test_the_prelude_and_built_in_kinds() -> None:

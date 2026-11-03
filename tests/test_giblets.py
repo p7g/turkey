@@ -62,8 +62,8 @@ def test_a_giblet_module_must_come_from_the_library(tmp_path):
     entry = tmp_path / "main.gob"
     entry.write_text("import Mine as M\nfun main() { }\n", encoding="utf-8")
     message = verdict(entry, "Mine")
-    assert "'Mine' is a giblet module, and a giblet module must come from " \
-           "the standard library" in message
+    assert "module 'Mine' has the name of a giblet module of the standard " \
+           "library; rename it" in message
 
 
 # -- the lowered code ----------------------------------------------------------
@@ -266,9 +266,10 @@ def test_what_a_giblet_makes_is_refused(lowered, body, function, reason):
                               exports="P(..), tuple, array, record, closure, "
                                       "pick, h")
     assert code != 0
-    assert re.search(rf"giblets: {re.escape(function)} is in a giblet module "
-                     rf"and may allocate: .*{re.escape(reason)} "
-                     rf"\([^)]*Probe_giblet_\w+\.gob:\d+:\d+\)", stderr), stderr
+    assert re.search(rf"giblets: '{re.escape(function)}' in a giblet module "
+                     rf".*{re.escape(reason)} "
+                     rf"\([^)]*Probe_giblet_\w+\.gob:\d+:\d+\), and giblet "
+                     rf"code cannot allocate", stderr), stderr
 
 
 def test_a_traced_value_held_across_a_call_is_refused(lowered):
@@ -285,25 +286,26 @@ def test_a_traced_value_held_across_a_call_is_refused(lowered):
         "fun text(n : Int) -> String = if n <= 0 { \"text\" } else { text(n - 1) }\n",
         exports="h, text")
     assert code != 0
-    assert "giblets: g is in a giblet module and holds a traced value across " \
-           "a call" in stderr, stderr
+    assert "giblets: 'g' in a giblet module holds a traced value across a " \
+           "call, and giblet code cannot" in stderr, stderr
 
 
 # A literal's `String` is made by the entry sequence, which giblet code can
 # run before; `Prim.cString` is the route that needs nothing made.
-@pytest.mark.parametrize("body, what", [
+@pytest.mark.parametrize("body, what, rule", [
     ("fun f(n : Int) -> Int = if n < 0 { Prim.error(\"negative\") } else { n }\n",
-     "panics with a String"),
+     "panics with a 'String'",
+     "giblet code cannot; panic with 'Process.panic(Prim.cString(...))'"),
     ("fun f(n : Int) -> Int = String.byteLength(\"text\") + n\n",
-     'uses the string literal "text"'),
+     'uses the string literal "text"',
+     "giblet code cannot use one; write a C string with 'Prim.cString(...)'"),
 ])
-def test_a_string_literal_is_refused(lowered, body, what):
+def test_a_string_literal_is_refused(lowered, body, what, rule):
     code, _, stderr = lowered(body, "fun h(n : Int) -> Int = n\n")
     assert code != 0
-    assert re.search(rf"giblets: f is in a giblet module and {re.escape(what)} "
-                     rf"\([^)]*Probe_giblet_\w+\.gob:\d+:\d+\); a giblet "
-                     rf"panics with Process\.panic\(Prim\.cString\(\.\.\.\)\)",
-                     stderr), stderr
+    assert re.search(rf"giblets: 'f' in a giblet module {re.escape(what)} "
+                     rf"\([^)]*Probe_giblet_\w+\.gob:\d+:\d+\), and "
+                     rf"{re.escape(rule)}", stderr), stderr
 
 
 def test_a_call_that_allocates_is_refused_with_the_path_to_it(lowered):
@@ -315,9 +317,9 @@ def test_a_call_that_allocates_is_refused_with_the_path_to_it(lowered):
         # survives to the Low IR, and the diagnostic has a path to print.
         "fun h(n : Int) -> Int = if n == 0 { len([n, n]) } else { h(n - 1) }\n")
     assert code != 0
-    assert "giblets: f is in a giblet module and may allocate: @f calls @h " \
-           "(" in stderr, stderr
-    assert re.search(r"@f calls @h \([^)]*Probe_giblet_\w+\.gob:4:\d+\), which "
+    assert "giblets: 'f' in a giblet module calls 'h' (" in stderr, stderr
+    assert re.search(r"'f' in a giblet module calls 'h' "
+                     r"\([^)]*Probe_giblet_\w+\.gob:4:\d+\), which "
                      r"builds an array \([^)]*Probe_helper_\w+\.gob:3:\d+\)",
                      stderr), stderr
 
@@ -332,9 +334,8 @@ def test_a_stack_switch_is_refused(lowered):
         "}\n",
         "fun h(n : Int) -> Int = n\n")
     assert code != 0
-    assert "giblets: f is in a giblet module and may allocate: @f " \
-           "switches stacks, and the code it switches to may allocate" \
-           in stderr, stderr
+    assert "giblets: 'f' in a giblet module switches stacks, and the code it " \
+           "switches to may allocate" in stderr, stderr
 
 
 def test_a_stack_switch_in_a_callee_is_refused_with_the_path_to_it(lowered):
@@ -347,7 +348,8 @@ def test_a_stack_switch_in_a_callee_is_refused_with_the_path_to_it(lowered):
         "    n\n"
         "}\n")
     assert code != 0
-    assert re.search(r"@f calls @h \([^)]*\), which switches stacks", stderr), \
+    assert re.search(r"'f' in a giblet module calls 'h' \([^)]*\), which "
+                     r"switches stacks", stderr), \
         stderr
 
 
@@ -386,7 +388,7 @@ def test_an_allocation_nobody_wrote_is_named_where_it_came_from(
     code, _, stderr = lowered(f"fun f(n : Int) -> Int = H.{helper}(n)\n",
                               HIDDEN, exports="nests, packs, dicts")
     assert code != 0
-    assert f"@f calls @{helper} (" in stderr, stderr
+    assert f"'f' in a giblet module calls '{helper}' (" in stderr, stderr
     assert re.search(rf"which {re.escape(reason)} \([^)]*Probe_helper_\w+\.gob:"
                      rf"{line}:\d+\)", stderr), stderr
 

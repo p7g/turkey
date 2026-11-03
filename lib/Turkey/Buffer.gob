@@ -42,6 +42,7 @@ import Data.Array as Array
 import Data.Bool (Bool(..))
 import Data.Byte as Byte
 import Data.Int ()
+import Data.Int as Int
 import Data.Option (Option(..))
 import Data.String (String(..))
 import Data.String as Str
@@ -57,7 +58,9 @@ type Buffer = Buffer {
 
 -- An empty buffer that holds up to `capacity` bytes.
 fun buffer(capacity : Int) -> Buffer {
-    if capacity < 0 { Prim.error("a buffer's capacity cannot be negative") }
+    if capacity < 0 {
+        Prim.error("System.IO.buffer: capacity " + Int.toString(capacity) + " is negative")
+    }
     Buffer { storage = Array.filled(capacity, Byte.truncate(0)), start = 0, end = 0,
              limit = capacity }
 }
@@ -79,23 +82,21 @@ fun clear(b : Buffer) -> Unit {
 -- Drop `n` bytes from the front of the window. A window emptied this way
 -- starts again at the front, so that the room behind it is not lost.
 fun consume(b : Buffer, n : Int) -> Unit {
-    if n < 0 || n > b.end - b.start {
-        Prim.error("Buffer.consume: more bytes than the buffer holds")
-    }
+    if n < 0 || n > b.end - b.start { cannotConsume(n, b.end - b.start) }
     b.start = b.start + n
     if b.start == b.end { clear(b) }
 }
 
 -- Append one byte. Panics if there is no room.
 fun push(b : Buffer, x : Byte) -> Unit {
-    if b.end >= b.limit { Prim.error("Buffer.push: the buffer is full") }
+    if b.end >= b.limit { Prim.error("System.IO.push: the buffer is full") }
     b.storage[b.end] = x
     b.end = b.end + 1
 }
 
 -- Append `source[from..to)`. Panics if there is not room for all of it.
 fun append(b : Buffer, source : Array Byte, from : Int, to : Int) -> Unit {
-    if to - from > b.limit - b.end { Prim.error("Buffer.append: not enough room") }
+    if to - from > b.limit - b.end { noRoom(to - from, b.limit - b.end) }
     IO.copy(b.storage, b.end, source, from, to)
     b.end = b.end + (to - from)
 }
@@ -103,7 +104,7 @@ fun append(b : Buffer, source : Array Byte, from : Int, to : Int) -> Unit {
 -- Append the bytes of `text` from byte `from` to byte `to`. Panics if there is
 -- not room for all of them.
 fun appendText(b : Buffer, text : String, from : Int, to : Int) -> Unit {
-    if to - from > b.limit - b.end { Prim.error("Buffer.append: not enough room") }
+    if to - from > b.limit - b.end { Prim.error("Buffer.appendText: not enough room") }
     IO.copy(b.storage, b.end, Prim.castAs(Str.bytesOf(text)), from, to)
     b.end = b.end + (to - from)
 }
@@ -127,6 +128,25 @@ fun bytesOf(text : String) -> Buffer {
     b.end = n
     b
 }
+
+-- The panics' messages, each built apart from its test so that the strings
+-- it allocates cost nothing on the path that passes.
+
+fun cannotConsume(n : Int, held : Int) -> Unit {
+    if n < 0 {
+        Prim.error("System.IO.consume: count " + Int.toString(n) + " is negative")
+    }
+    Prim.error("System.IO.consume: asked for " + Int.toString(n)
+               + " bytes, but the buffer holds " + Int.toString(held))
+}
+
+fun noRoom(n : Int, space : Int) -> Unit =
+    Prim.error("System.IO.append: " + Int.toString(n) + " bytes do not fit in the buffer's "
+               + Int.toString(space) + " bytes of room")
+
+fun outsideWindow(i : Int, length : Int) -> Unit =
+    Prim.error("buffer index out of bounds: read at index " + Int.toString(i)
+               + ", length " + Int.toString(length))
 
 -- -- for the library ---------------------------------------------------------------
 
@@ -180,7 +200,7 @@ instance Index Buffer {
     type Key = Int
     type Value = Byte
     fun get(b, i) {
-        if i < 0 || i >= b.end - b.start { Prim.error("Buffer: index outside the window") }
+        if i < 0 || i >= b.end - b.start { outsideWindow(i, b.end - b.start) }
         b.storage[b.start + i]
     }
 }

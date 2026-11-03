@@ -136,7 +136,8 @@ def test_a_path_with_a_nul_is_refused(tmp_path):
     result = panics(HEADER + """
 fun main() { let _ = IO.open("a\\u{0}b", Sys.readOnly, 0) }
 """)
-    assert panic_message(result) == "a path cannot contain a NUL byte"
+    assert panic_message(result) == (
+        "path has a NUL byte at byte offset 1, and a path cannot contain one")
 
 
 def test_copy_moves_a_window(tmp_path):
@@ -176,12 +177,12 @@ fun main() {
 ])
 def test_a_window_outside_its_array_panics(call):
     result = panics(HEADER + f"fun main() {{ {call} }}\n")
-    assert "is outside an array of length" in panic_message(result)
+    assert "are outside an array of length" in panic_message(result)
 
 
 def test_a_copy_past_the_targets_end_panics():
     result = panics(HEADER + "fun main() { IO.copy(bytes(\"abc\"), 1, bytes(\"abc\"), 0, 3) }\n")
-    assert "the window 1 to 4 is outside an array of length 3" in panic_message(result)
+    assert "bytes 1 to 4 are outside an array of length 3" in panic_message(result)
 
 
 # -- the directory calls ---------------------------------------------------------

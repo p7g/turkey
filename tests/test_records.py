@@ -124,7 +124,7 @@ fun main() {
 def test_a_record_pattern_on_a_positional_variant_is_still_refused():
     """A positional variant has no names, so a record pattern cannot match it."""
     src = "type Pair = Pair(Int, Int)\nfun f(p : Pair) -> Int = match p { Pair { a } -> a }"
-    assert fails(src) == "constructor 'Pair' has positional arguments, not fields"
+    assert fails(src) == "constructor 'Pair' has positional arguments, not fields; write 'Pair(...)'"
 
 
 def test_the_exhaustiveness_witness_is_a_pattern_the_checker_accepts():
@@ -253,8 +253,8 @@ fun main() {
 }
 """)
     assert message == ("cannot assign to field 'owner': it is not 'var' in "
-                       "'Account' (declared at Main.gob:1:26). Declare it "
-                       "'var owner' to make it assignable.")
+                       "'Account' (declared at Main.gob:1:26); declare it "
+                       "'var owner' to make it assignable")
 
 
 def test_a_polymorphic_assignment_is_checked_where_the_type_is_supplied():
@@ -315,7 +315,7 @@ def test_a_program_may_declare_its_own_bool():
     which is what stops the shadow from being a way to break the language."""
     check("type Bool = A | B\nfun main() { print(1) }")
     assert fails("type Bool = A | B\nfun main() { if A { print(1) } }") == (
-        "expected Main.Bool, found Data.Bool.Bool in an 'if' condition")
+        "expected 'Main.Bool', found 'Data.Bool.Bool' in an 'if' condition")
 
 
 def test_the_lower_case_spellings_are_gone():

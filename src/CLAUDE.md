@@ -127,6 +127,32 @@ walker comes to skip a new child silently.
 A function that reads a few fields on purpose -- an accessor, a diagnostic, a
 one-field test -- projects, or writes `..`.
 
+## Diagnostics
+
+A message has up to three parts, in this order, and the reader must be able to
+tell which part is which:
+
+1. **What is wrong**, stated about the code at the span and naming the user's
+   own identifiers and types: `'x' is bound twice in this pattern`. Every
+   message has this part.
+2. **The rule it breaks**, only when the first part leaves it unclear. Phrase
+   it modally -- *cannot*, *must*, *can only* -- never as a plain-present
+   description of how things are. `a function made by '_' uses its parameter
+   once` reads as neither the problem nor the requirement; `'_' can stand for
+   only one parameter` is the rule.
+3. **The fix**, when there is a clear one, as an imperative after a semicolon:
+   `; write 'Some(x)'`.
+
+Leave out the compiler's reasons ("so that reduction terminates") and its
+vocabulary (Core, binders, giblet, opens, lowering). Say *associated type*, as
+the reference does, not *type family*. A message starts lowercase, has no
+trailing period, and quotes code in single quotes. A runtime panic names the
+operation and the values it was given: `Byte.getLE: width 9 is outside 1..8`.
+
+The stage prefix says who is complaining. A check that only a compiler bug can
+fail uses the stage `internal error`, never a user-facing stage such as
+`type error`, so the reader knows the program is not at fault.
+
 ## Comments
 
 The standard is in the root `CLAUDE.md`: the code as it is now, no references

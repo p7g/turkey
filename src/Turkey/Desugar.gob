@@ -408,8 +408,8 @@ fun split(d : D, stmts : Vec Stmt, i : Int, k : Cont, span : Span,
         } else {
             expr(d, e, after, False, flow)
         }
-        SFun(_) -> oops("'?' is not supported in this kind of statement yet",
-                        s.span)
+        SFun(_) -> bug("'?' is not supported in this kind of statement yet",
+                       s.span)
     }
 }
 
@@ -431,7 +431,7 @@ fun binding(d : D, s : Stmt, pat : Pat, value : Expr, isVar : Bool,
 fun refuseEscapes(d : D, stmts : Vec Stmt, from : Int) -> Unit {
     for var j = from; j < len(stmts); j = j + 1 {
         match escapes(ChStmt(stmts[j]), False) {
-            Some(found) -> oops(
+            Some(found) -> bug(
                 "a 'return', 'break' or 'continue' cannot cross a '?' yet: it "
                 + "would have to be carried through the monad's 'bind' as a "
                 + "value, which is not implemented", found.span)
@@ -440,12 +440,23 @@ fun refuseEscapes(d : D, stmts : Vec Stmt, from : Int) -> Unit {
     }
 }
 
-fun refuseEscapesIn(d : D, e : Expr) -> Unit = match escapes(ChExpr(e), False) {
-    Some(found) -> oops(
-        "a 'return', 'break' or 'continue' cannot cross a '?' yet: it would "
-        + "have to be carried through the monad's 'bind' as a value, which is "
-        + "not implemented", found.span)
-    None -> {}
+-- Refuses a transfer inside `e`, a branch of the `if` or `match` that
+-- `construct` names.
+fun refuseEscapesIn(d : D, e : Expr, construct : String) -> Unit =
+    match escapes(ChExpr(e), False) {
+        Some(found) -> oops(
+            "this '" + keyword(found) + "' cannot leave the '" + construct
+            + "' around it, which holds a '?' and is nested in another "
+            + "expression; bind that '" + construct + "' with 'let' first",
+            found.span)
+        None -> {}
+    }
+
+-- Returns the keyword of a transfer that `escapes` found.
+fun keyword(transfer : Expr) -> String = match transfer.kind {
+    EReturn(_) -> "return"
+    EBreak(_) -> "break"
+    _ -> "continue"
 }
 
 -- -- expressions --------------------------------------------------------------------
@@ -513,10 +524,14 @@ fun expr(d : D, e : Expr, k : Cont, tail : Bool, flow : Bool) -> Expr {
         EForC(_, _, _, _) -> loopExpr(d, e, k)
         ELoop(_) -> loopExpr(d, e, k)
         EReturn(_) -> oops(
-            "'?' cannot appear in the value of a 'return' or 'break' yet", e.span)
+            "this 'return' is nested in another expression, so its value "
+            + "cannot hold a '?'; make the 'return' a statement of its own",
+            e.span)
         EBreak(_) -> oops(
-            "'?' cannot appear in the value of a 'return' or 'break' yet", e.span)
-        _ -> oops("'?' is not supported in this expression yet", e.span)
+            "this 'break' is nested in another expression, so its value "
+            + "cannot hold a '?'; make the 'break' a statement of its own",
+            e.span)
+        _ -> bug("'?' is not supported in this expression yet", e.span)
     }
 }
 
@@ -580,9 +595,9 @@ fun ifExpr(d : D, span : Span, cond : Expr, then : Expr,
         if !flow {
             -- Outside flow mode a branch becomes a lambda body, so a transfer
             -- in it would change meaning.
-            refuseEscapesIn(d, then)
+            refuseEscapesIn(d, then, "if")
             match otherwise {
-                Some(o) -> refuseEscapesIn(d, o)
+                Some(o) -> refuseEscapesIn(d, o, "if")
                 None -> {}
             }
         }
@@ -614,7 +629,7 @@ fun matchExpr(d : D, span : Span, scrutinee : Expr, arms : Vec Arm,
     expr(d, scrutinee, KFn(fun(s) = {
         let built = Vec.new(len(arms))
         for a in arms {
-            if !flow { refuseEscapesIn(d, a.body) }
+            if !flow { refuseEscapesIn(d, a.body, "match") }
             Vec.push(built, Arm {
                 span = a.span, patterns = a.patterns,
                 body = block(d, a.body, inner, flow),
@@ -671,7 +686,7 @@ fun transfer(d : D, e : Expr) -> Expr = match e.kind {
     EContinue -> pureOf(d, conOf(d, P.flowCont, [], e.span))
     EReturn(value) -> transferWith(d, P.flowRet, value, e.span)
     EBreak(value) -> transferWith(d, P.flowBrk, value, e.span)
-    _ -> oops("not a control transfer", e.span)
+    _ -> bug("not a control transfer", e.span)
 }
 
 fun transferWith(d : D, con : String, value : Option Expr, span : Span) -> Expr =
@@ -776,9 +791,8 @@ fun brokeArm(d : D, span : Span, body : Expr) -> Arm {
 -- inference, because only the expansion has a loop to lift.
 fun loopExpr(d : D, e : Expr, k : Cont) -> Expr {
     if !isFall(k) {
-        oops("a loop containing a '?' can only be a statement, not a value: "
-             + "its result has to carry whether the body broke, continued or "
-             + "returned", e.span)
+        oops("this " + loopName(e) + " holds a '?', so it cannot be nested "
+             + "in another expression; bind its value with 'let' first", e.span)
     }
     let span = e.span
     let name = fresh(d, "%loop")
@@ -822,7 +836,7 @@ fun loopExpr(d : D, e : Expr, k : Cont) -> Expr {
             wrap(d, Vec.append(optStmtArray(init),
                                  [loopFun(d, name, inner, span)]), call, span)
         }
-        _ -> oops("not a loop", span)
+        _ -> bug("not a loop", span)
     }
 }
 
@@ -832,6 +846,13 @@ fun loopBody(e : Expr) -> Expr = match e.kind {
     EForC(_, _, _, body) -> body
     ELoop(body) -> body
     _ -> e
+}
+
+-- Returns how a message names the loop `e`: "'while' loop", say.
+fun loopName(e : Expr) -> String = match e.kind {
+    EWhile(_, _) -> "'while' loop"
+    ELoop(_) -> "'loop'"
+    _ -> "'for' loop"
 }
 
 fun optStmtArray(s : Option Stmt) -> Vec Stmt = match s {
@@ -893,11 +914,11 @@ fun forIn(d : D, pat : Pat, iterable : Expr, iterFn : Option Expr,
     }), False, False)
 }
 
--- A `for` loop's `iter` or `next`, which resolution wrote. Absent only if the
--- module cannot see `Iterator` at all, which inference would refuse anyway.
+-- A `for` loop's `iter` or `next`, which the parser always writes and
+-- resolution resolves.
 fun iteration(d : D, ref : Option Expr, span : Span) -> Expr = match ref {
     Some(e) -> e
-    None -> oops("this 'for' loop has no 'iter' or 'next' in scope", span)
+    None -> bug("this 'for' loop has no 'iter' or 'next' in scope", span)
 }
 
 fun wrap(d : D, prefix : Vec Stmt, value : Expr, span : Span) -> Expr {
@@ -923,9 +944,9 @@ fun walkExpr(d : D, e : Expr) -> Expr {
             e.kind = ELambda(params, ret, context(d, body))
             return e
         }
-        EQuestion(_, _) -> oops(
-            "'?' is only meaningful inside a function body or a 'do' block",
-            e.span)
+        EQuestion(_, _) -> Diag.fail(Diag.at("type error",
+            "this '?' is not inside a function body or a 'do' block", e.span),
+            e.span.file)
         ELit(_) -> {}
         EUnit -> {}
         EVar(_, _) -> {}
@@ -1140,7 +1161,12 @@ fun indexOptStmt(d : D, s : Option Stmt) -> Unit = match s {
 
 -- -- diagnostics --------------------------------------------------------------------
 
+-- Raises a construct the language allows and this pass cannot translate.
 fun oops(message : String, where : Span) -> a =
     Diag.fail(Diag.at("unsupported", message, where), where.file)
+
+-- Raises a check that only a compiler bug can fail.
+fun bug(message : String, where : Span) -> a =
+    Diag.fail(Diag.at("internal error", message, where), where.file)
 
 fun discard(x : a) -> Unit = {}

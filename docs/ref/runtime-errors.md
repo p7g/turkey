@@ -50,7 +50,7 @@ may point at the caller instead.
 | `Int` arithmetic overflows (`+`, `-`, `*`, unary `-`) | `integer overflow in +` (and so on) |
 | `Int` division or remainder by zero | `division by zero`, `remainder by zero` |
 | An array is indexed outside its bounds | `array index out of bounds: ...` |
-| A map is indexed with a key it does not contain | `No such key` |
+| A map is indexed with a key it does not contain | `map has no entry for this key; ...` |
 | A call to `error(message)` | the message |
 
 <!-- panic: integer overflow in + -->

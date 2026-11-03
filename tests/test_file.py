@@ -212,7 +212,7 @@ fun main() {
     }
 }
 """, tmp_path)
-    assert out == ["invalid UTF-8", "open missing: no such file or directory",
+    assert out == ["the input is not well-formed UTF-8", "open missing: no such file or directory",
                    "the input ended early", "read .: is a directory"]
 
 

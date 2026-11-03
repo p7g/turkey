@@ -56,7 +56,8 @@ def scheme(src: str, name: str) -> str:
 
 
 def test_a_family_is_declared_over_the_class_parameter():
-    assert "must be a family over 'c'" in fails(
+    assert "associated type 'Elem' must take the class parameter 'c', not 'd'; " \
+        "write 'type Elem c'" in fails(
         "class C c {\n type Elem d\n fun f(c) -> Int\n}"
     )
 
@@ -92,7 +93,7 @@ def test_a_family_takes_the_kind_the_class_gives_its_parameter():
     """
     # `f` is applied in `peek`, so it is `* -> *`, and `Held` is a family over
     # a constructor rather than over a type.
-    assert "has kind *, but 'Box.Held' is a family over a type of kind * -> *" in fails(
+    assert "has kind *, but 'Box.Held' expects an argument of kind * -> *" in fails(
         src + "fun f(x : Held Int) -> Int = 1"
     )
 
@@ -101,14 +102,14 @@ def test_a_family_takes_the_kind_the_class_gives_its_parameter():
 
 
 def test_an_instance_must_define_every_family():
-    assert "does not define Elem" in fails(
+    assert "does not define 'Elem'" in fails(
         "class C c {\n type Elem c\n fun f(c) -> Elem c\n}\n"
         "instance C Int {\n fun f(x) = x\n}"
     )
 
 
 def test_an_instance_may_not_define_a_family_the_class_lacks():
-    assert "not a type family of class 'C'" in fails(
+    assert "not an associated type of class 'C'" in fails(
         "class C c {\n fun f(c) -> Int\n}\n"
         "instance C Int {\n type Elem = Int\n fun f(x) = 1\n}"
     )
@@ -125,7 +126,7 @@ def test_a_definition_may_not_grow_its_argument():
     # `Elem (Array a)` is `Elem` again over something *larger*, so reduction
     # would not terminate. The rule is that a family's argument here is a
     # variable of the head, which is a proper subterm of what selected it.
-    assert "so that reduction terminates" in fails(
+    assert "can only be applied to a type variable of the instance head" in fails(
         "class C c {\n type Elem c\n fun f(c) -> Elem c\n}\n"
         "instance C (Array a) {\n type Elem = Elem (Array a)\n fun f(xs) = xs[0]\n}"
     )
@@ -221,17 +222,16 @@ def test_a_carried_equation_is_checked_at_the_use_site(capsys):
     """
     # `Elem (Array String)` reduces, and the equality is then an ordinary
     # mismatch at the call rather than a mystery inside `f`.
-    assert "expected String, found Int" in fails(bad)
+    assert "expected 'String', found 'Int'" in fails(bad)
 
 
 def test_an_equation_that_can_never_be_decided_is_rejected():
     message = fails(CONTAINER + "fun f[Container c](xs : c) -> Int = first(xs)")
     # `c` is the name the signature wrote, kept by the skolem.
-    assert "cannot reduce 'Container.Elem c' to 'Int'" in message
-    assert "which 'Container' instance defines it" in message
+    assert "cannot tell whether 'Container.Elem c' is 'Int'" in message
     # And the remedy, which is the equality itself: `f` is rejected for saying
     # too little, not for being wrong, and adding it to the context fixes it.
-    assert "Add 'Container.Elem c ~ Int' to the context." in message
+    assert "add 'Container.Elem c ~ Int' to the context" in message
     assert scheme(
         CONTAINER + "fun f[Elem c ~ Int, Container c](xs : c) -> Int = first(xs)",
         "f",
@@ -240,7 +240,7 @@ def test_an_equation_that_can_never_be_decided_is_rejected():
 
 def test_a_family_over_a_type_with_no_instance_is_rejected_where_written():
     assert fails(CONTAINER + "fun f(x : Elem Bool) -> Int = 1\nfun g() = f(True)") == (
-        "no instance for 'Container Bool', so 'Container.Elem Bool' has no definition"
+        "no instance for 'Container Bool', which 'Container.Elem Bool' needs"
     )
 
 
@@ -391,12 +391,12 @@ def test_two_answers_for_one_family_application_conflict():
     src = OPS + """
     fun bad[Iterator s, Item s ~ Op, Item s ~ Int](ops : s) -> Int = 1
     """
-    assert "and a family has one answer for one argument" in fails(src)
+    assert "is required to be both 'Op' and 'Int'; keep one equality" in fails(src)
 
 
 def test_the_left_side_of_an_equality_must_be_a_family():
     src = "fun f[Int ~ a](x : a) -> Int = 1"
-    assert "is not a type family" in fails(src)
+    assert "'Int' is not an associated type" in fails(src)
 
 
 def test_an_equality_may_not_define_a_family_by_itself():
@@ -405,5 +405,5 @@ def test_an_equality_may_not_define_a_family_by_itself():
 
 
 def test_a_context_entry_that_is_neither_form_is_a_parse_error():
-    assert "an equality, as in 'Item c ~ Op'" in fails("fun f[Ord a b](x : a) -> Int = 1")
+    assert "neither a constraint nor an equality" in fails("fun f[Ord a b](x : a) -> Int = 1")
 

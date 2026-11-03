@@ -218,7 +218,7 @@ fun newDeclTable() -> DeclTable {
 
 fun head(t : DeclTable, name : String) -> Ty.Type = match Map.get(t.heads, name) {
     Some(h) -> h
-    None -> oops("unknown type '" + name + "'", None)
+    None -> bug("unknown type '" + name + "'", None)
 }
 
 -- -- registration -------------------------------------------------------------------
@@ -265,10 +265,12 @@ fun registerAll(t : DeclTable, decls : Vec TypeDecl) -> Unit {
                     }
                 }
                 let distinct = Set.new()
-                for b in c.binders { Set.add(distinct, b) }
-                if len(Set.elements(distinct)) != len(c.binders) {
-                    oops("the bracket of '" + c.name + "' binds a variable twice",
-                         Some(c.span))
+                for b in c.binders {
+                    if Set.contains(distinct, b) {
+                        oops("'" + b + "' appears twice in the bracket of '"
+                             + c.name + "'", Some(c.span))
+                    }
+                    Set.add(distinct, b)
                 }
                 let hiddenSet = Set.new()
                 for name in hidden { Set.add(hiddenSet, name) }
@@ -343,9 +345,8 @@ fun checkAliasHead(t : DeclTable, d : TypeDecl) -> Unit = match d.alias {
         TECon(name, args) -> {
             if len(args) != 0 && !Map.contains(t.tycons, name)
                     && !Map.contains(t.families, name) {
-                oops("unknown type '" + name + "'; if '" + name + "' is meant as a "
-                     + "constructor, parenthesize its payload: write '" + name
-                     + "(...)'", Some(te.span))
+                oops("unknown type '" + name + "'; to declare a constructor, "
+                     + "write '" + name + "(...)'", Some(te.span))
             }
         }
         _ -> {}
@@ -355,7 +356,7 @@ fun checkAliasHead(t : DeclTable, d : TypeDecl) -> Unit = match d.alias {
 
 fun tyconOf(t : DeclTable, name : String) -> TyconInfo = match Map.get(t.tycons, name) {
     Some(info) -> info
-    None -> oops("unknown type '" + name + "'", None)
+    None -> bug("unknown type '" + name + "'", None)
 }
 
 -- The declaration's parameters as variables carrying the kinds its own kind
@@ -369,7 +370,7 @@ fun paramVars(info : TyconInfo, level : Int) -> Map String Ty.Type {
                 Map.put(out, p, TVar(Ty.newVar(level, arg)))
                 k = res
             }
-            _ -> oops("type '" + info.name + "' has fewer arrows than parameters",
+            _ -> bug("type '" + info.name + "' has fewer arrows than parameters",
                       info.span)
         }
     }
@@ -480,13 +481,11 @@ fun checkVars(decl : TypeDecl, c : ConDecl, variants : Vec ConDecl) -> Unit {
     let at = Some(firstVarSpan(c))
     if len(variants) > 1 {
         oops("field '" + c.vars[0] + "' cannot be 'var': '" + decl.name
-             + "' has more than one constructor, and an assignment cannot name a "
-             + "field that only some of its values have", at)
+             + "' has more than one constructor", at)
     }
     if len(hiddenVariables(c)) > 0 {
         oops("field '" + c.vars[0] + "' cannot be 'var': '" + c.name
-             + "' is existential, and an assignment cannot name the type a "
-             + "hidden field holds", at)
+             + "' is existential", at)
     }
 }
 
@@ -589,9 +588,9 @@ fun toType(t : DeclTable, te : Type, tyvars : Map String Ty.Type,
             -- family's do; an expansion has kind `*`, so that is a kind error
             -- naming what the alias stands for, `Int Bool` saying `Int`.
             if len(resolved) < len(info.params) {
-                oops("type alias '" + name + "' expects "
-                     + Int.toString(len(info.params)) + " argument(s), but "
-                     + Int.toString(len(resolved)) + " were given; an alias "
+                oops("type alias '" + name + "' needs "
+                     + arguments(len(info.params)) + " but has "
+                     + Int.toString(len(resolved)) + "; an alias "
                      + "cannot be partially applied", Some(te.span))
             }
             let substitution = Map.new()
@@ -618,22 +617,25 @@ fun family(t : DeclTable, te : Type, name : String, args : Vec Type,
            tyvars : Map String Ty.Type, fresh : Ty.Fresh) -> Ty.Type {
     let fam = match Map.get(t.families, name) {
         Some(f) -> f
-        None -> oops("unknown type family '" + name + "'", Some(te.span))
+        None -> bug("unknown type family '" + name + "'", Some(te.span))
     }
     if len(args) == 0 {
-        oops("'" + name + "' is a type family of class '" + fam.cls
+        oops("'" + name + "' is an associated type of class '" + fam.cls
              + "' and must be applied to a type", Some(te.span))
     }
     let resolved = Array.map(args, toType(t, _, tyvars, fresh))
     if !Ty.unifyKinds(Ty.kindOf(resolved[0]), fam.argKind) {
         oops("'" + Ty.show(resolved[0]) + "' has kind "
              + Ty.showKind(Ty.kindOf(resolved[0])) + ", but '" + name
-             + "' is a family over a type of kind " + Ty.showKind(fam.argKind),
+             + "' expects an argument of kind " + Ty.showKind(fam.argKind),
              Some(te.span))
     }
     Ty.applyTo(TFam(name, resolved[0], fam.resKind),
                Array.slice(resolved, 1, len(resolved)), Some(te.span))
 }
+
+fun arguments(n : Int) -> String =
+    if n == 1 { "1 argument" } else { Int.toString(n) + " arguments" }
 
 fun expandAlias(t : DeclTable, info : TyconInfo, substitution : Map String Ty.Type,
                 fresh : Ty.Fresh) -> Ty.Type {
@@ -642,7 +644,7 @@ fun expandAlias(t : DeclTable, info : TyconInfo, substitution : Map String Ty.Ty
     let local = Map.new()
     let body = match info.aliasBody {
         Some(b) -> toType(t, b, local, fresh)
-        None -> oops("type alias '" + info.name + "' has no body", info.span)
+        None -> bug("type alias '" + info.name + "' has no body", info.span)
     }
     let mapping = Map.new()
     for (name, stood) in Map.entries(local) {
@@ -744,7 +746,7 @@ fun fieldType(t : DeclTable, receiver : Ty.Type, label : String) -> Ty.Type {
     let (h, args) = Ty.spine(receiver)
     let name = match h {
         TCon(c) -> c.name
-        _ -> oops("a field was read from something that is not a record", None)
+        _ -> bug("a field was read from something that is not a record", None)
     }
     let c = tyconOf(t, name).variants[0]
     match c.scheme.body {
@@ -753,13 +755,13 @@ fun fieldType(t : DeclTable, receiver : Ty.Type, label : String) -> Ty.Type {
             let index = match c.fields {
                 Some(fs) -> match Array.indexOf(fs, label) {
                     Some(i) -> i
-                    None -> oops("'" + name + "' has no field '" + label + "'", None)
+                    None -> bug("'" + name + "' has no field '" + label + "'", None)
                 }
-                None -> oops("'" + name + "' is not a record", None)
+                None -> bug("'" + name + "' is not a record", None)
             }
             substitute(params[index], mapping)
         }
-        _ -> oops("constructor '" + c.name + "' is not a function", None)
+        _ -> bug("constructor '" + c.name + "' is not a function", None)
     }
 }
 
@@ -1147,11 +1149,18 @@ fun typeVariablesInto(te : Type, out : Vec Type) -> Unit = match te.kind {
 -- caught before any of this runs, so reaching here is a bug rather than a
 -- program's mistake.
 fun undeclared() -> VarCell =
-    oops("type declaration validation missed an undeclared variable", None)
+    bug("type declaration validation missed an undeclared variable", None)
 
 fun oops(message : String, where : Option Span) -> a = match where {
     None -> Diag.fail(Diag.whole("type error", message), "")
     Some(s) -> Diag.fail(Diag.at("type error", message, s), s.file)
+}
+
+-- A check only a compiler bug can fail, so it is not reported as the
+-- program's fault.
+fun bug(message : String, where : Option Span) -> a = match where {
+    None -> Diag.fail(Diag.whole("internal error", message), "")
+    Some(s) -> Diag.fail(Diag.at("internal error", message, s), s.file)
 }
 
 fun discard(x : a) -> Unit = {}

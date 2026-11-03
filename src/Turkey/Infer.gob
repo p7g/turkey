@@ -112,7 +112,9 @@ type Generator = Generator {
     matchSites  : Vec (Expr, Ty.Type),
     -- And irrefutability: every pattern that binds with no second arm to fall
     -- to.
-    binderSites : Vec (Pat, Ty.Type),
+    -- A binding pattern, the type it binds, and what a refutable one should
+    -- be rewritten as.
+    binderSites : Vec (Pat, Ty.Type, String),
     -- And every expression whose value is thrown away, recorded after it is
     -- generated, since whether a value is discarded is a property of where the
     -- expression sits rather than of the expression.
@@ -302,14 +304,13 @@ fun generate(g : Generator, modules : Vec (String, Program)) -> (Vec Stmt, Const
                      Some(items[i].span))
             }
             if Map.contains(g.decls.foreigns, name) {
-                oops("'" + name + "' is already defined: it is a foreign "
-                     + "declaration, which binds the name the same way a "
-                     + "'fun' does", Some(items[i].span))
+                oops("'" + name + "' is already defined by a foreign "
+                     + "declaration; rename one of them", Some(items[i].span))
             }
             match Map.get(g.classes.owner, name) {
-                Some(cls) -> oops("'" + name + "' is already defined: it is a "
-                    + "method of class '" + cls + "', and methods share the "
-                    + "namespace of ordinary functions", Some(items[i].span))
+                Some(cls) -> oops("'" + name + "' is already defined as a method "
+                    + "of class '" + cls + "'; rename one of them",
+                    Some(items[i].span))
                 None -> {}
             }
             Map.put(owner, name, key)
@@ -380,8 +381,9 @@ fun checkGroupRecursion(group : Vec Stmt, boundNames : Vec String,
     for item in group {
         match item.kind {
             SFun(_) -> {}
-            _ -> oops("cyclic definition: " + String.join(boundNames, ", ")
-                      + " depend on each other, but only functions may be "
+            _ -> oops("cyclic definition: "
+                      + String.join(Array.map(boundNames, fun(n) = "'" + n + "'"), ", ")
+                      + " depend on each other, but only functions can be "
                       + "mutually recursive", Some(group[0].span))
         }
     }
@@ -406,8 +408,8 @@ fun bindForeigns(g : Generator, decls : Vec ForeignDecl) -> Unit {
             PAnnot(_, te) -> foreignType(g, te, d.name)
             -- The parser builds every one of these, so this cannot
             -- happen; saying so beats a silent wrong type.
-            _ -> oops("a foreign parameter must state its type",
-                      Some(param.span))
+            _ -> bug("a foreign parameter must state its type",
+                     Some(param.span))
         })
         let ret = foreignType(g, d.ret, d.name)
         checkForeignArity(d.name, d.span, params)
@@ -443,13 +445,13 @@ fun checkDefinitions(g : Generator, items : Vec Stmt) -> Unit {
             if let Some(symbol) = d.symbol {
                 let params = Array.map(d.params, fun(param) = match param.kind {
                     PAnnot(_, te) -> foreignType(g, te, Ty.shortName(d.name))
-                    _ -> oops("a foreign parameter must state its type",
-                              Some(param.span))
+                    _ -> bug("a foreign parameter must state its type",
+                             Some(param.span))
                 })
                 let ret = match d.ret {
                     Some(te) -> foreignType(g, te, Ty.shortName(d.name))
-                    None -> oops("a foreign definition must state its result type",
-                                 Some(d.span))
+                    None -> bug("a foreign definition must state its result type",
+                                Some(d.span))
                 }
                 checkForeignArity(Ty.shortName(d.name), d.span, params)
                 var general = 0
@@ -458,11 +460,10 @@ fun checkDefinitions(g : Generator, items : Vec Stmt) -> Unit {
                 }
                 let limit = Ty.foreignArgLimit()
                 if general >= limit {
-                    oops("'" + Ty.shortName(d.name) + "' takes " + Int.toString(general)
-                         + " general arguments, and a foreign definition takes "
-                         + "at most " + Int.toString(limit - 1) + ": its body is "
-                         + "a Turkey function, whose environment arrives in one "
-                         + "of the eight", Some(d.span))
+                    oops("'" + Ty.shortName(d.name) + "' has " + Int.toString(general)
+                         + " non-'Float' parameters, but a foreign definition "
+                         + "can have at most " + Int.toString(limit - 1),
+                         Some(d.span))
                 }
                 for (_, other) in Map.entries(g.decls.foreigns) {
                     if other.symbol == symbol { symbolClaimed(symbol, other, d.span) }
@@ -480,8 +481,9 @@ fun checkDefinitions(g : Generator, items : Vec Stmt) -> Unit {
 }
 
 fun symbolClaimed(symbol : String, other : ForeignInfo, span : Span) -> a =
-    oops("the C symbol '" + symbol + "' is already claimed by '"
-         + Ty.shortName(other.name) + "'; a program may define or declare a symbol once", Some(span))
+    oops("the C symbol '" + symbol + "' is already declared or defined by '"
+         + Ty.shortName(other.name) + "'; a C symbol can be declared or defined "
+         + "only once", Some(span))
 
 -- One argument or result type, checked against what can cross.
 --
@@ -496,10 +498,8 @@ fun foreignType(g : Generator, te : Type, who : String) -> Ty.Type {
         TCon(cell) -> if Ty.isForeignType(cell.name) { return ty }
         _ -> {}
     }
-    oops("'" + Ty.show(ty) + "' cannot cross a foreign boundary in '" + who
-         + "'; a foreign signature is written over " + Ty.foreignTypes()
-         + ", and anything else is copied into raw memory by its caller",
-         Some(te.span))
+    oops("'" + Ty.show(ty) + "' cannot appear in the foreign signature of '"
+         + who + "'; use one of " + Ty.foreignTypes(), Some(te.span))
 }
 
 -- At most eight arguments per register file, variadic ones included.
@@ -523,14 +523,11 @@ fun checkForeignArity(name : String, span : Span, params : Array Ty.Type) -> Uni
         else { general = general + 1 }
     }
     let limit = Ty.foreignArgLimit()
-    for (count, file, regs) in [(general, "general", "x0-x7"),
-                                (vector, "floating-point", "d0-d7")] {
+    for (count, which) in [(general, "non-'Float'"), (vector, "'Float'")] {
         if count > limit {
-            oops("'" + name + "' takes " + Int.toString(count) + " " + file
-                 + " arguments, and only " + Int.toString(limit) + " fit in "
-                 + regs + "; arguments past the registers go on the stack by a "
-                 + "convention this compiler does not implement",
-                 Some(span))
+            oops("'" + name + "' has " + Int.toString(count) + " " + which
+                 + " parameters, but a foreign function can have at most "
+                 + Int.toString(limit), Some(span))
         }
     }
 }
@@ -544,8 +541,8 @@ fun bindMethods(g : Generator) -> Unit {
                 -- and unqualified, so every module sees the same one. Binding it
                 -- again is a no-op, not a collision.
                 if !alreadyOwned {
-                    oops("'" + m.name + "' is already defined; a class method "
-                         + "shares the namespace of ordinary functions",
+                    oops("the class method '" + m.name + "' has the same name as "
+                         + "an existing function; rename one of them",
                          Some(m.decl.span))
                 }
             } else {
@@ -597,8 +594,8 @@ fun genMethodBodies(g : Generator, classDecls : Vec ClassDecl,
         for methodDecl in decl.methods {
             let m = match Map.get(info.methods, methodDecl.name) {
                 Some(x) -> x
-                None -> oops("'" + methodDecl.name + "' is not a method of '"
-                             + decl.cls + "'", Some(methodDecl.span))
+                None -> bug("'" + methodDecl.name + "' is not a method of '"
+                            + decl.cls + "'", Some(methodDecl.span))
             }
             let sk = Classes.newSkolems()
             for v in Ty.varsOf([inst.head]) {
@@ -622,13 +619,13 @@ fun instanceFor(g : Generator, decl : InstanceDecl) -> InstInfo {
            && inst.decl.span.col == decl.span.col
            && inst.decl.span.file == decl.span.file { return inst }
     }
-    oops("no registered instance for this declaration", Some(decl.span))
+    bug("no registered instance for this declaration", Some(decl.span))
 }
 
 fun classNamed(g : Generator, name : String) -> ClassInfo =
     match Map.get(g.classes.classes, name) {
         Some(i) -> i
-        None -> oops("unknown class '" + name + "'", None)
+        None -> bug("unknown class '" + name + "'", None)
     }
 
 fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
@@ -677,8 +674,14 @@ fun checkMethod(g : Generator, m : MethodInfo, sk : Skolems,
     push(g)
     let inferred = genFunction(g, decl.params, decl.ret, decl.body, decl.span,
                                decl.context, None, -1)
+    -- A method's name is qualified by its class, which the message names
+    -- separately.
+    let method = match String.rsplitOnce(Ty.shortName(m.name), ".") {
+        Some((_, after)) -> after
+        None -> Ty.shortName(m.name)
+    }
     eq(g, inferred, expected, Some(decl.span),
-       "the type class '" + m.cls + "' declares for '" + m.name + "'")
+       "the type of '" + method + "' that class '" + m.cls + "' declares")
     let defn = pop(g)
     -- A binder for the rank, not for the polymorphism: the expected type is
     -- rigid, so nothing generalizes. What the rank buys is that a predicate the
@@ -774,8 +777,8 @@ fun declaredScheme(g : Generator,
         }
         if !touches {
             oops("'" + Ty.showPredWith(preds[i], written) + "' constrains a type "
-                 + "that the declared type of '" + decl.name + "' does not "
-                 + "mention, so no use of '" + decl.name + "' could decide it",
+                 + "variable that the declared type of '" + decl.name + "' does "
+                 + "not mention; remove it from the context",
                  Some(decl.context[i].span))
         }
     }
@@ -877,14 +880,14 @@ fun checkExhaustiveness(g : Generator) -> Unit {
     }
     -- After every match, as in `turkey/infer.py`, so a program with both faults
     -- reports the same one first on either side.
-    for (pat, bound) in g.binderSites {
+    for (pat, bound, fix) in g.binderSites {
         match Exhaustive.checkPattern(g.decls, pat, Typed.resolve(g.types, bound)) {
             None -> {}
             Some(missing) -> {
-                let detail = if missing == "_" { "it does not match every value" }
-                             else { "'" + missing + "' is not matched" }
-                oops("this pattern is refutable; " + detail
-                     + ". Use 'if let' or 'match'", Some(pat.span))
+                let detail = if missing == "_" { "every value" }
+                             else { "'" + missing + "'" }
+                oops("this pattern does not match " + detail + "; " + fix,
+                     Some(pat.span))
             }
         }
     }
@@ -1097,7 +1100,7 @@ fun buildDefinition(g : Generator, group : Vec Stmt)
     match stmt.kind {
         SLet(pat, value) -> letDefinition(g, stmt, pat, value, False)
         SVar(pat, value) -> letDefinition(g, stmt, pat, value, True)
-        _ -> oops("only functions may share a binding group", Some(stmt.span))
+        _ -> bug("only functions may share a binding group", Some(stmt.span))
     }
 }
 
@@ -1109,7 +1112,7 @@ fun letDefinition(g : Generator, stmt : Stmt, pat : Pat, value : Expr,
     Vec.push(g.openings, None)
     let bound = matchPattern(g, pat, t)
     discard(Vec.pop(g.openings))
-    Vec.push(g.binderSites, (pat, t))
+    Vec.push(g.binderSites, (pat, t, "use 'if let' or 'match'"))
     let binds = Vec.new(4)
     for (n, ty) in Map.entries(bound) { Vec.push(binds, (n, ty)) }
     let defn = pop(g)
@@ -1158,7 +1161,7 @@ fun buildFunGroup(g : Generator, decls : Vec FunDecl)
         eq(g, placeholder,
            genFunction(g, decl.params, decl.ret, decl.body, decl.span,
                        decl.context, None, decl.id),
-           Some(decl.span), "")
+           Some(decl.span), "the definition of '" + Ty.shortName(decl.name) + "'")
     }
     let inner = pop(g)
     discard(Vec.pop(g.scopes))
@@ -1194,7 +1197,8 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
     let paramTypes = Array.map(params, fun(param) {
         let tv = fresh(g)
         mergeInto(binds, matchPattern(g, param, tv), param.span)
-        Vec.push(g.binderSites, (param, tv))
+        Vec.push(g.binderSites, (param, tv,
+            "name the parameter and 'match' on it in the body"))
         tv
     })
     let openings = popOpenings(g)
@@ -1216,7 +1220,9 @@ fun genFunction(g : Generator, params : Vec Pat, retAnnot : Option Type,
         None -> {
             let written = Classes.resolveContext(g.classes, context,
                 g.tyvarScopes[len(g.tyvarScopes) - 1], Some(fun() = freshCell(g)))
-            for p in written { emit(g, C.cpredOf(p, Some(where), "read")) }
+            for p in written {
+                emit(g, C.cpredOf(p, Some(where), "the context this function declares"))
+            }
             -- The header has been read and the body has not, so the scope holds
             -- exactly the variables the header wrote.
             if key >= 0 {
@@ -1306,7 +1312,11 @@ fun matchPatternInner(g : Generator, pat : Pat, t : Ty.Type) -> Map String Ty.Ty
             Map.new()
         }
         PAnnot(inner, te) -> {
-            eq(g, t, typeOf(g, te), Some(pat.span), "a pattern annotation")
+            let what = match inner.kind {
+                PVar(name) -> "the annotation on '" + name + "'"
+                _ -> "a type annotation"
+            }
+            eq(g, t, typeOf(g, te), Some(pat.span), what)
             matchPattern(g, inner, t)
         }
         PTuple(elems) -> {
@@ -1343,12 +1353,13 @@ fun matchPatternInner(g : Generator, pat : Pat, t : Ty.Type) -> Map String Ty.Ty
             TFun(conParams, conRet) -> {
                 let info = match Decls.con(g.decls, name) {
                     Some(i) -> i
-                    None -> oops("unknown constructor '" + name + "'", Some(pat.span))
+                    None -> bug("unknown constructor '" + name + "'", Some(pat.span))
                 }
                 let names = match info.fields {
                     Some(ns) -> ns
                     None -> oops("constructor '" + name + "' has positional "
-                                 + "arguments, not fields", Some(pat.span))
+                                 + "arguments, not fields; write '" + name
+                                 + "(...)'", Some(pat.span))
                 }
                 eq(g, t, conRet, Some(pat.span), "the pattern '" + name + "'")
                 let out = Map.new()
@@ -1423,7 +1434,7 @@ fun genStmt(g : Generator, stmt : Stmt) -> Ty.Type = match stmt.kind {
         genAssign(g, stmt.span, target, value)
         Ty.tUnit()
     }
-    _ -> oops("a binder reached the statement generator", Some(stmt.span))
+    _ -> bug("a binder reached the statement generator", Some(stmt.span))
 }
 
 fun genAssign(g : Generator, where : Span, target : Expr, value : Expr) -> Unit =
@@ -1433,8 +1444,8 @@ fun genAssign(g : Generator, where : Span, target : Expr, value : Expr) -> Unit 
                 oops("'" + name + "' is not defined", Some(where))
             }
             if !isMutable(g, name) {
-                oops("cannot assign to '" + name + "': it was bound with 'let'. "
-                     + "Use 'var' to make it reassignable.", Some(where))
+                oops("cannot assign to '" + name + "': it was bound with 'let'; "
+                     + "declare it with 'var' to make it reassignable", Some(where))
             }
             eq(g, use(g, name, Some(where), None), genExpr(g, value), Some(where),
                "the assignment to '" + name + "'")
@@ -1450,8 +1461,8 @@ fun genAssign(g : Generator, where : Span, target : Expr, value : Expr) -> Unit 
             eq(g, genExpr(g, index), Ty.tInt(), Some(where), "an array index")
             eq(g, element, genExpr(g, value), Some(where), "the assigned value")
         }
-        _ -> oops("the parser should have rejected this assignment target",
-                  Some(where))
+        _ -> bug("the parser should have rejected this assignment target",
+                 Some(where))
     }
 
 -- -- expressions -------------------------------------------------------------------
@@ -1526,7 +1537,9 @@ fun arrayLiteralType(g : Generator, e : Expr, element : Ty.Type) -> Ty.Type {
 fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
     ELit(l) -> {
         let kind = litKind(l)
-        if isNumericKind(kind) { numeric(g, kind, l, Some(e.span), "") }
+        if isNumericKind(kind) {
+            numeric(g, kind, l, Some(e.span), "a numeric literal")
+        }
         else { literalType(kind) }
     }
     EUnit -> Ty.tUnit()
@@ -1562,7 +1575,7 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
     }
     EIndex(arr, index, _, _) -> {
         let element = fresh(g)
-        eq(g, genExpr(g, arr), Ty.arrayOf(element), Some(e.span), "an index")
+        eq(g, genExpr(g, arr), Ty.arrayOf(element), Some(e.span), "the indexed value")
         eq(g, genExpr(g, index), Ty.tInt(), Some(index.span), "an array index")
         element
     }
@@ -1583,7 +1596,7 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
                    "the operand of '" + op + "'")
                 result
             }
-            None -> oops("no rule for unary '" + op + "'", Some(e.span))
+            None -> bug("no rule for unary '" + op + "'", Some(e.span))
         }
     }
     EBinary(op, left, right, fn) -> match fn {
@@ -1596,10 +1609,10 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
                    "the right operand of '" + op + "'")
                 result
             }
-            None -> oops("no rule for binary '" + op + "'", Some(e.span))
+            None -> bug("no rule for binary '" + op + "'", Some(e.span))
         }
     }
-    EChain(_, _) -> oops("an operator chain survived resolution", Some(e.span))
+    EChain(_, _) -> bug("an operator chain survived resolution", Some(e.span))
     EAnnot(inner, te) -> {
         let annotated = typeOf(g, te)
         join(g, genExpr(g, inner), annotated, Some(e.span), "a type annotation")
@@ -1673,7 +1686,7 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
     EMatch(scrutinee, arms) -> genMatch(g, e, scrutinee, arms)
     EReturn(value) -> {
         if len(g.fnStack) == 0 {
-            oops("'return' is only valid inside a function", Some(e.span))
+            oops("'return' cannot appear outside a function", Some(e.span))
         }
         let t = match value {
             Some(v) -> genExpr(g, v)
@@ -1684,7 +1697,7 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
     }
     EBreak(value) -> {
         if len(g.loopStack) == 0 {
-            oops("'break' is only valid inside a loop", Some(e.span))
+            oops("'break' cannot appear outside a loop", Some(e.span))
         }
         let ctx = g.loopStack[len(g.loopStack) - 1]
         ctx.sawBreak = True
@@ -1693,7 +1706,7 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
                        "a valueless 'break'")
             Some(v) -> if ctx.kind != "loop" {
                 oops("'break' cannot carry a value out of a '" + ctx.kind
-                     + "' loop; only 'loop' produces one", Some(e.span))
+                     + "' loop; remove the value, or use 'loop'", Some(e.span))
             } else {
                 ctx.result = join(g, ctx.result, genExpr(g, v), Some(e.span),
                                   "a 'break'")
@@ -1703,12 +1716,12 @@ fun genExprKind(g : Generator, e : Expr) -> Ty.Type = match e.kind {
     }
     EContinue -> {
         if len(g.loopStack) == 0 {
-            oops("'continue' is only valid inside a loop", Some(e.span))
+            oops("'continue' cannot appear outside a loop", Some(e.span))
         }
         TBottom
     }
-    EQuestion(_, _) -> oops("'?' survived desugaring", Some(e.span))
-    EDo(_) -> oops("'do' survived desugaring", Some(e.span))
+    EQuestion(_, _) -> bug("'?' survived desugaring", Some(e.span))
+    EDo(_) -> bug("'do' survived desugaring", Some(e.span))
 }
 
 -- A constructor's type at a use: an existential with a context is used like a
@@ -1752,10 +1765,9 @@ fun openedCon(g : Generator, pat : Pat, name : String) -> Ty.Type {
     }
     let pending = match top {
         Some(list) -> list
-        None -> oops("the pattern '" + name + "' opens an existential "
-            + "constructor, which only a 'match' arm or a function parameter "
-            + "may do: a 'let', 'var' or 'for' has no body for the type it "
-            + "hides to live in", Some(pat.span))
+        None -> oops("the existential constructor '" + name + "' cannot be "
+            + "matched by a 'let', 'var' or 'for' pattern; match it in a "
+            + "'match' arm or a function parameter", Some(pat.span))
     }
     -- One `Skolems` per pattern, but the names have to be unique across the
     -- whole opening scope, not just this pattern: every opening in an arm or a
@@ -1816,7 +1828,7 @@ fun genRecord(g : Generator, e : Expr, conName : String,
         TFun(conParams, conRet) -> {
             let info = match Decls.con(g.decls, conName) {
                 Some(i) -> i
-                None -> oops("unknown constructor '" + conName + "'", Some(e.span))
+                None -> bug("unknown constructor '" + conName + "'", Some(e.span))
             }
             let names = match info.fields {
                 Some(ns) -> ns
@@ -1838,14 +1850,16 @@ fun genRecord(g : Generator, e : Expr, conName : String,
                 if !Array.contains(given, n) { Vec.push(missing, n) }
             }
             if len(missing) > 0 {
-                oops("'" + conName + "' is missing field(s): "
-                     + String.join(missing, ", "), Some(e.span))
+                let noun = if len(missing) == 1 { "field " } else { "fields " }
+                oops("'" + conName + "' is missing " + noun
+                     + String.join(Vec.map(missing, fun(n) = "'" + n + "'"), ", "),
+                     Some(e.span))
             }
             let seen = Set.new()
             for f in given {
                 if Set.contains(seen, f) {
-                    oops("a field is initialized twice in '" + conName + "'",
-                         Some(e.span))
+                    oops("field '" + f + "' is initialized twice in '" + conName
+                         + "'", Some(e.span))
                 }
                 Set.add(seen, f)
             }
@@ -1867,7 +1881,7 @@ fun genRecord(g : Generator, e : Expr, conName : String,
 fun familyResult(g : Generator, fam : String) -> Ty.Kind =
     match Map.get(g.classes.decls.families, fam) {
         Some(info) -> info.resKind
-        None -> oops("'" + fam + "' was not declared", None)
+        None -> bug("'" + fam + "' was not declared", None)
     }
 
 -- Emit `%HasField.f r` for `r.f` and hand back `%Field.f r`. An assignment to
@@ -1900,20 +1914,20 @@ fun genField(g : Generator, e : Expr, assigning : Bool) -> Ty.Type =
             let reads = Ty.pred(cls, [receiver])
             Vec.push(u.preds, reads)
             emit(g, C.cpredOf(reads, Some(e.span),
-                if assigning { "mutate" } else { "read" }))
+                if assigning { "assign to" } else { "read" }))
             if assigning {
                 let setter = Classes.setterClass(name)
                 discard(Classes.ensureGenerated(g.classes, setter))
                 let writes = Ty.pred(setter, [receiver])
                 Vec.push(u.preds, writes)
-                emit(g, C.cpredOf(writes, Some(e.span), "mutate"))
+                emit(g, C.cpredOf(writes, Some(e.span), "assign to"))
             }
             Map.put(g.types.uses, e.id, u)
             emit(g, CUse(u))
             let fam = Classes.fieldFamily(name)
             TFam(fam, receiver, familyResult(g, fam))
         }
-        _ -> oops("not a field access", Some(e.span))
+        _ -> bug("not a field access", Some(e.span))
     }
 
 -- An operator is a call to the method it desugars to.
@@ -1933,7 +1947,7 @@ fun genOperator(g : Generator, fn : Expr, operands : Array Expr, op : String,
     -- `show(_) + "!"` adds a function to a string, and the mismatch is here.
     for operand in operands {
         if Ast.isShorthand(operand) {
-            what = what + ", where '_' means " + Ast.sketch(operand)
+            what = what + ", where '_' means '" + Ast.sketch(operand) + "'"
             break
         }
     }
@@ -1956,11 +1970,11 @@ fun genForIn(g : Generator, e : Expr, pat : Pat, iterable : Expr, body : Expr,
     let where = "the sequence of a 'for ... in' loop"
     let iter = match iterFn {
         Some(f) -> f
-        None -> oops("this 'for' loop has no 'iter' in scope", Some(e.span))
+        None -> bug("this 'for' loop has no 'iter' in scope", Some(e.span))
     }
     let next = match nextFn {
         Some(f) -> f
-        None -> oops("this 'for' loop has no 'next' in scope", Some(e.span))
+        None -> bug("this 'for' loop has no 'next' in scope", Some(e.span))
     }
     eq(g, genExpr(g, iter), TFun([sequence], cursor), Some(iterable.span), where)
     eq(g, genExpr(g, next),
@@ -1971,7 +1985,8 @@ fun genForIn(g : Generator, e : Expr, pat : Pat, iterable : Expr, body : Expr,
     Vec.push(g.openings, None)
     let binds = matchPattern(g, pat, element)
     discard(Vec.pop(g.openings))
-    Vec.push(g.binderSites, (pat, element))
+    Vec.push(g.binderSites, (pat, element,
+        "name the element and 'match' on it in the loop body"))
     let scope = Map.new()
     for (n, _) in Map.entries(binds) { Map.put(scope, n, False) }
     Vec.push(g.scopes, scope)
@@ -2001,9 +2016,14 @@ fun genMatch(g : Generator, e : Expr, scrutinee : Expr,
         for var i = 1; i < len(arm.patterns); i = i + 1 {
             let alt = arm.patterns[i]
             let other = matchPattern(g, alt, scrutineeType)
-            if !sameKeys(other, bindings) {
-                oops("every alternative in a match arm must bind the same "
-                     + "variables", Some(alt.span))
+            match unshared(other, bindings) {
+                Some((name, True)) -> oops("this alternative binds '" + name
+                    + "' and the first does not; every alternative must bind "
+                    + "the same variables", Some(alt.span))
+                Some((name, False)) -> oops("this alternative does not bind '"
+                    + name + "' and the first does; every alternative must "
+                    + "bind the same variables", Some(alt.span))
+                None -> {}
             }
             for (name, ty) in Map.entries(other) {
                 eq(g, Map.getOr(bindings, name, ty), ty, Some(alt.span),
@@ -2012,9 +2032,8 @@ fun genMatch(g : Generator, e : Expr, scrutinee : Expr,
         }
         let openings = popOpenings(g)
         if len(openings) > 0 && len(arm.patterns) > 1 {
-            oops("an arm with alternatives cannot open an existential "
-                 + "constructor: each alternative would hide a different type",
-                 Some(arm.span))
+            oops("an arm with alternatives cannot match an existential "
+                 + "constructor; give it an arm of its own", Some(arm.span))
         }
         let scope = Map.new()
         for (n, _) in Map.entries(bindings) { Map.put(scope, n, False) }
@@ -2051,12 +2070,16 @@ fun genMatch(g : Generator, e : Expr, scrutinee : Expr,
     result
 }
 
-fun sameKeys(a : Map String Ty.Type, b : Map String Ty.Type) -> Bool {
-    if len(Map.keys(a)) != len(Map.keys(b)) { return False }
-    for k in Map.keys(a) {
-        if !Map.contains(b, k) { return False }
+-- Returns a name that exactly one of `alt` and `first` binds, paired with
+-- whether `alt` is the one that binds it, or `None` if they bind the same
+-- names. The first such name in sorted order is returned.
+fun unshared(alt : Map String Ty.Type,
+             first : Map String Ty.Type) -> Option (String, Bool) {
+    for k in Array.sort(Map.keys(alt) + Map.keys(first)) {
+        let inAlt = Map.contains(alt, k)
+        if inAlt != Map.contains(first, k) { return Some((k, inAlt)) }
     }
-    True
+    None
 }
 
 -- -- the value restriction ---------------------------------------------------------
@@ -2109,7 +2132,7 @@ fun immutableCon(g : Generator, name : String) -> Bool = match Decls.con(g.decls
 -- extent was not what its author meant surfaces as a mismatch at exactly such
 -- a call, and the extent is the thing the message has to show.
 fun callContext(args : Vec Expr) -> String = match shorthandIn(args, 2) {
-    Some(l) -> "a function call, where '_' means " + Ast.sketch(l)
+    Some(l) -> "a function call, where '_' means '" + Ast.sketch(l) + "'"
     None -> "a function call"
 }
 
@@ -2134,6 +2157,12 @@ fun shorthandIn(args : Vec Expr, depth : Int) -> Option Expr {
 fun oops(message : String, where : Option Span) -> a = match where {
     None -> Diag.fail(Diag.whole("type error", message), "")
     Some(s) -> Diag.fail(Diag.at("type error", message, s), s.file)
+}
+
+-- Reports a check that only a compiler bug can fail.
+fun bug(message : String, where : Option Span) -> a = match where {
+    None -> Diag.fail(Diag.whole("internal error", message), "")
+    Some(s) -> Diag.fail(Diag.at("internal error", message, s), s.file)
 }
 
 fun discard(x : a) -> Unit = {}

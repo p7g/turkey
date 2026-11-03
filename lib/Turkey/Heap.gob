@@ -39,13 +39,11 @@ import Data.Tuple (Unit)
 import Data.Eq (Eq(..), (==), (!=))
 import Data.Ord (Ord(..), (<), (<=), (>), (>=))
 import Data.Num (Add(..), Sub(..), Mul(..), Div(..), Rem(..), Neg(..), (+), (-), (*), (/), (%))
--- Shifts are written with `Prim.intShl` and `Prim.intShr`, not `<<` and `>>`.
--- The operators check the shift amount and panic through `error`, which
--- allocates, so a shift by a variable amount does not compile in a giblet. A
--- shift by a constant does, since its check folds away, but the inliner sizes
--- the call before it folds: written with the operators, the giblets' shifts
--- would make a self-compile about 8% slower.
-import Bits (BitAnd(..), BitOr(..), BitXor(..), (&), (|), (^))
+-- A shift by a variable amount is written `Prim.intShl` or `Prim.intShr`, not
+-- `<<` or `>>`. The operators check the amount and panic through `error`,
+-- which allocates, so a variable shift does not compile in a giblet. A
+-- constant amount's check folds away.
+import Bits (BitAnd(..), BitOr(..), BitXor(..), Shift(..), (&), (|), (^), (<<), (>>))
 import Data.Error (Error(..))
 import Control.Iterator (Iterator(..))
 import Data.Int ()
@@ -395,7 +393,7 @@ fun below(a : Int, b : Int) -> Bool =
 -- there -- offsets inside a region, counts of objects -- cannot overflow.
 fun plus(augend : Int, addend : Int) -> Int = Prim.intAddWrapping(augend, addend)
 
-fun times8(multiplicand : Int) -> Int = Prim.intShl(multiplicand, 3)
+fun times8(multiplicand : Int) -> Int = multiplicand << 3
 
 -- `n` in 1..63: arm64 masks a shift amount to six bits, so a shift by 64 is a
 -- shift by 0.
@@ -408,7 +406,7 @@ fun complement(x : Int) -> Int = Prim.intNot(x)
 fun bit(index : Int) -> Int = Prim.intShl(1, index & 63)
 
 -- Bit `index` of the bitmap at `offset`; `index` is not negative.
-fun bitWord(offset : Int, index : Int) -> Int = plus(offset, times8(Prim.intShr(index, 6)))
+fun bitWord(offset : Int, index : Int) -> Int = plus(offset, times8(index >> 6))
 
 fun testBit(p : Prim.Ptr, offset : Int, index : Int) -> Bool =
     Prim.loadI64(p, bitWord(offset, index)) & bit(index) != 0
@@ -551,8 +549,8 @@ fun classTable() -> Prim.Ptr {
 
 fun classFor(bytes : Int) -> Int {
     if bytes <= 16 { return 0 }
-    if bytes <= 64 { return Prim.intShr(bytes + 7, 3) - 2 }
-    if bytes <= 256 { return Prim.intShr(bytes + 15, 4) + 2 }
+    if bytes <= 64 { return ((bytes + 7) >> 3) - 2 }
+    if bytes <= 256 { return ((bytes + 15) >> 4) + 2 }
     var classSize = 256
     var sizeClass = 18
     while classSize < bytes {
@@ -569,17 +567,17 @@ fun classSlot(sizeClass : Int) -> Int =
 
 -- The class of an object of at most `smallBytes` bytes.
 fun classOf(size : Int) -> Int =
-    Prim.byteToInt(Prim.loadI8(classes, Prim.intShr(plus(size, 7), 3)))
+    Prim.byteToInt(Prim.loadI8(classes, plus(size, 7) >> 3))
 
 -- Whether `size`, unsigned, is small enough for the fast path: a class-table
 -- step below 4096. The few sizes just under `smallBytes` it turns away are
 -- still small, and `allocateSlow` gives them their class.
-fun fastSize(size : Int) -> Bool = Prim.intShr(plus(size, 7), 15) == 0
+fun fastSize(size : Int) -> Bool = plus(size, 7) >> 15 == 0
 
 fun cursorOf(sizeClass : Int) -> Prim.Ptr = cursorIn(Prim.processState(), sizeClass)
 
 fun cursorIn(w : Prim.Ptr, sizeClass : Int) -> Prim.Ptr =
-    Prim.ptrAdd(w, plus(320, Prim.intShl(sizeClass, 6)))
+    Prim.ptrAdd(w, plus(320, sizeClass << 6))
 
 -- The lowest of the cursor's free slots, `free`, which is not zero.
 fun takeSlot(cursor : Prim.Ptr, free : Int) -> Prim.Ptr {
@@ -594,7 +592,7 @@ fun takeSlot(cursor : Prim.Ptr, free : Int) -> Prim.Ptr {
 -- its checked subtraction, none of which a bit already isolated needs. This
 -- runs at every allocation.
 fun bitIndex(lowest : Int) -> Int {
-    let pattern = Prim.intShr(Prim.intMulWrapping(lowest, 0x03F7_9D71_B4CB_0A89), 58) & 63
+    let pattern = Prim.intMulWrapping(lowest, 0x03F7_9D71_B4CB_0A89) >> 58 & 63
     let positions = Prim.cString("01`2iaL3mjbZVMA4ngkTec[F]WQNHB<5o_hKlYU@fSdE\\PG;^JX?RDO:I>C9=876")
     Prim.intSubWrapping(Prim.byteToInt(Prim.loadI8(positions, pattern)), 48)
 }
@@ -633,7 +631,7 @@ fun refill(cursor : Prim.Ptr, sizeClass : Int) -> Bool {
     }
     -- The last word's bits past the capacity are clear, and are not slots.
     var claim = complement(taken)
-    let beyond = Prim.intSubWrapping(capacity, Prim.intShl(w, 6))
+    let beyond = Prim.intSubWrapping(capacity, w << 6)
     if beyond < 64 { claim = claim & Prim.intSubWrapping(Prim.intShl(1, beyond), 1) }
     if stress || statsWanted { claim = claim & Prim.intNegWrapping(claim) }
     let now = taken | claim
@@ -647,7 +645,7 @@ fun refill(cursor : Prim.Ptr, sizeClass : Int) -> Bool {
     localAdd(n, Prim.intMulWrapping(n, slotSize))
     Prim.storeI64(cursor, cursorFree, claim)
     Prim.storePtr(cursor, cursorBase,
-                  Prim.ptrAdd(region, plus(regionData, Prim.intMulWrapping(Prim.intShl(w, 6), slotSize))))
+                  Prim.ptrAdd(region, plus(regionData, Prim.intMulWrapping(w << 6, slotSize))))
     Prim.storeI64(cursor, cursorSlot, slotSize)
     Prim.storeI64(cursor, cursorWord, w)
     True
@@ -915,7 +913,7 @@ fun stressDue() -> Bool {
         -- sampling interval needs of it.
         var mixed = stressRandom
         mixed = mixed ^ shiftRight(mixed, 12)
-        mixed = mixed ^ Prim.intShl(mixed, 25)
+        mixed = mixed ^ mixed << 25
         mixed = mixed ^ shiftRight(mixed, 27)
         stressRandom = mixed
         let drawn = shiftRight(Prim.intMulWrapping(mixed, 0x2545_F491_4F6C_DD1D), 1)
@@ -1065,7 +1063,7 @@ fun frameEntryFor(retaddr : Int) -> Prim.Ptr {
     var low = 0
     var high = frameEntryCount - 1
     while low <= high {
-        let middle = Prim.intShr(plus(low, high), 1)
+        let middle = plus(low, high) >> 1
         let found = entryKey(frameEntries, middle)
         if found == retaddr {
             return Prim.ptrAdd(frameEntries, Prim.intMulWrapping(entryBytes, middle))
@@ -1192,7 +1190,7 @@ fun markGrey(value : Prim.Ptr, what : Prim.Ptr, index : Int) -> Unit {
     }
     let region = regionOf(value)
     let slot = slotOf(region, value)
-    let at = plus(regionMarked, times8(Prim.intShr(slot, 6)))
+    let at = plus(regionMarked, times8(slot >> 6))
     -- Most roots are marked already, by the time a collection's later tasks
     -- reach them.
     if Prim.loadI64(region, at) & bit(slot) != 0 { return {} }
@@ -1248,7 +1246,7 @@ fun marker() -> Prim.Ptr = Prim.ptrAdd(markers, markerBytes * Workers.index())
 fun slotOf(region : Prim.Ptr, object : Prim.Ptr) -> Int {
     let offset = Prim.intSubWrapping(Prim.ptrDiff(object, region), regionData)
     let multiplier = Prim.loadI64(reciprocals, times8(load32(region, regionSizeClass)))
-    Prim.intShr(Prim.intMulWrapping(offset, multiplier), 32)
+    Prim.intMulWrapping(offset, multiplier) >> 32
 }
 
 -- Double the mark stack `m`; False, with the mark failed, if there is no
@@ -1342,15 +1340,15 @@ fun drain() -> Unit {
         }
         top = Prim.intSubWrapping(top, 1)
         let entry = Prim.ptrToInt(Prim.loadPtr(stack, times8(top)))
-        let chunk = Prim.intShr(entry, 48)
+        let chunk = entry >> 48
         let object = Prim.ptrFromInt(if chunk == 0 { entry } else { entry & addressBits })
         -- Where its pointers start and how many there are: every word from
         -- `first` to `slots` is one. A cell's flag is the count of its one
         -- word.
         let header = load32(object, 0)
-        let kind = Prim.intShr(header, 8) & 255
+        let kind = header >> 8 & 255
         var first = objectFields
-        var slots = Prim.intShr(header, 16)
+        var slots = header >> 16
         if kind == arrayKind {
             first = arrayElements
             slots = if slots == 7 { Prim.loadI64(object, arrayLength) } else { 0 }
@@ -1373,7 +1371,7 @@ fun drain() -> Unit {
                 stack = Prim.loadPtr(m, 0)
                 capacity = Prim.loadI64(m, 16)
             }
-            let next = Prim.ptrToInt(object) | Prim.intShl(plus(chunk, 1), 48)
+            let next = Prim.ptrToInt(object) | plus(chunk, 1) << 48
             Prim.storePtr(stack, times8(top), Prim.ptrFromInt(next))
             top = plus(top, 1)
         }
@@ -1385,7 +1383,7 @@ fun drain() -> Unit {
             } else {
                 let childRegion = regionOf(child)
                 let childSlot = slotOf(childRegion, child)
-                let at = plus(regionMarked, times8(Prim.intShr(childSlot, 6)))
+                let at = plus(regionMarked, times8(childSlot >> 6))
                 let marks = Prim.loadI64(childRegion, at)
                 let mask = bit(childSlot)
                 -- In line when this worker marks alone: a call per object

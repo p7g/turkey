@@ -8,7 +8,6 @@ allocation and the heap verified around each.
 """
 
 import hashlib
-import sys
 
 import pytest
 
@@ -328,7 +327,6 @@ def test_a_sleeper_is_woken_while_the_other_worker_computes(probe):
     assert probe("P.sleepBesideCompute()", "2") == ["slept", "True", "computed"]
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="Linux reports no release of a lock")
 @pytest.mark.parametrize("workers", WORKERS)
 @pytest.mark.parametrize("stress", [False, True])
 def test_a_lock_wait_times_out_and_leaves_nothing_registered(probe, workers, stress, tmp_path):

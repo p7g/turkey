@@ -26,11 +26,10 @@ export (run, Semaphore, semaphore, acquire, release)
 -- sleeps instead, as a thread in a blocking call does
 -- (`Turkey.Workers.blockingSleepOn`), and the monitor hands its permit to a
 -- thread that runs the helper. That needs the monitor, which starts with the
--- workers (`System.Task`): a module that waits here imports that first.
+-- workers, so the program's own stack starts them if nothing has
+-- (`Turkey.Scheduler.start`). A task exists only once they have.
 --
--- A deadline is a time on `Turkey.Wait.now`'s clock, or -1 for none; one that
--- has passed already answers `Turkey.Wait.timedOut` without starting
--- anything.
+-- A deadline is a time on `Turkey.Wait.now`'s clock, or -1 for none.
 
 import Turkey.Coroutine as Co
 import Turkey.Libc as Libc
@@ -58,14 +57,15 @@ fun zeroed() -> Prim.Ptr {
 
 -- Run `call` on a helper task and wait until `deadline` for its result:
 -- `Right` with it, or `Left(Wait.timedOut)` if the deadline came first, and
--- then `cleanup` gets the result when the call returns.
+-- then `cleanup` gets the result when the call returns. The call starts even
+-- if the deadline has passed already, so that the result, and with it the
+-- cleanup, always comes.
 --
 -- `call` makes its C call through one of `Turkey.Workers`' blocking
 -- wrappers, followed by `Turkey.Scheduler.afterCall`, as `Turkey.IO` does,
 -- so that the helper's thread may lose its permit while it waits. `cleanup`
 -- runs on the helper, and may make such calls too.
 fun run(call : fun() -> a, cleanup : fun(a) -> Unit, deadline : Int) -> Either Int a {
-    if passed(deadline) { return Left(Wait.timedOut) }
     let pending = Pending { waiter = None, value = None }
     let program = Option.isNone(Co.running())
     -- Made here rather than under the lock, since a stack is mapped for it.
@@ -120,7 +120,7 @@ type Queued = Queued { waiter : Poll.Waiter, program : Bool }
 fun semaphore(units : Int) -> Semaphore = Semaphore { free = units, queue = [], head = 0 }
 
 -- Take a unit of `s`, waiting until `deadline` for one if none is free: 0,
--- or `Wait.timedOut`.
+-- or `Wait.timedOut`, without a unit, if the deadline has passed already.
 fun acquire(s : Semaphore, deadline : Int) -> Int {
     if passed(deadline) { return Wait.timedOut }
     Scheduler.lock()
@@ -179,6 +179,7 @@ fun await(start : fun(Int) -> Poll.Waiter, deadline : Int) -> Int = match Co.run
 -- short only loops. Back from the sleep, the stack holds a permit again
 -- (`Turkey.Workers.callExit`).
 fun programWait(start : fun(Int) -> Poll.Waiter, deadline : Int) -> Int {
+    let _ = Scheduler.start()
     Scheduler.lock()
     let w = start(-1)
     Scheduler.unlock()

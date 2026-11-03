@@ -191,11 +191,13 @@ For more depth:
 - [Language reference](docs/ref/README.md): the syntax and meaning of every construct
 - [Compiler written in Turkey](src/)
 
-The recorded programs in `tests/programs/` and the examples in `docs/ref/` are
-run by a harness written in Turkey, `tests/harness/`:
+The recorded programs in `tests/programs/`, the case archives in
+`tests/cases/` and the examples in `docs/ref/` are run by a harness written in
+Turkey, `tests/harness/`:
 
     sh scripts/test.sh                    # every case, one per core at once
     sh scripts/test.sh tests/programs/bf  # the programs whose path starts so
+    sh scripts/test.sh tests/cases/placeholders.cases::condition  # some of an archive's cases
     sh scripts/test.sh docs/ref/types.md  # one chapter's examples
     sh scripts/test.sh -v --shard 2/4     # a quarter of them, passes listed
     sh scripts/test.sh --selftest         # the harness checked on its own cases
@@ -210,11 +212,30 @@ that fails is shown with a diff, and every actual output is kept under
 the line of its fence, `docs/ref/types.md:40`, and checked against what the
 chapter says of it (`docs/ref/README.md`); `--bless` never writes one.
 
+A case archive holds many small cases in one text file, cut into sections by
+header lines:
+
+    -- shared Shapes.gob --     a module written beside every case (before the first case only)
+    -- case area_of_a_square -- starts a case; `--` comments and `--@` directives follow
+    --@ error                   as in a program, plus `check` and `matrix: VAR=1,4`
+    -- Main.gob --              the case's entry module; other `NAME.gob` sections sit beside it
+    -- stdout --                its exact stdout; also `stderr`, `error`, `panic`,
+                                `types`, `kinds` and `classes`
+
+A case with no `stdout` or `stderr` section must print nothing there. `error`
+is the diagnostic without its place, `panic` the panic's message, and a dump
+section holds only the case's own declarations. `--@ matrix` runs the case once
+per value, with the variable set in its environment, as `NAME[VAR=4]`. Any
+other header or directive is an error, so a line reading `-- X --` inside a
+module has to be reworded. `tests/harness/Archive.gob` gives the whole format.
+
 `--bless` writes the selected programs' actual output over their `.expected`
 files, and their dumps over the `.types`, `.core`, `.opt` and `.mono` files
-they already have. It refuses a program that crashed, timed out, did not end
-as its directive says, or printed nothing where its golden had output, and
-says why. When more than 5 are refused it writes nothing at all, since that
+they already have. In an archive it rewrites the case's expectation sections
+in place, adding a missing `stdout`, `stderr`, `error` or `panic` section, and
+leaves every other byte of the file alone. It refuses a case that crashed,
+timed out, did not end as its directive says, printed nothing where its golden
+had output, or printed what an archive cannot hold, and says why. When more than 5 are refused it writes nothing at all, since that
 is what a broken compiler looks like. It never changes a directive.
 
 The rest of the tests are Python. Install their dependencies with

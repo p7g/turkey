@@ -1,0 +1,592 @@
+export (Edit(..), Comparison(..), cases, comparisons, dumpOf, filtered, unholdable, sameEdit, apply, rewrite)
+
+-- Cases from `.cases` archives: `tests/cases/` and the harness's own
+-- `selftest/cases/`. An archive is plain text cut into sections, each opened
+-- by a header line `-- X --`, with no escaping:
+--
+--   -- shared NAME.gob --   a module written beside every case's own; only
+--                          before the first case
+--   -- case NAME --        starts a case
+--   -- NAME.gob --         one of the case's modules; `Main.gob` is its entry
+--   -- stdout --           what the case's program must print, exactly; also
+--                          `stderr`, `error`, `panic`, `types`, `kinds` and
+--                          `classes`
+--
+-- Between a case's header and its first section, its preamble, stand `--`
+-- comment lines, which say what the case is for, and `--@` directive lines:
+-- the program directives `Case.directives` reads, `check`, which compiles the
+-- case with `boot check` alone, and `matrix: NAME=V1,V2`, which runs the case
+-- once per value with NAME set in its environment. Several `matrix` lines
+-- multiply. An expansion is named `NAME[K=V,K2=V2]`, and is a case of its own
+-- for running and reporting.
+--
+-- A header line names one of those, or the archive is malformed: a line that
+-- reads `-- X --` inside a module has to be reworded. Every other line is
+-- content, including a `--` comment with no closing ` --`, and a `--@` line
+-- inside a module, which is source. A section's body runs up to the next
+-- header, blank lines included, so a blank line after an expectation section
+-- is part of what is expected. A malformed archive is one harness-error
+-- case named by the archive and the line, and none of its cases are run; a
+-- case whose directives are wrong is a harness error in its place.
+--
+-- **What is compared.** A missing `stdout` or `stderr` section means the
+-- stream must be empty. Under `--@ error` the diagnostic, without its place
+-- and stage, is compared with `error` instead of stderr, and the case is only
+-- checked, as `boot check` reports what a program is refused for. Under `--@
+-- panic` the panic's message, without `panic: ` and the trace, is compared
+-- with `panic`, and stderr is not compared. A dump section is compared only
+-- when it is there, with `boot check --dump` of its stage (`kinds` is the
+-- `decls` dump) filtered to the declarations of the case's modules, its own
+-- and the shared ones (`filtered`). Every
+-- comparison is exact, including the final newline.
+--
+-- **Where a case is run.** Its modules and the shared ones are written to a
+-- directory under `WORK` named by their hash (`Files.writeOut`), so a
+-- diagnostic names the bare file.
+--
+-- **Bless** rewrites a case's expectation sections in place. Each case keeps
+-- the lines its sections span, and `apply` replaces exactly those lines, or
+-- inserts a missing section after the case's last, leaving every other byte
+-- of the archive as it was.
+
+import Case (Case(..), Expected(..), Golden(..), Archived(..), Section(..), Expectation(..), Finish(..),
+             Observed(..))
+import Case as Case
+import Files as Files
+import Reference as Reference
+
+-- What a header line names: a case, a shared module, a module of the case,
+-- or an expectation.
+type Header = CaseHeader(String) | SharedHeader(String) | ModuleHeader(String) | ExpectationHeader(Expectation)
+
+-- What is wrong with an archive, and on which line, counting from 1.
+type Malformed = Malformed { line : Int, why : String }
+
+-- An archive's text as lines without their newlines, and whether the last
+-- line has one. Writing each line back with its newline gives the text back
+-- byte for byte, which `String.lines` does not promise: it drops a carriage
+-- return before a newline.
+type Text = Text { lines : Vec String, terminated : Bool }
+
+-- A case as its archive gives it, before its directives are read: its name,
+-- the line of its header, its `--@` lines, its modules as (file name,
+-- source), its expectation sections, and the line after its last section.
+type Parsed = Parsed {
+    name : String,
+    line : Int,
+    directives : Array String,
+    modules : Array (String, String),
+    sections : Array Section,
+    end : Int,
+}
+
+-- An archive's shared modules, as (file name, source), and its cases.
+type Archive = Archive { shared : Array (String, String), cases : Array Parsed }
+
+-- Returns a case for every case in each `.cases` file under `directory` (an
+-- absolute path), at any depth, named by `prefix`, the path to it from the
+-- repository root, in sorted order. Writes each case's files under `work`.
+-- A directory that is not there has no cases.
+fun cases(directory : String, prefix : String, work : String) -> Array Case {
+    let out = []
+    for name in Either.unwrapOr(Files.filesUnder(directory), []) {
+        if !String.endsWith(name, ".cases") { continue }
+        for c in archive(directory + "/" + name, prefix + "/" + name, work) { Vec.push(out, c) }
+    }
+    Vec.toArray(out)
+}
+
+fun archive(path : String, name : String, work : String) -> Array Case {
+    let text = match Files.readText(path) {
+        Right(text) -> text
+        Left(e) -> return [broken(name, path, Error.describe(e))]
+    }
+    let parsed = match parse(split(text)) {
+        Right(parsed) -> parsed
+        Left(m) -> return [broken(name + ":" + Int.toString(m.line), path, m.why)]
+    }
+    if len(parsed.cases) == 0 { return [broken(name, path, "no cases in " + name)] }
+    let out = []
+    for p in parsed.cases {
+        for c in expanded(path, name, work, parsed.shared, p) { Vec.push(out, c) }
+    }
+    Vec.toArray(out)
+}
+
+-- A case that is a harness error for `why`, and is never compiled.
+fun broken(name : String, path : String, why : String) -> Case = Case {
+    name = name,
+    directory = path,
+    entry = "",
+    sources = [],
+    golden = InArchive(Archived { path, origin = 0, sections = [], end = 0, modules = [] }),
+    dumps = [],
+    expected = Exits(0),
+    timeout = None,
+    requires = [],
+    xfail = None,
+    problem = Some(why),
+    checkOnly = False,
+    environment = [],
+}
+
+-- -- reading an archive ------------------------------------------------------------
+
+fun split(text : String) -> Text {
+    let lines = String.split(text, "\n")
+    -- A newline ends a line rather than starting one, so the text after the
+    -- last newline is a line only if it is not empty.
+    let terminated = Option.fold(Vec.last(lines), True, String.isEmpty)
+    if terminated { let _ = Vec.pop(lines) }
+    Text { lines, terminated }
+}
+
+-- Line `i` with the newline after it, if it has one.
+fun line(t : Text, i : Int) -> String =
+    if i < len(t.lines) - 1 || t.terminated { t.lines[i] + "\n" } else { t.lines[i] }
+
+-- Lines `from` up to but not including `to`, as they are in the archive.
+fun span(t : Text, from : Int, to : Int) -> String {
+    let b = String.builder()
+    for i in Int.range(from, to) { String.push(b, line(t, i)) }
+    String.build(b)
+}
+
+-- What the header `line` names, or why it names nothing an archive may
+-- hold. Returns `None` if `line` is not a header.
+fun header(line : String) -> Option (Either String Header) {
+    let inner = String.stripSuffix(String.stripPrefix(line, "-- ")?, " --")?
+    Some(if let Some(name) = String.stripPrefix(inner, "case ") {
+        Either.map(caseName(name), \CaseHeader(_))
+    } else if let Some(file) = String.stripPrefix(inner, "shared ") {
+        Either.map(moduleFile(file), \SharedHeader(_))
+    } else if let Some(e) = expectation(inner) {
+        Right(ExpectationHeader(e))
+    } else if String.endsWith(inner, ".gob") {
+        Either.map(moduleFile(inner), \ModuleHeader(_))
+    } else {
+        Left("unknown section '" + inner + "'")
+    })
+}
+
+-- A case name is one word without the brackets and colons that a matrix
+-- expansion's name and a selection use.
+fun caseName(name : String) -> Either String String {
+    let plain = len(String.words(name)) == 1
+                && !Iterator.any(["[", "]", ":"], String.contains(name, _))
+    if plain { Right(name) } else { Left("'" + name + "' is not a case name: it must be one word with no '[', ']' or ':'") }
+}
+
+fun moduleFile(file : String) -> Either String String {
+    let plain = len(String.words(file)) == 1 && String.endsWith(file, ".gob")
+                && !String.startsWith(file, "/") && !String.contains(file, "..")
+    if plain { Right(file) } else { Left("'" + file + "' is not a module file name") }
+}
+
+fun expectation(name : String) -> Option Expectation = match name {
+    "stdout" -> Some(StdoutText)
+    "stderr" -> Some(StderrText)
+    "error" -> Some(ErrorText)
+    "panic" -> Some(PanicText)
+    "types" -> Some(TypesDump)
+    "kinds" -> Some(KindsDump)
+    "classes" -> Some(ClassesDump)
+    _ -> None
+}
+
+-- Whether `line` may stand outside every section and every module: blank,
+-- or a `--` comment.
+fun isComment(line : String) -> Bool = String.isEmpty(String.trim(line)) || String.startsWith(line, "--")
+
+fun parse(t : Text) -> Either Malformed Archive {
+    let headers = []
+    for i in Int.range(0, len(t.lines)) {
+        if let Some(read) = header(t.lines[i]) {
+            Vec.push(headers, (i, Either.mapLeft(read, \Malformed(i + 1, _))?))
+        }
+    }
+    let first = Option.fold(Vec.at(headers, 0), len(t.lines), _.0)
+    for i in Int.range(0, first) {
+        let l = t.lines[i]
+        if String.startsWith(l, "--@") { return Left(Malformed(i + 1, "a directive before the first case")) }
+        if !isComment(l) { return Left(Malformed(i + 1, "text before the first case")) }
+    }
+    let shared = []
+    let cases = []
+    -- The case being read: its name and the line of its header, its
+    -- directives, its modules and its expectation sections.
+    var open = None
+    var directives = []
+    var modules = []
+    var sections = []
+    for k in Int.range(0, len(headers)) {
+        let (at, h) = headers[k]
+        let from = at + 1
+        let to = if k + 1 < len(headers) { headers[k + 1].0 } else { len(t.lines) }
+        match h {
+            CaseHeader(name) -> {
+                if let Some((n, l)) = open {
+                    Vec.push(cases, finished(n, l, at, directives, modules, sections)?)
+                }
+                if Iterator.any(cases, _.name == name) || Option.fold(open, False, _.0 == name) {
+                    return Left(Malformed(from, "two cases named '" + name + "'"))
+                }
+                open = Some((name, at))
+                directives = []
+                modules = []
+                sections = []
+                for i in Int.range(from, to) {
+                    let l = t.lines[i]
+                    if String.startsWith(l, "--@") { Vec.push(directives, l) }
+                    else if !isComment(l) { return Left(Malformed(i + 1, "text before the case's first section")) }
+                }
+            }
+            SharedHeader(file) -> {
+                if Option.isSome(open) { return Left(Malformed(from, "'shared' after the first case")) }
+                if Iterator.any(shared, _.0 == file) { return Left(Malformed(from, "two shared modules named '" + file + "'")) }
+                Vec.push(shared, (file, span(t, from, to)))
+            }
+            ModuleHeader(file) -> {
+                if Option.isNone(open) { return Left(Malformed(from, "a section before the first case")) }
+                if Iterator.any(modules, _.0 == file) || Iterator.any(shared, _.0 == file) {
+                    return Left(Malformed(from, "two modules named '" + file + "'"))
+                }
+                Vec.push(modules, (file, span(t, from, to)))
+            }
+            ExpectationHeader(e) -> {
+                if Option.isNone(open) { return Left(Malformed(from, "a section before the first case")) }
+                let name = Case.expectationName(e)
+                if Iterator.any(sections, \Case.expectationName(_.expectation) == name) {
+                    return Left(Malformed(from, "two '" + name + "' sections"))
+                }
+                Vec.push(sections, Section { expectation = e, from, to, text = span(t, from, to) })
+            }
+        }
+    }
+    if let Some((n, l)) = open {
+        Vec.push(cases, finished(n, l, len(t.lines), directives, modules, sections)?)
+    }
+    Right(Archive { shared = Vec.toArray(shared), cases = Vec.toArray(cases) })
+}
+
+fun finished(name : String, line : Int, end : Int, directives : Vec String, modules : Vec (String, String),
+             sections : Vec Section) -> Either Malformed Parsed {
+    if !Iterator.any(modules, _.0 == "Main.gob") {
+        return Left(Malformed(line + 1, "case '" + name + "' has no Main.gob"))
+    }
+    Right(Parsed {
+        name, line, end,
+        directives = Vec.toArray(directives),
+        modules = Vec.toArray(modules),
+        sections = Vec.toArray(sections),
+    })
+}
+
+-- -- a case's directives ---------------------------------------------------------------
+
+-- The case `p` once per expansion of its matrix, or once if it has none.
+fun expanded(path : String, archiveName : String, work : String, shared : Array (String, String),
+             p : Parsed) -> Array Case {
+    var check = False
+    let axes = []
+    let problems = []
+    let rest = []
+    for l in p.directives {
+        let body = String.trim(Option.unwrapOr(String.stripPrefix(l, "--@"), l))
+        let (name, value) = match String.splitOnce(body, ":") {
+            Some((n, v)) -> (String.trim(n), Some(String.trim(v)))
+            None -> (body, None)
+        }
+        match (name, value) {
+            ("check", None) -> { check = True }
+            ("check", Some(_)) -> Vec.push(problems, "'check' takes no value")
+            ("matrix", _) -> match axis(value) {
+                Right((variable, values)) -> {
+                    if Iterator.any(axes, _.0 == variable) {
+                        Vec.push(problems, "two 'matrix' lines set '" + variable + "'")
+                    }
+                    Vec.push(axes, (variable, values))
+                }
+                Left(why) -> Vec.push(problems, why)
+            }
+            _ -> Vec.push(rest, l)
+        }
+    }
+    let files = p.modules + shared
+    let written = Files.writeOut(work, files)
+    let golden = Archived {
+        path, origin = p.line, sections = p.sections, end = p.end,
+        modules = Array.map(files, \moduleName(_.0)),
+    }
+    let dumps = []
+    for s in p.sections {
+        if let Some(stage) = stageOf(s.expectation) { Vec.push(dumps, (stage, path)) }
+    }
+    let out = []
+    for environment in expansions(Vec.toArray(axes)) {
+        let suffix = if len(environment) == 0 { "" }
+                     else { "[" + String.join(Array.map(environment, \_.0 + "=" + _.1), ",") + "]" }
+        let base = Case {
+            name = archiveName + "::" + p.name + suffix,
+            directory = Either.unwrapOr(written, work),
+            entry = "Main.gob",
+            sources = Array.map(files, _.0),
+            golden = InArchive(golden),
+            dumps = Vec.toArray(dumps),
+            expected = Exits(0),
+            timeout = None,
+            requires = [],
+            xfail = None,
+            problem = Option.or(Vec.at(problems, 0), Option.map(Either.left(written), Error.describe)),
+            checkOnly = check,
+            environment,
+        }
+        let read = Case.directives(base, String.unlines(rest))
+        let checkOnly = match read.expected {
+            Rejected -> True
+            Exits(_) | Panics -> check
+        }
+        Vec.push(out, Case {
+            name = read.name,
+            directory = read.directory,
+            entry = read.entry,
+            sources = read.sources,
+            golden = read.golden,
+            dumps = read.dumps,
+            expected = read.expected,
+            timeout = read.timeout,
+            requires = read.requires,
+            xfail = read.xfail,
+            problem = Option.or(read.problem, inconsistency(read.expected, check, p.sections)),
+            checkOnly,
+            environment = read.environment,
+        })
+    }
+    Vec.toArray(out)
+}
+
+-- One `matrix` line's variable and values.
+fun axis(value : Option String) -> Either String (String, Array String) {
+    let usage = "'matrix' takes NAME=V1,V2,..."
+    let parts = match Option.map(value, String.splitOnce(_, "=")) {
+        Some(Some(parts)) -> parts
+        _ -> return Left(usage)
+    }
+    let variable = String.trim(parts.0)
+    let values = Vec.toArray(Vec.map(String.split(parts.1, ","), String.trim))
+    if len(String.words(variable)) != 1 || Iterator.any(values, String.isEmpty) { return Left(usage) }
+    for i in Int.range(0, len(values)) {
+        if Array.contains(Array.slice(values, 0, i), values[i]) {
+            return Left("'matrix' lists '" + values[i] + "' twice")
+        }
+    }
+    Right((variable, values))
+}
+
+-- Every environment the axes make, one value from each, in the order the
+-- axes and their values are listed. No axes make one empty environment.
+fun expansions(axes : Array (String, Array String)) -> Array (Array (String, String)) {
+    var out : Array (Array (String, String)) = [[]]
+    for (variable, values) in axes {
+        let next : Vec (Array (String, String)) = []
+        for environment in out {
+            for v in values { Vec.push(next, environment + [(variable, v)]) }
+        }
+        out = Vec.toArray(next)
+    }
+    out
+}
+
+-- Why the outcome `expected` and the sections a case has cannot go together,
+-- if they cannot: a section that would never be compared, or a run that
+-- `check` never makes.
+fun inconsistency(expected : Expected, check : Bool, sections : Array Section) -> Option String {
+    match expected {
+        Rejected -> if hasSection(sections, "stderr") { return Some("a case marked '--@ error' compares its 'error' section, not 'stderr'") }
+        Panics -> if hasSection(sections, "stderr") { return Some("stderr is not compared for a case marked '--@ panic'") }
+        Exits(_) -> {}
+    }
+    match expected {
+        Rejected -> {}
+        _ -> if hasSection(sections, "error") { return Some("an 'error' section needs '--@ error'") }
+    }
+    match expected {
+        Panics -> {}
+        _ -> if hasSection(sections, "panic") { return Some("a 'panic' section needs '--@ panic'") }
+    }
+    if check {
+        match expected {
+            Panics -> return Some("'check' never runs the program, so it cannot panic")
+            Exits(n) -> if n != 0 { return Some("'check' never runs the program, so it cannot exit " + Int.toString(n)) }
+            Rejected -> {}
+        }
+        if hasSection(sections, "stdout") { return Some("'check' never runs the program, so it prints nothing to stdout") }
+    }
+    None
+}
+
+fun hasSection(sections : Array Section, name : String) -> Bool =
+    Iterator.any(sections, \Case.expectationName(_.expectation) == name)
+
+-- The module a file of a case holds: `Data/Pair.gob` is `Data.Pair`.
+fun moduleName(file : String) -> String =
+    String.replace(Option.unwrapOr(String.stripSuffix(file, ".gob"), file), "/", ".")
+
+-- The `boot check --dump` stage a dump section is compared with.
+fun stageOf(e : Expectation) -> Option String = match e {
+    TypesDump -> Some("types")
+    KindsDump -> Some("decls")
+    ClassesDump -> Some("classes")
+    StdoutText | StderrText | ErrorText | PanicText -> None
+}
+
+-- -- judging ---------------------------------------------------------------------------
+
+-- One thing an archive case is compared on: which expectation, its section
+-- if the case has one, and what the run produced for it.
+type Comparison = Comparison { expectation : Expectation, section : Option Section, actual : String }
+
+-- Returns what case `c`, whose expectations are `a`, is compared on, given
+-- what its run produced: stdout; stderr unless the case expects an error or
+-- a panic, which are compared instead; and each dump it has a section for.
+-- A stream without a section is compared with the empty string.
+fun comparisons(c : Case, a : Archived, observed : Observed) -> Array Comparison {
+    let streams = match c.expected {
+        Rejected -> [StdoutText, ErrorText]
+        Panics -> [StdoutText, PanicText]
+        Exits(_) -> [StdoutText, StderrText]
+    }
+    let dumps = Array.filter(Array.map(a.sections, _.expectation), \Option.isSome(stageOf(_)))
+    let out = []
+    for e in streams + dumps {
+        let name = Case.expectationName(e)
+        let section = Iterator.find(a.sections, \Case.expectationName(_.expectation) == name)
+        Vec.push(out, Comparison { expectation = e, section, actual = actual(c, a, observed, e) })
+    }
+    Vec.toArray(out)
+}
+
+fun actual(c : Case, a : Archived, observed : Observed, e : Expectation) -> String = match e {
+    StdoutText -> observed.stdout
+    StderrText -> observed.stderr
+    ErrorText -> terminated(Reference.diagnostic(observed.stderr))
+    PanicText -> terminated(Reference.panicMessage(observed.stderr))
+    TypesDump | KindsDump | ClassesDump -> match dumpOf(c, observed, e) {
+        Some((_, stdout, _)) -> filtered(e, a.modules, stdout)
+        None -> ""
+    }
+}
+
+-- `text` as a section holds it: with a newline after it, unless it is empty.
+fun terminated(text : String) -> String = if String.isEmpty(text) { "" } else { text + "\n" }
+
+-- Returns how the dump that `e`'s section is compared with ended, its stdout
+-- and its stderr, if it was run.
+fun dumpOf(c : Case, observed : Observed, e : Expectation) -> Option (Finish, String, String) {
+    let stage = stageOf(e)?
+    for i in Int.range(0, min(len(c.dumps), len(observed.dumps))) {
+        if c.dumps[i].0 == stage { return Some(observed.dumps[i]) }
+    }
+    None
+}
+
+-- Returns the entries of `dump`, what `boot check --dump` printed for the
+-- section `e`, that a module in `modules` declares, in the order printed.
+--
+-- The `types` dump prints the entry module's signatures alone, so all of it
+-- is kept. The `decls` and `classes` dumps print every module the program
+-- uses, the library's included, as blocks: a line naming a declaration, and
+-- the indented lines under it. A type or a class is named by its qualified
+-- name, `Main#Box`, and belongs to the module before the `#`; an instance
+-- ends with its module in brackets, `[Main]`. A name with no module, such as
+-- a primitive type's, belongs to none of the case's.
+fun filtered(e : Expectation, modules : Array String, dump : String) -> String {
+    if let TypesDump = e { return dump }
+    let kept = []
+    var keeping = False
+    for l in String.lines(dump) {
+        if !String.startsWith(l, " ") {
+            keeping = Option.fold(owner(l), False, Array.contains(modules, _))
+        }
+        if keeping { Vec.push(kept, l) }
+    }
+    String.unlines(kept)
+}
+
+-- The module that declares the entry a block's first line names.
+fun owner(line : String) -> Option String {
+    let words = String.words(line)
+    if len(words) < 2 { return None }
+    if words[0] == "instance" {
+        let last = words[len(words) - 1]
+        return String.stripSuffix(String.stripPrefix(last, "[")?, "]")
+    }
+    Option.map(String.splitOnce(words[1], "#"), _.0)
+}
+
+-- -- blessing ----------------------------------------------------------------------------
+
+-- Returns why `text` cannot be an expectation section's body, if it cannot:
+-- it does not end in a newline, so the next header would be on its last line;
+-- or a line of it reads as a header, which would end the section there.
+fun unholdable(text : String) -> Option String {
+    if !String.isEmpty(text) && !String.endsWith(text, "\n") { return Some("does not end in a newline") }
+    for l in String.split(text, "\n") {
+        if Option.isSome(header(l)) { return Some("has the line '" + l + "', which would start a section") }
+    }
+    None
+}
+
+-- One change to an archive: lines `from` up to but not including `to` of the
+-- archive at `path` become `text`. An insertion has `from` equal to `to`.
+-- `section` names the expectation section it writes, for the report.
+type Edit = Edit { path : String, section : String, from : Int, to : Int, text : String }
+
+fun sameEdit(a : Edit, b : Edit) -> Bool =
+    a.path == b.path && a.section == b.section && a.from == b.from && a.to == b.to && a.text == b.text
+
+-- An archive that bless could not edit, and why.
+type Unedited = Unedited { path : String, why : String }
+
+instance Error Unedited { fun message(e) = "cannot edit " + e.path + ": " + e.why }
+
+-- Returns `text` with each of `edits` made, or why they cannot all be. Edits
+-- at one line are made in the order given. Every byte outside the lines an
+-- edit replaces is kept, except that a last line with no newline gains one
+-- when an edit is inserted after it.
+fun apply(text : String, edits : Array Edit) -> Either String String {
+    let t = split(text)
+    let b = String.builder()
+    var at = 0
+    -- Whether what is built so far ends a line, so that inserted text starts
+    -- one.
+    var ended = True
+    for e in Array.sortByKey(edits, _.from) {
+        if e.from < at || e.to < e.from || e.to > len(t.lines) {
+            return Left("an edit of lines " + Int.toString(e.from + 1) + " to " + Int.toString(e.to)
+                        + " overlaps another or runs past the end")
+        }
+        for i in Int.range(at, e.from) {
+            let l = line(t, i)
+            String.push(b, l)
+            ended = String.endsWith(l, "\n")
+        }
+        if !ended { String.push(b, "\n") }
+        String.push(b, e.text)
+        if !String.isEmpty(e.text) { ended = String.endsWith(e.text, "\n") }
+        at = e.to
+    }
+    String.push(b, span(t, at, len(t.lines)))
+    Right(String.build(b))
+}
+
+-- Makes `edits` to the archive at `path`, rewriting it only if that changes it.
+fun rewrite(path : String, edits : Array Edit) -> Either SomeError Unit {
+    let before = Files.readText(path)?
+    let after = match apply(before, edits) {
+        Right(after) -> after
+        Left(why) -> return Left(fail(Unedited { path, why }))
+    }
+    if after != before { Files.writeText(path, after)? }
+    Right(())
+}

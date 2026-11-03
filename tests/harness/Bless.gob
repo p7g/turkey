@@ -1,4 +1,5 @@
-export (Guard(..), Blessing(..), decide, permitted, overLimit, refused, refusalLimit, guardName)
+export (Guard(..), Blessing(..), decide, merged, permitted, archiveEdits, collected, overLimit, refused, refusalLimit,
+        guardName)
 
 -- Whether `--bless` may write a case's actual results over its goldens.
 --
@@ -9,10 +10,13 @@ export (Guard(..), Blessing(..), decide, permitted, overLimit, refused, refusalL
 -- nothing at all: a real change moves a few goldens, and a broken compiler
 -- moves all of them.
 --
--- Both decisions are pure functions of the case, its goldens and what its
--- run produced, so the selftest checks them without writing a file.
+-- Every decision is a pure function of the cases, their goldens and what
+-- their runs produced, so the selftest checks them without writing a file.
 
-import Case (Case(..), Expected(..), Golden(..), Finish(..), Ending(..), Observed(..), Recorded(..))
+import Archive (Edit(..), Comparison(..))
+import Archive as Archive
+import Case (Case(..), Expected(..), Golden(..), Archived(..), Section(..), Finish(..), Ending(..), Observed(..),
+             Recorded(..))
 import Case as Case
 
 -- The most refused cases a run may have and still write the rest.
@@ -21,9 +25,10 @@ let refusalLimit : Int = 5
 -- Why a result was refused: a compiler or program crash; a timeout; a `boot`
 -- diagnostic on a case not marked `--@ error`, or an error `boot` reports
 -- about itself rather than the program on any case; an end other than the
--- one its directive names; output that is empty where its golden is not; or
--- a case that could not be run at all.
-type Guard = Crash | Overrun | Diagnostic | WrongEnd | NewlyEmpty | Unrunnable
+-- one its directive names; output that is empty where its golden is not;
+-- output an archive section cannot hold; expansions of one matrix case that
+-- would not all write the same; or a case that could not be run at all.
+type Guard = Crash | Overrun | Diagnostic | WrongEnd | NewlyEmpty | Unholdable | Divergent | Unrunnable
 
 fun guardName(g : Guard) -> String = match g {
     Crash -> "crash"
@@ -31,34 +36,59 @@ fun guardName(g : Guard) -> String = match g {
     Diagnostic -> "diagnostic"
     WrongEnd -> "wrong end"
     NewlyEmpty -> "newly empty"
+    Unholdable -> "unholdable"
+    Divergent -> "divergent"
     Unrunnable -> "unrunnable"
 }
 
 -- What bless does with a case: nothing, because every golden already holds
--- what the run produced; write each (path, text); nothing, deliberately, for
--- the reason given, as for every reference example; or nothing, refused, by the guard and for the reason
+-- what the run produced; write each (path, text); make each edit to an
+-- archive; nothing, deliberately, for the reason given, as for every
+-- reference example; or nothing, refused, by the guard and for the reason
 -- given. Only a refusal fails the run.
-type Blessing = Unchanged | Write(Array (String, String)) | Keep(String) | Refuse(Guard, String)
+type Blessing = Unchanged | Write(Array (String, String)) | Edits(Array Edit) | Keep(String) | Refuse(Guard, String)
 
 -- Returns what bless does with case `c`, whose goldens are `recorded` and
 -- whose run produced `observed`. Never writes a file.
 --
 -- A case is refused whole: if any of its results is suspect, none of its
--- goldens is written. A missing `.expected` is written, and a dump golden is
--- written only if it is in `c.dumps`, which holds the ones that exist.
+-- goldens is written.
 fun decide(c : Case, recorded : Recorded, observed : Observed) -> Blessing {
     -- A quote is prose a person wrote about the example, and a failure there
     -- is a fix to the chapter or to the compiler that a person makes.
-    let golden = match c.golden {
-        OnDisk(path) -> path
-        Quoted(_) -> return Keep("the reference is written by hand")
-    }
+    if let Quoted(_) = c.golden { return Keep("the reference is written by hand") }
     -- An `xfail` golden records what the case is expected not to print yet;
     -- writing what it does print would delete that.
     if let Some(reason) = c.xfail { return Keep("xfail: " + reason) }
     if let Some((guard, why)) = suspect(c.expected, observed) { return Refuse(guard, why) }
-    -- A new program needs an `.expected`, so a missing one is created. Adding
-    -- a dump golden is a deliberate act, so only existing ones are compared.
+    for i in Int.range(0, len(c.dumps)) {
+        if let Some((guard, why)) = dumpSuspect(c.dumps[i].0, observed.dumps[i].0) { return Refuse(guard, why) }
+    }
+    match c.golden {
+        OnDisk(path) -> onDisk(c, path, recorded, observed)
+        InArchive(a) -> inArchive(c, a, observed)
+        Quoted(_) -> Keep("the reference is written by hand")
+    }
+}
+
+-- The guard that how the dump of `stage` ended trips, and why, if it trips
+-- one.
+fun dumpSuspect(stage : String, finish : Finish) -> Option (Guard, String) {
+    let dump = "the " + stage + " dump"
+    match finish {
+        Returned(0) -> None
+        Returned(code) -> Some((WrongEnd, dump + " exited " + Int.toString(code)))
+        Panicked(_) -> Some((Crash, dump + " panicked"))
+        Killed(n) -> Some((Crash, dump + " died by signal " + Int.toString(n)))
+        Expired -> Some((Overrun, dump + " took too long"))
+    }
+}
+
+-- A program's goldens are files. A missing `.expected` is written, since a
+-- new program needs one. A dump golden is written only if it is in
+-- `c.dumps`, which holds the ones that exist, since adding one is a
+-- deliberate act.
+fun onDisk(c : Case, golden : String, recorded : Recorded, observed : Observed) -> Blessing {
     let writes = []
     let output = Case.printed(observed)
     match recorded.expected {
@@ -69,21 +99,37 @@ fun decide(c : Case, recorded : Recorded, observed : Observed) -> Blessing {
         None -> Vec.push(writes, (golden, output))
     }
     for i in Int.range(0, len(c.dumps)) {
-        let stage = c.dumps[i].0
-        let (finish, printed) = observed.dumps[i]
-        let dump = "the " + stage + " dump"
-        match finish {
-            Returned(0) -> {}
-            Returned(code) -> return Refuse(WrongEnd, dump + " exited " + Int.toString(code))
-            Panicked(_) -> return Refuse(Crash, dump + " panicked")
-            Killed(n) -> return Refuse(Crash, dump + " died by signal " + Int.toString(n))
-            Expired -> return Refuse(Overrun, dump + " took too long")
-        }
+        let dump = "the " + c.dumps[i].0 + " dump"
+        let (_, stdout, stderr) = observed.dumps[i]
+        let printed = stdout + stderr
         let old = recorded.dumps[i]
         if newlyEmpty(old, printed) { return Refuse(NewlyEmpty, dump + " is newly empty") }
         if old != printed { Vec.push(writes, (c.dumps[i].1, printed)) }
     }
     if len(writes) == 0 { Unchanged } else { Write(Vec.toArray(writes)) }
+}
+
+-- An archive case's goldens are its sections, each rewritten where it is. A
+-- missing stream section is inserted after the case's last section. A dump
+-- section is compared only where it already is, as for a program.
+fun inArchive(c : Case, a : Archived, observed : Observed) -> Blessing {
+    let edits = []
+    for cmp in Archive.comparisons(c, a, observed) {
+        let name = Case.expectationName(cmp.expectation)
+        let old = Option.fold(cmp.section, "", _.text)
+        if old == cmp.actual { continue }
+        if newlyEmpty(old, cmp.actual) { return Refuse(NewlyEmpty, "the " + name + " is newly empty") }
+        if let Some(why) = Archive.unholdable(cmp.actual) { return Refuse(Unholdable, "the " + name + " " + why) }
+        let edit = match cmp.section {
+            Some(s) -> Edit { path = a.path, section = name, from = s.from, to = s.to, text = cmp.actual }
+            None -> Edit {
+                path = a.path, section = name, from = a.end, to = a.end,
+                text = "-- " + name + " --\n" + cmp.actual,
+            }
+        }
+        Vec.push(edits, edit)
+    }
+    if len(edits) == 0 { Unchanged } else { Edits(Vec.toArray(edits)) }
 }
 
 -- The guard that how the case ended trips, and why, if it trips one.
@@ -113,6 +159,52 @@ fun suspect(expected : Expected, observed : Observed) -> Option (Guard, String) 
 
 fun newlyEmpty(old : String, actual : String) -> Bool = !String.isEmpty(old) && String.isEmpty(actual)
 
+-- Returns `decided` with every expansion of a matrix case refused unless
+-- they all agree: each would make the same edits, or none, and none was
+-- refused. The expansions share their sections, so two that disagree would
+-- each overwrite what the other wrote.
+fun merged(decided : Array (Case, Blessing)) -> Array (Case, Blessing) {
+    -- Group by the archive and the case's header line, which the expansions
+    -- of a case share and no two cases do.
+    let groups : Map String (Vec Blessing) = Map.new()
+    for (c, b) in decided {
+        if let Some(key) = expansionKey(c) {
+            match Map.get(groups, key) {
+                Some(held) -> Vec.push(held, b)
+                None -> Map.put(groups, key, Vec.fromArray([b]))
+            }
+        }
+    }
+    let out = []
+    for (c, b) in decided {
+        let group = match expansionKey(c) {
+            Some(key) -> Map.get(groups, key)
+            None -> None
+        }
+        let agreed = match (b, group) {
+            (Refuse(_, _), _) | (Keep(_), _) | (_, None) -> b
+            (_, Some(blessings)) ->
+                if Iterator.all(blessings, agree(b, _)) { b }
+                else { Refuse(Divergent, "the expansions of this case would not all write the same") }
+        }
+        Vec.push(out, (c, agreed))
+    }
+    Vec.toArray(out)
+}
+
+fun expansionKey(c : Case) -> Option String = match c.golden {
+    InArchive(a) -> Some(a.path + "\u{0}" + Int.toString(a.origin))
+    OnDisk(_) | Quoted(_) -> None
+}
+
+-- Whether two expansions' blessings would write the same.
+fun agree(a : Blessing, b : Blessing) -> Bool = match (a, b) {
+    (Unchanged, Unchanged) -> True
+    (Keep(_), Keep(_)) -> True
+    (Edits(x), Edits(y)) -> len(x) == len(y) && Iterator.all(Int.range(0, len(x)), fun(i) = Archive.sameEdit(x[i], y[i]))
+    _ -> False
+}
+
 fun refused(b : Blessing) -> Bool = match b {
     Refuse(_, _) -> True
     _ -> False
@@ -133,4 +225,33 @@ fun permitted(blessings : Array Blessing) -> Array (String, String) {
         }
     }
     Vec.toArray(writes)
+}
+
+-- Returns the edits the run may make to each archive, as (path, edits),
+-- given each case's blessing: every one, unless more than `refusalLimit`
+-- cases were refused, and then none.
+fun archiveEdits(blessings : Array Blessing) -> Array (String, Array Edit) =
+    if overLimit(blessings) { [] } else { collected(blessings) }
+
+-- Returns every edit in `blessings`, as (path, edits), in the order first
+-- seen. An edit that several expansions of a matrix case make is listed
+-- once.
+fun collected(blessings : Array Blessing) -> Array (String, Array Edit) {
+    let byPath = []
+    for b in blessings {
+        if let Edits(edits) = b {
+            for e in edits {
+                let held = match Iterator.find(byPath, _.0 == e.path) {
+                    Some((_, held)) -> held
+                    None -> {
+                        let held = []
+                        Vec.push(byPath, (e.path, held))
+                        held
+                    }
+                }
+                if !Iterator.any(held, Archive.sameEdit(_, e)) { Vec.push(held, e) }
+            }
+        }
+    }
+    Vec.toArray(Vec.map(byPath, fun((path, edits)) = (path, Vec.toArray(edits))))
 }

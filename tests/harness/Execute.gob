@@ -12,7 +12,8 @@ export (execute, diffLimit)
 -- --dump STAGE`, which is not cached, since the dump is what is tested.
 --
 -- A reference example is judged on what its chapter quotes instead
--- (`Reference`): its stdout exactly, and a part of its message.
+-- (`Reference`): its stdout exactly, and a part of its message. An archive
+-- case is judged on its expectation sections (`Archive`), each exactly.
 --
 -- Running a case and judging it are separate: `observe` runs the processes
 -- and gathers what they produced, and `verdict` and `Bless.decide` are pure
@@ -30,8 +31,10 @@ import Time.Duration as Duration
 import Time.Stopwatch as Stopwatch
 import Bless (Blessing(..), Guard(..))
 import Bless as Bless
-import Case (Case(..), Golden(..), Quote(..), Outcome(..), Result(..), Finish(..), Ending(..), Observed(..),
-             Recorded(..))
+import Archive (Comparison(..))
+import Archive as Archive
+import Case (Case(..), Golden(..), Quote(..), Archived(..), Section(..), Outcome(..), Result(..), Finish(..),
+             Ending(..), Observed(..), Recorded(..))
 import Case as Case
 import Cache (Cache, Compiled(..))
 import Cache as Cache
@@ -94,11 +97,12 @@ fun unrunnable(why : String) -> (Verdict, Blessing) = (Verdict(HarnessError, why
 
 -- The case's goldens as they are on disk. A missing `.expected` is not an
 -- error here: the verdict reports it, and bless creates it. A quoted golden
--- is not on disk, and is recorded as no `.expected`.
+-- and an archive's sections are not files of their own, and are recorded as
+-- nothing.
 fun goldens(c : Case) -> Either SomeError Recorded {
     let expected = match c.golden {
         OnDisk(path) -> if Files.exists(path) { Some(Files.readText(path)?) } else { None }
-        Quoted(_) -> None
+        Quoted(_) | InArchive(_) -> return Right(Recorded { expected = None, dumps = [] })
     }
     let dumps = []
     for (_, path) in c.dumps { Vec.push(dumps, Files.readText(path)?) }
@@ -142,26 +146,26 @@ fun runProgram(t : Toolchain, c : Case, binary : String, warnings : String)
     -> Either IOError (Ending, String, String) {
     let argv = t.run + [binary]
     let limit = Toolchain.limit(t, Option.unwrapOr(c.timeout, defaultTimeout))
-    let Output { stdout, stderr, status } = Process.run(Toolchain.command(t, argv, c.directory), Some(limit))?
+    let Output { stdout, stderr, status } = Process.run(Toolchain.caseCommand(t, c, argv), Some(limit))?
     let err = Toolchain.text(stderr)
     Right((Ran(finish(status, err)), Toolchain.text(stdout), warnings + err))
 }
 
--- Each of the case's dump stages, as `boot check --dump STAGE` ended and what
--- it printed, stdout then stderr.
-fun runDumps(t : Toolchain, actual : String, c : Case) -> Either String (Array (Finish, String)) {
+-- Each of the case's dump stages, as `boot check --dump STAGE` ended, its
+-- stdout and its stderr.
+fun runDumps(t : Toolchain, actual : String, c : Case) -> Either String (Array (Finish, String, String)) {
     let out = []
     for (stage, _) in c.dumps {
         let argv = t.run + [t.boot, "check", "--dump", stage, c.entry]
         let limit = Toolchain.limit(t, defaultTimeout)
-        let ran = match Process.run(Toolchain.command(t, argv, c.directory), Some(limit)) {
+        let ran = match Process.run(Toolchain.caseCommand(t, c, argv), Some(limit)) {
             Right(ran) -> ran
             Left(e) -> return Left("boot did not start: " + Error.message(e))
         }
+        let stdout = Toolchain.text(ran.stdout)
         let stderr = Toolchain.text(ran.stderr)
-        let printed = Toolchain.text(ran.stdout) + stderr
-        record(actual, stage, printed)
-        Vec.push(out, (finish(ran.status, stderr), printed))
+        record(actual, stage, stdout + stderr)
+        Vec.push(out, (finish(ran.status, stderr), stdout, stderr))
     }
     Right(Vec.toArray(out))
 }
@@ -187,6 +191,7 @@ fun record(directory : String, name : String, text : String) -> Unit {
 fun verdict(c : Case, recorded : Recorded, observed : Observed) -> Verdict = match c.golden {
     OnDisk(path) -> goldenVerdict(c, path, recorded, observed)
     Quoted(q) -> quotedVerdict(c, q, observed)
+    InArchive(a) -> archiveVerdict(c, a, observed)
 }
 
 fun goldenVerdict(c : Case, path : String, recorded : Recorded, observed : Observed) -> Verdict {
@@ -208,7 +213,37 @@ fun goldenVerdict(c : Case, path : String, recorded : Recorded, observed : Obser
         return Verdict(Fail, why, diff)
     }
     for i in Int.range(0, len(c.dumps)) {
-        if let Some(v) = dumpVerdict(c.dumps[i].0, recorded.dumps[i], observed.dumps[i]) { return v }
+        let (finished, stdout, stderr) = observed.dumps[i]
+        let stage = c.dumps[i].0
+        if let Some(v) = dumpVerdict(stage, recorded.dumps[i], finished, stdout + stderr) { return v }
+    }
+    Verdict(Pass, "", "")
+}
+
+-- The outcome of an archive case whose expectations are `a`. Each
+-- comparison is made in the order `Archive.comparisons` gives, and the first
+-- that differs decides.
+fun archiveVerdict(c : Case, a : Archived, observed : Observed) -> Verdict {
+    let compared = Archive.comparisons(c, a, observed)
+    let diffs = Array.map(compared, comparedDiff)
+    let first = Option.unwrapOr(Iterator.find(diffs, \!String.isEmpty(_)), "")
+    if let Some(v) = ended(observed, diffs[0]) { return v }
+    if let Some(why) = Case.disagreement(c.expected, observed.ending) { return Verdict(Fail, why, first) }
+    for i in Int.range(0, len(compared)) {
+        let e = compared[i].expectation
+        let name = Case.expectationName(e)
+        let dump = "the " + name + " dump"
+        let ran = Archive.dumpOf(c, observed, e)
+        if let Some((finished, stdout, stderr)) = ran {
+            if let Some(v) = dumpCrashed(dump, finished, stdout + stderr, diffs[i]) { return v }
+        }
+        if !String.isEmpty(diffs[i]) {
+            let what = if Option.isSome(ran) { dump } else { "the " + name }
+            return Verdict(Fail, what + " differs", diffs[i])
+        }
+        if let Some((finished, _, _)) = ran {
+            if let Some(v) = dumpExited(dump, finished) { return v }
+        }
     }
     Verdict(Pass, "", "")
 }
@@ -249,20 +284,37 @@ fun ended(observed : Observed, diff : String) -> Option Verdict {
     }
 }
 
+-- The diff of a comparison's section, or the empty string where the case
+-- has none, against what the run produced.
+fun comparedDiff(cmp : Comparison) -> String {
+    let recorded = Option.fold(cmp.section, "", _.text)
+    Diff.unified(recorded, cmp.actual, diffLimit)
+}
+
 -- What is wrong with the dump of `stage`, whose golden is `golden`, if
 -- anything is.
-fun dumpVerdict(stage : String, golden : String, ran : (Finish, String)) -> Option Verdict {
-    let (finished, printed) = ran
+fun dumpVerdict(stage : String, golden : String, finished : Finish, printed : String) -> Option Verdict {
     let dump = "the " + stage + " dump"
     let diff = Diff.unified(golden, printed, diffLimit)
+    if let Some(v) = dumpCrashed(dump, finished, printed, diff) { return Some(v) }
+    if diff != "" { return Some(Verdict(Fail, dump + " differs", diff)) }
+    dumpExited(dump, finished)
+}
+
+-- The outcome of `dump` if it ran out of time or crashed, showing `diff` for
+-- a timeout.
+fun dumpCrashed(dump : String, finished : Finish, printed : String, diff : String) -> Option Verdict =
     match finished {
         Expired -> Some(Verdict(Timeout, dump + " took too long", diff))
         Killed(n) -> Some(Verdict(CompilerCrash, dump + " died by signal " + Int.toString(n), tail(printed)))
         Panicked(_) -> Some(Verdict(CompilerCrash, dump + " panicked", tail(printed)))
-        Returned(code) -> if diff != "" { Some(Verdict(Fail, dump + " differs", diff)) }
-                          else if code != 0 { Some(Verdict(Fail, dump + " exited " + Int.toString(code), "")) }
-                          else { None }
+        Returned(_) -> None
     }
+
+-- The outcome of `dump` if it exited non-zero.
+fun dumpExited(dump : String, finished : Finish) -> Option Verdict = match finished {
+    Returned(code) -> if code != 0 { Some(Verdict(Fail, dump + " exited " + Int.toString(code), "")) } else { None }
+    Expired | Killed(_) | Panicked(_) -> None
 }
 
 -- A crash's last lines, which is where what went wrong usually is.

@@ -166,8 +166,8 @@ that compile the compiler's own source are most of that.
 
 On an arm64 Linux machine none of that is needed: `cc` links for it and the
 programs run directly. CI does this on GitHub's arm64 runners
-(`.github/workflows/linux.yml`), building from the bootstrap once under gcc and once
-under clang, and running the suite and the fixed point split across jobs by
+(`.github/workflows/linux.yml`), building from the bootstrap under gcc and
+running the suite and the fixed point split across jobs by
 `scripts/ci-shard.sh`.
 
 One group of tests depends on the C compiler, and skips, saying why, where it

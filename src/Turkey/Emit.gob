@@ -75,20 +75,22 @@ fun emitFunc(asm : Asm.Asm, f : Func Inst, a : Regalloc.Allocation,
     -- and its edge costs no instruction at all.
     let order = Ssa.reversePostorder(f)
     let reads = useCounts(f)
+    let edges = atEdges(f, reads)
     let cold = Cold { text = [], count = 0 }
     for var k = 0; k < len(order); k = k + 1 {
         let at = Ssa.blockId(order[k])
         let next = if k + 1 < len(order) { Ssa.blockId(order[k + 1]) } else { -1 }
         emit(b, Label(blockLabel(d, tag, at)))
         let block = f.blocks[at]
+        let insts = withoutEdgeDefinitions(block.insts, edges)
         match fused(block, reads) {
             Some((c, yes, no)) -> {
-                emitInsts(b, cold, d, f, a, l, tag, block.insts, len(block.insts) - 1)
+                emitInsts(b, cold, d, f, a, l, tag, insts, len(insts) - 1)
                 conditional(b, d, tag, c, yes, no, next)
             }
             None -> {
-                emitInsts(b, cold, d, f, a, l, tag, block.insts, len(block.insts))
-                emitTerm(b, d, f, a, l, tag, block.term, next)
+                emitInsts(b, cold, d, f, a, l, tag, insts, len(insts))
+                emitTerm(b, d, f, a, l, tag, edges, block.term, next)
             }
         }
     }
@@ -161,6 +163,47 @@ fun useCounts(f : Func Inst) -> Array Int {
         for v in Ssa.termUses(block.term) {
             out[Ssa.valueId(v)] = out[Ssa.valueId(v)] + 1
         }
+    }
+    out
+}
+
+-- For each value, its definition if a jump computes it into a block
+-- parameter's register and it is not computed where it is defined: a value
+-- `A.rematerializable` defines whose one read is a jump's argument. Its
+-- definition is one instruction that reads no register, so writing it into
+-- the parameter's register on the edge costs what the copy's `mov` would
+-- have, and leaves out the definition the `mov` would have copied.
+fun atEdges(f : Func Inst, reads : Array Int) -> Array (Option A.Arm) {
+    let out : Array (Option A.Arm) = Array.filled(len(f.reps), None)
+    let passed = Array.filled(len(f.reps), False)
+    for block in f.blocks {
+        match block.term {
+            Jump(_, args) -> for v in args {
+                if reads[Ssa.valueId(v)] == 1 { passed[Ssa.valueId(v)] = True }
+            }
+            _ -> {}
+        }
+    }
+    for block in f.blocks {
+        for i in block.insts {
+            if A.rematerializable(i.op) {
+                Ssa.eachDef(i, fun(v) {
+                    if passed[Ssa.valueId(v)] { out[Ssa.valueId(v)] = Some(i.op) }
+                })
+            }
+        }
+    }
+    out
+}
+
+-- A block's instructions less the definitions a jump computes instead
+-- (`atEdges`). The same vector when there are none, which is almost always.
+fun withoutEdgeDefinitions(insts : Vec Inst, edges : Array (Option A.Arm)) -> Vec Inst {
+    let atEdge = fun(i : Inst) = Ssa.anyDef(i, fun(v) = Option.isSome(edges[Ssa.valueId(v)]))
+    if !Iterator.any(insts, atEdge) { return insts }
+    let out : Vec Inst = []
+    for i in insts {
+        if !atEdge(i) { Vec.push(out, i) }
     }
     out
 }
@@ -572,8 +615,8 @@ fun wideSlot(l : Frame.Layout, op : A.Arm) -> Option Int = match A.memOf(op) {
 -- -- terminators -------------------------------------------------------------
 
 fun emitTerm(b : Code, d : Asm.Dialect, f : Func Inst,
-             a : Regalloc.Allocation, l : Frame.Layout, tag : Int, t : Term,
-             next : Int) -> Unit =
+             a : Regalloc.Allocation, l : Frame.Layout, tag : Int,
+             edges : Array (Option A.Arm), t : Term, next : Int) -> Unit =
     match t {
         -- The result into the register the convention answers in, then the
         -- frame comes down. Every return does its own epilogue: a shared exit
@@ -584,7 +627,20 @@ fun emitTerm(b : Code, d : Asm.Dialect, f : Func Inst,
             epilogue(b, l)
         }
         Jump(target, args) -> {
-            copies(b, f, a, Ssa.blockAt(f, target).params, args)
+            let params = Ssa.blockAt(f, target).params
+            copies(b, f, a, edges, params, args)
+            -- After the copies, which may still read the registers these
+            -- write, and which have finished with the scratch register a
+            -- wide frame address takes.
+            for var i = 0; i < len(params) && i < len(args); i = i + 1 {
+                match edges[Ssa.valueId(args[i])] {
+                    Some(op) -> emitInst(b, d, f, a, l, tag, Inst {
+                        op = A.rewrite(op, fun(r) = renamed(r, args[i], params[i]),
+                                       fun(m) = m)
+                    })
+                    None -> {}
+                }
+            }
             if Ssa.blockId(target) != next {
                 instruction(b, A.B(blockLabel(d, tag, Ssa.blockId(target))))
             }
@@ -641,11 +697,15 @@ fun zero(b : Code, f : Func Inst) -> Unit =
 --
 -- This is the one place the block-parameter design costs an algorithm, and it
 -- is the same one every allocator that shuffles registers at a merge writes.
-fun copies(b : Code, f : Func Inst, a : Regalloc.Allocation,
+--
+-- An argument the jump computes itself (`atEdges`) is no move's source, and
+-- is left to the caller.
+fun copies(b : Code, f : Func Inst, a : Regalloc.Allocation, edges : Array (Option A.Arm),
            params : Vec Value, args : Vec Value) -> Unit {
     let dsts : Vec Reg = []
     let srcs : Vec Reg = []
     for var i = 0; i < len(params) && i < len(args); i = i + 1 {
+        if Option.isSome(edges[Ssa.valueId(args[i])]) { continue }
         let d = coloured(f, a, A.reg(params[i]))
         let s = coloured(f, a, A.reg(args[i]))
         if A.showReg(d, A.W64) != A.showReg(s, A.W64) {
@@ -689,6 +749,12 @@ fun copies(b : Code, f : Func Inst, a : Regalloc.Allocation,
             }
         }
     }
+}
+
+-- `r`, naming `to` where it named `from`.
+fun renamed(r : Reg, from : Value, to : Value) -> Reg = match r {
+    Virtual(n) -> if n == Ssa.valueId(from) { A.reg(to) } else { r }
+    Physical(_, _) -> r
 }
 
 fun isSource(r : Reg, srcs : Vec Reg, done : Array Bool) -> Bool {

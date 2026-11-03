@@ -766,18 +766,27 @@ fun cheaperHolder(w : Walk, taken : Taken, id : Int, bank : Bank) -> Option Int 
 -- pointer puts a load in front of every dereference. On a loop over two
 -- arrays with nine accumulators, and on library loops a bytecode interpreter
 -- spends its time in, it measured 1.5 to 3% slower.
+--
+-- A value `spill` would rematerialize pays no store, and each read costs a
+-- quarter of a load: one instruction that waits on nothing. So it is the
+-- holder `cheaperHolder` sends to memory first.
 fun spillCosts(f : Func A.Inst, roots : Map Int Int) -> Array Int {
     let weight = loopWeights(f)
+    let remade = rematerializable(f, roots)
     let cost = Array.filled(len(f.reps), 0)
     for var b = 0; b < len(f.blocks); b = b + 1 {
         let block = f.blocks[b]
         let w = weight[b]
         let charge = fun(v : Value) {
             let id = Ssa.valueId(v)
-            cost[id] = cost[id] + w
+            let each = if Map.contains(remade, id) { w } else { memoryCost * w }
+            cost[id] = cost[id] + each
         }
         let stored = fun(v : Value) {
-            if !Map.contains(roots, Ssa.valueId(v)) { charge(v) }
+            let id = Ssa.valueId(v)
+            if !Map.contains(roots, id) && !Map.contains(remade, id) {
+                cost[id] = cost[id] + memoryCost * w
+            }
         }
         for p in block.params { stored(p) }
         for i in block.insts {
@@ -792,6 +801,10 @@ fun spillCosts(f : Func A.Inst, roots : Map Int Int) -> Array Int {
     }
     cost
 }
+
+-- What `spillCosts` charges for one executed load or store, against one for
+-- a repeated definition.
+let memoryCost = 4
 
 -- How often each block is guessed to run relative to the entry: ten times
 -- over for each natural loop it is in, the weight Chaitin's spill cost uses,
@@ -1219,7 +1232,11 @@ type Spills = Spills {
     -- Spilled value id -> its slot: its root slot if `Turkey.Roots` gave it
     -- one, a spill slot of its own otherwise.
     slots          : Map Int A.Mem,
-    -- Reload value id -> the spilled value it reloads.
+    -- Rematerialized value id -> its defining instruction. Such a value has
+    -- no slot and no store: its definition is deleted, and each reload of it
+    -- repeats that instruction into the reload's value.
+    remat          : Map Int A.Arm,
+    -- Reload value id -> the spilled or rematerialized value it reloads.
     reloadOf       : Map Int Int,
     -- The reloads read more than once. Only these may be evicted: a later
     -- round splits one back into a reload per read.
@@ -1229,7 +1246,7 @@ type Spills = Spills {
 }
 
 fun newSpills() -> Spills =
-    Spills { slots = Map.new(), reloadOf = Map.new(), shared = Set.new(),
+    Spills { slots = Map.new(), remat = Map.new(), reloadOf = Map.new(), shared = Set.new(),
              spillSlots = 0, stores = 0 }
 
 type Allocation = Allocation {
@@ -1263,11 +1280,18 @@ let maxRounds = 16
 -- if it has more than one read, into reloads that have one; the cap is a
 -- report, not a policy.
 --
+-- A value `A.rematerializable` defines is spilled by repeating its definition
+-- rather than through a slot. Every such value live across a call is spilled
+-- before the first walk, so the walk never gives one a callee-saved register
+-- or a slot: repeating one instruction after the call is cheaper than either.
+--
 -- The input is not changed. Selection's output is still printed and measured
 -- after this runs, and a pass that mutated it would make both lie.
 fun allocate(f : Func A.Inst, roots : Map Int Int) -> Allocation {
     let g = copyFunc(Ssa.pruneUnreachable(f))
     let spills = newSpills()
+    let crossing = rematerializableAcrossCalls(g, roots)
+    if len(crossing) > 0 { spill(g, crossing, Set.new(), roots, spills) }
     var rounds = 0
     var answer = Allocation {
         func = g, colouring = Colouring { of_ = [], stopped = None },
@@ -1295,6 +1319,44 @@ fun allocate(f : Func A.Inst, roots : Map Int Int) -> Allocation {
         }
     }
     answer
+}
+
+-- The values `spill` would rematerialize that are live across some call.
+fun rematerializableAcrossCalls(g : Func A.Inst, roots : Map Int Int) -> Set.Set Int {
+    let out = Set.new()
+    let candidates = rematerializable(g, roots)
+    if len(candidates) == 0 { return out }
+    let liveOut = Ssa.liveness(g)
+    for var b = 0; b < len(g.blocks); b = b + 1 {
+        let block = g.blocks[b]
+        let after = Ssa.liveAfter(g, Ssa.BlockId(b), liveOut[b])
+        for var n = 0; n < len(block.insts); n = n + 1 {
+            if A.isCall(block.insts[n]) {
+                for id in after[n] {
+                    if Map.contains(candidates, id) { Set.add(out, id) }
+                }
+            }
+        }
+    }
+    out
+}
+
+-- Each value `spill` sends to memory by repeating its definition, and that
+-- definition. Not a rooted one: its root store reads the value after its
+-- definition, and the frame table names its slot.
+fun rematerializable(g : Func A.Inst, roots : Map Int Int) -> Map Int A.Arm {
+    let out = Map.new()
+    for block in g.blocks {
+        for i in block.insts {
+            if A.rematerializable(i.op) {
+                Ssa.eachDef(i, fun(d) {
+                    let id = Ssa.valueId(d)
+                    if !Map.contains(roots, id) { Map.put(out, id, i.op) }
+                })
+            }
+        }
+    }
+    out
 }
 
 fun copyFunc(f : Func A.Inst) -> Func A.Inst {
@@ -1332,13 +1394,26 @@ fun copyFunc(f : Func A.Inst) -> Func A.Inst {
 -- to give this backend, and it is why the root array is consulted here and not
 -- only by the emitter. It is also why splitting at the calls costs only the
 -- loads: the store was owed anyway.
+--
+-- A value `rematerializable` names gets no slot and no store. Its definition
+-- is deleted, since every read of it is renamed, and its reload is a copy of
+-- that definition into the reload's value: a constant is one instruction to
+-- recompute, where a slot costs a store, a load, and room in the frame.
 fun spill(g : Func A.Inst, ids : Set.Set Int, crowded : Set.Set Int,
           roots : Map Int Int, spills : Spills) -> Unit {
     let splitting = Set.new()
+    let remade = rematerializable(g, roots)
     for id in Array.sort(Set.elements(ids)) {
         if Map.contains(spills.reloadOf, id) {
             Set.add(splitting, id)
             continue
+        }
+        match Map.get(remade, id) {
+            Some(op) -> {
+                Map.put(spills.remat, id, op)
+                continue
+            }
+            None -> {}
         }
         let slot = match Map.get(roots, id) {
             Some(n) -> A.RootSlot(n)
@@ -1366,7 +1441,9 @@ fun spill(g : Func A.Inst, ids : Set.Set Int, crowded : Set.Set Int,
             -- `storeIfSpilled` at the same point, so selection's store would
             -- be a reload and a second write of what the slot holds.
             if isRootStoreOfSpilled(i.op, ids, spills) { continue }
-            if isLoadOf(i.op, splitting) { continue }
+            if Ssa.anyDef(i, fun(d) = isRemade(Ssa.valueId(d), ids, splitting, spills)) {
+                continue
+            }
             var op = i.op
             for id in Array.sort(Set.elements(usedSpilled(Ssa.uses(i), ids))) {
                 let t = standIn(g, out, spills, ready, crowded, id)
@@ -1463,10 +1540,13 @@ fun clear(m : Map Int v) -> Unit {
     }
 }
 
-fun isLoadOf(op : A.Arm, ids : Set.Set Int) -> Bool = match A.slotLoad(op) {
-    Some((t, _)) -> Set.contains(ids, t)
-    None -> False
-}
+-- Whether `spill` deletes the definition of `id`, because each of its reads
+-- gets a reload of its own instead: a reload being split, or a value being
+-- rematerialized.
+fun isRemade(id : Int, ids : Set.Set Int, splitting : Set.Set Int,
+             spills : Spills) -> Bool =
+    Set.contains(splitting, id)
+    || (Set.contains(ids, id) && Map.contains(spills.remat, id))
 
 fun isRootStoreOfSpilled(op : A.Arm, ids : Set.Set Int, spills : Spills) -> Bool =
     match A.slotStore(op) {
@@ -1496,16 +1576,24 @@ fun storeIfSpilled(out : Vec A.Inst, spills : Spills, ids : Set.Set Int,
     }
 }
 
--- A fresh value holding `id`, loaded from its slot at the end of `out`.
+-- A fresh value holding `id`, at the end of `out`: loaded from its slot, or
+-- computed again by a copy of its definition.
 fun reload(g : Func A.Inst, out : Vec A.Inst, spills : Spills, id : Int) -> Int {
     let t = Ssa.valueId(Ssa.freshValue(g, g.reps[id]))
     Map.put(spills.reloadOf, t, id)
     match Map.get(spills.slots, id) {
         Some(slot) -> Vec.push(out, A.Inst { op = A.Ldr(A.Virtual(t), slot, A.W64) })
-        None -> {}
+        None -> match Map.get(spills.remat, id) {
+            Some(op) -> Vec.push(out, A.Inst { op = remade(op, id, t) })
+            None -> {}
+        }
     }
     t
 }
+
+-- The definition `op` of `id`, defining `t` instead.
+fun remade(op : A.Arm, id : Int, t : Int) -> A.Arm =
+    A.rewrite(op, renamed(_, id, t), fun(m) = m)
 
 fun renamed(r : Reg, from : Int, to : Int) -> Reg = match r {
     Virtual(n) -> if n == from { Virtual(to) } else { r }
@@ -1566,6 +1654,7 @@ fun verifyAllocation(a : Allocation) -> Vec String {
                 if Map.contains(spills.slots, id) {
                     checkStore(out, spills, block, definers, b, n, id)
                 }
+                checkRematRead(out, spills, id, where_(b, n))
                 checkReloadRead(out, spills, ready, id, where_(b, n))
             })
             match A.slotLoad(op) {
@@ -1582,7 +1671,7 @@ fun verifyAllocation(a : Allocation) -> Vec String {
                     None -> Vec.push(out, "a slot load at " + where_(b, n)
                                             + " is not a recorded reload")
                 }
-                None -> {}
+                None -> checkRemade(out, spills, ready, block.insts[n], where_(b, n))
             }
             if endsReloads(block.insts[n]) { clear(ready) }
             if A.isCSet(op) { checkFlags(out, block, b, n) }
@@ -1593,6 +1682,7 @@ fun verifyAllocation(a : Allocation) -> Vec String {
                 Vec.push(out, "spilled value %" + Int.toString(id)
                                 + " is read by the terminator of b" + Int.toString(b))
             }
+            checkRematRead(out, spills, id, "the terminator of b" + Int.toString(b))
             checkReloadRead(out, spills, ready, id, "the terminator of b" + Int.toString(b))
         }
         leaving[b] = Some(ready)
@@ -1669,6 +1759,42 @@ fun checkReloadRead(out : Vec String, spills : Spills, ready : Map Int Unit,
         Vec.push(out, "reload %" + Int.toString(id) + " is read at " + at
                         + ", past a call or a merge since it was loaded")
     }
+}
+
+-- A rematerialized value is read by nothing. Its definition is gone, and each
+-- read reads a reload instead: a copy of that definition into a fresh value,
+-- which `checkReloadRead` holds to a reload's rule, never read across a call
+-- or a poll from where it was placed.
+fun checkRematRead(out : Vec String, spills : Spills, id : Int, at : String) -> Unit {
+    if Map.contains(spills.remat, id) {
+        Vec.push(out, "rematerialized value %" + Int.toString(id) + " is read at " + at)
+    }
+}
+
+-- A reload defined by anything but a slot load is a rematerialized value's,
+-- and is defined by exactly that value's definition, renamed. From there it may
+-- be read as any reload may.
+fun checkRemade(out : Vec String, spills : Spills, ready : Map Int Unit,
+                i : A.Inst, at : String) -> Unit {
+    Ssa.eachDef(i, fun(d) {
+        let t = Ssa.valueId(d)
+        match Map.get(spills.reloadOf, t) {
+            Some(from) -> {
+                match Map.get(spills.remat, from) {
+                    Some(op) -> if show(A.Inst { op = remade(op, from, t) }) != show(i) {
+                        Vec.push(out, "reload %" + Int.toString(t) + " at " + at
+                                        + " is not the definition of %"
+                                        + Int.toString(from))
+                    }
+                    None -> Vec.push(out, "reload %" + Int.toString(t) + " at " + at
+                                            + " is not a load of %" + Int.toString(from)
+                                            + "'s slot")
+                }
+                Map.put(ready, t, ())
+            }
+            None -> {}
+        }
+    })
 }
 
 fun isReload(op : A.Arm) -> Bool = match A.slotLoad(op) {

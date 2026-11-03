@@ -192,6 +192,49 @@ def test_a_value_in_a_slot_is_loaded_once_between_calls():
             seen.add(match.group(1))
 
 
+ZERO = re.compile(r"mov (x\d+), xzr$")
+CALLEE_SAVED = {f"x{n}" for n in range(19, 28)}
+
+
+def test_a_zero_read_after_a_call_is_computed_again():
+    """A zero defined before a call and read after it is not kept across it.
+
+    `Main#label` passes `String.concat` a null closure environment, which
+    selection materializes before the calls in its argument list. Kept, it
+    would hold a callee-saved register or a stack slot; computed again, it is
+    a `mov` of `xzr` between the last of those calls and the one that reads
+    it.
+    """
+    body = _functions(_native("rematerialize.gob"))["Main#label"]
+    calls = [n for n, line in enumerate(body) if line.startswith("bl ")]
+    concat = next(n for n in calls if "String#concat" in body[n])
+    before = max(n for n in calls if n < concat)
+    assert "mov x0, xzr" in body[before + 1:concat], body[before:concat]
+    first_label = next(n for n, line in enumerate(body) if line.endswith(":"))
+    loads = [line for line in body[first_label:concat] if SLOT_LOAD.match(line)]
+    assert not loads, loads
+    held = [line for line in body
+            if (m := ZERO.match(line)) and m.group(1) in CALLEE_SAVED]
+    assert not held, held
+
+
+def test_a_constant_jump_argument_is_computed_into_its_parameter():
+    """A zero passed to a block parameter is written into the parameter's
+    register on the edge, not into another register and then copied.
+
+    `Main#pick` joins a call's result with a zero, and the join's parameter is
+    live across a call, so it holds a callee-saved register that the zero's
+    own definition would not have chosen.
+    """
+    body = _functions(_native("rematerialize.gob"))["Main#pick"]
+    assert any((m := ZERO.match(line)) and m.group(1) in CALLEE_SAVED
+               for line in body), body
+    for line, after in zip(body, body[1:]):
+        m = ZERO.match(line)
+        assert not (m and after.startswith("mov ")
+                    and after.endswith(", " + m.group(1))), (line, after)
+
+
 ROOT_STORE = re.compile(r"str (%\d+), \[root (\d+)\]$")
 PARAMETER = re.compile(r"mov (%\d+), x\d+$")
 

@@ -191,7 +191,7 @@ target     ::= IDENT | CONID ("." CONID)* "." IDENT
 
 `infix` is not a reserved word; it begins an `infix-decl` only at the start of
 a top-level item. The `CONID` is a precedence group, and the `OPERATOR` is
-neither built in nor `=`, `->` or `~` ([Declared
+none of `&&`, `||`, `!`, `=`, `->` and `~` ([Declared
 operators](expressions.md#declared-operators)).
 
 ## Patterns

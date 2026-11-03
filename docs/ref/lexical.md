@@ -89,15 +89,19 @@ An operator is a run of these characters:
 
 The lexer takes the longest run it can, so `<=` is one token and not `<`
 followed by `=`, and `x==-1` is `x`, the operator `==-`, and `1`. A run stops
-before `--`, which begins a comment. Some runs are built in:
+before `--`, which begins a comment. Some runs the language spells itself:
 
 ```text
 +   -   *   /   %   ==  !=  <   <=  >   >=  &&  ||  !   =   ->  |   ~
 ```
 
-`|` separates patterns and constructors, and is the one of these a module
-may also [declare](expressions.md#declared-operators) as a binary operator.
-Any other run is an operator only where a module declares it. Using one that nothing
+`&&`, `||` and `!` are built in, and `=`, `->`, `|` and `~` are punctuation;
+`|` separates patterns and constructors, and a module may also
+[declare](expressions.md#declared-operators) it as a binary operator. The
+arithmetic and comparison operators are
+[declared by the Prelude](expressions.md#operators-are-class-methods), in
+groups the language fixes. Any other run is an operator only where a module
+declares it. Using one that nothing
 declares is an error, and when the run splits into operators that do exist,
 the message suggests the split:
 

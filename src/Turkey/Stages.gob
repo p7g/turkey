@@ -1,0 +1,185 @@
+export (localize, passOf)
+
+-- `boot interpret --stages FILE ARGS...`: which pass a wrong answer comes
+-- from.
+--
+-- The program is interpreted from the Core after each stage, in pipeline
+-- order, and then compiled and run natively. Each interpreted run is compared
+-- with the one before it, and the first stage whose run differs names the
+-- pass that made it differ. When every stage agrees and the native run does
+-- not, the fault is below Core: in the backend or the runtime.
+--
+-- **Or it is in inlining host code.** The interpreted stages never inline a
+-- binding that runs compiled under the interpreter (the runtime's modules,
+-- and `Turkey.Stdout`'s compiled half) into library or user code, because an
+-- inlined runtime body would be interpreted against a copy of the runtime's
+-- state. The native compile does inline them. So a reduction that goes wrong
+-- only where it inlines host code makes every interpreted stage agree while
+-- native output differs, and the verdict names that possibility beside the
+-- backend.
+--
+-- Each run is its own process: this program's own executable, run again as
+-- `boot interpret --after STAGE`, since an interpreted program may exit, and
+-- what it prints goes to the process's own streams. The native build is
+-- `boot build` to an object, linked by `$TURKEY_CC` (`cc` when unset) and run
+-- under `$TURKEY_RUN`, as `scripts/build.sh` reads them. Two runs agree when
+-- they end the same way and print the same, a panic's trace lines (`  at
+-- ...`) aside, since the interpreter prints none.
+--
+-- Exits 0 when everything agrees, 1 when something differs, and 2 when the
+-- interpreter cannot run the program at some stage.
+
+import Process (Output(..), Status(..))
+import Process as Process
+import System.Env as Env
+import System.File as File
+import Interpreter.Host as Host
+import Turkey.Interpret as Interpret
+
+-- How a run ended, and what it printed.
+type Run = Run { status : Status, stdout : String, stderr : String }
+
+-- Returns the pass whose output `stage` is, for the stages
+-- `boot interpret --after` takes.
+fun passOf(stage : String) -> String = match stage {
+    "core" -> "lowering to Core (Turkey.Lower)"
+    "mono" -> "monomorphization (Mono.monomorphize)"
+    "reduce" -> "the first reduction (Opt.reduceProgram)"
+    "joins" -> "join discovery (Joins.discover)"
+    "rereduce" -> "the second reduction (Opt.reduceProgram)"
+    "reachable" -> "reachability after the reductions (Mono.reachable)"
+    "types" -> "associated type reduction (Mono.reduceTypes)"
+    "opt" -> "layout sharing and uncurrying (Layout.share, Uncurry.program)"
+    _ -> "'" + stage + "'"
+}
+
+-- Interpret `argv`'s program, `argv[0]`, with the rest as its arguments,
+-- after each of `stages` in turn, then natively, and report the first that
+-- differs. Never returns.
+fun localize(stages : Array String, argv : Array String) -> a {
+    let self = prefix() + [Host.executable()]
+    let path = argv[0]
+    let args = Array.slice(argv, 1, len(argv))
+    var before = None
+    for stage in stages {
+        let run = execute(self + ["interpret", "--after", stage] + argv)
+        if run.status == Exited(Interpret.cannotStatus)
+                || run.status == Exited(Interpret.outOfStackStatus) {
+            say("the interpreter cannot run " + path + " after '" + stage + "': "
+                + String.trim(run.stderr))
+            Env.exit(2)
+        }
+        if let Some((previous, earlier)) = before {
+            if !agree(earlier, run) {
+                say("the run after '" + stage + "' differs from the run after '" + previous
+                    + "', so the fault is in " + passOf(stage))
+                difference("after " + previous, earlier, "after " + stage, run)
+                Env.exit(1)
+            }
+        }
+        before = Some((stage, run))
+    }
+    let (last, interpreted) = match before {
+        Some(found) -> found
+        None -> {
+            say("no stages to interpret")
+            Env.exit(2)
+        }
+    }
+    let native = natively(self, path, args)
+    if agree(interpreted, native) {
+        say("every stage agrees with the native run")
+        Env.exit(0)
+    }
+    say("every stage agrees, and the native run differs, so the fault is below Core: in "
+        + "the backend or the runtime. Or it is in inlining host code: no interpreted "
+        + "stage inlines a runtime binding into library or user code, and the native "
+        + "compile does")
+    difference("after " + last, interpreted, "native", native)
+    Env.exit(1)
+}
+
+-- The program compiled by `self build`, linked and run with `args`. Its
+-- stderr starts with the compile's warnings, as an interpreted run's does.
+fun natively(self : Array String, path : String, args : Array String) -> Run {
+    let directory = match File.temporaryDir("turkey-stages-") {
+        Right(d) -> d
+        Left(e) -> {
+            say("cannot make a directory to build in: " + message(e))
+            Env.exit(2)
+        }
+    }
+    let object = directory + "/main.o"
+    let binary = directory + "/main"
+    let built = execute(self + ["build", "-f", "obj", "-o", object, path])
+    if built.status != Exited(0) {
+        let _ = File.removeTree(directory)
+        say("the native build failed:\n" + built.stderr)
+        Env.exit(2)
+    }
+    let cc = words(Env.get("TURKEY_CC"), "cc")
+    let machine = execute(cc + ["-dumpmachine"]).stdout
+    -- glibc keeps the maths library out of libc, and the runtime calls into it.
+    let libraries = if String.contains(machine, "linux") { ["-lm"] } else { [] }
+    let linked = execute(cc + ["-o", binary, object] + libraries)
+    if linked.status != Exited(0) {
+        let _ = File.removeTree(directory)
+        say("the link failed:\n" + linked.stderr)
+        Env.exit(2)
+    }
+    let ran = execute(prefix() + [binary] + args)
+    let _ = File.removeTree(directory)
+    Run { status = ran.status, stdout = ran.stdout, stderr = built.stderr + ran.stderr }
+}
+
+-- `$TURKEY_RUN`, split into words, which everything linked runs under.
+fun prefix() -> Array String = words(Env.get("TURKEY_RUN"), "")
+
+fun words(value : Option String, fallback : String) -> Array String {
+    let found = Vec.toArray(String.words(Option.unwrapOr(value, fallback)))
+    if len(found) == 0 && !String.isEmpty(fallback) { [fallback] } else { found }
+}
+
+fun execute(argv : Array String) -> Run = match Process.run(Process.command(argv), None) {
+    Right(Output { stdout, stderr, status }) ->
+        Run { status, stdout = String.fromBytesLossy(stdout), stderr = String.fromBytesLossy(stderr) }
+    Left(e) -> {
+        say("cannot run " + argv[0] + ": " + message(e))
+        Env.exit(2)
+    }
+}
+
+fun agree(a : Run, b : Run) -> Bool =
+    a.status == b.status && a.stdout == b.stdout && untraced(a.stderr) == untraced(b.stderr)
+
+fun untraced(text : String) -> String =
+    String.join(Vec.filter(String.split(text, "\n"), \!String.startsWith(_, "  at ")), "\n")
+
+-- Print how runs `a` and `b`, called `an` and `bn`, ended, and the first
+-- line where what they printed differs.
+fun difference(an : String, a : Run, bn : String, b : Run) -> Unit {
+    let width = max(String.byteLength(an), String.byteLength(bn))
+    let pad = fun(s) = s + String.repeat(" ", width - String.byteLength(s))
+    print("  " + pad(an) + "  " + ending(a.status))
+    print("  " + pad(bn) + "  " + ending(b.status))
+    let left = String.split(a.stdout + untraced(a.stderr), "\n")
+    let right = String.split(b.stdout + untraced(b.stderr), "\n")
+    for var i = 0; i < max(len(left), len(right)); i = i + 1 {
+        let l = if i < len(left) { Some(left[i]) } else { None }
+        let r = if i < len(right) { Some(right[i]) } else { None }
+        if l != r {
+            print("the output first differs at line " + Int.toString(i + 1) + ":")
+            print("  " + pad(an) + "  " + Option.fold(l, "(ended)", \"'" + _ + "'"))
+            print("  " + pad(bn) + "  " + Option.fold(r, "(ended)", \"'" + _ + "'"))
+            return ()
+        }
+    }
+}
+
+fun ending(s : Status) -> String = match s {
+    Exited(code) -> "exited " + Int.toString(code)
+    Signaled(n) -> "died by signal " + Int.toString(n)
+    TimedOut -> "ran out of time"
+}
+
+fun say(message : String) -> Unit = print("interpret: " + message)

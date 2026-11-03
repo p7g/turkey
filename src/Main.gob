@@ -7,7 +7,8 @@
 --
 -- And two for the interpreter (`Turkey.Interpret`). `interpret FILE ARGS...`
 -- runs a program without compiling it, on Core from the stage `--after` names
--- (`core` by default). `boundary HOST` prints the table of compiled bindings
+-- (`core` by default); with `--stages`, after every stage and natively, to
+-- find the first pass whose output runs differently (`Turkey.Stages`). `boundary HOST` prints the table of compiled bindings
 -- the interpreter calls, generated from the library, given the entry of the
 -- program the interpreter is part of, which is this one (`Turkey.Hosted`).
 -- Either takes `--dump STAGE,...` to print what a stage produced, which is how
@@ -82,6 +83,7 @@ import Turkey.Sites as Sites
 import Turkey.Uncurry as Uncurry
 import Turkey.Interpret as Interpret
 import Turkey.Hosted as Hosted
+import Turkey.Stages as Stages
 import Turkey.Opt as Opt
 import Turkey.Build as Build
 import Turkey.Target as Target
@@ -527,10 +529,12 @@ fun dumpMono(b : String.Builder, checked : Checked, entry : Modules.Module,
 fun optimize(checked : Checked, main : String, specialized : Core.CProgram)
         -> Core.CProgram = optimizeTo(checked, main, specialized, "opt", Set.new())
 
--- The same, stopping after the step `stop` names: `reduce`, after the first
--- reduction; `joins`, after join discovery; or `opt`, the whole of it, and
--- inlining none of the bindings in `opaque` (`Opt.reduceProgram`). What the
--- interpreter runs a stage of a program from.
+-- The same, stopping after the step `stop` names, and inlining none of the
+-- bindings in `opaque` (`Opt.reduceProgram`): `reduce`, after the first
+-- reduction; `joins`, after join discovery; `rereduce`, after the second
+-- reduction; `reachable`, after reachability; `types`, after
+-- `Mono.reduceTypes`; or `opt`, the whole of it. What the interpreter runs a
+-- stage of a program from.
 fun optimizeTo(checked : Checked, main : String, specialized : Core.CProgram,
                stop : String, opaque : Set.Set String) -> Core.CProgram {
     -- Each step's time, for `--timings`, under `opt.`.
@@ -543,6 +547,7 @@ fun optimizeTo(checked : Checked, main : String, specialized : Core.CProgram,
     if stop == "joins" { return discovered }
     let second = Opt.reduceProgram(discovered, checked.decls, opaque)
     at = lap("opt.reduce", at)
+    if stop == "rereduce" { return second }
     -- Reachability again, now that the reductions have inlined calls away and
     -- folded the branches a constant decides: what only they reached is dead.
     let reduced = Mono.reachable(second, main, roots(checked), checked.decls.definitions,
@@ -551,11 +556,13 @@ fun optimizeTo(checked : Checked, main : String, specialized : Core.CProgram,
     Coretc.checkProgram(checked.decls, checked.classes, reduced,
                         Coretc.globalsOf(checked.env))
     at = lap("opt.check", at)
+    if stop == "reachable" { return reduced }
     -- Family applications reduced before the layouts are decided, since a stuck
     -- one has no representation and the backend would guess. See
     -- `Mono.reduceTypes`.
     let settled = Mono.reduceTypes(reduced, checked.classes)
     at = lap("opt.types", at)
+    if stop == "types" { return settled }
     -- What the cap left generic, shared by layout instead of by type. This is
     -- after the optimizations rather than among them: a copy is the optimized
     -- body under another name, so there is nothing left to reduce in it.
@@ -1481,10 +1488,11 @@ fun readOrDie(path : String) -> Source = match File.readText(path) {
 -- -- the interpreter ----------------------------------------------------------------
 
 -- The stages `interpret --after` can run a program from, in pipeline order.
-let interpretedStages = ["core", "mono", "reduce", "joins", "opt"]
+let interpretedStages = ["core", "mono", "reduce", "joins", "rereduce", "reachable", "types", "opt"]
 
 -- `interpret [--after STAGE] FILE ARGS...`: check the program, lower it as
 -- far as the stage, and interpret it with `ARGS` as its arguments.
+-- `interpret --stages FILE ARGS...`: `Stages.localize`.
 --
 -- Read straight from the arguments rather than through `Args`, because how
 -- many of them are the interpreter's is what the program must not see.
@@ -1493,8 +1501,11 @@ fun interpret() -> Unit {
     var i = 1
     var after = "core"
     while i < len(args) && String.startsWith(args[i], "--") {
+        if args[i] == "--stages" && i + 1 < len(args) {
+            Stages.localize(interpretedStages, Array.slice(args, i + 1, len(args)))
+        }
         if args[i] != "--after" || i + 1 >= len(args) {
-            die("'interpret' takes '--after STAGE' and then a file")
+            die("'interpret' takes '--after STAGE' or '--stages', and then a file")
         }
         after = args[i + 1]
         if !Array.contains(interpretedStages, after) {
@@ -1604,7 +1615,7 @@ fun reachedFromMain(path : String) -> Set.Set String {
 fun usage() -> a =
     die("usage: boot check [OPTIONS] FILE...\n"
         + "       boot build [OPTIONS] [-o PATH] [-f exe|obj|asm] FILE...\n"
-        + "       boot interpret [--after STAGE] FILE ARGS...\n"
+        + "       boot interpret [--after STAGE | --stages] FILE ARGS...\n"
         + "       boot boundary HOST\n"
         + "options: --target TARGET  --dump STAGE,...  --timings  --gc-verify"
         + "  --gc-stats  --export-runtime\n"

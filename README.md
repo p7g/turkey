@@ -99,9 +99,13 @@ much of the optimizer's work could run in parallel.
 `build/stages/stage2 interpret rectangles.gob` runs a program without
 compiling it, passing any further arguments to the program. It interprets the
 compiler's intermediate form, Core, as lowering produces it, or as a later
-stage leaves it with `--after mono`, `reduce`, `joins` or `opt`; a program
-whose output differs between two stages points at the pass between them. It
-exits 98 for a program that calls C itself and 99 when it runs out of stack.
+stage leaves it with `--after mono`, `reduce`, `joins`, `rereduce`,
+`reachable`, `types` or `opt`. It exits 98 for a program that calls C itself
+and 99 when it runs out of stack. `interpret --stages rectangles.gob` runs it
+after every stage and then natively, and names the first pass whose output
+runs differently, or says the fault is below Core when only the native run
+differs. The test harness runs every program it compiles through the
+interpreter as well, except those `tests/interpret_skips.txt` lists.
 The C functions and runtime it reaches run compiled, through
 `lib/Interpreter/Boundary.gob`, which `scripts/build.sh` checks against what
 `stage2 boundary src/Main.gob` generates from the library.

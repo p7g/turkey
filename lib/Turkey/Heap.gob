@@ -54,38 +54,35 @@ import Turkey.Workers as Workers
 
 -- -- layouts ----------------------------------------------------------------------------
 --
--- Copied by `Turkey.HeapCheck` and, for the root frame, the heap header, the
--- cursors and the size classes, shared with the generated code: `Turkey.Emit`
--- builds the globals' root frame, and takes small objects' slots from the
--- cursors itself by `Turkey.Runtime`'s copy of those layouts. A change here is
--- a change there.
+-- Copied by `Turkey.HeapCheck` and, for the root frame, the object header,
+-- the cursors, the size classes and the size table, shared with the generated
+-- code: `Turkey.Emit` builds the globals' root frame, and takes small objects'
+-- slots from the cursors itself by `Turkey.Runtime`'s copy of those layouts. A
+-- change here is a change there.
 
--- `HeapHeader`, immediately before every payload: the generation word, the
--- payload size, the heap kind (u32) and the mark epoch that last reached it
--- (u32).
-let headerBytes : Int = 24
+-- An object's header, the word its address points at: its generation (u8),
+-- its kind (u8), the count of the traced words its fields start with (u16),
+-- and its tag (i32), which the collector does not read. In an array the
+-- count is the element's layout code, and in a cell it is 1 if the value is
+-- traced. `Turkey.Runtime.objectFields` says the same.
 let headerGeneration : Int = 0
-let headerSize : Int = 8
-let headerKind : Int = 16
-let headerMarked : Int = 20
--- The header and its kind, from the payload.
-let payloadHeader : Int = -24
-let payloadKind : Int = -8
 
--- The generation word's values. An object is young from its allocation until
--- the first collection that marks it, and old from then on: one survived
+-- The generation's values. An object is young from its allocation until the
+-- first collection that marks it, and old from then on: one survived
 -- collection promotes. An old object given a young one by a store is
 -- remembered, once, by the write barrier (`writeBarrier`), which `Turkey.Select`
 -- emits: the compiler reads these values too, as does every frame object's
--- header, which is zero.
+-- header, which is young.
 let young : Int = 0
 let old : Int = 1
 let rememberedOld : Int = 2
 
--- Heap kinds: an object (constructor, record, array, closure, environment)
--- and a cell.
-let heapObject : Int = 2
-let heapCell : Int = 3
+-- The kinds that are not laid out as fields after the header: an array, whose
+-- length follows the header and its elements the length, and a cell, whose
+-- value follows the header. The rest are 0 constructor, 1 record, 3 closure
+-- and 4 environment.
+let arrayKind : Int = 2
+let cellKind : Int = 5
 
 -- `HeapRegion`. Small objects live in fixed-size slots of a 64KB region
 -- aligned to its size, so a header's region is its address with the low bits
@@ -107,8 +104,10 @@ let regionSearchWord : Int = 44
 let regionSizeClass : Int = 48
 let regionAllocated : Int = 56
 let regionMarked : Int = 312
--- Where the slots begin. Eight-byte alignment is all a payload needs.
-let regionData : Int = 568
+-- The region's size table, or null: see `sizesKept`.
+let regionSizes : Int = 568
+-- Where the slots begin. Eight-byte alignment is all an object needs.
+let regionData : Int = 576
 
 -- `RootFrame`, the shadow stack -- the globals' frame, and any a C caller
 -- registers -- is a chain of these: the previous frame, a NUL-terminated
@@ -125,18 +124,14 @@ let frameLive : Int = 32
 -- it skips null.
 let immediates : Int = 4096
 
--- The objects `Turkey.Alloc` builds: `kind` and `tag` (i32), `count`, the
--- descriptor, then the fields. An array's count is its length and its
--- descriptor its element width. Any other object's count is the bytes of its
--- fields, a whole number of words, and its descriptor is how many words they
--- start with that are traced pointers: the compiler puts every traced field
--- first (`Turkey.Runtime.layout`). A cell is its value and an i32 flag saying
--- whether the value is a pointer.
-let objectKind : Int = 0
-let objectTag : Int = 4
-let objectCount : Int = 8
-let objectDescriptor : Int = 16
-let objectSlots : Int = 24
+-- Where an object's fields are, and so its traced words: right after the
+-- header, since the compiler puts every traced field first
+-- (`Turkey.Runtime.layout`). A cell's value is there too. An array's length
+-- is there instead, and its elements after it; they are traced words if the
+-- element's layout code is 7.
+let objectFields : Int = 8
+let arrayLength : Int = 8
+let arrayElements : Int = 16
 
 -- One frame-table entry: a return address, how many roots are live across the
 -- call, and where their `x29` offsets are.
@@ -161,7 +156,7 @@ var available : Prim.Ptr = zeroed(8 * regionClasses)
 var regionBytesInUse : Int = 0
 var regionBytesPeak : Int = 0
 
--- Every live region's base, as an open-addressed set, so that `findHeader`
+-- Every live region's base, as an open-addressed set, so that `findObject`
 -- can ask whether an arbitrary word is a heap pointer in constant time. GC
 -- stress asks that of every pointer it traces, at every allocation, and a walk
 -- of the region list there made a stressed run quadratic in the heap.
@@ -208,8 +203,6 @@ fun localFold(w : Prim.Ptr) -> Unit {
 var liveBytes : Int = 0
 var threshold : Int = 131072
 var collections : Int = 0
--- A u32 in each header, so it wraps; see `startMarking`.
-var markEpoch : Int = 0
 
 -- The grey set, as an explicit stack per worker: tracing by recursion made
 -- the native stack depth proportional to the longest chain of heap pointers,
@@ -221,7 +214,7 @@ let markerBytes : Int = 24
 var markers : Prim.Ptr = zeroed(markerBytes * 64)
 
 -- The old objects the write barrier has seen given a young one since the last
--- collection, each once: its generation word says it is here.
+-- collection, each once: its generation says it is here.
 -- The write barrier's remembered set is per worker, so that no two barriers
 -- write one buffer: a `malloc`ed array of objects, its count and its
 -- capacity, in words 296, 304 and 312 of the running worker's record
@@ -258,6 +251,16 @@ var stressCountdown : Int = 1
 var verify : Bool = Prim.gcVerify
 var verifyIgnored : Bool = notCompiledIn(verify, Prim.cString("TURKEY_GC_VERIFY"),
                                          Prim.cString("--gc-verify"))
+
+-- Whether every region keeps a size table: a word per eight bytes of its
+-- first 64KB, holding the size of the object at that offset, written by every
+-- allocation. No object records its size, so the table is how the verifier
+-- checks that an object fits its slot and has its slot's size class, which is
+-- the check that the compiler's copy of the class rule
+-- (`Turkey.Runtime.sizeClass`) agrees with this module's. Only in a program
+-- compiled with `--gc-verify`, whose generated code writes the table too; a
+-- program compiled without it has no table and no stores.
+let sizesKept : Bool = Prim.gcVerify
 
 -- Whether a collection may be minor: trace only from the roots and the
 -- remembered objects, keep every old object's mark, and free only young
@@ -320,9 +323,9 @@ var statsClock : Int = 0
 -- sweep and the bookkeeping around it.
 var statsMarkClock : Int = 0
 var statsMinor : Int = 0
--- Allocations by what the object is, indexed by `Turkey.Alloc`'s kind, also
--- added to atomically:
--- 0 constructor, 1 record, 2 array, 3 closure, 4 environment, 7 cell.
+-- Allocations by what the object is, indexed by its kind, also added to
+-- atomically: 0 constructor, 1 record, 2 array, 3 closure, 4 environment,
+-- 5 cell.
 var statsByKind : Prim.Ptr = zeroed(64)
 
 -- Room to build one diagnostic or one line of the report, and a `timespec`.
@@ -518,12 +521,12 @@ let cursorBytes : Int = 64
 -- code finds them. The offset is a literal in `cursorOf` rather than a `let`
 -- because a `let` is a load from its global, on every slow-path allocation.
 
--- The largest payload a size class holds: half a region, less the header.
-let smallPayload : Int = 32744
+-- The largest object a size class holds: half a region.
+let smallBytes : Int = 32768
 
--- Each small request's class, indexed by its size with the header, rounded up
--- to 16 and divided by 16. Every class boundary is a multiple of 16, so every
--- size in one step has the same class.
+-- Each small object's class, indexed by its size rounded up to 16 and divided
+-- by 16. Every class boundary is a multiple of 16, so every size in one step
+-- has the same class.
 var classes : Prim.Ptr = classTable()
 
 fun classTable() -> Prim.Ptr {
@@ -549,14 +552,14 @@ fun classFor(bytes : Int) -> Int {
 fun classSlot(sizeClass : Int) -> Int =
     if sizeClass < 15 { 32 + 16 * sizeClass } else { Prim.intShl(256, sizeClass - 14) }
 
--- The class of a payload of at most `smallPayload` bytes.
+-- The class of an object of at most `smallBytes` bytes.
 fun classOf(size : Int) -> Int =
-    Prim.byteToInt(Prim.loadI8(classes, Prim.intShr(plus(size, 39), 4)))
+    Prim.byteToInt(Prim.loadI8(classes, Prim.intShr(plus(size, 15), 4)))
 
 -- Whether `size`, unsigned, is small enough for the fast path: a class-table
--- step below 2048. The few sizes just under `smallPayload` it turns away are
+-- step below 2048. The few sizes just under `smallBytes` it turns away are
 -- still small, and `allocateSlow` gives them their class.
-fun fastSize(size : Int) -> Bool = Prim.intShr(plus(size, 39), 15) == 0
+fun fastSize(size : Int) -> Bool = Prim.intShr(plus(size, 15), 15) == 0
 
 fun cursorOf(sizeClass : Int) -> Prim.Ptr = cursorIn(Prim.processState(), sizeClass)
 
@@ -711,8 +714,8 @@ fun population(x : Int) -> Int {
     shiftRight(Prim.intMulWrapping(bytes, 0x0101_0101_0101_0101), 56)
 }
 
--- A region of its own for a request of `bytes`, header included, with its one
--- slot allocated; null if there is no memory for it. Under `heapLock`.
+-- A region of its own for an object of `bytes`, with its one slot allocated;
+-- null if there is no memory for it. Under `heapLock`.
 fun largeAllocate(bytes : Int) -> Prim.Ptr {
     let made = newRegion(bytes, bytes, regionClasses, True)
     if Prim.ptrIsNull(made) { return made }
@@ -733,11 +736,14 @@ fun newRegion(bytes : Int, slotSize : Int, sizeClass : Int, large : Bool) -> Pri
     } else { regionBytes }
     let made = Libc.alignedAlloc(regionBytes, reserved)
     if Prim.ptrIsNull(made) { return made }
-    if !tableInsert(made) {
+    let sizes = if sizesKept { Libc.malloc(regionBytes) } else { Prim.ptrNull() }
+    if (sizesKept && Prim.ptrIsNull(sizes)) || !tableInsert(made) {
+        Libc.free(sizes)
         Libc.free(made)
         return Prim.ptrNull()
     }
     Memory.fill(made, regionData, 0)
+    Prim.storePtr(made, regionSizes, sizes)
     Prim.storeI64(made, regionSlotSize, slotSize)
     Prim.storeI64(made, regionReserved, reserved)
     store32(made, regionCapacity, if large { 1 } else { (regionBytes - regionData) / slotSize })
@@ -753,37 +759,35 @@ fun newRegion(bytes : Int, slotSize : Int, sizeClass : Int, large : Bool) -> Pri
     made
 }
 
--- The largest payload a region can be made for: an `Int` that the header,
--- the region's own fields and the rounding up to a whole region all fit
--- beside.
--- 2^63 - 1 - 24 - 568 - 65535.
-let largest : Int = 9223372036854709680
+-- The largest object a region can be made for: an `Int` that the region's
+-- own fields and the rounding up to a whole region all fit beside.
+-- 2^63 - 1 - 576 - 65535.
+let largest : Int = 9223372036854709696
 
--- The header of the live object `value` points at, or null if it points at
--- none: not into a region, not at a slot's payload, or at a free slot.
-fun findHeader(value : Prim.Ptr) -> Prim.Ptr {
+-- `value` if it is a live object, or null if it is not: not into a region,
+-- not at a slot, or at a free slot.
+fun findObject(value : Prim.Ptr) -> Prim.Ptr {
     let address = Prim.ptrToInt(value)
-    if below(address, headerBytes) { return Prim.ptrNull() }
-    let region = regionOf(Prim.ptrFromInt(Prim.intSubWrapping(address, headerBytes)))
+    let region = regionOf(value)
     if !tableContains(region) { return Prim.ptrNull() }
-    let first = plus(Prim.ptrToInt(region), plus(regionData, headerBytes))
+    let first = plus(Prim.ptrToInt(region), regionData)
     if below(address, first) { return Prim.ptrNull() }
     let offset = Prim.intSubWrapping(address, first)
     let slot = Prim.loadI64(region, regionSlotSize)
     if offset % slot != 0 { return Prim.ptrNull() }
     let index = offset / slot
     if index < load32(region, regionCapacity) && testBit(region, regionAllocated, index) {
-        return Prim.ptrAdd(region, plus(regionData, Prim.intMulWrapping(index, slot)))
+        return value
     }
     Prim.ptrNull()
 }
 
 -- -- allocation -------------------------------------------------------------------------
 
--- `size` payload bytes of heap `kind`, uninitialized, or null with a panic
--- raised. `size` is an unsigned byte count carried in an `Int`'s bits.
--- `counted` is what the statistics count it as: `Turkey.Alloc`'s kind, or 7
--- for a cell.
+-- A slot for an object of `size` bytes, header included, and of `kind`,
+-- uninitialized, or null with a panic raised. `size` is an unsigned byte
+-- count carried in an `Int`'s bits. The caller writes the header before
+-- anything can collect.
 --
 -- May collect, so every managed value the caller holds must be rooted. `frame`
 -- is the caller's own frame record, where the walk of the Turkey stack starts:
@@ -793,15 +797,15 @@ fun findHeader(value : Prim.Ptr) -> Prim.Ptr {
 -- The path taken by nearly every allocation is a slot from the class's cursor;
 -- everything else -- a collection, an empty cursor, a large object, GC stress
 -- -- is `allocateSlow`, which is also what keeps this one small.
-fun allocate(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Prim.Ptr {
-    if !fastSize(size) { return allocateSlow(size, kind, counted, frame) }
+fun allocate(size : Int, kind : Int, frame : Prim.Ptr) -> Prim.Ptr {
+    if !fastSize(size) { return allocateSlow(size, kind, frame) }
     let cursor = cursorOf(classOf(size))
     let free = Prim.loadI64(cursor, cursorFree)
-    if free == 0 { return allocateSlow(size, kind, counted, frame) }
-    initialize(takeSlot(cursor, free), size, kind, counted)
+    if free == 0 { return allocateSlow(size, kind, frame) }
+    taken(takeSlot(cursor, free), size, kind)
 }
 
-fun allocateSlow(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Prim.Ptr {
+fun allocateSlow(size : Int, kind : Int, frame : Prim.Ptr) -> Prim.Ptr {
     if stopAsked() { stopAt(frame) }
     if stress { pollWordSet(True) }
     if (stress && stressDue()) || plus(bytesSince, localBytes()) >= threshold {
@@ -816,19 +820,19 @@ fun allocateSlow(size : Int, kind : Int, counted : Int, frame : Prim.Ptr) -> Pri
                               Prim.cString(" bytes is too large"))
         return Prim.ptrNull()
     }
-    if below(smallPayload, size) {
+    if below(smallBytes, size) {
         Lock.acquire(heapLock)
-        let header = largeAllocate(plus(headerBytes, size))
+        let object = largeAllocate(size)
         Lock.release(heapLock)
-        if Prim.ptrIsNull(header) { return outOfMemory() }
-        return initialize(header, size, kind, counted)
+        if Prim.ptrIsNull(object) { return outOfMemory() }
+        return taken(object, size, kind)
     }
     let sizeClass = classOf(size)
     let cursor = cursorOf(sizeClass)
     if Prim.loadI64(cursor, cursorFree) == 0 && !refill(cursor, sizeClass) {
         return outOfMemory()
     }
-    initialize(takeSlot(cursor, Prim.loadI64(cursor, cursorFree)), size, kind, counted)
+    taken(takeSlot(cursor, Prim.loadI64(cursor, cursorFree)), size, kind)
 }
 
 fun outOfMemory() -> Prim.Ptr {
@@ -892,19 +896,20 @@ fun stressDue() -> Bool {
     True
 }
 
--- The header of a fresh slot, and the payload after it.
-fun initialize(header : Prim.Ptr, size : Int, kind : Int, counted : Int) -> Prim.Ptr {
-    Prim.storeI64(header, headerGeneration, young)
-    Prim.storeI64(header, headerSize, size)
-    -- The kind, and a mark epoch of 0 above it: no epoch is 0.
-    Prim.storeI64(header, headerKind, kind)
+-- A fresh slot for an object of `size` bytes and of `kind`, recorded in the
+-- size table and the statistics where they are kept.
+fun taken(object : Prim.Ptr, size : Int, kind : Int) -> Prim.Ptr {
+    if sizesKept {
+        let region = regionOf(object)
+        Prim.storeI64(Prim.loadPtr(region, regionSizes), Prim.ptrDiff(object, region), size)
+    }
     if statsWanted {
         let _ = Prim.atomicAdd(statsCounts, statsAllocationsAt, 1)
-        let _ = Prim.atomicAdd(statsCounts, statsBytesAt, plus(size, headerBytes))
-        let at = if counted >= 0 && counted < 8 { times8(counted) } else { 0 }
+        let _ = Prim.atomicAdd(statsCounts, statsBytesAt, size)
+        let at = if kind >= 0 && kind < 8 { times8(kind) } else { 0 }
         let _ = Prim.atomicAdd(statsByKind, at, 1)
     }
-    Prim.ptrAdd(header, headerBytes)
+    object
 }
 
 -- -- roots ------------------------------------------------------------------------------
@@ -1125,7 +1130,7 @@ fun scanStack(frame : Prim.Ptr, high : Prim.Ptr) -> Unit {
 -- an edge to an object already marked -- most edges, in a heap of shared
 -- names and types -- then reads the region's header, which a few thousand
 -- objects share and which stays in cache, and not the object's own. The
--- header's epoch is written too, for the verifier, which checks the two agree.
+-- bitmap is the only record of a mark: no object header has one.
 --
 -- `drain` is the whole of the tracing loop, decoding and pushing in line: the
 -- inliner does not copy a body this size, and a call per edge was most of what
@@ -1153,28 +1158,27 @@ fun markGrey(value : Prim.Ptr, what : Prim.Ptr, index : Int) -> Unit {
     -- that is not in the heap means a root was missed or a descriptor is
     -- wrong, and this turns that from a rare corruption into a panic on the
     -- first collection.
-    if stress && Prim.ptrIsNull(findHeader(value)) {
+    if stress && Prim.ptrIsNull(findObject(value)) {
         notHeapPointer(value, what, index)
         return {}
     }
-    let header = Prim.ptrFromInt(Prim.intSubWrapping(Prim.ptrToInt(value), headerBytes))
-    let region = regionOf(header)
-    let slot = slotOf(region, header)
+    let region = regionOf(value)
+    let slot = slotOf(region, value)
     let at = plus(regionMarked, times8(Prim.intShr(slot, 6)))
     -- Most roots are marked already, by the time a collection's later tasks
     -- reach them.
     if Prim.intAnd(Prim.loadI64(region, at), bit(slot)) != 0 { return {} }
-    if !claim(region, at, bit(slot), header, sharing) { return {} }
+    if !claim(region, at, bit(slot), value, sharing) { return {} }
     push(value)
 }
 
--- Set `mask` in the mark word at `at` of `region`, and with it the header's
--- epoch and generation and the region's live count: False if it was set
+-- Set `mask` in the mark word at `at` of `region`, and with it the
+-- generation of `object` and the region's live count: False if it was set
 -- already. With other workers marking (`shared`), the bit is claimed by
 -- compare-and-swap and the count added to atomically, since the word holds
 -- 64 objects' marks and another worker may be setting one of the others; the
 -- header is the winner's alone.
-fun claim(region : Prim.Ptr, at : Int, mask : Int, header : Prim.Ptr, shared : Bool) -> Bool {
+fun claim(region : Prim.Ptr, at : Int, mask : Int, object : Prim.Ptr, shared : Bool) -> Bool {
     while True {
         let marks = Prim.loadI64(region, at)
         if Prim.intAnd(marks, mask) != 0 { return False }
@@ -1191,10 +1195,14 @@ fun claim(region : Prim.Ptr, at : Int, mask : Int, header : Prim.Ptr, shared : B
             break
         }
     }
-    store32(header, headerMarked, markEpoch)
-    Prim.storeI64(header, headerGeneration, old)
+    promote(object)
     True
 }
+
+-- Make `object` old. A byte store, so that the rest of the header, which
+-- nothing else writes once the object is built, is not written at all.
+fun promote(object : Prim.Ptr) -> Unit =
+    Prim.storeI8(object, headerGeneration, Prim.byteFromInt(old))
 
 -- Push `entry` on the running worker's mark stack.
 fun push(entry : Prim.Ptr) -> Unit {
@@ -1208,9 +1216,9 @@ fun push(entry : Prim.Ptr) -> Unit {
 -- The running worker's mark stack.
 fun marker() -> Prim.Ptr = Prim.ptrAdd(markers, markerBytes * Workers.index())
 
--- The index of the slot whose header is `header`, in `region`.
-fun slotOf(region : Prim.Ptr, header : Prim.Ptr) -> Int {
-    let offset = Prim.intSubWrapping(Prim.ptrDiff(header, region), regionData)
+-- The index of the slot of `object`, in `region`.
+fun slotOf(region : Prim.Ptr, object : Prim.Ptr) -> Int {
+    let offset = Prim.intSubWrapping(Prim.ptrDiff(object, region), regionData)
     let multiplier = Prim.loadI64(reciprocals, times8(load32(region, regionSizeClass)))
     Prim.intShr(Prim.intMulWrapping(offset, multiplier), 32)
 }
@@ -1241,13 +1249,14 @@ fun growMarkStack(m : Prim.Ptr) -> Bool {
 -- managed object, from Turkey or C -- must call it too, unless the object was
 -- allocated after the value they store.
 foreign "turkey_write_barrier" fun writeBarrier(parent : Prim.Ptr) -> Unit {
-    let header = Prim.ptrAdd(parent, payloadHeader)
-    -- Claimed by changing the word, atomically: two workers storing into one
-    -- old object at once must not both remember it.
-    if Prim.loadI64(header, headerGeneration) != old
-            || Prim.atomicCas(header, headerGeneration, old, rememberedOld) != old {
-        return {}
-    }
+    -- Claimed by changing the generation, atomically: two workers storing
+    -- into one old object at once must not both remember it. The swap is of
+    -- the whole header, whose other bytes nothing changes once the object is
+    -- built, and it writes them back as they were.
+    let header = Prim.loadI64(parent, 0)
+    if Prim.intAnd(header, 255) != old { return {} }
+    let remembered = Prim.intOr(Prim.intAnd(header, complement(255)), rememberedOld)
+    if Prim.atomicCas(parent, 0, header, remembered) != header { return {} }
     remember(parent)
     let _ = Prim.atomicAdd(statsCounts, statsRememberedAt, 1)
 }
@@ -1308,19 +1317,15 @@ fun drain() -> Unit {
         let chunk = Prim.intShr(entry, 48)
         let object = Prim.ptrFromInt(if chunk == 0 { entry } else { Prim.intAnd(entry, addressBits) })
         -- Where its pointers start and how many there are: every word from
-        -- `first` to `slots` is one.
-        var first = objectSlots
-        var slots = 0
-        let heapKind = load32(object, payloadKind)
-        if heapKind == heapCell {
-            first = 0
-            slots = if load32(object, 8) != 0 { 1 } else { 0 }
-        } else if heapKind == heapObject {
-            if load32(object, objectKind) == 2 {
-                if load32(object, objectTag) == 7 { slots = Prim.loadI64(object, objectCount) }
-            } else {
-                slots = Prim.loadI64(object, objectDescriptor)
-            }
+        -- `first` to `slots` is one. A cell's flag is the count of its one
+        -- word.
+        let header = load32(object, 0)
+        let kind = Prim.intAnd(Prim.intShr(header, 8), 255)
+        var first = objectFields
+        var slots = Prim.intShr(header, 16)
+        if kind == arrayKind {
+            first = arrayElements
+            slots = if slots == 7 { Prim.loadI64(object, arrayLength) } else { 0 }
         }
         var field = 0
         var end = slots
@@ -1347,23 +1352,21 @@ fun drain() -> Unit {
         while field < end {
             let child = Prim.loadPtr(object, plus(first, times8(field)))
             if immediate(child) {
-            } else if stress && Prim.ptrIsNull(findHeader(child)) {
-                notHeapPointer(child, fieldName(object, heapKind), field)
+            } else if stress && Prim.ptrIsNull(findObject(child)) {
+                notHeapPointer(child, fieldName(kind), field)
             } else {
-                let childHeader = Prim.ptrFromInt(Prim.intSubWrapping(Prim.ptrToInt(child), headerBytes))
-                let childRegion = regionOf(childHeader)
-                let childSlot = slotOf(childRegion, childHeader)
+                let childRegion = regionOf(child)
+                let childSlot = slotOf(childRegion, child)
                 let at = plus(regionMarked, times8(Prim.intShr(childSlot, 6)))
                 let marks = Prim.loadI64(childRegion, at)
                 let mask = bit(childSlot)
                 -- In line when this worker marks alone: a call per object
                 -- marked is a large share of what marking costs.
                 if Prim.intAnd(marks, mask) == 0 {
-                    let won = if shared { claim(childRegion, at, mask, childHeader, True) } else {
+                    let won = if shared { claim(childRegion, at, mask, child, True) } else {
                         Prim.storeI64(childRegion, at, Prim.intOr(marks, mask))
                         store32(childRegion, regionLive, plus(load32(childRegion, regionLive), 1))
-                        store32(childHeader, headerMarked, markEpoch)
-                        Prim.storeI64(childHeader, headerGeneration, old)
+                        promote(child)
                         True
                     }
                     if won {
@@ -1593,7 +1596,7 @@ fun run(task : Int) -> Unit {
         -- remembered after.
         for var at = Prim.ptrToInt(a); at < Prim.ptrToInt(b); at = plus(at, 8) {
             let parent = Prim.loadPtr(Prim.ptrFromInt(at), 0)
-            Prim.storeI64(Prim.ptrAdd(parent, payloadHeader), headerGeneration, old)
+            promote(parent)
             push(parent)
         }
     }
@@ -1761,14 +1764,11 @@ fun stopAt(frame : Prim.Ptr) -> Unit {
 }
 
 -- What `notHeapPointer` calls a field, by the kind of object it is in.
-fun fieldName(object : Prim.Ptr, cellOrObject : Int) -> Prim.Ptr =
-    if cellOrObject == heapCell { Prim.ptrNull() }
-    else {
-        let kind = load32(object, objectKind)
-        if kind == 2 { Prim.cString("array pointer field") }
-        else if kind == 0 || kind == 1 { Prim.cString("object pointer field") }
-        else { Prim.cString("capture") }
-    }
+fun fieldName(kind : Int) -> Prim.Ptr =
+    if kind == cellKind { Prim.ptrNull() }
+    else if kind == arrayKind { Prim.cString("array pointer field") }
+    else if kind == 0 || kind == 1 { Prim.cString("object pointer field") }
+    else { Prim.cString("capture") }
 
 -- "<what> <index> is not a heap pointer (0x...)", or "GC root or field is not
 -- a heap pointer (0x...)" when the caller cannot name where it looked. Named,
@@ -1826,7 +1826,6 @@ fun collectStopped(frame : Prim.Ptr, asked : Asked) -> Unit {
     let allocsSince = allocationsSince
     let wanted = statsWanted
     let started = if wanted { nanoseconds() } else { 0 }
-    startMarking()
     if !minor {
         -- Everything is traced again, and every live object marked again,
         -- which makes it old and forgets that it was remembered.
@@ -1881,28 +1880,6 @@ fun clearMarks() -> Unit {
     }
 }
 
--- A new epoch, so that no header needs clearing before a mark. The epoch is a
--- u32 in each header, and a stress run collects at every allocation, so it
--- wraps: then every live header is cleared once and counting starts again.
-fun startMarking() -> Unit {
-    markEpoch = markEpoch + 1
-    if markEpoch < 0x1_0000_0000 { return {} }
-    var region = regions
-    while !Prim.ptrIsNull(region) {
-        let slotSize = Prim.loadI64(region, regionSlotSize)
-        for var word = 0; word < regionWords; word = word + 1 {
-            var bits = Prim.loadI64(region, regionAllocated + 8 * word)
-            while bits != 0 {
-                let slot = word * 64 + Memory.trailingZeros(bits)
-                store32(region, regionData + slot * slotSize + headerMarked, 0)
-                bits = Prim.intAnd(bits, Prim.intSubWrapping(bits, 1))
-            }
-        }
-        region = Prim.loadPtr(region, regionNext)
-    }
-    markEpoch = 1
-}
-
 -- Empty regions cost one free, however many objects they held. A survivor's
 -- marks become its allocation bitmap, so no individual header is visited.
 --
@@ -1925,6 +1902,7 @@ fun sweep() -> Unit {
             else { Prim.storePtr(previous, regionNext, next) }
             regionBytesInUse = regionBytesInUse - Prim.loadI64(region, regionReserved)
             tableRemove(region)
+            Libc.free(Prim.loadPtr(region, regionSizes))
             Libc.free(region)
         } else {
             Memory.copy(Prim.ptrAdd(region, regionAllocated),
@@ -2016,7 +1994,7 @@ foreign "turkey_gc_report" fun report() -> Unit {
     put(Prim.cString(", closure-env "))
     putKind(4)
     put(Prim.cString(", cell "))
-    putKind(7)
+    putKind(cellKind)
     put(Prim.cString("\n"))
     writeLine()
     put(Prim.cString("[gc] final live "))
@@ -2268,13 +2246,12 @@ fun snapshot() -> Prim.Ptr {
     Prim.storeI64(state, Check.stateRegionTableCount, regionTableCount)
     Prim.storeI64(state, Check.stateRegionBytes, regionBytesInUse)
     Prim.storeI64(state, Check.stateObjects, heapCount)
-    Prim.storeI64(state, Check.stateMarkEpoch, markEpoch)
+    Prim.storeI64(state, Check.stateSizesKept, if sizesKept { 1 } else { 0 })
     Prim.storePtr(state, Check.stateFrameEntries, frameEntries)
     Prim.storeI64(state, Check.stateFrameEntryCount, frameEntryCount)
     Prim.storePtr(state, Check.stateStacks, Stack.first())
     Prim.storePtr(state, Check.stateRunning, Stack.running())
     Prim.storePtr(state, Check.stateRoots, roots)
-    Prim.storeI64(state, Check.stateMinor, if minor { 1 } else { 0 })
     Prim.storeI64(state, Check.stateGenerational, if generational { 1 } else { 0 })
     Prim.storePtr(state, Check.stateRemembered, remembered())
     Prim.storeI64(state, Check.stateRememberedCount, rememberedCount())
@@ -2332,20 +2309,14 @@ foreign "turkey_heap_region_table" fun heapRegionTable() -> Prim.Ptr = regionTab
 foreign "turkey_heap_region_table_capacity" fun heapRegionTableCapacity() -> Int =
     regionTableCapacity
 
-foreign "turkey_heap_mark_epoch" fun heapMarkEpoch() -> Int = markEpoch
-
 -- Whether `value` is a live object, for the tests' questions about reuse and
 -- reclamation.
 foreign "turkey_heap_contains" fun heapContains(value : Prim.Ptr) -> Int {
     retire()
-    if Prim.ptrIsNull(findHeader(value)) { 0 } else { 1 }
+    if Prim.ptrIsNull(findObject(value)) { 0 } else { 1 }
 }
 
 -- For the tests that corrupt the heap on purpose, to see the verifier notice.
-foreign "turkey_heap_set_mark_epoch" fun setMarkEpoch(epoch : Int) -> Unit {
-    markEpoch = epoch
-}
-
 foreign "turkey_heap_set_objects" fun setHeapObjects(count : Int) -> Unit {
     retire()
     heapCount = count

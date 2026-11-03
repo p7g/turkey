@@ -240,6 +240,8 @@ with nothing changed is quicker; `-n0` runs serially, for debugging.
 
 To check the heap while debugging a program, compile it with
 `boot build --gc-verify`. Each collection independently checks object bounds,
+each object's size class against the size its allocation recorded (objects
+carry no size of their own, so such a build keeps a size table per region),
 traced references, shadow-stack and native roots, marking completeness,
 region bookkeeping before and after sweeping, and the generational
 invariants: an old object holding a young one must have been remembered by

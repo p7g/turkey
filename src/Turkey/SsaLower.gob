@@ -1567,6 +1567,7 @@ fun aggregate(l : Lower, items : Array Core, kind : Int, tag : Int,
 fun built(l : Lower, kind : Int, tag : Int, values : Array Value, mutable : Int,
           what : String) -> Value {
     let layout = Rt.layout(Array.map(values, Ssa.repOf(l.func, _)))
+    if !countable(l, layout) { return Ssa.freshValue(l.func, Ssa.traced(Ptr)) }
     let made = L.emit(l.b, ObjectNew(kind, tag, layout, values, mutable), Ssa.traced(Ptr))
     Map.put(l.func.reasons, Ssa.valueId(made), what)
     made
@@ -1620,6 +1621,17 @@ fun wide(l : Lower, count : Int, refusal : fun(Int) -> String) -> Bool {
     if count <= Rt.fieldLimit { return False }
     refuse(l, refusal(count))
     True
+}
+
+-- Whether an object of this layout can say where its pointers are, stopping
+-- the lowering if it cannot: its header counts its traced words in 16 bits
+-- (`Rt.tracedLimit`).
+fun countable(l : Lower, layout : Rt.Layout) -> Bool {
+    if layout.pointers <= Rt.tracedLimit { return True }
+    refuse(l, "a value needs " + Int.toString(layout.pointers) + " pointer fields, and a "
+              + "value can have at most " + Int.toString(Rt.tracedLimit)
+              + "; move some fields into a record")
+    False
 }
 
 -- -- closures ----------------------------------------------------------------------
@@ -2833,7 +2845,9 @@ fun act(l : Lower, a : Action, held : Map String Rep) -> Unit = match a {
                 return stop1(l, "a dictionary slot of " + con + " held at " + show(r))
             }
         }
-        let made = L.emit(l.b, ObjectNew(1, Map.getOr(l.tags, con, -1), Rt.layout(reps),
+        let layout = Rt.layout(reps)
+        if !countable(l, layout) { return {} }
+        let made = L.emit(l.b, ObjectNew(1, Map.getOr(l.tags, con, -1), layout,
                                          Array.map(reps, storageZero(l, _)),
                                          allFields(len(slots))),
                           Ssa.traced(Ptr))

@@ -1348,14 +1348,14 @@ fun parsePostfix(p : P) -> Expr {
             }
             skipToken(p, ")")
             p.noRecord = saved
-            e = mkExpr(p, e.span, ECall(e, args))
+            e = closeAround(p, mkExpr(p, e.span, ECall(e, args)), args)
         } else if at(p, "[") {
             step(p)
             let saved = setNoRecord(p, False)
             let index = closePart(p, parseExpr(p))
             p.noRecord = saved
             skipToken(p, "]")
-            e = mkExpr(p, e.span, EIndex(e, index, None, None))
+            e = closeAround(p, mkExpr(p, e.span, EIndex(e, index, None, None)), [index])
         } else if at(p, ".") && memberFollows(p) {
             step(p)
             let member = advance(p)
@@ -1485,7 +1485,8 @@ fun parseParenAtom(p : P, tok : Token) -> Expr {
     -- `(_ + 1) * 2` is one function. A tuple's components are.
     if len(elems) == 1 { return elems[0] }
     fieldLimit(p, tok, "this tuple", len(elems))
-    mkExpr(p, tok.span, ETuple(Vec.map(elems, closePart(p, _))))
+    let parts = Vec.map(elems, closePart(p, _))
+    closeAround(p, mkExpr(p, tok.span, ETuple(parts)), parts)
 }
 
 fun parseArrayAtom(p : P, tok : Token) -> Expr {
@@ -1498,7 +1499,7 @@ fun parseArrayAtom(p : P, tok : Token) -> Expr {
     }
     skipToken(p, "]")
     p.noRecord = saved
-    mkExpr(p, tok.span, EArray(elems))
+    closeAround(p, mkExpr(p, tok.span, EArray(elems)), elems)
 }
 
 -- A CONID atom is a constructor, a record construction, or -- when followed by
@@ -1527,7 +1528,8 @@ fun parseConidAtom(p : P) -> Expr {
         }
         p.noRecord = saved
         skipToken(p, "}")
-        return mkExpr(p, tok.span, ERecord(name, fields))
+        let record = mkExpr(p, tok.span, ERecord(name, fields))
+        return closeAround(p, record, Vec.map(fields, fun((_, value)) = value))
     }
     mkExpr(p, tok.span, ECon(name))
 }
@@ -1721,9 +1723,11 @@ fun parseMatchArm(p : P) -> Arm {
 -- *boundary* that closes it.
 --
 -- A *part* -- a call argument, an index, a tuple component, an array element, a
--- record field -- closes the `_`s inside it, except that a bare `_` is left open
--- for the boundary around it. That is what makes `pow(_, 2)` the function
--- rather than the `_`.
+-- record field -- closes the `_`s inside it, except that a bare `_` makes the
+-- function of the node it is a part of. That is what makes `pow(_, 2)` the
+-- function rather than the `_`. The node closes as soon as it is read, so
+-- nothing around it joins the function: `xs |> map(_, f) |> filter(_, g)` is
+-- two functions, and `show(_) + "!"` adds a function to a string.
 --
 -- A *whole* -- a statement, including a block's last; a `let` right-hand side;
 -- a `fun` body; a match arm; the value of `return` or `break` -- closes the
@@ -1740,8 +1744,8 @@ fun parseMatchArm(p : P) -> Arm {
 -- `\`, through any `fun` in between, and they are all the one parameter.
 --
 -- Boundaries close bottom-up, as the parser returns from them. So when one
--- looks, every `_` beneath a nested boundary has been rewritten already, except
--- a bare `_` that a part directly beneath left open -- and walking the whole
+-- looks, every `_` beneath a nested boundary has been rewritten already, and a
+-- bare part has been closed by the node around it -- and walking the whole
 -- expression finds exactly the `_`s this boundary owns.
 
 fun isPlaceholder(e : Expr) -> Bool = match e.kind {
@@ -1773,6 +1777,14 @@ fun closePart(p : P, e : Expr) -> Expr {
     closeImplicit(p, e)
 }
 
+fun closeAround(p : P, e : Expr, parts : Vec Expr) -> Expr {
+    if p.pending == 0 || p.explicit > 0 { return e }
+    for part in parts {
+        if isPlaceholder(part) { return closeImplicit(p, e) }
+    }
+    e
+}
+
 fun closeWhole(p : P, e : Expr) -> Expr {
     if p.pending == 0 || p.explicit > 0 { return e }
     if isPlaceholder(e) {
@@ -1793,13 +1805,17 @@ fun closeImplicit(p : P, e : Expr) -> Expr {
 }
 
 fun refusePlaceholder(p : P, e : Expr, what : String) -> Unit {
+    let message = "'_' cannot be used in " + what
+                  + ": the function it makes could never be used there"
+    -- A bare part has made its node a function before the condition is read,
+    -- so `if Array.contains(_, 2)` leaves no `_` pending: the function is here.
+    match e.kind {
+        ELambda(params, _, _) -> if isShorthand(e) { oops(p, message, params[0].span) }
+        _ -> {}
+    }
     if p.pending == 0 || p.explicit > 0 { return {} }
     let found = placeholders(e)
-    if len(found) > 0 {
-        oops(p, "'_' cannot be used in " + what
-                + ": the function it makes could never be used there",
-             found[0].span)
-    }
+    if len(found) > 0 { oops(p, message, found[0].span) }
 }
 
 -- `\e` is `fun(x) = e` with every `_` it owns as `x`, and reaches as far right

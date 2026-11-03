@@ -1,4 +1,4 @@
-export (IP(..), parse, Query(..), system, lookup, lookupsAtOnce)
+export (IP(..), parse, Resolver(..), system, lookup, lookupsAtOnce)
 
 -- Names to addresses, for `Net`: the address type, its text form, and
 -- lookups through the system's resolver, `getaddrinfo`.
@@ -18,7 +18,9 @@ export (IP(..), parse, Query(..), system, lookup, lookupsAtOnce)
 -- deadline makes the call itself.
 
 import Turkey.Detach as Detach
-import Turkey.Errors (IOError(..), ErrorKind(..))
+-- `ErrorKind`'s constructors are qualified, since its `Resolver` is not the
+-- type here.
+import Turkey.Errors (IOError(..), ErrorKind)
 import Turkey.Errors as Errors
 import Turkey.IO as IO
 import Turkey.Libc as Libc
@@ -250,15 +252,18 @@ fun pack(g : Array Int, at : Int) -> Int {
 
 -- -- lookups ------------------------------------------------------------------------
 
--- How a lookup asks: `ask(node, hints, out)` as
--- `Turkey.Workers.blockingGetaddrinfo`, and `free(list)` as `freeaddrinfo`.
--- Every lookup is given `system`; a test gives one that blocks for as long as
--- it likes, or counts what it frees.
-type Query = Query { ask : fun(Prim.Ptr, Prim.Ptr, Prim.Ptr) -> Int, free : fun(Prim.Ptr) -> Unit }
+-- The two C calls a lookup makes: `getaddrinfo(node, hints, out)` as
+-- `Turkey.Workers.blockingGetaddrinfo`, and `freeaddrinfo(list)`. Every
+-- lookup is given `system`; a test gives one whose `getaddrinfo` blocks for
+-- as long as it likes, or whose `freeaddrinfo` counts what it frees.
+type Resolver = Resolver {
+    getaddrinfo : fun(Prim.Ptr, Prim.Ptr, Prim.Ptr) -> Int,
+    freeaddrinfo : fun(Prim.Ptr) -> Unit,
+}
 
-let system : Query = Query {
-    ask = fun(node, hints, out) = Workers.blockingGetaddrinfo(node, hints, out),
-    free = fun(list) = Libc.freeaddrinfo(list),
+let system : Resolver = Resolver {
+    getaddrinfo = fun(node, hints, out) = Workers.blockingGetaddrinfo(node, hints, out),
+    freeaddrinfo = fun(list) = Libc.freeaddrinfo(list),
 }
 
 -- At most this many lookups are in `getaddrinfo` at once; more wait for one
@@ -272,38 +277,37 @@ let lookupsAtOnce : Int = 128
 
 let lookups : Detach.Semaphore = Detach.semaphore(lookupsAtOnce)
 
--- What `getaddrinfo` answered: its code, the list when the code is 0, and
--- `errno` when it is `EAI_SYSTEM`.
-type Answer = Answer { code : Int, list : Prim.Ptr, errno : Int }
+-- What `getaddrinfo` returned: the list it allocated, or its error code,
+-- an `EAI_*` value, with the `errno` that goes with `EAI_SYSTEM`.
+type Addrinfo = Listed(Prim.Ptr) | Failed(Int, Int)
 
 -- The addresses `host` names, in the order the resolver gives them, each
 -- once; waiting at most until `deadline`, on `Turkey.Wait.now`'s clock, or
 -- without limit when it is -1.
-fun lookup(query : Query, host : String, deadline : Int) -> Either IOError (Array IP) {
+fun lookup(resolver : Resolver, host : String, deadline : Int) -> Either IOError (Array IP) {
     match parse(host) {
         Some(ip) -> return Right([ip])
         None -> {}
     }
     let bytes = String.bytesOf(host)
     for var i = 0; i < len(bytes); i = i + 1 {
-        if byte(bytes, i) == 0 { return Left(failure(host, Other(Sys.einval))) }
+        if byte(bytes, i) == 0 { return Left(failure(host, Errors.Other(Sys.einval))) }
     }
     let name = IO.cPath(host)
-    if Detach.acquire(lookups, deadline) != 0 { return Left(failure(host, TimedOut)) }
-    let call = fun() {
-        let answer = ask(query, name)
+    if Detach.acquire(lookups, deadline) != 0 { return Left(failure(host, Errors.TimedOut)) }
+    let callInTurn = fun() {
+        let returned = call(resolver, name)
         Detach.release(lookups)
-        answer
+        returned
     }
-    let answered = if deadline < 0 { Right(call()) }
-                   else { Detach.run(call, fun(answer) = discard(query, answer), deadline) }
-    match answered {
-        Left(_) -> Left(failure(host, TimedOut))
-        Right(answer) -> if answer.code != 0 {
-            Left(failure(host, kindOf(answer)))
-        } else {
-            let found = addresses(answer.list)
-            discard(query, answer)
+    let waited = if deadline < 0 { Right(callInTurn()) }
+                 else { Detach.run(callInTurn, fun(late) = discard(resolver, late), deadline) }
+    match waited {
+        Left(_) -> Left(failure(host, Errors.TimedOut))
+        Right(Failed(code, errno)) -> Left(failure(host, kindOf(code, errno)))
+        Right(Listed(list)) -> {
+            let found = addresses(list)
+            resolver.freeaddrinfo(list)
             Right(found)
         }
     }
@@ -311,36 +315,32 @@ fun lookup(query : Query, host : String, deadline : Int) -> Either IOError (Arra
 
 -- `getaddrinfo` for the NUL-terminated `name`, which this frame keeps alive
 -- until the call has returned.
-fun ask(query : Query, name : Array Byte) -> Answer {
+fun call(resolver : Resolver, name : Array Byte) -> Addrinfo {
     let hints = Libc.malloc(Sys.addrinfoBytes)
     let out = Libc.malloc(16)
     if Prim.ptrIsNull(hints) || Prim.ptrIsNull(out) {
         Libc.free(hints)
         Libc.free(out)
-        return Answer { code = Sys.eaiMemory(), list = Prim.ptrNull(), errno = 0 }
+        return Failed(Sys.eaiMemory(), 0)
     }
-    -- Either family, and no flags, so that the answer depends on the name
-    -- and not on which interfaces are up. One socket type, since each
+    -- Either family, and no flags, so that what is returned depends on the
+    -- name and not on which interfaces are up. One socket type, since each
     -- address comes once per type otherwise.
     Memory.fill(hints, Sys.addrinfoBytes, 0)
     Memory.fill(out, 16, 0)
     Prim.storeI32(hints, Sys.addrinfoSocktypeAt, Prim.charFromInt(Sys.sockStream))
-    let asking = query.ask
-    let code = asking(IO.addressOf(name, 0), hints, out)
+    let code = resolver.getaddrinfo(IO.addressOf(name, 0), hints, out)
     Scheduler.afterCall()
     Prim.keepAlive(name)
-    let list = if code == 0 { Prim.loadPtr(out, 0) } else { Prim.ptrNull() }
-    let answer = Answer { code = code, list = list, errno = Prim.loadI64(out, 8) }
+    let returned = if code == 0 { Listed(Prim.loadPtr(out, 0)) } else { Failed(code, Prim.loadI64(out, 8)) }
     Libc.free(hints)
     Libc.free(out)
-    answer
+    returned
 }
 
-fun discard(query : Query, answer : Answer) -> Unit {
-    if answer.code == 0 {
-        let freeing = query.free
-        freeing(answer.list)
-    }
+fun discard(resolver : Resolver, returned : Addrinfo) -> Unit = match returned {
+    Listed(list) -> resolver.freeaddrinfo(list)
+    Failed(_, _) -> {}
 }
 
 -- The addresses on `list`, each once, in its order.
@@ -373,12 +373,12 @@ fun bigEndian(p : Prim.Ptr, at : Int, bytes : Int) -> Int {
     n
 }
 
-fun kindOf(answer : Answer) -> ErrorKind {
-    let code = answer.code
-    if code == Sys.eaiNoName() || code == Sys.eaiNoData() { HostNotFound }
-    else if code == Sys.eaiMemory() { Other(Sys.enomem) }
-    else if code == Sys.eaiSystem() && answer.errno != 0 { Errors.kindOf(-answer.errno) }
-    else { Resolver(code) }
+-- The kind of error a `Failed` code, and its `errno`, stand for.
+fun kindOf(code : Int, errno : Int) -> ErrorKind {
+    if code == Sys.eaiNoName() || code == Sys.eaiNoData() { Errors.HostNotFound }
+    else if code == Sys.eaiMemory() { Errors.Other(Sys.enomem) }
+    else if code == Sys.eaiSystem() && errno != 0 { Errors.kindOf(-errno) }
+    else { Errors.Resolver(code) }
 }
 
 fun failure(host : String, kind : ErrorKind) -> IOError =

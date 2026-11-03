@@ -2,9 +2,10 @@
 
 `getaddrinfo` cannot be timed or stopped, so a lookup with a deadline runs on a
 helper task (`Turkey.Detach`) and the caller leaves at the deadline while the
-call goes on. These programs give `Turkey.Resolve.lookup` a query of their
-own that blocks for as long as the test says, since no real resolver can be
-made slow on demand, and that counts what it frees.
+call goes on. These programs give `Turkey.Resolve.lookup` a resolver of their
+own, whose `getaddrinfo` blocks for as long as the test says, since no real
+resolver can be made slow on demand, and whose `freeaddrinfo` counts what it
+frees.
 """
 
 import os
@@ -115,10 +116,10 @@ import Net
 import Time.Duration as Duration
 import Turkey.Resolve as Resolve
 
--- A query that must not be asked.
-let never : Resolve.Query = Resolve.Query {
-    ask = fun(_, _, _) = error("a literal reached getaddrinfo"),
-    free = fun(_) = {},
+-- A resolver whose `getaddrinfo` must not be called.
+let never : Resolve.Resolver = Resolve.Resolver {
+    getaddrinfo = fun(_, _, _) = error("a literal reached getaddrinfo"),
+    freeaddrinfo = fun(_) = {},
 }
 
 fun main() {
@@ -172,17 +173,17 @@ fun say(text : String) -> Unit {
     let _ = IO.writeText(IO.stderr(), text + "\\n")
 }
 
--- Waits for a byte on the standard input, then asks the system, and counts
--- each list it frees.
-let slow : Resolve.Query = Resolve.Query {
-    ask = fun(node, hints, out) {
+-- Waits for a byte on the standard input, then calls `getaddrinfo`, and
+-- counts each list it frees.
+let slow : Resolve.Resolver = Resolve.Resolver {
+    getaddrinfo = fun(node, hints, out) {
         let buffer = Libc.malloc(8)
         let _ = Workers.blockingRead(0, buffer, 1)
         Scheduler.afterCall()
         Libc.free(buffer)
         Workers.blockingGetaddrinfo(node, hints, out)
     },
-    free = fun(list) {
+    freeaddrinfo = fun(list) {
         Libc.freeaddrinfo(list)
         -- Said before it is counted: `main` may end as soon as it is.
         say("freed")
@@ -284,8 +285,8 @@ fun zeroed() {
 
 -- Stays in a blocking call for 20 ms, as a slow name server would keep
 -- `getaddrinfo`, counting the lookups inside at once.
-let slow : Resolve.Query = Resolve.Query {
-    ask = fun(node, hints, out) {
+let slow : Resolve.Resolver = Resolve.Resolver {
+    getaddrinfo = fun(node, hints, out) {
         let n = Sync.addAndGet(inside, 1)
         var seen = Sync.load(most)
         while n > seen && !Sync.compareAndSet(most, seen, n) { seen = Sync.load(most) }
@@ -294,7 +295,7 @@ let slow : Resolve.Query = Resolve.Query {
         let _ = Sync.addAndGet(inside, -1)
         Workers.blockingGetaddrinfo(node, hints, out)
     },
-    free = fun(list) = Libc.freeaddrinfo(list),
+    freeaddrinfo = fun(list) = Libc.freeaddrinfo(list),
 }
 
 fun main() {

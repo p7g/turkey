@@ -1,4 +1,4 @@
-export (Program, prepare, run, outOfStackStatus, cannotStatus)
+export (Program, prepare, prepareAfter, run, start, callGlobal, outOfStackStatus, cannotStatus)
 
 -- An evaluator over Core, at any stage from `Turkey.Lower`'s output to what
 -- `optimize` hands the backend, running on the compiled host's own runtime.
@@ -96,7 +96,17 @@ type Ctx = Ctx { program : Program, limit : Int }
 -- Every table the evaluator reads, built from `core`, a whole program.
 -- `skipped` is how many of the process's arguments are the interpreter's own.
 fun prepare(core : CProgram, decls : DeclTable, classes : ClassTable,
-            skipped : Int) -> Program {
+            skipped : Int) -> Program = prepareAfter(None, core, decls, classes, skipped)
+
+-- The same, for a program that has every module `earlier` had, unchanged, and
+-- more. A global `earlier` computed keeps its value and is not computed
+-- again; `start` computes only the others.
+--
+-- A value carries no program, so a closure an earlier global holds runs
+-- against this one and finds its globals by name. That is sound because a
+-- module's global names depend only on the module itself.
+fun prepareAfter(earlier : Option Program, core : CProgram, decls : DeclTable,
+                 classes : ClassTable, skipped : Int) -> Program {
     let p = Program {
         decls = decls, fams = Some(Coretc.famsOf(classes, [])), cons = Map.new(),
         globals = Map.new(), inits = [], cstrings = Map.new(), host = Hosted.hostModules(),
@@ -131,15 +141,27 @@ fun prepare(core : CProgram, decls : DeclTable, classes : ClassTable,
                         params = params, body = body, env = None, tys = None }))
                     CTyLam(binders, body) -> define(p, b.name, VAbstraction(Abstraction {
                         binders = binders, body = body, env = None, tys = None }))
-                    _ -> {
-                        Map.put(p.globals, b.name, Global { value = VUnit, ready = False })
-                        Vec.push(p.inits, (b.name, b.value))
+                    _ -> match computed(earlier, b.name) {
+                        Some(g) -> Map.put(p.globals, b.name, g)
+                        None -> {
+                            Map.put(p.globals, b.name, Global { value = VUnit, ready = False })
+                            Vec.push(p.inits, (b.name, b.value))
+                        }
                     }
                 }
             }
         }
     }
     p
+}
+
+-- The global `name` as `earlier` computed it, if it did.
+fun computed(earlier : Option Program, name : String) -> Option Global = match earlier {
+    Some(e) -> match Map.get(e.globals, name) {
+        Some(g) -> if g.ready { Some(g) } else { None }
+        None -> None
+    }
+    None -> None
 }
 
 fun define(p : Program, name : String, v : Value) -> Unit =
@@ -196,6 +218,12 @@ fun stripTypes(e : Core) -> Core = match e.kind {
 
 -- Run the program: compute its globals in order, then call `main`.
 fun run(p : Program, main : String) -> Unit {
+    start(p)
+    let _ = callGlobal(p, main, [])
+}
+
+-- Compute the program's globals in order: each one not computed already.
+fun start(p : Program) -> Unit {
     let c = Ctx { program = p, limit = V.stackLimit(V.entryBudget) }
     -- Every dictionary is published before any slot is computed, as the
     -- compiled initializer does, so that a slot may mention any of them.
@@ -221,7 +249,12 @@ fun run(p : Program, main : String) -> Unit {
             }
         }
     }
-    let _ = applyValue(c, global(c, main), [])
+}
+
+-- The global `name` applied to `args`, once `start` has computed the globals.
+fun callGlobal(p : Program, name : String, args : Array Value) -> Value {
+    let c = Ctx { program = p, limit = V.stackLimit(V.entryBudget) }
+    applyValue(c, global(c, name), args)
 }
 
 fun global(c : Ctx, name : String) -> Value = match Map.get(c.program.globals, name) {

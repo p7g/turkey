@@ -19,14 +19,19 @@ export (Skips(..), file, readSkips, judge, entry, rewritten)
 --   the interpreter exits 98;
 -- * `stack`: interpreting it needs more stack than the interpreter allows
 --   itself; it exits 99;
--- * `timing`: the interpreter's slowdown changes what it prints.
+-- * `timing`: the interpreter's slowdown changes what it prints, or makes it
+--   take longer than its test allows;
+-- * `unrepeatable`: a second run cannot see or print what the first did,
+--   because the program writes files, or prints a process id or a temporary
+--   name. Only a test through `tests/lang.py`, which runs the program a
+--   second time, can be listed so; a golden is repeatable by construction.
 --
 -- A listed case whose interpreted run agrees fails, so that the list is no
 -- longer than it is true. `--bless` rewrites the line of every case it ran,
 -- and keeps every other line as it is:
 -- it lists `ffi` and `stack` from the interpreter's exit status, unlists a
--- case that agrees, and keeps a `timing` line while the runs disagree. It
--- never adds a `timing` line, since a disagreement it cannot explain is as
+-- case that agrees, and keeps a `timing` or `unrepeatable` line while the runs
+-- disagree. It never adds one, since a disagreement it cannot explain is as
 -- likely a miscompile as a slow interpreter; it refuses the case instead.
 
 import Case (Outcome(..), Finish(..), Ending(..), Observed(..), Interpretation)
@@ -36,7 +41,10 @@ import Diff as Diff
 -- The skip list's path from the repository root.
 let file = "tests/interpret_skips.txt"
 
-let reasons = ["ffi", "stack", "timing"]
+let reasons = ["ffi", "stack", "timing", "unrepeatable"]
+
+-- The reasons a person writes, since they say why two runs that ran differ.
+let byHand = ["timing", "unrepeatable"]
 
 -- The skip list as read: the comment lines it starts with, kept as they are,
 -- and each listed case's reason.
@@ -120,8 +128,8 @@ fun judge(listed : Option String, observed : Observed, i : Interpretation, limit
                                   + "', but the interpreted run agrees; unlist it", ""))
         }
     }
+    if Option.fold(listed, False, \Array.contains(byHand, _)) { return None }
     match (listed, cannot(i)) {
-        (Some("timing"), _) -> None
         (Some(reason), Some(found)) ->
             if reason == found { None }
             else { Some((Fail, "listed in " + file + " as '" + reason + "', but the interpreter "
@@ -145,12 +153,13 @@ fun nativeEnding(observed : Observed) -> String = match observed.ending {
 fun entry(listed : Option String, observed : Observed, i : Interpretation) -> Either String (Option String) {
     if agrees(observed, i) { return Right(None) }
     if let Some(found) = cannot(i) { return Right(Some(found)) }
+    let differs = "the interpreted run differs from the native one; a miscompile, or, if the "
+                  + "interpreter's slowdown is why, list it in " + file + " as 'timing' by hand"
     match (i.finish, listed) {
         (Expired, _) -> Left("the interpreter ran out of time")
         (Killed(n), _) -> Left("the interpreter died by signal " + Int.toString(n))
-        (_, Some("timing")) -> Right(Some("timing"))
-        _ -> Left("the interpreted run differs from the native one; a miscompile, or, if the "
-                  + "interpreter's slowdown is why, list it in " + file + " as 'timing' by hand")
+        (_, Some(reason)) -> if Array.contains(byHand, reason) { Right(Some(reason)) } else { Left(differs) }
+        (_, None) -> Left(differs)
     }
 }
 

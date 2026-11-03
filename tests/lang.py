@@ -15,6 +15,17 @@ sources, because a behavioral suite is hundreds of small programs and under
 `pytest -n auto` any of them may be asked for by any worker. Running is not
 cached: it is the thing being tested, and it takes milliseconds.
 
+Every program `run` runs is also run by `boot interpret`, with the same
+arguments, input, environment and directory, and the two runs must agree:
+the same exit status, stdout, and stderr without a panic's trace lines. A
+test whose programs the interpreter cannot run is listed in
+`tests/interpret_skips.txt` by its pytest node id, as the harness lists its
+cases (`tests/harness/Interpreted.gob` says what the reasons mean). A test
+listed as `timing` or `unrepeatable` is not interpreted at all: its second run
+would cost the slowdown, or see the files the first one wrote, and its answer
+could not count either way. The harness's `--bless` keeps these lines as they
+are, so they are written by hand, from what the failure says to write.
+
 A compile error ends a `boot` process -- a diagnostic is reported by exiting --
 so each program is its own invocation. That is also what makes this cheap:
 the native `boot` checks a small program in a fraction of a second.
@@ -24,6 +35,7 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
+import functools
 import hashlib
 import json
 import os
@@ -38,6 +50,7 @@ from tests import bootc, toolchain
 
 REPO_ROOT = bootc.REPO_ROOT
 LIB = REPO_ROOT / "lib"
+SKIPS = REPO_ROOT / "tests" / "interpret_skips.txt"
 CORPUS = REPO_ROOT / "tests" / "programs"
 WORK = Path(tempfile.gettempdir()) / "turkey-lang"
 
@@ -248,7 +261,10 @@ def run(src: Source, modules: dict[str, str] | None = None,
         flags: tuple[str, ...] = ()) -> Result:
     """Compile and run. Raises `CompileError` if it does not compile.
 
-    `flags` are `boot`'s, for the compile: `--gc-verify`, `--gc-stats`.
+    `flags` are `boot`'s, for the compile: `--gc-verify`, `--gc-stats`. A
+    program compiled with one is not interpreted, since the interpreter has no
+    such flags; nor is one that died by a signal, which is what its test is
+    about. Raises `AssertionError` if the interpreted run disagrees.
 
     The program runs in its own directory unless `cwd` says otherwise -- which
     a program that writes files should, since the directory a source string is
@@ -269,9 +285,81 @@ def run(src: Source, modules: dict[str, str] | None = None,
         capture_output=True,
         timeout=600,
     )
-    return Result(result.stdout.decode("utf-8"),
-                  compiled.stderr + result.stderr.decode("utf-8"),
-                  result.returncode)
+    ran = Result(result.stdout.decode("utf-8"),
+                 compiled.stderr + result.stderr.decode("utf-8"),
+                 result.returncode)
+    if not flags and ran.code >= 0:
+        _interpret(entry, compiled.stderr, ran, args, stdin, env, cwd)
+    return ran
+
+
+# The interpreter's exit statuses for a program it cannot run, by the skip
+# list's reason (`src/Turkey/Interpret.gob`).
+_CANNOT = {98: "ffi", 99: "stack"}
+
+
+def _interpret(entry: Path, warnings: str, native: Result, args: tuple[str, ...],
+               stdin: str | None, env: dict[str, str] | None, cwd: Path | None) -> None:
+    """Run `entry` by `boot interpret` as `run` ran it natively, and raise
+    `AssertionError` unless the two runs agree or the skip list says why
+    they cannot."""
+    test = os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0]
+    listed = _skips().get(test)
+    if listed in ("timing", "unrepeatable"):
+        return
+    here = cwd or entry.parent
+    # From the program's own directory a warning names the bare file, as the
+    # compile's did; from anywhere else it names the path it was given.
+    path = entry.name if Path(here).resolve() == entry.parent else str(entry)
+    ran = subprocess.run(
+        toolchain.command(bootc.binary(), "interpret", path, *args),
+        cwd=here,
+        input=None if stdin is None else stdin.encode("utf-8"),
+        env=dict(os.environ, TURKEY_LIB=str(LIB), **(env or {})),
+        capture_output=True,
+        timeout=600,
+    )
+    stdout = ran.stdout.decode("utf-8", errors="replace")
+    stderr = ran.stderr.decode("utf-8", errors="replace")
+    expected = native.stderr
+    if path != entry.name:
+        expected = warnings.replace(f"{entry.name}:", f"{path}:") + native.stderr[len(warnings):]
+    agrees = (ran.returncode == native.code and stdout == native.stdout
+              and _untraced(stderr) == _untraced(expected))
+    cannot = _CANNOT.get(ran.returncode)
+    if listed is not None:
+        assert not agrees, (
+            f"{test} is listed in {SKIPS.name} as '{listed}', but the interpreted "
+            "run agrees; unlist it")
+        if listed == cannot:
+            return
+    if agrees:
+        return
+    why = (f"the interpreter cannot run it; add '{test} {cannot}' to {SKIPS.name}"
+           if cannot else "the interpreted run differs from the native one")
+    raise AssertionError(
+        f"{why}\nnative: exited {native.code}\n{native.stdout}{native.stderr}"
+        f"\ninterpreted: exited {ran.returncode}\n{stdout}{stderr}")
+
+
+def _untraced(text: str) -> str:
+    """A panic is compared without the lines of its trace, which only
+    compiled code prints."""
+    return "".join(line for line in text.splitlines(keepends=True)
+                   if not line.startswith("  at "))
+
+
+@functools.cache
+def _skips() -> dict[str, str]:
+    """The skip list, name -> reason. A line is `NAME REASON`, and anything
+    after a `#` is ignored."""
+    out = {}
+    for line in SKIPS.read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            name, reason = line.rsplit(None, 1)
+            out[name] = reason
+    return out
 
 
 def binary(src: Source, modules: dict[str, str] | None = None) -> Path:

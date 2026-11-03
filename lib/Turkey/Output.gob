@@ -36,6 +36,7 @@ import Data.Int ()
 import Data.Bool (Bool(..))
 import Turkey.Libc as Libc
 import Turkey.Sys as Sys
+import Turkey.Workers as Workers
 
 fun heldAt() -> Int = 0
 fun capacityAt() -> Int = 8
@@ -101,11 +102,23 @@ fun lastLineEnd() -> Int {
 -- Retried at once after a signal. Any other failure drops everything held,
 -- which would otherwise fail again at every line, and is kept for
 -- `takeFailure` if it is the first.
-fun drain(n : Int) -> Int {
+--
+-- A blocking call (`Turkey.Workers.blockingWrite`), since a pipe whose reader
+-- is slow keeps the write waiting: the caller follows it with
+-- `Turkey.Scheduler.afterCall`.
+fun drain(n : Int) -> Int = drainBy(n, True)
+
+-- `drain`, through a blocking call or, not `carried`, an inline `write`.
+fun drainBy(n : Int, carried : Bool) -> Int {
     var done = 0
     var left = 0
     while done < n {
-        let r = Sys.result(Libc.write(1, Prim.ptrAdd(block, bytesAt() + done), n - done))
+        let at = Prim.ptrAdd(block, bytesAt() + done)
+        let r = if carried {
+            Workers.blockingWrite(1, at, n - done)
+        } else {
+            Sys.result(Libc.write(1, at, n - done))
+        }
         if r == -Sys.eagain() {
             left = n - done
             break
@@ -180,9 +193,14 @@ fun unlock() -> Bool {
 -- it is held, the bytes are written anyway: the holder is a task the program
 -- did not wait for, and its line may be cut. A descriptor answering `EAGAIN`
 -- is asked again at once, since there is nothing else left to run.
+--
+-- The write is inline, as the contract in `Turkey.Workers` allows: this runs
+-- from `Turkey.Entry` after the program's entry has returned, when no task the
+-- program waits for is left, so holding the thread through the write delays
+-- nothing the program asked for.
 fun final() -> Unit {
     if !started() { return {} }
     let _ = tryLock()
     var left = held()
-    while left > 0 { left = drain(left) }
+    while left > 0 { left = drainBy(left, False) }
 }

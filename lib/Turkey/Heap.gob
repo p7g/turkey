@@ -708,6 +708,10 @@ fun retireWorker(w : Prim.Ptr) -> Unit {
 -- (`Turkey.Monitor`), which holds the worker so that it cannot allocate:
 -- under the lock, since every other worker may be allocating.
 fun retireHeld(w : Prim.Ptr) -> Unit {
+    -- The monitor waits for the lock while it holds a worker that a
+    -- collection may be waiting for. That is safe only because the lock is
+    -- never held at a safepoint: nothing under it allocates, and no loop in
+    -- this module polls, so its holder never stops for that collection.
     Lock.acquire(heapLock)
     retireWorker(w)
     Lock.release(heapLock)
@@ -1984,8 +1988,12 @@ foreign "turkey_gc_report" fun report() -> Unit {
     if !statsWanted { return {} }
     -- With the world stopped, as a collection retires: other workers may
     -- still be allocating, and the monitor retiring a blocked one's cursors.
-    -- A collection under way stops this worker at the loop's poll.
-    while !Workers.stopTheWorld() {}
+    -- When another worker is collecting, it waits for this one to stop, and
+    -- this loop must stop for it by hand: no loop in this module polls
+    -- (`Turkey.Polls`).
+    while !Workers.stopTheWorld() {
+        if stopAsked() { stopAt(Prim.frameAddress()) }
+    }
     retire()
     Workers.startTheWorld()
     textLength = 0

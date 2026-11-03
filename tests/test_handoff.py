@@ -227,3 +227,41 @@ def test_a_collection_with_hundreds_of_blocked_threads(tmp_path):
     threads = re.search(r"\[gc\] threads (\d+) of at most (\d+), permits 2", err)
     assert threads, err[-2000:]
     assert 300 < int(threads.group(1)) <= int(threads.group(2))
+
+
+ENDING = """
+import System.Task as Task
+
+fun main() {
+    let tasks = Task.runScope(do {
+        let started : Vec (Task.Task Int) = []
+        for var i = 0; i < 64; i = i + 1 {
+            let n = i
+            Vec.push(started, Task.spawn(fun() = n * 2)?)
+        }
+        pure(started)
+    })
+    var total = 0
+    for t in tasks { total = total + Task.join(t) }
+    print(total)
+}
+"""
+
+
+def test_the_report_at_exit_stops_for_another_workers_collection(tmp_path):
+    # The --gc-stats report stops the world to retire every cursor. Workers
+    # woken by the last task to finish allocate as they look for more, and
+    # under stress each of those allocations collects: the report must stop
+    # for that collection rather than wait for it. A race, so many runs.
+    if toolchain.missing():
+        pytest.skip("C compiler unavailable")
+    entry = tmp_path / "main.gob"
+    entry.write_text(ENDING)
+    binary = tmp_path / "ending"
+    bootc.link(entry, binary, "--gc-stats")
+    env = dict(os.environ, TURKEY_WORKERS="8", TURKEY_GC_STRESS="1")
+    for _ in range(100):
+        result = subprocess.run(toolchain.command(binary), capture_output=True, text=True,
+                                env=env, timeout=60)
+        assert result.returncode == 0, result.stderr[-2000:]
+        assert result.stdout == "4032\n"

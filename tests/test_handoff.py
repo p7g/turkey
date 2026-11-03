@@ -12,6 +12,8 @@ import fcntl
 import os
 import re
 import subprocess
+import threading
+import time
 
 import pytest
 
@@ -51,11 +53,11 @@ fun permits() -> Int = match Env.get("TURKEY_WORKERS") {
     None -> 1
 }
 
--- A read of the standard input that blocks its thread, as a regular file's
--- does, rather than waiting in the poller.
-fun blockedRead() -> Int {
-    let buffer = Libc.malloc(8)
-    let n = Workers.blockingRead(0, buffer, 8)
+-- A read of up to `most` bytes of the standard input, which blocks its
+-- thread, as a regular file's does, rather than waiting in the poller.
+fun blockedRead(most : Int) -> Int {
+    let buffer = Libc.malloc(most)
+    let n = Workers.blockingRead(0, buffer, most)
     Scheduler.afterCall()
     Libc.free(buffer)
     n
@@ -76,7 +78,7 @@ READ = HEADER + SPINNERS + """
 fun main() {
     let (reader, spun) = Task.runScope(do {
         -- First, so that it is the first task a thread takes.
-        let reader = Task.spawn(blockedRead)?
+        let reader = Task.spawn(fun() = blockedRead(8))?
         let spun = spinners(permits())?
         pure((reader, spun))
     })
@@ -165,7 +167,7 @@ fun main() {
         None -> 0 }
     let (readers, churner) = Task.runScope(do {
         let readers : Vec (Task.Task Int) = []
-        for var i = 0; i < wanted; i = i + 1 { Vec.push(readers, Task.spawn(blockedRead)?) }
+        for var i = 0; i < wanted; i = i + 1 { Vec.push(readers, Task.spawn(fun() = blockedRead(1))?) }
         -- Collects, by allocating, while the readers' threads pile up, and
         -- for a while after they all have.
         let churner = Task.spawn(fun() {
@@ -193,20 +195,35 @@ fun main() {
 
 def test_a_collection_with_hundreds_of_blocked_threads(tmp_path):
     # Every reader blocks a thread of its own, and each collection stops
-    # them all. Closing the input ends every read: one takes the byte.
+    # them all. The readers are let go one byte at a time: woken all at
+    # once, 300 threads each collecting at every allocation take minutes
+    # on a 4-core machine, which tests the machine rather than the handoff.
+    readers = 300
     process = _start(tmp_path, MANY, "2", "--gc-verify", "--gc-stats",
-                     READERS="300", TURKEY_GC_STRESS="1")
+                     READERS=str(readers), TURKEY_GC_STRESS="1")
     try:
         # Each collection reports itself on stderr first.
         before = []
         while (line := process.stderr.readline()) not in ("churned\n", ""):
             before.append(line)
         assert line == "churned\n", "".join(before)[-2000:]
-        out, err = process.communicate("x", timeout=300)
+        # Drained meanwhile, or a full pipe would stop the program.
+        after = []
+        drain = threading.Thread(target=lambda: after.extend(process.stderr))
+        drain.start()
+        for _ in range(readers):
+            process.stdin.write("x")
+            process.stdin.flush()
+            time.sleep(0.002)
+        process.stdin.close()
+        process.wait(timeout=300)
+        out = process.stdout.read()
+        drain.join()
+        err = "".join(after)
     finally:
         process.kill()
-    assert process.returncode == 0, err
-    assert out == "1\n"
+    assert process.returncode == 0, err[-2000:]
+    assert out == f"{readers}\n"
     threads = re.search(r"\[gc\] threads (\d+) of at most (\d+), permits 2", err)
     assert threads, err[-2000:]
     assert 300 < int(threads.group(1)) <= int(threads.group(2))

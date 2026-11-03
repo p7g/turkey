@@ -98,3 +98,57 @@ def test_well_formed_agrees_with_python():
     src_call = "Option.isSome(String.fromBytes(bytes))"
     out = outputs(cases, src_call)
     assert out == [str(valid(case)) for case in cases]
+
+
+# What `String.fromBytesLossy` makes of bytes, as its bytes, in the form
+# `Show (Array Int)` prints them.
+LOSSY = "Array.map(String.toBytes(String.fromBytesLossy(bytes)), Byte.toInt)"
+
+
+def lossy(data: bytes) -> str:
+    """Python's decoder also replaces each maximal subpart with one U+FFFD."""
+    return str(list(data.decode("utf-8", errors="replace").encode("utf-8")))
+
+
+def test_lossy_agrees_with_python():
+    rng = random.Random(332)
+    pieces = ["a", "é", "€", "𝄞", "߿", "￿", "\U0010ffff"]
+    bad = [b"\x80", b"\xc0\xaf", b"\xe0\x80\xaf", b"\xed\xa0\x80", b"\xf4\x90\x80\x80",
+           b"\xf5", b"\xff", b"\xe2\x82", b"\xc3", b"\xf0\x9f\x98", b"\xe0\x80"]
+    cases = [b"", b"plain"]
+    for length in (0, 5, 8, 33, 40):
+        for _ in range(6):
+            text = "".join(rng.choice(pieces) if rng.random() < 0.2 else "a"
+                           for _ in range(length))
+            data = text.encode("utf-8")
+            at = rng.randrange(len(data) + 1)
+            cases.append(data[:at] + rng.choice(bad) + data[at:])
+            cases.append(data[:at] + rng.choice(bad) + rng.choice(bad))
+    # The example the Unicode Standard gives for maximal subparts.
+    cases.append(bytes.fromhex("61 F1 80 80 E1 80 C2 62 80 63 80 BF 64"))
+    out = outputs(cases, LOSSY)
+    assert out == [lossy(case) for case in cases]
+
+
+def test_lossy_agrees_with_python_for_every_lead_and_second_byte():
+    """Each pair alone, and followed by two continuation bytes and an `A`, so
+    that every way a maximal subpart can end is met."""
+    src = """
+fun lossy(bytes : Array Byte) -> String =
+    show(Array.map(String.toBytes(String.fromBytesLossy(bytes)), Byte.toInt))
+
+fun main() {
+    for var lead = 0; lead < 256; lead = lead + 1 {
+        for var second = 0; second < 256; second = second + 1 {
+            let a = Byte.truncate(lead)
+            let b = Byte.truncate(second)
+            print(lossy([a, b]) + " " + lossy([a, b, Byte.truncate(0x80), Byte.truncate(0xBF), Byte.truncate(65)]))
+        }
+    }
+}
+"""
+    result = run(src)
+    assert result.code == 0, result.stderr
+    expected = [f"{lossy(bytes([a, b]))} {lossy(bytes([a, b, 0x80, 0xBF, 65]))}"
+                for a in range(256) for b in range(256)]
+    assert result.stdout.split("\n")[:-1] == expected

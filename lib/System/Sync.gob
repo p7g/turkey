@@ -2,21 +2,30 @@ export (
     Mutex, mutex, withLock, update,
     AtomicInt, atomicInt, load, store, addAndGet, compareAndSet,
     Once, once, force,
+    Semaphore, semaphore, acquire, release, withUnit,
 )
 
 -- What tasks that share data need when they run at once (`System.Task`): a
--- mutex around a value, an integer changed atomically, and a value computed
--- once however many tasks ask for it.
+-- mutex around a value, an integer changed atomically, a value computed once
+-- however many tasks ask for it, and a count of units that bounds how many
+-- tasks do something at once.
 --
 -- A task waiting for any of them waits as it does in `Task.join`: it is
--- suspended, and its worker runs other tasks meanwhile. Nothing here blocks a
--- worker's thread.
+-- suspended, and its worker runs other tasks meanwhile. The program's own
+-- code waiting for a semaphore's unit runs no task meanwhile, since the one
+-- that gives the unit back may be among them: it sleeps, and the right to
+-- run tasks goes to another thread. So nothing here holds up a worker.
 --
 -- Each keeps its state word in a `Prim.Atomic`, a cell of its own whose every
 -- access is atomic.
 
+import Time.Clock as Clock
+import Time.Deadline (Deadline)
+import Time.Deadline as Deadline
 import Turkey.Coroutine as Co
 import Turkey.Scheduler as Scheduler
+import Turkey.Semaphore (Semaphore)
+import Turkey.Semaphore as Units
 
 -- -- mutex -----------------------------------------------------------------------------
 
@@ -153,4 +162,43 @@ fun force(o : Once a) -> a {
         Some(value) -> value
         None -> Prim.error("System.Sync.force: a value marked made is missing")
     }
+}
+
+-- -- semaphores ------------------------------------------------------------------------
+
+-- A count of units that tasks take and give back, which bounds how many do
+-- something at once: with `semaphore(4)`, four tasks take a unit each, and a
+-- fifth waits until one of them gives its unit back.
+--
+--     let downloads = Sync.semaphore(4)
+--     ...
+--     Sync.withUnit(downloads, fun() = fetch(url))
+--
+-- **In order.** A unit given back goes to the task that has waited longest,
+-- of those still waiting; one whose deadline passed is skipped. A unit
+-- nobody waits for goes back to the count, and a free unit is taken only
+-- when nobody waits for one, so a task that comes later never overtakes one
+-- that waits.
+--
+-- A unit is not tied to the task that took it: any task may give one back.
+
+fun semaphore(units : Int) -> Semaphore = Units.new(units)
+
+-- Take a unit of `s`, waiting until one is given back if none is free, and
+-- until `deadline` if there is one: whether a unit was taken. A deadline
+-- that has passed already takes none, even if one is free.
+fun acquire(s : Semaphore, deadline : Option Deadline) -> Bool = match deadline {
+    Some(d) -> Units.acquire(s, Clock.nanos(Deadline.reading(d)))
+    None -> Units.acquire(s, -1)
+}
+
+-- Give a unit of `s` back.
+fun release(s : Semaphore) -> Unit = Units.release(s)
+
+-- `f()`, holding a unit of `s` while it runs.
+fun withUnit(s : Semaphore, f : fun() -> b) -> b {
+    let _ = acquire(s, None)
+    let made = f()
+    release(s)
+    made
 }

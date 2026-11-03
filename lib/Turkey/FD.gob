@@ -79,6 +79,7 @@ import Turkey.Coroutine as Co
 import Turkey.Detach as Detach
 import Turkey.IO as IO
 import Turkey.Scheduler as Scheduler
+import Turkey.Semaphore as Semaphore
 import Turkey.Sys as Sys
 import Turkey.Wait as Wait
 import Target (OS(..))
@@ -111,7 +112,7 @@ type FD = FD {
     var writers  : Vec Co.Coroutine,
     -- Linux's `flock` calls on the descriptor, one at a time (`flockLinux`).
     -- Made by the first, under the scheduler's lock.
-    var flocking : Option Detach.Semaphore,
+    var flocking : Option Semaphore.Semaphore,
 }
 
 -- An `FD` for a descriptor the caller owns from now on: its `close` closes it.
@@ -290,21 +291,21 @@ fun flockParked(f : FD, operation : Int, deadline : Int) -> Int {
 -- closed and reused under it.
 fun flockLinux(f : FD, operation : Int, deadline : Int) -> Int {
     let calls = flockCalls(f)
-    if Detach.acquire(calls, deadline) != 0 { return timedOut }
+    if !Semaphore.acquire(calls, deadline) { return timedOut }
     if deadline < 0 {
         let r = IO.flock(f.number, operation)
-        Detach.release(calls)
+        Semaphore.release(calls)
         return r
     }
     -- Try first, so that a lock nobody holds costs no helper.
     let tried = IO.flock(f.number, operation | Sys.lockNonBlocking)
     if tried != -Sys.eagain() {
-        Detach.release(calls)
+        Semaphore.release(calls)
         return tried
     }
     -- The helper's reference.
     if !acquire(f) {
-        Detach.release(calls)
+        Semaphore.release(calls)
         return closed
     }
     let n = f.number
@@ -312,7 +313,7 @@ fun flockLinux(f : FD, operation : Int, deadline : Int) -> Int {
     -- helper's cleanup.
     let done = fun() {
         let _ = release(f)
-        Detach.release(calls)
+        Semaphore.release(calls)
     }
     let late = fun(r) {
         if r == 0 { let _ = IO.flock(n, Sys.lockUnlock) }
@@ -328,11 +329,11 @@ fun flockLinux(f : FD, operation : Int, deadline : Int) -> Int {
     }
 }
 
-fun flockCalls(f : FD) -> Detach.Semaphore {
+fun flockCalls(f : FD) -> Semaphore.Semaphore {
     Scheduler.lock()
     let calls = match f.flocking {
         Some(calls) -> calls
-        None -> Detach.semaphore(1)
+        None -> Semaphore.new(1)
     }
     f.flocking = Some(calls)
     Scheduler.unlock()

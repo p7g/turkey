@@ -181,9 +181,11 @@ alias for a function: `infix Combine (<>) = combine` puts `<>` in the group
 * The group is one of the groups in the [table above](#operators). A program
   chooses among them and cannot add its own.
 * The operator is any [operator token](lexical.md#operators-and-punctuation)
-  other than a built-in operator (`+`, `==`, `&&`, `!` and the rest) and the
-  punctuation `=`, `->` and `~`. `|` may be declared: patterns and type
-  declarations, which use it, are read separately from expressions.
+  other than a built-in operator (`+`, `==`, `&&`, `!` and the rest), the
+  punctuation `=`, `->` and `~`, and an operator that ends in `=` without
+  beginning with one: `+=` and `>>=` cannot be declared, and `===` can. `|`
+  may be declared: patterns and type declarations, which use it, are read
+  separately from expressions.
 * The target is a top-level function or a class method that takes two
   parameters, from this module or one it imports. It may be qualified.
 * A use is an ordinary call of the target. Its types are the target's, a class

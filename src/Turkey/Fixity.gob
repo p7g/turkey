@@ -1,5 +1,5 @@
 export (
-    Group(..), groupNamed, groupName, groupList, builtinGroup, binaryMethod,
+    Group(..), groupNamed, groupName, groupList, builtinGroup, fixedGroup,
     isBuiltin, declarable, associate, splitAdvice,
 )
 
@@ -105,39 +105,31 @@ fun tighter(a : Group, b : Group) -> Bool {
 
 fun same(a : Group, b : Group) -> Bool = groupName(a) == groupName(b)
 
--- The built-in binary operators. `&&` and `||` are here too: they have groups
--- like any operator, and only what they mean, not how they group, is special.
+-- The binary operators the compiler defines. They short-circuit, which no
+-- function call does, so no declaration could mean them.
 fun builtinGroup(op : String) -> Option Group = match op {
-    "*" | "/" | "%" -> Some(Multiplication)
-    "+" | "-" -> Some(Addition)
-    "<" | "<=" | ">" | ">=" -> Some(Comparison)
-    "==" | "!=" -> Some(Equality)
     "&&" -> Some(Conjunction)
     "||" -> Some(Disjunction)
     _ -> None
 }
 
--- The class method a built-in operator means. `&&` and `||` have none: they
--- short-circuit, which no function call does.
-fun binaryMethod(op : String) -> Option String = match op {
-    "+" -> Some("add")
-    "-" -> Some("sub")
-    "*" -> Some("mul")
-    "/" -> Some("div")
-    "%" -> Some("rem")
-    "==" -> Some("eq")
-    "!=" -> Some("ne")
-    "<" -> Some("lt")
-    "<=" -> Some("lte")
-    ">" -> Some("gt")
-    ">=" -> Some("gte")
-    _ -> None
+-- The operators whose group the language fixes: the two above, and the
+-- arithmetic and comparison operators, which the library declares beside the
+-- classes they call. A module may declare one of the latter again, shadowing
+-- the Prelude's as it may shadow `print`, but only in the group given here,
+-- so that `a + b * c` groups the same way in every module.
+fun fixedGroup(op : String) -> Option Group = match op {
+    "*" | "/" | "%" -> Some(Multiplication)
+    "+" | "-" -> Some(Addition)
+    "<" | "<=" | ">" | ">=" -> Some(Comparison)
+    "==" | "!=" -> Some(Equality)
+    _ -> builtinGroup(op)
 }
 
 -- Every operator-character token the language gives a meaning of its own: the
--- binary operators, the prefix `!`, and the punctuation spelled with operator
--- characters.
-fun isBuiltin(op : String) -> Bool = match builtinGroup(op) {
+-- operators with a fixed group, the prefix `!`, and the punctuation spelled
+-- with operator characters.
+fun isBuiltin(op : String) -> Bool = match fixedGroup(op) {
     Some(_) -> True
     None -> match op {
         "!" | "=" | "->" | "~" | "|" -> True
@@ -151,20 +143,28 @@ fun isBuiltin(op : String) -> Bool = match builtinGroup(op) {
 --
 -- An operator that ends in `=` reads as an assignment, `+=` or `>>=`, so no
 -- program may declare one. One that begins with `=`, such as `===`, reads as
--- an equality and may be declared. The built-in comparisons that end in `=`
--- are refused as built-ins first.
-fun declarable(op : String) -> Option String = match op {
+-- an equality and may be declared. The comparisons that end in `=` have fixed
+-- groups, and are settled before that rule.
+fun declarable(op : String, group : Group) -> Option String = match op {
     "=" | "->" | "~" -> Some("'" + op + "' is punctuation and cannot be declared as an operator")
     "|" -> None
-    _ -> if isBuiltin(op) {
-        Some("'" + op + "' is a built-in operator and cannot be redeclared")
-    } else if String.endsWith(op, "=") && !String.startsWith(op, "=") {
+    "&&" | "||" | "!" -> Some("'" + op + "' is a built-in operator and cannot be redeclared")
+    _ -> match fixedGroup(op) {
+        Some(fixed) -> if same(fixed, group) { None } else {
+            Some("'" + op + "' is always in the group " + groupName(fixed)
+                 + " and cannot be declared in " + groupName(group))
+        }
+        None -> assignmentShaped(op)
+    }
+}
+
+fun assignmentShaped(op : String) -> Option String =
+    if String.endsWith(op, "=") && !String.startsWith(op, "=") {
         Some("'" + op + "' cannot be declared: an operator that ends in '=' "
              + "must begin with '=' too")
     } else {
         None
     }
-}
 
 -- -- re-association -------------------------------------------------------------------
 --

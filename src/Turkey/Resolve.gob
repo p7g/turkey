@@ -19,12 +19,14 @@ export (program, arities, operators)
 --   the scope that binds them, so they need no qualification, and the frames
 --   below track scopes precisely enough to tell one from a top-level
 --   reference.
--- * **Operators.** `a + b` means the class method `add`, and once shadowing
---   an import is legal a plain `add` reference would resolve to whatever `add`
---   the module happens to define. So the reference an operator means is
---   marked, and the marked ones are looked up in the separate protocol-method
---   scope -- so `+` still means the imported `Add.add` in a module whose own
---   `add` is unrelated.
+-- * **Method references the compiler writes.** `-x` means the class method
+--   `neg`, `xs[i]` means `get`, and a `for` loop `iter` and `next`; a plain
+--   `neg` reference would resolve to whatever `neg` the module happens to
+--   define. So these references are marked, and the marked ones are looked up
+--   in the separate protocol-method scope -- so `-x` still means the imported
+--   `Neg.neg` in a module whose own `neg` is unrelated. A binary operator needs
+--   no such scope: its `infix` declaration names its target in the module that
+--   declares it.
 --
 -- Operator chains are grouped here too, because a declared operator's group
 -- is known only once its `infix` declaration has been read, and the parser
@@ -519,14 +521,18 @@ fun methodRef(r : R, name : String, where : Span) -> Option Expr =
 
 -- -- operators --------------------------------------------------------------------
 
-fun groupOf(r : R, op : String, where : Span) -> Group = match Fixity.builtinGroup(op) {
+-- A declaration of an operator with a fixed group is in that group, so the
+-- fixed group is the answer without asking which declaration is in scope.
+fun groupOf(r : R, op : String, where : Span) -> Group = match Fixity.fixedGroup(op) {
     Some(g) -> g
     None -> match declared(r, op, where) {
         Some((g, _)) -> g
-        None -> Diag.fail(Diag.at("parse error", missing(r, op), where),
-                          where.file)
+        None -> notDeclared(r, op, where)
     }
 }
+
+fun notDeclared(r : R, op : String, where : Span) -> a =
+    Diag.fail(Diag.at("parse error", missing(r, op), where), where.file)
 
 -- Returns the message for `op`, which is not in scope: which import would
 -- bring it, if one of the module's imports exports it, and otherwise how it
@@ -579,21 +585,16 @@ fun declaringModule(id : String) -> String = match String.splitOnce(id, "#") {
 }
 
 -- One operator of a chain, applied. A built-in operator's node is spanned by
--- where its left operand begins, and means its class method; a declared one's
--- is spanned by the operator, which is what a diagnostic about the call
--- should point at.
+-- where its left operand begins; a declared one's is spanned by the operator,
+-- which is what a diagnostic about the call should point at.
 fun binary(r : R, op : (String, Span), left : Expr, right : Expr, from : Span) -> Expr {
     let (name, where) = op
     match declared(r, name, where) {
         Some((_, target)) -> node(where, EBinary(name, left, right,
                                                  Some(node(where, EVar(target, False)))))
-        None -> match Fixity.binaryMethod(name) {
-            Some(method) -> {
-                let fn = Some(node(from, EVar(method, True)))
-                resolveMethod(r, fn)
-                node(from, EBinary(name, left, right, fn))
-            }
-            None -> node(from, EBinary(name, left, right, None))
+        None -> match Fixity.builtinGroup(name) {
+            Some(_) -> node(from, EBinary(name, left, right, None))
+            None -> notDeclared(r, name, where)
         }
     }
 }

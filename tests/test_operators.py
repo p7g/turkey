@@ -4,7 +4,8 @@
 golden cannot show: that `+` is *nothing but* a call to `Add.add` -- no table,
 no special case, no privilege -- and what follows from that. It also pins the
 two boundaries the prelude draws: `Prim.*` is not in the surface language, and
-a program may not redefine what the prelude declares.
+a program may redeclare an arithmetic operator only in the group the language
+gives it.
 """
 
 from __future__ import annotations
@@ -255,10 +256,24 @@ def test_an_unknown_group_is_refused():
 
 
 def test_a_built_in_operator_cannot_be_redeclared():
-    assert fails("infix Addition (+) = combine") == \
-        "'+' is a built-in operator and cannot be redeclared"
     assert fails("infix Conjunction (&&) = combine") == \
         "'&&' is a built-in operator and cannot be redeclared"
+    assert fails("infix Disjunction (||) = combine") == \
+        "'||' is a built-in operator and cannot be redeclared"
+
+
+def test_an_arithmetic_operator_keeps_its_group():
+    assert fails("infix Combine (+) = combine") == \
+        "'+' is always in the group Addition and cannot be declared in Combine"
+
+
+def test_an_arithmetic_operator_may_be_shadowed_in_its_group(capsys):
+    src = """
+infix Addition (+) = joined
+fun joined(a : String, b : String) -> String = String.join([a, b], "-")
+fun main() { print("a" + "b") }
+"""
+    assert output(src, capsys) == ["a-b"]
 
 
 @pytest.mark.parametrize("op", ["=", "->", "~"])

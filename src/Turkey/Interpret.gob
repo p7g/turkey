@@ -1,0 +1,646 @@
+export (Program, prepare, run, outOfStackStatus, cannotStatus)
+
+-- An evaluator over Core, at any stage from `Turkey.Lower`'s output to what
+-- `optimize` hands the backend, running on the compiled host's own runtime.
+--
+-- **Type passing.** Every node carries its type, but a value carries none: a
+-- type abstraction is a closure over the types in scope, and a type
+-- application extends them (`TyEnv`). A type is substituted to ground only
+-- where its layout is asked for -- an array allocation, an array literal, and
+-- an existential pack -- because everywhere else nothing at run time depends
+-- on it. After `Turkey.Mono` most type applications are gone and the
+-- environments stay empty, which is the same evaluator with less to do.
+--
+-- **The host boundary.** A binding of a host module, and a monomorphic
+-- binding of `Turkey.Stdout`, is never interpreted: a mention of one is the
+-- compiled function `Interpreter.Boundary` holds for it. Their initializers
+-- never run here either, and nor does `System.Task`'s, whose one global
+-- starts the workers: the host started them already. What crosses, and why
+-- each module is where it is, is said in `Turkey.Hosted`.
+--
+-- **No state of its own.** Every table here is built by `prepare`, before the
+-- program runs, and only read after. A closure that the host calls on
+-- another worker therefore needs nothing but the `Program`. The interpreted
+-- program's own globals are host cells, and race as compiled globals do.
+--
+-- **Control.** A join is a loop, not a call: a jump evaluates to `VJump`,
+-- which every tail position yields unchanged until the join it names catches
+-- it and runs its body. Core guarantees a jump stands only in tail position,
+-- so nothing else ever sees one.
+
+import Data.Set as Set
+import System.Env as Env
+import System.IO as IO
+import Interpreter.Value (Value(..), Closure(..), Abstraction(..), Cell(..), Env(..),
+                          TyEnv(..), Reenter(..))
+import Interpreter.Value as V
+import Interpreter.Prims (Element(..))
+import Interpreter.Prims as P
+import Interpreter.Boundary as Boundary
+import Interpreter.Host as Host
+import Turkey.Hosted as Hosted
+import Turkey.Ast (Lit(..), Opening(..))
+import Turkey.Classes (ClassTable)
+import Turkey.Core (..)
+import Turkey.Coretc as Coretc
+import Turkey.Decls (DeclTable, ConInfo(..))
+import Turkey.Decls as Decls
+import Turkey.Layout as Layout
+import Turkey.Prelude as Prelude
+import Turkey.Prims as Prims
+import Turkey.Typed as Typed
+import Turkey.Types as Ty
+import Turkey.Types (Type, TVar, TCon, TApp, TFam, TFun, TTuple, VarCell)
+
+-- The exit status of a program the interpreter ran out of stack for: not
+-- the program's, so a harness can tell the two apart and skip the program.
+let outOfStackStatus = 99
+
+-- The exit status of a program that calls what only compiled code can:
+-- a `foreign` function of its own.
+let cannotStatus = 98
+
+-- What a constructor is, for building and matching one.
+type Con = Con {
+    tag    : Int,
+    -- Erased: a value of its type is its one field (`Decls.newtypes`).
+    erased : Bool,
+    -- The dictionaries an existential packs before its fields.
+    dicts  : Int,
+    params : Array Type,
+    exists : Vec VarCell,
+}
+
+-- A global: computed in run order, or ready from the start if it is a
+-- function, which computes nothing until it is called.
+type Global = Global { var value : Value, var ready : Bool }
+
+type Program = Program {
+    decls    : DeclTable,
+    fams     : Option Ty.Families,
+    cons     : Map String Con,
+    globals  : Map String Global,
+    -- In run order: the globals that compute something as the program starts.
+    inits    : Vec (String, Core),
+    -- Each `Prim.cString` literal's bytes and NUL, kept for the whole run.
+    cstrings : Map String Value,
+}
+
+-- The state of one interpretation: the program, and how deep it may go.
+type Ctx = Ctx { program : Program, limit : Int }
+
+-- -- preparing --------------------------------------------------------------------
+
+-- Every table the evaluator reads, built from `core`, a whole program.
+-- `skipped` is how many of the process's arguments are the interpreter's own.
+fun prepare(core : CProgram, decls : DeclTable, classes : ClassTable,
+            skipped : Int) -> Program {
+    let p = Program {
+        decls = decls, fams = Some(Coretc.famsOf(classes, [])), cons = Map.new(),
+        globals = Map.new(), inits = [], cstrings = Map.new(),
+    }
+    -- Read now, so that the lazily built set is not built while the program
+    -- runs.
+    let erased = Decls.newtypes(decls)
+    for (name, info) in Map.entries(decls.constructors) {
+        Map.put(p.cons, name, conOf(decls, info, Set.contains(erased, info.tycon)))
+    }
+    let reenter = Reenter { call = fun(f, args, budget) =
+        applyValue(Ctx { program = p, limit = V.stackLimit(budget) }, f, args) }
+    for (name, entry) in Array.append(Boundary.functions, Host.overrides(skipped)) {
+        define(p, name, VNative(name, fun(args) = entry(reenter, args)))
+    }
+    for (name, read) in Boundary.values { define(p, name, read()) }
+    let host = Hosted.hostModules()
+    let shared = Set.new()
+    for name in Boundary.compiledShared { Set.add(shared, name) }
+    for group in [core.dicts, core.binds] {
+        for b in group {
+            if Set.contains(host, b.module_) || Set.contains(shared, b.name) { continue }
+            if Map.contains(p.globals, b.name) { continue }
+            let literals = []
+            cStringsInto(b.value, literals)
+            for s in literals { Map.put(p.cstrings, s, P.cString(s)) }
+            if len(b.binders) > 0 {
+                define(p, b.name, VAbstraction(Abstraction {
+                    binders = b.binders, body = b.value, env = None, tys = None }))
+            } else {
+                match b.value.kind {
+                    CLam(params, body, _) -> define(p, b.name, VFun(Closure {
+                        params = params, body = body, env = None, tys = None }))
+                    CTyLam(binders, body) -> define(p, b.name, VAbstraction(Abstraction {
+                        binders = binders, body = body, env = None, tys = None }))
+                    _ -> {
+                        Map.put(p.globals, b.name, Global { value = VUnit, ready = False })
+                        Vec.push(p.inits, (b.name, b.value))
+                    }
+                }
+            }
+        }
+    }
+    p
+}
+
+fun define(p : Program, name : String, v : Value) -> Unit =
+    Map.put(p.globals, name, Global { value = v, ready = True })
+
+fun conOf(decls : DeclTable, info : ConInfo, erased : Bool) -> Con {
+    let siblings = match Map.get(decls.tycons, info.tycon) {
+        Some(t) -> t.variants
+        None -> []
+    }
+    var tag = 0
+    for var i = 0; i < len(siblings); i = i + 1 {
+        if siblings[i].name == info.name { tag = i }
+    }
+    let params = match Ty.prune(info.scheme.body) {
+        TFun(ps, _) -> ps
+        _ -> []
+    }
+    Con {
+        tag = tag, erased = erased, dicts = len(info.scheme.preds), params = params,
+        exists = info.exists,
+    }
+}
+
+-- Push each `Prim.cString` literal in `e` to `out`.
+fun cStringsInto(e : Core, out : Vec String) -> Unit {
+    match e.kind {
+        CApp(fn, args) -> if let CPrim(Prims.CString) = stripTypes(fn).kind {
+            if len(args) == 1 {
+                if let CLit(LString(s)) = args[0].kind { Vec.push(out, s) }
+            }
+        }
+        _ -> {}
+    }
+    let _ = mapKind(e.kind, Mapper {
+        expr = fun(x) {
+            cStringsInto(x, out)
+            x
+        },
+        type_ = fun(t) = t,
+        bind = fun(b) {
+            cStringsInto(b.value, out)
+            b
+        },
+    })
+}
+
+fun stripTypes(e : Core) -> Core = match e.kind {
+    CTyApp(inner, _) -> stripTypes(inner)
+    _ -> e
+}
+
+-- -- running ----------------------------------------------------------------------
+
+-- Run the program: compute its globals in order, then call `main`.
+fun run(p : Program, main : String) -> Unit {
+    let c = Ctx { program = p, limit = V.stackLimit(V.entryBudget) }
+    for (name, value) in p.inits {
+        let g = p.globals[name]
+        -- A dictionary is published before its slots are computed, as the
+        -- compiled initializer does, so that a slot may mention it.
+        match value.kind {
+            CDict(_, slots) -> {
+                let held = Array.filled(len(slots), VUnit)
+                g.value = VTuple(held)
+                g.ready = True
+                for var i = 0; i < len(slots); i = i + 1 {
+                    held[i] = eval(c, slots[i], None, None)
+                }
+            }
+            _ -> {
+                g.value = eval(c, value, None, None)
+                g.ready = True
+            }
+        }
+    }
+    let _ = applyValue(c, global(c, main), [])
+}
+
+fun global(c : Ctx, name : String) -> Value = match Map.get(c.program.globals, name) {
+    Some(g) -> if g.ready { g.value } else {
+        oops("'" + name + "' is read before it is initialized")
+    }
+    None -> if Map.contains(c.program.decls.foreigns, name) {
+        cannot("call the foreign function '" + String.replace(name, "#", ".") + "'")
+    } else {
+        oops("no binding '" + name + "'")
+    }
+}
+
+fun lookup(c : Ctx, env : Option Env, name : String) -> Value {
+    var at = env
+    loop {
+        match at {
+            Some(frame) -> {
+                if frame.name == name { return frame.value }
+                at = frame.next
+            }
+            None -> return global(c, name)
+        }
+    }
+}
+
+fun bind(env : Option Env, name : String, v : Value) -> Option Env =
+    Some(Env { name = name, value = v, next = env })
+
+fun eval(c : Ctx, e : Core, env : Option Env, tys : Option TyEnv) -> Value = match e.kind {
+    CLit(l) -> literal(l, e.ty)
+    CUnit -> VUnit
+    CVar(name) -> lookup(c, env, name)
+    CCon(name) -> {
+        let con = conNamed(c, name)
+        if len(con.params) == 0 && con.dicts == 0 && !con.erased {
+            VCon(con.tag, [])
+        } else {
+            VConstructor(name)
+        }
+    }
+    CPrim(p) -> VPrimitive(p)
+    CTuple(elems) -> VTuple(evalAll(c, elems, env, tys))
+    CArray(elems) -> P.arrayOf(elementOf(c, e.ty, tys), evalAll(c, elems, env, tys))
+    CDict(_, slots) -> VTuple(evalAll(c, slots, env, tys))
+    CSlot(target, index) -> V.fields(eval(c, target, env, tys))[index]
+    CProject(target, index) -> {
+        let v = eval(c, target, env, tys)
+        if Option.isSome(Decls.erasedPayload(c.program.decls, Ty.prune(target.ty))) {
+            v
+        } else {
+            V.fields(v)[index]
+        }
+    }
+    CIndex(target, index) -> {
+        let a = eval(c, target, env, tys)
+        P.apply(Prims.ArrayGet, [a, eval(c, index, env, tys)], EValue)
+    }
+    CLam(params, body, _) -> VFun(Closure { params = params, body = body, env = env, tys = tys })
+    CApp(fn, args) -> call(c, e, fn, args, env, tys)
+    CTyLam(binders, body) ->
+        VAbstraction(Abstraction { binders = binders, body = body, env = env, tys = tys })
+    CTyApp(fn, args) -> match eval(c, fn, env, tys) {
+        VAbstraction(a) -> instantiate(c, a, args, tys)
+        other -> other
+    }
+    CLet(name, _, value, body, binders) -> {
+        let v = if len(binders) > 0 {
+            VAbstraction(Abstraction { binders = binders, body = value, env = env, tys = tys })
+        } else {
+            eval(c, value, env, tys)
+        }
+        eval(c, body, bind(env, name, v), tys)
+    }
+    CLetRec(binds, body) -> {
+        var inner = env
+        for b in binds { inner = bind(inner, b.name, VUnit) }
+        -- Each value closes over `inner`, which holds them all: the frames are
+        -- assigned once the closures exist.
+        for b in binds {
+            let v = if len(b.binders) > 0 {
+                VAbstraction(Abstraction {
+                    binders = b.binders, body = b.value, env = inner, tys = tys })
+            } else {
+                eval(c, b.value, inner, tys)
+            }
+            frameOf(inner, b.name).value = v
+        }
+        eval(c, body, inner, tys)
+    }
+    CJoin(name, params, body, rest, _) -> {
+        var out = eval(c, rest, env, tys)
+        loop {
+            match out {
+                VJump(target, args) -> {
+                    if target != name { return out }
+                    var inner = env
+                    for var i = 0; i < len(params); i = i + 1 {
+                        inner = bind(inner, params[i].name, args[i])
+                    }
+                    out = eval(c, body, inner, tys)
+                }
+                _ -> return out
+            }
+        }
+    }
+    CJump(name, args) -> VJump(name, evalAll(c, Vec.toArray(args), env, tys))
+    CRef(value) -> VCell(Cell { value = eval(c, value, env, tys) })
+    CDeref(target) -> match eval(c, target, env, tys) {
+        VCell(cell) -> cell.value
+        _ -> oops("a dereference of something that is not a cell")
+    }
+    CAssign(target, value) -> {
+        -- The value first, then the target's parts: the order compiled code
+        -- evaluates an assignment in.
+        let v = eval(c, value, env, tys)
+        match target.kind {
+            CProject(obj, index) -> {
+                let fs = V.fields(eval(c, obj, env, tys))
+                fs[index] = v
+            }
+            CIndex(arr, index) -> {
+                let a = eval(c, arr, env, tys)
+                let _ = P.apply(Prims.ArraySet, [a, eval(c, index, env, tys), v], EValue)
+            }
+            _ -> match eval(c, target, env, tys) {
+                VCell(cell) -> { cell.value = v }
+                _ -> oops("an assignment to something that is not a cell")
+            }
+        }
+        VUnit
+    }
+    CIf(cond, then, otherwise) -> if V.isTrue(eval(c, cond, env, tys)) {
+        eval(c, then, env, tys)
+    } else {
+        match otherwise {
+            Some(o) -> eval(c, o, env, tys)
+            None -> VUnit
+        }
+    }
+    CMatch(scrutinee, alts) -> {
+        let v = eval(c, scrutinee, env, tys)
+        for a in alts {
+            match matched(c, a.alt, v, env, tys) {
+                Some((inner, innerTys)) -> return eval(c, a.body, inner, innerTys)
+                None -> {}
+            }
+        }
+        oops("no arm of a match accepted its value")
+    }
+}
+
+fun frameOf(env : Option Env, name : String) -> Env {
+    var at = env
+    loop {
+        match at {
+            Some(frame) -> {
+                if frame.name == name { return frame }
+                at = frame.next
+            }
+            None -> oops("no frame '" + name + "'")
+        }
+    }
+}
+
+-- Left to right.
+fun evalAll[Iterator t, Length t, Item t ~ Core](c : Ctx, es : t, env : Option Env,
+                                               tys : Option TyEnv) -> Array Value {
+    let out = Array.filled(len(es), VUnit)
+    var i = 0
+    for x in es {
+        out[i] = eval(c, x, env, tys)
+        i = i + 1
+    }
+    out
+}
+
+fun literal(l : Lit, ty : Type) -> Value = match l {
+    LInt(n) -> P.numeral(n, headName(ty))
+    LFloat(x) -> VFloat(x)
+    LString(s) -> V.string(s)
+    LChar(ch) -> VChar(ch)
+}
+
+fun headName(ty : Type) -> String = match Ty.spine(Ty.prune(ty)) {
+    (TCon(cell), _) -> cell.name
+    _ -> ""
+}
+
+-- -- calls ------------------------------------------------------------------------
+
+fun call(c : Ctx, e : Core, fn : Core, args : Array Core, env : Option Env,
+         tys : Option TyEnv) -> Value {
+    let head = stripTypes(fn)
+    match head.kind {
+        CPrim(p) -> primitive(c, p, e, args, env, tys)
+        CCon(name) -> construct(c, name, args, evalAll(c, args, env, tys), tys)
+        _ -> {
+            let f = eval(c, fn, env, tys)
+            applyValue(c, f, evalAll(c, args, env, tys))
+        }
+    }
+}
+
+fun applyValue(c : Ctx, f : Value, args : Array Value) -> Value = match f {
+    VFun(closure) -> {
+        if V.beyond(c.limit) { outOfStack() }
+        var inner = closure.env
+        let params = closure.params
+        if len(params) != len(args) {
+            oops("a function of " + Int.toString(len(params)) + " parameters applied to "
+                 + Int.toString(len(args)))
+        }
+        for var i = 0; i < len(params); i = i + 1 {
+            inner = bind(inner, params[i].name, args[i])
+        }
+        eval(c, closure.body, inner, closure.tys)
+    }
+    VAbstraction(a) -> applyValue(c, instantiate(c, a, [], None), args)
+    VNative(_, run) -> run(args)
+    VPrimitive(p) -> P.apply(p, args, EValue)
+    VConstructor(name) -> construct(c, name, [], args, None)
+    _ -> oops("a call of something that is not a function")
+}
+
+-- `a`'s body, with its binders bound to `args`, which are written in `scope`.
+fun instantiate(c : Ctx, a : Abstraction, args : Array Type, scope : Option TyEnv) -> Value {
+    var tys = a.tys
+    for var i = 0; i < len(args) && i < len(a.binders); i = i + 1 {
+        tys = Some(TyEnv { key = a.binders[i].id, ty = args[i], scope = scope, next = tys })
+    }
+    eval(c, a.body, a.env, tys)
+}
+
+fun primitive(c : Ctx, p : Prims.Prim, e : Core, args : Array Core, env : Option Env,
+              tys : Option TyEnv) -> Value = match p {
+    Prims.CString -> match args[0].kind {
+        CLit(LString(s)) -> P.stringAddress(c.program.cstrings[s])
+        _ -> oops("Prim.cString of something that is not a literal")
+    }
+    Prims.ArrayNew | Prims.ArrayNewUninit ->
+        P.apply(p, evalAll(c, args, env, tys), elementOf(c, e.ty, tys))
+    _ -> P.apply(p, evalAll(c, args, env, tys), EValue)
+}
+
+fun conNamed(c : Ctx, name : String) -> Con = match Map.get(c.program.cons, name) {
+    Some(con) -> con
+    None -> oops("no constructor '" + name + "'")
+}
+
+-- A constructor applied to `values`. An existential one records the ground
+-- types it packs, found by matching its declared fields against the types
+-- of `args`, the terms they came from.
+fun construct(c : Ctx, name : String, args : Array Core, values : Array Value,
+              tys : Option TyEnv) -> Value {
+    let con = conNamed(c, name)
+    if con.erased { return values[0] }
+    if len(con.exists) == 0 { return VCon(con.tag, values) }
+    if len(args) != len(values) {
+        oops("the existential constructor '" + name + "' used as a function value")
+    }
+    let found = Map.new()
+    for var i = 0; i < len(con.params); i = i + 1 {
+        matchInto(con.params[i], ground(c, args[con.dicts + i].ty, tys), found)
+    }
+    let packed = Array.map(Vec.toArray(con.exists), fun(v) = Map.getOr(found, v.id, Ty.tUnit()))
+    VPacked(con.tag, values, packed)
+}
+
+-- Bind the variables of `pattern` to the parts of `target` they stand for.
+fun matchInto(pattern : Type, target : Type, out : Map Int Type) -> Unit =
+    match (Ty.prune(pattern), Ty.prune(target)) {
+        (TVar(v), t) -> Map.put(out, v.id, t)
+        (TApp(f, a, _), TApp(g, b, _)) -> {
+            matchInto(f, g, out)
+            matchInto(a, b, out)
+        }
+        (TFun(ps, r), TFun(qs, s)) -> {
+            for var i = 0; i < len(ps) && i < len(qs); i = i + 1 { matchInto(ps[i], qs[i], out) }
+            matchInto(r, s, out)
+        }
+        (TTuple(xs), TTuple(ys)) ->
+            for var i = 0; i < len(xs) && i < len(ys); i = i + 1 { matchInto(xs[i], ys[i], out) }
+        _ -> {}
+    }
+
+-- -- matching ---------------------------------------------------------------------
+
+-- The environments an arm's body runs in, if the arm accepts `v`.
+fun matched(c : Ctx, alt : Alt, v : Value, env : Option Env,
+            tys : Option TyEnv) -> Option (Option Env, Option TyEnv) = match alt {
+    AAny(binder) -> Some((bindSome(env, binder, v), tys))
+    ATuple(binders) -> Some((bindAll(env, binders, V.fields(v), 0), tys))
+    ALit(l) -> if sameLiteral(l, v) { Some((env, tys)) } else { None }
+    ACon(name, binders, opening) -> {
+        let con = conNamed(c, name)
+        if con.erased { return Some((bindSome(env, binders[0], v), tys)) }
+        match v {
+            VCon(tag, fs) -> if tag == con.tag {
+                Some((bindAll(env, binders, fs, con.dicts), tys))
+            } else { None }
+            VPacked(tag, fs, packed) -> if tag == con.tag {
+                var inner = env
+                var innerTys = tys
+                if let Some(o) = opening {
+                    for var i = 0; i < len(o.evidence); i = i + 1 {
+                        inner = bind(inner, o.evidence[i], fs[i])
+                    }
+                    for var i = 0; i < len(o.skolems) && i < len(packed); i = i + 1 {
+                        innerTys = Some(TyEnv {
+                            key = 0 - o.skolems[i].uid, ty = packed[i], scope = None,
+                            next = innerTys })
+                    }
+                }
+                Some((bindAll(inner, binders, fs, con.dicts), innerTys))
+            } else { None }
+            _ -> oops("a constructor pattern against a value that is not constructed")
+        }
+    }
+}
+
+fun bindSome(env : Option Env, binder : Option String, v : Value) -> Option Env =
+    match binder {
+        Some(name) -> bind(env, name, v)
+        None -> env
+    }
+
+fun bindAll(env : Option Env, binders : Array (Option String), vs : Array Value,
+            from : Int) -> Option Env {
+    var out = env
+    for var i = 0; i < len(binders); i = i + 1 { out = bindSome(out, binders[i], vs[from + i]) }
+    out
+}
+
+fun sameLiteral(l : Lit, v : Value) -> Bool = match (l, v) {
+    (LInt(n), VInt(m)) -> n == m
+    (LInt(n), VByte(b)) -> n == Byte.toInt(b)
+    (LFloat(x), VFloat(y)) -> x == y
+    (LChar(a), VChar(b)) -> a == b
+    (LString(s), VBytes(_)) -> s == V.text(v)
+    _ -> oops("a literal pattern against a value of another type")
+}
+
+-- -- types ------------------------------------------------------------------------
+
+-- `t` with every variable and opened constant in `tys` replaced by what it
+-- stands for, and its family applications reduced.
+fun ground(c : Ctx, t : Type, tys : Option TyEnv) -> Type =
+    Typed.reduceDeep(substitute(t, tys), c.program.fams)
+
+fun substitute(t : Type, tys : Option TyEnv) -> Type = match Ty.prune(t) {
+    TVar(cell) -> match find(tys, cell.id) {
+        Some(b) -> substitute(b.ty, b.scope)
+        None -> TVar(cell)
+    }
+    TCon(cell) -> if cell.uid == 0 { TCon(cell) } else {
+        match find(tys, 0 - cell.uid) {
+            Some(b) -> substitute(b.ty, b.scope)
+            None -> TCon(cell)
+        }
+    }
+    TApp(fn, arg, k) -> TApp(substitute(fn, tys), substitute(arg, tys), k)
+    TFam(name, arg, k) -> TFam(name, substitute(arg, tys), k)
+    TFun(params, ret) -> TFun(Array.map(params, substitute(_, tys)), substitute(ret, tys))
+    TTuple(elems) -> TTuple(Array.map(elems, substitute(_, tys)))
+    other -> other
+}
+
+fun find(tys : Option TyEnv, key : Int) -> Option TyEnv {
+    var at = tys
+    loop {
+        match at {
+            Some(b) -> {
+                if b.key == key { return Some(b) }
+                at = b.next
+            }
+            None -> return None
+        }
+    }
+}
+
+-- How an array of type `arrayTy` holds its elements: by the layout of its
+-- ground element type, where an enumeration's narrow layout is still a host
+-- array of values.
+fun elementOf(c : Ctx, arrayTy : Type, tys : Option TyEnv) -> Element {
+    var t = ground(c, arrayTy, tys)
+    loop {
+        match Decls.erasedPayload(c.program.decls, t) {
+            Some(payload) -> { t = Ty.prune(payload) }
+            None -> break
+        }
+    }
+    let (_, args) = Ty.spine(t)
+    if len(args) == 0 { oops("an array of type '" + Ty.show(t) + "'") }
+    var element = Ty.prune(args[0])
+    loop {
+        match Decls.erasedPayload(c.program.decls, element) {
+            Some(payload) -> { element = Ty.prune(payload) }
+            None -> break
+        }
+    }
+    let name = headName(element)
+    match Layout.layoutOf(c.program.decls, element, Map.new()) {
+        Some("i64") -> EInt
+        Some("f64") -> EFloat
+        Some("addr") -> EPtr
+        Some("i8") -> if name == "Byte" { EByte } else { EValue }
+        Some("i32") -> if name == "Char" { EChar } else { EValue }
+        Some("i1") -> if name == Prelude.boolType { EBool } else { EValue }
+        Some(_) -> EValue
+        None -> oops("no layout for '" + Ty.show(element) + "'")
+    }
+}
+
+-- -- failing ----------------------------------------------------------------------
+
+fun outOfStack() -> a {
+    let _ = IO.writeText(IO.stderr(), "interpreter out of stack\n")
+    Env.exit(outOfStackStatus)
+}
+
+-- A program the interpreter cannot run, through no fault of the program's.
+fun cannot(what : String) -> a {
+    let _ = IO.writeText(IO.stderr(), "the interpreter cannot " + what + "\n")
+    Env.exit(cannotStatus)
+}
+
+fun oops(message : String) -> a = error("internal error: interpreter: " + message)

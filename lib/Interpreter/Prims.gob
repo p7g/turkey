@@ -1,0 +1,299 @@
+export (Element(..), apply, newArray, arrayOf, numeral, cString, stringAddress)
+
+-- Every machine operation, on interpreted values.
+--
+-- Each one is the `Prim` operation compiled code would run, applied to the
+-- unboxed scalars, so it traps where compiled code traps and with the same
+-- message: `Prim.intAdd` overflowing, `Prim.arrayGet` out of bounds,
+-- `Prim.intDiv` by zero. Writing any of them through a library function
+-- instead would compare the library with itself.
+--
+-- A library module, for `Prim.*`; see `Interpreter.Value`.
+
+import Turkey.Prims (Prim(..))
+import Turkey.Prims as Prims
+import Interpreter.Value (Value(..))
+import Interpreter.Value as V
+
+-- How an array holds its elements, which its element type decides: a host
+-- array of that scalar, or of `Value`.
+type Element = EInt | EByte | EChar | EFloat | EBool | EPtr | EValue
+
+-- `p` applied to `args`. `element` is the element of the array an
+-- allocation makes, and is read by nothing else. `Prim.cString`'s address
+-- and `Prim.castAs`, which need the term rather than the values, are the
+-- evaluator's.
+fun apply(p : Prim, args : Array Value, element : Element) -> Value = match p {
+    Error -> Prim.error(V.text(args[0]))
+    Exit -> Prim.exit(V.int(args[0]))
+    PtrAdd -> VPtr(Prim.ptrAdd(ptr(args[0]), V.int(args[1])))
+    PtrDiff -> VInt(Prim.ptrDiff(ptr(args[0]), ptr(args[1])))
+    PtrNull -> VPtr(Prim.ptrNull())
+    PtrIsNull -> V.bool(Prim.ptrIsNull(ptr(args[0])))
+    PtrEq -> V.bool(Prim.ptrEq(ptr(args[0]), ptr(args[1])))
+    PtrToInt -> VInt(Prim.ptrToInt(ptr(args[0])))
+    PtrFromInt -> VPtr(Prim.ptrFromInt(V.int(args[0])))
+    ElementAddress -> VPtr(elementAddress(args[0], V.int(args[1])))
+    KeepAlive -> {
+        Prim.keepAlive(args[0])
+        VUnit
+    }
+    CString | CodeAddress | SwapStack -> unsupported(p)
+    FrameAddress -> VPtr(Prim.frameAddress())
+    ProcessState -> VPtr(Prim.processState())
+    LoadI1 -> V.bool(Prim.loadI1(ptr(args[0]), V.int(args[1])))
+    LoadI8 -> VByte(Prim.loadI8(ptr(args[0]), V.int(args[1])))
+    LoadI32 -> VChar(Prim.loadI32(ptr(args[0]), V.int(args[1])))
+    LoadI64 -> VInt(Prim.loadI64(ptr(args[0]), V.int(args[1])))
+    LoadF64 -> VFloat(Prim.loadF64(ptr(args[0]), V.int(args[1])))
+    LoadPtr -> VPtr(Prim.loadPtr(ptr(args[0]), V.int(args[1])))
+    StoreI1 -> done(Prim.storeI1(ptr(args[0]), V.int(args[1]), V.isTrue(args[2])))
+    StoreI8 -> done(Prim.storeI8(ptr(args[0]), V.int(args[1]), byte(args[2])))
+    StoreI32 -> done(Prim.storeI32(ptr(args[0]), V.int(args[1]), char(args[2])))
+    StoreI64 -> done(Prim.storeI64(ptr(args[0]), V.int(args[1]), V.int(args[2])))
+    StoreF64 -> done(Prim.storeF64(ptr(args[0]), V.int(args[1]), float(args[2])))
+    StorePtr -> done(Prim.storePtr(ptr(args[0]), V.int(args[1]), ptr(args[2])))
+    CopyBytes -> done(Prim.copyBytes(ptr(args[0]), ptr(args[1]), V.int(args[2])))
+    FillBytes -> done(Prim.fillBytes(ptr(args[0]), V.int(args[1]), V.int(args[2])))
+    AtomicCas -> VInt(Prim.atomicCas(ptr(args[0]), V.int(args[1]), V.int(args[2]),
+                                     V.int(args[3])))
+    AtomicAdd -> VInt(Prim.atomicAdd(ptr(args[0]), V.int(args[1]), V.int(args[2])))
+    AtomicLoad -> VInt(Prim.atomicLoad(ptr(args[0]), V.int(args[1])))
+    AtomicStore -> done(Prim.atomicStore(ptr(args[0]), V.int(args[1]), V.int(args[2])))
+    AtomicNew -> VAtomic(Prim.atomicNew(V.int(args[0])))
+    AtomicGet -> VInt(Prim.atomicGet(atomic(args[0])))
+    AtomicSet -> done(Prim.atomicSet(atomic(args[0]), V.int(args[1])))
+    AtomicAddTo -> VInt(Prim.atomicAddTo(atomic(args[0]), V.int(args[1])))
+    AtomicSwapIf -> VInt(Prim.atomicSwapIf(atomic(args[0]), V.int(args[1]), V.int(args[2])))
+    ArrayNew -> newArray(element, V.int(args[0]), Some(args[1]))
+    ArrayNewUninit -> newArray(element, V.int(args[0]), None)
+    ArrayGet -> arrayGet(args[0], V.int(args[1]))
+    ArraySet -> done(arraySet(args[0], V.int(args[1]), args[2]))
+    ArrayLength -> VInt(arrayLength(args[0]))
+    CastAs -> args[0]
+    ArrayCopy -> done(arrayCopy(args[0], V.int(args[1]), args[2], V.int(args[3]),
+                                V.int(args[4])))
+    ArrayCopyIn -> done(arrayCopyIn(args[0], V.int(args[1]), ptr(args[2]), V.int(args[3])))
+    ArrayFill -> done(arrayFill(args[0], V.int(args[1]), V.int(args[2]), args[3]))
+    CharFromInt -> VChar(Prim.charFromInt(V.int(args[0])))
+    CharIsScalar -> V.bool(Prim.charIsScalar(V.int(args[0])))
+    CharToInt -> VInt(Prim.charToInt(char(args[0])))
+    CharEq -> V.bool(Prim.charEq(char(args[0]), char(args[1])))
+    CharLt -> V.bool(Prim.charLt(char(args[0]), char(args[1])))
+    ByteFromInt -> VByte(Prim.byteFromInt(V.int(args[0])))
+    ByteToInt -> VInt(Prim.byteToInt(byte(args[0])))
+    ByteEq -> V.bool(Prim.byteEq(byte(args[0]), byte(args[1])))
+    ByteLt -> V.bool(Prim.byteLt(byte(args[0]), byte(args[1])))
+    IntAdd -> VInt(Prim.intAdd(V.int(args[0]), V.int(args[1])))
+    IntSub -> VInt(Prim.intSub(V.int(args[0]), V.int(args[1])))
+    IntMul -> VInt(Prim.intMul(V.int(args[0]), V.int(args[1])))
+    IntDiv -> VInt(Prim.intDiv(V.int(args[0]), V.int(args[1])))
+    IntRem -> VInt(Prim.intRem(V.int(args[0]), V.int(args[1])))
+    IntNeg -> VInt(Prim.intNeg(V.int(args[0])))
+    IntAddWrapping -> VInt(Prim.intAddWrapping(V.int(args[0]), V.int(args[1])))
+    IntSubWrapping -> VInt(Prim.intSubWrapping(V.int(args[0]), V.int(args[1])))
+    IntMulWrapping -> VInt(Prim.intMulWrapping(V.int(args[0]), V.int(args[1])))
+    IntNegWrapping -> VInt(Prim.intNegWrapping(V.int(args[0])))
+    IntAnd -> VInt(Prim.intAnd(V.int(args[0]), V.int(args[1])))
+    IntOr -> VInt(Prim.intOr(V.int(args[0]), V.int(args[1])))
+    IntXor -> VInt(Prim.intXor(V.int(args[0]), V.int(args[1])))
+    IntNot -> VInt(Prim.intNot(V.int(args[0])))
+    IntShl -> VInt(Prim.intShl(V.int(args[0]), V.int(args[1])))
+    IntShr -> VInt(Prim.intShr(V.int(args[0]), V.int(args[1])))
+    IntEq -> V.bool(Prim.intEq(V.int(args[0]), V.int(args[1])))
+    IntLt -> V.bool(Prim.intLt(V.int(args[0]), V.int(args[1])))
+    IntToFloat -> VFloat(Prim.intToFloat(V.int(args[0])))
+    FloatAdd -> VFloat(Prim.floatAdd(float(args[0]), float(args[1])))
+    FloatSub -> VFloat(Prim.floatSub(float(args[0]), float(args[1])))
+    FloatMul -> VFloat(Prim.floatMul(float(args[0]), float(args[1])))
+    FloatDiv -> VFloat(Prim.floatDiv(float(args[0]), float(args[1])))
+    FloatNeg -> VFloat(Prim.floatNeg(float(args[0])))
+    FloatTruncate -> VInt(Prim.floatTruncate(float(args[0])))
+    FloatFitsInt -> V.bool(Prim.floatFitsInt(float(args[0])))
+    FloatBits -> VInt(Prim.floatBits(float(args[0])))
+    FloatFromBits -> VFloat(Prim.floatFromBits(V.int(args[0])))
+    FloatIsNaN -> V.bool(Prim.floatIsNaN(float(args[0])))
+    FloatEq -> V.bool(Prim.floatEq(float(args[0]), float(args[1])))
+    FloatLt -> V.bool(Prim.floatLt(float(args[0]), float(args[1])))
+    FloatLte -> V.bool(Prim.floatLte(float(args[0]), float(args[1])))
+    FloatGt -> V.bool(Prim.floatGt(float(args[0]), float(args[1])))
+    FloatGte -> V.bool(Prim.floatGte(float(args[0]), float(args[1])))
+    Not -> V.bool(Prim.not(V.isTrue(args[0])))
+    BoolEq -> V.bool(Prim.boolEq(V.isTrue(args[0]), V.isTrue(args[1])))
+    BoolLt -> V.bool(Prim.boolLt(V.isTrue(args[0]), V.isTrue(args[1])))
+}
+
+fun done(u : Unit) -> Value = VUnit
+
+-- A primitive only the host modules use, which the interpreter never runs.
+fun unsupported(p : Prim) -> a =
+    Prim.error("internal error: " + Prims.name(p) + " cannot be interpreted")
+
+fun ptr(v : Value) -> Prim.Ptr = match v {
+    VPtr(p) -> p
+    _ -> Prim.error("internal error: not a Prim.Ptr")
+}
+
+fun byte(v : Value) -> Byte = match v {
+    VByte(b) -> b
+    _ -> Prim.error("internal error: not a Byte")
+}
+
+fun char(v : Value) -> Char = match v {
+    VChar(c) -> c
+    _ -> Prim.error("internal error: not a Char")
+}
+
+fun float(v : Value) -> Float = match v {
+    VFloat(x) -> x
+    _ -> Prim.error("internal error: not a Float")
+}
+
+fun atomic(v : Value) -> Prim.Atomic = match v {
+    VAtomic(a) -> a
+    _ -> Prim.error("internal error: not a Prim.Atomic")
+}
+
+fun wrongArray() -> a = Prim.error("internal error: not an array")
+
+-- -- arrays -------------------------------------------------------------------------
+
+-- An array of `n` elements, each `fill`, or each as an uninitialized slot
+-- holds it: the zero of a scalar, and unit in a slot nothing has written.
+fun newArray(element : Element, n : Int, fill : Option Value) -> Value = match element {
+    EInt -> VInts(match fill {
+        Some(x) -> Prim.arrayNew(n, V.int(x))
+        None -> Prim.arrayNewUninit(n)
+    })
+    EByte -> VBytes(match fill {
+        Some(x) -> Prim.arrayNew(n, byte(x))
+        None -> Prim.arrayNewUninit(n)
+    })
+    EChar -> VChars(match fill {
+        Some(x) -> Prim.arrayNew(n, char(x))
+        None -> Prim.arrayNewUninit(n)
+    })
+    EFloat -> VFloats(match fill {
+        Some(x) -> Prim.arrayNew(n, float(x))
+        None -> Prim.arrayNewUninit(n)
+    })
+    EBool -> VBools(match fill {
+        Some(x) -> Prim.arrayNew(n, V.isTrue(x))
+        None -> Prim.arrayNewUninit(n)
+    })
+    EPtr -> VPtrs(match fill {
+        Some(x) -> Prim.arrayNew(n, ptr(x))
+        None -> Prim.arrayNewUninit(n)
+    })
+    EValue -> VValues(Prim.arrayNew(n, match fill {
+        Some(x) -> x
+        None -> VUnit
+    }))
+}
+
+-- The array literal `elems`.
+fun arrayOf(element : Element, elems : Array Value) -> Value {
+    let out = newArray(element, len(elems), None)
+    for var i = 0; i < len(elems); i = i + 1 { arraySet(out, i, elems[i]) }
+    out
+}
+
+fun arrayGet(a : Value, i : Int) -> Value = match a {
+    VInts(xs) -> VInt(Prim.arrayGet(xs, i))
+    VBytes(xs) -> VByte(Prim.arrayGet(xs, i))
+    VChars(xs) -> VChar(Prim.arrayGet(xs, i))
+    VFloats(xs) -> VFloat(Prim.arrayGet(xs, i))
+    VBools(xs) -> V.bool(Prim.arrayGet(xs, i))
+    VPtrs(xs) -> VPtr(Prim.arrayGet(xs, i))
+    VValues(xs) -> Prim.arrayGet(xs, i)
+    _ -> wrongArray()
+}
+
+fun arraySet(a : Value, i : Int, x : Value) -> Unit = match a {
+    VInts(xs) -> Prim.arraySet(xs, i, V.int(x))
+    VBytes(xs) -> Prim.arraySet(xs, i, byte(x))
+    VChars(xs) -> Prim.arraySet(xs, i, char(x))
+    VFloats(xs) -> Prim.arraySet(xs, i, float(x))
+    VBools(xs) -> Prim.arraySet(xs, i, V.isTrue(x))
+    VPtrs(xs) -> Prim.arraySet(xs, i, ptr(x))
+    VValues(xs) -> Prim.arraySet(xs, i, x)
+    _ -> wrongArray()
+}
+
+fun arrayLength(a : Value) -> Int = match a {
+    VInts(xs) -> Prim.arrayLength(xs)
+    VBytes(xs) -> Prim.arrayLength(xs)
+    VChars(xs) -> Prim.arrayLength(xs)
+    VFloats(xs) -> Prim.arrayLength(xs)
+    VBools(xs) -> Prim.arrayLength(xs)
+    VPtrs(xs) -> Prim.arrayLength(xs)
+    VValues(xs) -> Prim.arrayLength(xs)
+    _ -> wrongArray()
+}
+
+fun elementAddress(a : Value, i : Int) -> Prim.Ptr = match a {
+    VInts(xs) -> Prim.elementAddress(xs, i)
+    VBytes(xs) -> Prim.elementAddress(xs, i)
+    VChars(xs) -> Prim.elementAddress(xs, i)
+    VFloats(xs) -> Prim.elementAddress(xs, i)
+    VBools(xs) -> Prim.elementAddress(xs, i)
+    VPtrs(xs) -> Prim.elementAddress(xs, i)
+    VValues(xs) -> Prim.elementAddress(xs, i)
+    _ -> wrongArray()
+}
+
+-- Both arrays have one element type, so they are held alike.
+fun arrayCopy(target : Value, at : Int, source : Value, from : Int, count : Int) -> Unit =
+    match (target, source) {
+        (VInts(t), VInts(s)) -> Prim.arrayCopy(t, at, s, from, count)
+        (VBytes(t), VBytes(s)) -> Prim.arrayCopy(t, at, s, from, count)
+        (VChars(t), VChars(s)) -> Prim.arrayCopy(t, at, s, from, count)
+        (VFloats(t), VFloats(s)) -> Prim.arrayCopy(t, at, s, from, count)
+        (VBools(t), VBools(s)) -> Prim.arrayCopy(t, at, s, from, count)
+        (VPtrs(t), VPtrs(s)) -> Prim.arrayCopy(t, at, s, from, count)
+        (VValues(t), VValues(s)) -> Prim.arrayCopy(t, at, s, from, count)
+        _ -> wrongArray()
+    }
+
+fun arrayCopyIn(target : Value, at : Int, source : Prim.Ptr, count : Int) -> Unit =
+    match target {
+        VInts(t) -> Prim.arrayCopyIn(t, at, source, count)
+        VBytes(t) -> Prim.arrayCopyIn(t, at, source, count)
+        VChars(t) -> Prim.arrayCopyIn(t, at, source, count)
+        VFloats(t) -> Prim.arrayCopyIn(t, at, source, count)
+        VBools(t) -> Prim.arrayCopyIn(t, at, source, count)
+        VPtrs(t) -> Prim.arrayCopyIn(t, at, source, count)
+        _ -> Prim.error("internal error: Prim.arrayCopyIn into an array of values")
+    }
+
+fun arrayFill(target : Value, at : Int, count : Int, x : Value) -> Unit = match target {
+    VInts(t) -> Prim.arrayFill(t, at, count, V.int(x))
+    VBytes(t) -> Prim.arrayFill(t, at, count, byte(x))
+    VChars(t) -> Prim.arrayFill(t, at, count, char(x))
+    VFloats(t) -> Prim.arrayFill(t, at, count, float(x))
+    VBools(t) -> Prim.arrayFill(t, at, count, V.isTrue(x))
+    VPtrs(t) -> Prim.arrayFill(t, at, count, ptr(x))
+    VValues(t) -> Prim.arrayFill(t, at, count, x)
+    _ -> wrongArray()
+}
+
+-- The address of a NUL-terminated copy of `s`'s bytes, for `Prim.cString`.
+-- The copy is `held`, which the caller keeps for as long as the program
+-- runs: a `cString` is read-only data in compiled code, and lives as long.
+fun stringAddress(held : Value) -> Value = VPtr(elementAddress(held, 0))
+
+-- An integer literal of the type named `ty`.
+fun numeral(n : Int, ty : String) -> Value = match ty {
+    "Byte" -> VByte(Prim.byteFromInt(n))
+    "Float" -> VFloat(Prim.intToFloat(n))
+    _ -> VInt(n)
+}
+
+-- `s`'s bytes and a NUL, as `Prim.cString` lays a literal out.
+fun cString(s : String) -> Value {
+    let bytes : Prim.Array Byte = Prim.castAs(s)
+    let n = Prim.arrayLength(bytes)
+    let out = Prim.arrayNew(n + 1, Prim.byteFromInt(0))
+    Prim.arrayCopy(out, 0, bytes, 0, n)
+    VBytes(out)
+}

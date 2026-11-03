@@ -4,6 +4,12 @@
 -- Two commands. `check` compiles as far as the last stage that can reject a
 -- program, and writes nothing. `build` compiles all the way and writes the
 -- result to `-o`, in the format its extension names or `-f` overrides.
+--
+-- And two for the interpreter (`Turkey.Interpret`). `interpret FILE ARGS...`
+-- runs a program without compiling it, on Core from the stage `--after` names
+-- (`core` by default). `boundary HOST` prints the table of compiled bindings
+-- the interpreter calls, generated from the library, given the entry of the
+-- program the interpreter is part of, which is this one (`Turkey.Hosted`).
 -- Either takes `--dump STAGE,...` to print what a stage produced, which is how
 -- a pass is read while it is being written: `check` goes on as far as the
 -- latest stage asked for and no further, and `build` prints them on its way.
@@ -74,6 +80,8 @@ import Turkey.Clean as Clean
 import Turkey.Bounds as Bounds
 import Turkey.Sites as Sites
 import Turkey.Uncurry as Uncurry
+import Turkey.Interpret as Interpret
+import Turkey.Hosted as Hosted
 import Turkey.Opt as Opt
 import Turkey.Build as Build
 import Turkey.Target as Target
@@ -142,9 +150,11 @@ fun main() {
     let building = match Args.next(p) {
         Right(Some(Value("check"))) -> False
         Right(Some(Value("build"))) -> True
+        Right(Some(Value("interpret"))) -> return interpret()
+        Right(Some(Value("boundary"))) -> return boundary(p)
         Right(Some(Value(other))) -> die("unknown command '" + other
-                                         + "'; the commands are 'check' and "
-                                         + "'build'")
+                                         + "'; the commands are 'check', 'build', "
+                                         + "'interpret' and 'boundary'")
         _ -> usage()
     }
     var output = None
@@ -388,9 +398,15 @@ fun loadResolved(path : String) -> Vec Modules.Module {
 -- at a time, and the entry among them. The entry is in the last component to
 -- finish loading, since a component finishes after everything it imports, but
 -- saying so here beats relying on it at every call site.
-fun loadProgram(path : String) -> (Vec (Vec Modules.Module), Modules.Module) {
-    let loader = Modules.newLoader([directoryOf(path), libRoot()])
-    let entry = Modules.loadEntry(loader, readOrDie(path), "Main")
+fun loadProgram(path : String) -> (Vec (Vec Modules.Module), Modules.Module) =
+    loadFrom([directoryOf(path), libRoot()], readOrDie(path))
+
+-- The same for an entry `source`, with the modules it imports found in
+-- `roots`, in order.
+fun loadFrom(roots : Array String,
+             source : Source) -> (Vec (Vec Modules.Module), Modules.Module) {
+    let loader = Modules.newLoader(roots)
+    let entry = Modules.loadEntry(loader, source, "Main")
     let operators = Resolve.operators(loader.order, Resolve.arities(loader.order))
     for m in loader.order {
         Resolve.program(m.scope, m.program, operators)
@@ -509,13 +525,21 @@ fun dumpMono(b : String.Builder, checked : Checked, entry : Modules.Module,
 -- compile both run this one function, so they cannot come to disagree about
 -- the pass order.
 fun optimize(checked : Checked, main : String, specialized : Core.CProgram)
-        -> Core.CProgram {
+        -> Core.CProgram = optimizeTo(checked, main, specialized, "opt")
+
+-- The same, stopping after the step `stop` names: `reduce`, after the first
+-- reduction; `joins`, after join discovery; or `opt`, the whole of it. What
+-- the interpreter runs a stage of a program from.
+fun optimizeTo(checked : Checked, main : String, specialized : Core.CProgram,
+               stop : String) -> Core.CProgram {
     -- Each step's time, for `--timings`, under `opt.`.
     var at = Stopwatch.start()
     let first = Opt.reduceProgram(specialized, checked.decls)
     at = lap("opt.reduce", at)
+    if stop == "reduce" { return first }
     let discovered = Joins.discover(first)
     at = lap("opt.joins", at)
+    if stop == "joins" { return discovered }
     let second = Opt.reduceProgram(discovered, checked.decls)
     at = lap("opt.reduce", at)
     -- Reachability again, now that the reductions have inlined calls away and
@@ -1249,8 +1273,15 @@ type Checked = Checked {
 }
 
 fun checkProgram(path : String) -> (Checked, Modules.Module) {
+    let (checked, entry, _) = checkLoaded(loadProgram(path))
+    (checked, entry)
+}
+
+-- The front end over modules already loaded, with every module of them.
+fun checkLoaded(loaded : (Vec (Vec Modules.Module), Modules.Module))
+        -> (Checked, Modules.Module, Vec Modules.Module) {
     Solved.resetDictNames()
-    let (groups, entry) = loadProgram(path)
+    let (groups, entry) = loaded
     let checked = Checked {
         decls = Decls.newDeclTable(), classes = Classes.newClassTable(
             Decls.newDeclTable()),
@@ -1294,7 +1325,9 @@ fun checkProgram(path : String) -> (Checked, Modules.Module) {
         for w in g.warnings { Vec.push(checked.warnings, w) }
     }
     checkMain(entry, checked.env, checked.classes)
-    (checked, entry)
+    let all = []
+    for group in groups { for m in group { Vec.push(all, m) } }
+    (checked, entry, all)
 }
 
 -- The value constructors a module's scope can name, ambiguous ones included.
@@ -1444,9 +1477,134 @@ fun readOrDie(path : String) -> Source = match File.readText(path) {
     Left(Right(e)) -> die(message(e))
 }
 
+-- -- the interpreter ----------------------------------------------------------------
+
+-- The stages `interpret --after` can run a program from, in pipeline order.
+let interpretedStages = ["core", "mono", "reduce", "joins", "opt"]
+
+-- `interpret [--after STAGE] FILE ARGS...`: check the program, lower it as
+-- far as the stage, and interpret it with `ARGS` as its arguments.
+--
+-- Read straight from the arguments rather than through `Args`, because how
+-- many of them are the interpreter's is what the program must not see.
+fun interpret() -> Unit {
+    let args = Env.args()
+    var i = 1
+    var after = "core"
+    while i < len(args) && String.startsWith(args[i], "--") {
+        if args[i] != "--after" || i + 1 >= len(args) {
+            die("'interpret' takes '--after STAGE' and then a file")
+        }
+        after = args[i + 1]
+        if !Array.contains(interpretedStages, after) {
+            die("cannot interpret after '" + after + "'; the stages are "
+                + String.join(interpretedStages, ", "))
+        }
+        i = i + 2
+    }
+    if i >= len(args) { usage() }
+    let path = args[i]
+    Diag.compiling(path)
+    let (checked, entry) = checkProgram(path)
+    reportWarnings(checked, path)
+    let main = Map.getOr(entry.scope.values, "main", "main")
+    let program = staged(checked, main, lowered(checked), after)
+    Interpret.run(Interpret.prepare(program, checked.decls, checked.classes, i + 1), main)
+}
+
+-- `program`, carried on through the pipeline to the end of `after`.
+fun staged(checked : Checked, main : String, program : Core.CProgram,
+           after : String) -> Core.CProgram {
+    if after == "core" { return program }
+    let specialized = Mono.monomorphize(program, checked.decls, checked.classes, main,
+                                        roots(checked))
+    if after == "mono" { return specialized }
+    optimizeTo(checked, main, specialized, after)
+}
+
+-- `boundary HOST`: the generated table `lib/Interpreter/Boundary.gob`, from
+-- every module of the library, for the interpreter whose program's entry is
+-- `HOST`. Exits 1, saying why, if the library cannot have one.
+fun boundary(p : Args.Parser) -> Unit {
+    let host = match Args.next(p) {
+        Right(Some(Value(path))) -> path
+        _ -> usage()
+    }
+    let reaches = reachedFromMain(host)
+    let source = Source { name = "<library>", text = libraryEntry() }
+    let (checked, _, modules) = checkLoaded(loadFrom([libRoot()], source))
+    match Hosted.generate(lowered(checked), checked.decls, modules, reaches) {
+        Right(text) -> write(text)
+        Left(problems) -> {
+            for problem in problems { toStderr("boot: boundary: " + problem + "\n") }
+            Env.exit(1)
+        }
+    }
+}
+
+-- A program importing every module of the library a program may import:
+-- what the interpreter can be asked to run.
+fun libraryEntry() -> String {
+    let b = String.builder()
+    for name in libraryModules(libRoot(), "") {
+        if !String.startsWith(name, "Turkey.") && !String.startsWith(name, "Interpreter.") {
+            String.push(b, "import " + name + " ()\n")
+        }
+    }
+    String.push(b, "fun main() {}\n")
+    String.build(b)
+}
+
+fun libraryModules(directory : String, prefix : String) -> Vec String {
+    let out = []
+    let names = match File.listPath(directory) {
+        Right(found) -> Array.sort(found)
+        Left(e) -> die(message(e))
+    }
+    for name in names {
+        let path = directory + "/" + name
+        let isDirectory = match File.metadata(path) {
+            Right(stat) -> stat.kind == File.Directory
+            Left(_) -> False
+        }
+        if isDirectory {
+            for inner in libraryModules(path, prefix + name + ".") { Vec.push(out, inner) }
+        } else if let Some(stem) = String.stripSuffix(name, ".gob") {
+            Vec.push(out, prefix + stem)
+        }
+    }
+    out
+}
+
+-- Every top-level name the program at `path` reaches from its `main`.
+fun reachedFromMain(path : String) -> Set.Set String {
+    let (checked, entry) = checkProgram(path)
+    let program = lowered(checked)
+    let byName = Map.new()
+    for group in [program.dicts, program.binds] {
+        for b in group { Map.put(byName, b.name, b) }
+    }
+    let seen = Set.new()
+    let todo = [Map.getOr(entry.scope.values, "main", "main")]
+    while len(todo) > 0 {
+        match Vec.pop(todo) {
+            Some(name) -> if !Set.contains(seen, name) {
+                Set.add(seen, name)
+                if let Some(b) = Map.get(byName, name) {
+                    for n in Set.elements(Core.namesOf(b.value)) { Vec.push(todo, n) }
+                }
+            }
+            None -> {}
+        }
+    }
+    seen
+}
+
 fun usage() -> a =
     die("usage: boot check [OPTIONS] FILE...\n"
         + "       boot build [OPTIONS] [-o PATH] [-f exe|obj|asm] FILE...\n"
+        + "       boot interpret [--after STAGE] FILE ARGS...\n"
+        + "       boot boundary HOST\n"
         + "options: --target TARGET  --dump STAGE,...  --timings  --gc-verify"
         + "  --gc-stats  --export-runtime\n"
         + "stages: " + String.join(stages, ", "))

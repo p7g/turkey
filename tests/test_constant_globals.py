@@ -11,9 +11,8 @@ from __future__ import annotations
 import re
 
 from tests import lang
-from tests.test_programs import PROGRAMS_DIR
 
-POLYREC = PROGRAMS_DIR / "constant_globals_polyrec.gob"
+POLYREC = lang.CORPUS / "constant_globals_polyrec.gob"
 
 
 def _bindings(dump: str) -> dict[str, str]:

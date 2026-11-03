@@ -6,9 +6,9 @@ a register spelled for the wrong file -- and accepts a parallel copy that loses
 half its values, since that is well-formed assembly. Everything the allocator,
 the frame layout and the emitter actually decide is invisible to it.
 
-Whether each corpus program prints what it should is `test_programs`' check:
-every program there is compiled by this backend and diffed against its
-`.expected`. What is left here is what that cannot see -- the module's shape,
+Whether each corpus program prints what it should is the harness's check
+(`scripts/test.sh`): every program there is compiled by this backend and
+diffed against its `.expected`. What is left here is what that cannot see -- the module's shape,
 the frame table, and the same programs run collecting at every allocation,
 which must print exactly what they print without it.
 """
@@ -121,7 +121,7 @@ def test_the_corpus_agrees_under_gc_stress(name, generational):
     reachable. Compiled with the heap verifier, which checks every collection.
     """
     env = dict(os.environ, TURKEY_GC_STRESS="1", TURKEY_GC_GENERATIONAL=generational)
-    # From the program's own directory, as `test_programs` runs it: a program
+    # From the program's own directory, as the harness runs it: a program
     # may read a file by its bare name (`system.gob`).
     result = subprocess.run(toolchain.command(_binary(name, ("--gc-verify",))),
                             cwd=PROGRAMS,

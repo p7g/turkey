@@ -1,0 +1,147 @@
+-- The test harness: finds the cases, runs them against `boot`, and reports.
+-- `scripts/test.sh` builds it and runs it with `--root`, `--boot` and
+-- `--cache` filled in; everything after those is the user's:
+--
+--   -j N               cases in flight at once (default: one per worker,
+--                      which is one per core)
+--   -v                 list the passes too, with their times
+--   --shard I/N        run only shard I of N, counting from 1
+--   --timeout-scale F  multiply every time limit by F
+--   --selftest         run the harness's own cases instead of the corpus
+--   PATH[::CASE]       run only the cases whose path starts with PATH, and
+--                      whose case name contains CASE
+--
+-- The exit status is 0 when no case failed the run, 1 when one did, and 2
+-- when the harness could not run at all.
+
+import System.Args as Args
+import System.Args (Arg(..))
+import System.Env as Env
+import System.Parallel as Parallel
+import Time.Duration as Duration
+import Time.Stopwatch as Stopwatch
+import Case (Case(..), Result(..))
+import Cache as Cache
+import Execute as Execute
+import Programs as Programs
+import Report as Report
+import Schedule as Schedule
+import Selftest as Selftest
+import Toolchain as Toolchain
+
+type Options = Options {
+    var root : String,
+    var boot : String,
+    var cache : String,
+    var jobs : Int,
+    var verbose : Bool,
+    var shard : Option (Int, Int),
+    var scale : Float,
+    var selftest : Bool,
+    selections : Vec String,
+}
+
+fun main() {
+    -- Read on the main stack, before any task starts: the arguments are not
+    -- available to a task running on another worker.
+    let o = options(Env.args())
+    let watch = Stopwatch.start()
+    let t = Toolchain.detect(o.root, o.boot, o.scale)
+    Cache.evict(o.cache)
+    let cache = match Cache.open(o.cache, t) {
+        Right(c) -> c
+        Left(e) -> die("cannot read what the cache key is made of: " + Error.describe(e))
+    }
+    let found = if o.selftest { Selftest.cases(o.root, o.cache) }
+                else { Programs.discover(o.root + "/tests/programs", "tests/programs") }
+    let selected = Array.filter(found, \chosen(o, _.name))
+    let timingsFile = o.cache + "/timings"
+    let timings = Schedule.readTimings(timingsFile)
+    let cases = Schedule.ordered(selected, timings)
+    let actual = o.cache + "/actual"
+    let results = Schedule.runAll(cases, o.jobs, Execute.execute(t, cache, actual, _))
+    let ran = Array.init(len(cases), \(cases[_], results[_]))
+    Schedule.writeTimings(timingsFile, timings, ran)
+    -- Reported in name order, whatever order they ran in.
+    let byName = Array.sortBy(ran, fun((a, _), (b, _)) = Array.threeWay(a.name, b.name))
+    let millis = Duration.toNanos(Stopwatch.elapsed(watch)) / 1000000
+    let reported = Report.report(byName, o.verbose, actual, millis)
+    let ok = if o.selftest { Selftest.check(byName) } else { reported }
+    Env.exit(if ok { 0 } else { 1 })
+}
+
+-- Whether the case `name` is in the shard and the selection.
+fun chosen(o : Options, name : String) -> Bool {
+    if let Some((index, count)) = o.shard {
+        if !Schedule.inShard(name, index, count) { return False }
+    }
+    if len(o.selections) == 0 { return True }
+    let (path, part) = selector(name)
+    for s in o.selections {
+        let (wantPath, wantPart) = selector(s)
+        let wantPath = Option.unwrapOr(String.stripPrefix(wantPath, "./"), wantPath)
+        if String.startsWith(path, wantPath) && String.contains(part, wantPart) { return True }
+    }
+    False
+}
+
+-- `PATH::CASE` as its two parts, and a bare `PATH` as one with no `CASE`.
+fun selector(s : String) -> (String, String) = Option.unwrapOr(String.splitOnce(s, "::"), (s, ""))
+
+fun options(args : Array String) -> Options {
+    let o = Options {
+        root = ".", boot = "boot", cache = "", jobs = Parallel.workers(), verbose = False,
+        shard = None, scale = 1.0, selftest = False, selections = [],
+    }
+    let p = Args.parser(args)
+    loop {
+        match Args.next(p) {
+            Left(message) -> die(message)
+            Right(None) -> break
+            Right(Some(arg)) -> match arg {
+                Long("root") -> { o.root = valueOf(p) }
+                Long("boot") -> { o.boot = valueOf(p) }
+                Long("cache") -> { o.cache = valueOf(p) }
+                Short('j') -> { o.jobs = positive("-j", valueOf(p)) }
+                Short('v') -> { o.verbose = True }
+                Long("shard") -> { o.shard = Some(shard(valueOf(p))) }
+                Long("timeout-scale") -> {
+                    let v = valueOf(p)
+                    o.scale = match Float.parse(v) {
+                        Some(f) -> if f > 0.0 { f } else { die("--timeout-scale must be positive") }
+                        None -> die("--timeout-scale takes a number, not '" + v + "'")
+                    }
+                }
+                Long("selftest") -> { o.selftest = True }
+                Value(path) -> Vec.push(o.selections, path)
+                _ -> die(Args.unexpected(arg))
+            }
+        }
+    }
+    if String.isEmpty(o.cache) { die("--cache is required; run the harness by scripts/test.sh") }
+    o
+}
+
+fun valueOf(p : Args.Parser) -> String = match Args.value(p) {
+    Left(message) -> die(message)
+    Right(v) -> v
+}
+
+fun positive(flag : String, v : String) -> Int = match Int.parse(v) {
+    Some(n) -> if n > 0 { n } else { die(flag + " must be positive") }
+    None -> die(flag + " takes a number, not '" + v + "'")
+}
+
+fun shard(v : String) -> (Int, Int) {
+    let (index, count) = match String.splitOnce(v, "/") {
+        Some((i, n)) -> (positive("--shard", i), positive("--shard", n))
+        None -> die("--shard takes I/N, not '" + v + "'")
+    }
+    if index > count { die("--shard " + v + ": there is no shard " + Int.toString(index)) }
+    (index, count)
+}
+
+fun die(message : String) -> a {
+    print("harness: " + message)
+    Env.exit(2)
+}

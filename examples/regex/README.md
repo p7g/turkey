@@ -132,7 +132,7 @@ From the repository root:
 .venv/bin/python -m turkey run --backend python examples/regex/main.gob
 .venv/bin/python -m turkey run --backend llvm examples/regex/main.gob
 .venv/bin/python -m pytest tests/test_regex.py -q
-.venv/bin/python -m pytest tests/test_programs.py tests/test_llvmgen.py -k regex_library -q
+sh scripts/test.sh tests/programs/regex_library
 ```
 
 The conformance program in `tests/programs/regex_library.gob` covers construction

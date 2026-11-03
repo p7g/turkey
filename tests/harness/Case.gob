@@ -1,0 +1,195 @@
+module Case (
+    Case(..), Expected(..), Requirement(..), Outcome(..), Result(..),
+    directives, requirementName, outcomeName, failsRun, passed,
+)
+
+-- What a test is, whatever source it came from, and what can become of it.
+--
+-- Every source of cases is a function from a path to an `Array Case`, and the
+-- runner sees nothing else. A case that cannot be run as written -- an
+-- unknown directive, a missing golden -- is still a case, carrying its
+-- `problem`, so that it is reported as a harness error in its place rather
+-- than dropped.
+
+-- How a case must end. Without a directive saying otherwise, a program
+-- compiles, runs and exits 0.
+type Expected = Exits(Int) | Panics | Rejected
+
+-- What a case may need of the machine: a C compiler, an assembler, or one
+-- system.
+type Requirement = Cc | As | Darwin | Linux
+
+fun requirementName(r : Requirement) -> String = match r {
+    Cc -> "cc"
+    As -> "as"
+    Darwin -> "darwin"
+    Linux -> "linux"
+}
+
+fun requirement(name : String) -> Option Requirement = match name {
+    "cc" -> Some(Cc)
+    "as" -> Some(As)
+    "darwin" -> Some(Darwin)
+    "linux" -> Some(Linux)
+    _ -> None
+}
+
+type Case = Case {
+    -- What the report and a selection call it: the path from the repository
+    -- root to the case's file or directory.
+    name : String,
+    -- Where `boot` and the compiled program run, so that diagnostics name the
+    -- bare file.
+    directory : String,
+    -- The entry module, relative to `directory`.
+    entry : String,
+    -- Every file the compile reads besides the library, relative to
+    -- `directory`: the cache key is made of these.
+    sources : Array String,
+    -- The `.expected` golden: stdout, then stderr.
+    golden : String,
+    -- Dump goldens, as (stage, path): `boot check --dump STAGE` must print
+    -- exactly that file and exit 0.
+    dumps : Array (String, String),
+    expected : Expected,
+    -- How long the compiled program may run, in seconds, before `--timeout-scale`.
+    timeout : Option Int,
+    -- The case is skipped unless each holds.
+    requires : Array Requirement,
+    -- The reason the case is expected to fail its comparison.
+    xfail : Option String,
+    problem : Option String,
+}
+
+-- Every outcome is reported distinctly. `CompilerCrash` is `boot` dying by a
+-- signal or panicking, which is never a diagnostic a case can expect;
+-- `ProgramCrash` is the compiled program dying by a signal. A panic is an
+-- exit, not a crash: whether it was wanted is the directive's to say.
+type Outcome = Pass | Fail | CompilerCrash | ProgramCrash | Timeout | Skip | XFail | XPass
+             | HarnessError
+
+-- No wildcard arm, so a new constructor without a rank fails to compile rather
+-- than comparing equal to the wrong outcome.
+fun rank(o : Outcome) -> Int = match o {
+    Pass -> 0
+    Fail -> 1
+    CompilerCrash -> 2
+    ProgramCrash -> 3
+    Timeout -> 4
+    Skip -> 5
+    XFail -> 6
+    XPass -> 7
+    HarnessError -> 8
+}
+
+instance Eq Outcome { fun eq(a, b) = rank(a) == rank(b) }
+
+-- What became of one case: `why` in a few words, `diff` the unified diff of
+-- expected against actual (empty when there is none to show), and how long it
+-- took.
+type Result = Result { outcome : Outcome, why : String, diff : String, millis : Int }
+
+fun outcomeName(o : Outcome) -> String = match o {
+    Pass -> "pass"
+    Fail -> "fail"
+    CompilerCrash -> "compiler crash"
+    ProgramCrash -> "program crash"
+    Timeout -> "timeout"
+    Skip -> "skip"
+    XFail -> "xfail"
+    XPass -> "xpass"
+    HarnessError -> "harness error"
+}
+
+-- Whether the outcome makes the run fail. A skip and an expected failure do
+-- not; an unexpected pass does, since the `xfail` it contradicts is stale.
+fun failsRun(o : Outcome) -> Bool = match o {
+    Pass | Skip | XFail -> False
+    _ -> True
+}
+
+fun passed(o : Outcome) -> Bool = match o {
+    Pass -> True
+    _ -> False
+}
+
+-- -- directives -----------------------------------------------------------------------
+
+-- What a case's `--@` lines say, applied to `base`. A directive is a line
+-- that starts `--@`, then a name, then `: value` if it takes one; to Turkey
+-- it is a comment. The set is closed: a name not listed here, a value that
+-- does not parse, or two outcome directives make the case a harness error
+-- rather than being ignored, since a misspelt directive that did nothing
+-- would leave a case checking less than it says.
+--
+-- Directives are read wherever they are in the file, not only above the
+-- first declaration.
+fun directives(base : Case, text : String) -> Case {
+    var expected = None
+    var timeout = None
+    let requires = []
+    var xfail = None
+    var problem = None
+    for line in String.lines(text) {
+        let rest = match String.stripPrefix(line, "--@") {
+            Some(r) -> String.trim(r)
+            None -> continue
+        }
+        let (name, value) = match String.splitOnce(rest, ":") {
+            Some((n, v)) -> (String.trim(n), Some(String.trim(v)))
+            None -> (rest, None)
+        }
+        match directive(name, value) {
+            Left(why) -> { if Option.isNone(problem) { problem = Some(why) } }
+            Right(Ends(e)) -> {
+                if Option.isSome(expected) && Option.isNone(problem) {
+                    problem = Some("more than one of 'exit', 'panic' and 'error'")
+                }
+                expected = Some(e)
+            }
+            Right(TimesOut(n)) -> { timeout = Some(n) }
+            Right(Requires(r)) -> Vec.push(requires, r)
+            Right(Fails(reason)) -> { xfail = Some(reason) }
+        }
+    }
+    Case {
+        name = base.name,
+        directory = base.directory,
+        entry = base.entry,
+        sources = base.sources,
+        golden = base.golden,
+        dumps = base.dumps,
+        expected = Option.unwrapOr(expected, Exits(0)),
+        timeout = timeout,
+        requires = Vec.toArray(requires),
+        xfail = xfail,
+        problem = if Option.isSome(problem) { problem } else { base.problem },
+    }
+}
+
+-- One `--@` line.
+type Directive = Ends(Expected) | TimesOut(Int) | Requires(Requirement) | Fails(String)
+
+fun directive(name : String, value : Option String) -> Either String Directive = match (name, value) {
+    ("exit", Some(v)) -> match Int.parse(v) {
+        Some(n) -> Right(Ends(Exits(n)))
+        None -> Left("'exit' takes a number, not '" + v + "'")
+    }
+    ("panic", None) -> Right(Ends(Panics))
+    ("error", None) -> Right(Ends(Rejected))
+    ("timeout", Some(v)) -> {
+        let n = Option.unwrapOr(Int.parse(v), 0)
+        if n > 0 { Right(TimesOut(n)) }
+        else { Left("'timeout' takes a whole number of seconds, not '" + v + "'") }
+    }
+    ("requires", Some(v)) -> match requirement(v) {
+        Some(r) -> Right(Requires(r))
+        None -> Left("'requires' takes cc, as, darwin or linux, not '" + v + "'")
+    }
+    ("xfail", Some("")) -> Left("'xfail' needs a reason")
+    ("xfail", Some(v)) -> Right(Fails(v))
+    ("exit", None) | ("timeout", None) | ("requires", None) | ("xfail", None) ->
+        Left("'" + name + "' needs a value")
+    ("panic", Some(_)) | ("error", Some(_)) -> Left("'" + name + "' takes no value")
+    _ -> Left("unknown directive '" + name + "'")
+}

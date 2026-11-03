@@ -1,0 +1,117 @@
+module Toolchain (Toolchain(..), detect, words, command, linkCommand, limit, satisfies, text)
+
+-- The programs a case is run with -- `boot`, the C compiler that links what it
+-- emits, and the prefix that runs what was linked -- and how each is started.
+--
+-- `$TURKEY_CC` is the C compiler and linker, `cc` when unset; `$TURKEY_RUN` is
+-- a prefix for running anything it linked (`qemu-aarch64-static`), empty
+-- when unset. `scripts/build.sh` reads the same two. Both are split into words
+-- at spaces, with no quoting.
+
+import Process (Command, Output(..), Status(..))
+import Process as Process
+import System.Env as Env
+import Time.Duration (Duration)
+import Time.Duration as Duration
+import Case (Requirement(..))
+
+type Toolchain = Toolchain {
+    root : String,
+    lib : String,
+    boot : String,
+    cc : Array String,
+    run : Array String,
+    -- What a link against the runtime needs after its objects: glibc keeps
+    -- the maths library out of libc, and the runtime calls `log10`.
+    libraries : Array String,
+    -- `$TURKEY_CC -dumpmachine`, which is also what `boot` emits for.
+    machine : String,
+    -- The C compiler, its `--version`, and the run prefix: part of every
+    -- cache key, since the same source linked by two compilers is two
+    -- different binaries and the cache is shared by every session.
+    identity : String,
+    hasCc : Bool,
+    hasAs : Bool,
+    timeoutScale : Float,
+}
+
+fun words(s : String) -> Array String = Vec.toArray(String.words(s))
+
+fun detect(root : String, boot : String, scale : Float) -> Toolchain {
+    let cc = words(Option.unwrapOr(Env.get("TURKEY_CC"), "cc"))
+    let cc = if len(cc) == 0 { ["cc"] } else { cc }
+    let run = words(Option.unwrapOr(Env.get("TURKEY_RUN"), ""))
+    let machine = String.trim(Option.unwrapOr(answer(cc + ["-dumpmachine"]), ""))
+    let version = answer(cc + ["--version"])
+    Toolchain {
+        root = root,
+        lib = root + "/lib",
+        boot = boot,
+        cc = cc,
+        run = run,
+        libraries = if String.contains(machine, "linux") { ["-lm"] } else { [] },
+        machine = machine,
+        identity = String.join(cc, " ") + "\n" + Option.unwrapOr(version, "") + "\n"
+                   + String.join(run, " ") + "\n",
+        hasCc = Option.isSome(version),
+        hasAs = Option.isSome(answer(["as", "--version"])),
+        timeoutScale = scale,
+    }
+}
+
+-- What `argv` printed, if it ran and exited 0.
+fun answer(argv : Array String) -> Option String =
+    match Process.run(Process.command(argv), Some(Duration.seconds(60))) {
+        Right(Output { stdout, status = Exited(0), .. }) -> String.fromBytes(stdout)
+        _ -> None
+    }
+
+-- `argv` run in `directory` the way every process of a case is: with the
+-- library found through `$TURKEY_LIB`, since `directory` is not the
+-- repository root, and with one worker, since the harness already runs a
+-- process per core and each starting a worker per core would be that squared.
+--
+-- `TURKEY_TEST_INTERNAL_IMPORTS` names the implementation's modules that a
+-- corpus program may import -- raw memory, a C call, a giblet -- which the
+-- compiler refuses outside the library unless named there.
+fun command(t : Toolchain, argv : Array String, directory : String) -> Command {
+    var c = Process.inDirectory(Process.command(argv), directory)
+    c = Process.withEnvironment(c, "TURKEY_LIB", t.lib)
+    c = Process.withEnvironment(c, "TURKEY_WORKERS", "1")
+    Process.withEnvironment(c, "TURKEY_TEST_INTERNAL_IMPORTS", "Turkey.Libc,Turkey.Memory,Turkey.Ptr")
+}
+
+-- The C compiler linking `object` into `binary`.
+fun linkCommand(t : Toolchain, object : String, binary : String, directory : String) -> Command =
+    command(t, t.cc + ["-o", binary, object] + t.libraries, directory)
+
+-- `seconds`, scaled by `--timeout-scale`.
+fun limit(t : Toolchain, seconds : Int) -> Duration {
+    let nanos = Float.fromInt(seconds) * t.timeoutScale * 1000000000.0
+    Duration.nanos(Option.unwrapOr(Float.truncate(nanos), seconds * 1000000000))
+}
+
+-- Whether the requirement `r` holds here.
+fun satisfies(t : Toolchain, r : Requirement) -> Bool = match r {
+    Cc -> t.hasCc
+    As -> t.hasAs
+    Darwin -> String.contains(t.machine, "darwin")
+    Linux -> String.contains(t.machine, "linux")
+}
+
+-- Bytes as text, for comparing against a golden. Output that is not UTF-8
+-- keeps its ASCII and shows every other byte as U+FFFD, the bytes of
+-- well-formed characters included. No golden holds U+FFFD, so such output can
+-- only fail; the diff is lossy, not the verdict.
+fun text(bytes : Array Byte) -> String = match String.fromBytes(bytes) {
+    Some(s) -> s
+    None -> {
+        let b = String.builder()
+        for byte in bytes {
+            let n = Byte.toInt(byte)
+            let ascii = if n < 128 { Char.fromInt(n) } else { None }
+            String.push(b, Option.fold(ascii, "\u{FFFD}", Char.toString))
+        }
+        String.build(b)
+    }
+}

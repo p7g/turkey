@@ -1,0 +1,107 @@
+module Schedule (Timing(..), readTimings, writeTimings, ordered, inShard, runAll)
+
+-- Which cases run, in what order, and how many at once.
+--
+-- **Order.** The timings file in the cache records each case's last duration
+-- and whether it failed. The cases that failed last time run first, so a fix
+-- is confirmed early; then the rest slowest first, so the longest case is not
+-- the one the run waits for at the end; then the cases with no timing yet.
+--
+-- **Shards** are by a hash of the case's name, so they need no timings,
+-- which CI does not keep, and a case stays in its shard as others come and go.
+--
+-- **Running** is `jobs` tasks, each taking the next case until none is left.
+-- A case spends its time waiting for its processes, which holds no worker, so
+-- this is as many cases in flight as `jobs` says whatever the workers.
+
+import Hash.SHA256 as SHA256
+import System.File as File
+import System.Sync as Sync
+import System.Task as Task
+import Case (Case(..), Result(..))
+import Case as Case
+import Files as Files
+
+type Timing = Timing { millis : Int, failed : Bool }
+
+-- The timings file: one line per case, `MILLIS FAILED NAME`, where FAILED is
+-- 0 or 1. A line that does not read so is skipped; this is a hint, not data
+-- anything depends on.
+fun readTimings(path : String) -> Map String Timing {
+    let timings = Map.new()
+    let text = Either.unwrapOr(Files.readText(path), "")
+    for line in String.lines(text) {
+        if let Some((name, timing)) = timingOf(line) { Map.put(timings, name, timing) }
+    }
+    timings
+}
+
+fun timingOf(line : String) -> Option (String, Timing) {
+    let (millis, rest) = String.splitOnce(line, " ")?
+    let (failed, name) = String.splitOnce(rest, " ")?
+    let ms = Int.parse(millis)?
+    Some((name, Timing { millis = ms, failed = failed == "1" }))
+}
+
+-- The timings of this run written over the old ones, which are kept for the
+-- cases this run did not select. Written beside the file and renamed over it,
+-- so a concurrent session reads the old file or the new one.
+fun writeTimings(path : String, old : Map String Timing, ran : Array (Case, Result)) -> Unit {
+    for (c, r) in ran {
+        Map.put(old, c.name, Timing { millis = r.millis, failed = Case.failsRun(r.outcome) })
+    }
+    let b = String.builder()
+    for (name, timing) in old {
+        String.push(b, Int.toString(timing.millis) + " " + (if timing.failed { "1" } else { "0" })
+                       + " " + name + "\n")
+    }
+    if let Right(staging) = File.temporaryDir("turkey-test-") {
+        if let Right(_) = Files.writeText(staging + "/timings", String.build(b)) {
+            let _ = File.rename(staging + "/timings", path)
+        }
+        let _ = File.removeTree(staging)
+    }
+}
+
+-- `cases` in the order to run them. The sort is stable and `cases` arrive
+-- sorted by name, so cases that tie keep that order.
+fun ordered(cases : Array Case, timings : Map String Timing) -> Array Case =
+    Array.sortBy(cases, fun(a, b) = Array.threeWay(rank(timings, a), rank(timings, b)))
+
+-- What a case is sorted by: the group it runs in, failed last time first and
+-- untimed last, then its last duration, longest first.
+fun rank(timings : Map String Timing, c : Case) -> (Int, Int) = match Map.get(timings, c.name) {
+    Some(Timing { failed = True, millis }) -> (0, -millis)
+    Some(Timing { millis, .. }) -> (1, -millis)
+    None -> (2, 0)
+}
+
+-- Whether the case `name` is in shard `index` of `count`, counting from 1.
+fun inShard(name : String, index : Int, count : Int) -> Bool {
+    let h = SHA256.new()
+    SHA256.updateText(h, name)
+    let digest = SHA256.finish(h)
+    let n = Array.fold(Array.slice(digest, 0, 4), 0, fun(n, b) = n * 256 + Byte.toInt(b))
+    n % count == index - 1
+}
+
+-- `run` of each case, `jobs` at a time, each result in its case's place.
+fun runAll(cases : Array Case, jobs : Int, run : fun(Case) -> Result) -> Array Result {
+    let results = Array.filled(len(cases), None)
+    -- The next case to take. Atomic, since with more than one worker two
+    -- tasks may take one at once.
+    let next = Sync.atomicInt(0)
+    Task.runScope(do {
+        for var j = 0; j < jobs; j = j + 1 {
+            let _ = Task.spawn(fun() {
+                loop {
+                    let i = Sync.addAndGet(next, 1) - 1
+                    if i >= len(cases) { break }
+                    results[i] = Some(run(cases[i]))
+                }
+            })?
+        }
+        pure(())
+    })
+    Array.map(results, Option.expect(_, "a case was not run"))
+}

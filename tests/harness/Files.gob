@@ -1,0 +1,77 @@
+module Files (readBytes, readText, writeText, listed, filesUnder, isDirectory, exists, age, parentOf)
+
+-- The file operations the harness needs. Every failure here ends up as a
+-- harness error, so each carries the path it was about.
+
+import System.File as File
+import System.File (FileKind(..), Stat(..))
+import System.IO as IO
+import Time.Duration (Duration)
+import Time.Instant as Instant
+
+-- A file read as text that is not UTF-8. `InvalidUTF8` alone does not say
+-- which file.
+type NotText = NotText { path : String }
+
+instance Error NotText { fun message(e) = e.path + " is not UTF-8" }
+
+fun readBytes(path : String) -> Either SomeError (Array Byte) {
+    let b = Error.promote(File.readAll(path))?
+    Right(IO.bytes(b))
+}
+
+fun readText(path : String) -> Either SomeError String = match File.readText(path) {
+    Right(s) -> Right(s)
+    Left(Left(_)) -> Left(fail(NotText { path }))
+    Left(Right(e)) -> Left(fail(e))
+}
+
+-- Replace `path`'s contents with `text`, making its directory if need be.
+fun writeText(path : String, text : String) -> Either SomeError Unit {
+    if let Some(parent) = parentOf(path) { Error.promote(File.createDirAll(parent))? }
+    Error.promote(File.writeText(path, text))?
+    Right(())
+}
+
+fun parentOf(path : String) -> Option String = match String.rsplitOnce(path, "/") {
+    Some(("", _)) -> Some("/")
+    Some((parent, _)) -> Some(parent)
+    None -> None
+}
+
+fun isDirectory(path : String) -> Bool = match File.metadata(path) {
+    Right(Stat { kind = Directory, .. }) -> True
+    _ -> False
+}
+
+fun exists(path : String) -> Bool = Either.isRight(File.metadata(path))
+
+-- How long ago `path`'s contents last changed, if it is there.
+fun age(path : String) -> Option Duration = match File.metadata(path) {
+    Right(Stat { modified, .. }) -> Some(Instant.elapsed(modified, Instant.now()))
+    Left(_) -> None
+}
+
+-- The names in `directory`, sorted, or none if it cannot be listed.
+fun listed(directory : String) -> Array String = Either.unwrapOr(File.listPath(directory), [])
+
+-- Every file under `directory`, at any depth, as a path relative to it, in
+-- the sorted order `File.list` gives each level in.
+fun filesUnder(directory : String) -> Either SomeError (Array String) {
+    let out = []
+    collect(directory, "", out)?
+    Right(Vec.toArray(out))
+}
+
+fun collect(directory : String, prefix : String, out : Vec String) -> Either SomeError Unit {
+    let names = Error.promote(File.listPath(directory))?
+    for name in names {
+        let path = directory + "/" + name
+        if isDirectory(path) {
+            collect(path, prefix + name + "/", out)?
+        } else {
+            Vec.push(out, prefix + name)
+        }
+    }
+    Right(())
+}

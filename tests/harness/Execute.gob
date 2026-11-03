@@ -1,0 +1,176 @@
+module Execute (execute, diffLimit)
+
+-- One case, compiled, run and compared, as an outcome.
+--
+-- A case is compiled by `boot` from its own directory, so a diagnostic names
+-- the file by its bare name, then linked by the C compiler, then run in that
+-- directory under `$TURKEY_RUN` (`Cache.compile`, `Toolchain.command`). What
+-- it printed -- stdout, then the compile's warnings and the program's stderr
+-- -- must equal the golden exactly, and how it ended must be what its
+-- directive says. Then each dump golden is checked against `boot check
+-- --dump STAGE`, which is not cached, since the dump is what is tested.
+--
+-- Every actual result is written under `ACTUAL/NAME/` for inspection, whether
+-- the case passed or not: `output`, and one file per dump.
+
+import Process (Output(..), Status(..))
+import Process as Process
+import System.IO (IOError)
+import Time.Duration as Duration
+import Time.Stopwatch as Stopwatch
+import Case (Case(..), Expected(..), Outcome(..), Result(..))
+import Case as Case
+import Cache (Cache, Compiled(..))
+import Cache as Cache
+import Diff as Diff
+import Files as Files
+import Toolchain (Toolchain(..))
+import Toolchain as Toolchain
+
+-- The longest diff shown for a case, in lines; the whole actual output is in
+-- the actual results.
+let diffLimit : Int = 200
+
+-- How long a program may run without a `timeout` directive, and how long
+-- `boot` and the link may take, in seconds, before `--timeout-scale`.
+let defaultTimeout : Int = 300
+
+-- What became of a case, before its time is added.
+type Verdict = Verdict { outcome : Outcome, why : String, diff : String }
+
+fun execute(t : Toolchain, cache : Cache, actual : String, c : Case) -> Result {
+    let watch = Stopwatch.start()
+    let Verdict { outcome, why, diff } = expected(c, judge(t, cache, actual + "/" + c.name, c))
+    Result { outcome, why, diff, millis = Duration.toNanos(Stopwatch.elapsed(watch)) / 1000000 }
+}
+
+-- An `xfail` case turns a wrong answer into the failure it expects and a
+-- pass into an unexpected one. A crash or a timeout stays what it is: that is
+-- not the failure the reason describes.
+fun expected(c : Case, judged : Verdict) -> Verdict = match (c.xfail, judged.outcome) {
+    (Some(reason), Pass) -> Verdict(XPass, reason, "")
+    (Some(reason), Fail) -> Verdict(XFail, reason, "")
+    _ -> judged
+}
+
+fun harnessError(e : SomeError) -> Verdict = Verdict(HarnessError, Error.describe(e), "")
+
+fun judge(t : Toolchain, cache : Cache, actual : String, c : Case) -> Verdict {
+    if let Some(problem) = c.problem { return Verdict(HarnessError, problem, "") }
+    for r in c.requires {
+        if !Toolchain.satisfies(t, r) { return Verdict(Skip, "requires " + Case.requirementName(r), "") }
+    }
+    let golden = match Files.readText(c.golden) {
+        Right(text) -> text
+        Left(e) -> return harnessError(e)
+    }
+    let compiled = match Cache.compile(cache, t, c) {
+        Right(compiled) -> compiled
+        Left(e) -> return harnessError(e)
+    }
+    let ran = match compiled {
+        Crashed(why, stderr) -> {
+            record(actual, "output", stderr)
+            return Verdict(CompilerCrash, why, tail(stderr))
+        }
+        Overran(stderr) -> {
+            record(actual, "output", stderr)
+            return Verdict(Timeout, "boot or the link took too long", tail(stderr))
+        }
+        Refused(_, stderr) -> {
+            record(actual, "output", stderr)
+            let diff = Diff.unified(golden, stderr, diffLimit)
+            return match c.expected {
+                Rejected -> if diff == "" { dumps(t, actual, c) }
+                            else { Verdict(Fail, "the diagnostic differs", diff) }
+                _ -> Verdict(Fail, "did not compile", diff)
+            }
+        }
+        Built(binary, warnings) -> match runProgram(t, c, binary, warnings) {
+            Right(r) -> r
+            Left(e) -> {
+                record(actual, "output", "")
+                return Verdict(HarnessError, "the program did not start: " + Error.message(e), "")
+            }
+        }
+    }
+    let (status, output, programStderr) = ran
+    record(actual, "output", output)
+    let diff = Diff.unified(golden, output, diffLimit)
+    match status {
+        TimedOut -> Verdict(Timeout, "the program ran out of time", diff)
+        Signaled(n) -> Verdict(ProgramCrash, "the program died by signal " + Int.toString(n), diff)
+        Exited(code) -> {
+            let panicked = Cache.panicked(programStderr)
+            let wrongEnd = match c.expected {
+                Exits(n) -> if panicked { Some("panicked") }
+                            else if code != n { Some("exited " + Int.toString(code) + ", not " + Int.toString(n)) }
+                            else { None }
+                Panics -> if panicked && code != 0 { None }
+                          else { Some("exited " + Int.toString(code) + " without the panic --@ panic expects") }
+                Rejected -> Some("compiled, but --@ error expects a compile error")
+            }
+            match wrongEnd {
+                Some(why) -> Verdict(Fail, why, diff)
+                None -> if diff != "" { Verdict(Fail, "the output differs", diff) } else { dumps(t, actual, c) }
+            }
+        }
+    }
+}
+
+-- The compiled program run in the case's directory: how it ended, what the
+-- golden is compared with, and its own stderr, where a panic is looked for.
+fun runProgram(t : Toolchain, c : Case, binary : String, warnings : String)
+    -> Either IOError (Status, String, String) {
+    let argv = t.run + [binary]
+    let limit = Toolchain.limit(t, Option.unwrapOr(c.timeout, defaultTimeout))
+    let Output { stdout, stderr, status } = Process.run(Toolchain.command(t, argv, c.directory), Some(limit))?
+    let err = Toolchain.text(stderr)
+    Right((status, Toolchain.text(stdout) + warnings + err, err))
+}
+
+-- Each dump golden against what `boot check --dump STAGE` prints, stdout then
+-- stderr; the first that differs decides.
+fun dumps(t : Toolchain, actual : String, c : Case) -> Verdict {
+    for (stage, golden) in c.dumps {
+        let expected = match Files.readText(golden) {
+            Right(text) -> text
+            Left(e) -> return harnessError(e)
+        }
+        let argv = t.run + [t.boot, "check", "--dump", stage, c.entry]
+        let limit = Toolchain.limit(t, defaultTimeout)
+        let out = match Process.run(Toolchain.command(t, argv, c.directory), Some(limit)) {
+            Right(out) -> out
+            Left(e) -> return Verdict(HarnessError, "boot did not start: " + Error.message(e), "")
+        }
+        let stderr = Toolchain.text(out.stderr)
+        let printed = Toolchain.text(out.stdout) + stderr
+        record(actual, stage, printed)
+        let diff = Diff.unified(expected, printed, diffLimit)
+        match out.status {
+            TimedOut -> return Verdict(Timeout, "the " + stage + " dump took too long", diff)
+            Signaled(n) -> return Verdict(CompilerCrash, "the " + stage + " dump died by signal " + Int.toString(n), tail(stderr))
+            Exited(code) -> {
+                if Cache.panicked(stderr) { return Verdict(CompilerCrash, "the " + stage + " dump panicked", tail(stderr)) }
+                if diff != "" { return Verdict(Fail, "the " + stage + " dump differs", diff) }
+                if code != 0 { return Verdict(Fail, "the " + stage + " dump exited " + Int.toString(code), "") }
+            }
+        }
+    }
+    Verdict(Pass, "", "")
+}
+
+-- A crash's last lines, which is where what went wrong usually is.
+fun tail(text : String) -> String {
+    let lines = String.lines(text)
+    let from = if len(lines) > diffLimit { len(lines) - diffLimit } else { 0 }
+    let b = String.builder()
+    for var i = from; i < len(lines); i = i + 1 { String.push(b, lines[i] + "\n") }
+    String.build(b)
+}
+
+-- Keep `text` as the actual result `name` of a case. Failing to is not a
+-- reason to fail the case, which has been judged on what was compared.
+fun record(directory : String, name : String, text : String) -> Unit {
+    let _ = Files.writeText(directory + "/" + name, text)
+}
